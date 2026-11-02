@@ -323,3 +323,36 @@ func TestSandboxExecIsNotResent(t *testing.T) {
 		t.Fatalf("server saw %d exec requests for 2 calls, want 2", execs)
 	}
 }
+
+// TestRetryConfigMaxRetryAfterReachesClient: the public MaxRetryAfterMs caps
+// a 503's Retry-After, so a 120 s ask is retried after about 50 ms.
+func TestRetryConfigMaxRetryAfterReachesClient(t *testing.T) {
+	var calls int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if calls == 1 {
+			w.Header().Set("Retry-After", "120")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(models.Sandbox{ID: "sb1", Status: models.SandboxStatusStarted})
+	}))
+	defer server.Close()
+
+	limit := 50
+	client, err := NewClientWithConfig(&sdktypes.MicroVMConfig{
+		PATToken: "pat",
+		APIUrl:   server.URL,
+		Retry:    &sdktypes.RetryConfig{MaxRetryAfterMs: &limit},
+	})
+	if err != nil {
+		t.Fatalf("NewClientWithConfig() error = %v", err)
+	}
+	start := time.Now()
+	if _, err := client.Get(context.Background(), "sb1"); err != nil {
+		t.Fatalf("Get() error = %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second || calls != 2 {
+		t.Fatalf("Get() took %v over %d requests; want one retry about 50 ms later", elapsed, calls)
+	}
+}

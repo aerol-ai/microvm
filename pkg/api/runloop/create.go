@@ -93,24 +93,31 @@ func (h *handlers) handleCreate(w http.ResponseWriter, r *http.Request) {
 	// cluster id header is deliberately not read here: in single-node mode
 	// nothing authenticates it, and a caller must not pick its own id.
 	id := "sb-" + randomHex()
+	var earlier []string
 	if requestID := strings.TrimSpace(r.Header.Get("X-Request-Id")); requestID != "" {
-		id = devboxIDForRequest(service.OwnerRefForCreate(r.Context()), requestID, raw)
+		// No server key (or a revoked one) refuses the create rather than
+		// fall back to a plain hash or to an id a retry cannot find again.
+		ids, err := devboxIDsForRequest(h.deps.Service, service.OwnerRefForCreate(r.Context()), requestID, raw,
+			time.Now().Before(h.legacyDevboxIDsUntil))
+		if err != nil {
+			writeStoreAwareError(h.deps.Logger, w, err)
+			return
+		}
+		id, earlier = ids.current, ids.earlier
 	}
 
-	// Retry of a create still running on this node: join it. This comes
-	// before the row, which lands while the create is still running.
-	if f, ok := h.creates.get(id); ok && !f.isDone() {
-		h.awaitCreate(w, r, f)
+	if h.replayLocalCreate(w, r, id) {
 		return
 	}
-	// Retry of a create that already finished: answer from the row.
-	// writeDevbox still defers to a create that claimed the id meanwhile.
-	if sandbox, err := h.deps.Service.GetSandbox(r.Context(), id); err == nil {
-		h.writeDevbox(w, r, sandbox)
-		return
-	} else if !errors.Is(err, store.ErrNotFound) {
-		writeStoreAwareError(h.deps.Logger, w, err)
-		return
+	// A retry of a create made under an earlier id (the previous server
+	// key, or the unkeyed id before an upgrade) answers with that devbox,
+	// as a retry under the current id would. Only this node's creates and
+	// rows are looked up: the earlier id's devbox may sit on another node,
+	// and forwarding there could not fall back to a create if it is gone.
+	for _, prior := range earlier {
+		if h.replayLocalCreate(w, r, prior) {
+			return
+		}
 	}
 
 	// Prepare may forward the request to the placement target, which
@@ -143,6 +150,28 @@ func (h *handlers) handleCreate(w http.ResponseWriter, r *http.Request) {
 	h.awaitCreate(w, r, f)
 }
 
+// replayLocalCreate answers a retry of a create of id from this node: by
+// joining the create while it still runs (this comes before the row, which
+// lands while the create is still running), or from the row once it has
+// finished (writeDevbox still defers to a create that claimed the id
+// meanwhile). It reports whether it wrote the response.
+func (h *handlers) replayLocalCreate(w http.ResponseWriter, r *http.Request, id string) bool {
+	if f, ok := h.creates.get(id); ok && !f.isDone() {
+		h.awaitCreate(w, r, f)
+		return true
+	}
+	sandbox, err := h.deps.Service.GetSandbox(r.Context(), id)
+	if err == nil {
+		h.writeDevbox(w, r, sandbox)
+		return true
+	}
+	if !errors.Is(err, store.ErrNotFound) {
+		writeStoreAwareError(h.deps.Logger, w, err)
+		return true
+	}
+	return false
+}
+
 // runCreate performs the create and persists the facade state. The state
 // write is part of the create: a devbox without it would answer GETs with
 // its blueprint/name/launch parameters missing, so a failed write rolls
@@ -172,7 +201,10 @@ func (h *handlers) runCreate(ctx context.Context, req models.CreateSandboxReques
 		err = h.deps.Service.UpsertCompatState(ctx, resp.Sandbox.ID, models.FacadeRunloop, stateJSON)
 	}
 	if err != nil {
-		clustercreate.RollbackLocalCreate(context.Background(), h.deps.Service, h.deps.Logger, resp.Sandbox.ID)
+		// A replay's sandbox is the earlier create's: never roll it back.
+		if !resp.Replayed {
+			clustercreate.RollbackLocalCreate(context.Background(), h.deps.Service, h.deps.Logger, resp.Sandbox.ID)
+		}
 		return nil, err
 	}
 	return &resp.Sandbox, nil

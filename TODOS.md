@@ -176,11 +176,31 @@ Every entry was re-verified against `main` at `704c9e74` on 2026-10-06.
   `Terraform/variables.tf:379-383`, `scripts/install.sh:29`. Only the two
   t3.medium `-routing` scenarios turn it on. The 2026-10-04 cluster-hetero
   run behind #595 ran with it off.
-- **Remaining before the default flips on:** a run on the metal flagship
-  with the flag on (no metal routing scenario or make target exists yet;
-  `Makefile:179-183` has only `integration-routing` and
-  `integration-routing-hetero-lite`), and a latency/throughput A/B
-  (`plans/ingress-proxy-routing.md:300-301`, `:494-496`).
+- **Remaining before the default flips on:** a green run of
+  `cluster-bank-flagship` (the metal flagship), which now runs with the flag
+  on and carries the routing gate plus UC-357, and a latency/throughput A/B
+  against the flag-off flagship runs (`plans/ingress-proxy-routing.md:300-301`,
+  `:494-496`). Then the flip is `default_ingress_proxy_routing = true` in
+  `Terraform/variables.tf` plus the `setup/config-defaults.md` row.
+- **Why it matters (cluster-bank-flagship, 2026-11-01, flag off):** UC-230
+  and UC-266 exec-stream dials failed with `unexpected EOF`, 1 run in 20.
+  Every create or destroy anywhere in the cluster made both dedicated
+  ingress nodes write a `-ingress-sni` route, and each write reloaded Caddy:
+  330 reloads in one hour on ingress-2.
+- **Mechanism, confirmed against the release build** (Caddy v2.11.7 +
+  caddy-l4 v0.1.2, `make test-ingress-reload-e2e`, Linux): a reload restarts
+  every Caddy app, and new connections die two ways. (1) Go's `http.Server`,
+  once `Shutdown` has begun, reads the next request on a connection it
+  already accepted and returns without answering (`net/http`
+  `conn.serve`), so the client sees TLS succeed, then zero bytes:
+  `unexpected EOF` on a WebSocket upgrade. (2) Caddy binds a fresh
+  `SO_REUSEPORT` socket per config and closes the old one, and Linux resets
+  what was still queued on it: `connection reset by peer` or EOF in the TLS
+  handshake. caddy-l4 itself does not cut connections it already accepted.
+  At ~18 reloads/s: 2,053 of 33,241 exec-stream dials failed (1,765
+  `unexpected EOF`); with a 20 ms RTT the resets dominate. The static routes:
+  0 of 20,410. Neither mechanism has a Caddy knob, so the only fix is not
+  reloading.
 - **Background (why the flag exists):** seen in T19 S6 (UC-09). A TLS dial
   to the apex was reset 0.5s in, after another test's route DELETE made
   Caddy reload, and every route change reloads the whole config, including
@@ -197,6 +217,8 @@ Every entry was re-verified against `main` at `704c9e74` on 2026-10-06.
   close with zero bytes: the old http server's graceful shutdown closing
   connections that have not sent a request yet. The T19 notes are in
   `plans/integration-test-security.md` §7.12.
+- **Resolver stalls under the flag (fixed, 2026-11-01):** the first flagship run with the flag failed UC-171 with 6 fresh HTTPS dials ending in EOF. caddy-l4's dial of `{sni}.rt.internal` timed out in systemd-resolved: resolved pins its socket for the `aerolvm-rt` link's DNS server to that dummy link, so UDP to the loopback responder was dropped, and every time it re-probed UDP (about 7, 19 and 70 minutes apart on the flagship) lookups stalled for about 20 s. Zero Caddy loads happened on any node in the suite. Fix: the link's DNS server is the link's own address (`SB_ROUTE_DNS_LINK_ADDR`), and the responder echoes EDNS0.
+- **Containerd sandboxes froze after ~128 KiB of output (fixed, 2026-11-01):** the next flagship run (with the resolver fix) still failed UC-171, 2 dials timing out. Not routing: the target's `python3 -m http.server` blocked on its access log. sandboxd closed a containerd task's log file when Create returned, the FIFO copy stopped, and the task froze after ~128 KiB more output. It was reproduced live, stopping at 127 KiB, and froze for good from 47 s to about 5 min into a run depending on request rate. Also after any sandboxd restart: nothing re-attached to running tasks. Fix in `internal/runtime/containerd/logio.go`; live gate UC-360. Docker sandboxes were never affected, which is why the docker routing cluster passed UC-171.
 - **Established WebSockets too (#712):** each reload also closed every
   WebSocket a `reverse_proxy` carried (exec streams, `aerolvm shell`, session
   attach) with code 1001 (UC-68 on `cluster-hetero-lite-secrets`,

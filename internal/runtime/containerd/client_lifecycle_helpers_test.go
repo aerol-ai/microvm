@@ -270,8 +270,16 @@ func TestCappedWriterWriteErrorPath(t *testing.T) {
 	if err := f.Close(); err != nil {
 		t.Fatal(err)
 	}
+	// A failed file write (here: a closed file; on a node, a full disk) must
+	// not fail the copy that drains the task's FIFO, or the task blocks on
+	// its next write. It is reported as taken, and later writes are dropped.
 	w := &cappedWriter{f: f, cap: 100}
-	if _, err := w.Write([]byte("x")); err == nil {
-		t.Fatal("want write error")
+	for range 3 {
+		if n, err := w.Write([]byte("xyz")); err != nil || n != 3 {
+			t.Fatalf("Write = %d, %v; want 3, nil (a failed write must keep the copy draining)", n, err)
+		}
+	}
+	if !w.capped {
+		t.Fatal("a writer whose file failed should stop writing")
 	}
 }

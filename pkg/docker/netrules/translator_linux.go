@@ -200,6 +200,14 @@ func exprEqual(a, b expr.Any) bool {
 			return false
 		}
 		return matchInfoEqual(x.Info, y.Info)
+	case *expr.Lookup:
+		// The set's ID is per transaction; its name is what the rule means.
+		y, ok := b.(*expr.Lookup)
+		return ok && x.SourceRegister == y.SourceRegister && x.SetName == y.SetName && x.Invert == y.Invert &&
+			x.DestRegister == y.DestRegister && x.IsDestRegSet == y.IsDestRegSet
+	case *expr.Ct:
+		y, ok := b.(*expr.Ct)
+		return ok && x.Key == y.Key && x.Register == y.Register && x.SourceRegister == y.SourceRegister && x.Direction == y.Direction
 	case *expr.Counter:
 		// Counters are runtime state (packet/byte totals), not identity —
 		// two counter exprs always match regardless of what they've counted.

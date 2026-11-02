@@ -41,6 +41,10 @@ const (
 	// and the established inspected connections: sandboxd sends it when the
 	// customer revoked the key (plans/customer-key-custody.md §10, eng D21).
 	opClearCA = "clear_inspect_ca"
+	// opNodeCtlPools carries NodeControl: the endpoints and the pools
+	// guarded whole. A gateway from before it answers "unknown op", and
+	// sandboxd falls back to opNodeCtl with every address listed.
+	opNodeCtlPools = "node_control_pools"
 )
 
 // syncPayload is a full Sync: the specs, and the token of the block writes

@@ -526,12 +526,18 @@ func TestRecreateSandboxWasmDurableFailoverE2E(t *testing.T) {
 	svc.AttachWasmCheckpointPusher(puller)
 
 	spec := models.CreateSandboxRequest{
-		Runtime:    models.RuntimeWasm,
-		Durability: models.DurabilityDurable,
-		ModuleRef:  "file:///tmp/demo.wasm",
+		Runtime:              models.RuntimeWasm,
+		Durability:           models.DurabilityDurable,
+		ModuleRef:            "file:///tmp/demo.wasm",
+		CreateRequestDigests: []string{"hmac:0:failover"},
 	}
 	if err := svc.RecreateSandbox(ctx, "sb-failover-e2e", spec, cluster.PlacementSecrets{IncarnationID: "inc-sb-failover-e2e"}, nil); err != nil {
 		t.Fatalf("RecreateSandbox: %v", err)
+	}
+	// The recreated row keeps the keyed create's digest from the spec, so a
+	// reused key is still refused after failover.
+	if digest, err := st.GetCreateRequestDigest(ctx, "sb-failover-e2e"); err != nil || digest != "hmac:0:failover" {
+		t.Fatalf("recreated create digest = %q, %v", digest, err)
 	}
 	if puller.pulled != 1 {
 		t.Fatalf("pull count = %d, want 1", puller.pulled)

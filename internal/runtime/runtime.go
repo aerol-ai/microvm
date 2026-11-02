@@ -139,7 +139,15 @@ type NetRulesReporter interface {
 // egress gateway, which carries its own copy of the floor.
 type EgressFloorSetter interface {
 	SetEgressFloor(ctx context.Context, cidrs []netip.Prefix) error
+	// ReassertEgressFloor puts back a floor something removed; repaired
+	// reports that it had to.
+	ReassertEgressFloor(ctx context.Context) (repaired bool, err error)
 }
+
+// ErrEgressFloorUnavailable means the runtime has no host firewall (network
+// rules are off), so nothing on the host keeps its sandboxes off the cloud
+// metadata endpoints.
+var ErrEgressFloorUnavailable = errors.New("runtime: the host firewall is off; sandboxes can reach the cloud metadata endpoints")
 
 // NodeGuardSetter is implemented by runtimes whose sandboxes reach the node
 // over a host bridge or TAP subnet (containers, gVisor, Firecracker): it
@@ -263,10 +271,11 @@ func AsToolboxAddresser(rt Runtime) (ToolboxAddresser, bool) {
 }
 
 // IdentityStarter is a Runtime whose start must hand the container its
-// sandbox identity again. A Docker container adopted from the warm pool keeps
-// the pool's parked env for life (Docker can't change a container's env), so
-// after every stop its toolboxd boots parked and serves nothing until it is
-// adopted again with the sandbox's ID and toolbox token. A Firecracker guest
+// sandbox identity again. A Docker or containerd container adopted from the
+// warm pool keeps the pool's parked env for life (Docker can't change a
+// container's env; containerd adoption relabels the container and leaves
+// its spec alone), so after every stop its toolboxd boots parked and serves
+// nothing until it is adopted again with the sandbox's ID and toolbox token. A Firecracker guest
 // restored from its stopped snapshot is adopted again over vsock: its
 // toolboxd serves nothing without the token.
 type IdentityStarter interface {

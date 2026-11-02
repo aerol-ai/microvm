@@ -88,6 +88,15 @@ func (f *FakeRunner) Del(ctx context.Context, netnsPath, containerID string) err
 	return nil
 }
 
+// IPOf returns the address ADD gave containerID that no DEL has released:
+// what a real netns realized under that id would hold.
+func (f *FakeRunner) IPOf(containerID string) (string, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	ip, ok := f.ips[containerID]
+	return ip, ok
+}
+
 func (f *FakeRunner) Adds() []call {
 	f.mu.Lock()
 	defer f.mu.Unlock()

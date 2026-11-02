@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { Image } from "./Image.js";
+import { MicroVMApiError as ExportedMicroVMApiError } from "./index.js";
 import { MicroVM } from "./MicroVM.js";
 import { Sandbox } from "./Sandbox.js";
 
@@ -1567,4 +1568,57 @@ test("MicroVM getSnapshot/listSnapshots/deleteSnapshot hit the v1 snapshot surfa
   assert.ok(seen.some((s) => s.method === "GET" && s.url.endsWith("/v1/snapshots/py-base")));
   assert.ok(seen.some((s) => s.method === "GET" && s.url.includes("/v1/snapshots?limit=1&starting_after=cursor")));
   assert.ok(seen.some((s) => s.method === "DELETE" && s.url.endsWith("/v1/snapshots/py-base")));
+});
+
+test("MicroVM passes retry.maxRetryAfterMs and signal to its client", async () => {
+  let calls = 0;
+  const sdk = new MicroVM({
+    patToken: "pat",
+    apiUrl: "https://api.example.com",
+    retry: { maxRetryAfterMs: 50 },
+    fetch: async () => {
+      calls++;
+      if (calls === 1) {
+        return new Response(JSON.stringify({ error: "busy" }), { status: 503, headers: { "retry-after": "120" } });
+      }
+      return jsonResponse(200, { tokens: [] });
+    },
+  });
+  const start = performance.now();
+  await sdk.tokens.list();
+  assert.ok(performance.now() - start < 2000, "a 120 s Retry-After is cut to 50 ms");
+  assert.equal(calls, 2);
+
+  const aborted = new MicroVM({
+    patToken: "pat",
+    apiUrl: "https://api.example.com",
+    signal: AbortSignal.abort(new Error("stopped")),
+    fetch: async (_input, init) => {
+      init?.signal?.throwIfAborted();
+      return jsonResponse(200, { tokens: [] });
+    },
+  });
+  await assert.rejects(aborted.tokens.list(), { message: "stopped" });
+});
+
+test("MicroVM create failures are MicroVMApiError from the package entry point", async () => {
+  const sdk = new MicroVM({
+    patToken: "pat-token",
+    apiUrl: "https://api.example.com",
+    retry: { maxRetries: 0 },
+    fetch: async () =>
+      new Response(JSON.stringify({ error: "Idempotency-Key reused", code: "idempotency_key_reused" }), {
+        status: 422,
+        headers: { "content-type": "application/json" },
+      }),
+  });
+  try {
+    await sdk.create({ image: "ubuntu:22.04" });
+    assert.fail("create should fail");
+  } catch (err) {
+    assert.ok(err instanceof ExportedMicroVMApiError);
+    assert.equal(err.status, 422);
+    assert.equal(err.code, "idempotency_key_reused");
+    assert.equal(err.message, "Idempotency-Key reused");
+  }
 });

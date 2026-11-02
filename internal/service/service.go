@@ -336,6 +336,9 @@ type Service struct {
 	localReadyWasmModuleIDsCache   []string
 	localReadyWasmModuleIDsKnown   bool
 	localReadyWasmModuleIDsExpires time.Time
+	// slotPools caches LocalSlotPools (slot_pools.go) for the capacity
+	// heartbeat, so placement's per-create self refresh does not read SQLite.
+	slotPools slotPoolCache
 	// Reserved standard-module aliases that actually resolve on this host,
 	// computed once: each resolve hashes a staged file up to 256MiB, so it must
 	// not run on every 5s inventory refresh (hard rule 2). Staged modules are
@@ -399,6 +402,11 @@ type Service struct {
 	// show yet into it (review finding 1).
 	egressSyncMu   sync.RWMutex
 	egressInflight egressInflight
+	// egressCreateHolds counts the creates holding an early gateway attach
+	// per sandbox, and egressCreateLocks orders an undo's check-and-detach
+	// against a duplicate create's attach (egress_early.go).
+	egressCreateHolds egressCreateHolds
+	egressCreateLocks egressPolicyLocks
 	// egressHoldLocks serializes each sandbox's hold record with the
 	// enforcement derived from it (egress_blocks.go).
 	egressHoldLocks egressPolicyLocks
@@ -434,6 +442,9 @@ type Service struct {
 	// createsInFlight is the sandbox IDs whose create is running, which the
 	// reconcile orphan sweep skips (create_inflight.go).
 	createsInFlight createsInFlight
+	// createLeases holds, per sandbox ID, the one create of it running on
+	// this node; a second create of the ID waits for it (create_lease.go).
+	createLeases createLeases
 	// reconcileUnknown tracks sandboxes whose runtime could not say whether
 	// they exist, pass after pass (reconcile_unknown.go).
 	reconcileUnknown reconcileUnknownTracker
@@ -477,6 +488,10 @@ type Service struct {
 	// nodeGuard is the node guard's state: what each runtime got, and the
 	// per-runtime result the create gate reads (node_guard.go).
 	nodeGuard nodeGuardState
+	// egressFloor is the host-firewall deny floor's state: the floor each
+	// runtime got, and the per-runtime result the create gate reads
+	// (egress_floor.go).
+	egressFloor egressFloorState
 	// egressPolicyLocks serializes live policy updates per sandbox (§5.8).
 	egressPolicyLocks egressPolicyLocks
 	// egressProfileKick wakes SuperviseEgressProfiles after a profile change
@@ -684,6 +699,10 @@ type Service struct {
 	// create paths. Tests close the DB here so PutMounts / custom-domain
 	// persist failure arms run without a store wrapper. Nil in production.
 	testAfterStoreCreate func()
+	// testAttachStage, when set, sees each gateway-attach sub-stage's
+	// duration (egress_attach_stages.go); the attach benchmark reads the
+	// split from it. Nil in production.
+	testAttachStage func(stage string, d time.Duration)
 	// testAfterCustomDomainsOnCreate runs after persistCustomDomainsOnCreate
 	// succeeds on the wasm create path so the subsequent Get/sync failure
 	// rollbacks can be forced. Nil in production.
@@ -731,6 +750,10 @@ type Service struct {
 	// testForceUnmountErr, when non-nil, replaces the UnmountAll result in
 	// DestroySandbox so the warn arm is reachable offline. Nil in production.
 	testForceUnmountErr error
+	// testCreateLeaseWait, when >0, replaces createLeaseWait so a test can
+	// reach a waiter's ErrCreateInProgress without waiting out the create
+	// timeout. Zero in production.
+	testCreateLeaseWait time.Duration
 	// testSecretPeerPusher overrides cluster secret fan-out in tests. Nil in
 	// production (SealAndDistribute type-asserts the live Cluster/Agent).
 	testSecretPeerPusher cluster.SecretPeerPusher
@@ -1292,25 +1315,46 @@ func (s *Service) noteSandboxCreated(ctx context.Context, resp *models.CreateSan
 // Idempotent at the cluster boundary — if a sandbox with this ID already
 // exists locally we return the existing record without touching docker. Used
 // by the cluster owner watcher to re-materialize a sandbox after its previous
-// owner died.
+// owner died, and by every create that derives its ID (Idempotency-Key, E2B,
+// Runloop).
+//
+// It holds the ID's create lease (create_lease.go) from before it looks for
+// the row until the create's rollback has run, so a second create of the ID
+// on this node waits for this one and then replays its sandbox, or creates
+// afresh when this one failed, instead of running a second create whose
+// failure would undo this one's reservation and mounts.
 func (s *Service) CreateSandboxWithID(ctx context.Context, req models.CreateSandboxRequest, id string) (*models.CreateSandboxResponse, error) {
 	if id == "" {
 		return nil, errors.New("CreateSandboxWithID: id required")
 	}
-	if existing, err := s.store.Get(ctx, id); err == nil && existing != nil {
+	// An Idempotency-Key create replays only the request it was made with
+	// (keyed_create.go): a different one is refused here, before anything is
+	// created, when a create of the ID is running, and below when the
+	// sandbox exists.
+	ctx, release, err := s.beginCreateLease(ctx, id, req.CreateRequestDigests)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+	if existing, getErr := s.store.Get(ctx, id); getErr == nil && existing != nil {
 		// The fast path returns a fully-hydrated row — toolbox token included
 		// — so it must never answer a caller that does not own it. A facade
 		// deriving the ID from request content (E2B) would otherwise let any
 		// tenant reclaim another tenant's ID and be handed its credentials.
 		// enforceOwner passes for the owner-watcher / internal recreate path,
 		// which carries no Access and legitimately re-materializes any row.
+		// It answers before the digest check, so a digest says nothing about
+		// another tenant's sandbox.
 		if err := enforceOwner(ctx, existing); err != nil {
 			return nil, fmt.Errorf("%w: sandbox id is already in use", models.ErrSandboxExists)
+		}
+		if err := s.checkStoredCreateDigest(ctx, id); err != nil {
+			return nil, err
 		}
 		// Already present locally — recreate is a no-op. The watcher tick that
 		// noticed the FSM-only entry must have raced with a local create.
 		auditlog.NoteSandboxIdentity(ctx, id, existing.AuditIncarnationID, existing.OwnerRef)
-		return &models.CreateSandboxResponse{Sandbox: *existing}, nil
+		return &models.CreateSandboxResponse{Sandbox: *existing, Replayed: true}, nil
 	}
 	resp, err := s.createSandbox(ctx, req, id)
 	s.noteSandboxCreated(ctx, resp)
@@ -1449,7 +1493,9 @@ func (s *Service) finalizeStaleLocalSandbox(ctx context.Context, sandbox *models
 		return err
 	}
 	if !runtimeAlreadyGone {
-		if err := rt.Destroy(ctx, sandbox); err != nil {
+		// The gateway lets go once the workload is gone and before the
+		// runtime frees the address (gatewayReleaser).
+		if err := rt.Destroy(s.gatewayReleaserCtx(ctx, sandbox, false), sandbox); err != nil {
 			// With the row gone, the ordinary orphan-runtime sweep owns retries and
 			// cannot mistake this for a lifecycle-wide delete.
 			return err
@@ -1799,6 +1845,19 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 		if err := models.ValidateSandboxID(idOverride); err != nil {
 			return nil, err
 		}
+		// Every per-ID side effect below (admission, mounts, the runtime's
+		// names, routes, rows) assumes it is the only create of this ID:
+		// hold the ID's create lease (create_lease.go) before the first of
+		// them and until the last rollback has run. CreateSandboxWithID
+		// already holds it, so this take joins it; it is here so no caller
+		// can reach the side effects without it. A generated ID cannot
+		// collide and needs no lease.
+		var release func()
+		ctx, release, err = s.beginCreateLease(ctx, idOverride, req.CreateRequestDigests)
+		if err != nil {
+			return nil, err
+		}
+		defer release()
 	}
 	// Bound the entire create operation so a stalled image pull or a slow
 	// registry cannot block a goroutine forever. 0 disables the guard.
@@ -1968,6 +2027,12 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 	// install, since it could reach every service on the node. One atomic
 	// map read (node_guard.go).
 	if err := s.requireNodeGuard(chosenRuntime); err != nil {
+		return nil, err
+	}
+	// Fail closed: no sandbox on a runtime whose egress deny floor is not
+	// installed, since it could reach the cloud metadata endpoints and the
+	// node's credentials. One atomic map read (egress_floor.go).
+	if err := s.requireEgressFloor(chosenRuntime); err != nil {
 		return nil, err
 	}
 	if hasBinariesRule(req.NetworkEgressRules) && chosenRuntime == models.RuntimeGvisor {
@@ -2174,15 +2239,9 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 	// > 0 by normalizeCreateRequest above), so a default-sized request still
 	// counts against the host budget. Reservation happens here; every failure
 	// path below must release it.
-	if s.admitter != nil {
-		if err := s.admitter.Admit(sandboxID, capacityRequestFromCreate(req)); err != nil {
-			return nil, err
-		}
-	}
-	releaseAdmission := func() {
-		if s.admitter != nil {
-			s.admitter.Release(sandboxID)
-		}
+	releaseAdmission, err := s.admitCreate(sandboxID, req)
+	if err != nil {
+		return nil, err
 	}
 
 	prepareStart := time.Now()
@@ -2229,8 +2288,13 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 		releaseAdmission()
 		return nil, fmt.Errorf("mount external storage: %w", err)
 	}
+	// The ID's mount set is this create's only if it made one: MountAll
+	// refuses an ID whose mounts are established, and a create without
+	// mounts made none. Tearing down rootDir/<id> otherwise would unmount
+	// the storage of whatever holds the ID.
+	mountedHere := len(req.Mounts) > 0
 	cleanupMounts := func() {
-		if s.mounts == nil {
+		if s.mounts == nil || !mountedHere {
 			return
 		}
 		err := s.mounts.UnmountAll(sandboxID)
@@ -2267,6 +2331,21 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 		createtiming.From(ctx).RecordStage("svc_egress_join", time.Since(joinStart))
 		return err
 	}
+	// early is the gateway attach this create starts as soon as the runtime
+	// reports the sandbox's address, so it overlaps the runtime create
+	// (egress_early.go). Per-binary rules keep the late attach: the gateway
+	// traces them from the container's init pid, which only the started
+	// container has.
+	var early *earlyEgressAttach
+	createCtx := ctx
+	if gatewayMode && !hasBinariesRule(req.NetworkEgressRules) {
+		if cr, ok := runtime.AsContainerRuntime(ociRt); ok {
+			early = s.newEarlyEgressAttach(ctx, cr, models.Sandbox{ID: sandboxID, Runtime: chosenRuntime, Engine: chosenEngine,
+				NetworkAllowOut: req.NetworkAllowOut, NetworkDenyOut: req.NetworkDenyOut, NetworkEgressMode: req.NetworkEgressMode,
+				NetworkEgressRules: req.NetworkEgressRules, Env: req.Env})
+			createCtx = runtime.WithAddressObserver(ctx, early)
+		}
+	}
 	rollbackDestroy := func(partial *models.Sandbox) {
 		if partial == nil {
 			return
@@ -2275,9 +2354,26 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 		partial.Runtime = chosenRuntime
 		partial.Engine = chosenEngine
 		// Destroy first: a container that outlives a failed rollback stays
-		// filtered (attached, or still behind the driver's block-all).
-		destroyErr := ociRt.Destroy(rollback.Context(), partial)
-		if gatewayMode && destroyErr == nil {
+		// filtered (attached, or still behind the driver's block-all). The
+		// runtime tells the observer once the workload is gone and before
+		// its address is free, so the gateway lets go first: an early attach
+		// undoes itself (unless a duplicate create holds it), any other
+		// attach detaches.
+		_, reported := early.reported()
+		destroyCtx := s.gatewayReleaserCtx(rollback.Context(), partial, false)
+		if reported {
+			destroyCtx = runtime.WithAddressObserver(rollback.Context(), early)
+		}
+		destroyErr := ociRt.Destroy(destroyCtx, partial)
+		switch {
+		case !gatewayMode:
+		case reported && destroyErr != nil:
+			// It may still run: it keeps the attach, and the orphan sweep's
+			// removal detaches it.
+			early.commit()
+		case reported:
+			early.undo()
+		case destroyErr == nil:
 			s.detachSandboxEgress(rollback.Context(), partial, partial.ContainerIP)
 		}
 	}
@@ -2287,18 +2383,35 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 	// The runtime instance exists before the row: reconcile's orphan sweep
 	// must not take it for a leak until this create has returned.
 	defer s.createsInFlight.begin(sandboxID)()
+	// Settles the early attach on every exit, before the in-flight mark
+	// goes: once the row is stored with the attach joined it owns the
+	// attach; any other exit undoes it (a no-op once a rollback has).
+	egressCommitted := false
+	defer func() { early.end(egressCommitted) }()
 	clearGen := s.egressClears.now()
-	state, err := ociRt.Create(ctx, driverReq, sandboxID, toolboxToken, append(binds, inspectBinds...))
+	state, err := ociRt.Create(createCtx, driverReq, sandboxID, toolboxToken, append(binds, inspectBinds...))
 	if err != nil {
+		// A driver that reported the address and failed let it go through
+		// ReleasingAddress; this covers one that didn't.
+		early.undo()
+		// A name collision (ErrSandboxContainerExists) means another
+		// instance holds the ID. This create still releases only what it
+		// made: releaseAdmission and cleanupMounts are no-ops for a
+		// reservation or a mount set it found in place (admitCreate,
+		// mountedHere), on the replay exit as on every other.
 		cleanupMounts()
 		if resp, dupErr := s.handleDuplicateCreateAfterRuntime(ctx, sandboxID, err); dupErr == nil {
+			releaseAdmission()
 			return resp, nil
 		} else if !errors.Is(dupErr, err) {
 			releaseAdmission()
 			return nil, dupErr
 		}
 		releaseAdmission()
-		return nil, err
+		// A bridge or subnet that filled past the counted pool (a port
+		// taken without a reservation) is still capacity, not a fault: the
+		// driver removed what it created, and the API answers 503.
+		return nil, capacity.AsNetworkSlotExhausted(networkSlotPool(chosenEngine), err)
 	}
 	s.releaseAdoptedParkReservation(state)
 	if gatewayMode {
@@ -2307,17 +2420,7 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 			NetworkAllowOut: req.NetworkAllowOut, NetworkDenyOut: req.NetworkDenyOut, NetworkEgressMode: req.NetworkEgressMode,
 			NetworkEgressRules: req.NetworkEgressRules, Env: req.Env}
 		egressDone = make(chan error, 1)
-		go func() {
-			attachStart := time.Now()
-			var err error
-			if !ok {
-				err = ErrEgressGatewayRequired
-			} else {
-				err = s.attachSandboxEgress(ctx, attachSB, cr)
-			}
-			createtiming.From(ctx).RecordStage("svc_egress_attach", time.Since(attachStart))
-			egressDone <- err
-		}()
+		s.startCreateAttach(ctx, early, attachSB, cr, ok, egressDone)
 	}
 
 	// Seal the registry creds (if any) BEFORE building the row so a marshal
@@ -2411,10 +2514,14 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 	persistStart := time.Now()
 	sandbox.OwnerRef = ownerRef
 	if err := s.persistSandboxCreate(ctx, sandbox); err != nil {
-		_ = s.deleteSandboxPublicRoutes(rollback.Context(), sandbox)
+		// ErrSandboxExists: a row holds the ID, and with it the ID's public
+		// route, reservation and mounts. This create releases only what it
+		// made (admitCreate, mountedHere) and puts the route back.
+		s.rollbackCreatePublicRoutes(rollback.Context(), sandbox, errors.Is(err, models.ErrSandboxExists))
 		rollbackDestroy(sandbox)
 		cleanupMounts()
 		if resp, dupErr := s.handleDuplicateStoreCreate(ctx, sandbox.ID, err); dupErr == nil {
+			releaseAdmission()
 			return resp, nil
 		} else if !errors.Is(dupErr, err) {
 			releaseAdmission()
@@ -2512,6 +2619,7 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 		}
 	}
 	platformVolumesCommitted = true
+	egressCommitted = true
 	s.settleEgressAttach(sandbox.ID)
 	s.settleEnforcedEgress(ctx, sandbox, clearGen)
 	stored, err := s.store.Get(ctx, sandbox.ID)
@@ -2594,6 +2702,7 @@ func (s *Service) createFirecrackerSandbox(ctx context.Context, req models.Creat
 	// Hostname entries, profiles and learn mode go through the egress
 	// gateway, as on the container runtimes: the driver gets a block-all
 	// copy, so the guest boots shut, and the attach lifts it (§5.7).
+	prepareStart := time.Now()
 	egressPol, err := compileCreateEgressEffective(&req)
 	if err != nil {
 		return nil, err
@@ -2606,6 +2715,9 @@ func (s *Service) createFirecrackerSandbox(ctx context.Context, req models.Creat
 		}
 		driverReq.NetworkBlockAll = true
 		driverReq.NetworkAllowOut, driverReq.NetworkDenyOut = nil, nil
+		// The same stage as the container path, so a Firecracker create's
+		// Server-Timing splits its egress work the same way (UC-185).
+		createtiming.From(ctx).RecordStage("svc_egress_prepare", time.Since(prepareStart))
 	}
 	if req.NetworkBytesInLimit > 0 || req.NetworkBytesOutLimit > 0 {
 		return nil, unsupportedFirecrackerOption("network byte limits")
@@ -2635,27 +2747,40 @@ func (s *Service) createFirecrackerSandbox(ctx context.Context, req models.Creat
 	// Admission check mirrors the docker path. The capacity model is
 	// runtime-agnostic — a firecracker VMM's vCPU/memory footprint
 	// is counted the same way as a docker container's.
-	if s.admitter != nil {
-		if err := s.admitter.Admit(sandboxID, capacityRequestFromCreate(req)); err != nil {
-			return nil, err
-		}
-	}
-	releaseAdmission := func() {
-		if s.admitter != nil {
-			s.admitter.Release(sandboxID)
-		}
+	releaseAdmission, err := s.admitCreate(sandboxID, req)
+	if err != nil {
+		return nil, err
 	}
 
 	// Dispatch into the firecracker driver. The driver's Create owns
 	// TAP slot allocation, host TAP creation, rootfs build, VMM spawn,
 	// REST orchestration, and the vsock handshake. On error, the
 	// driver releases everything it acquired before returning.
+	//
+	// The gateway attach starts as soon as the driver has the guest's TAP
+	// slot shut and reports its address, so it overlaps the boot
+	// (egress_early.go); a warm-pool hit reports nothing and attaches late.
+	gwSB := models.Sandbox{ID: sandboxID, Runtime: req.Runtime,
+		NetworkAllowOut: req.NetworkAllowOut, NetworkDenyOut: req.NetworkDenyOut, NetworkEgressMode: req.NetworkEgressMode}
+	var early *earlyEgressAttach
+	createCtx := ctx
+	if gatewayMode && !hasBinariesRule(req.NetworkEgressRules) {
+		if cr, ok := runtime.AsContainerRuntime(s.firecracker); ok {
+			early = s.newEarlyEgressAttach(ctx, cr, gwSB)
+			createCtx = runtime.WithAddressObserver(ctx, early)
+		}
+	}
+	committed := false
 	// The runtime instance exists before the row: reconcile's orphan sweep
 	// must not take it for a leak until this create has returned.
 	defer s.createsInFlight.begin(sandboxID)()
+	// Settles the early attach on every exit, before the in-flight mark
+	// goes (see the container path).
+	defer func() { early.end(committed) }()
 	clearGen := s.egressClears.now()
-	state, err := s.firecracker.Create(ctx, driverReq, sandboxID, toolboxToken, nil)
+	state, err := s.firecracker.Create(createCtx, driverReq, sandboxID, toolboxToken, nil)
 	if err != nil {
+		early.undo()
 		// Phase 6 PR-A: cold-load corruption intercept. The driver's
 		// configureVMMForLoad path verifies the snapshot checksum and
 		// returns ErrSnapshotCorrupt-wrapping errors on mismatch; surface
@@ -2676,32 +2801,40 @@ func (s *Service) createFirecrackerSandbox(ctx context.Context, req models.Creat
 		if egressDone == nil {
 			return nil
 		}
+		joinStart := time.Now()
 		err := <-egressDone
 		egressDone = nil
+		createtiming.From(ctx).RecordStage("svc_egress_join", time.Since(joinStart))
 		return err
 	}
+	gwSB.ContainerIP = state.ContainerIP
 	destroyVM := func(partial *models.Sandbox) {
 		_ = waitEgress()
 		// As on the docker path: a VM that outlives a failed rollback stays
-		// filtered.
-		if err := s.firecracker.Destroy(rollback.Context(), partial); err == nil && gatewayMode {
+		// filtered, and the gateway lets go once the VM is down and before
+		// the TAP slot is free.
+		_, reported := early.reported()
+		destroyCtx := s.gatewayReleaserCtx(rollback.Context(), &gwSB, false)
+		if reported {
+			destroyCtx = runtime.WithAddressObserver(rollback.Context(), early)
+		}
+		err := s.firecracker.Destroy(destroyCtx, partial)
+		switch {
+		case !gatewayMode:
+		case reported && err != nil:
+			early.commit()
+		case reported:
+			early.undo()
+		case err == nil:
 			s.detachSandboxEgress(rollback.Context(), partial, state.ContainerIP)
 		}
 	}
 	if gatewayMode {
 		cr, ok := runtime.AsContainerRuntime(s.firecracker)
-		attachSB := &models.Sandbox{ID: state.SandboxID, ContainerIP: state.ContainerIP, Runtime: req.Runtime,
-			NetworkAllowOut: req.NetworkAllowOut, NetworkDenyOut: req.NetworkDenyOut, NetworkEgressMode: req.NetworkEgressMode}
+		attachSB := gwSB
+		attachSB.ID = state.SandboxID
 		egressDone = make(chan error, 1)
-		go func() {
-			attachStart := time.Now()
-			err := ErrEgressGatewayRequired
-			if ok {
-				err = s.attachSandboxEgress(ctx, attachSB, cr)
-			}
-			createtiming.From(ctx).RecordStage("svc_egress_attach", time.Since(attachStart))
-			egressDone <- err
-		}()
+		s.startCreateAttach(ctx, early, &attachSB, cr, ok, egressDone)
 	}
 
 	sealedRegistry, err := s.sealRegistry(req.Registry)
@@ -2811,6 +2944,7 @@ func (s *Service) createFirecrackerSandbox(ctx context.Context, req models.Creat
 			return nil, fmt.Errorf("%w: %v", ErrEgressGatewayUnavailable, err)
 		}
 	}
+	committed = true
 	s.settleEgressAttach(sandbox.ID)
 	s.settleEnforcedEgress(ctx, sandbox, clearGen)
 
@@ -2900,6 +3034,9 @@ func (s *Service) attachWasmRegistryAuth(ctx context.Context, sandbox *models.Sa
 func (s *Service) persistSandboxCreate(ctx context.Context, sandbox *models.Sandbox) error {
 	if s == nil || s.store == nil {
 		return errors.New("store is not configured")
+	}
+	if digests := createRequestDigestsFrom(ctx); sandbox.CreateRequestDigest == "" && len(digests) > 0 {
+		sandbox.CreateRequestDigest = digests[0]
 	}
 	if strings.TrimSpace(sandbox.AuditIncarnationID) == "" {
 		incarnationID, err := s.prepareAuditIncarnation(ctx, sandbox.ID, sandbox.ToolboxToken)
@@ -3403,6 +3540,13 @@ func (s *Service) StartSandbox(ctx context.Context, id string) (*models.Sandbox,
 		if err != nil {
 			_ = s.mounts.UnmountAll(id)
 			releaseAdmission()
+			if capacity.IsNetworkExhaustion(err) {
+				// A full bridge refused the start the way admission
+				// would have: the sandbox is still stopped and a retry
+				// can start it, so it is not marked error.
+				s.invalidateWarm(id)
+				return nil, capacity.AsNetworkSlotExhausted(networkSlotPool(models.SandboxEngine(sandbox)), err)
+			}
 			_ = s.store.UpdateStatus(ctx, id, models.SandboxStatusError, err.Error())
 			s.invalidateWarm(id)
 			return nil, err
@@ -3530,12 +3674,16 @@ func (s *Service) DestroySandbox(ctx context.Context, id string) error {
 	if err != nil {
 		return err
 	}
-	// Leave the egress gateway only once the runtime is gone: a destroy that
-	// fails leaves the sandbox running, and still filtered, for the retry
-	// (review finding 3). The gateway's IP ownership check makes the late
-	// detach harmless if the IP was reused meanwhile (D5), and a new owner's
-	// Attach purges the old entry itself.
-	if err := rt.Destroy(ctx, sandbox); err != nil {
+	// Leave the egress gateway only once the workload is gone: a destroy
+	// that fails leaves the sandbox running, and still filtered, for the
+	// retry (review finding 3). And leave it before the address is free:
+	// the runtime calls the releaser between the two (containerd, a pause
+	// netns, Firecracker), so no other sandbox ever meets this one's
+	// gateway state. A runtime whose address goes with the container
+	// (Docker's IPAM) can't, and the teardown below detaches right after;
+	// there the gateway's IP ownership check (D5) and a new gateway-mode
+	// owner's own Attach purge cover the reuse.
+	if err := rt.Destroy(s.gatewayReleaserCtx(ctx, sandbox, false), sandbox); err != nil {
 		return err
 	}
 	// The runtime is gone: end its toolbox requests now, and again on the
@@ -5518,6 +5666,9 @@ func (s *Service) Capacity() capacity.Snapshot {
 		snap.LocalWasmModuleIDs = refs
 	}
 	snap.EgressGatewayReady = s.EgressGatewayReady()
+	// Network-slot pools: a peer with CPU and memory to spare can still be
+	// full for a runtime, and placement can only skip it if we say so.
+	snap.SlotPools = s.LocalSlotPools(context.Background())
 	// Observability-only engine tag (not a placement attribute).
 	if s.cfg.ContainerEngine != "" {
 		snap.ContainerEngine = s.cfg.ContainerEngine
@@ -5890,7 +6041,7 @@ func (s *Service) Reconcile(ctx context.Context) error {
 				if err != nil {
 					return err
 				}
-				if err := rt.Destroy(ctx, sandbox); err != nil {
+				if err := rt.Destroy(s.gatewayReleaserCtx(ctx, sandbox, false), sandbox); err != nil {
 					return err
 				}
 			}
@@ -6165,7 +6316,11 @@ func (s *Service) Reconcile(ctx context.Context) error {
 				Runtime:     runtimeName,
 				Engine:      engine,
 			}
-			err := rt.Destroy(ctx, stub)
+			// An orphan may be a create that died after an early gateway
+			// attach (egress_early.go); its stub carries no policy, so the
+			// releaser detaches whatever the gateway holds for it before the
+			// runtime frees the address (a no-op when it holds nothing).
+			err := rt.Destroy(s.gatewayReleaserCtx(ctx, stub, true), stub)
 			orphanDone(err)
 			if err != nil {
 				s.logger.Warn("orphan runtime removal failed",

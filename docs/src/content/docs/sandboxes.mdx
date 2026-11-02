@@ -246,6 +246,102 @@ Names make "get or create" safe to retry. Look the name up. If it is missing, cr
 
 An older server that does not support name lookup returns a normal list instead. Every SDK notices this and raises a "does not support sandbox name lookup" error. It never guesses which sandbox you meant. Use the ID with that server, or upgrade it.
 
+## Retry a create safely
+
+Every SDK sends a key with each create. It is called an idempotency key, and the server uses it to spot a create it has already seen.
+
+- **The SDK makes one for you.** If you do not pass a key, the SDK makes a random one for each create call. When the call fails part way, for example on a timeout, the SDK tries again on its own with the same key. The server then returns the sandbox the first try made, instead of making a second one.
+- **Pass your own key to retry the whole call.** The SDK's key lasts for one call. If your program stops and starts again, its next call gets a new key. To make that retry safe too, use a key that stays the same for the same job, such as an order number.
+- **One key, one request.** The same key with the same options returns the same sandbox. The same key with different options, such as another image, fails with status `422` and the code `idempotency_key_reused`. Send the first options again, or use a new key.
+- **Keys belong to your account.** Another account can use the same key.
+- **A key lasts as long as its sandbox.** After you delete the sandbox, the same key makes a new one.
+- **Only the first answer has the SSH key.** A repeated create returns the sandbox, but not its SSH private key.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    import { MicroVMApiError } from "@aerol-ai/aerolvm-sdk";
+
+    try {
+      const sandbox = await client.create({
+        image: "ubuntu:22.04",
+        idempotencyKey: "order-1234",
+      });
+      console.log(sandbox.id); // the same ID each time you send order-1234
+    } catch (err) {
+      if (!(err instanceof MicroVMApiError) || err.code !== "idempotency_key_reused") throw err;
+      console.error("order-1234 was already used with other options");
+    }
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    from microvm import MicroVMHTTPError
+
+    try:
+        sandbox = client.create(image="ubuntu:22.04", idempotency_key="order-1234")
+        print(sandbox.id)  # the same ID each time you send order-1234
+    except MicroVMHTTPError as err:
+        if err.code != "idempotency_key_reused":
+            raise
+        print("order-1234 was already used with other options")
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    sandbox, err := client.CreateWithIdempotencyKey(ctx, sdktypes.CreateSandboxOptions{
+        Image: "ubuntu:22.04",
+    }, "order-1234")
+    var apiErr *microvm.APIError
+    switch {
+    case errors.As(err, &apiErr) && apiErr.Code == "idempotency_key_reused":
+        log.Print("order-1234 was already used with other options")
+    case err != nil:
+        log.Fatal(err)
+    default:
+        fmt.Println(sandbox.ID) // the same ID each time you send order-1234
+    }
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    use aerolvm_sdk::{CreateOptions, Error};
+
+    match client.create(CreateOptions {
+        image: "ubuntu:22.04".into(),
+        idempotency_key: Some("order-1234".into()),
+        ..Default::default()
+    }) {
+        // The same ID each time you send order-1234.
+        Ok(sandbox) => println!("{}", sandbox.data.id),
+        Err(Error::Api(err)) if err.code() == Some("idempotency_key_reused") => {
+            eprintln!("order-1234 was already used with other options")
+        }
+        Err(err) => return Err(err.into()),
+    }
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    import ai.aerol.microvm.MicroVMApiException;
+
+    try {
+        Sandbox sandbox = client.create(new CreateOptions()
+            .setImage("ubuntu:22.04")
+            .setIdempotencyKey("order-1234"));
+        System.out.println(sandbox.id); // the same ID each time you send order-1234
+    } catch (MicroVMApiException e) {
+        if (!"idempotency_key_reused".equals(e.getCode())) {
+            throw e;
+        }
+        System.err.println("order-1234 was already used with other options");
+    }
+    ```
+  </TabItem>
+</Tabs>
+
+[Safe retries](/engineering-idempotency/#the-idempotency-key-header-v1-and-daytona) explains how the server keeps track of keys.
+
 ## Stop or delete it automatically
 
 A lifecycle tells the server when to stop or delete a sandbox for you. This example stops it after one hour with no activity, and deletes it 24 hours after it was created.

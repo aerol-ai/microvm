@@ -27,7 +27,7 @@ func TestCoverage95NetnsPoolSpawnAndAdopt(t *testing.T) {
 	if _, ok := pool.Adopt(context.Background(), "other"); ok {
 		t.Fatal("empty pool unexpectedly adopted a slot")
 	}
-	pool.ReleaseAdopted(context.Background(), adopted)
+	pool.client.releaseSandboxPause(context.Background(), adopted)
 }
 
 func TestCoverage95RemoveNetnsPausePaths(t *testing.T) {

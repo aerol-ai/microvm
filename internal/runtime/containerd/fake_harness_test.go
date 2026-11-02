@@ -211,6 +211,17 @@ type fakeContainer struct {
 	newTaskErr   error
 	specOverride *oci.Spec
 	setLabelsErr error
+	// mountCheck makes NewTask fail, as runc does, when a bind mount in
+	// specOverride names a host path that isn't there; onTaskStart runs (in
+	// a goroutine) each time a task of this container starts, with its spec.
+	mountCheck  bool
+	onTaskStart func(*oci.Spec)
+	onDelete    func()
+	specErr     error
+	// attaches counts Task calls that carried an IO attach; attachFIFOs,
+	// when set, is handed to that attach as containerd would.
+	attaches    int
+	attachFIFOs *cio.FIFOSet
 }
 
 func (c *fakeContainer) ID() string { return c.id }
@@ -245,29 +256,59 @@ func (c *fakeContainer) Info(context.Context, ...cntr.InfoOpts) (containers.Cont
 		Snapshotter: snapper,
 	}, nil
 }
-func (c *fakeContainer) Delete(context.Context, ...cntr.DeleteOpts) error { return nil }
+func (c *fakeContainer) Delete(context.Context, ...cntr.DeleteOpts) error {
+	if c.onDelete != nil {
+		c.onDelete()
+	}
+	return nil
+}
 func (c *fakeContainer) NewTask(context.Context, cio.Creator, ...cntr.NewTaskOpts) (cntr.Task, error) {
 	if c.newTaskErr != nil {
 		return nil, c.newTaskErr
 	}
+	if c.mountCheck && c.specOverride != nil {
+		for _, m := range c.specOverride.Mounts {
+			if m.Type != "bind" {
+				continue
+			}
+			if _, err := os.Stat(m.Source); err != nil {
+				return nil, fmt.Errorf("failed to create shim task: OCI runtime create failed: runc create failed: unable to start container process: error during container init: failed to fulfil mount request: open %s: no such file or directory", m.Source)
+			}
+		}
+	}
 	if c.task == nil {
 		c.task = &fakeTask{status: cntr.Running}
+	}
+	if c.onTaskStart != nil {
+		spec, hook := c.specOverride, c.onTaskStart
+		c.task.onStart = func() { hook(spec) }
 	}
 	return c.task, nil
 }
 func (c *fakeContainer) Spec(context.Context) (*oci.Spec, error) {
+	if c.specErr != nil {
+		return nil, c.specErr
+	}
 	if c.specOverride != nil {
 		return c.specOverride, nil
 	}
 	return &oci.Spec{}, nil
 }
-func (c *fakeContainer) Task(context.Context, cio.Attach) (cntr.Task, error) {
+func (c *fakeContainer) Task(_ context.Context, attach cio.Attach) (cntr.Task, error) {
 	if c.taskErr != nil {
 		return nil, c.taskErr
 	}
 	if c.task == nil {
 		// containerd's loadTask wraps the task service's NotFound this way.
 		return nil, fmt.Errorf("no running task found: %w", errdefs.ErrNotFound)
+	}
+	if attach != nil {
+		c.attaches++
+		if c.attachFIFOs != nil {
+			if _, err := attach(c.attachFIFOs); err != nil {
+				return nil, err
+			}
+		}
 	}
 	return c.task, nil
 }
@@ -311,6 +352,8 @@ type fakeTask struct {
 	pids      []cntr.ProcessInfo
 	pauseErr  error
 	startErr  error
+	onStart   func()
+	killed    int
 }
 
 func (t *fakeTask) Pid() uint32 { return 0 }
@@ -320,13 +363,19 @@ func (t *fakeTask) Start(context.Context) error {
 		return t.startErr
 	}
 	t.status = cntr.Running
+	if t.onStart != nil {
+		go t.onStart()
+	}
 	return nil
 }
 func (t *fakeTask) Delete(context.Context, ...cntr.ProcessDeleteOpts) (*cntr.ExitStatus, error) {
 	t.status = cntr.Stopped
 	return &cntr.ExitStatus{}, nil
 }
-func (t *fakeTask) Kill(context.Context, syscall.Signal, ...cntr.KillOpts) error { return nil }
+func (t *fakeTask) Kill(context.Context, syscall.Signal, ...cntr.KillOpts) error {
+	t.killed++
+	return nil
+}
 func (t *fakeTask) Pause(context.Context) error {
 	if t.pauseErr != nil {
 		return t.pauseErr

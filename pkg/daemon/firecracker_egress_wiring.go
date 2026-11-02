@@ -74,6 +74,7 @@ func wireFirecrackerEgress(ctx context.Context, cfg config.Config, logger *slog.
 		stopIsolation()
 		return nil, fmt.Errorf("firecracker egress: bootstrap %s: %w", netrules.ChainAerolvmFC, err)
 	}
+	prepareBlockSets(rules, netrules.ChainAerolvmFC, logger)
 	d.SetNetRules(rules)
 	d.SetTapSubnet(subnet.Masked())
 	logger.Info("firecracker egress: NAT, isolation and per-guest firewall ready", "tap_subnet", subnet.Masked().String(),

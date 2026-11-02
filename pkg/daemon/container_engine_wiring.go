@@ -49,6 +49,7 @@ func wireContainerEngine(ctx context.Context, cfg config.Config, logger *slog.Lo
 	if err := ctdRules.EnsureChain(); err != nil {
 		return nil, fmt.Errorf("bootstrap AEROLVM-USER chain: %w", err)
 	}
+	prepareBlockSets(ctdRules, netrules.ChainAerolvmUser, logger)
 	reassertStop := startChainReassert(ctx, ctdRules, logger)
 	driver := cntr.New(cntr.FromDaemonConfig(cfg), ctdRules, logger)
 	// Same cluster-PAT pull credential the docker client got in Run (see
@@ -101,6 +102,7 @@ func startChainReassert(ctx context.Context, rules *netrules.Manager, logger *sl
 				if err := rules.ReassertChain(); err != nil {
 					logger.Warn("re-assert AEROLVM-USER chain failed", "error", err)
 				}
+				reassertBlockSets(rules, logger)
 			}
 		}
 	}()

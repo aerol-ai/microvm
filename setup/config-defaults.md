@@ -28,8 +28,10 @@ feature is still mid-rollout.
 | `SB_ENABLE_EVENT_MONITOR` | true. Also what ends a toolbox request (an exec, a file transfer, a session) the moment its container sandbox dies: the die/destroy event answers it 409 instead of leaving it to the connection timeout below. |
 | `SB_TOOLBOX_DEAD_PEER_TIMEOUT` | `30s` — how long a toolbox connection (exec, file transfer, session, SSH-gateway shell) lives on once its sandbox stops answering without closing it, as a killed gVisor sandbox or Firecracker VM does. Keepalive probes start after 15s idle, every 5s, and the third unanswered one ends it; `TCP_USER_TIMEOUT` (Linux) 30s also bounds data the sandbox never acknowledges. A live sandbox's kernel answers the probes, so a command that runs for hours with no output is never cut. What it does cut is a sandbox that answers nothing for the whole bound while still existing: raise it if your sandboxes are paused (a gVisor or Firecracker snapshot) for longer. `0` = off (Go's default keepalive, about 2.5 minutes; about 15 minutes for unacknowledged data); otherwise at least `6s`, or the boot is refused. |
 | `SB_ENABLE_SSH_GATEWAY` | true |
+| `SB_LIVENESS_SOCKET` | `/run/sandboxd/live.sock` — the Unix socket (root `0600`) the install.sh watchdog (`sandboxd-healthcheck`) probes: `GET /livez` answers `200` with the phase (`booting`, `serving`, `stopping`) from its own listener, with no I/O and no lock, from the first moment of the boot. It is liveness only; `/health` stays the readiness check (store, engines, Caddy). The watchdog restarts sandboxd only after 3 failed liveness probes in a row of one daemon run over at least 90 s, never in the daemon's first 120 s and never while a start, stop or restart is under way. `off` closes the socket, and the watchdog then probes `/health` with the same rule. Must be absolute. |
 | `SB_ENABLE_SERVERLESS` | true — wake path on out of the box |
 | `SB_DOCKER_READY_SOCKET_ENABLED` | true |
+| `SB_DOCKER_BRIDGE_SLOTS` | `0`: the docker engine's bridge slot pool is sized at boot from the sandbox network (min(1,023 bridge ports, usable addresses) − 23 headroom − the pause-netns pool depth; 1,000 on a stock `docker0`), so a full bridge is a 503 capacity refusal and placement skips the node instead of dockerd failing the start. A set value replaces the derivation and is clamped to what the network holds. See "Per-node slot limits" below. |
 | `SB_IMAGE_BUILD_GC_ENABLED` | true — both image janitors |
 | `SB_WASM_MODULE_GC_ENABLED` | true |
 | `SB_WASM_POOL_ENABLED` | true — warm-worker pool |
@@ -53,7 +55,7 @@ feature is still mid-rollout.
 ## 🔴 Must stay off — security / safety
 | Env var | Why off is correct |
 |---|---|
-| `SB_ENTERPRISE_MODE` | Opt-in fail-fast profile; local development keeps its lightweight defaults. Production deployments should enable it. Requires an `SB_PAT_TOKEN` of at least 32 bytes, and named credentials for people (`plans/identity-and-access.md` §5.12): `SB_IDENTITY_ENABLED=true` (tokens-only is enough; an identity file is optional, so air-gapped installs work), `SB_PAT_SCOPE=host`, an `SB_TOKEN_MAX_TTL` of at most 90 days, `SB_AUDIT_API_RECORDS` not `off`, and `SB_AUDIT_API_DURABLE` not `false`. With an external `SB_SECRET_PROVIDER` it also requires `SB_SECRET_PROVIDER_STRICT_BOOT=true` and a hardware PKCS#11 slot, and warns at boot (and fires `SandboxdServerKeyPlaintext`) while `SB_CREDENTIAL_KEY_CUSTODY=file`; the next release refuses that (plans/customer-key-custody.md §7, F2). |
+| `SB_ENTERPRISE_MODE` | Opt-in fail-fast profile; local development keeps its lightweight defaults. Production deployments should enable it. Requires an `SB_PAT_TOKEN` of at least 32 bytes, and named credentials for people (`plans/identity-and-access.md` §5.12): `SB_IDENTITY_ENABLED=true` (tokens-only is enough; an identity file is optional, so air-gapped installs work), `SB_PAT_SCOPE=host`, an `SB_TOKEN_MAX_TTL` of at most 90 days, `SB_AUDIT_API_RECORDS` not `off`, and `SB_AUDIT_API_DURABLE` not `false`. With an external `SB_SECRET_PROVIDER` it also requires `SB_SECRET_PROVIDER_STRICT_BOOT=true` and a hardware PKCS#11 slot, and `SB_CREDENTIAL_KEY_CUSTODY=wrapped` (plans/customer-key-custody.md §7, F2; the release before only warned). |
 | `SB_CONTAINER_PRIVILEGED` | Privileged containers = sandbox escape. |
 | `SB_CLUSTER_INSECURE_GOSSIP` | Disables gossip encryption. |
 | `SB_CLUSTER_INSECURE_CREDENTIALS` | Disables credential protection. |
@@ -121,6 +123,49 @@ Whole-chain verification no longer runs on every page read. It runs at boot, bef
 
 `vault` is accepted as a known name but **fails boot** with a not-implemented error (no silent fallback to local).
 
+## API overload protection (SB_API_LIST_*)
+
+A cluster-wide sandbox list (`GET /v1/sandboxes`, and the Daytona, E2B and
+Runloop lists) fans out: a placement-page read from the control plane and one
+request per owner node. Each node runs only so many at once; past that a list
+waits briefly for a slot and is otherwise answered `503` + `Retry-After: 1`
+with code `overloaded`, instead of queueing until it takes 30 s and the node
+falls over (bank flagship ramp, 2026-11-01: 1024 concurrent list clients gave
+a 37 s p99 and 5,081 `502`s from a node the watchdog restarted). A single node
+(cluster off) and a peer's forwarded list hop are never gated. Concurrent
+identical placement-page reads on a node share one control-plane request, and
+each still comes from a read that began after its caller asked.
+
+The slots are shared fairly between tenants. A tenant is the owner a
+credential acts for (a team for `avm_` team tokens and OIDC identities, the
+account for a managed identity), never the token, so minting more tokens buys
+no more share; every unscoped caller (the PAT, fleet-wide tokens) is the one
+`operator` tenant. A tenant may hold at most its share of a node's slots.
+When lists must wait, freed slots go to waiting tenants in turn (round-robin),
+not first come first served, so a quiet tenant waits at most one turn of each
+other waiting tenant, not behind a noisy tenant's hundreds of lists. A list refused
+because its own tenant holds its share gets `429` + `Retry-After: 1` with
+code `rate_limited`; a list refused because the node is full while its tenant
+is within its share keeps `503` `overloaded`. Either refusal comes only after
+the queue wait, so a client that ignores `Retry-After` still makes at most two
+requests a second per connection.
+
+| Env var | Default | Notes |
+|---|---|---|
+| `SB_API_LIST_MAX_INFLIGHT` | `16` | Cluster-wide lists this node runs at once. Matches the cluster transport's 16 pooled connections per peer, so list fan-out reuses mTLS connections rather than opening new ones. A healthy list holds its slot for milliseconds, so 16 slots serve thousands of lists a second and fill only when owners or the control plane slow down. Raise it on nodes with more CPU. `0` = no limit (the behaviour before this setting). Anything but a whole number refuses the boot. |
+| `SB_API_LIST_MAX_INFLIGHT_PER_TENANT` | a quarter of `SB_API_LIST_MAX_INFLIGHT`, at least 1 (`4` by default) | How many of a node's list slots one tenant may hold. With the default, one tenant's burst runs 4 lists at once and three quarters of the node stay free for everyone else. Raise it for few tenants with bursty but legitimate list traffic; the node limit still applies. `0` = no per-tenant share (one tenant may take every slot; turns stay round-robin). More than `SB_API_LIST_MAX_INFLIGHT`, or anything but a whole number, refuses the boot; ignored when `SB_API_LIST_MAX_INFLIGHT=0`. |
+| `SB_API_LIST_QUEUE_WAIT` | `500ms` | How long a list waits for a free slot before it is refused (`503`, or `429` when its tenant holds its share). Short on purpose: inside every SDK's own retry backoff (they retry `503` up to 3 times, about 1-1.75 s in all). `0` = refuse at once. |
+
+Metrics (none labelled by tenant): `aerolvm_api_list_inflight`,
+`aerolvm_api_list_queued`, `aerolvm_api_list_tenants` (tenants with a list in
+flight or queued), `aerolvm_api_list_admitted_total`,
+`aerolvm_api_list_shed_total` (`503`, alert `SandboxdAPIListShedding`),
+`aerolvm_api_list_rate_limited_total` (`429`, alert
+`SandboxdAPIListTenantRateLimited`), and the configured
+`aerolvm_api_list_max_inflight` and `aerolvm_api_list_max_inflight_per_tenant`.
+Which tenants: `GET /debug/vars` (fleet admin only) has `api_list_gate`, the
+gate's totals and its 10 busiest tenants by name, most refused first.
+
 ## Audit export connectors (SB_AUDIT_EXPORT_BACKEND)
 
 Modeled on kube-apiserver's audit backends (`plans/audit-export-connectors.md`):
@@ -161,7 +206,8 @@ this schema as a coordinated, one-way change.
 Create, delete, exec, file, port, snapshot and token calls each write one
 hash-chained `api` record naming the caller (`plans/identity-and-access.md`
 §5.9): `ref` is the route pattern, `request` holds the method, status, the
-exec body's SHA-256, and the object a non-sandbox route acts on. Only the node
+exec body's keyed digest (`SB_AUDIT_EXEC_COMMAND`), and the object a
+non-sandbox route acts on. Only the node
 that runs the handler records; a forwarded call is recorded by its owner with
 the edge as `caller.via`. Refused calls are records too: a 403 is an `api`
 record with `result: denied`; a refused credential (401) is an `auth_denied`
@@ -182,7 +228,7 @@ before flood control, inside the existing retention and export.
 | `SB_AUDIT_API_RECORDS` | `mutations` | `mutations` records every non-GET call, every toolbox call (file reads too: files can hold secrets), token listing and every refused call. `all` adds plain GETs. `off` records none and costs nothing per request (refused in enterprise mode). `cluster.internal` traffic, `/health` and the outer `/mcp` request are never recorded; each MCP tool's inner call records itself with `request.surface: mcp`. |
 | `SB_AUDIT_API_FLOOD_CONTROL` | `budget` | `budget`: a token bucket per (sandbox, caller); calls over it are counted into one `rate_limited` record naming the caller, the count (`dropped`) and the routes. `coalesce`: identical calls (same caller, route, sandbox, status, digest) within one second become one record with `request.count`; different commands never merge, and nothing is capped. `both`: coalesce, then budget. A node hosting sandboxes of more than one owner always budgets: `coalesce` runs as `both` there, and every change of the effective mode writes an `api_flood_mode` record. Gauge: `aerolvm_audit_api_flood_mode{key=<configured>,key2=<effective>}`. Records with no sandbox (token and cluster admin calls), durable records, secret opens and gap markers are never budgeted. |
 | `SB_AUDIT_API_RATE` / `SB_AUDIT_API_BURST` | `20` / `100` | The budget above, per (sandbox, caller): a caller keeps one record per call for bursts up to the burst size, then this rate. `aerolvm_audit_api_rate_limited_total` counts the calls folded into `rate_limited` records. |
-| `SB_AUDIT_EXEC_COMMAND` | `digest` | `digest` records the SHA-256 of an exec request body, hashed as it streams (never buffered): it proves which command ran without recording it, because commands carry secrets. `full` also records the argv (never the environment), read from the first 64 KiB of the body. |
+| `SB_AUDIT_EXEC_COMMAND` | `digest` | `digest` records a keyed digest of an exec request body, `hmac:<key id>:<hex>`: an HMAC-SHA256, under a key derived from the current server key, of the body's SHA-256, hashed as it streams (never buffered). It proves which command ran without recording it, because commands carry secrets, and a reader of the log or its exports cannot test a guessed secret against it. Identical bodies get the same digest on every node until the server key is rotated. With the server key revoked the record carries no digest. Records from older releases keep their plain SHA-256. `full` also records the argv (never the environment), read from the first 64 KiB of the body. |
 | `SB_AUDIT_API_DURABLE` | `false` (`true` in enterprise mode, which refuses `false`) | Token create, token revoke and sandbox delete wait for their record to reach disk. Off by default to keep fsync off the request path. Without it, an unclean crash can lose the records of the last sync interval (1 s), the same window secret-open records have. |
 
 ## Audit witness (SB_AUDIT_WITNESS_BACKEND)
@@ -232,7 +278,7 @@ Terraform creates one with `audit_witness_enabled = true` (lock mode
 | `SB_CONTAINERD_CNI_CONF_PATH` | Bridge conflist path; default `/etc/cni/net.d/aerolvm.conflist`. Auto-generated at boot (bridge + host-local + `ipMasq`) if absent; an operator-provided file is never clobbered. |
 | `SB_CONTAINERD_BUILDKIT_ADDR` | buildkitd control socket for image builds on the containerd engine; default `unix:///run/buildkit/buildkitd.sock`. The bootstrap installs buildkitd with a containerd worker pinned to the aerolvm namespace, so built images land where the driver can run them. Only used when `SB_CONTAINER_ENGINE=containerd`. |
 | `SB_CONTAINERD_NETNS_POOL_DEPTH` | Number of netns slots the refiller keeps pre-realized (warm) for fast-hit creates; default `4`. This is the WARM target, NOT the concurrency ceiling — see `SB_CONTAINERD_NETNS_POOL_SIZE`. Only relevant when `SB_CONTAINERD_NATIVE_NETNS_POOL_ENABLED=true`. |
-| `SB_CONTAINERD_NETNS_POOL_SIZE` | TOTAL netns slots seeded at boot = the ceiling on concurrent containerd sandboxes per node; default `256` (decoupled from the warm depth, exactly like `SB_FIRECRACKER_TAP_POOL_SIZE` is decoupled from the warm VMM depth). Cold creates reserve+realize any free slot up to this size; the refiller only pre-realizes `_DEPTH` of them. Floored to `_DEPTH` if set lower. Historically this was conflated with `_DEPTH`, which capped every node at 4 concurrent sandboxes. Only relevant when `SB_CONTAINERD_NATIVE_NETNS_POOL_ENABLED=true`. |
+| `SB_CONTAINERD_NETNS_POOL_SIZE` | TOTAL netns slots seeded at boot = the ceiling on concurrent containerd sandboxes per node; default `256` (decoupled from the warm depth, exactly like `SB_FIRECRACKER_TAP_POOL_SIZE` is decoupled from the warm VMM depth). Cold creates reserve+realize any free slot up to this size; the refiller only pre-realizes `_DEPTH` of them. Floored to `_DEPTH` if set lower. Historically this was conflated with `_DEPTH`, which capped every node at 4 concurrent sandboxes. runc and gVisor share it; keep it at or below 1,023 (one bridge's port limit). Sizing per host: "Per-node slot limits" below. Only relevant when `SB_CONTAINERD_NATIVE_NETNS_POOL_ENABLED=true`. |
 | `SB_CONTAINERD_NETNS_POOL_REFILL_INTERVAL` | netns pool refill ticker; default `2s`. |
 | `SB_CONTAINERD_POOL_DEPTH` | Warm containers per image key; default `2`. Only relevant when `SB_CONTAINERD_POOL_ENABLED=true`. |
 | `SB_CONTAINERD_POOL_IMAGES` | Comma-separated image allowlist to pre-warm; default empty. |
@@ -259,7 +305,7 @@ via Terraform/Ansible — do not flip the code default on.
 | Env var | Status |
 |---|---|
 | `SB_DOCKER_POOL_ENABLED` | SHIPPED & VERIFIED v0.5.33 (2026-07-11): warm-hit p50 **43ms**, beats the ≤100ms gate. Holds pre-started containers resident; enabling also widens `DockerReadySocketEffective`. See `plans/docker-warm-pool.md` §12. |
-| `SB_DOCKER_NETNS_POOL_ENABLED` | Companion pause-netns pool shipped/deployed (PR #300, v0.5.30–32). Terraform plumbs it per-node. |
+| `SB_DOCKER_NETNS_POOL_ENABLED` | Companion pause-netns pool shipped/deployed (PR #300, v0.5.30–32). Terraform plumbs it per-node. With it off (or empty), a Docker create with network rules starts a pause container of its own so its rules are on before its workload runs (`docker_pause` stage); `SB_DOCKER_NETNS_POOL_PAUSE_IMAGE` (default `registry.k8s.io/pause:3.10`) is that container's image too, pulled in the background at boot, so an air-gapped node must point it at a mirror. |
 
 ## 🟠 Mid-rollout / not soaked — flip only with soak data
 | Env var | Status |
@@ -268,8 +314,9 @@ via Terraform/Ansible — do not flip the code default on.
 | `SB_HTTP_WAKE_DIRECT_BYPASS_ENABLED` | Being canaried (`plans/warm-direct-route-bypass.md`). |
 | `SB_L4_WAKE_DIRECT_BYPASS_ENABLED` | Ships only after HTTP has been default-on for two cycles. |
 | `SB_CONTAINERD_NATIVE_NETNS_POOL_ENABLED` | Turns on Phase-2 CNI container networking for the containerd engine (netns pool + CNI ADD/DEL + `AEROLVM-USER` chain). Code-flag default is off (docker hosts), but **containerd deployments enable it** (`config/cluster.yml`, Terraform, Ansible all set it `true`) — and since server deployments now default to containerd, it is on by default there. The §8 exit gates (neighbor isolation, orphan=0, live bench) passed on the t3 containerd topology (`cluster-3-mixed-containerd`); still un-proven on metal/arm64, so validate those before relying on them. Requires `SB_CONTAINER_ENGINE=containerd` + CNI plugin binaries. |
-| `SB_INGRESS_PROXY_ROUTING` | Routing without per-sandbox Caddy writes (`plans/ingress-proxy-routing.md`). Each per-sandbox write reloads Caddy's whole config and drops ~2.6% of new connections under churn. With the flag on, Caddy holds static routes and asks a loopback sandboxd DNS responder where each host goes. Raw TCP host ports move to kernel DNAT, so sessions survive sandboxd restarts. **Default off** because the flip has host prerequisites: the `~rt.internal` resolver routing domain on ingress nodes (`install.sh --ingress-proxy-routing`), iptables, and `SB_AUTO_RECONCILE` on workers. The flag refuses to engage without them and the node stays on Caddy routes. Engaging is one Caddy load. Turning the flag off is detected on the next boot through the `ingress_proxy_routing_last_enabled` marker and rolled back in one load. Per-node, no flag-day. Flip only after the churn repro gate shows 0 failures. |
-| `SB_ROUTE_DNS_ADDR` | `127.0.0.1:53053`: the route responder's loopback address. The static Caddy routes and the resolver routing domain both point here; change all three together. |
+| `SB_INGRESS_PROXY_ROUTING` | Routing without per-sandbox Caddy writes (`plans/ingress-proxy-routing.md`). Each per-sandbox write reloads Caddy's whole config and drops ~2.6% of new connections under churn. With the flag on, Caddy holds static routes and asks a loopback sandboxd DNS responder where each host goes. Raw TCP host ports move to kernel DNAT, so sessions survive sandboxd restarts. **Default off** because the flip has host prerequisites: the `~rt.internal` resolver routing domain on ingress nodes (`install.sh --ingress-proxy-routing`), iptables, and `SB_AUTO_RECONCILE` on workers. The flag refuses to engage without them and the node stays on Caddy routes. Engaging is one Caddy load. Turning the flag off is detected on the next boot through the `ingress_proxy_routing_last_enabled` marker and rolled back in one load. Per-node, no flag-day. Flip only after the churn repro gate shows 0 failures. `cluster-bank-flagship` runs it on (a reload drops new connections in two ways that no Caddy setting turns off; TODOS.md has the mechanism), and the default flips after that run is green and the A/B is in. |
+| `SB_ROUTE_DNS_ADDR` | `127.0.0.1:53053`: the route responder's loopback address. The static owner route and the boot probes ask it directly; change both together. |
+| `SB_ROUTE_DNS_LINK_ADDR` | Empty: a second responder listener, on the `aerolvm-rt` link's own address, which is where systemd-resolved sends `*.rt.internal`. `install.sh --ingress-proxy-routing` sets `169.254.53.53:53053` and points the link's DNS server at the same address. Not loopback, because resolved pins its socket for a link's DNS server to that link: a UDP query to `127.0.0.1` leaves through the dummy link and is dropped, and resolved then stalls lookups for about 20 s each time it re-probes UDP, failing new connections through the ingress with EOF (cluster-bank-flagship UC-171, 2026-11-01). The listener answers only this node (loopback, or its own address). An ingress engaging the flag without it logs a warning. |
 | `SB_HOSTPORT_REDIRECT_PORT` | `21215`: the listener that REDIRECTed raw-TCP host ports reach, for targets the kernel can't DNAT to (a stopped serverless sandbox to wake, WASM/isolate loopback mediators). It must sit outside `SB_L4_PORT_RANGE_*`; config load refuses it otherwise. |
 | `SB_MCP_ENABLED` | Mounts the remote MCP endpoint `/mcp` (`plans/mcp-server-and-agent-cli.md` §5.7): MCP clients reach a pinned sandbox over Streamable HTTP with an API token, no local install. **Default off** because it is a new public surface on the API listener; turn it on per deployment once the "Remote MCP" dashboard row and `SandboxdRemoteMCPErrorRate` alert are wired. Companion settings: `SB_MCP_ALLOWED_ORIGINS` (browser origins allowed; default none, so any request carrying an `Origin` is refused), `SB_MCP_ALLOWED_HOSTS` (optional `Host` allowlist), `SB_MCP_RATE_LIMIT` (per-token req/s, default 20, burst 2x; 0 disables). OAuth for claude.ai/ChatGPT connectors is a later phase; this is bearer-only. Runbook: `setup/runbooks/remote-mcp.md`. |
 | `SB_IDENTITY_ENABLED` | Turns on sandboxd's own named credentials (`plans/identity-and-access.md`): scoped API tokens (`avm_…`, minted with `POST /v1/tokens` or `aerolvm token create`) and SSO through an identity provider when `SB_IDENTITY_FILE` names one. **Default off**: off is byte for byte the PAT-only server, which every existing install relies on; tokens can still be minted, listed and revoked, but no node accepts them, and no node loads or mirrors them. It cannot run next to a control-plane provider that validates tokens itself (boot refuses). The test-only `SB_ITEST_IDENTITY_FILE` is gone: the variable is ignored. Enterprise mode requires it (boot refuses `SB_ENTERPRISE_MODE=true` without it); tokens-only mode, with no `SB_IDENTITY_FILE`, satisfies that. Docs: `docs/src/content/docs/enterprise/sso.mdx`. |
@@ -283,6 +330,37 @@ via Terraform/Ansible — do not flip the code default on.
 | `SB_OPERATOR_VOLUME_SCOPE` | Empty (the legacy `op-<hash of the PAT>`): the operator's platform-volume namespace. Pin it to the value boot logs (`operator volume scope scope=op-… pinned=false`) before rotating the PAT, so volumes stay where they are. Empty keeps every existing install's volumes in place. Format: `op-` and up to 61 of `a-z 0-9 . _ -`. |
 | `SB_L4_FALLBACK_PROXY_PROTOCOL` | `false`: the caddy-l4 TLS fallback sends a PROXY v2 header to the 8443 HTTPS site, so Caddy sees the real client and passes it to sandboxd as `X-AerolVM-Client-IP` (for `auth_denied` records, their per-address limit, and the `origin` label of the break-glass PAT alert). **Default off** because it needs the 8443 `proxy_protocol` listener wrapper: on without it, every public HTTPS handshake fails. Only `install.sh --l4-proxy-protocol` (domain mode) turns it on, writing the wrapper and the flag together. sandboxd trusts the header only from the public socket or a loopback peer; anything else is dropped and counted in `aerolvm_auth_client_ip_dropped_total`. To undo: set it `false` and restart **before** removing the wrapper. |
 | `SB_CONTAINERD_POOL_ENABLED` | Turns on the Phase-3 containerd warm-container pool (rename-free park/adopt). Default-off **ship-dark**; also widens the ready-socket gate like `SB_DOCKER_POOL_ENABLED`. Requires `SB_CONTAINER_ENGINE=containerd` + `SB_DOCKER_READY_SOCKET_ENABLED=true`. Gated on the §8 warm-hit bench. |
+
+## Per-node slot limits (capacity planning)
+
+Besides CPU, memory and disk, every sandbox holds one network slot on its node
+until it is destroyed (stopped sandboxes keep theirs, so their address
+survives a restart; the docker engine's bridge is the exception, below). The
+pools are fixed at boot, so on a big host a pool, not
+the CPU or memory budget, is often what fills first. The 2026-11-01 bank
+flagship density ramp stopped every m5zn.metal worker (48 vCPU, 192 GiB) at
+256 containerd + gVisor sandboxes and 256 Firecracker VMs, while the CPU
+budget at the default ratios (48 × 0.9 × 10 = 432 vCPU) still had room for
+1,728 sandboxes of 0.25 vCPU. The 2026-11-02 single-node-fc run (one
+m5zn.metal, docker engine) started exactly 1,023 docker sandboxes, then
+dockerd failed every start with "failed to set up container networking": the
+`docker0` bridge was full, and nothing counted it.
+
+A full pool is a capacity refusal: the create answers 503 with `Retry-After`
+(the pool's error wraps `capacity.ErrCapacityExceeded`), each worker reports
+its pools and free slots as `slot_pools` on `/v1/capacity`, and cluster
+placement skips a node whose pool for the request's runtime is full. When
+every node that could run the request is full, the cluster answers 503 "at
+capacity" (`docs/src/content/docs/engineering-placement-failover.mdx`, section
+"Network slots").
+
+| Pool | Setting | Default | Who draws on it | Hard ceiling and why | Cost per slot | Recommendation |
+|---|---|---|---|---|---|---|
+| containerd netns | `SB_CONTAINERD_NETNS_POOL_SIZE` | `256` | runc (`docker`) **and** gVisor creates on the containerd engine — one shared pool; also warm-parked containers (`SB_CONTAINERD_POOL_*`) and slots parked `releasing` after a failed teardown | **1,023**: every slot is a veth on the one `aerolvm0` bridge, and a Linux bridge numbers ports with 10 bits (`BR_MAX_PORTS` 1024, port 0 unused). Past it CNI ADD fails with "exchange full"; boot logs a warning when the size is set higher. Address space is not the limit (`10.88.0.0/16`, 65,534 addresses); the seed refuses more than 10,000. | a netns, a veth pair, a host-local lease, and the bridge plugin's `ipMasq` chain (3 nat rules, so `POSTROUTING` grows by one jump per slot). conntrack entries follow connections, not slots. | Keep `256` as the code default: on most hosts the CPU budget fills first (an m6i.xlarge's 36-vCPU budget holds 144 sandboxes of 0.25 vCPU). On a large host set it to the number of the smallest sandbox the CPU and memory budgets admit, capped at **1,000** (headroom under 1,023 for warm and prewarmed slots). For the m5zn.metal flagship workers: `1000`. |
+| Firecracker TAP | `SB_FIRECRACKER_TAP_POOL_SIZE` (with `SB_FIRECRACKER_TAP_BASE_CIDR`) | `256` (in `172.16.0.0/20`) | Firecracker creates; warm VMMs (`SB_FIRECRACKER_VMM_POOL_*`) hold theirs | the base CIDR: one `/30` per slot, so the default `/20` holds **1,024**; boot refuses a size the CIDR cannot hold. TAPs are routed, not bridged, so there is no bridge-port wall. Each slot also takes a vsock CID and a `fctapN` name; the seed refuses more than 10,000. | a TAP device and a `/30` route; the isolation rules are per subnet, not per TAP. The VM's guest memory is the real cost, and the memory budget, live-memory floor and `SB_FIRECRACKER_RSS_WATERMARK_RATIO` already bound it. | Keep `256` as the code default. On a metal Firecracker host set it to what the memory budget admits for your smallest VM, up to `1024` within the default `/20`; beyond that widen `SB_FIRECRACKER_TAP_BASE_CIDR` (a `/19` holds 2,048) **before** the first boot, because a re-seed keeps the old layout. For the m5zn.metal flagship workers: `1024`. |
+| isolate egress | `SB_ISOLATE_EGRESS_POOL_SIZE` | `64` | isolate sandboxes that may reach the network (block-all ones take no slot), **per tenant group per node**, not per node | none in practice: a slot is a Unix socket path, bound only while a sandbox holds it, and one declared service in that group's workerd config | one listener goroutine while held; the generated group config grows by one service per slot | Raise it when one tenant runs more than 64 egress-using isolates on one node. Because the pool is per group, it is not in `slot_pools`: a create that needs a slot in a full group is refused with the 503 capacity error (before, it started with egress silently denied), and the retry may land on another node. |
+| WASM instances | `SB_WASM_MAX_INSTANCES` | `0` (no cap) | WASM creates | only what the operator sets; WASM networking is host-mediated, so there is no per-sandbox address | the module instance itself | Leave uncapped unless you need a hard per-host count; when set, it is advertised in `slot_pools` and placement honours it. |
+| docker bridge (`docker_bridge`) | `SB_DOCKER_BRIDGE_SLOTS` | `0` = derived at boot: **1,000** on a stock `docker0` | runc (`docker`) and gVisor creates on the docker engine, one shared pool; also parked warm containers (`SB_DOCKER_POOL_*`). Unlike the pools above, a **stopped** sandbox holds no slot: dockerd removes its veth on stop, and a start takes one again through admission. | **1,023**: the sandbox network (`SB_DOCKER_NETWORK`, default `bridge` → `docker0`) is one Linux bridge, and the 1,024th veth fails the container start with "exchange full". The subnet is the smaller limit only when it is small: `docker0`'s `/16` has 65,533 usable addresses, a `/24` has 253, and dockerd's `fixed-cidr` (the network's IP range) narrows it further. Derived as min(1,023 if bridged, usable addresses) − 23 headroom − `SB_DOCKER_NETNS_POOL_DEPTH` when the pause-netns pool is on. | a veth on the bridge and an address; nothing to seed, the admitter counts its own reservations, so a restart recounts from the store. | Keep the derived default. The 23 ports of headroom are for what attaches without a reservation: the `RUN` steps of image builds (dockerd's builder joins them to the default bridge), a container started by hand, a teardown in flight. Set `SB_DOCKER_BRIDGE_SLOTS` lower to hold a host under its CPU budget, or up to the limit (it is clamped there) on a host that never builds images. Past ~1,000 sandboxes on one host, use the containerd engine with Firecracker or more hosts; sharding the docker engine across bridges is not built. |
 
 ## Client settings (the five SDKs and the aerolvm CLI)
 

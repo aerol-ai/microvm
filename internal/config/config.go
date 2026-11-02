@@ -514,6 +514,15 @@ type Config struct {
 	// DockerNetnsPoolRefillInterval drives the refill/reap loop.
 	// SB_DOCKER_NETNS_POOL_REFILL_INTERVAL.
 	DockerNetnsPoolRefillInterval time.Duration
+	// DockerBridgeSlots caps how many docker-engine sandboxes (and parked
+	// warm containers) this node runs on its sandbox bridge; past it a
+	// create is a 503 capacity refusal instead of dockerd failing the start
+	// on a bridge whose 1,023 ports are all taken. 0 (the default) derives
+	// it at boot from the network: min(1,023 bridge ports, the subnet's
+	// usable addresses), minus headroom for what attaches without a
+	// reservation and minus the pause-netns pool. A set value is clamped to
+	// what the network holds. SB_DOCKER_BRIDGE_SLOTS.
+	DockerBridgeSlots int
 	// DockerToolboxLoopback publishes each Docker sandbox's toolbox port on
 	// 127.0.0.1 (a Docker-assigned host port, nothing else published) and has
 	// sandboxd reach toolboxd there instead of at ContainerIP:ToolboxPort.
@@ -1132,6 +1141,16 @@ type Config struct {
 	// See plans/data-plane-load-balancer.md.
 	// SB_INGRESS_ADVERTISE_HOST.
 	IngressAdvertiseHost string
+	// L4PublicHost is the host name clients dial for a raw-TCP exposure
+	// (the L4 host-port pool). Empty keeps the old target: SB_DOMAIN, else
+	// the public host. It exists for a domain that points at a load
+	// balancer which cannot carry the pool: an AWS Network Load Balancer
+	// has at most 50 listeners and the pool is 1,001 ports, so with
+	// Terraform's api_load_balancer = "nlb" the domain reaches the
+	// balancer and raw TCP keeps reaching the ingress nodes directly under
+	// tcp.<domain>. Only the advertised URL and host change; the pool, the
+	// allocator and the routes do not. SB_L4_PUBLIC_HOST.
+	L4PublicHost string
 	// ClusterShardAwareIngress confirms that the public ingress router is
 	// shard-aware when the live ingress tier is larger than
 	// cluster.MaxReplicatedIngressRouteNodes. Above that size, each ingress
@@ -1149,6 +1168,15 @@ type Config struct {
 	// §3.2). On ingress nodes the resolver routes *.rt.internal here.
 	// SB_ROUTE_DNS_ADDR.
 	RouteDNSAddr string
+	// RouteDNSLinkAddr is a second responder listener, on the address of the
+	// node's aerolvm-rt link, where the system resolver sends *.rt.internal.
+	// systemd-resolved pins its socket for a link's DNS server to that link,
+	// so a UDP query to the loopback address goes out the dummy link and is
+	// dropped; resolved then stalls every lookup for about 20s while it falls
+	// back to TCP, and does it again each time it re-probes. install.sh sets
+	// it with --ingress-proxy-routing. Empty: no second listener.
+	// SB_ROUTE_DNS_LINK_ADDR.
+	RouteDNSLinkAddr string
 	// HostPortRedirectPort is the sandboxd listener that raw-TCP host ports
 	// are REDIRECTed to under ingress proxy routing when the kernel can't
 	// DNAT them straight to the sandbox (stopped serverless sandboxes to
@@ -1445,7 +1473,8 @@ type Config struct {
 	AuditAPIRate  float64
 	AuditAPIBurst int
 	// AuditExecCommand is what an exec record says about the command:
-	// "digest" (default) is the SHA-256 of the request body only, because
+	// "digest" (default) is a keyed digest of the request body only (an HMAC
+	// under the server key, so a log reader cannot test guesses), because
 	// commands carry secrets; "full" also records the argv, never the
 	// environment. SB_AUDIT_EXEC_COMMAND.
 	AuditExecCommand string
@@ -1494,6 +1523,26 @@ type Config struct {
 	// PATScopeHost: every request on it is public, so a PAT there is
 	// refused. Unused under PATScopeAny. SB_PUBLIC_API_SOCKET.
 	PublicAPISocket string
+	// LivenessSocket is the Unix socket sandboxd answers liveness on from
+	// the first moment of its boot, for the install.sh watchdog. It does no
+	// I/O and takes no lock, so a daemon busy serving the API still answers
+	// it. Empty means off. SB_LIVENESS_SOCKET.
+	LivenessSocket string
+	// APIListMaxInflight bounds the cluster-wide sandbox lists (v1 and the
+	// Daytona, E2B and Runloop facades) this node runs at once; past it a
+	// list waits at most APIListQueueWait for a slot and is otherwise
+	// answered 503 + Retry-After. 0 = no limit. SB_API_LIST_MAX_INFLIGHT,
+	// SB_API_LIST_QUEUE_WAIT (api_admission.go).
+	APIListMaxInflight int
+	APIListQueueWait   time.Duration
+	// APIListMaxInflightPerTenant is how many of those slots one tenant (the
+	// owner a credential acts for; every unscoped caller is the one
+	// "operator" tenant) may hold; past it the tenant's lists wait their
+	// turn and are otherwise answered 429 + Retry-After. Resolved at load:
+	// a quarter of APIListMaxInflight (at least 1) when unset, and
+	// APIListMaxInflight itself (no share) for an explicit 0.
+	// SB_API_LIST_MAX_INFLIGHT_PER_TENANT.
+	APIListMaxInflightPerTenant int
 	// OperatorVolumeScope pins the scope segment of the operator's platform
 	// volumes. Empty keeps the legacy op-<hash(PAT)>, which a PAT rotation
 	// would move (H2). SB_OPERATOR_VOLUME_SCOPE.
@@ -2049,6 +2098,7 @@ func load(keyTool bool) (Config, error) {
 		DockerNetnsPoolDepth:          getEnvInt("SB_DOCKER_NETNS_POOL_DEPTH", 4),
 		DockerNetnsPoolPauseImage:     getEnv("SB_DOCKER_NETNS_POOL_PAUSE_IMAGE", "registry.k8s.io/pause:3.10"),
 		DockerNetnsPoolRefillInterval: getEnvDuration("SB_DOCKER_NETNS_POOL_REFILL_INTERVAL", 2*time.Second),
+		DockerBridgeSlots:             getEnvInt("SB_DOCKER_BRIDGE_SLOTS", 0),
 		DockerToolboxLoopback:         getEnvBool("SB_DOCKER_TOOLBOX_LOOPBACK", false),
 		ReconcileInterval:             getEnvDuration("SB_RECONCILE_INTERVAL", 5*time.Minute),
 		NetstatsPollInterval:          getEnvDuration("SB_NETSTATS_POLL_INTERVAL", 10*time.Second),
@@ -2093,9 +2143,11 @@ func load(keyTool bool) (Config, error) {
 		SelfAPIAdvertiseURL:              strings.TrimSpace(os.Getenv("SB_API_ADVERTISE_URL")),
 		DataPlaneAdvertiseHost:           normalizeAdvertiseHost(os.Getenv("SB_DATA_PLANE_ADVERTISE_HOST")),
 		IngressAdvertiseHost:             normalizeAdvertiseHost(os.Getenv("SB_INGRESS_ADVERTISE_HOST")),
+		L4PublicHost:                     normalizeAdvertiseHost(os.Getenv("SB_L4_PUBLIC_HOST")),
 		ClusterShardAwareIngress:         getEnvBool("SB_CLUSTER_SHARD_AWARE_INGRESS", false),
 		IngressProxyRouting:              getEnvBool("SB_INGRESS_PROXY_ROUTING", false),
 		RouteDNSAddr:                     getEnv("SB_ROUTE_DNS_ADDR", "127.0.0.1:53053"),
+		RouteDNSLinkAddr:                 getEnv("SB_ROUTE_DNS_LINK_ADDR", ""),
 		HostPortRedirectPort:             getEnvInt("SB_HOSTPORT_REDIRECT_PORT", 21215),
 		ClusterRaftCommitTimeout:         getEnvDuration("SB_RAFT_COMMIT_TIMEOUT", 5*time.Second),
 		ClusterCapacityGossipInterval:    getEnvDuration("SB_CAPACITY_GOSSIP_INTERVAL", 5*time.Second),
@@ -2362,6 +2414,9 @@ func load(keyTool bool) (Config, error) {
 	if cfg.ImagePullMaxConcurrent < 0 {
 		return Config{}, errors.New("SB_IMAGE_PULL_MAX_CONCURRENT must be >= 0")
 	}
+	if cfg.DockerBridgeSlots < 0 {
+		return Config{}, errors.New("SB_DOCKER_BRIDGE_SLOTS must be >= 0 (0 derives it from the docker network)")
+	}
 	if cfg.ImagePullFailureBackoff < 0 {
 		return Config{}, errors.New("SB_IMAGE_PULL_FAILURE_BACKOFF must be >= 0")
 	}
@@ -2623,6 +2678,14 @@ func load(keyTool bool) (Config, error) {
 		return Config{}, fmt.Errorf("invalid SB_HOSTPORT_REDIRECT_PORT %d: require 1-65535 outside SB_L4_PORT_RANGE_START/END (%d-%d)",
 			cfg.HostPortRedirectPort, cfg.L4PortRangeStart, cfg.L4PortRangeEnd)
 	}
+	if cfg.RouteDNSLinkAddr != "" {
+		host, port, err := net.SplitHostPort(cfg.RouteDNSLinkAddr)
+		if ip := net.ParseIP(host); err != nil || ip == nil || ip.IsUnspecified() || port == "" || port == "0" {
+			// An address, not a wildcard: the responder answers a non-loopback
+			// client only when it is the listener's own address.
+			return Config{}, fmt.Errorf("invalid SB_ROUTE_DNS_LINK_ADDR %q: require ip:port with a specific IP", cfg.RouteDNSLinkAddr)
+		}
+	}
 	if cfg.SandboxPidsLimit < 0 {
 		return Config{}, fmt.Errorf("invalid SB_SANDBOX_PIDS_LIMIT %d: require 0 (unlimited) or more", cfg.SandboxPidsLimit)
 	}
@@ -2862,6 +2925,12 @@ func load(keyTool bool) (Config, error) {
 	if err := cfg.loadPATScopeConfig(); err != nil {
 		return Config{}, err
 	}
+	if err := cfg.loadLivenessConfig(); err != nil {
+		return Config{}, err
+	}
+	if err := cfg.loadAPIAdmissionConfig(); err != nil {
+		return Config{}, err
+	}
 	if err := validateIdentity(&cfg); err != nil {
 		return Config{}, err
 	}
@@ -2905,6 +2974,13 @@ func load(keyTool bool) (Config, error) {
 		// one it is (plans/customer-key-custody.md §7).
 		if secrets.IsExternalProvider(cfg.SecretProvider) && !cfg.SecretProviderStrictBoot {
 			return Config{}, fmt.Errorf("SB_SECRET_PROVIDER_STRICT_BOOT must be true for %s when SB_ENTERPRISE_MODE=true", secrets.NormalizeProviderName(cfg.SecretProvider))
+		}
+		// With a customer key store the server key must be wrapped by it: a
+		// plaintext key file would make the custody claim false (F2, Phase
+		// 7; the release before warned). `sandboxd key` still loads, since
+		// `sandboxd key wrap` is how a node gets there.
+		if secrets.IsExternalProvider(cfg.SecretProvider) && cfg.CredentialKeyCustody != secrets.CustodyWrapped && !keyTool {
+			return Config{}, fmt.Errorf("SB_CREDENTIAL_KEY_CUSTODY must be wrapped for %s when SB_ENTERPRISE_MODE=true: run `sandboxd key wrap`, set SB_CREDENTIAL_KEY_CUSTODY=wrapped and delete the plaintext key (plans/customer-key-custody.md §7)", secrets.NormalizeProviderName(cfg.SecretProvider))
 		}
 		if cfg.SecretAuditRetentionDays == 0 || cfg.SecretTombRetentionDays == 0 {
 			return Config{}, errors.New("secret audit and tomb retention must be non-zero when SB_ENTERPRISE_MODE=true")

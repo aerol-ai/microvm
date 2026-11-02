@@ -63,10 +63,15 @@ while [ $# -gt 0 ]; do
         echo "$fail failed" >&2
         exit 2
       fi
-      touch "$chains"
+      touch "$chains" "$state"
       if grep -Fxq "$table|$chain" "$chains"; then
+        printf '%s\n' "-N $chain"
+        grep -F "$table|$chain|" "$state" | while IFS= read -r line; do
+          printf '%s\n' "-A $chain ${line#"$table|$chain|"}"
+        done
         exit 0
       fi
+      echo "iptables: No chain/target/match by that name." >&2
       exit 1
       ;;
     -C|-I|-D)

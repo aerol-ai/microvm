@@ -25,6 +25,14 @@ const (
 	keyStoreUnavailableRetryAfterSeconds = 5
 )
 
+// Create-retry hints. A create still running past a waiter's bound has run
+// for the whole create timeout, so the retry is spaced out; a reservation
+// that is gone is replaced by the very next retry.
+const (
+	createInProgressRetryAfterSeconds = 5
+	reservationGoneRetryAfterSeconds  = 1
+)
+
 // ErrKind names the few service errors a facade words differently for its own
 // SDK (otherwise it uses Classification.Message verbatim). Every other error
 // is ErrKindOther.
@@ -76,6 +84,21 @@ func Classify(err error) Classification {
 	switch {
 	case errors.Is(err, store.ErrNotFound):
 		return Classification{Status: http.StatusNotFound, Message: "sandbox not found", Kind: ErrKindNotFound}
+	// A keyed create whose Idempotency-Key was used with a different request.
+	// The text names the key (models.IdempotencyKeyReusedError) and nothing
+	// about the sandbox; no Retry-After, since the same request fails again.
+	case errors.Is(err, models.ErrIdempotencyKeyReused):
+		return Classification{Status: http.StatusUnprocessableEntity, Code: models.ErrorCodeIdempotencyKeyReused, Message: idempotencyKeyReusedMessage(err)}
+	// A create that waited its bound for another create of the same sandbox
+	// id on this node (service create_lease.go). Nothing was created; the
+	// same request retried replays that create's sandbox.
+	case errors.Is(err, service.ErrCreateInProgress):
+		return Classification{Status: http.StatusServiceUnavailable, RetryAfter: createInProgressRetryAfterSeconds, Code: models.ErrorCodeCreateInProgress, Message: service.ErrCreateInProgress.Error()}
+	// A reserved create whose reservation is gone (a failed create of the
+	// same id cancelled it, or it expired). Nothing was created; a retry
+	// reserves afresh.
+	case errors.Is(err, service.ErrReservedPlacementGone):
+		return Classification{Status: http.StatusServiceUnavailable, RetryAfter: reservationGoneRetryAfterSeconds, Message: "cluster: the create's placement reservation is gone; retry to create afresh"}
 
 	// Fleet admission verdicts (managed builds only). Denied is a definite
 	// 403; unavailable is a retryable 503.
@@ -117,6 +140,16 @@ func Classify(err error) Classification {
 	case errors.Is(err, service.ErrWakeCircuitOpen):
 		return Classification{Status: http.StatusServiceUnavailable, RetryAfter: 60, Message: err.Error()}
 
+	// Load shedding (admission.go): this node runs as many requests of an
+	// expensive kind as it is configured to. Retryable at once, no log line
+	// (a storm would otherwise write one per refused request).
+	case errors.Is(err, ErrOverloaded):
+		return Classification{Status: http.StatusServiceUnavailable, RetryAfter: OverloadedRetryAfterSeconds, Code: models.ErrorCodeOverloaded, Message: ErrOverloaded.Error()}
+	// The caller's own tenant holds its share of those slots: 429, so the
+	// noisy tenant (not the node) is named as the one to slow down.
+	case errors.Is(err, ErrRateLimited):
+		return Classification{Status: http.StatusTooManyRequests, RetryAfter: RateLimitedRetryAfterSeconds, Code: models.ErrorCodeRateLimited, Message: ErrRateLimited.Error()}
+
 	case errors.Is(err, service.ErrSecretAuditBusy):
 		return Classification{Status: http.StatusTooManyRequests, RetryAfter: 1, Message: service.ErrSecretAuditBusy.Error()}
 	case errors.Is(err, service.ErrSecretAuditChainBroken):
@@ -153,6 +186,10 @@ func Classify(err error) Classification {
 	case errors.Is(err, service.ErrNodeGuardNotReady):
 		// The cause (an iptables error) is for the node's log, not the caller.
 		return Classification{Status: http.StatusServiceUnavailable, RetryAfter: 5, Code: models.ErrorCodeNodeGuardNotReady, Message: service.ErrNodeGuardNotReady.Error(), Log: true, LogLevel: slog.LevelError}
+	case errors.Is(err, service.ErrEgressFloorNotReady):
+		// The cause (an iptables or netlink error) is for the node's log,
+		// not the caller.
+		return Classification{Status: http.StatusServiceUnavailable, RetryAfter: 5, Code: models.ErrorCodeEgressFloorNotReady, Message: service.ErrEgressFloorNotReady.Error(), Log: true, LogLevel: slog.LevelError}
 	case errors.Is(err, service.ErrEgressGatewayUnavailable), errors.Is(err, cluster.ErrNoEgressGatewayTarget):
 		return Classification{Status: http.StatusServiceUnavailable, RetryAfter: 5, Code: models.ErrorCodeEgressGatewayUnavailable, Message: err.Error()}
 	case errors.Is(err, service.ErrEgressSpecCommitFailed):
@@ -296,4 +333,12 @@ func (c Classification) SetRetryAfter(w http.ResponseWriter) {
 	if c.RetryAfter > 0 {
 		w.Header().Set("Retry-After", strconv.Itoa(c.RetryAfter))
 	}
+}
+
+func idempotencyKeyReusedMessage(err error) string {
+	var reused *models.IdempotencyKeyReusedError
+	if errors.As(err, &reused) {
+		return truncate(reused.Error())
+	}
+	return (&models.IdempotencyKeyReusedError{}).Error()
 }

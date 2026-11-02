@@ -48,6 +48,14 @@ func ApplyErrorStatus(err error) int {
 		// a retry of an Idempotency-Key create on a multi-node cluster 503s
 		// instead of replaying the existing sandbox.
 		return http.StatusConflict
+	case errors.Is(err, ErrIncarnationConflict):
+		// An incarnation fence is a verdict too: the placement moved to
+		// another incarnation, and re-sending the same write cannot succeed.
+		// The create path routes an Idempotency-Key retry whose re-reserve
+		// hit it to the reservation's owner (clustercreate.Prepare), which
+		// only works if the sentinel survives the hop; as a 500 the retry
+		// answered 503 (seen live on cluster-hetero-lite, UC-367).
+		return http.StatusConflict
 	default:
 		return http.StatusInternalServerError
 	}
@@ -85,6 +93,8 @@ func forwardApplyStatus(status int, message string) error {
 			return fmt.Errorf("%w: %s", ErrReservationConflict, message)
 		case strings.Contains(message, ErrNameConflict.Error()):
 			return fmt.Errorf("%w: %s", ErrNameConflict, message)
+		case strings.Contains(message, ErrIncarnationConflict.Error()):
+			return fmt.Errorf("%w: %s", ErrIncarnationConflict, message)
 		}
 	case http.StatusServiceUnavailable:
 		switch {

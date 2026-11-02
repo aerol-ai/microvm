@@ -347,7 +347,8 @@ func TestCreateRefusedWithoutNodeGuard(t *testing.T) {
 // escape hatch, a local resolver).
 func TestNodeControlAndNodeGuardAgree(t *testing.T) {
 	withResolvers(t, []string{"172.17.0.1"}, "nameserver 172.17.0.1\n")
-	svc, gw, _ := newEgressHarness(t)
+	svc, gw, hr := newEgressHarness(t)
+	svc.SetFirecrackerRuntime(&tapPoolRuntime{holdRuntime: hr, subnet: netip.MustParsePrefix("172.16.0.0/16")})
 	svc.cfg.NodeRole, svc.cfg.EnableCaddy = config.NodeRoleMixed, true
 	svc.cfg.APIPort, svc.cfg.SSHListenAddr, svc.cfg.RaftBindAddr = 21212, "0.0.0.0:2220", "0.0.0.0:7000"
 	svc.cfg.EgressDNSPort, svc.cfg.EgressProxyPort = 53054, 15080
@@ -369,6 +370,17 @@ func TestNodeControlAndNodeGuardAgree(t *testing.T) {
 		for _, p := range allow {
 			if p.Port == ep.Port() && p.Proto == "tcp" {
 				t.Errorf("node_control drops %s, which the node guard opens (%s)", ep, p)
+			}
+		}
+	}
+	// The Firecracker TAP pool, guarded whole: none of its ports either.
+	if len(gw.pools) != 1 {
+		t.Fatalf("the TAP pool was not pushed: %v", gw.pools)
+	}
+	for _, port := range gw.pools[0].Ports {
+		for _, p := range allow {
+			if p.Port == port && p.Proto == "tcp" {
+				t.Errorf("node_control drops the TAP pool's port %d, which the node guard opens (%s)", port, p)
 			}
 		}
 	}

@@ -2,9 +2,11 @@ package service
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"net/netip"
 	"net/url"
+	"slices"
 	"strings"
 
 	"github.com/aerol-ai/microvm/internal/egress"
@@ -106,25 +108,71 @@ var localIPv4s = func() []netip.Addr {
 	return out
 }
 
+// nodeControl is the guard as the gateway gets it: the Firecracker TAP
+// pool guarded whole on the control ports, and every endpoint the pool
+// doesn't cover one by one. Each guest's TAP holds a host address (the
+// host side of its /30), so listing local addresses alone made the list
+// change with every guest started or stopped, and each change rewrote the
+// whole node_control set in the gateway: a commit that held the node's
+// nftables commit mutex for 25 ms on a 48-vCPU host, which any create's
+// lift landing then waited out (egress.ControlPool).
+func (s *Service) nodeControl(all []netip.AddrPort) egress.NodeControl {
+	nc := egress.NodeControl{Endpoints: all}
+	subnet, on := s.tapPool()
+	if !on || !subnet.Addr().Is4() {
+		return nc
+	}
+	var ports []uint16
+	for _, p := range s.controlPorts() {
+		if p != 0 && p != 80 && p != 443 && !slices.Contains(ports, p) {
+			ports = append(ports, p)
+		}
+	}
+	if len(ports) == 0 {
+		return nc
+	}
+	pool := subnet.Masked()
+	nc.Pools = []egress.ControlPool{{Prefix: pool, Ports: ports}}
+	nc.Endpoints = nil
+	for _, ep := range all {
+		if !pool.Contains(ep.Addr()) || !slices.Contains(ports, ep.Port()) {
+			nc.Endpoints = append(nc.Endpoints, ep)
+		}
+	}
+	return nc
+}
+
 // syncNodeControl pushes the control endpoints when they changed (cluster
 // membership moves, or a gateway restart cleared the record). The guard is
 // on without an operator file; only node_control_port_guard: false in one
 // turns it off, which clears anything pushed earlier.
+//
+// A gateway from before control pools answers the pools op "unknown op";
+// it then gets every address listed, as before, and the list it got is
+// what the next tick compares against.
 func (s *Service) syncNodeControl(ctx context.Context) {
 	if !s.egressEnabled() || !s.egressReady.Load() {
 		return
 	}
 	op := s.egressOperator()
-	var eps []netip.AddrPort
+	var all []netip.AddrPort
+	var nc egress.NodeControl
 	if op.NodeControlPortGuard() {
-		eps = s.nodeControlEndpoints()
+		all = s.nodeControlEndpoints()
+		nc = s.nodeControl(all)
 	}
-	key := controlKey(eps)
-	if prev := s.egressControlPushed.Load(); prev != nil && *prev == key {
+	key, listKey := poolsKey(nc), "list|"+controlKey(all)
+	if prev := s.egressControlPushed.Load(); prev != nil && (*prev == key || *prev == listKey) {
 		return
 	}
-	if err := s.egressGateway().SetNodeControl(ctx, eps); err != nil {
-		s.logger.Warn("egress: node control-port guard not updated", "endpoints", len(eps), "error", err)
+	gw := s.egressGateway()
+	err := gw.SetNodeControlPools(ctx, nc)
+	if egress.IsUnknownOp(err) {
+		key = listKey
+		err = gw.SetNodeControl(ctx, all)
+	}
+	if err != nil {
+		s.logger.Warn("egress: node control-port guard not updated", "endpoints", len(all), "error", err)
 		return
 	}
 	s.egressControlPushed.Store(&key)
@@ -135,6 +183,18 @@ func controlKey(eps []netip.AddrPort) string {
 	for _, ep := range eps {
 		b.WriteString(ep.String())
 		b.WriteByte(',')
+	}
+	return b.String()
+}
+
+// poolsKey names a NodeControl push; a list push's key starts "list|", so
+// the two never match each other.
+func poolsKey(nc egress.NodeControl) string {
+	var b strings.Builder
+	b.WriteString("pools|")
+	b.WriteString(controlKey(nc.Endpoints))
+	for _, p := range nc.Pools {
+		fmt.Fprintf(&b, "|%s:%v", p.Prefix, p.Ports)
 	}
 	return b.String()
 }

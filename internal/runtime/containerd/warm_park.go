@@ -263,7 +263,7 @@ func (d *Driver) parkContainer(ctx context.Context, slotID string, key container
 	if err != nil {
 		return nil, err
 	}
-	logCreator, closeLog, err := taskLogIO(logPath)
+	logCreator, closeLog, err := d.taskLogIO(logPath)
 	if err != nil {
 		return nil, err
 	}

@@ -38,6 +38,11 @@ WITH_ISOLATE="false"
 # route responder via systemd-resolved.
 INGRESS_PROXY_ROUTING="false"
 ROUTE_DNS_ADDR="127.0.0.1:53053"
+# The aerolvm-rt link's own address. systemd-resolved sends *.rt.internal
+# here, not to ROUTE_DNS_ADDR (write_route_dns_resolver says why), and
+# sandboxd listens here too (SB_ROUTE_DNS_LINK_ADDR).
+ROUTE_DNS_LINK_IP="169.254.53.53"
+ROUTE_DNS_LINK_ADDR="${ROUTE_DNS_LINK_IP}:53053"
 WORKERD_PATH=""
 # Version-pinned workerd release for --with-isolate (plans/isolate-runtime.md
 # Phase 1). Upstream ships gzipped standalone binaries with no checksum
@@ -105,6 +110,10 @@ SECRET_PROVIDER_ENV=""
 NO_START="false"
 PUBLIC_API_SOCKET="/run/sandboxd-public/api.sock"
 L4_PROXY_PROTOCOL="false"
+# --lb-health-port: a plain-HTTP /health listener for a load balancer's
+# health check (Terraform api_load_balancer = "nlb"). Empty writes none, so
+# a default install opens no new port.
+LB_HEALTH_PORT=""
 
 # A re-run restarts a running sandboxd when it changed the daemon's settings
 # file or unit (see restart_sandboxd_if_reconfigured). record_sandboxd_state
@@ -287,6 +296,14 @@ Options:
                                outside" alert see it instead of 127.0.0.1.
                                Writes the Caddy listener wrapper and
                                SB_L4_FALLBACK_PROXY_PROTOCOL=true together.
+  --lb-health-port <port>      Domain mode: serve GET /health in plain HTTP
+                               on <port> for a load balancer's health check.
+                               It answers 200 only when the whole path a
+                               client takes works (caddy-l4 on :443, the
+                               HTTPS site and sandboxd), and 502 otherwise,
+                               so the balancer drops this node while its
+                               daemon is down. Open the port to the load
+                               balancer only.
   --local                     Local development mode. The server binds to
                                127.0.0.1:21212 with no Caddy or TLS. Supported
                                on both macOS and Linux. No domain name required.
@@ -679,6 +696,10 @@ while [[ $# -gt 0 ]]; do
 			L4_PROXY_PROTOCOL="true"
 			shift
 			;;
+		--lb-health-port)
+			LB_HEALTH_PORT="$2"
+			shift 2
+			;;
 		--key-custody)
 			KEY_CUSTODY="$2"
 			shift 2
@@ -843,6 +864,29 @@ esac
 if [[ "$L4_PROXY_PROTOCOL" == "true" && -z "$L4_TLS_LISTEN_DEFAULT" ]]; then
 	echo "--l4-proxy-protocol requires domain mode (--domain with --dns-provider, or --tls-issuer internal)." >&2
 	exit 1
+fi
+# The load-balancer health listener probes through caddy-l4 on :443, which
+# only exists in domain mode. Its port must not be one this node already
+# listens on, or Caddy fails to start and takes the API down with it.
+if [[ -n "$LB_HEALTH_PORT" ]]; then
+	if [[ -z "$L4_TLS_LISTEN_DEFAULT" ]]; then
+		echo "--lb-health-port requires domain mode (--domain with --dns-provider, or --tls-issuer internal)." >&2
+		exit 1
+	fi
+	if ! [[ "$LB_HEALTH_PORT" =~ ^[1-9][0-9]{3,4}$ ]] || ((LB_HEALTH_PORT > 65535)); then
+		echo "--lb-health-port must be a port from 1024 to 65535, got '$LB_HEALTH_PORT'." >&2
+		exit 1
+	fi
+	case "$LB_HEALTH_PORT" in
+	2019 | 2220 | 7000 | 7001 | 7002 | 8443 | 21212 | 21215 | 53053)
+		echo "--lb-health-port $LB_HEALTH_PORT is already used on this node (Caddy admin, SSH gateway, cluster, HTTPS site, API, host-port redirect or route DNS)." >&2
+		exit 1
+		;;
+	esac
+	if ((LB_HEALTH_PORT >= 22000 && LB_HEALTH_PORT <= 23000)); then
+		echo "--lb-health-port $LB_HEALTH_PORT is inside the raw-TCP port pool (22000-23000)." >&2
+		exit 1
+	fi
 fi
 
 # Shared cert storage validation. The feature only makes sense alongside
@@ -1245,6 +1289,10 @@ install_binaries() {
 write_environment() {
 	mkdir -p /etc/sandboxd /var/lib/sandboxd /var/lib/sandboxd/mounts /run/sandboxd
 	chmod 0700 /var/lib/sandboxd /var/lib/sandboxd/mounts /run/sandboxd
+	local route_dns_link_addr=""
+	if [[ "$INGRESS_PROXY_ROUTING" == "true" ]]; then
+		route_dns_link_addr="$ROUTE_DNS_LINK_ADDR"
+	fi
 	cat > /etc/sandboxd/sandboxd.env <<EOF
 SB_PAT_TOKEN=$PAT_TOKEN
 SB_NODE_NAME=$NODE_NAME
@@ -1278,6 +1326,7 @@ SB_L4_PORT_RANGE_END=23000
 SB_L4_TLS_LISTEN=$L4_TLS_LISTEN_DEFAULT
 SB_INGRESS_PROXY_ROUTING=$INGRESS_PROXY_ROUTING
 SB_ROUTE_DNS_ADDR=$ROUTE_DNS_ADDR
+SB_ROUTE_DNS_LINK_ADDR=$route_dns_link_addr
 SB_L4_TLS_FALLBACK=127.0.0.1:8443
 EOF
 	# The custom-domain certificate policy sandboxd installs follows the
@@ -1554,6 +1603,40 @@ ${tls_block}
 	}
 }
 EOF
+	if [[ -n "$LB_HEALTH_PORT" ]]; then
+		cat >> /etc/caddy/Caddyfile <<EOF
+
+# Load-balancer health listener (--lb-health-port). Plain HTTP, so keep the
+# port closed to everything but the balancer (Terraform opens it to the
+# balancer's security group only). GET /health walks the path a client
+# takes: caddy-l4 on :443, its SNI fallback, the HTTPS API site and
+# sandboxd. Any of them down answers 502, and the balancer stops sending
+# this node new connections. Bound to every address: Caddy numbers its
+# servers by sorted listen address, so ":${LB_HEALTH_PORT}" sorts after
+# "127.0.0.1:8443" and the API site stays srv0, where sandboxd writes routes.
+http://:${LB_HEALTH_PORT} {
+	handle /health {
+		reverse_proxy https://127.0.0.1:443 {
+			# The balancer's probe carries its own address as Host and no
+			# SNI. Send the API site's name in both, or the probe matches
+			# no site and Caddy answers an empty 200 with sandboxd down.
+			header_up Host ${DOMAIN}
+			# Required on every reverse_proxy here; the probe holds no stream.
+			stream_close_delay 10m
+			transport http {
+				tls_server_name ${DOMAIN}
+				# A loopback hop to this same Caddy: the probe checks that
+				# the handshake works (certificate loaded), not who answers.
+				tls_insecure_skip_verify
+			}
+		}
+	}
+	handle {
+		respond 404
+	}
+}
+EOF
+	fi
 }
 
 write_caddy_env() {
@@ -1615,6 +1698,35 @@ write_caddy_env() {
 # The link needs an address and no IPv6 autoconf, or networkd leaves it in
 # "configuring" and resolved ignores its DNS settings. Requires
 # systemd-networkd and systemd >= 249 (ActivationPolicy, DNS=ip:port).
+#
+# WHY the DNS server is the link's own address, not the loopback responder:
+# resolved pins its socket for a link's DNS server to that link
+# (IP_UNICAST_IF), so a UDP query to 127.0.0.1 leaves through the dummy link
+# and is dropped. resolved then stalls every lookup for about 20s while it
+# falls back to TCP, and it re-probes UDP every few minutes and stalls again.
+# Each stall failed new connections through the ingress with EOF
+# (cluster-bank-flagship UC-171, 2026-11-01). A query to the link's own
+# address is delivered locally, and sandboxd answers there.
+route_dns_network_unit() {
+	cat <<EOF
+[Match]
+Name=aerolvm-rt
+
+[Link]
+RequiredForOnline=no
+ActivationPolicy=always-up
+
+[Network]
+ConfigureWithoutCarrier=yes
+DNS=$ROUTE_DNS_LINK_ADDR
+Domains=~rt.internal
+DNSDefaultRoute=false
+Address=$ROUTE_DNS_LINK_IP/32
+LinkLocalAddressing=no
+IPv6AcceptRA=no
+EOF
+}
+
 write_route_dns_resolver() {
 	if [[ "$INGRESS_PROXY_ROUTING" != "true" ]]; then
 		return
@@ -1634,23 +1746,7 @@ write_route_dns_resolver() {
 Name=aerolvm-rt
 Kind=dummy
 EOF
-	cat > /etc/systemd/network/10-aerolvm-rt.network <<EOF
-[Match]
-Name=aerolvm-rt
-
-[Link]
-RequiredForOnline=no
-ActivationPolicy=always-up
-
-[Network]
-ConfigureWithoutCarrier=yes
-DNS=$ROUTE_DNS_ADDR
-Domains=~rt.internal
-DNSDefaultRoute=false
-Address=169.254.53.53/32
-LinkLocalAddressing=no
-IPv6AcceptRA=no
-EOF
+	route_dns_network_unit > /etc/systemd/network/10-aerolvm-rt.network
 	systemctl restart systemd-networkd
 	systemctl restart systemd-resolved
 	local i
@@ -1765,13 +1861,59 @@ restart_sandboxd_if_reconfigured() {
 write_healthcheck_script() {
 	cat > "$INSTALL_PREFIX/sandboxd-healthcheck" <<'EOF'
 #!/usr/bin/env bash
+# sandboxd-healthcheck: run by sandboxd-healthcheck.timer every 30 s.
+#
+# It restarts sandboxd only when the process has stopped answering, never
+# because it is busy. A restart kills every request in flight on the node,
+# so on the bank flagship (2026-11-01) restarting an overloaded node after
+# one slow /health turned overload into an outage. Hence:
+#   - it probes the liveness socket, which the daemon answers from its own
+#     listener with no I/O and no lock (pkg/daemon/liveness.go), not
+#     /health, which reads the store and pings the engines;
+#   - it restarts only after FAILS_TO_RESTART failed probes in a row of one
+#     run of the daemon (its InvocationID), the first and the last at least
+#     FAIL_WINDOW_SECONDS apart; the streak is kept between timer runs;
+#   - it never restarts a daemon younger than BOOT_GRACE_SECONDS, nor while
+#     a start, stop or restart of the unit is already under way, and it
+#     asks systemd for the restart without waiting for it, so its next run
+#     sees the restart in progress instead of probing a half-booted daemon.
 
 set -euo pipefail
 
 ENV_FILE="/etc/sandboxd/sandboxd.env"
 if [[ -f "$ENV_FILE" ]]; then
-	# shellcheck disable=SC1091
+	# shellcheck source=/dev/null
 	source "$ENV_FILE"
+fi
+
+UNIT="sandboxd.service"
+STATE_DIR="${SANDBOXD_HEALTHCHECK_STATE_DIR:-/run/sandboxd-healthcheck}"
+STATE_FILE="$STATE_DIR/streak"
+LIVENESS_SOCKET="${SB_LIVENESS_SOCKET:-/run/sandboxd/live.sock}"
+FAILS_TO_RESTART=3
+FAIL_WINDOW_SECONDS=90
+BOOT_GRACE_SECONDS=120
+PROBE_TIMEOUT_SECONDS=10
+
+log() {
+	logger -t sandboxd-healthcheck "$*"
+}
+
+clear_streak() {
+	rm -f "$STATE_FILE"
+}
+
+unit_prop() {
+	systemctl show -p "$1" --value "$UNIT" 2>/dev/null || true
+}
+
+mkdir -p "$STATE_DIR"
+chmod 0700 "$STATE_DIR"
+# One watchdog at a time: a manual run beside the timer's must not ask for
+# a second restart.
+if command -v flock >/dev/null 2>&1; then
+	exec 9>"$STATE_DIR/lock"
+	flock -n 9 || exit 0
 fi
 
 # systemd stops restarting a unit that failed StartLimitBurst times within
@@ -1780,26 +1922,82 @@ fi
 # key store came back, so a failed unit is reset and started again here,
 # every run of this timer. A unit an operator stopped is inactive, not
 # failed, and is left alone.
-if systemctl is-failed --quiet sandboxd.service; then
-	logger -t sandboxd-healthcheck "sandboxd.service is failed; resetting it and starting it again"
-	systemctl reset-failed sandboxd.service
-	systemctl start sandboxd.service || true
+if systemctl is-failed --quiet "$UNIT"; then
+	log "sandboxd.service is failed; resetting it and starting it again"
+	clear_streak
+	systemctl reset-failed "$UNIT"
+	systemctl start "$UNIT" || true
 	exit 0
 fi
 
-if ! systemctl is-active --quiet sandboxd.service; then
+# inactive: stopped by an operator. activating, deactivating, reloading: a
+# start, stop or restart is already under way. Neither is ours to touch.
+if [[ "$(unit_prop ActiveState)" != "active" ]]; then
+	clear_streak
+	exit 0
+fi
+# A job queued on the unit (a restart someone already asked for) is under
+# way too: never stack a second restart on it.
+if [[ -n "$(systemctl list-jobs --no-legend "$UNIT" 2>/dev/null || true)" ]]; then
+	exit 0
+fi
+invocation="$(unit_prop InvocationID)"
+main_pid="$(unit_prop MainPID)"
+
+probe() {
+	if [[ -S "$LIVENESS_SOCKET" ]]; then
+		curl -fsS --max-time "$PROBE_TIMEOUT_SECONDS" --unix-socket "$LIVENESS_SOCKET" "http://localhost/livez" >/dev/null
+		return
+	fi
+	# A daemon older than the liveness socket, or one run with
+	# SB_LIVENESS_SOCKET=off: /health is the only signal it has.
+	curl -fsS --max-time "$PROBE_TIMEOUT_SECONDS" "http://127.0.0.1:${SB_API_PORT:-21212}/health" >/dev/null
+}
+
+if probe; then
+	clear_streak
 	exit 0
 fi
 
-HEALTH_HOST="127.0.0.1"
-HEALTH_PORT="${SB_API_PORT:-21212}"
-HEALTH_URL="http://${HEALTH_HOST}:${HEALTH_PORT}/health"
-
-if ! curl -fsS --max-time 10 "$HEALTH_URL" >/dev/null; then
-	logger -t sandboxd-healthcheck "health check failed for ${HEALTH_URL}; restarting sandboxd.service"
-	systemctl restart sandboxd.service
-	logger -t sandboxd-healthcheck "sandboxd.service restart requested"
+now="$(date +%s)"
+streak_invocation=""
+fails=0
+first=0
+if [[ -f "$STATE_FILE" ]]; then
+	read -r streak_invocation fails first <"$STATE_FILE" || true
 fi
+# Failures of an earlier run of the daemon say nothing about this one.
+if [[ "$streak_invocation" != "$invocation" || ! "$fails" =~ ^[0-9]+$ || ! "$first" =~ ^[0-9]+$ ]]; then
+	fails=0
+	first="$now"
+fi
+fails=$((fails + 1))
+printf '%s %s %s\n' "$invocation" "$fails" "$first" >"$STATE_FILE.tmp"
+mv -f "$STATE_FILE.tmp" "$STATE_FILE"
+span=$((now - first))
+
+age="$(ps -o etimes= -p "$main_pid" 2>/dev/null | tr -d ' ' || true)"
+if [[ ! "$age" =~ ^[0-9]+$ ]]; then
+	age=0
+fi
+if ((age < BOOT_GRACE_SECONDS)); then
+	log "liveness probe failed ($fails in a row over ${span}s) for a daemon ${age}s old; a daemon in its first ${BOOT_GRACE_SECONDS}s is never restarted"
+	exit 0
+fi
+if ((fails < FAILS_TO_RESTART || span < FAIL_WINDOW_SECONDS)); then
+	log "liveness probe failed ($fails in a row over ${span}s); restarting only after $FAILS_TO_RESTART in a row over ${FAIL_WINDOW_SECONDS}s"
+	exit 0
+fi
+# Last look before acting: a restart that began while we probed is not ours
+# to repeat.
+if [[ "$(unit_prop InvocationID)" != "$invocation" || "$(unit_prop ActiveState)" != "active" ]]; then
+	clear_streak
+	exit 0
+fi
+log "liveness probe failed $fails times in a row over ${span}s; restarting sandboxd.service"
+clear_streak
+systemctl --no-block restart "$UNIT"
+log "sandboxd.service restart requested"
 EOF
 	chmod 0755 "$INSTALL_PREFIX/sandboxd-healthcheck"
 }
@@ -2560,7 +2758,7 @@ if [[ "$LOCAL_MODE" == "true" ]]; then
 	echo "API URL: http://127.0.0.1:21212"
 	echo "Health URL: http://127.0.0.1:21212/health"
 	echo "systemd restart policy: always (5 second backoff, 10 restarts per 5 minutes)"
-	echo "Health watchdog: sandboxd-healthcheck.timer probes /health every 30 seconds"
+	echo "Health watchdog: sandboxd-healthcheck.timer probes the liveness socket every 30 seconds and restarts sandboxd only after 3 failed probes in a row over 90 seconds"
 	exit 0
 fi
 
@@ -2632,6 +2830,9 @@ if [[ -n "$DOMAIN" ]]; then
 	echo "TLS-SNI multiplexing: ENABLED on :443 (caddy-l4 routes by SNI)"
 	echo "  Regular HTTPS sites moved to 127.0.0.1:8443; caddy-l4 forwards"
 	echo "  unmatched SNI to that listener. exposeTLSPort() works out of the box."
+	if [[ -n "$LB_HEALTH_PORT" ]]; then
+		echo "Load-balancer health check: http://<this node>:${LB_HEALTH_PORT}/health (open it to the balancer only)"
+	fi
 else
 	echo "API URL: http://$PUBLIC_HOST:21212"
 	echo "Health URL: http://$PUBLIC_HOST:21212/health"
@@ -2642,4 +2843,4 @@ echo "  This range sits below the Linux ephemeral range (32768-60999) on purpose
 echo "  kernel never hands these out as outbound source ports — eliminates random EADDRINUSE"
 echo "  failures on ExposeTCPPort. 1000 slots = max concurrent TCP exposures per host."
 echo "systemd restart policy: always (5 second backoff, 10 restarts per 5 minutes)"
-echo "Health watchdog: sandboxd-healthcheck.timer probes /health every 30 seconds"
+echo "Health watchdog: sandboxd-healthcheck.timer probes the liveness socket every 30 seconds and restarts sandboxd only after 3 failed probes in a row over 90 seconds"

@@ -1150,7 +1150,7 @@ func TestExtractTarMkdirError(t *testing.T) {
 
 func TestTaskLogIOOpenError(t *testing.T) {
 	badPath := filepath.Join(t.TempDir(), "missing", "log")
-	_, _, err := taskLogIO(badPath)
+	_, _, err := (&Driver{}).taskLogIO(badPath)
 	if err == nil {
 		t.Fatal("want open error")
 	}

@@ -109,8 +109,8 @@ const (
 	// the two pools are independent (netns slots hold no capacity
 	// reservations, so this one leaves the UC-95 density gate untouched).
 	CapDockerNetnsPool Capability = "docker-netns-pool"
-	// CapDockerEngine is consumed by run.sh's engine selection, not by any UC's
-	// Requires. It is an OPT-OUT: containerd is the DEFAULT engine for every
+	// CapDockerEngine is consumed by run.sh's engine selection, and by the one
+	// UC that reads dockerd's own image store (UC-364). It is an OPT-OUT: containerd is the DEFAULT engine for every
 	// scenario (run.sh writes SB_CONTAINER_ENGINE=containerd), and only a
 	// scenario advertising this cap runs dockerd instead. Exactly two do — the
 	// local dev install (local-mode) and the docker A/B benchmark baseline
@@ -244,6 +244,22 @@ const (
 	// CapKeyCustodySingleWrapped: one node installed with
 	// install.sh --key-custody wrapped on a real AWS KMS key.
 	CapKeyCustodySingleWrapped Capability = "key-custody-single-wrapped"
+	// CapAPILoadBalancer: the domain fronts a health-checked AWS Network Load
+	// Balancer (Terraform api_load_balancer = "nlb"; run.sh derives that
+	// variable from this capability, the way deploy_obs follows
+	// observability). Every ingress node runs install.sh --lb-health-port and
+	// every node SB_L4_PUBLIC_HOST=tcp.<domain>. Gates UC-356; the other
+	// cases run unchanged and so cover the balancer's path (and raw TCP on
+	// tcp.<domain>) too.
+	CapAPILoadBalancer Capability = "api-load-balancer"
+	// CapAPIListFairness: every node runs a list gate small enough that one
+	// tenant's list storm fills its per-tenant share (the scenario's
+	// extra_sandboxd_env sets SB_API_LIST_MAX_INFLIGHT and
+	// SB_API_LIST_MAX_INFLIGHT_PER_TENANT). A healthy list holds its slot for
+	// milliseconds, so the default 16 slots with 4 per tenant may never fill
+	// under the suite's client; gates UC-362, which asserts the noisy tenant
+	// is told 429.
+	CapAPIListFairness Capability = "api-list-fairness"
 )
 
 // UseCase is one row of the coverage matrix.
@@ -295,6 +311,7 @@ var KnownCapabilities = map[Capability]bool{
 	CapL4ProxyProtocol: true, CapPATRotation: true,
 	CapKeyCustodyVault: true, CapKeyCustodyPKCS11: true, CapKeyCustodyKMSWrapped: true,
 	CapKeyCustodyKMSSwitch: true, CapKeyCustodySingleWrapped: true,
+	CapAPILoadBalancer: true, CapAPIListFairness: true,
 }
 
 // Registry is the full use-case catalogue. Order is the matrix row order.
@@ -878,10 +895,54 @@ var Registry = []UseCase{
 	// Bank-readiness security, continued (bank_security_test.go).
 	{ID: "UC-339", Title: "Security: no sandbox reaches another sandbox's toolbox agent (port 2280) on any pair of runtimes; a Firecracker guest's agent, cold-booted or cloned from a template, refuses exec, files and sessions without its sandbox's token even from the node", Requires: []Capability{CapDocker}, Implemented: true},
 	{ID: "UC-340", Title: "Compatibility: IPv6 off inside sandboxes breaks no listener: on every runtime an AF_INET6 socket binds [::], and a listener on [::] accepts an IPv4 connection", Requires: []Capability{CapDocker}, Implemented: true},
+	// Early gateway attach (perf/egress-attach-early): the attach overlaps the
+	// runtime create, and must never open a sandbox or leave state behind.
+	{ID: "UC-341", Title: "Egress: a hostname-allowlisted sandbox has no unfiltered egress from its workload's first instruction (probes started at workload start never reach an outside address directly, during or after the create), and after the create only its allowlist is reachable", Requires: []Capability{CapEgressFQDN}, Implemented: true},
+	{ID: "UC-342", Title: "Egress: a hostname-filtered create that fails after the runtime built the sandbox leaves no gateway set element and no firewall rule per address on any node, and the next sandboxes get only their own policy", Requires: []Capability{CapEgressFQDN}, Implemented: true},
+	{ID: "UC-343", Title: "Egress: churn of hostname-rule sandboxes (create, fetch the allowed name, destroy; AEROL_EGRESS_CHURN times) leaves the gateway's sets and the host firewall's per-address rules flat on every node", Requires: []Capability{CapEgressFQDN}, Implemented: true},
 	// Bank-readiness stability, continued (bank_scale_test.go).
 	{ID: "UC-344", Title: "Stability: an exec in flight when its sandbox's runtime process is killed (runc init, gVisor sentry, Firecracker VMM) fails within 45 s, with 409 where the runtime reports the exit (502 allowed for Firecracker, which has no exit event); a healthy exec silent for 75 s first completes", Requires: []Capability{CapDocker}, Implemented: true},
 	// Bank-readiness security, continued (bank_security_test.go).
 	{ID: "UC-345", Title: "Security: a process OOM-killed inside a block-all sandbox (256 MiB, the UC-321 doubling bomb) neither stops the sandbox nor opens its egress, on every shell runtime: it still runs and answers exec, TCP to 1.1.1.1:443 still fails, and every host rule for its address is still on the node", Requires: []Capability{CapDocker}, Implemented: true},
+	// Restricted Docker creates start their own pause (fix/egress-docker-pause-on-demand).
+	{ID: "UC-346", Title: "Egress (Docker engine): a create with network rules (block-all, CIDR allow, CIDR deny, hostname allowlist) runs in a pause container named for it with or without the pause pool, probes from its workload's first instruction never reach an outside address directly, and its destroy leaves no pause, firewall rule or gateway entry", Requires: []Capability{CapDocker}, Implemented: true},
+	{ID: "UC-347", Title: "Egress (Docker engine): a create without network rules keeps Docker's own path: no docker_pause stage, and no pause container without the pause pool", Requires: []Capability{CapDocker}, Implemented: true},
+	{ID: "UC-358", Title: "Egress: a sandboxd killed (SIGKILL) between a hostname-filtered create's block and its lift leaves the address blocked (in @blocked, never in @released) through the restart until the orphan's removal lets it go", Requires: []Capability{CapEgressFQDN}, Implemented: true},
+	{ID: "UC-359", Title: "Egress: destroying a hostname-filtered sandbox removes its address from both block sets (no release left behind), and a block-all sandbox that gets the address next is shut from its first instruction", Requires: []Capability{CapEgressFQDN}, Implemented: true},
+	// Ingress high availability behind the load balancer (api_lb_test.go).
+	{ID: "UC-356", Title: "Ingress HA: with sandboxd stopped on one ingress node behind the health-checked load balancer, the node leaves rotation within the health-check window, API calls through the domain on fresh connections then see no 502 and no failure, and the node returns to rotation once its daemon is back", Requires: []Capability{CapAPILoadBalancer, CapDomain, CapCluster}, Implemented: true},
+	// Ingress proxy routing, continued (ingress_routing_test.go): the
+	// exec-stream churn gate for the cluster-bank-flagship UC-230/UC-266
+	// "unexpected EOF" dials.
+	{ID: "UC-357", Title: "Churn gate for new connections: through every ingress node, fresh TLS to the API and to a sandbox, and new exec streams, never reset or EOF while sandboxes are created and destroyed across the cluster", Requires: []Capability{CapIngressProxyRouting, CapCluster, CapDomain}, Implemented: true},
+	// Bank-readiness stability, continued (bank_scale_test.go): containerd
+	// task output kept draining after create (the UC-171 flagship stall).
+	{ID: "UC-360", Title: "Stability: a sandbox whose main process writes 3 MiB to stdout and 3 MiB to stderr after create keeps running and finishes, on every container runtime (output is drained past the pipe buffers and the task-log cap)", Requires: []Capability{CapDocker}, Implemented: true},
+	// Overload is shed, never turned into an outage (overload_shed_test.go):
+	// the bank-flagship ramp's 1024-client list collapse and watchdog restart.
+	{ID: "UC-361", Title: "Overload: N concurrent clients (default 1024) listing sandboxes through the domain for 60 s get 200 or a refusal with Retry-After (503/429), never 502, another 5xx, a refused or reset connection or a request hung past 30 s; no sandboxd on any node restarts (InvocationID, NRestarts and the journal unchanged); and the list is back to its baseline latency within 60 s of the load stopping", Requires: []Capability{CapCluster, CapDomain}, Implemented: true},
+	// Per-tenant fairness for the list gate (list_fairness_test.go): one
+	// tenant's list storm must not degrade another tenant's lists.
+	{ID: "UC-362", Title: "Fairness: two teams list sandboxes through every ingress node at once for 60 s, a noisy one with N clients (default 1024) and a quiet one with 4: the quiet team's lists succeed at least 99% of the time with a p99 within the stated bound (default 2 s), the noisy team is told 429 rate_limited with Retry-After and never sees a 502, another 5xx, a transport error or a request hung past 30 s, and no sandboxd restarts", Requires: []Capability{CapCluster, CapDomain, CapIdentity, CapDocker, CapAPIListFairness}, Implemented: true},
+	// Bank-readiness security, continued (bank_security_test.go): the egress
+	// deny floor fails closed and heals (disruptive; skipped in local mode).
+	{ID: "UC-363", Title: "Security: the egress deny floor fails closed and heals: with a runtime's AEROLVM-FLOOR chain removed over SSH, the node puts it back (jumped first, dropping 169.254.169.254) within 45 s, aerolvm_egress_floor_ready reads 1 for that runtime and the journal names the repair; every create on that runtime meanwhile succeeds or gets 503 egress_floor_not_ready, and the metadata endpoints stay unreachable from the running sandbox and a new one on the node", Requires: []Capability{CapDocker}, Implemented: true},
+	// A Docker snapshot keeps no secrets (secrets_env_test.go): the commit
+	// used to copy the sandbox's toolbox token and env into the image config.
+	{ID: "UC-364", Title: "Secrets: a Docker snapshot of a sandbox created with an env secret keeps neither the secret nor its toolbox token, in the image config dockerd reports or in any env list `docker save` holds (what a registry push sends), and a sandbox created from the snapshot runs on its own token and sees the variable empty", Requires: []Capability{CapDocker, CapDockerEngine}, Implemented: true},
+	// An Idempotency-Key reused with a different request is refused
+	// (bank_security_test.go): v1 and Daytona used to hand back the old
+	// sandbox and drop the new request.
+	{ID: "UC-365", Title: "Security: an Idempotency-Key reused with a different create request is refused, on v1 and Daytona: the same request replays the same sandbox, a changed env gets 422 idempotency_key_reused naming the key and carrying no sandbox data or secret, and the first sandbox is untouched", Requires: []Capability{CapDocker}, Implemented: true},
+	// Keyed digests agree across nodes (keyed_digest_test.go): the Runloop
+	// devbox id and the exec record's body digest are HMACs under the
+	// server key, not plain SHA-256 a reader could test guesses against.
+	{ID: "UC-366", Title: "Security: values derived from secret-bearing request bodies are keyed with the server key and agree across nodes: a Runloop create retried with the same x-request-id through a second node gets the same devbox, another env value under that x-request-id gets another devbox, and one exec body run on sandboxes of two different owners is recorded on both as the same hmac:<key id>:<64 hex> digest, never the body's plain SHA-256 or the secret", Requires: []Capability{CapCluster, CapDocker}, Implemented: true},
+	// Concurrent retries of one Idempotency-Key create (idempotency_concurrent_test.go):
+	// each retry used to run a second create of the id on the owner, fail on
+	// the container name, and release the first create's capacity reservation
+	// and mounts on its way out.
+	{ID: "UC-367", Title: "Idempotency: N concurrent v1 creates (default 8) with one Idempotency-Key and one body, sent at once through every ingress node, all answer 201 naming one sandbox; exactly one sandbox carries the request's tag; and the owner node's GET /v1/capacity holds exactly that sandbox's reservation (deleting it gives back one sandbox at its cpu and memory, not zero)", Requires: []Capability{CapDocker}, Implemented: true},
 }
 
 // byID is a lookup built once for the report generator.

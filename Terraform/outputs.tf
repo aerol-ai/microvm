@@ -22,12 +22,17 @@ output "nodes" {
 }
 
 output "ingress_public_ips" {
-  description = "Public IPs of every node whose role set contains \"ingress\". These are pointed at <domain_name> + wildcard in Cloudflare."
+  description = "Public IPs of every node whose role set contains \"ingress\". Cloudflare points <domain_name> + wildcard at them, or, with api_load_balancer = \"nlb\", tcp.<domain_name> (the balancer takes the rest)."
   value       = [for n in local.ingress_node_names : local.all_instances[n].public_ip]
 }
 
 output "ingress_hostname" {
   value = local.domain_name
+}
+
+output "api_load_balancer" {
+  description = "The load balancer in front of the ingress nodes (api_load_balancer = \"nlb\"): its IP (what <domain_name> resolves to), DNS name, the raw-TCP host name, the health-check port and the target group ARN per listener port. null when api_load_balancer = \"none\"."
+  value       = local.api_lb_summary
 }
 
 # api_base_url is the single endpoint the integration harness points its SDK at.
@@ -64,6 +69,9 @@ output "integration_targets" {
     pushgateway_url = var.deploy_obs ? "http://${aws_instance.obs[0].public_ip}:9091" : ""
     obs_public_ip   = var.deploy_obs ? aws_instance.obs[0].public_ip : ""
     obs_private_ip  = var.deploy_obs ? aws_instance.obs[0].private_ip : ""
+    # UC-356 checks that the domain resolves to this address only (the run
+    # measures the balancer, not round-robin) and reads target health.
+    api_load_balancer = local.api_lb_summary
   }
 }
 

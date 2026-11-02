@@ -2,17 +2,21 @@
 
 package suite
 
-// Group D — env sealing and the API contract (§7 group D, F5). UC-126..129.
+// Group D — env sealing and the API contract (§7 group D, F5). UC-126..129,
+// and UC-364 (a Docker snapshot keeps no secrets).
 // UC-130 is disruptive and lives in z_secrets_env_loss_test.go.
 
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/aerol-ai/microvm/integration-tests/suite/harness"
+	microvm "github.com/aerol-ai/microvm/sdk/go/pkg/microvm"
 	sdktypes "github.com/aerol-ai/microvm/sdk/go/pkg/types"
 )
 
@@ -181,4 +185,119 @@ func TestOnDiskEnvIsSealedAndSurvivesAnUpdate(t *testing.T) {
 	if withEnv.Env["UC129_TOKEN"] != secret {
 		t.Fatalf("the sealed env did not survive an unrelated update: got %q", withEnv.Env["UC129_TOKEN"])
 	}
+}
+
+// UC-364 — a Docker snapshot keeps neither the sandbox's toolbox token nor
+// its env secrets, and a sandbox created from it gets only its own.
+//
+// A Docker commit copies the container's env into the image, and the
+// graphdriver store also records the container's original config with it.
+// Both are read here the way they leave the node: the image config dockerd
+// reports, and every env list in `docker save`, which holds the same config a
+// registry push sends. Read over SSH because the API never shows an image's
+// config at all.
+func TestDockerSnapshotKeepsNoSecrets(t *testing.T) {
+	harness.Require(t, sc, "UC-364")
+	targets := harness.LoadIntegrationTargets()
+	if targets == nil {
+		t.Skip("AEROL_INTEGRATION_TARGETS not set (run via integration-tests/run.sh)")
+	}
+	c := client(t)
+	secret := secretValue(t, "363")
+
+	src := c.NewSandbox(t, sdktypes.CreateSandboxOptions{
+		Name: harness.UniqueName(sc, t),
+		Env:  map[string]string{"UC363_TOKEN": secret},
+	})
+	waitRunning(t, src)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Minute)
+	defer cancel()
+	snap, err := c.SDK().CreateSnapshot(ctx, src.ID, harness.UniqueName(sc, t)+"-snap")
+	if err != nil {
+		t.Fatalf("create snapshot: %v", err)
+	}
+	t.Cleanup(func() {
+		cctx, ccancel := context.WithTimeout(context.Background(), time.Minute)
+		defer ccancel()
+		_ = c.SDK().DeleteSnapshot(cctx, snap.Name)
+	})
+
+	// The commit ran on the node that runs the source sandbox.
+	node, ok := nodeForClusterID(t, c, targets, resolvePlacementOwner(t, c, src.ID))
+	if !ok {
+		// Single-node deployments have no placement; the seed ran it.
+		if node, ok = harness.PickSSHNode(targets); !ok {
+			t.Skip("no SSH-reachable node holding the snapshot image")
+		}
+	}
+	target, _ := harness.SSHTarget(node)
+	script, err := dockerSnapshotEnvScript(snap.Image)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := harness.SSHRun(t, target, script)
+	if err != nil {
+		t.Fatalf("read the snapshot image on %s: %v", node.Name, err)
+	}
+	if strings.Contains(out, "NOIMAGE") {
+		t.Fatalf("snapshot image %s is not in dockerd's store on %s; this case needs the docker engine", snap.Image, node.Name)
+	}
+	// The cleared token key proves these are the sandbox's env lists, not
+	// some unrelated JSON; without it the absence checks prove nothing.
+	if !strings.Contains(out, "SB_TOOLBOX_TOKEN=") || !strings.Contains(out, "UC363_TOKEN=") {
+		t.Fatalf("the image's env lists do not name the sandbox's variables, so their contents prove nothing:\n%s", out)
+	}
+	harness.AssertNoPlaintext(t, "the snapshot image's config", out, secret)
+	for _, key := range []string{"SB_TOOLBOX_TOKEN", "SB_READY_NONCE", "UC363_TOKEN"} {
+		if regexp.MustCompile(key + `=[^"]`).MatchString(out) {
+			t.Fatalf("the snapshot image keeps a value for %s; it must be cleared", key)
+		}
+	}
+
+	// A sandbox from the snapshot runs on its own token (exec works) and sees
+	// only the env its own create passed. In a cluster the snapshot reaches
+	// other nodes through a background push, so a create landing elsewhere
+	// can briefly fail to pull it (see UC-21).
+	derivedName := harness.UniqueName(sc, t)
+	var derived *microvm.Sandbox
+	deadline := time.Now().Add(3 * time.Minute)
+	for {
+		derived, err = c.SDK().Create(ctx, sdktypes.CreateSandboxOptions{Image: snap.Image, Name: derivedName})
+		if err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("create from snapshot never succeeded: %v", err)
+		}
+		time.Sleep(5 * time.Second)
+	}
+	t.Cleanup(func() {
+		cctx, ccancel := context.WithTimeout(context.Background(), time.Minute)
+		defer ccancel()
+		_ = c.SDK().Destroy(cctx, derived.ID)
+	})
+	waitRunning(t, derived)
+	if got := execOK(t, derived, `printf '[%s]' "${UC363_TOKEN:-}"`); got != "[]" {
+		harness.AssertNoPlaintext(t, "the restored sandbox's env", got, secret)
+		t.Fatalf("the restored sandbox sees UC363_TOKEN = %d bytes, want it empty", len(got)-2)
+	}
+}
+
+// snapshotImageRef is the shape of an image reference the script may quote.
+var snapshotImageRef = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._/:@-]*$`)
+
+// dockerSnapshotEnvScript prints the env lists dockerd holds for image: its
+// config, then every "Env" list in `docker save` (the config, and on the
+// graphdriver store the recorded container config). NOIMAGE when dockerd does
+// not have it. Nothing secret is on the command line.
+func dockerSnapshotEnvScript(image string) (string, error) {
+	if !snapshotImageRef.MatchString(image) {
+		return "", fmt.Errorf("unexpected snapshot image reference %q", image)
+	}
+	return fmt.Sprintf(`img='%s'
+if ! command -v docker >/dev/null 2>&1 || ! sudo docker image inspect "$img" >/dev/null 2>&1; then echo NOIMAGE; exit 0; fi
+echo '## config'; sudo docker image inspect -f '{{json .Config.Env}}' "$img"
+echo '## saved'; sudo docker save "$img" | grep -a -o '"Env":\[[^]]*\]' | sort -u
+`, image), nil
 }

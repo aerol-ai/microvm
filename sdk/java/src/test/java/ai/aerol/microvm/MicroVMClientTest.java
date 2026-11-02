@@ -2570,6 +2570,393 @@ class MicroVMClientTest {
         }
     }
 
+    // With a 1 ms backoff, only the server's Retry-After explains a 1 s wait.
+    // The cases run side by side so the test takes about 2 s.
+    @Test
+    void retryWaitsOutRetryAfterOn429And503() throws Exception {
+        java.time.format.DateTimeFormatter imfFixdate =
+            java.time.format.DateTimeFormatter.ofPattern("EEE, dd MMM yyyy HH:mm:ss 'GMT'", java.util.Locale.US);
+        String inTwoSeconds = imfFixdate.format(java.time.ZonedDateTime.now(java.time.ZoneOffset.UTC).plusSeconds(2));
+        // {name, status, header, min ms, max ms}; the date has whole-second
+        // precision, so it asks for 1-2 s.
+        Object[][] cases = {
+            {"429 seconds", 429, "1", 1000L, 2000L},
+            {"503 seconds", 503, "1", 1000L, 2000L},
+            {"503 HTTP date", 503, inTwoSeconds, 1000L, 3000L},
+        };
+        java.util.concurrent.ExecutorService pool = java.util.concurrent.Executors.newFixedThreadPool(cases.length * 2);
+        try {
+            List<java.util.concurrent.Future<?>> runs = new ArrayList<>();
+            for (Object[] c : cases) {
+                for (boolean exec : new boolean[] {false, true}) {
+                    runs.add(pool.submit(() -> {
+                        AtomicInteger hits = new AtomicInteger();
+                        HttpServer server = pacedServer((Integer) c[1], 1, () -> (String) c[2], hits);
+                        try {
+                            long start = System.nanoTime();
+                            getOrExec(clientFor(serverUrl(server), fastRetry(), HttpClient.newHttpClient()), exec);
+                            long elapsedMs = (System.nanoTime() - start) / 1_000_000;
+                            String name = c[0] + (exec ? "/exec" : "/get");
+                            assertEquals(2, hits.get(), name);
+                            assertTrue(elapsedMs >= (Long) c[3] && elapsedMs <= (Long) c[4], name + ": retried after " + elapsedMs + " ms");
+                        } finally {
+                            server.stop(0);
+                        }
+                        return null;
+                    }));
+                }
+            }
+            for (java.util.concurrent.Future<?> run : runs) {
+                run.get();
+            }
+        } finally {
+            pool.shutdownNow();
+        }
+    }
+
+    @Test
+    void retryAfterIsCappedByMaxRetryAfterMs() throws Exception {
+        AtomicInteger hits = new AtomicInteger();
+        HttpServer server = pacedServer(503, 1, () -> "120", hits);
+        try {
+            MicroVMClient client = clientFor(serverUrl(server), fastRetry().setMaxRetryAfterMs(100), HttpClient.newHttpClient());
+            long start = System.nanoTime();
+            client.get("sb-1");
+            long elapsedMs = (System.nanoTime() - start) / 1_000_000;
+            assertEquals(2, hits.get());
+            assertTrue(elapsedMs >= 80 && elapsedMs <= 1000, "Retry-After: 120 with a 100 ms cap waited " + elapsedMs + " ms");
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    // A missing or malformed header, or one on a status that is a hop's rather
+    // than the server's pacing (421/502/504), keeps the 1 ms backoff.
+    @Test
+    void retryWithoutUsableRetryAfterUsesBackoff() throws Exception {
+        Object[][] cases = {{503, null}, {429, "soon"}, {503, "-1"}, {421, "120"}, {502, "120"}, {504, "120"}};
+        for (Object[] c : cases) {
+            AtomicInteger hits = new AtomicInteger();
+            HttpServer server = pacedServer((Integer) c[0], 1, () -> (String) c[1], hits);
+            try {
+                long start = System.nanoTime();
+                clientFor(serverUrl(server), fastRetry(), HttpClient.newHttpClient()).get("sb-1");
+                long elapsedMs = (System.nanoTime() - start) / 1_000_000;
+                assertEquals(2, hits.get(), c[0] + " " + c[1]);
+                assertTrue(elapsedMs < 500, c[0] + " " + c[1] + ": retried after " + elapsedMs + " ms");
+            } finally {
+                server.stop(0);
+            }
+        }
+    }
+
+    @Test
+    void retryAfterKeepsRetryBudgetAndStatuses() throws Exception {
+        AtomicInteger exhausted = new AtomicInteger();
+        HttpServer server = pacedServer(503, 100, () -> "0", exhausted);
+        try {
+            MicroVMException ex = assertThrows(MicroVMException.class,
+                () -> clientFor(serverUrl(server), fastRetry(), HttpClient.newHttpClient()).get("sb-1"));
+            assertEquals("busy", ex.getMessage());
+            assertEquals(4, exhausted.get(), "1 + 3 retries");
+        } finally {
+            server.stop(0);
+        }
+
+        for (int status : new int[] {400, 404, 500}) {
+            AtomicInteger hits = new AtomicInteger();
+            HttpServer refusing = pacedServer(status, 100, () -> "1", hits);
+            try {
+                assertThrows(MicroVMException.class,
+                    () -> clientFor(serverUrl(refusing), fastRetry(), HttpClient.newHttpClient()).get("sb-1"));
+                assertEquals(1, hits.get(), status + " is not retried");
+            } finally {
+                refusing.stop(0);
+            }
+        }
+
+        AtomicInteger execHits = new AtomicInteger();
+        HttpServer gateway = pacedServer(502, 100, () -> "1", execHits);
+        try {
+            assertThrows(MicroVMException.class,
+                () -> getOrExec(clientFor(serverUrl(gateway), fastRetry(), HttpClient.newHttpClient()), true));
+            assertEquals(1, execHits.get(), "exec does not re-send a 502");
+        } finally {
+            gateway.stop(0);
+        }
+    }
+
+    // Future.cancel(true) interrupts the calling thread; the call must end
+    // then, not after a 30 s Retry-After, and keep the interrupt flag set.
+    @Test
+    void cancelEndsRetryAfterWait() throws Exception {
+        for (boolean exec : new boolean[] {false, true}) {
+            AtomicInteger hits = new AtomicInteger();
+            HttpServer server = pacedServer(503, 100, () -> "30", hits);
+            java.util.concurrent.ExecutorService pool = java.util.concurrent.Executors.newSingleThreadExecutor();
+            try {
+                MicroVMClient client = clientFor(serverUrl(server), fastRetry(), HttpClient.newHttpClient());
+                AtomicReference<Throwable> outcome = new AtomicReference<>();
+                java.util.concurrent.atomic.AtomicBoolean interrupted = new java.util.concurrent.atomic.AtomicBoolean();
+                java.util.concurrent.CountDownLatch done = new java.util.concurrent.CountDownLatch(1);
+                java.util.concurrent.Future<?> call = pool.submit(() -> {
+                    try {
+                        getOrExec(client, exec);
+                    } catch (Throwable t) {
+                        outcome.set(t);
+                        interrupted.set(Thread.currentThread().isInterrupted());
+                    } finally {
+                        done.countDown();
+                    }
+                });
+                Thread.sleep(200);
+                call.cancel(true);
+                assertTrue(done.await(2, java.util.concurrent.TimeUnit.SECONDS), "the wait ignored the interrupt");
+                assertTrue(outcome.get() instanceof MicroVMException, String.valueOf(outcome.get()));
+                assertEquals("request interrupted during backoff", outcome.get().getMessage());
+                assertTrue(interrupted.get(), "the interrupt flag is restored");
+                assertEquals(1, hits.get());
+            } finally {
+                pool.shutdownNow();
+                server.stop(0);
+            }
+        }
+    }
+
+    /**
+     * Answers the first {@code refusals} requests with {@code status} and the
+     * Retry-After {@code retryAfter} supplies (none for null), then 200.
+     */
+    private static HttpServer pacedServer(int status, int refusals, java.util.function.Supplier<String> retryAfter, AtomicInteger hits) throws IOException {
+        return startServer(exchange -> {
+            exchange.getRequestBody().readAllBytes();
+            if (hits.incrementAndGet() <= refusals) {
+                String value = retryAfter.get();
+                if (value != null) {
+                    exchange.getResponseHeaders().set("Retry-After", value);
+                }
+                writeJson(exchange, status, mapOf("error", "busy", "code", "overloaded"));
+                return;
+            }
+            if (exchange.getRequestURI().getPath().endsWith("/toolbox/process/execute")) {
+                writeJson(exchange, 200, mapOf("stdout", "", "stderr", "", "exit_code", 0, "duration_ms", 1));
+                return;
+            }
+            writeJson(exchange, 200, mapOf(
+                "id", "sb-1",
+                "image", "ubuntu:22.04",
+                "status", "started",
+                "created_at", "2026-05-07T10:00:00Z",
+                "updated_at", "2026-05-07T10:00:00Z"
+            ));
+        });
+    }
+
+    /** Get is idempotent; exec is re-sent only after a refusal. */
+    private static void getOrExec(MicroVMClient client, boolean exec) {
+        if (exec) {
+            client.exec("sb-1", new ExecRequest().setCommand("true"));
+        } else {
+            client.get("sb-1");
+        }
+    }
+
+    // Every HTTP error is a MicroVMApiException carrying the status, the
+    // server's stable code and its Retry-After, with the message unchanged.
+    @Test
+    void createErrorsCarryStatusCodeAndRetryAfter() throws Exception {
+        Object[][] cases = {
+            // {name, status, content type, Retry-After, body, code, message, retry after}
+            {"422 idempotency_key_reused", 422, "application/json", null,
+                "{\"error\":\"Idempotency-Key reused with a different request\",\"code\":\"idempotency_key_reused\"}",
+                "idempotency_key_reused", "Idempotency-Key reused with a different request", null},
+            {"503 egress_floor_not_ready", 503, "application/json", "5",
+                "{\"error\":\"egress deny floor not ready\",\"code\":\"egress_floor_not_ready\"}",
+                "egress_floor_not_ready", "egress deny floor not ready", java.time.Duration.ofSeconds(5)},
+            {"non-JSON body", 502, "text/html", null, "<html>Bad Gateway</html>",
+                null, "request failed with status 502", null},
+        };
+        for (Object[] c : cases) {
+            String name = (String) c[0];
+            int status = (Integer) c[1];
+            HttpServer server = startServer(exchange -> {
+                if (c[3] != null) {
+                    exchange.getResponseHeaders().set("Retry-After", (String) c[3]);
+                }
+                writeResponse(exchange, status, (String) c[2], ((String) c[4]).getBytes(StandardCharsets.UTF_8));
+            });
+            try {
+                MicroVMClient client = clientFor(serverUrl(server), new RetryConfig().setMaxRetries(0), HttpClient.newHttpClient());
+                MicroVMApiException err = assertThrows(MicroVMApiException.class,
+                    () -> client.create(new CreateOptions().setImage("ubuntu:22.04")), name);
+                assertTrue(err instanceof MicroVMException, name);
+                assertEquals(status, err.getStatusCode(), name);
+                assertEquals(c[5], err.getCode(), name);
+                assertEquals(c[6], err.getMessage(), name);
+                assertEquals(c[7], err.getRetryAfter(), name);
+            } finally {
+                server.stop(0);
+            }
+        }
+    }
+
+    @Test
+    void idempotencyKeyReusedIsNotRetried() throws Exception {
+        AtomicInteger hits = new AtomicInteger();
+        HttpServer server = startServer(exchange -> {
+            hits.incrementAndGet();
+            writeJson(exchange, 422, mapOf("error", "reused", "code", "idempotency_key_reused"));
+        });
+        try {
+            MicroVMClient client = clientFor(serverUrl(server), fastRetry(), HttpClient.newHttpClient());
+            MicroVMApiException err = assertThrows(MicroVMApiException.class,
+                () -> client.create(new CreateOptions().setImage("ubuntu:22.04")));
+            assertEquals("idempotency_key_reused", err.getCode());
+            assertEquals(1, hits.get());
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    // A create carries an Idempotency-Key: the caller's, or one the SDK makes
+    // per call and sends unchanged on every automatic retry of that call.
+    @Test
+    void createSendsTheCallersIdempotencyKeyNotInTheBody() throws Exception {
+        List<String> keys = java.util.Collections.synchronizedList(new ArrayList<>());
+        AtomicReference<Map<String, Object>> body = new AtomicReference<>();
+        HttpServer server = startServer(exchange -> {
+            keys.add(exchange.getRequestHeaders().getFirst("Idempotency-Key"));
+            body.set(castMap(JsonSupport.read(exchange.getRequestBody().readAllBytes(), Map.class)));
+            writeJson(exchange, 201, mapOf("id", "sb-keyed", "image", "ubuntu:22.04", "status", "started"));
+        });
+        try {
+            MicroVMClient client = clientFor(serverUrl(server), fastRetry(), HttpClient.newHttpClient());
+            client.create(new CreateOptions().setImage("ubuntu:22.04").setIdempotencyKey(" order-42 "));
+            assertEquals(List.of("order-42"), keys);
+            assertFalse(body.get().containsKey("idempotency_key"));
+            assertFalse(body.get().containsKey("idempotencyKey"));
+            assertEquals("ubuntu:22.04", body.get().get("image"));
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void createKeepsOneIdempotencyKeyAcrossRetries() throws Exception {
+        // Two 503s, then the sandbox.
+        List<String> keys = java.util.Collections.synchronizedList(new ArrayList<>());
+        HttpServer server = startServer(exchange -> {
+            keys.add(exchange.getRequestHeaders().getFirst("Idempotency-Key"));
+            if (keys.size() <= 2) {
+                exchange.getResponseHeaders().set("Retry-After", "0");
+                writeJson(exchange, 503, mapOf("error", "egress deny floor not ready", "code", "egress_floor_not_ready"));
+                return;
+            }
+            writeJson(exchange, 201, mapOf("id", "sb-keyed", "image", "ubuntu:22.04", "status", "started"));
+        });
+        try {
+            MicroVMClient client = clientFor(serverUrl(server), fastRetry(), HttpClient.newHttpClient());
+            Sandbox sandbox = client.create(new CreateOptions().setImage("ubuntu:22.04"));
+            assertEquals("sb-keyed", sandbox.id);
+            assertEquals(3, keys.size());
+            assertTrue(keys.get(0).matches("[0-9a-f]{32}"), keys.get(0));
+            assertEquals(List.of(keys.get(0), keys.get(0), keys.get(0)), keys);
+
+            // Two connection resets after the request may have been sent, then
+            // the sandbox; the caller's key rides every attempt too.
+            for (String callerKey : new String[] {null, "order-42"}) {
+                ScriptedHttpClient http = new ScriptedHttpClient(
+                    new SocketException("Connection reset"),
+                    new SocketException("Connection reset")
+                );
+                MicroVMClient resetClient = clientFor(serverUrl(server), fastRetry(), http);
+                resetClient.create(new CreateOptions().setImage("ubuntu:22.04").setIdempotencyKey(callerKey));
+                assertEquals(3, http.sends.get());
+                String first = http.idempotencyKeys.get(0);
+                if (callerKey == null) {
+                    assertTrue(first.matches("[0-9a-f]{32}"), first);
+                } else {
+                    assertEquals(callerKey, first);
+                }
+                assertEquals(List.of(first, first, first), http.idempotencyKeys);
+            }
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void eachCreateCallGetsANewIdempotencyKey() throws Exception {
+        List<String> keys = java.util.Collections.synchronizedList(new ArrayList<>());
+        HttpServer server = startServer(exchange -> {
+            keys.add(exchange.getRequestHeaders().getFirst("Idempotency-Key"));
+            writeJson(exchange, 201, mapOf("id", "sb-keyed", "image", "ubuntu:22.04", "status", "started"));
+        });
+        try {
+            MicroVMClient client = clientFor(serverUrl(server), fastRetry(), HttpClient.newHttpClient());
+            client.create(new CreateOptions().setImage("ubuntu:22.04"));
+            client.create(new CreateOptions().setImage("ubuntu:22.04"));
+            client.create(new CreateOptions().setImage("ubuntu:22.04").setIdempotencyKey("   "));
+            assertEquals(3, new java.util.HashSet<>(keys).size(), keys.toString());
+            for (String key : keys) {
+                assertTrue(key.matches("[0-9a-f]{32}"), key);
+            }
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void createWithImageKeepsTheCallersIdempotencyKey() throws Exception {
+        Map<String, String> keyByPath = new java.util.concurrent.ConcurrentHashMap<>();
+        HttpServer server = startServer(exchange -> {
+            String path = exchange.getRequestURI().getPath();
+            keyByPath.put(path, String.valueOf(exchange.getRequestHeaders().getFirst("Idempotency-Key")));
+            if ("/v1/images/build".equals(path)) {
+                writeJson(exchange, 200, mapOf("image", "aerolvm-build/abc:latest"));
+                return;
+            }
+            writeJson(exchange, 201, mapOf("id", "sb-keyed", "image", "aerolvm-build/abc:latest", "status", "started"));
+        });
+        try {
+            MicroVMClient client = clientFor(serverUrl(server), fastRetry(), HttpClient.newHttpClient());
+            client.createWithImage(Image.base("alpine"), new CreateOptions().setIdempotencyKey("order-42"));
+            assertEquals("order-42", keyByPath.get("/v1/sandboxes"));
+            assertEquals("null", keyByPath.get("/v1/images/build"), "only the create carries the key");
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void onlySandboxCreateSendsTheIdempotencyKey() throws Exception {
+        List<String> keys = java.util.Collections.synchronizedList(new ArrayList<>());
+        HttpServer server = startServer(exchange -> {
+            keys.add(String.valueOf(exchange.getRequestHeaders().getFirst("Idempotency-Key")));
+            writeJson(exchange, 200, mapOf("id", "sb-keyed", "image", "ubuntu:22.04", "status", "started",
+                "stdout", "", "stderr", "", "exit_code", 0));
+        });
+        try {
+            MicroVMClient client = clientFor(serverUrl(server), fastRetry(), HttpClient.newHttpClient());
+            client.get("sb-keyed");
+            client.exec("sb-keyed", new ExecRequest().setCommand("true"));
+            assertEquals(List.of("null", "null"), keys);
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void newIdempotencyKeysAreHexAndUnique() {
+        java.util.Set<String> keys = new java.util.HashSet<>();
+        for (int i = 0; i < 1000; i++) {
+            String key = MicroVMClient.newIdempotencyKey();
+            assertTrue(key.matches("[0-9a-f]{32}"), key);
+            keys.add(key);
+        }
+        assertEquals(1000, keys.size());
+    }
+
     private static MicroVMClient clientFor(HttpServer server) {
         return new MicroVMClient(
             new MicroVMConfig().setApiUrl(serverUrl(server)).setPatToken("pat-token"),
@@ -2673,6 +3060,8 @@ class MicroVMClientTest {
         private final HttpClient delegate = HttpClient.newHttpClient();
         private final java.util.ArrayDeque<IOException> failures;
         private final AtomicInteger sends = new AtomicInteger();
+        // The Idempotency-Key of every request sent, failed ones included.
+        private final List<String> idempotencyKeys = java.util.Collections.synchronizedList(new ArrayList<>());
 
         private ScriptedHttpClient(IOException... failures) {
             this.failures = new java.util.ArrayDeque<>(List.of(failures));
@@ -2681,6 +3070,7 @@ class MicroVMClientTest {
         @Override
         public <T> HttpResponse<T> send(HttpRequest request, HttpResponse.BodyHandler<T> handler) throws IOException, InterruptedException {
             sends.incrementAndGet();
+            idempotencyKeys.add(request.headers().firstValue(MicroVMClient.IDEMPOTENCY_KEY_HEADER).orElse(null));
             IOException failure = failures.poll();
             if (failure != null) {
                 throw failure;

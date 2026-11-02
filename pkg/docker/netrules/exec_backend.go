@@ -143,3 +143,34 @@ func (e *execBackend) EnsureJumpChain(parent, child string) error {
 func (e *execBackend) FlushChain(chain string) error {
 	return e.ipt.ClearChain("filter", chain)
 }
+
+// ClearAddressRules implements addressRuleClearer: each chain listed once
+// (`iptables -S`), and every rule keyed by ip deleted by its spec.
+func (e *execBackend) ClearAddressRules(chains []string, ip string) error {
+	for _, chain := range chains {
+		lines, err := e.ipt.List("filter", chain)
+		if err != nil {
+			if ruleNotExist(err) {
+				continue
+			}
+			return fmt.Errorf("list %s: %w", chain, err)
+		}
+		for _, line := range lines {
+			f := strings.Fields(line)
+			if len(f) < 3 || f[0] != "-A" || f[1] != chain {
+				continue
+			}
+			spec := f[2:]
+			for i := range spec {
+				spec[i] = strings.Trim(spec[i], `"`)
+			}
+			if !addressRuleKeyed(spec, ip) {
+				continue
+			}
+			if err := e.ipt.Delete("filter", chain, spec...); err != nil && !ruleNotExist(err) {
+				return fmt.Errorf("delete %s rule: %w", chain, err)
+			}
+		}
+	}
+	return nil
+}

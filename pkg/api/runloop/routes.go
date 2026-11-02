@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/aerol-ai/microvm/internal/service"
 	"github.com/aerol-ai/microvm/pkg/api/apihttp"
@@ -38,6 +39,10 @@ type Deps struct {
 	// (SB_RUNLOOP_BLUEPRINT_MAP_JSON), read once in config; the facade parses
 	// it and applies its own defaults.
 	BlueprintMapJSON string
+	// ListGate bounds the cluster-wide lists this node runs at once
+	// (clusterlist.Admit); nil admits every list. One gate is shared by v1
+	// and every facade: they cost the same fan-out.
+	ListGate *apihttp.Gate
 }
 
 // RouteBy returns h behind authenticate → authorize → audit seam
@@ -74,6 +79,10 @@ type handlers struct {
 	// the first read of its state. Tests only: it lets one put the watcher
 	// ahead of that read without relying on scheduling. Nil in production.
 	testAfterSubmit func(devboxID string, ref execRef)
+	// legacyDevboxIDsUntil ends the window in which a create still looks
+	// for a devbox under the unkeyed id older servers derived
+	// (legacyDevboxIDWindow).
+	legacyDevboxIDsUntil time.Time
 }
 
 func newHandlers(d Deps) *handlers {
@@ -84,6 +93,8 @@ func newHandlers(d Deps) *handlers {
 		execs:      newExecTracker(),
 		snapshots:  newSnapshotTracker(),
 		homes:      newHomeCache(),
+
+		legacyDevboxIDsUntil: time.Now().Add(legacyDevboxIDWindow),
 	}
 }
 

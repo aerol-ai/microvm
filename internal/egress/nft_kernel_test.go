@@ -470,3 +470,70 @@ func TestKernelDataPath(t *testing.T) {
 		}
 	})
 }
+
+// TestKernelControlPool: a control pool drops a sandbox's connection to
+// any host address in the pool on the pool's ports (here the host's side
+// of the sandbox link, as a guest's TAP address is), whatever addresses it
+// holds, and nothing else; an endpoint the pool covers listed as well
+// does not fail the set (its intervals may not overlap); taking the pool
+// away opens the port again.
+func TestKernelControlPool(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("needs root in a privileged container")
+	}
+	setupTopology(t)
+	resetTable(t)
+	for _, port := range []string{"21212", "21213"} {
+		ln, err := net.Listen("tcp", net.JoinHostPort(kHostSbx, port))
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = ln.Close() })
+		go func() {
+			for {
+				c, err := ln.Accept()
+				if err != nil {
+					return
+				}
+				_, _ = c.Write([]byte("ctl-" + port + "\n"))
+				_ = c.Close()
+			}
+		}()
+	}
+	g := New(Options{Backend: NewNFTBackend(), Conntrack: NetlinkConntrack{},
+		Layout: LayoutConfig{DNSPort: kDNSPort, ProxyPort: kProxy, FlowSetSize: 8}})
+	if err := g.Bootstrap(); err != nil {
+		t.Fatal(err)
+	}
+	guarded, open := net.JoinHostPort(kHostSbx, "21212"), net.JoinHostPort(kHostSbx, "21213")
+	if got := dialFromSandbox(t, guarded); got != "OK ctl-21212" {
+		t.Fatalf("baseline: %s", got)
+	}
+	subnet := netip.MustParsePrefix("10.201.0.0/24")
+	pool := ControlPool{Prefix: subnet, Ports: []uint16{21212}}
+	nw := NodeWide{Subnets: []netip.Prefix{subnet}, ControlPools: []ControlPool{pool}, ControlKnown: true}
+	if err := g.SetNodeWide(nw); err != nil {
+		t.Fatal(err)
+	}
+	if got := dialFromSandbox(t, guarded); !strings.HasPrefix(got, "TIMEOUT") {
+		t.Fatalf("pooled port: %s, want dropped", got)
+	}
+	if got := dialFromSandbox(t, open); got != "OK ctl-21213" {
+		t.Fatalf("a port the pool doesn't list: %s", got)
+	}
+	// The same address listed one by one too: left to the pool.
+	nw.Control = []netip.AddrPort{netip.MustParseAddrPort(guarded), netip.MustParseAddrPort("10.202.0.2:9000")}
+	if err := g.SetNodeWide(nw); err != nil {
+		t.Fatalf("an endpoint inside the pool: %v", err)
+	}
+	if got := dialFromSandbox(t, guarded); !strings.HasPrefix(got, "TIMEOUT") {
+		t.Fatalf("pooled port with the endpoint listed: %s", got)
+	}
+	nw.Control, nw.ControlPools = nil, nil
+	if err := g.SetNodeWide(nw); err != nil {
+		t.Fatal(err)
+	}
+	if got := dialFromSandbox(t, guarded); got != "OK ctl-21212" {
+		t.Fatalf("pool removed: %s", got)
+	}
+}

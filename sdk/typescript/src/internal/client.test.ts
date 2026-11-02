@@ -3,7 +3,8 @@ import { createServer, type RequestListener } from "node:http";
 import type { AddressInfo } from "node:net";
 import test from "node:test";
 
-import { APIClient, SandboxResource } from "./client.js";
+import { APIClient, SandboxResource, newIdempotencyKey, parseRetryAfter, retryDelayMs } from "./client.js";
+import { MicroVMApiError } from "../errors.js";
 import { Image } from "../Image.js";
 import type { CreateOptions, Sandbox } from "../types.js";
 
@@ -1893,4 +1894,397 @@ test("egress rules: binaries go out and come back as written", async () => {
   assert.deepEqual(bodies[1].network_egress_rules, [git, { host: "pypi.org" }]);
   assert.deepEqual(pol.networkEgressRules, [git, pip]);
   assert.deepEqual(sandbox.networkEgressRules, [git, pip]);
+});
+
+test("parseRetryAfter reads delta-seconds and HTTP dates", () => {
+  const now = Date.parse("2026-11-02T12:00:00Z");
+  const cases: Array<[string | null, number | undefined]> = [
+    [null, undefined],
+    ["", undefined],
+    ["   ", undefined],
+    ["3", 3000],
+    [" 3 ", 3000],
+    ["0", 0],
+    ["-1", undefined],
+    ["+3", undefined],
+    ["1.5", undefined],
+    ["soon", undefined],
+    ["Mon, 02 Nov 2026 12:00:07 GMT", 7000],
+    ["Mon, 02 Nov 2026 11:59:00 GMT", 0],
+    ["Mon, 32 Nov 2026 12:00:07 GMT", undefined],
+    // No zone: Date.parse would read it in local time, so it is refused.
+    ["Mon Nov  2 12:00:07 2026", undefined],
+  ];
+  for (const [value, want] of cases) {
+    assert.equal(parseRetryAfter(value, now), want, String(value));
+  }
+  assert.ok(parseRetryAfter("99999999999999999999", now)! > 1e20);
+});
+
+test("retryDelayMs honours Retry-After between the backoff and the cap", () => {
+  const now = Date.parse("2026-11-02T12:00:00Z");
+  const config = (maxRetryAfterMs: number) => ({ maxRetries: 3, baseDelayMs: 100, maxDelayMs: 1000, maxRetryAfterMs });
+  const cases: Array<{ name: string; limit: number; attempt: number; header: string | null; random: number; want: number }> = [
+    { name: "no header: backoff minus a quarter", limit: 2000, attempt: 0, header: null, random: 0, want: 75 },
+    { name: "no header: backoff plus a quarter", limit: 2000, attempt: 0, header: null, random: 1, want: 125 },
+    { name: "no header: doubles per attempt", limit: 2000, attempt: 2, header: null, random: 0.5, want: 400 },
+    { name: "no header: capped by maxDelayMs", limit: 2000, attempt: 5, header: null, random: 0.5, want: 1000 },
+    { name: "malformed header falls back", limit: 2000, attempt: 0, header: "soon", random: 0, want: 75 },
+    { name: "seconds: never sooner than asked", limit: 2000, attempt: 0, header: "1", random: 0, want: 1000 },
+    { name: "seconds: at most a fifth later", limit: 2000, attempt: 0, header: "1", random: 1, want: 1200 },
+    { name: "HTTP date", limit: 2000, attempt: 0, header: "Mon, 02 Nov 2026 12:00:01 GMT", random: 0, want: 1000 },
+    { name: "backoff is the floor", limit: 2000, attempt: 2, header: "0", random: 0, want: 400 },
+    { name: "spread stops at the cap", limit: 1100, attempt: 0, header: "1", random: 1, want: 1100 },
+    { name: "long ask is cut to the cap", limit: 2000, attempt: 0, header: "120", random: 0, want: 2000 },
+    { name: "long ask spreads below the cap", limit: 2000, attempt: 0, header: "120", random: 1, want: 1600 },
+    { name: "cap 0 ignores the header", limit: 0, attempt: 0, header: "120", random: 0, want: 75 },
+  ];
+  for (const tc of cases) {
+    assert.ok(Math.abs(retryDelayMs(config(tc.limit), tc.attempt, tc.header, now, tc.random) - tc.want) < 1e-9, tc.name);
+  }
+});
+
+/**
+ * A fetch that answers the first `refusals` calls with `status` and the
+ * Retry-After `header()` returns, then a sandbox (or an exec result). It
+ * records when each call arrived.
+ */
+function pacedFetch(status: number, refusals: number, header: () => string | null) {
+  const arrivals: number[] = [];
+  const signals: Array<AbortSignal | null | undefined> = [];
+  const fetchFn = async (input: RequestInfo | URL, init?: RequestInit) => {
+    arrivals.push(performance.now());
+    signals.push(init?.signal);
+    if (arrivals.length <= refusals) {
+      const value = header();
+      const headers: Record<string, string> = { "content-type": "application/json" };
+      if (value !== null) headers["retry-after"] = value;
+      return new Response(JSON.stringify({ error: "busy", code: "overloaded" }), { status, headers });
+    }
+    if (String(input).endsWith("/toolbox/process/execute")) {
+      return jsonResponse({ stdout: "ok\n", stderr: "", exit_code: 0, duration_ms: 1 });
+    }
+    return jsonResponse(apiSandbox("sb-paced"));
+  };
+  const gap = () => {
+    assert.ok(arrivals.length >= 2, `saw ${arrivals.length} calls, want a retry`);
+    return arrivals[1] - arrivals[0];
+  };
+  return { fetchFn, arrivals, signals, gap };
+}
+
+function pacedClient(fetchFn: ReturnType<typeof pacedFetch>["fetchFn"], extra: { maxRetryAfterMs?: number; signal?: AbortSignal } = {}) {
+  return new APIClient({
+    baseURL: "https://api.example.com",
+    patToken: "pat-token",
+    retry: { maxRetries: 3, baseDelayMs: 1, maxDelayMs: 1, maxRetryAfterMs: extra.maxRetryAfterMs },
+    signal: extra.signal,
+    fetch: fetchFn,
+  });
+}
+
+// Get is idempotent; exec is re-sent only after a refusal. Both honour it.
+const callBoth: Array<[string, (client: APIClient) => Promise<unknown>]> = [
+  ["get", (client) => client.get("sb-paced")],
+  ["exec", (client) => client.exec("sb-paced", { command: "true" })],
+];
+
+// With a 1 ms backoff, only the server's Retry-After explains a 1 s gap.
+test("internal client waits out Retry-After on 429 and 503", async () => {
+  const inTwoSeconds = () => new Date(Date.now() + 2000).toUTCString();
+  const cases: Array<{ name: string; status: number; header: () => string; min: number; max: number }> = [
+    { name: "429 seconds", status: 429, header: () => "1", min: 1000, max: 2000 },
+    { name: "503 seconds", status: 503, header: () => "1", min: 1000, max: 2000 },
+    // Whole-second precision: the date asks for 1-2 s.
+    { name: "503 HTTP date", status: 503, header: inTwoSeconds, min: 1000, max: 3000 },
+  ];
+  await Promise.all(cases.flatMap((tc) => callBoth.map(async ([callName, call]) => {
+    const paced = pacedFetch(tc.status, 1, tc.header);
+    await call(pacedClient(paced.fetchFn));
+    const gap = paced.gap();
+    // setTimeout may fire up to a millisecond early.
+    assert.ok(gap >= tc.min - 2 && gap <= tc.max, `${tc.name}/${callName}: retried after ${gap} ms`);
+  })));
+});
+
+test("internal client caps Retry-After at maxRetryAfterMs", async () => {
+  const paced = pacedFetch(503, 1, () => "120");
+  await pacedClient(paced.fetchFn, { maxRetryAfterMs: 100 }).get("sb-paced");
+  const gap = paced.gap();
+  assert.ok(gap >= 78 && gap <= 1000, `retried after ${gap} ms`);
+});
+
+// A missing or malformed header, or one on a status that is a hop's rather
+// than the server's pacing (421/502/504), leaves the 1 ms backoff in charge.
+test("internal client falls back to backoff without a usable Retry-After", async () => {
+  const cases: Array<[number, string | null]> = [
+    [503, null],
+    [429, "soon"],
+    [503, "-1"],
+    [421, "120"],
+    [502, "120"],
+    [504, "120"],
+  ];
+  for (const [status, header] of cases) {
+    const paced = pacedFetch(status, 1, () => header);
+    await pacedClient(paced.fetchFn).get("sb-paced");
+    assert.ok(paced.gap() < 500, `${status} ${header}: retried after ${paced.gap()} ms`);
+  }
+});
+
+test("internal client keeps its retry budget and statuses with Retry-After", async () => {
+  const exhausted = pacedFetch(503, 100, () => "0");
+  await assert.rejects(pacedClient(exhausted.fetchFn).get("sb-paced"), { message: "busy" });
+  assert.equal(exhausted.arrivals.length, 4, "1 + 3 retries");
+
+  for (const status of [400, 404, 500]) {
+    const paced = pacedFetch(status, 100, () => "1");
+    await assert.rejects(pacedClient(paced.fetchFn).get("sb-paced"));
+    assert.equal(paced.arrivals.length, 1, `${status} is not retried`);
+  }
+  const exec502 = pacedFetch(502, 100, () => "1");
+  await assert.rejects(pacedClient(exec502.fetchFn).exec("sb-paced", { command: "true" }));
+  assert.equal(exec502.arrivals.length, 1, "exec does not re-send a 502");
+});
+
+test("internal client signal ends a Retry-After wait", async () => {
+  const cases: Array<{ name: string; signal: () => AbortSignal; error: (err: unknown) => boolean }> = [
+    {
+      name: "abort",
+      signal: () => {
+        const controller = new AbortController();
+        setTimeout(() => controller.abort(new Error("caller gave up")), 100);
+        return controller.signal;
+      },
+      error: (err) => err instanceof Error && err.message === "caller gave up",
+    },
+    {
+      name: "timeout",
+      signal: () => AbortSignal.timeout(100),
+      error: (err) => err instanceof DOMException && err.name === "TimeoutError",
+    },
+  ];
+  for (const tc of cases) {
+    for (const [callName, call] of callBoth) {
+      const paced = pacedFetch(503, 100, () => "30");
+      const signal = tc.signal();
+      const start = performance.now();
+      await assert.rejects(call(pacedClient(paced.fetchFn, { signal })), tc.error, `${tc.name}/${callName}`);
+      const elapsed = performance.now() - start;
+      assert.ok(elapsed < 2000, `${tc.name}/${callName}: returned after ${elapsed} ms`);
+      assert.equal(paced.arrivals.length, 1, `${tc.name}/${callName}`);
+      assert.equal(paced.signals[0], signal, "fetch gets the client's signal");
+    }
+  }
+});
+
+test("internal client does not retry once its signal has aborted", async () => {
+  const controller = new AbortController();
+  let attempts = 0;
+  const client = new APIClient({
+    baseURL: "https://api.example.com",
+    patToken: "pat-token",
+    retry: { maxRetries: 3, baseDelayMs: 1, maxDelayMs: 1 },
+    signal: controller.signal,
+    fetch: async () => {
+      attempts++;
+      controller.abort();
+      // A transport error that would otherwise be retried.
+      throw new TypeError("fetch failed", { cause: Object.assign(new Error("reset"), { code: "ECONNRESET" }) });
+    },
+  });
+  await assert.rejects(client.get("sb-paced"), TypeError);
+  assert.equal(attempts, 1);
+});
+
+// Every HTTP error is a MicroVMApiError carrying the status, the server's
+// stable code and its Retry-After, with the message the SDK always threw.
+test("internal client errors carry status, code and Retry-After", async () => {
+  const cases: Array<{
+    name: string;
+    response: () => Response;
+    status: number;
+    code: string | undefined;
+    message: string;
+    retryAfterMs: number | undefined;
+    attempts: number;
+  }> = [
+    {
+      name: "422 idempotency_key_reused is not retried",
+      response: () => jsonResponse({ error: 'Idempotency-Key "k-1" was already used with a different request', code: "idempotency_key_reused" }, 422),
+      status: 422,
+      code: "idempotency_key_reused",
+      message: 'Idempotency-Key "k-1" was already used with a different request',
+      retryAfterMs: undefined,
+      attempts: 1,
+    },
+    {
+      name: "503 egress_floor_not_ready keeps Retry-After after the retries run out",
+      response: () =>
+        new Response(JSON.stringify({ error: "this node's egress deny floor is not ready", code: "egress_floor_not_ready" }), {
+          status: 503,
+          headers: { "content-type": "application/json", "retry-after": "0" },
+        }),
+      status: 503,
+      code: "egress_floor_not_ready",
+      message: "this node's egress deny floor is not ready",
+      retryAfterMs: 0,
+      attempts: 3,
+    },
+    {
+      name: "non-JSON body has no code and the status message",
+      response: () => new Response("<html>Bad Gateway</html>", { status: 502, headers: { "content-type": "text/html" } }),
+      status: 502,
+      code: undefined,
+      message: "request failed with status 502",
+      retryAfterMs: undefined,
+      attempts: 3,
+    },
+  ];
+  for (const tc of cases) {
+    let attempts = 0;
+    const client = new APIClient({
+      baseURL: "https://api.example.com",
+      patToken: "pat-token",
+      retry: { maxRetries: 2, baseDelayMs: 1, maxDelayMs: 1 },
+      fetch: async () => {
+        attempts++;
+        return tc.response();
+      },
+    });
+    const err = await client.create({ image: "ubuntu:22.04" }).then(
+      () => assert.fail(`${tc.name}: create should fail`),
+      (e: unknown) => e,
+    );
+    assert.ok(err instanceof MicroVMApiError, `${tc.name}: ${String(err)}`);
+    assert.ok(err instanceof Error, tc.name);
+    assert.equal(err.name, "MicroVMApiError", tc.name);
+    assert.equal(err.status, tc.status, tc.name);
+    assert.equal(err.code, tc.code, tc.name);
+    assert.equal(err.message, tc.message, tc.name);
+    assert.equal(err.retryAfterMs, tc.retryAfterMs, tc.name);
+    assert.equal(attempts, tc.attempts, tc.name);
+  }
+});
+
+test("internal client error Retry-After reads seconds and HTTP dates", async () => {
+  const at = Date.now() + 60_000;
+  const cases: Array<[string, (ms: number | undefined) => boolean]> = [
+    ["7", (ms) => ms === 7000],
+    [new Date(at).toUTCString(), (ms) => ms !== undefined && ms > 50_000 && ms <= 60_000],
+    ["soon", (ms) => ms === undefined],
+  ];
+  for (const [header, ok] of cases) {
+    const client = new APIClient({
+      baseURL: "https://api.example.com",
+      patToken: "pat-token",
+      retry: { maxRetries: 0 },
+      fetch: async () =>
+        new Response(JSON.stringify({ error: "busy", code: "overloaded" }), {
+          status: 503,
+          headers: { "content-type": "application/json", "retry-after": header },
+        }),
+    });
+    const err = await client.list().catch((e: unknown) => e);
+    assert.ok(err instanceof MicroVMApiError, header);
+    assert.ok(ok(err.retryAfterMs), `${header}: retryAfterMs=${err.retryAfterMs}`);
+  }
+});
+
+// A create carries an Idempotency-Key: the caller's, or one the SDK makes per
+// call and sends unchanged on every automatic retry of that call.
+function keyRecordingClient(script: Array<"ok" | "503" | "reset" | "422">) {
+  const keys: Array<string | null> = [];
+  const bodies: Array<Record<string, unknown>> = [];
+  const client = new APIClient({
+    baseURL: "https://api.example.com",
+    patToken: "pat-token",
+    retry: { maxRetries: 3, baseDelayMs: 1, maxDelayMs: 1 },
+    fetch: async (input, init) => {
+      const request = new Request(input, init);
+      keys.push(request.headers.get("idempotency-key"));
+      if (request.method === "POST" && request.url.endsWith("/v1/sandboxes")) {
+        bodies.push((await request.json()) as Record<string, unknown>);
+      }
+      const step = script[Math.min(keys.length - 1, script.length - 1)];
+      switch (step) {
+        case "503":
+          return new Response(JSON.stringify({ error: "busy", code: "egress_floor_not_ready" }), {
+            status: 503,
+            headers: { "content-type": "application/json", "retry-after": "0" },
+          });
+        case "reset":
+          throw new TypeError("fetch failed", { cause: Object.assign(new Error("reset"), { code: "ECONNRESET" }) });
+        case "422":
+          return jsonResponse({ error: "Idempotency-Key reused", code: "idempotency_key_reused" }, 422);
+        default:
+          return jsonResponse(apiSandbox("sb-keyed"), 201);
+      }
+    },
+  });
+  return { client, keys, bodies };
+}
+
+test("internal client create sends the caller's Idempotency-Key, not in the body", async () => {
+  const { client, keys, bodies } = keyRecordingClient(["ok"]);
+  await client.create({ image: "ubuntu:22.04", idempotencyKey: " order-42 " });
+  assert.deepEqual(keys, ["order-42"]);
+  assert.equal(bodies[0].idempotencyKey, undefined);
+  assert.equal(bodies[0].idempotency_key, undefined);
+  assert.equal(bodies[0].image, "ubuntu:22.04");
+});
+
+test("internal client create keeps one generated Idempotency-Key across retries", async () => {
+  for (const first of ["503", "reset"] as const) {
+    const { client, keys } = keyRecordingClient([first, first, "ok"]);
+    const sandbox = await client.create({ image: "ubuntu:22.04" });
+    assert.equal(sandbox.id, "sb-keyed", first);
+    assert.equal(keys.length, 3, first);
+    assert.match(keys[0] ?? "", /^[0-9a-f]{32}$/, first);
+    assert.deepEqual(keys, [keys[0], keys[0], keys[0]], `${first}: every attempt sends the first key`);
+  }
+});
+
+test("internal client create keeps the caller's Idempotency-Key across retries", async () => {
+  const { client, keys } = keyRecordingClient(["503", "ok"]);
+  await client.create({ image: "ubuntu:22.04", idempotencyKey: "order-42" });
+  assert.deepEqual(keys, ["order-42", "order-42"]);
+});
+
+test("internal client makes a new Idempotency-Key for each create call", async () => {
+  const { client, keys } = keyRecordingClient(["ok"]);
+  await client.create({ image: "ubuntu:22.04" });
+  await client.create({ image: "ubuntu:22.04" });
+  assert.equal(keys.length, 2);
+  assert.notEqual(keys[0], keys[1]);
+  // A blank key counts as none.
+  await client.create({ image: "ubuntu:22.04", idempotencyKey: "   " });
+  assert.match(keys[2] ?? "", /^[0-9a-f]{32}$/);
+});
+
+test("internal client create surfaces idempotency_key_reused without retrying", async () => {
+  const { client, keys } = keyRecordingClient(["422"]);
+  const err = await client.create({ image: "ubuntu:22.04", idempotencyKey: "order-42" }).catch((e: unknown) => e);
+  assert.ok(err instanceof MicroVMApiError);
+  assert.equal(err.status, 422);
+  assert.equal(err.code, "idempotency_key_reused");
+  assert.equal(keys.length, 1);
+});
+
+test("internal client sends Idempotency-Key only on sandbox create", async () => {
+  const { client, keys } = keyRecordingClient(["ok"]);
+  await client.get("sb-keyed");
+  await client.exec("sb-keyed", { command: "true" }).catch(() => undefined);
+  await client.createSnapshot("sb-keyed", "snap").catch(() => undefined);
+  assert.deepEqual(keys, [null, null, null]);
+});
+
+test("newIdempotencyKey is 32 hex characters and unique", () => {
+  const seen = new Set<string>();
+  for (let i = 0; i < 1000; i++) {
+    const key = newIdempotencyKey();
+    assert.match(key, /^[0-9a-f]{32}$/);
+    seen.add(key);
+  }
+  assert.equal(seen.size, 1000);
 });

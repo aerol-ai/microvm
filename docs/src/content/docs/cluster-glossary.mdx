@@ -81,6 +81,7 @@ Terraform writes these settings to `/etc/sandboxd/cluster.env` on each node when
 | `SB_DATA_PLANE_ADVERTISE_HOST` | The host other nodes use to send sandbox traffic here. Set it when that differs from the API address. | The host in `SB_API_ADVERTISE_URL` |
 | `SB_BOOTSTRAP_PEERS` | Gossip addresses to contact when joining, separated by commas. Required on every node except the seed. | Empty |
 | `SB_INGRESS_ADVERTISE_HOST` | The public host name used in sandbox URLs. See [Ingress nodes](/cluster-ingress/). | Empty |
+| `SB_L4_PUBLIC_HOST` | The host name in raw TCP port addresses (`tcp://<host>:<port>`). Set it when your domain points at a load balancer that cannot carry the TCP port pool. Terraform sets it to `tcp.<domain>` when the [load balancer](/cluster-setup/#put-a-load-balancer-in-front) is on. | Empty: the domain |
 
 ### Raft settings
 

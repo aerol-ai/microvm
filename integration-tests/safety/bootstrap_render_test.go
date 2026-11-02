@@ -80,6 +80,7 @@ func TestBootstrapTemplateRenders(t *testing.T) {
 	for _, branch := range []string{
 		"seed", "joiner", "joiner_kms", "joiner_audit_s3", "joiner_audit_file",
 		"seed_receiver", "joiner_receiver", "seed_public_ca", "seed_wrapped",
+		"joiner_api_lb", "joiner_api_lb_worker",
 	} {
 		t.Run(branch, func(t *testing.T) {
 			out, err := run("output", "-raw", branch)
@@ -346,6 +347,36 @@ func TestBootstrapPassesIdentityInstallFlagsOnlyWhenSet(t *testing.T) {
 	}
 	if flagAt, runAt := strings.Index(on, "--pat-scope host"), strings.Index(on, "sudo /tmp/install.sh"); runAt < 0 || flagAt > runAt {
 		t.Errorf("the flags must be appended before install.sh runs (flag at %d, install at %d)", flagAt, runAt)
+	}
+}
+
+// api_load_balancer (Terraform/load_balancer.tf): an ingress node behind the
+// balancer passes --lb-health-port to install.sh, before install.sh runs,
+// and every node gets SB_L4_PUBLIC_HOST in the env the final restart reads,
+// ahead of the per-node overrides so an operator can still set their own.
+// Off, neither renders a byte: user_data_replace_on_change would otherwise
+// replace every node of an existing cluster on its next apply.
+func TestBootstrapLoadBalancerSettingsOnlyWhenSet(t *testing.T) {
+	off := renderBootstrap(t, "joiner")
+	for _, forbidden := range []string{"--lb-health-port", "SB_L4_PUBLIC_HOST", "load balancer"} {
+		if strings.Contains(off, forbidden) {
+			t.Errorf("the default render carries %q", forbidden)
+		}
+	}
+	on := renderBootstrap(t, "joiner_api_lb")
+	if !strings.Contains(on, "INSTALL_ARGS+=(--lb-health-port '21280')") {
+		t.Error("an ingress node behind the balancer does not pass --lb-health-port")
+	}
+	if flagAt, runAt := strings.Index(on, "--lb-health-port '21280'"), strings.Index(on, "sudo /tmp/install.sh"); runAt < 0 || flagAt > runAt {
+		t.Errorf("--lb-health-port must be appended before install.sh runs (flag at %d, install at %d)", flagAt, runAt)
+	}
+	host, overrides, restart := strings.Index(on, "SB_L4_PUBLIC_HOST=tcp.x.example.com"), strings.Index(on, "extra_sandboxd_env (global) merged"), strings.LastIndex(on, "systemctl restart sandboxd")
+	if host < 0 || overrides < 0 || host > overrides || host > restart {
+		t.Errorf("SB_L4_PUBLIC_HOST must be written before the per-node overrides and the final restart (host %d, overrides %d, restart %d)", host, overrides, restart)
+	}
+	worker := renderBootstrap(t, "joiner_api_lb_worker")
+	if strings.Contains(worker, "--lb-health-port") || !strings.Contains(worker, "SB_L4_PUBLIC_HOST=tcp.x.example.com") {
+		t.Error("a worker behind the balancer must get the raw-TCP host and no health listener")
 	}
 }
 

@@ -144,6 +144,17 @@ class GPUOptions(TypedDict, total=False):
 
 class CreateOptions(TypedDict, total=False):
     image: Union[str, "Image"]
+    # Sent as the create's Idempotency-Key header, never in the body. A
+    # create sent again with the same key and the same options returns the
+    # sandbox the first one made instead of making a second; the same key
+    # with different options raises a 422 MicroVMHTTPError whose code is
+    # "idempotency_key_reused". Keys are scoped to the caller's account.
+    # Unset, the SDK makes a random key for each create call and reuses it on
+    # that call's automatic retries, so a retry after a timeout cannot make a
+    # second sandbox. Set your own to make your own retries of the whole call
+    # safe too, such as after your process restarts. idempotencyKey is
+    # accepted too.
+    idempotency_key: str
     # Optional name, unique among the caller's sandboxes (another account may
     # use the same name); a repeat create with a held name returns HTTP 409.
     # Names starting with "owner:" or shaped like a sandbox ID ("sb-" plus 16
@@ -731,6 +742,13 @@ class RetryConfig(TypedDict, total=False):
     maxRetries: int
     baseDelayMs: int
     maxDelayMs: int
+    # Cap in milliseconds on the wait before re-sending a 429 or 503. The
+    # client waits as long as the server's Retry-After header asks (seconds
+    # or an HTTP date), never less than its own backoff, plus up to a fifth
+    # more so clients told the same value spread out; a longer ask is cut to
+    # this. A missing or malformed header uses the backoff. Defaults to
+    # 30000; 0 ignores Retry-After.
+    maxRetryAfterMs: int
 
 
 class MicroVMConfig(TypedDict, total=False):

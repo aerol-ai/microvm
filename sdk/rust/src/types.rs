@@ -159,6 +159,19 @@ pub struct GPUOptions {
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
 pub struct CreateOptions {
     pub image: String,
+    /// Sent as the create's `Idempotency-Key` header, never in the body. A
+    /// create sent again with the same key and the same options returns the
+    /// sandbox the first one made instead of making a second; the same key
+    /// with different options fails with an `Error::Api` whose code is
+    /// `"idempotency_key_reused"` (HTTP 422). Keys are scoped to the caller's
+    /// account.
+    ///
+    /// `None` makes the SDK send a random key for each `create` call, reused
+    /// on that call's automatic retries, so a retry after a timeout cannot
+    /// make a second sandbox. Set your own to make your own retries of the
+    /// whole call safe too, such as after your process restarts.
+    #[serde(skip)]
+    pub idempotency_key: Option<String>,
     /// Optional name, unique among the caller's sandboxes (another account may
     /// use the same name); a repeat create with a held name returns HTTP 409.
     /// Names starting with `owner:` or shaped like a sandbox ID (`sb-` plus 16
@@ -1317,6 +1330,16 @@ pub struct RetryConfig {
     pub max_retries: Option<i32>,
     pub base_delay_ms: Option<u64>,
     pub max_delay_ms: Option<u64>,
+    /// Cap in milliseconds on the wait before re-sending a 429 or 503. The
+    /// client waits as long as the server's `Retry-After` header asks
+    /// (seconds or an HTTP date), never less than its own backoff, plus up
+    /// to a fifth more so clients told the same value spread out; a longer
+    /// ask is cut to this. A missing or malformed header uses the backoff.
+    /// `None` means 30000; `Some(0)` ignores `Retry-After`. The client is
+    /// blocking, so the wait holds the calling thread: lower this to bound
+    /// how long a call can take under load.
+    #[serde(default)]
+    pub max_retry_after_ms: Option<u64>,
 }
 
 impl Default for RetryConfig {
@@ -1325,6 +1348,7 @@ impl Default for RetryConfig {
             max_retries: Some(3),
             base_delay_ms: Some(200),
             max_delay_ms: Some(5000),
+            max_retry_after_ms: Some(30_000),
         }
     }
 }

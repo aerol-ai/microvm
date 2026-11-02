@@ -14,11 +14,12 @@ timeline
     July 2026 : 1 release : v0.5.5
     September 2026 : 3 releases : v0.5.6 to v0.6.0
     October 2026 : 8 releases : v0.6.1 to v0.6.8
+    November 2026 : 2 releases : v0.6.9 to v0.6.10
 ```
 
 | Release line | Releases | Dates | Latest |
 |---|---|---|---|
-| [0.6](#06-release-line) | 9 | Sep 28, 2026 to Oct 19, 2026 | [v0.6.8](#v068-sso-roles-and-the-caller-in-every-audit-record) |
+| [0.6](#06-release-line) | 11 | Sep 28, 2026 to Nov 2, 2026 | [v0.6.10](#v0610-key-custody-enforced-and-safe-create-retries) |
 | [0.5](#05-release-line) | 7 | Jun 1, 2026 to Sep 28, 2026 | [v0.5.7](#v057-dependency-updates) |
 | [0.4](#04-release-line) | 1 | May 28, 2026 | [v0.4.1](#v041-firecracker-runtime-wiring) |
 | [0.3](#03-release-line) | 1 | May 24, 2026 | [v0.3.1](#v031-custom-domains-and-image-garbage-collection) |
@@ -26,6 +27,124 @@ timeline
 | [0.1](#01-release-line) | 8 | May 8, 2026 to May 16, 2026 | [v0.1.7](#v017-daytona-and-e2b-compatibility-snapshots-image-builds) |
 
 ## 0.6 release line
+
+### v0.6.10: Key custody enforced, and safe create retries
+
+*November 2, 2026* · [Full notes](https://github.com/aerol-ai/microvm/releases/tag/v0.6.10)
+
+This release finishes the work v0.6.9 started. Enterprise servers that use your own key store now refuse to run with a plain server key. A create retried while the first attempt is still running gets the same sandbox. The last two plain hashes over request bodies that can hold secrets are now keyed with the server key. The SDKs, published as 0.8.0 alongside this release, send a retry-safe key on every create and expose the server's error code.
+
+> **Enterprise servers with a key store must wrap the server key before they upgrade.** With `SB_ENTERPRISE_MODE=true` and `SB_SECRET_PROVIDER` set to `vault`, `pkcs11` or `awskms`, v0.6.10 refuses to start while `SB_CREDENTIAL_KEY_CUSTODY` is still `file`. v0.6.9 warned about this at start and with the `SandboxdServerKeyPlaintext` alert. Wrap the key on v0.6.9 first (see the upgrade notes).
+
+- **A key store means a wrapped server key.** An enterprise server with a customer key store will not start while its server key is a plain file. `sandboxd key` still runs on such a server, so `sandboxd key wrap` is always available to fix it.
+- **Retrying a create is safe, even while the first attempt runs.** A v1 or Daytona create retried with the same `Idempotency-Key` and the same request now waits for the create already running and returns its sandbox. Before, the retry started a second create of the same sandbox, and when that failed it could take away the first create's capacity reservation and mounts.
+- **The SDKs send a key on every create.** Each SDK generates an `Idempotency-Key` once per create call and sends the same key on its own automatic retries, so a create retried after a timeout or a dropped connection no longer makes a second sandbox. Pass your own key to make your own retries of the whole call safe too.
+- **Every SDK exposes the server's error code.** TypeScript, Python, Go, Rust and Java errors carry the HTTP status, the server's `code` (such as `idempotency_key_reused` or `overloaded`) and the `Retry-After` wait.
+- **No plain hashes over secret-bearing bodies are left.** The Runloop devbox ID and the exec audit record's digest are now HMACs under a key derived from the server key, like the E2B fingerprint in v0.6.9. A guessed env value can no longer be checked offline against either.
+
+**Before you upgrade:**
+
+- **Enterprise servers with a key store: wrap first.** On v0.6.9, run `sandboxd key wrap` on one server, copy `credential_encryption.key.wrapped` to every server, set `SB_CREDENTIAL_KEY_CUSTODY=wrapped`, remove `SB_CREDENTIAL_ENCRYPTION_KEY` from the env files, run `sandboxd key verify`, delete the old key file, and restart one server at a time. Then upgrade. A server upgraded first refuses to start, and `sandboxd key wrap` still works on it. Terraform users set `key_custody = "wrapped"`. Servers without enterprise mode, or without a key store, are unaffected.
+- **New answers on create.**
+
+  | Status | Code | `Retry-After` | When |
+  |---|---|---|---|
+  | 503 | `create_in_progress` | 5 | A keyed retry waited the whole create timeout for the create it repeats. Nothing was changed. |
+  | 503 | none | 1 | In a cluster, a keyed retry whose create settled while the retry was being routed, or whose reservation is gone. Was a `409` in one case. |
+
+- **Exec audit digests change format.** Anything that reads the `digest` field of exec audit records, such as a SIEM rule, must accept `hmac:<key id>:<hex>` as well as the old 64-character hex. Digests change again when the server key is rotated.
+- **Runloop devbox IDs change for new creates.** Existing devboxes keep their IDs. A Runloop create retried across nodes while they disagree on the current server key (during a rotation) or run different releases (during a rolling upgrade) can still make a second devbox.
+- **SDK 0.8.0 is a breaking release for Rust.** HTTP errors are `Error::Api(ApiError)` instead of `Error::Api(String)`, and the SDK's own errors moved to a new `Error::Client(String)`. `Error` is `#[non_exhaustive]`, so a `match` on it needs a `_` arm. `CreateOptions` gains `idempotency_key`, so a struct literal without `..Default::default()` must add it. The other SDKs only add to their APIs.
+- **Every SDK create is now a keyed create.** On the server, each one costs one HMAC at the API edge, one extra database read and one small row (`sandbox_create_digests`), a few microseconds in all.
+- **Rolling upgrades.** Old and new servers work together in a cluster. The incarnation conflict travels as `409` only between upgraded nodes; an older node still sees a `500` and answers that create's retry with a `503` the SDKs retry.
+
+### v0.6.9: Your own key store, and sandboxes fenced off by default
+
+*November 2, 2026* · [Full notes](https://github.com/aerol-ai/microvm/releases/tag/v0.6.9)
+
+This release has two parts. Customer key custody lets you keep the key that protects sandbox secrets in your own key store. The rest comes from a bank-readiness review: a live test campaign on AWS that tried to break sandbox isolation, use up a server's resources and overload the API, on every runtime. The fixes from that review are in this release, and the tests that found the problems are now part of the integration suite.
+
+> **Stricter defaults. Read the upgrade notes before you upgrade.** Sandboxes can no longer reach the server they run on, other sandboxes on the same server, the cloud metadata service, or anything over IPv6. Firecracker templates built by an older release must be deleted and re-created. The Terraform module now requires `admin_allowed_cidrs`.
+
+- **Keep the server key in your own key store.** Vault or OpenBao Transit, an HSM over PKCS#11, or AWS KMS can now hold the key that protects sandbox secrets. Each server keeps only a wrapped copy and unlocks it into memory when it starts. Revoke the key in your key store and every server that can reach it stops using your data within about 15 minutes, with no restart. Restore the key and they resume. The new `sandboxd key` command checks, wraps and rotates the server key. It is off until you turn it on.
+- **Sandboxes are fenced off by default.** A sandbox cannot reach the cloud metadata service, the services on its own server, other sandboxes on the same server, or anything over IPv6. A server that cannot put one of these fences in place refuses new sandboxes with a `503` the SDKs retry, instead of running them without it.
+- **The agent inside a Firecracker sandbox needs that sandbox's token.** Sandboxes started from a template or the warm pool used to run it with no token at all. Firecracker sandboxes also get the `env` they were created with now. Before, they ignored it.
+- **Limits on what one sandbox can use.** Container sandboxes get a process limit (4,096 by default). A sandbox that writes past its disk size is stopped. A process killed for running out of memory no longer stops its sandbox or removes its network rules.
+- **Busy servers say "retry later" instead of falling over.** In a cluster, each node runs at most 16 cluster-wide sandbox lists at once and shares them fairly between teams. The rest get `503 overloaded` or `429 rate_limited`, with `Retry-After: 1`. The health watchdog restarts only a server that has stopped answering, never a busy one. A node whose network slots are full answers `503` with `Retry-After: 30`, and the cluster places the create on another node.
+- **All five SDKs wait as long as `Retry-After` asks.** A retry after a 429 or 503 waits for the server's hint, up to 30 seconds per retry by default. SDKs are published separately from the server.
+- **Fewer copies of your secrets.** A Docker snapshot no longer keeps the sandbox's internal token or the `env` it was created with. The E2B create fingerprint, which was a plain hash that included `env` values, is now keyed with the server key.
+- **A reused `Idempotency-Key` must come with the same create.** A v1 or Daytona create that reuses an `Idempotency-Key` with a different request now gets `422 idempotency_key_reused` instead of the first request's sandbox. A retry of the same request still returns the first sandbox.
+
+**Before you upgrade:**
+
+- **Key custody changes nothing until you turn it on.** The defaults are `SB_SECRET_PROVIDER=local` and `SB_CREDENTIAL_KEY_CUSTODY=file`, and a server with them contacts no key store. To wrap an existing server key: run `sandboxd key wrap` on one server, copy `credential_encryption.key.wrapped` to every server, set `SB_CREDENTIAL_KEY_CUSTODY=wrapped`, remove `SB_CREDENTIAL_ENCRYPTION_KEY` from the env files, run `sandboxd key verify`, delete the old key file, and restart one server at a time. Backups made before the wrap still hold the plain key until you destroy them or rotate the server key.
+- **Server-key rotation is one-way.** Every server must run v0.6.9 before `sandboxd key rotate --stage`, which checks this. After `--stage` the wrapped key file uses a format older releases cannot read, and after `--promote` no server can go back to an older release.
+- **AWS KMS users.** Key-store failures now answer `503` with a code (see the table below) instead of `400` or `500`. At most `SB_SECRET_PROVIDER_MAX_INFLIGHT` (8) key-store calls run at once per server; past that, calls back off and then fail with `503 key_store_throttled`.
+- **Enterprise mode.** The new `SandboxdServerKeyPlaintext` alert (warning) fires on an enterprise server whose server key is not wrapped. This release only warns.
+- **New and changed responses.** SDKs retry the `503` and `429` answers by default. They do not retry `501` or `422`.
+
+  | Status | Code | `Retry-After` | When |
+  |---|---|---|---|
+  | 503 | `overloaded` | 1 | A cluster-wide list (v1, Daytona, E2B, Runloop) finds the node's list slots full. Cluster mode only. |
+  | 429 | `rate_limited` | 1 | The caller's team or account already holds its share of the node's list slots. Cluster mode only. |
+  | 503 | none | 30 | The node's network slots or Docker bridge are full. Was `400` or `500`. |
+  | 503 | `node_guard_not_ready`, `ipv6_fence_not_ready`, `egress_floor_not_ready` | 5 | A container, gVisor or Firecracker create while the server's guard, IPv6 fence or metadata deny floor is not in place. |
+  | 503 | none | 2 | A cluster write while the leader changes. Was `400`. |
+  | 503 | none | 1 | A restarted cluster node has not caught up and cannot see the sandbox yet. Was `404`. |
+  | 503 | `key_store_throttled` / `key_store_unavailable` | 1 / 5 | The key store is throttling or cannot be reached. |
+  | 503 | `key_revoked`, `key_version_retired`, `key_store_denied` | none | The key store revoked the key, retired its version, or refused this server. |
+  | 501 | `network_policy_unenforced` | none | A network policy on a server with the host firewall off. Was accepted and not enforced. |
+  | 501 | `mount_tool_unavailable` | none | The node lacks the mount program. Was `400`. |
+  | 501 | none | none | A Firecracker create from a template built by an older release, or a start of a Firecracker sandbox stopped before the upgrade. |
+  | 409 | none | none | An exec, file call or session whose sandbox stopped while it ran. Was a `502` after minutes. The E2B facade keeps its `502`. |
+  | 422 | `idempotency_key_reused` | none | A v1 or Daytona create reuses an `Idempotency-Key` with a different request. |
+
+- **New settings.** All are optional. `setup/config-defaults.md` has the details.
+
+  | Setting | Default |
+  |---|---|
+  | `SB_API_LIST_MAX_INFLIGHT` | `16` (`0` turns the gate off) |
+  | `SB_API_LIST_MAX_INFLIGHT_PER_TENANT` | a quarter of the gate, at least 1 (`4`) |
+  | `SB_API_LIST_QUEUE_WAIT` | `500ms` |
+  | `SB_LIVENESS_SOCKET` | `/run/sandboxd/live.sock` (`off` disables it) |
+  | `SB_SANDBOX_INTERCONNECT` | `false` |
+  | `SB_SANDBOX_NODE_PORTS_ALLOW` | empty |
+  | `SB_SANDBOX_PIDS_LIMIT` | `4096` (`0` = unlimited) |
+  | `SB_DISK_LIMIT_CHECK_INTERVAL` | `15s` (`0` = off) |
+  | `SB_ALLOW_UNENFORCED_NETWORK_POLICY` | `false` |
+  | `SB_TOOLBOX_DEAD_PEER_TIMEOUT` | `30s` (`0` = off) |
+  | `SB_DOCKER_BRIDGE_SLOTS` | `0`, sized at start (1,000 on a stock `docker0`) |
+  | `SB_L4_PUBLIC_HOST` | empty |
+  | `SB_ROUTE_DNS_LINK_ADDR` | empty (`install.sh --ingress-proxy-routing` sets `169.254.53.53:53053`) |
+  | `SB_CREDENTIAL_KEY_CUSTODY` | `file` |
+  | `SB_CREDENTIAL_ENCRYPTION_KEY_WRAPPED_PATH` | `/var/lib/sandboxd/credential_encryption.key.wrapped` |
+  | `SB_CREDENTIAL_KEY_RING_PATH` | the key file path plus `.ring` |
+  | `SB_SECRET_PROVIDER_MAX_INFLIGHT` | `8` |
+  | `SB_SECRET_PROVIDER_RECHECK_INTERVAL` | `5m` |
+  | `SB_SECRET_PROVIDER_REVOKE_AFTER` | `3` |
+  | `SB_SECRET_VAULT_ADDR`, `_KEY_NAME`, `_TOKEN_FILE`, `_NAMESPACE`, `_CACERT` | empty |
+  | `SB_SECRET_VAULT_TRANSIT_MOUNT` | `transit` |
+  | `SB_SECRET_PKCS11_MODULE`, `_TOKEN_LABEL`, `_PIN_FILE`, `_KEY_LABEL`, `_DECRYPT_KEY_LABELS` | empty |
+  | `SB_SECRET_PKCS11_GCM_IV` | `auto` |
+  | `SB_SECRET_PKCS11_RUN_DIR` | `/run/sandboxd/pkcs11` |
+
+- **Sandboxes lose access they had.** No sandbox reaches the cloud metadata service, and there is no setting to allow it. A program that used a service on its own server needs `SB_SANDBOX_NODE_PORTS_ALLOW`, unless it is the egress gateway, DNS, or ports 80 and 443 on a server that serves public URLs. Sandboxes that talked to each other on one server need `SB_SANDBOX_INTERCONNECT=true`. A program that listens only on `::1` no longer starts; one that listens on `[::]` still accepts IPv4. If you changed `SB_EGRESS_DNS_PORT` or `SB_EGRESS_PROXY_PORT` in `egress-gateway.env`, set them in `sandboxd.env` too.
+- **New limits.** A container sandbox is stopped once it writes more than its disk size plus 5%. The default disk size is 10 GiB, so the default limit is 10.5 GiB. Raise `disk_gb` at create, or set `SB_DISK_LIMIT_CHECK_INTERVAL=0`. A sandbox that needs more than 4,096 processes needs a higher `SB_SANDBOX_PIDS_LIMIT`. A gVisor sandbox gets one process per MiB of memory.
+- **Local installs.** On `install.sh --local` and any server with `SB_ENABLE_NETWORK_RULES=false`, a Docker or containerd create, start or update that asks for network policy gets `501`. A stopped sandbox with such a policy no longer starts there. `SB_ALLOW_UNENFORCED_NETWORK_POLICY=true` restores the old behavior for local development (not allowed in enterprise mode).
+- **Firecracker templates.** Delete and re-create every Firecracker template. Rebuilding one is not enough, because a rebuild reuses the old disk. Until then, creates from it fail with `501`, and its warm-pool slots are released. A Firecracker sandbox stopped before the upgrade cannot start again: destroy it and create a new one. Upgrade `toolboxd` together with sandboxd (`SB_TOOLBOX_BINARY_PATH`). In a cluster, upgrade every Firecracker node before you re-create templates. A sandbox from a new template on an old node answers `503` to every call. A Firecracker create whose `env` has an empty key, a key with `=` or a NUL byte is now refused.
+- **Docker-engine servers.** A create with network rules and no pool slot starts its own pause container. That adds about 100 ms at the median, and the server pulls `SB_DOCKER_NETNS_POOL_PAUSE_IMAGE` (`registry.k8s.io/pause:3.10`) when it starts. Point an air-gapped server at a mirror, or those creates fail. On a stock `docker0`, the bridge pool refuses the 1,001st running sandbox with `503`. `SB_DOCKER_BRIDGE_SLOTS=1023` gives back the 23 slots held in reserve on a server that never builds images.
+- **Docker snapshots.** A sandbox created from a new Docker snapshot no longer inherits the source sandbox's `env`. Pass `env` at create, as containerd already requires. A snapshot saved by an older release can still hold the values: delete it and save it again.
+- **E2B creates.** New E2B sandboxes get IDs from the keyed fingerprint, in the same `sb-<16 hex>` shape. Existing sandboxes keep theirs. For 4 minutes after an upgraded server starts, a retried E2B create still finds a claim made before the upgrade, so an in-flight retry still gets its sandbox.
+- **`Idempotency-Key` on create is checked.** On `POST /v1/sandboxes` and the Daytona create, a retry that reuses a key with a different request (another image, `env` value or network policy, for example) gets `422 idempotency_key_reused`, with the key in the message and no `Retry-After`. Before, it got the first sandbox and the new request was dropped. The same request still replays. Sandboxes created before the upgrade, and creates on a server with no server key, replay unchecked, as before. None of the five SDKs sends this header, so only callers that set it themselves see the change.
+- **Toolbox connections.** Every toolbox call opens its own connection, and a connection to a sandbox that stops answering ends after `SB_TOOLBOX_DEAD_PEER_TIMEOUT` (30 seconds). A sandbox that answers nothing for that long while it still exists, such as a VM paused that long, loses its open calls. Raise the setting, or set `0` and restart sandboxd.
+- **Reconcile and audit.** A sandbox whose runtime cannot say whether it exists now stays as `error` until you destroy it, instead of being deleted. An address that keeps sending bad credentials adds up to one more `auth_denied` record per minute. In a cluster, SSH session records move to the sandbox's own server once every member runs v0.6.9.
+- **SDKs 0.7.0.** The SDKs with the `Retry-After` change were published as 0.7.0 on 2026-11-02, to npm, PyPI, crates.io and GitHub Packages. The Go SDK comes with this tag. In Rust, `RetryConfig` gains a public field, `max_retry_after_ms`, so code that builds `RetryConfig` with a struct literal and no `..Default::default()` must add it.
+- **Store schema.** One new table, `sandbox_create_digests`, is created automatically at start. Older releases ignore it. Nothing else in the database schema changes.
+- **Re-run `install.sh`** to pick up the new watchdog. A binary-only upgrade keeps the old watchdog, which still works with the new daemon. On servers installed with `--ingress-proxy-routing`, re-run it to move the route resolver to the link address. New installs turn rpcbind off. Servers that already have it keep it as it is.
+- **Terraform.** Set `admin_allowed_cidrs` (your office or VPN ranges) before the next `terraform plan`, or it fails. `0.0.0.0/0` also needs `allow_admin_from_anywhere = true`. The next apply sets the node metadata hop limit to 1.
+- **Backups.** A backup made with an older `sandboxd-backup.sh` may not include the server key file, so it restores only onto the same machine. Update `sandboxd-backup.sh` and `sandboxd-restore.sh` from this release (the Ansible `configure-ops` playbook installs them), then take a new backup.
+- **Rolling upgrades are safe.** Old and new servers work together in a cluster. Features that need every server, such as server-key rotation and the new SSH record placement, wait until every member runs v0.6.9.
+- **Rolling back.** If you go back to v0.6.8, the firewall tables this release adds stay in place and only drop more traffic. Addresses blocked through the new `ip aerolvm_block` table stay blocked; once their sandboxes are re-created, run `nft delete table ip aerolvm_block`. The egress-gateway runbook has the steps. containerd network slots left in the new `releasing` state stay out of use until you free them by hand (#834 has the query).
 
 ### v0.6.8: SSO, roles, and the caller in every audit record
 

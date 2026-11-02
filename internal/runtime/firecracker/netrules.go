@@ -24,6 +24,7 @@ import (
 type NetRules interface {
 	BlockAllEgress(ip string) error
 	ClearBlockAllEgress(ip string) error
+	LiftBlockAllEgress(ip string) error
 	ApplyEgressPolicy(ip string, allow, deny []string) error
 	ClearEgressPolicy(ip string, allow, deny []string) error
 	BlockAllIngress(ip string) error
@@ -31,6 +32,7 @@ type NetRules interface {
 	HoldEgress(ip string) error
 	ClearHoldEgress(ip string) error
 	SetFloor(subnet netip.Prefix, cidrs []netip.Prefix) error
+	ReassertFloor() (bool, error)
 	SetNodeGuard(subnet netip.Prefix, allow []netrules.NodePort) error
 	ReassertNodeGuard() (bool, error)
 }
@@ -154,7 +156,8 @@ func (d *Driver) ClearNetworkBlockEgress(ip string) error {
 	if err != nil {
 		return err
 	}
-	return r.ClearBlockAllEgress(ip)
+	// The guest keeps its address: lift, don't forget.
+	return r.LiftBlockAllEgress(ip)
 }
 
 // ApplyEgressHold implements runtime.EgressHolder: the fail-closed hold
@@ -176,17 +179,26 @@ func (d *Driver) ClearEgressHold(ip string) error {
 	return r.ClearHoldEgress(ip)
 }
 
+var _ sbruntime.EgressFloorSetter = (*Driver)(nil)
+
 // SetEgressFloor implements runtime.EgressFloorSetter for the TAP subnet
 // (§5.10 PC-2).
 func (d *Driver) SetEgressFloor(_ context.Context, cidrs []netip.Prefix) error {
-	r, err := d.rules("SetEgressFloor")
-	if err != nil {
-		return err
+	if d.netRules == nil {
+		return sbruntime.ErrEgressFloorUnavailable
 	}
 	if !d.tapSubnet.IsValid() {
-		return nil
+		return errors.New("firecracker: egress floor needs the TAP subnet")
 	}
-	return r.SetFloor(d.tapSubnet, cidrs)
+	return d.netRules.SetFloor(d.tapSubnet, cidrs)
+}
+
+// ReassertEgressFloor puts the floor back if something removed it.
+func (d *Driver) ReassertEgressFloor(context.Context) (bool, error) {
+	if d.netRules == nil {
+		return false, nil
+	}
+	return d.netRules.ReassertFloor()
 }
 
 var _ sbruntime.NodeGuardSetter = (*Driver)(nil)

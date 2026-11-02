@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sort"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	"github.com/aerol-ai/microvm/pkg/models"
+	"github.com/aerol-ai/microvm/pkg/secrets"
 )
 
 const (
@@ -28,6 +30,18 @@ const (
 	// shuts down an hour after create unless the caller asked otherwise.
 	defaultKeepAliveSeconds = 3600
 	maxKeepAliveSeconds     = 172800
+
+	// devboxIDPurpose separates the devbox id's keyed digest from every
+	// other use of the server key. Changing it changes the id every create
+	// derives, so a retry spanning the change would make a second devbox.
+	devboxIDPurpose = "runloop.devbox-id/v1"
+	// legacyDevboxIDWindow is how long after start a create still looks for
+	// a devbox under the unkeyed id older servers derived. Both SDKs give a
+	// create 30s and reuse its x-request-id only across the automatic
+	// retries of that one call, which back off for seconds, so a retry
+	// chain that began before an upgrade restart is over within a few
+	// minutes. Past the window the unkeyed id is never computed.
+	legacyDevboxIDWindow = 4 * time.Minute
 )
 
 // resourceSizes is Runloop's resource_size_request table (cpu, GiB memory,
@@ -74,21 +88,68 @@ func encodeDevboxBlob(blob devboxBlob) (string, error) {
 	return string(encoded), nil
 }
 
-// devboxIDForRequest derives the devbox id from the SDK's x-request-id,
+// devboxIDs are the ids one create's x-request-id derives.
+type devboxIDs struct {
+	// current is the id under the server's current key: a new devbox is
+	// made under it.
+	current string
+	// earlier are ids an earlier attempt of the same create may have used:
+	// one per other key the server holds (a key rotation in progress) and,
+	// for a short while after start, the unkeyed id older servers derived.
+	// They are looked up, never created.
+	earlier []string
+}
+
+// requestDigester is the part of the service a devbox id needs.
+type requestDigester interface {
+	RequestDigests(purpose string, data []byte) ([]secrets.KeyedDigest, error)
+}
+
+// devboxIDsForRequest derives the devbox id from the SDK's x-request-id,
 // which both SDKs reuse across every automatic retry of one call. The body
 // is folded in so a caller that pins x-request-id to a constant (it is
 // settable through RUNLOOP_CUSTOM_HEADERS) still gets one devbox per
 // distinct create rather than every create collapsing onto the first.
 // Owner-qualified so two tenants can never derive the same id.
-func devboxIDForRequest(ownerRef, requestID string, body []byte) string {
-	h := sha256.New()
-	h.Write([]byte("runloop.create\x00"))
-	h.Write([]byte(ownerRef))
-	h.Write([]byte{0})
-	h.Write([]byte(requestID))
-	h.Write([]byte{0})
-	h.Write(body)
-	return "sb-" + hex.EncodeToString(h.Sum(nil)[:8])
+//
+// The body carries the create's env values and the id is public, so a
+// plain hash would let anyone who knows the request id test guessed env
+// values offline. The id is "sb-" and the first 64 bits of an HMAC under a
+// key derived from the server key instead: the same on every node that
+// shares the key, and new only when the key is rotated.
+func devboxIDsForRequest(d requestDigester, ownerRef, requestID string, body []byte, withLegacy bool) (devboxIDs, error) {
+	if d == nil {
+		return devboxIDs{}, errors.New("devbox id needs the server key")
+	}
+	data := make([]byte, 0, len(ownerRef)+len(requestID)+len(body)+2)
+	data = append(data, ownerRef...)
+	data = append(data, 0)
+	data = append(data, requestID...)
+	data = append(data, 0)
+	data = append(data, body...)
+	digests, err := d.RequestDigests(devboxIDPurpose, data)
+	if err != nil {
+		return devboxIDs{}, err
+	}
+	if len(digests) == 0 {
+		return devboxIDs{}, errors.New("devbox id: the server key ring is empty")
+	}
+	var out devboxIDs
+	for i, digest := range digests {
+		id := "sb-" + hex.EncodeToString(digest.Sum[:8])
+		if i == 0 {
+			out.current = id
+			continue
+		}
+		out.earlier = append(out.earlier, id)
+	}
+	if withLegacy {
+		h := sha256.New()
+		h.Write([]byte("runloop.create\x00"))
+		h.Write(data)
+		out.earlier = append(out.earlier, "sb-"+hex.EncodeToString(h.Sum(nil)[:8]))
+	}
+	return out, nil
 }
 
 // shortHash is a path- and session-name-safe digest for ids derived from

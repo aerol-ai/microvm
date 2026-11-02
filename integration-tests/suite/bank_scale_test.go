@@ -198,7 +198,10 @@ func bankWaitStarted(c *harness.Client, id string, timeout time.Duration) bool {
 }
 
 // UC-334 — API read throughput: concurrent clients list sandboxes and read
-// health for a fixed time; no server error, no transport error.
+// health for a fixed time; no server error, no transport error. A refusal
+// that says when to come back (429, or the 503 a node sheds a list with past
+// SB_API_LIST_MAX_INFLIGHT, both with Retry-After) is load shedding, counted
+// apart; UC-361 drives the cluster past that point on purpose.
 func TestBankAPIThroughput(t *testing.T) {
 	harness.Require(t, sc, "UC-334")
 	workers := benchEnvInt("AEROL_BANK_API_CONCURRENCY", 16)
@@ -222,7 +225,7 @@ func TestBankAPIThroughput(t *testing.T) {
 					switch {
 					case err != nil:
 						netErr.Add(1)
-					case resp.Status == http.StatusTooManyRequests:
+					case (resp.Status == http.StatusTooManyRequests || resp.Status == http.StatusServiceUnavailable) && resp.Header.Get("Retry-After") != "":
 						limited.Add(1)
 					case resp.Status >= 500:
 						srvErr.Add(1)
@@ -693,8 +696,11 @@ func TestBankRecoveryUnderLoad(t *testing.T) {
 
 // UC-338 — density per runtime: small sandboxes are created, 8 at a time,
 // until the cluster refuses for capacity or AEROL_BANK_DENSITY_MAX is
-// reached. The refusal is a clean capacity error, every created sandbox
-// runs, and the nodes stay healthy.
+// reached. The refusal is a clean capacity error — a 503 with Retry-After,
+// whichever limit ran out first (CPU, memory, or a node's network-slot pool:
+// the 2026-11-01 flagship ramp stopped on full netns and TAP pools that
+// answered as the catch-all 400) — every created sandbox runs, and the nodes
+// stay healthy.
 func TestBankDensity(t *testing.T) {
 	harness.Require(t, sc, "UC-338")
 	max := benchEnvInt("AEROL_BANK_DENSITY_MAX", 40)
@@ -705,6 +711,7 @@ func TestBankDensity(t *testing.T) {
 			var created []string
 			var failures []string
 			capacityHit := false
+			var refusal error
 			var lat []time.Duration
 			t.Cleanup(func() {
 				var wg sync.WaitGroup
@@ -735,6 +742,9 @@ func TestBankDensity(t *testing.T) {
 							created = append(created, sb.ID)
 							lat = append(lat, time.Since(t0))
 						case bankIsCapacity(err):
+							if !capacityHit {
+								refusal = err
+							}
 							capacityHit = true
 						default:
 							failures = append(failures, err.Error())
@@ -742,6 +752,15 @@ func TestBankDensity(t *testing.T) {
 					}(i)
 				}
 				wg.Wait()
+			}
+			if capacityHit {
+				// Full must be distinguishable from broken: the status and
+				// the retry hint, not only words in the message.
+				var apiErr *microvm.APIError
+				if !errors.As(refusal, &apiErr) || apiErr.StatusCode != http.StatusServiceUnavailable || apiErr.RetryAfter <= 0 {
+					t.Errorf("the capacity refusal is not a 503 with Retry-After: %v", refusal)
+				}
+				t.Logf("%s density stopped on: %v", rt.name, refusal)
 			}
 			running := 0
 			for _, id := range created {
@@ -876,4 +895,35 @@ esac
 if [ -z "$pids" ] || [ "$pids" = 0 ]; then echo "no %s process for $id (container $cid)"; exit 1; fi
 sudo kill -9 $pids && echo "killed %s process(es) $pids (container $cid)"
 `, shellQuote(id), kind, kind, kind)
+}
+
+// UC-360 — a sandbox that writes a lot to stdout and stderr keeps running.
+// On containerd, sandboxd stopped draining a task's output when the create
+// returned, so the task's next write blocked forever once ~128 KiB had piled
+// up: a web server froze after a few thousand access-log lines
+// (cluster-bank-flagship UC-171, 2026-11-01; the main process stopped at 127
+// KiB). Here the main process writes 3 MiB to each stream after the create,
+// past the stall and past the 4 MiB task-log cap, and must finish. VM guests
+// write to their console instead, so only container runtimes run it.
+func TestBankChattySandboxKeepsRunning(t *testing.T) {
+	harness.Require(t, sc, "UC-360")
+	const chunks = 48 // 64 KiB each, per stream
+	script := `i=0; while [ $i -lt ` + strconv.Itoa(chunks) + ` ]; do head -c 65535 /dev/zero | tr '\0' o; echo; head -c 65535 /dev/zero | tr '\0' e >&2; echo >&2; i=$((i+1)); echo $i > /tmp/progress; done; echo done > /tmp/done; exec sleep 600`
+	bankEachRuntime(t, func(t *testing.T, rt bankRuntime) {
+		if rt.vm {
+			t.Skip("a VM guest's output goes to its console, not a task FIFO")
+		}
+		sb := bankSandbox(t, rt, sdktypes.CreateSandboxOptions{ContainerCommand: []string{"sh", "-c", script}})
+		deadline := time.Now().Add(2 * time.Minute)
+		for {
+			out, _ := bankRun(t, sb, "cat /tmp/done 2>/dev/null; cat /tmp/progress 2>/dev/null", time.Minute)
+			if strings.Contains(out, "done") {
+				return
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("the main process stopped after %s of %d 64 KiB chunks per stream: its output is not drained (a task blocks after ~128 KiB)", strings.TrimSpace(out), chunks)
+			}
+			time.Sleep(2 * time.Second)
+		}
+	})
 }

@@ -7,6 +7,7 @@ import {
   sandboxCustomDomainPath as v1SandboxCustomDomainPath,
   sandboxCustomDomainsPath as v1SandboxCustomDomainsPath,
 } from "./api/v1/paths.js";
+import { MicroVMApiError } from "../errors.js";
 import { Image } from "../Image.js";
 import type {
   AddCustomDomainOptions,
@@ -129,6 +130,15 @@ export interface RetryConfig {
    * waits when `maxRetries` is high. Defaults to `5000`.
    */
   maxDelayMs?: number;
+  /**
+   * Cap in milliseconds on the wait before re-sending a 429 or 503. The SDK
+   * waits as long as the server's `Retry-After` header asks (seconds or an
+   * HTTP date), never less than its own backoff, plus up to a fifth more so
+   * clients told the same value spread out; a longer ask is cut to this. A
+   * missing or malformed header uses the backoff above. Defaults to
+   * `30000`; `0` ignores `Retry-After`.
+   */
+  maxRetryAfterMs?: number;
 }
 
 export interface APIClientConfig {
@@ -154,6 +164,12 @@ export interface APIClientConfig {
    * 429/503. Pass `{ maxRetries: 0 }` to disable retry entirely.
    */
   retry?: RetryConfig;
+  /**
+   * Cancels the client's HTTP requests: aborting it ends the request in
+   * flight and any retry wait, so a call never sits out a long
+   * `Retry-After` once aborted. WebSocket streams are not affected.
+   */
+  signal?: AbortSignal;
 }
 
 interface ApiWhoAmI {
@@ -469,7 +485,10 @@ const RETRYABLE_STATUS_CODES = new Set([421, 429, 502, 503, 504]);
 // The subset a non-idempotent request (exec) may retry: 429 and 503 are the
 // server turning the request away before doing any work. 421, 502 and 504 come
 // from forwarding/proxy hops, and the status alone can't prove that no hop
-// already handed the command to the sandbox, so exec surfaces them.
+// already handed the command to the sandbox, so exec surfaces them. They are
+// also the statuses whose Retry-After paces clients: 429 when this caller is
+// over its share, 503 when the node sheds load. A Retry-After on a 421, 502 or
+// 504 is a hop's, not the server's, so those use the normal backoff.
 const REFUSED_STATUS_CODES = new Set([429, 503]);
 
 /** Per-call options for {@link APIClient.request}. */
@@ -482,6 +501,23 @@ interface RequestOptions {
    * retry.
    */
   idempotent?: boolean;
+  /** Extra request headers, sent unchanged on every retry. */
+  headers?: Record<string, string>;
+}
+
+/**
+ * The header a sandbox create carries so the server can recognise a retry of
+ * it. Keep in sync with clustercreate.HeaderIdempotencyKey on the server.
+ */
+export const IDEMPOTENCY_KEY_HEADER = "Idempotency-Key";
+
+/** A fresh create key: 128 random bits as 32 lowercase hex characters. */
+export function newIdempotencyKey(): string {
+  // getRandomValues, unlike randomUUID, also works on a page served over
+  // plain http.
+  const bytes = new Uint8Array(16);
+  globalThis.crypto.getRandomValues(bytes);
+  return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
 }
 
 /** Default retry settings when the caller doesn't supply a RetryConfig. */
@@ -489,7 +525,65 @@ const DEFAULT_RETRY: Required<RetryConfig> = {
   maxRetries: 3,
   baseDelayMs: 200,
   maxDelayMs: 5_000,
+  // An overloaded node asks for about a second, so the cap only bites on a
+  // long ask (maintenance, a misconfigured proxy), which should not hold a
+  // call for minutes per retry.
+  maxRetryAfterMs: 30_000,
 };
+
+// IMF-fixdate, the HTTP-date form servers send ("Sun, 06 Nov 1994 08:49:37
+// GMT"). Date.parse alone would also take "1" or a date with no zone, read in
+// local time.
+const IMF_FIXDATE = /^[A-Za-z]{3}, \d{2} [A-Za-z]{3} \d{4} \d{2}:\d{2}:\d{2} GMT$/;
+
+/**
+ * Reads a `Retry-After` value in either form RFC 9110 allows: delta-seconds
+ * (`"120"`) or an HTTP date. Returns the wait in milliseconds (0 for a date
+ * already past), or `undefined` for an absent or malformed value.
+ */
+export function parseRetryAfter(value: string | null | undefined, nowMs: number): number | undefined {
+  const trimmed = (value ?? "").trim();
+  if (/^[0-9]+$/.test(trimmed)) {
+    return Number(trimmed) * 1000;
+  }
+  if (!IMF_FIXDATE.test(trimmed)) {
+    return undefined;
+  }
+  const when = Date.parse(trimmed);
+  return Number.isNaN(when) ? undefined : Math.max(when - nowMs, 0);
+}
+
+/**
+ * How long {@link APIClient.request} waits before re-sending. `attempt`
+ * counts from 0, `retryAfter` is a 429/503's `Retry-After` header (null
+ * otherwise) and `random` is uniform in [0, 1).
+ *
+ * Without a usable header it is the exponential backoff ±25%. With one, it
+ * never retries sooner than the server asked (nor sooner than the backoff)
+ * and adds up to a fifth so clients told the same value spread out.
+ * `maxRetryAfterMs` is a hard ceiling: when the server asks for at least
+ * that long the client is early anyway, so the spread goes below it instead.
+ */
+export function retryDelayMs(
+  config: Required<RetryConfig>,
+  attempt: number,
+  retryAfter: string | null,
+  nowMs: number,
+  random: number,
+): number {
+  const backoff = Math.min(config.baseDelayMs * 2 ** attempt, config.maxDelayMs);
+  const limit = config.maxRetryAfterMs;
+  const hint = limit > 0 ? parseRetryAfter(retryAfter, nowMs) : undefined;
+  if (hint === undefined) {
+    return backoff * (0.75 + 0.5 * random);
+  }
+  const target = Math.max(hint, backoff);
+  if (target >= limit) {
+    return limit - limit * 0.2 * random;
+  }
+  const upper = Math.min(target * 1.2, limit);
+  return target + (upper - target) * random;
+}
 
 /**
  * Returns `true` when the thrown `error` looks like a transport-level failure
@@ -580,10 +674,23 @@ export function stripTrailingSlashes(value: string): string {
   return value.slice(0, end);
 }
 
-/** Sleep with ±25% jitter so concurrent callers don't thundering-herd. */
-function jitteredDelay(baseMs: number): Promise<void> {
-  const jitter = 1 + (Math.random() - 0.5) * 0.5; // 0.75 – 1.25
-  return new Promise((resolve) => setTimeout(resolve, Math.round(baseMs * jitter)));
+/** Waits `ms`, or rejects with the signal's reason as soon as it aborts. */
+function sleep(ms: number, signal: AbortSignal | undefined): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(signal.reason);
+      return;
+    }
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(signal?.reason);
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
 }
 
 export class APIClient {
@@ -595,6 +702,7 @@ export class APIClient {
   private readonly fetchFn: FetchLike;
   private readonly versionPrefix: string;
   private readonly retryConfig: Required<RetryConfig>;
+  private readonly signal: AbortSignal | undefined;
 
   constructor(config: APIClientConfig) {
     this.baseURL = stripTrailingSlashes(config.baseURL);
@@ -607,7 +715,9 @@ export class APIClient {
       maxRetries: config.retry?.maxRetries ?? DEFAULT_RETRY.maxRetries,
       baseDelayMs: config.retry?.baseDelayMs ?? DEFAULT_RETRY.baseDelayMs,
       maxDelayMs: config.retry?.maxDelayMs ?? DEFAULT_RETRY.maxDelayMs,
+      maxRetryAfterMs: config.retry?.maxRetryAfterMs ?? DEFAULT_RETRY.maxRetryAfterMs,
     };
+    this.signal = config.signal;
   }
 
   /**
@@ -622,7 +732,13 @@ export class APIClient {
 
   async create(options: CreateOptions): Promise<SandboxResource> {
     const resolved = await this.resolveImage(options);
-    const response = await this.doJSON<ApiCreateSandboxResponse>("POST", this.versioned("/sandboxes"), toApiCreateOptions(resolved));
+    // One key per call, sent unchanged on each of its automatic retries: a
+    // create retried after a timeout gets back the sandbox the first attempt
+    // made instead of making a second one.
+    const key = options.idempotencyKey?.trim() || newIdempotencyKey();
+    const response = await this.doJSON<ApiCreateSandboxResponse>("POST", this.versioned("/sandboxes"), toApiCreateOptions(resolved), {
+      headers: { [IDEMPOTENCY_KEY_HEADER]: key },
+    });
     return new SandboxResource(this, fromApiCreateSandboxResponse(response));
   }
 
@@ -1277,12 +1393,10 @@ export class APIClient {
   }
 
   private async doJSON<T>(method: string, path: string, body?: unknown, options?: RequestOptions): Promise<T> {
-    const init: RequestInit = {};
+    const init: RequestInit = { headers: { ...options?.headers } };
     if (body !== undefined) {
       init.body = JSON.stringify(body);
-      init.headers = {
-        "Content-Type": "application/json",
-      };
+      init.headers = { ...init.headers, "Content-Type": "application/json" };
     }
 
     const response = await this.request(method, path, init, options);
@@ -1317,6 +1431,10 @@ export class APIClient {
    * failures that prove the request never left the client and HTTP 429/503;
    * everything else is surfaced to the caller rather than risk running the
    * command twice.
+   *
+   * A 429 or 503 waits as long as its `Retry-After` asks (see
+   * {@link retryDelayMs}). The client's `signal` ends the request and any
+   * wait.
    */
   private async request(method: string, path: string, init: RequestInit = {}, options: RequestOptions = {}): Promise<Response> {
     const headers = new Headers(init.headers);
@@ -1328,40 +1446,34 @@ export class APIClient {
     }
 
     const url = `${this.baseURL}${path}`;
-    const requestInit: RequestInit = { ...init, method, headers };
-    const { maxRetries, baseDelayMs, maxDelayMs } = this.retryConfig;
+    const signal = init.signal ?? this.signal;
+    const requestInit: RequestInit = { ...init, method, headers, ...(signal ? { signal } : {}) };
+    const { maxRetries } = this.retryConfig;
     const idempotent = options.idempotent ?? true;
     const retryableStatusCodes = idempotent ? RETRYABLE_STATUS_CODES : REFUSED_STATUS_CODES;
     const isRetryableError = idempotent ? isTransientTransportError : isUnsentTransportError;
 
-    let lastError: unknown;
-    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    for (let attempt = 0; ; attempt++) {
+      let retryAfter: string | null = null;
       try {
         const response = await this.fetchFn(url, requestInit);
-
-        // Retry on transient HTTP status codes.
-        if (retryableStatusCodes.has(response.status) && attempt < maxRetries) {
-          const delay = Math.min(baseDelayMs * 2 ** attempt, maxDelayMs);
-          await jitteredDelay(delay);
-          continue;
+        if (!retryableStatusCodes.has(response.status) || attempt >= maxRetries) {
+          return response;
         }
-
-        return response;
+        if (REFUSED_STATUS_CODES.has(response.status)) {
+          retryAfter = response.headers.get("retry-after");
+        }
+        // Free the connection instead of holding it through the wait.
+        response.body?.cancel().catch(() => undefined);
       } catch (error: unknown) {
-        lastError = error;
-
-        // Only retry transport-level failures; anything else propagates.
-        if (!isRetryableError(error) || attempt >= maxRetries) {
+        // Only retry transport-level failures; anything else propagates. An
+        // aborted signal surfaces whatever fetch threw for it.
+        if (signal?.aborted || !isRetryableError(error) || attempt >= maxRetries) {
           throw error;
         }
-
-        const delay = Math.min(baseDelayMs * 2 ** attempt, maxDelayMs);
-        await jitteredDelay(delay);
       }
+      await sleep(retryDelayMs(this.retryConfig, attempt, retryAfter, Date.now(), Math.random()), signal);
     }
-
-    // Should be unreachable — the loop always throws or returns.
-    throw lastError;
   }
 }
 
@@ -2058,16 +2170,19 @@ function toBlob(data: BinaryLike): Blob {
   return new Blob([Uint8Array.from(data)]);
 }
 
-async function decodeError(response: Response): Promise<Error> {
+async function decodeError(response: Response): Promise<MicroVMApiError> {
+  const retryAfterMs = parseRetryAfter(response.headers.get("retry-after"), Date.now());
   try {
-    const payload = (await response.json()) as { error?: string };
+    const payload = (await response.json()) as { error?: unknown; code?: unknown };
     if (typeof payload.error === "string" && payload.error !== "") {
-      return new Error(payload.error);
+      const code = typeof payload.code === "string" && payload.code !== "" ? payload.code : undefined;
+      return new MicroVMApiError(response.status, payload.error, { code, retryAfterMs });
     }
   } catch {
-    // Fall through to status-based error.
+    // Not JSON (a proxy's error page) or no body: fall through to the
+    // status-based message, with no code.
   }
-  return new Error(`request failed with status ${response.status}`);
+  return new MicroVMApiError(response.status, `request failed with status ${response.status}`, { retryAfterMs });
 }
 
 const STREAM_PREFIX_STDOUT = 0x01;

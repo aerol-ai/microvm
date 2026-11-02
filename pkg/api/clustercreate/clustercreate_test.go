@@ -33,14 +33,18 @@ import (
 
 type clusterStub struct {
 	*cluster.Noop
-	owner      cluster.OwnerInfo
-	ownerErr   error
-	forwards   int
-	lastTarget cluster.Endpoint
-	deletes    int
-	deleteErr  error
-	cancels    int
-	cancelErr  error
+	owner    cluster.OwnerInfo
+	ownerErr error
+	// ownerMisses is how many OwnerOf reads answer ErrUnknownSandbox before
+	// owner: a voter's FSM copy trailing the leader by an apply.
+	ownerMisses int
+	ownerReads  int
+	forwards    int
+	lastTarget  cluster.Endpoint
+	deletes     int
+	deleteErr   error
+	cancels     int
+	cancelErr   error
 
 	selectTarget cluster.PlacementTarget
 	selectErr    error
@@ -81,6 +85,11 @@ type recordCall struct {
 }
 
 func (s *clusterStub) OwnerOf(_ string) (cluster.OwnerInfo, error) {
+	s.ownerReads++
+	if s.ownerMisses > 0 {
+		s.ownerMisses--
+		return cluster.OwnerInfo{}, cluster.ErrUnknownSandbox
+	}
 	if s.ownerErr != nil {
 		return cluster.OwnerInfo{}, s.ownerErr
 	}
@@ -250,6 +259,15 @@ type fakeRuntime struct {
 	// promote-waits-for-create regression test reads it from the
 	// RecordPlacement hook.
 	createFinished atomic.Bool
+	// hold, when set, parks every Create until it is closed, and entered is
+	// closed when the first one parks: a create still running while a retry
+	// of it arrives. failOnce fails the first Create that sees it. creates
+	// counts Create calls.
+	hold      chan struct{}
+	entered   chan struct{}
+	enterOnce sync.Once
+	failOnce  error
+	creates   atomic.Int32
 }
 
 func newFakeRuntime() *fakeRuntime {
@@ -257,6 +275,18 @@ func newFakeRuntime() *fakeRuntime {
 }
 
 func (f *fakeRuntime) Create(_ context.Context, _ models.CreateSandboxRequest, sandboxID, _ string, _ []mounts.ContainerBind) (*models.SandboxRuntimeState, error) {
+	f.creates.Add(1)
+	if f.hold != nil {
+		f.enterOnce.Do(func() { close(f.entered) })
+		<-f.hold
+	}
+	f.mu.Lock()
+	failErr := f.failOnce
+	f.failOnce = nil
+	f.mu.Unlock()
+	if failErr != nil {
+		return nil, failErr
+	}
 	if f.createDelay > 0 {
 		time.Sleep(f.createDelay)
 	}
@@ -921,11 +951,16 @@ func TestPrepare_ReservePaths(t *testing.T) {
 	})
 
 	t.Run("reserve_error_shapes", func(t *testing.T) {
+		prevWait := ownerCatchUpWait
+		ownerCatchUpWait = 100 * time.Millisecond
+		t.Cleanup(func() { ownerCatchUpWait = prevWait })
 		tests := []struct {
 			name           string
 			err            error
 			opts           PrepareOptions
 			owner          cluster.OwnerInfo
+			ownerErr       error
+			ownerMisses    int
 			wantStatus     int
 			wantRetryAfter string
 			wantOK         bool
@@ -948,6 +983,27 @@ func TestPrepare_ReservePaths(t *testing.T) {
 				wantStatus:   http.StatusAccepted,
 				wantForwards: 1,
 			},
+			// UC-367 on cluster-3-mixed: the leader reported the conflict
+			// before this voter's FSM copy applied the reservation, so the
+			// first owner reads miss. The retry waits for the copy and is
+			// routed, instead of answering 409.
+			{
+				name:         "preferred_id_conflict_owner_appears_after_apply_lag_forwards",
+				err:          cluster.ErrReservationConflict,
+				opts:         PrepareOptions{PreferredSandboxID: "sb-fixed"},
+				owner:        cluster.OwnerInfo{NodeID: "node-b", APIURL: "http://node-b"},
+				ownerMisses:  3,
+				wantStatus:   http.StatusAccepted,
+				wantForwards: 1,
+			},
+			{
+				name:           "preferred_id_conflict_no_owner_is_retryable_not_409",
+				err:            cluster.ErrReservationConflict,
+				opts:           PrepareOptions{PreferredSandboxID: "sb-fixed"},
+				ownerErr:       cluster.ErrUnknownSandbox,
+				wantStatus:     http.StatusServiceUnavailable,
+				wantRetryAfter: "1",
+			},
 			{
 				name:       "preferred_id_conflict_owner_without_url_returns_503",
 				err:        cluster.ErrReservationConflict,
@@ -955,6 +1011,35 @@ func TestPrepare_ReservePaths(t *testing.T) {
 				owner:      cluster.OwnerInfo{NodeID: "node-b"},
 				wantStatus: http.StatusServiceUnavailable,
 			},
+			// A keyed retry whose reservation is pending on the same target:
+			// the FSM answers ErrIncarnationConflict (each reserve mints a new
+			// incarnation). It goes to the reservation's owner like a
+			// conflict, instead of a bare 503.
+			{
+				name:           "preferred_id_incarnation_conflict_local_owner_reuses_reservation",
+				err:            fmt.Errorf("%w: reservation retry changed its incarnation", cluster.ErrIncarnationConflict),
+				opts:           PrepareOptions{PreferredSandboxID: "sb-fixed"},
+				owner:          cluster.OwnerInfo{NodeID: "node-a", IsSelf: true},
+				wantOK:         true,
+				wantDecisionID: "sb-fixed",
+			},
+			{
+				name:         "preferred_id_incarnation_conflict_remote_owner_forwards",
+				err:          fmt.Errorf("%w: reservation retry changed its incarnation", cluster.ErrIncarnationConflict),
+				opts:         PrepareOptions{PreferredSandboxID: "sb-fixed"},
+				owner:        cluster.OwnerInfo{NodeID: "node-b", APIURL: "http://node-b"},
+				wantStatus:   http.StatusAccepted,
+				wantForwards: 1,
+			},
+			{
+				name:           "preferred_id_incarnation_conflict_reservation_gone_retries",
+				err:            fmt.Errorf("%w: reservation retry changed its incarnation", cluster.ErrIncarnationConflict),
+				opts:           PrepareOptions{PreferredSandboxID: "sb-fixed"},
+				ownerErr:       cluster.ErrUnknownSandbox,
+				wantStatus:     http.StatusServiceUnavailable,
+				wantRetryAfter: "1",
+			},
+			{name: "fresh_id_incarnation_conflict_stays_generic", err: cluster.ErrIncarnationConflict, wantStatus: http.StatusServiceUnavailable},
 			{name: "name_conflict", err: cluster.ErrNameConflict, wantStatus: http.StatusConflict},
 			{name: "reservation_conflict", err: cluster.ErrReservationConflict, wantStatus: http.StatusConflict},
 			{name: "backpressure", err: cluster.ErrCreateBackpressure, wantStatus: http.StatusTooManyRequests, wantRetryAfter: "5"},
@@ -970,6 +1055,8 @@ func TestPrepare_ReservePaths(t *testing.T) {
 					selectTarget: cluster.PlacementTarget{NodeID: "node-a", APIURL: "http://node-a", IsSelf: true},
 					reserveErr:   tc.err,
 					owner:        tc.owner,
+					ownerErr:     tc.ownerErr,
+					ownerMisses:  tc.ownerMisses,
 				}
 				svc := testServiceWithCluster(stub)
 				w := httptest.NewRecorder()
@@ -1752,4 +1839,37 @@ func TestOverlapCreateAndPromote_PromoteGetsFreshTimeoutAfterSlowCreate(t *testi
 	if len(stub.recordCalls) != 1 {
 		t.Fatalf("RecordPlacement calls = %d, want 1 (promote must succeed on its fresh budget)", len(stub.recordCalls))
 	}
+}
+
+// awaitOwner returns as soon as the owner shows, gives up at its budget, and
+// never outlives the request.
+func TestAwaitOwner(t *testing.T) {
+	t.Run("returns_once_the_copy_catches_up", func(t *testing.T) {
+		stub := &clusterStub{Noop: cluster.NewNoop("node-a", "http://node-a", ""), ownerMisses: 2}
+		awaitOwner(context.Background(), stub, "sb-x", time.Second)
+		if stub.ownerReads != 3 {
+			t.Fatalf("OwnerOf reads = %d, want 3 (two misses, then the owner)", stub.ownerReads)
+		}
+	})
+	t.Run("gives_up_at_its_budget", func(t *testing.T) {
+		stub := &clusterStub{Noop: cluster.NewNoop("node-a", "http://node-a", ""), ownerErr: cluster.ErrUnknownSandbox}
+		start := time.Now()
+		awaitOwner(context.Background(), stub, "sb-x", 60*time.Millisecond)
+		if took := time.Since(start); took > time.Second {
+			t.Fatalf("awaitOwner took %v past a 60ms budget", took)
+		}
+		if stub.ownerReads < 2 {
+			t.Fatalf("OwnerOf reads = %d, want it to look again before giving up", stub.ownerReads)
+		}
+	})
+	t.Run("stops_with_the_request", func(t *testing.T) {
+		stub := &clusterStub{Noop: cluster.NewNoop("node-a", "http://node-a", ""), ownerErr: cluster.ErrUnknownSandbox}
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		start := time.Now()
+		awaitOwner(ctx, stub, "sb-x", time.Minute)
+		if took := time.Since(start); took > time.Second {
+			t.Fatalf("awaitOwner ignored a cancelled request for %v", took)
+		}
+	})
 }

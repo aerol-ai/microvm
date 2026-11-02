@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/aerol-ai/microvm/pkg/capacity"
 	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/aerol-ai/microvm/pkg/secrets"
 	sqlite3 "github.com/mattn/go-sqlite3"
@@ -151,6 +152,18 @@ func open(path string, secretCipher *secrets.Cipher) (*Store, error) {
 			sealed_blob BLOB NOT NULL,
 			created_at DATETIME NOT NULL,
 			binding_version INTEGER NOT NULL DEFAULT 1 CHECK (binding_version = 1),
+			FOREIGN KEY (sandbox_id) REFERENCES sandboxes(id) ON DELETE CASCADE
+		);`,
+		// sandbox_create_digests holds the keyed digest of the request an
+		// Idempotency-Key create was made with, so a retry with the same key
+		// and a different request is refused instead of handed the sandbox.
+		// A retry replays for as long as the sandbox exists, so the row lives
+		// exactly as long as its sandbox. A side table rather than a sandboxes
+		// column: only keyed creates write it and only their retries read it,
+		// so the list and scan paths never carry it.
+		`CREATE TABLE IF NOT EXISTS sandbox_create_digests (
+			sandbox_id TEXT PRIMARY KEY,
+			digest TEXT NOT NULL,
 			FOREIGN KEY (sandbox_id) REFERENCES sandboxes(id) ON DELETE CASCADE
 		);`,
 		// sandbox_custom_domains attaches operator-provided public hostnames
@@ -1968,6 +1981,9 @@ func (s *Store) Create(ctx context.Context, sandbox *models.Sandbox) error {
 	if err := s.insertSandbox(ctx, tx, sandbox); err != nil {
 		return err
 	}
+	if err := putCreateDigestExec(ctx, tx, sandbox); err != nil {
+		return err
+	}
 	// An empty env is recorded as an empty row, never as an absent one. That
 	// is what lets a later read tell "this sandbox has no environment" from
 	// "this sandbox's sealed environment is gone" and fail loud on the second
@@ -2012,6 +2028,9 @@ func (s *Store) CreateWithSealedEnv(ctx context.Context, sandbox *models.Sandbox
 	if err := s.insertSandbox(ctx, tx, &cleared); err != nil {
 		return err
 	}
+	if err := putCreateDigestExec(ctx, tx, sandbox); err != nil {
+		return err
+	}
 	if err := putEnvExec(ctx, tx, sandbox.ID, sealedEnv); err != nil {
 		return err
 	}
@@ -2024,6 +2043,34 @@ func (s *Store) CreateWithSealedEnv(ctx context.Context, sandbox *models.Sandbox
 		return fmt.Errorf("commit create+env tx: %w", err)
 	}
 	return nil
+}
+
+// putCreateDigestExec records a keyed create's request digest with its row.
+// A create without one (no Idempotency-Key, or no server key) writes nothing.
+func putCreateDigestExec(ctx context.Context, exec dbExecer, sandbox *models.Sandbox) error {
+	digest := strings.TrimSpace(sandbox.CreateRequestDigest)
+	if digest == "" {
+		return nil
+	}
+	if _, err := exec.ExecContext(ctx, `INSERT INTO sandbox_create_digests (sandbox_id, digest) VALUES (?, ?)`, sandbox.ID, digest); err != nil {
+		return fmt.Errorf("insert create digest: %w", err)
+	}
+	return nil
+}
+
+// GetCreateRequestDigest returns the request digest a sandbox's keyed create
+// stored, or "" when it has none (a create without a key, a server without a
+// key, or a row made before digests were kept).
+func (s *Store) GetCreateRequestDigest(ctx context.Context, sandboxID string) (string, error) {
+	var digest string
+	err := s.db.QueryRowContext(ctx, `SELECT digest FROM sandbox_create_digests WHERE sandbox_id = ?`, strings.TrimSpace(sandboxID)).Scan(&digest)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("get create digest: %w", err)
+	}
+	return digest, nil
 }
 
 func (s *Store) insertSandbox(ctx context.Context, exec dbExecer, sandbox *models.Sandbox) error {
@@ -8107,10 +8154,10 @@ func (s *Store) GetFirecrackerTapPoolStats(ctx context.Context) (FirecrackerTapP
 }
 
 // ErrNoFreeFirecrackerTapSlot is returned by AllocateFirecrackerTapSlot
-// when every slot is claimed. The Firecracker create path translates
-// this into a 503-ish admission error upstream — operators see "pool
-// exhausted" before the customer sees a confusing timeout.
-var ErrNoFreeFirecrackerTapSlot = errors.New("firecracker tap pool: no free slot")
+// when every slot is claimed. It is a capacity refusal (errors.Is matches
+// capacity.ErrCapacityExceeded), so a full pool answers 503 + Retry-After
+// like any other admission refusal rather than a catch-all 400.
+var ErrNoFreeFirecrackerTapSlot error = capacity.NewSlotPoolExhausted("firecracker tap pool")
 
 // Firecracker warm-VMM pool status constants. Kept as bare strings
 // rather than a typed enum because SQLite stores them as TEXT and the

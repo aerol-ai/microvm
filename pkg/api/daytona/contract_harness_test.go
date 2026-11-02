@@ -52,6 +52,12 @@ type fakeDaytonaContractRuntime struct {
 	allowedPorts  map[string][]int
 	imageSeq      int
 	ipSeq         int
+	// hold, when set, parks every Create until it is closed; entered is
+	// closed when the first one parks. creates counts Create calls.
+	hold      chan struct{}
+	entered   chan struct{}
+	enterOnce sync.Once
+	creates   int
 }
 
 func newFakeDaytonaContractRuntime() *fakeDaytonaContractRuntime {
@@ -63,6 +69,13 @@ func newFakeDaytonaContractRuntime() *fakeDaytonaContractRuntime {
 }
 
 func (f *fakeDaytonaContractRuntime) Create(_ context.Context, _ models.CreateSandboxRequest, sandboxID, _ string, _ []mounts.ContainerBind) (*models.SandboxRuntimeState, error) {
+	f.mu.Lock()
+	f.creates++
+	f.mu.Unlock()
+	if f.hold != nil {
+		f.enterOnce.Do(func() { close(f.entered) })
+		<-f.hold
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 

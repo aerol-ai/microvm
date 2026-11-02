@@ -25,7 +25,7 @@ AerolVM puts the fix in the database schema, using three tools together:
 - **Partial unique indexes** on the tables that hand out resources such as ports and network slots.
 - A general **`request_idempotency`** table that claims a request and replays its result.
 
-Resource allocations are safe under retry. The E2B facade's create is also safe when the same request body arrives twice, because it dedupes by fingerprint (a hash of the request body). The application only reads the outcome; SQLite does the rejecting.
+Resource allocations are safe under retry. The E2B facade's create is also safe when the same request body arrives twice, because it dedupes by fingerprint (a keyed hash of the request body). The application only reads the outcome; SQLite does the rejecting.
 
 The sections below cover three hazards, the invariant for each (a rule that always holds), and the SQL that enforces it. You can search for every name below in `internal/store/store.go` and `internal/cluster/fsm.go`.
 
@@ -234,7 +234,7 @@ The `request_idempotency` table is the general tool. Each row is keyed by a scop
 ```sql
 CREATE TABLE request_idempotency (
   scope         TEXT NOT NULL,          -- facade namespace, e.g. "e2b.create"
-  fingerprint   TEXT NOT NULL,          -- hash of the request body
+  fingerprint   TEXT NOT NULL,          -- keyed hash of the request body
   target_id     TEXT NOT NULL DEFAULT '',
   state         TEXT NOT NULL DEFAULT 'pending',  -- pending | ready
   locked_until  DATETIME NOT NULL,      -- pending TTL
@@ -309,7 +309,7 @@ Two TTLs (time-to-live limits) control how long a claim lasts, and each facade s
 
 `replayTTL` is how long the same fingerprint keeps replaying the same sandbox. After that, the row resets and a duplicate request runs the create again.
 
-`createRequestFingerprint` (`pkg/api/e2b/meta.go`) builds the hash from a fixed list of fields:
+`createRequestFingerprints` (`pkg/api/e2b/meta.go`) builds the hash from a fixed list of fields:
 
 - the caller's account and the `templateID`,
 - env vars and sandbox metadata,
@@ -317,6 +317,12 @@ Two TTLs (time-to-live limits) control how long a claim lasts, and each facade s
 - the network allow and deny settings, the public-traffic setting and the host-header mask.
 
 It does NOT include a client request ID or timestamp. If your SDK adds one to the body, dedupe silently breaks, because every retry hashes to a new fingerprint. Fields outside that list are not in the hash, so they cannot drive dedupe either.
+
+The hash is keyed. The fields include env values, the fingerprint is stored in the table, and its first 64 bits become the sandbox ID. A plain SHA-256 of them would let anyone who sees the ID or the row check a guessed password offline. So the fingerprint is an HMAC-SHA256 under a key derived from the server key (`Cipher.Digests` in `pkg/secrets/digest.go`), written `hmac:<key id>:<hex>`:
+
+- **The same across restarts and nodes.** Every node of a cluster holds the same server key, so every node derives the same fingerprint and the same sandbox ID.
+- **New only when the server key is rotated.** While a rotation is in progress the server holds the old key too, and a create also looks for a claim under the old key's fingerprint, so a retry across the promote on one node still replays. Each node switches at its next read of the key ring (about every 5 minutes). Until all have, two nodes can derive different IDs, so a retry that moves to another node in that window can create a second sandbox.
+- **Upgrades.** Older servers stored an unkeyed `fingerprint:<sha256>`. For 4 minutes after start (twice the pending TTL, so every claim the old process could leave), a create also looks for a claim under that format. It is computed only to look up; it is never written or logged. During a rolling upgrade an old node and a new node derive different sandbox IDs for the same create, so a retry that moves from one to the other can create a second sandbox.
 
 ### Dedupe is per process
 
@@ -348,6 +354,104 @@ flowchart TB
 - The claim-and-replay row lives on the node that ran the first create. Forwarding by ID is how a retry finds it.
 - The replay only happens inside the 10-second replay window.
 
+## The Idempotency-Key header (v1 and Daytona)
+
+The native v1 create and the Daytona create take an optional `Idempotency-Key` header. It works differently from the E2B fingerprint above: the client picks the key, and the request body is not part of the sandbox ID.
+
+- **Every SDK sends one.** Each AerolVM SDK's create sends the caller's key, or a random 128-bit key it makes for that call. The SDK resends the same key on each of the call's automatic retries, so a create retried after a timeout gets back the sandbox the first try made. A new call gets a new key, so two separate calls still make two sandboxes.
+
+- **The sandbox ID comes from the key.** It is a hash of the caller's account and the key (`DeterministicSandboxID` in `pkg/api/clustercreate/clustercreate.go`). Every node derives the same ID, so a retry on any node finds the sandbox the first call made. A create without the header gets a fresh ID every time.
+- **A retry replays for as long as the sandbox exists.** There is no time window. Delete the sandbox and the key is free again.
+- **The key belongs to one request.** The first create keeps a keyed fingerprint of its request as the client sent it, before any server default, in `sandbox_create_digests` next to the sandbox. A retry with the same request gets the same sandbox back (201). A retry with the same key and a different request, such as a new value in `env`, a different image or a different network policy, gets **422** with the code `idempotency_key_reused` and no sandbox data. The order of keys inside `env` or `tags` does not matter. Send the original request again, or use a new key.
+- **The fingerprint is keyed.** It is an HMAC under a key derived from the server key (`Service.CreateRequestDigests`), so it says nothing about the env values it covers. The server keeps one per server key while a key rotation is in progress, so a rotation between the two calls does not turn a retry into a refusal.
+- **A retry while the first call still runs.** An SDK retries a create after a proxy timeout or a dropped connection, often while the first call is still pulling its image. When the retry has the same key and the same request, it waits on the sandbox's node for the first create to finish. Then it answers what a later retry would: the same sandbox (201), or a fresh create if the first one failed and was undone. Only one create of a sandbox runs at a time, so a retry can never undo the first create's capacity reservation or mounts (`BeginSandboxCreate` in `internal/service/create_lease.go`).
+- **The wait has limits.** It ends when the client gives up, or after the server's create timeout plus a short margin. Past that the retry gets **503** with the code `create_in_progress` and a `Retry-After` header, and nothing was created.
+- **Two calls with different requests.** A retry with the same key and a different request does not wait. It gets 422 at once, before it creates anything.
+- **In a cluster.** A retry that reaches another node is sent to the node holding the sandbox's reservation, and waits there. If the first create failed, the retry gets 503 with `Retry-After: 1`, and the next retry reserves the sandbox again.
+- **Failover keeps it.** The fingerprint rides the replicated create spec, so a sandbox recreated on another node after its node died still refuses a different request.
+- **Older sandboxes are not checked.** A sandbox created before this check existed, or by a server with no server key, has no fingerprint. A retry with its key replays it as before, whatever the request.
+
+The SDK's own key only covers retries inside one call. To make your own retry of the whole call safe, such as after your program restarts, pass a key that stays the same for the same job:
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const options = { image: "ubuntu:22.04", idempotencyKey: "job-42" };
+
+    const first = await client.create(options);
+    // Your own retry of the whole call, such as after a restart.
+    const again = await client.create(options);
+
+    console.log(first.id === again.id); // true
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    first = client.create(image="ubuntu:22.04", idempotency_key="job-42")
+    # Your own retry of the whole call, such as after a restart.
+    again = client.create(image="ubuntu:22.04", idempotency_key="job-42")
+
+    print(first.id == again.id)  # True
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    opts := sdktypes.CreateSandboxOptions{Image: "ubuntu:22.04"}
+
+    first, err := client.CreateWithIdempotencyKey(ctx, opts, "job-42")
+    if err != nil {
+        log.Fatal(err)
+    }
+    // Your own retry of the whole call, such as after a restart.
+    again, err := client.CreateWithIdempotencyKey(ctx, opts, "job-42")
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    fmt.Println(first.ID == again.ID) // true
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    let options = CreateOptions {
+        image: "ubuntu:22.04".to_string(),
+        idempotency_key: Some("job-42".to_string()),
+        ..Default::default()
+    };
+
+    let first = client.create(options.clone())?;
+    // Your own retry of the whole call, such as after a restart.
+    let again = client.create(options)?;
+
+    println!("{}", first.data.id == again.data.id); // true
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    CreateOptions options = new CreateOptions()
+        .setImage("ubuntu:22.04")
+        .setIdempotencyKey("job-42");
+
+    Sandbox first = client.create(options);
+    // Your own retry of the whole call, such as after a restart.
+    Sandbox again = client.create(options);
+
+    System.out.println(first.id.equals(again.id)); // true
+    ```
+  </TabItem>
+</Tabs>
+
+## The Runloop devbox ID
+
+The Runloop SDKs send an `x-request-id` header with each call, and send the same one again when they retry it. The Runloop facade turns that header into the devbox ID, so a retry gets the devbox the first attempt made.
+
+- **The ID comes from the caller's account, the request ID and the request body.** So two different creates sent with the same request ID still get two devboxes.
+- **The hash is keyed.** The body holds the env values, and the devbox ID is public. A plain SHA-256 would let anyone who knows the request ID check a guessed password against the ID. So the ID is cut from an HMAC under a key derived from the server key (`devboxIDsForRequest` in `pkg/api/runloop/meta.go`). Every node holds the same server key, so every node derives the same ID.
+- **A retry on the same server finds its devbox through a key rotation.** While a rotation is in progress, the server holds the old key too, and a create also looks for a devbox under the old key's ID.
+- **And through an upgrade.** Older servers used the plain SHA-256 ID. For 4 minutes after start, a create also looks for a devbox under that ID. It is computed only to look up; no new devbox gets it.
+- **Across servers, the cluster finds it by ID.** A retry that lands on another node derives the same ID, collides with the first devbox in the placement layer, and is sent to its node. While nodes disagree on the current key (up to about 5 minutes during a rotation) or run different releases (a rolling upgrade), a retry that moves to another node can create a second devbox.
+- **No server key, no create.** If the server key is revoked, a create with an `x-request-id` gets 503 and nothing is created. A create without the header gets a fresh ID every time, as before.
+
 ## Why a single writer at all
 
 One writer makes these rules cheap, and it keeps AerolVM easy to run. With many writers, as in a clustered Postgres, partial unique indexes need careful thought about isolation levels. (An isolation level sets how much one running transaction can see of another.)
@@ -363,7 +467,7 @@ From the SDK, most of this is invisible, but a few behaviors show through:
 - A retried `exposePort` returns the existing public URL. It does not walk the host-port pool until the pool runs out. The partial unique index on `host_port` and the `(sandbox_id, port)` primary key together make the second call see the same row.
 - Two creates racing for the same name get a typed 409 error at the API, not two sandboxes that share a name.
 - In the E2B facade, a duplicate `create` with the same body returns the same sandbox ID, by fingerprint replay through `request_idempotency`.
-- Native `/v1/sandboxes` does not dedupe by fingerprint today. Two identical creates either collide on the name index (409), or return two different IDs if no `name` is set.
+- Native `/v1/sandboxes` dedupes by `Idempotency-Key`, not by fingerprint. The SDKs send a new key for each create call, so two identical calls either collide on the name index (409), or return two different IDs if no `name` is set. An SDK's automatic retry inside one call reuses its key and gets the first sandbox back.
 
 The `exposePort` retry is the easiest one to show. The same call, made twice, returns the same public URL in every SDK:
 
