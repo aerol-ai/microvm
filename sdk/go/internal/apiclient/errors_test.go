@@ -30,6 +30,9 @@ func TestDecodeErrorReturnsAPIError(t *testing.T) {
 		{name: "code passes through", status: 503, body: `{"error":"gone","code":"artifact_node_unavailable"}`, retryAfter: "7", wantMessage: "gone", wantCode: "artifact_node_unavailable", wantRetry: true, wantAfter: 7 * time.Second},
 		{name: "no body falls back to status", status: 500, body: ``, wantMessage: "request failed with status 500"},
 		{name: "bad retry-after ignored", status: 429, body: `{"error":"slow down"}`, retryAfter: "soon", wantMessage: "slow down", wantRetry: true},
+		{name: "idempotency key reused", status: 422, body: `{"error":"Idempotency-Key reused with a different request","code":"idempotency_key_reused"}`, wantMessage: "Idempotency-Key reused with a different request", wantCode: "idempotency_key_reused"},
+		{name: "egress floor not ready keeps Retry-After", status: 503, body: `{"error":"egress deny floor not ready","code":"egress_floor_not_ready"}`, retryAfter: "5", wantMessage: "egress deny floor not ready", wantCode: "egress_floor_not_ready", wantRetry: true, wantAfter: 5 * time.Second},
+		{name: "non-JSON body has no code", status: 502, body: `<html>Bad Gateway</html>`, wantMessage: "request failed with status 502", wantRetry: true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -122,5 +125,29 @@ func TestListWithQuerySendsName(t *testing.T) {
 	}
 	if seen[0] != "tag.team=x&name=agent" || seen[1] != "" {
 		t.Fatalf("queries = %q", seen)
+	}
+}
+
+// TestCreateIdempotencyKeyReusedIsNotRetried: a 422 is the server refusing
+// the request itself, so the create surfaces it at once, code and all, even
+// with retries enabled.
+func TestCreateIdempotencyKeyReusedIsNotRetried(t *testing.T) {
+	var hits int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnprocessableEntity)
+		_, _ = w.Write([]byte(`{"error":"Idempotency-Key reused with a different request","code":"idempotency_key_reused"}`))
+	}))
+	defer server.Close()
+	retries, delay := 3, 1
+	client := NewClient(server.URL, ClientOptions{PATToken: "pat", HTTPClient: server.Client(), Retry: &RetryConfig{MaxRetries: &retries, BaseDelayMs: &delay, MaxDelayMs: &delay}})
+	_, _, err := client.Create(context.Background(), CreateOptions{Image: "ubuntu:22.04"})
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) || apiErr.StatusCode != http.StatusUnprocessableEntity || apiErr.Code != "idempotency_key_reused" || apiErr.Retryable() {
+		t.Fatalf("Create error = %#v", err)
+	}
+	if hits != 1 {
+		t.Fatalf("server saw %d creates, want 1 (a 422 is not retried)", hits)
 	}
 }
