@@ -1473,7 +1473,8 @@ type Config struct {
 	AuditAPIRate  float64
 	AuditAPIBurst int
 	// AuditExecCommand is what an exec record says about the command:
-	// "digest" (default) is the SHA-256 of the request body only, because
+	// "digest" (default) is a keyed digest of the request body only (an HMAC
+	// under the server key, so a log reader cannot test guesses), because
 	// commands carry secrets; "full" also records the argv, never the
 	// environment. SB_AUDIT_EXEC_COMMAND.
 	AuditExecCommand string

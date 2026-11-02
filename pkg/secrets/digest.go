@@ -4,9 +4,11 @@ import (
 	"crypto/hkdf"
 	"crypto/hmac"
 	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -20,6 +22,13 @@ const digestKeyInfo = "aerolvm-keyed-digest/v1"
 type KeyedDigest struct {
 	KeyID uint32
 	Sum   []byte
+}
+
+// String is the digest as it is stored or recorded: "hmac:<key id>:<hex>".
+// The key id says which server key made it, so a reader can tell digests of
+// two key epochs apart rather than take them for two different inputs.
+func (d KeyedDigest) String() string {
+	return "hmac:" + strconv.FormatUint(uint64(d.KeyID), 10) + ":" + hex.EncodeToString(d.Sum)
 }
 
 func deriveDigestKey(key []byte) ([]byte, error) {

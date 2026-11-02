@@ -2,8 +2,6 @@ package service
 
 import (
 	"context"
-	"encoding/hex"
-	"strconv"
 	"strings"
 	"sync"
 
@@ -41,7 +39,7 @@ func (s *Service) CreateRequestDigests(facade string, canonical []byte) ([]strin
 	}
 	out := make([]string, 0, len(digests))
 	for _, d := range digests {
-		out = append(out, "hmac:"+strconv.FormatUint(uint64(d.KeyID), 10)+":"+hex.EncodeToString(d.Sum))
+		out = append(out, d.String())
 	}
 	return out, nil
 }

@@ -135,3 +135,19 @@ func TestDigestsRefuseBadInput(t *testing.T) {
 		t.Fatal("a nil Cipher digested")
 	}
 }
+
+// String is the stored and recorded form: the key id, then the hex digest.
+func TestKeyedDigestString(t *testing.T) {
+	for _, tc := range []struct {
+		d    KeyedDigest
+		want string
+	}{
+		{KeyedDigest{KeyID: 0, Sum: []byte{0x00, 0xab}}, "hmac:0:00ab"},
+		{KeyedDigest{KeyID: 4294967295, Sum: []byte{0xff}}, "hmac:4294967295:ff"},
+		{KeyedDigest{KeyID: 7}, "hmac:7:"},
+	} {
+		if got := tc.d.String(); got != tc.want {
+			t.Errorf("String() = %q, want %q", got, tc.want)
+		}
+	}
+}
