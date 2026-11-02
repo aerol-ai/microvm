@@ -3,11 +3,11 @@ package docker
 import (
 	"bufio"
 	"context"
-	"fmt"
+	"encoding/json"
 	"net"
 	"net/http"
-	"net/url"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -220,18 +220,16 @@ func TestStartWithIdentityReadoptsAWarmPoolContainer(t *testing.T) {
 // container's carries SB_POOL_PARKED=1. Both ends drop it: the commit, and
 // every cold create (for snapshots already made).
 func TestSnapshotsDoNotCarryTheParkedFlag(t *testing.T) {
-	var commit url.Values
-	c := &Client{httpClient: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
-		if r.URL.Path == "/commit" {
-			commit = r.URL.Query()
-			return jsonResponse(http.StatusCreated, map[string]string{"Id": "sha256:snap"}), nil
-		}
-		return textResponse(http.StatusNotFound, fmt.Sprintf("unexpected %s", r.URL.Path)), nil
-	})}}
-	if _, err := c.CreateSnapshot(context.Background(), "sb", "snap:v1"); err != nil {
+	d := newSnapshotDaemon(t)
+	d.containerConfig["Env"] = []string{"SB_TOOLBOX_TOKEN=boot-tok", poolParkedEnv + "=1", "PATH=/usr/local/bin:/usr/bin:/bin"}
+	if _, err := d.client().CreateSnapshot(context.Background(), "cid", "snap:v1"); err != nil {
 		t.Fatalf("CreateSnapshot: %v", err)
 	}
-	if got := commit["changes"]; len(got) != 1 || got[0] != "ENV "+poolParkedEnv+"=" {
-		t.Fatalf("commit changes = %q, want the parked flag cleared", got)
+	var env []string
+	if err := json.Unmarshal(d.commitBodies[0]["Env"], &env); err != nil {
+		t.Fatalf("committed Env: %v", err)
+	}
+	if !slices.Contains(env, poolParkedEnv+"=") || slices.Contains(env, poolParkedEnv+"=1") {
+		t.Fatalf("committed Env = %q, want the parked flag cleared", env)
 	}
 }

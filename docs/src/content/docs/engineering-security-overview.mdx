@@ -266,7 +266,7 @@ Storage such as an S3 bucket is mounted by the server, not by the sandbox, so th
 ### Where the seal stops
 
 - **Inside the sandbox, variables are plain.** Code in the sandbox can read every variable you gave it. That is why inject rules exist.
-- **The container engine sees them.** On Docker and containerd, plain variables are handed to the engine on the server, and a container snapshot saves them.
+- **The container engine sees them.** On Docker and containerd, plain variables are handed to the engine on the server. A container snapshot does not keep them, but on Docker the node keeps a hidden copy of the sandbox's settings next to the snapshot until it is deleted.
 - **The server is trusted.** Someone with full control of the server can read what the server can read.
 
 ## Sister buildings: the cluster
