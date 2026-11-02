@@ -137,17 +137,6 @@ func startPKCS11Helper(cfg config.Config, logger *slog.Logger) (pkcs11Helper, fu
 	return h, stop, nil
 }
 
-// enterpriseCustodyWarning is the first-release half of F2 (§7): an
-// enterprise node with a customer key store whose server key is still a
-// plaintext file. The next release refuses it (Phase 7).
-func enterpriseCustodyWarning(cfg config.Config) string {
-	if !cfg.EnterpriseMode || !secrets.IsExternalProvider(cfg.SecretProvider) || cfg.CredentialKeyCustody == secrets.CustodyWrapped {
-		return ""
-	}
-	return "SB_ENTERPRISE_MODE=true with SB_SECRET_PROVIDER=" + secrets.NormalizeProviderName(cfg.SecretProvider) +
-		" but the server key is a plaintext file (SB_CREDENTIAL_KEY_CUSTODY=file); the key custody claim does not hold. Run `sandboxd key wrap` and set SB_CREDENTIAL_KEY_CUSTODY=wrapped; the next release refuses this combination"
-}
-
 // openServerKey opens the server key per §3's boot decision: today's
 // plaintext key (or custody=file's ring, once rotated) with custody "file",
 // the wrapped file's ring through the key store with custody "wrapped"
@@ -174,9 +163,6 @@ func openServerKey(ctx context.Context, cfg config.Config, w secrets.DataKeyWrap
 	}
 	c, err := secrets.OpenServerKey(secrets.ContextWithBackgroundPurpose(ctx, "boot"), in, cfg.CredentialEncryptionKey, w,
 		secrets.NormalizeProviderName(cfg.SecretProvider), service.KeyStoreRef(cfg))
-	if msg := enterpriseCustodyWarning(cfg); err == nil && logger != nil && msg != "" {
-		logger.Warn(msg)
-	}
 	if err == nil && logger != nil && secrets.RetiredKeyStillPresent(in, cfg.CredentialEncryptionKey) {
 		logger.Warn("server-key ring: key 0 is retired but the plaintext key is still in SB_CREDENTIAL_ENCRYPTION_KEY or the key file; remove it so a copy of it opens nothing current",
 			"key_file", cfg.CredentialEncryptionKeyPath)
