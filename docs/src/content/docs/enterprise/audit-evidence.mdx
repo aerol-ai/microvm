@@ -61,13 +61,15 @@ A SIEM (security information and event management system) is where many companie
 | `sandbox_id` and `owner_ref` | The sandbox it was about, and the team that owns it |
 | `ref` | Which secret, by name, such as `env:<sandbox-id>`, or which route, such as `POST /v1/sandboxes/{id}/exec`. Never a value. |
 | `caller` | Who caused it: `kind` (`operator`, `token`, `oidc`, `node`, `system`, `sandbox_key` or `controlplane`), a stable `id` (such as `tok_…` or `oidc:okta:00u1ab…`), a display `name`, the `team` acted for, and `via`, the server a forwarded call came through |
-| `request` | For `api` records: `method`, `route`, `status`, the command's SHA-256 `digest`, a `count` when identical calls were merged, `surface` (`mcp` or `ssh`), the `target` a non-sandbox call acted on (such as a token ID), and the `grant` (role and team) a token create handed out |
+| `request` | For `api` records: `method`, `route`, `status`, the command's keyed fingerprint (`digest`, written `hmac:<key id>:<hex>`), a `count` when identical calls were merged, `surface` (`mcp` or `ssh`), the `target` a non-sandbox call acted on (such as a token ID), and the `grant` (role and team) a token create handed out |
 | `destination` | For `egress` records, where the connection was going |
 | `result` and `reason` | What happened. Reasons come from a fixed list, never free text. |
 | `correlation_id` | The request's correlation ID, the same on every server one call touched |
 | `prev_hash` and `event_hash` | The links of the chain |
 
 No record holds a secret's value or the content of traffic. Commands are recorded only as a fingerprint (`digest`), because commands can carry secrets. An operator who sets `SB_AUDIT_EXEC_COMMAND=full` also records each command's arguments, never its environment.
+
+The fingerprint is keyed. It is an HMAC made with a key derived from the server key, so a person who can read the log, or its S3 or webhook export, cannot check a guessed secret against it. Two identical commands still get the same fingerprint, on every server, until the server key is rotated. The number after `hmac:` names the server key that made it, so you can tell a rotation apart from a different command. If the server key is revoked, the record is still written, with no fingerprint. Records written by older releases hold a plain SHA-256 hash instead. They are never rewritten, and they still verify.
 
 An SSH session is recorded on the server that runs the sandbox, so it shows up in the sandbox's audit whichever server took the connection. Its caller is the sandbox's key (`sandbox_key`). On a cluster, `via` names the server whose SSH port took the connection. The calls that server makes to carry the session are recorded with the same caller and surface `ssh`, never as the operator's. During a rolling upgrade, until every server runs the new release, the session record stays on the server that took the connection.
 

@@ -5,7 +5,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"hash"
@@ -20,6 +19,7 @@ import (
 	"github.com/aerol-ai/microvm/pkg/api/runloop"
 	"github.com/aerol-ai/microvm/pkg/auditlog"
 	"github.com/aerol-ai/microvm/pkg/controlplane"
+	"github.com/aerol-ai/microvm/pkg/secrets"
 )
 
 // The api recorder (plans/identity-and-access.md §5.9) is the T2 audit seam
@@ -183,7 +183,7 @@ func (p *pendingAPIRecord) emit(status int) {
 		}
 		call.Grant = p.state.Grant()
 		if p.body != nil {
-			call.Digest = p.body.digest()
+			call.Digest = p.body.digest(p.svc)
 			call.Argv = p.body.argv()
 		}
 		p.svc.RecordAPICall(p.ctx, call)
@@ -303,6 +303,16 @@ func (w *recordingWriter) statusCode() int {
 // this is a file upload, not a command.
 const execArgvCaptureMax = 64 << 10
 
+// execDigestPurpose separates the exec record's keyed digest from every
+// other use of the server key. The data it keys is the body's SHA-256, not
+// the body: the body streams through and is never buffered (I5).
+const execDigestPurpose = "api-audit.exec-body-sha256/v1"
+
+// bodyDigester is the part of the service the exec digest needs.
+type bodyDigester interface {
+	RequestDigests(purpose string, data []byte) ([]secrets.KeyedDigest, error)
+}
+
 // digestBody hashes an exec request body as the handler reads it: the
 // record proves which command ran without the body ever being buffered
 // (I5). Once the call is forwarded to a peer it stops hashing, since the
@@ -336,13 +346,24 @@ func (d *digestBody) Read(p []byte) (int, error) {
 	return n, err
 }
 
-// digest is the hex SHA-256 of what the handler read, or "" if it read
-// nothing.
-func (d *digestBody) digest() string {
-	if d == nil || d.n == 0 {
+// digest is the keyed digest of what the handler read, "hmac:<key id>:<hex>"
+// under the server's current key, or "" if it read nothing.
+//
+// An exec body can carry the command's env, and the record reaches whoever
+// reads the audit log or its exports, so a plain hash of it would let them
+// test a guessed secret offline. Keyed, the same body still gives the same
+// digest on every node that shares the key, until the key is rotated. With
+// no usable server key (none configured, or revoked) the record carries no
+// digest rather than an unkeyed one; the call is still recorded.
+func (d *digestBody) digest(k bodyDigester) string {
+	if d == nil || d.n == 0 || k == nil {
 		return ""
 	}
-	return hex.EncodeToString(d.h.Sum(nil))
+	digests, err := k.RequestDigests(execDigestPurpose, d.h.Sum(nil))
+	if err != nil || len(digests) == 0 {
+		return ""
+	}
+	return digests[0].String()
 }
 
 // argv extracts the command from a captured JSON exec body. It reads only
