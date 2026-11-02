@@ -25,9 +25,11 @@ class RecordingMicroVM(MicroVM):
         self.calls = []
         self.raw_calls = []
         self.non_idempotent_calls = []
+        self.headers = []
 
-    def _do_json(self, method, path, payload, *, idempotent=True):  # type: ignore[override]
+    def _do_json(self, method, path, payload, *, idempotent=True, headers=None):  # type: ignore[override]
         self.calls.append((method, path, payload))
+        self.headers.append(dict(headers or {}))
         if not idempotent:
             self.non_idempotent_calls.append((method, path))
         if method == "POST" and path == "/v1/images/build":
@@ -1565,6 +1567,110 @@ class HTTPErrorTests(unittest.TestCase):
 
         self.assertIs(microvm.MicroVMHTTPError, MicroVMHTTPError)
         self.assertIs(microvm.MicroVMError, MicroVMError)
+
+
+class IdempotencyKeyTests(unittest.TestCase):
+    """A create carries an Idempotency-Key: the caller's, or one the SDK makes
+    per call and sends unchanged on every automatic retry of that call."""
+
+    def _serve(self, script):
+        """Answers request N with script[N] ("ok", "503", "hangup" or "422";
+        the last entry repeats). Returns the client and, per request, its
+        method, path, Idempotency-Key header and body."""
+        seen = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def _handle(self):
+                length = int(self.headers.get("Content-Length") or 0)
+                seen.append((self.command, self.path, self.headers.get("Idempotency-Key"), self.rfile.read(length)))
+                step = script[min(len(seen), len(script)) - 1]
+                if step == "hangup":
+                    self.close_connection = True
+                    return
+                if step in ("503", "422"):
+                    code = "egress_floor_not_ready" if step == "503" else "idempotency_key_reused"
+                    body = json.dumps({"error": "refused", "code": code}).encode("utf-8")
+                    self.send_response(int(step))
+                    if step == "503":
+                        self.send_header("Retry-After", "0")
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
+                body = json.dumps({"id": "sb-keyed", "image": "ubuntu:22.04", "stdout": "", "exit_code": 0}).encode("utf-8")
+                self.send_response(201 if self.command == "POST" and self.path == "/v1/sandboxes" else 200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            do_GET = _handle
+            do_POST = _handle
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
+        thread.start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        return MicroVM("http://127.0.0.1:%d" % server.server_port, "pat", config=_FAST_RETRY), seen
+
+    def test_sends_the_callers_key_and_keeps_it_out_of_the_body(self):
+        for name, call in [
+            ("keyword", lambda c: c.create(image="ubuntu:22.04", idempotency_key=" order-42 ")),
+            ("dict camelCase", lambda c: c.create({"image": "ubuntu:22.04", "idempotencyKey": "order-42"})),
+        ]:
+            with self.subTest(name):
+                client, seen = self._serve(["ok"])
+                call(client)
+                self.assertEqual(seen[0][2], "order-42")
+                body = json.loads(seen[0][3])
+                self.assertNotIn("idempotency_key", body)
+                self.assertNotIn("idempotencyKey", body)
+                self.assertEqual(body["image"], "ubuntu:22.04")
+
+    def test_generated_key_is_the_same_on_every_retry(self):
+        for first in ("503", "hangup"):
+            with self.subTest(first=first):
+                client, seen = self._serve([first, first, "ok"])
+                sandbox = client.create(image="ubuntu:22.04")
+                self.assertEqual(sandbox.id, "sb-keyed")
+                keys = [entry[2] for entry in seen]
+                self.assertEqual(len(keys), 3)
+                self.assertRegex(keys[0], r"^[0-9a-f]{32}$")
+                self.assertEqual(keys, [keys[0]] * 3)
+
+    def test_callers_key_is_the_same_on_every_retry(self):
+        client, seen = self._serve(["503", "ok"])
+        client.create(image="ubuntu:22.04", idempotency_key="order-42")
+        self.assertEqual([entry[2] for entry in seen], ["order-42", "order-42"])
+
+    def test_each_create_call_gets_a_new_key(self):
+        client, seen = self._serve(["ok"])
+        client.create(image="ubuntu:22.04")
+        client.create(image="ubuntu:22.04")
+        client.create(image="ubuntu:22.04", idempotency_key="   ")
+        keys = [entry[2] for entry in seen]
+        self.assertEqual(len(set(keys)), 3)
+        for key in keys:
+            self.assertRegex(key, r"^[0-9a-f]{32}$")
+
+    def test_reused_key_is_not_retried(self):
+        client, seen = self._serve(["422"])
+        with self.assertRaises(MicroVMHTTPError) as ctx:
+            client.create(image="ubuntu:22.04", idempotency_key="order-42")
+        self.assertEqual(ctx.exception.status_code, 422)
+        self.assertEqual(ctx.exception.code, "idempotency_key_reused")
+        self.assertEqual(len(seen), 1)
+
+    def test_only_sandbox_create_sends_the_header(self):
+        client, seen = self._serve(["ok"])
+        client.get("sb-keyed")
+        client.exec("sb-keyed", {"command": "true"})
+        self.assertEqual([entry[2] for entry in seen], [None, None])
 
 
 class RetryAfterTests(unittest.TestCase):
