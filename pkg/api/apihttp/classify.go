@@ -76,6 +76,11 @@ func Classify(err error) Classification {
 	switch {
 	case errors.Is(err, store.ErrNotFound):
 		return Classification{Status: http.StatusNotFound, Message: "sandbox not found", Kind: ErrKindNotFound}
+	// A keyed create whose Idempotency-Key was used with a different request.
+	// The text names the key (models.IdempotencyKeyReusedError) and nothing
+	// about the sandbox; no Retry-After, since the same request fails again.
+	case errors.Is(err, models.ErrIdempotencyKeyReused):
+		return Classification{Status: http.StatusUnprocessableEntity, Code: models.ErrorCodeIdempotencyKeyReused, Message: idempotencyKeyReusedMessage(err)}
 
 	// Fleet admission verdicts (managed builds only). Denied is a definite
 	// 403; unavailable is a retryable 503.
@@ -310,4 +315,12 @@ func (c Classification) SetRetryAfter(w http.ResponseWriter) {
 	if c.RetryAfter > 0 {
 		w.Header().Set("Retry-After", strconv.Itoa(c.RetryAfter))
 	}
+}
+
+func idempotencyKeyReusedMessage(err error) string {
+	var reused *models.IdempotencyKeyReusedError
+	if errors.As(err, &reused) {
+		return truncate(reused.Error())
+	}
+	return (&models.IdempotencyKeyReusedError{}).Error()
 }

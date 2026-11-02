@@ -76,6 +76,8 @@ func TestClassify(t *testing.T) {
 		{"placement view catching up", fmt.Errorf("destroy: %w", cluster.ErrNotCaughtUp), http.StatusServiceUnavailable, cluster.CatchUpRetryAfterSeconds, "", ErrKindOther},
 		{"snapshot name conflict", store.ErrSnapshotNameConflict, http.StatusConflict, 0, "", ErrKindSnapshotNameConflict},
 		{"sandbox exists", models.ErrSandboxExists, http.StatusConflict, 0, "", ErrKindSandboxExists},
+		{"idempotency key reused", models.ErrIdempotencyKeyReused, http.StatusUnprocessableEntity, 0, models.ErrorCodeIdempotencyKeyReused, ErrKindOther},
+		{"idempotency key reused, named", &models.IdempotencyKeyReusedError{Key: "job-42"}, http.StatusUnprocessableEntity, 0, models.ErrorCodeIdempotencyKeyReused, ErrKindOther},
 		{"token request invalid", service.ErrAPITokenInvalid, http.StatusBadRequest, 0, "", ErrKindOther},
 		{"token name taken", service.ErrAPITokenNameTaken, http.StatusConflict, 0, "", ErrKindOther},
 		{"token ops not on every server", service.ErrAPITokenClusterVersion, http.StatusConflict, 0, "", ErrKindOther},
@@ -179,5 +181,24 @@ func TestWriteStoreAwareErrorMountToolUnavailable(t *testing.T) {
 	}
 	if c := Classify(missingMountS3); !c.Log {
 		t.Fatal("the missing tool must reach the node's log")
+	}
+}
+
+// The refusal names the key the client sent, and says nothing else.
+func TestClassifyIdempotencyKeyReusedMessage(t *testing.T) {
+	cases := map[string]struct {
+		err  error
+		want string
+	}{
+		"named":   {&models.IdempotencyKeyReusedError{Key: "job-42"}, `Idempotency-Key "job-42" was already used with a different request`},
+		"unnamed": {models.ErrIdempotencyKeyReused, "Idempotency-Key was already used with a different request"},
+		"long":    {&models.IdempotencyKeyReusedError{Key: strings.Repeat("k", 300)}, `Idempotency-Key "` + strings.Repeat("k", 300)[:200-len(`Idempotency-Key "`)]},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			if got := Classify(fmt.Errorf("create: %w", tc.err)).Message; got != tc.want {
+				t.Fatalf("message = %q, want %q", got, tc.want)
+			}
+		})
 	}
 }

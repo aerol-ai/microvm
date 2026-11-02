@@ -930,6 +930,10 @@ var Registry = []UseCase{
 	// A Docker snapshot keeps no secrets (secrets_env_test.go): the commit
 	// used to copy the sandbox's toolbox token and env into the image config.
 	{ID: "UC-364", Title: "Secrets: a Docker snapshot of a sandbox created with an env secret keeps neither the secret nor its toolbox token, in the image config dockerd reports or in any env list `docker save` holds (what a registry push sends), and a sandbox created from the snapshot runs on its own token and sees the variable empty", Requires: []Capability{CapDocker, CapDockerEngine}, Implemented: true},
+	// An Idempotency-Key reused with a different request is refused
+	// (bank_security_test.go): v1 and Daytona used to hand back the old
+	// sandbox and drop the new request.
+	{ID: "UC-365", Title: "Security: an Idempotency-Key reused with a different create request is refused, on v1 and Daytona: the same request replays the same sandbox, a changed env gets 422 idempotency_key_reused naming the key and carrying no sandbox data or secret, and the first sandbox is untouched", Requires: []Capability{CapDocker}, Implemented: true},
 }
 
 // byID is a lookup built once for the report generator.
