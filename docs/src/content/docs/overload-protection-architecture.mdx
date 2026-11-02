@@ -476,12 +476,12 @@ Also, the `503` path has not been reached in a live run yet. Unit tests cover it
 
 Your code does not need to handle overload by hand. All five SDKs retry a `503` on a list up to 3 times. They wait about 200, 400 and then 800 ms. Each wait varies by up to 25% at random, so clients spread out.
 
-If the node is still busy after the third retry, you get an error. In Go and Python the error also carries the code `overloaded`. The examples below set the retry settings to their defaults, so you can see where to change them.
+If the node is still busy after the third retry, you get an error. In every SDK the error carries the status `503` and the code `overloaded` ([how to read it](/sdk-setup/#when-a-request-fails)). The examples below set the retry settings to their defaults, so you can see where to change them.
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
     ```ts
-    import { MicroVM } from '@aerol-ai/aerolvm-sdk'
+    import { MicroVM, MicroVMApiError } from '@aerol-ai/aerolvm-sdk'
 
     const client = new MicroVM({
       apiUrl: process.env.SB_API_URL,
@@ -495,8 +495,12 @@ If the node is still busy after the third retry, you get an error. In Go and Pyt
       const sandboxes = await client.list()
       console.log(`${sandboxes.length} sandboxes`)
     } catch (err) {
-      // Still busy after 3 retries.
-      console.error('list failed:', err)
+      if (err instanceof MicroVMApiError && err.code === 'overloaded') {
+        // Still busy after 3 retries. retryAfterMs is the server's hint.
+        console.error(`cluster busy, try again in ${err.retryAfterMs} ms`)
+      } else {
+        throw err
+      }
     }
     ```
   </TabItem>
@@ -565,7 +569,7 @@ If the node is still busy after the third retry, you get an error. In Go and Pyt
   </TabItem>
   <TabItem label="Rust">
     ```rust
-    use aerolvm_sdk::{ApiVersion, Client, ClientConfig, RetryConfig};
+    use aerolvm_sdk::{ApiVersion, Client, ClientConfig, Error, RetryConfig};
 
     let client = Client::with_config(
         ClientConfig {
@@ -576,6 +580,7 @@ If the node is still busy after the third retry, you get an error. In Go and Pyt
                 max_retries: Some(3),
                 base_delay_ms: Some(200),
                 max_delay_ms: Some(5000),
+                ..Default::default()
             }),
             ..Default::default()
         },
@@ -585,16 +590,19 @@ If the node is still busy after the third retry, you get an error. In Go and Pyt
     // A 503 "overloaded" answer is retried for you.
     match client.list() {
         Ok(sandboxes) => println!("{} sandboxes", sandboxes.len()),
-        // Still busy after 3 retries.
+        // Still busy after 3 retries. retry_after() is the server's hint.
+        Err(Error::Status(err)) if err.code() == Some("overloaded") => {
+            eprintln!("cluster busy, try again in {:?}", err.retry_after())
+        }
         Err(err) => eprintln!("list failed: {err}"),
     }
     ```
   </TabItem>
   <TabItem label="Java">
     ```java
+    import ai.aerol.microvm.MicroVMApiException;
     import ai.aerol.microvm.MicroVMClient;
     import ai.aerol.microvm.MicroVMConfig;
-    import ai.aerol.microvm.MicroVMException;
     import ai.aerol.microvm.Sandbox;
     import ai.aerol.microvm.model.RetryConfig;
     import java.util.List;
@@ -611,9 +619,12 @@ If the node is still busy after the third retry, you get an error. In Go and Pyt
         // A 503 "overloaded" answer is retried for you.
         List<Sandbox> sandboxes = client.list();
         System.out.println(sandboxes.size() + " sandboxes");
-    } catch (MicroVMException e) {
-        // Still busy after 3 retries.
-        System.err.println("list failed: " + e.getMessage());
+    } catch (MicroVMApiException e) {
+        if (!"overloaded".equals(e.getCode())) {
+            throw e;
+        }
+        // Still busy after 3 retries. getRetryAfter() is the server's hint.
+        System.err.println("cluster busy, try again in " + e.getRetryAfter());
     }
     ```
   </TabItem>
