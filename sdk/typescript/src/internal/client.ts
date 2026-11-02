@@ -501,6 +501,23 @@ interface RequestOptions {
    * retry.
    */
   idempotent?: boolean;
+  /** Extra request headers, sent unchanged on every retry. */
+  headers?: Record<string, string>;
+}
+
+/**
+ * The header a sandbox create carries so the server can recognise a retry of
+ * it. Keep in sync with clustercreate.HeaderIdempotencyKey on the server.
+ */
+export const IDEMPOTENCY_KEY_HEADER = "Idempotency-Key";
+
+/** A fresh create key: 128 random bits as 32 lowercase hex characters. */
+export function newIdempotencyKey(): string {
+  // getRandomValues, unlike randomUUID, also works on a page served over
+  // plain http.
+  const bytes = new Uint8Array(16);
+  globalThis.crypto.getRandomValues(bytes);
+  return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
 }
 
 /** Default retry settings when the caller doesn't supply a RetryConfig. */
@@ -715,7 +732,13 @@ export class APIClient {
 
   async create(options: CreateOptions): Promise<SandboxResource> {
     const resolved = await this.resolveImage(options);
-    const response = await this.doJSON<ApiCreateSandboxResponse>("POST", this.versioned("/sandboxes"), toApiCreateOptions(resolved));
+    // One key per call, sent unchanged on each of its automatic retries: a
+    // create retried after a timeout gets back the sandbox the first attempt
+    // made instead of making a second one.
+    const key = options.idempotencyKey?.trim() || newIdempotencyKey();
+    const response = await this.doJSON<ApiCreateSandboxResponse>("POST", this.versioned("/sandboxes"), toApiCreateOptions(resolved), {
+      headers: { [IDEMPOTENCY_KEY_HEADER]: key },
+    });
     return new SandboxResource(this, fromApiCreateSandboxResponse(response));
   }
 
@@ -1370,12 +1393,10 @@ export class APIClient {
   }
 
   private async doJSON<T>(method: string, path: string, body?: unknown, options?: RequestOptions): Promise<T> {
-    const init: RequestInit = {};
+    const init: RequestInit = { headers: { ...options?.headers } };
     if (body !== undefined) {
       init.body = JSON.stringify(body);
-      init.headers = {
-        "Content-Type": "application/json",
-      };
+      init.headers = { ...init.headers, "Content-Type": "application/json" };
     }
 
     const response = await this.request(method, path, init, options);

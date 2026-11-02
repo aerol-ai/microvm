@@ -3,7 +3,7 @@ import { createServer, type RequestListener } from "node:http";
 import type { AddressInfo } from "node:net";
 import test from "node:test";
 
-import { APIClient, SandboxResource, parseRetryAfter, retryDelayMs } from "./client.js";
+import { APIClient, SandboxResource, newIdempotencyKey, parseRetryAfter, retryDelayMs } from "./client.js";
 import { MicroVMApiError } from "../errors.js";
 import { Image } from "../Image.js";
 import type { CreateOptions, Sandbox } from "../types.js";
@@ -2189,4 +2189,102 @@ test("internal client error Retry-After reads seconds and HTTP dates", async () 
     assert.ok(err instanceof MicroVMApiError, header);
     assert.ok(ok(err.retryAfterMs), `${header}: retryAfterMs=${err.retryAfterMs}`);
   }
+});
+
+// A create carries an Idempotency-Key: the caller's, or one the SDK makes per
+// call and sends unchanged on every automatic retry of that call.
+function keyRecordingClient(script: Array<"ok" | "503" | "reset" | "422">) {
+  const keys: Array<string | null> = [];
+  const bodies: Array<Record<string, unknown>> = [];
+  const client = new APIClient({
+    baseURL: "https://api.example.com",
+    patToken: "pat-token",
+    retry: { maxRetries: 3, baseDelayMs: 1, maxDelayMs: 1 },
+    fetch: async (input, init) => {
+      const request = new Request(input, init);
+      keys.push(request.headers.get("idempotency-key"));
+      if (request.method === "POST" && request.url.endsWith("/v1/sandboxes")) {
+        bodies.push((await request.json()) as Record<string, unknown>);
+      }
+      const step = script[Math.min(keys.length - 1, script.length - 1)];
+      switch (step) {
+        case "503":
+          return new Response(JSON.stringify({ error: "busy", code: "egress_floor_not_ready" }), {
+            status: 503,
+            headers: { "content-type": "application/json", "retry-after": "0" },
+          });
+        case "reset":
+          throw new TypeError("fetch failed", { cause: Object.assign(new Error("reset"), { code: "ECONNRESET" }) });
+        case "422":
+          return jsonResponse({ error: "Idempotency-Key reused", code: "idempotency_key_reused" }, 422);
+        default:
+          return jsonResponse(apiSandbox("sb-keyed"), 201);
+      }
+    },
+  });
+  return { client, keys, bodies };
+}
+
+test("internal client create sends the caller's Idempotency-Key, not in the body", async () => {
+  const { client, keys, bodies } = keyRecordingClient(["ok"]);
+  await client.create({ image: "ubuntu:22.04", idempotencyKey: " order-42 " });
+  assert.deepEqual(keys, ["order-42"]);
+  assert.equal(bodies[0].idempotencyKey, undefined);
+  assert.equal(bodies[0].idempotency_key, undefined);
+  assert.equal(bodies[0].image, "ubuntu:22.04");
+});
+
+test("internal client create keeps one generated Idempotency-Key across retries", async () => {
+  for (const first of ["503", "reset"] as const) {
+    const { client, keys } = keyRecordingClient([first, first, "ok"]);
+    const sandbox = await client.create({ image: "ubuntu:22.04" });
+    assert.equal(sandbox.id, "sb-keyed", first);
+    assert.equal(keys.length, 3, first);
+    assert.match(keys[0] ?? "", /^[0-9a-f]{32}$/, first);
+    assert.deepEqual(keys, [keys[0], keys[0], keys[0]], `${first}: every attempt sends the first key`);
+  }
+});
+
+test("internal client create keeps the caller's Idempotency-Key across retries", async () => {
+  const { client, keys } = keyRecordingClient(["503", "ok"]);
+  await client.create({ image: "ubuntu:22.04", idempotencyKey: "order-42" });
+  assert.deepEqual(keys, ["order-42", "order-42"]);
+});
+
+test("internal client makes a new Idempotency-Key for each create call", async () => {
+  const { client, keys } = keyRecordingClient(["ok"]);
+  await client.create({ image: "ubuntu:22.04" });
+  await client.create({ image: "ubuntu:22.04" });
+  assert.equal(keys.length, 2);
+  assert.notEqual(keys[0], keys[1]);
+  // A blank key counts as none.
+  await client.create({ image: "ubuntu:22.04", idempotencyKey: "   " });
+  assert.match(keys[2] ?? "", /^[0-9a-f]{32}$/);
+});
+
+test("internal client create surfaces idempotency_key_reused without retrying", async () => {
+  const { client, keys } = keyRecordingClient(["422"]);
+  const err = await client.create({ image: "ubuntu:22.04", idempotencyKey: "order-42" }).catch((e: unknown) => e);
+  assert.ok(err instanceof MicroVMApiError);
+  assert.equal(err.status, 422);
+  assert.equal(err.code, "idempotency_key_reused");
+  assert.equal(keys.length, 1);
+});
+
+test("internal client sends Idempotency-Key only on sandbox create", async () => {
+  const { client, keys } = keyRecordingClient(["ok"]);
+  await client.get("sb-keyed");
+  await client.exec("sb-keyed", { command: "true" }).catch(() => undefined);
+  await client.createSnapshot("sb-keyed", "snap").catch(() => undefined);
+  assert.deepEqual(keys, [null, null, null]);
+});
+
+test("newIdempotencyKey is 32 hex characters and unique", () => {
+  const seen = new Set<string>();
+  for (let i = 0; i < 1000; i++) {
+    const key = newIdempotencyKey();
+    assert.match(key, /^[0-9a-f]{32}$/);
+    seen.add(key);
+  }
+  assert.equal(seen.size, 1000);
 });
