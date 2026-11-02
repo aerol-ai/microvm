@@ -159,6 +159,19 @@ pub struct GPUOptions {
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
 pub struct CreateOptions {
     pub image: String,
+    /// Sent as the create's `Idempotency-Key` header, never in the body. A
+    /// create sent again with the same key and the same options returns the
+    /// sandbox the first one made instead of making a second; the same key
+    /// with different options fails with an `Error::Status` whose code is
+    /// `"idempotency_key_reused"` (HTTP 422). Keys are scoped to the caller's
+    /// account.
+    ///
+    /// `None` makes the SDK send a random key for each `create` call, reused
+    /// on that call's automatic retries, so a retry after a timeout cannot
+    /// make a second sandbox. Set your own to make your own retries of the
+    /// whole call safe too, such as after your process restarts.
+    #[serde(skip)]
+    pub idempotency_key: Option<String>,
     /// Optional name, unique among the caller's sandboxes (another account may
     /// use the same name); a repeat create with a held name returns HTTP 409.
     /// Names starting with `owner:` or shaped like a sandbox ID (`sb-` plus 16
