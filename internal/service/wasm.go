@@ -111,15 +111,9 @@ func (s *Service) createWasmSandbox(ctx context.Context, req models.CreateSandbo
 		}
 	}
 
-	if s.admitter != nil {
-		if err := s.admitter.Admit(sandboxID, capacityRequestFromCreate(req)); err != nil {
-			return nil, err
-		}
-	}
-	releaseAdmission := func() {
-		if s.admitter != nil {
-			s.admitter.Release(sandboxID)
-		}
+	releaseAdmission, err := s.admitCreate(sandboxID, req)
+	if err != nil {
+		return nil, err
 	}
 
 	ctx, span := observability.StartSpan(ctx, "wasm.create",

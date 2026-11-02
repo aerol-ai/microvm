@@ -25,6 +25,14 @@ const (
 	keyStoreUnavailableRetryAfterSeconds = 5
 )
 
+// Create-retry hints. A create still running past a waiter's bound has run
+// for the whole create timeout, so the retry is spaced out; a reservation
+// that is gone is replaced by the very next retry.
+const (
+	createInProgressRetryAfterSeconds = 5
+	reservationGoneRetryAfterSeconds  = 1
+)
+
 // ErrKind names the few service errors a facade words differently for its own
 // SDK (otherwise it uses Classification.Message verbatim). Every other error
 // is ErrKindOther.
@@ -81,6 +89,16 @@ func Classify(err error) Classification {
 	// about the sandbox; no Retry-After, since the same request fails again.
 	case errors.Is(err, models.ErrIdempotencyKeyReused):
 		return Classification{Status: http.StatusUnprocessableEntity, Code: models.ErrorCodeIdempotencyKeyReused, Message: idempotencyKeyReusedMessage(err)}
+	// A create that waited its bound for another create of the same sandbox
+	// id on this node (service create_lease.go). Nothing was created; the
+	// same request retried replays that create's sandbox.
+	case errors.Is(err, service.ErrCreateInProgress):
+		return Classification{Status: http.StatusServiceUnavailable, RetryAfter: createInProgressRetryAfterSeconds, Code: models.ErrorCodeCreateInProgress, Message: service.ErrCreateInProgress.Error()}
+	// A reserved create whose reservation is gone (a failed create of the
+	// same id cancelled it, or it expired). Nothing was created; a retry
+	// reserves afresh.
+	case errors.Is(err, service.ErrReservedPlacementGone):
+		return Classification{Status: http.StatusServiceUnavailable, RetryAfter: reservationGoneRetryAfterSeconds, Message: "cluster: the create's placement reservation is gone; retry to create afresh"}
 
 	// Fleet admission verdicts (managed builds only). Denied is a definite
 	// 403; unavailable is a retryable 503.
