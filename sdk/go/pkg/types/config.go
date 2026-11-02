@@ -25,7 +25,8 @@ type MicroVMConfig struct {
 	// Retry configures the policy for transient transport errors and retryable
 	// HTTP status codes (421, 429, 502, 503, 504). Exec is narrower: it is
 	// re-sent only when the connection never opened or on 429/503, because a
-	// re-sent exec runs the command again.
+	// re-sent exec runs the command again. A 429 or 503 retry waits as long
+	// as the server's Retry-After asks, up to RetryConfig.MaxRetryAfterMs.
 	Retry *RetryConfig
 }
 
@@ -39,4 +40,11 @@ type RetryConfig struct {
 	BaseDelayMs *int
 	// MaxDelayMs is the hard ceiling on the computed delay. Defaults to 5000.
 	MaxDelayMs *int
+	// MaxRetryAfterMs caps the wait before re-sending a 429 or 503. The
+	// client waits as long as the server's Retry-After header asks (seconds
+	// or an HTTP date), never less than its own backoff, plus up to a fifth
+	// more so clients told the same value spread out; a longer ask is cut to
+	// this. A missing or malformed header uses the backoff above. Defaults
+	// to 30000; 0 or less ignores Retry-After. A cancelled ctx ends the wait.
+	MaxRetryAfterMs *int
 }

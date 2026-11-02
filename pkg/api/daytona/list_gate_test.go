@@ -7,12 +7,14 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/aerol-ai/microvm/internal/cluster"
 	"github.com/aerol-ai/microvm/internal/config"
 	"github.com/aerol-ai/microvm/internal/service"
 	"github.com/aerol-ai/microvm/pkg/api/apihttp"
+	"github.com/aerol-ai/microvm/pkg/models"
 )
 
 // listGateCluster is a real cluster client (not the single-node Noop type),
@@ -26,7 +28,7 @@ func TestListIsShedWhenTheNodesListSlotsAreFull(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	svc := service.New(config.Config{}, logger, nil, nil, nil, nil, nil, nil, nil)
 	svc.AttachCluster(&listGateCluster{Noop: cluster.NewNoop("node-a", "http://node-a", "")})
-	gate := apihttp.NewGate(1, 0, apihttp.GateMetrics{})
+	gate := apihttp.NewGate(1, 0, 0, apihttp.GateMetrics{})
 	hold, err := gate.Acquire(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -44,6 +46,38 @@ func TestListIsShedWhenTheNodesListSlotsAreFull(t *testing.T) {
 		}
 		if got := rr.Header().Get("Retry-After"); got != strconv.Itoa(apihttp.OverloadedRetryAfterSeconds) {
 			t.Fatalf("%s: Retry-After = %q", tc.name, got)
+		}
+	}
+}
+
+// A tenant (here the operator) whose lists already hold its share of the
+// node's slots is told 429 + Retry-After in this facade's own envelope,
+// while the node still has room for other tenants.
+func TestListIsRateLimitedWhenTheTenantHoldsItsShare(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	svc := service.New(config.Config{}, logger, nil, nil, nil, nil, nil, nil, nil)
+	svc.AttachCluster(&listGateCluster{Noop: cluster.NewNoop("node-a", "http://node-a", "")})
+	gate := apihttp.NewGate(2, 1, 0, apihttp.GateMetrics{})
+	hold, err := gate.AcquireFlow(context.Background(), apihttp.OperatorFlow)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer hold()
+	h := newHandlers(Deps{Service: svc, Logger: logger, ListGate: gate})
+	for _, tc := range []struct {
+		name string
+		fn   http.HandlerFunc
+	}{{"GET /daytona/sandbox", h.listSandboxes}, {"GET /daytona/sandbox/paginated", h.listSandboxesPaginated}} {
+		rr := httptest.NewRecorder()
+		tc.fn(rr, httptest.NewRequest(http.MethodGet, "/", nil))
+		if rr.Code != http.StatusTooManyRequests {
+			t.Fatalf("%s with the tenant's share taken = %d, want 429: %s", tc.name, rr.Code, rr.Body.String())
+		}
+		if got := rr.Header().Get("Retry-After"); got != strconv.Itoa(apihttp.RateLimitedRetryAfterSeconds) {
+			t.Fatalf("%s: Retry-After = %q", tc.name, got)
+		}
+		if !strings.Contains(rr.Body.String(), `"code":"`+models.ErrorCodeRateLimited+`"`) {
+			t.Fatalf("%s: body %s lacks code %q", tc.name, rr.Body.String(), models.ErrorCodeRateLimited)
 		}
 	}
 }

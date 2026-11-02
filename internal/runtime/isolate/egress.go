@@ -34,6 +34,15 @@ type EgressPolicySetter interface {
 	SetEgressPolicy(sandboxID string, p EgressPolicy)
 }
 
+// EgressPolicyClaimer is the create-time form of EgressPolicySetter. Where the
+// setter falls back to deny-all when the group's egress-slot pool is full, the
+// claimer refuses with a capacity error (pkg/isolate.ErrEgressPoolExhausted),
+// so Create fails cleanly instead of starting a sandbox that asked for egress
+// and cannot reach anything. Production hosts implement both.
+type EgressPolicyClaimer interface {
+	ClaimEgressPolicy(sandboxID string, p EgressPolicy) error
+}
+
 // policyFromCreate maps CreateSandboxRequest network fields onto EgressPolicy.
 func policyFromCreate(blockAll bool, allow, deny []string, learn bool, rules []egresspolicy.RuleSpec, secrets map[string]string) EgressPolicy {
 	return EgressPolicy{

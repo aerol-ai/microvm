@@ -514,6 +514,15 @@ type Config struct {
 	// DockerNetnsPoolRefillInterval drives the refill/reap loop.
 	// SB_DOCKER_NETNS_POOL_REFILL_INTERVAL.
 	DockerNetnsPoolRefillInterval time.Duration
+	// DockerBridgeSlots caps how many docker-engine sandboxes (and parked
+	// warm containers) this node runs on its sandbox bridge; past it a
+	// create is a 503 capacity refusal instead of dockerd failing the start
+	// on a bridge whose 1,023 ports are all taken. 0 (the default) derives
+	// it at boot from the network: min(1,023 bridge ports, the subnet's
+	// usable addresses), minus headroom for what attaches without a
+	// reservation and minus the pause-netns pool. A set value is clamped to
+	// what the network holds. SB_DOCKER_BRIDGE_SLOTS.
+	DockerBridgeSlots int
 	// DockerToolboxLoopback publishes each Docker sandbox's toolbox port on
 	// 127.0.0.1 (a Docker-assigned host port, nothing else published) and has
 	// sandboxd reach toolboxd there instead of at ContainerIP:ToolboxPort.
@@ -1525,6 +1534,14 @@ type Config struct {
 	// SB_API_LIST_QUEUE_WAIT (api_admission.go).
 	APIListMaxInflight int
 	APIListQueueWait   time.Duration
+	// APIListMaxInflightPerTenant is how many of those slots one tenant (the
+	// owner a credential acts for; every unscoped caller is the one
+	// "operator" tenant) may hold; past it the tenant's lists wait their
+	// turn and are otherwise answered 429 + Retry-After. Resolved at load:
+	// a quarter of APIListMaxInflight (at least 1) when unset, and
+	// APIListMaxInflight itself (no share) for an explicit 0.
+	// SB_API_LIST_MAX_INFLIGHT_PER_TENANT.
+	APIListMaxInflightPerTenant int
 	// OperatorVolumeScope pins the scope segment of the operator's platform
 	// volumes. Empty keeps the legacy op-<hash(PAT)>, which a PAT rotation
 	// would move (H2). SB_OPERATOR_VOLUME_SCOPE.
@@ -2080,6 +2097,7 @@ func load(keyTool bool) (Config, error) {
 		DockerNetnsPoolDepth:          getEnvInt("SB_DOCKER_NETNS_POOL_DEPTH", 4),
 		DockerNetnsPoolPauseImage:     getEnv("SB_DOCKER_NETNS_POOL_PAUSE_IMAGE", "registry.k8s.io/pause:3.10"),
 		DockerNetnsPoolRefillInterval: getEnvDuration("SB_DOCKER_NETNS_POOL_REFILL_INTERVAL", 2*time.Second),
+		DockerBridgeSlots:             getEnvInt("SB_DOCKER_BRIDGE_SLOTS", 0),
 		DockerToolboxLoopback:         getEnvBool("SB_DOCKER_TOOLBOX_LOOPBACK", false),
 		ReconcileInterval:             getEnvDuration("SB_RECONCILE_INTERVAL", 5*time.Minute),
 		NetstatsPollInterval:          getEnvDuration("SB_NETSTATS_POLL_INTERVAL", 10*time.Second),
@@ -2394,6 +2412,9 @@ func load(keyTool bool) (Config, error) {
 	}
 	if cfg.ImagePullMaxConcurrent < 0 {
 		return Config{}, errors.New("SB_IMAGE_PULL_MAX_CONCURRENT must be >= 0")
+	}
+	if cfg.DockerBridgeSlots < 0 {
+		return Config{}, errors.New("SB_DOCKER_BRIDGE_SLOTS must be >= 0 (0 derives it from the docker network)")
 	}
 	if cfg.ImagePullFailureBackoff < 0 {
 		return Config{}, errors.New("SB_IMAGE_PULL_FAILURE_BACKOFF must be >= 0")

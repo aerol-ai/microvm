@@ -7,6 +7,9 @@
 name: cluster-3-mixed-lb
 capabilities:
   - api-load-balancer
+  # The tfvars size the list gate (8 slots, 2 per tenant) so one tenant's
+  # list storm fills its share; gates UC-362 (per-tenant fairness).
+  - api-list-fairness
   - docker
   - platform-volumes
   - domain

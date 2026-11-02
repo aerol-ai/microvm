@@ -1461,11 +1461,25 @@ const ErrorCodeMountToolUnavailable = "mount_tool_unavailable"
 // recovery; nothing is wrong with the request.
 const ErrorCodeOverloaded = "overloaded"
 
+// ErrorCodeRateLimited is returned (429, with Retry-After) when the caller's
+// own tenant already runs its share of the node's requests of that kind
+// (cluster-wide sandbox lists): the node has room, but not for one more from
+// this tenant. Other tenants are unaffected. Retrying after Retry-After is
+// the recovery; slowing down is the cure.
+const ErrorCodeRateLimited = "rate_limited"
+
 // ErrorCodeNodeGuardNotReady is returned (503, with Retry-After) for a
 // container or Firecracker create while this node's guard that keeps
 // sandboxes off the node's own services is not installed for that runtime;
 // the node retries it every few seconds.
 const ErrorCodeNodeGuardNotReady = "node_guard_not_ready"
+
+// ErrorCodeEgressFloorNotReady is returned (503, with Retry-After) for a
+// container or Firecracker create while this node's egress deny floor, which
+// keeps sandboxes off the cloud metadata endpoints and the operator's
+// deny_cidrs, is not installed for that runtime; the node retries it every
+// few seconds.
+const ErrorCodeEgressFloorNotReady = "egress_floor_not_ready"
 
 // Key-store error codes, each returned with 503 when the key store that wraps
 // sandbox secrets (SB_SECRET_PROVIDER) answers with one of its five error

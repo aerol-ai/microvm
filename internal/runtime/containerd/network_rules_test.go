@@ -154,8 +154,29 @@ func TestSetEgressFloorUsesTheCNISubnet(t *testing.T) {
 	if len(be.rules) != 2 || !strings.Contains(be.rules[0], "10.88.0.0/16|-d|10.20.0.0/16") || !strings.Contains(be.rules[1], "10.88.0.0/16|-d|10.88.0.0/16") {
 		t.Fatalf("floor rules = %v", be.rules)
 	}
-	if err := New(Config{}, nil, nil).SetEgressFloor(context.Background(), nil); err != nil {
-		t.Fatal("no rules manager is a no-op")
+	// The floor's re-assert goes to the manager (in place: nothing to do).
+	if repaired, err := d.ReassertEgressFloor(context.Background()); repaired || err != nil {
+		t.Fatalf("re-assert of a floor in place: %v %v", repaired, err)
+	}
+	// No firewall: no floor, said so (the service allows it outside
+	// enterprise mode, like the node guard), and nothing to re-assert.
+	if err := New(Config{}, nil, nil).SetEgressFloor(context.Background(), nil); !errors.Is(err, sbruntime.ErrEgressFloorUnavailable) {
+		t.Fatalf("no rules manager: %v", err)
+	}
+	off, err := netrules.New(false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := New(Config{}, off, nil).SetEgressFloor(context.Background(), nil); !errors.Is(err, sbruntime.ErrEgressFloorUnavailable) {
+		t.Fatalf("rules disabled: %v", err)
+	}
+	if repaired, err := New(Config{}, nil, nil).ReassertEgressFloor(context.Background()); repaired || err != nil {
+		t.Fatal("no rules manager: nothing to re-assert")
+	}
+	// A firewall but no CNI subnet: an error, never a silent success the
+	// create gate would read as "installed".
+	if err := New(Config{}, netrules.NewWithBackend(&floorMemBackend{}), nil).SetEgressFloor(context.Background(), nil); err == nil {
+		t.Fatal("no CNI subnet must not pass for a floor")
 	}
 }
 

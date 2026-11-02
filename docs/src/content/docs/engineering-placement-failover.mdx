@@ -189,7 +189,7 @@ sequenceDiagram
 
 Why power-of-two instead of consistent hashing, Maglev or load-aware random choice? Power-of-two needs no rebalancing when members change, costs the same for every decision, and needs no global state. A result by Michael Mitzenmacher (see Further reading) explains why it lands within a constant factor of the best choice.
 
-The score is `(budget − reserved − pending − request) / budget`, averaged across CPU, memory and (when reported) disk. See `headroomScore` in `placement.go`. A candidate is rejected if any of these is true:
+The score is `(budget − reserved − pending − request) / budget`, averaged across CPU, memory and (when reported) disk. When the node reports a network-slot pool for the request's runtime, the share of slots left is one more axis in the average (`placementScore`). A candidate is rejected if any of these is true:
 
 - It is drained or dead.
 - Its role cannot own sandboxes (`CanOwnSandboxRole`).
@@ -197,6 +197,7 @@ The score is `(budget − reserved − pending − request) / budget`, averaged 
 - Its capacity report is stale (`CapacityStale`), or the request would overflow its budget.
 - Its GPU or runtime (container, gVisor, Firecracker and so on) does not match the request.
 - It lacks the requested template. Older peers that do not report templates are let through (the "unknown-allow" rule).
+- Its network-slot pool for the runtime has no free slot after its pending reservations are counted (see [Network slots](#network-slots)).
 
 **The first pick wins ties.** The comparison in `placement.go` uses `>`, not `>=`. So `a` (the first pick) wins unless `b` has strictly more headroom. When `a` is the local node, the local node keeps the sandbox.
 
@@ -209,8 +210,9 @@ flowchart TB
     ALL["Every node this server knows about"] --> F1["Drop nodes that are dead, drained,<br/>cannot own sandboxes or have no API address"]
     F1 --> F2["Drop nodes whose capacity report is stale"]
     F2 --> F3["Drop nodes that cannot fit the request<br/>after subtracting pending reservations"]
-    F3 --> ANY{"Any nodes left?"}
-    ANY -- "no" --> NONE["Answer 503<br/>no node has room"]
+    F3 --> F4["Drop nodes whose network-slot pool<br/>for the runtime is full"]
+    F4 --> ANY{"Any nodes left?"}
+    ANY -- "no" --> NONE["Answer 503 + Retry-After<br/>'at capacity' when a node that could<br/>run it was only full"]
     ANY -- "yes" --> PICK["Pick two of them at random"]
     PICK --> CMP{"Does the second pick have<br/>strictly more headroom?"}
     CMP -- "yes" --> WB["The second pick wins"]
@@ -229,6 +231,37 @@ Draining is a hard admission rule, not a scoring penalty. (Draining a node tells
 > soft-scoring penalty.
 
 > **Invariant.** A placement decision uses the freshest information the deciding node has. That is the capacity report, minus in-flight reservations, minus drain marks. The leader sees reservations at once; other replicas see them once their FSM apply catches up. Nodes with stale capacity drop out of the candidate set until their next successful report.
+
+## Network slots
+
+CPU, memory and disk are not the only limits on a node. Each sandbox also holds a network slot until it is destroyed, and each node has a fixed number of them:
+
+| Pool | Runtimes that use it | Size setting | Default |
+|---|---|---|---|
+| containerd netns pool | runc (`docker`) and gVisor on the containerd engine, shared | `SB_CONTAINERD_NETNS_POOL_SIZE` | 256 |
+| docker bridge pool | runc (`docker`) and gVisor on the docker engine, shared | `SB_DOCKER_BRIDGE_SLOTS` | 1,000 on a stock `docker0` (worked out at boot) |
+| Firecracker TAP pool | Firecracker | `SB_FIRECRACKER_TAP_POOL_SIZE` | 256 |
+| WASM instances | WASM, only when capped | `SB_WASM_MAX_INSTANCES` | no cap |
+
+A stopped sandbox keeps its slot, so its address survives a restart. Warm-pool containers and warm VMMs hold slots too.
+
+The docker bridge pool works differently. Docker gives each running container one port on its bridge, and a Linux bridge has 1,023 ports. Docker frees the port when the container stops. So a stopped sandbox holds no slot, and starting it again needs a free one. Nothing is seeded: the node counts its own running sandboxes and warm containers, and recounts them from its database after a restart. At boot it sets the size to the smaller of 1,023 and the number of addresses in the network's subnet, then keeps 23 ports back for image builds and other containers. A stock `docker0` gets 1,000.
+
+A node with CPU and memory to spare can still be full for a runtime. In a bank density test, two 48-core metal workers stopped at 256 containers and 256 Firecracker VMs each. Admission still had room, so placement kept choosing them, and every create past that failed with a 400 that looked like a bug. A docker-engine metal host stopped the same way at 1,023 containers, the size of its bridge.
+
+Now each worker reports its pools and their free slots in its capacity report (`slot_pools` on `/v1/capacity`). Placement treats a full pool like a full budget:
+
+- A node is skipped for a runtime when its pool has no free slot. Reservations still in flight to that node are subtracted first, counted for every runtime the pool serves. A pending gVisor create uses up a slot a runc create could have had.
+- When every node that could run the request is full, the answer is a 503 with `Retry-After` and a message that says "at capacity" (`ErrClusterAtCapacity`). When no node can run the request at all, the message does not say capacity, because waiting will not help.
+- The pool itself refuses with a capacity error when it runs dry. The API answers it like any other capacity refusal: 503 with `Retry-After`. The SDKs retry that, and the retry is placed again.
+- If something takes the last bridge port or address without going through the pool, the kernel or Docker refuses the start. That refusal ("exchange full", or no free address) is also answered as the 503 capacity error, and the half-made container is removed.
+- An isolate's egress slots (`SB_ISOLATE_EGRESS_POOL_SIZE`, default 64) belong to one tenant group on one node, not to the node, so they are not in the report. A create that asks for egress in a full group is refused with the same capacity error, instead of starting with its egress silently blocked.
+
+A node that does not report pools (an older build during a rolling upgrade) is not gated. This is the same "unknown-allow" rule as for runtimes.
+
+One gap is left on purpose. A report can lag a create that has just finished: the pending reservation is gone, and the next report has not arrived. For up to one report interval, a node can still be picked for its last slots. The worker then refuses with the capacity error and the retry is placed again. CPU and memory have the same window.
+
+`setup/config-defaults.md` explains how to size each pool for a host.
 
 ## Capacity reports and freshness
 
