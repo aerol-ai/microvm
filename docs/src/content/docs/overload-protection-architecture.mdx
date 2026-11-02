@@ -591,7 +591,7 @@ If the node is still busy after the third retry, you get an error. In every SDK 
     match client.list() {
         Ok(sandboxes) => println!("{} sandboxes", sandboxes.len()),
         // Still busy after 3 retries. retry_after() is the server's hint.
-        Err(Error::Status(err)) if err.code() == Some("overloaded") => {
+        Err(Error::Api(err)) if err.code() == Some("overloaded") => {
             eprintln!("cluster busy, try again in {:?}", err.retry_after())
         }
         Err(err) => eprintln!("list failed: {err}"),
