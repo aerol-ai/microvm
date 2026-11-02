@@ -150,9 +150,14 @@ class MicroVMError(Exception):
 
 class MicroVMHTTPError(MicroVMError):
     """An HTTP error response from sandboxd. ``str(err)`` is the server's
-    message. The other attributes are empty unless the server sent them:
+    message, or the HTTP reason phrase when the body is not the server's
+    JSON (a proxy's error page). ``status_code`` is the HTTP status. The
+    other attributes are empty unless the server sent them:
 
-    - ``code``: a stable error code a client can act on.
+    - ``code``: a stable error code a client can act on, such as
+      ``idempotency_key_reused`` or ``overloaded``.
+    - ``retry_after``: how many seconds the response's ``Retry-After``
+      header asked the caller to wait; ``None`` without a usable header.
     - ``reason``: why an avm_ API token or an OIDC token was refused
       (``expired``, ``unknown_or_revoked``, ``no_binding``, ...).
     - ``required_permission`` and ``role``: on a 403 for an API token or an
@@ -173,10 +178,12 @@ class MicroVMHTTPError(MicroVMError):
         issuer: str = "",
         name: str = "",
         groups: Optional[List[str]] = None,
+        retry_after: Optional[float] = None,
     ) -> None:
         super().__init__(message)
         self.status_code = status_code
         self.code = code
+        self.retry_after = retry_after
         self.reason = reason
         self.required_permission = required_permission
         self.role = role
@@ -185,14 +192,15 @@ class MicroVMHTTPError(MicroVMError):
         self.groups: List[str] = list(groups or [])
 
 
-def _http_error(status_code: int, data: Any, fallback: str) -> MicroVMHTTPError:
+def _http_error(status_code: int, data: Any, fallback: str, retry_after: Optional[float] = None) -> MicroVMHTTPError:
     """Builds the error for a decoded JSON error body."""
     if not isinstance(data, dict):
-        return MicroVMHTTPError(status_code, fallback)
+        return MicroVMHTTPError(status_code, fallback, retry_after=retry_after)
     groups = data.get("groups")
     return MicroVMHTTPError(
         status_code,
         str(data.get("error", fallback)),
+        retry_after=retry_after,
         code=str(data.get("code") or ""),
         reason=str(data.get("reason") or ""),
         required_permission=str(data.get("required_permission") or ""),
@@ -1403,6 +1411,7 @@ class MicroVM:
                     # Free the socket before the backoff sleep.
                     exc.close()
                 else:
+                    wait = _parse_retry_after(exc.headers.get("Retry-After"), time.time()) if exc.headers is not None else None
                     try:
                         payload = exc.read()
                     finally:
@@ -1410,8 +1419,8 @@ class MicroVM:
                     try:
                         data = json.loads(payload.decode("utf-8"))
                     except (ValueError, TypeError):
-                        raise MicroVMHTTPError(exc.code, str(exc.reason)) from exc
-                    raise _http_error(exc.code, data, str(exc.reason)) from exc
+                        raise MicroVMHTTPError(exc.code, str(exc.reason), retry_after=wait) from exc
+                    raise _http_error(exc.code, data, str(exc.reason), wait) from exc
             except urllib.error.URLError as exc:
                 last_exc = exc
                 if attempt >= max_retries or not (idempotent or _request_never_sent(exc)):

@@ -1,4 +1,4 @@
-from .client import MicroVM, Tokens
+from .client import MicroVM, MicroVMError, MicroVMHTTPError, Tokens
 from .image import Image
 from .types import (
     APIToken,
@@ -74,6 +74,8 @@ __all__ = [
     "DNSRecord",
     "Image",
     "MicroVM",
+    "MicroVMError",
+    "MicroVMHTTPError",
     "ExposeProtocol",
     "ExposeResult",
     "Failover",
