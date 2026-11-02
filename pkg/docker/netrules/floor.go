@@ -146,6 +146,19 @@ func renderFloor(chain string, e *floorEntry) error {
 	if !m.legacyFloorEmptied.Swap(true) {
 		_ = fb.FlushChain(ChainAerolvmFloor)
 	}
+	src := e.subnet.String()
+	for _, dst := range floorDsts(e) {
+		if err := m.ipt.Insert("filter", chain, 1, floorDropSpec(src, dst)...); err != nil {
+			return fmt.Errorf("egress floor rule %s: %w", dst, err)
+		}
+	}
+	return nil
+}
+
+// floorDsts are the destinations one floor drops: its operator floor
+// addresses and, with interconnect off, every sandbox subnet registered on
+// the node (its own included); IPv4 only, each once. Caller holds floorMu.
+func floorDsts(e *floorEntry) []string {
 	dsts := append([]netip.Prefix(nil), e.cidrs...)
 	if !allowInterconnect.Load() {
 		subnets := make([]netip.Prefix, 0, len(floors))
@@ -155,7 +168,7 @@ func renderFloor(chain string, e *floorEntry) error {
 		sort.Slice(subnets, func(i, j int) bool { return subnets[i].String() < subnets[j].String() })
 		dsts = append(dsts, subnets...)
 	}
-	src := e.subnet.String()
+	out := make([]string, 0, len(dsts))
 	seen := map[string]bool{}
 	for _, c := range dsts {
 		if !c.Addr().Is4() {
@@ -166,11 +179,52 @@ func renderFloor(chain string, e *floorEntry) error {
 			continue
 		}
 		seen[dst] = true
-		if err := m.ipt.Insert("filter", chain, 1, "-s", src, "-d", dst, "-j", "DROP"); err != nil {
-			return fmt.Errorf("egress floor rule %s: %w", c, err)
+		out = append(out, dst)
+	}
+	return out
+}
+
+func floorDropSpec(src, dst string) []string {
+	return []string{"-s", src, "-d", dst, "-j", "DROP"}
+}
+
+// ReassertFloor puts this manager's floor back if something removed it: the
+// chain, the user chain's jump to it, or any of its DROPs (a host firewall
+// reload, a flush). Cheap when nothing is missing: the jump check and one
+// rule check per floor address, no rewrite, so a floor in place never has
+// the empty moment SetFloor's flush and refill has. repaired reports that
+// the floor was rewritten. A no-op until SetFloor has run.
+func (m *Manager) ReassertFloor() (repaired bool, err error) {
+	if m == nil || !m.Enabled() {
+		return false, nil
+	}
+	chain, _ := m.floorChain.Load().(string)
+	if chain == "" {
+		return false, nil
+	}
+	floorMu.Lock()
+	defer floorMu.Unlock()
+	e := floors[chain]
+	if e == nil {
+		return false, nil
+	}
+	// Creates the chain if it is gone, so the checks below can name it (a
+	// check against a missing chain is an error, not a "no"), and keeps the
+	// jump first in the user chain.
+	if err := e.fb.EnsureJumpChain(e.m.filterChain(), chain); err != nil {
+		return false, fmt.Errorf("egress floor chain: %w", err)
+	}
+	src := e.subnet.String()
+	for _, dst := range floorDsts(e) {
+		ok, err := e.m.ipt.Exists("filter", chain, floorDropSpec(src, dst)...)
+		if err != nil {
+			return false, fmt.Errorf("egress floor: check the rule for %s: %w", dst, err)
+		}
+		if !ok {
+			return true, renderFloor(chain, e)
 		}
 	}
-	return nil
+	return false, nil
 }
 
 // BridgeSubnet returns the subnet set by SetBridgeSubnet (the containerd

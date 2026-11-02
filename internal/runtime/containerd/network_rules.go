@@ -2,6 +2,7 @@ package containerd
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/netip"
 
@@ -156,11 +157,26 @@ func (d *Driver) ReassertNodeGuard(context.Context) (bool, error) {
 	return d.networkRules.ReassertNodeGuard()
 }
 
+var _ sbruntime.EgressFloorSetter = (*Driver)(nil)
+
 // SetEgressFloor installs the operator's node-wide deny floor for the CNI
 // bridge subnet (§5.10 PC-2).
 func (d *Driver) SetEgressFloor(_ context.Context, cidrs []netip.Prefix) error {
-	if d.networkRules == nil {
-		return nil
+	if d.networkRules == nil || !d.networkRules.Enabled() {
+		return sbruntime.ErrEgressFloorUnavailable
 	}
-	return d.networkRules.SetFloor(d.networkRules.BridgeSubnet(), cidrs)
+	subnet := d.networkRules.BridgeSubnet()
+	if !subnet.IsValid() {
+		// SetFloor would install nothing and report success.
+		return errors.New("containerd: egress floor needs the CNI bridge subnet")
+	}
+	return d.networkRules.SetFloor(subnet, cidrs)
+}
+
+// ReassertEgressFloor puts the floor back if something removed it.
+func (d *Driver) ReassertEgressFloor(context.Context) (bool, error) {
+	if d.networkRules == nil {
+		return false, nil
+	}
+	return d.networkRules.ReassertFloor()
 }

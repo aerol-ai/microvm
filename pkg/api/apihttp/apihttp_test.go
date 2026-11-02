@@ -524,6 +524,22 @@ func TestWriteStoreAwareError_NodeGuardNotReady(t *testing.T) {
 	}
 }
 
+// TestWriteStoreAwareError_EgressFloorNotReady: a create refused because the
+// egress deny floor is not installed is a 503 with a retry and its own code,
+// and the firewall detail stays in the node's log.
+func TestWriteStoreAwareError_EgressFloorNotReady(t *testing.T) {
+	rr := httptest.NewRecorder()
+	WriteStoreAwareError(discardLogger(), rr, fmt.Errorf("%w (runtime containerd: netlink: secret detail)", service.ErrEgressFloorNotReady))
+	var body models.ErrorResponse
+	_ = json.Unmarshal(rr.Body.Bytes(), &body)
+	if rr.Code != http.StatusServiceUnavailable || body.Code != models.ErrorCodeEgressFloorNotReady || rr.Header().Get("Retry-After") != "5" {
+		t.Fatalf("status=%d code=%q retry=%q", rr.Code, body.Code, rr.Header().Get("Retry-After"))
+	}
+	if strings.Contains(rr.Body.String(), "secret detail") {
+		t.Fatalf("the cause leaked to the caller: %s", rr.Body.String())
+	}
+}
+
 // TestWriteStoreAwareError_EgressPolicyUpdate: the live-update failures are
 // told apart by status and code (plans/egress-domain-filtering.md §5.8), and
 // every one carries a Retry-After since the PUT is idempotent.
