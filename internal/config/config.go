@@ -2978,7 +2978,7 @@ func load(keyTool bool) (Config, error) {
 		// plaintext key file would make the custody claim false (F2, Phase
 		// 7; the release before warned). `sandboxd key` still loads, since
 		// `sandboxd key wrap` is how a node gets there.
-		if secrets.IsExternalProvider(cfg.SecretProvider) && cfg.CredentialKeyCustody != "wrapped" && !keyTool {
+		if secrets.IsExternalProvider(cfg.SecretProvider) && cfg.CredentialKeyCustody != secrets.CustodyWrapped && !keyTool {
 			return Config{}, fmt.Errorf("SB_CREDENTIAL_KEY_CUSTODY must be wrapped for %s when SB_ENTERPRISE_MODE=true: run `sandboxd key wrap`, set SB_CREDENTIAL_KEY_CUSTODY=wrapped and delete the plaintext key (plans/customer-key-custody.md §7)", secrets.NormalizeProviderName(cfg.SecretProvider))
 		}
 		if cfg.SecretAuditRetentionDays == 0 || cfg.SecretTombRetentionDays == 0 {
