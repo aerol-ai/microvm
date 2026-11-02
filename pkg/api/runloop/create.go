@@ -201,7 +201,10 @@ func (h *handlers) runCreate(ctx context.Context, req models.CreateSandboxReques
 		err = h.deps.Service.UpsertCompatState(ctx, resp.Sandbox.ID, models.FacadeRunloop, stateJSON)
 	}
 	if err != nil {
-		clustercreate.RollbackLocalCreate(context.Background(), h.deps.Service, h.deps.Logger, resp.Sandbox.ID)
+		// A replay's sandbox is the earlier create's: never roll it back.
+		if !resp.Replayed {
+			clustercreate.RollbackLocalCreate(context.Background(), h.deps.Service, h.deps.Logger, resp.Sandbox.ID)
+		}
 		return nil, err
 	}
 	return &resp.Sandbox, nil
