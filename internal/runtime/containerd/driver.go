@@ -22,6 +22,7 @@ type Config struct {
 	ToolboxPort        int
 	Privileged         bool
 	ResourceLimitsOff  bool
+	PidsLimit          int64
 	DefaultRuntime     string
 	WaitTimeout        time.Duration
 	ToolboxWaitTimeout time.Duration
@@ -58,6 +59,7 @@ func FromDaemonConfig(cfg config.Config) Config {
 		ToolboxPort:        cfg.ToolboxPort,
 		Privileged:         cfg.ContainerPrivileged,
 		ResourceLimitsOff:  cfg.ResourceLimitsOff,
+		PidsLimit:          int64(cfg.SandboxPidsLimit),
 		DefaultRuntime:     cfg.Runtime,
 		WaitTimeout:        cfg.DockerRuntimeWaitTimeout,
 		ToolboxWaitTimeout: cfg.ToolboxWaitTimeout,
@@ -103,6 +105,47 @@ type Driver struct {
 
 	warmPool WarmPool
 	netns    NetnsHandoff
+
+	// startLocks serializes starts of one container: a start deletes the
+	// stopped task, binds the container's park socket and creates a new
+	// task, and two at once would unlink each other's socket and race for
+	// the one task. Entries live only while a start holds or waits on them.
+	startMu    sync.Mutex
+	startLocks map[string]*startLock
+
+	// drainedTasks maps a container ID to the *taskLog this process drains
+	// its output into (logio.go). A running task missing from it gets
+	// re-attached by ListManaged.
+	drainedTasks sync.Map
+}
+
+type startLock struct {
+	mu   sync.Mutex
+	refs int
+}
+
+// lockStart takes the start lock of containerRef and returns its release.
+func (d *Driver) lockStart(containerRef string) func() {
+	d.startMu.Lock()
+	if d.startLocks == nil {
+		d.startLocks = make(map[string]*startLock)
+	}
+	l := d.startLocks[containerRef]
+	if l == nil {
+		l = &startLock{}
+		d.startLocks[containerRef] = l
+	}
+	l.refs++
+	d.startMu.Unlock()
+	l.mu.Lock()
+	return func() {
+		l.mu.Unlock()
+		d.startMu.Lock()
+		if l.refs--; l.refs == 0 {
+			delete(d.startLocks, containerRef)
+		}
+		d.startMu.Unlock()
+	}
 }
 
 // New constructs a Driver. The containerd connection is lazy — Ping and

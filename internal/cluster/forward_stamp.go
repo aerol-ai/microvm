@@ -39,6 +39,16 @@ const (
 	// peer, and it widens where a verified credential is accepted; it never
 	// supplies an identity.
 	HeaderSurface = "X-Cluster-Surface"
+	// HeaderSSHGateway marks a forward of a call the SSH gateway bridged
+	// for the holder of a sandbox's key (auditlog.SSHGatewayCall.Encode:
+	// the sandbox id, plus the open marker on the session's first call).
+	// The owner then names sandbox_key:<id> as the caller, via the edge,
+	// instead of the operator whose token the gateway's loopback hop
+	// carries, and writes the session's ssh record. Like every X-Cluster-*
+	// header it is honoured only from a live mTLS peer, and pkg/api honours
+	// it only with the operator token, on the sandbox's sessions routes,
+	// for the sandbox the path names.
+	HeaderSSHGateway = "X-Cluster-Ssh-Gateway"
 )
 
 // PAT origins carried in HeaderPATOrigin.
@@ -95,6 +105,10 @@ func PATOriginFromContext(ctx context.Context) string {
 //     MCP-only access token and record the call without surface mcp. Any
 //     other request has the header removed, so the marker always follows
 //     the context and never a header that came in with the request.
+//   - HeaderSSHGateway, when the API edge found the request to be a call
+//     the SSH gateway bridged for a sandbox key holder (the context carries
+//     auditlog.SSHGatewayCall). Removed from every other request, the same
+//     way as HeaderSurface.
 //
 // It also marks the edge's api record as forwarded (auditlog.MarkForwarded):
 // only the node that runs the handler records the call, so the peer writes
@@ -131,6 +145,11 @@ func StampForward(out *http.Request, access controlplane.Access) {
 		out.Header.Set(HeaderSurface, auditlog.SurfaceMCP)
 	} else {
 		out.Header.Del(HeaderSurface)
+	}
+	if call, ok := auditlog.SSHGatewayCallFromContext(out.Context()); ok {
+		out.Header.Set(HeaderSSHGateway, call.Encode())
+	} else {
+		out.Header.Del(HeaderSSHGateway)
 	}
 	auditlog.MarkForwarded(out.Context())
 }

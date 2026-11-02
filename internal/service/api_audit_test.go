@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -204,6 +205,64 @@ func TestRecordSSHSession(t *testing.T) {
 	}
 	if ev.Request.Surface != auditlog.SurfaceSSH || ev.Request.Target != "default" {
 		t.Fatalf("ssh request = %+v", ev.Request)
+	}
+}
+
+// TestRecordSSHSessionOnOwner: the owner writes the record of a session
+// another node's gateway bridged to it under the request that opened it, so
+// the caller is still the sandbox key, now via the gateway's node.
+func TestRecordSSHSessionOnOwner(t *testing.T) {
+	s, sink := apiAuditService(t, config.Config{})
+	via := controlplane.OperatorAccess()
+	via.Via = "edge-1"
+	s.RecordSSHSession(controlplane.ContextWithAccess(context.Background(), via), "sb-ssh", "")
+	evs := sink.Events()
+	if len(evs) != 1 {
+		t.Fatalf("records = %d, want 1", len(evs))
+	}
+	want := &auditlog.Caller{Kind: "sandbox_key", ID: "sb-ssh", Via: "edge-1"}
+	if ev := evs[0]; ev.Ref != auditlog.RefSSH || !reflect.DeepEqual(ev.Caller, want) || ev.Request.Target != "" {
+		t.Fatalf("ssh record = %+v caller %+v, want caller %+v and no session (a one-shot exec)", ev, ev.Caller, want)
+	}
+}
+
+// sshRecordGateCluster answers the owner-record gate the way the gossip
+// view does during a rolling upgrade.
+type sshRecordGateCluster struct {
+	*cluster.Noop
+	open bool
+}
+
+func (c *sshRecordGateCluster) SSHSessionOwnerRecordAllowed() bool { return c.open }
+
+// TestSSHSessionsRecordedByOwner: the gateway leaves a bridged session's
+// record to the owner only in cluster mode with the gate open. A single
+// node, a cluster client that cannot answer and a closed gate all keep
+// the record on the gateway's node.
+func TestSSHSessionsRecordedByOwner(t *testing.T) {
+	cases := []struct {
+		name    string
+		cluster bool
+		client  cluster.Client
+		want    bool
+	}{
+		{name: "single node bridges nothing", client: &sshRecordGateCluster{Noop: cluster.NewNoop("n1", "", ""), open: true}},
+		{name: "cluster client that cannot answer", cluster: true, client: cluster.NewNoop("n1", "", "")},
+		{name: "rolling upgrade in progress", cluster: true, client: &sshRecordGateCluster{Noop: cluster.NewNoop("n1", "", "")}},
+		{name: "every member honours the marker", cluster: true, client: &sshRecordGateCluster{Noop: cluster.NewNoop("n1", "", ""), open: true}, want: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s, _ := apiAuditService(t, config.Config{EnableCluster: tc.cluster})
+			s.cluster = tc.client
+			if got := s.SSHSessionsRecordedByOwner(); got != tc.want {
+				t.Fatalf("SSHSessionsRecordedByOwner = %v, want %v", got, tc.want)
+			}
+		})
+	}
+	var nilSvc *Service
+	if nilSvc.SSHSessionsRecordedByOwner() {
+		t.Fatal("a nil service handed the record away")
 	}
 }
 

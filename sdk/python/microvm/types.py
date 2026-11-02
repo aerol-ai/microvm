@@ -459,7 +459,8 @@ class SandboxData(TypedDict, total=False):
     env: Dict[str, str]
     networkBlockAll: bool
     # Hostname-egress state on get (container runtimes): "active", "held" or
-    # "unavailable". Absent otherwise.
+    # "unavailable"; "unenforced" when the server's firewall is off and
+    # nothing filters the sandbox. Absent otherwise.
     egressStatus: str
     # Egress profiles this sandbox references, and the generation of each
     # that is live on it.
@@ -635,7 +636,8 @@ class NetworkPolicy(TypedDict, total=False):
     networkEgressRules: List["EgressRule"]
     # Hostname entries in force: inline plus every profile's (at most 1024).
     effectiveHostnameCount: int
-    # "active", "held" or "unavailable" for hostname rules on a container.
+    # "active", "held" or "unavailable" for hostname rules on a container;
+    # "unenforced" when the server's firewall is off.
     egressStatus: str
 
 
@@ -729,6 +731,13 @@ class RetryConfig(TypedDict, total=False):
     maxRetries: int
     baseDelayMs: int
     maxDelayMs: int
+    # Cap in milliseconds on the wait before re-sending a 429 or 503. The
+    # client waits as long as the server's Retry-After header asks (seconds
+    # or an HTTP date), never less than its own backoff, plus up to a fifth
+    # more so clients told the same value spread out; a longer ask is cut to
+    # this. A missing or malformed header uses the backoff. Defaults to
+    # 30000; 0 ignores Retry-After.
+    maxRetryAfterMs: int
 
 
 class MicroVMConfig(TypedDict, total=False):

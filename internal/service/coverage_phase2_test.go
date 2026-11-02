@@ -453,7 +453,9 @@ func TestPushOneClaimFailure(t *testing.T) {
 
 func TestHandleDockerEventDestroyAndStart(t *testing.T) {
 	ctx := context.Background()
-	svc, admitter, st := newCapacityHarness(t, nil, nil)
+	svc, admitter, st := newCapacityHarness(t, nil, map[string]*models.SandboxRuntimeState{
+		"ctr-sb-evt": {SandboxID: "sb-evt", ContainerID: "ctr-sb-evt", Status: models.SandboxStatusStarted},
+	})
 	seedSandbox(t, st, "sb-evt", models.SandboxStatusStarted, 1, 512)
 	admitter.Reserve("sb-evt", capacity.Request{CPU: 1, MemoryMB: 512})
 

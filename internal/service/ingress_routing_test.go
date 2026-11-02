@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -370,6 +371,183 @@ func TestIngressProxyRoutingIngressNode(t *testing.T) {
 		t.Fatal("the ingress-sni passthrough survived the commit")
 	}
 	_ = fwd
+}
+
+// churnIngressCluster is a dedicated ingress's view of a cluster whose
+// sandboxes come and go: the placement feed (for the route index) and the
+// placement list (for ReconcileClusterIngress) are the same moving view.
+type churnIngressCluster struct {
+	fakeWatcherCluster
+	mu   sync.Mutex
+	view map[string]cluster.Placement
+}
+
+func (c *churnIngressCluster) snapshot() []cluster.Placement {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make([]cluster.Placement, 0, len(c.view))
+	for _, p := range c.view {
+		out = append(out, p)
+	}
+	return out
+}
+
+func (c *churnIngressCluster) Placements() []cluster.Placement { return c.snapshot() }
+
+func (c *churnIngressCluster) PlacementsForShards(cluster.PlacementShardFilter) []cluster.Placement {
+	return c.snapshot()
+}
+
+// put and drop change the view and stream the change, as a create or a
+// destroy on some worker does.
+func (c *churnIngressCluster) put(p cluster.Placement) {
+	c.mu.Lock()
+	c.view[p.SandboxID] = p
+	c.mu.Unlock()
+	if c.fn != nil {
+		c.fn(nil, []cluster.PlacementChange{{SandboxID: p.SandboxID, Placement: &p}})
+	}
+}
+
+func (c *churnIngressCluster) drop(id string) {
+	c.mu.Lock()
+	delete(c.view, id)
+	c.mu.Unlock()
+	if c.fn != nil {
+		c.fn(nil, []cluster.PlacementChange{{SandboxID: id, Deleted: true}})
+	}
+}
+
+// newChurnIngress is a dedicated ingress node (domain mode, tls-mux on :443)
+// over a fake whole-config Caddy.
+func newChurnIngress(t *testing.T) (*Service, *wholeCaddy, IngressRoutingOptions, *churnIngressCluster) {
+	t.Helper()
+	svc, fc, _, opts := newRoutingHarness(t)
+	svc.cfg.EnableCluster = true
+	svc.cfg.NodeRole = "ingress"
+	svc.cfg.AutoReconcile = false // not a worker: nothing to rebuild locally
+	svc.cfg.L4TLSListen = ":443"
+	svc.cfg.L4TLSFallback = "127.0.0.1:8443"
+	svc.caddy = caddy.New(config.Config{
+		EnableCaddy: true, CaddyAdminURL: svc.cfg.CaddyAdminURL, CaddyServerID: "srv0",
+		Domain: "sandbox.test", L4TLSListen: ":443", L4TLSFallback: "127.0.0.1:8443", HTTPClientTimeout: 5 * time.Second,
+	})
+	var root any
+	_ = json.Unmarshal([]byte(`{"apps":{"http":{"servers":{"srv0":{"routes":[{"handle":[]}]}}},
+	  "layer4":{"servers":{"tls-mux":{"listen":[":443"],"routes":[
+	    {"@id":"tls-mux-fallback","handle":[{"handler":"proxy","upstreams":[{"dial":["127.0.0.1:8443"]}]}]}]}}}}}`), &root)
+	fc.mu.Lock()
+	fc.emu = caddy.NewConfigEmulator(root)
+	fc.mu.Unlock()
+	cl := &churnIngressCluster{
+		fakeWatcherCluster: fakeWatcherCluster{Noop: cluster.NewNoop("ing-1", "", "")},
+		view:               map[string]cluster.Placement{},
+	}
+	svc.AttachCluster(cl)
+	opts.SystemResolver = directResolver(svc.cfg.RouteDNSAddr) // as if ~rt.internal routes here
+	return svc, fc, opts, cl
+}
+
+// churnPlacement is a public sandbox on another node with an http and a tcp
+// exposure: with per-sandbox routes, three ingress writes to add and three
+// to remove.
+func churnPlacement(i int) cluster.Placement {
+	return cluster.Placement{
+		SandboxID: fmt.Sprintf("sbc%d", i), OwnerNodeID: "w-1", OwnerDataPlaneHost: "10.2.0.7",
+		PublicTraffic: true, ExposedPorts: map[int]string{8080: "http", 5432: "tcp"},
+		ExposedPortRoutes: map[int]cluster.ExposedPortRoute{
+			8080: {Protocol: "http"},
+			5432: {Protocol: "tcp", HostPort: 40000 + i},
+		},
+		Version: uint64(100 + i),
+	}
+}
+
+// The cluster-bank-flagship failure (UC-230 and UC-266, 2026-11-01) in unit
+// form. A dedicated ingress serves every sandbox in the cluster, so with
+// per-sandbox routes every create or destroy on ANY worker made it write
+// Caddy, and every write reloaded Caddy's whole config, dropping new
+// connections (pkg/caddy TestE2EIngressReloadChurn). With the flag engaged,
+// the same churn reaches only the route index: the feed updates it, the
+// reconcile passes (including the periodic live audit, and the layer4 repair
+// every applied pass runs) read Caddy but never write it.
+func TestIngressProxyRoutingClusterChurnMakesNoCaddyWrites(t *testing.T) {
+	const churn = 12
+	t.Run("flag on: zero writes, the index follows the churn", func(t *testing.T) {
+		svc, fc, opts, cl := newChurnIngress(t)
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		r, err := svc.StartIngressProxyRouting(ctx, opts)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer r.Stop()
+		go cl.fn([]cluster.Placement{}, nil) // the first snapshot: an empty cluster
+		if err := svc.CommitIngressProxyRouting(ctx, r, true); err != nil {
+			t.Fatal(err)
+		}
+		loads, writes := fc.counts()
+		if loads != 1 {
+			t.Fatalf("commit loads = %d, want 1", loads)
+		}
+		resolve := func(host string) string {
+			addrs, _ := directResolver(svc.cfg.RouteDNSAddr).LookupHost(ctx, host+"."+routedns.IngressZone+".")
+			return strings.Join(addrs, ",")
+		}
+		for i := range churn {
+			p := churnPlacement(i)
+			cl.put(p)
+			if i == churn/2 {
+				svc.ingressLastFullGCUnix.Store(0) // the live audit runs on this pass
+			}
+			if err := svc.ReconcileClusterIngress(ctx); err != nil {
+				t.Fatalf("reconcile after create %d: %v", i, err)
+			}
+			if got := resolve(p.SandboxID + ".sandbox.test"); got != "10.2.0.7" {
+				t.Fatalf("created %s resolves to %q, want the owner", p.SandboxID, got)
+			}
+			cl.drop(p.SandboxID)
+			if err := svc.ReconcileClusterIngress(ctx); err != nil {
+				t.Fatalf("reconcile after destroy %d: %v", i, err)
+			}
+			// Gone from the index: the local router answers (404).
+			if got := resolve(p.SandboxID + ".sandbox.test"); got != opts.Static.LocalIP {
+				t.Fatalf("destroyed %s resolves to %q, want the local router at %s", p.SandboxID, got, opts.Static.LocalIP)
+			}
+		}
+		if l, w := fc.counts(); l != loads || w != writes {
+			t.Fatalf("%d create/destroy pairs made %d Caddy loads and %d admin writes after commit, want 0 (each one reloads Caddy and drops new connections)", churn, l-loads, w-writes)
+		}
+	})
+
+	// The control: the same churn on an ingress without the flag writes
+	// Caddy on every step. Without it the zero above could mean the churn
+	// never reached the ingress at all.
+	t.Run("flag off: every churn step writes Caddy", func(t *testing.T) {
+		svc, fc, _, cl := newChurnIngress(t)
+		svc.cfg.IngressProxyRouting = false
+		ctx := context.Background()
+		_, before := fc.counts()
+		for i := range churn {
+			cl.put(churnPlacement(i))
+			if err := svc.ReconcileClusterIngress(ctx); err != nil {
+				t.Fatalf("reconcile after create %d: %v", i, err)
+			}
+			_, afterCreate := fc.counts()
+			if afterCreate == before {
+				t.Fatalf("create %d made no Caddy write without the flag; the control lost its signal", i)
+			}
+			cl.drop(churnPlacement(i).SandboxID)
+			if err := svc.ReconcileClusterIngress(ctx); err != nil {
+				t.Fatalf("reconcile after destroy %d: %v", i, err)
+			}
+			_, afterDestroy := fc.counts()
+			if afterDestroy == afterCreate {
+				t.Fatalf("destroy %d made no Caddy write without the flag; the control lost its signal", i)
+			}
+			before = afterDestroy
+		}
+	})
 }
 
 // No change feed (and a first snapshot that never arrives): the index

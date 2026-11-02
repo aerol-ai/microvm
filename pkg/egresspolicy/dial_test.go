@@ -23,6 +23,7 @@ func TestDialGuardCheck(t *testing.T) {
 	allowlist := mustCompile(t, Spec{AllowOut: []string{"pypi.org"}})
 	mixed := mustCompile(t, Spec{AllowOut: []string{"api.example.com"}, DenyOut: []string{"203.0.113.0/24"}})
 	blocked := mustCompile(t, Spec{BlockAll: true})
+	cgnatAllow := mustCompile(t, Spec{AllowOut: []string{"100.64.0.0/10"}})
 
 	tests := []struct {
 		name   string
@@ -52,8 +53,12 @@ func TestDialGuardCheck(t *testing.T) {
 		{"rfc1918_rebinding", DialGuard{}, allowlist, DialTarget{Name: "pypi.org", NameAllowed: true, Addr: ap("192.168.1.1:443")}, DialReasonPrivate, ""},
 		{"rfc1918_cidr_allowed", DialGuard{}, cidrAllow, DialTarget{Name: "pypi.org", NameAllowed: true, Addr: ap("10.1.2.3:443")}, "", ""},
 		{"rfc1918_cidr_allowed_raw", DialGuard{}, cidrAllow, DialTarget{Addr: ap("10.1.2.3:5432")}, "", ""},
-		{"cgnat_alibaba_metadata", DialGuard{}, nil, DialTarget{Addr: ap("100.100.100.200:80")}, DialReasonPrivate, ""},
-		{"ula_aws_metadata_v6", DialGuard{}, nil, DialTarget{Addr: ap("[fd00:ec2::254]:80")}, DialReasonPrivate, ""},
+		// Cloud metadata is on the built-in floor: refused before the
+		// private-range rule, so no allowed CIDR can open it.
+		{"cgnat_alibaba_metadata", DialGuard{}, nil, DialTarget{Addr: ap("100.100.100.200:80")}, DialReasonDenyFloor, "100.100.100.200/32"},
+		{"cgnat_alibaba_metadata_cidr_allowed", DialGuard{}, cgnatAllow, DialTarget{Addr: ap("100.100.100.200:80")}, DialReasonDenyFloor, "100.100.100.200/32"},
+		{"ula_aws_metadata_v6", DialGuard{}, nil, DialTarget{Addr: ap("[fd00:ec2::254]:80")}, DialReasonDenyFloor, "fd00:ec2::254/128"},
+		{"azure_wireserver_public", DialGuard{}, nil, DialTarget{Addr: ap("168.63.129.16:80")}, DialReasonDenyFloor, "168.63.129.16/32"},
 		{"v4_mapped_private", DialGuard{}, nil, DialTarget{Addr: ap("[::ffff:10.0.0.1]:443")}, DialReasonPrivate, ""},
 		{"public_no_policy", DialGuard{}, nil, DialTarget{Addr: ap("8.8.8.8:443")}, "", ""},
 
@@ -151,7 +156,10 @@ func TestDialGuardCheckFloor(t *testing.T) {
 		{"127.0.0.1:80", "127.0.0.0/8"},
 		{"[::ffff:203.0.113.9]:443", "203.0.113.0/24"}, // v4-mapped must not dodge the floor
 		{"10.0.0.1:443", ""},
-		{"169.254.169.254:80", ""},
+		// The metadata endpoints are on every floor, listed or not: the
+		// WASM mediator's no-policy dials leave from the node itself.
+		{"169.254.169.254:80", "169.254.169.254/32"},
+		{"168.63.129.16:80", "168.63.129.16/32"},
 		{"8.8.8.8:443", ""},
 	}
 	for _, tc := range tests {

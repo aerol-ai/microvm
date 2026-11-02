@@ -27,6 +27,9 @@ func (s *Service) returnExistingSandboxResponse(ctx context.Context, sandboxID s
 func (s *Service) handleDuplicateCreateAfterRuntime(ctx context.Context, sandboxID string, err error) (*models.CreateSandboxResponse, error) {
 	if errors.Is(err, docker.ErrSandboxContainerExists) {
 		if resp, ok := s.returnExistingSandboxResponse(ctx, sandboxID); ok {
+			if err := s.checkStoredCreateDigest(ctx, sandboxID); err != nil {
+				return nil, err
+			}
 			return resp, nil
 		}
 		return nil, models.ErrSandboxExists
@@ -37,6 +40,9 @@ func (s *Service) handleDuplicateCreateAfterRuntime(ctx context.Context, sandbox
 func (s *Service) handleDuplicateStoreCreate(ctx context.Context, sandboxID string, err error) (*models.CreateSandboxResponse, error) {
 	if errors.Is(err, models.ErrSandboxExists) {
 		if resp, ok := s.returnExistingSandboxResponse(ctx, sandboxID); ok {
+			if err := s.checkStoredCreateDigest(ctx, sandboxID); err != nil {
+				return nil, err
+			}
 			return resp, nil
 		}
 		return nil, models.ErrSandboxExists

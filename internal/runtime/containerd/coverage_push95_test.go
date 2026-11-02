@@ -24,6 +24,9 @@ import (
 
 // coverage_push95_test.go: hit remaining offline-reachable branches to clear 95%.
 
+// A running task whose address can't be read is still a running sandbox.
+// ListManaged used to skip it, and reconcile then deleted the live sandbox's
+// row (UC-320 gVisor neighbour). It is listed, started, with no address.
 func TestListManagedInspectFailPush95(t *testing.T) {
 	orig := containerIPv4FromTaskFn
 	containerIPv4FromTaskFn = func(context.Context, cntr.Task) (string, error) {
@@ -39,8 +42,11 @@ func TestListManagedInspectFailPush95(t *testing.T) {
 	d := newTestDriver(t)
 	d.SetClient(NewTestClient("aerolvm", tr))
 	got, err := d.ListManaged(context.Background())
-	if err != nil || len(got) != 0 {
+	if err != nil || len(got) != 1 {
 		t.Fatalf("got=%v err=%v", got, err)
+	}
+	if st := got["sb-badip"]; st == nil || st.Status != models.SandboxStatusStarted || st.ContainerIP != "" {
+		t.Fatalf("state=%+v, want started with no address", st)
 	}
 }
 
@@ -213,7 +219,7 @@ func TestWaitToolboxHTTPCancelDuringPollPush95(t *testing.T) {
 }
 
 func TestResourceSpecOptsTinyCPUPush95(t *testing.T) {
-	opts := resourceSpecOpts(models.CreateSandboxRequest{CPU: 0.001})
+	opts := resourceSpecOpts(models.CreateSandboxRequest{CPU: 0.001}, 0)
 	if len(opts) != 1 {
 		t.Fatalf("opts=%d", len(opts))
 	}

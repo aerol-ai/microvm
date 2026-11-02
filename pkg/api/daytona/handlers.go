@@ -42,6 +42,22 @@ func (h *handlers) createSandbox(w http.ResponseWriter, r *http.Request) {
 		apihttp.WriteError(w, http.StatusBadRequest, "invalid JSON body")
 		return
 	}
+	// A keyed create replays only the request it was made with: digest the
+	// Daytona request as the client sent it. A forward re-sends this same
+	// wire body, so the target node digests it the same way.
+	idempotencyKey := strings.TrimSpace(r.Header.Get(clustercreate.HeaderIdempotencyKey))
+	var requestDigests []string
+	if idempotencyKey != "" {
+		r = r.WithContext(service.WithIdempotencyKey(r.Context(), idempotencyKey))
+		canonical, err := json.Marshal(req)
+		if err == nil {
+			requestDigests, err = h.deps.Service.CreateRequestDigests("daytona", canonical)
+		}
+		if err != nil {
+			apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
+			return
+		}
+	}
 
 	placementReq, err := h.clusterPlacementRequest(r.Context(), req)
 	if err != nil {
@@ -68,6 +84,7 @@ func (h *handlers) createSandbox(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	serviceReq.CreateRequestDigests = requestDigests
 	response, err := clustercreate.CreateOnSelectedNode(r.Context(), h.deps.Service, h.deps.Logger, serviceReq, decision.ReservationID, clustercreate.CreateOptions{PromoteWithSpec: true, SandboxID: preferredID})
 	if err != nil {
 		// A build this request made is now orphaned: no sandbox row
@@ -334,6 +351,12 @@ func (h *handlers) listSandboxes(w http.ResponseWriter, r *http.Request) {
 		apihttp.WriteJSON(w, http.StatusOK, []sandboxResponse{})
 		return
 	}
+	release, err := clusterlist.Admit(h.deps.ListGate, h.deps.Service.Cluster(), r)
+	if err != nil {
+		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
+		return
+	}
+	defer release()
 	sandboxes, err := h.deps.Service.ListSandboxes(r.Context(), nil)
 	if err != nil {
 		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
@@ -423,6 +446,12 @@ func (h *handlers) listSandboxesPaginated(w http.ResponseWriter, r *http.Request
 		apihttp.WriteJSON(w, http.StatusOK, paginatedSandboxesResponse{})
 		return
 	}
+	release, err := clusterlist.Admit(h.deps.ListGate, h.deps.Service.Cluster(), r)
+	if err != nil {
+		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
+		return
+	}
+	defer release()
 	sandboxes, err := h.deps.Service.ListSandboxes(r.Context(), nil)
 	if err != nil {
 		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)

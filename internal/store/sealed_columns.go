@@ -127,25 +127,3 @@ func (s *Store) ResealSealedRows(ctx context.Context, col SealedColumn, rows []R
 	}
 	return written, nil
 }
-
-// registryAuthStorage is the registry blob a whole-row write stores. The
-// blob comes from a sandbox read earlier, so one read before a rotation's
-// reseal pass and written after it would put the old key's bytes back;
-// while a rotation is in progress it is moved onto the current key first
-// (§13). A blob that does not open is stored as given, as before.
-func (s *Store) registryAuthStorage(sealed []byte) []byte {
-	if len(sealed) == 0 || !s.secretCipher.Rotating() {
-		return sealed
-	}
-	// A blob sealed by this create names the current key: no open. A
-	// legacy blob whose nonce happens to match is left for the reseal
-	// pass, which opens every value.
-	if cur := s.secretCipher.CurrentKeyID(); cur != 0 && secrets.SealedKeyID(sealed) == cur {
-		return sealed
-	}
-	out, _, _, err := s.secretCipher.Reseal(sealed, nil)
-	if err != nil {
-		return sealed
-	}
-	return out
-}

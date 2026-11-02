@@ -2,6 +2,8 @@ package store
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"fmt"
 
 	"github.com/aerol-ai/microvm/pkg/models"
@@ -40,4 +42,18 @@ func (s *Store) SandboxIDsClaimingContainerIP(ctx context.Context, ip string) ([
 		return nil, fmt.Errorf("iterate container ip claimants: %w", err)
 	}
 	return ids, nil
+}
+
+// HasSandbox reports whether a sandbox row exists for id. It reads no
+// sealed column, so it answers on a node whose server key is revoked.
+func (s *Store) HasSandbox(ctx context.Context, id string) (bool, error) {
+	var one int
+	err := s.db.QueryRowContext(ctx, `SELECT 1 FROM sandboxes WHERE id = ?`, id).Scan(&one)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("check sandbox row: %w", err)
+	}
+	return true, nil
 }

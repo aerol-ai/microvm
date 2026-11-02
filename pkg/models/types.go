@@ -122,6 +122,26 @@ var ErrRuntimeNotImplemented = errors.New("runtime not yet implemented on this b
 // already exists. Distinct from name conflicts (store.ErrSandboxNameConflict).
 var ErrSandboxExists = errors.New("sandbox already exists")
 
+// ErrIdempotencyKeyReused is returned when a create's Idempotency-Key was
+// already used with a different request. It is answered 422
+// (ErrorCodeIdempotencyKeyReused) with no sandbox data.
+var ErrIdempotencyKeyReused = errors.New("idempotency key was already used with a different request")
+
+// IdempotencyKeyReusedError is ErrIdempotencyKeyReused naming the key.
+type IdempotencyKeyReusedError struct {
+	Key string
+}
+
+func (e *IdempotencyKeyReusedError) Error() string {
+	if e == nil || e.Key == "" {
+		return "Idempotency-Key was already used with a different request"
+	}
+	return fmt.Sprintf("Idempotency-Key %q was already used with a different request", e.Key)
+}
+
+// Is makes errors.Is(err, ErrIdempotencyKeyReused) hold.
+func (e *IdempotencyKeyReusedError) Is(target error) bool { return target == ErrIdempotencyKeyReused }
+
 // ErrSnapshotCorrupt is returned when a runtime snapshot fails checksum
 // verification at load time — the on-disk artifact does not match the
 // checksum stamped at capture. Firecracker templates and WASM boundary
@@ -697,6 +717,14 @@ type CreateSandboxRequest struct {
 	// (Sandbox.CustomDomains) carries per-hostname status. Capped by
 	// MaxCustomDomainsPerCreateRequest.
 	CustomDomains []string `json:"custom_domains,omitempty"`
+	// CreateRequestDigests are keyed digests ("hmac:<key id>:<hex>", one per
+	// server key, the current key's first) of the request an Idempotency-Key
+	// create was made with, as the client sent it. Server-internal: the API
+	// edge sets it from the decoded request and replaces any client value; it
+	// rides a cluster forward and the replicated spec, so the node that runs
+	// the sandbox, and a failover recreate, can tell a retry of the same
+	// request from a reuse of the key for a different one.
+	CreateRequestDigests []string `json:"create_request_digests,omitempty"`
 	// TemplateID, when set alongside Runtime="firecracker", skips the
 	// per-create OCI→ext4 build and reuses a previously prepared
 	// rootfs.ext4 from a Firecracker template (POST /v1/templates). The
@@ -785,6 +813,10 @@ type Sandbox struct {
 	NetworkBlockAll bool              `json:"network_block_all"`
 	ToolboxEnabled  bool              `json:"toolbox_enabled"`
 	ToolboxToken    string            `json:"-"`
+	// CreateRequestDigest is the keyed digest of the request an
+	// Idempotency-Key create was made with (CreateSandboxRequest's current
+	// one). Stored in sandbox_create_digests, never on the wire.
+	CreateRequestDigest string `json:"-"`
 	// AuditIncarnationID scopes retained audit evidence to this exact sandbox
 	// lifecycle. It is persisted in sandbox_audit_acl, not on the sandbox row,
 	// and never crosses the public API or Raft recovery payload.
@@ -871,9 +903,11 @@ type Sandbox struct {
 	// EgressStatus is the hostname-egress state on GET for a sandbox whose
 	// policy needs the egress gateway: "active", "held" (attach failed or the
 	// stored policy is invalid; no egress until it attaches) or
-	// "unavailable" (the gateway is down or lost its table). Empty for every
-	// other sandbox, and on list responses (plans/egress-domain-filtering.md
-	// D16). Response-only: never stored.
+	// "unavailable" (the gateway is down or lost its table). "unenforced" is
+	// any egress policy on a runtime whose host firewall is off on this node
+	// (SB_ENABLE_NETWORK_RULES=false): nothing filters the sandbox's traffic.
+	// Empty for every other sandbox, and on list responses
+	// (plans/egress-domain-filtering.md D16). Response-only: never stored.
 	EgressStatus string `json:"egress_status,omitempty"`
 	// AllowPublicTraffic is whether the sandbox currently has a public route:
 	// only true is public. It starts as the create-time flag and the first
@@ -1006,7 +1040,8 @@ type NetworkPolicyRequest struct {
 // NetworkPolicy is the effective egress policy a PUT leaves in force. A 2xx
 // means it is stored, replicated in a cluster, and live on a running
 // sandbox. EgressStatus is set for a container sandbox in gateway mode, as
-// on GET.
+// on GET; "unenforced" there means the node's host firewall is off and the
+// policy was accepted only under SB_ALLOW_UNENFORCED_NETWORK_POLICY.
 type NetworkPolicy struct {
 	NetworkBlockAll bool     `json:"network_block_all"`
 	NetworkAllowOut []string `json:"network_allow_out"`
@@ -1428,6 +1463,60 @@ const ErrorCodeEgressGatewayUnavailable = "egress_gateway_unavailable"
 // deployment's default egress policy is unknown, so creates fail closed
 // (plans/egress-domain-filtering.md §5.10).
 const ErrorCodeEgressOperatorConfigInvalid = "egress_operator_config_invalid"
+
+// ErrorCodeIPv6FenceNotReady is returned (503, with Retry-After) for a
+// container or Firecracker create while this node's IPv6 fence, which keeps
+// IPv6 off the sandbox bridges and TAPs, is not installed for that runtime;
+// the node retries it every few seconds.
+const ErrorCodeIPv6FenceNotReady = "ipv6_fence_not_ready"
+
+// ErrorCodeNetworkPolicyUnenforced is returned (501) for a create, start,
+// policy update or byte-cap update that needs the host firewall on a node
+// where it is off (SB_ENABLE_NETWORK_RULES=false, or not a Linux host): the
+// docker, containerd and Firecracker runtimes enforce block-all, address
+// lists, hostname rules and byte caps with it. Retrying won't help; the
+// operator turns the firewall on, or the caller drops the policy or picks a
+// runtime that filters egress itself (wasm, isolate).
+const ErrorCodeNetworkPolicyUnenforced = "network_policy_unenforced"
+
+// ErrorCodeMountToolUnavailable is returned (501) for a create or start whose
+// external-storage or platform-volume mount needs a mount tool (mount-s3,
+// sshfs, rclone, mount) that is not installed on this node, as on a local
+// install. Retrying won't help, so it is not a 503 (every SDK retries those);
+// the operator installs the tool (the server installer does), or the caller
+// creates the sandbox without the mount.
+const ErrorCodeMountToolUnavailable = "mount_tool_unavailable"
+
+// ErrorCodeOverloaded is returned (503, with Retry-After) when the node shed
+// the request: it already runs as many requests of that kind (cluster-wide
+// sandbox lists) as it is configured to. Retrying after Retry-After is the
+// recovery; nothing is wrong with the request.
+const ErrorCodeOverloaded = "overloaded"
+
+// ErrorCodeRateLimited is returned (429, with Retry-After) when the caller's
+// own tenant already runs its share of the node's requests of that kind
+// (cluster-wide sandbox lists): the node has room, but not for one more from
+// this tenant. Other tenants are unaffected. Retrying after Retry-After is
+// the recovery; slowing down is the cure.
+const ErrorCodeRateLimited = "rate_limited"
+
+// ErrorCodeNodeGuardNotReady is returned (503, with Retry-After) for a
+// container or Firecracker create while this node's guard that keeps
+// sandboxes off the node's own services is not installed for that runtime;
+// the node retries it every few seconds.
+const ErrorCodeNodeGuardNotReady = "node_guard_not_ready"
+
+// ErrorCodeEgressFloorNotReady is returned (503, with Retry-After) for a
+// container or Firecracker create while this node's egress deny floor, which
+// keeps sandboxes off the cloud metadata endpoints and the operator's
+// deny_cidrs, is not installed for that runtime; the node retries it every
+// few seconds.
+const ErrorCodeEgressFloorNotReady = "egress_floor_not_ready"
+
+// ErrorCodeIdempotencyKeyReused is returned (422) for a create whose
+// Idempotency-Key was already used with a different request. Retrying the
+// same request cannot succeed: send the original request, or a new key.
+const ErrorCodeIdempotencyKeyReused = "idempotency_key_reused"
 
 // Key-store error codes, each returned with 503 when the key store that wraps
 // sandbox secrets (SB_SECRET_PROVIDER) answers with one of its five error

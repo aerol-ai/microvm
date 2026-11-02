@@ -12,6 +12,10 @@ import (
 	"time"
 )
 
+// apiHTTPClient is http.DefaultClient on the shared API-pool transport: no
+// timeout of its own, so each caller's context bounds the request.
+var apiHTTPClient = HTTPClient(0)
+
 // rawGet issues an authenticated GET against the scenario's control-plane API
 // for the handful of endpoints the Go SDK does not wrap yet (capacity,
 // metrics, cluster/* observability, ops). The suite is primarily a Go-SDK
@@ -24,7 +28,7 @@ func (c *Client) rawGet(ctx context.Context, path string) (*http.Response, error
 		return nil, err
 	}
 	req.Header.Set("Authorization", "Bearer "+c.sc.PAT)
-	return http.DefaultClient.Do(req)
+	return apiHTTPClient.Do(req)
 }
 
 // rawPost issues an authenticated POST with an optional JSON body. Used by the
@@ -46,7 +50,7 @@ func (c *Client) rawPost(ctx context.Context, path string, body any) (*http.Resp
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
-	return http.DefaultClient.Do(req)
+	return apiHTTPClient.Do(req)
 }
 
 // PostStatus issues an authenticated POST and returns the status code and body
@@ -72,7 +76,7 @@ func (c *Client) Delete(ctx context.Context, path string) error {
 		return err
 	}
 	req.Header.Set("Authorization", "Bearer "+c.sc.PAT)
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := apiHTTPClient.Do(req)
 	if err != nil {
 		return err
 	}

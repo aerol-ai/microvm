@@ -142,13 +142,27 @@ func Prepare(w http.ResponseWriter, r *http.Request, svc *service.Service, req m
 		return Decision{ReservationID: sandboxID}, true
 	}
 
-	if err := svc.NormalizeCreateImageDistribution(r.Context(), &req); err != nil {
-		writeMsg(w, http.StatusBadRequest, err.Error())
+	// A create naming a snapshot's committed tag that another node holds goes
+	// to that node: only its catalogue row can resolve and authorize the tag.
+	// This node skips the image normalization it cannot do (it would answer a
+	// tenant not-found and send an operator to pull the tag from Docker Hub),
+	// and the failover check that depends on its result; the home node runs
+	// both when the forward arrives.
+	snapshotHome, err := snapshotTagHome(r.Context(), svc, c, req)
+	if err != nil {
+		w.Header().Set("Retry-After", strconv.Itoa(cluster.CapacityRetryAfterSeconds))
+		writeMsg(w, http.StatusServiceUnavailable, "cluster: snapshot home lookup: "+err.Error())
 		return Decision{}, false
 	}
-	if err := service.NormalizeCreateFailover(&req); err != nil {
-		writeMsg(w, http.StatusBadRequest, err.Error())
-		return Decision{}, false
+	if snapshotHome == "" {
+		if err := svc.NormalizeCreateImageDistribution(r.Context(), &req); err != nil {
+			writeMsg(w, http.StatusBadRequest, err.Error())
+			return Decision{}, false
+		}
+		if err := service.NormalizeCreateFailover(&req); err != nil {
+			writeMsg(w, http.StatusBadRequest, err.Error())
+			return Decision{}, false
+		}
 	}
 	svc.NormalizeCreateEgressDefault(&req)
 	if opts.Normalize != nil {
@@ -180,8 +194,11 @@ func Prepare(w http.ResponseWriter, r *http.Request, svc *service.Service, req m
 		r.Body = io.NopCloser(bytes.NewReader(normalized))
 		r.ContentLength = int64(len(normalized))
 	}
-	if service.ImageRequiresLocalPlacement(req) {
+	if snapshotHome != "" || service.ImageRequiresLocalPlacement(req) {
 		requiredNodeID, nodeBound := docker.BuiltImagePlacementNode(req.Image)
+		if snapshotHome != "" {
+			requiredNodeID, nodeBound = snapshotHome, true
+		}
 		if clusterCreateSelfCanOwnSandbox(c) && (!nodeBound || requiredNodeID == c.SelfNodeID()) {
 			if c.IsNodeDrained(c.SelfNodeID()) {
 				writeMsg(w, http.StatusServiceUnavailable, cluster.ErrNoPlacementTarget.Error())
@@ -189,7 +206,13 @@ func Prepare(w http.ResponseWriter, r *http.Request, svc *service.Service, req m
 			}
 			return Decision{}, true
 		}
-		target, err := c.SelectPlacement(CapacityRequestFromCreate(req))
+		placementReq := CapacityRequestFromCreate(req)
+		if snapshotHome != "" {
+			// The snapshot's image is only on its home: a home that is gone
+			// fails as ErrArtifactNodeUnavailable below, like a built image's.
+			placementReq.RequiredNodeID = snapshotHome
+		}
+		target, err := c.SelectPlacement(placementReq)
 		if err != nil {
 			if writeNoEgressGateway(w, err, writeError) {
 				return Decision{}, false
@@ -223,7 +246,10 @@ func Prepare(w http.ResponseWriter, r *http.Request, svc *service.Service, req m
 			writeMsg(w, http.StatusServiceUnavailable, cluster.ErrNoPlacementTarget.Error())
 			return Decision{}, false
 		}
-		if opts.Logger != nil && strings.HasPrefix(strings.TrimSpace(req.Image), docker.BuiltImageNamespace+"/") {
+		if opts.Logger != nil && snapshotHome != "" {
+			opts.Logger.Info("cluster create: forwarding snapshot image to the node holding the snapshot",
+				"image", req.Image, "target", target.NodeID)
+		} else if opts.Logger != nil && strings.HasPrefix(strings.TrimSpace(req.Image), docker.BuiltImageNamespace+"/") {
 			opts.Logger.Info("cluster create: forwarding built local image to selected worker",
 				"image", req.Image, "target", target.NodeID)
 		}
@@ -334,6 +360,38 @@ func Prepare(w http.ResponseWriter, r *http.Request, svc *service.Service, req m
 	forwardReservedCreate(w, r, c, cluster.Endpoint{NodeID: target.NodeID, InternalURL: target.InternalURL, APIURL: target.APIURL},
 		sandboxID, opts.PreferredSandboxID == "", opts.Logger)
 	return Decision{}, false
+}
+
+// snapshotTagHome returns the node a create is forwarded to because its image
+// is a snapshot's committed tag (docker.SnapshotImageTagForOwner) held by
+// another node. The tag exists only in that node's image store, and only that
+// node's catalogue row says who may start it, so the home node runs the whole
+// create, ownership checks included; this lookup routes and never authorizes.
+//
+// "" keeps today's path: the image is not a snapshot tag; the caller also named
+// the pushed registry copy, which any node can start; this node holds the
+// snapshot, whatever the index says; or no home is registered (single-node,
+// the Noop client, or a home that left the cluster and took the snapshot with
+// it). The local catalogue is read first so a create on the home node never
+// waits on the index, which on an agent-role node is a control-plane call.
+func snapshotTagHome(ctx context.Context, svc *service.Service, c cluster.Client, req models.CreateSandboxRequest) (string, error) {
+	if !service.ImageRequiresLocalPlacement(req) || !docker.IsSnapshotImageRef(req.Image) {
+		return "", nil
+	}
+	held, err := svc.HoldsCommittedSnapshotImage(ctx, req.Image)
+	if err != nil || held {
+		// A catalogue read error is NormalizeCreateImageDistribution's to
+		// report: it makes the same read next.
+		return "", nil
+	}
+	node, ok, err := c.SnapshotHomeNode(ctx, cluster.SnapshotImageHomeKey(req.Image))
+	if err != nil {
+		return "", err
+	}
+	if !ok || node == c.SelfNodeID() {
+		return "", nil
+	}
+	return node, nil
 }
 
 // forwardReservedCreate forwards a create this router just reserved and, when

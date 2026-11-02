@@ -453,8 +453,9 @@ func interpretWaitResult(err error) (int, string) {
 }
 
 func mergeEnvForExec(extra map[string]string) []string {
-	// Inherit container env so PATH, HOME, etc. are present.
-	base := append([]string(nil), os.Environ()...)
+	// Inherit the container env (PATH, HOME, ...) and the sandbox env; the
+	// request's env goes last so it wins.
+	base := childEnviron()
 	for k, v := range extra {
 		base = append(base, fmt.Sprintf("%s=%s", k, v))
 	}

@@ -45,6 +45,9 @@ func TestAuditCallerFromContext(t *testing.T) {
 	}
 	withVia := func(a controlplane.Access, via string) controlplane.Access { a.Via = via; return a }
 	tagged := func(ctx context.Context) context.Context { return withAuditSubsystem(ctx, auditSubsystemReconcile) }
+	bridged := func(ctx context.Context) context.Context {
+		return auditlog.ContextWithSSHGatewayCall(ctx, auditlog.SSHGatewayCall{SandboxID: "sb-1"})
+	}
 
 	cases := []struct {
 		name string
@@ -69,6 +72,15 @@ func TestAuditCallerFromContext(t *testing.T) {
 		{"a request's caller wins over a subsystem tag", tagged(controlplane.ContextWithAccess(context.Background(), forwarded)),
 			&auditlog.Caller{Kind: "token", ID: "tok_7Hq2", Name: "ci-deploy", Team: "payments", Via: "edge-1"}},
 		{"untagged background work", context.Background(), &auditlog.Caller{Kind: "system", ID: "system:daemon"}},
+		// UC-287 on a cluster: the SSH gateway bridges a session with the
+		// operator token, but the operator did nothing.
+		{"a bridged SSH call on the owner: the sandbox key, via the gateway's node",
+			bridged(controlplane.ContextWithAccess(context.Background(), withVia(controlplane.OperatorAccess(), "edge-1"))),
+			&auditlog.Caller{Kind: "sandbox_key", ID: "sb-1", Via: "edge-1"}},
+		{"a bridged SSH call run on the gateway's own node", bridged(controlplane.ContextWithAccess(context.Background(), controlplane.OperatorAccess())),
+			&auditlog.Caller{Kind: "sandbox_key", ID: "sb-1"}},
+		{"the marker without an authenticated request names nobody new", bridged(context.Background()),
+			&auditlog.Caller{Kind: "system", ID: "system:daemon"}},
 		{"nil context", nil, &auditlog.Caller{Kind: "system", ID: "system:daemon"}},
 	}
 	for _, tc := range cases {

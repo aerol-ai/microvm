@@ -23,7 +23,7 @@ func TestAuthEnforced(t *testing.T) {
 		t.Fatalf("build request: %v", err)
 	}
 	// Deliberately no Authorization header.
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := harness.HTTPClient(0).Do(req)
 	if err != nil {
 		t.Fatalf("request: %v", err)
 	}

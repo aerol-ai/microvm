@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"math/big"
 	"net"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -63,6 +64,26 @@ func kcEnsureFastRecheck(t *testing.T, targets *harness.IntegrationTargets) {
 	for _, n := range nodes {
 		kcMark(t, n, "fast-recheck")
 	}
+}
+
+// kcMetricSum adds up every series of one metric in a /v1/metrics scrape.
+func kcMetricSum(text, name string) float64 {
+	var sum float64
+	for _, line := range strings.Split(text, "\n") {
+		line = strings.TrimSpace(line)
+		rest, ok := strings.CutPrefix(line, name)
+		if !ok || (!strings.HasPrefix(rest, "{") && !strings.HasPrefix(rest, " ")) {
+			continue
+		}
+		fields := strings.Fields(rest[strings.LastIndex(rest, "}")+1:])
+		if len(fields) == 0 {
+			continue
+		}
+		if v, err := strconv.ParseFloat(fields[0], 64); err == nil {
+			sum += v
+		}
+	}
+	return sum
 }
 
 // kcPutSecretFile writes content to path on node, owner root, mode 0600,

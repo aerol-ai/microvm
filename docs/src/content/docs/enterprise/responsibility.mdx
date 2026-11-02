@@ -92,7 +92,7 @@ Each limit has a workaround you can use today. Where a fix is planned, the last 
 | **The audit log on a server can be rewritten by someone with root on it.** The hash chain catches a changed record, not a rebuilt chain. | Send the records off the server to a webhook or an S3 bucket you control. | |
 | **Audit records hold people's email addresses,** as the caller's display name. A changed record breaks the chain, so a name cannot be erased from a live record. | Keep the server's 30-day retention, and set a retention period on your export store. See [Audit and compliance](/enterprise/audit-evidence/#personal-data-in-audit-records). | |
 | **An unclean crash can lose the last second of records**, the ones not yet written to disk. | Turn on `SB_AUDIT_API_DURABLE`, which enterprise mode requires: token create, token revoke and sandbox delete then wait for their record. | |
-| **Code in a sandbox can read its own variables**, and container snapshots save them. | Use an inject rule for API keys, so the sandbox only holds a placeholder. | |
+| **Code in a sandbox can read its own variables**, and Docker keeps a copy of them next to each snapshot on the node. | Use an inject rule for API keys, so the sandbox only holds a placeholder. | |
 | **Inject rules are not supported on WebAssembly or Firecracker yet.** | Use a container, gVisor or a V8 isolate for code that needs a protected key. | |
 | **Public URLs have no login,** and shared TCP ports are open to the whole internet. | Protect the app itself, or share only what must be public. | |
 

@@ -16,6 +16,7 @@ import (
 	"github.com/aerol-ai/microvm/internal/cluster"
 	"github.com/aerol-ai/microvm/pkg/api/apihttp"
 	"github.com/aerol-ai/microvm/pkg/controlplane"
+	"github.com/aerol-ai/microvm/pkg/models"
 	"golang.org/x/sync/singleflight"
 )
 
@@ -129,21 +130,14 @@ func (c *clusterListCache[T]) put(key string, now time.Time, value clusterListAg
 	c.entries[key] = clusterListCacheEntry[T]{expires: now.Add(clusterListCacheTTL), value: value}
 }
 
-// clusterListCallerKey isolates cached catalogues by tenant. Operator and
+// clusterListCallerKey isolates cached catalogues by tenant: the same
+// tenant key the list gate's fairness uses (apihttp.FlowOf). Operator and
 // unscoped callers share one fleet-wide slot; a user token never reads it.
 func clusterListCallerKey(r *http.Request) string {
 	if r == nil {
-		return "operator"
+		return apihttp.OperatorFlow
 	}
-	access, ok := controlplane.AccessFromContext(r.Context())
-	if !ok || access.Fleet {
-		return "operator"
-	}
-	owner := strings.TrimSpace(access.Identity.OwnerRef)
-	if owner == "" {
-		return "operator"
-	}
-	return "owner:" + owner
+	return apihttp.FlowOf(r.Context())
 }
 
 func clusterListSweepContext(parent *http.Request) (context.Context, context.CancelFunc) {
@@ -418,6 +412,15 @@ func clusterListSweep[T any](r *http.Request, c cluster.Client, runtimeName, for
 		Warn(string, ...any)
 	}, what string, index clusterArtifactLocationIndex, catalog clusterArtifactCatalog[T],
 ) (clusterListAggregate[T], error) {
+	// The node aggregating may not run this runtime at all: a server or an
+	// ingress on a cluster whose isolate or Firecracker work lives on
+	// dedicated workers. That is "no rows here", not a failed peer. Counting
+	// it as one marked every such list partial (X-Aerol-Partial) on a
+	// healthy cluster, and with no rows yet answered 501 for a runtime the
+	// cluster does run.
+	if errors.Is(localErr, models.ErrRuntimeNotImplemented) {
+		local, localErr = nil, nil
+	}
 	if localErr != nil && logger != nil {
 		logger.Warn("cluster "+what+": local list failed", "err", localErr)
 	}

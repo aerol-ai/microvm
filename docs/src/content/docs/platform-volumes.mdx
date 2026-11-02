@@ -141,7 +141,7 @@ This depends on the store your operator picked. Ask them which one it is.
 | Add new files | Yes, written from start to finish in one go | Yes |
 | Change, rename or delete a file already there | No | Yes |
 
-On an S3 store, the server mounts the bucket with `mount-s3`, which only adds new files by default. To change a file, write a new file with a new name.
+On an S3 store, the server mounts the bucket with `mount-s3`, which only adds new files by default. To change a file, write a new file with a new name. A server without `mount-s3` installed, such as a [local install](/getting-started/local-setup/), refuses the volume with `501` and the code `mount_tool_unavailable`.
 
 ## Platform volume or your own storage?
 

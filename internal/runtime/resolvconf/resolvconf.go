@@ -8,12 +8,18 @@ import (
 	"bufio"
 	"fmt"
 	"net"
+	"net/netip"
 	"os"
 	"strings"
 )
 
 // HostPath is the host resolver configuration Generate is usually given.
 const HostPath = "/etc/resolv.conf"
+
+// SystemdUpstreamPath is where systemd-resolved lists its upstream
+// resolvers. dockerd hands those to containers on the default bridge when
+// HostPath holds only the 127.0.0.53 stub.
+const SystemdUpstreamPath = "/run/systemd/resolve/resolv.conf"
 
 // Fallback is what a sandbox gets when the host names no usable resolver.
 const Fallback = "nameserver 8.8.8.8\n"
@@ -82,4 +88,27 @@ func isLoopback(ip string) bool {
 		return false
 	}
 	return parsed.IsLoopback()
+}
+
+// Nameservers returns the non-loopback nameserver addresses path lists:
+// the resolvers a sandbox is handed (Generate). A missing or unreadable
+// file has none.
+func Nameservers(path string) []netip.Addr {
+	body, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	var out []netip.Addr
+	for _, line := range strings.Split(string(body), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 2 || strings.ToLower(fields[0]) != "nameserver" {
+			continue
+		}
+		ip, err := netip.ParseAddr(fields[1])
+		if err != nil || ip.Unmap().IsLoopback() {
+			continue
+		}
+		out = append(out, ip.Unmap())
+	}
+	return out
 }

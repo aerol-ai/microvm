@@ -5,7 +5,7 @@ use std::fmt;
 use std::path::Path;
 use std::sync::{mpsc, Arc};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures_util::{SinkExt, StreamExt};
 use reqwest::blocking::{
@@ -328,6 +328,107 @@ impl RetryPolicy {
             RetryPolicy::UnsentOnly => err.is_connect(),
         }
     }
+}
+
+/// Default cap on one retry's wait for the server's `Retry-After`. An
+/// overloaded node asks for about a second, so the cap only bites on a long
+/// ask (maintenance, a misconfigured proxy), which should not hold a call for
+/// minutes per retry.
+const DEFAULT_MAX_RETRY_AFTER_MS: u64 = 30_000;
+
+/// Longer delta-seconds values are clamped: no cap is that long anyway.
+const MAX_RETRY_AFTER_SECS: u64 = 1_000_000_000;
+
+/// The response's `Retry-After` when the status is one the server paces
+/// clients with: 429 (this caller is over its share) and 503 (the node is
+/// shedding load). A 421, 502 or 504 comes from a routing or proxy hop, so
+/// a `Retry-After` on it is not the server's and the backoff applies.
+fn retry_after_hint(response: &reqwest::blocking::Response) -> Option<String> {
+    use reqwest::StatusCode as S;
+    if ![S::TOO_MANY_REQUESTS, S::SERVICE_UNAVAILABLE].contains(&response.status()) {
+        return None;
+    }
+    response
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .map(String::from)
+}
+
+/// Reads a `Retry-After` value in either form RFC 9110 allows:
+/// delta-seconds (`"120"`) or an HTTP date in IMF-fixdate form (`"Sun, 06
+/// Nov 1994 08:49:37 GMT"`, the form servers send). A date already past is
+/// a zero wait; `None` for a malformed value.
+fn parse_retry_after(value: &str, now: SystemTime) -> Option<Duration> {
+    let value = value.trim();
+    if !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()) {
+        // All digits, so parse fails only on overflow: absurdly long.
+        let secs = value.parse::<u64>().unwrap_or(u64::MAX).min(MAX_RETRY_AFTER_SECS);
+        return Some(Duration::from_secs(secs));
+    }
+    let when = parse_imf_fixdate(value)?;
+    Some(when.duration_since(now).unwrap_or(Duration::ZERO))
+}
+
+fn parse_imf_fixdate(value: &str) -> Option<SystemTime> {
+    const WEEKDAYS: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    // Byte offsets below are only char boundaries for ASCII.
+    let b = value.as_bytes();
+    if !value.is_ascii()
+        || b.len() != 29
+        || &b[3..5] != b", "
+        || b[7] != b' '
+        || b[11] != b' '
+        || b[16] != b' '
+        || b[19] != b':'
+        || b[22] != b':'
+        || &b[25..] != b" GMT"
+        || !WEEKDAYS.contains(&&value[0..3])
+    {
+        return None;
+    }
+    let number = |range: std::ops::Range<usize>| -> Option<i64> {
+        let text = &value[range];
+        if text.bytes().all(|c| c.is_ascii_digit()) {
+            text.parse().ok()
+        } else {
+            None
+        }
+    };
+    let month = MONTHS.iter().position(|m| *m == &value[8..11])? as i64 + 1;
+    let (day, year) = (number(5..7)?, number(12..16)?);
+    let (hour, minute, second) = (number(17..19)?, number(20..22)?, number(23..25)?);
+    if !(1..=31).contains(&day) || hour > 23 || minute > 59 || second > 60 {
+        return None;
+    }
+    // Days since 1970-01-01 for a proleptic Gregorian date (Howard Hinnant's
+    // days_from_civil).
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let doy = (153 * (if month > 2 { month - 3 } else { month + 9 }) + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    let secs = days * 86_400 + hour * 3_600 + minute * 60 + second;
+    // A date before 1970 is long past: a zero wait.
+    Some(UNIX_EPOCH + Duration::from_secs(u64::try_from(secs).unwrap_or(0)))
+}
+
+/// Turns the server's `Retry-After` into a wait. It never retries sooner
+/// than the server asked (nor sooner than the client's own backoff), and
+/// adds up to a fifth on top so clients told the same value spread out.
+/// `limit` is a hard ceiling: when the server asks for at least that long,
+/// the client is early anyway, so the spread goes below the limit instead.
+fn wait_for_hint(hint: Duration, backoff: Duration, limit: Duration, r: f64) -> Duration {
+    let target = hint.max(backoff);
+    if target >= limit {
+        return limit - limit.mul_f64(0.2 * r);
+    }
+    let upper = (target + target / 5).min(limit);
+    target + (upper - target).mul_f64(r)
 }
 
 #[derive(Clone, Debug)]
@@ -1892,6 +1993,27 @@ impl Client {
         self.send_json(method, path, payload, RetryPolicy::Idempotent)
     }
 
+    /// How long [`Client::send_json`] sleeps before re-sending. `attempt`
+    /// counts from 0, `retry_after` is [`retry_after_hint`]'s result and `r`
+    /// is uniform in [0, 1). Without a usable header it is the exponential
+    /// backoff ±25%; with one, see [`wait_for_hint`].
+    fn retry_wait(&self, attempt: i32, retry_after: Option<&str>, now: SystemTime, r: f64) -> Duration {
+        let base_delay = self.retry_config.base_delay_ms.unwrap_or(200);
+        let max_delay = self.retry_config.max_delay_ms.unwrap_or(5000);
+        let factor = 1u64.checked_shl(attempt.max(0) as u32).unwrap_or(u64::MAX);
+        let backoff = Duration::from_millis(base_delay.saturating_mul(factor).min(max_delay));
+        let limit = self
+            .retry_config
+            .max_retry_after_ms
+            .unwrap_or(DEFAULT_MAX_RETRY_AFTER_MS);
+        if limit > 0 {
+            if let Some(hint) = retry_after.and_then(|value| parse_retry_after(value, now)) {
+                return wait_for_hint(hint, backoff, Duration::from_millis(limit), r);
+            }
+        }
+        backoff.mul_f64(0.75 + 0.5 * r)
+    }
+
     fn send_json<T: Serialize, U: DeserializeOwned>(
         &self,
         method: Method,
@@ -1900,11 +2022,10 @@ impl Client {
         policy: RetryPolicy,
     ) -> Result<(U, reqwest::header::HeaderMap), Error> {
         let max_retries = self.retry_config.max_retries.unwrap_or(3);
-        let base_delay = self.retry_config.base_delay_ms.unwrap_or(200);
-        let max_delay = self.retry_config.max_delay_ms.unwrap_or(5000);
 
         let mut attempt = 0;
         loop {
+            let mut retry_after = None;
             let url = self.full_url(path);
             let mut builder = self
                 .inner
@@ -1917,7 +2038,9 @@ impl Client {
             match builder.send() {
                 Ok(response) => {
                     if attempt < max_retries && policy.retries_status(response.status()) {
-                        // Fall through to retry logic
+                        // Fall through to retry logic; dropping the response
+                        // frees the connection before the wait.
+                        retry_after = retry_after_hint(&response);
                     } else {
                         let response = self.handle_response(response)?;
                         let headers = response.headers().clone();
@@ -1936,11 +2059,15 @@ impl Client {
                 }
             }
 
-            let delay_ms = std::cmp::min(base_delay * (1 << attempt), max_delay);
-            // Add jitter
-            let jitter = 1.0 + (rand::random::<f64>() - 0.5) * 0.5;
-            let sleep_duration = std::time::Duration::from_millis((delay_ms as f64 * jitter) as u64);
-            std::thread::sleep(sleep_duration);
+            // A 429 or 503 waits as long as its Retry-After asks, within
+            // max_retry_after_ms. The client is blocking, so nothing can
+            // interrupt this sleep; the cap is what bounds it.
+            std::thread::sleep(self.retry_wait(
+                attempt,
+                retry_after.as_deref(),
+                SystemTime::now(),
+                rand::random::<f64>(),
+            ));
             attempt += 1;
         }
     }
@@ -2307,6 +2434,11 @@ mod tests {
             body: String,
             delay: Duration,
         },
+        /// A refusal carrying a `Retry-After` header (none when `None`).
+        Paced {
+            status: &'static str,
+            retry_after: Option<String>,
+        },
     }
 
     impl Reply {
@@ -2336,18 +2468,31 @@ mod tests {
                 let Ok(mut stream) = stream else { continue };
                 let _ = read_http_request(&mut stream);
                 server_hits.fetch_add(1, Ordering::SeqCst);
-                if let Reply::Json { status, body, delay } = &script[i.min(script.len() - 1)] {
-                    thread::sleep(*delay);
-                    let head = format!(
-                        "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                        status,
-                        body.len()
-                    );
-                    // The client may have given up already; that is the point
-                    // of some scripts, so a failed write is not an error.
-                    let _ = stream.write_all(head.as_bytes());
-                    let _ = stream.write_all(body.as_bytes());
-                }
+                let paced_body = r#"{"error":"busy","code":"overloaded"}"#.to_string();
+                let (status, body, delay, extra) = match &script[i.min(script.len() - 1)] {
+                    Reply::Hangup => continue,
+                    Reply::Json { status, body, delay } => (*status, body, *delay, String::new()),
+                    Reply::Paced { status, retry_after } => (
+                        *status,
+                        &paced_body,
+                        Duration::ZERO,
+                        retry_after
+                            .as_ref()
+                            .map(|v| format!("Retry-After: {}\r\n", v))
+                            .unwrap_or_default(),
+                    ),
+                };
+                thread::sleep(delay);
+                let head = format!(
+                    "HTTP/1.1 {}\r\n{}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    status,
+                    extra,
+                    body.len()
+                );
+                // The client may have given up already; that is the point
+                // of some scripts, so a failed write is not an error.
+                let _ = stream.write_all(head.as_bytes());
+                let _ = stream.write_all(body.as_bytes());
             }
         });
         (format!("http://{}", addr), hits)
@@ -2363,6 +2508,7 @@ mod tests {
                     max_retries: Some(3),
                     base_delay_ms: Some(1),
                     max_delay_ms: Some(5),
+                    max_retry_after_ms: None,
                 }),
                 ..Default::default()
             },
@@ -2777,6 +2923,7 @@ mod tests {
                     max_retries: Some(3),
                     base_delay_ms: Some(40),
                     max_delay_ms: Some(1000),
+                    max_retry_after_ms: None,
                 }),
                 ..Default::default()
             },
@@ -2807,6 +2954,231 @@ mod tests {
             .expect("get should retry to success");
         assert_eq!(sandbox.data.id, "sb-1");
         assert_eq!(hits.load(Ordering::SeqCst), 2);
+    }
+
+    /// Formats `t` as an IMF-fixdate, the HTTP-date form servers send.
+    fn format_imf_fixdate(t: SystemTime) -> String {
+        const WEEKDAYS: [&str; 7] = ["Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"];
+        const MONTHS: [&str; 12] = [
+            "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+        ];
+        let secs = t.duration_since(UNIX_EPOCH).expect("after 1970").as_secs() as i64;
+        let (days, rem) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
+        // Howard Hinnant's civil_from_days.
+        let z = days + 719_468;
+        let era = z.div_euclid(146_097);
+        let doe = z - era * 146_097;
+        let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let day = doy - (153 * mp + 2) / 5 + 1;
+        let month = if mp < 10 { mp + 3 } else { mp - 9 };
+        let year = yoe + era * 400 + if month <= 2 { 1 } else { 0 };
+        format!(
+            "{}, {:02} {} {} {:02}:{:02}:{:02} GMT",
+            WEEKDAYS[days.rem_euclid(7) as usize],
+            day,
+            MONTHS[(month - 1) as usize],
+            year,
+            rem / 3_600,
+            rem % 3_600 / 60,
+            rem % 60
+        )
+    }
+
+    #[test]
+    fn parse_retry_after_reads_seconds_and_http_dates() {
+        // Mon, 02 Nov 2026 12:00:00 GMT
+        let now = UNIX_EPOCH + Duration::from_secs(1_793_620_800);
+        let secs = |s: u64| Some(Duration::from_secs(s));
+        for (value, want) in [
+            ("", None),
+            ("   ", None),
+            ("3", secs(3)),
+            (" 3 ", secs(3)),
+            ("0", secs(0)),
+            ("-1", None),
+            ("+3", None),
+            ("1.5", None),
+            ("soon", None),
+            ("99999999999999999999", secs(MAX_RETRY_AFTER_SECS)),
+            ("Mon, 02 Nov 2026 12:00:07 GMT", secs(7)),
+            ("Mon, 02 Nov 2026 11:59:00 GMT", secs(0)),
+            ("Thu, 01 Jan 1960 00:00:00 GMT", secs(0)),
+            ("Mon, 32 Nov 2026 12:00:07 GMT", None),
+            ("Mon, 02 Foo 2026 12:00:07 GMT", None),
+            ("Mon, 02 Nov 2026 12:00:07 UTC", None),
+            ("Monday, 02-Nov-26 12:00:07 GMT", None),
+            ("Mon, 02 Nov 2026 12:00:07 GMT\u{e9}", None),
+        ] {
+            assert_eq!(parse_retry_after(value, now), want, "{:?}", value);
+        }
+        assert_eq!(format_imf_fixdate(now), "Mon, 02 Nov 2026 12:00:00 GMT");
+        // Round trip across leap years and month ends.
+        for secs in [0u64, 951_782_400, 1_709_208_000, 1_793_620_807, 4_102_444_799] {
+            let t = UNIX_EPOCH + Duration::from_secs(secs);
+            assert_eq!(parse_imf_fixdate(&format_imf_fixdate(t)), Some(t), "{}", secs);
+        }
+    }
+
+    #[test]
+    fn retry_wait_honours_retry_after_between_backoff_and_cap() {
+        let now = UNIX_EPOCH + Duration::from_secs(1_793_620_800);
+        let ms = Duration::from_millis;
+        let client = |limit: u64| {
+            Client::with_config(
+                ClientConfig {
+                    api_url: Some("http://unused".to_string()),
+                    pat_token: Some("pat-token".to_string()),
+                    retry: Some(RetryConfig {
+                        max_retries: Some(3),
+                        base_delay_ms: Some(100),
+                        max_delay_ms: Some(1000),
+                        max_retry_after_ms: Some(limit),
+                    }),
+                    ..Default::default()
+                },
+                ApiVersion::V1,
+            )
+            .expect("client should build")
+        };
+        for (name, limit, attempt, header, r, want) in [
+            ("no header: backoff minus a quarter", 2000, 0, None, 0.0, ms(75)),
+            ("no header: backoff plus a quarter", 2000, 0, None, 1.0, ms(125)),
+            ("no header: doubles per attempt", 2000, 2, None, 0.5, ms(400)),
+            ("no header: capped by max_delay_ms", 2000, 5, None, 0.5, ms(1000)),
+            ("no header: huge attempt saturates", 2000, 200, None, 0.5, ms(1000)),
+            ("malformed header falls back", 2000, 0, Some("soon"), 0.0, ms(75)),
+            ("seconds: never sooner than asked", 2000, 0, Some("1"), 0.0, ms(1000)),
+            ("seconds: at most a fifth later", 2000, 0, Some("1"), 1.0, ms(1200)),
+            ("HTTP date", 2000, 0, Some("Mon, 02 Nov 2026 12:00:01 GMT"), 0.0, ms(1000)),
+            ("backoff is the floor", 2000, 2, Some("0"), 0.0, ms(400)),
+            ("spread stops at the cap", 1100, 0, Some("1"), 1.0, ms(1100)),
+            ("long ask is cut to the cap", 2000, 0, Some("120"), 0.0, ms(2000)),
+            ("long ask spreads below the cap", 2000, 0, Some("120"), 1.0, ms(1600)),
+            ("cap 0 ignores the header", 0, 0, Some("120"), 0.0, ms(75)),
+        ] {
+            assert_eq!(client(limit).retry_wait(attempt, header, now, r), want, "{}", name);
+        }
+        assert_eq!(RetryConfig::default().max_retry_after_ms, Some(DEFAULT_MAX_RETRY_AFTER_MS));
+    }
+
+    fn paced(status: &'static str, retry_after: Option<&str>) -> Reply {
+        Reply::Paced { status, retry_after: retry_after.map(String::from) }
+    }
+
+    /// Runs one call through each retry policy: get is idempotent, exec is
+    /// re-sent only after a refusal.
+    fn get_or_exec(client: &Client, exec: bool) -> Result<(), Error> {
+        if exec {
+            client.exec("sb-1", ExecRequest::from("true")).map(|_| ())
+        } else {
+            client.get("sb-1").map(|_| ())
+        }
+    }
+
+    // With a 1 ms backoff, only the server's Retry-After explains a 1 s wait.
+    // The cases run side by side so the test takes about 2 s.
+    #[test]
+    fn retry_waits_out_retry_after_on_429_and_503() {
+        // Whole-second precision: the date asks for 1-2 s.
+        let in_two_seconds = format_imf_fixdate(SystemTime::now() + Duration::from_secs(2));
+        let cases = [
+            ("429 seconds", "429 Too Many Requests", "1".to_string(), 1000, 2000),
+            ("503 seconds", "503 Service Unavailable", "1".to_string(), 1000, 2000),
+            ("503 HTTP date", "503 Service Unavailable", in_two_seconds, 1000, 3000),
+        ];
+        let runs: Vec<_> = cases
+            .into_iter()
+            .flat_map(|(name, status, header, low, high)| {
+                [false, true].map(move |exec| {
+                    let header = header.clone();
+                    thread::spawn(move || {
+                        let ok = if exec { exec_ok_json() } else { named_sandbox_json("sb-1", "web").to_string() };
+                        let (url, hits) = spawn_scripted_server(vec![paced(status, Some(&header)), Reply::ok(ok)]);
+                        let started = std::time::Instant::now();
+                        let result = get_or_exec(&fast_retry_client(&url), exec);
+                        let elapsed = started.elapsed();
+                        assert!(result.is_ok(), "{} exec={}: {:?}", name, exec, result.err());
+                        assert_eq!(hits.load(Ordering::SeqCst), 2, "{} exec={}", name, exec);
+                        assert!(
+                            elapsed >= Duration::from_millis(low) && elapsed <= Duration::from_millis(high),
+                            "{} exec={}: retried after {:?}",
+                            name,
+                            exec,
+                            elapsed
+                        );
+                    })
+                })
+            })
+            .collect();
+        for run in runs {
+            run.join().expect("case should pass");
+        }
+    }
+
+    #[test]
+    fn retry_after_is_capped() {
+        let ok = named_sandbox_json("sb-1", "web").to_string();
+        let (url, hits) = spawn_scripted_server(vec![paced("503 Service Unavailable", Some("120")), Reply::ok(ok)]);
+        let client = Client::with_config(
+            ClientConfig {
+                api_url: Some(url),
+                pat_token: Some("pat-token".to_string()),
+                retry: Some(RetryConfig { max_retry_after_ms: Some(100), ..fast_retry_client("http://unused").retry_config }),
+                ..Default::default()
+            },
+            ApiVersion::V1,
+        )
+        .expect("client should build");
+        let started = std::time::Instant::now();
+        client.get("sb-1").expect("get should retry to success");
+        let elapsed = started.elapsed();
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        assert!(
+            elapsed >= Duration::from_millis(80) && elapsed <= Duration::from_secs(1),
+            "Retry-After: 120 with a 100 ms cap waited {:?}",
+            elapsed
+        );
+    }
+
+    // A missing or malformed header, or one on a status that is a hop's
+    // rather than the server's pacing (421/502/504), keeps the 1 ms backoff.
+    #[test]
+    fn retry_without_usable_retry_after_uses_backoff() {
+        for (status, header) in [
+            ("503 Service Unavailable", None),
+            ("429 Too Many Requests", Some("soon")),
+            ("503 Service Unavailable", Some("-1")),
+            ("421 Misdirected Request", Some("120")),
+            ("502 Bad Gateway", Some("120")),
+            ("504 Gateway Timeout", Some("120")),
+        ] {
+            let ok = named_sandbox_json("sb-1", "web").to_string();
+            let (url, hits) = spawn_scripted_server(vec![paced(status, header), Reply::ok(ok)]);
+            let started = std::time::Instant::now();
+            fast_retry_client(&url).get("sb-1").expect("get should retry to success");
+            assert_eq!(hits.load(Ordering::SeqCst), 2, "{} {:?}", status, header);
+            assert!(started.elapsed() < Duration::from_millis(500), "{} {:?}: {:?}", status, header, started.elapsed());
+        }
+    }
+
+    #[test]
+    fn retry_after_keeps_retry_budget_and_statuses() {
+        let (url, hits) = spawn_scripted_server(vec![paced("503 Service Unavailable", Some("0"))]);
+        let err = fast_retry_client(&url).get("sb-1").expect_err("every attempt is refused");
+        assert!(err.to_string().contains("503"), "unexpected error: {}", err);
+        assert_eq!(hits.load(Ordering::SeqCst), 4, "1 + 3 retries");
+
+        for status in ["400 Bad Request", "404 Not Found", "500 Internal Server Error"] {
+            let (url, hits) = spawn_scripted_server(vec![paced(status, Some("1"))]);
+            assert!(fast_retry_client(&url).get("sb-1").is_err(), "{}", status);
+            assert_eq!(hits.load(Ordering::SeqCst), 1, "{} is not retried", status);
+        }
+
+        let (url, hits) = spawn_scripted_server(vec![paced("502 Bad Gateway", Some("1"))]);
+        assert!(get_or_exec(&fast_retry_client(&url), true).is_err());
+        assert_eq!(hits.load(Ordering::SeqCst), 1, "exec does not re-send a 502");
     }
 
     // reqwest's 30 s default total timeout failed every exec longer than
@@ -5236,7 +5608,7 @@ mod tests {
                 api_url: Some(url.to_string()),
                 pat_token: Some("avm_admin".to_string()),
                 team: team.map(String::from),
-                retry: Some(RetryConfig { max_retries: Some(0), base_delay_ms: Some(1), max_delay_ms: Some(1) }),
+                retry: Some(RetryConfig { max_retries: Some(0), base_delay_ms: Some(1), max_delay_ms: Some(1), max_retry_after_ms: None }),
             },
             ApiVersion::V1,
         )

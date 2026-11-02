@@ -300,17 +300,21 @@ func pickFreeTCPPort(t *testing.T) int {
 	return port
 }
 
-// waitForLeader blocks until the cluster reports a leader, or fails the test.
+// waitForLeader blocks until the cluster reports a leader and its placement
+// view has caught up with that leader (catch_up.go), or fails the test. Tests
+// read the FSM right after this returns; before catch-up a page is
+// deliberately non-authoritative and the owner watcher deliberately idle.
 func waitForLeader(t *testing.T, c *Cluster, max time.Duration) {
 	t.Helper()
 	deadline := time.Now().Add(max)
 	for time.Now().Before(deadline) {
-		if c.Leader() != "" {
+		if c.Leader() != "" && c.PlacementViewCaughtUp() {
 			return
 		}
-		time.Sleep(100 * time.Millisecond)
+		time.Sleep(20 * time.Millisecond)
 	}
-	t.Fatalf("cluster %q never elected a leader within %s", c.SelfNodeID(), max)
+	t.Fatalf("cluster %q never elected a leader and caught up within %s (leader %q, caught up %v)",
+		c.SelfNodeID(), max, c.Leader(), c.PlacementViewCaughtUp())
 }
 
 // waitForFollowerToReachLeader blocks until follower can forward a write to

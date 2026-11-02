@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -609,9 +610,10 @@ func TestCreate_HappyPath(t *testing.T) {
 	if !f.vmm.started || !f.vmm.waited || f.vmm.shutdown {
 		t.Errorf("vmm started=%v waited=%v shutdown=%v; want true/true/false", f.vmm.started, f.vmm.waited, f.vmm.shutdown)
 	}
-	// Vsock handshake plus best-effort post-boot network reconfigure.
-	if f.vsock.dials != 2 {
-		t.Errorf("vsock dials = %d, want 2", f.vsock.dials)
+	// Vsock handshake, best-effort post-boot network reconfigure, and the
+	// mandatory adopt (guest_identity.go).
+	if f.vsock.dials != 3 {
+		t.Errorf("vsock dials = %d, want 3", f.vsock.dials)
 	}
 	// REST: machine config, boot source, drive, nic, vsock, action all set.
 	if f.client.mc == nil || f.client.mc.VcpuCount != 2 || f.client.mc.MemSizeMib != 256 {
@@ -619,6 +621,8 @@ func TestCreate_HappyPath(t *testing.T) {
 	}
 	if f.client.bs == nil || f.client.bs.KernelImagePath != f.kernel {
 		t.Errorf("BootSource wrong: %+v", f.client.bs)
+	} else if !strings.Contains(f.client.bs.BootArgs, guestNoIPv6Arg) {
+		t.Errorf("cold-boot args must turn guest IPv6 off: %q", f.client.bs.BootArgs)
 	}
 	if d, ok := f.client.drives[rootDriveID]; !ok || !d.IsRootDevice {
 		t.Errorf("root drive wrong: %+v", d)

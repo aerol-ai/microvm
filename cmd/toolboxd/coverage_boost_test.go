@@ -90,13 +90,21 @@ func TestNormalizeSandboxPath_ExtendedCases(t *testing.T) {
 func TestRequireAuth_WithAndWithoutToken(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
-	// No token configured → always allowed.
+	// No token configured → refused, even with a bearer header: an agent
+	// that holds no token fails closed instead of serving everyone.
 	sNoToken := &server{logger: logger, allowedPorts: map[int]struct{}{}}
-	rr := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodGet, "/health", nil)
-	if !sNoToken.requireAuth(rr, req) {
-		t.Fatal("requireAuth with no token should always return true")
+	for _, header := range []string{"", "Bearer ", "Bearer anything"} {
+		rr := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/health", nil)
+		if header != "" {
+			req.Header.Set("Authorization", header)
+		}
+		if sNoToken.requireAuth(rr, req) || rr.Code != http.StatusUnauthorized {
+			t.Fatalf("requireAuth with no token and header %q = allowed (status %d), want 401", header, rr.Code)
+		}
 	}
+	var rr *httptest.ResponseRecorder
+	var req *http.Request
 
 	// Token configured, no header → 401.
 	sWithToken := &server{logger: logger, authToken: "secret", allowedPorts: map[int]struct{}{}}
@@ -129,7 +137,7 @@ func TestRequireAuth_WithAndWithoutToken(t *testing.T) {
 func TestRoutesRootVersionHealth(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	s := &server{logger: logger, sandboxID: "testbox", allowedPorts: map[int]struct{}{}}
-	h := s.routes()
+	h := authedRoutes(s)
 
 	for _, tc := range []struct {
 		path string
@@ -154,7 +162,7 @@ func TestRoutesRootVersionHealth(t *testing.T) {
 func TestRoutesDefaultNotFound(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	s := &server{logger: logger, sandboxID: "sb-known", allowedPorts: map[int]struct{}{}}
-	h := s.routes()
+	h := authedRoutes(s)
 
 	// /sb-known/definitely/not/a/known/path doesn't strip to a known prefix.
 	// The router's default branch returns 404.
@@ -169,7 +177,7 @@ func TestRoutesDefaultNotFound(t *testing.T) {
 func TestRoutesCodeInterpreterNotImplemented(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	s := &server{logger: logger, authToken: "", allowedPorts: map[int]struct{}{}}
-	h := s.routes()
+	h := authedRoutes(s)
 
 	rr := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/process/interpreter/anything", nil)
@@ -378,7 +386,7 @@ func TestRequestedEnvdUsername_InvalidHeader(t *testing.T) {
 
 func TestEnvdFilesystemMakeDir_ConflictAndErrors(t *testing.T) {
 	srv := newEnvdTestServer(t)
-	h := srv.routes()
+	h := authedRoutes(srv)
 	root := t.TempDir()
 
 	// Create a directory that already exists → 409.
@@ -417,7 +425,7 @@ func TestEnvdFilesystemMakeDir_ConflictAndErrors(t *testing.T) {
 
 func TestEnvdFilesystemMove_Errors(t *testing.T) {
 	srv := newEnvdTestServer(t)
-	h := srv.routes()
+	h := authedRoutes(srv)
 
 	// Invalid JSON body → 400.
 	rr := httptest.NewRecorder()
@@ -441,7 +449,7 @@ func TestEnvdFilesystemMove_Errors(t *testing.T) {
 
 func TestEnvdFilesystemListDir_Errors(t *testing.T) {
 	srv := newEnvdTestServer(t)
-	h := srv.routes()
+	h := authedRoutes(srv)
 
 	// Invalid JSON.
 	rr := httptest.NewRecorder()
@@ -464,7 +472,7 @@ func TestEnvdFilesystemListDir_Errors(t *testing.T) {
 
 func TestEnvdFilesystemRemove_InvalidJSON(t *testing.T) {
 	srv := newEnvdTestServer(t)
-	h := srv.routes()
+	h := authedRoutes(srv)
 
 	rr := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, envdPrefix+"/filesystem.Filesystem/Remove", strings.NewReader("{bad"))
@@ -477,7 +485,7 @@ func TestEnvdFilesystemRemove_InvalidJSON(t *testing.T) {
 
 func TestEnvdFilesystemStat_InvalidJSON(t *testing.T) {
 	srv := newEnvdTestServer(t)
-	h := srv.routes()
+	h := authedRoutes(srv)
 
 	rr := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, envdPrefix+"/filesystem.Filesystem/Stat", strings.NewReader("{bad"))
@@ -490,7 +498,7 @@ func TestEnvdFilesystemStat_InvalidJSON(t *testing.T) {
 
 func TestEnvdRouteWatcherNotImplemented(t *testing.T) {
 	srv := newEnvdTestServer(t)
-	h := srv.routes()
+	h := authedRoutes(srv)
 
 	for _, path := range []string{
 		envdPrefix + "/filesystem.Filesystem/WatchDir",
@@ -511,7 +519,7 @@ func TestEnvdRouteWatcherNotImplemented(t *testing.T) {
 
 func TestEnvdOctetStreamWrite_MissingPath(t *testing.T) {
 	srv := newEnvdTestServer(t)
-	h := srv.routes()
+	h := authedRoutes(srv)
 
 	rr := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, envdPrefix+"/files", strings.NewReader("data"))
@@ -525,7 +533,7 @@ func TestEnvdOctetStreamWrite_MissingPath(t *testing.T) {
 
 func TestEnvdMultipartWrite_MissingFile(t *testing.T) {
 	srv := newEnvdTestServer(t)
-	h := srv.routes()
+	h := authedRoutes(srv)
 
 	var body bytes.Buffer
 	mw := multipart.NewWriter(&body)
@@ -547,7 +555,7 @@ func TestEnvdMultipartWrite_MissingFile(t *testing.T) {
 
 func TestEnvdFileRead_MissingPath(t *testing.T) {
 	srv := newEnvdTestServer(t)
-	h := srv.routes()
+	h := authedRoutes(srv)
 
 	rr := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, envdPrefix+"/files", nil)
@@ -560,7 +568,7 @@ func TestEnvdFileRead_MissingPath(t *testing.T) {
 
 func TestEnvdFileRead_NotFound(t *testing.T) {
 	srv := newEnvdTestServer(t)
-	h := srv.routes()
+	h := authedRoutes(srv)
 
 	rr := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, envdPrefix+"/files?path=/definitely/missing/file", nil)
@@ -573,7 +581,7 @@ func TestEnvdFileRead_NotFound(t *testing.T) {
 
 func TestEnvdProcessUpdate_InvalidJSON(t *testing.T) {
 	srv := newEnvdTestServer(t)
-	h := srv.routes()
+	h := authedRoutes(srv)
 
 	rr := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, envdPrefix+"/process.Process/Update", strings.NewReader("{bad"))
@@ -586,7 +594,7 @@ func TestEnvdProcessUpdate_InvalidJSON(t *testing.T) {
 
 func TestEnvdProcessSendSignal_InvalidJSON(t *testing.T) {
 	srv := newEnvdTestServer(t)
-	h := srv.routes()
+	h := authedRoutes(srv)
 
 	rr := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, envdPrefix+"/process.Process/SendSignal", strings.NewReader("{bad"))
@@ -599,7 +607,7 @@ func TestEnvdProcessSendSignal_InvalidJSON(t *testing.T) {
 
 func TestEnvdProcessCloseStdin_InvalidJSON(t *testing.T) {
 	srv := newEnvdTestServer(t)
-	h := srv.routes()
+	h := authedRoutes(srv)
 
 	rr := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, envdPrefix+"/process.Process/CloseStdin", strings.NewReader("{bad"))
@@ -613,7 +621,7 @@ func TestEnvdProcessCloseStdin_InvalidJSON(t *testing.T) {
 func TestEnvdProcessList_NoSessions(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	srv := &server{logger: logger, authToken: "", allowedPorts: map[int]struct{}{}, envd: newEnvdCompat()}
-	h := srv.routes()
+	h := authedRoutes(srv)
 
 	rr := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, envdPrefix+"/process.Process/List", strings.NewReader("{}"))
@@ -626,7 +634,7 @@ func TestEnvdProcessList_NoSessions(t *testing.T) {
 func TestEnvdProcessStart_NoSessions(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	srv := &server{logger: logger, authToken: "", allowedPorts: map[int]struct{}{}, envd: newEnvdCompat()}
-	h := srv.routes()
+	h := authedRoutes(srv)
 
 	payload := []byte(`{"process":{"cmd":"/bin/sh"}}`)
 	rr := httptest.NewRecorder()
@@ -640,7 +648,7 @@ func TestEnvdProcessStart_NoSessions(t *testing.T) {
 
 func TestEnvdProcessStart_MissingCmd(t *testing.T) {
 	srv := newEnvdTestServer(t)
-	h := srv.routes()
+	h := authedRoutes(srv)
 
 	payload := []byte(`{"process":{"cmd":""}}`)
 	rr := httptest.NewRecorder()
@@ -959,7 +967,7 @@ func TestSessionAttach_ReplayAndExit(t *testing.T) {
 func TestSessionAttach_SessionsDisabled(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	srv := &server{logger: logger, allowedPorts: map[int]struct{}{}}
-	h := srv.routes()
+	h := authedRoutes(srv)
 
 	rr := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/sessions/abc/attach", nil)
@@ -971,7 +979,7 @@ func TestSessionAttach_SessionsDisabled(t *testing.T) {
 
 func TestSessionsRoute_SessionDeleteNotFound(t *testing.T) {
 	srv := newDaytonaTestServer(t)
-	h := srv.routes()
+	h := authedRoutes(srv)
 
 	rr := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodDelete, "/sessions/nonexistent-id", nil)
@@ -983,7 +991,7 @@ func TestSessionsRoute_SessionDeleteNotFound(t *testing.T) {
 
 func TestSessionsRoute_MethodNotAllowedOnSessionID(t *testing.T) {
 	srv := newDaytonaTestServer(t)
-	h := srv.routes()
+	h := authedRoutes(srv)
 
 	createReq := httptest.NewRequest(http.MethodPost, "/sessions",
 		strings.NewReader(`{"name":"mna-test","command":"printf x"}`))
@@ -1002,7 +1010,7 @@ func TestSessionsRoute_MethodNotAllowedOnSessionID(t *testing.T) {
 
 func TestSessionsRoute_MethodNotAllowedOnActions(t *testing.T) {
 	srv := newDaytonaTestServer(t)
-	h := srv.routes()
+	h := authedRoutes(srv)
 
 	createReq := httptest.NewRequest(http.MethodPost, "/sessions",
 		strings.NewReader(`{"name":"mna-action","command":"printf x"}`))
@@ -1049,7 +1057,7 @@ func TestSessionsRoute_SessionIDRequired(t *testing.T) {
 
 func TestSessionsRoute_SignalMissingSession(t *testing.T) {
 	srv := newDaytonaTestServer(t)
-	h := srv.routes()
+	h := authedRoutes(srv)
 
 	rr := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/sessions/nope/signal",
@@ -1062,7 +1070,7 @@ func TestSessionsRoute_SignalMissingSession(t *testing.T) {
 
 func TestSessionsRoute_ResizeMissingSession(t *testing.T) {
 	srv := newDaytonaTestServer(t)
-	h := srv.routes()
+	h := authedRoutes(srv)
 
 	rr := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/sessions/nope/resize",
@@ -1075,7 +1083,7 @@ func TestSessionsRoute_ResizeMissingSession(t *testing.T) {
 
 func TestSessionsRoute_LogMissingSession(t *testing.T) {
 	srv := newDaytonaTestServer(t)
-	h := srv.routes()
+	h := authedRoutes(srv)
 
 	rr := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/sessions/nope/log", nil)
@@ -1087,7 +1095,7 @@ func TestSessionsRoute_LogMissingSession(t *testing.T) {
 
 func TestSessionsRoute_RecordingMissingSession(t *testing.T) {
 	srv := newDaytonaTestServer(t)
-	h := srv.routes()
+	h := authedRoutes(srv)
 
 	rr := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/sessions/nope/recording", nil)
@@ -1196,7 +1204,7 @@ func TestWriteCodeRunScript_Success(t *testing.T) {
 
 func TestHandleDaytonaListFiles_NotFoundPath(t *testing.T) {
 	srv := newDaytonaTestServer(t)
-	h := srv.routes()
+	h := authedRoutes(srv)
 
 	rr := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/files?path=/definitely/missing/dir", nil)
@@ -1208,7 +1216,7 @@ func TestHandleDaytonaListFiles_NotFoundPath(t *testing.T) {
 
 func TestHandleDaytonaMoveFile_MissingSource(t *testing.T) {
 	srv := newDaytonaTestServer(t)
-	h := srv.routes()
+	h := authedRoutes(srv)
 
 	rr := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/files/move?source=/missing/src&destination=/tmp/dest", nil)
@@ -1220,7 +1228,7 @@ func TestHandleDaytonaMoveFile_MissingSource(t *testing.T) {
 
 func TestHandleDaytonaGitAdd_InvalidJSON(t *testing.T) {
 	srv := newDaytonaTestServer(t)
-	h := srv.routes()
+	h := authedRoutes(srv)
 
 	rr := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/git/add", strings.NewReader("{bad"))
@@ -1232,7 +1240,7 @@ func TestHandleDaytonaGitAdd_InvalidJSON(t *testing.T) {
 
 func TestHandleDaytonaGitCheckout_InvalidJSON(t *testing.T) {
 	srv := newDaytonaTestServer(t)
-	h := srv.routes()
+	h := authedRoutes(srv)
 
 	rr := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/git/checkout", strings.NewReader("{bad"))
@@ -1244,7 +1252,7 @@ func TestHandleDaytonaGitCheckout_InvalidJSON(t *testing.T) {
 
 func TestHandleDaytonaGitCheckout_EmptyBranch(t *testing.T) {
 	srv := newDaytonaTestServer(t)
-	h := srv.routes()
+	h := authedRoutes(srv)
 	repo := initGitRepo(t)
 
 	rr := httptest.NewRecorder()
@@ -1258,7 +1266,7 @@ func TestHandleDaytonaGitCheckout_EmptyBranch(t *testing.T) {
 
 func TestHandleDaytonaGitClone_InvalidJSON(t *testing.T) {
 	srv := newDaytonaTestServer(t)
-	h := srv.routes()
+	h := authedRoutes(srv)
 
 	rr := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/git/clone", strings.NewReader("{bad"))
@@ -1270,7 +1278,7 @@ func TestHandleDaytonaGitClone_InvalidJSON(t *testing.T) {
 
 func TestHandleDaytonaGitClone_EmptyURL(t *testing.T) {
 	srv := newDaytonaTestServer(t)
-	h := srv.routes()
+	h := authedRoutes(srv)
 
 	rr := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/git/clone",
@@ -1283,7 +1291,7 @@ func TestHandleDaytonaGitClone_EmptyURL(t *testing.T) {
 
 func TestHandleDaytonaGitCommit_InvalidJSON(t *testing.T) {
 	srv := newDaytonaTestServer(t)
-	h := srv.routes()
+	h := authedRoutes(srv)
 
 	rr := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/git/commit", strings.NewReader("{bad"))
@@ -1295,7 +1303,7 @@ func TestHandleDaytonaGitCommit_InvalidJSON(t *testing.T) {
 
 func TestHandleDaytonaGitCreateBranch_InvalidJSON(t *testing.T) {
 	srv := newDaytonaTestServer(t)
-	h := srv.routes()
+	h := authedRoutes(srv)
 
 	rr := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/git/branches", strings.NewReader("{bad"))
@@ -1307,7 +1315,7 @@ func TestHandleDaytonaGitCreateBranch_InvalidJSON(t *testing.T) {
 
 func TestHandleDaytonaGitCreateBranch_EmptyName(t *testing.T) {
 	srv := newDaytonaTestServer(t)
-	h := srv.routes()
+	h := authedRoutes(srv)
 	repo := initGitRepo(t)
 
 	rr := httptest.NewRecorder()
@@ -1321,7 +1329,7 @@ func TestHandleDaytonaGitCreateBranch_EmptyName(t *testing.T) {
 
 func TestHandleDaytonaGitDeleteBranch_EmptyName(t *testing.T) {
 	srv := newDaytonaTestServer(t)
-	h := srv.routes()
+	h := authedRoutes(srv)
 	repo := initGitRepo(t)
 
 	rr := httptest.NewRecorder()
@@ -1335,7 +1343,7 @@ func TestHandleDaytonaGitDeleteBranch_EmptyName(t *testing.T) {
 
 func TestHandleDaytonaGitDeleteBranch_InvalidJSON(t *testing.T) {
 	srv := newDaytonaTestServer(t)
-	h := srv.routes()
+	h := authedRoutes(srv)
 
 	rr := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodDelete, "/git/branches", strings.NewReader("{bad"))
@@ -1347,7 +1355,7 @@ func TestHandleDaytonaGitDeleteBranch_InvalidJSON(t *testing.T) {
 
 func TestHandleDaytonaGitHistory_InvalidPath(t *testing.T) {
 	srv := newDaytonaTestServer(t)
-	h := srv.routes()
+	h := authedRoutes(srv)
 
 	rr := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/git/history", nil)
@@ -1359,7 +1367,7 @@ func TestHandleDaytonaGitHistory_InvalidPath(t *testing.T) {
 
 func TestHandleDaytonaGitListBranches_InvalidPath(t *testing.T) {
 	srv := newDaytonaTestServer(t)
-	h := srv.routes()
+	h := authedRoutes(srv)
 
 	rr := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/git/branches", nil)
@@ -1371,7 +1379,7 @@ func TestHandleDaytonaGitListBranches_InvalidPath(t *testing.T) {
 
 func TestHandleDaytonaFindInFiles_MissingPattern(t *testing.T) {
 	srv := newDaytonaTestServer(t)
-	h := srv.routes()
+	h := authedRoutes(srv)
 
 	rr := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/files/find?path=/tmp", nil)

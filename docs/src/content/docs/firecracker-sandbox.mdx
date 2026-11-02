@@ -234,6 +234,9 @@ This sandbox gets 2 CPU cores and 1 GB of memory. It stops after 30 idle minutes
 
 - **Memory is reserved up front.** A container uses memory only as it needs it. A Firecracker VM takes its full `memoryMB` the moment it starts. Ask only for what the program needs.
 - **Stop saves the whole VM.** Stopping writes the VM's memory and disks to the server's disk. Start brings it back with the same internal IP address. Delete removes the saved copy.
+- **Environment variables work as on a container.** Every command, terminal, SSH session and process in the VM sees the `env` you set at create, and a command's own `env` still wins. The server hands the values to the agent in the VM over vsock right after it boots. They are held in memory there and never written to the VM's disk. Like anything in memory, they are part of what Stop saves. See [Environment variables](/sandbox-env/).
+- **Re-create templates built by an older release.** A template's disk holds the copy of the VM agent it was built with. An agent from before this release cannot take variables, and cannot take the sandbox's token either, which it needs before it answers any call. A create from such a template fails with `rebuild the template` instead of starting a sandbox that would answer without a token. [Delete the template and create it again](/firecracker-templates/#delete-a-template); a rebuild is not enough, because it reuses the same disk.
+- **Sandboxes stopped by an older release may not start.** Start restores the saved memory, including the agent that was running. If that agent is too old to take the sandbox's token, Start fails with `destroy it and create a new one`.
 - **No resizing yet.** Changing CPU or memory on a running Firecracker sandbox fails with `not yet implemented`. Create a new sandbox with the size you need.
 - **No GPU.** Firecracker VMs cannot use the server's GPU.
 

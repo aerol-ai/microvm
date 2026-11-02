@@ -273,7 +273,7 @@ func TestSessionAttachRoundTripBinaryFrames(t *testing.T) {
 func TestRoutesDispatchSmoke(t *testing.T) {
 	srv := newEnvdTestServer(t)
 	srv.authToken = "route-token"
-	h := srv.routes()
+	h := authedRoutes(srv)
 
 	type reqSpec struct {
 		method string

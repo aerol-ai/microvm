@@ -56,6 +56,10 @@ type Cipher struct {
 type keyRing struct {
 	current uint32
 	keys    map[uint32]cipher.AEAD
+	// digestKeys are each key's derived digest key (digest.go), kept here so
+	// the raw key need not be: a ring change derives one for a new key and
+	// carries the rest over, and a revoke drops them with the AEADs.
+	digestKeys map[uint32][]byte
 }
 
 // keyIDMarker starts a sealed blob that names its key:
@@ -110,7 +114,7 @@ func newGCM(key []byte) (cipher.AEAD, error) {
 }
 
 func (c *Cipher) buildRing(keys []RingKey, prev *keyRing) (*keyRing, map[uint32][]byte, error) {
-	ring := &keyRing{keys: map[uint32]cipher.AEAD{}}
+	ring := &keyRing{keys: map[uint32]cipher.AEAD{}, digestKeys: map[uint32][]byte{}}
 	checks := map[uint32][]byte{}
 	currents := 0
 	for _, k := range keys {
@@ -122,6 +126,7 @@ func (c *Cipher) buildRing(keys []RingKey, prev *keyRing) (*keyRing, map[uint32]
 				return nil, nil, fmt.Errorf("server-key ring: key id %d is not loaded on this node", k.ID)
 			}
 			ring.keys[k.ID] = prev.keys[k.ID]
+			ring.digestKeys[k.ID] = prev.digestKeys[k.ID]
 			checks[k.ID] = c.checks[k.ID]
 			if k.Current {
 				ring.current = k.ID
@@ -137,7 +142,12 @@ func (c *Cipher) buildRing(keys []RingKey, prev *keyRing) (*keyRing, map[uint32]
 		if err != nil {
 			return nil, nil, err
 		}
+		digestKey, err := deriveDigestKey(k.Key)
+		if err != nil {
+			return nil, nil, err
+		}
 		ring.keys[k.ID] = gcm
+		ring.digestKeys[k.ID] = digestKey
 		checks[k.ID] = check
 		if k.Current {
 			ring.current = k.ID
@@ -278,11 +288,11 @@ func (c *Cipher) Reseal(sealed, aad []byte) (out []byte, from uint32, changed bo
 	return out, from, true, nil
 }
 
-// SealedKeyID names the key a blob says it was sealed with, without opening
+// sealedKeyID names the key a blob says it was sealed with, without opening
 // it: the id after the marker, or 0 (legacy) for a blob without one. A
 // legacy blob that happens to start with the marker reads as another id;
 // open it to be sure.
-func SealedKeyID(sealed []byte) uint32 {
+func sealedKeyID(sealed []byte) uint32 {
 	if len(sealed) > keyIDHeaderLen && sealed[0] == keyIDMarker {
 		return binary.BigEndian.Uint32(sealed[1:keyIDHeaderLen])
 	}

@@ -14,9 +14,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/aws/aws-sdk-go-v2/service/s3"
-
 	"github.com/aerol-ai/microvm/pkg/auditexport"
 	"github.com/aerol-ai/microvm/pkg/auditlog"
 	"github.com/aerol-ai/microvm/pkg/auditwitness"
@@ -57,6 +54,9 @@ type auditVerifyOptions struct {
 	since     time.Time
 	maxLag    time.Duration
 	s3        auditexport.S3Config
+	// fetchConcurrency is how many export batches one node's walk
+	// downloads from S3 at once.
+	fetchConcurrency int
 }
 
 type s3Location struct{ bucket, prefix string }
@@ -96,6 +96,7 @@ func runAuditVerify(ctx context.Context, a *app, args []string) int {
 		region, endpoint                           string
 		pathStyle                                  bool
 		maxLag                                     = auditVerifyDefaultMaxLag
+		fetch                                      = auditFetchDefaultConcurrency
 		locals, nodes                              stringList
 	)
 	fs.StringVar(&witnessURL, "witness", "", "")
@@ -103,6 +104,7 @@ func runAuditVerify(ctx context.Context, a *app, args []string) int {
 	fs.StringVar(&exportDir, "export-dir", "", "")
 	fs.StringVar(&sinceRaw, "since", "", "")
 	fs.DurationVar(&maxLag, "max-lag", maxLag, "")
+	fs.IntVar(&fetch, "fetch-concurrency", fetch, "")
 	fs.Var(&locals, "local", "")
 	fs.Var(&nodes, "node", "")
 	fs.StringVar(&region, "region", "", "")
@@ -116,7 +118,7 @@ func runAuditVerify(ctx context.Context, a *app, args []string) int {
 		return a.usageError(c, verbName, "unexpected argument %q", pos[0])
 	}
 	now := time.Now().UTC()
-	opts := auditVerifyOptions{nodes: nodes, maxLag: maxLag, exportDir: exportDir}
+	opts := auditVerifyOptions{nodes: nodes, maxLag: maxLag, exportDir: exportDir, fetchConcurrency: fetch}
 	switch {
 	case witnessURL == "":
 		return a.usageError(c, verbName, "--witness is required")
@@ -126,6 +128,8 @@ func runAuditVerify(ctx context.Context, a *app, args []string) int {
 		return a.usageError(c, verbName, "give exactly one of --export or --export-dir")
 	case maxLag < 0:
 		return a.usageError(c, verbName, "--max-lag must not be negative")
+	case badFetchConcurrency(fetch):
+		return a.usageError(c, verbName, "%s", fetchConcurrencyUsage)
 	}
 	if opts.witness, err = parseS3URL("witness", witnessURL); err != nil {
 		return a.usageError(c, verbName, "%v", err)
@@ -145,9 +149,11 @@ func runAuditVerify(ctx context.Context, a *app, args []string) int {
 	}
 	opts.s3 = auditexport.S3Config{Region: region, Endpoint: endpoint, PathStyle: pathStyle}
 
+	ctx, received, stop := a.notifySignals(ctx)
+	defer stop()
 	report, err := verifyAudit(ctx, opts, now)
 	if err != nil {
-		return a.fail(c, err, exitError)
+		return a.fail(c, err, auditErrorExit(received))
 	}
 	if c.json {
 		a.printJSON(report)
@@ -162,6 +168,23 @@ func runAuditVerify(ctx context.Context, a *app, args []string) int {
 	default:
 		return exitError
 	}
+}
+
+// fetchConcurrencyUsage is the usage error for a --fetch-concurrency out of
+// range, shared by every verb that reads the export.
+var fetchConcurrencyUsage = fmt.Sprintf("--fetch-concurrency must be between 1 and %d", auditFetchMaxConcurrency)
+
+func badFetchConcurrency(n int) bool { return n < 1 || n > auditFetchMaxConcurrency }
+
+// auditErrorExit is the exit code for a walk that ended in an error: 128+n
+// when Ctrl-C (or SIGTERM) stopped it, so a script can tell an interrupted
+// check from a failed one. Either way the spool is gone by then: the walk
+// cancels its downloads and removes their files on the way out.
+func auditErrorExit(received func() os.Signal) int {
+	if sig := received(); sig != nil {
+		return signalExit(sig)
+	}
+	return exitError
 }
 
 // parseLocals reads --local node=path (or a bare path when exactly one
@@ -218,7 +241,7 @@ func verifyAudit(ctx context.Context, opts auditVerifyOptions, now time.Time) (a
 			return report, err
 		}
 		export = func() (auditlog.ExportSource, func(), error) {
-			return newS3Export(client, opts.export.bucket, opts.export.prefix, now)
+			return newS3Export(client, opts.export.bucket, opts.export.prefix, now, opts.fetchConcurrency)
 		}
 	} else {
 		export = func() (auditlog.ExportSource, func(), error) {
@@ -307,106 +330,6 @@ func printAuditReport(w io.Writer, r auditReport) {
 			fmt.Fprintf(w, "  note: %s\n", warn)
 		}
 	}
-}
-
-// s3Export reads an S3 export a day at a time. A day's batches are spooled
-// to a temporary directory on first read, because the verifier reads each
-// batch twice (once for its ends, once to walk it) and a busy node ships
-// thousands a day; the spool is dropped when the next day starts.
-type s3Export struct {
-	api            *s3.Client
-	bucket, prefix string
-	now            time.Time
-	dir            string
-	day            string
-	spooled        map[string]string
-}
-
-func newS3Export(api *s3.Client, bucket, prefix string, now time.Time) (auditlog.ExportSource, func(), error) {
-	dir, err := os.MkdirTemp("", "aerolvm-audit-verify-")
-	if err != nil {
-		return nil, nil, err
-	}
-	e := &s3Export{api: api, bucket: bucket, prefix: prefix, now: now, dir: dir}
-	return e, func() { _ = os.RemoveAll(dir) }, nil
-}
-
-// Days walks the calendar rather than listing: the layout puts each day
-// under its own prefix, so an empty day costs one empty list.
-func (e *s3Export) Days(_ context.Context, _, from string) ([]string, error) {
-	return calendarDays(from, e.now)
-}
-
-func (e *s3Export) Batches(ctx context.Context, nodeID, day string) ([]string, error) {
-	if err := e.startDay(day); err != nil {
-		return nil, err
-	}
-	t, err := time.Parse("2006-01-02", day)
-	if err != nil {
-		return nil, err
-	}
-	prefix := auditexport.DayPrefix(e.prefix, nodeID, t)
-	in := &s3.ListObjectsV2Input{Bucket: aws.String(e.bucket), Prefix: aws.String(prefix)}
-	var names []string
-	for {
-		out, err := e.api.ListObjectsV2(ctx, in)
-		if err != nil {
-			return nil, fmt.Errorf("list s3://%s/%s: %w", e.bucket, prefix, err)
-		}
-		for _, o := range out.Contents {
-			if name := strings.TrimPrefix(aws.ToString(o.Key), prefix); strings.HasSuffix(name, ".jsonl") {
-				names = append(names, name)
-			}
-		}
-		if !aws.ToBool(out.IsTruncated) {
-			break
-		}
-		in.ContinuationToken = out.NextContinuationToken
-	}
-	return names, nil
-}
-
-func (e *s3Export) startDay(day string) error {
-	if day == e.day {
-		return nil
-	}
-	for _, f := range e.spooled {
-		_ = os.Remove(f)
-	}
-	e.day, e.spooled = day, map[string]string{}
-	return nil
-}
-
-func (e *s3Export) Open(ctx context.Context, nodeID, day, name string) (io.ReadCloser, error) {
-	if f, ok := e.spooled[name]; ok && day == e.day {
-		return os.Open(f)
-	}
-	t, err := time.Parse("2006-01-02", day)
-	if err != nil {
-		return nil, err
-	}
-	key := auditexport.DayPrefix(e.prefix, nodeID, t) + name
-	out, err := e.api.GetObject(ctx, &s3.GetObjectInput{Bucket: aws.String(e.bucket), Key: aws.String(key)})
-	if err != nil {
-		return nil, fmt.Errorf("read s3://%s/%s: %w", e.bucket, key, err)
-	}
-	defer out.Body.Close()
-	f, err := os.CreateTemp(e.dir, "batch-")
-	if err != nil {
-		return nil, err
-	}
-	if _, err := io.Copy(f, out.Body); err != nil {
-		_ = f.Close()
-		return nil, fmt.Errorf("read s3://%s/%s: %w", e.bucket, key, err)
-	}
-	if _, err := f.Seek(0, io.SeekStart); err != nil {
-		_ = f.Close()
-		return nil, err
-	}
-	if day == e.day {
-		e.spooled[name] = f.Name()
-	}
-	return f, nil
 }
 
 // dirExport reads batches saved from a webhook or bus receiver, laid out

@@ -227,6 +227,17 @@ func (d *Driver) Inspect(ctx context.Context, sandboxID string) (*models.Sandbox
 	return d.runtimeState(inst), nil
 }
 
+// ManagedCount is how many WASM sandboxes this driver holds, without
+// ListManaged's per-instance worker probe. The capacity heartbeat reads it
+// to advertise free instances under SB_WASM_MAX_INSTANCES; it may count an
+// instance whose worker just died, which only makes the advertisement
+// conservative until the next refresh.
+func (d *Driver) ManagedCount() int {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return len(d.byID)
+}
+
 func (d *Driver) ListManaged(ctx context.Context) (map[string]*models.SandboxRuntimeState, error) {
 	d.mu.Lock()
 	instances := make(map[string]*sandboxInstance, len(d.byID))

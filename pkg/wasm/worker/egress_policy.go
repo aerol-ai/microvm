@@ -203,6 +203,18 @@ func (m *NetMediator) stopOperatorWatch() {
 	}
 }
 
+// nodeCheck refuses the node's own addresses (egresspolicy.CheckNode). A
+// var so this package's tests, whose servers listen on loopback, can stand
+// in a node that does not own it.
+var nodeCheck = egresspolicy.CheckNode
+
+// loadNodeAllowedPorts takes the node ports sandboxd lets host-mediated
+// sandboxes reach from the environment it starts workers with. Unset
+// allows none.
+func loadNodeAllowedPorts() {
+	egresspolicy.SetNodeAllowedPorts(egresspolicy.ParseNodePorts(os.Getenv(egresspolicy.NodePortsEnv)))
+}
+
 func (m *NetMediator) dialGuard() egresspolicy.DialGuard {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -266,6 +278,11 @@ func policyMatch(p *egresspolicy.Policy, d connDest) (allowed bool, rule string)
 // file unreadable" posture: the floor is unknown, so the whole strict guard
 // applies (fail closed, as for policy dials).
 func openCheck(g egresspolicy.DialGuard, name string, addr netip.AddrPort) error {
+	// The node itself first: no policy, no operator file and no guard
+	// posture makes the node a destination (egresspolicy.CheckNode).
+	if err := nodeCheck(addr); err != nil {
+		return err
+	}
 	if g.Strict {
 		return g.Check(nil, egresspolicy.DialTarget{Name: name, Addr: addr})
 	}
@@ -307,9 +324,11 @@ func remoteAddr(c net.Conn) netip.AddrPort {
 	return netip.AddrPort{}
 }
 
-// openDial dials for a sandbox with no policy. With no operator guard it is
-// today's plain dial to any destination, byte for byte (no Control hook at
-// all). With one, every resolved address goes through openCheck first.
+// openDial dials for a sandbox with no policy. Every resolved address goes
+// through openCheck first, with or without an operator guard: the node
+// itself and the cloud metadata endpoints are refused for every sandbox
+// (with no operator file the hook used to be skipped, which left both
+// reachable from a no-policy WASM sandbox).
 //
 // It never routes through the operator's upstream proxy, even for a name
 // the proxy would carry: the proxy is part of the policy path (it serves
@@ -322,10 +341,9 @@ func (m *NetMediator) openDial(ctx context.Context, network, address string) (ne
 		// Let the dialer report the bad address, as it always has.
 		dest = connDest{host: address}
 	}
-	d := net.Dialer{Timeout: 30 * time.Second}
-	if g := m.dialGuard(); g.Strict || len(g.DenyFloor) > 0 {
-		d.Control = egresspolicy.ControlHook(func(ap netip.AddrPort) error { return openCheck(g, dest.name, ap) })
-	}
+	g := m.dialGuard()
+	d := net.Dialer{Timeout: 30 * time.Second,
+		Control: egresspolicy.ControlHook(func(ap netip.AddrPort) error { return openCheck(g, dest.name, ap) })}
 	conn, err := d.DialContext(ctx, network, address)
 	if err != nil {
 		if errors.Is(err, egresspolicy.ErrDialRefused) {

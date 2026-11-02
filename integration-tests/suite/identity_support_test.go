@@ -125,7 +125,7 @@ func tokenWaitBase(t *testing.T, node harness.IntegrationNode) string {
 // and an avm_ token goes in the SDK's token field like a PAT does.
 func sdkFor(t *testing.T, bearer string) *microvm.Client {
 	t.Helper()
-	c, err := microvm.NewClientWithConfig(&sdktypes.MicroVMConfig{APIUrl: sc.BaseURL, PATToken: bearer})
+	c, err := microvm.NewClientWithConfig(&sdktypes.MicroVMConfig{APIUrl: sc.BaseURL, PATToken: bearer, HTTPClient: harness.HTTPClient(0)})
 	if err != nil {
 		t.Fatalf("SDK client: %v", err)
 	}

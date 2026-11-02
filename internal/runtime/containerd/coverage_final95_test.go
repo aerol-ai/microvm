@@ -439,7 +439,7 @@ func TestResizeMinimumCPUQuotaFinal95(t *testing.T) {
 }
 
 func TestResourceSpecOptsMemoryOnlyFinal95(t *testing.T) {
-	opts := resourceSpecOpts(models.CreateSandboxRequest{MemoryMB: 128})
+	opts := resourceSpecOpts(models.CreateSandboxRequest{MemoryMB: 128}, 0)
 	if len(opts) != 1 {
 		t.Fatalf("opts=%d", len(opts))
 	}

@@ -336,6 +336,51 @@ What each node's status means:
 
 To check that your code can reach the cluster, point an SDK at `https://cluster.example.com`. See [SDK setup](/sdk-setup/).
 
+## Put a load balancer in front
+
+By default, Terraform gives your domain one DNS record for each ingress node. This is called DNS round-robin: each client picks one of the nodes. It costs nothing, but it has a weak spot.
+
+Say the AerolVM server on one node stops: it crashed, or you are restarting or upgrading it. Caddy, the web server in front of it on the same node, keeps running. A client sent to that node still connects, so it does not try another node. It gets error `502` until the server is back. With three ingress nodes, about one call in three fails for that whole time.
+
+A **load balancer** fixes this. It sits in front of the ingress nodes and checks each one every 5 seconds. After two failed checks, about 10 seconds after the server stops, it sends no new connections to that node. After two passed checks, it sends them again.
+
+| | DNS round-robin (`none`, the default) | Load balancer (`nlb`) |
+|---|---|---|
+| The AerolVM server stops on one node | Its share of calls get `502` until it is back | Calls to it fail for about 10 seconds, then none do |
+| What your domain points at | Every ingress node | The load balancer's one fixed IP address |
+| Raw TCP port addresses | `tcp://cluster.example.com:22017` | `tcp://tcp.cluster.example.com:22017` |
+| Extra AWS cost | None | One Network Load Balancer and one Elastic IP |
+
+Use the load balancer for production. A bank or anyone with an uptime promise should turn it on.
+
+### Turn it on
+
+Add this line to `config/terraform.tfvars`, then run `scripts/terraform.sh apply`:
+
+```hcl
+api_load_balancer = "nlb"
+```
+
+<Aside type="caution" title="Choose it when you create the cluster">
+The setting changes the setup script of every node. On a running cluster, Terraform then replaces every node, and the sandboxes on them are lost. Turn it on before the first `apply`.
+</Aside>
+
+When `apply` finishes, this shows the load balancer's address and the name raw TCP ports now use:
+
+```bash
+scripts/terraform.sh output api_load_balancer
+```
+
+### What it sets up
+
+- **An AWS Network Load Balancer that passes connections through.** It does not open them. Caddy on each node still holds your certificates, and [TLS ports](/tcp-vs-tls-ports/) keep working.
+- **The caller's real IP address reaches AerolVM.** Audit records and limits see the client, not the load balancer.
+- **Ports 80, 443 and the SSH gateway (2220) go through it.** Raw TCP ports do not: an AWS Network Load Balancer takes at most 50 ports, and the pool is about 1,000. So raw TCP goes straight to the nodes under `tcp.<your domain>`, which keeps one DNS record per node. These connections do not pass through the AerolVM server, so they keep working while it restarts.
+- **A health check that follows a user's path.** Each ingress node answers the check on port `21280` (change it with `api_lb_health_check_port`). The check goes through Caddy on port 443 to the AerolVM server, so it fails when any part of that path is down. Only the load balancer can reach this port.
+- **Open connections stay open.** When a node leaves, only new connections go elsewhere. A connection to a sandbox's port is relayed by Caddy, not by the AerolVM server, so it keeps working while the server restarts.
+
+Your domain stops pointing at the nodes, but they keep their public IP addresses and still answer on them. `admin_allowed_cidrs` works as before.
+
 ## Tear down
 
 To delete the whole cluster and every AWS resource it made:
@@ -350,7 +395,7 @@ This deletes every EC2 instance, VPC and S3 bucket in the cluster, and every run
 
 ## Good to know
 
-- **Lock down SSH and the API.** By default, `admin_allowed_cidrs` lets any address reach SSH (port 22) and the API (port 21212). Set it to your own IP ranges in `config/terraform.tfvars`.
+- **Lock down SSH and the API.** `admin_allowed_cidrs` is required: set it to your own IP ranges in `config/terraform.tfvars`. It decides who outside the VPC can reach SSH (port 22) and the API (port 21212). A world-open range (`0.0.0.0/0`) is refused unless you also set `allow_admin_from_anywhere = true`.
 - **Keep `config/secrets.yml` private.** It holds your cluster token and your Cloudflare token.
 - **Node names are limited.** Each name in `nodes` must start with a letter or number. It may use only letters, numbers, dots, underscores and hyphens, up to 128 characters.
 

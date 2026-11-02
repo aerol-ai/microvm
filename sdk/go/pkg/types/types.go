@@ -162,7 +162,8 @@ type NetworkPolicyOptions = models.NetworkPolicyRequest
 
 // NetworkPolicy is the policy a sandbox enforces after SetNetworkPolicy, with
 // EgressStatus ("active", "held", "unavailable") for hostname rules on a
-// container.
+// container, or "unenforced" when the server's firewall is off and nothing
+// filters the sandbox.
 type NetworkPolicy = models.NetworkPolicy
 
 // NetworkLearned is what a sandbox reached in learn mode and the allow list

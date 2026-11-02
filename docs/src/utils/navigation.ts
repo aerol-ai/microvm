@@ -12,6 +12,9 @@ export interface NavigationLink extends NavigationItem {
   description?: string
   external?: boolean
   exact?: boolean
+  // Anchors inside this page, listed under it in a list that starts closed.
+  // They are not pages, so pagination and Explore More skip them.
+  children?: NavigationLink[]
 }
 
 export interface NavigationGroup extends NavigationItem {

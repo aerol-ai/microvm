@@ -53,7 +53,12 @@ type internalServer struct {
 	// extra is loaded atomically so AttachInternalHandler is lock-free for
 	// the hot path (every incoming forward reads it once per request).
 	extra atomic.Pointer[http.Handler]
+	// readIndex answers InternalReadIndexPath (catch_up.go): the leader half
+	// of a restarted follower's read index. Installed by New.
+	readIndex atomic.Pointer[readIndexFunc]
 }
+
+type readIndexFunc func(context.Context) (uint64, error)
 
 type internalPeerAuthorizer func(nodeID string) bool
 
@@ -90,6 +95,16 @@ func startInternalServer(bindAddr string, ct *ClusterTLS, applyHandler func(cont
 			return
 		}
 		w.WriteHeader(http.StatusNoContent)
+	})
+	mux.HandleFunc("GET "+InternalReadIndexPath, func(w http.ResponseWriter, r *http.Request) {
+		if !is.authorizePeerRequest(w, r) {
+			return
+		}
+		var fn readIndexFunc
+		if p := is.readIndex.Load(); p != nil {
+			fn = *p
+		}
+		serveReadIndex(w, r, fn)
 	})
 	// Catch-all delegate: anything that isn't the raft-apply endpoint runs
 	// through the registered extra handler. We register on "/" so the ServeMux
@@ -191,6 +206,18 @@ func (s *internalServer) SetExtraHandler(h http.Handler) {
 		return
 	}
 	s.extra.Store(&h)
+}
+
+// SetReadIndexHandler installs the InternalReadIndexPath handler.
+func (s *internalServer) SetReadIndexHandler(fn readIndexFunc) {
+	if s == nil {
+		return
+	}
+	if fn == nil {
+		s.readIndex.Store(nil)
+		return
+	}
+	s.readIndex.Store(&fn)
 }
 
 func (s *internalServer) Addr() string { return s.listener.Addr().String() }

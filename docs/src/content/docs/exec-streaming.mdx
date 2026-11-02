@@ -539,6 +539,7 @@ For work that must keep going after you disconnect, such as a dev server or a lo
 
 - **Background jobs make `exec` wait.** If your command starts something with `&`, `exec` waits until that program ends too, because it still holds the output open. Start servers and other long-running programs in a [terminal session](/sessions/) instead.
 - **`exec` keeps all output in memory** until the command ends. For commands that print a lot, use `execStream`.
+- **If the sandbox stops while a command runs**, the call fails within seconds instead of waiting. This covers a sandbox that crashes, is stopped or is deleted. The error is HTTP 409 with `sandbox is not running`. A crashed Firecracker sandbox can take up to 30 seconds to notice, and that call fails with HTTP 502. The command may have done part of its work, so the SDKs do not send it again. A command that is still running is never cut off, however long it stays quiet.
 - **WebAssembly sandboxes** support `exec`, but not `execStream` or terminals. What a command does there depends on the module. See [WebAssembly (WASM)](/wasm-sandbox/).
 - **V8 isolate sandboxes** have no shell. There, `exec` calls the isolate's request handler, and the command is the URL path to request. See [V8 isolate](/isolate-sandbox/).
 

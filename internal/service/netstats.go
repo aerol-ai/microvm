@@ -105,6 +105,14 @@ func (s *Service) SetNetworkLimits(ctx context.Context, id string, bytesInLimit,
 	if s.isFirecrackerSandbox(sandbox) && (bytesInLimit > 0 || bytesOutLimit > 0) {
 		return nil, unsupportedFirecrackerOption("network byte limits")
 	}
+	// A container crossing its cap is blocked by a firewall DROP: without the
+	// firewall the cap would be stored and the over-quota flag set while the
+	// traffic keeps flowing. Lifting a cap (0) is always allowed.
+	if err := s.checkSandboxNetRules(sandbox, "set_network_limits", firewallPolicyFields(&models.CreateSandboxRequest{
+		NetworkBytesInLimit: bytesInLimit, NetworkBytesOutLimit: bytesOutLimit,
+	})); err != nil {
+		return nil, err
+	}
 	// Stronger lazy-bootstrap case than GetNetworkUsage: setting a limit
 	// implies the operator wants enforcement to start. If the poller is
 	// down, "limit set, never enforced" is silent failure of a security

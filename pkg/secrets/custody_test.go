@@ -100,8 +100,9 @@ func TestWrappedKeyFileIO(t *testing.T) {
 	if err != nil || !got.MigratedFromPlaintext || got.KeyVersion() != "vault:v3" || string(got.Wrapped) != "vault:v3:abc" {
 		t.Fatalf("read = %+v %v", got, err)
 	}
+	// The file and its writers' lock sidecar, no temp file.
 	entries, _ := os.ReadDir(filepath.Dir(path))
-	if len(entries) != 1 {
+	if len(entries) != 2 || entries[1].Name() != filepath.Base(path)+".lock" {
 		t.Fatalf("temp file left behind: %v", entries)
 	}
 	write := func(body string, mode os.FileMode) string {

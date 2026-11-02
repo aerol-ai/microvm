@@ -138,20 +138,17 @@ func (s *Service) StartIngressProxyRouting(ctx context.Context, opts IngressRout
 	if r.Ingress != nil {
 		responder.Miss = s.ingressMissLookup()
 	}
-	served := make(chan error, 1)
-	go func() {
-		// Retry the bind: on a back-to-back restart the previous process can
-		// still hold the port for a moment.
-		deadline := time.Now().Add(opts.ProbeTimeout)
-		for {
-			err := responder.ListenAndServe(rctx, s.cfg.RouteDNSAddr)
-			if err == nil || rctx.Err() != nil || time.Now().After(deadline) {
-				served <- err
-				return
-			}
-			time.Sleep(200 * time.Millisecond)
-		}
-	}()
+	served := serveRouteResponder(rctx, responder, s.cfg.RouteDNSAddr, opts.ProbeTimeout)
+	// The system resolver reaches the responder on the link address when
+	// one is configured (see config.RouteDNSLinkAddr for why loopback is
+	// not enough), so that is the listener its probe depends on.
+	systemServed := served
+	if s.cfg.RouteDNSLinkAddr != "" {
+		systemServed = serveRouteResponder(rctx, responder, s.cfg.RouteDNSLinkAddr, opts.ProbeTimeout)
+	} else if r.Ingress != nil {
+		s.logger.Warn("ingress proxy routing: no SB_ROUTE_DNS_LINK_ADDR; if systemd-resolved routes *.rt.internal to the loopback responder, its link-pinned UDP queries are dropped and lookups stall for about 20s every few minutes (new connections then fail). Re-run install.sh --ingress-proxy-routing",
+			"route_dns_addr", s.cfg.RouteDNSAddr)
+	}
 
 	fail := func(err error) (*IngressRouting, error) {
 		cancel()
@@ -163,7 +160,7 @@ func (s *Service) StartIngressProxyRouting(ctx context.Context, opts IngressRout
 		return fail(fmt.Errorf("route responder on %s: %w", s.cfg.RouteDNSAddr, err))
 	}
 	if r.Ingress != nil {
-		if err := waitRouteProbe(rctx, opts.SystemResolver, opts.ProbeTimeout, served); err != nil {
+		if err := waitRouteProbe(rctx, opts.SystemResolver, opts.ProbeTimeout, systemServed); err != nil {
 			return fail(err)
 		}
 		var once sync.Once
@@ -186,7 +183,8 @@ func (s *Service) StartIngressProxyRouting(ctx context.Context, opts IngressRout
 	}
 	s.setRouteWriter(w)
 	s.logger.Info("ingress proxy routing engaged",
-		"route_dns_addr", s.cfg.RouteDNSAddr, "ingress_index", r.Ingress != nil, "redirect_port", w.redirectPort)
+		"route_dns_addr", s.cfg.RouteDNSAddr, "route_dns_link_addr", s.cfg.RouteDNSLinkAddr,
+		"ingress_index", r.Ingress != nil, "redirect_port", w.redirectPort)
 	return r, nil
 }
 
@@ -283,6 +281,27 @@ func (s *Service) RollbackIngressProxyRouting(ctx context.Context, fwd HostPortF
 	}
 	s.logger.Info("ingress proxy routing rolled back to per-sandbox Caddy routes")
 	return nil
+}
+
+// serveRouteResponder serves responder on addr until ctx ends. It retries
+// the bind until timeout: on a back-to-back restart the previous process can
+// still hold the port, and at boot the link address can appear after
+// sandboxd starts. The channel gets the listener's final error (nil when ctx
+// ended it).
+func serveRouteResponder(ctx context.Context, responder *routedns.Responder, addr string, timeout time.Duration) <-chan error {
+	served := make(chan error, 1)
+	go func() {
+		deadline := time.Now().Add(timeout)
+		for {
+			err := responder.ListenAndServe(ctx, addr)
+			if err == nil || ctx.Err() != nil || time.Now().After(deadline) {
+				served <- err
+				return
+			}
+			time.Sleep(200 * time.Millisecond)
+		}
+	}()
+	return served
 }
 
 // directResolver asks addr only (the responder), never the system resolver.

@@ -14,6 +14,7 @@ import (
 
 	"github.com/aerol-ai/microvm/integration-tests/suite/harness"
 	"github.com/aerol-ai/microvm/pkg/auditlog"
+	"github.com/aerol-ai/microvm/sdk/go/pkg/microvm"
 	sdktypes "github.com/aerol-ai/microvm/sdk/go/pkg/types"
 )
 
@@ -25,12 +26,41 @@ const exportDeliveryTimeout = 5 * time.Minute
 // leftovers from an earlier one.
 func generateAuditRecords(t *testing.T, c *harness.Client, tag string, reads int) (string, string) {
 	t.Helper()
+	return generateAuditRecordsOn(t, c, nil, tag, reads)
+}
+
+// generateAuditRecordsOn is generateAuditRecords with the sandbox placed on
+// node. A case that switches ONE node's exporter must look at records that
+// node writes, and a create goes wherever placement puts it: on a 3-node
+// cluster UC-139 found its records about one run in three. The placement
+// API takes no node, so this creates until one lands there.
+func generateAuditRecordsOn(t *testing.T, c *harness.Client, node *harness.IntegrationNode, tag string, reads int) (string, string) {
+	t.Helper()
 	secret := secretValue(t, tag)
-	sb := c.NewSandbox(t, sdktypes.CreateSandboxOptions{
-		Name: harness.UniqueName(sc, t),
-		Env:  map[string]string{"UC_TOKEN": secret},
-	})
-	waitRunning(t, sb)
+	targets := harness.LoadIntegrationTargets()
+	pin := node != nil && targets != nil && len(targets.Nodes) > 1
+	const attempts = 12 // (2/3)^12 < 1% on three nodes
+	var sb *microvm.Sandbox
+	for i := 0; ; i++ {
+		sb = c.NewSandbox(t, sdktypes.CreateSandboxOptions{
+			Name: harness.UniqueName(sc, t),
+			Env:  map[string]string{"UC_TOKEN": secret},
+		})
+		waitRunning(t, sb)
+		if !pin {
+			break
+		}
+		owner := resolvePlacementOwner(t, c, sb.ID)
+		if on, ok := nodeForClusterID(t, c, targets, owner); ok && on.Name == node.Name {
+			break
+		}
+		if i+1 == attempts {
+			t.Fatalf("%d creates never landed on %s (last on %q); placement may exclude it", attempts, node.Name, owner)
+		}
+		dctx, dcancel := context.WithTimeout(context.Background(), time.Minute)
+		_ = c.SDK().Destroy(dctx, sb.ID)
+		dcancel()
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancel()
 	for i := 0; i < reads; i++ {
@@ -72,7 +102,7 @@ func TestFileExportBackendWritesChainedRecords(t *testing.T) {
 			}
 			t.Fatalf("node %s did not start with the file exporter: %s\n%s", node.Name, res.Status, tailLines(res.Journal, 30))
 		}
-		sandboxID, secret := generateAuditRecords(t, c, "139", 3)
+		sandboxID, secret := generateAuditRecordsOn(t, c, &node, "139", 3)
 
 		target, _ := harness.SSHTarget(node)
 		deadline := time.Now().Add(exportDeliveryTimeout)
@@ -116,7 +146,7 @@ func TestS3ExportBackendWritesReconstructableObjects(t *testing.T) {
 		if !res.Started {
 			t.Fatalf("node %s did not start with the s3 exporter: %s\n%s", node.Name, res.Status, tailLines(res.Journal, 30))
 		}
-		sandboxID, secret := generateAuditRecords(t, c, "140", 3)
+		sandboxID, secret := generateAuditRecordsOn(t, c, &node, "140", 3)
 
 		target, _ := harness.SSHTarget(node)
 		deadline := time.Now().Add(exportDeliveryTimeout)

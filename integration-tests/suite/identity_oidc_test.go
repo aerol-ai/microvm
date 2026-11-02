@@ -217,7 +217,7 @@ func TestIdentityRemoteMCPOAuth(t *testing.T) {
 	// 1. The challenge.
 	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, sc.BaseURL+"/mcp", strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"initialize"}`))
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := harness.HTTPClient(0).Do(req)
 	if err != nil {
 		t.Fatal(err)
 	}

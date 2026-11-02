@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -323,6 +324,51 @@ func TestExposePortTCPReusedReservationKeepsRouteOnClusterFailure(t *testing.T) 
 	}
 	if len(rt.pushes) != 0 {
 		t.Fatalf("allowlist pushes = %d, want 0 on failed replacement", len(rt.pushes))
+	}
+}
+
+// SB_L4_PUBLIC_HOST: when the domain fronts a load balancer that cannot carry
+// the host-port pool (Terraform api_load_balancer = "nlb"), a raw-TCP
+// exposure is advertised under the direct name, in the response and in the
+// stored row, and a retry returns the same answer from that row.
+func TestExposePortTCPAdvertisesL4PublicHost(t *testing.T) {
+	ctx := context.Background()
+	rt := &recordingRuntime{}
+	svc, st, _ := newServiceRuntimeHarness(t, rt)
+	fake := newRouteAdminCaddyFake()
+	server := httptest.NewServer(fake.handler(t))
+	t.Cleanup(server.Close)
+
+	svc.cfg = config.Config{EnableCaddy: true, CaddyAdminURL: server.URL, CaddyServerID: "srv0", Domain: "sandbox.example.com", L4PublicHost: "tcp.sandbox.example.com", L4PortRangeStart: 32000, L4PortRangeEnd: 32002, HTTPClientTimeout: time.Second}
+	svc.caddy = caddy.New(svc.cfg)
+	svc.l4Ready.Store(true)
+
+	now := time.Now().UTC()
+	if err := st.Create(ctx, &models.Sandbox{ID: "sb-tcp-l4host", Image: "postgres:16", Status: models.SandboxStatusStarted, ContainerID: "ctr-tcp-l4host", ContainerIP: "10.0.0.73", Runtime: models.RuntimeDocker, CPU: 1, MemoryMB: 256, DiskGB: 5, CreatedAt: now, UpdatedAt: now, LastActiveAt: now}); err != nil {
+		t.Fatalf("seed sandbox: %v", err)
+	}
+
+	resp, err := svc.ExposePort(ctx, "sb-tcp-l4host", 5432, models.ExposedPortProtocolTCP)
+	if err != nil {
+		t.Fatalf("ExposePort() error = %v", err)
+	}
+	want := "tcp://tcp.sandbox.example.com:" + strconv.Itoa(resp.HostPort)
+	if resp.PublicURL != want || resp.Host != "tcp.sandbox.example.com" {
+		t.Fatalf("ExposePort() = url %q host %q, want %q on tcp.sandbox.example.com", resp.PublicURL, resp.Host, want)
+	}
+	got, err := st.Get(ctx, "sb-tcp-l4host")
+	if err != nil {
+		t.Fatalf("store.Get() error = %v", err)
+	}
+	if row := findExposure(got, 5432); row == nil || row.PublicURL != want {
+		t.Fatalf("stored exposure = %+v, want public URL %q", row, want)
+	}
+	again, err := svc.ExposePort(ctx, "sb-tcp-l4host", 5432, models.ExposedPortProtocolTCP)
+	if err != nil {
+		t.Fatalf("retried ExposePort() error = %v", err)
+	}
+	if again.HostPort != resp.HostPort || again.PublicURL != want || again.Host != resp.Host {
+		t.Fatalf("retried ExposePort() = %+v, want the first answer %+v", again, resp)
 	}
 }
 

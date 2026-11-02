@@ -74,7 +74,7 @@ func TestManagerHelpersAndSweepBranches(t *testing.T) {
 		t.Fatalf("buildArgv default = %v, %v", defArgv, err)
 	}
 
-	if got := mergeEnv(nil); len(got) != len(os.Environ()) {
+	if got := mergeEnvOnto(os.Environ(), nil); len(got) != len(os.Environ()) {
 		t.Fatalf("mergeEnv(nil) length = %d, want %d", len(got), len(os.Environ()))
 	}
 	if got := orDefault(0, 42); got != 42 {

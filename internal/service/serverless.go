@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/store"
-	"github.com/aerol-ai/microvm/pkg/docker"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
 
@@ -63,7 +62,7 @@ type expectedStopRecord struct {
 const expectedStopMaxAge = 5 * time.Minute
 
 // recordExpectedStop notes that sandboxd is about to issue a stop for id
-// with the given mode. The matching die/stop/oom event is then consumed
+// with the given mode. The matching die/stop event is then consumed
 // by consumeExpectedStop in the events handler. Safe to call concurrently
 // — entries with the same id silently overwrite, which is the right
 // behavior for retries that issue a fresh stop.
@@ -168,6 +167,14 @@ func (s *Service) stopSandboxInternal(ctx context.Context, id string, mode stopM
 		s.consumeExpectedStop(id)
 		return nil, err
 	}
+	// The sandbox is down: its toolbox requests will never be answered.
+	// End them now, and again once the row says stopped (toolbox_calls.go).
+	detail := "stopped"
+	if mode == stopModeLifecycle {
+		detail = "stopped by its lifecycle"
+	}
+	s.endToolboxCalls(id, toolboxEndStopped, detail)
+	defer s.endToolboxCalls(id, toolboxEndStopped, detail)
 
 	// Release the admitter slot now that the container is no longer running.
 	// A stopped sandbox holds no CPU/RAM on the host; keeping the reservation
@@ -410,13 +417,15 @@ func (s *Service) ReconstructWakeArmedIfNeeded(ctx context.Context, sandbox *mod
 	)
 }
 
-// classifyDockerStopEvent maps a Docker die/stop/oom event to the stop
-// mode that should drive wake arming. OOM is treated as involuntary
-// even when sandboxd issued the stop: an OOM-kill mid-stop means the
-// kernel reaped the container, not the operator. Otherwise we trust
-// the expected-stop bookkeeping populated by stopSandboxInternal.
-func (s *Service) classifyDockerStopEvent(id string, event docker.DockerEvent) stopMode {
-	if event.Action == "oom" {
+// classifyDockerStopEvent maps a die/stop event to the stop mode that
+// should drive wake arming. An exit that is an OOM kill (oomKilled: a die
+// right after an oom event, sandbox_oom.go) is involuntary even when
+// sandboxd issued the stop: the kernel reaped the container, not the
+// operator. Otherwise we trust the expected-stop bookkeeping populated by
+// stopSandboxInternal. An oom event on its own never gets here: it is not
+// an exit.
+func (s *Service) classifyDockerStopEvent(id string, oomKilled bool) stopMode {
+	if oomKilled {
 		// Drop any expectation so the slot is freed for a retry.
 		s.expectedStopsMu.Lock()
 		delete(s.expectedStops, id)

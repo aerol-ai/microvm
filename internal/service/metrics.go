@@ -106,6 +106,16 @@ var (
 	networkBlockReapplyTotal  = expvar.NewInt("aerolvm_network_block_reapply_total")
 	networkBlockReapplyErrors = expvar.NewInt("aerolvm_network_block_reapply_errors_total")
 
+	// Reconcile asked a runtime about a sandbox missing from its listing and
+	// got no answer (reconcile_unknown.go). The row is kept, never deleted.
+	// unknown_total is keyed by runtime (docker, containerd, firecracker,
+	// wasm, isolate); unknown_sandboxes is how many are unanswered now;
+	// marked_error_total counts sandboxes recorded as status=error after
+	// staying unanswered past reconcileUnknownMarkAfter.
+	reconcileRuntimeUnknownTotal       = expvar.NewMap("aerolvm_reconcile_runtime_unknown_total")
+	reconcileRuntimeUnknownSandboxes   = expvar.NewInt("aerolvm_reconcile_runtime_unknown_sandboxes")
+	reconcileRuntimeUnknownMarkedTotal = expvar.NewInt("aerolvm_reconcile_runtime_unknown_marked_error_total")
+
 	wakeRequestsTotal   = expvar.NewInt("aerolvm_wake_requests_total")
 	wakeColdStartsTotal = expvar.NewInt("aerolvm_wake_cold_starts_total")
 	wakeFailuresTotal   = expvar.NewMap("aerolvm_wake_failures_total")

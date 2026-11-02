@@ -40,6 +40,8 @@ func floorNS(t *testing.T, ns, hostIf, nsIf, hostIP, nsIP, gw string) {
 }
 
 func TestKernelFloor(t *testing.T) {
+	ResetFloorsForTest()
+	t.Cleanup(ResetFloorsForTest)
 	if os.Geteuid() != 0 {
 		t.Skip("needs root in a privileged container")
 	}
@@ -81,7 +83,7 @@ func TestKernelFloor(t *testing.T) {
 	floor := []netip.Prefix{netip.MustParsePrefix("10.211.0.0/24")}
 	for _, backend := range []string{BackendNetlink, BackendExec} {
 		t.Run(backend, func(t *testing.T) {
-			_ = exec.Command("iptables", "-F", ChainAerolvmFloor).Run()
+			_ = exec.Command("iptables", "-F", FloorChainFor(subnet)).Run()
 			mgr, err := NewWithOptions(true, backend, ChainAerolvmUser)
 			if err != nil {
 				t.Fatal(err)
@@ -98,13 +100,37 @@ func TestKernelFloor(t *testing.T) {
 			if canReach() {
 				t.Fatal("the floor must drop forwarded traffic from the sandbox subnet")
 			}
+			// Something takes the floor away (a host firewall reload): the
+			// re-assert puts it back, and a floor in place is left alone.
+			for _, damage := range []struct {
+				name string
+				do   func()
+			}{
+				{"chain and jump deleted", func() { deleteFloorChain(t, ChainAerolvmUser, FloorChainFor(subnet)) }},
+				{"chain flushed", func() { run(t, "iptables", "-F", FloorChainFor(subnet)) }},
+			} {
+				damage.do()
+				if !waitReach() {
+					t.Fatalf("%s: the damage did not open the path, so the re-assert proves nothing", damage.name)
+				}
+				if repaired, err := mgr.ReassertFloor(); !repaired || err != nil {
+					t.Fatalf("%s: re-assert repaired=%v err=%v", damage.name, repaired, err)
+				}
+				if canReach() {
+					t.Fatalf("%s: the re-assert must drop the path again", damage.name)
+				}
+				if repaired, err := mgr.ReassertFloor(); repaired || err != nil {
+					t.Fatalf("%s: a whole floor must not be rewritten: repaired=%v err=%v", damage.name, repaired, err)
+				}
+			}
 			// Replacing is whole-chain: a second set with the same entry
-			// leaves one rule, not two.
+			// leaves the same two rules (the entry, and the subnet to itself
+			// while sandboxes are isolated from each other), not four.
 			if err := mgr.SetFloor(subnet, floor); err != nil {
 				t.Fatal(err)
 			}
-			out, _ := exec.Command("iptables", "-S", ChainAerolvmFloor).CombinedOutput()
-			if n := strings.Count(string(out), "-j DROP"); n != 1 {
+			out, _ := exec.Command("iptables", "-S", FloorChainFor(subnet)).CombinedOutput()
+			if n := strings.Count(string(out), "-j DROP"); n != 2 {
 				t.Fatalf("floor rules after a repeat = %d:\n%s", n, out)
 			}
 			if err := mgr.SetFloor(subnet, nil); err != nil {
@@ -115,6 +141,25 @@ func TestKernelFloor(t *testing.T) {
 			}
 		})
 	}
+}
+
+// deleteFloorChain removes a floor the way a host firewall reload would:
+// every jump to it from parent, then the chain itself (nft, so it works on
+// rules either backend wrote).
+func deleteFloorChain(t *testing.T, parent, chain string) {
+	t.Helper()
+	out, err := exec.Command("nft", "-a", "list", "chain", "ip", "filter", parent).CombinedOutput()
+	if err != nil {
+		t.Fatalf("nft list %s: %v\n%s", parent, err, out)
+	}
+	for _, line := range strings.Split(string(out), "\n") {
+		_, handle, ok := strings.Cut(line, "# handle ")
+		if ok && strings.Contains(line, "jump "+chain) {
+			run(t, "nft", "delete", "rule", "ip", "filter", parent, "handle", strings.TrimSpace(handle))
+		}
+	}
+	run(t, "nft", "flush", "chain", "ip", "filter", chain)
+	run(t, "nft", "delete", "chain", "ip", "filter", chain)
 }
 
 // TestKernelFloorHelper is re-executed inside the remote netns as a tiny

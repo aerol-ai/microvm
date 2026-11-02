@@ -17,13 +17,13 @@ func TestTryAcquireWarm_OverlayMismatchAndAcquireError(t *testing.T) {
 	f.driver.SetWarmPool(&fakeWarmPool{})
 	req := models.CreateSandboxRequest{TemplateID: "tpl", OverlaySizeGB: 1}
 	snap := &TemplateResolution{HasSnapshot: true, HasOverlay: false}
-	if _, hit, err := f.driver.tryAcquireWarm(context.Background(), req, "sb", snap, &TapSlot{}, ""); err == nil || hit {
+	if _, hit, err := f.driver.tryAcquireWarm(context.Background(), req, "sb", "tok", snap, &TapSlot{}, ""); err == nil || hit {
 		t.Fatalf("overlay mismatch: hit=%v err=%v", hit, err)
 	}
 
 	pool := &fakeWarmPool{acquireEr: errors.New("acquire failed")}
 	f.driver.SetWarmPool(pool)
-	if _, hit, err := f.driver.tryAcquireWarm(context.Background(), models.CreateSandboxRequest{TemplateID: "tpl"}, "sb", &TemplateResolution{HasSnapshot: true}, &TapSlot{}, ""); err == nil || hit {
+	if _, hit, err := f.driver.tryAcquireWarm(context.Background(), models.CreateSandboxRequest{TemplateID: "tpl"}, "sb", "tok", &TemplateResolution{HasSnapshot: true}, &TapSlot{}, ""); err == nil || hit {
 		t.Fatalf("acquire error: hit=%v err=%v", hit, err)
 	}
 }

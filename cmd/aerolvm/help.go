@@ -397,6 +397,9 @@ Flags:
   --witness URL     also check the witnessed heads, as audit verify does;
                     nodes then come from the witness
   --max-lag D       how long a head may wait for its records (default 15m)
+  --fetch-concurrency N
+                    S3 export batches downloaded at once per node (default
+                    32, 1 to 256); up to 4 nodes are read at once
   --region R        AWS region for the buckets
   --endpoint URL    S3-compatible endpoint
   --path-style      path-style S3 addressing
@@ -459,6 +462,12 @@ Flags:
   --node ID         check only this node (repeatable; default: every node in
                     the witness)
   --max-lag D       how long a head may wait for its records (default 15m)
+  --fetch-concurrency N
+                    S3 export batches downloaded at once (default 32, 1 to
+                    256). Every batch is still read and checked; this only
+                    sets how many GETs overlap. Downloads wait in a
+                    temporary directory that is removed when the check
+                    ends, Ctrl-C included
   --region R        AWS region for both buckets
   --endpoint URL    S3-compatible endpoint
   --path-style      path-style S3 addressing
@@ -482,8 +491,9 @@ too, without it only the links. Exit codes are audit verify's.
   --limit N         print at most N matches (default 1000, 0 = all); the
                     walk and the verdict always cover the whole window
   --witness URL     also check the witnessed heads, as audit verify does
-  --node, --local, --export, --export-dir, --since, --max-lag, --region,
-  --endpoint, --path-style, --json   as for audit verify
+  --node, --local, --export, --export-dir, --since, --max-lag,
+  --fetch-concurrency, --region, --endpoint, --path-style, --json
+                    as for audit verify
 
 Examples:
   aerolvm audit verify --witness s3://acme-witness/witness/ --since 30d \

@@ -192,6 +192,7 @@ func TestManagerSuperviseRestartsAfterFirstCrash(t *testing.T) {
 		hostPath:   hostPath,
 		plan:       adapters.Plan{Argv: []string{"true"}},
 		cmd:        cmd,
+		exit:       watchExit(cmd),
 		startedAt:  time.Now().UTC(),
 		supervised: true,
 	}

@@ -38,6 +38,8 @@ import (
 	"fmt"
 	"os/exec"
 	"strings"
+
+	"github.com/aerol-ai/microvm/internal/network/hostnet"
 )
 
 // HostManager is the operations the firecracker runtime driver depends on
@@ -78,6 +80,9 @@ type Host struct {
 	// rpFilter turns on strict reverse-path filtering on a TAP; nil is the
 	// platform's (a /proc write on Linux). Seam for tests.
 	rpFilter func(tap string) error
+	// ipv6Off turns IPv6 off on a TAP; nil is hostnet.DisableIPv6OnLink.
+	// Seam for tests.
+	ipv6Off func(tap string) error
 }
 
 // runFn is the type the test seam injects. Mirrors exec.CommandContext's
@@ -123,7 +128,8 @@ func (h *Host) exec(ctx context.Context, args ...string) ([]byte, error) {
 // Order matters:
 //
 //  1. `ip tuntap add` first — we need the device to exist before
-//     `ip addr add` can target it.
+//     `ip addr add` can target it. IPv6 goes off right after, before
+//     anything brings the link up.
 //  2. `ip addr add` next — putting the IP on first means the link is
 //     usable the moment step 3 makes it up. Reverse order would race
 //     against the guest's DHCP/static-IP probe.
@@ -162,6 +168,19 @@ func (h *Host) Ensure(ctx context.Context, slot Slot) error {
 		if !looksLikeExists(out) {
 			return fmt.Errorf("tap host: tuntap add %s: %w (%s)", slot.TapName, err, strings.TrimSpace(string(out)))
 		}
+	}
+
+	// Step 1b: IPv6 off on the host end, before the link comes up, so the
+	// host never gets a link-local address on it. The guest is IPv4-only;
+	// an fe80 address here was a way to every host service listening on
+	// [::] that the IPv4 rules between a guest and its node never see.
+	// The node's IPv6 fence drops whatever a guest still sends.
+	off := h.ipv6Off
+	if off == nil {
+		off = hostnet.DisableIPv6OnLink
+	}
+	if err := off(slot.TapName); err != nil {
+		return fmt.Errorf("tap host: disable ipv6 on %s: %w", slot.TapName, err)
 	}
 
 	// Step 2: assign the host-side IP. The CIDR carries the /30 mask;

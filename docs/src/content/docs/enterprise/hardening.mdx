@@ -165,6 +165,7 @@ USER app
 | HV‑13 | Turn on [enterprise mode](#enterprise-mode) with the audit witness | 3 | LT‑8 |
 | HV‑14 | Turn on [access control](/enterprise/sso/): SSO for people, a scoped API token for each service, and the smallest role that works | 2, 3 | IM‑5, IM‑6 |
 | HV‑15 | Limit the server token to the server with `SB_PAT_SCOPE=host` (`install.sh --pat-scope host`), after moving remote tools to named credentials | 3 | IM‑7 |
+| HV‑16 | Keep `rpcbind` off, so nothing answers on port `111`. The installer turns it off. On a server set up by an older installer, run `sudo systemctl disable --now rpcbind.socket rpcbind.service`. | All | NS‑6 |
 
 ### Firewall
 

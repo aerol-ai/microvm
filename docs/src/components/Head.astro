@@ -7,3 +7,10 @@ import Default from '@astrojs/starlight/components/Head.astro'
 </Default>
 <meta name="theme-color" content="#0B1116" />
 <meta property="og:site_name" content="Aerol.ai AerolVM" />
+
+<script>
+  // Turns on smooth scrolling after load; see init.scss for why not before.
+  const smoothScroll = () => document.documentElement.setAttribute('data-smooth-scroll', '')
+  if (document.readyState === 'complete') smoothScroll()
+  else addEventListener('load', smoothScroll, { once: true })
+</script>

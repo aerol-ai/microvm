@@ -357,7 +357,7 @@ func TestSessionsLookalikePathIs404(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/sessionsX/foo", nil)
 	req.Header.Set("Authorization", "Bearer toolbox-token")
 	rec := httptest.NewRecorder()
-	srv.routes().ServeHTTP(rec, req)
+	authedRoutes(srv).ServeHTTP(rec, req)
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
 	}

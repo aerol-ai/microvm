@@ -213,13 +213,13 @@ For Docker, containerd and gVisor sandboxes, a separate filter service on each s
   <TabItem label="TypeScript">
     ```ts
     const current = await client.get(sandbox.id)
-    console.log(current.egressStatus) // "active", "held" or "unavailable"
+    console.log(current.egressStatus) // "active", "held", "unavailable" or "unenforced"
     ```
   </TabItem>
   <TabItem label="Python">
     ```python
     current = client.get(sandbox.id)
-    print(getattr(current, 'egressStatus', None))  # "active", "held" or "unavailable"
+    print(getattr(current, 'egressStatus', None))  # "active", "held", "unavailable" or "unenforced"
     ```
   </TabItem>
   <TabItem label="Go">
@@ -228,19 +228,19 @@ For Docker, containerd and gVisor sandboxes, a separate filter service on each s
     if err != nil {
         return err
     }
-    fmt.Println(current.EgressStatus) // "active", "held" or "unavailable"
+    fmt.Println(current.EgressStatus) // "active", "held", "unavailable" or "unenforced"
     ```
   </TabItem>
   <TabItem label="Rust">
     ```rust
     let current = client.get(&sandbox.data.id)?;
-    println!("{:?}", current.data.egress_status); // "active", "held" or "unavailable"
+    println!("{:?}", current.data.egress_status); // "active", "held", "unavailable" or "unenforced"
     ```
   </TabItem>
   <TabItem label="Java">
     ```java
     Sandbox current = client.get(sandbox.id);
-    System.out.println(current.egressStatus); // "active", "held" or "unavailable"
+    System.out.println(current.egressStatus); // "active", "held", "unavailable" or "unenforced"
     ```
   </TabItem>
 </Tabs>
@@ -250,6 +250,7 @@ For Docker, containerd and gVisor sandboxes, a separate filter service on each s
 | `active` | The filter is working as listed. |
 | `unavailable` | The filter service is down or restarting. Traffic comes back by itself within seconds of it returning. |
 | `held` | The policy could not be applied. The sandbox gets no outbound traffic until it can be. |
+| `unenforced` | This server's firewall is off, so nothing filters the sandbox's traffic. You only see it when the operator set `SB_ALLOW_UNENFORCED_NETWORK_POLICY=true` for local development, or turned the firewall off after the sandbox was created. Any policy, not only names, can show it. |
 
 A create that lists names while the server's filter cannot take it returns `503`, with code `egress_gateway_unavailable` and a `Retry-After` header. Retry it. In a cluster, these creates only go to servers whose filter is ready.
 
@@ -1516,7 +1517,8 @@ One case reads more strictly here than on E2B. `allowOut` with no `denyOut` is a
 
 ## Limits
 
-- **IPv4 only.** None of these rules filter IPv6 traffic.
+- **IPv4 only.** None of these rules filter IPv6 traffic. Container, gVisor and Firecracker sandboxes have none: see [No IPv6 in a sandbox](/engineering-network-defenses/#no-ipv6-in-a-sandbox).
+- **The server's firewall is required.** On Docker, containerd and Firecracker sandboxes, every policy on this page relies on the server's firewall, names too: the sandbox starts shut until the filter service takes it, and is shut again if the filter fails. A server without the firewall refuses them with `501` and the code `network_policy_unenforced`. That covers a create, a `setNetworkPolicy` that adds a policy, and starting a stopped sandbox that has one. Clearing a policy always works. WASM and V8 isolate sandboxes filter their own traffic and are not affected.
 - **Names, not paths.** The filter decides by site name. It does not read inside HTTPS, so on its own it cannot allow one path or method and refuse another. [Rules and inspection](#allow-only-some-requests) adds that, for plain HTTP and for HTTPS sites you choose to inspect.
 - **Firecracker** supports everything on this page: names, address lists and `networkBlockAll`, at create and with `setNetworkPolicy`. Each VM has its own network device, so another VM cannot pretend to be it. [Rules and inspection](#allow-only-some-requests) is not supported there (`501`).
 - **Inspected traffic is decrypted on the server.** The filter decrypts each inspected request and response in memory to check it, then encrypts it again. Any password or key the sandbox sends to an inspected site is visible to the server at that moment. An injected key is held by the server's filter for the sandbox's whole life. Inspect only the sites you need to.
@@ -1531,7 +1533,8 @@ One case reads more strictly here than on E2B. `allowOut` with no `denyOut` is a
 
 | Setting | What it does | Default |
 |---|---|---|
-| `SB_ENABLE_NETWORK_RULES` | Turns on the per-sandbox firewall rules behind `networkBlockAll`, the address lists and the byte caps. Linux only. When off, Docker sandboxes start without the rules, and Firecracker sandboxes refuse these options. | `true` |
+| `SB_ENABLE_NETWORK_RULES` | Turns on the per-sandbox firewall rules behind `networkBlockAll`, the address lists, website names and the byte caps. Linux only. When off, or on another OS, Docker, containerd and Firecracker sandboxes refuse these options with `501` and the code `network_policy_unenforced`. They are never accepted and left unenforced. | `true` |
+| `SB_ALLOW_UNENFORCED_NETWORK_POLICY` | For local development only. With the firewall off, accept those options anyway, without enforcing them. The server logs a warning at start and for each such sandbox, and `get` shows `egressStatus: "unenforced"`. Firecracker still refuses them. Not allowed with `SB_ENTERPRISE_MODE=true`. | `false` |
 | `SB_NETRULES_BACKEND` | How the rules are written: `netlink` (nftables) or `exec` (the `iptables` tool). | `netlink` |
 
 ### Website names

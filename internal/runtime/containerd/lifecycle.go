@@ -19,8 +19,10 @@ import (
 	"github.com/opencontainers/runtime-spec/specs-go"
 
 	"github.com/aerol-ai/microvm/internal/pool/containerdpool"
+	sbruntime "github.com/aerol-ai/microvm/internal/runtime"
 	"github.com/aerol-ai/microvm/pkg/createtiming"
 	dockerpkg "github.com/aerol-ai/microvm/pkg/docker"
+	"github.com/aerol-ai/microvm/pkg/gvisorpids"
 	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/aerol-ai/microvm/pkg/mounts"
 )
@@ -78,6 +80,11 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		netnsPath        string
 		prepaidIP        string
 		netnsProvisioned bool
+		// earlyRules: the request's network rules may be on prepaidIP, put
+		// there before the workload started; addressReported: the create
+		// was told prepaidIP (runtime.AddressObserver). Both drive the
+		// failure cleanup below.
+		earlyRules, addressReported bool
 	)
 	if d.cfg.NativeNetnsPool && d.netns != nil {
 		netnsPath, prepaidIP, err = d.netns.Provision(ctx, sandboxID)
@@ -114,11 +121,21 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		if committed || lostRace {
 			return
 		}
+		// Undo in the order that keeps the sandbox shut and its address
+		// clean: the workload dies first; then whatever the create keyed by
+		// the address (the egress gateway attach) is told and lets go; then
+		// the address's rules go, while this call still holds the slot (a
+		// rule cleared after the slot is free could be the next owner's);
+		// and the slot goes back to the pool last.
 		d.lifoTeardown(ctx, client, container, task, logPath, hostFiles)
-	}()
-	defer func() {
-		if committed || lostRace || !netnsProvisioned || d.netns == nil {
+		if !netnsProvisioned || d.netns == nil {
 			return
+		}
+		if addressReported {
+			sbruntime.NotifyReleasingAddress(ctx, prepaidIP)
+		}
+		if earlyRules {
+			d.clearCreateNetRules(prepaidIP, req)
 		}
 		_ = d.netns.Release(ctx, sandboxID)
 	}()
@@ -186,15 +203,19 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		specOpts = append(specOpts, securitySpecOpts()...)
 	}
 	if !d.cfg.ResourceLimitsOff {
-		specOpts = append(specOpts, resourceSpecOpts(req)...)
+		hostPids, pidsEnv := gvisorpids.ForRuntime(ociRuntime, d.cfg.PidsLimit, req.MemoryMB)
+		envValues = append(envValues, pidsEnv...)
+		specOpts = append(specOpts, resourceSpecOpts(req, hostPids)...)
 	}
 	if netnsPath != "" {
 		specOpts = append(specOpts, withNetworkNamespace(netnsPath))
 	}
+	specOpts = append(specOpts, withSandboxIPv6Off())
+	mountSpecs := buildMounts(d.cfg, hostFiles, hostMounts)
 	if ociRuntime == "runsc" {
 		specOpts = append(specOpts, runscSandboxAnnotationOpt())
+		mountSpecs = append(mountSpecs, runscCgroupMount())
 	}
-	mountSpecs := buildMounts(d.cfg, hostFiles, hostMounts)
 
 	if d.cfg.ReadyEnabled {
 		readyListener, err = d.setupReadySocket(&envValues, &mountSpecs, sandboxID, toolboxToken)
@@ -212,6 +233,9 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		managedLabelKey:   "true",
 		sandboxIDLabelKey: sandboxID,
 	}
+	if ip := strings.TrimSpace(prepaidIP); ip != "" {
+		containerLabels[containerIPLabelKey] = ip
+	}
 	leaseID, err = d.pinImageLease(ctx, client, image)
 	if err != nil {
 		return nil, err
@@ -223,7 +247,7 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 	containerOpts := []cntr.NewContainerOpts{
 		cntr.WithImage(image),
 		cntr.WithNewSnapshot(sandboxID, image),
-		cntr.WithNewSpec(specOpts...),
+		withNewSpec(specOpts...),
 		cntr.WithContainerLabels(containerLabels),
 	}
 	if ociRuntime != "" {
@@ -245,12 +269,31 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		}
 		return nil, fmt.Errorf("create container: %w", err)
 	}
+	// The prepaid address is this sandbox's from here (a duplicate create
+	// stopped at NewContainer above), and the workload hasn't started: put
+	// the request's rules on it now, so the workload never runs without
+	// them (a hostname-filtered create's block-all included), and report
+	// it, so the create's egress gateway attach overlaps the task start and
+	// the readiness wait. The container exists, so a crash from here leaves
+	// an orphan whose Destroy clears these rules.
+	if ip := strings.TrimSpace(prepaidIP); ip != "" {
+		earlyRules = true
+		netrulesStart := time.Now()
+		if err := d.applyCreateNetRules(ip, req); err != nil {
+			return nil, err
+		}
+		if hasCreateNetRules(req) {
+			createtiming.From(ctx).RecordStage("containerd_netrules", time.Since(netrulesStart))
+		}
+		addressReported = true
+		sbruntime.NotifyAddressKnown(ctx, ip)
+	}
 
 	logPath, err = d.taskLogPath(sandboxID)
 	if err != nil {
 		return nil, err
 	}
-	logIO, closeLog, err := taskLogIO(logPath)
+	logIO, closeLog, err := d.taskLogIO(logPath)
 	if err != nil {
 		return nil, err
 	}
@@ -290,16 +333,26 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 	}
 	createtiming.From(ctx).RecordReadinessWaits(0, time.Since(readyStart), readinessSource)
 
-	if req.NetworkBlockAll && state.ContainerIP != "" {
-		netrulesStart := time.Now()
-		if err := d.ApplyNetworkBlockAll(state.ContainerIP); err != nil {
-			return nil, fmt.Errorf("apply network block: %w", err)
+	switch {
+	case earlyRules && state.ContainerIP != strings.TrimSpace(prepaidIP):
+		// The rules, and any attach the create started, are on the prepaid
+		// address: a sandbox at another one would run without them.
+		return nil, fmt.Errorf("containerd: sandbox came up at %q, not at its prepaid address %q", state.ContainerIP, prepaidIP)
+	case earlyRules:
+	default:
+		// No address before the workload (no netns pool): the rules go on
+		// the one the started task reports.
+		if req.NetworkBlockAll && state.ContainerIP != "" {
+			netrulesStart := time.Now()
+			if err := d.ApplyNetworkBlockAll(state.ContainerIP); err != nil {
+				return nil, fmt.Errorf("apply network block: %w", err)
+			}
+			createtiming.From(ctx).RecordStage("containerd_netrules", time.Since(netrulesStart))
 		}
-		createtiming.From(ctx).RecordStage("containerd_netrules", time.Since(netrulesStart))
-	}
-	if len(req.NetworkAllowOut) > 0 || len(req.NetworkDenyOut) > 0 {
-		if err := d.ApplyEgressPolicy(state.ContainerIP, req.NetworkAllowOut, req.NetworkDenyOut); err != nil {
-			return nil, fmt.Errorf("apply egress policy: %w", err)
+		if len(req.NetworkAllowOut) > 0 || len(req.NetworkDenyOut) > 0 {
+			if err := d.ApplyEgressPolicy(state.ContainerIP, req.NetworkAllowOut, req.NetworkDenyOut); err != nil {
+				return nil, fmt.Errorf("apply egress policy: %w", err)
+			}
 		}
 	}
 
@@ -307,11 +360,49 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 	return state, nil
 }
 
+// Start starts a stopped sandbox's container again. A container adopted from
+// the warm pool cannot be started this way: its spec still carries the
+// pool's env, so its toolboxd would boot parked and serve nothing; the
+// service starts every containerd sandbox through StartWithIdentity.
 func (d *Driver) Start(ctx context.Context, containerRef string) (*models.SandboxRuntimeState, error) {
+	return d.startTask(ctx, containerRef, "", "")
+}
+
+// StartWithIdentity implements runtime.IdentityStarter. A container adopted
+// from the warm pool keeps the pool's env for life (SB_POOL_PARKED=1, its
+// slot's bootstrap token and park nonce, the bind of its slot's park socket)
+// because adoption relabels the container and leaves its spec alone. Every
+// start re-creates the task from that spec, so its toolboxd boots parked,
+// holds the user's command back and answers only /health until it is
+// adopted again. This listens on the slot's socket before the task starts,
+// takes the parked hello and adopts it with the sandbox's own ID and token,
+// exactly as the create did. Any other container starts as Start does.
+func (d *Driver) StartWithIdentity(ctx context.Context, containerRef, sandboxID, toolboxToken string) (*models.SandboxRuntimeState, error) {
+	return d.startTask(ctx, containerRef, sandboxID, toolboxToken)
+}
+
+// readoptParkedFn waits for a restarted pool container's parked hello and
+// adopts it. Tests stub it to drive the handshake without a guest toolbox.
+var readoptParkedFn = func(ctx context.Context, pl *dockerpkg.ParkedListener, sandboxID, toolboxToken string) error {
+	if err := pl.WaitParked(ctx); err != nil {
+		return err
+	}
+	nonce, err := dockerpkg.MintReadyNonce()
+	if err != nil {
+		return err
+	}
+	return pl.Adopt(ctx, sandboxID, toolboxToken, nonce)
+}
+
+func (d *Driver) startTask(ctx context.Context, containerRef, sandboxID, toolboxToken string) (*models.SandboxRuntimeState, error) {
 	client, err := d.ensureClient()
 	if err != nil {
 		return nil, err
 	}
+	// A duplicate concurrent start waits here, then finds the task running
+	// and returns its state.
+	unlock := d.lockStart(containerRef)
+	defer unlock()
 	container, err := client.LoadContainer(ctx, containerRef)
 	if err != nil {
 		return nil, fmt.Errorf("load container: %w", err)
@@ -324,15 +415,32 @@ func (d *Driver) Start(ctx context.Context, containerRef string) (*models.Sandbo
 		}
 		_, _ = task.Delete(ctx, cntr.WithProcessKill)
 	}
+	spec, err := container.Spec(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("load container spec: %w", err)
+	}
+	// The task about to be created bind-mounts every host file the spec
+	// names; one that went missing would fail it in runc.
+	if err := d.ensureSpecHostFiles(spec, sandboxID); err != nil {
+		return nil, fmt.Errorf("container host files: %w", err)
+	}
+	parked, err := d.parkedRestartListener(spec, sandboxID, toolboxToken)
+	if err != nil {
+		return nil, err
+	}
+	if parked != nil {
+		defer func() { _ = parked.Close() }()
+	}
 	logPath, err := d.taskLogPath(containerRef)
 	if err != nil {
 		return nil, err
 	}
 	// Use the size-capped writer, not cio.LogFile: containerd never rotates task
 	// IO, so an uncapped resume log grows for the life of the task and can fill
-	// the host disk — the exact hazard Create's taskLogIO guards against. Closed
-	// on return, mirroring Create's logCloser handling.
-	logIO, closeLog, err := taskLogIO(logPath)
+	// the host disk — the exact hazard Create's taskLogIO guards against.
+	// Released on return like Create's: once the task's IO exists, its copy
+	// goroutines keep the file and close it when the task goes.
+	logIO, closeLog, err := d.taskLogIO(logPath)
 	if err != nil {
 		return nil, err
 	}
@@ -342,11 +450,10 @@ func (d *Driver) Start(ctx context.Context, containerRef string) (*models.Sandbo
 	// runc's mount fails ("open .../ready/<id>.<nonce>.sock: no such file"). Recreate
 	// the exact socket (nonce from the spec mount path, token from the spec env)
 	// so the mount succeeds and the restarted toolbox can re-signal readiness.
-	if d.cfg.ReadyEnabled {
-		if spec, serr := container.Spec(ctx); serr == nil {
-			if rl := d.recreateResumeReadySocket(spec); rl != nil {
-				defer func() { _ = rl.Close() }()
-			}
+	// A pool container's park socket is the parked listener above.
+	if d.cfg.ReadyEnabled && parked == nil {
+		if rl := d.recreateResumeReadySocket(spec); rl != nil {
+			defer func() { _ = rl.Close() }()
 		}
 	}
 	task, err = container.NewTask(ctx, logIO)
@@ -356,7 +463,52 @@ func (d *Driver) Start(ctx context.Context, containerRef string) (*models.Sandbo
 	if err := task.Start(ctx); err != nil {
 		return nil, fmt.Errorf("start task: %w", err)
 	}
+	if parked != nil {
+		waitCtx, cancel := context.WithTimeout(ctx, d.cfg.ToolboxWaitTimeout)
+		err := readoptParkedFn(waitCtx, parked, sandboxID, toolboxToken)
+		cancel()
+		if err != nil {
+			// A container that was not adopted serves nothing: don't leave it
+			// running parked behind a start that reports failure.
+			_ = task.Kill(ctx, syscall.SIGKILL)
+			_, _ = task.Delete(ctx, cntr.WithProcessKill)
+			return nil, fmt.Errorf("re-adopt warm-pool container: %w", err)
+		}
+	}
 	return d.runtimeStateAfterStart(ctx, container, task, containerRef, "")
+}
+
+// parkedRestartListener returns the listener a start of a warm-pool
+// container must adopt its toolboxd over, or nil for any other container.
+// The hello must carry the bootstrap token and park nonce in the spec's env,
+// and it arrives on the host socket the spec's ready mount names, which must
+// be a park socket directly in the ready dir: the listener unlinks whatever
+// is at that path before it binds.
+func (d *Driver) parkedRestartListener(spec *specs.Spec, sandboxID, toolboxToken string) (*dockerpkg.ParkedListener, error) {
+	if spec == nil || spec.Process == nil {
+		return nil, nil
+	}
+	bootstrapToken, parkNonce, parked := dockerpkg.ParkedEnvCredentials(spec.Process.Env)
+	if !parked {
+		return nil, nil
+	}
+	if strings.TrimSpace(sandboxID) == "" || strings.TrimSpace(toolboxToken) == "" {
+		return nil, errors.New("warm-pool container: a start needs the sandbox's identity to adopt it again")
+	}
+	var source string
+	for _, m := range spec.Mounts {
+		if m.Destination == dockerpkg.GuestReadySocketPath {
+			source = filepath.Clean(m.Source)
+			break
+		}
+	}
+	readyDir := filepath.Clean(strings.TrimSpace(d.cfg.ReadyDir))
+	slotID := strings.TrimSuffix(filepath.Base(source), ".sock")
+	if source == "" || source == "." || strings.TrimSpace(d.cfg.ReadyDir) == "" || filepath.Dir(source) != readyDir ||
+		!IsParkedSandboxID(slotID) || validateSandboxID(slotID) != nil {
+		return nil, fmt.Errorf("warm-pool container has no park socket under %s to be adopted over (mount %q)", d.cfg.ReadyDir, source)
+	}
+	return dockerpkg.NewParkedListener(readyDir, slotID, bootstrapToken, parkNonce)
 }
 
 // stopGraceTimeout and stopPollInterval are test seams for Stop's SIGTERM→SIGKILL path.
@@ -397,21 +549,42 @@ func (d *Driver) Stop(ctx context.Context, containerRef string) error {
 	return err
 }
 
+// Destroy removes the sandbox in the order that keeps it shut and its
+// address clean: the workload is killed first; then the destroy's
+// runtime.AddressObserver (the egress gateway detach) is told; then the
+// address's rules are cleared, while the netns slot is still held (a rule
+// cleared after the slot is free could be the next owner's); and the slot
+// goes back to the pool last. It used to clear the rules and free the slot
+// first and kill the task last, so a destroyed sandbox briefly ran without
+// its rules and its address could be handed on while the gateway still held
+// state for it. A failed container removal still lets the address go (the
+// netns teardown cuts the workload's network) and is returned.
 func (d *Driver) Destroy(ctx context.Context, sandbox *models.Sandbox) error {
-	if sandbox != nil {
-		_ = d.ClearNetworkRules(sandbox.ContainerIP)
-		_ = d.ClearEgressPolicy(sandbox.ContainerIP, sandbox.NetworkAllowOut, sandbox.NetworkDenyOut)
-	}
 	if sandbox == nil {
 		return nil
 	}
+	destroyErr := d.destroyContainer(ctx, sandbox)
+	sbruntime.NotifyReleasingAddress(ctx, sandbox.ContainerIP)
+	_ = d.ClearNetworkRules(sandbox.ContainerIP)
+	_ = d.ClearEgressPolicy(sandbox.ContainerIP, sandbox.NetworkAllowOut, sandbox.NetworkDenyOut)
 	if d.netns != nil {
 		_ = d.netns.Release(ctx, sandbox.ID)
 	}
 	dockerpkg.RemoveReadySocketsForSandbox(d.cfg.ReadyDir, sandbox.ID)
-	_ = d.removeHostFiles(sandbox.ID)
-	_ = d.removeTaskLog(sandbox.ID)
+	// A warm-adopted sandbox's container keeps its park id, and so do its
+	// host files, task log and park socket; a cold one's container id is
+	// the sandbox id. Both keys are cleared: the sandbox id also covers
+	// host files an older build renamed to it on adopt.
+	d.removeContainerFiles(sandbox.ID)
+	if ref := strings.TrimSpace(sandbox.ContainerID); ref != "" && ref != sandbox.ID {
+		d.removeContainerFiles(ref)
+	}
+	return destroyErr
+}
 
+// destroyContainer kills the sandbox's task and deletes its container; a
+// container containerd doesn't have is already gone.
+func (d *Driver) destroyContainer(ctx context.Context, sandbox *models.Sandbox) error {
 	client, err := d.ensureClient()
 	if err != nil {
 		return err
@@ -437,25 +610,112 @@ func (d *Driver) Destroy(ctx context.Context, sandbox *models.Sandbox) error {
 	return container.Delete(ctx, cntr.WithSnapshotCleanup)
 }
 
+// Inspect reports what containerd knows about one container. An error
+// wrapping sbruntime.ErrInstanceNotFound means containerd answered NotFound
+// for the container; reconcile deletes the sandbox's row on that and only
+// that. Any other error means containerd could not answer, and says nothing
+// about the sandbox.
+//
+// A container that exists always yields a state. Stopped when it has no task
+// or its task has exited — a task that died and is still there (runsc crashed
+// under a fork bomb: exit status unavailable) is a stopped sandbox, not a
+// missing one. Started when its task runs, with the address sandboxAddress
+// finds: the netns probe, else the address recorded at create. A running
+// gVisor sandbox always needs the record (its probe can't succeed), and one
+// created before the record existed, or whose netns is gone, has neither:
+// it is still Started, with ContainerIP empty. An unreadable address used to
+// fail Inspect, ListManaged then skipped the container, and reconcile deleted
+// the live sandbox's row and cluster placement. Callers that need the
+// address check for an empty one: Create and Start keep requiring it
+// (runtimeStateAfterStart), the start event and runningAt treat empty as
+// "no change", and reconcile keeps the row's address.
 func (d *Driver) Inspect(ctx context.Context, containerRef string) (*models.SandboxRuntimeState, error) {
 	client, err := d.ensureClient()
 	if err != nil {
 		return nil, err
 	}
-	container, err := client.LoadContainer(ctx, containerRef)
+	// By id, then by sandbox-id label: a warm-adopted sandbox keeps its park
+	// container's id, so a sandbox id alone misses it. Gone means neither.
+	container, err := d.loadContainerForRef(ctx, client, containerRef)
 	if err != nil {
-		return nil, err
+		if errdefs.IsNotFound(err) {
+			return nil, fmt.Errorf("load container %q: %w: %w", containerRef, sbruntime.ErrInstanceNotFound, err)
+		}
+		return nil, fmt.Errorf("load container %q: %w", containerRef, err)
+	}
+	sandboxID := d.sandboxIDFromContainer(ctx, container)
+	stopped := &models.SandboxRuntimeState{
+		SandboxID:   sandboxID,
+		ContainerID: container.ID(),
+		Status:      models.SandboxStatusStopped,
 	}
 	task, err := container.Task(ctx, nil)
 	if err != nil {
-		return &models.SandboxRuntimeState{
-			SandboxID:   d.sandboxIDFromContainer(ctx, container),
-			ContainerID: containerRef,
-			Status:      models.SandboxStatusStopped,
-		}, nil
+		if errdefs.IsNotFound(err) {
+			return stopped, nil
+		}
+		return nil, fmt.Errorf("load task of %q: %w", containerRef, err)
 	}
-	sandboxID := d.sandboxIDFromContainer(ctx, container)
-	return d.runtimeStateAfterStart(ctx, container, task, sandboxID, "")
+	status, err := task.Status(ctx)
+	if err != nil {
+		if errdefs.IsNotFound(err) {
+			return stopped, nil
+		}
+		return nil, fmt.Errorf("task status of %q: %w", containerRef, err)
+	}
+	switch status.Status {
+	case cntr.Running, cntr.Paused, cntr.Pausing:
+		// Paused is a snapshot commit in progress: the sandbox still owns
+		// its address and must not be reported stopped.
+	case cntr.Stopped, cntr.Created:
+		// Created is a task that never started (an interrupted create or
+		// start); Start deletes and recreates it, as it does a stopped one.
+		return stopped, nil
+	default:
+		return nil, fmt.Errorf("task of %q is in state %q", containerRef, status.Status)
+	}
+	state := &models.SandboxRuntimeState{
+		SandboxID:   sandboxID,
+		ContainerID: container.ID(),
+		Status:      models.SandboxStatusStarted,
+	}
+	ip, err := d.sandboxAddress(ctx, container, task, "")
+	if err != nil {
+		inspectIPUnavailableTotal.Add(1)
+		if d.logger != nil {
+			d.logger.Warn("containerd inspect: running task's address unreadable; reporting it started without one",
+				"sandbox_id", sandboxID, "container_id", container.ID(), "error", err)
+		}
+		return state, nil
+	}
+	state.ContainerIP = ip
+	return state, nil
+}
+
+// sandboxAddress resolves a running task's IPv4. The netns probe answers for
+// runc. It cannot answer for a running gVisor sandbox: runsc takes eth0's
+// address out of the pinned netns when the sentry starts, and the task's pid
+// sits in the host netns, which the probe refuses to report. So when the
+// probe fails, the address the netns slot was given stands in: hint (the
+// create path's prepaid address), then the container's containerIPLabelKey
+// label. The slot keeps that address for the sandbox's life. The label is
+// read only after a failed probe, so a runc sandbox pays nothing extra.
+func (d *Driver) sandboxAddress(ctx context.Context, container cntr.Container, task cntr.Task, hint string) (string, error) {
+	ip, err := containerIPv4FromTaskFn(ctx, task)
+	if err == nil {
+		return ip, nil
+	}
+	if h := strings.TrimSpace(hint); h != "" {
+		return h, nil
+	}
+	if container != nil {
+		if labels, lerr := container.Labels(ctx); lerr == nil {
+			if recorded := strings.TrimSpace(labels[containerIPLabelKey]); recorded != "" {
+				return recorded, nil
+			}
+		}
+	}
+	return "", err
 }
 
 func (d *Driver) sandboxIDFromContainer(ctx context.Context, container cntr.Container) string {
@@ -494,6 +754,11 @@ func (d *Driver) ListManaged(ctx context.Context) (map[string]*models.SandboxRun
 		}
 		if state.SandboxID == "" || IsParkedSandboxID(state.SandboxID) {
 			continue
+		}
+		if state.Status == models.SandboxStatusStarted {
+			// The boot reconcile lists every sandbox, so after a restart
+			// this is where a running task gets a reader again.
+			d.ensureTaskDrain(ctx, container)
 		}
 		out[state.SandboxID] = state
 	}
@@ -606,6 +871,11 @@ func buildEnv(req models.CreateSandboxRequest, sandboxID, toolboxToken string, t
 		"SB_POOL_PARKED=",
 	}
 	for key, value := range req.Env {
+		if key == gvisorpids.EnvVar {
+			// The driver sets the gVisor task cap; a create's env must not
+			// shadow it (toolboxd reads the first value of a key).
+			continue
+		}
 		envValues = append(envValues, key+"="+value)
 	}
 	sort.Strings(envValues)
@@ -855,11 +1125,7 @@ func (d *Driver) lifoTeardown(ctx context.Context, client *Client, container cnt
 }
 
 func (d *Driver) runtimeStateAfterStart(ctx context.Context, container cntr.Container, task cntr.Task, sandboxID, ipHint string) (*models.SandboxRuntimeState, error) {
-	ip, err := containerIPv4FromTaskFn(ctx, task)
-	if err != nil && strings.TrimSpace(ipHint) != "" {
-		ip = ipHint
-		err = nil
-	}
+	ip, err := d.sandboxAddress(ctx, container, task, ipHint)
 	if err != nil {
 		return nil, err
 	}
@@ -944,12 +1210,31 @@ func (d *Driver) removeTaskLog(sandboxID string) error {
 }
 
 func (d *Driver) removeHostFiles(sandboxID string) error {
-	dir := filepath.Join(d.cfg.RunDir, "hosts", sandboxID)
-	return os.RemoveAll(dir)
+	return os.RemoveAll(hostFilesDir(d.cfg.RunDir, sandboxID))
 }
 
-func resourceSpecOpts(req models.CreateSandboxRequest) []oci.SpecOpts {
+// removeContainerFiles removes the files a container's spec and task keep on
+// the host under its id: host files, task log, and (for a pool container)
+// its park socket. A key that isn't a valid id builds no path, so a
+// malformed store row can't point the RemoveAll anywhere else.
+func (d *Driver) removeContainerFiles(key string) {
+	key = strings.TrimSpace(key)
+	if validateSandboxID(key) != nil {
+		return
+	}
+	_ = d.removeHostFiles(key)
+	_ = d.removeTaskLog(key)
+	if IsParkedSandboxID(key) && strings.TrimSpace(d.cfg.ReadyDir) != "" {
+		dockerpkg.RemoveParkSocket(filepath.Join(d.cfg.ReadyDir, key+".sock"))
+	}
+}
+
+func resourceSpecOpts(req models.CreateSandboxRequest, pidsLimit int64) []oci.SpecOpts {
 	var out []oci.SpecOpts
+	if pidsLimit > 0 {
+		// A fork bomb stops here instead of exhausting the node.
+		out = append(out, oci.WithPidsLimit(pidsLimit))
+	}
 	if req.MemoryMB > 0 {
 		out = append(out, oci.WithMemoryLimit(uint64(req.MemoryMB)*1024*1024))
 	}
@@ -966,4 +1251,30 @@ func resourceSpecOpts(req models.CreateSandboxRequest) []oci.SpecOpts {
 		out = append(out, oci.WithCPUCFS(quota, cpuPeriod))
 	}
 	return out
+}
+
+// WritableLayerBytes implements runtime.WritableLayerSizer: the size of the
+// container's active snapshot (its writable layer) as the snapshotter
+// reports it.
+func (d *Driver) WritableLayerBytes(ctx context.Context, containerRef string) (int64, error) {
+	if d.client == nil || d.client.Raw() == nil {
+		return 0, errors.New("containerd: client not connected")
+	}
+	container, err := d.client.LoadContainer(ctx, containerRef)
+	if err != nil {
+		return 0, err
+	}
+	ctx = d.client.withNS(ctx)
+	info, err := container.Info(ctx)
+	if err != nil {
+		return 0, err
+	}
+	if info.SnapshotKey == "" {
+		return 0, nil
+	}
+	usage, err := d.client.Raw().SnapshotService(info.Snapshotter).Usage(ctx, info.SnapshotKey)
+	if err != nil {
+		return 0, err
+	}
+	return usage.Size, nil
 }

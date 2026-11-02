@@ -13,7 +13,7 @@ import (
 
 func TestDaytonaFileRoutes(t *testing.T) {
 	srv := newDaytonaTestServer(t)
-	h := srv.routes()
+	h := authedRoutes(srv)
 	root := t.TempDir()
 
 	src := filepath.Join(root, "notes.txt")
@@ -101,7 +101,7 @@ func TestDaytonaFileRoutes(t *testing.T) {
 
 func TestDaytonaGitRoutes(t *testing.T) {
 	srv := newDaytonaTestServer(t)
-	h := srv.routes()
+	h := authedRoutes(srv)
 
 	repo := initGitRepo(t)
 	if err := os.WriteFile(filepath.Join(repo, "first.txt"), []byte("v1\n"), 0o644); err != nil {
@@ -253,7 +253,7 @@ func TestDaytonaGitRoutes(t *testing.T) {
 
 func TestDaytonaFileAndGitRouteErrors(t *testing.T) {
 	srv := newDaytonaTestServer(t)
-	h := srv.routes()
+	h := authedRoutes(srv)
 
 	t.Run("files_info_missing_path", func(t *testing.T) {
 		rr := httptest.NewRecorder()

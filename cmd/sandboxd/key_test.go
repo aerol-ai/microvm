@@ -258,19 +258,26 @@ func TestKeyCLIErrors(t *testing.T) {
 	}
 }
 
-func TestLoadEnvFile(t *testing.T) {
-	p := filepath.Join(t.TempDir(), "env")
-	_ = os.WriteFile(p, []byte("A_KC_TEST='quoted value'\nB_KC_TEST=\"x\"\nC_KC_TEST=keep\n=nokey\n"), 0o600)
+func TestLoadEnvFiles(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "sandboxd.env")
+	_ = os.WriteFile(p, []byte("A_KC_TEST='quoted value'\nB_KC_TEST=\"x\"\nC_KC_TEST=keep\n=nokey\nD_KC_TEST=awskms\n"), 0o600)
+	// The cluster drop-in's file comes after the unit's: it wins, as in
+	// systemd, while the process environment wins over both.
+	cluster := filepath.Join(dir, "cluster.env")
+	_ = os.WriteFile(cluster, []byte("D_KC_TEST=vault\nC_KC_TEST=cluster\n"), 0o600)
 	t.Setenv("C_KC_TEST", "from-process")
-	t.Setenv("A_KC_TEST", "")
-	_ = os.Unsetenv("A_KC_TEST")
-	t.Setenv("B_KC_TEST", "")
-	_ = os.Unsetenv("B_KC_TEST")
-	if err := loadEnvFile(p); err != nil {
-		t.Fatal(err)
+	for _, k := range []string{"A_KC_TEST", "B_KC_TEST", "D_KC_TEST"} {
+		t.Setenv(k, "")
+		_ = os.Unsetenv(k)
 	}
-	if os.Getenv("A_KC_TEST") != "quoted value" || os.Getenv("B_KC_TEST") != "x" || os.Getenv("C_KC_TEST") != "from-process" {
-		t.Fatalf("env = %q %q %q", os.Getenv("A_KC_TEST"), os.Getenv("B_KC_TEST"), os.Getenv("C_KC_TEST"))
+	var warned []error
+	loadEnvFiles([]string{p, filepath.Join(dir, "missing.env"), cluster}, func(err error) { warned = append(warned, err) })
+	if os.Getenv("A_KC_TEST") != "quoted value" || os.Getenv("B_KC_TEST") != "x" || os.Getenv("C_KC_TEST") != "from-process" || os.Getenv("D_KC_TEST") != "vault" {
+		t.Fatalf("env = %q %q %q %q", os.Getenv("A_KC_TEST"), os.Getenv("B_KC_TEST"), os.Getenv("C_KC_TEST"), os.Getenv("D_KC_TEST"))
+	}
+	if len(warned) != 1 || !strings.Contains(warned[0].Error(), "missing.env") {
+		t.Fatalf("warnings = %v", warned)
 	}
 }
 

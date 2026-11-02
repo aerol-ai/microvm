@@ -17,6 +17,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 )
 
 // Result is the subset of CNI ADD output the netns pool needs.
@@ -44,6 +45,9 @@ type Config struct {
 // `type`, speaking the CNI exec protocol.
 type ExecRunner struct {
 	cfg Config
+
+	natMu sync.Mutex
+	nat   natTable
 }
 
 func NewExecRunner(cfg Config) (*ExecRunner, error) {

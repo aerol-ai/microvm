@@ -65,6 +65,7 @@ func TestCov96LoadEnterpriseRejectsHardeningOptOuts(t *testing.T) {
 	}{
 		{name: "privileged containers", env: map[string]string{"SB_CONTAINER_PRIVILEGED": "true"}, want: "SB_CONTAINER_PRIVILEGED must be false"},
 		{name: "resource limits off", env: map[string]string{"SB_RESOURCE_LIMITS_DISABLED": "true"}, want: "SB_RESOURCE_LIMITS_DISABLED must be false"},
+		{name: "unenforced network policy", env: map[string]string{"SB_ALLOW_UNENFORCED_NETWORK_POLICY": "true"}, want: "SB_ALLOW_UNENFORCED_NETWORK_POLICY must be false"},
 		{name: "lenient audit boot", env: map[string]string{"SB_SECRET_AUDIT_STRICT_BOOT": "false"}, want: "SB_SECRET_AUDIT_STRICT_BOOT must be true"},
 		{name: "lenient awskms boot", env: map[string]string{
 			"SB_SECRET_PROVIDER":             "awskms",

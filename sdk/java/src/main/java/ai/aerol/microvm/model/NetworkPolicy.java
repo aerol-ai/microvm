@@ -14,6 +14,9 @@ public class NetworkPolicy {
     public List<EgressRule> networkEgressRules = new ArrayList<>();
     /** Hostname entries in force: inline plus every profile's (at most 1024). */
     public int effectiveHostnameCount;
-    /** "active", "held" or "unavailable" for hostname rules on a container, or null. */
+    /**
+     * "active", "held" or "unavailable" for hostname rules on a container;
+     * "unenforced" when the server's firewall is off; or null.
+     */
     public String egressStatus;
 }

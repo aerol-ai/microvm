@@ -1,6 +1,6 @@
 module github.com/aerol-ai/microvm
 
-go 1.26.9
+go 1.26.10
 
 require (
 	github.com/bytecodealliance/wasmtime-go/v37 v37.0.0
@@ -14,7 +14,7 @@ require (
 	github.com/hashicorp/memberlist v0.6.0
 	github.com/hashicorp/raft v1.7.3
 	github.com/hashicorp/raft-boltdb/v2 v2.3.1
-	github.com/klauspost/compress v1.20.1
+	github.com/klauspost/compress v1.20.3
 	github.com/mattn/go-sqlite3 v1.14.52
 	github.com/opencontainers/image-spec v1.1.1
 	github.com/tetratelabs/wazero v1.12.0

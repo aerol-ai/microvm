@@ -213,7 +213,43 @@ func WriteKeyRingFile(path string, f KeyRingFile) error {
 		return err
 	}
 	f.Ring = sortedEntries(f.Ring)
+	unlock, err := lockKeyFile(path)
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	return writeSecretJSON(path, f, ".key-ring-*")
+}
+
+// ReplaceKeyRingFile is WriteKeyRingFile as a compare-and-swap under the
+// key-file lock: it writes next only if the file still holds prev (nil:
+// the file must not exist yet), else ErrKeyFileChanged.
+func ReplaceKeyRingFile(path string, prev *KeyRingFile, next KeyRingFile) error {
+	next.Format = KeyRingFileFormat
+	if err := validateRing(next.Ring, false); err != nil {
+		return err
+	}
+	next.Ring = sortedEntries(next.Ring)
+	unlock, err := lockKeyFile(path)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	cur, err := ReadKeyRingFile(path)
+	switch {
+	case prev == nil && errors.Is(err, os.ErrNotExist):
+	case prev == nil && err == nil:
+		return ErrKeyFileChanged
+	case err != nil:
+		return err
+	default:
+		a, _ := json.Marshal(cur.Ring)
+		b, _ := json.Marshal(sortedEntries(prev.Ring))
+		if !bytes.Equal(a, b) {
+			return ErrKeyFileChanged
+		}
+	}
+	return writeSecretJSON(path, next, ".key-ring-*")
 }
 
 // writeSecretJSON writes v to path atomically at mode 0600: a temp file in
@@ -431,6 +467,11 @@ var ErrKeyFileChanged = errors.New("the server-key file changed while it was bei
 // ReplaceWrappedKeyFile writes next only if the file still holds prev: a
 // compare-and-swap on the file's content, re-read just before the write.
 func ReplaceWrappedKeyFile(path string, prev, next WrappedKeyFile) error {
+	unlock, err := lockKeyFile(path)
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	cur, err := ReadWrappedKeyFile(path)
 	if err != nil {
 		return err
@@ -440,7 +481,7 @@ func ReplaceWrappedKeyFile(path string, prev, next WrappedKeyFile) error {
 	if !bytes.Equal(a, b) {
 		return ErrKeyFileChanged
 	}
-	return WriteWrappedKeyFile(path, next)
+	return writeSecretJSON(path, next, ".wrapped-key-*")
 }
 
 // LegacyRingEntry is a plaintext key as ring key 0, the current key: the

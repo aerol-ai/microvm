@@ -10,6 +10,7 @@ package suite
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"strings"
 	"sync"
@@ -53,6 +54,19 @@ if sudo test -s /tmp/aerolvm-cred-bundle.tar.gz; then echo "BUNDLE:$(sudo tar -t
 		}
 		if s := kcSSH(t, n, "sudo /usr/local/bin/sandboxd key status --check"); !strings.Contains(s, "check: every server key unwraps and matches") {
 			t.Fatalf("%s: `sandboxd key status --check` failed:\n%s", n.Name, s)
+		}
+		if n.Seed {
+			continue
+		}
+		// A joiner installs with --no-start: sandboxd first starts after
+		// cluster-join.sh wrote its drop-in, and never makes a key of its own.
+		boot := kcSSH(t, n, `join=$(sudo stat -c %Y /etc/systemd/system/sandboxd.service.d/cluster.conf)
+first=$(sudo journalctl -u sandboxd -o short-unix --no-pager | grep -m1 -E 'Started .*AerolVM daemon' | cut -d. -f1)
+echo "join=$join first=$first"
+sudo journalctl -u sandboxd --no-pager | grep -c 'wrap server key' || true`)
+		var join, first, wraps int64
+		if _, err := fmt.Sscanf(strings.TrimSpace(boot), "join=%d first=%d\n%d", &join, &first, &wraps); err != nil || first < join || wraps != 0 {
+			t.Fatalf("%s started sandboxd before it joined, or made a key of its own (%v):\n%s", n.Name, err, boot)
 		}
 	}
 	if !sawBundle {

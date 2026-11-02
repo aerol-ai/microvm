@@ -41,6 +41,14 @@ type SessionRecorder interface {
 	RecordSSHSession(ctx context.Context, sandboxID, session string)
 }
 
+// OwnerSessionRecorder is the slice of *service.Service that says whether
+// the owner of a sandbox records the SSH sessions this gateway bridges to
+// it (cluster mode, once every member runs a build that does; see
+// bridgeSession). A lookup without it keeps the record on this node.
+type OwnerSessionRecorder interface {
+	SSHSessionsRecordedByOwner() bool
+}
+
 // DockerExec is the slice of *docker.Client the gateway needs. It exists so
 // the gateway can be tested with a fake.
 type DockerExec interface {
@@ -235,7 +243,11 @@ func (g *Gateway) handleConn(ctx context.Context, nConn net.Conn) {
 			g.logger.Warn("ssh channel accept failed", "error", err)
 			continue
 		}
-		g.recordSession(ctx, sandboxID, mode, sessionName)
+		if !remoteOwned {
+			// A remote-owned session is recorded by bridgeSession: by
+			// the owner, where the sandbox's audit lives.
+			g.recordSession(ctx, sandboxID, mode, sessionName)
+		}
 		go g.handleSession(ctx, sandboxID, mode, sessionName, remoteOwned, channel, requests)
 	}
 }
@@ -249,10 +261,16 @@ func (g *Gateway) recordSession(ctx context.Context, sandboxID, mode, sessionNam
 	if !ok || sandboxID == "" {
 		return
 	}
+	rec.RecordSSHSession(ctx, sandboxID, sessionRecordTarget(mode, sessionName))
+}
+
+// sessionRecordTarget is the toolbox session an ssh record names: the
+// session a "session" mode login attaches to, "" for a one-shot exec.
+func sessionRecordTarget(mode, sessionName string) string {
 	if mode != "session" {
-		sessionName = ""
+		return ""
 	}
-	rec.RecordSSHSession(ctx, sandboxID, sessionName)
+	return sessionName
 }
 
 // parseSSHUser splits the SSH username into (sandbox_id, mode, name).
@@ -373,7 +391,7 @@ func (g *Gateway) handleSession(ctx context.Context, sandboxID, mode, sessionNam
 	// v1 API, which forwards to the owner. Auth already happened at the edge in
 	// publicKeyCallback against the owner's authoritative key.
 	if remoteOwned {
-		g.handleRemoteSession(ctx, sandboxID, sessionName, channel, requests)
+		g.handleRemoteSession(ctx, sandboxID, sessionName, g.bridgeSession(ctx, sandboxID, mode, sessionName), channel, requests)
 		return
 	}
 

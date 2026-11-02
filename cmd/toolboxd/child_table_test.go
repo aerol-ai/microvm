@@ -2,6 +2,7 @@ package main
 
 import (
 	"errors"
+	"os"
 	"os/exec"
 	"strings"
 	"syscall"
@@ -71,6 +72,57 @@ func TestTrackedChildKeepsExitStatusWhenReaperWinsTheRace(t *testing.T) {
 				t.Fatalf("pid %d still registered after wait", child.pid)
 			}
 		})
+	}
+}
+
+// gVisor's waitid(P_PIDFD) reports a child the reaper already collected
+// as ESRCH, not ECHILD. The status the reaper handed over must still win.
+func TestTrackedChildKeepsExitStatusWhenWaitSaysESRCH(t *testing.T) {
+	tests := []struct {
+		name     string
+		script   string
+		wantCode int
+		wantNil  bool
+	}{
+		{name: "non-zero exit", script: "exit 3", wantCode: 3},
+		{name: "success stays success", script: "exit 0", wantCode: 0, wantNil: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cmd := exec.Command("sh", "-c", tc.script)
+			child, err := startTracked(cmd)
+			if err != nil {
+				t.Fatalf("startTracked: %v", err)
+			}
+			reapBeforeWait(t, child)
+			_ = cmd.Wait() // ECHILD here; gVisor says ESRCH, fed in below
+
+			waitErr := child.settle(&os.SyscallError{Syscall: "waitid", Err: syscall.ESRCH})
+			code, _ := interpretWaitResult(waitErr)
+			if code != tc.wantCode {
+				t.Fatalf("exit code = %d, want %d; waitErr=%v", code, tc.wantCode, waitErr)
+			}
+			if tc.wantNil && waitErr != nil {
+				t.Fatalf("exit 0 must settle to nil, got %v", waitErr)
+			}
+		})
+	}
+}
+
+func TestReapedElsewhere(t *testing.T) {
+	for _, tc := range []struct {
+		err  error
+		want bool
+	}{
+		{&os.SyscallError{Syscall: "wait", Err: syscall.ECHILD}, true},
+		{&os.SyscallError{Syscall: "waitid", Err: syscall.ESRCH}, true},
+		{&os.SyscallError{Syscall: "waitid", Err: syscall.EINVAL}, false},
+		{errors.New("exit status 1"), false},
+		{nil, false},
+	} {
+		if got := reapedElsewhere(tc.err); got != tc.want {
+			t.Errorf("reapedElsewhere(%v) = %v, want %v", tc.err, got, tc.want)
+		}
 	}
 }
 

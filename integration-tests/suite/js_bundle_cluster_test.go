@@ -78,26 +78,74 @@ func TestJSBundleListDeclaresUnreachablePeers(t *testing.T) {
 		return
 	}
 
-	// Now stop a peer and assert the response SAYS so.
-	victim, ok := pickNonSeedNode(targets)
+	// Now stop a peer and assert the response SAYS so. The peer must run
+	// isolate: the aggregate asks only isolate workers, so stopping any other
+	// node (the containerd worker on cluster-bank-flagship) correctly leaves
+	// the list complete.
+	victim, ok := isolatePeerToStop(t, c, targets)
 	if !ok {
-		t.Skip("no SSH-reachable non-seed node to stop")
+		t.Skip("no SSH-reachable non-seed node runs the isolate runtime")
 	}
+	requireNonSeedVictim(t, victim)
 	target, _ := harness.SSHTarget(victim)
 	if out, err := harness.SSHRun(t, target, "sudo systemctl stop sandboxd"); err != nil {
 		t.Fatalf("stop sandboxd on %s: %v\n%s", victim.Name, err, out)
 	}
+	// Out of the client's rotation, as a health-checked load balancer would
+	// take it out. The missing-peers header is written by the node that
+	// serves the list, which still has to ask the victim and fail, so this
+	// hides nothing; a client pinned to the victim's Caddy would read 502
+	// for the whole poll instead. restoreNodeDaemon puts it back.
+	harness.MarkNodeDown(victim.PublicIP)
 	t.Cleanup(func() { restoreNodeDaemon(t, victim, target) })
 
 	deadline := time.Now().Add(3 * time.Minute)
+	// Two correct answers with the holder down: the list still names the
+	// bundle (the server tier's replicated catalogue answers for a node that
+	// published its inventory, so nothing is missing), or it is short and
+	// says so in the header. Short and silent is the failure.
+	var stopped string
 	for time.Now().Before(deadline) {
-		_, headers, err := getWithHeaders(ctx, c, "/v1/js-bundles")
+		body, headers, err := getWithHeaders(ctx, c, "/v1/js-bundles")
 		if err == nil && strings.TrimSpace(headers.Get(missingPeersHeader)) != "" {
 			t.Logf("UC-168 PASS: the aggregate declared %q unreachable", headers.Get(missingPeersHeader))
 			return
 		}
+		if err == nil && strings.Contains(body, created.Digest) {
+			stopped = body
+		} else if err == nil {
+			stopped = ""
+		}
 		time.Sleep(10 * time.Second)
 	}
-	t.Fatalf("with %s stopped, the js-bundle list never set %s: the response is silently short, so an operator would conclude a bundle was deleted",
-		victim.Name, missingPeersHeader)
+	if stopped != "" {
+		t.Logf("UC-168 PASS: with %s stopped the list still names its bundle %s (served from the replicated catalogue), so nothing is short", victim.Name, created.Digest)
+		return
+	}
+	t.Fatalf("with %s stopped, the js-bundle list dropped bundle %s and never set %s: the response is silently short, so an operator would conclude a bundle was deleted",
+		victim.Name, created.Digest, missingPeersHeader)
+}
+
+// isolatePeerToStop picks a non-seed, SSH-reachable node whose capacity
+// advertises the isolate runtime.
+func isolatePeerToStop(t *testing.T, c *harness.Client, targets *harness.IntegrationTargets) (harness.IntegrationNode, bool) {
+	t.Helper()
+	members, err := benchClusterMembers(c)
+	if err != nil {
+		t.Fatalf("read cluster members: %v", err)
+	}
+	for _, n := range targets.Nodes {
+		if n.Seed {
+			continue
+		}
+		if _, ok := harness.SSHTarget(n); !ok {
+			continue
+		}
+		for _, m := range members.Members {
+			if (m.NodeName == n.Name || strings.HasSuffix(m.NodeName, "-"+n.Name)) && nodeAdvertisesRuntime(members, m.NodeID, models.RuntimeIsolate) {
+				return n, true
+			}
+		}
+	}
+	return harness.IntegrationNode{}, false
 }

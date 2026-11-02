@@ -168,6 +168,28 @@ func TestSelectPeersAuthoritativeEmptyTenantReady(t *testing.T) {
 	}
 }
 
+// A non-authoritative placement page (a server still catching up after a
+// restart, or an agent whose control plane did not answer) has no index to
+// continue a cursor from. Page one may still fan out to every owner on a small
+// fleet; a later page must not answer, or the list silently ends early.
+func TestSelectPeersNonAuthoritativeCursorIsNotReady(t *testing.T) {
+	c := &stubListCluster{
+		Noop: cluster.NewNoop("self", "http://self", ""),
+		members: []cluster.Member{
+			{NodeID: "self", Alive: true, Role: config.NodeRoleMixed},
+			{NodeID: "w-1", Alive: true, Role: config.NodeRoleWorker, InternalURL: "https://w-1"},
+		},
+	}
+	peers, _, _, ready, _ := SelectPeersForPage(c, "", "", DefaultPageLimit)
+	if !ready || len(peers) != 1 {
+		t.Fatalf("first page: ready=%v peers=%d, want small-fleet fan-out to the one peer", ready, len(peers))
+	}
+	peers, placements, next, ready, _ := SelectPeersForPage(c, "", "sb-0100", DefaultPageLimit)
+	if ready || peers != nil || placements != nil || next != "" {
+		t.Fatalf("later page: ready=%v peers=%v placements=%v next=%q, want not ready", ready, peers, placements, next)
+	}
+}
+
 func TestDialPeerRequiresInternalURLAndClient(t *testing.T) {
 	tr := Transport{
 		InternalClient: http.DefaultClient,

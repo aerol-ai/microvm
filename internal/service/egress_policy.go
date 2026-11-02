@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"slices"
 
+	"github.com/aerol-ai/microvm/internal/runtime"
 	"github.com/aerol-ai/microvm/pkg/egresspolicy"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
@@ -81,7 +82,7 @@ func (s *Service) checkFirecrackerEgress(req *models.CreateSandboxRequest) error
 		len(req.EgressProfiles) == 0 && req.NetworkEgressMode == "" && len(req.NetworkEgressRules) == 0 {
 		return nil
 	}
-	fw, ok := s.firecracker.(interface{ NetRulesEnabled() bool })
+	fw, ok := s.firecracker.(runtime.NetRulesReporter)
 	if !ok || !fw.NetRulesEnabled() {
 		return unsupportedFirecrackerOption("egress policies (this node has no firewall for its guests)")
 	}

@@ -158,7 +158,7 @@ func TestHandleUpload_InvalidJSON(t *testing.T) {
 func TestHandleProxy_PortNotAllowed(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	s := &server{logger: logger, allowedPorts: map[int]struct{}{8080: {}}}
-	h := s.routes()
+	h := authedRoutes(s)
 
 	// Port 9999 not in allowed list → 403.
 	rr := httptest.NewRecorder()
@@ -261,7 +261,7 @@ func TestPumpSession_CloseControl(t *testing.T) {
 
 func TestSessionHandlerDelete_Success(t *testing.T) {
 	srv := newDaytonaTestServer(t)
-	h := srv.routes()
+	h := authedRoutes(srv)
 
 	createReq := httptest.NewRequest(http.MethodPost, "/sessions",
 		strings.NewReader(`{"name":"del-success","command":"printf x"}`))
@@ -288,7 +288,7 @@ func TestSessionHandlerDelete_Success(t *testing.T) {
 
 func TestSessionHandlerSignalValidSession_InvalidBody(t *testing.T) {
 	srv := newDaytonaTestServer(t)
-	h := srv.routes()
+	h := authedRoutes(srv)
 
 	createReq := httptest.NewRequest(http.MethodPost, "/sessions",
 		strings.NewReader(`{"name":"sig-invalid","command":"sleep 5","pty":true,"cols":80,"rows":24}`))
@@ -309,7 +309,7 @@ func TestSessionHandlerSignalValidSession_InvalidBody(t *testing.T) {
 
 func TestSessionHandlerResize_InvalidBody(t *testing.T) {
 	srv := newDaytonaTestServer(t)
-	h := srv.routes()
+	h := authedRoutes(srv)
 
 	createReq := httptest.NewRequest(http.MethodPost, "/sessions",
 		strings.NewReader(`{"name":"resize-invalid","command":"sleep 5","pty":true,"cols":80,"rows":24}`))
@@ -350,7 +350,7 @@ func TestSessionHandlerRecording_WithContent(t *testing.T) {
 		logger:       logger,
 		allowedPorts: map[int]struct{}{},
 	}
-	h := srv.routes()
+	h := authedRoutes(srv)
 
 	// Create a PTY session (recording only works with PTY).
 	createReq := httptest.NewRequest(http.MethodPost, "/sessions",
@@ -414,7 +414,7 @@ func TestHandleDaytonaSessionDelete_Success(t *testing.T) {
 
 func TestHandleDaytonaGitHistory_NotGitRepo(t *testing.T) {
 	srv := newDaytonaTestServer(t)
-	h := srv.routes()
+	h := authedRoutes(srv)
 	dir := t.TempDir()
 
 	rr := httptest.NewRecorder()
@@ -427,7 +427,7 @@ func TestHandleDaytonaGitHistory_NotGitRepo(t *testing.T) {
 
 func TestHandleDaytonaGitStatus_NotGitRepo(t *testing.T) {
 	srv := newDaytonaTestServer(t)
-	h := srv.routes()
+	h := authedRoutes(srv)
 	dir := t.TempDir()
 
 	rr := httptest.NewRecorder()
@@ -440,7 +440,7 @@ func TestHandleDaytonaGitStatus_NotGitRepo(t *testing.T) {
 
 func TestHandleDaytonaGitListBranches_NotGitRepo(t *testing.T) {
 	srv := newDaytonaTestServer(t)
-	h := srv.routes()
+	h := authedRoutes(srv)
 	dir := t.TempDir()
 
 	rr := httptest.NewRecorder()
@@ -453,7 +453,7 @@ func TestHandleDaytonaGitListBranches_NotGitRepo(t *testing.T) {
 
 func TestHandleDaytonaGitCommit_NoStagedFiles(t *testing.T) {
 	srv := newDaytonaTestServer(t)
-	h := srv.routes()
+	h := authedRoutes(srv)
 	repo := initGitRepo(t)
 
 	// Commit without staged files → git error.
@@ -468,7 +468,7 @@ func TestHandleDaytonaGitCommit_NoStagedFiles(t *testing.T) {
 
 func TestHandleDaytonaGitAdd_NoFiles(t *testing.T) {
 	srv := newDaytonaTestServer(t)
-	h := srv.routes()
+	h := authedRoutes(srv)
 	repo := initGitRepo(t)
 
 	// No files listed → 400.
@@ -483,7 +483,7 @@ func TestHandleDaytonaGitAdd_NoFiles(t *testing.T) {
 
 func TestHandleDaytonaGitClone_NonexistentURL(t *testing.T) {
 	srv := newDaytonaTestServer(t)
-	h := srv.routes()
+	h := authedRoutes(srv)
 	dest := filepath.Join(t.TempDir(), "clone")
 
 	cloneBody := `{"path":"` + dest + `","url":"/nonexistent-bare-repo"}`
@@ -497,7 +497,7 @@ func TestHandleDaytonaGitClone_NonexistentURL(t *testing.T) {
 
 func TestHandleDaytonaSearchFiles_NonexistentPath(t *testing.T) {
 	srv := newDaytonaTestServer(t)
-	h := srv.routes()
+	h := authedRoutes(srv)
 
 	rr := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/files/search?path=/definitely/missing&pattern=*.go", nil)
@@ -509,7 +509,7 @@ func TestHandleDaytonaSearchFiles_NonexistentPath(t *testing.T) {
 
 func TestHandleDaytonaFindInFiles_NonexistentPath(t *testing.T) {
 	srv := newDaytonaTestServer(t)
-	h := srv.routes()
+	h := authedRoutes(srv)
 
 	rr := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/files/find?path=/definitely/missing&pattern=needle", nil)
@@ -740,7 +740,7 @@ func TestWriteFilesystemError_TypeMapping(t *testing.T) {
 func TestHandleSetAllowedPorts(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	s := &server{logger: logger, allowedPorts: map[int]struct{}{}}
-	h := s.routes()
+	h := authedRoutes(s)
 
 	rr := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/admin/allowed-ports",
@@ -755,7 +755,7 @@ func TestRoutesExecStreamRoute(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	s := &server{logger: logger, allowedPorts: map[int]struct{}{}}
 
-	httpSrv := httptest.NewServer(s.routes())
+	httpSrv := httptest.NewServer(authedRoutes(s))
 	defer httpSrv.Close()
 
 	wsURL := "ws" + strings.TrimPrefix(httpSrv.URL, "http") + "/process/exec/stream"
@@ -790,7 +790,7 @@ func TestRoutesExecStreamRoute(t *testing.T) {
 func TestRoutesUploadDownload(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	s := &server{logger: logger, allowedPorts: map[int]struct{}{}}
-	h := s.routes()
+	h := authedRoutes(s)
 	root := t.TempDir()
 	targetFile := filepath.Join(root, "uploaded.txt")
 

@@ -23,8 +23,14 @@ func TestFakeRunnerAddDelIdempotentIP(t *testing.T) {
 	if r2.IP4 != r1.IP4 {
 		t.Fatalf("second add changed ip: %s -> %s", r1.IP4, r2.IP4)
 	}
+	if ip, ok := f.IPOf("sb-1"); !ok || ip != r1.IP4 {
+		t.Fatalf("IPOf after add = %q %v, want %s", ip, ok, r1.IP4)
+	}
 	if err := f.Del(ctx, "/run/netns/a", "sb-1"); err != nil {
 		t.Fatal(err)
+	}
+	if ip, ok := f.IPOf("sb-1"); ok {
+		t.Fatalf("IPOf after del = %q, want released", ip)
 	}
 	if err := f.Del(ctx, "/run/netns/a", "sb-1"); err != nil {
 		t.Fatal("double del should be no-op")

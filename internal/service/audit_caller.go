@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"strings"
 
 	"github.com/aerol-ai/microvm/internal/cluster"
 	"github.com/aerol-ai/microvm/pkg/auditlog"
@@ -47,6 +48,11 @@ func withAuditSubsystem(ctx context.Context, subsystem string) context.Context {
 //     and id, the display name when it adds something, the team a
 //     team-bound credential acted for, and Via, the edge node a forwarded
 //     request came through (from the verified mTLS peer);
+//   - except for a call the SSH gateway bridged for a sandbox key holder
+//     (the edge attached an auditlog.SSHGatewayCall after checking where it
+//     came from): the gateway sends the operator token because that is the
+//     credential its loopback hop has, but the operator did nothing, so the
+//     caller is sandbox_key:<id>, via the gateway's node;
 //   - otherwise the system:<subsystem> principal background work tagged;
 //   - otherwise system:daemon, for work reached through an untagged entry
 //     point.
@@ -55,6 +61,9 @@ func withAuditSubsystem(ctx context.Context, subsystem string) context.Context {
 func AuditCallerFromContext(ctx context.Context) *auditlog.Caller {
 	if ctx != nil {
 		if access, ok := controlplane.AccessFromContext(ctx); ok {
+			if call, bridged := auditlog.SSHGatewayCallFromContext(ctx); bridged {
+				return &auditlog.Caller{Kind: string(controlplane.PrincipalSandboxKey), ID: call.SandboxID, Via: access.Via}
+			}
 			return callerFromAccess(access)
 		}
 	}
@@ -84,6 +93,19 @@ func callerFromAccess(a controlplane.Access) *auditlog.Caller {
 		// Only team-bound credentials select a team (§5.3); "*" records
 		// that a fleet binding acted across teams.
 		c.Team = a.Team()
+	}
+	return c
+}
+
+// sandboxKeyCaller is the caller of an SSH session record: the sandbox's
+// key, via the edge node when a peer forwarded the request that opened the
+// session (the gateway's own calls carry no Access, so no Via).
+func sandboxKeyCaller(ctx context.Context, sandboxID string) *auditlog.Caller {
+	c := &auditlog.Caller{Kind: string(controlplane.PrincipalSandboxKey), ID: strings.TrimSpace(sandboxID)}
+	if ctx != nil {
+		if access, ok := controlplane.AccessFromContext(ctx); ok {
+			c.Via = access.Via
+		}
 	}
 	return c
 }

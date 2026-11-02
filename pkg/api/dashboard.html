@@ -753,6 +753,13 @@ function promptFor(mode, promptValuesSupported) {
 
 function redirectURI(loc) { return loc.origin + "/ui"; }
 
+// oidcScope adds groups where the provider makes the groups claim a scope
+// (Dex, for one): without it the ID token carries no groups and no group rule
+// can match. Same rule as the CLI's ssoScopes.
+function oidcScope(scopesSupported) {
+  return Array.isArray(scopesSupported) && scopesSupported.includes("groups") ? OIDC_SCOPE + " groups" : OIDC_SCOPE;
+}
+
 // authorizeURL is the authorization-code request with PKCE. The dashboard
 // is a public client: no secret anywhere (§5.7).
 function authorizeURL(endpoint, p) {
@@ -761,7 +768,7 @@ function authorizeURL(endpoint, p) {
   q.set("response_type", "code");
   q.set("client_id", p.clientId);
   q.set("redirect_uri", p.redirectUri);
-  q.set("scope", OIDC_SCOPE);
+  q.set("scope", oidcScope(p.scopesSupported));
   q.set("state", p.state);
   q.set("nonce", p.nonce);
   q.set("code_challenge", p.challenge);
@@ -771,8 +778,9 @@ function authorizeURL(endpoint, p) {
 }
 
 // providerMetadata reads the provider's own discovery document: where to
-// send the person, where to redeem the code, and which prompt values it
-// supports. connect-src allows the issuer's origin for exactly this fetch.
+// send the person, where to redeem the code, and which prompt values and
+// scopes it supports. connect-src allows the issuer's origin for exactly
+// this fetch.
 async function providerMetadata(fetchFn, issuerURL) {
   const base = String(issuerURL).replace(/\/+$/, "");
   const res = await fetchFn(base + "/.well-known/openid-configuration", { headers: { Accept: "application/json" } });
@@ -785,6 +793,7 @@ async function providerMetadata(fetchFn, issuerURL) {
     authorization_endpoint: authz,
     token_endpoint: token,
     prompt_values_supported: Array.isArray(doc.prompt_values_supported) ? doc.prompt_values_supported : [],
+    scopes_supported: Array.isArray(doc.scopes_supported) ? doc.scopes_supported : [],
   };
 }
 
@@ -1612,7 +1621,7 @@ async function beginRedirect(issuer, mode) {
   store.set(KEYS.lastIssuer, issuer.name);
   return authorizeURL(meta.authorization_endpoint, {
     clientId: issuer.client, redirectUri: redirectURI(window.location), state, nonce, challenge,
-    prompt: promptFor(mode, meta.prompt_values_supported),
+    prompt: promptFor(mode, meta.prompt_values_supported), scopesSupported: meta.scopes_supported,
   });
 }
 

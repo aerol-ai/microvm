@@ -50,6 +50,7 @@ func TestNFTSetsAndEncoding(t *testing.T) {
 		{SetDenyCIDR, Elem{Src: src, SrcEnd: srcRange, Dst: dst}},
 		{SetDenyFloor, Elem{Src: src, SrcEnd: srcRange, Dst: dst, DstEnd: end}},
 		{SetNodeControl, Elem{Src: src, SrcEnd: srcRange, Dst: dst, Port: 443}},
+		{SetNodeControl, Elem{Src: src, SrcEnd: srcRange, Dst: dst, DstEnd: end, Port: 22}},
 		{SetAllowLearned, Elem{Src: src, Dst: dst, Port: 443, Timeout: time.Minute}},
 		{SetBinLearned, Elem{Src: src, Dst: dst, Port: 80}},
 		{SetLearnFlows, Elem{Src: src, Dst: dst, Port: 53}},
@@ -76,6 +77,9 @@ func TestNFTSetsAndEncoding(t *testing.T) {
 		}
 		if c.elem.SrcEnd.IsValid() && got[0].SrcEnd != c.elem.SrcEnd {
 			t.Fatalf("%s src end = %s", c.set, got[0].SrcEnd)
+		}
+		if c.set == SetNodeControl && got[0] != c.elem {
+			t.Fatalf("%s round trip = %+v, want %+v", c.set, got[0], c.elem)
 		}
 	}
 

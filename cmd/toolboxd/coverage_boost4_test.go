@@ -251,7 +251,7 @@ func TestHelperProcessStartReaper(t *testing.T) {
 
 func TestEnvdProcessStartConflictAndPtyInputBranches(t *testing.T) {
 	srv := newEnvdTestServer(t)
-	h := srv.routes()
+	h := authedRoutes(srv)
 
 	startPTYBody, _ := json.Marshal(map[string]any{
 		"process": map[string]any{"cmd": "/bin/sh", "args": []string{"-c", "cat"}},
@@ -316,7 +316,7 @@ func TestEnvdProcessStartConflictAndPtyInputBranches(t *testing.T) {
 
 func TestEnvdConnectKeepaliveAndCloseStdinNoop(t *testing.T) {
 	srv := newEnvdTestServer(t)
-	h := srv.routes()
+	h := authedRoutes(srv)
 
 	root := t.TempDir()
 	startBody, _ := json.Marshal(map[string]any{
@@ -359,7 +359,7 @@ func TestEnvdConnectKeepaliveAndCloseStdinNoop(t *testing.T) {
 
 func TestEnvdCloseStdinNoopWhileRunning(t *testing.T) {
 	srv := newEnvdTestServer(t)
-	h := srv.routes()
+	h := authedRoutes(srv)
 
 	startBody, _ := json.Marshal(map[string]any{
 		"process": map[string]any{"cmd": "/bin/sh", "args": []string{"-c", "sleep 30"}},

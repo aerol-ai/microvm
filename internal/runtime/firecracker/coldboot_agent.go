@@ -92,9 +92,27 @@ func shellSingleQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", "'\\''") + "'"
 }
 
+// guestNoIPv6Arg starts every guest interface with IPv6 off: no address,
+// not even a link-local one or ::1. A guest is IPv4-only (the ip= clause
+// below, the TAP /30), and every host rule between a guest and its node is
+// IPv4. This is defence in depth; the boundary is the node: the TAP's host
+// end has IPv6 off and the node's IPv6 fence drops whatever a guest sends,
+// so root in a guest switching the sysctl back on gains nothing. That is
+// also why it is ipv6.disable_ipv6=1 (the ipv6 module's default for every
+// interface, honoured on the command line with IPv6 built in, as in the
+// Firecracker CI guest kernels) and not ipv6.disable=1: that one removes the
+// IPv6 stack, so socket(AF_INET6) fails with EAFNOSUPPORT and a workload
+// that listens on [::] (nginx's stock listen [::]:80, python3 -m
+// http.server) fails in a VM while it works on every other runtime. With
+// disable_ipv6, [::] still binds dual-stack and takes IPv4, as in a
+// container. Templates take it at snapshot time; one snapshotted before it
+// keeps IPv6 in its guests, held back by the node the same way.
+const guestNoIPv6Arg = "ipv6.disable_ipv6=1"
+
 // coldBootArgs builds the kernel command line for a cold-boot guest that
 // runs the injected agent. It extends the base args with:
 //
+//   - ipv6.disable_ipv6=1 — always (guestNoIPv6Arg).
 //   - ip=<guest>::<gw>:<mask>::eth0:off — kernel IP autoconfig (CONFIG_IP_PNP)
 //     so eth0 is up before userspace; the agent's HTTP server is then
 //     reachable at GuestIP:2280 over the TAP without an in-guest DHCP client.
@@ -106,7 +124,7 @@ func shellSingleQuote(s string) string {
 // toolboxInjected is false the init= clause is omitted so an agent-less
 // cold-boot falls back to the image's own init.
 func coldBootArgs(slot *TapSlot, toolboxInjected bool) string {
-	args := baseBootArgsFor(runtime.GOARCH)
+	args := baseBootArgsFor(runtime.GOARCH) + " " + guestNoIPv6Arg
 	if ipClause := kernelIPArg(slot); ipClause != "" {
 		args += " " + ipClause
 	}

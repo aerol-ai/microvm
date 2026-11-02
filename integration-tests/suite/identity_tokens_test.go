@@ -470,7 +470,11 @@ func TestIdentityFacadesWithTeamToken(t *testing.T) {
 
 // UC-287 — an SSH session through the gateway writes one api record whose
 // caller is the sandbox key, and the sandbox's create record names the
-// token that made it.
+// token that made it. On a cluster the gateway that takes the connection is
+// often not the owner's: it bridges the session through its own node's
+// sessions API with the operator token, and the owner must still hold the
+// ssh record and must not name the operator for the bridged calls (the
+// sandbox key holder made them, via the gateway's node).
 func TestIdentitySSHSessionRecord(t *testing.T) {
 	harness.Require(t, sc, "UC-287")
 	tok := mintToken(t, "uc287", "runner", harness.TeamPayments)
@@ -520,6 +524,16 @@ func TestIdentitySSHSessionRecord(t *testing.T) {
 	}
 	if len(byCallerRoute(evs, tok.ID, routeCreate)) != 1 {
 		t.Fatalf("the sandbox's create record does not name its creator %s:\n%s", tok.ID, describeEvents(evs))
+	}
+	// Single node: the gateway talks to the toolbox directly and there are
+	// no bridged calls, so this holds trivially.
+	bridged := harness.FilterAudit(evs, func(ev auditlog.Event) bool {
+		return ev.Ref != auditlog.RefSSH && ev.Request != nil && strings.HasPrefix(ev.Request.Route, "/v1/sandboxes/{id}/sessions")
+	})
+	for _, ev := range bridged {
+		if ev.Caller == nil || ev.Caller.Kind != "sandbox_key" || ev.Caller.ID != sb.ID {
+			t.Fatalf("a call the SSH gateway bridged is not the sandbox key's:\n%s", describeEvents(bridged))
+		}
 	}
 }
 

@@ -89,6 +89,38 @@ func (h *handlers) idempotentCreateID(r *http.Request) string {
 	return clustercreate.DeterministicSandboxID(service.OwnerRefForCreate(r.Context()), r.Header.Get(clustercreate.HeaderIdempotencyKey))
 }
 
+// withIdempotencyKey names the request's Idempotency-Key on its context, so a
+// refused reuse of the key says which key it was.
+func withIdempotencyKey(r *http.Request) *http.Request {
+	key := strings.TrimSpace(r.Header.Get(clustercreate.HeaderIdempotencyKey))
+	if key == "" {
+		return r
+	}
+	return r.WithContext(service.WithIdempotencyKey(r.Context(), key))
+}
+
+// stampCreateRequestDigests sets req.CreateRequestDigests to the keyed
+// digests of the request as the client sent it, before any server default,
+// when the create carries an Idempotency-Key; otherwise clears it, so a
+// client cannot supply its own. encoding/json writes map keys sorted, so a
+// retry that orders its env or tags differently digests the same.
+func (h *handlers) stampCreateRequestDigests(r *http.Request, req *models.CreateSandboxRequest) error {
+	req.CreateRequestDigests = nil
+	if strings.TrimSpace(r.Header.Get(clustercreate.HeaderIdempotencyKey)) == "" {
+		return nil
+	}
+	canonical, err := json.Marshal(req)
+	if err != nil {
+		return err
+	}
+	digests, err := h.deps.Service.CreateRequestDigests("v1", canonical)
+	if err != nil {
+		return err
+	}
+	req.CreateRequestDigests = digests
+	return nil
+}
+
 func (h *handlers) clusterCreateWrap(w http.ResponseWriter, r *http.Request) {
 	// Parse the body up front so an invalid JSON request fails fast with 400
 	// without consuming a placement slot — and so the test that passes a nil
@@ -111,6 +143,16 @@ func (h *handlers) clusterCreateWrap(w http.ResponseWriter, r *http.Request) {
 	// can read it.
 	r.Body = io.NopCloser(bytes.NewReader(raw))
 	r.ContentLength = int64(len(raw))
+	r = withIdempotencyKey(r)
+	// A create forwarded by the node that placed it carries the digests that
+	// node took of the client's request; its body here already has the
+	// router's defaults applied, so digesting it again would not match.
+	if strings.TrimSpace(r.Header.Get(clustercreate.HeaderTarget)) == "" {
+		if err := h.stampCreateRequestDigests(r, &req); err != nil {
+			apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
+			return
+		}
+	}
 
 	if h.deps.Service == nil {
 		h.createSandbox(w, r)
@@ -334,6 +376,14 @@ func (h *handlers) clusterListWrap(w http.ResponseWriter, r *http.Request) {
 		h.listSandboxesLocalPage(w, r)
 		return
 	}
+	// A list that fans out takes one of this node's list slots, or is
+	// answered 503 + Retry-After at once when they are all taken.
+	release, err := clusterlist.Admit(h.deps.ListGate, c, r)
+	if err != nil {
+		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
+		return
+	}
+	defer release()
 
 	ownerRef := clusterlist.OwnerRefFromContext(r.Context())
 	limit, pageToken := clusterlist.ParsePageParams(r.URL)
@@ -418,6 +468,11 @@ func (h *handlers) listSandboxesLocalPage(w http.ResponseWriter, r *http.Request
 func (h *handlers) clusterListByName(w http.ResponseWriter, r *http.Request, c cluster.Client, name string) {
 	_, owner, err := c.OwnerOfName(service.OwnerRefForCreate(r.Context()), name)
 	switch {
+	case errors.Is(err, cluster.ErrUnknownSandbox) && !cluster.CaughtUp(c):
+		// The index may not have applied this name yet: an empty list would
+		// read as "no such sandbox".
+		clusterroute.WriteNotCaughtUp(w, apihttp.WriteError)
+		return
 	case errors.Is(err, cluster.ErrUnknownSandbox):
 		h.listSandboxes(w, r)
 		return
@@ -544,6 +599,12 @@ func (h *handlers) writeClusterSandboxIndex(w http.ResponseWriter, r *http.Reque
 			ShardCount: parsePositiveIntQuery(r, "shard_count"),
 			Shards:     parseRepeatedIntQuery(r, "shard"),
 		},
+	}
+	if !cluster.CaughtUp(c) {
+		// PlacementPage would be an empty non-authoritative page: a fleet
+		// scan that silently skips every sandbox.
+		clusterroute.WriteNotCaughtUp(w, apihttp.WriteError)
+		return
 	}
 	resp := c.PlacementPage(req)
 
@@ -1220,7 +1281,7 @@ func (h *handlers) clusterInternalPlacementByName(w http.ResponseWriter, r *http
 	id, owner, err := c.OwnerOfNameKey(string(decoded))
 	if err != nil {
 		if errors.Is(err, cluster.ErrUnknownSandbox) {
-			apihttp.WriteError(w, http.StatusNotFound, "no placement record")
+			writeInternalNoPlacement(w, c)
 			return
 		}
 		if errors.Is(err, cluster.ErrOrphaned) {
@@ -1235,11 +1296,24 @@ func (h *handlers) clusterInternalPlacementByName(w http.ResponseWriter, r *http
 	}
 	p, ok := c.PlacementOf(id)
 	if !ok {
-		apihttp.WriteError(w, http.StatusNotFound, "no placement record")
+		writeInternalNoPlacement(w, c)
 		return
 	}
 	redactPlacementSecretFields(&p)
 	apihttp.WriteJSON(w, http.StatusOK, cluster.PlacementLookupResponse{SandboxID: id, Placement: p, Owner: owner})
+}
+
+// writeInternalNoPlacement answers a worker/ingress agent's lookup for a
+// placement this server's FSM does not hold. The agent reads 404 as "no such
+// sandbox" and its own local handler then answers 404 to the client; a 503
+// makes it ask the next server instead, which is what it must do while this
+// server is still catching up after a restart.
+func writeInternalNoPlacement(w http.ResponseWriter, c cluster.Client) {
+	if !cluster.CaughtUp(c) {
+		clusterroute.WriteNotCaughtUp(w, apihttp.WriteError)
+		return
+	}
+	apihttp.WriteError(w, http.StatusNotFound, "no placement record")
 }
 
 func (h *handlers) writeInternalPlacement(w http.ResponseWriter, id string) {
@@ -1254,7 +1328,7 @@ func (h *handlers) writeInternalPlacement(w http.ResponseWriter, id string) {
 	}
 	p, ok := c.PlacementOf(id)
 	if !ok {
-		apihttp.WriteError(w, http.StatusNotFound, "no placement record")
+		writeInternalNoPlacement(w, c)
 		return
 	}
 	redactPlacementSecretFields(&p)
@@ -1336,6 +1410,12 @@ func (h *handlers) clusterInternalSnapshotNode(w http.ResponseWriter, r *http.Re
 		apihttp.WriteError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	if !found && !cluster.CaughtUp(c) {
+		// "No home entry" sends the agent to its local store, which 404s a
+		// snapshot held elsewhere; let it ask a server that has caught up.
+		clusterroute.WriteNotCaughtUp(w, apihttp.WriteError)
+		return
+	}
 	apihttp.WriteJSON(w, http.StatusOK, cluster.SnapshotNodeQueryResponse{NodeID: node, Found: found})
 }
 
@@ -1343,6 +1423,12 @@ func (h *handlers) clusterInternalPlacements(w http.ResponseWriter, r *http.Requ
 	c := h.deps.Service.Cluster()
 	if c == nil {
 		apihttp.WriteError(w, http.StatusServiceUnavailable, "cluster: not enabled on this node")
+		return
+	}
+	if !cluster.CaughtUp(c) {
+		// The whole view, still short of rows: the agent would read every
+		// missing row as absent.
+		clusterroute.WriteNotCaughtUp(w, apihttp.WriteError)
 		return
 	}
 	placements := c.Placements()
@@ -1379,6 +1465,12 @@ func (h *handlers) clusterInternalPlacementsPage(w http.ResponseWriter, r *http.
 	var req cluster.PlacementPageRequest
 	if err := apihttp.DecodeJSON(w, r, &req); err != nil {
 		apihttp.WriteError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	if !cluster.CaughtUp(c) {
+		// The agent marks any 200 page authoritative; a page short of rows
+		// would become an empty list or a reconcile that sees nothing placed.
+		clusterroute.WriteNotCaughtUp(w, apihttp.WriteError)
 		return
 	}
 	resp := c.PlacementPage(req)
@@ -1537,6 +1629,11 @@ func (h *handlers) clusterInternalPlacementsByIDs(w http.ResponseWriter, r *http
 		apihttp.WriteError(w, http.StatusBadRequest, "too many placement ids")
 		return
 	}
+	if !cluster.CaughtUp(c) {
+		// A missing key in this map means "absent" to the caller.
+		clusterroute.WriteNotCaughtUp(w, apihttp.WriteError)
+		return
+	}
 	out := c.PlacementsByIDs(req.IDs)
 	for id, p := range out {
 		minimizePlacementBatchRecord(&p)
@@ -1637,7 +1734,7 @@ func (h *handlers) clusterInternalSelectPlacement(w http.ResponseWriter, r *http
 	if sandboxID := strings.TrimSpace(req.SandboxID); sandboxID != "" {
 		target, recipients, err := c.SelectPlacementForCreate(req.Request, sandboxID, req.RecipientBackups)
 		if err != nil {
-			apihttp.WriteJSON(w, http.StatusOK, cluster.SelectPlacementResponse{Error: err.Error()})
+			apihttp.WriteJSON(w, http.StatusOK, cluster.SelectPlacementErrorResponse(err))
 			return
 		}
 		apihttp.WriteJSON(w, http.StatusOK, cluster.SelectPlacementResponse{Target: target, Recipients: recipients})
@@ -1650,7 +1747,7 @@ func (h *handlers) clusterInternalSelectPlacement(w http.ResponseWriter, r *http
 	if req.TargetOnly {
 		target, err := c.SelectPlacement(req.Request)
 		if err != nil {
-			apihttp.WriteJSON(w, http.StatusOK, cluster.SelectPlacementResponse{Error: err.Error()})
+			apihttp.WriteJSON(w, http.StatusOK, cluster.SelectPlacementErrorResponse(err))
 			return
 		}
 		apihttp.WriteJSON(w, http.StatusOK, cluster.SelectPlacementResponse{Target: target})
@@ -1658,7 +1755,7 @@ func (h *handlers) clusterInternalSelectPlacement(w http.ResponseWriter, r *http
 	}
 	target, candidates, err := c.SelectPlacementWithCandidates(req.Request)
 	if err != nil {
-		apihttp.WriteJSON(w, http.StatusOK, cluster.SelectPlacementResponse{Error: err.Error()})
+		apihttp.WriteJSON(w, http.StatusOK, cluster.SelectPlacementErrorResponse(err))
 		return
 	}
 	apihttp.WriteJSON(w, http.StatusOK, cluster.SelectPlacementResponse{Target: target, Candidates: candidates})
@@ -1976,6 +2073,10 @@ func (h *handlers) clusterPlacement(w http.ResponseWriter, r *http.Request) {
 	owner, ownerErr := c.OwnerOf(id)
 	if ownerErr != nil && !errors.Is(ownerErr, cluster.ErrOrphaned) {
 		if errors.Is(ownerErr, cluster.ErrUnknownSandbox) {
+			if !cluster.CaughtUp(c) {
+				clusterroute.WriteNotCaughtUp(w, apihttp.WriteError)
+				return
+			}
 			apihttp.WriteError(w, http.StatusNotFound, "no placement record")
 			return
 		}

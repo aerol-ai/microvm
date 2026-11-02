@@ -10,3 +10,6 @@ capabilities:
   - docker
   - docker-engine
   - platform-volumes
+  # install.sh --local runs without the host firewall: network policy on a
+  # container sandbox is refused, fail closed (PR #846).
+  - no-host-firewall

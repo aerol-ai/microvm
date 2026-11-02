@@ -2,8 +2,10 @@ package containerd
 
 import (
 	"context"
+	"errors"
 	"testing"
 
+	cntr "github.com/containerd/containerd/v2/client"
 	"github.com/opencontainers/runtime-spec/specs-go"
 )
 
@@ -92,4 +94,55 @@ func TestSetNetnsHandoff(t *testing.T) {
 	if d.netns == nil {
 		t.Fatal("handoff not wired")
 	}
+}
+
+// SandboxContainerExists is the netns pool's boot-time ownership test. It must
+// say "owned" for a stopped or warm-adopted sandbox and only say "gone" on a
+// confirmed NotFound; anything else is an error the caller keeps the slot for.
+func TestSandboxContainerExists(t *testing.T) {
+	ctx := context.Background()
+	t.Run("container under the sandbox id, stopped", func(t *testing.T) {
+		tr := newFakeTransport()
+		tr.containers["sb-stopped"] = &fakeContainer{id: "sb-stopped"}
+		d := newTestDriver(t)
+		d.SetClient(NewTestClient("aerolvm", tr))
+		if ok, err := d.SandboxContainerExists(ctx, "sb-stopped"); err != nil || !ok {
+			t.Fatalf("exists=%v err=%v, want true", ok, err)
+		}
+	})
+	t.Run("warm-adopted sandbox found by label", func(t *testing.T) {
+		tr := newFakeTransport()
+		tr.containers["park-1"] = &fakeContainer{id: "park-1", labels: map[string]string{sandboxIDLabelKey: "sb-adopted"}}
+		d := newTestDriver(t)
+		d.SetClient(NewTestClient("aerolvm", tr))
+		if ok, err := d.SandboxContainerExists(ctx, "sb-adopted"); err != nil || !ok {
+			t.Fatalf("exists=%v err=%v, want true", ok, err)
+		}
+	})
+	t.Run("gone", func(t *testing.T) {
+		d := newTestDriver(t)
+		if ok, err := d.SandboxContainerExists(ctx, "sb-gone"); err != nil || ok {
+			t.Fatalf("exists=%v err=%v, want false", ok, err)
+		}
+	})
+	t.Run("containerd error is not gone", func(t *testing.T) {
+		tr := newFakeTransport()
+		tr.loadContainerFn = func(context.Context, string) (cntr.Container, error) {
+			return nil, errors.New("connection reset")
+		}
+		d := newTestDriver(t)
+		d.SetClient(NewTestClient("aerolvm", tr))
+		if _, err := d.SandboxContainerExists(ctx, "sb-x"); err == nil {
+			t.Fatal("want the containerd error surfaced")
+		}
+	})
+	t.Run("no client", func(t *testing.T) {
+		orig := connectFn
+		connectFn = func(string, string) (*Client, error) { return nil, errors.New("no socket") }
+		t.Cleanup(func() { connectFn = orig })
+		d := New(Config{}, nil, nil)
+		if _, err := d.SandboxContainerExists(ctx, "sb-x"); err == nil {
+			t.Fatal("want connect error")
+		}
+	})
 }

@@ -13,6 +13,7 @@ import (
 	"github.com/aerol-ai/microvm/pkg/capacity"
 	"github.com/aerol-ai/microvm/pkg/controlplane"
 	"github.com/aerol-ai/microvm/pkg/models"
+	"github.com/aerol-ai/microvm/pkg/mounts"
 	"github.com/aerol-ai/microvm/pkg/secrets"
 	"github.com/aerol-ai/microvm/pkg/wasmmod"
 )
@@ -75,6 +76,11 @@ func Classify(err error) Classification {
 	switch {
 	case errors.Is(err, store.ErrNotFound):
 		return Classification{Status: http.StatusNotFound, Message: "sandbox not found", Kind: ErrKindNotFound}
+	// A keyed create whose Idempotency-Key was used with a different request.
+	// The text names the key (models.IdempotencyKeyReusedError) and nothing
+	// about the sandbox; no Retry-After, since the same request fails again.
+	case errors.Is(err, models.ErrIdempotencyKeyReused):
+		return Classification{Status: http.StatusUnprocessableEntity, Code: models.ErrorCodeIdempotencyKeyReused, Message: idempotencyKeyReusedMessage(err)}
 
 	// Fleet admission verdicts (managed builds only). Denied is a definite
 	// 403; unavailable is a retryable 503.
@@ -116,12 +122,41 @@ func Classify(err error) Classification {
 	case errors.Is(err, service.ErrWakeCircuitOpen):
 		return Classification{Status: http.StatusServiceUnavailable, RetryAfter: 60, Message: err.Error()}
 
+	// Load shedding (admission.go): this node runs as many requests of an
+	// expensive kind as it is configured to. Retryable at once, no log line
+	// (a storm would otherwise write one per refused request).
+	case errors.Is(err, ErrOverloaded):
+		return Classification{Status: http.StatusServiceUnavailable, RetryAfter: OverloadedRetryAfterSeconds, Code: models.ErrorCodeOverloaded, Message: ErrOverloaded.Error()}
+	// The caller's own tenant holds its share of those slots: 429, so the
+	// noisy tenant (not the node) is named as the one to slow down.
+	case errors.Is(err, ErrRateLimited):
+		return Classification{Status: http.StatusTooManyRequests, RetryAfter: RateLimitedRetryAfterSeconds, Code: models.ErrorCodeRateLimited, Message: ErrRateLimited.Error()}
+
 	case errors.Is(err, service.ErrSecretAuditBusy):
 		return Classification{Status: http.StatusTooManyRequests, RetryAfter: 1, Message: service.ErrSecretAuditBusy.Error()}
 	case errors.Is(err, service.ErrSecretAuditChainBroken):
 		return Classification{Status: http.StatusServiceUnavailable, Message: service.ErrSecretAuditChainBroken.Error()}
 	case errors.Is(err, service.ErrClusterFinalizationUnavailable):
 		return Classification{Status: http.StatusServiceUnavailable, RetryAfter: 5, Message: service.ErrClusterFinalizationUnavailable.Error()}
+
+	// A network policy this node's host firewall would leave unenforced. It
+	// also matches ErrRuntimeNotImplemented, so it must come first to keep
+	// its code.
+	case errors.Is(err, service.ErrNetworkPolicyUnenforced):
+		return Classification{Status: http.StatusNotImplemented, Code: models.ErrorCodeNetworkPolicyUnenforced, Message: err.Error()}
+
+	// A mount whose tool is not installed on this node (a local install
+	// skips them): the node's configuration, not the request, so not the
+	// catch-all 400. 501 like the policy refusal above, not 503: every SDK
+	// retries 503, and a missing program will not appear between retries.
+	// Logged, so the node's journal names the missing tool.
+	case errors.Is(err, mounts.ErrMountToolUnavailable):
+		return Classification{Status: http.StatusNotImplemented, Code: models.ErrorCodeMountToolUnavailable, Message: err.Error(), Log: true, LogLevel: slog.LevelWarn}
+
+	// The node cannot keep IPv6 off its sandbox networks right now. The
+	// cause (a netlink error) is for the node's log, not the caller.
+	case errors.Is(err, service.ErrIPv6FenceNotReady):
+		return Classification{Status: http.StatusServiceUnavailable, RetryAfter: 5, Code: models.ErrorCodeIPv6FenceNotReady, Message: service.ErrIPv6FenceNotReady.Error(), Log: true, LogLevel: slog.LevelError}
 
 	// An option this runtime/build can't honor is 501, not 400.
 	case errors.Is(err, models.ErrRuntimeNotImplemented):
@@ -130,6 +165,13 @@ func Classify(err error) Classification {
 	// Egress sentinels (plans/egress-domain-filtering.md).
 	case errors.Is(err, service.ErrEgressOperatorConfigInvalid):
 		return Classification{Status: http.StatusServiceUnavailable, Code: models.ErrorCodeEgressOperatorConfigInvalid, Message: err.Error()}
+	case errors.Is(err, service.ErrNodeGuardNotReady):
+		// The cause (an iptables error) is for the node's log, not the caller.
+		return Classification{Status: http.StatusServiceUnavailable, RetryAfter: 5, Code: models.ErrorCodeNodeGuardNotReady, Message: service.ErrNodeGuardNotReady.Error(), Log: true, LogLevel: slog.LevelError}
+	case errors.Is(err, service.ErrEgressFloorNotReady):
+		// The cause (an iptables or netlink error) is for the node's log,
+		// not the caller.
+		return Classification{Status: http.StatusServiceUnavailable, RetryAfter: 5, Code: models.ErrorCodeEgressFloorNotReady, Message: service.ErrEgressFloorNotReady.Error(), Log: true, LogLevel: slog.LevelError}
 	case errors.Is(err, service.ErrEgressGatewayUnavailable), errors.Is(err, cluster.ErrNoEgressGatewayTarget):
 		return Classification{Status: http.StatusServiceUnavailable, RetryAfter: 5, Code: models.ErrorCodeEgressGatewayUnavailable, Message: err.Error()}
 	case errors.Is(err, service.ErrEgressSpecCommitFailed):
@@ -242,6 +284,16 @@ func Classify(err error) Classification {
 		return Classification{Status: http.StatusServiceUnavailable, RetryAfter: cluster.InvalidTopologyRetryAfterSeconds, Message: err.Error()}
 	case errors.Is(err, cluster.ErrNoPlacementTarget):
 		return Classification{Status: http.StatusServiceUnavailable, Message: err.Error()}
+	// A write that found no reachable leader: an election is in flight.
+	// Retryable, and worded without the error itself, which names the old
+	// leader's internal address.
+	case cluster.IsLeaderUnavailable(err):
+		return Classification{Status: http.StatusServiceUnavailable, RetryAfter: cluster.LeaderChangeRetryAfterSeconds, Message: "cluster leader unavailable (an election is in progress); retry shortly", LogLevel: slog.LevelInfo, Log: true}
+	// A restarted node whose placement view has not caught up cannot prove a
+	// sandbox is gone: retry, never 404 (a client that trusts a 404 leaks
+	// the sandbox, its secrets and its capacity).
+	case errors.Is(err, cluster.ErrNotCaughtUp):
+		return Classification{Status: http.StatusServiceUnavailable, RetryAfter: cluster.CatchUpRetryAfterSeconds, Message: "this node is catching up with the cluster after a restart; retry shortly"}
 
 	default:
 		return Classification{Status: http.StatusBadRequest, Message: truncate(err.Error()), Kind: ErrKindUnclassified, LogLevel: slog.LevelWarn, Log: true}
@@ -263,4 +315,12 @@ func (c Classification) SetRetryAfter(w http.ResponseWriter) {
 	if c.RetryAfter > 0 {
 		w.Header().Set("Retry-After", strconv.Itoa(c.RetryAfter))
 	}
+}
+
+func idempotencyKeyReusedMessage(err error) string {
+	var reused *models.IdempotencyKeyReusedError
+	if errors.As(err, &reused) {
+		return truncate(reused.Error())
+	}
+	return (&models.IdempotencyKeyReusedError{}).Error()
 }

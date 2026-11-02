@@ -49,6 +49,12 @@ type Config struct {
 	// start, then cmd.Wait: right for a host that reaps nothing (the WASM
 	// tool host).
 	StartProcess func(cmd *exec.Cmd, start func() error) (wait func() (code int, signal string), err error)
+	// BaseEnv returns the environment a session starts from, before the
+	// request's own env is laid on top. Nil means os.Environ(). toolboxd
+	// sets it so sessions, terminals and envd processes see the sandbox env
+	// a Firecracker host pushed over vsock (cmd/toolboxd/sandboxenv), which
+	// is not in toolboxd's own process environment.
+	BaseEnv func() []string
 }
 
 // Manager owns every Session running in the container.
@@ -254,7 +260,7 @@ func (m *Manager) Create(ctx context.Context, req models.CreateSessionRequest) (
 	if req.WorkDir != "" {
 		cmd.Dir = req.WorkDir
 	}
-	cmd.Env = append(mergeEnv(req.Env), loginshell.EnvFor(req.Env)...)
+	cmd.Env = append(mergeEnvOnto(m.baseEnv(), req.Env), loginshell.EnvFor(req.Env)...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		Setsid:  req.PTY,
 		Setpgid: !req.PTY,
@@ -473,12 +479,22 @@ func newSessionID() (string, error) {
 	return "ses-" + hex.EncodeToString(buf), nil
 }
 
-func mergeEnv(extra map[string]string) []string {
-	base := append([]string{}, os.Environ()...)
+// mergeEnvOnto appends a request's env after base, so a key the request sets
+// wins (os/exec keeps the last value of a repeated key).
+func mergeEnvOnto(base []string, extra map[string]string) []string {
+	out := append([]string{}, base...)
 	for k, v := range extra {
-		base = append(base, k+"="+v)
+		out = append(out, k+"="+v)
 	}
-	return base
+	return out
+}
+
+// baseEnv is the environment every session starts from.
+func (m *Manager) baseEnv() []string {
+	if m.cfg.BaseEnv != nil {
+		return m.cfg.BaseEnv()
+	}
+	return os.Environ()
 }
 
 func orDefault(v, fallback int) int {

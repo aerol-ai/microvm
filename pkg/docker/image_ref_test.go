@@ -110,3 +110,38 @@ func TestIsSnapshotImageRef(t *testing.T) {
 		t.Error("snapshots committed under snapshots/ names must stay local only")
 	}
 }
+
+// Every spelling of a committed snapshot tag canonicalizes to the exact string
+// SnapshotImageTagForOwner returned, so the tag works as a lookup key however
+// the caller wrote it; refs outside the snapshot namespace have no canonical
+// tag.
+func TestCanonicalSnapshotImageTag(t *testing.T) {
+	tag := SnapshotImageTagForOwner("tenant-a", "demo")
+	bare := strings.TrimSuffix(tag, ":latest")
+	digest := bare + "@sha256:" + strings.Repeat("0", 64)
+	for _, tc := range []struct {
+		ref    string
+		want   string
+		wantOK bool
+	}{
+		{ref: tag, want: tag, wantOK: true},
+		{ref: bare, want: tag, wantOK: true},
+		{ref: "docker.io/" + tag, want: tag, wantOK: true},
+		{ref: " index.docker.io/" + bare + " ", want: tag, wantOK: true},
+		{ref: bare + ":v1", want: bare + ":v1", wantOK: true},
+		{ref: digest, want: digest, wantOK: true},
+		{ref: "ghcr.io/" + tag},
+		{ref: "aerolvm-snapshots/abc:latest"},
+		{ref: "snapshots/demo:v1"},
+		{ref: "Not A Ref"},
+		{ref: ""},
+	} {
+		got, ok := CanonicalSnapshotImageTag(tc.ref)
+		if got != tc.want || ok != tc.wantOK {
+			t.Errorf("CanonicalSnapshotImageTag(%q) = %q,%v, want %q,%v", tc.ref, got, ok, tc.want, tc.wantOK)
+		}
+		if ok != IsSnapshotImageRef(tc.ref) {
+			t.Errorf("CanonicalSnapshotImageTag(%q) ok=%v disagrees with IsSnapshotImageRef", tc.ref, ok)
+		}
+	}
+}

@@ -32,7 +32,9 @@ func NewClient(t *testing.T, sc *Scenario) *Client {
 	// Wrap the SDK's transport so we can read the server's self-reported create
 	// duration (Server-Timing) without touching any create call. Transparent: it
 	// only observes the response header, never alters the request or response.
-	timing := &serverTimingTransport{base: http.DefaultTransport}
+	// The base is the shared API-pool transport, so a node a case took down
+	// (MarkNodeDown) stops receiving this client's requests.
+	timing := &serverTimingTransport{base: SharedTransport()}
 	sdk, err := microvm.NewClientWithConfig(&sdktypes.MicroVMConfig{
 		APIUrl:     sc.BaseURL,
 		PATToken:   sc.PAT,

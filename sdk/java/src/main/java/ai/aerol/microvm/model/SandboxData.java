@@ -31,7 +31,8 @@ public class SandboxData {
     public boolean networkBlockAll;
     /**
      * Hostname-egress state on get (container runtimes): "active", "held" or
-     * "unavailable". Null otherwise, and on list results.
+     * "unavailable"; "unenforced" when the server's firewall is off and
+     * nothing filters the sandbox. Null otherwise, and on list results.
      */
     public String egressStatus;
     /** Egress profiles this sandbox references, and the generation of each live on it. */

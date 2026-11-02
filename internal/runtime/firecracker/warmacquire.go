@@ -87,7 +87,7 @@ func (d *Driver) SetWarmPool(p WarmPool) { d.warmPool = p }
 func (d *Driver) tryAcquireWarm(
 	ctx context.Context,
 	req models.CreateSandboxRequest,
-	sandboxID string,
+	sandboxID, toolboxToken string,
 	snap *TemplateResolution,
 	tapSlot *TapSlot,
 	overlayPath string,
@@ -285,6 +285,18 @@ func (d *Driver) tryAcquireWarm(
 			"tap", tapSlot.TapName)
 	}
 	cancel()
+	// The sandbox env, as on the cold path: the warm slot was loaded from a
+	// template snapshot before this sandbox existed. A failure releases the
+	// slot and shuts the VMM down through the deferred rollback above.
+	if err := d.deliverGuestEnv(ctx, vsockPath, slot.VsockCID, sandboxID, req.Env); err != nil {
+		return nil, false, err
+	}
+	// The sandbox's identity: the slot's agent was loaded from the template
+	// snapshot token-less and serves nothing until it is adopted. A failure
+	// rolls the slot back like any other.
+	if err := d.adoptGuest(ctx, vsockPath, slot.VsockCID, sandboxID, toolboxToken, adoptRemedyCreate); err != nil {
+		return nil, false, err
+	}
 	d.scheduleToolboxTCPProbe("warm_acquire", sandboxID, tapSlot, true)
 
 	// Register the warm handle + client into the driver's map so

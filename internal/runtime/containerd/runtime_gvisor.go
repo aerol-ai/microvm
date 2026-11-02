@@ -7,6 +7,7 @@ import (
 	cntr "github.com/containerd/containerd/v2/client"
 	"github.com/containerd/containerd/v2/core/containers"
 	"github.com/containerd/containerd/v2/pkg/oci"
+	"github.com/opencontainers/runtime-spec/specs-go"
 )
 
 // runscShimName is the containerd runtime handler for gVisor (runsc).
@@ -78,4 +79,19 @@ func (d *Driver) runtimeContainerOpt(ociRuntime string) (cntr.NewContainerOpts, 
 		return nil, err
 	}
 	return cntr.WithRuntime(name, opts), nil
+}
+
+// runscCgroupMount gives a gVisor sandbox a cgroup mount. With it, runsc puts
+// the container's tasks in their own "/<id>" cgroup and binds it at
+// /sys/fs/cgroup/<controller>, so toolboxd can set its pids.max
+// (pkg/gvisorpids). containerd's default spec has no cgroup mount (Docker's
+// has one), so a containerd gVisor sandbox ran in the sentry's root cgroup,
+// which has no pids.max to set: UC-320 read "none" there.
+func runscCgroupMount() specs.Mount {
+	return specs.Mount{
+		Destination: "/sys/fs/cgroup",
+		Type:        "cgroup",
+		Source:      "cgroup",
+		Options:     []string{"ro", "nosuid", "noexec", "nodev"},
+	}
 }

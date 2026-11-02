@@ -155,7 +155,7 @@ service except the KMS key of the last three.
 | `cluster-3-mixed-secrets-pkcs11` | `make integration-key-custody-pkcs11` | SoftHSM2 on every node, the same keys imported into each token |
 | `cluster-3-mixed-wrapped-kms` | `make integration-key-custody-kms` | A real AWS KMS key, with Terraform `key_custody = "wrapped"`; UC-311 disables and re-enables it |
 | `cluster-3-mixed-kms-switch` | `make integration-key-custody-kms-switch` | A real AWS KMS key with custody `file`; UC-312 runs the two-step switch from local to it |
-| `single-node-wrapped-kms` | `make integration-key-custody-single` | A real AWS KMS key, one node with `install.sh --key-custody wrapped` |
+| `single-node-wrapped-kms` | `make integration-key-custody-single` | A real AWS KMS key, one node with `install.sh --key-custody wrapped`; UC-316 replaces its root disk and restores a backup onto the fresh install |
 
 The vault and pkcs11 scenarios boot a plain local cluster. The cases
 (`suite/z_keycustody_*_test.go`, helpers in
@@ -185,6 +185,80 @@ Fixture notes:
 - SoftHSM2 keeps keys on the node's disk: the pkcs11 scenario proves the
   code path, not a network HSM. The one AWS CloudHSM run is operator-gated
   and not a scenario here (CloudHSM bills hourly per HSM).
+
+## Ingress load balancer (UC-356)
+
+`cluster-3-mixed-lb` (`make integration-cluster-mixed-lb`) is cluster-3-mixed
+with a health-checked AWS Network Load Balancer in front of the ingress
+nodes. Its `api-load-balancer` capability is the switch: run.sh applies and
+destroys with `api_load_balancer = "nlb"` for it and `"none"` for every other
+scenario, whatever `config/terraform.tfvars` says. The domain then resolves to
+the balancer's Elastic IP, and raw TCP ports to `tcp.<domain>` (one record
+per node), so the whole suite also runs through the balancer.
+
+UC-356 (`suite/api_lb_test.go`) checks the domain resolves to the balancer
+only, stops sandboxd on one non-seed node, and reads the balancer's own view
+(`aws elbv2 describe-target-health` on the 443 target group): the node must
+leave rotation within `AEROL_LB_OUT_OF_ROTATION_MAX` (default 20s), 60
+fresh-connection calls through the domain must then all succeed, and after
+the daemon restarts the node must be healthy again within
+`AEROL_LB_BACK_IN_ROTATION_MAX` (default 90s). Each call opens its own TCP
+and TLS connection on a transport of its own, so neither keep-alive nor the
+suite's shared client can hide a 502. The numbers land in
+`<reports>/cluster-3-mixed-lb-bank.json` under
+`api_load_balancer_daemon_outage`.
+
+The scenario needs the default local build, or a release that has
+`install.sh --lb-health-port` and `SB_L4_PUBLIC_HOST`. The reaper
+(`scripts/integration-reap.sh`) terminates instances only, so a scenario
+whose teardown failed keeps its balancer and Elastic IP until
+`integration-tests/run.sh cluster-3-mixed-lb --destroy-only`.
+
+## Overload is shed, not restarted (UC-361)
+
+UC-361 (`suite/overload_shed_test.go`) runs on any scenario with `cluster`,
+`domain` and `disruptive: true`. It drives `AEROL_OVERLOAD_CONCURRENCY`
+clients (default 1024, the step that broke the bank flagship) at
+`GET /v1/sandboxes` through the domain for `AEROL_OVERLOAD_SECONDS` (default
+60) with a client that never retries. Every answer must be 200 or a refusal
+with `Retry-After` (503 or 429); a 502, any other 5xx, a refused or reset
+connection, or a request hung past 30 s fails it. Over SSH it then checks
+that no sandboxd restarted on any node: the unit's `InvocationID` and
+`NRestarts` are unchanged (a watchdog restart does not raise `NRestarts`),
+and neither `journalctl -u sandboxd` nor `journalctl -t sandboxd-healthcheck`
+shows a start or a restart since the load began. Last, the list must be back
+to its baseline latency (the median of 5 in a row within 2x the idle p50, or
+the p50 plus 250 ms) within 60 s of the load stopping. The numbers, and each
+node's `aerolvm_api_list_shed_total`, land in `<reports>/<scenario>-bank.json`
+under `overload_shed_v1_sandboxes`; a run that shed nothing says so in the
+test log, since it never reached the shedding point.
+
+## One tenant's list storm does not degrade another (UC-362)
+
+UC-362 (`suite/list_fairness_test.go`) runs on a scenario with `cluster`,
+`domain`, `identity`, `docker`, `api-list-fairness` and `disruptive: true`:
+today `cluster-3-mixed-lb`, whose tfvars run the list gate at 8 slots with 2
+per tenant (`SB_API_LIST_MAX_INFLIGHT`, `SB_API_LIST_MAX_INFLIGHT_PER_TENANT`).
+That is on purpose: a healthy list holds its slot for milliseconds, so with
+the default 16 slots and 4 per tenant the suite's client may never fill a
+tenant's share, and the case is about what happens when it is full.
+
+It mints runner tokens for two teams (`payments`, noisy; `checkout`, quiet),
+gives each `AEROL_FAIRNESS_SANDBOXES` sandboxes (default 3) so every list
+fans out to owner nodes, then lists as both at once for
+`AEROL_FAIRNESS_SECONDS` (default 60): `AEROL_FAIRNESS_NOISY` clients
+(default 1024) and `AEROL_FAIRNESS_QUIET` (default 4), each pinned to one
+ingress node round-robin on its own tenant's connection, so every node serves
+both. It first reads each node's gate size from `/v1/metrics` and refuses to
+run when the quiet tenant's clients would not fit inside its own share on a
+node. It passes when the quiet team's lists succeed at least 99% of the time
+with a p99 within `AEROL_FAIRNESS_QUIET_P99_MS` (default 2000), the noisy
+team got at least one `429` with code `rate_limited` and `Retry-After` and no
+`502`, other 5xx, refusal without `Retry-After`, transport error or request
+over 30 s, and no sandboxd restarted (UC-361's checks). The numbers land in
+`<reports>/<scenario>-bank.json` under `list_fairness_v1_sandboxes`, with
+each node's `429`/`503` counts. A run whose noisy team never got a `429`
+fails and says to raise `AEROL_FAIRNESS_NOISY`.
 
 ## Enterprise scenarios and the audit witness
 

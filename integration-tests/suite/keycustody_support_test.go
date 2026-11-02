@@ -264,10 +264,13 @@ func kcHAFailover(t *testing.T, targets *harness.IntegrationTargets, id, key, se
 		t.Fatalf("owner %s of %s is not a node this suite can reach", owner, id)
 	}
 	// Read and exec through a node that stays up, on its own loopback API.
-	// The suite's clients share http.DefaultTransport, whose keep-alive pool
-	// can stay pinned to the victim's ingress: every call then gets a 502
-	// from its Caddy for as long as the victim is down, though the cluster
-	// failed over in seconds (the first wrapped-kms run lost UC-310 to that).
+	// The suite's clients once shared http.DefaultTransport, whose keep-alive
+	// pool could stay pinned to the victim's ingress: every call then got a
+	// 502 from its Caddy for as long as the victim was down, though the
+	// cluster failed over in seconds (the first wrapped-kms run lost UC-310
+	// to that). KillNodeDaemon now takes the victim out of the shared API
+	// pool (harness.MarkNodeDown); the loopback route predates that and is
+	// kept as the stricter form, since it cannot reach the victim at all.
 	var via harness.IntegrationNode
 	for _, n := range kcNodes(targets) {
 		if n.Name != victim.Name {

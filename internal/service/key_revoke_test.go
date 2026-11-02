@@ -5,7 +5,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -72,6 +76,20 @@ func revokeHarness(t *testing.T) (*Service, *switchableKMS, *fakeGateway, []byte
 	closed := new(int)
 	svc.OnKeyRevoked(func() int { *closed++; return 2 })
 	return svc, kms, gw, key, closed
+}
+
+// startKeyCustody starts svc's custody loops for one test and, when the
+// test ends, stops them and waits: the loops publish process-wide gauges
+// that later tests read, and a loop left running resets them under those
+// tests (the reseal gauge flaked under -race that way).
+func startKeyCustody(t *testing.T, svc *Service, ctx context.Context) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(ctx)
+	t.Cleanup(func() {
+		cancel()
+		svc.keyCustody.loops.Wait()
+	})
+	svc.StartKeyCustody(ctx)
 }
 
 func custodyRecords(svc *Service, kind string) []SecretAuditEvent {
@@ -320,6 +338,150 @@ func TestRevokeRestartsAnOldGateway(t *testing.T) {
 	}
 }
 
+// heldCAGateway holds SetInspectCA until released and tracks whether the
+// gateway ends up holding the CA, in the order set and clear arrive.
+type heldCAGateway struct {
+	*fakeGateway
+	entered, release chan struct{}
+	once             sync.Once
+	holds            bool
+}
+
+func (g *heldCAGateway) SetInspectCA(context.Context, egress.InspectCA) error {
+	g.once.Do(func() { close(g.entered) })
+	<-g.release
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.holds = true
+	return nil
+}
+
+func (g *heldCAGateway) ClearInspectCA(context.Context) error {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.holds = false
+	g.cleared++
+	return nil
+}
+
+// TestInFlightCAPushLandsBeforeTheRevokeClear: a CA push in flight when
+// the key is revoked must not reach the gateway after the revoke's clear,
+// and no push starts once the key is revoked (eng D4).
+func TestInFlightCAPushLandsBeforeTheRevokeClear(t *testing.T) {
+	svc, _, gw, _, _ := revokeHarness(t)
+	tempDataDir(t, svc)
+	ctx := context.Background()
+	ca, err := svc.ensureEgressCA()
+	if err != nil {
+		t.Fatal(err)
+	}
+	g := &heldCAGateway{fakeGateway: gw, entered: make(chan struct{}), release: make(chan struct{})}
+	svc.SetEgressGateway(g, nil)
+	pushed := make(chan error, 1)
+	go func() { pushed <- svc.pushEgressCA(ctx, ca) }()
+	<-g.entered
+	revoked := make(chan struct{})
+	go func() { svc.revokeKey(ctx, secrets.ErrKeyRevoked); close(revoked) }()
+	select {
+	case <-revoked:
+		t.Fatal("the revoke's clear did not wait for the push in flight")
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(g.release)
+	<-revoked
+	if err := <-pushed; err != nil {
+		t.Fatal(err)
+	}
+	g.mu.Lock()
+	holds := g.holds
+	g.mu.Unlock()
+	if holds {
+		t.Fatal("the gateway holds the CA after the revoke")
+	}
+	if err := svc.pushEgressCA(ctx, ca); !errors.Is(err, secrets.ErrKeyRevoked) {
+		t.Fatalf("a push after the revoke = %v", err)
+	}
+	if err := svc.resyncEgressCA(ctx); err != nil || svc.egressCA.Load() != nil {
+		t.Fatalf("a resync after the revoke = %v, CA in memory %v", err, svc.egressCA.Load() != nil)
+	}
+}
+
+// TestOwedGatewayClearIsRetried: a revoke whose clear never reached the
+// gateway sends it again on each re-check and on a gateway reconnect,
+// until it lands. A revoked node that keeps talking to the gateway is never
+// silent long enough for the gateway's own bound to drop the CA.
+func TestOwedGatewayClearIsRetried(t *testing.T) {
+	svc, kms, gw, _, _ := revokeHarness(t)
+	tempDataDir(t, svc)
+	ctx := context.Background()
+	if _, err := svc.ensureEgressCA(); err != nil {
+		t.Fatal(err)
+	}
+	clears := func() int {
+		gw.mu.Lock()
+		defer gw.mu.Unlock()
+		return gw.cleared
+	}
+	gw.mu.Lock()
+	gw.clearErr = errors.New("connection refused")
+	gw.mu.Unlock()
+	kms.set(secrets.ErrKeyRevoked)
+	for i := 0; i < 3; i++ {
+		svc.RecheckServerKey(ctx)
+	}
+	if !svc.KeyRevoked() || clears() != 1 {
+		t.Fatalf("revoked %v, clears %d", svc.KeyRevoked(), clears())
+	}
+	svc.RecheckServerKey(ctx)
+	if clears() != 2 {
+		t.Fatalf("the next re-check did not send the clear again: %d", clears())
+	}
+	gw.mu.Lock()
+	gw.clearErr = nil
+	gw.mu.Unlock()
+	if err := svc.ResyncEgressGateway(ctx); err != nil || clears() != 3 {
+		t.Fatalf("a reconnect = %v, clears %d", err, clears())
+	}
+	svc.RecheckServerKey(ctx)
+	if err := svc.ResyncEgressGateway(ctx); err != nil || clears() != 3 {
+		t.Fatalf("a clear that landed was sent again: %v, clears %d", err, clears())
+	}
+}
+
+// TestVaultReplyTextNeverReachesLogs: a key-store reply can echo request
+// content (a plugin, a proxy in front of Vault), and the re-check logs its
+// error, so nothing of the reply's text may reach the log.
+func TestVaultReplyTextNeverReachesLogs(t *testing.T) {
+	const marker = "SENSITIVE_PROVIDER_BODY_MARKER"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		fmt.Fprintf(w, `{"errors":[%q]}`, marker)
+	}))
+	t.Cleanup(srv.Close)
+	v, err := secrets.NewVault(secrets.VaultOptions{Addr: srv.URL, KeyName: "k"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc, _, _, _, _ := revokeHarness(t)
+	var logs bytes.Buffer
+	svc.logger = slog.New(slog.NewTextHandler(&logs, nil))
+	svc.SetKeyStoreWrapper(v)
+	f, err := secrets.ReadWrappedKeyFile(svc.cfg.CredentialKeyWrappedPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.Wrapped = []byte("vault:v1:fixture")
+	if err := secrets.WriteWrappedKeyFile(svc.cfg.CredentialKeyWrappedPath, f); err != nil {
+		t.Fatal(err)
+	}
+	if got := svc.RecheckServerKey(context.Background()); got != recheckDenied {
+		t.Fatalf("re-check = %s, want %s", got, recheckDenied)
+	}
+	if strings.Contains(logs.String(), marker) || !strings.Contains(logs.String(), "403") {
+		t.Fatalf("log = %s, want the status and none of the reply", logs.String())
+	}
+}
+
 // The file swapped for another key: it unwraps and matches its own check,
 // but the node only takes back the key it was built with.
 func TestRecoveryRefusesADifferentKey(t *testing.T) {
@@ -358,7 +520,7 @@ func TestStartKeyCustody(t *testing.T) {
 	}
 	before := count()
 	ctx, cancel := context.WithCancel(context.Background())
-	svc.StartKeyCustody(ctx)
+	startKeyCustody(t, svc, ctx)
 	deadline := time.Now().Add(2 * time.Second)
 	for count() == before {
 		if time.Now().After(deadline) {
@@ -369,7 +531,7 @@ func TestStartKeyCustody(t *testing.T) {
 	cancel()
 	// File custody: no loop at all.
 	svc.cfg.CredentialKeyCustody = secrets.CustodyFile
-	svc.StartKeyCustody(context.Background())
+	startKeyCustody(t, svc, context.Background())
 	(*Service)(nil).StartKeyCustody(context.Background())
 	if (*Service)(nil).KeyRevoked() {
 		t.Fatal("nil service revoked")

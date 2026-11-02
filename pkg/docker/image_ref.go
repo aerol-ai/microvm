@@ -51,11 +51,31 @@ func SnapshotImageTagForOwner(owner, name string) string {
 // "aerolvm-snapshot/x", "docker.io/aerolvm-snapshot/x" and
 // "index.docker.io/aerolvm-snapshot/x:latest" are all the same local image.
 func IsSnapshotImageRef(ref string) bool {
+	_, ok := parseSnapshotImageRef(ref)
+	return ok
+}
+
+// CanonicalSnapshotImageTag returns the one spelling of a snapshot-namespace
+// ref that SnapshotImageTag produces ("aerolvm-snapshot/<hash>:latest"), so a
+// tag used as a lookup key matches whichever spelling the caller wrote. ok is
+// false for a ref outside the snapshot namespace.
+func CanonicalSnapshotImageTag(ref string) (string, bool) {
+	named, ok := parseSnapshotImageRef(ref)
+	if !ok {
+		return "", false
+	}
+	return reference.FamiliarString(reference.TagNameOnly(named)), true
+}
+
+func parseSnapshotImageRef(ref string) (reference.Named, bool) {
 	named, err := reference.ParseNormalizedNamed(strings.TrimSpace(ref))
 	if err != nil {
-		return false
+		return nil, false
 	}
-	return reference.Domain(named) == "docker.io" && strings.HasPrefix(reference.Path(named), SnapshotImageNamespace+"/")
+	if reference.Domain(named) != "docker.io" || !strings.HasPrefix(reference.Path(named), SnapshotImageNamespace+"/") {
+		return nil, false
+	}
+	return named, true
 }
 
 // LooksLikeImageID reports a reference the engine would resolve by image id

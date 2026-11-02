@@ -9,6 +9,8 @@ import (
 	"sync"
 	"testing"
 
+	sbruntime "github.com/aerol-ai/microvm/internal/runtime"
+	"github.com/aerol-ai/microvm/pkg/docker/netrules"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
 
@@ -32,6 +34,7 @@ func (f *fakeNetRules) rec(op, ip string, extra ...[]string) error {
 
 func (f *fakeNetRules) BlockAllEgress(ip string) error       { return f.rec("block-egress", ip) }
 func (f *fakeNetRules) ClearBlockAllEgress(ip string) error  { return f.rec("clear-egress", ip) }
+func (f *fakeNetRules) LiftBlockAllEgress(ip string) error   { return f.rec("lift-egress", ip) }
 func (f *fakeNetRules) BlockAllIngress(ip string) error      { return f.rec("block-ingress", ip) }
 func (f *fakeNetRules) ClearBlockAllIngress(ip string) error { return f.rec("clear-ingress", ip) }
 func (f *fakeNetRules) HoldEgress(ip string) error           { return f.rec("hold", ip) }
@@ -44,6 +47,19 @@ func (f *fakeNetRules) ClearEgressPolicy(ip string, a, d []string) error {
 }
 func (f *fakeNetRules) SetFloor(subnet netip.Prefix, cidrs []netip.Prefix) error {
 	return f.rec("floor", subnet.String())
+}
+func (f *fakeNetRules) SetNodeGuard(subnet netip.Prefix, allow []netrules.NodePort) error {
+	var ports []string
+	for _, p := range allow {
+		ports = append(ports, p.String())
+	}
+	return f.rec("node-guard", subnet.String(), ports)
+}
+func (f *fakeNetRules) ReassertNodeGuard() (bool, error) {
+	return true, f.rec("node-guard-reassert", "")
+}
+func (f *fakeNetRules) ReassertFloor() (bool, error) {
+	return true, f.rec("floor-reassert", "")
 }
 
 func (f *fakeNetRules) has(prefix string) bool {
@@ -111,16 +127,28 @@ func TestNetRuleMethods(t *testing.T) {
 		"ClearNetworkBlockEgress":  func() error { return d.ClearNetworkBlockEgress("10.0.0.2") },
 		"ApplyEgressHold":          func() error { return d.ApplyEgressHold("10.0.0.2") },
 		"ClearEgressHold":          func() error { return d.ClearEgressHold("10.0.0.2") },
-		"SetEgressFloor":           func() error { return d.SetEgressFloor(context.Background(), nil) },
 	} {
 		if err := fn(); !errors.Is(err, models.ErrRuntimeNotImplemented) {
 			t.Fatalf("%s without a firewall: %v", name, err)
 		}
 	}
+	// No firewall: no floor, said so (the service allows it outside
+	// enterprise mode, like the node guard), and nothing to re-assert.
+	if err := d.SetEgressFloor(context.Background(), nil); !errors.Is(err, sbruntime.ErrEgressFloorUnavailable) {
+		t.Fatalf("floor without a firewall: %v", err)
+	}
+	if repaired, err := d.ReassertEgressFloor(context.Background()); repaired || err != nil {
+		t.Fatalf("re-assert without a firewall: %v %v", repaired, err)
+	}
 	rules := &fakeNetRules{}
 	d.SetNetRules(rules)
-	if err := d.SetEgressFloor(context.Background(), nil); err != nil || rules.has("floor") {
-		t.Fatal("no TAP subnet, no floor")
+	// A firewall but no TAP subnet: an error, never a silent success the
+	// create gate would read as "installed".
+	if err := d.SetEgressFloor(context.Background(), nil); err == nil || rules.has("floor") {
+		t.Fatalf("no TAP subnet, no floor: %v", err)
+	}
+	if repaired, err := d.ReassertEgressFloor(context.Background()); !repaired || err != nil || !rules.has("floor-reassert") {
+		t.Fatalf("re-assert goes to the firewall: %v %v %v", repaired, err, rules.calls)
 	}
 	d.SetTapSubnet(netip.MustParsePrefix("172.16.0.0/16"))
 	calls := []func() error{
@@ -140,7 +168,7 @@ func TestNetRuleMethods(t *testing.T) {
 			t.Fatalf("call %d: %v", i, err)
 		}
 	}
-	for _, want := range []string{"clear-egress", "clear-ingress", "block-egress", "policy", "clear-policy", "block-ingress", "hold", "clear-hold", "floor 172.16.0.0/16"} {
+	for _, want := range []string{"clear-egress", "lift-egress 10.0.0.2", "clear-ingress", "block-egress", "policy", "clear-policy", "block-ingress", "hold", "clear-hold", "floor 172.16.0.0/16"} {
 		if !rules.has(want) {
 			t.Fatalf("missing %q in %v", want, rules.calls)
 		}
@@ -182,5 +210,35 @@ func TestGatewayGuestRules(t *testing.T) {
 	}
 	if firewallLists([]string{"bad entry"}, nil) {
 		t.Fatal("an invalid list is never handed to the firewall")
+	}
+}
+
+// TestFirecrackerNodeGuard: the TAP subnet gets the node guard through the
+// driver's firewall; without a firewall the service hears that the guard
+// is unavailable, not that it is in place.
+func TestFirecrackerNodeGuard(t *testing.T) {
+	ctx := context.Background()
+	d := New(Config{}, nil)
+	if err := d.SetNodeGuard(ctx, nil); !errors.Is(err, sbruntime.ErrNodeGuardUnavailable) {
+		t.Fatalf("no firewall: %v", err)
+	}
+	if repaired, err := d.ReassertNodeGuard(ctx); repaired || err != nil {
+		t.Fatalf("no firewall, nothing to re-assert: %v %v", repaired, err)
+	}
+	rules := &fakeNetRules{}
+	d.SetNetRules(rules)
+	if err := d.SetNodeGuard(ctx, nil); err == nil {
+		t.Fatal("a firewall without a TAP subnet cannot place the guard")
+	}
+	d.SetTapSubnet(netip.MustParsePrefix("172.16.0.0/16"))
+	allow := []netrules.NodePort{{Proto: "tcp", Port: 15080}, {Proto: "udp", Port: 53054}}
+	if err := d.SetNodeGuard(ctx, allow); err != nil {
+		t.Fatal(err)
+	}
+	if !rules.has("node-guard 172.16.0.0/16 tcp/15080,udp/53054") {
+		t.Fatalf("calls = %v", rules.calls)
+	}
+	if repaired, err := d.ReassertNodeGuard(ctx); !repaired || err != nil || !rules.has("node-guard-reassert") {
+		t.Fatalf("re-assert goes to the firewall: %v %v %v", repaired, err, rules.calls)
 	}
 }

@@ -156,9 +156,14 @@ func TestClassifyVault(t *testing.T) {
 			t.Fatalf("%s %d %v = %v, want %v", tc.op, tc.status, tc.errs, err, tc.want)
 		}
 	}
-	long := classifyVault("decrypt", 500, []string{strings.Repeat("x", 500)})
-	if len(long.Error()) > vaultErrorTextMax+80 {
-		t.Fatalf("error text not bounded: %d bytes", len(long.Error()))
+	// Vault's text picks the class but is never carried: it can echo
+	// request content, and these errors are logged.
+	for _, tc := range cases {
+		for _, e := range tc.errs {
+			if err := classifyVault(tc.op, tc.status, []string{e + " ECHOED-REQUEST"}); strings.Contains(err.Error(), "ECHOED-REQUEST") {
+				t.Fatalf("%s %d carries Vault's text: %v", tc.op, tc.status, err)
+			}
+		}
 	}
 }
 
@@ -607,7 +612,8 @@ func TestVaultErrorsCarryNoBody(t *testing.T) {
 			}
 		}
 	}
-	if !strings.Contains(uerr.Error(), "internal error") {
-		t.Fatalf("Vault's own error text is gone: %v", uerr)
+	// Not even Vault's own error list: only the status.
+	if strings.Contains(uerr.Error(), "internal error") || !strings.Contains(uerr.Error(), "500") {
+		t.Fatalf("unwrap error = %v, want the status and no reply text", uerr)
 	}
 }

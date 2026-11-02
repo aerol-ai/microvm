@@ -146,15 +146,23 @@ func (p *NetnsPool) reconcile(ctx context.Context) {
 		name := containerSummaryName(s)
 		switch {
 		case strings.HasPrefix(name, netnsAdoptedPrefix):
+			// Only a sandbox the engine says is gone: on any other answer
+			// the workload may still run in this pause's namespace, and
+			// removing the pause would hand its address to someone else.
 			sandboxID := strings.TrimPrefix(name, netnsAdoptedPrefix)
-			if _, err := p.client.inspectContainer(ctx, sandboxID); err != nil {
+			if _, err := p.client.inspectContainer(ctx, sandboxID); isContainerNotFoundError(err) {
 				netnsPoolOrphansReaped.Add(1)
-				_ = p.client.removeContainer(ctx, s.ID, true)
+				if err := p.client.removePause(ctx, s.ID, ""); err != nil {
+					p.logger.Warn("netns pool reconcile: orphan pause not removed", "container_id", s.ID, "error", err)
+				}
 			}
 		case strings.HasPrefix(name, netnsFreePrefix):
 			inspect, err := p.client.inspectContainer(ctx, s.ID)
 			ip := getContainerIP(inspect, p.client.network)
-			if err != nil || inspect.State == nil || !inspect.State.Running || ip == "" {
+			// A free pause an older daemon started has IPv6 on in its
+			// netns; a sandbox must never join it. Replace it instead.
+			if err != nil || inspect.State == nil || !inspect.State.Running || ip == "" ||
+				(p.client.network != "host" && !hasSandboxIPv6Off(inspect.HostConfig.Sysctls)) {
 				_ = p.client.removeContainer(ctx, s.ID, true)
 				continue
 			}
@@ -210,16 +218,36 @@ func (p *NetnsPool) spawnPause(ctx context.Context) (netnsSlot, error) {
 	if _, err := rand.Read(suffix); err != nil {
 		return netnsSlot{}, err
 	}
-	name := netnsFreePrefix + hex.EncodeToString(suffix)
+	return p.client.startNetnsPause(ctx, p.pauseImage, netnsFreePrefix+hex.EncodeToString(suffix))
+}
 
+// startNetnsPause starts a pause container named name on the sandbox
+// network and returns it with its address. The pool's refill and a
+// restricted create's own pause (netns_pause_on_demand.go) both start
+// theirs here, so an address is held the same way whichever started it.
+// On failure nothing is left behind.
+func (c *Client) startNetnsPause(ctx context.Context, image, name string) (netnsSlot, error) {
+	id, err := c.createNetnsPause(ctx, image, name)
+	if err != nil {
+		return netnsSlot{}, err
+	}
+	return c.runNetnsPause(ctx, id)
+}
+
+// createNetnsPause creates (does not start) a pause container named name.
+func (c *Client) createNetnsPause(ctx context.Context, image, name string) (string, error) {
 	createRequest := map[string]any{
-		"Image":  p.pauseImage,
+		"Image":  image,
 		"Labels": map[string]string{netnsPauseLabelKey: "true"},
 	}
 	hostConfig := map[string]any{}
-	if p.client.network != "" && p.client.network != "bridge" {
-		hostConfig["NetworkMode"] = p.client.network
+	if c.network != "" && c.network != "bridge" {
+		hostConfig["NetworkMode"] = c.network
 	}
+	// The pause owns the netns its sandbox joins (a pool slot's adopter, or
+	// the restricted create that started it), so IPv6 goes off here, once,
+	// for both.
+	setSandboxIPv6Off(hostConfig, c.network)
 	createRequest["HostConfig"] = hostConfig
 
 	var created struct {
@@ -227,23 +255,37 @@ func (p *NetnsPool) spawnPause(ctx context.Context) (netnsSlot, error) {
 	}
 	q := url.Values{}
 	q.Set("name", name)
-	if err := p.client.doJSON(ctx, http.MethodPost, "/containers/create", q, createRequest, nil, &created); err != nil {
-		return netnsSlot{}, fmt.Errorf("create pause container: %w", err)
+	if err := c.doJSON(ctx, http.MethodPost, "/containers/create", q, createRequest, nil, &created); err != nil {
+		return "", fmt.Errorf("create pause container: %w", err)
 	}
-	if err := p.client.doJSON(ctx, http.MethodPost, "/containers/"+url.PathEscape(created.ID)+"/start", nil, nil, nil, nil); err != nil {
-		_ = p.client.removeContainer(ctx, created.ID, true)
+	return created.ID, nil
+}
+
+// runNetnsPause starts a created pause container and reads its address,
+// removing it if either fails.
+func (c *Client) runNetnsPause(ctx context.Context, id string) (netnsSlot, error) {
+	slot, err := c.bootNetnsPause(ctx, id)
+	if err != nil {
+		_ = c.removeContainer(context.WithoutCancel(ctx), id, true)
+	}
+	return slot, err
+}
+
+// bootNetnsPause starts a created pause container and reads its address.
+// On failure the container is the caller's to remove.
+func (c *Client) bootNetnsPause(ctx context.Context, id string) (netnsSlot, error) {
+	if err := c.doJSON(ctx, http.MethodPost, "/containers/"+url.PathEscape(id)+"/start", nil, nil, nil, nil); err != nil {
 		return netnsSlot{}, fmt.Errorf("start pause container: %w", err)
 	}
-	inspect, err := p.client.inspectContainer(ctx, created.ID)
-	ip := getContainerIP(inspect, p.client.network)
+	inspect, err := c.inspectContainer(ctx, id)
+	ip := getContainerIP(inspect, c.network)
 	if err != nil || ip == "" {
-		_ = p.client.removeContainer(ctx, created.ID, true)
 		if err == nil {
-			err = fmt.Errorf("pause container %s has no IP", created.ID)
+			err = fmt.Errorf("pause container %s has no IP", id)
 		}
 		return netnsSlot{}, err
 	}
-	return netnsSlot{containerID: created.ID, ip: ip}, nil
+	return netnsSlot{containerID: id, ip: ip}, nil
 }
 
 // Adopt pops a warm slot and renames it to the sandbox's adopted name.
@@ -265,21 +307,14 @@ func (p *NetnsPool) Adopt(ctx context.Context, sandboxID string) (netnsSlot, boo
 		netnsPoolSize.Set(int64(p.size()))
 
 		if err := p.client.renameContainer(ctx, slot.containerID, netnsAdoptedName(sandboxID)); err != nil {
-			// Dead or vanished slot: drop it and try the next one.
-			_ = p.client.removeContainer(ctx, slot.containerID, true)
+			// Dead or vanished slot: drop it, and anything keyed by its
+			// address, and try the next one.
+			_ = p.client.removePause(ctx, slot.containerID, slot.ip)
 			continue
 		}
 		netnsPoolHits.Add(1)
 		return slot, true
 	}
-}
-
-// ReleaseAdopted removes an adopted pause container after the sandbox
-// create failed downstream of Adopt. The slot can't be returned to the
-// pool: it already carries the sandbox's adopted name, and a rename
-// back would race a concurrent duplicate create for the same ID.
-func (p *NetnsPool) ReleaseAdopted(ctx context.Context, slot netnsSlot) {
-	_ = p.client.removeContainer(ctx, slot.containerID, true)
 }
 
 // removeNetnsPauseForSandbox is the destroy-path cleanup: best-effort
@@ -291,9 +326,11 @@ func (c *Client) removeNetnsPauseForSandbox(ctx context.Context, sandboxID strin
 	if sandboxID == "" {
 		return
 	}
-	// removeContainer already treats 404 as success, so a sandbox that never
-	// adopted a pause slot (pool disabled, warm-pool hit) is a silent no-op.
-	if err := c.removeContainer(ctx, netnsAdoptedName(sandboxID), true); err != nil {
+	// A sandbox that never had a pause (pool disabled, warm-pool hit, no
+	// rules) is a silent no-op: the pause isn't found. The pause's address
+	// is read from it, not from the row, so its rules go with it even when
+	// the row never knew them (an orphan, a create that died).
+	if err := c.removePause(ctx, netnsAdoptedName(sandboxID), ""); err != nil {
 		c.logger.Warn("remove netns pause container failed", "sandbox_id", sandboxID, "error", err)
 	}
 }

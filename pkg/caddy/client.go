@@ -26,6 +26,9 @@ type Client struct {
 	enabled       bool
 	l4TLSListen   string
 	l4TLSFallback string
+	// l4PublicHost, when set, is the host raw-TCP exposures are dialled at
+	// instead of the domain (SB_L4_PUBLIC_HOST).
+	l4PublicHost string
 	// l4FallbackProxyProtocol makes every tls-mux route that hands a
 	// connection to l4TLSFallback send a PROXY v2 header first
 	// (SB_L4_FALLBACK_PROXY_PROTOCOL, CEO review D12).
@@ -60,6 +63,7 @@ func New(cfg config.Config) *Client {
 		enabled:                 cfg.EnableCaddy,
 		l4TLSListen:             cfg.L4TLSListen,
 		l4TLSFallback:           cfg.L4TLSFallback,
+		l4PublicHost:            cfg.L4PublicHost,
 		l4FallbackProxyProtocol: cfg.L4FallbackProxyProtocol,
 		onDemandIssuer: TLSIssuer{Internal: cfg.TLSIssuer == config.TLSIssuerInternal,
 			CA: cfg.TLSACMECA, TrustedRoot: cfg.TLSACMECARoot},
@@ -97,10 +101,15 @@ func (c *Client) Enabled() bool {
 	return c.enabled
 }
 
-// PublicHost returns the dial target for raw-TCP exposures. In domain mode the
-// base domain is returned so TCP URLs are consistent with HTTP sandbox URLs;
-// otherwise falls back to the configured publicHost IP.
+// PublicHost returns the dial target for raw-TCP exposures. SB_L4_PUBLIC_HOST
+// wins when set: the domain then fronts a load balancer that cannot carry the
+// host-port pool, and raw TCP is dialled at a name that reaches the ingress
+// nodes directly. Otherwise, in domain mode the base domain is returned so TCP
+// URLs are consistent with HTTP sandbox URLs, and else the publicHost IP.
 func (c *Client) PublicHost() string {
+	if c.l4PublicHost != "" {
+		return c.l4PublicHost
+	}
 	if c.domain != "" {
 		return c.domain
 	}
@@ -141,15 +150,12 @@ func (c *Client) PortPublicURL(id string, port int) string {
 }
 
 // TCPPublicEndpoint returns the URL clients dial for a raw TCP exposure
-// allocated at hostPort. In domain mode the base domain is used as the dial
-// target (e.g. tcp://sandbox.aerol.cloud:22534); otherwise falls back to
-// publicHost.
+// allocated at hostPort, on PublicHost: in domain mode the base domain (e.g.
+// tcp://sandbox.aerol.cloud:22534), SB_L4_PUBLIC_HOST when set, and otherwise
+// publicHost. One function for the URL and the response's Host field, so the
+// two cannot disagree.
 func (c *Client) TCPPublicEndpoint(hostPort int) string {
-	host := c.publicHost
-	if c.domain != "" {
-		host = c.domain
-	}
-	return fmt.Sprintf("tcp://%s:%d", host, hostPort)
+	return fmt.Sprintf("tcp://%s:%d", c.PublicHost(), hostPort)
 }
 
 // TLSPublicEndpoint returns the dial target for a TLS-SNI multiplexed

@@ -49,6 +49,10 @@ const vsockCIDStart uint32 = 3
 // chars (IFNAMSIZ); fctapN with N up to 9999 is comfortably inside.
 const tapNamePrefix = "fctap"
 
+// NamePrefix is the prefix every TAP this package creates starts with: the
+// node's IPv6 fence matches all of them, present and future, by it.
+const NamePrefix = tapNamePrefix
+
 // SeedConfig describes the network plan the pool is laid out from.
 // BaseCIDR is carved into /30 subnets, one per slot; PoolSize is the
 // number of /30s to produce (and therefore the maximum number of

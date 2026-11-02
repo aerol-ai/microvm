@@ -56,7 +56,14 @@ func TestSecuritySpecOptsEnvelope(t *testing.T) {
 }
 
 func TestResourceSpecOptsUsesCFSQuotaNotCpuset(t *testing.T) {
-	spec := applyOpts(t, resourceSpecOpts(models.CreateSandboxRequest{MemoryMB: 256, CPU: 0.5}))
+	spec := applyOpts(t, resourceSpecOpts(models.CreateSandboxRequest{MemoryMB: 256, CPU: 0.5}, 4096))
+	// The process limit stops a fork bomb at the sandbox.
+	if spec.Linux.Resources == nil || spec.Linux.Resources.Pids == nil || spec.Linux.Resources.Pids.Limit == nil || *spec.Linux.Resources.Pids.Limit != 4096 {
+		t.Fatalf("pids limit = %+v", spec.Linux.Resources)
+	}
+	if unlimited := applyOpts(t, resourceSpecOpts(models.CreateSandboxRequest{MemoryMB: 256}, 0)); unlimited.Linux.Resources.Pids != nil {
+		t.Fatal("SB_SANDBOX_PIDS_LIMIT=0 must set no limit")
+	}
 
 	if spec.Linux.Resources == nil || spec.Linux.Resources.Memory == nil || spec.Linux.Resources.Memory.Limit == nil {
 		t.Fatal("memory limit not set")

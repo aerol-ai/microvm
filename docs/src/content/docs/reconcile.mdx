@@ -112,12 +112,13 @@ Reconcile first, then create:
 
 ## What reconcile changes
 
-For each sandbox record, the server looks for its container:
+For each sandbox record, the server asks the container engine about its container. The engine gives one of three answers:
 
-- **The container is gone.** The server removes the sandbox's web routes and exposed ports, and unmounts its storage. Then it deletes the record. That frees the sandbox's CPU and memory reservation, and any TCP port it held.
-- **The container is there.** The server updates the record's status, IP address and public URL to match the container. It also fixes the CPU and memory reservation, and puts back a "block all internet" rule if one went missing.
+- **The container does not exist.** The server removes the sandbox's web routes and exposed ports, and unmounts its storage. Then it deletes the record. That frees the sandbox's CPU and memory reservation, and any TCP port it held.
+- **The container is there.** The server updates the record's status, IP address and public URL to match the container. It also fixes the CPU and memory reservation, and puts back a "block all internet" rule if one went missing. A container that stopped, or crashed, stays as a stopped sandbox you can start again. If the engine says the container runs but can't tell its IP address this time, the server keeps the address it has.
+- **The engine can't say.** The engine timed out or returned an error. The server changes nothing and asks again on the next check. If the engine still can't answer after 10 minutes and 3 checks in a row, the sandbox's status becomes `error`, with a message that names the engine and its error. The record is never deleted for this. When the engine answers again, the next check sets the real status and clears the message.
 
-Before it deletes a record, the server looks for that container once more, directly. So a container that was briefly hard to see (for example, while it was starting) is not deleted by mistake.
+Only the first answer deletes a record. Before it deletes one, the server asks about that container once more, directly. So a container that was briefly hard to see (for example, while it was starting) is not deleted by mistake.
 
 In a cluster, reconcile also removes local copies of sandboxes that another node now owns. This happens when a node comes back after an outage and finds its sandboxes were moved.
 
@@ -137,6 +138,8 @@ These run only on nodes that run sandboxes (`worker` or `mixed` nodes). Server-o
 |---|---|---|
 | `SB_AUTO_RECONCILE` | Run reconcile at server start and on a timer. Set to `false` to turn off both. | `true` |
 | `SB_RECONCILE_INTERVAL` | How often the timed check runs. `0` turns off the timer. | `5m` |
+
+If sandboxes go to `error` with a message that starts `runtime state unknown`, the container engine on that node is not answering. The metric `aerolvm_reconcile_runtime_unknown_sandboxes` counts the sandboxes waiting on an answer right now.
 
 ## Next steps
 

@@ -55,7 +55,6 @@ const (
 	// that is down delays boot by at most this before the canary reports it.
 	vaultPolicyCheckTimeout = 5 * time.Second
 	vaultMaxResponseBytes   = 1 << 20
-	vaultErrorTextMax       = 200
 	// CorrelationHeader carries the sandboxd secret-audit correlation id to
 	// the key store, so a Vault audit entry joins to the exact sandboxd event
 	// (CEO-E3). Vault records it once listed under audited request headers.
@@ -242,28 +241,29 @@ func (v *Vault) Unwrap(ctx context.Context, wrapped []byte, encCtx map[string]st
 // texts are the ones Phase 0 recorded on Vault 1.18 and OpenBao 2.1. Only a
 // deleted key is a revoke: a 403 looks the same for a revoked policy and an
 // expired Agent token, and a retired version marks a stale row (§10).
+//
+// Vault's own text picks the class but never rides along in the error: a
+// plugin, a proxy in front of Vault or a misbehaving server can echo
+// request content into it, and these errors are logged. Each class says
+// the status and a fixed phrase instead.
 func classifyVault(op string, status int, errs []string) error {
-	text := strings.Join(errs, "; ")
-	if len(text) > vaultErrorTextMax {
-		text = text[:vaultErrorTextMax]
-	}
-	lower := strings.ToLower(text)
+	lower := strings.ToLower(strings.Join(errs, "; "))
 	switch {
 	case status == http.StatusTooManyRequests:
-		return fmt.Errorf("%w: vault %s: %d %s", ErrProviderThrottled, op, status, text)
+		return fmt.Errorf("%w: vault %s: %d too many requests", ErrProviderThrottled, op, status)
 	case status == http.StatusForbidden:
-		return fmt.Errorf("%w: vault %s: %d %s", ErrProviderDenied, op, status, text)
+		return fmt.Errorf("%w: vault %s: %d permission denied", ErrProviderDenied, op, status)
 	case status == http.StatusBadRequest && strings.Contains(lower, "encryption key not found"):
-		return fmt.Errorf("%w: vault %s: %s", ErrKeyRevoked, op, text)
+		return fmt.Errorf("%w: vault %s: encryption key not found", ErrKeyRevoked, op)
 	case status == http.StatusBadRequest && strings.Contains(lower, "disallowed by policy"):
-		return fmt.Errorf("%w: vault %s: %s", ErrKeyVersionRetired, op, text)
+		return fmt.Errorf("%w: vault %s: key version disallowed by policy", ErrKeyVersionRetired, op)
 	case status == http.StatusBadRequest && op == "decrypt":
 		// Wrong associated data, a tampered ciphertext or a malformed one.
-		return fmt.Errorf("%w: vault decrypt: %s", ErrDecryptFailed, text)
+		return fmt.Errorf("%w: vault decrypt: %d", ErrDecryptFailed, status)
 	default:
 		// 5xx (sealed, standby), 404 (mount gone), a redirect, or an encrypt
 		// 400 nobody expects: the key store cannot do the work right now.
-		return fmt.Errorf("%w: vault %s: %d %s", ErrProviderUnavailable, op, status, text)
+		return fmt.Errorf("%w: vault %s: %d", ErrProviderUnavailable, op, status)
 	}
 }
 

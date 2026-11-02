@@ -23,7 +23,7 @@ func TestCloneEnvdProcessStateNil(t *testing.T) {
 // path exists but is a regular file (not a directory) → 409 "path already exists".
 func TestHandleEnvdMakeDirFileAlreadyExists(t *testing.T) {
 	srv := newEnvdTestServer(t)
-	handler := srv.routes()
+	handler := authedRoutes(srv)
 
 	f := filepath.Join(t.TempDir(), "existing.txt")
 	if err := os.WriteFile(f, []byte("x"), 0o644); err != nil {
@@ -47,7 +47,7 @@ func TestHandleEnvdMakeDirFileAlreadyExists(t *testing.T) {
 // error path for an empty Destination field → 400.
 func TestHandleEnvdFilesystemMoveEmptyDestination(t *testing.T) {
 	srv := newEnvdTestServer(t)
-	handler := srv.routes()
+	handler := authedRoutes(srv)
 
 	src := filepath.Join(t.TempDir(), "src.txt")
 	if err := os.WriteFile(src, []byte("hi"), 0o644); err != nil {
@@ -178,7 +178,7 @@ func TestHandleEnvdMultipartWriteEmptyFilenameNoOverride(t *testing.T) {
 	req.Header.Set("Authorization", "Bearer toolbox-token")
 	req.Header.Set("Content-Type", mw.FormDataContentType())
 	rec := httptest.NewRecorder()
-	srv.routes().ServeHTTP(rec, req)
+	authedRoutes(srv).ServeHTTP(rec, req)
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400; body=%s", rec.Code, rec.Body.String())
 	}

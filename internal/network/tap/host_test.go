@@ -3,8 +3,11 @@ package tap
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
+
+	"github.com/aerol-ai/microvm/internal/network/hostnet"
 )
 
 // recordingRun is the test seam Host.run takes. Records every invocation
@@ -41,7 +44,7 @@ func (r *recordingRun) fn(_ context.Context, name string, args ...string) ([]byt
 }
 
 func newHostWithRun(r *recordingRun) *Host {
-	return &Host{IPCmd: "/test/ip", run: r.fn, rpFilter: func(string) error { return nil }}
+	return &Host{IPCmd: "/test/ip", run: r.fn, rpFilter: func(string) error { return nil }, ipv6Off: func(string) error { return nil }}
 }
 
 // TestEnsure_HappyPath confirms the four-step sequence (tuntap add,
@@ -425,7 +428,7 @@ outer:
 func TestEnsureRPFilter(t *testing.T) {
 	r := &recordingRun{}
 	var got []string
-	h := &Host{IPCmd: "/test/ip", run: r.fn, rpFilter: func(tap string) error { got = append(got, tap); return nil }}
+	h := &Host{IPCmd: "/test/ip", run: r.fn, rpFilter: func(tap string) error { got = append(got, tap); return nil }, ipv6Off: func(string) error { return nil }}
 	slot := Slot{TapName: "fctap7", HostIP: "172.16.0.29", GuestIP: "172.16.0.30", CIDR: "172.16.0.28/30"}
 	if err := h.Ensure(context.Background(), slot); err != nil {
 		t.Fatal(err)
@@ -436,5 +439,81 @@ func TestEnsureRPFilter(t *testing.T) {
 	h.rpFilter = func(string) error { return errors.New("read-only /proc") }
 	if err := h.Ensure(context.Background(), slot); err == nil {
 		t.Fatal("a failed rp_filter must fail the Ensure")
+	}
+}
+
+// TestEnsureDisablesIPv6BeforeLinkUp is the regression test for the guest
+// to host link-local path: IPv6 goes off on the host end of every TAP right
+// after it is created, before the address and before the link is up, so the
+// host never gets an fe80 address a guest could reach. A failure fails the
+// Ensure (the caller's cleanup removes the TAP).
+func TestEnsureDisablesIPv6BeforeLinkUp(t *testing.T) {
+	var events []string
+	run := func(_ context.Context, _ string, args ...string) ([]byte, error) {
+		events = append(events, "ip "+strings.Join(args, " "))
+		return nil, nil
+	}
+	h := &Host{
+		IPCmd:    "/test/ip",
+		run:      run,
+		rpFilter: func(string) error { return nil },
+		ipv6Off:  func(tap string) error { events = append(events, "ipv6-off "+tap); return nil },
+	}
+	slot := Slot{TapName: "fctap3", HostIP: "172.16.0.13", GuestIP: "172.16.0.14", CIDR: "172.16.0.12/30", VsockCID: 5}
+	if err := h.Ensure(context.Background(), slot); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{
+		"ip tuntap add fctap3 mode tap",
+		"ipv6-off fctap3",
+		"ip addr add 172.16.0.13/30 dev fctap3",
+		"ip link set fctap3 up",
+	}
+	if len(events) < len(want) {
+		t.Fatalf("events = %v", events)
+	}
+	for i, w := range want {
+		if events[i] != w {
+			t.Fatalf("event %d = %q, want %q (all: %v)", i, events[i], w, events)
+		}
+	}
+
+	// Re-running Ensure on an existing TAP (a restart mid-create) turns it
+	// off again: idempotent, never skipped.
+	events = nil
+	if err := h.Ensure(context.Background(), slot); err != nil {
+		t.Fatal(err)
+	}
+	if len(events) < 2 || events[1] != "ipv6-off fctap3" {
+		t.Fatalf("second Ensure events = %v", events)
+	}
+
+	events = nil
+	h.ipv6Off = func(string) error { return errors.New("read-only /proc") }
+	err := h.Ensure(context.Background(), slot)
+	if err == nil || !strings.Contains(err.Error(), "disable ipv6 on fctap3") {
+		t.Fatalf("Ensure err = %v, want the ipv6 failure", err)
+	}
+	for _, e := range events {
+		if strings.HasPrefix(e, "ip link set") {
+			t.Fatalf("link brought up after the ipv6 step failed: %v", events)
+		}
+	}
+}
+
+// The production default is hostnet.DisableIPv6OnLink: on a host without
+// IPv6 (no /proc/sys/net/ipv6) it is a no-op, so Ensure still succeeds.
+func TestEnsureDefaultIPv6Off(t *testing.T) {
+	h := &Host{IPCmd: "/test/ip", run: func(context.Context, string, ...string) ([]byte, error) { return nil, nil }, rpFilter: func(string) error { return nil }}
+	err := h.Ensure(context.Background(), Slot{TapName: "fctap-unit-x", HostIP: "172.16.0.1", CIDR: "172.16.0.0/30"})
+	if hostnet.HostHasIPv6() {
+		// A Linux host with IPv6: the made-up TAP has no /proc entry.
+		if err == nil {
+			t.Fatal("a TAP with no /proc/sys/net/ipv6 entry must fail on a host with IPv6")
+		}
+		return
+	}
+	if err != nil {
+		t.Fatal(err)
 	}
 }

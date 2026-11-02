@@ -64,6 +64,7 @@ func runAuditSearch(ctx context.Context, a *app, args []string) int {
 		region, endpoint                                     string
 		pathStyle                                            bool
 		maxLag                                               = auditVerifyDefaultMaxLag
+		fetch                                                = auditFetchDefaultConcurrency
 		limit                                                = auditSearchDefaultLimit
 		locals, nodes                                        stringList
 		filter                                               auditlog.SearchFilter
@@ -79,6 +80,7 @@ func runAuditSearch(ctx context.Context, a *app, args []string) int {
 	fs.StringVar(&filter.Result, "result", "", "")
 	fs.IntVar(&limit, "limit", limit, "")
 	fs.DurationVar(&maxLag, "max-lag", maxLag, "")
+	fs.IntVar(&fetch, "fetch-concurrency", fetch, "")
 	fs.Var(&locals, "local", "")
 	fs.Var(&nodes, "node", "")
 	fs.StringVar(&region, "region", "", "")
@@ -92,7 +94,7 @@ func runAuditSearch(ctx context.Context, a *app, args []string) int {
 		return a.usageError(c, verbName, "unexpected argument %q", pos[0])
 	}
 	now := time.Now().UTC()
-	opts := auditSearchOptions{auditVerifyOptions: auditVerifyOptions{nodes: nodes, maxLag: maxLag, exportDir: exportDir}, limit: limit}
+	opts := auditSearchOptions{auditVerifyOptions: auditVerifyOptions{nodes: nodes, maxLag: maxLag, exportDir: exportDir, fetchConcurrency: fetch}, limit: limit}
 	switch {
 	case sinceRaw == "":
 		return a.usageError(c, verbName, "--since is required: the window to search is yours to choose")
@@ -102,6 +104,8 @@ func runAuditSearch(ctx context.Context, a *app, args []string) int {
 		return a.usageError(c, verbName, "--max-lag must not be negative")
 	case limit < 0:
 		return a.usageError(c, verbName, "--limit must not be negative (0 prints every match)")
+	case badFetchConcurrency(fetch):
+		return a.usageError(c, verbName, "%s", fetchConcurrencyUsage)
 	}
 	if witnessURL != "" {
 		if opts.witness, err = parseS3URL("witness", witnessURL); err != nil {
@@ -138,9 +142,11 @@ func runAuditSearch(ctx context.Context, a *app, args []string) int {
 	if c.json {
 		out = nil
 	}
+	ctx, received, stop := a.notifySignals(ctx)
+	defer stop()
 	report, err := searchAudit(ctx, opts, now, out)
 	if err != nil {
-		return a.fail(c, err, exitError)
+		return a.fail(c, err, auditErrorExit(received))
 	}
 	if c.json {
 		a.printJSON(report)
@@ -280,7 +286,7 @@ func searchExport(ctx context.Context, opts auditVerifyOptions, now time.Time) (
 		return nil, nil, err
 	}
 	factory := func() (auditlog.ExportSource, func(), error) {
-		return newS3Export(client, opts.export.bucket, opts.export.prefix, now)
+		return newS3Export(client, opts.export.bucket, opts.export.prefix, now, opts.fetchConcurrency)
 	}
 	lister := func(ctx context.Context) ([]string, error) {
 		return s3ExportNodes(ctx, client, opts.export.bucket, opts.export.prefix)

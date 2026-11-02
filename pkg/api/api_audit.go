@@ -156,6 +156,12 @@ func (p *pendingAPIRecord) emit(status int) {
 		if p.state.Forwarded() && !p.state.ForwardFailed() {
 			return // the peer that ran the handler records it
 		}
+		if g, ok := auditlog.SSHGatewayCallFromContext(p.ctx); ok && g.Open {
+			// The first call of a bridged SSH session writes the session's
+			// one ssh record, on the node that runs it: the owner, whose
+			// audit is the sandbox's.
+			p.svc.RecordSSHSession(p.ctx, g.SandboxID, g.Session)
+		}
 		call := service.APICall{
 			Method:        p.method,
 			Route:         p.desc.route,
@@ -205,10 +211,7 @@ var sandboxPathSegments = map[string]bool{"sandboxes": true, "sandbox": true, "t
 // path values it bound. The raw path is never recorded: it can carry query
 // values, and ids belong in their own fields.
 func describeRoute(r *http.Request) routeDesc {
-	pattern := r.Pattern
-	if i := strings.IndexByte(pattern, ' '); i >= 0 {
-		pattern = pattern[i+1:]
-	}
+	pattern := routePattern(r)
 	if strings.HasPrefix(pattern, runloop.DevboxesPath) {
 		route, sandboxID, target, deletes := runloop.AuditRoute(r)
 		return routeDesc{route: route, sandboxID: sandboxID, target: target, deletesSandbox: deletes}

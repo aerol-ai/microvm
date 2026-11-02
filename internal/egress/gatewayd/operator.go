@@ -33,7 +33,9 @@ func fromOperatorFile(path string) (egresspolicy.DialGuard, *egresspolicy.Upstre
 // without them.
 func fromOperator(path string, w *operator.Watcher) (egresspolicy.DialGuard, *egresspolicy.Upstream, error) {
 	if path == "" {
-		return egresspolicy.DialGuard{}, nil, nil
+		// No file: the guard and the kernel floor still hold the cloud
+		// metadata endpoints.
+		return (*operator.Operator)(nil).Guard(), nil, nil
 	}
 	if err := w.BootError(); err != nil {
 		return egresspolicy.DialGuard{}, nil, err

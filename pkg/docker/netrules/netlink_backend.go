@@ -4,6 +4,7 @@ package netrules
 
 import (
 	"fmt"
+	"sync"
 	"syscall"
 
 	"github.com/google/nftables"
@@ -37,18 +38,35 @@ type nftAPI interface {
 // is already the Manager's job via lockIP.
 type netlinkBackend struct {
 	newConn func() (nftAPI, error)
+	// newSetConn dials the block sets' conn (netlink_blockset.go). Nil keeps
+	// the manager on the per-address block rules.
+	newSetConn func() (nftSetAPI, error)
+	// setMu guards setC, the one block-set conn kept open between
+	// operations (withSetConn). Every block-set write is a commit, and
+	// commits on a node run one at a time in the kernel anyway.
+	setMu sync.Mutex
+	setC  nftSetAPI
 }
 
 // NewNetlinkBackend wires the per-operation nftables connection factory.
 // Callers must be on linux; non-linux builds use the stub that always errors.
 func NewNetlinkBackend() (RuleBackend, error) {
-	return &netlinkBackend{newConn: func() (nftAPI, error) {
-		c, err := nftables.New()
-		if err != nil {
-			return nil, fmt.Errorf("nftables conn: %w", err)
-		}
-		return c, nil
-	}}, nil
+	return &netlinkBackend{
+		newConn: func() (nftAPI, error) {
+			c, err := nftables.New()
+			if err != nil {
+				return nil, fmt.Errorf("nftables conn: %w", err)
+			}
+			return c, nil
+		},
+		newSetConn: func() (nftSetAPI, error) {
+			c, err := nftables.New(nftables.AsLasting())
+			if err != nil {
+				return nil, fmt.Errorf("nftables conn: %w", err)
+			}
+			return c, nil
+		},
+	}, nil
 }
 
 func (b *netlinkBackend) Exists(table, chain string, rulespec ...string) (bool, error) {
@@ -370,17 +388,34 @@ func (b *netlinkBackend) EnsureJumpChain(parent, child string) error {
 	if err != nil {
 		return fmt.Errorf("nft get %s rules: %w", parent, err)
 	}
-	for _, r := range rules {
+	isJump := func(r *nftables.Rule) bool {
 		for _, e := range r.Exprs {
 			if v, ok := e.(*expr.Verdict); ok && v.Kind == expr.VerdictJump && v.Chain == child {
-				return nil
+				return true
 			}
 		}
+		return false
 	}
+	var lower []*nftables.Rule
+	for i, r := range rules {
+		if isJump(r) {
+			if i == 0 {
+				return nil
+			}
+			lower = append(lower, r)
+		}
+	}
+	// One batch: the new top jump goes in and any lower one comes out by its
+	// handle (stable, unlike a position), so there is no moment without it.
 	conn.InsertRule(&nftables.Rule{Table: tbl, Chain: pch, Exprs: []expr.Any{
 		&expr.Counter{},
 		&expr.Verdict{Kind: expr.VerdictJump, Chain: child},
 	}})
+	for _, r := range lower {
+		if err := conn.DelRule(r); err != nil {
+			return fmt.Errorf("nft delete lower %s jump to %s: %w", parent, child, err)
+		}
+	}
 	if err := conn.Flush(); err != nil {
 		return fmt.Errorf("nft insert %s jump to %s: %w", parent, child, err)
 	}

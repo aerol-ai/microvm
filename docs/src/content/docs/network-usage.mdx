@@ -204,7 +204,7 @@ If the new cap is above the current count, traffic flows again at once. If it is
 - **Received bytes are counted after they arrive.** A cap stops further traffic. It cannot undo bytes the sandbox already received.
 - **A cap does not undo block-all.** Raising or removing the sent-bytes cap never lifts `networkBlockAll`. Both use the same block.
 - **IPv4 only.** The counters and caps cover IPv4 traffic, as with [Block or allow the internet](/network-access/).
-- **Linux servers only.** On Docker sandboxes the block is applied by the server's firewall, which runs only on Linux.
+- **Linux servers only.** On Docker and containerd sandboxes the block is applied by the server's firewall, which runs only on Linux. A server without it refuses a cap with `501` and the code `network_policy_unenforced`, at create and with `setNetworkLimits`. Removing a cap (setting it to 0) always works.
 - **Not on Firecracker yet.** A Firecracker sandbox refuses byte caps with `501`, at create and with `setNetworkLimits`.
 
 ## For server operators

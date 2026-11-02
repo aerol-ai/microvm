@@ -2,6 +2,7 @@ package cluster
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -102,6 +103,48 @@ func TestDoLeaderApply(t *testing.T) {
 	err = c.doLeaderApply(context.Background(), ts4.Client(), ts4.URL, []byte("payload"))
 	if err == nil {
 		t.Errorf("expected error")
+	}
+}
+
+// A leader that stops answering mid-forward is a leader change: the caller
+// retries it (IsLeaderUnavailable), and the public API answers 503, not the
+// 400 an unclassified error became. Found live: UC-160 stopped the node that
+// was the leader, and the next forward reported "connection refused" as 400.
+func TestDoLeaderApplyUnreachableLeaderIsALeaderChange(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	endpoint, client := ts.URL, ts.Client()
+	ts.Close() // the old leader's listener is gone
+
+	c := &Cluster{}
+	tests := []struct {
+		name         string
+		ctx          func() context.Context
+		wantLeader   bool
+		wantCanceled bool
+	}{
+		{name: "leader gone", ctx: context.Background, wantLeader: true},
+		{name: "caller cancelled", ctx: func() context.Context {
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel()
+			return ctx
+		}, wantCanceled: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := c.doLeaderApply(tc.ctx(), client, endpoint, []byte("payload"))
+			if err == nil {
+				t.Fatal("expected an error from a closed listener")
+			}
+			if got := errors.Is(err, ErrNotLeader); got != tc.wantLeader {
+				t.Fatalf("errors.Is(ErrNotLeader) = %v, want %v: %v", got, tc.wantLeader, err)
+			}
+			if got := IsLeaderUnavailable(err); got != tc.wantLeader {
+				t.Fatalf("IsLeaderUnavailable = %v, want %v: %v", got, tc.wantLeader, err)
+			}
+			if got := errors.Is(err, context.Canceled); got != tc.wantCanceled {
+				t.Fatalf("errors.Is(context.Canceled) = %v, want %v: %v", got, tc.wantCanceled, err)
+			}
+		})
 	}
 }
 

@@ -85,7 +85,7 @@ Set `networkBlockAll` to `true` when you create the sandbox.
 Now every outbound connection fails at once: web requests, database connections and DNS lookups (DNS turns a name like `example.com` into an address). To check, run a command that needs the internet, such as `curl -I https://google.com`. It fails with a non-zero exit code.
 
 <Aside type="caution">
-The server's firewall does the blocking, and it only runs on Linux. On the macOS install from the [Quickstart](/quick-start/), a sandbox with these settings still starts, but nothing is blocked. Test network rules on a Linux server.
+The server's firewall does the blocking, and it only runs on Linux. A server without it, such as the [local install](/getting-started/local-setup/) on macOS or Linux, refuses these settings with `501` and the code `network_policy_unenforced`. It does not start a sandbox that only looks blocked. Test network rules on a Linux server.
 </Aside>
 
 ## Allow only some websites
@@ -268,8 +268,8 @@ Some servers cannot check names. A create that lists names on one of them gets `
 
 ## Limits
 
-- **IPv4 only.** These rules cover IPv4 traffic. If the sandbox has IPv6 routing, its IPv6 connections are not filtered.
-- **Linux servers only.** The rules are enforced by the server's firewall, which runs only on Linux. On macOS, nothing is blocked.
+- **IPv4 only.** These rules cover IPv4 traffic. Container, gVisor and Firecracker sandboxes have no IPv6, and the server drops any IPv6 they send, so there is no IPv6 path to filter. See [No IPv6 in a sandbox](/engineering-network-defenses/#no-ipv6-in-a-sandbox).
+- **Linux servers only.** On Docker, containerd and Firecracker sandboxes the rules are enforced by the server's firewall, which runs only on Linux. A server whose firewall is off (`SB_ENABLE_NETWORK_RULES=false`, or macOS) refuses them with `501` and the code `network_policy_unenforced`. WASM and V8 isolate sandboxes filter their own traffic, so they keep their rules there.
 - **Website names need the filter service.** A server that cannot run it refuses a create that lists names, with `501`. Lists of IP address ranges still work there.
 
 ## Next steps

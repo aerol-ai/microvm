@@ -143,6 +143,11 @@ func ReadWrappedKeyFile(path string) (WrappedKeyFile, error) {
 
 // WriteWrappedKeyFile writes f to path atomically at mode 0600.
 func WriteWrappedKeyFile(path string, f WrappedKeyFile) error {
+	unlock, err := lockKeyFile(path)
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	return writeSecretJSON(path, f, ".wrapped-key-*")
 }
 

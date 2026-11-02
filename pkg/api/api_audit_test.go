@@ -27,6 +27,7 @@ import (
 	"github.com/aerol-ai/microvm/pkg/caddy"
 	"github.com/aerol-ai/microvm/pkg/controlplane"
 	"github.com/aerol-ai/microvm/pkg/models"
+	"github.com/aerol-ai/microvm/pkg/sshgateway"
 )
 
 // recSink is the audit writer the api-record tests read back.
@@ -371,15 +372,15 @@ func TestAuthDeniedLimiterBounds(t *testing.T) {
 	now := time.Date(2026, 10, 17, 9, 0, 0, 0, time.UTC)
 	l.now = func() time.Time { return now }
 	for i := 0; i < authDeniedMaxSources; i++ {
-		if ok, _ := l.admit("10.0.0." + strings.Repeat("x", i%7) + string(rune(i))); !ok {
+		if ok, _ := l.admit("10.0.0."+strings.Repeat("x", i%7)+string(rune(i)), authDeniedRequest{}); !ok {
 			t.Fatalf("source %d refused below the cap", i)
 		}
 	}
-	if ok, _ := l.admit("192.0.2.1"); ok {
+	if ok, _ := l.admit("192.0.2.1", authDeniedRequest{}); ok {
 		t.Fatal("a new source past the cap was recorded")
 	}
 	now = now.Add(time.Minute)
-	if ok, n := l.admit("192.0.2.1"); !ok || n != 1 {
+	if ok, n := l.admit("192.0.2.1", authDeniedRequest{}); !ok || n != 1 {
 		t.Fatalf("after the sweep: %v %d", ok, n)
 	}
 	if got := tcpPeerAddress(&http.Request{RemoteAddr: "pipe"}); got != "pipe" {
@@ -395,6 +396,8 @@ type forwardingCluster struct {
 	*cluster.Noop
 	owner *Server
 	fail  bool
+	// wire, when set, sees the headers of every request that leaves the edge.
+	wire func(http.Header)
 }
 
 func (c *forwardingCluster) AuditCallerWritesAllowed() bool { return true }
@@ -412,6 +415,9 @@ func (c *forwardingCluster) ForwardHTTP(_ cluster.Endpoint, w http.ResponseWrite
 	}
 	// The network hop: the owner sees the wire, not the edge's context.
 	out = out.WithContext(context.Background())
+	if c.wire != nil {
+		c.wire(out.Header.Clone())
+	}
 	out.TLS = peerTLS("edge-1")
 	out.Header.Set(cluster.PeerNodeIDHeader, "edge-1")
 	c.owner.Handler().ServeHTTP(w, out)
@@ -778,12 +784,16 @@ func TestDescribeRoute(t *testing.T) {
 }
 
 // TestSSHGatewayServiceRecordsSessions pins that the service the daemon
-// hands the SSH gateway can write the session record.
+// hands the SSH gateway can write the session record, and can say whether
+// the owner of a remote sandbox writes it instead. The gateway finds both
+// by type assertion, so without this a rename would silently keep every
+// bridged session's record on the gateway's node.
 func TestSSHGatewayServiceRecordsSessions(t *testing.T) {
 	var svc any = (*service.Service)(nil)
-	if _, ok := svc.(interface {
-		RecordSSHSession(context.Context, string, string)
-	}); !ok {
+	if _, ok := svc.(sshgateway.SessionRecorder); !ok {
 		t.Fatal("*service.Service no longer records SSH sessions")
+	}
+	if _, ok := svc.(sshgateway.OwnerSessionRecorder); !ok {
+		t.Fatal("*service.Service no longer answers whether the owner records bridged SSH sessions")
 	}
 }

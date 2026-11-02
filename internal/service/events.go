@@ -19,9 +19,10 @@ const (
 )
 
 // StartEventMonitor launches the Docker event consumer goroutine. It is the
-// realtime counterpart to Reconcile() — when a container dies, OOM-kills, or
-// is destroyed out-of-band, this loop updates the DB and tears down routes
-// within ~1s instead of waiting for the next reconcile tick.
+// realtime counterpart to Reconcile() — when a container dies or is
+// destroyed out-of-band, this loop updates the DB and tears down routes
+// within ~1s instead of waiting for the next reconcile tick. An OOM kill
+// inside a container is recorded, not treated as a stop (sandbox_oom.go).
 func (s *Service) StartEventMonitor(ctx context.Context) {
 	if !s.cfg.EnableEventMonitor {
 		return
@@ -102,7 +103,12 @@ func (s *Service) handleDockerEvent(ctx context.Context, event docker.DockerEven
 	}
 
 	switch event.Action {
-	case "die", "stop", "oom":
+	case "oom":
+		// A process in the sandbox was OOM-killed. Not an exit: if it was
+		// the init, the die event that follows stops the sandbox.
+		s.noteSandboxOOM(sandbox)
+		return nil
+	case "die", "stop":
 		if err := s.markSandboxStopped(ctx, sandbox, event); err != nil {
 			return err
 		}
@@ -124,6 +130,7 @@ func (s *Service) handleDockerEvent(ctx context.Context, event docker.DockerEven
 			return fmt.Errorf("reload sandbox after the destroy wait: %w", err)
 		}
 		sandbox = current
+		s.sandboxOOMs.forget(sandbox.ID)
 		if err := s.handleDestroyEvent(ctx, sandbox); err != nil {
 			return err
 		}
@@ -131,6 +138,8 @@ func (s *Service) handleDockerEvent(ctx context.Context, event docker.DockerEven
 		s.emitLifecycleStopUsage(ctx, sandbox, time.Now(), true)
 		return nil
 	case "start":
+		// A new run: an OOM recorded before it explains none of its exits.
+		s.sandboxOOMs.forget(sandbox.ID)
 		if err := s.handleStartEvent(ctx, sandbox); err != nil {
 			return err
 		}
@@ -143,7 +152,7 @@ func (s *Service) handleDockerEvent(ctx context.Context, event docker.DockerEven
 	}
 }
 
-// markSandboxStopped handles die/stop/oom events: the container exited but the
+// markSandboxStopped handles die/stop events: the container exited but the
 // sandbox row stays — Start can resurrect it, the image is still needed, and
 // the capacity reservation is legitimately held. Routes are torn down and
 // per-IP netrules cleared so a stopped sandbox doesn't leave dangling Caddy
@@ -171,11 +180,22 @@ func (s *Service) markSandboxStopped(ctx context.Context, sandbox *models.Sandbo
 	// Invalidate the warm-preflight cache the moment we observe the
 	// stop event — this is the tightest possible signal that the
 	// sandbox is no longer Started, since the Docker /events stream
-	// surfaces die/stop/oom sub-second after the container actually
+	// surfaces die/stop sub-second after the container actually
 	// exits. The ingress proxy's IsSandboxStarted hot path will fall
 	// through to SQLite from here on for this id.
 	s.invalidateWarm(sandbox.ID)
-	mode := s.classifyDockerStopEvent(sandbox.ID, event)
+	// A die right after an oom event is the init's OOM kill (sandbox_oom.go).
+	// Docker's stop event follows its die and leaves the record to it.
+	oomKilled := event.Action == "die" && s.sandboxOOMs.take(sandbox.ID) && event.ExitCode != 0
+	detail := stopDetail(event.Action, event.ExitCode)
+	if oomKilled {
+		detail = "killed by OOM"
+	}
+	// End the toolbox requests waiting on it now, before the route and
+	// rule teardown below: a killed gVisor sandbox never closes their
+	// connections.
+	s.endToolboxCalls(sandbox.ID, toolboxEndStopped, detail)
+	mode := s.classifyDockerStopEvent(sandbox.ID, oomKilled)
 	arm := s.shouldArmWake(sandbox, mode)
 
 	// Release the admitter slot — a stopped container holds no host CPU/RAM
@@ -215,13 +235,17 @@ func (s *Service) markSandboxStopped(ctx context.Context, sandbox *models.Sandbo
 	sandbox.Status = models.SandboxStatusStopped
 	sandbox.UpdatedAt = time.Now().UTC()
 	sandbox.WakeArmed = arm
-	if event.Action == "oom" {
+	if oomKilled {
 		sandbox.LastError = "container killed by OOM"
 	} else if event.Action == "die" && event.ExitCode != 0 {
 		sandbox.LastError = fmt.Sprintf("container exited with code %d", event.ExitCode)
 	}
 
-	if err := s.store.Upsert(ctx, sandbox); err != nil {
+	err := s.store.Upsert(ctx, sandbox)
+	// Again for a request that read the row while it still said started
+	// (toolbox_calls.go).
+	s.endToolboxCalls(sandbox.ID, toolboxEndStopped, detail)
+	if err != nil {
 		return fmt.Errorf("update sandbox status: %w", err)
 	}
 
@@ -229,6 +253,7 @@ func (s *Service) markSandboxStopped(ctx context.Context, sandbox *models.Sandbo
 		"sandbox_id", sandbox.ID,
 		"action", event.Action,
 		"exit_code", event.ExitCode,
+		"oom_killed", oomKilled,
 		"status", string(sandbox.Status),
 		"stop_mode", mode.String(),
 		"wake_armed", arm,
@@ -252,6 +277,10 @@ func (s *Service) handleDestroyEvent(ctx context.Context, sandbox *models.Sandbo
 	// so the ingress proxy stops treating this id as Started.
 	s.invalidateWarm(sandbox.ID)
 	s.forgetNetstatsActivity(sandbox.ID)
+	// The container is gone: end its toolbox requests now, and again on
+	// the way out for one that read the row meanwhile.
+	s.endToolboxCalls(sandbox.ID, toolboxEndDestroyed, "destroyed")
+	defer s.endToolboxCalls(sandbox.ID, toolboxEndDestroyed, "destroyed")
 
 	// Best-effort teardown. Order matches DestroySandbox (caddy → mounts →
 	// store.Delete → admitter → schedulePendingImageGC); container destroy

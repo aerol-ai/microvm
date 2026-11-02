@@ -38,6 +38,10 @@ type Deps struct {
 	// (SB_RUNLOOP_BLUEPRINT_MAP_JSON), read once in config; the facade parses
 	// it and applies its own defaults.
 	BlueprintMapJSON string
+	// ListGate bounds the cluster-wide lists this node runs at once
+	// (clusterlist.Admit); nil admits every list. One gate is shared by v1
+	// and every facade: they cost the same fan-out.
+	ListGate *apihttp.Gate
 }
 
 // RouteBy returns h behind authenticate → authorize → audit seam

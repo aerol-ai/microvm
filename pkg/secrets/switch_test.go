@@ -63,6 +63,15 @@ func TestTwoStepSwitchFromLocal(t *testing.T) {
 	if err := opens(stepOne, "sb-vault", vaultRow, "node-a"); err != nil {
 		t.Fatalf("a vault row on a local node with Vault settings: %v", err)
 	}
+	// The settings alone are enough: a caller that passes no client gets
+	// the one they describe.
+	fromSettings, _, err := NewProvider(ctx, ProviderOptions{Name: ProviderLocal, Vault: vault, Cipher: c, Store: store})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := opens(fromSettings, "sb-vault", vaultRow, "node-a"); err != nil {
+		t.Fatalf("a vault row on a local node built from Vault settings: %v", err)
+	}
 	// It still seals with the server key, and its own rows keep the local
 	// rules, recipient check included.
 	localRow, err := stepOne.Put(ctx, "sb-local", bag, []string{"node-a"})
@@ -117,5 +126,8 @@ func TestTwoStepSwitchFromLocal(t *testing.T) {
 	f.caps = []any{"create", "update"}
 	if _, err := NewOpenWrapper(ctx, ProviderOptions{Name: ProviderLocal, Vault: startTransit(t, f)}); !IsVaultPolicyError(err) {
 		t.Fatalf("a token that may create keys = %v", err)
+	}
+	if _, _, err := NewProvider(ctx, ProviderOptions{Name: ProviderLocal, Vault: startTransit(t, f), Cipher: c, Store: store}); !IsVaultPolicyError(err) {
+		t.Fatalf("a local provider from a token that may create keys = %v", err)
 	}
 }

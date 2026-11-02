@@ -8,6 +8,8 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+
+	"github.com/aerol-ai/microvm/pkg/egresspolicy"
 )
 
 // Spawner starts a worker subprocess bound to socketPath. Production wiring uses
@@ -54,6 +56,8 @@ func workerEnvironment() []string {
 		"SB_AUDIT_INGEST_PORT": {}, "SB_AUDIT_SPILL_DIR": {},
 		"SB_EGRESS_ATTRIBUTION_ENABLED": {}, "SB_NODE_ID": {},
 		"SB_EGRESS_OPERATOR_FILE": {},
+		// The node ports host-mediated sandboxes may reach (node guard).
+		egresspolicy.NodePortsEnv: {},
 	}
 	out := make([]string, 0, len(allowed))
 	for _, entry := range os.Environ() {
@@ -202,5 +206,6 @@ func RunCLI(args []string) error {
 	if len(args) != 1 {
 		return fmt.Errorf("usage: --wasm-worker <socket-path>")
 	}
+	loadNodeAllowedPorts()
 	return ServeSocketPath(args[0])
 }

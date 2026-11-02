@@ -84,10 +84,12 @@ What you choose is the address that SDKs and users connect to. Set it with `SB_I
 There are three common ways to put one address in front of the ingress nodes:
 
 1. **DNS round-robin.** DNS is the system that turns names into IP addresses. Point one `A` or `AAAA` record at every ingress node's public IP. It costs nothing. When an ingress node dies, some users keep trying it until their DNS cache expires.
-2. **A cloud TCP load balancer**, such as AWS NLB, GCP TCP load balancing or Cloudflare Spectrum. A load balancer spreads connections across the ingress nodes. It checks their health and stops using a dead node within seconds.
+2. **A cloud TCP load balancer**, such as AWS NLB, GCP TCP load balancing or Cloudflare Spectrum. A load balancer spreads connections across the ingress nodes. It checks their health and stops using a dead node within seconds. The Terraform setup can create an AWS one for you: see [Put a load balancer in front](/cluster-setup/#put-a-load-balancer-in-front).
 3. **MetalLB or a BGP virtual IP**, for your own hardware. MetalLB gives a group of machines one shared IP address on your network. It does not know which sandbox lives on which worker, so it does not replace the ingress nodes. Put it in front of them.
 
-AerolVM does not build, run or manage any of these. The ingress nodes do the routing. What sits in front of them is your choice.
+Round-robin has one more weak spot. If the AerolVM server on an ingress node stops while Caddy keeps running, clients sent there still connect, so they never try the next record: they get `502` until it is back. A load balancer whose health check reaches the AerolVM server, not just Caddy, avoids that.
+
+Outside the Terraform setup, AerolVM does not build, run or manage any of these. The ingress nodes do the routing. What sits in front of them is your choice.
 
 ## Pick a layout for your cluster size
 
@@ -232,3 +234,4 @@ The placement map is the record of which sandbox lives on which worker. Only nod
 - [Durability and failover](/durability/): keep sandboxes alive when a worker dies.
 - [Glossary](/cluster-glossary/): every cluster setting in one place.
 - [Runbooks](/operational-runbooks/): fixes for topology alerts and outages.
+- [Staying up under overload](/overload-protection-architecture/): what an ingress node does when it gets more list calls than it can serve.
