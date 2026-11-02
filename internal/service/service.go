@@ -485,6 +485,10 @@ type Service struct {
 	// nodeGuard is the node guard's state: what each runtime got, and the
 	// per-runtime result the create gate reads (node_guard.go).
 	nodeGuard nodeGuardState
+	// egressFloor is the host-firewall deny floor's state: the floor each
+	// runtime got, and the per-runtime result the create gate reads
+	// (egress_floor.go).
+	egressFloor egressFloorState
 	// egressPolicyLocks serializes live policy updates per sandbox (§5.8).
 	egressPolicyLocks egressPolicyLocks
 	// egressProfileKick wakes SuperviseEgressProfiles after a profile change
@@ -1982,6 +1986,12 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 	// install, since it could reach every service on the node. One atomic
 	// map read (node_guard.go).
 	if err := s.requireNodeGuard(chosenRuntime); err != nil {
+		return nil, err
+	}
+	// Fail closed: no sandbox on a runtime whose egress deny floor is not
+	// installed, since it could reach the cloud metadata endpoints and the
+	// node's credentials. One atomic map read (egress_floor.go).
+	if err := s.requireEgressFloor(chosenRuntime); err != nil {
 		return nil, err
 	}
 	if hasBinariesRule(req.NetworkEgressRules) && chosenRuntime == models.RuntimeGvisor {
