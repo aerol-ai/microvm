@@ -201,14 +201,13 @@ This is what a container snapshot keeps, and what it leaves behind.
 flowchart TB
     SB["A container sandbox"] --> Snap["Take a snapshot"]
     Snap --> Files["Kept<br/>the image plus the sandbox's file changes"]
-    Snap --> Env["Kept on Docker<br/>the environment variables"]
+    Snap -. "not kept" .-> Env["The env passed at create<br/>and the internal agent token"]
     Snap -. "not kept" .-> Mem["Memory and running programs"]
     Snap -. "not kept" .-> Mnt["The contents of your mounts"]
     Files --> New["A new image that<br/>new sandboxes start from"]
-    Env --> New
 ```
 
-- **A container snapshot saves files, and on Docker also environment variables.** It does not save memory. Since it can keep the variables, do not snapshot a sandbox whose secrets you would not give every user of the snapshot.
+- **A container snapshot saves files, not environment variables.** It does not save memory either. The `env` passed at create and the internal token the server uses to reach the sandbox are cleared from the saved image, so a sandbox started from it gets only its own. On Docker the variable names stay, with empty values.
 - **Stopping a Firecracker sandbox writes its memory to disk** on the server, so it can resume where it left off.
 - **Clones of one Firecracker template are made unique.** Each one gets fresh randomness and the right time before your code runs. [Correct snapshot clones](/engineering-snapshot-correctness/) explains how, and lists the gaps that remain.
 - **Named snapshots outlive the sandbox.** Deleting a sandbox does not delete them. Delete them yourself.
@@ -234,7 +233,7 @@ flowchart TB
 
 - **Image contents are yours to trust.** AerolVM runs what the image contains.
 - **A sandbox's own files are open to its own code.** Anything you upload into a sandbox, code in that sandbox can read.
-- **Snapshots copy secrets.** Treat a snapshot like the sandbox it came from.
+- **Snapshots keep the files.** A secret a program wrote to a file is in the snapshot. Treat a snapshot like the sandbox it came from.
 
 ## Next steps
 

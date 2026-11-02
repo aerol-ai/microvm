@@ -443,11 +443,10 @@ A snapshot saves the sandbox's image, not the running state around it.
 | Files and installed packages | Attached cloud storage (it lives outside the sandbox; see [Attach cloud storage](/external-storage/)) |
 | The image's start command and working folder | Running programs, open terminal sessions, anything in memory |
 | The OS user and the image's own environment variables | Network rules, exposed ports and public URLs |
-| Environment variables set with `env` at create time | |
-| CPU, memory and disk hints, when you set them | |
+| CPU, memory and disk hints, when you set them | Environment variables set with `env` at create time, and the internal token the server uses to reach the sandbox |
 
-<Aside type="caution">
-Saving a sandbox also saves the environment variables you passed in `env`. A sandbox started from that snapshot can read them, even though its own `env` is empty. We confirmed this on a server that runs containers on Docker. Do not snapshot a sandbox whose `env` holds secrets you would not share with every user of the snapshot.
+<Aside type="note">
+A snapshot does not keep the variables you passed in `env`. A sandbox started from it gets only the `env` you pass to its own create. On Docker, the names of those variables stay in the snapshot with empty values, because Docker cannot remove a variable from a saved image. A snapshot saved by an older server can still hold the values. Delete it and save it again.
 </Aside>
 
 To keep data next to an image, write it to [attached cloud storage](/external-storage/) instead. Declare the same storage when you create the new sandbox. The data then lives on its own, apart from any one sandbox.
