@@ -6,6 +6,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/capacity"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
@@ -40,13 +41,17 @@ type wasmInstanceCounter interface {
 //   - containerd netns pool (containerd engine with the native netns pool):
 //     docker (runc) and gVisor share it. Free counts free and prewarmed rows;
 //     rows held by running or stopped sandboxes, warm-parked containers and
-//     slots parked as releasing after a failed teardown are not free.
+//     slots parked as releasing after a failed teardown are not free. Held
+//     to the 1,023 ports of its bridge (aerolvm0) when seeded past them.
+//   - docker bridge pool (docker engine): docker (runc) and gVisor share the
+//     sandbox bridge. The admitter counts it (capacity.SlotLimit), so it
+//     costs no store read.
 //   - Firecracker TAP pool: unallocated /30 slots (warm VMMs hold theirs).
 //   - WASM instances, only when SB_WASM_MAX_INSTANCES caps them.
 //
-// Nothing is reported for the docker engine (dockerd's own bridge) or for
-// isolate's egress slots, which are per tenant group rather than per node; an
-// isolate create refuses itself when its group's pool is full.
+// Nothing is reported for isolate's egress slots, which are per tenant group
+// rather than per node; an isolate create refuses itself when its group's
+// pool is full.
 //
 // On a store error it returns the last good answer: a one-off SQLite hiccup
 // must not make the node advertise "no slot limit" or "no slots".
@@ -80,14 +85,12 @@ func (s *Service) readSlotPools(ctx context.Context) ([]capacity.SlotPool, error
 			return nil, err
 		}
 		if stats.Total > 0 {
-			pools = append(pools, capacity.SlotPool{
-				Name:     capacity.SlotPoolContainerNetns,
-				Runtimes: []string{models.RuntimeDocker, models.RuntimeGvisor},
-				Total:    stats.Total,
-				// A prewarmed (pooled) row is claimed first by a create, so
-				// it is as good as free.
-				Free: stats.Free + stats.Pooled,
-			})
+			pools = append(pools, containerNetnsSlotPool(stats))
+		}
+	}
+	if s.admitter != nil {
+		if pool, ok := s.admitter.SlotPool(); ok {
+			pools = append(pools, pool)
 		}
 	}
 	if s.store != nil && s.cfg.EnableFirecracker {
@@ -115,4 +118,38 @@ func (s *Service) readSlotPools(ctx context.Context) ([]capacity.SlotPool, error
 		}
 	}
 	return pools, nil
+}
+
+// containerNetnsSlotPool advertises the containerd netns pool. A prewarmed
+// (pooled) row is claimed first by a create, so it is as good as free. Every
+// slot is a veth on the one aerolvm0 bridge, so a pool seeded past the
+// bridge's 1,023 ports (SB_CONTAINERD_NETNS_POOL_SIZE; boot warns) has rows
+// the kernel will never realize: those must not count as room, or placement
+// keeps sending creates that CNI ADD then fails with "exchange full".
+func containerNetnsSlotPool(stats store.ContainerNetnsPoolStats) capacity.SlotPool {
+	total, free := stats.Total, stats.Free+stats.Pooled
+	if total > capacity.BridgeMaxPorts {
+		// Every row that is not free holds a port, or is about to. A
+		// create from a free row adds a port; one from a prewarmed row
+		// does not.
+		room := max(capacity.BridgeMaxPorts-(stats.Total-stats.Free), 0)
+		total, free = capacity.BridgeMaxPorts, stats.Pooled+min(stats.Free, room)
+	}
+	return capacity.SlotPool{
+		Name:     capacity.SlotPoolContainerNetns,
+		Runtimes: []string{models.RuntimeDocker, models.RuntimeGvisor},
+		Total:    total,
+		Free:     free,
+	}
+}
+
+// networkSlotPool names the pool a container create on engine takes its
+// network slot from, for the capacity refusal a full bridge or subnet becomes
+// (capacity.AsNetworkSlotExhausted).
+func networkSlotPool(engine string) string {
+	if engine == models.ContainerEngineContainerd {
+		pool, _ := capacity.SlotPoolExhausted(store.ErrNoFreeContainerNetnsSlot)
+		return pool
+	}
+	return capacity.DockerBridgePool
 }
