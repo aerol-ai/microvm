@@ -186,6 +186,7 @@ const getBlogSidebarConfig = (): NavigationGroup[] => [
       link('/overload-protection-architecture', '- Staying up under overload'),
       link('/sandbox-metadata-isolation', '- Metadata service isolation'),
       link('/toolbox-agent-authentication', '- Agent authentication'),
+      link('/secret-env-architecture', '- The life of an API key'),
     ],
   },
 ]
