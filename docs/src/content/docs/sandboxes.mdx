@@ -314,7 +314,7 @@ Every SDK sends a key with each create. It is called an idempotency key, and the
     }) {
         // The same ID each time you send order-1234.
         Ok(sandbox) => println!("{}", sandbox.data.id),
-        Err(Error::Status(err)) if err.code() == Some("idempotency_key_reused") => {
+        Err(Error::Api(err)) if err.code() == Some("idempotency_key_reused") => {
             eprintln!("order-1234 was already used with other options")
         }
         Err(err) => return Err(err.into()),

@@ -162,7 +162,7 @@ pub struct CreateOptions {
     /// Sent as the create's `Idempotency-Key` header, never in the body. A
     /// create sent again with the same key and the same options returns the
     /// sandbox the first one made instead of making a second; the same key
-    /// with different options fails with an `Error::Status` whose code is
+    /// with different options fails with an `Error::Api` whose code is
     /// `"idempotency_key_reused"` (HTTP 422). Keys are scoped to the caller's
     /// account.
     ///
