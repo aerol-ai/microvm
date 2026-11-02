@@ -78,6 +78,8 @@ func TestClassify(t *testing.T) {
 		{"sandbox exists", models.ErrSandboxExists, http.StatusConflict, 0, "", ErrKindSandboxExists},
 		{"idempotency key reused", models.ErrIdempotencyKeyReused, http.StatusUnprocessableEntity, 0, models.ErrorCodeIdempotencyKeyReused, ErrKindOther},
 		{"idempotency key reused, named", &models.IdempotencyKeyReusedError{Key: "job-42"}, http.StatusUnprocessableEntity, 0, models.ErrorCodeIdempotencyKeyReused, ErrKindOther},
+		{"create of the id still running", service.ErrCreateInProgress, http.StatusServiceUnavailable, createInProgressRetryAfterSeconds, models.ErrorCodeCreateInProgress, ErrKindOther},
+		{"reservation gone", service.ErrReservedPlacementGone, http.StatusServiceUnavailable, reservationGoneRetryAfterSeconds, "", ErrKindOther},
 		{"token request invalid", service.ErrAPITokenInvalid, http.StatusBadRequest, 0, "", ErrKindOther},
 		{"token name taken", service.ErrAPITokenNameTaken, http.StatusConflict, 0, "", ErrKindOther},
 		{"token ops not on every server", service.ErrAPITokenClusterVersion, http.StatusConflict, 0, "", ErrKindOther},

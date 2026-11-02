@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -41,9 +42,40 @@ type apiRecordingRuntime struct {
 	// handler tests can assert the create→readiness Server-Timing attribution
 	// is threaded through service.CreateSandbox.
 	timingSource string
+	// gate, when set, parks every Create until it opens and counts the
+	// creates itself: a create still running while retries of it arrive.
+	gate *createGate
+}
+
+// createGate holds creates for the concurrent-retry tests. It is a pointer
+// field so runtimes that embed apiRecordingRuntime by value stay copyable.
+type createGate struct {
+	hold    chan struct{}
+	entered chan struct{}
+	once    sync.Once
+	mu      sync.Mutex
+	calls   int
+}
+
+func newCreateGate() *createGate {
+	return &createGate{hold: make(chan struct{}), entered: make(chan struct{})}
+}
+
+func (g *createGate) creates() int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.calls
 }
 
 func (r *apiRecordingRuntime) Create(ctx context.Context, _ models.CreateSandboxRequest, sandboxID, _ string, _ []mounts.ContainerBind) (*models.SandboxRuntimeState, error) {
+	if g := r.gate; g != nil {
+		g.mu.Lock()
+		g.calls++
+		g.mu.Unlock()
+		g.once.Do(func() { close(g.entered) })
+		<-g.hold
+		return &models.SandboxRuntimeState{SandboxID: sandboxID, ContainerID: "ctr-" + sandboxID, ContainerIP: "10.0.0.2", Status: models.SandboxStatusStarted}, nil
+	}
 	if r.createDelay > 0 {
 		select {
 		case <-time.After(r.createDelay):

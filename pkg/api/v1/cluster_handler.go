@@ -254,11 +254,21 @@ func (h *handlers) createSandboxOnSelectedNode(w http.ResponseWriter, r *http.Re
 
 	service.RecordCreateReservationState("self_local")
 	// Local-only images carry no pre-minted reservation id, so honor the
-	// Idempotency-Key here too: a retry replays the existing sandbox through
-	// CreateSandboxWithID's fast path instead of building a second one.
+	// Idempotency-Key here too: a retry replays the existing sandbox instead
+	// of building a second one. The key's create lease (service
+	// create_lease.go) covers the create and the seal and promote below, so
+	// a retry arriving while they run waits for them, then replays; a replay
+	// is never sealed, promoted or rolled back again.
+	preferredID := h.idempotentCreateID(r)
+	createCtx, release, err := h.deps.Service.BeginSandboxCreate(createCtx, preferredID, req.CreateRequestDigests)
+	if err != nil {
+		setCreateServerTiming(w, createStart, createTiming, h.deps.ContainerEngine)
+		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
+		return
+	}
+	defer release()
 	var resp *models.CreateSandboxResponse
-	var err error
-	if preferredID := h.idempotentCreateID(r); preferredID != "" {
+	if preferredID != "" {
 		resp, err = h.deps.Service.CreateSandboxWithID(createCtx, req, preferredID)
 	} else {
 		resp, err = h.deps.Service.CreateSandbox(createCtx, req)
@@ -266,6 +276,11 @@ func (h *handlers) createSandboxOnSelectedNode(w http.ResponseWriter, r *http.Re
 	if err != nil {
 		setCreateServerTiming(w, createStart, createTiming, h.deps.ContainerEngine)
 		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
+		return
+	}
+	if resp.Replayed {
+		setCreateServerTiming(w, createStart, createTiming, h.deps.ContainerEngine)
+		apihttp.WriteJSON(w, http.StatusCreated, resp)
 		return
 	}
 
@@ -312,6 +327,12 @@ func (h *handlers) writeOverlapCreateError(w http.ResponseWriter, err error) {
 	if of, ok := clustercreate.AsOverlapFailure(err); ok {
 		switch of.Phase {
 		case clustercreate.OverlapPhaseSeal:
+			if errors.Is(of.Err, service.ErrReservedPlacementGone) {
+				// Nothing was created and a retry reserves afresh: 503 with
+				// Retry-After, not a seal failure.
+				apihttp.WriteStoreAwareError(h.deps.Logger, w, of.Err)
+				return
+			}
 			apihttp.WriteError(w, http.StatusInternalServerError, clustercreate.FormatSealError(of.Err))
 			return
 		case clustercreate.OverlapPhasePromote:

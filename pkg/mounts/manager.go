@@ -110,8 +110,16 @@ func (m *Manager) Close() {
 	}
 }
 
+// ErrMountsEstablished refuses a MountAll for a sandbox ID whose mounts are
+// established or being established. A sandbox has one mount set: a second
+// MountAll would replace it, losing track of the first set's processes, and
+// its failure's UnmountAll would tear down the first set's storage. It is
+// ErrSandboxExists because the ID belongs to whatever holds those mounts.
+var ErrMountsEstablished = fmt.Errorf("%w: its mounts are already established", models.ErrSandboxExists)
+
 // MountAll mounts every spec for a sandbox. On any failure already-mounted
-// entries are torn down before returning.
+// entries are torn down before returning. It refuses, untouched, an ID that
+// already has mounts (ErrMountsEstablished).
 func (m *Manager) MountAll(ctx context.Context, sandboxID string, mounts []models.MountSpec) ([]ContainerBind, error) {
 	if len(mounts) == 0 {
 		return nil, nil
@@ -131,6 +139,14 @@ func (m *Manager) MountAll(ctx context.Context, sandboxID string, mounts []model
 		return nil, fmt.Errorf("mount: %w", err)
 	}
 	defer release()
+	m.mu.Lock()
+	// beginMount counted this call, so more than one is another MountAll of
+	// the ID still running.
+	taken := len(m.state[sandboxID]) > 0 || m.mounting[sandboxID] > 1
+	m.mu.Unlock()
+	if taken {
+		return nil, fmt.Errorf("mount %s: %w", sandboxID, ErrMountsEstablished)
+	}
 	if err := os.MkdirAll(filepath.Join(m.rootDir, sandboxID), 0o700); err != nil {
 		return nil, fmt.Errorf("create sandbox mount dir: %w", err)
 	}
