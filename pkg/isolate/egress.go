@@ -16,6 +16,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/aerol-ai/microvm/pkg/capacity"
 	"github.com/aerol-ai/microvm/pkg/egresspolicy"
 )
 
@@ -107,6 +108,12 @@ func compileEgressPolicy(p EgressPolicy) (*egresspolicy.Policy, error) {
 	return egresspolicy.Compile(egresspolicy.Spec{AllowOut: p.Allow, DenyOut: p.Deny, BlockAll: p.BlockAll, Mode: mode, MaxHostnames: egresspolicy.MaxUnionHostnames})
 }
 
+// ErrEgressPoolExhausted is ClaimEgressPolicy's refusal when the group has no
+// free egress slot (SB_ISOLATE_EGRESS_POOL_SIZE). It is a capacity refusal:
+// errors.Is matches capacity.ErrCapacityExceeded, so the create answers 503 +
+// Retry-After instead of starting a sandbox whose egress is silently denied.
+var ErrEgressPoolExhausted error = capacity.NewSlotPoolExhausted("isolate egress pool")
+
 // SetEgressPolicy registers (or replaces) the outbound policy for a sandbox and
 // (re)assigns its egress slot (§4). A non-block-all policy claims a free slot
 // and lazily binds that slot's listener; block-all releases any slot so the
@@ -114,13 +121,30 @@ func compileEgressPolicy(p EgressPolicy) (*egresspolicy.Policy, error) {
 // exhausted — the sandbox has no slot and its egress is denied (fail-closed).
 // Called after Load; Unload clears both policy and slot.
 //
+// A create uses ClaimEgressPolicy instead, which refuses rather than fall back.
+// This form stays for the paths that cannot refuse: a live policy update and
+// the reload of a sandbox that already exists.
+//
 // Creates validate the lists first (internal/service), so a policy that does
 // not compile here is a stored row from before the shared grammar (for
 // example a hostname in Deny, D15). It is enforced as block-all rather than
 // guessed at: fail closed, never open.
 func (h *Host) SetEgressPolicy(id string, raw EgressPolicy) {
+	_ = h.setEgressPolicy(id, raw, false)
+}
+
+// ClaimEgressPolicy is SetEgressPolicy for a new sandbox: when the policy needs
+// an egress slot and the group has none free, it records nothing and returns
+// ErrEgressPoolExhausted. Falling back to deny-all there started a sandbox
+// that asked for egress and could not reach anything — a full pool that looked
+// like a working create. A block-all policy needs no slot and never refuses.
+func (h *Host) ClaimEgressPolicy(id string, raw EgressPolicy) error {
+	return h.setEgressPolicy(id, raw, true)
+}
+
+func (h *Host) setEgressPolicy(id string, raw EgressPolicy, claim bool) error {
 	if id == "" {
-		return
+		return nil
 	}
 	p, err := compileEgressPolicy(raw)
 	var rules *egresspolicy.Rules
@@ -133,6 +157,14 @@ func (h *Host) SetEgressPolicy(id string, raw EgressPolicy) {
 		p, rules = egresspolicy.BlockAllPolicy(), nil
 	}
 	h.mu.Lock()
+	if claim && !p.BlockAll() {
+		// Refuse before anything is recorded, so the caller's Unload has
+		// nothing of this sandbox's to undo but its bundle.
+		if _, held := h.slotByID[id]; !held && h.firstFreeSlotLocked() < 0 {
+			h.mu.Unlock()
+			return ErrEgressPoolExhausted
+		}
+	}
 	if h.egressPolicy == nil {
 		h.egressPolicy = make(map[string]*egresspolicy.Policy)
 	}
@@ -152,35 +184,41 @@ func (h *Host) SetEgressPolicy(id string, raw EgressPolicy) {
 			h.freeSlotLocked(id, slot)
 		}
 		h.mu.Unlock()
-		return
+		return nil
 	}
 	if _, ok := h.slotByID[id]; ok {
 		h.mu.Unlock() // already assigned; the policy replacement above suffices
-		return
+		return nil
 	}
-	slot := -1
-	for i, occ := range h.idBySlot {
-		if occ == "" {
-			slot = i
-			break
-		}
-	}
+	slot := h.firstFreeSlotLocked()
 	if slot < 0 {
 		h.mu.Unlock()
 		// No silent caps: a sandbox beyond the pool falls back to deny-all.
 		h.logger.Warn("isolate egress pool exhausted; sandbox falls back to deny-all egress",
 			"group", h.cfg.GroupKey, "sandbox", id, "pool_size", h.cfg.EgressPoolSize)
-		return
+		return nil
 	}
 	if err := h.startSlotServerLocked(slot); err != nil {
 		h.mu.Unlock()
 		h.logger.Error("isolate: failed to bind egress slot listener; sandbox falls back to deny-all",
 			"group", h.cfg.GroupKey, "sandbox", id, "slot", slot, "err", err)
-		return
+		return nil
 	}
 	h.slotByID[id] = slot
 	h.idBySlot[slot] = id
 	h.mu.Unlock()
+	return nil
+}
+
+// firstFreeSlotLocked returns the lowest unowned egress slot, or -1 when the
+// pool is full. Caller holds h.mu.
+func (h *Host) firstFreeSlotLocked() int {
+	for i, occ := range h.idBySlot {
+		if occ == "" {
+			return i
+		}
+	}
+	return -1
 }
 
 // startSlotServerLocked binds the per-slot egress listener. Caller holds h.mu;

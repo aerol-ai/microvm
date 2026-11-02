@@ -117,6 +117,16 @@ func Classify(err error) Classification {
 	case errors.Is(err, service.ErrWakeCircuitOpen):
 		return Classification{Status: http.StatusServiceUnavailable, RetryAfter: 60, Message: err.Error()}
 
+	// Load shedding (admission.go): this node runs as many requests of an
+	// expensive kind as it is configured to. Retryable at once, no log line
+	// (a storm would otherwise write one per refused request).
+	case errors.Is(err, ErrOverloaded):
+		return Classification{Status: http.StatusServiceUnavailable, RetryAfter: OverloadedRetryAfterSeconds, Code: models.ErrorCodeOverloaded, Message: ErrOverloaded.Error()}
+	// The caller's own tenant holds its share of those slots: 429, so the
+	// noisy tenant (not the node) is named as the one to slow down.
+	case errors.Is(err, ErrRateLimited):
+		return Classification{Status: http.StatusTooManyRequests, RetryAfter: RateLimitedRetryAfterSeconds, Code: models.ErrorCodeRateLimited, Message: ErrRateLimited.Error()}
+
 	case errors.Is(err, service.ErrSecretAuditBusy):
 		return Classification{Status: http.StatusTooManyRequests, RetryAfter: 1, Message: service.ErrSecretAuditBusy.Error()}
 	case errors.Is(err, service.ErrSecretAuditChainBroken):
@@ -153,6 +163,10 @@ func Classify(err error) Classification {
 	case errors.Is(err, service.ErrNodeGuardNotReady):
 		// The cause (an iptables error) is for the node's log, not the caller.
 		return Classification{Status: http.StatusServiceUnavailable, RetryAfter: 5, Code: models.ErrorCodeNodeGuardNotReady, Message: service.ErrNodeGuardNotReady.Error(), Log: true, LogLevel: slog.LevelError}
+	case errors.Is(err, service.ErrEgressFloorNotReady):
+		// The cause (an iptables or netlink error) is for the node's log,
+		// not the caller.
+		return Classification{Status: http.StatusServiceUnavailable, RetryAfter: 5, Code: models.ErrorCodeEgressFloorNotReady, Message: service.ErrEgressFloorNotReady.Error(), Log: true, LogLevel: slog.LevelError}
 	case errors.Is(err, service.ErrEgressGatewayUnavailable), errors.Is(err, cluster.ErrNoEgressGatewayTarget):
 		return Classification{Status: http.StatusServiceUnavailable, RetryAfter: 5, Code: models.ErrorCodeEgressGatewayUnavailable, Message: err.Error()}
 	case errors.Is(err, service.ErrEgressSpecCommitFailed):

@@ -77,7 +77,8 @@ type ClientOptions struct {
 	// Retry configures the policy for transient transport errors and retryable
 	// HTTP status codes (421, 429, 502, 503, 504). Exec is narrower: it is
 	// re-sent only when the connection never opened or on 429/503, because a
-	// re-sent exec runs the command again.
+	// re-sent exec runs the command again. A 429 or 503 retry waits as long
+	// as the server's Retry-After asks, up to MaxRetryAfterMs.
 	Retry *RetryConfig
 }
 
@@ -86,6 +87,9 @@ type RetryConfig struct {
 	MaxRetries  *int
 	BaseDelayMs *int
 	MaxDelayMs  *int
+	// MaxRetryAfterMs caps the wait a 429 or 503 Retry-After asks for.
+	// Defaults to 30000; 0 or less ignores Retry-After.
+	MaxRetryAfterMs *int
 }
 
 const (
@@ -139,6 +143,10 @@ func NewClient(baseURL string, config ClientOptions) *Client {
 	if client.retryConfig.MaxDelayMs == nil {
 		v := defaultMaxDelayMs
 		client.retryConfig.MaxDelayMs = &v
+	}
+	if client.retryConfig.MaxRetryAfterMs == nil {
+		v := defaultMaxRetryAfterMs
+		client.retryConfig.MaxRetryAfterMs = &v
 	}
 	return client
 }
@@ -1279,14 +1287,13 @@ func isRetryableStatusCode(code int) bool {
 }
 
 // doWithRetry sends the request makeReq builds, re-sending it with jittered
-// exponential backoff when policy allows the failure.
+// exponential backoff when policy allows the failure. A 429 or 503 waits as
+// long as its Retry-After asks instead (see retryWait), and ctx ends any wait.
 func (c *Client) doWithRetry(ctx context.Context, policy retryPolicy, makeReq func() (*http.Request, error)) (*http.Response, error) {
 	maxRetries := *c.retryConfig.MaxRetries
 	if maxRetries < 0 {
 		maxRetries = 0
 	}
-	baseDelayMs := *c.retryConfig.BaseDelayMs
-	maxDelayMs := *c.retryConfig.MaxDelayMs
 
 	var lastErr error
 	for attempt := 0; attempt <= maxRetries; attempt++ {
@@ -1297,34 +1304,24 @@ func (c *Client) doWithRetry(ctx context.Context, policy retryPolicy, makeReq fu
 
 		response, err := c.httpClient.Do(req)
 
-		// If we got a response, check if the status code is transient.
+		var retryAfter string
 		if err == nil {
-			if policy.retriesStatus(response.StatusCode) && attempt < maxRetries {
-				response.Body.Close()
-				goto retry
+			// A response: re-send only a transient status with budget left.
+			if !policy.retriesStatus(response.StatusCode) || attempt >= maxRetries {
+				return response, nil
 			}
-			return response, nil
+			retryAfter = retryAfterHint(response)
+			response.Body.Close()
+		} else {
+			// An error: re-send only if the policy allows it.
+			lastErr = err
+			if !policy.retriesError(err) || attempt >= maxRetries {
+				break
+			}
 		}
 
-		// We got an error. Check if the policy allows re-sending after it.
-		lastErr = err
-		if !policy.retriesError(err) || attempt >= maxRetries {
-			break
-		}
-
-	retry:
-		delayMs := baseDelayMs * (1 << attempt)
-		if delayMs > maxDelayMs {
-			delayMs = maxDelayMs
-		}
-		// Jitter ±25%
-		jitter := 1.0 + (rand.Float64()-0.5)*0.5
-		sleepDuration := time.Duration(float64(delayMs)*jitter) * time.Millisecond
-
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case <-time.After(sleepDuration):
+		if err := sleepCtx(ctx, c.retryWait(attempt, retryAfter, time.Now(), rand.Float64())); err != nil {
+			return nil, err
 		}
 	}
 	return nil, lastErr

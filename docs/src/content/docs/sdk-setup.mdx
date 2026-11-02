@@ -177,6 +177,93 @@ This lists your sandboxes. If the address or token is wrong, it fails with a cle
 | `unauthorized` | The token does not match the one the server was installed with. |
 | `Connection refused` | The server is not running, or `SB_API_URL` points to the wrong address. |
 
+## When the server is busy
+
+A busy server can turn a request away and say when to try again. It answers `503` when it is overloaded, and `429` when your code sends more than its fair share. Both answers can carry a `Retry-After` header: the number of seconds to wait, or a date and time.
+
+Every SDK retries these for you, up to 3 times:
+
+- It waits as long as `Retry-After` asks, never less.
+- It adds up to a fifth more, at random, so many clients do not all come back at the same moment.
+- It never waits more than 30 seconds for one retry. A longer ask is cut to 30 seconds.
+- Without a `Retry-After`, it waits a short time that doubles on each try: about 200 ms, then 400 ms, then 800 ms.
+
+To change the 30-second limit, set the retry option `maxRetryAfterMs` (`MaxRetryAfterMs` in Go, `max_retry_after_ms` in Rust). Set it to `0` to ignore `Retry-After` and always use the short waits.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    import { MicroVM } from "@aerol-ai/aerolvm-sdk";
+
+    const controller = new AbortController();
+    const client = new MicroVM({
+      retry: { maxRetryAfterMs: 10_000 },
+      // Optional: lets you stop this client's requests and waits.
+      signal: controller.signal,
+    });
+
+    // Later, to stop everything this client is doing:
+    controller.abort();
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    from microvm import MicroVM
+
+    client = MicroVM(config={"retry": {"maxRetryAfterMs": 10000}})
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    maxWait := 10000
+    client, err := microvm.NewClientWithConfig(&sdktypes.MicroVMConfig{
+        Retry: &sdktypes.RetryConfig{MaxRetryAfterMs: &maxWait},
+    })
+    if err != nil {
+        log.Fatal(err)
+    }
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    use aerolvm_sdk::{ApiVersion, Client, ClientConfig, RetryConfig};
+
+    let client = Client::with_config(
+        ClientConfig {
+            retry: Some(RetryConfig {
+                max_retry_after_ms: Some(10_000),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        ApiVersion::V1,
+    )?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    import ai.aerol.microvm.MicroVMClient;
+    import ai.aerol.microvm.MicroVMConfig;
+    import ai.aerol.microvm.model.RetryConfig;
+
+    MicroVMClient client = new MicroVMClient(
+        new MicroVMConfig()
+            .setRetry(new RetryConfig().setMaxRetryAfterMs(10_000))
+    );
+    ```
+  </TabItem>
+</Tabs>
+
+Each SDK stops a wait early in its own way:
+
+| SDK | How to stop waiting |
+|---|---|
+| TypeScript | Pass `signal` to `MicroVM`. Aborting it ends the request and any wait. |
+| Python | A signal handler that raises, such as Ctrl-C, ends the wait. |
+| Go | Cancel the `ctx` you pass, or give it a deadline. |
+| Rust | The client blocks, so a wait cannot be stopped. Lower `max_retry_after_ms` to keep waits short. |
+| Java | Interrupt the thread, for example with `Future.cancel(true)`. |
+
 ## Next steps
 
 - [Quickstart](/quick-start/): run your first sandbox from start to finish.

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import datetime
+import email.utils
 import importlib
 import json
 import os
@@ -96,8 +98,36 @@ _RETRY_STATUSES = frozenset({421, 429, 502, 503, 504})
 # A request that must not run twice (exec) retries only the statuses that say
 # the server turned it away before doing any work. A 421, 502 or 504 comes
 # from a hop that already read the request, so whether the command started
-# is unknown.
+# is unknown. These are also the statuses whose Retry-After paces clients:
+# 429 when this caller is over its share, 503 when the node sheds load. A
+# Retry-After on a 421, 502 or 504 is a hop's, so those use the backoff.
 _NOT_STARTED_STATUSES = frozenset({429, 503})
+# An overloaded node asks for about a second, so the cap only bites on a long
+# ask (maintenance, a misconfigured proxy), which should not hold a call for
+# minutes per retry.
+_DEFAULT_MAX_RETRY_AFTER_MS = 30000
+# Longer delta-seconds values are clamped: no cap is that long anyway.
+_MAX_RETRY_AFTER_SECONDS = 10**9
+
+
+def _parse_retry_after(value: Optional[str], now: float) -> Optional[float]:
+    """Seconds a ``Retry-After`` value asks for, in either form RFC 9110
+    allows: delta-seconds (``"120"``) or an HTTP date. A date already past is
+    0. ``None`` for an absent or malformed value. ``now`` is a Unix time."""
+    text = (value or "").strip()
+    # isascii: str.isdigit alone also takes digits such as "²".
+    if text.isascii() and text.isdigit():
+        return float(min(int(text), _MAX_RETRY_AFTER_SECONDS))
+    try:
+        when = email.utils.parsedate_to_datetime(text)
+    except (TypeError, ValueError, IndexError, OverflowError):
+        return None
+    if when is None:
+        return None
+    if when.tzinfo is None:
+        # The asctime form carries no zone; HTTP dates are always GMT.
+        when = when.replace(tzinfo=datetime.timezone.utc)
+    return max(when.timestamp() - now, 0.0)
 
 
 def _normalize_url(value: str) -> str:
@@ -573,6 +603,7 @@ class MicroVM:
             "maxRetries": retry_cfg.get("maxRetries", 3),
             "baseDelayMs": retry_cfg.get("baseDelayMs", 200),
             "maxDelayMs": retry_cfg.get("maxDelayMs", 5000),
+            "maxRetryAfterMs": retry_cfg.get("maxRetryAfterMs", _DEFAULT_MAX_RETRY_AFTER_MS),
         }
 
         if not self.pat_token:
@@ -1338,15 +1369,19 @@ class MicroVM:
         that prove the server never got the request, plus 429 and 503: a
         timeout or reset after the request was written leaves it unknown
         whether the command ran, and a retry would run it again.
+
+        A 429 or 503 waits as long as its ``Retry-After`` asks (see
+        :meth:`_retry_delay`). The wait is a plain ``time.sleep``, so a
+        signal handler that raises (Ctrl-C, a ``signal.alarm`` timeout) ends
+        it at once.
         """
         max_retries = self._retry_config["maxRetries"]
-        base_delay_ms = self._retry_config["baseDelayMs"]
-        max_delay_ms = self._retry_config["maxDelayMs"]
         retry_statuses = _RETRY_STATUSES if idempotent else _NOT_STARTED_STATUSES
 
         last_exc: Optional[Exception] = None
 
         for attempt in range(max_retries + 1):
+            retry_after: Optional[str] = None
             request = urllib.request.Request(url, data=body, method=method)
             request.add_header("Authorization", f"Bearer {self.pat_token}")
             if self.team:
@@ -1363,6 +1398,8 @@ class MicroVM:
             except urllib.error.HTTPError as exc:
                 last_exc = exc
                 if exc.code in retry_statuses and attempt < max_retries:
+                    if exc.code in _NOT_STARTED_STATUSES and exc.headers is not None:
+                        retry_after = exc.headers.get("Retry-After")
                     # Free the socket before the backoff sleep.
                     exc.close()
                 else:
@@ -1386,14 +1423,34 @@ class MicroVM:
                 last_exc = exc
                 if attempt >= max_retries or not idempotent:
                     raise
-            
-            # Compute delay with exponential backoff and jitter
-            delay_ms = min(base_delay_ms * (2 ** attempt), max_delay_ms)
-            jitter = 1.0 + (random.random() - 0.5) * 0.5
-            time.sleep((delay_ms * jitter) / 1000.0)
+
+            time.sleep(self._retry_delay(attempt, retry_after, time.time(), random.random()))
 
         assert last_exc is not None
         raise last_exc
+
+    def _retry_delay(self, attempt: int, retry_after: Optional[str], now: float, rand: float) -> float:
+        """Seconds to wait before re-sending. ``attempt`` counts from 0,
+        ``retry_after`` is a 429/503's header (``None`` otherwise) and
+        ``rand`` is uniform in [0, 1).
+
+        Without a usable header it is the exponential backoff ±25%. With one,
+        it never retries sooner than the server asked (nor sooner than the
+        backoff) and adds up to a fifth so clients told the same value spread
+        out. ``maxRetryAfterMs`` is a hard ceiling: when the server asks for
+        at least that long the client is early anyway, so the spread goes
+        below it instead.
+        """
+        backoff = min(self._retry_config["baseDelayMs"] * (2 ** attempt), self._retry_config["maxDelayMs"]) / 1000.0
+        limit = self._retry_config["maxRetryAfterMs"] / 1000.0
+        hint = _parse_retry_after(retry_after, now) if limit > 0 else None
+        if hint is None:
+            return backoff * (0.75 + 0.5 * rand)
+        target = max(hint, backoff)
+        if target >= limit:
+            return limit - limit * 0.2 * rand
+        upper = min(target * 1.2, limit)
+        return target + (upper - target) * rand
 
     def _do_json(self, method: str, path: str, payload: Optional[Dict[str, Any]], *, idempotent: bool = True) -> Any:
         data, _ = self._do_json_headers(method, path, payload, idempotent=idempotent)

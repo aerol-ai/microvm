@@ -443,6 +443,14 @@ type placementFSM struct {
 	pendingReservationCapacity   map[string]capacity.Request
 	pendingReservationIDsByOwner map[string]map[string]struct{}
 	pendingReservationExpiries   pendingReservationExpiryHeap
+	// pendingReservationRuntimes counts the same live reservations by owner
+	// and runtime. A reserved create has not taken its network slot yet, so
+	// the owner's capacity heartbeat cannot show it; placement subtracts
+	// these from the owner's advertised free slots (placement.go slotsFit).
+	// Like pendingReservationCapacity it is derived, never persisted: the
+	// same claim/release paths rebuild it on log replay and Restore, so
+	// every replica holds the same counts.
+	pendingReservationRuntimes map[string]map[string]int
 	// reservedIndex tracks rows that are still State=Reserved even after their
 	// capacity claim has been pruned as expired. The leader GC uses it to find
 	// expired reservation rows without scanning every placed sandbox.
@@ -602,6 +610,7 @@ func newPlacementFSMWithRecoveryStore(store placementRecoveryStore) *placementFS
 		pendingReservationClaims:     make(map[string]pendingReservationClaim),
 		pendingReservationCapacity:   make(map[string]capacity.Request),
 		pendingReservationIDsByOwner: make(map[string]map[string]struct{}),
+		pendingReservationRuntimes:   make(map[string]map[string]int),
 		reservedIndex:                make(map[string]struct{}),
 		deletingIndex:                make(map[string]struct{}),
 		drainedNodes:                 make(map[string]bool),
@@ -2581,10 +2590,32 @@ func (f *placementFSM) addPendingCapacityLocked(owner string, req capacity.Reque
 	cur.DiskGB += req.DiskGB
 	cur.GPUs += req.GPUs
 	f.pendingReservationCapacity[owner] = cur
+	if f.pendingReservationRuntimes == nil {
+		f.pendingReservationRuntimes = make(map[string]map[string]int)
+	}
+	byRuntime := f.pendingReservationRuntimes[owner]
+	if byRuntime == nil {
+		byRuntime = make(map[string]int)
+		f.pendingReservationRuntimes[owner] = byRuntime
+	}
+	byRuntime[req.Runtime]++
 }
 
 func (f *placementFSM) subtractPendingCapacityLocked(owner string, req capacity.Request) {
-	if owner == "" || f.pendingReservationCapacity == nil {
+	if owner == "" {
+		return
+	}
+	if byRuntime := f.pendingReservationRuntimes[owner]; byRuntime != nil {
+		if byRuntime[req.Runtime] <= 1 {
+			delete(byRuntime, req.Runtime)
+		} else {
+			byRuntime[req.Runtime]--
+		}
+		if len(byRuntime) == 0 {
+			delete(f.pendingReservationRuntimes, owner)
+		}
+	}
+	if f.pendingReservationCapacity == nil {
 		return
 	}
 	cur := f.pendingReservationCapacity[owner]
@@ -2888,6 +2919,15 @@ func (f *placementFSM) currentVersion() uint64 {
 // lazily from the expiry heap, so this path does not scan the full placement
 // table at 100k-sandbox scale.
 func (f *placementFSM) pendingReservationsByNode(now int64) map[string]capacity.Request {
+	out, _ := f.pendingReservationLoadByNode(now)
+	return out
+}
+
+// pendingReservationLoadByNode is pendingReservationsByNode plus the same
+// reservations counted by owner and runtime, read under one lock so the two
+// agree. Placement needs both: the aggregate for CPU, memory and disk, the
+// counts for network slots (a pool serves some runtimes, not others).
+func (f *placementFSM) pendingReservationLoadByNode(now int64) (map[string]capacity.Request, map[string]map[string]int) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.pruneExpiredPendingReservationsLocked(now)
@@ -2895,7 +2935,15 @@ func (f *placementFSM) pendingReservationsByNode(now int64) map[string]capacity.
 	for owner, req := range f.pendingReservationCapacity {
 		out[owner] = req
 	}
-	return out
+	runtimes := make(map[string]map[string]int, len(f.pendingReservationRuntimes))
+	for owner, byRuntime := range f.pendingReservationRuntimes {
+		cp := make(map[string]int, len(byRuntime))
+		for rt, n := range byRuntime {
+			cp[rt] = n
+		}
+		runtimes[owner] = cp
+	}
+	return out, runtimes
 }
 
 func (f *placementFSM) expiredReservationIDs(now int64) []string {
@@ -3519,6 +3567,7 @@ func (f *placementFSM) Restore(rc io.ReadCloser) (err error) {
 	f.pendingReservationClaims = make(map[string]pendingReservationClaim)
 	f.pendingReservationCapacity = make(map[string]capacity.Request)
 	f.pendingReservationIDsByOwner = make(map[string]map[string]struct{})
+	f.pendingReservationRuntimes = make(map[string]map[string]int)
 	f.pendingReservationExpiries = nil
 	f.reservedIndex = make(map[string]struct{})
 	f.deletingIndex = make(map[string]struct{})

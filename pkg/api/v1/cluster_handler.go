@@ -334,6 +334,14 @@ func (h *handlers) clusterListWrap(w http.ResponseWriter, r *http.Request) {
 		h.listSandboxesLocalPage(w, r)
 		return
 	}
+	// A list that fans out takes one of this node's list slots, or is
+	// answered 503 + Retry-After at once when they are all taken.
+	release, err := clusterlist.Admit(h.deps.ListGate, c, r)
+	if err != nil {
+		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
+		return
+	}
+	defer release()
 
 	ownerRef := clusterlist.OwnerRefFromContext(r.Context())
 	limit, pageToken := clusterlist.ParsePageParams(r.URL)
@@ -1684,7 +1692,7 @@ func (h *handlers) clusterInternalSelectPlacement(w http.ResponseWriter, r *http
 	if sandboxID := strings.TrimSpace(req.SandboxID); sandboxID != "" {
 		target, recipients, err := c.SelectPlacementForCreate(req.Request, sandboxID, req.RecipientBackups)
 		if err != nil {
-			apihttp.WriteJSON(w, http.StatusOK, cluster.SelectPlacementResponse{Error: err.Error()})
+			apihttp.WriteJSON(w, http.StatusOK, cluster.SelectPlacementErrorResponse(err))
 			return
 		}
 		apihttp.WriteJSON(w, http.StatusOK, cluster.SelectPlacementResponse{Target: target, Recipients: recipients})
@@ -1697,7 +1705,7 @@ func (h *handlers) clusterInternalSelectPlacement(w http.ResponseWriter, r *http
 	if req.TargetOnly {
 		target, err := c.SelectPlacement(req.Request)
 		if err != nil {
-			apihttp.WriteJSON(w, http.StatusOK, cluster.SelectPlacementResponse{Error: err.Error()})
+			apihttp.WriteJSON(w, http.StatusOK, cluster.SelectPlacementErrorResponse(err))
 			return
 		}
 		apihttp.WriteJSON(w, http.StatusOK, cluster.SelectPlacementResponse{Target: target})
@@ -1705,7 +1713,7 @@ func (h *handlers) clusterInternalSelectPlacement(w http.ResponseWriter, r *http
 	}
 	target, candidates, err := c.SelectPlacementWithCandidates(req.Request)
 	if err != nil {
-		apihttp.WriteJSON(w, http.StatusOK, cluster.SelectPlacementResponse{Error: err.Error()})
+		apihttp.WriteJSON(w, http.StatusOK, cluster.SelectPlacementErrorResponse(err))
 		return
 	}
 	apihttp.WriteJSON(w, http.StatusOK, cluster.SelectPlacementResponse{Target: target, Candidates: candidates})

@@ -171,6 +171,14 @@ var ErrArtifactNodeUnavailable = fmt.Errorf("cluster: the node holding this arti
 // ErrNoPlacementTarget so every existing 503 mapping still applies.
 var ErrNoEgressGatewayTarget = fmt.Errorf("%w: no node has a ready egress gateway for hostname egress rules", ErrNoPlacementTarget)
 
+// ErrClusterAtCapacity is ErrNoPlacementTarget's form when every worker that
+// could run the request is full: its CPU, memory or disk budget is spent, or
+// its network-slot pool for the runtime has no free slot. It stays an
+// ErrNoPlacementTarget so every existing 503 + Retry-After mapping applies;
+// its message says "capacity", so a client reading it can tell a full fleet
+// from a fleet that cannot run the request at all.
+var ErrClusterAtCapacity = fmt.Errorf("%w: every worker that can run this sandbox is at capacity (cpu, memory, disk or network slots)", ErrNoPlacementTarget)
+
 // ErrInvalidTopology is returned when the live cluster shape violates a
 // production topology invariant. API layers translate this to 503 so clients
 // retry after the operator fixes membership instead of treating it as a

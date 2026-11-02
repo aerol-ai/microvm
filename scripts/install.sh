@@ -1861,13 +1861,59 @@ restart_sandboxd_if_reconfigured() {
 write_healthcheck_script() {
 	cat > "$INSTALL_PREFIX/sandboxd-healthcheck" <<'EOF'
 #!/usr/bin/env bash
+# sandboxd-healthcheck: run by sandboxd-healthcheck.timer every 30 s.
+#
+# It restarts sandboxd only when the process has stopped answering, never
+# because it is busy. A restart kills every request in flight on the node,
+# so on the bank flagship (2026-11-01) restarting an overloaded node after
+# one slow /health turned overload into an outage. Hence:
+#   - it probes the liveness socket, which the daemon answers from its own
+#     listener with no I/O and no lock (pkg/daemon/liveness.go), not
+#     /health, which reads the store and pings the engines;
+#   - it restarts only after FAILS_TO_RESTART failed probes in a row of one
+#     run of the daemon (its InvocationID), the first and the last at least
+#     FAIL_WINDOW_SECONDS apart; the streak is kept between timer runs;
+#   - it never restarts a daemon younger than BOOT_GRACE_SECONDS, nor while
+#     a start, stop or restart of the unit is already under way, and it
+#     asks systemd for the restart without waiting for it, so its next run
+#     sees the restart in progress instead of probing a half-booted daemon.
 
 set -euo pipefail
 
 ENV_FILE="/etc/sandboxd/sandboxd.env"
 if [[ -f "$ENV_FILE" ]]; then
-	# shellcheck disable=SC1091
+	# shellcheck source=/dev/null
 	source "$ENV_FILE"
+fi
+
+UNIT="sandboxd.service"
+STATE_DIR="${SANDBOXD_HEALTHCHECK_STATE_DIR:-/run/sandboxd-healthcheck}"
+STATE_FILE="$STATE_DIR/streak"
+LIVENESS_SOCKET="${SB_LIVENESS_SOCKET:-/run/sandboxd/live.sock}"
+FAILS_TO_RESTART=3
+FAIL_WINDOW_SECONDS=90
+BOOT_GRACE_SECONDS=120
+PROBE_TIMEOUT_SECONDS=10
+
+log() {
+	logger -t sandboxd-healthcheck "$*"
+}
+
+clear_streak() {
+	rm -f "$STATE_FILE"
+}
+
+unit_prop() {
+	systemctl show -p "$1" --value "$UNIT" 2>/dev/null || true
+}
+
+mkdir -p "$STATE_DIR"
+chmod 0700 "$STATE_DIR"
+# One watchdog at a time: a manual run beside the timer's must not ask for
+# a second restart.
+if command -v flock >/dev/null 2>&1; then
+	exec 9>"$STATE_DIR/lock"
+	flock -n 9 || exit 0
 fi
 
 # systemd stops restarting a unit that failed StartLimitBurst times within
@@ -1876,26 +1922,82 @@ fi
 # key store came back, so a failed unit is reset and started again here,
 # every run of this timer. A unit an operator stopped is inactive, not
 # failed, and is left alone.
-if systemctl is-failed --quiet sandboxd.service; then
-	logger -t sandboxd-healthcheck "sandboxd.service is failed; resetting it and starting it again"
-	systemctl reset-failed sandboxd.service
-	systemctl start sandboxd.service || true
+if systemctl is-failed --quiet "$UNIT"; then
+	log "sandboxd.service is failed; resetting it and starting it again"
+	clear_streak
+	systemctl reset-failed "$UNIT"
+	systemctl start "$UNIT" || true
 	exit 0
 fi
 
-if ! systemctl is-active --quiet sandboxd.service; then
+# inactive: stopped by an operator. activating, deactivating, reloading: a
+# start, stop or restart is already under way. Neither is ours to touch.
+if [[ "$(unit_prop ActiveState)" != "active" ]]; then
+	clear_streak
+	exit 0
+fi
+# A job queued on the unit (a restart someone already asked for) is under
+# way too: never stack a second restart on it.
+if [[ -n "$(systemctl list-jobs --no-legend "$UNIT" 2>/dev/null || true)" ]]; then
+	exit 0
+fi
+invocation="$(unit_prop InvocationID)"
+main_pid="$(unit_prop MainPID)"
+
+probe() {
+	if [[ -S "$LIVENESS_SOCKET" ]]; then
+		curl -fsS --max-time "$PROBE_TIMEOUT_SECONDS" --unix-socket "$LIVENESS_SOCKET" "http://localhost/livez" >/dev/null
+		return
+	fi
+	# A daemon older than the liveness socket, or one run with
+	# SB_LIVENESS_SOCKET=off: /health is the only signal it has.
+	curl -fsS --max-time "$PROBE_TIMEOUT_SECONDS" "http://127.0.0.1:${SB_API_PORT:-21212}/health" >/dev/null
+}
+
+if probe; then
+	clear_streak
 	exit 0
 fi
 
-HEALTH_HOST="127.0.0.1"
-HEALTH_PORT="${SB_API_PORT:-21212}"
-HEALTH_URL="http://${HEALTH_HOST}:${HEALTH_PORT}/health"
-
-if ! curl -fsS --max-time 10 "$HEALTH_URL" >/dev/null; then
-	logger -t sandboxd-healthcheck "health check failed for ${HEALTH_URL}; restarting sandboxd.service"
-	systemctl restart sandboxd.service
-	logger -t sandboxd-healthcheck "sandboxd.service restart requested"
+now="$(date +%s)"
+streak_invocation=""
+fails=0
+first=0
+if [[ -f "$STATE_FILE" ]]; then
+	read -r streak_invocation fails first <"$STATE_FILE" || true
 fi
+# Failures of an earlier run of the daemon say nothing about this one.
+if [[ "$streak_invocation" != "$invocation" || ! "$fails" =~ ^[0-9]+$ || ! "$first" =~ ^[0-9]+$ ]]; then
+	fails=0
+	first="$now"
+fi
+fails=$((fails + 1))
+printf '%s %s %s\n' "$invocation" "$fails" "$first" >"$STATE_FILE.tmp"
+mv -f "$STATE_FILE.tmp" "$STATE_FILE"
+span=$((now - first))
+
+age="$(ps -o etimes= -p "$main_pid" 2>/dev/null | tr -d ' ' || true)"
+if [[ ! "$age" =~ ^[0-9]+$ ]]; then
+	age=0
+fi
+if ((age < BOOT_GRACE_SECONDS)); then
+	log "liveness probe failed ($fails in a row over ${span}s) for a daemon ${age}s old; a daemon in its first ${BOOT_GRACE_SECONDS}s is never restarted"
+	exit 0
+fi
+if ((fails < FAILS_TO_RESTART || span < FAIL_WINDOW_SECONDS)); then
+	log "liveness probe failed ($fails in a row over ${span}s); restarting only after $FAILS_TO_RESTART in a row over ${FAIL_WINDOW_SECONDS}s"
+	exit 0
+fi
+# Last look before acting: a restart that began while we probed is not ours
+# to repeat.
+if [[ "$(unit_prop InvocationID)" != "$invocation" || "$(unit_prop ActiveState)" != "active" ]]; then
+	clear_streak
+	exit 0
+fi
+log "liveness probe failed $fails times in a row over ${span}s; restarting sandboxd.service"
+clear_streak
+systemctl --no-block restart "$UNIT"
+log "sandboxd.service restart requested"
 EOF
 	chmod 0755 "$INSTALL_PREFIX/sandboxd-healthcheck"
 }
@@ -2656,7 +2758,7 @@ if [[ "$LOCAL_MODE" == "true" ]]; then
 	echo "API URL: http://127.0.0.1:21212"
 	echo "Health URL: http://127.0.0.1:21212/health"
 	echo "systemd restart policy: always (5 second backoff, 10 restarts per 5 minutes)"
-	echo "Health watchdog: sandboxd-healthcheck.timer probes /health every 30 seconds"
+	echo "Health watchdog: sandboxd-healthcheck.timer probes the liveness socket every 30 seconds and restarts sandboxd only after 3 failed probes in a row over 90 seconds"
 	exit 0
 fi
 
@@ -2741,4 +2843,4 @@ echo "  This range sits below the Linux ephemeral range (32768-60999) on purpose
 echo "  kernel never hands these out as outbound source ports — eliminates random EADDRINUSE"
 echo "  failures on ExposeTCPPort. 1000 slots = max concurrent TCP exposures per host."
 echo "systemd restart policy: always (5 second backoff, 10 restarts per 5 minutes)"
-echo "Health watchdog: sandboxd-healthcheck.timer probes /health every 30 seconds"
+echo "Health watchdog: sandboxd-healthcheck.timer probes the liveness socket every 30 seconds and restarts sandboxd only after 3 failed probes in a row over 90 seconds"

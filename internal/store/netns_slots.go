@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"github.com/aerol-ai/microvm/pkg/capacity"
 )
 
 // Container netns pool lifecycle states. Stored as TEXT; queries use literals.
@@ -38,7 +40,10 @@ type ContainerNetnsSlot struct {
 }
 
 // ErrNoFreeContainerNetnsSlot is returned when the netns pool is exhausted.
-var ErrNoFreeContainerNetnsSlot = errors.New("container netns pool: no free slot")
+// It is a capacity refusal (errors.Is matches capacity.ErrCapacityExceeded),
+// so the API answers 503 + Retry-After and placement can try another node,
+// instead of the catch-all 400 a full node used to look like.
+var ErrNoFreeContainerNetnsSlot error = capacity.NewSlotPoolExhausted("container netns pool")
 
 // SeedContainerNetnsSlot inserts one free pool row. Idempotent on slot_id PK.
 func (s *Store) SeedContainerNetnsSlot(ctx context.Context, slotID string, now time.Time) error {

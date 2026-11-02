@@ -334,6 +334,12 @@ func (h *handlers) listSandboxes(w http.ResponseWriter, r *http.Request) {
 		apihttp.WriteJSON(w, http.StatusOK, []sandboxResponse{})
 		return
 	}
+	release, err := clusterlist.Admit(h.deps.ListGate, h.deps.Service.Cluster(), r)
+	if err != nil {
+		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
+		return
+	}
+	defer release()
 	sandboxes, err := h.deps.Service.ListSandboxes(r.Context(), nil)
 	if err != nil {
 		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
@@ -423,6 +429,12 @@ func (h *handlers) listSandboxesPaginated(w http.ResponseWriter, r *http.Request
 		apihttp.WriteJSON(w, http.StatusOK, paginatedSandboxesResponse{})
 		return
 	}
+	release, err := clusterlist.Admit(h.deps.ListGate, h.deps.Service.Cluster(), r)
+	if err != nil {
+		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
+		return
+	}
+	defer release()
 	sandboxes, err := h.deps.Service.ListSandboxes(r.Context(), nil)
 	if err != nil {
 		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
