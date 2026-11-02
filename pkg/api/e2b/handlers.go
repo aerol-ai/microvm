@@ -34,14 +34,18 @@ type handlers struct {
 	defaultDomain  *string
 	defaultEnvdVer string
 	snapshotMu     sync.Mutex
+	// legacyFingerprintsUntil ends the window in which a create still looks
+	// for a claim under the unkeyed fingerprint (legacyFingerprintWindow).
+	legacyFingerprintsUntil time.Time
 }
 
 func newHandlers(d Deps) *handlers {
 	return &handlers{
-		deps:           d,
-		templateMap:    loadTemplateMap(d.TemplateMapJSON, d.Logger),
-		clientID:       loadClientID(d.ClientID),
-		defaultEnvdVer: defaultEnvdVersion,
+		deps:                    d,
+		templateMap:             loadTemplateMap(d.TemplateMapJSON, d.Logger),
+		clientID:                loadClientID(d.ClientID),
+		defaultEnvdVer:          defaultEnvdVersion,
+		legacyFingerprintsUntil: time.Now().Add(legacyFingerprintWindow),
 	}
 }
 
@@ -61,11 +65,13 @@ func (h *handlers) createSandbox(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	fingerprint, err := createRequestFingerprint(svcmetrics.OwnerRefForCreate(r.Context()), req.TemplateID, serviceReq, meta)
+	fingerprints, err := createRequestFingerprints(h.deps.Service, svcmetrics.OwnerRefForCreate(r.Context()), req.TemplateID, serviceReq, meta,
+		time.Now().Before(h.legacyFingerprintsUntil))
 	if err != nil {
 		writeStoreAwareError(h.deps.Logger, w, err)
 		return
 	}
+	fingerprint := fingerprints.current
 	deterministicID := sandboxIDFromFingerprint(fingerprint)
 	decision, ok := clustercreate.Prepare(w, r, h.deps.Service, serviceReq, writeErrorCode, clustercreate.PrepareOptions{PreferredSandboxID: deterministicID})
 	if !ok {
@@ -77,7 +83,25 @@ func (h *handlers) createSandbox(w http.ResponseWriter, r *http.Request) {
 		// promptly rather than leave a pending row to age out on its TTL (D5).
 		// This mirrors the create rollback, which already uses a detached context.
 		if err := h.deps.Service.DeleteIdempotentRequest(context.WithoutCancel(r.Context()), idempotencyScopeCreate, fingerprint); err != nil && !errors.Is(err, store.ErrNotFound) && h.deps.Logger != nil {
-			h.deps.Logger.Warn("e2b create reservation cleanup failed", "fingerprint", fingerprint, "error", err)
+			h.deps.Logger.Warn("e2b create reservation cleanup failed", "sandbox_id", deterministicID, "error", err)
+		}
+	}
+
+	// A retry of a create claimed under an earlier fingerprint (the previous
+	// server key, or the unkeyed format before an upgrade) replays that
+	// create, or waits for it, as a claim under the current one would.
+	for _, earlier := range fingerprints.earlier {
+		sandbox, storedMeta, replayed, err := h.waitForCreateReplay(r.Context(), earlier)
+		if err != nil {
+			if !writeKnownError(w, err) {
+				writeStoreAwareError(h.deps.Logger, w, err)
+			}
+			return
+		}
+		if replayed {
+			svcmetrics.RecordFacadeIdempotencyReplay(idempotencyScopeCreate)
+			writeJSON(w, http.StatusCreated, h.toSandboxResponse(r, sandbox, storedMeta))
+			return
 		}
 	}
 
@@ -142,8 +166,11 @@ func (h *handlers) createSandbox(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, h.toSandboxResponse(r, &response.Sandbox, meta))
 }
 
+// sandboxIDFromFingerprint is "sb-" and the first 16 hex digits of a
+// fingerprint's digest ("hmac:<key id>:<hex>", or an older "fingerprint:<hex>").
 func sandboxIDFromFingerprint(fingerprint string) string {
-	hexPart := strings.TrimPrefix(strings.TrimSpace(fingerprint), "fingerprint:")
+	fingerprint = strings.TrimSpace(fingerprint)
+	hexPart := fingerprint[strings.LastIndex(fingerprint, ":")+1:]
 	if len(hexPart) < 16 {
 		return ""
 	}

@@ -25,7 +25,7 @@ AerolVM puts the fix in the database schema, using three tools together:
 - **Partial unique indexes** on the tables that hand out resources such as ports and network slots.
 - A general **`request_idempotency`** table that claims a request and replays its result.
 
-Resource allocations are safe under retry. The E2B facade's create is also safe when the same request body arrives twice, because it dedupes by fingerprint (a hash of the request body). The application only reads the outcome; SQLite does the rejecting.
+Resource allocations are safe under retry. The E2B facade's create is also safe when the same request body arrives twice, because it dedupes by fingerprint (a keyed hash of the request body). The application only reads the outcome; SQLite does the rejecting.
 
 The sections below cover three hazards, the invariant for each (a rule that always holds), and the SQL that enforces it. You can search for every name below in `internal/store/store.go` and `internal/cluster/fsm.go`.
 
@@ -234,7 +234,7 @@ The `request_idempotency` table is the general tool. Each row is keyed by a scop
 ```sql
 CREATE TABLE request_idempotency (
   scope         TEXT NOT NULL,          -- facade namespace, e.g. "e2b.create"
-  fingerprint   TEXT NOT NULL,          -- hash of the request body
+  fingerprint   TEXT NOT NULL,          -- keyed hash of the request body
   target_id     TEXT NOT NULL DEFAULT '',
   state         TEXT NOT NULL DEFAULT 'pending',  -- pending | ready
   locked_until  DATETIME NOT NULL,      -- pending TTL
@@ -309,7 +309,7 @@ Two TTLs (time-to-live limits) control how long a claim lasts, and each facade s
 
 `replayTTL` is how long the same fingerprint keeps replaying the same sandbox. After that, the row resets and a duplicate request runs the create again.
 
-`createRequestFingerprint` (`pkg/api/e2b/meta.go`) builds the hash from a fixed list of fields:
+`createRequestFingerprints` (`pkg/api/e2b/meta.go`) builds the hash from a fixed list of fields:
 
 - the caller's account and the `templateID`,
 - env vars and sandbox metadata,
@@ -317,6 +317,12 @@ Two TTLs (time-to-live limits) control how long a claim lasts, and each facade s
 - the network allow and deny settings, the public-traffic setting and the host-header mask.
 
 It does NOT include a client request ID or timestamp. If your SDK adds one to the body, dedupe silently breaks, because every retry hashes to a new fingerprint. Fields outside that list are not in the hash, so they cannot drive dedupe either.
+
+The hash is keyed. The fields include env values, the fingerprint is stored in the table, and its first 64 bits become the sandbox ID. A plain SHA-256 of them would let anyone who sees the ID or the row check a guessed password offline. So the fingerprint is an HMAC-SHA256 under a key derived from the server key (`Cipher.Digests` in `pkg/secrets/digest.go`), written `hmac:<key id>:<hex>`:
+
+- **The same across restarts and nodes.** Every node of a cluster holds the same server key, so every node derives the same fingerprint and the same sandbox ID.
+- **New only when the server key is rotated.** While a rotation is in progress the server holds the old key too, and a create also looks for a claim under the old key's fingerprint, so a retry across the promote on one node still replays. Each node switches at its next read of the key ring (about every 5 minutes). Until all have, two nodes can derive different IDs, so a retry that moves to another node in that window can create a second sandbox.
+- **Upgrades.** Older servers stored an unkeyed `fingerprint:<sha256>`. For 4 minutes after start (twice the pending TTL, so every claim the old process could leave), a create also looks for a claim under that format. It is computed only to look up; it is never written or logged. During a rolling upgrade an old node and a new node derive different sandbox IDs for the same create, so a retry that moves from one to the other can create a second sandbox.
 
 ### Dedupe is per process
 
