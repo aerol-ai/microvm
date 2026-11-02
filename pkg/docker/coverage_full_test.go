@@ -175,7 +175,8 @@ func TestContainerPID(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Stop / Destroy / CreateSnapshot / Resize / Inspect / ListManaged / RemoveImage
+// Stop / Destroy / Resize / Inspect / ListManaged / RemoveImage
+// (CreateSnapshot: snapshot_commit_test.go)
 // ---------------------------------------------------------------------------
 
 func TestStop(t *testing.T) {
@@ -218,40 +219,6 @@ func TestDestroy(t *testing.T) {
 		sb := &models.Sandbox{ContainerID: "cid", ContainerIP: "172.17.0.2"}
 		if err := c.Destroy(context.Background(), sb); err != nil {
 			t.Fatalf("Destroy() = %v", err)
-		}
-	})
-}
-
-func TestCreateSnapshot(t *testing.T) {
-	t.Run("success", func(t *testing.T) {
-		c := &Client{httpClient: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
-			if r.URL.Path != "/commit" {
-				t.Fatalf("unexpected path %s", r.URL.Path)
-			}
-			if got := r.URL.Query().Get("tag"); got != "v1" {
-				t.Fatalf("tag query = %q", got)
-			}
-			return jsonResponse(http.StatusCreated, map[string]string{"Id": "img-sha"}), nil
-		})}}
-		id, err := c.CreateSnapshot(context.Background(), "cid", "snap-alpha:v1")
-		if err != nil || id != "img-sha" {
-			t.Fatalf("CreateSnapshot() = %q, %v", id, err)
-		}
-	})
-
-	t.Run("invalid_ref", func(t *testing.T) {
-		c := &Client{}
-		if _, err := c.CreateSnapshot(context.Background(), "cid", "bad@sha256:x"); err == nil {
-			t.Fatal("CreateSnapshot() expected ref error")
-		}
-	})
-
-	t.Run("commit_error", func(t *testing.T) {
-		c := &Client{httpClient: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
-			return textResponse(http.StatusInternalServerError, "boom"), nil
-		})}}
-		if _, err := c.CreateSnapshot(context.Background(), "cid", "snap-alpha"); err == nil {
-			t.Fatal("CreateSnapshot() expected commit error")
 		}
 	})
 }

@@ -1117,31 +1117,6 @@ func readySocketSourceFromBind(bind string) (string, bool) {
 	return src, true
 }
 
-func (c *Client) CreateSnapshot(ctx context.Context, containerRef, imageRef string) (string, error) {
-	repo, tag, err := splitSnapshotImageRef(imageRef)
-	if err != nil {
-		return "", err
-	}
-	query := url.Values{}
-	query.Set("container", strings.TrimSpace(containerRef))
-	query.Set("repo", repo)
-	if tag != "" {
-		query.Set("tag", tag)
-	}
-	// The commit copies the container's env into the image. Drop the warm
-	// pool's parked flag so a sandbox made from the snapshot, on any node or
-	// engine, doesn't boot parked.
-	query.Add("changes", "ENV "+poolParkedEnv+"=")
-
-	var response struct {
-		ID string `json:"Id"`
-	}
-	if err := c.doJSON(ctx, http.MethodPost, "/commit", query, nil, nil, &response); err != nil {
-		return "", fmt.Errorf("commit snapshot: %w", err)
-	}
-	return strings.TrimSpace(response.ID), nil
-}
-
 func (c *Client) Resize(ctx context.Context, containerRef string, req models.ResizeSandboxRequest) error {
 	if c.resourceLimitsOff {
 		return nil
