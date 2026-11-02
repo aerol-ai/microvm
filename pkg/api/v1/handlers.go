@@ -94,6 +94,11 @@ func (h *handlers) createSandbox(w http.ResponseWriter, r *http.Request) {
 		apihttp.WriteError(w, http.StatusBadRequest, "invalid JSON body")
 		return
 	}
+	r = withIdempotencyKey(r)
+	if err := h.stampCreateRequestDigests(r, &req); err != nil {
+		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
+		return
+	}
 	// Time the create server-side and report it as a Server-Timing metric so a
 	// client (e.g. the create benchmark) can separate the real create cost from
 	// the client<->cluster network round-trip. Set the header before

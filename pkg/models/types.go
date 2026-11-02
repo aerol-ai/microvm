@@ -122,6 +122,26 @@ var ErrRuntimeNotImplemented = errors.New("runtime not yet implemented on this b
 // already exists. Distinct from name conflicts (store.ErrSandboxNameConflict).
 var ErrSandboxExists = errors.New("sandbox already exists")
 
+// ErrIdempotencyKeyReused is returned when a create's Idempotency-Key was
+// already used with a different request. It is answered 422
+// (ErrorCodeIdempotencyKeyReused) with no sandbox data.
+var ErrIdempotencyKeyReused = errors.New("idempotency key was already used with a different request")
+
+// IdempotencyKeyReusedError is ErrIdempotencyKeyReused naming the key.
+type IdempotencyKeyReusedError struct {
+	Key string
+}
+
+func (e *IdempotencyKeyReusedError) Error() string {
+	if e == nil || e.Key == "" {
+		return "Idempotency-Key was already used with a different request"
+	}
+	return fmt.Sprintf("Idempotency-Key %q was already used with a different request", e.Key)
+}
+
+// Is makes errors.Is(err, ErrIdempotencyKeyReused) hold.
+func (e *IdempotencyKeyReusedError) Is(target error) bool { return target == ErrIdempotencyKeyReused }
+
 // ErrSnapshotCorrupt is returned when a runtime snapshot fails checksum
 // verification at load time — the on-disk artifact does not match the
 // checksum stamped at capture. Firecracker templates and WASM boundary
@@ -697,6 +717,14 @@ type CreateSandboxRequest struct {
 	// (Sandbox.CustomDomains) carries per-hostname status. Capped by
 	// MaxCustomDomainsPerCreateRequest.
 	CustomDomains []string `json:"custom_domains,omitempty"`
+	// CreateRequestDigests are keyed digests ("hmac:<key id>:<hex>", one per
+	// server key, the current key's first) of the request an Idempotency-Key
+	// create was made with, as the client sent it. Server-internal: the API
+	// edge sets it from the decoded request and replaces any client value; it
+	// rides a cluster forward and the replicated spec, so the node that runs
+	// the sandbox, and a failover recreate, can tell a retry of the same
+	// request from a reuse of the key for a different one.
+	CreateRequestDigests []string `json:"create_request_digests,omitempty"`
 	// TemplateID, when set alongside Runtime="firecracker", skips the
 	// per-create OCI→ext4 build and reuses a previously prepared
 	// rootfs.ext4 from a Firecracker template (POST /v1/templates). The
@@ -1484,6 +1512,11 @@ const ErrorCodeNodeGuardNotReady = "node_guard_not_ready"
 // deny_cidrs, is not installed for that runtime; the node retries it every
 // few seconds.
 const ErrorCodeEgressFloorNotReady = "egress_floor_not_ready"
+
+// ErrorCodeIdempotencyKeyReused is returned (422) for a create whose
+// Idempotency-Key was already used with a different request. Retrying the
+// same request cannot succeed: send the original request, or a new key.
+const ErrorCodeIdempotencyKeyReused = "idempotency_key_reused"
 
 // Key-store error codes, each returned with 503 when the key store that wraps
 // sandbox secrets (SB_SECRET_PROVIDER) answers with one of its five error

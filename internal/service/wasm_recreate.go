@@ -97,6 +97,9 @@ func (s *Service) recreateWasmDurableSandbox(ctx context.Context, id, incarnatio
 	seed.CreatedAt = now
 	seed.UpdatedAt = now
 	seed.OwnerRef = s.tenantOwnerRefForRecreate(ctx, id)
+	if len(spec.CreateRequestDigests) > 0 {
+		seed.CreateRequestDigest = spec.CreateRequestDigests[0]
+	}
 	if err := s.persistSandboxCreate(ctx, seed); err != nil {
 		return true, fmt.Errorf("recreate %s: persist row: %w", id, err)
 	}

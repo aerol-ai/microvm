@@ -89,6 +89,38 @@ func (h *handlers) idempotentCreateID(r *http.Request) string {
 	return clustercreate.DeterministicSandboxID(service.OwnerRefForCreate(r.Context()), r.Header.Get(clustercreate.HeaderIdempotencyKey))
 }
 
+// withIdempotencyKey names the request's Idempotency-Key on its context, so a
+// refused reuse of the key says which key it was.
+func withIdempotencyKey(r *http.Request) *http.Request {
+	key := strings.TrimSpace(r.Header.Get(clustercreate.HeaderIdempotencyKey))
+	if key == "" {
+		return r
+	}
+	return r.WithContext(service.WithIdempotencyKey(r.Context(), key))
+}
+
+// stampCreateRequestDigests sets req.CreateRequestDigests to the keyed
+// digests of the request as the client sent it, before any server default,
+// when the create carries an Idempotency-Key; otherwise clears it, so a
+// client cannot supply its own. encoding/json writes map keys sorted, so a
+// retry that orders its env or tags differently digests the same.
+func (h *handlers) stampCreateRequestDigests(r *http.Request, req *models.CreateSandboxRequest) error {
+	req.CreateRequestDigests = nil
+	if strings.TrimSpace(r.Header.Get(clustercreate.HeaderIdempotencyKey)) == "" {
+		return nil
+	}
+	canonical, err := json.Marshal(req)
+	if err != nil {
+		return err
+	}
+	digests, err := h.deps.Service.CreateRequestDigests("v1", canonical)
+	if err != nil {
+		return err
+	}
+	req.CreateRequestDigests = digests
+	return nil
+}
+
 func (h *handlers) clusterCreateWrap(w http.ResponseWriter, r *http.Request) {
 	// Parse the body up front so an invalid JSON request fails fast with 400
 	// without consuming a placement slot — and so the test that passes a nil
@@ -111,6 +143,16 @@ func (h *handlers) clusterCreateWrap(w http.ResponseWriter, r *http.Request) {
 	// can read it.
 	r.Body = io.NopCloser(bytes.NewReader(raw))
 	r.ContentLength = int64(len(raw))
+	r = withIdempotencyKey(r)
+	// A create forwarded by the node that placed it carries the digests that
+	// node took of the client's request; its body here already has the
+	// router's defaults applied, so digesting it again would not match.
+	if strings.TrimSpace(r.Header.Get(clustercreate.HeaderTarget)) == "" {
+		if err := h.stampCreateRequestDigests(r, &req); err != nil {
+			apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
+			return
+		}
+	}
 
 	if h.deps.Service == nil {
 		h.createSandbox(w, r)
