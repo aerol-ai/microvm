@@ -310,13 +310,30 @@ func Prepare(w http.ResponseWriter, r *http.Request, svc *service.Service, req m
 	err = c.ReserveOnTarget(commitCtx, sandboxID, target, &redacted, reserveSecrets, ReservationTTL)
 	cancel()
 	if err != nil {
-		if opts.PreferredSandboxID != "" && errors.Is(err, cluster.ErrReservationConflict) {
+		// A keyed retry that finds its id reserved goes to the reservation's
+		// node, which replays the sandbox, or holds the retry until the create
+		// running there settles and then replays it (service create_lease.go).
+		// The FSM answers a re-reserve of an unexpired reservation for the
+		// same target with ErrIncarnationConflict, since every ReserveOnTarget
+		// mints a fresh incarnation, and another target with
+		// ErrReservationConflict: both mean "this id's create is pending".
+		// The first used to fall through to a bare 503 the SDK gave up on
+		// while the create it was retrying was still running.
+		if opts.PreferredSandboxID != "" && (errors.Is(err, cluster.ErrReservationConflict) || errors.Is(err, cluster.ErrIncarnationConflict)) {
 			service.RecordFacadeIdempotencyConflict(opts.metric("reservation"))
 			handled, local := routeExistingPlacement(w, r, c, sandboxID, writeError)
 			if local {
 				return Decision{ReservationID: sandboxID}, true
 			}
 			if handled {
+				return Decision{}, false
+			}
+			if errors.Is(err, cluster.ErrIncarnationConflict) {
+				// The reservation went between the reserve and the owner
+				// read (its create failed, or it expired): the next retry
+				// reserves afresh.
+				w.Header().Set("Retry-After", "1")
+				writeMsg(w, http.StatusServiceUnavailable, "cluster: the sandbox's pending create settled while this retry was routed; retry")
 				return Decision{}, false
 			}
 		}
@@ -410,28 +427,34 @@ func snapshotTagHome(ctx context.Context, svc *service.Service, c cluster.Client
 // race it. A 409 is excluded and keeps today's behavior (see
 // rejectionHold.rejected).
 //
-// Only a fresh id is released here. With an Idempotency-Key the id is shared
-// by every replay of the key, a replay routes to the existing reservation
-// (routeExistingPlacement) and may be creating under it right now, and the
-// reservation it keeps is exactly what lets that retry finish.
+// An Idempotency-Key id is shared by every replay of the key, and a replay
+// routes to the standing reservation (routeExistingPlacement) and may be
+// creating under it on the target right now. Its reservation is released
+// only on a refusal of the request itself (rejectionHold.refusedForEveryReplay),
+// which that replay, carrying the same request, would have met too before its
+// create began; a refusal of this attempt alone keeps it for the replay.
+// ReserveOnTarget succeeding means this request made the reservation: a
+// re-reserve of a standing one fails (ErrIncarnationConflict or
+// ErrReservationConflict) and never reaches here.
 //
 // A 5xx, a transport failure or a timeout keeps the reservation, as before:
 // the target may still be creating, and cancelling under a live create would
 // leave an untracked sandbox. The expiry sweep stays the safety net there.
 func forwardReservedCreate(w http.ResponseWriter, r *http.Request, c cluster.Client, target cluster.Endpoint, sandboxID string, freshID bool, logger *slog.Logger) {
-	if !freshID {
-		c.ForwardHTTP(target, w, r)
-		return
-	}
 	hold := &rejectionHold{ResponseWriter: w}
 	defer hold.release()
 	c.ForwardHTTP(target, hold, r)
-	if hold.rejected() {
-		service.RecordCreateReservationState("release_rejected")
-		// WithoutCancel: a client that hangs up on the 4xx must not leave
-		// its name held for two minutes.
-		cancelReservation(context.WithoutCancel(r.Context()), c, logger, sandboxID)
+	if !hold.rejected() || (!freshID && !hold.refusedForEveryReplay()) {
+		return
 	}
+	if freshID {
+		service.RecordCreateReservationState("release_rejected")
+	} else {
+		service.RecordCreateReservationState("release_rejected_keyed")
+	}
+	// WithoutCancel: a client that hangs up on the 4xx must not leave its
+	// name held for two minutes.
+	cancelReservation(context.WithoutCancel(r.Context()), c, logger, sandboxID)
 }
 
 // maxHeldRejectionBytes bounds the refusal body rejectionHold buffers. A
@@ -505,6 +528,27 @@ func (h *rejectionHold) rejected() bool {
 		h.status != http.StatusConflict
 }
 
+// refusedForEveryReplay reports a refusal of the request itself, which every
+// replay of an Idempotency-Key carrying the same request meets too, so none
+// can be creating under the reservation. A refusal of this attempt alone is
+// not one: 401 (a worker whose token mirror is a poll behind), 407, 408 and
+// 425 (timing), 421 (a stale target) and 429 (a rate limit) — the SDK
+// retries those with the same key, and the retry needs the reservation. Nor
+// is 422 idempotency_key_reused: the key's reservation is then the create
+// of the request that used it first, which the target is running.
+func (h *rejectionHold) refusedForEveryReplay() bool {
+	if !h.rejected() {
+		return false
+	}
+	switch h.status {
+	case http.StatusUnauthorized, http.StatusProxyAuthRequired, http.StatusRequestTimeout,
+		http.StatusMisdirectedRequest, http.StatusUnprocessableEntity, http.StatusTooEarly,
+		http.StatusTooManyRequests:
+		return false
+	}
+	return true
+}
+
 // release sends a held refusal. Safe to call more than once.
 func (h *rejectionHold) release() {
 	if !h.held {
@@ -574,9 +618,20 @@ func CreateOnSelectedNode(ctx context.Context, svc *service.Service, logger *slo
 	}
 
 	service.RecordCreateReservationState("self_local")
+	// An id the caller names (an Idempotency-Key, a Runloop request id) holds
+	// its create lease (service create_lease.go) across the create AND the
+	// seal and promote below, so a retry arriving meanwhile waits for all
+	// three, then replays (resp.Replayed) or, after a rollback, creates
+	// afresh. A replay is never sealed, promoted or rolled back again. A
+	// generated id needs no lease.
+	id := strings.TrimSpace(opts.SandboxID)
+	ctx, release, err := svc.BeginSandboxCreate(ctx, id, req.CreateRequestDigests)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
 	var resp *models.CreateSandboxResponse
-	var err error
-	if id := strings.TrimSpace(opts.SandboxID); id != "" {
+	if id != "" {
 		resp, err = svc.CreateSandboxWithID(ctx, req, id)
 	} else {
 		resp, err = svc.CreateSandbox(ctx, req)
@@ -584,9 +639,11 @@ func CreateOnSelectedNode(ctx context.Context, svc *service.Service, logger *slo
 	if err != nil {
 		return nil, err
 	}
-	if c == nil {
-		// No cluster client at all (embedded/test wiring): nothing to seal
-		// or promote, the same as OverlapCreateAndPromote's nil-cluster leg.
+	if c == nil || resp.Replayed {
+		// No cluster client (embedded/test wiring): nothing to seal or
+		// promote, the same as OverlapCreateAndPromote's nil-cluster leg.
+		// A replay was sealed and promoted by the create that made it, and
+		// is never this request's to roll back.
 		return resp, nil
 	}
 	if err := svc.ResolvePlatformVolumesForReplication(ctx, &req); err != nil {

@@ -250,6 +250,15 @@ type fakeRuntime struct {
 	// promote-waits-for-create regression test reads it from the
 	// RecordPlacement hook.
 	createFinished atomic.Bool
+	// hold, when set, parks every Create until it is closed, and entered is
+	// closed when the first one parks: a create still running while a retry
+	// of it arrives. failOnce fails the first Create that sees it. creates
+	// counts Create calls.
+	hold      chan struct{}
+	entered   chan struct{}
+	enterOnce sync.Once
+	failOnce  error
+	creates   atomic.Int32
 }
 
 func newFakeRuntime() *fakeRuntime {
@@ -257,6 +266,18 @@ func newFakeRuntime() *fakeRuntime {
 }
 
 func (f *fakeRuntime) Create(_ context.Context, _ models.CreateSandboxRequest, sandboxID, _ string, _ []mounts.ContainerBind) (*models.SandboxRuntimeState, error) {
+	f.creates.Add(1)
+	if f.hold != nil {
+		f.enterOnce.Do(func() { close(f.entered) })
+		<-f.hold
+	}
+	f.mu.Lock()
+	failErr := f.failOnce
+	f.failOnce = nil
+	f.mu.Unlock()
+	if failErr != nil {
+		return nil, failErr
+	}
 	if f.createDelay > 0 {
 		time.Sleep(f.createDelay)
 	}
@@ -926,6 +947,7 @@ func TestPrepare_ReservePaths(t *testing.T) {
 			err            error
 			opts           PrepareOptions
 			owner          cluster.OwnerInfo
+			ownerErr       error
 			wantStatus     int
 			wantRetryAfter string
 			wantOK         bool
@@ -955,6 +977,35 @@ func TestPrepare_ReservePaths(t *testing.T) {
 				owner:      cluster.OwnerInfo{NodeID: "node-b"},
 				wantStatus: http.StatusServiceUnavailable,
 			},
+			// A keyed retry whose reservation is pending on the same target:
+			// the FSM answers ErrIncarnationConflict (each reserve mints a new
+			// incarnation). It goes to the reservation's owner like a
+			// conflict, instead of a bare 503.
+			{
+				name:           "preferred_id_incarnation_conflict_local_owner_reuses_reservation",
+				err:            fmt.Errorf("%w: reservation retry changed its incarnation", cluster.ErrIncarnationConflict),
+				opts:           PrepareOptions{PreferredSandboxID: "sb-fixed"},
+				owner:          cluster.OwnerInfo{NodeID: "node-a", IsSelf: true},
+				wantOK:         true,
+				wantDecisionID: "sb-fixed",
+			},
+			{
+				name:         "preferred_id_incarnation_conflict_remote_owner_forwards",
+				err:          fmt.Errorf("%w: reservation retry changed its incarnation", cluster.ErrIncarnationConflict),
+				opts:         PrepareOptions{PreferredSandboxID: "sb-fixed"},
+				owner:        cluster.OwnerInfo{NodeID: "node-b", APIURL: "http://node-b"},
+				wantStatus:   http.StatusAccepted,
+				wantForwards: 1,
+			},
+			{
+				name:           "preferred_id_incarnation_conflict_reservation_gone_retries",
+				err:            fmt.Errorf("%w: reservation retry changed its incarnation", cluster.ErrIncarnationConflict),
+				opts:           PrepareOptions{PreferredSandboxID: "sb-fixed"},
+				ownerErr:       cluster.ErrUnknownSandbox,
+				wantStatus:     http.StatusServiceUnavailable,
+				wantRetryAfter: "1",
+			},
+			{name: "fresh_id_incarnation_conflict_stays_generic", err: cluster.ErrIncarnationConflict, wantStatus: http.StatusServiceUnavailable},
 			{name: "name_conflict", err: cluster.ErrNameConflict, wantStatus: http.StatusConflict},
 			{name: "reservation_conflict", err: cluster.ErrReservationConflict, wantStatus: http.StatusConflict},
 			{name: "backpressure", err: cluster.ErrCreateBackpressure, wantStatus: http.StatusTooManyRequests, wantRetryAfter: "5"},
@@ -970,6 +1021,7 @@ func TestPrepare_ReservePaths(t *testing.T) {
 					selectTarget: cluster.PlacementTarget{NodeID: "node-a", APIURL: "http://node-a", IsSelf: true},
 					reserveErr:   tc.err,
 					owner:        tc.owner,
+					ownerErr:     tc.ownerErr,
 				}
 				svc := testServiceWithCluster(stub)
 				w := httptest.NewRecorder()

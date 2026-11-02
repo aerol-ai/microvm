@@ -247,18 +247,64 @@ func TestForwardedCreateConflictKeepsTheReservation(t *testing.T) {
 	}
 }
 
-// TestForwardedCreateRefusalKeepsAnIdempotencyKeyReservation: with an
-// Idempotency-Key every replay shares the id, and a replay routes to the
-// standing reservation instead of reserving, so the router must not cancel
-// it under a replay that may be creating right now.
-func TestForwardedCreateRefusalKeepsAnIdempotencyKeyReservation(t *testing.T) {
-	c := newNameReservingCluster(validatingTarget)
-	w := createThroughRouter(t, c, models.CreateSandboxRequest{Name: "demo-key"}, PrepareOptions{PreferredSandboxID: "sb-00000000000000ab"})
-	if w.Code != http.StatusBadRequest {
-		t.Fatalf("status = %d, want the target's 400", w.Code)
+// TestForwardedKeyedCreateRefusals: an Idempotency-Key reservation is shared
+// by every replay of the key, so the router releases it only on a refusal of
+// the request itself, which a replay carrying the same request would have met
+// too before creating anything. That frees the name for the client's
+// corrected create at once instead of 409ing it for ReservationTTL. A refusal
+// of this attempt alone (auth mirror lag, a stale target, timing, a rate
+// limit) and the key's own 422 keep it: a replay may be creating under it.
+func TestForwardedKeyedCreateRefusals(t *testing.T) {
+	const id = "sb-00000000000000ab"
+	tests := []struct {
+		name        string
+		status      int
+		wantRelease bool
+	}{
+		{name: "400 invalid request", status: http.StatusBadRequest, wantRelease: true},
+		{name: "403 not permitted", status: http.StatusForbidden, wantRelease: true},
+		{name: "404 image or volume not found", status: http.StatusNotFound, wantRelease: true},
+		{name: "413 body too large", status: http.StatusRequestEntityTooLarge, wantRelease: true},
+		{name: "401 token mirror behind", status: http.StatusUnauthorized},
+		{name: "408 timeout", status: http.StatusRequestTimeout},
+		{name: "421 stale target", status: http.StatusMisdirectedRequest},
+		{name: "422 key reused", status: http.StatusUnprocessableEntity},
+		{name: "425 too early", status: http.StatusTooEarly},
+		{name: "429 rate limited", status: http.StatusTooManyRequests},
+		{name: "409 kept as for a fresh id", status: http.StatusConflict},
+		{name: "503 may still be creating", status: http.StatusServiceUnavailable},
 	}
-	if c.cancelCount() != 0 || c.holder("demo-key") != "sb-00000000000000ab" {
-		t.Fatalf("an Idempotency-Key reservation was released by the router (cancels %d)", c.cancelCount())
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := newNameReservingCluster(func(_ *nameReservingCluster, w http.ResponseWriter, _ *http.Request) {
+				apihttp.WriteError(w, tt.status, "refused")
+			})
+			w := createThroughRouter(t, c, models.CreateSandboxRequest{Name: "demo-key", Image: "alpine:3.20"}, PrepareOptions{PreferredSandboxID: id})
+			if w.Code != tt.status {
+				t.Fatalf("status = %d, want the target's %d passed through", w.Code, tt.status)
+			}
+			released := c.holder("demo-key") == ""
+			if released != tt.wantRelease {
+				t.Fatalf("released = %v (cancels %d), want %v", released, c.cancelCount(), tt.wantRelease)
+			}
+			for i, saw := range c.clientSawRefusal {
+				if saw {
+					t.Fatalf("cancel %d ran after the refusal reached the client", i)
+				}
+			}
+		})
+	}
+
+	// The live finding the release fixes, keyed: a create the worker refused
+	// with 400 used to hold its name for two minutes, so the corrected create
+	// (the SDK sends a new key for a new call) got 409.
+	c := newNameReservingCluster(validatingTarget)
+	if w := createThroughRouter(t, c, models.CreateSandboxRequest{Name: "demo-key"}, PrepareOptions{PreferredSandboxID: id}); w.Code != http.StatusBadRequest {
+		t.Fatalf("create without an image = %d, want 400", w.Code)
+	}
+	fixed := createThroughRouter(t, c, models.CreateSandboxRequest{Name: "demo-key", Image: "alpine:3.20"}, PrepareOptions{PreferredSandboxID: "sb-00000000000000cd"})
+	if fixed.Code != http.StatusCreated {
+		t.Fatalf("the corrected create right after the refusal = %d %s, want 201", fixed.Code, fixed.Body.String())
 	}
 }
 
@@ -319,7 +365,7 @@ func TestRejectionHold(t *testing.T) {
 		h := &rejectionHold{ResponseWriter: rec}
 		_, _ = h.Write([]byte("ok")) // an implicit 200
 		h.Flush()
-		if rec.Code != http.StatusOK || rec.Body.String() != "ok" || !rec.Flushed || h.rejected() {
+		if rec.Code != http.StatusOK || rec.Body.String() != "ok" || !rec.Flushed || h.rejected() || h.refusedForEveryReplay() {
 			t.Fatalf("code %d body %q flushed %v rejected %v", rec.Code, rec.Body.String(), rec.Flushed, h.rejected())
 		}
 		h.WriteHeader(http.StatusTeapot) // a second status is ignored
