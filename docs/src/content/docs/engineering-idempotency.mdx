@@ -366,6 +366,17 @@ The native v1 create and the Daytona create take an optional `Idempotency-Key` h
 - **Failover keeps it.** The fingerprint rides the replicated create spec, so a sandbox recreated on another node after its node died still refuses a different request.
 - **Older sandboxes are not checked.** A sandbox created before this check existed, or by a server with no server key, has no fingerprint. A retry with its key replays it as before, whatever the request.
 
+## The Runloop devbox ID
+
+The Runloop SDKs send an `x-request-id` header with each call, and send the same one again when they retry it. The Runloop facade turns that header into the devbox ID, so a retry gets the devbox the first attempt made.
+
+- **The ID comes from the caller's account, the request ID and the request body.** So two different creates sent with the same request ID still get two devboxes.
+- **The hash is keyed.** The body holds the env values, and the devbox ID is public. A plain SHA-256 would let anyone who knows the request ID check a guessed password against the ID. So the ID is cut from an HMAC under a key derived from the server key (`devboxIDsForRequest` in `pkg/api/runloop/meta.go`). Every node holds the same server key, so every node derives the same ID.
+- **A retry on the same server finds its devbox through a key rotation.** While a rotation is in progress, the server holds the old key too, and a create also looks for a devbox under the old key's ID.
+- **And through an upgrade.** Older servers used the plain SHA-256 ID. For 4 minutes after start, a create also looks for a devbox under that ID. It is computed only to look up; no new devbox gets it.
+- **Across servers, the cluster finds it by ID.** A retry that lands on another node derives the same ID, collides with the first devbox in the placement layer, and is sent to its node. While nodes disagree on the current key (up to about 5 minutes during a rotation) or run different releases (a rolling upgrade), a retry that moves to another node can create a second devbox.
+- **No server key, no create.** If the server key is revoked, a create with an `x-request-id` gets 503 and nothing is created. A create without the header gets a fresh ID every time, as before.
+
 ## Why a single writer at all
 
 One writer makes these rules cheap, and it keeps AerolVM easy to run. With many writers, as in a clustered Postgres, partial unique indexes need careful thought about isolation levels. (An isolation level sets how much one running transaction can see of another.)

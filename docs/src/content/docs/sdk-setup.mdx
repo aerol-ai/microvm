@@ -264,6 +264,135 @@ Each SDK stops a wait early in its own way:
 | Rust | The client blocks, so a wait cannot be stopped. Lower `max_retry_after_ms` to keep waits short. |
 | Java | Interrupt the thread, for example with `Future.cancel(true)`. |
 
+## When a request fails
+
+When the server says no, every SDK gives you an error that holds:
+
+- **The status**, the HTTP number, such as `422` or `503`.
+- **The code**, a short name such as `overloaded`. The server sends one for errors your code can act on.
+- **The message**, words for a person to read.
+- **The wait**, how long the server's `Retry-After` asked you to wait, when it sent one.
+
+Use the code, not the message, to decide what your program does next. A code stays the same from one release to the next. A message can change.
+
+Not every error has a code. Many errors are only meant for a person to read. An error page from a proxy in front of the server has no code either. For that page, the SDK makes the message from the status. The Rust SDK uses the page's text instead.
+
+| SDK | Error type | Status | Code (when none) | Wait |
+|---|---|---|---|---|
+| TypeScript | `MicroVMApiError` | `status` | `code` (`undefined`) | `retryAfterMs` |
+| Python | `MicroVMHTTPError` | `status_code` | `code` (`""`) | `retry_after`, in seconds |
+| Go | `*microvm.APIError` | `StatusCode` | `Code` (`""`) | `RetryAfter` |
+| Rust | `Error::Api(ApiError)` | `status()` | `code()` (`None`) | `retry_after()` |
+| Java | `MicroVMApiException` | `getStatusCode()` | `getCode()` (`null`) | `getRetryAfter()` |
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    import { MicroVM, MicroVMApiError } from "@aerol-ai/aerolvm-sdk";
+
+    const client = new MicroVM();
+
+    try {
+      const sandbox = await client.create({ image: "ubuntu:22.04" });
+      console.log(`Created ${sandbox.id}`);
+    } catch (err) {
+      if (!(err instanceof MicroVMApiError)) throw err;
+      console.error(`status ${err.status}, code ${err.code ?? "none"}: ${err.message}`);
+      if (err.retryAfterMs !== undefined) {
+        console.error(`The server asked to wait ${err.retryAfterMs} ms.`);
+      }
+    }
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    from microvm import MicroVM, MicroVMHTTPError
+
+    client = MicroVM()
+
+    try:
+        sandbox = client.create(image="ubuntu:22.04")
+        print(f"Created {sandbox.id}")
+    except MicroVMHTTPError as err:
+        print(f"status {err.status_code}, code {err.code or 'none'}: {err}")
+        if err.retry_after is not None:
+            print(f"The server asked to wait {err.retry_after} seconds.")
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    sandbox, err := client.Create(ctx, sdktypes.CreateSandboxOptions{Image: "ubuntu:22.04"})
+    var apiErr *microvm.APIError
+    switch {
+    case errors.As(err, &apiErr):
+        log.Printf("status %d, code %q: %s", apiErr.StatusCode, apiErr.Code, apiErr.Message)
+        if apiErr.RetryAfter > 0 {
+            log.Printf("The server asked to wait %s.", apiErr.RetryAfter)
+        }
+    case err != nil:
+        log.Fatal(err)
+    default:
+        fmt.Println("Created", sandbox.ID)
+    }
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    use aerolvm_sdk::{Client, CreateOptions, Error};
+
+    let client = Client::new(None, None)?;
+
+    match client.create(CreateOptions {
+        image: "ubuntu:22.04".to_string(),
+        ..Default::default()
+    }) {
+        Ok(sandbox) => println!("Created {}", sandbox.data.id),
+        Err(Error::Api(err)) => {
+            eprintln!("status {}, code {:?}: {}", err.status(), err.code(), err.message());
+            if let Some(wait) = err.retry_after() {
+                eprintln!("The server asked to wait {:?}.", wait);
+            }
+        }
+        Err(err) => eprintln!("create failed: {err}"),
+    }
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    import ai.aerol.microvm.MicroVMApiException;
+    import ai.aerol.microvm.MicroVMClient;
+    import ai.aerol.microvm.Sandbox;
+    import ai.aerol.microvm.model.CreateOptions;
+
+    MicroVMClient client = new MicroVMClient();
+
+    try {
+        Sandbox sandbox = client.create(new CreateOptions().setImage("ubuntu:22.04"));
+        System.out.println("Created " + sandbox.id);
+    } catch (MicroVMApiException e) {
+        System.err.println("status " + e.getStatusCode() + ", code " + e.getCode() + ": " + e.getMessage());
+        if (e.getRetryAfter() != null) {
+            System.err.println("The server asked to wait " + e.getRetryAfter().toSeconds() + " seconds.");
+        }
+    }
+    ```
+  </TabItem>
+</Tabs>
+
+Some codes you may see:
+
+| Code | Status | What it means | What to do |
+|---|---|---|---|
+| `overloaded` | `503` | The node is running as many of this kind of request as it allows. | The SDK already tried again. Wait, then try later. |
+| `rate_limited` | `429` | Your account or team sent more than its share of this kind of request. | Send fewer requests at once. |
+| `egress_floor_not_ready` | `503` | The node has not yet set up the rules that keep sandboxes away from cloud metadata and blocked addresses. | Try again after the wait. The node fixes this by itself. |
+| `node_guard_not_ready` | `503` | The node has not yet set up the rules that keep sandboxes away from the node's own services. | Try again after the wait. |
+| `key_store_unavailable` | `503` | The server could not reach the key store that protects sandbox secrets. | Try again after the wait. |
+| `key_revoked` | `503` | The key that protects sandbox secrets was turned off or deleted in the key store. | Ask the key's owner to restore it. |
+| `network_policy_unenforced` | `501` | This node cannot enforce the network rules you asked for. | Drop the rules, or ask the operator to turn on the host firewall. |
+
+In Rust SDK 0.8.0, `Error::Api` holds an `ApiError` instead of the text `"<status>: <message>"`. Errors the SDK finds itself, such as a missing argument, moved to `Error::Client`. Code that read the old text as a `String` no longer compiles, so the compiler shows each place to update.
+
 ## Next steps
 
 - [Quickstart](/quick-start/): run your first sandbox from start to finish.

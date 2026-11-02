@@ -2761,6 +2761,63 @@ class MicroVMClientTest {
         }
     }
 
+    // Every HTTP error is a MicroVMApiException carrying the status, the
+    // server's stable code and its Retry-After, with the message unchanged.
+    @Test
+    void createErrorsCarryStatusCodeAndRetryAfter() throws Exception {
+        Object[][] cases = {
+            // {name, status, content type, Retry-After, body, code, message, retry after}
+            {"422 idempotency_key_reused", 422, "application/json", null,
+                "{\"error\":\"Idempotency-Key reused with a different request\",\"code\":\"idempotency_key_reused\"}",
+                "idempotency_key_reused", "Idempotency-Key reused with a different request", null},
+            {"503 egress_floor_not_ready", 503, "application/json", "5",
+                "{\"error\":\"egress deny floor not ready\",\"code\":\"egress_floor_not_ready\"}",
+                "egress_floor_not_ready", "egress deny floor not ready", java.time.Duration.ofSeconds(5)},
+            {"non-JSON body", 502, "text/html", null, "<html>Bad Gateway</html>",
+                null, "request failed with status 502", null},
+        };
+        for (Object[] c : cases) {
+            String name = (String) c[0];
+            int status = (Integer) c[1];
+            HttpServer server = startServer(exchange -> {
+                if (c[3] != null) {
+                    exchange.getResponseHeaders().set("Retry-After", (String) c[3]);
+                }
+                writeResponse(exchange, status, (String) c[2], ((String) c[4]).getBytes(StandardCharsets.UTF_8));
+            });
+            try {
+                MicroVMClient client = clientFor(serverUrl(server), new RetryConfig().setMaxRetries(0), HttpClient.newHttpClient());
+                MicroVMApiException err = assertThrows(MicroVMApiException.class,
+                    () -> client.create(new CreateOptions().setImage("ubuntu:22.04")), name);
+                assertTrue(err instanceof MicroVMException, name);
+                assertEquals(status, err.getStatusCode(), name);
+                assertEquals(c[5], err.getCode(), name);
+                assertEquals(c[6], err.getMessage(), name);
+                assertEquals(c[7], err.getRetryAfter(), name);
+            } finally {
+                server.stop(0);
+            }
+        }
+    }
+
+    @Test
+    void idempotencyKeyReusedIsNotRetried() throws Exception {
+        AtomicInteger hits = new AtomicInteger();
+        HttpServer server = startServer(exchange -> {
+            hits.incrementAndGet();
+            writeJson(exchange, 422, mapOf("error", "reused", "code", "idempotency_key_reused"));
+        });
+        try {
+            MicroVMClient client = clientFor(serverUrl(server), fastRetry(), HttpClient.newHttpClient());
+            MicroVMApiException err = assertThrows(MicroVMApiException.class,
+                () -> client.create(new CreateOptions().setImage("ubuntu:22.04")));
+            assertEquals("idempotency_key_reused", err.getCode());
+            assertEquals(1, hits.get());
+        } finally {
+            server.stop(0);
+        }
+    }
+
     private static MicroVMClient clientFor(HttpServer server) {
         return new MicroVMClient(
             new MicroVMConfig().setApiUrl(serverUrl(server)).setPatToken("pat-token"),

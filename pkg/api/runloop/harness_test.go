@@ -550,6 +550,9 @@ type testEnv struct {
 	toolbox *fakeToolbox
 	handler http.Handler
 	h       *handlers
+	// cipher is the service's server key, for tests that rotate or
+	// revoke it.
+	cipher *secrets.Cipher
 }
 
 func newTestEnv(t *testing.T) *testEnv {
@@ -597,7 +600,7 @@ func newTestEnvWithConfig(t *testing.T, mutate func(*config.Config)) *testEnv {
 	mux := http.NewServeMux()
 	mux.Handle(devboxesPath, http.HandlerFunc(h.route))
 	mux.Handle(devboxesPath+"/", http.HandlerFunc(h.route))
-	return &testEnv{svc: svc, store: st, runtime: rt, toolbox: toolbox, handler: mux, h: h}
+	return &testEnv{svc: svc, store: st, runtime: rt, toolbox: toolbox, handler: mux, h: h, cipher: cipher}
 }
 
 // do sends a request and decodes a JSON response into out (when non-nil).

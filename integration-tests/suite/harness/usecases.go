@@ -934,6 +934,10 @@ var Registry = []UseCase{
 	// (bank_security_test.go): v1 and Daytona used to hand back the old
 	// sandbox and drop the new request.
 	{ID: "UC-365", Title: "Security: an Idempotency-Key reused with a different create request is refused, on v1 and Daytona: the same request replays the same sandbox, a changed env gets 422 idempotency_key_reused naming the key and carrying no sandbox data or secret, and the first sandbox is untouched", Requires: []Capability{CapDocker}, Implemented: true},
+	// Keyed digests agree across nodes (keyed_digest_test.go): the Runloop
+	// devbox id and the exec record's body digest are HMACs under the
+	// server key, not plain SHA-256 a reader could test guesses against.
+	{ID: "UC-366", Title: "Security: values derived from secret-bearing request bodies are keyed with the server key and agree across nodes: a Runloop create retried with the same x-request-id through a second node gets the same devbox, another env value under that x-request-id gets another devbox, and one exec body run on sandboxes of two different owners is recorded on both as the same hmac:<key id>:<64 hex> digest, never the body's plain SHA-256 or the secret", Requires: []Capability{CapCluster, CapDocker}, Implemented: true},
 }
 
 // byID is a lookup built once for the report generator.

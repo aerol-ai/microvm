@@ -1476,6 +1476,97 @@ class ExecRetryTests(unittest.TestCase):
                     self.assertEqual(opened.call_count, 4 if retried else 1)
 
 
+class HTTPErrorTests(unittest.TestCase):
+    """Every HTTP error is a MicroVMHTTPError carrying the status, the
+    server's stable code and its Retry-After, with the message unchanged."""
+
+    def _serve(self, status, body, content_type="application/json", retry_after=None, retry=None):
+        hits = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length") or 0)
+                hits.append(self.rfile.read(length))
+                self.send_response(status)
+                if retry_after is not None:
+                    self.send_header("Retry-After", retry_after)
+                self.send_header("Content-Type", content_type)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
+        thread.start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        config = {"retry": dict(_FAST_RETRY["retry"], **(retry or {}))}
+        return MicroVM("http://127.0.0.1:%d" % server.server_port, "pat", config=config), hits
+
+    def test_create_errors_carry_status_code_and_retry_after(self):
+        cases = [
+            # (name, status, body, content type, Retry-After, retry config,
+            #  want code, want message, want retry_after, want hits)
+            (
+                "422 idempotency_key_reused is not retried",
+                422,
+                b'{"error": "Idempotency-Key reused with a different request", "code": "idempotency_key_reused"}',
+                "application/json",
+                None,
+                None,
+                "idempotency_key_reused",
+                "Idempotency-Key reused with a different request",
+                None,
+                1,
+            ),
+            (
+                "503 egress_floor_not_ready with Retry-After",
+                503,
+                b'{"error": "egress deny floor not ready", "code": "egress_floor_not_ready"}',
+                "application/json",
+                "5",
+                {"maxRetries": 0},
+                "egress_floor_not_ready",
+                "egress deny floor not ready",
+                5.0,
+                1,
+            ),
+            (
+                "non-JSON body keeps the reason phrase and has no code",
+                502,
+                b"<html>Bad Gateway</html>",
+                "text/html",
+                None,
+                {"maxRetries": 0},
+                "",
+                "Bad Gateway",
+                None,
+                1,
+            ),
+        ]
+        for name, status, body, ctype, header, retry, code, message, wait, want_hits in cases:
+            with self.subTest(name):
+                client, hits = self._serve(status, body, ctype, header, retry)
+                with self.assertRaises(MicroVMHTTPError) as ctx:
+                    client.create(image="ubuntu:22.04")
+                err = ctx.exception
+                self.assertIsInstance(err, MicroVMError)
+                self.assertEqual(err.status_code, status)
+                self.assertEqual(err.code, code)
+                self.assertEqual(str(err), message)
+                self.assertEqual(err.retry_after, wait)
+                self.assertEqual(len(hits), want_hits)
+
+    def test_error_types_are_exported_from_the_package(self):
+        import microvm
+
+        self.assertIs(microvm.MicroVMHTTPError, MicroVMHTTPError)
+        self.assertIs(microvm.MicroVMError, MicroVMError)
+
+
 class RetryAfterTests(unittest.TestCase):
     """A 429 or 503 waits as long as the server's Retry-After asks, within
     ``maxRetryAfterMs``; anything else keeps the client's own backoff."""

@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { Image } from "./Image.js";
+import { MicroVMApiError as ExportedMicroVMApiError } from "./index.js";
 import { MicroVM } from "./MicroVM.js";
 import { Sandbox } from "./Sandbox.js";
 
@@ -1598,4 +1599,26 @@ test("MicroVM passes retry.maxRetryAfterMs and signal to its client", async () =
     },
   });
   await assert.rejects(aborted.tokens.list(), { message: "stopped" });
+});
+
+test("MicroVM create failures are MicroVMApiError from the package entry point", async () => {
+  const sdk = new MicroVM({
+    patToken: "pat-token",
+    apiUrl: "https://api.example.com",
+    retry: { maxRetries: 0 },
+    fetch: async () =>
+      new Response(JSON.stringify({ error: "Idempotency-Key reused", code: "idempotency_key_reused" }), {
+        status: 422,
+        headers: { "content-type": "application/json" },
+      }),
+  });
+  try {
+    await sdk.create({ image: "ubuntu:22.04" });
+    assert.fail("create should fail");
+  } catch (err) {
+    assert.ok(err instanceof ExportedMicroVMApiError);
+    assert.equal(err.status, 422);
+    assert.equal(err.code, "idempotency_key_reused");
+    assert.equal(err.message, "Idempotency-Key reused");
+  }
 });
