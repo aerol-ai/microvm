@@ -3,7 +3,7 @@
 package suite
 
 // Security boundary cases for running untrusted code (UC-317..UC-332,
-// UC-339, UC-340, UC-345 and UC-363): what
+// UC-339, UC-340, UC-345, UC-363 and UC-365): what
 // a regulated buyer asks of a platform that executes code it did not write.
 // Every case attacks the boundary from inside a sandbox, or from the
 // internet, and asserts it holds on each shell runtime the scenario has:
@@ -1877,4 +1877,71 @@ func TestBankOOMKeepsSandboxAndEgress(t *testing.T) {
 			t.Errorf("%s: %d host rule lines for %s were removed by an OOM kill inside the sandbox: %v", rt.name, len(gone), ip, gone)
 		}
 	})
+}
+
+// UC-365 — an Idempotency-Key reused with a different create request is
+// refused, on v1 and on Daytona: the same request replays the same sandbox,
+// and a changed env (a rotated API key, say) gets 422 idempotency_key_reused
+// naming the key, not the old sandbox with the new request dropped. The first
+// sandbox is untouched by the refusal. In a cluster the retries land on any
+// node, so the refusal must hold wherever the sandbox runs.
+func TestBankIdempotencyKeyReuseRefused(t *testing.T) {
+	harness.Require(t, sc, "UC-365")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	for _, surface := range []struct {
+		name, path, imageField string
+	}{
+		{name: "v1", path: "/v1/sandboxes", imageField: "image"},
+		{name: "daytona", path: "/daytona/sandbox", imageField: "snapshot"},
+	} {
+		t.Run(surface.name, func(t *testing.T) {
+			key := "uc365-" + surface.name + "-" + harness.UniqueName(sc, t)
+			hdr := map[string]string{"Idempotency-Key": key}
+			oldSecret, newSecret := secretValue(t, "365old"), secretValue(t, "365new")
+			body := func(secret string) map[string]any {
+				return map[string]any{surface.imageField: "alpine:3.20", "env": map[string]string{"UC365_TOKEN": secret}}
+			}
+
+			st, b := fcDo(t, ctx, http.MethodPost, "", surface.path, body(oldSecret), hdr)
+			if st != http.StatusCreated {
+				t.Fatalf("first create = %d; body=%s", st, b)
+			}
+			var first idResponse
+			fcDecode(t, b, &first)
+			destroySandbox(t, first.ID)
+
+			st, b = fcDo(t, ctx, http.MethodPost, "", surface.path, body(oldSecret), hdr)
+			var replay idResponse
+			if st == http.StatusCreated {
+				fcDecode(t, b, &replay)
+			}
+			if st != http.StatusCreated || replay.ID != first.ID {
+				t.Fatalf("retry with the same request = %d %s; want 201 and %s", st, b, first.ID)
+			}
+
+			st, b = fcDo(t, ctx, http.MethodPost, "", surface.path, body(newSecret), hdr)
+			var refusal struct {
+				Error string `json:"error"`
+				Code  string `json:"code"`
+				ID    string `json:"id"`
+			}
+			if st == http.StatusUnprocessableEntity {
+				fcDecode(t, b, &refusal)
+			}
+			if st != http.StatusUnprocessableEntity || refusal.Code != models.ErrorCodeIdempotencyKeyReused || refusal.ID != "" {
+				t.Fatalf("retry with a changed env = %d %s; want 422 %s and no sandbox", st, b, models.ErrorCodeIdempotencyKeyReused)
+			}
+			if !strings.Contains(refusal.Error, key) {
+				t.Fatalf("the refusal does not name the key %q: %q", key, refusal.Error)
+			}
+			harness.AssertNoPlaintext(t, "the refusal", string(b), oldSecret, newSecret)
+
+			// The refusal left the first sandbox as it was.
+			if st, b := fcDo(t, ctx, http.MethodGet, "", "/v1/sandboxes/"+first.ID, nil, nil); st != http.StatusOK {
+				t.Fatalf("the first sandbox after the refusal = %d %s", st, b)
+			}
+		})
+	}
 }
