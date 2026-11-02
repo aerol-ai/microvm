@@ -390,6 +390,7 @@ Some codes you may see:
 | `key_store_unavailable` | `503` | The server could not reach the key store that protects sandbox secrets. | Try again after the wait. |
 | `key_revoked` | `503` | The key that protects sandbox secrets was turned off or deleted in the key store. | Ask the key's owner to restore it. |
 | `network_policy_unenforced` | `501` | This node cannot enforce the network rules you asked for. | Drop the rules, or ask the operator to turn on the host firewall. |
+| `idempotency_key_reused` | `422` | The create's idempotency key was already used with other options. | Send the first options again, or use a new key. See [Retry a create safely](/sandboxes/#retry-a-create-safely). |
 
 In Rust SDK 0.8.0, `Error::Api` holds an `ApiError` instead of the text `"<status>: <message>"`. Errors the SDK finds itself, such as a missing argument, moved to `Error::Client`. Code that read the old text as a `String` no longer compiles, so the compiler shows each place to update.
 

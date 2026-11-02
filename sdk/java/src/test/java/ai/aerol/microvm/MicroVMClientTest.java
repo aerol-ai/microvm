@@ -2818,6 +2818,145 @@ class MicroVMClientTest {
         }
     }
 
+    // A create carries an Idempotency-Key: the caller's, or one the SDK makes
+    // per call and sends unchanged on every automatic retry of that call.
+    @Test
+    void createSendsTheCallersIdempotencyKeyNotInTheBody() throws Exception {
+        List<String> keys = java.util.Collections.synchronizedList(new ArrayList<>());
+        AtomicReference<Map<String, Object>> body = new AtomicReference<>();
+        HttpServer server = startServer(exchange -> {
+            keys.add(exchange.getRequestHeaders().getFirst("Idempotency-Key"));
+            body.set(castMap(JsonSupport.read(exchange.getRequestBody().readAllBytes(), Map.class)));
+            writeJson(exchange, 201, mapOf("id", "sb-keyed", "image", "ubuntu:22.04", "status", "started"));
+        });
+        try {
+            MicroVMClient client = clientFor(serverUrl(server), fastRetry(), HttpClient.newHttpClient());
+            client.create(new CreateOptions().setImage("ubuntu:22.04").setIdempotencyKey(" order-42 "));
+            assertEquals(List.of("order-42"), keys);
+            assertFalse(body.get().containsKey("idempotency_key"));
+            assertFalse(body.get().containsKey("idempotencyKey"));
+            assertEquals("ubuntu:22.04", body.get().get("image"));
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void createKeepsOneIdempotencyKeyAcrossRetries() throws Exception {
+        // Two 503s, then the sandbox.
+        List<String> keys = java.util.Collections.synchronizedList(new ArrayList<>());
+        HttpServer server = startServer(exchange -> {
+            keys.add(exchange.getRequestHeaders().getFirst("Idempotency-Key"));
+            if (keys.size() <= 2) {
+                exchange.getResponseHeaders().set("Retry-After", "0");
+                writeJson(exchange, 503, mapOf("error", "egress deny floor not ready", "code", "egress_floor_not_ready"));
+                return;
+            }
+            writeJson(exchange, 201, mapOf("id", "sb-keyed", "image", "ubuntu:22.04", "status", "started"));
+        });
+        try {
+            MicroVMClient client = clientFor(serverUrl(server), fastRetry(), HttpClient.newHttpClient());
+            Sandbox sandbox = client.create(new CreateOptions().setImage("ubuntu:22.04"));
+            assertEquals("sb-keyed", sandbox.id);
+            assertEquals(3, keys.size());
+            assertTrue(keys.get(0).matches("[0-9a-f]{32}"), keys.get(0));
+            assertEquals(List.of(keys.get(0), keys.get(0), keys.get(0)), keys);
+
+            // Two connection resets after the request may have been sent, then
+            // the sandbox; the caller's key rides every attempt too.
+            for (String callerKey : new String[] {null, "order-42"}) {
+                ScriptedHttpClient http = new ScriptedHttpClient(
+                    new SocketException("Connection reset"),
+                    new SocketException("Connection reset")
+                );
+                MicroVMClient resetClient = clientFor(serverUrl(server), fastRetry(), http);
+                resetClient.create(new CreateOptions().setImage("ubuntu:22.04").setIdempotencyKey(callerKey));
+                assertEquals(3, http.sends.get());
+                String first = http.idempotencyKeys.get(0);
+                if (callerKey == null) {
+                    assertTrue(first.matches("[0-9a-f]{32}"), first);
+                } else {
+                    assertEquals(callerKey, first);
+                }
+                assertEquals(List.of(first, first, first), http.idempotencyKeys);
+            }
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void eachCreateCallGetsANewIdempotencyKey() throws Exception {
+        List<String> keys = java.util.Collections.synchronizedList(new ArrayList<>());
+        HttpServer server = startServer(exchange -> {
+            keys.add(exchange.getRequestHeaders().getFirst("Idempotency-Key"));
+            writeJson(exchange, 201, mapOf("id", "sb-keyed", "image", "ubuntu:22.04", "status", "started"));
+        });
+        try {
+            MicroVMClient client = clientFor(serverUrl(server), fastRetry(), HttpClient.newHttpClient());
+            client.create(new CreateOptions().setImage("ubuntu:22.04"));
+            client.create(new CreateOptions().setImage("ubuntu:22.04"));
+            client.create(new CreateOptions().setImage("ubuntu:22.04").setIdempotencyKey("   "));
+            assertEquals(3, new java.util.HashSet<>(keys).size(), keys.toString());
+            for (String key : keys) {
+                assertTrue(key.matches("[0-9a-f]{32}"), key);
+            }
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void createWithImageKeepsTheCallersIdempotencyKey() throws Exception {
+        Map<String, String> keyByPath = new java.util.concurrent.ConcurrentHashMap<>();
+        HttpServer server = startServer(exchange -> {
+            String path = exchange.getRequestURI().getPath();
+            keyByPath.put(path, String.valueOf(exchange.getRequestHeaders().getFirst("Idempotency-Key")));
+            if ("/v1/images/build".equals(path)) {
+                writeJson(exchange, 200, mapOf("image", "aerolvm-build/abc:latest"));
+                return;
+            }
+            writeJson(exchange, 201, mapOf("id", "sb-keyed", "image", "aerolvm-build/abc:latest", "status", "started"));
+        });
+        try {
+            MicroVMClient client = clientFor(serverUrl(server), fastRetry(), HttpClient.newHttpClient());
+            client.createWithImage(Image.base("alpine"), new CreateOptions().setIdempotencyKey("order-42"));
+            assertEquals("order-42", keyByPath.get("/v1/sandboxes"));
+            assertEquals("null", keyByPath.get("/v1/images/build"), "only the create carries the key");
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void onlySandboxCreateSendsTheIdempotencyKey() throws Exception {
+        List<String> keys = java.util.Collections.synchronizedList(new ArrayList<>());
+        HttpServer server = startServer(exchange -> {
+            keys.add(String.valueOf(exchange.getRequestHeaders().getFirst("Idempotency-Key")));
+            writeJson(exchange, 200, mapOf("id", "sb-keyed", "image", "ubuntu:22.04", "status", "started",
+                "stdout", "", "stderr", "", "exit_code", 0));
+        });
+        try {
+            MicroVMClient client = clientFor(serverUrl(server), fastRetry(), HttpClient.newHttpClient());
+            client.get("sb-keyed");
+            client.exec("sb-keyed", new ExecRequest().setCommand("true"));
+            assertEquals(List.of("null", "null"), keys);
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void newIdempotencyKeysAreHexAndUnique() {
+        java.util.Set<String> keys = new java.util.HashSet<>();
+        for (int i = 0; i < 1000; i++) {
+            String key = MicroVMClient.newIdempotencyKey();
+            assertTrue(key.matches("[0-9a-f]{32}"), key);
+            keys.add(key);
+        }
+        assertEquals(1000, keys.size());
+    }
+
     private static MicroVMClient clientFor(HttpServer server) {
         return new MicroVMClient(
             new MicroVMConfig().setApiUrl(serverUrl(server)).setPatToken("pat-token"),
@@ -2921,6 +3060,8 @@ class MicroVMClientTest {
         private final HttpClient delegate = HttpClient.newHttpClient();
         private final java.util.ArrayDeque<IOException> failures;
         private final AtomicInteger sends = new AtomicInteger();
+        // The Idempotency-Key of every request sent, failed ones included.
+        private final List<String> idempotencyKeys = java.util.Collections.synchronizedList(new ArrayList<>());
 
         private ScriptedHttpClient(IOException... failures) {
             this.failures = new java.util.ArrayDeque<>(List.of(failures));
@@ -2929,6 +3070,7 @@ class MicroVMClientTest {
         @Override
         public <T> HttpResponse<T> send(HttpRequest request, HttpResponse.BodyHandler<T> handler) throws IOException, InterruptedException {
             sends.incrementAndGet();
+            idempotencyKeys.add(request.headers().firstValue(MicroVMClient.IDEMPOTENCY_KEY_HEADER).orElse(null));
             IOException failure = failures.poll();
             if (failure != null) {
                 throw failure;

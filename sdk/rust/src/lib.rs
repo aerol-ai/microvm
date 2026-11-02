@@ -53,6 +53,16 @@ const DEFAULT_API_URL: &str = "http://127.0.0.1:21212";
 /// acts for. Keep in sync with `pkg/api.HeaderTeam` on the server.
 pub const TEAM_HEADER: &str = "X-AerolVM-Team";
 
+/// The header a sandbox create carries so the server can recognise a retry
+/// of it. Keep in sync with `clustercreate.HeaderIdempotencyKey` on the
+/// server.
+pub const IDEMPOTENCY_KEY_HEADER: &str = "Idempotency-Key";
+
+/// A fresh create key: 128 random bits as 32 lowercase hex characters.
+fn new_idempotency_key() -> String {
+    format!("{:032x}", rand::random::<u128>())
+}
+
 const STREAM_PREFIX_STDOUT: u8 = 0x01;
 const STREAM_PREFIX_STDERR: u8 = 0x02;
 
@@ -938,11 +948,25 @@ impl Client {
         self.api_version.path_prefix()
     }
 
+    /// Creates a sandbox. The request carries an `Idempotency-Key`: the
+    /// caller's [`CreateOptions::idempotency_key`], or a random one made for
+    /// this call. Either way it is sent unchanged on each of the call's
+    /// automatic retries, so a create retried after a timeout gets back the
+    /// sandbox the first attempt made instead of making a second one.
     pub fn create(&self, opts: CreateOptions) -> Result<Sandbox, Error> {
-        let raw = self.do_json::<CreateOptions, CreateSandboxResponse>(
+        let key = opts
+            .idempotency_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|key| !key.is_empty())
+            .map(String::from)
+            .unwrap_or_else(new_idempotency_key);
+        let (raw, _) = self.send_json_with_headers::<CreateOptions, CreateSandboxResponse>(
             Method::POST,
             &format!("{}/sandboxes", self.version_prefix()),
             Some(&opts),
+            RetryPolicy::Idempotent,
+            &[(IDEMPOTENCY_KEY_HEADER, key.as_str())],
         )?;
         Ok(Sandbox::new_with_ssh_private_key(
             self.clone(),
@@ -2111,6 +2135,19 @@ impl Client {
         payload: Option<&T>,
         policy: RetryPolicy,
     ) -> Result<(U, reqwest::header::HeaderMap), Error> {
+        self.send_json_with_headers(method, path, payload, policy, &[])
+    }
+
+    /// [`Client::send_json`] with extra request headers, set on every
+    /// attempt so a retry carries them unchanged.
+    fn send_json_with_headers<T: Serialize, U: DeserializeOwned>(
+        &self,
+        method: Method,
+        path: &str,
+        payload: Option<&T>,
+        policy: RetryPolicy,
+        headers: &[(&str, &str)],
+    ) -> Result<(U, reqwest::header::HeaderMap), Error> {
         let max_retries = self.retry_config.max_retries.unwrap_or(3);
 
         let mut attempt = 0;
@@ -2123,6 +2160,9 @@ impl Client {
                 .authorize(self);
             if let Some(body) = payload {
                 builder = builder.json(body);
+            }
+            for (name, value) in headers {
+                builder = builder.header(*name, *value);
             }
 
             match builder.send() {
@@ -2566,14 +2606,25 @@ mod tests {
     /// read. The last reply repeats for every further connection, so a client
     /// that re-sends more than expected is counted rather than refused.
     fn spawn_scripted_server(script: Vec<Reply>) -> (String, Arc<AtomicUsize>) {
+        let (url, hits, _) = spawn_recording_scripted_server(script);
+        (url, hits)
+    }
+
+    /// [`spawn_scripted_server`] that also keeps every raw request it read.
+    fn spawn_recording_scripted_server(
+        script: Vec<Reply>,
+    ) -> (String, Arc<AtomicUsize>, Arc<Mutex<Vec<String>>>) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("listener should bind");
         let addr = listener.local_addr().expect("listener address");
         let hits = Arc::new(AtomicUsize::new(0));
         let server_hits = hits.clone();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let server_requests = requests.clone();
         thread::spawn(move || {
             for (i, stream) in listener.incoming().enumerate() {
                 let Ok(mut stream) = stream else { continue };
-                let _ = read_http_request(&mut stream);
+                let request = read_http_request(&mut stream);
+                server_requests.lock().expect("requests lock").push(request);
                 server_hits.fetch_add(1, Ordering::SeqCst);
                 let paced_body = r#"{"error":"busy","code":"overloaded"}"#.to_string();
                 let (status, body, delay, extra) = match &script[i.min(script.len() - 1)] {
@@ -2602,7 +2653,7 @@ mod tests {
                 let _ = stream.write_all(body.as_bytes());
             }
         });
-        (format!("http://{}", addr), hits)
+        (format!("http://{}", addr), hits, requests)
     }
 
     /// Retries in milliseconds, so a test that counts re-sends stays fast.
@@ -2821,6 +2872,7 @@ mod tests {
             tenant_id: None,
             name: None,
             tags: None,
+            idempotency_key: None,
         }
     }
 
@@ -5994,5 +6046,139 @@ mod tests {
         assert_eq!(malformed.retry_after(), None);
         assert_eq!(malformed.code(), None, "JSON without an error field has no code");
         assert_eq!(malformed.message(), "{}");
+    }
+
+    /// The `Idempotency-Key` header of a raw request, if it has one.
+    fn idempotency_key_of(request: &str) -> Option<String> {
+        request
+            .split("\r\n\r\n")
+            .next()
+            .unwrap_or("")
+            .lines()
+            .filter_map(|line| line.split_once(':'))
+            .find(|(name, _)| name.eq_ignore_ascii_case(IDEMPOTENCY_KEY_HEADER))
+            .map(|(_, value)| value.trim().to_string())
+    }
+
+    fn is_generated_key(key: &str) -> bool {
+        key.len() == 32 && key.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    }
+
+    fn create_ok_json() -> String {
+        serde_json::json!({
+            "id": "sb-keyed",
+            "image": "ubuntu:22.04",
+            "status": "started",
+            "public_url": "https://sb-keyed.example.com",
+            "cpu": 2,
+            "memory_mb": 2048,
+            "disk_gb": 20,
+            "os_user": "root",
+            "network_block_all": false,
+            "toolbox_enabled": true,
+            "exposed_ports": [],
+            "created_at": "2026-05-07T10:00:00Z",
+            "updated_at": "2026-05-07T10:00:00Z",
+            "last_active_at": "2026-05-07T10:00:00Z"
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn create_sends_the_callers_idempotency_key_not_in_the_body() {
+        let (url, _hits, requests) = spawn_recording_scripted_server(vec![Reply::ok(create_ok_json())]);
+        fast_retry_client(&url)
+            .create(CreateOptions {
+                image: "ubuntu:22.04".to_string(),
+                idempotency_key: Some(" order-42 ".to_string()),
+                ..Default::default()
+            })
+            .expect("create should succeed");
+        let requests = requests.lock().expect("requests lock");
+        assert_eq!(idempotency_key_of(&requests[0]).as_deref(), Some("order-42"));
+        let body = request_json_body(&requests[0]);
+        assert!(body.get("idempotency_key").is_none(), "key leaked into the body: {}", body);
+        assert_eq!(body["image"], "ubuntu:22.04");
+    }
+
+    #[test]
+    fn create_keeps_one_idempotency_key_across_retries() {
+        let cases: Vec<(&str, Vec<Reply>, Option<&str>)> = vec![
+            (
+                "generated key across 503s",
+                vec![paced("503 Service Unavailable", Some("0")), paced("503 Service Unavailable", Some("0")), Reply::ok(create_ok_json())],
+                None,
+            ),
+            ("generated key across dropped connections", vec![Reply::Hangup, Reply::Hangup, Reply::ok(create_ok_json())], None),
+            ("caller's key across a 503", vec![paced("503 Service Unavailable", Some("0")), Reply::ok(create_ok_json())], Some("order-42")),
+        ];
+        for (name, script, key) in cases {
+            let attempts = script.len();
+            let (url, hits, requests) = spawn_recording_scripted_server(script);
+            let sandbox = fast_retry_client(&url)
+                .create(CreateOptions {
+                    image: "ubuntu:22.04".to_string(),
+                    idempotency_key: key.map(String::from),
+                    ..Default::default()
+                })
+                .unwrap_or_else(|err| panic!("{}: {}", name, err));
+            assert_eq!(sandbox.data.id, "sb-keyed", "{}", name);
+            assert_eq!(hits.load(Ordering::SeqCst), attempts, "{}", name);
+            let keys: Vec<String> = requests
+                .lock()
+                .expect("requests lock")
+                .iter()
+                .map(|request| idempotency_key_of(request).expect("every attempt sends a key"))
+                .collect();
+            match key {
+                Some(key) => assert_eq!(keys[0], key, "{}", name),
+                None => assert!(is_generated_key(&keys[0]), "{}: {:?}", name, keys),
+            }
+            assert!(keys.iter().all(|k| *k == keys[0]), "{}: {:?}", name, keys);
+        }
+    }
+
+    #[test]
+    fn each_create_call_gets_a_new_idempotency_key() {
+        let (url, _hits, requests) = spawn_recording_scripted_server(vec![Reply::ok(create_ok_json())]);
+        let client = fast_retry_client(&url);
+        for key in [None, None, Some("   ")] {
+            client
+                .create(CreateOptions {
+                    image: "ubuntu:22.04".to_string(),
+                    idempotency_key: key.map(String::from),
+                    ..Default::default()
+                })
+                .expect("create should succeed");
+        }
+        let keys: Vec<String> = requests
+            .lock()
+            .expect("requests lock")
+            .iter()
+            .map(|request| idempotency_key_of(request).expect("a key"))
+            .collect();
+        assert_eq!(keys.len(), 3);
+        assert!(keys.iter().all(|k| is_generated_key(k)), "{:?}", keys);
+        assert!(keys[0] != keys[1] && keys[1] != keys[2] && keys[0] != keys[2], "{:?}", keys);
+    }
+
+    #[test]
+    fn only_sandbox_create_sends_the_idempotency_key() {
+        let (url, _hits, requests) = spawn_recording_scripted_server(vec![Reply::ok(create_ok_json())]);
+        let client = fast_retry_client(&url);
+        let _ = client.get("sb-keyed");
+        let _ = client.exec("sb-keyed", ExecRequest::from("true"));
+        let requests = requests.lock().expect("requests lock");
+        assert_eq!(requests.len(), 2);
+        for request in requests.iter() {
+            assert_eq!(idempotency_key_of(request), None, "{}", request.lines().next().unwrap_or(""));
+        }
+    }
+
+    #[test]
+    fn new_idempotency_keys_are_hex_and_unique() {
+        let keys: std::collections::HashSet<String> = (0..1000).map(|_| new_idempotency_key()).collect();
+        assert_eq!(keys.len(), 1000);
+        assert!(keys.iter().all(|k| is_generated_key(k)));
     }
 }

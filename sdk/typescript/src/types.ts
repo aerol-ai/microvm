@@ -161,6 +161,19 @@ import type { Image } from "./Image.js";
 
 export interface CreateOptions {
   /**
+   * Sent as the create's `Idempotency-Key` header, never in the body. A create
+   * sent again with the same key and the same options returns the sandbox the
+   * first one made instead of making a second; the same key with different
+   * options fails with a 422 `MicroVMApiError` whose `code` is
+   * `"idempotency_key_reused"`. Keys are scoped to the caller's account.
+   *
+   * Leave it unset and the SDK makes a random key for each `create` call and
+   * reuses it on that call's automatic retries, so a retry after a timeout
+   * cannot make a second sandbox. Set your own to make your own retries of
+   * the whole call safe too, such as after your process restarts.
+   */
+  idempotencyKey?: string;
+  /**
    * Optional name, unique among the caller's sandboxes (another account may
    * use the same name). A repeat create with a name the caller already holds
    * returns HTTP 409. Names starting with `owner:` or shaped like a sandbox

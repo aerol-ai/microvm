@@ -6,6 +6,7 @@ import importlib
 import json
 import os
 import random
+import secrets
 import socket
 import threading
 import time
@@ -142,6 +143,15 @@ def _read_env(name: str) -> Optional[str]:
 # The request header that selects which of a credential's teams a request
 # acts for. Keep in sync with pkg/api.HeaderTeam on the server.
 TEAM_HEADER = "X-AerolVM-Team"
+
+# The header a sandbox create carries so the server can recognise a retry of
+# it. Keep in sync with clustercreate.HeaderIdempotencyKey on the server.
+IDEMPOTENCY_KEY_HEADER = "Idempotency-Key"
+
+
+def _new_idempotency_key() -> str:
+    """A fresh create key: 128 random bits as 32 lowercase hex characters."""
+    return secrets.token_hex(16)
 
 
 class MicroVMError(Exception):
@@ -637,7 +647,16 @@ class MicroVM:
         # keyword replaces the same key in the dict.
         resolved_options: Dict[str, Any] = {**(options or {}), **fields}
         resolved_options["image"] = self._resolve_image(_first_of(resolved_options, "image"))
-        sandbox = self._do_json("POST", self._versioned("/sandboxes"), _to_api_create_options(resolved_options))
+        # One key per call, sent unchanged on each of its automatic retries: a
+        # create retried after a timeout gets back the sandbox the first
+        # attempt made instead of making a second one.
+        key = str(_first_of(resolved_options, "idempotency_key", "idempotencyKey") or "").strip() or _new_idempotency_key()
+        sandbox = self._do_json(
+            "POST",
+            self._versioned("/sandboxes"),
+            _to_api_create_options(resolved_options),
+            headers={IDEMPOTENCY_KEY_HEADER: key},
+        )
         return self._wrap_sandbox(sandbox)
 
     def build_image(self, image: Image) -> str:
@@ -1461,8 +1480,17 @@ class MicroVM:
         upper = min(target * 1.2, limit)
         return target + (upper - target) * rand
 
-    def _do_json(self, method: str, path: str, payload: Optional[Dict[str, Any]], *, idempotent: bool = True) -> Any:
-        data, _ = self._do_json_headers(method, path, payload, idempotent=idempotent)
+    def _do_json(
+        self,
+        method: str,
+        path: str,
+        payload: Optional[Dict[str, Any]],
+        *,
+        idempotent: bool = True,
+        headers: Optional[Dict[str, str]] = None,
+    ) -> Any:
+        """``headers`` are extra request headers, sent unchanged on every retry."""
+        data, _ = self._do_json_headers(method, path, payload, idempotent=idempotent, headers=headers)
         return data
 
     def _do_json_headers(
@@ -1472,16 +1500,19 @@ class MicroVM:
         payload: Optional[Dict[str, Any]],
         *,
         idempotent: bool = True,
+        headers: Optional[Dict[str, str]] = None,
     ) -> tuple[Any, Dict[str, str]]:
         body = None
         content_type = None
         if payload is not None:
             body = json.dumps(payload).encode("utf-8")
             content_type = "application/json"
-        raw, headers = self._request_headers(method, self._url(path), body, content_type, idempotent=idempotent)
+        raw, response_headers = self._request_headers(
+            method, self._url(path), body, content_type, headers, idempotent=idempotent
+        )
         if raw == b"":
-            return {}, headers
-        return json.loads(raw.decode("utf-8")), headers
+            return {}, response_headers
+        return json.loads(raw.decode("utf-8")), response_headers
 
     def _do_multipart(
         self,
