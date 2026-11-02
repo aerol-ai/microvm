@@ -111,6 +111,17 @@ func OverlapCreateAndPromote(
 		return svc.CreateSandboxWithID(ctx, req, reservationID)
 	}
 
+	// A keyed create (Idempotency-Key) replays only the request it was made
+	// with. A different request under the key is refused here, before the
+	// replay below and before either leg: its create leg must never run,
+	// because a failed leg retracts the reservation and destroys the sandbox
+	// it shares an id with, which is the first request's.
+	ctx, release, err := svc.BeginKeyedCreate(ctx, reservationID, req.CreateRequestDigests)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+
 	// Idempotent replay: if a sandbox already exists locally under this id, the
 	// create + promote already happened. This path is reached when an
 	// Idempotency-Key retry (or a lost-ack retry) hits the reservation-conflict

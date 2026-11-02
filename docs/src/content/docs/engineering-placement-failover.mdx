@@ -239,18 +239,22 @@ CPU, memory and disk are not the only limits on a node. Each sandbox also holds 
 | Pool | Runtimes that use it | Size setting | Default |
 |---|---|---|---|
 | containerd netns pool | runc (`docker`) and gVisor on the containerd engine, shared | `SB_CONTAINERD_NETNS_POOL_SIZE` | 256 |
+| docker bridge pool | runc (`docker`) and gVisor on the docker engine, shared | `SB_DOCKER_BRIDGE_SLOTS` | 1,000 on a stock `docker0` (worked out at boot) |
 | Firecracker TAP pool | Firecracker | `SB_FIRECRACKER_TAP_POOL_SIZE` | 256 |
 | WASM instances | WASM, only when capped | `SB_WASM_MAX_INSTANCES` | no cap |
 
 A stopped sandbox keeps its slot, so its address survives a restart. Warm-pool containers and warm VMMs hold slots too.
 
-A node with CPU and memory to spare can still be full for a runtime. In a bank density test, two 48-core metal workers stopped at 256 containers and 256 Firecracker VMs each. Admission still had room, so placement kept choosing them, and every create past that failed with a 400 that looked like a bug.
+The docker bridge pool works differently. Docker gives each running container one port on its bridge, and a Linux bridge has 1,023 ports. Docker frees the port when the container stops. So a stopped sandbox holds no slot, and starting it again needs a free one. Nothing is seeded: the node counts its own running sandboxes and warm containers, and recounts them from its database after a restart. At boot it sets the size to the smaller of 1,023 and the number of addresses in the network's subnet, then keeps 23 ports back for image builds and other containers. A stock `docker0` gets 1,000.
+
+A node with CPU and memory to spare can still be full for a runtime. In a bank density test, two 48-core metal workers stopped at 256 containers and 256 Firecracker VMs each. Admission still had room, so placement kept choosing them, and every create past that failed with a 400 that looked like a bug. A docker-engine metal host stopped the same way at 1,023 containers, the size of its bridge.
 
 Now each worker reports its pools and their free slots in its capacity report (`slot_pools` on `/v1/capacity`). Placement treats a full pool like a full budget:
 
 - A node is skipped for a runtime when its pool has no free slot. Reservations still in flight to that node are subtracted first, counted for every runtime the pool serves. A pending gVisor create uses up a slot a runc create could have had.
 - When every node that could run the request is full, the answer is a 503 with `Retry-After` and a message that says "at capacity" (`ErrClusterAtCapacity`). When no node can run the request at all, the message does not say capacity, because waiting will not help.
 - The pool itself refuses with a capacity error when it runs dry. The API answers it like any other capacity refusal: 503 with `Retry-After`. The SDKs retry that, and the retry is placed again.
+- If something takes the last bridge port or address without going through the pool, the kernel or Docker refuses the start. That refusal ("exchange full", or no free address) is also answered as the 503 capacity error, and the half-made container is removed.
 - An isolate's egress slots (`SB_ISOLATE_EGRESS_POOL_SIZE`, default 64) belong to one tenant group on one node, not to the node, so they are not in the report. A create that asks for egress in a full group is refused with the same capacity error, instead of starting with its egress silently blocked.
 
 A node that does not report pools (an older build during a rolling upgrade) is not gated. This is the same "unknown-allow" rule as for runtimes.

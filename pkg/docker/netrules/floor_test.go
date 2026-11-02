@@ -90,6 +90,95 @@ func TestSetFloor(t *testing.T) {
 	}
 }
 
+// existsErrBackend fails rule checks, as a lost netlink socket would.
+type existsErrBackend struct {
+	*floorMemBackend
+	err error
+}
+
+func (e *existsErrBackend) Exists(table, chain string, spec ...string) (bool, error) {
+	if e.err != nil {
+		return false, e.err
+	}
+	return e.floorMemBackend.Exists(table, chain, spec...)
+}
+
+// TestReassertFloor: the re-assert only checks a floor in place (no flush,
+// no empty moment), rewrites it when a rule or the whole chain is gone, and
+// reports errors rather than a floor it could not check.
+func TestReassertFloor(t *testing.T) {
+	subnet := netip.MustParsePrefix("172.17.0.0/16")
+	imds := []netip.Prefix{netip.MustParsePrefix("169.254.169.254/32"), netip.MustParsePrefix("10.20.0.0/16")}
+	chain := FloorChainFor(subnet)
+	imdsDrop := memKey("filter", chain, floorDropSpec(subnet.String(), "169.254.169.254/32")...)
+	cases := []struct {
+		name         string
+		damage       func(be *existsErrBackend)
+		wantRepaired bool
+		wantErr      bool
+		wantFlushes  int // flushes the re-assert itself did
+	}{
+		{name: "whole: checked, not rewritten"},
+		{name: "a DROP removed", damage: func(be *existsErrBackend) {
+			be.mu.Lock()
+			defer be.mu.Unlock()
+			be.rules = slices.DeleteFunc(be.rules, func(r string) bool { return r == imdsDrop })
+		}, wantRepaired: true, wantFlushes: 1},
+		{name: "chain flushed", damage: func(be *existsErrBackend) { _ = be.FlushChain(chain) }, wantRepaired: true, wantFlushes: 1},
+		{name: "jump cannot be put back", damage: func(be *existsErrBackend) { be.jumpErr = errors.New("chain gone") }, wantErr: true},
+		{name: "rules cannot be checked", damage: func(be *existsErrBackend) { be.err = errors.New("netlink: socket closed") }, wantErr: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ResetFloorsForTest()
+			t.Cleanup(ResetFloorsForTest)
+			be := &existsErrBackend{floorMemBackend: &floorMemBackend{}}
+			m := NewWithBackend(be)
+			if err := m.SetFloor(subnet, imds); err != nil {
+				t.Fatal(err)
+			}
+			if tc.damage != nil {
+				tc.damage(be)
+			}
+			flushes := be.flushes
+			repaired, err := m.ReassertFloor()
+			if repaired != tc.wantRepaired || (err != nil) != tc.wantErr {
+				t.Fatalf("repaired=%v err=%v", repaired, err)
+			}
+			if got := be.flushes - flushes; got != tc.wantFlushes {
+				t.Fatalf("the re-assert flushed %d times, want %d", got, tc.wantFlushes)
+			}
+			if !tc.wantErr && be.countMatching(chain) != 3 {
+				t.Fatalf("floor after the re-assert: %v", be.rules)
+			}
+		})
+	}
+
+	// Nothing to re-assert: no manager, network rules off, or no floor set.
+	ResetFloorsForTest()
+	t.Cleanup(ResetFloorsForTest)
+	var none *Manager
+	disabled, err := New(false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	be := &floorMemBackend{}
+	for name, m := range map[string]*Manager{"nil": none, "disabled": disabled, "no floor yet": NewWithBackend(be)} {
+		if repaired, err := m.ReassertFloor(); repaired || err != nil || len(be.jumps) != 0 {
+			t.Fatalf("%s: repaired=%v err=%v jumps=%v", name, repaired, err, be.jumps)
+		}
+	}
+	// A registry reset under a manager that had a floor: nothing to check.
+	m := NewWithBackend(be)
+	if err := m.SetFloor(subnet, imds); err != nil {
+		t.Fatal(err)
+	}
+	ResetFloorsForTest()
+	if repaired, err := m.ReassertFloor(); repaired || err != nil {
+		t.Fatalf("forgotten floor: %v %v", repaired, err)
+	}
+}
+
 // orderedBackend keeps each chain's rules in order and honours insert
 // positions, so a test can see what a packet meets first.
 type orderedBackend struct {

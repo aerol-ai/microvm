@@ -7,6 +7,7 @@ import (
 
 	"github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/models"
+	"github.com/aerol-ai/microvm/pkg/secrets"
 )
 
 // Facade-state helpers. These thin wrappers around the generic store API
@@ -167,6 +168,19 @@ func (s *Service) requireVisibleSnapshot(ctx context.Context, name string) error
 		return store.ErrNotFound
 	}
 	return nil
+}
+
+// RequestDigests returns keyed digests of a request under the server key
+// ring, the current key's first (secrets.Cipher.Digests). A facade that
+// stores or logs a value derived from a request that carries secrets, such
+// as an idempotency fingerprint over a create's env, uses these instead of a
+// plain hash, which anyone holding the value could test guesses against.
+// Every node that shares the server key derives the same digest.
+func (s *Service) RequestDigests(purpose string, data []byte) ([]secrets.KeyedDigest, error) {
+	if s == nil || s.cipher == nil {
+		return nil, errors.New("request digests need the server key, and none is configured")
+	}
+	return s.cipher.Digests(purpose, data)
 }
 
 func (s *Service) ClaimIdempotentRequest(ctx context.Context, scope, fingerprint string, now time.Time, pendingTTL time.Duration) (*models.IdempotentRequestRecord, bool, error) {

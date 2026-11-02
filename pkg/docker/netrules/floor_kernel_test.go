@@ -100,6 +100,29 @@ func TestKernelFloor(t *testing.T) {
 			if canReach() {
 				t.Fatal("the floor must drop forwarded traffic from the sandbox subnet")
 			}
+			// Something takes the floor away (a host firewall reload): the
+			// re-assert puts it back, and a floor in place is left alone.
+			for _, damage := range []struct {
+				name string
+				do   func()
+			}{
+				{"chain and jump deleted", func() { deleteFloorChain(t, ChainAerolvmUser, FloorChainFor(subnet)) }},
+				{"chain flushed", func() { run(t, "iptables", "-F", FloorChainFor(subnet)) }},
+			} {
+				damage.do()
+				if !waitReach() {
+					t.Fatalf("%s: the damage did not open the path, so the re-assert proves nothing", damage.name)
+				}
+				if repaired, err := mgr.ReassertFloor(); !repaired || err != nil {
+					t.Fatalf("%s: re-assert repaired=%v err=%v", damage.name, repaired, err)
+				}
+				if canReach() {
+					t.Fatalf("%s: the re-assert must drop the path again", damage.name)
+				}
+				if repaired, err := mgr.ReassertFloor(); repaired || err != nil {
+					t.Fatalf("%s: a whole floor must not be rewritten: repaired=%v err=%v", damage.name, repaired, err)
+				}
+			}
 			// Replacing is whole-chain: a second set with the same entry
 			// leaves the same two rules (the entry, and the subnet to itself
 			// while sandboxes are isolated from each other), not four.
@@ -118,6 +141,25 @@ func TestKernelFloor(t *testing.T) {
 			}
 		})
 	}
+}
+
+// deleteFloorChain removes a floor the way a host firewall reload would:
+// every jump to it from parent, then the chain itself (nft, so it works on
+// rules either backend wrote).
+func deleteFloorChain(t *testing.T, parent, chain string) {
+	t.Helper()
+	out, err := exec.Command("nft", "-a", "list", "chain", "ip", "filter", parent).CombinedOutput()
+	if err != nil {
+		t.Fatalf("nft list %s: %v\n%s", parent, err, out)
+	}
+	for _, line := range strings.Split(string(out), "\n") {
+		_, handle, ok := strings.Cut(line, "# handle ")
+		if ok && strings.Contains(line, "jump "+chain) {
+			run(t, "nft", "delete", "rule", "ip", "filter", parent, "handle", strings.TrimSpace(handle))
+		}
+	}
+	run(t, "nft", "flush", "chain", "ip", "filter", chain)
+	run(t, "nft", "delete", "chain", "ip", "filter", chain)
 }
 
 // TestKernelFloorHelper is re-executed inside the remote netns as a tiny

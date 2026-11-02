@@ -31,6 +31,7 @@ feature is still mid-rollout.
 | `SB_LIVENESS_SOCKET` | `/run/sandboxd/live.sock` — the Unix socket (root `0600`) the install.sh watchdog (`sandboxd-healthcheck`) probes: `GET /livez` answers `200` with the phase (`booting`, `serving`, `stopping`) from its own listener, with no I/O and no lock, from the first moment of the boot. It is liveness only; `/health` stays the readiness check (store, engines, Caddy). The watchdog restarts sandboxd only after 3 failed liveness probes in a row of one daemon run over at least 90 s, never in the daemon's first 120 s and never while a start, stop or restart is under way. `off` closes the socket, and the watchdog then probes `/health` with the same rule. Must be absolute. |
 | `SB_ENABLE_SERVERLESS` | true — wake path on out of the box |
 | `SB_DOCKER_READY_SOCKET_ENABLED` | true |
+| `SB_DOCKER_BRIDGE_SLOTS` | `0`: the docker engine's bridge slot pool is sized at boot from the sandbox network (min(1,023 bridge ports, usable addresses) − 23 headroom − the pause-netns pool depth; 1,000 on a stock `docker0`), so a full bridge is a 503 capacity refusal and placement skips the node instead of dockerd failing the start. A set value replaces the derivation and is clamped to what the network holds. See "Per-node slot limits" below. |
 | `SB_IMAGE_BUILD_GC_ENABLED` | true — both image janitors |
 | `SB_WASM_MODULE_GC_ENABLED` | true |
 | `SB_WASM_POOL_ENABLED` | true — warm-worker pool |
@@ -135,13 +136,35 @@ a 37 s p99 and 5,081 `502`s from a node the watchdog restarted). A single node
 identical placement-page reads on a node share one control-plane request, and
 each still comes from a read that began after its caller asked.
 
+The slots are shared fairly between tenants. A tenant is the owner a
+credential acts for (a team for `avm_` team tokens and OIDC identities, the
+account for a managed identity), never the token, so minting more tokens buys
+no more share; every unscoped caller (the PAT, fleet-wide tokens) is the one
+`operator` tenant. A tenant may hold at most its share of a node's slots.
+When lists must wait, freed slots go to waiting tenants in turn (round-robin),
+not first come first served, so a quiet tenant waits at most one turn of each
+other waiting tenant, not behind a noisy tenant's hundreds of lists. A list refused
+because its own tenant holds its share gets `429` + `Retry-After: 1` with
+code `rate_limited`; a list refused because the node is full while its tenant
+is within its share keeps `503` `overloaded`. Either refusal comes only after
+the queue wait, so a client that ignores `Retry-After` still makes at most two
+requests a second per connection.
+
 | Env var | Default | Notes |
 |---|---|---|
 | `SB_API_LIST_MAX_INFLIGHT` | `16` | Cluster-wide lists this node runs at once. Matches the cluster transport's 16 pooled connections per peer, so list fan-out reuses mTLS connections rather than opening new ones. A healthy list holds its slot for milliseconds, so 16 slots serve thousands of lists a second and fill only when owners or the control plane slow down. Raise it on nodes with more CPU. `0` = no limit (the behaviour before this setting). Anything but a whole number refuses the boot. |
-| `SB_API_LIST_QUEUE_WAIT` | `500ms` | How long a list waits for a free slot before it is shed. Short on purpose: inside every SDK's own retry backoff (they retry `503` up to 3 times, about 1-1.75 s in all). `0` = refuse at once. |
+| `SB_API_LIST_MAX_INFLIGHT_PER_TENANT` | a quarter of `SB_API_LIST_MAX_INFLIGHT`, at least 1 (`4` by default) | How many of a node's list slots one tenant may hold. With the default, one tenant's burst runs 4 lists at once and three quarters of the node stay free for everyone else. Raise it for few tenants with bursty but legitimate list traffic; the node limit still applies. `0` = no per-tenant share (one tenant may take every slot; turns stay round-robin). More than `SB_API_LIST_MAX_INFLIGHT`, or anything but a whole number, refuses the boot; ignored when `SB_API_LIST_MAX_INFLIGHT=0`. |
+| `SB_API_LIST_QUEUE_WAIT` | `500ms` | How long a list waits for a free slot before it is refused (`503`, or `429` when its tenant holds its share). Short on purpose: inside every SDK's own retry backoff (they retry `503` up to 3 times, about 1-1.75 s in all). `0` = refuse at once. |
 
-Metrics: `aerolvm_api_list_inflight`, `aerolvm_api_list_admitted_total`,
-`aerolvm_api_list_shed_total` (alert `SandboxdAPIListShedding`).
+Metrics (none labelled by tenant): `aerolvm_api_list_inflight`,
+`aerolvm_api_list_queued`, `aerolvm_api_list_tenants` (tenants with a list in
+flight or queued), `aerolvm_api_list_admitted_total`,
+`aerolvm_api_list_shed_total` (`503`, alert `SandboxdAPIListShedding`),
+`aerolvm_api_list_rate_limited_total` (`429`, alert
+`SandboxdAPIListTenantRateLimited`), and the configured
+`aerolvm_api_list_max_inflight` and `aerolvm_api_list_max_inflight_per_tenant`.
+Which tenants: `GET /debug/vars` (fleet admin only) has `api_list_gate`, the
+gate's totals and its 10 busiest tenants by name, most refused first.
 
 ## Audit export connectors (SB_AUDIT_EXPORT_BACKEND)
 
@@ -311,12 +334,16 @@ via Terraform/Ansible — do not flip the code default on.
 
 Besides CPU, memory and disk, every sandbox holds one network slot on its node
 until it is destroyed (stopped sandboxes keep theirs, so their address
-survives a restart). The pools are fixed at boot, so on a big host a pool, not
+survives a restart; the docker engine's bridge is the exception, below). The
+pools are fixed at boot, so on a big host a pool, not
 the CPU or memory budget, is often what fills first. The 2026-11-01 bank
 flagship density ramp stopped every m5zn.metal worker (48 vCPU, 192 GiB) at
 256 containerd + gVisor sandboxes and 256 Firecracker VMs, while the CPU
 budget at the default ratios (48 × 0.9 × 10 = 432 vCPU) still had room for
-1,728 sandboxes of 0.25 vCPU.
+1,728 sandboxes of 0.25 vCPU. The 2026-11-02 single-node-fc run (one
+m5zn.metal, docker engine) started exactly 1,023 docker sandboxes, then
+dockerd failed every start with "failed to set up container networking": the
+`docker0` bridge was full, and nothing counted it.
 
 A full pool is a capacity refusal: the create answers 503 with `Retry-After`
 (the pool's error wraps `capacity.ErrCapacityExceeded`), each worker reports
@@ -332,7 +359,7 @@ capacity" (`docs/src/content/docs/engineering-placement-failover.mdx`, section
 | Firecracker TAP | `SB_FIRECRACKER_TAP_POOL_SIZE` (with `SB_FIRECRACKER_TAP_BASE_CIDR`) | `256` (in `172.16.0.0/20`) | Firecracker creates; warm VMMs (`SB_FIRECRACKER_VMM_POOL_*`) hold theirs | the base CIDR: one `/30` per slot, so the default `/20` holds **1,024**; boot refuses a size the CIDR cannot hold. TAPs are routed, not bridged, so there is no bridge-port wall. Each slot also takes a vsock CID and a `fctapN` name; the seed refuses more than 10,000. | a TAP device and a `/30` route; the isolation rules are per subnet, not per TAP. The VM's guest memory is the real cost, and the memory budget, live-memory floor and `SB_FIRECRACKER_RSS_WATERMARK_RATIO` already bound it. | Keep `256` as the code default. On a metal Firecracker host set it to what the memory budget admits for your smallest VM, up to `1024` within the default `/20`; beyond that widen `SB_FIRECRACKER_TAP_BASE_CIDR` (a `/19` holds 2,048) **before** the first boot, because a re-seed keeps the old layout. For the m5zn.metal flagship workers: `1024`. |
 | isolate egress | `SB_ISOLATE_EGRESS_POOL_SIZE` | `64` | isolate sandboxes that may reach the network (block-all ones take no slot), **per tenant group per node**, not per node | none in practice: a slot is a Unix socket path, bound only while a sandbox holds it, and one declared service in that group's workerd config | one listener goroutine while held; the generated group config grows by one service per slot | Raise it when one tenant runs more than 64 egress-using isolates on one node. Because the pool is per group, it is not in `slot_pools`: a create that needs a slot in a full group is refused with the 503 capacity error (before, it started with egress silently denied), and the retry may land on another node. |
 | WASM instances | `SB_WASM_MAX_INSTANCES` | `0` (no cap) | WASM creates | only what the operator sets; WASM networking is host-mediated, so there is no per-sandbox address | the module instance itself | Leave uncapped unless you need a hard per-host count; when set, it is advertised in `slot_pools` and placement honours it. |
-| Docker engine | none (dockerd's own bridge) | — | runc and gVisor creates on the docker engine | **1,023** containers per bridge (the same `docker0` port limit), then dockerd fails the container start. Not a pool sandboxd counts, so it is not in `slot_pools`; the pause-netns pool (`SB_DOCKER_NETNS_POOL_*`) is a warm pool whose miss falls back, never a ceiling. | a veth on `docker0` | Keep a docker-engine host's CPU budget below ~1,000 of its smallest sandbox, or move dense hosts to containerd. |
+| docker bridge (`docker_bridge`) | `SB_DOCKER_BRIDGE_SLOTS` | `0` = derived at boot: **1,000** on a stock `docker0` | runc (`docker`) and gVisor creates on the docker engine, one shared pool; also parked warm containers (`SB_DOCKER_POOL_*`). Unlike the pools above, a **stopped** sandbox holds no slot: dockerd removes its veth on stop, and a start takes one again through admission. | **1,023**: the sandbox network (`SB_DOCKER_NETWORK`, default `bridge` → `docker0`) is one Linux bridge, and the 1,024th veth fails the container start with "exchange full". The subnet is the smaller limit only when it is small: `docker0`'s `/16` has 65,533 usable addresses, a `/24` has 253, and dockerd's `fixed-cidr` (the network's IP range) narrows it further. Derived as min(1,023 if bridged, usable addresses) − 23 headroom − `SB_DOCKER_NETNS_POOL_DEPTH` when the pause-netns pool is on. | a veth on the bridge and an address; nothing to seed, the admitter counts its own reservations, so a restart recounts from the store. | Keep the derived default. The 23 ports of headroom are for what attaches without a reservation: the `RUN` steps of image builds (dockerd's builder joins them to the default bridge), a container started by hand, a teardown in flight. Set `SB_DOCKER_BRIDGE_SLOTS` lower to hold a host under its CPU budget, or up to the limit (it is clamped there) on a host that never builds images. Past ~1,000 sandboxes on one host, use the containerd engine with Firecracker or more hosts; sharding the docker engine across bridges is not built. |
 
 ## Client settings (the five SDKs and the aerolvm CLI)
 

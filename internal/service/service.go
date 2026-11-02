@@ -442,6 +442,9 @@ type Service struct {
 	// createsInFlight is the sandbox IDs whose create is running, which the
 	// reconcile orphan sweep skips (create_inflight.go).
 	createsInFlight createsInFlight
+	// keyedCreates is the Idempotency-Key creates running here, with the
+	// request digest each was made with (keyed_create.go).
+	keyedCreates keyedCreateClaims
 	// reconcileUnknown tracks sandboxes whose runtime could not say whether
 	// they exist, pass after pass (reconcile_unknown.go).
 	reconcileUnknown reconcileUnknownTracker
@@ -485,6 +488,10 @@ type Service struct {
 	// nodeGuard is the node guard's state: what each runtime got, and the
 	// per-runtime result the create gate reads (node_guard.go).
 	nodeGuard nodeGuardState
+	// egressFloor is the host-firewall deny floor's state: the floor each
+	// runtime got, and the per-runtime result the create gate reads
+	// (egress_floor.go).
+	egressFloor egressFloorState
 	// egressPolicyLocks serializes live policy updates per sandbox (§5.8).
 	egressPolicyLocks egressPolicyLocks
 	// egressProfileKick wakes SuperviseEgressProfiles after a profile change
@@ -1309,7 +1316,9 @@ func (s *Service) CreateSandboxWithID(ctx context.Context, req models.CreateSand
 	if id == "" {
 		return nil, errors.New("CreateSandboxWithID: id required")
 	}
-	if existing, err := s.store.Get(ctx, id); err == nil && existing != nil {
+	existing, getErr := s.store.Get(ctx, id)
+	found := getErr == nil && existing != nil
+	if found {
 		// The fast path returns a fully-hydrated row — toolbox token included
 		// — so it must never answer a caller that does not own it. A facade
 		// deriving the ID from request content (E2B) would otherwise let any
@@ -1319,6 +1328,16 @@ func (s *Service) CreateSandboxWithID(ctx context.Context, req models.CreateSand
 		if err := enforceOwner(ctx, existing); err != nil {
 			return nil, fmt.Errorf("%w: sandbox id is already in use", models.ErrSandboxExists)
 		}
+	}
+	// An Idempotency-Key create replays only the request it was made with
+	// (keyed_create.go): a different one is refused before anything is
+	// created, whether the sandbox exists or is being created right now.
+	ctx, release, err := s.BeginKeyedCreate(ctx, id, req.CreateRequestDigests)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+	if found {
 		// Already present locally — recreate is a no-op. The watcher tick that
 		// noticed the FSM-only entry must have raced with a local create.
 		auditlog.NoteSandboxIdentity(ctx, id, existing.AuditIncarnationID, existing.OwnerRef)
@@ -1984,6 +2003,12 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 	if err := s.requireNodeGuard(chosenRuntime); err != nil {
 		return nil, err
 	}
+	// Fail closed: no sandbox on a runtime whose egress deny floor is not
+	// installed, since it could reach the cloud metadata endpoints and the
+	// node's credentials. One atomic map read (egress_floor.go).
+	if err := s.requireEgressFloor(chosenRuntime); err != nil {
+		return nil, err
+	}
 	if hasBinariesRule(req.NetworkEgressRules) && chosenRuntime == models.RuntimeGvisor {
 		return nil, unsupportedBinaries(chosenRuntime)
 	}
@@ -2352,7 +2377,10 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 			return nil, dupErr
 		}
 		releaseAdmission()
-		return nil, err
+		// A bridge or subnet that filled past the counted pool (a port
+		// taken without a reservation) is still capacity, not a fault: the
+		// driver removed what it created, and the API answers 503.
+		return nil, capacity.AsNetworkSlotExhausted(networkSlotPool(chosenEngine), err)
 	}
 	s.releaseAdoptedParkReservation(state)
 	if gatewayMode {
@@ -2978,6 +3006,9 @@ func (s *Service) persistSandboxCreate(ctx context.Context, sandbox *models.Sand
 	if s == nil || s.store == nil {
 		return errors.New("store is not configured")
 	}
+	if digests := createRequestDigestsFrom(ctx); sandbox.CreateRequestDigest == "" && len(digests) > 0 {
+		sandbox.CreateRequestDigest = digests[0]
+	}
 	if strings.TrimSpace(sandbox.AuditIncarnationID) == "" {
 		incarnationID, err := s.prepareAuditIncarnation(ctx, sandbox.ID, sandbox.ToolboxToken)
 		if err != nil {
@@ -3480,6 +3511,13 @@ func (s *Service) StartSandbox(ctx context.Context, id string) (*models.Sandbox,
 		if err != nil {
 			_ = s.mounts.UnmountAll(id)
 			releaseAdmission()
+			if capacity.IsNetworkExhaustion(err) {
+				// A full bridge refused the start the way admission
+				// would have: the sandbox is still stopped and a retry
+				// can start it, so it is not marked error.
+				s.invalidateWarm(id)
+				return nil, capacity.AsNetworkSlotExhausted(networkSlotPool(models.SandboxEngine(sandbox)), err)
+			}
 			_ = s.store.UpdateStatus(ctx, id, models.SandboxStatusError, err.Error())
 			s.invalidateWarm(id)
 			return nil, err

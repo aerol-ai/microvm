@@ -58,6 +58,9 @@ func (f *fakeNetRules) SetNodeGuard(subnet netip.Prefix, allow []netrules.NodePo
 func (f *fakeNetRules) ReassertNodeGuard() (bool, error) {
 	return true, f.rec("node-guard-reassert", "")
 }
+func (f *fakeNetRules) ReassertFloor() (bool, error) {
+	return true, f.rec("floor-reassert", "")
+}
 
 func (f *fakeNetRules) has(prefix string) bool {
 	f.mu.Lock()
@@ -124,16 +127,28 @@ func TestNetRuleMethods(t *testing.T) {
 		"ClearNetworkBlockEgress":  func() error { return d.ClearNetworkBlockEgress("10.0.0.2") },
 		"ApplyEgressHold":          func() error { return d.ApplyEgressHold("10.0.0.2") },
 		"ClearEgressHold":          func() error { return d.ClearEgressHold("10.0.0.2") },
-		"SetEgressFloor":           func() error { return d.SetEgressFloor(context.Background(), nil) },
 	} {
 		if err := fn(); !errors.Is(err, models.ErrRuntimeNotImplemented) {
 			t.Fatalf("%s without a firewall: %v", name, err)
 		}
 	}
+	// No firewall: no floor, said so (the service allows it outside
+	// enterprise mode, like the node guard), and nothing to re-assert.
+	if err := d.SetEgressFloor(context.Background(), nil); !errors.Is(err, sbruntime.ErrEgressFloorUnavailable) {
+		t.Fatalf("floor without a firewall: %v", err)
+	}
+	if repaired, err := d.ReassertEgressFloor(context.Background()); repaired || err != nil {
+		t.Fatalf("re-assert without a firewall: %v %v", repaired, err)
+	}
 	rules := &fakeNetRules{}
 	d.SetNetRules(rules)
-	if err := d.SetEgressFloor(context.Background(), nil); err != nil || rules.has("floor") {
-		t.Fatal("no TAP subnet, no floor")
+	// A firewall but no TAP subnet: an error, never a silent success the
+	// create gate would read as "installed".
+	if err := d.SetEgressFloor(context.Background(), nil); err == nil || rules.has("floor") {
+		t.Fatalf("no TAP subnet, no floor: %v", err)
+	}
+	if repaired, err := d.ReassertEgressFloor(context.Background()); !repaired || err != nil || !rules.has("floor-reassert") {
+		t.Fatalf("re-assert goes to the firewall: %v %v %v", repaired, err, rules.calls)
 	}
 	d.SetTapSubnet(netip.MustParsePrefix("172.16.0.0/16"))
 	calls := []func() error{

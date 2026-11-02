@@ -10,7 +10,6 @@ import (
 	"sync/atomic"
 
 	"github.com/aerol-ai/microvm/internal/egress/operator"
-	"github.com/aerol-ai/microvm/internal/runtime"
 	"github.com/aerol-ai/microvm/pkg/egresspolicy"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
@@ -102,25 +101,18 @@ func (s *Service) ApplyEgressFloor(ctx context.Context) {
 	s.applyEgressFloor(ctx, nil)
 }
 
-// applyEgressFloor installs the deny floor (the operator's deny_cidrs and
-// the cloud metadata endpoints; op may be nil) as a node-wide DROP on each
-// container engine's bridge and the Firecracker TAP subnet (§5.10 PC-2). It
-// is the floor's copy that works without the egress gateway; failures are
-// logged, not fatal, because the gateway's own floor and the WASM/isolate
-// dial guards still hold it.
+// applyEgressFloor makes op's deny floor (the operator's deny_cidrs and the
+// cloud metadata endpoints; op may be nil) the one this node must have, and
+// installs it now as a node-wide DROP on each container engine's bridge and
+// the Firecracker TAP subnet (§5.10 PC-2). It is not best-effort: for a
+// container, gVisor or Firecracker sandbox whose traffic does not pass the
+// egress gateway, this host-firewall copy is the only one (the gateway's
+// deny_floor set filters only what the gateway carries, and the WASM and
+// isolate dial guards cover only those runtimes). A runtime where it fails
+// refuses creates with ErrEgressFloorNotReady until the supervisor installs
+// it (egress_floor.go).
 func (s *Service) applyEgressFloor(ctx context.Context, op *operator.Operator) {
-	if s == nil {
-		return
-	}
-	for _, rt := range []runtime.Runtime{s.docker, s.containerd, s.firecracker} {
-		fs, ok := rt.(runtime.EgressFloorSetter)
-		if !ok || rt == nil {
-			continue
-		}
-		if err := fs.SetEgressFloor(ctx, op.DenyFloor()); err != nil {
-			s.logger.Error("egress: deny floor not installed on the host firewall", "error", err)
-		}
-	}
+	s.syncEgressFloor(ctx, op.DenyFloor())
 }
 
 func publishOperatorHash(op *operator.Operator) {

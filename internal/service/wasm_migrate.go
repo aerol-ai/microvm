@@ -174,6 +174,9 @@ func (s *Service) ensureWasmSandboxRowForImport(ctx context.Context, sandboxID s
 	if row.Image == "" {
 		row.Image = row.ModuleRef
 	}
+	if len(spec.CreateRequestDigests) > 0 {
+		row.CreateRequestDigest = spec.CreateRequestDigests[0]
+	}
 	return s.persistSandboxCreate(ctx, row)
 }
 

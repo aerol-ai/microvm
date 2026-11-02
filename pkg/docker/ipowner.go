@@ -66,17 +66,31 @@ var (
 // rule method below returns nil without installing anything.
 func (c *Client) NetRulesEnabled() bool { return c.networkRules.Enabled() }
 
+var _ runtime.EgressFloorSetter = (*Client)(nil)
+
 // SetEgressFloor installs the operator's node-wide deny floor for the
 // sandbox network's subnet (§5.10 PC-2).
 func (c *Client) SetEgressFloor(ctx context.Context, cidrs []netip.Prefix) error {
 	if c.networkRules == nil || !c.networkRules.Enabled() {
-		return nil
+		return runtime.ErrEgressFloorUnavailable
 	}
 	sn, err := c.SandboxBridge(ctx)
 	if err != nil {
 		return err
 	}
+	if !sn.Subnet.IsValid() {
+		// SetFloor would install nothing and report success.
+		return fmt.Errorf("docker network %s has no IPv4 subnet for the egress floor", sn.Name)
+	}
 	return c.networkRules.SetFloor(sn.Subnet, cidrs)
+}
+
+// ReassertEgressFloor puts the floor back if something removed it.
+func (c *Client) ReassertEgressFloor(context.Context) (bool, error) {
+	if c.networkRules == nil {
+		return false, nil
+	}
+	return c.networkRules.ReassertFloor()
 }
 
 var _ runtime.NodeGuardSetter = (*Client)(nil)
@@ -119,6 +133,12 @@ type SandboxNetwork struct {
 	Name    string
 	Gateway netip.Addr
 	Subnet  netip.Prefix
+	// Driver ("bridge" for docker0 and a user-defined bridge) and IPRange
+	// (the part of Subnet IPAM hands out, dockerd's fixed-cidr) size the
+	// docker bridge slot pool: a bridge holds 1,023 ports, and IPAM can run
+	// out of addresses first.
+	Driver  string
+	IPRange netip.Prefix
 }
 
 // SandboxBridge returns the Linux bridge, gateway IP and subnet of the
@@ -132,10 +152,12 @@ func (c *Client) SandboxBridge(ctx context.Context) (SandboxNetwork, error) {
 	}
 	var resp struct {
 		ID      string            `json:"Id"`
+		Driver  string            `json:"Driver"`
 		Options map[string]string `json:"Options"`
 		IPAM    struct {
 			Config []struct {
 				Subnet  string `json:"Subnet"`
+				IPRange string `json:"IPRange"`
 				Gateway string `json:"Gateway"`
 			} `json:"Config"`
 		} `json:"IPAM"`
@@ -154,12 +176,15 @@ func (c *Client) SandboxBridge(ctx context.Context) (SandboxNetwork, error) {
 	for _, cfg := range resp.IPAM.Config {
 		gw, err := netip.ParseAddr(cfg.Gateway)
 		if err == nil && gw.Is4() {
-			sn := SandboxNetwork{Name: name, Gateway: gw}
+			sn := SandboxNetwork{Name: name, Gateway: gw, Driver: resp.Driver}
 			if p, err := netip.ParsePrefix(cfg.Subnet); err == nil && p.Addr().Is4() {
 				sn.Subnet = p.Masked()
+			}
+			if p, err := netip.ParsePrefix(cfg.IPRange); err == nil && p.Addr().Is4() {
+				sn.IPRange = p.Masked()
 			}
 			return sn, nil
 		}
 	}
-	return SandboxNetwork{Name: name}, fmt.Errorf("docker network %s has no IPv4 gateway", network)
+	return SandboxNetwork{Name: name, Driver: resp.Driver}, fmt.Errorf("docker network %s has no IPv4 gateway", network)
 }
