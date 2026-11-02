@@ -4,6 +4,7 @@ import type { AddressInfo } from "node:net";
 import test from "node:test";
 
 import { APIClient, SandboxResource, parseRetryAfter, retryDelayMs } from "./client.js";
+import { MicroVMApiError } from "../errors.js";
 import { Image } from "../Image.js";
 import type { CreateOptions, Sandbox } from "../types.js";
 
@@ -2094,4 +2095,98 @@ test("internal client does not retry once its signal has aborted", async () => {
   });
   await assert.rejects(client.get("sb-paced"), TypeError);
   assert.equal(attempts, 1);
+});
+
+// Every HTTP error is a MicroVMApiError carrying the status, the server's
+// stable code and its Retry-After, with the message the SDK always threw.
+test("internal client errors carry status, code and Retry-After", async () => {
+  const cases: Array<{
+    name: string;
+    response: () => Response;
+    status: number;
+    code: string | undefined;
+    message: string;
+    retryAfterMs: number | undefined;
+    attempts: number;
+  }> = [
+    {
+      name: "422 idempotency_key_reused is not retried",
+      response: () => jsonResponse({ error: 'Idempotency-Key "k-1" was already used with a different request', code: "idempotency_key_reused" }, 422),
+      status: 422,
+      code: "idempotency_key_reused",
+      message: 'Idempotency-Key "k-1" was already used with a different request',
+      retryAfterMs: undefined,
+      attempts: 1,
+    },
+    {
+      name: "503 egress_floor_not_ready keeps Retry-After after the retries run out",
+      response: () =>
+        new Response(JSON.stringify({ error: "this node's egress deny floor is not ready", code: "egress_floor_not_ready" }), {
+          status: 503,
+          headers: { "content-type": "application/json", "retry-after": "0" },
+        }),
+      status: 503,
+      code: "egress_floor_not_ready",
+      message: "this node's egress deny floor is not ready",
+      retryAfterMs: 0,
+      attempts: 3,
+    },
+    {
+      name: "non-JSON body has no code and the status message",
+      response: () => new Response("<html>Bad Gateway</html>", { status: 502, headers: { "content-type": "text/html" } }),
+      status: 502,
+      code: undefined,
+      message: "request failed with status 502",
+      retryAfterMs: undefined,
+      attempts: 3,
+    },
+  ];
+  for (const tc of cases) {
+    let attempts = 0;
+    const client = new APIClient({
+      baseURL: "https://api.example.com",
+      patToken: "pat-token",
+      retry: { maxRetries: 2, baseDelayMs: 1, maxDelayMs: 1 },
+      fetch: async () => {
+        attempts++;
+        return tc.response();
+      },
+    });
+    const err = await client.create({ image: "ubuntu:22.04" }).then(
+      () => assert.fail(`${tc.name}: create should fail`),
+      (e: unknown) => e,
+    );
+    assert.ok(err instanceof MicroVMApiError, `${tc.name}: ${String(err)}`);
+    assert.ok(err instanceof Error, tc.name);
+    assert.equal(err.name, "MicroVMApiError", tc.name);
+    assert.equal(err.status, tc.status, tc.name);
+    assert.equal(err.code, tc.code, tc.name);
+    assert.equal(err.message, tc.message, tc.name);
+    assert.equal(err.retryAfterMs, tc.retryAfterMs, tc.name);
+    assert.equal(attempts, tc.attempts, tc.name);
+  }
+});
+
+test("internal client error Retry-After reads seconds and HTTP dates", async () => {
+  const at = Date.now() + 60_000;
+  const cases: Array<[string, (ms: number | undefined) => boolean]> = [
+    ["7", (ms) => ms === 7000],
+    [new Date(at).toUTCString(), (ms) => ms !== undefined && ms > 50_000 && ms <= 60_000],
+    ["soon", (ms) => ms === undefined],
+  ];
+  for (const [header, ok] of cases) {
+    const client = new APIClient({
+      baseURL: "https://api.example.com",
+      patToken: "pat-token",
+      retry: { maxRetries: 0 },
+      fetch: async () =>
+        new Response(JSON.stringify({ error: "busy", code: "overloaded" }), {
+          status: 503,
+          headers: { "content-type": "application/json", "retry-after": header },
+        }),
+    });
+    const err = await client.list().catch((e: unknown) => e);
+    assert.ok(err instanceof MicroVMApiError, header);
+    assert.ok(ok(err.retryAfterMs), `${header}: retryAfterMs=${err.retryAfterMs}`);
+  }
 });
