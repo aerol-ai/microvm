@@ -321,6 +321,12 @@ func Prepare(w http.ResponseWriter, r *http.Request, svc *service.Service, req m
 		// while the create it was retrying was still running.
 		if opts.PreferredSandboxID != "" && (errors.Is(err, cluster.ErrReservationConflict) || errors.Is(err, cluster.ErrIncarnationConflict)) {
 			service.RecordFacadeIdempotencyConflict(opts.metric("reservation"))
+			// The verdict came from the leader, which holds the reservation.
+			// On a raft voter the owner read below is this node's own FSM
+			// copy, which can trail the leader by an apply, so give it a
+			// moment to show the reservation (UC-367 on cluster-3-mixed: a
+			// voter ingress read no owner yet and answered 409).
+			awaitOwner(r.Context(), c, sandboxID, ownerCatchUpWait)
 			handled, local := routeExistingPlacement(w, r, c, sandboxID, writeError)
 			if local {
 				return Decision{ReservationID: sandboxID}, true
@@ -328,14 +334,14 @@ func Prepare(w http.ResponseWriter, r *http.Request, svc *service.Service, req m
 			if handled {
 				return Decision{}, false
 			}
-			if errors.Is(err, cluster.ErrIncarnationConflict) {
-				// The reservation went between the reserve and the owner
-				// read (its create failed, or it expired): the next retry
-				// reserves afresh.
-				w.Header().Set("Retry-After", "1")
-				writeMsg(w, http.StatusServiceUnavailable, "cluster: the sandbox's pending create settled while this retry was routed; retry")
-				return Decision{}, false
-			}
+			// Still no owner: the same key's create settled between the
+			// reserve and the read (it failed, or its reservation expired),
+			// or this node's copy is further behind. Either way the next
+			// retry of this key replays or reserves afresh; a 409 would
+			// tell the client its retry can never succeed.
+			w.Header().Set("Retry-After", "1")
+			writeMsg(w, http.StatusServiceUnavailable, "cluster: the sandbox's pending create settled while this retry was routed; retry")
+			return Decision{}, false
 		}
 		if errors.Is(err, cluster.ErrNameConflict) {
 			service.RecordFacadeIdempotencyConflict(opts.metric("name"))
@@ -558,6 +564,43 @@ func (h *rejectionHold) release() {
 	h.ResponseWriter.WriteHeader(h.status)
 	_, _ = h.ResponseWriter.Write(h.body.Bytes())
 	h.body.Reset()
+}
+
+// ownerCatchUpWait bounds how long a keyed reservation conflict waits for this
+// node's FSM copy to show the reservation the leader just reported. An apply
+// reaches a voter's copy within a heartbeat or two; a variable so tests can
+// shorten it.
+var ownerCatchUpWait = 2 * time.Second
+
+// awaitOwner returns once sandboxID has an owner in this node's view, or the
+// budget or ctx runs out. It backs off from 10ms to 200ms between reads: on a
+// non-voter OwnerOf is a control-plane request, and its first read already
+// sees the leader's state.
+func awaitOwner(ctx context.Context, c cluster.Client, sandboxID string, budget time.Duration) {
+	deadline := time.Now().Add(budget)
+	pause := 10 * time.Millisecond
+	for {
+		if _, err := c.OwnerOf(sandboxID); err == nil {
+			return
+		}
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return
+		}
+		if pause > remaining {
+			pause = remaining
+		}
+		timer := time.NewTimer(pause)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return
+		case <-timer.C:
+		}
+		if pause *= 2; pause > 200*time.Millisecond {
+			pause = 200 * time.Millisecond
+		}
+	}
 }
 
 func routeExistingPlacement(w http.ResponseWriter, r *http.Request, c cluster.Client, sandboxID string, writeError ErrorWriter) (handled bool, local bool) {

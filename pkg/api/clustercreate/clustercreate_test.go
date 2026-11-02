@@ -33,14 +33,18 @@ import (
 
 type clusterStub struct {
 	*cluster.Noop
-	owner      cluster.OwnerInfo
-	ownerErr   error
-	forwards   int
-	lastTarget cluster.Endpoint
-	deletes    int
-	deleteErr  error
-	cancels    int
-	cancelErr  error
+	owner    cluster.OwnerInfo
+	ownerErr error
+	// ownerMisses is how many OwnerOf reads answer ErrUnknownSandbox before
+	// owner: a voter's FSM copy trailing the leader by an apply.
+	ownerMisses int
+	ownerReads  int
+	forwards    int
+	lastTarget  cluster.Endpoint
+	deletes     int
+	deleteErr   error
+	cancels     int
+	cancelErr   error
 
 	selectTarget cluster.PlacementTarget
 	selectErr    error
@@ -81,6 +85,11 @@ type recordCall struct {
 }
 
 func (s *clusterStub) OwnerOf(_ string) (cluster.OwnerInfo, error) {
+	s.ownerReads++
+	if s.ownerMisses > 0 {
+		s.ownerMisses--
+		return cluster.OwnerInfo{}, cluster.ErrUnknownSandbox
+	}
 	if s.ownerErr != nil {
 		return cluster.OwnerInfo{}, s.ownerErr
 	}
@@ -942,12 +951,16 @@ func TestPrepare_ReservePaths(t *testing.T) {
 	})
 
 	t.Run("reserve_error_shapes", func(t *testing.T) {
+		prevWait := ownerCatchUpWait
+		ownerCatchUpWait = 100 * time.Millisecond
+		t.Cleanup(func() { ownerCatchUpWait = prevWait })
 		tests := []struct {
 			name           string
 			err            error
 			opts           PrepareOptions
 			owner          cluster.OwnerInfo
 			ownerErr       error
+			ownerMisses    int
 			wantStatus     int
 			wantRetryAfter string
 			wantOK         bool
@@ -969,6 +982,27 @@ func TestPrepare_ReservePaths(t *testing.T) {
 				owner:        cluster.OwnerInfo{NodeID: "node-b", APIURL: "http://node-b"},
 				wantStatus:   http.StatusAccepted,
 				wantForwards: 1,
+			},
+			// UC-367 on cluster-3-mixed: the leader reported the conflict
+			// before this voter's FSM copy applied the reservation, so the
+			// first owner reads miss. The retry waits for the copy and is
+			// routed, instead of answering 409.
+			{
+				name:         "preferred_id_conflict_owner_appears_after_apply_lag_forwards",
+				err:          cluster.ErrReservationConflict,
+				opts:         PrepareOptions{PreferredSandboxID: "sb-fixed"},
+				owner:        cluster.OwnerInfo{NodeID: "node-b", APIURL: "http://node-b"},
+				ownerMisses:  3,
+				wantStatus:   http.StatusAccepted,
+				wantForwards: 1,
+			},
+			{
+				name:           "preferred_id_conflict_no_owner_is_retryable_not_409",
+				err:            cluster.ErrReservationConflict,
+				opts:           PrepareOptions{PreferredSandboxID: "sb-fixed"},
+				ownerErr:       cluster.ErrUnknownSandbox,
+				wantStatus:     http.StatusServiceUnavailable,
+				wantRetryAfter: "1",
 			},
 			{
 				name:       "preferred_id_conflict_owner_without_url_returns_503",
@@ -1022,6 +1056,7 @@ func TestPrepare_ReservePaths(t *testing.T) {
 					reserveErr:   tc.err,
 					owner:        tc.owner,
 					ownerErr:     tc.ownerErr,
+					ownerMisses:  tc.ownerMisses,
 				}
 				svc := testServiceWithCluster(stub)
 				w := httptest.NewRecorder()
@@ -1804,4 +1839,37 @@ func TestOverlapCreateAndPromote_PromoteGetsFreshTimeoutAfterSlowCreate(t *testi
 	if len(stub.recordCalls) != 1 {
 		t.Fatalf("RecordPlacement calls = %d, want 1 (promote must succeed on its fresh budget)", len(stub.recordCalls))
 	}
+}
+
+// awaitOwner returns as soon as the owner shows, gives up at its budget, and
+// never outlives the request.
+func TestAwaitOwner(t *testing.T) {
+	t.Run("returns_once_the_copy_catches_up", func(t *testing.T) {
+		stub := &clusterStub{Noop: cluster.NewNoop("node-a", "http://node-a", ""), ownerMisses: 2}
+		awaitOwner(context.Background(), stub, "sb-x", time.Second)
+		if stub.ownerReads != 3 {
+			t.Fatalf("OwnerOf reads = %d, want 3 (two misses, then the owner)", stub.ownerReads)
+		}
+	})
+	t.Run("gives_up_at_its_budget", func(t *testing.T) {
+		stub := &clusterStub{Noop: cluster.NewNoop("node-a", "http://node-a", ""), ownerErr: cluster.ErrUnknownSandbox}
+		start := time.Now()
+		awaitOwner(context.Background(), stub, "sb-x", 60*time.Millisecond)
+		if took := time.Since(start); took > time.Second {
+			t.Fatalf("awaitOwner took %v past a 60ms budget", took)
+		}
+		if stub.ownerReads < 2 {
+			t.Fatalf("OwnerOf reads = %d, want it to look again before giving up", stub.ownerReads)
+		}
+	})
+	t.Run("stops_with_the_request", func(t *testing.T) {
+		stub := &clusterStub{Noop: cluster.NewNoop("node-a", "http://node-a", ""), ownerErr: cluster.ErrUnknownSandbox}
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		start := time.Now()
+		awaitOwner(ctx, stub, "sb-x", time.Minute)
+		if took := time.Since(start); took > time.Second {
+			t.Fatalf("awaitOwner ignored a cancelled request for %v", took)
+		}
+	})
 }
