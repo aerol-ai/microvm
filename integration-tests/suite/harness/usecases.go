@@ -109,8 +109,8 @@ const (
 	// the two pools are independent (netns slots hold no capacity
 	// reservations, so this one leaves the UC-95 density gate untouched).
 	CapDockerNetnsPool Capability = "docker-netns-pool"
-	// CapDockerEngine is consumed by run.sh's engine selection, not by any UC's
-	// Requires. It is an OPT-OUT: containerd is the DEFAULT engine for every
+	// CapDockerEngine is consumed by run.sh's engine selection, and by the one
+	// UC that reads dockerd's own image store (UC-364). It is an OPT-OUT: containerd is the DEFAULT engine for every
 	// scenario (run.sh writes SB_CONTAINER_ENGINE=containerd), and only a
 	// scenario advertising this cap runs dockerd instead. Exactly two do — the
 	// local dev install (local-mode) and the docker A/B benchmark baseline
@@ -927,6 +927,9 @@ var Registry = []UseCase{
 	// Bank-readiness security, continued (bank_security_test.go): the egress
 	// deny floor fails closed and heals (disruptive; skipped in local mode).
 	{ID: "UC-363", Title: "Security: the egress deny floor fails closed and heals: with a runtime's AEROLVM-FLOOR chain removed over SSH, the node puts it back (jumped first, dropping 169.254.169.254) within 45 s, aerolvm_egress_floor_ready reads 1 for that runtime and the journal names the repair; every create on that runtime meanwhile succeeds or gets 503 egress_floor_not_ready, and the metadata endpoints stay unreachable from the running sandbox and a new one on the node", Requires: []Capability{CapDocker}, Implemented: true},
+	// A Docker snapshot keeps no secrets (secrets_env_test.go): the commit
+	// used to copy the sandbox's toolbox token and env into the image config.
+	{ID: "UC-364", Title: "Secrets: a Docker snapshot of a sandbox created with an env secret keeps neither the secret nor its toolbox token, in the image config dockerd reports or in any env list `docker save` holds (what a registry push sends), and a sandbox created from the snapshot runs on its own token and sees the variable empty", Requires: []Capability{CapDocker, CapDockerEngine}, Implemented: true},
 }
 
 // byID is a lookup built once for the report generator.
