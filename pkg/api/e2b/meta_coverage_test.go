@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/aerol-ai/microvm/pkg/models"
+	"github.com/aerol-ai/microvm/pkg/secrets"
 )
 
 func TestSandboxMetaFromNativeNilTagsAndNetworkDefaults(t *testing.T) {
@@ -61,9 +62,11 @@ func TestSandboxMetaFromNativeDestroyAtAgeBranch(t *testing.T) {
 }
 
 func TestCreateRequestFingerprintAndMetadataHelpers(t *testing.T) {
-	fp, err := createRequestFingerprint("", "base", models.CreateSandboxRequest{Image: "ubuntu:22.04"}, sandboxMeta{
+	d := cipherDigester{fpCipher(t, secrets.RingKey{ID: 0, Key: fpKey(1), Current: true})}
+	fps, err := createRequestFingerprints(d, "", "base", models.CreateSandboxRequest{Image: "ubuntu:22.04"}, sandboxMeta{
 		TemplateID: "base", TimeoutSeconds: 120, OnTimeout: "kill",
-	})
+	}, false)
+	fp := fps.current
 	if err != nil || fp == "" {
 		t.Fatalf("fingerprint = %q err=%v", fp, err)
 	}

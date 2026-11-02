@@ -375,9 +375,8 @@ func TestLoadReplayableCreateResultSandboxDBError(t *testing.T) {
 
 func TestCreateSandboxFingerprintErrorPath(t *testing.T) {
 	h := newHandlers(Deps{Service: nil})
-	_, err := createRequestFingerprint("", "base", models.CreateSandboxRequest{}, sandboxMeta{})
-	if err != nil {
-		t.Fatalf("unexpected fingerprint error: %v", err)
+	if _, err := createRequestFingerprints(h.deps.Service, "", "base", models.CreateSandboxRequest{}, sandboxMeta{}, false); err == nil {
+		t.Fatal("a fingerprint without the server key succeeded")
 	}
 	// Exercise handler path where fingerprint succeeds but claim fails with closed DB.
 	_, st, handler := newE2BHandlerTestEnv(t)
@@ -397,7 +396,7 @@ func TestCreateSandboxReadyReplayLoadError(t *testing.T) {
 	id := createE2BSandbox(t, handler)
 
 	ctx := context.Background()
-	fingerprint, err := createRequestFingerprint("", "base", models.CreateSandboxRequest{
+	fps, err := createRequestFingerprints(svc, "", "base", models.CreateSandboxRequest{
 		Image: "ubuntu:22.04",
 		Env:   map[string]string{},
 	}, sandboxMeta{
@@ -407,10 +406,11 @@ func TestCreateSandboxReadyReplayLoadError(t *testing.T) {
 		Secure:          true,
 		NetworkAllowOut: []string{},
 		NetworkDenyOut:  []string{},
-	})
+	}, false)
 	if err != nil {
 		t.Fatalf("fingerprint: %v", err)
 	}
+	fingerprint := fps.current
 	now := time.Now().UTC()
 	if _, _, err := svc.ClaimIdempotentRequest(ctx, idempotencyScopeCreate, fingerprint, now, time.Minute); err != nil {
 		t.Fatalf("ClaimIdempotentRequest: %v", err)

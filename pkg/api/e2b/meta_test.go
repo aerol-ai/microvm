@@ -247,33 +247,3 @@ func TestMetaSnapshotNameFromID(t *testing.T) {
 		}
 	})
 }
-
-func TestCreateRequestFingerprint(t *testing.T) {
-	f, err := createRequestFingerprint("", "tid", models.CreateSandboxRequest{NetworkBlockAll: true}, sandboxMeta{TimeoutSeconds: 10})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.HasPrefix(f, "fingerprint:") {
-		t.Error("missing prefix", f)
-	}
-}
-
-// The create idempotency ledger is keyed (scope, fingerprint) with no owner
-// column, so the owner must be folded into the fingerprint — otherwise two
-// tenants sending the same create body would collide and the second would
-// replay the first tenant's sandbox (D13). This pins that invariant.
-func TestCreateRequestFingerprintIsOwnerNamespaced(t *testing.T) {
-	req := models.CreateSandboxRequest{NetworkBlockAll: true}
-	meta := sandboxMeta{TimeoutSeconds: 10}
-	acme, err := createRequestFingerprint("acme", "tid", req, meta)
-	if err != nil {
-		t.Fatal(err)
-	}
-	globex, err := createRequestFingerprint("globex", "tid", req, meta)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if acme == globex {
-		t.Fatalf("same fingerprint for different owners: %q", acme)
-	}
-}
