@@ -288,3 +288,19 @@ func TestAsNetworkSlotExhausted(t *testing.T) {
 		t.Fatalf("a capacity refusal was wrapped again: %v", got)
 	}
 }
+
+// Parks already ready when the limit is set (a pool refilled before boot
+// wiring finished) are counted as held and as free room.
+func TestSetSlotLimitRecountsReadyParks(t *testing.T) {
+	a := roomyHost()
+	gate := &ParkGate{Admitter: a}
+	if err := gate.ParkReservation("p1", dockerpool.ParkShape{CPU: 0.25, MemoryMB: 128, Runtime: models.RuntimeDocker}); err != nil {
+		t.Fatal(err)
+	}
+	gate.MarkParkReady("p1", true)
+	a.Reserve("sb-1", small(models.RuntimeDocker))
+	a.SetSlotLimit(bridgeLimit(2))
+	if p, _ := a.SlotPool(); p.Free != 1 {
+		t.Fatalf("Free = %d, want 1 (two held, one of them a ready park)", p.Free)
+	}
+}
