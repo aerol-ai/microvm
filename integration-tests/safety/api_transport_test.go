@@ -37,6 +37,7 @@ var nonAPIClients = map[string]string{
 	"z_ingress_routing_restart_test.go:TestIngressRoutingSessionsSurviveSandboxdRestart": "the subject is a keep-alive connection surviving a restart",
 	"z_identity_chaos_test.go:TestIdentityTokenSpray":                                    "one node's loopback through an SSH forward",
 	"api_lb_test.go:newLBProber":                                                         "the real load balancer, one new connection per call; the shared pool would hide what the LB does",
+	"list_fairness_test.go:pinnedAPIClients":                                             "pins each tenant's clients to one ingress node by address on that tenant's own connections, so both tenants load every node; nothing takes a node down meanwhile",
 	"observability_test.go:TestUC106_GrafanaReachable":                                   "the observability node, not the API domain",
 }
 

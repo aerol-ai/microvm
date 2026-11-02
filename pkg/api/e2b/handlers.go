@@ -187,6 +187,12 @@ func (h *handlers) listSandboxes(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, []listedSandboxResponse{})
 		return
 	}
+	release, err := clusterlist.Admit(h.deps.ListGate, h.deps.Service.Cluster(), r)
+	if err != nil {
+		writeStoreAwareError(h.deps.Logger, w, err)
+		return
+	}
+	defer release()
 	sandboxes, err := h.deps.Service.ListSandboxes(r.Context(), nil)
 	if err != nil {
 		writeStoreAwareError(h.deps.Logger, w, err)

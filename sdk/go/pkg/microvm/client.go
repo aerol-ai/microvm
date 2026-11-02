@@ -117,6 +117,9 @@ func NewClientWithConfig(config *sdktypes.MicroVMConfig) (*Client, error) {
 		if config.Retry.MaxDelayMs != nil {
 			opts.Retry.MaxDelayMs = config.Retry.MaxDelayMs
 		}
+		if config.Retry.MaxRetryAfterMs != nil {
+			opts.Retry.MaxRetryAfterMs = config.Retry.MaxRetryAfterMs
+		}
 	}
 
 	inner := apiclient.NewClient(apiURL, opts)

@@ -117,12 +117,20 @@ type hostAdapter struct {
 }
 
 func (a *hostAdapter) SetEgressPolicy(id string, p EgressPolicy) {
-	a.Host.SetEgressPolicy(id, pkgisolate.EgressPolicy{
+	a.Host.SetEgressPolicy(id, toHostEgressPolicy(p))
+}
+
+func (a *hostAdapter) ClaimEgressPolicy(id string, p EgressPolicy) error {
+	return a.Host.ClaimEgressPolicy(id, toHostEgressPolicy(p))
+}
+
+func toHostEgressPolicy(p EgressPolicy) pkgisolate.EgressPolicy {
+	return pkgisolate.EgressPolicy{
 		BlockAll: p.BlockAll,
 		Allow:    p.Allow,
 		Deny:     p.Deny,
 		Learn:    p.Learn,
 		Rules:    p.Rules,
 		Secrets:  p.Secrets,
-	})
+	}
 }

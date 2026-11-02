@@ -150,7 +150,8 @@ What the installer does:
 2. Downloads `sandboxd` + `toolboxd` binaries.
 3. Writes `/etc/sandboxd/sandboxd.env` and `/etc/caddy/Caddyfile`.
 4. Registers `sandboxd.service` (always-restart, 5s backoff) and
-   `sandboxd-healthcheck.timer` (probes `/health` every 30s).
+   `sandboxd-healthcheck.timer` (probes the daemon's liveness socket every
+   30s).
 5. Starts everything.
 
 Verify:
@@ -193,8 +194,13 @@ languages.
 | Update binaries | Re-run the installer with the same flags, then `sudo systemctl restart sandboxd`. State and certs are preserved. |
 | List sandboxes | `curl -H "Authorization: Bearer $SB_PAT_TOKEN" https://sandbox.example.com/v1/sandboxes` |
 
-The systemd watchdog (`sandboxd-healthcheck.timer`) restarts the daemon if
-`/health` fails. The daemon itself restarts on any non-zero exit
+The systemd watchdog (`sandboxd-healthcheck.timer`) restarts the daemon only
+when it stops answering: it probes the liveness socket
+(`/run/sandboxd/live.sock`, which a busy daemon still answers) and restarts
+after 3 failed probes in a row over at least 90 s, never in the daemon's
+first 2 minutes and never while a start, stop or restart is already under
+way. A daemon that is merely slow to answer `/health` (readiness) is left
+running. The daemon itself restarts on any non-zero exit
 (`Restart=always`, max 10 restarts per 5 min); once systemd stops after
 those 10, the watchdog resets the failed unit and starts it again every 30 s.
 A unit you stopped with `systemctl stop` is not failed and stays stopped.
@@ -301,5 +307,7 @@ docker ps -a --filter 'label=aerol.sandbox' -q | xargs -r docker rm -f
 | Sandbox creation 500 | Docker not running, or out of capacity | `docker ps`; check `/v1/admission` |
 | Mount errors | `fuse3` / sshfs / mountpoint-s3 missing | Re-run installer; it installs these |
 
-Health watchdog already auto-restarts on `/health` failure. For deeper
+The health watchdog restarts a daemon that stopped answering its liveness
+socket; `journalctl -t sandboxd-healthcheck` shows each failed probe and the
+streak it is on. For deeper
 issues, `journalctl -u sandboxd -f` is the first stop.

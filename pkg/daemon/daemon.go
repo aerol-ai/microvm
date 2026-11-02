@@ -79,11 +79,21 @@ type ProviderFactory func(ctx context.Context, fc FleetConfig) (controlplane.Pro
 // makeProvider supplies the control-plane capabilities. nil (the open-source
 // default) means controlplane.Noop(): every non-PAT token rejected, every usage
 // report a no-op, every create admitted, no enforcement loop.
-func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory) error {
+func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory) (err error) {
+	// stop is the caller's context: cancelled only when the daemon is asked
+	// to stop (SIGTERM/SIGINT in the standard wrapper). Run derives its own
+	// cancellable child below, which a failed listener also cancels.
+	stop := ctx
+	defer func() { err = bootStopped(stop, err, logger) }()
+
 	cfg, err := config.Load()
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
 	}
+	// First, before any slow boot step: the watchdog reads "booting" from
+	// here on instead of "connection refused" (liveness.go).
+	live := startLiveness(cfg.LivenessSocket, logger)
+	defer live.stop()
 
 	cp := controlplane.Noop()
 	if makeProvider != nil {
@@ -295,6 +305,9 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 		"memory_overprovision_factor", cfg.MemoryOverProvisionFactor,
 		"rss_watermark_ratio", cfg.FirecrackerRSSWatermarkRatio,
 	)
+	// The docker engine's sandbox bridge holds 1,023 ports; count them as a
+	// slot pool before any create or reservation replay can fill it.
+	wireDockerBridgeSlots(ctx, cfg, logger, dockerClient, admitter)
 
 	// dockerClient is passed twice: as the runtime.Runtime driver (the
 	// abstraction service uses for sandbox lifecycle) and as the concrete
@@ -656,6 +669,7 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 		}); ok {
 			withEgress.SetEgressGatewayReadyProvider(svc.EgressGatewayReady)
 		}
+		registerSlotPoolsProvider(cfg, clusterClient, svc.LocalSlotPools)
 		if cfg.EnableWasm && cfg.IsWorker() {
 			if withModules, ok := clusterClient.(interface {
 				SetLocalWasmModuleIDsProvider(func() ([]string, bool))
@@ -1045,6 +1059,7 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 	// The revoke re-check (wrapped custody only) starts once the API is up;
 	// it runs on the key store's background budget, never a create's.
 	svc.StartKeyCustody(ctx)
+	live.setPhase(livenessPhaseServing)
 	if publicServer != nil {
 		logger.Info("public API socket listening", "path", cfg.PublicAPISocket)
 		go func() {
@@ -1163,6 +1178,7 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 	}
 
 	<-ctx.Done()
+	live.setPhase(livenessPhaseStopping)
 	logger.Info("shutting down sandboxd")
 
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
@@ -1872,6 +1888,27 @@ func readBypassMarker(path string) bool {
 // the gateway on exactly the nodes that start it.
 func shouldStartSSHGateway(cfg config.Config) bool {
 	return cfg.RunsSSHGateway()
+}
+
+// registerSlotPoolsProvider overlays this node's network-slot pools
+// (containerd netns, docker bridge, Firecracker TAP, capped WASM instances)
+// onto its own capacity lease, matching what peers read from /v1/capacity,
+// so placement skips the node for a runtime whose pool is full. Only a node
+// that can own sandboxes has pools; a client without the hook (the Agent,
+// Noop) is left alone.
+func registerSlotPoolsProvider(cfg config.Config, client any, pools func(context.Context) []capacity.SlotPool) {
+	if !cfg.IsWorker() || pools == nil {
+		return
+	}
+	withSlots, ok := client.(interface {
+		SetLocalSlotPoolsProvider(func() []capacity.SlotPool)
+	})
+	if !ok {
+		return
+	}
+	withSlots.SetLocalSlotPoolsProvider(func() []capacity.SlotPool {
+		return pools(context.Background())
+	})
 }
 
 func supportedRuntimesForConfig(cfg config.Config) []string {

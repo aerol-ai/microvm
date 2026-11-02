@@ -54,7 +54,15 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 	rules := ruleSpecs(req.NetworkEgressRules)
 	egress := policyFromCreate(req.NetworkBlockAll, req.NetworkAllowOut, req.NetworkDenyOut, req.NetworkEgressMode == models.NetworkEgressModeLearn,
 		rules, injectSecrets(rules, req.Env))
-	if setter, ok := host.(EgressPolicySetter); ok {
+	// The slot claim refuses on a full group pool (a capacity error) rather
+	// than start a sandbox whose egress is silently denied; the refusal
+	// unwinds the load like any other post-acquire failure.
+	if claimer, ok := host.(EgressPolicyClaimer); ok {
+		if err := claimer.ClaimEgressPolicy(sandboxID, egress); err != nil {
+			d.releaseFromGroup(groupKey, sandboxID)
+			return nil, fmt.Errorf("isolate: %w", err)
+		}
+	} else if setter, ok := host.(EgressPolicySetter); ok {
 		setter.SetEgressPolicy(sandboxID, egress)
 	}
 	// Mirror WASM: host-mediated sandboxes advertise loopback so

@@ -31,6 +31,10 @@ type Deps struct {
 	// neither a snapshot nor a build (SB_DAYTONA_DEFAULT_IMAGE, read once in
 	// config). Empty falls back to the built-in default.
 	DefaultImage string
+	// ListGate bounds the cluster-wide lists this node runs at once
+	// (clusterlist.Admit); nil admits every list. One gate is shared by v1
+	// and every facade: they cost the same fan-out.
+	ListGate *apihttp.Gate
 }
 
 // Route returns h behind authenticate → authorize(perm) → audit seam
