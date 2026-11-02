@@ -268,7 +268,7 @@ With `SB_ENTERPRISE_MODE=true`:
 
 - `SB_SECRET_PROVIDER_STRICT_BOOT` must be `true` for every key store, so a server that cannot reach yours does not start.
 - A PKCS#11 token that is not real hardware is refused.
-- A server key in a plain file next to a key store logs a warning at start and fires `SandboxdServerKeyPlaintext`. The next release refuses it.
+- A server key in a plain file next to a key store is refused. [Wrap the server key](#wrap-the-server-key) first: `sandboxd key` still runs on such a server, so the wrap works while AerolVM is stopped.
 
 ## Good to know
 

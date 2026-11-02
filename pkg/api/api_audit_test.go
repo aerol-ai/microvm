@@ -27,6 +27,7 @@ import (
 	"github.com/aerol-ai/microvm/pkg/caddy"
 	"github.com/aerol-ai/microvm/pkg/controlplane"
 	"github.com/aerol-ai/microvm/pkg/models"
+	"github.com/aerol-ai/microvm/pkg/secrets"
 	"github.com/aerol-ai/microvm/pkg/sshgateway"
 )
 
@@ -80,8 +81,15 @@ func (s *recSink) waitRecords(t *testing.T, n int) []auditlog.Event {
 // records land in a recSink.
 func auditServer(t *testing.T, svcCfg config.Config, sandboxes ...*models.Sandbox) (*Server, *recSink, *service.Service) {
 	t.Helper()
+	return auditServerWithKey(t, svcCfg, nil, sandboxes...)
+}
+
+// auditServerWithKey is auditServer whose service holds cipher as its
+// server key (nil: none).
+func auditServerWithKey(t *testing.T, svcCfg config.Config, cipher *secrets.Cipher, sandboxes ...*models.Sandbox) (*Server, *recSink, *service.Service) {
+	t.Helper()
 	st := storeWith(t, "audit", sandboxes...)
-	svc := service.New(svcCfg, discardLogger(), st, nil, nil, nil, nil, nil, nil)
+	svc := service.New(svcCfg, discardLogger(), st, nil, nil, nil, cipher, nil, nil)
 	sink := &recSink{}
 	svc.UseAuditSinkForTest(sink)
 	srv := NewServer(discardLogger(), svc, nil, nil, config.Config{IdentityEnabled: true}, "pat-token", nil,
@@ -526,35 +534,47 @@ func recordCall(srv *Server, perm controlplane.Permission, pattern string, value
 }
 
 // TestAPIRecordExecDigest: an exec body is hashed as the handler reads it,
-// never buffered; with SB_AUDIT_EXEC_COMMAND=full the argv is recorded
-// too, never the environment.
+// never buffered, and recorded as a keyed digest; with
+// SB_AUDIT_EXEC_COMMAND=full the argv is recorded too, never the
+// environment. Without a usable server key the call is recorded with no
+// digest at all.
 func TestAPIRecordExecDigest(t *testing.T) {
 	body := `{"command":["sh","-c","echo hi"],"env":{"API_KEY":"sk-secret"}}`
 	sum := sha256.Sum256([]byte(body))
+	key := newExecDigestKey(t, 1)
+	keyed := mustExecDigest(t, key, body)
 	readAll := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.Copy(io.Discard, r.Body)
 		w.WriteHeader(http.StatusOK)
 	})
 	pattern := "POST /v1/sandboxes/{id}/toolbox/{path...}"
 	values := map[string]string{"id": "sb-1", "path": "process/execute"}
+	revoked := newExecDigestKey(t, 1)
+	revoked.Revoke()
 	for _, tc := range []struct {
 		name     string
 		cfg      config.Config
+		key      *secrets.Cipher
 		handler  http.Handler
 		wantSum  string
 		wantArgv []string
 	}{
-		{"digest only by default", config.Config{}, readAll, hex.EncodeToString(sum[:]), nil},
-		{"full adds the argv, not the env", config.Config{AuditExecCommand: config.AuditExecCommandFull}, readAll, hex.EncodeToString(sum[:]), []string{"sh", "-c", "echo hi"}},
-		{"a body the handler never read has no digest", config.Config{}, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNotFound) }), "", nil},
+		{"digest only by default", config.Config{}, key, readAll, keyed, nil},
+		{"full adds the argv, not the env", config.Config{AuditExecCommand: config.AuditExecCommandFull}, key, readAll, keyed, []string{"sh", "-c", "echo hi"}},
+		{"a body the handler never read has no digest", config.Config{}, key, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNotFound) }), "", nil},
+		{"no server key: recorded with no digest", config.Config{}, nil, readAll, "", nil},
+		{"a revoked server key: recorded with no digest", config.Config{AuditExecCommand: config.AuditExecCommandFull}, revoked, readAll, "", []string{"sh", "-c", "echo hi"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			srv, sink, _ := auditServer(t, tc.cfg)
+			srv, sink, _ := auditServerWithKey(t, tc.cfg, tc.key)
 			req := httptest.NewRequest("POST", "/v1/sandboxes/sb-1/toolbox/process/execute", strings.NewReader(body))
 			recordCall(srv, controlplane.PermSandboxExec, pattern, values, req, httptest.NewRecorder(), tc.handler)
 			got := sink.records()
 			if len(got) != 1 || got[0].Request.Digest != tc.wantSum || !slices.Equal(got[0].Request.Argv, tc.wantArgv) {
 				t.Fatalf("records = %+v", got)
+			}
+			if d := got[0].Request.Digest; d == hex.EncodeToString(sum[:]) || strings.Contains(d, hex.EncodeToString(sum[:])) {
+				t.Fatal("the record holds the plain SHA-256 of the body")
 			}
 			if strings.Contains(strings.Join(got[0].Request.Argv, " "), "sk-secret") {
 				t.Fatal("the environment reached the record")
@@ -585,7 +605,7 @@ func TestAPIRecordExecDigest(t *testing.T) {
 			t.Error("a body cut at the capture cap must yield no argv")
 		}
 		var nilBody *digestBody
-		if nilBody.digest() != "" || nilBody.argv() != nil {
+		if nilBody.digest(cipherDigester{key}) != "" || nilBody.argv() != nil {
 			t.Error("nil digest body")
 		}
 	})

@@ -111,18 +111,36 @@ func OverlapCreateAndPromote(
 		return svc.CreateSandboxWithID(ctx, req, reservationID)
 	}
 
+	// One create of an id runs on this node at a time, from here through the
+	// promote or the retract (service create_lease.go). A failed leg retracts
+	// the reservation and destroys the sandbox under its id, so a second
+	// create of the id running alongside — an Idempotency-Key retry routed
+	// here while the first is still pulling its image — would, on failing,
+	// tear down the first. It waits instead, bounded by ctx and the create
+	// timeout, and then sees what the first left. A different request under
+	// the key is refused at once, before the replay below and before either
+	// leg. The create leg's CreateSandboxWithID joins this lease.
+	ctx, release, err := svc.BeginSandboxCreate(ctx, reservationID, req.CreateRequestDigests)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+
 	// Idempotent replay: if a sandbox already exists locally under this id, the
 	// create + promote already happened. This path is reached when an
 	// Idempotency-Key retry (or a lost-ack retry) hits the reservation-conflict
 	// replay in Prepare, which routes the retry back here with the existing id
-	// once the sandbox is already Placed. Re-binding its (now consumed)
-	// reservation would fail with "reserved placement is no longer
-	// authoritative", so return the existing sandbox instead. The id is
-	// owner-namespaced for derived keys, so GetSandbox only matches the caller's
-	// own sandbox; a not-yet-created concurrent reservation falls through to the
-	// normal create+promote below.
+	// once the sandbox is already Placed, and when a retry waited above for
+	// the create it repeats. Re-binding its (now consumed) reservation would
+	// fail with "reserved placement is no longer authoritative", so return
+	// the existing sandbox instead. The id is owner-namespaced for derived
+	// keys, so GetSandbox only matches the caller's own sandbox; when nothing
+	// is here yet this create runs the normal create+promote below, and when
+	// the create it waited for failed, its retract already cancelled the
+	// reservation, so the binding below answers ErrReservedPlacementGone
+	// (503): the client's next retry reserves afresh.
 	if existing, err := svc.GetSandbox(ctx, reservationID); err == nil && existing != nil {
-		return &models.CreateSandboxResponse{Sandbox: *existing}, nil
+		return &models.CreateSandboxResponse{Sandbox: *existing, Replayed: true}, nil
 	}
 
 	// Platform volumes: the seal and the promoted spec need concrete
@@ -158,10 +176,16 @@ func OverlapCreateAndPromote(
 		}
 		// No local side effect has started. Release only this reservation; its
 		// incarnation-fenced CancelReservation implementation makes a delayed
-		// cleanup harmless after ID reuse.
-		if err := c.CancelReservation(commitCtx, reservationID); err != nil && logger != nil {
-			logger.Warn("cluster: cancel reservation after binding failure",
-				"sandbox_id", reservationID, "err", err)
+		// cleanup harmless after ID reuse. A reservation this node does not
+		// hold (gone, expired, another node's) is not this request's to
+		// cancel: CancelReservation cancels whatever reservation of the id is
+		// current, and after a retry waited out a failed create of the id
+		// that may already be the client's next retry's.
+		if !errors.Is(bindingErr, service.ErrReservedPlacementGone) {
+			if err := c.CancelReservation(commitCtx, reservationID); err != nil && logger != nil {
+				logger.Warn("cluster: cancel reservation after binding failure",
+					"sandbox_id", reservationID, "err", err)
+			}
 		}
 		return nil, &OverlapFailure{Phase: OverlapPhaseSeal, Err: bindingErr}
 	}

@@ -304,6 +304,9 @@ func TestEnsureWasmSandboxRowForImport_CreatesNewRow(t *testing.T) {
 			NetworkBlockAll:    true,
 			NetworkAllowOut:    []string{"10.0.0.0/24"},
 			AllowPublicTraffic: &deny,
+			// A keyed create's digest rides the spec, so the imported row
+			// still refuses a reused key.
+			CreateRequestDigests: []string{"hmac:0:import"},
 		},
 	}
 	svc.cfg.EnableCluster = true
@@ -325,6 +328,9 @@ func TestEnsureWasmSandboxRowForImport_CreatesNewRow(t *testing.T) {
 	}
 	if got.ModuleRef != "sha256:abcd" {
 		t.Fatalf("module_ref = %s", got.ModuleRef)
+	}
+	if digest, err := st.GetCreateRequestDigest(ctx, "sb-import-1"); err != nil || digest != "hmac:0:import" {
+		t.Fatalf("imported create digest = %q, %v", digest, err)
 	}
 	if got.AllowPublicTraffic == nil || *got.AllowPublicTraffic {
 		t.Fatalf("AllowPublicTraffic = %v, want false", got.AllowPublicTraffic)

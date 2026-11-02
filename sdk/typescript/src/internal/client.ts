@@ -7,6 +7,7 @@ import {
   sandboxCustomDomainPath as v1SandboxCustomDomainPath,
   sandboxCustomDomainsPath as v1SandboxCustomDomainsPath,
 } from "./api/v1/paths.js";
+import { MicroVMApiError } from "../errors.js";
 import { Image } from "../Image.js";
 import type {
   AddCustomDomainOptions,
@@ -500,6 +501,23 @@ interface RequestOptions {
    * retry.
    */
   idempotent?: boolean;
+  /** Extra request headers, sent unchanged on every retry. */
+  headers?: Record<string, string>;
+}
+
+/**
+ * The header a sandbox create carries so the server can recognise a retry of
+ * it. Keep in sync with clustercreate.HeaderIdempotencyKey on the server.
+ */
+export const IDEMPOTENCY_KEY_HEADER = "Idempotency-Key";
+
+/** A fresh create key: 128 random bits as 32 lowercase hex characters. */
+export function newIdempotencyKey(): string {
+  // getRandomValues, unlike randomUUID, also works on a page served over
+  // plain http.
+  const bytes = new Uint8Array(16);
+  globalThis.crypto.getRandomValues(bytes);
+  return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
 }
 
 /** Default retry settings when the caller doesn't supply a RetryConfig. */
@@ -714,7 +732,13 @@ export class APIClient {
 
   async create(options: CreateOptions): Promise<SandboxResource> {
     const resolved = await this.resolveImage(options);
-    const response = await this.doJSON<ApiCreateSandboxResponse>("POST", this.versioned("/sandboxes"), toApiCreateOptions(resolved));
+    // One key per call, sent unchanged on each of its automatic retries: a
+    // create retried after a timeout gets back the sandbox the first attempt
+    // made instead of making a second one.
+    const key = options.idempotencyKey?.trim() || newIdempotencyKey();
+    const response = await this.doJSON<ApiCreateSandboxResponse>("POST", this.versioned("/sandboxes"), toApiCreateOptions(resolved), {
+      headers: { [IDEMPOTENCY_KEY_HEADER]: key },
+    });
     return new SandboxResource(this, fromApiCreateSandboxResponse(response));
   }
 
@@ -1369,12 +1393,10 @@ export class APIClient {
   }
 
   private async doJSON<T>(method: string, path: string, body?: unknown, options?: RequestOptions): Promise<T> {
-    const init: RequestInit = {};
+    const init: RequestInit = { headers: { ...options?.headers } };
     if (body !== undefined) {
       init.body = JSON.stringify(body);
-      init.headers = {
-        "Content-Type": "application/json",
-      };
+      init.headers = { ...init.headers, "Content-Type": "application/json" };
     }
 
     const response = await this.request(method, path, init, options);
@@ -2148,16 +2170,19 @@ function toBlob(data: BinaryLike): Blob {
   return new Blob([Uint8Array.from(data)]);
 }
 
-async function decodeError(response: Response): Promise<Error> {
+async function decodeError(response: Response): Promise<MicroVMApiError> {
+  const retryAfterMs = parseRetryAfter(response.headers.get("retry-after"), Date.now());
   try {
-    const payload = (await response.json()) as { error?: string };
+    const payload = (await response.json()) as { error?: unknown; code?: unknown };
     if (typeof payload.error === "string" && payload.error !== "") {
-      return new Error(payload.error);
+      const code = typeof payload.code === "string" && payload.code !== "" ? payload.code : undefined;
+      return new MicroVMApiError(response.status, payload.error, { code, retryAfterMs });
     }
   } catch {
-    // Fall through to status-based error.
+    // Not JSON (a proxy's error page) or no body: fall through to the
+    // status-based message, with no code.
   }
-  return new Error(`request failed with status ${response.status}`);
+  return new MicroVMApiError(response.status, `request failed with status ${response.status}`, { retryAfterMs });
 }
 
 const STREAM_PREFIX_STDOUT = 0x01;

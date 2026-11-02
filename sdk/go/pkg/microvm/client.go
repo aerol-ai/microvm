@@ -131,8 +131,24 @@ func NewClientWithConfig(config *sdktypes.MicroVMConfig) (*Client, error) {
 	}, nil
 }
 
+// Create creates a sandbox. It sends a random Idempotency-Key, made once
+// for this call and sent unchanged on each of its automatic retries, so a
+// create retried after a timeout gets back the sandbox the first attempt
+// made instead of making a second one. Use CreateWithIdempotencyKey to
+// choose the key.
 func (c *Client) Create(ctx context.Context, opts sdktypes.CreateSandboxOptions) (*Sandbox, error) {
-	item, sshPrivateKey, err := c.inner.Create(ctx, opts)
+	return c.CreateWithIdempotencyKey(ctx, opts, "")
+}
+
+// CreateWithIdempotencyKey is Create with key as the Idempotency-Key. A
+// create sent again with the same key and the same options returns the
+// sandbox the first one made instead of making a second, so your own
+// retries of the whole call are safe too, such as after your process
+// restarts. The same key with different options fails with an *APIError
+// whose Code is "idempotency_key_reused" (HTTP 422). Keys are scoped to the
+// caller's account. A blank key gets a random one, as Create does.
+func (c *Client) CreateWithIdempotencyKey(ctx context.Context, opts sdktypes.CreateSandboxOptions, key string) (*Sandbox, error) {
+	item, sshPrivateKey, err := c.inner.CreateWithIdempotencyKey(ctx, opts, key)
 	if err != nil {
 		return nil, err
 	}

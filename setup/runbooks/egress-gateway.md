@@ -290,6 +290,14 @@ reads it for the internal zone, its copy of the floor and the proxy.
   guards. Check the host copies with `sudo iptables -S | grep AEROLVM-FLOOR-`:
   a node running containers and Firecracker guests has one chain for each.
   A plain `AEROLVM-FLOOR` chain is an older daemon's, emptied at boot.
+  The cloud metadata endpoints are on the floor with or without a file.
+  The `aerolvm_egress_floor_ready` expvar is 1 per runtime that has the
+  current floor. sandboxd re-asserts it every 30 s and puts back a chain,
+  jump or rule something removed. A runtime where it cannot be installed
+  (or where a changed file's floor failed to go in) refuses creates with
+  503 `egress_floor_not_ready`, logs why, and is retried every 5 s. With
+  network rules off (local mode) there is no floor; creates are allowed
+  outside enterprise mode and the boot log says so.
 - **Control-port guard (`node_control_port_guard`, on by default when a file
   is present).** Sandboxes cannot open TCP connections to any cluster
   member's API, SSH gateway, Raft, gossip or cluster mTLS port, including

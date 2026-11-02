@@ -205,7 +205,7 @@ func TestCreateBetweenRowAndStateAnswersFromTheCreate(t *testing.T) {
 	t.Cleanup(func() { createHold = old })
 
 	body := `{"name":"slow","blueprint_name":"python","metadata":{"team":"sdk"}}`
-	id := devboxIDForRequest("", "req-window", []byte(body))
+	id := env.devboxID(t, "", "req-window", body)
 	blob := devboxBlob{Name: "slow", BlueprintID: "python"}
 	f, sandbox := stopCreateBetweenWrites(t, env, id, blob, map[string]string{"team": "sdk"})
 
@@ -263,7 +263,7 @@ func TestCreateBetweenRowAndStateAnswersFromTheCreate(t *testing.T) {
 // failure the create returned, never as a running devbox.
 func TestFailedCreateOutranksItsLeftoverRow(t *testing.T) {
 	env := newTestEnv(t)
-	id := devboxIDForRequest("", "req-failed", []byte(`{"name":"doomed"}`))
+	id := env.devboxID(t, "", "req-failed", `{"name":"doomed"}`)
 	f, _ := stopCreateBetweenWrites(t, env, id, devboxBlob{Name: "doomed"}, nil)
 	env.h.creates.finish(f, nil, errors.New("record placement failed"))
 

@@ -2,6 +2,7 @@ package apihttp
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -31,6 +32,9 @@ func TestSlotPoolExhaustionClassifiesAsCapacity(t *testing.T) {
 		{"containerd netns", fmt.Errorf("provision netns: %w", store.ErrNoFreeContainerNetnsSlot), "container netns pool"},
 		{"firecracker tap", fmt.Errorf("firecracker runtime: tap allocate: %w", store.ErrNoFreeFirecrackerTapSlot), "firecracker tap pool"},
 		{"isolate egress", fmt.Errorf("isolate: %w", isolate.ErrEgressPoolExhausted), "isolate egress pool"},
+		{"docker bridge admission", fullDockerBridgeAdmit(t), capacity.DockerBridgePool},
+		// The backstop: dockerd refused the start on a full bridge.
+		{"docker bridge exchange full", capacity.AsNetworkSlotExhausted(capacity.DockerBridgePool, errors.New(`start container: docker API POST /containers/c1/start failed with status 500: {"message":"failed to set up container networking: adding interface veth5f0e1a2 to bridge docker0 failed: exchange full"}`)), capacity.DockerBridgePool},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -55,6 +59,19 @@ func TestSlotPoolExhaustionClassifiesAsCapacity(t *testing.T) {
 			}
 		})
 	}
+}
+
+// fullDockerBridgeAdmit is the admitter's refusal on a full docker bridge.
+func fullDockerBridgeAdmit(t *testing.T) error {
+	t.Helper()
+	a := capacity.New(capacity.HostInfo{CPUCores: 4, MemoryTotalMB: 4096}, capacity.Limits{}, nil)
+	a.SetSlotLimit(capacity.SlotLimit{Name: capacity.SlotPoolDockerBridge, Pool: capacity.DockerBridgePool, Runtimes: []string{models.RuntimeDocker}, Total: 1})
+	a.Reserve("sb-1", capacity.Request{Runtime: models.RuntimeDocker})
+	err := a.Admit("sb-2", capacity.Request{Runtime: models.RuntimeDocker})
+	if err == nil {
+		t.Fatal("admit on a full docker bridge succeeded")
+	}
+	return err
 }
 
 // Every worker full is a 503 like "no target", and its message says capacity.

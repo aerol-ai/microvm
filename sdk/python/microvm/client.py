@@ -6,6 +6,7 @@ import importlib
 import json
 import os
 import random
+import secrets
 import socket
 import threading
 import time
@@ -143,6 +144,15 @@ def _read_env(name: str) -> Optional[str]:
 # acts for. Keep in sync with pkg/api.HeaderTeam on the server.
 TEAM_HEADER = "X-AerolVM-Team"
 
+# The header a sandbox create carries so the server can recognise a retry of
+# it. Keep in sync with clustercreate.HeaderIdempotencyKey on the server.
+IDEMPOTENCY_KEY_HEADER = "Idempotency-Key"
+
+
+def _new_idempotency_key() -> str:
+    """A fresh create key: 128 random bits as 32 lowercase hex characters."""
+    return secrets.token_hex(16)
+
 
 class MicroVMError(Exception):
     pass
@@ -150,9 +160,14 @@ class MicroVMError(Exception):
 
 class MicroVMHTTPError(MicroVMError):
     """An HTTP error response from sandboxd. ``str(err)`` is the server's
-    message. The other attributes are empty unless the server sent them:
+    message, or the HTTP reason phrase when the body is not the server's
+    JSON (a proxy's error page). ``status_code`` is the HTTP status. The
+    other attributes are empty unless the server sent them:
 
-    - ``code``: a stable error code a client can act on.
+    - ``code``: a stable error code a client can act on, such as
+      ``idempotency_key_reused`` or ``overloaded``.
+    - ``retry_after``: how many seconds the response's ``Retry-After``
+      header asked the caller to wait; ``None`` without a usable header.
     - ``reason``: why an avm_ API token or an OIDC token was refused
       (``expired``, ``unknown_or_revoked``, ``no_binding``, ...).
     - ``required_permission`` and ``role``: on a 403 for an API token or an
@@ -173,10 +188,12 @@ class MicroVMHTTPError(MicroVMError):
         issuer: str = "",
         name: str = "",
         groups: Optional[List[str]] = None,
+        retry_after: Optional[float] = None,
     ) -> None:
         super().__init__(message)
         self.status_code = status_code
         self.code = code
+        self.retry_after = retry_after
         self.reason = reason
         self.required_permission = required_permission
         self.role = role
@@ -185,14 +202,15 @@ class MicroVMHTTPError(MicroVMError):
         self.groups: List[str] = list(groups or [])
 
 
-def _http_error(status_code: int, data: Any, fallback: str) -> MicroVMHTTPError:
+def _http_error(status_code: int, data: Any, fallback: str, retry_after: Optional[float] = None) -> MicroVMHTTPError:
     """Builds the error for a decoded JSON error body."""
     if not isinstance(data, dict):
-        return MicroVMHTTPError(status_code, fallback)
+        return MicroVMHTTPError(status_code, fallback, retry_after=retry_after)
     groups = data.get("groups")
     return MicroVMHTTPError(
         status_code,
         str(data.get("error", fallback)),
+        retry_after=retry_after,
         code=str(data.get("code") or ""),
         reason=str(data.get("reason") or ""),
         required_permission=str(data.get("required_permission") or ""),
@@ -629,7 +647,16 @@ class MicroVM:
         # keyword replaces the same key in the dict.
         resolved_options: Dict[str, Any] = {**(options or {}), **fields}
         resolved_options["image"] = self._resolve_image(_first_of(resolved_options, "image"))
-        sandbox = self._do_json("POST", self._versioned("/sandboxes"), _to_api_create_options(resolved_options))
+        # One key per call, sent unchanged on each of its automatic retries: a
+        # create retried after a timeout gets back the sandbox the first
+        # attempt made instead of making a second one.
+        key = str(_first_of(resolved_options, "idempotency_key", "idempotencyKey") or "").strip() or _new_idempotency_key()
+        sandbox = self._do_json(
+            "POST",
+            self._versioned("/sandboxes"),
+            _to_api_create_options(resolved_options),
+            headers={IDEMPOTENCY_KEY_HEADER: key},
+        )
         return self._wrap_sandbox(sandbox)
 
     def build_image(self, image: Image) -> str:
@@ -1403,6 +1430,7 @@ class MicroVM:
                     # Free the socket before the backoff sleep.
                     exc.close()
                 else:
+                    wait = _parse_retry_after(exc.headers.get("Retry-After"), time.time()) if exc.headers is not None else None
                     try:
                         payload = exc.read()
                     finally:
@@ -1410,8 +1438,8 @@ class MicroVM:
                     try:
                         data = json.loads(payload.decode("utf-8"))
                     except (ValueError, TypeError):
-                        raise MicroVMHTTPError(exc.code, str(exc.reason)) from exc
-                    raise _http_error(exc.code, data, str(exc.reason)) from exc
+                        raise MicroVMHTTPError(exc.code, str(exc.reason), retry_after=wait) from exc
+                    raise _http_error(exc.code, data, str(exc.reason), wait) from exc
             except urllib.error.URLError as exc:
                 last_exc = exc
                 if attempt >= max_retries or not (idempotent or _request_never_sent(exc)):
@@ -1452,8 +1480,17 @@ class MicroVM:
         upper = min(target * 1.2, limit)
         return target + (upper - target) * rand
 
-    def _do_json(self, method: str, path: str, payload: Optional[Dict[str, Any]], *, idempotent: bool = True) -> Any:
-        data, _ = self._do_json_headers(method, path, payload, idempotent=idempotent)
+    def _do_json(
+        self,
+        method: str,
+        path: str,
+        payload: Optional[Dict[str, Any]],
+        *,
+        idempotent: bool = True,
+        headers: Optional[Dict[str, str]] = None,
+    ) -> Any:
+        """``headers`` are extra request headers, sent unchanged on every retry."""
+        data, _ = self._do_json_headers(method, path, payload, idempotent=idempotent, headers=headers)
         return data
 
     def _do_json_headers(
@@ -1463,16 +1500,19 @@ class MicroVM:
         payload: Optional[Dict[str, Any]],
         *,
         idempotent: bool = True,
+        headers: Optional[Dict[str, str]] = None,
     ) -> tuple[Any, Dict[str, str]]:
         body = None
         content_type = None
         if payload is not None:
             body = json.dumps(payload).encode("utf-8")
             content_type = "application/json"
-        raw, headers = self._request_headers(method, self._url(path), body, content_type, idempotent=idempotent)
+        raw, response_headers = self._request_headers(
+            method, self._url(path), body, content_type, headers, idempotent=idempotent
+        )
         if raw == b"":
-            return {}, headers
-        return json.loads(raw.decode("utf-8")), headers
+            return {}, response_headers
+        return json.loads(raw.decode("utf-8")), response_headers
 
     def _do_multipart(
         self,

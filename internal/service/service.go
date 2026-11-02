@@ -442,6 +442,9 @@ type Service struct {
 	// createsInFlight is the sandbox IDs whose create is running, which the
 	// reconcile orphan sweep skips (create_inflight.go).
 	createsInFlight createsInFlight
+	// createLeases holds, per sandbox ID, the one create of it running on
+	// this node; a second create of the ID waits for it (create_lease.go).
+	createLeases createLeases
 	// reconcileUnknown tracks sandboxes whose runtime could not say whether
 	// they exist, pass after pass (reconcile_unknown.go).
 	reconcileUnknown reconcileUnknownTracker
@@ -485,6 +488,10 @@ type Service struct {
 	// nodeGuard is the node guard's state: what each runtime got, and the
 	// per-runtime result the create gate reads (node_guard.go).
 	nodeGuard nodeGuardState
+	// egressFloor is the host-firewall deny floor's state: the floor each
+	// runtime got, and the per-runtime result the create gate reads
+	// (egress_floor.go).
+	egressFloor egressFloorState
 	// egressPolicyLocks serializes live policy updates per sandbox (§5.8).
 	egressPolicyLocks egressPolicyLocks
 	// egressProfileKick wakes SuperviseEgressProfiles after a profile change
@@ -743,6 +750,10 @@ type Service struct {
 	// testForceUnmountErr, when non-nil, replaces the UnmountAll result in
 	// DestroySandbox so the warn arm is reachable offline. Nil in production.
 	testForceUnmountErr error
+	// testCreateLeaseWait, when >0, replaces createLeaseWait so a test can
+	// reach a waiter's ErrCreateInProgress without waiting out the create
+	// timeout. Zero in production.
+	testCreateLeaseWait time.Duration
 	// testSecretPeerPusher overrides cluster secret fan-out in tests. Nil in
 	// production (SealAndDistribute type-asserts the live Cluster/Agent).
 	testSecretPeerPusher cluster.SecretPeerPusher
@@ -1304,25 +1315,46 @@ func (s *Service) noteSandboxCreated(ctx context.Context, resp *models.CreateSan
 // Idempotent at the cluster boundary — if a sandbox with this ID already
 // exists locally we return the existing record without touching docker. Used
 // by the cluster owner watcher to re-materialize a sandbox after its previous
-// owner died.
+// owner died, and by every create that derives its ID (Idempotency-Key, E2B,
+// Runloop).
+//
+// It holds the ID's create lease (create_lease.go) from before it looks for
+// the row until the create's rollback has run, so a second create of the ID
+// on this node waits for this one and then replays its sandbox, or creates
+// afresh when this one failed, instead of running a second create whose
+// failure would undo this one's reservation and mounts.
 func (s *Service) CreateSandboxWithID(ctx context.Context, req models.CreateSandboxRequest, id string) (*models.CreateSandboxResponse, error) {
 	if id == "" {
 		return nil, errors.New("CreateSandboxWithID: id required")
 	}
-	if existing, err := s.store.Get(ctx, id); err == nil && existing != nil {
+	// An Idempotency-Key create replays only the request it was made with
+	// (keyed_create.go): a different one is refused here, before anything is
+	// created, when a create of the ID is running, and below when the
+	// sandbox exists.
+	ctx, release, err := s.beginCreateLease(ctx, id, req.CreateRequestDigests)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+	if existing, getErr := s.store.Get(ctx, id); getErr == nil && existing != nil {
 		// The fast path returns a fully-hydrated row — toolbox token included
 		// — so it must never answer a caller that does not own it. A facade
 		// deriving the ID from request content (E2B) would otherwise let any
 		// tenant reclaim another tenant's ID and be handed its credentials.
 		// enforceOwner passes for the owner-watcher / internal recreate path,
 		// which carries no Access and legitimately re-materializes any row.
+		// It answers before the digest check, so a digest says nothing about
+		// another tenant's sandbox.
 		if err := enforceOwner(ctx, existing); err != nil {
 			return nil, fmt.Errorf("%w: sandbox id is already in use", models.ErrSandboxExists)
+		}
+		if err := s.checkStoredCreateDigest(ctx, id); err != nil {
+			return nil, err
 		}
 		// Already present locally — recreate is a no-op. The watcher tick that
 		// noticed the FSM-only entry must have raced with a local create.
 		auditlog.NoteSandboxIdentity(ctx, id, existing.AuditIncarnationID, existing.OwnerRef)
-		return &models.CreateSandboxResponse{Sandbox: *existing}, nil
+		return &models.CreateSandboxResponse{Sandbox: *existing, Replayed: true}, nil
 	}
 	resp, err := s.createSandbox(ctx, req, id)
 	s.noteSandboxCreated(ctx, resp)
@@ -1813,6 +1845,19 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 		if err := models.ValidateSandboxID(idOverride); err != nil {
 			return nil, err
 		}
+		// Every per-ID side effect below (admission, mounts, the runtime's
+		// names, routes, rows) assumes it is the only create of this ID:
+		// hold the ID's create lease (create_lease.go) before the first of
+		// them and until the last rollback has run. CreateSandboxWithID
+		// already holds it, so this take joins it; it is here so no caller
+		// can reach the side effects without it. A generated ID cannot
+		// collide and needs no lease.
+		var release func()
+		ctx, release, err = s.beginCreateLease(ctx, idOverride, req.CreateRequestDigests)
+		if err != nil {
+			return nil, err
+		}
+		defer release()
 	}
 	// Bound the entire create operation so a stalled image pull or a slow
 	// registry cannot block a goroutine forever. 0 disables the guard.
@@ -1982,6 +2027,12 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 	// install, since it could reach every service on the node. One atomic
 	// map read (node_guard.go).
 	if err := s.requireNodeGuard(chosenRuntime); err != nil {
+		return nil, err
+	}
+	// Fail closed: no sandbox on a runtime whose egress deny floor is not
+	// installed, since it could reach the cloud metadata endpoints and the
+	// node's credentials. One atomic map read (egress_floor.go).
+	if err := s.requireEgressFloor(chosenRuntime); err != nil {
 		return nil, err
 	}
 	if hasBinariesRule(req.NetworkEgressRules) && chosenRuntime == models.RuntimeGvisor {
@@ -2188,15 +2239,9 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 	// > 0 by normalizeCreateRequest above), so a default-sized request still
 	// counts against the host budget. Reservation happens here; every failure
 	// path below must release it.
-	if s.admitter != nil {
-		if err := s.admitter.Admit(sandboxID, capacityRequestFromCreate(req)); err != nil {
-			return nil, err
-		}
-	}
-	releaseAdmission := func() {
-		if s.admitter != nil {
-			s.admitter.Release(sandboxID)
-		}
+	releaseAdmission, err := s.admitCreate(sandboxID, req)
+	if err != nil {
+		return nil, err
 	}
 
 	prepareStart := time.Now()
@@ -2243,8 +2288,13 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 		releaseAdmission()
 		return nil, fmt.Errorf("mount external storage: %w", err)
 	}
+	// The ID's mount set is this create's only if it made one: MountAll
+	// refuses an ID whose mounts are established, and a create without
+	// mounts made none. Tearing down rootDir/<id> otherwise would unmount
+	// the storage of whatever holds the ID.
+	mountedHere := len(req.Mounts) > 0
 	cleanupMounts := func() {
-		if s.mounts == nil {
+		if s.mounts == nil || !mountedHere {
 			return
 		}
 		err := s.mounts.UnmountAll(sandboxID)
@@ -2344,15 +2394,24 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 		// A driver that reported the address and failed let it go through
 		// ReleasingAddress; this covers one that didn't.
 		early.undo()
+		// A name collision (ErrSandboxContainerExists) means another
+		// instance holds the ID. This create still releases only what it
+		// made: releaseAdmission and cleanupMounts are no-ops for a
+		// reservation or a mount set it found in place (admitCreate,
+		// mountedHere), on the replay exit as on every other.
 		cleanupMounts()
 		if resp, dupErr := s.handleDuplicateCreateAfterRuntime(ctx, sandboxID, err); dupErr == nil {
+			releaseAdmission()
 			return resp, nil
 		} else if !errors.Is(dupErr, err) {
 			releaseAdmission()
 			return nil, dupErr
 		}
 		releaseAdmission()
-		return nil, err
+		// A bridge or subnet that filled past the counted pool (a port
+		// taken without a reservation) is still capacity, not a fault: the
+		// driver removed what it created, and the API answers 503.
+		return nil, capacity.AsNetworkSlotExhausted(networkSlotPool(chosenEngine), err)
 	}
 	s.releaseAdoptedParkReservation(state)
 	if gatewayMode {
@@ -2455,10 +2514,14 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 	persistStart := time.Now()
 	sandbox.OwnerRef = ownerRef
 	if err := s.persistSandboxCreate(ctx, sandbox); err != nil {
-		_ = s.deleteSandboxPublicRoutes(rollback.Context(), sandbox)
+		// ErrSandboxExists: a row holds the ID, and with it the ID's public
+		// route, reservation and mounts. This create releases only what it
+		// made (admitCreate, mountedHere) and puts the route back.
+		s.rollbackCreatePublicRoutes(rollback.Context(), sandbox, errors.Is(err, models.ErrSandboxExists))
 		rollbackDestroy(sandbox)
 		cleanupMounts()
 		if resp, dupErr := s.handleDuplicateStoreCreate(ctx, sandbox.ID, err); dupErr == nil {
+			releaseAdmission()
 			return resp, nil
 		} else if !errors.Is(dupErr, err) {
 			releaseAdmission()
@@ -2684,15 +2747,9 @@ func (s *Service) createFirecrackerSandbox(ctx context.Context, req models.Creat
 	// Admission check mirrors the docker path. The capacity model is
 	// runtime-agnostic — a firecracker VMM's vCPU/memory footprint
 	// is counted the same way as a docker container's.
-	if s.admitter != nil {
-		if err := s.admitter.Admit(sandboxID, capacityRequestFromCreate(req)); err != nil {
-			return nil, err
-		}
-	}
-	releaseAdmission := func() {
-		if s.admitter != nil {
-			s.admitter.Release(sandboxID)
-		}
+	releaseAdmission, err := s.admitCreate(sandboxID, req)
+	if err != nil {
+		return nil, err
 	}
 
 	// Dispatch into the firecracker driver. The driver's Create owns
@@ -2977,6 +3034,9 @@ func (s *Service) attachWasmRegistryAuth(ctx context.Context, sandbox *models.Sa
 func (s *Service) persistSandboxCreate(ctx context.Context, sandbox *models.Sandbox) error {
 	if s == nil || s.store == nil {
 		return errors.New("store is not configured")
+	}
+	if digests := createRequestDigestsFrom(ctx); sandbox.CreateRequestDigest == "" && len(digests) > 0 {
+		sandbox.CreateRequestDigest = digests[0]
 	}
 	if strings.TrimSpace(sandbox.AuditIncarnationID) == "" {
 		incarnationID, err := s.prepareAuditIncarnation(ctx, sandbox.ID, sandbox.ToolboxToken)
@@ -3480,6 +3540,13 @@ func (s *Service) StartSandbox(ctx context.Context, id string) (*models.Sandbox,
 		if err != nil {
 			_ = s.mounts.UnmountAll(id)
 			releaseAdmission()
+			if capacity.IsNetworkExhaustion(err) {
+				// A full bridge refused the start the way admission
+				// would have: the sandbox is still stopped and a retry
+				// can start it, so it is not marked error.
+				s.invalidateWarm(id)
+				return nil, capacity.AsNetworkSlotExhausted(networkSlotPool(models.SandboxEngine(sandbox)), err)
+			}
 			_ = s.store.UpdateStatus(ctx, id, models.SandboxStatusError, err.Error())
 			s.invalidateWarm(id)
 			return nil, err

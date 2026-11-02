@@ -19,7 +19,7 @@ type fanOutCluster struct{ *cluster.Noop }
 // slot on the node that fanned out (refusing it would only make that list
 // partial).
 func TestAdmitGatesOnlyListsThatFanOut(t *testing.T) {
-	gate := apihttp.NewGate(1, 0, apihttp.GateMetrics{})
+	gate := apihttp.NewGate(1, 0, 0, apihttp.GateMetrics{})
 	hold, err := gate.Acquire(context.Background())
 	if err != nil {
 		t.Fatal(err)

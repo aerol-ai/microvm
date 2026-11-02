@@ -106,7 +106,7 @@ func cover96_ptr_handlers(recv *handlers) {
 func cover96_funcs() {
 	cover96Call(func() { clusterListMode(zero96[*svcmetrics.Service](), zero96[*http.Request]()) }) // handlers.go:215
 	cover96Call(func() {
-		createRequestFingerprint(zero96[string](), zero96[string](), zero96[models.CreateSandboxRequest](), zero96[sandboxMeta]())
+		createRequestFingerprints(zero96[requestDigester](), zero96[string](), zero96[string](), zero96[models.CreateSandboxRequest](), zero96[sandboxMeta](), zero96[bool]())
 	}) // meta.go:317
 	cover96Call(func() { loadTemplateMap(zero96[string](), zero96[*slog.Logger]()) })                                    // handlers.go:1280
 	cover96Call(func() { parseMetadataFilter(zero96[string]()) })                                                        // handlers.go:1179

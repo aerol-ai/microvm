@@ -5,12 +5,14 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"math"
 	"sort"
 	"strings"
 	"time"
 
 	"github.com/aerol-ai/microvm/pkg/models"
+	"github.com/aerol-ai/microvm/pkg/secrets"
 )
 
 const (
@@ -27,6 +29,15 @@ const (
 	// fingerprints. Pick a stable string — changing it would
 	// disconnect in-flight retries from their original claims.
 	idempotencyScopeCreate = "e2b.create"
+	// createFingerprintPurpose separates the create fingerprint's keyed
+	// digest from every other use of the server key. Changing it changes
+	// every fingerprint and the sandbox IDs derived from them.
+	createFingerprintPurpose = "e2b.create-fingerprint/v1"
+	// legacyFingerprintWindow is how long after start a create still looks
+	// for a claim stored under the unkeyed fingerprint older servers used: a
+	// claim lives at most e2bCreatePendingTTL, so twice that covers every
+	// claim the previous process could have left.
+	legacyFingerprintWindow = 2 * e2bCreatePendingTTL
 	// metadataKeyServerless is the opt-in metadata key that flips a
 	// sandbox into AerolVM-native serverless mode (auto-stop on idle
 	// + wake on HTTP). E2B has no first-class serverless field, so
@@ -314,7 +325,63 @@ type createFingerprintPayload struct {
 	MaskRequestHost     string            `json:"maskRequestHost,omitempty"`
 }
 
-func createRequestFingerprint(ownerRef, templateID string, serviceReq models.CreateSandboxRequest, meta sandboxMeta) (string, error) {
+// createFingerprints are one create's idempotency fingerprints.
+type createFingerprints struct {
+	// current is the fingerprint under the server's current key: a new claim
+	// is made under it, and the deterministic sandbox ID comes from it.
+	current string
+	// earlier are fingerprints an earlier claim of the same create may sit
+	// under: one per other key the server holds (a key rotation in progress)
+	// and, for a short while after start, the unkeyed one older servers
+	// stored. They are looked up, never written or logged.
+	earlier []string
+}
+
+// requestDigester is the part of the service a fingerprint needs.
+type requestDigester interface {
+	RequestDigests(purpose string, data []byte) ([]secrets.KeyedDigest, error)
+}
+
+// createRequestFingerprints fingerprints a create for idempotency.
+//
+// The payload holds the create's env values, and the fingerprint is stored
+// in the idempotency table and its first 64 bits become the public sandbox
+// ID. A plain hash of it would let anyone holding either test guessed env
+// values offline, so the fingerprint is an HMAC under a key derived from the
+// server key ("hmac:<key id>:<hex>"): stable across restarts, the same on
+// every node that shares the key, and new only when the key is rotated.
+func createRequestFingerprints(d requestDigester, ownerRef, templateID string, serviceReq models.CreateSandboxRequest, meta sandboxMeta, withLegacy bool) (createFingerprints, error) {
+	if d == nil {
+		return createFingerprints{}, errors.New("create fingerprint needs the server key")
+	}
+	payload, err := createFingerprintPayloadJSON(ownerRef, templateID, serviceReq, meta)
+	if err != nil {
+		return createFingerprints{}, err
+	}
+	digests, err := d.RequestDigests(createFingerprintPurpose, payload)
+	if err != nil {
+		return createFingerprints{}, err
+	}
+	if len(digests) == 0 {
+		return createFingerprints{}, errors.New("create fingerprint: the server key ring is empty")
+	}
+	var out createFingerprints
+	for i, digest := range digests {
+		fp := digest.String()
+		if i == 0 {
+			out.current = fp
+			continue
+		}
+		out.earlier = append(out.earlier, fp)
+	}
+	if withLegacy {
+		sum := sha256.Sum256(payload)
+		out.earlier = append(out.earlier, "fingerprint:"+hex.EncodeToString(sum[:]))
+	}
+	return out, nil
+}
+
+func createFingerprintPayloadJSON(ownerRef, templateID string, serviceReq models.CreateSandboxRequest, meta sandboxMeta) ([]byte, error) {
 	payload := createFingerprintPayload{
 		OwnerRef:            strings.TrimSpace(ownerRef),
 		TemplateID:          strings.TrimSpace(templateID),
@@ -331,12 +398,7 @@ func createRequestFingerprint(ownerRef, templateID string, serviceReq models.Cre
 		AllowPublicTraffic:  meta.AllowPublicTraffic == nil || *meta.AllowPublicTraffic,
 		MaskRequestHost:     strings.TrimSpace(meta.MaskRequestHost),
 	}
-	encoded, err := json.Marshal(payload)
-	if err != nil {
-		return "", err
-	}
-	sum := sha256.Sum256(encoded)
-	return "fingerprint:" + hex.EncodeToString(sum[:]), nil
+	return json.Marshal(payload)
 }
 
 func sortedStringSlice(values []string) []string {

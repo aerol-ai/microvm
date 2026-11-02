@@ -164,12 +164,10 @@ func (c *Client) versioned(suffix string) string {
 // package.
 func (c *Client) versionedURL() string { return c.versionPrefix }
 
+// Create creates a sandbox under a fresh Idempotency-Key, the same on each
+// of this call's automatic retries (see CreateWithIdempotencyKey).
 func (c *Client) Create(ctx context.Context, opts CreateOptions) (*Sandbox, string, error) {
-	var response models.CreateSandboxResponse
-	if err := c.doJSON(ctx, http.MethodPost, c.versionPrefix+"/sandboxes", opts, &response); err != nil {
-		return nil, "", err
-	}
-	return c.wrap(response.Sandbox), response.SSHPrivateKey, nil
+	return c.CreateWithIdempotencyKey(ctx, opts, "")
 }
 
 // BuildImagePushSpec is the wire shape of the per-request push directive
@@ -1140,6 +1138,12 @@ func (c *Client) doJSON(ctx context.Context, method, path string, requestBody an
 }
 
 func (c *Client) doJSONHeaders(ctx context.Context, method, path string, requestBody any, responseBody any, policy retryPolicy) (http.Header, error) {
+	return c.doJSONRequest(ctx, method, path, requestBody, responseBody, policy, nil)
+}
+
+// doJSONRequest is doJSONHeaders with extra request headers, set on every
+// attempt so a retry carries them unchanged.
+func (c *Client) doJSONRequest(ctx context.Context, method, path string, requestBody any, responseBody any, policy retryPolicy, extra http.Header) (http.Header, error) {
 	var encoded []byte
 	var err error
 	if requestBody != nil {
@@ -1160,6 +1164,9 @@ func (c *Client) doJSONHeaders(ctx context.Context, method, path string, request
 		}
 		if encoded != nil {
 			request.Header.Set("Content-Type", "application/json")
+		}
+		for name, values := range extra {
+			request.Header[name] = values
 		}
 		c.addAuth(request)
 		return request, nil

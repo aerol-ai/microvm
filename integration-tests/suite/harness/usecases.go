@@ -109,8 +109,8 @@ const (
 	// the two pools are independent (netns slots hold no capacity
 	// reservations, so this one leaves the UC-95 density gate untouched).
 	CapDockerNetnsPool Capability = "docker-netns-pool"
-	// CapDockerEngine is consumed by run.sh's engine selection, not by any UC's
-	// Requires. It is an OPT-OUT: containerd is the DEFAULT engine for every
+	// CapDockerEngine is consumed by run.sh's engine selection, and by the one
+	// UC that reads dockerd's own image store (UC-364). It is an OPT-OUT: containerd is the DEFAULT engine for every
 	// scenario (run.sh writes SB_CONTAINER_ENGINE=containerd), and only a
 	// scenario advertising this cap runs dockerd instead. Exactly two do — the
 	// local dev install (local-mode) and the docker A/B benchmark baseline
@@ -252,6 +252,14 @@ const (
 	// cases run unchanged and so cover the balancer's path (and raw TCP on
 	// tcp.<domain>) too.
 	CapAPILoadBalancer Capability = "api-load-balancer"
+	// CapAPIListFairness: every node runs a list gate small enough that one
+	// tenant's list storm fills its per-tenant share (the scenario's
+	// extra_sandboxd_env sets SB_API_LIST_MAX_INFLIGHT and
+	// SB_API_LIST_MAX_INFLIGHT_PER_TENANT). A healthy list holds its slot for
+	// milliseconds, so the default 16 slots with 4 per tenant may never fill
+	// under the suite's client; gates UC-362, which asserts the noisy tenant
+	// is told 429.
+	CapAPIListFairness Capability = "api-list-fairness"
 )
 
 // UseCase is one row of the coverage matrix.
@@ -303,7 +311,7 @@ var KnownCapabilities = map[Capability]bool{
 	CapL4ProxyProtocol: true, CapPATRotation: true,
 	CapKeyCustodyVault: true, CapKeyCustodyPKCS11: true, CapKeyCustodyKMSWrapped: true,
 	CapKeyCustodyKMSSwitch: true, CapKeyCustodySingleWrapped: true,
-	CapAPILoadBalancer: true,
+	CapAPILoadBalancer: true, CapAPIListFairness: true,
 }
 
 // Registry is the full use-case catalogue. Order is the matrix row order.
@@ -913,6 +921,28 @@ var Registry = []UseCase{
 	// Overload is shed, never turned into an outage (overload_shed_test.go):
 	// the bank-flagship ramp's 1024-client list collapse and watchdog restart.
 	{ID: "UC-361", Title: "Overload: N concurrent clients (default 1024) listing sandboxes through the domain for 60 s get 200 or a refusal with Retry-After (503/429), never 502, another 5xx, a refused or reset connection or a request hung past 30 s; no sandboxd on any node restarts (InvocationID, NRestarts and the journal unchanged); and the list is back to its baseline latency within 60 s of the load stopping", Requires: []Capability{CapCluster, CapDomain}, Implemented: true},
+	// Per-tenant fairness for the list gate (list_fairness_test.go): one
+	// tenant's list storm must not degrade another tenant's lists.
+	{ID: "UC-362", Title: "Fairness: two teams list sandboxes through every ingress node at once for 60 s, a noisy one with N clients (default 1024) and a quiet one with 4: the quiet team's lists succeed at least 99% of the time with a p99 within the stated bound (default 2 s), the noisy team is told 429 rate_limited with Retry-After and never sees a 502, another 5xx, a transport error or a request hung past 30 s, and no sandboxd restarts", Requires: []Capability{CapCluster, CapDomain, CapIdentity, CapDocker, CapAPIListFairness}, Implemented: true},
+	// Bank-readiness security, continued (bank_security_test.go): the egress
+	// deny floor fails closed and heals (disruptive; skipped in local mode).
+	{ID: "UC-363", Title: "Security: the egress deny floor fails closed and heals: with a runtime's AEROLVM-FLOOR chain removed over SSH, the node puts it back (jumped first, dropping 169.254.169.254) within 45 s, aerolvm_egress_floor_ready reads 1 for that runtime and the journal names the repair; every create on that runtime meanwhile succeeds or gets 503 egress_floor_not_ready, and the metadata endpoints stay unreachable from the running sandbox and a new one on the node", Requires: []Capability{CapDocker}, Implemented: true},
+	// A Docker snapshot keeps no secrets (secrets_env_test.go): the commit
+	// used to copy the sandbox's toolbox token and env into the image config.
+	{ID: "UC-364", Title: "Secrets: a Docker snapshot of a sandbox created with an env secret keeps neither the secret nor its toolbox token, in the image config dockerd reports or in any env list `docker save` holds (what a registry push sends), and a sandbox created from the snapshot runs on its own token and sees the variable empty", Requires: []Capability{CapDocker, CapDockerEngine}, Implemented: true},
+	// An Idempotency-Key reused with a different request is refused
+	// (bank_security_test.go): v1 and Daytona used to hand back the old
+	// sandbox and drop the new request.
+	{ID: "UC-365", Title: "Security: an Idempotency-Key reused with a different create request is refused, on v1 and Daytona: the same request replays the same sandbox, a changed env gets 422 idempotency_key_reused naming the key and carrying no sandbox data or secret, and the first sandbox is untouched", Requires: []Capability{CapDocker}, Implemented: true},
+	// Keyed digests agree across nodes (keyed_digest_test.go): the Runloop
+	// devbox id and the exec record's body digest are HMACs under the
+	// server key, not plain SHA-256 a reader could test guesses against.
+	{ID: "UC-366", Title: "Security: values derived from secret-bearing request bodies are keyed with the server key and agree across nodes: a Runloop create retried with the same x-request-id through a second node gets the same devbox, another env value under that x-request-id gets another devbox, and one exec body run on sandboxes of two different owners is recorded on both as the same hmac:<key id>:<64 hex> digest, never the body's plain SHA-256 or the secret", Requires: []Capability{CapCluster, CapDocker}, Implemented: true},
+	// Concurrent retries of one Idempotency-Key create (idempotency_concurrent_test.go):
+	// each retry used to run a second create of the id on the owner, fail on
+	// the container name, and release the first create's capacity reservation
+	// and mounts on its way out.
+	{ID: "UC-367", Title: "Idempotency: N concurrent v1 creates (default 8) with one Idempotency-Key and one body, sent at once through every ingress node, all answer 201 naming one sandbox; exactly one sandbox carries the request's tag; and the owner node's GET /v1/capacity holds exactly that sandbox's reservation (deleting it gives back one sandbox at its cpu and memory, not zero)", Requires: []Capability{CapDocker}, Implemented: true},
 }
 
 // byID is a lookup built once for the report generator.
