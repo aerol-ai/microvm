@@ -36,6 +36,10 @@ type Deps struct {
 	// own defaults.
 	TemplateMapJSON string
 	ClientID        string
+	// ListGate bounds the cluster-wide lists this node runs at once
+	// (clusterlist.Admit); nil admits every list. One gate is shared by v1
+	// and every facade: they cost the same fan-out.
+	ListGate *apihttp.Gate
 }
 
 // Route returns h behind authenticate → authorize(perm) → audit seam

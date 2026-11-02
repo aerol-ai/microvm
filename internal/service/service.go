@@ -336,6 +336,9 @@ type Service struct {
 	localReadyWasmModuleIDsCache   []string
 	localReadyWasmModuleIDsKnown   bool
 	localReadyWasmModuleIDsExpires time.Time
+	// slotPools caches LocalSlotPools (slot_pools.go) for the capacity
+	// heartbeat, so placement's per-create self refresh does not read SQLite.
+	slotPools slotPoolCache
 	// Reserved standard-module aliases that actually resolve on this host,
 	// computed once: each resolve hashes a staged file up to 256MiB, so it must
 	// not run on every 5s inventory refresh (hard rule 2). Staged modules are
@@ -482,6 +485,10 @@ type Service struct {
 	// nodeGuard is the node guard's state: what each runtime got, and the
 	// per-runtime result the create gate reads (node_guard.go).
 	nodeGuard nodeGuardState
+	// egressFloor is the host-firewall deny floor's state: the floor each
+	// runtime got, and the per-runtime result the create gate reads
+	// (egress_floor.go).
+	egressFloor egressFloorState
 	// egressPolicyLocks serializes live policy updates per sandbox (§5.8).
 	egressPolicyLocks egressPolicyLocks
 	// egressProfileKick wakes SuperviseEgressProfiles after a profile change
@@ -1981,6 +1988,12 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 	if err := s.requireNodeGuard(chosenRuntime); err != nil {
 		return nil, err
 	}
+	// Fail closed: no sandbox on a runtime whose egress deny floor is not
+	// installed, since it could reach the cloud metadata endpoints and the
+	// node's credentials. One atomic map read (egress_floor.go).
+	if err := s.requireEgressFloor(chosenRuntime); err != nil {
+		return nil, err
+	}
 	if hasBinariesRule(req.NetworkEgressRules) && chosenRuntime == models.RuntimeGvisor {
 		return nil, unsupportedBinaries(chosenRuntime)
 	}
@@ -2349,7 +2362,10 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 			return nil, dupErr
 		}
 		releaseAdmission()
-		return nil, err
+		// A bridge or subnet that filled past the counted pool (a port
+		// taken without a reservation) is still capacity, not a fault: the
+		// driver removed what it created, and the API answers 503.
+		return nil, capacity.AsNetworkSlotExhausted(networkSlotPool(chosenEngine), err)
 	}
 	s.releaseAdoptedParkReservation(state)
 	if gatewayMode {
@@ -3477,6 +3493,13 @@ func (s *Service) StartSandbox(ctx context.Context, id string) (*models.Sandbox,
 		if err != nil {
 			_ = s.mounts.UnmountAll(id)
 			releaseAdmission()
+			if capacity.IsNetworkExhaustion(err) {
+				// A full bridge refused the start the way admission
+				// would have: the sandbox is still stopped and a retry
+				// can start it, so it is not marked error.
+				s.invalidateWarm(id)
+				return nil, capacity.AsNetworkSlotExhausted(networkSlotPool(models.SandboxEngine(sandbox)), err)
+			}
 			_ = s.store.UpdateStatus(ctx, id, models.SandboxStatusError, err.Error())
 			s.invalidateWarm(id)
 			return nil, err
@@ -5596,6 +5619,9 @@ func (s *Service) Capacity() capacity.Snapshot {
 		snap.LocalWasmModuleIDs = refs
 	}
 	snap.EgressGatewayReady = s.EgressGatewayReady()
+	// Network-slot pools: a peer with CPU and memory to spare can still be
+	// full for a runtime, and placement can only skip it if we say so.
+	snap.SlotPools = s.LocalSlotPools(context.Background())
 	// Observability-only engine tag (not a placement attribute).
 	if s.cfg.ContainerEngine != "" {
 		snap.ContainerEngine = s.cfg.ContainerEngine

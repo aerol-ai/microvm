@@ -12,8 +12,13 @@ import (
 	"github.com/aerol-ai/microvm/internal/network/netns"
 	cntr "github.com/aerol-ai/microvm/internal/runtime/containerd"
 	"github.com/aerol-ai/microvm/internal/store"
+	"github.com/aerol-ai/microvm/pkg/capacity"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
+
+// maxBridgePorts is how many interfaces one Linux bridge can hold
+// (capacity.BridgeMaxPorts). Each containerd netns slot uses one.
+const maxBridgePorts = capacity.BridgeMaxPorts
 
 type containerdNetnsPool struct {
 	refiller *netns.Refiller
@@ -84,6 +89,15 @@ func wireContainerdNativeNetnsPool(ctx context.Context, cfg config.Config, logge
 	poolSize := cfg.ContainerdNetnsPoolSize
 	if poolSize < cfg.ContainerdNetnsPoolDepth {
 		poolSize = cfg.ContainerdNetnsPoolDepth
+	}
+	if poolSize > maxBridgePorts {
+		// Every realized slot attaches one veth to the aerolvm0 bridge, and
+		// a Linux bridge takes at most 1023 ports. Slots past that fail CNI
+		// ADD with "exchange full" instead of refusing cleanly for capacity,
+		// so an operator raising the size must know where the wall is.
+		logger.Warn("containerd netns pool is larger than one bridge can hold; slots past the bridge limit cannot be realized",
+			"pool_size", poolSize, "bridge_port_limit", maxBridgePorts,
+			"hint", "keep SB_CONTAINERD_NETNS_POOL_SIZE at or below the bridge limit (setup/config-defaults.md)")
 	}
 	if err := pool.Seed(ctx, netns.SeedConfig{PoolSize: poolSize}, now); err != nil {
 		return nil, fmt.Errorf("seed containerd netns pool: %w", err)

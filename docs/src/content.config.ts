@@ -183,6 +183,8 @@ const getBlogSidebarConfig = (): NavigationGroup[] => [
       link('/firecracker-architecture', '- Firecracker architecture'),
       link('/firecracker-hydration', '- Firecracker snapshot restore'),
       link('/wasm-architecture', '- WASM architecture'),
+      link('/overload-protection-architecture', '- Staying up under overload'),
+      link('/secret-env-architecture', '- The life of an API key'),
     ],
   },
 ]

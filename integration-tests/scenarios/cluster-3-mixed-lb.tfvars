@@ -37,6 +37,13 @@ extra_sandboxd_env = {
   # the suite installs on every node (see single-node.tfvars).
   SB_IDENTITY_ENABLED = "true"
   SB_IDENTITY_FILE    = "/etc/sandboxd/itest-identity.yaml"
+  # Capability api-list-fairness (UC-362): a list gate small enough that one
+  # tenant's storm fills its share and is told 429, while the quiet tenant's
+  # 4 clients (at most 2 per node over 3 nodes) fit inside theirs. The
+  # default 16 slots with 4 per tenant may never fill: a healthy list holds
+  # its slot for milliseconds. UC-361's operator storm here is mostly 429.
+  SB_API_LIST_MAX_INFLIGHT            = "8"
+  SB_API_LIST_MAX_INFLIGHT_PER_TENANT = "2"
 }
 
 # Audit export to the scenario's S3 bucket (force_destroy, 3-day expiry), so

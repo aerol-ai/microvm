@@ -13,9 +13,11 @@
 package api
 
 import (
+	"expvar"
 	"log/slog"
 	"net/http"
 	"sync"
+	"sync/atomic"
 
 	"github.com/aerol-ai/microvm/internal/config"
 	"github.com/aerol-ai/microvm/internal/service"
@@ -31,6 +33,39 @@ import (
 	"github.com/aerol-ai/microvm/pkg/identitywire"
 )
 
+// listGateMetrics are the cluster-list gate's series on /v1/metrics: lists
+// holding a slot now, lists admitted, lists refused 503 (node full) and 429
+// (the caller's tenant over its share), lists queued now, and tenants with a
+// list in flight or queued now. None is labelled by tenant.
+var listGateMetrics = apihttp.GateMetrics{
+	InFlight:    expvar.NewInt("aerolvm_api_list_inflight"),
+	Admitted:    expvar.NewInt("aerolvm_api_list_admitted_total"),
+	Shed:        expvar.NewInt("aerolvm_api_list_shed_total"),
+	RateLimited: expvar.NewInt("aerolvm_api_list_rate_limited_total"),
+	Queued:      expvar.NewInt("aerolvm_api_list_queued"),
+	Flows:       expvar.NewInt("aerolvm_api_list_tenants"),
+}
+
+// The gate's configured size, so a dashboard can plot in-flight against the
+// limit and a live test can read what it is up against.
+var (
+	listGateLimitMetric     = expvar.NewInt("aerolvm_api_list_max_inflight")
+	listGatePerTenantMetric = expvar.NewInt("aerolvm_api_list_max_inflight_per_tenant")
+)
+
+// listGateDebugTop is how many tenants /debug/vars names under api_list_gate.
+const listGateDebugTop = 10
+
+// listGateDebug is the gate /debug/vars (fleet admin only) shows as
+// api_list_gate: its totals and its busiest tenants by name, for an
+// operator chasing a noisy one. The name has no aerolvm_ prefix, so
+// /v1/metrics never turns tenant names into labels.
+var listGateDebug atomic.Pointer[apihttp.Gate]
+
+func init() {
+	expvar.Publish("api_list_gate", expvar.Func(func() any { return listGateDebug.Load().Snapshot(listGateDebugTop) }))
+}
+
 type Server struct {
 	logger          *slog.Logger
 	service         *service.Service
@@ -38,10 +73,14 @@ type Server struct {
 	patToken        string
 	validator       controlplane.Validator
 	auditLimiter    *apiv1.AuditRateLimiter
-	clusterEnabled  bool
-	mux             *http.ServeMux
-	root            http.Handler
-	mcp             *remotemcp.Handler
+	// listGate sheds cluster-wide lists past SB_API_LIST_MAX_INFLIGHT and
+	// a tenant's past SB_API_LIST_MAX_INFLIGHT_PER_TENANT (apihttp.Gate);
+	// nil with no limit.
+	listGate       *apihttp.Gate
+	clusterEnabled bool
+	mux            *http.ServeMux
+	root           http.Handler
+	mcp            *remotemcp.Handler
 
 	// authChain is the ordered authenticator list authenticate() tries
 	// (auth.go). NewServer builds it; a bare &Server{} falls back to the
@@ -144,6 +183,7 @@ func NewServer(logger *slog.Logger, service *service.Service, dockerClient *dock
 			OperatorRate: cfg.AuditRateLimitOperator,
 			NodeRate:     cfg.AuditRateLimitNode,
 		}),
+		listGate:                apihttp.NewGate(cfg.APIListMaxInflight, cfg.APIListMaxInflightPerTenant, cfg.APIListQueueWait, listGateMetrics),
 		daytonaDefaultImage:     cfg.DaytonaDefaultImage,
 		e2bTemplateMapJSON:      cfg.E2BTemplateMapJSON,
 		e2bClientID:             cfg.E2BClientID,
@@ -151,6 +191,9 @@ func NewServer(logger *slog.Logger, service *service.Service, dockerClient *dock
 		mux:                     http.NewServeMux(),
 		authDenied:              newAuthDeniedLimiter(),
 	}
+	listGateDebug.Store(s.listGate)
+	listGateLimitMetric.Set(int64(s.listGate.Limit()))
+	listGatePerTenantMetric.Set(int64(s.listGate.PerFlowLimit()))
 	s.patTokenPrevious = cfg.PATTokenPrevious
 	s.patScopeHost = cfg.PATScopeHostOnly()
 	s.l4ProxyProtocol = cfg.L4FallbackProxyProtocol
@@ -207,6 +250,7 @@ func (s *Server) registerRoutes(mux apihttp.Mux) {
 		Audit:           s.audit,
 		ContainerEngine: s.containerEngine,
 		DefaultImage:    s.daytonaDefaultImage,
+		ListGate:        s.listGate,
 	})
 
 	e2b.RegisterRoutes(mux, e2b.Deps{
@@ -216,6 +260,7 @@ func (s *Server) registerRoutes(mux apihttp.Mux) {
 		Audit:           s.audit,
 		TemplateMapJSON: s.e2bTemplateMapJSON,
 		ClientID:        s.e2bClientID,
+		ListGate:        s.listGate,
 	})
 
 	runloop.RegisterRoutes(mux, runloop.Deps{
@@ -224,6 +269,7 @@ func (s *Server) registerRoutes(mux apihttp.Mux) {
 		Auth:             s.requireRunloopAuth,
 		Audit:            s.audit,
 		BlueprintMapJSON: s.runloopBlueprintMapJSON,
+		ListGate:         s.listGate,
 	})
 
 	apiv1.RegisterRoutes(mux, apiv1.Deps{
@@ -233,6 +279,7 @@ func (s *Server) registerRoutes(mux apihttp.Mux) {
 		Audit:           s.audit,
 		AuditLimiter:    s.auditLimiter,
 		ContainerEngine: s.containerEngine,
+		ListGate:        s.listGate,
 	})
 
 	// Remote MCP (opt-in, SB_MCP_ENABLED). /mcp needs only a valid principal

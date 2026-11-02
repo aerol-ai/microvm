@@ -1685,6 +1685,16 @@ func (c *Cluster) SetEgressGatewayReadyProvider(fn func() bool) {
 	c.capacityLeases.SetEgressGatewayReadyProvider(fn)
 }
 
+// SetLocalSlotPoolsProvider registers the network-slot pool callback whose
+// answer is overlaid onto this node's own capacity lease, matching what peers
+// read from its /v1/capacity.
+func (c *Cluster) SetLocalSlotPoolsProvider(fn func() []capacity.SlotPool) {
+	if c == nil || c.capacityLeases == nil {
+		return
+	}
+	c.capacityLeases.SetLocalSlotPoolsProvider(fn)
+}
+
 func (c *Cluster) membersWithCapacity() []Member {
 	members := c.gossip.members()
 	if c.capacityLeases == nil {

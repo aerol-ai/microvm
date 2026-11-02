@@ -129,6 +129,37 @@ groups:
   - name: sandboxd.ingress-and-data-plane
     interval: 30s
     rules:
+      # Cluster-wide lists are being shed. A list holds its slot for
+      # milliseconds when owners and the control plane answer quickly, so
+      # sustained shedding means list traffic beyond what the node is sized
+      # for, or slow owners holding slots. One tenant alone cannot cause it
+      # (it is held to its share and told 429), so it takes several busy
+      # tenants at once, or slow owners.
+      - alert: SandboxdAPIListShedding
+        expr: sum by (instance) (increase(aerolvm_api_list_shed_total[10m])) > 100
+        for: 10m
+        labels:
+          severity: warning
+          component: api
+        annotations:
+          summary: "sandboxd is shedding cluster-wide list requests (503)"
+          description: "aerolvm_api_list_shed_total is rising: GET /v1/sandboxes (and the Daytona, E2B and Runloop lists) found all SB_API_LIST_MAX_INFLIGHT slots taken for SB_API_LIST_QUEUE_WAIT while the caller's tenant was within its share, and were answered 503 + Retry-After. The node itself is fine. Check aerolvm_api_list_inflight, aerolvm_api_list_tenants, peer list latency, and which tenants poll lists (/debug/vars api_list_gate); add ingress nodes or raise the limit on bigger nodes."
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/slo-breach.md"
+
+      # One tenant keeps asking for more cluster-wide lists than its share of
+      # the node: it is told 429 and every other tenant is unaffected, so this
+      # is a heads-up about a client to slow down, not a node problem.
+      - alert: SandboxdAPIListTenantRateLimited
+        expr: sum by (instance) (increase(aerolvm_api_list_rate_limited_total[10m])) > 600
+        for: 15m
+        labels:
+          severity: warning
+          component: api
+        annotations:
+          summary: "a tenant keeps exceeding its share of sandboxd's list slots (429)"
+          description: "aerolvm_api_list_rate_limited_total is rising: one or more tenants hold SB_API_LIST_MAX_INFLIGHT_PER_TENANT lists at once and the rest of theirs are answered 429 rate_limited + Retry-After. Other tenants still get their share. Find the tenant in GET /debug/vars (api_list_gate.busiest, most refused first) and ask it to poll less or honour Retry-After; raise the share only for a legitimate bursty client."
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/slo-breach.md"
+
       - alert: SandboxdIngressRouteLag
         expr: max(aerolvm_ingress_route_lag_versions) > 100
         for: 5m
