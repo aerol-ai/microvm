@@ -924,6 +924,9 @@ var Registry = []UseCase{
 	// Per-tenant fairness for the list gate (list_fairness_test.go): one
 	// tenant's list storm must not degrade another tenant's lists.
 	{ID: "UC-362", Title: "Fairness: two teams list sandboxes through every ingress node at once for 60 s, a noisy one with N clients (default 1024) and a quiet one with 4: the quiet team's lists succeed at least 99% of the time with a p99 within the stated bound (default 2 s), the noisy team is told 429 rate_limited with Retry-After and never sees a 502, another 5xx, a transport error or a request hung past 30 s, and no sandboxd restarts", Requires: []Capability{CapCluster, CapDomain, CapIdentity, CapDocker, CapAPIListFairness}, Implemented: true},
+	// Bank-readiness security, continued (bank_security_test.go): the egress
+	// deny floor fails closed and heals (disruptive; skipped in local mode).
+	{ID: "UC-363", Title: "Security: the egress deny floor fails closed and heals: with a runtime's AEROLVM-FLOOR chain removed over SSH, the node puts it back (jumped first, dropping 169.254.169.254) within 45 s, aerolvm_egress_floor_ready reads 1 for that runtime and the journal names the repair; every create on that runtime meanwhile succeeds or gets 503 egress_floor_not_ready, and the metadata endpoints stay unreachable from the running sandbox and a new one on the node", Requires: []Capability{CapDocker}, Implemented: true},
 }
 
 // byID is a lookup built once for the report generator.

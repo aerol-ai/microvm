@@ -85,6 +85,16 @@ func TestSecretLifecyclePruneAndReconcileStartup(t *testing.T) {
 	time.Sleep(20 * time.Millisecond)
 }
 
+// Mount credentials for the round-trip test. They are long on purpose: the
+// sealed bag is JSON with base64 fields, so a 3-byte secret like "shh" shows
+// up in random ciphertext by chance about once in a few hundred runs and the
+// leak check below fails with nothing leaked. At this length a chance match
+// cannot happen.
+const (
+	roundTripS3AccessKeyID = "fixture-akid-Q7XW3NJ5TZK2HM4VR8PD"
+	roundTripS3SecretKey   = "fixture-secret-wJ7rXq9Lk2Vt8Zm4Np6Bs1Hd3Fy5Gc0E"
+)
+
 func TestClusterSecretEnvelopeAndRedactionRoundTrip(t *testing.T) {
 	s := &Service{cipher: newTestCipher(t)}
 	req := models.CreateSandboxRequest{
@@ -96,7 +106,7 @@ func TestClusterSecretEnvelopeAndRedactionRoundTrip(t *testing.T) {
 		},
 		Mounts: []models.MountSpec{
 			{Type: models.MountTypeS3, Target: "/data", Source: "bucket",
-				Credentials: map[string]string{"AWS_ACCESS_KEY_ID": "AKIA", "AWS_SECRET_ACCESS_KEY": "shh"}},
+				Credentials: map[string]string{"AWS_ACCESS_KEY_ID": roundTripS3AccessKeyID, "AWS_SECRET_ACCESS_KEY": roundTripS3SecretKey}},
 			{Type: models.MountTypeNFS, Target: "/srv", Source: "nfs.example:/export"},
 		},
 		PlatformVolumes: []models.PlatformVolumeMount{{Name: "data", Path: "/workspace"}},
@@ -117,7 +127,7 @@ func TestClusterSecretEnvelopeAndRedactionRoundTrip(t *testing.T) {
 	if bytes.Contains(sealed, []byte("supersecret")) {
 		t.Fatal("sealed bag leaks registry password as plaintext")
 	}
-	if bytes.Contains(sealed, []byte("AKIA")) || bytes.Contains(sealed, []byte("shh")) {
+	if bytes.Contains(sealed, []byte(roundTripS3AccessKeyID)) || bytes.Contains(sealed, []byte(roundTripS3SecretKey)) {
 		t.Fatal("sealed bag leaks mount credentials as plaintext")
 	}
 
@@ -138,7 +148,7 @@ func TestClusterSecretEnvelopeAndRedactionRoundTrip(t *testing.T) {
 	if req.Registry.Password != "supersecret" {
 		t.Fatal("Redact mutated the source request's registry password")
 	}
-	if req.Mounts[0].Credentials["AWS_ACCESS_KEY_ID"] != "AKIA" {
+	if req.Mounts[0].Credentials["AWS_ACCESS_KEY_ID"] != roundTripS3AccessKeyID {
 		t.Fatal("Redact mutated the source request's mount credentials")
 	}
 	redacted.PlatformVolumes[0].Path = "/mutated"
@@ -154,7 +164,7 @@ func TestClusterSecretEnvelopeAndRedactionRoundTrip(t *testing.T) {
 	if merged.Registry == nil || merged.Registry.Password != "supersecret" {
 		t.Fatalf("merged registry password lost: %+v", merged.Registry)
 	}
-	if merged.Mounts[0].Credentials["AWS_SECRET_ACCESS_KEY"] != "shh" {
+	if merged.Mounts[0].Credentials["AWS_SECRET_ACCESS_KEY"] != roundTripS3SecretKey {
 		t.Fatalf("merged mount creds lost: %+v", merged.Mounts[0].Credentials)
 	}
 	// Mount #1 had no credentials originally; unseal must not invent any.

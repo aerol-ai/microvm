@@ -313,6 +313,12 @@ type Admitter struct {
 	parkedDiskGB int
 	parkedSlots  int
 	reclaimers   []ParkReclaimer
+	// The admitter-counted network-slot pool (SetSlotLimit): slotUsed is
+	// how many reservations it serves, slotParked how many of those are
+	// reclaimable parks.
+	slotLimit  SlotLimit
+	slotUsed   int
+	slotParked int
 }
 
 // ParkReclaimer gives up to slots warm-pool slots back to the admitter and
@@ -370,6 +376,9 @@ func (a *Admitter) addLocked(id string, req Request) {
 	a.totalMemMB += req.MemoryMB
 	a.totalDiskGB += req.DiskGB
 	a.totalGPUs += req.GPUs
+	if a.slotLimit.serves(req.Runtime) {
+		a.slotUsed++
+	}
 	if _, ok := a.reclaimable[id]; ok {
 		a.addParkedLocked(req)
 	}
@@ -380,6 +389,9 @@ func (a *Admitter) subtractLocked(id string, req Request) {
 	a.totalMemMB -= req.MemoryMB
 	a.totalDiskGB -= req.DiskGB
 	a.totalGPUs -= req.GPUs
+	if a.slotLimit.serves(req.Runtime) {
+		a.slotUsed--
+	}
 	if _, ok := a.reclaimable[id]; ok {
 		a.subtractParkedLocked(req)
 	}
@@ -390,6 +402,9 @@ func (a *Admitter) addParkedLocked(req Request) {
 	a.parkedMemMB += req.MemoryMB
 	a.parkedDiskGB += req.DiskGB
 	a.parkedSlots++
+	if a.slotLimit.serves(req.Runtime) {
+		a.slotParked++
+	}
 }
 
 func (a *Admitter) subtractParkedLocked(req Request) {
@@ -397,6 +412,9 @@ func (a *Admitter) subtractParkedLocked(req Request) {
 	a.parkedMemMB -= req.MemoryMB
 	a.parkedDiskGB -= req.DiskGB
 	a.parkedSlots--
+	if a.slotLimit.serves(req.Runtime) {
+		a.slotParked--
+	}
 }
 
 // New builds an admitter. host should reflect the machine's total capacity;
@@ -541,6 +559,24 @@ func (a *Admitter) admitOnce(sandboxID string, req Request) (int, error) {
 			))
 		}
 	}
+
+	// The admitter-counted network-slot pool (SetSlotLimit). It sits with
+	// the budgets because a ready warm slot frees one the same way: a park
+	// holds a bridge port exactly like a sandbox.
+	slotsOver := 0
+	if a.slotLimit.serves(req.Runtime) {
+		held := a.slotUsed
+		if exists && a.slotLimit.serves(prior.Runtime) {
+			held--
+		}
+		if held+1 > a.slotLimit.Total {
+			slotsOver = held + 1 - a.slotLimit.Total
+			reasons = append(reasons, fmt.Sprintf(
+				"network slot reservation exceeded (%d+1 > %d slots)",
+				held, a.slotLimit.Total,
+			))
+		}
+	}
 	budgetReasons := len(reasons)
 
 	// GPU and runtime are not "budgets" the operator scales — they are
@@ -600,10 +636,15 @@ func (a *Admitter) admitOnce(sandboxID string, req Request) (int, error) {
 
 	if len(reasons) > 0 {
 		err := fmt.Errorf("%w: %v", ErrCapacityExceeded, reasons)
+		if slotsOver > 0 {
+			// Name the pool, like the store-backed pools' refusals do, so
+			// the 503 says which limit ran out.
+			err = fmt.Errorf("%w: %v", NewSlotPoolExhausted(a.slotLimit.Pool), reasons)
+		}
 		if len(reasons) != budgetReasons || isParkReservation(sandboxID) {
 			return 0, err
 		}
-		return a.parkedSlotsCoveringLocked(over), err
+		return a.parkedSlotsCoveringLocked(over, slotsOver), err
 	}
 
 	if exists {
@@ -615,21 +656,25 @@ func (a *Admitter) admitOnce(sandboxID string, req Request) (int, error) {
 }
 
 // parkedSlotsCoveringLocked counts how many parked reservations free at least
-// over on every axis, or 0 when even all of them would not. Only reached when
-// a create is already refused, so the scan is off the success path.
-func (a *Admitter) parkedSlotsCoveringLocked(over Request) int {
-	if a.parkedSlots == 0 || a.parkedCPU < over.CPU || a.parkedMemMB < over.MemoryMB || a.parkedDiskGB < over.DiskGB {
+// over on every axis, and at least slotsOver network slots, or 0 when even all
+// of them would not. Only reached when a create is already refused, so the
+// scan is off the success path.
+func (a *Admitter) parkedSlotsCoveringLocked(over Request, slotsOver int) int {
+	if a.parkedSlots == 0 || a.parkedCPU < over.CPU || a.parkedMemMB < over.MemoryMB || a.parkedDiskGB < over.DiskGB || a.slotParked < slotsOver {
 		return 0
 	}
 	var freed Request
-	slots := 0
+	freedSlots, slots := 0, 0
 	for id := range a.reclaimable {
 		r := a.reservations[id]
 		freed.CPU += r.CPU
 		freed.MemoryMB += r.MemoryMB
 		freed.DiskGB += r.DiskGB
+		if a.slotLimit.serves(r.Runtime) {
+			freedSlots++
+		}
 		slots++
-		if freed.CPU >= over.CPU && freed.MemoryMB >= over.MemoryMB && freed.DiskGB >= over.DiskGB {
+		if freed.CPU >= over.CPU && freed.MemoryMB >= over.MemoryMB && freed.DiskGB >= over.DiskGB && freedSlots >= slotsOver {
 			return slots
 		}
 	}
@@ -774,10 +819,12 @@ func (a *Admitter) dryRun(req Request, excludeParked bool) (bool, []string) {
 	totalMem := a.totalMemMB
 	totalDisk := a.totalDiskGB
 	totalGPUs := a.totalGPUs
+	slotLimit, slotHeld := a.slotLimit, a.slotUsed
 	if excludeParked {
 		totalCPU -= a.parkedCPU
 		totalMem -= a.parkedMemMB
 		totalDisk -= a.parkedDiskGB
+		slotHeld -= a.slotParked
 	}
 	a.mu.Unlock()
 
@@ -799,6 +846,9 @@ func (a *Admitter) dryRun(req Request, excludeParked bool) (bool, []string) {
 		if totalDisk+req.DiskGB > diskBudget {
 			reasons = append(reasons, fmt.Sprintf("disk reservation exceeded (%d GB/%d GB)", totalDisk, diskBudget))
 		}
+	}
+	if slotLimit.serves(req.Runtime) && slotHeld+1 > slotLimit.Total {
+		reasons = append(reasons, fmt.Sprintf("network slot reservation exceeded (%d/%d slots)", slotHeld, slotLimit.Total))
 	}
 	if req.GPUs > 0 {
 		if a.host.GPUCount <= 0 {
