@@ -64,10 +64,20 @@ func seedSealedRows(t *testing.T, svc *Service, id string) string {
 
 // tempDataDir points the node's data directory (audit state, egress CA)
 // at a temp dir: these harnesses leave DBPath empty.
+//
+// With a data dir, the first key-custody record (a revoke, a recovery, a
+// rotation step) opens the file audit sink under <dir>/audit. Its writer
+// wakes every second and re-creates its lock and tip files, so it must stop
+// before t.TempDir's RemoveAll, or the removal fails with "directory not
+// empty". The removal was registered by the harness's first TempDir call,
+// so this cleanup, registered later, runs first. Any startKeyCustody
+// cleanup is registered after this one, so the loops stop before the sink
+// closes.
 func tempDataDir(t *testing.T, svc *Service) {
 	t.Helper()
 	svc.cfg.DBPath = filepath.Join(t.TempDir(), "state.db")
 	svc.egressCA.Store(nil)
+	t.Cleanup(svc.CloseSecretAuditSink)
 }
 
 func ringGauge(t *testing.T, m *expvar.Map) map[string]any {
