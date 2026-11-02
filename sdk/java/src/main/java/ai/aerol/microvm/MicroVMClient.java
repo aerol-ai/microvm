@@ -1402,11 +1402,15 @@ public class MicroVMClient {
 
     private void ensureSuccess(HttpResponse<byte[]> response) {
         if (response.statusCode() >= 400) {
+            int status = response.statusCode();
+            java.time.Duration retryAfter = RetryAfter.parse(
+                response.headers().firstValue("Retry-After").orElse(null), java.time.Instant.now());
             ErrorResponse error = JsonSupport.tryRead(response.body(), ErrorResponse.class);
             if (error != null && error.error != null && !error.error.isEmpty()) {
-                throw new MicroVMException(error.error);
+                String code = error.code == null || error.code.isEmpty() ? null : error.code;
+                throw new MicroVMApiException(status, code, error.error, retryAfter);
             }
-            throw new MicroVMException("request failed with status " + response.statusCode());
+            throw new MicroVMApiException(status, null, "request failed with status " + status, retryAfter);
         }
     }
 
@@ -1594,6 +1598,7 @@ public class MicroVMClient {
     @SuppressWarnings("unused")
     private static final class ErrorResponse {
         public String error;
+        public String code;
     }
 
     @SuppressWarnings("unused")
