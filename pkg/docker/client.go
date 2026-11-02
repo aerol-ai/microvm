@@ -1219,6 +1219,12 @@ func (c *Client) ListManaged(ctx context.Context) (map[string]*SandboxRuntime, e
 		if isParkedContainer(summary) {
 			continue
 		}
+		// A snapshot's helper container inherits the managed label from the
+		// image it is made from. While its snapshot runs it is no orphan, and
+		// reaping it would fail the snapshot (isLiveSnapshotHelper).
+		if isLiveSnapshotHelper(summary, time.Now()) {
+			continue
+		}
 		inspect, err := c.inspectContainer(ctx, summary.ID)
 		if err != nil {
 			continue

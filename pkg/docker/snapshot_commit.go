@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 
 	"github.com/aerol-ai/microvm/pkg/gvisorpids"
 )
@@ -17,6 +18,11 @@ import (
 // snapshotHelperPrefix names the short-lived container CreateSnapshot commits
 // the final image from. It never starts and never collides with a sandbox ID.
 const snapshotHelperPrefix = "snapcommit-"
+
+// snapshotHelperMaxAge is how long the orphan sweep leaves a snapshot helper
+// alone. The helper lives only for one commit of a container that never ran,
+// which takes seconds; this just has to outlast the slowest.
+const snapshotHelperMaxAge = 10 * time.Minute
 
 // snapshotInternalEnvKeys are the variables the driver itself puts in a
 // sandbox container's env. A snapshot keeps none of their values, even when
@@ -106,7 +112,7 @@ func (c *Client) recommitSnapshot(ctx context.Context, intermediate, repo, tag s
 	}
 	defer func() {
 		if err := c.removeContainer(cleanupCtx, name, true); err != nil {
-			c.warn("snapshot helper container not removed; the orphan sweep reclaims it",
+			c.warn("snapshot helper container not removed; the orphan sweep reclaims it once it is stale",
 				"container", name, "error", err)
 		}
 	}()
@@ -264,6 +270,21 @@ func snapshotEnv(containerEnv, baseEnv []string) []string {
 		}
 	}
 	return out
+}
+
+// isLiveSnapshotHelper reports whether a container is a snapshot helper
+// young enough that its snapshot may still be running. The helper is made
+// from the sandbox's own committed image, so it carries the sandbox's managed
+// label, and the orphan sweep would otherwise see a container with no row and
+// remove it between the helper's create and its commit. A helper older than
+// snapshotHelperMaxAge was left by a crash, and the sweep may reap it.
+func isLiveSnapshotHelper(summary containerSummary, now time.Time) bool {
+	for _, name := range summary.Names {
+		if strings.HasPrefix(strings.TrimPrefix(name, "/"), snapshotHelperPrefix) {
+			return now.Sub(time.Unix(summary.Created, 0)) < snapshotHelperMaxAge
+		}
+	}
+	return false
 }
 
 func snapshotHelperName() (string, error) {
