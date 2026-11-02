@@ -2352,7 +2352,10 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 			return nil, dupErr
 		}
 		releaseAdmission()
-		return nil, err
+		// A bridge or subnet that filled past the counted pool (a port
+		// taken without a reservation) is still capacity, not a fault: the
+		// driver removed what it created, and the API answers 503.
+		return nil, capacity.AsNetworkSlotExhausted(networkSlotPool(chosenEngine), err)
 	}
 	s.releaseAdoptedParkReservation(state)
 	if gatewayMode {
@@ -3480,6 +3483,13 @@ func (s *Service) StartSandbox(ctx context.Context, id string) (*models.Sandbox,
 		if err != nil {
 			_ = s.mounts.UnmountAll(id)
 			releaseAdmission()
+			if capacity.IsNetworkExhaustion(err) {
+				// A full bridge refused the start the way admission
+				// would have: the sandbox is still stopped and a retry
+				// can start it, so it is not marked error.
+				s.invalidateWarm(id)
+				return nil, capacity.AsNetworkSlotExhausted(networkSlotPool(models.SandboxEngine(sandbox)), err)
+			}
 			_ = s.store.UpdateStatus(ctx, id, models.SandboxStatusError, err.Error())
 			s.invalidateWarm(id)
 			return nil, err
