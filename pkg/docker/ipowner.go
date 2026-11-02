@@ -66,17 +66,31 @@ var (
 // rule method below returns nil without installing anything.
 func (c *Client) NetRulesEnabled() bool { return c.networkRules.Enabled() }
 
+var _ runtime.EgressFloorSetter = (*Client)(nil)
+
 // SetEgressFloor installs the operator's node-wide deny floor for the
 // sandbox network's subnet (§5.10 PC-2).
 func (c *Client) SetEgressFloor(ctx context.Context, cidrs []netip.Prefix) error {
 	if c.networkRules == nil || !c.networkRules.Enabled() {
-		return nil
+		return runtime.ErrEgressFloorUnavailable
 	}
 	sn, err := c.SandboxBridge(ctx)
 	if err != nil {
 		return err
 	}
+	if !sn.Subnet.IsValid() {
+		// SetFloor would install nothing and report success.
+		return fmt.Errorf("docker network %s has no IPv4 subnet for the egress floor", sn.Name)
+	}
 	return c.networkRules.SetFloor(sn.Subnet, cidrs)
+}
+
+// ReassertEgressFloor puts the floor back if something removed it.
+func (c *Client) ReassertEgressFloor(context.Context) (bool, error) {
+	if c.networkRules == nil {
+		return false, nil
+	}
+	return c.networkRules.ReassertFloor()
 }
 
 var _ runtime.NodeGuardSetter = (*Client)(nil)

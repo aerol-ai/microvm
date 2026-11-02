@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/netip"
 	"slices"
+	"sync"
 	"testing"
 
 	"github.com/aerol-ai/microvm/internal/cluster"
@@ -16,18 +17,48 @@ import (
 // floorRuntime is a container runtime that records the deny floor.
 type floorRuntime struct {
 	*holdRuntime
-	floor [][]netip.Prefix
-	err   error
+	fmu       sync.Mutex
+	floor     [][]netip.Prefix
+	err       error
+	reasserts int
+	repaired  bool
+	reErr     error
+}
+
+func newFloorRuntime() *floorRuntime {
+	return &floorRuntime{holdRuntime: &holdRuntime{recordingRuntime: &recordingRuntime{}}}
 }
 
 func (f *floorRuntime) SetEgressFloor(_ context.Context, cidrs []netip.Prefix) error {
+	f.fmu.Lock()
+	defer f.fmu.Unlock()
 	f.floor = append(f.floor, cidrs)
 	return f.err
 }
 
+func (f *floorRuntime) ReassertEgressFloor(context.Context) (bool, error) {
+	f.fmu.Lock()
+	defer f.fmu.Unlock()
+	f.reasserts++
+	return f.repaired, f.reErr
+}
+
+func (f *floorRuntime) counts() (sets, reasserts int) {
+	f.fmu.Lock()
+	defer f.fmu.Unlock()
+	return len(f.floor), f.reasserts
+}
+
+func (f *floorRuntime) set(err, reErr error, repaired bool) {
+	f.fmu.Lock()
+	defer f.fmu.Unlock()
+	f.err, f.reErr, f.repaired = err, reErr, repaired
+}
+
 // TestOperatorFloorReachesTheHostFirewall (§5.10 PC-2): loading or changing
 // the operator file installs deny_cidrs on each container engine and the
-// Firecracker TAP subnet (Phase 4); a failure is logged, not fatal.
+// Firecracker TAP subnet (Phase 4). What a failure does to creates is
+// egress_floor_test.go's.
 func TestOperatorFloorReachesTheHostFirewall(t *testing.T) {
 	svc, _, hr := newEgressHarness(t)
 	rt := &floorRuntime{holdRuntime: hr}
