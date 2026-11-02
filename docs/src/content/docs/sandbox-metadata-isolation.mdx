@@ -258,7 +258,8 @@ These rules keep the design true as the code changes. A change that breaks one o
 4. **No shared chain.** Each sandbox network has its own floor chain, and a runtime rewrites only its own. Two runtimes on one server cannot overwrite each other's floor.
 5. **Every floor knows every sandbox network.** The server keeps one list of sandbox networks, and each floor drops traffic to all of them. Start order does not matter.
 6. **On from the first second.** The floor is installed when the server starts, with or without an operator file.
-7. **The cloud setting is a second layer, never the only one.** AerolVM must block the service even where the cloud setting is missing.
+7. **No floor, no sandbox.** If the floor is missing for a runtime, the server refuses new sandboxes on that runtime until it is back. It never starts a sandbox and hopes the other layers hold.
+8. **The cloud setting is a second layer, never the only one.** AerolVM must block the service even where the cloud setting is missing.
 
 ## How every test run checks it
 
@@ -291,6 +292,14 @@ flowchart TB
 **What this shows:** the live test covers each runtime, with and without an allow list that asks for the metadata service.
 
 UC-317 runs in every integration scenario that has container sandboxes, which is most of them. The largest is an 11-server cluster with containers, gVisor and Firecracker side by side. So the "two runtimes on one server" case is part of that run.
+
+### The live test: UC-363
+
+UC-363 (`TestBankEgressFloorFailsClosedAndHeals`, in the same file) removes a runtime's floor chain on a live server, the way a stray firewall reload might. It then checks three things:
+
+- the server puts the floor back within 45 seconds;
+- every create in that window either works or is refused with `egress_floor_not_ready`, never started without the floor;
+- the metadata addresses stay unreachable, from the running sandbox and from a new one.
 
 ### The unit tests
 
@@ -409,6 +418,8 @@ This section lists what AerolVM does for you, and what you can add.
 **What AerolVM does with no setup:**
 
 - installs the floor on every sandbox network when the server starts, with or without `SB_EGRESS_OPERATOR_FILE`;
+- refuses to start a sandbox without the floor. If the floor cannot be installed for a runtime, new container, gVisor and Firecracker sandboxes on it get HTTP 503, error code `egress_floor_not_ready`, with `Retry-After: 5`. The server tries again every 5 seconds until the floor is in;
+- checks every 30 seconds that the floor is still there, and puts it back if a firewall reload or flush removed it;
 - refuses the metadata addresses in every connection it opens for a sandbox;
 - turns IPv6 off in every sandbox and drops IPv6 on every sandbox network.
 
@@ -419,7 +430,7 @@ This section lists what AerolVM does for you, and what you can add.
 - **On AWS,** require IMDSv2 and set the hop limit to 1 on every server that runs sandboxes. You can set this per server, in a launch template, or as your account's default for new servers.
 - **Keep the server's role small.** Give it only the S3 buckets and keys the cluster uses. The fewer rights it has, the less any leak could do.
 - **Add your private ranges to `deny_cidrs`.** The floor drops them for every sandbox, the same way it drops the metadata addresses. You do not need to list the metadata addresses yourself.
-- **Watch the log.** If the server cannot install the floor, for example because the firewall tools are missing, it logs `egress: deny floor not installed on the host firewall`. Alert on that line. Sandboxes still start in that case, and the other layers still apply.
+- **Watch the floor metric.** `aerolvm_egress_floor_ready` at `GET /v1/metrics` is 1 for each runtime (`docker`, `containerd`, `firecracker`) whose floor is in place, and 0 otherwise. Alert on 0 only on servers with network rules on: a local-mode server has no floor and always reads 0.
 
 **Where to look:** each runtime's chain (`DOCKER-USER`, `AEROLVM-USER` or `AEROLVM-FC`) starts with a jump to a chain named `AEROLVM-FLOOR-` and 8 characters. That chain holds one drop rule per blocked range. The [egress gateway runbook](https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/egress-gateway.md) shows how to check them.
 
