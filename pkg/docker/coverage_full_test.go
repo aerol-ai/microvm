@@ -360,6 +360,41 @@ func TestListManaged(t *testing.T) {
 		}
 	})
 
+	t.Run("skips_a_running_snapshots_helper", func(t *testing.T) {
+		// A snapshot helper inherits the sandbox's managed label from the
+		// committed image. A fresh one belongs to a snapshot in progress and
+		// must not reach the orphan sweep; a stale one was left by a crash and
+		// must, so it gets reaped.
+		now := time.Now().Unix()
+		c := &Client{httpClient: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			switch {
+			case r.URL.Path == "/containers/json":
+				return jsonResponse(http.StatusOK, []map[string]any{
+					{"Id": "fresh", "Names": []string{"/snapcommit-00aa"}, "Created": now - 5, "Labels": map[string]string{managedLabelKey: "true"}},
+					{"Id": "stale", "Names": []string{"/snapcommit-00bb"}, "Created": now - int64((snapshotHelperMaxAge + time.Minute).Seconds()), "Labels": map[string]string{managedLabelKey: "true"}},
+				}), nil
+			case r.URL.Path == "/containers/stale/json":
+				return textResponse(http.StatusOK, inspectBody("stale", "/snapcommit-00bb", "", false, "created", 0)), nil
+			case r.URL.Path == "/containers/fresh/json":
+				t.Fatal("ListManaged must not inspect a running snapshot's helper")
+				return nil, nil
+			default:
+				t.Fatalf("unexpected path %s", r.URL.Path)
+				return nil, nil
+			}
+		})}}
+		result, err := c.ListManaged(context.Background())
+		if err != nil {
+			t.Fatalf("ListManaged() = %v", err)
+		}
+		if _, ok := result["snapcommit-00aa"]; ok {
+			t.Fatalf("ListManaged() listed a running snapshot's helper: %+v", result)
+		}
+		if _, ok := result["snapcommit-00bb"]; !ok || len(result) != 1 {
+			t.Fatalf("ListManaged() = %+v, want only the stale helper", result)
+		}
+	})
+
 	t.Run("list_error", func(t *testing.T) {
 		c := &Client{httpClient: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
 			return textResponse(http.StatusInternalServerError, "boom"), nil

@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/aerol-ai/microvm/pkg/gvisorpids"
 	"github.com/aerol-ai/microvm/pkg/models"
@@ -577,5 +578,29 @@ func TestDockerMergeEnvMatchesDockerd(t *testing.T) {
 	}
 	if fmt.Sprint(dockerMergeEnv(nil, nil)) != "[]" {
 		t.Fatal("dockerMergeEnv(nil, nil) is not empty")
+	}
+}
+
+func TestIsLiveSnapshotHelper(t *testing.T) {
+	now := time.Unix(1_800_000_000, 0)
+	age := func(d time.Duration) int64 { return now.Add(-d).Unix() }
+	cases := []struct {
+		name    string
+		summary containerSummary
+		want    bool
+	}{
+		{"fresh helper", containerSummary{Names: []string{"/snapcommit-0011"}, Created: age(time.Second)}, true},
+		{"helper just under the limit", containerSummary{Names: []string{"/snapcommit-0011"}, Created: age(snapshotHelperMaxAge - time.Second)}, true},
+		{"helper at the limit", containerSummary{Names: []string{"/snapcommit-0011"}, Created: age(snapshotHelperMaxAge)}, false},
+		{"helper with no creation time", containerSummary{Names: []string{"/snapcommit-0011"}}, false},
+		{"sandbox", containerSummary{Names: []string{"/sb-0011"}, Created: age(time.Second)}, false},
+		{"no name", containerSummary{Created: age(time.Second)}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isLiveSnapshotHelper(tc.summary, now); got != tc.want {
+				t.Fatalf("isLiveSnapshotHelper(%+v) = %v, want %v", tc.summary, got, tc.want)
+			}
+		})
 	}
 }
