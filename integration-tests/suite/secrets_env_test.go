@@ -3,7 +3,7 @@
 package suite
 
 // Group D — env sealing and the API contract (§7 group D, F5). UC-126..129,
-// and UC-363 (a Docker snapshot keeps no secrets).
+// and UC-364 (a Docker snapshot keeps no secrets).
 // UC-130 is disruptive and lives in z_secrets_env_loss_test.go.
 
 import (
@@ -187,7 +187,7 @@ func TestOnDiskEnvIsSealedAndSurvivesAnUpdate(t *testing.T) {
 	}
 }
 
-// UC-363 — a Docker snapshot keeps neither the sandbox's toolbox token nor
+// UC-364 — a Docker snapshot keeps neither the sandbox's toolbox token nor
 // its env secrets, and a sandbox created from it gets only its own.
 //
 // A Docker commit copies the container's env into the image, and the
@@ -197,7 +197,7 @@ func TestOnDiskEnvIsSealedAndSurvivesAnUpdate(t *testing.T) {
 // registry push sends. Read over SSH because the API never shows an image's
 // config at all.
 func TestDockerSnapshotKeepsNoSecrets(t *testing.T) {
-	harness.Require(t, sc, "UC-363")
+	harness.Require(t, sc, "UC-364")
 	targets := harness.LoadIntegrationTargets()
 	if targets == nil {
 		t.Skip("AEROL_INTEGRATION_TARGETS not set (run via integration-tests/run.sh)")

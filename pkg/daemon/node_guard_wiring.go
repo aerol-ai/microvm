@@ -34,11 +34,15 @@ func configureHostMediatedNodeGuard(cfg config.Config, logger *slog.Logger) {
 
 // wireNodeGuard installs the node guard on every container and Firecracker
 // runtime before the API serves, so no sandbox starts without it, and keeps
-// it in place. Only nodes that own sandboxes need it.
+// it in place. It also keeps the egress deny floor in place, which
+// wireEgressOperator installed at boot: a runtime where that failed is
+// retried at the guard's pace, and its creates are refused until it is in.
+// Only nodes that own sandboxes need either.
 func wireNodeGuard(ctx context.Context, cfg config.Config, svc *service.Service) {
 	if !cfg.IsWorker() {
 		return
 	}
 	svc.ApplyNodeGuard(ctx)
 	go svc.SuperviseNodeGuard(ctx, nodeGuardSuperviseInterval)
+	go svc.SuperviseEgressFloor(ctx, nodeGuardSuperviseInterval)
 }
