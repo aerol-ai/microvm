@@ -3,12 +3,28 @@ package ai.aerol.microvm.model;
 import java.util.List;
 import java.util.Map;
 
+import com.fasterxml.jackson.annotation.JsonIgnore;
 import com.fasterxml.jackson.annotation.JsonInclude;
 import com.fasterxml.jackson.annotation.JsonProperty;
 
 @JsonInclude(JsonInclude.Include.NON_NULL)
 public class CreateOptions {
     public String image;
+    /**
+     * Sent as the create's {@code Idempotency-Key} header, never in the body.
+     * A create sent again with the same key and the same options returns the
+     * sandbox the first one made instead of making a second; the same key
+     * with different options throws a 422 {@code MicroVMApiException} whose
+     * code is {@code "idempotency_key_reused"}. Keys are scoped to the
+     * caller's account.
+     *
+     * <p>Null makes the SDK send a random key for each {@code create} call,
+     * reused on that call's automatic retries, so a retry after a timeout
+     * cannot make a second sandbox. Set your own to make your own retries of
+     * the whole call safe too, such as after your process restarts.
+     */
+    @JsonIgnore
+    public String idempotencyKey;
     /**
      * Optional name, unique among the caller's sandboxes (another account may
      * use the same name); a repeat create with a held name returns HTTP 409.
@@ -107,6 +123,11 @@ public class CreateOptions {
 
     public CreateOptions setImage(String image) {
         this.image = image;
+        return this;
+    }
+
+    public CreateOptions setIdempotencyKey(String idempotencyKey) {
+        this.idempotencyKey = idempotencyKey;
         return this;
     }
 
