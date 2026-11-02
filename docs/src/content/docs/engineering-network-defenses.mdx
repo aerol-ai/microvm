@@ -23,6 +23,8 @@ Untrusted code that can reach your private network can attack it. This post expl
 
 For containers, gVisor and Firecracker, a firewall rule on the server drops this traffic. The server checks every 30 seconds that the rule is still in place and puts it back if a firewall reload removed it. If it cannot install the rule, it refuses new sandboxes on that runtime with `503` and the code `egress_floor_not_ready` until it can, and retries every 5 seconds. The metric `aerolvm_egress_floor_ready` is 1 for each runtime that has the rule. A server with `SB_ENABLE_NETWORK_RULES=false` (local mode) has no firewall rules, so this rule is missing there too. Outside enterprise mode it still creates sandboxes, and its log says so.
 
+[Keeping sandboxes away from the node's cloud credentials](/sandbox-metadata-isolation/) explains each layer behind this rule.
+
 So for code you do not trust, always set a policy, or have your operator set one for every sandbox on the server. See [For server operators](#for-server-operators).
 
 This is how a new container, gVisor or Firecracker sandbox gets its outbound policy.

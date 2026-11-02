@@ -40,4 +40,6 @@ These posts go deeper than the docs. They explain how AerolVM works inside, why 
 | [Firecracker snapshot restore](/firecracker-hydration/) | How VMs are prepared, restored and shared so a create is just attach and resume. |
 | [WASM architecture](/wasm-architecture/) | How WebAssembly sandboxes run, with one worker process each and saved checkpoints. |
 | [Staying up under overload](/overload-protection-architecture/) | What broke when a cluster got 4 times more list calls than it could serve, how we fixed it, and how this compares with Kubernetes. |
+| [Keeping sandboxes away from the node's cloud credentials](/sandbox-metadata-isolation/) | Why the cloud metadata service is a target, the four layers that keep every sandbox away from it, and how this compares with Kubernetes. |
+| [How the in-sandbox agent knows who is calling](/toolbox-agent-authentication/) | How the agent in each sandbox checks every caller, why a cloned VM gets its token only after restore, and how this compares with the kubelet. |
 | [The life of an API key](/secret-env-architecture/) | One `OPENAI_API_KEY`, followed from the create call to the OpenAI SDK in the sandbox: sealing, each runtime, the key tree, the cluster, inject rules, and how this compares with Kubernetes Secrets. |
