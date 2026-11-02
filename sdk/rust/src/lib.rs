@@ -83,11 +83,24 @@ pub struct SessionAttachOptions {
     pub rows: Option<u16>,
 }
 
+/// Every failure a [`Client`] call can return.
+///
+/// It is `#[non_exhaustive]`: a later SDK may add a variant without a
+/// breaking release, so a `match` on it needs a wildcard arm.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum Error {
     Reqwest(reqwest::Error),
     MissingToken,
+    /// A failure the SDK found itself, before or after talking to the
+    /// server: a missing argument, an Image build the daemon does not
+    /// support, an incomplete cluster list, a WebSocket handshake or stream
+    /// failure. An HTTP error response from the server is [`Error::Status`].
     Api(String),
+    /// The server, or a proxy in front of it, answered with an HTTP error
+    /// status. [`ApiError`] carries the status, the server's stable error
+    /// code and its `Retry-After`.
+    Status(ApiError),
     WebSocket(WebSocketError),
     Http(http::Error),
     SerdeJson(serde_json::Error),
@@ -104,6 +117,7 @@ impl fmt::Display for Error {
                 "PAT token is required. Set SB_PAT_TOKEN or SB_API_TOKEN, or pass pat_token."
             ),
             Error::Api(message) => write!(f, "API error: {}", message),
+            Error::Status(err) => write!(f, "API error: {}", err),
             Error::WebSocket(err) => write!(f, "WebSocket error: {}", err),
             Error::Http(err) => write!(f, "HTTP request build error: {}", err),
             Error::SerdeJson(err) => write!(f, "JSON error: {}", err),
@@ -114,6 +128,80 @@ impl fmt::Display for Error {
 }
 
 impl std::error::Error for Error {}
+
+/// An HTTP error response from the AerolVM server, returned as
+/// [`Error::Status`].
+///
+/// Branch on [`ApiError::code`], not on the message: the code is a stable
+/// identifier such as `"idempotency_key_reused"` or `"overloaded"`, the
+/// message is wording for a person. It displays as
+/// `"<status>: <message>"`, the text `Error::Api` carried for these errors
+/// before this type existed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ApiError {
+    status: reqwest::StatusCode,
+    code: Option<String>,
+    message: String,
+    retry_after: Option<Duration>,
+}
+
+impl ApiError {
+    /// Reads an error response: the server's `{"error": ..., "code": ...}`
+    /// body, or, for any other body (a proxy's error page), the body text as
+    /// the message with no code.
+    fn from_response(status: reqwest::StatusCode, retry_after: Option<&str>, body: &str) -> Self {
+        let mut message = body.to_string();
+        let mut code = None;
+        if let Ok(value) = serde_json::from_str::<Value>(body) {
+            if let Some(error) = value.get("error").and_then(|entry| entry.as_str()) {
+                message = error.to_string();
+                code = value
+                    .get("code")
+                    .and_then(|entry| entry.as_str())
+                    .filter(|entry| !entry.is_empty())
+                    .map(String::from);
+            }
+        }
+        ApiError {
+            status,
+            code,
+            message,
+            retry_after: retry_after.and_then(|value| parse_retry_after(value, SystemTime::now())),
+        }
+    }
+
+    /// The HTTP status of the final attempt, such as 422 or 503.
+    pub fn status(&self) -> u16 {
+        self.status.as_u16()
+    }
+
+    /// The server's stable error code, or `None` when the response has
+    /// none: many errors are only ever shown to a person, and a proxy's
+    /// error page has no code.
+    pub fn code(&self) -> Option<&str> {
+        self.code.as_deref()
+    }
+
+    /// The server's message, or the response body when it was not the
+    /// server's JSON error.
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+
+    /// How long the response's `Retry-After` header asked the caller to
+    /// wait, or `None` without a usable header.
+    pub fn retry_after(&self) -> Option<Duration> {
+        self.retry_after
+    }
+}
+
+impl fmt::Display for ApiError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}: {}", self.status, self.message)
+    }
+}
+
+impl std::error::Error for ApiError {}
 
 impl From<reqwest::Error> for Error {
     fn from(err: reqwest::Error) -> Self {
@@ -1226,8 +1314,8 @@ impl Client {
     }
 
     /// Look a snapshot up by name. In a cluster the request is routed to the
-    /// node holding the image. A missing snapshot surfaces as an `Api` error
-    /// carrying the server's 404.
+    /// node holding the image. A missing snapshot surfaces as an
+    /// [`Error::Status`] carrying the server's 404.
     pub fn get_snapshot(&self, name: &str) -> Result<SandboxSnapshot, Error> {
         self.do_json::<(), SandboxSnapshot>(
             Method::GET,
@@ -1402,7 +1490,7 @@ impl Client {
     /// in its post-transition state (typically `Unhealthy`); poll
     /// [`Client::get_template`] to observe the transition back to `Ready`.
     ///
-    /// Returns an [`Error::Api`] wrapping a 412 response when the template
+    /// Returns an [`Error::Status`] wrapping a 412 response when the template
     /// is in a state where rebuild is unsafe (build in flight) or
     /// unsupported (`ReadyNoSnapshot`, `Failed` — those need
     /// delete+recreate today).
@@ -2091,13 +2179,17 @@ impl Client {
             Ok(response)
         } else {
             let status = response.status();
+            let retry_after = response
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok())
+                .map(String::from);
             let body = response.text().unwrap_or_default();
-            if let Ok(value) = serde_json::from_str::<Value>(&body) {
-                if let Some(message) = value.get("error").and_then(|entry| entry.as_str()) {
-                    return Err(Error::Api(format!("{}: {}", status, message)));
-                }
-            }
-            Err(Error::Api(format!("{}: {}", status, body)))
+            Err(Error::Status(ApiError::from_response(
+                status,
+                retry_after.as_deref(),
+                &body,
+            )))
         }
     }
 }
@@ -2398,11 +2490,23 @@ mod tests {
         content_type: &str,
         body: Vec<u8>,
     ) -> (String, std::sync::mpsc::Receiver<String>) {
+        spawn_response_server_with_headers(status_line, content_type, "", body)
+    }
+
+    /// [`spawn_response_server`] with `extra_headers` (each line ending in
+    /// `\r\n`) added to the response head.
+    fn spawn_response_server_with_headers(
+        status_line: &str,
+        content_type: &str,
+        extra_headers: &str,
+        body: Vec<u8>,
+    ) -> (String, std::sync::mpsc::Receiver<String>) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("listener should bind");
         let addr = listener.local_addr().expect("listener address");
         let (request_tx, request_rx) = std::sync::mpsc::channel();
         let status_line = status_line.to_string();
         let content_type = content_type.to_string();
+        let extra_headers = extra_headers.to_string();
 
         thread::spawn(move || {
             let (mut stream, _) = listener.accept().expect("server should accept");
@@ -2410,8 +2514,9 @@ mod tests {
             request_tx.send(request).expect("request should be sent");
 
             let response = format!(
-                "HTTP/1.1 {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                "HTTP/1.1 {}\r\n{}Content-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                 status_line,
+                extra_headers,
                 content_type,
                 body.len(),
             );
@@ -5150,7 +5255,7 @@ mod tests {
 
     // 409 Conflict is the documented response when the hostname is already
     // bound to a different sandbox. We just need to confirm it surfaces as an
-    // Api error carrying the server-supplied JSON `error` field — that's the
+    // Status error carrying the server-supplied JSON `error` field — that's the
     // contract handle_response promises for any 4xx.
     #[test]
     fn add_custom_domain_surfaces_409_conflict() {
@@ -5455,7 +5560,10 @@ mod tests {
             .rebuild_template("tpl-pending")
             .expect_err("412 must surface as error");
         match err {
-            Error::Api(msg) => assert!(msg.contains("not eligible"), "msg = {}", msg),
+            Error::Status(api) => {
+                assert_eq!(api.status(), 412);
+                assert!(api.message().contains("not eligible"), "msg = {}", api.message());
+            }
             other => panic!("unexpected error: {:?}", other),
         }
     }
@@ -5750,5 +5858,139 @@ mod tests {
         assert!(bare.headers().get(TEAM_HEADER).is_none());
 
         assert!(websocket_request("wss://sandbox.example.com/v1/x".into(), "pat", Some("bad\nteam")).is_err());
+    }
+
+    fn no_retry_client(url: &str) -> Client {
+        Client::with_config(
+            ClientConfig {
+                api_url: Some(url.to_string()),
+                pat_token: Some("pat-token".to_string()),
+                retry: Some(RetryConfig {
+                    max_retries: Some(0),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            ApiVersion::V1,
+        )
+        .expect("client should build")
+    }
+
+    // Every HTTP error response is Error::Status carrying the status, the
+    // server's stable code and its Retry-After; Display keeps the
+    // "API error: <status>: <message>" text Error::Api carried before.
+    #[test]
+    fn http_errors_carry_status_code_and_retry_after() {
+        struct Case {
+            name: &'static str,
+            status_line: &'static str,
+            content_type: &'static str,
+            headers: &'static str,
+            body: &'static str,
+            status: u16,
+            code: Option<&'static str>,
+            message: &'static str,
+            retry_after: Option<Duration>,
+        }
+        let cases = [
+            Case {
+                name: "422 idempotency_key_reused",
+                status_line: "422 Unprocessable Entity",
+                content_type: "application/json",
+                headers: "",
+                body: r#"{"error":"Idempotency-Key reused with a different request","code":"idempotency_key_reused"}"#,
+                status: 422,
+                code: Some("idempotency_key_reused"),
+                message: "Idempotency-Key reused with a different request",
+                retry_after: None,
+            },
+            Case {
+                name: "503 egress_floor_not_ready with Retry-After",
+                status_line: "503 Service Unavailable",
+                content_type: "application/json",
+                headers: "Retry-After: 5\r\n",
+                body: r#"{"error":"egress deny floor not ready","code":"egress_floor_not_ready"}"#,
+                status: 503,
+                code: Some("egress_floor_not_ready"),
+                message: "egress deny floor not ready",
+                retry_after: Some(Duration::from_secs(5)),
+            },
+            Case {
+                name: "non-JSON body keeps the body text and has no code",
+                status_line: "502 Bad Gateway",
+                content_type: "text/html",
+                headers: "",
+                body: "<html>Bad Gateway</html>",
+                status: 502,
+                code: None,
+                message: "<html>Bad Gateway</html>",
+                retry_after: None,
+            },
+        ];
+        for case in cases {
+            let (url, _request_rx) = spawn_response_server_with_headers(
+                case.status_line,
+                case.content_type,
+                case.headers,
+                case.body.as_bytes().to_vec(),
+            );
+            let err = no_retry_client(&url)
+                .create(CreateOptions {
+                    image: "ubuntu:22.04".to_string(),
+                    ..Default::default()
+                })
+                .expect_err(case.name);
+            let display = err.to_string();
+            let Error::Status(api) = err else {
+                panic!("{}: want Error::Status, got {:?}", case.name, err);
+            };
+            assert_eq!(api.status(), case.status, "{}", case.name);
+            assert_eq!(api.code(), case.code, "{}", case.name);
+            assert_eq!(api.message(), case.message, "{}", case.name);
+            assert_eq!(api.retry_after(), case.retry_after, "{}", case.name);
+            assert_eq!(
+                display,
+                format!("API error: {}: {}", case.status_line, case.message),
+                "{}",
+                case.name
+            );
+        }
+    }
+
+    #[test]
+    fn idempotency_key_reused_is_not_retried() {
+        let (url, hits) = spawn_scripted_server(vec![Reply::Json {
+            status: "422 Unprocessable Entity",
+            body: r#"{"error":"reused","code":"idempotency_key_reused"}"#.to_string(),
+            delay: Duration::ZERO,
+        }]);
+        let err = fast_retry_client(&url)
+            .create(CreateOptions {
+                image: "ubuntu:22.04".to_string(),
+                ..Default::default()
+            })
+            .expect_err("a reused key is refused");
+        assert!(
+            matches!(&err, Error::Status(api) if api.code() == Some("idempotency_key_reused")),
+            "unexpected error: {:?}",
+            err
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), 1, "a 422 is not re-sent");
+    }
+
+    #[test]
+    fn error_retry_after_reads_an_http_date() {
+        let at = SystemTime::now() + Duration::from_secs(60);
+        let api = ApiError::from_response(
+            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            Some(&format_imf_fixdate(at)),
+            r#"{"error":"busy","code":"overloaded"}"#,
+        );
+        let wait = api.retry_after().expect("a date parses");
+        assert!(wait > Duration::from_secs(50) && wait <= Duration::from_secs(60), "{:?}", wait);
+        let malformed = ApiError::from_response(reqwest::StatusCode::SERVICE_UNAVAILABLE, Some("soon"), "{}");
+        assert_eq!(malformed.retry_after(), None);
+        assert_eq!(malformed.code(), None, "JSON without an error field has no code");
+        assert_eq!(malformed.message(), "{}");
     }
 }
