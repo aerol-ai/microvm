@@ -938,6 +938,11 @@ var Registry = []UseCase{
 	// devbox id and the exec record's body digest are HMACs under the
 	// server key, not plain SHA-256 a reader could test guesses against.
 	{ID: "UC-366", Title: "Security: values derived from secret-bearing request bodies are keyed with the server key and agree across nodes: a Runloop create retried with the same x-request-id through a second node gets the same devbox, another env value under that x-request-id gets another devbox, and one exec body run on sandboxes of two different owners is recorded on both as the same hmac:<key id>:<64 hex> digest, never the body's plain SHA-256 or the secret", Requires: []Capability{CapCluster, CapDocker}, Implemented: true},
+	// Concurrent retries of one Idempotency-Key create (idempotency_concurrent_test.go):
+	// each retry used to run a second create of the id on the owner, fail on
+	// the container name, and release the first create's capacity reservation
+	// and mounts on its way out.
+	{ID: "UC-367", Title: "Idempotency: N concurrent v1 creates (default 8) with one Idempotency-Key and one body, sent at once through every ingress node, all answer 201 naming one sandbox; exactly one sandbox carries the request's tag; and the owner node's GET /v1/capacity holds exactly that sandbox's reservation (deleting it gives back one sandbox at its cpu and memory, not zero)", Requires: []Capability{CapDocker}, Implemented: true},
 }
 
 // byID is a lookup built once for the report generator.
