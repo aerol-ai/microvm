@@ -785,6 +785,10 @@ type Sandbox struct {
 	NetworkBlockAll bool              `json:"network_block_all"`
 	ToolboxEnabled  bool              `json:"toolbox_enabled"`
 	ToolboxToken    string            `json:"-"`
+	// CreateRequestDigest is the keyed digest of the request an
+	// Idempotency-Key create was made with (CreateSandboxRequest's current
+	// one). Stored in sandbox_create_digests, never on the wire.
+	CreateRequestDigest string `json:"-"`
 	// AuditIncarnationID scopes retained audit evidence to this exact sandbox
 	// lifecycle. It is persisted in sandbox_audit_acl, not on the sandbox row,
 	// and never crosses the public API or Raft recovery payload.
