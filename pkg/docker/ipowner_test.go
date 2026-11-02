@@ -59,9 +59,14 @@ func TestSandboxBridge(t *testing.T) {
 			return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(body)), Header: make(http.Header)}, nil
 		})}}
 	}
-	sn, err := respond(`{"Id":"abc","IPAM":{"Config":[{"Subnet":"172.17.0.0/16","Gateway":"172.17.0.1"}]}}`).SandboxBridge(context.Background())
-	if err != nil || sn.Name != "docker0" || sn.Gateway.String() != "172.17.0.1" || sn.Subnet.String() != "172.17.0.0/16" {
+	sn, err := respond(`{"Id":"abc","Driver":"bridge","IPAM":{"Config":[{"Subnet":"172.17.0.0/16","Gateway":"172.17.0.1"}]}}`).SandboxBridge(context.Background())
+	if err != nil || sn.Name != "docker0" || sn.Gateway.String() != "172.17.0.1" || sn.Subnet.String() != "172.17.0.0/16" || sn.Driver != "bridge" || sn.IPRange.IsValid() {
 		t.Fatalf("default bridge = %+v %v", sn, err)
+	}
+	// dockerd's fixed-cidr narrows what IPAM hands out.
+	sn, err = respond(`{"Id":"abc","Driver":"bridge","IPAM":{"Config":[{"Subnet":"172.17.0.0/16","IPRange":"172.17.4.0/24","Gateway":"172.17.0.1"}]}}`).SandboxBridge(context.Background())
+	if err != nil || sn.IPRange.String() != "172.17.4.0/24" {
+		t.Fatalf("fixed-cidr bridge = %+v %v", sn, err)
 	}
 	c := respond(`{"Id":"0123456789abcdef","IPAM":{"Config":[{"Gateway":"fd00::1"},{"Gateway":"10.5.0.1"}]}}`)
 	c.network = "aerolnet"
