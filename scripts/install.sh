@@ -51,6 +51,38 @@ WORKERD_PATH=""
 WORKERD_VERSION="v1.20260717.1"
 WORKERD_SHA256_LINUX_64="7ff61e052347ab3122c43b1e2419ccd68bd91e3c766f9770320591798e0e89a0"
 WORKERD_SHA256_LINUX_ARM64="3ef71b4a692d2705fa4db0636724409be833402f1c9b99094294a5901989680d"
+WITH_FIRECRACKER="false"
+# Version-pinned Firecracker for --with-firecracker: the release and guest
+# kernel Terraform (Terraform/variables.tf) and Ansible
+# (Ansible/inventory/group_vars/all/defaults.yml) pin, so a node set up by
+# hand boots what the cluster tooling is tested on. The kernel bucket
+# publishes no checksums, and the release's .sha256.txt comes from the same
+# place as the tarball, so it cannot catch a replaced release. Every file is
+# checked against a SHA-256 pinned here instead, as for workerd. Bump the
+# versions and all six hashes together.
+FIRECRACKER_VERSION="v1.15.1"
+FIRECRACKER_KERNEL_CI_VERSION="v1.15"
+FIRECRACKER_KERNEL_VERSION="5.10.245"
+FIRECRACKER_SHA256_X86_64="d4a32ab2322d887ca1bc4a4e7afa9cc35393e6362dfc2b3becb389d362e4275a"
+FIRECRACKER_SHA256_AARCH64="00654ac1e702a22744121ea9f10a4f792ebd7c3a744cba587dfac9fcb79b41a5"
+FIRECRACKER_KERNEL_SHA256_X86_64="c453f36520d2f2792ab8e4532a814e4a647a4a41a4c94d4e9083a502800159b1"
+FIRECRACKER_KERNEL_SHA256_AARCH64="f88e4f934b8d9c3f3a58a4df24c3cef4e6d94976d34a9360525c008e7e5df0a7"
+FIRECRACKER_KERNEL_CONFIG_SHA256_X86_64="bccb4a2403d902e1e184e6281270b2b755c6ad6eff1a830c5b8bc788c7b205f8"
+FIRECRACKER_KERNEL_CONFIG_SHA256_AARCH64="ecd245d7a011920456813472f5182db730884a3088dbe79aad4c1e7e23401656"
+# The daemon's own defaults (SB_FIRECRACKER_BINARY, SB_JAILER_BINARY,
+# SB_FIRECRACKER_KERNEL, SB_FIRECRACKER_TEMPLATES_DIR, SB_JAILER_CHROOT_BASE),
+# so sandboxd.env carries no path settings for them.
+FIRECRACKER_BIN="/usr/local/bin/firecracker"
+JAILER_BIN="/usr/local/bin/jailer"
+FIRECRACKER_KERNEL_PATH="/var/lib/sandboxd/firecracker/vmlinux"
+FIRECRACKER_TEMPLATES_DIR="/var/lib/sandboxd/firecracker/templates"
+JAILER_CHROOT_BASE="/srv/jailer"
+# The jailer drops every firecracker process to this user. The daemon's
+# default (uid/gid 1000) is the first login user on most images — on AWS
+# Ubuntu that is `ubuntu`, with sudo — so the VMs get an identity that owns
+# nothing and can log in nowhere, like the isolate jail's.
+JAILER_USER="sandboxd-jailer"
+KVM_DEVICE="/dev/kvm"
 WITH_NVIDIA_GPU="false"
 WITH_AMD_GPU="false"
 WITH_CONTAINERD_ENGINE="false"
@@ -210,6 +242,19 @@ Options:
                                binary. Skips the download and points
                                SB_ISOLATE_WORKERD_PATH at it. Only consulted
                                with --with-isolate.
+  --with-firecracker           Set this node up for the Firecracker runtime
+                               (runtime: "firecracker" on create): each
+                               sandbox runs in its own microVM. Needs
+                               /dev/kvm, so a bare-metal server or a VM with
+                               nested virtualization, on x86_64 or aarch64.
+                               Installs firecracker and jailer to
+                               /usr/local/bin, a guest kernel to
+                               /var/lib/sandboxd/firecracker/vmlinux (one
+                               already there is kept), and skopeo, umoci and
+                               e2fsprogs. Each download is checked against a
+                               SHA-256 pinned in this script. VMs run as the
+                               sandboxd-jailer system user. Writes
+                               SB_ENABLE_FIRECRACKER=true. Not with --local.
   --with-nvidia-gpu            Install nvidia-container-toolkit and register
                                the nvidia OCI runtime in daemon.json. Requires
                                NVIDIA drivers already installed on the host
@@ -624,6 +669,10 @@ while [[ $# -gt 0 ]]; do
 			WITH_ISOLATE="true"
 			shift
 			;;
+		--with-firecracker)
+			WITH_FIRECRACKER="true"
+			shift
+			;;
 		--ingress-proxy-routing)
 			INGRESS_PROXY_ROUTING="true"
 			shift
@@ -723,6 +772,14 @@ while [[ $# -gt 0 ]]; do
 			;;
 	esac
 done
+
+# Firecracker is a runtime for a server node: --cli-only installs no daemon,
+# and --local is the Docker-only developer install (macOS has no KVM at all).
+# Refused before either branch runs, so neither half-installs it.
+if [[ "$WITH_FIRECRACKER" == "true" && ("$CLI_ONLY" == "true" || "$LOCAL_MODE" == "true") ]]; then
+	echo "--with-firecracker sets up a server node; it does not work with --cli-only or --local" >&2
+	exit 1
+fi
 
 if [[ "$CLI_ONLY" == "true" ]]; then
 	install_cli
@@ -1361,6 +1418,9 @@ EOF
 	# binary landed on also tells the cluster it can place gVisor sandboxes.
 	if [[ "$WITH_GVISOR" == "true" ]]; then
 		echo "SB_HOST_RUNTIMES=docker,gvisor" >> /etc/sandboxd/sandboxd.env
+	fi
+	if [[ "$WITH_FIRECRACKER" == "true" ]]; then
+		firecracker_environment >> /etc/sandboxd/sandboxd.env
 	fi
 	# Isolate runtime (plans/isolate-runtime.md). SB_ENABLE_ISOLATE is enough
 	# for advertisement — the daemon appends "isolate" to SupportedRuntimes
@@ -2305,6 +2365,180 @@ register_isolate_runtime() {
 	fi
 }
 
+# firecracker_preflight refuses a host Firecracker cannot run on. It runs
+# before anything is installed: without it a non-KVM host gets Docker, Caddy
+# and sandboxd, and only the first runtime:"firecracker" create fails.
+firecracker_preflight() {
+	if [[ "$(uname -s)" != "Linux" ]]; then
+		echo "--with-firecracker: Firecracker runs on Linux only" >&2
+		exit 1
+	fi
+	case "$(uname -m)" in
+		x86_64 | amd64 | aarch64 | arm64) ;;
+		*)
+			echo "--with-firecracker: unsupported architecture $(uname -m); Firecracker runs on x86_64 and aarch64" >&2
+			exit 1
+			;;
+	esac
+	if [[ ! -e "$KVM_DEVICE" ]]; then
+		{
+			echo "--with-firecracker: $KVM_DEVICE is missing, so this host cannot run Firecracker VMs."
+			echo "Firecracker needs hardware virtualization (KVM):"
+			echo "  * AWS: use a bare-metal instance type (c5.metal, m5zn.metal, c7g.metal ...)."
+			echo "    Other instance types are VMs themselves and have no /dev/kvm."
+			echo "  * GCP or Azure: use a machine type with nested virtualization turned on."
+			echo "  * Your own server: turn on Intel VT-x or AMD-V in the BIOS, then run"
+			echo "    'sudo modprobe kvm_intel' (or kvm_amd)."
+			echo "Or re-run without --with-firecracker."
+		} >&2
+		exit 1
+	fi
+}
+
+# firecracker_binary_version prints the first line of `<bin> --version`
+# ("Firecracker v1.15.1", "Jailer v1.15.1"), or nothing when bin is missing
+# or does not run.
+firecracker_binary_version() {
+	local out
+	[[ -x "$1" ]] || return 0
+	out="$("$1" --version 2>/dev/null)" || return 0
+	printf '%s\n' "${out%%$'\n'*}"
+}
+
+# firecracker_verify stops the install unless file $1 has SHA-256 $2.
+firecracker_verify() {
+	if ! echo "$2  $1" | sha256sum -c - >/dev/null; then
+		echo "--with-firecracker: checksum verification failed for ${1##*/} (pinned $2)" >&2
+		exit 1
+	fi
+}
+
+# install_firecracker_release installs firecracker and jailer from the pinned
+# release, unless both already report the pinned version. A different version
+# is replaced, as the Ansible install does.
+install_firecracker_release() {
+	local arch="$1" sha="$2" tmp_dir="$3"
+	if [[ "$(firecracker_binary_version "$FIRECRACKER_BIN")" == "Firecracker $FIRECRACKER_VERSION" &&
+		"$(firecracker_binary_version "$JAILER_BIN")" == "Jailer $FIRECRACKER_VERSION" ]]; then
+		echo "firecracker and jailer $FIRECRACKER_VERSION already installed"
+		return 0
+	fi
+	local tarball="firecracker-${FIRECRACKER_VERSION}-${arch}.tgz"
+	local url="https://github.com/firecracker-microvm/firecracker/releases/download/${FIRECRACKER_VERSION}/${tarball}"
+	echo "Downloading Firecracker ${FIRECRACKER_VERSION} for ${arch} from ${url}"
+	if ! curl_download "$url" -o "${tmp_dir}/${tarball}"; then
+		echo "--with-firecracker: failed to download ${url}" >&2
+		exit 1
+	fi
+	firecracker_verify "${tmp_dir}/${tarball}" "$sha"
+	tar -xzf "${tmp_dir}/${tarball}" -C "$tmp_dir"
+	local release="${tmp_dir}/release-${FIRECRACKER_VERSION}-${arch}"
+	install -m 0755 "${release}/firecracker-${FIRECRACKER_VERSION}-${arch}" "$FIRECRACKER_BIN"
+	install -m 0755 "${release}/jailer-${FIRECRACKER_VERSION}-${arch}" "$JAILER_BIN"
+	echo "Installed firecracker and jailer ${FIRECRACKER_VERSION} to ${FIRECRACKER_BIN%/*}"
+}
+
+# install_firecracker_kernel installs the pinned guest kernel and its build
+# config, unless a kernel is already there: an operator's own kernel stays,
+# and so does the one the templates and stopped sandboxes on this node were
+# made with. Either way the config must set CONFIG_VMGENID=y. Without it,
+# VMs restored from one snapshot can start with the same random-number state,
+# and sandboxd's /health reports Firecracker degraded.
+install_firecracker_kernel() {
+	local arch="$1" kernel_sha="$2" config_sha="$3" tmp_dir="$4"
+	local config="${FIRECRACKER_KERNEL_PATH}.config" downloaded="false"
+	if [[ -f "$FIRECRACKER_KERNEL_PATH" ]]; then
+		echo "Keeping the guest kernel already at $FIRECRACKER_KERNEL_PATH"
+		if [[ ! -f "$config" ]]; then
+			echo "--with-firecracker: the kernel at $FIRECRACKER_KERNEL_PATH has no build config at $config." >&2
+			echo "Put the kernel's .config there, or remove the kernel to install the pinned one." >&2
+			exit 1
+		fi
+	else
+		local base="https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/${FIRECRACKER_KERNEL_CI_VERSION}/${arch}"
+		local name="vmlinux-${FIRECRACKER_KERNEL_VERSION}"
+		echo "Downloading guest kernel ${FIRECRACKER_KERNEL_VERSION} for ${arch} from ${base}/${name}"
+		if ! curl_download "${base}/${name}" -o "${tmp_dir}/vmlinux" ||
+			! curl_download "${base}/${name}.config" -o "${tmp_dir}/vmlinux.config"; then
+			echo "--with-firecracker: failed to download the guest kernel from ${base}" >&2
+			exit 1
+		fi
+		firecracker_verify "${tmp_dir}/vmlinux" "$kernel_sha"
+		firecracker_verify "${tmp_dir}/vmlinux.config" "$config_sha"
+		config="${tmp_dir}/vmlinux.config"
+		downloaded="true"
+	fi
+	if ! grep -qx 'CONFIG_VMGENID=y' "$config"; then
+		echo "--with-firecracker: the guest kernel's config ($config) does not set CONFIG_VMGENID=y" >&2
+		exit 1
+	fi
+	if [[ "$downloaded" == "true" ]]; then
+		# Config first: a run cut off between the two leaves no kernel, so the
+		# next run downloads both again instead of keeping a kernel without one.
+		install -d -m 0755 "${FIRECRACKER_KERNEL_PATH%/*}"
+		install -m 0644 "${tmp_dir}/vmlinux.config" "${FIRECRACKER_KERNEL_PATH}.config"
+		install -m 0644 "${tmp_dir}/vmlinux" "$FIRECRACKER_KERNEL_PATH"
+		echo "Installed guest kernel ${FIRECRACKER_KERNEL_VERSION} to $FIRECRACKER_KERNEL_PATH"
+	fi
+}
+
+# install_firecracker sets up what the Firecracker driver needs on this host:
+# firecracker and jailer, the guest kernel and its config, the tools that turn
+# an image into a VM disk, the template and jailer directories, and the
+# jailer's user. Every download is checked before anything is installed from
+# it. Same artifacts as the Terraform bootstrap and Ansible configure-ops.yml.
+install_firecracker() {
+	local arch release_sha kernel_sha config_sha
+	case "$(uname -m)" in
+		x86_64 | amd64)
+			arch="x86_64"
+			release_sha="$FIRECRACKER_SHA256_X86_64"
+			kernel_sha="$FIRECRACKER_KERNEL_SHA256_X86_64"
+			config_sha="$FIRECRACKER_KERNEL_CONFIG_SHA256_X86_64"
+			;;
+		aarch64 | arm64)
+			arch="aarch64"
+			release_sha="$FIRECRACKER_SHA256_AARCH64"
+			kernel_sha="$FIRECRACKER_KERNEL_SHA256_AARCH64"
+			config_sha="$FIRECRACKER_KERNEL_CONFIG_SHA256_AARCH64"
+			;;
+		*)
+			echo "--with-firecracker: unsupported architecture $(uname -m); Firecracker runs on x86_64 and aarch64" >&2
+			exit 1
+			;;
+	esac
+
+	# skopeo and umoci unpack an image, mkfs.ext4 (e2fsprogs) makes the VM's
+	# disk from it, and ip (iproute2) makes each VM's TAP device.
+	apt-get install -y skopeo umoci e2fsprogs iproute2
+
+	local tmp_dir
+	tmp_dir="$(mktemp -d)"
+	# shellcheck disable=SC2064  # capture tmp_dir at trap-install time, not at return
+	trap "rm -rf '$tmp_dir'" RETURN
+
+	install_firecracker_release "$arch" "$release_sha" "$tmp_dir"
+	install_firecracker_kernel "$arch" "$kernel_sha" "$config_sha" "$tmp_dir"
+	install -d -m 0755 "$FIRECRACKER_TEMPLATES_DIR" "$JAILER_CHROOT_BASE"
+	if ! getent passwd "$JAILER_USER" >/dev/null 2>&1; then
+		useradd --system --no-create-home --shell /usr/sbin/nologin --user-group "$JAILER_USER"
+	fi
+}
+
+# firecracker_environment prints the sandboxd.env lines for
+# --with-firecracker. SB_ENABLE_FIRECRACKER also advertises "firecracker" to
+# cluster placement, even next to the SB_HOST_RUNTIMES --with-gvisor writes
+# (pkg/daemon supportedRuntimesForConfig appends it). Every path is the
+# daemon's default; only the jailer's identity has to be written.
+firecracker_environment() {
+	local uid gid
+	uid="$(id -u "$JAILER_USER")"
+	gid="$(id -g "$JAILER_USER")"
+	echo "SB_ENABLE_FIRECRACKER=true"
+	echo "SB_JAILER_UID=$uid"
+	echo "SB_JAILER_GID=$gid"
+}
+
 install_cni_plugins() {
 	# CNI bridge + host-local are required for containerd native netns
 	# (plans/containerd-engine.md §4 / Phase 5). Install under /opt/cni/bin.
@@ -2767,12 +3001,20 @@ if [[ $EUID -ne 0 ]]; then
 	exit 1
 fi
 
+if [[ "$WITH_FIRECRACKER" == "true" ]]; then
+	# Before install_packages, so a host without KVM fails before Docker and
+	# Caddy are installed on it.
+	firecracker_preflight
+fi
 install_packages
 if [[ "$WITH_GVISOR" == "true" ]]; then
 	register_gvisor_runtime
 fi
 if [[ "$WITH_ISOLATE" == "true" ]]; then
 	register_isolate_runtime
+fi
+if [[ "$WITH_FIRECRACKER" == "true" ]]; then
+	install_firecracker
 fi
 if [[ "$WITH_CONTAINERD_ENGINE" == "true" ]]; then
 	install_cni_plugins
