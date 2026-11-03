@@ -14,12 +14,12 @@ timeline
     July 2026 : 1 release : v0.5.5
     September 2026 : 3 releases : v0.5.6 to v0.6.0
     October 2026 : 8 releases : v0.6.1 to v0.6.8
-    November 2026 : 2 releases : v0.6.9 to v0.6.10
+    November 2026 : 3 releases : v0.6.9 to v0.6.11
 ```
 
 | Release line | Releases | Dates | Latest |
 |---|---|---|---|
-| [0.6](#06-release-line) | 11 | Sep 28, 2026 to Nov 2, 2026 | [v0.6.10](#v0610-key-custody-enforced-and-safe-create-retries) |
+| [0.6](#06-release-line) | 12 | Sep 28, 2026 to Nov 3, 2026 | [v0.6.11](#v0611-firecracker-from-installsh-and-stopstart-that-works-and-stays-small) |
 | [0.5](#05-release-line) | 7 | Jun 1, 2026 to Sep 28, 2026 | [v0.5.7](#v057-dependency-updates) |
 | [0.4](#04-release-line) | 1 | May 28, 2026 | [v0.4.1](#v041-firecracker-runtime-wiring) |
 | [0.3](#03-release-line) | 1 | May 24, 2026 | [v0.3.1](#v031-custom-domains-and-image-garbage-collection) |
@@ -27,6 +27,24 @@ timeline
 | [0.1](#01-release-line) | 8 | May 8, 2026 to May 16, 2026 | [v0.1.7](#v017-daytona-and-e2b-compatibility-snapshots-image-builds) |
 
 ## 0.6 release line
+
+### v0.6.11: Firecracker from install.sh, and Stop/Start that works and stays small
+
+*November 3, 2026* · [Full notes](https://github.com/aerol-ai/microvm/releases/tag/v0.6.11)
+
+This release is about Firecracker. `install.sh --with-firecracker` sets a server up for Firecracker sandboxes, the way `--with-gvisor` does for gVisor. A stopped Firecracker sandbox can be started again on servers that run the jailer, which is every production server. And Stop and Start now copy only a sandbox's data, so a stopped sandbox takes about as much disk as it holds, not its full disk size.
+
+> **Stopped Firecracker sandboxes could not be started on earlier releases.** Start failed with `Permission denied (os error 13) rootfs.ext4` on every server that runs the jailer. v0.6.11 fixes Start; the saved format is unchanged, so sandboxes stopped on an earlier release can be started after the upgrade.
+
+- **`install.sh --with-firecracker`.** The installer checks that the server has `/dev/kvm` before it installs anything, then installs Firecracker and its jailer v1.15.1 and guest kernel 5.10.245. Every download is checked against a SHA-256 written into the script. Virtual machines run as a new `sandboxd-jailer` system user. Running it again downloads nothing that is already installed.
+- **Stopped Firecracker sandboxes start again.** The restored disk is now handed to the VM's user before the VM opens it.
+- **Stop and Start keep disks small and are faster.** Copies skip empty space. On an AWS `m5zn.metal`, a sandbox with a 10 GiB disk and 1 GiB of memory that wrote 256 MiB: the saved copy went from 11,265 MiB to 597 MiB, Stop from 108 s to 15 s, and Start from 88 s to 3.6 s.
+
+**Before you upgrade:**
+
+- **Saved copies made by earlier releases stay full-size** until the sandbox's next Stop rewrites them.
+- **Pass `--with-firecracker` on every later run of the installer.** Each run rewrites `/etc/sandboxd/sandboxd.env`, so a run without it turns Firecracker off.
+- **Terraform and Ansible servers are unchanged.** They install Firecracker their own way and run the jailer as uid 1000.
 
 ### v0.6.10: Key custody enforced, and safe create retries
 
