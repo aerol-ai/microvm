@@ -604,9 +604,10 @@ set -x
 ###############################################################################
 # 2d. Firecracker host prerequisites
 #
-# install.sh does not yet know how to provision Firecracker hosts, so the
-# Terraform bootstrap handles the host-side prerequisites for nodes that opt
-# in. URLs are optional: when omitted and auto_install_artifacts is true,
+# install.sh --with-firecracker installs the same pinned release and kernel
+# for a single host, but at fixed paths and from upstream only. This block
+# stays because Terraform also takes private-mirror URLs and per-node paths.
+# URLs are optional: when omitted and auto_install_artifacts is true,
 # bootstrap pulls the arch-matched upstream release + spec.ccfc.min kernel.
 ###############################################################################
 
