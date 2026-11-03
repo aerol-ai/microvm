@@ -320,3 +320,32 @@ func TestLinkOrCopyRootfsCopyIsSparse(t *testing.T) {
 		t.Fatalf("the copy uses %d bytes of disk for two blocks of data", got)
 	}
 }
+
+// The copy goes by the size it read first. A file that is longer by the
+// time its ranges are listed (written to after the stat) must not give
+// ranges past that size, or the copy would not match what was stat'ed.
+func TestDataRangesStopAtTheGivenSize(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "disk")
+	if err := os.WriteFile(path, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Truncate(path, 12<<20); err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	if _, err := f.WriteAt([]byte("data past the size"), 8<<20); err != nil {
+		t.Fatal(err)
+	}
+	// 4 MiB ends before the data, 8 MiB + 10 inside its block, 10 MiB after it.
+	for _, size := range []int64{4 << 20, 8<<20 + 10, 10 << 20} {
+		for _, r := range dataRanges(f, size) {
+			if r.start < 0 || r.end > size || r.end <= r.start {
+				t.Fatalf("dataRanges(size %d) gave %v, outside [0, %d)", size, r, size)
+			}
+		}
+	}
+}

@@ -1940,12 +1940,14 @@ func linkOrCopyRootfs(src, dst string) error {
 		return fmt.Errorf("open template rootfs: %w", err)
 	}
 	defer in.Close()
+	// The copy goes by the file's size, so a directory or device (a size of
+	// 0 or a block count) must not be taken for a file.
 	info, err := in.Stat()
-	if err != nil {
-		return fmt.Errorf("stat template rootfs: %w", err)
+	if err == nil && !info.Mode().IsRegular() {
+		err = fmt.Errorf("%s is not a regular file", src)
 	}
-	if !info.Mode().IsRegular() {
-		return fmt.Errorf("copy template rootfs: %s is not a regular file", src)
+	if err != nil {
+		return fmt.Errorf("copy template rootfs: %w", err)
 	}
 	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
 	if err != nil {
