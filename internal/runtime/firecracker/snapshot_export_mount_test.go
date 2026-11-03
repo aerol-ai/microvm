@@ -221,3 +221,58 @@ func TestWriteRootfsTarKeepsNamesThatAreNotUTF8(t *testing.T) {
 		t.Fatalf("entries %v, want caf\\xe9/menu", headers)
 	}
 }
+
+// lockDir makes dir undeletable for a non-root user (its entries cannot be
+// unlinked) and gives the permission back before the test's temp dirs go.
+func lockDir(t *testing.T, dir string) {
+	t.Helper()
+	writeGuestFile(t, dir, "/held", "x")
+	if err := os.Chmod(dir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+}
+
+// A work dir that will not go is only logged: the image is already in the
+// store, and the boot sweep gets the dir next time.
+func TestCreateSnapshotOnlyWarnsWhenItsWorkDirStays(t *testing.T) {
+	if os.Getuid() == 0 {
+		t.Skip("root removes entries of mode-500 dirs")
+	}
+	f, store, mounter := stoppedSandboxForSnapshot(t, "sb-stuck")
+	var locked string
+	mounter.fill = func(t *testing.T, dir string) {
+		guestTree(t, dir)
+		locked = filepath.Join(dir, "srv")
+		lockDir(t, locked)
+	}
+	if _, err := f.driver.CreateSnapshot(context.Background(), "sb-stuck", "r:1"); err != nil {
+		t.Fatalf("CreateSnapshot: %v, want the snapshot to stand", err)
+	}
+	if _, ok := store.imported["r:1"]; !ok {
+		t.Fatal("nothing was imported")
+	}
+	if _, err := os.Stat(locked); err != nil {
+		t.Fatalf("the locked dir is gone (%v); the test did not reach the warning", err)
+	}
+}
+
+func TestSweepSnapshotExportsWarnsOnWhatItCannotRemove(t *testing.T) {
+	if os.Getuid() == 0 {
+		t.Skip("root removes entries of mode-500 dirs")
+	}
+	f := newDriverFixture(t)
+	dir, err := f.driver.snapshotExportDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	locked := filepath.Join(dir, "sb-crashed-1", "mnt", "srv")
+	if err := os.MkdirAll(locked, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	lockDir(t, locked)
+	f.driver.SweepSnapshotExports()
+	if _, err := os.Stat(locked); err != nil {
+		t.Fatalf("the locked dir is gone (%v); the test did not reach the warning", err)
+	}
+}
