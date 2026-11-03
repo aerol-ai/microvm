@@ -173,6 +173,7 @@ const getBlogSidebarConfig = (): NavigationGroup[] => [
       link('/engineering-snapshot-correctness', '- Correct snapshot clones'),
       link('/engineering-frozen-kernel-problem', '- The frozen-kernel problem'),
       link('/randomness-in-cloned-sandboxes', '- Randomness in FC clones'),
+      link('/engineering-sparse-disks', '- Stop and start, disk stays small'),
     ],
   },
   {

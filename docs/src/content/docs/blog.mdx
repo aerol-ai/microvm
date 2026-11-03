@@ -31,6 +31,7 @@ These posts go deeper than the docs. They explain how AerolVM works inside, why 
 | [Correct snapshot clones](/engineering-snapshot-correctness/) | Five ways a cloned Firecracker snapshot can go wrong, and the rule that keeps each clone safe and unique. |
 | [The frozen-kernel problem](/engineering-frozen-kernel-problem/) | Why clones of one snapshot start out as the same machine, and how each one is made unique before your code runs. |
 | [Randomness in clones](/randomness-in-cloned-sandboxes/) | How Firecracker sandboxes cloned from one template avoid handing out the same random numbers. |
+| [Stop and start without filling the disk](/engineering-sparse-disks/) | Why copying a VM disk the plain way turns a few hundred MiB into 10 GiB, and how AerolVM's copy keeps the holes. Measured on bare metal. |
 
 ## Architecture
 
