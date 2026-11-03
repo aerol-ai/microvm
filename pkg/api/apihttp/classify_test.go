@@ -55,6 +55,7 @@ func TestClassify(t *testing.T) {
 		{"stopped mid request", service.ErrSandboxStoppedMidRequest, http.StatusConflict, 0, "", ErrKindSandboxNotRunning},
 		{"not resumable", service.ErrSandboxNotResumable, http.StatusConflict, 0, "", ErrKindSandboxNotResumable},
 		{"runtime not implemented", models.ErrRuntimeNotImplemented, http.StatusNotImplemented, 0, "", ErrKindOther},
+		{"snapshot of a running firecracker sandbox", fmt.Errorf("stop the sandbox before taking a snapshot of it: %w", models.ErrSnapshotSourceNotReady), http.StatusConflict, 0, "", ErrKindOther},
 		// The service's refusal matches both sentinels; it keeps its code.
 		{"network policy unenforced", errors.Join(service.ErrNetworkPolicyUnenforced, models.ErrRuntimeNotImplemented), http.StatusNotImplemented, 0, models.ErrorCodeNetworkPolicyUnenforced, ErrKindOther},
 		{"mount tool unavailable", missingMountS3, http.StatusNotImplemented, 0, models.ErrorCodeMountToolUnavailable, ErrKindOther},

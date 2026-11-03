@@ -83,6 +83,13 @@ const (
 	// set_env it is mandatory: the host fails the create when it is not
 	// acked. The first token sticks; see server.adoptOverVsock.
 	OpAdopt VsockOp = "adopt"
+	// OpSyncFS asks the guest to flush every filesystem to its disk. Stop
+	// sends it just before pausing the VM: the paused VM's memory holds any
+	// writes still in the guest's page cache, which a restore brings back,
+	// but a snapshot made from the disk alone (CreateSnapshot) would lose
+	// them. Optional like set_env: an older agent answers "unknown op", and
+	// the host records that the saved disk was not flushed.
+	OpSyncFS VsockOp = "sync_fs"
 )
 
 // VsockMessage is the request shape. Newline-delimited JSON, one
@@ -126,6 +133,12 @@ type vsockEnvHandler interface {
 // reason as vsockEnvHandler: a handler without it answers "unknown op".
 type vsockAdoptHandler interface {
 	OnAdopt(ctx context.Context, raw json.RawMessage) error
+}
+
+// vsockSyncHandler is the optional sync_fs capability, separate for the same
+// reason as vsockEnvHandler.
+type vsockSyncHandler interface {
+	OnSyncFS(ctx context.Context) error
 }
 
 // identityAdopter is the part of the server the adopt op drives.
@@ -209,6 +222,11 @@ func dispatchVsock(ctx context.Context, msg VsockMessage, handler VsockHandler) 
 			return h.OnAdopt(ctx, msg.Data)
 		}
 		return fmt.Errorf("unknown op %q", msg.Op)
+	case OpSyncFS:
+		if h, ok := handler.(vsockSyncHandler); ok {
+			return h.OnSyncFS(ctx)
+		}
+		return fmt.Errorf("unknown op %q", msg.Op)
 	case "":
 		return errors.New("missing op")
 	default:
@@ -226,6 +244,9 @@ type quiesceOps interface {
 	ReseedRandom() error
 	SetWallclock(unixNs int64) error
 	ConfigureNetwork(guestNetworkConfig) error
+	// SyncFilesystems flushes every filesystem's dirty data and metadata
+	// to its disk (sync(2)).
+	SyncFilesystems() error
 }
 
 type guestNetworkConfig struct {
@@ -294,6 +315,18 @@ func (h *quiesceHandler) OnPreSnapshot(ctx context.Context, _ json.RawMessage) e
 		}
 	}
 	h.logger.Info("vsock: pre_snapshot quiesce complete")
+	return nil
+}
+
+// OnSyncFS flushes the guest's filesystems so the disk the host saves on Stop
+// holds every write made before it, not only the ones the kernel had
+// already written back. Unlike pre_snapshot it is not best-effort: an error
+// goes back to the host, which then records the saved disk as unflushed.
+func (h *quiesceHandler) OnSyncFS(_ context.Context) error {
+	if err := h.quiesce.SyncFilesystems(); err != nil {
+		return fmt.Errorf("sync filesystems: %w", err)
+	}
+	h.logger.Info("vsock: sync_fs complete")
 	return nil
 }
 

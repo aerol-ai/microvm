@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"strings"
 	"time"
 
@@ -50,6 +51,13 @@ type snapshotBackend interface {
 	// unpack realizes the image's layers in the snapshotter so it can back a new
 	// container via WithNewSnapshot.
 	unpack(ctx context.Context, name, snapshotter string) error
+	// writeLayer streams a tar into the store as a gzip layer (Firecracker
+	// snapshot import, image_import.go).
+	writeLayer(ctx context.Context, ref string, rootfs io.Reader) (ocispec.Descriptor, digest.Digest, error)
+	// updateImage repoints an existing image record.
+	updateImage(ctx context.Context, img images.Image) (images.Image, error)
+	// exportImage writes an image as an OCI archive.
+	exportImage(ctx context.Context, name string, w io.Writer) error
 }
 
 type rawSnapshotBackend struct {

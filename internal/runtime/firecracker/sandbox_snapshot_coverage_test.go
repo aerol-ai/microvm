@@ -80,7 +80,7 @@ func TestWriteSandboxSnapshot_HashStateFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 	handle := &warmDestroyHandle{runDir: runDir}
-	err := d.writeSandboxSnapshot(context.Background(), "sb-hash-fail", handle, client, 3)
+	err := d.writeSandboxSnapshot(context.Background(), "sb-hash-fail", handle, client, 3, false)
 	if err == nil || !strings.Contains(err.Error(), "hash state") {
 		t.Fatalf("hash state error: got %v", err)
 	}
@@ -158,7 +158,7 @@ func TestWriteSandboxSnapshot_HashMemoryFailure(t *testing.T) {
 	}
 	handle := &warmDestroyHandle{runDir: runDir}
 	client := &hashFailSnapshotClient{fakeClient: *newFakeClient(), failState: false}
-	if err := d.writeSandboxSnapshot(context.Background(), "sb-hash-mem", handle, client, 3); err == nil || !strings.Contains(err.Error(), "hash memory") {
+	if err := d.writeSandboxSnapshot(context.Background(), "sb-hash-mem", handle, client, 3, false); err == nil || !strings.Contains(err.Error(), "hash memory") {
 		t.Fatalf("hash memory: got %v", err)
 	}
 }
@@ -172,7 +172,7 @@ func TestWriteSandboxSnapshot_SecondWriteRotates(t *testing.T) {
 	}
 	handle := &warmDestroyHandle{runDir: runDir}
 	for i := 0; i < 2; i++ {
-		if err := d.writeSandboxSnapshot(context.Background(), "sb-rotate-2", handle, client, uint32(3+i)); err != nil {
+		if err := d.writeSandboxSnapshot(context.Background(), "sb-rotate-2", handle, client, uint32(3+i), false); err != nil {
 			t.Fatalf("write %d: %v", i, err)
 		}
 	}
@@ -196,7 +196,7 @@ func TestWriteSandboxSnapshot_BaseNotDirectory(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(runDir, rootfsFileName), []byte("r"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	err = d.writeSandboxSnapshot(context.Background(), "sb-base-file", &warmDestroyHandle{runDir: runDir}, newFakeClient(), 3)
+	err = d.writeSandboxSnapshot(context.Background(), "sb-base-file", &warmDestroyHandle{runDir: runDir}, newFakeClient(), 3, false)
 	if err == nil || !strings.Contains(err.Error(), "create snapshot base") {
 		t.Fatalf("base not dir: got %v", err)
 	}
@@ -214,7 +214,7 @@ func TestWriteSandboxSnapshot_RemoveOldBackupWarn(t *testing.T) {
 	}
 	handle := &warmDestroyHandle{runDir: runDir}
 	ctx := context.Background()
-	if err := d.writeSandboxSnapshot(ctx, "sb-old-warn", handle, client, 3); err != nil {
+	if err := d.writeSandboxSnapshot(ctx, "sb-old-warn", handle, client, 3, false); err != nil {
 		t.Fatalf("first write: %v", err)
 	}
 	finalDir, _, _, _, _, _ := d.sandboxSnapshotPaths("sb-old-warn")
@@ -226,7 +226,7 @@ func TestWriteSandboxSnapshot_RemoveOldBackupWarn(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer os.Chmod(oldDir, 0o700)
-	if err := d.writeSandboxSnapshot(ctx, "sb-old-warn", handle, client, 4); err != nil {
+	if err := d.writeSandboxSnapshot(ctx, "sb-old-warn", handle, client, 4, false); err != nil {
 		t.Fatalf("second write: %v", err)
 	}
 }

@@ -134,6 +134,11 @@ func Classify(err error) Classification {
 	case errors.Is(err, service.ErrSandboxNotResumable):
 		return Classification{Status: http.StatusConflict, Message: err.Error(), Kind: ErrKindSandboxNotResumable}
 
+	// A snapshot of a sandbox in a state its runtime cannot snapshot (a
+	// running Firecracker sandbox). The message says what to do.
+	case errors.Is(err, models.ErrSnapshotSourceNotReady):
+		return Classification{Status: http.StatusConflict, Message: err.Error()}
+
 	// Wake-aware proxy sentinels.
 	case errors.Is(err, service.ErrSandboxManuallyStopped):
 		return Classification{Status: http.StatusConflict, Message: err.Error()}
