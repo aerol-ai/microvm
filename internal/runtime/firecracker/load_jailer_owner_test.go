@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"testing"
 )
@@ -117,5 +118,34 @@ func TestTemplateLoadChownsCopiedRootfsBeforeLoad(t *testing.T) {
 	}
 	if patch := client.drivePatches[rootDriveID]; patch.PathOnHost != rootfsFileName {
 		t.Fatalf("root drive patch path = %q, want %q", patch.PathOnHost, rootfsFileName)
+	}
+}
+
+// A rootfs that cannot be staged stops a template load before LoadSnapshot,
+// so Firecracker never opens a disk it cannot use.
+func TestTemplateLoadStopsWhenTheRootfsCannotBeStaged(t *testing.T) {
+	f := newDriverFixture(t)
+	f.driver.cfg.UseJailer = true
+	// Ids this process may chown its own files to, with at least one of them
+	// non-zero so staging always chowns: as root, any gid; otherwise its own.
+	gid := os.Getgid()
+	if os.Getuid() == 0 {
+		gid = 4242
+	}
+	f.driver.cfg.JailerUID, f.driver.cfg.JailerGID = os.Getuid(), gid
+	mem, state := writeLoadArtifacts(t, t.TempDir())
+	client := newFakeClient()
+	loaded := false
+	client.loadSnapshotHook = func() error { loaded = true; return nil }
+
+	err := f.driver.configureVMMForLoad(context.Background(), client, &TemplateResolution{
+		SnapshotMemoryPath: mem,
+		SnapshotStatePath:  state,
+	}, filepath.Join(t.TempDir(), rootfsFileName), &TapSlot{TapName: "tap0"}, "")
+	if err == nil || !strings.Contains(err.Error(), "stage snapshot rootfs") {
+		t.Fatalf("template load with a missing rootfs: got %v, want a stage snapshot rootfs error", err)
+	}
+	if loaded {
+		t.Fatal("LoadSnapshot ran although the rootfs could not be staged")
 	}
 }
