@@ -1123,6 +1123,14 @@ func (d *Driver) configureVMMForLoad(ctx context.Context, client VMMClient, snap
 	if err != nil {
 		return fmt.Errorf("firecracker runtime: stage snapshot load artifacts: %w", err)
 	}
+	// Staged before LoadSnapshot, which opens the drive read-write as the
+	// jailer's uid. A hard link to the template's rootfs already has that
+	// owner, but the cross-device copy linkOrCopyRootfs falls back to is
+	// root's until chowned (the stopped-sandbox restore hit exactly this).
+	rootfsAPIPath, err := d.chrootFilePath(runDir, rootfsPath, rootfsFileName)
+	if err != nil {
+		return fmt.Errorf("firecracker runtime: stage snapshot rootfs: %w", err)
+	}
 	var overlayAPIPath string
 	if overlayPath != "" {
 		overlayAPIPath, err = d.chrootFilePath(runDir, overlayPath, overlayFileName)
@@ -1144,10 +1152,6 @@ func (d *Driver) configureVMMForLoad(ctx context.Context, client VMMClient, snap
 		}},
 	}); err != nil {
 		return fmt.Errorf("firecracker runtime: LoadSnapshot: %w", err)
-	}
-	rootfsAPIPath, err := d.chrootFilePath(runDir, rootfsPath, rootfsFileName)
-	if err != nil {
-		return fmt.Errorf("firecracker runtime: stage snapshot rootfs: %w", err)
 	}
 	if err := client.PatchDrive(ctx, rootDriveID, firecracker.DrivePatch{
 		DriveID:    rootDriveID,

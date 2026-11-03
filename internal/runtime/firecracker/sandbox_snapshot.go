@@ -478,6 +478,15 @@ func (d *Driver) configureSandboxSnapshotRestore(ctx context.Context, client VMM
 	if err != nil {
 		return fmt.Errorf("firecracker runtime: stage snapshot load artifacts: %w", err)
 	}
+	// LoadSnapshot reopens every drive the snapshot names, read-write, as the
+	// jailer's uid. startFromSandboxSnapshot copied the rootfs in as root, so
+	// it is chowned here, before the load, like the overlay (#248). Chowned
+	// after the load, every Start under the jailer failed with
+	// "Permission denied (os error 13) rootfs.ext4".
+	rootfsAPIPath, err := d.chrootFilePath(runDir, rootfsPath, rootfsFileName)
+	if err != nil {
+		return fmt.Errorf("firecracker runtime: stage snapshot rootfs: %w", err)
+	}
 	var overlayAPIPath string
 	if manifest.HasOverlay {
 		overlayAPIPath, err = d.chrootFilePath(runDir, overlayPath, overlayFileName)
@@ -499,10 +508,6 @@ func (d *Driver) configureSandboxSnapshotRestore(ctx context.Context, client VMM
 		}},
 	}); err != nil {
 		return fmt.Errorf("firecracker runtime: LoadSnapshot: %w", err)
-	}
-	rootfsAPIPath, err := d.chrootFilePath(runDir, rootfsPath, rootfsFileName)
-	if err != nil {
-		return fmt.Errorf("firecracker runtime: stage snapshot rootfs: %w", err)
 	}
 	if err := client.PatchDrive(ctx, rootDriveID, firecracker.DrivePatch{
 		DriveID:    rootDriveID,
