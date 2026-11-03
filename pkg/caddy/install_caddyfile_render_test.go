@@ -53,7 +53,7 @@ func renderInstall(t *testing.T, installSh string, vars map[string]string) (env,
 		"DOMAIN": "sandbox.example.com", "DNS_PROVIDER": "cloudflare", "TLS_ISSUER": "acme", "CADDY_STORAGE_S3": "false",
 		"PAT_TOKEN": "pat", "NODE_NAME": "n1", "PUBLIC_HOST": "203.0.113.1", "INSTALL_PREFIX": "/usr/local/bin",
 		"IDLE_TIMEOUT_MIN": "0", "L4_TLS_LISTEN_DEFAULT": ":443", "INGRESS_PROXY_ROUTING": "false",
-		"ROUTE_DNS_ADDR": "127.0.0.1:53053", "ROUTE_DNS_LINK_ADDR": "169.254.53.53:53053", "WITH_GVISOR": "false", "WITH_ISOLATE": "false", "WITH_CONTAINERD_ENGINE": "false",
+		"ROUTE_DNS_ADDR": "127.0.0.1:53053", "ROUTE_DNS_LINK_ADDR": "169.254.53.53:53053", "WITH_GVISOR": "false", "WITH_ISOLATE": "false", "WITH_FIRECRACKER": "false", "WITH_CONTAINERD_ENGINE": "false",
 		"PAT_SCOPE": "any", "PUBLIC_API_SOCKET": "/run/sandboxd-public/api.sock", "L4_PROXY_PROTOCOL": "false",
 		"ACME_CA": "", "ACME_CA_ROOT": "", "ACME_EMAIL": "", "CADDY_STORAGE_S3_ACCESS_KEY": "",
 		// --lb-health-port: empty writes no health listener.

@@ -163,16 +163,6 @@ func TestWriteSandboxSnapshot_HashMemoryFailure(t *testing.T) {
 	}
 }
 
-func TestCopyFile_LinuxProcCopyError(t *testing.T) {
-	if runtime.GOOS != "linux" {
-		t.Skip("linux-specific copy failure")
-	}
-	err := copyFile("/proc/self/mem", filepath.Join(t.TempDir(), "dst"))
-	if err == nil || !strings.Contains(err.Error(), "copy ") {
-		t.Fatalf("proc mem copy: got %v", err)
-	}
-}
-
 func TestWriteSandboxSnapshot_SecondWriteRotates(t *testing.T) {
 	d := &Driver{cfg: Config{RunDir: filepath.Join(t.TempDir(), "run")}}
 	client := newFakeClient()
@@ -264,17 +254,20 @@ func TestConfigureSandboxSnapshotRestore_OverlayPatchError(t *testing.T) {
 type failingCopyDest struct {
 	buf      []byte
 	writeErr error
+	truncErr error
 	syncErr  error
 	closeErr error
 }
 
-func (f *failingCopyDest) Write(p []byte) (int, error) {
+func (f *failingCopyDest) WriteAt(p []byte, _ int64) (int, error) {
 	if f.writeErr != nil {
 		return 0, f.writeErr
 	}
 	f.buf = append(f.buf, p...)
 	return len(p), nil
 }
+
+func (f *failingCopyDest) Truncate(int64) error { return f.truncErr }
 
 func (f *failingCopyDest) Sync() error { return f.syncErr }
 
@@ -303,6 +296,14 @@ func TestCopyFile_InjectedIOFailures(t *testing.T) {
 		}
 		if err := copyFile(src, filepath.Join(dir, "dst-copy")); err == nil || !strings.Contains(err.Error(), "copy ") {
 			t.Fatalf("copy: %v", err)
+		}
+	})
+	t.Run("truncate", func(t *testing.T) {
+		copyFileOpenDst = func(string, os.FileMode) (copyFileDest, error) {
+			return &failingCopyDest{truncErr: os.ErrInvalid}, nil
+		}
+		if err := copyFile(src, filepath.Join(dir, "dst-truncate")); err == nil || !strings.Contains(err.Error(), "truncate to ") {
+			t.Fatalf("truncate: %v", err)
 		}
 	})
 	t.Run("sync", func(t *testing.T) {

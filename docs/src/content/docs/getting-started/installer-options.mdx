@@ -61,7 +61,7 @@ A plain container is the default. You can add stronger walls between the sandbox
 | Containers on containerd | `--with-containerd-engine` | Runs containers through containerd (the engine Docker itself is built on) instead of Docker. Needs containerd's socket at `/run/containerd/containerd.sock`. |
 | [gVisor](/gvisor-sandbox/) | `--with-gvisor` | Adds a user-space kernel: a layer that handles the sandbox's requests to the operating system, so they never reach the server's kernel directly. |
 | [V8 isolate](/isolate-sandbox/) | `--with-isolate` | Installs Cloudflare's `workerd` and turns on JavaScript isolates. Off by default. |
-| [Firecracker](/firecracker-sandbox/) | No flag. Set it up by hand. | Each sandbox is a small virtual machine. Needs a bare-metal server. See [Turn on Firecracker](#turn-on-firecracker). |
+| [Firecracker](/firecracker-sandbox/) | `--with-firecracker` | Each sandbox is a small virtual machine with its own Linux kernel. Needs `/dev/kvm`, which usually means a bare-metal server. See [Turn on Firecracker](#turn-on-firecracker). |
 | [WebAssembly (WASM)](/wasm-sandbox/) | No flag. Set `SB_ENABLE_WASM=true`. | Runs WASI modules (WebAssembly programs with file and clock access). See [Turn on WebAssembly](#turn-on-webassembly). |
 | Kata Containers | Not available | Create requests fail with `runtime not yet implemented on this build`. |
 
@@ -143,17 +143,59 @@ The SSH gateway listens on `0.0.0.0:2220`. Change it with `SB_SSH_LISTEN_ADDR`.
 - `--with-gvisor` installs `runsc` and `containerd-shim-runsc-v1`, registers `runsc` in `/etc/docker/daemon.json`, and restarts Docker if that file changed. It also writes `SB_HOST_RUNTIMES=docker,gvisor`. Use `--runsc-path` to point at a `runsc` you already have.
 - `--with-containerd-engine` installs the CNI networking plugins (`bridge`, `host-local`, `loopback`) in `/opt/cni/bin` and writes `SB_CONTAINER_ENGINE=containerd`. Docker stays installed, so older sandboxes keep working.
 - `--with-isolate` installs `workerd`, Cloudflare's program for running JavaScript, to `/usr/local/bin/workerd`. The version is pinned and its checksum is checked. It writes `SB_ENABLE_ISOLATE=true` and creates a `sandboxd-isolate` system user and the jail folder `/srv/isolate-jail`, so each workerd process runs locked down. Use `--workerd-path` to point at a `workerd` you already have.
+- `--with-firecracker` first checks that the server has `/dev/kvm`, and stops before it installs anything if not. Then it installs `firecracker` and `jailer` to `/usr/local/bin`, a guest Linux kernel to `/var/lib/sandboxd/firecracker/vmlinux`, and `skopeo`, `umoci` and `e2fsprogs`, which turn container images into virtual machine disks. The versions are pinned and every download's checksum is checked. It creates a `sandboxd-jailer` system user, so each virtual machine runs without root rights, and writes `SB_ENABLE_FIRECRACKER=true`. Not with `--local`.
 
 ### Turn on Firecracker
 
-There is no installer flag for Firecracker. The server needs `/dev/kvm`, which usually means a bare-metal machine. Then:
+The server needs `/dev/kvm`. That means a bare-metal server, or a virtual machine with nested virtualization turned on. On AWS, pick a `.metal` instance type. Check before you install. This needs no `sudo`:
 
-1. Put the `firecracker` and `jailer` programs in `/usr/local/bin`.
-2. Put a guest Linux kernel at `/var/lib/sandboxd/firecracker/vmlinux`. Put its config next to it as `vmlinux.config`. The config must contain `CONFIG_VMGENID=y`.
-3. Install `skopeo` and `umoci`. They turn container images into virtual machine disks.
-4. Add `SB_ENABLE_FIRECRACKER=true` to `/etc/sandboxd/sandboxd.env` and restart `sandboxd`.
+```bash
+ls -l /dev/kvm
+```
 
-If your files live elsewhere, settings such as `SB_FIRECRACKER_BINARY`, `SB_JAILER_BINARY` and `SB_FIRECRACKER_KERNEL` point to them. The [cluster setup](/cluster-setup/) does all of this for you with `with_firecracker = true`. Next, build images with [Firecracker templates](/firecracker-templates/).
+If it is missing on your own hardware, turn on Intel VT-x or AMD-V in the BIOS, then load the KVM module. Loading it needs root. On AMD, use `kvm_amd`:
+
+```bash
+sudo modprobe kvm_intel
+```
+
+Then add `--with-firecracker` to the install command. The installer runs as root, so pipe it to `sudo bash`:
+
+```bash
+curl -fsSL https://aerolvm.aerol.ai | sudo bash -s -- \
+    --domain sandbox.example.com \
+    --pat-token your-secret-pat \
+    --dns-provider cloudflare \
+    --dns-api-token your-cloudflare-api-token \
+    --with-firecracker
+```
+
+Without `/dev/kvm` the installer stops before it installs anything, and tells you what to change. Running it again is safe: it downloads nothing that is already in place. Pass `--with-firecracker` on every later run too. A run without it turns Firecracker off.
+
+To use your own guest kernel, put it in place before you install. The installer keeps a kernel it finds there, and downloads its own only when there is none. The folder belongs to root, so each step needs `sudo`:
+
+```bash
+sudo install -D -m 0644 vmlinux /var/lib/sandboxd/firecracker/vmlinux
+sudo install -m 0644 vmlinux.config /var/lib/sandboxd/firecracker/vmlinux.config
+sudo grep -x CONFIG_VMGENID=y /var/lib/sandboxd/firecracker/vmlinux.config
+```
+
+The last command must print `CONFIG_VMGENID=y`. If it prints nothing, the installer refuses the kernel.
+
+To set Firecracker up by hand instead, first load your own settings file (see [Keep your own settings](#keep-your-own-settings)). Then run these from a folder that holds `firecracker`, `jailer`, `vmlinux` and `vmlinux.config`. Every step but `id` changes the system, so it needs `sudo`:
+
+```bash
+sudo install -m 0755 firecracker jailer /usr/local/bin/
+sudo install -D -m 0644 vmlinux /var/lib/sandboxd/firecracker/vmlinux
+sudo install -m 0644 vmlinux.config /var/lib/sandboxd/firecracker/vmlinux.config
+sudo apt-get install -y skopeo umoci e2fsprogs
+sudo useradd --system --no-create-home --shell /usr/sbin/nologin --user-group sandboxd-jailer
+printf 'SB_ENABLE_FIRECRACKER=true\nSB_JAILER_UID=%s\nSB_JAILER_GID=%s\n' \
+    "$(id -u sandboxd-jailer)" "$(id -g sandboxd-jailer)" | sudo tee -a /etc/sandboxd/local.env
+sudo systemctl restart sandboxd
+```
+
+The `sandboxd-jailer` user keeps each virtual machine from running as a login user. If your files live elsewhere, settings such as `SB_FIRECRACKER_BINARY`, `SB_JAILER_BINARY` and `SB_FIRECRACKER_KERNEL` point to them. The [cluster setup](/cluster-setup/) does all of this for you with `with_firecracker = true`. Next, build images with [Firecracker templates](/firecracker-templates/).
 
 ### Turn on WebAssembly
 

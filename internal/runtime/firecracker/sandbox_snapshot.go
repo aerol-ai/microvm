@@ -478,6 +478,15 @@ func (d *Driver) configureSandboxSnapshotRestore(ctx context.Context, client VMM
 	if err != nil {
 		return fmt.Errorf("firecracker runtime: stage snapshot load artifacts: %w", err)
 	}
+	// LoadSnapshot reopens every drive the snapshot names, read-write, as the
+	// jailer's uid. startFromSandboxSnapshot copied the rootfs in as root, so
+	// it is chowned here, before the load, like the overlay (#248). Chowned
+	// after the load, every Start under the jailer failed with
+	// "Permission denied (os error 13) rootfs.ext4".
+	rootfsAPIPath, err := d.chrootFilePath(runDir, rootfsPath, rootfsFileName)
+	if err != nil {
+		return fmt.Errorf("firecracker runtime: stage snapshot rootfs: %w", err)
+	}
 	var overlayAPIPath string
 	if manifest.HasOverlay {
 		overlayAPIPath, err = d.chrootFilePath(runDir, overlayPath, overlayFileName)
@@ -500,10 +509,6 @@ func (d *Driver) configureSandboxSnapshotRestore(ctx context.Context, client VMM
 	}); err != nil {
 		return fmt.Errorf("firecracker runtime: LoadSnapshot: %w", err)
 	}
-	rootfsAPIPath, err := d.chrootFilePath(runDir, rootfsPath, rootfsFileName)
-	if err != nil {
-		return fmt.Errorf("firecracker runtime: stage snapshot rootfs: %w", err)
-	}
 	if err := client.PatchDrive(ctx, rootDriveID, firecracker.DrivePatch{
 		DriveID:    rootDriveID,
 		PathOnHost: rootfsAPIPath,
@@ -523,9 +528,11 @@ func (d *Driver) configureSandboxSnapshotRestore(ctx context.Context, client VMM
 
 // copyFileDst is the destination open used by copyFile. Production opens a
 // real file; tests swap it to inject Sync/Close/Write failures that real
-// filesystems almost never surface.
+// filesystems almost never surface. WriteAt and Truncate let copySparse
+// write only the blocks that hold data and leave the rest as holes.
 type copyFileDest interface {
-	io.Writer
+	io.WriterAt
+	Truncate(size int64) error
 	Sync() error
 	Close() error
 }
@@ -534,6 +541,9 @@ var copyFileOpenDst = func(path string, perm os.FileMode) (copyFileDest, error) 
 	return os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, perm)
 }
 
+// copyFile copies src to dst and keeps dst sparse (see copySparse). Every
+// caller copies a VM file that is mostly zeros: a 10 GiB rootfs or overlay
+// holding a few hundred MiB, or a memory snapshot of mostly untouched RAM.
 func copyFile(src, dst string) error {
 	info, err := os.Stat(src)
 	if err != nil {
@@ -551,7 +561,7 @@ func copyFile(src, dst string) error {
 	if err != nil {
 		return fmt.Errorf("create %s: %w", dst, err)
 	}
-	if _, err := io.Copy(out, in); err != nil {
+	if err := copySparse(out, in, dataRanges(in, info.Size()), info.Size()); err != nil {
 		_ = out.Close()
 		_ = os.Remove(dst)
 		return fmt.Errorf("copy %s to %s: %w", src, dst, err)
