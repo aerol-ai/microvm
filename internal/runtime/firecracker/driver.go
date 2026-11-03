@@ -1944,11 +1944,22 @@ func linkOrCopyRootfs(src, dst string) error {
 		return fmt.Errorf("open template rootfs: %w", err)
 	}
 	defer in.Close()
+	// The copy goes by the file's size, so a directory or device (a size of
+	// 0 or a block count) must not be taken for a file.
+	info, err := in.Stat()
+	if err == nil && !info.Mode().IsRegular() {
+		err = fmt.Errorf("%s is not a regular file", src)
+	}
+	if err != nil {
+		return fmt.Errorf("copy template rootfs: %w", err)
+	}
 	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
 	if err != nil {
 		return fmt.Errorf("create staged rootfs: %w", err)
 	}
-	if _, err := io.Copy(out, in); err != nil {
+	// Sparse, like copyFile: a template's rootfs is a mostly-hole image of
+	// the sandbox's full disk size, and a plain copy writes every byte of it.
+	if err := copySparse(out, in, dataRanges(in, info.Size()), info.Size()); err != nil {
 		_ = out.Close()
 		_ = os.Remove(dst)
 		return fmt.Errorf("copy template rootfs: %w", err)
