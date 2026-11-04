@@ -118,6 +118,12 @@ const (
 // an actionable error instead of a generic 500.
 var ErrRuntimeNotImplemented = errors.New("runtime not yet implemented on this build")
 
+// ErrSnapshotSourceNotReady is a snapshot request for a sandbox its runtime
+// cannot snapshot in the state it is in: a Firecracker sandbox must be
+// stopped, by an agent that flushed its disk first. The wrapping message
+// says what to do. HTTP 409.
+var ErrSnapshotSourceNotReady = errors.New("sandbox cannot be snapshotted in its current state")
+
 // ErrSandboxExists is returned when a sandbox row with the same primary key
 // already exists. Distinct from name conflicts (store.ErrSandboxNameConflict).
 var ErrSandboxExists = errors.New("sandbox already exists")

@@ -447,6 +447,14 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 		fcDriver.SetRootfsBuilder(&firecrackerRootfsAdapter{inner: ociBuilder})
 		fcDriver.SetTapHost(&firecrackerTapHostAdapter{inner: tap.NewHost(cfg.FirecrackerIPBinary)})
 		fcDriver.SetVsockDialer(fcruntime.NewLinuxVsockDialer())
+		// Snapshots (CreateSnapshot) go into the node's container engine,
+		// and a cold boot pulls a snapshot another node pushed with the
+		// cluster PAT, the same credential the engines use.
+		if store := newFirecrackerImageStore(cfg, dockerClient, ctdWiring); store != nil {
+			fcDriver.SetImageStore(store)
+		}
+		configureAOCRPullAuth(logger, cfg, "firecracker", fcDriver)
+		fcDriver.SweepSnapshotExports()
 		// Not fatal: a node that booted before this keeps booting. Without
 		// it the guests have no NAT and the driver no firewall, so the
 		// service keeps refusing their egress options (501).
@@ -2033,6 +2041,7 @@ func (a *firecrackerRootfsAdapter) Build(ctx context.Context, req fcruntime.Root
 	}
 	res, err := a.inner.Build(ctx, oci.BuildRequest{
 		ImageRef:    req.ImageRef,
+		Auth:        req.Auth,
 		OutPath:     req.OutPath,
 		MinSizeMiB:  req.MinSizeMiB,
 		Tag:         req.Tag,

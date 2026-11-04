@@ -943,6 +943,9 @@ var Registry = []UseCase{
 	// the container name, and release the first create's capacity reservation
 	// and mounts on its way out.
 	{ID: "UC-367", Title: "Idempotency: N concurrent v1 creates (default 8) with one Idempotency-Key and one body, sent at once through every ingress node, all answer 201 naming one sandbox; exactly one sandbox carries the request's tag; and the owner node's GET /v1/capacity holds exactly that sandbox's reservation (deleting it gives back one sandbox at its cpu and memory, not zero)", Requires: []Capability{CapDocker}, Implemented: true},
+	// Firecracker snapshots across nodes (fc_snapshot_cross_node_test.go):
+	// CreateSnapshot answered 501 for Firecracker until PR #911.
+	{ID: "UC-368", Title: "Firecracker snapshot on another node: a snapshot of a running Firecracker sandbox is refused with 409; once stopped, its snapshot is pushed to the cluster registry, outlives the source, and boots, in each direction across two Firecracker nodes, as a Firecracker sandbox and as a container on the node that did not take it, with the same data, hard link, symlink and nested file, and without the source's toolbox token file", Requires: []Capability{CapCluster, CapFirecracker}, Implemented: true},
 }
 
 // byID is a lookup built once for the report generator.

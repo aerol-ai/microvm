@@ -48,6 +48,7 @@ import (
 	"github.com/aerol-ai/microvm/internal/config"
 	sbruntime "github.com/aerol-ai/microvm/internal/runtime"
 	"github.com/aerol-ai/microvm/pkg/createtiming"
+	dockerpkg "github.com/aerol-ai/microvm/pkg/docker"
 	"github.com/aerol-ai/microvm/pkg/firecracker"
 	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/aerol-ai/microvm/pkg/mounts"
@@ -83,6 +84,19 @@ type Driver struct {
 	rootfs    RootfsBuilder
 	tapHost   TapHost
 	vsockDial VsockDialer
+	// images is the node's container image store: CreateSnapshot puts a
+	// stopped sandbox's filesystem there, and a create reads from it a
+	// snapshot this node holds but no registry has. Optional: without it
+	// CreateSnapshot is not implemented. Set via SetImageStore.
+	images ImageStore
+	// mounter mounts the copy of a saved disk CreateSnapshot reads. nil
+	// means the host's loop mount (loopMounter).
+	mounter DiskMounter
+	// aocrPullAuth is the cluster PAT a cold-boot pull of an in-scope AOCR
+	// `cluster/` ref presents, the same credential the container engines
+	// use (docker.AOCRPullAuth), so a snapshot pushed by another node can
+	// be pulled. nil off a cluster. Set via ConfigureAOCRPullAuth.
+	aocrPullAuth *dockerpkg.AOCRPullAuth
 	// templates resolves a CreateSandboxRequest.TemplateID to the
 	// host path of a pre-built rootfs.ext4. Optional: when nil, every
 	// Create runs the OCI build pipeline (Phase 1 behavior). Set by
@@ -722,8 +736,13 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 			d.logger.Warn("firecracker cold-boot: no toolbox binary configured; guest will boot without an agent and the vsock handshake will fail",
 				"sandbox_id", allocID)
 		}
+		source, auth, releaseSource, err := d.rootfsSource(ctx, req.Image, req.ImageRegistryRef, req.Registry)
+		if err != nil {
+			return nil, fmt.Errorf("firecracker runtime: rootfs source: %w", err)
+		}
 		rootfsResult, err := d.rootfs.Build(ctx, RootfsBuildRequest{
-			ImageRef: ociImageRefFor(req.Image),
+			ImageRef: source,
+			Auth:     auth,
 			OutPath:  rootfsPath,
 			// MinSizeMiB carries the user's disk request through to mkfs;
 			// the OCI builder rounds up to the larger of the image and
@@ -733,6 +752,7 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 			Tag:         "latest",
 			InjectFiles: inject,
 		})
+		releaseSource()
 		if err != nil {
 			return nil, fmt.Errorf("firecracker runtime: rootfs build: %w", err)
 		}
@@ -1587,16 +1607,6 @@ func (d *Driver) Destroy(ctx context.Context, sandbox *models.Sandbox) error {
 		rememberErr(err)
 	}
 	return firstErr
-}
-
-// CreateSnapshot is the runtime-level "commit" primitive. On the
-// Firecracker side this is more involved than on Docker: we need to pause
-// the VMM, write snapshot.memory + snapshot.state, copy the read-only
-// rootfs reference, and write a manifest — the template-builder pipeline
-// in internal/templates uses this driver method as one of its building
-// blocks rather than calling Firecracker directly.
-func (d *Driver) CreateSnapshot(_ context.Context, _, _ string) (string, error) {
-	return "", methodNotImplemented("CreateSnapshot")
 }
 
 // Resize updates VCPU and memory caps. Firecracker only supports

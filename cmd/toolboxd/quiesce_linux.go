@@ -120,6 +120,15 @@ func (linuxQuiesceOps) SetWallclock(unixNs int64) error {
 	return nil
 }
 
+// SyncFilesystems is sync(2): it writes every filesystem's dirty pages and
+// metadata to disk and returns when the writes are queued to the devices.
+// With ext4's default data=ordered, a journal replay afterwards then finds
+// the file data the metadata points at.
+func (linuxQuiesceOps) SyncFilesystems() error {
+	unix.Sync()
+	return nil
+}
+
 func (linuxQuiesceOps) ConfigureNetwork(cfg guestNetworkConfig) error {
 	if cfg.GuestIP == "" || cfg.GatewayIP == "" || cfg.PrefixLen <= 0 {
 		return fmt.Errorf("incomplete network config: %+v", cfg)

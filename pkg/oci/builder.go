@@ -37,6 +37,8 @@ package oci
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -45,6 +47,8 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+
+	"github.com/aerol-ai/microvm/pkg/models"
 )
 
 // stderrTailCap caps how many bytes of subprocess stderr we hold in
@@ -109,7 +113,12 @@ func New(cfg Config) (*Builder, error) {
 // guest has writable headroom on a sparse-but-fixed-size ext4; zero
 // means "minimum size as computed by mkfs.ext4 -d".
 type BuildRequest struct {
-	ImageRef   string
+	ImageRef string
+	// Auth is the credential for ImageRef's registry; nil (or no Username)
+	// pulls anonymously. It reaches skopeo through an auth file in the
+	// build's staging dir, mode 0600 and removed after the copy, never on
+	// the command line, where any local user could read it.
+	Auth       *models.RegistryAuth
 	OutPath    string
 	MinSizeMiB int
 	// Tag is the OCI tag to apply inside the staging layout. Almost
@@ -189,7 +198,7 @@ func (b *Builder) Build(ctx context.Context, req BuildRequest) (*Result, error) 
 	bundleDir := filepath.Join(staging, "bundle")
 
 	// Stage 1: skopeo copy <ref> oci:<dir>:<tag>
-	if err := b.runSkopeo(ctx, req.ImageRef, ociDir, req.Tag); err != nil {
+	if err := b.runSkopeo(ctx, req.ImageRef, req.Auth, staging, ociDir, req.Tag); err != nil {
 		_ = os.RemoveAll(staging)
 		return nil, err
 	}
@@ -229,14 +238,55 @@ func (b *Builder) Build(ctx context.Context, req BuildRequest) (*Result, error) 
 // that allows-all (signature verification is upstream of this pipeline);
 // the flag keeps the daemon working even when /etc/containers/policy.json
 // is missing (common on minimal base images).
-func (b *Builder) runSkopeo(ctx context.Context, ref, ociDir, tag string) error {
-	args := []string{
-		"--insecure-policy",
-		"copy",
-		ref,
-		"oci:" + ociDir + ":" + tag,
+func (b *Builder) runSkopeo(ctx context.Context, ref string, auth *models.RegistryAuth, staging, ociDir, tag string) error {
+	args := []string{"--insecure-policy", "copy"}
+	if auth != nil && auth.Username != "" {
+		authFile, err := writeSkopeoAuthFile(staging, ref, auth)
+		if err != nil {
+			return fmt.Errorf("oci: registry credential: %w", err)
+		}
+		defer os.Remove(authFile)
+		args = append(args, "--src-authfile", authFile)
 	}
+	args = append(args, ref, "oci:"+ociDir+":"+tag)
 	return runStage(ctx, "skopeo", b.cfg.SkopeoBin, args)
+}
+
+// writeSkopeoAuthFile writes auth as a containers-auth.json file (the format
+// skopeo's --src-authfile reads) for the registry ref names, and returns its
+// path. The registry key is auth.Server when set, else ref's host.
+func writeSkopeoAuthFile(dir, ref string, auth *models.RegistryAuth) (string, error) {
+	host := strings.TrimSpace(auth.Server)
+	if host == "" {
+		host = registryHost(ref)
+	}
+	body, err := json.Marshal(map[string]any{
+		"auths": map[string]any{
+			host: map[string]string{
+				"auth": base64.StdEncoding.EncodeToString([]byte(auth.Username + ":" + auth.Password)),
+			},
+		},
+	})
+	if err != nil {
+		return "", err
+	}
+	path := filepath.Join(dir, "auth.json")
+	if err := os.WriteFile(path, body, 0o600); err != nil {
+		return "", err
+	}
+	return path, nil
+}
+
+// registryHost is the registry a docker:// reference pulls from: its first
+// path element when that looks like a host (a dot, a port or localhost),
+// else Docker Hub.
+func registryHost(ref string) string {
+	ref = strings.TrimPrefix(ref, "docker://")
+	first, _, found := strings.Cut(ref, "/")
+	if found && (strings.ContainsAny(first, ".:") || first == "localhost") {
+		return first
+	}
+	return "docker.io"
 }
 
 // runUmoci wraps stage 2. --rootless lets the unpack work without

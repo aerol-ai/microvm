@@ -4392,7 +4392,7 @@ func (s *Service) DeleteSnapshot(ctx context.Context, idOrName string) error {
 	switch {
 	case shared:
 	case snapshotOwnsImage(snapshot):
-		if err := s.docker.RemoveImage(ctx, snapshot.Image); err != nil {
+		if err := s.removeSnapshotImage(ctx, snapshot.Image); err != nil {
 			return err
 		}
 	default:
@@ -4402,6 +4402,24 @@ func (s *Service) DeleteSnapshot(ctx context.Context, idOrName string) error {
 		return err
 	}
 	s.forgetSnapshotHome(ctx, snapshot)
+	return nil
+}
+
+// removeSnapshotImage deletes a snapshot's own image from every container
+// engine on this node. A snapshot taken on a containerd node (from a
+// containerd sandbox, or a Firecracker one, whose image goes into the node's
+// engine) is in containerd's store, not Docker's; removing it from Docker
+// alone found nothing and left it there. The tag is the snapshot's own, and
+// both engines treat a missing image as removed, so this touches nothing else.
+func (s *Service) removeSnapshotImage(ctx context.Context, image string) error {
+	if err := s.docker.RemoveImage(ctx, image); err != nil {
+		return err
+	}
+	if s.containerd != nil {
+		if err := s.containerd.RemoveImage(ctx, image); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 

@@ -244,9 +244,18 @@ type fakeQuiesceOps struct {
 	reseedCalls   int
 	wallclockArgs []int64
 	networkArgs   []guestNetworkConfig
+	syncCalls     int
 	reseedErr     error
 	wallclockErr  error
 	networkErr    error
+	syncErr       error
+}
+
+func (f *fakeQuiesceOps) SyncFilesystems() error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.syncCalls++
+	return f.syncErr
 }
 
 func (f *fakeQuiesceOps) ReseedRandom() error {

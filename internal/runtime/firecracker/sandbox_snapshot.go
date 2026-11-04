@@ -31,6 +31,12 @@ type sandboxSnapshotManifest struct {
 	SnapshotChecksum string    `json:"snapshot_checksum"`
 	HasOverlay       bool      `json:"has_overlay"`
 	CreatedAt        time.Time `json:"created_at"`
+	// GuestSynced records that the guest flushed its filesystems (sync_fs)
+	// before the pause, so rootfs.ext4 holds every write made before Stop.
+	// Start does not need it: it restores the memory, which holds the
+	// rest. CreateSnapshot exports the disk alone and refuses a stop
+	// without it. Absent in manifests written before sync_fs existed.
+	GuestSynced bool `json:"guest_synced,omitempty"`
 }
 
 func (d *Driver) sandboxSnapshotDir(sandboxID string) string {
@@ -134,7 +140,9 @@ func (d *Driver) stopToSandboxSnapshot(ctx context.Context, sandboxID string) er
 		guestCID = slot.VsockCID
 	}
 
-	if err := d.sendVsockOp(ctx, filepath.Join(handle.RunDir(), hostVsockUDSName), guestCID, "pre_snapshot", nil); err != nil {
+	vsockPath := filepath.Join(handle.RunDir(), hostVsockUDSName)
+	guestSynced := d.syncGuestFilesystems(ctx, sandboxID, vsockPath, guestCID)
+	if err := d.sendVsockOp(ctx, vsockPath, guestCID, "pre_snapshot", nil); err != nil {
 		d.logger.Warn("firecracker stop: pre_snapshot send failed (continuing)",
 			"sandbox_id", sandboxID, "error", err)
 	}
@@ -154,7 +162,7 @@ func (d *Driver) stopToSandboxSnapshot(ctx context.Context, sandboxID string) er
 		}
 	}()
 
-	if err := d.writeSandboxSnapshot(ctx, sandboxID, handle, client, guestCID); err != nil {
+	if err := d.writeSandboxSnapshot(ctx, sandboxID, handle, client, guestCID, guestSynced); err != nil {
 		return err
 	}
 	if err := handle.Shutdown(ctx, 3*time.Second); err != nil {
@@ -184,7 +192,27 @@ func (d *Driver) stopToSandboxSnapshot(ctx context.Context, sandboxID string) er
 	return nil
 }
 
-func (d *Driver) writeSandboxSnapshot(ctx context.Context, sandboxID string, handle VMMHandle, client VMMClient, guestCID uint32) error {
+// guestSyncTimeout bounds the wait for the guest's sync_fs ack. A sync of a
+// lot of dirty data can take seconds; past this, Stop goes on and the saved
+// disk is recorded as unflushed.
+const guestSyncTimeout = time.Minute
+
+// syncGuestFilesystems asks the guest to flush its filesystems (sync_fs)
+// before the pause, and reports whether it did. Stop goes ahead either way:
+// Start restores the memory, which holds any write not yet on the disk. Only
+// a snapshot made from the disk alone (CreateSnapshot) needs the flush.
+func (d *Driver) syncGuestFilesystems(ctx context.Context, sandboxID, vsockPath string, guestCID uint32) bool {
+	syncCtx, cancel := context.WithTimeout(ctx, guestSyncTimeout)
+	defer cancel()
+	if err := d.sendVsockOpAck(syncCtx, vsockPath, guestCID, "sync_fs", nil); err != nil {
+		d.logger.Warn("firecracker stop: guest filesystems not flushed; a snapshot of this stopped sandbox will be refused",
+			"sandbox_id", sandboxID, "error", err)
+		return false
+	}
+	return true
+}
+
+func (d *Driver) writeSandboxSnapshot(ctx context.Context, sandboxID string, handle VMMHandle, client VMMClient, guestCID uint32, guestSynced bool) error {
 	base, err := d.sandboxSnapshotBase()
 	if err != nil {
 		return err
@@ -248,6 +276,7 @@ func (d *Driver) writeSandboxSnapshot(ctx context.Context, sandboxID string, han
 		SnapshotChecksum: formatSnapshotChecksum(memDigest, stateDigest),
 		HasOverlay:       hasOverlay,
 		CreatedAt:        time.Now().UTC(),
+		GuestSynced:      guestSynced,
 	}
 	raw, err := json.MarshalIndent(manifest, "", "  ")
 	if err != nil {
