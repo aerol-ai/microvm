@@ -65,6 +65,17 @@ pub struct CloneGeneration {
     pub resumed_at: i64,
 }
 
+/// Options for `create_snapshot_with_options`.
+#[derive(Debug, Clone, Default)]
+pub struct CreateSnapshotOptions {
+    /// Whether the snapshot may pause a running sandbox. `None` (the
+    /// default) or `Some(true)`: a running sandbox is paused while it is
+    /// copied (its disk writes wait; Docker pauses the container) and keeps
+    /// running afterwards. `Some(false)`: a sandbox that is not stopped is
+    /// refused with HTTP 409 instead, for a workload that must never stall.
+    pub allow_pause: Option<bool>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct RegisterSnapshotOptions {
     /// Human-readable identifier other callers use in create-time snapshot references.

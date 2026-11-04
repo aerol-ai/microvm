@@ -42,6 +42,17 @@ export interface BuildImageResult {
   pushed?: string;
 }
 
+export interface CreateSnapshotOptions {
+  /**
+   * Whether the snapshot may pause a running sandbox. Defaults to true: a
+   * running sandbox is paused while it is copied (its disk writes wait;
+   * Docker pauses the container) and keeps running afterwards. Set false to
+   * have a sandbox that is not stopped refused with HTTP 409 instead, for a
+   * workload that must never stall. A stopped sandbox needs no pause.
+   */
+  allowPause?: boolean;
+}
+
 export interface RegisterSnapshotOptions {
   /** Human-readable identifier other callers use in `CreateOptions.snapshot`. */
   name: string;

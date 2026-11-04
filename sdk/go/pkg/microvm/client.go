@@ -436,8 +436,30 @@ func (c *Client) Stop(ctx context.Context, id string) (*Sandbox, error) {
 	return wrapSandbox(c, item), nil
 }
 
-func (c *Client) CreateSnapshot(ctx context.Context, id, name string) (sdktypes.SandboxSnapshot, error) {
-	return c.inner.CreateSnapshot(ctx, id, name)
+// SnapshotOption configures CreateSnapshot.
+type SnapshotOption func(*snapshotOptions)
+
+type snapshotOptions struct {
+	allowPause *bool
+}
+
+// WithAllowPause says whether the snapshot may pause a running sandbox.
+// Without it the answer is yes: a running sandbox is paused while it is
+// copied (its disk writes wait; Docker pauses the container) and keeps
+// running afterwards. WithAllowPause(false) has a sandbox that is not
+// stopped refused with HTTP 409 instead, for a workload that must never
+// stall. A stopped sandbox needs no pause.
+func WithAllowPause(allow bool) SnapshotOption {
+	return func(o *snapshotOptions) { o.allowPause = &allow }
+}
+
+// CreateSnapshot saves the sandbox id's files as a snapshot named name.
+func (c *Client) CreateSnapshot(ctx context.Context, id, name string, opts ...SnapshotOption) (sdktypes.SandboxSnapshot, error) {
+	var cfg snapshotOptions
+	for _, opt := range opts {
+		opt(&cfg)
+	}
+	return c.inner.CreateSnapshot(ctx, id, name, cfg.allowPause)
 }
 
 // RegisterSnapshot persists a named snapshot pointing at either a pre-built
@@ -770,8 +792,9 @@ func (s *Sandbox) CustomDomainDNS(ctx context.Context) (sdktypes.CustomDomainDNS
 	return s.client.inner.CustomDomainDNS(ctx, s.ID)
 }
 
-func (s *Sandbox) CreateSnapshot(ctx context.Context, name string) (sdktypes.SandboxSnapshot, error) {
-	return s.client.CreateSnapshot(ctx, s.ID, name)
+// CreateSnapshot saves this sandbox's files as a snapshot named name.
+func (s *Sandbox) CreateSnapshot(ctx context.Context, name string, opts ...SnapshotOption) (sdktypes.SandboxSnapshot, error) {
+	return s.client.CreateSnapshot(ctx, s.ID, name, opts...)
 }
 
 func (s *Sandbox) Start(ctx context.Context) error {

@@ -63,6 +63,7 @@ import type {
   NetworkPolicyOptions,
   PlatformVolumeMount,
   ListSnapshotsOptions,
+  CreateSnapshotOptions,
   RegisterSnapshotOptions,
   SnapshotList,
   SetNetworkLimitsOptions,
@@ -887,8 +888,12 @@ export class APIClient {
     return this.wrap(response);
   }
 
-	async createSnapshot(id: string, name: string): Promise<SandboxSnapshot> {
-		const response = await this.doJSON<ApiSandboxSnapshot>("POST", `${this.versionPrefix}/sandboxes/${id}/snapshot`, { name });
+	async createSnapshot(id: string, name: string, options: CreateSnapshotOptions = {}): Promise<SandboxSnapshot> {
+		const body: { name: string; allow_pause?: boolean } = { name };
+		if (options.allowPause !== undefined) {
+			body.allow_pause = options.allowPause;
+		}
+		const response = await this.doJSON<ApiSandboxSnapshot>("POST", `${this.versionPrefix}/sandboxes/${id}/snapshot`, body);
 		return fromApiSandboxSnapshot(response);
 	}
 
@@ -1618,8 +1623,8 @@ export class SandboxResource implements Sandbox {
     };
   }
 
-	async createSnapshot(name: string): Promise<SandboxSnapshot> {
-		return this.client.createSnapshot(this.id, name);
+	async createSnapshot(name: string, options: CreateSnapshotOptions = {}): Promise<SandboxSnapshot> {
+		return this.client.createSnapshot(this.id, name, options);
 	}
 
   async start(): Promise<this> {

@@ -457,6 +457,38 @@ test("sandbox resource createSnapshot delegates to client", async () => {
   assert.equal(snapshot.sourceSandboxID, "sb-resource");
 });
 
+test("createSnapshot sends allow_pause only when it is set", async () => {
+  const bodies: unknown[] = [];
+  const client = new APIClient({
+    baseURL: "https://api.example.com",
+    fetch: async (input, init) => {
+      const request = new Request(input, init);
+      if (request.method === "POST" && request.url.endsWith("/sandboxes/sb-pause/snapshot")) {
+        bodies.push(await request.json());
+        return jsonResponse({
+          name: "snap",
+          image: "aerolvm-snapshot/abc:latest",
+          source_sandbox_id: "sb-pause",
+          created_at: "2026-11-04T10:00:00Z",
+        });
+      }
+      return jsonResponse(apiSandbox("sb-pause"));
+    },
+  });
+
+  await client.createSnapshot("sb-pause", "snap");
+  await client.createSnapshot("sb-pause", "snap", { allowPause: false });
+  await client.createSnapshot("sb-pause", "snap", { allowPause: true });
+  const sandbox = await client.get("sb-pause");
+  await sandbox.createSnapshot("snap", { allowPause: false });
+  assert.deepEqual(bodies, [
+    { name: "snap" },
+    { name: "snap", allow_pause: false },
+    { name: "snap", allow_pause: true },
+    { name: "snap", allow_pause: false },
+  ]);
+});
+
 test("internal client decodes API errors", async () => {
   const client = new APIClient({
     baseURL: "https://api.example.com",

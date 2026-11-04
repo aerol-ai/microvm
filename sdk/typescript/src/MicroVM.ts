@@ -28,6 +28,7 @@ import type {
   GetOptions,
   ListOptions,
   MountSpecRedacted,
+  CreateSnapshotOptions,
   RegisterSnapshotOptions,
   ListSnapshotsOptions,
   SnapshotList,
@@ -184,8 +185,8 @@ export class MicroVM {
     return this.wrap(sandbox.toJSON());
   }
 
-	async createSnapshot(id: string, name: string): Promise<SandboxSnapshot> {
-		return this.client.createSnapshot(id, name);
+	async createSnapshot(id: string, name: string, options: CreateSnapshotOptions = {}): Promise<SandboxSnapshot> {
+		return this.client.createSnapshot(id, name, options);
 	}
 
   async registerSnapshot(options: RegisterSnapshotOptions): Promise<SandboxSnapshot> {

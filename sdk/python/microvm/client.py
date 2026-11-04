@@ -520,8 +520,14 @@ class Sandbox:
         self._data = updated.to_dict()
         return self
 
-    def create_snapshot(self, name: str) -> SandboxSnapshot:
-        return self._client.create_snapshot(self.id, name)
+    def create_snapshot(self, name: str, *, allow_pause: Optional[bool] = None) -> SandboxSnapshot:
+        """Save this sandbox's files as a snapshot named ``name``.
+
+        A running sandbox is paused briefly while it is copied (its disk
+        writes wait) and keeps running. Pass ``allow_pause=False`` to have a
+        sandbox that is not stopped refused (HTTP 409) instead.
+        """
+        return self._client.create_snapshot(self.id, name, allow_pause=allow_pause)
 
     def destroy(self) -> None:
         self._client.destroy(self.id)
@@ -785,8 +791,19 @@ class MicroVM:
         sandbox = self._do_json("POST", f"{self._version_prefix}/sandboxes/{sandbox_id}/stop", None)
         return self._wrap_sandbox(sandbox)
 
-    def create_snapshot(self, sandbox_id: str, name: str) -> SandboxSnapshot:
-        response = self._do_json("POST", f"{self._version_prefix}/sandboxes/{sandbox_id}/snapshot", {"name": name})
+    def create_snapshot(
+        self, sandbox_id: str, name: str, *, allow_pause: Optional[bool] = None
+    ) -> SandboxSnapshot:
+        """Save a sandbox's files as a snapshot named ``name``.
+
+        A running sandbox is paused briefly while it is copied (its disk
+        writes wait) and keeps running. Pass ``allow_pause=False`` to have a
+        sandbox that is not stopped refused (HTTP 409) instead.
+        """
+        body: Dict[str, Any] = {"name": name}
+        if allow_pause is not None:
+            body["allow_pause"] = allow_pause
+        response = self._do_json("POST", f"{self._version_prefix}/sandboxes/{sandbox_id}/snapshot", body)
         return _from_api_sandbox_snapshot(response)
 
     def register_snapshot(self, options: RegisterSnapshotOptions) -> SandboxSnapshot:

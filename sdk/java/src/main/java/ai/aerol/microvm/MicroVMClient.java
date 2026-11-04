@@ -49,6 +49,7 @@ import ai.aerol.microvm.model.BuildImageOptions;
 import ai.aerol.microvm.model.BuildImagePushOptions;
 import ai.aerol.microvm.model.BuildImageResult;
 import ai.aerol.microvm.model.CloneGeneration;
+import ai.aerol.microvm.model.CreateSnapshotOptions;
 import ai.aerol.microvm.model.CreateOptions;
 import ai.aerol.microvm.model.CreateSessionOptions;
 import ai.aerol.microvm.model.CreateTemplateOptions;
@@ -502,7 +503,16 @@ public class MicroVMClient {
     }
 
     public SandboxSnapshot createSnapshot(String sandboxId, String name) {
-        return doJson("POST", sandboxPath(sandboxId) + "/snapshot", new CreateSnapshotRequest(name), SandboxSnapshot.class);
+        return createSnapshot(sandboxId, name, null);
+    }
+
+    /**
+     * Saves a sandbox's files as a snapshot. With {@code allowPause} false, a
+     * sandbox that is not stopped is refused (HTTP 409) instead of paused.
+     */
+    public SandboxSnapshot createSnapshot(String sandboxId, String name, CreateSnapshotOptions options) {
+        Boolean allowPause = options == null ? null : options.allowPause;
+        return doJson("POST", sandboxPath(sandboxId) + "/snapshot", new CreateSnapshotRequest(name, allowPause), SandboxSnapshot.class);
     }
 
     public SandboxSnapshot registerSnapshot(RegisterSnapshotOptions options) {
@@ -1035,11 +1045,15 @@ public class MicroVMClient {
         }
     }
 
+    @com.fasterxml.jackson.annotation.JsonInclude(com.fasterxml.jackson.annotation.JsonInclude.Include.NON_NULL)
     static class CreateSnapshotRequest {
         public final String name;
+        @com.fasterxml.jackson.annotation.JsonProperty("allow_pause")
+        public final Boolean allowPause;
 
-        CreateSnapshotRequest(String name) {
+        CreateSnapshotRequest(String name, Boolean allowPause) {
             this.name = name;
+            this.allowPause = allowPause;
         }
     }
 

@@ -147,7 +147,7 @@ func TestOnlySandboxCreateSendsIdempotencyKey(t *testing.T) {
 	ctx := context.Background()
 	_, _ = client.Get(ctx, "sb-keyed")
 	_, _ = client.Exec(ctx, "sb-keyed", ExecRequest{Command: "true"})
-	_, _ = client.CreateSnapshot(ctx, "sb-keyed", "snap")
+	_, _ = client.CreateSnapshot(ctx, "sb-keyed", "snap", nil)
 	for i, key := range srv.seen() {
 		if key != "" {
 			t.Fatalf("%s sent Idempotency-Key %q", srv.paths[i], key)

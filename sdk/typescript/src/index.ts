@@ -61,6 +61,7 @@ export type {
   MountSpecRedacted,
   MountType,
   PlatformVolumeMount,
+  CreateSnapshotOptions,
   RegisterSnapshotOptions,
   ListSnapshotsOptions,
   SnapshotList,

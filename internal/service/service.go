@@ -4025,6 +4025,9 @@ func (s *Service) CreateSnapshotWithOwnership(ctx context.Context, sandboxID str
 	if err != nil {
 		return nil, false, err
 	}
+	if err := snapshotPauseAllowed(sandbox, req.AllowPause); err != nil {
+		return nil, false, err
+	}
 
 	rt, err := s.runtimeForSandbox(sandbox)
 	if err != nil {
@@ -4100,6 +4103,24 @@ func (s *Service) CreateSnapshotWithAlias(ctx context.Context, sandboxID string,
 		return nil, false, err
 	}
 	return snapshot, created, nil
+}
+
+// snapshotPauseAllowed refuses a snapshot that would pause a sandbox whose
+// caller said it must not be paused (allow_pause: false). Every runtime
+// pauses a running sandbox for its snapshot, so only a stopped (or, for
+// WASM, passivated) sandbox passes. Checked here, before any runtime work,
+// so the answer is the same on every runtime. A retry of a snapshot that
+// already exists never gets here: it pauses nothing.
+func snapshotPauseAllowed(sandbox *models.Sandbox, allowPause *bool) error {
+	if allowPause == nil || *allowPause {
+		return nil
+	}
+	switch sandbox.Status {
+	case models.SandboxStatusStopped, models.SandboxStatusPassivated:
+		return nil
+	}
+	return fmt.Errorf("sandbox %s is %s and allow_pause is false; stop it first, or allow the snapshot to pause it briefly: %w",
+		sandbox.ID, sandbox.Status, models.ErrSnapshotSourceNotReady)
 }
 
 // replayExistingSnapshot answers a snapshot create whose name is taken. The
