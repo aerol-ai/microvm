@@ -422,6 +422,39 @@ func TestCommitContainerSnapshotErrorBranches(t *testing.T) {
 	}(), "sb-1")
 }
 
+// A commit whose unpack fails takes back the record it created; one that
+// found the record already there (a retry) leaves it, since it is not this
+// call's.
+func TestCommitContainerSnapshotUnpackFailureRemovesOnlyItsOwnRecord(t *testing.T) {
+	d := newTestDriver(t)
+	cases := []struct {
+		name        string
+		exists      bool
+		wantDeleted []string
+	}{
+		{name: "created by this commit", wantDeleted: []string{"snap:v1"}},
+		{name: "already there", exists: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			b := baseFixture(&fakeTask{status: cntr.Running})
+			b.unpackErr = errors.New("unpack failed")
+			if tc.exists {
+				b.createErr = errdefs.ErrAlreadyExists
+				b.getImg = images.Image{Target: ocispec.Descriptor{Digest: digest.Digest("sha256:" + strings.Repeat("d", 64))}}
+			}
+			testSnapshotBackend = b
+			t.Cleanup(func() { testSnapshotBackend = nil })
+			if _, err := d.commitContainerSnapshotLive(context.Background(), d.client, "sb-1", "snap:v1"); err == nil {
+				t.Fatal("want unpack error")
+			}
+			if len(b.deleted) != len(tc.wantDeleted) || (len(b.deleted) > 0 && b.deleted[0] != tc.wantDeleted[0]) {
+				t.Fatalf("deleted = %v, want %v", b.deleted, tc.wantDeleted)
+			}
+		})
+	}
+}
+
 func TestLoadContainerForRefListError(t *testing.T) {
 	tr := &listFailTransport{}
 	d := newTestDriver(t)

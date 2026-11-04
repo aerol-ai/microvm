@@ -4039,8 +4039,26 @@ func (s *Service) CreateSnapshotWithOwnership(ctx context.Context, sandboxID str
 	// The tag is scoped to the snapshot's owner so two tenants committing a
 	// same-named snapshot on one node do not collide on one local image.
 	image := docker.SnapshotImageTagForOwner(sandbox.OwnerRef, name)
+	// Rollback rule (pr-review §4): the image exists from the moment the
+	// commit returns, the catalogue row that owns it only from the insert
+	// below. A failure or a crash between the two would leave an image
+	// nothing names, so the cleanup is recorded durably BEFORE the commit
+	// and cleared only once the row is in. Any exit in between leaves the
+	// intent for runPendingImageGC; a failure after the commit also removes
+	// the image right away (rollbackSnapshotCommit). snapshotMu, held from
+	// before the commit until after the insert, keeps the janitor off a tag
+	// whose create is in flight.
+	engine, engineImage := snapshotCommitEngine(sandbox)
+	if engineImage {
+		if err := s.recordSnapshotCommitIntent(ctx, engine, image); err != nil {
+			return nil, false, err
+		}
+	}
 	imageID, err := rt.CreateSnapshot(ctx, s.runtimeRef(sandbox), image)
 	if err != nil {
+		// The intent stays: a commit that failed here can still land its
+		// tag (an engine finishing after the caller gave up), and the
+		// janitor removes whatever is there once no row names it.
 		return nil, false, err
 	}
 
@@ -4055,6 +4073,7 @@ func (s *Service) CreateSnapshotWithOwnership(ctx context.Context, sandboxID str
 		OwnerRef: sandbox.OwnerRef,
 	}
 	if err := s.normalizeSnapshotImageDistribution(ctx, snapshot, true); err != nil {
+		s.rollbackSnapshotCommit(ctx, engineImage, engine, image)
 		return nil, false, err
 	}
 	snapshot.PushState = s.initialSnapshotPushState(snapshot)
@@ -4067,15 +4086,94 @@ func (s *Service) CreateSnapshotWithOwnership(ctx context.Context, sandboxID str
 			// differ from the caller (an operator/internal caller committing a
 			// tenant's sandbox). Resolve the conflicting row in that owner's
 			// namespace, not the caller's, so a legitimate retry replays.
+			//
+			// The tag may be that row's image now, so it is not removed
+			// here: the intent stays for the janitor, which drops it while
+			// any row names the tag and removes the tag once none does.
 			if existing, getErr := s.store.GetSnapshotByNames(ctx, snapshot.OwnerRef, docker.EquivalentImageNames(name)); getErr == nil {
 				return replayExistingSnapshot(ctx, existing, sandboxID)
 			}
 		}
+		s.rollbackSnapshotCommit(ctx, engineImage, engine, image)
 		return nil, false, err
+	}
+	if engineImage {
+		// The row owns the image now. A failed delete is harmless: the
+		// janitor sees the row (HasActiveImageRef) and drops the intent.
+		s.clearSnapshotCommitIntent(ctx, engine, image)
 	}
 	s.kickSnapshotPushReconciler(snapshot)
 	s.registerSnapshotHome(ctx, snapshot)
 	return snapshot, true, nil
+}
+
+// snapshotCommitEngine reports which engine's image store a sandbox's
+// snapshot commit writes its tag into, and whether it writes one at all. A
+// container sandbox commits through its own engine; a Firecracker one imports
+// its disk into the node's configured engine ("" resolves to it). A WASM
+// checkpoint is a file, not an image, so it has no tag to clean up.
+func snapshotCommitEngine(sandbox *models.Sandbox) (engine string, ok bool) {
+	switch sandbox.Runtime {
+	case models.RuntimeFirecracker:
+		return "", true
+	case models.RuntimeWasm, models.RuntimeIsolate:
+		return "", false
+	}
+	return models.SandboxEngine(sandbox), true
+}
+
+// recordSnapshotCommitIntent durably schedules a snapshot tag for removal
+// before the commit that creates it, so a crash between the commit and the
+// catalogue insert leaves the tag to the janitor instead of to nobody. An
+// upsert: a retry resets the TTL rather than adding a row. Gated like
+// schedulePendingImageGC — with image GC off no janitor would ever drain the
+// row — but unlike it, a failed write fails the create: committing without
+// the intent is exactly the leak this exists to close.
+func (s *Service) recordSnapshotCommitIntent(ctx context.Context, engine, image string) error {
+	if !s.cfg.ImageBuildGCEnabled || s.imageGCWhitelisted(image) {
+		return nil
+	}
+	if err := s.store.SchedulePendingImageGC(ctx, engine, image, time.Now().UTC()); err != nil {
+		return fmt.Errorf("record snapshot cleanup intent: %w", err)
+	}
+	return nil
+}
+
+// clearSnapshotCommitIntent drops the cleanup intent once nothing is left to
+// clean up: the catalogue row owns the image, or the image is gone. Failure
+// only delays the janitor's own decision, so it is logged, not returned.
+func (s *Service) clearSnapshotCommitIntent(ctx context.Context, engine, image string) {
+	if !s.cfg.ImageBuildGCEnabled {
+		return
+	}
+	if err := s.store.DeletePendingImageGC(ctx, engine, image); err != nil {
+		s.logger.Warn("snapshot cleanup intent clear failed; image gc will drop it", "engine", engine, "image", image, "error", err)
+	}
+}
+
+// rollbackSnapshotCommit removes the image a commit produced when its
+// catalogue row could not be written, instead of waiting a TTL for the
+// janitor. It applies the janitor's own rule — never remove a tag a row or a
+// live sandbox still names — and keeps the intent unless the tag is really
+// gone, so anything it cannot finish stays the janitor's. Runs detached from
+// the request: the failure being rolled back may be that the caller left.
+func (s *Service) rollbackSnapshotCommit(ctx context.Context, engineImage bool, engine, image string) {
+	if !engineImage {
+		return
+	}
+	ctx = context.WithoutCancel(ctx)
+	referenced, err := s.store.HasActiveImageRef(ctx, image)
+	if err != nil || referenced {
+		if err != nil {
+			s.logger.Warn("snapshot commit rollback: image ref check failed; left to image gc", "image", image, "error", err)
+		}
+		return
+	}
+	if err := s.removeSnapshotImage(ctx, image); err != nil {
+		s.logger.Warn("snapshot commit rollback: image remove failed; left to image gc", "image", image, "error", err)
+		return
+	}
+	s.clearSnapshotCommitIntent(ctx, engine, image)
 }
 
 // CreateSnapshotWithAlias commits a snapshot and records the facade alias that
@@ -7148,61 +7246,78 @@ func (s *Service) runPendingImageGC(ctx context.Context) {
 		s.testAfterPendingImageGCList()
 	}
 	for _, entry := range entries {
-		image := entry.Image
-		engine := entry.Engine
-		if s.imageGCWhitelisted(image) {
-			// Operator whitelisted this image after the row landed.
-			// Drop it so the ledger doesn't carry it forever; the
-			// destroy path's short-circuit keeps new rows out.
-			if _, err := s.store.DeletePendingImageGCIfScheduledAt(ctx, engine, image, entry.ScheduledAt); err != nil {
-				s.logger.Warn("pending image gc whitelist row clear failed", "engine", engine, "image", image, "error", err)
-			}
-			continue
-		}
-		referenced, err := s.store.HasActiveImageRef(ctx, image)
-		if err != nil {
-			s.logger.Warn("pending image gc ref check failed", "image", image, "error", err)
-			continue
-		}
-		if referenced {
-			// Image came back into use between scheduling and now.
-			// Drop the row; if it goes idle again the destroy path
-			// will re-schedule with a fresh timestamp.
-			if err := s.store.DeletePendingImageGC(ctx, engine, image); err != nil {
-				s.logger.Warn("pending image gc row clear failed", "engine", engine, "image", image, "error", err)
-			}
-			continue
-		}
-		remover, err := s.imageRemoverForEngine(engine)
-		if err != nil {
-			// The engine that owns this copy is not wired on this node
-			// (an operator flipped SB_CONTAINER_ENGINE). Leave the row:
-			// removing through the other engine would miss the disk we
-			// are trying to reclaim and could evict its cache instead.
-			s.logger.Warn("pending image gc engine unavailable", "engine", engine, "image", image, "error", err)
-			continue
-		}
-		if err := remover.RemoveImage(ctx, image); err != nil {
-			// Leave the row in place so the next tick retries. Note
-			// docker.RemoveImage returns nil for 404/409, so the
-			// "image vanished" and "still in use by an unknown
-			// container" cases fall through to the delete below.
-			s.logger.Warn("pending image gc remove failed", "engine", engine, "image", image, "error", err)
-			continue
-		}
-		// Conditional delete: if a destroy refreshed the row between
-		// the list and now, leave the fresh row in place — the next
-		// tick will pick it up after the new TTL elapses. The image
-		// was already removed from Docker in that case, which is
-		// acceptable: it gets re-pulled on the next create. The thing
-		// we MUST avoid is silently throwing away the row that would
-		// have extended the TTL.
-		if _, err := s.store.DeletePendingImageGCIfScheduledAt(ctx, engine, image, entry.ScheduledAt); err != nil {
-			s.logger.Warn("pending image gc row delete failed", "engine", engine, "image", image, "error", err)
-			continue
-		}
-		s.logger.Info("audit pending image gc removed", "engine", engine, "image", image)
+		s.sweepPendingImageGCEntry(ctx, entry)
 	}
+}
+
+// sweepPendingImageGCEntry decides one ledger row: drop it, remove its image,
+// or leave it for the next tick.
+//
+// A snapshot's own tag is decided under snapshotMu. CreateSnapshotWithOwnership
+// writes its cleanup intent before the commit and holds snapshotMu until the
+// catalogue row that owns the tag is in, so without the lock this sweep could
+// see "no row names the tag" mid-create and remove the image the create just
+// committed. Under it, the sweep sees either no create at all, or the
+// finished one's row (and keeps the image).
+func (s *Service) sweepPendingImageGCEntry(ctx context.Context, entry store.PendingImageGCEntry) {
+	image := entry.Image
+	engine := entry.Engine
+	if s.imageGCWhitelisted(image) {
+		// Operator whitelisted this image after the row landed.
+		// Drop it so the ledger doesn't carry it forever; the
+		// destroy path's short-circuit keeps new rows out.
+		if _, err := s.store.DeletePendingImageGCIfScheduledAt(ctx, engine, image, entry.ScheduledAt); err != nil {
+			s.logger.Warn("pending image gc whitelist row clear failed", "engine", engine, "image", image, "error", err)
+		}
+		return
+	}
+	if docker.IsSnapshotImageRef(image) {
+		s.snapshotMu.Lock()
+		defer s.snapshotMu.Unlock()
+	}
+	referenced, err := s.store.HasActiveImageRef(ctx, image)
+	if err != nil {
+		s.logger.Warn("pending image gc ref check failed", "image", image, "error", err)
+		return
+	}
+	if referenced {
+		// Image came back into use between scheduling and now.
+		// Drop the row; if it goes idle again the destroy path
+		// will re-schedule with a fresh timestamp.
+		if err := s.store.DeletePendingImageGC(ctx, engine, image); err != nil {
+			s.logger.Warn("pending image gc row clear failed", "engine", engine, "image", image, "error", err)
+		}
+		return
+	}
+	remover, err := s.imageRemoverForEngine(engine)
+	if err != nil {
+		// The engine that owns this copy is not wired on this node
+		// (an operator flipped SB_CONTAINER_ENGINE). Leave the row:
+		// removing through the other engine would miss the disk we
+		// are trying to reclaim and could evict its cache instead.
+		s.logger.Warn("pending image gc engine unavailable", "engine", engine, "image", image, "error", err)
+		return
+	}
+	if err := remover.RemoveImage(ctx, image); err != nil {
+		// Leave the row in place so the next tick retries. Note
+		// docker.RemoveImage returns nil for 404/409, so the
+		// "image vanished" and "still in use by an unknown
+		// container" cases fall through to the delete below.
+		s.logger.Warn("pending image gc remove failed", "engine", engine, "image", image, "error", err)
+		return
+	}
+	// Conditional delete: if a destroy refreshed the row between
+	// the list and now, leave the fresh row in place — the next
+	// tick will pick it up after the new TTL elapses. The image
+	// was already removed from Docker in that case, which is
+	// acceptable: it gets re-pulled on the next create. The thing
+	// we MUST avoid is silently throwing away the row that would
+	// have extended the TTL.
+	if _, err := s.store.DeletePendingImageGCIfScheduledAt(ctx, engine, image, entry.ScheduledAt); err != nil {
+		s.logger.Warn("pending image gc row delete failed", "engine", engine, "image", image, "error", err)
+		return
+	}
+	s.logger.Info("audit pending image gc removed", "engine", engine, "image", image)
 }
 
 func (s *Service) StartReconcileLoop(ctx context.Context) {
