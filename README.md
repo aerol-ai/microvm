@@ -10,12 +10,12 @@
 
 <h3 align="center">
   Run Untrusted Code Safely.<br/>
-  Self-Hosted or Fully-Managed Sandbox Infrastructure for AI Agents and Ephemeral Workloads.
+  Multi-Cloud, Self-Hosted Sandbox Infrastructure for AI Agents and Short-Lived Workloads.
 </h3>
 
 <p align="center">
   <a href="https://microvm.aerol.ai">Documentation</a> ·
-  <a href="https://microvm.aerol.ai/getting-started">Quick Start</a> ·
+  <a href="https://microvm.aerol.ai/quick-start">Quick Start</a> ·
   <a href="https://github.com/aerol-ai/microvm/issues/new?labels=bug&template=bug_report.md">Report Bug</a> ·
   <a href="https://github.com/aerol-ai/microvm/issues/new?labels=enhancement&template=feature_request.md">Request Feature</a> ·
   <a href="https://github.com/sponsors/aerol-ai">Sponsor</a>
@@ -32,83 +32,85 @@
 
 &nbsp;
 
-AerolVM is open-source sandbox infrastructure for running isolated code environments - self-host it on your own Linux host, or run it as a managed, multi-tenant service. Each sandbox is a fully isolated compute unit with its own filesystem, network stack, and allocated resources - create latency as low as **4ms server-side** (V8 isolate warm path) and supporting OCI containers on **containerd** (default), gVisor, Firecracker, WASM, and V8-isolate runtimes. Built for AI agent pipelines and ephemeral CI, it ships as a single Go binary backed by Caddy for TLS routing and SQLite for state, with no external dependencies and a one-line installer.
+AerolVM is open-source sandbox infrastructure that you run yourself, on any cloud or on your own servers. Each sandbox is an isolated machine with its own files, its own network, and its own CPU and memory limits. You choose how strong the wall is for each sandbox: OCI containers on **containerd** (the default), gVisor, Firecracker microVMs, WASM, or V8 isolates. The fastest path creates a sandbox in about **4ms** on the server.
 
-What the project intends to do, and not do, through October 2027 is in [ROADMAP.md](ROADMAP.md).
+AerolVM is one Go binary (`sandboxd`). It uses Caddy for HTTPS and routing and SQLite for state. It needs no outside database and installs with one command.
+
+What the project plans to do, and not do, through October 2027 is in [ROADMAP.md](ROADMAP.md).
+
+## Multi-cloud and self-hosted
+
+AerolVM runs where you run it. There is no hosted control plane you have to use, and no Aerol account is needed.
+
+- **Any cloud.** Run it on AWS, Google Cloud, Azure, DigitalOcean, Hetzner, or any other cloud. Any Linux server works. Ubuntu 22.04 or newer is the tested path.
+- **Your own hardware.** Run it in your data center or on bare metal. Firecracker needs KVM, so use bare metal or a VM with nested virtualization.
+- **Your laptop.** `--local` runs it on macOS or Linux with Docker. You need no domain and no cloud account.
+- **No lock-in.** AerolVM does not depend on any one cloud's services. You can move between clouds without changing your code. Key stores (AWS KMS, Vault, OpenBao, or an HSM) and audit sinks (S3, webhook, or file) are optional add-ons you pick.
+- **Mix machines in one cluster.** A hetero cluster puts each job on the hardware that suits it: small VMs for containers, bare metal for Firecracker, GPU machines for GPU work. See [Architecture](#architecture).
+- **Your data stays with you.** Sandboxes, code, secrets, and audit logs live on your machines.
+- **Open source.** MIT licensed, with SDKs in five languages.
+
+Install with the script on any Linux server. For fleets, use the [Ansible playbooks](Ansible/) or the [Terraform module](Terraform/) (the Terraform module targets AWS today). Our live test suite runs on AWS.
 
 ## Features
 
-AerolVM provides a complete surface for building sandbox-backed products and agent workflows.
+AerolVM gives you everything you need to build sandbox-backed products and agent workflows.
 
 | Sandboxes | Execution | Networking & Ports | Storage & Secrets | Platform & Cluster |
 | :--- | :--- | :--- | :--- | :--- |
-| [Lifecycle (create / start / stop / destroy)](https://microvm.aerol.ai/sandboxes) | [Streaming exec & PTY](https://microvm.aerol.ai/exec-streaming) | [HTTP preview URLs](https://microvm.aerol.ai/preview) | [External storage (S3, NFS, SSHFS, rclone)](https://microvm.aerol.ai/external-storage) | [Raft-coordinated cluster](https://microvm.aerol.ai/cluster-setup) |
-| [Environment & resource limits](https://microvm.aerol.ai/environment) | [Persistent PTY sessions w/ replay](https://microvm.aerol.ai/sessions) | [TCP port exposure](https://microvm.aerol.ai/tcp-ports) | [Encrypted sandbox secrets](https://microvm.aerol.ai/environment) | [HA failover & durability](https://microvm.aerol.ai/durability) |
-| [Snapshots (stop-start persistence)](https://microvm.aerol.ai/snapshots) | [SSH access per sandbox](https://microvm.aerol.ai/ssh-access) | [TLS + SNI port routing](https://microvm.aerol.ai/tcp-vs-tls-ports) | [Custom domains](https://microvm.aerol.ai/custom-domains) | [Cluster ingress topology](https://microvm.aerol.ai/cluster-ingress) |
-| [Multi-runtime (containerd OCI / gVisor / Firecracker / WASM / Isolate)](https://microvm.aerol.ai/sandboxes) | [File system operations](https://microvm.aerol.ai/file-system) | [Per-sandbox egress control](https://microvm.aerol.ai/network-isolation) | [Sandbox tags & tenant scoping](https://microvm.aerol.ai/sandbox-tags) | [Reconciler & self-healing](https://microvm.aerol.ai/reconcile) |
-| [GPU sandboxes](https://microvm.aerol.ai/gpu-sandboxes) | [Port allowlist](https://microvm.aerol.ai/port-allowlist) | [Per-sandbox network quotas](https://microvm.aerol.ai/network-usage) | [Dashboard](https://microvm.aerol.ai/dashboard) | [Operational runbooks](https://microvm.aerol.ai/operational-runbooks) |
-
-## Why AerolVM
-
-How AerolVM compares with the two most common alternatives on the axes that matter most for AI workloads: **isolation choices**, **cost**, and **running it yourself**. The e2b and Daytona columns come from their own docs and repositories, as of October 2026.
-
-| | AerolVM | e2b | Daytona |
-| :--- | :--- | :--- | :--- |
-| **Deployment** | ✅ Self-host (single binary, one-line install) or managed multi-tenant SaaS | E2B Cloud, a deployment E2B runs in your cloud account, or self-host on one machine (E2B Embed) | Daytona Cloud, plus your own runner machines (BYOC) under Daytona's control plane |
-| **Runs locally** | ✅ `--local` flag, no DNS needed | Linux hosts with KVM only (E2B Embed) | ✗ |
-| **Sandbox startup (server p50)** | Isolate ~4ms · WASM ~22ms · Firecracker ~34ms · containerd ~189ms | ~200ms | < 90ms |
-| **Runtime isolation** | ✅ OCI (containerd default) / gVisor / Firecracker / WASM / V8 isolate | Firecracker (microVM) | Containers by default; Linux, Windows and macOS VMs |
-| **Sandbox lifetime** | Unlimited | Unlimited while paused; 24h running at a stretch on E2B Cloud Pro (1h Hobby) | Unlimited |
-| **Serverless / Workers-style sandboxes** | ✅ WASM + V8 isolate | ✗ | ✗ |
-| **TCP + TLS port routing** | ✅ | ✗ | ✗ |
-| **Per-sandbox egress control** | ✅ Domain allowlists, filtering DNS, method/path rules, credential injection | ✅ Allow/deny lists incl. domains | ✅ Block all, CIDR and domain allowlists |
-| **External storage** | ✅ S3 / NFS / SSHFS / rclone | Volumes; buckets via FUSE in a template | ✅ S3 / R2 / GCS / Azure Blob and more |
-| **GPU support** | ✅ | ✗ | ✅ NVIDIA and AMD |
-| **HA cluster mode** | ✅ Raft + SWIM gossip | Managed by E2B; Embed is one machine | Managed by Daytona (failover not documented) |
-| **Drop-in SDK compat** | ✅ `/daytona`, `/e2b` and `/runloop` facades | ✗ | ✗ |
-| **Price (100 × 2vCPU/4GB sandboxes/mo)** | ~$4,000 on your infra | ~$12,000 | ~$12,000 |
-| **SDK languages** | TS, Python, Go, Rust, Java | TS, Python | TS, Python, Ruby, Go, Java |
-| **Open source** | ✅ MIT | ✅ Apache-2.0 | ✗ Public repo frozen at v0.190.0 (AGPL) in June 2026; development is private |
-
-[See the full comparison →](https://microvm.aerol.ai/comparison)
-
-### vs e2b
-
-e2b is the fastest managed path if you want zero infrastructure. Its runtime is open source (Apache-2.0), and E2B Embed self-hosts the whole stack on one Linux machine with KVM; past one machine, E2B runs a dedicated deployment for you. On E2B Cloud you pay per sandbox-second, and a sandbox runs at most 24 hours at a stretch before it must be paused. Every e2b sandbox is a Firecracker microVM, so every host needs KVM. AerolVM covers the same AI execution use case on infrastructure you own, with clusters in the open-source server — pick OCI on containerd, gVisor, Firecracker, WASM, or V8 isolates per sandbox — with predictable fixed-cost pricing.
-
-> **Already on the e2b SDK?** AerolVM's `/e2b` API facade means your existing code keeps working - just point `E2B_API_URL` at your AerolVM host.
-
-### vs Daytona
-
-Daytona now runs agent sandboxes as a cloud service: containers by default, with VM, GPU and macOS sandboxes. In June 2026 its core development moved to a private codebase, and the public AGPL repository is frozen at v0.190.0. Its BYOC option runs sandboxes on your machines, but Daytona's control plane still manages them. AerolVM is MIT-licensed and runs entirely on your servers as a single binary you install in 60 seconds.
-
-> **Already on the Daytona SDK?** AerolVM's `/daytona` API facade lets you swap the backend without touching your SDK code - just update `DAYTONA_API_URL`.
+| [Lifecycle (create / start / stop / destroy)](https://microvm.aerol.ai/sandboxes) | [Streaming exec & PTY](https://microvm.aerol.ai/exec-streaming) | [HTTP public URLs](https://microvm.aerol.ai/public-urls) | [External storage (S3, NFS, SSHFS, rclone)](https://microvm.aerol.ai/external-storage) | [Raft-coordinated cluster](https://microvm.aerol.ai/getting-started/cluster-setup) |
+| [Environment & resource limits](https://microvm.aerol.ai/sandbox-env) | [Persistent PTY sessions w/ replay](https://microvm.aerol.ai/sessions) | [TCP port exposure](https://microvm.aerol.ai/tcp-ports) | [Encrypted sandbox secrets](https://microvm.aerol.ai/sandbox-env) | [HA failover & durability](https://microvm.aerol.ai/durability) |
+| [Images & snapshots](https://microvm.aerol.ai/images-and-snapshots) | [SSH access per sandbox](https://microvm.aerol.ai/ssh-access) | [TLS + SNI port routing](https://microvm.aerol.ai/tcp-vs-tls-ports) | [Custom domains](https://microvm.aerol.ai/custom-domains) | [Cluster ingress](https://microvm.aerol.ai/cluster-ingress) |
+| [Five runtimes (containerd / gVisor / Firecracker / WASM / Isolate)](https://microvm.aerol.ai/sandboxes) | [File system operations](https://microvm.aerol.ai/file-system) | [Per-sandbox egress control](https://microvm.aerol.ai/network-access) | [Sandbox tags & tenant scoping](https://microvm.aerol.ai/sandbox-tags) | [Reconciler & self-healing](https://microvm.aerol.ai/reconcile) |
+| [GPU sandboxes](https://microvm.aerol.ai/gpu-sandboxes) | [MCP server & CLI for agents](https://microvm.aerol.ai/mcp) | [Per-sandbox network quotas](https://microvm.aerol.ai/network-usage) | [Dashboard](https://microvm.aerol.ai/dashboard) | [Operational runbooks](https://microvm.aerol.ai/operational-runbooks) |
 
 ## Architecture
 
-AerolVM is a single Go binary (`sandboxd`) wired to three components:
+The diagram shows a **hetero cluster**: each node has one job, and each job runs on the hardware that suits it. All nodes run the same `sandboxd` binary. Nodes talk to each other over mutual TLS and find each other with encrypted SWIM gossip.
 
-- **Caddy** - handles wildcard TLS via DNS-01, L7 HTTP routing (`<sandbox-id>.<domain>`), and L4 TCP SNI routing (`<sandbox-id>-<port>.<domain>`). The daemon talks to the Caddy admin API; no config files are reloaded at runtime.
-- **Runtimes** - OCI containers (`runtime: "docker"` on the **containerd** engine by default; dockerd optional), gVisor (`runsc`), Firecracker (microVM), WASM (WASI workers / resident host), and V8 isolate (`workerd`). WASM and isolate are host-mediated and Runtime-only.
-- **SQLite (WAL mode, single-writer)** - stores sandbox state, the TCP host-port pool, exposed-port intents, and sealed secrets. Single-writer means no contention; WAL mode means reads never block writes.
+```mermaid
+flowchart TB
+    Apps["Your apps, agents and visitors"] --> Entry["One address<br/>DNS or load balancer"]
 
-For multi-host deployments, `sandboxd` nodes form a cluster using **Raft** (FSM-replicated placement state) and **SWIM gossip** (membership + capacity heartbeats). Nodes take `server`, `worker`, or `ingress` roles. The Raft voter count stays fixed at 3 or 5 regardless of how many workers you add - the same topology Kubernetes uses for control-plane vs. data-plane scaling. See [Cluster Setup](https://microvm.aerol.ai/cluster-setup).
+    subgraph Cluster["AerolVM hetero cluster: all nodes run sandboxd and talk over mutual TLS"]
+        direction TB
+        subgraph Ingress["Ingress nodes, 2 to 10: take public traffic"]
+            I1["Ingress<br/>Caddy: HTTPS, HTTP and TCP routes"]
+            I2["Ingress<br/>Caddy: HTTPS, HTTP and TCP routes"]
+        end
+        subgraph Workers["Worker nodes, as many as you need: run the sandboxes"]
+            W1["Small cloud VMs<br/>containerd, gVisor,<br/>WASM, V8 isolate"]
+            W2["Bare metal with KVM<br/>Firecracker microVMs"]
+            W3["GPU machines<br/>GPU sandboxes"]
+        end
+        subgraph Servers["Server nodes, 3 or 5: vote on where each sandbox runs"]
+            S1["Server<br/>Raft voter"] --- S2["Server<br/>Raft voter"] --- S3["Server<br/>Raft voter"]
+        end
+    end
 
+    Entry --> I1
+    Entry --> I2
+    I1 --> W1
+    I1 --> W2
+    I2 --> W2
+    I2 --> W3
+    Workers <-. "capacity and placements" .-> Servers
+
+    Servers -.-> Yours["Your systems, optional<br/>Key store: AWS KMS, Vault, OpenBao or HSM<br/>Audit store: S3, webhook or file<br/>Monitoring: Prometheus, Grafana, OpenTelemetry"]
 ```
-┌─────────────────────────────────────────────────────┐
-│                    sandboxd                         │
-│                                                     │
-│  ┌──────────┐   ┌──────────┐   ┌─────────────────┐  │
-│  │  HTTP    │   │ Service  │   │    SQLite store │  │
-│  │  API v1  │──▶│  layer   │──▶│  (WAL, 1-writer)│  │
-│  └──────────┘   └────┬─────┘   └─────────────────┘  │
-│                      │                              │
-│          ┌───────────┼───────────┐                  │
-│          ▼           ▼           ▼                  │
-│  containerd/gVisor  Caddy      SSH gateway            │
-│  FC/WASM/isolate  admin API  (Ed25519)              │
-└─────────────────────────────────────────────────────┘
-```
+
+- **Ingress nodes** take public traffic and send each request to the worker that runs the sandbox. Only they hold the public route table.
+- **Server nodes** hold the placement state in Raft: which worker runs which sandbox. The voter count stays at 3 or 5 (at most 7) however many workers join, so adding workers does not slow down voting. They do little work, so small machines are enough.
+- **Worker nodes** run the sandboxes. Each worker reports which runtimes and GPUs it has, so a sandbox only lands on a worker that can run it. Add more workers to get more room.
+- **Failover.** If a worker dies, a sandbox created with failover is rebuilt on a healthy worker with the same ID, ports, and public link. See [Durability](https://microvm.aerol.ai/durability).
+
+You do not need a cluster to start. One server runs all three jobs on one machine. A **mixed cluster** of 2 to 10 alike servers gives you more room and survives a dead server. Move to a hetero cluster past 10 nodes, or when you want bare metal and GPU machines. Your code is the same in every layout. See [Clusters](https://microvm.aerol.ai/getting-started/cluster-setup) and [Reference architectures](https://microvm.aerol.ai/enterprise/deployment).
+
+Inside each node, `sandboxd` uses three parts:
+
+- **Caddy** handles wildcard TLS via DNS-01, HTTP routing (`<sandbox-id>.<domain>`), and TCP SNI routing (`<sandbox-id>-<port>.<domain>`). The daemon drives Caddy through its admin API, so no config files are reloaded at runtime.
+- **Runtimes**: OCI containers (`runtime: "docker"` on the **containerd** engine by default; dockerd is optional), gVisor (`runsc`), Firecracker (microVM), WASM (WASI workers or a resident host), and V8 isolate (`workerd`).
+- **SQLite** (WAL mode, one writer) stores sandbox state, the TCP host-port pool, exposed-port intents, and sealed secrets. One writer means no lock fights. WAL mode means reads never block writes.
 
 ## Runtimes
 
@@ -120,7 +122,7 @@ For multi-host deployments, `sandboxd` nodes form a cluster using **Raft** (FSM-
 | WASM | ✅ Available | Config / cluster wasm workers | WASI modules; resident host ~22ms warm create. |
 | Isolate (V8 / workerd) | ✅ Available (off by default) | `--with-isolate` / `SB_ENABLE_ISOLATE` | JS/TS `fetch` handlers; **~4ms** warm server create. |
 
-## Create latency (live UC-94)
+## Create latency
 
 Server-side create from `Server-Timing` (excludes client↔cluster WAN). Artifacts under `integration-tests/reports/`. Production deployments use the **containerd** engine for OCI sandboxes (`runtime: "docker"` on the wire).
 
@@ -143,42 +145,40 @@ AerolVM ships first-party SDKs for five languages. Install the one that matches 
 npm install @aerol-ai/aerolvm-sdk
 
 # Python
-pip install aerolvm
+pip install aerolvm-sdk
 
 # Go
-go get github.com/aerol-ai/microvm/sdk/go
+go get github.com/aerol-ai/microvm/sdk/go/pkg/microvm@latest
 
 # Rust
-cargo add aerolvm
+cargo add aerolvm-sdk
 
-# Java (Maven)
+# Java: from GitHub Packages, see the SDK Setup docs
 # <dependency><groupId>ai.aerol</groupId><artifactId>aerolvm-sdk</artifactId></dependency>
 ```
 
 ### Quick Start
 
+Every SDK reads the server address and token from two settings:
+
+```bash
+export SB_API_URL=http://localhost:21212
+export SB_PAT_TOKEN=your-secret-pat
+```
+
 <details open>
 <summary><strong>TypeScript</strong></summary>
 
 ```ts
-import { MicroVM } from '@aerol-ai/aerolvm-sdk'
+import { MicroVM } from "@aerol-ai/aerolvm-sdk";
 
-const client = new MicroVM({
-  apiUrl: process.env.SB_API_URL,
-  patToken: process.env.SB_PAT_TOKEN,
-})
+const client = new MicroVM(); // reads SB_API_URL and SB_PAT_TOKEN
 
-const sandbox = await client.create({ image: 'ubuntu:22.04' })
+const sandbox = await client.create({ image: "python:3.12-slim" });
+const result = await sandbox.exec(`python3 -c "print('Hello from AerolVM!')"`);
+console.log(result.stdout);
 
-// Run a command and stream output
-const stream = await sandbox.execStream('python3 -c "print(\'hello\')"')
-stream.on('data', chunk => process.stdout.write(chunk))
-
-// Expose a port and get a public URL
-const url = await sandbox.exposePort(3000)
-console.log(url) // https://<sandbox-id>-3000.sandbox.example.com
-
-await sandbox.destroy()
+await sandbox.destroy();
 ```
 
 </details>
@@ -187,21 +187,13 @@ await sandbox.destroy()
 <summary><strong>Python</strong></summary>
 
 ```python
-from aerolvm import MicroVM
-import os
+from microvm import MicroVM
 
-client = MicroVM(
-    api_url=os.environ["SB_API_URL"],
-    pat_token=os.environ["SB_PAT_TOKEN"],
-)
+client = MicroVM()  # reads SB_API_URL and SB_PAT_TOKEN
 
-sandbox = client.create(image="ubuntu:22.04")
-
-result = sandbox.exec("python3 -c \"print('hello')\"")
-print(result.stdout)
-
-url = sandbox.expose_port(3000)
-print(url)  # https://<sandbox-id>-3000.sandbox.example.com
+sandbox = client.create(image="python:3.12-slim")
+result = sandbox.exec("python3 -c \"print('Hello from AerolVM!')\"")
+print(result["stdout"])
 
 sandbox.destroy()
 ```
@@ -217,37 +209,88 @@ package main
 import (
     "context"
     "fmt"
-    "os"
+    "log"
 
     microvm "github.com/aerol-ai/microvm/sdk/go/pkg/microvm"
     sdktypes "github.com/aerol-ai/microvm/sdk/go/pkg/types"
 )
 
 func main() {
-    client := microvm.New(microvm.Options{
-        APIURL:   os.Getenv("SB_API_URL"),
-        PATToken: os.Getenv("SB_PAT_TOKEN"),
-    })
-
     ctx := context.Background()
-    sandbox, _ := client.Create(ctx, sdktypes.CreateSandboxOptions{
-        Image: "ubuntu:22.04",
-    })
 
-    result, _ := sandbox.Exec(ctx, "echo hello")
-    fmt.Println(result.Stdout)
+    client, err := microvm.NewClient() // reads SB_API_URL and SB_PAT_TOKEN
+    if err != nil {
+        log.Fatal(err)
+    }
 
-    sandbox.Destroy(ctx)
+    sandbox, err := client.Create(ctx, sdktypes.CreateSandboxOptions{Image: "python:3.12-slim"})
+    if err != nil {
+        log.Fatal(err)
+    }
+    defer sandbox.Destroy(ctx)
+
+    result, err := sandbox.ExecCommand(ctx, `python3 -c "print('Hello from AerolVM!')"`)
+    if err != nil {
+        log.Fatal(err)
+    }
+    fmt.Print(result.Stdout)
 }
 ```
 
 </details>
 
-Full examples for Rust and Java are in the [SDK Setup docs](https://microvm.aerol.ai/sdk-setup).
+<details>
+<summary><strong>Rust</strong></summary>
+
+```rust
+use aerolvm_sdk::{Client, CreateOptions};
+
+fn main() -> Result<(), aerolvm_sdk::Error> {
+    let client = Client::new(None, None)?; // reads SB_API_URL and SB_PAT_TOKEN
+
+    let sandbox = client.create(CreateOptions {
+        image: "python:3.12-slim".into(),
+        ..Default::default()
+    })?;
+    let result = sandbox.exec(r#"python3 -c "print('Hello from AerolVM!')""#)?;
+    print!("{}", result.stdout);
+
+    sandbox.destroy()?;
+    Ok(())
+}
+```
+
+</details>
+
+<details>
+<summary><strong>Java</strong></summary>
+
+```java
+import ai.aerol.microvm.MicroVMClient;
+import ai.aerol.microvm.Sandbox;
+import ai.aerol.microvm.model.CreateOptions;
+import ai.aerol.microvm.model.ExecResult;
+
+public class Hello {
+    public static void main(String[] args) {
+        MicroVMClient client = new MicroVMClient(); // reads SB_API_URL and SB_PAT_TOKEN
+
+        Sandbox sandbox = client.create(new CreateOptions().setImage("python:3.12-slim"));
+        ExecResult result = sandbox.exec("python3 -c \"print('Hello from AerolVM!')\"");
+        System.out.print(result.stdout);
+
+        sandbox.destroy();
+    }
+}
+```
+
+</details>
+
+To give a port in the sandbox a public URL, see [Public URLs](https://microvm.aerol.ai/public-urls). More setup detail is in [SDK Setup](https://microvm.aerol.ai/sdk-setup).
 
 ### Drop-in SDK Compatibility
 
-If you are already running the e2b, Daytona or Runloop SDK, AerolVM has API facades that accept their wire format unchanged:
+If your code already uses the e2b, Daytona, or Runloop SDK, AerolVM has API facades that accept their wire format unchanged:
 
 | Existing SDK | AerolVM facade endpoint | Migration |
 | :--- | :--- | :--- |
@@ -259,7 +302,15 @@ If you are already running the e2b, Daytona or Runloop SDK, AerolVM has API faca
 
 ## Installation
 
-See [Server Setup](https://microvm.aerol.ai/getting-started) for all installation paths: local development, single-node production with wildcard TLS, and multi-node cluster deployment.
+Pick where you want to run it. The SDK code is the same in all three.
+
+| Where | You need | Guide |
+| :--- | :--- | :--- |
+| Your computer | macOS or Linux with Docker | [Install on your computer](https://microvm.aerol.ai/getting-started/local-setup) |
+| One server on any cloud, or your own | One Ubuntu or Debian server and a domain on Cloudflare | [Install on a server](https://microvm.aerol.ai/getting-started/single-node-setup) |
+| A cluster | Several Linux servers. The step-by-step guide uses AWS with Terraform. | [Clusters](https://microvm.aerol.ai/getting-started/cluster-setup) |
+
+The installer gets HTTPS certificates through Cloudflare DNS, which is the only DNS provider it supports today. All installer flags are in [Installer options](https://microvm.aerol.ai/getting-started/installer-options).
 
 ## Use Cases
 
@@ -275,13 +326,13 @@ See [Server Setup](https://microvm.aerol.ai/getting-started) for all installatio
 | Guide | Description |
 | :--- | :--- |
 | [Quick Start](https://microvm.aerol.ai/quick-start) | Spin up a sandbox and run a command in under five minutes. |
-| [Server Setup](https://microvm.aerol.ai/getting-started) | Install and configure AerolVM on a Linux host. |
+| [Server Setup](https://microvm.aerol.ai/getting-started) | Install AerolVM on your computer, one server, or a cluster. |
 | [SDK Setup](https://microvm.aerol.ai/sdk-setup) | Connect an SDK to your AerolVM server. |
 | [Sandboxes](https://microvm.aerol.ai/sandboxes) | Lifecycle states, runtimes, resource limits, and configuration. |
 | [Sessions](https://microvm.aerol.ai/sessions) | Persistent PTY sessions that survive reconnects with output replay. |
-| [Snapshots](https://microvm.aerol.ai/snapshots) | Stop a sandbox, snapshot its state, restart it later exactly where it left off. |
-| [Cluster Setup](https://microvm.aerol.ai/cluster-setup) | Multi-node deployment with Raft placement and SWIM gossip. |
-| [Comparison](https://microvm.aerol.ai/comparison) | AerolVM vs e2b vs Daytona - full feature and cost analysis. |
+| [Snapshots](https://microvm.aerol.ai/images-and-snapshots) | Stop a sandbox, snapshot its state, restart it later exactly where it left off. |
+| [Clusters](https://microvm.aerol.ai/getting-started/cluster-setup) | Mixed and hetero clusters with Raft placement and SWIM gossip. |
+| [Reference architectures](https://microvm.aerol.ai/enterprise/deployment) | Single server, mixed cluster, and hetero cluster, with diagrams. |
 | [Actors and actions](DESIGN.md) | Who acts on a released node, and which component carries out each action. |
 | [Security assessment](SECURITY-ASSESSMENT.md) | The most likely and most severe problems for a released node, and where the 0.6.3 review left each one. |
 | [Releasing](RELEASING.md) | How the maintainer publishes a release and keeps the changelog in sync. |
@@ -310,7 +361,6 @@ These GitHub accounts can reach the repository's sensitive resources. Registry p
 | :--- | :--- |
 | [`sumansaurabh`](https://github.com/sumansaurabh) | Organization owner and repository admin. Can change branch rules, Actions secrets, security settings, and publish a release. |
 | [`akanshasinha19`](https://github.com/akanshasinha19) | Write. Can push branches, open pull requests, publish a GitHub release, and dispatch the SDK publish workflow. |
-| [`sumansaurabh-slice`](https://github.com/sumansaurabh-slice) | Write. Same as above. |
 
 Merges to the default branch still require a reviewed pull request. [Code owners](.github/CODEOWNERS) are the review list, separate from this access list. How the project keeps creating issues, accepting changes, and publishing releases if one person is unavailable, and why the bus factor is 2, is in [CONTINUITY.md](CONTINUITY.md).
 
@@ -322,7 +372,7 @@ How these roles make decisions is in [GOVERNANCE.md](GOVERNANCE.md).
 | :--- | :--- | :--- |
 | Maintainer | [`sumansaurabh`](https://github.com/sumansaurabh) | Approve pull requests. Publish official releases and the SDK packages. Change branch rules, Actions secrets, and security settings. Triage reports sent to [security@aerol.ai](mailto:security@aerol.ai) and [GitHub private advisories](https://github.com/aerol-ai/microvm/security/advisories/new). |
 | Code owner | [`sumansaurabh`](https://github.com/sumansaurabh), [`akanshasinha19`](https://github.com/akanshasinha19) | Review pull requests. A code owner other than the pull request author approves changes to the default branch. |
-| Write collaborator | [`akanshasinha19`](https://github.com/akanshasinha19), [`sumansaurabh-slice`](https://github.com/sumansaurabh-slice) | Push branches and open pull requests. Official releases stay with the maintainer. |
+| Write collaborator | [`akanshasinha19`](https://github.com/akanshasinha19) | Push branches and open pull requests. Official releases stay with the maintainer. |
 | Contributor | Anyone else | Open issues and pull requests. No access to Actions secrets, branch rules, or release publishing. |
 
 ## Contributing
