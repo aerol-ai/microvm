@@ -84,6 +84,12 @@ func runPushWorker(ctx context.Context, interval time.Duration, wake <-chan stru
 		case <-tick:
 		case <-wake:
 		}
+		// select picks at random among ready cases, so a wake-up still
+		// pending when ctx ends can win over ctx.Done. A sweep then would
+		// only fail on the cancelled ctx and report that as an error.
+		if ctx.Err() != nil {
+			return
+		}
 		sweep(ctx)
 	}
 }
