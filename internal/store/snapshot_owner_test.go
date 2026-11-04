@@ -36,7 +36,7 @@ func TestSnapshotOwnerRefRoundTrip(t *testing.T) {
 	if err != nil || len(listed) != 1 || listed[0].OwnerRef != "acme" {
 		t.Fatalf("ListSnapshots = %+v, %v", listed, err)
 	}
-	pending, err := st.ListSnapshotsPendingPush(ctx)
+	pending, err := st.ListSnapshotsPendingPushPage(ctx, SnapshotPushCursor{}, 10)
 	if err != nil || len(pending) != 1 || pending[0].OwnerRef != "acme" {
 		t.Fatalf("ListSnapshotsPendingPush = %+v, %v", pending, err)
 	}
@@ -128,6 +128,18 @@ func TestSnapshotOwnerRefWarmUpgrade(t *testing.T) {
 		t.Fatalf("reopen: %v", err)
 	}
 	t.Cleanup(func() { _ = st.Close() })
+	// The rekey copies a fixed column list; the same open must put back
+	// push_claimed_at and the indexes, or the push queue fails until the
+	// next restart.
+	if _, _, _, err := st.ClaimSnapshotPush(ctx, "acme", "snap-tenant"); err != nil {
+		t.Fatalf("push claim after the upgrade: %v", err)
+	}
+	for _, index := range []string{"idx_sandbox_snapshots_push_queue", "idx_sandbox_snapshots_image", "idx_sandbox_snapshots_source_sandbox_id"} {
+		var n int
+		if err := st.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = ?`, index).Scan(&n); err != nil || n != 1 {
+			t.Fatalf("index %s after the upgrade: %d, %v", index, n, err)
+		}
+	}
 	// snap-kept lost its owner with the column; re-stamp it to check the
 	// next open's backfill leaves an attributed row alone.
 	if _, err := st.db.ExecContext(ctx, `UPDATE sandbox_snapshots SET owner_ref = 'globex' WHERE name = 'snap-kept'`); err != nil {

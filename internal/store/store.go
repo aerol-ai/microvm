@@ -1141,6 +1141,10 @@ func open(path string, secretCipher *secrets.Cipher) (*Store, error) {
 		db.Close()
 		return nil, err
 	}
+	if err := ensureSnapshotPushQueueShape(db); err != nil {
+		db.Close()
+		return nil, err
+	}
 	// Widen the WASM catalogue key from (id) to (owner_ref, id) so a second
 	// tenant registering the same module bytes gets its own digest-id row.
 	// Runs after the migrations loop, which adds owner_ref to pre-#724 tables.
@@ -1600,6 +1604,34 @@ func migrateSnapshotOwnerPK(db *sql.DB) error {
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit snapshot PK migration: %w", err)
+	}
+	return nil
+}
+
+// ensureSnapshotPushQueueShape puts back what migrateSnapshotOwnerPK's
+// rebuild drops: it copies sandbox_snapshots from a fixed column list, so the
+// push_claimed_at column and the table's indexes, all added before it runs,
+// were gone until the next open — and the push queue failed on the missing
+// column for the whole of the first boot after the upgrade. Idempotent, and
+// also where the push-queue index is built, since it needs push_claimed_at's
+// table in its final shape.
+func ensureSnapshotPushQueueShape(db *sql.DB) error {
+	if _, err := db.Exec(`ALTER TABLE sandbox_snapshots ADD COLUMN push_claimed_at DATETIME;`); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
+		return fmt.Errorf("restore sandbox_snapshots.push_claimed_at: %w", err)
+	}
+	for _, stmt := range []string{
+		`CREATE INDEX IF NOT EXISTS idx_sandbox_snapshots_source_sandbox_id ON sandbox_snapshots(source_sandbox_id);`,
+		`CREATE INDEX IF NOT EXISTS idx_sandbox_snapshots_image ON sandbox_snapshots(image);`,
+		// The push queue, in the order the reconciler pages it. Partial, so
+		// it holds only rows with push work outstanding — steady state is
+		// empty — and a page is a range scan however large the catalogue.
+		// The WHERE must stay word for word the first term of
+		// snapshotPushQueued, or SQLite cannot use the index for it.
+		`CREATE INDEX IF NOT EXISTS idx_sandbox_snapshots_push_queue ON sandbox_snapshots(created_at, owner_ref, name) WHERE push_state IN ('pending', 'error', 'pushing');`,
+	} {
+		if _, err := db.Exec(stmt); err != nil {
+			return fmt.Errorf("snapshot push queue index: %w", err)
+		}
 	}
 	return nil
 }
@@ -4506,8 +4538,9 @@ func (s *Store) MarkTemplatePushPending(ctx context.Context, id string) (bool, e
 // ListTemplatesPendingPush returns the templates the reconciler should
 // retry: push_state IN ('pending', 'error'). 'pushing' is intentionally
 // excluded so a row currently being processed by another reconciler
-// tick is not re-claimed before its terminal state lands. Mirrors
-// ListSnapshotsPendingPush exactly.
+// tick is not re-claimed before its terminal state lands; a stale claim
+// (older than PushClaimLease) is listed again. Claiming goes through
+// ClaimTemplatePush, which is what actually keeps two workers apart.
 //
 // The status precondition (must be ready) keeps half-built templates
 // from sneaking into the push queue if someone manually flipped
@@ -4670,75 +4703,6 @@ func (s *Store) ListReadyTemplateIDs(ctx context.Context) ([]string, error) {
 	return ready, err
 }
 
-// SetTemplatePushState is a narrow single-column update used by the
-// push reconciler. errMsg is overwritten unconditionally (including
-// to empty on success transitions) so callers don't have to remember
-// to clear it. Mirrors SetSnapshotPushState.
-// PushClaimLease bounds how long a row may sit in 'pushing' before another
-// reconciler tick may reclaim it. Longer than any realistic single artifact
-// push, short enough that a crashed daemon's claims drain on the next few
-// ticks rather than needing operator action.
-const PushClaimLease = 30 * time.Minute
-
-// pushClaimStamp records when a row entered 'pushing' and clears the stamp on
-// every terminal state, so a reclaim window only exists while a push is
-// genuinely believed to be in flight. Snapshots and templates share the
-// literal state name, so one helper serves both ledgers.
-func pushClaimStamp(state string, now time.Time) any {
-	if strings.TrimSpace(state) == models.SnapshotPushStatePushing {
-		return now
-	}
-	return nil
-}
-
-func (s *Store) SetTemplatePushState(ctx context.Context, id, state, errMsg string) error {
-	now := time.Now().UTC()
-	result, err := s.db.ExecContext(ctx, `
-		UPDATE firecracker_templates
-		SET push_state = ?, push_error = ?, updated_at = ?, push_claimed_at = ?
-		WHERE id = ?
-	`, strings.TrimSpace(state), errMsg, now, pushClaimStamp(state, now), strings.TrimSpace(id))
-	if err != nil {
-		return fmt.Errorf("set template push state: %w", err)
-	}
-	affected, err := result.RowsAffected()
-	if err == nil && affected == 0 {
-		return ErrNotFound
-	}
-	return nil
-}
-
-// UpdateTemplatePushDistribution stamps the registry destination
-// metadata after a successful AOCR push. ref is the canonical repo:tag
-// the daemon pushed; digest is the manifest digest the registry
-// surfaced via the push stream's `aux` payload (may be empty). Called
-// from the reconciler success path together with SetTemplatePushState.
-//
-// Written in one statement so a crash between the two fields cannot
-// land a half-filled row — the consumer-side pull in PR 6-B.2 sees
-// either both fields populated or both empty.
-func (s *Store) UpdateTemplatePushDistribution(ctx context.Context, id, ref, digest string) error {
-	now := time.Now().UTC()
-	result, err := s.db.ExecContext(ctx, `
-		UPDATE firecracker_templates
-		SET registry_ref = ?, push_digest = ?, updated_at = ?
-		WHERE id = ?
-	`,
-		strings.TrimSpace(ref),
-		strings.TrimSpace(digest),
-		now,
-		strings.TrimSpace(id),
-	)
-	if err != nil {
-		return fmt.Errorf("update template push distribution: %w", err)
-	}
-	affected, err := result.RowsAffected()
-	if err == nil && affected == 0 {
-		return ErrNotFound
-	}
-	return nil
-}
-
 func (s *Store) DeleteTemplate(ctx context.Context, id string) error {
 	result, err := s.db.ExecContext(ctx, `DELETE FROM firecracker_templates WHERE id = ?`, strings.TrimSpace(id))
 	if err != nil {
@@ -4849,91 +4813,6 @@ func (s *Store) ListGCEligibleTemplates(ctx context.Context, olderThan time.Time
 		return nil, fmt.Errorf("iterate templates: %w", err)
 	}
 	return items, nil
-}
-
-// ListSnapshotsPendingPush returns snapshots the reconciler should retry —
-// 'pending' is the brand-new state set by the snapshot-create path, 'error'
-// is what a failed previous attempt left behind. 'pushing' is intentionally
-// excluded so a row currently being processed by another reconciler tick
-// (or a still-running goroutine kicked off by snapshot-create) is not
-// re-claimed before its terminal state lands.
-func (s *Store) ListSnapshotsPendingPush(ctx context.Context) ([]*models.SandboxSnapshot, error) {
-	rows, err := s.db.QueryContext(ctx, `
-		SELECT name, image, image_id, source_sandbox_id, created_at,
-			entrypoint_json, region_id, cpu, memory_mb, disk_gb, gpu,
-			image_distribution_mode, image_digest, image_registry_ref, image_verified_at,
-			push_state, push_error, owner_ref
-		FROM sandbox_snapshots
-		WHERE push_state IN ('pending', 'error')
-			OR (push_state = 'pushing' AND (push_claimed_at IS NULL OR push_claimed_at <= ?))
-		ORDER BY created_at ASC, name ASC
-	`, time.Now().UTC().Add(-PushClaimLease))
-	if err != nil {
-		return nil, fmt.Errorf("list snapshots pending push: %w", err)
-	}
-	defer rows.Close()
-
-	var items []*models.SandboxSnapshot
-	for rows.Next() {
-		snapshot, err := scanSnapshot(rows)
-		if err != nil {
-			return nil, fmt.Errorf("scan snapshot: %w", err)
-		}
-		items = append(items, snapshot)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate snapshots: %w", err)
-	}
-	return items, nil
-}
-
-// SetSnapshotPushState is a narrow single-column update used by the push
-// reconciler. errMsg is overwritten unconditionally (including to empty
-// on success transitions) so callers don't have to remember to clear it.
-func (s *Store) SetSnapshotPushState(ctx context.Context, ownerRef, name, state, errMsg string) error {
-	result, err := s.db.ExecContext(ctx, `
-		UPDATE sandbox_snapshots
-		SET push_state = ?, push_error = ?, push_claimed_at = ?
-		WHERE owner_ref = ? AND name = ?
-	`, strings.TrimSpace(state), errMsg, pushClaimStamp(state, time.Now().UTC()), strings.TrimSpace(ownerRef), strings.TrimSpace(name))
-	if err != nil {
-		return fmt.Errorf("set snapshot push state: %w", err)
-	}
-	affected, err := result.RowsAffected()
-	if err == nil && affected == 0 {
-		return ErrNotFound
-	}
-	return nil
-}
-
-// UpdateSnapshotImageDistribution flips the distribution metadata on a
-// snapshot row after a successful AOCR push — local_only → aocr. Called
-// from the reconciler success path together with SetSnapshotPushState.
-// VerifiedAt records when the push completed; cluster placement on other
-// nodes uses this together with the new mode to decide the snapshot is
-// fan-outable.
-func (s *Store) UpdateSnapshotImageDistribution(ctx context.Context, ownerRef, name, mode, registryRef, digest string) error {
-	now := time.Now().UTC()
-	result, err := s.db.ExecContext(ctx, `
-		UPDATE sandbox_snapshots
-		SET image_distribution_mode = ?, image_registry_ref = ?, image_digest = ?, image_verified_at = ?
-		WHERE owner_ref = ? AND name = ?
-	`,
-		strings.TrimSpace(mode),
-		strings.TrimSpace(registryRef),
-		strings.TrimSpace(digest),
-		now,
-		strings.TrimSpace(ownerRef),
-		strings.TrimSpace(name),
-	)
-	if err != nil {
-		return fmt.Errorf("update snapshot image distribution: %w", err)
-	}
-	affected, err := result.RowsAffected()
-	if err == nil && affected == 0 {
-		return ErrNotFound
-	}
-	return nil
 }
 
 func (s *Store) UpdateStatus(ctx context.Context, id string, status models.SandboxStatus, lastError string) error {

@@ -321,10 +321,13 @@ func TestListHelpersQueryErrorsByDroppedTables(t *testing.T) {
 			call: func(st *Store) error { _, err := st.ListGCEligibleTemplates(ctx, now); return err },
 		},
 		{
-			name: "ListSnapshotsPendingPush",
+			name: "ListSnapshotsPendingPushPage",
 			drop: "sandbox_snapshots",
 			seed: func(t *testing.T, st *Store) {},
-			call: func(st *Store) error { _, err := st.ListSnapshotsPendingPush(ctx); return err },
+			call: func(st *Store) error {
+				_, err := st.ListSnapshotsPendingPushPage(ctx, SnapshotPushCursor{}, 10)
+				return err
+			},
 		},
 		{
 			name: "ListAllExposedPorts",
@@ -3354,7 +3357,7 @@ func TestListHelpersScanCorruptRows(t *testing.T) {
 		if _, err := st.ListSnapshots(ctx); err == nil {
 			t.Fatal("ListSnapshots corrupt created_at")
 		}
-		if _, err := st.ListSnapshotsPendingPush(ctx); err == nil {
+		if _, err := st.ListSnapshotsPendingPushPage(ctx, SnapshotPushCursor{}, 10); err == nil {
 			t.Fatal("ListSnapshotsPendingPush corrupt created_at")
 		}
 	})
@@ -3885,7 +3888,7 @@ func TestListGetWithAttachmentsAndClosedDB(t *testing.T) {
 	_, _ = st.ListTemplatesReadyBefore(ctx, now)
 	_, _ = st.ListReadyTemplateIDs(ctx)
 	_, _ = st.ListGCEligibleTemplates(ctx, now)
-	_, _ = st.ListSnapshotsPendingPush(ctx)
+	_, _ = st.ListSnapshotsPendingPushPage(ctx, SnapshotPushCursor{}, 10)
 	_, _ = st.ListAllExposedPorts(ctx)
 	_, _ = st.ListAllCustomDomains(ctx)
 	_, _ = st.ListCustomDomains(ctx, "sb")

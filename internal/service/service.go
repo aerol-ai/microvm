@@ -4265,12 +4265,11 @@ func (s *Service) initialSnapshotPushState(snapshot *models.SandboxSnapshot) str
 	return models.SnapshotPushStatePending
 }
 
-// kickSnapshotPushReconciler runs the reconciler once in a background
-// goroutine after a snapshot was just inserted in 'pending' state. This
-// is purely a latency optimization — without it, the caller would have
-// to wait up to SnapshotPushReconcileInterval before the push begins.
-// The reconciler is safe to invoke concurrently; the 'pushing' state
-// guards against double-claim.
+// kickSnapshotPushReconciler wakes the node's snapshot push worker after a
+// snapshot was just inserted in 'pending' state, so its push starts now
+// rather than on the next tick. A non-blocking wake-up, not a sweep of its
+// own: a burst of creates used to start one full sweep each, every one with
+// its own fan-out, all listing the same rows.
 func (s *Service) kickSnapshotPushReconciler(snapshot *models.SandboxSnapshot) {
 	if s.snapshotPushReconciler == nil || snapshot == nil {
 		return
@@ -4278,14 +4277,7 @@ func (s *Service) kickSnapshotPushReconciler(snapshot *models.SandboxSnapshot) {
 	if snapshot.PushState != models.SnapshotPushStatePending {
 		return
 	}
-	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
-		defer cancel()
-		if _, err := s.snapshotPushReconciler.RunOnce(ctx); err != nil && s.logger != nil {
-			s.logger.Warn("snapshot push: post-create reconciler tick failed",
-				"snapshot", snapshot.Name, "error", err)
-		}
-	}()
+	s.snapshotPushReconciler.Kick()
 }
 
 // markTemplateForPush is the kickTemplateBuild success-path seam for
@@ -4308,25 +4300,15 @@ func (s *Service) markTemplateForPush(ctx context.Context, templateID string) bo
 	return changed
 }
 
-// kickTemplateArtifactPushReconciler runs the reconciler once in a
-// background goroutine after the build path just flipped a template
-// row to push_state=pending. Pure latency optimization — without it,
-// the operator waits up to one reconciler tick before the AOCR push
-// starts. Detached context + 15-minute timeout mirror
-// kickSnapshotPushReconciler: a hung Docker import / push cannot pin
-// the goroutine forever.
+// kickTemplateArtifactPushReconciler wakes the node's template push worker
+// after the build path flipped a template row to push_state=pending, so the
+// AOCR push starts without waiting a tick. A wake-up, not a sweep of its own
+// (see kickSnapshotPushReconciler).
 func (s *Service) kickTemplateArtifactPushReconciler(templateID string) {
 	if s.templateArtifactPushReconciler == nil {
 		return
 	}
-	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
-		defer cancel()
-		if _, err := s.templateArtifactPushReconciler.RunOnce(ctx); err != nil && s.logger != nil {
-			s.logger.Warn("template push: post-build reconciler tick failed",
-				"template", templateID, "error", err)
-		}
-	}()
+	s.templateArtifactPushReconciler.Kick()
 }
 
 // GetSnapshot resolves a snapshot by name or image ID. Another tenant's
