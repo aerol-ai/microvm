@@ -89,7 +89,7 @@ We checked this example with `@daytona/sdk` 0.223.1. AerolVM's own [Daytona exam
 | Daytona feature | On AerolVM |
 |---|---|
 | Snapshots: create from an image or a Dockerfile, list, get, delete | Works. |
-| Take a snapshot of a running sandbox | Works. |
+| Take a snapshot of a running sandbox | Works, Firecracker sandboxes included. The sandbox pauses briefly while it is copied, then keeps running ([details](/images-and-snapshots/#save-a-running-sandbox)). |
 | Volumes: create, list, get, get by name, delete, and attach when creating a sandbox | Works when your operator has turned on [platform volumes](/platform-volumes/). Otherwise these calls fail with HTTP 412. |
 
 ## What does not work

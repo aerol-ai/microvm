@@ -100,7 +100,7 @@ A snapshot is a saved copy of a sandbox's files and installed software, stored a
 
 There are three ways to make a snapshot:
 
-- **[Save a running sandbox](#save-a-running-sandbox)** with `createSnapshot`. A Firecracker sandbox must be [stopped first](#save-a-firecracker-sandbox).
+- **[Save a running sandbox](#save-a-running-sandbox)** with `createSnapshot`. It works on a running or a stopped sandbox, [Firecracker included](#save-a-firecracker-sandbox).
 - **[Give an existing image a short name](#give-an-existing-image-a-snapshot-name)** with `registerSnapshot` and `image`.
 - **[Build one from a Dockerfile](#build-a-snapshot-from-a-dockerfile)** with `registerSnapshot` and `dockerfileContent`.
 
@@ -171,16 +171,58 @@ Set up a sandbox the way you want it, then save it. The original sandbox keeps r
 
 Snapshot names are unique across the whole server, and names that start with `aerolvm-snapshot/` are reserved. If you save again after changes, use a new name, like `py-ready-2026-05`. Calling `createSnapshot` again with the same name on the **same** sandbox is safe: it returns the snapshot you already have. The same name on a **different** sandbox fails with `snapshot name already in use`.
 
+Saving a running sandbox pauses it for a moment, so its files hold still while they are copied. A container is paused for as long as the copy takes. A Firecracker sandbox keeps running, and only its writes to disk wait. Either way the sandbox carries on afterwards, and a stopped sandbox is not paused at all. The pause is about a second for a small sandbox and grows with the data on its disk.
+
+### Keep a sandbox from pausing
+
+If your sandbox runs something that must never stall, like a database with tight deadlines, set `allowPause` to `false`. A sandbox that is not stopped is then refused with `409` instead of paused, so you can save it later, when it is stopped or quiet.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const snapshot = await sandbox.createSnapshot("db-ready", { allowPause: false });
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    snapshot = sandbox.create_snapshot("db-ready", allow_pause=False)
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    snapshot, err := sandbox.CreateSnapshot(ctx, "db-ready", microvm.WithAllowPause(false))
+    if err != nil {
+        log.Fatal(err)
+    }
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    let snapshot = sandbox.create_snapshot_with_options(
+        "db-ready",
+        &CreateSnapshotOptions { allow_pause: Some(false) },
+    )?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    SandboxSnapshot snapshot = sandbox.createSnapshot("db-ready",
+        new CreateSnapshotOptions().setAllowPause(false));
+    ```
+  </TabItem>
+</Tabs>
+
+The refusal says `allow_pause is false`. Leave the option out to get the default, which pauses briefly. The Daytona, E2B and Runloop SDKs have no such option, so their snapshot calls always use the default.
+
 ### Save a Firecracker sandbox
 
-A Firecracker sandbox is saved the same way, with one difference: stop it first. The snapshot is made from the disk that Stop saves, so it holds every file the sandbox had when it stopped. Then start new sandboxes from the snapshot's name, as Firecracker sandboxes or as containers.
+A Firecracker sandbox is saved the same way, running or stopped. A running one keeps running: its writes to disk wait while the disk is copied, then carry on. A stopped one is saved from the disk Stop kept. Then start new sandboxes from the snapshot's name, as Firecracker sandboxes or as containers.
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
     ```ts
     const sandbox = await client.create({ image: "python:3.11", runtime: "firecracker" });
     await sandbox.exec("pip install requests");
-    await sandbox.stop();
 
     const snapshot = await sandbox.createSnapshot("py-fc-ready");
     const copy = await client.create({ image: "py-fc-ready", runtime: "firecracker" });
@@ -190,7 +232,6 @@ A Firecracker sandbox is saved the same way, with one difference: stop it first.
     ```python
     sandbox = client.create(image="python:3.11", runtime="firecracker")
     sandbox.exec("pip install requests")
-    sandbox.stop()
 
     snapshot = sandbox.create_snapshot("py-fc-ready")
     copy = client.create(image="py-fc-ready", runtime="firecracker")
@@ -208,9 +249,6 @@ A Firecracker sandbox is saved the same way, with one difference: stop it first.
     if _, err := sandbox.ExecCommand(ctx, "pip install requests"); err != nil {
         log.Fatal(err)
     }
-    if err := sandbox.Stop(ctx); err != nil {
-        log.Fatal(err)
-    }
 
     snapshot, err := sandbox.CreateSnapshot(ctx, "py-fc-ready")
     if err != nil {
@@ -224,13 +262,12 @@ A Firecracker sandbox is saved the same way, with one difference: stop it first.
   </TabItem>
   <TabItem label="Rust">
     ```rust
-    let mut sandbox = client.create(CreateOptions {
+    let sandbox = client.create(CreateOptions {
         image: "python:3.11".into(),
         runtime: Some("firecracker".into()),
         ..Default::default()
     })?;
     sandbox.exec("pip install requests")?;
-    sandbox.stop()?;
 
     let snapshot = sandbox.create_snapshot("py-fc-ready")?;
     let copy = client.create(CreateOptions {
@@ -246,7 +283,6 @@ A Firecracker sandbox is saved the same way, with one difference: stop it first.
         .setImage("python:3.11")
         .setRuntime("firecracker"));
     sandbox.exec("pip install requests");
-    sandbox.stop();
 
     SandboxSnapshot snapshot = sandbox.createSnapshot("py-fc-ready");
     Sandbox copy = client.create(new CreateOptions()
@@ -256,9 +292,10 @@ A Firecracker sandbox is saved the same way, with one difference: stop it first.
   </TabItem>
 </Tabs>
 
-- **Stop first.** A snapshot of a running Firecracker sandbox fails with `409` and `stop the sandbox before taking a snapshot of it`. Stopping keeps the sandbox; you can start it again after the snapshot.
+- **Running or stopped.** A running sandbox's writes wait for the copy, about a second for a small sandbox and longer for a big disk (roughly 15 seconds per GB of data on standard cloud disks). Reads, programs and the network carry on. To never pause it, use [`allowPause: false`](#keep-a-sandbox-from-pausing).
 - **In a cluster it moves like any snapshot.** When the cluster pushes snapshots to its registry, a Firecracker snapshot is pushed too, and any server can start it.
-- **Stopped by an older release?** A sandbox stopped before this release may have files that never reached its disk, so its snapshot is refused with `start and stop it again`. Do that, then save it.
+- **Created by an older release?** A sandbox created before this release runs an older agent inside, which cannot flush or pause its disk. Its snapshot is refused with `created by an older release`, and restarting it does not help, because a restart keeps the same agent. Create a new sandbox on this release to take snapshots.
+- **Refused with `start it and stop it again`?** The disk was not flushed the last time the sandbox stopped. Start it and stop it again, or save it while it runs.
 - **It saves the disk, not the memory.** Running programs are not saved, and neither are the variables you passed in `env`: they live in the VM's memory only. Neither is the optional extra data disk a Firecracker sandbox can have; keep data that must outlive the sandbox in [attached cloud storage](/external-storage/).
 - **Starting from it boots the VM.** It takes a few seconds, like any Firecracker sandbox started from an image. For starts under 100 ms, use a [template](#firecracker-use-a-template).
 
