@@ -99,7 +99,7 @@ func (v *vmm) jailerArgv() []string {
 		"--gid", strconv.Itoa(v.cfg.JailerGID),
 		"--chroot-base-dir", v.cfg.JailerChrootBase,
 		// Hold the firecracker stderr/stdout in the host process group
-		// rather than detaching to a daemon; we want the cappedBuffer in
+		// rather than detaching to a daemon; we want the output file in
 		// vmm.go to see the lines. Without --daemonize jailer keeps the
 		// child attached to our stdio fds, which is what we need.
 		"--",

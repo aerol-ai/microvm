@@ -367,6 +367,13 @@ func (s *Service) NormalizeCreateImageDistribution(ctx context.Context, req *mod
 			// "invalid reference format". A tagged ref (e.g. `alpine:3.20`)
 			// is a plain base image, not a snapshot, so fall through to the
 			// classifier below.
+			//
+			// The pull is also the only existence check, so a snapshot
+			// deleted on its own node stays resolvable here until that
+			// node's push worker retires the registry copy (DeleteSnapshot
+			// records the obligation with the row delete; the worker
+			// removes the manifest by digest, retrying every tick until it
+			// lands). The window is bounded by that retry loop, not closed.
 			if imageRegistryHost(req.Image) == "" && !docker.IsLocalOnlyImageRef(req.Image) && !imageRefHasTagOrDigest(req.Image) {
 				dest := s.snapshotPusher.DestRefFor(owner, req.Image)
 				if meta := req.ImageDistribution(); !scoped && meta.Mode == models.ImageDistributionAOCR && meta.RegistryRef != "" {

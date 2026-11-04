@@ -412,11 +412,31 @@ func (d *Driver) sendVsockOp(ctx context.Context, socketPath string, guestCID ui
 	return nil
 }
 
-// openVsockOp marshals {"op":<op>,"data":<data>}, dials the guest agent
-// through Firecracker's host-side vsock proxy and writes the line. The
-// caller reads the ack, then closes the conn and calls cancel (which ends
-// the dial context whose deadline the conn carries).
+// defaultVsockOpTimeout bounds one guest op, from connect to ack, unless
+// the caller gives it a budget of its own (openVsockOpWithin).
+const defaultVsockOpTimeout = 2 * time.Second
+
+// deadlineConn is a conn whose deadline can move (the production dialer's
+// net.Conn).
+type deadlineConn interface {
+	SetDeadline(time.Time) error
+}
+
+// openVsockOp opens an op with the default budget.
 func (d *Driver) openVsockOp(ctx context.Context, socketPath string, guestCID uint32, op string, data any) (io.ReadWriteCloser, context.CancelFunc, error) {
+	return d.openVsockOpWithin(ctx, defaultVsockOpTimeout, socketPath, guestCID, op, data)
+}
+
+// openVsockOpWithin marshals {"op":<op>,"data":<data>}, dials the guest
+// agent through Firecracker's host-side vsock proxy and writes the line. The
+// caller reads the ack, then closes the conn and calls cancel.
+//
+// The connect itself never waits more than defaultVsockOpTimeout. The dialer
+// puts the dial context's deadline on the conn (vsock_dial_linux.go), so an
+// op with a longer budget, such as a flush of a lot of dirty data, moves the
+// conn's deadline out to its budget (or the caller's deadline, if sooner);
+// without that, every op's ack had 2 s, whatever budget the caller gave.
+func (d *Driver) openVsockOpWithin(ctx context.Context, budget time.Duration, socketPath string, guestCID uint32, op string, data any) (io.ReadWriteCloser, context.CancelFunc, error) {
 	payload := struct {
 		Op   string          `json:"op"`
 		Data json.RawMessage `json:"data,omitempty"`
@@ -432,11 +452,22 @@ func (d *Driver) openVsockOp(ctx context.Context, socketPath string, guestCID ui
 	if err != nil {
 		return nil, nil, fmt.Errorf("marshal op: %w", err)
 	}
-	dialCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	dialCtx, cancel := context.WithTimeout(ctx, min(budget, defaultVsockOpTimeout))
 	conn, err := d.vsockDial.Dial(dialCtx, socketPath, guestCID, defaultVsockPort)
 	if err != nil {
 		cancel()
 		return nil, nil, fmt.Errorf("dial cid=%d: %w", guestCID, err)
+	}
+	if dc, ok := conn.(deadlineConn); ok && budget > defaultVsockOpTimeout {
+		deadline := time.Now().Add(budget)
+		if ctxDeadline, ok := ctx.Deadline(); ok && ctxDeadline.Before(deadline) {
+			deadline = ctxDeadline
+		}
+		if err := dc.SetDeadline(deadline); err != nil {
+			_ = conn.Close()
+			cancel()
+			return nil, nil, fmt.Errorf("set op deadline: %w", err)
+		}
 	}
 	if _, err := conn.Write(append(line, '\n')); err != nil {
 		_ = conn.Close()

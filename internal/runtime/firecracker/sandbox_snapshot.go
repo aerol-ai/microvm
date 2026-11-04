@@ -31,27 +31,29 @@ type sandboxSnapshotManifest struct {
 	SnapshotChecksum string    `json:"snapshot_checksum"`
 	HasOverlay       bool      `json:"has_overlay"`
 	CreatedAt        time.Time `json:"created_at"`
-	// GuestFlush records how the guest's flush (sync_fs) before the pause
-	// went; see guestFlush. Start does not need the flush: it restores the
-	// memory, which holds any write not yet on the disk. CreateSnapshot
-	// exports the disk alone and needs guestFlushDone. Empty in manifests
-	// written before this field existed, all by releases whose agent
-	// predates sync_fs.
+	// GuestFlush records how freezing the guest's root filesystem before
+	// the pause went; see guestFlush. Start does not need the freeze: it
+	// restores the memory, which holds any write not yet on the disk.
+	// CreateSnapshot exports the disk alone and needs guestFlushDone. Empty
+	// in manifests written before this field existed, all by releases whose
+	// agent cannot freeze.
 	GuestFlush guestFlush `json:"guest_flush,omitempty"`
 }
 
-// guestFlush is how the guest's sync_fs before a Stop went.
+// guestFlush is how the guest's freeze_fs before a Stop went.
 type guestFlush string
 
 const (
-	// guestFlushDone: rootfs.ext4 holds every write made before Stop.
+	// guestFlushDone: the root filesystem was frozen, so rootfs.ext4 holds
+	// every write made before Stop, with a clean journal. The saved memory
+	// holds the freeze too, which Start lifts.
 	guestFlushDone guestFlush = "done"
-	// guestFlushFailed: the agent knows sync_fs but the flush failed or
-	// timed out. A later Stop may flush.
+	// guestFlushFailed: the agent knows freeze_fs but the freeze failed or
+	// timed out. A later Stop may freeze.
 	guestFlushFailed guestFlush = "failed"
-	// guestFlushUnsupported: the agent predates sync_fs. It stays that
+	// guestFlushUnsupported: the agent predates freeze_fs. It stays that
 	// agent for the sandbox's whole life (Start restores its memory, it is
-	// never restarted), so no Stop of this sandbox will ever flush.
+	// never restarted), so no Stop of this sandbox will ever freeze.
 	guestFlushUnsupported guestFlush = "unsupported"
 )
 
@@ -157,24 +159,34 @@ func (d *Driver) stopToSandboxSnapshot(ctx context.Context, sandboxID string) er
 	}
 
 	vsockPath := filepath.Join(handle.RunDir(), hostVsockUDSName)
-	flush := d.syncGuestFilesystems(ctx, sandboxID, vsockPath, guestCID)
+	// Sessions flush their recordings first: those are writes to the disk,
+	// which the freeze then holds still.
 	if err := d.sendVsockOp(ctx, vsockPath, guestCID, "pre_snapshot", nil); err != nil {
 		d.logger.Warn("firecracker stop: pre_snapshot send failed (continuing)",
 			"sandbox_id", sandboxID, "error", err)
 	}
+	flush := d.freezeForStop(ctx, sandboxID, vsockPath, guestCID)
+	frozen := flush == guestFlushDone
 
-	paused := false
 	vmmStopped := false
 	if err := client.PatchVM(ctx, firecracker.VM{State: firecracker.VMStatePaused}); err != nil {
+		if frozen {
+			d.thawGuest(sandboxID, vsockPath, guestCID)
+		}
 		return fmt.Errorf("firecracker runtime: stop %s: patch VM Paused: %w", sandboxID, err)
 	}
-	paused = true
 	defer func() {
-		if paused && !vmmStopped {
-			if err := client.PatchVM(context.Background(), firecracker.VM{State: firecracker.VMStateResumed}); err != nil {
-				d.logger.Warn("firecracker stop: resume after failed snapshot failed",
-					"sandbox_id", sandboxID, "error", err)
-			}
+		if vmmStopped {
+			return
+		}
+		// The stop failed: the sandbox runs on, and must be able to write.
+		if err := client.PatchVM(context.Background(), firecracker.VM{State: firecracker.VMStateResumed}); err != nil {
+			d.logger.Warn("firecracker stop: resume after failed snapshot failed",
+				"sandbox_id", sandboxID, "error", err)
+			return
+		}
+		if frozen {
+			d.thawGuest(sandboxID, vsockPath, guestCID)
 		}
 	}()
 
@@ -190,12 +202,7 @@ func (d *Driver) stopToSandboxSnapshot(ctx context.Context, sandboxID string) er
 	}
 	vmmStopped = true
 
-	d.mu.Lock()
-	delete(d.clients, sandboxID)
-	delete(d.vmms, sandboxID)
-	delete(d.guestCID, sandboxID)
-	d.mu.Unlock()
-	d.rssUnregister(sandboxID)
+	d.unregister(sandboxID)
 
 	if err := d.tapHost.Remove(ctx, slot.TapName); err != nil {
 		d.logger.Warn("firecracker stop: tap remove failed",
@@ -208,28 +215,36 @@ func (d *Driver) stopToSandboxSnapshot(ctx context.Context, sandboxID string) er
 	return nil
 }
 
-// guestSyncTimeout bounds the wait for the guest's sync_fs ack. A sync of a
-// lot of dirty data can take seconds; past this, Stop goes on and the saved
-// disk is recorded as unflushed.
+// guestSyncTimeout bounds the wait for the guest to flush and freeze its
+// root filesystem. A flush of a lot of dirty data can take seconds; past
+// this, Stop goes on and the saved disk is recorded as unflushed.
 const guestSyncTimeout = time.Minute
 
-// syncGuestFilesystems asks the guest to flush its filesystems (sync_fs)
-// before the pause, and reports how that went. Stop goes ahead either way:
-// Start restores the memory, which holds any write not yet on the disk. Only
-// a snapshot made from the disk alone (CreateSnapshot) needs the flush.
-func (d *Driver) syncGuestFilesystems(ctx context.Context, sandboxID, vsockPath string, guestCID uint32) guestFlush {
-	syncCtx, cancel := context.WithTimeout(ctx, guestSyncTimeout)
-	defer cancel()
-	err := d.sendVsockOpAck(syncCtx, vsockPath, guestCID, "sync_fs", nil)
+// freezeForStop has the guest flush and freeze its root filesystem before
+// the pause, and reports how that went. A flush alone is no barrier: the
+// guest's programs keep writing until the pause, and those writes would be
+// only in the saved memory. Frozen, every write made before the pause is on
+// the saved disk, so a snapshot from the disk alone (CreateSnapshot) misses
+// nothing; ext4 also leaves its journal clean when it freezes.
+//
+// Stop goes ahead either way: Start restores the memory, which holds any
+// write not on the disk. The saved memory holds the freeze too, so Start
+// lifts it (the agent on post_resume, and Start with thaw_fs).
+func (d *Driver) freezeForStop(ctx context.Context, sandboxID, vsockPath string, guestCID uint32) guestFlush {
+	err := d.sendVsockOpAckWithin(ctx, guestSyncTimeout, vsockPath, guestCID, "freeze_fs",
+		map[string]int64{"thaw_after_ms": guestFreezeLimit.Milliseconds()})
 	switch {
 	case err == nil:
 		return guestFlushDone
 	case isUnknownOp(err):
-		d.logger.Warn("firecracker stop: the guest agent predates sync_fs; this sandbox cannot be snapshotted",
+		d.logger.Warn("firecracker stop: the guest agent predates freeze_fs; this sandbox cannot be snapshotted",
 			"sandbox_id", sandboxID)
 		return guestFlushUnsupported
 	default:
-		d.logger.Warn("firecracker stop: guest filesystems not flushed; a snapshot of this stopped sandbox will be refused until a Stop flushes",
+		// Only the ack may have been lost: thaw, so the sandbox the stop
+		// may yet hand back running is not left unable to write.
+		d.thawGuest(sandboxID, vsockPath, guestCID)
+		d.logger.Warn("firecracker stop: guest filesystem not frozen; a snapshot of this stopped sandbox will be refused until a Stop freezes it",
 			"sandbox_id", sandboxID, "error", err)
 		return guestFlushFailed
 	}
@@ -504,6 +519,12 @@ func (d *Driver) startFromSandboxSnapshot(ctx context.Context, sandboxID, toolbo
 			"tap", slot.TapName)
 	}
 	cancel()
+	// Stop froze the root filesystem before saving the memory, so the VM
+	// comes back frozen. The agent thaws itself on post_resume; this covers
+	// a post_resume that did not land.
+	if manifest.GuestFlush == guestFlushDone {
+		d.thawGuest(sandboxID, vsockPath, manifest.VsockCID)
+	}
 	// The restored agent's identity. It normally holds this token already
 	// (it was adopted at create, and Stop snapshotted its memory) and the op
 	// converges. One that holds none gets it now; one that cannot take it is
@@ -514,12 +535,7 @@ func (d *Driver) startFromSandboxSnapshot(ctx context.Context, sandboxID, toolbo
 	}
 	d.probeToolboxTCP(ctx, "start", sandboxID, slot, true)
 
-	d.mu.Lock()
-	d.clients[sandboxID] = client
-	d.vmms[sandboxID] = handle
-	d.guestCID[sandboxID] = manifest.VsockCID
-	d.mu.Unlock()
-	d.rssRegister(sandboxID, handle.Pid())
+	d.register(sandboxID, client, handle, manifest.VsockCID, true)
 
 	tapCommitted = true
 	committed = true

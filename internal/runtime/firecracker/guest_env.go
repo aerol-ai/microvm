@@ -121,7 +121,14 @@ func (d *Driver) deliverGuestEnv(ctx context.Context, socketPath string, guestCI
 // which discards the ack. Returns *guestRejectedError when the agent answers
 // {"error": ...} or anything but {"ok": true}.
 func (d *Driver) sendVsockOpAck(ctx context.Context, socketPath string, guestCID uint32, op string, data any) error {
-	conn, cancel, err := d.openVsockOp(ctx, socketPath, guestCID, op, data)
+	return d.sendVsockOpAckWithin(ctx, defaultVsockOpTimeout, socketPath, guestCID, op, data)
+}
+
+// sendVsockOpAckWithin is sendVsockOpAck for an op that may take longer
+// than the default to ack: the guest acks a flush or a freeze only once it
+// is done.
+func (d *Driver) sendVsockOpAckWithin(ctx context.Context, budget time.Duration, socketPath string, guestCID uint32, op string, data any) error {
+	conn, cancel, err := d.openVsockOpWithin(ctx, budget, socketPath, guestCID, op, data)
 	if err != nil {
 		return err
 	}

@@ -13,7 +13,9 @@ import (
 
 	"github.com/aerol-ai/microvm/pkg/docker"
 	"github.com/aerol-ai/microvm/pkg/models"
+	"github.com/aerol-ai/microvm/pkg/wasmmod"
 	"github.com/distribution/reference"
+	"github.com/opencontainers/go-digest"
 )
 
 // SnapshotPushConfig wires the optional background AOCR push to a specific
@@ -110,6 +112,10 @@ type SnapshotPusher struct {
 	cfg    SnapshotPushConfig
 	docker SnapshotPushDocker
 	logger *slog.Logger
+	// deleteRef removes a manifest from the registry; nil is the ORAS
+	// delete the WASM checkpoint path uses against the same AOCR. Tests
+	// set it so no retirement goes to the network.
+	deleteRef func(ctx context.Context, cfg wasmmod.ORASPushConfig, registryRef string) error
 }
 
 // NewSnapshotPusher builds a pusher. Returns nil if cfg.Enabled is false
@@ -212,6 +218,58 @@ func (p *SnapshotPusher) DestRefFor(ownerRef, snapshotName string) string {
 		return ""
 	}
 	return snapshotAOCRRef(p.cfg.Host, p.cfg.ClusterID, ownerRef, name, p.cfg.TagSuffix)
+}
+
+// errRegistryCopyNotOurs marks a retirement this pusher must not perform:
+// the ref is not a snapshot copy under this cluster's namespace on the
+// configured registry host, or the digest is not a digest. Retrying cannot
+// change that, and the cluster credential must never be presented to a
+// host it was not configured for.
+var errRegistryCopyNotOurs = errors.New("not a snapshot registry copy this node pushes")
+
+// RetireManifest removes one registry copy of a deleted snapshot: the
+// manifest registryRef@digest, deleted BY DIGEST and never by tag. The tag
+// is the snapshot's name, so it may already hold a newer snapshot of the
+// same name (pushed with a new digest), which must survive. Credentials and
+// host are this pusher's own, the ones the copy was pushed with. A manifest
+// that is already gone counts as removed.
+func (p *SnapshotPusher) RetireManifest(ctx context.Context, registryRef, dgst string) error {
+	if p == nil {
+		return errors.New("snapshot retire: pusher is nil")
+	}
+	pinned, err := p.pinnedRegistryCopy(registryRef, dgst)
+	if err != nil {
+		return err
+	}
+	del := p.deleteRef
+	if del == nil {
+		del = wasmmod.DeleteSnapshotRef
+	}
+	cfg := wasmmod.ORASPushConfig{Host: p.cfg.Host, ClusterID: p.cfg.ClusterID, PATPath: p.cfg.PATPath}
+	if err := del(ctx, cfg, pinned); err != nil {
+		return fmt.Errorf("snapshot retire %s: %w", pinned, err)
+	}
+	return nil
+}
+
+// pinnedRegistryCopy returns registryRef's repository pinned to dgst, or
+// errRegistryCopyNotOurs for anything outside this pusher's own snapshot
+// namespace (`<host>/cluster/<id>/snapshots/...`).
+func (p *SnapshotPusher) pinnedRegistryCopy(registryRef, dgst string) (string, error) {
+	named, err := reference.ParseNormalizedNamed(strings.TrimSpace(registryRef))
+	if err != nil {
+		return "", fmt.Errorf("%w: %q: %v", errRegistryCopyNotOurs, registryRef, err)
+	}
+	host := strings.TrimRight(strings.TrimSpace(p.cfg.Host), "/")
+	prefix := "cluster/" + strings.TrimSpace(p.cfg.ClusterID) + "/snapshots/"
+	if reference.Domain(named) != host || !strings.HasPrefix(reference.Path(named), prefix) {
+		return "", fmt.Errorf("%w: %q", errRegistryCopyNotOurs, registryRef)
+	}
+	parsed, err := digest.Parse(strings.TrimSpace(dgst))
+	if err != nil {
+		return "", fmt.Errorf("%w: digest %q: %v", errRegistryCopyNotOurs, dgst, err)
+	}
+	return reference.TrimNamed(named).String() + "@" + parsed.String(), nil
 }
 
 // snapshotOwnerNamespaceLen is the hex length of an owner's namespace hash:

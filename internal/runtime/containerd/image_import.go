@@ -73,7 +73,10 @@ func (d *Driver) ImportRootfsImage(ctx context.Context, imageRef string, rootfs 
 	// Unpacked like a pulled image (WithPullUnpack), so a container create
 	// from it finds its layers in the default snapshotter.
 	if err := backend.unpack(ctx, fullRef, ""); err != nil {
-		return "", fmt.Errorf("import unpack: %w", err)
+		// The record now names an image no container can run, and no
+		// snapshot row will be written for it; taken back here (whether this
+		// call created it or repointed it) rather than left as a GC root.
+		return "", removeFailedImageRecord(ctx, backend, fullRef, fmt.Errorf("import unpack: %w", err))
 	}
 	return imageDigestID(created.Target), nil
 }

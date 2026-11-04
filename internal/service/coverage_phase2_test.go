@@ -420,23 +420,9 @@ func TestAddLocalIngressExpectedRoutes(t *testing.T) {
 
 // --- snapshot_push_retry pushOne edge cases ---
 
-type claimFailPushStore struct {
-	*fakePushStore
-	claimErr error
-}
-
-func (f *claimFailPushStore) SetSnapshotPushState(ctx context.Context, ownerRef, name, state, errMsg string) error {
-	if state == models.SnapshotPushStatePushing && f.claimErr != nil {
-		return f.claimErr
-	}
-	return f.fakePushStore.SetSnapshotPushState(ctx, ownerRef, name, state, errMsg)
-}
-
 func TestPushOneClaimFailure(t *testing.T) {
-	fs := &claimFailPushStore{
-		fakePushStore: newFakePushStore(),
-		claimErr:      errors.New("claim failed"),
-	}
+	fs := newFakePushStore()
+	fs.claimErr = errors.New("claim failed")
 	fs.seed(&models.SandboxSnapshot{
 		Name: "snap-claim", Image: "img:1",
 		PushState:             models.SnapshotPushStatePending,

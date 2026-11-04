@@ -284,8 +284,9 @@ func TestStartWithIdentityAdoptsTheRestoredGuest(t *testing.T) {
 	if state.Status != models.SandboxStatusStarted {
 		t.Fatalf("state = %+v", state)
 	}
-	if got := vsock.opList(); !slices.Equal(got, []string{"ping", "post_resume", guestAdoptOp}) {
-		t.Fatalf("restore ops = %v, want [ping post_resume adopt]", got)
+	// Stop froze the disk, so Start thaws it before the agent is adopted.
+	if got := vsock.opList(); !slices.Equal(got, []string{"ping", "post_resume", "thaw_fs", guestAdoptOp}) {
+		t.Fatalf("restore ops = %v, want [ping post_resume thaw_fs adopt]", got)
 	}
 	if pushes := vsock.adoptPushes(t); len(pushes) != 1 || pushes[0] != (adoptPayload{SandboxID: "sb-restart", Token: tokenCanary}) {
 		t.Fatalf("adopt pushes = %+v", pushes)
