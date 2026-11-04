@@ -66,50 +66,52 @@ AerolVM gives you everything you need to build sandbox-backed products and agent
 
 ## Architecture
 
-The diagram shows a **hetero cluster**: each node has one job, and each job runs on the hardware that suits it. All nodes run the same `sandboxd` binary. Nodes talk to each other over mutual TLS and find each other with encrypted SWIM gossip.
+The diagram shows a **hetero cluster**: each node has one job, and each job runs on the hardware that suits it. All nodes run the same `sandboxd` binary.
 
 ```mermaid
 flowchart TB
-    App["Your apps, agents and visitors"] --> Entry["One address<br/>(load balancer or DNS)"]
-    Entry --> I1
-    Entry --> I2
-    subgraph Cluster["AerolVM cluster: nodes talk over mutual TLS"]
-        subgraph Ingress["Ingress nodes: take public traffic"]
+    Users["Your apps, agents and visitors"] --> LB["One address<br/>(load balancer or DNS)"]
+    LB -- "API calls and sandbox links" --> Ingress
+
+    subgraph Cluster["AerolVM cluster: all nodes find each other by SWIM gossip and talk over mutual TLS"]
+        direction TB
+        subgraph Ingress["Ingress nodes, 2 to 10: Caddy and the public route table"]
+            direction LR
             I1["Ingress"]
             I2["Ingress"]
         end
-        subgraph Workers["Worker nodes: run the sandboxes"]
-            W1["Containers, gVisor, WASM<br/>(small cloud machines)"]
-            W2["Firecracker<br/>(bare metal)"]
-            W3["GPU sandboxes<br/>(GPU machines)"]
+        subgraph Servers["Server nodes, 3 or 5: the Raft group"]
+            direction LR
+            S1["Server"] <-- "Raft" --> S2["Server<br/>(leader)"] <-- "Raft" --> S3["Server"]
         end
-        subgraph Servers["Server nodes: vote on where each sandbox runs"]
-            S1["Server"] --- S2["Server"] --- S3["Server"]
+        subgraph Workers["Worker nodes, as many as you need: run sandboxes, keep their sealed secrets"]
+            direction LR
+            W1["Containers, gVisor, WASM<br/>(small cloud machines)"] ~~~ W2["Firecracker<br/>(bare metal)"] ~~~ W3["GPU sandboxes<br/>(GPU machines)"]
         end
     end
-    I1 --> W1
-    I1 --> W2
-    I2 --> W2
-    I2 --> W3
-    Servers -. "where each sandbox runs" .-> Ingress
+
+    Ingress <-- "1. which worker gets a new sandbox?<br/>where does each sandbox run?" --> Servers
+    Servers <-- "2. free room on each worker,<br/>failover work" --> Workers
+    Ingress -- "3. create the sandbox, then send it<br/>commands, files and web traffic" --> Workers
+
     subgraph Yours["Your systems (all optional)"]
-        Keys["Key store<br/>Vault, OpenBao, HSM or AWS KMS"]
-        Audit["Audit store<br/>your S3 bucket or SIEM webhook"]
-        Witness["Audit witness<br/>S3 bucket with Object Lock"]
-        Obs["Monitoring<br/>Prometheus, Grafana, OpenTelemetry"]
+        direction LR
+        Keys["Key store<br/>Vault, OpenBao, HSM or AWS KMS<br/><i>unlocks the keys to sealed secrets</i>"] ~~~ Audit["Audit store<br/>S3 bucket or SIEM webhook<br/><i>gets hash-chained audit records</i>"] ~~~ Witness["Audit witness<br/>S3 bucket with Object Lock<br/><i>keeps each node's newest audit fingerprint</i>"] ~~~ Obs["Monitoring<br/>Prometheus, Grafana, OpenTelemetry<br/><i>gets metrics and traces</i>"]
     end
-    Cluster -. "unlock the keys<br/>to sealed secrets" .-> Keys
-    Cluster -- "hash-chained audit records:<br/>who did what, when" --> Audit
-    Cluster -. "newest audit fingerprint,<br/>every 30 seconds" .-> Witness
-    Cluster -- "metrics, traces, alerts" --> Obs
+    Cluster <--> Yours
 ```
 
-- **Ingress nodes (2 to 10)** take public traffic and send each request to the worker that runs the sandbox. Only they hold the public route table.
-- **Server nodes (3, 5 or at most 7)** keep the record of which worker runs which sandbox, in Raft. The voter count stays the same however many workers join, so adding workers does not slow down voting. They do little work, so small machines are enough.
-- **Worker nodes** run the sandboxes. Add as many as you need. Each worker reports which runtimes and GPUs it has, so a sandbox only lands on a worker that can run it.
-- **Secret keys.** Sandbox secrets are always encrypted on disk: environment variables, registry passwords and storage credentials. By default, each node keeps the key in a file. You can keep it in your own key store instead: Vault, OpenBao, an HSM or AWS KMS. Each node then asks your key store to unlock the key at start, and checks again every 5 minutes. Disable the key, and every node stops using your secrets within about 15 minutes. See [Secrets providers](https://microvm.aerol.ai/cluster-secrets) and [Use your own key store](https://microvm.aerol.ai/enterprise/key-custody).
+The numbers follow one new sandbox:
+
+1. **Ingress nodes (2 to 10)** take every API call and every sandbox link. For a new sandbox, the ingress node asks the server nodes which worker should run it. Ingress nodes also follow the server nodes' record of where each sandbox runs, so their public route table stays current.
+2. **Server nodes (3, 5 or at most 7)** form the Raft group. They keep the record of which worker runs which sandbox, and they agree on every change to it. They check how much free room each worker has, and pick a worker with room for each new sandbox. The voter count stays the same however many workers join, so adding workers does not slow down voting. They do little work, so small machines are enough.
+3. **Worker nodes** run the sandboxes. The ingress node sends the create to the chosen worker, then sends that worker the sandbox's commands, file calls and web traffic. Each worker reports which runtimes and GPUs it has, so a sandbox only lands on a worker that can run it. Add as many workers as you need.
+
+Every node finds the others with SWIM gossip, protected by a shared key. Every call between nodes uses mutual TLS.
+
+- **Secret keys.** Sandbox secrets are always encrypted on disk: environment variables, registry passwords and storage credentials. Each worker keeps the sealed secrets of its sandboxes. By default, each node keeps the key in a file. You can keep it in your own key store instead: Vault, OpenBao, an HSM or AWS KMS. Each node then asks your key store to unlock the key at start, and checks again every 5 minutes. Disable the key, and every node stops using your secrets within about 15 minutes. See [Secrets providers](https://microvm.aerol.ai/cluster-secrets) and [Use your own key store](https://microvm.aerol.ai/enterprise/key-custody).
 - **Audit.** Every node writes a record each time a secret is opened, an API call changes something, or a call is refused. Each record names the caller. Each record also holds a fingerprint (hash) of the one before it, so an edited or deleted record breaks the chain. Nodes ship the records to your S3 bucket or a webhook. The audit witness keeps each node's newest fingerprint in an S3 bucket with Object Lock, where no node can change it. So if someone with root on a node rewrites its log, `aerolvm audit verify` catches it. See [Audit and compliance](https://microvm.aerol.ai/enterprise/audit-evidence).
-- **Failover.** If a worker dies, a sandbox created with failover is rebuilt on a healthy worker with the same ID, ports, and public link. Its sealed secrets are copied to at least one backup node when it is created, so they still open on the new worker. See [Durability](https://microvm.aerol.ai/durability).
+- **Failover.** If a worker dies, the server nodes give its failover sandboxes to healthy workers. Each one is rebuilt with the same ID, ports, and public link. Its sealed secrets were copied to at least one backup node when it was created, so they still open on the new worker. See [Durability](https://microvm.aerol.ai/durability).
 
 You do not need a cluster to start. One server runs all three jobs on one machine. A **mixed cluster** of 2 to 10 alike servers gives you more room and survives a dead server. Move to a hetero cluster past 10 nodes, or when you want bare metal and GPU machines. Your code is the same in every layout. See [Clusters](https://microvm.aerol.ai/getting-started/cluster-setup) and [Reference architectures](https://microvm.aerol.ai/enterprise/deployment).
 
