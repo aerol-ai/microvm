@@ -41,6 +41,7 @@ import ai.aerol.microvm.internal.JsonSupport;
 import ai.aerol.microvm.internal.StreamingWebSocket;
 import ai.aerol.microvm.internal.StreamingWebSocketListener;
 import ai.aerol.microvm.internal.WebSocketConnector;
+import ai.aerol.microvm.model.CreateSnapshotOptions;
 import ai.aerol.microvm.model.AuditOptions;
 import ai.aerol.microvm.model.EgressProfile;
 import ai.aerol.microvm.model.EgressProfileList;
@@ -568,6 +569,42 @@ class MicroVMClientTest {
             assertEquals("sha256:snap-1", snapshot.imageId);
             assertEquals("sb-1", snapshot.sourceSandboxId);
             assertEquals("snapshots/from-sandbox:v1", sandboxSnapshot.name);
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void createSnapshotSendsAllowPauseOnlyWhenSet() throws Exception {
+        List<Map<String, Object>> requestBodies = new ArrayList<>();
+        HttpServer server = startServer(exchange -> {
+            Map<String, Object> request = castMap(JsonSupport.read(exchange.getRequestBody().readAllBytes(), Map.class));
+            requestBodies.add(request);
+            writeJson(exchange, 200, mapOf(
+                "name", "snap",
+                "image", "aerolvm-snapshot/abc:latest",
+                "source_sandbox_id", "sb-1",
+                "created_at", "2026-11-04T10:00:00Z"
+            ));
+        });
+
+        try {
+            MicroVMClient client = clientFor(server);
+            client.createSnapshot("sb-1", "snap", new CreateSnapshotOptions().setAllowPause(false));
+            client.createSnapshot("sb-1", "snap", new CreateSnapshotOptions().setAllowPause(true));
+            client.createSnapshot("sb-1", "snap", new CreateSnapshotOptions());
+            client.createSnapshot("sb-1", "snap", null);
+            Sandbox sandbox = new Sandbox(client, new SandboxData());
+            sandbox.id = "sb-1";
+            sandbox.createSnapshot("snap", new CreateSnapshotOptions().setAllowPause(false));
+
+            assertEquals(5, requestBodies.size());
+            assertEquals(Boolean.FALSE, requestBodies.get(0).get("allow_pause"));
+            assertEquals(Boolean.TRUE, requestBodies.get(1).get("allow_pause"));
+            assertFalse(requestBodies.get(2).containsKey("allow_pause"));
+            assertFalse(requestBodies.get(3).containsKey("allow_pause"));
+            assertEquals(Boolean.FALSE, requestBodies.get(4).get("allow_pause"));
+            assertEquals("snap", requestBodies.get(4).get("name"));
         } finally {
             server.stop(0);
         }

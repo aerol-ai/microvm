@@ -90,6 +90,33 @@
         cmd: mv -f /tmp/sandboxd.new {{ sandboxd_binary_path }}
       changed_when: true
 
+    # Releases up to v0.6.11 started Firecracker VMs in sandboxd's cgroup,
+    # which the restart (KillMode=control-group) kills. Moved out first, they
+    # keep running and the new sandboxd takes them over. Current releases
+    # start every VM outside it; a no-op then, and without cgroup v2. Such a
+    # VM's output is a pipe sandboxd read; a reader of its own keeps the VM
+    # from wedging on EPIPE once sandboxd is gone (scripts/install.sh,
+    # keep_firecracker_vms_running).
+    - name: "[{{ inventory_hostname }}] Keep running Firecracker VMs through the restart"
+      ansible.builtin.shell: |
+        set -u
+        [ -f /sys/fs/cgroup/cgroup.controllers ] || exit 0
+        cg="$(systemctl show -p ControlGroup --value {{ sandboxd_service_name }} 2>/dev/null || true)"
+        [ -n "$cg" ] && [ -f "/sys/fs/cgroup${cg}/cgroup.procs" ] || exit 0
+        mkdir -p /sys/fs/cgroup/aerolvm-vmm || exit 0
+        while read -r pid; do
+          argv0="$(tr '\0' '\n' < "/proc/${pid}/cmdline" 2>/dev/null | head -n1)"
+          [ "${argv0##*/}" = firecracker ] || continue
+          echo "$pid" > /sys/fs/cgroup/aerolvm-vmm/cgroup.procs 2>/dev/null || true
+          case "$(readlink "/proc/${pid}/fd/1" 2>/dev/null)" in
+            pipe:*)
+              setsid cat "/proc/${pid}/fd/1" < /dev/null > /dev/null 2>&1 &
+              echo "$!" > /sys/fs/cgroup/aerolvm-vmm/cgroup.procs 2>/dev/null || true
+              ;;
+          esac
+        done < "/sys/fs/cgroup${cg}/cgroup.procs"
+      changed_when: false
+
     - name: "[{{ inventory_hostname }}] Restart sandboxd"
       ansible.builtin.systemd:
         name: "{{ sandboxd_service_name }}"

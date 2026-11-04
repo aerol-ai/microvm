@@ -33,7 +33,7 @@ pub use types::{
     NetworkPolicy, NetworkPolicyCheckOptions, NetworkPolicyCheckResult, NetworkPolicyOptions,
     BuildImagePushOptions, BuildImageResult,
     CloneGeneration, ClientConfig, CreateOptions, CreateSessionOptions, CreateTemplateOptions,
-    CreateWasmModuleOptions,
+    CreateSnapshotOptions, CreateWasmModuleOptions,
     CustomDomain,
     CustomDomainDnsRecords,
     CustomDomainStatus, DnsRecord, ExecExitInfo, ExecRequest, ExecResult, ExposeOptions,
@@ -833,6 +833,15 @@ impl Sandbox {
         self.client.create_snapshot(&self.data.id, name)
     }
 
+    /// `create_snapshot` with options, such as `allow_pause`.
+    pub fn create_snapshot_with_options(
+        &self,
+        name: &str,
+        opts: &CreateSnapshotOptions,
+    ) -> Result<SandboxSnapshot, Error> {
+        self.client.create_snapshot_with_options(&self.data.id, name, opts)
+    }
+
     pub fn destroy(self) -> Result<(), Error> {
         self.client.destroy(&self.data.id)
     }
@@ -1227,15 +1236,31 @@ impl Client {
     }
 
     pub fn create_snapshot(&self, id: &str, name: &str) -> Result<SandboxSnapshot, Error> {
+        self.create_snapshot_with_options(id, name, &CreateSnapshotOptions::default())
+    }
+
+    /// `create_snapshot` with options. `allow_pause: Some(false)` has a
+    /// sandbox that is not stopped refused (HTTP 409) instead of paused.
+    pub fn create_snapshot_with_options(
+        &self,
+        id: &str,
+        name: &str,
+        opts: &CreateSnapshotOptions,
+    ) -> Result<SandboxSnapshot, Error> {
         #[derive(Serialize)]
         struct CreateSnapshotRequest<'a> {
             name: &'a str,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            allow_pause: Option<bool>,
         }
 
         self.do_json::<CreateSnapshotRequest<'_>, SandboxSnapshot>(
             Method::POST,
             &format!("{}/sandboxes/{}/snapshot", self.version_prefix(), id),
-            Some(&CreateSnapshotRequest { name }),
+            Some(&CreateSnapshotRequest {
+                name,
+                allow_pause: opts.allow_pause,
+            }),
         )
     }
 
@@ -3823,6 +3848,36 @@ mod tests {
         assert_eq!(snapshot.name, "snapshots/demo:v1");
         assert_eq!(snapshot.image_id.as_deref(), Some("sha256:snap-1"));
         assert_eq!(snapshot.source_sandbox_id, "sb-1");
+    }
+
+    #[test]
+    fn create_snapshot_with_options_sends_allow_pause_only_when_set() {
+        let body = serde_json::json!({
+            "name": "snap",
+            "image": "aerolvm-snapshot/abc:latest",
+            "source_sandbox_id": "sb-1",
+            "created_at": "2026-11-04T10:00:00Z"
+        })
+        .to_string();
+        for (opts, want) in [
+            (
+                CreateSnapshotOptions { allow_pause: Some(false) },
+                serde_json::json!({"name": "snap", "allow_pause": false}),
+            ),
+            (
+                CreateSnapshotOptions { allow_pause: Some(true) },
+                serde_json::json!({"name": "snap", "allow_pause": true}),
+            ),
+            (CreateSnapshotOptions::default(), serde_json::json!({"name": "snap"})),
+        ] {
+            let (url, request_rx) = spawn_json_server(body.clone());
+            let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+            client
+                .create_snapshot_with_options("sb-1", "snap", &opts)
+                .expect("create snapshot should succeed");
+            let request = request_rx.recv().expect("request should be captured");
+            assert_eq!(request_json_body(&request), want);
+        }
     }
 
     #[test]

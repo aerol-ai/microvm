@@ -33,6 +33,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"sync"
 	"time"
 
 	"github.com/aerol-ai/microvm/cmd/toolboxd/sandboxenv"
@@ -83,13 +84,20 @@ const (
 	// set_env it is mandatory: the host fails the create when it is not
 	// acked. The first token sticks; see server.adoptOverVsock.
 	OpAdopt VsockOp = "adopt"
-	// OpSyncFS asks the guest to flush every filesystem to its disk. Stop
-	// sends it just before pausing the VM: the paused VM's memory holds any
-	// writes still in the guest's page cache, which a restore brings back,
-	// but a snapshot made from the disk alone (CreateSnapshot) would lose
-	// them. Optional like set_env: an older agent answers "unknown op", and
-	// the host records that the saved disk was not flushed.
-	OpSyncFS VsockOp = "sync_fs"
+	// OpFreezeFS flushes the root filesystem and holds every new write to it
+	// until OpThawFS, so the host can copy a running VM's disk while nothing
+	// changes it (CreateSnapshot of a running sandbox). Programs keep
+	// running; only their writes to / wait. Data is {"thaw_after_ms":N}: the
+	// agent thaws on its own after N ms, so a host that dies mid-copy cannot
+	// leave the sandbox frozen. Stop sends it too, just before pausing the
+	// VM, so the saved disk holds every write made before Stop; the VM then
+	// resumes frozen, and post_resume thaws it. Optional like set_env: an
+	// older agent answers "unknown op", and the host refuses to snapshot a
+	// sandbox whose disk it could not freeze.
+	OpFreezeFS VsockOp = "freeze_fs"
+	// OpThawFS releases a freeze_fs. Thawing a filesystem that is not
+	// frozen succeeds, so the host can always send it.
+	OpThawFS VsockOp = "thaw_fs"
 )
 
 // VsockMessage is the request shape. Newline-delimited JSON, one
@@ -135,10 +143,10 @@ type vsockAdoptHandler interface {
 	OnAdopt(ctx context.Context, raw json.RawMessage) error
 }
 
-// vsockSyncHandler is the optional sync_fs capability, separate for the same
-// reason as vsockEnvHandler.
-type vsockSyncHandler interface {
-	OnSyncFS(ctx context.Context) error
+// vsockFreezeHandler is the optional freeze_fs / thaw_fs capability.
+type vsockFreezeHandler interface {
+	OnFreezeFS(ctx context.Context, raw json.RawMessage) error
+	OnThawFS(ctx context.Context) error
 }
 
 // identityAdopter is the part of the server the adopt op drives.
@@ -222,9 +230,14 @@ func dispatchVsock(ctx context.Context, msg VsockMessage, handler VsockHandler) 
 			return h.OnAdopt(ctx, msg.Data)
 		}
 		return fmt.Errorf("unknown op %q", msg.Op)
-	case OpSyncFS:
-		if h, ok := handler.(vsockSyncHandler); ok {
-			return h.OnSyncFS(ctx)
+	case OpFreezeFS:
+		if h, ok := handler.(vsockFreezeHandler); ok {
+			return h.OnFreezeFS(ctx, msg.Data)
+		}
+		return fmt.Errorf("unknown op %q", msg.Op)
+	case OpThawFS:
+		if h, ok := handler.(vsockFreezeHandler); ok {
+			return h.OnThawFS(ctx)
 		}
 		return fmt.Errorf("unknown op %q", msg.Op)
 	case "":
@@ -247,6 +260,11 @@ type quiesceOps interface {
 	// SyncFilesystems flushes every filesystem's dirty data and metadata
 	// to its disk (sync(2)).
 	SyncFilesystems() error
+	// FreezeRoot flushes the root filesystem and blocks new writes to it
+	// (FIFREEZE); ThawRoot releases it (FITHAW). ThawRoot on a filesystem
+	// that is not frozen returns nil.
+	FreezeRoot() error
+	ThawRoot() error
 }
 
 type guestNetworkConfig struct {
@@ -287,6 +305,46 @@ type quiesceHandler struct {
 	env *sandboxenv.Store
 	// identity receives adopt; nil answers adopt with an error.
 	identity identityAdopter
+
+	// freeze tracks a freeze_fs in progress and its safety thaw.
+	freeze freezeState
+	// afterFunc schedules the safety thaw; tests replace it.
+	afterFunc func(time.Duration, func()) thawTimer
+}
+
+// freezeState is the root filesystem's freeze, as freeze_fs left it. gen
+// changes on every freeze and thaw, so a safety thaw scheduled for an
+// earlier freeze cannot thaw a later one.
+type freezeState struct {
+	mu     sync.Mutex
+	frozen bool
+	gen    uint64
+	timer  thawTimer
+}
+
+// thawTimer is the part of *time.Timer the safety thaw needs.
+type thawTimer interface{ Stop() bool }
+
+// Bounds on freeze_fs's thaw_after_ms. Below the minimum a slow copy would
+// always be cut short; above the maximum a host that died would leave the
+// sandbox unable to write for too long. Zero (an older host's request)
+// gets the default.
+const (
+	minFreezeThawAfter     = time.Second
+	defaultFreezeThawAfter = 10 * time.Minute
+	maxFreezeThawAfter     = 30 * time.Minute
+)
+
+func clampFreezeThawAfter(d time.Duration) time.Duration {
+	switch {
+	case d <= 0:
+		return defaultFreezeThawAfter
+	case d < minFreezeThawAfter:
+		return minFreezeThawAfter
+	case d > maxFreezeThawAfter:
+		return maxFreezeThawAfter
+	}
+	return d
 }
 
 func newQuiesceHandler(logger *slog.Logger, sessions sessionFlusher, cloneGen *clonegen.Generation) *quiesceHandler {
@@ -318,19 +376,113 @@ func (h *quiesceHandler) OnPreSnapshot(ctx context.Context, _ json.RawMessage) e
 	return nil
 }
 
-// OnSyncFS flushes the guest's filesystems so the disk the host saves on Stop
-// holds every write made before it, not only the ones the kernel had
-// already written back. Unlike pre_snapshot it is not best-effort: an error
-// goes back to the host, which then records the saved disk as unflushed.
-func (h *quiesceHandler) OnSyncFS(_ context.Context) error {
-	if err := h.quiesce.SyncFilesystems(); err != nil {
-		return fmt.Errorf("sync filesystems: %w", err)
+// OnFreezeFS freezes the root filesystem so the host can copy the disk of a
+// running VM. It flushes first, while writes still flow, so the freeze
+// itself has little left to write and the pause the sandbox sees is mostly
+// the host's copy. A repeated freeze_fs (a host retry) keeps the freeze and
+// restarts the safety thaw.
+func (h *quiesceHandler) OnFreezeFS(_ context.Context, raw json.RawMessage) error {
+	var data struct {
+		ThawAfterMS int64 `json:"thaw_after_ms"`
 	}
-	h.logger.Info("vsock: sync_fs complete")
+	if len(raw) > 0 {
+		if err := json.Unmarshal(raw, &data); err != nil {
+			return fmt.Errorf("freeze_fs: decode: %w", err)
+		}
+	}
+	thawAfter := clampFreezeThawAfter(time.Duration(data.ThawAfterMS) * time.Millisecond)
+
+	h.freeze.mu.Lock()
+	defer h.freeze.mu.Unlock()
+	if !h.freeze.frozen {
+		if err := h.quiesce.SyncFilesystems(); err != nil {
+			h.logger.Warn("vsock: freeze_fs pre-flush failed; freezing anyway", "error", err)
+		}
+		if err := h.quiesce.FreezeRoot(); err != nil {
+			return fmt.Errorf("freeze root filesystem: %w", err)
+		}
+		h.freeze.frozen = true
+	}
+	if h.freeze.timer != nil {
+		h.freeze.timer.Stop()
+	}
+	h.freeze.gen++
+	gen := h.freeze.gen
+	h.freeze.timer = h.scheduleThaw(thawAfter, func() { h.safetyThaw(gen) })
+	h.logger.Info("vsock: root filesystem frozen", "thaw_after", thawAfter)
 	return nil
 }
 
+// OnThawFS releases the freeze. It always asks the kernel, even when this
+// agent did not record a freeze, so a host that lost track can still thaw.
+func (h *quiesceHandler) OnThawFS(_ context.Context) error {
+	h.freeze.mu.Lock()
+	defer h.freeze.mu.Unlock()
+	if h.freeze.timer != nil {
+		h.freeze.timer.Stop()
+		h.freeze.timer = nil
+	}
+	h.freeze.gen++
+	if err := h.quiesce.ThawRoot(); err != nil {
+		return fmt.Errorf("thaw root filesystem: %w", err)
+	}
+	h.freeze.frozen = false
+	h.logger.Info("vsock: root filesystem thawed")
+	return nil
+}
+
+// safetyThaw runs when the host never sent thaw_fs for freeze gen: the host
+// died or lost the guest mid-copy. The sandbox must not stay unable to
+// write; the host discards a copy that outlived its freeze.
+func (h *quiesceHandler) safetyThaw(gen uint64) {
+	h.freeze.mu.Lock()
+	defer h.freeze.mu.Unlock()
+	if !h.freeze.frozen || h.freeze.gen != gen {
+		return
+	}
+	h.freeze.timer = nil
+	if err := h.quiesce.ThawRoot(); err != nil {
+		h.logger.Error("vsock: safety thaw failed", "error", err)
+		return
+	}
+	h.freeze.frozen = false
+	h.logger.Warn("vsock: root filesystem thawed by the safety timer; the host never sent thaw_fs")
+}
+
+// thawAfterResume lifts a freeze this agent holds. A failure is only
+// logged: the host also sends thaw_fs after a resume, and the safety timer
+// is still armed.
+func (h *quiesceHandler) thawAfterResume() {
+	h.freeze.mu.Lock()
+	defer h.freeze.mu.Unlock()
+	if !h.freeze.frozen {
+		return
+	}
+	if err := h.quiesce.ThawRoot(); err != nil {
+		h.logger.Warn("vsock post_resume: thaw failed", "error", err)
+		return
+	}
+	if h.freeze.timer != nil {
+		h.freeze.timer.Stop()
+		h.freeze.timer = nil
+	}
+	h.freeze.gen++
+	h.freeze.frozen = false
+	h.logger.Info("vsock post_resume: root filesystem thawed")
+}
+
+func (h *quiesceHandler) scheduleThaw(d time.Duration, f func()) thawTimer {
+	if h.afterFunc != nil {
+		return h.afterFunc(d, f)
+	}
+	return time.AfterFunc(d, f)
+}
+
 func (h *quiesceHandler) OnPostResume(ctx context.Context, raw json.RawMessage) error {
+	// A VM stopped frozen (Stop freezes the root filesystem so the saved
+	// disk holds every write) resumes frozen. The host is done with that
+	// disk, so the freeze goes first, before anything below writes.
+	h.thawAfterResume()
 	var data struct {
 		WallclockUnixNs int64               `json:"wallclock_unix_ns"`
 		Network         *guestNetworkConfig `json:"network,omitempty"`

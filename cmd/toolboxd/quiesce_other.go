@@ -32,6 +32,14 @@ func (otherQuiesceOps) SyncFilesystems() error {
 	return errors.New("quiesce: linux-only (build tag !linux)")
 }
 
+func (otherQuiesceOps) FreezeRoot() error {
+	return errors.New("quiesce: linux-only (build tag !linux)")
+}
+
+func (otherQuiesceOps) ThawRoot() error {
+	return errors.New("quiesce: linux-only (build tag !linux)")
+}
+
 // newQuiesceOps returns the platform-specific quiesce implementation.
 // Non-Linux gets the stub above; Linux gets real syscalls from
 // quiesce_linux.go.

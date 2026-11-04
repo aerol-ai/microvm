@@ -1230,6 +1230,14 @@ type CreateSandboxResponse struct {
 // pass back into CreateSandboxRequest.Image.
 type CreateSandboxSnapshotRequest struct {
 	Name string `json:"name"`
+	// AllowPause says whether the snapshot may pause a running sandbox.
+	// Omitted or true: a running sandbox is paused for the copy (Docker
+	// pauses the container while it commits it; Firecracker holds the
+	// guest's disk writes while it copies the disk) and keeps running
+	// afterwards. False: a sandbox that is not stopped is refused with
+	// ErrSnapshotSourceNotReady (409) instead, for workloads that must never
+	// stall. A stopped sandbox needs no pause either way.
+	AllowPause *bool `json:"allow_pause,omitempty"`
 }
 
 // SandboxSnapshot is the persisted metadata for a committed sandbox image.

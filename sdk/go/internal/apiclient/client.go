@@ -431,9 +431,12 @@ func (c *Client) Stop(ctx context.Context, id string) (*Sandbox, error) {
 	return c.wrap(response), nil
 }
 
-func (c *Client) CreateSnapshot(ctx context.Context, id, name string) (SandboxSnapshot, error) {
+// CreateSnapshot saves a sandbox's files as a snapshot. allowPause nil
+// leaves the server's default (pause a running sandbox briefly).
+func (c *Client) CreateSnapshot(ctx context.Context, id, name string, allowPause *bool) (SandboxSnapshot, error) {
 	var response models.SandboxSnapshot
-	err := c.doJSON(ctx, http.MethodPost, c.versionPrefix+"/sandboxes/"+id+"/snapshot", models.CreateSandboxSnapshotRequest{Name: name}, &response)
+	err := c.doJSON(ctx, http.MethodPost, c.versionPrefix+"/sandboxes/"+id+"/snapshot",
+		models.CreateSandboxSnapshotRequest{Name: name, AllowPause: allowPause}, &response)
 	return response, err
 }
 

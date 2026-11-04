@@ -49,7 +49,7 @@ func TestInstallRestartsSandboxdOnlyWhenARerunChangedIt(t *testing.T) {
 		t.Fatal(err)
 	}
 	funcs := installShFunctions(t, string(raw), "sandboxd_config_fingerprint", "record_sandboxd_state",
-		"wait_for_sandboxd_ready", "restart_sandboxd_if_reconfigured")
+		"wait_for_sandboxd_ready", "keep_firecracker_vms_running", "restart_sandboxd_if_reconfigured")
 
 	cases := []struct {
 		name         string
@@ -106,11 +106,23 @@ func TestInstallRestartsSandboxdOnlyWhenARerunChangedIt(t *testing.T) {
 			if tc.active {
 				active = "true"
 			}
+			// A cgroup v2 root, so keep_firecracker_vms_running asks systemd
+			// for sandboxd's cgroup; the stub answers none, and it stops
+			// there. Its moves themselves are tested in
+			// internal/runtime/firecracker/install_script_test.go.
+			cgroupRoot := filepath.Join(dir, "cgroup")
+			if err := os.MkdirAll(cgroupRoot, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(cgroupRoot, "cgroup.controllers"), nil, 0o644); err != nil {
+				t.Fatal(err)
+			}
 			script := "set -euo pipefail\n" +
 				"SANDBOXD_ENV_FILE='" + env + "'\nSANDBOXD_UNIT_FILE='" + unit + "'\n" +
 				"SANDBOXD_HEALTH_URL='http://127.0.0.1:21212/health'\nSANDBOXD_READY_TRIES=3\n" +
 				"SANDBOXD_WAS_ACTIVE=false\nSANDBOXD_CONFIG_BEFORE=''\n" +
 				"PAT_SCOPE='" + tc.patScope + "'\nPUBLIC_API_SOCKET='" + sock + "'\n" +
+				"CGROUP_ROOT='" + cgroupRoot + "'\nPROC_ROOT='" + filepath.Join(dir, "proc") + "'\n" +
 				"LOG='" + filepath.Join(dir, "calls.log") + "'\nUP='" + filepath.Join(dir, "up") + "'\n" +
 				funcs +
 				// The stubs. sandboxd answers /health only once restarted.
@@ -138,6 +150,15 @@ func TestInstallRestartsSandboxdOnlyWhenARerunChangedIt(t *testing.T) {
 			restarted := strings.Contains(string(calls), "systemctl restart sandboxd")
 			if restarted != tc.wantRestart {
 				t.Fatalf("restarted = %v, want %v; calls:\n%s", restarted, tc.wantRestart, calls)
+			}
+			// The restart kills everything in sandboxd's cgroup, so a VM an
+			// older release started there must be moved out first.
+			moved := strings.Index(string(calls), "systemctl show -p ControlGroup --value sandboxd")
+			if restarted && (moved < 0 || moved > strings.Index(string(calls), "systemctl restart sandboxd")) {
+				t.Fatalf("the restart did not move Firecracker VMs out of sandboxd's cgroup first; calls:\n%s", calls)
+			}
+			if !restarted && moved >= 0 {
+				t.Fatalf("Firecracker VMs were moved without a restart; calls:\n%s", calls)
 			}
 			if got := strings.Contains(stderr.String(), "warning: sandboxd is not answering"); got != tc.wantWarning {
 				t.Fatalf("warning = %v, want %v; stderr: %s", got, tc.wantWarning, stderr.String())

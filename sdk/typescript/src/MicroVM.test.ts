@@ -215,6 +215,9 @@ test("MicroVM createSnapshot returns snapshot metadata", async () => {
   assert.deepEqual(seen[0]?.body, { name: "snapshots/demo:v1" });
   assert.equal(snapshot.imageID, "sha256:snap-1");
   assert.equal(snapshot.sourceSandboxID, "sb-demo");
+
+  await sdk.createSnapshot("sb-demo", "snapshots/demo:v1", { allowPause: false });
+  assert.deepEqual(seen[1]?.body, { name: "snapshots/demo:v1", allow_pause: false });
 });
 
 test("MicroVM registerSnapshot returns persisted snapshot metadata", async () => {

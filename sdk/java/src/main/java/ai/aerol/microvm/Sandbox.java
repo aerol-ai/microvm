@@ -5,6 +5,7 @@ import java.util.List;
 import ai.aerol.microvm.model.AuditOptions;
 import ai.aerol.microvm.model.AuditPage;
 import ai.aerol.microvm.model.CloneGeneration;
+import ai.aerol.microvm.model.CreateSnapshotOptions;
 import ai.aerol.microvm.model.CreateSessionOptions;
 import ai.aerol.microvm.model.CustomDomain;
 import ai.aerol.microvm.model.CustomDomainDnsRecords;
@@ -157,6 +158,14 @@ public class Sandbox extends SandboxData {
 
     public SandboxSnapshot createSnapshot(String name) {
         return client.createSnapshot(id, name);
+    }
+
+    /**
+     * Saves this sandbox's files as a snapshot. With {@code allowPause} false,
+     * a sandbox that is not stopped is refused (HTTP 409) instead of paused.
+     */
+    public SandboxSnapshot createSnapshot(String name, CreateSnapshotOptions options) {
+        return client.createSnapshot(id, name, options);
     }
 
     public void destroy() {

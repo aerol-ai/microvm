@@ -111,7 +111,7 @@ func TestTransportClientCases(t *testing.T) {
 				defer server.Close()
 
 				client := NewClient(server.URL, ClientOptions{PATToken: "pat-token", HTTPClient: server.Client()})
-				snapshot, err := client.CreateSnapshot(ctx, "sb-snap", "snapshots/demo:v1")
+				snapshot, err := client.CreateSnapshot(ctx, "sb-snap", "snapshots/demo:v1", nil)
 				if err != nil {
 					t.Fatalf("CreateSnapshot() error = %v", err)
 				}

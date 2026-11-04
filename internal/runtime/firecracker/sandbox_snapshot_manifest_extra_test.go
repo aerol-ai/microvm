@@ -27,7 +27,7 @@ func TestReadWriteSandboxSnapshotManifest_Extra(t *testing.T) {
 	// But if the client fails to CreateSnapshot, it fails. I'll test CreateSnapshot failure in writeSandboxSnapshot.
 	client := newFakeClient()
 	client.snapshotCreateErr = os.ErrPermission
-	err := d.writeSandboxSnapshot(context.Background(), sbID, &warmDestroyHandle{}, client, 3, false)
+	err := d.writeSandboxSnapshot(context.Background(), sbID, &warmDestroyHandle{}, client, 3, guestFlushFailed)
 	if err == nil || !strings.Contains(err.Error(), "permission") {
 		t.Errorf("expected permission error, got %v", err)
 	}

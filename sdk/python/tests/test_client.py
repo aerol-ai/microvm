@@ -768,6 +768,25 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(snapshot["sourceSandboxID"], "sb-1")
         self.assertEqual(sandbox_snapshot["name"], "snapshots/from-sandbox:v1")
 
+    def test_create_snapshot_sends_allow_pause_only_when_set(self):
+        client = RecordingMicroVM()
+        client.create_snapshot("sb-1", "snap", allow_pause=False)
+        client.create_snapshot("sb-1", "snap", allow_pause=True)
+        sandbox = client.create({"image": "ubuntu:22.04"})
+        sandbox.create_snapshot("snap", allow_pause=False)
+        sandbox.create_snapshot("snap")
+
+        snapshot_bodies = [call[2] for call in client.calls if call[1].endswith("/snapshot")]
+        self.assertEqual(
+            snapshot_bodies,
+            [
+                {"name": "snap", "allow_pause": False},
+                {"name": "snap", "allow_pause": True},
+                {"name": "snap", "allow_pause": False},
+                {"name": "snap"},
+            ],
+        )
+
     def test_register_snapshot_maps_request_and_response_shapes(self):
         client = RecordingMicroVM()
 

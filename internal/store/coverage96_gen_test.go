@@ -157,7 +157,7 @@ func cover96_ptr_Store(recv *Store) {
 	cover96Call(func() { recv.ListReadyWasmModuleRefs(cover96Ctx()) })                                       // store.go:8155
 	cover96Call(func() { recv.ListSnapshotAliases(cover96Ctx(), zero96[string]()) })                         // store.go:2901
 	cover96Call(func() { recv.ListSnapshots(cover96Ctx()) })                                                 // store.go:3176
-	cover96Call(func() { recv.ListSnapshotsPendingPush(cover96Ctx()) })                                      // store.go:3886
+	cover96Call(func() { recv.ListSnapshotsPendingPushPage(cover96Ctx(), SnapshotPushCursor{}, 1) })         // store.go:3886
 	cover96Call(func() { recv.ListTemplateInventoryIDs(cover96Ctx()) })                                      // store.go:3665
 	cover96Call(func() { recv.ListTemplates(cover96Ctx()) })                                                 // store.go:3314
 	cover96Call(func() { recv.ListTemplatesPendingPush(cover96Ctx()) })                                      // store.go:3542

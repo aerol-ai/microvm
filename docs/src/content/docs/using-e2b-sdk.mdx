@@ -102,7 +102,7 @@ We checked both examples with E2B SDK 2.50.0. With no template, the E2B SDK asks
 
 | E2B feature | On AerolVM |
 |---|---|
-| Take a snapshot of a sandbox | Works. |
+| Take a snapshot of a sandbox | Works, Firecracker sandboxes included. A running sandbox pauses briefly while it is copied, then keeps running ([details](/images-and-snapshots/#save-a-running-sandbox)). |
 | List snapshots, delete a template | Works. |
 | Start a sandbox from a snapshot | Works: pass the snapshot's name or ID as the template. |
 

@@ -89,9 +89,12 @@ type Driver struct {
 	// snapshot this node holds but no registry has. Optional: without it
 	// CreateSnapshot is not implemented. Set via SetImageStore.
 	images ImageStore
-	// mounter mounts the copy of a saved disk CreateSnapshot reads. nil
-	// means the host's loop mount (loopMounter).
-	mounter DiskMounter
+	// helperImages caches the root image of the VM CreateSnapshot reads a
+	// disk in (snapshot_export_vm.go).
+	helperImages exportHelperImages
+	// gate lets Stop and a snapshot of a running VM take turns, so a Stop
+	// never saves a VM whose filesystem a snapshot has frozen.
+	gate vmGate
 	// aocrPullAuth is the cluster PAT a cold-boot pull of an in-scope AOCR
 	// `cluster/` ref presents, the same credential the container engines
 	// use (docker.AOCRPullAuth), so a snapshot pushed by another node can
@@ -966,19 +969,7 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 	// half-built state (the deferred closures run on panic).
 	released = true
 	tapRemoved = false // sandbox-owned now; Destroy will remove
-	d.mu.Lock()
-	d.clients[allocID] = client
-	d.vmms[allocID] = handle
-	d.guestCID[allocID] = handshakeCID
-	d.mu.Unlock()
-
-	// Phase 5: tell the RSS sampler about the new VMM so the next
-	// sampleOnce includes it in the host-pressure aggregate. Done
-	// AFTER the map writes so a sampler tick that races us doesn't
-	// see a registered pid the rest of the driver thinks doesn't
-	// exist yet. Nil-safe via rssRegister — daemons without Phase 5
-	// take no penalty.
-	d.rssRegister(allocID, handle.Pid())
+	d.register(allocID, client, handle, handshakeCID, true)
 
 	return &models.SandboxRuntimeState{
 		SandboxID: allocID,
@@ -1358,7 +1349,7 @@ func vcpuFromRequest(cpu float64) int {
 // plus our toolbox init:
 //
 //   - console=ttyS0: useful for early-boot panics on the firecracker
-//     stdio (cappedBuffer captures these).
+//     stdio (vmmOutput keeps these).
 //   - reboot=k panic=1: convert kernel panics into a clean VMM exit
 //     rather than a hung guest — the driver's cleanup contract relies
 //     on the VMM process actually exiting on failure.
@@ -1480,6 +1471,13 @@ func (d *Driver) StartWithIdentity(ctx context.Context, containerRef, sandboxID,
 // and vsock identity; Destroy releases that allocation and deletes the
 // snapshot.
 func (d *Driver) Stop(ctx context.Context, sandboxID string) error {
+	// A snapshot of the running VM may have its filesystem frozen; stopping
+	// now would save the VM frozen. Wait for the thaw.
+	release, err := d.gate.lock(ctx, sandboxID)
+	if err != nil {
+		return fmt.Errorf("firecracker runtime: stop %s: %w", sandboxID, err)
+	}
+	defer release()
 	return d.stopToSandboxSnapshot(ctx, sandboxID)
 }
 
@@ -1505,18 +1503,9 @@ func (d *Driver) Destroy(ctx context.Context, sandbox *models.Sandbox) error {
 		return nil
 	}
 	sandboxID := sandbox.ID
-	d.mu.Lock()
-	handle, hasHandle := d.vmms[sandboxID]
-	delete(d.vmms, sandboxID)
-	delete(d.clients, sandboxID)
-	delete(d.guestCID, sandboxID)
-	d.mu.Unlock()
-
-	// Phase 5: tell the RSS sampler the VMM is gone so the next
-	// sampleOnce drops its contribution to the host-pressure
-	// aggregate. Unregister before Shutdown so a slow Shutdown can't
-	// leave the sampler reading a dying pid for one extra tick.
-	d.rssUnregister(sandboxID)
+	// Before Shutdown, so a slow Shutdown can't leave the sampler reading
+	// a dying pid for one extra tick.
+	handle, hasHandle := d.unregister(sandboxID)
 
 	var firstErr error
 	rememberErr := func(err error) {
@@ -1638,6 +1627,9 @@ func (d *Driver) Inspect(ctx context.Context, sandboxID string) (*models.Sandbox
 	}, nil
 }
 
+// listManagedInspectTimeout bounds one VMM's state query in ListManaged.
+const listManagedInspectTimeout = 5 * time.Second
+
 // ListManaged enumerates every Firecracker VMM the driver knows about.
 // Walks the in-memory registry (no SQLite hit) — reconcile uses this
 // to compare driver state against the persisted row set.
@@ -1655,7 +1647,11 @@ func (d *Driver) ListManaged(ctx context.Context) (map[string]*models.SandboxRun
 
 	out := make(map[string]*models.SandboxRuntimeState, len(ids))
 	for i, id := range ids {
-		info, err := clients[i].InstanceInfo(ctx)
+		// A VMM that does not answer costs listManagedInspectTimeout, not
+		// the client's 30 s: reconcile at boot walks every VM in turn.
+		ictx, cancel := context.WithTimeout(ctx, listManagedInspectTimeout)
+		info, err := clients[i].InstanceInfo(ictx)
+		cancel()
 		if err != nil {
 			// One unreachable VMM doesn't fail the whole walk —
 			// reconcile uses this as a snapshot, and a transient API

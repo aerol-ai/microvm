@@ -840,7 +840,7 @@ func TestWriteSandboxSnapshot_RotationPromotesSnapshot(t *testing.T) {
 	handle := &warmDestroyHandle{runDir: runDir}
 	ctx := context.Background()
 	for i := 0; i < 2; i++ {
-		if err := d.writeSandboxSnapshot(ctx, "sb-rotate", handle, client, 3, false); err != nil {
+		if err := d.writeSandboxSnapshot(ctx, "sb-rotate", handle, client, 3, guestFlushFailed); err != nil {
 			t.Fatalf("writeSandboxSnapshot pass %d: %v", i+1, err)
 		}
 	}
@@ -860,7 +860,7 @@ func TestWriteSandboxSnapshot_HappyPathWithOverlay(t *testing.T) {
 		t.Fatalf("write overlay: %v", err)
 	}
 	handle := &warmDestroyHandle{runDir: runDir}
-	if err := d.writeSandboxSnapshot(context.Background(), "sb-write-ok", handle, client, 42, false); err != nil {
+	if err := d.writeSandboxSnapshot(context.Background(), "sb-write-ok", handle, client, 42, guestFlushFailed); err != nil {
 		t.Fatalf("writeSandboxSnapshot: %v", err)
 	}
 	manifest, err := d.readSandboxSnapshotManifest("sb-write-ok")

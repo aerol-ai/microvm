@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"slices"
 	"strings"
 	"testing"
 
@@ -117,6 +118,55 @@ func TestImportRootfsImageErrors(t *testing.T) {
 				t.Fatalf("err = %v, want %q", err, tc.want)
 			}
 		})
+	}
+}
+
+// A failed unpack must not leave the image record behind: it is a GC root, so
+// it would pin the layer just written forever with no snapshot row naming it.
+// Taken back whether this call created the record or repointed an old one,
+// and only on the unpack failure (an earlier failure wrote no record).
+func TestImportRootfsImageTakesBackTheRecordOnUnpackFailure(t *testing.T) {
+	boom := errors.New("snapshotter full")
+	cases := []struct {
+		name        string
+		set         func(*fakeSnapshotBackend)
+		wantDeleted []string
+		wantErr     []string
+	}{
+		{name: "created record", set: func(b *fakeSnapshotBackend) { b.unpackErr = boom },
+			wantDeleted: []string{"aerolvm-snapshot/abc:latest"}, wantErr: []string{"import unpack", "snapshotter full"}},
+		{name: "repointed record", set: func(b *fakeSnapshotBackend) { b.createErr = errdefs.ErrAlreadyExists; b.unpackErr = boom },
+			wantDeleted: []string{"aerolvm-snapshot/abc:latest"}, wantErr: []string{"import unpack"}},
+		{name: "record already gone", set: func(b *fakeSnapshotBackend) { b.unpackErr = boom; b.deleteErr = errdefs.ErrNotFound },
+			wantErr: []string{"import unpack"}},
+		{name: "delete fails too", set: func(b *fakeSnapshotBackend) { b.unpackErr = boom; b.deleteErr = errors.New("metadata locked") },
+			wantErr: []string{"import unpack", "snapshotter full", "removing image record", "metadata locked"}},
+		{name: "no record written", set: func(b *fakeSnapshotBackend) { b.createErr = boom },
+			wantErr: []string{"import image record"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			d, backend := importFixture(t)
+			tc.set(backend)
+			// A cancelled caller still gets the record removed.
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			_, err := d.ImportRootfsImage(ctx, "aerolvm-snapshot/abc", strings.NewReader("x"))
+			if err == nil {
+				t.Fatal("ImportRootfsImage succeeded")
+			}
+			for _, want := range tc.wantErr {
+				if !strings.Contains(err.Error(), want) {
+					t.Fatalf("err = %v, want it to mention %q", err, want)
+				}
+			}
+			if !slices.Equal(backend.deleted, tc.wantDeleted) {
+				t.Fatalf("deleted records = %v, want %v", backend.deleted, tc.wantDeleted)
+			}
+		})
+	}
+	if !errors.Is(removeFailedImageRecord(context.Background(), &fakeSnapshotBackend{}, "x", boom), boom) {
+		t.Fatal("the cause must stay matchable")
 	}
 }
 

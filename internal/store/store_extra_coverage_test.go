@@ -160,52 +160,6 @@ func TestExposedPortReads(t *testing.T) {
 	}
 }
 
-func TestSnapshotPushLifecycle(t *testing.T) {
-	ctx := context.Background()
-	st := newTestStore(t)
-
-	now := time.Now().UTC().Round(0)
-	if err := st.CreateSnapshot(ctx, &models.SandboxSnapshot{
-		Name:      "snap-1",
-		Image:     "img:1",
-		CreatedAt: now,
-		PushState: models.SnapshotPushStatePending,
-	}); err != nil {
-		t.Fatalf("CreateSnapshot: %v", err)
-	}
-
-	pending, err := st.ListSnapshotsPendingPush(ctx)
-	if err != nil {
-		t.Fatalf("ListSnapshotsPendingPush: %v", err)
-	}
-	if len(pending) != 1 || pending[0].Name != "snap-1" {
-		t.Fatalf("pending = %+v", pending)
-	}
-
-	if err := st.UpdateSnapshotImageDistribution(ctx, "", "snap-1", "aocr", "reg/ref", "sha256:abc"); err != nil {
-		t.Fatalf("UpdateSnapshotImageDistribution: %v", err)
-	}
-	if err := st.UpdateSnapshotImageDistribution(ctx, "", "missing", "aocr", "r", "d"); !errors.Is(err, ErrNotFound) {
-		t.Fatalf("UpdateSnapshotImageDistribution(missing) = %v", err)
-	}
-
-	if err := st.SetSnapshotPushState(ctx, "", "snap-1", "active", ""); err != nil {
-		t.Fatalf("SetSnapshotPushState: %v", err)
-	}
-	if err := st.SetSnapshotPushState(ctx, "", "missing", "active", ""); !errors.Is(err, ErrNotFound) {
-		t.Fatalf("SetSnapshotPushState(missing) = %v", err)
-	}
-
-	// snap-1 is now active so no longer pending.
-	pending, err = st.ListSnapshotsPendingPush(ctx)
-	if err != nil {
-		t.Fatalf("ListSnapshotsPendingPush 2: %v", err)
-	}
-	if len(pending) != 0 {
-		t.Fatalf("expected no pending after active, got %+v", pending)
-	}
-}
-
 func TestReleaseOrphanedFirecrackerVMMSlots(t *testing.T) {
 	ctx := context.Background()
 	st := newTestStore(t)
@@ -316,8 +270,6 @@ func runExtraCoverageWithCtx(ctx context.Context, st *Store) {
 	_ = st.UpdateTemplateSnapshotFailed(ctx, "tpl-1", "error")
 	_, _ = st.MarkTemplateUnhealthy(ctx, "tpl-1", "error")
 	_, _ = st.MarkTemplatePushPending(ctx, "tpl-1")
-	_ = st.SetTemplatePushState(ctx, "tpl-1", "ready", "")
-	_ = st.UpdateTemplatePushDistribution(ctx, "tpl-1", "reg", "repo")
 	_ = st.DeleteTemplate(ctx, "tpl-1")
 
 	// Compat State
@@ -334,9 +286,7 @@ func runExtraCoverageWithCtx(ctx context.Context, st *Store) {
 	_ = st.DeleteSnapshot(ctx, "", "missing")
 	_, _ = st.GetSnapshot(ctx, "", "missing")
 	_, _ = st.ListSnapshots(ctx)
-	_, _ = st.ListSnapshotsPendingPush(ctx)
-	_ = st.SetSnapshotPushState(ctx, "", "missing", "a", "b")
-	_ = st.UpdateSnapshotImageDistribution(ctx, "", "missing", "a", "b", "c")
+	_, _ = st.ListSnapshotsPendingPushPage(ctx, SnapshotPushCursor{}, 10)
 
 	// Ports
 	_ = st.UpsertPort(ctx, models.ExposedPort{})
