@@ -66,43 +66,48 @@ AerolVM gives you everything you need to build sandbox-backed products and agent
 
 ## Architecture
 
-The diagram shows a **hetero cluster**: each node has one job, and each job runs on the hardware that suits it. All nodes run the same `sandboxd` binary. Nodes talk to each other over mutual TLS and find each other with encrypted SWIM gossip.
+The diagram shows a **hetero cluster**: each node has one job, and each job runs on the hardware that suits it. All nodes run the same `sandboxd` binary.
 
 ```mermaid
 flowchart TB
-    Apps["Your apps, agents and visitors"] --> Entry["One address<br/>DNS or load balancer"]
-
-    subgraph Cluster["AerolVM hetero cluster: all nodes run sandboxd and talk over mutual TLS"]
+    Users["Your apps, agents<br/>and visitors"] --> LB["One address<br/>(load balancer or DNS)"]
+    LB -- "API calls and<br/>sandbox links" --> Cluster
+    subgraph Cluster["AerolVM cluster: SWIM gossip and mutual TLS between all nodes"]
         direction TB
-        subgraph Ingress["Ingress nodes, 2 to 10: take public traffic"]
-            I1["Ingress<br/>Caddy: HTTPS, HTTP and TCP routes"]
-            I2["Ingress<br/>Caddy: HTTPS, HTTP and TCP routes"]
+        subgraph Ingress["Ingress nodes, 2 to 10: Caddy + public route table"]
+            direction LR
+            I1["Ingress"] ~~~ I2["Ingress"]
         end
-        subgraph Workers["Worker nodes, as many as you need: run the sandboxes"]
-            W1["Small cloud VMs<br/>containerd, gVisor,<br/>WASM, V8 isolate"]
-            W2["Bare metal with KVM<br/>Firecracker microVMs"]
-            W3["GPU machines<br/>GPU sandboxes"]
+        subgraph Servers["Server nodes, 3 or 5: the Raft group"]
+            direction LR
+            S1["Server"] <-- "Raft" --> S2["Server<br/>(leader)"] <-- "Raft" --> S3["Server"]
         end
-        subgraph Servers["Server nodes, 3 or 5: vote on where each sandbox runs"]
-            S1["Server<br/>Raft voter"] --- S2["Server<br/>Raft voter"] --- S3["Server<br/>Raft voter"]
+        subgraph Workers["Worker nodes: run sandboxes, keep their sealed secrets"]
+            direction LR
+            W1["Containers,<br/>gVisor, WASM<br/>(cloud VMs)"] ~~~ W2["Firecracker<br/>(bare metal)"] ~~~ W3["GPU sandboxes<br/>(GPU machines)"]
         end
     end
-
-    Entry --> I1
-    Entry --> I2
-    I1 --> W1
-    I1 --> W2
-    I2 --> W2
-    I2 --> W3
-    Workers <-. "capacity and placements" .-> Servers
-
-    Servers -.-> Yours["Your systems, optional<br/>Key store: AWS KMS, Vault, OpenBao or HSM<br/>Audit store: S3, webhook or file<br/>Monitoring: Prometheus, Grafana, OpenTelemetry"]
+    Ingress <-- "1. which worker gets<br/>a new sandbox?<br/>where does each<br/>sandbox run?" --> Servers
+    Servers <-- "2. free room on<br/>each worker,<br/>failover work" --> Workers
+    Ingress -- "3. create the sandbox,<br/>then send it commands,<br/>files and web traffic" --> Workers
+    subgraph Yours["Your systems (all optional)"]
+        direction LR
+        Keys["<b>Key store</b><br/>Vault, OpenBao,<br/>HSM or AWS KMS<br/><i>unlocks the keys<br/>to sealed secrets</i>"] ~~~ Audit["<b>Audit store</b><br/>S3 bucket or<br/>SIEM webhook<br/><i>gets hash-chained<br/>audit records</i>"] ~~~ Witness["<b>Audit witness</b><br/>S3 bucket with<br/>Object Lock<br/><i>stores audit<br/>fingerprints</i>"] ~~~ Obs["<b>Monitoring</b><br/>Prometheus, Grafana,<br/>OpenTelemetry<br/><i>gets metrics<br/>and traces</i>"]
+    end
+    Cluster <--> Yours
 ```
 
-- **Ingress nodes** take public traffic and send each request to the worker that runs the sandbox. Only they hold the public route table.
-- **Server nodes** hold the placement state in Raft: which worker runs which sandbox. The voter count stays at 3 or 5 (at most 7) however many workers join, so adding workers does not slow down voting. They do little work, so small machines are enough.
-- **Worker nodes** run the sandboxes. Each worker reports which runtimes and GPUs it has, so a sandbox only lands on a worker that can run it. Add more workers to get more room.
-- **Failover.** If a worker dies, a sandbox created with failover is rebuilt on a healthy worker with the same ID, ports, and public link. See [Durability](https://microvm.aerol.ai/durability).
+The numbers follow one new sandbox:
+
+1. **Ingress nodes (2 to 10)** take every API call and every sandbox link. For a new sandbox, the ingress node asks the server nodes which worker should run it. Ingress nodes also follow the server nodes' record of where each sandbox runs, so their public route table stays current.
+2. **Server nodes (3, 5 or at most 7)** form the Raft group. They keep the record of which worker runs which sandbox, and they agree on every change to it. They check how much free room each worker has, and pick a worker with room for each new sandbox. The voter count stays the same however many workers join, so adding workers does not slow down voting. They do little work, so small machines are enough.
+3. **Worker nodes** run the sandboxes. The ingress node sends the create to the chosen worker, then sends that worker the sandbox's commands, file calls and web traffic. Each worker reports which runtimes and GPUs it has, so a sandbox only lands on a worker that can run it. Add as many workers as you need.
+
+Every node finds the others with SWIM gossip, protected by a shared key. Every call between nodes uses mutual TLS.
+
+- **Secret keys.** Sandbox secrets are always encrypted on disk: environment variables, registry passwords and storage credentials. Each worker keeps the sealed secrets of its sandboxes. By default, each node keeps the key in a file. You can keep it in your own key store instead: Vault, OpenBao, an HSM or AWS KMS. Each node then asks your key store to unlock the key at start, and checks again every 5 minutes. Disable the key, and every node stops using your secrets within about 15 minutes. See [Secrets providers](https://microvm.aerol.ai/cluster-secrets) and [Use your own key store](https://microvm.aerol.ai/enterprise/key-custody).
+- **Audit.** Every node writes a record each time a secret is opened, an API call changes something, or a call is refused. Each record names the caller. Each record also holds a fingerprint (hash) of the one before it, so an edited or deleted record breaks the chain. Nodes ship the records to your S3 bucket or a webhook. The audit witness keeps each node's newest fingerprint in an S3 bucket with Object Lock, where no node can change it. So if someone with root on a node rewrites its log, `aerolvm audit verify` catches it. See [Audit and compliance](https://microvm.aerol.ai/enterprise/audit-evidence).
+- **Failover.** If a worker dies, the server nodes give its failover sandboxes to healthy workers. Each one is rebuilt with the same ID, ports, and public link. Its sealed secrets were copied to at least one backup node when it was created, so they still open on the new worker. See [Durability](https://microvm.aerol.ai/durability).
 
 You do not need a cluster to start. One server runs all three jobs on one machine. A **mixed cluster** of 2 to 10 alike servers gives you more room and survives a dead server. Move to a hetero cluster past 10 nodes, or when you want bare metal and GPU machines. Your code is the same in every layout. See [Clusters](https://microvm.aerol.ai/getting-started/cluster-setup) and [Reference architectures](https://microvm.aerol.ai/enterprise/deployment).
 
@@ -131,10 +136,14 @@ Server-side create from `Server-Timing` (excludes client↔cluster WAN). Artifac
 | **Isolate** | **4ms** | 6ms | 19ms | `single-node-isolate` · t3.medium | Warm path (same tenant group); API p50 266ms is WAN |
 | **WASM** (resident host) | **22ms** | 46ms | 50ms | `cluster-3-mixed-wasm` · t3.large | Flag-on resident host; no cold-compile tail |
 | **Firecracker** (warm pool) | **34ms** | 36ms | 37ms | `single-node-fc` · c5.metal | Post warm-pool path; cold/template builds are higher |
-| **containerd** (OCI default) | **189ms** | 225ms | 233ms | `cluster-3-mixed-containerd` · t3.medium | Default host engine; API runtime remains `docker` |
-| **gVisor** | **284ms** | 330ms | 346ms | `cluster-3-mixed-gvisor` · t3.medium | User-space kernel boot cost |
+| **containerd** (warm pool) | **31ms** | 33ms | 66ms | `cluster-mixed-benchmark-with-obs` · t3.large | All 10 samples came from the pool. Turn it on with `SB_CONTAINERD_POOL_ENABLED=true` (off by default) |
+| **containerd** (OCI default, cold) | **189ms** | 225ms | 233ms | `cluster-3-mixed-containerd` · t3.medium | Default host engine, pool off; API runtime remains `docker` |
+| **gVisor** (warm pool) | **34ms** | 37ms | 42ms | `cluster-mixed-benchmark-with-obs` · t3.large | Same containerd pool, with runsc. 8 of 10 samples came from the pool; the 2 misses were full creates and set the p90 and p99 |
+| **gVisor** (cold) | **284ms** | 330ms | 346ms | `cluster-3-mixed-gvisor` · t3.medium | User-space kernel boot cost, pool off |
 
-Reproduce: `make integration-benchmark-isolate`, `integration-benchmark-wasm`, `integration-benchmark-containerd`, `integration-benchmark-fc`, `integration-benchmark-gvisor`.
+The warm-pool rows come from one 10-sample run (2026-10-04) with the pool on for `alpine:3.20`. Only plain creates use the pool: no environment variables, mounts, custom command, private registry or GPUs, running as root, with a warm slot ready for that image. Every other create takes the cold path.
+
+Reproduce: `make integration-benchmark-isolate`, `integration-benchmark-wasm`, `integration-benchmark-containerd`, `integration-benchmark-fc`, `integration-benchmark-gvisor`, and `integration-cluster-mixed-obs` for the warm-pool rows.
 
 ## SDKs
 
