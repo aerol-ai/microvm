@@ -246,9 +246,7 @@ func (d *Driver) copyRunningDisk(ctx context.Context, sandboxID, diskCopy string
 // freezeGuest asks the guest to flush and freeze its root filesystem. The
 // freeze itself flushes, so it can take a while with a lot of dirty data.
 func (d *Driver) freezeGuest(ctx context.Context, sandboxID, vsockPath string, guestCID uint32) error {
-	fctx, cancel := context.WithTimeout(ctx, guestSyncTimeout)
-	defer cancel()
-	err := d.sendVsockOpAck(fctx, vsockPath, guestCID, "freeze_fs",
+	err := d.sendVsockOpAckWithin(ctx, guestSyncTimeout, vsockPath, guestCID, "freeze_fs",
 		map[string]int64{"thaw_after_ms": guestFreezeLimit.Milliseconds()})
 	switch {
 	case err == nil:
@@ -265,14 +263,13 @@ func (d *Driver) freezeGuest(ctx context.Context, sandboxID, vsockPath string, g
 
 // thawGuest releases a freeze, retrying, and never with the caller's
 // context: a cancelled request must not leave the sandbox unable to write.
-// If every attempt fails, the guest's safety timer thaws it.
+// If every attempt fails, the guest's safety timer thaws it. An agent that
+// does not know thaw_fs cannot have frozen anything.
 func (d *Driver) thawGuest(sandboxID, vsockPath string, guestCID uint32) {
 	var err error
 	for attempt := 0; attempt < 3; attempt++ {
-		tctx, cancel := context.WithTimeout(context.Background(), guestThawTimeout)
-		err = d.sendVsockOpAck(tctx, vsockPath, guestCID, "thaw_fs", nil)
-		cancel()
-		if err == nil {
+		err = d.sendVsockOpAckWithin(context.Background(), guestThawTimeout, vsockPath, guestCID, "thaw_fs", nil)
+		if err == nil || isUnknownOp(err) {
 			return
 		}
 	}

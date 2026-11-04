@@ -320,6 +320,13 @@ func (d *Driver) adoptVM(ctx context.Context, rec vmmRecord, keep VMMKeeper) boo
 	d.guestCID[rec.SandboxID] = rec.VsockCID
 	d.mu.Unlock()
 	d.rssRegister(rec.SandboxID, rec.PID)
+	// The sandboxd that died may have frozen the guest's disk (a snapshot's
+	// copy, or a Stop it never finished), and no one else will ever thaw
+	// it. Not waited for: an unresponsive guest must not hold up the boot,
+	// and its own timer thaws it in the end.
+	if d.vsockDial != nil {
+		go d.thawGuest(rec.SandboxID, filepath.Join(rec.RunDir, hostVsockUDSName), rec.VsockCID)
+	}
 	d.logger.Info("firecracker adopt: running VM taken over", "sandbox_id", rec.SandboxID, "pid", rec.PID)
 	return true
 }

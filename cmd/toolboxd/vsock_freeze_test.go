@@ -249,3 +249,57 @@ func TestQuiesceHandler_ScheduleThawUsesARealTimerByDefault(t *testing.T) {
 		t.Fatal("the real timer never fired")
 	}
 }
+
+// A VM Stop froze resumes frozen; post_resume lifts the freeze before it
+// does anything that might write, and disarms the safety thaw.
+func TestQuiesceHandler_PostResumeThawsAFreeze(t *testing.T) {
+	h, q, timers := freezeHandler()
+	if err := h.OnFreezeFS(context.Background(), freezeData(60_000)); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.OnPostResume(context.Background(), nil); err != nil {
+		t.Fatal(err)
+	}
+	if h.freeze.frozen || !timers.last(t).stopped {
+		t.Fatalf("frozen=%v timer stopped=%v after post_resume", h.freeze.frozen, timers.last(t).stopped)
+	}
+	got := q.recorded()
+	thawAt := slicesIndex(got, "thaw")
+	reseedAt := slicesIndex(got, "reseed")
+	if thawAt < 0 || (reseedAt >= 0 && reseedAt < thawAt) {
+		t.Fatalf("calls %v, want the thaw before anything else post_resume does", got)
+	}
+	// No freeze held: post_resume thaws nothing.
+	before := len(q.recorded())
+	if err := h.OnPostResume(context.Background(), nil); err != nil {
+		t.Fatal(err)
+	}
+	if slicesIndex(q.recorded()[before:], "thaw") >= 0 {
+		t.Fatal("thawed with no freeze held")
+	}
+}
+
+// A thaw that fails on resume keeps the freeze recorded (and its safety
+// thaw armed) and does not fail post_resume.
+func TestQuiesceHandler_PostResumeThawFailureKeepsTheFreeze(t *testing.T) {
+	h, q, timers := freezeHandler()
+	if err := h.OnFreezeFS(context.Background(), freezeData(60_000)); err != nil {
+		t.Fatal(err)
+	}
+	q.thawErr = errors.New("EBUSY")
+	if err := h.OnPostResume(context.Background(), nil); err != nil {
+		t.Fatal(err)
+	}
+	if !h.freeze.frozen || timers.last(t).stopped {
+		t.Fatal("a failed thaw dropped the freeze or its safety thaw")
+	}
+}
+
+func slicesIndex(s []string, v string) int {
+	for i, x := range s {
+		if x == v {
+			return i
+		}
+	}
+	return -1
+}
