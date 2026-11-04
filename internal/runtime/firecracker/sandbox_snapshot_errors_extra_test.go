@@ -19,7 +19,7 @@ func TestWriteSandboxSnapshot_Errors_Extra(t *testing.T) {
 	testErr := func(setup func(), errStr string) {
 		t.Helper()
 		setup()
-		err := d.writeSandboxSnapshot(context.Background(), "sb-1", handle, client, 3, false)
+		err := d.writeSandboxSnapshot(context.Background(), "sb-1", handle, client, 3, guestFlushFailed)
 		if err == nil || !strings.Contains(err.Error(), errStr) {
 			t.Errorf("expected %q error, got %v", errStr, err)
 		}

@@ -204,6 +204,9 @@ type fakeVsockDialer struct {
 	// Post-boot/post-resume sends are best-effort, so tests use this
 	// to assert Create does not fail when that follow-up dial fails.
 	errOnDialIdx int
+	// replyFor, when set, answers each connection by the op written on it
+	// (ok, or the error text), instead of guestRespOk/guestError.
+	replyFor func(op string) (ok bool, errMsg string)
 }
 
 func newFakeVsockDialer() *fakeVsockDialer {
@@ -228,6 +231,9 @@ func (d *fakeVsockDialer) Dial(_ context.Context, socketPath string, cid, _ uint
 		return nil, d.err
 	}
 	rwc := newFakeVsockConn(d.guestRespOk, d.guestError)
+	if d.replyFor != nil {
+		rwc.reply, rwc.replyFor = nil, d.replyFor
+	}
 	rwc.parent = d
 	d.mu.Unlock()
 	return rwc, nil
@@ -257,6 +263,9 @@ type fakeVsockConn struct {
 	pos    int
 	closed bool
 	parent *fakeVsockDialer
+	// replyFor picks the reply from the op written, on the first Read.
+	replyFor func(op string) (ok bool, errMsg string)
+	op       string
 }
 
 func newFakeVsockConn(ok bool, errMsg string) *fakeVsockConn {
@@ -269,6 +278,10 @@ func newFakeVsockConn(ok bool, errMsg string) *fakeVsockConn {
 func (c *fakeVsockConn) Read(p []byte) (int, error) {
 	if c.closed {
 		return 0, io.EOF
+	}
+	if c.reply == nil && c.replyFor != nil {
+		ok, msg := c.replyFor(c.op)
+		c.reply = newFakeVsockConn(ok, msg).reply
 	}
 	if c.pos >= len(c.reply) {
 		return 0, io.EOF
@@ -284,6 +297,12 @@ func (c *fakeVsockConn) Write(p []byte) (int, error) {
 	}
 	if c.parent != nil {
 		c.parent.recordWrite(p)
+	}
+	var msg struct {
+		Op string `json:"op"`
+	}
+	if json.Unmarshal(p, &msg) == nil && msg.Op != "" {
+		c.op = msg.Op
 	}
 	return len(p), nil
 }

@@ -31,13 +31,29 @@ type sandboxSnapshotManifest struct {
 	SnapshotChecksum string    `json:"snapshot_checksum"`
 	HasOverlay       bool      `json:"has_overlay"`
 	CreatedAt        time.Time `json:"created_at"`
-	// GuestSynced records that the guest flushed its filesystems (sync_fs)
-	// before the pause, so rootfs.ext4 holds every write made before Stop.
-	// Start does not need it: it restores the memory, which holds the
-	// rest. CreateSnapshot exports the disk alone and refuses a stop
-	// without it. Absent in manifests written before sync_fs existed.
-	GuestSynced bool `json:"guest_synced,omitempty"`
+	// GuestFlush records how the guest's flush (sync_fs) before the pause
+	// went; see guestFlush. Start does not need the flush: it restores the
+	// memory, which holds any write not yet on the disk. CreateSnapshot
+	// exports the disk alone and needs guestFlushDone. Empty in manifests
+	// written before this field existed, all by releases whose agent
+	// predates sync_fs.
+	GuestFlush guestFlush `json:"guest_flush,omitempty"`
 }
+
+// guestFlush is how the guest's sync_fs before a Stop went.
+type guestFlush string
+
+const (
+	// guestFlushDone: rootfs.ext4 holds every write made before Stop.
+	guestFlushDone guestFlush = "done"
+	// guestFlushFailed: the agent knows sync_fs but the flush failed or
+	// timed out. A later Stop may flush.
+	guestFlushFailed guestFlush = "failed"
+	// guestFlushUnsupported: the agent predates sync_fs. It stays that
+	// agent for the sandbox's whole life (Start restores its memory, it is
+	// never restarted), so no Stop of this sandbox will ever flush.
+	guestFlushUnsupported guestFlush = "unsupported"
+)
 
 func (d *Driver) sandboxSnapshotDir(sandboxID string) string {
 	base := strings.TrimSpace(d.cfg.TemplatesDir)
@@ -141,7 +157,7 @@ func (d *Driver) stopToSandboxSnapshot(ctx context.Context, sandboxID string) er
 	}
 
 	vsockPath := filepath.Join(handle.RunDir(), hostVsockUDSName)
-	guestSynced := d.syncGuestFilesystems(ctx, sandboxID, vsockPath, guestCID)
+	flush := d.syncGuestFilesystems(ctx, sandboxID, vsockPath, guestCID)
 	if err := d.sendVsockOp(ctx, vsockPath, guestCID, "pre_snapshot", nil); err != nil {
 		d.logger.Warn("firecracker stop: pre_snapshot send failed (continuing)",
 			"sandbox_id", sandboxID, "error", err)
@@ -162,7 +178,7 @@ func (d *Driver) stopToSandboxSnapshot(ctx context.Context, sandboxID string) er
 		}
 	}()
 
-	if err := d.writeSandboxSnapshot(ctx, sandboxID, handle, client, guestCID, guestSynced); err != nil {
+	if err := d.writeSandboxSnapshot(ctx, sandboxID, handle, client, guestCID, flush); err != nil {
 		return err
 	}
 	if err := handle.Shutdown(ctx, 3*time.Second); err != nil {
@@ -198,21 +214,35 @@ func (d *Driver) stopToSandboxSnapshot(ctx context.Context, sandboxID string) er
 const guestSyncTimeout = time.Minute
 
 // syncGuestFilesystems asks the guest to flush its filesystems (sync_fs)
-// before the pause, and reports whether it did. Stop goes ahead either way:
+// before the pause, and reports how that went. Stop goes ahead either way:
 // Start restores the memory, which holds any write not yet on the disk. Only
 // a snapshot made from the disk alone (CreateSnapshot) needs the flush.
-func (d *Driver) syncGuestFilesystems(ctx context.Context, sandboxID, vsockPath string, guestCID uint32) bool {
+func (d *Driver) syncGuestFilesystems(ctx context.Context, sandboxID, vsockPath string, guestCID uint32) guestFlush {
 	syncCtx, cancel := context.WithTimeout(ctx, guestSyncTimeout)
 	defer cancel()
-	if err := d.sendVsockOpAck(syncCtx, vsockPath, guestCID, "sync_fs", nil); err != nil {
-		d.logger.Warn("firecracker stop: guest filesystems not flushed; a snapshot of this stopped sandbox will be refused",
+	err := d.sendVsockOpAck(syncCtx, vsockPath, guestCID, "sync_fs", nil)
+	switch {
+	case err == nil:
+		return guestFlushDone
+	case isUnknownOp(err):
+		d.logger.Warn("firecracker stop: the guest agent predates sync_fs; this sandbox cannot be snapshotted",
+			"sandbox_id", sandboxID)
+		return guestFlushUnsupported
+	default:
+		d.logger.Warn("firecracker stop: guest filesystems not flushed; a snapshot of this stopped sandbox will be refused until a Stop flushes",
 			"sandbox_id", sandboxID, "error", err)
-		return false
+		return guestFlushFailed
 	}
-	return true
 }
 
-func (d *Driver) writeSandboxSnapshot(ctx context.Context, sandboxID string, handle VMMHandle, client VMMClient, guestCID uint32, guestSynced bool) error {
+// isUnknownOp reports an agent that does not know the op: one built before
+// the op existed.
+func isUnknownOp(err error) bool {
+	var rejected *guestRejectedError
+	return errors.As(err, &rejected) && strings.Contains(rejected.msg, "unknown op")
+}
+
+func (d *Driver) writeSandboxSnapshot(ctx context.Context, sandboxID string, handle VMMHandle, client VMMClient, guestCID uint32, flush guestFlush) error {
 	base, err := d.sandboxSnapshotBase()
 	if err != nil {
 		return err
@@ -276,7 +306,7 @@ func (d *Driver) writeSandboxSnapshot(ctx context.Context, sandboxID string, han
 		SnapshotChecksum: formatSnapshotChecksum(memDigest, stateDigest),
 		HasOverlay:       hasOverlay,
 		CreatedAt:        time.Now().UTC(),
-		GuestSynced:      guestSynced,
+		GuestFlush:       flush,
 	}
 	raw, err := json.MarshalIndent(manifest, "", "  ")
 	if err != nil {

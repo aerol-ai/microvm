@@ -109,7 +109,7 @@ func cover96_ptr_Driver(recv *Driver) {
 		recv.tryAcquireWarm(cover96Ctx(), zero96[models.CreateSandboxRequest](), zero96[string](), zero96[string](), zero96[*TemplateResolution](), zero96[*TapSlot](), zero96[string]())
 	}) // warmacquire.go:94
 	cover96Call(func() {
-		recv.writeSandboxSnapshot(cover96Ctx(), zero96[string](), zero96[VMMHandle](), zero96[VMMClient](), zero96[uint32](), zero96[bool]())
+		recv.writeSandboxSnapshot(cover96Ctx(), zero96[string](), zero96[VMMHandle](), zero96[VMMClient](), zero96[uint32](), zero96[guestFlush]())
 	}) // sandbox_snapshot.go:187
 }
 

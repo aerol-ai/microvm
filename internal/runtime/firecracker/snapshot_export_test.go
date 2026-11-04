@@ -208,14 +208,6 @@ func TestCreateSnapshotExportsTheStoppedDisk(t *testing.T) {
 }
 
 func TestCreateSnapshotRefusesWhatItCannotSnapshot(t *testing.T) {
-	t.Run("a running sandbox", func(t *testing.T) {
-		f := stoppedFixtureSandbox(t, "sb-run")
-		f.driver.SetImageStore(&recordingImageStore{})
-		_, err := f.driver.CreateSnapshot(context.Background(), "sb-run", "aerolvm-snapshot/x:latest")
-		if !errors.Is(err, models.ErrSnapshotSourceNotReady) || !strings.Contains(err.Error(), "stop the sandbox") {
-			t.Fatalf("err = %v, want a 409 that says to stop it", err)
-		}
-	})
 	t.Run("a sandbox never stopped", func(t *testing.T) {
 		f := newDriverFixture(t)
 		f.driver.SetImageStore(&recordingImageStore{})
@@ -224,7 +216,9 @@ func TestCreateSnapshotRefusesWhatItCannotSnapshot(t *testing.T) {
 			t.Fatalf("err = %v, want a 409", err)
 		}
 	})
-	t.Run("a disk an older agent did not flush", func(t *testing.T) {
+	// An agent from before sync_fs can never flush: it is the sandbox's
+	// agent for life, so the 409 must not suggest a restart.
+	t.Run("a disk an older agent cannot flush", func(t *testing.T) {
 		f := stoppedFixtureSandbox(t, "sb-old")
 		f.vsock.mu.Lock()
 		f.vsock.guestRespOk, f.vsock.guestError = false, `unknown op \"sync_fs\"`
@@ -234,7 +228,23 @@ func TestCreateSnapshotRefusesWhatItCannotSnapshot(t *testing.T) {
 		}
 		f.driver.SetImageStore(&recordingImageStore{})
 		_, err := f.driver.CreateSnapshot(context.Background(), "sb-old", "aerolvm-snapshot/x:latest")
-		if !errors.Is(err, models.ErrSnapshotSourceNotReady) || !strings.Contains(err.Error(), "start and stop it again") {
+		if !errors.Is(err, models.ErrSnapshotSourceNotReady) || !strings.Contains(err.Error(), "created by an older release") ||
+			strings.Contains(err.Error(), "stop it again") {
+			t.Fatalf("err = %v, want a 409 that says the sandbox is too old, not to restart it", err)
+		}
+	})
+	// A current agent whose flush failed will flush on a later Stop.
+	t.Run("a disk whose flush failed", func(t *testing.T) {
+		f := stoppedFixtureSandbox(t, "sb-noflush")
+		f.vsock.mu.Lock()
+		f.vsock.guestRespOk, f.vsock.guestError = false, "sync filesystems: EIO"
+		f.vsock.mu.Unlock()
+		if err := f.driver.Stop(context.Background(), "sb-noflush"); err != nil {
+			t.Fatal(err)
+		}
+		f.driver.SetImageStore(&recordingImageStore{})
+		_, err := f.driver.CreateSnapshot(context.Background(), "sb-noflush", "aerolvm-snapshot/x:latest")
+		if !errors.Is(err, models.ErrSnapshotSourceNotReady) || !strings.Contains(err.Error(), "start it and stop it again") {
 			t.Fatalf("err = %v, want a 409 that says to start and stop it", err)
 		}
 	})
@@ -258,7 +268,7 @@ func TestCreateSnapshotFailures(t *testing.T) {
 	t.Run("mount", func(t *testing.T) {
 		f, _, mounter := stoppedSandboxForSnapshot(t, "sb-mnt")
 		mounter.err = boom
-		if _, err := f.driver.CreateSnapshot(context.Background(), "sb-mnt", "r:1"); err == nil || !strings.Contains(err.Error(), "mount saved disk") {
+		if _, err := f.driver.CreateSnapshot(context.Background(), "sb-mnt", "r:1"); err == nil || !strings.Contains(err.Error(), "mount disk copy") {
 			t.Fatalf("err = %v", err)
 		}
 	})

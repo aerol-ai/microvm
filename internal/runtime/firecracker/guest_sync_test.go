@@ -63,13 +63,14 @@ func TestStopFlushesTheGuestBeforeThePause(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !manifest.GuestSynced {
-		t.Fatal("manifest.GuestSynced = false after the guest acked sync_fs")
+	if manifest.GuestFlush != guestFlushDone {
+		t.Fatalf("manifest.GuestFlush = %q after the guest acked sync_fs, want done", manifest.GuestFlush)
 	}
 }
 
 // An agent from before sync_fs answers "unknown op". Stop still saves the
-// VM (Start does not need the flush), and records the disk as unflushed.
+// VM (Start does not need the flush), and records that this agent cannot
+// flush, which no later Stop will change.
 func TestStopRecordsAnUnflushedDiskWhenTheGuestCannotSync(t *testing.T) {
 	f := stoppedFixtureSandbox(t, "sb-sync-old")
 	f.vsock.mu.Lock()
@@ -82,7 +83,7 @@ func TestStopRecordsAnUnflushedDiskWhenTheGuestCannotSync(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if manifest.GuestSynced {
-		t.Fatal("manifest.GuestSynced = true although the guest refused sync_fs")
+	if manifest.GuestFlush != guestFlushUnsupported {
+		t.Fatalf("manifest.GuestFlush = %q for an agent without sync_fs, want unsupported", manifest.GuestFlush)
 	}
 }

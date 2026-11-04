@@ -92,6 +92,9 @@ type Driver struct {
 	// mounter mounts the copy of a saved disk CreateSnapshot reads. nil
 	// means the host's loop mount (loopMounter).
 	mounter DiskMounter
+	// gate lets Stop and a snapshot of a running VM take turns, so a Stop
+	// never saves a VM whose filesystem a snapshot has frozen.
+	gate vmGate
 	// aocrPullAuth is the cluster PAT a cold-boot pull of an in-scope AOCR
 	// `cluster/` ref presents, the same credential the container engines
 	// use (docker.AOCRPullAuth), so a snapshot pushed by another node can
@@ -1480,6 +1483,13 @@ func (d *Driver) StartWithIdentity(ctx context.Context, containerRef, sandboxID,
 // and vsock identity; Destroy releases that allocation and deletes the
 // snapshot.
 func (d *Driver) Stop(ctx context.Context, sandboxID string) error {
+	// A snapshot of the running VM may have its filesystem frozen; stopping
+	// now would save the VM frozen. Wait for the thaw.
+	release, err := d.gate.lock(ctx, sandboxID)
+	if err != nil {
+		return fmt.Errorf("firecracker runtime: stop %s: %w", sandboxID, err)
+	}
+	defer release()
 	return d.stopToSandboxSnapshot(ctx, sandboxID)
 }
 
