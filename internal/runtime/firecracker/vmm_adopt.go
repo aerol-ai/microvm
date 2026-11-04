@@ -495,5 +495,9 @@ func (h *adoptedVMM) Cleanup() error {
 	if h.cleanupRoot == "" || !strings.HasPrefix(h.rec.RunDir, h.cleanupRoot+string(filepath.Separator)) {
 		return fmt.Errorf("vmm: refusing to clean up path outside %q: %s", h.cleanupRoot, h.rec.RunDir)
 	}
-	return os.RemoveAll(h.rec.RunDir)
+	if err := os.RemoveAll(h.rec.RunDir); err != nil {
+		return err
+	}
+	removeJailDir(h.rec.RunDir, h.rec.SandboxID)
+	return nil
 }

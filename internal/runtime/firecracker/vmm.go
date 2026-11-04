@@ -413,7 +413,22 @@ func (v *vmm) Cleanup() error {
 	if !strings.HasPrefix(v.runDir, root) {
 		return fmt.Errorf("vmm: refusing to clean up path outside %q: %s", root, v.runDir)
 	}
-	return os.RemoveAll(v.runDir)
+	if err := os.RemoveAll(v.runDir); err != nil {
+		return err
+	}
+	removeJailDir(v.runDir, v.sandboxID)
+	return nil
+}
+
+// removeJailDir removes the now empty <base>/firecracker/<id> a jailed VM's
+// run dir (its chroot, <id>/root) lived in. Left behind, every destroyed
+// sandbox and every snapshot's helper VM added one. Only an empty dir goes,
+// and only one named for this VM.
+func removeJailDir(runDir, id string) {
+	if filepath.Base(runDir) != "root" || filepath.Base(filepath.Dir(runDir)) != id {
+		return
+	}
+	_ = os.Remove(filepath.Dir(runDir))
 }
 
 // vmmOutputName is the file a VM's stdout and stderr go to, in its run dir.
