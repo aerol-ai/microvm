@@ -94,6 +94,14 @@ func runPushWorker(ctx context.Context, interval time.Duration, wake <-chan stru
 	}
 }
 
+// cutShortByShutdown reports whether a sweep failed only because the
+// worker's ctx ended while it ran. The worker does not report such a sweep:
+// stopping is not a failure, and reporting it logged a spurious error on
+// every shutdown that caught a sweep in flight.
+func cutShortByShutdown(ctx context.Context, err error) bool {
+	return err != nil && ctx.Err() != nil
+}
+
 // acquirePushSlot takes one of the node's push slots, or gives up when ctx
 // ends. A cancelled ctx never takes a slot, even a free one, so a sweep that
 // is being shut down starts no new push.
