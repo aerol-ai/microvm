@@ -134,7 +134,7 @@ func (r *SnapshotPushReconciler) Run(ctx context.Context, interval time.Duration
 	}
 	runPushWorker(ctx, interval, r.gate.wake, func(ctx context.Context) {
 		stats, err := r.RunOnce(ctx)
-		if report != nil {
+		if report != nil && !cutShortByShutdown(ctx, err) {
 			report(stats, err)
 		}
 	})
