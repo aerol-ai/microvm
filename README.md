@@ -70,33 +70,29 @@ The diagram shows a **hetero cluster**: each node has one job, and each job runs
 
 ```mermaid
 flowchart TB
-    Users["Your apps, agents and visitors"] --> LB["One address<br/>(load balancer or DNS)"]
-    LB -- "API calls and sandbox links" --> Ingress
-
-    subgraph Cluster["AerolVM cluster: all nodes find each other by SWIM gossip and talk over mutual TLS"]
+    Users["Your apps, agents<br/>and visitors"] --> LB["One address<br/>(load balancer or DNS)"]
+    LB -- "API calls and<br/>sandbox links" --> Cluster
+    subgraph Cluster["AerolVM cluster: SWIM gossip and mutual TLS between all nodes"]
         direction TB
-        subgraph Ingress["Ingress nodes, 2 to 10: Caddy and the public route table"]
+        subgraph Ingress["Ingress nodes, 2 to 10: Caddy + public route table"]
             direction LR
-            I1["Ingress"]
-            I2["Ingress"]
+            I1["Ingress"] ~~~ I2["Ingress"]
         end
         subgraph Servers["Server nodes, 3 or 5: the Raft group"]
             direction LR
             S1["Server"] <-- "Raft" --> S2["Server<br/>(leader)"] <-- "Raft" --> S3["Server"]
         end
-        subgraph Workers["Worker nodes, as many as you need: run sandboxes, keep their sealed secrets"]
+        subgraph Workers["Worker nodes: run sandboxes, keep their sealed secrets"]
             direction LR
-            W1["Containers, gVisor, WASM<br/>(small cloud machines)"] ~~~ W2["Firecracker<br/>(bare metal)"] ~~~ W3["GPU sandboxes<br/>(GPU machines)"]
+            W1["Containers,<br/>gVisor, WASM<br/>(cloud VMs)"] ~~~ W2["Firecracker<br/>(bare metal)"] ~~~ W3["GPU sandboxes<br/>(GPU machines)"]
         end
     end
-
-    Ingress <-- "1. which worker gets a new sandbox?<br/>where does each sandbox run?" --> Servers
-    Servers <-- "2. free room on each worker,<br/>failover work" --> Workers
-    Ingress -- "3. create the sandbox, then send it<br/>commands, files and web traffic" --> Workers
-
+    Ingress <-- "1. which worker gets<br/>a new sandbox?<br/>where does each<br/>sandbox run?" --> Servers
+    Servers <-- "2. free room on<br/>each worker,<br/>failover work" --> Workers
+    Ingress -- "3. create the sandbox,<br/>then send it commands,<br/>files and web traffic" --> Workers
     subgraph Yours["Your systems (all optional)"]
         direction LR
-        Keys["Key store<br/>Vault, OpenBao, HSM or AWS KMS<br/><i>unlocks the keys to sealed secrets</i>"] ~~~ Audit["Audit store<br/>S3 bucket or SIEM webhook<br/><i>gets hash-chained audit records</i>"] ~~~ Witness["Audit witness<br/>S3 bucket with Object Lock<br/><i>keeps each node's newest audit fingerprint</i>"] ~~~ Obs["Monitoring<br/>Prometheus, Grafana, OpenTelemetry<br/><i>gets metrics and traces</i>"]
+        Keys["<b>Key store</b><br/>Vault, OpenBao,<br/>HSM or AWS KMS<br/><i>unlocks the keys<br/>to sealed secrets</i>"] ~~~ Audit["<b>Audit store</b><br/>S3 bucket or<br/>SIEM webhook<br/><i>gets hash-chained<br/>audit records</i>"] ~~~ Witness["<b>Audit witness</b><br/>S3 bucket with<br/>Object Lock<br/><i>stores audit<br/>fingerprints</i>"] ~~~ Obs["<b>Monitoring</b><br/>Prometheus, Grafana,<br/>OpenTelemetry<br/><i>gets metrics<br/>and traces</i>"]
     end
     Cluster <--> Yours
 ```
