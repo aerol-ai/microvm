@@ -1349,7 +1349,7 @@ func vcpuFromRequest(cpu float64) int {
 // plus our toolbox init:
 //
 //   - console=ttyS0: useful for early-boot panics on the firecracker
-//     stdio (cappedBuffer captures these).
+//     stdio (vmmOutput keeps these).
 //   - reboot=k panic=1: convert kernel panics into a clean VMM exit
 //     rather than a hung guest — the driver's cleanup contract relies
 //     on the VMM process actually exiting on failure.
@@ -1627,6 +1627,9 @@ func (d *Driver) Inspect(ctx context.Context, sandboxID string) (*models.Sandbox
 	}, nil
 }
 
+// listManagedInspectTimeout bounds one VMM's state query in ListManaged.
+const listManagedInspectTimeout = 5 * time.Second
+
 // ListManaged enumerates every Firecracker VMM the driver knows about.
 // Walks the in-memory registry (no SQLite hit) — reconcile uses this
 // to compare driver state against the persisted row set.
@@ -1644,7 +1647,11 @@ func (d *Driver) ListManaged(ctx context.Context) (map[string]*models.SandboxRun
 
 	out := make(map[string]*models.SandboxRuntimeState, len(ids))
 	for i, id := range ids {
-		info, err := clients[i].InstanceInfo(ctx)
+		// A VMM that does not answer costs listManagedInspectTimeout, not
+		// the client's 30 s: reconcile at boot walks every VM in turn.
+		ictx, cancel := context.WithTimeout(ctx, listManagedInspectTimeout)
+		info, err := clients[i].InstanceInfo(ictx)
+		cancel()
 		if err != nil {
 			// One unreachable VMM doesn't fail the whole walk —
 			// reconcile uses this as a snapshot, and a transient API

@@ -658,6 +658,18 @@ func TestInstallShKeepsFirecrackerVMsThroughARestart(t *testing.T) {
 	if got := run(); got != "101\n" {
 		t.Fatalf("moved %q, want only the VM (101)", got)
 	}
+	// A VM whose output is a pipe (an older release's) also gets a reader,
+	// moved in after it. (Here the "pipe" is a dangling link, so the reader
+	// exits at once; what is checked is that one was started and moved.)
+	if err := os.MkdirAll(filepath.Join(procs, "101", "fd"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("pipe:[4242]", filepath.Join(procs, "101", "fd", "1")); err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.TrimSpace(run()); got == "101" || got == "" || strings.Trim(got, "0123456789") != "" {
+		t.Fatalf("last moved %q, want the reader's pid after the VM", got)
+	}
 	// No cgroup v2, or no unit cgroup: nothing to do, and no error under
 	// set -e.
 	if err := os.Remove(filepath.Join(unit, "cgroup.procs")); err != nil {

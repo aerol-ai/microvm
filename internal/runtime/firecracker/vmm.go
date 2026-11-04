@@ -27,6 +27,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"os/exec"
@@ -71,7 +72,7 @@ type vmm struct {
 	started bool
 
 	cmd     *exec.Cmd
-	stderr  *cappedBuffer
+	stderr  *vmmOutput
 	waitCh  chan struct{} // closed when cmd.Wait returns
 	waitErr error         // populated before waitCh closes
 }
@@ -187,17 +188,21 @@ func (v *vmm) Start(ctx context.Context) error {
 	// completes.
 	cmd := exec.Command(binary, args...)
 	cmd.Dir = v.runDir
-	v.stderr = newCappedBuffer(stderrTailCap)
-	// Merge stdout + stderr into one capped buffer. Firecracker writes its
-	// boot diagnostics to stderr; some operator-visible messages (and the
-	// guest kernel's early-init lines, when the kernel is configured to
-	// log to the VMM stdio) land on stdout. One buffer is enough for
-	// post-mortem context.
-	cmd.Stdout = v.stderr
-	cmd.Stderr = v.stderr
+	// stdout and stderr go to one file in the run dir (vmmOutput): the
+	// boot diagnostics on stderr, and the guest's serial console on stdout.
+	// Not a pipe to sandboxd, which the VM outlives.
+	out, err := openVMMOutput(v.runDir)
+	if err != nil {
+		return err
+	}
+	v.stderr = out
+	cmd.Stdout, cmd.Stderr = out.file, out.file
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
-	if err := cmd.Start(); err != nil {
+	err = cmd.Start()
+	// The child has its own descriptor now.
+	_ = out.file.Close()
+	if err != nil {
 		return fmt.Errorf("vmm: spawn %s: %w", v.cfg.FirecrackerBinary, err)
 	}
 	// Out of sandboxd's cgroup, so a sandboxd restart leaves the VM
@@ -214,6 +219,7 @@ func (v *vmm) Start(ctx context.Context) error {
 	v.cmd = cmd
 	v.waitCh = make(chan struct{})
 	v.started = true
+	go boundVMMOutput(out.path, v.waitCh)
 
 	go func() {
 		v.waitErr = cmd.Wait()
@@ -377,10 +383,9 @@ func (v *vmm) Kill() error {
 	return nil
 }
 
-// StderrTail returns the captured stdout+stderr tail. Safe to call at any
-// time; before Start it returns the empty string. Useful for log lines
-// that surface a "VMM died" condition with the last 16 KiB the process
-// emitted.
+// StderrTail returns the head of the VM's stdout+stderr (vmmOutput). Safe
+// to call at any time; before Start it returns the empty string. Useful for
+// log lines that surface a "VMM died" condition.
 func (v *vmm) StderrTail() string {
 	if v.stderr == nil {
 		return ""
@@ -411,43 +416,80 @@ func (v *vmm) Cleanup() error {
 	return os.RemoveAll(v.runDir)
 }
 
-// cappedBuffer is a goroutine-safe io.Writer that retains at most cap
-// bytes from the start of the stream (head-keep). Head-keep beats
-// tail-keep here: the most useful diagnostic from a Firecracker process
-// that fails to boot is the *first* error line, not the last
-// (subsequent output is often noise from a flailing kernel). Once full,
-// further writes are reported as accepted (so the caller's exec.Cmd does
-// not block on a backed-up pipe) but dropped.
-type cappedBuffer struct {
-	mu    sync.Mutex
-	cap   int
-	buf   []byte
-	dropd int
+// vmmOutputName is the file a VM's stdout and stderr go to, in its run dir.
+// A file, not a pipe to sandboxd: the pipe's reader dies with sandboxd while
+// the VM lives on (vmm_adopt.go), and Firecracker's next write would then get
+// EPIPE, whose SIGPIPE handler logs from inside the signal handler and
+// deadlocks the VMM: its API and vCPU threads wait forever on the logger, so
+// the guest freezes and no call reaches it.
+const vmmOutputName = "vmm.out"
+
+// vmmOutputMax bounds the output file. The guest's console writes to it for
+// as long as the VM runs; past this the file is cut back to its first
+// stderrTailCap bytes, which hold what a failed boot printed. A var for
+// tests, as is how often it is checked.
+var (
+	vmmOutputMax        int64 = 256 << 10
+	vmmOutputCheckEvery       = 30 * time.Second
+)
+
+// vmmOutput is a VM's output file. Its head is the "stderr tail" the driver
+// reports: the most useful line from a Firecracker that fails to boot is the
+// first error, not the last (later output is often noise from a flailing
+// kernel).
+type vmmOutput struct {
+	path string
+	file *os.File // set between open and the spawn only
 }
 
-func newCappedBuffer(cap int) *cappedBuffer { return &cappedBuffer{cap: cap} }
-
-func (b *cappedBuffer) Write(p []byte) (int, error) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	if len(b.buf) >= b.cap {
-		b.dropd += len(p)
-		return len(p), nil
+func openVMMOutput(runDir string) (*vmmOutput, error) {
+	path := filepath.Join(runDir, vmmOutputName)
+	// O_APPEND: a write after boundVMMOutput cut the file lands at its new
+	// end, not past it.
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC|os.O_APPEND, 0o600)
+	if err != nil {
+		return nil, fmt.Errorf("vmm: output file: %w", err)
 	}
-	take := len(p)
-	if len(b.buf)+take > b.cap {
-		take = b.cap - len(b.buf)
-		b.dropd += len(p) - take
-	}
-	b.buf = append(b.buf, p[:take]...)
-	return len(p), nil
+	return &vmmOutput{path: path, file: f}, nil
 }
 
-func (b *cappedBuffer) String() string {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	if b.dropd == 0 {
-		return string(b.buf)
+// String is the first stderrTailCap bytes of the output, noting how much
+// more there is.
+func (o *vmmOutput) String() string {
+	if o == nil || o.path == "" {
+		return ""
 	}
-	return fmt.Sprintf("%s\n[... %d more bytes dropped ...]", string(b.buf), b.dropd)
+	return readOutputHead(o.path)
+}
+
+func readOutputHead(path string) string {
+	f, err := os.Open(path)
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+	head := make([]byte, stderrTailCap)
+	n, _ := io.ReadFull(f, head)
+	info, err := f.Stat()
+	if err != nil || info.Size() <= int64(n) {
+		return string(head[:n])
+	}
+	return fmt.Sprintf("%s\n[... %d more bytes ...]", head[:n], info.Size()-int64(n))
+}
+
+// boundVMMOutput keeps a VM's output file under vmmOutputMax until done is
+// closed (the VM exited).
+func boundVMMOutput(path string, done <-chan struct{}) {
+	t := time.NewTicker(vmmOutputCheckEvery)
+	defer t.Stop()
+	for {
+		select {
+		case <-done:
+			return
+		case <-t.C:
+			if info, err := os.Stat(path); err == nil && info.Size() > vmmOutputMax {
+				_ = os.Truncate(path, stderrTailCap)
+			}
+		}
+	}
 }

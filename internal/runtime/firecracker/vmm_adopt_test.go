@@ -291,8 +291,12 @@ func TestAdoptRunningVMs(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	host.cgroup = []int{101, 102, 106, 107, 200, 201}
+	host.cgroup = []int{101, 102, 106, 107, 200, 201, 202}
 	host.killErr[201] = errors.New("operation not permitted")
+	host.cmdlines[200] = []string{"/firecracker", "--id", "warm-slot-1"}
+	host.cmdlines[201] = []string{"/firecracker", "--id", "template-x"}
+	// An installer's output reader for an older release's VM is no VM.
+	host.cmdlines[202] = []string{"cat", "/proc/9/fd/1"}
 	// The paused VM's client is made before adoption asks it.
 	d.SetClientFactory(func(socket string) VMMClient {
 		c := newFakeClient()
@@ -458,6 +462,18 @@ func TestAdoptedVMM(t *testing.T) {
 		p.exit()
 		if h.Pid() != 0 {
 			t.Fatal("an exited VM still reports a pid")
+		}
+	})
+	t.Run("its output file", func(t *testing.T) {
+		dir := t.TempDir()
+		if err := os.WriteFile(filepath.Join(dir, vmmOutputName), []byte("fc said hi"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if got := newHandle(newFakeProcess(), true, dir).StderrTail(); got != "fc said hi" {
+			t.Fatalf("StderrTail = %q", got)
+		}
+		if newHandle(newFakeProcess(), true, "").StderrTail() != "" {
+			t.Fatal("a VM with no run dir has output")
 		}
 	})
 	t.Run("shutdown that SIGTERM ends", func(t *testing.T) {
@@ -673,7 +689,8 @@ func TestAdoptRunningVMsDiscoversUnrecordedVMs(t *testing.T) {
 	if !reflect.DeepEqual(host.procs[302].sent(), []syscall.Signal{syscall.SIGKILL}) {
 		t.Fatalf("stopped sandbox's VM got %v", host.procs[302].sent())
 	}
-	if !reflect.DeepEqual(host.killed, []int{302, 303, 304, 305}) {
+	// 303 (rclone) and 305 (no command line) are not VMs: left alone.
+	if !reflect.DeepEqual(host.killed, []int{302, 304}) {
 		t.Fatalf("killed %v", host.killed)
 	}
 	if _, ok := readRecord(t, d, "sb-stopped"); ok {

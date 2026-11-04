@@ -55,7 +55,7 @@ func TestVMM_ExtraCoverage(t *testing.T) {
 	}
 
 	// WaitSocket with process exit
-	v3 := &vmm{started: true, waitCh: make(chan struct{}), stderr: newCappedBuffer(100), apiSocket: "/nonexistent/socket"}
+	v3 := &vmm{started: true, waitCh: make(chan struct{}), stderr: &vmmOutput{}, apiSocket: "/nonexistent/socket"}
 	close(v3.waitCh)
 	if err := v3.WaitSocket(context.Background(), 1*time.Second); err == nil || !strings.Contains(err.Error(), "firecracker exited before API socket bound") {
 		t.Errorf("expected firecracker exited error, got %v", err)

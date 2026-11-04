@@ -265,6 +265,12 @@ func (d *Driver) AdoptRunningVMs(ctx context.Context, keep VMMKeeper) int {
 				continue
 			}
 		}
+		// Only a VM is a stray. The installer also puts here the reader it
+		// starts for each VM an older release left writing into a pipe
+		// (keep_firecracker_vms_running); it exits with its VM.
+		if args, err := processCmdline(pid); err != nil || len(args) == 0 || filepath.Base(args[0]) != "firecracker" {
+			continue
+		}
 		if err := killStrayVMM(pid); err != nil {
 			d.logger.Warn("firecracker adopt: leftover VM not killed", "pid", pid, "error", err)
 			continue
@@ -302,6 +308,9 @@ func (d *Driver) adoptVM(ctx context.Context, rec vmmRecord, keep VMMKeeper) boo
 		}
 		d.removeVMMRecord(rec.SandboxID)
 		return false
+	}
+	if rec.RunDir != "" {
+		go boundVMMOutput(filepath.Join(rec.RunDir, vmmOutputName), proc.Done())
 	}
 	client := d.newClient(rec.APISocket)
 	d.resumeIfPaused(ctx, rec.SandboxID, client)
@@ -415,9 +424,14 @@ func (h *adoptedVMM) Start(context.Context) error {
 
 func (h *adoptedVMM) WaitSocket(context.Context, time.Duration) error { return nil }
 
-// StderrTail is empty: the output pipe went with the sandboxd that started
-// the VM.
-func (h *adoptedVMM) StderrTail() string { return "" }
+// StderrTail is the head of the VM's output file, as for a VM this sandboxd
+// started. A VM a release before the file started has none.
+func (h *adoptedVMM) StderrTail() string {
+	if h.rec.RunDir == "" {
+		return ""
+	}
+	return readOutputHead(filepath.Join(h.rec.RunDir, vmmOutputName))
+}
 
 func (h *adoptedVMM) Pid() int {
 	select {

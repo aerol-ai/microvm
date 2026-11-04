@@ -1908,6 +1908,12 @@ wait_for_sandboxd_ready() {
 # moved, they keep running, and the new sandboxd takes them over. Current
 # releases start every VM outside it already. Needs cgroup v2; a no-op
 # without it or without such VMs.
+#
+# Those releases also gave each VM's output to a pipe sandboxd read. With
+# sandboxd gone, the VM's next write would fail with EPIPE, and Firecracker's
+# SIGPIPE handler deadlocks the VMM: the guest freezes. So each such VM gets
+# a reader of its own, in the VMs' cgroup, that drains the pipe for as long
+# as the VM lives and exits with it.
 keep_firecracker_vms_running() {
 	local cg pid argv0
 	[[ -f "$CGROUP_ROOT/cgroup.controllers" ]] || return 0
@@ -1920,6 +1926,10 @@ keep_firecracker_vms_running() {
 		argv0="$(tr '\0' '\n' <"${PROC_ROOT}/${pid}/cmdline" 2>/dev/null | head -n1 || true)"
 		[[ "${argv0##*/}" == firecracker ]] || continue
 		echo "$pid" >"$CGROUP_ROOT/aerolvm-vmm/cgroup.procs" 2>/dev/null || true
+		if [[ "$(readlink "${PROC_ROOT}/${pid}/fd/1" 2>/dev/null || true)" == pipe:* ]]; then
+			setsid cat "${PROC_ROOT}/${pid}/fd/1" </dev/null >/dev/null 2>&1 &
+			echo "$!" >"$CGROUP_ROOT/aerolvm-vmm/cgroup.procs" 2>/dev/null || true
+		fi
 	done <"${CGROUP_ROOT}${cg}/cgroup.procs"
 }
 

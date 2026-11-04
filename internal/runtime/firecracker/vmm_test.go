@@ -338,27 +338,69 @@ func TestVMM_CleanupRejectsEscape(t *testing.T) {
 	}
 }
 
-func TestCappedBuffer(t *testing.T) {
-	b := newCappedBuffer(8)
-	n, _ := b.Write([]byte("12345"))
-	if n != 5 {
-		t.Fatalf("Write n = %d", n)
+// A VM's output goes to a file in its run dir, whose head is the "stderr
+// tail" (the first error a failed boot printed), noting how much follows.
+func TestVMMOutput(t *testing.T) {
+	dir := t.TempDir()
+	out, err := openVMMOutput(dir)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if got := b.String(); got != "12345" {
+	if _, err := out.file.WriteString("boot error\n"); err != nil {
+		t.Fatal(err)
+	}
+	if got := out.String(); got != "boot error\n" {
 		t.Fatalf("String = %q", got)
 	}
-	// Fill exactly to cap.
-	_, _ = b.Write([]byte("678"))
-	if got := b.String(); got != "12345678" {
-		t.Fatalf("String = %q", got)
+	if _, err := out.file.WriteString(strings.Repeat("x", stderrTailCap)); err != nil {
+		t.Fatal(err)
 	}
-	// Overflow — first byte accepted up to cap, rest reported dropped.
-	_, _ = b.Write([]byte("XXXXX"))
-	got := b.String()
-	if !strings.HasPrefix(got, "12345678\n[... ") {
-		t.Fatalf("overflow report missing: %q", got)
+	_ = out.file.Close()
+	if got := out.String(); !strings.HasPrefix(got, "boot error\n") || !strings.HasSuffix(got, "[... 11 more bytes ...]") {
+		t.Fatalf("String = ...%q", got[len(got)-40:])
 	}
-	if !strings.Contains(got, "5 more bytes dropped") {
-		t.Fatalf("dropped byte count missing: %q", got)
+	if (*vmmOutput)(nil).String() != "" || (&vmmOutput{}).String() != "" || readOutputHead(filepath.Join(dir, "missing")) != "" {
+		t.Fatal("no output file must read as empty")
 	}
+	if _, err := openVMMOutput(filepath.Join(dir, "missing", "dir")); err == nil {
+		t.Fatal("an output file in a missing dir was opened")
+	}
+}
+
+// The output file is cut back to its head once it outgrows its cap, and
+// appends land at the new end.
+func TestBoundVMMOutput(t *testing.T) {
+	savedMax, savedEvery := vmmOutputMax, vmmOutputCheckEvery
+	t.Cleanup(func() { vmmOutputMax, vmmOutputCheckEvery = savedMax, savedEvery })
+	vmmOutputMax, vmmOutputCheckEvery = int64(stderrTailCap+10), 5*time.Millisecond
+	out, err := openVMMOutput(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer out.file.Close()
+	done := make(chan struct{})
+	finished := make(chan struct{})
+	go func() { boundVMMOutput(out.path, done); close(finished) }()
+	if _, err := out.file.WriteString(strings.Repeat("y", stderrTailCap+100)); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		info, err := os.Stat(out.path)
+		if err == nil && info.Size() == int64(stderrTailCap) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("output not cut back: %v %v", info.Size(), err)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if _, err := out.file.WriteString("after"); err != nil {
+		t.Fatal(err)
+	}
+	if info, _ := os.Stat(out.path); info.Size() != int64(stderrTailCap)+5 {
+		t.Fatalf("an append after the cut landed at %d", info.Size())
+	}
+	close(done)
+	<-finished
 }
