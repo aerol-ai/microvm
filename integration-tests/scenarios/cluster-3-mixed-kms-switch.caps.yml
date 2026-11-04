@@ -1,0 +1,13 @@
+name: cluster-3-mixed-kms-switch
+capabilities:
+  - docker
+  - domain
+  - cluster
+  - secrets
+  # Installed on a real AWS KMS key with custody file, so a case can step
+  # it back to local sealing and run the two-step switch to AWS KMS
+  # (plans/customer-key-custody.md eng D22).
+  - key-custody-kms-switch
+disruptive: true
+
+expected_members: 3

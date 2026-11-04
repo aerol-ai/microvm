@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"github.com/aerol-ai/microvm/internal/egress/gatewayd"
 	"io"
 	"log/slog"
 	"os"
@@ -21,10 +22,17 @@ func TestRunDelegatesToDaemonRun(t *testing.T) {
 	orig := runDaemon
 	t.Cleanup(func() { runDaemon = orig })
 
-	runDaemon = func(ctx context.Context, l *slog.Logger, _ daemon.ProviderFactory) error {
+	runDaemon = func(ctx context.Context, l *slog.Logger, factory daemon.ProviderFactory) error {
 		called = true
 		if ctx == nil || l == nil {
 			t.Fatalf("expected non-nil ctx and logger")
+		}
+		// The shipped binary must hand daemon.Run no provider, so it uses
+		// controlplane.Noop() and enterprise mode boots only with a witness
+		// the operator configured (SB_AUDIT_WITNESS_BACKEND). A factory here
+		// would carry a provider seam into every release.
+		if factory != nil {
+			t.Fatal("run passed a non-nil provider factory; the open-source daemon must use controlplane.Noop()")
 		}
 		return nil
 	}
@@ -257,5 +265,63 @@ func TestMainIsolateJailShimDispatch(t *testing.T) {
 	main()
 	if exitCode != 125 {
 		t.Fatalf("shim failure exit = %d, want 125", exitCode)
+	}
+}
+
+func TestMainEgressGatewayDispatch(t *testing.T) {
+	origArgs := os.Args
+	t.Cleanup(func() { os.Args = origArgs })
+	os.Args = []string{"sandboxd", gatewayd.Subcommand}
+	origGW := runEgressGatewayCLI
+	t.Cleanup(func() { runEgressGatewayCLI = origGW })
+	origExit := osExit
+	t.Cleanup(func() { osExit = origExit })
+	for _, tc := range []struct {
+		err      error
+		wantCode int
+	}{{nil, -1}, {errors.New("gw boom"), 1}} {
+		called := false
+		runEgressGatewayCLI = func(context.Context, *slog.Logger) error { called = true; return tc.err }
+		code := -1
+		osExit = func(c int) { code = c }
+		main()
+		if !called || code != tc.wantCode {
+			t.Fatalf("err=%v: called=%v exit=%d want %d", tc.err, called, code, tc.wantCode)
+		}
+	}
+}
+
+func TestMainPKCS11Helper(t *testing.T) {
+	origArgs := os.Args
+	t.Cleanup(func() { os.Args = origArgs })
+	os.Args = []string{"sandboxd", "--pkcs11-helper", "--socket", "/run/x/helper.sock"}
+	orig := runPKCS11Helper
+	t.Cleanup(func() { runPKCS11Helper = orig })
+	origExit := osExit
+	exitCode := -1
+	osExit = func(code int) { exitCode = code }
+	t.Cleanup(func() { osExit = origExit })
+
+	var got []string
+	runPKCS11Helper = func(args []string) error { got = args; return nil }
+	main()
+	if strings.Join(got, " ") != "--socket /run/x/helper.sock" || exitCode != -1 {
+		t.Fatalf("helper args %v exit %d", got, exitCode)
+	}
+
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	origStderr := os.Stderr
+	os.Stderr = w
+	t.Cleanup(func() { os.Stderr = origStderr })
+	runPKCS11Helper = func([]string) error { return errors.New("no token") }
+	main()
+	_ = w.Close()
+	var stderr bytes.Buffer
+	_, _ = io.Copy(&stderr, r)
+	if exitCode != 1 || !strings.Contains(stderr.String(), "no token") {
+		t.Fatalf("helper failure: exit %d stderr %q", exitCode, stderr.String())
 	}
 }

@@ -149,6 +149,9 @@ func TestSnapshotTemplate_JailerStagesAPIPaths(t *testing.T) {
 	if !strings.Contains(f.client.bs.BootArgs, "ip=172.16.0.2::172.16.0.1:255.255.255.252::eth0:off") {
 		t.Fatalf("snapshot boot args missing TAP ip config: %q", f.client.bs.BootArgs)
 	}
+	if !strings.Contains(f.client.bs.BootArgs, guestNoIPv6Arg) {
+		t.Fatalf("template snapshot boot args must turn guest IPv6 off: %q", f.client.bs.BootArgs)
+	}
 	if root := f.client.drives[rootDriveID]; root.PathOnHost != rootfsFileName {
 		t.Fatalf("root drive path = %q, want %q", root.PathOnHost, rootfsFileName)
 	}

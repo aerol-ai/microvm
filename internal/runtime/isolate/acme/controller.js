@@ -24,10 +24,12 @@ export default {
     // is exhausted) binds EGRESS_DENY, which fail-closed 403s (spike-proven
     // 2026-07-18; plans/isolate-runtime.md §4).
     const slot = spec.egress_slot;
-    const outbound = (slot === undefined || slot === null || slot < 0)
-      ? env.EGRESS_DENY
-      : env["EGRESS_" + slot];
-    const worker = env.LOADER.get(id, async () => ({
+    const denied = slot === undefined || slot === null || slot < 0;
+    const outbound = denied ? env.EGRESS_DENY : env["EGRESS_" + slot];
+    // The cache key carries the slot: a live policy change that moves the
+    // sandbox between a slot and EGRESS_DENY must not reuse an isolate whose
+    // globalOutbound is still bound to the old slot.
+    const worker = env.LOADER.get(id + "#" + (denied ? "deny" : slot), async () => ({
       compatibilityDate: spec.compatibility_date,
       mainModule: spec.main_module,
       modules: spec.modules,

@@ -668,7 +668,7 @@ func TestDaytonaGeneratedSnapshotContracts(t *testing.T) {
 					Execute()
 				mustGeneratedSandboxSuccess(t, resp, httpResp, err)
 
-				snapshot, err := env.store.GetSnapshot(env.ctx, "generated-snapshot")
+				snapshot, err := env.store.GetSnapshot(env.ctx, "", "generated-snapshot")
 				if err != nil {
 					t.Fatalf("store.GetSnapshot(generated-snapshot) error = %v", err)
 				}
@@ -688,7 +688,7 @@ func TestDaytonaGeneratedSnapshotContracts(t *testing.T) {
 					Execute()
 				mustGeneratedSandboxSuccess(t, resp, httpResp, err)
 
-				snapshot, err := env.store.GetSnapshot(env.ctx, "snapshot-by-name")
+				snapshot, err := env.store.GetSnapshot(env.ctx, "", "snapshot-by-name")
 				if err != nil {
 					t.Fatalf("store.GetSnapshot(snapshot-by-name) error = %v", err)
 				}
@@ -733,7 +733,7 @@ func TestDaytonaGeneratedSnapshotContracts(t *testing.T) {
 					Execute()
 				mustGeneratedSandboxSuccess(t, resp, httpResp, err)
 
-				snapshot, err := env.store.GetSnapshot(env.ctx, "idempotent")
+				snapshot, err := env.store.GetSnapshot(env.ctx, "", "idempotent")
 				if err != nil {
 					t.Fatalf("store.GetSnapshot(idempotent) error = %v", err)
 				}
@@ -1242,7 +1242,7 @@ func TestDaytonaSDKContracts(t *testing.T) {
 				if err := sandbox.ExperimentalCreateSnapshot(env.ctx, "sdk-created-snapshot"); err != nil {
 					t.Fatalf("sandbox.ExperimentalCreateSnapshot() error = %v", err)
 				}
-				snapshot, err := env.store.GetSnapshot(env.ctx, "sdk-created-snapshot")
+				snapshot, err := env.store.GetSnapshot(env.ctx, "", "sdk-created-snapshot")
 				if err != nil {
 					t.Fatalf("store.GetSnapshot(sdk-created-snapshot) error = %v", err)
 				}
@@ -1395,7 +1395,7 @@ func assertSandboxMissing(t *testing.T, env *daytonaContractEnv, sandboxID strin
 
 func assertSnapshotMissing(t *testing.T, env *daytonaContractEnv, snapshotName string) {
 	t.Helper()
-	if _, err := env.store.GetSnapshot(env.ctx, snapshotName); !errors.Is(err, store.ErrNotFound) {
+	if _, err := env.store.GetSnapshot(env.ctx, "", snapshotName); !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("expected snapshot %q to be missing, got err=%v", snapshotName, err)
 	}
 }

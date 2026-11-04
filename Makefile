@@ -1,8 +1,8 @@
 GO ?= go
 BIN_DIR ?= bin
 
-.PHONY: fmt install-git-hooks test test-acme-e2e build build-sandboxd build-toolboxd docs-install docs-dev docs-build clean \
-	integration-local integration-single integration-single-containerd integration-single-wasm integration-single-isolate integration-cluster-mixed integration-cluster-mixed-docker integration-cluster-mixed-containerd integration-cluster-mixed-wasm \
+.PHONY: fmt install-git-hooks test test-acme-e2e test-ingress-reload-e2e build build-sandboxd build-toolboxd docs-install docs-dev docs-build clean \
+	integration-local integration-single integration-single-containerd integration-single-wasm integration-single-isolate integration-single-private-cloud integration-cluster-mixed integration-cluster-mixed-lb integration-cluster-mixed-docker integration-cluster-mixed-containerd integration-cluster-mixed-wasm \
 	integration-cluster-mixed-fc integration-cluster-mixed-gvisor integration-cluster-hetero integration-cluster-hetero-safe \
 	integration-cluster-mixed-obs integration-cluster-mixed-obs-only \
 	integration-cluster-hetero-obs integration-cluster-hetero-obs-only integration-obs-snapshot \
@@ -18,11 +18,13 @@ BIN_DIR ?= bin
 	integration-cert-store-init integration-clear-lease \
 	itest-build itest-publish itest-artifacts-init \
 	integration-secrets-single integration-secrets-cluster integration-secrets-kms \
-	integration-secrets-enterprise integration-secrets-hetero integration-secrets-hetero-kms \
+	integration-secrets-enterprise integration-secrets-enterprise-single integration-secrets-hetero integration-secrets-hetero-kms \
 	integration-secrets-gate integration-secrets-flagship integration-secrets-only \
 	integration-secrets-hetero-lite integration-secrets-hetero-lite-kms integration-secrets-hetero-lite-pair \
+	integration-key-custody-vault integration-key-custody-pkcs11 integration-key-custody-kms \
+	integration-key-custody-kms-switch integration-key-custody-single \
 	integration-routing integration-routing-hetero-lite \
-	integration-bench-cluster
+	integration-bench-cluster integration-identity-gate integration-identity-only
 
 fmt:
 	$(GO) fmt ./...
@@ -40,6 +42,22 @@ test:
 # Not wired into CI — gated by the e2e build tag.
 test-acme-e2e:
 	$(GO) test -tags=e2e -count=1 -timeout=10m ./internal/service -run TestACME
+
+# Operator-runnable reproduction of new connections dropped by Caddy config
+# reloads under sandbox churn, and the gate that the static routes of
+# SB_INGRESS_PROXY_ROUTING drop none (pkg/caddy TestE2EIngressReloadChurn).
+# Needs a Caddy with caddy-l4: AEROL_E2E_CADDY_BIN, or this builds the
+# release combination (.github/workflows/release.yml) with xcaddy. Linux
+# only (the test is build-tagged linux): on macOS run it in a Linux container.
+CADDY_E2E_VERSION ?= v2.11.7
+CADDY_E2E_BIN ?= $(BIN_DIR)/caddy-l4-e2e
+test-ingress-reload-e2e:
+	@if [ -z "$$AEROL_E2E_CADDY_BIN" ] && [ ! -x "$(CADDY_E2E_BIN)" ]; then \
+		mkdir -p $(BIN_DIR) && CGO_ENABLED=0 $(GO) run github.com/caddyserver/xcaddy/cmd/xcaddy@v0.4.6 build $(CADDY_E2E_VERSION) \
+			--output $(CADDY_E2E_BIN) --with github.com/mholt/caddy-l4@v0.1.2; \
+	fi
+	AEROL_E2E_CADDY_BIN="$${AEROL_E2E_CADDY_BIN:-$(abspath $(CADDY_E2E_BIN))}" \
+		$(GO) test -tags=e2e -count=1 -timeout=10m -v ./pkg/caddy -run TestE2EIngressReloadChurn
 
 build: build-sandboxd build-toolboxd
 
@@ -141,8 +159,34 @@ integration-secrets-cluster:
 integration-secrets-kms:
 	integration-tests/run.sh cluster-3-mixed-secrets-kms $(RUN_FLAGS)
 
+# Customer key custody (plans/customer-key-custody.md Phase 6). Real AWS,
+# costs money like every scenario here. vault and pkcs11 install their key
+# store over SSH; kms is built with Terraform key_custody = "wrapped";
+# kms-switch runs the two-step switch from local to AWS KMS; single is one
+# node installed with install.sh --key-custody wrapped.
+integration-key-custody-vault:
+	integration-tests/run.sh cluster-3-mixed-secrets-vault $(RUN_FLAGS)
+
+integration-key-custody-pkcs11:
+	integration-tests/run.sh cluster-3-mixed-secrets-pkcs11 $(RUN_FLAGS)
+
+integration-key-custody-kms:
+	integration-tests/run.sh cluster-3-mixed-wrapped-kms $(RUN_FLAGS)
+
+integration-key-custody-kms-switch:
+	integration-tests/run.sh cluster-3-mixed-kms-switch $(RUN_FLAGS)
+
+integration-key-custody-single:
+	integration-tests/run.sh single-node-wrapped-kms $(RUN_FLAGS)
+
 integration-secrets-enterprise:
 	integration-tests/run.sh cluster-3-mixed-secrets-enterprise $(RUN_FLAGS)
+
+# Enterprise mode on one server with the stock daemon and an S3 Object Lock
+# witness (plans/open-audit-witness.md, Phase 4); the release smoke (T24) runs
+# the same scenario against a published tag.
+integration-secrets-enterprise-single:
+	integration-tests/run.sh single-node-secrets-enterprise $(RUN_FLAGS)
 
 # S1→S4 in order, cheapest first: a red S1 means the cluster scenarios are not
 # worth paying for. Sequential on purpose — they share the domain pool.
@@ -174,8 +218,10 @@ integration-secrets-hetero-lite-kms:
 # Ingress proxy routing gate (plans/ingress-proxy-routing.md T10): the same
 # topologies with SB_INGRESS_PROXY_ROUTING on every node. UC-171 (churn: 0
 # failed fresh HTTP/TCP connections), UC-172 (sessions survive a sandboxd
-# restart), UC-173 (no per-sandbox Caddy routes). Run the cheap 3-mixed pair
-# first, then hetero-lite, which covers the ingress-only → worker path.
+# restart), UC-173 (no per-sandbox Caddy routes), UC-357 (fresh TLS and exec
+# streams through every ingress node: 0 resets or EOFs under churn). Run the
+# cheap 3-mixed pair first, then hetero-lite, which covers the ingress-only →
+# worker path. cluster-bank-flagship runs the same gate on the metal shape.
 integration-routing:
 	integration-tests/run.sh cluster-3-mixed-routing $(RUN_FLAGS)
 
@@ -203,6 +249,20 @@ integration-secrets-only:
 # Narrow it further ad hoc: make integration-secrets-only SECRETS_TEST_RUN='TestOwnerDeath.*'
 SECRETS_TEST_RUN ?= $(shell cat integration-tests/lib/secrets-tests.regex)
 SCENARIO ?= cluster-3-mixed-secrets
+
+# Identity and access (plans/identity-and-access.md T12, UC-268..UC-294).
+# The base pair carries the token and SSO cases; the enterprise pair adds the
+# host-scoped PAT, PROXY protocol, PAT rotation and the enterprise boot gates;
+# hetero-lite adds the worker-partition chaos (UC-291) and the token spray
+# (UC-272b). Cheapest first, sequential because they share the domain pool.
+integration-identity-gate: integration-single integration-cluster-mixed integration-secrets-enterprise-single integration-secrets-enterprise integration-secrets-hetero-lite
+
+# Re-run only the identity cases against a scenario kept up with `keep`.
+# Partial report, like integration-secrets-only.
+#   make integration-identity-only SCENARIO=cluster-3-mixed
+integration-identity-only:
+	AEROL_TEST_RUN='$(IDENTITY_TEST_RUN)' integration-tests/run.sh $(SCENARIO) $(RUN_FLAGS)
+IDENTITY_TEST_RUN ?= ^TestIdentity
 
 # The latency arm UC-165's band is measured against (D5: baseline is
 # main-built binaries via `make itest-build BUILD_FLAGS="--ref main"`).
@@ -234,6 +294,13 @@ integration-single-wasm:
 integration-single-isolate:
 	integration-tests/run.sh single-node-isolate $(RUN_FLAGS)
 
+# Private-cloud egress (plans/egress-domain-filtering.md §5.10, P1-20): one
+# node with node-local stand-ins for a bank network (dnsmasq internal names,
+# an internal HTTP service, a squid upstream proxy) and the egress operator
+# file wired to them. Runs UC-186..189.
+integration-single-private-cloud:
+	integration-tests/run.sh single-node-private-cloud $(RUN_FLAGS)
+
 # Same box with the workerd jail ON (the daemon default): chroot + cgroup +
 # privilege drop + enforcing seccomp. Runs UC-103..105 against jailed groups
 # and UC-109, which inspects the workerd process over SSH. This is the gate for
@@ -243,6 +310,12 @@ integration-single-isolate-jail:
 
 integration-cluster-mixed:
 	integration-tests/run.sh cluster-3-mixed $(RUN_FLAGS)
+
+# cluster-3-mixed behind a health-checked AWS Network Load Balancer
+# (api_load_balancer = "nlb"). UC-356 stops one node's daemon and asserts
+# the balancer drops it with no failed call and brings it back.
+integration-cluster-mixed-lb:
+	integration-tests/run.sh cluster-3-mixed-lb $(RUN_FLAGS)
 
 # 3× mixed cluster for docker-only benchmarks — same topology as
 # integration-cluster-mixed but advertises `benchmark` and names artifacts
@@ -328,6 +401,11 @@ integration-cluster-hetero:
 	# so --metal-on-demand is unnecessary here. Disruptive failover tests
 	# (UC-58b) run by default; use integration-cluster-hetero-safe to skip them.
 	integration-tests/run.sh cluster-hetero $(RUN_FLAGS)
+
+# cluster-hetero without the c5.metal worker (worker-z is a t3.medium): every
+# runtime but Firecracker, ~8 x t3.medium on-demand.
+integration-cluster-hetero-lite:
+	integration-tests/run.sh cluster-hetero-lite $(RUN_FLAGS)
 
 # Same as integration-cluster-hetero but skips node-kill / failover fault injection.
 integration-cluster-hetero-safe:

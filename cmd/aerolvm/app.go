@@ -1,0 +1,415 @@
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"flag"
+	"fmt"
+	"io"
+	"os"
+	"os/signal"
+	"sort"
+	"strings"
+	"syscall"
+	"time"
+
+	"github.com/aerol-ai/microvm/internal/agenttools"
+	"github.com/aerol-ai/microvm/internal/version"
+)
+
+// Exit codes (§5.2 rule 5). exec passes the remote command's code through
+// and uses execFailure for its own failures; every other verb uses
+// exitOK / exitError / exitUsage.
+const (
+	exitOK      = 0
+	exitError   = 1
+	exitUsage   = 2
+	execFailure = 125
+)
+
+// app holds the process's I/O so tests drive the CLI in-process.
+type app struct {
+	stdin       io.Reader
+	stdout      io.Writer
+	stderr      io.Writer
+	getenv      func(string) string
+	stdinIsTTY  bool
+	stdoutIsTTY bool
+	term        terminal
+	// notifySignals returns a context cancelled by SIGINT/SIGTERM and the
+	// signal that cancelled it.
+	notifySignals func(context.Context) (context.Context, func() os.Signal, func())
+	newTools      func(agenttools.Config) (*agenttools.Tools, error)
+	// now is the clock token expiry is judged by; nil means time.Now.
+	now func() time.Time
+	// openBrowser opens the SSO sign-in page; nil means the system browser.
+	openBrowser func(string) error
+	// conn is the connection the command's tools use, so a refused token
+	// can be named in the error.
+	conn *connection
+}
+
+func newApp() *app {
+	return &app{
+		stdin:         os.Stdin,
+		stdout:        os.Stdout,
+		stderr:        os.Stderr,
+		getenv:        os.Getenv,
+		stdinIsTTY:    isTerminal(os.Stdin),
+		stdoutIsTTY:   isTerminal(os.Stdout),
+		term:          osTerminal{},
+		notifySignals: notifyInterrupts,
+		newTools:      agenttools.New,
+		now:           time.Now,
+		openBrowser:   openBrowser,
+	}
+}
+
+func (a *app) clock() time.Time {
+	if a.now != nil {
+		return a.now()
+	}
+	return time.Now()
+}
+
+type verb struct {
+	name    string
+	summary string
+	help    string
+	run     func(ctx context.Context, a *app, args []string) int
+}
+
+// verbGroup is a heading in the overview.
+type verbGroup struct {
+	title string
+	verbs []verb
+}
+
+// verbGroups orders the overview by what people open the CLI for: getting
+// into a sandbox they already have comes first, managing sandboxes second.
+func (a *app) verbGroups() []verbGroup {
+	return []verbGroup{
+		{"Work in a sandbox", []verb{
+			{"shell", "Open an interactive shell in a sandbox", shellHelp, runShell},
+			{"exec", "Run a command in a sandbox", execHelp, runExec},
+			{"cp", "Copy a file between this machine and a sandbox", cpHelp, runCp},
+			{"ls", "List a directory in a sandbox", lsHelp, runLs},
+			{"logs", "Print a background command's output", logsHelp, runLogs},
+			{"expose", "Publish a sandbox port and print its URL", exposeHelp, runExpose},
+		}},
+		{"Manage sandboxes", []verb{
+			{"list", "List sandboxes", listHelp, runList},
+			{"get", "Show one sandbox", getHelp, runGet},
+			{"create", "Create a sandbox, or return the existing one with that name", createHelp, runCreate},
+			{"start", "Start stopped sandboxes", startHelp, runStart},
+			{"stop", "Stop sandboxes (files are kept)", stopHelp, runStop},
+			{"destroy", "Destroy sandboxes", destroyHelp, runDestroy},
+			{"snapshot", "Snapshot a sandbox as a reusable image", snapshotHelp, runSnapshot},
+		}},
+		{"Audit", []verb{
+			{"audit", "Verify or search nodes' audit logs", auditHelp, runAudit},
+		}},
+		{"Access", []verb{
+			{"token", "Create, list and revoke scoped API tokens", tokenHelp, runToken},
+			{"whoami", "Show who sandboxd takes you for: role, team, expiry", whoamiHelp, runWhoAmI},
+			{"auth", "Print a fresh bearer token for scripts and SDKs", authHelp, runAuth},
+			{"access", "Review who holds access and what they did with it", accessHelp, runAccess},
+		}},
+		{"Setup", []verb{
+			{"login", "Save the sandboxd URL and token for every command", loginHelp, runLogin},
+			{"logout", "Forget the saved login", logoutHelp, runLogout},
+			{"health", "Check that sandboxd is reachable and the token works", healthHelp, runHealth},
+			{"version", "Print the aerolvm version", versionHelp, runVersion},
+			{"mcp", "Run the MCP server over stdio, or print client setup", mcpHelp, runMCP},
+		}},
+	}
+}
+
+func (a *app) verbs() []verb {
+	var all []verb
+	for _, g := range a.verbGroups() {
+		all = append(all, g.verbs...)
+	}
+	return all
+}
+
+func (a *app) run(ctx context.Context, args []string) int {
+	if len(args) == 0 {
+		fmt.Fprint(a.stderr, a.overview())
+		return exitUsage
+	}
+	switch args[0] {
+	case "-h", "--help", "help":
+		if len(args) > 1 && args[0] == "help" {
+			for _, v := range a.verbs() {
+				if v.name == args[1] {
+					fmt.Fprint(a.stdout, v.help)
+					return exitOK
+				}
+			}
+		}
+		fmt.Fprint(a.stdout, a.overview())
+		return exitOK
+	case "--version":
+		return runVersion(ctx, a, nil)
+	}
+	for _, v := range a.verbs() {
+		if v.name == args[0] {
+			for _, arg := range args[1:] {
+				if arg == "--" {
+					break
+				}
+				if arg == "-h" || arg == "--help" {
+					fmt.Fprint(a.stdout, v.help)
+					return exitOK
+				}
+			}
+			return v.run(ctx, a, args[1:])
+		}
+	}
+	fmt.Fprintf(a.stderr, "aerolvm: unknown command %q\n\n%s", args[0], a.overview())
+	return exitUsage
+}
+
+func (a *app) overview() string {
+	var b strings.Builder
+	b.WriteString(overviewHead)
+	for _, g := range a.verbGroups() {
+		fmt.Fprintf(&b, "\n%s:\n", g.title)
+		for _, v := range g.verbs {
+			fmt.Fprintf(&b, "  %-9s %s\n", v.name, v.summary)
+		}
+	}
+	b.WriteString(overviewTail)
+	return b.String()
+}
+
+// commonFlags are on every verb.
+type commonFlags struct {
+	json  bool
+	debug bool
+}
+
+func (a *app) newFlagSet(name string) (*flag.FlagSet, *commonFlags) {
+	fs := flag.NewFlagSet(name, flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	c := &commonFlags{}
+	jsonDefault := strings.EqualFold(strings.TrimSpace(a.getenv("AEROLVM_OUTPUT")), "json")
+	fs.BoolVar(&c.json, "json", jsonDefault, "print JSON on stdout (default when AEROLVM_OUTPUT=json)")
+	fs.BoolVar(&c.debug, "debug", false, "log API requests to stderr (the token is redacted)")
+	return fs, c
+}
+
+// parseArgs parses flags anywhere among the positional arguments, the way
+// agents write commands ("exec sb --cwd /app -- make"). Everything after the
+// first bare "--" is returned as rest, never parsed as flags.
+func parseArgs(fs *flag.FlagSet, args []string) (positional, rest []string, err error) {
+	for i, arg := range args {
+		if arg == "--" {
+			rest = append([]string{}, args[i+1:]...)
+			args = args[:i]
+			break
+		}
+	}
+	for len(args) > 0 {
+		if err := fs.Parse(args); err != nil {
+			return nil, nil, err
+		}
+		args = fs.Args()
+		if len(args) == 0 {
+			break
+		}
+		positional = append(positional, args[0])
+		args = args[1:]
+	}
+	return positional, rest, nil
+}
+
+// usageError prints a usage problem and returns exit code 2.
+func (a *app) usageError(c *commonFlags, verbName, format string, args ...any) int {
+	msg := fmt.Sprintf(format, args...)
+	if c != nil && c.json {
+		a.writeErrorJSON(&agenttools.Error{Code: "usage", Message: msg, Hint: "run `aerolvm " + verbName + " --help`"})
+	} else {
+		fmt.Fprintf(a.stderr, "aerolvm %s: %s\nrun `aerolvm %s --help` for usage\n", verbName, msg, verbName)
+	}
+	return exitUsage
+}
+
+// flagError maps a flag-parse failure onto a usage error.
+func (a *app) flagError(c *commonFlags, verbName string, err error) int {
+	return a.usageError(c, verbName, "%s", strings.TrimPrefix(err.Error(), "flag provided but not defined: "))
+}
+
+// fail reports err and returns code. With --json the error envelope goes to
+// stderr: {"error":{"code","message","http_status","retryable","hint"}}.
+func (a *app) fail(c *commonFlags, err error, code int) int {
+	e := a.explainRefusal(agenttools.Classify(err))
+	if c != nil && c.json {
+		a.writeErrorJSON(e)
+	} else {
+		fmt.Fprintf(a.stderr, "aerolvm: %s\n", e.Message)
+		if e.Hint != "" {
+			fmt.Fprintf(a.stderr, "hint: %s\n", e.Hint)
+		}
+	}
+	return code
+}
+
+func (a *app) writeErrorJSON(e *agenttools.Error) {
+	enc := json.NewEncoder(a.stderr)
+	_ = enc.Encode(map[string]any{"error": e})
+}
+
+func (a *app) printJSON(v any) {
+	enc := json.NewEncoder(a.stdout)
+	enc.SetIndent("", "  ")
+	// Output goes to shells, jq and models, never into HTML: keep "&&" and
+	// "<token>" readable instead of \u0026 and \u003c.
+	enc.SetEscapeHTML(false)
+	_ = enc.Encode(v)
+}
+
+// note writes a human notice to stderr; stdout stays data-only.
+func (a *app) note(format string, args ...any) {
+	fmt.Fprintf(a.stderr, format+"\n", args...)
+}
+
+// prepare is connection plus what must happen before a command's first
+// call: an SSO login is renewed when under a minute is left (§5.6). It
+// records the connection so a refused token can be named in the error.
+//
+// A failed renewal keeps the current ID token while it is unexpired: a
+// provider outage or a network blip in the last minute of a sign-in is a
+// warning, not "sign in again". The token is used strictly until its exp.
+// sandboxd's 60 s leeway is for clock skew between machines, not extra
+// life, and this machine's clock can't tell how much of it is left, so
+// counting on it would send tokens some nodes already refuse. DR15's
+// refresh-failure line is for a token that has expired.
+func (a *app) prepare(ctx context.Context, c *commonFlags) (connection, error) {
+	conn, err := a.connection()
+	if err != nil {
+		return connection{}, err
+	}
+	a.conn = &conn
+	if conn.sso != nil {
+		conn.sso.client = a.providerClient(c)
+		token, err := conn.sso.token(ctx)
+		if err != nil {
+			if c != nil && c.debug {
+				a.note("aerolvm debug: renewing the sign-in failed: %v", err)
+			}
+			exp := conn.sso.expiry()
+			left := exp.Sub(a.clock())
+			if left <= 0 {
+				return connection{}, renewalFailedError(conn.apiURL)
+			}
+			a.note("aerolvm: warning: your sign-in to %s couldn't be renewed. It still works until %s (%s left). If this keeps happening, sign in again: aerolvm login --sso %s",
+				conn.apiURL, exp.UTC().Format("15:04:05 UTC"), shortDuration(left), conn.apiURL)
+		}
+		conn.token = token
+	}
+	return conn, nil
+}
+
+// resolve is prepare plus the expiry warning for an API token (D8, D15).
+func (a *app) resolve(ctx context.Context, c *commonFlags) (connection, error) {
+	conn, err := a.prepare(ctx, c)
+	if err != nil {
+		return connection{}, err
+	}
+	a.checkTokenExpiry(ctx, c, conn, false)
+	return conn, nil
+}
+
+// tools builds the agenttools layer for a CLI verb, with the connection
+// from the environment or the saved login.
+func (a *app) tools(ctx context.Context, c *commonFlags) (*agenttools.Tools, error) {
+	conn, err := a.resolve(ctx, c)
+	if err != nil {
+		return nil, err
+	}
+	return a.toolsFor(c, conn)
+}
+
+// toolsFor builds the agenttools layer for one sandboxd and token. Both are
+// always passed: the SDK falls back to the process environment for an empty
+// one, which would bypass connection's rules.
+func (a *app) toolsFor(c *commonFlags, conn connection) (*agenttools.Tools, error) {
+	cfg := agenttools.Config{
+		APIURL: conn.apiURL,
+		Token:  conn.token,
+		// The SDK sends the team on every request and on the WebSocket
+		// handshakes of streamed exec and shell attach, which no HTTP
+		// client reaches.
+		Team:       conn.team,
+		Source:     agenttools.SourceCLI,
+		HTTPClient: a.apiHTTPClient(c, conn),
+		Warn:       func(s string) { a.note("aerolvm: %s", s) },
+	}
+	return a.newTools(cfg)
+}
+
+// kvList is a repeatable K=V flag.
+type kvList map[string]string
+
+func (l kvList) String() string {
+	keys := make([]string, 0, len(l))
+	for k := range l {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	parts := make([]string, 0, len(keys))
+	for _, k := range keys {
+		parts = append(parts, k+"="+l[k])
+	}
+	return strings.Join(parts, ",")
+}
+
+func (l kvList) Set(s string) error {
+	k, v, ok := strings.Cut(s, "=")
+	if !ok || strings.TrimSpace(k) == "" {
+		return fmt.Errorf("expected KEY=VALUE, got %q", s)
+	}
+	l[strings.TrimSpace(k)] = v
+	return nil
+}
+
+func (l kvList) orNil() map[string]string {
+	if len(l) == 0 {
+		return nil
+	}
+	return l
+}
+
+// notifyInterrupts cancels ctx on SIGINT or SIGTERM and reports which one.
+func notifyInterrupts(ctx context.Context) (context.Context, func() os.Signal, func()) {
+	ctx, cancel := context.WithCancel(ctx)
+	ch := make(chan os.Signal, 1)
+	signal.Notify(ch, os.Interrupt, syscall.SIGTERM)
+	var got os.Signal
+	done := make(chan struct{})
+	go func() {
+		select {
+		case got = <-ch:
+			cancel()
+		case <-done:
+		}
+	}()
+	stop := func() {
+		signal.Stop(ch)
+		close(done)
+		cancel()
+	}
+	return ctx, func() os.Signal { return got }, stop
+}
+
+// signalExit is the conventional 128+n exit code for a local signal.
+func signalExit(sig os.Signal) int {
+	if s, ok := sig.(syscall.Signal); ok {
+		return 128 + int(s)
+	}
+	return execFailure
+}
+
+func versionString() string { return version.Version }

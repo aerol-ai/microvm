@@ -40,12 +40,19 @@ func TestHandleHealthStoreFailure(t *testing.T) {
 	}
 }
 
+// With no builder passed, the service builds with the docker client; with
+// neither, it has none and builds answer 503.
 func TestNewServerFallsBackToDockerBuilder(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	dc := &docker.Client{}
-	server := NewServer(logger, nil, dc, nil, config.Config{}, "pat", nil)
-	if server.builder != dc {
-		t.Fatal("expected docker client to be used as builder fallback")
+	svc := service.New(config.Config{}, logger, nil, nil, nil, nil, nil, nil, nil)
+	NewServer(logger, svc, &docker.Client{}, nil, config.Config{}, "pat", nil)
+	if !svc.ImageBuilderConfigured() {
+		t.Fatal("expected the docker client as the service's builder")
+	}
+	bare := service.New(config.Config{}, logger, nil, nil, nil, nil, nil, nil, nil)
+	NewServer(logger, bare, nil, nil, config.Config{}, "pat", nil)
+	if bare.ImageBuilderConfigured() {
+		t.Fatal("a daemon with no builder and no docker client reported one")
 	}
 }
 
@@ -61,7 +68,7 @@ func TestRequireE2BAuthAcceptsUserToken(t *testing.T) {
 	handler := server.requireE2BAuth(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		called = true
 		access, ok := controlplane.AccessFromContext(r.Context())
-		if !ok || access.Operator || access.Identity.OwnerRef != "tenant-1" {
+		if !ok || access.Fleet || access.Identity.OwnerRef != "tenant-1" {
 			t.Fatalf("unexpected access: %+v ok=%v", access, ok)
 		}
 		w.WriteHeader(http.StatusNoContent)

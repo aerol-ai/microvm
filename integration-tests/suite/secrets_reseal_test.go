@@ -282,8 +282,20 @@ func TestConcurrentResealTriggersConverge(t *testing.T) {
 
 	// Converged means: no outstanding outbox work AND two consecutive reads
 	// agree. One read can catch a moment between two competing reseals.
+	// With a node left outside the owner and both victims, the drains
+	// reseal once onto a set without them. Without one (a 3-node cluster)
+	// the durability floor holds: a drained copy stays until a replacement
+	// holds the new one, so nothing moves and nothing is owed.
+	replacementExists := len(withoutAll(all, append([]string{owner}, victims...))) > 0
 	settled := harness.AwaitSecretHolders(t, c, sb.ID, resealTimeout, func(v harness.SecretHoldersView) bool {
-		return v.SealGeneration > before.SealGeneration || len(v.Holders) >= 1
+		if !v.Converged() || len(v.Holders) == 0 {
+			return false
+		}
+		if replacementExists {
+			return v.SealGeneration > before.SealGeneration &&
+				!slices.Contains(v.Holders, victims[0]) && !slices.Contains(v.Holders, victims[1])
+		}
+		return v.SealGeneration == before.SealGeneration && slices.Equal(v.Holders, before.Holders)
 	})
 	time.Sleep(20 * time.Second)
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)

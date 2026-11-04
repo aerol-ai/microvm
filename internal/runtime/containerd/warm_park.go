@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"os"
 	"sort"
 	"strings"
 	"time"
@@ -15,6 +16,7 @@ import (
 
 	"github.com/aerol-ai/microvm/internal/pool/containerdpool"
 	dockerpkg "github.com/aerol-ai/microvm/pkg/docker"
+	"github.com/aerol-ai/microvm/pkg/gvisorpids"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
 
@@ -164,32 +166,60 @@ func (d *Driver) parkContainer(ctx context.Context, slotID string, key container
 		}
 	}()
 
+	// Parked containers resolve DNS exactly like cold creates: a generated
+	// resolv.conf with the host's upstream resolvers, keyed by slot. Without
+	// it an adopted sandbox keeps the image's resolver (often 127.0.0.1) and
+	// gateway-mode DNS never reaches the filter's redirect (plans/
+	// egress-domain-filtering.md D14). Built at park time, off the create path.
+	hostFiles, err := prepareSandboxHostFiles(d.cfg.RunDir, slotID)
+	if err != nil {
+		return nil, fmt.Errorf("park resolv.conf: %w", err)
+	}
+	defer func() {
+		if !committed {
+			_ = os.RemoveAll(hostFiles.Dir)
+		}
+	}()
+
 	envValues := []string{
 		fmt.Sprintf("SB_TOOLBOX_PORT=%d", d.cfg.ToolboxPort),
 		"SB_TOOLBOX_TOKEN=" + bootstrapToken,
 	}
 	envValues = append(envValues, pl.EnvVars()...)
+	parkReq := parkDefaultCreateRequest()
+	// A parked toolboxd caps a gVisor sentry at park time, sized for the
+	// park's default memory: the adopt handshake does not restart it.
+	hostPids, pidsEnv := gvisorpids.ForRuntime(ociRuntime, d.cfg.PidsLimit, parkReq.MemoryMB)
+	if !d.cfg.ResourceLimitsOff {
+		envValues = append(envValues, pidsEnv...)
+	}
 	sort.Strings(envValues)
 
+	parkMounts := []specs.Mount{
+		{Type: "bind", Source: d.cfg.ToolboxBinaryPath, Destination: d.cfg.ToolboxMountPath, Options: []string{"rbind", "ro"}},
+		{Type: "bind", Source: pl.HostSocketPath(), Destination: dockerpkg.GuestReadySocketPath, Options: []string{"rbind"}},
+		{Type: "bind", Source: hostFiles.ResolvConf, Destination: "/etc/resolv.conf", Options: []string{"rbind", "ro"}},
+	}
+	if ociRuntime == "runsc" {
+		parkMounts = append(parkMounts, runscCgroupMount())
+	}
 	specOpts := []oci.SpecOpts{
 		oci.WithImageConfig(image),
 		oci.WithProcessArgs(append([]string{d.cfg.ToolboxMountPath}, userCommand...)...),
 		oci.WithHostname(slotID),
 		oci.WithEnv(envValues),
-		oci.WithMounts([]specs.Mount{
-			{Type: "bind", Source: d.cfg.ToolboxBinaryPath, Destination: d.cfg.ToolboxMountPath, Options: []string{"rbind", "ro"}},
-			{Type: "bind", Source: pl.HostSocketPath(), Destination: dockerpkg.GuestReadySocketPath, Options: []string{"rbind"}},
-		}),
+		oci.WithMounts(parkMounts),
 	}
 	if !d.cfg.Privileged {
 		specOpts = append(specOpts, securitySpecOpts()...)
 	}
 	if !d.cfg.ResourceLimitsOff {
-		specOpts = append(specOpts, resourceSpecOpts(parkDefaultCreateRequest())...)
+		specOpts = append(specOpts, resourceSpecOpts(parkReq, hostPids)...)
 	}
 	if netnsPath != "" {
 		specOpts = append(specOpts, withNetworkNamespace(netnsPath))
 	}
+	specOpts = append(specOpts, withSandboxIPv6Off())
 	if ociRuntime == "runsc" {
 		specOpts = append(specOpts, runscSandboxAnnotationOpt())
 	}
@@ -197,6 +227,9 @@ func (d *Driver) parkContainer(ctx context.Context, slotID string, key container
 	labels := map[string]string{
 		managedLabelKey:  "true",
 		poolParkLabelKey: poolParkLabelValue,
+	}
+	if ip := strings.TrimSpace(prepaidIP); ip != "" {
+		labels[containerIPLabelKey] = ip
 	}
 	leaseID, err = d.pinImageLease(ctx, client, image)
 	if err != nil {
@@ -208,7 +241,7 @@ func (d *Driver) parkContainer(ctx context.Context, slotID string, key container
 	containerOpts := []cntr.NewContainerOpts{
 		cntr.WithImage(image),
 		cntr.WithNewSnapshot(slotID, image),
-		cntr.WithNewSpec(specOpts...),
+		withNewSpec(specOpts...),
 		cntr.WithContainerLabels(labels),
 	}
 	if ociRuntime != "" {
@@ -230,7 +263,7 @@ func (d *Driver) parkContainer(ctx context.Context, slotID string, key container
 	if err != nil {
 		return nil, err
 	}
-	logCreator, closeLog, err := taskLogIO(logPath)
+	logCreator, closeLog, err := d.taskLogIO(logPath)
 	if err != nil {
 		return nil, err
 	}

@@ -17,7 +17,7 @@ import (
 
 func operatorAuth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		ctx := controlplane.ContextWithAccess(r.Context(), controlplane.Access{Operator: true})
+		ctx := controlplane.ContextWithAccess(r.Context(), controlplane.Access{Fleet: true})
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }

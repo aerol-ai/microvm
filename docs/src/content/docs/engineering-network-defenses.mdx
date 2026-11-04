@@ -1,0 +1,278 @@
+---
+title: How AerolVM fences a sandbox's network
+description: What a sandbox can reach by default, how policies fence it in, which DNS tricks the filter stops, and who can reach the sandbox.
+---
+
+import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
+
+*By [Suman Saurabh](https://www.linkedin.com/in/ssumansaurabh/), maintainer of AerolVM.*
+
+Untrusted code that can reach your private network can attack it. This post explains what a sandbox can reach out to, how a policy fences that in, which tricks the filter stops, and who can reach in.
+
+## Default posture
+
+**Outbound traffic is not filtered until you set a policy.** This is the most important default to know.
+
+| Runtime | Outbound, with no policy | Inbound |
+|---|---|---|
+| Containers, gVisor and Firecracker | The internet, plus anything the server can reach: private addresses. Never the cloud metadata service, another sandbox on the same server, or the server itself. | Nothing, until you share a port |
+| WebAssembly | No filter until you set a policy. Never the cloud metadata service or the server itself. | Nothing, until you share a port |
+| V8 isolate | The internet over HTTPS only. Private, loopback, link-local and metadata addresses are always blocked, and so is the server itself. | Nothing, until you share a port |
+
+**The cloud metadata service is never reachable.** On every server, with or without a policy or an operator file, every sandbox's traffic to the metadata and credential addresses of AWS, Google Cloud, Azure, Alibaba, Oracle and OpenStack is dropped: `169.254.169.254`, `169.254.170.2`, `169.254.170.23`, `168.63.129.16`, `100.100.100.200` and their IPv6 forms. No allow list can open them. Those addresses hand out the server's own cloud credentials.
+
+For containers, gVisor and Firecracker, a firewall rule on the server drops this traffic. The server checks every 30 seconds that the rule is still in place and puts it back if a firewall reload removed it. If it cannot install the rule, it refuses new sandboxes on that runtime with `503` and the code `egress_floor_not_ready` until it can, and retries every 5 seconds. The metric `aerolvm_egress_floor_ready` is 1 for each runtime that has the rule. A server with `SB_ENABLE_NETWORK_RULES=false` (local mode) has no firewall rules, so this rule is missing there too. Outside enterprise mode it still creates sandboxes, and its log says so.
+
+[Keeping sandboxes away from the node's cloud credentials](/sandbox-metadata-isolation/) explains each layer behind this rule.
+
+So for code you do not trust, always set a policy, or have your operator set one for every sandbox on the server. See [For server operators](#for-server-operators).
+
+This is how a new container, gVisor or Firecracker sandbox gets its outbound policy.
+
+```mermaid
+flowchart TB
+    Create["A create request"] --> Q{"Does it set a<br/>network policy?"}
+    Q -- "yes" --> Own["Use the sandbox's own policy"]
+    Q -- "no" --> Op{"Did the operator set a default<br/>of block everything or an allow list?"}
+    Op -- "yes" --> Def["Use the operator's default"]
+    Op -- "no" --> Open["No filter"]
+    Own --> Floor["The operator's always-blocked<br/>ranges, if set, still apply"]
+    Def --> Floor
+    Open --> Floor
+```
+
+- The default is saved with the sandbox when it is created, so reading the sandbox shows the policy it got.
+
+## Turn on a policy
+
+A policy is set when you create the sandbox. There are three kinds:
+
+- **Block everything:** `networkBlockAll: true`. Every outbound connection fails, including name lookups.
+- **Allow only some sites:** `networkAllowOut` with site names, wildcards or address ranges. Everything else is refused.
+- **Block some sites:** `networkDenyOut`. Everything else is allowed. This is the weakest kind.
+
+This sandbox can install Python packages and reach nothing else:
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const sandbox = await client.create({
+      image: 'python:3.12',
+      networkAllowOut: ['pypi.org', '*.pythonhosted.org', 'github.com:22'],
+    })
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    sandbox = client.create({
+        'image': 'python:3.12',
+        'networkAllowOut': ['pypi.org', '*.pythonhosted.org', 'github.com:22'],
+    })
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    sandbox, err := client.Create(ctx, sdktypes.CreateSandboxOptions{
+        Image:           "python:3.12",
+        NetworkAllowOut: []string{"pypi.org", "*.pythonhosted.org", "github.com:22"},
+    })
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    let sandbox = client.create(CreateOptions {
+        image: "python:3.12".to_string(),
+        network_allow_out: Some(vec![
+            "pypi.org".to_string(),
+            "*.pythonhosted.org".to_string(),
+            "github.com:22".to_string(),
+        ]),
+        ..Default::default()
+    })?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    Sandbox sandbox = client.create(
+        new CreateOptions()
+            .setImage("python:3.12")
+            .setNetworkAllowOut(List.of("pypi.org", "*.pythonhosted.org", "github.com:22"))
+    );
+    ```
+  </TabItem>
+</Tabs>
+
+The server's firewall does the blocking, and it only runs on Linux. See [Network access](/network-access/) for the full options, and [Advanced network rules](/advanced-network-rules/) for request rules.
+
+## How a name allow list is enforced
+
+```mermaid
+flowchart LR
+    Box["Sandbox"] -- "DNS lookup" --> DNS["Server's DNS filter<br/>answers only listed names"]
+    Box -- "HTTPS to port 443" --> Proxy["Server's proxy<br/>checks the site name"]
+    Proxy -- "allowed" --> Site["pypi.org"]
+    Box -. "anything else" .-x Drop["Refused"]
+```
+
+1. **Name lookups go to the server's DNS filter.** A name that is not on the list gets "no such name", with a note explaining why. Lookups to outside DNS servers, DNS over TLS and QUIC are refused.
+2. **Web traffic goes to the server's proxy.** On ports 80 and 443, the proxy reads the site name the program asked for (the SNI or `Host` header), checks it against the list, and looks the name up again itself. It ignores the address the program tried to use.
+3. **Everything else is refused.**
+
+This is the same flow, step by step, for one HTTPS connection to an allowed site.
+
+```mermaid
+sequenceDiagram
+    participant B as Sandbox
+    participant D as DNS filter
+    participant P as Server's proxy
+    participant S as pypi.org
+    B->>D: Look up pypi.org
+    D-->>B: An address, because the name is on the list
+    B->>P: HTTPS to that address, asking for pypi.org
+    P->>P: Is pypi.org on the list?
+    P->>P: Look up pypi.org again, itself
+    P->>P: Guard checks each address it got
+    P->>S: Connect, then pass the bytes through
+```
+
+- The proxy never trusts the address the sandbox chose. It connects to the address it looked up itself.
+- It does not decrypt the traffic unless you turned on inspection for that site.
+
+## Private addresses and cloud metadata
+
+When a sandbox has a name allow list (or is in learn mode), a guard checks every address before the server connects:
+
+- **Blocked:** loopback, link-local (`169.254.0.0/16`, which includes the cloud metadata service at `169.254.169.254`) and private ranges (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`).
+- **Opened only on purpose:** a private range opens only if your list names it as an address range, or if the operator marks it as an internal zone.
+
+The guard asks these questions in order, for every address.
+
+```mermaid
+flowchart TB
+    A["An address the server<br/>is about to connect to"] --> Q1{"Loopback, link-local,<br/>multicast or 0.0.0.0?"}
+    Q1 -- "yes" --> R["Refused"]
+    Q1 -- "no" --> Q2{"In the operator's<br/>always-blocked ranges?"}
+    Q2 -- "yes" --> R
+    Q2 -- "no" --> Q3{"In a private range<br/>not opened on purpose?"}
+    Q3 -- "yes" --> R
+    Q3 -- "no" --> Q4{"Name on the allow list, or<br/>address allowed by the policy?"}
+    Q4 -- "yes" --> OK["Connect"]
+    Q4 -- "no" --> R
+```
+
+No sandbox can reach the server it runs on, whatever its policy allows. See [The server itself](#the-server-itself).
+
+## DNS tricks
+
+| Trick | What stops it |
+|---|---|
+| **DNS rebinding**: a name first resolves to a public address, then to a private one | The guard checks the address at the moment of connecting, after the lookup, and before any answer is trusted. |
+| **Hard-coded addresses**: connecting to an address directly, with no name | With no site name, the connection is refused unless an address range allows it. |
+| **A false site name**: sending an allowed name to a different address | The proxy looks the name up itself and connects there, not where the program wanted. |
+| **Going around the filter**: outside DNS, DNS over TLS, QUIC | Refused. |
+| **IPv6 and encrypted client hello** | IPv6 and HTTPS record lookups get empty answers, so programs use IPv4 and a visible site name. A sandbox has no IPv6 to use anyway: see [No IPv6 in a sandbox](#no-ipv6-in-a-sandbox). |
+| **Domain fronting**: a request for one site, sent inside a connection to another on the same CDN | Stopped on inspected HTTPS, where every request's `Host` must match the site name (`421` otherwise). Not checked without inspection. |
+
+## Ports other than 80 and 443
+
+For an entry with another port, such as `github.com:22`, the proxy cannot read a site name. The server opens the addresses that name looked up to, on that port only. Any other site at the same address and port can then be reached too.
+
+## No IPv6 in a sandbox
+
+Container, gVisor and Firecracker sandboxes use IPv4 only. Every rule on this page that keeps sandboxes apart, and away from the server, is written for IPv4. So IPv6 is shut off twice, and either one alone is enough:
+
+- **IPv6 is off inside the sandbox from the start.** A container or gVisor sandbox starts with IPv6 turned off in its own network, before your code runs. A Firecracker sandbox's kernel boots with IPv6 off on every network device (`ipv6.disable_ipv6=1`). The sandbox has no IPv6 address at all, not even `::1`.
+- **The server drops IPv6 on every sandbox network.** Even if code inside a sandbox turns IPv6 back on, as root in a Firecracker guest can, the server drops every IPv6 packet between two sandboxes on the same network, from a sandbox to the server, and from the server to a sandbox. The server's own end of each Firecracker network device has IPv6 off as well.
+
+What this means for you:
+
+- **There is no IPv6 internet access from a sandbox.** Sandboxes reach the internet over IPv4.
+- **Listening on `::` still works.** IPv6 sockets can still be opened, so a server that listens on `::`, such as nginx's default `listen [::]:80` or `python3 -m http.server`, starts as usual and takes IPv4 connections, on every runtime.
+- **Do not listen on `::1` alone.** There is no `::1`, so a program that listens only there fails to start. Listen on `127.0.0.1` instead.
+
+For operators:
+
+- **The rules are two `nftables` tables named `aerolvm_ipv6`:** `nft list table ip6 aerolvm_ipv6` and `nft list table bridge aerolvm_ipv6`. Each rule counts the packets it dropped. They do not depend on the policy file or on `SB_ENABLE_NETWORK_RULES`.
+- **A kernel without nftables bridge support** gets only the `ip6` table. The server then turns on `br_netfilter` so traffic inside a bridge still goes through that table, and checks that it stays on.
+- **The server checks the tables every 30 seconds** and puts them back if a firewall reload removed them. If it cannot install them, it refuses new container, gVisor and Firecracker sandboxes with `503` and the code `ipv6_fence_not_ready` until it can.
+- **A server with `SB_ENABLE_NETWORK_RULES=false`** (local mode) has no host firewall, so it installs no IPv6 tables either. IPv6 is still off inside its sandboxes. Enterprise mode always installs them.
+
+## Between sandboxes
+
+- **Sandboxes on the same server cannot reach each other.** Traffic from one sandbox to another on the same server is dropped, policy or not. An operator who needs the old open behavior sets `SB_SANDBOX_INTERCONNECT=true` (refused in enterprise mode).
+- **Sandboxes cannot reach the server's own services.** See [The server itself](#the-server-itself).
+- **Firecracker sandboxes are always fenced off.** No packet of any kind, ping included, goes from one Firecracker sandbox to another. Nothing in a container or gVisor sandbox can open a connection into one. Replies to a Firecracker sandbox's own connections still come in, and the server reaches it directly, not through this fence.
+- **Addresses cannot be faked.** Containers cannot forge packets, and the server checks that each packet from a Firecracker sandbox comes from its own address.
+- **Each sandbox's rules follow its address,** so one sandbox's policy never changes another's.
+
+## The server itself
+
+A server runs more than AerolVM: an EDR agent, a log shipper, a metrics exporter, a SIEM forwarder. **A sandbox cannot open a connection to any of them.** Every new connection from a sandbox to the server it runs on is dropped, on every address the server has: the sandbox network's gateway, the server's private address, and a public address bound to the server. Only these are open:
+
+| Open to sandboxes on their own server | When |
+|---|---|
+| The egress gateway's DNS (53054) and proxy (15080) ports | The gateway runs on the server, and only for sandboxes with a name allow list, which are sent there. The gateway drops them for every other sandbox. |
+| DNS (53) on one server address | The resolver handed to sandboxes is that address. By default sandboxes get the server's upstream resolvers, which are not on the server. |
+| Web ports 80 and 443 | The server serves public URLs. They answer the internet anyway, so a sandbox can open its own public URL. |
+| Ports the operator lists in `SB_SANDBOX_NODE_PORTS_ALLOW` | Only outside enterprise mode. |
+
+- **Replies still flow.** When the server opens a connection into a sandbox (AerolVM's agent, health checks), the sandbox's replies get through.
+- **No policy opens the server.** An allow list that names the server's address range still cannot reach it.
+- **Containers, gVisor and Firecracker** are held back by the server's firewall: a chain named `AEROLVM-NODE` runs first in its `INPUT` chain, with one chain per sandbox network. The server checks every 30 seconds that it is still in place and puts it back if a firewall reload removed it. If it cannot be put in place, the server refuses new sandboxes on that runtime (503, `node_guard_not_ready`) until it can. Over IPv6, a sandbox cannot reach the server at all: see [No IPv6 in a sandbox](#no-ipv6-in-a-sandbox).
+- **WebAssembly and V8 isolate** sandboxes connect out through AerolVM itself, so the same rule sits in its connection check instead: loopback and every server address are refused.
+- **Other servers in a cluster:** their AerolVM ports (API, Raft, gossip, cluster, SSH gateway) and their SSH and rpcbind are closed to every sandbox, through the egress gateway. Their other ports are not: block your private ranges with `deny_cidrs`.
+- **The server's public address through NAT** (a cloud public IP that is not bound to the server) is reached the way any internet client reaches it. What answers there is up to the cloud firewall.
+
+## Who can reach the sandbox
+
+```mermaid
+flowchart LR
+    User["Anyone on the internet"] -- "public URL" --> Caddy["Caddy on the server"]
+    Caddy -- "shared ports only" --> Box["Sandbox"]
+    Client["Database client"] -- "TCP port, any source" --> Box
+```
+
+- **A new sandbox is private.** It has no public address until you share a port. The Daytona API makes sandboxes public by default, and the E2B API always does.
+- **A public URL has no login of its own.** Anyone with the address can open it. Protect the app itself if it needs a login. See [Public URLs](/public-urls/).
+- **From outside the server, only shared ports are reachable.** Other sandboxes on the same server are a different matter: see [Between sandboxes](#between-sandboxes).
+- **TCP ports are open to the whole internet.** The server passes the bytes through without checking who connects. See [TCP and TLS ports](/tcp-ports/).
+- **Blocking outbound traffic does not close shared ports.**
+
+## Usage limits
+
+You can cap how many bytes a sandbox sends or receives in its lifetime. The server reads the counters every 10 seconds, so a sandbox can go a little over before it is cut off. There is no speed limit. See [Limit egress and ingress](/network-usage/).
+
+## In a cluster
+
+- **Servers prove who they are.** The shared record and the internal API use mutual TLS: each server needs a certificate signed by the cluster's own authority, with TLS 1.2 or newer.
+- **Membership gossip is encrypted.** The cluster will not start without a gossip key, unless the operator turns that check off on purpose.
+- **Forwarded calls need both** mutual TLS and the operator token.
+
+## For server operators
+
+Set these in the private-network policy file (`SB_EGRESS_OPERATOR_FILE`). They apply to every sandbox on the server, whatever its own policy says. See [Private networks](/advanced-network-rules/#private-networks).
+
+- **`default_policy`:** the policy a create gets when it sets none. Use `block_all` or `allowlist` so no sandbox starts open.
+- **`deny_cidrs`:** address ranges that are always dropped. Add your company's private ranges. The cloud metadata addresses are always dropped already. Do not add the ranges the server gives its own sandboxes.
+- **`node_control_port_guard`:** on by default, file or no file. Sandboxes cannot reach AerolVM's own ports on the other servers of a cluster, or their SSH and rpcbind. Set `false` only if a sandbox must reach them. It never opens the sandbox's own server: see [The server itself](#the-server-itself).
+
+These are environment settings on each server, not in the file:
+
+- **`SB_SANDBOX_NODE_PORTS_ALLOW`:** extra ports of the server that every sandbox on it may reach, such as `8080,5353/udp`. Empty by default. It cannot open AerolVM's own ports or SSH, and it is refused in enterprise mode: run a service sandboxes need on another machine.
+
+<Aside type="caution" title="Privileged sandboxes turn off name filtering">
+If the server allows privileged containers, name allow lists are turned off. Keep `SB_CONTAINER_PRIVILEGED` off.
+</Aside>
+
+## Where this boundary ends
+
+- **What an allowed site does with your data.** The filter controls where traffic goes, not what the far side does with it.
+- **Traffic inside an allowed HTTPS connection** is not read unless you turn on inspection for that site.
+- **Name filtering works on IPv4.** IPv6 lookups get empty answers.
+- **The server guard works on IPv4,** like the rest of the sandbox network. Over IPv6 nothing gets through at all: see [No IPv6 in a sandbox](#no-ipv6-in-a-sandbox).
+
+## Next steps
+
+- [Network access](/network-access/): block the internet, or allow only some sites.
+- [Advanced network rules](/advanced-network-rules/): profiles, learn mode and per-request rules.
+- [Secret handling](/engineering-secret-handling/): keep API keys out of the sandbox.

@@ -36,6 +36,26 @@ func ApplyErrorStatus(err error) int {
 		// Conflict, not a server error: the state the caller asked for lost
 		// to a newer one, and re-sending the same request cannot succeed.
 		return http.StatusConflict
+	case errors.Is(err, ErrReservationConflict), errors.Is(err, ErrNameConflict):
+		// A placement-id or name conflict is a conflict, not a server error:
+		// the slot the caller asked for is already held, and re-sending the
+		// same request unchanged cannot succeed. Answering 409 (instead of the
+		// default 500) is what lets forwardApplyStatus restore the sentinel on
+		// the far side of a leader-forward hop, so the create path's
+		// idempotent-replay branch (PreferredSandboxID + ErrReservationConflict)
+		// and its name-conflict branch fire on a non-leader node exactly as
+		// they already do when the apply lands on the local leader. Without it
+		// a retry of an Idempotency-Key create on a multi-node cluster 503s
+		// instead of replaying the existing sandbox.
+		return http.StatusConflict
+	case errors.Is(err, ErrIncarnationConflict):
+		// An incarnation fence is a verdict too: the placement moved to
+		// another incarnation, and re-sending the same write cannot succeed.
+		// The create path routes an Idempotency-Key retry whose re-reserve
+		// hit it to the reservation's owner (clustercreate.Prepare), which
+		// only works if the sentinel survives the hop; as a 500 the retry
+		// answered 503 (seen live on cluster-hetero-lite, UC-367).
+		return http.StatusConflict
 	default:
 		return http.StatusInternalServerError
 	}
@@ -63,8 +83,18 @@ func forwardApplyStatus(status int, message string) error {
 	case http.StatusTooManyRequests:
 		return fmt.Errorf("%w: %s", ErrCreateBackpressure, message)
 	case http.StatusConflict:
-		if strings.Contains(message, ErrArtifactCatalogSuperseded.Error()) {
+		// Restore whichever conflict sentinel the leader answered 409 with.
+		// The messages are disjoint prefixes (each is the sentinel's own
+		// Error()), so a plain Contains picks exactly one.
+		switch {
+		case strings.Contains(message, ErrArtifactCatalogSuperseded.Error()):
 			return fmt.Errorf("%w: %s", ErrArtifactCatalogSuperseded, message)
+		case strings.Contains(message, ErrReservationConflict.Error()):
+			return fmt.Errorf("%w: %s", ErrReservationConflict, message)
+		case strings.Contains(message, ErrNameConflict.Error()):
+			return fmt.Errorf("%w: %s", ErrNameConflict, message)
+		case strings.Contains(message, ErrIncarnationConflict.Error()):
+			return fmt.Errorf("%w: %s", ErrIncarnationConflict, message)
 		}
 	case http.StatusServiceUnavailable:
 		switch {

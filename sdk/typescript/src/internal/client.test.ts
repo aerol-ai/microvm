@@ -1,9 +1,12 @@
 import assert from "node:assert/strict";
+import { createServer, type RequestListener } from "node:http";
+import type { AddressInfo } from "node:net";
 import test from "node:test";
 
-import { APIClient, SandboxResource } from "./client.js";
+import { APIClient, SandboxResource, newIdempotencyKey, parseRetryAfter, retryDelayMs } from "./client.js";
+import { MicroVMApiError } from "../errors.js";
 import { Image } from "../Image.js";
-import type { Sandbox } from "../types.js";
+import type { CreateOptions, Sandbox } from "../types.js";
 
 test("internal client uses config object and auth header", async () => {
   let seenAuthorization = "";
@@ -452,6 +455,38 @@ test("sandbox resource createSnapshot delegates to client", async () => {
   const sandbox = await client.get("sb-resource");
   const snapshot = await sandbox.createSnapshot("snapshots/resource:v1");
   assert.equal(snapshot.sourceSandboxID, "sb-resource");
+});
+
+test("createSnapshot sends allow_pause only when it is set", async () => {
+  const bodies: unknown[] = [];
+  const client = new APIClient({
+    baseURL: "https://api.example.com",
+    fetch: async (input, init) => {
+      const request = new Request(input, init);
+      if (request.method === "POST" && request.url.endsWith("/sandboxes/sb-pause/snapshot")) {
+        bodies.push(await request.json());
+        return jsonResponse({
+          name: "snap",
+          image: "aerolvm-snapshot/abc:latest",
+          source_sandbox_id: "sb-pause",
+          created_at: "2026-11-04T10:00:00Z",
+        });
+      }
+      return jsonResponse(apiSandbox("sb-pause"));
+    },
+  });
+
+  await client.createSnapshot("sb-pause", "snap");
+  await client.createSnapshot("sb-pause", "snap", { allowPause: false });
+  await client.createSnapshot("sb-pause", "snap", { allowPause: true });
+  const sandbox = await client.get("sb-pause");
+  await sandbox.createSnapshot("snap", { allowPause: false });
+  assert.deepEqual(bodies, [
+    { name: "snap" },
+    { name: "snap", allow_pause: false },
+    { name: "snap", allow_pause: true },
+    { name: "snap", allow_pause: false },
+  ]);
 });
 
 test("internal client decodes API errors", async () => {
@@ -1190,6 +1225,45 @@ test("internal client create forwards customDomains as snake_case", async () => 
   assert.deepEqual(body?.custom_domains, ["api.acme.com", "www.acme.com"]);
 });
 
+test("internal client create sends gpus and template_id in the wire shape", async () => {
+  const cases: Array<{ name: string; options: Partial<CreateOptions>; want: Record<string, unknown> }> = [
+    {
+      name: "nvidia with count and device ids",
+      options: { gpus: { vendor: "nvidia", count: 2, deviceIDs: ["0", "GPU-abc123"] } },
+      want: { gpus: { vendor: "nvidia", count: 2, device_ids: ["0", "GPU-abc123"] } },
+    },
+    {
+      name: "vendor only leaves count and device_ids out",
+      options: { gpus: { vendor: "amd" } },
+      want: { gpus: { vendor: "amd" } },
+    },
+    {
+      name: "firecracker template",
+      options: { runtime: "firecracker", templateId: "py311" },
+      want: { runtime: "firecracker", template_id: "py311" },
+    },
+    {
+      name: "neither set stays omitted",
+      options: {},
+      want: {},
+    },
+  ];
+
+  for (const tc of cases) {
+    let body: Record<string, unknown> | undefined;
+    const client = new APIClient({
+      baseURL: "https://api.example.com",
+      patToken: "pat-token",
+      fetch: async (input, init) => {
+        body = (await new Request(input, init).json()) as Record<string, unknown>;
+        return jsonResponse(apiSandbox("sb-create-fields"));
+      },
+    });
+    await client.create({ image: "python:3.11", ...tc.options });
+    assert.deepEqual(body, { image: "python:3.11", ...tc.want }, tc.name);
+  }
+});
+
 test("internal client ingressDNS GETs and returns target verbatim", async () => {
   let seenRequest: Request | undefined;
   const client = new APIClient({
@@ -1366,4 +1440,883 @@ test("internal client retries 421 Misdirected Request", async () => {
   const sandbox = await client.get("sb-421");
   assert.equal(calls, 2);
   assert.ok(sandbox instanceof SandboxResource);
+});
+
+// A re-sent exec runs the caller's command again (the Rust SDK once ran a 40 s
+// command 4 times), so exec must not retry once the request may have arrived.
+test("internal client exec is not re-sent after the server read it", async () => {
+  const seen: string[] = [];
+  await withServer((req) => {
+    seen.push(`${req.method} ${req.url}`);
+    req.resume();
+    // Read the whole request, then hang up without answering: the command
+    // may be running, and the client cannot know.
+    req.on("end", () => req.socket.destroy());
+  }, async (baseURL) => {
+    let attempts = 0;
+    const client = new APIClient({
+      baseURL,
+      patToken: "pat-token",
+      retry: { maxRetries: 3, baseDelayMs: 1, maxDelayMs: 1 },
+      fetch: (input, init) => {
+        attempts++;
+        return fetch(input, init);
+      },
+    });
+    await assert.rejects(client.exec("sb-exec", { command: "sleep 40" }), TypeError);
+    assert.equal(attempts, 1);
+  });
+  assert.deepEqual(seen, ["POST /v1/sandboxes/sb-exec/toolbox/process/execute"]);
+});
+
+test("internal client exec retries a refused connection", async () => {
+  // Grab a free port, then close it so the connect is refused.
+  const server = createServer();
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const { port } = server.address() as AddressInfo;
+  await new Promise((resolve) => server.close(resolve));
+
+  let attempts = 0;
+  const client = new APIClient({
+    baseURL: `http://127.0.0.1:${port}`,
+    patToken: "pat-token",
+    retry: { maxRetries: 2, baseDelayMs: 1, maxDelayMs: 1 },
+    fetch: (input, init) => {
+      attempts++;
+      return fetch(input, init);
+    },
+  });
+  await assert.rejects(client.exec("sb-exec", { command: "true" }), TypeError);
+  assert.equal(attempts, 3);
+});
+
+test("internal client get still retries a connection closed after the request was read", async () => {
+  let served = 0;
+  await withServer((req, res) => {
+    served++;
+    req.resume();
+    if (served === 1) {
+      req.on("end", () => req.socket.destroy());
+      return;
+    }
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify(apiSandbox("sb-get-retry")));
+  }, async (baseURL) => {
+    let attempts = 0;
+    const client = new APIClient({
+      baseURL,
+      patToken: "pat-token",
+      retry: { maxRetries: 2, baseDelayMs: 1, maxDelayMs: 1 },
+      fetch: (input, init) => {
+        attempts++;
+        return fetch(input, init);
+      },
+    });
+    const sandbox = await client.get("sb-get-retry");
+    assert.equal(sandbox.id, "sb-get-retry");
+    assert.equal(attempts, 2);
+  });
+  assert.equal(served, 2);
+});
+
+test("internal client exec retries only transport errors that prove the request was never sent", async () => {
+  const errno = (code: string, syscall?: string, message = code): NodeJS.ErrnoException =>
+    Object.assign(new Error(message), { code, syscall });
+  // Shape every error the way undici's fetch does: a TypeError whose cause
+  // carries the Node / undici code.
+  const fetchFailed = (cause: unknown) => new TypeError("fetch failed", { cause });
+  const cases: Array<{ name: string; error: unknown; retried: boolean }> = [
+    { name: "connection refused", error: fetchFailed(errno("ECONNREFUSED", "connect")), retried: true },
+    {
+      name: "connection refused on every address",
+      error: fetchFailed(Object.assign(
+        new AggregateError([errno("ECONNREFUSED", "connect"), errno("ECONNREFUSED", "connect")]),
+        { code: "ECONNREFUSED" },
+      )),
+      retried: true,
+    },
+    { name: "DNS lookup failed transiently", error: fetchFailed(errno("EAI_AGAIN", "getaddrinfo")), retried: true },
+    { name: "undici connect timeout", error: fetchFailed(errno("UND_ERR_CONNECT_TIMEOUT")), retried: true },
+    { name: "TCP connect timed out", error: fetchFailed(errno("ETIMEDOUT", "connect")), retried: true },
+    {
+      name: "TCP connect timed out on every address",
+      error: fetchFailed(Object.assign(
+        new AggregateError([errno("ETIMEDOUT", "connect"), errno("ETIMEDOUT", "connect")]),
+        { code: "ETIMEDOUT" },
+      )),
+      retried: true,
+    },
+    { name: "open socket timed out", error: fetchFailed(errno("ETIMEDOUT", "read")), retried: false },
+    { name: "ETIMEDOUT with no syscall", error: fetchFailed(errno("ETIMEDOUT")), retried: false },
+    { name: "headers timeout", error: fetchFailed(errno("UND_ERR_HEADERS_TIMEOUT")), retried: false },
+    { name: "body timeout", error: fetchFailed(errno("UND_ERR_BODY_TIMEOUT")), retried: false },
+    { name: "connection reset", error: fetchFailed(errno("ECONNRESET", "read")), retried: false },
+    { name: "broken pipe", error: fetchFailed(errno("EPIPE", "write")), retried: false },
+    { name: "other side closed", error: fetchFailed(errno("UND_ERR_SOCKET", undefined, "other side closed")), retried: false },
+    { name: "socket hang up", error: fetchFailed(new Error("socket hang up")), retried: false },
+  ];
+
+  for (const tc of cases) {
+    let attempts = 0;
+    const client = new APIClient({
+      baseURL: "https://api.example.com",
+      patToken: "pat-token",
+      retry: { maxRetries: 2, baseDelayMs: 1, maxDelayMs: 1 },
+      fetch: async () => {
+        attempts++;
+        throw tc.error;
+      },
+    });
+    await assert.rejects(client.exec("sb-exec", { command: "true" }), (err) => err === tc.error, tc.name);
+    assert.equal(attempts, tc.retried ? 3 : 1, tc.name);
+  }
+});
+
+test("internal client exec retries 429 and 503 but surfaces other gateway statuses", async () => {
+  const cases: Array<{ status: number; retried: boolean }> = [
+    { status: 429, retried: true },
+    { status: 503, retried: true },
+    { status: 421, retried: false },
+    { status: 502, retried: false },
+    { status: 504, retried: false },
+  ];
+
+  for (const tc of cases) {
+    let attempts = 0;
+    const client = new APIClient({
+      baseURL: "https://api.example.com",
+      patToken: "pat-token",
+      retry: { maxRetries: 2, baseDelayMs: 1, maxDelayMs: 1 },
+      fetch: async () => {
+        attempts++;
+        if (attempts === 1) {
+          return jsonResponse({ error: `status ${tc.status}` }, tc.status);
+        }
+        return jsonResponse({ stdout: "ok\n", stderr: "", exit_code: 0, duration_ms: 1 });
+      },
+    });
+    const run = client.exec("sb-exec", { command: "echo ok" });
+    if (tc.retried) {
+      assert.equal((await run).stdout, "ok\n", `status ${tc.status}`);
+      assert.equal(attempts, 2, `status ${tc.status}`);
+    } else {
+      await assert.rejects(run, { message: `status ${tc.status}` });
+      assert.equal(attempts, 1, `status ${tc.status}`);
+    }
+  }
+});
+
+async function withServer(handler: RequestListener, fn: (baseURL: string) => Promise<void>): Promise<void> {
+  const server = createServer(handler);
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const { port } = server.address() as AddressInfo;
+  try {
+    await fn(`http://127.0.0.1:${port}`);
+  } finally {
+    server.closeAllConnections();
+    await new Promise((resolve) => server.close(resolve));
+  }
+}
+
+test("internal client getAudit sends filters and maps the page", async () => {
+  let seenRequest: Request | undefined;
+  const client = new APIClient({
+    baseURL: "https://api.example.com",
+    patToken: "pat-token",
+    fetch: async (input, init) => {
+      seenRequest = new Request(input, init);
+      return jsonResponse({
+        events: [
+          {
+            time: "2026-10-06T10:00:00Z",
+            kind: "egress",
+            result: "failure",
+            reason: "host_not_allowed",
+            destination: "evil.example:443",
+            network: "tcp",
+            event_id: "ae-1",
+            incarnation_id: "inc-1",
+          },
+        ],
+        coverage: { answered: ["node-a"], missing: null, partial: false },
+        next_cursor: "c2",
+      });
+    },
+  });
+
+  const page = await client.getAudit("sb-audit", { kind: "egress", limit: 50, cursor: "c1", incarnationID: "inc-1" });
+  assert.ok(seenRequest);
+  assert.equal(seenRequest.method, "GET");
+  const url = new URL(seenRequest.url);
+  assert.equal(url.pathname, "/v1/sandboxes/sb-audit/audit");
+  assert.equal(url.searchParams.get("kind"), "egress");
+  assert.equal(url.searchParams.get("limit"), "50");
+  assert.equal(url.searchParams.get("cursor"), "c1");
+  assert.equal(url.searchParams.get("incarnation_id"), "inc-1");
+  assert.equal(page.events[0].reason, "host_not_allowed");
+  assert.equal(page.events[0].eventID, "ae-1");
+  assert.deepEqual(page.coverage, { answered: ["node-a"], missing: [], partial: false });
+  assert.equal(page.nextCursor, "c2");
+});
+
+test("internal client getAudit without options sends no query and tolerates null events", async () => {
+  let seenURL = "";
+  const client = new APIClient({
+    baseURL: "https://api.example.com",
+    patToken: "pat-token",
+    fetch: async (input, init) => {
+      seenURL = new Request(input, init).url;
+      return jsonResponse({ events: null });
+    },
+  });
+  const page = await client.getAudit("sb-x");
+  assert.ok(seenURL.endsWith("/v1/sandboxes/sb-x/audit"));
+  assert.deepEqual(page, { events: [], coverage: { answered: [], missing: [], partial: false } });
+});
+
+test("sandbox.audit reads its own sandbox's log", async () => {
+  const urls: string[] = [];
+  const client = new APIClient({
+    baseURL: "https://api.example.com",
+    patToken: "pat-token",
+    fetch: async (input, init) => {
+      const req = new Request(input, init);
+      urls.push(req.url);
+      if (req.method === "POST") return jsonResponse(apiSandbox("sb-own"));
+      return jsonResponse({ events: [], coverage: { answered: [], missing: [], partial: false } });
+    },
+  });
+  const sandbox = await client.create({ image: "ubuntu:22.04" });
+  await sandbox.audit({ kind: "egress" });
+  assert.ok(urls[urls.length - 1].endsWith("/v1/sandboxes/sb-own/audit?kind=egress"));
+});
+
+test("get maps egress_status for gateway-mode sandboxes", async () => {
+  const client = new APIClient({
+    baseURL: "https://api.example.com",
+    patToken: "pat-token",
+    fetch: async () => jsonResponse({ ...apiSandbox("sb-eg"), egress_status: "held" }),
+  });
+  const sandbox = await client.get("sb-eg");
+  assert.equal(sandbox.egressStatus, "held");
+});
+
+test("checkNetworkPolicy posts the policy and maps the answer", async () => {
+  let seen: Request | undefined;
+  let body: Record<string, unknown> = {};
+  const client = new APIClient({
+    baseURL: "https://api.example.com",
+    patToken: "pat-token",
+    fetch: async (input, init) => {
+      seen = new Request(input, init);
+      body = JSON.parse(String(init?.body));
+      return jsonResponse({ allowed: true, matched_rule: "*.github.com", default_verdict: "deny", outside_ceiling: "x.example" });
+    },
+  });
+  const res = await client.checkNetworkPolicy({ networkAllowOut: ["*.github.com"], destination: "api.github.com" });
+  assert.ok(seen && seen.url.endsWith("/v1/network/policy/check"));
+  assert.equal(seen?.method, "POST");
+  assert.deepEqual(body.network_allow_out, ["*.github.com"]);
+  assert.equal(body.destination, "api.github.com");
+  assert.deepEqual(res, { allowed: true, matchedRule: "*.github.com", defaultVerdict: "deny", outsideCeiling: "x.example" });
+});
+
+test("setNetworkPolicy PUTs the whole policy and maps the effective one", async () => {
+  let seen: Request | undefined;
+  let body: Record<string, unknown> = {};
+  const client = new APIClient({
+    baseURL: "https://api.example.com",
+    patToken: "pat-token",
+    fetch: async (input, init) => {
+      seen = new Request(input, init);
+      body = JSON.parse(String(init?.body));
+      return jsonResponse({ network_block_all: false, network_allow_out: ["pypi.org"], network_deny_out: null, egress_profiles: ["python"], effective_hostname_count: 3, egress_status: "active" });
+    },
+  });
+  const res = await client.setNetworkPolicy("sb-pol", { networkAllowOut: ["pypi.org"], egressProfiles: ["python"] });
+  assert.ok(seen && seen.url.endsWith("/v1/sandboxes/sb-pol/network/policy"));
+  assert.equal(seen?.method, "PUT");
+  assert.deepEqual(body, { network_block_all: false, network_allow_out: ["pypi.org"], network_deny_out: [], egress_profiles: ["python"] });
+  assert.deepEqual(res, { networkBlockAll: false, networkAllowOut: ["pypi.org"], networkDenyOut: [], egressProfiles: ["python"], networkEgressMode: "enforce", networkEgressRules: [], effectiveHostnameCount: 3, egressStatus: "active" });
+});
+
+test("sandbox.setNetworkPolicy updates its own policy fields", async () => {
+  const client = new APIClient({
+    baseURL: "https://api.example.com",
+    patToken: "pat-token",
+    fetch: async (input, init) => {
+      const req = new Request(input, init);
+      if (req.method === "POST") return jsonResponse(apiSandbox("sb-own"));
+      assert.ok(req.url.endsWith("/v1/sandboxes/sb-own/network/policy"));
+      return jsonResponse({ network_block_all: true, network_allow_out: [], network_deny_out: [] });
+    },
+  });
+  const sandbox = await client.create({ image: "ubuntu:22.04" });
+  const res = await sandbox.setNetworkPolicy({ networkBlockAll: true });
+  assert.equal(res.networkBlockAll, true);
+  assert.equal(sandbox.networkBlockAll, true);
+  assert.equal(sandbox.egressStatus, undefined);
+});
+
+test("egress profile CRUD maps the wire shape", async () => {
+  const seen: { method: string; url: string; body?: unknown }[] = [];
+  const profile = { name: "python", allow_out: ["pypi.org"], description: "pip", generation: 2, created_at: "c", updated_at: "u" };
+  const client = new APIClient({
+    baseURL: "https://api.example.com",
+    patToken: "pat-token",
+    fetch: async (input, init) => {
+      const req = new Request(input, init);
+      seen.push({ method: req.method, url: req.url, body: init?.body ? JSON.parse(String(init.body)) : undefined });
+      if (req.method === "DELETE") return new Response(null, { status: 204 });
+      if (req.url.includes("/egress-profiles?")) return jsonResponse({ profiles: [profile], next_cursor: "python" });
+      if (req.url.endsWith("/egress-profiles")) return jsonResponse({ profiles: null });
+      return jsonResponse(profile);
+    },
+  });
+  const put = await client.putEgressProfile("python", { allowOut: ["pypi.org"], description: "pip" });
+  assert.deepEqual(put, { name: "python", allowOut: ["pypi.org"], description: "pip", generation: 2, createdAt: "c", updatedAt: "u" });
+  assert.deepEqual(seen[0], { method: "PUT", url: "https://api.example.com/v1/egress-profiles/python", body: { allow_out: ["pypi.org"], description: "pip" } });
+  assert.equal((await client.getEgressProfile("python")).generation, 2);
+  const page = await client.listEgressProfiles({ cursor: "a", limit: 10 });
+  assert.equal(page.nextCursor, "python");
+  assert.ok(seen[2].url.endsWith("/v1/egress-profiles?cursor=a&limit=10"));
+  assert.deepEqual(await client.listEgressProfiles(), { profiles: [] });
+  await client.deleteEgressProfile("python");
+  assert.equal(seen[4].method, "DELETE");
+});
+
+test("sandboxes carry their egress profiles", async () => {
+  let body: Record<string, unknown> = {};
+  const client = new APIClient({
+    baseURL: "https://api.example.com",
+    patToken: "pat-token",
+    fetch: async (_input, init) => {
+      if (init?.body) body = JSON.parse(String(init.body));
+      return jsonResponse({ ...apiSandbox("sb-p"), egress_profiles: ["python"], egress_profiles_applied: [{ name: "python", generation: 2 }] });
+    },
+  });
+  const sandbox = await client.create({ image: "alpine", egressProfiles: ["python"] });
+  assert.deepEqual(body.egress_profiles, ["python"]);
+  assert.deepEqual(sandbox.egressProfiles, ["python"]);
+  assert.deepEqual(sandbox.egressProfilesApplied, [{ name: "python", generation: 2 }]);
+});
+
+test("learn mode: create, the policy answer and the learned read", async () => {
+  const bodies: Record<string, unknown>[] = [];
+  const client = new APIClient({
+    baseURL: "https://api.example.com",
+    patToken: "pat-token",
+    fetch: async (input, init) => {
+      const req = new Request(input, init);
+      if (init?.body) bodies.push(JSON.parse(String(init.body)));
+      if (req.url.endsWith("/network/learned")) {
+        return jsonResponse({
+          mode: "learn",
+          truncated: false,
+          entries: [{ host: "pypi.org", ports: [443], first_seen: "a", last_seen: "b", hits: 3 }],
+          cidrs: null,
+          suggested_allow_out: ["pypi.org"],
+          suggested_profile: { allow_out: ["x.example"], description: "d" },
+        });
+      }
+      if (req.url.endsWith("/network/policy")) {
+        return jsonResponse({ network_block_all: false, network_allow_out: [], network_deny_out: [], network_egress_mode: "learn" });
+      }
+      return jsonResponse({ ...apiSandbox("sb-learn"), network_egress_mode: "learn" });
+    },
+  });
+  const sandbox = await client.create({ image: "alpine", networkEgressMode: "learn" });
+  assert.equal(bodies[0].network_egress_mode, "learn");
+  assert.equal(sandbox.networkEgressMode, "learn");
+  const pol = await sandbox.setNetworkPolicy({ networkEgressMode: "learn" });
+  assert.equal(pol.networkEgressMode, "learn");
+  assert.equal(bodies[1].network_egress_mode, "learn");
+  const learned = await sandbox.learned();
+  assert.deepEqual(learned.entries[0], { host: "pypi.org", ports: [443], firstSeen: "a", lastSeen: "b", hits: 3 });
+  assert.deepEqual(learned.cidrs, []);
+  assert.deepEqual(learned.suggestedProfile, { allowOut: ["x.example"], description: "d" });
+});
+
+test("egress rules: create, the policy answer and the sandbox's own copy", async () => {
+  const bodies: Record<string, unknown>[] = [];
+  const rule = { host: "api.github.com", methods: ["GET"], paths: ["/repos/acme/**"], inspect: true };
+  let policyRules: unknown = [rule];
+  const client = new APIClient({
+    baseURL: "https://api.example.com",
+    patToken: "pat-token",
+    fetch: async (input, init) => {
+      const req = new Request(input, init);
+      if (init?.body) bodies.push(JSON.parse(String(init.body)));
+      if (req.url.endsWith("/network/policy")) {
+        return jsonResponse({ network_block_all: false, network_allow_out: ["api.github.com"], network_deny_out: [], network_egress_rules: policyRules });
+      }
+      return jsonResponse({ ...apiSandbox("sb-rules"), network_egress_rules: [{ ...rule, ports: [443] }] });
+    },
+  });
+  const sandbox = await client.create({ image: "alpine", networkAllowOut: ["api.github.com"], networkEgressRules: [rule] });
+  assert.deepEqual(bodies[0].network_egress_rules, [rule]);
+  assert.deepEqual(sandbox.networkEgressRules, [{ ...rule, ports: [443] }]);
+
+  const pol = await sandbox.setNetworkPolicy({ networkAllowOut: ["api.github.com"], networkEgressRules: [rule] });
+  assert.deepEqual(bodies[1].network_egress_rules, [rule]);
+  assert.deepEqual(pol.networkEgressRules, [rule]);
+  assert.deepEqual(sandbox.networkEgressRules, [rule]);
+
+  policyRules = null;
+  const cleared = await sandbox.setNetworkPolicy({ networkAllowOut: ["api.github.com"] });
+  assert.equal("network_egress_rules" in bodies[2], false);
+  assert.deepEqual(cleared.networkEgressRules, []);
+  assert.equal(sandbox.networkEgressRules, undefined);
+});
+
+test("egress rules: inject goes out as secret_ref and comes back as secretRef", async () => {
+  const bodies: Record<string, unknown>[] = [];
+  const rule = { host: "api.github.com", inspect: true, paths: ["/repos/**"], inject: { header: "Authorization", secretRef: "env:GITHUB_TOKEN" } };
+  const wire = { host: "api.github.com", inspect: true, paths: ["/repos/**"], inject: { header: "Authorization", secret_ref: "env:GITHUB_TOKEN" } };
+  const client = new APIClient({
+    baseURL: "https://api.example.com",
+    patToken: "pat-token",
+    fetch: async (input, init) => {
+      const req = new Request(input, init);
+      if (init?.body) bodies.push(JSON.parse(String(init.body)));
+      if (req.url.endsWith("/network/policy")) {
+        return jsonResponse({ network_block_all: false, network_allow_out: ["api.github.com"], network_deny_out: [], network_egress_rules: [wire] });
+      }
+      return jsonResponse({ ...apiSandbox("sb-inject"), network_egress_rules: [{ ...wire, ports: [443] }] });
+    },
+  });
+  const sandbox = await client.create({
+    image: "alpine",
+    env: { GITHUB_TOKEN: "Bearer ghp_x" },
+    networkAllowOut: ["api.github.com"],
+    networkEgressRules: [rule],
+  });
+  assert.deepEqual(bodies[0].network_egress_rules, [wire]);
+  assert.deepEqual(sandbox.networkEgressRules, [{ ...rule, ports: [443] }]);
+
+  // A rule without inject goes out unchanged, with no inject key at all.
+  const pol = await sandbox.setNetworkPolicy({ networkAllowOut: ["api.github.com"], networkEgressRules: [rule, { host: "api.github.com" }] });
+  assert.deepEqual(bodies[1].network_egress_rules, [wire, { host: "api.github.com" }]);
+  assert.deepEqual(pol.networkEgressRules, [rule]);
+  assert.deepEqual(sandbox.networkEgressRules, [rule]);
+});
+
+test("egress rules: binaries go out and come back as written", async () => {
+  const bodies: Record<string, unknown>[] = [];
+  const git = { host: "github.com", ports: [22], binaries: ["/usr/bin/git"] };
+  const pip = { host: "pypi.org", ports: [443], binaries: ["/usr/local/bin/pip"] };
+  const client = new APIClient({
+    baseURL: "https://api.example.com",
+    patToken: "pat-token",
+    fetch: async (input, init) => {
+      const req = new Request(input, init);
+      if (init?.body) bodies.push(JSON.parse(String(init.body)));
+      if (req.url.endsWith("/network/policy")) {
+        return jsonResponse({ network_block_all: false, network_allow_out: ["github.com:22", "pypi.org"], network_deny_out: [], network_egress_rules: [git, pip] });
+      }
+      return jsonResponse({ ...apiSandbox("sb-binaries"), network_egress_rules: [git, pip] });
+    },
+  });
+  const sandbox = await client.create({ image: "alpine", networkAllowOut: ["github.com:22", "pypi.org"], networkEgressRules: [git, pip] });
+  assert.deepEqual(bodies[0].network_egress_rules, [git, pip]);
+  assert.deepEqual(sandbox.networkEgressRules, [git, pip]);
+
+  // A rule without binaries goes out with no binaries key at all.
+  const pol = await sandbox.setNetworkPolicy({ networkAllowOut: ["github.com:22", "pypi.org"], networkEgressRules: [git, { host: "pypi.org" }] });
+  assert.deepEqual(bodies[1].network_egress_rules, [git, { host: "pypi.org" }]);
+  assert.deepEqual(pol.networkEgressRules, [git, pip]);
+  assert.deepEqual(sandbox.networkEgressRules, [git, pip]);
+});
+
+test("parseRetryAfter reads delta-seconds and HTTP dates", () => {
+  const now = Date.parse("2026-11-02T12:00:00Z");
+  const cases: Array<[string | null, number | undefined]> = [
+    [null, undefined],
+    ["", undefined],
+    ["   ", undefined],
+    ["3", 3000],
+    [" 3 ", 3000],
+    ["0", 0],
+    ["-1", undefined],
+    ["+3", undefined],
+    ["1.5", undefined],
+    ["soon", undefined],
+    ["Mon, 02 Nov 2026 12:00:07 GMT", 7000],
+    ["Mon, 02 Nov 2026 11:59:00 GMT", 0],
+    ["Mon, 32 Nov 2026 12:00:07 GMT", undefined],
+    // No zone: Date.parse would read it in local time, so it is refused.
+    ["Mon Nov  2 12:00:07 2026", undefined],
+  ];
+  for (const [value, want] of cases) {
+    assert.equal(parseRetryAfter(value, now), want, String(value));
+  }
+  assert.ok(parseRetryAfter("99999999999999999999", now)! > 1e20);
+});
+
+test("retryDelayMs honours Retry-After between the backoff and the cap", () => {
+  const now = Date.parse("2026-11-02T12:00:00Z");
+  const config = (maxRetryAfterMs: number) => ({ maxRetries: 3, baseDelayMs: 100, maxDelayMs: 1000, maxRetryAfterMs });
+  const cases: Array<{ name: string; limit: number; attempt: number; header: string | null; random: number; want: number }> = [
+    { name: "no header: backoff minus a quarter", limit: 2000, attempt: 0, header: null, random: 0, want: 75 },
+    { name: "no header: backoff plus a quarter", limit: 2000, attempt: 0, header: null, random: 1, want: 125 },
+    { name: "no header: doubles per attempt", limit: 2000, attempt: 2, header: null, random: 0.5, want: 400 },
+    { name: "no header: capped by maxDelayMs", limit: 2000, attempt: 5, header: null, random: 0.5, want: 1000 },
+    { name: "malformed header falls back", limit: 2000, attempt: 0, header: "soon", random: 0, want: 75 },
+    { name: "seconds: never sooner than asked", limit: 2000, attempt: 0, header: "1", random: 0, want: 1000 },
+    { name: "seconds: at most a fifth later", limit: 2000, attempt: 0, header: "1", random: 1, want: 1200 },
+    { name: "HTTP date", limit: 2000, attempt: 0, header: "Mon, 02 Nov 2026 12:00:01 GMT", random: 0, want: 1000 },
+    { name: "backoff is the floor", limit: 2000, attempt: 2, header: "0", random: 0, want: 400 },
+    { name: "spread stops at the cap", limit: 1100, attempt: 0, header: "1", random: 1, want: 1100 },
+    { name: "long ask is cut to the cap", limit: 2000, attempt: 0, header: "120", random: 0, want: 2000 },
+    { name: "long ask spreads below the cap", limit: 2000, attempt: 0, header: "120", random: 1, want: 1600 },
+    { name: "cap 0 ignores the header", limit: 0, attempt: 0, header: "120", random: 0, want: 75 },
+  ];
+  for (const tc of cases) {
+    assert.ok(Math.abs(retryDelayMs(config(tc.limit), tc.attempt, tc.header, now, tc.random) - tc.want) < 1e-9, tc.name);
+  }
+});
+
+/**
+ * A fetch that answers the first `refusals` calls with `status` and the
+ * Retry-After `header()` returns, then a sandbox (or an exec result). It
+ * records when each call arrived.
+ */
+function pacedFetch(status: number, refusals: number, header: () => string | null) {
+  const arrivals: number[] = [];
+  const signals: Array<AbortSignal | null | undefined> = [];
+  const fetchFn = async (input: RequestInfo | URL, init?: RequestInit) => {
+    arrivals.push(performance.now());
+    signals.push(init?.signal);
+    if (arrivals.length <= refusals) {
+      const value = header();
+      const headers: Record<string, string> = { "content-type": "application/json" };
+      if (value !== null) headers["retry-after"] = value;
+      return new Response(JSON.stringify({ error: "busy", code: "overloaded" }), { status, headers });
+    }
+    if (String(input).endsWith("/toolbox/process/execute")) {
+      return jsonResponse({ stdout: "ok\n", stderr: "", exit_code: 0, duration_ms: 1 });
+    }
+    return jsonResponse(apiSandbox("sb-paced"));
+  };
+  const gap = () => {
+    assert.ok(arrivals.length >= 2, `saw ${arrivals.length} calls, want a retry`);
+    return arrivals[1] - arrivals[0];
+  };
+  return { fetchFn, arrivals, signals, gap };
+}
+
+function pacedClient(fetchFn: ReturnType<typeof pacedFetch>["fetchFn"], extra: { maxRetryAfterMs?: number; signal?: AbortSignal } = {}) {
+  return new APIClient({
+    baseURL: "https://api.example.com",
+    patToken: "pat-token",
+    retry: { maxRetries: 3, baseDelayMs: 1, maxDelayMs: 1, maxRetryAfterMs: extra.maxRetryAfterMs },
+    signal: extra.signal,
+    fetch: fetchFn,
+  });
+}
+
+// Get is idempotent; exec is re-sent only after a refusal. Both honour it.
+const callBoth: Array<[string, (client: APIClient) => Promise<unknown>]> = [
+  ["get", (client) => client.get("sb-paced")],
+  ["exec", (client) => client.exec("sb-paced", { command: "true" })],
+];
+
+// With a 1 ms backoff, only the server's Retry-After explains a 1 s gap.
+test("internal client waits out Retry-After on 429 and 503", async () => {
+  const inTwoSeconds = () => new Date(Date.now() + 2000).toUTCString();
+  const cases: Array<{ name: string; status: number; header: () => string; min: number; max: number }> = [
+    { name: "429 seconds", status: 429, header: () => "1", min: 1000, max: 2000 },
+    { name: "503 seconds", status: 503, header: () => "1", min: 1000, max: 2000 },
+    // Whole-second precision: the date asks for 1-2 s.
+    { name: "503 HTTP date", status: 503, header: inTwoSeconds, min: 1000, max: 3000 },
+  ];
+  await Promise.all(cases.flatMap((tc) => callBoth.map(async ([callName, call]) => {
+    const paced = pacedFetch(tc.status, 1, tc.header);
+    await call(pacedClient(paced.fetchFn));
+    const gap = paced.gap();
+    // setTimeout may fire up to a millisecond early.
+    assert.ok(gap >= tc.min - 2 && gap <= tc.max, `${tc.name}/${callName}: retried after ${gap} ms`);
+  })));
+});
+
+test("internal client caps Retry-After at maxRetryAfterMs", async () => {
+  const paced = pacedFetch(503, 1, () => "120");
+  await pacedClient(paced.fetchFn, { maxRetryAfterMs: 100 }).get("sb-paced");
+  const gap = paced.gap();
+  assert.ok(gap >= 78 && gap <= 1000, `retried after ${gap} ms`);
+});
+
+// A missing or malformed header, or one on a status that is a hop's rather
+// than the server's pacing (421/502/504), leaves the 1 ms backoff in charge.
+test("internal client falls back to backoff without a usable Retry-After", async () => {
+  const cases: Array<[number, string | null]> = [
+    [503, null],
+    [429, "soon"],
+    [503, "-1"],
+    [421, "120"],
+    [502, "120"],
+    [504, "120"],
+  ];
+  for (const [status, header] of cases) {
+    const paced = pacedFetch(status, 1, () => header);
+    await pacedClient(paced.fetchFn).get("sb-paced");
+    assert.ok(paced.gap() < 500, `${status} ${header}: retried after ${paced.gap()} ms`);
+  }
+});
+
+test("internal client keeps its retry budget and statuses with Retry-After", async () => {
+  const exhausted = pacedFetch(503, 100, () => "0");
+  await assert.rejects(pacedClient(exhausted.fetchFn).get("sb-paced"), { message: "busy" });
+  assert.equal(exhausted.arrivals.length, 4, "1 + 3 retries");
+
+  for (const status of [400, 404, 500]) {
+    const paced = pacedFetch(status, 100, () => "1");
+    await assert.rejects(pacedClient(paced.fetchFn).get("sb-paced"));
+    assert.equal(paced.arrivals.length, 1, `${status} is not retried`);
+  }
+  const exec502 = pacedFetch(502, 100, () => "1");
+  await assert.rejects(pacedClient(exec502.fetchFn).exec("sb-paced", { command: "true" }));
+  assert.equal(exec502.arrivals.length, 1, "exec does not re-send a 502");
+});
+
+test("internal client signal ends a Retry-After wait", async () => {
+  const cases: Array<{ name: string; signal: () => AbortSignal; error: (err: unknown) => boolean }> = [
+    {
+      name: "abort",
+      signal: () => {
+        const controller = new AbortController();
+        setTimeout(() => controller.abort(new Error("caller gave up")), 100);
+        return controller.signal;
+      },
+      error: (err) => err instanceof Error && err.message === "caller gave up",
+    },
+    {
+      name: "timeout",
+      signal: () => AbortSignal.timeout(100),
+      error: (err) => err instanceof DOMException && err.name === "TimeoutError",
+    },
+  ];
+  for (const tc of cases) {
+    for (const [callName, call] of callBoth) {
+      const paced = pacedFetch(503, 100, () => "30");
+      const signal = tc.signal();
+      const start = performance.now();
+      await assert.rejects(call(pacedClient(paced.fetchFn, { signal })), tc.error, `${tc.name}/${callName}`);
+      const elapsed = performance.now() - start;
+      assert.ok(elapsed < 2000, `${tc.name}/${callName}: returned after ${elapsed} ms`);
+      assert.equal(paced.arrivals.length, 1, `${tc.name}/${callName}`);
+      assert.equal(paced.signals[0], signal, "fetch gets the client's signal");
+    }
+  }
+});
+
+test("internal client does not retry once its signal has aborted", async () => {
+  const controller = new AbortController();
+  let attempts = 0;
+  const client = new APIClient({
+    baseURL: "https://api.example.com",
+    patToken: "pat-token",
+    retry: { maxRetries: 3, baseDelayMs: 1, maxDelayMs: 1 },
+    signal: controller.signal,
+    fetch: async () => {
+      attempts++;
+      controller.abort();
+      // A transport error that would otherwise be retried.
+      throw new TypeError("fetch failed", { cause: Object.assign(new Error("reset"), { code: "ECONNRESET" }) });
+    },
+  });
+  await assert.rejects(client.get("sb-paced"), TypeError);
+  assert.equal(attempts, 1);
+});
+
+// Every HTTP error is a MicroVMApiError carrying the status, the server's
+// stable code and its Retry-After, with the message the SDK always threw.
+test("internal client errors carry status, code and Retry-After", async () => {
+  const cases: Array<{
+    name: string;
+    response: () => Response;
+    status: number;
+    code: string | undefined;
+    message: string;
+    retryAfterMs: number | undefined;
+    attempts: number;
+  }> = [
+    {
+      name: "422 idempotency_key_reused is not retried",
+      response: () => jsonResponse({ error: 'Idempotency-Key "k-1" was already used with a different request', code: "idempotency_key_reused" }, 422),
+      status: 422,
+      code: "idempotency_key_reused",
+      message: 'Idempotency-Key "k-1" was already used with a different request',
+      retryAfterMs: undefined,
+      attempts: 1,
+    },
+    {
+      name: "503 egress_floor_not_ready keeps Retry-After after the retries run out",
+      response: () =>
+        new Response(JSON.stringify({ error: "this node's egress deny floor is not ready", code: "egress_floor_not_ready" }), {
+          status: 503,
+          headers: { "content-type": "application/json", "retry-after": "0" },
+        }),
+      status: 503,
+      code: "egress_floor_not_ready",
+      message: "this node's egress deny floor is not ready",
+      retryAfterMs: 0,
+      attempts: 3,
+    },
+    {
+      name: "non-JSON body has no code and the status message",
+      response: () => new Response("<html>Bad Gateway</html>", { status: 502, headers: { "content-type": "text/html" } }),
+      status: 502,
+      code: undefined,
+      message: "request failed with status 502",
+      retryAfterMs: undefined,
+      attempts: 3,
+    },
+  ];
+  for (const tc of cases) {
+    let attempts = 0;
+    const client = new APIClient({
+      baseURL: "https://api.example.com",
+      patToken: "pat-token",
+      retry: { maxRetries: 2, baseDelayMs: 1, maxDelayMs: 1 },
+      fetch: async () => {
+        attempts++;
+        return tc.response();
+      },
+    });
+    const err = await client.create({ image: "ubuntu:22.04" }).then(
+      () => assert.fail(`${tc.name}: create should fail`),
+      (e: unknown) => e,
+    );
+    assert.ok(err instanceof MicroVMApiError, `${tc.name}: ${String(err)}`);
+    assert.ok(err instanceof Error, tc.name);
+    assert.equal(err.name, "MicroVMApiError", tc.name);
+    assert.equal(err.status, tc.status, tc.name);
+    assert.equal(err.code, tc.code, tc.name);
+    assert.equal(err.message, tc.message, tc.name);
+    assert.equal(err.retryAfterMs, tc.retryAfterMs, tc.name);
+    assert.equal(attempts, tc.attempts, tc.name);
+  }
+});
+
+test("internal client error Retry-After reads seconds and HTTP dates", async () => {
+  const at = Date.now() + 60_000;
+  const cases: Array<[string, (ms: number | undefined) => boolean]> = [
+    ["7", (ms) => ms === 7000],
+    [new Date(at).toUTCString(), (ms) => ms !== undefined && ms > 50_000 && ms <= 60_000],
+    ["soon", (ms) => ms === undefined],
+  ];
+  for (const [header, ok] of cases) {
+    const client = new APIClient({
+      baseURL: "https://api.example.com",
+      patToken: "pat-token",
+      retry: { maxRetries: 0 },
+      fetch: async () =>
+        new Response(JSON.stringify({ error: "busy", code: "overloaded" }), {
+          status: 503,
+          headers: { "content-type": "application/json", "retry-after": header },
+        }),
+    });
+    const err = await client.list().catch((e: unknown) => e);
+    assert.ok(err instanceof MicroVMApiError, header);
+    assert.ok(ok(err.retryAfterMs), `${header}: retryAfterMs=${err.retryAfterMs}`);
+  }
+});
+
+// A create carries an Idempotency-Key: the caller's, or one the SDK makes per
+// call and sends unchanged on every automatic retry of that call.
+function keyRecordingClient(script: Array<"ok" | "503" | "reset" | "422">) {
+  const keys: Array<string | null> = [];
+  const bodies: Array<Record<string, unknown>> = [];
+  const client = new APIClient({
+    baseURL: "https://api.example.com",
+    patToken: "pat-token",
+    retry: { maxRetries: 3, baseDelayMs: 1, maxDelayMs: 1 },
+    fetch: async (input, init) => {
+      const request = new Request(input, init);
+      keys.push(request.headers.get("idempotency-key"));
+      if (request.method === "POST" && request.url.endsWith("/v1/sandboxes")) {
+        bodies.push((await request.json()) as Record<string, unknown>);
+      }
+      const step = script[Math.min(keys.length - 1, script.length - 1)];
+      switch (step) {
+        case "503":
+          return new Response(JSON.stringify({ error: "busy", code: "egress_floor_not_ready" }), {
+            status: 503,
+            headers: { "content-type": "application/json", "retry-after": "0" },
+          });
+        case "reset":
+          throw new TypeError("fetch failed", { cause: Object.assign(new Error("reset"), { code: "ECONNRESET" }) });
+        case "422":
+          return jsonResponse({ error: "Idempotency-Key reused", code: "idempotency_key_reused" }, 422);
+        default:
+          return jsonResponse(apiSandbox("sb-keyed"), 201);
+      }
+    },
+  });
+  return { client, keys, bodies };
+}
+
+test("internal client create sends the caller's Idempotency-Key, not in the body", async () => {
+  const { client, keys, bodies } = keyRecordingClient(["ok"]);
+  await client.create({ image: "ubuntu:22.04", idempotencyKey: " order-42 " });
+  assert.deepEqual(keys, ["order-42"]);
+  assert.equal(bodies[0].idempotencyKey, undefined);
+  assert.equal(bodies[0].idempotency_key, undefined);
+  assert.equal(bodies[0].image, "ubuntu:22.04");
+});
+
+test("internal client create keeps one generated Idempotency-Key across retries", async () => {
+  for (const first of ["503", "reset"] as const) {
+    const { client, keys } = keyRecordingClient([first, first, "ok"]);
+    const sandbox = await client.create({ image: "ubuntu:22.04" });
+    assert.equal(sandbox.id, "sb-keyed", first);
+    assert.equal(keys.length, 3, first);
+    assert.match(keys[0] ?? "", /^[0-9a-f]{32}$/, first);
+    assert.deepEqual(keys, [keys[0], keys[0], keys[0]], `${first}: every attempt sends the first key`);
+  }
+});
+
+test("internal client create keeps the caller's Idempotency-Key across retries", async () => {
+  const { client, keys } = keyRecordingClient(["503", "ok"]);
+  await client.create({ image: "ubuntu:22.04", idempotencyKey: "order-42" });
+  assert.deepEqual(keys, ["order-42", "order-42"]);
+});
+
+test("internal client makes a new Idempotency-Key for each create call", async () => {
+  const { client, keys } = keyRecordingClient(["ok"]);
+  await client.create({ image: "ubuntu:22.04" });
+  await client.create({ image: "ubuntu:22.04" });
+  assert.equal(keys.length, 2);
+  assert.notEqual(keys[0], keys[1]);
+  // A blank key counts as none.
+  await client.create({ image: "ubuntu:22.04", idempotencyKey: "   " });
+  assert.match(keys[2] ?? "", /^[0-9a-f]{32}$/);
+});
+
+test("internal client create surfaces idempotency_key_reused without retrying", async () => {
+  const { client, keys } = keyRecordingClient(["422"]);
+  const err = await client.create({ image: "ubuntu:22.04", idempotencyKey: "order-42" }).catch((e: unknown) => e);
+  assert.ok(err instanceof MicroVMApiError);
+  assert.equal(err.status, 422);
+  assert.equal(err.code, "idempotency_key_reused");
+  assert.equal(keys.length, 1);
+});
+
+test("internal client sends Idempotency-Key only on sandbox create", async () => {
+  const { client, keys } = keyRecordingClient(["ok"]);
+  await client.get("sb-keyed");
+  await client.exec("sb-keyed", { command: "true" }).catch(() => undefined);
+  await client.createSnapshot("sb-keyed", "snap").catch(() => undefined);
+  assert.deepEqual(keys, [null, null, null]);
+});
+
+test("newIdempotencyKey is 32 hex characters and unique", () => {
+  const seen = new Set<string>();
+  for (let i = 0; i < 1000; i++) {
+    const key = newIdempotencyKey();
+    assert.match(key, /^[0-9a-f]{32}$/);
+    seen.add(key);
+  }
+  assert.equal(seen.size, 1000);
 });

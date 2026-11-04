@@ -18,7 +18,9 @@ func TestBuildEnvIncludesToolboxContractAndUserEnv(t *testing.T) {
 	if !slices.IsSorted(env) {
 		t.Fatalf("env not sorted: %v", env)
 	}
-	want := []string{"SB_TOOLBOX_PORT=2280", "SB_TOOLBOX_TOKEN=tok-123", "SB_SANDBOX_ID=sb-1", "FOO=bar", "BAZ=qux"}
+	// SB_POOL_PARKED= overrides a parked flag inherited from a snapshot of a
+	// Docker warm-pool container, which would otherwise park this sandbox.
+	want := []string{"SB_TOOLBOX_PORT=2280", "SB_TOOLBOX_TOKEN=tok-123", "SB_SANDBOX_ID=sb-1", "SB_POOL_PARKED=", "FOO=bar", "BAZ=qux"}
 	for _, w := range want {
 		if !slices.Contains(env, w) {
 			t.Fatalf("env missing %q: %v", w, env)
@@ -32,12 +34,19 @@ func TestBuildMountsIncludesToolboxAndHostFilesAndUserBinds(t *testing.T) {
 	binds := []mounts.ContainerBind{
 		{HostPath: "/host/data", ContainerPath: "/data", ReadOnly: false},
 		{HostPath: "/host/ro", ContainerPath: "/ro", ReadOnly: true},
+		{ContainerPath: "/run/aerolvm", Tmpfs: true, TmpfsSize: 2 << 20},
 	}
 	ms := buildMounts(cfg, hf, binds)
 
 	byDest := map[string][]string{}
 	for _, m := range ms {
 		byDest[m.Destination] = m.Options
+		if m.Destination == "/run/aerolvm" && (m.Type != "tmpfs" || !slices.Contains(m.Options, "size=2097152") || !slices.Contains(m.Options, "mode=1777")) {
+			t.Fatalf("tmpfs mount = %+v", m)
+		}
+	}
+	if _, ok := byDest["/run/aerolvm"]; !ok {
+		t.Fatal("tmpfs mount missing")
 	}
 	if _, ok := byDest["/.aerol/toolboxd"]; !ok {
 		t.Fatal("toolbox binary mount missing")

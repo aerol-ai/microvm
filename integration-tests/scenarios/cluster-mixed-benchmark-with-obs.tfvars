@@ -35,10 +35,10 @@ caddy_shared_cert_storage = {
   enabled = true
 }
 
-# Per-node: WASM resident host + isolate jail-off + gVisor shim (until releases
-# ship install.sh that bundles containerd-shim-runsc-v1). SB_HOST_RUNTIMES is
-# written by install.sh --with-gvisor; isolate is appended by the daemon when
-# EnableIsolate is on. tfvars are literal-only, hence the repetition.
+# Per-node: WASM resident host + isolate jail-off. install.sh --with-gvisor
+# installs runsc and containerd-shim-runsc-v1 and writes SB_HOST_RUNTIMES;
+# isolate is appended by the daemon when EnableIsolate is on. tfvars are
+# literal-only, hence the repetition.
 #
 # Warm pools for best-case latency: WASM (resident+pool) and isolate pools are
 # on by default; the containerd warm TASK pool is enabled here (seeded with the
@@ -50,10 +50,6 @@ nodes = {
   node1 = {
     role            = "mixed", seed = true, spot = false
     extra_user_data = <<-EOT
-      curl -fsSL https://storage.googleapis.com/gvisor/releases/release/latest/x86_64/containerd-shim-runsc-v1 -o /tmp/runsc-shim
-      curl -fsSL https://storage.googleapis.com/gvisor/releases/release/latest/x86_64/containerd-shim-runsc-v1.sha512 -o /tmp/runsc-shim.sha512
-      (cd /tmp && awk '{print $1"  runsc-shim"}' runsc-shim.sha512 > runsc-shim.check && sha512sum -c runsc-shim.check)
-      sudo install -m 0755 /tmp/runsc-shim /usr/local/bin/containerd-shim-runsc-v1
       echo 'SB_WASM_RESIDENT_HOST_ENABLED=true' | sudo tee -a /etc/sandboxd/cluster.env >/dev/null
       echo 'SB_ISOLATE_USE_JAIL=false' | sudo tee -a /etc/sandboxd/sandboxd.env >/dev/null
       echo 'SB_CONTAINERD_POOL_ENABLED=true' | sudo tee -a /etc/sandboxd/sandboxd.env >/dev/null
@@ -66,10 +62,6 @@ nodes = {
   node2 = {
     role            = "mixed", spot = false
     extra_user_data = <<-EOT
-      curl -fsSL https://storage.googleapis.com/gvisor/releases/release/latest/x86_64/containerd-shim-runsc-v1 -o /tmp/runsc-shim
-      curl -fsSL https://storage.googleapis.com/gvisor/releases/release/latest/x86_64/containerd-shim-runsc-v1.sha512 -o /tmp/runsc-shim.sha512
-      (cd /tmp && awk '{print $1"  runsc-shim"}' runsc-shim.sha512 > runsc-shim.check && sha512sum -c runsc-shim.check)
-      sudo install -m 0755 /tmp/runsc-shim /usr/local/bin/containerd-shim-runsc-v1
       echo 'SB_WASM_RESIDENT_HOST_ENABLED=true' | sudo tee -a /etc/sandboxd/cluster.env >/dev/null
       echo 'SB_ISOLATE_USE_JAIL=false' | sudo tee -a /etc/sandboxd/sandboxd.env >/dev/null
       echo 'SB_CONTAINERD_POOL_ENABLED=true' | sudo tee -a /etc/sandboxd/sandboxd.env >/dev/null
@@ -82,10 +74,6 @@ nodes = {
   node3 = {
     role            = "mixed", spot = false
     extra_user_data = <<-EOT
-      curl -fsSL https://storage.googleapis.com/gvisor/releases/release/latest/x86_64/containerd-shim-runsc-v1 -o /tmp/runsc-shim
-      curl -fsSL https://storage.googleapis.com/gvisor/releases/release/latest/x86_64/containerd-shim-runsc-v1.sha512 -o /tmp/runsc-shim.sha512
-      (cd /tmp && awk '{print $1"  runsc-shim"}' runsc-shim.sha512 > runsc-shim.check && sha512sum -c runsc-shim.check)
-      sudo install -m 0755 /tmp/runsc-shim /usr/local/bin/containerd-shim-runsc-v1
       echo 'SB_WASM_RESIDENT_HOST_ENABLED=true' | sudo tee -a /etc/sandboxd/cluster.env >/dev/null
       echo 'SB_ISOLATE_USE_JAIL=false' | sudo tee -a /etc/sandboxd/sandboxd.env >/dev/null
       echo 'SB_CONTAINERD_POOL_ENABLED=true' | sudo tee -a /etc/sandboxd/sandboxd.env >/dev/null

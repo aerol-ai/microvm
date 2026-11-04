@@ -14,6 +14,18 @@ type bootstrapBackend interface {
 	EnsureForwardJump(userChain string) error
 }
 
+// inputBootstrapBackend creates the AEROLVM-INPUT chain: a regular filter
+// chain jumped from the top of INPUT whose first rule returns established and
+// related traffic, so per-IP drops below it only stop NEW connections from a
+// sandbox to host services. Replies to sandboxd→toolboxd connections are
+// established and keep flowing (plans/egress-domain-filtering.md P0-5).
+type inputBootstrapBackend interface {
+	EnsureInputChain(chain string) error
+}
+
+// inputEstablishedReturn is the static first rule of the input chain.
+var inputEstablishedReturn = []string{"-m", "conntrack", "--ctstate", "RELATED,ESTABLISHED", "-j", "RETURN"}
+
 // execBackend wraps go-iptables for RuleBackend + chain bootstrap.
 type execBackend struct {
 	ipt *iptables.IPTables
@@ -68,6 +80,97 @@ func (e *execBackend) EnsureForwardJump(userChain string) error {
 	}
 	if err := e.ipt.Insert("filter", "FORWARD", 1, spec...); err != nil {
 		return fmt.Errorf("insert forward jump to %s: %w", userChain, err)
+	}
+	return nil
+}
+
+func (e *execBackend) EnsureInputChain(chain string) error {
+	if err := e.EnsureUserChain(chain); err != nil {
+		return err
+	}
+	exists, err := e.ipt.Exists("filter", chain, inputEstablishedReturn...)
+	if err != nil {
+		return fmt.Errorf("check %s established return: %w", chain, err)
+	}
+	if !exists {
+		if err := e.ipt.Insert("filter", chain, 1, inputEstablishedReturn...); err != nil {
+			return fmt.Errorf("insert %s established return: %w", chain, err)
+		}
+	}
+	jump := []string{"-j", chain}
+	exists, err = e.ipt.Exists("filter", "INPUT", jump...)
+	if err != nil {
+		return fmt.Errorf("check input jump to %s: %w", chain, err)
+	}
+	if exists {
+		return nil
+	}
+	if err := e.ipt.Insert("filter", "INPUT", 1, jump...); err != nil {
+		return fmt.Errorf("insert input jump to %s: %w", chain, err)
+	}
+	return nil
+}
+
+// EnsureJumpChain implements floorBackend. A jump that is not the first rule
+// gets a new one on top; the lower one stays (a second jump to the same
+// chain is a no-op), because deleting it by position could race a
+// concurrent insert into a stale position and remove a sandbox's rule.
+func (e *execBackend) EnsureJumpChain(parent, child string) error {
+	if err := e.EnsureUserChain(child); err != nil {
+		return err
+	}
+	rules, err := e.ipt.List("filter", parent)
+	if err != nil {
+		return fmt.Errorf("list %s: %w", parent, err)
+	}
+	for _, r := range rules {
+		if !strings.HasPrefix(r, "-A ") {
+			continue
+		}
+		if strings.TrimSpace(r) == "-A "+parent+" -j "+child {
+			return nil
+		}
+		break // the first rule is something else
+	}
+	jump := []string{"-j", child}
+	if err := e.ipt.Insert("filter", parent, 1, jump...); err != nil {
+		return fmt.Errorf("insert %s jump to %s: %w", parent, child, err)
+	}
+	return nil
+}
+
+// FlushChain implements floorBackend.
+func (e *execBackend) FlushChain(chain string) error {
+	return e.ipt.ClearChain("filter", chain)
+}
+
+// ClearAddressRules implements addressRuleClearer: each chain listed once
+// (`iptables -S`), and every rule keyed by ip deleted by its spec.
+func (e *execBackend) ClearAddressRules(chains []string, ip string) error {
+	for _, chain := range chains {
+		lines, err := e.ipt.List("filter", chain)
+		if err != nil {
+			if ruleNotExist(err) {
+				continue
+			}
+			return fmt.Errorf("list %s: %w", chain, err)
+		}
+		for _, line := range lines {
+			f := strings.Fields(line)
+			if len(f) < 3 || f[0] != "-A" || f[1] != chain {
+				continue
+			}
+			spec := f[2:]
+			for i := range spec {
+				spec[i] = strings.Trim(spec[i], `"`)
+			}
+			if !addressRuleKeyed(spec, ip) {
+				continue
+			}
+			if err := e.ipt.Delete("filter", chain, spec...); err != nil && !ruleNotExist(err) {
+				return fmt.Errorf("delete %s rule: %w", chain, err)
+			}
+		}
 	}
 	return nil
 }

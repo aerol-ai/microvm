@@ -21,6 +21,7 @@ import (
 	"github.com/aerol-ai/microvm/internal/config"
 	"github.com/aerol-ai/microvm/internal/service"
 	"github.com/aerol-ai/microvm/internal/store"
+	"github.com/aerol-ai/microvm/pkg/api/apihttp"
 	"github.com/aerol-ai/microvm/pkg/caddy"
 	"github.com/aerol-ai/microvm/pkg/capacity"
 	"github.com/aerol-ai/microvm/pkg/createtiming"
@@ -32,14 +33,18 @@ import (
 
 type clusterStub struct {
 	*cluster.Noop
-	owner      cluster.OwnerInfo
-	ownerErr   error
-	forwards   int
-	lastTarget cluster.Endpoint
-	deletes    int
-	deleteErr  error
-	cancels    int
-	cancelErr  error
+	owner    cluster.OwnerInfo
+	ownerErr error
+	// ownerMisses is how many OwnerOf reads answer ErrUnknownSandbox before
+	// owner: a voter's FSM copy trailing the leader by an apply.
+	ownerMisses int
+	ownerReads  int
+	forwards    int
+	lastTarget  cluster.Endpoint
+	deletes     int
+	deleteErr   error
+	cancels     int
+	cancelErr   error
 
 	selectTarget cluster.PlacementTarget
 	selectErr    error
@@ -80,6 +85,11 @@ type recordCall struct {
 }
 
 func (s *clusterStub) OwnerOf(_ string) (cluster.OwnerInfo, error) {
+	s.ownerReads++
+	if s.ownerMisses > 0 {
+		s.ownerMisses--
+		return cluster.OwnerInfo{}, cluster.ErrUnknownSandbox
+	}
 	if s.ownerErr != nil {
 		return cluster.OwnerInfo{}, s.ownerErr
 	}
@@ -214,7 +224,12 @@ func seedReservedPlacement(s *clusterStub, sandboxID string) {
 	}
 }
 
-func (s *clusterStub) RecordPlacement(_ context.Context, sandboxID string, spec *models.CreateSandboxRequest, placementSecrets cluster.PlacementSecrets) error {
+func (s *clusterStub) RecordPlacement(ctx context.Context, sandboxID string, spec *models.CreateSandboxRequest, placementSecrets cluster.PlacementSecrets) error {
+	// Honor the context like the real Raft-backed promote: an expired promote
+	// budget must surface, so the B13 fresh-timeout fix is observable.
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if s.onRecord != nil {
 		s.onRecord()
 	}
@@ -244,6 +259,15 @@ type fakeRuntime struct {
 	// promote-waits-for-create regression test reads it from the
 	// RecordPlacement hook.
 	createFinished atomic.Bool
+	// hold, when set, parks every Create until it is closed, and entered is
+	// closed when the first one parks: a create still running while a retry
+	// of it arrives. failOnce fails the first Create that sees it. creates
+	// counts Create calls.
+	hold      chan struct{}
+	entered   chan struct{}
+	enterOnce sync.Once
+	failOnce  error
+	creates   atomic.Int32
 }
 
 func newFakeRuntime() *fakeRuntime {
@@ -251,6 +275,18 @@ func newFakeRuntime() *fakeRuntime {
 }
 
 func (f *fakeRuntime) Create(_ context.Context, _ models.CreateSandboxRequest, sandboxID, _ string, _ []mounts.ContainerBind) (*models.SandboxRuntimeState, error) {
+	f.creates.Add(1)
+	if f.hold != nil {
+		f.enterOnce.Do(func() { close(f.entered) })
+		<-f.hold
+	}
+	f.mu.Lock()
+	failErr := f.failOnce
+	f.failOnce = nil
+	f.mu.Unlock()
+	if failErr != nil {
+		return nil, failErr
+	}
 	if f.createDelay > 0 {
 		time.Sleep(f.createDelay)
 	}
@@ -385,6 +421,11 @@ func newCreateService(t *testing.T, c cluster.Client, withCipher bool) (*service
 
 func newCreateServiceWithRuntime(t *testing.T, c cluster.Client, rt *fakeRuntime, withCipher bool) (*service.Service, *store.Store) {
 	t.Helper()
+	return newCreateServiceWithConfig(t, c, rt, withCipher, nil)
+}
+
+func newCreateServiceWithConfig(t *testing.T, c cluster.Client, rt *fakeRuntime, withCipher bool, mutate func(*config.Config)) (*service.Service, *store.Store) {
+	t.Helper()
 	dir := t.TempDir()
 	st, err := store.Open(filepath.Join(dir, "state.db"))
 	if err != nil {
@@ -411,6 +452,9 @@ func newCreateServiceWithRuntime(t *testing.T, c cluster.Client, rt *fakeRuntime
 	}
 
 	cfg := config.Config{EnableCaddy: false, EnableCluster: c != nil, ToolboxPort: 2280}
+	if mutate != nil {
+		mutate(&cfg)
+	}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	svc := service.New(cfg, logger, st, rt, nil, caddy.New(cfg), cipher, mgr, nil)
 	if c != nil {
@@ -483,7 +527,7 @@ func TestRouteExistingPlacement(t *testing.T) {
 			var status int
 			var message string
 
-			handled, local := routeExistingPlacement(w, r, tc.stub, "sb-1", func(_ http.ResponseWriter, code int, msg string) {
+			handled, local := routeExistingPlacement(w, r, tc.stub, "sb-1", func(_ http.ResponseWriter, code int, _, msg string) {
 				status = code
 				message = msg
 				w.WriteHeader(code)
@@ -533,7 +577,7 @@ func TestPrepare_ForwardedHeaderValidation(t *testing.T) {
 		r.Header.Set(HeaderTarget, "node-b")
 		w := httptest.NewRecorder()
 		var status int
-		_, ok := Prepare(w, r, svc, baseReq, func(_ http.ResponseWriter, code int, _ string) {
+		_, ok := Prepare(w, r, svc, baseReq, func(_ http.ResponseWriter, code int, _, _ string) {
 			status = code
 		}, PrepareOptions{})
 		if ok {
@@ -549,7 +593,7 @@ func TestPrepare_ForwardedHeaderValidation(t *testing.T) {
 		r.Header.Set(HeaderTarget, "node-a")
 		w := httptest.NewRecorder()
 		var status int
-		_, ok := Prepare(w, r, svc, baseReq, func(_ http.ResponseWriter, code int, _ string) {
+		_, ok := Prepare(w, r, svc, baseReq, func(_ http.ResponseWriter, code int, _, _ string) {
 			status = code
 		}, PrepareOptions{})
 		if ok {
@@ -597,7 +641,7 @@ func TestPrepare_GuardsAndPlacementBranches(t *testing.T) {
 		_, ok := Prepare(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/v1/sandboxes", nil), svc, models.CreateSandboxRequest{
 			Image:                 "e2b/sb-local:default",
 			ImageDistributionMode: models.ImageDistributionLocalOnly,
-		}, func(_ http.ResponseWriter, code int, _ string) {
+		}, func(_ http.ResponseWriter, code int, _, _ string) {
 			status = code
 		}, PrepareOptions{})
 		if ok {
@@ -679,9 +723,11 @@ func TestPrepare_GuardsAndPlacementBranches(t *testing.T) {
 				svc := testServiceWithCluster(stub)
 				w := httptest.NewRecorder()
 				status := 0
-				_, ok := Prepare(w, httptest.NewRequest(http.MethodPost, "/v1/sandboxes", nil), svc, baseReq, func(_ http.ResponseWriter, code int, _ string) {
+				writer := func(rw http.ResponseWriter, code int, errCode, msg string) {
 					status = code
-				}, PrepareOptions{})
+					apihttp.WriteErrorCode(rw, code, errCode, msg)
+				}
+				_, ok := Prepare(w, httptest.NewRequest(http.MethodPost, "/v1/sandboxes", nil), svc, baseReq, writer, PrepareOptions{})
 				if ok {
 					t.Fatal("Prepare returned ok=true, want false")
 				}
@@ -774,7 +820,7 @@ func TestPrepareLocalImageCoverageBranches(t *testing.T) {
 		var status int
 		_, ok := Prepare(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/v1/sandboxes", nil), svc, models.CreateSandboxRequest{
 			Image: docker.BuiltImageNamespace + "/abc:latest",
-		}, func(_ http.ResponseWriter, code int, _ string) { status = code }, PrepareOptions{})
+		}, func(_ http.ResponseWriter, code int, _, _ string) { status = code }, PrepareOptions{})
 		if ok || status != http.StatusServiceUnavailable {
 			t.Fatalf("ok=%v status=%d, want 503", ok, status)
 		}
@@ -793,7 +839,7 @@ func TestPrepareLocalImageCoverageBranches(t *testing.T) {
 		var status int
 		_, ok := Prepare(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/v1/sandboxes", nil), svc, models.CreateSandboxRequest{
 			Image: docker.BuiltImageNamespace + "/abc:latest",
-		}, func(_ http.ResponseWriter, code int, _ string) { status = code }, PrepareOptions{})
+		}, func(_ http.ResponseWriter, code int, _, _ string) { status = code }, PrepareOptions{})
 		if ok || status != http.StatusServiceUnavailable {
 			t.Fatalf("ok=%v status=%d, want 503", ok, status)
 		}
@@ -811,7 +857,7 @@ func TestPrepareLocalImageCoverageBranches(t *testing.T) {
 		var status int
 		_, ok := Prepare(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/v1/sandboxes", nil), svc, models.CreateSandboxRequest{
 			Image: docker.BuiltImageNamespace + "/abc:latest",
-		}, func(_ http.ResponseWriter, code int, _ string) { status = code }, PrepareOptions{})
+		}, func(_ http.ResponseWriter, code int, _, _ string) { status = code }, PrepareOptions{})
 		if ok || status != http.StatusInternalServerError {
 			t.Fatalf("ok=%v status=%d, want 500", ok, status)
 		}
@@ -905,11 +951,16 @@ func TestPrepare_ReservePaths(t *testing.T) {
 	})
 
 	t.Run("reserve_error_shapes", func(t *testing.T) {
+		prevWait := ownerCatchUpWait
+		ownerCatchUpWait = 100 * time.Millisecond
+		t.Cleanup(func() { ownerCatchUpWait = prevWait })
 		tests := []struct {
 			name           string
 			err            error
 			opts           PrepareOptions
 			owner          cluster.OwnerInfo
+			ownerErr       error
+			ownerMisses    int
 			wantStatus     int
 			wantRetryAfter string
 			wantOK         bool
@@ -932,6 +983,27 @@ func TestPrepare_ReservePaths(t *testing.T) {
 				wantStatus:   http.StatusAccepted,
 				wantForwards: 1,
 			},
+			// UC-367 on cluster-3-mixed: the leader reported the conflict
+			// before this voter's FSM copy applied the reservation, so the
+			// first owner reads miss. The retry waits for the copy and is
+			// routed, instead of answering 409.
+			{
+				name:         "preferred_id_conflict_owner_appears_after_apply_lag_forwards",
+				err:          cluster.ErrReservationConflict,
+				opts:         PrepareOptions{PreferredSandboxID: "sb-fixed"},
+				owner:        cluster.OwnerInfo{NodeID: "node-b", APIURL: "http://node-b"},
+				ownerMisses:  3,
+				wantStatus:   http.StatusAccepted,
+				wantForwards: 1,
+			},
+			{
+				name:           "preferred_id_conflict_no_owner_is_retryable_not_409",
+				err:            cluster.ErrReservationConflict,
+				opts:           PrepareOptions{PreferredSandboxID: "sb-fixed"},
+				ownerErr:       cluster.ErrUnknownSandbox,
+				wantStatus:     http.StatusServiceUnavailable,
+				wantRetryAfter: "1",
+			},
 			{
 				name:       "preferred_id_conflict_owner_without_url_returns_503",
 				err:        cluster.ErrReservationConflict,
@@ -939,6 +1011,35 @@ func TestPrepare_ReservePaths(t *testing.T) {
 				owner:      cluster.OwnerInfo{NodeID: "node-b"},
 				wantStatus: http.StatusServiceUnavailable,
 			},
+			// A keyed retry whose reservation is pending on the same target:
+			// the FSM answers ErrIncarnationConflict (each reserve mints a new
+			// incarnation). It goes to the reservation's owner like a
+			// conflict, instead of a bare 503.
+			{
+				name:           "preferred_id_incarnation_conflict_local_owner_reuses_reservation",
+				err:            fmt.Errorf("%w: reservation retry changed its incarnation", cluster.ErrIncarnationConflict),
+				opts:           PrepareOptions{PreferredSandboxID: "sb-fixed"},
+				owner:          cluster.OwnerInfo{NodeID: "node-a", IsSelf: true},
+				wantOK:         true,
+				wantDecisionID: "sb-fixed",
+			},
+			{
+				name:         "preferred_id_incarnation_conflict_remote_owner_forwards",
+				err:          fmt.Errorf("%w: reservation retry changed its incarnation", cluster.ErrIncarnationConflict),
+				opts:         PrepareOptions{PreferredSandboxID: "sb-fixed"},
+				owner:        cluster.OwnerInfo{NodeID: "node-b", APIURL: "http://node-b"},
+				wantStatus:   http.StatusAccepted,
+				wantForwards: 1,
+			},
+			{
+				name:           "preferred_id_incarnation_conflict_reservation_gone_retries",
+				err:            fmt.Errorf("%w: reservation retry changed its incarnation", cluster.ErrIncarnationConflict),
+				opts:           PrepareOptions{PreferredSandboxID: "sb-fixed"},
+				ownerErr:       cluster.ErrUnknownSandbox,
+				wantStatus:     http.StatusServiceUnavailable,
+				wantRetryAfter: "1",
+			},
+			{name: "fresh_id_incarnation_conflict_stays_generic", err: cluster.ErrIncarnationConflict, wantStatus: http.StatusServiceUnavailable},
 			{name: "name_conflict", err: cluster.ErrNameConflict, wantStatus: http.StatusConflict},
 			{name: "reservation_conflict", err: cluster.ErrReservationConflict, wantStatus: http.StatusConflict},
 			{name: "backpressure", err: cluster.ErrCreateBackpressure, wantStatus: http.StatusTooManyRequests, wantRetryAfter: "5"},
@@ -954,11 +1055,13 @@ func TestPrepare_ReservePaths(t *testing.T) {
 					selectTarget: cluster.PlacementTarget{NodeID: "node-a", APIURL: "http://node-a", IsSelf: true},
 					reserveErr:   tc.err,
 					owner:        tc.owner,
+					ownerErr:     tc.ownerErr,
+					ownerMisses:  tc.ownerMisses,
 				}
 				svc := testServiceWithCluster(stub)
 				w := httptest.NewRecorder()
 				var status int
-				decision, ok := Prepare(w, httptest.NewRequest(http.MethodPost, "/v1/sandboxes", nil), svc, models.CreateSandboxRequest{Image: "alpine:3.20"}, func(_ http.ResponseWriter, code int, _ string) {
+				decision, ok := Prepare(w, httptest.NewRequest(http.MethodPost, "/v1/sandboxes", nil), svc, models.CreateSandboxRequest{Image: "alpine:3.20"}, func(_ http.ResponseWriter, code int, _, _ string) {
 					status = code
 				}, tc.opts)
 				if ok != tc.wantOK {
@@ -1584,9 +1687,12 @@ func TestCreateOnSelectedNode_ReservedResolvePlatformVolumesFailure(t *testing.T
 	t.Cleanup(func() { _ = st.Close() })
 
 	cfg := config.Config{
-		EnableCaddy: false,
-		ToolboxPort: 2280,
-		PATToken:    "operator-pat",
+		// A reservation only exists in cluster mode; production never
+		// attaches a cluster client with EnableCluster off.
+		EnableCluster: true,
+		EnableCaddy:   false,
+		ToolboxPort:   2280,
+		PATToken:      "operator-pat",
 		PlatformVolumes: config.PlatformVolumesConfig{
 			Enabled:  true,
 			Backend:  config.PlatformVolumesBackendS3,
@@ -1639,4 +1745,131 @@ func TestOverlapFailureHelpers(t *testing.T) {
 	if errString(nil) != "" || errString(base) != "boom" {
 		t.Fatalf("errString: %q / %q", errString(nil), errString(base))
 	}
+}
+
+// TestCapacityRequestFromCreateEgressGateway: the public create path marks
+// hostname-filtered container creates so placement only picks nodes with a
+// ready gateway (plans/egress-domain-filtering.md CEO D20).
+func TestCapacityRequestFromCreateEgressGateway(t *testing.T) {
+	if !CapacityRequestFromCreate(models.CreateSandboxRequest{NetworkAllowOut: []string{"pypi.org"}}).NeedsEgressGateway {
+		t.Fatal("hostname allow list must need the gateway")
+	}
+	for _, req := range []models.CreateSandboxRequest{
+		{NetworkAllowOut: []string{"10.0.0.0/8"}},
+		{Runtime: models.RuntimeWasm, NetworkAllowOut: []string{"pypi.org"}},
+		{NetworkBlockAll: true, NetworkAllowOut: []string{"pypi.org"}},
+	} {
+		if CapacityRequestFromCreate(req).NeedsEgressGateway {
+			t.Fatalf("%+v must not need the gateway", req)
+		}
+	}
+}
+
+func TestWriteNoEgressGateway(t *testing.T) {
+	rr := httptest.NewRecorder()
+	if writeNoEgressGateway(rr, cluster.ErrNoPlacementTarget, apihttp.WriteErrorCode) {
+		t.Fatal("a plain placement failure is not a gateway failure")
+	}
+	if !writeNoEgressGateway(rr, cluster.ErrNoEgressGatewayTarget, apihttp.WriteErrorCode) {
+		t.Fatal("gateway sentinel must be written")
+	}
+	var body models.ErrorResponse
+	_ = json.Unmarshal(rr.Body.Bytes(), &body)
+	if rr.Code != http.StatusServiceUnavailable || body.Code != models.ErrorCodeEgressGatewayUnavailable || rr.Header().Get("Retry-After") == "" {
+		t.Fatalf("status=%d code=%q", rr.Code, body.Code)
+	}
+}
+
+// TestOverlapCreateAndPromote_PromoteGetsFreshTimeoutAfterSlowCreate pins B13:
+// the promote runs after the create+seal join on its own fresh budget, so a
+// create slower than the commit budget no longer expires the promote and fails
+// it even though the sandbox is up.
+// A retry that reaches OverlapCreateAndPromote with an id whose sandbox already
+// exists (the reservation-conflict idempotency replay) must return the existing
+// sandbox without re-binding or re-promoting — the reservation is already
+// consumed on the real cluster, so a second ReservedSecretBinding/RecordPlacement
+// fails with "reserved placement is no longer authoritative" (found live on the
+// single-node 1-node-cluster path). The stub does not model reservation
+// consumption, so this asserts the replay guard fires before any promote.
+func TestOverlapCreateAndPromote_IdempotentReplayReturnsExisting(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	stub := &clusterStub{Noop: cluster.NewNoop("node-a", "http://node-a", "")}
+	seedReservedPlacement(stub, "sb-replay")
+	svc, _ := newCreateServiceWithRuntime(t, stub, newFakeRuntime(), true)
+	req := models.CreateSandboxRequest{Image: "alpine:3.20"}
+
+	first, err := OverlapCreateAndPromote(context.Background(), svc, logger, req, "sb-replay", OverlapOptions{PromoteWithSpec: true})
+	if err != nil {
+		t.Fatalf("first create: %v", err)
+	}
+	promotes := len(stub.recordCalls)
+
+	second, err := OverlapCreateAndPromote(context.Background(), svc, logger, req, "sb-replay", OverlapOptions{PromoteWithSpec: true})
+	if err != nil {
+		t.Fatalf("idempotent replay: %v", err)
+	}
+	if second.Sandbox.ID != "sb-replay" || second.Sandbox.ID != first.Sandbox.ID {
+		t.Fatalf("replay returned %q, want the existing %q", second.Sandbox.ID, first.Sandbox.ID)
+	}
+	if len(stub.recordCalls) != promotes {
+		t.Fatalf("replay promoted again (%d → %d); it must return the existing sandbox without re-promoting", promotes, len(stub.recordCalls))
+	}
+}
+
+func TestOverlapCreateAndPromote_PromoteGetsFreshTimeoutAfterSlowCreate(t *testing.T) {
+	prev := overlapCommitTimeout
+	overlapCommitTimeout = 50 * time.Millisecond
+	defer func() { overlapCommitTimeout = prev }()
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	stub := &clusterStub{Noop: cluster.NewNoop("node-a", "http://node-a", "")}
+	seedReservedPlacement(stub, "sb-slow-create")
+	rt := newFakeRuntime()
+	rt.createDelay = 200 * time.Millisecond // > overlapCommitTimeout
+	svc, _ := newCreateServiceWithRuntime(t, stub, rt, true)
+
+	resp, err := OverlapCreateAndPromote(context.Background(), svc, logger,
+		models.CreateSandboxRequest{Image: "alpine:3.20"}, "sb-slow-create", OverlapOptions{PromoteWithSpec: true})
+	if err != nil {
+		t.Fatalf("OverlapCreateAndPromote with a create slower than the commit budget: %v", err)
+	}
+	if resp.Sandbox.ID != "sb-slow-create" {
+		t.Fatalf("sandbox id = %q", resp.Sandbox.ID)
+	}
+	if len(stub.recordCalls) != 1 {
+		t.Fatalf("RecordPlacement calls = %d, want 1 (promote must succeed on its fresh budget)", len(stub.recordCalls))
+	}
+}
+
+// awaitOwner returns as soon as the owner shows, gives up at its budget, and
+// never outlives the request.
+func TestAwaitOwner(t *testing.T) {
+	t.Run("returns_once_the_copy_catches_up", func(t *testing.T) {
+		stub := &clusterStub{Noop: cluster.NewNoop("node-a", "http://node-a", ""), ownerMisses: 2}
+		awaitOwner(context.Background(), stub, "sb-x", time.Second)
+		if stub.ownerReads != 3 {
+			t.Fatalf("OwnerOf reads = %d, want 3 (two misses, then the owner)", stub.ownerReads)
+		}
+	})
+	t.Run("gives_up_at_its_budget", func(t *testing.T) {
+		stub := &clusterStub{Noop: cluster.NewNoop("node-a", "http://node-a", ""), ownerErr: cluster.ErrUnknownSandbox}
+		start := time.Now()
+		awaitOwner(context.Background(), stub, "sb-x", 60*time.Millisecond)
+		if took := time.Since(start); took > time.Second {
+			t.Fatalf("awaitOwner took %v past a 60ms budget", took)
+		}
+		if stub.ownerReads < 2 {
+			t.Fatalf("OwnerOf reads = %d, want it to look again before giving up", stub.ownerReads)
+		}
+	})
+	t.Run("stops_with_the_request", func(t *testing.T) {
+		stub := &clusterStub{Noop: cluster.NewNoop("node-a", "http://node-a", ""), ownerErr: cluster.ErrUnknownSandbox}
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		start := time.Now()
+		awaitOwner(ctx, stub, "sb-x", time.Minute)
+		if took := time.Since(start); took > time.Second {
+			t.Fatalf("awaitOwner ignored a cancelled request for %v", took)
+		}
+	})
 }

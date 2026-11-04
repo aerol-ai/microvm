@@ -63,7 +63,7 @@ func TestGetSandboxAuditRateLimit429RetryAfter(t *testing.T) {
 		AuditLimiter: limiter,
 		Auth: func(next http.Handler) http.Handler {
 			return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				ctx := controlplane.ContextWithAccess(r.Context(), controlplane.Access{Operator: true})
+				ctx := controlplane.ContextWithAccess(r.Context(), controlplane.Access{Fleet: true})
 				next.ServeHTTP(w, r.WithContext(ctx))
 			})
 		},
@@ -110,7 +110,7 @@ func TestGetSandboxAuditReturnsEvents(t *testing.T) {
 		rr := httptest.NewRecorder()
 		req := httptest.NewRequest(http.MethodGet, "/v1/sandboxes/"+sbID+"/audit", nil)
 		req.SetPathValue("id", sbID)
-		req = req.WithContext(controlplane.ContextWithAccess(req.Context(), controlplane.Access{Operator: true}))
+		req = req.WithContext(controlplane.ContextWithAccess(req.Context(), controlplane.Access{Fleet: true}))
 		h.getSandboxAudit(rr, req)
 		if rr.Code != http.StatusOK {
 			t.Fatalf("status = %d body=%s", rr.Code, rr.Body.String())

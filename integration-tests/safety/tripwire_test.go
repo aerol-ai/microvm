@@ -73,6 +73,20 @@ func TestProdDomainCollisionAborts(t *testing.T) {
 	}
 }
 
+// An empty name collides with nothing, so the collision tripwire alone passed
+// a run that had leased no domain at all (2026-10-16). A scenario with no
+// domain passes the none.itest.invalid placeholder, which must keep passing.
+func TestEmptyLeasedDomainAborts(t *testing.T) {
+	if code := runCheck(t, "integration/x/terraform.tfstate",
+		"", "sandbox.example.com", "aerolvm-itest-x"); code == 0 {
+		t.Fatal("empty leased domain was NOT rejected")
+	}
+	if code := runCheck(t, "integration/local-mode/terraform.tfstate",
+		"none.itest.invalid", "sandbox.example.com", "aerolvm-itest-local-mode"); code != 0 {
+		t.Fatalf("the no-domain placeholder was rejected (exit %d)", code)
+	}
+}
+
 func TestClusterNameWithoutItestMarkerAborts(t *testing.T) {
 	if code := runCheck(t, "integration/x/terraform.tfstate",
 		"abc.itest.example.com", "sandbox.example.com", "aerolvm-prod"); code == 0 {

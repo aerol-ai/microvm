@@ -45,6 +45,7 @@ func (d *Driver) execSandbox(ctx context.Context, sandboxID string, req models.E
 			HostPath:  inst.workDir,
 		}},
 	}, inst.memoryMB, wallTimeout)
+	d.bindNetworkBlocks(sandboxID, &caps)
 
 	client := d.newWorkerClient(inst.socketPath)
 	start := time.Now()

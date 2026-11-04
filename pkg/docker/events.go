@@ -88,12 +88,16 @@ func (c *Client) StreamEvents(ctx context.Context, out chan<- DockerEvent) error
 
 // rawDockerEvent matches the subset of Docker's event payload we care about.
 // Docker uses both "status" (legacy) and "Action" (newer) for the action name.
+// rawDockerEvent is one /events frame. Status and ID are the legacy
+// top-level fields, deprecated since API v1.22 and gone from v1.52 (Docker
+// 29); Action and Actor.ID carry the same values on every version.
 type rawDockerEvent struct {
 	Status string `json:"status"`
 	Action string `json:"Action"`
 	ID     string `json:"id"`
 	Time   int64  `json:"time"`
 	Actor  struct {
+		ID         string            `json:"ID"`
 		Attributes map[string]string `json:"Attributes"`
 	} `json:"Actor"`
 }
@@ -103,7 +107,14 @@ func (r rawDockerEvent) normalize() (DockerEvent, bool) {
 	if action == "" {
 		action = r.Status
 	}
-	if action == "" || r.ID == "" {
+	// Actor.ID first: reading only the legacy "id" dropped every event on
+	// Docker 29, so stops never cleared a sandbox's egress rules (UC-206)
+	// and no die/destroy/start handler ran at all.
+	containerID := r.Actor.ID
+	if containerID == "" {
+		containerID = r.ID
+	}
+	if action == "" || containerID == "" {
 		return DockerEvent{}, false
 	}
 
@@ -128,7 +139,7 @@ func (r rawDockerEvent) normalize() (DockerEvent, bool) {
 	}
 
 	return DockerEvent{
-		ContainerID: r.ID,
+		ContainerID: containerID,
 		SandboxID:   sandboxID,
 		Action:      action,
 		ExitCode:    exitCode,

@@ -5,6 +5,7 @@ use std::fmt;
 use std::path::Path;
 use std::sync::{mpsc, Arc};
 use std::thread;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures_util::{SinkExt, StreamExt};
 use reqwest::blocking::{
@@ -24,14 +25,20 @@ use tokio_tungstenite::tungstenite::{Error as WebSocketError, Message};
 pub use image::Image;
 pub use types::CreateSandboxResponse;
 use types::{CustomDomainListWire, ExposePortResponseWire};
+pub use types::{ApiToken, ApiTokenList, CreateApiTokenOptions, CreatedApiToken, WhoAmI, WhoAmIPrincipal};
 pub use types::{
-    AddCustomDomainOptions, BuildImageOptions, BuildImagePushOptions, BuildImageResult,
+    AddCustomDomainOptions, AuditCoverage, AuditEvent, AuditOptions, AuditPage, BuildImageOptions,
+    EgressInject, EgressProfile, EgressProfileList, EgressProfileOptions, EgressProfileRef, EgressRule,
+    ListEgressProfilesOptions, ListSnapshotsOptions, SnapshotList, NetworkLearned, NetworkLearnedEntry,
+    NetworkPolicy, NetworkPolicyCheckOptions, NetworkPolicyCheckResult, NetworkPolicyOptions,
+    BuildImagePushOptions, BuildImageResult,
     CloneGeneration, ClientConfig, CreateOptions, CreateSessionOptions, CreateTemplateOptions,
-    CreateWasmModuleOptions,
+    CreateSnapshotOptions, CreateWasmModuleOptions,
     CustomDomain,
     CustomDomainDnsRecords,
     CustomDomainStatus, DnsRecord, ExecExitInfo, ExecRequest, ExecResult, ExposeOptions,
-    ExposeProtocol, ExposeResult, ExposedPort, Failover, HealthStatus, IngressTarget, Lifecycle,
+    ExposeProtocol, ExposeResult, ExposedPort, Failover, GPUOptions, GPUVendor, HealthStatus,
+    IngressTarget, Lifecycle,
     MountSpec, MountSpecRedacted, MountType, NetworkUsage, PlatformVolumeMount,
     RegisterSnapshotOptions, RegistryAuth,
     ResizeOptions, RetryConfig, Sandbox as SandboxData, SandboxSnapshot, Session, SessionList,
@@ -41,6 +48,21 @@ pub use types::{
 };
 
 const DEFAULT_API_URL: &str = "http://127.0.0.1:21212";
+
+/// The request header that selects which of a credential's teams a request
+/// acts for. Keep in sync with `pkg/api.HeaderTeam` on the server.
+pub const TEAM_HEADER: &str = "X-AerolVM-Team";
+
+/// The header a sandbox create carries so the server can recognise a retry
+/// of it. Keep in sync with `clustercreate.HeaderIdempotencyKey` on the
+/// server.
+pub const IDEMPOTENCY_KEY_HEADER: &str = "Idempotency-Key";
+
+/// A fresh create key: 128 random bits as 32 lowercase hex characters.
+fn new_idempotency_key() -> String {
+    format!("{:032x}", rand::random::<u128>())
+}
+
 const STREAM_PREFIX_STDOUT: u8 = 0x01;
 const STREAM_PREFIX_STDERR: u8 = 0x02;
 
@@ -71,11 +93,25 @@ pub struct SessionAttachOptions {
     pub rows: Option<u16>,
 }
 
+/// Every failure a [`Client`] call can return.
+///
+/// It is `#[non_exhaustive]`: a later SDK may add a variant without a
+/// breaking release, so a `match` on it needs a wildcard arm.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum Error {
     Reqwest(reqwest::Error),
     MissingToken,
-    Api(String),
+    /// The server, or a proxy in front of it, answered with an HTTP error
+    /// status. [`ApiError`] carries the status, the server's stable error
+    /// code and its `Retry-After`.
+    Api(ApiError),
+    /// A failure the SDK client found itself rather than an HTTP error
+    /// response: a missing or invalid argument, a server that lacks a
+    /// feature (Image builds, name lookup), an incomplete cluster list, or a
+    /// WebSocket handshake or stream failure. Before 0.8.0 these were
+    /// `Error::Api(String)`.
+    Client(String),
     WebSocket(WebSocketError),
     Http(http::Error),
     SerdeJson(serde_json::Error),
@@ -89,9 +125,11 @@ impl fmt::Display for Error {
             Error::Reqwest(err) => write!(f, "HTTP error: {}", err),
             Error::MissingToken => write!(
                 f,
-                "PAT token is required. Set SB_PAT_TOKEN or pass pat_token."
+                "PAT token is required. Set SB_PAT_TOKEN or SB_API_TOKEN, or pass pat_token."
             ),
-            Error::Api(message) => write!(f, "API error: {}", message),
+            Error::Api(err) => write!(f, "API error: {}", err),
+            // The text these errors had as Error::Api(String) before 0.8.0.
+            Error::Client(message) => write!(f, "API error: {}", message),
             Error::WebSocket(err) => write!(f, "WebSocket error: {}", err),
             Error::Http(err) => write!(f, "HTTP request build error: {}", err),
             Error::SerdeJson(err) => write!(f, "JSON error: {}", err),
@@ -102,6 +140,80 @@ impl fmt::Display for Error {
 }
 
 impl std::error::Error for Error {}
+
+/// An HTTP error response from the AerolVM server, returned as
+/// [`Error::Api`].
+///
+/// Branch on [`ApiError::code`], not on the message: the code is a stable
+/// identifier such as `"idempotency_key_reused"` or `"overloaded"`, the
+/// message is wording for a person. It displays as
+/// `"<status>: <message>"`, the same text `Error::Api(String)` carried for
+/// these errors before 0.8.0.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ApiError {
+    status: reqwest::StatusCode,
+    code: Option<String>,
+    message: String,
+    retry_after: Option<Duration>,
+}
+
+impl ApiError {
+    /// Reads an error response: the server's `{"error": ..., "code": ...}`
+    /// body, or, for any other body (a proxy's error page), the body text as
+    /// the message with no code.
+    fn from_response(status: reqwest::StatusCode, retry_after: Option<&str>, body: &str) -> Self {
+        let mut message = body.to_string();
+        let mut code = None;
+        if let Ok(value) = serde_json::from_str::<Value>(body) {
+            if let Some(error) = value.get("error").and_then(|entry| entry.as_str()) {
+                message = error.to_string();
+                code = value
+                    .get("code")
+                    .and_then(|entry| entry.as_str())
+                    .filter(|entry| !entry.is_empty())
+                    .map(String::from);
+            }
+        }
+        ApiError {
+            status,
+            code,
+            message,
+            retry_after: retry_after.and_then(|value| parse_retry_after(value, SystemTime::now())),
+        }
+    }
+
+    /// The HTTP status of the final attempt, such as 422 or 503.
+    pub fn status(&self) -> u16 {
+        self.status.as_u16()
+    }
+
+    /// The server's stable error code, or `None` when the response has
+    /// none: many errors are only ever shown to a person, and a proxy's
+    /// error page has no code.
+    pub fn code(&self) -> Option<&str> {
+        self.code.as_deref()
+    }
+
+    /// The server's message, or the response body when it was not the
+    /// server's JSON error.
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+
+    /// How long the response's `Retry-After` header asked the caller to
+    /// wait, or `None` without a usable header.
+    pub fn retry_after(&self) -> Option<Duration> {
+        self.retry_after
+    }
+}
+
+impl fmt::Display for ApiError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}: {}", self.status, self.message)
+    }
+}
+
+impl std::error::Error for ApiError {}
 
 impl From<reqwest::Error> for Error {
     fn from(err: reqwest::Error) -> Self {
@@ -160,10 +272,270 @@ mod api_v1 {
     pub const PATH_PREFIX: &str = "/v1";
 }
 
+/// The bearer a client sends: the explicit value, else `SB_PAT_TOKEN`, else
+/// its alias `SB_API_TOKEN`. A blank value counts as unset. `SB_PAT_TOKEN`
+/// wins over the alias so a setup that already exports it keeps its token.
+fn resolve_token(explicit: Option<String>, env: impl Fn(&str) -> Option<String>) -> Option<String> {
+    let set = |value: &String| !value.trim().is_empty();
+    explicit
+        .filter(set)
+        .or_else(|| env("SB_PAT_TOKEN").filter(set))
+        .or_else(|| env("SB_API_TOKEN").filter(set))
+}
+
+/// The team a client sends in [`TEAM_HEADER`]: the explicit value, else
+/// `SB_TEAM`, trimmed; `None` (no header) when both are blank.
+fn resolve_team(explicit: Option<String>, env: impl Fn(&str) -> Option<String>) -> Option<String> {
+    let trimmed = |value: String| Some(value.trim().to_string()).filter(|v| !v.is_empty());
+    explicit
+        .and_then(trimmed)
+        .or_else(|| env("SB_TEAM").and_then(trimmed))
+}
+
+/// Adds the client's credential and team selection to a request. Every HTTP
+/// call goes through it, so a client built with a team never sends a
+/// request that acts for another one.
+trait Authorize {
+    fn authorize(self, client: &Client) -> Self;
+}
+
+impl Authorize for reqwest::blocking::RequestBuilder {
+    fn authorize(self, client: &Client) -> Self {
+        let builder = self.bearer_auth(&client.pat_token);
+        match &client.team {
+            Some(team) => builder.header(TEAM_HEADER, team),
+            None => builder,
+        }
+    }
+}
+
+/// The WebSocket handshake for `ws_url`, carrying the same credential and
+/// team header as every HTTP request.
+fn websocket_request(
+    ws_url: String,
+    pat_token: &str,
+    team: Option<&str>,
+) -> Result<tokio_tungstenite::tungstenite::handshake::client::Request, Error> {
+    let mut request = ws_url.into_client_request().map_err(Error::WebSocket)?;
+    request.headers_mut().insert(
+        http::header::AUTHORIZATION,
+        http::HeaderValue::from_str(&format!("Bearer {}", pat_token))
+            .map_err(|err| Error::Client(format!("invalid auth header: {}", err)))?,
+    );
+    if let Some(team) = team {
+        request.headers_mut().insert(
+            TEAM_HEADER,
+            http::HeaderValue::from_str(team)
+                .map_err(|err| Error::Client(format!("invalid {} header: {}", TEAM_HEADER, err)))?,
+        );
+    }
+    Ok(request)
+}
+
+/// Scoped API tokens (`avm_…`) for services and CI, reached through
+/// [`Client::tokens`]. Creating and revoking needs an admin credential;
+/// listing needs an auditor or an admin.
+pub struct Tokens<'a> {
+    client: &'a Client,
+}
+
+impl Tokens<'_> {
+    fn path(&self, suffix: &str) -> String {
+        format!("{}/tokens{}", self.client.version_prefix(), suffix)
+    }
+
+    /// Mints a token. The result's `token` is the secret, returned this once
+    /// and never again. A 409 means the name is taken, possibly by an
+    /// earlier attempt whose reply was lost; that secret cannot be
+    /// recovered, so revoke the token and create it again.
+    pub fn create(&self, opts: CreateApiTokenOptions) -> Result<CreatedApiToken, Error> {
+        self.client
+            .do_json::<CreateApiTokenOptions, CreatedApiToken>(Method::POST, &self.path(""), Some(&opts))
+    }
+
+    /// Lists every token, expired ones included (`expired` is true) until
+    /// the server removes them 30 days after expiry. Never a secret.
+    pub fn list(&self) -> Result<ApiTokenList, Error> {
+        self.client.do_json::<(), ApiTokenList>(Method::GET, &self.path(""), None)
+    }
+
+    /// Revokes a token by id (`tok_…`). Revoking one that is already gone
+    /// succeeds, so a retried revoke is safe.
+    pub fn revoke(&self, id: &str) -> Result<(), Error> {
+        let id = id.trim();
+        if id.is_empty() {
+            return Err(Error::Client("token id is required".to_string()));
+        }
+        let path = self.path(&format!("/{}", urlencoding::encode(id)));
+        self.client.do_json::<(), ()>(Method::DELETE, &path, None)
+    }
+}
+
+/// Bounds only the TCP/TLS connect, which no legitimate call needs long for.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// `HttpClient::new()` caps every request at 30 s in total, which fails any
+/// exec, build or upload that legitimately runs longer, so production passes
+/// `None` (no total cap) and leaves ending long calls to the server's own
+/// limits, such as exec `timeout_seconds`. The argument exists so a test can
+/// prove the value reaches reqwest rather than its 30 s default.
+fn build_http_client(total_timeout: Option<Duration>) -> Result<HttpClient, Error> {
+    HttpClient::builder()
+        .connect_timeout(CONNECT_TIMEOUT)
+        .timeout(total_timeout)
+        .build()
+        .map_err(Error::Reqwest)
+}
+
+/// Which failures [`Client::send_json`] answers by sending the request again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RetryPolicy {
+    /// The daemon designs these endpoints for retry under duplicates, so any
+    /// transport error and the routing/overload statuses re-send.
+    Idempotent,
+    /// Re-sending repeats the work (exec runs the user's command again), so
+    /// only re-send what provably did none: a connection that never opened,
+    /// or a 429/503 the server refused up front. A timeout, reset or 502/504
+    /// can arrive after the command started, so it goes to the caller.
+    UnsentOnly,
+}
+
+impl RetryPolicy {
+    fn retries_status(self, status: reqwest::StatusCode) -> bool {
+        use reqwest::StatusCode as S;
+        match self {
+            // 421: misdirected (connection coalescing or a stale route); the
+            // server closed the connection, so the retry reconnects.
+            RetryPolicy::Idempotent => [
+                S::MISDIRECTED_REQUEST,
+                S::TOO_MANY_REQUESTS,
+                S::BAD_GATEWAY,
+                S::SERVICE_UNAVAILABLE,
+                S::GATEWAY_TIMEOUT,
+            ]
+            .contains(&status),
+            RetryPolicy::UnsentOnly => {
+                [S::TOO_MANY_REQUESTS, S::SERVICE_UNAVAILABLE].contains(&status)
+            }
+        }
+    }
+
+    fn retries_error(self, err: &reqwest::Error) -> bool {
+        match self {
+            RetryPolicy::Idempotent => err.is_request() || err.is_connect() || err.is_timeout(),
+            // is_connect covers refused, DNS failure and connect timeout, all
+            // of which fail before a byte of the request is written.
+            RetryPolicy::UnsentOnly => err.is_connect(),
+        }
+    }
+}
+
+/// Default cap on one retry's wait for the server's `Retry-After`. An
+/// overloaded node asks for about a second, so the cap only bites on a long
+/// ask (maintenance, a misconfigured proxy), which should not hold a call for
+/// minutes per retry.
+const DEFAULT_MAX_RETRY_AFTER_MS: u64 = 30_000;
+
+/// Longer delta-seconds values are clamped: no cap is that long anyway.
+const MAX_RETRY_AFTER_SECS: u64 = 1_000_000_000;
+
+/// The response's `Retry-After` when the status is one the server paces
+/// clients with: 429 (this caller is over its share) and 503 (the node is
+/// shedding load). A 421, 502 or 504 comes from a routing or proxy hop, so
+/// a `Retry-After` on it is not the server's and the backoff applies.
+fn retry_after_hint(response: &reqwest::blocking::Response) -> Option<String> {
+    use reqwest::StatusCode as S;
+    if ![S::TOO_MANY_REQUESTS, S::SERVICE_UNAVAILABLE].contains(&response.status()) {
+        return None;
+    }
+    response
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .map(String::from)
+}
+
+/// Reads a `Retry-After` value in either form RFC 9110 allows:
+/// delta-seconds (`"120"`) or an HTTP date in IMF-fixdate form (`"Sun, 06
+/// Nov 1994 08:49:37 GMT"`, the form servers send). A date already past is
+/// a zero wait; `None` for a malformed value.
+fn parse_retry_after(value: &str, now: SystemTime) -> Option<Duration> {
+    let value = value.trim();
+    if !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()) {
+        // All digits, so parse fails only on overflow: absurdly long.
+        let secs = value.parse::<u64>().unwrap_or(u64::MAX).min(MAX_RETRY_AFTER_SECS);
+        return Some(Duration::from_secs(secs));
+    }
+    let when = parse_imf_fixdate(value)?;
+    Some(when.duration_since(now).unwrap_or(Duration::ZERO))
+}
+
+fn parse_imf_fixdate(value: &str) -> Option<SystemTime> {
+    const WEEKDAYS: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    // Byte offsets below are only char boundaries for ASCII.
+    let b = value.as_bytes();
+    if !value.is_ascii()
+        || b.len() != 29
+        || &b[3..5] != b", "
+        || b[7] != b' '
+        || b[11] != b' '
+        || b[16] != b' '
+        || b[19] != b':'
+        || b[22] != b':'
+        || &b[25..] != b" GMT"
+        || !WEEKDAYS.contains(&&value[0..3])
+    {
+        return None;
+    }
+    let number = |range: std::ops::Range<usize>| -> Option<i64> {
+        let text = &value[range];
+        if text.bytes().all(|c| c.is_ascii_digit()) {
+            text.parse().ok()
+        } else {
+            None
+        }
+    };
+    let month = MONTHS.iter().position(|m| *m == &value[8..11])? as i64 + 1;
+    let (day, year) = (number(5..7)?, number(12..16)?);
+    let (hour, minute, second) = (number(17..19)?, number(20..22)?, number(23..25)?);
+    if !(1..=31).contains(&day) || hour > 23 || minute > 59 || second > 60 {
+        return None;
+    }
+    // Days since 1970-01-01 for a proleptic Gregorian date (Howard Hinnant's
+    // days_from_civil).
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let doy = (153 * (if month > 2 { month - 3 } else { month + 9 }) + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    let secs = days * 86_400 + hour * 3_600 + minute * 60 + second;
+    // A date before 1970 is long past: a zero wait.
+    Some(UNIX_EPOCH + Duration::from_secs(u64::try_from(secs).unwrap_or(0)))
+}
+
+/// Turns the server's `Retry-After` into a wait. It never retries sooner
+/// than the server asked (nor sooner than the client's own backoff), and
+/// adds up to a fifth on top so clients told the same value spread out.
+/// `limit` is a hard ceiling: when the server asks for at least that long,
+/// the client is early anyway, so the spread goes below the limit instead.
+fn wait_for_hint(hint: Duration, backoff: Duration, limit: Duration, r: f64) -> Duration {
+    let target = hint.max(backoff);
+    if target >= limit {
+        return limit - limit.mul_f64(0.2 * r);
+    }
+    let upper = (target + target / 5).min(limit);
+    target + (upper - target).mul_f64(r)
+}
+
 #[derive(Clone, Debug)]
 pub struct Client {
     api_url: String,
     pat_token: String,
+    team: Option<String>,
     api_version: ApiVersion,
     inner: HttpClient,
     retry_config: RetryConfig,
@@ -332,8 +704,10 @@ impl Sandbox {
         Ok(self)
     }
 
-    pub fn exec(&self, request: ExecRequest) -> Result<ExecResult, Error> {
-        self.client.exec(&self.data.id, request)
+    /// Runs a command and waits for it to exit. See [`Client::exec`] for why a
+    /// failure after the request was sent is returned instead of retried.
+    pub fn exec(&self, request: impl Into<ExecRequest>) -> Result<ExecResult, Error> {
+        self.client.exec(&self.data.id, request.into())
     }
 
     /// Read this sandbox's clone-generation token (changes on
@@ -459,6 +833,15 @@ impl Sandbox {
         self.client.create_snapshot(&self.data.id, name)
     }
 
+    /// `create_snapshot` with options, such as `allow_pause`.
+    pub fn create_snapshot_with_options(
+        &self,
+        name: &str,
+        opts: &CreateSnapshotOptions,
+    ) -> Result<SandboxSnapshot, Error> {
+        self.client.create_snapshot_with_options(&self.data.id, name, opts)
+    }
+
     pub fn destroy(self) -> Result<(), Error> {
         self.client.destroy(&self.data.id)
     }
@@ -482,6 +865,42 @@ impl Sandbox {
     pub fn set_network_limits(&self, opts: SetNetworkLimitsOptions) -> Result<NetworkUsage, Error> {
         self.client.set_network_limits(&self.data.id, opts)
     }
+
+    /// Replaces this sandbox's egress policy while it runs (see
+    /// [`Client::set_network_policy`]) and updates its policy fields.
+    pub fn set_network_policy(&mut self, opts: NetworkPolicyOptions) -> Result<NetworkPolicy, Error> {
+        let policy = self.client.set_network_policy(&self.data.id, opts)?;
+        self.data.network_block_all = policy.network_block_all;
+        self.data.egress_status = policy.egress_status.clone();
+        self.data.egress_profiles = if policy.egress_profiles.is_empty() {
+            None
+        } else {
+            Some(policy.egress_profiles.clone())
+        };
+        self.data.network_egress_mode = if policy.network_egress_mode == "learn" {
+            Some("learn".to_string())
+        } else {
+            None
+        };
+        self.data.network_egress_rules = if policy.network_egress_rules.is_empty() {
+            None
+        } else {
+            Some(policy.network_egress_rules.clone())
+        };
+        Ok(policy)
+    }
+
+    /// Reads what this sandbox reached in learn mode. A recording stays
+    /// readable after a switch to enforce, until the sandbox is destroyed.
+    pub fn learned(&self) -> Result<NetworkLearned, Error> {
+        self.client.get_network_learned(&self.data.id)
+    }
+
+    /// Reads one page of this sandbox's audit log: outbound connections and
+    /// egress denials (kind "egress") and secret reads.
+    pub fn audit(&self, opts: AuditOptions) -> Result<AuditPage, Error> {
+        self.client.get_audit(&self.data.id, opts)
+    }
 }
 
 impl Client {
@@ -501,6 +920,7 @@ impl Client {
             api_url: api_url.map(String::from),
             pat_token: pat_token.map(String::from),
             retry: None,
+            team: None,
         }, api_version)
     }
 
@@ -508,15 +928,9 @@ impl Client {
         config: ClientConfig,
         api_version: ApiVersion,
     ) -> Result<Self, Error> {
-        let token = config.pat_token
-            .filter(|value| !value.trim().is_empty())
-            .or_else(|| {
-                std::env::var("SB_PAT_TOKEN")
-                    .ok()
-                    .filter(|value| !value.trim().is_empty())
-            });
-
-        let pat_token = token.ok_or(Error::MissingToken)?;
+        let env = |name: &str| std::env::var(name).ok();
+        let pat_token = resolve_token(config.pat_token, env).ok_or(Error::MissingToken)?;
+        let team = resolve_team(config.team, env);
         let api_url = config.api_url
             .filter(|value| !value.trim().is_empty())
             .map(|value| value.trim().trim_end_matches('/').to_string())
@@ -531,8 +945,9 @@ impl Client {
         Ok(Client {
             api_url,
             pat_token,
+            team,
             api_version,
-            inner: HttpClient::new(),
+            inner: build_http_client(None)?,
             retry_config: config.retry.unwrap_or_default(),
         })
     }
@@ -542,11 +957,25 @@ impl Client {
         self.api_version.path_prefix()
     }
 
+    /// Creates a sandbox. The request carries an `Idempotency-Key`: the
+    /// caller's [`CreateOptions::idempotency_key`], or a random one made for
+    /// this call. Either way it is sent unchanged on each of the call's
+    /// automatic retries, so a create retried after a timeout gets back the
+    /// sandbox the first attempt made instead of making a second one.
     pub fn create(&self, opts: CreateOptions) -> Result<Sandbox, Error> {
-        let raw = self.do_json::<CreateOptions, CreateSandboxResponse>(
+        let key = opts
+            .idempotency_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|key| !key.is_empty())
+            .map(String::from)
+            .unwrap_or_else(new_idempotency_key);
+        let (raw, _) = self.send_json_with_headers::<CreateOptions, CreateSandboxResponse>(
             Method::POST,
             &format!("{}/sandboxes", self.version_prefix()),
             Some(&opts),
+            RetryPolicy::Idempotent,
+            &[(IDEMPOTENCY_KEY_HEADER, key.as_str())],
         )?;
         Ok(Sandbox::new_with_ssh_private_key(
             self.clone(),
@@ -596,18 +1025,18 @@ impl Client {
         }
 
         if let Some(message) = image.validation_error() {
-            return Err(Error::Api(message.to_string()));
+            return Err(Error::Client(message.to_string()));
         }
 
         let push_body = if let Some(push) = options.push.as_ref() {
             let registry = push.registry.trim();
             if registry.is_empty() {
-                return Err(Error::Api(
+                return Err(Error::Client(
                     "push.registry is required when push is set".to_string(),
                 ));
             }
             if push.username.is_empty() || push.password.is_empty() {
-                return Err(Error::Api(
+                return Err(Error::Client(
                     "push.username and push.password are required when push is set".to_string(),
                 ));
             }
@@ -626,7 +1055,7 @@ impl Client {
         let response = self
             .inner
             .request(Method::POST, self.full_url(&path))
-            .bearer_auth(&self.pat_token)
+            .authorize(self)
             .json(&BuildImageRequest {
                 dockerfile_content: image.dockerfile(),
                 push: push_body,
@@ -634,7 +1063,7 @@ impl Client {
             .send()?;
         if response.status() == reqwest::StatusCode::NOT_FOUND {
             let _ = response.text();
-            return Err(Error::Api(format!(
+            return Err(Error::Client(format!(
                 "this daemon does not support Image builds (POST {} is not registered) — pass a string image reference (e.g. \"ubuntu:22.04\") instead, or upgrade the daemon",
                 path,
             )));
@@ -692,7 +1121,7 @@ impl Client {
                 None => return Ok(items),
             }
         }
-        Err(Error::Api(
+        Err(Error::Client(
             "incomplete cluster list: exceeded max pages".into(),
         ))
     }
@@ -718,7 +1147,7 @@ impl Client {
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
         if partial == "true" || ready == "false" {
-            return Err(Error::Api("incomplete cluster list".into()));
+            return Err(Error::Client("incomplete cluster list".into()));
         }
         let next = headers
             .get("X-Cluster-List-Next-Page-Token")
@@ -733,6 +1162,44 @@ impl Client {
                 .collect(),
             next_page_token: if next.is_empty() { None } else { Some(next) },
         })
+    }
+
+    /// Returns the caller's sandbox with this name, or `None` if there is
+    /// none. Names are unique per owner. The reply is only trusted when it
+    /// holds at most one sandbox carrying the requested name: a server that
+    /// predates `?name=` ignores the filter and returns an ordinary list page,
+    /// and acting on its first row would target the wrong sandbox.
+    pub fn get_by_name(&self, name: &str) -> Result<Option<Sandbox>, Error> {
+        self.get_by_name_with_options(name, false)
+    }
+
+    /// [`Client::get_by_name`] with optional `include_env=true`.
+    pub fn get_by_name_with_options(
+        &self,
+        name: &str,
+        include_env: bool,
+    ) -> Result<Option<Sandbox>, Error> {
+        let wanted = name.trim();
+        if wanted.is_empty() {
+            return Err(Error::Client("sandbox name is required".into()));
+        }
+        let mut path = format!("{}/sandboxes", self.version_prefix());
+        path.push_str(&build_sandbox_query(
+            &std::collections::HashMap::new(),
+            include_env,
+        ));
+        let path = append_query_param(&path, "name", wanted);
+        let mut raw = self.do_json::<(), Vec<SandboxData>>(Method::GET, &path, None)?;
+        if raw.is_empty() {
+            return Ok(None);
+        }
+        if raw.len() > 1 || raw[0].name.as_deref() != Some(wanted) {
+            return Err(Error::Client(format!(
+                "{} does not support sandbox name lookup; use the sandbox ID or upgrade the server",
+                self.api_url
+            )));
+        }
+        Ok(Some(Sandbox::new(self.clone(), raw.remove(0))))
     }
 
     pub fn get(&self, id: &str) -> Result<Sandbox, Error> {
@@ -769,15 +1236,31 @@ impl Client {
     }
 
     pub fn create_snapshot(&self, id: &str, name: &str) -> Result<SandboxSnapshot, Error> {
+        self.create_snapshot_with_options(id, name, &CreateSnapshotOptions::default())
+    }
+
+    /// `create_snapshot` with options. `allow_pause: Some(false)` has a
+    /// sandbox that is not stopped refused (HTTP 409) instead of paused.
+    pub fn create_snapshot_with_options(
+        &self,
+        id: &str,
+        name: &str,
+        opts: &CreateSnapshotOptions,
+    ) -> Result<SandboxSnapshot, Error> {
         #[derive(Serialize)]
         struct CreateSnapshotRequest<'a> {
             name: &'a str,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            allow_pause: Option<bool>,
         }
 
         self.do_json::<CreateSnapshotRequest<'_>, SandboxSnapshot>(
             Method::POST,
             &format!("{}/sandboxes/{}/snapshot", self.version_prefix(), id),
-            Some(&CreateSnapshotRequest { name }),
+            Some(&CreateSnapshotRequest {
+                name,
+                allow_pause: opts.allow_pause,
+            }),
         )
     }
 
@@ -810,7 +1293,7 @@ impl Client {
 
         let name = opts.name.trim();
         if name.is_empty() {
-            return Err(Error::Api("name is required".to_string()));
+            return Err(Error::Client("name is required".to_string()));
         }
 
         let image = opts
@@ -823,12 +1306,12 @@ impl Client {
             .filter(|value| !value.is_empty());
         match (&image, &dockerfile_content) {
             (None, None) => {
-                return Err(Error::Api(
+                return Err(Error::Client(
                     "image or dockerfile_content is required".to_string(),
                 ))
             }
             (Some(_), Some(_)) => {
-                return Err(Error::Api(
+                return Err(Error::Client(
                     "image and dockerfile_content are mutually exclusive".to_string(),
                 ))
             }
@@ -873,12 +1356,55 @@ impl Client {
         mut opts: RegisterSnapshotOptions,
     ) -> Result<SandboxSnapshot, Error> {
         if let Some(message) = image.validation_error() {
-            return Err(Error::Api(message.to_string()));
+            return Err(Error::Client(message.to_string()));
         }
         opts.name = name.to_string();
         opts.image = None;
         opts.dockerfile_content = Some(image.dockerfile().to_string());
         self.register_snapshot(opts)
+    }
+
+    /// Look a snapshot up by name. In a cluster the request is routed to the
+    /// node holding the image. A missing snapshot surfaces as an
+    /// [`Error::Api`] carrying the server's 404.
+    pub fn get_snapshot(&self, name: &str) -> Result<SandboxSnapshot, Error> {
+        self.do_json::<(), SandboxSnapshot>(
+            Method::GET,
+            &format!(
+                "{}/snapshots/{}",
+                self.version_prefix(),
+                urlencoding::encode(name)
+            ),
+            None,
+        )
+    }
+
+    /// List the caller's snapshots, one name-ordered page at a time. Maps
+    /// `limit` / `starting_after` to the matching query params; a null
+    /// `snapshots` array in the reply decodes to an empty vec.
+    pub fn list_snapshots(&self, opts: ListSnapshotsOptions) -> Result<SnapshotList, Error> {
+        let mut path = format!("{}/snapshots", self.version_prefix());
+        if let Some(limit) = opts.limit {
+            path = append_query_param(&path, "limit", &limit.to_string());
+        }
+        if let Some(starting_after) = &opts.starting_after {
+            path = append_query_param(&path, "starting_after", starting_after);
+        }
+        self.do_json::<(), SnapshotList>(Method::GET, &path, None)
+    }
+
+    /// Delete a snapshot by name. A missing snapshot surfaces as the server's
+    /// 404.
+    pub fn delete_snapshot(&self, name: &str) -> Result<(), Error> {
+        self.do_json::<(), ()>(
+            Method::DELETE,
+            &format!(
+                "{}/snapshots/{}",
+                self.version_prefix(),
+                urlencoding::encode(name)
+            ),
+            None,
+        )
     }
 
     pub fn destroy(&self, id: &str) -> Result<(), Error> {
@@ -899,7 +1425,7 @@ impl Client {
     /// template.
     pub fn create_template(&self, opts: CreateTemplateOptions) -> Result<Template, Error> {
         if opts.image.trim().is_empty() {
-            return Err(Error::Api("image is required".to_string()));
+            return Err(Error::Client("image is required".to_string()));
         }
         self.do_json::<CreateTemplateOptions, Template>(
             Method::POST,
@@ -936,7 +1462,7 @@ impl Client {
     /// the returned row is typically already `WasmModuleStatus::Ready`.
     pub fn create_wasm_module(&self, opts: CreateWasmModuleOptions) -> Result<WasmModule, Error> {
         if opts.module_ref.trim().is_empty() {
-            return Err(Error::Api("module_ref is required".to_string()));
+            return Err(Error::Client("module_ref is required".to_string()));
         }
         self.do_json::<CreateWasmModuleOptions, WasmModule>(
             Method::POST,
@@ -978,10 +1504,10 @@ impl Client {
         opts: PushWasmModuleOptions,
     ) -> Result<PushWasmModuleResponse, Error> {
         if opts.name.trim().is_empty() {
-            return Err(Error::Api("name is required".to_string()));
+            return Err(Error::Client("name is required".to_string()));
         }
         if opts.registry_token.trim().is_empty() {
-            return Err(Error::Api("registry_token is required".to_string()));
+            return Err(Error::Client("registry_token is required".to_string()));
         }
         let tag = if opts.tag.trim().is_empty() {
             "latest"
@@ -998,7 +1524,7 @@ impl Client {
         let mut builder = self
             .inner
             .post(&url)
-            .bearer_auth(&self.pat_token)
+            .authorize(self)
             .header("Content-Type", "application/octet-stream")
             .header("X-Registry-Token", &opts.registry_token)
             .body(opts.module);
@@ -1058,6 +1584,20 @@ impl Client {
         self.do_json::<(), HealthStatus>(Method::GET, "/health", None)
     }
 
+    /// Asks whether a sandbox created with these egress fields would reach a
+    /// destination, with the same matcher the filter enforces. No sandbox is
+    /// needed.
+    pub fn check_network_policy(
+        &self,
+        opts: NetworkPolicyCheckOptions,
+    ) -> Result<NetworkPolicyCheckResult, Error> {
+        self.do_json::<NetworkPolicyCheckOptions, NetworkPolicyCheckResult>(
+            Method::POST,
+            &format!("{}/network/policy/check", self.version_prefix()),
+            Some(&opts),
+        )
+    }
+
     pub fn mounts(&self, id: &str) -> Result<Vec<MountSpecRedacted>, Error> {
         #[derive(serde::Deserialize)]
         struct MountList {
@@ -1096,6 +1636,78 @@ impl Client {
         )
     }
 
+    /// Reads what a sandbox reached in learn mode and the allow list that
+    /// would have allowed it.
+    pub fn get_network_learned(&self, id: &str) -> Result<NetworkLearned, Error> {
+        self.do_json::<(), NetworkLearned>(
+            Method::GET,
+            &format!("{}/sandboxes/{}/network/learned", self.version_prefix(), id),
+            None,
+        )
+    }
+
+    fn egress_profile_path(&self, name: &str) -> String {
+        format!("{}/egress-profiles/{}", self.version_prefix(), urlencoding::encode(name))
+    }
+
+    /// Creates or replaces a named egress profile (a full replace: the same
+    /// body twice is a no-op). A change reaches every sandbox using it.
+    pub fn put_egress_profile(&self, name: &str, opts: EgressProfileOptions) -> Result<EgressProfile, Error> {
+        self.do_json::<EgressProfileOptions, EgressProfile>(Method::PUT, &self.egress_profile_path(name), Some(&opts))
+    }
+
+    pub fn get_egress_profile(&self, name: &str) -> Result<EgressProfile, Error> {
+        self.do_json::<(), EgressProfile>(Method::GET, &self.egress_profile_path(name), None)
+    }
+
+    pub fn list_egress_profiles(&self, opts: ListEgressProfilesOptions) -> Result<EgressProfileList, Error> {
+        let mut path = format!("{}/egress-profiles", self.version_prefix());
+        if let Some(cursor) = &opts.cursor {
+            path = append_query_param(&path, "cursor", cursor);
+        }
+        if let Some(limit) = opts.limit {
+            path = append_query_param(&path, "limit", &limit.to_string());
+        }
+        self.do_json::<(), EgressProfileList>(Method::GET, &path, None)
+    }
+
+    /// Deletes a profile; one that sandboxes still reference is refused (409).
+    pub fn delete_egress_profile(&self, name: &str) -> Result<(), Error> {
+        self.do_json::<(), ()>(Method::DELETE, &self.egress_profile_path(name), None)
+    }
+
+    /// Who the server says the caller is: principal, role, team and when
+    /// the credential expires. Every valid credential may ask.
+    pub fn whoami(&self) -> Result<WhoAmI, Error> {
+        self.do_json::<(), WhoAmI>(
+            Method::GET,
+            &format!("{}/whoami", self.version_prefix()),
+            None,
+        )
+    }
+
+    /// Scoped API tokens: `client.tokens().create/list/revoke`.
+    pub fn tokens(&self) -> Tokens<'_> {
+        Tokens { client: self }
+    }
+
+    pub fn get_audit(&self, id: &str, opts: AuditOptions) -> Result<AuditPage, Error> {
+        let mut path = format!("{}/sandboxes/{}/audit", self.version_prefix(), id);
+        if let Some(kind) = &opts.kind {
+            path = append_query_param(&path, "kind", kind);
+        }
+        if let Some(limit) = opts.limit {
+            path = append_query_param(&path, "limit", &limit.to_string());
+        }
+        if let Some(cursor) = &opts.cursor {
+            path = append_query_param(&path, "cursor", cursor);
+        }
+        if let Some(inc) = &opts.incarnation_id {
+            path = append_query_param(&path, "incarnation_id", inc);
+        }
+        self.do_json::<(), AuditPage>(Method::GET, &path, None)
+    }
+
     pub fn set_network_limits(
         &self,
         id: &str,
@@ -1108,8 +1720,27 @@ impl Client {
         )
     }
 
+    /// Replaces a sandbox's egress policy while it runs and returns once the
+    /// new policy is enforced. Sending the same policy again is a no-op, so
+    /// it is safe to retry.
+    pub fn set_network_policy(
+        &self,
+        id: &str,
+        opts: NetworkPolicyOptions,
+    ) -> Result<NetworkPolicy, Error> {
+        self.do_json::<NetworkPolicyOptions, NetworkPolicy>(
+            Method::PUT,
+            &format!("{}/sandboxes/{}/network/policy", self.version_prefix(), id),
+            Some(&opts),
+        )
+    }
+
+    /// Runs a command and waits for it to exit. Unlike other calls, a failure
+    /// after the request may have reached the sandbox (timeout, reset, 502,
+    /// 504) is returned rather than retried, because a re-send would run the
+    /// command a second time; the command may or may not have run.
     pub fn exec(&self, id: &str, request: ExecRequest) -> Result<ExecResult, Error> {
-        self.do_json::<ExecRequest, ExecResult>(
+        let (body, _) = self.send_json::<ExecRequest, ExecResult>(
             Method::POST,
             &format!(
                 "{}/sandboxes/{}/toolbox/process/execute",
@@ -1117,7 +1748,9 @@ impl Client {
                 id
             ),
             Some(&request),
-        )
+            RetryPolicy::UnsentOnly,
+        )?;
+        Ok(body)
     }
 
     pub fn create_session(&self, id: &str, opts: CreateSessionOptions) -> Result<Session, Error> {
@@ -1207,7 +1840,7 @@ impl Client {
         let response = self
             .inner
             .request(Method::GET, &url)
-            .bearer_auth(&self.pat_token)
+            .authorize(self)
             .send()?;
         self.handle_response(response)?
             .bytes()
@@ -1225,7 +1858,7 @@ impl Client {
         let response = self
             .inner
             .request(Method::GET, &url)
-            .bearer_auth(&self.pat_token)
+            .authorize(self)
             .send()?;
         self.handle_response(response)?
             .bytes()
@@ -1243,6 +1876,7 @@ impl Client {
         let (done_tx, done_rx) = mpsc::channel();
         let api_url = self.api_url.clone();
         let pat_token = self.pat_token.clone();
+        let team = self.team.clone();
         let api_version = self.api_version;
         let sandbox_id = id.to_string();
         let session_id = session_id.to_string();
@@ -1254,6 +1888,7 @@ impl Client {
                     api_url,
                     api_version,
                     pat_token,
+                    team,
                     sandbox_id,
                     session_id,
                     options,
@@ -1276,13 +1911,14 @@ impl Client {
         options: ExecStreamOptions,
     ) -> Result<ExecStreamHandle, Error> {
         if options.command.trim().is_empty() {
-            return Err(Error::Api("command is required".to_string()));
+            return Err(Error::Client("command is required".to_string()));
         }
 
         let (control_tx, control_rx) = unbounded_channel();
         let (done_tx, done_rx) = mpsc::channel();
         let api_url = self.api_url.clone();
         let pat_token = self.pat_token.clone();
+        let team = self.team.clone();
         let api_version = self.api_version;
         let sandbox_id = id.to_string();
 
@@ -1293,6 +1929,7 @@ impl Client {
                     api_url,
                     api_version,
                     pat_token,
+                    team,
                     sandbox_id,
                     options,
                     control_rx,
@@ -1338,7 +1975,7 @@ impl Client {
         let response = self
             .inner
             .request(Method::GET, &url)
-            .bearer_auth(&self.pat_token)
+            .authorize(self)
             .send()?;
         self.handle_response(response)?
             .bytes()
@@ -1379,7 +2016,7 @@ impl Client {
             "http" | "" => Ok(ExposeResult::Http {
                 url: wire.public_url,
             }),
-            other => Err(Error::Api(format!("unknown expose protocol: {}", other))),
+            other => Err(Error::Client(format!("unknown expose protocol: {}", other))),
         }
     }
 
@@ -1492,34 +2129,73 @@ impl Client {
         path: &str,
         payload: Option<&T>,
     ) -> Result<(U, reqwest::header::HeaderMap), Error> {
-        let max_retries = self.retry_config.max_retries.unwrap_or(3);
+        self.send_json(method, path, payload, RetryPolicy::Idempotent)
+    }
+
+    /// How long [`Client::send_json`] sleeps before re-sending. `attempt`
+    /// counts from 0, `retry_after` is [`retry_after_hint`]'s result and `r`
+    /// is uniform in [0, 1). Without a usable header it is the exponential
+    /// backoff ±25%; with one, see [`wait_for_hint`].
+    fn retry_wait(&self, attempt: i32, retry_after: Option<&str>, now: SystemTime, r: f64) -> Duration {
         let base_delay = self.retry_config.base_delay_ms.unwrap_or(200);
         let max_delay = self.retry_config.max_delay_ms.unwrap_or(5000);
+        let factor = 1u64.checked_shl(attempt.max(0) as u32).unwrap_or(u64::MAX);
+        let backoff = Duration::from_millis(base_delay.saturating_mul(factor).min(max_delay));
+        let limit = self
+            .retry_config
+            .max_retry_after_ms
+            .unwrap_or(DEFAULT_MAX_RETRY_AFTER_MS);
+        if limit > 0 {
+            if let Some(hint) = retry_after.and_then(|value| parse_retry_after(value, now)) {
+                return wait_for_hint(hint, backoff, Duration::from_millis(limit), r);
+            }
+        }
+        backoff.mul_f64(0.75 + 0.5 * r)
+    }
+
+    fn send_json<T: Serialize, U: DeserializeOwned>(
+        &self,
+        method: Method,
+        path: &str,
+        payload: Option<&T>,
+        policy: RetryPolicy,
+    ) -> Result<(U, reqwest::header::HeaderMap), Error> {
+        self.send_json_with_headers(method, path, payload, policy, &[])
+    }
+
+    /// [`Client::send_json`] with extra request headers, set on every
+    /// attempt so a retry carries them unchanged.
+    fn send_json_with_headers<T: Serialize, U: DeserializeOwned>(
+        &self,
+        method: Method,
+        path: &str,
+        payload: Option<&T>,
+        policy: RetryPolicy,
+        headers: &[(&str, &str)],
+    ) -> Result<(U, reqwest::header::HeaderMap), Error> {
+        let max_retries = self.retry_config.max_retries.unwrap_or(3);
 
         let mut attempt = 0;
         loop {
+            let mut retry_after = None;
             let url = self.full_url(path);
             let mut builder = self
                 .inner
                 .request(method.clone(), &url)
-                .bearer_auth(&self.pat_token);
+                .authorize(self);
             if let Some(body) = payload {
                 builder = builder.json(body);
+            }
+            for (name, value) in headers {
+                builder = builder.header(*name, *value);
             }
 
             match builder.send() {
                 Ok(response) => {
-                    let status = response.status();
-                    // 421: misdirected (connection coalescing or a stale route);
-                    // the server closed the connection, so the retry reconnects.
-                    if (status == reqwest::StatusCode::MISDIRECTED_REQUEST
-                        || status == reqwest::StatusCode::TOO_MANY_REQUESTS
-                        || status == reqwest::StatusCode::BAD_GATEWAY
-                        || status == reqwest::StatusCode::SERVICE_UNAVAILABLE
-                        || status == reqwest::StatusCode::GATEWAY_TIMEOUT)
-                        && attempt < max_retries
-                    {
-                        // Fall through to retry logic
+                    if attempt < max_retries && policy.retries_status(response.status()) {
+                        // Fall through to retry logic; dropping the response
+                        // frees the connection before the wait.
+                        retry_after = retry_after_hint(&response);
                     } else {
                         let response = self.handle_response(response)?;
                         let headers = response.headers().clone();
@@ -1532,17 +2208,21 @@ impl Client {
                     }
                 }
                 Err(err) => {
-                    if attempt >= max_retries || !err.is_request() && !err.is_connect() && !err.is_timeout() {
+                    if attempt >= max_retries || !policy.retries_error(&err) {
                         return Err(Error::Reqwest(err));
                     }
                 }
             }
 
-            let delay_ms = std::cmp::min(base_delay * (1 << attempt), max_delay);
-            // Add jitter
-            let jitter = 1.0 + (rand::random::<f64>() - 0.5) * 0.5;
-            let sleep_duration = std::time::Duration::from_millis((delay_ms as f64 * jitter) as u64);
-            std::thread::sleep(sleep_duration);
+            // A 429 or 503 waits as long as its Retry-After asks, within
+            // max_retry_after_ms. The client is blocking, so nothing can
+            // interrupt this sleep; the cap is what bounds it.
+            std::thread::sleep(self.retry_wait(
+                attempt,
+                retry_after.as_deref(),
+                SystemTime::now(),
+                rand::random::<f64>(),
+            ));
             attempt += 1;
         }
     }
@@ -1552,7 +2232,7 @@ impl Client {
         let response = self
             .inner
             .post(&url)
-            .bearer_auth(&self.pat_token)
+            .authorize(self)
             .multipart(form)
             .send()?;
         self.handle_response(response).map(|_| ())
@@ -1566,13 +2246,17 @@ impl Client {
             Ok(response)
         } else {
             let status = response.status();
+            let retry_after = response
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok())
+                .map(String::from);
             let body = response.text().unwrap_or_default();
-            if let Ok(value) = serde_json::from_str::<Value>(&body) {
-                if let Some(message) = value.get("error").and_then(|entry| entry.as_str()) {
-                    return Err(Error::Api(format!("{}: {}", status, message)));
-                }
-            }
-            Err(Error::Api(format!("{}: {}", status, body)))
+            Err(Error::Api(ApiError::from_response(
+                status,
+                retry_after.as_deref(),
+                &body,
+            )))
         }
     }
 }
@@ -1581,6 +2265,7 @@ async fn run_exec_stream(
     api_url: String,
     api_version: ApiVersion,
     pat_token: String,
+    team: Option<String>,
     sandbox_id: String,
     options: ExecStreamOptions,
     mut control_rx: tokio::sync::mpsc::UnboundedReceiver<ControlMessage>,
@@ -1593,12 +2278,7 @@ async fn run_exec_stream(
             urlencoding::encode(&sandbox_id)
         ),
     )?;
-    let mut request = ws_url.into_client_request().map_err(Error::WebSocket)?;
-    request.headers_mut().insert(
-        http::header::AUTHORIZATION,
-        http::HeaderValue::from_str(&format!("Bearer {}", pat_token))
-            .map_err(|err| Error::Api(format!("invalid auth header: {}", err)))?,
-    );
+    let request = websocket_request(ws_url, &pat_token, team.as_deref())?;
 
     let (stream, _) = connect_async(request)
         .await
@@ -1660,10 +2340,10 @@ async fn run_exec_stream(
                             if let Some(callback) = &options.on_error {
                                 callback(message.clone());
                             }
-                            return Err(Error::Api(message));
+                            return Err(Error::Client(message));
                         }
                     }
-                    Some(Ok(Message::Close(_))) | None => return Err(Error::Api("stream closed before exit".to_string())),
+                    Some(Ok(Message::Close(_))) | None => return Err(Error::Client("stream closed before exit".to_string())),
                     Some(Ok(_)) => {}
                     Some(Err(err)) => return Err(Error::WebSocket(err)),
                 }
@@ -1676,6 +2356,7 @@ async fn run_session_attach(
     api_url: String,
     api_version: ApiVersion,
     pat_token: String,
+    team: Option<String>,
     sandbox_id: String,
     session_id: String,
     options: SessionAttachOptions,
@@ -1690,12 +2371,7 @@ async fn run_session_attach(
             urlencoding::encode(&session_id)
         ),
     )?;
-    let mut request = ws_url.into_client_request().map_err(Error::WebSocket)?;
-    request.headers_mut().insert(
-        http::header::AUTHORIZATION,
-        http::HeaderValue::from_str(&format!("Bearer {}", pat_token))
-            .map_err(|err| Error::Api(format!("invalid auth header: {}", err)))?,
-    );
+    let request = websocket_request(ws_url, &pat_token, team.as_deref())?;
 
     let (stream, _) = connect_async(request)
         .await
@@ -1761,10 +2437,10 @@ async fn run_session_attach(
                             if let Some(callback) = &options.on_error {
                                 callback(message.clone());
                             }
-                            return Err(Error::Api(message));
+                            return Err(Error::Client(message));
                         }
                     }
-                    Some(Ok(Message::Close(_))) | None => return Err(Error::Api("session stream closed before exit".to_string())),
+                    Some(Ok(Message::Close(_))) | None => return Err(Error::Client("session stream closed before exit".to_string())),
                     Some(Ok(_)) => {}
                     Some(Err(err)) => return Err(Error::WebSocket(err)),
                 }
@@ -1831,12 +2507,12 @@ fn decorate_ws_handshake(label: &str, err: WebSocketError) -> Error {
             let body_str = String::from_utf8_lossy(&body);
             let trimmed = body_str.trim();
             if trimmed.is_empty() {
-                Error::Api(format!(
+                Error::Client(format!(
                     "{} websocket handshake failed: status={}",
                     label, status
                 ))
             } else {
-                Error::Api(format!(
+                Error::Client(format!(
                     "{} websocket handshake failed: status={}, body={:?}",
                     label, status, trimmed
                 ))
@@ -1848,7 +2524,7 @@ fn decorate_ws_handshake(label: &str, err: WebSocketError) -> Error {
 
 fn websocket_url(base_url: &str, path: &str) -> Result<String, Error> {
     let mut parsed = reqwest::Url::parse(&format!("{}{}", base_url.trim_end_matches('/'), path))
-        .map_err(|err| Error::Api(format!("invalid API URL: {}", err)))?;
+        .map_err(|err| Error::Client(format!("invalid API URL: {}", err)))?;
     match parsed.scheme() {
         "http" => {
             let _ = parsed.set_scheme("ws");
@@ -1857,7 +2533,7 @@ fn websocket_url(base_url: &str, path: &str) -> Result<String, Error> {
             let _ = parsed.set_scheme("wss");
         }
         "ws" | "wss" => {}
-        other => return Err(Error::Api(format!("unsupported API URL scheme: {}", other))),
+        other => return Err(Error::Client(format!("unsupported API URL scheme: {}", other))),
     }
     Ok(parsed.to_string())
 }
@@ -1867,6 +2543,7 @@ mod tests {
     use super::*;
     use std::io::{Read, Write};
     use std::net::TcpListener;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
     use std::thread;
     use tokio_tungstenite::accept_async;
@@ -1880,11 +2557,23 @@ mod tests {
         content_type: &str,
         body: Vec<u8>,
     ) -> (String, std::sync::mpsc::Receiver<String>) {
+        spawn_response_server_with_headers(status_line, content_type, "", body)
+    }
+
+    /// [`spawn_response_server`] with `extra_headers` (each line ending in
+    /// `\r\n`) added to the response head.
+    fn spawn_response_server_with_headers(
+        status_line: &str,
+        content_type: &str,
+        extra_headers: &str,
+        body: Vec<u8>,
+    ) -> (String, std::sync::mpsc::Receiver<String>) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("listener should bind");
         let addr = listener.local_addr().expect("listener address");
         let (request_tx, request_rx) = std::sync::mpsc::channel();
         let status_line = status_line.to_string();
         let content_type = content_type.to_string();
+        let extra_headers = extra_headers.to_string();
 
         thread::spawn(move || {
             let (mut stream, _) = listener.accept().expect("server should accept");
@@ -1892,8 +2581,9 @@ mod tests {
             request_tx.send(request).expect("request should be sent");
 
             let response = format!(
-                "HTTP/1.1 {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                "HTTP/1.1 {}\r\n{}Content-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                 status_line,
+                extra_headers,
                 content_type,
                 body.len(),
             );
@@ -1904,6 +2594,114 @@ mod tests {
         });
 
         (format!("http://{}", addr), request_rx)
+    }
+
+    /// One scripted answer per accepted connection.
+    enum Reply {
+        /// Read the whole request, then close without answering, as a daemon
+        /// or proxy that dies mid-call does.
+        Hangup,
+        Json {
+            status: &'static str,
+            body: String,
+            delay: Duration,
+        },
+        /// A refusal carrying a `Retry-After` header (none when `None`).
+        Paced {
+            status: &'static str,
+            retry_after: Option<String>,
+        },
+    }
+
+    impl Reply {
+        fn ok(body: String) -> Self {
+            Reply::Json { status: "200 OK", body, delay: Duration::ZERO }
+        }
+
+        fn status(status: &'static str) -> Self {
+            Reply::Json {
+                status,
+                body: r#"{"error":"scripted"}"#.to_string(),
+                delay: Duration::ZERO,
+            }
+        }
+    }
+
+    /// Serves `script` one connection at a time and counts the requests it
+    /// read. The last reply repeats for every further connection, so a client
+    /// that re-sends more than expected is counted rather than refused.
+    fn spawn_scripted_server(script: Vec<Reply>) -> (String, Arc<AtomicUsize>) {
+        let (url, hits, _) = spawn_recording_scripted_server(script);
+        (url, hits)
+    }
+
+    /// [`spawn_scripted_server`] that also keeps every raw request it read.
+    fn spawn_recording_scripted_server(
+        script: Vec<Reply>,
+    ) -> (String, Arc<AtomicUsize>, Arc<Mutex<Vec<String>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener should bind");
+        let addr = listener.local_addr().expect("listener address");
+        let hits = Arc::new(AtomicUsize::new(0));
+        let server_hits = hits.clone();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let server_requests = requests.clone();
+        thread::spawn(move || {
+            for (i, stream) in listener.incoming().enumerate() {
+                let Ok(mut stream) = stream else { continue };
+                let request = read_http_request(&mut stream);
+                server_requests.lock().expect("requests lock").push(request);
+                server_hits.fetch_add(1, Ordering::SeqCst);
+                let paced_body = r#"{"error":"busy","code":"overloaded"}"#.to_string();
+                let (status, body, delay, extra) = match &script[i.min(script.len() - 1)] {
+                    Reply::Hangup => continue,
+                    Reply::Json { status, body, delay } => (*status, body, *delay, String::new()),
+                    Reply::Paced { status, retry_after } => (
+                        *status,
+                        &paced_body,
+                        Duration::ZERO,
+                        retry_after
+                            .as_ref()
+                            .map(|v| format!("Retry-After: {}\r\n", v))
+                            .unwrap_or_default(),
+                    ),
+                };
+                thread::sleep(delay);
+                let head = format!(
+                    "HTTP/1.1 {}\r\n{}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    status,
+                    extra,
+                    body.len()
+                );
+                // The client may have given up already; that is the point
+                // of some scripts, so a failed write is not an error.
+                let _ = stream.write_all(head.as_bytes());
+                let _ = stream.write_all(body.as_bytes());
+            }
+        });
+        (format!("http://{}", addr), hits, requests)
+    }
+
+    /// Retries in milliseconds, so a test that counts re-sends stays fast.
+    fn fast_retry_client(url: &str) -> Client {
+        Client::with_config(
+            ClientConfig {
+                api_url: Some(url.to_string()),
+                pat_token: Some("pat-token".to_string()),
+                retry: Some(RetryConfig {
+                    max_retries: Some(3),
+                    base_delay_ms: Some(1),
+                    max_delay_ms: Some(5),
+                    max_retry_after_ms: None,
+                }),
+                ..Default::default()
+            },
+            ApiVersion::V1,
+        )
+        .expect("client should build")
+    }
+
+    fn exec_ok_json() -> String {
+        serde_json::json!({"stdout": "", "stderr": "", "exit_code": 0, "duration_ms": 1}).to_string()
     }
 
     fn spawn_create_with_image_server() -> (String, std::sync::mpsc::Receiver<String>) {
@@ -2077,6 +2875,9 @@ mod tests {
             network_block_all: None,
             network_allow_out: None,
             network_deny_out: None,
+            egress_profiles: None,
+            network_egress_mode: None,
+            network_egress_rules: None,
             allow_public_traffic: None,
             mask_request_host: None,
             network_bytes_in_limit: None,
@@ -2088,11 +2889,15 @@ mod tests {
             lifecycle: None,
             failover: None,
             runtime: None,
+            template_id: None,
             gpus: None,
             custom_domains: None,
             durability: None,
             module_ref: None,
             tenant_id: None,
+            name: None,
+            tags: None,
+            idempotency_key: None,
         }
     }
 
@@ -2249,6 +3054,344 @@ mod tests {
             .expect("421 should be retried to success");
         assert_eq!(sandbox.data.id, "sb-421");
         assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    // The proven failure: a 40 s exec ran four times because a transport
+    // error after the POST was sent re-sent it. Once the server has read the
+    // request, the failure must reach the caller with the command sent once.
+    #[test]
+    fn exec_does_not_resend_after_the_request_was_sent() {
+        let (url, hits) = spawn_scripted_server(vec![Reply::Hangup]);
+        let err = fast_retry_client(&url)
+            .exec("sb-1", ExecRequest::from("sleep 40"))
+            .expect_err("a hangup after the request was sent must surface");
+        assert!(matches!(err, Error::Reqwest(_)), "unexpected error: {}", err);
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    // 429 and 503 are refusals before any work, so exec re-sends them; 421,
+    // 502 and 504 can follow a command that already started, so they surface.
+    #[test]
+    fn exec_retries_only_up_front_refusal_statuses() {
+        for (status, retried) in [
+            ("429 Too Many Requests", true),
+            ("503 Service Unavailable", true),
+            ("421 Misdirected Request", false),
+            ("502 Bad Gateway", false),
+            ("504 Gateway Timeout", false),
+        ] {
+            let (url, hits) =
+                spawn_scripted_server(vec![Reply::status(status), Reply::ok(exec_ok_json())]);
+            let result = fast_retry_client(&url).exec("sb-1", ExecRequest::from("true"));
+            assert_eq!(result.is_ok(), retried, "{}: {:?}", status, result.as_ref().err());
+            assert_eq!(hits.load(Ordering::SeqCst), if retried { 2 } else { 1 }, "{}", status);
+        }
+    }
+
+    // Refused means the connection never opened, so nothing ran and exec may
+    // re-send. Nothing listens, so attempts are counted by time instead: each
+    // re-send first sleeps its backoff (at least 75% of 40 + 80 + 160 ms
+    // here), while an unretried refusal on loopback returns at once.
+    #[test]
+    fn exec_retries_connection_refused() {
+        let port = TcpListener::bind("127.0.0.1:0")
+            .expect("listener should bind")
+            .local_addr()
+            .expect("listener address")
+            .port();
+        let client = Client::with_config(
+            ClientConfig {
+                api_url: Some(format!("http://127.0.0.1:{}", port)),
+                pat_token: Some("pat-token".to_string()),
+                retry: Some(RetryConfig {
+                    max_retries: Some(3),
+                    base_delay_ms: Some(40),
+                    max_delay_ms: Some(1000),
+                    max_retry_after_ms: None,
+                }),
+                ..Default::default()
+            },
+            ApiVersion::V1,
+        )
+        .expect("client should build");
+        let started = std::time::Instant::now();
+        let err = client
+            .exec("sb-1", ExecRequest::from("true"))
+            .expect_err("nothing listens on the port");
+        let elapsed = started.elapsed();
+        assert!(
+            matches!(&err, Error::Reqwest(inner) if inner.is_connect()),
+            "unexpected error: {}",
+            err
+        );
+        assert!(elapsed >= Duration::from_millis(200), "refusal was not retried: {:?}", elapsed);
+    }
+
+    // Every other call is safe to repeat, so an ambiguous failure (the
+    // connection dying after the request was read) still re-sends.
+    #[test]
+    fn get_still_retries_a_hangup_after_the_request_was_sent() {
+        let body = named_sandbox_json("sb-1", "web").to_string();
+        let (url, hits) = spawn_scripted_server(vec![Reply::Hangup, Reply::ok(body)]);
+        let sandbox = fast_retry_client(&url)
+            .get("sb-1")
+            .expect("get should retry to success");
+        assert_eq!(sandbox.data.id, "sb-1");
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+    }
+
+    /// Formats `t` as an IMF-fixdate, the HTTP-date form servers send.
+    fn format_imf_fixdate(t: SystemTime) -> String {
+        const WEEKDAYS: [&str; 7] = ["Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"];
+        const MONTHS: [&str; 12] = [
+            "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+        ];
+        let secs = t.duration_since(UNIX_EPOCH).expect("after 1970").as_secs() as i64;
+        let (days, rem) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
+        // Howard Hinnant's civil_from_days.
+        let z = days + 719_468;
+        let era = z.div_euclid(146_097);
+        let doe = z - era * 146_097;
+        let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let day = doy - (153 * mp + 2) / 5 + 1;
+        let month = if mp < 10 { mp + 3 } else { mp - 9 };
+        let year = yoe + era * 400 + if month <= 2 { 1 } else { 0 };
+        format!(
+            "{}, {:02} {} {} {:02}:{:02}:{:02} GMT",
+            WEEKDAYS[days.rem_euclid(7) as usize],
+            day,
+            MONTHS[(month - 1) as usize],
+            year,
+            rem / 3_600,
+            rem % 3_600 / 60,
+            rem % 60
+        )
+    }
+
+    #[test]
+    fn parse_retry_after_reads_seconds_and_http_dates() {
+        // Mon, 02 Nov 2026 12:00:00 GMT
+        let now = UNIX_EPOCH + Duration::from_secs(1_793_620_800);
+        let secs = |s: u64| Some(Duration::from_secs(s));
+        for (value, want) in [
+            ("", None),
+            ("   ", None),
+            ("3", secs(3)),
+            (" 3 ", secs(3)),
+            ("0", secs(0)),
+            ("-1", None),
+            ("+3", None),
+            ("1.5", None),
+            ("soon", None),
+            ("99999999999999999999", secs(MAX_RETRY_AFTER_SECS)),
+            ("Mon, 02 Nov 2026 12:00:07 GMT", secs(7)),
+            ("Mon, 02 Nov 2026 11:59:00 GMT", secs(0)),
+            ("Thu, 01 Jan 1960 00:00:00 GMT", secs(0)),
+            ("Mon, 32 Nov 2026 12:00:07 GMT", None),
+            ("Mon, 02 Foo 2026 12:00:07 GMT", None),
+            ("Mon, 02 Nov 2026 12:00:07 UTC", None),
+            ("Monday, 02-Nov-26 12:00:07 GMT", None),
+            ("Mon, 02 Nov 2026 12:00:07 GMT\u{e9}", None),
+        ] {
+            assert_eq!(parse_retry_after(value, now), want, "{:?}", value);
+        }
+        assert_eq!(format_imf_fixdate(now), "Mon, 02 Nov 2026 12:00:00 GMT");
+        // Round trip across leap years and month ends.
+        for secs in [0u64, 951_782_400, 1_709_208_000, 1_793_620_807, 4_102_444_799] {
+            let t = UNIX_EPOCH + Duration::from_secs(secs);
+            assert_eq!(parse_imf_fixdate(&format_imf_fixdate(t)), Some(t), "{}", secs);
+        }
+    }
+
+    #[test]
+    fn retry_wait_honours_retry_after_between_backoff_and_cap() {
+        let now = UNIX_EPOCH + Duration::from_secs(1_793_620_800);
+        let ms = Duration::from_millis;
+        let client = |limit: u64| {
+            Client::with_config(
+                ClientConfig {
+                    api_url: Some("http://unused".to_string()),
+                    pat_token: Some("pat-token".to_string()),
+                    retry: Some(RetryConfig {
+                        max_retries: Some(3),
+                        base_delay_ms: Some(100),
+                        max_delay_ms: Some(1000),
+                        max_retry_after_ms: Some(limit),
+                    }),
+                    ..Default::default()
+                },
+                ApiVersion::V1,
+            )
+            .expect("client should build")
+        };
+        for (name, limit, attempt, header, r, want) in [
+            ("no header: backoff minus a quarter", 2000, 0, None, 0.0, ms(75)),
+            ("no header: backoff plus a quarter", 2000, 0, None, 1.0, ms(125)),
+            ("no header: doubles per attempt", 2000, 2, None, 0.5, ms(400)),
+            ("no header: capped by max_delay_ms", 2000, 5, None, 0.5, ms(1000)),
+            ("no header: huge attempt saturates", 2000, 200, None, 0.5, ms(1000)),
+            ("malformed header falls back", 2000, 0, Some("soon"), 0.0, ms(75)),
+            ("seconds: never sooner than asked", 2000, 0, Some("1"), 0.0, ms(1000)),
+            ("seconds: at most a fifth later", 2000, 0, Some("1"), 1.0, ms(1200)),
+            ("HTTP date", 2000, 0, Some("Mon, 02 Nov 2026 12:00:01 GMT"), 0.0, ms(1000)),
+            ("backoff is the floor", 2000, 2, Some("0"), 0.0, ms(400)),
+            ("spread stops at the cap", 1100, 0, Some("1"), 1.0, ms(1100)),
+            ("long ask is cut to the cap", 2000, 0, Some("120"), 0.0, ms(2000)),
+            ("long ask spreads below the cap", 2000, 0, Some("120"), 1.0, ms(1600)),
+            ("cap 0 ignores the header", 0, 0, Some("120"), 0.0, ms(75)),
+        ] {
+            assert_eq!(client(limit).retry_wait(attempt, header, now, r), want, "{}", name);
+        }
+        assert_eq!(RetryConfig::default().max_retry_after_ms, Some(DEFAULT_MAX_RETRY_AFTER_MS));
+    }
+
+    fn paced(status: &'static str, retry_after: Option<&str>) -> Reply {
+        Reply::Paced { status, retry_after: retry_after.map(String::from) }
+    }
+
+    /// Runs one call through each retry policy: get is idempotent, exec is
+    /// re-sent only after a refusal.
+    fn get_or_exec(client: &Client, exec: bool) -> Result<(), Error> {
+        if exec {
+            client.exec("sb-1", ExecRequest::from("true")).map(|_| ())
+        } else {
+            client.get("sb-1").map(|_| ())
+        }
+    }
+
+    // With a 1 ms backoff, only the server's Retry-After explains a 1 s wait.
+    // The cases run side by side so the test takes about 2 s.
+    #[test]
+    fn retry_waits_out_retry_after_on_429_and_503() {
+        // Whole-second precision: the date asks for 1-2 s.
+        let in_two_seconds = format_imf_fixdate(SystemTime::now() + Duration::from_secs(2));
+        let cases = [
+            ("429 seconds", "429 Too Many Requests", "1".to_string(), 1000, 2000),
+            ("503 seconds", "503 Service Unavailable", "1".to_string(), 1000, 2000),
+            ("503 HTTP date", "503 Service Unavailable", in_two_seconds, 1000, 3000),
+        ];
+        let runs: Vec<_> = cases
+            .into_iter()
+            .flat_map(|(name, status, header, low, high)| {
+                [false, true].map(move |exec| {
+                    let header = header.clone();
+                    thread::spawn(move || {
+                        let ok = if exec { exec_ok_json() } else { named_sandbox_json("sb-1", "web").to_string() };
+                        let (url, hits) = spawn_scripted_server(vec![paced(status, Some(&header)), Reply::ok(ok)]);
+                        let started = std::time::Instant::now();
+                        let result = get_or_exec(&fast_retry_client(&url), exec);
+                        let elapsed = started.elapsed();
+                        assert!(result.is_ok(), "{} exec={}: {:?}", name, exec, result.err());
+                        assert_eq!(hits.load(Ordering::SeqCst), 2, "{} exec={}", name, exec);
+                        assert!(
+                            elapsed >= Duration::from_millis(low) && elapsed <= Duration::from_millis(high),
+                            "{} exec={}: retried after {:?}",
+                            name,
+                            exec,
+                            elapsed
+                        );
+                    })
+                })
+            })
+            .collect();
+        for run in runs {
+            run.join().expect("case should pass");
+        }
+    }
+
+    #[test]
+    fn retry_after_is_capped() {
+        let ok = named_sandbox_json("sb-1", "web").to_string();
+        let (url, hits) = spawn_scripted_server(vec![paced("503 Service Unavailable", Some("120")), Reply::ok(ok)]);
+        let client = Client::with_config(
+            ClientConfig {
+                api_url: Some(url),
+                pat_token: Some("pat-token".to_string()),
+                retry: Some(RetryConfig { max_retry_after_ms: Some(100), ..fast_retry_client("http://unused").retry_config }),
+                ..Default::default()
+            },
+            ApiVersion::V1,
+        )
+        .expect("client should build");
+        let started = std::time::Instant::now();
+        client.get("sb-1").expect("get should retry to success");
+        let elapsed = started.elapsed();
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        assert!(
+            elapsed >= Duration::from_millis(80) && elapsed <= Duration::from_secs(1),
+            "Retry-After: 120 with a 100 ms cap waited {:?}",
+            elapsed
+        );
+    }
+
+    // A missing or malformed header, or one on a status that is a hop's
+    // rather than the server's pacing (421/502/504), keeps the 1 ms backoff.
+    #[test]
+    fn retry_without_usable_retry_after_uses_backoff() {
+        for (status, header) in [
+            ("503 Service Unavailable", None),
+            ("429 Too Many Requests", Some("soon")),
+            ("503 Service Unavailable", Some("-1")),
+            ("421 Misdirected Request", Some("120")),
+            ("502 Bad Gateway", Some("120")),
+            ("504 Gateway Timeout", Some("120")),
+        ] {
+            let ok = named_sandbox_json("sb-1", "web").to_string();
+            let (url, hits) = spawn_scripted_server(vec![paced(status, header), Reply::ok(ok)]);
+            let started = std::time::Instant::now();
+            fast_retry_client(&url).get("sb-1").expect("get should retry to success");
+            assert_eq!(hits.load(Ordering::SeqCst), 2, "{} {:?}", status, header);
+            assert!(started.elapsed() < Duration::from_millis(500), "{} {:?}: {:?}", status, header, started.elapsed());
+        }
+    }
+
+    #[test]
+    fn retry_after_keeps_retry_budget_and_statuses() {
+        let (url, hits) = spawn_scripted_server(vec![paced("503 Service Unavailable", Some("0"))]);
+        let err = fast_retry_client(&url).get("sb-1").expect_err("every attempt is refused");
+        assert!(err.to_string().contains("503"), "unexpected error: {}", err);
+        assert_eq!(hits.load(Ordering::SeqCst), 4, "1 + 3 retries");
+
+        for status in ["400 Bad Request", "404 Not Found", "500 Internal Server Error"] {
+            let (url, hits) = spawn_scripted_server(vec![paced(status, Some("1"))]);
+            assert!(fast_retry_client(&url).get("sb-1").is_err(), "{}", status);
+            assert_eq!(hits.load(Ordering::SeqCst), 1, "{} is not retried", status);
+        }
+
+        let (url, hits) = spawn_scripted_server(vec![paced("502 Bad Gateway", Some("1"))]);
+        assert!(get_or_exec(&fast_retry_client(&url), true).is_err());
+        assert_eq!(hits.load(Ordering::SeqCst), 1, "exec does not re-send a 502");
+    }
+
+    // reqwest's 30 s default total timeout failed every exec longer than
+    // 30 s. Waiting that out is too slow for a unit test, so prove both
+    // halves: the value build_http_client takes reaches reqwest (a 50 ms cap
+    // trips on a reply 300 ms away), and the client Client::new builds waits
+    // for that same slow reply.
+    #[test]
+    fn http_client_has_no_total_request_timeout() {
+        let slow = |body: String| Reply::Json {
+            status: "200 OK",
+            body,
+            delay: Duration::from_millis(300),
+        };
+        let (url, _) = spawn_scripted_server(vec![slow("{}".to_string())]);
+        let err = build_http_client(Some(Duration::from_millis(50)))
+            .expect("client should build")
+            .get(&url)
+            .send()
+            .expect_err("a 50 ms cap must trip on a 300 ms reply");
+        assert!(err.is_timeout(), "unexpected error: {}", err);
+
+        let (url, hits) = spawn_scripted_server(vec![slow(exec_ok_json())]);
+        let result = Client::new(Some(&url), Some("pat-token"))
+            .expect("client should build")
+            .exec("sb-1", ExecRequest::from("sleep 1"))
+            .expect("a slow exec must not time out");
+        assert_eq!(result.exit_code, 0);
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -2708,6 +3851,36 @@ mod tests {
     }
 
     #[test]
+    fn create_snapshot_with_options_sends_allow_pause_only_when_set() {
+        let body = serde_json::json!({
+            "name": "snap",
+            "image": "aerolvm-snapshot/abc:latest",
+            "source_sandbox_id": "sb-1",
+            "created_at": "2026-11-04T10:00:00Z"
+        })
+        .to_string();
+        for (opts, want) in [
+            (
+                CreateSnapshotOptions { allow_pause: Some(false) },
+                serde_json::json!({"name": "snap", "allow_pause": false}),
+            ),
+            (
+                CreateSnapshotOptions { allow_pause: Some(true) },
+                serde_json::json!({"name": "snap", "allow_pause": true}),
+            ),
+            (CreateSnapshotOptions::default(), serde_json::json!({"name": "snap"})),
+        ] {
+            let (url, request_rx) = spawn_json_server(body.clone());
+            let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+            client
+                .create_snapshot_with_options("sb-1", "snap", &opts)
+                .expect("create snapshot should succeed");
+            let request = request_rx.recv().expect("request should be captured");
+            assert_eq!(request_json_body(&request), want);
+        }
+    }
+
+    #[test]
     fn register_snapshot_sends_image_path_and_maps_response() {
         let body = serde_json::json!({
             "name": "py-base",
@@ -2851,6 +4024,130 @@ mod tests {
     }
 
     #[test]
+    fn get_snapshot_url_encodes_name_and_maps_response() {
+        let body = serde_json::json!({
+            "name": "team/py base:v1",
+            "image": "snapshots/py:v1",
+            "image_id": "sha256:snap-9",
+            "source_sandbox_id": "sb-7",
+            "created_at": "2026-05-16T10:00:00Z",
+            "region_id": "us",
+            "cpu": 2.0,
+            "memory_mb": 2048,
+            "disk_gb": 10
+        })
+        .to_string();
+        let (url, request_rx) = spawn_json_server(body);
+
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        let snapshot = client
+            .get_snapshot("team/py base:v1")
+            .expect("get snapshot should succeed");
+        let request = request_rx.recv().expect("request should be captured");
+
+        // The name carries a slash and a space, so the path must be
+        // percent-encoded; pin the encoded form so a regression that drops
+        // the encoder is caught.
+        assert!(
+            request.starts_with("GET /v1/snapshots/team%2Fpy%20base%3Av1 HTTP/1.1\r\n"),
+            "unexpected request: {}",
+            request
+        );
+        assert_eq!(snapshot.name, "team/py base:v1");
+        assert_eq!(snapshot.image_id.as_deref(), Some("sha256:snap-9"));
+        assert_eq!(snapshot.source_sandbox_id, "sb-7");
+        assert_eq!(snapshot.region_id.as_deref(), Some("us"));
+        assert_eq!(snapshot.cpu, Some(2.0));
+        assert_eq!(snapshot.memory_mb, Some(2048));
+    }
+
+    #[test]
+    fn list_snapshots_sends_query_params_and_maps_page() {
+        let body = serde_json::json!({
+            "snapshots": [
+                {
+                    "name": "a",
+                    "image": "snapshots/a:v1",
+                    "image_id": "sha256:a",
+                    "source_sandbox_id": "sb-a",
+                    "created_at": "2026-05-16T10:00:00Z"
+                },
+                {
+                    "name": "b",
+                    "image": "snapshots/b:v1",
+                    "source_sandbox_id": "sb-b",
+                    "created_at": "2026-05-16T11:00:00Z"
+                }
+            ],
+            "has_more": true
+        })
+        .to_string();
+        let (url, request_rx) = spawn_json_server(body);
+
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        let page = client
+            .list_snapshots(ListSnapshotsOptions {
+                limit: Some(2),
+                starting_after: Some("last-name".to_string()),
+            })
+            .expect("list snapshots should succeed");
+        let request = request_rx.recv().expect("request should be captured");
+
+        assert!(
+            request.starts_with(
+                "GET /v1/snapshots?limit=2&starting_after=last-name HTTP/1.1\r\n"
+            ),
+            "unexpected request: {}",
+            request
+        );
+        assert_eq!(page.snapshots.len(), 2);
+        assert_eq!(page.snapshots[0].name, "a");
+        assert_eq!(page.snapshots[1].name, "b");
+        assert!(page.has_more);
+    }
+
+    #[test]
+    fn list_snapshots_defaults_params_and_null_array_to_empty() {
+        // A null `snapshots` array and an absent `has_more` must decode to an
+        // empty page, and no query string should be sent when both options are
+        // unset.
+        let (url, request_rx) =
+            spawn_json_server(serde_json::json!({ "snapshots": null }).to_string());
+
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        let page = client
+            .list_snapshots(ListSnapshotsOptions::default())
+            .expect("list snapshots should succeed");
+        let request = request_rx.recv().expect("request should be captured");
+
+        assert!(
+            request.starts_with("GET /v1/snapshots HTTP/1.1\r\n"),
+            "unexpected request: {}",
+            request
+        );
+        assert!(page.snapshots.is_empty());
+        assert!(!page.has_more);
+    }
+
+    #[test]
+    fn delete_snapshot_url_encodes_and_accepts_no_content() {
+        let (url, request_rx) =
+            spawn_response_server("204 No Content", "application/json", Vec::new());
+
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        client
+            .delete_snapshot("team/py base:v1")
+            .expect("delete snapshot should succeed");
+        let request = request_rx.recv().expect("request should be captured");
+
+        assert!(
+            request.starts_with("DELETE /v1/snapshots/team%2Fpy%20base%3Av1 HTTP/1.1\r\n"),
+            "unexpected request: {}",
+            request
+        );
+    }
+
+    #[test]
     fn mounts_returns_redacted_mount_specs() {
         let body = serde_json::json!({
             "mounts": [
@@ -2917,6 +4214,82 @@ mod tests {
     }
 
     #[test]
+    fn check_network_policy_posts_and_maps() {
+        let body = serde_json::json!({"allowed": true, "matched_rule": "*.github.com", "default_verdict": "deny"}).to_string();
+        let (url, request_rx) = spawn_json_server(body);
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        let res = client
+            .check_network_policy(NetworkPolicyCheckOptions {
+                network_allow_out: vec!["*.github.com".to_string()],
+                destination: "api.github.com".to_string(),
+                ..Default::default()
+            })
+            .expect("check should succeed");
+        let request = request_rx.recv().expect("request should be captured");
+        assert!(request.starts_with("POST /v1/network/policy/check HTTP/1.1\r\n"), "unexpected request: {}", request);
+        assert!(request.contains("\"network_allow_out\":[\"*.github.com\"]"), "body: {}", request);
+        assert!(!request.contains("network_block_all"), "unset fields are not sent: {}", request);
+        assert!(res.allowed);
+        assert_eq!(res.matched_rule, "*.github.com");
+        assert_eq!(res.outside_ceiling, None);
+    }
+
+    #[test]
+    fn get_audit_sends_filters_and_maps_page() {
+        let body = serde_json::json!({
+            "events": [{
+                "time": "2026-10-06T10:00:00Z",
+                "kind": "egress",
+                "result": "failure",
+                "reason": "host_not_allowed",
+                "destination": "evil.example:443",
+                "event_id": "ae-1"
+            }],
+            "coverage": {"answered": ["n1"], "missing": null, "partial": false},
+            "next_cursor": "c2"
+        })
+        .to_string();
+        let (url, request_rx) = spawn_json_server(body);
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        let page = client
+            .get_audit(
+                "sb-1",
+                AuditOptions {
+                    kind: Some("egress".to_string()),
+                    limit: Some(50),
+                    cursor: Some("c1".to_string()),
+                    incarnation_id: Some("inc-1".to_string()),
+                },
+            )
+            .expect("get_audit should succeed");
+        let request = request_rx.recv().expect("request should be captured");
+        assert!(
+            request.starts_with(
+                "GET /v1/sandboxes/sb-1/audit?kind=egress&limit=50&cursor=c1&incarnation_id=inc-1 HTTP/1.1\r\n"
+            ),
+            "unexpected request: {}",
+            request
+        );
+        assert_eq!(page.events[0].reason.as_deref(), Some("host_not_allowed"));
+        assert_eq!(page.events[0].event_id.as_deref(), Some("ae-1"));
+        assert_eq!(page.coverage.answered, vec!["n1".to_string()]);
+        assert!(page.coverage.missing.is_empty());
+        assert_eq!(page.next_cursor.as_deref(), Some("c2"));
+    }
+
+    #[test]
+    fn get_audit_without_options_and_null_events() {
+        let (url, request_rx) = spawn_json_server(serde_json::json!({"events": null}).to_string());
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        let page = client
+            .get_audit("sb-1", AuditOptions::default())
+            .expect("get_audit should succeed");
+        let request = request_rx.recv().expect("request should be captured");
+        assert!(request.starts_with("GET /v1/sandboxes/sb-1/audit HTTP/1.1\r\n"), "unexpected request: {}", request);
+        assert!(page.events.is_empty());
+    }
+
+    #[test]
     fn get_network_usage_maps_response_shape() {
         let body = serde_json::json!({
             "sandbox_id": "sb-1",
@@ -2964,6 +4337,292 @@ mod tests {
             .get_network_usage("sb-fresh")
             .expect("get_network_usage should succeed");
         assert_eq!(usage.last_sampled_at, None);
+    }
+
+    #[test]
+    fn set_network_policy_puts_whole_policy() {
+        let body = serde_json::json!({
+            "network_block_all": false,
+            "network_allow_out": ["pypi.org"],
+            "network_deny_out": [],
+            "egress_status": "active"
+        })
+        .to_string();
+        let (url, request_rx) = spawn_json_server(body);
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        let data: SandboxData = serde_json::from_value(serde_json::json!({
+            "id": "sb-1", "image": "alpine", "status": "started", "public_url": "", "cpu": 1,
+            "memory_mb": 512, "disk_gb": 1, "os_user": "root", "network_block_all": true,
+            "toolbox_enabled": true, "created_at": "", "updated_at": "", "last_active_at": "",
+            "lifecycle": {}, "runtime": "docker"
+        }))
+        .expect("sandbox data should parse");
+        let mut sandbox = Sandbox::new(client, data);
+        let policy = sandbox
+            .set_network_policy(NetworkPolicyOptions {
+                network_allow_out: vec!["pypi.org".to_string()],
+                ..Default::default()
+            })
+            .expect("set_network_policy should succeed");
+        let request = request_rx.recv().expect("request should be captured");
+        assert!(
+            request.starts_with("PUT /v1/sandboxes/sb-1/network/policy HTTP/1.1\r\n"),
+            "unexpected request: {}",
+            request
+        );
+        assert_eq!(
+            request_json_body(&request),
+            serde_json::json!({"network_block_all": false, "network_allow_out": ["pypi.org"], "network_deny_out": [], "egress_profiles": []})
+        );
+        assert_eq!(policy.network_allow_out, vec!["pypi.org".to_string()]);
+        assert!(!sandbox.data.network_block_all);
+        assert_eq!(sandbox.data.egress_status.as_deref(), Some("active"));
+    }
+
+    #[test]
+    fn set_network_policy_sends_and_syncs_egress_rules() {
+        let body = serde_json::json!({
+            "network_block_all": false,
+            "network_allow_out": ["api.github.com"],
+            "network_deny_out": [],
+            "network_egress_rules": [{"host": "api.github.com", "ports": [443], "methods": ["GET"], "paths": ["/repos/acme/**"], "inspect": true}]
+        })
+        .to_string();
+        let (url, request_rx) = spawn_json_server(body);
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        let data: SandboxData = serde_json::from_value(serde_json::json!({
+            "id": "sb-1", "image": "alpine", "status": "started", "public_url": "", "cpu": 1,
+            "memory_mb": 512, "disk_gb": 1, "os_user": "root", "network_block_all": false,
+            "toolbox_enabled": true, "created_at": "", "updated_at": "", "last_active_at": "",
+            "lifecycle": {}, "runtime": "docker",
+            "network_egress_rules": [{"host": "old.example", "ports": null}]
+        }))
+        .expect("sandbox data should parse");
+        assert_eq!(data.network_egress_rules.as_ref().map(|r| r[0].ports.is_empty()), Some(true));
+        let mut sandbox = Sandbox::new(client, data);
+        let rule = EgressRule {
+            host: "api.github.com".to_string(),
+            methods: vec!["GET".to_string()],
+            paths: vec!["/repos/acme/**".to_string()],
+            inspect: true,
+            ..Default::default()
+        };
+        let policy = sandbox
+            .set_network_policy(NetworkPolicyOptions {
+                network_allow_out: vec!["api.github.com".to_string()],
+                network_egress_rules: vec![rule],
+                ..Default::default()
+            })
+            .expect("set_network_policy should succeed");
+        let request = request_rx.recv().expect("request should be captured");
+        assert_eq!(
+            request_json_body(&request)["network_egress_rules"],
+            serde_json::json!([{"host": "api.github.com", "methods": ["GET"], "paths": ["/repos/acme/**"], "inspect": true}])
+        );
+        assert_eq!(policy.network_egress_rules[0].ports, vec![443]);
+        let synced = sandbox.data.network_egress_rules.as_ref().expect("rules should be synced");
+        assert_eq!(synced[0].host, "api.github.com");
+        assert!(synced[0].inspect);
+    }
+
+    #[test]
+    fn egress_rule_inject_round_trips_as_secret_ref() {
+        let wire = serde_json::json!({
+            "host": "api.github.com", "ports": [443], "paths": ["/repos/**"], "inspect": true,
+            "inject": {"header": "Authorization", "secret_ref": "env:GITHUB_TOKEN"}
+        });
+        let body = serde_json::json!({
+            "network_block_all": false,
+            "network_allow_out": ["api.github.com"],
+            "network_deny_out": [],
+            "network_egress_rules": [wire.clone()]
+        })
+        .to_string();
+        let (url, request_rx) = spawn_json_server(body);
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        let data: SandboxData = serde_json::from_value(serde_json::json!({
+            "id": "sb-1", "image": "alpine", "status": "started", "public_url": "", "cpu": 1,
+            "memory_mb": 512, "disk_gb": 1, "os_user": "root", "network_block_all": false,
+            "toolbox_enabled": true, "created_at": "", "updated_at": "", "last_active_at": "",
+            "lifecycle": {}, "runtime": "docker",
+            "network_egress_rules": [wire.clone(), {"host": "pypi.org", "inject": null}]
+        }))
+        .expect("sandbox data should parse");
+        let inject = EgressInject {
+            header: "Authorization".to_string(),
+            secret_ref: "env:GITHUB_TOKEN".to_string(),
+        };
+        let parsed = data.network_egress_rules.as_ref().expect("rules should parse");
+        assert_eq!(parsed[0].inject.as_ref(), Some(&inject));
+        assert_eq!(parsed[1].inject, None);
+        let mut sandbox = Sandbox::new(client, data);
+        let rule = EgressRule {
+            host: "api.github.com".to_string(),
+            paths: vec!["/repos/**".to_string()],
+            inspect: true,
+            inject: Some(inject.clone()),
+            ..Default::default()
+        };
+        let plain = EgressRule { host: "api.github.com".to_string(), ..Default::default() };
+        let policy = sandbox
+            .set_network_policy(NetworkPolicyOptions {
+                network_allow_out: vec!["api.github.com".to_string()],
+                network_egress_rules: vec![rule, plain],
+                ..Default::default()
+            })
+            .expect("set_network_policy should succeed");
+        let request = request_rx.recv().expect("request should be captured");
+        assert_eq!(
+            request_json_body(&request)["network_egress_rules"],
+            serde_json::json!([
+                {"host": "api.github.com", "paths": ["/repos/**"], "inspect": true,
+                 "inject": {"header": "Authorization", "secret_ref": "env:GITHUB_TOKEN"}},
+                {"host": "api.github.com"}
+            ])
+        );
+        assert_eq!(policy.network_egress_rules[0].inject.as_ref(), Some(&inject));
+        let synced = sandbox.data.network_egress_rules.as_ref().expect("rules should be synced");
+        assert_eq!(synced[0].inject.as_ref(), Some(&inject));
+    }
+
+    #[test]
+    fn egress_rule_binaries_round_trip() {
+        let git = serde_json::json!({"host": "github.com", "ports": [22], "binaries": ["/usr/bin/git"]});
+        let pip = serde_json::json!({"host": "pypi.org", "ports": [443], "binaries": ["/usr/local/bin/pip"]});
+        let body = serde_json::json!({
+            "network_block_all": false,
+            "network_allow_out": ["github.com:22", "pypi.org"],
+            "network_deny_out": [],
+            "network_egress_rules": [git.clone(), pip.clone()]
+        })
+        .to_string();
+        let (url, request_rx) = spawn_json_server(body);
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        let data: SandboxData = serde_json::from_value(serde_json::json!({
+            "id": "sb-1", "image": "alpine", "status": "started", "public_url": "", "cpu": 1,
+            "memory_mb": 512, "disk_gb": 1, "os_user": "root", "network_block_all": false,
+            "toolbox_enabled": true, "created_at": "", "updated_at": "", "last_active_at": "",
+            "lifecycle": {}, "runtime": "docker",
+            "network_egress_rules": [git.clone(), {"host": "pypi.org", "binaries": null}]
+        }))
+        .expect("sandbox data should parse");
+        let parsed = data.network_egress_rules.as_ref().expect("rules should parse");
+        assert_eq!(parsed[0].binaries, vec!["/usr/bin/git".to_string()]);
+        assert!(parsed[1].binaries.is_empty());
+        let mut sandbox = Sandbox::new(client, data);
+        let rule = EgressRule {
+            host: "github.com".to_string(),
+            ports: vec![22],
+            binaries: vec!["/usr/bin/git".to_string()],
+            ..Default::default()
+        };
+        let plain = EgressRule { host: "pypi.org".to_string(), ..Default::default() };
+        let policy = sandbox
+            .set_network_policy(NetworkPolicyOptions {
+                network_allow_out: vec!["github.com:22".to_string(), "pypi.org".to_string()],
+                network_egress_rules: vec![rule.clone(), plain],
+                ..Default::default()
+            })
+            .expect("set_network_policy should succeed");
+        let request = request_rx.recv().expect("request should be captured");
+        assert_eq!(
+            request_json_body(&request)["network_egress_rules"],
+            serde_json::json!([git, {"host": "pypi.org"}])
+        );
+        assert_eq!(policy.network_egress_rules[0], rule);
+        assert_eq!(policy.network_egress_rules[1].binaries, vec!["/usr/local/bin/pip".to_string()]);
+        let synced = sandbox.data.network_egress_rules.as_ref().expect("rules should be synced");
+        assert_eq!(synced[1].binaries, vec!["/usr/local/bin/pip".to_string()]);
+    }
+
+    #[test]
+    fn exec_request_defaults_the_options() {
+        let req = ExecRequest { command: "true".to_string(), ..Default::default() };
+        assert!(req.work_dir.is_none() && req.env.is_none() && req.timeout_seconds.is_none());
+    }
+
+    #[test]
+    fn exec_request_from_plain_command_string() {
+        for req in [ExecRequest::from("echo hello"), ExecRequest::from("echo hello".to_string())] {
+            assert_eq!(req.command, "echo hello");
+            assert!(req.work_dir.is_none() && req.env.is_none() && req.timeout_seconds.is_none());
+        }
+    }
+
+    #[test]
+    fn sandbox_exec_accepts_plain_command_string() {
+        let body = serde_json::json!({"stdout": "hello\n", "stderr": "", "exit_code": 0, "duration_ms": 3}).to_string();
+        let (url, request_rx) = spawn_json_server(body);
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        let data: SandboxData = serde_json::from_value(serde_json::json!({
+            "id": "sb-1", "image": "alpine", "status": "started", "public_url": "", "cpu": 1,
+            "memory_mb": 512, "disk_gb": 1, "os_user": "root", "network_block_all": false,
+            "toolbox_enabled": true, "created_at": "", "updated_at": "", "last_active_at": "",
+            "lifecycle": {}, "runtime": "docker"
+        }))
+        .expect("sandbox data should parse");
+        let sandbox = Sandbox::new(client, data);
+        let result = sandbox.exec("echo hello").expect("exec should succeed");
+        let request = request_rx.recv().expect("request should be captured");
+        assert!(
+            request.starts_with("POST /v1/sandboxes/sb-1/toolbox/process/execute HTTP/1.1\r\n"),
+            "unexpected request: {}",
+            request
+        );
+        assert_eq!(request_json_body(&request), serde_json::json!({"command": "echo hello"}));
+        assert_eq!(result.stdout, "hello\n");
+    }
+
+    #[test]
+    fn get_network_learned_maps_nulls() {
+        let body = serde_json::json!({
+            "mode": "learn", "truncated": false,
+            "entries": [{"host": "pypi.org", "ports": null, "hits": 1}],
+            "cidrs": null, "suggested_allow_out": ["pypi.org"], "suggested_profile": null
+        })
+        .to_string();
+        let (url, request_rx) = spawn_json_server(body);
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        let learned = client.get_network_learned("sb-1").expect("learned should succeed");
+        let request = request_rx.recv().expect("request should be captured");
+        assert!(request.starts_with("GET /v1/sandboxes/sb-1/network/learned HTTP/1.1\r\n"), "unexpected request: {}", request);
+        assert_eq!(learned.mode, "learn");
+        assert!(learned.entries[0].ports.is_empty());
+        assert!(learned.cidrs.is_empty());
+        assert_eq!(learned.suggested_allow_out, vec!["pypi.org".to_string()]);
+        assert!(learned.suggested_profile.is_none());
+    }
+
+    #[test]
+    fn egress_profile_crud_maps_wire_shape() {
+        let body = serde_json::json!({
+            "name": "python", "allow_out": ["pypi.org"], "description": "pip",
+            "generation": 2, "created_at": "c", "updated_at": "u"
+        })
+        .to_string();
+        let (url, request_rx) = spawn_json_server(body);
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        let profile = client
+            .put_egress_profile(
+                "python",
+                EgressProfileOptions { allow_out: vec!["pypi.org".to_string()], description: "pip".to_string() },
+            )
+            .expect("put should succeed");
+        let request = request_rx.recv().expect("request should be captured");
+        assert!(request.starts_with("PUT /v1/egress-profiles/python HTTP/1.1\r\n"), "unexpected request: {}", request);
+        assert_eq!(request_json_body(&request), serde_json::json!({"allow_out": ["pypi.org"], "description": "pip"}));
+        assert_eq!(profile.generation, 2);
+        assert_eq!(profile.description, "pip");
+
+        let (url, request_rx) = spawn_json_server(serde_json::json!({"profiles": null, "next_cursor": "z"}).to_string());
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        let page = client
+            .list_egress_profiles(ListEgressProfilesOptions { cursor: Some("a".to_string()), limit: Some(5) })
+            .expect("list should succeed");
+        let request = request_rx.recv().expect("request should be captured");
+        assert!(request.starts_with("GET /v1/egress-profiles?cursor=a&limit=5 HTTP/1.1\r\n"), "unexpected request: {}", request);
+        assert!(page.profiles.is_empty());
+        assert_eq!(page.next_cursor.as_deref(), Some("z"));
     }
 
     #[test]
@@ -3283,6 +4942,122 @@ mod tests {
         );
     }
 
+    fn named_sandbox_json(id: &str, name: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": id,
+            "name": name,
+            "tags": {"team": "x"},
+            "image": "ubuntu:22.04",
+            "status": "started",
+            "public_url": "https://sb.example.com",
+            "container_id": "c1",
+            "container_ip": "10.0.0.1",
+            "cpu": 1,
+            "memory_mb": 512,
+            "disk_gb": 5,
+            "os_user": "root",
+            "network_block_all": false,
+            "toolbox_enabled": true,
+            "created_at": "2024-01-01T00:00:00Z",
+            "updated_at": "2024-01-01T00:00:00Z",
+            "last_active_at": "2024-01-01T00:00:00Z",
+            "lifecycle": {}
+        })
+    }
+
+    // Names are unique per owner and looked up with ?name=. get_by_name must
+    // trust the reply only when it holds at most one sandbox carrying that
+    // name: an old server ignores the filter and returns a normal list page.
+    #[test]
+    fn get_by_name_sends_name_query_and_verifies_reply() {
+        let body = serde_json::json!([named_sandbox_json("sb-1", "agent")]).to_string();
+        let (url, request_rx) = spawn_json_server(body);
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        let found = client
+            .get_by_name(" agent ")
+            .expect("get_by_name should succeed")
+            .expect("sandbox should be found");
+        assert_eq!(found.data.id, "sb-1");
+        assert_eq!(found.data.name.as_deref(), Some("agent"));
+        assert_eq!(
+            found.data.tags.as_ref().and_then(|t| t.get("team")).map(String::as_str),
+            Some("x")
+        );
+        let request = request_rx.recv().expect("request");
+        assert!(
+            request.starts_with("GET /v1/sandboxes?name=agent HTTP/1.1\r\n"),
+            "unexpected request: {}",
+            request
+        );
+
+        let (url, _rx) = spawn_json_server("[]".to_string());
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        assert!(client.get_by_name("agent").expect("empty reply is ok").is_none());
+
+        for reply in [
+            serde_json::json!([named_sandbox_json("sb-1", "a"), named_sandbox_json("sb-2", "b")]),
+            serde_json::json!([named_sandbox_json("sb-3", "someone-else")]),
+        ] {
+            let (url, _rx) = spawn_json_server(reply.to_string());
+            let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+            match client.get_by_name("agent") {
+                Err(Error::Client(msg)) => assert!(msg.contains("does not support sandbox name lookup"), "{}", msg),
+                other => panic!("expected unsupported error, got {:?}", other.map(|s| s.map(|s| s.data.id))),
+            }
+        }
+
+        let client = Client::new(Some("http://127.0.0.1:1"), Some("pat-token")).expect("client should build");
+        assert!(matches!(client.get_by_name("  "), Err(Error::Client(_))));
+    }
+
+    #[test]
+    fn create_options_serializes_name_and_tags() {
+        let mut opts = minimal_create_options();
+        assert!(serde_json::to_value(&opts).expect("serialize").get("name").is_none());
+        opts.name = Some("agent".to_string());
+        let mut tags = std::collections::HashMap::new();
+        tags.insert("a".to_string(), "b".to_string());
+        opts.tags = Some(tags);
+        let value = serde_json::to_value(&opts).expect("serialize create options");
+        assert_eq!(value["name"], "agent");
+        assert_eq!(value["tags"]["a"], "b");
+    }
+
+    #[test]
+    fn create_sends_template_id_and_gpus() {
+        let (url, request_rx) = spawn_json_server(named_sandbox_json("sb-fc", "fc").to_string());
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        client
+            .create(CreateOptions {
+                runtime: Some("firecracker".to_string()),
+                template_id: Some("tpl-1".to_string()),
+                gpus: Some(GPUOptions {
+                    vendor: GPUVendor::Nvidia,
+                    count: Some(2),
+                    device_ids: Some(vec!["0".to_string(), "GPU-abc".to_string()]),
+                }),
+                ..minimal_create_options()
+            })
+            .expect("create should succeed");
+        let body = request_json_body(&request_rx.recv().expect("request should be captured"));
+        assert_eq!(body["template_id"], "tpl-1");
+        assert_eq!(
+            body["gpus"],
+            serde_json::json!({"vendor": "nvidia", "count": 2, "device_ids": ["0", "GPU-abc"]})
+        );
+
+        let plain = serde_json::to_value(minimal_create_options()).expect("serialize");
+        assert!(plain.get("template_id").is_none());
+        assert!(plain.get("gpus").is_none());
+        let amd = serde_json::to_value(GPUOptions {
+            vendor: GPUVendor::Amd,
+            count: None,
+            device_ids: None,
+        })
+        .expect("serialize gpus");
+        assert_eq!(amd, serde_json::json!({"vendor": "amd"}));
+    }
+
     #[test]
     fn get_and_list_include_env() {
         // Only assert wire query for include_env; list returns [] so we avoid
@@ -3417,7 +5192,7 @@ mod tests {
             Client::new(Some(&format!("http://{}", addr)), Some("pat-token")).expect("client");
         let err = client.list().expect_err("partial list must fail");
         match err {
-            Error::Api(msg) => assert!(msg.contains("incomplete cluster list"), "msg={msg}"),
+            Error::Client(msg) => assert!(msg.contains("incomplete cluster list"), "msg={msg}"),
             other => panic!("unexpected error: {other:?}"),
         }
     }
@@ -3589,7 +5364,7 @@ mod tests {
 
     // 409 Conflict is the documented response when the hostname is already
     // bound to a different sandbox. We just need to confirm it surfaces as an
-    // Api error carrying the server-supplied JSON `error` field — that's the
+    // Status error carrying the server-supplied JSON `error` field — that's the
     // contract handle_response promises for any 4xx.
     #[test]
     fn add_custom_domain_surfaces_409_conflict() {
@@ -3805,7 +5580,7 @@ mod tests {
             .create_template(CreateTemplateOptions::default())
             .expect_err("empty image must be rejected");
         match err {
-            Error::Api(msg) => assert!(msg.contains("image is required"), "msg = {}", msg),
+            Error::Client(msg) => assert!(msg.contains("image is required"), "msg = {}", msg),
             other => panic!("unexpected error: {:?}", other),
         }
     }
@@ -3863,7 +5638,7 @@ mod tests {
             })
             .expect_err("empty module_ref must be rejected");
         match err {
-            Error::Api(msg) => assert!(msg.contains("module_ref is required"), "msg = {}", msg),
+            Error::Client(msg) => assert!(msg.contains("module_ref is required"), "msg = {}", msg),
             other => panic!("unexpected error: {:?}", other),
         }
     }
@@ -3894,7 +5669,10 @@ mod tests {
             .rebuild_template("tpl-pending")
             .expect_err("412 must surface as error");
         match err {
-            Error::Api(msg) => assert!(msg.contains("not eligible"), "msg = {}", msg),
+            Error::Api(api) => {
+                assert_eq!(api.status(), 412);
+                assert!(api.message().contains("not eligible"), "msg = {}", api.message());
+            }
             other => panic!("unexpected error: {:?}", other),
         }
     }
@@ -3947,5 +5725,515 @@ mod tests {
 
         assert!(dns.records.is_empty());
         assert_eq!(dns.target.hostname.as_deref(), Some("ingress.example.com"));
+    }
+
+    fn env_from(vars: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let map: std::collections::HashMap<String, String> = vars
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        move |name: &str| map.get(name).cloned()
+    }
+
+    // SB_API_TOKEN is an alias of SB_PAT_TOKEN; SB_PAT_TOKEN wins when both
+    // are set, and an explicit pat_token beats both.
+    #[test]
+    fn resolve_token_prefers_option_then_pat_then_alias() {
+        let cases: Vec<(&str, Option<&str>, Vec<(&str, &str)>, Option<&str>)> = vec![
+            ("pat only", None, vec![("SB_PAT_TOKEN", "pat")], Some("pat")),
+            ("alias only", None, vec![("SB_API_TOKEN", "avm_alias")], Some("avm_alias")),
+            ("pat beats alias", None, vec![("SB_PAT_TOKEN", "pat"), ("SB_API_TOKEN", "avm_alias")], Some("pat")),
+            ("blank pat falls through", None, vec![("SB_PAT_TOKEN", "  "), ("SB_API_TOKEN", "avm_alias")], Some("avm_alias")),
+            ("option beats both", Some("opt"), vec![("SB_PAT_TOKEN", "pat"), ("SB_API_TOKEN", "avm_alias")], Some("opt")),
+            ("blank option falls through", Some(" "), vec![("SB_API_TOKEN", "avm_alias")], Some("avm_alias")),
+            ("nothing set", None, vec![], None),
+        ];
+        for (name, explicit, env, want) in cases {
+            let got = resolve_token(explicit.map(String::from), env_from(&env));
+            assert_eq!(got.as_deref(), want, "{}", name);
+        }
+    }
+
+    #[test]
+    fn resolve_team_trims_and_falls_back_to_sb_team() {
+        let cases: Vec<(&str, Option<&str>, Vec<(&str, &str)>, Option<&str>)> = vec![
+            ("SB_TEAM", None, vec![("SB_TEAM", " payments ")], Some("payments")),
+            ("option beats SB_TEAM", Some("ml"), vec![("SB_TEAM", "payments")], Some("ml")),
+            ("blank option falls through", Some("  "), vec![("SB_TEAM", "payments")], Some("payments")),
+            ("blank SB_TEAM is no header", None, vec![("SB_TEAM", "   ")], None),
+            ("nothing set", None, vec![], None),
+        ];
+        for (name, explicit, env, want) in cases {
+            let got = resolve_team(explicit.map(String::from), env_from(&env));
+            assert_eq!(got.as_deref(), want, "{}", name);
+        }
+    }
+
+    #[test]
+    fn missing_token_error_names_the_alias() {
+        assert!(Error::MissingToken.to_string().contains("SB_API_TOKEN"));
+    }
+
+    /// Serves `count` requests, answering each by its request line from
+    /// `routes` (404 otherwise), and hands back every raw request.
+    fn spawn_route_server(
+        routes: Vec<(&'static str, &'static str, String)>,
+        count: usize,
+    ) -> (String, std::sync::mpsc::Receiver<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener should bind");
+        let addr = listener.local_addr().expect("listener address");
+        let (request_tx, request_rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            for _ in 0..count {
+                let (mut stream, _) = listener.accept().expect("server should accept");
+                let request = read_http_request(&mut stream);
+                let line = request.lines().next().unwrap_or_default().to_string();
+                let (status, body) = routes
+                    .iter()
+                    .find(|(prefix, _, _)| line.starts_with(prefix))
+                    .map(|(_, status, body)| (*status, body.clone()))
+                    .unwrap_or(("404 Not Found", r#"{"error":"unexpected"}"#.to_string()));
+                let head = if status.starts_with("204") {
+                    "HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n".to_string()
+                } else {
+                    format!(
+                        "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        status,
+                        body.len(),
+                        body
+                    )
+                };
+                stream.write_all(head.as_bytes()).expect("response should write");
+                request_tx.send(request).expect("request should be sent");
+            }
+        });
+        (format!("http://{}", addr), request_rx)
+    }
+
+    fn header_value<'a>(request: &'a str, name: &str) -> Option<&'a str> {
+        request
+            .lines()
+            .take_while(|line| !line.is_empty())
+            .filter_map(|line| line.split_once(':'))
+            .find(|(key, _)| key.trim().eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.trim())
+    }
+
+    fn team_client(url: &str, team: Option<&str>) -> Client {
+        let mut client = Client::with_config(
+            ClientConfig {
+                api_url: Some(url.to_string()),
+                pat_token: Some("avm_admin".to_string()),
+                team: team.map(String::from),
+                retry: Some(RetryConfig { max_retries: Some(0), base_delay_ms: Some(1), max_delay_ms: Some(1), max_retry_after_ms: None }),
+            },
+            ApiVersion::V1,
+        )
+        .expect("client should build");
+        // Pin the team so an SB_TEAM in the test environment can't leak in.
+        client.team = team.map(String::from);
+        client
+    }
+
+    #[test]
+    fn whoami_and_tokens_round_trip_with_the_team_header() {
+        let token = serde_json::json!({
+            "id": "tok_abc123def456",
+            "name": "ci",
+            "role": "runner",
+            "team": "payments",
+            "created_by": "operator",
+            "created_at": "2026-10-17T09:00:00Z",
+            "expires_at": "2027-01-02T03:04:05Z",
+            "expired": false
+        });
+        let mut created = token.clone();
+        created["token"] = serde_json::json!("avm_secret");
+        let mut expired = token.clone();
+        expired["expired"] = serde_json::json!(true);
+        let routes = vec![
+            (
+                "GET /v1/whoami ",
+                "200 OK",
+                serde_json::json!({
+                    "principal": {"kind": "token", "id": "tok_abc123def456", "name": "ci"},
+                    "role": "runner",
+                    "team": "payments",
+                    "expires_at": "2027-01-02T03:04:05Z"
+                })
+                .to_string(),
+            ),
+            ("POST /v1/tokens ", "201 Created", created.to_string()),
+            ("GET /v1/tokens ", "200 OK", serde_json::json!({ "tokens": [expired] }).to_string()),
+            ("DELETE /v1/tokens/", "204 No Content", String::new()),
+        ];
+        let (url, request_rx) = spawn_route_server(routes, 6);
+        let client = team_client(&url, Some("ops"));
+
+        let who = client.whoami().expect("whoami should succeed");
+        assert_eq!(who.principal.id, "tok_abc123def456");
+        assert_eq!(who.principal.name, "ci");
+        assert_eq!(who.role, "runner");
+        assert_eq!(who.team.as_deref(), Some("payments"));
+        assert_eq!(who.expires_at.as_deref(), Some("2027-01-02T03:04:05Z"));
+
+        let made = client
+            .tokens()
+            .create(CreateApiTokenOptions {
+                name: "ci".into(),
+                role: "runner".into(),
+                team: "payments".into(),
+                expires_in: "90d".into(),
+            })
+            .expect("create should succeed");
+        assert_eq!(made.token, "avm_secret");
+        assert_eq!(made.api_token.id, "tok_abc123def456");
+        assert_eq!(made.api_token.created_by, "operator");
+
+        let list = client.tokens().list().expect("list should succeed");
+        assert_eq!(list.tokens.len(), 1);
+        assert!(list.tokens[0].expired);
+
+        // A repeat revoke is another 204; the id is one escaped path segment.
+        client.tokens().revoke("tok_abc123def456").expect("revoke should succeed");
+        client.tokens().revoke(" tok_abc123def456 ").expect("repeat revoke should succeed");
+        client.tokens().revoke("../sandboxes").expect("revoke should succeed");
+        assert!(client.tokens().revoke("  ").is_err(), "a blank id must fail before sending");
+
+        let requests: Vec<String> = (0..6).map(|_| request_rx.recv().expect("request")).collect();
+        let lines: Vec<&str> = requests.iter().map(|r| r.lines().next().unwrap_or_default()).collect();
+        assert_eq!(
+            lines,
+            vec![
+                "GET /v1/whoami HTTP/1.1",
+                "POST /v1/tokens HTTP/1.1",
+                "GET /v1/tokens HTTP/1.1",
+                "DELETE /v1/tokens/tok_abc123def456 HTTP/1.1",
+                "DELETE /v1/tokens/tok_abc123def456 HTTP/1.1",
+                "DELETE /v1/tokens/..%2Fsandboxes HTTP/1.1",
+            ]
+        );
+        let body = requests[1].split("\r\n\r\n").nth(1).unwrap_or_default();
+        let body: Value = serde_json::from_str(body).expect("create body is JSON");
+        assert_eq!(
+            body,
+            serde_json::json!({"name": "ci", "role": "runner", "team": "payments", "expires_in": "90d"})
+        );
+        for request in &requests {
+            assert_eq!(header_value(request, TEAM_HEADER), Some("ops"), "{}", request);
+            assert_eq!(header_value(request, "authorization"), Some("Bearer avm_admin"));
+        }
+    }
+
+    #[test]
+    fn no_team_header_without_a_team() {
+        let (url, request_rx) = spawn_route_server(
+            vec![("GET /v1/tokens ", "200 OK", r#"{"tokens":null}"#.to_string())],
+            1,
+        );
+        let client = team_client(&url, None);
+        let list = client.tokens().list().expect("list should succeed");
+        assert!(list.tokens.is_empty(), "a null list decodes as empty");
+        let request = request_rx.recv().expect("request");
+        assert_eq!(header_value(&request, TEAM_HEADER), None, "{}", request);
+    }
+
+    #[test]
+    fn token_refusal_keeps_the_server_message() {
+        let (url, _request_rx) = spawn_route_server(
+            vec![(
+                "POST /v1/tokens ",
+                "403 Forbidden",
+                r#"{"error":"role viewer on team payments cannot token.write","required_permission":"token.write","role":"viewer"}"#.to_string(),
+            )],
+            1,
+        );
+        let err = team_client(&url, None)
+            .tokens()
+            .create(CreateApiTokenOptions::default())
+            .expect_err("a viewer cannot create tokens");
+        assert!(err.to_string().contains("cannot token.write"), "{}", err);
+    }
+
+    #[test]
+    fn websocket_request_carries_the_team() {
+        let request = websocket_request("wss://sandbox.example.com/v1/x".into(), "pat", Some("payments"))
+            .expect("request should build");
+        assert_eq!(request.headers().get("authorization").unwrap(), "Bearer pat");
+        assert_eq!(request.headers().get(TEAM_HEADER).unwrap(), "payments");
+
+        let bare = websocket_request("wss://sandbox.example.com/v1/x".into(), "pat", None)
+            .expect("request should build");
+        assert!(bare.headers().get(TEAM_HEADER).is_none());
+
+        assert!(websocket_request("wss://sandbox.example.com/v1/x".into(), "pat", Some("bad\nteam")).is_err());
+    }
+
+    fn no_retry_client(url: &str) -> Client {
+        Client::with_config(
+            ClientConfig {
+                api_url: Some(url.to_string()),
+                pat_token: Some("pat-token".to_string()),
+                retry: Some(RetryConfig {
+                    max_retries: Some(0),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            ApiVersion::V1,
+        )
+        .expect("client should build")
+    }
+
+    // Every HTTP error response is Error::Api(ApiError) carrying the status,
+    // the server's stable code and its Retry-After; Display keeps the
+    // "API error: <status>: <message>" text of the old Error::Api(String).
+    #[test]
+    fn http_errors_carry_status_code_and_retry_after() {
+        struct Case {
+            name: &'static str,
+            status_line: &'static str,
+            content_type: &'static str,
+            headers: &'static str,
+            body: &'static str,
+            status: u16,
+            code: Option<&'static str>,
+            message: &'static str,
+            retry_after: Option<Duration>,
+        }
+        let cases = [
+            Case {
+                name: "422 idempotency_key_reused",
+                status_line: "422 Unprocessable Entity",
+                content_type: "application/json",
+                headers: "",
+                body: r#"{"error":"Idempotency-Key reused with a different request","code":"idempotency_key_reused"}"#,
+                status: 422,
+                code: Some("idempotency_key_reused"),
+                message: "Idempotency-Key reused with a different request",
+                retry_after: None,
+            },
+            Case {
+                name: "503 egress_floor_not_ready with Retry-After",
+                status_line: "503 Service Unavailable",
+                content_type: "application/json",
+                headers: "Retry-After: 5\r\n",
+                body: r#"{"error":"egress deny floor not ready","code":"egress_floor_not_ready"}"#,
+                status: 503,
+                code: Some("egress_floor_not_ready"),
+                message: "egress deny floor not ready",
+                retry_after: Some(Duration::from_secs(5)),
+            },
+            Case {
+                name: "non-JSON body keeps the body text and has no code",
+                status_line: "502 Bad Gateway",
+                content_type: "text/html",
+                headers: "",
+                body: "<html>Bad Gateway</html>",
+                status: 502,
+                code: None,
+                message: "<html>Bad Gateway</html>",
+                retry_after: None,
+            },
+        ];
+        for case in cases {
+            let (url, _request_rx) = spawn_response_server_with_headers(
+                case.status_line,
+                case.content_type,
+                case.headers,
+                case.body.as_bytes().to_vec(),
+            );
+            let err = no_retry_client(&url)
+                .create(CreateOptions {
+                    image: "ubuntu:22.04".to_string(),
+                    ..Default::default()
+                })
+                .expect_err(case.name);
+            let display = err.to_string();
+            let Error::Api(api) = err else {
+                panic!("{}: want Error::Api, got {:?}", case.name, err);
+            };
+            assert_eq!(api.status(), case.status, "{}", case.name);
+            assert_eq!(api.code(), case.code, "{}", case.name);
+            assert_eq!(api.message(), case.message, "{}", case.name);
+            assert_eq!(api.retry_after(), case.retry_after, "{}", case.name);
+            assert_eq!(
+                display,
+                format!("API error: {}: {}", case.status_line, case.message),
+                "{}",
+                case.name
+            );
+        }
+    }
+
+    #[test]
+    fn idempotency_key_reused_is_not_retried() {
+        let (url, hits) = spawn_scripted_server(vec![Reply::Json {
+            status: "422 Unprocessable Entity",
+            body: r#"{"error":"reused","code":"idempotency_key_reused"}"#.to_string(),
+            delay: Duration::ZERO,
+        }]);
+        let err = fast_retry_client(&url)
+            .create(CreateOptions {
+                image: "ubuntu:22.04".to_string(),
+                ..Default::default()
+            })
+            .expect_err("a reused key is refused");
+        assert!(
+            matches!(&err, Error::Api(api) if api.code() == Some("idempotency_key_reused")),
+            "unexpected error: {:?}",
+            err
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), 1, "a 422 is not re-sent");
+    }
+
+    #[test]
+    fn error_retry_after_reads_an_http_date() {
+        let at = SystemTime::now() + Duration::from_secs(60);
+        let api = ApiError::from_response(
+            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            Some(&format_imf_fixdate(at)),
+            r#"{"error":"busy","code":"overloaded"}"#,
+        );
+        let wait = api.retry_after().expect("a date parses");
+        assert!(wait > Duration::from_secs(50) && wait <= Duration::from_secs(60), "{:?}", wait);
+        let malformed = ApiError::from_response(reqwest::StatusCode::SERVICE_UNAVAILABLE, Some("soon"), "{}");
+        assert_eq!(malformed.retry_after(), None);
+        assert_eq!(malformed.code(), None, "JSON without an error field has no code");
+        assert_eq!(malformed.message(), "{}");
+    }
+
+    /// The `Idempotency-Key` header of a raw request, if it has one.
+    fn idempotency_key_of(request: &str) -> Option<String> {
+        request
+            .split("\r\n\r\n")
+            .next()
+            .unwrap_or("")
+            .lines()
+            .filter_map(|line| line.split_once(':'))
+            .find(|(name, _)| name.eq_ignore_ascii_case(IDEMPOTENCY_KEY_HEADER))
+            .map(|(_, value)| value.trim().to_string())
+    }
+
+    fn is_generated_key(key: &str) -> bool {
+        key.len() == 32 && key.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    }
+
+    fn create_ok_json() -> String {
+        serde_json::json!({
+            "id": "sb-keyed",
+            "image": "ubuntu:22.04",
+            "status": "started",
+            "public_url": "https://sb-keyed.example.com",
+            "cpu": 2,
+            "memory_mb": 2048,
+            "disk_gb": 20,
+            "os_user": "root",
+            "network_block_all": false,
+            "toolbox_enabled": true,
+            "exposed_ports": [],
+            "created_at": "2026-05-07T10:00:00Z",
+            "updated_at": "2026-05-07T10:00:00Z",
+            "last_active_at": "2026-05-07T10:00:00Z"
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn create_sends_the_callers_idempotency_key_not_in_the_body() {
+        let (url, _hits, requests) = spawn_recording_scripted_server(vec![Reply::ok(create_ok_json())]);
+        fast_retry_client(&url)
+            .create(CreateOptions {
+                image: "ubuntu:22.04".to_string(),
+                idempotency_key: Some(" order-42 ".to_string()),
+                ..Default::default()
+            })
+            .expect("create should succeed");
+        let requests = requests.lock().expect("requests lock");
+        assert_eq!(idempotency_key_of(&requests[0]).as_deref(), Some("order-42"));
+        let body = request_json_body(&requests[0]);
+        assert!(body.get("idempotency_key").is_none(), "key leaked into the body: {}", body);
+        assert_eq!(body["image"], "ubuntu:22.04");
+    }
+
+    #[test]
+    fn create_keeps_one_idempotency_key_across_retries() {
+        let cases: Vec<(&str, Vec<Reply>, Option<&str>)> = vec![
+            (
+                "generated key across 503s",
+                vec![paced("503 Service Unavailable", Some("0")), paced("503 Service Unavailable", Some("0")), Reply::ok(create_ok_json())],
+                None,
+            ),
+            ("generated key across dropped connections", vec![Reply::Hangup, Reply::Hangup, Reply::ok(create_ok_json())], None),
+            ("caller's key across a 503", vec![paced("503 Service Unavailable", Some("0")), Reply::ok(create_ok_json())], Some("order-42")),
+        ];
+        for (name, script, key) in cases {
+            let attempts = script.len();
+            let (url, hits, requests) = spawn_recording_scripted_server(script);
+            let sandbox = fast_retry_client(&url)
+                .create(CreateOptions {
+                    image: "ubuntu:22.04".to_string(),
+                    idempotency_key: key.map(String::from),
+                    ..Default::default()
+                })
+                .unwrap_or_else(|err| panic!("{}: {}", name, err));
+            assert_eq!(sandbox.data.id, "sb-keyed", "{}", name);
+            assert_eq!(hits.load(Ordering::SeqCst), attempts, "{}", name);
+            let keys: Vec<String> = requests
+                .lock()
+                .expect("requests lock")
+                .iter()
+                .map(|request| idempotency_key_of(request).expect("every attempt sends a key"))
+                .collect();
+            match key {
+                Some(key) => assert_eq!(keys[0], key, "{}", name),
+                None => assert!(is_generated_key(&keys[0]), "{}: {:?}", name, keys),
+            }
+            assert!(keys.iter().all(|k| *k == keys[0]), "{}: {:?}", name, keys);
+        }
+    }
+
+    #[test]
+    fn each_create_call_gets_a_new_idempotency_key() {
+        let (url, _hits, requests) = spawn_recording_scripted_server(vec![Reply::ok(create_ok_json())]);
+        let client = fast_retry_client(&url);
+        for key in [None, None, Some("   ")] {
+            client
+                .create(CreateOptions {
+                    image: "ubuntu:22.04".to_string(),
+                    idempotency_key: key.map(String::from),
+                    ..Default::default()
+                })
+                .expect("create should succeed");
+        }
+        let keys: Vec<String> = requests
+            .lock()
+            .expect("requests lock")
+            .iter()
+            .map(|request| idempotency_key_of(request).expect("a key"))
+            .collect();
+        assert_eq!(keys.len(), 3);
+        assert!(keys.iter().all(|k| is_generated_key(k)), "{:?}", keys);
+        assert!(keys[0] != keys[1] && keys[1] != keys[2] && keys[0] != keys[2], "{:?}", keys);
+    }
+
+    #[test]
+    fn only_sandbox_create_sends_the_idempotency_key() {
+        let (url, _hits, requests) = spawn_recording_scripted_server(vec![Reply::ok(create_ok_json())]);
+        let client = fast_retry_client(&url);
+        let _ = client.get("sb-keyed");
+        let _ = client.exec("sb-keyed", ExecRequest::from("true"));
+        let requests = requests.lock().expect("requests lock");
+        assert_eq!(requests.len(), 2);
+        for request in requests.iter() {
+            assert_eq!(idempotency_key_of(request), None, "{}", request.lines().next().unwrap_or(""));
+        }
+    }
+
+    #[test]
+    fn new_idempotency_keys_are_hex_and_unique() {
+        let keys: std::collections::HashSet<String> = (0..1000).map(|_| new_idempotency_key()).collect();
+        assert_eq!(keys.len(), 1000);
+        assert!(keys.iter().all(|k| is_generated_key(k)));
     }
 }

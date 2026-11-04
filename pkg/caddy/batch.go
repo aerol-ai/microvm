@@ -39,44 +39,59 @@ func (c *Client) Batch(ctx context.Context, fn func() error) error {
 	c.batchMu.Lock()
 	defer c.batchMu.Unlock()
 
-	c.gate.Lock()
-	base, err := c.fetchRawConfig(ctx)
-	if err != nil {
-		c.gate.Unlock()
+	// Opening under the admin lock means no writer is between the read and
+	// the write of a read-modify-write when the base config is taken.
+	var emu *configEmulator
+	if err := c.withAdminLock(ctx, func(ctx context.Context) error {
+		c.gate.Lock()
+		defer c.gate.Unlock()
+		base, err := c.fetchRawConfig(ctx)
+		if err != nil {
+			return err
+		}
+		emu = newConfigEmulator(base)
+		c.batch = emu
+		return nil
+	}); err != nil {
 		return err
 	}
-	emu := newConfigEmulator(base)
-	c.batch = emu
-	c.gate.Unlock()
 
 	fnErr := fn()
 
-	c.gate.Lock()
-	defer c.gate.Unlock()
-	c.batch = nil
-	if fnErr != nil {
-		return fnErr
-	}
-	if !emu.changed() {
+	// The /load is a config write like any other: it takes the admin lock.
+	return c.withAdminLock(ctx, func(ctx context.Context) error {
+		c.gate.Lock()
+		defer c.gate.Unlock()
+		c.batch = nil
+		if fnErr != nil {
+			return fnErr
+		}
+		if !emu.changed() {
+			return nil
+		}
+		body, err := json.Marshal(emu.root)
+		if err != nil {
+			return fmt.Errorf("marshal batched caddy config: %w", err)
+		}
+		status, detail, err := c.sendDirect(ctx, http.MethodPost, c.baseURL+"/load", body)
+		if err != nil {
+			return err
+		}
+		if status >= 400 {
+			return caddyErr("load batched caddy config", status, detail)
+		}
 		return nil
-	}
-	body, err := json.Marshal(emu.root)
-	if err != nil {
-		return fmt.Errorf("marshal batched caddy config: %w", err)
-	}
-	status, detail, err := c.sendDirect(ctx, http.MethodPost, c.baseURL+"/load", body)
-	if err != nil {
-		return err
-	}
-	if status >= 400 {
-		return caddyErr("load batched caddy config", status, detail)
-	}
-	return nil
+	})
 }
 
 // do is the one place admin requests leave the client: to the open batch if
-// there is one, otherwise to Caddy.
+// there is one, otherwise to Caddy. Config mutations are serialized here
+// (admin_lock.go) unless the caller already holds the admin lock.
 func (c *Client) do(req *http.Request) (*http.Response, error) {
+	if mutatesConfig(req.Method) && !holdsAdminLock(req.Context()) {
+		c.adminMu.Lock()
+		defer c.adminMu.Unlock()
+	}
 	c.gate.RLock()
 	defer c.gate.RUnlock()
 	if c.batch != nil {

@@ -3,16 +3,47 @@ package microvm
 import (
 	"context"
 	"errors"
+	"io"
 	"net/http"
-	"os"
+	"net/url"
 	"strings"
 
 	apiclient "github.com/aerol-ai/microvm/sdk/go/internal/apiclient"
 	sdktypes "github.com/aerol-ai/microvm/sdk/go/pkg/types"
 )
 
+// APIError is an HTTP error response from sandboxd: status, the server's
+// optional stable error code, and its message (Error() returns the message
+// unchanged). Use errors.As to read it.
+type APIError = apiclient.APIError
+
+// StreamError is a failure the toolbox reported on an exec or session
+// stream, such as a command that could not start, as opposed to the stream
+// dropping. Use errors.As to tell the two apart.
+type StreamError = apiclient.StreamError
+
+// Sentinels for errors.Is. ErrNotFound matches a 404 (and a GetByName miss),
+// ErrConflict a 409, and ErrNameLookupUnsupported a server that ignored
+// `?name=`.
+var (
+	ErrNotFound              = apiclient.ErrNotFound
+	ErrConflict              = apiclient.ErrConflict
+	ErrNameLookupUnsupported = apiclient.ErrNameLookupUnsupported
+)
+
 const defaultAPIURL = "http://127.0.0.1:21212"
-const authRequiredErrorMessage = "PAT token is required. Set PATToken or SB_PAT_TOKEN."
+const authRequiredErrorMessage = "PAT token is required. Set PATToken, SB_PAT_TOKEN or SB_API_TOKEN."
+
+// Environment variables NewClientWithConfig falls back to. SB_API_TOKEN is
+// an alias of SB_PAT_TOKEN for any bearer (an avm_ API token, an OIDC ID
+// token or the PAT); SB_PAT_TOKEN wins when both are set, so existing
+// setups keep the token they had.
+const (
+	envPATToken = "SB_PAT_TOKEN"
+	envAPIToken = "SB_API_TOKEN"
+	envAPIURL   = "SB_API_URL"
+	envTeam     = "SB_TEAM"
+)
 
 type Client struct {
 	apiURL   string
@@ -42,6 +73,7 @@ func NewClientWithConfig(config *sdktypes.MicroVMConfig) (*Client, error) {
 	apiURL := ""
 	patToken := ""
 	apiVersion := ""
+	team := ""
 	var httpClient *http.Client
 
 	if config != nil {
@@ -49,16 +81,20 @@ func NewClientWithConfig(config *sdktypes.MicroVMConfig) (*Client, error) {
 		patToken = strings.TrimSpace(config.PATToken)
 		httpClient = config.HTTPClient
 		apiVersion = strings.TrimSpace(config.APIVersion)
+		team = strings.TrimSpace(config.Team)
 	}
 
 	if patToken == "" {
-		patToken = strings.TrimSpace(os.Getenv("SB_PAT_TOKEN"))
+		patToken = firstEnv(envPATToken, envAPIToken)
 	}
 	if apiURL == "" {
-		apiURL = strings.TrimSpace(os.Getenv("SB_API_URL"))
+		apiURL = firstEnv(envAPIURL)
 		if apiURL == "" {
 			apiURL = defaultAPIURL
 		}
+	}
+	if team == "" {
+		team = firstEnv(envTeam)
 	}
 	if patToken == "" {
 		return nil, errors.New(authRequiredErrorMessage)
@@ -66,6 +102,7 @@ func NewClientWithConfig(config *sdktypes.MicroVMConfig) (*Client, error) {
 
 	opts := apiclient.ClientOptions{
 		PATToken:   patToken,
+		Team:       team,
 		HTTPClient: httpClient,
 		APIVersion: apiclient.APIVersion(apiVersion),
 	}
@@ -80,6 +117,9 @@ func NewClientWithConfig(config *sdktypes.MicroVMConfig) (*Client, error) {
 		if config.Retry.MaxDelayMs != nil {
 			opts.Retry.MaxDelayMs = config.Retry.MaxDelayMs
 		}
+		if config.Retry.MaxRetryAfterMs != nil {
+			opts.Retry.MaxRetryAfterMs = config.Retry.MaxRetryAfterMs
+		}
 	}
 
 	inner := apiclient.NewClient(apiURL, opts)
@@ -91,8 +131,24 @@ func NewClientWithConfig(config *sdktypes.MicroVMConfig) (*Client, error) {
 	}, nil
 }
 
+// Create creates a sandbox. It sends a random Idempotency-Key, made once
+// for this call and sent unchanged on each of its automatic retries, so a
+// create retried after a timeout gets back the sandbox the first attempt
+// made instead of making a second one. Use CreateWithIdempotencyKey to
+// choose the key.
 func (c *Client) Create(ctx context.Context, opts sdktypes.CreateSandboxOptions) (*Sandbox, error) {
-	item, sshPrivateKey, err := c.inner.Create(ctx, opts)
+	return c.CreateWithIdempotencyKey(ctx, opts, "")
+}
+
+// CreateWithIdempotencyKey is Create with key as the Idempotency-Key. A
+// create sent again with the same key and the same options returns the
+// sandbox the first one made instead of making a second, so your own
+// retries of the whole call are safe too, such as after your process
+// restarts. The same key with different options fails with an *APIError
+// whose Code is "idempotency_key_reused" (HTTP 422). Keys are scoped to the
+// caller's account. A blank key gets a random one, as Create does.
+func (c *Client) CreateWithIdempotencyKey(ctx context.Context, opts sdktypes.CreateSandboxOptions, key string) (*Sandbox, error) {
+	item, sshPrivateKey, err := c.inner.CreateWithIdempotencyKey(ctx, opts, key)
 	if err != nil {
 		return nil, err
 	}
@@ -162,6 +218,33 @@ type ListOption func(*listOptions)
 type listOptions struct {
 	tags       map[string]string
 	includeEnv bool
+	name       string
+	limit      int
+}
+
+func (o listOptions) query() apiclient.ListQuery {
+	return apiclient.ListQuery{Tags: o.tags, IncludeEnv: o.includeEnv, Name: o.name, Limit: o.limit}
+}
+
+// WithLimit asks for at most n sandboxes per page (`?limit=<n>`); with
+// ListPage that bounds one call, and List still drains every page. The
+// server clamps n to its maximum (500). Servers that predate single-node
+// paging ignore it there and return every row, so a caller that needs a hard
+// bound must also cap the slice it gets back.
+func WithLimit(n int) ListOption {
+	return func(o *listOptions) {
+		if n > 0 {
+			o.limit = n
+		}
+	}
+}
+
+// WithName filters to the caller's sandbox with exactly this name
+// (`?name=<name>`); the result has zero or one entries. Names are unique per
+// owner. Servers that predate name lookup ignore the filter and return a
+// normal list, so prefer GetByName, which checks the reply.
+func WithName(name string) ListOption {
+	return func(o *listOptions) { o.name = strings.TrimSpace(name) }
 }
 
 // WithTags filters the result to sandboxes whose Tags map contains every
@@ -183,7 +266,7 @@ func (c *Client) List(ctx context.Context, opts ...ListOption) ([]*Sandbox, erro
 	for _, opt := range opts {
 		opt(&cfg)
 	}
-	items, err := c.inner.ListWithOptions(ctx, cfg.tags, cfg.includeEnv)
+	items, err := c.inner.ListWithQuery(ctx, cfg.query())
 	if err != nil {
 		return nil, err
 	}
@@ -202,7 +285,7 @@ func (c *Client) ListPage(ctx context.Context, pageToken string, opts ...ListOpt
 	for _, opt := range opts {
 		opt(&cfg)
 	}
-	items, next, err := c.inner.ListPageWithOptions(ctx, cfg.tags, cfg.includeEnv, pageToken)
+	items, next, err := c.inner.ListPageWithQuery(ctx, cfg.query(), pageToken)
 	if err != nil {
 		return nil, "", err
 	}
@@ -237,6 +320,23 @@ func (c *Client) Get(ctx context.Context, id string, opts ...GetOption) (*Sandbo
 	return wrapSandbox(c, item), nil
 }
 
+// GetByName returns the caller's sandbox called name, with one request.
+// Names are unique per owner. A missing name returns an error matching
+// ErrNotFound. A server that predates name lookup ignores `?name=` and
+// returns an unfiltered list; GetByName detects that and returns an error
+// matching ErrNameLookupUnsupported instead of picking a row.
+func (c *Client) GetByName(ctx context.Context, name string, opts ...GetOption) (*Sandbox, error) {
+	var cfg getOptions
+	for _, opt := range opts {
+		opt(&cfg)
+	}
+	item, err := c.inner.GetByName(ctx, name, cfg.includeEnv)
+	if err != nil {
+		return nil, err
+	}
+	return wrapSandbox(c, item), nil
+}
+
 // Mounts returns the redacted mount config for a sandbox. Credentials are
 // never included; this endpoint is for showing the user what their sandbox
 // has configured, not for retrieving secrets.
@@ -263,12 +363,61 @@ func (c *Client) CloneGeneration(ctx context.Context, id string) (sdktypes.Clone
 	return sdktypes.CloneGeneration{Generation: res.Generation, ResumedAt: res.ResumedAt}, nil
 }
 
+// CheckNetworkPolicy asks whether a sandbox created with these egress fields
+// would reach a destination, with the same matcher the filter enforces. No
+// sandbox is needed.
+func (c *Client) CheckNetworkPolicy(ctx context.Context, opts sdktypes.NetworkPolicyCheckOptions) (sdktypes.NetworkPolicyCheckResult, error) {
+	return c.inner.CheckNetworkPolicy(ctx, opts)
+}
+
+// GetAudit reads one page of a sandbox's audit log: outbound connections
+// and egress denials (Kind "egress") and secret reads.
+func (c *Client) GetAudit(ctx context.Context, id string, opts sdktypes.AuditOptions) (sdktypes.AuditPage, error) {
+	return c.inner.GetAudit(ctx, id, opts)
+}
+
 // SetNetworkLimits raises or lifts the per-direction byte caps. Leave a field
 // nil to keep the current value; pass a pointer to zero to set "unlimited".
 // Raising a cap above current usage clears the per-IP iptables block on the
 // next reconcile pass (or immediately if it's already over the new cap).
 func (c *Client) SetNetworkLimits(ctx context.Context, id string, opts sdktypes.SetNetworkLimitsOptions) (sdktypes.NetworkUsage, error) {
 	return c.inner.SetNetworkLimits(ctx, id, opts)
+}
+
+// SetNetworkPolicy replaces a sandbox's egress policy while it runs and
+// returns once the new policy is enforced. Sending the same policy again is
+// a no-op, so it is safe to retry.
+func (c *Client) SetNetworkPolicy(ctx context.Context, id string, opts sdktypes.NetworkPolicyOptions) (sdktypes.NetworkPolicy, error) {
+	return c.inner.SetNetworkPolicy(ctx, id, opts)
+}
+
+// GetNetworkLearned reads what a sandbox reached in learn mode and the
+// allow list that would have allowed it.
+func (c *Client) GetNetworkLearned(ctx context.Context, id string) (sdktypes.NetworkLearned, error) {
+	return c.inner.GetNetworkLearned(ctx, id)
+}
+
+// PutEgressProfile creates or replaces a named egress profile (a full
+// replace: the same body twice is a no-op). Sandboxes reference it through
+// EgressProfiles, and a change reaches every one of them.
+func (c *Client) PutEgressProfile(ctx context.Context, name string, opts sdktypes.EgressProfileOptions) (sdktypes.EgressProfile, error) {
+	return c.inner.PutEgressProfile(ctx, name, opts)
+}
+
+// GetEgressProfile reads one named egress profile.
+func (c *Client) GetEgressProfile(ctx context.Context, name string) (sdktypes.EgressProfile, error) {
+	return c.inner.GetEgressProfile(ctx, name)
+}
+
+// ListEgressProfiles reads one page of your egress profiles by name.
+func (c *Client) ListEgressProfiles(ctx context.Context, opts sdktypes.ListEgressProfilesOptions) (sdktypes.EgressProfileList, error) {
+	return c.inner.ListEgressProfiles(ctx, opts)
+}
+
+// DeleteEgressProfile deletes a profile; one that sandboxes still reference
+// is refused (409).
+func (c *Client) DeleteEgressProfile(ctx context.Context, name string) error {
+	return c.inner.DeleteEgressProfile(ctx, name)
 }
 
 func (c *Client) Start(ctx context.Context, id string) (*Sandbox, error) {
@@ -287,8 +436,30 @@ func (c *Client) Stop(ctx context.Context, id string) (*Sandbox, error) {
 	return wrapSandbox(c, item), nil
 }
 
-func (c *Client) CreateSnapshot(ctx context.Context, id, name string) (sdktypes.SandboxSnapshot, error) {
-	return c.inner.CreateSnapshot(ctx, id, name)
+// SnapshotOption configures CreateSnapshot.
+type SnapshotOption func(*snapshotOptions)
+
+type snapshotOptions struct {
+	allowPause *bool
+}
+
+// WithAllowPause says whether the snapshot may pause a running sandbox.
+// Without it the answer is yes: a running sandbox is paused while it is
+// copied (its disk writes wait; Docker pauses the container) and keeps
+// running afterwards. WithAllowPause(false) has a sandbox that is not
+// stopped refused with HTTP 409 instead, for a workload that must never
+// stall. A stopped sandbox needs no pause.
+func WithAllowPause(allow bool) SnapshotOption {
+	return func(o *snapshotOptions) { o.allowPause = &allow }
+}
+
+// CreateSnapshot saves the sandbox id's files as a snapshot named name.
+func (c *Client) CreateSnapshot(ctx context.Context, id, name string, opts ...SnapshotOption) (sdktypes.SandboxSnapshot, error) {
+	var cfg snapshotOptions
+	for _, opt := range opts {
+		opt(&cfg)
+	}
+	return c.inner.CreateSnapshot(ctx, id, name, cfg.allowPause)
 }
 
 // RegisterSnapshot persists a named snapshot pointing at either a pre-built
@@ -330,6 +501,26 @@ func (c *Client) RegisterSnapshotFromImage(ctx context.Context, name string, ima
 	opts.Image = ""
 	opts.DockerfileContent = image.Dockerfile()
 	return c.RegisterSnapshot(ctx, opts)
+}
+
+// GetSnapshot reads one named snapshot's metadata. Returns ErrNotFound (404)
+// when no snapshot by that name exists.
+func (c *Client) GetSnapshot(ctx context.Context, name string) (sdktypes.SandboxSnapshot, error) {
+	return c.inner.GetSnapshot(ctx, name)
+}
+
+// ListSnapshots reads one page of your snapshots ordered by name. Pass
+// opts.Limit to cap the page and opts.StartingAfter (the last name of the
+// previous page) to keep paging while the returned SnapshotList.HasMore is
+// true.
+func (c *Client) ListSnapshots(ctx context.Context, opts sdktypes.ListSnapshotsOptions) (sdktypes.SnapshotList, error) {
+	return c.inner.ListSnapshots(ctx, opts)
+}
+
+// DeleteSnapshot removes a named snapshot. Returns ErrNotFound (404) when no
+// snapshot by that name exists.
+func (c *Client) DeleteSnapshot(ctx context.Context, name string) error {
+	return c.inner.DeleteSnapshot(ctx, name)
 }
 
 func (c *Client) Destroy(ctx context.Context, id string) error {
@@ -476,6 +667,30 @@ func (s *Sandbox) DownloadFile(ctx context.Context, targetPath string) ([]byte, 
 	return s.client.inner.DownloadFile(ctx, s.ID, targetPath)
 }
 
+// UploadFileStream uploads r to targetPath without holding the file in
+// memory; use it instead of UploadFile for large or unbounded inputs. The
+// request is not retried (the reader is consumed as it is sent).
+func (s *Sandbox) UploadFileStream(ctx context.Context, targetPath string, r io.Reader) error {
+	return s.client.inner.UploadFileStream(ctx, s.ID, targetPath, r)
+}
+
+// DownloadFileStream opens targetPath for reading without buffering it. The
+// caller must Close the returned body; closing early ends the transfer, so
+// reading only the head of a large file costs only the head.
+func (s *Sandbox) DownloadFileStream(ctx context.Context, targetPath string) (io.ReadCloser, error) {
+	return s.client.inner.DownloadFileStream(ctx, s.ID, targetPath)
+}
+
+// ToolboxRequest sends one raw request to this sandbox's toolbox (path such
+// as "/files" or "/process/execute") and returns the response for the caller
+// to read and close. Use it for toolbox endpoints without a typed method, or
+// to bound how much of a response you read. A 4xx/5xx returns an *APIError.
+// Reads (GET/HEAD) retry on transient statuses; requests with a body are
+// sent once.
+func (s *Sandbox) ToolboxRequest(ctx context.Context, method, path string, query url.Values, body []byte, contentType string) (*http.Response, error) {
+	return s.client.inner.ToolboxRequest(ctx, s.ID, method, path, query, body, contentType)
+}
+
 // ExposeOption customizes an ExposePort call. Build values with WithProtocol;
 // the variadic shape leaves room for future expansion (e.g. tags, idle TTL)
 // without breaking call sites.
@@ -502,6 +717,10 @@ func WithProtocol(p sdktypes.ExposeProtocol) ExposeOption {
 //
 // With no option (or WithProtocol(ExposeProtocolHTTP)) the result is the
 // default Caddy HTTP reverse-proxy URL.
+//
+// A sandbox created with AllowPublicTraffic omitted or false starts private,
+// with no public URL; the first ExposePort makes it public, whichever of the
+// two it was. Set AllowPublicTraffic to true to make it public from boot.
 func (s *Sandbox) ExposePort(ctx context.Context, port int, opts ...ExposeOption) (sdktypes.ExposeResult, error) {
 	cfg := exposeOptions{protocol: sdktypes.ExposeProtocolHTTP}
 	for _, opt := range opts {
@@ -573,8 +792,9 @@ func (s *Sandbox) CustomDomainDNS(ctx context.Context) (sdktypes.CustomDomainDNS
 	return s.client.inner.CustomDomainDNS(ctx, s.ID)
 }
 
-func (s *Sandbox) CreateSnapshot(ctx context.Context, name string) (sdktypes.SandboxSnapshot, error) {
-	return s.client.CreateSnapshot(ctx, s.ID, name)
+// CreateSnapshot saves this sandbox's files as a snapshot named name.
+func (s *Sandbox) CreateSnapshot(ctx context.Context, name string, opts ...SnapshotOption) (sdktypes.SandboxSnapshot, error) {
+	return s.client.CreateSnapshot(ctx, s.ID, name, opts...)
 }
 
 func (s *Sandbox) Start(ctx context.Context) error {
@@ -612,8 +832,37 @@ func (s *Sandbox) GetNetworkUsage(ctx context.Context) (sdktypes.NetworkUsage, e
 	return s.client.GetNetworkUsage(ctx, s.ID)
 }
 
+// Audit reads one page of this sandbox's audit log (see Client.GetAudit).
+func (s *Sandbox) Audit(ctx context.Context, opts sdktypes.AuditOptions) (sdktypes.AuditPage, error) {
+	return s.client.GetAudit(ctx, s.ID, opts)
+}
+
 func (s *Sandbox) SetNetworkLimits(ctx context.Context, opts sdktypes.SetNetworkLimitsOptions) (sdktypes.NetworkUsage, error) {
 	return s.client.SetNetworkLimits(ctx, s.ID, opts)
+}
+
+// SetNetworkPolicy replaces this sandbox's egress policy (see
+// Client.SetNetworkPolicy) and updates its policy fields.
+func (s *Sandbox) SetNetworkPolicy(ctx context.Context, opts sdktypes.NetworkPolicyOptions) (sdktypes.NetworkPolicy, error) {
+	policy, err := s.client.SetNetworkPolicy(ctx, s.ID, opts)
+	if err != nil {
+		return policy, err
+	}
+	s.NetworkBlockAll, s.NetworkAllowOut, s.NetworkDenyOut = policy.NetworkBlockAll, policy.NetworkAllowOut, policy.NetworkDenyOut
+	s.EgressProfiles, s.EgressStatus = policy.EgressProfiles, policy.EgressStatus
+	s.NetworkEgressRules = policy.NetworkEgressRules
+	s.NetworkEgressMode = ""
+	if policy.NetworkEgressMode == sdktypes.NetworkEgressModeLearn {
+		s.NetworkEgressMode = sdktypes.NetworkEgressModeLearn
+	}
+	return policy, nil
+}
+
+// Learned reads what this sandbox reached in learn mode (see
+// Client.GetNetworkLearned). A recording stays readable after a switch to
+// enforce, until the sandbox is destroyed.
+func (s *Sandbox) Learned(ctx context.Context) (sdktypes.NetworkLearned, error) {
+	return s.client.GetNetworkLearned(ctx, s.ID)
 }
 
 func (s *Sandbox) UpdateLifecycle(ctx context.Context, lifecycle sdktypes.Lifecycle) error {

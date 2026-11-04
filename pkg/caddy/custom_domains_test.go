@@ -3,6 +3,7 @@ package caddy
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -264,10 +265,11 @@ type fakeAutomationServer struct {
 	URL    string
 	Client *http.Client
 
-	mu       sync.Mutex
-	policies []map[string]any
-	onDemand map[string]any
-	server   *httptest.Server
+	mu           sync.Mutex
+	policies     []map[string]any
+	onDemand     map[string]any
+	issuerWrites []string // "PATCH 0", "PUT 1"
+	server       *httptest.Server
 }
 
 func newFakeAutomationServer(t *testing.T) *fakeAutomationServer {
@@ -311,7 +313,34 @@ func newFakeAutomationServer(t *testing.T) *fakeAutomationServer {
 				http.Error(w, "method", http.StatusMethodNotAllowed)
 			}
 		default:
-			http.Error(w, "unexpected "+r.Method+" "+r.URL.Path, http.StatusNotFound)
+			// policies/<n>/issuers, with the admin API's semantics: PATCH
+			// replaces an existing key, PUT creates a missing one.
+			var idx int
+			if _, err := fmt.Sscanf(r.URL.Path, "/config/apps/tls/automation/policies/%d/issuers", &idx); err != nil || idx >= len(f.policies) {
+				http.Error(w, "unexpected "+r.Method+" "+r.URL.Path, http.StatusNotFound)
+				return
+			}
+			_, exists := f.policies[idx]["issuers"]
+			switch {
+			case r.Method == http.MethodPatch && !exists:
+				http.Error(w, "key does not exist", http.StatusNotFound)
+				return
+			case r.Method == http.MethodPut && exists:
+				http.Error(w, "key already exists", http.StatusConflict)
+				return
+			case r.Method != http.MethodPatch && r.Method != http.MethodPut:
+				http.Error(w, "method", http.StatusMethodNotAllowed)
+				return
+			}
+			var issuers []any
+			body, _ := io.ReadAll(r.Body)
+			if err := json.Unmarshal(body, &issuers); err != nil {
+				http.Error(w, "decode", http.StatusBadRequest)
+				return
+			}
+			f.policies[idx]["issuers"] = issuers
+			f.issuerWrites = append(f.issuerWrites, fmt.Sprintf("%s %d", r.Method, idx))
+			w.WriteHeader(http.StatusOK)
 		}
 	}))
 	t.Cleanup(f.server.Close)

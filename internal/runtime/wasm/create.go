@@ -164,6 +164,8 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		d.noteWorkerSpawnCount(inst)
 	}
 
+	d.seedNetworkBlocks(sandboxID, req.NetworkBlockAll, req.NetworkBlockAll)
+	d.seedNetworkPolicy(sandboxID, req.NetworkAllowOut, req.NetworkDenyOut, req.NetworkEgressMode == models.NetworkEgressModeLearn)
 	caps := wasmengine.CapsFromResourceLimits(wasmengine.Capabilities{
 		Env:            req.Env,
 		Args:           wasmArgs(req),
@@ -174,6 +176,7 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		cleanup()
 		return nil, err
 	}
+	d.bindNetworkBlocks(sandboxID, &caps)
 
 	instStart := time.Now()
 	if err := client.Instantiate(sandboxID, caps); err != nil {

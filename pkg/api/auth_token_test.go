@@ -73,8 +73,8 @@ func TestRequireAuthSecondTokenPath(t *testing.T) {
 			if !gotOK {
 				t.Fatalf("expected Access in context")
 			}
-			if gotAccess.Operator != tc.wantOp {
-				t.Fatalf("Operator = %v, want %v", gotAccess.Operator, tc.wantOp)
+			if gotAccess.Fleet != tc.wantOp {
+				t.Fatalf("Fleet = %v, want %v", gotAccess.Fleet, tc.wantOp)
 			}
 			if gotAccess.Identity.OwnerRef != tc.wantOwner {
 				t.Fatalf("OwnerRef = %q, want %q", gotAccess.Identity.OwnerRef, tc.wantOwner)

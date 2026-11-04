@@ -57,6 +57,13 @@ func wireIsolateRuntime(ctx context.Context, cfg config.Config, logger *slog.Log
 			setter.SetEgressObserver(svc.EgressAuditObserver())
 		}
 	}
+	// H5: denials are counted even with attribution off; the observer
+	// skips the audit write itself in that case.
+	if setter, ok := supervisor.(interface {
+		SetEgressDenialObserver(pkgisolate.EgressDenialObserver)
+	}); ok {
+		setter.SetEgressDenialObserver(svc.EgressDenialObserver())
+	}
 	driver.SetHostSupervisor(supervisor)
 
 	if cfg.IsolatePoolEnabled {

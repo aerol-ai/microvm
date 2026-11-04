@@ -94,9 +94,15 @@ func TestIsDockerNameConflict(t *testing.T) {
 }
 
 func TestParkDefaultResources(t *testing.T) {
-	res := parkDefaultResources(&Client{})
+	res := parkDefaultResources(0)
 	if res["CpuQuota"] == nil || res["Memory"] == nil {
 		t.Fatalf("resources = %#v", res)
+	}
+	if _, ok := res["PidsLimit"]; ok {
+		t.Fatalf("an unlimited node must not set PidsLimit: %#v", res)
+	}
+	if got := parkDefaultResources(3072)["PidsLimit"]; got != int64(3072) {
+		t.Fatalf("PidsLimit = %v, want 3072", got)
 	}
 }
 
@@ -131,6 +137,11 @@ type memRuleBackend struct {
 func ruleKey(table, chain string, spec ...string) string {
 	return table + "/" + chain + "/" + strings.Join(spec, " ")
 }
+
+// EnsureInputChain satisfies the netrules input bootstrap (P0-5): block-all
+// and allowlist rules also guard host INPUT, so a fake must be able to
+// create AEROLVM-INPUT for those paths to succeed.
+func (m *memRuleBackend) EnsureInputChain(string) error { return nil }
 
 func (m *memRuleBackend) Exists(table, chain string, spec ...string) (bool, error) {
 	return slices.Contains(m.rules, ruleKey(table, chain, spec...)), nil
@@ -412,8 +423,12 @@ func slogDefault() *slog.Logger {
 func TestListAndPurgeParkedContainers(t *testing.T) {
 	d := &poolFakeDaemon{t: t}
 	var listQuery url.Values
+	// Both carry the park label (the list filters on it); only park-c1 is
+	// still parked. c-adopted was renamed to its sandbox at adoption and is a
+	// live sandbox the boot purge must keep (UC-212).
 	d.listJSON = func() *http.Response {
-		return textResponse(http.StatusOK, `[{"Id":"park-c1"}]`)
+		return textResponse(http.StatusOK, `[{"Id":"park-c1","Names":["/park-c1"],"Labels":{"aerol.pool":"park"}},`+
+			`{"Id":"c-adopted","Names":["/sb-adopted"],"Labels":{"aerol.pool":"park"}}]`)
 	}
 	c := newPoolClient(t, d, func(c *Client) {
 		inner := c.httpClient.Transport

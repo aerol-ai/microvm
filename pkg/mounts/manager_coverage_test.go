@@ -98,7 +98,7 @@ func TestMountOneHostPathMkdirFailure(t *testing.T) {
 
 func TestMountOneKernelMountWithEnv(t *testing.T) {
 	oldProbe := waitForMountProbe
-	waitForMountProbe = func(string, time.Duration) error { return nil }
+	waitForMountProbe = func(string, time.Duration, <-chan struct{}) error { return nil }
 	t.Cleanup(func() { waitForMountProbe = oldProbe })
 
 	m := newTestManager(t, map[models.MountType]adapters.Adapter{
@@ -130,6 +130,7 @@ func TestSuperviseExitNilCmdAndDisabled(t *testing.T) {
 		hostPath:  hostPath,
 		plan:      adapters.Plan{Argv: []string{"true"}},
 		cmd:       cmd,
+		exit:      watchExit(cmd),
 		disabled:  true,
 	}
 	m.mu.Lock()
@@ -150,14 +151,14 @@ func TestKillMountSIGKILLAfterTermIgnored(t *testing.T) {
 }
 
 func TestWaitForMountStatParentFailure(t *testing.T) {
-	if err := waitForMount("/nonexistent/parent/child", 50*time.Millisecond); err == nil {
+	if err := waitForMount("/nonexistent/parent/child", 50*time.Millisecond, nil); err == nil {
 		t.Fatal("expected stat parent failure")
 	}
 }
 
 func TestMountOneCredFileWriteFailure(t *testing.T) {
 	oldProbe := waitForMountProbe
-	waitForMountProbe = func(string, time.Duration) error { return nil }
+	waitForMountProbe = func(string, time.Duration, <-chan struct{}) error { return nil }
 	t.Cleanup(func() { waitForMountProbe = oldProbe })
 
 	credDir := t.TempDir()

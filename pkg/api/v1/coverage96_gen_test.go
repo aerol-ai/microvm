@@ -130,7 +130,6 @@ func cover96_ptr_handlers(recv *handlers) {
 	cover96Call(func() { recv.listSandboxes(zero96[http.ResponseWriter](), zero96[*http.Request]()) })    // handlers.go:115
 	cover96Call(func() { recv.pushWasmModule(zero96[http.ResponseWriter](), zero96[*http.Request]()) })   // wasm_module.go:30
 	cover96Call(func() { recv.registerSnapshot(zero96[http.ResponseWriter](), zero96[*http.Request]()) }) // snapshot.go:47
-	cover96Call(func() { recv.resolveSnapshotImage(cover96Ctx(), zero96[string](), zero96[[]string]()) }) // snapshot.go:112
 	cover96Call(func() {
 		recv.runImageBuildOnTarget(zero96[cluster.Client](), zero96[*http.Request](), zero96[[]byte](), zero96[cluster.Member](), zero96[bool]())
 	}) // build.go:136
@@ -147,7 +146,6 @@ func cover96_funcs() {
 	cover96Call(func() { diskGBForCapacity(zero96[int](), zero96[string](), zero96[int]()) })      // cluster_handler.go:1946
 	cover96Call(func() { parseRepeatedIntQuery(zero96[*http.Request](), zero96[string]()) })       // cluster_handler.go:410
 	cover96Call(func() { peerMemberAlive(zero96[Deps](), zero96[string]()) })                      // routes.go:240
-	cover96Call(func() { singleLineFROM(zero96[string]()) })                                       // snapshot.go:188
 	cover96Call(func() { templateListKey(zero96[*models.Template]()) })                            // template.go:118
 	cover96Call(func() { templateMemberByID(zero96[cluster.Client](), zero96[string]()) })         // template.go:153
 	cover96Call(func() { templateOwnerFromInventory(zero96[cluster.Client](), zero96[string]()) }) // template.go:240

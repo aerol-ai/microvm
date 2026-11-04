@@ -30,41 +30,19 @@ caddy_shared_cert_storage = {
   enabled = true
 }
 
-# STOPGAP until a release ships the install.sh that bundles the shim: nodes
-# fetch install.sh from releases/latest, and the released --with-gvisor only
-# installs runsc + the dockerd daemon.json registration. The containerd engine
-# needs containerd-shim-runsc-v1 on PATH (io.containerd.runsc.v1 resolves to
-# that binary), so install it via extra_user_data — same download + SHA-512
-# pattern install.sh now uses (scripts/install.sh install_runsc_shim). Runs
-# after install.sh during cloud-init; no containerd restart needed (shims are
-# resolved per-container launch). tfvars are literal-only, hence the per-node
-# repetition. Drop this block once releases/latest carries the fix.
+# install.sh --with-gvisor installs runsc and containerd-shim-runsc-v1 from
+# gVisor's release tarball (scripts/install.sh install_runsc_shim), so the
+# nodes need no extra_user_data. gVisor stopped publishing the bare binaries
+# under releases/release/latest on 2026-09-30, which broke the old per-node
+# download.
 nodes = {
   node1 = {
-    role            = "mixed", seed = true, spot = true
-    extra_user_data = <<-EOT
-      curl -fsSL https://storage.googleapis.com/gvisor/releases/release/latest/x86_64/containerd-shim-runsc-v1 -o /tmp/runsc-shim
-      curl -fsSL https://storage.googleapis.com/gvisor/releases/release/latest/x86_64/containerd-shim-runsc-v1.sha512 -o /tmp/runsc-shim.sha512
-      (cd /tmp && awk '{print $1"  runsc-shim"}' runsc-shim.sha512 > runsc-shim.check && sha512sum -c runsc-shim.check)
-      sudo install -m 0755 /tmp/runsc-shim /usr/local/bin/containerd-shim-runsc-v1
-    EOT
+    role = "mixed", seed = true, spot = true
   }
   node2 = {
-    role            = "mixed", spot = true
-    extra_user_data = <<-EOT
-      curl -fsSL https://storage.googleapis.com/gvisor/releases/release/latest/x86_64/containerd-shim-runsc-v1 -o /tmp/runsc-shim
-      curl -fsSL https://storage.googleapis.com/gvisor/releases/release/latest/x86_64/containerd-shim-runsc-v1.sha512 -o /tmp/runsc-shim.sha512
-      (cd /tmp && awk '{print $1"  runsc-shim"}' runsc-shim.sha512 > runsc-shim.check && sha512sum -c runsc-shim.check)
-      sudo install -m 0755 /tmp/runsc-shim /usr/local/bin/containerd-shim-runsc-v1
-    EOT
+    role = "mixed", spot = true
   }
   node3 = {
-    role            = "mixed", spot = true
-    extra_user_data = <<-EOT
-      curl -fsSL https://storage.googleapis.com/gvisor/releases/release/latest/x86_64/containerd-shim-runsc-v1 -o /tmp/runsc-shim
-      curl -fsSL https://storage.googleapis.com/gvisor/releases/release/latest/x86_64/containerd-shim-runsc-v1.sha512 -o /tmp/runsc-shim.sha512
-      (cd /tmp && awk '{print $1"  runsc-shim"}' runsc-shim.sha512 > runsc-shim.check && sha512sum -c runsc-shim.check)
-      sudo install -m 0755 /tmp/runsc-shim /usr/local/bin/containerd-shim-runsc-v1
-    EOT
+    role = "mixed", spot = true
   }
 }

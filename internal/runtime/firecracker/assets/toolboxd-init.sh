@@ -24,6 +24,13 @@ mount -t sysfs    sys  /sys         2>/dev/null || true
 mount -t devtmpfs dev  /dev         2>/dev/null || true
 mount -t tmpfs    tmp  /tmp         2>/dev/null || true
 
+# Terminals (aerolvm shell, exec -t, SSH) need devpts on /dev/pts: without
+# it, opening /dev/ptmx fails with ENODEV. A container runtime mounts it
+# from the OCI spec; in a VM nothing does but us. It goes after /dev, which
+# would hide it, with the options runc uses (gid 5 is "tty").
+mkdir -p /dev/pts
+mount -t devpts -o newinstance,ptmxmode=0666,mode=0620,gid=5 devpts /dev/pts 2>/dev/null || true
+
 find_cmd() {
 	if command -v "$1" >/dev/null 2>&1; then
 		command -v "$1"
@@ -87,5 +94,17 @@ configure_network() {
 }
 
 configure_network
+
+# Name resolution. A container runtime mounts a resolv.conf in; here the
+# host's resolvers are injected beside it and installed now, replacing the
+# image's (stock images often ship none, and musl then asks 127.0.0.1, so no
+# lookup ever leaves the guest). rm first: the image's may be a symlink.
+# Copied with shell builtins only; the image may lack cp.
+if [ -f /etc/toolboxd.resolv.conf ]; then
+	rm -f /etc/resolv.conf
+	while IFS= read -r line || [ -n "$line" ]; do
+		printf '%s\n' "$line"
+	done < /etc/toolboxd.resolv.conf > /etc/resolv.conf
+fi
 
 exec /usr/local/bin/toolboxd

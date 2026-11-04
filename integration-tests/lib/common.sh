@@ -111,6 +111,12 @@ wait_for_cloud_init() {
       echo "cloud-init: ${target} done (with warnings)"
       return 0
     fi
+    # Finished, but a user-data step failed: waiting longer won't change
+    # it. Return 2 so a caller can tell this from a timeout.
+    if grep -q 'status: error' <<<"$out"; then
+      echo "cloud-init: ${target} finished with an error" >&2
+      return 2
+    fi
     sleep 10
   done
   echo "cloud-init: ${target} did not finish after ${timeout}s" >&2
@@ -146,6 +152,12 @@ dump_service_logs() {
           | grep -iE 'cluster|gossip|memberlist|serf|raft|swim|join|leav|voter|leader|peer|bootstrap|secret|encrypt|decrypt|mtls|handshake|advertise|bind' \
           | grep -ivE 'request complete|drain-state lookup|placements lookup' \
           || echo '(no cluster/gossip/raft lines in boot journal)'
+        echo '--- mount sweep / orphan reaping (FULL boot journal, grepped) ---'
+        # The reconcile sweep runs every 5 minutes, so the line that explains a
+        # killed mount (UC-84) is usually long gone from the tail below.
+        sudo journalctl -u ${svc} -b --no-pager 2>/dev/null \
+          | grep -iE 'mounts sweep|orphan|mount process exited|mount external storage' \
+          || echo '(no mount sweep / orphan lines in boot journal)'
       fi
       echo '--- journal (last ${lines} lines) ---'
       sudo journalctl -u ${svc} --no-pager -n ${lines}
@@ -253,8 +265,12 @@ dump_node_diagnostics() {
 # boot. So without this step modules_dir is empty, the node advertises no wasm
 # inventory, and cluster placement (every scenario runs cluster-init, so even
 # single-node is a 1-member real cluster) rejects each wasm create with
-# ErrNoPlacementTarget. This mirrors what stage-wasm-modules.yml does, but reuses
-# the committed, digest-verified fixture bytes instead of re-downloading on-box.
+# ErrNoPlacementTarget. This mirrors what stage-wasm-modules.yml does: each node
+# downloads the modules itself and checks the digest pinned in modules.yml.
+# Pushing them from the operator's machine instead (about 65 MB per worker node)
+# took hours on a slow uplink: 2026-10-09, cluster-hetero-lite sat 26 min on one
+# 26 MB scp at 24 KB/s, with three more nodes to go. The verified local fixtures
+# are the fallback, for a node that cannot reach the module URL.
 stage_wasm_modules() {
   local fxdir="$1" config_cluster="$2" caps_domain="$3" targets="$4"
   local modules_dir
@@ -289,7 +305,7 @@ stage_wasm_modules() {
   n=$(yq -r '.standard_modules | length' "${fxdir}/modules.yml")
   [[ "$n" =~ ^[0-9]+$ && "$n" -gt 0 ]] || { echo "stage_wasm: no modules in ${fxdir}/modules.yml" >&2; return 1; }
 
-  local ip tgt i alias ref file
+  local ip tgt i alias ref digest file
   for ip in "${ips[@]}"; do
     tgt="ubuntu@${ip}"
     # Block until THIS node's user-data finished before touching its sandboxd.
@@ -310,12 +326,21 @@ stage_wasm_modules() {
     for i in $(seq 0 $((n - 1))); do
       alias=$(yq -r ".standard_modules[$i].alias" "${fxdir}/modules.yml")
       ref=$(yq -r ".standard_modules[$i].ref" "${fxdir}/modules.yml")
+      digest=$(yq -r ".standard_modules[$i].digest" "${fxdir}/modules.yml")
       # fetch.sh names each local file after the URL basename (sans query).
       file="${fxdir}/$(basename "${ref%\?*}")"
       # ubuntu can't write modules_dir directly; land in /tmp then sudo-install
       # under the reserved alias filename SB_WASM_STANDARD_MODULES expects.
-      if ! scp "${SSH_OPTS[@]}" "$file" "${tgt}:/tmp/${alias}.wasm" \
-        || ! ssh "${SSH_OPTS[@]}" "$tgt" \
+      if ! ssh "${SSH_OPTS[@]}" "$tgt" \
+             "curl -fsSL --retry 3 --max-time 300 -o '/tmp/${alias}.wasm' '${ref}' \
+              && echo '${digest#sha256:}  /tmp/${alias}.wasm' | sha256sum -c --quiet -"; then
+        echo "stage_wasm: ${tgt} could not download ${alias}; copying the local fixture" >&2
+        if ! scp "${SSH_OPTS[@]}" "$file" "${tgt}:/tmp/${alias}.wasm"; then
+          echo "stage_wasm: staging ${alias} on ${tgt} failed" >&2
+          return 1
+        fi
+      fi
+      if ! ssh "${SSH_OPTS[@]}" "$tgt" \
              "sudo install -m 0644 '/tmp/${alias}.wasm' '${modules_dir}/${alias}.wasm' && rm -f '/tmp/${alias}.wasm'"; then
         echo "stage_wasm: staging ${alias} on ${tgt} failed" >&2
         return 1
@@ -351,6 +376,35 @@ direct_resolve_args() {
 # direct_resolve_ip <host> — the last A record, from a direct DNS query.
 direct_resolve_ip() {
   dig +short A "$1" 2>/dev/null | grep -E '^[0-9]+(\.[0-9]+){3}$' | tail -1
+}
+
+# mint_suite_token <ssh_target> <pat> <scenario> [timeout_s]
+# Under SB_PAT_SCOPE=host (capability pat-scope-host; identity-and-access
+# T10) the PAT works only from a loopback peer and from mTLS cluster peers,
+# so the health probes, the member wait and the whole suite need a named
+# credential. This mints an admin avm_ token on the seed's loopback with the
+# PAT and prints it. An admin is bound to every team and holds fleet.admin,
+# so it passes every gate the PAT passed. The PAT goes to curl on stdin
+# (-H @-), never into an argv a remote `ps` or the sudo log would show.
+# Retries while the daemon is still coming up.
+mint_suite_token() {
+  local target="$1" pat="$2" scenario="$3" timeout="${4:-${AEROL_HEALTH_TIMEOUT:-600}}"
+  local deadline=$(( $(date +%s) + timeout ))
+  local body out="" token=""
+  body=$(printf '{"name":"itest-harness-%s-%s","role":"admin","team":"*","expires_in":"24h"}' "$scenario" "$(date +%s)")
+  while (( $(date +%s) < deadline )); do
+    out=$(printf 'Authorization: Bearer %s\n' "$pat" | ssh "${SSH_OPTS[@]}" "$target" \
+      "curl -sS -m 20 -X POST -H @- -H 'Content-Type: application/json' --data '${body}' http://127.0.0.1:21212/v1/tokens" 2>/dev/null) || out=""
+    token=$(printf '%s' "$out" | jq -r '.token // empty' 2>/dev/null || true)
+    if [[ "$token" == avm_* ]]; then
+      echo "mint_suite_token: admin token minted on ${target}" >&2
+      printf '%s\n' "$token"
+      return 0
+    fi
+    sleep 5
+  done
+  echo "mint_suite_token: no admin token from ${target} within ${timeout}s (last answer: ${out:0:200})" >&2
+  return 1
 }
 
 # wait_for_health <base_url> <pat> [timeout_s]
@@ -487,4 +541,84 @@ wait_for_grafana() {
   done
   echo "grafana: ${url} not ready after ${timeout}s" >&2
   return 1
+}
+
+# empty_versioned_bucket <bucket> <aws command...>
+# Deletes every object version AND every delete marker in a versioned bucket,
+# sending the governance-bypass header with each batch, so that a following
+# `terraform destroy` can delete the bucket (S3 refuses while any entry is
+# left, a delete marker included).
+#
+# Exists for the S3 Object Lock audit witness (Terraform/audit_witness.tf). Its
+# heads are locked versions and the bucket has no force_destroy, on purpose;
+# the integration scenarios lock in GOVERNANCE mode for a day (D13), which a
+# principal holding s3:BypassGovernanceRetention can lift by sending the
+# bypass header with the delete. force_destroy is not known to send it.
+#
+# One listing page is one batch: S3 returns at most 1000 entries per page,
+# versions and markers counted together, which is also DeleteObjects' per-call
+# limit. The listing restarts from the top after each batch, since deleted
+# entries leave it, so the loop needs no continuation markers and a re-run
+# picks up wherever an interrupted one stopped. The batch goes through a file
+# because a 1000-key JSON argument passes Linux's 128 KiB limit on one argv
+# string. A bucket that is already empty or gone prints nothing.
+#
+# Returns non-zero, naming the first entry S3 kept and why, when anything
+# could not be deleted (a COMPLIANCE lock, credentials without the bypass
+# permission); a batch that deletes nothing would otherwise loop forever. The
+# round cap is the same guard for a failure that reports success: 1000 rounds
+# is a million entries, hundreds of times what a run's witness writes.
+empty_versioned_bucket() {
+  local bucket="$1"; shift
+  local -a awscli=("$@")
+  local tmp listing out n refused total=0 rounds=0
+  tmp="$(mktemp -d "${TMPDIR:-/tmp}/aerol-empty-bucket.XXXXXX")" || return 1
+  while :; do
+    rounds=$(( rounds + 1 ))
+    if (( rounds > 1000 )); then
+      echo "empty s3://${bucket}: still not empty after 1000 batches (${total} entries deleted); something keeps writing to it or a delete is not taking effect" >&2
+      rm -rf "$tmp"
+      return 1
+    fi
+    if ! listing="$("${awscli[@]}" s3api list-object-versions --bucket "$bucket" \
+        --no-paginate --output json 2>"${tmp}/err")"; then
+      if grep -q 'NoSuchBucket' "${tmp}/err"; then
+        rm -rf "$tmp"
+        return 0
+      fi
+      echo "empty s3://${bucket}: list-object-versions failed: $(tr '\n' ' ' <"${tmp}/err")" >&2
+      rm -rf "$tmp"
+      return 1
+    fi
+    if ! printf '%s' "$listing" | jq -c \
+        '{Objects: [((.Versions // [])[], (.DeleteMarkers // [])[]) | {Key, VersionId}], Quiet: true}' \
+        >"${tmp}/batch.json"; then
+      echo "empty s3://${bucket}: could not read the version listing" >&2
+      rm -rf "$tmp"
+      return 1
+    fi
+    n="$(jq '.Objects | length' "${tmp}/batch.json")"
+    (( n > 0 )) || break
+    if ! out="$("${awscli[@]}" s3api delete-objects --bucket "$bucket" \
+        --bypass-governance-retention --delete "file://${tmp}/batch.json" \
+        --output json 2>"${tmp}/err")"; then
+      echo "empty s3://${bucket}: delete-objects failed: $(tr '\n' ' ' <"${tmp}/err")" >&2
+      rm -rf "$tmp"
+      return 1
+    fi
+    # Quiet mode answers with errors only, so an empty answer is success.
+    refused="$(printf '%s' "$out" | jq -r \
+      '(.Errors // [])[0] | select(. != null) | "\(.Key) version \(.VersionId): \(.Code) \(.Message)"')"
+    if [[ -n "$refused" ]]; then
+      echo "empty s3://${bucket}: S3 kept ${refused}" >&2
+      rm -rf "$tmp"
+      return 1
+    fi
+    total=$(( total + n ))
+  done
+  rm -rf "$tmp"
+  if (( total > 0 )); then
+    echo "emptied s3://${bucket}: deleted ${total} object versions and delete markers (governance bypass)"
+  fi
+  return 0
 }

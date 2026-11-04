@@ -38,14 +38,21 @@ func (h *handlers) reconcile(w http.ResponseWriter, r *http.Request) {
 func (h *handlers) capacity(w http.ResponseWriter, r *http.Request) {
 	snapshot := h.deps.Service.Capacity()
 	access, ok := controlplane.AccessFromContext(r.Context())
-	if !ok || !access.Operator {
-		// Template administration is operator-only. Capacity remains useful to
-		// managed callers, but template identifiers can encode internal workload
+	if !ok || !access.Can(controlplane.PermFleetAdmin) {
+		// Template administration is fleet.admin. Capacity remains useful to
+		// every reader, but template identifiers can encode internal workload
 		// names and must not leak through this otherwise tenant-visible endpoint.
+		// Fleet scope alone is not enough: a viewer or auditor bound to every
+		// team reads capacity without administering templates.
 		snapshot.LocalTemplateInventoryKnown = false
 		snapshot.LocalTemplateIDs = nil
 		snapshot.LocalTemplateCatalogInventoryKnown = false
 		snapshot.LocalTemplateCatalogIDs = nil
+		// WASM module refs encode tenant registry paths (e.g. a private
+		// registry host + repo) across every tenant on the node, so they must
+		// not leak through this tenant-visible endpoint either.
+		snapshot.LocalWasmModuleInventoryKnown = false
+		snapshot.LocalWasmModuleIDs = nil
 	}
 	apihttp.WriteJSON(w, http.StatusOK, snapshot)
 }
@@ -87,13 +94,28 @@ func (h *handlers) createSandbox(w http.ResponseWriter, r *http.Request) {
 		apihttp.WriteError(w, http.StatusBadRequest, "invalid JSON body")
 		return
 	}
+	r = withIdempotencyKey(r)
+	if err := h.stampCreateRequestDigests(r, &req); err != nil {
+		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
+		return
+	}
 	// Time the create server-side and report it as a Server-Timing metric so a
 	// client (e.g. the create benchmark) can separate the real create cost from
 	// the client<->cluster network round-trip. Set the header before
 	// WriteJSON/WriteError — response headers must land before the status line.
 	createStart := time.Now()
 	ctx, createTiming := docker.WithCreateTiming(r.Context())
-	response, err := h.deps.Service.CreateSandbox(ctx, req)
+	// An Idempotency-Key header makes the create retry-stable: the derived id
+	// is reused and CreateSandboxWithID replays the existing owner's sandbox
+	// instead of minting a second one. Without the header the id is empty and
+	// the create keeps its default, mint-fresh-every-call behaviour.
+	var response *models.CreateSandboxResponse
+	var err error
+	if preferredID := h.idempotentCreateID(r); preferredID != "" {
+		response, err = h.deps.Service.CreateSandboxWithID(ctx, req, preferredID)
+	} else {
+		response, err = h.deps.Service.CreateSandbox(ctx, req)
+	}
 	setCreateServerTiming(w, createStart, createTiming, h.deps.ContainerEngine)
 	if err != nil {
 		if errors.Is(err, context.DeadlineExceeded) {
@@ -115,6 +137,16 @@ func (h *handlers) createSandbox(w http.ResponseWriter, r *http.Request) {
 func (h *handlers) listSandboxes(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	opts := service.GetSandboxOptions{IncludeEnv: parseIncludeEnv(r), CorrelationID: correlationIDFromRequest(r)}
+	if name, ok := parseNameFilter(r); ok {
+		sandboxes, err := h.deps.Service.ListSandboxesByName(ctx, name, parseTagFilter(r), opts)
+		if err != nil {
+			h.deps.Logger.Warn("list sandboxes by name failed", "error", err)
+			apihttp.WriteError(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+		apihttp.WriteJSON(w, http.StatusOK, sandboxes)
+		return
+	}
 	sandboxes, err := h.deps.Service.ListSandboxesWithOptions(ctx, parseTagFilter(r), opts)
 	if err != nil {
 		h.deps.Logger.Warn("list sandboxes failed", "error", err)
@@ -165,6 +197,13 @@ func parseSandboxIDsFilter(r *http.Request) map[string]struct{} {
 // CreateSandboxRequest.Tags — an external control plane stamps tags at create
 // time and uses the same keys here to scope its list calls. See
 // plans/multi-tenancy-via-control-plane.md.
+// parseNameFilter reads ?name=<name>. A present-but-blank value is treated as
+// absent: no sandbox can be looked up by an empty name.
+func parseNameFilter(r *http.Request) (string, bool) {
+	name := strings.TrimSpace(r.URL.Query().Get("name"))
+	return name, name != ""
+}
+
 func parseTagFilter(r *http.Request) map[string]string {
 	const prefix = "tag."
 	q := r.URL.Query()
@@ -195,10 +234,12 @@ func (h *handlers) getSandbox(w http.ResponseWriter, r *http.Request) {
 	apihttp.WriteJSON(w, http.StatusOK, sandbox)
 }
 
-// parseIncludeEnv accepts include_env=true|1|yes (case-insensitive).
+// parseIncludeEnv accepts include_env=true|1|yes (case-insensitive). It is
+// the same parse the route's permission classifier uses
+// (apihttp.ReadOrSecrets), so any spelling that returns env needed
+// sandbox.secrets to get here.
 func parseIncludeEnv(r *http.Request) bool {
-	v := strings.TrimSpace(strings.ToLower(r.URL.Query().Get("include_env")))
-	return v == "true" || v == "1" || v == "yes"
+	return apihttp.IncludeEnvRequested(r)
 }
 
 func (h *handlers) startSandbox(w http.ResponseWriter, r *http.Request) {
@@ -415,6 +456,102 @@ func (h *handlers) getNetworkUsage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	apihttp.WriteJSON(w, http.StatusOK, usage)
+}
+
+// checkNetworkPolicy answers whether a policy would let a sandbox reach a
+// destination, without a sandbox (plans/egress-domain-filtering.md P2-9).
+func (h *handlers) checkNetworkPolicy(w http.ResponseWriter, r *http.Request) {
+	var req models.NetworkPolicyCheckRequest
+	if err := apihttp.DecodeJSON(w, r, &req); err != nil {
+		apihttp.WriteError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	resp, err := h.deps.Service.CheckNetworkPolicy(r.Context(), req)
+	if err != nil {
+		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
+		return
+	}
+	apihttp.WriteJSON(w, http.StatusOK, resp)
+}
+
+// putEgressProfile creates or replaces a named egress profile (D21): a full
+// replace, so the same body twice is a no-op.
+func (h *handlers) putEgressProfile(w http.ResponseWriter, r *http.Request) {
+	var req models.EgressProfileRequest
+	if err := apihttp.DecodeJSON(w, r, &req); err != nil {
+		apihttp.WriteError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	p, err := h.deps.Service.PutEgressProfile(r.Context(), r.PathValue("name"), req)
+	if err != nil {
+		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
+		return
+	}
+	apihttp.WriteJSON(w, http.StatusOK, p)
+}
+
+func (h *handlers) getEgressProfile(w http.ResponseWriter, r *http.Request) {
+	p, err := h.deps.Service.GetEgressProfile(r.Context(), r.PathValue("name"))
+	if err != nil {
+		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
+		return
+	}
+	apihttp.WriteJSON(w, http.StatusOK, p)
+}
+
+func (h *handlers) listEgressProfiles(w http.ResponseWriter, r *http.Request) {
+	limit := 0
+	if raw := r.URL.Query().Get("limit"); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil || n < 0 {
+			apihttp.WriteError(w, http.StatusBadRequest, "limit must be a non-negative integer")
+			return
+		}
+		limit = n
+	}
+	page, err := h.deps.Service.ListEgressProfiles(r.Context(), r.URL.Query().Get("cursor"), limit)
+	if err != nil {
+		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
+		return
+	}
+	apihttp.WriteJSON(w, http.StatusOK, page)
+}
+
+// deleteEgressProfile removes a profile; one sandboxes still reference is a
+// 409, and one that is already gone counts as deleted.
+func (h *handlers) deleteEgressProfile(w http.ResponseWriter, r *http.Request) {
+	if err := h.deps.Service.DeleteEgressProfile(r.Context(), r.PathValue("name")); err != nil {
+		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// getNetworkLearned returns a learn-mode sandbox's recording and the allow
+// list it suggests (P2-7).
+func (h *handlers) getNetworkLearned(w http.ResponseWriter, r *http.Request) {
+	learned, err := h.deps.Service.GetNetworkLearned(r.Context(), r.PathValue("id"))
+	if err != nil {
+		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
+		return
+	}
+	apihttp.WriteJSON(w, http.StatusOK, learned)
+}
+
+// updateNetworkPolicy replaces a sandbox's egress policy live (§5.8). The
+// body is a full replace, so the same body twice is a no-op.
+func (h *handlers) updateNetworkPolicy(w http.ResponseWriter, r *http.Request) {
+	var req models.NetworkPolicyRequest
+	if err := apihttp.DecodeJSON(w, r, &req); err != nil {
+		apihttp.WriteError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	resp, err := h.deps.Service.UpdateNetworkPolicy(r.Context(), r.PathValue("id"), req)
+	if err != nil {
+		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
+		return
+	}
+	apihttp.WriteJSON(w, http.StatusOK, resp)
 }
 
 func (h *handlers) updateNetworkLimits(w http.ResponseWriter, r *http.Request) {

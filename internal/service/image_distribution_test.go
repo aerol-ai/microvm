@@ -172,7 +172,7 @@ func TestNormalizeCreateImageDistributionAOCRFallback(t *testing.T) {
 			name:      "bare name with pusher rewrites to AOCR ref",
 			image:     "my-snap",
 			pusher:    pusher,
-			wantImage: pusher.DestRefFor("my-snap"),
+			wantImage: pusher.DestRefFor("", "my-snap"),
 			wantMode:  models.ImageDistributionAOCR,
 		},
 		{

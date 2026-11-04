@@ -10,20 +10,21 @@ import (
 	"github.com/aerol-ai/microvm/pkg/models"
 
 	cntr "github.com/containerd/containerd/v2/client"
-	"github.com/containerd/containerd/v2/core/images"
 	ctddocker "github.com/containerd/containerd/v2/core/remotes/docker"
-	"github.com/containerd/errdefs"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 )
 
 // pushLiveDeps is the containerd surface livePush exercises. Production wires
 // client.Raw(); tests inject a fake so the push path is covered offline.
+//
+// There is deliberately no image-record write here. A push goes by
+// descriptor (client.Push takes the ref and the manifest descriptor and reads
+// the content store), so it needs no local record named after the registry
+// destination — and such a record is a GC root: it kept the snapshot's layers
+// alive after the snapshot's own tag was deleted, and nothing ever removed it.
 type pushLiveDeps struct {
-	getImage    func(context.Context, string) (cntr.Image, error)
-	imageGet    func(context.Context, string) (images.Image, error)
-	imageCreate func(context.Context, images.Image) (images.Image, error)
-	imageUpdate func(context.Context, images.Image, ...string) (images.Image, error)
-	push        func(context.Context, string, ocispec.Descriptor, ...cntr.RemoteOpt) error
+	getImage func(context.Context, string) (cntr.Image, error)
+	push     func(context.Context, string, ocispec.Descriptor, ...cntr.RemoteOpt) error
 }
 
 // pushLiveDepsFn resolves push dependencies; nil uses client.Raw().
@@ -43,7 +44,8 @@ func NewRegistryPusher(d *Driver) *RegistryPusher {
 	return &RegistryPusher{driver: d}
 }
 
-// PushImage tags SourceTag as DestRef in the aerolvm namespace and pushes it.
+// PushImage pushes the local image SourceTag to the registry as DestRef. No
+// local image is created under DestRef (see pushLiveDeps).
 func (p *RegistryPusher) PushImage(ctx context.Context, req docker.PushImageRequest) (string, error) {
 	if p == nil {
 		return "", errors.New("containerd registry pusher is nil")
@@ -105,23 +107,9 @@ func (p *RegistryPusher) livePush(ctx context.Context, source, dest string, auth
 	if err != nil {
 		return "", fmt.Errorf("containerd push: get %s: %w", source, err)
 	}
+	// The source image's own manifest goes to dest as is; the source record
+	// keeps its content alive for the length of the push.
 	target := img.Target()
-	if _, err := deps.imageGet(ctx, dest); err != nil {
-		if !errdefs.IsNotFound(err) {
-			return "", fmt.Errorf("containerd push: lookup dest: %w", err)
-		}
-		if _, err := deps.imageCreate(ctx, images.Image{Name: dest, Target: target}); err != nil {
-			// A concurrent duplicate push may have created the name first — that
-			// is success, not an error (pr-review §1 idempotency). Fall through to
-			// the Push below with the same target.
-			if !errdefs.IsAlreadyExists(err) {
-				return "", fmt.Errorf("containerd push: create dest name: %w", err)
-			}
-		}
-	} else if _, err := deps.imageUpdate(ctx, images.Image{Name: dest, Target: target}, "target"); err != nil {
-		// Name already exists; push with the source descriptor anyway.
-		_ = err
-	}
 
 	// Scope creds to exactly one registry host; never broadcast them to every
 	// host the resolver dials (foreign-layer / redirect hosts). A hostless dest
@@ -155,13 +143,9 @@ func resolvePushLiveDeps(client *Client) (pushLiveDeps, error) {
 	if raw == nil {
 		return pushLiveDeps{}, errors.New("containerd push: live client required")
 	}
-	isvc := raw.ImageService()
 	return pushLiveDeps{
-		getImage:    client.GetImage,
-		imageGet:    isvc.Get,
-		imageCreate: isvc.Create,
-		imageUpdate: isvc.Update,
-		push:        raw.Push,
+		getImage: client.GetImage,
+		push:     raw.Push,
 	}, nil
 }
 

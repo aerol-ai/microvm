@@ -22,10 +22,14 @@ import (
 
 	"github.com/aerol-ai/microvm/internal/config"
 	"github.com/aerol-ai/microvm/internal/pool/dockerpool"
+	sbruntime "github.com/aerol-ai/microvm/internal/runtime"
 	"github.com/aerol-ai/microvm/pkg/docker/netrules"
+	"github.com/aerol-ai/microvm/pkg/gvisorpids"
 	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/aerol-ai/microvm/pkg/mounts"
 	"github.com/aerol-ai/microvm/pkg/secrets"
+
+	"github.com/distribution/reference"
 )
 
 // managedLabelKey is the Docker label every sandbox container we create
@@ -56,6 +60,7 @@ type Client struct {
 	toolboxLoopback    bool
 	privileged         bool
 	resourceLimitsOff  bool
+	pidsLimit          int64
 	defaultRuntime     string
 	httpClient         *http.Client
 	streamClient       *http.Client
@@ -74,8 +79,12 @@ type Client struct {
 	pullFailures       map[string]imagePullFailure
 	warmPool           *dockerpool.Pool
 	netnsPool          *NetnsPool
-	parkDiskGB         int
-	imageIDs           *imageIDCache
+	// pauseImage is the image of the pause container a restricted create
+	// starts for itself when the pool has no slot for it
+	// (netns_pause_on_demand.go).
+	pauseImage string
+	parkDiskGB int
+	imageIDs   *imageIDCache
 	// Mirror configuration: zero value disables rewriting and the pull
 	// path behaves exactly as it did before AOCR mirror support landed.
 	// Set via ConfigureMirror after construction; main() is responsible
@@ -87,7 +96,7 @@ type Client struct {
 	// artifacts (snapshots + Firecracker templates) from AOCR. nil disables it
 	// (anonymous pulls). Set via ConfigureAOCRPullAuth after construction. See
 	// aocr_pull_auth.go.
-	aocrPullAuth *aocrClusterPullAuth
+	aocrPullAuth *AOCRPullAuth
 }
 
 type imagePull struct {
@@ -131,6 +140,7 @@ func New(logger *slog.Logger, cfg config.Config, rules *netrules.Manager) (*Clie
 		toolboxLoopback:    cfg.DockerToolboxLoopback,
 		privileged:         cfg.ContainerPrivileged,
 		resourceLimitsOff:  cfg.ResourceLimitsOff,
+		pidsLimit:          int64(cfg.SandboxPidsLimit),
 		defaultRuntime:     cfg.Runtime,
 		httpClient:         &http.Client{Timeout: cfg.HTTPClientTimeout, Transport: transport},
 		streamClient:       &http.Client{Transport: transport},
@@ -281,7 +291,44 @@ func (c *Client) ClearNetworkBlockEgress(containerIP string) error {
 	if containerIP == "" {
 		return nil
 	}
-	return c.networkRules.ClearBlockAllEgress(containerIP)
+	// The sandbox keeps its address: lift, don't forget (netrules
+	// LiftBlockAllEgress; on the block sets, one element add).
+	return c.networkRules.LiftBlockAllEgress(containerIP)
+}
+
+// hasCreateNetRules reports whether a create asks for host firewall rules.
+func hasCreateNetRules(req models.CreateSandboxRequest) bool {
+	return req.NetworkBlockAll || len(req.NetworkAllowOut) > 0 || len(req.NetworkDenyOut) > 0
+}
+
+// applyCreateNetRules installs a create's rules on ip before its workload
+// starts: block-all (a hostname-filtered create arrives as one), or the
+// CIDR lists.
+func (c *Client) applyCreateNetRules(ip string, req models.CreateSandboxRequest) error {
+	if req.NetworkBlockAll {
+		if err := c.networkRules.BlockAllEgress(ip); err != nil {
+			return fmt.Errorf("apply network block: %w", err)
+		}
+	}
+	if len(req.NetworkAllowOut) > 0 || len(req.NetworkDenyOut) > 0 {
+		if err := c.networkRules.ApplyEgressPolicy(ip, req.NetworkAllowOut, req.NetworkDenyOut); err != nil {
+			return fmt.Errorf("apply egress policy: %w", err)
+		}
+	}
+	return nil
+}
+
+// clearCreateNetRules removes what applyCreateNetRules may have installed
+// on ip, a partial install included.
+func (c *Client) clearCreateNetRules(ip string, req models.CreateSandboxRequest) {
+	if !hasCreateNetRules(req) {
+		return
+	}
+	_ = c.networkRules.ClearBlockAllEgress(ip)
+	_ = c.networkRules.ClearBlockAllIngress(ip)
+	if len(req.NetworkAllowOut) > 0 || len(req.NetworkDenyOut) > 0 {
+		_ = c.networkRules.ClearEgressPolicy(ip, req.NetworkAllowOut, req.NetworkDenyOut)
+	}
 }
 
 // ApplyEgressPolicy installs the selective-egress CIDR policy. Idempotent —
@@ -406,6 +453,21 @@ func (c *Client) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		if err != nil {
 			return nil, fmt.Errorf("inspect image: %w", err)
 		}
+	} else if req.VerifyRegistryAccess && registryRefNeedsTenantAuth(req) {
+		// The image is already cached, but an owner-scoped caller must prove it
+		// may pull this (private) registry image — otherwise a tenant could
+		// start another tenant's image straight from the shared local cache
+		// with no credentials. A pull of a cached image contacts the registry
+		// for the manifest and authorizes there, reusing cached layers, so this
+		// is a manifest round-trip rather than a re-download. A private image
+		// without valid creds 401s here and the create fails; a public image
+		// authorizes anonymously. Boot-path cost: one manifest round-trip on a
+		// tenant create of a cached plain-registry image (pr-review §2).
+		pullCtx := WithSandboxID(ctx, sandboxID)
+		if pullErr := c.pullImageDedup(pullCtx, req.Image, req.Registry); pullErr != nil {
+			return nil, fmt.Errorf("verify image access: %w", pullErr)
+		}
+		imageSource = "verified"
 	}
 	CreateTimingFrom(ctx).RecordStageDesc("docker_image", time.Since(imageStart), imageSource)
 
@@ -414,14 +476,27 @@ func (c *Client) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		workingDir = "/"
 	}
 
-	envValues := make([]string, 0, len(req.Env)+4)
+	envValues := make([]string, 0, len(req.Env)+5)
 	envValues = append(envValues,
 		fmt.Sprintf("SB_TOOLBOX_PORT=%d", c.toolboxPort),
 		"SB_TOOLBOX_TOKEN="+toolboxToken,
 		"SB_SANDBOX_ID="+sandboxID,
+		// A snapshot of a warm-pool container carries its parked flag in the
+		// image config; a sandbox created from it would boot parked and wait
+		// forever for an adopt. Docker lets the container's env win.
+		poolParkedEnv+"=",
 	)
 	for key, value := range req.Env {
+		if key == gvisorpids.EnvVar {
+			// The driver sets the gVisor task cap; a create's env must not
+			// shadow it (toolboxd reads the first value of a key).
+			continue
+		}
 		envValues = append(envValues, key+"="+value)
+	}
+	hostPids, pidsEnv := gvisorpids.ForRuntime(ociRuntime, c.pidsLimit, req.MemoryMB)
+	if !c.resourceLimitsOff {
+		envValues = append(envValues, pidsEnv...)
 	}
 	sort.Strings(envValues)
 
@@ -481,7 +556,15 @@ func (c *Client) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		createRequest["Env"] = envValues
 	}
 
+	var tmpfs map[string]string
 	for _, m := range hostMounts {
+		if m.Tmpfs {
+			if tmpfs == nil {
+				tmpfs = map[string]string{}
+			}
+			tmpfs[m.ContainerPath] = strings.Join(m.TmpfsOptions(), ",")
+			continue
+		}
 		entry := fmt.Sprintf("%s:%s", m.HostPath, m.ContainerPath)
 		if m.ReadOnly {
 			entry += ":ro"
@@ -501,6 +584,24 @@ func (c *Client) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 	// joining a foreign netns is not a supported shape there.
 	var adoptedNetns netnsSlot
 	var netnsAdopted, keepNetnsPause bool
+	// earlyRules: the request's rules may be on the pause slot's address,
+	// put there before the workload started; addressReported: the create
+	// was told that address (runtime.AddressObserver).
+	var earlyRules, addressReported bool
+	// workloadLeft: a failed create's workload container could not be
+	// removed and may run. What keeps it shut then stays: its rules, its
+	// pause and the address the create was told. The orphan sweep destroys
+	// it later, in Destroy's order.
+	var workloadLeft bool
+	removeWorkload := func(id string) {
+		// Not the create's context: a cancelled create must still take its
+		// workload down before anything that keeps it shut goes.
+		if err := c.removeContainer(context.WithoutCancel(ctx), id, true); err != nil {
+			workloadLeft = true
+			c.logger.Warn("failed create: workload container not removed; its rules and pause stay until it is",
+				"sandbox_id", sandboxID, "container_id", id, "error", err)
+		}
+	}
 	if c.netnsPool != nil && effectiveRuntime == models.RuntimeDocker {
 		netnsStart := time.Now()
 		adoptedNetns, netnsAdopted = c.netnsPool.Adopt(ctx, sandboxID)
@@ -510,18 +611,52 @@ func (c *Client) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		}
 		CreateTimingFrom(ctx).RecordStageDesc("docker_netns", time.Since(netnsStart), desc)
 	}
+	// No slot for a create with network rules: it starts a pause container
+	// of its own and goes on as with a slot, so its rules are on before its
+	// workload runs (netns_pause_on_demand.go). Without rules, Docker's own
+	// path, unchanged.
+	var own *ownPause
+	var ownCreate time.Duration
+	ownDesc := "on_demand"
+	if !netnsAdopted && c.needsOwnPause(req, effectiveRuntime) {
+		pauseStart := time.Now()
+		p, pulled, err := c.startSandboxPause(ctx, sandboxID)
+		if pulled {
+			ownDesc = "on_demand_pulled"
+		}
+		ownCreate = time.Since(pauseStart)
+		if err != nil {
+			CreateTimingFrom(ctx).RecordStageDesc("docker_pause", ownCreate, ownDesc)
+			return nil, fmt.Errorf("pause container for the sandbox's network rules: %w", err)
+		}
+		// Its address is read once it runs, after the workload's create.
+		own, adoptedNetns, netnsAdopted = p, netnsSlot{containerID: p.id}, true
+	}
 	defer func() {
-		// The adopted slot already carries this sandbox's name, so on any
-		// failure below it must be removed, not returned to the pool — a
-		// rename back would race a concurrent duplicate create.
-		if netnsAdopted && !keepNetnsPause {
-			c.netnsPool.ReleaseAdopted(context.WithoutCancel(ctx), adoptedNetns)
+		// The slot (adopted, or the create's own pause) carries this
+		// sandbox's name, so on any failure below it must be removed, not
+		// returned to the pool: a rename back would race a concurrent
+		// duplicate create.
+		if netnsAdopted && !keepNetnsPause && !workloadLeft {
+			// A pause still starting is not removed under its start.
+			_, _ = own.wait()
+			// Every failure below has removed the workload container by
+			// now, so nothing sends from the address: the create lets go of
+			// what it keyed by it, then its rules go while the pause
+			// container still holds it, and the address goes last.
+			if addressReported {
+				sbruntime.NotifyReleasingAddress(ctx, adoptedNetns.ip)
+			}
+			if earlyRules {
+				c.clearCreateNetRules(adoptedNetns.ip, req)
+			}
+			c.releaseSandboxPause(ctx, adoptedNetns)
 		}
 	}()
 
-	hostConfig := map[string]any{
-		"Privileged": c.privileged,
-		"Binds":      binds,
+	hostConfig := sandboxHostConfig(c.privileged, binds)
+	if tmpfs != nil {
+		hostConfig["Tmpfs"] = tmpfs
 	}
 
 	if netnsAdopted {
@@ -531,6 +666,7 @@ func (c *Client) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 	}
 	if !netnsAdopted {
 		c.publishToolboxLoopback(createRequest, hostConfig)
+		setSandboxIPv6Off(hostConfig, c.network)
 	}
 
 	// Only set HostConfig.Runtime when we actually need to override the
@@ -553,6 +689,12 @@ func (c *Client) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		if req.MemoryMB > 0 {
 			resources["Memory"] = int64(req.MemoryMB) * 1024 * 1024
 			resources["MemorySwap"] = int64(req.MemoryMB) * 1024 * 1024
+		}
+		if hostPids > 0 {
+			// A fork bomb stops here instead of exhausting the node. For
+			// gVisor this is the sentry's host budget; the sandbox's own
+			// cap is the env toolboxd applies (pkg/gvisorpids).
+			resources["PidsLimit"] = hostPids
 		}
 		if req.DiskGB > 0 {
 			// gVisor does not honor StorageOpt size — silently applying it
@@ -625,10 +767,41 @@ func (c *Client) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 	if err != nil {
 		return nil, fmt.Errorf("create container: %w", err)
 	}
+	if own != nil {
+		// The pause started alongside the workload's create; only what that
+		// didn't cover is the create's cost (docker_pause).
+		joinStart := time.Now()
+		slot, err := own.wait()
+		CreateTimingFrom(ctx).RecordStageDesc("docker_pause", ownCreate+time.Since(joinStart), ownDesc)
+		if err != nil {
+			removeWorkload(created.ID)
+			return nil, fmt.Errorf("pause container for the sandbox's network rules: %w", err)
+		}
+		adoptedNetns = slot
+	}
+	// The pause slot fixed the address before the workload exists, and a
+	// duplicate create stopped at the name conflict above: put the
+	// request's rules on the address before the workload starts, so it
+	// never runs without them (a hostname-filtered create's block-all
+	// included), and report it, so the create's egress gateway attach
+	// overlaps the start and the readiness wait.
+	if ip := strings.TrimSpace(adoptedNetns.ip); netnsAdopted && ip != "" {
+		earlyRules = true
+		netrulesStart := time.Now()
+		if err := c.applyCreateNetRules(ip, req); err != nil {
+			removeWorkload(created.ID)
+			return nil, err
+		}
+		if hasCreateNetRules(req) {
+			CreateTimingFrom(ctx).RecordStage("docker_netrules", time.Since(netrulesStart))
+		}
+		addressReported = true
+		sbruntime.NotifyAddressKnown(ctx, ip)
+	}
 
 	startStart := time.Now()
 	if err := c.doJSON(ctx, http.MethodPost, "/containers/"+url.PathEscape(created.ID)+"/start", nil, nil, nil, nil); err != nil {
-		_ = c.removeContainer(ctx, created.ID, true)
+		removeWorkload(created.ID)
 		return nil, fmt.Errorf("start container: %w", err)
 	}
 	CreateTimingFrom(ctx).RecordStage("docker_start", time.Since(startStart))
@@ -637,13 +810,13 @@ func (c *Client) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 	containerIP, inspect, err := c.waitForContainerRunning(ctx, created.ID)
 	runtimeWait := time.Since(runtimeWaitStart)
 	if err != nil {
-		_ = c.removeContainer(ctx, created.ID, true)
+		removeWorkload(created.ID)
 		return nil, err
 	}
 
 	toolboxAddr, err := c.toolboxAddr(inspect, containerIP)
 	if err != nil {
-		_ = c.removeContainer(ctx, created.ID, true)
+		removeWorkload(created.ID)
 		return nil, err
 	}
 	toolboxWaitStart := time.Now()
@@ -653,7 +826,7 @@ func (c *Client) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		timing.RecordDockerWaits(runtimeWait, toolboxWait, toolboxSource)
 	}
 	if err != nil {
-		_ = c.removeContainer(ctx, created.ID, true)
+		removeWorkload(created.ID)
 		return nil, err
 	}
 	if readyListener != nil {
@@ -672,31 +845,37 @@ func (c *Client) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		Status:      models.SandboxStatusStarted,
 	}
 
+	if earlyRules && runtime.ContainerIP != strings.TrimSpace(adoptedNetns.ip) {
+		// The rules, and any attach the create started, are on the pause
+		// slot's address: a workload at another one would run without them.
+		removeWorkload(created.ID)
+		return nil, fmt.Errorf("docker: sandbox came up at %q, not at its pause slot's address %q", runtime.ContainerIP, adoptedNetns.ip)
+	}
 	netrulesStart := time.Now()
-	if req.NetworkBlockAll {
+	if req.NetworkBlockAll && !earlyRules {
 		if err := c.networkRules.BlockAllEgress(runtime.ContainerIP); err != nil {
 			// Fail closed: the user opted into network isolation, so a sandbox
 			// that came up without the DROP rule must not be left running.
 			// Clear any partial state and tear the container down before
 			// returning the error.
 			_ = c.networkRules.ClearBlockAllEgress(runtime.ContainerIP)
-			_ = c.removeContainer(ctx, created.ID, true)
+			removeWorkload(created.ID)
 			return nil, fmt.Errorf("apply network block: %w", err)
 		}
 	}
 
-	if len(req.NetworkAllowOut) > 0 || len(req.NetworkDenyOut) > 0 {
+	if (len(req.NetworkAllowOut) > 0 || len(req.NetworkDenyOut) > 0) && !earlyRules {
 		if err := c.networkRules.ApplyEgressPolicy(runtime.ContainerIP, req.NetworkAllowOut, req.NetworkDenyOut); err != nil {
 			// Fail closed, same rationale as NetworkBlockAll: the user opted
 			// into a restricted egress policy, so a sandbox that came up with
 			// only a partial rule set must not be left running. Roll the
 			// partial policy back and tear the container down.
 			_ = c.networkRules.ClearEgressPolicy(runtime.ContainerIP, req.NetworkAllowOut, req.NetworkDenyOut)
-			_ = c.removeContainer(ctx, created.ID, true)
+			removeWorkload(created.ID)
 			return nil, fmt.Errorf("apply egress policy: %w", err)
 		}
 	}
-	if req.NetworkBlockAll || len(req.NetworkAllowOut) > 0 || len(req.NetworkDenyOut) > 0 {
+	if hasCreateNetRules(req) && !earlyRules {
 		CreateTimingFrom(ctx).RecordStage("docker_netrules", time.Since(netrulesStart))
 	}
 
@@ -713,11 +892,91 @@ func (c *Client) Start(ctx context.Context, containerRef string) (*SandboxRuntim
 	return c.waitForRuntime(ctx, containerRef)
 }
 
+// StartWithIdentity starts a stopped sandbox's container. One adopted from
+// the warm pool still carries the pool's env (SB_POOL_PARKED=1, its slot's
+// bootstrap token and park nonce, the bind to its slot's park socket), since
+// Docker keeps a container's env across stop and start. Its toolboxd boots
+// parked, holds the user's command back and answers nothing but /health, so
+// a plain Start would pass its health poll and hand out a sandbox whose every
+// call is 503 "sandbox not adopted". It is adopted again over its slot's
+// socket with the sandbox's own identity, exactly as at create.
+func (c *Client) StartWithIdentity(ctx context.Context, containerRef, sandboxID, toolboxToken string) (*SandboxRuntime, error) {
+	inspect, err := c.inspectContainer(ctx, containerRef)
+	if err != nil {
+		return nil, fmt.Errorf("inspect container: %w", err)
+	}
+	pl, err := c.parkedResumeListener(inspect)
+	if err != nil {
+		return nil, err
+	}
+	if pl == nil {
+		return c.Start(ctx, containerRef)
+	}
+	defer func() { _ = pl.Close() }()
+	if err := c.doJSON(ctx, http.MethodPost, "/containers/"+url.PathEscape(containerRef)+"/start", nil, nil, nil, nil); err != nil {
+		return nil, fmt.Errorf("start container: %w", err)
+	}
+	if err := c.readopt(ctx, pl, sandboxID, toolboxToken); err != nil {
+		// A container that can't be adopted serves nothing; don't leave it
+		// running parked behind a start that reported failure.
+		_ = c.Stop(ctx, containerRef)
+		return nil, fmt.Errorf("re-adopt warm-pool container: %w", err)
+	}
+	return c.waitForRuntime(ctx, containerRef)
+}
+
+func (c *Client) readopt(ctx context.Context, pl *ParkedListener, sandboxID, toolboxToken string) error {
+	waitCtx, cancel := context.WithTimeout(ctx, c.toolboxWaitTimeout)
+	defer cancel()
+	if err := pl.WaitParked(waitCtx); err != nil {
+		return err
+	}
+	nonce, err := mintReadyNonce()
+	if err != nil {
+		return err
+	}
+	return pl.Adopt(waitCtx, sandboxID, toolboxToken, nonce)
+}
+
+// parkedResumeListener returns a listener for the parked hello of a container
+// adopted from the warm pool, or nil for any other container. The hello must
+// carry the bootstrap token and park nonce in the container's env, and it
+// arrives on whatever host socket the container's ready-socket bind names,
+// which has to be one of ours.
+func (c *Client) parkedResumeListener(inspect containerInspect) (*ParkedListener, error) {
+	env := map[string]string{}
+	for _, kv := range inspect.Config.Env {
+		if k, v, ok := strings.Cut(kv, "="); ok {
+			env[k] = v
+		}
+	}
+	if env[poolParkedEnv] != "1" {
+		return nil, nil
+	}
+	source := ""
+	for _, bind := range inspect.HostConfig.Binds {
+		if src, ok := readySocketSourceFromBind(bind); ok {
+			source = src
+			break
+		}
+	}
+	if source == "" || !c.readySocketPathOwnedByDir(source) {
+		return nil, fmt.Errorf("warm-pool container %s has no park socket under %s to be adopted over", inspect.ID, c.readyDir)
+	}
+	slotID := strings.TrimSuffix(filepath.Base(source), ".sock")
+	return NewParkedListener(filepath.Dir(source), slotID, env["SB_TOOLBOX_TOKEN"], env[readyNonceEnv])
+}
+
 func (c *Client) Stop(ctx context.Context, containerRef string) error {
 	return c.doJSON(ctx, http.MethodPost, "/containers/"+url.PathEscape(containerRef)+"/stop", queryValues(map[string]string{"t": "10"}), nil, nil, nil)
 }
 
 func (c *Client) Destroy(ctx context.Context, sandbox *models.Sandbox) error {
+	if sandbox != nil && c.pausesPossible() {
+		if onPause, err := c.hasNetnsPause(ctx, sandbox.ID); err == nil && onPause {
+			return c.destroyOnPause(ctx, sandbox)
+		}
+	}
 	if sandbox != nil {
 		// Clear both directions: a stale ingress DROP would re-attach to whoever
 		// next gets this IP from Docker's IPAM pool.
@@ -740,6 +999,43 @@ func (c *Client) Destroy(ctx context.Context, sandbox *models.Sandbox) error {
 		return errors.New("sandbox container ID is not available")
 	}
 	return c.removeContainer(ctx, containerRef, true)
+}
+
+// hasNetnsPause reports whether the sandbox runs in a pause container's
+// network namespace (a pool slot, or its own).
+func (c *Client) hasNetnsPause(ctx context.Context, sandboxID string) (bool, error) {
+	if _, err := c.inspectContainer(ctx, netnsAdoptedName(sandboxID)); err != nil {
+		if isContainerNotFoundError(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
+}
+
+// destroyOnPause removes a sandbox whose address its pause container holds.
+// That address outlives the workload container, so the order can keep the
+// sandbox shut and its address clean: the workload goes first; then the
+// destroy's runtime.AddressObserver (the egress gateway detach) is told;
+// then the address's rules go while the pause container still holds it;
+// and the pause container, with the address, goes last. A workload that
+// couldn't be removed keeps everything for the retry. (A plain container's
+// address is Docker's and goes with the container, so Destroy keeps its
+// rules-first order there.)
+func (c *Client) destroyOnPause(ctx context.Context, sandbox *models.Sandbox) error {
+	RemoveReadySocketsForSandbox(c.readyDir, sandbox.ID)
+	ref := strings.TrimSpace(sandbox.ContainerID)
+	if ref == "" {
+		return errors.New("sandbox container ID is not available")
+	}
+	if err := c.removeContainer(ctx, ref, true); err != nil {
+		return err
+	}
+	sbruntime.NotifyReleasingAddress(ctx, sandbox.ContainerIP)
+	_ = c.ClearNetworkRules(sandbox.ContainerIP)
+	_ = c.ClearEgressPolicy(sandbox.ContainerIP, sandbox.NetworkAllowOut, sandbox.NetworkDenyOut)
+	c.removeNetnsPauseForSandbox(ctx, sandbox.ID)
+	return nil
 }
 
 // SweepOrphanReadySockets removes ready sockets not referenced by existing
@@ -821,27 +1117,6 @@ func readySocketSourceFromBind(bind string) (string, bool) {
 	return src, true
 }
 
-func (c *Client) CreateSnapshot(ctx context.Context, containerRef, imageRef string) (string, error) {
-	repo, tag, err := splitSnapshotImageRef(imageRef)
-	if err != nil {
-		return "", err
-	}
-	query := url.Values{}
-	query.Set("container", strings.TrimSpace(containerRef))
-	query.Set("repo", repo)
-	if tag != "" {
-		query.Set("tag", tag)
-	}
-
-	var response struct {
-		ID string `json:"Id"`
-	}
-	if err := c.doJSON(ctx, http.MethodPost, "/commit", query, nil, nil, &response); err != nil {
-		return "", fmt.Errorf("commit snapshot: %w", err)
-	}
-	return strings.TrimSpace(response.ID), nil
-}
-
 func (c *Client) Resize(ctx context.Context, containerRef string, req models.ResizeSandboxRequest) error {
 	if c.resourceLimitsOff {
 		return nil
@@ -907,6 +1182,12 @@ func (c *Client) PushAllowedPorts(ctx context.Context, containerIP, toolboxToken
 func (c *Client) Inspect(ctx context.Context, containerRef string) (*SandboxRuntime, error) {
 	inspect, err := c.inspectContainer(ctx, containerRef)
 	if err != nil {
+		// Only Docker's 404 says the container is gone; a timeout or a 500
+		// says nothing about it, and reconcile deletes the row only on the
+		// former (sbruntime.InstanceGone).
+		if isContainerNotFoundError(err) {
+			return nil, fmt.Errorf("inspect container: %w: %w", sbruntime.ErrInstanceNotFound, err)
+		}
 		return nil, fmt.Errorf("inspect container: %w", err)
 	}
 	return &SandboxRuntime{
@@ -933,8 +1214,15 @@ func (c *Client) ListManaged(ctx context.Context) (map[string]*SandboxRuntime, e
 		// Warm-pool parked containers carry aerolvm.managed=true (so the
 		// boot purge / events filter can find them) but they are not
 		// sandboxes — they have no DB row. Exclude them here so Reconcile's
-		// orphan pass does not destroy live park inventory.
-		if isParkedContainerLabels(summary.Labels) {
+		// orphan pass does not destroy live park inventory. Adopted ones keep
+		// the label but are sandboxes, so they stay (isParkedContainer).
+		if isParkedContainer(summary) {
+			continue
+		}
+		// A snapshot's helper container inherits the managed label from the
+		// image it is made from. While its snapshot runs it is no orphan, and
+		// reaping it would fail the snapshot (isLiveSnapshotHelper).
+		if isLiveSnapshotHelper(summary, time.Now()) {
 			continue
 		}
 		inspect, err := c.inspectContainer(ctx, summary.ID)
@@ -970,7 +1258,22 @@ func (c *Client) ensureToolboxBinary() error {
 	return nil
 }
 
+// withDefaultTag adds ":latest" to a reference with neither a tag nor a
+// digest. Docker's POST /images/create pulls EVERY tag of the repository
+// when fromImage names none (the docker CLI adds :latest itself; the raw
+// API does not), so `--image gcr.io/distroless/static-debian12` pulled
+// hundreds of images one by one until the create timed out. A reference
+// the parser rejects is left for Docker to report.
+func withDefaultTag(imageRef string) string {
+	named, err := reference.ParseNormalizedNamed(imageRef)
+	if err != nil || !reference.IsNameOnly(named) {
+		return imageRef
+	}
+	return imageRef + ":latest"
+}
+
 func (c *Client) pullImage(ctx context.Context, imageRef string, auth *models.RegistryAuth) error {
+	imageRef = withDefaultTag(imageRef)
 	// Apply mirror rewrite first so the auth payload we build below can be
 	// keyed off the *upstream* host (the AOCR auth service wants the
 	// upstream's username/password wrapped inside an identity token, not the
@@ -1281,9 +1584,37 @@ func imagePullKey(imageRef string, auth *models.RegistryAuth) string {
 	return strings.TrimSpace(imageRef) + "\x00" + strings.TrimSpace(auth.Server) + "\x00" + strings.TrimSpace(auth.Username)
 }
 
+// IsLocalOnlyImageRef reports an image only this node can have: a built
+// image, or a snapshot's committed image — including ones committed under a
+// "snapshots/..." name before snapshots had tags of their own.
 func IsLocalOnlyImageRef(imageRef string) bool {
 	imageRef = strings.TrimSpace(imageRef)
-	return strings.HasPrefix(imageRef, BuiltImageNamespace+"/") || strings.HasPrefix(imageRef, "snapshots/")
+	return strings.HasPrefix(imageRef, BuiltImageNamespace+"/") || strings.HasPrefix(imageRef, SnapshotImageNamespace+"/") ||
+		strings.HasPrefix(imageRef, "snapshots/")
+}
+
+// registryRefNeedsTenantAuth reports whether a cached image should be
+// re-authorized against its registry for an owner-scoped caller (the
+// VerifyRegistryAccess path). Only plain external-registry refs qualify:
+//   - local-only refs (built images, local snapshot commits) have no registry
+//     to authorize against;
+//   - the LocalOnly distribution mode is node-local by definition;
+//   - cluster AOCR refs are pulled with the cluster PAT and are already
+//     authorized per-tenant at the service layer (authorizeTenantImageRef),
+//     so re-pulling them here would add a round-trip with no security gain.
+func registryRefNeedsTenantAuth(req models.CreateSandboxRequest) bool {
+	if req.ImageDistributionMode == models.ImageDistributionLocalOnly {
+		return false
+	}
+	image := strings.TrimSpace(req.Image)
+	if image == "" || IsLocalOnlyImageRef(image) || IsBuiltImageRef(image) {
+		return false
+	}
+	// A cluster AOCR ref ("[host/]cluster/<id>/...") is authorized elsewhere.
+	if _, rest := splitHostRepo(image); rest == "cluster" || strings.HasPrefix(rest, "cluster/") {
+		return false
+	}
+	return true
 }
 
 func (c *Client) waitForRuntime(ctx context.Context, containerRef string) (*SandboxRuntime, error) {
@@ -1601,8 +1932,11 @@ type imageInspect struct {
 }
 
 type containerInspect struct {
-	ID    string `json:"Id"`
-	Name  string `json:"Name"`
+	ID     string `json:"Id"`
+	Name   string `json:"Name"`
+	Config struct {
+		Env []string `json:"Env"`
+	} `json:"Config"`
 	State *struct {
 		Running bool   `json:"Running"`
 		Status  string `json:"Status"`
@@ -1615,8 +1949,9 @@ type containerInspect struct {
 		Ports map[string][]portBinding `json:"Ports"`
 	} `json:"NetworkSettings"`
 	HostConfig struct {
-		Binds       []string `json:"Binds"`
-		NetworkMode string   `json:"NetworkMode"`
+		Binds       []string          `json:"Binds"`
+		NetworkMode string            `json:"NetworkMode"`
+		Sysctls     map[string]string `json:"Sysctls"`
 	} `json:"HostConfig"`
 	Mounts []struct {
 		Source      string `json:"Source"`
@@ -1628,6 +1963,8 @@ type containerSummary struct {
 	ID     string            `json:"Id"`
 	Names  []string          `json:"Names"`
 	Labels map[string]string `json:"Labels"`
+	// Created is the container's creation time, Unix seconds.
+	Created int64 `json:"Created"`
 }
 
 func splitSnapshotImageRef(imageRef string) (repo, tag string, err error) {
@@ -1688,6 +2025,12 @@ func (c *Client) removeContainer(ctx context.Context, containerRef string, force
 	return err
 }
 
+// isContainerNotFoundError matches the status doRequest reports when Docker
+// answers 404 ("No such container") for a container path.
+func isContainerNotFoundError(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "failed with status 404")
+}
+
 // isContainerRemoveBenignError matches the substring doRequest emits for HTTP
 // 404 from the Docker daemon when deleting a container. The post-condition of
 // removeContainer is "container is gone"; 404 means it already is.
@@ -1734,4 +2077,20 @@ func sandboxIDFromContainerName(name string) string {
 	name = strings.TrimSpace(name)
 	name = strings.TrimPrefix(name, "/")
 	return name
+}
+
+// WritableLayerBytes implements runtime.WritableLayerSizer: the container's
+// SizeRw (bytes written to its writable layer), which dockerd computes on a
+// size=true inspect.
+func (c *Client) WritableLayerBytes(ctx context.Context, containerRef string) (int64, error) {
+	var out struct {
+		SizeRw *int64 `json:"SizeRw"`
+	}
+	if err := c.doJSON(ctx, http.MethodGet, "/containers/"+url.PathEscape(containerRef)+"/json", url.Values{"size": {"true"}}, nil, nil, &out); err != nil {
+		return 0, fmt.Errorf("inspect container size: %w", err)
+	}
+	if out.SizeRw == nil {
+		return 0, nil
+	}
+	return *out.SizeRw, nil
 }

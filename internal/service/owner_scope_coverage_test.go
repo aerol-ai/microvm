@@ -11,7 +11,7 @@ func TestOwnerRefForCreateExported(t *testing.T) {
 	if got := OwnerRefForCreate(context.Background()); got != "" {
 		t.Fatalf("unscoped = %q", got)
 	}
-	if got := OwnerRefForCreate(controlplane.ContextWithAccess(context.Background(), controlplane.Access{Operator: true})); got != "" {
+	if got := OwnerRefForCreate(controlplane.ContextWithAccess(context.Background(), controlplane.Access{Fleet: true})); got != "" {
 		t.Fatalf("operator = %q", got)
 	}
 	ctx := controlplane.ContextWithAccess(context.Background(), controlplane.Access{Identity: controlplane.Identity{OwnerRef: "acme"}})

@@ -69,7 +69,7 @@ func TestScaleGateIngressDeltaAt100KPlacements(t *testing.T) {
 	if len(desired) != placements*3 {
 		t.Fatalf("desired route intents=%d, want %d", len(desired), placements*3)
 	}
-	ops, commit := svc.planClusterIngressDelta(desired)
+	ops, commit := svc.planClusterIngressDelta(desired, nil)
 	if len(ops) != len(desired) {
 		t.Fatalf("initial delta ops=%d, want %d", len(ops), len(desired))
 	}
@@ -77,7 +77,7 @@ func TestScaleGateIngressDeltaAt100KPlacements(t *testing.T) {
 
 	view[placements/2].Version++
 	desired, _ = svc.buildClusterIngressIntents(view, "self")
-	ops, _ = svc.planClusterIngressDelta(desired)
+	ops, _ = svc.planClusterIngressDelta(desired, nil)
 	if len(ops) > 3 {
 		t.Fatalf("one placement mutation produced %d route ops, want <=3", len(ops))
 	}

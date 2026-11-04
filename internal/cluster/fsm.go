@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/aerol-ai/microvm/internal/identity"
 	"github.com/aerol-ai/microvm/pkg/capacity"
 	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/google/btree"
@@ -52,6 +53,11 @@ const (
 	opAllocateArtifactEpoch  opCode = 25 // issue one publisher its fencing token for a catalogue kind
 	// opReportStorageObligations = 26: owner delete-outbox snapshots folded by
 	// the leader (storage_obligations.go).
+	// 26 is opReportStorageObligations (storage_obligations.go); 27/28 are the
+	// egress-profile ops (fsm_egress_profiles.go); 31/32 are the API-token
+	// ops (fsm_tokens.go). The next free code is 33.
+	opRegisterSnapshotNode opCode = 29 // record which node holds a snapshot's image (name → node, cluster-wide)
+	opForgetSnapshotNode   opCode = 30 // drop a snapshot's name → node entry (on delete / node death)
 )
 
 // command is the wire format for one raft log entry. Recovery payloads ride
@@ -184,6 +190,21 @@ type command struct {
 	MaxPerTenant      int                       `json:"max_per_tenant,omitempty"`
 	VolumeAttachments []models.VolumeAttachment `json:"volume_attachments,omitempty"`
 	VolumeSandboxID   string                    `json:"volume_sandbox_id,omitempty"`
+	// EgressProfile carries the profile for opPutEgressProfile, and its owner
+	// and name for opDeleteEgressProfile (fsm_egress_profiles.go).
+	EgressProfile *EgressProfileRecord `json:"egress_profile,omitempty"`
+	// SnapshotName carries the (global) snapshot name for
+	// opRegisterSnapshotNode / opForgetSnapshotNode. The holding node rides in
+	// the existing NodeID field. The name → node row is replicated so any node
+	// can route a snapshot-by-id GET/DELETE to the node that holds the image,
+	// which a snapshot's local-only SQLite catalogue row cannot answer after
+	// the request lands elsewhere.
+	SnapshotName string `json:"snapshot_name,omitempty"`
+	// APIToken carries the record for opPutAPIToken (its secret hash, never
+	// the secret); APITokenID names the token opDeleteAPIToken removes
+	// (fsm_tokens.go).
+	APIToken   *identity.TokenRecord `json:"api_token,omitempty"`
+	APITokenID string                `json:"api_token_id,omitempty"`
 }
 
 type reservationCommand struct {
@@ -377,8 +398,10 @@ type placementFSM struct {
 	// tests and single-process FSM use can stay local-only.
 	recoveryResolver func(context.Context, string) (RecoveryBlob, bool, error)
 	version          uint64
-	// nameIndex maps sandbox Name → SandboxID for cluster-wide name uniqueness.
-	// Empty names are NOT indexed (anonymous sandboxes don't conflict, matching
+	// nameIndex maps a sandbox name key → SandboxID for name uniqueness. Names
+	// are unique per owner: tenant specs carry an owner-qualified key and
+	// operator specs a plain name, both written by the proposer so apply
+	// stays byte-deterministic (name_key.go). Empty names are NOT indexed (anonymous sandboxes don't conflict, matching
 	// the local SQLite partial unique index that allows many empty names but
 	// rejects duplicate non-empty names). Updated inside Apply alongside the
 	// placement write so the index can never lag the authoritative map; rebuilt
@@ -420,6 +443,14 @@ type placementFSM struct {
 	pendingReservationCapacity   map[string]capacity.Request
 	pendingReservationIDsByOwner map[string]map[string]struct{}
 	pendingReservationExpiries   pendingReservationExpiryHeap
+	// pendingReservationRuntimes counts the same live reservations by owner
+	// and runtime. A reserved create has not taken its network slot yet, so
+	// the owner's capacity heartbeat cannot show it; placement subtracts
+	// these from the owner's advertised free slots (placement.go slotsFit).
+	// Like pendingReservationCapacity it is derived, never persisted: the
+	// same claim/release paths rebuild it on log replay and Restore, so
+	// every replica holds the same counts.
+	pendingReservationRuntimes map[string]map[string]int
 	// reservedIndex tracks rows that are still State=Reserved even after their
 	// capacity claim has been pruned as expired. The leader GC uses it to find
 	// expired reservation rows without scanning every placed sandbox.
@@ -488,12 +519,29 @@ type placementFSM struct {
 	// is deterministic in S3/NFS, so only this small metadata table is replicated.
 	volumes         map[string]models.Volume
 	volumeNameIndex map[string]string
+	// snapshotNodeIndex maps a (global) snapshot name → the node that holds its
+	// image. Snapshots live in per-node SQLite with no node column, so only this
+	// replicated index lets any node route a snapshot-by-id GET/DELETE to the
+	// holder. The entry is tiny (name + node), carries no recovery payload, and
+	// is dropped when the snapshot is deleted or its node leaves the cluster.
+	snapshotNodeIndex map[string]string
 	// volumeAttachments is the cluster-wide live-reference index. It mirrors the
 	// single-node SQLite volume_attachments table but lives in raft so a delete
 	// request on any node sees sandboxes attached on every worker.
 	volumeAttachments          map[string]models.VolumeAttachment
 	volumeAttachmentsByVolume  map[string]map[string]struct{}
 	volumeAttachmentsBySandbox map[string]map[string]struct{}
+	// egressProfiles are the replicated named egress profiles (snapshotted).
+	// egressProfileRefs is derived: which placements reference each profile,
+	// kept in step with f.placements by reindexEgressProfilesLocked and
+	// rebuilt on Restore from the rows.
+	egressProfiles    map[EgressProfileKey]*EgressProfileRecord
+	egressProfileRefs map[EgressProfileKey]map[string]struct{}
+	// tokens is the replicated API-token table and its change ring
+	// (fsm_tokens.go, snapshotted rows, node-local ring). It has its own
+	// lock: token reads on the request path never take mu.
+	tokens       *apiTokenState
+	apiTokenInit sync.Once
 
 	// subMu guards subscribers. Separate from mu so a slow subscriber accept
 	// can't block FSM reads — Apply takes mu briefly to write, releases it,
@@ -562,6 +610,7 @@ func newPlacementFSMWithRecoveryStore(store placementRecoveryStore) *placementFS
 		pendingReservationClaims:     make(map[string]pendingReservationClaim),
 		pendingReservationCapacity:   make(map[string]capacity.Request),
 		pendingReservationIDsByOwner: make(map[string]map[string]struct{}),
+		pendingReservationRuntimes:   make(map[string]map[string]int),
 		reservedIndex:                make(map[string]struct{}),
 		deletingIndex:                make(map[string]struct{}),
 		drainedNodes:                 make(map[string]bool),
@@ -575,9 +624,13 @@ func newPlacementFSMWithRecoveryStore(store placementRecoveryStore) *placementFS
 		auditACLBySandbox:            make(map[string]map[string]struct{}),
 		volumes:                      make(map[string]models.Volume),
 		volumeNameIndex:              make(map[string]string),
+		snapshotNodeIndex:            make(map[string]string),
 		volumeAttachments:            make(map[string]models.VolumeAttachment),
 		volumeAttachmentsByVolume:    make(map[string]map[string]struct{}),
 		volumeAttachmentsBySandbox:   make(map[string]map[string]struct{}),
+		egressProfiles:               make(map[EgressProfileKey]*EgressProfileRecord),
+		egressProfileRefs:            make(map[EgressProfileKey]map[string]struct{}),
+		tokens:                       newAPITokenState(),
 	}
 }
 
@@ -1019,6 +1072,7 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 		f.releasePendingReservationOwnerLocked(cmd.SandboxID, existing.OwnerNodeID)
 		f.releaseVolumeAttachmentsForIncarnationLocked(cmd.SandboxID, expectedIncarnationID)
 		f.deletePlacementRecoveryLocked(cmd.SandboxID)
+		f.releaseEgressProfilesLocked(cmd.SandboxID)
 		delete(f.placements, cmd.SandboxID)
 		delete(f.deletingIndex, cmd.SandboxID)
 		f.recordPlacementChangeLocked(cmd.SandboxID, true)
@@ -1100,6 +1154,7 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 		}
 		f.releaseVolumeAttachmentsForSandboxLocked(cmd.SandboxID)
 		f.deletePlacementRecoveryLocked(cmd.SandboxID)
+		f.releaseEgressProfilesLocked(cmd.SandboxID)
 		delete(f.placements, cmd.SandboxID)
 		delete(f.deletingIndex, cmd.SandboxID)
 		f.recordPlacementChangeLocked(cmd.SandboxID, true)
@@ -1213,9 +1268,22 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 			f.releasePendingReservationOwnerLocked(id, existing.OwnerNodeID)
 			f.releaseVolumeAttachmentsForIncarnationLocked(id, existing.IncarnationID)
 			f.deletePlacementRecoveryLocked(id)
+			f.releaseEgressProfilesLocked(id)
 			delete(f.placements, id)
 			delete(f.deletingIndex, id)
 			f.recordPlacementChangeLocked(id, true)
+		}
+		// Drop the dead node's snapshot-home entries: its local SQLite catalogue
+		// rows went with it, so the snapshots are gone from the cluster (if the
+		// image was pushed to a registry the bytes survive, but the catalogue
+		// metadata that a GET/DELETE needs does not). A left entry would route
+		// callers to a node that is no longer there. The scan is bounded by the
+		// index size and runs only on a node death. Mirrors how the loops above
+		// release the dead node's placements.
+		for name, node := range f.snapshotNodeIndex {
+			if node == cmd.NodeID {
+				delete(f.snapshotNodeIndex, name)
+			}
 		}
 		return nil
 	case opClaimOrphan:
@@ -1675,6 +1743,28 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 		state.Committed[nodeID] = pending
 		delete(state.Pending, nodeID)
 		return nil
+	case opPutEgressProfile:
+		result, err := f.applyPutEgressProfileLocked(cmd)
+		if err != nil {
+			return err
+		}
+		return result
+	case opDeleteEgressProfile:
+		if err := f.applyDeleteEgressProfileLocked(cmd); err != nil {
+			return err
+		}
+		return nil
+	case opPutAPIToken:
+		result, err := f.applyPutAPITokenLocked(cmd)
+		if err != nil {
+			return err
+		}
+		return result
+	case opDeleteAPIToken:
+		if err := f.applyDeleteAPITokenLocked(cmd); err != nil {
+			return err
+		}
+		return nil
 	case opAllocateArtifactEpoch:
 		// Issue a publisher its fencing token. This is an ALLOCATION, not a
 		// read: a process that reads the current epoch and locally picks "one
@@ -1807,6 +1897,26 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 		}
 		delete(f.volumes, key)
 		delete(f.volumeNameIndex, volumeNameKey(tenant, row.Name))
+		return nil
+	case opRegisterSnapshotNode:
+		// Idempotent get-or-set-or-move: a re-register with the same name
+		// overwrites the node (a snapshot re-committed on a different node moves
+		// its home), so the op is safe under retry and a re-create.
+		name := strings.TrimSpace(cmd.SnapshotName)
+		node := strings.TrimSpace(cmd.NodeID)
+		if name == "" || node == "" {
+			return fmt.Errorf("placementFSM: opRegisterSnapshotNode requires snapshot_name and node_id")
+		}
+		f.snapshotNodeIndex[name] = node
+		return nil
+	case opForgetSnapshotNode:
+		name := strings.TrimSpace(cmd.SnapshotName)
+		if name == "" {
+			return fmt.Errorf("placementFSM: opForgetSnapshotNode requires snapshot_name")
+		}
+		// Idempotent: forgetting an unknown name is a no-op (a delete that races
+		// a never-registered snapshot, or a double delete).
+		delete(f.snapshotNodeIndex, name)
 		return nil
 	case opPutVolumeAttach:
 		if len(cmd.VolumeAttachments) == 0 {
@@ -2480,10 +2590,32 @@ func (f *placementFSM) addPendingCapacityLocked(owner string, req capacity.Reque
 	cur.DiskGB += req.DiskGB
 	cur.GPUs += req.GPUs
 	f.pendingReservationCapacity[owner] = cur
+	if f.pendingReservationRuntimes == nil {
+		f.pendingReservationRuntimes = make(map[string]map[string]int)
+	}
+	byRuntime := f.pendingReservationRuntimes[owner]
+	if byRuntime == nil {
+		byRuntime = make(map[string]int)
+		f.pendingReservationRuntimes[owner] = byRuntime
+	}
+	byRuntime[req.Runtime]++
 }
 
 func (f *placementFSM) subtractPendingCapacityLocked(owner string, req capacity.Request) {
-	if owner == "" || f.pendingReservationCapacity == nil {
+	if owner == "" {
+		return
+	}
+	if byRuntime := f.pendingReservationRuntimes[owner]; byRuntime != nil {
+		if byRuntime[req.Runtime] <= 1 {
+			delete(byRuntime, req.Runtime)
+		} else {
+			byRuntime[req.Runtime]--
+		}
+		if len(byRuntime) == 0 {
+			delete(f.pendingReservationRuntimes, owner)
+		}
+	}
+	if f.pendingReservationCapacity == nil {
 		return
 	}
 	cur := f.pendingReservationCapacity[owner]
@@ -2571,6 +2703,11 @@ func (f *placementFSM) storePlacementLocked(id string, p Placement) error {
 	// because readers take the value from f.placements at serve time.
 	f.recordPlacementChangeLocked(id, false)
 	hot, rec := splitPlacement(p)
+	if old, ok := f.placements[id]; ok {
+		f.reindexEgressProfilesLocked(id, &old, &hot)
+	} else {
+		f.reindexEgressProfilesLocked(id, nil, &hot)
+	}
 	if rec.empty() {
 		if hot.RecoveryRef == "" {
 			delete(f.recovery, id)
@@ -2626,6 +2763,11 @@ func splitPlacement(p Placement) (Placement, placementRecovery) {
 	// the hot row already carries rather than clearing it.
 	if p.Spec != nil {
 		p.PublicTraffic = p.Spec.AllowPublicTraffic != nil && *p.Spec.AllowPublicTraffic
+		// Egress profile references ride the hot row too: the FSM's
+		// reference index and apply-time cap check read them without
+		// hydrating the spec.
+		p.EgressProfiles = append([]string(nil), p.Spec.EgressProfiles...)
+		p.EgressInlineHostnames = egressInlineHostnames(p.Spec)
 	}
 	p.Spec = nil
 	p.SecretRef = ""
@@ -2713,6 +2855,38 @@ func (f *placementFSM) sandboxIDByName(name string) (string, bool) {
 	return id, ok
 }
 
+// sandboxIDByOwnerName resolves name within ownerRef's namespace (see
+// name_key.go): the owner-qualified key first, then a legacy plain key whose
+// placement belongs to the same owner. One read lock covers both probes.
+func (f *placementFSM) sandboxIDByOwnerName(ownerRef, name string) (string, bool) {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	return resolveOwnerName(ownerRef, name, func(key string) (string, string, bool) {
+		id, ok := f.nameIndex[key]
+		if !ok {
+			return "", "", false
+		}
+		p, ok := f.placements[id]
+		if !ok {
+			return "", "", false
+		}
+		return id, p.OwnerRef, true
+	})
+}
+
+// ownerRefOf returns the replicated OwnerRef for sandboxID from the hot
+// placement row, without loading the recovery spec the way get does.
+// Proposers use it to qualify a spec name when the caller didn't pass one.
+func (f *placementFSM) ownerRefOf(sandboxID string) (string, bool) {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	p, ok := f.placements[sandboxID]
+	if !ok {
+		return "", false
+	}
+	return p.OwnerRef, true
+}
+
 // idsOwnedBy returns the sandbox IDs whose current owner is nodeID. Used by
 // the dead-owner reconciler to enumerate orphan candidates.
 func (f *placementFSM) idsOwnedBy(nodeID string) []string {
@@ -2745,6 +2919,15 @@ func (f *placementFSM) currentVersion() uint64 {
 // lazily from the expiry heap, so this path does not scan the full placement
 // table at 100k-sandbox scale.
 func (f *placementFSM) pendingReservationsByNode(now int64) map[string]capacity.Request {
+	out, _ := f.pendingReservationLoadByNode(now)
+	return out
+}
+
+// pendingReservationLoadByNode is pendingReservationsByNode plus the same
+// reservations counted by owner and runtime, read under one lock so the two
+// agree. Placement needs both: the aggregate for CPU, memory and disk, the
+// counts for network slots (a pool serves some runtimes, not others).
+func (f *placementFSM) pendingReservationLoadByNode(now int64) (map[string]capacity.Request, map[string]map[string]int) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.pruneExpiredPendingReservationsLocked(now)
@@ -2752,7 +2935,15 @@ func (f *placementFSM) pendingReservationsByNode(now int64) map[string]capacity.
 	for owner, req := range f.pendingReservationCapacity {
 		out[owner] = req
 	}
-	return out
+	runtimes := make(map[string]map[string]int, len(f.pendingReservationRuntimes))
+	for owner, byRuntime := range f.pendingReservationRuntimes {
+		cp := make(map[string]int, len(byRuntime))
+		for rt, n := range byRuntime {
+			cp[rt] = n
+		}
+		runtimes[owner] = cp
+	}
+	return out, runtimes
 }
 
 func (f *placementFSM) expiredReservationIDs(now int64) []string {
@@ -3212,6 +3403,17 @@ type fsmSnapshotPayload struct {
 	// snapshot decodes it as nil, which reads as "nobody has published", and
 	// the list path falls back to the fan-out.
 	ArtifactCatalog map[string]artifactCatalogSnapshotState
+	// EgressProfiles is the replicated named-profile set. Optional; an older
+	// snapshot decodes it as nil, which reads as "no profiles".
+	EgressProfiles []EgressProfileRecord
+	// SnapshotNodes is the replicated snapshot name → holding-node index.
+	// Optional; an older snapshot decodes it as nil, which reads as "no
+	// snapshot-home entries" and routing falls back to local serving.
+	SnapshotNodes map[string]string
+	// APITokens is the replicated API-token table (hashes, never secrets).
+	// Optional; an older snapshot decodes it as nil, which reads as "no
+	// tokens". An older build decoding a newer snapshot ignores the field.
+	APITokens []identity.TokenRecord
 }
 
 type placementSnapshotRow struct {
@@ -3237,6 +3439,10 @@ func (f *placementFSM) Snapshot() (raft.FSMSnapshot, error) {
 	drained := make(map[string]bool, len(f.drainedNodes))
 	for k, v := range f.drainedNodes {
 		drained[k] = v
+	}
+	snapshotNodes := make(map[string]string, len(f.snapshotNodeIndex))
+	for k, v := range f.snapshotNodeIndex {
+		snapshotNodes[k] = v
 	}
 	auditACLs := make(map[string]AuditACL, len(f.auditACLs))
 	for id, acl := range f.auditACLs {
@@ -3284,6 +3490,9 @@ func (f *placementFSM) Snapshot() (raft.FSMSnapshot, error) {
 		auditACLs:          auditACLs,
 		volumes:            f.volumesSnapshotLocked(),
 		volumeAttachments:  f.volumeAttachmentsSnapshotLocked(),
+		egressProfiles:     f.egressProfilesSnapshotLocked(),
+		snapshotNodes:      snapshotNodes,
+		apiTokens:          f.apiTokens().snapshot(),
 		recoveryStore:      f.recoveryStore,
 		recoveryRefs:       recoveryRefs,
 	}, nil
@@ -3358,10 +3567,14 @@ func (f *placementFSM) Restore(rc io.ReadCloser) (err error) {
 	f.pendingReservationClaims = make(map[string]pendingReservationClaim)
 	f.pendingReservationCapacity = make(map[string]capacity.Request)
 	f.pendingReservationIDsByOwner = make(map[string]map[string]struct{})
+	f.pendingReservationRuntimes = make(map[string]map[string]int)
 	f.pendingReservationExpiries = nil
 	f.reservedIndex = make(map[string]struct{})
 	f.deletingIndex = make(map[string]struct{})
 	f.customHostnameIndex = make(map[string]string)
+	f.egressProfileRefs = make(map[EgressProfileKey]map[string]struct{})
+	f.restoreEgressProfilesLocked(payload.EgressProfiles)
+	f.apiTokens().restore(payload.APITokens, payload.Version)
 	f.auditACLs = make(map[string]AuditACL, len(payload.AuditACLs))
 	f.auditACLLatest = make(map[string]string)
 	f.auditACLBySandbox = make(map[string]map[string]struct{})
@@ -3455,6 +3668,14 @@ func (f *placementFSM) Restore(rc io.ReadCloser) (err error) {
 	} else {
 		f.drainedNodes = payload.DrainedNodes
 	}
+	// Snapshots written before the snapshot-home index existed carry none —
+	// initialize empty so the register path never nil-panics; raft replays any
+	// post-snapshot opRegisterSnapshotNode entries to bring us current.
+	if payload.SnapshotNodes == nil {
+		f.snapshotNodeIndex = make(map[string]string)
+	} else {
+		f.snapshotNodeIndex = payload.SnapshotNodes
+	}
 	// Snapshots written before storage retirement existed carry none.
 	if payload.StorageRetirements == nil {
 		f.storageRetirements = make(map[string]NodeStorageRetirement)
@@ -3503,6 +3724,9 @@ type fsmSnapshot struct {
 	auditACLs          map[string]AuditACL
 	volumes            []models.Volume
 	volumeAttachments  []models.VolumeAttachment
+	egressProfiles     []EgressProfileRecord
+	snapshotNodes      map[string]string
+	apiTokens          []identity.TokenRecord
 	recoveryStore      placementRecoveryStore
 	recoveryRefs       []string
 }
@@ -3525,6 +3749,9 @@ func (s *fsmSnapshot) Persist(sink raft.SnapshotSink) (err error) {
 		AuditACLs:          s.auditACLs,
 		Volumes:            s.volumes,
 		VolumeAttachments:  s.volumeAttachments,
+		EgressProfiles:     s.egressProfiles,
+		SnapshotNodes:      s.snapshotNodes,
+		APITokens:          s.apiTokens,
 	}); err != nil {
 		_ = sink.Cancel()
 		return fmt.Errorf("fsmSnapshot: encode: %w", err)
@@ -3652,6 +3879,7 @@ func cloneCreateSandboxRequest(in *models.CreateSandboxRequest) *models.CreateSa
 	out := *in
 	out.Env = cloneStringMap(in.Env)
 	out.Tags = cloneStringMap(in.Tags)
+	out.CompatState = cloneStringMap(in.CompatState)
 	if len(in.ContainerCommand) > 0 {
 		out.ContainerCommand = append([]string(nil), in.ContainerCommand...)
 	}
@@ -3693,9 +3921,16 @@ func cloneCreateSandboxRequest(in *models.CreateSandboxRequest) *models.CreateSa
 // signal collapses into the next one (the watcher only needs "something
 // changed", not the count of changes). Returns a cancel func that removes the
 // subscriber and is safe to call multiple times.
+// subscribe and its cancel replace f.subscribers with a new slice instead of
+// editing it in place: notifySubscribers walks the slice it read under
+// subMu after releasing the lock, so an in-place append or removal would
+// write into the array a fan-out is reading. Subscribing is rare; the
+// fan-out runs on every Apply, so the copy belongs here.
 func (f *placementFSM) subscribe(ch chan<- struct{}) (cancel func()) {
 	f.subMu.Lock()
-	f.subscribers = append(f.subscribers, ch)
+	next := make([]chan<- struct{}, len(f.subscribers), len(f.subscribers)+1)
+	copy(next, f.subscribers)
+	f.subscribers = append(next, ch)
 	f.subMu.Unlock()
 	var once sync.Once
 	return func() {
@@ -3704,7 +3939,9 @@ func (f *placementFSM) subscribe(ch chan<- struct{}) (cancel func()) {
 			defer f.subMu.Unlock()
 			for i, c := range f.subscribers {
 				if c == ch {
-					f.subscribers = append(f.subscribers[:i], f.subscribers[i+1:]...)
+					next := make([]chan<- struct{}, 0, len(f.subscribers)-1)
+					next = append(next, f.subscribers[:i]...)
+					f.subscribers = append(next, f.subscribers[i+1:]...)
 					return
 				}
 			}
@@ -3718,7 +3955,7 @@ func (f *placementFSM) subscribe(ch chan<- struct{}) (cancel func()) {
 // just "wake up and reconcile."
 func (f *placementFSM) notifySubscribers() {
 	f.subMu.Lock()
-	subs := f.subscribers
+	subs := f.subscribers // never mutated in place; see subscribe
 	f.subMu.Unlock()
 	for _, ch := range subs {
 		select {

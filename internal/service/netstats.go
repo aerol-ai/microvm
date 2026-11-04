@@ -105,6 +105,14 @@ func (s *Service) SetNetworkLimits(ctx context.Context, id string, bytesInLimit,
 	if s.isFirecrackerSandbox(sandbox) && (bytesInLimit > 0 || bytesOutLimit > 0) {
 		return nil, unsupportedFirecrackerOption("network byte limits")
 	}
+	// A container crossing its cap is blocked by a firewall DROP: without the
+	// firewall the cap would be stored and the over-quota flag set while the
+	// traffic keeps flowing. Lifting a cap (0) is always allowed.
+	if err := s.checkSandboxNetRules(sandbox, "set_network_limits", firewallPolicyFields(&models.CreateSandboxRequest{
+		NetworkBytesInLimit: bytesInLimit, NetworkBytesOutLimit: bytesOutLimit,
+	})); err != nil {
+		return nil, err
+	}
 	// Stronger lazy-bootstrap case than GetNetworkUsage: setting a limit
 	// implies the operator wants enforcement to start. If the poller is
 	// down, "limit set, never enforced" is silent failure of a security
@@ -139,7 +147,7 @@ func (s *Service) applyNetworkQuotaState(ctx context.Context, sandbox *models.Sa
 		return
 	}
 	if s.isWasmSandbox(sandbox) {
-		s.syncWasmNetworkPolicy(sandbox, overIn, overOut)
+		s.syncWasmNetworkPolicy(ctx, sandbox, overIn, overOut)
 		if overIn || overOut {
 			if err := s.store.MarkNetworkQuotaExceeded(ctx, sandbox.ID, time.Now().UTC()); err != nil && !errors.Is(err, store.ErrNotFound) {
 				s.logger.Warn("mark network quota exceeded failed",
@@ -163,6 +171,10 @@ func (s *Service) applyNetworkQuotaState(ctx context.Context, sandbox *models.Sa
 	// `quota_exceeded` flag stuck true even after the operator raises the
 	// limit and the over-quota condition no longer holds.
 	if sandbox.ContainerIP != "" {
+		// Mirror the egress quota into the gateway's @blocked_src for a
+		// gateway-mode sandbox (eng re-review D2). The DROP below stays as
+		// the second layer.
+		s.setEgressQuotaBlock(ctx, sandbox, overOut)
 		cr, err := s.containerRuntimeForSandbox(sandbox)
 		if err != nil {
 			s.logger.Warn("apply network quota skipped: runtime has no container network rules",

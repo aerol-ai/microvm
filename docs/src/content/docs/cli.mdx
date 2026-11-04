@@ -1,0 +1,450 @@
+---
+title: aerolvm CLI
+description: Create sandboxes, run commands, copy files and share ports from your terminal. Scripts and AI agents can use it too.
+---
+
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+
+`aerolvm` lets you work with sandboxes from your terminal. You can create a sandbox, run commands in it, copy files in and out, and share a web server from it. It talks to the same server as the SDKs, so it works with a local install, one server or a cluster.
+
+Scripts and AI agents can use it too. The same program is also an [MCP server](/mcp/) for AI coding tools.
+
+## Install
+
+```bash
+curl -fsSL https://aerolvm.aerol.ai | bash -s -- --cli-only
+```
+
+This installs only the CLI. It needs no server, no Docker and no admin rights, and works on Linux and macOS. If it tells you to add a folder to your `PATH`, do that, then open a new terminal.
+
+Other ways to install:
+
+- **With Go:** `go install github.com/aerol-ai/microvm/cmd/aerolvm@latest`
+- **By hand, including on Windows:** download the file for your system from [GitHub releases](https://github.com/aerol-ai/microvm/releases). Check it against `checksums.txt`, then put it in a folder on your `PATH`.
+
+## Sign in
+
+The CLI uses the same two settings as the SDKs: your server's address and your token. If you followed the [Quickstart](/quick-start/), they are already set. If not, set them now:
+
+```bash
+export SB_API_URL=http://localhost:21212
+export SB_PAT_TOKEN=your-secret-pat
+```
+
+Then check that the CLI can reach your server:
+
+```bash
+aerolvm health
+```
+
+To skip the `export` lines in every new terminal, run `aerolvm login` once. It asks for the address and the token and saves them. If your server offers single sign-on (SSO), it opens your browser to sign in with your company account instead. See [Save your login](#save-your-login).
+
+## Your first sandbox
+
+### Step 1: Create a sandbox
+
+```bash
+aerolvm create --name build-box --image python:3.12 --destroy-if-idle 2h
+```
+
+This starts a sandbox named `build-box` from the `python:3.12` image. It deletes itself after 2 hours with no activity. If you already have a sandbox with that name, you get that one back instead of a second one.
+
+### Step 2: Run a command in it
+
+```bash
+aerolvm exec build-box -- python -V
+```
+
+Everything after `--` runs inside the sandbox, and the output shows up live. To use pipes or `&&`, put the whole command in quotes:
+
+```bash
+aerolvm exec build-box -- "pip install requests && pip list"
+```
+
+### Step 3: Copy files in and out
+
+```bash
+aerolvm cp ./data.csv build-box:/tmp/data.csv
+aerolvm cp build-box:/tmp/data.csv ./copy.csv
+```
+
+Write a path inside the sandbox as `<sandbox>:<path>`. `cp` copies one file at a time.
+
+### Step 4: Share a web server
+
+```bash
+aerolvm exec build-box --background -- python -m http.server 8000
+aerolvm expose build-box 8000
+```
+
+`--background` starts the server and returns right away. `expose` prints a public web address for port 8000. Sandboxes are [private](/network-access/) until you expose a port.
+
+Public addresses need a [server install](/getting-started/single-node-setup/). On a local install, `expose` still prints an address, but nothing answers there.
+
+### Step 5: Delete it
+
+```bash
+aerolvm destroy build-box
+```
+
+## Open a shell in a sandbox
+
+```bash
+aerolvm shell build-box
+```
+
+You get a terminal inside the sandbox, as if you had logged in to it. Type `exit` to end the shell.
+
+- **Leave without closing it:** press `Ctrl-]`. The shell keeps running. Run the same command to get back in, with your recent output on screen.
+- **Pick from a list:** run `aerolvm shell` with no name.
+- **Not every sandbox has a shell.** WebAssembly and V8 isolate sandboxes do not, and neither do images without `bash` or `sh`. Use `exec` for those.
+
+More in [Shell details](#shell-details).
+
+## More things you can do
+
+| To do this | Run |
+|---|---|
+| List your sandboxes | `aerolvm list` |
+| See one sandbox | `aerolvm get build-box` |
+| Stop a sandbox and keep its files | `aerolvm stop build-box` |
+| Start it again | `aerolvm start build-box` |
+| List a folder | `aerolvm ls build-box:/tmp` |
+| Follow a background command's output | `aerolvm logs build-box <session-id> --follow` |
+| Save a sandbox as an image | `aerolvm snapshot build-box my-image` |
+| Run a command in a folder, with a time limit | `aerolvm exec build-box --cwd /app --timeout 10m -- npm test` |
+| Give a command an environment variable | `aerolvm exec build-box --env CI=1 -- npm test` |
+| Share a raw TCP port, such as a database | `aerolvm expose build-box 5432 --tcp` |
+| See every option of a command | `aerolvm <command> --help` |
+
+You can name a sandbox by its name or by its ID (`sb-` and 16 hex digits). `--background` prints the session ID that `logs` needs.
+
+## Limit what a sandbox can reach
+
+A new sandbox can reach the internet. To allow only some sites, list them when you create it:
+
+```bash
+aerolvm create --name build-box --image python:3.12 --allow-host pypi.org --allow-host '*.pythonhosted.org'
+```
+
+Everything else is refused. An entry can be a site name, a `*.` wildcard, `host:port`, or a range of IP addresses such as `10.0.0.0/8`. To turn the internet off completely, use `--block-network` instead. To change the list later, use an SDK. [Allow only some websites](/network-access/#allow-only-some-websites) has the details.
+
+## Reference
+
+### Save your login
+
+```bash
+aerolvm login https://sandbox.example.com
+```
+
+What happens next depends on the server:
+
+- **The server offers SSO:** your browser opens your company's sign-in page. If the server offers several providers, the CLI asks which one. Afterwards the CLI prints who you are, your role and your team.
+- **No SSO:** it asks for a token with typing hidden, checks it with the server, then saves it.
+
+Either way, the login is saved in `~/.config/aerolvm/config.json`, and only you can read that file.
+
+- With no address, it asks for one. The default is the local install, `http://127.0.0.1:21212`.
+- `SB_API_URL` and `SB_PAT_TOKEN` (or `SB_API_TOKEN`) still win over the saved login when they are set.
+- The saved login is only ever sent to the address it was saved for.
+- An SSO login renews itself while your company allows it. If a renewal fails while your sign-in still works, the CLI warns you and keeps using it until it ends. Once it has ended, the CLI says so: sign in again with `aerolvm login --sso <url>`.
+- In CI, pipe a token in: `aerolvm login <url> --token-stdin`.
+- `aerolvm logout` forgets the login on this machine. A token keeps working on the server.
+
+| Flag | What it does |
+|---|---|
+| `--sso` | Sign in with SSO, and fail if the server does not offer it. |
+| `--device` | Sign in with a code on another device. Use it over SSH, where no browser can open. |
+| `--issuer <name>` | Pick the sign-in provider by name, when the server offers several. |
+| `--team <team>` | The team to act for, when you belong to several. It is sent with every request. `SB_TEAM` overrides it. |
+| `--client-secret-stdin` | Read the provider app's client secret from stdin, and save it with the login. Only Google needs this. Your admin gives you the value. |
+| `--token-stdin` | Read an API token from stdin instead of signing in. |
+
+Over SSH, `--device` prints something like `aerolvm: to sign in, open https://acme.okta.com/activate and enter the code ABCD-EFGH. Waiting…`. It works only if your admin turned on the device flow for the CLI app at your provider. Some providers, such as Keycloak, then ask you to grant access on that page. [SSO](/enterprise/sso/#step-3-register-the-apps-at-your-provider) lists that setting for Okta, Entra ID, Keycloak, Google, Authentik, Zitadel and Dex.
+
+When you sign in but the server has no rule for you, the CLI lists the groups your sign-in carried. Send that line to your AerolVM admin. [SSO](/enterprise/sso/) explains roles, teams and rules.
+
+### Check who you are
+
+```bash
+aerolvm whoami
+```
+
+```text
+alice@acme.com
+role     runner
+team     payments
+via      Acme Okta
+expires  in 54m (15:04 UTC)
+```
+
+`team` reads `all teams` for a credential bound to every team. `via` says how you signed in: a provider's name, `API token "<name>"`, or `server token`.
+
+Add `--explain` to see which rule (binding) gave you this role, and the claims of your own sign-in it was matched against:
+
+```text
+Why:
+  binding 3 matched, in effect: okta group="payments-eng" -> runner/payments
+  binding 5 also matched: okta group="everyone" -> viewer/*
+
+Your sign-in carried (issuer okta):
+  username  alice@acme.com
+  groups    everyone, payments-eng
+  roles     (none)
+```
+
+When a saved API token has less than 7 days left, every command prints one warning line on stderr, such as `aerolvm: warning: the API token "ci-deploy" expires in 6 days (2026-10-23). Ask an admin for a new one before then.` It never goes to stdout or `--json` output.
+
+### Print a token for scripts
+
+```bash
+SB_API_TOKEN=$(aerolvm auth token) python agent.py
+```
+
+`aerolvm auth token` prints the credential the CLI would send: your SSO sign-in (renewed first if it is about to expire), the saved API token, or `SB_PAT_TOKEN`. A sign-in token lasts about an hour, so run it again for long jobs.
+
+### Manage API tokens
+
+```bash
+aerolvm token create --name ci-deploy --role runner --team payments --expires-in 90d
+aerolvm token list
+aerolvm token revoke tok_7Hq2aBcDeFgH
+```
+
+- **`create`** prints the new token on stdout, and only this once. Store it right away. All four flags are required. `--team '*'` means every team, and `auditor` and `admin` need it.
+- **`list`** shows each token's ID, name, role, team, expiry and creator. It never shows a secret.
+- **`revoke`** takes the ID (`tok_…`) or the token itself. It succeeds even when the token is already gone. Every server stops accepting it within seconds.
+- `create` and `revoke` need an admin. `list` needs an auditor or an admin.
+
+The server needs `SB_IDENTITY_ENABLED=true` to accept the tokens it creates. See [SSO](/enterprise/sso/#give-a-service-its-own-token).
+
+### Search audit records
+
+```bash
+aerolvm audit search --export s3://acme-audit/audit --caller ana@acme.com --since 7d
+```
+
+This finds records in your exported audit log, such as everything one person did this week. It checks each record's place in the hash chain as it reads, so what it prints is tamper-checked. It needs no server and no token.
+
+| Flag | What it does |
+|---|---|
+| `--since <when>` | Where the window starts. Required. A time, a duration such as `720h`, or days such as `30d`. |
+| `--export` or `--export-dir` | Where the exported records are. Give exactly one, as for `audit verify`. |
+| `--caller <id-or-name>` | Records for one caller: an ID (`tok_…`, `operator`, `system:lifecycle`) or a display name such as an email, in any case. |
+| `--kind <kind>` | One kind of record, such as `api`, `secret_open`, `egress` or `auth_denied`. |
+| `--sandbox <id>` | Records about one sandbox. |
+| `--result <result>` | `ok`, `denied` or `error` for API records. |
+| `--until <when>` | Where the window ends. Default: now. |
+| `--limit <n>` | Print at most this many matches. Default `1000`, and `0` prints all. |
+| `--witness <s3://…>` | Also check the witnessed fingerprints, as `audit verify` does. |
+| `--fetch-concurrency <n>` | How many S3 batches to download at once, as for `audit verify`. Default `32`. |
+
+Each match is one line, then each server's verdict. Exit codes are those of `audit verify`.
+
+### Review who has access
+
+```bash
+aerolvm access review --export s3://acme-audit/audit --since 90d --identity-file identity.yaml > access-review.md
+```
+
+This writes the evidence for a quarterly access review. It joins the server's token list with your exported audit records, and flags tokens no record names, expired and expiring tokens, every admin, identity file changes, and refused calls. It needs an auditor or admin credential for the token list, and reads the export like `audit search`.
+
+| Flag | What it does |
+|---|---|
+| `--since <when>` | Where the review window starts. Required. A quarter is `90d`. |
+| `--export` or `--export-dir` | Where the exported records are. Give exactly one. |
+| `--identity-file <path>` | Also list the role rules in your identity file, and which servers run that exact file. It is read on your machine and never sent anywhere. |
+| `--format md\|csv` | Markdown (the default) or CSV. |
+| `--witness <s3://…>` | Also check the witnessed fingerprints, as `audit verify` does. |
+| `--fetch-concurrency <n>` | How many S3 batches to download at once for each server, as for `audit verify`. Default `32`. Up to four servers are read at once. |
+| `--json` | Print the report as JSON. |
+
+A tampered export fails the review: nothing is printed on stdout, and the command exits `1`. [Audit and compliance](/enterprise/audit-evidence/#access-review-evidence) describes every section, flag and CSV column.
+
+### Shell details
+
+- **Shells are shared.** Two terminals on the same sandbox share its `default` shell, like `tmux`. An [SSH login](/ssh-access/) lands in the same one. `--new` starts a separate shell, and `--session <name>` opens a named one.
+- **It acts like a local terminal.** Resizing your window resizes the remote one, so `vim`, `top` and `less` fit.
+- **A stopped sandbox is started first.**
+- **Stopping or deleting the sandbox ends the shell.** When the connection drops, `aerolvm shell` tells you whether the shell is still there to reopen.
+- **`shell` needs a real terminal.** Scripts and agents use `exec`.
+
+These shells are [terminal sessions](/sessions/), so the SDKs can see and manage them too.
+
+### Output for scripts and agents
+
+Normal output is data. Progress, notes and errors go to the error stream (stderr).
+
+Add `--json` to any command, or set `AEROLVM_OUTPUT=json` once, to get one JSON document instead. `exec --json` waits for the command and prints its `exit_code`, `stdout` and `stderr`. Long output keeps its first 4 KB and last 12 KB.
+
+With `--json`, errors look like this:
+
+```json
+{"error":{"code":"not_found","message":"sandbox \"build-box\" not found","http_status":404,"retryable":false}}
+```
+
+Check the `code` field. It does not change between versions. Common codes are `not_found`, `conflict`, `invalid_argument`, `unauthorized`, `unavailable`, `timeout`, `server_unsupported` and `unsupported_runtime`. `retryable` says whether trying again can work.
+
+### Exit codes
+
+| Code | Meaning |
+|---|---|
+| `0` | It worked. |
+| `1` | The command failed. |
+| `2` | Bad usage, such as an unknown flag. |
+
+`exec` and `shell` exit with the remote command's own code instead. It is `128+n` when signal `n` killed the command, and `125` when `aerolvm` itself failed. `exec` exits with `124` when `--timeout` fires, and `shell` with `0` when you detach.
+
+`audit verify`, `audit search` and `access review` exit with `3` when the result is INCOMPLETE. See [Check an audit log against its witness](#check-an-audit-log-against-its-witness).
+
+### Safe to repeat
+
+- **`create`** returns the sandbox that already has the name. With `--json`, it reports `"created": false`. Without `--name`, the CLI picks a name (`agent-` and random characters) before the first try, so a retry finds the same sandbox.
+- **`destroy`** of a sandbox that is already gone succeeds.
+- **`expose`** returns the same address each time.
+
+Every sandbox the CLI creates gets the tag `aerolvm.created_by=cli`. Find them with `aerolvm list --tag aerolvm.created_by=cli`.
+
+### Input and stopping
+
+- **Input is passed along** when it is not a terminal, so `echo hi | aerolvm exec build-box -- cat` works. Some agent tools leave input open forever. Pass `--no-stdin` there, or a command that reads input waits until `--timeout`.
+- **Interactive programs:** `aerolvm exec build-box -it -- htop` works like `docker exec -it`.
+- **Stopping:** `--timeout` and `Ctrl-C` stop the command inside the sandbox, not just on your machine. A dropped connection stops it too. See [If the connection drops](/exec-streaming/#if-the-connection-drops).
+
+### Sandbox types
+
+- **WebAssembly sandboxes** run a command and print the output when it ends. They pass no input, and `-i`, `-t` and `shell` are refused.
+- **V8 isolate sandboxes** run one request handler, with no shell and no files. `shell`, `exec`, `cp` and `ls` fail with `unsupported_runtime`. Call the handler from an SDK instead. See [V8 isolate](/isolate-sandbox/).
+
+### Check an audit log against its witness
+
+```bash
+aerolvm audit verify --witness s3://my-audit-witness --since 30d --export s3://my-audit-export
+```
+
+This is for servers in [enterprise mode](/enterprise/enterprise-mode/). Each server stores its audit log's newest fingerprint in a locked S3 bucket, called the witness. `audit verify` checks that every fingerprint stored since `--since` links to the next one through the audit records.
+
+- It needs no server and no token. It reads the buckets with your usual AWS credentials, and read access is enough.
+- Run it on a machine outside the cluster you are checking.
+- It checks every server in the bucket, one by one. The worst result wins.
+
+| Flag | What it does |
+|---|---|
+| `--witness s3://<bucket>[/<prefix>]` | The witness bucket. Required. The prefix defaults to `witness/`. |
+| `--since <when>` | Where the window starts. Required. Give a time such as `2026-10-01T00:00:00Z`, a duration such as `720h`, or days such as `30d`. |
+| `--export s3://<bucket>[/<prefix>]` | The S3 audit export. Give this or `--export-dir`, not both. |
+| `--export-dir <dir>` | Batches saved from a webhook or bus receiver, laid out as `<dir>/node=<id>/YYYY/MM/DD/<batch>.jsonl`. |
+| `--local <id>=<path>` | A copy of one server's `secrets.jsonl`, for records not exported yet. Repeat it for more servers. A bare path works with exactly one `--node`. |
+| `--node <id>` | Check only this server. Repeat it for more. By default, every server in the bucket. |
+| `--max-lag <duration>` | How long a fingerprint may wait for its records. Default `15m`. |
+| `--fetch-concurrency <n>` | How many S3 batches to download at once. Default `32`, from `1` to `256`. Every batch is still read and checked. This only sets how many downloads overlap. |
+| `--region`, `--endpoint`, `--path-style` | S3 client settings, used for both buckets. |
+| `--json` | Print the full report as JSON. |
+
+| Result | Exit code | Meaning |
+|---|---|---|
+| PASS | `0` | Every fingerprint in the window links to the records. |
+| FAIL | `1` | A fingerprint does not link: a rewritten history, a rollback, or missing records. Also used when the check cannot run. |
+| INCOMPLETE | `3` | Nothing contradicts the witness, but some fingerprints have waited longer than `--max-lag` for their records. The export is behind. Never read this as PASS. |
+
+Each server writes up to one export batch a second, so a busy day can hold tens of thousands of them. The check reads every batch of every day it covers, starting the day before `--since`, so a short window still reads one or two full days. Downloads overlap (`--fetch-concurrency`), wait in a temporary folder, and the folder is removed when the check ends, also when you press Ctrl-C. Ctrl-C exits with `130`.
+
+Keep exported records at least as long as your `--since` window, or the result is FAIL. [Check the whole history](/enterprise/enterprise-mode/#check-the-whole-history) explains how to pick the window.
+
+### Debugging
+
+`--debug` prints every API request and response status to stderr. The token is hidden.
+
+
+If two programs race to create the same name, both calls succeed. One creates the sandbox. The other gets HTTP 409 (Conflict) and should look the name up again. The CLI does that for you.
+
+## Same thing from the SDK
+
+Every command is an ordinary API call, so the SDKs do the same. This is [Your first sandbox](#your-first-sandbox) in code:
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    import { MicroVM } from "@aerol-ai/aerolvm-sdk";
+
+    const client = new MicroVM(); // reads SB_API_URL and SB_PAT_TOKEN or SB_API_TOKEN
+
+    const sandbox = await client.create({ image: "python:3.12" });
+    const result = await sandbox.exec("python -V");
+    console.log(result.stdout);
+    await sandbox.destroy();
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    from microvm import MicroVM
+
+    client = MicroVM()  # reads SB_API_URL and SB_PAT_TOKEN or SB_API_TOKEN
+
+    sandbox = client.create(image="python:3.12")
+    result = sandbox.exec("python -V")
+    print(result["stdout"])
+    sandbox.destroy()
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    client, err := microvm.NewClient() // reads SB_API_URL and SB_PAT_TOKEN or SB_API_TOKEN
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    sandbox, err := client.Create(ctx, sdktypes.CreateSandboxOptions{Image: "python:3.12"})
+    if err != nil {
+        log.Fatal(err)
+    }
+    defer sandbox.Destroy(ctx)
+
+    result, err := sandbox.ExecCommand(ctx, "python -V")
+    if err != nil {
+        log.Fatal(err)
+    }
+    fmt.Print(result.Stdout)
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    use aerolvm_sdk::{Client, CreateOptions};
+
+    let client = Client::new(None, None)?; // reads SB_API_URL and SB_PAT_TOKEN or SB_API_TOKEN
+
+    let sandbox = client.create(CreateOptions {
+        image: "python:3.12".into(),
+        ..Default::default()
+    })?;
+    let result = sandbox.exec("python -V")?;
+    print!("{}", result.stdout);
+    sandbox.destroy()?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    import ai.aerol.microvm.MicroVMClient;
+    import ai.aerol.microvm.Sandbox;
+    import ai.aerol.microvm.model.CreateOptions;
+    import ai.aerol.microvm.model.ExecResult;
+
+    MicroVMClient client = new MicroVMClient(); // reads SB_API_URL and SB_PAT_TOKEN or SB_API_TOKEN
+
+    Sandbox sandbox = client.create(new CreateOptions().setImage("python:3.12"));
+    ExecResult result = sandbox.exec("python -V");
+    System.out.print(result.stdout);
+    sandbox.destroy();
+    ```
+  </TabItem>
+</Tabs>
+
+`aerolvm whoami` and `aerolvm token` are `whoami()` and `tokens` in every SDK. See [SSO](/enterprise/sso/).
+
+## Next steps
+
+- [SSO](/enterprise/sso/): company sign-in, roles, teams and API tokens.
+- [MCP server](/mcp/): give an AI coding tool its own sandboxes through the same program.
+- [Run commands](/exec-streaming/): what `exec` does, from the SDK side.
+- [Terminal sessions](/sessions/): the shells and background commands behind `shell` and `--background`.
+- [SDK setup](/sdk-setup/): drive sandboxes from your own code.

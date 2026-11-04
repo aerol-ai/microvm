@@ -53,7 +53,7 @@ func newRetirementHandlers(t *testing.T) *handlers {
 func asOperator(r *http.Request, operator bool) *http.Request {
 	return r.WithContext(controlplane.ContextWithAccess(r.Context(), controlplane.Access{
 		Identity: controlplane.Identity{ExternalID: "op-1"},
-		Operator: operator,
+		Fleet:    operator,
 	}))
 }
 

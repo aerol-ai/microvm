@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 
+	"github.com/aerol-ai/microvm/pkg/egresspolicy"
 	wasmengine "github.com/aerol-ai/microvm/pkg/wasm"
 	"github.com/aerol-ai/microvm/pkg/wasm/worker"
 	"github.com/aerol-ai/microvm/pkg/wasmmod"
@@ -100,6 +101,16 @@ func (a workerClientAdapter) NetstatsTick(sandboxID string) (int64, int64, error
 
 func (a workerClientAdapter) SetNetworkBlocks(sandboxID string, blockIngress, blockEgress bool) error {
 	return a.client.SetNetworkBlocks(sandboxID, blockIngress, blockEgress)
+}
+
+// SetEgressPolicy is the optional live-update hook (egressPolicySetter).
+func (a workerClientAdapter) SetEgressPolicy(sandboxID string, allowOut, denyOut []string, learn bool) error {
+	return a.client.SetEgressPolicy(sandboxID, allowOut, denyOut, learn)
+}
+
+// EgressLearned reads a learn-mode recording (egressLearnReader).
+func (a workerClientAdapter) EgressLearned(sandboxID string) (egresspolicy.Learned, error) {
+	return a.client.EgressLearned(sandboxID)
 }
 
 func (a workerClientAdapter) SetListenPort(sandboxID string, port int, host string) error {

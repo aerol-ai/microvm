@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"strings"
 	"time"
 
@@ -23,6 +24,11 @@ const (
 	OverlapPhaseSeal    = "seal"
 	OverlapPhasePromote = "promote"
 )
+
+// overlapCommitTimeout bounds the seal (concurrent with the create) and,
+// separately, the promote that runs after the create+seal join. A var so tests
+// can shrink it.
+var overlapCommitTimeout = 5 * time.Second
 
 // OverlapFailure is returned when the create leg, seal leg, or the post-join
 // promote fails. Retract has already been attempted; the handler should
@@ -105,10 +111,62 @@ func OverlapCreateAndPromote(
 		return svc.CreateSandboxWithID(ctx, req, reservationID)
 	}
 
+	// One create of an id runs on this node at a time, from here through the
+	// promote or the retract (service create_lease.go). A failed leg retracts
+	// the reservation and destroys the sandbox under its id, so a second
+	// create of the id running alongside — an Idempotency-Key retry routed
+	// here while the first is still pulling its image — would, on failing,
+	// tear down the first. It waits instead, bounded by ctx and the create
+	// timeout, and then sees what the first left. A different request under
+	// the key is refused at once, before the replay below and before either
+	// leg. The create leg's CreateSandboxWithID joins this lease.
+	ctx, release, err := svc.BeginSandboxCreate(ctx, reservationID, req.CreateRequestDigests)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+
+	// Idempotent replay: if a sandbox already exists locally under this id, the
+	// create + promote already happened. This path is reached when an
+	// Idempotency-Key retry (or a lost-ack retry) hits the reservation-conflict
+	// replay in Prepare, which routes the retry back here with the existing id
+	// once the sandbox is already Placed, and when a retry waited above for
+	// the create it repeats. Re-binding its (now consumed) reservation would
+	// fail with "reserved placement is no longer authoritative", so return
+	// the existing sandbox instead. The id is owner-namespaced for derived
+	// keys, so GetSandbox only matches the caller's own sandbox; when nothing
+	// is here yet this create runs the normal create+promote below, and when
+	// the create it waited for failed, its retract already cancelled the
+	// reservation, so the binding below answers ErrReservedPlacementGone
+	// (503): the client's next retry reserves afresh.
+	if existing, err := svc.GetSandbox(ctx, reservationID); err == nil && existing != nil {
+		return &models.CreateSandboxResponse{Sandbox: *existing, Replayed: true}, nil
+	}
+
+	// Platform volumes: the seal and the promoted spec need concrete
+	// MountSpecs (a failover recreate has no caller identity to scope the
+	// tenant, and S3 keys must land in the sealed bag), but the create leg
+	// must keep the bare references. Its resolvePlatformVolumes is what makes
+	// a first-use volume's row under the tenant quota, records the attachment
+	// that stops an in-use volume being deleted, and removes the row again if
+	// the create fails. Resolving req in place here (as the callers used to)
+	// 404'd every first-use volume and skipped the attachment, so resolve a
+	// copy with its own Mounts array: the create leg appends to req.Mounts
+	// while the seal leg reads this one.
+	replicated := req
+	if len(req.PlatformVolumes) > 0 {
+		replicated.Mounts = slices.Clone(req.Mounts)
+		if err := svc.ResolvePlatformVolumesForReplication(ctx, &replicated); err != nil {
+			// Nothing local has started; release only the reservation.
+			cancelReservation(context.Background(), c, logger, reservationID)
+			return nil, err
+		}
+	}
+
 	// commitCtx is derived from the request so an overall deadline still
 	// bounds seal+promote, but we NEVER treat cancelling it as cleanup: a
 	// Raft apply can fail client-side and still land in the FSM (§2.2).
-	commitCtx, commitCancel := context.WithTimeout(ctx, 5*time.Second)
+	commitCtx, commitCancel := context.WithTimeout(ctx, overlapCommitTimeout)
 	defer commitCancel()
 	sealStart := time.Now()
 	binding, bindingErr := svc.ReservedSecretBinding(commitCtx, reservationID)
@@ -118,10 +176,16 @@ func OverlapCreateAndPromote(
 		}
 		// No local side effect has started. Release only this reservation; its
 		// incarnation-fenced CancelReservation implementation makes a delayed
-		// cleanup harmless after ID reuse.
-		if err := c.CancelReservation(commitCtx, reservationID); err != nil && logger != nil {
-			logger.Warn("cluster: cancel reservation after binding failure",
-				"sandbox_id", reservationID, "err", err)
+		// cleanup harmless after ID reuse. A reservation this node does not
+		// hold (gone, expired, another node's) is not this request's to
+		// cancel: CancelReservation cancels whatever reservation of the id is
+		// current, and after a retry waited out a failed create of the id
+		// that may already be the client's next retry's.
+		if !errors.Is(bindingErr, service.ErrReservedPlacementGone) {
+			if err := c.CancelReservation(commitCtx, reservationID); err != nil && logger != nil {
+				logger.Warn("cluster: cancel reservation after binding failure",
+					"sandbox_id", reservationID, "err", err)
+			}
 		}
 		return nil, &OverlapFailure{Phase: OverlapPhaseSeal, Err: bindingErr}
 	}
@@ -158,7 +222,7 @@ func OverlapCreateAndPromote(
 		}()
 		// HA creates: local seal only on this path; async fan-out is off-path
 		// (plans/secrets-hardening §3e). cluster_seal timing stays local seal.
-		sealed, err := svc.SealAndDistribute(sealCtx, reservationID, req, binding.Recipients)
+		sealed, err := svc.SealAndDistribute(sealCtx, reservationID, replicated, binding.Recipients)
 		if opts.Timing != nil {
 			opts.Timing.RecordStage("cluster_seal", time.Since(sealStart))
 		}
@@ -184,13 +248,20 @@ func OverlapCreateAndPromote(
 		sr.secrets.OwnerRef = cr.resp.Sandbox.OwnerRef
 	}
 
+	// The promote runs only after the create and seal legs have joined, so it
+	// must not share the seal's commitCtx: that 5s clock started before the
+	// create leg, so a create slower than 5s (a cold image pull or boot) would
+	// leave commitCtx already expired and fail the promote with a deadline even
+	// though the sandbox is up (B13). Give the promote its own fresh 5s.
+	promoteCtx, promoteCancel := context.WithTimeout(ctx, overlapCommitTimeout)
+	defer promoteCancel()
 	promoteStart := time.Now()
 	var promoteErr error
 	if opts.PromoteWithSpec {
-		redacted := service.RedactClusterSecrets(req)
-		promoteErr = c.RecordPlacement(commitCtx, reservationID, &redacted, sr.secrets)
+		redacted := service.RedactClusterSecrets(replicated)
+		promoteErr = c.RecordPlacement(promoteCtx, reservationID, &redacted, sr.secrets)
 	} else {
-		promoteErr = c.RecordPlacement(commitCtx, reservationID, nil, sr.secrets)
+		promoteErr = c.RecordPlacement(promoteCtx, reservationID, nil, sr.secrets)
 	}
 	if opts.Timing != nil {
 		opts.Timing.RecordStage("cluster_promote", time.Since(promoteStart))

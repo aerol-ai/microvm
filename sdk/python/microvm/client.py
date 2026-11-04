@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import datetime
+import email.utils
 import importlib
 import json
 import os
 import random
+import secrets
+import socket
 import threading
 import time
 import urllib.error
@@ -12,11 +16,16 @@ import urllib.request
 import uuid
 from concurrent.futures import Future, TimeoutError as FutureTimeoutError
 from io import BytesIO
-from typing import Any, Dict, Iterator, List, Optional
+from typing import Any, Dict, Iterator, List, Optional, Union
 
 from ._internal.api.v1.paths import PATH_PREFIX as _V1_PATH_PREFIX
 from .image import Image
 from .types import (
+    APIToken,
+    APITokenList,
+    CreateAPITokenOptions,
+    CreatedAPIToken,
+    WhoAmI,
     BuildImagePushOptions,
     BuildImageResult,
     CloneGeneration,
@@ -34,6 +43,7 @@ from .types import (
     ExposeProtocol,
     ExposeResult,
     Failover,
+    GPUOptions,
     HealthStatus,
     IngressTarget,
     Lifecycle,
@@ -41,6 +51,19 @@ from .types import (
     MountSpec,
     MountSpecRedacted,
     NetworkUsage,
+    AuditEvent,
+    AuditOptions,
+    AuditPage,
+    EgressProfile,
+    EgressProfileList,
+    EgressProfileOptions,
+    EgressRule,
+    ListEgressProfilesOptions,
+    NetworkLearned,
+    NetworkPolicy,
+    NetworkPolicyCheckOptions,
+    NetworkPolicyCheckResult,
+    NetworkPolicyOptions,
     PlatformVolumeMount,
     RegisterSnapshotOptions,
     ResizeOptions,
@@ -50,6 +73,7 @@ from .types import (
     Session,
     SessionAttachOptions,
     SetNetworkLimitsOptions,
+    SnapshotList,
     Template,
     WasmModule,
     PushWasmModuleOptions,
@@ -68,6 +92,44 @@ _PATH_PREFIXES: Dict[str, str] = {
     "v1": _V1_PATH_PREFIX,
 }
 
+# Statuses retried on an idempotent request. 421 is a misdirected request (a
+# stale route or a coalesced connection): the server closes the connection,
+# so the retry reconnects and the ingress re-routes it.
+_RETRY_STATUSES = frozenset({421, 429, 502, 503, 504})
+# A request that must not run twice (exec) retries only the statuses that say
+# the server turned it away before doing any work. A 421, 502 or 504 comes
+# from a hop that already read the request, so whether the command started
+# is unknown. These are also the statuses whose Retry-After paces clients:
+# 429 when this caller is over its share, 503 when the node sheds load. A
+# Retry-After on a 421, 502 or 504 is a hop's, so those use the backoff.
+_NOT_STARTED_STATUSES = frozenset({429, 503})
+# An overloaded node asks for about a second, so the cap only bites on a long
+# ask (maintenance, a misconfigured proxy), which should not hold a call for
+# minutes per retry.
+_DEFAULT_MAX_RETRY_AFTER_MS = 30000
+# Longer delta-seconds values are clamped: no cap is that long anyway.
+_MAX_RETRY_AFTER_SECONDS = 10**9
+
+
+def _parse_retry_after(value: Optional[str], now: float) -> Optional[float]:
+    """Seconds a ``Retry-After`` value asks for, in either form RFC 9110
+    allows: delta-seconds (``"120"``) or an HTTP date. A date already past is
+    0. ``None`` for an absent or malformed value. ``now`` is a Unix time."""
+    text = (value or "").strip()
+    # isascii: str.isdigit alone also takes digits such as "²".
+    if text.isascii() and text.isdigit():
+        return float(min(int(text), _MAX_RETRY_AFTER_SECONDS))
+    try:
+        when = email.utils.parsedate_to_datetime(text)
+    except (TypeError, ValueError, IndexError, OverflowError):
+        return None
+    if when is None:
+        return None
+    if when.tzinfo is None:
+        # The asctime form carries no zone; HTTP dates are always GMT.
+        when = when.replace(tzinfo=datetime.timezone.utc)
+    return max(when.timestamp() - now, 0.0)
+
 
 def _normalize_url(value: str) -> str:
     return value.rstrip("/")
@@ -78,14 +140,85 @@ def _read_env(name: str) -> Optional[str]:
     return value if value not in (None, "") else None
 
 
+# The request header that selects which of a credential's teams a request
+# acts for. Keep in sync with pkg/api.HeaderTeam on the server.
+TEAM_HEADER = "X-AerolVM-Team"
+
+# The header a sandbox create carries so the server can recognise a retry of
+# it. Keep in sync with clustercreate.HeaderIdempotencyKey on the server.
+IDEMPOTENCY_KEY_HEADER = "Idempotency-Key"
+
+
+def _new_idempotency_key() -> str:
+    """A fresh create key: 128 random bits as 32 lowercase hex characters."""
+    return secrets.token_hex(16)
+
+
 class MicroVMError(Exception):
     pass
 
 
 class MicroVMHTTPError(MicroVMError):
-    def __init__(self, status_code: int, message: str) -> None:
+    """An HTTP error response from sandboxd. ``str(err)`` is the server's
+    message, or the HTTP reason phrase when the body is not the server's
+    JSON (a proxy's error page). ``status_code`` is the HTTP status. The
+    other attributes are empty unless the server sent them:
+
+    - ``code``: a stable error code a client can act on, such as
+      ``idempotency_key_reused`` or ``overloaded``.
+    - ``retry_after``: how many seconds the response's ``Retry-After``
+      header asked the caller to wait; ``None`` without a usable header.
+    - ``reason``: why an avm_ API token or an OIDC token was refused
+      (``expired``, ``unknown_or_revoked``, ``no_binding``, ...).
+    - ``required_permission`` and ``role``: on a 403 for an API token or an
+      OIDC caller, the permission the route needs and the role held.
+    - ``issuer``, ``name`` and ``groups``: on the 403 an OIDC caller gets
+      when no role binding matches, the caller's own claims.
+    """
+
+    def __init__(
+        self,
+        status_code: int,
+        message: str,
+        *,
+        code: str = "",
+        reason: str = "",
+        required_permission: str = "",
+        role: str = "",
+        issuer: str = "",
+        name: str = "",
+        groups: Optional[List[str]] = None,
+        retry_after: Optional[float] = None,
+    ) -> None:
         super().__init__(message)
         self.status_code = status_code
+        self.code = code
+        self.retry_after = retry_after
+        self.reason = reason
+        self.required_permission = required_permission
+        self.role = role
+        self.issuer = issuer
+        self.name = name
+        self.groups: List[str] = list(groups or [])
+
+
+def _http_error(status_code: int, data: Any, fallback: str, retry_after: Optional[float] = None) -> MicroVMHTTPError:
+    """Builds the error for a decoded JSON error body."""
+    if not isinstance(data, dict):
+        return MicroVMHTTPError(status_code, fallback, retry_after=retry_after)
+    groups = data.get("groups")
+    return MicroVMHTTPError(
+        status_code,
+        str(data.get("error", fallback)),
+        retry_after=retry_after,
+        code=str(data.get("code") or ""),
+        reason=str(data.get("reason") or ""),
+        required_permission=str(data.get("required_permission") or ""),
+        role=str(data.get("role") or ""),
+        issuer=str(data.get("issuer") or ""),
+        name=str(data.get("name") or ""),
+        groups=[str(g) for g in groups] if isinstance(groups, list) else None,
+    )
 
 
 class ExecStreamHandle:
@@ -299,7 +432,12 @@ class Sandbox:
         self._data = updated.to_dict()
         return self
 
-    def exec(self, request: ExecRequest) -> ExecResult:
+    def exec(self, request: Union[str, ExecRequest]) -> ExecResult:
+        # A plain string is a shell command, matching exec(string) in the
+        # TypeScript and Java SDKs, so the one-line hello world reads the same
+        # in every language.
+        if isinstance(request, str):
+            return self.exec_command(request)
         return self._client.exec(self.id, request)
 
     def exec_command(self, command: str) -> ExecResult:
@@ -382,8 +520,14 @@ class Sandbox:
         self._data = updated.to_dict()
         return self
 
-    def create_snapshot(self, name: str) -> SandboxSnapshot:
-        return self._client.create_snapshot(self.id, name)
+    def create_snapshot(self, name: str, *, allow_pause: Optional[bool] = None) -> SandboxSnapshot:
+        """Save this sandbox's files as a snapshot named ``name``.
+
+        A running sandbox is paused briefly while it is copied (its disk
+        writes wait) and keeps running. Pass ``allow_pause=False`` to have a
+        sandbox that is not stopped refused (HTTP 409) instead.
+        """
+        return self._client.create_snapshot(self.id, name, allow_pause=allow_pause)
 
     def destroy(self) -> None:
         self._client.destroy(self.id)
@@ -404,6 +548,36 @@ class Sandbox:
     def set_network_limits(self, options: SetNetworkLimitsOptions) -> NetworkUsage:
         return self._client.set_network_limits(self.id, options)
 
+    def set_network_policy(self, options: NetworkPolicyOptions) -> NetworkPolicy:
+        """Replace this sandbox's egress policy while it runs. Returns once
+        the new policy is enforced; the same policy again is a no-op, so it
+        is safe to retry."""
+        policy = self._client.set_network_policy(self.id, options)
+        self._data["networkBlockAll"] = policy["networkBlockAll"]
+        if policy.get("networkEgressMode") == "learn":
+            self._data["networkEgressMode"] = "learn"
+        else:
+            self._data.pop("networkEgressMode", None)
+        if policy.get("networkEgressRules"):
+            self._data["networkEgressRules"] = policy["networkEgressRules"]
+        else:
+            self._data.pop("networkEgressRules", None)
+        if "egressStatus" in policy:
+            self._data["egressStatus"] = policy["egressStatus"]
+        else:
+            self._data.pop("egressStatus", None)
+        return policy
+
+    def learned(self) -> NetworkLearned:
+        """Read what this sandbox reached in learn mode. A recording stays
+        readable after a switch to enforce, until the sandbox is destroyed."""
+        return self._client.get_network_learned(self.id)
+
+    def audit(self, options: Optional[AuditOptions] = None) -> AuditPage:
+        """Read this sandbox's audit log: outbound connections and egress
+        denials (``kind="egress"``) and secret reads."""
+        return self._client.get_audit(self.id, options)
+
     @property
     def id(self) -> str:
         return str(self._data.get("id", ""))
@@ -416,7 +590,7 @@ class Sandbox:
 
 class MicroVM:
     default_api_url = "http://127.0.0.1:21212"
-    auth_required_error_message = "PAT token is required. Set pat_token or SB_PAT_TOKEN."
+    auth_required_error_message = "PAT token is required. Set pat_token, SB_PAT_TOKEN or SB_API_TOKEN."
 
     def __init__(
         self,
@@ -425,19 +599,35 @@ class MicroVM:
         *,
         api_version: str = _DEFAULT_API_VERSION,
         config: Optional[MicroVMConfig] = None,
+        team: Optional[str] = None,
     ) -> None:
+        """``pat_token`` is the bearer every request carries: the operator
+        PAT, an avm_ API token or an OIDC ID token. It defaults to
+        ``SB_PAT_TOKEN``, then its alias ``SB_API_TOKEN``; when both are set,
+        ``SB_PAT_TOKEN`` wins.
+
+        ``team`` (default ``SB_TEAM``) is sent as the ``X-AerolVM-Team``
+        header on every request, WebSocket handshakes included. With
+        neither, no header is sent and the server uses the credential's
+        first matching binding. The header only chooses among teams the
+        credential is already bound to: a team it does not hold is refused
+        (403), and the operator PAT ignores it.
+        """
         if config is not None:
             api_url = api_url or config.get("apiUrl")
             pat_token = pat_token or config.get("patToken")
-        
+            team = team or config.get("team")
+
         self.api_url = _normalize_url(api_url or _read_env("SB_API_URL") or self.default_api_url)
-        self.pat_token = pat_token or _read_env("SB_PAT_TOKEN") or ""
+        self.pat_token = pat_token or _read_env("SB_PAT_TOKEN") or _read_env("SB_API_TOKEN") or ""
+        self.team = (team or _read_env("SB_TEAM") or "").strip()
 
         retry_cfg: RetryConfig = config.get("retry", {}) if config else {}
         self._retry_config = {
             "maxRetries": retry_cfg.get("maxRetries", 3),
             "baseDelayMs": retry_cfg.get("baseDelayMs", 200),
             "maxDelayMs": retry_cfg.get("maxDelayMs", 5000),
+            "maxRetryAfterMs": retry_cfg.get("maxRetryAfterMs", _DEFAULT_MAX_RETRY_AFTER_MS),
         }
 
         if not self.pat_token:
@@ -456,10 +646,23 @@ class MicroVM:
         """
         return f"{self._version_prefix}{suffix}"
 
-    def create(self, options: CreateOptions) -> Sandbox:
-        resolved_options = dict(options)
-        resolved_options["image"] = self._resolve_image(_first_of(options, "image"))
-        sandbox = self._do_json("POST", self._versioned("/sandboxes"), _to_api_create_options(resolved_options))
+    def create(self, options: Optional[CreateOptions] = None, **fields: Any) -> Sandbox:
+        # Keyword arguments are the same fields as the options dict, in either
+        # spelling (memory_mb or memoryMB), so create(image="python:3.12")
+        # and create({"image": "python:3.12"}) send the same request. A
+        # keyword replaces the same key in the dict.
+        resolved_options: Dict[str, Any] = {**(options or {}), **fields}
+        resolved_options["image"] = self._resolve_image(_first_of(resolved_options, "image"))
+        # One key per call, sent unchanged on each of its automatic retries: a
+        # create retried after a timeout gets back the sandbox the first
+        # attempt made instead of making a second one.
+        key = str(_first_of(resolved_options, "idempotency_key", "idempotencyKey") or "").strip() or _new_idempotency_key()
+        sandbox = self._do_json(
+            "POST",
+            self._versioned("/sandboxes"),
+            _to_api_create_options(resolved_options),
+            headers={IDEMPOTENCY_KEY_HEADER: key},
+        )
         return self._wrap_sandbox(sandbox)
 
     def build_image(self, image: Image) -> str:
@@ -522,9 +725,14 @@ class MicroVM:
         *,
         tags: Optional[Dict[str, str]] = None,
         include_env: bool = False,
+        name: Optional[str] = None,
     ) -> List[Sandbox]:
+        """List sandboxes. ``name`` filters to the caller's sandbox with exactly
+        that name (``?name=``). Servers that predate name lookup ignore the
+        filter and return a normal list; prefer :meth:`get_by_name`, which
+        checks the reply."""
         items: List[Sandbox] = []
-        for page in self.iter_pages(tags=tags, include_env=include_env):
+        for page in self.iter_pages(tags=tags, include_env=include_env, name=name):
             items.extend(page)
         return items
 
@@ -533,9 +741,10 @@ class MicroVM:
         *,
         tags: Optional[Dict[str, str]] = None,
         include_env: bool = False,
+        name: Optional[str] = None,
     ) -> Iterator[List[Sandbox]]:
         """Yield one server page at a time for bounded-memory fleet scans."""
-        base_path = self._versioned("/sandboxes") + _build_sandbox_query(tags, include_env)
+        base_path = self._versioned("/sandboxes") + _build_sandbox_query(tags, include_env, name)
         page_token = ""
         for _ in range(100000):
             path = _append_query_param(base_path, "page_token", page_token)
@@ -550,6 +759,25 @@ class MicroVM:
                 return
         raise MicroVMError("incomplete cluster list: exceeded max pages")
 
+    def get_by_name(self, name: str, *, include_env: bool = False) -> Optional[Sandbox]:
+        """Return the caller's sandbox with this name, or ``None`` if there is
+        none. Names are unique per owner. The reply is only trusted when it holds
+        at most one sandbox carrying the requested name: a server that predates
+        ``?name=`` ignores the filter and returns an ordinary list page, and
+        acting on its first row would target the wrong sandbox."""
+        wanted = (name or "").strip()
+        if not wanted:
+            raise ValueError("sandbox name is required")
+        path = self._versioned("/sandboxes") + _build_sandbox_query(None, include_env, wanted)
+        sandboxes = self._do_json("GET", path, None) or []
+        if not sandboxes:
+            return None
+        if len(sandboxes) > 1 or str(_first_of(sandboxes[0], "name") or "") != wanted:
+            raise MicroVMError(
+                f"{self.api_url} does not support sandbox name lookup; use the sandbox ID or upgrade the server"
+            )
+        return self._wrap_sandbox(sandboxes[0])
+
     def get(self, sandbox_id: str, *, include_env: bool = False) -> Sandbox:
         path = f"{self._version_prefix}/sandboxes/{sandbox_id}" + _build_sandbox_query(None, include_env)
         sandbox = self._do_json("GET", path, None)
@@ -563,8 +791,19 @@ class MicroVM:
         sandbox = self._do_json("POST", f"{self._version_prefix}/sandboxes/{sandbox_id}/stop", None)
         return self._wrap_sandbox(sandbox)
 
-    def create_snapshot(self, sandbox_id: str, name: str) -> SandboxSnapshot:
-        response = self._do_json("POST", f"{self._version_prefix}/sandboxes/{sandbox_id}/snapshot", {"name": name})
+    def create_snapshot(
+        self, sandbox_id: str, name: str, *, allow_pause: Optional[bool] = None
+    ) -> SandboxSnapshot:
+        """Save a sandbox's files as a snapshot named ``name``.
+
+        A running sandbox is paused briefly while it is copied (its disk
+        writes wait) and keeps running. Pass ``allow_pause=False`` to have a
+        sandbox that is not stopped refused (HTTP 409) instead.
+        """
+        body: Dict[str, Any] = {"name": name}
+        if allow_pause is not None:
+            body["allow_pause"] = allow_pause
+        response = self._do_json("POST", f"{self._version_prefix}/sandboxes/{sandbox_id}/snapshot", body)
         return _from_api_sandbox_snapshot(response)
 
     def register_snapshot(self, options: RegisterSnapshotOptions) -> SandboxSnapshot:
@@ -607,6 +846,40 @@ class MicroVM:
         resolved_options.pop("image", None)
         resolved_options["dockerfileContent"] = image.dockerfile
         return self.register_snapshot(resolved_options)
+
+    def get_snapshot(self, name: str) -> SandboxSnapshot:
+        """Look a snapshot up by name. In a cluster the request is routed to
+        the node holding the image."""
+        return _from_api_sandbox_snapshot(self._do_json("GET", self._snapshot_path(name), None) or {})
+
+    def list_snapshots(
+        self,
+        limit: Optional[int] = None,
+        starting_after: Optional[str] = None,
+    ) -> SnapshotList:
+        """List the caller's snapshots, one name-ordered page at a time.
+        ``starting_after`` is the exclusive name cursor — pass the last name of
+        the previous page to fetch the next one."""
+        params: Dict[str, str] = {}
+        if limit:
+            params["limit"] = str(int(limit))
+        if starting_after:
+            params["starting_after"] = str(starting_after)
+        path = self._versioned("/snapshots")
+        if params:
+            path += "?" + urllib.parse.urlencode(params)
+        payload = self._do_json("GET", path, None) or {}
+        return {
+            "snapshots": [_from_api_sandbox_snapshot(s) for s in payload.get("snapshots") or []],
+            "hasMore": bool(payload.get("has_more")),
+        }
+
+    def delete_snapshot(self, name: str) -> None:
+        """Delete a snapshot by name (idempotent 404 if it does not exist)."""
+        self._do_json("DELETE", self._snapshot_path(name), None)
+
+    def _snapshot_path(self, name: str) -> str:
+        return f"{self._version_prefix}/snapshots/{urllib.parse.quote(name, safe='')}"
 
     def destroy(self, sandbox_id: str) -> None:
         self._do_json("DELETE", f"{self._version_prefix}/sandboxes/{sandbox_id}", None)
@@ -765,13 +1038,157 @@ class MicroVM:
         payload = self._do_json("GET", f"{self._version_prefix}/sandboxes/{sandbox_id}/network/usage", None)
         return _from_api_network_usage(payload)
 
+    def check_network_policy(self, options: NetworkPolicyCheckOptions) -> NetworkPolicyCheckResult:
+        """Ask whether a sandbox created with these egress fields would reach
+        a destination, with the same matcher the filter enforces. No sandbox
+        is needed."""
+        body = {
+            "network_block_all": bool(options.get("networkBlockAll", False)),
+            "network_allow_out": list(options.get("networkAllowOut") or []),
+            "network_deny_out": list(options.get("networkDenyOut") or []),
+            "destination": options.get("destination", ""),
+        }
+        payload = self._do_json("POST", f"{self._version_prefix}/network/policy/check", body) or {}
+        result: NetworkPolicyCheckResult = {
+            "allowed": bool(payload.get("allowed", False)),
+            "matchedRule": str(payload.get("matched_rule") or ""),
+            "defaultVerdict": str(payload.get("default_verdict") or ""),
+        }
+        if payload.get("outside_ceiling"):
+            result["outsideCeiling"] = str(payload["outside_ceiling"])
+        return result
+
+    def get_audit(self, sandbox_id: str, options: Optional[AuditOptions] = None) -> AuditPage:
+        opts = options or {}
+        params: Dict[str, str] = {}
+        if opts.get("kind"):
+            params["kind"] = opts["kind"]
+        if opts.get("limit") is not None:
+            params["limit"] = str(opts["limit"])
+        if opts.get("cursor"):
+            params["cursor"] = opts["cursor"]
+        if opts.get("incarnationID"):
+            params["incarnation_id"] = opts["incarnationID"]
+        path = f"{self._version_prefix}/sandboxes/{sandbox_id}/audit"
+        if params:
+            path += "?" + urllib.parse.urlencode(params)
+        payload = self._do_json("GET", path, None)
+        return _from_api_audit_page(payload or {})
+
     def set_network_limits(self, sandbox_id: str, options: SetNetworkLimitsOptions) -> NetworkUsage:
         body = _to_api_set_network_limits_options(options)
         payload = self._do_json("PATCH", f"{self._version_prefix}/sandboxes/{sandbox_id}/network/limits", body)
         return _from_api_network_usage(payload)
 
+    def set_network_policy(self, sandbox_id: str, options: NetworkPolicyOptions) -> NetworkPolicy:
+        body = {
+            "network_block_all": bool(_first_of(options, "networkBlockAll", "network_block_all") or False),
+            "network_allow_out": list(_first_of(options, "networkAllowOut", "network_allow_out") or []),
+            "network_deny_out": list(_first_of(options, "networkDenyOut", "network_deny_out") or []),
+            "egress_profiles": list(_first_of(options, "egressProfiles", "egress_profiles") or []),
+        }
+        mode = _first_of(options, "networkEgressMode", "network_egress_mode")
+        if mode:
+            body["network_egress_mode"] = str(mode)
+        rules = _first_of(options, "networkEgressRules", "network_egress_rules")
+        if rules is not None:
+            body["network_egress_rules"] = _egress_rules(rules, wire=True)
+        payload = self._do_json("PUT", f"{self._version_prefix}/sandboxes/{sandbox_id}/network/policy", body) or {}
+        policy: NetworkPolicy = {
+            "networkBlockAll": bool(payload.get("network_block_all", False)),
+            "networkAllowOut": list(payload.get("network_allow_out") or []),
+            "networkDenyOut": list(payload.get("network_deny_out") or []),
+            "egressProfiles": list(payload.get("egress_profiles") or []),
+            "networkEgressMode": str(payload.get("network_egress_mode") or "enforce"),
+            "networkEgressRules": _egress_rules(payload.get("network_egress_rules")),
+            "effectiveHostnameCount": int(payload.get("effective_hostname_count") or 0),
+        }
+        if payload.get("egress_status"):
+            policy["egressStatus"] = str(payload["egress_status"])
+        return policy
+
+    def get_network_learned(self, sandbox_id: str) -> NetworkLearned:
+        """Read what a sandbox reached in learn mode and the allow list that
+        would have allowed it."""
+        payload = self._do_json("GET", f"{self._version_prefix}/sandboxes/{sandbox_id}/network/learned", None) or {}
+        result: NetworkLearned = {
+            "mode": str(payload.get("mode") or "enforce"),
+            "truncated": bool(payload.get("truncated", False)),
+            "entries": [
+                {
+                    "host": str(e.get("host") or ""),
+                    "ports": [int(p) for p in e.get("ports") or []],
+                    "firstSeen": str(e.get("first_seen") or ""),
+                    "lastSeen": str(e.get("last_seen") or ""),
+                    "hits": int(e.get("hits") or 0),
+                }
+                for e in payload.get("entries") or []
+            ],
+            "cidrs": list(payload.get("cidrs") or []),
+            "suggestedAllowOut": list(payload.get("suggested_allow_out") or []),
+        }
+        profile = payload.get("suggested_profile")
+        if profile:
+            result["suggestedProfile"] = {"allowOut": list(profile.get("allow_out") or []), "description": str(profile.get("description") or "")}
+        return result
+
+    def put_egress_profile(self, name: str, options: EgressProfileOptions) -> EgressProfile:
+        """Create or replace a named egress profile (a full replace: the same
+        body twice is a no-op). A change reaches every sandbox using it."""
+        body: Dict[str, Any] = {"allow_out": list(_first_of(options, "allowOut", "allow_out") or [])}
+        description = _first_of(options, "description")
+        if description:
+            body["description"] = str(description)
+        payload = self._do_json("PUT", self._egress_profile_path(name), body) or {}
+        return _from_api_egress_profile(payload)
+
+    def get_egress_profile(self, name: str) -> EgressProfile:
+        return _from_api_egress_profile(self._do_json("GET", self._egress_profile_path(name), None) or {})
+
+    def list_egress_profiles(self, options: Optional[ListEgressProfilesOptions] = None) -> EgressProfileList:
+        opts = options or {}
+        params: Dict[str, str] = {}
+        if opts.get("cursor"):
+            params["cursor"] = str(opts["cursor"])
+        if opts.get("limit"):
+            params["limit"] = str(int(opts["limit"]))
+        path = f"{self._version_prefix}/egress-profiles"
+        if params:
+            path += "?" + urllib.parse.urlencode(params)
+        payload = self._do_json("GET", path, None) or {}
+        result: EgressProfileList = {"profiles": [_from_api_egress_profile(p) for p in payload.get("profiles") or []]}
+        if payload.get("next_cursor"):
+            result["nextCursor"] = str(payload["next_cursor"])
+        return result
+
+    def delete_egress_profile(self, name: str) -> None:
+        """Delete a profile; one that sandboxes still reference is refused (409)."""
+        self._do_json("DELETE", self._egress_profile_path(name), None)
+
+    def _egress_profile_path(self, name: str) -> str:
+        return f"{self._version_prefix}/egress-profiles/{urllib.parse.quote(name, safe='')}"
+
+    def whoami(self) -> WhoAmI:
+        """Who the server says the caller is: principal, role, team and when
+        the credential expires. Every valid credential may ask."""
+        return _from_api_whoami(self._do_json("GET", self._versioned("/whoami"), None) or {})
+
+    @property
+    def tokens(self) -> "Tokens":
+        """Scoped API tokens (avm_…) for services and CI:
+        ``client.tokens.create/list/revoke``."""
+        return Tokens(self)
+
     def exec(self, sandbox_id: str, request: ExecRequest) -> ExecResult:
-        response = self._do_json("POST", f"{self._version_prefix}/sandboxes/{sandbox_id}/toolbox/process/execute", _to_api_exec_request(request))
+        # Not idempotent: a re-sent POST runs the user's command again, so a
+        # timeout or reset after the request went out surfaces instead of
+        # retrying. Sandbox.exec and exec_command both end here.
+        response = self._do_json(
+            "POST",
+            f"{self._version_prefix}/sandboxes/{sandbox_id}/toolbox/process/execute",
+            _to_api_exec_request(request),
+            idempotent=False,
+        )
         return _from_api_exec_result(response)
 
     def exec_stream(self, sandbox_id: str, options: ExecStreamOptions) -> ExecStreamHandle:
@@ -781,7 +1198,7 @@ class MicroVM:
 
         websocket_module = _load_websocket_module()
         ws_url = _to_websocket_url(self.api_url, f"{self._version_prefix}/sandboxes/{urllib.parse.quote(sandbox_id, safe='')}/toolbox/process/exec/stream")
-        ws = _connect_websocket(websocket_module, ws_url, self.pat_token, "exec stream")
+        ws = _connect_websocket(websocket_module, ws_url, self._websocket_headers(), "exec stream")
         ws.send(json.dumps(_to_api_exec_stream_request(options)))
         return ExecStreamHandle(websocket_module, ws, options)
 
@@ -827,7 +1244,7 @@ class MicroVM:
             self.api_url,
             f"{self._version_prefix}/sandboxes/{urllib.parse.quote(sandbox_id, safe='')}/sessions/{urllib.parse.quote(session_id, safe='')}/attach",
         )
-        ws = _connect_websocket(websocket_module, ws_url, self.pat_token, "session attach")
+        ws = _connect_websocket(websocket_module, ws_url, self._websocket_headers(), "session attach")
 
         cols = _first_of(attach_options, "cols")
         rows = _first_of(attach_options, "rows")
@@ -959,8 +1376,23 @@ class MicroVM:
     def _url(self, path: str) -> str:
         return f"{self.api_url}{path}"
 
-    def _request(self, method: str, url: str, body: Optional[bytes] = None, content_type: Optional[str] = None, extra_headers: Optional[Dict[str, str]] = None) -> bytes:
-        raw, _ = self._request_headers(method, url, body, content_type, extra_headers)
+    def _websocket_headers(self) -> List[str]:
+        headers = [f"Authorization: Bearer {self.pat_token}"]
+        if self.team:
+            headers.append(f"{TEAM_HEADER}: {self.team}")
+        return headers
+
+    def _request(
+        self,
+        method: str,
+        url: str,
+        body: Optional[bytes] = None,
+        content_type: Optional[str] = None,
+        extra_headers: Optional[Dict[str, str]] = None,
+        *,
+        idempotent: bool = True,
+    ) -> bytes:
+        raw, _ = self._request_headers(method, url, body, content_type, extra_headers, idempotent=idempotent)
         return raw
 
     def _request_headers(
@@ -970,16 +1402,34 @@ class MicroVM:
         body: Optional[bytes] = None,
         content_type: Optional[str] = None,
         extra_headers: Optional[Dict[str, str]] = None,
+        *,
+        idempotent: bool = True,
     ) -> tuple[bytes, Dict[str, str]]:
+        """Send one request, retrying transient failures with backoff.
+
+        ``idempotent=True`` (every endpoint but exec; the daemon designs them
+        for duplicate calls) retries any transport failure and the statuses
+        in ``_RETRY_STATUSES``. ``idempotent=False`` retries only failures
+        that prove the server never got the request, plus 429 and 503: a
+        timeout or reset after the request was written leaves it unknown
+        whether the command ran, and a retry would run it again.
+
+        A 429 or 503 waits as long as its ``Retry-After`` asks (see
+        :meth:`_retry_delay`). The wait is a plain ``time.sleep``, so a
+        signal handler that raises (Ctrl-C, a ``signal.alarm`` timeout) ends
+        it at once.
+        """
         max_retries = self._retry_config["maxRetries"]
-        base_delay_ms = self._retry_config["baseDelayMs"]
-        max_delay_ms = self._retry_config["maxDelayMs"]
+        retry_statuses = _RETRY_STATUSES if idempotent else _NOT_STARTED_STATUSES
 
         last_exc: Optional[Exception] = None
 
         for attempt in range(max_retries + 1):
+            retry_after: Optional[str] = None
             request = urllib.request.Request(url, data=body, method=method)
             request.add_header("Authorization", f"Bearer {self.pat_token}")
+            if self.team:
+                request.add_header(TEAM_HEADER, self.team)
             if content_type is not None:
                 request.add_header("Content-Type", content_type)
             for header_key, header_val in (extra_headers or {}).items():
@@ -991,48 +1441,95 @@ class MicroVM:
                     return response.read(), headers
             except urllib.error.HTTPError as exc:
                 last_exc = exc
-                # 421: misdirected (connection coalescing / stale route);
-                # the server closed the connection, so the retry reconnects.
-                if exc.code in (421, 429, 502, 503, 504) and attempt < max_retries:
-                    pass # Handled by the retry logic below
+                if exc.code in retry_statuses and attempt < max_retries:
+                    if exc.code in _NOT_STARTED_STATUSES and exc.headers is not None:
+                        retry_after = exc.headers.get("Retry-After")
+                    # Free the socket before the backoff sleep.
+                    exc.close()
                 else:
-                    payload = exc.read()
+                    wait = _parse_retry_after(exc.headers.get("Retry-After"), time.time()) if exc.headers is not None else None
+                    try:
+                        payload = exc.read()
+                    finally:
+                        exc.close()
                     try:
                         data = json.loads(payload.decode("utf-8"))
-                        raise MicroVMHTTPError(exc.code, str(data.get("error", exc.reason))) from exc
                     except (ValueError, TypeError):
-                        raise MicroVMHTTPError(exc.code, str(exc.reason)) from exc
+                        raise MicroVMHTTPError(exc.code, str(exc.reason), retry_after=wait) from exc
+                    raise _http_error(exc.code, data, str(exc.reason), wait) from exc
             except urllib.error.URLError as exc:
                 last_exc = exc
-                if attempt >= max_retries:
+                if attempt >= max_retries or not (idempotent or _request_never_sent(exc)):
                     raise
             except Exception as exc:
+                # Raised while waiting for or reading the response (a read
+                # timeout, a reset, the server closing without a reply): the
+                # server may already be acting on the request.
                 last_exc = exc
-                if attempt >= max_retries:
+                if attempt >= max_retries or not idempotent:
                     raise
-            
-            # Compute delay with exponential backoff and jitter
-            delay_ms = min(base_delay_ms * (2 ** attempt), max_delay_ms)
-            jitter = 1.0 + (random.random() - 0.5) * 0.5
-            time.sleep((delay_ms * jitter) / 1000.0)
+
+            time.sleep(self._retry_delay(attempt, retry_after, time.time(), random.random()))
 
         assert last_exc is not None
         raise last_exc
 
-    def _do_json(self, method: str, path: str, payload: Optional[Dict[str, Any]]) -> Any:
-        data, _ = self._do_json_headers(method, path, payload)
+    def _retry_delay(self, attempt: int, retry_after: Optional[str], now: float, rand: float) -> float:
+        """Seconds to wait before re-sending. ``attempt`` counts from 0,
+        ``retry_after`` is a 429/503's header (``None`` otherwise) and
+        ``rand`` is uniform in [0, 1).
+
+        Without a usable header it is the exponential backoff ±25%. With one,
+        it never retries sooner than the server asked (nor sooner than the
+        backoff) and adds up to a fifth so clients told the same value spread
+        out. ``maxRetryAfterMs`` is a hard ceiling: when the server asks for
+        at least that long the client is early anyway, so the spread goes
+        below it instead.
+        """
+        backoff = min(self._retry_config["baseDelayMs"] * (2 ** attempt), self._retry_config["maxDelayMs"]) / 1000.0
+        limit = self._retry_config["maxRetryAfterMs"] / 1000.0
+        hint = _parse_retry_after(retry_after, now) if limit > 0 else None
+        if hint is None:
+            return backoff * (0.75 + 0.5 * rand)
+        target = max(hint, backoff)
+        if target >= limit:
+            return limit - limit * 0.2 * rand
+        upper = min(target * 1.2, limit)
+        return target + (upper - target) * rand
+
+    def _do_json(
+        self,
+        method: str,
+        path: str,
+        payload: Optional[Dict[str, Any]],
+        *,
+        idempotent: bool = True,
+        headers: Optional[Dict[str, str]] = None,
+    ) -> Any:
+        """``headers`` are extra request headers, sent unchanged on every retry."""
+        data, _ = self._do_json_headers(method, path, payload, idempotent=idempotent, headers=headers)
         return data
 
-    def _do_json_headers(self, method: str, path: str, payload: Optional[Dict[str, Any]]) -> tuple[Any, Dict[str, str]]:
+    def _do_json_headers(
+        self,
+        method: str,
+        path: str,
+        payload: Optional[Dict[str, Any]],
+        *,
+        idempotent: bool = True,
+        headers: Optional[Dict[str, str]] = None,
+    ) -> tuple[Any, Dict[str, str]]:
         body = None
         content_type = None
         if payload is not None:
             body = json.dumps(payload).encode("utf-8")
             content_type = "application/json"
-        raw, headers = self._request_headers(method, self._url(path), body, content_type)
+        raw, response_headers = self._request_headers(
+            method, self._url(path), body, content_type, headers, idempotent=idempotent
+        )
         if raw == b"":
-            return {}, headers
-        return json.loads(raw.decode("utf-8")), headers
+            return {}, response_headers
+        return json.loads(raw.decode("utf-8")), response_headers
 
     def _do_multipart(
         self,
@@ -1062,11 +1559,83 @@ class MicroVM:
         self._request("POST", self._url(path), body.getvalue(), f"multipart/form-data; boundary={boundary}")
 
 
+class Tokens:
+    """Scoped API tokens (avm_…) for services and CI, reached as
+    ``client.tokens``. Creating and revoking needs an admin credential;
+    listing needs an auditor or an admin."""
+
+    def __init__(self, client: MicroVM) -> None:
+        self._client = client
+
+    def create(self, options: Optional[CreateAPITokenOptions] = None, **fields: Any) -> CreatedAPIToken:
+        """Mint a token. Takes ``name``, ``role``, ``team`` and ``expiresIn``
+        (or ``expires_in``) as a dict or as keywords. The result's ``token``
+        is the secret, returned this once and never again.
+
+        A 409 means the name is taken, possibly by an earlier attempt whose
+        reply was lost; that secret cannot be recovered, so revoke the token
+        and create it again.
+        """
+        resolved: Dict[str, Any] = {**(options or {}), **fields}
+        body = {
+            "name": str(_first_of(resolved, "name") or ""),
+            "role": str(_first_of(resolved, "role") or ""),
+            "team": str(_first_of(resolved, "team") or ""),
+            "expires_in": str(_first_of(resolved, "expiresIn", "expires_in") or ""),
+        }
+        payload = self._client._do_json("POST", self._client._versioned("/tokens"), body) or {}
+        created: CreatedAPIToken = {**_from_api_api_token(payload), "token": str(payload.get("token") or "")}  # type: ignore[typeddict-item]
+        return created
+
+    def list(self) -> APITokenList:
+        """Every token, expired ones included (``expired`` is True) until the
+        server removes them 30 days after expiry. Never a secret."""
+        payload = self._client._do_json("GET", self._client._versioned("/tokens"), None) or {}
+        tokens = payload.get("tokens") if isinstance(payload, dict) else None
+        return {"tokens": [_from_api_api_token(t) for t in tokens or [] if isinstance(t, dict)]}
+
+    def revoke(self, token_id: str) -> None:
+        """Revoke a token by id (tok_…). Revoking one that is already gone
+        succeeds, so a retried revoke is safe."""
+        trimmed = (token_id or "").strip()
+        if not trimmed:
+            raise ValueError("token id is required")
+        self._client._do_json("DELETE", self._client._versioned(f"/tokens/{urllib.parse.quote(trimmed, safe='')}"), None)
+
+
+def _from_api_whoami(payload: Dict[str, Any]) -> WhoAmI:
+    principal = payload.get("principal") or {}
+    result: WhoAmI = {
+        "principal": {"kind": str(principal.get("kind") or ""), "id": str(principal.get("id") or "")},
+        "role": str(payload.get("role") or ""),
+    }
+    if principal.get("name"):
+        result["principal"]["name"] = str(principal["name"])
+    if payload.get("team"):
+        result["team"] = str(payload["team"])
+    if payload.get("expires_at"):
+        result["expiresAt"] = str(payload["expires_at"])
+    return result
+
+
+def _from_api_api_token(payload: Dict[str, Any]) -> APIToken:
+    return {
+        "id": str(payload.get("id") or ""),
+        "name": str(payload.get("name") or ""),
+        "role": str(payload.get("role") or ""),
+        "team": str(payload.get("team") or ""),
+        "createdBy": str(payload.get("created_by") or ""),
+        "createdAt": str(payload.get("created_at") or ""),
+        "expiresAt": str(payload.get("expires_at") or ""),
+        "expired": bool(payload.get("expired", False)),
+    }
+
+
 def _load_websocket_module() -> Any:
     return importlib.import_module("websocket")
 
 
-def _connect_websocket(websocket_module: Any, ws_url: str, pat_token: str, label: str) -> Any:
+def _connect_websocket(websocket_module: Any, ws_url: str, headers: List[str], label: str) -> Any:
     """create_connection wrapper that surfaces HTTP status/body on bad
     handshake. websocket-client raises WebSocketBadStatusException for non-101
     responses, which carries .status_code and .resp_body but stringifies as
@@ -1077,7 +1646,7 @@ def _connect_websocket(websocket_module: Any, ws_url: str, pat_token: str, label
     try:
         return websocket_module.create_connection(
             ws_url,
-            header=[f"Authorization: Bearer {pat_token}"],
+            header=headers,
             enable_multithread=True,
         )
     except Exception as exc:
@@ -1103,6 +1672,21 @@ def _to_websocket_url(base_url: str, path: str) -> str:
     return urllib.parse.urlunparse((scheme, parsed.netloc, path, "", "", ""))
 
 
+def _request_never_sent(exc: urllib.error.URLError) -> bool:
+    """Whether a transport failure proves the server never got the request.
+
+    urlopen wraps only connect- and send-phase OSErrors in URLError; a
+    failure while waiting for or reading the response is raised unwrapped.
+    Of the wrapped ones, a refused connection and a failed DNS lookup happen
+    before any byte is sent. A timeout fires while connecting or before the
+    request was fully written, and a request whose body never fully arrived
+    fails to decode on the server, so nothing runs. A reset or broken pipe
+    is not taken as that proof, so it surfaces to the caller.
+    """
+    # socket.timeout is TimeoutError from 3.10; listed apart for 3.9.
+    return isinstance(exc.reason, (ConnectionRefusedError, socket.gaierror, socket.timeout, TimeoutError))
+
+
 def _first_of(mapping: Dict[str, Any], *keys: str) -> Any:
     for key in keys:
         # Callers pass string field names. Skip anything else so a dict
@@ -1118,7 +1702,9 @@ def _compact(payload: Dict[str, Any]) -> Dict[str, Any]:
     return {key: value for key, value in payload.items() if value is not None}
 
 
-def _build_sandbox_query(tags: Optional[Dict[str, str]], include_env: bool = False) -> str:
+def _build_sandbox_query(
+    tags: Optional[Dict[str, str]], include_env: bool = False, name: Optional[str] = None
+) -> str:
     # Renders tag filters and optional include_env as the server's wire format.
     # The `tag.` prefix is literal — the server's parseTagFilter inspects the
     # decoded query key — so only the user-supplied key and value get
@@ -1132,6 +1718,9 @@ def _build_sandbox_query(tags: Optional[Dict[str, str]], include_env: bool = Fal
         )
     if include_env:
         parts.append("include_env=true")
+    wanted = (name or "").strip()
+    if wanted:
+        parts.append(f"name={urllib.parse.quote(wanted, safe='')}")
     if not parts:
         return ""
     return "?" + "&".join(parts)
@@ -1147,8 +1736,11 @@ def _append_query_param(path: str, key: str, value: str) -> str:
 def _to_api_create_options(options: CreateOptions) -> Dict[str, Any]:
     lifecycle = _first_of(options, "lifecycle")
     failover = _first_of(options, "failover")
+    gpus = _first_of(options, "gpus")
     return _compact(
         {
+            "name": _first_of(options, "name"),
+            "tags": _first_of(options, "tags"),
             "image": _first_of(options, "image"),
             "cpu": _first_of(options, "cpu"),
             "memory_mb": _first_of(options, "memoryMB", "memory_mb"),
@@ -1158,6 +1750,9 @@ def _to_api_create_options(options: CreateOptions) -> Dict[str, Any]:
             "network_block_all": _first_of(options, "networkBlockAll", "network_block_all"),
             "network_allow_out": _first_of(options, "networkAllowOut", "network_allow_out"),
             "network_deny_out": _first_of(options, "networkDenyOut", "network_deny_out"),
+            "egress_profiles": _first_of(options, "egressProfiles", "egress_profiles"),
+            "network_egress_mode": _first_of(options, "networkEgressMode", "network_egress_mode"),
+            "network_egress_rules": _egress_rules_or_none(_first_of(options, "networkEgressRules", "network_egress_rules")),
             "allow_public_traffic": _first_of(options, "allowPublicTraffic", "allow_public_traffic"),
             "mask_request_host": _first_of(options, "maskRequestHost", "mask_request_host"),
             "network_bytes_in_limit": _first_of(options, "networkBytesInLimit", "network_bytes_in_limit"),
@@ -1176,6 +1771,18 @@ def _to_api_create_options(options: CreateOptions) -> Dict[str, Any]:
             "module_ref": _first_of(options, "moduleRef", "module_ref"),
             "tenant_id": _first_of(options, "tenantId", "tenant_id"),
             "custom_domains": _first_of(options, "customDomains", "custom_domains"),
+            "gpus": _to_api_gpus(gpus) if isinstance(gpus, dict) else None,
+            "template_id": _first_of(options, "templateId", "template_id"),
+        }
+    )
+
+
+def _to_api_gpus(gpus: GPUOptions) -> Dict[str, Any]:
+    return _compact(
+        {
+            "vendor": _first_of(gpus, "vendor"),
+            "count": _first_of(gpus, "count"),
+            "device_ids": _first_of(gpus, "deviceIDs", "device_ids"),
         }
     )
 
@@ -1505,6 +2112,45 @@ def _to_api_set_network_limits_options(options: SetNetworkLimitsOptions) -> Dict
     )
 
 
+_AUDIT_EVENT_FIELDS = (
+    ("time", "time"),
+    ("kind", "kind"),
+    ("result", "result"),
+    ("reason", "reason"),
+    ("destination", "destination"),
+    ("network", "network"),
+    ("actor", "actor"),
+    ("ref", "ref"),
+    ("event_id", "eventID"),
+    ("incarnation_id", "incarnationID"),
+)
+
+
+def _from_api_audit_page(payload: Dict[str, Any]) -> AuditPage:
+    events: List[AuditEvent] = []
+    for raw in payload.get("events") or []:
+        event: AuditEvent = {}
+        for api_key, key in _AUDIT_EVENT_FIELDS:
+            value = raw.get(api_key)
+            if value not in (None, ""):
+                event[key] = str(value)  # type: ignore[literal-required]
+        if raw.get("dropped"):
+            event["dropped"] = int(raw["dropped"])
+        events.append(event)
+    coverage = payload.get("coverage") or {}
+    page: AuditPage = {
+        "events": events,
+        "coverage": {
+            "answered": list(coverage.get("answered") or []),
+            "missing": list(coverage.get("missing") or []),
+            "partial": bool(coverage.get("partial") or False),
+        },
+    }
+    if payload.get("next_cursor"):
+        page["nextCursor"] = str(payload["next_cursor"])
+    return page
+
+
 def _from_api_network_usage(payload: Dict[str, Any]) -> NetworkUsage:
     result: NetworkUsage = {
         "sandboxID": str(_first_of(payload, "sandbox_id", "sandboxID") or ""),
@@ -1564,6 +2210,48 @@ def _from_api_session(session: Dict[str, Any]) -> Session:
     return result
 
 
+def _from_api_egress_profile(payload: Dict[str, Any]) -> EgressProfile:
+    result: EgressProfile = {
+        "name": str(payload.get("name") or ""),
+        "allowOut": list(payload.get("allow_out") or []),
+        "generation": int(payload.get("generation") or 0),
+        "createdAt": str(payload.get("created_at") or ""),
+        "updatedAt": str(payload.get("updated_at") or ""),
+    }
+    if payload.get("description"):
+        result["description"] = str(payload["description"])
+    return result
+
+
+def _egress_rules(rules: Optional[List[Dict[str, Any]]], wire: bool = False) -> List[EgressRule]:
+    # The wire and SDK keys are the same words except inject's secretRef
+    # (secret_ref on the wire), so this drops unset keys, pins the types and
+    # reads either spelling; wire picks the one it writes.
+    result: List[EgressRule] = []
+    for r in rules or []:
+        rule: EgressRule = {"host": str(r.get("host") or "")}
+        if r.get("ports"):
+            rule["ports"] = [int(p) for p in r["ports"]]
+        if r.get("methods"):
+            rule["methods"] = [str(m) for m in r["methods"]]
+        if r.get("paths"):
+            rule["paths"] = [str(p) for p in r["paths"]]
+        if r.get("inspect"):
+            rule["inspect"] = True
+        if r.get("binaries"):
+            rule["binaries"] = [str(b) for b in r["binaries"]]
+        inject = r.get("inject")
+        if inject:
+            ref = str(_first_of(inject, "secretRef", "secret_ref") or "")
+            rule["inject"] = {"header": str(inject.get("header") or ""), ("secret_ref" if wire else "secretRef"): ref}  # type: ignore[typeddict-item]
+        result.append(rule)
+    return result
+
+
+def _egress_rules_or_none(rules: Optional[List[Dict[str, Any]]]) -> Optional[List[EgressRule]]:
+    return None if rules is None else _egress_rules(rules, wire=True)
+
+
 def _from_api_sandbox(sandbox: Dict[str, Any]) -> SandboxData:
     exposed_ports = _first_of(sandbox, "exposed_ports", "exposedPorts") or []
     lifecycle = _first_of(sandbox, "lifecycle")
@@ -1590,12 +2278,33 @@ def _from_api_sandbox(sandbox: Dict[str, Any]) -> SandboxData:
         if mapped_failover:
             result["failover"] = mapped_failover
 
+    name = _first_of(sandbox, "name")
+    if name not in (None, ""):
+        result["name"] = str(name)
+    tags = _first_of(sandbox, "tags")
+    if isinstance(tags, dict) and len(tags) > 0:
+        result["tags"] = {str(key): str(value) for key, value in tags.items()}
     container_id = _first_of(sandbox, "container_id", "containerID")
     if container_id not in (None, ""):
         result["containerID"] = str(container_id)
     container_ip = _first_of(sandbox, "container_ip", "containerIP")
     if container_ip not in (None, ""):
         result["containerIP"] = str(container_ip)
+    egress_status = _first_of(sandbox, "egress_status", "egressStatus")
+    if egress_status not in (None, ""):
+        result["egressStatus"] = str(egress_status)
+    egress_profiles = _first_of(sandbox, "egress_profiles", "egressProfiles")
+    if egress_profiles:
+        result["egressProfiles"] = [str(p) for p in egress_profiles]
+    egress_mode = _first_of(sandbox, "network_egress_mode", "networkEgressMode")
+    if egress_mode:
+        result["networkEgressMode"] = str(egress_mode)
+    egress_rules = _first_of(sandbox, "network_egress_rules", "networkEgressRules")
+    if egress_rules:
+        result["networkEgressRules"] = _egress_rules(egress_rules)
+    applied = _first_of(sandbox, "egress_profiles_applied", "egressProfilesApplied")
+    if applied:
+        result["egressProfilesApplied"] = [{"name": str(r.get("name", "")), "generation": int(r.get("generation", 0))} for r in applied]
     env = _first_of(sandbox, "env")
     if isinstance(env, dict) and len(env) > 0:
         result["env"] = {str(key): str(value) for key, value in env.items()}

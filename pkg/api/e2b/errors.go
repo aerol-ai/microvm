@@ -6,16 +6,16 @@ import (
 	"log/slog"
 	"net/http"
 
-	"github.com/aerol-ai/microvm/internal/cluster"
-	"github.com/aerol-ai/microvm/internal/service"
-	"github.com/aerol-ai/microvm/internal/store"
-	"github.com/aerol-ai/microvm/pkg/capacity"
-	"github.com/aerol-ai/microvm/pkg/models"
+	"github.com/aerol-ai/microvm/pkg/api/apihttp"
 )
 
 type errorResponse struct {
 	Code    int    `json:"code"`
 	Message string `json:"message"`
+	// Reason is set only on a 401 for a refused avm_ token or JWT
+	// (plans/identity-and-access.md D17); every other body omits it, so
+	// existing responses are byte for byte unchanged.
+	Reason string `json:"reason,omitempty"`
 }
 
 type requestError struct {
@@ -43,9 +43,22 @@ func notImplemented(message string) error {
 
 // WriteError writes the E2B error envelope shape expected by the SDK.
 func WriteError(w http.ResponseWriter, status int, message string) {
+	WriteErrorReason(w, status, message, "")
+}
+
+// WriteErrorReason is WriteError with the D17 refusal reason in the body
+// (omitted when empty). The API edge sets the matching WWW-Authenticate
+// header before calling it.
+func WriteErrorReason(w http.ResponseWriter, status int, message, reason string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(errorResponse{Code: status, Message: message})
+	_ = json.NewEncoder(w).Encode(errorResponse{Code: status, Message: message, Reason: reason})
+}
+
+// writeErrorCode is the clustercreate.ErrorWriter for E2B: its envelope has
+// no code field, so the code is dropped and only status + message are written.
+func writeErrorCode(w http.ResponseWriter, status int, _, message string) {
+	WriteError(w, status, message)
 }
 
 func writeKnownError(w http.ResponseWriter, err error) bool {
@@ -61,84 +74,27 @@ func writeStoreAwareError(logger *slog.Logger, w http.ResponseWriter, err error)
 	if writeKnownError(w, err) {
 		return
 	}
-	if errors.Is(err, store.ErrNotFound) {
-		WriteError(w, http.StatusNotFound, "Not found")
-		return
+	c := apihttp.Classify(err)
+	c.Apply(logger, err)
+	c.SetRetryAfter(w)
+	WriteError(w, c.Status, e2bMessage(c))
+}
+
+// e2bMessage keeps the E2B SDK's wording for the few errors it words
+// differently; everything else uses the shared classification message.
+func e2bMessage(c apihttp.Classification) string {
+	switch c.Kind {
+	case apihttp.ErrKindNotFound:
+		return "Not found"
+	case apihttp.ErrKindSnapshotNameConflict:
+		return "Snapshot name already in use"
+	case apihttp.ErrKindSandboxExists:
+		return "Sandbox already exists"
+	case apihttp.ErrKindSandboxNotRunning:
+		return "Sandbox is not running"
+	case apihttp.ErrKindSandboxNotResumable:
+		return "Sandbox is not available for connect"
+	default:
+		return c.Message
 	}
-	// Wake-aware proxy sentinels — see apihttp.WriteStoreAwareError
-	// for the rationale; the E2B facade keeps its own writer for
-	// envelope-shape reasons, so we mirror the mapping here.
-	if errors.Is(err, service.ErrSandboxManuallyStopped) {
-		WriteError(w, http.StatusConflict, err.Error())
-		return
-	}
-	if errors.Is(err, service.ErrWakeCircuitOpen) {
-		w.Header().Set("Retry-After", "60")
-		WriteError(w, http.StatusServiceUnavailable, err.Error())
-		return
-	}
-	if errors.Is(err, service.ErrPublicTrafficDisabled) {
-		WriteError(w, http.StatusConflict, err.Error())
-		return
-	}
-	if errors.Is(err, store.ErrSnapshotNameConflict) {
-		WriteError(w, http.StatusConflict, "Snapshot name already in use")
-		return
-	}
-	// A create that resolved to an id another caller already holds. The
-	// owner-bound fingerprint makes this unreachable for distinct tenants;
-	// it stays mapped so the CreateSandboxWithID ownership guard surfaces as
-	// a conflict rather than the 400 default.
-	if errors.Is(err, models.ErrSandboxExists) {
-		WriteError(w, http.StatusConflict, "Sandbox already exists")
-		return
-	}
-	if errors.Is(err, capacity.ErrCapacityExceeded) || errors.Is(err, cluster.ErrCapacityExceeded) {
-		if logger != nil {
-			logger.Info("capacity rejected", "error", err)
-		}
-		w.Header().Set("Retry-After", "30")
-		message := err.Error()
-		if len(message) > 200 {
-			message = message[:200]
-		}
-		WriteError(w, http.StatusServiceUnavailable, message)
-		return
-	}
-	if errors.Is(err, cluster.ErrCreateBackpressure) {
-		w.Header().Set("Retry-After", "5")
-		WriteError(w, http.StatusTooManyRequests, err.Error())
-		return
-	}
-	if errors.Is(err, cluster.ErrNoPlacementTarget) || errors.Is(err, cluster.ErrInvalidTopology) {
-		if errors.Is(err, cluster.ErrInvalidTopology) {
-			w.Header().Set("Retry-After", "300")
-		}
-		WriteError(w, http.StatusServiceUnavailable, err.Error())
-		return
-	}
-	// Platform-volume sentinels (plans/e2b-volume-mounts.md). 412 = deployment
-	// hasn't enabled platform volumes; 400 = volumes on an unsupported runtime
-	// (client input); 409 = per-tenant quota. Mirrors apihttp.WriteStoreAwareError
-	// because the E2B facade keeps its own envelope writer.
-	if errors.Is(err, models.ErrPlatformVolumesDisabled) {
-		WriteError(w, http.StatusPreconditionFailed, err.Error())
-		return
-	}
-	if errors.Is(err, models.ErrPlatformVolumesUnsupportedRuntime) {
-		WriteError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-	if errors.Is(err, models.ErrPlatformVolumeQuota) {
-		WriteError(w, http.StatusConflict, err.Error())
-		return
-	}
-	if logger != nil {
-		logger.Warn("e2b request failed", "error", err)
-	}
-	message := err.Error()
-	if len(message) > 200 {
-		message = message[:200]
-	}
-	WriteError(w, http.StatusBadRequest, message)
 }

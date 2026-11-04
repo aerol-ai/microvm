@@ -3,7 +3,7 @@
 package suite
 
 // Group F — export connectors and witness (§7 group F, F9/F10/F11).
-// UC-139..143, 145, 145b.
+// UC-139..143, 145, 145b, and UC-263 (the S3 witness canary).
 
 import (
 	"context"
@@ -14,6 +14,7 @@ import (
 
 	"github.com/aerol-ai/microvm/integration-tests/suite/harness"
 	"github.com/aerol-ai/microvm/pkg/auditlog"
+	"github.com/aerol-ai/microvm/sdk/go/pkg/microvm"
 	sdktypes "github.com/aerol-ai/microvm/sdk/go/pkg/types"
 )
 
@@ -25,12 +26,41 @@ const exportDeliveryTimeout = 5 * time.Minute
 // leftovers from an earlier one.
 func generateAuditRecords(t *testing.T, c *harness.Client, tag string, reads int) (string, string) {
 	t.Helper()
+	return generateAuditRecordsOn(t, c, nil, tag, reads)
+}
+
+// generateAuditRecordsOn is generateAuditRecords with the sandbox placed on
+// node. A case that switches ONE node's exporter must look at records that
+// node writes, and a create goes wherever placement puts it: on a 3-node
+// cluster UC-139 found its records about one run in three. The placement
+// API takes no node, so this creates until one lands there.
+func generateAuditRecordsOn(t *testing.T, c *harness.Client, node *harness.IntegrationNode, tag string, reads int) (string, string) {
+	t.Helper()
 	secret := secretValue(t, tag)
-	sb := c.NewSandbox(t, sdktypes.CreateSandboxOptions{
-		Name: harness.UniqueName(sc, t),
-		Env:  map[string]string{"UC_TOKEN": secret},
-	})
-	waitRunning(t, sb)
+	targets := harness.LoadIntegrationTargets()
+	pin := node != nil && targets != nil && len(targets.Nodes) > 1
+	const attempts = 12 // (2/3)^12 < 1% on three nodes
+	var sb *microvm.Sandbox
+	for i := 0; ; i++ {
+		sb = c.NewSandbox(t, sdktypes.CreateSandboxOptions{
+			Name: harness.UniqueName(sc, t),
+			Env:  map[string]string{"UC_TOKEN": secret},
+		})
+		waitRunning(t, sb)
+		if !pin {
+			break
+		}
+		owner := resolvePlacementOwner(t, c, sb.ID)
+		if on, ok := nodeForClusterID(t, c, targets, owner); ok && on.Name == node.Name {
+			break
+		}
+		if i+1 == attempts {
+			t.Fatalf("%d creates never landed on %s (last on %q); placement may exclude it", attempts, node.Name, owner)
+		}
+		dctx, dcancel := context.WithTimeout(context.Background(), time.Minute)
+		_ = c.SDK().Destroy(dctx, sb.ID)
+		dcancel()
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancel()
 	for i := 0; i < reads; i++ {
@@ -72,7 +102,7 @@ func TestFileExportBackendWritesChainedRecords(t *testing.T) {
 			}
 			t.Fatalf("node %s did not start with the file exporter: %s\n%s", node.Name, res.Status, tailLines(res.Journal, 30))
 		}
-		sandboxID, secret := generateAuditRecords(t, c, "139", 3)
+		sandboxID, secret := generateAuditRecordsOn(t, c, &node, "139", 3)
 
 		target, _ := harness.SSHTarget(node)
 		deadline := time.Now().Add(exportDeliveryTimeout)
@@ -116,7 +146,7 @@ func TestS3ExportBackendWritesReconstructableObjects(t *testing.T) {
 		if !res.Started {
 			t.Fatalf("node %s did not start with the s3 exporter: %s\n%s", node.Name, res.Status, tailLines(res.Journal, 30))
 		}
-		sandboxID, secret := generateAuditRecords(t, c, "140", 3)
+		sandboxID, secret := generateAuditRecordsOn(t, c, &node, "140", 3)
 
 		target, _ := harness.SSHTarget(node)
 		deadline := time.Now().Add(exportDeliveryTimeout)
@@ -229,18 +259,20 @@ func TestExportRetriesUntilEveryRecordLands(t *testing.T) {
 	t.Logf("UC-142 PASS: delivery survived 5 forced 503s (batches=%d duplicates=%d)", stats.Batches, stats.Duplicates)
 }
 
-// UC-143 — the witness receives chain heads, receipts persist, and the health
-// gauge reports 1.
+// UC-143 — chain heads reach the S3 Object Lock witness, receipts persist,
+// and the health gauge reports 1.
+//
+// The head is read from the bucket with the operator's credentials, through
+// the reader the node's own boot check uses (auditwitness.Reader), and never
+// through the node: the witness exists so that a node's account of its
+// history can be checked against a store the node cannot rewrite.
 func TestWitnessShipsHeadsAndReportsHealthy(t *testing.T) {
 	harness.Require(t, sc, "UC-143")
 	targets := harness.LoadIntegrationTargets()
 	if targets == nil {
 		t.Skip("AEROL_INTEGRATION_TARGETS not set (run via integration-tests/run.sh)")
 	}
-	receiver, ok := harness.FindReceiverNode(t, targets)
-	if !ok {
-		t.Skip("no audit receiver provisioned in this scenario")
-	}
+	witness := harness.RequireWitnessBucket(t)
 	c := client(t)
 
 	// Fresh records, so the head the witness records is one produced during
@@ -254,7 +286,7 @@ func TestWitnessShipsHeadsAndReportsHealthy(t *testing.T) {
 	// on exactly that (ingress-1's secrets.jsonl was 0 bytes); the all-mixed
 	// 3-node scenarios only passed because every node there owns sandboxes.
 	var node harness.IntegrationNode
-	ok = false
+	ok := false
 	if sc.Has(harness.CapCluster) {
 		if owner := resolvePlacementOwner(t, c, sandboxID); owner != "" {
 			node, ok = nodeForClusterID(t, c, targets, owner)
@@ -271,9 +303,13 @@ func TestWitnessShipsHeadsAndReportsHealthy(t *testing.T) {
 	deadline := time.Now().Add(exportDeliveryTimeout)
 	var head string
 	for time.Now().Before(deadline) {
-		h, present, err := harness.WitnessedHeadFor(t, receiver, nodeID)
+		// An error is fatal, not retried: the read is the node's own boot
+		// read, so an error here (a delete marker over the newest head, a
+		// body that is not this node's record) is one that would refuse the
+		// node's next boot.
+		h, present, err := harness.WitnessedHeadFor(t, witness, nodeID)
 		if err != nil {
-			t.Fatalf("read the witnessed head for %s: %v", nodeID, err)
+			t.Fatalf("read the witnessed head for %s from s3://%s: %v", nodeID, witness.Bucket, err)
 		}
 		if present && h != "" {
 			head = h
@@ -282,7 +318,7 @@ func TestWitnessShipsHeadsAndReportsHealthy(t *testing.T) {
 		time.Sleep(15 * time.Second)
 	}
 	if head == "" {
-		t.Fatalf("the witness never recorded a head for %s within %s", nodeID, exportDeliveryTimeout)
+		t.Fatalf("the witness s3://%s never recorded a head for %s within %s", witness.Bucket, nodeID, exportDeliveryTimeout)
 	}
 
 	// The health gauge is what an operator alerts on; a witness that ships
@@ -294,6 +330,55 @@ func TestWitnessShipsHeadsAndReportsHealthy(t *testing.T) {
 	out, err := harness.SSHRun(t, target, witnessReceiptScript)
 	if err != nil || !strings.Contains(out, "FOUND") {
 		t.Fatalf("no witness receipt persisted on %s: %v (%s)", node.Name, err, strings.TrimSpace(out))
+	}
+}
+
+// UC-263 — the node role can neither delete a witnessed version nor hide one
+// behind a delete marker, shown on the real bucket with the real role.
+//
+// Every boot runs the witness canary (pkg/auditwitness checkCanary): it writes
+// a locked version to auditwitness.CanaryKey, deletes it by version id WITH
+// the governance bypass header, then tries a plain delete, which on a
+// versioned bucket would leave a delete marker; the node refuses to start
+// unless both are denied. For a node that is serving, at least one canary
+// version and no delete marker is therefore the plan's "try a delete marker
+// with the node role (denied)" tamper case, run by the node itself on every
+// boot. A marker would mean some boot's plain delete got through, and the same
+// call on a head key hides the newest head.
+//
+// Every node, not one: the role is shared, but the boot and SB_NODE_ID are per
+// node, and a node with no canary version is a node that is serving without
+// having run its witness checks.
+func TestWitnessNodeRoleCannotDeleteOrHideAHead(t *testing.T) {
+	harness.Require(t, sc, "UC-263")
+	targets := harness.LoadIntegrationTargets()
+	if targets == nil {
+		t.Skip("AEROL_INTEGRATION_TARGETS not set (run via integration-tests/run.sh)")
+	}
+	if len(targets.Nodes) == 0 {
+		t.Fatal("AEROL_INTEGRATION_TARGETS lists no nodes; this case would pass having checked nothing")
+	}
+	witness := harness.RequireWitnessBucket(t)
+	c := client(t)
+
+	for _, node := range targets.Nodes {
+		nodeID := heteroNodeID(t, c, targets, node.Name)
+		versions, markers, err := harness.WitnessCanary(t, witness, nodeID)
+		if err != nil {
+			t.Fatalf("read %s's witness canary: %v", node.Name, err)
+		}
+		if markers > 0 {
+			t.Errorf("%s's canary key in s3://%s carries %d delete marker(s): a boot's plain DeleteObject succeeded, so the node role can hide its newest head (deny s3:DeleteObject on the witness bucket)",
+				node.Name, witness.Bucket, markers)
+		}
+		if versions == 0 {
+			t.Errorf("%s (%s) is serving but has no canary version in s3://%s: it booted without running the witness canary, so nothing proved its role cannot delete a head",
+				node.Name, nodeID, witness.Bucket)
+		}
+		t.Logf("%s: %d canary version(s) kept, no delete marker", node.Name, versions)
+	}
+	if !t.Failed() {
+		t.Logf("UC-263 PASS: on all %d nodes the role could neither delete a locked version nor place a delete marker", len(targets.Nodes))
 	}
 }
 

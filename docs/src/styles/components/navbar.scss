@@ -24,13 +24,7 @@
     display: flex;
     align-items: center;
     gap: 14px;
-
-    &:after {
-      content: '/';
-      font-family: var(--font-mono);
-      font-size: 0.875rem;
-      color: var(--secondary-text-color);
-    }
+    flex-shrink: 0;
   }
 
   .brand-mark {
@@ -67,25 +61,39 @@
     line-height: 1;
   }
 
+  // The section tabs. They used to sit after a "/" as plain text, so they read
+  // as a breadcrumb; pills with a filled active state read as tabs.
   .navbar-links {
     display: flex;
     align-items: center;
-    gap: 18px;
-    margin-left: 22px;
+    gap: 4px;
+    margin-left: 24px;
+    padding-left: 20px;
+    border-left: var(--border);
   }
 
   .navbar-links a {
-    text-transform: uppercase;
-    font-size: 0.875rem;
+    padding: 7px 14px;
+    border: 1px solid transparent;
+    border-radius: 999px;
     font-family: var(--font-mono);
-    color: var(--primary-text-color);
-    transition: color 0.2s ease;
-    letter-spacing: -0.02em;
+    font-size: 0.8125rem;
+    letter-spacing: 0.01em;
+    text-transform: uppercase;
+    white-space: nowrap;
+    color: var(--secondary-text-color);
+    transition: color 0.2s ease, background-color 0.2s ease, border-color 0.2s ease;
   }
 
-  .navbar-links a.active,
   .navbar-links a:hover {
+    color: var(--primary-text-color);
+    background: var(--block-bg-color);
+  }
+
+  .navbar-links a.active {
     color: var(--hover-color);
+    background: var(--block-bg-color);
+    border-color: var(--border-color);
   }
 
   .nav__items_side_menu {
@@ -135,26 +143,38 @@
     }
   }
 
+  // On small screens the tabs get their own row under the logo, so three of
+  // them fit without squeezing; the menu button stays fixed at the top right.
   .mobile-navigation {
     display: none;
     position: relative;
-    padding: 16px 72px 16px 20px;
+    padding: 16px 72px 12px 20px;
     min-height: 72px;
+    flex-wrap: wrap;
+    row-gap: 12px;
     align-items: center;
-    justify-content: space-between;
 
     @include for-tablet-screen-sizes {
       display: flex;
     }
   }
 
+  // The row sits below the menu button, so it can use the width the nav
+  // keeps free for that button on the first row.
   .mobile-navbar-links {
-    margin-left: auto;
-    gap: 12px;
+    order: 2;
+    width: calc(100% + 52px);
+    flex-shrink: 0;
+    margin: 0;
+    padding: 0;
+    border-left: 0;
+    overflow-x: auto;
+    scrollbar-width: none;
   }
 
   .mobile-navbar-links a {
-    font-size: 0.75rem;
+    padding: 6px 8px;
+    font-size: 0.6875rem;
   }
 
   @media (max-width: 650px) {

@@ -75,7 +75,6 @@ func (d *Driver) reloadSandbox(ctx context.Context, sandboxID string) error {
 	}
 	tenantID := rec.tenantID
 	bundleRef := rec.bundleRef
-	egress := rec.egress
 	cpu := 0.0
 	memMB := 0
 	d.mu.Unlock()
@@ -99,11 +98,13 @@ func (d *Driver) reloadSandbox(ctx context.Context, sandboxID string) error {
 		d.releaseFromGroup(groupKey, sandboxID)
 		return err
 	}
-	if setter, ok := host.(EgressPolicySetter); ok {
-		setter.SetEgressPolicy(sandboxID, egress)
-	}
 	d.mu.Lock()
 	if rec := d.byID[sandboxID]; rec != nil {
+		// Read the policy again and push it under d.mu: a live update
+		// (UpdateEgressPolicy) that landed during the reload must win.
+		if setter, ok := host.(EgressPolicySetter); ok {
+			setter.SetEgressPolicy(sandboxID, rec.egress)
+		}
 		rec.groupKey = groupKey
 		rec.needsReload = false
 		rec.state.Status = models.SandboxStatusStarted

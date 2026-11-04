@@ -1,5 +1,7 @@
 package e2b
 
+import "encoding/json"
+
 type createSandboxRequest struct {
 	TemplateID          string                     `json:"templateID"`
 	AllowInternetAccess *bool                      `json:"allow_internet_access,omitempty"`
@@ -19,10 +21,22 @@ type sandboxAutoResumeRequest struct {
 }
 
 type sandboxNetworkRequest struct {
-	AllowOut           []string `json:"allowOut,omitempty"`
-	AllowPublicTraffic *bool    `json:"allowPublicTraffic,omitempty"`
-	DenyOut            []string `json:"denyOut,omitempty"`
-	MaskRequestHost    string   `json:"maskRequestHost,omitempty"`
+	AllowOut           []string        `json:"allowOut,omitempty"`
+	AllowPublicTraffic *bool           `json:"allowPublicTraffic,omitempty"`
+	DenyOut            []string        `json:"denyOut,omitempty"`
+	MaskRequestHost    string          `json:"maskRequestHost,omitempty"`
+	EgressProxy        json.RawMessage `json:"egressProxy,omitempty"`
+	Rules              json.RawMessage `json:"rules,omitempty"`
+}
+
+// sandboxNetworkUpdateRequest is E2B's SandboxNetworkUpdateConfig, the body
+// of PUT /sandboxes/{id}/network.
+type sandboxNetworkUpdateRequest struct {
+	AllowOut            []string        `json:"allowOut,omitempty"`
+	DenyOut             []string        `json:"denyOut,omitempty"`
+	AllowInternetAccess *bool           `json:"allow_internet_access,omitempty"`
+	EgressProxy         json.RawMessage `json:"egressProxy,omitempty"`
+	Rules               json.RawMessage `json:"rules,omitempty"`
 }
 
 type sandboxVolumeMountCreate struct {

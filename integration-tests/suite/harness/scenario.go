@@ -19,11 +19,18 @@ type capsFile struct {
 
 // Env var names the harness reads. run.sh exports these after provisioning.
 const (
-	EnvBaseURL  = "AEROL_BASE_URL" // e.g. https://abc.itest.example.com or http://localhost:21212
-	EnvPAT      = "AEROL_PAT"
-	EnvScenario = "AEROL_SCENARIO"
-	EnvCaps     = "AEROL_CAPS"   // path to the scenario caps.yml
-	EnvDomain   = "AEROL_DOMAIN" // leased apex domain; empty in local-mode
+	EnvBaseURL = "AEROL_BASE_URL" // e.g. https://abc.itest.example.com or http://localhost:21212
+	EnvPAT     = "AEROL_PAT"
+	// EnvOperatorPAT is the operator token itself. Under SB_PAT_SCOPE=host
+	// (capability pat-scope-host) the PAT works only from a loopback peer,
+	// so run.sh mints an admin avm_ token on the seed and exports THAT as
+	// AEROL_PAT for every remote call, and the PAT here for the cases that
+	// use it on a node's loopback (UC-277, UC-283, UC-285). Without host
+	// scope the two are the same token.
+	EnvOperatorPAT = "AEROL_OPERATOR_PAT"
+	EnvScenario    = "AEROL_SCENARIO"
+	EnvCaps        = "AEROL_CAPS"   // path to the scenario caps.yml
+	EnvDomain      = "AEROL_DOMAIN" // leased apex domain; empty in local-mode
 	// EnvCustomDomain is a real hostname OUTSIDE the deployment base domain that
 	// the operator has already provisioned for custom-domain tests (UC-35/36):
 	// a `_aerol-verify.<host>` TXT record proving ownership and a CNAME pointing
@@ -67,10 +74,15 @@ func LoadScenario() (*Scenario, error) {
 	for _, c := range cf.Capabilities {
 		caps[c] = true
 	}
+	operator := os.Getenv(EnvOperatorPAT)
+	if operator == "" {
+		operator = pat
+	}
 	return &Scenario{
 		Name:         name,
 		BaseURL:      base,
 		PAT:          pat,
+		OperatorPAT:  operator,
 		Domain:       os.Getenv(EnvDomain),
 		CustomDomain: os.Getenv(EnvCustomDomain),
 		caps:         caps,

@@ -1,0 +1,16 @@
+alice@acme.com
+role     runner
+team     payments
+via      Acme Okta
+expires  in 54m (15:04 UTC)
+
+Why:
+  this sandboxd doesn't report which binding matched. It uses the first
+  binding in its identity file that matches the claims below, or with a
+  team selected, the first one for that team.
+
+Your sign-in carried (issuer okta):
+  subject   00u1alice
+  email     alice@acme.com
+  groups    everyone, payments-eng
+  roles     (none)

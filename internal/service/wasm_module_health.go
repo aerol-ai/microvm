@@ -55,12 +55,23 @@ func (s *Service) runWasmModuleGC(ctx context.Context, now time.Time) {
 		// recorded content digest (a local-only RemoveImage path that also drops
 		// the warm-pool entry) or, lacking a digest, the recorded local path; the
 		// content-addressed cache file is evicted separately by cache GC below.
-		if s.wasm != nil && rec.Digest != "" {
+		//
+		// Ids are per owner but bytes are shared per digest, so another
+		// owner's row for the same bytes keeps them (and their warm-pool
+		// target) alive; only this row goes.
+		shared, err := s.store.IsWasmDigestCataloguedElsewhere(ctx, rec.OwnerRef, rec.ID, rec.Digest)
+		if err != nil {
+			s.logger.Warn("wasm module gc shared-digest check failed", "module_id", rec.ID, "error", err)
+			continue
+		}
+		switch {
+		case shared:
+		case s.wasm != nil && rec.Digest != "":
 			_ = s.wasm.RemoveImage(ctx, rec.Digest)
-		} else if wasmPathUnderDir(s.cfg.WasmModulesDir, rec.ModulePath) {
+		case wasmPathUnderDir(s.cfg.WasmModulesDir, rec.ModulePath):
 			_ = os.RemoveAll(rec.ModulePath)
 		}
-		if err := s.store.DeleteWasmModule(ctx, rec.ID); err != nil {
+		if err := s.store.DeleteWasmModule(ctx, rec.OwnerRef, rec.ID); err != nil {
 			s.logger.Warn("wasm module gc delete failed", "module_id", rec.ID, "error", err)
 			continue
 		}

@@ -1,0 +1,103 @@
+---
+// Click a diagram to see it full size. Mermaid scales a wide diagram down to
+// the text column, which can shrink its labels below a readable size; the
+// overlay shows the same drawing at its natural size, scrolling if needed.
+---
+
+<dialog class="diagram-zoom" aria-label="Enlarged diagram">
+  <button class="diagram-zoom__close" type="button" aria-label="Close">×</button>
+  <div class="diagram-zoom__body"></div>
+</dialog>
+
+<script>
+  const dialog = document.querySelector<HTMLDialogElement>('dialog.diagram-zoom')
+  const body = dialog?.querySelector<HTMLElement>('.diagram-zoom__body')
+
+  if (dialog && body) {
+    // Delegated, because Mermaid draws its SVGs after the page loads.
+    document.addEventListener('click', (event) => {
+      const svg = (event.target as Element | null)?.closest<SVGSVGElement>('.mermaid svg')
+      if (!svg || dialog.open) return
+
+      const copy = svg.cloneNode(true) as SVGSVGElement
+      const natural = svg.viewBox?.baseVal?.width || svg.getBoundingClientRect().width
+      const room = window.innerWidth * 0.9 - 48
+      // Natural size, grown up to 1.5x when the screen has room for it.
+      const width = Math.max(natural, Math.min(room, natural * 1.5))
+      copy.removeAttribute('height')
+      copy.style.maxWidth = 'none'
+      copy.style.width = `${width}px`
+      copy.style.height = 'auto'
+      body.replaceChildren(copy)
+      dialog.showModal()
+    })
+
+    dialog.addEventListener('click', (event) => {
+      const target = event.target as Element
+      if (target === dialog || target.closest('.diagram-zoom__close')) dialog.close()
+    })
+  }
+</script>
+
+<style is:global>
+  .mermaid svg {
+    cursor: zoom-in;
+  }
+
+  /* A quiet hint, shown only once Mermaid has drawn the diagram. The diagram
+     box is a centered flex row, so the hint needs its own line; as a second
+     item in the row it would squeeze the diagram. */
+  .mermaid:has(svg) {
+    flex-wrap: wrap;
+  }
+
+  .mermaid:has(svg)::after {
+    content: 'Click the diagram to enlarge it';
+    display: block;
+    flex-basis: 100%;
+    margin-top: 6px;
+    font-size: 0.75rem;
+    text-align: right;
+    color: var(--secondary-text-color);
+  }
+</style>
+
+<style>
+  .diagram-zoom {
+    width: min(96vw, 1600px);
+    max-width: none;
+    max-height: 92vh;
+    padding: 0;
+    border: 1px solid var(--border-color);
+    border-radius: 12px;
+    background: var(--bg-color);
+    color: var(--primary-text-color);
+  }
+
+  .diagram-zoom::backdrop {
+    background: rgb(0 0 0 / 60%);
+  }
+
+  .diagram-zoom__body {
+    overflow: auto;
+    max-height: calc(92vh - 2px);
+    padding: 48px 24px 24px;
+    text-align: center;
+  }
+
+  .diagram-zoom__close {
+    position: absolute;
+    top: 10px;
+    right: 10px;
+    z-index: 1;
+    width: 36px;
+    height: 36px;
+    border: 1px solid var(--border-color);
+    border-radius: 999px;
+    background: var(--block-bg-color);
+    color: var(--primary-text-color);
+    font-size: 1.4rem;
+    line-height: 1;
+    cursor: pointer;
+  }
+</style>

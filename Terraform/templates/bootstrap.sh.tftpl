@@ -7,6 +7,7 @@
 #   pat_token, domain, cloudflare_api_token,
 #   with_firecracker (bool), with_gvisor (bool), with_isolate (bool), ingress_proxy_routing (bool), with_nvidia_gpu (bool), with_amd_gpu (bool),
 #   idle_timeout_min (number; 0 disables),
+#   pat_scope ("any" | "host"), l4_proxy_protocol (bool),
 #   firecracker_binary_url, firecracker_jailer_url, firecracker_kernel_url,
 #   firecracker_kernel_config_url, firecracker_auto_install,
 #   firecracker_version, firecracker_upstream_arch,
@@ -35,6 +36,7 @@
 #   sandboxd_url, toolboxd_url, checksums_url,
 #   joiner_role_unique_id, sandboxd_env (map),
 #   secret_kms_key_arn ("" = disabled), secret_kms_strict_boot (bool),
+#   key_custody ("file" | "wrapped"),
 #   audit_export_backend ("" = daemon default), audit_export_file_path,
 #   audit_export_s3_bucket ("" = no bucket provisioned), audit_export_s3_prefix,
 #   audit_receiver_url, audit_receiver_port, audit_receiver_token,
@@ -143,6 +145,22 @@ fi
 if [ -n '${acme_email}' ]; then
   INSTALL_ARGS+=(--acme-email '${acme_email}')
 fi
+# An internal CA for every certificate (§5.10 PC-5). The root goes where
+# Caddy, which reads it, can.
+%{ if acme_ca != null && acme_ca != "" ~}
+INSTALL_ARGS+=(--acme-ca '${acme_ca}')
+%{ endif ~}
+%{ if acme_ca_root_pem != null && acme_ca_root_pem != "" ~}
+install -d -m 0755 /etc/caddy
+cat > /etc/caddy/acme-ca-root.pem <<'AEROLVM_ACME_CA_ROOT'
+${acme_ca_root_pem}
+AEROLVM_ACME_CA_ROOT
+chmod 0644 /etc/caddy/acme-ca-root.pem
+INSTALL_ARGS+=(--acme-ca-root /etc/caddy/acme-ca-root.pem)
+%{ endif ~}
+%{ if tls_issuer != null && tls_issuer != "" && tls_issuer != "acme" ~}
+INSTALL_ARGS+=(--tls-issuer '${tls_issuer}')
+%{ endif ~}
 %{ if caddy_binary_url != "" ~}
 INSTALL_ARGS+=(--caddy-binary-url '${caddy_binary_url}')
 %{ endif ~}
@@ -174,6 +192,19 @@ INSTALL_ARGS+=(--with-amd-gpu)
 %{ if idle_timeout_min > 0 ~}
 INSTALL_ARGS+=(--idle-timeout-min '${idle_timeout_min}')
 %{ endif ~}
+%{ if pat_scope == "host" ~}
+INSTALL_ARGS+=(--pat-scope host)
+%{ endif ~}
+%{ if l4_proxy_protocol ~}
+INSTALL_ARGS+=(--l4-proxy-protocol)
+%{ endif ~}
+%{ if lb_health_port > 0 ~}
+# A health-checked load balancer fronts this ingress node (Terraform
+# api_load_balancer; lb_health_port is 0 otherwise, and this renders
+# nothing). Its probe hits this plain-HTTP /health listener, which walks
+# caddy-l4 on :443 to sandboxd.
+INSTALL_ARGS+=(--lb-health-port '${lb_health_port}')
+%{ endif ~}
 %{ if caddy_storage_s3_enabled ~}
 # Shared S3-backed Caddy cert storage. Every node points at the same
 # bucket; certmagic-s3 holds a distributed lock during ACME so only the
@@ -198,6 +229,25 @@ INSTALL_ARGS+=(
 %{ endif ~}
 %{ endif ~}
 
+%{ if key_custody == "wrapped" ~}
+# Wrapped server-key custody (plans/customer-key-custody.md §3): install.sh
+# writes the key-store settings into sandboxd.env before the first boot, so
+# the first boot (and cluster-init.sh / cluster-join.sh) can reach the KMS
+# key and no plaintext server key is ever written.
+cat > /tmp/aerolvm-secret-provider.env <<'EOF'
+SB_SECRET_PROVIDER=awskms
+SB_SECRET_AWS_KMS_KEY_ID=${secret_kms_key_arn}
+SB_SECRET_PROVIDER_STRICT_BOOT=${secret_kms_strict_boot}
+AWS_REGION=${aws_region}
+EOF
+INSTALL_ARGS+=(--key-custody wrapped --secret-provider-env /tmp/aerolvm-secret-provider.env)
+%{ endif ~}
+%{ if !is_seed ~}
+# A joiner: cluster-join.sh starts sandboxd once it has the cluster's config
+# and server key. Booted before that, as a lone node, it would begin making a
+# server key of its own (with wrapped custody, a wrap through the key store).
+INSTALL_ARGS+=(--no-start)
+%{ endif ~}
 sudo /tmp/install.sh "$${INSTALL_ARGS[@]}"
 
 %{ if is_seed ~}
@@ -217,13 +267,20 @@ chmod +x /tmp/cluster-init.sh
 # of the EC2 hostname. The signing rendezvous below needs an id BOTH sides can
 # agree on without trusting the joiner, and only Terraform knows one; it also
 # makes /v1/cluster/members readable (node names, not ip-10-42-1-43).
-sudo /tmp/cluster-init.sh \
-  --role '${role}' \
-  --node-id '${node_name}' \
-  --ingress-advertise-host '${domain}' \
-  --gossip-key "$GOSSIP_KEY" \
-  --tls-bundle-out /tmp/aerolvm-tls-bundle.tar.gz \
+INIT_ARGS=(
+  --role '${role}'
+  --node-id '${node_name}'
+  --ingress-advertise-host '${domain}'
+  --gossip-key "$GOSSIP_KEY"
+  --tls-bundle-out /tmp/aerolvm-tls-bundle.tar.gz
   --cred-bundle-out /tmp/aerolvm-cred-bundle.tar.gz
+)
+%{ if key_custody == "wrapped" ~}
+# Only when asked: a cluster-init.sh from before the flag rejects it, and the
+# default custody needs nothing new.
+INIT_ARGS+=(--key-custody wrapped)
+%{ endif ~}
+sudo /tmp/cluster-init.sh "$${INIT_ARGS[@]}"
 
 # Publish artifacts joiners need. Bucket is private + SSE-encrypted.
 printf '%s' "$GOSSIP_KEY" > /tmp/gossip-key.txt
@@ -318,9 +375,9 @@ echo "[bootstrap] seed CSR signer started (deadline ${seed_wait_max_seconds}s)"
 ###############################################################################
 # 2a-ter. Seed: audit receiver fixture (plans/integration-test-security.md §6.4)
 #
-# Webhook export and the audit-chain witness both need something listening.
-# Started BEFORE the ops-env block below points the daemon at it, so the first
-# export attempt is not a guaranteed failure that then has to back off.
+# Webhook export needs something listening. Started BEFORE the ops-env block
+# below points the daemon at it, so the first export attempt is not a
+# guaranteed failure that then has to back off.
 ###############################################################################
 curl_download '${audit_receiver_url}' -o /tmp/audit-receiver
 sudo install -m 0755 /tmp/audit-receiver /usr/local/bin/audit-receiver
@@ -547,9 +604,10 @@ set -x
 ###############################################################################
 # 2d. Firecracker host prerequisites
 #
-# install.sh does not yet know how to provision Firecracker hosts, so the
-# Terraform bootstrap handles the host-side prerequisites for nodes that opt
-# in. URLs are optional: when omitted and auto_install_artifacts is true,
+# install.sh --with-firecracker installs the same pinned release and kernel
+# for a single host, but at fixed paths and from upstream only. This block
+# stays because Terraform also takes private-mirror URLs and per-node paths.
+# URLs are optional: when omitted and auto_install_artifacts is true,
 # bootstrap pulls the arch-matched upstream release + spec.ccfc.min kernel.
 ###############################################################################
 
@@ -926,7 +984,7 @@ SB_SECRET_PROVIDER=awskms
 SB_SECRET_AWS_KMS_KEY_ID=${secret_kms_key_arn}
 SB_SECRET_PROVIDER_STRICT_BOOT=${secret_kms_strict_boot}
 %{ endif ~}
-%{ if secret_kms_key_arn != "" || audit_export_s3_bucket != "" ~}
+%{ if secret_kms_key_arn != "" || audit_export_s3_bucket != "" || audit_witness_s3_bucket != "" ~}
 # One assignment for every AWS-backed sink. Pinned rather than left to the
 # SDK's IMDS region fallback: an absent region surfaces as an opaque timeout at
 # seal/ship time instead of a clear failure.
@@ -934,7 +992,7 @@ AWS_REGION=${aws_region}
 %{ endif ~}
 
 %{ if audit_receiver_endpoint != "" ~}
-# Managed by Terraform bootstrap: webhook audit export + witness target.
+# Managed by Terraform bootstrap: webhook audit export.
 #
 # The endpoint is a NAME, not an address: one certificate then serves the seed
 # (which maps it to loopback) and every joiner (which maps it to the seed's
@@ -947,13 +1005,6 @@ SB_SECRET_AUDIT_EXPORT_URL=${audit_receiver_endpoint}/audit
 SB_SECRET_AUDIT_EXPORT_BEARER_TOKEN=${audit_receiver_token}
 SB_AUDIT_EXPORT_WEBHOOK_HMAC_KEY=${audit_receiver_hmac_key}
 SB_AUDIT_EXPORT_WEBHOOK_CA_FILE=/etc/sandboxd/audit-receiver-ca.pem
-# Consumed ONLY by a daemon built with -tags itestwitness, which is how an
-# enterprise scenario gets the non-noop controlplane.Witness that pkg/daemon
-# requires. A stock sandboxd ignores these two entirely, so setting them
-# unconditionally costs nothing and keeps the enterprise and non-enterprise
-# renders identical.
-AEROL_ITEST_WITNESS_URL=${audit_receiver_endpoint}
-AEROL_ITEST_WITNESS_TOKEN=${audit_receiver_token}
 %{ endif ~}
 %{ if audit_export_backend != "" ~}
 # Managed by Terraform bootstrap: audit export sink.
@@ -977,7 +1028,33 @@ SB_AUDIT_EXPORT_S3_REGION=${aws_region}
 SB_AUDIT_EXPORT_S3_PREFIX=${audit_export_s3_prefix}
 %{ endif ~}
 %{ endif ~}
+%{ if audit_witness_s3_bucket != "" ~}
+# Managed by Terraform bootstrap: S3 Object Lock audit witness
+# (plans/open-audit-witness.md). Template vars audit_witness_s3_bucket ("" =
+# no witness) and audit_witness_s3_prefix are documented here, not in the
+# header, because user_data_replace_on_change means any byte rendered with the
+# witness off would replace every running node on the next apply.
+#
+# Independent of the export backend: the export carries the records, the
+# witness carries the chain heads that prove they were not rewritten later.
+# SB_NODE_ID, which the witness requires, is already in this file from
+# cluster-init/cluster-join (--node-id ${node_name}). The region is pinned for
+# the same reason as AWS_REGION above; no endpoint or path-style setting,
+# because those are for S3-compatible stores and this is an AWS bucket.
+SB_AUDIT_WITNESS_BACKEND=s3
+SB_AUDIT_WITNESS_S3_BUCKET=${audit_witness_s3_bucket}
+SB_AUDIT_WITNESS_S3_PREFIX=${audit_witness_s3_prefix}
+SB_AUDIT_WITNESS_S3_REGION=${aws_region}
+%{ endif ~}
 
+%{ if l4_public_host != "" ~}
+# Managed by Terraform bootstrap: the domain points at the load balancer
+# (api_load_balancer; l4_public_host is "" otherwise, and this renders
+# nothing). An NLB cannot carry the raw-TCP port pool, so raw-TCP exposures
+# are advertised under a name with one A record per ingress node.
+SB_L4_PUBLIC_HOST=${l4_public_host}
+
+%{ endif ~}
 # Managed by Terraform bootstrap: extra_sandboxd_env (global) merged under this
 # node's own sandboxd_env. Rendered LAST inside this block so a per-node entry
 # wins over anything above it, and written BEFORE the final

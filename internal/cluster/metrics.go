@@ -53,6 +53,13 @@ var (
 
 	clusterReservationsExpired = expvar.NewInt("aerolvm_cluster_reservations_expired_total")
 
+	// Restart catch-up (catch_up.go). catching_up is 1 from New until the
+	// FSM applies the leader's read index; a node stuck at 1 cannot reach a
+	// leader. rejects counts requests answered 503 instead of a false 404.
+	clusterCatchingUp         = expvar.NewInt("aerolvm_cluster_placement_view_catching_up")
+	clusterCatchUpLastNanos   = expvar.NewInt("aerolvm_cluster_catch_up_last_nanos")
+	clusterNotCaughtUpRejects = expvar.NewInt("aerolvm_cluster_not_caught_up_rejects_total")
+
 	// Failover-recreate observability. Recreate outcome used to live only in
 	// logs and the in-memory recreateFailureTracker, so operators had no time
 	// series for "how often does failover fire across the fleet, and how often
@@ -81,6 +88,12 @@ var (
 	clusterMTLSCertNotAfterUnix = expvar.NewInt("aerolvm_cluster_mtls_cert_not_after_unix")
 	clusterMTLSCANotAfterUnix   = expvar.NewInt("aerolvm_cluster_mtls_ca_not_after_unix")
 )
+
+// patScopeDrift counts live members whose gossiped SB_PAT_SCOPE differs
+// from this node's (plans/identity-and-access.md §5.11). Any value above 0
+// fires SandboxdPATScopeDrift: an owner under host scope refuses the
+// drifting node's forwarded public PAT calls. 0 on a single node.
+var patScopeDrift = expvar.NewInt("aerolvm_pat_scope_drift")
 
 func recordClusterTLSExpiry(certExpiry, caExpiry time.Time) {
 	if !certExpiry.IsZero() {

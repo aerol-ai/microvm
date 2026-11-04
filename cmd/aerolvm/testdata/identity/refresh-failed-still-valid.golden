@@ -1,0 +1,1 @@
+aerolvm: warning: your sign-in to https://api.acme.dev couldn't be renewed. It still works until 14:10:40 UTC (40s left). If this keeps happening, sign in again: aerolvm login --sso https://api.acme.dev

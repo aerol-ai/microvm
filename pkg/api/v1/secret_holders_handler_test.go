@@ -144,7 +144,7 @@ func TestSecretHoldersRouteRejectsNonOperator(t *testing.T) {
 	// Auth that grants a tenant identity but NOT operator.
 	tenantAuth := func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			ctx := controlplane.ContextWithAccess(r.Context(), controlplane.Access{Operator: false})
+			ctx := controlplane.ContextWithAccess(r.Context(), controlplane.Access{Fleet: false})
 			next.ServeHTTP(w, r.WithContext(ctx))
 		})
 	}

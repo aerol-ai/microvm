@@ -10,3 +10,7 @@ capabilities:
   - platform-volumes
   - domain
   - custom-domains
+  # Hostname egress filtering (plans/egress-domain-filtering.md P1-10): install.sh
+  # starts the aerolvm-egress-gateway units and SB_EGRESS_FQDN_ENABLED defaults
+  # on, so UC-180..182 run here.
+  - egress-fqdn

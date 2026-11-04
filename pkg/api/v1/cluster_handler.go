@@ -20,6 +20,7 @@ import (
 	"github.com/aerol-ai/microvm/pkg/api/apihttp"
 	"github.com/aerol-ai/microvm/pkg/api/clustercreate"
 	"github.com/aerol-ai/microvm/pkg/api/clusterlist"
+	"github.com/aerol-ai/microvm/pkg/api/clusterroute"
 	"github.com/aerol-ai/microvm/pkg/capacity"
 	"github.com/aerol-ai/microvm/pkg/controlplane"
 	"github.com/aerol-ai/microvm/pkg/docker"
@@ -55,54 +56,7 @@ const (
 // and falls through to the local handler. The X-Cluster-Forwarded header set
 // by ForwardHTTP guards against infinite loops if the placement view is stale.
 func (h *handlers) clusterForwardWrap(local http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		id := r.PathValue("id")
-		if id == "" {
-			local.ServeHTTP(w, r)
-			return
-		}
-		if h.deps.Service == nil {
-			local.ServeHTTP(w, r)
-			return
-		}
-		c := h.deps.Service.Cluster()
-		if c == nil {
-			local.ServeHTTP(w, r)
-			return
-		}
-		owner, err := c.OwnerOf(id)
-		if err != nil {
-			if errors.Is(err, cluster.ErrUnknownSandbox) {
-				local.ServeHTTP(w, r)
-				return
-			}
-			if errors.Is(err, cluster.ErrOrphaned) {
-				// 410 Gone: the sandbox's owning node died and was
-				// auto-evicted. The placement record exists but points
-				// nowhere. Clients should treat this as a permanent
-				// disappearance and (if they care to) issue a fresh create.
-				apihttp.WriteError(w, http.StatusGone, "sandbox owner died; placement orphaned (manual recovery required)")
-				return
-			}
-			apihttp.WriteError(w, http.StatusInternalServerError, "cluster lookup: "+err.Error())
-			return
-		}
-		if owner.IsSelf {
-			local.ServeHTTP(w, r)
-			return
-		}
-		if owner.APIURL == "" && owner.InternalURL == "" {
-			// Route miss: placement says someone else owns the sandbox, but
-			// gossip hasn't surfaced any forwarding URL yet (mid-rollover,
-			// peer mid-boot, or misconfigured advertise URLs). Bump the
-			// counter so operator dashboards see persistent gossip-convergence
-			// lag rather than just sporadic 503s.
-			service.RecordRouteMiss()
-			apihttp.WriteError(w, http.StatusServiceUnavailable, "cluster: owner "+owner.NodeID+" URL unknown")
-			return
-		}
-		c.ForwardHTTP(cluster.Endpoint{NodeID: owner.NodeID, InternalURL: owner.InternalURL, APIURL: owner.APIURL}, w, r)
-	})
+	return clusterroute.Wrap(h.deps.Service, clusterroute.Options{WriteError: apihttp.WriteError}, local)
 }
 
 // clusterCreateWrap is the handler for POST /v1/sandboxes. It implements the
@@ -126,6 +80,47 @@ func (h *handlers) clusterForwardWrap(local http.Handler) http.Handler {
 // the peer: ForwardHTTP doesn't return a transport error (it streams the proxy
 // response straight to w), and the leader's reservation-GC sweep reclaims the
 // row 120s later. This is the documented orphan window in plans/release-blockers.
+// idempotentCreateID derives the opt-in deterministic sandbox id a v1 create
+// reuses across retries. It is empty unless the caller sent an Idempotency-Key
+// header, so a plain POST /v1/sandboxes still mints a fresh sandbox on every
+// call (the pre-existing, non-idempotent default). The id is namespaced by the
+// create owner, so one tenant's key never resolves to another tenant's id.
+func (h *handlers) idempotentCreateID(r *http.Request) string {
+	return clustercreate.DeterministicSandboxID(service.OwnerRefForCreate(r.Context()), r.Header.Get(clustercreate.HeaderIdempotencyKey))
+}
+
+// withIdempotencyKey names the request's Idempotency-Key on its context, so a
+// refused reuse of the key says which key it was.
+func withIdempotencyKey(r *http.Request) *http.Request {
+	key := strings.TrimSpace(r.Header.Get(clustercreate.HeaderIdempotencyKey))
+	if key == "" {
+		return r
+	}
+	return r.WithContext(service.WithIdempotencyKey(r.Context(), key))
+}
+
+// stampCreateRequestDigests sets req.CreateRequestDigests to the keyed
+// digests of the request as the client sent it, before any server default,
+// when the create carries an Idempotency-Key; otherwise clears it, so a
+// client cannot supply its own. encoding/json writes map keys sorted, so a
+// retry that orders its env or tags differently digests the same.
+func (h *handlers) stampCreateRequestDigests(r *http.Request, req *models.CreateSandboxRequest) error {
+	req.CreateRequestDigests = nil
+	if strings.TrimSpace(r.Header.Get(clustercreate.HeaderIdempotencyKey)) == "" {
+		return nil
+	}
+	canonical, err := json.Marshal(req)
+	if err != nil {
+		return err
+	}
+	digests, err := h.deps.Service.CreateRequestDigests("v1", canonical)
+	if err != nil {
+		return err
+	}
+	req.CreateRequestDigests = digests
+	return nil
+}
+
 func (h *handlers) clusterCreateWrap(w http.ResponseWriter, r *http.Request) {
 	// Parse the body up front so an invalid JSON request fails fast with 400
 	// without consuming a placement slot — and so the test that passes a nil
@@ -148,6 +143,16 @@ func (h *handlers) clusterCreateWrap(w http.ResponseWriter, r *http.Request) {
 	// can read it.
 	r.Body = io.NopCloser(bytes.NewReader(raw))
 	r.ContentLength = int64(len(raw))
+	r = withIdempotencyKey(r)
+	// A create forwarded by the node that placed it carries the digests that
+	// node took of the client's request; its body here already has the
+	// router's defaults applied, so digesting it again would not match.
+	if strings.TrimSpace(r.Header.Get(clustercreate.HeaderTarget)) == "" {
+		if err := h.stampCreateRequestDigests(r, &req); err != nil {
+			apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
+			return
+		}
+	}
 
 	if h.deps.Service == nil {
 		h.createSandbox(w, r)
@@ -164,13 +169,18 @@ func (h *handlers) clusterCreateWrap(w http.ResponseWriter, r *http.Request) {
 	// v1 keep calling SelectPlacementWithCandidates after the bounded
 	// selector landed — every create downloading one Member per eligible
 	// worker (~1.7 MB at 2k nodes) only to discard the slice.
-	decision, ok := clustercreate.Prepare(w, r, h.deps.Service, req, apihttp.WriteError, clustercreate.PrepareOptions{
-		Normalize:      normalizeCreateRuntimeForPlacement,
-		OwnerRef:       service.OwnerRefForCreate(r.Context()),
-		SyncBody:       true,
-		MetricPrefix:   "v1.create",
-		OnForwardStale: cluster.RecordOwnerForwardStale,
-		Logger:         h.deps.Logger,
+	decision, ok := clustercreate.Prepare(w, r, h.deps.Service, req, apihttp.WriteErrorCode, clustercreate.PrepareOptions{
+		// An Idempotency-Key makes the cluster create retry-stable: the derived
+		// id is the reservation id, so a retry lands on ErrReservationConflict
+		// and routes to the existing placement instead of placing a second
+		// sandbox. Empty leaves Prepare to mint a fresh id (the default).
+		PreferredSandboxID: h.idempotentCreateID(r),
+		Normalize:          normalizeCreateRuntimeForPlacement,
+		OwnerRef:           service.OwnerRefForCreate(r.Context()),
+		SyncBody:           true,
+		MetricPrefix:       "v1.create",
+		OnForwardStale:     cluster.RecordOwnerForwardStale,
+		Logger:             h.deps.Logger,
 	})
 	if !ok {
 		return
@@ -202,6 +212,10 @@ func (h *handlers) createSandboxOnSelectedNode(w http.ResponseWriter, r *http.Re
 		apihttp.WriteError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	// The operator default and pinned built-ins go into the spec promoted
+	// below, so a failover replays them (§5.10 PC-2, CEO D11).
+	h.deps.Service.NormalizeCreateEgressDefault(&req)
+	service.NormalizeCreateEgressProfiles(&req)
 	if err := normalizeCreateRuntimeForPlacement(&req); err != nil {
 		apihttp.WriteError(w, http.StatusBadRequest, err.Error())
 		return
@@ -221,6 +235,10 @@ func (h *handlers) createSandboxOnSelectedNode(w http.ResponseWriter, r *http.Re
 
 	if reservationID != "" {
 		service.RecordCreateReservationState("promote_local")
+		// OverlapCreateAndPromote resolves platform volumes into the spec it
+		// promotes (B3) and hands the create the unresolved request, so a
+		// volume named for the first time is created by this create instead
+		// of failing its lookup.
 		resp, err := clustercreate.OverlapCreateAndPromote(createCtx, h.deps.Service, h.deps.Logger, req, reservationID, clustercreate.OverlapOptions{
 			PromoteWithSpec: true,
 			Timing:          createTiming,
@@ -235,10 +253,34 @@ func (h *handlers) createSandboxOnSelectedNode(w http.ResponseWriter, r *http.Re
 	}
 
 	service.RecordCreateReservationState("self_local")
-	resp, err := h.deps.Service.CreateSandbox(createCtx, req)
+	// Local-only images carry no pre-minted reservation id, so honor the
+	// Idempotency-Key here too: a retry replays the existing sandbox instead
+	// of building a second one. The key's create lease (service
+	// create_lease.go) covers the create and the seal and promote below, so
+	// a retry arriving while they run waits for them, then replays; a replay
+	// is never sealed, promoted or rolled back again.
+	preferredID := h.idempotentCreateID(r)
+	createCtx, release, err := h.deps.Service.BeginSandboxCreate(createCtx, preferredID, req.CreateRequestDigests)
 	if err != nil {
 		setCreateServerTiming(w, createStart, createTiming, h.deps.ContainerEngine)
 		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
+		return
+	}
+	defer release()
+	var resp *models.CreateSandboxResponse
+	if preferredID != "" {
+		resp, err = h.deps.Service.CreateSandboxWithID(createCtx, req, preferredID)
+	} else {
+		resp, err = h.deps.Service.CreateSandbox(createCtx, req)
+	}
+	if err != nil {
+		setCreateServerTiming(w, createStart, createTiming, h.deps.ContainerEngine)
+		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
+		return
+	}
+	if resp.Replayed {
+		setCreateServerTiming(w, createStart, createTiming, h.deps.ContainerEngine)
+		apihttp.WriteJSON(w, http.StatusCreated, resp)
 		return
 	}
 
@@ -285,6 +327,12 @@ func (h *handlers) writeOverlapCreateError(w http.ResponseWriter, err error) {
 	if of, ok := clustercreate.AsOverlapFailure(err); ok {
 		switch of.Phase {
 		case clustercreate.OverlapPhaseSeal:
+			if errors.Is(of.Err, service.ErrReservedPlacementGone) {
+				// Nothing was created and a retry reserves afresh: 503 with
+				// Retry-After, not a seal failure.
+				apihttp.WriteStoreAwareError(h.deps.Logger, w, of.Err)
+				return
+			}
 			apihttp.WriteError(w, http.StatusInternalServerError, clustercreate.FormatSealError(of.Err))
 			return
 		case clustercreate.OverlapPhasePromote:
@@ -338,6 +386,25 @@ func (h *handlers) clusterListWrap(w http.ResponseWriter, r *http.Request) {
 		h.listSandboxes(w, r)
 		return
 	}
+	if name, ok := parseNameFilter(r); ok {
+		h.clusterListByName(w, r, c, name)
+		return
+	}
+	// Single-node runs this wrapper with the Noop client, whose list ignores
+	// limit. Page locally when the caller asked for pages so ?limit= means the
+	// same thing in both modes.
+	if !h.deps.Service.ClusterEnabled() && clusterlist.WantsLocalPaging(r.URL) {
+		h.listSandboxesLocalPage(w, r)
+		return
+	}
+	// A list that fans out takes one of this node's list slots, or is
+	// answered 503 + Retry-After at once when they are all taken.
+	release, err := clusterlist.Admit(h.deps.ListGate, c, r)
+	if err != nil {
+		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
+		return
+	}
+	defer release()
 
 	ownerRef := clusterlist.OwnerRefFromContext(r.Context())
 	limit, pageToken := clusterlist.ParsePageParams(r.URL)
@@ -389,6 +456,67 @@ func (h *handlers) clusterListWrap(w http.ResponseWriter, r *http.Request) {
 	result.NextPageToken = next
 	clusterlist.WriteCoverageHeaders(w, result.Coverage, result.NextPageToken)
 	apihttp.WriteJSON(w, http.StatusOK, result.Sandboxes)
+}
+
+// listSandboxesLocalPage serves one single-node list page in sandbox-ID order,
+// with the next-page token in the same header the cluster path uses.
+func (h *handlers) listSandboxesLocalPage(w http.ResponseWriter, r *http.Request) {
+	limit, pageToken := clusterlist.ParsePageParams(r.URL)
+	opts := service.GetSandboxOptions{IncludeEnv: parseIncludeEnv(r), CorrelationID: correlationIDFromRequest(r)}
+	local, err := h.deps.Service.ListSandboxesWithOptions(r.Context(), parseTagFilter(r), opts)
+	if err != nil {
+		h.deps.Logger.Warn("list sandboxes failed", "error", err)
+		apihttp.WriteError(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	page, next, err := clusterlist.PageLocal(local, limit, pageToken)
+	if err != nil {
+		apihttp.WriteError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if next != "" {
+		w.Header().Set(clusterlist.HeaderNextPageToken, next)
+	}
+	apihttp.WriteJSON(w, http.StatusOK, page)
+}
+
+// clusterListByName serves GET /v1/sandboxes?name= in cluster mode without a
+// fan-out: the replicated name index (an FSM read on voters, one or two
+// control-plane lookups on workers) names the owner, and the request goes to
+// that one node, whose local handler answers from its store. A name the index
+// doesn't hold is answered locally, which also covers a sandbox whose
+// placement the index hasn't caught up on yet.
+func (h *handlers) clusterListByName(w http.ResponseWriter, r *http.Request, c cluster.Client, name string) {
+	_, owner, err := c.OwnerOfName(service.OwnerRefForCreate(r.Context()), name)
+	switch {
+	case errors.Is(err, cluster.ErrUnknownSandbox) && !cluster.CaughtUp(c):
+		// The index may not have applied this name yet: an empty list would
+		// read as "no such sandbox".
+		clusterroute.WriteNotCaughtUp(w, apihttp.WriteError)
+		return
+	case errors.Is(err, cluster.ErrUnknownSandbox):
+		h.listSandboxes(w, r)
+		return
+	case errors.Is(err, cluster.ErrOrphaned):
+		// Failover is recreating it; an empty list here would invite the
+		// caller to create a duplicate that then hits the held name.
+		w.Header().Set("Retry-After", strconv.Itoa(cluster.CapacityRetryAfterSeconds))
+		apihttp.WriteError(w, http.StatusServiceUnavailable, "sandbox "+name+" lost its owner node; failover is in progress")
+		return
+	case err != nil:
+		apihttp.WriteError(w, http.StatusServiceUnavailable, "cluster: resolve sandbox name: "+err.Error())
+		return
+	}
+	if owner.IsSelf {
+		h.listSandboxes(w, r)
+		return
+	}
+	if owner.APIURL == "" && owner.InternalURL == "" {
+		service.RecordRouteMiss()
+		apihttp.WriteError(w, http.StatusServiceUnavailable, "cluster: owner "+owner.NodeID+" URL unknown")
+		return
+	}
+	c.ForwardHTTP(cluster.Endpoint{NodeID: owner.NodeID, InternalURL: owner.InternalURL, APIURL: owner.APIURL}, w, r)
 }
 
 func clusterMemberCanOwnSandbox(role string) bool {
@@ -493,6 +621,12 @@ func (h *handlers) writeClusterSandboxIndex(w http.ResponseWriter, r *http.Reque
 			Shards:     parseRepeatedIntQuery(r, "shard"),
 		},
 	}
+	if !cluster.CaughtUp(c) {
+		// PlacementPage would be an empty non-authoritative page: a fleet
+		// scan that silently skips every sandbox.
+		clusterroute.WriteNotCaughtUp(w, apihttp.WriteError)
+		return
+	}
 	resp := c.PlacementPage(req)
 
 	// One List call to build the id→status overlay so we don't issue N
@@ -561,7 +695,13 @@ func (h *handlers) clusterMembers(w http.ResponseWriter, r *http.Request) {
 	for _, m := range members {
 		view = append(view, memberView{Member: m, Drained: c.IsNodeDrained(m.NodeID)})
 	}
-	apihttp.WriteJSON(w, http.StatusOK, map[string]any{"members": view})
+	resp := map[string]any{"members": view}
+	// `sandboxd key rotate --stage` reads this (plans/customer-key-custody.md
+	// §13): the gossip gate with its boot-window rule, not just the list.
+	if gate, ok := c.(cluster.ServerKeyRingGate); ok {
+		resp["server_key_ring_ready"] = gate.ServerKeyRingAllowed()
+	}
+	apihttp.WriteJSON(w, http.StatusOK, resp)
 }
 
 // clusterRemoveMember explicitly removes a node from the raft configuration.
@@ -902,6 +1042,58 @@ func (h *handlers) clusterInternalArtifactCatalogEpoch(w http.ResponseWriter, r 
 	apihttp.WriteJSON(w, http.StatusOK, cluster.ArtifactCatalogEpochResponse{Epoch: epoch})
 }
 
+// clusterInternalEgressProfileWrite takes a profile write from a peer (a
+// follower forwarding to the leader, or a worker). The leader applies it
+// after its upgrade gate; FSM refusals answer 200 with a code so the
+// sentinel survives every hop, and 503 means retry elsewhere.
+func (h *handlers) clusterInternalEgressProfileWrite(w http.ResponseWriter, r *http.Request) {
+	writer, ok := h.deps.Service.Cluster().(interface {
+		WriteEgressProfile(context.Context, cluster.EgressProfileWriteRequest) (cluster.EgressProfileWriteResponse, error)
+	})
+	if !ok {
+		apihttp.WriteError(w, http.StatusServiceUnavailable, "cluster: node holds no placement state")
+		return
+	}
+	var req cluster.EgressProfileWriteRequest
+	if err := apihttp.DecodeJSON(w, r, &req); err != nil {
+		apihttp.WriteError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	resp, err := writer.WriteEgressProfile(r.Context(), req)
+	if err != nil {
+		if out := cluster.EgressProfileWriteOutcome(err); out.Code != "" {
+			apihttp.WriteJSON(w, http.StatusOK, out)
+			return
+		}
+		apihttp.WriteError(w, http.StatusServiceUnavailable, "cluster: egress profile write failed: "+err.Error())
+		return
+	}
+	apihttp.WriteJSON(w, http.StatusOK, resp)
+}
+
+// clusterInternalEgressProfileRead answers a worker's profile read from this
+// server's FSM.
+func (h *handlers) clusterInternalEgressProfileRead(w http.ResponseWriter, r *http.Request) {
+	reader, ok := h.deps.Service.Cluster().(interface {
+		ReadEgressProfiles(context.Context, cluster.EgressProfileReadRequest) (cluster.EgressProfileReadResponse, error)
+	})
+	if !ok {
+		apihttp.WriteError(w, http.StatusServiceUnavailable, "cluster: node holds no placement state")
+		return
+	}
+	var req cluster.EgressProfileReadRequest
+	if err := apihttp.DecodeJSON(w, r, &req); err != nil {
+		apihttp.WriteError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	resp, err := reader.ReadEgressProfiles(r.Context(), req)
+	if err != nil {
+		apihttp.WriteError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
+	apihttp.WriteJSON(w, http.StatusOK, resp)
+}
+
 // clusterRevokeNodeStorageRetirement withdraws an attestation made in error.
 // Obligations to that node become pending again. Idempotent.
 func (h *handlers) clusterRevokeNodeStorageRetirement(w http.ResponseWriter, r *http.Request) {
@@ -994,15 +1186,11 @@ func (h *handlers) clusterInternalStorageObligations(w http.ResponseWriter, r *h
 	apihttp.WriteJSON(w, http.StatusOK, cluster.StorageObligationsResponse{Obligations: views})
 }
 
-// clusterOperatorAccess gates the storage-retirement endpoints. An open-source
-// build carries no control-plane access record, so the PAT that already
-// guards /v1/cluster/** is the operator credential there.
+// clusterOperatorAccess gates the storage-retirement endpoints: the caller
+// must hold fleet.admin, which the route already required (this is the
+// handler's own second check). No Access is an internal call.
 func clusterOperatorAccess(r *http.Request) bool {
-	access, ok := controlplane.AccessFromContext(r.Context())
-	if !ok {
-		return true
-	}
-	return access.Operator
+	return apihttp.CallerCan(r.Context(), controlplane.PermFleetAdmin)
 }
 
 func clusterOperatorActor(r *http.Request) string {
@@ -1109,10 +1297,12 @@ func (h *handlers) clusterInternalPlacementByName(w http.ResponseWriter, r *http
 		apihttp.WriteError(w, http.StatusServiceUnavailable, "cluster: not enabled on this node")
 		return
 	}
-	id, owner, err := c.OwnerOfName(string(decoded))
+	// Raw-key contract: the path carries one nameIndex key, and the worker
+	// agent applies the per-owner rules itself (cluster.Agent.OwnerOfName).
+	id, owner, err := c.OwnerOfNameKey(string(decoded))
 	if err != nil {
 		if errors.Is(err, cluster.ErrUnknownSandbox) {
-			apihttp.WriteError(w, http.StatusNotFound, "no placement record")
+			writeInternalNoPlacement(w, c)
 			return
 		}
 		if errors.Is(err, cluster.ErrOrphaned) {
@@ -1127,11 +1317,24 @@ func (h *handlers) clusterInternalPlacementByName(w http.ResponseWriter, r *http
 	}
 	p, ok := c.PlacementOf(id)
 	if !ok {
-		apihttp.WriteError(w, http.StatusNotFound, "no placement record")
+		writeInternalNoPlacement(w, c)
 		return
 	}
 	redactPlacementSecretFields(&p)
 	apihttp.WriteJSON(w, http.StatusOK, cluster.PlacementLookupResponse{SandboxID: id, Placement: p, Owner: owner})
+}
+
+// writeInternalNoPlacement answers a worker/ingress agent's lookup for a
+// placement this server's FSM does not hold. The agent reads 404 as "no such
+// sandbox" and its own local handler then answers 404 to the client; a 503
+// makes it ask the next server instead, which is what it must do while this
+// server is still catching up after a restart.
+func writeInternalNoPlacement(w http.ResponseWriter, c cluster.Client) {
+	if !cluster.CaughtUp(c) {
+		clusterroute.WriteNotCaughtUp(w, apihttp.WriteError)
+		return
+	}
+	apihttp.WriteError(w, http.StatusNotFound, "no placement record")
 }
 
 func (h *handlers) writeInternalPlacement(w http.ResponseWriter, id string) {
@@ -1146,7 +1349,7 @@ func (h *handlers) writeInternalPlacement(w http.ResponseWriter, id string) {
 	}
 	p, ok := c.PlacementOf(id)
 	if !ok {
-		apihttp.WriteError(w, http.StatusNotFound, "no placement record")
+		writeInternalNoPlacement(w, c)
 		return
 	}
 	redactPlacementSecretFields(&p)
@@ -1214,10 +1417,39 @@ func (h *handlers) clusterInternalVolume(w http.ResponseWriter, r *http.Request)
 	}
 }
 
+// clusterInternalSnapshotNode answers an agent-role node's snapshot-home read
+// from this server node's replicated FSM. Writes never hit this path — they flow
+// through the generic apply endpoint.
+func (h *handlers) clusterInternalSnapshotNode(w http.ResponseWriter, r *http.Request) {
+	c := h.deps.Service.Cluster()
+	if c == nil {
+		apihttp.WriteError(w, http.StatusServiceUnavailable, "cluster: not enabled on this node")
+		return
+	}
+	node, found, err := c.SnapshotHomeNode(r.Context(), r.URL.Query().Get("name"))
+	if err != nil {
+		apihttp.WriteError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if !found && !cluster.CaughtUp(c) {
+		// "No home entry" sends the agent to its local store, which 404s a
+		// snapshot held elsewhere; let it ask a server that has caught up.
+		clusterroute.WriteNotCaughtUp(w, apihttp.WriteError)
+		return
+	}
+	apihttp.WriteJSON(w, http.StatusOK, cluster.SnapshotNodeQueryResponse{NodeID: node, Found: found})
+}
+
 func (h *handlers) clusterInternalPlacements(w http.ResponseWriter, r *http.Request) {
 	c := h.deps.Service.Cluster()
 	if c == nil {
 		apihttp.WriteError(w, http.StatusServiceUnavailable, "cluster: not enabled on this node")
+		return
+	}
+	if !cluster.CaughtUp(c) {
+		// The whole view, still short of rows: the agent would read every
+		// missing row as absent.
+		clusterroute.WriteNotCaughtUp(w, apihttp.WriteError)
 		return
 	}
 	placements := c.Placements()
@@ -1254,6 +1486,12 @@ func (h *handlers) clusterInternalPlacementsPage(w http.ResponseWriter, r *http.
 	var req cluster.PlacementPageRequest
 	if err := apihttp.DecodeJSON(w, r, &req); err != nil {
 		apihttp.WriteError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	if !cluster.CaughtUp(c) {
+		// The agent marks any 200 page authoritative; a page short of rows
+		// would become an empty list or a reconcile that sees nothing placed.
+		clusterroute.WriteNotCaughtUp(w, apihttp.WriteError)
 		return
 	}
 	resp := c.PlacementPage(req)
@@ -1412,6 +1650,11 @@ func (h *handlers) clusterInternalPlacementsByIDs(w http.ResponseWriter, r *http
 		apihttp.WriteError(w, http.StatusBadRequest, "too many placement ids")
 		return
 	}
+	if !cluster.CaughtUp(c) {
+		// A missing key in this map means "absent" to the caller.
+		clusterroute.WriteNotCaughtUp(w, apihttp.WriteError)
+		return
+	}
 	out := c.PlacementsByIDs(req.IDs)
 	for id, p := range out {
 		minimizePlacementBatchRecord(&p)
@@ -1512,7 +1755,7 @@ func (h *handlers) clusterInternalSelectPlacement(w http.ResponseWriter, r *http
 	if sandboxID := strings.TrimSpace(req.SandboxID); sandboxID != "" {
 		target, recipients, err := c.SelectPlacementForCreate(req.Request, sandboxID, req.RecipientBackups)
 		if err != nil {
-			apihttp.WriteJSON(w, http.StatusOK, cluster.SelectPlacementResponse{Error: err.Error()})
+			apihttp.WriteJSON(w, http.StatusOK, cluster.SelectPlacementErrorResponse(err))
 			return
 		}
 		apihttp.WriteJSON(w, http.StatusOK, cluster.SelectPlacementResponse{Target: target, Recipients: recipients})
@@ -1525,7 +1768,7 @@ func (h *handlers) clusterInternalSelectPlacement(w http.ResponseWriter, r *http
 	if req.TargetOnly {
 		target, err := c.SelectPlacement(req.Request)
 		if err != nil {
-			apihttp.WriteJSON(w, http.StatusOK, cluster.SelectPlacementResponse{Error: err.Error()})
+			apihttp.WriteJSON(w, http.StatusOK, cluster.SelectPlacementErrorResponse(err))
 			return
 		}
 		apihttp.WriteJSON(w, http.StatusOK, cluster.SelectPlacementResponse{Target: target})
@@ -1533,7 +1776,7 @@ func (h *handlers) clusterInternalSelectPlacement(w http.ResponseWriter, r *http
 	}
 	target, candidates, err := c.SelectPlacementWithCandidates(req.Request)
 	if err != nil {
-		apihttp.WriteJSON(w, http.StatusOK, cluster.SelectPlacementResponse{Error: err.Error()})
+		apihttp.WriteJSON(w, http.StatusOK, cluster.SelectPlacementErrorResponse(err))
 		return
 	}
 	apihttp.WriteJSON(w, http.StatusOK, cluster.SelectPlacementResponse{Target: target, Candidates: candidates})
@@ -1851,6 +2094,10 @@ func (h *handlers) clusterPlacement(w http.ResponseWriter, r *http.Request) {
 	owner, ownerErr := c.OwnerOf(id)
 	if ownerErr != nil && !errors.Is(ownerErr, cluster.ErrOrphaned) {
 		if errors.Is(ownerErr, cluster.ErrUnknownSandbox) {
+			if !cluster.CaughtUp(c) {
+				clusterroute.WriteNotCaughtUp(w, apihttp.WriteError)
+				return
+			}
 			apihttp.WriteError(w, http.StatusNotFound, "no placement record")
 			return
 		}

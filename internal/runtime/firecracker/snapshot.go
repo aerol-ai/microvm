@@ -390,31 +390,12 @@ func (d *Driver) SnapshotTemplate(ctx context.Context, req TemplateSnapshotReque
 // ignored. Passing data=nil omits the data field via json's "omitempty" on a
 // *json.RawMessage built from the marshal.
 func (d *Driver) sendVsockOp(ctx context.Context, socketPath string, guestCID uint32, op string, data any) error {
-	payload := struct {
-		Op   string          `json:"op"`
-		Data json.RawMessage `json:"data,omitempty"`
-	}{Op: op}
-	if data != nil {
-		raw, err := json.Marshal(data)
-		if err != nil {
-			return fmt.Errorf("marshal data: %w", err)
-		}
-		payload.Data = raw
-	}
-	line, err := json.Marshal(payload)
+	conn, cancel, err := d.openVsockOp(ctx, socketPath, guestCID, op, data)
 	if err != nil {
-		return fmt.Errorf("marshal op: %w", err)
+		return err
 	}
-	dialCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
-	conn, err := d.vsockDial.Dial(dialCtx, socketPath, guestCID, defaultVsockPort)
-	if err != nil {
-		return fmt.Errorf("dial cid=%d: %w", guestCID, err)
-	}
 	defer conn.Close()
-	if _, err := conn.Write(append(line, '\n')); err != nil {
-		return fmt.Errorf("write: %w", err)
-	}
 	// Read the single newline-delimited JSON ack the guest writes, and STOP at
 	// the newline. The guest (cmd/toolboxd handleVsockConn) keeps the
 	// connection open to serve further ops, so it never sends EOF after the
@@ -429,6 +410,71 @@ func (d *Driver) sendVsockOp(ctx context.Context, socketPath string, guestCID ui
 	// We only care that the ack arrived; its content is discarded.
 	_, _ = bufio.NewReader(conn).ReadString('\n')
 	return nil
+}
+
+// defaultVsockOpTimeout bounds one guest op, from connect to ack, unless
+// the caller gives it a budget of its own (openVsockOpWithin).
+const defaultVsockOpTimeout = 2 * time.Second
+
+// deadlineConn is a conn whose deadline can move (the production dialer's
+// net.Conn).
+type deadlineConn interface {
+	SetDeadline(time.Time) error
+}
+
+// openVsockOp opens an op with the default budget.
+func (d *Driver) openVsockOp(ctx context.Context, socketPath string, guestCID uint32, op string, data any) (io.ReadWriteCloser, context.CancelFunc, error) {
+	return d.openVsockOpWithin(ctx, defaultVsockOpTimeout, socketPath, guestCID, op, data)
+}
+
+// openVsockOpWithin marshals {"op":<op>,"data":<data>}, dials the guest
+// agent through Firecracker's host-side vsock proxy and writes the line. The
+// caller reads the ack, then closes the conn and calls cancel.
+//
+// The connect itself never waits more than defaultVsockOpTimeout. The dialer
+// puts the dial context's deadline on the conn (vsock_dial_linux.go), so an
+// op with a longer budget, such as a flush of a lot of dirty data, moves the
+// conn's deadline out to its budget (or the caller's deadline, if sooner);
+// without that, every op's ack had 2 s, whatever budget the caller gave.
+func (d *Driver) openVsockOpWithin(ctx context.Context, budget time.Duration, socketPath string, guestCID uint32, op string, data any) (io.ReadWriteCloser, context.CancelFunc, error) {
+	payload := struct {
+		Op   string          `json:"op"`
+		Data json.RawMessage `json:"data,omitempty"`
+	}{Op: op}
+	if data != nil {
+		raw, err := json.Marshal(data)
+		if err != nil {
+			return nil, nil, fmt.Errorf("marshal data: %w", err)
+		}
+		payload.Data = raw
+	}
+	line, err := json.Marshal(payload)
+	if err != nil {
+		return nil, nil, fmt.Errorf("marshal op: %w", err)
+	}
+	dialCtx, cancel := context.WithTimeout(ctx, min(budget, defaultVsockOpTimeout))
+	conn, err := d.vsockDial.Dial(dialCtx, socketPath, guestCID, defaultVsockPort)
+	if err != nil {
+		cancel()
+		return nil, nil, fmt.Errorf("dial cid=%d: %w", guestCID, err)
+	}
+	if dc, ok := conn.(deadlineConn); ok && budget > defaultVsockOpTimeout {
+		deadline := time.Now().Add(budget)
+		if ctxDeadline, ok := ctx.Deadline(); ok && ctxDeadline.Before(deadline) {
+			deadline = ctxDeadline
+		}
+		if err := dc.SetDeadline(deadline); err != nil {
+			_ = conn.Close()
+			cancel()
+			return nil, nil, fmt.Errorf("set op deadline: %w", err)
+		}
+	}
+	if _, err := conn.Write(append(line, '\n')); err != nil {
+		_ = conn.Close()
+		cancel()
+		return nil, nil, fmt.Errorf("write: %w", err)
+	}
+	return conn, cancel, nil
 }
 
 func (d *Driver) createSnapshotArtifacts(ctx context.Context, client VMMClient, runDir, outMemPath, outStatePath string) error {

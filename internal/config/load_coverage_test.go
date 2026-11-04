@@ -27,6 +27,28 @@ func TestLoad_HappyPathMinimal(t *testing.T) {
 	}
 }
 
+// TestLoad_TLSIssuer (§5.10 PC-5): an internal ACME CA and its root, or
+// Caddy's own CA, for custom-domain certificates without the internet.
+func TestLoad_TLSIssuer(t *testing.T) {
+	t.Setenv("SB_PAT_TOKEN", "operator-pat")
+	t.Setenv("SB_TLS_ACME_CA", " https://ca.bank.internal/acme/acme/directory ")
+	t.Setenv("SB_TLS_ACME_CA_ROOT", "/etc/sandboxd/bank-root.pem")
+	t.Setenv("SB_TLS_ISSUER", " ACME ")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.TLSACMECA != "https://ca.bank.internal/acme/acme/directory" || cfg.TLSACMECARoot != "/etc/sandboxd/bank-root.pem" || cfg.TLSIssuer != TLSIssuerACME {
+		t.Fatalf("cfg = %q %q %q", cfg.TLSACMECA, cfg.TLSACMECARoot, cfg.TLSIssuer)
+	}
+	t.Setenv("SB_TLS_ACME_CA", "")
+	t.Setenv("SB_TLS_ACME_CA_ROOT", "")
+	t.Setenv("SB_TLS_ISSUER", "internal")
+	if cfg, err = Load(); err != nil || cfg.TLSIssuer != TLSIssuerInternal {
+		t.Fatalf("internal: %q, %v", cfg.TLSIssuer, err)
+	}
+}
+
 func TestLoad_MissingPATToken(t *testing.T) {
 	// Ensure no inherited token.
 	t.Setenv("SB_PAT_TOKEN", "")
@@ -61,6 +83,11 @@ func TestLoad_ValidationErrors(t *testing.T) {
 			name: "image pull failure backoff negative",
 			env:  map[string]string{"SB_IMAGE_PULL_FAILURE_BACKOFF": "-1s"},
 			want: "SB_IMAGE_PULL_FAILURE_BACKOFF must be >= 0",
+		},
+		{
+			name: "docker bridge slots negative",
+			env:  map[string]string{"SB_DOCKER_BRIDGE_SLOTS": "-1"},
+			want: "SB_DOCKER_BRIDGE_SLOTS must be >= 0",
 		},
 		{
 			name: "auto import without hooks url",
@@ -117,6 +144,21 @@ func TestLoad_ValidationErrors(t *testing.T) {
 			name: "hostport redirect port out of range",
 			env:  map[string]string{"SB_INGRESS_PROXY_ROUTING": "true", "SB_HOSTPORT_REDIRECT_PORT": "0"},
 			want: "invalid SB_HOSTPORT_REDIRECT_PORT 0",
+		},
+		{
+			name: "route dns link addr is not an ip:port",
+			env:  map[string]string{"SB_ROUTE_DNS_LINK_ADDR": "aerolvm-rt:53053"},
+			want: "invalid SB_ROUTE_DNS_LINK_ADDR",
+		},
+		{
+			name: "route dns link addr is a wildcard",
+			env:  map[string]string{"SB_ROUTE_DNS_LINK_ADDR": "0.0.0.0:53053"},
+			want: "invalid SB_ROUTE_DNS_LINK_ADDR",
+		},
+		{
+			name: "route dns link addr has no port",
+			env:  map[string]string{"SB_ROUTE_DNS_LINK_ADDR": "169.254.53.53"},
+			want: "invalid SB_ROUTE_DNS_LINK_ADDR",
 		},
 		{
 			name: "node role without cluster",
@@ -252,6 +294,26 @@ func TestLoad_ValidationErrors(t *testing.T) {
 			name: "serverless wake start concurrency must be positive",
 			env:  map[string]string{"SB_WAKE_START_CONCURRENCY": "0"},
 			want: "SB_WAKE_START_CONCURRENCY must be > 0",
+		},
+		{
+			name: "tls issuer must be known",
+			env:  map[string]string{"SB_TLS_ISSUER": "letsencrypt"},
+			want: "SB_TLS_ISSUER must be",
+		},
+		{
+			name: "internal tls issuer takes no acme ca",
+			env:  map[string]string{"SB_TLS_ISSUER": "internal", "SB_TLS_ACME_CA": "https://ca.bank.internal/acme/acme/directory"},
+			want: "don't apply when SB_TLS_ISSUER=internal",
+		},
+		{
+			name: "acme ca must be https",
+			env:  map[string]string{"SB_TLS_ACME_CA": "http://ca.bank.internal/directory"},
+			want: "SB_TLS_ACME_CA must be an https ACME directory URL",
+		},
+		{
+			name: "acme ca root must be absolute",
+			env:  map[string]string{"SB_TLS_ACME_CA": "https://ca.bank.internal/directory", "SB_TLS_ACME_CA_ROOT": "root.pem"},
+			want: "SB_TLS_ACME_CA_ROOT must be an absolute path",
 		},
 		{
 			name: "custom domains require domain",
@@ -527,5 +589,19 @@ func TestLoad_ComprehensiveEnabledConfig(t *testing.T) {
 	}
 	if len(cfg.ImageGCWhitelist) != 2 || len(cfg.HostSupportedRuntimes) != 2 {
 		t.Fatalf("unexpected list parsing: whitelist=%v runtimes=%v", cfg.ImageGCWhitelist, cfg.HostSupportedRuntimes)
+	}
+}
+
+// SB_ROUTE_DNS_LINK_ADDR is empty unless set (no second responder listener),
+// and a link address loads as given.
+func TestLoad_RouteDNSLinkAddr(t *testing.T) {
+	t.Setenv("SB_PAT_TOKEN", "operator-pat")
+	cfg, err := Load()
+	if err != nil || cfg.RouteDNSLinkAddr != "" {
+		t.Fatalf("default: RouteDNSLinkAddr = %q, err = %v; want empty", cfg.RouteDNSLinkAddr, err)
+	}
+	t.Setenv("SB_ROUTE_DNS_LINK_ADDR", "169.254.53.53:53053")
+	if cfg, err = Load(); err != nil || cfg.RouteDNSLinkAddr != "169.254.53.53:53053" {
+		t.Fatalf("set: RouteDNSLinkAddr = %q, err = %v", cfg.RouteDNSLinkAddr, err)
 	}
 }

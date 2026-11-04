@@ -45,11 +45,13 @@ func TestPerIPLockSameIPNoDuplicateInsert(t *testing.T) {
 	for err := range errs {
 		t.Fatalf("BlockAllEgress: %v", err)
 	}
-	if got := backend.countMatching(ip); got != 1 {
-		t.Fatalf("rules for %s = %d, want exactly 1 (per-IP lock must serialize Exists+Insert)", ip, got)
+	for _, chain := range []string{"DOCKER-USER", ChainAerolvmInput} {
+		if got := backend.countMatching(chain + "|-s|" + ip + "|"); got != 1 {
+			t.Fatalf("%s rules for %s = %d, want exactly 1 (per-IP lock must serialize Exists+Insert)", chain, ip, got)
+		}
 	}
-	if backend.ruleCount() != 1 {
-		t.Fatalf("total rules = %d, want 1", backend.ruleCount())
+	if backend.ruleCount() != 2 {
+		t.Fatalf("total rules = %d, want 2 (FORWARD + INPUT drop)", backend.ruleCount())
 	}
 }
 
@@ -100,8 +102,8 @@ func TestPerIPLockDifferentIPsOverlap(t *testing.T) {
 	for err := range errs {
 		t.Fatalf("BlockAllEgress: %v", err)
 	}
-	if backend.ruleCount() != n {
-		t.Fatalf("rules = %d, want %d", backend.ruleCount(), n)
+	if backend.ruleCount() != 2*n {
+		t.Fatalf("rules = %d, want %d (FORWARD + INPUT drop per IP)", backend.ruleCount(), 2*n)
 	}
 	if backend.maxActive.Load() < 2 {
 		t.Fatalf("max concurrent Insert = %d, want ≥2 (different IPs must not share one global lock)", backend.maxActive.Load())

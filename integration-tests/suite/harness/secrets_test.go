@@ -468,11 +468,17 @@ type fakeSSH struct {
 	mu     sync.Mutex
 	runs   []string
 	active string // what is-active reports; "" means alternate per activeSeq
+	// restarting makes NRestarts climb on every read: a unit Restart=always
+	// keeps bringing back after its boot gate refuses it.
+	restarting   bool
+	restartReads int
 }
 
 func (f *fakeSSH) install(t *testing.T) {
 	t.Helper()
 	prev := sshRunner
+	prevWindow := unitStableWindow
+	unitStableWindow = 10 * time.Millisecond
 	sshRunner = func(_ *testing.T, _, script string) (string, error) {
 		// The reachability probe must answer, or RequireNodeSSH skips every
 		// test that uses this fake — the fake stands in for a node we CAN
@@ -486,6 +492,13 @@ func (f *fakeSSH) install(t *testing.T) {
 		if strings.Contains(script, "is-active") {
 			return f.active + "\n", nil
 		}
+		if strings.Contains(script, "NRestarts") {
+			f.restartReads++
+			if f.restarting {
+				return fmt.Sprintf("%d\n", f.restartReads), nil
+			}
+			return "0\n", nil
+		}
 		return "", nil
 	}
 	// The probe result is cached per target for the whole run, so a test that
@@ -494,6 +507,7 @@ func (f *fakeSSH) install(t *testing.T) {
 	resetSSHReachability()
 	t.Cleanup(func() {
 		sshRunner = prev
+		unitStableWindow = prevWindow
 		resetSSHReachability()
 	})
 }
@@ -817,66 +831,15 @@ func TestWithClusterEnvConfiguresEveryNodeThenRestoresAll(t *testing.T) {
 	}
 }
 
-// The planted witness head is built into a shell command that is already
-// inside `sudo bash -c '...'`. Getting the quoting wrong does not fail
-// loudly — it produces a malformed request, the receiver 400s, and UC-144
-// reports "the receiver refused the planted head", which reads like a
-// product problem rather than a quoting bug in this file.
-func TestShellSingleQuoteSurvivesNesting(t *testing.T) {
-	// The expansion the remote shell performs: close the outer quote, emit a
-	// literal quote, reopen. Applied twice, it wraps the payload in a
-	// single-quoted word inside the outer single-quoted word.
-	got := shellSingleQuote(`{"NodeID":"n1","HeadHex":"abc"}`)
-	if !strings.HasPrefix(got, `'"'"'`) || !strings.HasSuffix(got, `'"'"'`) {
-		t.Fatalf("not wrapped in the close/escape/reopen idiom: %s", got)
-	}
-	// Bare, unescaped single quotes inside would terminate the word early.
-	inner := strings.TrimSuffix(strings.TrimPrefix(got, `'"'"'`), `'"'"'`)
-	if strings.Contains(inner, "'") {
-		t.Fatalf("payload carries an unescaped single quote: %s", inner)
-	}
-	// A payload that itself contains a quote must survive too.
-	withQuote := shellSingleQuote(`a'b`)
-	if strings.Count(withQuote, `'"'"'`) < 3 {
-		t.Fatalf("an embedded quote was not escaped: %s", withQuote)
-	}
-}
-
 func TestReceiverStatsDecodesTheFixtureShape(t *testing.T) {
 	// Exactly what integration-tests/cmd/audit-receiver's /_stats writes.
-	const body = `{"batches":3,"records":42,"duplicates":1,"rejected":0,"fail_next":5,"nodes":2}`
+	const body = `{"batches":3,"records":42,"duplicates":1,"rejected":0,"fail_next":5}`
 	var st ReceiverStats
 	if err := json.Unmarshal([]byte(body), &st); err != nil {
 		t.Fatal(err)
 	}
-	if st.Batches != 3 || st.Records != 42 || st.Duplicates != 1 || st.Rejected != 0 || st.FailNext != 5 || st.Nodes != 2 {
+	if st.Batches != 3 || st.Records != 42 || st.Duplicates != 1 || st.Rejected != 0 || st.FailNext != 5 {
 		t.Fatalf("decoded %+v", st)
-	}
-}
-
-// The receiver's /witness/{node} answers 404 with a body, which must read as
-// "never recorded" rather than as a head or an error — UC-144 branches on
-// exactly that distinction when deciding what to restore.
-func TestWitnessedHeadForDistinguishesNeverRecorded(t *testing.T) {
-	fake := &fakeSSH{}
-	prev := sshRunner
-	sshRunner = func(_ *testing.T, _, script string) (string, error) {
-		fake.mu.Lock()
-		fake.runs = append(fake.runs, script)
-		fake.mu.Unlock()
-		if strings.Contains(script, "/witness/") {
-			return "no head for node\n", nil
-		}
-		return "", nil
-	}
-	t.Cleanup(func() { sshRunner = prev })
-
-	head, ok, err := WitnessedHeadFor(t, IntegrationNode{Name: "n", PublicIP: "203.0.113.10"}, "node-a")
-	if err != nil {
-		t.Fatalf("a 404 body surfaced as an error: %v", err)
-	}
-	if ok || head != "" {
-		t.Fatalf("a 404 body decoded as a head: %q (ok=%v)", head, ok)
 	}
 }
 
@@ -913,6 +876,28 @@ func TestRequireNodeSSHSkipsWhenUnreachable(t *testing.T) {
 	sshReachableMu.Unlock()
 	if reachable {
 		t.Fatal("a node answering 'Permission denied' was recorded as reachable")
+	}
+}
+
+// NodeSSHReachable answers the same probe without skipping: false for a node
+// with no address or one that refuses the key, true for one that answers.
+func TestNodeSSHReachable(t *testing.T) {
+	if NodeSSHReachable(t, IntegrationNode{Name: "no-address"}) {
+		t.Fatal("a node with no address is not reachable")
+	}
+	prev := sshRunner
+	sshRunner = func(*testing.T, string, string) (string, error) {
+		return "Permission denied (publickey).", errors.New("exit status 255")
+	}
+	resetSSHReachability()
+	t.Cleanup(func() { sshRunner = prev; resetSSHReachability() })
+	if NodeSSHReachable(t, IntegrationNode{Name: "node1", PublicIP: "203.0.113.11"}) {
+		t.Fatal("a node refusing the key was reported reachable")
+	}
+	fake := &fakeSSH{active: "active"}
+	fake.install(t)
+	if !NodeSSHReachable(t, IntegrationNode{Name: "node2", PublicIP: "203.0.113.12"}) {
+		t.Fatal("a node answering the probe was reported unreachable")
 	}
 }
 
@@ -1251,4 +1236,20 @@ func TestPeerProbeScriptCarriesBothCredentialsAndResolvesTheCertName(t *testing.
 	if strings.Contains(internalCurlPrefix, " -k ") || strings.Contains(internalCurlPrefix, "--insecure") {
 		t.Fatal("the peer probe disables TLS verification; UC-151/153 assert that verification works, so this would make them vacuous")
 	}
+}
+
+// A daemon its boot gate refuses is "active" between each restart and its
+// exit. Read as a start, a held gate looked like it failed OPEN (UC-265).
+func TestWithNodeEnvRestartLoopIsNotAStart(t *testing.T) {
+	fake := &fakeSSH{active: "active", restarting: true}
+	fake.install(t)
+	WithNodeEnv(t, testNode(), map[string]string{"SB_SECRET_AUDIT_STRICT_BOOT": "true"}, func(res NodeBootResult) {
+		if res.Started {
+			t.Fatal("a unit systemd keeps restarting was read as started")
+		}
+		// The override comes off next; the node boots for real then.
+		fake.mu.Lock()
+		fake.restarting = false
+		fake.mu.Unlock()
+	})
 }

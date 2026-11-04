@@ -68,6 +68,10 @@ type Caller struct {
 	Operator  bool   // true for the operator PAT path (no per-tenant identity)
 	HasAccess bool   // false for background/internal calls with no auth edge
 	PATToken  string // operator token, hashed as the fallback scope segment
+	// OperatorScope pins the operator path's scope segment
+	// (SB_OPERATOR_VOLUME_SCOPE). Empty keeps the legacy op-<hash(PATToken)>,
+	// which moves every operator volume when the PAT is rotated (H2).
+	OperatorScope string
 }
 
 // MaxVolumeNameLen bounds a volume name so it can never blow up a storage path.
@@ -121,13 +125,45 @@ func TenantScope(c Caller) (string, error) {
 		}
 		return "t-" + hashSegment(ref), nil
 	}
-	// Operator PAT / no-access path: no per-tenant identity. Fall back to a
-	// stable hash of the operator token so a single-tenant self-host deploy
-	// gets one deterministic scope. An empty token here is unscopeable.
-	if strings.TrimSpace(c.PATToken) == "" {
+	// Operator PAT / no-access path: no per-tenant identity.
+	return OperatorScope(c.OperatorScope, c.PATToken)
+}
+
+// operatorScopePrefix starts every operator scope. Tenant scopes start with
+// "t-", so a pinned value can never name a tenant's directory.
+const operatorScopePrefix = "op-"
+
+// OperatorScope is the scope segment of the operator's volumes. A pinned
+// value (SB_OPERATOR_VOLUME_SCOPE) wins. Otherwise it is the legacy stable
+// hash of the operator token, so a single-tenant self-host deploy keeps one
+// deterministic scope. That hash is why the PAT could not be rotated: a new
+// token moved every operator volume to a new, empty path. Pinning the value
+// the boot log prints keeps them in place across any number of rotations
+// (plans/identity-and-access.md §5.11, H2).
+func OperatorScope(pinned, patToken string) (string, error) {
+	if pinned = strings.TrimSpace(pinned); pinned != "" {
+		if err := ValidateOperatorScope(pinned); err != nil {
+			return "", err
+		}
+		return pinned, nil
+	}
+	if strings.TrimSpace(patToken) == "" {
 		return "", errors.New("no tenant identity and no operator token; cannot scope volume")
 	}
-	return "op-" + hashSegment(c.PATToken), nil
+	return operatorScopePrefix + hashSegment(patToken), nil
+}
+
+// ValidateOperatorScope checks a pinned operator scope: "op-" followed by
+// characters a volume name may hold, at most MaxVolumeNameLen in all. It is
+// one path segment of every operator volume, so it gets a volume name's
+// rules, and the prefix keeps it out of the tenant namespace.
+func ValidateOperatorScope(scope string) error {
+	clean, err := SanitizeVolumeName(scope)
+	if err != nil || clean != scope || !strings.HasPrefix(scope, operatorScopePrefix) || len(scope) == len(operatorScopePrefix) {
+		return fmt.Errorf("operator volume scope %q must be %q followed by up to %d characters of a-z 0-9 . _ -",
+			scope, operatorScopePrefix, MaxVolumeNameLen-len(operatorScopePrefix))
+	}
+	return nil
 }
 
 // hashSegment returns a stable, path-safe 16-hex-char digest of s. We hash

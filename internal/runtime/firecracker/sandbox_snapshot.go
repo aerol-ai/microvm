@@ -31,7 +31,31 @@ type sandboxSnapshotManifest struct {
 	SnapshotChecksum string    `json:"snapshot_checksum"`
 	HasOverlay       bool      `json:"has_overlay"`
 	CreatedAt        time.Time `json:"created_at"`
+	// GuestFlush records how freezing the guest's root filesystem before
+	// the pause went; see guestFlush. Start does not need the freeze: it
+	// restores the memory, which holds any write not yet on the disk.
+	// CreateSnapshot exports the disk alone and needs guestFlushDone. Empty
+	// in manifests written before this field existed, all by releases whose
+	// agent cannot freeze.
+	GuestFlush guestFlush `json:"guest_flush,omitempty"`
 }
+
+// guestFlush is how the guest's freeze_fs before a Stop went.
+type guestFlush string
+
+const (
+	// guestFlushDone: the root filesystem was frozen, so rootfs.ext4 holds
+	// every write made before Stop, with a clean journal. The saved memory
+	// holds the freeze too, which Start lifts.
+	guestFlushDone guestFlush = "done"
+	// guestFlushFailed: the agent knows freeze_fs but the freeze failed or
+	// timed out. A later Stop may freeze.
+	guestFlushFailed guestFlush = "failed"
+	// guestFlushUnsupported: the agent predates freeze_fs. It stays that
+	// agent for the sandbox's whole life (Start restores its memory, it is
+	// never restarted), so no Stop of this sandbox will ever freeze.
+	guestFlushUnsupported guestFlush = "unsupported"
+)
 
 func (d *Driver) sandboxSnapshotDir(sandboxID string) string {
 	base := strings.TrimSpace(d.cfg.TemplatesDir)
@@ -134,27 +158,39 @@ func (d *Driver) stopToSandboxSnapshot(ctx context.Context, sandboxID string) er
 		guestCID = slot.VsockCID
 	}
 
-	if err := d.sendVsockOp(ctx, filepath.Join(handle.RunDir(), hostVsockUDSName), guestCID, "pre_snapshot", nil); err != nil {
+	vsockPath := filepath.Join(handle.RunDir(), hostVsockUDSName)
+	// Sessions flush their recordings first: those are writes to the disk,
+	// which the freeze then holds still.
+	if err := d.sendVsockOp(ctx, vsockPath, guestCID, "pre_snapshot", nil); err != nil {
 		d.logger.Warn("firecracker stop: pre_snapshot send failed (continuing)",
 			"sandbox_id", sandboxID, "error", err)
 	}
+	flush := d.freezeForStop(ctx, sandboxID, vsockPath, guestCID)
+	frozen := flush == guestFlushDone
 
-	paused := false
 	vmmStopped := false
 	if err := client.PatchVM(ctx, firecracker.VM{State: firecracker.VMStatePaused}); err != nil {
+		if frozen {
+			d.thawGuest(sandboxID, vsockPath, guestCID)
+		}
 		return fmt.Errorf("firecracker runtime: stop %s: patch VM Paused: %w", sandboxID, err)
 	}
-	paused = true
 	defer func() {
-		if paused && !vmmStopped {
-			if err := client.PatchVM(context.Background(), firecracker.VM{State: firecracker.VMStateResumed}); err != nil {
-				d.logger.Warn("firecracker stop: resume after failed snapshot failed",
-					"sandbox_id", sandboxID, "error", err)
-			}
+		if vmmStopped {
+			return
+		}
+		// The stop failed: the sandbox runs on, and must be able to write.
+		if err := client.PatchVM(context.Background(), firecracker.VM{State: firecracker.VMStateResumed}); err != nil {
+			d.logger.Warn("firecracker stop: resume after failed snapshot failed",
+				"sandbox_id", sandboxID, "error", err)
+			return
+		}
+		if frozen {
+			d.thawGuest(sandboxID, vsockPath, guestCID)
 		}
 	}()
 
-	if err := d.writeSandboxSnapshot(ctx, sandboxID, handle, client, guestCID); err != nil {
+	if err := d.writeSandboxSnapshot(ctx, sandboxID, handle, client, guestCID, flush); err != nil {
 		return err
 	}
 	if err := handle.Shutdown(ctx, 3*time.Second); err != nil {
@@ -166,12 +202,7 @@ func (d *Driver) stopToSandboxSnapshot(ctx context.Context, sandboxID string) er
 	}
 	vmmStopped = true
 
-	d.mu.Lock()
-	delete(d.clients, sandboxID)
-	delete(d.vmms, sandboxID)
-	delete(d.guestCID, sandboxID)
-	d.mu.Unlock()
-	d.rssUnregister(sandboxID)
+	d.unregister(sandboxID)
 
 	if err := d.tapHost.Remove(ctx, slot.TapName); err != nil {
 		d.logger.Warn("firecracker stop: tap remove failed",
@@ -184,7 +215,49 @@ func (d *Driver) stopToSandboxSnapshot(ctx context.Context, sandboxID string) er
 	return nil
 }
 
-func (d *Driver) writeSandboxSnapshot(ctx context.Context, sandboxID string, handle VMMHandle, client VMMClient, guestCID uint32) error {
+// guestSyncTimeout bounds the wait for the guest to flush and freeze its
+// root filesystem. A flush of a lot of dirty data can take seconds; past
+// this, Stop goes on and the saved disk is recorded as unflushed.
+const guestSyncTimeout = time.Minute
+
+// freezeForStop has the guest flush and freeze its root filesystem before
+// the pause, and reports how that went. A flush alone is no barrier: the
+// guest's programs keep writing until the pause, and those writes would be
+// only in the saved memory. Frozen, every write made before the pause is on
+// the saved disk, so a snapshot from the disk alone (CreateSnapshot) misses
+// nothing; ext4 also leaves its journal clean when it freezes.
+//
+// Stop goes ahead either way: Start restores the memory, which holds any
+// write not on the disk. The saved memory holds the freeze too, so Start
+// lifts it (the agent on post_resume, and Start with thaw_fs).
+func (d *Driver) freezeForStop(ctx context.Context, sandboxID, vsockPath string, guestCID uint32) guestFlush {
+	err := d.sendVsockOpAckWithin(ctx, guestSyncTimeout, vsockPath, guestCID, "freeze_fs",
+		map[string]int64{"thaw_after_ms": guestFreezeLimit.Milliseconds()})
+	switch {
+	case err == nil:
+		return guestFlushDone
+	case isUnknownOp(err):
+		d.logger.Warn("firecracker stop: the guest agent predates freeze_fs; this sandbox cannot be snapshotted",
+			"sandbox_id", sandboxID)
+		return guestFlushUnsupported
+	default:
+		// Only the ack may have been lost: thaw, so the sandbox the stop
+		// may yet hand back running is not left unable to write.
+		d.thawGuest(sandboxID, vsockPath, guestCID)
+		d.logger.Warn("firecracker stop: guest filesystem not frozen; a snapshot of this stopped sandbox will be refused until a Stop freezes it",
+			"sandbox_id", sandboxID, "error", err)
+		return guestFlushFailed
+	}
+}
+
+// isUnknownOp reports an agent that does not know the op: one built before
+// the op existed.
+func isUnknownOp(err error) bool {
+	var rejected *guestRejectedError
+	return errors.As(err, &rejected) && strings.Contains(rejected.msg, "unknown op")
+}
+
+func (d *Driver) writeSandboxSnapshot(ctx context.Context, sandboxID string, handle VMMHandle, client VMMClient, guestCID uint32, flush guestFlush) error {
 	base, err := d.sandboxSnapshotBase()
 	if err != nil {
 		return err
@@ -248,6 +321,7 @@ func (d *Driver) writeSandboxSnapshot(ctx context.Context, sandboxID string, han
 		SnapshotChecksum: formatSnapshotChecksum(memDigest, stateDigest),
 		HasOverlay:       hasOverlay,
 		CreatedAt:        time.Now().UTC(),
+		GuestFlush:       flush,
 	}
 	raw, err := json.MarshalIndent(manifest, "", "  ")
 	if err != nil {
@@ -293,7 +367,7 @@ func (d *Driver) writeSandboxSnapshot(ctx context.Context, sandboxID string, han
 	return nil
 }
 
-func (d *Driver) startFromSandboxSnapshot(ctx context.Context, sandboxID string) (*models.SandboxRuntimeState, error) {
+func (d *Driver) startFromSandboxSnapshot(ctx context.Context, sandboxID, toolboxToken string) (*models.SandboxRuntimeState, error) {
 	if err := validateSandboxID(sandboxID); err != nil {
 		return nil, fmt.Errorf("firecracker runtime: start: %w", err)
 	}
@@ -327,6 +401,10 @@ func (d *Driver) startFromSandboxSnapshot(ctx context.Context, sandboxID string)
 		}, nil
 	}
 	d.mu.Unlock()
+	// A restore must be able to adopt the guest it boots (see below).
+	if strings.TrimSpace(toolboxToken) == "" {
+		return nil, fmt.Errorf("firecracker runtime: start %s: %w", sandboxID, errGuestTokenMissing)
+	}
 
 	manifest, err := d.readSandboxSnapshotManifest(sandboxID)
 	if err != nil {
@@ -441,14 +519,23 @@ func (d *Driver) startFromSandboxSnapshot(ctx context.Context, sandboxID string)
 			"tap", slot.TapName)
 	}
 	cancel()
+	// Stop froze the root filesystem before saving the memory, so the VM
+	// comes back frozen. The agent thaws itself on post_resume; this covers
+	// a post_resume that did not land.
+	if manifest.GuestFlush == guestFlushDone {
+		d.thawGuest(sandboxID, vsockPath, manifest.VsockCID)
+	}
+	// The restored agent's identity. It normally holds this token already
+	// (it was adopted at create, and Stop snapshotted its memory) and the op
+	// converges. One that holds none gets it now; one that cannot take it is
+	// an agent from before identity delivery that serves without a token, so
+	// it is shut down again with the snapshot left on disk.
+	if err := d.adoptGuest(ctx, vsockPath, manifest.VsockCID, sandboxID, toolboxToken, adoptRemedyStart); err != nil {
+		return nil, fmt.Errorf("firecracker runtime: start %s: %w", sandboxID, err)
+	}
 	d.probeToolboxTCP(ctx, "start", sandboxID, slot, true)
 
-	d.mu.Lock()
-	d.clients[sandboxID] = client
-	d.vmms[sandboxID] = handle
-	d.guestCID[sandboxID] = manifest.VsockCID
-	d.mu.Unlock()
-	d.rssRegister(sandboxID, handle.Pid())
+	d.register(sandboxID, client, handle, manifest.VsockCID, true)
 
 	tapCommitted = true
 	committed = true
@@ -465,6 +552,15 @@ func (d *Driver) configureSandboxSnapshotRestore(ctx context.Context, client VMM
 	snapshotMemoryPath, snapshotStatePath, err := d.stageSnapshotLoadPaths(runDir, memPath, statePath)
 	if err != nil {
 		return fmt.Errorf("firecracker runtime: stage snapshot load artifacts: %w", err)
+	}
+	// LoadSnapshot reopens every drive the snapshot names, read-write, as the
+	// jailer's uid. startFromSandboxSnapshot copied the rootfs in as root, so
+	// it is chowned here, before the load, like the overlay (#248). Chowned
+	// after the load, every Start under the jailer failed with
+	// "Permission denied (os error 13) rootfs.ext4".
+	rootfsAPIPath, err := d.chrootFilePath(runDir, rootfsPath, rootfsFileName)
+	if err != nil {
+		return fmt.Errorf("firecracker runtime: stage snapshot rootfs: %w", err)
 	}
 	var overlayAPIPath string
 	if manifest.HasOverlay {
@@ -488,10 +584,6 @@ func (d *Driver) configureSandboxSnapshotRestore(ctx context.Context, client VMM
 	}); err != nil {
 		return fmt.Errorf("firecracker runtime: LoadSnapshot: %w", err)
 	}
-	rootfsAPIPath, err := d.chrootFilePath(runDir, rootfsPath, rootfsFileName)
-	if err != nil {
-		return fmt.Errorf("firecracker runtime: stage snapshot rootfs: %w", err)
-	}
 	if err := client.PatchDrive(ctx, rootDriveID, firecracker.DrivePatch{
 		DriveID:    rootDriveID,
 		PathOnHost: rootfsAPIPath,
@@ -511,9 +603,11 @@ func (d *Driver) configureSandboxSnapshotRestore(ctx context.Context, client VMM
 
 // copyFileDst is the destination open used by copyFile. Production opens a
 // real file; tests swap it to inject Sync/Close/Write failures that real
-// filesystems almost never surface.
+// filesystems almost never surface. WriteAt and Truncate let copySparse
+// write only the blocks that hold data and leave the rest as holes.
 type copyFileDest interface {
-	io.Writer
+	io.WriterAt
+	Truncate(size int64) error
 	Sync() error
 	Close() error
 }
@@ -522,6 +616,9 @@ var copyFileOpenDst = func(path string, perm os.FileMode) (copyFileDest, error) 
 	return os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, perm)
 }
 
+// copyFile copies src to dst and keeps dst sparse (see copySparse). Every
+// caller copies a VM file that is mostly zeros: a 10 GiB rootfs or overlay
+// holding a few hundred MiB, or a memory snapshot of mostly untouched RAM.
 func copyFile(src, dst string) error {
 	info, err := os.Stat(src)
 	if err != nil {
@@ -539,7 +636,7 @@ func copyFile(src, dst string) error {
 	if err != nil {
 		return fmt.Errorf("create %s: %w", dst, err)
 	}
-	if _, err := io.Copy(out, in); err != nil {
+	if err := copySparse(out, in, dataRanges(in, info.Size()), info.Size()); err != nil {
 		_ = out.Close()
 		_ = os.Remove(dst)
 		return fmt.Errorf("copy %s to %s: %w", src, dst, err)

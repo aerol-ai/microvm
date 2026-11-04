@@ -1,0 +1,43 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.aerol-ai/aerolvm",
+  "title": "AerolVM",
+  "description": "Run commands, edit files and expose ports in isolated AerolVM sandboxes.",
+  "repository": {
+    "url": "https://github.com/aerol-ai/microvm",
+    "source": "github"
+  },
+  "version": "0.0.0",
+  "packages": [
+    {
+      "registryType": "npm",
+      "registryBaseUrl": "https://registry.npmjs.org",
+      "identifier": "@aerol-ai/aerolvm",
+      "version": "0.0.0",
+      "transport": {
+        "type": "stdio"
+      },
+      "packageArguments": [
+        {
+          "type": "positional",
+          "value": "mcp"
+        }
+      ],
+      "environmentVariables": [
+        {
+          "name": "SB_API_URL",
+          "description": "URL of your sandboxd, e.g. https://sandbox.example.com",
+          "isRequired": true,
+          "format": "string"
+        },
+        {
+          "name": "SB_PAT_TOKEN",
+          "description": "AerolVM API token",
+          "isRequired": true,
+          "isSecret": true,
+          "format": "string"
+        }
+      ]
+    }
+  ]
+}

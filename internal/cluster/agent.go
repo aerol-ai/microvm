@@ -45,6 +45,7 @@ const (
 	PublicInternalRecoveryPath        = "/v1/cluster/internal/recovery/"
 	PublicInternalSelectPlacementPath = "/v1/cluster/internal/select-placement"
 	PublicInternalVolumePath          = "/v1/cluster/internal/volume"
+	PublicInternalSnapshotNodePath    = "/v1/cluster/internal/snapshot-node"
 	PublicInternalDrainStatePath      = "/v1/cluster/internal/drain/"
 	PublicInternalAuditACLPath        = "/v1/cluster/internal/audit-acl/"
 	PublicInternalClusterLeaderPath   = "/v1/cluster/leader"
@@ -110,6 +111,20 @@ type SelectPlacementResponse struct {
 	// Recipients is the bounded answer: owner first, then the chosen backups.
 	Recipients []string `json:"recipients,omitempty"`
 	Error      string   `json:"error,omitempty"`
+	// AtCapacity marks a placement refused because every worker that can run
+	// the request is full (ErrClusterAtCapacity). Error then carries exactly
+	// ErrNoPlacementTarget's text, which is all an agent on the previous
+	// build matches — it keeps answering a 503 during a rolling upgrade —
+	// while a current agent restores ErrClusterAtCapacity from this flag.
+	AtCapacity bool `json:"at_capacity,omitempty"`
+}
+
+// SelectPlacementErrorResponse renders a placement failure for an agent.
+func SelectPlacementErrorResponse(err error) SelectPlacementResponse {
+	if errors.Is(err, ErrClusterAtCapacity) {
+		return SelectPlacementResponse{Error: ErrNoPlacementTarget.Error(), AtCapacity: true}
+	}
+	return SelectPlacementResponse{Error: err.Error()}
 }
 
 type DrainStateResponse struct {
@@ -124,6 +139,9 @@ type DrainStateResponse struct {
 type Agent struct {
 	// drained caches the control plane's drained set (drained_nodes.go).
 	drained drainedNodesCache
+	// profiles caches the egress profiles this worker's sandboxes use
+	// (egress_profiles.go): a worker holds no FSM.
+	profiles egressProfileCache
 
 	// feed is the placement delta feed (agent_placement_feed.go), started
 	// only with SB_INGRESS_PROXY_ROUTING. nil means the page walk.
@@ -166,6 +184,9 @@ type Agent struct {
 	recreator        SandboxRecreator
 	recreateFailures *recreateFailureTracker
 	ownerWatcherStop context.CancelFunc
+	// pageReads coalesces concurrent identical placement-page reads
+	// (PlacementPage).
+	pageReads freshFlight[PlacementPageResponse]
 	// ownedRecoveryCursor resumes the owner-index walk on the next tick. Only
 	// the owner-watcher goroutine touches it. It exists so a page budget can
 	// bound one tick's work without the walk losing its place — the reason
@@ -256,6 +277,7 @@ func NewAgent(cfg config.Config, logger *slog.Logger, admitter *capacity.Admitte
 		Events:         nil,
 		OnLeave:        a.invalidatePeerClient,
 		PeerCacheDir:   cfg.RaftDataDir,
+		PATScope:       cfg.PATScope,
 	}, admitter, logger)
 	if err != nil {
 		if a.internalServer != nil {
@@ -332,17 +354,60 @@ func (a *Agent) OwnerOf(sandboxID string) (OwnerInfo, error) {
 	return owner, nil
 }
 
-func (a *Agent) OwnerOfName(name string) (string, OwnerInfo, error) {
+// OwnerOfName runs the per-owner name lookup (name_key.go) over the control
+// plane's raw placement-by-name endpoint: the owner-qualified key first, then
+// the plain key, accepted only when the placement belongs to ownerRef. The
+// endpoint's raw-key contract is unchanged, so a worker on this binary gets
+// the same answer from a control-plane voter that hasn't upgraded yet.
+func (a *Agent) OwnerOfName(ownerRef, name string) (string, OwnerInfo, error) {
+	ownerRef = strings.TrimSpace(ownerRef)
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return "", OwnerInfo{}, ErrUnknownSandbox
+	}
+	if key := QualifiedSandboxName(ownerRef, name); key != name {
+		lookup, err := a.lookupPlacementByNameKey(key)
+		if err == nil {
+			return a.ownerFromNameLookup(lookup)
+		}
+		if !errors.Is(err, ErrUnknownSandbox) {
+			return "", OwnerInfo{}, err
+		}
+	}
+	lookup, err := a.lookupPlacementByNameKey(name)
+	if err != nil {
+		return "", OwnerInfo{}, err
+	}
+	if strings.TrimSpace(lookup.Placement.OwnerRef) != ownerRef {
+		return "", OwnerInfo{}, ErrUnknownSandbox
+	}
+	return a.ownerFromNameLookup(lookup)
+}
+
+// OwnerOfNameKey resolves one raw nameIndex key through the control plane.
+func (a *Agent) OwnerOfNameKey(key string) (string, OwnerInfo, error) {
+	lookup, err := a.lookupPlacementByNameKey(key)
+	if err != nil {
+		return "", OwnerInfo{}, err
+	}
+	return a.ownerFromNameLookup(lookup)
+}
+
+func (a *Agent) lookupPlacementByNameKey(key string) (PlacementLookupResponse, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), controlPlaneRequestTimeout)
 	defer cancel()
 	var lookup PlacementLookupResponse
-	err := a.doControlPlaneJSON(ctx, http.MethodGet, PublicInternalPlacementByNamePath+base64.RawURLEncoding.EncodeToString([]byte(strings.TrimSpace(name))), PublicInternalPlacementByNamePath+base64.RawURLEncoding.EncodeToString([]byte(strings.TrimSpace(name))), nil, &lookup)
-	if err != nil {
+	path := PublicInternalPlacementByNamePath + base64.RawURLEncoding.EncodeToString([]byte(strings.TrimSpace(key)))
+	if err := a.doControlPlaneJSON(ctx, http.MethodGet, path, path, nil, &lookup); err != nil {
 		if isStatus(err, http.StatusNotFound) {
-			return "", OwnerInfo{}, ErrUnknownSandbox
+			return PlacementLookupResponse{}, ErrUnknownSandbox
 		}
-		return "", OwnerInfo{}, err
+		return PlacementLookupResponse{}, err
 	}
+	return lookup, nil
+}
+
+func (a *Agent) ownerFromNameLookup(lookup PlacementLookupResponse) (string, OwnerInfo, error) {
 	if lookup.Orphaned {
 		return lookup.SandboxID, OwnerInfo{}, ErrOrphaned
 	}
@@ -380,8 +445,14 @@ func (a *Agent) selectPlacement(body SelectPlacementRequest) (PlacementTarget, [
 		return PlacementTarget{}, nil, nil, err
 	}
 	if resp.Error != "" {
+		if resp.AtCapacity {
+			return PlacementTarget{}, nil, nil, ErrClusterAtCapacity
+		}
 		if resp.Error == ErrNoPlacementTarget.Error() {
 			return PlacementTarget{}, nil, nil, ErrNoPlacementTarget
+		}
+		if resp.Error == ErrNoEgressGatewayTarget.Error() {
+			return PlacementTarget{}, nil, nil, ErrNoEgressGatewayTarget
 		}
 		if err := invalidTopologyFromMessage(resp.Error); err != nil {
 			return PlacementTarget{}, nil, nil, err
@@ -411,6 +482,7 @@ func (a *Agent) RecordPlacement(ctx context.Context, sandboxID string, spec *mod
 	}
 	expectedIncarnationID := strings.TrimSpace(secrets.IncarnationID)
 	incarnationID := expectedIncarnationID
+	nameOwnerRef := secrets.OwnerRef
 	if incarnationID == "" {
 		lookup, ok, err := a.lookupPlacement(ctx, sandboxID)
 		if err != nil {
@@ -421,6 +493,9 @@ func (a *Agent) RecordPlacement(ctx context.Context, sandboxID string, spec *mod
 			expectedIncarnationID = incarnationID
 			if incarnationID == "" {
 				return fmt.Errorf("%w: existing placement has no incarnation", ErrIncarnationConflict)
+			}
+			if strings.TrimSpace(nameOwnerRef) == "" {
+				nameOwnerRef = lookup.Placement.OwnerRef
 			}
 		} else {
 			incarnationID, err = MintIncarnationID()
@@ -435,7 +510,7 @@ func (a *Agent) RecordPlacement(ctx context.Context, sandboxID string, spec *mod
 		OwnerNodeID:           a.nodeID,
 		OwnerAPIURL:           a.apiURL,
 		OwnerDataPlaneHost:    a.dataPlaneHost,
-		Spec:                  spec,
+		Spec:                  QualifySpecName(spec, nameOwnerRef),
 		SecretRef:             secrets.Ref,
 		SecretVersion:         secrets.Version,
 		SecretRecipients:      normalizeSecretRecipientIDs(secrets.Recipients),
@@ -448,6 +523,7 @@ func (a *Agent) RecordPlacement(ctx context.Context, sandboxID string, spec *mod
 }
 
 func (a *Agent) ClaimOrphan(ctx context.Context, sandboxID string, spec *models.CreateSandboxRequest, secrets PlacementSecrets) error {
+	nameOwnerRef := secrets.OwnerRef
 	if strings.TrimSpace(secrets.IncarnationID) == "" {
 		lookup, ok, err := a.lookupPlacement(ctx, sandboxID)
 		if err != nil {
@@ -457,6 +533,9 @@ func (a *Agent) ClaimOrphan(ctx context.Context, sandboxID string, spec *models.
 			return ErrUnknownSandbox
 		}
 		secrets.IncarnationID = strings.TrimSpace(lookup.Placement.IncarnationID)
+		if strings.TrimSpace(nameOwnerRef) == "" {
+			nameOwnerRef = lookup.Placement.OwnerRef
+		}
 	}
 	if secrets.IncarnationID == "" {
 		return fmt.Errorf("%w: claim requires current incarnation", ErrIncarnationConflict)
@@ -472,7 +551,7 @@ func (a *Agent) ClaimOrphan(ctx context.Context, sandboxID string, spec *models.
 		OwnerNodeID:          a.nodeID,
 		OwnerAPIURL:          a.apiURL,
 		OwnerDataPlaneHost:   a.dataPlaneHost,
-		Spec:                 spec,
+		Spec:                 QualifySpecName(spec, nameOwnerRef),
 		SecretRef:            secrets.Ref,
 		SecretVersion:        secrets.Version,
 		SecretRecipients:     normalizeSecretRecipientIDs(secrets.Recipients),
@@ -487,6 +566,7 @@ func (a *Agent) UpsertSpec(ctx context.Context, sandboxID string, spec *models.C
 	if spec == nil && !secrets.hasUpdate() {
 		return nil
 	}
+	nameOwnerRef := secrets.OwnerRef
 	if strings.TrimSpace(secrets.IncarnationID) == "" {
 		lookup, ok, err := a.lookupPlacement(ctx, sandboxID)
 		if err != nil {
@@ -496,6 +576,9 @@ func (a *Agent) UpsertSpec(ctx context.Context, sandboxID string, spec *models.C
 			return ErrUnknownSandbox
 		}
 		secrets.IncarnationID = strings.TrimSpace(lookup.Placement.IncarnationID)
+		if strings.TrimSpace(nameOwnerRef) == "" {
+			nameOwnerRef = lookup.Placement.OwnerRef
+		}
 	}
 	if secrets.IncarnationID == "" {
 		return fmt.Errorf("%w: spec update requires current incarnation", ErrIncarnationConflict)
@@ -508,7 +591,7 @@ func (a *Agent) UpsertSpec(ctx context.Context, sandboxID string, spec *models.C
 	return a.applyCommand(ctx, command{
 		Op:                    opUpsertSpec,
 		SandboxID:             sandboxID,
-		Spec:                  spec,
+		Spec:                  QualifySpecName(spec, nameOwnerRef),
 		SecretRef:             secrets.Ref,
 		SecretVersion:         secrets.Version,
 		SecretRecipients:      normalizeSecretRecipientIDs(secrets.Recipients),
@@ -765,7 +848,7 @@ func (a *Agent) ReserveOnTarget(ctx context.Context, sandboxID string, target Pl
 		OwnerNodeID:          target.NodeID,
 		OwnerAPIURL:          target.APIURL,
 		OwnerDataPlaneHost:   target.DataPlaneHost,
-		Spec:                 redacted,
+		Spec:                 QualifySpecName(redacted, secrets.OwnerRef),
 		SecretRef:            secrets.Ref,
 		SecretVersion:        secrets.Version,
 		SecretSealGeneration: secrets.SealGeneration,
@@ -776,15 +859,29 @@ func (a *Agent) ReserveOnTarget(ctx context.Context, sandboxID string, target Pl
 	})
 }
 
+// CancelReservation releases a pending reservation, fenced by its
+// incarnation. The read that decides it goes to the leader. A plain lookup
+// reaches a control-plane member chosen at random, and a follower answers it
+// from its own FSM, which may not have applied a reservation proposed a few
+// milliseconds earlier: a worker whose forwarded create failed fast (400
+// "image is required") then read "no such reservation", cancelled nothing,
+// and the name stayed held for ReservationTTL, so every retry got "409
+// sandbox name already in use cluster-wide". Cluster.CancelReservation fixed
+// the same race for raft members; an agent has no FSM of its own, so every
+// cancel takes the authoritative read. If the leader cannot be asked, the
+// error is returned and the caller's retract path logs it; the expiry sweep
+// remains the safety net.
 func (a *Agent) CancelReservation(ctx context.Context, sandboxID string) error {
-	lookup, ok, err := a.lookupPlacement(ctx, strings.TrimSpace(sandboxID))
+	sandboxID = strings.TrimSpace(sandboxID)
+	got, err := a.AuthoritativePlacementsByIDs(ctx, []string{sandboxID})
 	if err != nil {
-		return err
+		return fmt.Errorf("cluster agent: cancel reservation: %w", err)
 	}
-	if !ok || !lookup.Placement.IsReserved() {
+	placement, ok := got[sandboxID]
+	if !ok || !placement.IsReserved() {
 		return nil
 	}
-	incarnationID := strings.TrimSpace(lookup.Placement.IncarnationID)
+	incarnationID := strings.TrimSpace(placement.IncarnationID)
 	if incarnationID == "" {
 		return fmt.Errorf("%w: cancel reservation requires current incarnation", ErrIncarnationConflict)
 	}
@@ -913,7 +1010,7 @@ func (a *Agent) AssertOwnership(ctx context.Context, local []LocalSandboxState) 
 				if existing.Placement.Spec == nil {
 					spec = st.Spec
 				}
-				replaySecrets := PlacementSecrets{IncarnationID: incarnationID}
+				replaySecrets := PlacementSecrets{IncarnationID: incarnationID, OwnerRef: st.Secrets.OwnerRef}
 				if needsSecretBackfill {
 					replaySecrets = st.Secrets
 				}
@@ -1166,8 +1263,28 @@ func (a *Agent) shardCacheEntryCount() int {
 	return len(a.shardCache)
 }
 
+// PlacementPage reads one page of the placement index from the control
+// plane. Concurrent identical reads share one control-plane request
+// (freshFlight): every GET /v1/sandboxes on an ingress or worker makes one,
+// and on the bank flagship 512 concurrent lists on one ingress made 512
+// concurrent mTLS requests to the servers, whose handshakes starved the
+// node. A shared answer still comes from a read that began after the
+// caller's own request, so coalescing adds no staleness. Each caller gets
+// its own copy of the rows slice (some redact fields in place); the rows'
+// own slices are shared and must not be modified.
 func (a *Agent) PlacementPage(req PlacementPageRequest) PlacementPageResponse {
 	req = req.Normalize()
+	// A struct of strings, ints and a slice of ints: Marshal cannot fail.
+	key, _ := json.Marshal(req)
+	page, _, _ := a.pageReads.do(string(key), func() (PlacementPageResponse, error) {
+		return a.fetchPlacementPage(req), nil
+	})
+	page.Placements = slices.Clone(page.Placements)
+	page.SkippedSandboxIDs = slices.Clone(page.SkippedSandboxIDs)
+	return page
+}
+
+func (a *Agent) fetchPlacementPage(req PlacementPageRequest) PlacementPageResponse {
 	ctx, cancel := context.WithTimeout(context.Background(), controlPlanePlacementRequestTimeout)
 	defer cancel()
 	var out PlacementPageResponse
@@ -1536,6 +1653,25 @@ func (a *Agent) doHTTPRequest(ctx context.Context, client *http.Client, endpoint
 			// a transient apply failure: one re-seeds, the other retries
 			// unchanged. See ApplyErrorStatus in apply_verdict.go.
 			return fmt.Errorf("%w: %s", ErrArtifactCatalogSuperseded, message)
+		}
+		if resp.StatusCode == http.StatusConflict && strings.Contains(message, ErrReservationConflict.Error()) {
+			// Carry the reservation conflict across the control-plane hop (the
+			// non-voter-ingress twin of the leader-forward hop in
+			// forwardApplyStatus). The create path's idempotent-replay branch
+			// keys off errors.Is(err, ErrReservationConflict) to route an
+			// Idempotency-Key retry to the existing placement; without this a
+			// retry from a non-voter ingress 503s on a multi-node cluster
+			// (seen on cluster-hetero, where the ingress is not a raft voter).
+			return fmt.Errorf("%w: %s", ErrReservationConflict, message)
+		}
+		if resp.StatusCode == http.StatusConflict && strings.Contains(message, ErrNameConflict.Error()) {
+			return fmt.Errorf("%w: %s", ErrNameConflict, message)
+		}
+		if resp.StatusCode == http.StatusConflict && strings.Contains(message, ErrIncarnationConflict.Error()) {
+			// The same hop for the incarnation fence (ApplyErrorStatus): an
+			// Idempotency-Key retry's re-reserve that hits it is routed to
+			// the reservation's owner, which keys off errors.Is.
+			return fmt.Errorf("%w: %s", ErrIncarnationConflict, message)
 		}
 		if resp.StatusCode == http.StatusConflict && strings.Contains(message, ErrMemberStillAlive.Error()) {
 			return ErrMemberStillAlive

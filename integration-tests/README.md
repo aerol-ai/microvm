@@ -50,6 +50,12 @@ make integration-reap                   # terminate any leaked itest instances p
 Reports land in `integration-tests/reports/` (`<scenario>.md`, `<scenario>.json`,
 `index.md` matrix). Legend: ✅ pass · ❌ fail · ⚪ skip(n/a) · 🟡 pending · 🟤 inconclusive.
 
+## Agent eval
+
+`agenteval/` checks that Claude can use the `aerolvm mcp` tools, against a
+local sandboxd and the Anthropic API rather than AWS. Run it before changing
+tool names, descriptions or notices; see [`agenteval/README.md`](agenteval/README.md).
+
 ## Where the binaries come from
 
 **Scenarios build the daemon locally by default.** Every run cross-compiles the
@@ -117,6 +123,181 @@ the metal (`*-fc`) and arm64 scenarios request containerd on hardware where the
 containerd bootstrap has not yet been live-proven — validate those on a `--keep`
 run before relying on them.
 
+## Release gate: snapshot-namespace migration
+
+The per-owner snapshot namespace (`sandbox_snapshots` PK → `(owner_ref, name)`)
+ships a destructive one-time migration that only runs on a pre-existing old-schema
+DB, so a fresh-provisioned run never exercises it. Before the first release that
+carries it, run the warm-upgrade gate and the failover exercise `UC-58d`
+(`TestSnapshotBackedFailover`, part of `make integration-cluster-hetero`).
+
+The warm-upgrade gate is automated — it provisions the old release, seeds
+snapshots, upgrades every node in place to the local build, and verifies the
+migration lost no rows:
+
+```bash
+integration-tests/run.sh single-node --upgrade-from v0.6.7     # minimum gate
+integration-tests/run.sh cluster-hetero --upgrade-from v0.6.7  # full gate
+```
+
+[`SNAPSHOT-MIGRATION-UPGRADE.md`](./SNAPSHOT-MIGRATION-UPGRADE.md) is the manual
+runbook the automation mirrors (use it to debug a failed gate).
+
+## Key custody scenarios
+
+Customer key custody (`plans/customer-key-custody.md` Phase 6) has five
+scenarios. Each costs what any scenario of its size costs; none adds an AWS
+service except the KMS key of the last three.
+
+| Scenario | Make target | Key store |
+|---|---|---|
+| `cluster-3-mixed-secrets-vault` | `make integration-key-custody-vault` | OpenBao 2.1.1 dev server (TLS) on the seed, OpenBao Proxy on every node |
+| `cluster-3-mixed-secrets-pkcs11` | `make integration-key-custody-pkcs11` | SoftHSM2 on every node, the same keys imported into each token |
+| `cluster-3-mixed-wrapped-kms` | `make integration-key-custody-kms` | A real AWS KMS key, with Terraform `key_custody = "wrapped"`; UC-311 disables and re-enables it |
+| `cluster-3-mixed-kms-switch` | `make integration-key-custody-kms-switch` | A real AWS KMS key with custody `file`; UC-312 runs the two-step switch from local to it |
+| `single-node-wrapped-kms` | `make integration-key-custody-single` | A real AWS KMS key, one node with `install.sh --key-custody wrapped`; UC-316 replaces its root disk and restores a backup onto the fresh install |
+
+The vault and pkcs11 scenarios boot a plain local cluster. The cases
+(`suite/z_keycustody_*_test.go`, helpers in
+`suite/keycustody_support_test.go`) install the key store over SSH, switch
+to it the two-step way and wrap the server key, which is the migration a
+customer runs. Each step leaves a marker in `/var/lib/itest-keycustody` on
+the node, so a case run alone (`-run`) brings the cluster to the state it
+needs first. Settings go into `/etc/sandboxd/itest-keycustody.env` under a
+drop-in that sorts before the suite's transient override, so a boot-gate
+case can still override them for one restart.
+
+Fixture notes:
+
+- The OpenBao dev store is in memory: it lives as long as the
+  `itest-openbao` unit on the seed. The Transit key is exportable with
+  plaintext backup allowed, only so UC-300 can restore it after deleting it.
+- `softhsm2-util --import` skips whitespace bytes in a key file, so the
+  fixture's AES keys are 32 alphanumeric bytes.
+- UC-313's private registry (`registry:2.8.3` in Docker on the seed, TLS from
+  a per-cluster CA, htpasswd auth) and SSHFS share (user `itestshare`, key
+  login, `restrict`) live on the seed; the vault scenario opens ports 5000
+  and 22 between nodes for them. Every node trusts the registry's CA and
+  restarts once, because sandboxd reads the system roots once per process.
+- UC-311 disables the scenario's own KMS key with the AWS CLI from the
+  machine running the suite, and re-enables it in cleanup; teardown
+  schedules the key for deletion either way.
+- SoftHSM2 keeps keys on the node's disk: the pkcs11 scenario proves the
+  code path, not a network HSM. The one AWS CloudHSM run is operator-gated
+  and not a scenario here (CloudHSM bills hourly per HSM).
+
+## Ingress load balancer (UC-356)
+
+`cluster-3-mixed-lb` (`make integration-cluster-mixed-lb`) is cluster-3-mixed
+with a health-checked AWS Network Load Balancer in front of the ingress
+nodes. Its `api-load-balancer` capability is the switch: run.sh applies and
+destroys with `api_load_balancer = "nlb"` for it and `"none"` for every other
+scenario, whatever `config/terraform.tfvars` says. The domain then resolves to
+the balancer's Elastic IP, and raw TCP ports to `tcp.<domain>` (one record
+per node), so the whole suite also runs through the balancer.
+
+UC-356 (`suite/api_lb_test.go`) checks the domain resolves to the balancer
+only, stops sandboxd on one non-seed node, and reads the balancer's own view
+(`aws elbv2 describe-target-health` on the 443 target group): the node must
+leave rotation within `AEROL_LB_OUT_OF_ROTATION_MAX` (default 20s), 60
+fresh-connection calls through the domain must then all succeed, and after
+the daemon restarts the node must be healthy again within
+`AEROL_LB_BACK_IN_ROTATION_MAX` (default 90s). Each call opens its own TCP
+and TLS connection on a transport of its own, so neither keep-alive nor the
+suite's shared client can hide a 502. The numbers land in
+`<reports>/cluster-3-mixed-lb-bank.json` under
+`api_load_balancer_daemon_outage`.
+
+The scenario needs the default local build, or a release that has
+`install.sh --lb-health-port` and `SB_L4_PUBLIC_HOST`. The reaper
+(`scripts/integration-reap.sh`) terminates instances only, so a scenario
+whose teardown failed keeps its balancer and Elastic IP until
+`integration-tests/run.sh cluster-3-mixed-lb --destroy-only`.
+
+## Overload is shed, not restarted (UC-361)
+
+UC-361 (`suite/overload_shed_test.go`) runs on any scenario with `cluster`,
+`domain` and `disruptive: true`. It drives `AEROL_OVERLOAD_CONCURRENCY`
+clients (default 1024, the step that broke the bank flagship) at
+`GET /v1/sandboxes` through the domain for `AEROL_OVERLOAD_SECONDS` (default
+60) with a client that never retries. Every answer must be 200 or a refusal
+with `Retry-After` (503 or 429); a 502, any other 5xx, a refused or reset
+connection, or a request hung past 30 s fails it. Over SSH it then checks
+that no sandboxd restarted on any node: the unit's `InvocationID` and
+`NRestarts` are unchanged (a watchdog restart does not raise `NRestarts`),
+and neither `journalctl -u sandboxd` nor `journalctl -t sandboxd-healthcheck`
+shows a start or a restart since the load began. Last, the list must be back
+to its baseline latency (the median of 5 in a row within 2x the idle p50, or
+the p50 plus 250 ms) within 60 s of the load stopping. The numbers, and each
+node's `aerolvm_api_list_shed_total`, land in `<reports>/<scenario>-bank.json`
+under `overload_shed_v1_sandboxes`; a run that shed nothing says so in the
+test log, since it never reached the shedding point.
+
+## One tenant's list storm does not degrade another (UC-362)
+
+UC-362 (`suite/list_fairness_test.go`) runs on a scenario with `cluster`,
+`domain`, `identity`, `docker`, `api-list-fairness` and `disruptive: true`:
+today `cluster-3-mixed-lb`, whose tfvars run the list gate at 8 slots with 2
+per tenant (`SB_API_LIST_MAX_INFLIGHT`, `SB_API_LIST_MAX_INFLIGHT_PER_TENANT`).
+That is on purpose: a healthy list holds its slot for milliseconds, so with
+the default 16 slots and 4 per tenant the suite's client may never fill a
+tenant's share, and the case is about what happens when it is full.
+
+It mints runner tokens for two teams (`payments`, noisy; `checkout`, quiet),
+gives each `AEROL_FAIRNESS_SANDBOXES` sandboxes (default 3) so every list
+fans out to owner nodes, then lists as both at once for
+`AEROL_FAIRNESS_SECONDS` (default 60): `AEROL_FAIRNESS_NOISY` clients
+(default 1024) and `AEROL_FAIRNESS_QUIET` (default 4), each pinned to one
+ingress node round-robin on its own tenant's connection, so every node serves
+both. It first reads each node's gate size from `/v1/metrics` and refuses to
+run when the quiet tenant's clients would not fit inside its own share on a
+node. It passes when the quiet team's lists succeed at least 99% of the time
+with a p99 within `AEROL_FAIRNESS_QUIET_P99_MS` (default 2000), the noisy
+team got at least one `429` with code `rate_limited` and `Retry-After` and no
+`502`, other 5xx, refusal without `Retry-After`, transport error or request
+over 30 s, and no sandboxd restarted (UC-361's checks). The numbers land in
+`<reports>/<scenario>-bank.json` under `list_fairness_v1_sandboxes`, with
+each node's `429`/`503` counts. A run whose noisy team never got a `429`
+fails and says to raise `AEROL_FAIRNESS_NOISY`.
+
+## Enterprise scenarios and the audit witness
+
+Enterprise mode (`SB_ENTERPRISE_MODE=true`) refuses to boot without an
+external witness for the audit chain. Every scenario that advertises the
+`audit-witness` capability — `single-node-secrets-enterprise`,
+`cluster-3-mixed-secrets-enterprise` and the five `cluster-hetero-*` security
+scenarios — gets one the way an operator would: Terraform creates an S3 Object
+Lock bucket (`audit_witness_enabled = true`) and the **stock** daemon writes
+its chain heads there. No scenario uses a test build of `sandboxd`.
+
+- **Lock:** `GOVERNANCE` for 1 day, with `SB_SECRET_AUDIT_RETENTION_DAYS=1`,
+  because the daemon refuses a lock shorter than retention. A `COMPLIANCE` or
+  longer lock would leave a bucket nobody can delete until it expires.
+  `make test` (`safety/`) refuses a scenario that drifts from this.
+- **Suite:** `run.sh` exports `AEROL_AUDIT_WITNESS_BUCKET` and
+  `AEROL_AUDIT_WITNESS_PREFIX` (from the scenario's `terraform output`) and
+  `AEROL_AUDIT_WITNESS_REGION`, and sets `AWS_PROFILE` to `aws_profile` from
+  `config/terraform.tfvars` when that is set. UC-143 reads heads, UC-144
+  plants a disagreeing head and buries it again, and UC-263 checks each
+  node's boot canary, all directly in the bucket with your credentials.
+  UC-264 and UC-265 edit, then delete, the same victim's local audit log,
+  require a refused boot, and put the log back.
+- **Teardown:** the bucket has no `force_destroy`. Before `terraform destroy`,
+  teardown (and `--destroy-only`) deletes every version and delete marker with
+  `--bypass-governance-retention`, and empties it again if the destroy fails,
+  since the nodes keep shipping heads until they are terminated. Your AWS
+  identity needs `s3:ListBucketVersions`, `s3:DeleteObjectVersion` and
+  `s3:BypassGovernanceRetention`. If emptying fails, teardown says so and
+  destroys everything else; fix the credentials and run
+  `integration-tests/run.sh <scenario> --destroy-only`. `make integration-reap`
+  terminates instances only and never empties a bucket.
+- **Single server:** `make integration-secrets-enterprise-single` runs
+  `single-node-secrets-enterprise`, which is also the scenario the release
+  smoke (T24 in `plans/open-audit-witness.md`) runs on a published tag. Note
+  that `--version`/`--released` provision no audit-receiver binary (releases
+  do not ship the fixture), so until T24 wires one in, the export cases fail
+  there while the witness cases still run.
+
 ## Persistent cert store (avoid Let's Encrypt re-issuance)
 
 Every domain scenario provisions a fresh box whose Caddy issues a `*.<domain>`
@@ -148,6 +329,152 @@ exactly once per cert lifetime. Staging and `--prod-tls` runs never collide
 (different issuer directory). The encryption key is the only way to read the
 stored certs — save it like any root credential; losing or rotating it orphans
 every stored cert. See [`setup/multi-node-cert-sharing.md`](../setup/multi-node-cert-sharing.md).
+
+## Identity and access (UC-268..UC-294)
+
+`suite/identity_*_test.go` and `suite/z_identity_chaos_test.go` cover named
+credentials end to end (plans/identity-and-access.md §8, task T12).
+
+- **Team tokens, not a token file.** The cross-tenant cases mint real team
+  `avm_` tokens with the operator credential at setup (`POST /v1/tokens`) and
+  revoke them on cleanup; `SB_ITEST_IDENTITY_FILE` is gone (D4). A token
+  minted on one node reaches a worker or ingress node (no Raft state) within
+  one mirror sync, and a request forwarded there is authenticated again, so
+  `mintToken` waits until the API domain AND every worker and ingress node
+  accept the token (one SSH tunnel per node per case) before the case uses
+  it. A node the suite cannot reach over SSH is logged and not waited on.
+- **The test issuer.** The nodes cannot reach the operator's machine, so they
+  never fetch keys from it. The suite generates the keys, writes the issuer's
+  JWKS and an identity file whose `issuers[].jwks_file` names it, installs
+  both on every node over SSH (`/etc/sandboxd/itest-identity.yaml`, the path
+  the scenarios' `SB_IDENTITY_FILE` names), reloads with SIGHUP, and mints ID,
+  workload, Kubernetes service-account and MCP access tokens locally
+  (`suite/harness/identity_issuer.go`, built on T6's `identitytest`). The
+  file is absent at boot, which sandboxd treats as "OIDC answers 503 until a
+  good file loads". The issuer also serves discovery, a device endpoint and a
+  token endpoint on `https://127.0.0.1:<port>`, for the two clients that
+  discover it: the remote-MCP OAuth client (UC-286, in the suite) and
+  `aerolvm login --sso --device` (UC-282), which runs on a node and reaches
+  the issuer through an SSH reverse forward on the same port.
+- **Capabilities.** `identity` (SB_IDENTITY_ENABLED) and `identity-oidc` (the
+  test issuer) are on `single-node`, `cluster-3-mixed`, the two
+  `*-secrets-enterprise` scenarios and `cluster-hetero-lite-secrets`;
+  `single-node-wasm` and the other enterprise hetero scenarios have
+  `identity` only. `audit-export-s3` (cluster-3-mixed exports to its S3
+  bucket; run.sh exports `AEROL_AUDIT_EXPORT_BUCKET`/`_PREFIX`) feeds
+  UC-279. `token-mirror` marks a role-separated topology (UC-291, UC-272b).
+- **Host-scoped PAT (`pat-scope-host`).** Enterprise mode requires
+  `SB_PAT_SCOPE=host` (T10), so every enterprise scenario installs with
+  `pat_scope = "host"` (Terraform → `install.sh --pat-scope host`). Through
+  Caddy the PAT is then a 401, so run.sh mints an admin `avm_` token on the
+  seed's loopback (`mint_suite_token`, the PAT on curl's stdin) and uses it
+  for the health probes, the member wait and the whole suite (`AEROL_PAT`);
+  the PAT itself goes to the suite as `AEROL_OPERATOR_PAT` for the cases that
+  present it on a node's loopback.
+- **Deployment capabilities.** `pat-scope-host` and `l4-proxy-protocol` say
+  how a scenario was installed (run.sh mints the suite's token for the
+  first); `pat-rotation` opts a scenario into UC-277's two rolling restarts.
+  The CLI cases (UC-279's `aerolvm audit search` and `access review`,
+  UC-282's `aerolvm login --sso --device`) run the `aerolvm` the suite
+  builds from the working tree.
+- **Disruptive cases** (`disruptive: true` scenarios only): UC-277 rotates
+  the PAT on every node (`SB_PAT_TOKEN_PREVIOUS`, `SB_OPERATOR_VOLUME_SCOPE`),
+  UC-283 refuses an enterprise boot without identity and with
+  `SB_PAT_SCOPE=any`, UC-289 restarts the single enterprise node with
+  `SB_AUDIT_API_FLOOD_CONTROL=coalesce`, UC-291 partitions a worker from the
+  server tier for 90 s (iptables, with a dead-man heal on the node), UC-292
+  kills the Raft leader during 50 token creates (it skips when the leader is
+  the seed, which on a fresh fleet it usually is), and UC-293 rotates the
+  issuer's key under load.
+
+| Env var | Default | Purpose |
+|---------|---------|---------|
+| `AEROL_TOKEN_SPRAY_RPS` / `AEROL_TOKEN_SPRAY_SECONDS` | `2000` / `10` | UC-272b's spray at one worker (the plan's 10k/s is the offline benchmark's figure) |
+| `AEROL_IDENTITY_CHAOS_RPS` | `1000` | UC-293's load while the key rotates |
+| `AEROL_WASM_REGISTER_REF` | *(unset)* | UC-294's module ref (as UC-51); skips without it |
+| `AEROL_UPGRADE_SANDBOXD_URL` / `AEROL_UPGRADE_SANDBOXD_SHA256` | *(unset)* | UC-281: the new build to roll onto a fleet provisioned from an older release; skips without them |
+
+```bash
+make integration-identity-gate                      # all five identity scenarios, cheapest first
+make integration-single                             # tokens, SSO, MCP OAuth, CLI device login, dashboard
+make integration-cluster-mixed                      # + forwards, fan-out, revoke propagation, audit search/review
+make integration-secrets-enterprise-single          # + host-scoped PAT, PROXY protocol, enterprise boot gates, flood control
+make integration-secrets-enterprise                 # + PAT rotation, leader-kill and key-rotation chaos
+make integration-secrets-hetero-lite                # + worker-partition chaos, token spray
+make integration-identity-only SCENARIO=cluster-3-mixed   # re-run the identity cases on a kept scenario
+```
+
+UC-281 needs a fleet on an older release and the new build's URL:
+
+```bash
+make itest-build && make itest-publish   # prints presigned tfvars: sandboxd_url, and checksums_url (its sandboxd line is the sha256)
+AEROL_UPGRADE_SANDBOXD_URL=... AEROL_UPGRADE_SANDBOXD_SHA256=... AEROL_TEST_RUN='^TestIdentityRollingUpgradeGate$' \
+  AEROL_ALLOW_DISRUPTIVE=1 integration-tests/run.sh cluster-3-mixed --version <tag before the identity stack>
+```
+
+## Egress domain filtering (UC-179..UC-204)
+
+`suite/egress_fqdn_test.go`, `suite/egress_phase2_test.go`,
+`suite/egress_phase3_test.go`, `suite/egress_firecracker_test.go` and
+`suite/egress_private_cloud_test.go` cover hostname egress filtering
+(plans/egress-domain-filtering.md P1-10, P1-20, Phases 2-4).
+
+- **`egress-fqdn`** (advertised by `single-node`, `single-node-containerd`,
+  `cluster-3-mixed-docker` and `cluster-3-mixed-gvisor`): UC-180..182 run real
+  traffic through the node's egress gateway (allowed name over HTTPS, NXDOMAIN
+  and a fast refusal for others, the 403 naming host and rule, the denial in
+  `sandbox.audit()`, `host:port` and `*.` entries). UC-185 is the EF-78
+  latency gate: with `AEROL_BENCH=1` it reads the `svc_egress_*` stages from
+  Server-Timing and fails over the join (≤2 ms p50) and attach (≤10 ms p99)
+  budgets (`AEROL_EGRESS_JOIN_P50_MS` / `AEROL_EGRESS_ATTACH_P99_MS` override).
+- Phase 2, also on `egress-fqdn`: UC-190 changes a running sandbox's policy,
+  UC-191 converges a named profile change and refuses deleting it while
+  referenced, and UC-192 (EF-48) learns `pip install` in learn mode, then
+  locks to the suggested list. UC-193..200 (EF-49) run each built-in profile's
+  real tool with only that profile: pip, npm, `git clone`, a Hugging Face
+  download, `go mod download`, `cargo fetch`, apt and `crane pull` (in place
+  of `docker pull`, which would need Docker in Docker). They pull the tool
+  images (python, node, alpine/git, golang, rust, ubuntu, crane) and reach the
+  public registries, so a failure there may be registry drift: the built-in
+  lists are kept by hand and these UCs are how operators catch a stale one
+  (CEO D12).
+- Phase 3, also on `egress-fqdn`: UC-201 (EF-52, EF-53) creates a
+  `python:3.12-alpine` sandbox allowed `api.github.com` with an inspect rule
+  for `GET /repos/**`. Python's `urllib`, trusting the node CA only through
+  `SSL_CERT_FILE`, gets a 200 for the ruled GET through the gateway's TLS
+  termination, and the gateway's own 403 (naming `network_egress_rules`) for a
+  POST and for an unruled path. It calls the public GitHub API unauthenticated,
+  so a 403 on the GET may be GitHub's rate limit; the failure prints the body.
+  UC-202 (EF-54, P3-2) creates a `python:3.12-alpine` sandbox with a random
+  `TEST_TOKEN` in its env and an inspect rule on `postman-echo.com` for
+  `/headers` that injects `Authorization` from `env:TEST_TOKEN`. Inside, the
+  env holds only `aerolvm-placeholder:TEST_TOKEN`; `urllib` sends that
+  placeholder as `Authorization`, and the echoed headers must show the real
+  token the gateway put in its place. It depends on the public
+  `postman-echo.com` service being up.
+  UC-203 (EF-55, P3-3) creates a `python:3.12-alpine` sandbox, pinned to the
+  `docker` runtime (runc under either engine, never runsc, which refuses
+  `binaries` with 501), allowed `pypi.org` and `files.pythonhosted.org` with a
+  binaries-only rule on 443 for each naming `/usr/local/bin/pip`. Inside,
+  `pip install requests` must pass without inspection (the gateway names pip by
+  its script), and busybox `wget` to `https://pypi.org/simple/` must be
+  refused at the TLS handshake. The node needs cgroup v2, which the Ubuntu
+  22.04 AMIs have; on cgroup v1 every covered connection is refused
+  (`binary_unknown`).
+- Phase 4, on `single-node-fc` (`firecracker` + `egress-fqdn`): UC-204
+  creates a Firecracker guest allowed `pypi.org`. Its traffic reaches the
+  egress gateway over its own TAP: the listed name fetches over HTTPS, another
+  is refused fast, `egress_status` is `active`, and a live switch to block-all
+  shuts it. That scenario also runs the docker egress UCs above.
+- UC-179 (CIDR allowlist), UC-183 (no `CAP_NET_RAW`) and UC-184 (block-all
+  can't reach host services) only need `docker`.
+- **`private-cloud`** (`single-node-private-cloud`, `make
+  integration-single-private-cloud`): the node runs dnsmasq with internal names,
+  an internal HTTP service and squid, wired into the egress operator file.
+  UC-186..189 cover the upstream proxy with synthetic DNS, the internal zone
+  (and its rebinding refusal), the deny floor and the control-port guard. The
+  node keeps its internet gateway; a no-egress VPC with an offline install is
+  the remaining part of P1-20.
 
 ## Create benchmark (UC-94 / UC-95)
 
@@ -321,8 +648,10 @@ The live suite is behind the `integration` build tag, so the everyday
 - **State:** `-backend-config=key=integration/<scenario>/...` + separate
   `TF_DATA_DIR`. The prod key (`prod/terraform.tfstate`) is never opened.
 - **Tripwires** (`lib/provision.sh check-safety`, unit-tested in `safety/`):
-  abort before any apply if the state key targets prod, the leased domain
-  collides with the prod domain, or `cluster_name` lacks the `itest` marker.
+  abort before any apply if the state key targets prod, the leased domain is
+  empty or collides with the prod domain, or `cluster_name` lacks the `itest`
+  marker. A domain scenario with no leased domain (e.g. `domains.yml` missing)
+  is refused before the tripwires even run.
 - **Config overlay:** generated at runtime from `config/cluster.yml` with AOCR
   auto-import + fleet **disabled** and the leased domain substituted — never a
   committed copy, so it can't drift.

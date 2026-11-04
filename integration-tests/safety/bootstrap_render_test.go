@@ -79,7 +79,8 @@ func TestBootstrapTemplateRenders(t *testing.T) {
 
 	for _, branch := range []string{
 		"seed", "joiner", "joiner_kms", "joiner_audit_s3", "joiner_audit_file",
-		"seed_receiver", "joiner_receiver",
+		"seed_receiver", "joiner_receiver", "seed_public_ca", "seed_wrapped",
+		"joiner_api_lb", "joiner_api_lb_worker",
 	} {
 		t.Run(branch, func(t *testing.T) {
 			out, err := run("output", "-raw", branch)
@@ -128,6 +129,11 @@ func TestBootstrapTemplateRenders(t *testing.T) {
 					"SB_AUDIT_EXPORT_S3_BUCKET=aerolvm-itest-x-audit-abc123",
 					"SB_AUDIT_EXPORT_S3_PREFIX=aerolvm-itest-x",
 					"AWS_REGION=",
+					// The S3 audit witness rides on the same render.
+					"SB_AUDIT_WITNESS_BACKEND=s3",
+					"SB_AUDIT_WITNESS_S3_BUCKET=aerolvm-itest-x-witness-abc123",
+					"SB_AUDIT_WITNESS_S3_PREFIX=witness/",
+					"SB_AUDIT_WITNESS_S3_REGION=",
 				},
 				"joiner_audit_file": {
 					"SB_AUDIT_EXPORT_BACKEND=file",
@@ -160,6 +166,18 @@ func TestBootstrapTemplateRenders(t *testing.T) {
 			for _, want := range mustContain[branch] {
 				if !strings.Contains(out, want) {
 					t.Errorf("rendered %s bootstrap is missing %q", branch, want)
+				}
+			}
+			// The internal-CA flags appear exactly when an internal CA is
+			// configured (PC-5): the seed fixture sets one, the public-CA
+			// branch has none.
+			internalCA := []string{"--acme-ca '", "--acme-ca-root ", "--tls-issuer '"}
+			for _, flag := range internalCA {
+				switch {
+				case branch == "seed_public_ca" && strings.Contains(out, flag):
+					t.Errorf("public-CA bootstrap passes %q", flag)
+				case branch == "seed" && !strings.Contains(out, flag):
+					t.Errorf("internal-CA bootstrap is missing %q", flag)
 				}
 			}
 		})
@@ -307,6 +325,59 @@ func renderBootstrap(t *testing.T, output string) string {
 		t.Fatalf("output %s: %v\n%s", output, err, out)
 	}
 	return out
+}
+
+// pat_scope and l4_proxy_protocol are install.sh flags (plans/identity-and-
+// access.md §5.11). Off, the render must not mention them, so a default
+// deployment is byte-identical to before; on, both reach install.sh, which
+// writes the Caddy half (the public socket, the PROXY listener wrapper) that
+// the sandboxd half needs.
+func TestBootstrapPassesIdentityInstallFlagsOnlyWhenSet(t *testing.T) {
+	off := renderBootstrap(t, "joiner")
+	for _, flag := range []string{"--pat-scope", "--l4-proxy-protocol"} {
+		if strings.Contains(off, flag) {
+			t.Errorf("the default render passes %s to install.sh", flag)
+		}
+	}
+	on := renderBootstrap(t, "joiner_identity_flags")
+	for _, want := range []string{"INSTALL_ARGS+=(--pat-scope host)", "INSTALL_ARGS+=(--l4-proxy-protocol)"} {
+		if !strings.Contains(on, want) {
+			t.Errorf("the render with the flags set lacks %q", want)
+		}
+	}
+	if flagAt, runAt := strings.Index(on, "--pat-scope host"), strings.Index(on, "sudo /tmp/install.sh"); runAt < 0 || flagAt > runAt {
+		t.Errorf("the flags must be appended before install.sh runs (flag at %d, install at %d)", flagAt, runAt)
+	}
+}
+
+// api_load_balancer (Terraform/load_balancer.tf): an ingress node behind the
+// balancer passes --lb-health-port to install.sh, before install.sh runs,
+// and every node gets SB_L4_PUBLIC_HOST in the env the final restart reads,
+// ahead of the per-node overrides so an operator can still set their own.
+// Off, neither renders a byte: user_data_replace_on_change would otherwise
+// replace every node of an existing cluster on its next apply.
+func TestBootstrapLoadBalancerSettingsOnlyWhenSet(t *testing.T) {
+	off := renderBootstrap(t, "joiner")
+	for _, forbidden := range []string{"--lb-health-port", "SB_L4_PUBLIC_HOST", "load balancer"} {
+		if strings.Contains(off, forbidden) {
+			t.Errorf("the default render carries %q", forbidden)
+		}
+	}
+	on := renderBootstrap(t, "joiner_api_lb")
+	if !strings.Contains(on, "INSTALL_ARGS+=(--lb-health-port '21280')") {
+		t.Error("an ingress node behind the balancer does not pass --lb-health-port")
+	}
+	if flagAt, runAt := strings.Index(on, "--lb-health-port '21280'"), strings.Index(on, "sudo /tmp/install.sh"); runAt < 0 || flagAt > runAt {
+		t.Errorf("--lb-health-port must be appended before install.sh runs (flag at %d, install at %d)", flagAt, runAt)
+	}
+	host, overrides, restart := strings.Index(on, "SB_L4_PUBLIC_HOST=tcp.x.example.com"), strings.Index(on, "extra_sandboxd_env (global) merged"), strings.LastIndex(on, "systemctl restart sandboxd")
+	if host < 0 || overrides < 0 || host > overrides || host > restart {
+		t.Errorf("SB_L4_PUBLIC_HOST must be written before the per-node overrides and the final restart (host %d, overrides %d, restart %d)", host, overrides, restart)
+	}
+	worker := renderBootstrap(t, "joiner_api_lb_worker")
+	if strings.Contains(worker, "--lb-health-port") || !strings.Contains(worker, "SB_L4_PUBLIC_HOST=tcp.x.example.com") {
+		t.Error("a worker behind the balancer must get the raw-TCP host and no health listener")
+	}
 }
 
 // secret_kms_enabled=false must emit NOTHING. A node that quietly got
@@ -480,5 +551,44 @@ func TestBootstrapOmitsAuditReceiverWhenDisabled(t *testing.T) {
 		if strings.Contains(out, forbidden) {
 			t.Errorf("receiver disabled but the render contains %q", forbidden)
 		}
+	}
+}
+
+// TestBootstrapWrappedCustodyFlags: with key_custody = "wrapped" the seed
+// passes --key-custody to install.sh (with the key-store env) and to
+// cluster-init.sh; with the default it passes neither, so an older
+// cluster-init.sh never sees the flag.
+func TestBootstrapWrappedCustodyFlags(t *testing.T) {
+	wrapped := renderBootstrap(t, "seed_wrapped")
+	for _, want := range []string{"INSTALL_ARGS+=(--key-custody wrapped --secret-provider-env /tmp/aerolvm-secret-provider.env)", "INIT_ARGS+=(--key-custody wrapped)", "SB_SECRET_PROVIDER=awskms"} {
+		if !strings.Contains(wrapped, want) {
+			t.Errorf("seed_wrapped is missing %q", want)
+		}
+	}
+	if plain := renderBootstrap(t, "seed"); strings.Contains(plain, "--key-custody") {
+		t.Error("the default custody passes --key-custody")
+	}
+}
+
+// A joiner's install.sh leaves sandboxd stopped (--no-start) until
+// cluster-join.sh starts it with the cluster's config and server key; a
+// first boot as a lone node would begin making a server key of its own. The
+// seed boots at install: its first boot is the one that makes the key.
+func TestBootstrapJoinerInstallsWithoutStarting(t *testing.T) {
+	const flag = "INSTALL_ARGS+=(--no-start)"
+	for _, out := range []string{"joiner", "joiner_kms"} {
+		if !strings.Contains(renderBootstrap(t, out), flag) {
+			t.Errorf("%s does not pass --no-start to install.sh", out)
+		}
+	}
+	for _, out := range []string{"seed", "seed_wrapped"} {
+		if strings.Contains(renderBootstrap(t, out), flag) {
+			t.Errorf("%s passes --no-start, but the seed must boot at install", out)
+		}
+	}
+	// install.sh runs before cluster-join.sh, and the flag is set before it.
+	joiner := renderBootstrap(t, "joiner")
+	if i, j := strings.Index(joiner, flag), strings.Index(joiner, `sudo /tmp/install.sh "${INSTALL_ARGS[@]}"`); i < 0 || j < 0 || i > j {
+		t.Errorf("--no-start is not added before install.sh runs (flag at %d, install at %d)", i, j)
 	}
 }

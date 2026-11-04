@@ -67,7 +67,7 @@ func newCustomDomainsV1Env(t *testing.T, cfgOverride func(*config.Config)) *cust
 		Logger:  logger,
 		Auth: func(h http.Handler) http.Handler {
 			return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				ctx := controlplane.ContextWithAccess(r.Context(), controlplane.Access{Operator: true})
+				ctx := controlplane.ContextWithAccess(r.Context(), controlplane.Access{Fleet: true})
 				h.ServeHTTP(w, r.WithContext(ctx))
 			})
 		},

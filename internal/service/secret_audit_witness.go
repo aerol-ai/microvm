@@ -31,6 +31,10 @@ var (
 	// witnessed head on the local receipt because it lay in the checkpoint's
 	// trusted prefix; the background pass settles it.
 	secretAuditBootWitnessProvisional = expvar.NewInt("aerolvm_secret_audit_boot_witness_provisional_total")
+	// secretAuditWitnessForeignHeads counts ship-loop reads that found a
+	// head this node neither shipped last nor holds now: another writer
+	// used this node's witness key (D18).
+	secretAuditWitnessForeignHeads = expvar.NewInt("aerolvm_secret_audit_witness_foreign_head_total")
 )
 
 type witnessReceiptRecord struct {
@@ -199,28 +203,49 @@ func (s *Service) shipSecretAuditHeadNow(ctx context.Context) error {
 		return nil
 	}
 	nodeID := s.witnessNodeID()
-	lastLocal, _ := lastWitnessedHead(s.secretAuditWitnessPath())
-	if tip, _ := readWitnessTip(s.secretAuditWitnessTipPath()); tip.HeadHex != "" {
-		lastLocal = tip.HeadHex
-	}
-	if lastLocal == head {
-		// A local receipt is not proof that the external store still has the
-		// acknowledgment. Confirm it; if missing/behind, re-submit the same
-		// idempotent head instead of suppressing witness repair forever.
-		verifyCtx := ctx
-		if verifyCtx == nil {
-			verifyCtx = context.Background()
-		}
-		checkCtx, cancel := context.WithTimeout(verifyCtx, secretAuditWitnessShipTimeout)
-		remoteHead, remoteOK, verifyErr := w.LastWitnessedHead(checkCtx, nodeID)
-		cancel()
-		if verifyErr == nil && remoteOK && strings.TrimSpace(remoteHead) == head {
-			secretAuditWitnessHealthy.Set(1)
-			return nil
-		}
-	}
+	last := s.lastWitnessShip()
+	lastLocal := strings.TrimSpace(last.HeadHex)
 	if ctx == nil {
 		ctx = context.Background()
+	}
+	// Read the witness before every ship, not only when the head is
+	// unchanged. A local receipt is not proof that the external store still
+	// has the acknowledgment; and a node whose head changed every interval
+	// used to ship without reading at all, so a head another writer put in
+	// its place was buried by the node's own next ship and seen only by an
+	// offline audit (D23). If the witness is missing or behind, the same
+	// idempotent head is re-submitted below rather than repair being
+	// suppressed forever.
+	checkCtx, cancel := context.WithTimeout(ctx, secretAuditWitnessShipTimeout)
+	remoteHead, remoteOK, verifyErr := w.LastWitnessedHead(checkCtx, nodeID)
+	cancel()
+	remoteHead = strings.TrimSpace(remoteHead)
+	if verifyErr == nil {
+		switch {
+		case lastLocal == head && remoteOK && remoteHead == head:
+			if !shippedBeforeUTCDay(last.ShippedAt, time.Now()) {
+				secretAuditWitnessHealthy.Set(1)
+				return nil
+			}
+			// The head is unchanged, but it was last written on an earlier
+			// UTC day: write it again. A day-keyed witness then has today's
+			// key, so an idle node's reads stay one GET instead of a missed
+			// GET plus a listing every tick, and an offline audit can tell an
+			// idle node from one that stopped shipping (D20).
+		case witnessHeadIsForeign(lastLocal, head, remoteHead, remoteOK):
+			// Nothing can delete from an Object Lock witness and its reads
+			// are consistent, so a head this node neither shipped last nor
+			// holds now was written by someone else: a shared node role, a
+			// duplicated SB_NODE_ID, or tampering. Count it before the ship
+			// below buries it (D18). A read error never gets here, so an S3
+			// blip pages no one.
+			secretAuditWitnessForeignHeads.Add(1)
+			if s.logger != nil {
+				s.logger.Warn("secret audit witness holds a head this node did not ship; re-shipping this node's head",
+					"node_id", nodeID, "witness_head", remoteHead, "witness_has_head", remoteOK,
+					"last_shipped_head", lastLocal, "local_head", head)
+			}
+		}
 	}
 	shipCtx, cancel := context.WithTimeout(ctx, secretAuditWitnessShipTimeout)
 	defer cancel()
@@ -256,6 +281,38 @@ func (s *Service) shipSecretAuditHeadNow(ctx context.Context) error {
 	}
 	secretAuditWitnessHealthy.Set(1)
 	return nil
+}
+
+// lastWitnessShip is this node's newest ship record: the tip sidecar when it
+// names a head, else the newest receipt line.
+func (s *Service) lastWitnessShip() witnessReceiptRecord {
+	if tip, err := readWitnessTip(s.secretAuditWitnessTipPath()); err == nil && tip.HeadHex != "" {
+		return tip
+	}
+	recs, _ := loadWitnessReceipts(s.secretAuditWitnessPath())
+	if len(recs) == 0 {
+		return witnessReceiptRecord{}
+	}
+	return recs[len(recs)-1]
+}
+
+// witnessHeadIsForeign reports whether the witness holds something other
+// than what this node put there: neither its last shipped head nor its
+// current one, including nothing at all after a ship. A node that never
+// shipped has nothing to compare with.
+func witnessHeadIsForeign(lastShipped, current, remote string, remoteOK bool) bool {
+	if lastShipped == "" {
+		return false
+	}
+	return !remoteOK || (remote != lastShipped && remote != current)
+}
+
+// shippedBeforeUTCDay reports whether a ship happened on an earlier UTC date
+// than now. A zero time is unknown, never "earlier": only receipts this
+// build wrote carry a ship time.
+func shippedBeforeUTCDay(shipped, now time.Time) bool {
+	const day = "2006-01-02"
+	return !shipped.IsZero() && shipped.UTC().Format(day) < now.UTC().Format(day)
 }
 
 func (s *Service) secretAuditWitnessPath() string {
@@ -362,9 +419,11 @@ func (s *Service) localWitnessReceiptHead() (string, error) {
 //   - a local receipt records a head this node shipped.
 //
 // Returning true means verification must fail. It cannot be recovered by
-// waiting: an operator who really did rebuild this node from scratch has to
-// clear the node's witnessed head (and the stale local receipt) deliberately,
-// which is the point — evidence loss is an event someone signs off on.
+// waiting, and an Object Lock witness cannot be told to forget the head: an
+// operator who really did rebuild this node from scratch brings it back
+// under a new SB_NODE_ID, which is the point — evidence loss is an event
+// someone signs off on, and the old id's locked history stays as the record
+// of it (D4).
 func (s *Service) emptyLocalChainIsErasure(remoteHead string, remoteOK bool) bool {
 	if remoteOK {
 		if h := strings.TrimSpace(remoteHead); h != "" && h != auditlog.GenesisPrevHash {
@@ -623,10 +682,29 @@ func (s *Service) ValidateSecretAuditWitness() error {
 		return fmt.Errorf("verify secret audit witness: %w", err)
 	}
 	if !ok {
+		if local == "" || local == auditlog.GenesisPrevHash {
+			return s.erasedChainError(witnessed)
+		}
 		return fmt.Errorf("secret audit witness mismatch: local_head=%q witnessed_head=%q", local, witnessed)
 	}
 	s.markSecretAuditWitnessValidated()
 	return nil
+}
+
+// erasedChainError explains a boot refused for an empty local chain that a
+// witness, or this node's own receipt, says once held records. The generic
+// mismatch text sent operators to clear the witnessed head, which an Object
+// Lock witness forbids for the lock period; the recovery that works is a new
+// node identity (D4).
+func (s *Service) erasedChainError(witnessed string) error {
+	remembered := strings.TrimSpace(witnessed)
+	if remembered == "" {
+		remembered, _ = s.localWitnessReceiptHead()
+	}
+	return fmt.Errorf("secret audit witness mismatch: the local audit log is empty, but node %q has witnessed head %q before: "+
+		"the log was deleted, or this node was rebuilt from an empty disk. The witness keeps every head it was sent, so a rebuilt "+
+		"node must come back under a new SB_NODE_ID (setup/runbooks/secrets-and-audit.md, \"Rebuild a node under a new SB_NODE_ID\"); "+
+		"if the log was deleted, treat it as tampering", s.witnessNodeID(), remembered)
 }
 
 // persistWitnessReceipt overwrites witness_tip.json and rewrites the receipts

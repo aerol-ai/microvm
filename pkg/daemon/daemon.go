@@ -20,6 +20,7 @@ import (
 
 	"github.com/aerol-ai/microvm/internal/cluster"
 	"github.com/aerol-ai/microvm/internal/config"
+	"github.com/aerol-ai/microvm/internal/identity"
 	"github.com/aerol-ai/microvm/internal/network/tap"
 	"github.com/aerol-ai/microvm/internal/observability"
 	vmmpool "github.com/aerol-ai/microvm/internal/pool/vmm"
@@ -31,8 +32,8 @@ import (
 	"github.com/aerol-ai/microvm/internal/version"
 	api "github.com/aerol-ai/microvm/pkg/api"
 	"github.com/aerol-ai/microvm/pkg/api/ingressproxy"
-	apiv1 "github.com/aerol-ai/microvm/pkg/api/v1"
 	"github.com/aerol-ai/microvm/pkg/auditexport"
+	"github.com/aerol-ai/microvm/pkg/auditwitness"
 	"github.com/aerol-ai/microvm/pkg/caddy"
 	"github.com/aerol-ai/microvm/pkg/capacity"
 	"github.com/aerol-ai/microvm/pkg/controlplane"
@@ -43,6 +44,7 @@ import (
 	"github.com/aerol-ai/microvm/pkg/oci"
 	"github.com/aerol-ai/microvm/pkg/secrets"
 	"github.com/aerol-ai/microvm/pkg/sshgateway"
+	"github.com/aerol-ai/microvm/pkg/toolboxhttp"
 	"github.com/aerol-ai/microvm/pkg/volumes"
 )
 
@@ -77,11 +79,21 @@ type ProviderFactory func(ctx context.Context, fc FleetConfig) (controlplane.Pro
 // makeProvider supplies the control-plane capabilities. nil (the open-source
 // default) means controlplane.Noop(): every non-PAT token rejected, every usage
 // report a no-op, every create admitted, no enforcement loop.
-func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory) error {
+func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory) (err error) {
+	// stop is the caller's context: cancelled only when the daemon is asked
+	// to stop (SIGTERM/SIGINT in the standard wrapper). Run derives its own
+	// cancellable child below, which a failed listener also cancels.
+	stop := ctx
+	defer func() { err = bootStopped(stop, err, logger) }()
+
 	cfg, err := config.Load()
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
 	}
+	// First, before any slow boot step: the watchdog reads "booting" from
+	// here on instead of "connection refused" (liveness.go).
+	live := startLiveness(cfg.LivenessSocket, logger)
+	defer live.stop()
 
 	cp := controlplane.Noop()
 	if makeProvider != nil {
@@ -96,6 +108,9 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 		}
 	}
 	cp = cp.WithDefaults()
+	if err := identityBootGuard(cfg, cp); err != nil {
+		return err
+	}
 
 	// Derive a cancellable child so a fatal failure in a background server
 	// goroutine (HTTP/ingress ListenAndServe) can trigger graceful shutdown by
@@ -104,6 +119,10 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	logger.Info("starting sandboxd", "version", version.Version, "addr", cfg.ListenAddr())
+	configureHostMediatedNodeGuard(cfg, logger)
+	// Before anything dials a toolbox: every toolbox connection is
+	// dialed with this bound.
+	toolboxhttp.SetDeadPeerTimeout(cfg.ToolboxDeadPeerTimeout)
 
 	otelTracesShutdown, err := observability.StartOTELTraces(ctx, logger, observability.OTELTracesConfig{
 		Enabled:     cfg.OTELTracesEnabled,
@@ -148,7 +167,15 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 	// Initialize the cipher before opening the database. Store startup may need
 	// it to transactionally seal plaintext env/toolbox values left by a
 	// pre-hardening release before any service begins reading the database.
-	cipher, err := secrets.NewCipher(cfg.CredentialEncryptionKey, cfg.CredentialEncryptionKeyPath)
+	// With wrapped custody the server key comes from the customer's key
+	// store, so its client (and the PKCS#11 helper) start first
+	// (plans/customer-key-custody.md §3).
+	keys, err := startKeyStore(ctx, cfg, logger)
+	if err != nil {
+		return err
+	}
+	defer keys.stop()
+	cipher, err := openServerKey(ctx, cfg, keys.wrapper, logger)
 	if err != nil {
 		return fmt.Errorf("initialize credential cipher: %w", err)
 	}
@@ -172,6 +199,10 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 	if rules.Enabled() {
 		netrules.WarnIfLegacyIptables(cfg.NetrulesBackend, logger)
 	}
+	logNetworkPolicyEnforcement(logger, cfg, rules.Enabled())
+	if prepareBlockSets(rules, netrules.ChainDockerUser, logger) {
+		defer startBlockSetReassert(ctx, rules, logger)()
+	}
 
 	dockerClient, err := docker.New(logger, cfg, rules)
 	if err != nil {
@@ -187,7 +218,7 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 		}
 	}
 	configureMirror(logger, cfg, dockerClient)
-	configureAOCRPullAuth(logger, cfg, dockerClient)
+	configureAOCRPullAuth(logger, cfg, models.ContainerEngineDocker, dockerClient)
 
 	caddyClient := caddy.New(cfg)
 
@@ -274,6 +305,9 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 		"memory_overprovision_factor", cfg.MemoryOverProvisionFactor,
 		"rss_watermark_ratio", cfg.FirecrackerRSSWatermarkRatio,
 	)
+	// The docker engine's sandbox bridge holds 1,023 ports; count them as a
+	// slot pool before any create or reservation replay can fill it.
+	wireDockerBridgeSlots(ctx, cfg, logger, dockerClient, admitter)
 
 	// dockerClient is passed twice: as the runtime.Runtime driver (the
 	// abstraction service uses for sandbox lifecycle) and as the concrete
@@ -291,12 +325,28 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 		return fmt.Errorf("start audit ingest: %w", err)
 	}
 	defer svc.StopAuditIngestServer()
+	// The open-source build's own witness (plans/open-audit-witness.md):
+	// SB_AUDIT_WITNESS_BACKEND fills the witness only when the provider
+	// brought none, the same precedence as the audit exporter below. It
+	// opens before the gate, so enterprise mode can be satisfied by the free
+	// download; with the setting unset nothing here talks to S3, and Open's
+	// boot checks refuse a bucket that would not really protect a head.
+	if !cp.HasExternalWitness() && cfg.AuditWitnessBackend != "" {
+		w, err := auditwitness.Open(ctx, cfg.AuditWitnessConfig())
+		if err != nil {
+			return fmt.Errorf("open audit witness: %w", err)
+		}
+		cp.Witness = w
+	}
 	if cfg.SecretAuditExternalWitness && !cp.HasExternalWitness() {
 		return errors.New("SB_SECRET_AUDIT_EXTERNAL_WITNESS=true requires a non-noop controlplane.Witness (tamper-evidence cannot be claimed from local JSONL alone)")
 	}
+	keys.handTo(svc)
 	if err := svc.ConfigureSecretProvider(ctx); err != nil {
 		return fmt.Errorf("configure secret provider: %w", err)
 	}
+	svc.RecordKeyCustody()
+	service.PublishKeyCustody(cfg, keys.custodyFacts())
 	svc.SetDockerAuxClient(dockerClient)
 	var ctdWiring *containerdEngineWiring
 	if ctd, err := wireContainerEngine(ctx, cfg, logger, svc, db, dockerClient, rules, admitter); err != nil {
@@ -338,9 +388,11 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 	if dockerWarmPool != nil {
 		defer func() { drainDockerWarmPool(dockerWarmPool, logger) }()
 	}
-	if netnsPool := wireDockerNetnsPool(ctx, cfg, logger, dockerClient); netnsPool != nil {
+	netnsPool := wireDockerNetnsPool(ctx, cfg, logger, dockerClient)
+	if netnsPool != nil {
 		defer netnsPool.Stop(context.WithoutCancel(ctx))
 	}
+	wireDockerOwnPause(ctx, cfg, dockerClient, rules.Enabled(), netnsPool != nil, time.Now())
 	// Start the standing-driven enforcement loop. EnforcementFor binds the loop
 	// to the service as its FleetController; under Noop() the factory yields a
 	// no-op whose Start does nothing. Runs on the daemon's cancellable ctx so it
@@ -395,6 +447,21 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 		fcDriver.SetRootfsBuilder(&firecrackerRootfsAdapter{inner: ociBuilder})
 		fcDriver.SetTapHost(&firecrackerTapHostAdapter{inner: tap.NewHost(cfg.FirecrackerIPBinary)})
 		fcDriver.SetVsockDialer(fcruntime.NewLinuxVsockDialer())
+		// Snapshots (CreateSnapshot) go into the node's container engine,
+		// and a cold boot pulls a snapshot another node pushed with the
+		// cluster PAT, the same credential the engines use.
+		if store := newFirecrackerImageStore(cfg, dockerClient, ctdWiring); store != nil {
+			fcDriver.SetImageStore(store)
+		}
+		configureAOCRPullAuth(logger, cfg, "firecracker", fcDriver)
+		// Not fatal: a node that booted before this keeps booting. Without
+		// it the guests have no NAT and the driver no firewall, so the
+		// service keeps refusing their egress options (501).
+		if stopFCEgress, err := wireFirecrackerEgress(ctx, cfg, logger, fcDriver); err != nil {
+			logger.Error("firecracker egress: guests get no NAT or egress policies", "error", err)
+		} else {
+			defer stopFCEgress()
+		}
 		// Phase 5: hand the sampler to the driver so Create / WarmSpawn
 		// / tryAcquireWarm / Destroy can Register/Unregister per-VMM
 		// pids. Without this call the sampler stays empty and the
@@ -402,6 +469,16 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 		// the same "no data, allow" cold-start behaviour the watermark
 		// check already protects against.
 		fcDriver.SetRSSSampler(rssSampler)
+		// The VMs a previous sandboxd left running (a restart or upgrade
+		// does not stop them). Before the warm pool fills and before the
+		// first reconcile, which reaps a started sandbox whose VM the
+		// driver does not know.
+		if n := fcDriver.AdoptRunningVMs(ctx, firecrackerVMKeeper(db)); n > 0 {
+			logger.Info("firecracker: running VMs taken over from the previous sandboxd", "vms", n)
+		}
+		// After the adoption, which kills a snapshot's helper VM a crash
+		// left running, so its dir can go.
+		fcDriver.SweepSnapshotExports()
 		// Phase 6 PR-A: warm-spawn corruption notifier. WarmSpawn runs
 		// outside any service-side call, so the runtime needs a back-
 		// channel to flip a corrupt template to unhealthy + kick rebuild.
@@ -600,6 +677,16 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 				})
 			}
 		}
+		// Capability-aware placement (plans/egress-domain-filtering.md CEO
+		// D20): our own lease advertises whether hostname-filtered creates
+		// can be attached here. Always registered; false while the gateway
+		// is off, down or not yet synced.
+		if withEgress, ok := clusterClient.(interface {
+			SetEgressGatewayReadyProvider(func() bool)
+		}); ok {
+			withEgress.SetEgressGatewayReadyProvider(svc.EgressGatewayReady)
+		}
+		registerSlotPoolsProvider(cfg, clusterClient, svc.LocalSlotPools)
 		if cfg.EnableWasm && cfg.IsWorker() {
 			if withModules, ok := clusterClient.(interface {
 				SetLocalWasmModuleIDsProvider(func() ([]string, bool))
@@ -619,6 +706,11 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 			"peers", cfg.BootstrapPeers,
 		)
 	}
+
+	// The IPv6 fence (internal/network/ipv6fence): synced once here, before
+	// the API serves, so no container or Firecracker sandbox is created
+	// without it; while it is not installed those creates are refused.
+	wireIPv6Fence(ctx, cfg, svc, dockerClient, logger)
 
 	// Bootstrap caddy-l4 at boot so the first L4 exposure isn't paying for
 	// it. Best-effort by design: a cold-started caddy may still be coming
@@ -645,6 +737,11 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 		hostPortForwarder = newHostPortForwarder(logger)
 	}
 	routingBoot := startIngressRouting(ctx, cfg, svc, hostPortForwarder, logger)
+	wireEgressOperator(ctx, cfg, svc, logger)
+	wireEgressGateway(ctx, cfg, svc, dockerClient, logger)
+	// After the gateway is wired: whether its ports are open depends on it.
+	wireNodeGuard(ctx, cfg, svc)
+	wireEgressProfiles(ctx, cfg, svc)
 	ownerReasserted := !cfg.IsWorker()
 	// Bootstrap the netstats poller at boot so the first /network/usage call
 	// doesn't pay for it. Best-effort by design — failure here just means
@@ -783,6 +880,7 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 			svc.StartReconcileLoop(ctx)
 		}
 		svc.StartLifecycleSweep(ctx)
+		svc.StartDiskLimitWatch(ctx)
 		svc.StartEventMonitor(ctx)
 		svc.StartBuiltImageGC(ctx)
 		// Opt-in live CPU/memory sampler. No-op unless a usage reporter is wired
@@ -889,6 +987,9 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 		if err != nil {
 			return fmt.Errorf("create ssh gateway: %w", err)
 		}
+		// A key revoke ends every SSH session: each holds a toolbox token
+		// opened before it (plans/customer-key-custody.md §10).
+		svc.OnKeyRevoked(gw.CloseAll)
 		go func() {
 			if err := gw.Start(ctx); err != nil {
 				logger.Warn("ssh gateway stopped", "error", err)
@@ -907,11 +1008,26 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 	// cp.Validator is the second-token (non-PAT) validation path. Under
 	// controlplane.Noop() it rejects every non-PAT token, so the server
 	// behaves exactly as the PAT-only build did before this seam existed.
-	var builder apiv1.ImageBuilder
+	var builder service.ImageBuilder
 	if apiBuilder != nil {
 		builder = apiBuilder
 	}
-	server := api.NewServer(logger, svc, dockerClient, builder, cfg, cfg.PATToken, cp.Validator)
+	// Scoped API tokens (plans/identity-and-access.md §5.4). With identity
+	// off this does nothing and NewServer drops the authenticator, so the
+	// server is byte for byte the PAT-only one (L8). With it on: a single
+	// node loads its tokens into memory, a Raft server reads its FSM, and
+	// any other cluster node starts its token mirror.
+	if err := svc.StartAPITokens(ctx); err != nil {
+		return err
+	}
+	// The chain runs the avm_ token authenticator before the OIDC verifier
+	// (§5.2). The verifier and the sign-in discovery issuers are wired only
+	// when an identity file is configured (SB_IDENTITY_FILE).
+	serverOpts := []api.ServerOption{
+		api.WithCredentialAuthenticator(controlplane.PrincipalToken, identity.NewTokenAuthenticator(svc.APITokenLookup(), logger)),
+	}
+	serverOpts = append(serverOpts, wireIdentityFile(ctx, cfg, svc, logger)...)
+	server := api.NewServer(logger, svc, dockerClient, builder, cfg, cfg.PATToken, cp.Validator, serverOpts...)
 	logger.Info("dashboard available", "url", "http://"+cfg.ListenAddr()+"/ui")
 	// Mount the same API handler onto the cluster-internal mTLS listener so
 	// peers can reverse-proxy owner API calls over the cert-pinned channel
@@ -920,6 +1036,20 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 	// keeps working unchanged.
 	if cfg.EnableCluster {
 		svc.Cluster().AttachInternalHandler(server.Handler())
+	}
+	logPATBootSettings(logger, cfg)
+	// SB_PAT_SCOPE=host: Caddy's own listener, where every request is public
+	// (plans/identity-and-access.md §5.11). Opened before the API listener
+	// so a socket that cannot be made with its owners and modes fails the
+	// boot cleanly. Off (the default), nothing is opened.
+	var publicServer *http.Server
+	var publicLn net.Listener
+	if cfg.PATScopeHostOnly() {
+		publicLn, err = listenPublicAPISocket(cfg.PublicAPISocket, publicAPISocketGroup)
+		if err != nil {
+			return err
+		}
+		publicServer = newPublicAPIServer(server.PublicHandler())
 	}
 	httpServer := &http.Server{
 		Addr:              cfg.ListenAddr(),
@@ -930,14 +1060,32 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 		// keep-alive connections sitting between requests, so it can't
 		// kill an in-flight stream but does bound idle-connection buildup.
 		IdleTimeout: 2 * time.Minute,
+		Protocols:   apiListenerProtocols(),
 	}
 
+	// The API server's own background work (the auth_denied flush) runs
+	// from here to StopBackground at shutdown; nothing when api records
+	// are off.
+	server.StartBackground(ctx)
 	go func() {
 		if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			logger.Error("sandboxd stopped unexpectedly", "error", err)
 			cancel()
 		}
 	}()
+	// The revoke re-check (wrapped custody only) starts once the API is up;
+	// it runs on the key store's background budget, never a create's.
+	svc.StartKeyCustody(ctx)
+	live.setPhase(livenessPhaseServing)
+	if publicServer != nil {
+		logger.Info("public API socket listening", "path", cfg.PublicAPISocket)
+		go func() {
+			if err := publicServer.Serve(publicLn); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				logger.Error("public API socket stopped unexpectedly", "error", err)
+				cancel()
+			}
+		}()
+	}
 
 	// Wake-aware HTTP ingress proxy: a loopback-only listener Caddy
 	// dials when forwarding a wake-aware port route. Stood up when
@@ -1047,6 +1195,7 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 	}
 
 	<-ctx.Done()
+	live.setPhase(livenessPhaseStopping)
 	logger.Info("shutting down sandboxd")
 
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
@@ -1059,11 +1208,20 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 	if err := httpServer.Shutdown(shutdownCtx); err != nil {
 		logger.Warn("graceful shutdown failed", "error", err)
 	}
+	if publicServer != nil {
+		if err := publicServer.Shutdown(shutdownCtx); err != nil {
+			logger.Warn("public API socket graceful shutdown failed", "error", err)
+		}
+	}
 	if ingressServer != nil {
 		if err := ingressServer.Shutdown(shutdownCtx); err != nil {
 			logger.Warn("ingress proxy graceful shutdown failed", "error", err)
 		}
 	}
+	// The API listeners are drained: write the auth_denied records still
+	// owed for folded 401s (those of the drain included) before the audit
+	// writer closes.
+	server.StopBackground()
 	// Drain any pending Caddy admin writes before the process exits so
 	// the last batch of route changes is not silently dropped. No-op on
 	// nodes that never started the coalescer.
@@ -1232,11 +1390,24 @@ func configureMirror(logger *slog.Logger, cfg config.Config, c *docker.Client) {
 	)
 }
 
-// configureAOCRPullAuth installs the cluster-PAT credential the docker client
+// aocrPullAuthConfigurer is the one method both container engines expose for
+// the node-local AOCR pull credential: *docker.Client (dockerd) and the native
+// containerd driver. Taking the interface keeps a single wiring helper, so the
+// two engines can never be configured from different host/cluster/PAT inputs.
+type aocrPullAuthConfigurer interface {
+	ConfigureAOCRPullAuth(hosts []string, clusterID, patPath string)
+}
+
+// configureAOCRPullAuth installs the cluster-PAT credential a container engine
 // uses to pull cluster-owned artifacts (snapshots + Firecracker templates) from
 // AOCR's `cluster/<id>/*` namespace. It reuses the same host/cluster/PAT config
 // as the producer-side snapshot and template pushers, so one credential covers
-// push and pull symmetrically.
+// push and pull symmetrically. engine only labels the boot log line.
+//
+// Called twice on a containerd node: once for the docker client (it still
+// serves Firecracker template pulls and pre-flip engine=docker sandboxes) and
+// once for the containerd driver, from wireContainerEngine. Missing the second
+// call is the bug that made cross-node create-from-snapshot 401 on containerd.
 //
 // Deliberately independent of SnapshotPushEnabled: a consume-only node (one that
 // never produces artifacts but must pull snapshots/templates on failover or
@@ -1245,11 +1416,11 @@ func configureMirror(logger *slog.Logger, cfg config.Config, c *docker.Client) {
 // wiring keeps pulling anonymously exactly as before.
 //
 // This call itself runs once at boot and adds nothing to the create path. The
-// only per-create cost it introduces lands later, in resolveAOCRPullAuth: a
-// single node-local PAT file read, and only on a cache-miss pull of an AOCR
+// only per-create cost it introduces lands later, in docker.AOCRPullAuth.Resolve:
+// a single node-local PAT file read, and only on a cache-miss pull of an AOCR
 // `cluster/...` ref (warm pulls, non-AOCR refs, and caller-supplied creds all
 // skip it). The fresh read is deliberate — it makes PAT rotation a file write.
-func configureAOCRPullAuth(logger *slog.Logger, cfg config.Config, c *docker.Client) {
+func configureAOCRPullAuth(logger *slog.Logger, cfg config.Config, engine string, c aocrPullAuthConfigurer) {
 	clusterID := strings.TrimSpace(cfg.AutoImportClusterID)
 	patPath := strings.TrimSpace(cfg.AutoImportClusterPATPath)
 	if clusterID == "" || patPath == "" {
@@ -1262,6 +1433,7 @@ func configureAOCRPullAuth(logger *slog.Logger, cfg config.Config, c *docker.Cli
 	hosts := []string{cfg.MirrorPushHost, cfg.ImageDistributionAOCRHost}
 	c.ConfigureAOCRPullAuth(hosts, clusterID, patPath)
 	logger.Info("aocr pull auth configured",
+		"engine", engine,
 		"cluster_id", clusterID,
 		"hosts", strings.Join(nonEmptyHosts(hosts), ","),
 	)
@@ -1432,31 +1604,29 @@ func startSnapshotPushReconciler(ctx context.Context, logger *slog.Logger, cfg c
 		"interval", cfg.SnapshotPushReconcileInterval,
 		"max_in_flight", cfg.SnapshotPushMaxInFlight,
 	)
-	go func() {
-		t := time.NewTicker(cfg.SnapshotPushReconcileInterval)
-		defer t.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-t.C:
-				stats, err := r.RunOnce(ctx)
-				if err != nil {
-					logger.Warn("snapshot push reconcile sweep failed", "error", err)
-					continue
-				}
-				if stats.Scanned == 0 {
-					continue
-				}
-				logger.Info("snapshot push reconcile sweep",
-					"scanned", stats.Scanned,
-					"succeeded", stats.Succeeded,
-					"failed", stats.Failed,
-					"skipped", stats.Skipped,
-				)
-			}
-		}
-	}()
+	// The node's one snapshot push worker: the ticker and every create's
+	// Kick both feed it, and it never runs two sweeps at once.
+	go r.Run(ctx, cfg.SnapshotPushReconcileInterval, func(stats service.SnapshotPushReconcileStats, err error) {
+		logSnapshotPushSweep(logger, stats, err)
+	})
+}
+
+func logSnapshotPushSweep(logger *slog.Logger, stats service.SnapshotPushReconcileStats, err error) {
+	if err != nil {
+		logger.Warn("snapshot push reconcile sweep failed", "error", err)
+		return
+	}
+	if stats.Scanned == 0 && stats.Retired == 0 && stats.RetireFailed == 0 {
+		return
+	}
+	logger.Info("snapshot push reconcile sweep",
+		"scanned", stats.Scanned,
+		"succeeded", stats.Succeeded,
+		"failed", stats.Failed,
+		"skipped", stats.Skipped,
+		"retired", stats.Retired,
+		"retire_failed", stats.RetireFailed,
+	)
 }
 
 // startTemplateRotationReconciler kicks off the Phase 6 PR-E rotation
@@ -1605,31 +1775,25 @@ func startTemplateArtifactPushReconciler(ctx context.Context, logger *slog.Logge
 		"interval", cfg.SnapshotPushReconcileInterval,
 		"max_in_flight", cfg.SnapshotPushMaxInFlight,
 	)
-	go func() {
-		t := time.NewTicker(cfg.SnapshotPushReconcileInterval)
-		defer t.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-t.C:
-				stats, err := r.RunOnce(ctx)
-				if err != nil {
-					logger.Warn("template push reconcile sweep failed", "error", err)
-					continue
-				}
-				if stats.Scanned == 0 {
-					continue
-				}
-				logger.Info("template push reconcile sweep",
-					"scanned", stats.Scanned,
-					"succeeded", stats.Succeeded,
-					"failed", stats.Failed,
-					"skipped", stats.Skipped,
-				)
-			}
-		}
-	}()
+	go r.Run(ctx, cfg.SnapshotPushReconcileInterval, func(stats service.TemplateArtifactPushStats, err error) {
+		logTemplatePushSweep(logger, stats, err)
+	})
+}
+
+func logTemplatePushSweep(logger *slog.Logger, stats service.TemplateArtifactPushStats, err error) {
+	if err != nil {
+		logger.Warn("template push reconcile sweep failed", "error", err)
+		return
+	}
+	if stats.Scanned == 0 {
+		return
+	}
+	logger.Info("template push reconcile sweep",
+		"scanned", stats.Scanned,
+		"succeeded", stats.Succeeded,
+		"failed", stats.Failed,
+		"skipped", stats.Skipped,
+	)
 }
 
 // autoImportSpecResolver adapts the service+cluster surface to the
@@ -1729,19 +1893,31 @@ func readBypassMarker(path string) bool {
 // cluster placement and every gVisor create is rejected with
 // ErrNoPlacementTarget (the same class of bug the firecracker/wasm flags fixed).
 // shouldStartSSHGateway decides whether this node binds the per-sandbox SSH
-// gateway. Workers run it because they own sandboxes locally. The ingress runs
-// it too: the public SSH endpoint (SB_SSH_LISTEN_ADDR, default :2220) and the
-// wildcard DNS both point at the ingress, so without a gateway there every
-// `ssh sandbox.<domain>` lands on a closed port (cluster-hetero UC-43/67:
-// "connection refused"). An ingress-hosted gateway bridges to the owning node
-// via Config.RemoteAPIBaseURL exactly like the worker path, so a connection for
-// a sandbox the ingress doesn't own is forwarded, not dropped.
-//
-// Multi-ingress note: every ingress that binds the gateway must present the
-// same SSH host key (SB_SSH_HOST_KEY_PATH material shared across ingress nodes)
-// or clients see host-key churn as they round-robin between ingress IPs.
+// gateway. The rule lives on config.Config.RunsSSHGateway so /health probes
+// the gateway on exactly the nodes that start it.
 func shouldStartSSHGateway(cfg config.Config) bool {
-	return cfg.EnableSSHGateway && (cfg.IsWorker() || cfg.IsIngress())
+	return cfg.RunsSSHGateway()
+}
+
+// registerSlotPoolsProvider overlays this node's network-slot pools
+// (containerd netns, docker bridge, Firecracker TAP, capped WASM instances)
+// onto its own capacity lease, matching what peers read from /v1/capacity,
+// so placement skips the node for a runtime whose pool is full. Only a node
+// that can own sandboxes has pools; a client without the hook (the Agent,
+// Noop) is left alone.
+func registerSlotPoolsProvider(cfg config.Config, client any, pools func(context.Context) []capacity.SlotPool) {
+	if !cfg.IsWorker() || pools == nil {
+		return
+	}
+	withSlots, ok := client.(interface {
+		SetLocalSlotPoolsProvider(func() []capacity.SlotPool)
+	})
+	if !ok {
+		return
+	}
+	withSlots.SetLocalSlotPoolsProvider(func() []capacity.SlotPool {
+		return pools(context.Background())
+	})
 }
 
 func supportedRuntimesForConfig(cfg config.Config) []string {
@@ -1866,6 +2042,7 @@ func (a *firecrackerRootfsAdapter) Build(ctx context.Context, req fcruntime.Root
 	}
 	res, err := a.inner.Build(ctx, oci.BuildRequest{
 		ImageRef:    req.ImageRef,
+		Auth:        req.Auth,
 		OutPath:     req.OutPath,
 		MinSizeMiB:  req.MinSizeMiB,
 		Tag:         req.Tag,
@@ -1925,6 +2102,9 @@ type templateBuilderAdapter struct {
 
 func (a *templateBuilderAdapter) Build(ctx context.Context, req service.TemplateBuildRequest) (*service.TemplateBuildResult, error) {
 	var inject []oci.InjectFile
+	// No token, on purpose: the template's disk and snapshot are shared by
+	// every sandbox booted from it, so its agent boots token-less, serves
+	// nothing, and is adopted per sandbox over vsock (the driver's adopt op).
 	for _, f := range fcruntime.ColdBootInjectFiles(a.toolboxBinaryPath, "", nil) {
 		inject = append(inject, oci.InjectFile{
 			HostPath:  f.HostPath,

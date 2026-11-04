@@ -244,9 +244,42 @@ type fakeQuiesceOps struct {
 	reseedCalls   int
 	wallclockArgs []int64
 	networkArgs   []guestNetworkConfig
+	syncCalls     int
 	reseedErr     error
 	wallclockErr  error
 	networkErr    error
+	syncErr       error
+	// calls records FreezeRoot / ThawRoot in order.
+	calls     []string
+	freezeErr error
+	thawErr   error
+}
+
+func (f *fakeQuiesceOps) SyncFilesystems() error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.syncCalls++
+	return f.syncErr
+}
+
+func (f *fakeQuiesceOps) FreezeRoot() error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, "freeze")
+	return f.freezeErr
+}
+
+func (f *fakeQuiesceOps) ThawRoot() error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, "thaw")
+	return f.thawErr
+}
+
+func (f *fakeQuiesceOps) recorded() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.calls...)
 }
 
 func (f *fakeQuiesceOps) ReseedRandom() error {

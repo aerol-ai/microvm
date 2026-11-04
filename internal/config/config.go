@@ -3,7 +3,6 @@ package config
 import (
 	"errors"
 	"fmt"
-	"github.com/aerol-ai/microvm/pkg/auditexport"
 	"net"
 	"net/url"
 	"os"
@@ -15,7 +14,13 @@ import (
 	"strings"
 	"time"
 
+	"github.com/aerol-ai/microvm/pkg/auditexport"
+	"github.com/aerol-ai/microvm/pkg/auditwitness"
+	"github.com/aerol-ai/microvm/pkg/identitywire"
+
 	"github.com/aerol-ai/microvm/pkg/models"
+	"github.com/aerol-ai/microvm/pkg/secrets"
+	"github.com/aerol-ai/microvm/pkg/toolboxhttp"
 )
 
 // snapshotRetentionSuffixPattern validates SB_SNAPSHOT_PUSH_TAG_SUFFIX. It
@@ -141,6 +146,28 @@ type Config struct {
 	CreateSandboxTimeoutSeconds int
 	ContainerPrivileged         bool
 	ResourceLimitsOff           bool
+	// SandboxPidsLimit caps the processes and threads of each container
+	// sandbox (SB_SANDBOX_PIDS_LIMIT, default 4096; 0 is unlimited). Without
+	// it one sandbox's fork bomb exhausts the node for every tenant. A gVisor
+	// sandbox is capped inside its own kernel instead, at this or one task
+	// per MiB of its memory if lower, and its host cgroup gets the room the
+	// sentry needs at that cap (pkg/gvisorpids).
+	SandboxPidsLimit int
+	// SandboxInterconnect lets sandboxes on one node connect to each other
+	// (SB_SANDBOX_INTERCONNECT, default false). Isolated by default: one
+	// tenant's sandbox cannot reach another's listeners.
+	SandboxInterconnect bool
+	// SandboxNodePortsAllow are node ports every sandbox on this node may
+	// reach on top of the node guard's own allowlist
+	// (SB_SANDBOX_NODE_PORTS_ALLOW, default empty; refused in enterprise
+	// mode). Sandboxes are default-denied from the node they run on.
+	SandboxNodePortsAllow []SandboxNodePort
+	// DiskLimitCheckInterval is how often the disk watchdog checks each
+	// container sandbox's writable layer against its DiskGB
+	// (SB_DISK_LIMIT_CHECK_INTERVAL, default 15s; 0 turns it off). The
+	// engines do not enforce DiskGB on a stock root filesystem, so without
+	// it one sandbox can fill the node's disk for every tenant.
+	DiskLimitCheckInterval time.Duration
 	// Runtime is the host default container runtime for new sandboxes.
 	// Per-sandbox CreateSandboxRequest.Runtime overrides it. Allowed values
 	// are "docker" (default), "gvisor", or "kata"; validation lives in Load().
@@ -208,10 +235,46 @@ type Config struct {
 	AutoReconcile                bool
 	EnableCaddy                  bool
 	EnableNetworkRules           bool
+	// AllowUnenforcedNetworkPolicy lets a container sandbox keep a network
+	// policy (block-all, address lists, hostname rules, byte caps) on a node
+	// whose host firewall is off (SB_ENABLE_NETWORK_RULES=false, or not a
+	// Linux host), where nothing enforces it. Off, those creates and updates
+	// are refused (501): a control the API accepts but does not enforce is
+	// worse than one it refuses. For local development only; enterprise mode
+	// refuses it. SB_ALLOW_UNENFORCED_NETWORK_POLICY.
+	AllowUnenforcedNetworkPolicy bool
 	// NetrulesBackend selects the RuleBackend for DOCKER-USER rules:
 	// "netlink" (default, google/nftables) or "exec" (go-iptables). See
 	// plans/warm-create-latency-tier1.md Phase 1. SB_NETRULES_BACKEND.
-	NetrulesBackend    string
+	NetrulesBackend string
+	// EgressFQDNEnabled turns on hostname egress filtering through the
+	// egress-gateway process (plans/egress-domain-filtering.md, CEO D25).
+	// Inert until a sandbox uses a hostname rule. Off means hostname
+	// policies get 501. SB_EGRESS_FQDN_ENABLED.
+	EgressFQDNEnabled bool
+	// EgressGatewaySocket is the gateway's UDS (SB_EGRESS_GATEWAY_SOCKET).
+	EgressGatewaySocket string
+	// EgressProcidSocket is where sandboxd answers the gateway's executable
+	// lookups for per-binary rules (SB_EGRESS_PROCID_SOCKET); empty turns
+	// them off (the rules' flows are then refused).
+	EgressProcidSocket string
+	// EgressGatewayUser is the gateway's system user, the only peer the
+	// lookup socket answers (SB_EGRESS_GATEWAY_USER).
+	EgressGatewayUser string
+	// EgressOperatorFile is the private-cloud operator policy (§5.10,
+	// SB_EGRESS_OPERATOR_FILE). Empty keeps today's behavior.
+	EgressOperatorFile string
+	// EgressProfileApplyQPS bounds how many sandboxes per second this node
+	// re-applies after an egress profile changes, so one profile edit can't
+	// flood the gateway and firewall (SB_EGRESS_PROFILE_APPLY_QPS, D21).
+	EgressProfileApplyQPS int
+	// EgressDNSPort and EgressProxyPort are the egress gateway's listener
+	// ports (SB_EGRESS_DNS_PORT, SB_EGRESS_PROXY_PORT, the same names and
+	// defaults the gateway reads from egress-gateway.env). The node guard
+	// opens them to sandboxes when the gateway runs here, until the gateway
+	// reports the ports it really listens on.
+	EgressDNSPort      int
+	EgressProxyPort    int
 	EnableEventMonitor bool
 	EnableSSHGateway   bool
 	// EnableServerless gates wake behavior for sandboxes created with
@@ -249,6 +312,17 @@ type Config struct {
 	// TLSOnDemandInterval is the daemon-side on-demand TLS issuance budget
 	// refill interval. Default 1m.
 	TLSOnDemandInterval time.Duration
+	// TLSACMECA is the ACME directory URL the on-demand TLS policy issues
+	// from (SB_TLS_ACME_CA): a bank PKI or step-ca on a network with no
+	// route to Let's Encrypt or ZeroSSL (plans/egress-domain-filtering.md
+	// §5.10 PC-5). Empty keeps the public CAs.
+	TLSACMECA string
+	// TLSACMECARoot is a PEM file of roots Caddy trusts when it talks to
+	// TLSACMECA (SB_TLS_ACME_CA_ROOT). Absolute path.
+	TLSACMECARoot string
+	// TLSIssuer selects the on-demand policy's issuer (SB_TLS_ISSUER):
+	// "acme" (default) or "internal", Caddy's own CA, for labs.
+	TLSIssuer string
 	// ACMEDaemonBudgetFraction is the high-water mark on the daemon-wide
 	// ACME issuance bucket — when usage crosses this fraction of Let's
 	// Encrypt's published `new-orders` limit (300 / 3h), TLSAsk returns
@@ -383,6 +457,19 @@ type Config struct {
 	SSHHostKeyPath              string
 	CredentialEncryptionKey     string
 	CredentialEncryptionKeyPath string
+	// CredentialKeyCustody is how the server key is kept at rest: "file"
+	// (default; plaintext in the env or the key file, today's behavior) or
+	// "wrapped" (wrapped by SB_SECRET_PROVIDER and unwrapped at boot, so no
+	// plaintext copy lives on disk; plans/customer-key-custody.md §3).
+	// SB_CREDENTIAL_KEY_CUSTODY.
+	CredentialKeyCustody string
+	// CredentialKeyWrappedPath is the wrapped server-key file used when
+	// CredentialKeyCustody=wrapped. SB_CREDENTIAL_ENCRYPTION_KEY_WRAPPED_PATH.
+	CredentialKeyWrappedPath string
+	// CredentialKeyRingPath is custody=file's server-key ring, written by
+	// `sandboxd key rotate` (plans/customer-key-custody.md §13).
+	// SB_CREDENTIAL_KEY_RING_PATH; empty means KeyRingPath's default.
+	CredentialKeyRingPath       string
 	MountsRootPath              string
 	MountsCredentialsRuntimeDir string
 	MountWaitTimeout            time.Duration
@@ -427,6 +514,15 @@ type Config struct {
 	// DockerNetnsPoolRefillInterval drives the refill/reap loop.
 	// SB_DOCKER_NETNS_POOL_REFILL_INTERVAL.
 	DockerNetnsPoolRefillInterval time.Duration
+	// DockerBridgeSlots caps how many docker-engine sandboxes (and parked
+	// warm containers) this node runs on its sandbox bridge; past it a
+	// create is a 503 capacity refusal instead of dockerd failing the start
+	// on a bridge whose 1,023 ports are all taken. 0 (the default) derives
+	// it at boot from the network: min(1,023 bridge ports, the subnet's
+	// usable addresses), minus headroom for what attaches without a
+	// reservation and minus the pause-netns pool. A set value is clamped to
+	// what the network holds. SB_DOCKER_BRIDGE_SLOTS.
+	DockerBridgeSlots int
 	// DockerToolboxLoopback publishes each Docker sandbox's toolbox port on
 	// 127.0.0.1 (a Docker-assigned host port, nothing else published) and has
 	// sandboxd reach toolboxd there instead of at ContainerIP:ToolboxPort.
@@ -438,6 +534,13 @@ type Config struct {
 	ReconcileInterval     time.Duration
 	NetstatsPollInterval  time.Duration
 	UploadMaxBytes        int64
+	// ToolboxDeadPeerTimeout bounds how long a toolbox connection (an exec,
+	// a file transfer, a session) lives on once its sandbox stops answering
+	// without closing it, as a killed gVisor sandbox or Firecracker VM does.
+	// A live sandbox's kernel answers the keepalive probes, so a long command
+	// with no output is never cut. SB_TOOLBOX_DEAD_PEER_TIMEOUT, default 30s;
+	// 0 = off (Go's keepalive, about 2.5 minutes); otherwise at least 6s.
+	ToolboxDeadPeerTimeout time.Duration
 	// OTELMetricsEnabled starts a native OTLP/HTTP metric exporter that bridges
 	// the daemon's aerolvm_* expvars into OpenTelemetry observations. It is
 	// also enabled automatically when SB_OTEL_METRICS_ENDPOINT is set.
@@ -1038,6 +1141,16 @@ type Config struct {
 	// See plans/data-plane-load-balancer.md.
 	// SB_INGRESS_ADVERTISE_HOST.
 	IngressAdvertiseHost string
+	// L4PublicHost is the host name clients dial for a raw-TCP exposure
+	// (the L4 host-port pool). Empty keeps the old target: SB_DOMAIN, else
+	// the public host. It exists for a domain that points at a load
+	// balancer which cannot carry the pool: an AWS Network Load Balancer
+	// has at most 50 listeners and the pool is 1,001 ports, so with
+	// Terraform's api_load_balancer = "nlb" the domain reaches the
+	// balancer and raw TCP keeps reaching the ingress nodes directly under
+	// tcp.<domain>. Only the advertised URL and host change; the pool, the
+	// allocator and the routes do not. SB_L4_PUBLIC_HOST.
+	L4PublicHost string
 	// ClusterShardAwareIngress confirms that the public ingress router is
 	// shard-aware when the live ingress tier is larger than
 	// cluster.MaxReplicatedIngressRouteNodes. Above that size, each ingress
@@ -1055,6 +1168,15 @@ type Config struct {
 	// §3.2). On ingress nodes the resolver routes *.rt.internal here.
 	// SB_ROUTE_DNS_ADDR.
 	RouteDNSAddr string
+	// RouteDNSLinkAddr is a second responder listener, on the address of the
+	// node's aerolvm-rt link, where the system resolver sends *.rt.internal.
+	// systemd-resolved pins its socket for a link's DNS server to that link,
+	// so a UDP query to the loopback address goes out the dummy link and is
+	// dropped; resolved then stalls every lookup for about 20s while it falls
+	// back to TCP, and does it again each time it re-probes. install.sh sets
+	// it with --ingress-proxy-routing. Empty: no second listener.
+	// SB_ROUTE_DNS_LINK_ADDR.
+	RouteDNSLinkAddr string
 	// HostPortRedirectPort is the sandboxd listener that raw-TCP host ports
 	// are REDIRECTed to under ingress proxy routing when the kernel can't
 	// DNAT them straight to the sandbox (stopped serverless sandboxes to
@@ -1116,16 +1238,60 @@ type Config struct {
 	SecretRecipientBackupCount int
 
 	// SecretProvider selects the secrets.Provider backend: "local" (default —
-	// node-local AES key, never contacts AWS/Vault), "awskms", or "vault".
-	// The off-state is local, not "no provider". SB_SECRET_PROVIDER.
+	// node-local AES key, never contacts a key store), "awskms", "vault" or
+	// "pkcs11". The off-state is local, not "no provider". SB_SECRET_PROVIDER.
 	SecretProvider string
 	// SecretAWSkmsKeyID is the CMK id/arn/alias used when SecretProvider=awskms.
+	// Set with another provider, the node still opens AWS KMS rows (step 1 of
+	// a provider switch, plans/customer-key-custody.md §12).
 	// SB_SECRET_AWS_KMS_KEY_ID.
 	SecretAWSkmsKeyID string
-	// SecretProviderStrictBoot fails daemon start when the awskms boot canary
-	// (wrap/unwrap) fails. Default false = fail-open with a warning (E4 lite).
-	// SB_SECRET_PROVIDER_STRICT_BOOT.
+	// Vault Transit / OpenBao settings for SecretProvider=vault
+	// (plans/customer-key-custody.md §1). Set with another provider, the node
+	// already opens vault rows. No Vault login code: TokenFile is written by
+	// Vault Agent, or Addr points at Agent's local API proxy.
+	// SB_SECRET_VAULT_ADDR, SB_SECRET_VAULT_TRANSIT_MOUNT (default transit),
+	// SB_SECRET_VAULT_KEY_NAME, SB_SECRET_VAULT_TOKEN_FILE,
+	// SB_SECRET_VAULT_NAMESPACE, SB_SECRET_VAULT_CACERT.
+	SecretVaultAddr      string
+	SecretVaultMount     string
+	SecretVaultKeyName   string
+	SecretVaultTokenFile string
+	SecretVaultNamespace string
+	SecretVaultCACert    string
+
+	// PKCS#11 (HSM) settings for SecretProvider=pkcs11
+	// (plans/customer-key-custody.md §2). The vendor module loads only in
+	// the `sandboxd --pkcs11-helper` process. Set with another provider, the
+	// node already opens p11 rows. SB_SECRET_PKCS11_MODULE,
+	// SB_SECRET_PKCS11_TOKEN_LABEL, SB_SECRET_PKCS11_PIN_FILE (owner-only
+	// mode), SB_SECRET_PKCS11_KEY_LABEL, SB_SECRET_PKCS11_DECRYPT_KEY_LABELS
+	// (comma-separated, for rotation), SB_SECRET_PKCS11_GCM_IV
+	// (auto|hsm|caller), SB_SECRET_PKCS11_RUN_DIR (the helper's socket).
+	SecretPKCS11Module        string
+	SecretPKCS11TokenLabel    string
+	SecretPKCS11PINFile       string
+	SecretPKCS11KeyLabel      string
+	SecretPKCS11DecryptLabels []string
+	SecretPKCS11GCMIV         string
+	SecretPKCS11RunDir        string
+	// SecretProviderStrictBoot fails daemon start when the boot canary
+	// (wrap/unwrap) of any external provider fails. Default false = fail-open
+	// with a warning (E4 lite). SB_SECRET_PROVIDER_STRICT_BOOT.
 	SecretProviderStrictBoot bool
+	// SecretProviderMaxInFlight caps foreground key-store calls per node, so
+	// a restart storm cannot exceed what the customer's key store (an HSM
+	// partition's session limit, one Vault active node) can take. One slot is
+	// kept for creates and background work has its own 2 slots on top (eng
+	// D13). Default 8, range 1-256. SB_SECRET_PROVIDER_MAX_INFLIGHT.
+	SecretProviderMaxInFlight int
+	// SecretProviderRecheckInterval is how often a node with wrapped
+	// custody unwraps its server-key file again to notice a revoke, with
+	// jitter; SecretProviderRevokeAfter consecutive revoked results stop the
+	// node (about 15 minutes by default, eng D18).
+	// SB_SECRET_PROVIDER_RECHECK_INTERVAL, SB_SECRET_PROVIDER_REVOKE_AFTER.
+	SecretProviderRecheckInterval time.Duration
+	SecretProviderRevokeAfter     int
 	// SecretAuditRetentionDays is how long local secrets.jsonl events are kept
 	// before PruneSecretAudit drops them. Default 30. SB_SECRET_AUDIT_RETENTION_DAYS.
 	SecretAuditRetentionDays int
@@ -1248,6 +1414,18 @@ type Config struct {
 	// SB_AUDIT_EXPORT_BUS_{BROKERS,TOPIC}.
 	AuditExportBusBrokers string
 	AuditExportBusTopic   string
+	// AuditWitness* let the open-source build supply the off-node audit
+	// witness enterprise mode requires: an S3 bucket with Object Lock
+	// (plans/open-audit-witness.md). Empty backend = no witness from here,
+	// and nothing talks to S3; a provider-supplied witness wins regardless.
+	// Credentials come from the default AWS chain, as for the S3 exporter.
+	// SB_AUDIT_WITNESS_{BACKEND,S3_BUCKET,S3_PREFIX,S3_ENDPOINT,S3_REGION,S3_PATH_STYLE}.
+	AuditWitnessBackend     string
+	AuditWitnessS3Bucket    string
+	AuditWitnessS3Prefix    string
+	AuditWitnessS3Endpoint  string
+	AuditWitnessS3Region    string
+	AuditWitnessS3PathStyle bool
 	// AuditDeletedGrace bounds how long the Raft FSM keeps a routing stub
 	// (owner_ref + evidence nodes) for a deleted sandbox so ingress can still
 	// route a post-delete audit read. It is a short grace, never history: 0
@@ -1275,6 +1453,139 @@ type Config struct {
 	// the file whenever they disagree. Off means every page scans the file.
 	// SB_AUDIT_INDEX_ENABLED. Default true.
 	AuditIndexEnabled bool
+	// AuditAPIRecords is which API calls write a kind "api" chain record
+	// (plans/identity-and-access.md §5.9): "mutations" (default) records
+	// every non-GET call, every toolbox call, every refused call and token
+	// listing; "all" adds plain GETs; "off" records none (refused in
+	// enterprise mode). SB_AUDIT_API_RECORDS.
+	AuditAPIRecords string
+	// AuditAPIFloodControl is how a flood of api records is bounded (CEO
+	// review D14): "budget" (default) is a token bucket per (sandbox,
+	// caller), with calls over it counted into one rate_limited record;
+	// "coalesce" merges identical calls made within one second; "both"
+	// coalesces, then budgets. A node hosting sandboxes of more than one
+	// owner always budgets, so "coalesce" runs as "both" there.
+	// SB_AUDIT_API_FLOOD_CONTROL.
+	AuditAPIFloodControl string
+	// AuditAPIRate / AuditAPIBurst are that budget: records per second per
+	// (sandbox, caller), and the burst. SB_AUDIT_API_RATE (20),
+	// SB_AUDIT_API_BURST (100).
+	AuditAPIRate  float64
+	AuditAPIBurst int
+	// AuditExecCommand is what an exec record says about the command:
+	// "digest" (default) is a keyed digest of the request body only (an HMAC
+	// under the server key, so a log reader cannot test guesses), because
+	// commands carry secrets; "full" also records the argv, never the
+	// environment. SB_AUDIT_EXEC_COMMAND.
+	AuditExecCommand string
+	// AuditAPIDurable makes token create, token revoke and sandbox delete
+	// wait for their record to reach disk. Default false; true in enterprise
+	// mode, which refuses false. SB_AUDIT_API_DURABLE.
+	AuditAPIDurable bool
+
+	// IdentityEnabled turns on sandboxd's own named credentials: scoped API
+	// tokens (avm_…) and SSO through OIDC (plans/identity-and-access.md).
+	// Off by default, and off is byte for byte the PAT-only server (L8).
+	// With it on the daemon refuses to boot next to a provider that brings
+	// its own token Validator. SB_IDENTITY_ENABLED.
+	IdentityEnabled bool
+	// IdentitySyncInterval is how often a cluster node without Raft state
+	// polls the server tier for token changes (the token mirror). A poll
+	// that finds nothing new is a 304 from an in-memory compare.
+	// SB_IDENTITY_SYNC_INTERVAL. Default 5s.
+	IdentitySyncInterval time.Duration
+	// IdentityMaxStale is how long a token mirror may go without a sync
+	// before the node refuses API tokens with 503 (metrics.read routes
+	// excepted, CEO review D16). SB_IDENTITY_MAX_STALE. Default 60s.
+	IdentityMaxStale time.Duration
+	// TokenMaxTTL caps an API token's lifetime: every token expires.
+	// SB_TOKEN_MAX_TTL. Default 8760h (365 days); 2160h (90 days) in
+	// enterprise mode, which refuses anything longer.
+	TokenMaxTTL time.Duration
+	// IdentityFile is the identity file (plans/identity-and-access.md
+	// §5.5): the OIDC issuers this node trusts and the group-to-role
+	// bindings. Empty with IdentityEnabled is tokens-only mode (avm_ tokens,
+	// no SSO). It needs IdentityEnabled: Load refuses it alone, so an
+	// operator never believes SSO and the deny list are on when they are
+	// not. SB_IDENTITY_FILE.
+	IdentityFile string
+
+	// PATTokenPrevious is also accepted as the PAT during a rotation, in
+	// constant time; nodes always send PATToken. Set it on every node with
+	// the new token as SB_PAT_TOKEN, restart in turn, then remove it.
+	// SB_PAT_TOKEN_PREVIOUS (plans/identity-and-access.md §5.11).
+	PATTokenPrevious string
+	// PATScope is where the PAT is accepted: PATScopeAny (default, as
+	// before) or PATScopeHost (a loopback TCP peer on the API listener and
+	// mTLS cluster peers only). SB_PAT_SCOPE.
+	PATScope string
+	// PublicAPISocket is the Unix socket sandboxd opens for Caddy under
+	// PATScopeHost: every request on it is public, so a PAT there is
+	// refused. Unused under PATScopeAny. SB_PUBLIC_API_SOCKET.
+	PublicAPISocket string
+	// LivenessSocket is the Unix socket sandboxd answers liveness on from
+	// the first moment of its boot, for the install.sh watchdog. It does no
+	// I/O and takes no lock, so a daemon busy serving the API still answers
+	// it. Empty means off. SB_LIVENESS_SOCKET.
+	LivenessSocket string
+	// APIListMaxInflight bounds the cluster-wide sandbox lists (v1 and the
+	// Daytona, E2B and Runloop facades) this node runs at once; past it a
+	// list waits at most APIListQueueWait for a slot and is otherwise
+	// answered 503 + Retry-After. 0 = no limit. SB_API_LIST_MAX_INFLIGHT,
+	// SB_API_LIST_QUEUE_WAIT (api_admission.go).
+	APIListMaxInflight int
+	APIListQueueWait   time.Duration
+	// APIListMaxInflightPerTenant is how many of those slots one tenant (the
+	// owner a credential acts for; every unscoped caller is the one
+	// "operator" tenant) may hold; past it the tenant's lists wait their
+	// turn and are otherwise answered 429 + Retry-After. Resolved at load:
+	// a quarter of APIListMaxInflight (at least 1) when unset, and
+	// APIListMaxInflight itself (no share) for an explicit 0.
+	// SB_API_LIST_MAX_INFLIGHT_PER_TENANT.
+	APIListMaxInflightPerTenant int
+	// OperatorVolumeScope pins the scope segment of the operator's platform
+	// volumes. Empty keeps the legacy op-<hash(PAT)>, which a PAT rotation
+	// would move (H2). SB_OPERATOR_VOLUME_SCOPE.
+	OperatorVolumeScope string
+	// L4FallbackProxyProtocol makes the caddy-l4 SNI fallback route send a
+	// PROXY v2 header to the 8443 HTTPS site, so Caddy, and through its
+	// X-AerolVM-Client-IP header sandboxd, see the real client address
+	// (CEO review D12). On only together with the site's proxy_protocol
+	// listener wrapper, which install.sh writes in the same step: on without
+	// it, every public HTTPS handshake fails. Default false.
+	// SB_L4_FALLBACK_PROXY_PROTOCOL.
+	L4FallbackProxyProtocol bool
+
+	// MCPEnabled mounts the remote MCP endpoint (/mcp) on the API server
+	// (plans/mcp-server-and-agent-cli.md §5.7). Off by default: it is a new
+	// public surface, and operators opt in like every other new listener
+	// (setup/config-defaults.md). SB_MCP_ENABLED.
+	MCPEnabled bool
+	// MCPAllowedOrigins lists browser origins allowed to call /mcp; a
+	// request carrying any other Origin is refused (DNS rebinding). MCP
+	// clients outside a browser send none. Comma list, default empty.
+	// SB_MCP_ALLOWED_ORIGINS.
+	MCPAllowedOrigins []string
+	// MCPAllowedHosts, when set, lists the Host values /mcp answers to.
+	// Comma list, default empty (any host). SB_MCP_ALLOWED_HOSTS.
+	MCPAllowedHosts []string
+	// MCPRateLimit is the per-token request rate (req/s) on /mcp, burst
+	// twice that. Default 20. SB_MCP_RATE_LIMIT.
+	MCPRateLimit float64
+
+	// Facade configuration read once here (not per request in the facades):
+	// which image/template a tenant lands on through each compatibility API.
+	// Each facade still parses its own format and applies its own defaults;
+	// config only owns the env read so there is one place the deployment sets
+	// them. DaytonaDefaultImage (SB_DAYTONA_DEFAULT_IMAGE) is the image a
+	// Daytona create falls back to; E2BTemplateMapJSON (SB_E2B_TEMPLATE_MAP_JSON)
+	// and RunloopBlueprintMapJSON (SB_RUNLOOP_BLUEPRINT_MAP_JSON) are the
+	// template/blueprint→image maps; E2BClientID (SB_E2B_CLIENT_ID) is the
+	// client id the E2B SDK echoes.
+	DaytonaDefaultImage     string
+	E2BTemplateMapJSON      string
+	E2BClientID             string
+	RunloopBlueprintMapJSON string
 
 	// Cluster-internal mTLS. When enabled, leader-forwarded raft applies (and
 	// any other future cluster-internal RPC) ride over a separate HTTPS listener
@@ -1451,8 +1762,9 @@ type Config struct {
 	// stay local-only — identical to pre-feature behavior. When true,
 	// snapshots whose distribution mode is `local_only` (sandbox commits
 	// and aerolvm-build/* tags) are pushed in the background to
-	// `<MirrorPushHost|ImageDistributionAOCRHost>/cluster/<ClusterID>/snapshots/<name>`,
-	// reusing the cluster PAT as the registry password. Requires
+	// `<MirrorPushHost|ImageDistributionAOCRHost>/cluster/<ClusterID>/snapshots/<name>`
+	// (a tenant's under `snapshots/tenant-<owner hash>/<name>`), reusing
+	// the cluster PAT as the registry password. Requires
 	// AutoImportClusterID and AutoImportClusterPATPath to be set —
 	// validated at startup. SB_SNAPSHOT_PUSH_ENABLED.
 	SnapshotPushEnabled bool
@@ -1599,7 +1911,58 @@ func (p PlatformVolumesConfig) Validate() error {
 	return nil
 }
 
+// Token lifetime caps (plans/identity-and-access.md §5.4, §12 I10).
+const (
+	defaultTokenMaxTTL    = 365 * 24 * time.Hour
+	enterpriseTokenMaxTTL = 90 * 24 * time.Hour
+)
+
+// validateIdentity checks the identity settings. Enterprise mode lowers the
+// token lifetime default to 90 days and refuses a longer cap.
+func validateIdentity(cfg *Config) error {
+	if cfg.IdentitySyncInterval <= 0 {
+		return errors.New("SB_IDENTITY_SYNC_INTERVAL must be > 0")
+	}
+	if cfg.IdentityMaxStale < cfg.IdentitySyncInterval {
+		return errors.New("SB_IDENTITY_MAX_STALE must be at least SB_IDENTITY_SYNC_INTERVAL: a mirror needs time for one poll before it counts as stale")
+	}
+	if cfg.TokenMaxTTL == 0 {
+		cfg.TokenMaxTTL = defaultTokenMaxTTL
+		if cfg.EnterpriseMode {
+			cfg.TokenMaxTTL = enterpriseTokenMaxTTL
+		}
+	}
+	if cfg.EnterpriseMode && cfg.TokenMaxTTL > enterpriseTokenMaxTTL {
+		return fmt.Errorf("SB_TOKEN_MAX_TTL must be at most %s when SB_ENTERPRISE_MODE=true", enterpriseTokenMaxTTL)
+	}
+	return nil
+}
+
+// validateIdentityFile refuses SB_IDENTITY_FILE without SB_IDENTITY_ENABLED.
+// The file names the issuers people sign in with and the emergency deny
+// list; with identity off the daemon reads neither, and a deploy that set
+// one without the other would believe SSO and the deny list were in force.
+// The file's content is checked when it loads (an invalid file at boot
+// keeps OIDC at 503, not the daemon down, as the egress operator file does).
+func validateIdentityFile(cfg Config) error {
+	if cfg.IdentityFile != "" && !cfg.IdentityEnabled {
+		return errors.New("SB_IDENTITY_FILE needs SB_IDENTITY_ENABLED=true: with identity off the identity file is never read")
+	}
+	return nil
+}
+
 func Load() (Config, error) {
+	return load(false)
+}
+
+// LoadForKeyTool is Load for `sandboxd key`, minus the cluster-mode check
+// that the shared server key already exists: `sandboxd key wrap --generate`
+// is what creates it on the seed.
+func LoadForKeyTool() (Config, error) {
+	return load(true)
+}
+
+func load(keyTool bool) (Config, error) {
 	exe, _ := os.Executable()
 	defaultToolboxPath := filepath.Join(filepath.Dir(exe), "toolboxd")
 
@@ -1617,10 +1980,14 @@ func Load() (Config, error) {
 		ToolboxBinaryPath:                 getEnv("SB_TOOLBOX_BINARY_PATH", defaultToolboxPath),
 		ToolboxMountPath:                  getEnv("SB_TOOLBOX_MOUNT_PATH", "/usr/local/bin/toolboxd"),
 		ToolboxPort:                       getEnvInt("SB_TOOLBOX_PORT", defaultToolboxPort),
+		ToolboxDeadPeerTimeout:            getEnvDuration("SB_TOOLBOX_DEAD_PEER_TIMEOUT", toolboxhttp.DefaultDeadPeerTimeout),
 		IdleTimeoutMinutes:                getEnvInt("SB_IDLE_TIMEOUT_MIN", 0),
 		CreateSandboxTimeoutSeconds:       getEnvInt("SB_CREATE_TIMEOUT_SEC", 600),
 		ContainerPrivileged:               getEnvBool("SB_CONTAINER_PRIVILEGED", false),
 		ResourceLimitsOff:                 getEnvBool("SB_RESOURCE_LIMITS_DISABLED", false),
+		SandboxPidsLimit:                  getEnvInt("SB_SANDBOX_PIDS_LIMIT", 4096),
+		SandboxInterconnect:               getEnvBool("SB_SANDBOX_INTERCONNECT", false),
+		DiskLimitCheckInterval:            getEnvDuration("SB_DISK_LIMIT_CHECK_INTERVAL", 15*time.Second),
 		Runtime:                           getEnv("SB_CONTAINER_RUNTIME", models.RuntimeDocker),
 		ContainerEngine:                   getEnv("SB_CONTAINER_ENGINE", models.ContainerEngineDocker),
 		ContainerdSocket:                  getEnv("SB_CONTAINERD_SOCKET", "/run/containerd/containerd.sock"),
@@ -1643,7 +2010,16 @@ func Load() (Config, error) {
 		AutoReconcile:                     getEnvBool("SB_AUTO_RECONCILE", true),
 		EnableCaddy:                       getEnvBool("SB_ENABLE_CADDY", true),
 		EnableNetworkRules:                getEnvBool("SB_ENABLE_NETWORK_RULES", true),
+		AllowUnenforcedNetworkPolicy:      getEnvBool("SB_ALLOW_UNENFORCED_NETWORK_POLICY", false),
 		NetrulesBackend:                   strings.ToLower(strings.TrimSpace(getEnv("SB_NETRULES_BACKEND", "netlink"))),
+		EgressFQDNEnabled:                 getEnvBool("SB_EGRESS_FQDN_ENABLED", true),
+		EgressGatewaySocket:               strings.TrimSpace(getEnv("SB_EGRESS_GATEWAY_SOCKET", "/run/aerolvm/egress-gateway.sock")),
+		EgressProcidSocket:                strings.TrimSpace(getEnv("SB_EGRESS_PROCID_SOCKET", "/run/aerolvm/egress-procid.sock")),
+		EgressGatewayUser:                 strings.TrimSpace(getEnv("SB_EGRESS_GATEWAY_USER", "aerolvm-egress")),
+		EgressOperatorFile:                strings.TrimSpace(getEnv("SB_EGRESS_OPERATOR_FILE", "")),
+		EgressProfileApplyQPS:             getEnvInt("SB_EGRESS_PROFILE_APPLY_QPS", 50),
+		EgressDNSPort:                     getEnvInt("SB_EGRESS_DNS_PORT", 53054),
+		EgressProxyPort:                   getEnvInt("SB_EGRESS_PROXY_PORT", 15080),
 		EnableEventMonitor:                getEnvBool("SB_ENABLE_EVENT_MONITOR", true),
 		EnableSSHGateway:                  getEnvBool("SB_ENABLE_SSH_GATEWAY", true),
 		EnableServerless:                  getEnvBool("SB_ENABLE_SERVERLESS", true),
@@ -1653,6 +2029,9 @@ func Load() (Config, error) {
 		CustomDomainVerifyValuePrefix:     getEnv("SB_CUSTOM_DOMAIN_VERIFY_VALUE_PREFIX", "aerol-verify="),
 		TLSOnDemandBurst:                  getEnvInt("SB_TLS_ON_DEMAND_BURST", 5),
 		TLSOnDemandInterval:               getEnvDuration("SB_TLS_ON_DEMAND_INTERVAL", time.Minute),
+		TLSACMECA:                         strings.TrimSpace(getEnv("SB_TLS_ACME_CA", "")),
+		TLSACMECARoot:                     strings.TrimSpace(getEnv("SB_TLS_ACME_CA_ROOT", "")),
+		TLSIssuer:                         strings.ToLower(strings.TrimSpace(getEnv("SB_TLS_ISSUER", TLSIssuerACME))),
 		ACMEDaemonBudgetFraction:          getEnvFloat("SB_ACME_DAEMON_BUDGET_FRACTION", 0.8),
 		ACMEDaemonBudgetWindow:            getEnvDuration("SB_ACME_DAEMON_BUDGET_WINDOW", 3*time.Hour),
 		ACMEDaemonBudgetCapacity:          getEnvInt("SB_ACME_DAEMON_BUDGET_CAPACITY", 300),
@@ -1678,6 +2057,9 @@ func Load() (Config, error) {
 		SSHHostKeyPath:                    getEnv("SB_SSH_HOST_KEY_PATH", "/var/lib/sandboxd/ssh_host_ed25519_key"),
 		CredentialEncryptionKey:           strings.TrimSpace(os.Getenv("SB_CREDENTIAL_ENCRYPTION_KEY")),
 		CredentialEncryptionKeyPath:       getEnv("SB_CREDENTIAL_ENCRYPTION_KEY_PATH", "/var/lib/sandboxd/credential_encryption.key"),
+		CredentialKeyCustody:              strings.ToLower(strings.TrimSpace(getEnv("SB_CREDENTIAL_KEY_CUSTODY", "file"))),
+		CredentialKeyWrappedPath:          getEnv("SB_CREDENTIAL_ENCRYPTION_KEY_WRAPPED_PATH", "/var/lib/sandboxd/credential_encryption.key.wrapped"),
+		CredentialKeyRingPath:             strings.TrimSpace(os.Getenv("SB_CREDENTIAL_KEY_RING_PATH")),
 		MountsRootPath:                    getEnv("SB_MOUNTS_ROOT", "/var/lib/sandboxd/mounts"),
 		MountsCredentialsRuntimeDir:       getEnv("SB_MOUNTS_CRED_DIR", "/run/sandboxd"),
 		MountWaitTimeout:                  getEnvDuration("SB_MOUNT_WAIT_TIMEOUT", 30*time.Second),
@@ -1716,6 +2098,7 @@ func Load() (Config, error) {
 		DockerNetnsPoolDepth:          getEnvInt("SB_DOCKER_NETNS_POOL_DEPTH", 4),
 		DockerNetnsPoolPauseImage:     getEnv("SB_DOCKER_NETNS_POOL_PAUSE_IMAGE", "registry.k8s.io/pause:3.10"),
 		DockerNetnsPoolRefillInterval: getEnvDuration("SB_DOCKER_NETNS_POOL_REFILL_INTERVAL", 2*time.Second),
+		DockerBridgeSlots:             getEnvInt("SB_DOCKER_BRIDGE_SLOTS", 0),
 		DockerToolboxLoopback:         getEnvBool("SB_DOCKER_TOOLBOX_LOOPBACK", false),
 		ReconcileInterval:             getEnvDuration("SB_RECONCILE_INTERVAL", 5*time.Minute),
 		NetstatsPollInterval:          getEnvDuration("SB_NETSTATS_POLL_INTERVAL", 10*time.Second),
@@ -1760,9 +2143,11 @@ func Load() (Config, error) {
 		SelfAPIAdvertiseURL:              strings.TrimSpace(os.Getenv("SB_API_ADVERTISE_URL")),
 		DataPlaneAdvertiseHost:           normalizeAdvertiseHost(os.Getenv("SB_DATA_PLANE_ADVERTISE_HOST")),
 		IngressAdvertiseHost:             normalizeAdvertiseHost(os.Getenv("SB_INGRESS_ADVERTISE_HOST")),
+		L4PublicHost:                     normalizeAdvertiseHost(os.Getenv("SB_L4_PUBLIC_HOST")),
 		ClusterShardAwareIngress:         getEnvBool("SB_CLUSTER_SHARD_AWARE_INGRESS", false),
 		IngressProxyRouting:              getEnvBool("SB_INGRESS_PROXY_ROUTING", false),
 		RouteDNSAddr:                     getEnv("SB_ROUTE_DNS_ADDR", "127.0.0.1:53053"),
+		RouteDNSLinkAddr:                 getEnv("SB_ROUTE_DNS_LINK_ADDR", ""),
 		HostPortRedirectPort:             getEnvInt("SB_HOSTPORT_REDIRECT_PORT", 21215),
 		ClusterRaftCommitTimeout:         getEnvDuration("SB_RAFT_COMMIT_TIMEOUT", 5*time.Second),
 		ClusterCapacityGossipInterval:    getEnvDuration("SB_CAPACITY_GOSSIP_INTERVAL", 5*time.Second),
@@ -1778,7 +2163,23 @@ func Load() (Config, error) {
 		SecretRecipientBackupCount:    getEnvInt("SB_SECRET_RECIPIENT_BACKUP_COUNT", 2),
 		SecretProvider:                strings.ToLower(strings.TrimSpace(getEnv("SB_SECRET_PROVIDER", "local"))),
 		SecretAWSkmsKeyID:             strings.TrimSpace(os.Getenv("SB_SECRET_AWS_KMS_KEY_ID")),
+		SecretVaultAddr:               strings.TrimSpace(os.Getenv("SB_SECRET_VAULT_ADDR")),
+		SecretVaultMount:              getEnv("SB_SECRET_VAULT_TRANSIT_MOUNT", "transit"),
+		SecretVaultKeyName:            strings.TrimSpace(os.Getenv("SB_SECRET_VAULT_KEY_NAME")),
+		SecretVaultTokenFile:          strings.TrimSpace(os.Getenv("SB_SECRET_VAULT_TOKEN_FILE")),
+		SecretVaultNamespace:          strings.TrimSpace(os.Getenv("SB_SECRET_VAULT_NAMESPACE")),
+		SecretVaultCACert:             strings.TrimSpace(os.Getenv("SB_SECRET_VAULT_CACERT")),
+		SecretPKCS11Module:            strings.TrimSpace(os.Getenv("SB_SECRET_PKCS11_MODULE")),
+		SecretPKCS11TokenLabel:        os.Getenv("SB_SECRET_PKCS11_TOKEN_LABEL"),
+		SecretPKCS11PINFile:           strings.TrimSpace(os.Getenv("SB_SECRET_PKCS11_PIN_FILE")),
+		SecretPKCS11KeyLabel:          strings.TrimSpace(os.Getenv("SB_SECRET_PKCS11_KEY_LABEL")),
+		SecretPKCS11DecryptLabels:     splitEnvList("SB_SECRET_PKCS11_DECRYPT_KEY_LABELS"),
+		SecretPKCS11GCMIV:             strings.ToLower(strings.TrimSpace(getEnv("SB_SECRET_PKCS11_GCM_IV", "auto"))),
+		SecretPKCS11RunDir:            getEnv("SB_SECRET_PKCS11_RUN_DIR", "/run/sandboxd/pkcs11"),
 		SecretProviderStrictBoot:      getEnvBool("SB_SECRET_PROVIDER_STRICT_BOOT", false),
+		SecretProviderMaxInFlight:     getEnvInt("SB_SECRET_PROVIDER_MAX_INFLIGHT", 8),
+		SecretProviderRecheckInterval: getEnvDuration("SB_SECRET_PROVIDER_RECHECK_INTERVAL", 5*time.Minute),
+		SecretProviderRevokeAfter:     getEnvInt("SB_SECRET_PROVIDER_REVOKE_AFTER", 3),
 		SecretAuditRetentionDays:      getEnvInt("SB_SECRET_AUDIT_RETENTION_DAYS", 30),
 		SecretAuditStrictBoot:         getEnvBool("SB_SECRET_AUDIT_STRICT_BOOT", true),
 		SecretAuditBootVerify:         strings.ToLower(strings.TrimSpace(getEnv("SB_SECRET_AUDIT_BOOT_VERIFY", "full"))),
@@ -1809,6 +2210,12 @@ func Load() (Config, error) {
 		AuditExportS3Endpoint:         strings.TrimSpace(os.Getenv("SB_AUDIT_EXPORT_S3_ENDPOINT")),
 		AuditExportS3Region:           strings.TrimSpace(os.Getenv("SB_AUDIT_EXPORT_S3_REGION")),
 		AuditExportS3PathStyle:        getEnvBool("SB_AUDIT_EXPORT_S3_PATH_STYLE", false),
+		AuditWitnessBackend:           strings.ToLower(strings.TrimSpace(os.Getenv("SB_AUDIT_WITNESS_BACKEND"))),
+		AuditWitnessS3Bucket:          strings.TrimSpace(os.Getenv("SB_AUDIT_WITNESS_S3_BUCKET")),
+		AuditWitnessS3Prefix:          getEnv("SB_AUDIT_WITNESS_S3_PREFIX", auditwitness.DefaultPrefix),
+		AuditWitnessS3Endpoint:        strings.TrimSpace(os.Getenv("SB_AUDIT_WITNESS_S3_ENDPOINT")),
+		AuditWitnessS3Region:          strings.TrimSpace(os.Getenv("SB_AUDIT_WITNESS_S3_REGION")),
+		AuditWitnessS3PathStyle:       getEnvBool("SB_AUDIT_WITNESS_S3_PATH_STYLE", false),
 		AuditExportBusBrokers:         strings.TrimSpace(os.Getenv("SB_AUDIT_EXPORT_BUS_BROKERS")),
 		AuditExportBusTopic:           strings.TrimSpace(os.Getenv("SB_AUDIT_EXPORT_BUS_TOPIC")),
 		AuditDeletedGrace:             getEnvDuration("SB_AUDIT_DELETED_GRACE", time.Hour),
@@ -1817,6 +2224,23 @@ func Load() (Config, error) {
 		AuditRateLimitOperator:        getEnvFloat("SB_AUDIT_RATE_LIMIT_OPERATOR", 50),
 		AuditRateLimitNode:            getEnvFloat("SB_AUDIT_RATE_LIMIT_NODE", 50),
 		AuditIndexEnabled:             getEnvBool("SB_AUDIT_INDEX_ENABLED", true),
+		AuditAPIRecords:               strings.ToLower(strings.TrimSpace(getEnv("SB_AUDIT_API_RECORDS", AuditAPIRecordsMutations))),
+		AuditAPIFloodControl:          strings.ToLower(strings.TrimSpace(getEnv("SB_AUDIT_API_FLOOD_CONTROL", AuditAPIFloodBudget))),
+		AuditAPIRate:                  getEnvFloat("SB_AUDIT_API_RATE", 20),
+		AuditAPIBurst:                 getEnvInt("SB_AUDIT_API_BURST", 100),
+		AuditExecCommand:              strings.ToLower(strings.TrimSpace(getEnv("SB_AUDIT_EXEC_COMMAND", AuditExecCommandDigest))),
+		IdentityEnabled:               getEnvBool("SB_IDENTITY_ENABLED", false),
+		IdentitySyncInterval:          getEnvDuration("SB_IDENTITY_SYNC_INTERVAL", 5*time.Second),
+		IdentityMaxStale:              getEnvDuration("SB_IDENTITY_MAX_STALE", 60*time.Second),
+		IdentityFile:                  strings.TrimSpace(os.Getenv("SB_IDENTITY_FILE")),
+		MCPEnabled:                    getEnvBool("SB_MCP_ENABLED", false),
+		MCPAllowedOrigins:             splitEnvList("SB_MCP_ALLOWED_ORIGINS"),
+		MCPAllowedHosts:               splitEnvList("SB_MCP_ALLOWED_HOSTS"),
+		MCPRateLimit:                  getEnvFloat("SB_MCP_RATE_LIMIT", 20),
+		DaytonaDefaultImage:           strings.TrimSpace(os.Getenv("SB_DAYTONA_DEFAULT_IMAGE")),
+		E2BTemplateMapJSON:            strings.TrimSpace(os.Getenv("SB_E2B_TEMPLATE_MAP_JSON")),
+		E2BClientID:                   strings.TrimSpace(os.Getenv("SB_E2B_CLIENT_ID")),
+		RunloopBlueprintMapJSON:       strings.TrimSpace(os.Getenv("SB_RUNLOOP_BLUEPRINT_MAP_JSON")),
 		ClusterTLSDir:                 strings.TrimSpace(os.Getenv("SB_CLUSTER_TLS_DIR")),
 		ClusterInternalListenAddr:     getEnv("SB_CLUSTER_INTERNAL_LISTEN", "0.0.0.0:7002"),
 		ClusterInternalAdvertiseURL:   strings.TrimSpace(os.Getenv("SB_CLUSTER_INTERNAL_ADVERTISE")),
@@ -1967,6 +2391,9 @@ func Load() (Config, error) {
 	if cfg.NodeID != "" && !models.ValidClusterNodeID(cfg.NodeID) {
 		return Config{}, errors.New("SB_NODE_ID must start with an alphanumeric character and contain only alphanumerics, dot, underscore, or hyphen (maximum 128 characters)")
 	}
+	if err := cfg.validateAuditWitness(); err != nil {
+		return Config{}, err
+	}
 
 	if err := cfg.PlatformVolumes.Validate(); err != nil {
 		return Config{}, err
@@ -1981,8 +2408,14 @@ func Load() (Config, error) {
 	if cfg.OTELTracesEnabled && (cfg.OTELTracesSampleRatio < 0 || cfg.OTELTracesSampleRatio > 1) {
 		return Config{}, errors.New("SB_OTEL_TRACES_SAMPLE_RATIO must be between 0 and 1 when OTEL traces are enabled")
 	}
+	if cfg.ToolboxDeadPeerTimeout < 0 || (cfg.ToolboxDeadPeerTimeout > 0 && cfg.ToolboxDeadPeerTimeout < toolboxhttp.MinDeadPeerTimeout) {
+		return Config{}, fmt.Errorf("SB_TOOLBOX_DEAD_PEER_TIMEOUT must be 0 (off) or at least %s", toolboxhttp.MinDeadPeerTimeout)
+	}
 	if cfg.ImagePullMaxConcurrent < 0 {
 		return Config{}, errors.New("SB_IMAGE_PULL_MAX_CONCURRENT must be >= 0")
+	}
+	if cfg.DockerBridgeSlots < 0 {
+		return Config{}, errors.New("SB_DOCKER_BRIDGE_SLOTS must be >= 0 (0 derives it from the docker network)")
 	}
 	if cfg.ImagePullFailureBackoff < 0 {
 		return Config{}, errors.New("SB_IMAGE_PULL_FAILURE_BACKOFF must be >= 0")
@@ -2245,6 +2678,28 @@ func Load() (Config, error) {
 		return Config{}, fmt.Errorf("invalid SB_HOSTPORT_REDIRECT_PORT %d: require 1-65535 outside SB_L4_PORT_RANGE_START/END (%d-%d)",
 			cfg.HostPortRedirectPort, cfg.L4PortRangeStart, cfg.L4PortRangeEnd)
 	}
+	if cfg.RouteDNSLinkAddr != "" {
+		host, port, err := net.SplitHostPort(cfg.RouteDNSLinkAddr)
+		if ip := net.ParseIP(host); err != nil || ip == nil || ip.IsUnspecified() || port == "" || port == "0" {
+			// An address, not a wildcard: the responder answers a non-loopback
+			// client only when it is the listener's own address.
+			return Config{}, fmt.Errorf("invalid SB_ROUTE_DNS_LINK_ADDR %q: require ip:port with a specific IP", cfg.RouteDNSLinkAddr)
+		}
+	}
+	if cfg.SandboxPidsLimit < 0 {
+		return Config{}, fmt.Errorf("invalid SB_SANDBOX_PIDS_LIMIT %d: require 0 (unlimited) or more", cfg.SandboxPidsLimit)
+	}
+	nodePorts, perr := ParseSandboxNodePorts(os.Getenv("SB_SANDBOX_NODE_PORTS_ALLOW"))
+	if perr != nil {
+		return Config{}, perr
+	}
+	cfg.SandboxNodePortsAllow = nodePorts
+	if err := validEgressGatewayPorts(cfg); err != nil {
+		return Config{}, err
+	}
+	if err := validateSandboxNodePorts(cfg); err != nil {
+		return Config{}, err
+	}
 	if cfg.L4PortRangeStart < 1024 || cfg.L4PortRangeEnd > 65535 || cfg.L4PortRangeStart >= cfg.L4PortRangeEnd {
 		return Config{}, fmt.Errorf("invalid SB_L4_PORT_RANGE_START/END (%d-%d): require 1024 <= start < end <= 65535",
 			cfg.L4PortRangeStart, cfg.L4PortRangeEnd)
@@ -2332,15 +2787,11 @@ func Load() (Config, error) {
 		// Sealed registry/mount credentials use this node-local AES key. A
 		// shared key is necessary but not sufficient for HA failover: the
 		// sealed row must also be fanned out to recipient peers (or a KMS
-		// provider used). Accept
-		// either an explicit env var or an already-distributed key file;
-		// refuse boot otherwise unless the operator opts out.
-		if cfg.CredentialEncryptionKey == "" && !cfg.ClusterInsecureCredentials {
-			if _, err := os.Stat(cfg.CredentialEncryptionKeyPath); err != nil {
-				if os.IsNotExist(err) {
-					return Config{}, fmt.Errorf("SB_CREDENTIAL_ENCRYPTION_KEY is required when SB_ENABLE_CLUSTER=true (or place a shared key at %s; set SB_CLUSTER_INSECURE_CREDENTIALS=true to opt out — a shared key alone does not make sealed creds survive failover; recipient-set sealing + async fan-out, or a KMS provider, is also required)", cfg.CredentialEncryptionKeyPath)
-				}
-				return Config{}, fmt.Errorf("stat %s: %w", cfg.CredentialEncryptionKeyPath, err)
+		// provider used). Refuse boot without a shared key unless the
+		// operator opts out.
+		if !cfg.ClusterInsecureCredentials && !keyTool {
+			if err := checkClusterCredentialKey(cfg); err != nil {
+				return Config{}, err
 			}
 		}
 		if cfg.ClusterTLSDir == "" {
@@ -2362,11 +2813,44 @@ func Load() (Config, error) {
 			return Config{}, errors.New("SB_SECRET_AWS_KMS_KEY_ID is required when SB_SECRET_PROVIDER=awskms")
 		}
 	case "vault":
-		// Honest reject: vault is a reserved value on the same Provider seam
-		// but is not implemented. Never silently fall back to local.
-		return Config{}, errors.New("SB_SECRET_PROVIDER=vault is not implemented yet; use local or awskms")
+		// NewVault below checks the settings.
+	case "pkcs11":
+		// checkPKCS11Settings below checks the settings.
 	default:
-		return Config{}, fmt.Errorf("SB_SECRET_PROVIDER must be local, awskms, or vault (got %q)", cfg.SecretProvider)
+		return Config{}, fmt.Errorf("SB_SECRET_PROVIDER must be local, awskms, vault, or pkcs11 (got %q)", cfg.SecretProvider)
+	}
+	if vault := cfg.SecretVaultOptions(); cfg.SecretProvider == "vault" || vault.Configured() {
+		// The daemon's own validator: address scheme, key and mount names,
+		// CA bundle. It makes no call to Vault.
+		if _, err := secrets.NewVault(vault); err != nil {
+			return Config{}, err
+		}
+	}
+	if cfg.SecretProvider == "pkcs11" || cfg.PKCS11Configured() {
+		if err := checkPKCS11Settings(cfg); err != nil {
+			return Config{}, err
+		}
+	}
+	if cfg.SecretProviderMaxInFlight < 1 || cfg.SecretProviderMaxInFlight > 256 {
+		return Config{}, fmt.Errorf("SB_SECRET_PROVIDER_MAX_INFLIGHT must be between 1 and 256 (got %d)", cfg.SecretProviderMaxInFlight)
+	}
+	if cfg.SecretProviderRecheckInterval < 10*time.Second {
+		return Config{}, fmt.Errorf("SB_SECRET_PROVIDER_RECHECK_INTERVAL must be at least 10s (got %s)", cfg.SecretProviderRecheckInterval)
+	}
+	if cfg.SecretProviderRevokeAfter < 1 {
+		return Config{}, fmt.Errorf("SB_SECRET_PROVIDER_REVOKE_AFTER must be at least 1 (got %d)", cfg.SecretProviderRevokeAfter)
+	}
+	switch cfg.CredentialKeyCustody {
+	case "", "file":
+		cfg.CredentialKeyCustody = "file"
+	case "wrapped":
+		// The server key is wrapped by the same key store that wraps row DEKs:
+		// one key store, one set of permissions, one log.
+		if cfg.SecretProvider == "local" {
+			return Config{}, errors.New("SB_CREDENTIAL_KEY_CUSTODY=wrapped needs an external SB_SECRET_PROVIDER (awskms, vault or pkcs11) to wrap the server key")
+		}
+	default:
+		return Config{}, fmt.Errorf("SB_CREDENTIAL_KEY_CUSTODY must be file or wrapped (got %q)", cfg.CredentialKeyCustody)
 	}
 	if cfg.SecretAuditRetentionDays < 0 {
 		return Config{}, errors.New("SB_SECRET_AUDIT_RETENTION_DAYS must be >= 0")
@@ -2382,6 +2866,9 @@ func Load() (Config, error) {
 	}
 	if cfg.AuditRateLimitIdentity <= 0 {
 		return Config{}, errors.New("SB_AUDIT_RATE_LIMIT_IDENTITY must be > 0")
+	}
+	if cfg.MCPRateLimit < 0 {
+		return Config{}, errors.New("SB_MCP_RATE_LIMIT must be >= 0 (0 disables the limit)")
 	}
 	if cfg.AuditRateLimitOperator <= 0 {
 		return Config{}, errors.New("SB_AUDIT_RATE_LIMIT_OPERATOR must be > 0")
@@ -2423,6 +2910,33 @@ func Load() (Config, error) {
 	if cfg.AuditDeletedIndexMax < 0 {
 		return Config{}, errors.New("SB_AUDIT_DELETED_INDEX_MAX must be >= 0")
 	}
+	if raw := strings.TrimSpace(os.Getenv("SB_TOKEN_MAX_TTL")); raw != "" {
+		// Parsed strictly (and with days, "90d"): a cap that silently fell
+		// back to the default would mint year-long tokens.
+		ttl, err := identitywire.ParseTokenTTL(raw)
+		if err != nil {
+			return Config{}, fmt.Errorf("SB_TOKEN_MAX_TTL: %w", err)
+		}
+		cfg.TokenMaxTTL = ttl
+	}
+	if err := cfg.loadAuditAPIConfig(); err != nil {
+		return Config{}, err
+	}
+	if err := cfg.loadPATScopeConfig(); err != nil {
+		return Config{}, err
+	}
+	if err := cfg.loadLivenessConfig(); err != nil {
+		return Config{}, err
+	}
+	if err := cfg.loadAPIAdmissionConfig(); err != nil {
+		return Config{}, err
+	}
+	if err := validateIdentity(&cfg); err != nil {
+		return Config{}, err
+	}
+	if err := validateIdentityFile(cfg); err != nil {
+		return Config{}, err
+	}
 	if cfg.EnterpriseMode {
 		// Enterprise tamper-evidence requires both reconstructable event export
 		// and an independently retained chain-head witness. Force the daemon's
@@ -2444,11 +2958,29 @@ func Load() (Config, error) {
 		if cfg.ResourceLimitsOff {
 			return Config{}, errors.New("SB_RESOURCE_LIMITS_DISABLED must be false when SB_ENTERPRISE_MODE=true")
 		}
+		if cfg.SandboxPidsLimit == 0 {
+			return Config{}, errors.New("SB_SANDBOX_PIDS_LIMIT must be above 0 when SB_ENTERPRISE_MODE=true")
+		}
+		if cfg.SandboxInterconnect {
+			return Config{}, errors.New("SB_SANDBOX_INTERCONNECT must be false when SB_ENTERPRISE_MODE=true")
+		}
+		if cfg.AllowUnenforcedNetworkPolicy {
+			return Config{}, errors.New("SB_ALLOW_UNENFORCED_NETWORK_POLICY must be false when SB_ENTERPRISE_MODE=true (it accepts network policy the node does not enforce)")
+		}
 		if !cfg.SecretAuditStrictBoot {
 			return Config{}, errors.New("SB_SECRET_AUDIT_STRICT_BOOT must be true when SB_ENTERPRISE_MODE=true")
 		}
-		if cfg.SecretProvider == "awskms" && !cfg.SecretProviderStrictBoot {
-			return Config{}, errors.New("SB_SECRET_PROVIDER_STRICT_BOOT must be true for awskms when SB_ENTERPRISE_MODE=true")
+		// A key store this node cannot reach must stop the boot, whichever
+		// one it is (plans/customer-key-custody.md §7).
+		if secrets.IsExternalProvider(cfg.SecretProvider) && !cfg.SecretProviderStrictBoot {
+			return Config{}, fmt.Errorf("SB_SECRET_PROVIDER_STRICT_BOOT must be true for %s when SB_ENTERPRISE_MODE=true", secrets.NormalizeProviderName(cfg.SecretProvider))
+		}
+		// With a customer key store the server key must be wrapped by it: a
+		// plaintext key file would make the custody claim false (F2, Phase
+		// 7; the release before warned). `sandboxd key` still loads, since
+		// `sandboxd key wrap` is how a node gets there.
+		if secrets.IsExternalProvider(cfg.SecretProvider) && cfg.CredentialKeyCustody != secrets.CustodyWrapped && !keyTool {
+			return Config{}, fmt.Errorf("SB_CREDENTIAL_KEY_CUSTODY must be wrapped for %s when SB_ENTERPRISE_MODE=true: run `sandboxd key wrap`, set SB_CREDENTIAL_KEY_CUSTODY=wrapped and delete the plaintext key (plans/customer-key-custody.md §7)", secrets.NormalizeProviderName(cfg.SecretProvider))
 		}
 		if cfg.SecretAuditRetentionDays == 0 || cfg.SecretTombRetentionDays == 0 {
 			return Config{}, errors.New("secret audit and tomb retention must be non-zero when SB_ENTERPRISE_MODE=true")
@@ -2543,6 +3075,10 @@ func Load() (Config, error) {
 		}
 	}
 
+	if err := validateTLSIssuer(cfg); err != nil {
+		return Config{}, err
+	}
+
 	if cfg.EnableCustomDomains {
 		// Custom-domain ingress relies on a wildcard cert under Domain and a
 		// distinguishable apex to reject base-domain collisions. Without
@@ -2602,6 +3138,15 @@ func firstNonEmpty(values ...string) string {
 	return ""
 }
 
+// KeyRingPath is custody=file's server-key ring: SB_CREDENTIAL_KEY_RING_PATH,
+// else the key file's path plus ".ring".
+func (c Config) KeyRingPath() string {
+	if c.CredentialKeyRingPath != "" {
+		return c.CredentialKeyRingPath
+	}
+	return c.CredentialEncryptionKeyPath + ".ring"
+}
+
 func (c Config) ListenAddr() string {
 	return fmt.Sprintf("%s:%d", c.APIHost, c.APIPort)
 }
@@ -2657,6 +3202,31 @@ func (c Config) IsWorker() bool { return c.hasRole(NodeRoleWorker) }
 // remote sandboxes. Pure server/worker nodes return false; mixed and any
 // hybrid that includes "ingress" return true.
 func (c Config) IsIngress() bool { return c.hasRole(NodeRoleIngress) }
+
+// RunsSSHGateway reports whether this node binds the per-sandbox SSH gateway:
+// SB_ENABLE_SSH_GATEWAY on a node whose role needs one. Workers run it
+// because they own sandboxes locally. The ingress runs it too: the public SSH
+// endpoint (SB_SSH_LISTEN_ADDR, default :2220) and the wildcard DNS both
+// point at the ingress, so without a gateway there every
+// `ssh sandbox.<domain>` lands on a closed port (cluster-hetero UC-43/67:
+// "connection refused"). An ingress-hosted gateway bridges to the owning node
+// via sshgateway.Config.RemoteAPIBaseURL exactly like the worker path. A
+// server-only node owns no sandboxes and is not the public endpoint, so it
+// never runs one.
+//
+// The daemon decides whether to start the gateway with this, and /health
+// decides whether to probe it with this too. They used to disagree: health
+// probed whenever the flag was on, so every server-only node of a
+// role-split cluster reported "degraded" for a gateway it was never meant
+// to run.
+//
+// Multi-ingress note: every ingress that binds the gateway must present the
+// same SSH host key (SB_SSH_HOST_KEY_PATH material shared across ingress
+// nodes) or clients see host-key churn as they round-robin between ingress
+// IPs.
+func (c Config) RunsSSHGateway() bool {
+	return c.EnableSSHGateway && (c.IsWorker() || c.IsIngress())
+}
 
 // EffectivePublicHost returns the hostname or IP that should appear in
 // SDK-facing sandbox URLs. In cluster mode, operators set
@@ -2755,6 +3325,37 @@ func getEnv(key, fallback string) string {
 		return ""
 	}
 	return value
+}
+
+// checkClusterCredentialKey refuses cluster mode without a server key every
+// node can share. With custody=file that is the env var or an already
+// distributed key file. With custody=wrapped it is the wrapped file only: a
+// plaintext copy is exactly what wrapped custody removes, so it does not
+// count here.
+func checkClusterCredentialKey(cfg Config) error {
+	if cfg.CredentialKeyCustody == "wrapped" {
+		if _, err := os.Stat(cfg.CredentialKeyWrappedPath); err != nil {
+			if os.IsNotExist(err) {
+				return fmt.Errorf("SB_CREDENTIAL_KEY_CUSTODY=wrapped needs the wrapped server key at %s when SB_ENABLE_CLUSTER=true (wrap it on the first node and copy the wrapped file to every node; set SB_CLUSTER_INSECURE_CREDENTIALS=true to opt out)", cfg.CredentialKeyWrappedPath)
+			}
+			return fmt.Errorf("stat %s: %w", cfg.CredentialKeyWrappedPath, err)
+		}
+		return nil
+	}
+	if cfg.CredentialEncryptionKey != "" {
+		return nil
+	}
+	if _, err := os.Stat(cfg.KeyRingPath()); err == nil {
+		// A rotated key: the ring holds every live key (§13).
+		return nil
+	}
+	if _, err := os.Stat(cfg.CredentialEncryptionKeyPath); err != nil {
+		if os.IsNotExist(err) {
+			return fmt.Errorf("SB_CREDENTIAL_ENCRYPTION_KEY is required when SB_ENABLE_CLUSTER=true (or place a shared key at %s; set SB_CLUSTER_INSECURE_CREDENTIALS=true to opt out — a shared key alone does not make sealed creds survive failover; recipient-set sealing + async fan-out, or a KMS provider, is also required)", cfg.CredentialEncryptionKeyPath)
+		}
+		return fmt.Errorf("stat %s: %w", cfg.CredentialEncryptionKeyPath, err)
+	}
+	return nil
 }
 
 func getEnvInt(key string, fallback int) int {
@@ -2935,6 +3536,106 @@ func normalizeAdvertiseHost(value string) string {
 	return trimmed
 }
 
+// validateAuditWitness rejects witness settings that would open a witness
+// the backend would refuse later, at load time where the message names the
+// setting.
+//
+// SB_NODE_ID is required with a backend because heads are stored per node
+// id, and a single server without one witnesses as "standalone": two such
+// servers sharing a bucket would overwrite each other's heads, both would
+// keep "repairing" them, and whichever restarted next would refuse to boot
+// (D3). Uniqueness across servers stays the operator's job.
+func (c Config) validateAuditWitness() error {
+	switch c.AuditWitnessBackend {
+	case "":
+		return nil
+	case auditwitness.BackendS3:
+	default:
+		return fmt.Errorf("SB_AUDIT_WITNESS_BACKEND=%q is not supported; use %q or leave it empty", c.AuditWitnessBackend, auditwitness.BackendS3)
+	}
+	if c.AuditWitnessS3Bucket == "" {
+		return errors.New("SB_AUDIT_WITNESS_S3_BUCKET is required when SB_AUDIT_WITNESS_BACKEND=s3")
+	}
+	if c.AuditWitnessS3Endpoint != "" {
+		u, err := url.Parse(c.AuditWitnessS3Endpoint)
+		if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
+			return errors.New("SB_AUDIT_WITNESS_S3_ENDPOINT must be an absolute http(s) URL")
+		}
+		// Request signing does not cover responses: over plain http a man in
+		// the middle could answer the boot read with any head it likes, and
+		// the canary with any verdict. Enterprise holds the witness to the
+		// same transport rule as the S3 exporter.
+		if c.EnterpriseMode && u.Scheme != "https" {
+			return errors.New("SB_AUDIT_WITNESS_S3_ENDPOINT must use https when SB_ENTERPRISE_MODE=true")
+		}
+	}
+	if c.NodeID == "" || c.NodeID == auditwitness.StandaloneNodeID {
+		return fmt.Errorf("SB_NODE_ID must be set, and not to %q, when SB_AUDIT_WITNESS_BACKEND is set: witness heads are stored per node id, so every server sharing the bucket needs its own", auditwitness.StandaloneNodeID)
+	}
+	return nil
+}
+
+// PKCS11Configured reports whether any PKCS#11 setting is present, which
+// makes the node start the helper even when it seals with another provider.
+func (c Config) PKCS11Configured() bool {
+	return c.SecretPKCS11Module != "" || c.SecretPKCS11KeyLabel != ""
+}
+
+// checkPKCS11Settings fails boot on settings the helper would refuse anyway,
+// so the error names the setting instead of a helper that will not start.
+func checkPKCS11Settings(c Config) error {
+	for _, s := range []struct{ name, value string }{
+		{"SB_SECRET_PKCS11_MODULE", c.SecretPKCS11Module},
+		{"SB_SECRET_PKCS11_TOKEN_LABEL", c.SecretPKCS11TokenLabel},
+		{"SB_SECRET_PKCS11_PIN_FILE", c.SecretPKCS11PINFile},
+		{"SB_SECRET_PKCS11_KEY_LABEL", c.SecretPKCS11KeyLabel},
+	} {
+		if strings.TrimSpace(s.value) == "" {
+			return fmt.Errorf("%s is required for the pkcs11 provider", s.name)
+		}
+	}
+	switch c.SecretPKCS11GCMIV {
+	case "auto", "hsm", "caller":
+	default:
+		return fmt.Errorf("SB_SECRET_PKCS11_GCM_IV must be auto, hsm or caller (got %q)", c.SecretPKCS11GCMIV)
+	}
+	if err := secrets.RefuseGroupOtherBits(c.SecretPKCS11PINFile); err != nil {
+		return fmt.Errorf("SB_SECRET_PKCS11_PIN_FILE: %w", err)
+	}
+	return nil
+}
+
+// SecretVaultOptions projects the Vault settings into the shape pkg/secrets
+// opens. NodeID is filled in by the service, which knows the cluster id.
+func (c Config) SecretVaultOptions() secrets.VaultOptions {
+	return secrets.VaultOptions{
+		Addr:      c.SecretVaultAddr,
+		Mount:     c.SecretVaultMount,
+		KeyName:   c.SecretVaultKeyName,
+		TokenFile: c.SecretVaultTokenFile,
+		Namespace: c.SecretVaultNamespace,
+		CACert:    c.SecretVaultCACert,
+	}
+}
+
+// AuditWitnessConfig projects the witness settings into the shape
+// pkg/auditwitness opens. RetentionDays rides along because a witnessed
+// head must stay locked at least as long as the records it vouches for.
+func (c Config) AuditWitnessConfig() auditwitness.Config {
+	return auditwitness.Config{
+		Backend:       c.AuditWitnessBackend,
+		NodeID:        c.NodeID,
+		RetentionDays: c.SecretAuditRetentionDays,
+		S3: auditexport.S3Config{
+			Bucket:    c.AuditWitnessS3Bucket,
+			Prefix:    c.AuditWitnessS3Prefix,
+			Endpoint:  c.AuditWitnessS3Endpoint,
+			Region:    c.AuditWitnessS3Region,
+			PathStyle: c.AuditWitnessS3PathStyle,
+		},
+	}
+}
+
 // AuditExportConfig projects the audit connector settings into the
 // backend-neutral shape pkg/auditexport validates and builds from.
 func (c Config) AuditExportConfig() auditexport.Config {
@@ -2981,4 +3682,47 @@ func (c Config) ResolvedAuditExportBackend() string {
 // AuditExportEnabled reports whether a non-noop connector is configured.
 func (c Config) AuditExportEnabled() bool {
 	return c.ResolvedAuditExportBackend() != auditexport.BackendNoop
+}
+
+// splitEnvList reads a comma-separated list, dropping blanks.
+func splitEnvList(key string) []string {
+	var out []string
+	for part := range strings.SplitSeq(os.Getenv(key), ",") {
+		if part = strings.TrimSpace(part); part != "" {
+			out = append(out, part)
+		}
+	}
+	return out
+}
+
+// TLS issuers for the on-demand policy (SB_TLS_ISSUER).
+const (
+	TLSIssuerACME     = "acme"
+	TLSIssuerInternal = "internal"
+)
+
+// validateTLSIssuer checks the on-demand issuer settings (§5.10 PC-5). The
+// internal CA takes no ACME directory, and a directory must be an https URL:
+// a typo would otherwise surface only as failed certificates.
+func validateTLSIssuer(cfg Config) error {
+	switch cfg.TLSIssuer {
+	case TLSIssuerACME:
+	case TLSIssuerInternal:
+		if cfg.TLSACMECA != "" || cfg.TLSACMECARoot != "" {
+			return errors.New("SB_TLS_ACME_CA and SB_TLS_ACME_CA_ROOT don't apply when SB_TLS_ISSUER=internal")
+		}
+		return nil
+	default:
+		return fmt.Errorf("SB_TLS_ISSUER must be %q or %q, got %q", TLSIssuerACME, TLSIssuerInternal, cfg.TLSIssuer)
+	}
+	if cfg.TLSACMECA != "" {
+		u, err := url.Parse(cfg.TLSACMECA)
+		if err != nil || u.Scheme != "https" || u.Host == "" {
+			return fmt.Errorf("SB_TLS_ACME_CA must be an https ACME directory URL, got %q", cfg.TLSACMECA)
+		}
+	}
+	if cfg.TLSACMECARoot != "" && !filepath.IsAbs(cfg.TLSACMECARoot) {
+		return fmt.Errorf("SB_TLS_ACME_CA_ROOT must be an absolute path, got %q", cfg.TLSACMECARoot)
+	}
+	return nil
 }

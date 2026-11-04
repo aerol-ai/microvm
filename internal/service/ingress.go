@@ -31,9 +31,15 @@ func (s *Service) CustomDomainDNS(ctx context.Context, sandboxID string) (models
 	if !s.cfg.EnableCustomDomains || s.cfg.Domain == "" {
 		return models.CustomDomainDNSRecords{}, ErrCustomDomainNotSupported
 	}
-	if _, err := s.scopedGet(ctx, sandboxID); err != nil {
+	sandbox, err := s.scopedGet(ctx, sandboxID)
+	if err != nil {
 		return models.CustomDomainDNSRecords{}, err
 	}
+	// The verification TXT is bound to the sandbox's OWNER (not the caller), so
+	// the published instructions match the record that owner must provide when
+	// attaching the hostname — whether the caller is that tenant or an operator
+	// reading on their behalf.
+	ownerToken := customDomainOwnerToken(sandbox.OwnerRef)
 	domains, err := s.store.ListCustomDomains(ctx, sandboxID)
 	if err != nil {
 		return models.CustomDomainDNSRecords{}, err
@@ -47,7 +53,7 @@ func (s *Service) CustomDomainDNS(ctx context.Context, sandboxID string) (models
 	// usable target. Normalise to an empty slice so the JSON shape is a
 	// stable `[]` — SDKs that type Records as `DNSRecord[]` would choke
 	// on `null` (TypeScript .map, Rust serde Vec, etc.).
-	records := models.ComposeDNSRecords(hostnames, target, s.cfg.CustomDomainVerifyPrefix, s.cfg.CustomDomainVerifyValuePrefix)
+	records := models.ComposeDNSRecordsForOwner(hostnames, target, s.cfg.CustomDomainVerifyPrefix, s.cfg.CustomDomainVerifyValuePrefix, ownerToken)
 	if records == nil {
 		records = []models.DNSRecord{}
 	}

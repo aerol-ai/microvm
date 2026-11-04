@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -268,7 +269,7 @@ func TestC96bClusterOperatorActorFallsBackToOwnerRef(t *testing.T) {
 	r := httptest.NewRequest(http.MethodGet, "/", nil)
 	r = r.WithContext(controlplane.ContextWithAccess(r.Context(), controlplane.Access{
 		Identity: controlplane.Identity{OwnerRef: " tenant-x "},
-		Operator: true,
+		Fleet:    true,
 	}))
 	if got := clusterOperatorActor(r); got != "tenant-x" {
 		t.Fatalf("actor = %q, want tenant-x", got)
@@ -627,7 +628,7 @@ func TestC96bBuildImageLogsCallbacksAndRefreshFailure(t *testing.T) {
 	const dockerfile = "FROM alpine\nRUN echo logs"
 
 	builder := &c96bLogBuilder{}
-	h := &handlers{deps: Deps{Builder: builder, Logger: logger}}
+	h := &handlers{deps: Deps{Service: buildService(builder, buildConfig{}), Logger: logger}}
 	body, _ := json.Marshal(buildImageRequest{
 		DockerfileContent: dockerfile,
 		Push:              &buildImagePushSpec{Registry: "ghcr.io/acme/app", Username: "u", Password: "p"},
@@ -643,7 +644,7 @@ func TestC96bBuildImageLogsCallbacksAndRefreshFailure(t *testing.T) {
 		exists:     map[string]bool{docker.BuildTagFor(dockerfile, nil): true},
 		refreshErr: errors.New("refresh failed"),
 	}
-	h = &handlers{deps: Deps{Builder: cached, Logger: logger}}
+	h = &handlers{deps: Deps{Service: buildService(cached, buildConfig{}), Logger: logger}}
 	rr = httptest.NewRecorder()
 	h.buildImage(rr, c96bBuildRequest(t, dockerfile))
 	c96bExpect(t, rr, http.StatusOK)
@@ -651,45 +652,23 @@ func TestC96bBuildImageLogsCallbacksAndRefreshFailure(t *testing.T) {
 
 // --- snapshot.go ------------------------------------------------------------
 
-func TestC96bResolveSnapshotImageBranches(t *testing.T) {
-	logger := c96bLogger()
-	const dockerfile = "FROM alpine\nRUN echo snap"
-	tag := docker.BuildTagFor(dockerfile, nil)
-
-	h := &handlers{deps: Deps{Builder: &fakeImageBuilder{existsErr: errors.New("daemon down")}, Logger: logger}}
-	if _, _, err := h.resolveSnapshotImage(context.Background(), dockerfile, nil); !errors.Is(err, errBuildOperationalV1) {
-		t.Fatalf("exists error = %v, want errBuildOperationalV1", err)
-	}
-
-	h = &handlers{deps: Deps{Builder: &fakeImageBuilder{
-		exists: map[string]bool{tag: true}, refreshErr: errors.New("refresh failed"),
-	}, Logger: logger}}
-	got, built, err := h.resolveSnapshotImage(context.Background(), dockerfile, nil)
-	if err != nil || got != tag || built != "" {
-		t.Fatalf("cache hit = (%q, %q, %v), want (%q, \"\", nil)", got, built, err, tag)
-	}
-
-	h = &handlers{deps: Deps{Builder: &c96bLogBuilder{}, Logger: logger}}
-	got, built, err = h.resolveSnapshotImage(context.Background(), dockerfile, nil)
-	if err != nil || got != tag || built != tag {
-		t.Fatalf("fresh build = (%q, %q, %v), want (%q, %q, nil)", got, built, err, tag, tag)
-	}
-}
-
-func TestC96bRegisterSnapshotRollbackRemoveFailureIsLogged(t *testing.T) {
+// A registration that fails after a fresh build hands the tag to the image
+// GC instead of removing it on the spot.
+func TestC96bRegisterSnapshotRollbackGoesToImageGC(t *testing.T) {
 	st := c96bOpenStore(t)
-	svc := c96bServiceWithCluster(config.Config{}, st, nil)
+	svc := c96bServiceWithCluster(config.Config{ImageBuildGCEnabled: true}, st, nil)
 	if _, err := svc.RegisterSnapshot(context.Background(), &models.SandboxSnapshot{Name: "snap-c96b", Image: "alpine:3"}); err != nil {
 		t.Fatalf("seed snapshot: %v", err)
 	}
 	builder := &c96bLogBuilder{fakeImageBuilder: fakeImageBuilder{removeErr: errors.New("image in use")}}
-	h := &handlers{deps: Deps{Service: svc, Builder: builder, Logger: c96bLogger()}}
+	h := &handlers{deps: Deps{Service: withBuilder(svc, builder), Logger: c96bLogger()}}
 	body, _ := json.Marshal(registerSnapshotRequest{Name: "snap-c96b", DockerfileContent: "FROM alpine\nRUN echo conflict"})
 	rr := httptest.NewRecorder()
 	h.registerSnapshot(rr, httptest.NewRequest(http.MethodPost, "/v1/snapshots", bytes.NewReader(body)))
 	c96bExpect(t, rr, http.StatusConflict)
-	if len(builder.removes) != 1 {
-		t.Fatalf("rollback RemoveImage calls = %d, want 1", len(builder.removes))
+	pending, err := st.ListPendingImageGCDue(context.Background(), time.Now().Add(time.Hour), 10)
+	if err != nil || len(builder.removes) != 0 || len(pending) != 1 || pending[0].Image != docker.BuildTagFor("FROM alpine\nRUN echo conflict", nil) {
+		t.Fatalf("rollback: %d direct removals, pending GC %+v (%v); want the fresh tag scheduled", len(builder.removes), pending, err)
 	}
 }
 
@@ -845,13 +824,46 @@ func TestC96bClusterListSweepSkipsBlankKeysAndCountsLocalFailure(t *testing.T) {
 	}
 }
 
+// The aggregating node not running the runtime is not a missing peer. Found
+// live on a heterogeneous cluster: a server without isolate answered every
+// js-bundle list with X-Aerol-Missing-Js-Bundle-Peers: 1 (UC-168).
+func TestClusterListSweepSelfWithoutTheRuntimeIsNotAMissingPeer(t *testing.T) {
+	c := cluster.NewNoop("self", "http://self", "")
+	notHere := fmt.Errorf("js-bundles require the isolate runtime: %w", models.ErrRuntimeNotImplemented)
+	tests := []struct {
+		name     string
+		catalog  []string
+		wantRows []string
+	}{
+		{name: "rows from the catalogue", catalog: []string{"a", "b"}, wantRows: []string{"a", "b"}},
+		{name: "no rows anywhere", catalog: nil, wantRows: nil},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			catalog := func(*http.Request) ([]string, []string, bool) { return tc.catalog, []string{"w1"}, true }
+			got, err := clusterListSweep[string](httptest.NewRequest(http.MethodGet, "/v1/js-bundles", nil), c, models.RuntimeIsolate, "X-Test",
+				nil, notHere, func(s string) string { return s }, c96bLogger(), "js-bundles", nil, catalog)
+			if err != nil {
+				t.Fatalf("sweep: %v (a node without the runtime must not fail the list)", err)
+			}
+			if got.failedPeers != 0 {
+				t.Fatalf("failedPeers = %d, want 0: this node not running isolate is not a peer that failed", got.failedPeers)
+			}
+			if len(got.rows) != len(tc.wantRows) {
+				t.Fatalf("rows = %v, want %v", got.rows, tc.wantRows)
+			}
+		})
+	}
+}
+
 func TestC96bClusterListJSBundlesWrapBranches(t *testing.T) {
 	t.Run("cluster_enabled_but_detached", func(t *testing.T) {
 		svc := c96bServiceWithCluster(config.Config{EnableCluster: true}, c96bOpenStore(t), nil)
 		svc.ClearClusterForTest()
 		rr := httptest.NewRecorder()
 		c96bHandlers(svc).clusterListJSBundlesWrap(rr, httptest.NewRequest(http.MethodGet, "/v1/js-bundles", nil))
-		c96bExpect(t, rr, http.StatusBadRequest)
+		// Isolate isn't enabled on this node: ErrRuntimeNotImplemented is a 501.
+		c96bExpect(t, rr, http.StatusNotImplemented)
 	})
 	t.Run("sweep_admission_fails", func(t *testing.T) {
 		svc := c96bServiceWithCluster(config.Config{EnableCluster: true}, c96bOpenStore(t), cluster.NewNoop("self", "http://self", ""))

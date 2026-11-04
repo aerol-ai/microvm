@@ -62,6 +62,8 @@ type egressAuditJob struct {
 	spill                                      *workerEgressSpiller
 	sandboxID, incarnationID, network, address string
 	eventTime                                  time.Time
+	// deniedReason marks a policy denial (H5); empty for a connection made.
+	deniedReason string
 }
 
 type egressAuditBinding struct {
@@ -120,7 +122,7 @@ func installDefaultEgressObserver(m *NetMediator, resolvers ...egressAuditBindin
 	}
 	workerEgressSpill.Store(spill)
 	ensureWorkerEgressPool()
-	m.SetEgressObserver(func(sandboxID, network, address string) {
+	enqueue := func(sandboxID, network, address, deniedReason string) {
 		binding := egressAuditBinding{}
 		if resolve != nil {
 			binding, _ = resolve(sandboxID)
@@ -128,14 +130,16 @@ func installDefaultEgressObserver(m *NetMediator, resolvers ...egressAuditBindin
 		job := egressAuditJob{
 			port: port, capability: binding.capability, spill: spill, node: node,
 			sandboxID: sandboxID, incarnationID: binding.incarnationID, network: network, address: address,
-			eventTime: time.Now().UTC(),
+			eventTime: time.Now().UTC(), deniedReason: deniedReason,
 		}
 		select {
 		case workerEgressCh <- job:
 		default:
 			noteWorkerEgressOverflow()
 		}
-	})
+	}
+	m.SetEgressObserver(func(sandboxID, network, address string) { enqueue(sandboxID, network, address, "") })
+	m.SetEgressDenialObserver(enqueue)
 }
 
 // noteWorkerEgressOverflow is the entire dial-path cost of a full queue: two
@@ -191,13 +195,17 @@ func postOrSpillWorkerEgress(job egressAuditJob) {
 	// fields ride along for operators reading the raw spill, but the drain
 	// rebinds sandbox/incarnation from the capability and stamps actor/owner
 	// itself, so a worker cannot spill under another sandbox's name.
+	result, reason := "success", "ok"
+	if job.deniedReason != "" {
+		result, reason = "failure", job.deniedReason
+	}
 	job.spill.enqueueRecord(workerEgressSpillRecord{
 		Event: workerEgressAuditEvent{
 			Time:          job.eventTime,
 			Actor:         job.node,
 			SandboxID:     sandboxID,
-			Result:        "success",
-			Reason:        "ok",
+			Result:        result,
+			Reason:        reason,
 			NodeID:        job.node,
 			Kind:          "egress",
 			Destination:   address,
@@ -209,10 +217,14 @@ func postOrSpillWorkerEgress(job egressAuditJob) {
 }
 
 func postWorkerEgressAudit(job egressAuditJob) error {
-	body, err := json.Marshal(map[string]any{
+	fields := map[string]any{
 		"network":     strings.TrimSpace(job.network),
 		"destination": job.address,
-	})
+	}
+	if job.deniedReason != "" {
+		fields["result"], fields["reason"] = "failure", job.deniedReason
+	}
+	body, err := json.Marshal(fields)
 	if err != nil {
 		return err
 	}

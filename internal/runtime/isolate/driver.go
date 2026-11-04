@@ -22,6 +22,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/aerol-ai/microvm/pkg/egresspolicy"
+	pkgisolate "github.com/aerol-ai/microvm/pkg/isolate"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
 
@@ -59,6 +61,9 @@ type sandboxRecord struct {
 	bundleRef   string
 	egress      EgressPolicy
 	needsReload bool
+	// learn is the learn-mode recording (P2-7), kept across reaps and
+	// switches to enforce, dropped with the record on destroy.
+	learn *egresspolicy.Recorder
 }
 
 // group is one running workerd host plus the group key it serves. members is
@@ -105,6 +110,11 @@ func (d *Driver) SetBundleResolver(r BundleResolver) {
 // production, Phase 2).
 func (d *Driver) SetHostSupervisor(s HostSupervisor) {
 	d.supervisor = s
+	if learner, ok := s.(interface {
+		SetLearnObserver(pkgisolate.LearnObserver)
+	}); ok {
+		learner.SetLearnObserver(d.observeLearn)
+	}
 }
 
 // SetWarmPool injects the blank-workerd-host pool (internal/pool/isolate,

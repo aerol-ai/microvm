@@ -246,14 +246,6 @@ func TestAddCustomDomainSuccess(t *testing.T) {
 	}
 }
 
-func TestResolveSnapshotImageSingleLineFROM(t *testing.T) {
-	h := &handlers{deps: Deps{Build: BuildConfig{}}}
-	img, built, err := h.resolveSnapshotImage(context.Background(), "FROM alpine:3.20", nil)
-	if err != nil || built != "" || img != "alpine:3.20" {
-		t.Fatalf("resolveSnapshotImage = (%q, %q, %v)", img, built, err)
-	}
-}
-
 func TestClusterTemplateItemWrapFallsThroughToLocal(t *testing.T) {
 	env := newTemplateV1TestEnv(t)
 	now := time.Now().UTC()

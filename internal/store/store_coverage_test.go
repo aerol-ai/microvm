@@ -321,10 +321,13 @@ func TestListHelpersQueryErrorsByDroppedTables(t *testing.T) {
 			call: func(st *Store) error { _, err := st.ListGCEligibleTemplates(ctx, now); return err },
 		},
 		{
-			name: "ListSnapshotsPendingPush",
+			name: "ListSnapshotsPendingPushPage",
 			drop: "sandbox_snapshots",
 			seed: func(t *testing.T, st *Store) {},
-			call: func(st *Store) error { _, err := st.ListSnapshotsPendingPush(ctx); return err },
+			call: func(st *Store) error {
+				_, err := st.ListSnapshotsPendingPushPage(ctx, SnapshotPushCursor{}, 10)
+				return err
+			},
 		},
 		{
 			name: "ListAllExposedPorts",
@@ -366,7 +369,7 @@ func TestListHelpersQueryErrorsByDroppedTables(t *testing.T) {
 			name: "ResolveSandboxIDByName",
 			drop: "sandboxes",
 			seed: func(t *testing.T, st *Store) {},
-			call: func(st *Store) error { _, err := st.ResolveSandboxIDByName(ctx, "x"); return err },
+			call: func(st *Store) error { _, err := st.ResolveSandboxIDByName(ctx, "", "x"); return err },
 		},
 		{
 			name: "IsTemplateReferenced",
@@ -978,8 +981,10 @@ func TestInsertSandboxAndUpsertRemaining(t *testing.T) {
 		t.Fatal("toolbox token without cipher")
 	}
 
+	// Names are unique per owner, so the duplicate must share the owner.
 	dupName := sampleSandbox("sb-dup-name")
 	dupName.Name = "named-full"
+	dupName.OwnerRef = "tenant-a"
 	tx, err := st.db.BeginTx(ctx, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -3051,7 +3056,7 @@ func TestFleetResolveAndDomainConflictEdges(t *testing.T) {
 	if err := st.SetFleetSuspended(ctx, "missing", true); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("SetFleetSuspended missing = %v", err)
 	}
-	if _, err := st.ResolveSandboxIDByName(ctx, "   "); !errors.Is(err, ErrNotFound) {
+	if _, err := st.ResolveSandboxIDByName(ctx, "", "   "); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("ResolveSandboxIDByName blank = %v", err)
 	}
 
@@ -3352,7 +3357,7 @@ func TestListHelpersScanCorruptRows(t *testing.T) {
 		if _, err := st.ListSnapshots(ctx); err == nil {
 			t.Fatal("ListSnapshots corrupt created_at")
 		}
-		if _, err := st.ListSnapshotsPendingPush(ctx); err == nil {
+		if _, err := st.ListSnapshotsPendingPushPage(ctx, SnapshotPushCursor{}, 10); err == nil {
 			t.Fatal("ListSnapshotsPendingPush corrupt created_at")
 		}
 	})
@@ -3883,7 +3888,7 @@ func TestListGetWithAttachmentsAndClosedDB(t *testing.T) {
 	_, _ = st.ListTemplatesReadyBefore(ctx, now)
 	_, _ = st.ListReadyTemplateIDs(ctx)
 	_, _ = st.ListGCEligibleTemplates(ctx, now)
-	_, _ = st.ListSnapshotsPendingPush(ctx)
+	_, _ = st.ListSnapshotsPendingPushPage(ctx, SnapshotPushCursor{}, 10)
 	_, _ = st.ListAllExposedPorts(ctx)
 	_, _ = st.ListAllCustomDomains(ctx)
 	_, _ = st.ListCustomDomains(ctx, "sb")
@@ -4184,7 +4189,7 @@ func TestSnapshotScanCorruptEntrypoint(t *testing.T) {
 	`, "{bad", "snap-e"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := st.GetSnapshot(ctx, "snap-e"); err == nil {
+	if _, err := st.GetSnapshot(ctx, "", "snap-e"); err == nil {
 		t.Fatal("GetSnapshot corrupt entrypoint")
 	}
 	if _, err := st.ListSnapshots(ctx); err == nil {

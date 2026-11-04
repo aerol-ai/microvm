@@ -56,7 +56,7 @@ func TestSecuritySpecOptsNonEmpty(t *testing.T) {
 
 func TestResourceSpecOptsHonorsRequest(t *testing.T) {
 	req := models.CreateSandboxRequest{CPU: 2, MemoryMB: 512}
-	opts := resourceSpecOpts(req)
+	opts := resourceSpecOpts(req, 0)
 	if len(opts) == 0 {
 		t.Fatal("expected resource opts")
 	}

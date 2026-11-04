@@ -144,24 +144,6 @@ func TestMiddlewareWriteJSONAndError(t *testing.T) {
 	}
 }
 
-func TestExtractBearerToken(t *testing.T) {
-	r := httptest.NewRequest("GET", "/", nil)
-	if extractBearerToken(r) != "" {
-		t.Fatal("expected empty token")
-	}
-
-	r.Header.Set("Authorization", "Bearer valid")
-	if extractBearerToken(r) != "valid" {
-		t.Fatal("expected valid")
-	}
-
-	r.Header.Del("Authorization")
-	r.Header.Set("Sec-WebSocket-Protocol", "sandbox.bearer, ws-token")
-	if extractBearerToken(r) != "ws-token" {
-		t.Fatal("expected ws-token")
-	}
-}
-
 func TestWriteStoreAwareError(t *testing.T) {
 	s := &Server{logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
 	rw := httptest.NewRecorder()

@@ -53,6 +53,10 @@ type SecretAuditQuery struct {
 	Cursor string // exclusive lower bound time (RFC3339Nano), or empty = from start
 	// Kind filters by event kind ("egress", "secret_open"). Empty = all kinds.
 	Kind string
+	// Caller filters by the record's caller: its id ("tok_7Hq2…",
+	// "operator", "system:lifecycle") or its display name, ignoring case.
+	// Empty = every caller. Gap markers always pass, as for Kind.
+	Caller string
 	// IncarnationID scopes history to one placement lifetime. When empty and
 	// the sandbox still has a live placement, ListSecretAuditLocal defaults
 	// it from Placement.IncarnationID.
@@ -179,7 +183,7 @@ func (s *Service) ListSecretAuditLocal(ctx context.Context, sandboxID string, op
 	if limit > maxSecretAuditLimit {
 		limit = maxSecretAuditLimit
 	}
-	q := secretAuditPageQuery{sandboxID: sandboxID, incarnationID: incarnationID, kind: strings.TrimSpace(opts.Kind), limit: limit}
+	q := secretAuditPageQuery{sandboxID: sandboxID, incarnationID: incarnationID, kind: strings.TrimSpace(opts.Kind), caller: strings.TrimSpace(opts.Caller), limit: limit}
 	if c := strings.TrimSpace(opts.Cursor); c != "" {
 		q.after, q.afterKey, err = parseSecretAuditCursor(c)
 		if err != nil {
@@ -305,6 +309,7 @@ type secretAuditPageQuery struct {
 	sandboxID     string
 	incarnationID string
 	kind          string
+	caller        string
 	after         time.Time
 	afterKey      string
 	limit         int
@@ -319,7 +324,8 @@ func (q secretAuditPageQuery) indexMinTime() int64 {
 }
 
 func (q secretAuditPageQuery) matches(ev SecretAuditEvent) bool {
-	return secretAuditEventMatches(ev, q.sandboxID, q.incarnationID, q.kind, q.after, q.afterKey)
+	return secretAuditEventMatches(ev, q.sandboxID, q.incarnationID, q.kind, q.after, q.afterKey) &&
+		secretAuditCallerMatches(ev, q.caller)
 }
 
 // secretAuditPageCollector retains the first page plus one look-ahead row.
@@ -857,7 +863,7 @@ func (s *Service) ListSecretAudit(ctx context.Context, sandboxID string, opts Se
 						results <- peerResult{nodeID: j.nodeID, err: fanCtx.Err()}
 						continue
 					}
-					page, fetchErr := fetcher.FetchSandboxAuditFromPeer(fanCtx, j.nodeID, sandboxID, limit, opts.Cursor, opts.Kind, opts.IncarnationID)
+					page, fetchErr := fetcher.FetchSandboxAuditFromPeer(fanCtx, j.nodeID, sandboxID, limit, opts.Cursor, opts.Kind, opts.IncarnationID, opts.Caller)
 					<-secretAuditFanoutSlots
 					results <- peerResult{nodeID: j.nodeID, page: page, err: fetchErr}
 				}
@@ -887,7 +893,8 @@ func (s *Service) ListSecretAudit(ctx context.Context, sandboxID string, opts Se
 			coverage.Answered = append(coverage.Answered, r.nodeID)
 			for _, dto := range r.page.Events {
 				ev := secretAuditEventFromDTO(dto)
-				if !secretAuditEventMatches(ev, sandboxID, opts.IncarnationID, opts.Kind, after, afterKey) {
+				if !secretAuditEventMatches(ev, sandboxID, opts.IncarnationID, opts.Kind, after, afterKey) ||
+					!secretAuditCallerMatches(ev, opts.Caller) {
 					continue
 				}
 				merged = append(merged, ev)
@@ -1006,6 +1013,18 @@ func secretAuditEventMatches(ev SecretAuditEvent, sandboxID, incarnationID, kind
 		return false
 	}
 	return !ev.Time.Equal(after) || (afterKey != "" && secretAuditEventCursorKey(ev) > afterKey)
+}
+
+// secretAuditCallerMatches is the caller filter (plans/identity-and-access.md
+// §5.10): the record's caller id, or its display name ignoring case. Gap
+// markers always match, so a caller-filtered page cannot hide a silent
+// drop; the same rule the kind filter follows.
+func secretAuditCallerMatches(ev SecretAuditEvent, caller string) bool {
+	caller = strings.TrimSpace(caller)
+	if caller == "" || ev.Result == secretAuditResultGap || ev.Kind == secretAuditKindGap {
+		return true
+	}
+	return auditlog.SearchFilter{Caller: caller}.Match(ev)
 }
 
 const secretAuditCursorSep = "\x1f"

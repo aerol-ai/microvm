@@ -91,6 +91,11 @@ func TestLift3AgentRemainingClientBranches(t *testing.T) {
 				}
 			}
 			w.Header().Set("Content-Type", "application/json")
+			if r.URL.Query().Get("authoritative") == "true" && len(req.IDs) == 1 && req.IDs[0] == "sb-res-empty" {
+				// CancelReservation's leader read.
+				_ = json.NewEncoder(w).Encode(map[string]Placement{"sb-res-empty": placements["sb-res-empty"]})
+				return
+			}
 			_, _ = io.WriteString(w, "null")
 		case r.Method == http.MethodPost && (r.URL.Path == PublicInternalApplyPath || r.URL.Path == InternalAPIPath):
 			http.Error(w, "apply failed", http.StatusInternalServerError)
@@ -99,7 +104,7 @@ func TestLift3AgentRemainingClientBranches(t *testing.T) {
 		}
 	}), Member{NodeID: "worker-self", Alive: true, Role: config.NodeRoleWorker})
 
-	if _, _, err := agent.OwnerOfName("named"); err == nil {
+	if _, _, err := agent.OwnerOfName("", "named"); err == nil {
 		t.Fatal("owner-of-name 500")
 	}
 	if sec := agent.SecretsOf("missing"); sec.Ref != "" {

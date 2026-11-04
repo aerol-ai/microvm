@@ -512,7 +512,7 @@ func TestStoreCases(t *testing.T) {
 					t.Fatalf("StopIfIdleFor = %v, want 15m", native.Lifecycle.StopIfIdleFor)
 				}
 
-				resolved, err := st.ResolveSandboxIDByName(ctx, "workspace-alpha")
+				resolved, err := st.ResolveSandboxIDByName(ctx, "", "workspace-alpha")
 				if err != nil {
 					t.Fatalf("ResolveSandboxIDByName() error = %v", err)
 				}
@@ -624,7 +624,7 @@ func TestStoreCases(t *testing.T) {
 				if _, err := st.GetCompatState(ctx, sandbox.ID, models.FacadeDaytona); !errors.Is(err, ErrNotFound) {
 					t.Fatalf("expected ErrNotFound after delete, got %v", err)
 				}
-				if _, err := st.ResolveSandboxIDByName(ctx, "cascade-name"); !errors.Is(err, ErrNotFound) {
+				if _, err := st.ResolveSandboxIDByName(ctx, "", "cascade-name"); !errors.Is(err, ErrNotFound) {
 					t.Fatalf("expected ErrNotFound from ResolveSandboxIDByName(), got %v", err)
 				}
 			},
@@ -762,7 +762,7 @@ func TestStoreCases(t *testing.T) {
 				}); err != nil {
 					t.Fatalf("UpsertSnapshotAlias() error = %v", err)
 				}
-				if err := st.DeleteSnapshot(ctx, snapshotName); err != nil {
+				if err := st.DeleteSnapshot(ctx, "", snapshotName); err != nil {
 					t.Fatalf("DeleteSnapshot() error = %v", err)
 				}
 				if _, err := st.GetSnapshotAlias(ctx, aliasID); !errors.Is(err, ErrNotFound) {
@@ -916,7 +916,7 @@ func TestStoreCases(t *testing.T) {
 				if err := st.CreateSnapshot(ctx, snapshot); err != nil {
 					t.Fatalf("CreateSnapshot() error = %v", err)
 				}
-				got, err := st.GetSnapshot(ctx, snapshot.Name)
+				got, err := st.GetSnapshot(ctx, snapshot.OwnerRef, snapshot.Name)
 				if err != nil {
 					t.Fatalf("GetSnapshot() error = %v", err)
 				}
@@ -960,7 +960,7 @@ func TestStoreCases(t *testing.T) {
 				if err := st.Delete(ctx, sandbox.ID); err != nil {
 					t.Fatalf("Delete() error = %v", err)
 				}
-				got, err := st.GetSnapshot(ctx, snapshot.Name)
+				got, err := st.GetSnapshot(ctx, snapshot.OwnerRef, snapshot.Name)
 				if err != nil {
 					t.Fatalf("GetSnapshot() after delete error = %v", err)
 				}
@@ -1007,13 +1007,13 @@ func TestStoreCases(t *testing.T) {
 					t.Fatalf("unexpected snapshot order: %+v", items)
 				}
 
-				if err := st.DeleteSnapshot(ctx, newer.Name); err != nil {
+				if err := st.DeleteSnapshot(ctx, newer.OwnerRef, newer.Name); err != nil {
 					t.Fatalf("DeleteSnapshot() error = %v", err)
 				}
-				if _, err := st.GetSnapshot(ctx, newer.Name); !errors.Is(err, ErrNotFound) {
+				if _, err := st.GetSnapshot(ctx, newer.OwnerRef, newer.Name); !errors.Is(err, ErrNotFound) {
 					t.Fatalf("expected ErrNotFound after delete, got %v", err)
 				}
-				remaining, err := st.GetSnapshot(ctx, older.Name)
+				remaining, err := st.GetSnapshot(ctx, older.OwnerRef, older.Name)
 				if err != nil {
 					t.Fatalf("GetSnapshot(older) error = %v", err)
 				}
@@ -2650,57 +2650,53 @@ func TestWasmStateKVCRUD(t *testing.T) {
 	}
 }
 
-// TestSnapshotPushClaimLease mirrors TestTemplatePushClaimLease for the
-// snapshot ledger: 'pushing' hides a row from the retry queue only for as long
-// as the claim is live, so a pusher that dies mid-push cannot strand the
-// snapshot in a state no reconciler will ever revisit.
-func TestSnapshotPushClaimLease(t *testing.T) {
+// ListCompatStateByOwner returns only the given owner's sandboxes' facade
+// state, joining through sandboxes.owner_ref — the owner-scoped read the
+// service uses so a user token never scans another tenant's rows (D13).
+func TestListCompatStateByOwner(t *testing.T) {
 	ctx := context.Background()
 	st := newTestStore(t)
 
-	snap := &models.SandboxSnapshot{
-		Name:                  "snap-lease",
-		Image:                 "alpine:3.19",
-		ImageID:               "sha256:abc",
-		CreatedAt:             time.Now().UTC(),
-		ImageDistributionMode: models.ImageDistributionLocalOnly,
-		PushState:             models.SnapshotPushStatePending,
+	mk := func(id, owner, blob string) {
+		sb := sampleSandbox(id)
+		sb.OwnerRef = owner
+		if err := st.Create(ctx, sb); err != nil {
+			t.Fatalf("Create(%s): %v", id, err)
+		}
+		if err := st.UpsertCompatState(ctx, id, models.FacadeE2B, blob); err != nil {
+			t.Fatalf("UpsertCompatState(%s): %v", id, err)
+		}
 	}
-	if err := st.CreateSnapshot(ctx, snap); err != nil {
-		t.Fatalf("CreateSnapshot: %v", err)
+	mk("sb-a1", "acme", `{"v":"a1"}`)
+	mk("sb-a2", "acme", `{"v":"a2"}`)
+	mk("sb-g1", "globex", `{"v":"g1"}`)
+
+	acme, err := st.ListCompatStateByOwner(ctx, models.FacadeE2B, "acme")
+	if err != nil {
+		t.Fatalf("ListCompatStateByOwner: %v", err)
+	}
+	if len(acme) != 2 {
+		t.Fatalf("acme rows = %d, want 2: %v", len(acme), acme)
+	}
+	if _, leaked := acme["sb-g1"]; leaked {
+		t.Fatalf("acme leaked globex's row")
+	}
+	if acme["sb-a1"].StateJSON != `{"v":"a1"}` {
+		t.Fatalf("sb-a1 state = %q", acme["sb-a1"].StateJSON)
 	}
 
-	if err := st.SetSnapshotPushState(ctx, snap.Name, models.SnapshotPushStatePushing, ""); err != nil {
-		t.Fatalf("claim: %v", err)
-	}
-	rows, err := st.ListSnapshotsPendingPush(ctx)
+	// A facade with no rows for this owner yields an empty (non-nil) map.
+	none, err := st.ListCompatStateByOwner(ctx, models.FacadeDaytona, "acme")
 	if err != nil {
-		t.Fatalf("ListSnapshotsPendingPush: %v", err)
+		t.Fatalf("ListCompatStateByOwner(daytona): %v", err)
 	}
-	if len(rows) != 0 {
-		t.Fatalf("live claim listed %d rows, want 0", len(rows))
+	if len(none) != 0 {
+		t.Fatalf("daytona rows = %d, want 0", len(none))
 	}
 
-	expired := time.Now().UTC().Add(-PushClaimLease - time.Minute)
-	if _, err := st.db.ExecContext(ctx, `UPDATE sandbox_snapshots SET push_claimed_at = ? WHERE name = ?`, expired, snap.Name); err != nil {
-		t.Fatalf("age the claim: %v", err)
-	}
-	rows, err = st.ListSnapshotsPendingPush(ctx)
-	if err != nil {
-		t.Fatalf("ListSnapshotsPendingPush after expiry: %v", err)
-	}
-	if len(rows) != 1 || rows[0].Name != snap.Name {
-		t.Fatalf("expired claim listed %v, want the row back", rows)
-	}
-
-	if err := st.SetSnapshotPushState(ctx, snap.Name, models.SnapshotPushStateActive, ""); err != nil {
-		t.Fatalf("finish: %v", err)
-	}
-	rows, err = st.ListSnapshotsPendingPush(ctx)
-	if err != nil {
-		t.Fatalf("ListSnapshotsPendingPush after finish: %v", err)
-	}
-	if len(rows) != 0 {
-		t.Fatalf("finished snapshot listed %v, want none", rows)
+	// A closed DB surfaces the query error rather than a nil map.
+	st.Close()
+	if _, err := st.ListCompatStateByOwner(ctx, models.FacadeE2B, "acme"); err == nil {
+		t.Fatal("ListCompatStateByOwner on a closed store returned no error")
 	}
 }

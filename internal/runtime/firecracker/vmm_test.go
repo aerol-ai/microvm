@@ -338,27 +338,109 @@ func TestVMM_CleanupRejectsEscape(t *testing.T) {
 	}
 }
 
-func TestCappedBuffer(t *testing.T) {
-	b := newCappedBuffer(8)
-	n, _ := b.Write([]byte("12345"))
-	if n != 5 {
-		t.Fatalf("Write n = %d", n)
+// A VM's output goes to a file in its run dir, whose head is the "stderr
+// tail" (the first error a failed boot printed), noting how much follows.
+func TestVMMOutput(t *testing.T) {
+	dir := t.TempDir()
+	out, err := openVMMOutput(dir)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if got := b.String(); got != "12345" {
+	if _, err := out.file.WriteString("boot error\n"); err != nil {
+		t.Fatal(err)
+	}
+	if got := out.String(); got != "boot error\n" {
 		t.Fatalf("String = %q", got)
 	}
-	// Fill exactly to cap.
-	_, _ = b.Write([]byte("678"))
-	if got := b.String(); got != "12345678" {
-		t.Fatalf("String = %q", got)
+	if _, err := out.file.WriteString(strings.Repeat("x", stderrTailCap)); err != nil {
+		t.Fatal(err)
 	}
-	// Overflow — first byte accepted up to cap, rest reported dropped.
-	_, _ = b.Write([]byte("XXXXX"))
-	got := b.String()
-	if !strings.HasPrefix(got, "12345678\n[... ") {
-		t.Fatalf("overflow report missing: %q", got)
+	_ = out.file.Close()
+	if got := out.String(); !strings.HasPrefix(got, "boot error\n") || !strings.HasSuffix(got, "[... 11 more bytes ...]") {
+		t.Fatalf("String = ...%q", got[len(got)-40:])
 	}
-	if !strings.Contains(got, "5 more bytes dropped") {
-		t.Fatalf("dropped byte count missing: %q", got)
+	if (*vmmOutput)(nil).String() != "" || (&vmmOutput{}).String() != "" || readOutputHead(filepath.Join(dir, "missing")) != "" {
+		t.Fatal("no output file must read as empty")
+	}
+	if _, err := openVMMOutput(filepath.Join(dir, "missing", "dir")); err == nil {
+		t.Fatal("an output file in a missing dir was opened")
+	}
+}
+
+// The output file is cut back to its head once it outgrows its cap, and
+// appends land at the new end.
+func TestBoundVMMOutput(t *testing.T) {
+	out, err := openVMMOutput(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer out.file.Close()
+	done := make(chan struct{})
+	finished := make(chan struct{})
+	go func() { boundOutput(out.path, done, int64(stderrTailCap+10), 5*time.Millisecond); close(finished) }()
+	if _, err := out.file.WriteString(strings.Repeat("y", stderrTailCap+100)); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		info, err := os.Stat(out.path)
+		if err == nil && info.Size() == int64(stderrTailCap) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("output not cut back: %v %v", info.Size(), err)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if _, err := out.file.WriteString("after"); err != nil {
+		t.Fatal(err)
+	}
+	if info, _ := os.Stat(out.path); info.Size() != int64(stderrTailCap)+5 {
+		t.Fatalf("an append after the cut landed at %d", info.Size())
+	}
+	close(done)
+	<-finished
+}
+
+// A jailed VM's chroot is <base>/firecracker/<id>/root; Cleanup removes the
+// <id> dir too once it is empty, and nothing that is not the VM's own.
+func TestCleanupRemovesTheJailDir(t *testing.T) {
+	base := t.TempDir()
+	jail := filepath.Join(base, "firecracker", "sb-jail")
+	root := filepath.Join(jail, "root")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	v := &vmm{sandboxID: "sb-jail", runDir: root, cfg: Config{UseJailer: true, JailerChrootBase: base}}
+	if err := v.Cleanup(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(jail); !os.IsNotExist(err) {
+		t.Fatal("the jail dir is left")
+	}
+	// A dir holding something else, or named for another VM, stays.
+	other := filepath.Join(base, "firecracker", "sb-other")
+	if err := os.MkdirAll(filepath.Join(other, "root"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(other, "keep"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	removeJailDir(filepath.Join(other, "root"), "sb-other")
+	removeJailDir(filepath.Join(base, "firecracker", "sb-x", "root"), "sb-y")
+	if _, err := os.Stat(other); err != nil {
+		t.Fatal("a non-empty jail dir was removed")
+	}
+	// Adopted VMs clean up the same way.
+	adoptedRoot := filepath.Join(base, "firecracker", "sb-adopted", "root")
+	if err := os.MkdirAll(adoptedRoot, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	h := &adoptedVMM{rec: vmmRecord{SandboxID: "sb-adopted", RunDir: adoptedRoot, OwnsRunDir: true}, cleanupRoot: base}
+	if err := h.Cleanup(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Dir(adoptedRoot)); !os.IsNotExist(err) {
+		t.Fatal("the adopted VM's jail dir is left")
 	}
 }

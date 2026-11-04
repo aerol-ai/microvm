@@ -71,19 +71,20 @@ func TestCoverage95SocketServersAcceptConnections(t *testing.T) {
 			path := filepath.Join(os.TempDir(), "aerol-worker-"+strconv.FormatInt(time.Now().UnixNano(), 10)+".sock")
 			t.Cleanup(func() { _ = os.Remove(path) })
 			go func() { _ = serve(path) }()
+			// The socket file appears at bind, a moment before listen, so a
+			// dial as soon as it exists can be refused: retry until the
+			// server accepts, rather than treating the file as readiness.
 			deadline := time.Now().Add(time.Second)
+			var conn net.Conn
 			for {
-				if _, err := os.Stat(path); err == nil {
+				var err error
+				if conn, err = net.Dial("unix", path); err == nil {
 					break
 				}
 				if time.Now().After(deadline) {
-					t.Fatal("socket was not created")
+					t.Fatalf("socket never accepted a connection: %v", err)
 				}
 				time.Sleep(time.Millisecond)
-			}
-			conn, err := net.Dial("unix", path)
-			if err != nil {
-				t.Fatal(err)
 			}
 			if err := writeFrame(conn, Envelope{Type: MsgHealthPing, SandboxID: "sb"}); err != nil {
 				t.Fatal(err)

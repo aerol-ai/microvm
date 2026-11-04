@@ -63,6 +63,10 @@ type Session struct {
 	bytes       atomic.Int64
 	attached    atomic.Int32
 
+	// wait collects the process's exit (Manager.startProcess). Nil falls
+	// back to cmd.Wait.
+	wait func() (int, string)
+
 	exited     atomic.Bool
 	exitedAt   time.Time
 	exitCode   int
@@ -344,7 +348,11 @@ func (s *Session) finish(code int, signal string, failed bool) {
 // Manager wires output pumps before calling this.
 func (s *Session) waitAndFinish() {
 	s.pumpWG.Wait()
-	code, sig := waitProcess(s.cmd)
+	wait := s.wait
+	if wait == nil {
+		wait = func() (int, string) { return waitProcess(s.cmd) }
+	}
+	code, sig := wait()
 	s.finish(code, sig, false)
 }
 

@@ -27,7 +27,9 @@ On the open-source build:
   (`pkg/controlplane.Witness`, wired via `SB_SECRET_AUDIT_EXTERNAL_WITNESS`)
   records chain heads / receipts so retroactive local-file tampering is
   detectable. It does **not** store full audit batches today and cannot rebuild
-  the JSONL after disk loss.
+  the JSONL after disk loss. The open-source build gets a real witness from
+  `SB_AUDIT_WITNESS_BACKEND=s3`, an S3 bucket with Object Lock; see
+  [S3 audit witness](#s3-audit-witness).
 - **Batch export.** Set `SB_AUDIT_EXPORT_BACKEND=webhook` with an `https://`
   `SB_SECRET_AUDIT_EXPORT_URL` and `SB_SECRET_AUDIT_EXPORT_BEARER_TOKEN` (or
   HMAC / mTLS), or `s3` / `bus`, to enable authenticated periodic export
@@ -81,8 +83,14 @@ only `ca.crt`, `node.crt`, and `node.key`.
 | `SandboxdSecretPutOutboxBacklogHigh` | Durable create-path peer PUTs are queued (`aerolvm_secret_put_outbox_pending`) | Check peer health/mTLS; put-outbox uses the same bounded worker pool as delete reconcile |
 | `SandboxdSecretPutOutboxFailures` | Put-outbox persist/reconcile failed (`aerolvm_secret_put_outbox_failures_total`) | Inspect disk/SQLite and peer reachability; creates retract when the initial journal fails |
 | `SandboxdSecretAuditExportFailing` | Off-node event batches are not being accepted | Restore receiver connectivity/auth before local disk loss exceeds the recovery objective |
+| `SandboxdAuditWitnessShipFailing` | Heads have not reached the witness for 15 minutes (`aerolvm_secret_audit_witness_healthy` is 0 and failures keep rising) | Fix the path to S3, the node role's witness grants or the bucket policy (the log names the error). Do not restart the node until the witness answers: boot validation needs it |
+| `SandboxdAuditWitnessForeignHead` | This node's witness key holds a head this node did not ship (`aerolvm_secret_audit_witness_foreign_head_total` rose) | Check for a duplicate `SB_NODE_ID`, then treat it as a security incident: [foreign head](#foreign-head-sandboxdauditwitnessforeignhead) |
 | `SandboxdClusterCertExpiring` | Node (<14 days) or CA (<30 days) certificate approaches expiry | Sign a fresh node pair and atomically replace `node.crt`/`node.key`; prefer ≤90-day leaf certs |
-| `SandboxdSecretProviderCanaryFailing` | Provider boot/runtime canary is down | For `awskms`, check IAM/KMS; consider `SB_SECRET_PROVIDER_STRICT_BOOT` |
+| `SandboxdSecretProviderCanaryFailing` | Provider boot/runtime canary is down; with wrapped custody the node also cannot see a revoke | Check the key store's reachability and this node's grants; consider `SB_SECRET_PROVIDER_STRICT_BOOT` |
+| `SandboxdServerKeyPlaintext` | An enterprise node keeps its server key in plaintext | [Wrap it](#server-key-in-plaintext) |
+| `SandboxdKeyRevoked` | The customer's key store revoked the key; the node stopped | [Key revoked](#key-revoked) |
+| `SandboxdKeyVersionRetiredInUse` | Rows are on a key version the key store no longer decrypts | [Re-enable the version](#retired-key-version-in-use) |
+| `SandboxdKeyStoreThrottling` | The key store throttles over 5% of calls | [Raise its limit](#key-store-throttling) |
 
 ## Audit export connectors
 
@@ -148,15 +156,370 @@ operator can request with `POST /v1/audit/verify` in the background:
 Do not delete `secrets.verified` to "force" a full check — set the mode to
 `full` for one boot, or call `POST /v1/audit/verify`.
 
+### Rolling back below the audit-caller release
+
+Records carry a hash-covered `caller` (who caused the record, and `via`, the
+edge node a forwarded request came through) and, on API action records, a
+hash-covered `request` (the call: method, route, status, digest). The same
+release writes new record kinds: `api`, `auth_denied` and `api_flood_mode`.
+A binary from before that release drops the fields when it reads a record,
+computes a different hash, and so fails boot verification on any log holding
+one; an older `aerolvm audit verify` or `aerolvm audit search` fails the same
+way. Upgrade the CLI first. The fields and the kinds share one gate, so
+everything below applies to all of them.
+
+- **When a node starts writing it.** A single node: from its first secret
+  open after the upgrade. A cluster node: only once every live gossip member
+  (servers, workers and ingress) advertises the release, and never while it
+  knows only itself and still has peers to join. During a rolling upgrade no
+  node writes it, so rolling the first nodes back is safe.
+- **Rolling back once it is written** is not supported. The older binary
+  refuses to boot under `SB_SECRET_AUDIT_STRICT_BOOT=true` (always the case
+  in enterprise mode). With strict boot off it starts, but its audit writer
+  stays unavailable and every record is dropped and counted in
+  `aerolvm_audit_events_dropped_total` until the node runs the newer release
+  again. Roll back no further than this release.
+
 An **empty** local chain is a failure, not a clean bill of health, whenever
 something still remembers a chain: the external witness holds a head for this
 node, or `witness_receipts.jsonl` records a head this node shipped. Deleting
 the log is the cheapest tamper there is, and it used to short-circuit
 verification before the witness was ever consulted. A node genuinely rebuilt
-from scratch under the same node id therefore fails witness verification until
-an operator clears that node's witnessed head (and the stale local receipt)
-deliberately — evidence loss is an event someone signs off on, not something
-the daemon papers over.
+from scratch under the same node id therefore fails witness verification —
+evidence loss is an event someone signs off on, not something the daemon
+papers over. With an Object Lock witness the old head can never be cleared,
+so the recovery is to bring the node back under a new id:
+[Rebuild a node under a new SB_NODE_ID](#rebuild-a-node-under-a-new-sb_node_id).
+
+## S3 audit witness
+
+The witness keeps each node's audit fingerprint (the hash-chain head) off the
+node, in an S3 bucket with **Object Lock**. Object Lock means nobody can change
+or delete a stored version until its lock ends, not even the node that wrote
+it. Design: `plans/open-audit-witness.md`. Settings and their defaults:
+`setup/config-defaults.md`, "Audit witness".
+
+**What it proves.** Someone who takes over a node *after* a head was stored
+cannot rewrite or delete the history that head covers without being caught.
+The node refuses to boot, and `aerolvm audit verify` reports FAIL.
+
+**What it does not prove.**
+
+- Records written since the last ship. Heads ship every
+  `SB_SECRET_AUDIT_WITNESS_INTERVAL` (30 s), so the newest 30 seconds can be
+  rewritten.
+- A node that was already compromised when it wrote. It can witness a forged
+  chain from the start.
+- That a newer head is honest. A compromised node can store a new head that
+  matches a rewritten chain, and the boot check reads only the latest head.
+  The offline verifier catches this, because it checks every head ever stored.
+- Who wrote a head. See [foreign head](#foreign-head-sandboxdauditwitnessforeignhead).
+
+The witness stores fingerprints, not records. It cannot rebuild a lost log.
+Pair it with an off-node export (`SB_AUDIT_EXPORT_BACKEND=s3`, `webhook` or
+`bus`). Enterprise mode requires both.
+
+### Bucket recipe
+
+Terraform builds all of this with `audit_witness_enabled = true`
+(`Terraform/audit_witness.tf`; lock mode `witness_lock_mode`, lock length
+`witness_lock_days`). The installer never creates a bucket. By hand:
+
+1. **Create the bucket with Object Lock on.** Turning on Object Lock at
+   creation also turns on versioning, which it needs. Use the bucket for the
+   witness alone: its default lock applies to every object in it.
+2. **Add a default retention rule.**
+   - **Compliance mode for production.** No one can delete a version before
+     its lock ends, not even the AWS account root.
+   - **Governance mode for trials.** A principal with
+     `s3:BypassGovernanceRetention` can delete versions early, which is what
+     lets you remove a trial bucket. The node role must never hold it.
+   - **Days: at least `SB_SECRET_AUDIT_RETENTION_DAYS`** (default 30). A head
+     must outlive the local records it vouches for. The lock length also
+     limits how far back the verifier can see heads.
+3. **Add a lifecycle rule that expires noncurrent versions** after the lock
+   period. Every ship adds a version, so without it the bucket grows forever.
+   Never expire current versions; the newest head of each day must stay. S3
+   never expires a version that is still locked.
+4. **Block public access and turn on default encryption.**
+5. **Give the node role exactly this.** `<prefix>` is
+   `SB_AUDIT_WITNESS_S3_PREFIX` (default `witness/`).
+
+   | Effect | Actions | Resource |
+   |---|---|---|
+   | Allow | `s3:PutObject`, `s3:GetObject`, `s3:GetObjectVersion` | `arn:aws:s3:::<bucket>/<prefix>*` |
+   | Allow | `s3:ListBucketVersions`, `s3:GetBucketVersioning`, `s3:GetBucketObjectLockConfiguration` | `arn:aws:s3:::<bucket>` |
+   | Allow | `s3:ListBucket`, with no `s3:prefix` condition | `arn:aws:s3:::<bucket>` |
+   | Deny | `s3:DeleteObject`, `s3:DeleteObjectVersion`, `s3:PutObjectRetention`, `s3:PutObjectLegalHold`, `s3:BypassGovernanceRetention` | `arn:aws:s3:::<bucket>/*` |
+   | Deny | `s3:PutBucketObjectLockConfiguration`, `s3:PutBucketVersioning`, `s3:PutLifecycleConfiguration`, `s3:PutBucketPolicy` | `arn:aws:s3:::<bucket>` |
+
+   `s3:ListBucket` is not optional. Without it, S3 answers a read of a missing
+   key with 403 instead of 404. A first boot on an empty bucket then fails,
+   and so does any boot after the node was down across UTC midnight. Do not
+   limit it with an `s3:prefix` condition: a read carries no prefix, so S3
+   would not count the grant and would still answer 403. Use a bucket that
+   holds only the witness.
+6. **Turn on CloudTrail S3 data events** (write events) for the bucket. An S3
+   version does not record who wrote it. CloudTrail does, and it is the only
+   way to attribute a foreign head.
+7. **Set the settings on every node**, with an `SB_NODE_ID` that is unique
+   among nodes sharing the bucket. Installer: commented out in
+   `/etc/sandboxd/sandboxd.env`. Ansible: `sandboxd_audit_witness_*` and
+   `sandboxd_node_id`. Terraform: automatic (the node id is
+   `<cluster_name>-<node>`).
+
+Turning the witness on for a node that never shipped to a witness is safe: the
+first boot finds the bucket empty for that node and stores its current head.
+Moving a node from another witness to S3 is not: its local receipts name heads
+the new bucket never saw, and that is treated as lost evidence. Bring such a
+node over under a new id ([rebuild](#rebuild-a-node-under-a-new-sb_node_id)).
+
+The node role is shared by every node in a Terraform cluster, so one node can
+write a version into another node's key. It cannot erase the other node's
+history; the lock stops that. Limiting each node to its own key needs the
+writer's AWS identity in the key, which is a future layout change
+(`TODOS.md`, "Per-node witness write scoping"). Until then, CloudTrail is how
+you find the writer.
+
+### Boot refusals
+
+sandboxd checks the bucket at every boot, within 30 seconds. If a check fails,
+it refuses to start, and the error names the fix.
+
+| The error names | What it means | Fix |
+|---|---|---|
+| Versioning not enabled | The bucket was not made for Object Lock | Create a new bucket with Object Lock on (simplest), or enable versioning and then Object Lock on this one |
+| Object Lock not enabled | Nothing stops a delete or an overwrite | Same as above |
+| No default retention rule | Heads are stored unlocked | Add a default retention rule with a mode and days |
+| Retention shorter than `SB_SECRET_AUDIT_RETENTION_DAYS` | A head could expire before the records it vouches for | Raise the bucket's default days (it applies to new versions), or lower `SB_SECRET_AUDIT_RETENTION_DAYS` |
+| `s3:ListBucket`, at the missing-key probe | S3 answered 403 for a key that does not exist | Grant `s3:ListBucket` on the bucket, without an `s3:prefix` condition |
+| `s3:BypassGovernanceRetention`, after the canary delete | sandboxd stored a test version and deleted it, the way an attacker would. The delete worked, so the lock does not protect this node | Remove bypass from the node role and add the Deny statements. Check that no other policy grants it |
+| `s3:DeleteObject`, after the canary delete marker | sandboxd then deleted the test key without a version id and got a delete marker. Object Lock does not block that, so this node could hide its newest head | Deny `s3:DeleteObject` on the node role (the Deny statements above do) |
+| The canary delete failed with something other than AccessDenied | sandboxd cannot prove deletes are blocked | Fix the cause in the message (region, network, endpoint). An unknown answer is never treated as safe |
+| A check and the bucket, after 30 seconds | S3 did not answer in time | Fix the path to S3 (VPC endpoint or NAT), the region or the endpoint |
+| `SB_NODE_ID`, at config load | The witness is set, but the id is empty or `standalone` | Set a unique `SB_NODE_ID` |
+| An empty local log while the witness holds a head | The log is gone, but the witness remembers a chain | [Rebuild a node under a new SB_NODE_ID](#rebuild-a-node-under-a-new-sb_node_id) |
+| `secret audit witness mismatch: local_head=… witnessed_head=…` | The newest stored head is not in the local chain | [Witness mismatch](#witness-mismatch) |
+| A delete marker on the newest head | Someone tried to hide the head. The node role cannot do this | [Witness mismatch](#witness-mismatch), step 4 |
+
+An S3 outage blocks restarts whenever a witness is configured. That is on
+purpose: a node that cannot reach its witness cannot prove its log is intact. A node that is
+already running keeps working through an outage. Its ships fail,
+`aerolvm_secret_audit_witness_healthy` drops to 0 and
+`aerolvm_secret_audit_witness_failures_total` rises. Records keep landing in
+the local log, and the next ship catches up.
+
+Each boot stores one canary version under `<prefix>canary/`. It stays locked
+for the lock period, then the lifecycle rule removes it.
+
+### Witness mismatch
+
+`secret audit witness mismatch` means the newest stored head is not in this
+node's local chain. Either the local log changed (edited, rolled back, or
+restored from an old backup), or someone else stored a newer head in this
+node's key.
+
+1. **Do not edit, delete or "repair" anything.** Copy the audit directory
+   somewhere safe: `secrets.jsonl`, `witness_receipts.jsonl`,
+   `witness_tip.json` and `secrets.verified`, next to the log
+   (`/var/lib/sandboxd/audit/` by default).
+2. **List the node's stored heads** (`witness/` is the default prefix):
+
+   ```bash
+   aws s3api list-object-versions --bucket <bucket> \
+     --prefix "witness/node=<SB_NODE_ID>/"
+   ```
+
+   There is one key per UTC day, and the newest day sorts last. Within a key,
+   the version marked `IsLatest` is the newest. Each version's body names its
+   `node_id` and `head_hex`; read one with `aws s3api get-object --version-id`.
+3. **Compare the newest `head_hex` with `witness_receipts.jsonl`.**
+   - It is one this node shipped: the local log changed. That is tampering, or
+     a restore from an old backup. Run the [verifier](#offline-verification-aerolvm-audit-verify)
+     over a window that covers the change, and keep the node down until you
+     know which.
+   - It is not one this node shipped: someone else wrote it. Go to
+     [foreign head](#foreign-head-sandboxdauditwitnessforeignhead).
+4. **A delete marker** on the newest day's key also stops boot. The node role
+   cannot create one, so someone with wider rights did. Find them in
+   CloudTrail. The locked versions under the marker are intact. After the
+   investigation, an administrator (never the node role) can delete the
+   delete marker itself, which makes the head current again.
+
+To bring the node back:
+
+- **The newest head is foreign, and the local log is intact** (the verifier
+  agrees): an administrator can restore the node's own head as the newest
+  version. Fetch the body of the node's last own version, then store it as a
+  new version of today's key
+  (`witness/node=<SB_NODE_ID>/day=<UTC yyyy-mm-dd>/head.json`) with
+  `aws s3api put-object --checksum-algorithm SHA256 --body <file>`. A bucket
+  with a default lock refuses an upload without a checksum.
+- **Anything else:** [rebuild under a new SB_NODE_ID](#rebuild-a-node-under-a-new-sb_node_id).
+
+Either way, the foreign or stale version stays locked as evidence, and the
+verifier keeps reporting FAIL for any window that contains it. Record the
+incident.
+
+### Foreign head (`SandboxdAuditWitnessForeignHead`)
+
+Before every ship, idle or busy, a node reads its own key. If the newest head
+there is neither its current head nor the last head it shipped, it counts that
+in `aerolvm_secret_audit_witness_foreign_head_total`, logs a warning naming both
+heads, and then ships as usual. A missing head after a successful ship counts
+the same way. `SandboxdAuditWitnessForeignHead` fires on any increase.
+
+What it means:
+
+- Someone wrote into this node's key. That is another node using the shared
+  role, a second server configured with the same `SB_NODE_ID`, or anyone
+  holding the node role's credentials.
+- It fires on the victim's next tick, whether the victim is idle or busy.
+- A read error is not counted. An S3 blip shows in the failures counter and
+  the healthy gauge instead, and pages nobody here.
+- The first ship of each UTC day re-ships an unchanged head on purpose. That is
+  not counted.
+
+What it does not prove:
+
+- **Who wrote it.** S3 versions carry no writer. Use CloudTrail S3 data events
+  on the witness bucket: the caller is the node role's session, and an EC2
+  instance-role session is named after the instance id. Terraform's `nodes`
+  output maps instance ids to node names.
+- **That every foreign write was seen.** A write that lands between the
+  victim's read and its own write is buried under the victim's version. No
+  alert fires. Only the verifier sees it, as a FAIL.
+- **That the node will refuse to restart.** After the alert, the node's next
+  ship puts its own head back on top, so it boots normally. A restart is
+  refused only if the foreign head is still the newest, for example when the
+  node was down as it landed.
+
+What to do:
+
+1. **Check for a duplicate `SB_NODE_ID`** among the servers that share the
+   bucket. That is the common honest cause. Rebuild one of them under a new id.
+2. **Otherwise, treat it as a security incident.** Find the writer in
+   CloudTrail and isolate it. Its own node is suspect too.
+3. **Run the verifier** over a window that covers the alert. Expect FAIL naming
+   the foreign head, and keep the report with the incident.
+
+### Rebuild a node under a new SB_NODE_ID
+
+Use this when a node's disk was lost or replaced, or its audit log is gone,
+and boot refuses because the witness still holds a head for its id. Object
+Lock forbids clearing that head, by design. So the node comes back under a new
+id, and the old id's locked history stays in the bucket as the record of the
+loss. Write down the old id, the new id, the time and the reason.
+
+**Single server:**
+
+1. Stop sandboxd. If the disk survived, move the old local receipts aside and
+   keep them: `witness_receipts.jsonl` and `witness_tip.json` in the audit
+   directory. They name heads stored under the old id, and boot treats them as
+   proof that a chain existed.
+2. Pick a new id that is unique among servers sharing the bucket, for example
+   `web-1-r2`.
+3. Set `SB_NODE_ID=<new id>` in `/etc/sandboxd/sandboxd.env` by hand. Ansible's
+   `sandboxd_node_id` refuses to change an existing id on purpose; it can set
+   the id on a freshly installed server that has none yet.
+4. Start sandboxd. The witness holds nothing for the new id, so the first boot
+   stores the current head.
+
+**Cluster node:** the node id is also its Raft member id and the `node:<id>`
+name in its certificate, so the node leaves the cluster and joins again.
+
+1. On a surviving node, remove the old member:
+
+   ```bash
+   sudo /usr/local/sbin/sandboxd-node-lifecycle.sh remove-member <old-id>
+   ```
+
+   (`scripts/sandboxd-node-lifecycle.sh` in the repo; Ansible's
+   `configure-ops.yml` installs it there.) It refuses a member that is still
+   gossiped alive; add `--force` only when you are sure the old node is down.
+   Sandboxes the old node owned are gone, as with any removed member.
+2. On the rebuilt host, stop sandboxd and move the old receipts aside, as in
+   step 1 above. If an old Raft data directory is still there, rejoin with
+   `--force`, which discards it.
+3. Join under the new id, with the same flags the node first joined with:
+
+   ```bash
+   sudo ./cluster-join.sh --node-id <new-id> \
+     --gossip-key '<key>' --peers <seed>:7001 \
+     --tls-bundle <path> --cred-bundle <path>
+   ```
+
+   It writes a CSR for `node:<new-id>` and stops. Sign it on the seed with
+   `cluster-sign-node.sh --csr <csr> --node-id <new-id> --out <crt>`, then run
+   the same `cluster-join.sh` command again with `--signed-cert <crt>`.
+4. On a Terraform cluster the id is `<cluster_name>-<name>`. Add the
+   replacement under a new name in `nodes` and remove the old entry, instead
+   of reusing the name.
+
+### Offline verification (`aerolvm audit verify`)
+
+The boot check reads only the newest head. The verifier checks every stored
+head inside a time window against the evidence: the export and, if you give
+it, each node's local log. Run it from a machine outside the cluster, with
+read-only access. Terraform can create that policy
+(`audit_witness_auditor_policy_enabled = true`, output
+`audit_witness_auditor_policy_arn`).
+
+```bash
+aerolvm audit verify \
+  --witness s3://<witness-bucket>/witness/ \
+  --since 720h \
+  --export s3://<export-bucket>/<SB_AUDIT_EXPORT_S3_PREFIX>
+```
+
+- **`--since` is required.** It takes an RFC 3339 time or a duration such as
+  `720h`. Every head newer than it must be reached by the evidence, or the
+  result is FAIL. Older heads are listed, not checked. The window comes from
+  you, not the node, because a node that controls its own export could delete
+  the oldest batches to shrink the check.
+- **Keep exports at least as long as the window you verify.** If the oldest
+  batches inside the window are gone, the result is FAIL. Keep the window no
+  longer than the witness lock too: older noncurrent heads have expired. The
+  integration suite's export bucket expires objects after 3 days, which suits
+  tests and is too short for an audit.
+- **Evidence.** `--export s3://…` reads an S3 export. For a `webhook` or `bus`
+  export, save the NDJSON batches your receiver got and pass `--export-dir
+  <dir>`. Add `--local <node-id>=<path to secrets.jsonl>` (repeatable) to
+  include a node's local log; it covers records the export has not shipped
+  yet.
+- **Other flags.** `--node <id>` (repeatable) limits the check to some nodes.
+  `--max-lag` (default `15m`) sets how long a head may wait for the export.
+  `--region`, `--endpoint` and `--path-style` configure the S3 client.
+  `--json` prints a machine-readable report.
+
+Results:
+
+| Result | Exit code | Meaning | Next step |
+|---|---|---|---|
+| PASS | 0 | Every head in the window links to the evidence | Keep the report |
+| FAIL | 1 | A head is not reached: a rewritten history, a rollback, a foreign head, or missing evidence. Also used when the verifier cannot verify at all | Read the report; it names the head and node. Start at [witness mismatch](#witness-mismatch) |
+| INCOMPLETE | 3 | A head is newer than the end of the evidence and has waited longer than `--max-lag` | The export is stalled or behind. Fix it and rerun, or pass `--local` for that node. Never read INCOMPLETE as PASS |
+
+Exit code 2 means the command line was wrong.
+
+An idle node still stores one head a day, so a node with no stored version for
+more than a day has stopped shipping. Find out why.
+
+### Retire a witness bucket
+
+A compliance bucket cannot be emptied until every version's lock ends, and
+`terraform destroy` fails on it until then. That is the point: the evidence
+outlives the cluster. Either wait for the locks to end, or take the bucket out
+of Terraform's state (`terraform state rm`) and delete it by hand once they
+have.
+
+A governance bucket can be emptied early by a principal that holds
+`s3:BypassGovernanceRetention` and sends the bypass header, for example
+`aws s3api delete-objects --bypass-governance-retention` over every version
+and delete marker. Then `terraform destroy` succeeds. That is why integration
+scenarios use governance buckets with a 1-day lock and
+`SB_SECRET_AUDIT_RETENTION_DAYS=1` (Terraform: `witness_lock_mode =
+"GOVERNANCE"`, `witness_lock_days = 1`).
 
 ## Audit read index and on-demand verification
 
@@ -407,9 +770,172 @@ nothing to retire.
 
 1. Read `aerolvm_secret_provider_canary_ok` (1 = ok, 0 = failing).
 2. For `SB_SECRET_PROVIDER=awskms`: verify `SB_SECRET_AWS_KMS_KEY_ID`, IAM
-   `Encrypt`/`Decrypt`, and network path to KMS.
-3. Default boot is fail-open unless `SB_SECRET_PROVIDER_STRICT_BOOT=true`.
+   `Encrypt`/`Decrypt`/`DescribeKey`, and network path to KMS. For `vault`:
+   the token file is readable and its policy allows `update` on
+   `transit/encrypt/<key>` and `transit/decrypt/<key>`. For `pkcs11`: the
+   helper is running (`aerolvm_pkcs11_helper_restarts_total`) and the PIN file
+   and labels are right.
+3. Default boot is fail-open unless `SB_SECRET_PROVIDER_STRICT_BOOT=true`
+   (required in enterprise mode for every external provider).
    Fail-open keeps the daemon up but new wraps/opens may fail — page on-call.
+   With wrapped custody a failing canary also means the node cannot tell a
+   revoke from an outage until the key store answers again.
+
+## Key custody
+
+The server key seals every sandbox's toolbox token, registry and mount
+credentials, environment and the egress inspection CA. `sandboxd key status`
+shows where each key lives on a node (add `--check` to unwrap the server-key
+file once). With `SB_CREDENTIAL_KEY_CUSTODY=wrapped` the server key is on disk
+only as `credential_encryption.key.wrapped`, wrapped by the customer's key
+store (`SB_SECRET_PROVIDER`: `awskms`, `vault` or `pkcs11`), and the node
+unwraps it into memory at boot. Design: `plans/customer-key-custody.md`.
+
+A node that cannot reach its key store at boot refuses to start (the log
+says `unwrap server key`). systemd retries every 5 s and gives up after 10
+failures; `sandboxd-healthcheck.timer` then starts the failed unit again
+every 30 s, so the node comes up by itself within about 30 s of the key
+store answering. Nothing needs restarting by hand.
+
+Useful gauges, all per node:
+
+| Metric | Meaning |
+|---|---|
+| `aerolvm_key_custody{key=class,key2=custody,key3=enterprise}` | Where each key class lives (published at boot) |
+| `aerolvm_key_revoked` | 1 while this node is stopped by a revoke |
+| `aerolvm_key_recheck_total{key=result}` | Re-check results: `ok`, `revoked`, `retired`, `denied`, `throttled`, `unavailable`, `mismatch` |
+| `aerolvm_key_rows_stale`, `aerolvm_key_rows_retired` | Rows not on the key store's current version; rows on a version it no longer decrypts. Stale is -1, unknown, until a sweep against the current version finishes (at boot, while the first pass against a new version runs, after a pass that stopped early, and on a node that does not sweep): not yet 0 |
+| `aerolvm_key_current`, `aerolvm_key_decryptable` | The key store's current and still-decryptable versions or labels |
+| `aerolvm_server_key_ring{key=id,key2=state}`, `aerolvm_server_key_rows{key=id}` | Server-key rotation: the ring this node holds, and how many sealed values each key opens; -1 for every old key until a reseal pass under the current ring finishes |
+| `aerolvm_key_store_calls_total{key=backend,key2=op,key3=class}` | Key-store calls by outcome |
+
+### Server key in plaintext
+
+`SandboxdServerKeyPlaintext`: an enterprise node keeps its server key in a
+file or the environment, so "the customer holds the keys" is not true on it.
+With a key store configured an enterprise node no longer starts like this:
+it exits naming `SB_CREDENTIAL_KEY_CUSTODY`, and `sandboxd key` still runs
+on it, so the steps below work with the daemon stopped. The alert itself is
+left for an enterprise node with no key store (`SB_SECRET_PROVIDER=local`):
+give it one first, the two-step way (settings on every node, then the
+provider), then wrap.
+
+1. On one node, with the key store reachable: `sandboxd key wrap`. It writes
+   `credential_encryption.key.wrapped` and reads it back through the key store.
+2. Copy that file to every node (it is ciphertext).
+3. On every node set `SB_CREDENTIAL_KEY_CUSTODY=wrapped` and remove
+   `SB_CREDENTIAL_ENCRYPTION_KEY` from `/etc/sandboxd/*.env`.
+4. Run `sandboxd key verify`, then delete the plaintext key file. sandboxd
+   refuses to boot with wrapped custody while a plaintext key is still set.
+5. Restart node by node, then work through the
+   [migration cleanup](#migration-cleanup).
+
+### Key revoked
+
+`SandboxdKeyRevoked`: the key store said the key is gone on
+`SB_SECRET_PROVIDER_REVOKE_AFTER` re-checks in a row (default 3, every 5
+minutes). The node dropped the server key from memory, cleared the egress
+inspection CA and the injected secrets in the gateway, closed SSH sessions and
+proxied toolbox streams, reports `"key_custody": "revoked"` on `/health` and
+wrote a `key_revoked` audit record. Sealed operations return
+`503 key_revoked`. Running sandboxes keep running and their public routes stay
+up.
+
+- **On purpose:** check the alert fired on every node that uses the key.
+- **Not on purpose:** read the key store's own log (Vault audit device,
+  CloudTrail, the HSM audit log) for who deleted or disabled the key, then
+  restore it: Vault/OpenBao from your Transit backup or snapshot, AWS KMS with
+  `aws kms cancel-key-deletion` and `aws kms enable-key`, PKCS#11 from the
+  HSM's backup under the same label.
+
+The node resumes on its own within one re-check of the key coming back
+(`key_recovered` record); no restart. A `403`, an outage or a retired version
+never counts toward a revoke.
+
+### Revoke on purpose
+
+| Backend | Revoke | Undo |
+|---|---|---|
+| Vault / OpenBao | `vault write transit/keys/<key>/config deletion_allowed=true`, then `vault delete transit/keys/<key>` | restore the key from a Transit backup |
+| AWS KMS | `aws kms disable-key --key-id <key>` (or schedule deletion) | `aws kms enable-key` (and `cancel-key-deletion`) |
+| PKCS#11 | delete the key object named by `SB_SECRET_PKCS11_KEY_LABEL` with the HSM's tool | restore the object from the HSM's backup |
+
+Every node stops within `SB_SECRET_PROVIDER_RECHECK_INTERVAL ×
+SB_SECRET_PROVIDER_REVOKE_AFTER` (15 minutes by default). sandboxd refuses a
+Vault token that may create keys, because Transit would silently recreate a
+deleted key on the next encrypt.
+
+### Retired key version in use
+
+`SandboxdKeyVersionRetiredInUse`: rows on this node are wrapped under a key
+version or label the key store no longer decrypts, so those sandboxes cannot
+start or fail over here.
+
+1. Make the old version decryptable again: Vault lower
+   `min_decryption_version`; PKCS#11 put the old label back in
+   `SB_SECRET_PKCS11_DECRYPT_KEY_LABELS`.
+2. Wait for the hourly sweep: `aerolvm_key_rows_stale` 0 on every member.
+3. Retire the old version again.
+
+### Key store throttling
+
+`SandboxdKeyStoreThrottling`: over 5% of one backend's calls were throttled
+for 15 minutes. Creates wait longer (`aerolvm_key_store_limiter_wait_seconds_bucket`
+with `key="foreground"`). Raise the key store's limit (Vault rate-limit
+quotas, an AWS KMS quota increase, more HSM sessions), or lower
+`SB_SECRET_PROVIDER_MAX_INFLIGHT` on every node. The re-check and the sweep
+use their own two slots and never take a create's.
+
+### Rotate the key-store key
+
+- **Vault / OpenBao:** `vault write -f transit/keys/<key>/rotate`. The hourly
+  sweep rewraps rows and the server-key file. When `aerolvm_key_rows_stale`
+  is 0 on every member, raise `min_decryption_version`.
+- **AWS KMS:** rotates in place; nothing to do.
+- **PKCS#11:** labels are per-node settings, so it takes four steps:
+  1. Create label B. Add B to `SB_SECRET_PKCS11_DECRYPT_KEY_LABELS` on every
+     node and restart node by node.
+  2. When `aerolvm_key_decryptable{key="pkcs11",key2="p11:B"}` shows on every
+     member, set `SB_SECRET_PKCS11_KEY_LABEL=B` and move A into the decrypt
+     labels, node by node.
+  3. Wait until `aerolvm_key_rows_stale` is 0 and
+     `aerolvm_key_current{key="pkcs11",key2="p11:B"}` shows on every member.
+  4. Remove A from the decrypt labels, then destroy A.
+
+### Rotate the server key
+
+A new server key makes copies of the old one (old backups, cred bundles, a
+pre-wrap plaintext file) useless for anything in the current database. Every
+node must run a release that reads a key ring first; `--stage` checks that.
+
+1. `sandboxd key rotate --stage` on one node. Copy the file it names to every
+   node, and into the cred bundle future joiners use. Wait until
+   `aerolvm_server_key_ring{key="1",key2="decrypt"}` shows on every member
+   (one re-check interval).
+2. `sandboxd key rotate --promote`, copy the file again. Each node seals new
+   data with the new key and reseals its stored values. Wait until
+   `aerolvm_server_key_rows{key="0"}` is gone and
+   `aerolvm_server_key_ring{key="1",key2="current"}` shows on every member.
+3. `sandboxd key rotate --retire 0`, copy the file again. With
+   `SB_CREDENTIAL_KEY_CUSTODY=file`, also remove the old key from the env files
+   and the key file.
+
+Each node writes `key_rotation_staged`, `key_rotation_promoted` and
+`key_rotation_retired` audit records as it takes each step. After a promote a
+node cannot go back to a release before rotation; restore from a backup taken
+before the promote instead. A member that was down during the rotation needs
+the current file (and this release) before it rejoins.
+
+### Migration cleanup
+
+Wrapping an existing key does not destroy the plaintext copies made before.
+`sandboxd key status` says "migrated from plaintext" until you either:
+
+- destroy every old copy (the key file on every node, the env files, cred
+  bundles and their S3 object versions, backups taken before the wrap), then
+  run `sandboxd key ack-migration`; or
+- rotate the server key and retire key 0, which clears the notice on its own:
+  the old copies then open nothing current.
 
 ## Query audit history
 

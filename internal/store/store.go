@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/aerol-ai/microvm/pkg/capacity"
 	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/aerol-ai/microvm/pkg/secrets"
 	sqlite3 "github.com/mattn/go-sqlite3"
@@ -151,6 +152,18 @@ func open(path string, secretCipher *secrets.Cipher) (*Store, error) {
 			sealed_blob BLOB NOT NULL,
 			created_at DATETIME NOT NULL,
 			binding_version INTEGER NOT NULL DEFAULT 1 CHECK (binding_version = 1),
+			FOREIGN KEY (sandbox_id) REFERENCES sandboxes(id) ON DELETE CASCADE
+		);`,
+		// sandbox_create_digests holds the keyed digest of the request an
+		// Idempotency-Key create was made with, so a retry with the same key
+		// and a different request is refused instead of handed the sandbox.
+		// A retry replays for as long as the sandbox exists, so the row lives
+		// exactly as long as its sandbox. A side table rather than a sandboxes
+		// column: only keyed creates write it and only their retries read it,
+		// so the list and scan paths never carry it.
+		`CREATE TABLE IF NOT EXISTS sandbox_create_digests (
+			sandbox_id TEXT PRIMARY KEY,
+			digest TEXT NOT NULL,
 			FOREIGN KEY (sandbox_id) REFERENCES sandboxes(id) ON DELETE CASCADE
 		);`,
 		// sandbox_custom_domains attaches operator-provided public hostnames
@@ -295,7 +308,7 @@ func open(path string, secretCipher *secrets.Cipher) (*Store, error) {
 			updated_at DATETIME NOT NULL
 		);`,
 		`CREATE TABLE IF NOT EXISTS sandbox_snapshots (
-			name TEXT PRIMARY KEY,
+			name TEXT NOT NULL,
 			image TEXT NOT NULL,
 			image_id TEXT NOT NULL DEFAULT '',
 			source_sandbox_id TEXT NOT NULL,
@@ -311,7 +324,13 @@ func open(path string, secretCipher *secrets.Cipher) (*Store, error) {
 			image_registry_ref TEXT NOT NULL DEFAULT '',
 			image_verified_at DATETIME,
 			push_state TEXT NOT NULL DEFAULT 'active',
-			push_error TEXT NOT NULL DEFAULT ''
+			push_error TEXT NOT NULL DEFAULT '',
+			owner_ref TEXT NOT NULL DEFAULT '',
+			-- A snapshot NAME is unique per owner, not globally: two tenants may
+			-- each hold a "prod-base". The owner leads the key so an owner's
+			-- rows are contiguous for scoped range scans (list/paginate), and so
+			-- one tenant can neither learn nor pre-claim another's names.
+			PRIMARY KEY (owner_ref, name)
 		);`,
 		// sandbox_compat_state holds opaque facade-private state that has
 		// no native meaning. One row per (sandbox, facade). state_json is
@@ -335,9 +354,14 @@ func open(path string, secretCipher *secrets.Cipher) (*Store, error) {
 			snapshot_name TEXT NOT NULL,
 			facade TEXT NOT NULL,
 			extra_names_json TEXT NOT NULL DEFAULT '[]',
+			state_json TEXT NOT NULL DEFAULT '',
 			created_at DATETIME NOT NULL,
 			updated_at DATETIME NOT NULL,
-			FOREIGN KEY (snapshot_name) REFERENCES sandbox_snapshots(name) ON DELETE CASCADE
+			-- Owner of the snapshot this alias points at. Snapshot names are
+			-- unique per owner now, so the alias must carry the owner to name a
+			-- single snapshot and to cascade-delete with the right one.
+			owner_ref TEXT NOT NULL DEFAULT '',
+			FOREIGN KEY (owner_ref, snapshot_name) REFERENCES sandbox_snapshots(owner_ref, name) ON DELETE CASCADE
 		);`,
 		// request_idempotency is the generic claim/replay primitive for
 		// caller-retry dedupe. scope is a caller-defined namespace string
@@ -357,6 +381,23 @@ func open(path string, secretCipher *secrets.Cipher) (*Store, error) {
 			updated_at DATETIME NOT NULL,
 			PRIMARY KEY (scope, fingerprint)
 		);`,
+		// deleted_sandbox_view is the durable replacement for a facade keeping
+		// the terminal view of a just-deleted sandbox in memory (Runloop's
+		// shutdown tombstone): a destroyed sandbox leaves no row, so a retried
+		// shutdown or a GET of it would 404 once the in-process cache was lost
+		// to a restart. It deliberately has NO foreign key to sandboxes — the
+		// row must outlive the sandbox it describes. owner_ref scopes reads;
+		// view_json is the facade's rendered body; the service sweeps rows past
+		// the replay window by created_at (idx below makes that a range scan).
+		`CREATE TABLE IF NOT EXISTS deleted_sandbox_view (
+			sandbox_id TEXT NOT NULL,
+			facade TEXT NOT NULL,
+			owner_ref TEXT NOT NULL DEFAULT '',
+			view_json TEXT NOT NULL,
+			created_at DATETIME NOT NULL,
+			PRIMARY KEY (sandbox_id, facade)
+		);`,
+		`CREATE INDEX IF NOT EXISTS idx_deleted_sandbox_view_created ON deleted_sandbox_view(created_at);`,
 		`CREATE INDEX IF NOT EXISTS idx_sandboxes_status ON sandboxes(status);`,
 		`CREATE INDEX IF NOT EXISTS idx_sandboxes_last_active_at ON sandboxes(last_active_at);`,
 		// idx_sandboxes_runtime backs ListByRuntime so the per-runtime background
@@ -369,12 +410,70 @@ func open(path string, secretCipher *secrets.Cipher) (*Store, error) {
 		// status using the index's row pointers, and the cardinality of
 		// status values is small enough that a composite buys nothing.
 		`CREATE INDEX IF NOT EXISTS idx_sandboxes_image ON sandboxes(image);`,
-		// Partial unique index on sandboxes.name. The default '' is allowed
-		// many times (for sandboxes created without a name); any non-empty
-		// name is unique across the table. Daytona depends on this for
-		// name-based lookup; everyone else benefits from collision-free
-		// names by default.
-		`CREATE UNIQUE INDEX IF NOT EXISTS idx_sandboxes_name ON sandboxes(name) WHERE name <> '';`,
+		// idx_sandboxes_container_ip backs SandboxIDsClaimingContainerIP, the
+		// owner check every stop/destroy event runs before clearing per-IP
+		// firewall rules (egress plan P0-6), so it stays an index probe as the
+		// destroyed-row history grows.
+		`CREATE INDEX IF NOT EXISTS idx_sandboxes_container_ip ON sandboxes(container_ip);`,
+		// sandbox_egress holds egress-gateway state that outlives a process:
+		// the fail-closed hold (plans/egress-domain-filtering.md CEO D16), and
+		// in Phase 2 the learn mode and pinned profiles. A side table keeps the
+		// hot sandboxes row and its many SELECT lists untouched; rows go with
+		// their sandbox.
+		`CREATE TABLE IF NOT EXISTS sandbox_egress (
+			sandbox_id TEXT PRIMARY KEY REFERENCES sandboxes(id) ON DELETE CASCADE,
+			hold_reason TEXT NOT NULL DEFAULT '',
+			hold_since DATETIME,
+			egress_mode TEXT NOT NULL DEFAULT '',
+			updated_at DATETIME NOT NULL
+		);`,
+		`CREATE INDEX IF NOT EXISTS idx_sandbox_egress_hold ON sandbox_egress(hold_reason) WHERE hold_reason != '';`,
+		// egress_profiles are named allowlists sandboxes reference
+		// (plans/egress-domain-filtering.md D21). Owner-scoped like sandbox
+		// names; this table is the single-node store, a cluster keeps them in
+		// the Raft FSM.
+		`CREATE TABLE IF NOT EXISTS egress_profiles (
+			owner_ref TEXT NOT NULL DEFAULT '',
+			name TEXT NOT NULL,
+			allow_out_json TEXT NOT NULL DEFAULT '[]',
+			description TEXT NOT NULL DEFAULT '',
+			generation INTEGER NOT NULL DEFAULT 1,
+			created_at DATETIME NOT NULL,
+			updated_at DATETIME NOT NULL,
+			PRIMARY KEY (owner_ref, name)
+		);`,
+		// sandbox_egress_profiles is each sandbox's profile references, in
+		// order, with the generation of each that is live. It is an index,
+		// not a JSON column on sandbox_egress, so a profile update finds its
+		// referencing sandboxes with an index probe, and delete-in-use is one
+		// query, at any fleet size. It is the only record of references.
+		`CREATE TABLE IF NOT EXISTS sandbox_egress_profiles (
+			sandbox_id TEXT NOT NULL REFERENCES sandboxes(id) ON DELETE CASCADE,
+			owner_ref TEXT NOT NULL DEFAULT '',
+			profile TEXT NOT NULL,
+			position INTEGER NOT NULL,
+			applied_generation INTEGER NOT NULL DEFAULT 0,
+			PRIMARY KEY (sandbox_id, profile)
+		);`,
+		`CREATE INDEX IF NOT EXISTS idx_sandbox_egress_profiles_ref ON sandbox_egress_profiles(owner_ref, profile);`,
+		// api_tokens are scoped API tokens (plans/identity-and-access.md
+		// §5.4): this table is the single-node store, a cluster keeps them
+		// in the Raft FSM. Only SHA-256 of the secret is stored, never the
+		// secret. owner_ref is team:<name>, or '' for a token bound to every
+		// team; names are unique per team, which UNIQUE(owner_ref, name)
+		// enforces, so two concurrent creates of one name can't both land.
+		// Times are unix nanoseconds, compared in Go, never by SQLite.
+		`CREATE TABLE IF NOT EXISTS api_tokens (
+			id TEXT PRIMARY KEY,
+			name TEXT NOT NULL,
+			role TEXT NOT NULL,
+			owner_ref TEXT NOT NULL DEFAULT '',
+			created_by TEXT NOT NULL DEFAULT '',
+			created_at INTEGER NOT NULL,
+			expires_at INTEGER NOT NULL,
+			secret_hash BLOB NOT NULL,
+			UNIQUE (owner_ref, name)
+		);`,
 		`CREATE INDEX IF NOT EXISTS idx_cluster_secrets_sandbox_id ON cluster_secrets(sandbox_id);`,
 		// Reconcile and retention are ordered bounded scans. These composite
 		// indexes avoid temp B-trees/full scans when the fleet has millions of
@@ -399,7 +498,15 @@ func open(path string, secretCipher *secrets.Cipher) (*Store, error) {
 		`CREATE INDEX IF NOT EXISTS idx_snapshot_aliases_snapshot_name ON snapshot_aliases(snapshot_name);`,
 		`CREATE INDEX IF NOT EXISTS idx_snapshot_aliases_facade ON snapshot_aliases(facade);`,
 		`CREATE INDEX IF NOT EXISTS idx_request_idempotency_replay_until ON request_idempotency(replay_until);`,
+		// Serves ListIdempotentRequests: a restart walks one scope's pending
+		// rows by fingerprint without reading the (far more numerous) ready
+		// rows that only wait out their replay window.
+		`CREATE INDEX IF NOT EXISTS idx_request_idempotency_state ON request_idempotency(scope, state, fingerprint);`,
 		`CREATE INDEX IF NOT EXISTS idx_sandbox_snapshots_source_sandbox_id ON sandbox_snapshots(source_sandbox_id);`,
+		// Serves GetSnapshotsByImage (authorizing a snapshot's own image
+		// when it is named directly) and HasActiveImageRef (the image
+		// janitors must not remove an image a snapshot still holds).
+		`CREATE INDEX IF NOT EXISTS idx_sandbox_snapshots_image ON sandbox_snapshots(image);`,
 		// Lookups by sandbox_id for ListCustomDomains and for the
 		// attachCustomDomainsBulk join. The PK on hostname already covers
 		// the ResolveCustomDomain hot path.
@@ -424,6 +531,27 @@ func open(path string, secretCipher *secrets.Cipher) (*Store, error) {
 			PRIMARY KEY (engine, image)
 		);`,
 		`CREATE INDEX IF NOT EXISTS idx_pending_image_gc_scheduled_at ON pending_image_gc(scheduled_at);`,
+		// snapshot_registry_retirements is the obligation to remove the
+		// registry copy of a deleted snapshot. The push reconciler writes a
+		// plain `latest` tag the registry keeps forever, and another node
+		// resolves a bare snapshot name to that tag, so without this a
+		// deleted snapshot stayed bootable cluster-wide. Keyed by the
+		// manifest (ref + digest): the copy is removed by digest, so a
+		// re-created snapshot that pushed a new digest under the same tag is
+		// untouched. Written in the same transaction as the row delete
+		// (DeleteSnapshotRetiringRegistryCopy), or by a push that lands after
+		// its row is gone. scheduled_at is when the next attempt is due.
+		`CREATE TABLE IF NOT EXISTS snapshot_registry_retirements (
+			registry_ref TEXT NOT NULL,
+			digest TEXT NOT NULL,
+			owner_ref TEXT NOT NULL DEFAULT '',
+			name TEXT NOT NULL DEFAULT '',
+			scheduled_at DATETIME NOT NULL,
+			attempts INTEGER NOT NULL DEFAULT 0,
+			last_error TEXT NOT NULL DEFAULT '',
+			PRIMARY KEY (registry_ref, digest)
+		);`,
+		`CREATE INDEX IF NOT EXISTS idx_snapshot_registry_retirements_scheduled_at ON snapshot_registry_retirements(scheduled_at);`,
 		// firecracker_tap_pool is the pre-populated network-slot pool for
 		// the native Firecracker runtime. Each row is one "slot" — a
 		// (TAP-device, host-IP, guest-IP, /30 CIDR, vsock-CID) tuple. The
@@ -572,9 +700,9 @@ func open(path string, secretCipher *secrets.Cipher) (*Store, error) {
 		`CREATE INDEX IF NOT EXISTS idx_firecracker_templates_updated_at
 			ON firecracker_templates(updated_at);`,
 		// wasm_modules mirrors firecracker_templates for WASM module catalogue
-		// (plans/wasm-runtime.md Phase 6). One row per registered module ref.
+		// (plans/wasm-runtime.md Phase 6). One row per (owner, catalogue id).
 		`CREATE TABLE IF NOT EXISTS wasm_modules (
-			id TEXT PRIMARY KEY,
+			id TEXT NOT NULL,
 			module_ref TEXT NOT NULL,
 			status TEXT NOT NULL,
 			module_path TEXT NOT NULL DEFAULT '',
@@ -583,9 +711,21 @@ func open(path string, secretCipher *secrets.Cipher) (*Store, error) {
 			entrypoint TEXT NOT NULL DEFAULT '_start',
 			has_warm INTEGER NOT NULL DEFAULT 0,
 			last_error TEXT NOT NULL DEFAULT '',
+			-- Tenant that owns the catalogue row. "" is an operator-published
+			-- module: readable by every tenant, writable only by the operator.
+			-- A validated user token stamps its OwnerRef here, and list/get/
+			-- delete fence on it so one tenant cannot see, use or remove
+			-- another's module (and its registry ref / host path).
+			owner_ref TEXT NOT NULL DEFAULT '',
 			created_at DATETIME NOT NULL,
 			updated_at DATETIME NOT NULL,
-			ready_at DATETIME
+			ready_at DATETIME,
+			-- A catalogue id is unique per owner, not per host: the id defaults
+			-- to the module's content digest, so two tenants registering the
+			-- same bytes must each get their own row rather than a conflict
+			-- that also confirms the other holds them. The owner leads the key
+			-- so the own-then-operator lookup is two probes of one index.
+			PRIMARY KEY (owner_ref, id)
 		);`,
 		`CREATE INDEX IF NOT EXISTS idx_wasm_modules_updated_at
 			ON wasm_modules(updated_at);`,
@@ -686,6 +826,26 @@ func open(path string, secretCipher *secrets.Cipher) (*Store, error) {
 				created_at DATETIME NOT NULL
 			);`,
 		`CREATE INDEX IF NOT EXISTS idx_pending_volume_deletions_created_at ON pending_volume_deletions(created_at);`,
+		// pending_egress_rule_clears is the durable cleanup ledger for the
+		// host egress rules (CIDR rule sets, the hold DROP) a container
+		// sandbox leaves at an IP: written before the sandbox lets go of the
+		// address (stop, destroy, a runtime found gone or moved) and deleted
+		// once the rules are confirmed gone. It is keyed by where the rules
+		// live (the engine's rule scope and the IP), not by sandbox, and has
+		// no foreign key: the rules outlive the row and the process, and the
+		// IP's next owner has to find them, since rules of the same IP share
+		// specs (the allowlist catch-all, the hold) and an old ACCEPT left
+		// above the new owner's DROP would let it out.
+		`CREATE TABLE IF NOT EXISTS pending_egress_rule_clears (
+				scope TEXT NOT NULL,
+				ip TEXT NOT NULL,
+				sandbox_id TEXT NOT NULL,
+				rules_json TEXT NOT NULL DEFAULT '',
+				hold INTEGER NOT NULL DEFAULT 0,
+				created_at DATETIME NOT NULL,
+				updated_at DATETIME NOT NULL,
+				PRIMARY KEY (scope, ip)
+			);`,
 	}
 
 	for _, stmt := range stmts {
@@ -774,6 +934,12 @@ func open(path string, secretCipher *secrets.Cipher) (*Store, error) {
 		// 'pushing' to 'active' or 'error'.
 		`ALTER TABLE sandbox_snapshots ADD COLUMN push_state TEXT NOT NULL DEFAULT 'active';`,
 		`ALTER TABLE sandbox_snapshots ADD COLUMN push_error TEXT NOT NULL DEFAULT '';`,
+		// Tenant that owns the snapshot. A snapshot outlives its source
+		// sandbox, so owner scoping cannot be derived from the source row
+		// after that row is destroyed; the owner has to live on the snapshot
+		// itself. Pre-migration rows are backfilled from a still-existing
+		// source sandbox after this loop (backfillSnapshotOwners).
+		`ALTER TABLE sandbox_snapshots ADD COLUMN owner_ref TEXT NOT NULL DEFAULT '';`,
 		// auto_import_pending is set when the post-pull AOCR auto-import
 		// (F21) failed and a background reconciler should retry. It is
 		// local-node bookkeeping only — never replicated, never user-visible.
@@ -912,6 +1078,38 @@ func open(path string, secretCipher *secrets.Cipher) (*Store, error) {
 		// permanently undistributed.
 		`ALTER TABLE sandbox_snapshots ADD COLUMN push_claimed_at DATETIME;`,
 		`ALTER TABLE firecracker_templates ADD COLUMN push_claimed_at DATETIME;`,
+		// A sandbox that references egress profiles stores its effective
+		// allow list (inline plus every profile's) in
+		// sandboxes.network_allow_out_json, which every enforcement path
+		// already reads, and its inline list here for GET and policy
+		// replays. Empty means no profiles: the row's list is the inline one.
+		`ALTER TABLE sandbox_egress ADD COLUMN inline_allow_json TEXT NOT NULL DEFAULT '';`,
+		// Phase 3 method and path rules (plans/egress-domain-filtering.md
+		// §5.9). inspect_ca records that the sandbox was created trusting the
+		// node's CA, the one thing a later policy change can't add: a live
+		// PUT may add an inspect rule only when it is set. It only ever turns
+		// on, since the bundle stays mounted for the container's life.
+		`ALTER TABLE sandbox_egress ADD COLUMN rules_json TEXT NOT NULL DEFAULT '';`,
+		`ALTER TABLE sandbox_egress ADD COLUMN inspect_ca INTEGER NOT NULL DEFAULT 0;`,
+		// The env keys a create withheld from the sandbox for credential
+		// injection (P3-2): the sandbox holds placeholders for them, so a
+		// later inject rule may use them, while any other key is already in
+		// the sandbox's hands. Set once at create.
+		`ALTER TABLE sandbox_egress ADD COLUMN withheld_env_json TEXT NOT NULL DEFAULT '';`,
+		// The host enforcement that may be in place for the sandbox (a
+		// gateway attachment, CIDR rule sets), as opposed to the stored
+		// (desired) policy on the sandbox row: a superset while a transition
+		// is unfinished, so the next one tears down everything a partial
+		// apply left behind (PR #622 review 3 findings 3 and 4). Empty: what
+		// the stored policy installs.
+		`ALTER TABLE sandbox_egress ADD COLUMN installed_egress_json TEXT NOT NULL DEFAULT '';`,
+		// Facade-private attributes of a snapshot, opaque to the store the
+		// same way sandbox_compat_state.state_json is: the Runloop facade
+		// keeps a snapshot's name, metadata and commit message here, which
+		// have no native column. It lives on the alias row rather than the
+		// source sandbox's compat state because a snapshot outlives the
+		// sandbox it was taken from.
+		`ALTER TABLE snapshot_aliases ADD COLUMN state_json TEXT NOT NULL DEFAULT '';`,
 		// Backfill an empty env row for every sandbox that predates the
 		// "always write a row" rule above. Without it a warm upgrade cannot
 		// tell an env-less sandbox from one whose sealed env was lost, and
@@ -919,6 +1117,16 @@ func open(path string, secretCipher *secrets.Cipher) (*Store, error) {
 		// sandboxes. INSERT OR IGNORE keeps it idempotent across restarts.
 		`INSERT OR IGNORE INTO sandbox_env (sandbox_id, sealed_blob, created_at)
 			SELECT id, X'', CURRENT_TIMESTAMP FROM sandboxes;`,
+		// Tenant owner for WASM catalogue rows (cross-tenant hardening). Warm
+		// upgrade rows predate owner scoping; they backfill to "" (operator-
+		// published, readable by all) which preserves the pre-migration
+		// behaviour for existing modules while new rows carry their creator's
+		// owner_ref.
+		`ALTER TABLE wasm_modules ADD COLUMN owner_ref TEXT NOT NULL DEFAULT '';`,
+		// Owner of the snapshot a snapshot_aliases row points at. Added here so
+		// the column exists on every upgrade path before any alias read; the
+		// full rebuild (with the composite FK) happens in migrateSnapshotOwnerPK.
+		`ALTER TABLE snapshot_aliases ADD COLUMN owner_ref TEXT NOT NULL DEFAULT '';`,
 	}
 	for _, stmt := range migrations {
 		if _, err := db.Exec(stmt); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
@@ -931,6 +1139,37 @@ func open(path string, secretCipher *secrets.Cipher) (*Store, error) {
 	// once so a node that holds the same image under two engines can carry a
 	// cleanup row for each.
 	if err := migratePendingImageGCKey(db); err != nil {
+		db.Close()
+		return nil, err
+	}
+	// owner_ref is a compatibility column, so the per-owner name index can
+	// only be built after the ALTER loop above.
+	if err := migrateSandboxNameIndex(db); err != nil {
+		db.Close()
+		return nil, err
+	}
+	if err := backfillSnapshotOwners(db); err != nil {
+		db.Close()
+		return nil, err
+	}
+	// Widen the snapshot primary key from (name) to (owner_ref, name) so two
+	// tenants can hold a same-named snapshot and one cannot learn or pre-claim
+	// another's names. Runs AFTER backfillSnapshotOwners so owner_ref is
+	// populated before it leads the key. SQLite cannot widen a PK in place, so
+	// this rebuilds sandbox_snapshots and snapshot_aliases (whose FK depends on
+	// it). Idempotent: a no-op once the composite key is in place.
+	if err := migrateSnapshotOwnerPK(db); err != nil {
+		db.Close()
+		return nil, err
+	}
+	if err := ensureSnapshotPushQueueShape(db); err != nil {
+		db.Close()
+		return nil, err
+	}
+	// Widen the WASM catalogue key from (id) to (owner_ref, id) so a second
+	// tenant registering the same module bytes gets its own digest-id row.
+	// Runs after the migrations loop, which adds owner_ref to pre-#724 tables.
+	if err := migrateWasmModuleOwnerPK(db); err != nil {
 		db.Close()
 		return nil, err
 	}
@@ -1251,6 +1490,347 @@ func migratePendingImageGCKey(db *sql.DB) error {
 	return nil
 }
 
+// sandboxNameIndexDDL makes sandbox names unique per owner. The empty name
+// is allowed many times (sandboxes created without a name). An empty
+// owner_ref is the operator namespace, so operator names stay unique among
+// themselves.
+// Daytona, the v1 ?name= lookup and the aerolvm CLI resolve names through it.
+const sandboxNameIndexDDL = `CREATE UNIQUE INDEX IF NOT EXISTS idx_sandboxes_name ON sandboxes(owner_ref, name) WHERE name <> '';`
+
+// backfillSnapshotOwners stamps pre-migration snapshot rows with the owner of
+// their source sandbox while that sandbox still exists. A row whose source is
+// already gone keeps an empty owner_ref (the operator namespace): nothing
+// durable records who took it. It runs on every open because it is cheap (only
+// unattributed rows with a tenant-owned source qualify) and idempotent, and the
+// owner index it pairs with can only be built once the ALTER has run.
+// migrateSnapshotOwnerPK rebuilds sandbox_snapshots with PRIMARY KEY
+// (owner_ref, name) and snapshot_aliases with an owner_ref column and the
+// matching composite foreign key. Idempotent: it checks whether owner_ref is
+// already part of the sandbox_snapshots primary key and returns early if so.
+//
+// SQLite cannot alter a primary key or a foreign key in place, so both tables
+// are rebuilt. The alias FK references sandbox_snapshots, so FK enforcement is
+// disabled for the rebuild and the two tables are swapped inside one
+// transaction. Alias rows backfill owner_ref from the snapshot they point at
+// (names are globally unique pre-migration, so each maps to exactly one owner).
+func migrateSnapshotOwnerPK(db *sql.DB) error {
+	rows, err := db.Query(`PRAGMA table_info(sandbox_snapshots)`)
+	if err != nil {
+		return fmt.Errorf("inspect sandbox_snapshots: %w", err)
+	}
+	ownerInKey := false
+	for rows.Next() {
+		var (
+			cid, notNull, pk int
+			name, colType    string
+			dflt             sql.NullString
+		)
+		if err := rows.Scan(&cid, &name, &colType, &notNull, &dflt, &pk); err != nil {
+			rows.Close()
+			return fmt.Errorf("scan sandbox_snapshots column: %w", err)
+		}
+		if name == "owner_ref" && pk > 0 {
+			ownerInKey = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return fmt.Errorf("iterate sandbox_snapshots columns: %w", err)
+	}
+	rows.Close()
+	if ownerInKey {
+		return nil
+	}
+
+	// FK enforcement must be off while the referenced table is swapped out.
+	// PRAGMA foreign_keys cannot change inside a transaction, so toggle it
+	// around the transaction.
+	if _, err := db.Exec(`PRAGMA foreign_keys = OFF;`); err != nil {
+		return fmt.Errorf("disable foreign keys: %w", err)
+	}
+	defer db.Exec(`PRAGMA foreign_keys = ON;`)
+
+	tx, err := db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin snapshot PK migration: %w", err)
+	}
+	defer tx.Rollback()
+
+	stmts := []string{
+		`CREATE TABLE sandbox_snapshots_rekeyed (
+			name TEXT NOT NULL,
+			image TEXT NOT NULL,
+			image_id TEXT NOT NULL DEFAULT '',
+			source_sandbox_id TEXT NOT NULL,
+			created_at DATETIME NOT NULL,
+			entrypoint_json TEXT NOT NULL DEFAULT '[]',
+			region_id TEXT NOT NULL DEFAULT '',
+			cpu REAL NOT NULL DEFAULT 0,
+			memory_mb INTEGER NOT NULL DEFAULT 0,
+			disk_gb INTEGER NOT NULL DEFAULT 0,
+			gpu REAL NOT NULL DEFAULT 0,
+			image_distribution_mode TEXT NOT NULL DEFAULT '',
+			image_digest TEXT NOT NULL DEFAULT '',
+			image_registry_ref TEXT NOT NULL DEFAULT '',
+			image_verified_at DATETIME,
+			push_state TEXT NOT NULL DEFAULT 'active',
+			push_error TEXT NOT NULL DEFAULT '',
+			owner_ref TEXT NOT NULL DEFAULT '',
+			PRIMARY KEY (owner_ref, name)
+		);`,
+		`INSERT INTO sandbox_snapshots_rekeyed
+			SELECT name, image, image_id, source_sandbox_id, created_at,
+				entrypoint_json, region_id, cpu, memory_mb, disk_gb, gpu,
+				image_distribution_mode, image_digest, image_registry_ref,
+				image_verified_at, push_state, push_error, owner_ref
+			FROM sandbox_snapshots;`,
+		`DROP TABLE sandbox_snapshots;`,
+		`ALTER TABLE sandbox_snapshots_rekeyed RENAME TO sandbox_snapshots;`,
+		`CREATE INDEX IF NOT EXISTS idx_sandbox_snapshots_owner_name ON sandbox_snapshots(owner_ref, name);`,
+
+		`CREATE TABLE snapshot_aliases_rekeyed (
+			alias TEXT PRIMARY KEY,
+			snapshot_name TEXT NOT NULL,
+			facade TEXT NOT NULL,
+			extra_names_json TEXT NOT NULL DEFAULT '[]',
+			state_json TEXT NOT NULL DEFAULT '',
+			created_at DATETIME NOT NULL,
+			updated_at DATETIME NOT NULL,
+			owner_ref TEXT NOT NULL DEFAULT '',
+			FOREIGN KEY (owner_ref, snapshot_name) REFERENCES sandbox_snapshots(owner_ref, name) ON DELETE CASCADE
+		);`,
+		// Backfill the alias owner from its snapshot. Pre-migration names are
+		// globally unique, so the subquery returns one owner. An alias whose
+		// snapshot is already gone backfills to '' and is dropped by the FK
+		// insert below only if no matching snapshot exists — so filter those.
+		`INSERT INTO snapshot_aliases_rekeyed
+			SELECT a.alias, a.snapshot_name, a.facade, a.extra_names_json, a.state_json,
+				a.created_at, a.updated_at,
+				COALESCE((SELECT s.owner_ref FROM sandbox_snapshots s WHERE s.name = a.snapshot_name), '')
+			FROM snapshot_aliases a
+			WHERE EXISTS (SELECT 1 FROM sandbox_snapshots s WHERE s.name = a.snapshot_name);`,
+		`DROP TABLE snapshot_aliases;`,
+		`ALTER TABLE snapshot_aliases_rekeyed RENAME TO snapshot_aliases;`,
+		`CREATE INDEX IF NOT EXISTS idx_snapshot_aliases_snapshot_name ON snapshot_aliases(snapshot_name);`,
+		`CREATE INDEX IF NOT EXISTS idx_snapshot_aliases_facade ON snapshot_aliases(facade);`,
+	}
+	for _, stmt := range stmts {
+		if _, err := tx.Exec(stmt); err != nil {
+			head := strings.TrimSpace(stmt)
+			if i := strings.IndexByte(head, '\n'); i > 0 {
+				head = head[:i]
+			}
+			return fmt.Errorf("snapshot PK migration %q: %w", head, err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit snapshot PK migration: %w", err)
+	}
+	return nil
+}
+
+// ensureSnapshotPushQueueShape puts back what migrateSnapshotOwnerPK's
+// rebuild drops: it copies sandbox_snapshots from a fixed column list, so the
+// push_claimed_at column and the table's indexes, all added before it runs,
+// were gone until the next open — and the push queue failed on the missing
+// column for the whole of the first boot after the upgrade. Idempotent, and
+// also where the push-queue index is built, since it needs push_claimed_at's
+// table in its final shape.
+func ensureSnapshotPushQueueShape(db *sql.DB) error {
+	if _, err := db.Exec(`ALTER TABLE sandbox_snapshots ADD COLUMN push_claimed_at DATETIME;`); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
+		return fmt.Errorf("restore sandbox_snapshots.push_claimed_at: %w", err)
+	}
+	for _, stmt := range []string{
+		`CREATE INDEX IF NOT EXISTS idx_sandbox_snapshots_source_sandbox_id ON sandbox_snapshots(source_sandbox_id);`,
+		`CREATE INDEX IF NOT EXISTS idx_sandbox_snapshots_image ON sandbox_snapshots(image);`,
+		// The push queue, in the order the reconciler pages it. Partial, so
+		// it holds only rows with push work outstanding — steady state is
+		// empty — and a page is a range scan however large the catalogue.
+		// The WHERE must stay word for word the first term of
+		// snapshotPushQueued, or SQLite cannot use the index for it.
+		`CREATE INDEX IF NOT EXISTS idx_sandbox_snapshots_push_queue ON sandbox_snapshots(created_at, owner_ref, name) WHERE push_state IN ('pending', 'error', 'pushing');`,
+		// SnapshotRegistryCopyInUse asks whether any row still names a
+		// registry copy before it is retired. Partial: only pushed rows.
+		`CREATE INDEX IF NOT EXISTS idx_sandbox_snapshots_registry_ref ON sandbox_snapshots(image_registry_ref) WHERE image_registry_ref <> '';`,
+	} {
+		if _, err := db.Exec(stmt); err != nil {
+			return fmt.Errorf("snapshot push queue index: %w", err)
+		}
+	}
+	return nil
+}
+
+// migrateWasmModuleOwnerPK rebuilds wasm_modules with PRIMARY KEY
+// (owner_ref, id). Idempotent: it returns early once owner_ref is part of the
+// primary key, so every open after the first costs one PRAGMA read.
+//
+// SQLite cannot widen a primary key in place, so the rows are copied into a
+// rekeyed twin and the tables swapped inside one transaction; a crash part way
+// rolls back to the old table and the next open retries. Every row keeps its
+// owner_ref: rows #724 backfilled stay "" (operator-published) and tenant rows
+// keep their tenant. Pre-migration ids were unique per host, so the copy
+// cannot collide. No table references wasm_modules, so foreign keys need no
+// toggling. The index list must match the wasm_modules indexes in open.
+func migrateWasmModuleOwnerPK(db *sql.DB) error {
+	ownerInKey, err := columnInPrimaryKey(db, "wasm_modules", "owner_ref")
+	if err != nil {
+		return err
+	}
+	if ownerInKey {
+		return nil
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin wasm module PK migration: %w", err)
+	}
+	defer tx.Rollback()
+
+	stmts := []string{
+		`CREATE TABLE wasm_modules_rekeyed (
+			id TEXT NOT NULL,
+			module_ref TEXT NOT NULL,
+			status TEXT NOT NULL,
+			module_path TEXT NOT NULL DEFAULT '',
+			module_size_bytes INTEGER NOT NULL DEFAULT 0,
+			digest TEXT NOT NULL DEFAULT '',
+			entrypoint TEXT NOT NULL DEFAULT '_start',
+			has_warm INTEGER NOT NULL DEFAULT 0,
+			last_error TEXT NOT NULL DEFAULT '',
+			owner_ref TEXT NOT NULL DEFAULT '',
+			created_at DATETIME NOT NULL,
+			updated_at DATETIME NOT NULL,
+			ready_at DATETIME,
+			PRIMARY KEY (owner_ref, id)
+		);`,
+		`INSERT INTO wasm_modules_rekeyed (
+			id, module_ref, status, module_path, module_size_bytes, digest,
+			entrypoint, has_warm, last_error, owner_ref, created_at, updated_at, ready_at
+		)
+		SELECT id, module_ref, status, module_path, module_size_bytes, digest,
+			entrypoint, has_warm, last_error, owner_ref, created_at, updated_at, ready_at
+		FROM wasm_modules;`,
+		`DROP TABLE wasm_modules;`,
+		`ALTER TABLE wasm_modules_rekeyed RENAME TO wasm_modules;`,
+		`CREATE INDEX IF NOT EXISTS idx_wasm_modules_updated_at ON wasm_modules(updated_at);`,
+		`CREATE INDEX IF NOT EXISTS idx_wasm_modules_status_ref ON wasm_modules(status, module_ref);`,
+		`CREATE INDEX IF NOT EXISTS idx_wasm_modules_digest ON wasm_modules(digest) WHERE digest <> '';`,
+	}
+	for _, stmt := range stmts {
+		if _, err := tx.Exec(stmt); err != nil {
+			head := strings.TrimSpace(stmt)
+			if i := strings.IndexByte(head, '\n'); i > 0 {
+				head = head[:i]
+			}
+			return fmt.Errorf("wasm module PK migration %q: %w", head, err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit wasm module PK migration: %w", err)
+	}
+	return nil
+}
+
+// columnInPrimaryKey reports whether column is part of table's primary key.
+func columnInPrimaryKey(db *sql.DB, table, column string) (bool, error) {
+	rows, err := db.Query(`SELECT name, pk FROM pragma_table_info(?)`, table)
+	if err != nil {
+		return false, fmt.Errorf("inspect %s: %w", table, err)
+	}
+	defer rows.Close()
+	inKey := false
+	for rows.Next() {
+		var (
+			name string
+			pk   int
+		)
+		if err := rows.Scan(&name, &pk); err != nil {
+			return false, fmt.Errorf("scan %s column: %w", table, err)
+		}
+		if name == column && pk > 0 {
+			inKey = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return false, fmt.Errorf("iterate %s columns: %w", table, err)
+	}
+	return inKey, nil
+}
+
+func backfillSnapshotOwners(db *sql.DB) error {
+	if _, err := db.Exec(`
+		UPDATE sandbox_snapshots
+		SET owner_ref = (SELECT owner_ref FROM sandboxes WHERE sandboxes.id = sandbox_snapshots.source_sandbox_id)
+		WHERE owner_ref = ''
+			AND EXISTS (
+				SELECT 1 FROM sandboxes
+				WHERE sandboxes.id = sandbox_snapshots.source_sandbox_id AND sandboxes.owner_ref <> ''
+			)
+	`); err != nil {
+		return fmt.Errorf("backfill snapshot owners: %w", err)
+	}
+	// Serves the owner-scoped catalogue page (ListSnapshotPage): one tenant's
+	// snapshots, walked by name.
+	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_sandbox_snapshots_owner_name ON sandbox_snapshots(owner_ref, name);`); err != nil {
+		return fmt.Errorf("create sandbox_snapshots owner index: %w", err)
+	}
+	return nil
+}
+
+// migrateSandboxNameIndex moves idx_sandboxes_name from the old global
+// (name) form to (owner_ref, name), keeping the index NAME (CEO review CF7).
+// The name is what makes rollback safe: SQLite's CREATE ... IF NOT EXISTS
+// checks only the index name, so a rolled-back binary's global statement is
+// a no-op against the per-owner index and the old daemon still boots. The
+// rebuild only relaxes a constraint, so existing rows cannot violate it, and
+// drop + create share one transaction so no window runs without either
+// index. A warm restart pays one PRAGMA.
+func migrateSandboxNameIndex(db *sql.DB) error {
+	rows, err := db.Query(`PRAGMA index_info(idx_sandboxes_name)`)
+	if err != nil {
+		return fmt.Errorf("inspect idx_sandboxes_name: %w", err)
+	}
+	exists, perOwner := false, false
+	for rows.Next() {
+		var (
+			seqno, cid int
+			column     sql.NullString
+		)
+		if err := rows.Scan(&seqno, &cid, &column); err != nil {
+			rows.Close()
+			return fmt.Errorf("scan idx_sandboxes_name column: %w", err)
+		}
+		exists = true
+		if column.String == "owner_ref" {
+			perOwner = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return fmt.Errorf("iterate idx_sandboxes_name columns: %w", err)
+	}
+	rows.Close()
+	if perOwner {
+		return nil
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin sandbox name index migration: %w", err)
+	}
+	defer tx.Rollback()
+	if exists {
+		if _, err := tx.Exec(`DROP INDEX idx_sandboxes_name;`); err != nil {
+			return fmt.Errorf("drop global sandbox name index: %w", err)
+		}
+	}
+	if _, err := tx.Exec(sandboxNameIndexDDL); err != nil {
+		return fmt.Errorf("create per-owner sandbox name index: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit sandbox name index migration: %w", err)
+	}
+	return nil
+}
+
 func migrateLegacyToolboxTokenRows(ctx context.Context, tx *sql.Tx, secretCipher *secrets.Cipher) error {
 	afterID := ""
 	for {
@@ -1457,6 +2037,9 @@ func (s *Store) Create(ctx context.Context, sandbox *models.Sandbox) error {
 	if err := s.insertSandbox(ctx, tx, sandbox); err != nil {
 		return err
 	}
+	if err := putCreateDigestExec(ctx, tx, sandbox); err != nil {
+		return err
+	}
 	// An empty env is recorded as an empty row, never as an absent one. That
 	// is what lets a later read tell "this sandbox has no environment" from
 	// "this sandbox's sealed environment is gone" and fail loud on the second
@@ -1501,6 +2084,9 @@ func (s *Store) CreateWithSealedEnv(ctx context.Context, sandbox *models.Sandbox
 	if err := s.insertSandbox(ctx, tx, &cleared); err != nil {
 		return err
 	}
+	if err := putCreateDigestExec(ctx, tx, sandbox); err != nil {
+		return err
+	}
 	if err := putEnvExec(ctx, tx, sandbox.ID, sealedEnv); err != nil {
 		return err
 	}
@@ -1513,6 +2099,34 @@ func (s *Store) CreateWithSealedEnv(ctx context.Context, sandbox *models.Sandbox
 		return fmt.Errorf("commit create+env tx: %w", err)
 	}
 	return nil
+}
+
+// putCreateDigestExec records a keyed create's request digest with its row.
+// A create without one (no Idempotency-Key, or no server key) writes nothing.
+func putCreateDigestExec(ctx context.Context, exec dbExecer, sandbox *models.Sandbox) error {
+	digest := strings.TrimSpace(sandbox.CreateRequestDigest)
+	if digest == "" {
+		return nil
+	}
+	if _, err := exec.ExecContext(ctx, `INSERT INTO sandbox_create_digests (sandbox_id, digest) VALUES (?, ?)`, sandbox.ID, digest); err != nil {
+		return fmt.Errorf("insert create digest: %w", err)
+	}
+	return nil
+}
+
+// GetCreateRequestDigest returns the request digest a sandbox's keyed create
+// stored, or "" when it has none (a create without a key, a server without a
+// key, or a row made before digests were kept).
+func (s *Store) GetCreateRequestDigest(ctx context.Context, sandboxID string) (string, error) {
+	var digest string
+	err := s.db.QueryRowContext(ctx, `SELECT digest FROM sandbox_create_digests WHERE sandbox_id = ?`, strings.TrimSpace(sandboxID)).Scan(&digest)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("get create digest: %w", err)
+	}
+	return digest, nil
 }
 
 func (s *Store) insertSandbox(ctx context.Context, exec dbExecer, sandbox *models.Sandbox) error {
@@ -1768,6 +2382,11 @@ func (s *Store) Upsert(ctx context.Context, sandbox *models.Sandbox) error {
 		}
 	}
 
+	// A whole-row write is a snapshot read earlier, so the update keeps a
+	// sealed column the row already has: one read before a rotation's reseal
+	// pass and written after the old key was retired would otherwise put
+	// back bytes nothing opens. Only Create, the reseal pass and a write
+	// with a new plaintext toolbox token (the last argument) change one.
 	_, err = exec.ExecContext(ctx, `
 		INSERT INTO sandboxes (
 			id, image, status, public_url, container_id, container_ip, cpu, memory_mb, disk_gb,
@@ -1806,7 +2425,10 @@ func (s *Store) Upsert(ctx context.Context, sandbox *models.Sandbox) error {
 			allow_public_traffic = excluded.allow_public_traffic,
 			mask_request_host = excluded.mask_request_host,
 			toolbox_enabled = excluded.toolbox_enabled,
-			toolbox_token_sealed = excluded.toolbox_token_sealed,
+			toolbox_token_sealed = CASE
+				WHEN ? = 1 OR COALESCE(length(sandboxes.toolbox_token_sealed), 0) = 0 THEN excluded.toolbox_token_sealed
+				ELSE sandboxes.toolbox_token_sealed
+			END,
 			ssh_public_key = excluded.ssh_public_key,
 			last_error = excluded.last_error,
 			container_command_json = excluded.container_command_json,
@@ -1824,7 +2446,10 @@ func (s *Store) Upsert(ctx context.Context, sandbox *models.Sandbox) error {
 			gpus_json = excluded.gpus_json,
 			net_bytes_in_limit = excluded.net_bytes_in_limit,
 			net_bytes_out_limit = excluded.net_bytes_out_limit,
-			registry_auth_sealed = excluded.registry_auth_sealed,
+			registry_auth_sealed = CASE
+				WHEN COALESCE(length(sandboxes.registry_auth_sealed), 0) = 0 THEN excluded.registry_auth_sealed
+				ELSE sandboxes.registry_auth_sealed
+			END,
 			auto_import_pending = excluded.auto_import_pending,
 			serverless = excluded.serverless,
 			wake_armed = excluded.wake_armed,
@@ -1901,6 +2526,7 @@ func (s *Store) Upsert(ctx context.Context, sandbox *models.Sandbox) error {
 		boolToInt(sandbox.FleetSuspended),
 		strings.TrimSpace(sandbox.TenantID),
 		incarnationID,
+		boolToInt(sandbox.ToolboxToken != ""),
 	)
 	if err != nil {
 		if isSandboxNameConflict(err, sandbox.Name) {
@@ -1980,7 +2606,25 @@ func (s *Store) Get(ctx context.Context, id string) (*models.Sandbox, error) {
 	}
 	sandbox.CustomDomains = customDomains
 
+	if err := s.attachEgressModes(ctx, map[string]*models.Sandbox{id: sandbox}); err != nil {
+		return nil, err
+	}
 	return sandbox, nil
+}
+
+// CountDistinctSandboxOwners counts the distinct owner_ref values among this
+// node's sandboxes ("" — operator-owned — counts as one), stopping at max:
+// the api-record flood control only needs to know whether a node is shared
+// (plans/identity-and-access.md §5.9, D14), so it asks for 2 and the
+// query never reads past the second owner.
+func (s *Store) CountDistinctSandboxOwners(ctx context.Context, max int) (int, error) {
+	if max < 1 {
+		max = 1
+	}
+	var n int
+	err := s.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM (SELECT DISTINCT owner_ref FROM sandboxes LIMIT ?)`, max).Scan(&n)
+	return n, err
 }
 
 func (s *Store) List(ctx context.Context) ([]*models.Sandbox, error) {
@@ -2038,6 +2682,9 @@ func (s *Store) List(ctx context.Context) ([]*models.Sandbox, error) {
 		if err := s.attachCustomDomainsBulk(ctx, byID); err != nil {
 			return nil, err
 		}
+		if err := s.attachEgressModes(ctx, byID); err != nil {
+			return nil, err
+		}
 	}
 
 	return sandboxes, nil
@@ -2082,15 +2729,20 @@ func (s *Store) ListByOwner(ctx context.Context, ownerRef string) ([]*models.San
 	defer rows.Close()
 
 	var sandboxes []*models.Sandbox
+	byID := map[string]*models.Sandbox{}
 	for rows.Next() {
 		sandbox, err := s.scanSandbox(rows)
 		if err != nil {
 			return nil, err
 		}
 		sandboxes = append(sandboxes, sandbox)
+		byID[sandbox.ID] = sandbox
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("iterate sandboxes by owner: %w", err)
+	}
+	if err := s.attachEgressModes(ctx, byID); err != nil {
+		return nil, err
 	}
 	return sandboxes, nil
 }
@@ -2135,15 +2787,20 @@ func (s *Store) ListByRuntime(ctx context.Context, runtime string) ([]*models.Sa
 	defer rows.Close()
 
 	var sandboxes []*models.Sandbox
+	byID := map[string]*models.Sandbox{}
 	for rows.Next() {
 		sandbox, err := s.scanSandbox(rows)
 		if err != nil {
 			return nil, err
 		}
 		sandboxes = append(sandboxes, sandbox)
+		byID[sandbox.ID] = sandbox
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("iterate sandboxes by runtime: %w", err)
+	}
+	if err := s.attachEgressModes(ctx, byID); err != nil {
+		return nil, err
 	}
 	return sandboxes, nil
 }
@@ -2231,23 +2888,30 @@ func (s *Store) attachPortsBulk(ctx context.Context, byID map[string]*models.San
 	return nil
 }
 
+const hasActiveImageRefSQL = `
+	SELECT 1 FROM sandboxes
+	WHERE image = ? AND status != ?
+	UNION ALL
+	SELECT 1 FROM sandbox_snapshots
+	WHERE image = ?
+	LIMIT 1`
+
 // HasActiveImageRef reports whether any sandbox row references image with a
-// status other than destroyed. Used by image GC: when this returns false the
-// caller may safely remove the image from Docker. Single indexed query —
-// constant cost regardless of how many destroyed rows have accumulated, so
-// 10k destroyed historical rows do not slow the destroy hot path. Returns
-// true on empty image as a conservative default (caller treats it as "still
-// in use, do not delete").
+// status other than destroyed, or any snapshot holds it. Used by image GC:
+// when this returns false the caller may safely remove the image from
+// Docker. A snapshot's image has no sandbox using it most of the time — a
+// sandbox started from it and since destroyed is what schedules it for GC —
+// yet removing it would leave the snapshot pointing at nothing. Two indexed
+// lookups — constant cost regardless of how many destroyed rows have
+// accumulated, so 10k destroyed historical rows do not slow the destroy hot
+// path. Returns true on empty image as a conservative default (caller
+// treats it as "still in use, do not delete").
 func (s *Store) HasActiveImageRef(ctx context.Context, image string) (bool, error) {
 	if image == "" {
 		return true, nil
 	}
 	var present int
-	err := s.db.QueryRowContext(ctx, `
-		SELECT 1 FROM sandboxes
-		WHERE image = ? AND status != ?
-		LIMIT 1
-	`, image, string(models.SandboxStatusDestroyed)).Scan(&present)
+	err := s.db.QueryRowContext(ctx, hasActiveImageRefSQL, image, string(models.SandboxStatusDestroyed), image).Scan(&present)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, nil
 	}
@@ -2818,16 +3482,50 @@ func (s *Store) ListCompatState(ctx context.Context, facade string) (map[string]
 	return items, nil
 }
 
-// ResolveSandboxIDByName returns the sandbox ID owning the given name, or
-// ErrNotFound if no row matches. Empty input is rejected so an accidental
-// "" lookup does not match a no-name sandbox via the partial unique
-// index's escape hatch.
-func (s *Store) ResolveSandboxIDByName(ctx context.Context, name string) (string, error) {
+// ListCompatStateByOwner is ListCompatState narrowed to one owner's sandboxes,
+// joining sandbox_compat_state to sandboxes on the id. A scoped caller (a user
+// token) only ever needs its own rows, so the service uses this instead of
+// scanning every tenant's compat rows on each list — the fleet-wide scan is a
+// real cost at 100k sandboxes, and returning only the owner's rows keeps the
+// owner check inside the shared helper rather than relying on the caller.
+func (s *Store) ListCompatStateByOwner(ctx context.Context, facade, ownerRef string) (map[string]models.SandboxCompatState, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT cs.sandbox_id, cs.facade, cs.state_json, cs.created_at, cs.updated_at
+		FROM sandbox_compat_state cs
+		JOIN sandboxes s ON s.id = cs.sandbox_id
+		WHERE cs.facade = ? AND s.owner_ref = ?
+		ORDER BY cs.sandbox_id ASC
+	`, strings.TrimSpace(facade), strings.TrimSpace(ownerRef))
+	if err != nil {
+		return nil, fmt.Errorf("list compat state by owner: %w", err)
+	}
+	defer rows.Close()
+
+	items := map[string]models.SandboxCompatState{}
+	for rows.Next() {
+		state, err := scanCompatState(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scan compat state: %w", err)
+		}
+		items[state.SandboxID] = *state
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate compat state: %w", err)
+	}
+	return items, nil
+}
+
+// ResolveSandboxIDByName returns the ID of ownerRef's sandbox called name, or
+// ErrNotFound if no row matches. Names are unique per owner
+// (idx_sandboxes_name), and ownerRef "" is the operator namespace, so at most
+// one row matches. Empty input is rejected so an accidental "" lookup does
+// not match a no-name sandbox via the partial unique index's escape hatch.
+func (s *Store) ResolveSandboxIDByName(ctx context.Context, ownerRef, name string) (string, error) {
 	trimmed := strings.TrimSpace(name)
 	if trimmed == "" {
 		return "", ErrNotFound
 	}
-	row := s.db.QueryRowContext(ctx, `SELECT id FROM sandboxes WHERE name = ?`, trimmed)
+	row := s.db.QueryRowContext(ctx, `SELECT id FROM sandboxes WHERE owner_ref = ? AND name = ?`, strings.TrimSpace(ownerRef), trimmed)
 	var sandboxID string
 	if err := row.Scan(&sandboxID); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -2857,20 +3555,24 @@ func (s *Store) UpsertSnapshotAlias(ctx context.Context, alias models.SnapshotAl
 		createdAt = now
 	}
 	_, err = s.db.ExecContext(ctx, `
-		INSERT INTO snapshot_aliases (alias, snapshot_name, facade, extra_names_json, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?)
+		INSERT INTO snapshot_aliases (alias, snapshot_name, facade, extra_names_json, state_json, created_at, updated_at, owner_ref)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(alias) DO UPDATE SET
 			snapshot_name = excluded.snapshot_name,
 			facade = excluded.facade,
 			extra_names_json = excluded.extra_names_json,
-			updated_at = excluded.updated_at
+			state_json = excluded.state_json,
+			updated_at = excluded.updated_at,
+			owner_ref = excluded.owner_ref
 	`,
 		strings.TrimSpace(alias.Alias),
 		strings.TrimSpace(alias.SnapshotName),
 		strings.TrimSpace(alias.Facade),
 		extraNamesJSON,
+		alias.StateJSON,
 		createdAt,
 		now,
+		strings.TrimSpace(alias.OwnerRef),
 	)
 	if err != nil {
 		return fmt.Errorf("upsert snapshot alias: %w", err)
@@ -2882,7 +3584,7 @@ func (s *Store) UpsertSnapshotAlias(ctx context.Context, alias models.SnapshotAl
 // does not exist.
 func (s *Store) GetSnapshotAlias(ctx context.Context, alias string) (*models.SnapshotAlias, error) {
 	row := s.db.QueryRowContext(ctx, `
-		SELECT alias, snapshot_name, facade, extra_names_json, created_at, updated_at
+		SELECT alias, snapshot_name, facade, extra_names_json, state_json, created_at, updated_at, owner_ref
 		FROM snapshot_aliases
 		WHERE alias = ?
 	`, strings.TrimSpace(alias))
@@ -2904,13 +3606,13 @@ func (s *Store) ListSnapshotAliases(ctx context.Context, facade string) (map[str
 	trimmed := strings.TrimSpace(facade)
 	if trimmed == "" {
 		rows, err = s.db.QueryContext(ctx, `
-			SELECT alias, snapshot_name, facade, extra_names_json, created_at, updated_at
+			SELECT alias, snapshot_name, facade, extra_names_json, state_json, created_at, updated_at, owner_ref
 			FROM snapshot_aliases
 			ORDER BY created_at DESC, alias ASC
 		`)
 	} else {
 		rows, err = s.db.QueryContext(ctx, `
-			SELECT alias, snapshot_name, facade, extra_names_json, created_at, updated_at
+			SELECT alias, snapshot_name, facade, extra_names_json, state_json, created_at, updated_at, owner_ref
 			FROM snapshot_aliases
 			WHERE facade = ?
 			ORDER BY created_at DESC, alias ASC
@@ -2918,6 +3620,36 @@ func (s *Store) ListSnapshotAliases(ctx context.Context, facade string) (map[str
 	}
 	if err != nil {
 		return nil, fmt.Errorf("list snapshot aliases: %w", err)
+	}
+	defer rows.Close()
+
+	items := map[string]models.SnapshotAlias{}
+	for rows.Next() {
+		alias, err := scanSnapshotAlias(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scan snapshot alias: %w", err)
+		}
+		items[alias.Alias] = *alias
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate snapshot aliases: %w", err)
+	}
+	return items, nil
+}
+
+// ListSnapshotAliasesForOwner is ListSnapshotAliases narrowed to aliases whose
+// snapshot belongs to ownerRef. Owner-scoped callers use it so another
+// tenant's alias rows (and the facade state on them) never leave the store.
+func (s *Store) ListSnapshotAliasesForOwner(ctx context.Context, facade, ownerRef string) (map[string]models.SnapshotAlias, error) {
+	trimmed := strings.TrimSpace(facade)
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT a.alias, a.snapshot_name, a.facade, a.extra_names_json, a.state_json, a.created_at, a.updated_at, a.owner_ref
+		FROM snapshot_aliases a
+		WHERE a.owner_ref = ? AND (? = '' OR a.facade = ?)
+		ORDER BY a.created_at DESC, a.alias ASC
+	`, strings.TrimSpace(ownerRef), trimmed, trimmed)
+	if err != nil {
+		return nil, fmt.Errorf("list snapshot aliases for owner: %w", err)
 	}
 	defer rows.Close()
 
@@ -3124,8 +3856,8 @@ func (s *Store) CreateSnapshot(ctx context.Context, snapshot *models.SandboxSnap
 		INSERT INTO sandbox_snapshots (name, image, image_id, source_sandbox_id, created_at,
 			entrypoint_json, region_id, cpu, memory_mb, disk_gb, gpu,
 			image_distribution_mode, image_digest, image_registry_ref, image_verified_at,
-			push_state, push_error)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			push_state, push_error, owner_ref)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`,
 		strings.TrimSpace(snapshot.Name),
 		strings.TrimSpace(snapshot.Image),
@@ -3144,6 +3876,7 @@ func (s *Store) CreateSnapshot(ctx context.Context, snapshot *models.SandboxSnap
 		imageVerifiedAt,
 		pushState,
 		strings.TrimSpace(snapshot.PushError),
+		strings.TrimSpace(snapshot.OwnerRef),
 	)
 	if err != nil {
 		if isSQLiteUniqueConstraint(err) {
@@ -3154,15 +3887,15 @@ func (s *Store) CreateSnapshot(ctx context.Context, snapshot *models.SandboxSnap
 	return nil
 }
 
-func (s *Store) GetSnapshot(ctx context.Context, name string) (*models.SandboxSnapshot, error) {
+func (s *Store) GetSnapshot(ctx context.Context, ownerRef, name string) (*models.SandboxSnapshot, error) {
 	row := s.db.QueryRowContext(ctx, `
 		SELECT name, image, image_id, source_sandbox_id, created_at,
 			entrypoint_json, region_id, cpu, memory_mb, disk_gb, gpu,
 			image_distribution_mode, image_digest, image_registry_ref, image_verified_at,
-			push_state, push_error
+			push_state, push_error, owner_ref
 		FROM sandbox_snapshots
-		WHERE name = ?
-	`, strings.TrimSpace(name))
+		WHERE owner_ref = ? AND name = ?
+	`, strings.TrimSpace(ownerRef), strings.TrimSpace(name))
 	snapshot, err := scanSnapshot(row)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -3173,12 +3906,105 @@ func (s *Store) GetSnapshot(ctx context.Context, name string) (*models.SandboxSn
 	return snapshot, nil
 }
 
+// GetSnapshotByNames returns the snapshot whose name is the earliest of names
+// that one exists for, in one primary-key lookup per name and one statement.
+// The create path resolves an image through it with every spelling the
+// engine treats as that image, so "snap:latest" cannot reach snapshot
+// "snap" without its owner check.
+func (s *Store) GetSnapshotByNames(ctx context.Context, ownerRef string, names []string) (*models.SandboxSnapshot, error) {
+	if len(names) == 0 {
+		return nil, ErrNotFound
+	}
+	args := make([]any, 0, len(names)+1)
+	args = append(args, strings.TrimSpace(ownerRef))
+	for _, name := range names {
+		args = append(args, strings.TrimSpace(name))
+	}
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT name, image, image_id, source_sandbox_id, created_at,
+			entrypoint_json, region_id, cpu, memory_mb, disk_gb, gpu,
+			image_distribution_mode, image_digest, image_registry_ref, image_verified_at,
+			push_state, push_error, owner_ref
+		FROM sandbox_snapshots
+		WHERE owner_ref = ? AND name IN (?`+strings.Repeat(", ?", len(names)-1)+`)
+	`, args...)
+	if err != nil {
+		return nil, fmt.Errorf("get snapshot by names: %w", err)
+	}
+	defer rows.Close()
+	found := map[string]*models.SandboxSnapshot{}
+	for rows.Next() {
+		snapshot, err := scanSnapshot(rows)
+		if err != nil {
+			return nil, fmt.Errorf("get snapshot by names: %w", err)
+		}
+		found[snapshot.Name] = snapshot
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("get snapshot by names: %w", err)
+	}
+	for _, name := range args {
+		if snapshot, ok := found[name.(string)]; ok {
+			return snapshot, nil
+		}
+	}
+	return nil, ErrNotFound
+}
+
+// maxSnapshotsByImage bounds GetSnapshotsByImage. One image backs one
+// committed snapshot plus whatever names were registered for it; a caller
+// only needs to find one it may see.
+const maxSnapshotsByImage = 64
+
+func snapshotsByImageSQL(images int) string {
+	return `
+		SELECT name, image, image_id, source_sandbox_id, created_at,
+			entrypoint_json, region_id, cpu, memory_mb, disk_gb, gpu,
+			image_distribution_mode, image_digest, image_registry_ref, image_verified_at,
+			push_state, push_error, owner_ref
+		FROM sandbox_snapshots
+		WHERE image IN (?` + strings.Repeat(", ?", images-1) + `)
+		ORDER BY name
+		LIMIT ?`
+}
+
+// GetSnapshotsByImage returns the snapshots whose image is any of images,
+// ordered by name: the snapshot an image was committed for, and any
+// registered under that image.
+func (s *Store) GetSnapshotsByImage(ctx context.Context, images []string) ([]*models.SandboxSnapshot, error) {
+	if len(images) == 0 {
+		return nil, nil
+	}
+	args := make([]any, 0, len(images)+1)
+	for _, image := range images {
+		args = append(args, strings.TrimSpace(image))
+	}
+	args = append(args, maxSnapshotsByImage)
+	rows, err := s.db.QueryContext(ctx, snapshotsByImageSQL(len(images)), args...)
+	if err != nil {
+		return nil, fmt.Errorf("get snapshots by image: %w", err)
+	}
+	defer rows.Close()
+	var out []*models.SandboxSnapshot
+	for rows.Next() {
+		snapshot, err := scanSnapshot(rows)
+		if err != nil {
+			return nil, fmt.Errorf("get snapshots by image: %w", err)
+		}
+		out = append(out, snapshot)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("get snapshots by image: %w", err)
+	}
+	return out, nil
+}
+
 func (s *Store) ListSnapshots(ctx context.Context) ([]*models.SandboxSnapshot, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT name, image, image_id, source_sandbox_id, created_at,
 			entrypoint_json, region_id, cpu, memory_mb, disk_gb, gpu,
 			image_distribution_mode, image_digest, image_registry_ref, image_verified_at,
-			push_state, push_error
+			push_state, push_error, owner_ref
 		FROM sandbox_snapshots
 		ORDER BY created_at DESC, name ASC
 	`)
@@ -3201,16 +4027,214 @@ func (s *Store) ListSnapshots(ctx context.Context) ([]*models.SandboxSnapshot, e
 	return items, nil
 }
 
-func (s *Store) DeleteSnapshot(ctx context.Context, name string) error {
-	result, err := s.db.ExecContext(ctx, `DELETE FROM sandbox_snapshots WHERE name = ?`, strings.TrimSpace(name))
+// DeleteSnapshot removes a snapshot row and records no registry
+// retirement; see DeleteSnapshotRetiringRegistryCopy.
+func (s *Store) DeleteSnapshot(ctx context.Context, ownerRef, name string) error {
+	return s.DeleteSnapshotRetiringRegistryCopy(ctx, ownerRef, name, "")
+}
+
+// maxSnapshotPageRows bounds one ListSnapshotPage read. Callers page with
+// AfterName; nothing a caller sends can make one read allocate more.
+const maxSnapshotPageRows = 1000
+
+// SnapshotPageQuery selects one page of the snapshot catalogue, ordered by
+// name. Name is the primary key, so the cursor is stable across inserts and
+// deletes and each page is an index range scan rather than a sort of the
+// whole catalogue.
+type SnapshotPageQuery struct {
+	// OwnerRef / Scoped apply owner scoping: Scoped=false returns every
+	// owner's rows (operator and internal callers).
+	OwnerRef string
+	Scoped   bool
+	// SourceSandboxID, when set, keeps only snapshots taken from it.
+	SourceSandboxID string
+	// AliasFacade, when set, joins that facade's alias row onto each
+	// snapshot.
+	AliasFacade string
+	// AfterName is the exclusive cursor: rows with a greater name.
+	AfterName string
+	// Limit is the number of rows to return; callers ask for one more than
+	// they show to learn whether another page exists.
+	Limit int
+}
+
+// SnapshotPageRow is one snapshot with its alias for the queried facade.
+type SnapshotPageRow struct {
+	Snapshot *models.SandboxSnapshot
+	// Alias is nil when the snapshot has no alias for AliasFacade.
+	Alias *models.SnapshotAlias
+}
+
+// ListSnapshotPage returns one page of the catalogue. A snapshot with
+// several aliases for the same facade still yields exactly one row (its
+// smallest alias), so a page never holds duplicates.
+func (s *Store) ListSnapshotPage(ctx context.Context, q SnapshotPageQuery) ([]SnapshotPageRow, error) {
+	if q.Limit <= 0 {
+		return nil, fmt.Errorf("list snapshot page: limit must be positive")
+	}
+	query, args := snapshotPageSQL(q, min(q.Limit, maxSnapshotPageRows))
+	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
-		return fmt.Errorf("delete snapshot: %w", err)
+		return nil, fmt.Errorf("list snapshot page: %w", err)
 	}
-	affected, err := result.RowsAffected()
-	if err == nil && affected == 0 {
-		return ErrNotFound
+	defer rows.Close()
+
+	var items []SnapshotPageRow
+	for rows.Next() {
+		row, err := scanSnapshotPageRow(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scan snapshot page row: %w", err)
+		}
+		items = append(items, row)
 	}
-	return nil
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate snapshot page: %w", err)
+	}
+	return items, nil
+}
+
+// snapshotPageFilter renders the owner and source filters as plain equality
+// predicates, present only when they apply. A catch-all form such as
+// `(? = 0 OR owner_ref = ?)` reads the same but hides the column from the
+// planner, which then walks the whole catalogue by name and filters row by
+// row: a tenant with few snapshots would make every page examine everyone
+// else's. As equalities, a scoped walk seeks idx_sandbox_snapshots_owner_name
+// and a source walk idx_sandbox_snapshots_source_sandbox_id.
+func snapshotPageFilter(ownerRef string, scoped bool, sourceSandboxID string) (string, []any) {
+	var where []string
+	var args []any
+	if scoped {
+		where = append(where, "s.owner_ref = ?")
+		args = append(args, strings.TrimSpace(ownerRef))
+	}
+	if source := strings.TrimSpace(sourceSandboxID); source != "" {
+		where = append(where, "s.source_sandbox_id = ?")
+		args = append(args, source)
+	}
+	return strings.Join(where, " AND "), args
+}
+
+// snapshotPageSQL is ListSnapshotPage's statement, separate so a test can
+// check the plan SQLite picks for each filter combination.
+func snapshotPageSQL(q SnapshotPageQuery, limit int) (string, []any) {
+	filter, filterArgs := snapshotPageFilter(q.OwnerRef, q.Scoped, q.SourceSandboxID)
+	where := "s.name > ?"
+	if filter != "" {
+		where += " AND " + filter
+	}
+	// The alias subquery runs only for the rows the page returns, through
+	// idx_snapshot_aliases_snapshot_name.
+	query := `
+		SELECT s.name, s.image, s.image_id, s.source_sandbox_id, s.created_at,
+			s.entrypoint_json, s.region_id, s.cpu, s.memory_mb, s.disk_gb, s.gpu,
+			s.image_distribution_mode, s.image_digest, s.image_registry_ref, s.image_verified_at,
+			s.push_state, s.push_error, s.owner_ref,
+			a.alias, a.snapshot_name, a.facade, a.extra_names_json, a.state_json, a.created_at, a.updated_at
+		FROM sandbox_snapshots s
+		LEFT JOIN snapshot_aliases a ON a.alias = (
+			SELECT MIN(alias) FROM snapshot_aliases
+			WHERE snapshot_name = s.name AND owner_ref = s.owner_ref AND facade = ? AND ? <> ''
+		)
+		WHERE ` + where + `
+		ORDER BY s.name ASC
+		LIMIT ?`
+	facade := strings.TrimSpace(q.AliasFacade)
+	args := append([]any{facade, facade, strings.TrimSpace(q.AfterName)}, filterArgs...)
+	return query, append(args, limit)
+}
+
+func countSnapshotsSQL(ownerRef string, scoped bool, sourceSandboxID string) (string, []any) {
+	query := `SELECT COUNT(*) FROM sandbox_snapshots s`
+	filter, args := snapshotPageFilter(ownerRef, scoped, sourceSandboxID)
+	if filter != "" {
+		query += ` WHERE ` + filter
+	}
+	return query, args
+}
+
+// CountSnapshots counts the snapshots a ListSnapshotPage walk with the same
+// owner and source filters would visit. Like the page, it counts through the
+// owner or source index rather than across the catalogue.
+func (s *Store) CountSnapshots(ctx context.Context, ownerRef string, scoped bool, sourceSandboxID string) (int, error) {
+	query, args := countSnapshotsSQL(ownerRef, scoped, sourceSandboxID)
+	var count int
+	err := s.db.QueryRowContext(ctx, query, args...).Scan(&count)
+	if err != nil {
+		return 0, fmt.Errorf("count snapshots: %w", err)
+	}
+	return count, nil
+}
+
+func scanSnapshotPageRow(scanner interface {
+	Scan(dest ...any) error
+}) (SnapshotPageRow, error) {
+	var snapshot models.SandboxSnapshot
+	var entrypointJSON string
+	var imageVerifiedAt sql.NullTime
+	var aliasName, aliasSnapshot, aliasFacade, aliasExtraNames, aliasState sql.NullString
+	var aliasCreated, aliasUpdated sql.NullTime
+	err := scanner.Scan(
+		&snapshot.Name,
+		&snapshot.Image,
+		&snapshot.ImageID,
+		&snapshot.SourceSandboxID,
+		&snapshot.CreatedAt,
+		&entrypointJSON,
+		&snapshot.RegionID,
+		&snapshot.CPU,
+		&snapshot.MemoryMB,
+		&snapshot.DiskGB,
+		&snapshot.GPU,
+		&snapshot.ImageDistributionMode,
+		&snapshot.ImageDigest,
+		&snapshot.ImageRegistryRef,
+		&imageVerifiedAt,
+		&snapshot.PushState,
+		&snapshot.PushError,
+		&snapshot.OwnerRef,
+		&aliasName,
+		&aliasSnapshot,
+		&aliasFacade,
+		&aliasExtraNames,
+		&aliasState,
+		&aliasCreated,
+		&aliasUpdated,
+	)
+	if err != nil {
+		return SnapshotPageRow{}, err
+	}
+	if imageVerifiedAt.Valid {
+		verifiedAt := imageVerifiedAt.Time.UTC()
+		snapshot.ImageVerifiedAt = &verifiedAt
+	}
+	if entrypointJSON != "" && entrypointJSON != "[]" {
+		if err := json.Unmarshal([]byte(entrypointJSON), &snapshot.Entrypoint); err != nil {
+			return SnapshotPageRow{}, fmt.Errorf("decode snapshot entrypoint: %w", err)
+		}
+	}
+	row := SnapshotPageRow{Snapshot: &snapshot}
+	if !aliasName.Valid {
+		return row, nil
+	}
+	alias := &models.SnapshotAlias{
+		Alias:        aliasName.String,
+		SnapshotName: aliasSnapshot.String,
+		Facade:       aliasFacade.String,
+		StateJSON:    aliasState.String,
+		CreatedAt:    aliasCreated.Time.UTC(),
+		UpdatedAt:    aliasUpdated.Time.UTC(),
+		ExtraNames:   []string{},
+	}
+	if aliasExtraNames.String != "" {
+		if err := json.Unmarshal([]byte(aliasExtraNames.String), &alias.ExtraNames); err != nil {
+			return SnapshotPageRow{}, fmt.Errorf("decode snapshot alias extra names: %w", err)
+		}
+		if alias.ExtraNames == nil {
+			alias.ExtraNames = []string{}
+		}
+	}
+	row.Alias = alias
+	return row, nil
 }
 
 // CreateTemplate inserts a freshly-allocated template row. Callers set
@@ -3532,8 +4556,9 @@ func (s *Store) MarkTemplatePushPending(ctx context.Context, id string) (bool, e
 // ListTemplatesPendingPush returns the templates the reconciler should
 // retry: push_state IN ('pending', 'error'). 'pushing' is intentionally
 // excluded so a row currently being processed by another reconciler
-// tick is not re-claimed before its terminal state lands. Mirrors
-// ListSnapshotsPendingPush exactly.
+// tick is not re-claimed before its terminal state lands; a stale claim
+// (older than PushClaimLease) is listed again. Claiming goes through
+// ClaimTemplatePush, which is what actually keeps two workers apart.
 //
 // The status precondition (must be ready) keeps half-built templates
 // from sneaking into the push queue if someone manually flipped
@@ -3696,75 +4721,6 @@ func (s *Store) ListReadyTemplateIDs(ctx context.Context) ([]string, error) {
 	return ready, err
 }
 
-// SetTemplatePushState is a narrow single-column update used by the
-// push reconciler. errMsg is overwritten unconditionally (including
-// to empty on success transitions) so callers don't have to remember
-// to clear it. Mirrors SetSnapshotPushState.
-// PushClaimLease bounds how long a row may sit in 'pushing' before another
-// reconciler tick may reclaim it. Longer than any realistic single artifact
-// push, short enough that a crashed daemon's claims drain on the next few
-// ticks rather than needing operator action.
-const PushClaimLease = 30 * time.Minute
-
-// pushClaimStamp records when a row entered 'pushing' and clears the stamp on
-// every terminal state, so a reclaim window only exists while a push is
-// genuinely believed to be in flight. Snapshots and templates share the
-// literal state name, so one helper serves both ledgers.
-func pushClaimStamp(state string, now time.Time) any {
-	if strings.TrimSpace(state) == models.SnapshotPushStatePushing {
-		return now
-	}
-	return nil
-}
-
-func (s *Store) SetTemplatePushState(ctx context.Context, id, state, errMsg string) error {
-	now := time.Now().UTC()
-	result, err := s.db.ExecContext(ctx, `
-		UPDATE firecracker_templates
-		SET push_state = ?, push_error = ?, updated_at = ?, push_claimed_at = ?
-		WHERE id = ?
-	`, strings.TrimSpace(state), errMsg, now, pushClaimStamp(state, now), strings.TrimSpace(id))
-	if err != nil {
-		return fmt.Errorf("set template push state: %w", err)
-	}
-	affected, err := result.RowsAffected()
-	if err == nil && affected == 0 {
-		return ErrNotFound
-	}
-	return nil
-}
-
-// UpdateTemplatePushDistribution stamps the registry destination
-// metadata after a successful AOCR push. ref is the canonical repo:tag
-// the daemon pushed; digest is the manifest digest the registry
-// surfaced via the push stream's `aux` payload (may be empty). Called
-// from the reconciler success path together with SetTemplatePushState.
-//
-// Written in one statement so a crash between the two fields cannot
-// land a half-filled row — the consumer-side pull in PR 6-B.2 sees
-// either both fields populated or both empty.
-func (s *Store) UpdateTemplatePushDistribution(ctx context.Context, id, ref, digest string) error {
-	now := time.Now().UTC()
-	result, err := s.db.ExecContext(ctx, `
-		UPDATE firecracker_templates
-		SET registry_ref = ?, push_digest = ?, updated_at = ?
-		WHERE id = ?
-	`,
-		strings.TrimSpace(ref),
-		strings.TrimSpace(digest),
-		now,
-		strings.TrimSpace(id),
-	)
-	if err != nil {
-		return fmt.Errorf("update template push distribution: %w", err)
-	}
-	affected, err := result.RowsAffected()
-	if err == nil && affected == 0 {
-		return ErrNotFound
-	}
-	return nil
-}
-
 func (s *Store) DeleteTemplate(ctx context.Context, id string) error {
 	result, err := s.db.ExecContext(ctx, `DELETE FROM firecracker_templates WHERE id = ?`, strings.TrimSpace(id))
 	if err != nil {
@@ -3875,90 +4831,6 @@ func (s *Store) ListGCEligibleTemplates(ctx context.Context, olderThan time.Time
 		return nil, fmt.Errorf("iterate templates: %w", err)
 	}
 	return items, nil
-}
-
-// ListSnapshotsPendingPush returns snapshots the reconciler should retry —
-// 'pending' is the brand-new state set by the snapshot-create path, 'error'
-// is what a failed previous attempt left behind. 'pushing' is intentionally
-// excluded so a row currently being processed by another reconciler tick
-// (or a still-running goroutine kicked off by snapshot-create) is not
-// re-claimed before its terminal state lands.
-func (s *Store) ListSnapshotsPendingPush(ctx context.Context) ([]*models.SandboxSnapshot, error) {
-	rows, err := s.db.QueryContext(ctx, `
-		SELECT name, image, image_id, source_sandbox_id, created_at,
-			entrypoint_json, region_id, cpu, memory_mb, disk_gb, gpu,
-			image_distribution_mode, image_digest, image_registry_ref, image_verified_at,
-			push_state, push_error
-		FROM sandbox_snapshots
-		WHERE push_state IN ('pending', 'error')
-			OR (push_state = 'pushing' AND (push_claimed_at IS NULL OR push_claimed_at <= ?))
-		ORDER BY created_at ASC, name ASC
-	`, time.Now().UTC().Add(-PushClaimLease))
-	if err != nil {
-		return nil, fmt.Errorf("list snapshots pending push: %w", err)
-	}
-	defer rows.Close()
-
-	var items []*models.SandboxSnapshot
-	for rows.Next() {
-		snapshot, err := scanSnapshot(rows)
-		if err != nil {
-			return nil, fmt.Errorf("scan snapshot: %w", err)
-		}
-		items = append(items, snapshot)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate snapshots: %w", err)
-	}
-	return items, nil
-}
-
-// SetSnapshotPushState is a narrow single-column update used by the push
-// reconciler. errMsg is overwritten unconditionally (including to empty
-// on success transitions) so callers don't have to remember to clear it.
-func (s *Store) SetSnapshotPushState(ctx context.Context, name, state, errMsg string) error {
-	result, err := s.db.ExecContext(ctx, `
-		UPDATE sandbox_snapshots
-		SET push_state = ?, push_error = ?, push_claimed_at = ?
-		WHERE name = ?
-	`, strings.TrimSpace(state), errMsg, pushClaimStamp(state, time.Now().UTC()), strings.TrimSpace(name))
-	if err != nil {
-		return fmt.Errorf("set snapshot push state: %w", err)
-	}
-	affected, err := result.RowsAffected()
-	if err == nil && affected == 0 {
-		return ErrNotFound
-	}
-	return nil
-}
-
-// UpdateSnapshotImageDistribution flips the distribution metadata on a
-// snapshot row after a successful AOCR push — local_only → aocr. Called
-// from the reconciler success path together with SetSnapshotPushState.
-// VerifiedAt records when the push completed; cluster placement on other
-// nodes uses this together with the new mode to decide the snapshot is
-// fan-outable.
-func (s *Store) UpdateSnapshotImageDistribution(ctx context.Context, name, mode, registryRef, digest string) error {
-	now := time.Now().UTC()
-	result, err := s.db.ExecContext(ctx, `
-		UPDATE sandbox_snapshots
-		SET image_distribution_mode = ?, image_registry_ref = ?, image_digest = ?, image_verified_at = ?
-		WHERE name = ?
-	`,
-		strings.TrimSpace(mode),
-		strings.TrimSpace(registryRef),
-		strings.TrimSpace(digest),
-		now,
-		strings.TrimSpace(name),
-	)
-	if err != nil {
-		return fmt.Errorf("update snapshot image distribution: %w", err)
-	}
-	affected, err := result.RowsAffected()
-	if err == nil && affected == 0 {
-		return ErrNotFound
-	}
-	return nil
 }
 
 func (s *Store) UpdateStatus(ctx context.Context, id string, status models.SandboxStatus, lastError string) error {
@@ -4593,8 +5465,10 @@ func scanSnapshotAlias(scanner interface {
 		&alias.SnapshotName,
 		&alias.Facade,
 		&extraNamesJSON,
+		&alias.StateJSON,
 		&alias.CreatedAt,
 		&alias.UpdatedAt,
+		&alias.OwnerRef,
 	)
 	if err != nil {
 		return nil, err
@@ -4663,6 +5537,7 @@ func scanSnapshot(scanner interface {
 		&imageVerifiedAt,
 		&snapshot.PushState,
 		&snapshot.PushError,
+		&snapshot.OwnerRef,
 	)
 	if err != nil {
 		return nil, err
@@ -4833,9 +5708,10 @@ var afterTapAllocateSelect func(tapName string)
 var afterTapAllocateMiss func()
 
 // ErrSandboxNameConflict is returned by Create/Upsert when the sandbox's
-// name collides with an existing row's name or id. Names are unique across
-// the sandboxes table; empty names skip the name uniqueness check but ids
-// still cannot collide with existing non-empty names.
+// name collides with another row of the same owner, or with an existing id.
+// Names are unique per owner_ref (idx_sandboxes_name); empty names skip the
+// name uniqueness check but ids still cannot collide with existing non-empty
+// names.
 var ErrSandboxNameConflict = errors.New("sandbox name already in use")
 
 var ErrSnapshotNameConflict = errors.New("snapshot name already in use")
@@ -4943,8 +5819,8 @@ func (s *Store) PutClusterSecret(ctx context.Context, rec ClusterSecretRecord) (
 		return 0, fmt.Errorf("%w: existing seal_generation %d > %d for ref %q", ErrClusterSecretStaleGeneration, existingGen.Int64, rec.SealGeneration, rec.Ref)
 	}
 	if existingGen.Valid && existingGen.Int64 == rec.SealGeneration {
-		if bytes.Equal(nullableBlob(existingPayload), nullableBlob(rec.SealedPayload)) {
-			// Same generation + same ciphertext: idempotent noop (still apply
+		if sameSealedSecret(existingPayload, rec.SealedPayload) {
+			// Same generation + same content: idempotent noop (still apply
 			// tomb and outbox transitions below so an originator retry recovers).
 		} else {
 			return 0, fmt.Errorf("%w: seal_generation %d payload conflict for ref %q", ErrClusterSecretPayloadConflict, rec.SealGeneration, rec.Ref)
@@ -4965,9 +5841,11 @@ func (s *Store) PutClusterSecret(ctx context.Context, rec ClusterSecretRecord) (
 		return 0, fmt.Errorf("%w: sandbox %q secret was deleted (tombstone gen=%d)", ErrClusterSecretTombBlocksPut, rec.SandboxID, tombGen.Int64)
 	}
 
-	if existingGen.Valid && existingGen.Int64 == rec.SealGeneration && bytes.Equal(nullableBlob(existingPayload), nullableBlob(rec.SealedPayload)) {
-		// Equal-generation identical payload: skip the row rewrite but still
-		// apply the generation's tomb and outbox transitions.
+	if existingGen.Valid && existingGen.Int64 == rec.SealGeneration && sameSealedSecret(existingPayload, rec.SealedPayload) {
+		// Equal-generation identical content: skip the row rewrite (the bytes
+		// on disk stay, so a late peer copy never undoes this node's own
+		// rewrap, eng D20) but still apply the generation's tomb and outbox
+		// transitions.
 		if _, err := tx.ExecContext(ctx, `
 			DELETE FROM cluster_secret_tombs WHERE sandbox_id = ? AND incarnation_id = ?
 		`, rec.SandboxID, parsedRef.IncarnationID); err != nil {
@@ -6716,6 +7594,37 @@ func (s *Store) ClusterSecretTombGenerationForIncarnation(ctx context.Context, s
 	return gen, nil
 }
 
+// sameSealedSecret reports whether two sealed rows of one generation hold
+// the same secret. After a key-store rewrap only the envelope's WrappedKey
+// differs between holders (plans/customer-key-custody.md §11, eng D3), and
+// that is the same secret.
+func sameSealedSecret(a, b []byte) bool {
+	return bytes.Equal(nullableBlob(a), nullableBlob(b)) || secrets.SameEnvelopeContent(a, b)
+}
+
+// RewrapClusterSecret replaces a row's sealed bytes with a rewrap of them,
+// only if the row still has the generation and the bytes the caller read
+// (compare-and-swap): a reseal, a delete or a newer peer copy that landed in
+// between wins, and the caller skips the row. A rewrap must keep the
+// content; anything else is refused.
+func (s *Store) RewrapClusterSecret(ctx context.Context, ref string, generation int64, old, rewrapped []byte) (bool, error) {
+	if !secrets.SameEnvelopeContent(old, rewrapped) {
+		return false, fmt.Errorf("%w: rewrap of %q changes more than the wrapped key", ErrClusterSecretPayloadConflict, ref)
+	}
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE cluster_secrets SET sealed_payload = ?, updated_at = ?
+		WHERE ref = ? AND seal_generation = ? AND sealed_payload = ?
+	`, rewrapped, time.Now().UTC(), ref, generation, old)
+	if err != nil {
+		return false, fmt.Errorf("rewrap cluster secret %q: %w", ref, err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("rewrap cluster secret %q: %w", ref, err)
+	}
+	return n == 1, nil
+}
+
 // ListClusterSecretsBatch returns the next ref-ordered page after afterRef.
 // Boot reconciliation must remain memory-bounded at the 100k-sandbox target,
 // so there is deliberately no all-rows convenience API.
@@ -7142,10 +8051,10 @@ func (s *Store) GetFirecrackerTapPoolStats(ctx context.Context) (FirecrackerTapP
 }
 
 // ErrNoFreeFirecrackerTapSlot is returned by AllocateFirecrackerTapSlot
-// when every slot is claimed. The Firecracker create path translates
-// this into a 503-ish admission error upstream — operators see "pool
-// exhausted" before the customer sees a confusing timeout.
-var ErrNoFreeFirecrackerTapSlot = errors.New("firecracker tap pool: no free slot")
+// when every slot is claimed. It is a capacity refusal (errors.Is matches
+// capacity.ErrCapacityExceeded), so a full pool answers 503 + Retry-After
+// like any other admission refusal rather than a catch-all 400.
+var ErrNoFreeFirecrackerTapSlot error = capacity.NewSlotPoolExhausted("firecracker tap pool")
 
 // Firecracker warm-VMM pool status constants. Kept as bare strings
 // rather than a typed enum because SQLite stores them as TEXT and the
@@ -7686,12 +8595,18 @@ type WasmModuleRecord struct {
 	Entrypoint      string
 	HasWarm         bool
 	LastError       string
-	CreatedAt       time.Time
-	UpdatedAt       time.Time
-	ReadyAt         *time.Time
+	// OwnerRef is the tenant that owns this catalogue row. "" means an
+	// operator-published module (readable by all tenants, writable only by the
+	// operator). See the wasm_modules.owner_ref column comment.
+	OwnerRef  string
+	CreatedAt time.Time
+	UpdatedAt time.Time
+	ReadyAt   *time.Time
 }
 
-// UpsertWasmModule inserts or updates a wasm_modules catalogue row.
+// UpsertWasmModule inserts or updates a wasm_modules catalogue row. The row is
+// keyed by (rec.OwnerRef, rec.ID), so an upsert only ever rewrites a row in
+// the record's own namespace and never another owner's row with the same id.
 func (s *Store) UpsertWasmModule(ctx context.Context, rec WasmModuleRecord) error {
 	now := time.Now().UTC()
 	if rec.CreatedAt.IsZero() {
@@ -7701,9 +8616,9 @@ func (s *Store) UpsertWasmModule(ctx context.Context, rec WasmModuleRecord) erro
 	_, err := s.db.ExecContext(ctx, `
 		INSERT INTO wasm_modules (
 			id, module_ref, status, module_path, module_size_bytes, digest,
-			entrypoint, has_warm, last_error, created_at, updated_at, ready_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT(id) DO UPDATE SET
+			entrypoint, has_warm, last_error, owner_ref, created_at, updated_at, ready_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(owner_ref, id) DO UPDATE SET
 			module_ref = excluded.module_ref,
 			status = excluded.status,
 			module_path = excluded.module_path,
@@ -7715,7 +8630,7 @@ func (s *Store) UpsertWasmModule(ctx context.Context, rec WasmModuleRecord) erro
 			updated_at = excluded.updated_at,
 			ready_at = excluded.ready_at
 	`,
-		rec.ID,
+		strings.TrimSpace(rec.ID),
 		strings.TrimSpace(rec.ModuleRef),
 		rec.Status,
 		rec.ModulePath,
@@ -7724,6 +8639,7 @@ func (s *Store) UpsertWasmModule(ctx context.Context, rec WasmModuleRecord) erro
 		rec.Entrypoint,
 		boolToInt(rec.HasWarm),
 		rec.LastError,
+		strings.TrimSpace(rec.OwnerRef),
 		rec.CreatedAt.UTC(),
 		rec.UpdatedAt.UTC(),
 		nullableTime(rec.ReadyAt),
@@ -8151,10 +9067,13 @@ func (s *Store) UpdateWasmRegistryPush(ctx context.Context, sandboxID, incarnati
 	return affected > 0, nil
 }
 
-// ListReadyWasmModuleRefs returns module_ref values for ready catalogue rows.
+// ListReadyWasmModuleRefs returns the distinct module_ref values of ready
+// catalogue rows. It is a per-host placement inventory ("which module bytes
+// can this node boot"), so it spans every owner's namespace; DISTINCT keeps two
+// owners' rows for the same ref from doubling the gossiped list.
 func (s *Store) ListReadyWasmModuleRefs(ctx context.Context) ([]string, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT module_ref FROM wasm_modules
+		SELECT DISTINCT module_ref FROM wasm_modules
 		WHERE status = 'ready' AND module_ref != ''
 		ORDER BY module_ref`)
 	if err != nil {
@@ -8176,7 +9095,7 @@ func (s *Store) ListReadyWasmModuleRefs(ctx context.Context) ([]string, error) {
 func (s *Store) ListWasmModulesOlderThan(ctx context.Context, cutoff time.Time) ([]WasmModuleRecord, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT id, module_ref, status, module_path, module_size_bytes, digest,
-			entrypoint, has_warm, last_error, created_at, updated_at, ready_at
+			entrypoint, has_warm, last_error, owner_ref, created_at, updated_at, ready_at
 		FROM wasm_modules
 		WHERE updated_at < ?
 		ORDER BY updated_at ASC`, cutoff.UTC())
@@ -8202,14 +9121,29 @@ func (s *Store) ListWasmModulesOlderThan(ctx context.Context, cutoff time.Time) 
 // would yank a digest still in use by another sandbox (codex C5). A blank
 // moduleDigest simply contributes no extra match.
 func (s *Store) IsWasmModuleReferenced(ctx context.Context, moduleID, moduleRef, moduleDigest string) (bool, error) {
+	return s.wasmModuleReferenced(ctx, false, "", moduleID, moduleRef, moduleDigest)
+}
+
+// IsWasmModuleReferencedByOwner is IsWasmModuleReferenced narrowed to the
+// sandboxes ownerRef owns. A tenant's catalogue row can only be resolved by
+// that tenant's own creates, so only its sandboxes can depend on the row; a
+// delete gated on this check never tells the tenant that another owner runs
+// the same bytes.
+func (s *Store) IsWasmModuleReferencedByOwner(ctx context.Context, ownerRef, moduleID, moduleRef, moduleDigest string) (bool, error) {
+	return s.wasmModuleReferenced(ctx, true, ownerRef, moduleID, moduleRef, moduleDigest)
+}
+
+func (s *Store) wasmModuleReferenced(ctx context.Context, byOwner bool, ownerRef, moduleID, moduleRef, moduleDigest string) (bool, error) {
 	moduleID = strings.TrimSpace(moduleID)
 	moduleRef = strings.TrimSpace(moduleRef)
 	moduleDigest = strings.TrimSpace(moduleDigest)
 	row := s.db.QueryRowContext(ctx, `
 		SELECT 1 FROM sandboxes
-		WHERE module_ref = ? OR module_ref = ? OR module_digest = ? OR
-		      (? <> '' AND module_digest = ?)
-		LIMIT 1`, moduleRef, moduleID, moduleID, moduleDigest, moduleDigest)
+		WHERE (? = 0 OR owner_ref = ?) AND
+		      (module_ref = ? OR module_ref = ? OR module_digest = ? OR
+		       (? <> '' AND module_digest = ?))
+		LIMIT 1`, boolToInt(byOwner), strings.TrimSpace(ownerRef),
+		moduleRef, moduleID, moduleID, moduleDigest, moduleDigest)
 	var one int
 	err := row.Scan(&one)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -8238,6 +9172,36 @@ func (s *Store) IsWasmDigestCatalogued(ctx context.Context, digest string) (bool
 	}
 	if err != nil {
 		return false, err
+	}
+	return true, nil
+}
+
+// wasmDigestCataloguedElsewhereSQL probes the digest index. The redundant
+// non-empty-digest term is what lets the planner use the partial
+// idx_wasm_modules_digest instead of scanning the catalogue.
+const wasmDigestCataloguedElsewhereSQL = `
+	SELECT 1 FROM wasm_modules
+	WHERE digest = ? AND digest <> '' AND NOT (owner_ref = ? AND id = ?)
+	LIMIT 1`
+
+// IsWasmDigestCataloguedElsewhere reports whether any catalogue row other than
+// (ownerRef, id) pins digest. Catalogue ids are per owner but the bytes behind
+// them are content-addressed and shared on the host (one cache file, one warm
+// pool target per digest), so removing one owner's row must leave the bytes
+// and the warm target in place while another row still points at them.
+func (s *Store) IsWasmDigestCataloguedElsewhere(ctx context.Context, ownerRef, id, digest string) (bool, error) {
+	digest = strings.TrimSpace(digest)
+	if digest == "" {
+		return false, nil
+	}
+	row := s.db.QueryRowContext(ctx, wasmDigestCataloguedElsewhereSQL, digest, strings.TrimSpace(ownerRef), strings.TrimSpace(id))
+	var one int
+	err := row.Scan(&one)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("wasm digest catalogued elsewhere: %w", err)
 	}
 	return true, nil
 }
@@ -8311,7 +9275,7 @@ func scanWasmModule(row interface {
 	var readyAt sql.NullTime
 	if err := row.Scan(
 		&rec.ID, &rec.ModuleRef, &rec.Status, &rec.ModulePath, &rec.ModuleSizeBytes,
-		&rec.Digest, &rec.Entrypoint, &hasWarm, &rec.LastError,
+		&rec.Digest, &rec.Entrypoint, &hasWarm, &rec.LastError, &rec.OwnerRef,
 		&rec.CreatedAt, &rec.UpdatedAt, &readyAt,
 	); err != nil {
 		return WasmModuleRecord{}, err
@@ -8324,16 +9288,18 @@ func scanWasmModule(row interface {
 	return rec, nil
 }
 
-// GetWasmModule returns one wasm_modules row by catalogue id.
-func (s *Store) GetWasmModule(ctx context.Context, id string) (WasmModuleRecord, error) {
+// GetWasmModule returns the catalogue row id in exactly ownerRef's namespace
+// ("" is the operator namespace). It never falls back to another namespace:
+// create's id-conflict check and delete must only ever see the caller's rows.
+func (s *Store) GetWasmModule(ctx context.Context, ownerRef, id string) (WasmModuleRecord, error) {
 	id = strings.TrimSpace(id)
 	if id == "" {
 		return WasmModuleRecord{}, errors.New("get wasm module: id required")
 	}
 	row := s.db.QueryRowContext(ctx, `
 		SELECT id, module_ref, status, module_path, module_size_bytes, digest,
-			entrypoint, has_warm, last_error, created_at, updated_at, ready_at
-		FROM wasm_modules WHERE id = ?`, id)
+			entrypoint, has_warm, last_error, owner_ref, created_at, updated_at, ready_at
+		FROM wasm_modules WHERE owner_ref = ? AND id = ?`, strings.TrimSpace(ownerRef), id)
 	rec, err := scanWasmModule(row)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -8344,13 +9310,47 @@ func (s *Store) GetWasmModule(ctx context.Context, id string) (WasmModuleRecord,
 	return rec, nil
 }
 
-// ListWasmModules returns all catalogue rows newest-first.
+// wasmModuleResolveSQL reads the owner's row and the operator's row for one id
+// through the (owner_ref, id) primary key; the ORDER BY sorts the operator row
+// last, so the owner's row wins when both exist.
+const wasmModuleResolveSQL = `
+	SELECT id, module_ref, status, module_path, module_size_bytes, digest,
+		entrypoint, has_warm, last_error, owner_ref, created_at, updated_at, ready_at
+	FROM wasm_modules
+	WHERE owner_ref IN (?, '') AND id = ?
+	ORDER BY owner_ref = '' ASC
+	LIMIT 1`
+
+// ResolveWasmModule returns ownerRef's own row for id, else the
+// operator-published ("") row for id: the order reads and create-time boots
+// resolve a catalogue id in. An own row wins even when it is not ready, so a
+// failed registration never silently boots the operator's different bytes.
+// One statement (two probes of the (owner_ref, id) key) so the create-time
+// lookup costs the same single query it did before ids were per owner.
+func (s *Store) ResolveWasmModule(ctx context.Context, ownerRef, id string) (WasmModuleRecord, error) {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return WasmModuleRecord{}, errors.New("resolve wasm module: id required")
+	}
+	row := s.db.QueryRowContext(ctx, wasmModuleResolveSQL, strings.TrimSpace(ownerRef), id)
+	rec, err := scanWasmModule(row)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return WasmModuleRecord{}, ErrNotFound
+		}
+		return WasmModuleRecord{}, fmt.Errorf("resolve wasm module: %w", err)
+	}
+	return rec, nil
+}
+
+// ListWasmModules returns all catalogue rows, every namespace, newest-first.
+// Callers filter by owner; the same id may appear once per namespace.
 func (s *Store) ListWasmModules(ctx context.Context) ([]WasmModuleRecord, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT id, module_ref, status, module_path, module_size_bytes, digest,
-			entrypoint, has_warm, last_error, created_at, updated_at, ready_at
+			entrypoint, has_warm, last_error, owner_ref, created_at, updated_at, ready_at
 		FROM wasm_modules
-		ORDER BY created_at DESC, id ASC`)
+		ORDER BY created_at DESC, id ASC, owner_ref ASC`)
 	if err != nil {
 		return nil, fmt.Errorf("list wasm modules: %w", err)
 	}
@@ -8366,13 +9366,14 @@ func (s *Store) ListWasmModules(ctx context.Context) ([]WasmModuleRecord, error)
 	return out, rows.Err()
 }
 
-// DeleteWasmModule removes a wasm_modules catalogue row.
-func (s *Store) DeleteWasmModule(ctx context.Context, id string) error {
+// DeleteWasmModule removes the catalogue row id in ownerRef's namespace only;
+// another owner's row with the same id is never touched.
+func (s *Store) DeleteWasmModule(ctx context.Context, ownerRef, id string) error {
 	id = strings.TrimSpace(id)
 	if id == "" {
 		return errors.New("delete wasm module: id required")
 	}
-	res, err := s.db.ExecContext(ctx, `DELETE FROM wasm_modules WHERE id = ?`, id)
+	res, err := s.db.ExecContext(ctx, `DELETE FROM wasm_modules WHERE owner_ref = ? AND id = ?`, strings.TrimSpace(ownerRef), id)
 	if err != nil {
 		return fmt.Errorf("delete wasm module: %w", err)
 	}

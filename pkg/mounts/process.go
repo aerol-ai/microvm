@@ -1,7 +1,9 @@
 package mounts
 
 import (
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"os/exec"
 	"strings"
@@ -51,12 +53,65 @@ func (c *capturedOutput) String() string {
 	return strings.TrimSpace(string(c.buf))
 }
 
+// ErrMountToolUnavailable is a mount whose tool (mount-s3, sshfs, rclone,
+// mount) is not installed on this node, as on a local install, which skips
+// them. It is the node's configuration, never the request: the adapters fix
+// argv[0], so no mount spec can name a missing program. The API answers it
+// with 501 mount_tool_unavailable instead of the catch-all 400.
+var ErrMountToolUnavailable = errors.New("mount tool is not installed on this node")
+
+// toolStartError marks a failure to start a mount tool as
+// ErrMountToolUnavailable when the program is missing: exec.ErrNotFound from
+// the $PATH lookup, or ENOENT starting an absolute path (or the interpreter
+// its #! line names). The exec error, which names the tool, stays wrapped.
+// Any other start failure is returned unchanged.
+func toolStartError(tool string, err error) error {
+	if errors.Is(err, exec.ErrNotFound) || errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("%w: %s: %w", ErrMountToolUnavailable, tool, err)
+	}
+	return err
+}
+
+// procExit reports a mount tool's exit. One goroutine reaps the process
+// (cmd.Wait); everyone else watches done. Two parties need the exit: the
+// readiness wait, which must stop as soon as the tool is gone, and the
+// supervisor, which restarts it once the mount is up. cmd.Wait may only be
+// called once, so neither may call it themselves.
+type procExit struct {
+	done chan struct{} // closed once cmd.Wait has returned
+	err  error         // cmd.Wait's result; read only after done is closed
+}
+
+func watchExit(cmd *exec.Cmd) *procExit {
+	e := &procExit{done: make(chan struct{})}
+	go func() {
+		e.err = cmd.Wait()
+		close(e.done)
+	}()
+	return e
+}
+
+// status reports how the tool exited, or false while it is still running.
+// It never blocks.
+func (e *procExit) status() (string, bool) {
+	select {
+	case <-e.done:
+	default:
+		return "", false
+	}
+	if e.err == nil {
+		return "exit status 0", true
+	}
+	return e.err.Error(), true
+}
+
 // spawnMountProcess starts a supervised FUSE mount tool with its stdout and
-// stderr teed into a capped buffer. Shared by the initial mount (mountOne) and
-// the supervisor's restart path so both surface the tool's output identically.
-// SysProcAttr.Setpgid keeps the process in its own group; killMount signals the
-// whole group so FUSE helper children die with it.
-func spawnMountProcess(plan adapters.Plan) (*exec.Cmd, *capturedOutput, error) {
+// stderr teed into a capped buffer, and starts the one goroutine that reaps it.
+// Shared by the initial mount (mountOne) and the supervisor's restart path so
+// both surface the tool's output identically. SysProcAttr.Setpgid keeps the
+// process in its own group; killMount signals the whole group so FUSE helper
+// children die with it.
+func spawnMountProcess(plan adapters.Plan) (*exec.Cmd, *capturedOutput, *procExit, error) {
 	cmd := exec.Command(plan.Argv[0], plan.Argv[1:]...)
 	if len(plan.Env) > 0 {
 		cmd.Env = append(os.Environ(), plan.Env...)
@@ -66,24 +121,29 @@ func spawnMountProcess(plan adapters.Plan) (*exec.Cmd, *capturedOutput, error) {
 	cmd.Stderr = out
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	if err := cmd.Start(); err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
-	return cmd, out, nil
+	return cmd, out, watchExit(cmd), nil
 }
 
-// mountWaitError wraps the readiness-probe error with the captured mount-tool
-// output so a mount that never became ready is actionable instead of a bare
-// timeout. The original probe error is wrapped with %w so callers/tests
-// matching on "timed out waiting for mount" still match.
+// mountWaitError wraps the readiness-wait error with how the tool exited, when
+// it has, and its captured output, so a mount that never became ready is
+// actionable instead of a bare timeout. The wait error is wrapped with %w so
+// callers matching on "timed out waiting for mount" still match a timeout.
 //
-// We deliberately do NOT report whether the process is still alive: on the
-// failure path nobody has reaped it, so an exited tool lingers as a zombie that
-// a signal-0 probe still reports as "running". The captured stderr is the
-// reliable signal — a tool that failed fast prints its reason here; a genuinely
-// hung tool leaves this empty.
-func mountWaitError(probeErr error, out *capturedOutput) error {
-	if tail := out.String(); tail != "" {
-		return fmt.Errorf("%w (mount tool output: %s)", probeErr, tail)
+// The exit status is reliable because procExit reaps the tool: an exited tool
+// is reported as exited, never mistaken for a live one. Call it before killing
+// the tool, so the status is the tool's own and not our SIGTERM.
+func mountWaitError(waitErr error, exit *procExit, out *capturedOutput) error {
+	if status, exited := exit.status(); exited {
+		if errors.Is(waitErr, errMountToolExited) {
+			waitErr = fmt.Errorf("%w: %s", waitErr, status)
+		} else {
+			waitErr = fmt.Errorf("%w (mount tool exited: %s)", waitErr, status)
+		}
 	}
-	return fmt.Errorf("%w (mount tool produced no output before timeout)", probeErr)
+	if tail := out.String(); tail != "" {
+		return fmt.Errorf("%w (mount tool output: %s)", waitErr, tail)
+	}
+	return fmt.Errorf("%w (mount tool produced no output)", waitErr)
 }

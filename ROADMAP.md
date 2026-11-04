@@ -9,6 +9,7 @@ This roadmap says what AerolVM intends to do, and not do, from October 2026 thro
 - Keep the current runtimes. OCI sandboxes stay on containerd by default. gVisor, Firecracker, WASM, and the V8 isolate runtime stay available. The isolate runtime stays off unless the operator turns it on.
 - Keep single-node installs on SQLite, with no external database required. Cluster mode stays optional: Raft for placement and SWIM gossip for membership.
 - Keep the `/e2b` and `/daytona` HTTP facades working for callers that already use those SDKs against AerolVM.
+- Ship `aerolvm`, a CLI and MCP server, as the interface AI agents use to drive sandboxes: locally over stdio, and from sandboxd's opt-in `/mcp` endpoint with the same bearer tokens. It is a client of the existing API, not a second API.
 - Ship security fixes on the newest minor release line, as [SUPPORT.md](SUPPORT.md) describes.
 
 ## What the project will not do

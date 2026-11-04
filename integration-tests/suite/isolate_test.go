@@ -25,9 +25,12 @@ import (
 // --with-isolate.
 
 // uploadBundle uploads a JS bundle to the owner-scoped catalogue and returns the
-// reference the create path accepts (the bundle name). Upload is content-
-// addressed and idempotent, so re-running with the same name+source resolves to
-// the same digest rather than accumulating bundles.
+// module_ref the upload answered with, which is the reference every create must
+// pass. In cluster mode that ref is node-bound ("node:<worker>:sha256:<digest>")
+// and a bare name or digest is refused, because the bundle lives only on the
+// worker that received it. Upload is content-addressed and idempotent, so
+// re-running with the same name+source resolves to the same digest rather than
+// accumulating bundles.
 func uploadBundle(t *testing.T, c *harness.Client, name, source string) string {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -39,10 +42,37 @@ func uploadBundle(t *testing.T, c *harness.Client, name, source string) string {
 	}, &out); err != nil {
 		t.Fatalf("upload bundle %q: %v", name, err)
 	}
-	if out.Digest == "" {
-		t.Fatalf("upload bundle %q: empty digest in response", name)
+	if out.Digest == "" || out.ModuleRef == "" {
+		t.Fatalf("upload bundle %q: response missing digest or module_ref: %+v", name, out)
 	}
-	return name
+	return out.ModuleRef
+}
+
+// jsBundleListed polls GET /v1/js-bundles until digest appears or 5s pass. In
+// cluster mode the Raft leader caches the aggregate for two seconds
+// (docs/src/content/docs/isolate-sandbox.mdx, "Cluster mode"), so a list that
+// lands inside another list's cache window can predate the upload. It returns
+// the last list length for the failure message.
+func jsBundleListed(ctx context.Context, t *testing.T, c *harness.Client, digest string) (int, bool) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	n := 0
+	for {
+		var list []models.JSBundle
+		if err := c.GetJSON(ctx, "/v1/js-bundles", &list); err != nil {
+			t.Fatalf("list: %v", err)
+		}
+		n = len(list)
+		for _, b := range list {
+			if b.Digest == digest {
+				return n, true
+			}
+		}
+		if time.Now().After(deadline) {
+			return n, false
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
 }
 
 // newIsolateSandbox creates a runtime=isolate sandbox referencing a bundle and
@@ -191,36 +221,27 @@ func TestIsolateJSBundleCatalogue(t *testing.T) {
 	}
 
 	// List includes it.
-	var list []models.JSBundle
-	if err := c.GetJSON(ctx, "/v1/js-bundles", &list); err != nil {
-		t.Fatalf("list: %v", err)
-	}
-	found := false
-	for _, b := range list {
-		if b.Digest == created.Digest {
-			found = true
-			break
-		}
-	}
-	if !found {
-		t.Fatalf("list %d bundles, none matched digest %s", len(list), created.Digest)
+	if n, ok := jsBundleListed(ctx, t, c, created.Digest); !ok {
+		t.Fatalf("list %d bundles, none matched digest %s", n, created.Digest)
 	}
 
-	// Get by digest round-trips.
+	// Get by module_ref round-trips. Item operations take the ref the upload
+	// returned: in cluster mode it names the worker holding the bundle, and a
+	// bare digest sent to another node is a 404 there.
 	var got models.JSBundle
-	if err := c.GetJSON(ctx, "/v1/js-bundles/"+created.Digest, &got); err != nil {
-		t.Fatalf("get %s: %v", created.Digest, err)
+	if err := c.GetJSON(ctx, "/v1/js-bundles/"+created.ModuleRef, &got); err != nil {
+		t.Fatalf("get %s: %v", created.ModuleRef, err)
 	}
 	if got.Digest != created.Digest {
 		t.Fatalf("get digest = %s, want %s", got.Digest, created.Digest)
 	}
 
 	// Delete removes it; a follow-up get must 404.
-	if err := c.Delete(ctx, "/v1/js-bundles/"+created.Digest); err != nil {
-		t.Fatalf("delete %s: %v", created.Digest, err)
+	if err := c.Delete(ctx, "/v1/js-bundles/"+created.ModuleRef); err != nil {
+		t.Fatalf("delete %s: %v", created.ModuleRef, err)
 	}
-	if err := c.GetJSON(ctx, "/v1/js-bundles/"+created.Digest, &models.JSBundle{}); err == nil {
-		t.Fatalf("get after delete succeeded; want not-found for %s", created.Digest)
+	if err := c.GetJSON(ctx, "/v1/js-bundles/"+created.ModuleRef, &models.JSBundle{}); err == nil {
+		t.Fatalf("get after delete succeeded; want not-found for %s", created.ModuleRef)
 	}
 }
 

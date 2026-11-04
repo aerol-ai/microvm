@@ -80,7 +80,7 @@ func TestWriteSandboxSnapshot_HashStateFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 	handle := &warmDestroyHandle{runDir: runDir}
-	err := d.writeSandboxSnapshot(context.Background(), "sb-hash-fail", handle, client, 3)
+	err := d.writeSandboxSnapshot(context.Background(), "sb-hash-fail", handle, client, 3, guestFlushFailed)
 	if err == nil || !strings.Contains(err.Error(), "hash state") {
 		t.Fatalf("hash state error: got %v", err)
 	}
@@ -158,18 +158,8 @@ func TestWriteSandboxSnapshot_HashMemoryFailure(t *testing.T) {
 	}
 	handle := &warmDestroyHandle{runDir: runDir}
 	client := &hashFailSnapshotClient{fakeClient: *newFakeClient(), failState: false}
-	if err := d.writeSandboxSnapshot(context.Background(), "sb-hash-mem", handle, client, 3); err == nil || !strings.Contains(err.Error(), "hash memory") {
+	if err := d.writeSandboxSnapshot(context.Background(), "sb-hash-mem", handle, client, 3, guestFlushFailed); err == nil || !strings.Contains(err.Error(), "hash memory") {
 		t.Fatalf("hash memory: got %v", err)
-	}
-}
-
-func TestCopyFile_LinuxProcCopyError(t *testing.T) {
-	if runtime.GOOS != "linux" {
-		t.Skip("linux-specific copy failure")
-	}
-	err := copyFile("/proc/self/mem", filepath.Join(t.TempDir(), "dst"))
-	if err == nil || !strings.Contains(err.Error(), "copy ") {
-		t.Fatalf("proc mem copy: got %v", err)
 	}
 }
 
@@ -182,7 +172,7 @@ func TestWriteSandboxSnapshot_SecondWriteRotates(t *testing.T) {
 	}
 	handle := &warmDestroyHandle{runDir: runDir}
 	for i := 0; i < 2; i++ {
-		if err := d.writeSandboxSnapshot(context.Background(), "sb-rotate-2", handle, client, uint32(3+i)); err != nil {
+		if err := d.writeSandboxSnapshot(context.Background(), "sb-rotate-2", handle, client, uint32(3+i), guestFlushFailed); err != nil {
 			t.Fatalf("write %d: %v", i, err)
 		}
 	}
@@ -206,7 +196,7 @@ func TestWriteSandboxSnapshot_BaseNotDirectory(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(runDir, rootfsFileName), []byte("r"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	err = d.writeSandboxSnapshot(context.Background(), "sb-base-file", &warmDestroyHandle{runDir: runDir}, newFakeClient(), 3)
+	err = d.writeSandboxSnapshot(context.Background(), "sb-base-file", &warmDestroyHandle{runDir: runDir}, newFakeClient(), 3, guestFlushFailed)
 	if err == nil || !strings.Contains(err.Error(), "create snapshot base") {
 		t.Fatalf("base not dir: got %v", err)
 	}
@@ -224,7 +214,7 @@ func TestWriteSandboxSnapshot_RemoveOldBackupWarn(t *testing.T) {
 	}
 	handle := &warmDestroyHandle{runDir: runDir}
 	ctx := context.Background()
-	if err := d.writeSandboxSnapshot(ctx, "sb-old-warn", handle, client, 3); err != nil {
+	if err := d.writeSandboxSnapshot(ctx, "sb-old-warn", handle, client, 3, guestFlushFailed); err != nil {
 		t.Fatalf("first write: %v", err)
 	}
 	finalDir, _, _, _, _, _ := d.sandboxSnapshotPaths("sb-old-warn")
@@ -236,7 +226,7 @@ func TestWriteSandboxSnapshot_RemoveOldBackupWarn(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer os.Chmod(oldDir, 0o700)
-	if err := d.writeSandboxSnapshot(ctx, "sb-old-warn", handle, client, 4); err != nil {
+	if err := d.writeSandboxSnapshot(ctx, "sb-old-warn", handle, client, 4, guestFlushFailed); err != nil {
 		t.Fatalf("second write: %v", err)
 	}
 }
@@ -264,17 +254,20 @@ func TestConfigureSandboxSnapshotRestore_OverlayPatchError(t *testing.T) {
 type failingCopyDest struct {
 	buf      []byte
 	writeErr error
+	truncErr error
 	syncErr  error
 	closeErr error
 }
 
-func (f *failingCopyDest) Write(p []byte) (int, error) {
+func (f *failingCopyDest) WriteAt(p []byte, _ int64) (int, error) {
 	if f.writeErr != nil {
 		return 0, f.writeErr
 	}
 	f.buf = append(f.buf, p...)
 	return len(p), nil
 }
+
+func (f *failingCopyDest) Truncate(int64) error { return f.truncErr }
 
 func (f *failingCopyDest) Sync() error { return f.syncErr }
 
@@ -303,6 +296,14 @@ func TestCopyFile_InjectedIOFailures(t *testing.T) {
 		}
 		if err := copyFile(src, filepath.Join(dir, "dst-copy")); err == nil || !strings.Contains(err.Error(), "copy ") {
 			t.Fatalf("copy: %v", err)
+		}
+	})
+	t.Run("truncate", func(t *testing.T) {
+		copyFileOpenDst = func(string, os.FileMode) (copyFileDest, error) {
+			return &failingCopyDest{truncErr: os.ErrInvalid}, nil
+		}
+		if err := copyFile(src, filepath.Join(dir, "dst-truncate")); err == nil || !strings.Contains(err.Error(), "truncate to ") {
+			t.Fatalf("truncate: %v", err)
 		}
 	})
 	t.Run("sync", func(t *testing.T) {

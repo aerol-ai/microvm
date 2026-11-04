@@ -193,6 +193,28 @@ func TestBuildIDTracksUntrackedFiles(t *testing.T) {
 	}
 }
 
+// TestResolveBuildIDRefusesATreeWithNoHEAD: every caller captures the id with
+// $(…), where bash clears errexit, so a failed rev-parse used to come back as
+// an EMPTY id with status 0, and cmd_build then ran `rm -rf "${BUILD_ROOT}/"`.
+// The id is captured here the same way, so the old code exits 0 and fails.
+func TestResolveBuildIDRefusesATreeWithNoHEAD(t *testing.T) {
+	dir := t.TempDir()
+	out, code := sourceAndRun(t, `unset GIT_DIR GIT_WORK_TREE
+export GIT_CEILING_DIRECTORIES=`+filepath.Dir(dir)+`
+REF=''; REPO_ROOT=`+dir+`
+id=$(resolve_build_id)
+printf 'id=[%s]\n' "$id"`)
+	if code == 0 {
+		t.Fatalf("resolve_build_id outside a git checkout succeeded: %s", out)
+	}
+	if strings.Contains(out, "id=[") {
+		t.Fatalf("an id was handed out with no HEAD to derive it from: %s", out)
+	}
+	if !strings.Contains(out, "cannot resolve HEAD") {
+		t.Fatalf("message %q does not name the problem", out)
+	}
+}
+
 func runScript(t *testing.T) string {
 	t.Helper()
 	return filepath.Join(filepath.Dir(buildScript(t)), "..", "run.sh")

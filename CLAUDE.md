@@ -4,6 +4,10 @@ Self-hosted or managed multi-tenant Docker-backed sandbox platform. Go daemon + 
 For non-trivial changes, invoke the matching project skill before coding (they live in
 [`.claude/skills/`](./.claude/skills/) — see the "Project skills" table below).
 Read [`pr-review.md`](./pr-review.md) before opening any PR that touches the server.
+Every PR description follows [`.github/pull_request_template.md`](./.github/pull_request_template.md)
+and the §A–§D description standard in `pr-review.md`. `gh pr create --body` bypasses
+GitHub's auto-fill, so write the body from the template into a file, run the §B
+citation check on it, and pass it with `--body-file`.
 
 ## Hard rules
 
@@ -17,7 +21,10 @@ Read [`pr-review.md`](./pr-review.md) before opening any PR that touches the ser
   page. Register it in the sidebar at `docs/src/content.config.ts` (note: file
   is `content.config.ts`, not `content/config.ts`).
 - Every new docs page must cover all five SDK languages with matching
-  `syncKey="lang"` tab order.
+  `syncKey="lang"` tab order. The one exception is `cli.mdx` and `mcp.mdx`:
+  their examples are shell commands and MCP client config, in tabs keyed
+  `syncKey="mcp-client"`, and each still ends with a "Same thing from the
+  SDK" section in the five `syncKey="lang"` tabs.
 
 ### API & server changes
 

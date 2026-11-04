@@ -2,7 +2,10 @@ package ai.aerol.microvm;
 
 import java.util.List;
 
+import ai.aerol.microvm.model.AuditOptions;
+import ai.aerol.microvm.model.AuditPage;
 import ai.aerol.microvm.model.CloneGeneration;
+import ai.aerol.microvm.model.CreateSnapshotOptions;
 import ai.aerol.microvm.model.CreateSessionOptions;
 import ai.aerol.microvm.model.CustomDomain;
 import ai.aerol.microvm.model.CustomDomainDnsRecords;
@@ -10,6 +13,9 @@ import ai.aerol.microvm.model.ExecRequest;
 import ai.aerol.microvm.model.ExecResult;
 import ai.aerol.microvm.model.ExecStreamOptions;
 import ai.aerol.microvm.model.ExposeOptions;
+import ai.aerol.microvm.model.NetworkLearned;
+import ai.aerol.microvm.model.NetworkPolicy;
+import ai.aerol.microvm.model.NetworkPolicyOptions;
 import ai.aerol.microvm.model.ExposeResult;
 import ai.aerol.microvm.model.Lifecycle;
 import ai.aerol.microvm.model.NetworkUsage;
@@ -154,6 +160,14 @@ public class Sandbox extends SandboxData {
         return client.createSnapshot(id, name);
     }
 
+    /**
+     * Saves this sandbox's files as a snapshot. With {@code allowPause} false,
+     * a sandbox that is not stopped is refused (HTTP 409) instead of paused.
+     */
+    public SandboxSnapshot createSnapshot(String name, CreateSnapshotOptions options) {
+        return client.createSnapshot(id, name, options);
+    }
+
     public void destroy() {
         client.destroy(id);
     }
@@ -174,6 +188,40 @@ public class Sandbox extends SandboxData {
 
     public NetworkUsage setNetworkLimits(SetNetworkLimitsOptions options) {
         return client.setNetworkLimits(id, options);
+    }
+
+    /**
+     * Replaces this sandbox's egress policy while it runs (see
+     * {@link MicroVMClient#setNetworkPolicy}) and updates its policy fields.
+     */
+    public NetworkPolicy setNetworkPolicy(NetworkPolicyOptions options) {
+        NetworkPolicy policy = client.setNetworkPolicy(id, options);
+        networkBlockAll = policy.networkBlockAll;
+        egressProfiles = policy.egressProfiles;
+        egressStatus = policy.egressStatus;
+        networkEgressMode = "learn".equals(policy.networkEgressMode) ? "learn" : null;
+        networkEgressRules = policy.networkEgressRules;
+        return policy;
+    }
+
+    /**
+     * Reads what this sandbox reached in learn mode. A recording stays readable
+     * after a switch to enforce, until the sandbox is destroyed.
+     */
+    public NetworkLearned learned() {
+        return client.getNetworkLearned(id);
+    }
+
+    /**
+     * Reads one page of this sandbox's audit log: outbound connections and
+     * egress denials (kind {@code "egress"}) and secret reads.
+     */
+    public AuditPage audit(AuditOptions options) {
+        return client.getAudit(id, options);
+    }
+
+    public AuditPage audit() {
+        return client.getAudit(id, null);
     }
 
     private void apply(SandboxData data) {

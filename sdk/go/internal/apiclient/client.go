@@ -9,14 +9,17 @@ import (
 	"io"
 	"math/rand"
 	"mime/multipart"
+	"net"
 	"net/http"
 	"net/url"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/aerol-ai/microvm/pkg/models"
 	apiv1 "github.com/aerol-ai/microvm/sdk/go/internal/apiclient/v1"
+	sdktypes "github.com/aerol-ai/microvm/sdk/go/pkg/types"
 )
 
 // APIVersion selects which wire version of the sandbox daemon API to call.
@@ -45,9 +48,15 @@ type ExposeResult = models.ExposePortResponse
 type SandboxSnapshot = models.SandboxSnapshot
 type HealthStatus = models.HealthStatus
 
+// HeaderTeam is the request header that selects which of a credential's
+// teams a request acts for. Keep in sync with pkg/api.HeaderTeam on the
+// server.
+const HeaderTeam = "X-AerolVM-Team"
+
 type Client struct {
 	baseURL       string
 	patToken      string
+	team          string
 	httpClient    *http.Client
 	apiVersion    APIVersion
 	versionPrefix string
@@ -55,14 +64,21 @@ type Client struct {
 }
 
 type ClientOptions struct {
-	PATToken   string
+	PATToken string
+	// Team is sent as the HeaderTeam header on every request and WebSocket
+	// handshake. Empty sends no header, so the server picks the
+	// credential's first matching binding.
+	Team       string
 	HTTPClient *http.Client
 	// APIVersion pins the wire version this client speaks. Empty defaults to
 	// the SDK's pinned default (v1 today). Pass APIVersionV1 explicitly to
 	// guarantee stability across SDK upgrades.
 	APIVersion APIVersion
 	// Retry configures the policy for transient transport errors and retryable
-	// HTTP status codes (421, 429, 502, 503, 504).
+	// HTTP status codes (421, 429, 502, 503, 504). Exec is narrower: it is
+	// re-sent only when the connection never opened or on 429/503, because a
+	// re-sent exec runs the command again. A 429 or 503 retry waits as long
+	// as the server's Retry-After asks, up to MaxRetryAfterMs.
 	Retry *RetryConfig
 }
 
@@ -71,6 +87,9 @@ type RetryConfig struct {
 	MaxRetries  *int
 	BaseDelayMs *int
 	MaxDelayMs  *int
+	// MaxRetryAfterMs caps the wait a 429 or 503 Retry-After asks for.
+	// Defaults to 30000; 0 or less ignores Retry-After.
+	MaxRetryAfterMs *int
 }
 
 const (
@@ -105,6 +124,7 @@ func NewClient(baseURL string, config ClientOptions) *Client {
 	client := &Client{
 		baseURL:       strings.TrimRight(baseURL, "/"),
 		patToken:      config.PATToken,
+		team:          strings.TrimSpace(config.Team),
 		httpClient:    httpClient,
 		apiVersion:    version,
 		versionPrefix: prefix,
@@ -124,6 +144,10 @@ func NewClient(baseURL string, config ClientOptions) *Client {
 		v := defaultMaxDelayMs
 		client.retryConfig.MaxDelayMs = &v
 	}
+	if client.retryConfig.MaxRetryAfterMs == nil {
+		v := defaultMaxRetryAfterMs
+		client.retryConfig.MaxRetryAfterMs = &v
+	}
 	return client
 }
 
@@ -140,12 +164,10 @@ func (c *Client) versioned(suffix string) string {
 // package.
 func (c *Client) versionedURL() string { return c.versionPrefix }
 
+// Create creates a sandbox under a fresh Idempotency-Key, the same on each
+// of this call's automatic retries (see CreateWithIdempotencyKey).
 func (c *Client) Create(ctx context.Context, opts CreateOptions) (*Sandbox, string, error) {
-	var response models.CreateSandboxResponse
-	if err := c.doJSON(ctx, http.MethodPost, c.versionPrefix+"/sandboxes", opts, &response); err != nil {
-		return nil, "", err
-	}
-	return c.wrap(response.Sandbox), response.SSHPrivateKey, nil
+	return c.CreateWithIdempotencyKey(ctx, opts, "")
 }
 
 // BuildImagePushSpec is the wire shape of the per-request push directive
@@ -220,7 +242,7 @@ func (c *Client) BuildImageWithPush(ctx context.Context, dockerfile string, push
 
 	path := c.versioned("/images/build")
 
-	response, err := c.doWithRetry(ctx, func() (*http.Request, error) {
+	response, err := c.doWithRetry(ctx, retryIdempotent, func() (*http.Request, error) {
 		request, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+path, bytes.NewReader(encoded))
 		if err != nil {
 			return nil, err
@@ -265,10 +287,15 @@ const maxClusterListPages = 100000
 // Partial coverage or an unready placement view is returned as an error rather
 // than a silent incomplete list.
 func (c *Client) ListWithOptions(ctx context.Context, tags map[string]string, includeEnv bool) ([]*Sandbox, error) {
+	return c.ListWithQuery(ctx, ListQuery{Tags: tags, IncludeEnv: includeEnv})
+}
+
+// ListWithQuery is ListWithOptions with every list filter.
+func (c *Client) ListWithQuery(ctx context.Context, q ListQuery) ([]*Sandbox, error) {
 	var items []*Sandbox
 	pageToken := ""
 	for page := 0; page < maxClusterListPages; page++ {
-		response, next, err := c.ListPageWithOptions(ctx, tags, includeEnv, pageToken)
+		response, next, err := c.ListPageWithQuery(ctx, q, pageToken)
 		if err != nil {
 			return nil, err
 		}
@@ -285,10 +312,33 @@ func (c *Client) ListWithOptions(ctx context.Context, tags map[string]string, in
 // token is opaque and empty on the final page. This is the bounded-memory path
 // for fleet inventory callers; partial/unready coverage is always an error.
 func (c *Client) ListPageWithOptions(ctx context.Context, tags map[string]string, includeEnv bool, pageToken string) ([]*Sandbox, string, error) {
-	basePath := c.versionPrefix + "/sandboxes" + buildSandboxQuery(tags, includeEnv)
+	return c.ListPageWithQuery(ctx, ListQuery{Tags: tags, IncludeEnv: includeEnv}, pageToken)
+}
+
+// ListQuery is the full set of GET /sandboxes filters.
+type ListQuery struct {
+	Tags       map[string]string
+	IncludeEnv bool
+	// Name filters to the caller's sandbox with this name (?name=). Servers
+	// that predate name lookup ignore it; GetByName verifies the reply.
+	Name string
+	// Limit asks for at most this many rows per page (?limit=); 0 leaves the
+	// server default. Single-node servers that predate single-node paging
+	// return every row in one page, so callers that need a bound must also
+	// cap the reply themselves.
+	Limit int
+}
+
+// ListPageWithQuery is ListPageWithOptions with every list filter.
+func (c *Client) ListPageWithQuery(ctx context.Context, q ListQuery, pageToken string) ([]*Sandbox, string, error) {
+	basePath := c.versionPrefix + "/sandboxes" + buildSandboxQuery(q.Tags, q.IncludeEnv)
+	basePath = appendQueryParam(basePath, "name", strings.TrimSpace(q.Name))
+	if q.Limit > 0 {
+		basePath = appendQueryParam(basePath, "limit", strconv.Itoa(q.Limit))
+	}
 	path := appendQueryParam(basePath, "page_token", pageToken)
 	var response []models.Sandbox
-	hdrs, err := c.doJSONHeaders(ctx, http.MethodGet, path, nil, &response)
+	hdrs, err := c.doJSONHeaders(ctx, http.MethodGet, path, nil, &response, retryIdempotent)
 	if err != nil {
 		return nil, "", err
 	}
@@ -327,6 +377,30 @@ func buildSandboxQuery(tags map[string]string, includeEnv bool) string {
 	return "?" + values.Encode()
 }
 
+// GetByName returns the caller's sandbox called name with one request, or an
+// error matching ErrNotFound. Names are unique per owner. The reply is only
+// trusted when it holds at most one sandbox carrying the requested name: a
+// server that predates ?name= ignores the filter and returns an ordinary list
+// page, and acting on its first row would target the wrong sandbox. That case
+// returns an error matching ErrNameLookupUnsupported.
+func (c *Client) GetByName(ctx context.Context, name string, includeEnv bool) (*Sandbox, error) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return nil, errors.New("sandbox name is required")
+	}
+	items, _, err := c.ListPageWithQuery(ctx, ListQuery{Name: name, IncludeEnv: includeEnv}, "")
+	if err != nil {
+		return nil, err
+	}
+	if len(items) == 0 {
+		return nil, fmt.Errorf("sandbox %q: %w", name, ErrNotFound)
+	}
+	if len(items) > 1 || items[0].Name != name {
+		return nil, fmt.Errorf("%s does not support sandbox name lookup; use the sandbox ID or upgrade the server: %w", c.baseURL, ErrNameLookupUnsupported)
+	}
+	return items[0], nil
+}
+
 func (c *Client) Get(ctx context.Context, id string) (*Sandbox, error) {
 	return c.GetWithOptions(ctx, id, false)
 }
@@ -357,9 +431,12 @@ func (c *Client) Stop(ctx context.Context, id string) (*Sandbox, error) {
 	return c.wrap(response), nil
 }
 
-func (c *Client) CreateSnapshot(ctx context.Context, id, name string) (SandboxSnapshot, error) {
+// CreateSnapshot saves a sandbox's files as a snapshot. allowPause nil
+// leaves the server's default (pause a running sandbox briefly).
+func (c *Client) CreateSnapshot(ctx context.Context, id, name string, allowPause *bool) (SandboxSnapshot, error) {
 	var response models.SandboxSnapshot
-	err := c.doJSON(ctx, http.MethodPost, c.versionPrefix+"/sandboxes/"+id+"/snapshot", models.CreateSandboxSnapshotRequest{Name: name}, &response)
+	err := c.doJSON(ctx, http.MethodPost, c.versionPrefix+"/sandboxes/"+id+"/snapshot",
+		models.CreateSandboxSnapshotRequest{Name: name, AllowPause: allowPause}, &response)
 	return response, err
 }
 
@@ -509,7 +586,7 @@ func (c *Client) PushWasmModule(ctx context.Context, opts models.PushWasmModuleO
 		query.Set("tag", opts.Tag)
 	}
 	path := c.baseURL + c.versioned("/wasm-modules/push") + "?" + query.Encode()
-	response, err := c.doWithRetry(ctx, func() (*http.Request, error) {
+	response, err := c.doWithRetry(ctx, retryIdempotent, func() (*http.Request, error) {
 		req, reqErr := http.NewRequestWithContext(ctx, http.MethodPost, path, bytes.NewReader(opts.Module))
 		if reqErr != nil {
 			return nil, reqErr
@@ -606,6 +683,145 @@ func (c *Client) GetNetworkUsage(ctx context.Context, id string) (models.Network
 	return response, nil
 }
 
+// CheckNetworkPolicy evaluates a policy against a destination without a
+// sandbox.
+func (c *Client) CheckNetworkPolicy(ctx context.Context, request models.NetworkPolicyCheckRequest) (models.NetworkPolicyCheckResponse, error) {
+	var response models.NetworkPolicyCheckResponse
+	err := c.doJSON(ctx, http.MethodPost, c.versionPrefix+"/network/policy/check", request, &response)
+	return response, err
+}
+
+// SetNetworkPolicy replaces a sandbox's egress policy and returns the
+// effective one.
+func (c *Client) SetNetworkPolicy(ctx context.Context, id string, request models.NetworkPolicyRequest) (models.NetworkPolicy, error) {
+	var response models.NetworkPolicy
+	err := c.doJSON(ctx, http.MethodPut, c.versionPrefix+"/sandboxes/"+id+"/network/policy", request, &response)
+	return response, err
+}
+
+// GetNetworkLearned reads a sandbox's learn-mode recording.
+func (c *Client) GetNetworkLearned(ctx context.Context, id string) (models.NetworkLearned, error) {
+	var response models.NetworkLearned
+	err := c.doJSON(ctx, http.MethodGet, c.versionPrefix+"/sandboxes/"+id+"/network/learned", nil, &response)
+	return response, err
+}
+
+func (c *Client) egressProfilePath(name string) string {
+	return c.versionPrefix + "/egress-profiles/" + url.PathEscape(name)
+}
+
+// PutEgressProfile creates or replaces a named egress profile.
+func (c *Client) PutEgressProfile(ctx context.Context, name string, request models.EgressProfileRequest) (models.EgressProfile, error) {
+	var response models.EgressProfile
+	err := c.doJSON(ctx, http.MethodPut, c.egressProfilePath(name), request, &response)
+	return response, err
+}
+
+// GetEgressProfile reads one named egress profile.
+func (c *Client) GetEgressProfile(ctx context.Context, name string) (models.EgressProfile, error) {
+	var response models.EgressProfile
+	err := c.doJSON(ctx, http.MethodGet, c.egressProfilePath(name), nil, &response)
+	return response, err
+}
+
+// ListEgressProfiles reads one page of named egress profiles.
+func (c *Client) ListEgressProfiles(ctx context.Context, opts sdktypes.ListEgressProfilesOptions) (models.EgressProfileList, error) {
+	values := make(url.Values)
+	if opts.Cursor != "" {
+		values.Set("cursor", opts.Cursor)
+	}
+	if opts.Limit > 0 {
+		values.Set("limit", strconv.Itoa(opts.Limit))
+	}
+	path := c.versionPrefix + "/egress-profiles"
+	if len(values) > 0 {
+		path += "?" + values.Encode()
+	}
+	var response models.EgressProfileList
+	if err := c.doJSON(ctx, http.MethodGet, path, nil, &response); err != nil {
+		return models.EgressProfileList{}, err
+	}
+	if response.Profiles == nil {
+		response.Profiles = []models.EgressProfile{}
+	}
+	return response, nil
+}
+
+// DeleteEgressProfile removes a named egress profile.
+func (c *Client) DeleteEgressProfile(ctx context.Context, name string) error {
+	return c.doJSON(ctx, http.MethodDelete, c.egressProfilePath(name), nil, nil)
+}
+
+func (c *Client) snapshotPath(name string) string {
+	return c.versionPrefix + "/snapshots/" + url.PathEscape(name)
+}
+
+// GetSnapshot reads one named snapshot's metadata.
+func (c *Client) GetSnapshot(ctx context.Context, name string) (SandboxSnapshot, error) {
+	var response models.SandboxSnapshot
+	err := c.doJSON(ctx, http.MethodGet, c.snapshotPath(name), nil, &response)
+	return response, err
+}
+
+// ListSnapshots reads one page of named snapshots. Limit and StartingAfter
+// map to the `limit` and `starting_after` query params; the wire `has_more`
+// flag is surfaced on SnapshotList.HasMore.
+func (c *Client) ListSnapshots(ctx context.Context, opts sdktypes.ListSnapshotsOptions) (sdktypes.SnapshotList, error) {
+	values := make(url.Values)
+	if opts.Limit > 0 {
+		values.Set("limit", strconv.Itoa(opts.Limit))
+	}
+	if opts.StartingAfter != "" {
+		values.Set("starting_after", opts.StartingAfter)
+	}
+	path := c.versioned("/snapshots")
+	if len(values) > 0 {
+		path += "?" + values.Encode()
+	}
+	var response sdktypes.SnapshotList
+	if err := c.doJSON(ctx, http.MethodGet, path, nil, &response); err != nil {
+		return sdktypes.SnapshotList{}, err
+	}
+	if response.Snapshots == nil {
+		response.Snapshots = []sdktypes.SandboxSnapshot{}
+	}
+	return response, nil
+}
+
+// DeleteSnapshot removes a named snapshot.
+func (c *Client) DeleteSnapshot(ctx context.Context, name string) error {
+	return c.doJSON(ctx, http.MethodDelete, c.snapshotPath(name), nil, nil)
+}
+
+// GetAudit reads one page of a sandbox's audit log.
+func (c *Client) GetAudit(ctx context.Context, id string, opts sdktypes.AuditOptions) (sdktypes.AuditPage, error) {
+	values := make(url.Values)
+	if opts.Kind != "" {
+		values.Set("kind", opts.Kind)
+	}
+	if opts.Limit > 0 {
+		values.Set("limit", strconv.Itoa(opts.Limit))
+	}
+	if opts.Cursor != "" {
+		values.Set("cursor", opts.Cursor)
+	}
+	if opts.IncarnationID != "" {
+		values.Set("incarnation_id", opts.IncarnationID)
+	}
+	path := c.versionPrefix + "/sandboxes/" + id + "/audit"
+	if len(values) > 0 {
+		path += "?" + values.Encode()
+	}
+	var page sdktypes.AuditPage
+	if err := c.doJSON(ctx, http.MethodGet, path, nil, &page); err != nil {
+		return sdktypes.AuditPage{}, err
+	}
+	if page.Events == nil {
+		page.Events = []sdktypes.AuditEvent{}
+	}
+	return page, nil
+}
+
 func (c *Client) SetNetworkLimits(ctx context.Context, id string, request models.UpdateNetworkLimitsRequest) (models.NetworkUsage, error) {
 	var response models.NetworkUsage
 	if err := c.doJSON(ctx, http.MethodPatch, c.versionPrefix+"/sandboxes/"+id+"/network/limits", request, &response); err != nil {
@@ -614,9 +830,15 @@ func (c *Client) SetNetworkLimits(ctx context.Context, id string, request models
 	return response, nil
 }
 
+// Exec runs a command in the sandbox and waits for it to finish. Unlike the
+// other endpoints, exec is not safe to re-send: the toolbox runs the command
+// once per request it receives, and a timeout or dropped connection after the
+// request was written cannot tell whether it already ran. So it is retried
+// only when the connection never opened or the server refused it with 429 or
+// 503; any other failure is returned to the caller.
 func (c *Client) Exec(ctx context.Context, id string, request ExecRequest) (ExecResult, error) {
 	var response ExecResult
-	err := c.doJSON(ctx, http.MethodPost, c.versionPrefix+"/sandboxes/"+id+"/toolbox/process/execute", request, &response)
+	_, err := c.doJSONHeaders(ctx, http.MethodPost, c.versionPrefix+"/sandboxes/"+id+"/toolbox/process/execute", request, &response, retryUnsentOnly)
 	return response, err
 }
 
@@ -653,6 +875,75 @@ func (c *Client) UploadFile(ctx context.Context, id, targetPath string, data []b
 	return nil
 }
 
+// UploadFileStream uploads r to targetPath without holding the file in
+// memory: the multipart body is produced through an io.Pipe while the request
+// is sent, so memory stays at the copy buffer no matter the file size. Unlike
+// a []byte upload it can't be retried by the client (the reader is consumed),
+// which matches UploadFile, whose request is not retried either.
+func (c *Client) UploadFileStream(ctx context.Context, id, targetPath string, r io.Reader) error {
+	pr, pw := io.Pipe()
+	// Closing the read side unblocks the writer goroutine if the request
+	// fails before the body is fully read.
+	defer pr.Close()
+	writer := multipart.NewWriter(pw)
+	go func() {
+		pw.CloseWithError(func() error {
+			if err := writer.WriteField("path", targetPath); err != nil {
+				return err
+			}
+			part, err := writer.CreateFormFile("file", filepath.Base(targetPath))
+			if err != nil {
+				return err
+			}
+			if _, err := io.Copy(part, r); err != nil {
+				return err
+			}
+			return writer.Close()
+		}())
+	}()
+
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+c.versionPrefix+"/sandboxes/"+id+"/toolbox/files/upload", pr)
+	if err != nil {
+		return err
+	}
+	request.Header.Set("Content-Type", writer.FormDataContentType())
+	c.addAuth(request)
+
+	response, err := c.httpClient.Do(request)
+	if err != nil {
+		return err
+	}
+	defer response.Body.Close()
+	if response.StatusCode >= 400 {
+		return decodeError(response)
+	}
+	return nil
+}
+
+// DownloadFileStream opens targetPath for reading without buffering it. The
+// caller reads the returned body and must Close it; closing early (after the
+// first window of a large file, say) ends the transfer. The request retries
+// like any other GET until the response headers arrive.
+func (c *Client) DownloadFileStream(ctx context.Context, id, targetPath string) (io.ReadCloser, error) {
+	path := c.versionPrefix + "/sandboxes/" + id + "/toolbox/files/download?path=" + url.QueryEscape(targetPath)
+	response, err := c.doWithRetry(ctx, retryIdempotent, func() (*http.Request, error) {
+		request, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+path, nil)
+		if err != nil {
+			return nil, err
+		}
+		c.addAuth(request)
+		return request, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	if response.StatusCode >= 400 {
+		defer response.Body.Close()
+		return nil, decodeError(response)
+	}
+	return response.Body, nil
+}
+
 func (c *Client) DownloadFile(ctx context.Context, id, targetPath string) ([]byte, error) {
 	encodedPath := url.QueryEscape(targetPath)
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+c.versionPrefix+"/sandboxes/"+id+"/toolbox/files/download?path="+encodedPath, nil)
@@ -675,7 +966,8 @@ func (c *Client) DownloadFile(ctx context.Context, id, targetPath string) ([]byt
 // ExposePort publishes a sandbox container port. Pass an empty protocol to
 // fall back to the default HTTP routing; pass "tcp" or "tls" to opt into the
 // caddy-l4 surfaces. Host and HostPort on the returned ExposeResult are
-// populated only on the "tcp" path.
+// populated only on the "tcp" path. The first exposure makes a private
+// sandbox public (AllowPublicTraffic omitted or false at create alike).
 func (c *Client) ExposePort(ctx context.Context, id string, port int, protocol string) (ExposeResult, error) {
 	var body any
 	if protocol != "" && protocol != "http" {
@@ -773,6 +1065,16 @@ func (s *Sandbox) UploadFile(ctx context.Context, targetPath string, data []byte
 	return s.client.UploadFile(ctx, s.ID, targetPath, data)
 }
 
+// UploadFileStream uploads r to targetPath without buffering it.
+func (s *Sandbox) UploadFileStream(ctx context.Context, targetPath string, r io.Reader) error {
+	return s.client.UploadFileStream(ctx, s.ID, targetPath, r)
+}
+
+// DownloadFileStream opens targetPath for reading; the caller must Close it.
+func (s *Sandbox) DownloadFileStream(ctx context.Context, targetPath string) (io.ReadCloser, error) {
+	return s.client.DownloadFileStream(ctx, s.ID, targetPath)
+}
+
 func (s *Sandbox) DownloadFile(ctx context.Context, targetPath string) ([]byte, error) {
 	return s.client.DownloadFile(ctx, s.ID, targetPath)
 }
@@ -834,11 +1136,17 @@ func (s *Sandbox) UpdateLifecycle(ctx context.Context, lifecycle models.Lifecycl
 }
 
 func (c *Client) doJSON(ctx context.Context, method, path string, requestBody any, responseBody any) error {
-	_, err := c.doJSONHeaders(ctx, method, path, requestBody, responseBody)
+	_, err := c.doJSONHeaders(ctx, method, path, requestBody, responseBody, retryIdempotent)
 	return err
 }
 
-func (c *Client) doJSONHeaders(ctx context.Context, method, path string, requestBody any, responseBody any) (http.Header, error) {
+func (c *Client) doJSONHeaders(ctx context.Context, method, path string, requestBody any, responseBody any, policy retryPolicy) (http.Header, error) {
+	return c.doJSONRequest(ctx, method, path, requestBody, responseBody, policy, nil)
+}
+
+// doJSONRequest is doJSONHeaders with extra request headers, set on every
+// attempt so a retry carries them unchanged.
+func (c *Client) doJSONRequest(ctx context.Context, method, path string, requestBody any, responseBody any, policy retryPolicy, extra http.Header) (http.Header, error) {
 	var encoded []byte
 	var err error
 	if requestBody != nil {
@@ -848,7 +1156,7 @@ func (c *Client) doJSONHeaders(ctx context.Context, method, path string, request
 		}
 	}
 
-	response, err := c.doWithRetry(ctx, func() (*http.Request, error) {
+	response, err := c.doWithRetry(ctx, policy, func() (*http.Request, error) {
 		var body io.Reader
 		if encoded != nil {
 			body = bytes.NewReader(encoded)
@@ -859,6 +1167,9 @@ func (c *Client) doJSONHeaders(ctx context.Context, method, path string, request
 		}
 		if encoded != nil {
 			request.Header.Set("Content-Type", "application/json")
+		}
+		for name, values := range extra {
+			request.Header[name] = values
 		}
 		c.addAuth(request)
 		return request, nil
@@ -880,9 +1191,46 @@ func (c *Client) doJSONHeaders(ctx context.Context, method, path string, request
 	return response.Header.Clone(), nil
 }
 
-// isTransientTransportError loosely matches the Node.js SDK logic by checking
-// if the error indicates a socket/connection failure before the server processed
-// the request.
+// retryPolicy is the per-request choice of which failures doWithRetry may
+// re-send after. The daemon designs most endpoints for idempotent retry, so a
+// duplicate is harmless there; exec is the exception, because the toolbox runs
+// the command once per request it receives.
+type retryPolicy int
+
+const (
+	// retryIdempotent re-sends after any transient transport error or
+	// retryable status. A timeout, reset or EOF can arrive after the server
+	// received the request and acted on it, so this is only for endpoints that
+	// tolerate a duplicate.
+	retryIdempotent retryPolicy = iota
+	// retryUnsentOnly re-sends only when the request provably never reached
+	// the server (the connection never opened) or the server answered 429 or
+	// 503, which it sends to refuse a request before doing any work. Every
+	// other status, 421/502/504 included, is surfaced: the SDK cannot tell
+	// which hop produced it, and a 502 or 504 can follow a command that
+	// already started.
+	retryUnsentOnly
+)
+
+func (p retryPolicy) retriesStatus(code int) bool {
+	if p == retryUnsentOnly {
+		return code == http.StatusTooManyRequests || code == http.StatusServiceUnavailable
+	}
+	return isRetryableStatusCode(code)
+}
+
+func (p retryPolicy) retriesError(err error) bool {
+	if p == retryUnsentOnly {
+		return isUnsentTransportError(err)
+	}
+	return isTransientTransportError(err)
+}
+
+// isTransientTransportError reports whether err is a transport failure worth
+// re-sending an idempotent request after. It is deliberately broad: a timeout,
+// reset or EOF says the exchange failed, not that the request never reached
+// the server, so it is only safe where a duplicate is harmless. Requests that
+// must not be duplicated use isUnsentTransportError instead.
 func isTransientTransportError(err error) bool {
 	if err == nil {
 		return false
@@ -908,6 +1256,34 @@ func isTransientTransportError(err error) bool {
 	return false
 }
 
+// isUnsentTransportError reports whether err proves the request never left
+// the client: the host name did not resolve, or the TCP connection was never
+// opened (refused, or the connect itself timed out). It inspects typed errors
+// rather than messages, because a "timeout" or "EOF" in a message cannot say
+// whether the request was written first.
+func isUnsentTransportError(err error) bool {
+	if err == nil || errors.Is(err, context.Canceled) {
+		return false
+	}
+	var dnsErr *net.DNSError
+	if errors.As(err, &dnsErr) {
+		return true
+	}
+	// Through an HTTP proxy the dial failure is wrapped in a "proxyconnect"
+	// OpError, and errors.As stops at the first OpError, so walk each one.
+	for err != nil {
+		var opErr *net.OpError
+		if !errors.As(err, &opErr) {
+			return false
+		}
+		if opErr.Op == "dial" {
+			return true
+		}
+		err = opErr.Err
+	}
+	return false
+}
+
 // isRetryableStatusCode returns true for HTTP 421, 429 and 502/503/504. 421
 // Misdirected Request means an owner answered for a sandbox it doesn't hold
 // (connection coalescing or a stale route after failover). The server closes
@@ -920,13 +1296,14 @@ func isRetryableStatusCode(code int) bool {
 	return false
 }
 
-func (c *Client) doWithRetry(ctx context.Context, makeReq func() (*http.Request, error)) (*http.Response, error) {
+// doWithRetry sends the request makeReq builds, re-sending it with jittered
+// exponential backoff when policy allows the failure. A 429 or 503 waits as
+// long as its Retry-After asks instead (see retryWait), and ctx ends any wait.
+func (c *Client) doWithRetry(ctx context.Context, policy retryPolicy, makeReq func() (*http.Request, error)) (*http.Response, error) {
 	maxRetries := *c.retryConfig.MaxRetries
 	if maxRetries < 0 {
 		maxRetries = 0
 	}
-	baseDelayMs := *c.retryConfig.BaseDelayMs
-	maxDelayMs := *c.retryConfig.MaxDelayMs
 
 	var lastErr error
 	for attempt := 0; attempt <= maxRetries; attempt++ {
@@ -937,53 +1314,45 @@ func (c *Client) doWithRetry(ctx context.Context, makeReq func() (*http.Request,
 
 		response, err := c.httpClient.Do(req)
 
-		// If we got a response, check if the status code is transient.
+		var retryAfter string
 		if err == nil {
-			if isRetryableStatusCode(response.StatusCode) && attempt < maxRetries {
-				response.Body.Close()
-				goto retry
+			// A response: re-send only a transient status with budget left.
+			if !policy.retriesStatus(response.StatusCode) || attempt >= maxRetries {
+				return response, nil
 			}
-			return response, nil
+			retryAfter = retryAfterHint(response)
+			response.Body.Close()
+		} else {
+			// An error: re-send only if the policy allows it.
+			lastErr = err
+			if !policy.retriesError(err) || attempt >= maxRetries {
+				break
+			}
 		}
 
-		// We got an error. Check if it's a transport error.
-		lastErr = err
-		if !isTransientTransportError(err) || attempt >= maxRetries {
-			break
-		}
-
-	retry:
-		delayMs := baseDelayMs * (1 << attempt)
-		if delayMs > maxDelayMs {
-			delayMs = maxDelayMs
-		}
-		// Jitter ±25%
-		jitter := 1.0 + (rand.Float64()-0.5)*0.5
-		sleepDuration := time.Duration(float64(delayMs)*jitter) * time.Millisecond
-
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case <-time.After(sleepDuration):
+		if err := sleepCtx(ctx, c.retryWait(attempt, retryAfter, time.Now(), rand.Float64())); err != nil {
+			return nil, err
 		}
 	}
 	return nil, lastErr
 }
 
 func (c *Client) addAuth(request *http.Request) {
+	c.setAuthHeaders(request.Header)
+}
+
+// setAuthHeaders writes the credential and the team selection. Every HTTP
+// request and WebSocket handshake goes through it, so a client built with a
+// team never sends a request that acts for another one.
+func (c *Client) setAuthHeaders(header http.Header) {
 	if c.patToken != "" {
-		request.Header.Set("Authorization", "Bearer "+c.patToken)
+		header.Set("Authorization", "Bearer "+c.patToken)
+	}
+	if c.team != "" {
+		header.Set(HeaderTeam, c.team)
 	}
 }
 
 func (c *Client) wrap(sandbox models.Sandbox) *Sandbox {
 	return &Sandbox{Sandbox: sandbox, client: c}
-}
-
-func decodeError(response *http.Response) error {
-	var payload models.ErrorResponse
-	if err := json.NewDecoder(response.Body).Decode(&payload); err == nil && payload.Error != "" {
-		return errors.New(payload.Error)
-	}
-	return fmt.Errorf("request failed with status %d", response.StatusCode)
 }

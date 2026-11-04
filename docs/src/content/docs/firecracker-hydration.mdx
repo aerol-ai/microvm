@@ -1,21 +1,29 @@
 ---
-title: Snapshot restore and the warm-VMM pool
-description: How AerolVM turns a Firecracker Create into PATCH + Resume against a pre-loaded paused VMM - resource pooling, snapshot restore, the warm-slot state machine, what is shared on a host, and what is not shipping yet.
+title: Firecracker snapshot restore
+description: How AerolVM prepares, restores and shares Firecracker VMs so a create is just attach and resume, and what is not built yet.
 ---
 
 import { Tabs, TabItem } from '@astrojs/starlight/components';
 
-A cold microVM is slow because *building* one is slow: pull an image, build a
-rootfs, boot a kernel, wait for init, wait for the agent. AerolVM does all of
-that ahead of the request. By the time `Create` arrives, the rootfs is built,
-the kernel is booted, the agent is up, and a Firecracker VMM is sitting paused
-mid-userspace. `Create` rebinds the per-sandbox state and issues `Resume`.
+A **microVM** is a small, fast virtual machine with its own kernel. A cold one is slow because *building* one is slow.
 
-This page walks through how that path is built. For the boot pipeline these
-pieces plug into, read [Firecracker Architecture](/firecracker-architecture)
-first.
+You pull an image and build a **rootfs** (the disk image that holds the root file system). Then you boot a kernel, wait for init and wait for the agent. AerolVM does all of that before the request arrives.
 
-## Pre-staged layers
+When `Create` arrives, the rootfs is built, the kernel is booted and the agent is up. A Firecracker **VMM** (virtual machine monitor: the process that runs one VM) sits paused while its guest is already running programs. `Create` gives it this sandbox's own network and disks, and resumes it.
+
+**In short:**
+
+- AerolVM builds each template's disk image once, boots it once, and saves one snapshot of it: a copy of the running VM's memory.
+- An optional warm pool keeps paused VMs with that snapshot already loaded. A create then only attaches devices and resumes.
+- Clones share the snapshot's memory pages until they write to them (copy-on-write), so one host can fit many sandboxes.
+- The pools track every slot in the server's database, so retries and crashes cannot give one VM to two sandboxes.
+- The warm pool is off by default, and several speed-ups (UFFD, huge pages, diff snapshots) are not built yet.
+
+This page walks through how that path is built. Read [Firecracker architecture](/firecracker-architecture/) first for the boot steps these pieces plug into.
+
+## What is ready before the request
+
+This section shows the layers that are prepared ahead of time. A **snapshot** is a saved copy of a running VM's memory and device state, and a **template** is a disk image plus its snapshot.
 
 ```mermaid
 graph TB
@@ -32,40 +40,29 @@ graph TB
     WARM --> CLAIM
 ```
 
-A rootfs is built once, snapshotted once, and that snapshot is what the warm
-pool pre-loads into live processes.
+A rootfs is built once and snapshotted once. That snapshot is what the warm pool loads into live processes ahead of time.
 
-## Resource pooling
+## Resource pools
 
-Two per-host pools turn "allocate a resource" into "pull one off a free list".
-Both are backed by the daemon's single-writer SQLite store, so allocation is
-idempotent and safe under concurrent duplicate `Create` calls.
+This section covers the two per-host pools that turn "create a resource" into "take one off a free list". Both are stored in the server's single-writer SQLite database. So taking a resource is **idempotent** (doing it twice has the same effect as doing it once). It is also safe when duplicate `Create` calls arrive at the same time.
 
 ### TAP slot pool
 
-A sandbox's network identity - its TAP device, host and guest IP, `/30` subnet,
-and vsock CID - is not invented per request. The host lays out a fixed pool of
-`/30` subnets at startup (`SB_FIRECRACKER_TAP_BASE_CIDR` carved into
-`SB_FIRECRACKER_TAP_POOL_SIZE` slots). `Create` claims a free slot row; the
-pool size is the hard cap on concurrent Firecracker sandboxes on that host.
-Allocation (reserving the row) is separated from realization (the actual
-`ip link add` of the TAP device), mirroring how the daemon separates host-port
-reservation from binding.
+This pool holds network identities. A sandbox's network identity is not made up per request. It is made of a TAP device (a virtual network cable), a host IP, a guest IP and a `/30` subnet. It also has a vsock CID: the VM's address on vsock, the direct host-to-VM channel.
+
+The host lays out a fixed pool of `/30` subnets at startup: `SB_FIRECRACKER_TAP_BASE_CIDR` divided into `SB_FIRECRACKER_TAP_POOL_SIZE` slots. `Create` claims a free slot row. The pool size is the hard limit on how many Firecracker sandboxes the host can run at once.
+
+Reserving the row is kept separate from creating the real TAP device with `ip link add`. This mirrors how the server keeps reserving a host port separate from binding it.
 
 ### Warm-VMM pool
 
-The warm-VMM pool removes the spawn and `LoadSnapshot` wall-clock from
-snapshot-load `Create` by doing both steps ahead of the request. The driver
-comment in `warmacquire.go:7` puts that cost at "~150ms+"; that number comes
-from the timeouts the driver was written against, not a published benchmark
-(see [Limitations](#limitations-and-gaps)).
+This pool holds paused VMs that are ready to go. It removes two costs from a snapshot-load `Create`: starting the process and calling `LoadSnapshot`. It does both before the request arrives.
 
-A background **refill goroutine** keeps a configurable depth of paused VMMs per
-template. For each empty slot it spawns a `firecracker` process, issues
-`LoadSnapshot` against the template's snapshot artifacts
-(`internal/runtime/firecracker/warmspawn.go:181-197`), and leaves the VM
-**paused**. The process is alive, the memory image is loaded, the devices are
-configured. It is one `Resume` away from running.
+A comment in `warmacquire.go` puts that cost at "~150ms+". That number comes from the timeouts the driver was written against, not from a published benchmark (see [Limitations](#limitations-and-gaps)).
+
+A background **refill goroutine** (a lightweight Go thread) keeps a set number of paused VMMs per template. For each empty slot it starts a `firecracker` process and calls `LoadSnapshot` on the template's snapshot files (in `internal/runtime/firecracker/warmspawn.go`). That call also attaches the slot's own TAP, through a network override. Then it leaves the VM **paused**.
+
+The process is alive, the memory image is loaded and the devices are set up. It is one resume call away from running.
 
 ```mermaid
 graph TB
@@ -77,26 +74,23 @@ graph TB
     end
     SNAP["template snapshot<br/>(memory + state)"] --> REFILL
     CREATE["Create (hot path)"] -->|AcquireWithHandle| S1
-    S1 -->|PATCH rootfs+TAP+overlay, Resume| RUN["running sandbox"]
+    S1 -->|transfer TAP, PATCH rootfs+overlay, Resume| RUN["running sandbox"]
     REFILL -.refills the drained slot.-> S2
 ```
 
-When `Create` acquires a warm slot it does **not** spawn or load anything. It
-PATCHes the per-sandbox rootfs, TAP, and (if requested) overlay onto the
-already-loaded VMM (`warmacquire.go:180-209`) and issues `Resume`. The drained
-slot is refilled in the background for the next request.
+When `Create` takes a warm slot, it does **not** start or load anything. Instead, it hands the slot's TAP over to this sandbox (`d.pool.Transfer`).
 
-The warm pool is **off by default**. See [Operational knobs](#operational-knobs).
+It points the rootfs and (if requested) overlay disks at this sandbox's own files with `PatchDrive` (in `warmacquire.go`). Then it resumes the VM with `PatchVM` (Firecracker's `PATCH /vm`, state `Resumed`). The emptied slot is refilled in the background for the next request.
+
+The warm pool is **off by default**. See [Settings for server operators](#settings-for-server-operators).
 
 ## Snapshot restore
 
-The artifact the warm pool restores is produced once, when a template is built.
-The daemon spins up a transient VM from the freshly built `rootfs.ext4`, boots
-it, waits for the in-guest agent to handshake, pauses it, and writes two files:
-`snapshot.memory` (the guest RAM image) and `snapshot.state` (device and CPU
-state). Then it tears the transient VM down
-(`internal/runtime/firecracker/snapshot.go`). That capture is a one-time cost;
-every later sandbox restores from it.
+This section explains how the snapshot is made, and why restoring from it is fast. The file the warm pool restores is made once, when a template is built.
+
+The server starts a temporary VM from the freshly built `rootfs.ext4`, boots it, waits for the agent's handshake and pauses it. It then writes two files: `snapshot.memory` (the guest's RAM) and `snapshot.state` (device and CPU state). Then it tears the temporary VM down (`internal/runtime/firecracker/snapshot.go`).
+
+That capture is a one-time cost. Every later sandbox restores from it.
 
 ```mermaid
 sequenceDiagram
@@ -112,15 +106,13 @@ sequenceDiagram
     Note over F: reused by every Create
 ```
 
-Restoring from a snapshot is a much shorter path than a cold boot: no kernel
-init, no agent startup, no userspace bring-up. It also gives you **on-demand
-page loading** ([Firecracker snapshot-support.md][fc-snap]): restoring does not
-fault the entire memory image in up front; the file is `mmap`'d and guest pages
-are loaded by the kernel's page-fault handler as the workload touches them.
-"On-demand" here means the kernel's standard mmap+fault path - not a userspace
-fault handler. UFFD is the opt-in alternative; see [Limitations](#limitations-and-gaps).
+Restoring from a snapshot is a much shorter path than a cold boot. There is no kernel start, no agent startup and no bring-up of user programs.
 
-The difference on the hot path:
+It also gives you **on-demand page loading** ([Firecracker snapshot-support.md][fc-snap]). Restoring does not read the whole memory image up front. The file is mapped with `mmap`, and the kernel's page-fault handler loads each guest page when the workload first touches it.
+
+"On demand" here means the kernel's standard mmap and page-fault path, not a handler in a user program. UFFD (`userfaultfd`, which lets a program handle page faults itself) is the opt-in alternative; see [Limitations](#limitations-and-gaps).
+
+This is the difference on the hot path (the steps a request waits for):
 
 ```mermaid
 sequenceDiagram
@@ -131,38 +123,35 @@ sequenceDiagram
     rect rgb(245, 235, 220)
     Note over C,G: snapshot-load (cold pool miss)
     C->>FC: spawn process
-    C->>FC: LoadSnapshot (memory + state)
-    C->>FC: Resume
+    C->>FC: LoadSnapshot (memory + state, TAP override)
+    C->>FC: PatchDrive rootfs + overlay
+    C->>FC: PATCH /vm state=Resumed
     C->>G: vsock handshake + post_resume
     end
 
     rect rgb(225, 240, 230)
     Note over C,G: warm-pool hit
-    C->>FC: PATCH rootfs + TAP + overlay
-    C->>FC: Resume
+    C->>FC: transfer TAP, PatchDrive rootfs + overlay
+    C->>FC: PATCH /vm state=Resumed
     C->>G: vsock handshake + post_resume
     end
 ```
 
-Both end identically. A `vsock` handshake confirms the agent is alive, and a
-best-effort `post_resume` message resyncs the guest. The payload is only
-`{ "wallclock_unix_ns": ... }` today
-(`internal/runtime/firecracker/warmacquire.go:230-232`,
-`sandbox_snapshot.go:422-424`), but the in-guest handler does two things on
-every invocation: it sets `CLOCK_REALTIME` from the payload and unconditionally
-reseeds the kernel RNG from virtio-rng via `RNDADDENTROPY`
-(`cmd/toolboxd/vsock.go:233-249`, `cmd/toolboxd/quiesce_linux.go:41`). See
-[Limitations](#limitations-and-gaps) for the entropy window before that ack
-lands, and for `CLOCK_MONOTONIC`.
+Both paths end the same way. A vsock handshake confirms the agent is alive. Then a best-effort `post_resume` message (if it fails, the create goes on) brings the guest up to date.
 
-## The warm slot lifecycle
+Every path builds the payload with `postResumeData` (in `driver.go`). It carries the host's wall clock and, when the TAP slot has an address, a `network` block with the guest IP and gateway. Cold boots get the same message too.
 
-Every warm slot moves through an explicit state machine in the store. The
-states make the pool safe under retries and crashes: a slot is only ever owned
-by one sandbox, and a failed `Create` returns its slot rather than leaking it.
+The agent then does four things (`OnPostResume` in `cmd/toolboxd/vsock.go`). It sets `CLOCK_REALTIME`, applies the network settings and forces a kernel reseed with `RNDADDENTROPY` and `RNDRESEEDCRNG`. Last, it changes the clone-generation token in `/run/aerolvm/clone-generation`.
 
-The actual states, per `internal/store/store.go:289-349`, are `spawning`,
-`loaded`, `allocated`, and `released`.
+The reseed bytes are 32 bytes from the guest's own `crypto/rand` (`ReseedRandom` in `cmd/toolboxd/quiesce_linux.go`). No randomness comes from the host: AerolVM attaches no virtio-rng device. On snapshot clones, fresh outside randomness comes from vmgenid, covered on [Correct snapshot clones](/engineering-snapshot-correctness/).
+
+See [Limitations](#limitations-and-gaps) for the randomness gap before that reply lands, and for `CLOCK_MONOTONIC`.
+
+## How a warm slot moves through its states
+
+This section shows the states each warm slot passes through. Every slot follows an explicit state machine stored in the database. The states keep the pool safe under retries and crashes: a slot only ever belongs to one sandbox, and a failed `Create` returns its slot instead of leaking it.
+
+The real states, from `internal/store/store.go`, are `spawning`, `loaded`, `allocated` and `released`.
 
 ```mermaid
 stateDiagram-v2
@@ -174,71 +163,48 @@ stateDiagram-v2
     released --> [*]: GC drops row after TTL
 ```
 
-There is no separate state for "resumed" or "in use". Once `Create` acquires
-the slot, the row stays `allocated` until the sandbox is destroyed (or rolled
-back on failure). The GC sweep walks `released` rows past
-`SB_FIRECRACKER_VMM_POOL_GC_TTL` and drops them
-(`internal/store/store.go:344-349`, `internal/pool/vmm/pool.go runGCOnce`).
+There is no separate state for "resumed" or "in use". Once `Create` takes the slot, the row stays `allocated` until the sandbox is destroyed, or rolled back after a failure.
 
-Two guarantees hold across these transitions:
+A cleanup sweep (GC, short for garbage collection) walks `released` rows older than `SB_FIRECRACKER_VMM_POOL_GC_TTL` and drops them. It lives in `internal/store/store.go` and in `runGCOnce` in `internal/pool/vmm/pool.go`.
 
-- **Idempotent acquire.** A retried or duplicated `Create` cannot end up with
-  two sandboxes on one VMM. The partial unique index
-  `idx_firecracker_vmm_pool_sandbox` (`internal/store/store.go:329-336`)
-  enforces exactly one `allocated` row per sandbox; acquire is a
-  guarded `SELECT`-then-`UPDATE` under the store's single writer.
-- **LIFO cleanup.** Everything `Create` acquires - TAP slot, host TAP, overlay
-  file, warm VMM - is released in reverse order on any failure. A slot that
-  fails to resume is moved back to `released` so the pool's GC sweep tears the
-  dead VMM down; it never sticks in `allocated` without an owner.
+Two guarantees hold across these steps:
+
+- **Taking a slot is idempotent.** A retried or duplicate `Create` cannot put two sandboxes on one VMM. The partial unique index `idx_firecracker_vmm_pool_sandbox` (in `internal/store/store.go`) allows exactly one `allocated` row per sandbox. Taking a slot is a guarded `SELECT` then `UPDATE`, run by the database's single writer.
+- **Cleanup runs last-in, first-out.** Everything `Create` takes (TAP slot, host TAP, overlay file, warm VMM) is released in reverse order on any failure. A slot that fails to resume moves back to `released`, so the cleanup sweep tears down the dead VMM. It never stays `allocated` without an owner.
 
 ## What is shared, and what is not
 
-Sharing read-only state across sandboxes is where high density comes from. The
-table below is what AerolVM actually does today on a single host:
+This section lists what sandboxes on one host share. Sharing read-only data is where high density (many sandboxes per host) comes from. The table shows what AerolVM does today on a single host:
 
-| Asset | Shared across sandboxes? | Mechanism |
+| What | Shared across sandboxes? | How |
 |---|---|---|
-| Guest kernel (`vmlinux`) | Yes, read-only | One image on disk; every jailer chroot references it. |
-| Template `rootfs.ext4` (snapshot/warm clones) | Yes, RO backing file | Hard-linked into each sandbox's jailer chroot (copy fallback across filesystems via `linkOrCopyRootfs` at `driver.go`); mounted `IsReadOnly=true` (`snapshot.go:227`); guest writes go to the overlay if the guest mounts it. |
-| Cold-boot rootfs (no template) | No | Per-sandbox `mkfs.ext4`, mounted `IsReadOnly=false` (`driver.go:817`). No "shared" rootfs concept on this path. |
-| Writable overlay | No | Each sandbox gets its own sparse `overlay.ext4`; real blocks are allocated only on write. |
-| Guest memory - snapshot/warm clones | Unmodified pages: yes, via kernel CoW | The template's `snapshot.memory` is `mmap`'d `MAP_PRIVATE` by Firecracker; unmodified pages stay shared in the host page cache. See [Memory](#memory-private-mappings-and-kernel-cow). |
-| Guest memory - cold boot | No | A cold-booted VM has no shared base; it reserves its `memoryMB` fresh. |
-| Snapshot artifacts | Yes, as source | One `snapshot.memory` / `snapshot.state` per template feeds every restore and every warm-pool spawn. |
+| Guest kernel (`vmlinux`) | Yes, read-only | One image on disk; every jailer chroot (the private file tree each VM runs in) refers to it. |
+| Template `rootfs.ext4` (snapshot and warm clones) | Yes, as a read-only backing file | Hard-linked into each sandbox's jailer chroot, with a copy fallback across file systems (`linkOrCopyRootfs` in `driver.go`). Mounted `IsReadOnly=true` (in `snapshot.go`). Guest writes go to the overlay, if the guest mounts it. |
+| Cold-boot rootfs (no template) | No | Each sandbox gets its own `mkfs.ext4` image, mounted `IsReadOnly=false` (in `driver.go`). This path has no shared rootfs. |
+| Writable overlay | No | Each sandbox gets its own sparse `overlay.ext4`. Real disk blocks are used only when the guest writes. |
+| Guest memory, snapshot and warm clones | Unchanged pages: yes, through kernel copy-on-write | Firecracker maps the template's `snapshot.memory` with `MAP_PRIVATE`. Unchanged pages stay shared in the host page cache. See [How clones share memory](#how-clones-share-memory-copy-on-write). |
+| Guest memory, cold boot | No | A cold-booted VM has no shared base. It reserves its `memoryMB` fresh. |
+| Snapshot files | Yes, as the source | One `snapshot.memory` and one `snapshot.state` per template feed every restore and every warm-pool start. |
 
-AerolVM shares the read-only inputs (kernel, rootfs, snapshot) and the
-unmodified guest pages of same-template clones. Each clone keeps private its
-overlay blocks and the anonymous pages allocated when it writes to a previously
-shared guest page. A cold-booted, template-less sandbox has no sharing.
+AerolVM shares the read-only inputs (kernel, rootfs, snapshot) and the unchanged guest pages of clones from the same template. Each clone keeps its own overlay blocks. It also keeps the anonymous pages made when it writes to a shared guest page. (An **anonymous page** is memory that no file backs.)
 
-This sharing model assumes a single-tenant host or a trusted-tenant
-deployment. See [Limitations](#limitations-and-gaps) for the side-channel
-surface and our KSM stance.
+A cold-booted sandbox with no template shares nothing.
 
-## Memory: private mappings and kernel CoW
+This sharing model assumes the host serves a single tenant (customer), or tenants that trust each other. See [Limitations](#limitations-and-gaps) for the side-channel risk and our stance on KSM.
 
-The single largest source of density is that clones of the same template share
-their unmodified guest memory. The mechanism is plain `MAP_PRIVATE`, not a
-userspace bitmap.
+## How clones share memory (copy-on-write)
 
-Per [Firecracker upstream][fc-snap]: with the File memory backend, Firecracker
-creates a `MAP_PRIVATE` mapping of the memory file and subsequent guest writes
-go to a copy-on-write anonymous memory mapping. We use the File backend on
-every load path (`internal/runtime/firecracker/driver.go:895-896`,
-`warmspawn.go:189-191`, `sandbox_snapshot.go:450-451`).
+This section explains the biggest reason one host can fit many clones. Clones of the same template share their unchanged guest memory. The mechanism is plain `MAP_PRIVATE`, not a bitmap kept by a user program.
 
-The first time the guest writes a page:
+[Firecracker's own docs][fc-snap] describe this. With the File memory backend, Firecracker maps the memory file with `MAP_PRIVATE`. Later guest writes go to a **copy-on-write** (CoW) anonymous memory mapping. We use the File backend on every load path (in `driver.go`, `warmspawn.go` and `sandbox_snapshot.go`).
 
-1. The MMU traps the write because the PTE is read-only.
-2. The kernel's CoW fault handler allocates an anonymous page, copies the
-   file's contents into it, and remaps the page private to that VM.
-3. The write completes against private anon memory; the shared file is never
-   modified.
+The first time the guest writes to a page:
 
-From then on, writes hit private memory; unmodified pages stay shared in the
-host's page cache. The host keeps one physical copy of every page no clone has
-dirtied.
+1. The MMU (the CPU's memory-mapping unit) traps the write, because the page-table entry is read-only.
+2. The kernel's CoW fault handler allocates an anonymous page, copies the file's contents into it, and maps that page privately for this VM.
+3. The write finishes in private memory. The shared file is never changed.
+
+From then on, writes to that page go to private memory. Unchanged pages stay shared in the host's **page cache** (the kernel's in-memory copy of file data). The host keeps one physical copy of every page that no clone has changed.
 
 ```mermaid
 graph TB
@@ -248,218 +214,200 @@ graph TB
     BASE --> C3["clone C<br/>shared pages + CoW anon pages (C's writes)"]
 ```
 
-### What `track_dirty_pages` actually does (and what it costs)
+### What `track_dirty_pages` does, and what it costs
 
-We also set `track_dirty_pages=true` and `enable_diff_snapshots=true` on every
-load (`driver.go:800`, `snapshot.go:206`, `warmspawn.go:193`). These do not
-cause the CoW: the kernel already does. They tell KVM to keep a dirty-page log
-so Firecracker can later emit a diff snapshot containing only the pages a clone
-wrote since restore.
+This section covers a related flag that is easy to confuse with copy-on-write. We also set `track_dirty_pages=true` and `enable_diff_snapshots=true` on every load (in `driver.go`, `snapshot.go` and `warmspawn.go`). These do not cause the copy-on-write; the kernel already does that.
 
-Per [Firecracker upstream][fc-snap]: enabling dirty page tracking incurs a
-runtime cost - KVM write-protects pages and the first write to each clean page
-generates a VM exit. We pay that cost on every clone today, even clones that
-will never be re-snapshotted, for uniformity with template VMs (the driver
-comment at `driver.go:796-800` calls this out).
+They tell **KVM** (the Linux kernel's hardware virtualization) to keep a log of dirty, or changed, pages. Firecracker can then write a diff snapshot that holds only the pages a clone changed since restore.
 
-The dirty log is also the foundation for incremental snapshots. The
-infrastructure is on; a user-facing diff-snapshot API is not shipping yet
-(see [Limitations](#limitations-and-gaps)).
+[Firecracker's docs][fc-snap] say dirty-page tracking has a runtime cost. KVM write-protects pages, and the first write to each clean page causes a VM exit (a trip from the guest back to the host). We pay that cost on every clone today, even clones that will never be snapshotted again.
+
+We do it so clones behave the same as template VMs, as a comment in `driver.go` notes. The dirty log is also the base for incremental snapshots. The groundwork is on, but a user-facing diff-snapshot API is not shipping yet (see [Limitations](#limitations-and-gaps)).
 
 ### Capacity accounting
 
-A clone's *reserved* `memoryMB` overstates its real footprint once pages are
-shared. AerolVM's per-VM RSS sampler walks `/proc/<pid>/statm`
-(`internal/runtime/firecracker/rss_sampler.go`) and the capacity admitter
-(`pkg/capacity/capacity.go`) consumes that signal so admission decisions
-reflect actual physical pages, not reserved size.
+This section covers how the host counts memory once pages are shared. A clone's *reserved* `memoryMB` then overstates what it really uses. AerolVM's per-VM RSS sampler reads `/proc/<pid>/statm` (in `internal/runtime/firecracker/rss_sampler.go`). **RSS**, or resident set size, is the physical memory a process really holds.
 
-## Operational knobs
+The capacity admitter (`pkg/capacity/capacity.go`) uses that number. So the check that decides whether a host has room is based on real physical pages, not reserved size.
 
-Defaults aim for a single-node install where the warm pool is opt-in. Cluster
-operators tune depth up after sizing snapshot RAM against host capacity.
+## Settings for server operators
 
-| Setting | Env | Effect |
+This section lists the server settings that control Firecracker and the warm pool. The defaults suit a single-node install, where the warm pool is opt-in. Cluster operators raise the depth after sizing snapshot memory against host capacity.
+
+| Setting | Environment variable | What it does |
 |---|---|---|
-| Enable runtime | `SB_ENABLE_FIRECRACKER` | Construct the Firecracker driver alongside Docker. |
+| Turn on the runtime | `SB_ENABLE_FIRECRACKER` | Builds the Firecracker driver alongside Docker. |
 | Kernel image | `SB_FIRECRACKER_KERNEL` | Path to the `vmlinux` every microVM boots. |
-| TAP pool | `SB_FIRECRACKER_TAP_BASE_CIDR` / `SB_FIRECRACKER_TAP_POOL_SIZE` | The `/30` layout and the concurrent-sandbox cap. |
-| Jailer | `SB_FIRECRACKER_USE_JAILER` | Wrap each VM in chroot + cgroups + privilege drop (default on; dev/CI can disable). |
-| Overlay drive | `SB_FIRECRACKER_OVERLAY_ENABLED` / `SB_FIRECRACKER_OVERLAY_MKFS` | Allow per-sandbox writable overlays, and optionally pre-format them. |
-| Template GC | `SB_FIRECRACKER_TEMPLATE_GC_ENABLED` | Sweep stale template artifacts. |
-| **Warm pool master switch** | `SB_FIRECRACKER_VMM_POOL_ENABLED` | Off by default (`internal/config/config.go:1157`). Without this set, every `Create` takes the snapshot-load path. |
-| Warm pool default depth | `SB_FIRECRACKER_VMM_POOL_DEPTH_DEFAULT` | Slots to keep ready per template. Default `0` (`config.go:1158`); a per-template override is planned but not shipping (`config.go:548-553`). |
-| Warm pool refill cadence | `SB_FIRECRACKER_VMM_POOL_REFILL_INTERVAL` | How often the refill goroutine tops slots up. Default 5s. |
-| Warm pool GC cadence | `SB_FIRECRACKER_VMM_POOL_GC_INTERVAL` | How often the GC sweep walks released rows. Default 5m. |
-| Warm pool GC TTL | `SB_FIRECRACKER_VMM_POOL_GC_TTL` | How long a released row sits before GC drops it. Default 1h. |
+| TAP pool | `SB_FIRECRACKER_TAP_BASE_CIDR` and `SB_FIRECRACKER_TAP_POOL_SIZE` | The `/30` layout, and the limit on sandboxes running at once. |
+| Jailer | `SB_FIRECRACKER_USE_JAILER` | Wraps each VM in a chroot, cgroups (resource limits) and a switch to a non-root user. On by default; dev and CI can turn it off. |
+| Overlay drive | `SB_FIRECRACKER_OVERLAY_ENABLED` and `SB_FIRECRACKER_OVERLAY_MKFS` | Allows per-sandbox writable overlays, and can format them ahead of time. |
+| Template cleanup | `SB_FIRECRACKER_TEMPLATE_GC_ENABLED` | Sweeps away stale template files. |
+| Snapshot check | `SB_FIRECRACKER_SNAPSHOT_VERIFY_ON_LOAD` and `SB_FIRECRACKER_SNAPSHOT_VERIFY_MODE` | Checks snapshot files against their checksum before each load. On by default. Mode `once` (the default) caches the result per server start and file; `always` re-hashes on every create. |
+| **Warm pool on or off** | `SB_FIRECRACKER_VMM_POOL_ENABLED` | Off by default. When it is off, every `Create` takes the snapshot-load path. |
+| Warm pool default depth | `SB_FIRECRACKER_VMM_POOL_DEPTH_DEFAULT` | How many slots to keep ready per template. Default `0`. A per-template override is planned but not shipping. |
+| Warm pool refill interval | `SB_FIRECRACKER_VMM_POOL_REFILL_INTERVAL` | How often the refill goroutine tops slots up. Default 5s. |
+| Warm pool cleanup interval | `SB_FIRECRACKER_VMM_POOL_GC_INTERVAL` | How often the cleanup sweep walks released rows. Default 5m. |
+| Warm pool cleanup TTL | `SB_FIRECRACKER_VMM_POOL_GC_TTL` | How long a released row waits before the sweep drops it. Default 1h. |
 
-To actually use the warm pool today: set
-`SB_FIRECRACKER_VMM_POOL_ENABLED=true` and
-`SB_FIRECRACKER_VMM_POOL_DEPTH_DEFAULT=N` for some `N > 0`. The per-template
-depth override is not yet wired into the public template API.
+To use the warm pool today, set `SB_FIRECRACKER_VMM_POOL_ENABLED=true` and `SB_FIRECRACKER_VMM_POOL_DEPTH_DEFAULT=N`, where `N` is more than 0. The per-template depth setting is not wired into the public template API yet.
 
-## Building a template
+## Build a template
 
-Everything above hangs off a template. Registering one builds the
-`rootfs.ext4`, captures the snapshot, and (with depth configured and the pool
-enabled) lets the warm pool start pre-spawning. The build is asynchronous: the
-call returns immediately and the template moves through `pending →
-building_rootfs → snapshotting → ready`.
+This section shows how to register the template everything above depends on. Registering one builds the `rootfs.ext4` and captures the snapshot. If the warm pool is on and has a depth, the pool then starts preparing paused VMs for it.
+
+The build runs in the background. The call returns at once, and the template moves through `pending`, `building_rootfs`, `snapshotting` and then `ready`.
+
+Creating a sandbox from a template needs the template id on the create call: `templateId` in TypeScript and Python, `TemplateID` in Go, `template_id` in Rust and `setTemplateId` in Java.
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
     ```ts
-    const tpl = await microvm.createTemplate({
-      id: 'py311',
-      image: 'docker://python:3.11',
-      minSizeMiB: 1024,
-    })
-    console.log(tpl.id, tpl.status) // "py311" "pending"
+    import { MicroVM } from "@aerol-ai/aerolvm-sdk";
 
-    // After the template is ready, every Create against it goes
-    // through the warm path if the pool has depth.
-    const sb = await microvm.createSandbox({ templateId: 'py311' })
+    const client = new MicroVM(); // reads SB_API_URL and SB_PAT_TOKEN
+
+    const tpl = await client.createTemplate({
+      id: "py311",
+      image: "docker://python:3.11",
+      minSizeMiB: 1024,
+    });
+    console.log(tpl.id, tpl.status); // py311 pending
+
+    // After the template is ready, every create against it takes the
+    // snapshot path, and the warm path if the pool has depth.
+    const sandbox = await client.create({
+      image: "python:3.11",
+      runtime: "firecracker",
+      templateId: "py311",
+    });
+    console.log(sandbox.id);
     ```
   </TabItem>
   <TabItem label="Python">
     ```python
-    tpl = microvm.create_template({
-        'id': 'py311',
-        'image': 'docker://python:3.11',
-        'minSizeMiB': 1024,
-    })
-    print(tpl['id'], tpl['status'])  # "py311" "pending"
+    from microvm import MicroVM
 
-    sb = microvm.create_sandbox({'templateId': 'py311'})
+    client = MicroVM()  # reads SB_API_URL and SB_PAT_TOKEN
+
+    tpl = client.create_template({
+        "id": "py311",
+        "image": "docker://python:3.11",
+        "minSizeMiB": 1024,
+    })
+    print(tpl["id"], tpl["status"])  # py311 pending
+
+    # After the template is ready, every create against it takes the
+    # snapshot path, and the warm path if the pool has depth.
+    sandbox = client.create(image="python:3.11", runtime="firecracker", templateId="py311")
+    print(sandbox.id)
     ```
   </TabItem>
   <TabItem label="Go">
     ```go
     tpl, err := client.CreateTemplate(ctx, sdktypes.CreateTemplateOptions{
-        ID: "py311", Image: "docker://python:3.11", MinSizeMiB: 1024,
+        ID:         "py311",
+        Image:      "docker://python:3.11",
+        MinSizeMiB: 1024,
     })
     if err != nil {
         log.Fatal(err)
     }
-    fmt.Println(tpl.ID, tpl.Status) // "py311" "pending"
+    fmt.Println(tpl.ID, tpl.Status) // py311 pending
 
-    sb, err := client.CreateSandbox(ctx, sdktypes.CreateSandboxOptions{
+    // After the template is ready, every create against it takes the
+    // snapshot path, and the warm path if the pool has depth.
+    sandbox, err := client.Create(ctx, sdktypes.CreateSandboxOptions{
+        Image:      "python:3.11",
+        Runtime:    sdktypes.RuntimeFirecracker,
         TemplateID: "py311",
     })
+    if err != nil {
+        log.Fatal(err)
+    }
+    fmt.Println(sandbox.ID)
     ```
   </TabItem>
   <TabItem label="Rust">
     ```rust
+    use aerolvm_sdk::{Client, CreateOptions, CreateTemplateOptions};
+
+    let client = Client::new(None, None)?; // reads SB_API_URL and SB_PAT_TOKEN
+
     let tpl = client.create_template(CreateTemplateOptions {
         id: Some("py311".into()),
         image: "docker://python:3.11".into(),
         min_size_mib: Some(1024),
     })?;
-    println!("{} {:?}", tpl.id, tpl.status); // "py311" Pending
+    println!("{} {:?}", tpl.id, tpl.status); // py311 Pending
 
-    let sb = client.create_sandbox(CreateSandboxOptions {
+    // After the template is ready, every create against it takes the
+    // snapshot path, and the warm path if the pool has depth.
+    let sandbox = client.create(CreateOptions {
+        image: "python:3.11".into(),
+        runtime: Some("firecracker".into()),
         template_id: Some("py311".into()),
         ..Default::default()
     })?;
+    println!("{}", sandbox.data.id);
     ```
   </TabItem>
   <TabItem label="Java">
     ```java
+    MicroVMClient client = new MicroVMClient(); // reads SB_API_URL and SB_PAT_TOKEN
+
     Template tpl = client.createTemplate(new CreateTemplateOptions()
         .setId("py311")
         .setImage("docker://python:3.11")
         .setMinSizeMib(1024));
-    System.out.println(tpl.id + " " + tpl.status); // "py311" PENDING
+    System.out.println(tpl.id + " " + tpl.status); // py311 PENDING
 
-    Sandbox sb = client.createSandbox(new CreateSandboxOptions()
+    // After the template is ready, every create against it takes the
+    // snapshot path, and the warm path if the pool has depth.
+    Sandbox sandbox = client.create(new CreateOptions()
+        .setImage("python:3.11")
+        .setRuntime("firecracker")
         .setTemplateId("py311"));
+    System.out.println(sandbox.id);
     ```
   </TabItem>
 </Tabs>
 
-Once the template is `ready`, sandbox creates against it restore from the
-snapshot, and if the warm pool has depth, claim an already-loaded VMM. See
-[Firecracker Templates](/firecracker-templates) for the full template lifecycle
-(polling, rebuilds, cluster replication).
+Once the template is `ready`, sandboxes created from it restore from the snapshot. If the warm pool has depth, they take an already-loaded VMM. See [Firecracker templates](/firecracker-templates/) for the full template lifecycle: waiting for `ready`, rebuilds and copies across a cluster.
 
 ## Limitations and gaps
 
-A short list of things this page deliberately does not over-claim.
+This section lists what this page does not claim. Keep these in mind before you depend on the warm path.
 
-- **No published benchmarks.** Numbers like "sub-100ms" or "~150ms" in the
-  driver source (`warmacquire.go:7`, `vmm.go:42`, `warmspawn.go:152`) are
-  written against internal timeouts on a healthy host, not measured P50/P95/P99
-  on a named instance class with a stated workload. Treat them as upper-bound
-  intent, not measurement.
-- **Cold-cache vs warm-cache restore.** The fast restore path assumes
-  `snapshot.memory` is already in the host page cache. The first restore after
-  a host reboot will fault every touched page from disk; on a multi-GB
-  snapshot that can be seconds, not milliseconds.
-- **Warm pool off by default.** See [Operational knobs](#operational-knobs).
-- **Per-template warm-pool depth.** Only the global default
-  (`SB_FIRECRACKER_VMM_POOL_DEPTH_DEFAULT`) is wired today. The per-template
-  override referenced in `config.go:548-553` is a planned follow-up.
-- **There is an entropy window before `post_resume` lands.** Reseed itself
-  ships (`cmd/toolboxd/vsock.go:247` calls `ReseedRandom` on every
-  `post_resume`), but the window between `Action(Resume)` and the agent's ack
-  is hundreds of milliseconds on a slow host. Anything that runs in that window
-  (init scripts, systemd units, the agent's own startup) draws from the
-  template's captured entropy pool. Any in-guest CSPRNG that pins state at
-  process start (TLS handshake nonces, session keys, IDs derived without
-  re-reading `/dev/urandom`) before the ack **will** repeat values across
-  clones of the same template. Templates AerolVM ships defer key generation
-  until after the agent signals quiesce-complete.
-- **`CLOCK_MONOTONIC` is not reset.** `post_resume` only nudges
-  `CLOCK_REALTIME`. Workloads that pin monotonic deadlines across the snapshot
-  boundary will see a long forward jump in elapsed time. This is a known
-  Firecracker behavior, not a bug we own.
-- **Best-effort `post_resume`.** If the vsock send fails, the driver logs and
-  continues (`warmacquire.go:233-234`, `sandbox_snapshot.go:425`). The guest
-  then keeps the snapshot's stale wallclock until something else corrects it.
-- **Huge pages are not enabled.** The `HugePages` field on `MachineConfig`
-  (`pkg/firecracker/types.go:32`) is never set anywhere in
-  `internal/runtime/firecracker/`. Per [Firecracker upstream][fc-huge],
-  huge-page-backed snapshots restore only via UFFD (we use File), and dirty
-  page tracking negates the TLB win because KVM falls back to 4K page tables.
-  All three would need to change together. (The lingering comment in
-  `types.go:25-26` is out of date and should be ignored.)
-- **UFFD memory backend is not enabled.** The File backend handles faults via
-  the kernel. UFFD would let userspace control faulting (prefetch, pre-warm,
-  remote paging) but is not wired today.
-- **Diff snapshot API is not user-facing.** The plumbing
-  (`track_dirty_pages=true`, `enable_diff_snapshots=true`) is on; there is no
-  public endpoint to *take* a diff snapshot of a running sandbox today.
-- **Secrets must not live in the template snapshot.** `post_resume` carries no
-  secret payload. Per-sandbox secrets must be injected through a separate path
-  (cluster sealed-secret machinery in `pkg/secrets/` and
-  `internal/cluster/recovery_replication.go`), not baked into
-  `snapshot.memory`, which is shared across every clone.
-- **Snapshot integrity is not authenticity.** The checksum verify on load
-  (`warmspawn.go:172-179`, `driver.go:888-892`, gated on
-  `SB_FIRECRACKER_SNAPSHOT_VERIFY_ON_LOAD`) catches a corrupt memory file
-  before mmap. It does not defend against a tenant who can write to the
-  snapshot directory and produce a matching checksum.
-- **Shared CoW pages are a tenant-isolation concern.** Two tenants whose VMs
-  derive from the same template share physical RAM for every page neither has
-  written. Rowhammer, flush+reload, and prime+probe apply across `MAP_PRIVATE`
-  pages until one side dirties them. AerolVM does **not** enable KSM (kernel
-  same-page merging) and assumes single-tenant per host or a trusted-tenant
-  deployment. Multi-tenant operators should pin templates per-tenant or
-  disable warm-pool sharing across tenants.
-- **Network identity is baked in at template build.** Every clone resumes with
-  the same guest MAC and guest IP as the template's transient build VM. This
-  is safe because each TAP slot lives on its own `/30` (host TAP and guest are
-  point-to-point); ARP cannot collide across slots. The host-side `HostDevName`
-  is what we PATCH per acquire (`warmacquire.go:192-197`), not the MAC.
-- **Vsock CID is also baked in.** `warmacquire.go:218-225` dials `slot.VsockCID`
-  (the snapshot's CID, captured at template build), not the per-sandbox TAP
-  slot CID. Differentiation across clones happens host-side on the AF_VSOCK
-  socket file path, not on the guest CID.
-- **Single-host CPU template only.** Firecracker is strict about CPU/MSR
-  compatibility when restoring on a host different from the one that captured
-  the snapshot. The cluster snapshot transfer path
-  (`internal/cluster/recovery_replication.go`) does not paper over CPU
-  drift; restores to a host with a different CPU template are not supported.
+- **No published benchmarks.** Numbers like "sub-100ms" or "~150ms" in the driver source (`warmacquire.go`, `vmm.go`, `warmspawn.go`) come from internal timeouts on a healthy host. They are not measured P50, P95 or P99 times (the median, 95th and 99th percentile) on a named instance type with a stated workload. Treat them as upper-bound goals, not measurements.
+- **Cold-cache versus warm-cache restore.** The fast restore path assumes `snapshot.memory` is already in the host's page cache. The first restore after a host reboot loads every touched page from disk. On a multi-GB snapshot that can take seconds, not milliseconds.
+- **Warm pool off by default.** See [Settings for server operators](#settings-for-server-operators).
+- **Per-template warm-pool depth.** Only the global default (`SB_FIRECRACKER_VMM_POOL_DEPTH_DEFAULT`) works today. The per-template override mentioned in `config.go` is planned for later.
+- **There is a randomness gap before `post_resume` lands.** The reseed itself ships: `cmd/toolboxd/vsock.go` calls `ReseedRandom` on every `post_resume`. But the time between the resume call and the agent's reply is hundreds of milliseconds on a slow host. Anything that runs in that window draws from the template's captured **entropy pool** (the kernel's store of unpredictable bits). That includes init scripts, systemd units and the agent's own startup.
+- **Some in-guest random generators will repeat values.** A **CSPRNG** (cryptographically secure random-number generator) inside the guest may fix its state when its process starts. If that happens before the reply, it **will** repeat values across clones of the same template. Examples are TLS handshake nonces (TLS is the encryption behind HTTPS), session keys, and IDs made without re-reading `/dev/urandom`. Templates AerolVM ships put off key generation until `post_resume` has finished.
+- **`CLOCK_MONOTONIC` is not reset.** `post_resume` only adjusts `CLOCK_REALTIME`. Workloads that hold monotonic deadlines across the snapshot will see a long forward jump in elapsed time. This is known Firecracker behavior, not a bug in AerolVM.
+- **`post_resume` is best-effort.** If the vsock send fails, the driver logs it and goes on (in `warmacquire.go` and `sandbox_snapshot.go`). The guest then keeps the snapshot's stale wall clock until something else corrects it.
+- **Huge pages are not turned on.** Huge pages are memory pages much larger than the usual 4 KiB, which means fewer entries in the TLB (the CPU's cache of address translations). The `HugePages` field on `MachineConfig` (`pkg/firecracker/types.go`) is never set anywhere in `internal/runtime/firecracker/`. [Firecracker's docs][fc-huge] say huge-page snapshots restore only through UFFD, and we use File. Dirty-page tracking also cancels the TLB gain, because KVM falls back to 4K page tables. All three would need to change together.
+
+  The older comment above `MachineConfig` in `types.go` is out of date; ignore it.
+- **The UFFD memory backend is not turned on.** With the File backend, the kernel handles page faults. UFFD would let a user program control faulting (prefetch, pre-warm, remote paging), but it is not wired up today.
+- **The diff-snapshot API is not public.** The groundwork (`track_dirty_pages=true`, `enable_diff_snapshots=true`) is on. But there is no public endpoint to *take* a diff snapshot of a running sandbox today.
+- **Secrets must not live in the template snapshot.** `post_resume` carries no secrets. Per-sandbox secrets must arrive by a separate path: the cluster's sealed-secret system in `pkg/secrets/` and `internal/cluster/recovery_replication.go`. Never bake them into `snapshot.memory`, which every clone shares.
+- **Snapshot integrity is not authenticity.** The checksum check on load catches a corrupt memory file before it is mapped. It lives in `warmspawn.go` and `driver.go`, and is switched by `SB_FIRECRACKER_SNAPSHOT_VERIFY_ON_LOAD` (on by default). It does not stop a tenant who can write to the snapshot folder and produce a matching checksum.
+- **Shared copy-on-write pages are a tenant-isolation concern.** Two tenants whose VMs come from the same template share physical RAM for every page neither has written. Rowhammer, flush+reload and prime+probe attacks work across `MAP_PRIVATE` pages until one side writes them.
+
+  These attacks read or flip another program's memory through shared hardware. AerolVM does **not** turn on KSM (kernel same-page merging, which merges identical pages across processes). It assumes one tenant per host, or tenants that trust each other. Multi-tenant operators should give each tenant its own templates, or turn off warm-pool sharing across tenants.
+- **The guest MAC is fixed when the template is built.** Every clone resumes with the same guest MAC and guest IP as the template's temporary build VM. `post_resume` then gives the guest this sandbox's own IP and gateway from its TAP slot. The MAC stays the template's, so the host points the TAP's neighbor entry at the template MAC (`hostSlot.GuestMAC` in `driver.go`).
+
+  This is safe because each TAP slot has its own `/30`: a point-to-point link between the host TAP and the guest. So ARP (the table that maps IP addresses to network cards) cannot collide across slots. What changes per sandbox at the Firecracker level is the host-side `HostDevName`, not the MAC. It is set by the network override in `LoadSnapshot`, in `driver.go` and in `warmspawn.go` for warm VMs.
+- **The vsock CID is also fixed.** `warmacquire.go` dials `slot.VsockCID`, which here is the snapshot's CID, captured at template build. It is not the sandbox's TAP slot CID. Clones are told apart on the host side, by the path of the `AF_VSOCK` socket file, not by the guest CID.
+- **Restores need the same CPU template.** Firecracker is strict about CPU and MSR (model-specific register) compatibility when you restore on a different host from the one that took the snapshot. The cluster's snapshot transfer path (`internal/cluster/recovery_replication.go`) does not hide CPU differences. Restoring to a host with a different CPU template (Firecracker's CPU feature profile) is not supported.
+
+## Next steps
+
+- [Firecracker architecture](/firecracker-architecture/): the boot path these pools plug into.
+- [Firecracker templates](/firecracker-templates/): register, wait for and rebuild templates.
+- [Correct snapshot clones](/engineering-snapshot-correctness/): the five hazards of cloning a running VM, and how AerolVM handles each.
+- [The frozen-kernel problem](/engineering-frozen-kernel-problem/): how clones get unique randomness and the right clock.
 
 [fc-snap]: https://github.com/firecracker-microvm/firecracker/blob/main/docs/snapshotting/snapshot-support.md
 [fc-huge]: https://github.com/firecracker-microvm/firecracker/blob/main/docs/hugepages.md

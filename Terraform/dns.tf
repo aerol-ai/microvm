@@ -1,10 +1,19 @@
 ###############################################################################
 # Cloudflare DNS for the cluster's public ingress.
 #
-# One A record per ingress-bearing node points at <domain_name>; an optional
-# wildcard *.<domain_name> repeats the same set. DNS round-robin gives basic
-# failover; for true LB use Cloudflare Spectrum / an NLB and point a single
-# A record at it instead.
+# api_load_balancer = "none": one A record per ingress-bearing node points at
+# <domain_name>, and an optional wildcard *.<domain_name> repeats the same
+# set. DNS round-robin gives basic failover only: a node whose sandboxd is
+# down still answers the handshakes, so its share of clients get 502.
+#
+# api_load_balancer = "nlb": <domain_name> and the wildcard get ONE A record,
+# the load balancer's Elastic IP (load_balancer.tf), and tcp.<domain_name>
+# keeps one A record per ingress node for the raw-TCP port pool, which an NLB
+# cannot carry. A records, not a CNAME to the balancer's DNS name: Cloudflare
+# refuses a CNAME on a name that still has A records, so a switch would have
+# to delete them first and leave the name unresolvable in between, and
+# resolvers would cache that for the zone's negative TTL. A records for the
+# same name coexist, so the switch has no gap in either direction.
 #
 # Zone resolution: var.cloudflare_zone_id wins if set. Otherwise we derive the
 # zone name from cluster.yml's ingress.domain_name by stripping the first
@@ -32,6 +41,12 @@ locals {
   # set a domain, so has_domain is true there and every resource below renders
   # exactly as before — a zero-diff change for prod.
   has_domain = local.domain_name != ""
+
+  # What <domain_name> and its wildcard point at. With the balancer off this
+  # is ingress_ip_by_node itself, so the records, their keys and their
+  # comments are exactly what they were: an existing deployment plans no
+  # change.
+  ingress_dns_targets = local.api_lb_enabled ? { lb = aws_eip.api_lb[0].public_ip } : local.ingress_ip_by_node
 }
 
 data "cloudflare_zones" "lookup" {
@@ -51,7 +66,7 @@ locals {
 }
 
 resource "cloudflare_record" "apex" {
-  for_each = local.has_domain ? local.ingress_ip_by_node : {}
+  for_each = local.has_domain ? local.ingress_dns_targets : {}
 
   zone_id = local.effective_zone_id
   name    = local.domain_name
@@ -63,7 +78,7 @@ resource "cloudflare_record" "apex" {
 }
 
 resource "cloudflare_record" "wildcard" {
-  for_each = local.has_domain && var.create_wildcard_record ? local.ingress_ip_by_node : {}
+  for_each = local.has_domain && var.create_wildcard_record ? local.ingress_dns_targets : {}
 
   zone_id = local.effective_zone_id
   name    = "*.${local.domain_name}"
@@ -72,4 +87,21 @@ resource "cloudflare_record" "wildcard" {
   ttl     = var.cloudflare_record_ttl
   proxied = var.cloudflare_proxied
   comment = "AerolVM ${var.cluster_name} wildcard ingress (${each.key})"
+}
+
+# Raw-TCP exposures behind the load balancer: tcp://tcp.<domain_name>:<port>
+# reaches the ingress nodes directly, as tcp://<domain_name>:<port> did
+# before. Never proxied: Cloudflare's proxy does not carry raw TCP. An
+# explicit name wins over the wildcard, so it does not resolve to the
+# balancer.
+resource "cloudflare_record" "l4_direct" {
+  for_each = local.l4_direct_host != "" ? local.ingress_ip_by_node : {}
+
+  zone_id = local.effective_zone_id
+  name    = local.l4_direct_host
+  type    = "A"
+  content = each.value
+  ttl     = var.cloudflare_record_ttl
+  proxied = false
+  comment = "AerolVM ${var.cluster_name} raw TCP, direct to ingress (${each.key})"
 }

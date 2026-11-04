@@ -52,7 +52,7 @@ func TestClusterListCallerKeyScopesTenants(t *testing.T) {
 		t.Fatalf("unscoped = %q", got)
 	}
 	op := httptest.NewRequest(http.MethodGet, "/", nil)
-	op = op.WithContext(controlplane.ContextWithAccess(op.Context(), controlplane.Access{Operator: true, Identity: controlplane.Identity{OwnerRef: "acme"}}))
+	op = op.WithContext(controlplane.ContextWithAccess(op.Context(), controlplane.Access{Fleet: true, Identity: controlplane.Identity{OwnerRef: "acme"}}))
 	if got := clusterListCallerKey(op); got != "operator" {
 		t.Fatalf("operator = %q", got)
 	}

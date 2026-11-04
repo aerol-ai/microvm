@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -67,7 +68,7 @@ func TestConfigureAOCRPullAuthGuard_NoPanic(t *testing.T) {
 	logger := testLogger()
 
 	// Empty config: must short-circuit before touching the client.
-	configureAOCRPullAuth(logger, config.Config{}, &docker.Client{})
+	configureAOCRPullAuth(logger, config.Config{}, models.ContainerEngineDocker, &docker.Client{})
 
 	// Fully configured: writes node-local pull auth onto the client. The
 	// behavior of the resolver itself is covered in pkg/docker; here we only
@@ -81,7 +82,65 @@ func TestConfigureAOCRPullAuthGuard_NoPanic(t *testing.T) {
 		AutoImportClusterPATPath:  patPath,
 		MirrorPushHost:            "aocr.aerol.ai",
 		ImageDistributionAOCRHost: "aocr.aerol.ai",
-	}, &docker.Client{})
+	}, models.ContainerEngineDocker, &docker.Client{})
+}
+
+// recordingAOCRConfigurer captures what configureAOCRPullAuth hands an engine,
+// so the test can pin the shared host/cluster/PAT inputs without reaching into
+// either engine's unexported state.
+type recordingAOCRConfigurer struct {
+	calls     int
+	hosts     []string
+	clusterID string
+	patPath   string
+}
+
+func (r *recordingAOCRConfigurer) ConfigureAOCRPullAuth(hosts []string, clusterID, patPath string) {
+	r.calls++
+	r.hosts = append([]string(nil), hosts...)
+	r.clusterID = clusterID
+	r.patPath = patPath
+}
+
+func TestConfigureAOCRPullAuth_EngineInputs(t *testing.T) {
+	cases := []struct {
+		name      string
+		cfg       config.Config
+		wantCalls int
+		wantHosts []string
+	}{
+		{"empty config is a no-op", config.Config{}, 0, nil},
+		{"cluster id without PAT path is a no-op", config.Config{AutoImportClusterID: "c1"}, 0, nil},
+		{"PAT path without cluster id is a no-op", config.Config{AutoImportClusterPATPath: "/etc/pat"}, 0, nil},
+		{
+			"push host and distribution host both passed, trimmed ids",
+			config.Config{
+				AutoImportClusterID:       "  prod-aerolvm-us-east-1 ",
+				AutoImportClusterPATPath:  " /etc/sandboxd/cluster-pat ",
+				MirrorPushHost:            "push.aocr.aerol.ai",
+				ImageDistributionAOCRHost: "aocr.aerol.ai",
+			},
+			1, []string{"push.aocr.aerol.ai", "aocr.aerol.ai"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := &recordingAOCRConfigurer{}
+			configureAOCRPullAuth(testLogger(), tc.cfg, models.ContainerEngineContainerd, r)
+			if r.calls != tc.wantCalls {
+				t.Fatalf("calls = %d, want %d", r.calls, tc.wantCalls)
+			}
+			if tc.wantCalls == 0 {
+				return
+			}
+			if strings.Join(r.hosts, ",") != strings.Join(tc.wantHosts, ",") {
+				t.Fatalf("hosts = %v, want %v", r.hosts, tc.wantHosts)
+			}
+			if r.clusterID != "prod-aerolvm-us-east-1" || r.patPath != "/etc/sandboxd/cluster-pat" {
+				t.Fatalf("clusterID=%q patPath=%q, want trimmed values", r.clusterID, r.patPath)
+			}
+		})
+	}
 }
 
 func TestWireDockerNetnsPool_Enabled(t *testing.T) {
@@ -435,4 +494,33 @@ func TestVMMTemplateListerAdapter_TypeUses(t *testing.T) {
 	// Compile-time sanity check that adapter output remains aligned with vmmpool input type.
 	var _ vmmpool.TemplateWarmInput
 	var _ = fcruntime.TemplateResolution{}
+}
+
+// TestWireDockerOwnPause: the image is always set; the background pull and
+// sweep run only on a docker-engine node with the host firewall on and no
+// pool (whose loop does both itself).
+func TestWireDockerOwnPause(t *testing.T) {
+	t.Setenv("DOCKER_HOST", "unix:///tmp/daemon-own-pause-test.sock")
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // the background work finds nothing to talk to and returns
+	cfg := config.Config{DockerNetnsPoolPauseImage: "registry.k8s.io/pause:3.10", ContainerEngine: models.ContainerEngineDocker}
+	cases := []struct {
+		name          string
+		cfg           config.Config
+		rulesOn, pool bool
+		want          bool
+	}{
+		{"docker, rules on, no pool", cfg, true, false, true},
+		{"rules off", cfg, false, false, false},
+		{"pool on", cfg, true, true, false},
+		{"containerd engine", config.Config{DockerNetnsPoolPauseImage: cfg.DockerNetnsPoolPauseImage, ContainerEngine: models.ContainerEngineContainerd}, true, false, false},
+	}
+	for _, tc := range cases {
+		// A client per case: the daemon wires one once, and the background
+		// work of one case must not see the next case's wiring.
+		c := newTestDockerClient(t)
+		if got := wireDockerOwnPause(ctx, tc.cfg, c, tc.rulesOn, tc.pool, time.Now()); got != tc.want {
+			t.Errorf("%s: started = %v, want %v", tc.name, got, tc.want)
+		}
+	}
 }

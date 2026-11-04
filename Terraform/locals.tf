@@ -22,6 +22,17 @@ locals {
   # local.cluster_ops.ingress.* / local.cluster_secrets.cluster.* everywhere.
   domain_name = local.cluster_ops.ingress.domain_name
   acme_email  = local.cluster_ops.ingress.acme_email
+  # Certificates from an internal CA on a network with no route to Let's
+  # Encrypt (plans/egress-domain-filtering.md §5.10 PC-5). Optional
+  # ingress.acme_ca (an ACME directory URL), ingress.acme_ca_root_pem (its
+  # root, PEM text) and ingress.tls_issuer ("acme" or "internal"); unset
+  # keeps the public CAs. A key present with no value (`acme_ca:` in YAML,
+  # or the itest overlay) decodes to null, which try() alone passes through
+  # to templatefile, and that refuses to render; coalesce() fails on null
+  # and "", so try() falls back to the default for both.
+  acme_ca          = try(coalesce(local.cluster_ops.ingress.acme_ca), "")
+  acme_ca_root_pem = try(coalesce(local.cluster_ops.ingress.acme_ca_root_pem), "")
+  tls_issuer       = try(coalesce(local.cluster_ops.ingress.tls_issuer), "acme")
   # Custom domains require a public domain (the daemon refuses to boot with
   # SB_ENABLE_CUSTOM_DOMAINS=true and no SB_DOMAIN). AND with domain presence so
   # the no-domain local-mode scenario — which still inherits the shared config's
@@ -30,6 +41,13 @@ locals {
   custom_domain_txt_prefix       = local.cluster_ops.ingress.custom_domain_txt_prefix
   custom_domain_txt_value_prefix = local.cluster_ops.ingress.custom_domain_txt_value_prefix
   pat_token                      = local.cluster_secrets.cluster.pat_token
+  # Optional read-only scrape credential (plans/identity-and-access.md
+  # §5.11): an avm_ viewer token bound to every team ("*"), which holds
+  # metrics.read. Empty (or the key absent) keeps the Prometheus scrape on
+  # the PAT, so a default cluster loses nothing. It is required once nodes
+  # run SB_PAT_SCOPE=host, which refuses the PAT from the obs host: bring the
+  # cluster up, mint the token on a node with the PAT, set it, re-apply.
+  metrics_token = try(coalesce(local.cluster_secrets.cluster.metrics_token), "")
 
   # Cloudflare provider credential. Lives in config/secrets.yml under
   # cloudflare.api_token (NOT in config/terraform.tfvars) so the rule
@@ -399,6 +417,13 @@ resource "terraform_data" "validate_cluster_ops" {
     precondition {
       condition     = local.pat_token != ""
       error_message = "cluster.pat_token in config/secrets.yml must be set (shared SB_PAT_TOKEN used by every node for operator/SDK API auth)."
+    }
+
+    precondition {
+      # The pkg/identitywire APITokenPattern: a typo here would leave every
+      # scrape answering 401 instead of failing the plan.
+      condition     = local.metrics_token == "" || can(regex("^avm_[0-9A-Za-z]{12}_[0-9A-Za-z_-]{43}_[0-9A-Za-z]{6}$", local.metrics_token))
+      error_message = "cluster.metrics_token in config/secrets.yml must be empty (scrape with the PAT) or an avm_ API token, e.g. from `aerolvm token create --name prometheus --role viewer --team '*' --expires-in 90d`."
     }
 
     precondition {

@@ -75,9 +75,19 @@ variable "availability_zone" {
 }
 
 variable "admin_allowed_cidrs" {
-  description = "CIDRs allowed to reach SSH (22) and the operator/SDK API (21212)."
+  description = "IPv4 CIDRs allowed to reach SSH (22), the operator/SDK API (21212) and the observability node from outside the VPC. Required: set your office or VPN ranges, e.g. [\"203.0.113.0/24\"]. A world-open range (any /0, such as 0.0.0.0/0) is refused unless allow_admin_from_anywhere = true. Inside the VPC the API is always reachable (monitoring, peers)."
   type        = list(string)
-  default     = ["0.0.0.0/0"]
+
+  validation {
+    condition     = length(var.admin_allowed_cidrs) > 0 && alltrue([for c in var.admin_allowed_cidrs : try(cidrsubnet(c, 0, 0) == c && cidrnetmask(c) != "", false)])
+    error_message = "admin_allowed_cidrs must list at least one IPv4 CIDR written as its network address (your office or VPN range, e.g. \"203.0.113.0/24\")."
+  }
+}
+
+variable "allow_admin_from_anywhere" {
+  description = "Accept a world-open admin_allowed_cidrs (0.0.0.0/0), opening SSH and the daemon API to the whole internet. Off by default."
+  type        = bool
+  default     = false
 }
 
 variable "public_http_ports" {
@@ -102,6 +112,50 @@ variable "ssh_gateway_port" {
   description = "Public TCP port for the per-sandbox SSH gateway. Must match SB_SSH_LISTEN_ADDR on the daemon (default 0.0.0.0:2220). Opened on ingress-bearing nodes."
   type        = number
   default     = 2220
+}
+
+variable "api_load_balancer" {
+  description = <<-EOT
+    What sits in front of the ingress nodes. "none" (the default) is DNS
+    round-robin: <domain> and *.<domain> get one A record per ingress node,
+    exactly as before. A client that DNS sends to a node whose sandboxd is
+    down gets 502 until it is back, because the TCP and TLS handshakes with
+    that node's Caddy still succeed and nothing makes the client try the next
+    record.
+
+    "nlb" creates an internet-facing AWS Network Load Balancer (TCP
+    passthrough, so Caddy keeps terminating TLS and caddy-l4 keeps routing by
+    SNI) on public_http_ports and ssh_gateway_port, with the client address
+    preserved. Its health check probes each ingress node's Caddy
+    (install.sh --lb-health-port), which walks caddy-l4 on :443 to sandboxd,
+    so a node leaves rotation about 10 s after its daemon stops. <domain> and
+    *.<domain> then point at the balancer's Elastic IP. The raw-TCP port
+    pool cannot ride an NLB (at most 50 listeners), so raw TCP moves to
+    tcp.<domain>, which keeps one A record per ingress node, and every node
+    gets SB_L4_PUBLIC_HOST.
+
+    Recommended for production. Changing it on a running cluster changes
+    every node's bootstrap, so Terraform replaces the nodes: choose it when
+    you create the cluster.
+  EOT
+  type        = string
+  default     = "none"
+
+  validation {
+    condition     = contains(["none", "nlb"], var.api_load_balancer)
+    error_message = "api_load_balancer must be \"none\" or \"nlb\"."
+  }
+}
+
+variable "api_lb_health_check_port" {
+  description = "Port of the plain-HTTP /health listener each ingress node opens for the load balancer's health check (install.sh --lb-health-port) when api_load_balancer = \"nlb\". Only the balancer's security group may reach it. It must be a port the node does not otherwise use."
+  type        = number
+  default     = 21280
+
+  validation {
+    condition     = var.api_lb_health_check_port >= 1024 && var.api_lb_health_check_port <= 65535 && floor(var.api_lb_health_check_port) == var.api_lb_health_check_port
+    error_message = "api_lb_health_check_port must be a port number from 1024 to 65535."
+  }
 }
 
 variable "ssh_host_key_pem" {
@@ -564,7 +618,7 @@ variable "cloudflare_record_ttl" {
 variable "install_script_url" {
   description = "URL of the single-node install.sh."
   type        = string
-  default     = "https://github.com/aerol-ai/microvm/releases/latest/download/install.sh"
+  default     = "https://aerolvm.aerol.ai"
 }
 
 variable "caddy_binary_url" {
@@ -595,6 +649,23 @@ variable "secret_kms_enabled" {
 # SB_ENTERPRISE_MODE is true, so defaulting it on keeps an enterprise scenario
 # from failing at daemon start with a config error. A scenario can still turn
 # it off through extra_sandboxd_env, which is rendered after this block.
+# Server-key custody (plans/customer-key-custody.md §3). "wrapped" keeps the
+# server key that seals env, registry, mount and toolbox secrets only wrapped
+# by the KMS key above: install.sh and cluster-init.sh never write it in
+# plaintext, and the S3 cred bundle object then holds only the wrapped file.
+# Needs secret_kms_enabled (this module provisions only AWS KMS; Vault and
+# HSM key stores are the customer's own).
+variable "key_custody" {
+  description = "Server-key custody: \"file\" (default, plaintext key) or \"wrapped\" (wrapped by the secret_kms_enabled key; needs a release whose scripts have --key-custody)."
+  type        = string
+  default     = "file"
+
+  validation {
+    condition     = contains(["file", "wrapped"], var.key_custody)
+    error_message = "key_custody must be \"file\" or \"wrapped\"."
+  }
+}
+
 variable "secret_kms_strict_boot" {
   description = "Set SB_SECRET_PROVIDER_STRICT_BOOT when secret_kms_enabled. Required by config.go for awskms + enterprise mode."
   type        = bool
@@ -639,12 +710,80 @@ variable "audit_export_file_path" {
   default     = "/var/log/aerol-audit-export.jsonl"
 }
 
+# S3 Object Lock audit witness (plans/open-audit-witness.md, audit_witness.tf).
+#
+# Off by default, so a production render is byte-identical and no bucket is
+# ever created for a deployment that did not ask for one. On, it creates the
+# locked bucket, grants both node roles the witness IAM, and sets
+# SB_AUDIT_WITNESS_BACKEND=s3 on every node. It does NOT turn on
+# SB_ENTERPRISE_MODE or SB_SECRET_AUDIT_EXTERNAL_WITNESS; set those through
+# extra_sandboxd_env.
+variable "audit_witness_enabled" {
+  description = "Create the S3 Object Lock audit-witness bucket, grant nodes the witness IAM, and set SB_AUDIT_WITNESS_* on every node."
+  type        = bool
+  default     = false
+}
+
+# One value feeds both the IAM resource paths and SB_AUDIT_WITNESS_S3_PREFIX,
+# so the grant and the keys the daemon writes cannot drift apart.
+variable "audit_witness_prefix" {
+  description = "SB_AUDIT_WITNESS_S3_PREFIX, and the key prefix the node-role IAM is scoped to."
+  type        = string
+  default     = "witness/"
+
+  validation {
+    # A leading slash would put every key under an empty path segment, and
+    # '*', '?' or '$' would turn the IAM resource into a wider wildcard or a
+    # policy variable than intended.
+    condition     = can(regex("^[^/*?$\\s][^*?$\\s]*$", var.audit_witness_prefix))
+    error_message = "audit_witness_prefix must be non-empty, must not start with '/', and must not contain whitespace, '*', '?' or '$'."
+  }
+}
+
+# COMPLIANCE: no one, the AWS account root included, can delete a head before
+# its lock ends. That is the claim production wants (founder F1). GOVERNANCE:
+# a principal with s3:BypassGovernanceRetention can, which is what makes a
+# trial or an integration bucket deletable (D13). The node role never holds
+# that permission, and the daemon's boot canary refuses a role that does.
+variable "witness_lock_mode" {
+  description = "Default Object Lock retention mode for the witness bucket: COMPLIANCE (production) or GOVERNANCE (trials, integration runs)."
+  type        = string
+  default     = "COMPLIANCE"
+
+  validation {
+    condition     = contains(["COMPLIANCE", "GOVERNANCE"], var.witness_lock_mode)
+    error_message = "witness_lock_mode must be COMPLIANCE or GOVERNANCE."
+  }
+}
+
+# Must be at least SB_SECRET_AUDIT_RETENTION_DAYS (daemon default 30) or the
+# daemon refuses to boot; audit_witness.tf checks that at plan time. Also the
+# noncurrent-version expiry, so it bounds how far back the offline verifier
+# can see witnessed heads.
+variable "witness_lock_days" {
+  description = "Default Object Lock retention, in days, for every witnessed head. Must be >= SB_SECRET_AUDIT_RETENTION_DAYS."
+  type        = number
+  default     = 30
+
+  validation {
+    condition     = var.witness_lock_days >= 1 && floor(var.witness_lock_days) == var.witness_lock_days
+    error_message = "witness_lock_days must be a whole number of days, at least 1."
+  }
+}
+
+variable "audit_witness_auditor_policy_enabled" {
+  description = "Also create an unattached read-only IAM policy (witness bucket, plus the audit-export bucket when audit_export_enabled) for whoever runs `aerolvm audit verify`."
+  type        = bool
+  default     = false
+}
+
 # Audit receiver fixture (plans/integration-test-security.md §6.4).
 #
 # One small binary, built by the same pipeline and shipped over the same
-# presigned URL, run as a systemd unit on the seed. Webhook export and the
-# audit-chain witness both need something listening; without it a scenario can
-# only assert that the daemon TRIED to export.
+# presigned URL, run as a systemd unit on the seed. Webhook export needs
+# something listening; without it a scenario can only assert that the daemon
+# TRIED to export. (The audit witness is the S3 Object Lock bucket above, not
+# this fixture.)
 variable "audit_receiver_enabled" {
   description = "Run the audit-receiver fixture on the seed and point webhook export at it."
   type        = bool
@@ -692,6 +831,31 @@ variable "extra_sandboxd_env" {
     ])
     error_message = "extra_sandboxd_env keys must be valid shell identifiers and values must not contain newlines."
   }
+}
+
+# Where the operator token works, and the client address through Caddy
+# (plans/identity-and-access.md §5.11). These are install.sh flags, not env
+# vars, because each writes a Caddy half that must match its sandboxd half:
+# --pat-scope host points Caddy's API proxy at the public Unix socket, and
+# --l4-proxy-protocol adds the PROXY listener wrapper on the 8443 site. Set
+# through extra_sandboxd_env alone, the sandboxd half would run against a
+# Caddyfile that undoes it. Both default off, so a default render is
+# byte-identical to before.
+variable "pat_scope" {
+  description = "install.sh --pat-scope: \"any\" (default) accepts the PAT from any peer; \"host\" accepts it only from this host's loopback and from mTLS cluster peers, with Caddy on the public socket. Enterprise mode requires \"host\". Needs a release whose install.sh has the flag."
+  type        = string
+  default     = "any"
+
+  validation {
+    condition     = contains(["any", "host"], var.pat_scope)
+    error_message = "pat_scope must be \"any\" or \"host\"."
+  }
+}
+
+variable "l4_proxy_protocol" {
+  description = "install.sh --l4-proxy-protocol: caddy-l4's fallback sends PROXY v2 to the HTTPS site and Caddy forwards the client address to sandboxd, so audit records see the real caller. Domain mode only. Needs a release whose install.sh has the flag."
+  type        = bool
+  default     = false
 }
 
 # Locally-built artifact overrides (integration harness, plans/integration-test-security.md §4.3).

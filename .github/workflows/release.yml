@@ -9,6 +9,48 @@ permissions:
   contents: read
 
 jobs:
+  # A published release becomes /releases/latest at once, but its files only
+  # arrive when the release job finishes, about half an hour later. install.sh
+  # and the cluster docs download from /releases/latest/download/, so in that
+  # window every new install gets a 404, and a failed build leaves it that way.
+  # RELEASING.md publishes with --latest=false. This job covers a release
+  # published with --latest anyway: it points latest back at the previous
+  # stable release, and the release job moves it forward once the files are
+  # attached. A prerelease is never latest, so for one this is a no-op.
+  hold-latest:
+    name: Keep the previous release as latest
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ github.event.release.tag_name }}
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Reject a release tag that is not a version
+        run: |
+          # Same check as the test job. The tag reaches gh below.
+          if [[ ! "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
+            echo "::error::release tag must look like v1.2.3"
+            exit 1
+          fi
+
+      - name: Point latest at the previous stable release
+        run: |
+          latest="$(gh release view --json tagName --jq .tagName)"
+          if [[ "$latest" != "$VERSION" ]]; then
+            echo "Latest is $latest, not $VERSION. Nothing to hold."
+            exit 0
+          fi
+          previous="$(gh release list --exclude-drafts --exclude-pre-releases --limit 1000 --json tagName --jq '.[].tagName' \
+            | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$' | grep -vxF "$VERSION" | sort -V | tail -n 1)"
+          if [[ -z "$previous" ]]; then
+            echo "No earlier stable release. Latest stays on $VERSION."
+            exit 0
+          fi
+          gh release edit "$previous" --latest
+          echo "Latest is $previous until $VERSION has its files."
+
   test:
     name: Test
     runs-on: ubuntu-latest
@@ -35,7 +77,7 @@ jobs:
           cache: true
 
       - name: Set up Node.js
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version: 22
           cache: npm
@@ -227,14 +269,76 @@ jobs:
           fi
 
       - name: Upload build artifacts
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: dist-${{ matrix.suffix }}
           path: dist/
 
+  # aerolvm, the agent CLI and stdio MCP server, is a static CGO_ENABLED=0
+  # client (cmd/aerolvm/deps_test.go keeps it free of server packages), so
+  # one runner cross-compiles every platform. The npm job and
+  # cmd/aerolvm/distribution_test.go both expect exactly this target list.
+  cli:
+    name: Build - aerolvm CLI
+    needs: test
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ github.event.release.tag_name }}
+      LDFLAGS: -X github.com/aerol-ai/microvm/internal/version.Version=${{ github.event.release.tag_name }}
+    steps:
+      - name: Reject a release tag that is not a version
+        run: |
+          # Same check as the test job. The tag is copied into ldflags.
+          if [[ ! "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
+            echo "::error::release tag must look like v1.2.3"
+            exit 1
+          fi
+
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ env.VERSION }}
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build aerolvm for every platform
+        shell: bash
+        env:
+          CGO_ENABLED: "0"
+        run: |
+          mkdir -p dist
+          for target in darwin/amd64 darwin/arm64 linux/amd64 linux/arm64 windows/amd64 windows/arm64; do
+            goos="${target%/*}"
+            goarch="${target#*/}"
+            ext=""
+            if [[ "$goos" == "windows" ]]; then
+              ext=".exe"
+            fi
+            GOOS="$goos" GOARCH="$goarch" go build -trimpath -ldflags "$LDFLAGS" -o "dist/aerolvm_${goos}_${goarch}${ext}" ./cmd/aerolvm
+          done
+          chmod 0755 dist/aerolvm_*
+
+      - name: Check the linux_amd64 build reports the release version
+        run: |
+          got="$(dist/aerolvm_linux_amd64 version)"
+          if [[ "$got" != "$VERSION" ]]; then
+            echo "::error::aerolvm version printed '$got', want '$VERSION'"
+            exit 1
+          fi
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: dist-aerolvm
+          path: dist/
+
   release:
     name: Publish release
-    needs: build
+    needs: [hold-latest, build, cli]
     runs-on: ubuntu-latest
     permissions:
       attestations: write
@@ -263,18 +367,23 @@ jobs:
           cache: true
 
       - name: Download all build artifacts
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           pattern: dist-*
           path: dist/
           merge-multiple: true
 
+      # Terraform's seed bootstrap downloads cluster-sign-node.sh from
+      # /releases/latest/download/ (Terraform/variables.tf), so every script a
+      # Terraform default names must ship here; integration-tests/safety
+      # TestTerraformReleaseURLsNameShippedAssets keeps the two in step.
       - name: Copy install scripts
         run: |
           cp scripts/install.sh dist/install.sh
           cp scripts/cluster-init.sh dist/cluster-init.sh
           cp scripts/cluster-join.sh dist/cluster-join.sh
-          chmod 0755 dist/install.sh dist/cluster-init.sh dist/cluster-join.sh
+          cp scripts/cluster-sign-node.sh dist/cluster-sign-node.sh
+          chmod 0755 dist/install.sh dist/cluster-init.sh dist/cluster-join.sh dist/cluster-sign-node.sh
 
       - name: Generate CycloneDX SBOM
         run: go run github.com/CycloneDX/cyclonedx-gomod/cmd/cyclonedx-gomod@v1.10.0 mod -json -output dist/sbom.cdx.json
@@ -299,7 +408,7 @@ jobs:
 
       - name: Attest release artifacts
         id: attest
-        uses: actions/attest-build-provenance@43d14bc2b83dec42d39ecae14e916627a18bb661 # v3
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: dist/*
 
@@ -318,3 +427,155 @@ jobs:
           tag_name: ${{ env.VERSION }}
           generate_release_notes: true
           files: dist/*
+          # Latest moves only in the next step, once every file is attached.
+          make_latest: "false"
+
+      # Only the newest stable release becomes latest, so re-running this
+      # workflow for an older tag never moves /releases/latest backwards.
+      - name: Mark the release as latest
+        if: ${{ !github.event.release.prerelease }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          newest="$(gh release list --exclude-drafts --exclude-pre-releases --limit 1000 --json tagName --jq '.[].tagName' \
+            | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$' | sort -V | tail -n 1)"
+          if [[ "$newest" != "$VERSION" ]]; then
+            echo "$newest is newer than $VERSION, so latest stays on $newest."
+            exit 0
+          fi
+          gh release edit "$VERSION" --latest
+
+  # npm and the MCP Registry are opt-in until their one-time setup is done
+  # (npm/README.md): set the repository variable AEROLVM_NPM_PUBLISH=true.
+  # Both run after the GitHub release, so a failure here never holds back
+  # the binaries, and both are safe to re-run.
+  npm:
+    name: Publish aerolvm to npm
+    needs: release
+    if: vars.AEROLVM_NPM_PUBLISH == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      VERSION: ${{ github.event.release.tag_name }}
+    steps:
+      - name: Reject a release tag that is not a version
+        run: |
+          # Same check as the test job. The tag becomes the npm version.
+          if [[ ! "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
+            echo "::error::release tag must look like v1.2.3"
+            exit 1
+          fi
+
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ env.VERSION }}
+
+      # No registry-url: setup-node would write an _authToken line into
+      # .npmrc, and any _authToken makes npm skip OIDC trusted publishing
+      # (actions/setup-node#1551).
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: 22
+
+      - name: Download the aerolvm binaries
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: dist-aerolvm
+          path: dist/
+
+      - name: Stage the npm packages
+        run: node npm/stage.mjs "$VERSION" dist npm-dist
+
+      - name: Publish through GitHub OIDC trusted publishing
+        run: |
+          # Node 22 ships npm older than 11.5.1, the first release that can
+          # publish with OIDC. .github/npm-cli pins a newer one; see the
+          # npm job in publish-sdks.yml.
+          npm ci --prefix "$GITHUB_WORKSPACE/.github/npm-cli"
+          npm_bin="$GITHUB_WORKSPACE/.github/npm-cli/node_modules/.bin/npm"
+          node -e 'const [maj,min,pat]=process.argv[1].split(".").map(Number); if (maj<11 || (maj===11 && (min<5 || (min===5 && pat<1)))) { console.error("npm "+process.argv[1]+" cannot do trusted publishing; need >= 11.5.1"); process.exit(1); }' "$("$npm_bin" -v)"
+          version="${VERSION#v}"
+          # A prerelease must not become what `npx @aerol-ai/aerolvm` runs.
+          tag="latest"
+          if [[ "$version" == *-* ]]; then
+            tag="next"
+          fi
+          # order.txt lists every platform package before the launcher.
+          while read -r dir; do
+            name="$(node -p "require('./npm-dist/$dir/package.json').name")"
+            if "$npm_bin" view "${name}@${version}" version >/dev/null 2>&1; then
+              echo "::notice::${name}@${version} is already on npm; skipping"
+              continue
+            fi
+            (cd "npm-dist/$dir" && "$npm_bin" publish --access public --tag "$tag")
+          done < npm-dist/order.txt
+
+  mcp-registry:
+    name: Publish to the MCP Registry
+    needs: npm
+    # The registry lists one latest version per server; prereleases stay off it.
+    if: vars.AEROLVM_NPM_PUBLISH == 'true' && !contains(github.event.release.tag_name, '-')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      VERSION: ${{ github.event.release.tag_name }}
+      # Pinned mcp-publisher release and the SHA-256 of its linux_amd64
+      # tarball. Bump both together.
+      MCP_PUBLISHER_VERSION: v1.8.1
+      MCP_PUBLISHER_SHA256: a06c9096dcb9727c13555b6be26c7effa707b01f06a4c561ba7a3635443cf2cc
+    steps:
+      - name: Reject a release tag that is not a version
+        run: |
+          # Same check as the test job. The tag becomes the server version.
+          if [[ ! "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::release tag must look like v1.2.3"
+            exit 1
+          fi
+
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ env.VERSION }}
+
+      - name: Install mcp-publisher
+        run: |
+          curl -fsSL -o mcp-publisher.tar.gz \
+            "https://github.com/modelcontextprotocol/registry/releases/download/${MCP_PUBLISHER_VERSION}/mcp-publisher_linux_amd64.tar.gz"
+          echo "${MCP_PUBLISHER_SHA256}  mcp-publisher.tar.gz" | sha256sum -c -
+          tar -xzf mcp-publisher.tar.gz mcp-publisher
+          ./mcp-publisher --help >/dev/null
+
+      - name: Stamp the release version into server.json
+        run: |
+          version="${VERSION#v}"
+          jq --arg v "$version" '.version = $v | .packages[0].version = $v' server.json > server.json.tmp
+          mv server.json.tmp server.json
+
+      - name: Validate server.json
+        run: ./mcp-publisher validate
+
+      # The registry checks the npm package's mcpName when it accepts the
+      # entry, so wait until the version just published is visible.
+      - name: Wait for the npm package
+        run: |
+          version="${VERSION#v}"
+          for _ in $(seq 1 30); do
+            if [[ "$(npm view "@aerol-ai/aerolvm@${version}" mcpName 2>/dev/null)" == "io.github.aerol-ai/aerolvm" ]]; then
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "::error::@aerol-ai/aerolvm@${version} did not appear on npm with its mcpName"
+          exit 1
+
+      - name: Publish
+        run: |
+          ./mcp-publisher login github-oidc
+          ./mcp-publisher publish

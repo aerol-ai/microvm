@@ -200,7 +200,7 @@ func TestDeleteSnapshotRemovesImageAndStoreEntry(t *testing.T) {
 	if rt.lastRemoved != snapshot.Image {
 		t.Fatalf("RemoveImage ref = %q, want %q", rt.lastRemoved, snapshot.Image)
 	}
-	if _, err := st.GetSnapshot(ctx, snapshot.Name); !errors.Is(err, store.ErrNotFound) {
+	if _, err := st.GetSnapshot(ctx, snapshot.OwnerRef, snapshot.Name); !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("expected ErrNotFound after delete, got %v", err)
 	}
 }

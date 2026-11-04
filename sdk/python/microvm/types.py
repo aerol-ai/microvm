@@ -144,6 +144,24 @@ class GPUOptions(TypedDict, total=False):
 
 class CreateOptions(TypedDict, total=False):
     image: Union[str, "Image"]
+    # Sent as the create's Idempotency-Key header, never in the body. A
+    # create sent again with the same key and the same options returns the
+    # sandbox the first one made instead of making a second; the same key
+    # with different options raises a 422 MicroVMHTTPError whose code is
+    # "idempotency_key_reused". Keys are scoped to the caller's account.
+    # Unset, the SDK makes a random key for each create call and reuses it on
+    # that call's automatic retries, so a retry after a timeout cannot make a
+    # second sandbox. Set your own to make your own retries of the whole call
+    # safe too, such as after your process restarts. idempotencyKey is
+    # accepted too.
+    idempotency_key: str
+    # Optional name, unique among the caller's sandboxes (another account may
+    # use the same name); a repeat create with a held name returns HTTP 409.
+    # Names starting with "owner:" or shaped like a sandbox ID ("sb-" plus 16
+    # hex) are rejected.
+    name: str
+    # Free-form key/value labels; filter on them with list(tags=...).
+    tags: Dict[str, str]
     # cpu accepts fractional cores: 0.5 = half a core, 1.5 = one and a half.
     cpu: float
     memoryMB: int
@@ -151,14 +169,29 @@ class CreateOptions(TypedDict, total=False):
     env: Dict[str, str]
     osUser: str
     networkBlockAll: bool
-    # Egress allowlist / blocklist of CIDRs enforced by the host firewall.
-    # networkAllowOut: sandbox may reach ONLY these; everything else is dropped.
-    # networkDenyOut: sandbox may reach anything EXCEPT these. The two are
-    # mutually exclusive; a full block is networkBlockAll, not a 0.0.0.0/0 deny.
+    # Egress policy. networkAllowOut takes CIDRs, hostnames, *.suffix wildcards
+    # and host:port entries; alone the sandbox may reach ONLY these.
+    # networkDenyOut takes CIDRs only; alone the sandbox may reach anything
+    # EXCEPT these. Both together: allow wins, then deny, then allow by default
+    # (a 0.0.0.0/0 deny makes it an allowlist). A full block is networkBlockAll.
     networkAllowOut: List[str]
     networkDenyOut: List[str]
-    # Whether the sandbox may be exposed publicly. Omitted defaults to private
-    # (no public URL, expose_port fails). True opts in; False permanently refuses.
+    # Named egress profiles whose entries join networkAllowOut (see
+    # put_egress_profile). A profile change reaches every sandbox using it.
+    egressProfiles: List[str]
+    # "learn" gives the sandbox open egress and records what it reaches, so
+    # learned() can suggest an allow list. Trusted runs only. Omitted is
+    # "enforce".
+    networkEgressMode: str
+    # Method and path rules that refine hosts the allow list already admits
+    # (at most 32). An inspect rule makes the egress gateway terminate TLS on
+    # 443 with the node's CA, which only a sandbox created with such a rule
+    # trusts, so set inspect rules here rather than adding them later.
+    networkEgressRules: List["EgressRule"]
+    # Omitted or False: the sandbox is private at create (no public URL).
+    # True: public from boot. The first expose_port makes a private sandbox
+    # public whether the flag was omitted or False, because asking for a
+    # public port is the opt-in.
     allowPublicTraffic: bool
     # Rewrite the upstream Host header on ingress to exposed HTTP ports to this
     # value so frameworks that validate Host (Vite, Django ALLOWED_HOSTS,
@@ -199,6 +232,11 @@ class CreateOptions(TypedDict, total=False):
     # time. Server-side cap: ``MaxCustomDomainsPerCreateRequest`` (5). Each
     # host is normalized + validated; the server lowercases for you.
     customDomains: List[str]
+    # Firecracker template id (see create_template): boots from the
+    # template's prepared rootfs instead of building one from the image.
+    # Requires runtime="firecracker" and image; the template must be ready.
+    # template_id is accepted too.
+    templateId: str
 
 
 class ResizeOptions(TypedDict, total=False):
@@ -386,6 +424,14 @@ class SandboxSnapshot(TypedDict, total=False):
     diskGB: int
 
 
+class SnapshotList(TypedDict, total=False):
+    """One name-ordered page of snapshots from ``MicroVM.list_snapshots``."""
+
+    snapshots: List[SandboxSnapshot]
+    # True when more snapshots remain after this page.
+    hasMore: bool
+
+
 # Wire protocol an exposure publishes through. "http" maps to the Caddy HTTP
 # reverse proxy; "tcp" and "tls" map to caddy-l4 surfaces.
 ExposeProtocol = Literal["http", "tcp", "tls"]
@@ -409,6 +455,9 @@ class ExposeResult:
 
 class SandboxData(TypedDict, total=False):
     id: str
+    # Name set at create time, unique per owner. Absent for unnamed sandboxes.
+    name: str
+    tags: Dict[str, str]
     image: str
     status: str
     publicURL: str
@@ -420,6 +469,18 @@ class SandboxData(TypedDict, total=False):
     osUser: str
     env: Dict[str, str]
     networkBlockAll: bool
+    # Hostname-egress state on get (container runtimes): "active", "held" or
+    # "unavailable"; "unenforced" when the server's firewall is off and
+    # nothing filters the sandbox. Absent otherwise.
+    egressStatus: str
+    # Egress profiles this sandbox references, and the generation of each
+    # that is live on it.
+    egressProfiles: List[str]
+    egressProfilesApplied: List["EgressProfileRef"]
+    # "learn" while the sandbox records its egress; absent otherwise.
+    networkEgressMode: str
+    # Method and path rules on the sandbox's egress; absent when it has none.
+    networkEgressRules: List["EgressRule"]
     toolboxEnabled: bool
     sshPublicKey: str
     sshPrivateKey: str
@@ -456,6 +517,212 @@ class NetworkUsage(TypedDict, total=False):
     lastSampledAt: str
 
 
+class AuditEvent(TypedDict, total=False):
+    """One record from a sandbox's audit log (``sandbox.audit()``).
+
+    ``kind`` is ``"egress"`` for outbound connections and denials; a denial
+    has ``result`` ``"failure"`` and the policy ``reason``
+    (``"host_not_allowed"``, ``"sni_not_allowed"``, ...).
+    """
+
+    time: str
+    kind: str
+    result: str
+    reason: str
+    destination: str
+    network: str
+    actor: str
+    ref: str
+    eventID: str
+    incarnationID: str
+    dropped: int
+
+
+class AuditCoverage(TypedDict):
+    answered: List[str]
+    missing: List[str]
+    partial: bool
+
+
+class AuditPage(TypedDict, total=False):
+    events: List[AuditEvent]
+    coverage: AuditCoverage
+    # Pass to ``audit({"cursor": ...})`` for the next page.
+    nextCursor: str
+
+
+class AuditOptions(TypedDict, total=False):
+    kind: str
+    limit: int
+    cursor: str
+    incarnationID: str
+
+
+class NetworkPolicyCheckOptions(TypedDict, total=False):
+    """Would a sandbox created with these egress fields reach ``destination``?
+
+    ``destination`` is "host", "host:port", "IP" or "IP:port"; a bare host is
+    checked as the web ports.
+    """
+
+    networkBlockAll: bool
+    networkAllowOut: List[str]
+    networkDenyOut: List[str]
+    destination: str
+
+
+class NetworkPolicyCheckResult(TypedDict, total=False):
+    allowed: bool
+    # The entry that decided; "" when the default verdict did.
+    matchedRule: str
+    # "allow" or "deny": what happens to a destination no entry matches.
+    defaultVerdict: str
+    # The first allow entry outside this deployment's ceiling, if any.
+    outsideCeiling: str
+
+
+class EgressProfileRef(TypedDict):
+    name: str
+    generation: int
+
+
+class EgressProfile(TypedDict, total=False):
+    """A named allowlist sandboxes reference through ``egressProfiles``.
+    Profiles belong to your account; ``generation`` goes up on every change."""
+
+    name: str
+    # Hostnames, *. wildcards, host:port entries and CIDRs (at most 512 hostnames).
+    allowOut: List[str]
+    description: str
+    generation: int
+    createdAt: str
+    updatedAt: str
+
+
+class EgressProfileOptions(TypedDict, total=False):
+    """The body of ``put_egress_profile``: a full replace."""
+
+    allowOut: List[str]
+    description: str
+
+
+class ListEgressProfilesOptions(TypedDict, total=False):
+    cursor: str
+    limit: int
+
+
+class EgressProfileList(TypedDict, total=False):
+    profiles: List[EgressProfile]
+    # Pass back as ``cursor`` for the next page; absent on the last one.
+    nextCursor: str
+
+
+class NetworkPolicyOptions(TypedDict, total=False):
+    """A sandbox's whole egress policy, for ``set_network_policy``.
+
+    It replaces the current policy: a key left out is cleared, so ``{}``
+    means open egress. The grammar is the create one (hostnames, ``*.``
+    wildcards, ``host:port`` and CIDRs in the allow list; CIDRs only in the
+    deny list).
+    """
+
+    networkBlockAll: bool
+    networkAllowOut: List[str]
+    networkDenyOut: List[str]
+    egressProfiles: List[str]
+    networkEgressMode: str
+    # Replaces the method and path rules. Adding an inspect rule to a
+    # container sandbox created without one is refused with 409: recreate it
+    # with the rule.
+    networkEgressRules: List["EgressRule"]
+
+
+class NetworkPolicy(TypedDict, total=False):
+    networkBlockAll: bool
+    networkAllowOut: List[str]
+    networkDenyOut: List[str]
+    egressProfiles: List[str]
+    # "enforce" or "learn".
+    networkEgressMode: str
+    networkEgressRules: List["EgressRule"]
+    # Hostname entries in force: inline plus every profile's (at most 1024).
+    effectiveHostnameCount: int
+    # "active", "held" or "unavailable" for hostname rules on a container;
+    # "unenforced" when the server's firewall is off.
+    egressStatus: str
+
+
+class EgressRule(TypedDict, total=False):
+    """One method, path or program rule. Rules refine a host the allow list
+    already admits: a request to a ruled host passes when some rule for that
+    host admits its program, method and path, and gets a 403 otherwise. A
+    host no rule names keeps its allow-list decision."""
+
+    # An exact name or "*." wildcard, without a port. Required.
+    host: str
+    # [80] by default, or [443] with inspect; only 80 and 443, except that a
+    # rule with only binaries may name any port the allow list opens.
+    ports: List[int]
+    # Exact, upper case ("GET", "POST"); empty allows any.
+    methods: List[str]
+    # Path globs: "*" within one segment, "**" as a whole segment for any
+    # number of them. Empty allows any path.
+    paths: List[str]
+    # Terminate TLS on 443 with the node's CA so the rule can see requests.
+    # The request's Host must then equal the TLS server name.
+    inspect: bool
+    # Replace a header on the requests this rule allows with a secret from
+    # the sandbox's own env, which the sandbox itself only sees as a
+    # placeholder. Needs inspect.
+    inject: "EgressInject"
+    # Limit the rule to connections opened by these executables: clean
+    # absolute paths inside the sandbox, at most 16. For an interpreter
+    # (python, node, a shell) the script it runs counts too, so
+    # "/usr/local/bin/pip" works. A rule with only binaries decides whole
+    # connections, on any port the allow list opens. Runc sandboxes only
+    # (docker and containerd); least privilege for trusted tooling, not a
+    # security boundary.
+    binaries: List[str]
+
+
+class EgressInject(TypedDict):
+    """A rule's credential injection. The sandbox's env holds
+    ``aerolvm-placeholder:<KEY>`` in place of the value, and the egress
+    gateway replaces ``header`` with the real value on each request the rule
+    allows, so code in the sandbox never holds the secret."""
+
+    # The header to replace, such as "Authorization". It is replaced, never
+    # added to a body or URL. Headers that frame or route the request, such
+    # as Host or Content-Length, can't be injected.
+    header: str
+    # "env:<KEY>": a key in the create's env, whose value is the whole header
+    # value (for example "Bearer ghp_..."). Sent as secret_ref on the wire.
+    # Rotating it means recreating the sandbox.
+    secretRef: str
+
+
+class NetworkLearnedEntry(TypedDict, total=False):
+    host: str
+    # Connection ports; empty when the name was only resolved.
+    ports: List[int]
+    firstSeen: str
+    lastSeen: str
+    hits: int
+
+
+class NetworkLearned(TypedDict, total=False):
+    """What a sandbox reached in learn mode, and the allow list that would
+    have allowed it: ``suggestedAllowOut`` when it fits 64 hostnames,
+    otherwise ``suggestedProfile`` (a body for ``put_egress_profile``)."""
+
+    mode: str
+    truncated: bool
+    entries: List[NetworkLearnedEntry]
+    cidrs: List[str]
+    suggestedAllowOut: List[str]
+    suggestedProfile: "EgressProfileOptions"
+
+
 class SetNetworkLimitsOptions(TypedDict, total=False):
     # Omit a key to leave that direction unchanged. 0 means unlimited.
     networkBytesInLimit: int
@@ -475,12 +742,87 @@ class RetryConfig(TypedDict, total=False):
     maxRetries: int
     baseDelayMs: int
     maxDelayMs: int
+    # Cap in milliseconds on the wait before re-sending a 429 or 503. The
+    # client waits as long as the server's Retry-After header asks (seconds
+    # or an HTTP date), never less than its own backoff, plus up to a fifth
+    # more so clients told the same value spread out; a longer ask is cut to
+    # this. A missing or malformed header uses the backoff. Defaults to
+    # 30000; 0 ignores Retry-After.
+    maxRetryAfterMs: int
 
 
 class MicroVMConfig(TypedDict, total=False):
     apiUrl: str
+    # The bearer every request carries: the operator PAT, an avm_ API token
+    # or an OIDC ID token. Defaults to SB_PAT_TOKEN, then its alias
+    # SB_API_TOKEN; when both are set, SB_PAT_TOKEN wins.
     patToken: str
+    # The team requests act for, sent as the X-AerolVM-Team header on every
+    # request. Defaults to SB_TEAM; with neither, no header is sent.
+    team: str
     retry: RetryConfig
+
+
+class WhoAmIPrincipal(TypedDict, total=False):
+    """Who the caller is: ``kind`` ("operator", "token", "oidc", ...), a
+    stable ``id`` ("operator", "tok_…") and a display ``name``."""
+
+    kind: str
+    id: str
+    name: str
+
+
+class WhoAmI(TypedDict, total=False):
+    """The result of :meth:`MicroVM.whoami`: the caller's own identity."""
+
+    principal: WhoAmIPrincipal
+    # viewer, runner, auditor or admin.
+    role: str
+    # "*" for every team, a team name, or absent for a managed account.
+    team: str
+    # When the credential stops working (RFC 3339); absent if it never does.
+    expiresAt: str
+
+
+class APIToken(TypedDict):
+    """One scoped API token as ``client.tokens.list()`` returns it. Never
+    the secret."""
+
+    # Public id (tok_…): what tokens.revoke takes and audit records name.
+    id: str
+    name: str
+    role: str
+    # A team name, or "*" for every team.
+    team: str
+    createdBy: str
+    createdAt: str
+    expiresAt: str
+    # Expired tokens no longer work; they stay listed for 30 days.
+    expired: bool
+
+
+class CreatedAPIToken(APIToken):
+    """The result of ``client.tokens.create()``: the token plus ``token``,
+    the secret (avm_…), returned this once and never stored by the server."""
+
+    token: str
+
+
+class CreateAPITokenOptions(TypedDict, total=False):
+    """The body of ``client.tokens.create()``. All four fields are required."""
+
+    # 1 to 64 of A-Z a-z 0-9 . _ -, unique among the team's tokens.
+    name: str
+    # viewer, runner, auditor or admin.
+    role: str
+    # A team name, or "*" for every team. auditor and admin require "*".
+    team: str
+    # The lifetime: "90d", "720h" or any Go duration.
+    expiresIn: str
+
+
+class APITokenList(TypedDict):
+    tokens: List[APIToken]
 
 
 # Firecracker rootfs templates. The lifecycle mirrors the daemon's

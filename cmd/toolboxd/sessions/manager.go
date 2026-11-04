@@ -17,9 +17,16 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/aerol-ai/microvm/cmd/toolboxd/loginshell"
 	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/creack/pty"
 )
+
+// writeLoginRestore writes the PATH restore as the first line of a
+// stdin-fed login shell. It is io.WriteString. A live pipe accepts this
+// short line, so tests replace it to reach the log-and-continue path
+// (the shell has already gone, and the pipe is closed).
+var writeLoginRestore = io.WriteString
 
 // Config controls Manager behavior. Defaults are sensible for an in-container
 // daemon; everything is overridable via toolboxd env vars.
@@ -34,6 +41,20 @@ type Config struct {
 	SweepInterval time.Duration
 	// BufferBytes is the per-session replay buffer size. Default 1 MiB.
 	BufferBytes int
+	// StartProcess starts a session's command (start is cmd.Start, or a PTY
+	// start that calls it) and returns how to wait for its exit. toolboxd is
+	// PID 1 and reaps orphans with wait4(-1), which can take a session's own
+	// exit status before cmd.Wait does; it passes its child table here so
+	// the status reaches the session instead of reading as exit 0. Nil means
+	// start, then cmd.Wait: right for a host that reaps nothing (the WASM
+	// tool host).
+	StartProcess func(cmd *exec.Cmd, start func() error) (wait func() (code int, signal string), err error)
+	// BaseEnv returns the environment a session starts from, before the
+	// request's own env is laid on top. Nil means os.Environ(). toolboxd
+	// sets it so sessions, terminals and envd processes see the sandbox env
+	// a Firecracker host pushed over vsock (cmd/toolboxd/sandboxenv), which
+	// is not in toolboxd's own process environment.
+	BaseEnv func() []string
 }
 
 // Manager owns every Session running in the container.
@@ -44,6 +65,13 @@ type Manager struct {
 	mu     sync.Mutex
 	byID   map[string]*Session // primary key
 	byName map[string]*Session // running, named-keyed; entry removed when session exits
+	// creating holds a GetOrCreate that is starting a session for a name
+	// and has not published it to byName yet. Starting a shell takes long
+	// enough that a second caller would otherwise miss byName, start its
+	// own shell, and also report created=true — and callers use that flag
+	// as an exclusive claim (the Runloop facade runs its command once per
+	// claim).
+	creating map[string]*pendingCreate
 
 	closeCh chan struct{}
 }
@@ -70,11 +98,12 @@ func New(logger *slog.Logger, cfg Config) (*Manager, error) {
 	}
 
 	m := &Manager{
-		logger:  logger,
-		cfg:     cfg,
-		byID:    map[string]*Session{},
-		byName:  map[string]*Session{},
-		closeCh: make(chan struct{}),
+		logger:   logger,
+		cfg:      cfg,
+		byID:     map[string]*Session{},
+		byName:   map[string]*Session{},
+		creating: map[string]*pendingCreate{},
+		closeCh:  make(chan struct{}),
 	}
 	go m.runSweeper()
 	return m, nil
@@ -154,27 +183,59 @@ func (m *Manager) GetByName(name string) (*Session, error) {
 	return s, nil
 }
 
+// pendingCreate is one GetOrCreate starting the session for a name. done
+// closes once session/err are set.
+type pendingCreate struct {
+	done    chan struct{}
+	session *Session
+	err     error
+}
+
 // GetOrCreate returns the running session with the given Name (creating it
 // from req if absent). Used by SSH attach so `ssh sandbox+default@host`
-// idempotently lands on a single shared shell.
+// idempotently lands on a single shared shell. created is true for exactly
+// one of any number of concurrent callers for the same name: the others
+// wait for that caller's session instead of starting their own.
 func (m *Manager) GetOrCreate(ctx context.Context, req models.CreateSessionRequest) (*Session, bool, error) {
 	name := strings.TrimSpace(req.Name)
 	if name == "" {
 		return nil, false, errors.New("name is required for GetOrCreate")
 	}
 
-	m.mu.Lock()
-	if existing, ok := m.byName[name]; ok && !existing.exited.Load() {
+	for {
+		m.mu.Lock()
+		if existing, ok := m.byName[name]; ok && !existing.exited.Load() {
+			m.mu.Unlock()
+			return existing, false, nil
+		}
+		if pending, ok := m.creating[name]; ok {
+			m.mu.Unlock()
+			select {
+			case <-pending.done:
+			case <-ctx.Done():
+				return nil, false, ctx.Err()
+			}
+			if pending.err == nil {
+				return pending.session, false, nil
+			}
+			// The creator failed; the next pass lets one waiter try again.
+			continue
+		}
+		pending := &pendingCreate{done: make(chan struct{})}
+		m.creating[name] = pending
 		m.mu.Unlock()
-		return existing, false, nil
-	}
-	m.mu.Unlock()
 
-	created, err := m.Create(ctx, req)
-	if err != nil {
-		return nil, false, err
+		created, err := m.Create(ctx, req)
+		m.mu.Lock()
+		delete(m.creating, name)
+		pending.session, pending.err = created, err
+		close(pending.done)
+		m.mu.Unlock()
+		if err != nil {
+			return nil, false, err
+		}
+		return created, true, nil
 	}
-	return created, true, nil
 }
 
 // Create starts a new session. Always assigns a fresh ID.
@@ -192,11 +253,14 @@ func (m *Manager) Create(ctx context.Context, req models.CreateSessionRequest) (
 		name = "default"
 	}
 
+	// A login shell given a command (an E2B command is bash -l -c) puts the
+	// image's PATH back after /etc/profile resets it (cmd/toolboxd/loginshell).
+	argv = loginshell.Argv(argv)
 	cmd := exec.Command(argv[0], argv[1:]...)
 	if req.WorkDir != "" {
 		cmd.Dir = req.WorkDir
 	}
-	cmd.Env = mergeEnv(req.Env)
+	cmd.Env = append(mergeEnvOnto(m.baseEnv(), req.Env), loginshell.EnvFor(req.Env)...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		Setsid:  req.PTY,
 		Setpgid: !req.PTY,
@@ -229,13 +293,19 @@ func (m *Manager) Create(ctx context.Context, req models.CreateSessionRequest) (
 	}
 
 	if req.PTY {
-		ptmx, err := pty.StartWithSize(cmd, &pty.Winsize{Cols: uint16(s.cols), Rows: uint16(s.rows)})
+		var ptmx *os.File
+		wait, err := m.startProcess(cmd, func() error {
+			var err error
+			ptmx, err = pty.StartWithSize(cmd, &pty.Winsize{Cols: uint16(s.cols), Rows: uint16(s.rows)})
+			return err
+		})
 		if err != nil {
 			s.failed = true
 			_ = s.recorder.Close()
 			return nil, fmt.Errorf("start pty: %w", err)
 		}
 		s.ptmx = ptmx
+		s.wait = wait
 		s.startedAt = time.Now().UTC()
 		s.pumpWG.Add(1)
 		go s.runPump(ptmx, StreamStdout)
@@ -254,13 +324,23 @@ func (m *Manager) Create(ctx context.Context, req models.CreateSessionRequest) (
 			_ = stdin.Close()
 			return nil, fmt.Errorf("stderr pipe: %w", err)
 		}
-		if err := cmd.Start(); err != nil {
+		wait, err := m.startProcess(cmd, cmd.Start)
+		if err != nil {
 			_ = stdin.Close()
 			s.failed = true
 			_ = s.recorder.Close()
 			return nil, fmt.Errorf("start: %w", err)
 		}
+		s.wait = wait
 		s.stdin = stdin
+		// A login shell fed through stdin (a Daytona session) runs this
+		// before any command, once its profile is done. A terminal gets the
+		// same from the profile hook, without echoing a line to the user.
+		if loginshell.LoginWithoutCommand(argv) {
+			if _, err := writeLoginRestore(stdin, loginshell.Restore+"\n"); err != nil {
+				m.logger.Warn("login shell PATH restore not written", "session_id", id, "error", err)
+			}
+		}
 		s.startedAt = time.Now().UTC()
 		s.pumpWG.Add(2)
 		go s.runPump(stdout, StreamStdout)
@@ -301,6 +381,18 @@ func (m *Manager) Create(ctx context.Context, req models.CreateSessionRequest) (
 
 // Delete removes a session record. If it's still running, signal it first.
 // Always best-effort — does not block on the process actually exiting.
+// startProcess starts cmd through Config.StartProcess, or plainly when it
+// is nil.
+func (m *Manager) startProcess(cmd *exec.Cmd, start func() error) (func() (int, string), error) {
+	if m.cfg.StartProcess != nil {
+		return m.cfg.StartProcess(cmd, start)
+	}
+	if err := start(); err != nil {
+		return nil, err
+	}
+	return func() (int, string) { return waitProcess(cmd) }, nil
+}
+
 func (m *Manager) Delete(id string) error {
 	m.mu.Lock()
 	s, ok := m.byID[id]
@@ -387,12 +479,22 @@ func newSessionID() (string, error) {
 	return "ses-" + hex.EncodeToString(buf), nil
 }
 
-func mergeEnv(extra map[string]string) []string {
-	base := append([]string{}, os.Environ()...)
+// mergeEnvOnto appends a request's env after base, so a key the request sets
+// wins (os/exec keeps the last value of a repeated key).
+func mergeEnvOnto(base []string, extra map[string]string) []string {
+	out := append([]string{}, base...)
 	for k, v := range extra {
-		base = append(base, k+"="+v)
+		out = append(out, k+"="+v)
 	}
-	return base
+	return out
+}
+
+// baseEnv is the environment every session starts from.
+func (m *Manager) baseEnv() []string {
+	if m.cfg.BaseEnv != nil {
+		return m.cfg.BaseEnv()
+	}
+	return os.Environ()
 }
 
 func orDefault(v, fallback int) int {
@@ -402,30 +504,45 @@ func orDefault(v, fallback int) int {
 	return v
 }
 
+// ErrNoShell is returned for a shell or a command string in an image with
+// neither bash nor sh (distroless, scratch). Without it the session fails
+// later as "fork/exec /bin/sh: no such file or directory", which reads as a
+// toolboxd fault rather than a property of the image.
+var ErrNoShell = errors.New("this sandbox's image has no shell: neither bash nor sh is installed")
+
+// lookPath and statPath are the filesystem lookups detectShell makes,
+// variables so tests can stand in an image without a shell.
+var (
+	lookPath = exec.LookPath
+	statPath = os.Stat
+)
+
 // buildArgv resolves the final argv from a CreateSessionRequest. If both
 // Argv and Command are empty, defaults to a login shell.
 func buildArgv(req models.CreateSessionRequest) ([]string, error) {
 	if len(req.Argv) > 0 {
 		return append([]string{}, req.Argv...), nil
 	}
-	if cmd := strings.TrimSpace(req.Command); cmd != "" {
-		shell := detectShell()
-		return []string{shell, "-c", cmd}, nil
+	shell, err := detectShell()
+	if err != nil {
+		return nil, err
 	}
-	// Default: a login shell. Prefer bash, fall back to sh.
-	shell := detectShell()
-	if filepath.Base(shell) == "bash" {
-		return []string{shell, "-l"}, nil
+	if cmd := strings.TrimSpace(req.Command); cmd != "" {
+		return []string{shell, "-c", cmd}, nil
 	}
 	return []string{shell, "-l"}, nil
 }
 
-func detectShell() string {
-	if path, err := exec.LookPath("bash"); err == nil {
-		return path
+// detectShell prefers bash, falls back to sh on PATH, then to /bin/sh for
+// a toolboxd started with a PATH that misses it.
+func detectShell() (string, error) {
+	for _, name := range []string{"bash", "sh"} {
+		if path, err := lookPath(name); err == nil {
+			return path, nil
+		}
 	}
-	if path, err := exec.LookPath("sh"); err == nil {
-		return path
+	if _, err := statPath("/bin/sh"); err == nil {
+		return "/bin/sh", nil
 	}
-	return "/bin/sh"
+	return "", ErrNoShell
 }

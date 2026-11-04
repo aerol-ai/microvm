@@ -1,14 +1,30 @@
 package containerd
 
 import (
-	"bufio"
-	"fmt"
-	"net"
 	"os"
 	"path/filepath"
-	"strings"
+
+	"github.com/opencontainers/runtime-spec/specs-go"
+
+	"github.com/aerol-ai/microvm/internal/runtime/resolvconf"
 )
 
+// A container's host files (resolv.conf, hosts, hostname) live in
+// <RunDir>/hosts/<container id>, and the container's OCI spec bind-mounts
+// them from there. The spec is written once, at NewContainer, and every task
+// start re-reads it, so the directory must sit at that path for as long as
+// the container exists: it belongs to the container, not to whichever
+// sandbox holds the container. For a cold create the container id is the
+// sandbox id. For a warm-pool container it stays the park slot id
+// (park-<hex>) after a sandbox adopts it, since adoption relabels the
+// container and never renames it. Destroy removes the directory by the
+// container id (destroyParked by the slot id, which is the same string).
+//
+// Adoption used to rename the directory to the sandbox id. The running task
+// didn't notice (a bind mount holds the inode, not the path), but the next
+// start re-created the task from a spec that still named the park path, and
+// runc failed: "open .../hosts/park-<id>/resolv.conf: no such file or
+// directory".
 type sandboxHostFiles struct {
 	Dir        string
 	ResolvConf string
@@ -16,12 +32,16 @@ type sandboxHostFiles struct {
 	Hostname   string
 }
 
+func hostFilesDir(runDir, containerID string) string {
+	return filepath.Join(runDir, "hosts", containerID)
+}
+
 func prepareSandboxHostFiles(runDir, sandboxID string) (*sandboxHostFiles, error) {
-	dir := filepath.Join(runDir, "hosts", sandboxID)
+	dir := hostFilesDir(runDir, sandboxID)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, err
 	}
-	resolvBody, err := generateResolvConf(hostResolvConfPath)
+	resolvBody, err := resolvconf.Generate(resolvconf.HostPath)
 	if err != nil {
 		return nil, err
 	}
@@ -45,72 +65,54 @@ func prepareSandboxHostFiles(runDir, sandboxID string) (*sandboxHostFiles, error
 	}, nil
 }
 
-// hostResolvConfPath is the host resolver source generateResolvConf reads.
-// A package var (not a literal) so tests can point it at a fixture.
-const hostResolvConfPath = "/etc/resolv.conf"
-
-// generateResolvConf copies upstream resolvers from the given host resolv.conf,
-// stripping loopback stubs like systemd-resolved's 127.0.0.53 that are
-// unreachable from a container netns. A missing/empty source falls back to a
-// public resolver so the sandbox still resolves DNS.
-func generateResolvConf(path string) (string, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return "nameserver 8.8.8.8\n", nil
+// ensureSpecHostFiles puts back a host-files directory the container's spec
+// mounts but the host no longer has, before a start hands that spec to runc.
+// The one way it goes missing is a warm-pool container adopted by a build
+// that renamed the directory to the sandbox id (see sandboxHostFiles): that
+// directory is moved back to the path the spec names. With nothing to move,
+// the files are generated again, as the park or create did. Either way the
+// start goes ahead; without this, such a sandbox could never start again.
+// A spec whose mounts are all present costs one stat per host-file mount.
+func (d *Driver) ensureSpecHostFiles(spec *specs.Spec, sandboxID string) error {
+	if spec == nil {
+		return nil
 	}
-	defer f.Close()
-
-	var nameservers []string
-	var search []string
-	var options []string
-	sc := bufio.NewScanner(f)
-	for sc.Scan() {
-		line := strings.TrimSpace(sc.Text())
-		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, ";") {
+	root := filepath.Join(d.cfg.RunDir, "hosts")
+	for _, m := range spec.Mounts {
+		if m.Type != "bind" || filepath.Dir(filepath.Dir(m.Source)) != root {
 			continue
 		}
-		fields := strings.Fields(line)
-		if len(fields) < 2 {
+		if _, err := os.Stat(m.Source); err == nil {
 			continue
 		}
-		switch strings.ToLower(fields[0]) {
-		case "nameserver":
-			ip := strings.TrimSpace(fields[1])
-			if isLoopbackResolver(ip) {
+		dir := filepath.Dir(m.Source)
+		owner := filepath.Base(dir)
+		if validateSandboxID(owner) != nil {
+			continue
+		}
+		// A sandbox has one container, so a directory under its own id here
+		// can only be that container's, renamed.
+		if sandboxID != owner && validateSandboxID(sandboxID) == nil {
+			legacy := hostFilesDir(d.cfg.RunDir, sandboxID)
+			if _, err := os.Stat(legacy); err == nil {
+				_ = os.RemoveAll(dir)
+				if err := os.Rename(legacy, dir); err != nil {
+					return err
+				}
+				if d.logger != nil {
+					d.logger.Warn("containerd start: moved a renamed host-files directory back to the path its container mounts",
+						"container_id", owner, "sandbox_id", sandboxID)
+				}
 				continue
 			}
-			if net.ParseIP(ip) != nil {
-				nameservers = append(nameservers, ip)
-			}
-		case "search":
-			search = append(search, fields[1:]...)
-		case "options":
-			options = append(options, fields[1:]...)
+		}
+		if _, err := prepareSandboxHostFiles(d.cfg.RunDir, owner); err != nil {
+			return err
+		}
+		if d.logger != nil {
+			d.logger.Warn("containerd start: regenerated a container's missing host files",
+				"container_id", owner, "missing", m.Source)
 		}
 	}
-	if err := sc.Err(); err != nil {
-		return "", err
-	}
-	if len(nameservers) == 0 {
-		nameservers = []string{"8.8.8.8"}
-	}
-	var b strings.Builder
-	if len(search) > 0 {
-		fmt.Fprintf(&b, "search %s\n", strings.Join(search, " "))
-	}
-	if len(options) > 0 {
-		fmt.Fprintf(&b, "options %s\n", strings.Join(options, " "))
-	}
-	for _, ns := range nameservers {
-		fmt.Fprintf(&b, "nameserver %s\n", ns)
-	}
-	return b.String(), nil
-}
-
-func isLoopbackResolver(ip string) bool {
-	parsed := net.ParseIP(ip)
-	if parsed == nil {
-		return false
-	}
-	return parsed.IsLoopback()
+	return nil
 }

@@ -242,3 +242,28 @@ func TestDriverImageExists(t *testing.T) {
 		t.Fatal("blank ref should be false")
 	}
 }
+
+// A forced-pull build tells BuildKit to resolve every image from its
+// registry; an ordinary build leaves the resolve mode alone.
+func TestBuildKitBuilderForcePull(t *testing.T) {
+	dir := t.TempDir()
+	argsFile := filepath.Join(dir, "args")
+	path := filepath.Join(dir, "buildctl")
+	if err := os.WriteFile(path, []byte("#!/bin/sh\necho \"$@\" >> "+argsFile+"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	b := NewBuildKitBuilder("", path, nil)
+	for _, force := range []bool{true, false} {
+		if err := b.BuildImage(context.Background(), docker.BuildImageRequest{Tag: "built:x", DockerfileContent: "FROM alpine", ForcePull: force}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	raw, err := os.ReadFile(argsFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	calls := strings.Split(strings.TrimSpace(string(raw)), "\n")
+	if len(calls) != 2 || !strings.Contains(calls[0], "--opt image-resolve-mode=pull") || strings.Contains(calls[1], "image-resolve-mode") {
+		t.Fatalf("buildctl calls = %q; want the resolve mode only on the forced build", calls)
+	}
+}

@@ -88,6 +88,12 @@ func (b *BuildKitBuilder) BuildImage(ctx context.Context, req docker.BuildImageR
 		"--local", "dockerfile=" + dir,
 		"--output", "type=image,name=" + tag + ",unpack=true",
 	}
+	if req.ForcePull {
+		// Resolve FROM, COPY --from and ONBUILD images from their registry,
+		// never from images already on this node (see
+		// docker.BuildImageRequest.ForcePull).
+		args = append(args, "--opt", "image-resolve-mode=pull")
+	}
 	cmd := exec.CommandContext(ctx, b.buildct, args...)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr

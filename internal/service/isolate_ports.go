@@ -9,6 +9,9 @@ import (
 	"github.com/aerol-ai/microvm/pkg/models"
 )
 
+// The isolate driver takes live policy updates, injected secrets included.
+var _ isolateEgressPolicyUpdater = (*isolateruntime.Driver)(nil)
+
 func (s *Service) isolatePortGateway() (isolateruntime.PortGateway, error) {
 	if s.isolate == nil {
 		return nil, fmt.Errorf("runtime %q: driver not registered: %w",

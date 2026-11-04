@@ -126,8 +126,10 @@ locals {
     f => file("${path.module}/../setup/grafana/${f}")
   } : {}
 
+  # The scrape credential: the optional read-only metrics_token when set,
+  # else the PAT, as before (plans/identity-and-access.md §5.11).
   obs_prometheus_yml = var.deploy_obs ? templatefile("${path.module}/../setup/obs/prometheus.yml.tftpl", {
-    pat_token      = local.pat_token
+    scrape_token   = local.metrics_token != "" ? local.metrics_token : local.pat_token
     scrape_targets = [for n, inst in local.all_instances : "${inst.private_ip}:21212"]
   }) : ""
 }

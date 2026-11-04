@@ -74,6 +74,15 @@ type netstatsResultPayload struct {
 	BytesOut int64 `json:"bytes_out"`
 }
 
+// setEgressPolicyPayload replaces a sandbox's mediator egress policy (live
+// update, plans/egress-domain-filtering.md P2-1). Empty lists remove it.
+type setEgressPolicyPayload struct {
+	AllowOut []string `json:"allow_out,omitempty"`
+	DenyOut  []string `json:"deny_out,omitempty"`
+	// Learn selects learn mode (P2-7); the lists are then empty.
+	Learn bool `json:"learn,omitempty"`
+}
+
 type setNetworkBlocksPayload struct {
 	BlockIngress bool `json:"block_ingress"`
 	BlockEgress  bool `json:"block_egress"`

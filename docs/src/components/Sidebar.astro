@@ -1,4 +1,5 @@
 ---
+import Search from '@astrojs/starlight/components/Search.astro'
 import { getSidebarConfig } from '../content.config'
 import { getSidebar } from '../utils/navigation'
 import SidebarSublist from './SidebarSublist.astro'
@@ -6,4 +7,32 @@ import SidebarSublist from './SidebarSublist.astro'
 const sidebar = getSidebar(getSidebarConfig(Astro.url.pathname), Astro.url.pathname)
 ---
 
+<!-- Search lives here, once per page: Starlight's Search uses a fixed element
+     id and a global Ctrl/Cmd+K listener, so a second copy in the header would
+     clash. The sidebar is also what the mobile menu opens. -->
+<div class="sidebar-search"><Search /></div>
 <SidebarSublist sublist={sidebar} />
+
+<style>
+  .sidebar-search {
+    padding: 4px 0 8px;
+  }
+
+  /* Starlight shrinks Search to a bare icon below 50rem, which is easy to miss
+     at the top of the mobile menu. Keep the full labelled box at every width;
+     these rules are unlayered, so they win over Starlight's layered styles. */
+  .sidebar-search :global(button[data-open-modal]) {
+    width: 100%;
+    max-width: none;
+    border: 1px solid var(--sl-color-gray-5);
+    border-radius: 0.5rem;
+    padding-inline: 0.75rem 0.5rem;
+    background-color: var(--sl-color-black);
+    color: var(--sl-color-gray-2);
+    font-size: var(--sl-text-sm);
+  }
+
+  .sidebar-search :global(button[data-open-modal] > span) {
+    display: block;
+  }
+</style>

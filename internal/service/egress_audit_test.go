@@ -8,6 +8,7 @@ import (
 
 	"github.com/aerol-ai/microvm/internal/cluster"
 	"github.com/aerol-ai/microvm/internal/config"
+	"github.com/aerol-ai/microvm/internal/egress"
 	storepkg "github.com/aerol-ai/microvm/internal/store"
 )
 
@@ -147,5 +148,24 @@ func TestSecretAuditKindMatches(t *testing.T) {
 	}
 	if !secretAuditKindMatches(secretAuditKindEgress, secretAuditKindEgress) {
 		t.Fatal("egress should match")
+	}
+}
+
+// TestLearnModeEventsMarkedInAudit (CEO D2): every allowed learn-mode
+// connection is marked in the audit log; denials keep their own reason.
+func TestLearnModeEventsMarkedInAudit(t *testing.T) {
+	mem := &memSecretAuditSink{}
+	s := &Service{
+		cfg:         config.Config{EgressAttributionEnabled: true},
+		secretAudit: mem,
+		cluster:     cluster.NewNoop("node-a", "", ""),
+	}
+	ctx := context.Background()
+	s.handleEgressEvent(ctx, egress.Event{Kind: "audit", SandboxID: "sb", Result: "allowed", Destination: "pypi.org:443", Mode: "learn"})
+	s.handleEgressEvent(ctx, egress.Event{Kind: "audit", SandboxID: "sb", Result: "allowed", Destination: "pypi.org:443", Mode: "allowlist"})
+	s.handleEgressEvent(ctx, egress.Event{Kind: "audit", SandboxID: "sb", Result: "denied", Reason: "host_not_allowed", Destination: "x:443", Mode: "allowlist"})
+	evs := mem.Events()
+	if len(evs) != 3 || evs[0].Reason != "learn_mode" || evs[0].Result != secretAuditResultSuccess || evs[1].Reason != secretAuditReasonOK || evs[2].Reason != "host_not_allowed" {
+		t.Fatalf("events = %+v", evs)
 	}
 }

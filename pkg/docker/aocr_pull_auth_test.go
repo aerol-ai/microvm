@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -202,6 +203,81 @@ func TestConfigureAOCRPullAuth_NoOpWhenIncomplete(t *testing.T) {
 			if c.aocrPullAuth != nil {
 				t.Fatalf("expected aocrPullAuth to stay nil for incomplete config")
 			}
+			if a := NewAOCRPullAuth(tc.hosts, tc.clusterID, tc.patPath); a != nil {
+				t.Fatalf("NewAOCRPullAuth = %+v, want nil for incomplete config", a)
+			}
 		})
+	}
+}
+
+// TestConfigureAOCRPullAuth_IncompleteKeepsPrior pins the documented no-op: an
+// incomplete reconfigure must not silently switch a configured node back to
+// anonymous pulls.
+func TestConfigureAOCRPullAuth_IncompleteKeepsPrior(t *testing.T) {
+	c := &Client{}
+	c.ConfigureAOCRPullAuth([]string{"aocr.aerol.ai"}, "c1", writePAT(t, "tok"))
+	prior := c.aocrPullAuth
+	c.ConfigureAOCRPullAuth([]string{"aocr.aerol.ai"}, "", "")
+	if c.aocrPullAuth != prior || prior == nil {
+		t.Fatalf("incomplete reconfigure replaced the credential: prior=%p now=%p", prior, c.aocrPullAuth)
+	}
+}
+
+// TestAOCRPullAuthResolve_ErrorContract covers the exported resolver the
+// containerd driver shares: out-of-scope refs never touch the PAT file, an
+// in-scope ref with an unusable PAT returns an error naming the path (never
+// the contents), and a nil receiver is a valid "feature off".
+func TestAOCRPullAuthResolve_ErrorContract(t *testing.T) {
+	dir := t.TempDir()
+	missing := filepath.Join(dir, "missing-pat")
+	blank := filepath.Join(dir, "blank-pat")
+	if err := os.WriteFile(blank, []byte(" \n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	clusterRef := "aocr.aerol.ai/cluster/c1/snapshots/s:latest--ttl-1h"
+
+	cases := []struct {
+		name    string
+		auth    *AOCRPullAuth
+		ref     string
+		wantErr error
+	}{
+		{"nil receiver", nil, clusterRef, nil},
+		{"blank ref", NewAOCRPullAuth([]string{"aocr.aerol.ai"}, "c1", missing), "  ", nil},
+		{"out of scope host skips PAT read", NewAOCRPullAuth([]string{"aocr.aerol.ai"}, "c1", missing), "ghcr.io/cluster/c1/x:1", nil},
+		{"out of scope repo skips PAT read", NewAOCRPullAuth([]string{"aocr.aerol.ai"}, "c1", missing), "aocr.aerol.ai/acme/x:1", nil},
+		{"in scope, PAT missing", NewAOCRPullAuth([]string{"aocr.aerol.ai"}, "c1", missing), clusterRef, os.ErrNotExist},
+		{"in scope, PAT blank", NewAOCRPullAuth([]string{"aocr.aerol.ai"}, "c1", blank), clusterRef, os.ErrInvalid},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := tc.auth.Resolve(tc.ref)
+			if got != nil {
+				t.Fatalf("Resolve returned auth %+v, want nil", got)
+			}
+			if tc.wantErr == nil {
+				if err != nil {
+					t.Fatalf("Resolve err = %v, want nil", err)
+				}
+				return
+			}
+			if !errors.Is(err, tc.wantErr) {
+				t.Fatalf("Resolve err = %v, want errors.Is %v", err, tc.wantErr)
+			}
+			if !strings.Contains(err.Error(), tc.auth.patPath) {
+				t.Fatalf("Resolve err %q does not name the PAT path %q", err, tc.auth.patPath)
+			}
+		})
+	}
+}
+
+func TestAOCRPullAuthResolve_InScope(t *testing.T) {
+	a := NewAOCRPullAuth([]string{" AOCR.aerol.ai/ "}, " c1 ", writePAT(t, "tok-1\n"))
+	got, err := a.Resolve("aocr.aerol.ai/cluster/c1/snapshots/s:latest--ttl-1h")
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	if got == nil || got.Server != "aocr.aerol.ai" || got.Username != "c1" || got.Password != "tok-1" {
+		t.Fatalf("Resolve = %+v, want server=aocr.aerol.ai user=c1 password=tok-1", got)
 	}
 }

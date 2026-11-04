@@ -12,6 +12,9 @@ export interface NavigationLink extends NavigationItem {
   description?: string
   external?: boolean
   exact?: boolean
+  // Anchors inside this page, listed under it in a list that starts closed.
+  // They are not pages, so pagination and Explore More skip them.
+  children?: NavigationLink[]
 }
 
 export interface NavigationGroup extends NavigationItem {
@@ -76,6 +79,17 @@ export function getSidebar(
   _currentPath: string
 ): NavigationGroup[] {
   return sidebarConfig
+}
+
+// The top-level sidebar group a page sits in, shown above the page title so a
+// reader landing from search knows which part of the docs they are in.
+export function getSectionLabel(
+  sidebarConfig: NavigationGroup[],
+  currentPath: string
+): string | undefined {
+  return sidebarConfig.find(group =>
+    flattenEntries(group.entries || []).some(link => comparePaths(link.href, currentPath))
+  )?.label
 }
 
 export function getPagination(

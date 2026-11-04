@@ -76,11 +76,10 @@ func (f *fakeImageBuilder) PushImage(_ context.Context, req docker.PushImageRequ
 	return req.DestRef, nil
 }
 
-func newTestMux(builder ImageBuilder, build BuildConfig) http.Handler {
+func newTestMux(builder service.ImageBuilder, build buildConfig) http.Handler {
 	mux := http.NewServeMux()
 	RegisterRoutes(mux, Deps{
-		Builder: builder,
-		Build:   build,
+		Service: buildService(builder, build),
 		Auth:    func(h http.Handler) http.Handler { return h },
 	})
 	return mux
@@ -89,7 +88,7 @@ func newTestMux(builder ImageBuilder, build BuildConfig) http.Handler {
 func TestBuildImageReturnsContentAddressedTag(t *testing.T) {
 	dockerfile := "FROM alpine\nRUN echo hi"
 	builder := &fakeImageBuilder{}
-	mux := newTestMux(builder, BuildConfig{})
+	mux := newTestMux(builder, buildConfig{})
 
 	body, _ := json.Marshal(buildImageRequest{DockerfileContent: dockerfile})
 	rr := httptest.NewRecorder()
@@ -202,9 +201,8 @@ func TestClusterBuildImageWrapBuildsLocallyWhenPlacementSelectsSelf(t *testing.T
 	builder := &fakeImageBuilder{}
 	mux := http.NewServeMux()
 	RegisterRoutes(mux, Deps{
-		Service: svc,
+		Service: withBuilder(svc, builder),
 		Logger:  logger,
-		Builder: builder,
 		Auth:    func(h http.Handler) http.Handler { return h },
 	})
 
@@ -268,7 +266,7 @@ func TestBuildImageCacheHitSkipsBuild(t *testing.T) {
 	dockerfile := "FROM alpine\nRUN echo hi"
 	wantTag := docker.BuildTagFor(dockerfile, nil)
 	builder := &fakeImageBuilder{exists: map[string]bool{wantTag: true}}
-	mux := newTestMux(builder, BuildConfig{})
+	mux := newTestMux(builder, buildConfig{})
 
 	body, _ := json.Marshal(buildImageRequest{DockerfileContent: dockerfile})
 	rr := httptest.NewRecorder()
@@ -283,7 +281,7 @@ func TestBuildImageCacheHitSkipsBuild(t *testing.T) {
 }
 
 func TestBuildImageRejectsEmptyDockerfile(t *testing.T) {
-	mux := newTestMux(&fakeImageBuilder{}, BuildConfig{})
+	mux := newTestMux(&fakeImageBuilder{}, buildConfig{})
 	body, _ := json.Marshal(buildImageRequest{DockerfileContent: "   "})
 	rr := httptest.NewRecorder()
 	mux.ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/v1/images/build", strings.NewReader(string(body))))
@@ -293,7 +291,7 @@ func TestBuildImageRejectsEmptyDockerfile(t *testing.T) {
 }
 
 func TestBuildImageRejectsContextHashesWithoutFlag(t *testing.T) {
-	mux := newTestMux(&fakeImageBuilder{}, BuildConfig{})
+	mux := newTestMux(&fakeImageBuilder{}, buildConfig{})
 	body, _ := json.Marshal(buildImageRequest{
 		DockerfileContent: "FROM alpine\nCOPY x x",
 		ContextHashes:     []string{"deadbeef"},
@@ -309,7 +307,7 @@ func TestBuildImageRejectsContextHashesWithoutFlag(t *testing.T) {
 }
 
 func TestBuildImageRejectsMissingBuilder(t *testing.T) {
-	mux := newTestMux(nil, BuildConfig{})
+	mux := newTestMux(nil, buildConfig{})
 	body, _ := json.Marshal(buildImageRequest{DockerfileContent: "FROM alpine"})
 	rr := httptest.NewRecorder()
 	mux.ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/v1/images/build", strings.NewReader(string(body))))
@@ -326,8 +324,7 @@ func TestBuildImageContainerdRoutesThroughBuilder(t *testing.T) {
 	builder := &fakeImageBuilder{}
 	mux := http.NewServeMux()
 	RegisterRoutes(mux, Deps{
-		Builder:         builder,
-		Build:           BuildConfig{},
+		Service:         buildService(builder, buildConfig{}),
 		Auth:            func(h http.Handler) http.Handler { return h },
 		ContainerEngine: models.ContainerEngineContainerd,
 	})
@@ -348,8 +345,7 @@ func TestBuildImageContainerdNoBuilder(t *testing.T) {
 	// path uses — rather than a hang or panic.
 	mux := http.NewServeMux()
 	RegisterRoutes(mux, Deps{
-		Builder:         nil,
-		Build:           BuildConfig{},
+		Service:         buildService(nil, buildConfig{}),
 		Auth:            func(h http.Handler) http.Handler { return h },
 		ContainerEngine: models.ContainerEngineContainerd,
 	})
@@ -364,7 +360,7 @@ func TestBuildImageContainerdNoBuilder(t *testing.T) {
 func TestBuildImagePushesAfterBuild(t *testing.T) {
 	dockerfile := "FROM alpine\nRUN echo hi"
 	builder := &fakeImageBuilder{}
-	mux := newTestMux(builder, BuildConfig{})
+	mux := newTestMux(builder, buildConfig{})
 
 	body, _ := json.Marshal(buildImageRequest{
 		DockerfileContent: dockerfile,
@@ -415,7 +411,7 @@ func TestBuildImagePushesOnCacheHit(t *testing.T) {
 	dockerfile := "FROM alpine\nRUN echo hi"
 	wantTag := docker.BuildTagFor(dockerfile, nil)
 	builder := &fakeImageBuilder{exists: map[string]bool{wantTag: true}}
-	mux := newTestMux(builder, BuildConfig{})
+	mux := newTestMux(builder, buildConfig{})
 
 	body, _ := json.Marshal(buildImageRequest{
 		DockerfileContent: dockerfile,
@@ -450,7 +446,7 @@ func TestBuildImagePushRejectsMissingCredentials(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			mux := newTestMux(&fakeImageBuilder{}, BuildConfig{})
+			mux := newTestMux(&fakeImageBuilder{}, buildConfig{})
 			body, _ := json.Marshal(buildImageRequest{
 				DockerfileContent: "FROM alpine",
 				Push:              tc.push,
@@ -467,7 +463,7 @@ func TestBuildImagePushRejectsMissingCredentials(t *testing.T) {
 func TestBuildImagePushFailureSurfaces(t *testing.T) {
 	dockerfile := "FROM alpine"
 	builder := &fakeImageBuilder{pushErr: errPushBoom}
-	mux := newTestMux(builder, BuildConfig{})
+	mux := newTestMux(builder, buildConfig{})
 
 	body, _ := json.Marshal(buildImageRequest{
 		DockerfileContent: dockerfile,
@@ -495,7 +491,7 @@ func TestBuildImageInvalidJSON(t *testing.T) {
 }
 
 func TestBuildImageContextHashesEnabledReturns501(t *testing.T) {
-	mux := newTestMux(&fakeImageBuilder{}, BuildConfig{ContextEnabled: true})
+	mux := newTestMux(&fakeImageBuilder{}, buildConfig{ContextEnabled: true})
 	body, _ := json.Marshal(buildImageRequest{
 		DockerfileContent: "FROM alpine\nCOPY . /app",
 		ContextHashes:     []string{"deadbeef"},
@@ -514,7 +510,7 @@ func TestBuildImageCacheRefreshFailureStillOK(t *testing.T) {
 		exists:     map[string]bool{wantTag: true},
 		refreshErr: errors.New("refresh failed"),
 	}
-	mux := newTestMux(builder, BuildConfig{})
+	mux := newTestMux(builder, buildConfig{})
 
 	body, _ := json.Marshal(buildImageRequest{DockerfileContent: dockerfile})
 	rr := httptest.NewRecorder()
@@ -526,18 +522,20 @@ func TestBuildImageCacheRefreshFailureStillOK(t *testing.T) {
 
 func TestBuildImageBuildFailure(t *testing.T) {
 	builder := &fakeImageBuilder{buildErr: errors.New("build failed")}
-	mux := newTestMux(builder, BuildConfig{})
+	mux := newTestMux(builder, buildConfig{})
 	body, _ := json.Marshal(buildImageRequest{DockerfileContent: "FROM alpine\nRUN false"})
 	rr := httptest.NewRecorder()
 	mux.ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/v1/images/build", strings.NewReader(string(body))))
-	if rr.Code != http.StatusInternalServerError {
-		t.Fatalf("status = %d, want 500; body=%s", rr.Code, rr.Body.String())
+	// An engine failure is the daemon's, the same 502 on every surface
+	// that builds (service.ErrBuildFailed).
+	if rr.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502; body=%s", rr.Code, rr.Body.String())
 	}
 }
 
 func TestBuildImageBuildTimeout(t *testing.T) {
 	builder := &fakeImageBuilder{buildErr: context.DeadlineExceeded}
-	mux := newTestMux(builder, BuildConfig{Timeout: time.Second})
+	mux := newTestMux(builder, buildConfig{Timeout: time.Second})
 	body, _ := json.Marshal(buildImageRequest{DockerfileContent: "FROM alpine\nRUN sleep 999"})
 	rr := httptest.NewRecorder()
 	mux.ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/v1/images/build", strings.NewReader(string(body))))
@@ -548,7 +546,7 @@ func TestBuildImageBuildTimeout(t *testing.T) {
 
 func TestBuildImagePushTimeout(t *testing.T) {
 	builder := &fakeImageBuilder{pushErr: context.DeadlineExceeded}
-	mux := newTestMux(builder, BuildConfig{Timeout: time.Second})
+	mux := newTestMux(builder, buildConfig{Timeout: time.Second})
 	body, _ := json.Marshal(buildImageRequest{
 		DockerfileContent: "FROM alpine",
 		Push: &buildImagePushSpec{
@@ -564,20 +562,14 @@ func TestBuildImagePushTimeout(t *testing.T) {
 
 func TestBuildImageExistsCheckError(t *testing.T) {
 	builder := &fakeImageBuilder{existsErr: errors.New("daemon down")}
-	mux := newTestMux(builder, BuildConfig{})
+	mux := newTestMux(builder, buildConfig{})
 	body := `{"dockerfile_content":"FROM alpine\nRUN echo hi"}`
 	rr := httptest.NewRecorder()
 	mux.ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/v1/images/build", strings.NewReader(body)))
-	if rr.Code != http.StatusInternalServerError {
-		t.Fatalf("status = %d, want 500; body=%s", rr.Code, rr.Body.String())
-	}
-}
-
-func TestBuildContextWithTimeoutZeroUsesCancelOnly(t *testing.T) {
-	ctx, cancel := buildContextWithTimeout(context.Background(), 0)
-	defer cancel()
-	if _, ok := ctx.Deadline(); ok {
-		t.Fatal("zero timeout should not set deadline")
+	// An engine failure is the daemon's, the same 502 on every surface
+	// that builds (service.ErrBuildFailed).
+	if rr.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502; body=%s", rr.Code, rr.Body.String())
 	}
 }
 

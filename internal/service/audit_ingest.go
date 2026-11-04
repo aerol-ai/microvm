@@ -53,6 +53,36 @@ type auditIngestServer struct {
 type auditIngestRequest struct {
 	Network     string `json:"network,omitempty"`
 	Destination string `json:"destination"`
+	// Result and Reason report a policy denial (H5): result "failure" with
+	// a reason from workerDenialReasons. Omitted for a connection made.
+	Result string `json:"result,omitempty"`
+	Reason string `json:"reason,omitempty"`
+}
+
+// workerDenialReasons is the closed set of denial reasons a worker may
+// report (the WASM mediator's vocabulary). Outcome stays otherwise
+// server-controlled. Letting a capability holder mark its own sandbox's
+// record as a denial grants nothing new: it already chooses which of its
+// sandbox's connections to report at all.
+var workerDenialReasons = map[string]bool{
+	"host_not_allowed": true,
+	"ip_not_allowed":   true,
+	"blocked_ip":       true,
+	"sni_mismatch":     true,
+}
+
+// workerEgressOutcome validates a worker-reported outcome: ("", "") is a
+// connection made; ("failure", known reason) is a denial. ok is false for
+// anything else.
+func workerEgressOutcome(result, reason string) (outResult, outReason string, ok bool) {
+	result, reason = strings.TrimSpace(result), strings.TrimSpace(reason)
+	switch {
+	case result == "" && reason == "", result == secretAuditResultSuccess && (reason == "" || reason == secretAuditReasonOK):
+		return secretAuditResultSuccess, secretAuditReasonOK, true
+	case result == secretAuditResultFailure && workerDenialReasons[reason]:
+		return secretAuditResultFailure, reason, true
+	}
+	return "", "", false
 }
 
 // StartAuditIngestServer binds 127.0.0.1:SB_AUDIT_INGEST_PORT (0 = ephemeral)
@@ -330,6 +360,12 @@ func (ing *auditIngestServer) handleEgress(w http.ResponseWriter, r *http.Reques
 		http.Error(w, "sandbox_id and destination required", http.StatusBadRequest)
 		return
 	}
+	result, reason, ok := workerEgressOutcome(req.Result, req.Reason)
+	if !ok {
+		auditIngestRejectedTotal.Add(1)
+		http.Error(w, "unknown egress outcome", http.StatusBadRequest)
+		return
+	}
 	if err := ing.svc.validateEgressAuditBinding(r.Context(), sandboxID, incarnationID); err != nil {
 		auditIngestRejectedTotal.Add(1)
 		if errors.Is(err, errAuditIngestBindingStale) {
@@ -350,8 +386,8 @@ func (ing *auditIngestServer) handleEgress(w http.ResponseWriter, r *http.Reques
 		Time:          eventTime.UTC(),
 		Actor:         actor,
 		SandboxID:     sandboxID,
-		Result:        secretAuditResultSuccess,
-		Reason:        secretAuditReasonOK,
+		Result:        result,
+		Reason:        reason,
 		NodeID:        actor,
 		Kind:          secretAuditKindEgress,
 		Destination:   destination,
@@ -384,6 +420,9 @@ func (ing *auditIngestServer) handleEgress(w http.ResponseWriter, r *http.Reques
 		sink.Emit(event)
 	}
 	auditIngestAcceptedTotal.Add(1)
+	if result == secretAuditResultFailure {
+		egressDeniedTotal.Add(reason, 1)
+	}
 	w.WriteHeader(http.StatusAccepted)
 }
 

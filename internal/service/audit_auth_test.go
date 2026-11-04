@@ -84,7 +84,7 @@ func TestAuthorizeSandboxAuditAccessViaPlacementOwnerRef(t *testing.T) {
 	if err := authorizeSandboxAuditAccess(svc, evil, "sb-remote", ""); !errors.Is(err, storepkg.ErrNotFound) {
 		t.Fatalf("evil tenant = %v, want ErrNotFound", err)
 	}
-	op := controlplane.ContextWithAccess(context.Background(), controlplane.Access{Operator: true})
+	op := controlplane.ContextWithAccess(context.Background(), controlplane.Access{Fleet: true})
 	if err := authorizeSandboxAuditAccess(svc, op, "sb-remote", ""); err != nil {
 		t.Fatalf("operator: %v", err)
 	}
@@ -121,7 +121,7 @@ func TestAuthorizeSandboxAuditAccessLocalRow(t *testing.T) {
 }
 
 func TestAuthorizeSandboxAuditAccessRejectsUnscopedLifecycleMetadata(t *testing.T) {
-	ctx := controlplane.ContextWithAccess(context.Background(), controlplane.Access{Operator: true})
+	ctx := controlplane.ContextWithAccess(context.Background(), controlplane.Access{Fleet: true})
 	svc := &Service{cluster: &placementOnlyCluster{
 		Noop:      cluster.NewNoop("ingress", "http://ingress", ""),
 		placement: cluster.Placement{SandboxID: "sb-live", OwnerNodeID: "owner"},
@@ -220,7 +220,7 @@ func TestAuthorizeSandboxAuditAccessAfterDeleteViaRaftACL(t *testing.T) {
 	if err := authorizeSandboxAuditAccess(svc, owner, "sb-deleted", "inc-other"); !errors.Is(err, storepkg.ErrNotFound) {
 		t.Fatalf("wrong retained incarnation = %v, want ErrNotFound", err)
 	}
-	operator := controlplane.ContextWithAccess(context.Background(), controlplane.Access{Operator: true})
+	operator := controlplane.ContextWithAccess(context.Background(), controlplane.Access{Fleet: true})
 	if err := authorizeSandboxAuditAccess(svc, operator, "sb-deleted", "inc-other"); !errors.Is(err, storepkg.ErrNotFound) {
 		t.Fatalf("operator wrong retained incarnation = %v, want ErrNotFound", err)
 	}
@@ -281,7 +281,7 @@ func TestAuditAuthorizationNilAndClosedStorePaths(t *testing.T) {
 
 func TestAuthorizeSandboxAuditAccessACLAndIncarnationBranches(t *testing.T) {
 	ctx := context.Background()
-	operator := controlplane.ContextWithAccess(ctx, controlplane.Access{Operator: true})
+	operator := controlplane.ContextWithAccess(ctx, controlplane.Access{Fleet: true})
 	tenant := controlplane.ContextWithAccess(ctx, controlplane.Access{Identity: controlplane.Identity{OwnerRef: "tenant-a"}})
 	foreign := controlplane.ContextWithAccess(ctx, controlplane.Access{Identity: controlplane.Identity{OwnerRef: "tenant-b"}})
 

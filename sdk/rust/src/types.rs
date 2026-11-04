@@ -65,6 +65,17 @@ pub struct CloneGeneration {
     pub resumed_at: i64,
 }
 
+/// Options for `create_snapshot_with_options`.
+#[derive(Debug, Clone, Default)]
+pub struct CreateSnapshotOptions {
+    /// Whether the snapshot may pause a running sandbox. `None` (the
+    /// default) or `Some(true)`: a running sandbox is paused while it is
+    /// copied (its disk writes wait; Docker pauses the container) and keeps
+    /// running afterwards. `Some(false)`: a sandbox that is not stopped is
+    /// refused with HTTP 409 instead, for a workload that must never stall.
+    pub allow_pause: Option<bool>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct RegisterSnapshotOptions {
     /// Human-readable identifier other callers use in create-time snapshot references.
@@ -159,6 +170,28 @@ pub struct GPUOptions {
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
 pub struct CreateOptions {
     pub image: String,
+    /// Sent as the create's `Idempotency-Key` header, never in the body. A
+    /// create sent again with the same key and the same options returns the
+    /// sandbox the first one made instead of making a second; the same key
+    /// with different options fails with an `Error::Api` whose code is
+    /// `"idempotency_key_reused"` (HTTP 422). Keys are scoped to the caller's
+    /// account.
+    ///
+    /// `None` makes the SDK send a random key for each `create` call, reused
+    /// on that call's automatic retries, so a retry after a timeout cannot
+    /// make a second sandbox. Set your own to make your own retries of the
+    /// whole call safe too, such as after your process restarts.
+    #[serde(skip)]
+    pub idempotency_key: Option<String>,
+    /// Optional name, unique among the caller's sandboxes (another account may
+    /// use the same name); a repeat create with a held name returns HTTP 409.
+    /// Names starting with `owner:` or shaped like a sandbox ID (`sb-` plus 16
+    /// hex) are rejected.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// Free-form key/value labels; filter on them with `Client::list_with_tags`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tags: Option<std::collections::HashMap<String, String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cpu: Option<u32>,
     #[serde(rename = "memory_mb", skip_serializing_if = "Option::is_none")]
@@ -171,19 +204,35 @@ pub struct CreateOptions {
     pub os_user: Option<String>,
     #[serde(rename = "network_block_all", skip_serializing_if = "Option::is_none")]
     pub network_block_all: Option<bool>,
-    /// Egress allowlist of CIDRs: when set, the sandbox may reach only these
-    /// destinations and all other outbound traffic is dropped by the host
-    /// firewall. Mutually exclusive with `network_deny_out`; use
-    /// `network_block_all` for a full block.
+    /// Egress allowlist: CIDRs, hostnames, `*.suffix` wildcards and
+    /// `host:port` entries. Alone, the sandbox may reach only these; with
+    /// `network_deny_out`, allow wins, then deny, then the default is allow.
+    /// Use `network_block_all` for a full block.
     #[serde(rename = "network_allow_out", skip_serializing_if = "Option::is_none")]
     pub network_allow_out: Option<Vec<String>>,
-    /// Egress blocklist of CIDRs: the sandbox may reach anything except these
-    /// destinations. Mutually exclusive with `network_allow_out`.
+    /// Egress blocklist of CIDRs (never hostnames): alone, the sandbox may
+    /// reach anything except these destinations.
     #[serde(rename = "network_deny_out", skip_serializing_if = "Option::is_none")]
     pub network_deny_out: Option<Vec<String>>,
-    /// Whether the sandbox may be exposed publicly. `None`/`Some(true)` allow
-    /// it; `Some(false)` makes `expose_port` fail — the sandbox stays reachable
-    /// only via the toolbox proxy and SSH gateway.
+    /// Named egress profiles whose entries join `network_allow_out` (see
+    /// `put_egress_profile`). A profile change reaches every sandbox using it.
+    #[serde(rename = "egress_profiles", skip_serializing_if = "Option::is_none")]
+    pub egress_profiles: Option<Vec<String>>,
+    /// `"learn"` gives the sandbox open egress and records what it reaches,
+    /// so `learned` can suggest an allow list. Trusted runs only. `None` is
+    /// `"enforce"`.
+    #[serde(rename = "network_egress_mode", skip_serializing_if = "Option::is_none")]
+    pub network_egress_mode: Option<String>,
+    /// Method and path rules that refine hosts the allow list already admits
+    /// (at most 32). An inspect rule makes the egress gateway terminate TLS
+    /// on 443 with the node's CA, which only a sandbox created with such a
+    /// rule trusts, so set inspect rules here rather than adding them later.
+    #[serde(rename = "network_egress_rules", skip_serializing_if = "Option::is_none")]
+    pub network_egress_rules: Option<Vec<EgressRule>>,
+    /// Public exposure at create. `None` or `Some(false)` creates the sandbox
+    /// private (no public URL; reachable through the toolbox proxy and SSH
+    /// gateway); `Some(true)` makes it public from boot. Either way, the first
+    /// `expose_port` makes the sandbox public.
     #[serde(rename = "allow_public_traffic", skip_serializing_if = "Option::is_none")]
     pub allow_public_traffic: Option<bool>,
     /// Rewrite the upstream `Host` header on ingress to exposed HTTP ports to
@@ -232,6 +281,12 @@ pub struct CreateOptions {
     /// API today. Not compatible with `gpus`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub runtime: Option<String>,
+    /// Firecracker template id from [`Client::create_template`](crate::Client::create_template).
+    /// Requires `runtime = "firecracker"` and `image`; the sandbox boots the
+    /// template's prepared rootfs instead of building one per create, so the
+    /// template must be ready. Other runtimes ignore it.
+    #[serde(rename = "template_id", skip_serializing_if = "Option::is_none")]
+    pub template_id: Option<String>,
     /// Attach GPU resources to the sandbox. Omit for CPU-only workloads.
     /// Not compatible with `runtime = "gvisor"`.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -509,6 +564,11 @@ pub(crate) struct ExposePortResponseWire {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Sandbox {
     pub id: String,
+    /// Name set at create time, unique per owner. `None` for unnamed sandboxes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tags: Option<std::collections::HashMap<String, String>>,
     pub image: String,
     pub status: String,
     #[serde(rename = "public_url")]
@@ -528,6 +588,23 @@ pub struct Sandbox {
     pub env: Option<std::collections::HashMap<String, String>>,
     #[serde(rename = "network_block_all")]
     pub network_block_all: bool,
+    /// Hostname-egress state on get (container runtimes): "active", "held"
+    /// or "unavailable"; "unenforced" when the server's firewall is off and
+    /// nothing filters the sandbox. `None` otherwise, and on list results.
+    #[serde(default, rename = "egress_status", skip_serializing_if = "Option::is_none")]
+    pub egress_status: Option<String>,
+    /// Egress profiles this sandbox references.
+    #[serde(default, rename = "egress_profiles", skip_serializing_if = "Option::is_none")]
+    pub egress_profiles: Option<Vec<String>>,
+    /// The generation of each referenced profile live on the sandbox.
+    #[serde(default, rename = "egress_profiles_applied", skip_serializing_if = "Option::is_none")]
+    pub egress_profiles_applied: Option<Vec<EgressProfileRef>>,
+    /// `"learn"` while the sandbox records its egress.
+    #[serde(default, rename = "network_egress_mode", skip_serializing_if = "Option::is_none")]
+    pub network_egress_mode: Option<String>,
+    /// Method and path rules on the sandbox's egress; `None` when it has none.
+    #[serde(default, rename = "network_egress_rules", skip_serializing_if = "Option::is_none")]
+    pub network_egress_rules: Option<Vec<EgressRule>>,
     #[serde(rename = "toolbox_enabled")]
     pub toolbox_enabled: bool,
     #[serde(rename = "ssh_public_key", skip_serializing_if = "Option::is_none")]
@@ -602,6 +679,33 @@ pub struct SandboxSnapshot {
     pub disk_gb: Option<u32>,
 }
 
+/// Paging for `list_snapshots`: one name-ordered page. Both fields are
+/// optional — an empty value maps to the first page at the server default
+/// page size.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ListSnapshotsOptions {
+    pub limit: Option<u32>,
+    pub starting_after: Option<String>,
+}
+
+/// One page of snapshots from `list_snapshots`.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
+pub struct SnapshotList {
+    #[serde(default, deserialize_with = "null_as_empty_snapshots")]
+    pub snapshots: Vec<SandboxSnapshot>,
+    /// `true` when another page follows; fetch it with the last name as
+    /// `starting_after`.
+    #[serde(rename = "has_more", default)]
+    pub has_more: bool,
+}
+
+fn null_as_empty_snapshots<'de, D>(d: D) -> Result<Vec<SandboxSnapshot>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<Vec<SandboxSnapshot>>::deserialize(d)?.unwrap_or_default())
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct HealthStatus {
     pub status: String,
@@ -613,7 +717,7 @@ pub struct HealthStatus {
     pub version: String,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
 pub struct ExecRequest {
     pub command: String,
     #[serde(rename = "workdir", skip_serializing_if = "Option::is_none")]
@@ -622,6 +726,20 @@ pub struct ExecRequest {
     pub env: Option<std::collections::HashMap<String, String>>,
     #[serde(rename = "timeout_seconds", skip_serializing_if = "Option::is_none")]
     pub timeout_seconds: Option<u64>,
+}
+
+// A plain string is a shell command with default options, so
+// `sandbox.exec("echo hello")` reads the same as exec(string) in the other SDKs.
+impl From<&str> for ExecRequest {
+    fn from(command: &str) -> Self {
+        ExecRequest { command: command.to_string(), ..Default::default() }
+    }
+}
+
+impl From<String> for ExecRequest {
+    fn from(command: String) -> Self {
+        ExecRequest { command, ..Default::default() }
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -698,6 +816,315 @@ pub struct Session {
 pub struct SessionList {
     pub sessions: Vec<Session>,
 }
+
+/// One record from a sandbox's audit log (`Sandbox::audit`). Kind "egress"
+/// covers outbound connections and denials; a denial has result "failure"
+/// and the policy reason ("host_not_allowed", "sni_not_allowed", ...).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+pub struct AuditEvent {
+    pub time: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    pub result: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub destination: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub r#ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub incarnation_id: Option<String>,
+    /// Records lost at this point (a gap record).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dropped: Option<i64>,
+}
+
+/// Which nodes answered an audit read.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+pub struct AuditCoverage {
+    #[serde(default, deserialize_with = "null_as_empty")]
+    pub answered: Vec<String>,
+    #[serde(default, deserialize_with = "null_as_empty")]
+    pub missing: Vec<String>,
+    #[serde(default)]
+    pub partial: bool,
+}
+
+/// One page of a sandbox's audit log.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+pub struct AuditPage {
+    #[serde(default, deserialize_with = "null_as_empty")]
+    pub events: Vec<AuditEvent>,
+    #[serde(default)]
+    pub coverage: AuditCoverage,
+    /// Pass back as `AuditOptions::cursor` for the next page.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
+/// A sandbox's whole egress policy, for `set_network_policy`. It replaces the
+/// current policy: an empty field is cleared, so the default means open
+/// egress. The grammar is the create one (hostnames, `*.` wildcards,
+/// `host:port` and CIDRs in the allow list; CIDRs only in the deny list).
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+pub struct NetworkPolicyOptions {
+    pub network_block_all: bool,
+    pub network_allow_out: Vec<String>,
+    pub network_deny_out: Vec<String>,
+    pub egress_profiles: Vec<String>,
+    /// `"enforce"` or `"learn"`; empty is `"enforce"`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub network_egress_mode: String,
+    /// Replaces the method and path rules. Adding an inspect rule to a
+    /// container sandbox created without one is refused with 409: recreate
+    /// it with the rule.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub network_egress_rules: Vec<EgressRule>,
+}
+
+/// The policy a sandbox enforces after `set_network_policy`.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+pub struct NetworkPolicy {
+    pub network_block_all: bool,
+    #[serde(default)]
+    pub network_allow_out: Vec<String>,
+    #[serde(default)]
+    pub network_deny_out: Vec<String>,
+    #[serde(default)]
+    pub egress_profiles: Vec<String>,
+    /// `"enforce"` or `"learn"`.
+    #[serde(default)]
+    pub network_egress_mode: String,
+    #[serde(default, deserialize_with = "null_as_empty")]
+    pub network_egress_rules: Vec<EgressRule>,
+    /// Hostname entries in force: inline plus every profile's (at most 1024).
+    #[serde(default)]
+    pub effective_hostname_count: usize,
+    /// "active", "held" or "unavailable" for hostname rules on a container;
+    /// "unenforced" when the server's firewall is off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub egress_status: Option<String>,
+}
+
+/// One method, path or program rule. Rules refine a host the allow list
+/// already admits: a request to a ruled host passes when some rule for that
+/// host admits its program, method and path, and gets a 403 otherwise. A
+/// host no rule names keeps its allow-list decision.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+pub struct EgressRule {
+    /// An exact name or `*.` wildcard, without a port.
+    pub host: String,
+    /// `[80]` by default, or `[443]` with `inspect`; only 80 and 443, except
+    /// that a rule with only `binaries` may name any port the allow list
+    /// opens.
+    #[serde(default, skip_serializing_if = "Vec::is_empty", deserialize_with = "null_as_empty")]
+    pub ports: Vec<u16>,
+    /// Exact, upper case (`GET`, `POST`); empty allows any.
+    #[serde(default, skip_serializing_if = "Vec::is_empty", deserialize_with = "null_as_empty")]
+    pub methods: Vec<String>,
+    /// Path globs: `*` within one segment, `**` as a whole segment for any
+    /// number of them. Empty allows any path.
+    #[serde(default, skip_serializing_if = "Vec::is_empty", deserialize_with = "null_as_empty")]
+    pub paths: Vec<String>,
+    /// Terminate TLS on 443 with the node's CA so the rule can see requests.
+    /// The request's Host must then equal the TLS server name.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub inspect: bool,
+    /// Replace a header on the requests this rule allows with a secret from
+    /// the sandbox's own env, which the sandbox itself only sees as a
+    /// placeholder. Needs `inspect`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inject: Option<EgressInject>,
+    /// Limit the rule to connections opened by these executables: clean
+    /// absolute paths inside the sandbox, at most 16. For an interpreter
+    /// (python, node, a shell) the script it runs counts too, so
+    /// `/usr/local/bin/pip` works. A rule with only `binaries` decides whole
+    /// connections, on any port the allow list opens. Runc sandboxes only
+    /// (docker and containerd); least privilege for trusted tooling, not a
+    /// security boundary.
+    #[serde(default, skip_serializing_if = "Vec::is_empty", deserialize_with = "null_as_empty")]
+    pub binaries: Vec<String>,
+}
+
+/// A rule's credential injection. The sandbox's env holds
+/// `aerolvm-placeholder:<KEY>` in place of the value, and the egress gateway
+/// replaces `header` with the real value on each request the rule allows,
+/// so code in the sandbox never holds the secret.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+pub struct EgressInject {
+    /// The header to replace, such as `Authorization`. It is replaced, never
+    /// added to a body or URL. Headers that frame or route the request, such
+    /// as `Host` or `Content-Length`, can't be injected.
+    pub header: String,
+    /// `"env:<KEY>"`: a key in the create's `env`, whose value is the whole
+    /// header value (for example `Bearer ghp_...`). Rotating it means
+    /// recreating the sandbox.
+    #[serde(rename = "secret_ref")]
+    pub secret_ref: String,
+}
+
+/// A named allowlist sandboxes reference through `egress_profiles`.
+/// Profiles belong to your account; `generation` goes up on every change.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+pub struct EgressProfile {
+    pub name: String,
+    /// Hostnames, `*.` wildcards, `host:port` entries and CIDRs.
+    #[serde(default)]
+    pub allow_out: Vec<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
+    pub generation: i64,
+    #[serde(default)]
+    pub created_at: String,
+    #[serde(default)]
+    pub updated_at: String,
+}
+
+/// The body of `put_egress_profile`: a full replace.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+pub struct EgressProfileOptions {
+    pub allow_out: Vec<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
+}
+
+/// Paging for `list_egress_profiles`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ListEgressProfilesOptions {
+    pub cursor: Option<String>,
+    pub limit: Option<u32>,
+}
+
+/// One page of egress profiles.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+pub struct EgressProfileList {
+    #[serde(default, deserialize_with = "null_as_empty_profiles")]
+    pub profiles: Vec<EgressProfile>,
+    /// Pass back as `cursor` for the next page; absent on the last one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
+fn null_as_empty_profiles<'de, D>(d: D) -> Result<Vec<EgressProfile>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<Vec<EgressProfile>>::deserialize(d)?.unwrap_or_default())
+}
+
+/// One destination a learn-mode sandbox reached.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+pub struct NetworkLearnedEntry {
+    pub host: String,
+    /// Connection ports; empty when the name was only resolved.
+    #[serde(default, deserialize_with = "null_as_empty_ports")]
+    pub ports: Vec<u16>,
+    #[serde(default)]
+    pub first_seen: String,
+    #[serde(default)]
+    pub last_seen: String,
+    #[serde(default)]
+    pub hits: u64,
+}
+
+fn null_as_empty_ports<'de, D>(d: D) -> Result<Vec<u16>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<Vec<u16>>::deserialize(d)?.unwrap_or_default())
+}
+
+fn null_as_empty_strings<'de, D>(d: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<Vec<String>>::deserialize(d)?.unwrap_or_default())
+}
+
+/// What a sandbox reached in learn mode, and the allow list that would have
+/// allowed it: `suggested_allow_out` when it fits 64 hostnames, otherwise
+/// `suggested_profile` (a body for `put_egress_profile`).
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+pub struct NetworkLearned {
+    pub mode: String,
+    /// Recording stopped at its cap.
+    #[serde(default)]
+    pub truncated: bool,
+    #[serde(default, deserialize_with = "null_as_empty_entries")]
+    pub entries: Vec<NetworkLearnedEntry>,
+    #[serde(default, deserialize_with = "null_as_empty_strings")]
+    pub cidrs: Vec<String>,
+    #[serde(default, deserialize_with = "null_as_empty_strings")]
+    pub suggested_allow_out: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suggested_profile: Option<EgressProfileOptions>,
+}
+
+fn null_as_empty_entries<'de, D>(d: D) -> Result<Vec<NetworkLearnedEntry>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<Vec<NetworkLearnedEntry>>::deserialize(d)?.unwrap_or_default())
+}
+
+/// A referenced profile and the generation of it live on a sandbox.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+pub struct EgressProfileRef {
+    pub name: String,
+    pub generation: i64,
+}
+
+/// Asks whether a sandbox created with these egress fields would reach
+/// `destination` ("host", "host:port", "IP" or "IP:port").
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+pub struct NetworkPolicyCheckOptions {
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub network_block_all: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub network_allow_out: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub network_deny_out: Vec<String>,
+    pub destination: String,
+}
+
+/// The answer to a policy check.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+pub struct NetworkPolicyCheckResult {
+    pub allowed: bool,
+    /// The entry that decided; empty when the default verdict did.
+    #[serde(default)]
+    pub matched_rule: String,
+    /// "allow" or "deny": what happens to a destination no entry matches.
+    #[serde(default)]
+    pub default_verdict: String,
+    /// The first allow entry outside this deployment's ceiling, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outside_ceiling: Option<String>,
+}
+
+/// Filters and paging for `Sandbox::audit`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AuditOptions {
+    pub kind: Option<String>,
+    pub limit: Option<u32>,
+    pub cursor: Option<String>,
+    pub incarnation_id: Option<String>,
+}
+
+fn null_as_empty<'de, D, T>(d: D) -> Result<Vec<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Ok(Option::<Vec<T>>::deserialize(d)?.unwrap_or_default())
+}
+
 
 /// Per-sandbox network byte counters and the configured caps that drive the
 /// quota enforcer. `bytes_in` is traffic the container received (ingress);
@@ -914,6 +1341,16 @@ pub struct RetryConfig {
     pub max_retries: Option<i32>,
     pub base_delay_ms: Option<u64>,
     pub max_delay_ms: Option<u64>,
+    /// Cap in milliseconds on the wait before re-sending a 429 or 503. The
+    /// client waits as long as the server's `Retry-After` header asks
+    /// (seconds or an HTTP date), never less than its own backoff, plus up
+    /// to a fifth more so clients told the same value spread out; a longer
+    /// ask is cut to this. A missing or malformed header uses the backoff.
+    /// `None` means 30000; `Some(0)` ignores `Retry-After`. The client is
+    /// blocking, so the wait holds the calling thread: lower this to bound
+    /// how long a call can take under load.
+    #[serde(default)]
+    pub max_retry_after_ms: Option<u64>,
 }
 
 impl Default for RetryConfig {
@@ -922,6 +1359,7 @@ impl Default for RetryConfig {
             max_retries: Some(3),
             base_delay_ms: Some(200),
             max_delay_ms: Some(5000),
+            max_retry_after_ms: Some(30_000),
         }
     }
 }
@@ -929,6 +1367,103 @@ impl Default for RetryConfig {
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
 pub struct ClientConfig {
     pub api_url: Option<String>,
+    /// The bearer every request carries: the operator PAT, an `avm_` API
+    /// token or an OIDC ID token. `None` (or blank) falls back to
+    /// `SB_PAT_TOKEN`, then to its alias `SB_API_TOKEN`; when both are set,
+    /// `SB_PAT_TOKEN` wins.
     pub pat_token: Option<String>,
     pub retry: Option<RetryConfig>,
+    /// The team requests act for, sent as the `X-AerolVM-Team` header on
+    /// every request, WebSocket handshakes included. `None` (or blank) falls
+    /// back to `SB_TEAM`; with neither, no header is sent and the server
+    /// uses the credential's first matching binding. The header only chooses
+    /// among teams the credential is already bound to: a team it does not
+    /// hold is refused (403), and the operator PAT ignores it.
+    #[serde(default)]
+    pub team: Option<String>,
+}
+
+/// Who the caller is, as [`crate::Client::whoami`] reports it.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+pub struct WhoAmIPrincipal {
+    /// `"operator"`, `"token"`, `"oidc"`, `"controlplane"`, ...
+    pub kind: String,
+    /// Stable id: `"operator"`, `"tok_…"`, `"oidc:<issuer>:<sub>"`, ...
+    pub id: String,
+    /// Display name; empty when the server has none.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub name: String,
+}
+
+/// The body of `GET /v1/whoami`: the caller's own resolved identity.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+pub struct WhoAmI {
+    pub principal: WhoAmIPrincipal,
+    /// `viewer`, `runner`, `auditor` or `admin`.
+    pub role: String,
+    /// `"*"` for every team, a team name, or `None` for a managed account.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub team: Option<String>,
+    /// When the credential stops working (RFC 3339); `None` if it never does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<String>,
+}
+
+/// One scoped API token as `client.tokens().list()` returns it. Never the
+/// secret.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+pub struct ApiToken {
+    /// Public id (`tok_…`): what `tokens().revoke` takes and audit records
+    /// name.
+    pub id: String,
+    pub name: String,
+    pub role: String,
+    /// A team name, or `"*"` for every team.
+    pub team: String,
+    #[serde(default)]
+    pub created_by: String,
+    #[serde(default)]
+    pub created_at: String,
+    #[serde(default)]
+    pub expires_at: String,
+    /// Expired tokens no longer work; they stay listed for 30 days.
+    #[serde(default)]
+    pub expired: bool,
+}
+
+/// `client.tokens().create()`'s result: the stored token plus `token`, the
+/// secret (`avm_…`), returned this once and never stored by the server.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+pub struct CreatedApiToken {
+    #[serde(flatten)]
+    pub api_token: ApiToken,
+    pub token: String,
+}
+
+/// The body of `client.tokens().create()`. All four fields are required.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+pub struct CreateApiTokenOptions {
+    /// 1 to 64 of `A-Z a-z 0-9 . _ -`, unique among the team's tokens.
+    pub name: String,
+    /// `viewer`, `runner`, `auditor` or `admin`.
+    pub role: String,
+    /// A team name, or `"*"` for every team. `auditor` and `admin` require
+    /// `"*"`.
+    pub team: String,
+    /// The lifetime: `"90d"`, `"720h"` or any Go duration.
+    pub expires_in: String,
+}
+
+/// `client.tokens().list()`'s result.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+pub struct ApiTokenList {
+    #[serde(default, deserialize_with = "null_as_empty_tokens")]
+    pub tokens: Vec<ApiToken>,
+}
+
+fn null_as_empty_tokens<'de, D>(d: D) -> Result<Vec<ApiToken>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<Vec<ApiToken>>::deserialize(d)?.unwrap_or_default())
 }

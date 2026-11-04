@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -203,6 +204,9 @@ type fakeVsockDialer struct {
 	// Post-boot/post-resume sends are best-effort, so tests use this
 	// to assert Create does not fail when that follow-up dial fails.
 	errOnDialIdx int
+	// replyFor, when set, answers each connection by the op written on it
+	// (ok, or the error text), instead of guestRespOk/guestError.
+	replyFor func(op string) (ok bool, errMsg string)
 }
 
 func newFakeVsockDialer() *fakeVsockDialer {
@@ -227,6 +231,9 @@ func (d *fakeVsockDialer) Dial(_ context.Context, socketPath string, cid, _ uint
 		return nil, d.err
 	}
 	rwc := newFakeVsockConn(d.guestRespOk, d.guestError)
+	if d.replyFor != nil {
+		rwc.reply, rwc.replyFor = nil, d.replyFor
+	}
 	rwc.parent = d
 	d.mu.Unlock()
 	return rwc, nil
@@ -256,6 +263,9 @@ type fakeVsockConn struct {
 	pos    int
 	closed bool
 	parent *fakeVsockDialer
+	// replyFor picks the reply from the op written, on the first Read.
+	replyFor func(op string) (ok bool, errMsg string)
+	op       string
 }
 
 func newFakeVsockConn(ok bool, errMsg string) *fakeVsockConn {
@@ -268,6 +278,10 @@ func newFakeVsockConn(ok bool, errMsg string) *fakeVsockConn {
 func (c *fakeVsockConn) Read(p []byte) (int, error) {
 	if c.closed {
 		return 0, io.EOF
+	}
+	if c.reply == nil && c.replyFor != nil {
+		ok, msg := c.replyFor(c.op)
+		c.reply = newFakeVsockConn(ok, msg).reply
 	}
 	if c.pos >= len(c.reply) {
 		return 0, io.EOF
@@ -283,6 +297,12 @@ func (c *fakeVsockConn) Write(p []byte) (int, error) {
 	}
 	if c.parent != nil {
 		c.parent.recordWrite(p)
+	}
+	var msg struct {
+		Op string `json:"op"`
+	}
+	if json.Unmarshal(p, &msg) == nil && msg.Op != "" {
+		c.op = msg.Op
 	}
 	return len(p), nil
 }
@@ -609,9 +629,10 @@ func TestCreate_HappyPath(t *testing.T) {
 	if !f.vmm.started || !f.vmm.waited || f.vmm.shutdown {
 		t.Errorf("vmm started=%v waited=%v shutdown=%v; want true/true/false", f.vmm.started, f.vmm.waited, f.vmm.shutdown)
 	}
-	// Vsock handshake plus best-effort post-boot network reconfigure.
-	if f.vsock.dials != 2 {
-		t.Errorf("vsock dials = %d, want 2", f.vsock.dials)
+	// Vsock handshake, best-effort post-boot network reconfigure, and the
+	// mandatory adopt (guest_identity.go).
+	if f.vsock.dials != 3 {
+		t.Errorf("vsock dials = %d, want 3", f.vsock.dials)
 	}
 	// REST: machine config, boot source, drive, nic, vsock, action all set.
 	if f.client.mc == nil || f.client.mc.VcpuCount != 2 || f.client.mc.MemSizeMib != 256 {
@@ -619,6 +640,8 @@ func TestCreate_HappyPath(t *testing.T) {
 	}
 	if f.client.bs == nil || f.client.bs.KernelImagePath != f.kernel {
 		t.Errorf("BootSource wrong: %+v", f.client.bs)
+	} else if !strings.Contains(f.client.bs.BootArgs, guestNoIPv6Arg) {
+		t.Errorf("cold-boot args must turn guest IPv6 off: %q", f.client.bs.BootArgs)
 	}
 	if d, ok := f.client.drives[rootDriveID]; !ok || !d.IsRootDevice {
 		t.Errorf("root drive wrong: %+v", d)

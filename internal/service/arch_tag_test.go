@@ -104,7 +104,7 @@ func TestValidateClusterArtifactRefArchSkipsImportedRefs(t *testing.T) {
 }
 
 func TestSnapshotAOCRRefIncludesHostArch(t *testing.T) {
-	ref := snapshotAOCRRef("aocr.test", "cluster-1", "Snap", "")
+	ref := snapshotAOCRRef("aocr.test", "cluster-1", "", "snap", "")
 	wantSuffix := archTagSuffix(hostSnapshotArch())
 	if wantSuffix != "" && !containsSuffix(ref, wantSuffix) {
 		t.Fatalf("snapshotAOCRRef = %q, want arch suffix %q", ref, wantSuffix)

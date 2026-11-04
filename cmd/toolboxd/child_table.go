@@ -76,7 +76,20 @@ func (t *childTable) reap(pid int) (reaped int, status syscall.WaitStatus, track
 // stops the copy goroutines. If the reaper took the status first, wait
 // returns that status instead of ECHILD.
 func (c *trackedChild) wait() error {
-	err := c.cmd.Wait()
+	return c.settle(c.cmd.Wait())
+}
+
+// reapedElsewhere reports a wait that found its child already collected.
+// Linux says ECHILD. gVisor's waitid(P_PIDFD), which Go's os.Process uses
+// once pidfds are available, says ESRCH for the same child, so a gVisor
+// exec that lost the race to the reaper came back as rc=-1 "waitid: no
+// such process" (UC-335 on cluster-bank-flagship).
+func reapedElsewhere(err error) bool {
+	return errors.Is(err, syscall.ECHILD) || errors.Is(err, syscall.ESRCH)
+}
+
+// settle is wait after cmd.Wait returned err.
+func (c *trackedChild) settle(err error) error {
 	c.table.mu.Lock()
 	// Only drop our own entry: once cmd.Wait reaped the pid, the kernel may
 	// hand it to a new child that start has already registered.
@@ -84,10 +97,10 @@ func (c *trackedChild) wait() error {
 		delete(c.table.byPID, c.pid)
 	}
 	c.table.mu.Unlock()
-	if !errors.Is(err, syscall.ECHILD) {
+	if !reapedElsewhere(err) {
 		return err
 	}
-	// ECHILD means the reaper's wait4 got the child. The reaper sends the
+	// The reaper's wait4 got the child. The reaper sends the
 	// status while it still holds mu, and we locked mu after that, so the
 	// status is already in the buffered channel.
 	select {
@@ -121,6 +134,19 @@ func reapedStatusError(st syscall.WaitStatus) error {
 // startTracked is cmd.Start for an exec child.
 func startTracked(cmd *exec.Cmd) (*trackedChild, error) {
 	return execChildren.start(cmd, cmd.Start)
+}
+
+// startSessionProcess starts a session's command as a tracked child, so the
+// reaper hands a background command's or a shell's exit status to its
+// session. Before sessions went through here, every pipe session lost the
+// race (it waits for its output pumps before cmd.Wait) and `aerolvm logs
+// --follow` reported exit 0 for a command that exited 4.
+func startSessionProcess(cmd *exec.Cmd, start func() error) (func() (int, string), error) {
+	child, err := execChildren.start(cmd, start)
+	if err != nil {
+		return nil, err
+	}
+	return func() (int, string) { return interpretWaitResult(child.wait()) }, nil
 }
 
 // trackedCombinedOutput is cmd.CombinedOutput for an exec child.

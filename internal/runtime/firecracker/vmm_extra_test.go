@@ -89,23 +89,4 @@ func TestVMM_ExtraCoverage2(t *testing.T) {
 		}
 	})
 
-	t.Run("CappedBufferFull", func(t *testing.T) {
-		buf := newCappedBuffer(10)
-		buf.Write([]byte("1234567890")) // fills capacity
-		buf.Write([]byte("123"))        // drop
-
-		if !strings.Contains(buf.String(), "[... 3 more bytes dropped ...]") {
-			t.Errorf("expected drop message, got %q", buf.String())
-		}
-	})
-
-	t.Run("CappedBufferPartialFit", func(t *testing.T) {
-		buf := newCappedBuffer(10)
-		buf.Write([]byte("12345678"))
-		buf.Write([]byte("90AB"))
-
-		if !strings.Contains(buf.String(), "[... 2 more bytes dropped ...]") {
-			t.Errorf("expected drop message, got %q", buf.String())
-		}
-	})
 }

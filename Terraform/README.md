@@ -12,7 +12,8 @@ Spawns a complete AerolVM cluster on EC2 in one `scripts/terraform.sh apply`:
 - an S3 bucket the seed uses to hand its gossip key + TLS bundle to joiners,
 - IAM instance profiles that grant only what each role needs on that bucket,
 - Cloudflare `A` + wildcard `A` records pointing at every ingress-bearing
-  node's public IP.
+  node's public IP, or, with `api_load_balancer = "nlb"`, at a health-checked
+  Network Load Balancer in front of them (see "Load balancer" below).
 
 ## Prereqs
 
@@ -58,7 +59,7 @@ secrets → `secrets.yml`, Terraform-only inputs → `terraform.tfvars`**.
 | `config/terraform.tfvars` | Terraform-only inputs: `aws_region`, `aws_profile`, `ssh_key_name`, `default_*`, `nodes = {...}`, `firecracker = {...}`, `caddy_shared_cert_storage`, `cloudflare_zone_id`, `extra_tags`. | gitignored |
 | `config/terraform.tfvars.example` | Drop-in starter for the above. | committed |
 | `config/cluster.yml` | Shared non-secret cluster ops env both Terraform (day-0) and Ansible (day-2) read: `ingress.domain_name`, `ingress.acme_email`, `mirror.*`, `auto_import.*`, `fleet_control_plane.*`, `otel.*`, `image_pull.*`, `image_build_gc.*`. | committed |
-| `config/secrets.yml` | Shared cluster secrets both Terraform and Ansible read: `cluster.pat_token`, `cloudflare.api_token`, `aocr.upstream_wrap_key`, `aocr.cluster_pat`, `fleet.token`. | gitignored |
+| `config/secrets.yml` | Shared cluster secrets both Terraform and Ansible read: `cluster.pat_token`, `cluster.metrics_token` (optional read-only Prometheus scrape token; empty scrapes with the PAT), `cloudflare.api_token`, `aocr.upstream_wrap_key`, `aocr.cluster_pat`, `fleet.token`. | gitignored |
 | `config/secrets.example.yml` | Empty template for the above. | committed |
 
 Outputs include every node's public IP, the seed's SSH command, and the
@@ -143,7 +144,11 @@ phases:
    --dns-provider cloudflare --dns-api-token <cloudflare.api_token>` so the
    per-node Caddy gets a real wildcard cert via Let's Encrypt DNS-01. Optional
    `--with-gvisor` / `--with-nvidia-gpu` / `--with-amd-gpu` /
-   `--idle-timeout-min` are appended from per-node flags. If `domain_name` is
+   `--idle-timeout-min` are appended from per-node flags, and the
+   cluster-wide `pat_scope = "host"` and `l4_proxy_protocol = true` add
+   `--pat-scope host` (the PAT only from this host and cluster peers, Caddy on
+   the public socket; enterprise mode requires it) and `--l4-proxy-protocol`
+   (the real client address through Caddy). If `domain_name` is
    empty the DNS-01 args are dropped and install.sh falls back to IP/path mode
    with no TLS.
 2. **Seed only - `cluster-init.sh`** with `--role <seed-role>
@@ -280,6 +285,31 @@ For each ingress-bearing node, two records are created:
 Set `cloudflare_proxied = true` to orange-cloud them. Note: Cloudflare only
 proxies HTTP(S); leave it `false` for raw TCP ingress.
 
+## Load balancer
+
+`api_load_balancer = "nlb"` (default `"none"`) puts an internet-facing AWS
+Network Load Balancer in front of the ingress nodes (`load_balancer.tf`).
+DNS round-robin cannot route around a node whose sandboxd is down while its
+Caddy is up: the handshakes succeed, so its share of clients get 502 until
+the daemon is back. The balancer health-checks every ingress node through
+Caddy to sandboxd and drops a failing one in about 10 s.
+
+- TCP passthrough on `public_http_ports` and `ssh_gateway_port`, instance
+  targets, client IP preserved: Caddy keeps TLS, caddy-l4 keeps SNI routing,
+  and sandboxd's audit records see the real caller.
+- Health check: HTTP `GET /health` on `api_lb_health_check_port` (21280),
+  served by `install.sh --lb-health-port`, open to the balancer's security
+  group only. Every 5 s; out after 2 failures, back after 2 passes.
+- `<domain_name>` and `*.<domain_name>` become one A record to the
+  balancer's Elastic IP. The raw-TCP pool (`l4_port_range`) cannot ride an
+  NLB (50 listeners at most), so `tcp.<domain_name>` keeps one A record per
+  ingress node and every node gets `SB_L4_PUBLIC_HOST=tcp.<domain_name>`.
+- Choose it when the cluster is created: it changes every node's user data,
+  so on a running cluster Terraform replaces the nodes.
+
+`terraform output api_load_balancer` shows the balancer's IP, DNS name,
+target groups and the raw-TCP host.
+
 ## Files
 
 | File                        | Purpose                                   |
@@ -292,6 +322,7 @@ proxies HTTP(S); leave it `false` for raw TCP ingress.
 | `iam.tf`                    | Bundle S3 bucket + seed/joiner profiles   |
 | `nodes.tf`                  | Seed `aws_instance` + joiner `for_each`   |
 | `dns.tf`                    | Cloudflare A + wildcard records           |
+| `load_balancer.tf`          | Optional NLB in front of ingress (`api_load_balancer`) |
 | `outputs.tf`                | Node summary, ingress IPs, SSH help       |
 | `templates/bootstrap.sh.tftpl` | Single user_data template (seed/joiner) |
 | `../config/terraform.tfvars.example` | Drop-in starter for `config/terraform.tfvars` (gitignored sibling) |

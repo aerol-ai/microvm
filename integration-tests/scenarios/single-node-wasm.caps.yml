@@ -11,6 +11,8 @@ capabilities:
   - docker
   - platform-volumes
   - wasm
+  # SB_IDENTITY_ENABLED=true: team avm_ tokens for UC-294 (T12).
+  - identity
   - domain
   - custom-domains
   # See single-node.caps.yml for why UC-35/36 (external-dns-zone) still skip

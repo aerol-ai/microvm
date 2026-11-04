@@ -17,24 +17,10 @@ import (
 	"github.com/aerol-ai/microvm/internal/config"
 	"github.com/aerol-ai/microvm/internal/service"
 	"github.com/aerol-ai/microvm/internal/store"
+	"github.com/aerol-ai/microvm/pkg/api/clusterlist"
 	"github.com/aerol-ai/microvm/pkg/docker"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
-
-func TestFilterFacadeLocalToPage(t *testing.T) {
-	type item struct{ ID string }
-	local := []item{{ID: "sb-1"}, {ID: "sb-2"}, {ID: ""}}
-	if got := filterFacadeLocalToPage(local, nil, "", func(it item) string { return it.ID }); len(got) != 3 {
-		t.Fatalf("cold start = %d", len(got))
-	}
-	if got := filterFacadeLocalToPage(local, nil, "tok", func(it item) string { return it.ID }); got != nil {
-		t.Fatalf("terminal nil placements = %+v", got)
-	}
-	got := filterFacadeLocalToPage(local, []cluster.Placement{{SandboxID: "sb-2"}}, "", func(it item) string { return it.ID })
-	if len(got) != 1 || got[0].ID != "sb-2" {
-		t.Fatalf("page filter = %+v", got)
-	}
-}
 
 func TestReplaceLabelsBadJSON(t *testing.T) {
 	handler, svc, _ := newDaytonaVolumesTestEnv(t)
@@ -186,8 +172,8 @@ func (b *onLogImageBuilder) BuildImage(ctx context.Context, req docker.BuildImag
 func TestResolveBuildInfoOnLogCoverage95(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	h := newHandlers(Deps{
+		Service: buildService(&onLogImageBuilder{}, buildConfig{}),
 		Logger:  logger,
-		Builder: &onLogImageBuilder{},
 	})
 	_, _, err := h.resolveBuildInfo(context.Background(), &buildInfoRequest{
 		DockerfileContent: stringPtr("FROM alpine\nRUN echo hi"),
@@ -739,13 +725,16 @@ func TestDestroySandboxLoadMetaErrorCoverage95(t *testing.T) {
 	}
 }
 
+// A create that fails after a fresh build hands the tag to the image GC
+// (service.DiscardBuiltImage) instead of removing it on the spot: another
+// request may have been handed the same tag from the build cache.
 func TestCreateSandboxImageRollbackOnCreateFailureCoverage95(t *testing.T) {
 	svc, _, rt, _ := newHandlerExtraTestEnv(t)
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	b := &rollbackTrackingBuilder{}
 	mux := http.NewServeMux()
 	RegisterRoutes(mux, Deps{
-		Service: svc, Logger: logger, Builder: b,
+		Service: withBuilder(svc, b), Logger: logger,
 		Auth: func(next http.Handler) http.Handler { return next },
 	})
 	rt.createState = &models.SandboxRuntimeState{Status: models.SandboxStatusStarted}
@@ -757,8 +746,8 @@ func TestCreateSandboxImageRollbackOnCreateFailureCoverage95(t *testing.T) {
 	if rr.Code == http.StatusCreated {
 		t.Fatal("expected create failure")
 	}
-	if len(b.removed) == 0 {
-		t.Fatal("expected built image rollback")
+	if !b.buildsCalled || len(b.removed) != 0 {
+		t.Fatalf("built %v, direct removals %v; want a build and no direct removal", b.buildsCalled, b.removed)
 	}
 }
 
@@ -831,5 +820,70 @@ func TestCreateSnapshotOnSandboxSuccessCoverage95(t *testing.T) {
 	handler.ServeHTTP(rr, req)
 	if rr.Code != http.StatusOK {
 		t.Fatalf("snapshot status = %d body=%s", rr.Code, rr.Body.String())
+	}
+}
+
+// gatherAllClusterPages walks every placement page so the unpaginated list
+// returns all the owner's sandboxes, deduped, and surfaces a not-ready page as
+// a 503 (B10).
+func TestGatherAllClusterPages(t *testing.T) {
+	type item struct{ ID string }
+	id := func(it item) string { return it.ID }
+	r := httptest.NewRequest(http.MethodGet, "/daytona/sandbox", nil)
+
+	t.Run("walks and concatenates pages", func(t *testing.T) {
+		calls := 0
+		fetch := func(pr *http.Request, _ []item) ([]item, clusterlist.Coverage, string, bool) {
+			calls++
+			switch pr.URL.Query().Get("page_token") {
+			case "":
+				return []item{{ID: "a"}}, clusterlist.Coverage{}, "t2", true
+			case "t2":
+				return []item{{ID: "b"}}, clusterlist.Coverage{}, "", true
+			default:
+				t.Fatalf("unexpected page_token %q", pr.URL.Query().Get("page_token"))
+				return nil, clusterlist.Coverage{}, "", true
+			}
+		}
+		items, _, ok := gatherAllClusterPages(r, nil, id, fetch)
+		if !ok || calls != 2 || len(items) != 2 || items[0].ID != "a" || items[1].ID != "b" {
+			t.Fatalf("items=%+v calls=%d ok=%v", items, calls, ok)
+		}
+	})
+
+	t.Run("dedups ids seen on more than one page", func(t *testing.T) {
+		fetch := func(pr *http.Request, _ []item) ([]item, clusterlist.Coverage, string, bool) {
+			if pr.URL.Query().Get("page_token") == "" {
+				return []item{{ID: "a"}}, clusterlist.Coverage{}, "t2", true
+			}
+			return []item{{ID: "a"}, {ID: "b"}}, clusterlist.Coverage{}, "", true
+		}
+		items, _, ok := gatherAllClusterPages(r, nil, id, fetch)
+		if !ok || len(items) != 2 {
+			t.Fatalf("dedup items=%+v ok=%v", items, ok)
+		}
+	})
+
+	t.Run("a not-ready page returns ok=false", func(t *testing.T) {
+		fetch := func(*http.Request, []item) ([]item, clusterlist.Coverage, string, bool) {
+			return nil, clusterlist.Coverage{Partial: true}, "", false
+		}
+		if _, _, ok := gatherAllClusterPages(r, nil, id, fetch); ok {
+			t.Fatal("expected ok=false for a not-ready page")
+		}
+	})
+}
+
+func TestWithPageToken(t *testing.T) {
+	r := httptest.NewRequest(http.MethodGet, "/daytona/sandbox?limit=10", nil)
+	clone := withPageToken(r, "tok-9")
+	if clone.URL.Query().Get("page_token") != "tok-9" {
+		t.Fatalf("page_token = %q", clone.URL.Query().Get("page_token"))
+	}
+	if clone.URL.Query().Get("limit") != "10" {
+		t.Fatalf("limit lost = %q", clone.URL.Query().Get("limit"))
+	}
+	if r.URL.RawQuery != "limit=10" {
+		t.Fatalf("original request mutated: %q", r.URL.RawQuery)
 	}
 }

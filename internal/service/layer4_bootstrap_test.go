@@ -6,6 +6,8 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -117,6 +119,88 @@ func TestEnsureLayer4ReadyDisabledCaddyLatchesImmediately(t *testing.T) {
 	}
 }
 
+// TestEnsureLayer4ReadyFallbackProxyProtocolOnlyWithFlag is the regression
+// test for CEO review D12 (plans/identity-and-access.md §5.11, §9.5): the
+// tls-mux fallback route EnsureLayer4 creates carries "proxy_protocol": "v2"
+// only with SB_L4_FALLBACK_PROXY_PROTOCOL on. Off (the default, and every
+// binary-only upgrade) it is byte for byte the route this path always wrote,
+// because the 8443 site accepts a PROXY header only after install.sh adds
+// its listener wrapper. The latch behaves the same either way.
+func TestEnsureLayer4ReadyFallbackProxyProtocolOnlyWithFlag(t *testing.T) {
+	const want = `{"listen":[":443"],"routes":[{"@id":"tls-mux-fallback","handle":[{"handler":"proxy","upstreams":[{"dial":["127.0.0.1:8443"]}]}]}]}`
+	const wantProxy = `{"listen":[":443"],"routes":[{"@id":"tls-mux-fallback","handle":[{"handler":"proxy","proxy_protocol":"v2","upstreams":[{"dial":["127.0.0.1:8443"]}]}]}]}`
+	for _, tc := range []struct {
+		name string
+		flag bool
+		want string
+	}{
+		{name: "flag off: no PROXY header (today's route)", flag: false, want: want},
+		{name: "flag on: PROXY v2 to the 8443 site", flag: true, want: wantProxy},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var (
+				mu      sync.Mutex
+				created string
+				puts    int
+			)
+			mux := http.NewServeMux()
+			mux.HandleFunc("/config/apps/layer4", func(w http.ResponseWriter, r *http.Request) {
+				if r.Method == http.MethodGet {
+					http.Error(w, "not found", http.StatusNotFound)
+					return
+				}
+				w.WriteHeader(http.StatusOK)
+			})
+			mux.HandleFunc("/config/apps/layer4/servers/tls-mux", func(w http.ResponseWriter, r *http.Request) {
+				switch r.Method {
+				case http.MethodGet:
+					http.Error(w, "not found", http.StatusNotFound)
+				case http.MethodPut:
+					body, _ := io.ReadAll(r.Body)
+					mu.Lock()
+					created, puts = string(body), puts+1
+					mu.Unlock()
+					w.WriteHeader(http.StatusOK)
+				default:
+					t.Fatalf("unexpected method %s on %s", r.Method, r.URL.Path)
+				}
+			})
+			server := httptest.NewServer(mux)
+			t.Cleanup(server.Close)
+
+			cfg := config.Config{
+				CaddyAdminURL:           server.URL,
+				EnableCaddy:             true,
+				HTTPClientTimeout:       time.Second,
+				L4TLSListen:             ":443",
+				L4TLSFallback:           "127.0.0.1:8443",
+				L4FallbackProxyProtocol: tc.flag,
+			}
+			svc := &Service{
+				logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+				caddy:  caddy.New(cfg),
+				cfg:    cfg,
+			}
+			for i := 0; i < 3; i++ {
+				if err := svc.EnsureLayer4Ready(context.Background()); err != nil {
+					t.Fatalf("EnsureLayer4Ready %d: %v", i, err)
+				}
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			if puts != 1 {
+				t.Fatalf("tls-mux created %d times, want once (the latch must still hold)", puts)
+			}
+			if strings.TrimSpace(created) != tc.want {
+				t.Fatalf("tls-mux server =\n %s\nwant\n %s", created, tc.want)
+			}
+			if !svc.l4Ready.Load() {
+				t.Fatal("a successful bootstrap latches ready")
+			}
+		})
+	}
+}
+
 func TestRepairLayer4ReadyBypassesSuccessLatch(t *testing.T) {
 	var repairPosts atomic.Int32
 
@@ -168,5 +252,66 @@ func TestRepairLayer4ReadyBypassesSuccessLatch(t *testing.T) {
 	}
 	if !svc.l4Ready.Load() {
 		t.Fatal("repair should keep the ready latch true after success")
+	}
+}
+
+// EnsureLayer4 reads the tls-mux server and, when the fallback is missing or
+// out of place, POSTs the whole server back. A route another goroutine
+// inserted between that GET and that POST used to be overwritten: the ingress
+// reconciler's repair and a lifecycle SNI write share one Caddy. The caddy
+// client now holds its admin lock across EnsureLayer4's read-modify-write, so
+// the concurrent insert waits for the POST and lands after it.
+func TestRepairLayer4ReadyKeepsAConcurrentlyInsertedSNIRoute(t *testing.T) {
+	const sniRoute = "sandbox-sb-late-ingress-sni"
+	e := newEmulatedCaddy(t, 0)
+	// tls-mux lost its fallback: the repair must rewrite the server.
+	e.outOfBand(t, http.MethodPatch, "/config/apps/layer4/servers/tls-mux/routes", `[]`)
+
+	svc := newLiveIngressService(t, e)
+	ctx := context.Background()
+
+	var (
+		hooked    atomic.Bool
+		arrived   = make(chan struct{})
+		arriveOne sync.Once
+		insertErr = make(chan error, 1)
+	)
+	e.setBefore(func(w http.ResponseWriter, r *http.Request) bool {
+		if strings.Contains(r.URL.Path, sniRoute) || r.Method == http.MethodPut {
+			arriveOne.Do(func() { close(arrived) })
+			return false
+		}
+		if r.Method != http.MethodGet || r.URL.Path != "/config/apps/layer4/servers/tls-mux" || hooked.Swap(true) {
+			return false
+		}
+		// Read the server as the repair sees it, then give a concurrent
+		// lifecycle insert every chance to land before the repair writes.
+		stale := httptest.NewRecorder()
+		e.apply(stale, r)
+		go func() {
+			insertErr <- svc.caddy.UpsertSNIPassthroughRoute(ctx, sniRoute, "sb-late.d.test", "10.42.1.108", 443)
+		}()
+		select {
+		case <-arrived:
+		case <-time.After(300 * time.Millisecond):
+		}
+		w.WriteHeader(stale.Code)
+		_, _ = w.Write(stale.Body.Bytes())
+		return true
+	})
+
+	if err := svc.RepairLayer4Ready(ctx); err != nil {
+		t.Fatalf("RepairLayer4Ready: %v", err)
+	}
+	if err := <-insertErr; err != nil {
+		t.Fatalf("concurrent SNI insert: %v", err)
+	}
+	ids := e.tlsMuxRouteIDs(t)
+	requireRouteOnce(t, ids, sniRoute)
+	if ids[len(ids)-1] != "tls-mux-fallback" {
+		t.Fatalf("repair did not put the fallback last: %v", ids)
+	}
+	if !svc.l4Ready.Load() {
+		t.Fatal("a successful repair keeps the ready latch true")
 	}
 }

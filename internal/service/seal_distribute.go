@@ -340,9 +340,18 @@ func pruneDeadSecretHolders(sandboxID, incarnationID string, alive map[string]st
 // HA creates: local seal + optional bounded sync wait for ≥1 peer ACK
 // (SB_SECRET_FANOUT_MIN_ACK_WAIT, default 2s) to shrink GAP-1; remaining
 // peers / retries continue asynchronously. A zero-ACK HA create is retracted.
+// Every caller is a create, so the seal may take the key-store slot kept for
+// creates: a restart storm of opens cannot queue it.
 func (s *Service) SealAndDistribute(ctx context.Context, sandboxID string, req models.CreateSandboxRequest, recipients []string) (cluster.PlacementSecrets, error) {
-	return s.sealAndDistributeForIncarnation(ctx, sandboxID, req, recipients, "")
+	return s.sealAndDistributeForIncarnation(secrets.ContextForCreate(ctx), sandboxID, req, recipients, "")
 }
+
+// ErrReservedPlacementGone answers a reserved create whose reservation this
+// node no longer holds: a failed create of the same id cancelled it (a retry
+// that waited for that create lands here), it expired, or it names another
+// owner. Nothing was created. The client's retry, through any node, reserves
+// afresh, so the API answers 503 with Retry-After rather than a 500.
+var ErrReservedPlacementGone = errors.New("reserved placement is no longer authoritative")
 
 // ReservedSecretBinding returns the one leader-confirmed identity used by both
 // legs of an overlapped reserved create. Resolving once before either leg
@@ -372,17 +381,17 @@ func (s *Service) ReservedSecretBinding(ctx context.Context, sandboxID string) (
 	}
 	placement, ok := placements[sandboxID]
 	if !ok || placement.SandboxID != sandboxID || !placement.IsReserved() {
-		return cluster.PlacementSecrets{}, errors.New("reserved placement is no longer authoritative")
+		return cluster.PlacementSecrets{}, ErrReservedPlacementGone
 	}
 	if ownerID := strings.TrimSpace(placement.OwnerNodeID); ownerID == "" || ownerID != s.selfNodeID() {
-		return cluster.PlacementSecrets{}, errors.New("reserved placement is not owned by this node")
+		return cluster.PlacementSecrets{}, fmt.Errorf("%w: reserved placement is not owned by this node", ErrReservedPlacementGone)
 	}
 	incarnationID := strings.TrimSpace(placement.IncarnationID)
 	if incarnationID == "" {
 		return cluster.PlacementSecrets{}, errors.New("reserved placement incarnation_id is required")
 	}
 	if placement.ExpiresUnix > 0 && time.Now().Unix() >= placement.ExpiresUnix {
-		return cluster.PlacementSecrets{}, errors.New("reserved placement has expired")
+		return cluster.PlacementSecrets{}, fmt.Errorf("%w: reserved placement has expired", ErrReservedPlacementGone)
 	}
 	recipients := secrets.NormalizeRecipients(placement.SecretRecipients)
 	if len(recipients) == 0 {

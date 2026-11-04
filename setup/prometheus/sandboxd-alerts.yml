@@ -129,6 +129,37 @@ groups:
   - name: sandboxd.ingress-and-data-plane
     interval: 30s
     rules:
+      # Cluster-wide lists are being shed. A list holds its slot for
+      # milliseconds when owners and the control plane answer quickly, so
+      # sustained shedding means list traffic beyond what the node is sized
+      # for, or slow owners holding slots. One tenant alone cannot cause it
+      # (it is held to its share and told 429), so it takes several busy
+      # tenants at once, or slow owners.
+      - alert: SandboxdAPIListShedding
+        expr: sum by (instance) (increase(aerolvm_api_list_shed_total[10m])) > 100
+        for: 10m
+        labels:
+          severity: warning
+          component: api
+        annotations:
+          summary: "sandboxd is shedding cluster-wide list requests (503)"
+          description: "aerolvm_api_list_shed_total is rising: GET /v1/sandboxes (and the Daytona, E2B and Runloop lists) found all SB_API_LIST_MAX_INFLIGHT slots taken for SB_API_LIST_QUEUE_WAIT while the caller's tenant was within its share, and were answered 503 + Retry-After. The node itself is fine. Check aerolvm_api_list_inflight, aerolvm_api_list_tenants, peer list latency, and which tenants poll lists (/debug/vars api_list_gate); add ingress nodes or raise the limit on bigger nodes."
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/slo-breach.md"
+
+      # One tenant keeps asking for more cluster-wide lists than its share of
+      # the node: it is told 429 and every other tenant is unaffected, so this
+      # is a heads-up about a client to slow down, not a node problem.
+      - alert: SandboxdAPIListTenantRateLimited
+        expr: sum by (instance) (increase(aerolvm_api_list_rate_limited_total[10m])) > 600
+        for: 15m
+        labels:
+          severity: warning
+          component: api
+        annotations:
+          summary: "a tenant keeps exceeding its share of sandboxd's list slots (429)"
+          description: "aerolvm_api_list_rate_limited_total is rising: one or more tenants hold SB_API_LIST_MAX_INFLIGHT_PER_TENANT lists at once and the rest of theirs are answered 429 rate_limited + Retry-After. Other tenants still get their share. Find the tenant in GET /debug/vars (api_list_gate.busiest, most refused first) and ask it to poll less or honour Retry-After; raise the share only for a legitimate bursty client."
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/slo-breach.md"
+
       - alert: SandboxdIngressRouteLag
         expr: max(aerolvm_ingress_route_lag_versions) > 100
         for: 5m
@@ -497,6 +528,41 @@ groups:
           description: "The last POST /v1/audit/verify on this node reported ok=false. The response body carries the failing offset and reason. Treat the local log as untrusted evidence until reconciled with the export backend or witness."
           runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/secrets-and-audit.md"
 
+      # Witness ships keep failing: the bucket is unreachable, the node's
+      # credentials or the bucket policy changed, or the bucket is throttling.
+      # Local records keep landing, but nothing new is anchored off the node,
+      # retention will not prune, and a restart now refuses to boot until the
+      # witness answers. Gated on the failure counter moving, so a node with
+      # no external witness (whose gauge is never set) stays quiet.
+      - alert: SandboxdAuditWitnessShipFailing
+        expr: aerolvm_secret_audit_witness_healthy == 0 and increase(aerolvm_secret_audit_witness_failures_total[15m]) > 0
+        for: 15m
+        labels:
+          severity: warning
+          component: secrets-audit
+        annotations:
+          summary: "sandboxd has not shipped an audit head to its witness for 15 minutes"
+          description: "aerolvm_secret_audit_witness_healthy is 0 and aerolvm_secret_audit_witness_failures_total keeps rising. The daemon log line 'secret audit witness ship failed' names the error. Check the path to S3 (VPC endpoint or NAT), the node role's witness grants and the bucket policy. Do not restart the node until the witness answers: boot validation needs it."
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/secrets-and-audit.md"
+
+      # The witness held a head this node did not ship. Nothing can delete
+      # from an Object Lock witness and its reads are consistent, so another
+      # writer used this node's witness key: a cluster node through the
+      # shared node role, a second server given the same SB_NODE_ID, or
+      # tampering. The node re-ships its own head, so this alert is the only
+      # live signal; a write that lands between the node's read and its
+      # write is caught only by `aerolvm audit verify`.
+      - alert: SandboxdAuditWitnessForeignHead
+        expr: increase(aerolvm_secret_audit_witness_foreign_head_total[15m]) > 0
+        for: 0m
+        labels:
+          severity: critical
+          component: secrets-audit
+        annotations:
+          summary: "sandboxd found a head in its audit witness that it did not write"
+          description: "aerolvm_secret_audit_witness_foreign_head_total increased: the witness held a head this node neither shipped last nor holds now (the daemon log line 'secret audit witness holds a head this node did not ship' names both). Check for a second server with the same SB_NODE_ID, then attribute the write with CloudTrail S3 data events on the witness bucket. Run aerolvm audit verify for this node; a restart refuses to boot only while the foreign head is still the newest."
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/secrets-and-audit.md"
+
       # Audit reads are being refused for lack of read slots. With the index
       # ready a slot is held for milliseconds; sustained busy rejections mean
       # the node is saturated or the index is off.
@@ -599,8 +665,70 @@ groups:
           component: secrets-audit
         annotations:
           summary: "sandboxd secret provider canary is failing"
-          description: "aerolvm_secret_provider_canary_ok has been 0 for 10 minutes. New wraps/opens may fail; for awskms check IAM/KMS reachability."
+          description: "aerolvm_secret_provider_canary_ok has been 0 for 10 minutes. New wraps/opens may fail, and with wrapped custody this node can no longer see a revoke. Check the key store's reachability and the node's grants (IAM/KMS, the Vault token, the PKCS#11 helper)."
           runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/secrets-and-audit.md"
+
+  # Customer key custody (plans/customer-key-custody.md §9-§11, Section 8).
+  # The custody gauge is published once at boot; the others move with the
+  # key-custody loop (re-check every SB_SECRET_PROVIDER_RECHECK_INTERVAL,
+  # sweep hourly). Labels are positional (key/key2/key3) like every expvar map.
+  - name: sandboxd.key-custody
+    interval: 30s
+    rules:
+      # An enterprise node whose server key is not wrapped by the customer's
+      # key store: the key custody claim is false on this node (F2).
+      - alert: SandboxdServerKeyPlaintext
+        expr: aerolvm_key_custody{key="server key",key2!="customer key store (wrapped)",key3="true"} == 1
+        for: 15m
+        labels:
+          severity: warning
+          component: key-custody
+        annotations:
+          summary: "sandboxd enterprise node keeps its server key in plaintext"
+          description: "{{ $labels.instance }} runs SB_ENTERPRISE_MODE=true with the server key as {{ $labels.key2 }}. Move it to a customer key store (SB_SECRET_PROVIDER), then wrap it with `sandboxd key wrap` and set SB_CREDENTIAL_KEY_CUSTODY=wrapped."
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/secrets-and-audit.md#server-key-in-plaintext"
+
+      # The customer's key store revoked the key and this node stopped
+      # processing their data (full stop, CEO-E2R). Paged: either someone
+      # revoked on purpose and should know every node obeyed, or not.
+      - alert: SandboxdKeyRevoked
+        expr: aerolvm_key_revoked == 1
+        for: 1m
+        labels:
+          severity: critical
+          component: key-custody
+        annotations:
+          summary: "sandboxd stopped: the customer's key store revoked the server key"
+          description: "{{ $labels.instance }} saw the key revoked on SB_SECRET_PROVIDER_REVOKE_AFTER consecutive re-checks. Sealed creates, starts, exec and SSH fail with 503 key_revoked; running sandboxes keep running. It resumes on its own within one re-check of the key being restored."
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/secrets-and-audit.md#key-revoked"
+
+      # Rows wrapped under a key version or label the key store no longer
+      # decrypts: those sandboxes cannot start or fail over on this node.
+      - alert: SandboxdKeyVersionRetiredInUse
+        expr: aerolvm_key_rows_retired > 0
+        for: 15m
+        labels:
+          severity: warning
+          component: key-custody
+        annotations:
+          summary: "sandboxd holds secrets on a retired key version"
+          description: "{{ $labels.instance }} has {{ $value }} sealed rows on a key version the key store no longer decrypts. Re-enable the old version until aerolvm_key_rows_stale is 0 on every member, then retire it again."
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/secrets-and-audit.md#retired-key-version-in-use"
+
+      # The key store keeps throttling this node: creates slow down and the
+      # limiter's foreground wait grows.
+      - alert: SandboxdKeyStoreThrottling
+        expr: |
+          sum by (instance, key) (rate(aerolvm_key_store_calls_total{key3="throttled"}[5m]))
+            / sum by (instance, key) (rate(aerolvm_key_store_calls_total[5m])) > 0.05
+        for: 15m
+        labels:
+          severity: warning
+          component: key-custody
+        annotations:
+          summary: "sandboxd's key store is throttling it"
+          description: "More than 5% of {{ $labels.key }} calls from {{ $labels.instance }} were throttled for 15 minutes. Raise the key store's rate limit or lower SB_SECRET_PROVIDER_MAX_INFLIGHT across the fleet."
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/secrets-and-audit.md#key-store-throttling"
 
   - name: sandboxd.cluster-topology
     interval: 30s
@@ -623,3 +751,261 @@ groups:
           summary: "sandboxd cluster topology violation; ingress may not be serving"
           description: "aerolvm_cluster_topology_ok has been 0 for 5 minutes on {{ $labels.instance }}. Either more than 10 live ingress nodes without a declared shard-aware router, or mixed/hybrid roles above 10 live nodes. See /health cluster_topology for the exact reason."
           runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/cluster-ingress-topology.md"
+
+  - name: sandboxd.remote-mcp
+    interval: 30s
+    rules:
+      # Remote MCP (/mcp, SB_MCP_ENABLED) tool calls failing on the platform
+      # side: 5xx, unreachable owners, timeouts. tool_error (not found, bad
+      # argument, edit conflict) is ordinary agent behaviour and is not
+      # counted. The traffic floor keeps one failed call on a quiet node
+      # from paging.
+      - alert: SandboxdRemoteMCPErrorRate
+        expr: |
+          (
+            sum(rate(aerolvm_mcp_tool_calls_total{key2="api_error"}[5m]))
+            / clamp_min(sum(rate(aerolvm_mcp_tool_calls_total[5m])), 1e-9)
+          ) > 0.2
+          and sum(rate(aerolvm_mcp_tool_calls_total[5m])) > 0.05
+        for: 10m
+        labels:
+          severity: warning
+          component: remote-mcp
+        annotations:
+          summary: "More than 20% of remote MCP tool calls are failing"
+          description: "Over 20% of /mcp tool calls have ended in api_error for 10 minutes. Agents connected over remote MCP are seeing platform failures; check the 'mcp tool call' log lines (outcome=api_error) for the tool and code."
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/remote-mcp.md"
+
+  # Hostname egress filtering (plans/egress-domain-filtering.md P1-12, P1-15).
+  # The aerolvm-egress-gateway unit owns the nft table, the filtering DNS
+  # resolver and the SNI/Host proxy; sandboxd exports its state. Gateway-mode
+  # sandboxes fail closed when it is away, so these alerts mean "filtered
+  # sandboxes have no egress", never "egress is unfiltered".
+  - name: sandboxd.egress
+    interval: 30s
+    rules:
+      # The node has hostname-filtered sandboxes and no live gateway: their
+      # egress is held (fail closed) and new gateway-mode creates get 503.
+      # Gated on fqdn_sandboxes so nodes without the feature never fire.
+      - alert: SandboxdEgressGatewayDown
+        expr: aerolvm_egress_gateway_up == 0 and aerolvm_egress_fqdn_sandboxes > 0
+        for: 1m
+        labels:
+          severity: critical
+          component: egress
+        annotations:
+          summary: "egress gateway down with hostname-filtered sandboxes on the node"
+          description: "aerolvm_egress_gateway_up has been 0 for 1 minute on {{ $labels.instance }} while {{ $value }} gateway-mode sandboxes are present. Their egress is held (fail closed) and new hostname-filtered creates are refused with 503 egress_gateway_unavailable; in a cluster, placement stops sending them here."
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/egress-gateway.md#gatewaydown"
+
+      # The gateway found its nft table missing and rebuilt it (CEO D17). The
+      # window without filtering was one heartbeat; something on the host is
+      # flushing nftables.
+      - alert: SandboxdEgressTableLost
+        expr: increase(aerolvm_egress_layout_lost_total[10m]) > 0
+        for: 0m
+        labels:
+          severity: warning
+          component: egress
+        annotations:
+          summary: "egress gateway nft table was lost and rebuilt"
+          description: "The inet aerolvm_egress table disappeared on {{ $labels.instance }} and was rebuilt. Gateway-mode sandboxes were held and re-attached. Find what flushes nftables on this host (a firewall manager, a provisioning script, `nft flush ruleset`)."
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/egress-gateway.md#tablelost"
+
+      # Each failure is a 503 create or a held sandbox.
+      - alert: SandboxdEgressAttachFailures
+        expr: increase(aerolvm_egress_attach_failed_total[10m]) > 2
+        for: 0m
+        labels:
+          severity: warning
+          component: egress
+        annotations:
+          summary: "sandboxd cannot attach sandboxes to the egress gateway"
+          description: "More than 2 gateway attaches failed on {{ $labels.instance }} in 10 minutes. Each failure is a hostname-filtered create answered 503 or a running sandbox held without egress."
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/egress-gateway.md#attachfailures"
+
+      # A changed profile that can't reach a sandbox leaves it held.
+      - alert: SandboxdEgressProfileApplyFailing
+        expr: increase(aerolvm_egress_profile_apply_failed_total[10m]) > 0
+        for: 10m
+        labels:
+          severity: warning
+          component: egress
+        annotations:
+          summary: "egress profile changes are not reaching some sandboxes"
+          description: "Re-applying egress profiles kept failing on {{ $labels.instance }} for 10 minutes: a changed or missing profile, an org profile removed or grown past the cap by an operator file edit, or a built-in version this node lacks. The affected sandboxes are held without egress until it succeeds."
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/egress-gateway.md#profileapplyfailing"
+
+      # Held sandboxes have no egress at all until the hold lifts.
+      - alert: SandboxdEgressSandboxesHeld
+        expr: aerolvm_egress_held_sandboxes > 0
+        for: 10m
+        labels:
+          severity: warning
+          component: egress
+        annotations:
+          summary: "sandboxes have been held without egress for 10 minutes"
+          description: "{{ $value }} gateway-mode sandboxes on {{ $labels.instance }} have been held (fail closed) for 10 minutes. A hold lifts on the next successful attach; a long hold means the gateway is not recovering."
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/egress-gateway.md#sandboxesheld"
+
+      # Filtering is unaffected; the audit trail has gaps. Denial counters
+      # stay exact (they come from the gateway's totals, not the stream).
+      - alert: SandboxdEgressAuditDropped
+        expr: increase(aerolvm_egress_audit_dropped_total[10m]) > 0
+        for: 0m
+        labels:
+          severity: warning
+          component: egress
+        annotations:
+          summary: "egress audit events are being dropped"
+          description: "The gateway's audit ring on {{ $labels.instance }} overflowed before sandboxd drained it. Enforcement is unaffected and aerolvm_egress_denied_total stays exact, but per-connection audit records are missing."
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/egress-gateway.md#auditdropped"
+
+      # Redirected traffic from a sandbox bridge does not reach the gateway
+      # (host INPUT policy drop, bridge netfilter off, IPv6 on the bridge).
+      # The node refuses hostname-filtered creates with 501 and, in a
+      # cluster, stops advertising egress_gateway_ready.
+      - alert: SandboxdEgressSelfTestFailing
+        expr: aerolvm_egress_selftest_ok == 0
+        for: 5m
+        labels:
+          severity: warning
+          component: egress
+        annotations:
+          summary: "egress gateway self-test is failing on a sandbox bridge"
+          description: "The per-bridge self-test on {{ $labels.instance }} has failed for 5 minutes: a probe sent through the redirect never reached the gateway. Hostname-filtered creates get 501 on this node. The sandboxd log names the bridge and the cause."
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/egress-gateway.md#selftestfailing"
+
+      # Nodes run different private-cloud operator files (§5.10): the
+      # default policy, ceiling, floor or proxy differ by node, so the same
+      # create behaves differently depending on placement.
+      - alert: SandboxdEgressOperatorConfigDrift
+        expr: count(count by (key) (aerolvm_egress_operator_config_info)) > 1
+        for: 10m
+        labels:
+          severity: warning
+          component: egress
+        annotations:
+          summary: "nodes are running different egress operator files"
+          description: "aerolvm_egress_operator_config_info reports {{ $value }} distinct file hashes across the fleet. Ship the same /etc/sandboxd/egress-policy.yaml to every node."
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/egress-gateway.md#operatorfile"
+
+      # An edit of the operator file did not validate; the node keeps the
+      # last good file, so nothing changed, but the operator's edit is not live.
+      - alert: SandboxdEgressOperatorConfigReloadFailed
+        expr: increase(aerolvm_egress_operator_config_load_failures_total[15m]) > 0
+        for: 0m
+        labels:
+          severity: warning
+          component: egress
+        annotations:
+          summary: "egress operator file failed to load"
+          description: "The operator file on {{ $labels.instance }} did not validate. A node that booted with it refuses every create (503 egress_operator_config_invalid); a running node keeps its last good file. The sandboxd log names the field."
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/egress-gateway.md#operatorfile"
+
+  # Identity and access (plans/identity-and-access.md §5.15). The auth
+  # metrics are expvar maps, so their labels are key/key2: key is the
+  # principal kind (or the issuer), key2 the origin, reason or result.
+  - name: sandboxd.identity-and-access
+    interval: 30s
+    rules:
+      # The shared operator token was used, or tried, from outside the host
+      # and the cluster: accepted from a public origin (SB_PAT_SCOPE=any), or
+      # refused by SB_PAT_SCOPE=host. People should use SSO or a named
+      # token; the PAT is the break-glass credential. Under scope "any" the
+      # origin needs SB_L4_FALLBACK_PROXY_PROTOCOL to tell Caddy's traffic
+      # from the host's own.
+      - alert: SandboxdBreakGlassPATUse
+        expr: |
+          sum by (instance) (increase(aerolvm_auth_requests_total{key="operator",key2="public"}[5m])) > 0
+          or
+          sum by (instance) (increase(aerolvm_auth_failures_total{key="operator",key2=~"pat_scope|pat_origin"}[5m])) > 0
+        for: 0m
+        labels:
+          severity: warning
+          component: identity
+        annotations:
+          summary: "the operator token was used from outside the host"
+          description: "{{ $labels.instance }} saw the shared operator token (PAT) from a public origin in the last 5 minutes. Find the caller in the auth_denied and api records, move it to SSO or a named token, and rotate the PAT if it leaked."
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/identity-and-access.md#breakglasspatuse"
+
+      # A node gossips a different SB_PAT_SCOPE: owners under "host" refuse
+      # its forwarded public PAT calls, and it accepts the PAT remotely.
+      - alert: SandboxdPATScopeDrift
+        expr: max by (instance) (aerolvm_pat_scope_drift) > 0
+        for: 5m
+        labels:
+          severity: warning
+          component: identity
+        annotations:
+          summary: "cluster nodes disagree on SB_PAT_SCOPE"
+          description: "{{ $labels.instance }} sees {{ $value }} live members whose SB_PAT_SCOPE differs from its own. Set the same scope on every node (Terraform or Ansible) and restart the odd ones."
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/identity-and-access.md#patscopedrift"
+
+      # The token mirror on a worker or ingress node has not synced from
+      # the server tier. Past SB_IDENTITY_MAX_STALE (60s) the node refuses
+      # API tokens with 503; metrics.read scrapes keep working (D16).
+      - alert: SandboxdIdentityMirrorStale
+        expr: max by (instance) (aerolvm_identity_mirror_age_seconds) > 30
+        for: 2m
+        labels:
+          severity: warning
+          component: identity
+        annotations:
+          summary: "API token mirror is falling behind"
+          description: "The token mirror on {{ $labels.instance }} is {{ $value }}s old (it polls every 5s). At 60s the node refuses API tokens with 503."
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/identity-and-access.md#mirrorstale"
+
+      - alert: SandboxdIdentityMirrorRefusingTokens
+        expr: max by (instance) (aerolvm_identity_mirror_age_seconds) > 60
+        for: 1m
+        labels:
+          severity: critical
+          component: identity
+        annotations:
+          summary: "API tokens are refused on a node: its token mirror is stale"
+          description: "The token mirror on {{ $labels.instance }} is {{ $value }}s old, past SB_IDENTITY_MAX_STALE. Every avm_ token gets 503 there except metrics scrapes; SSO and the PAT still work."
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/identity-and-access.md#mirrorstale"
+
+      # Signing keys for an issuer could not be fetched for 15 minutes with
+      # no success in between. Tokens signed with a cached key still verify;
+      # a new key id (rotation) or a node with no keys gets 503.
+      - alert: SandboxdIdentityJWKSFailing
+        expr: |
+          (sum by (instance, key) (increase(aerolvm_identity_jwks_fetch_total{key2=~"error|too_large"}[15m])) > 0)
+          unless on (instance, key)
+          (sum by (instance, key) (increase(aerolvm_identity_jwks_fetch_total{key2="ok"}[15m])) > 0)
+        for: 15m
+        labels:
+          severity: warning
+          component: identity
+        annotations:
+          summary: "an identity provider's signing keys cannot be fetched"
+          description: "{{ $labels.instance }} has failed to fetch the JWKS of issuer {{ $labels.key }} for 15 minutes. SSO sign-ins with a rotated or uncached key get 503 on that node."
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/identity-and-access.md#jwksfailing"
+
+      # Nodes run different identity files, so the same person can hold a
+      # different role depending on which node serves the request.
+      - alert: SandboxdIdentityFileDrift
+        expr: count(count by (key) (aerolvm_identity_file_info)) > 1
+        for: 10m
+        labels:
+          severity: warning
+          component: identity
+        annotations:
+          summary: "nodes are running different identity files"
+          description: "aerolvm_identity_file_info reports {{ $value }} distinct identity-file hashes across the fleet. Ship the same SB_IDENTITY_FILE to every node."
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/identity-and-access.md#identityfiledrift"
+
+      # An identity file did not load. At boot SSO answers 503 until it is
+      # fixed; on reload the node keeps its last good file.
+      - alert: SandboxdIdentityFileLoadErrors
+        expr: increase(aerolvm_identity_file_load_errors_total[10m]) > 0
+        for: 0m
+        labels:
+          severity: warning
+          component: identity
+        annotations:
+          summary: "the identity file failed to load"
+          description: "The identity file on {{ $labels.instance }} did not validate. A node that booted with it answers SSO with 503 (API tokens and the PAT still work); a running node keeps its last good file. The sandboxd log names the error."
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/identity-and-access.md#identityfileloaderrors"

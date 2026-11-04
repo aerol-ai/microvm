@@ -14,5 +14,9 @@ capabilities:
   - cluster
   # Opt UC-94/UC-95 in here (docker + gvisor latency; docker density).
   - benchmark
+  # Hostname egress filtering (plans/egress-domain-filtering.md P1-10): install.sh
+  # starts the aerolvm-egress-gateway units and SB_EGRESS_FQDN_ENABLED defaults
+  # on, so UC-180..182 run here.
+  - egress-fqdn
 
 expected_members: 3

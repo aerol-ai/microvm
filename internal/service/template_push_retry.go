@@ -4,18 +4,25 @@ import (
 	"context"
 	"log/slog"
 	"sync"
+	"time"
 
 	"github.com/aerol-ai/microvm/internal/cluster"
+	"github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
 
 // TemplateArtifactPushStore is the narrow store surface the template
 // push reconciler needs. Pulled out as an interface so the reconciler
 // is testable without a real SQLite store. Mirrors SnapshotPushStore.
+//
+// Like the snapshot queue, a listed row is only a candidate: the reconciler
+// owns a template from the claim that matches it to the completion or
+// release fenced by that claim's stamp (internal/store/push_queue.go).
 type TemplateArtifactPushStore interface {
 	ListTemplatesPendingPush(ctx context.Context) ([]*models.Template, error)
-	SetTemplatePushState(ctx context.Context, id, state, errMsg string) error
-	UpdateTemplatePushDistribution(ctx context.Context, id, ref, digest string) error
+	ClaimTemplatePush(ctx context.Context, id string) (*models.Template, time.Time, bool, error)
+	CompleteTemplatePush(ctx context.Context, id string, claimedAt time.Time, registryRef, digest string) (bool, error)
+	ReleaseTemplatePush(ctx context.Context, id string, claimedAt time.Time, state, errMsg string) (bool, error)
 }
 
 // TemplatePushStore wraps the raw store the push reconciler writes through so
@@ -44,36 +51,46 @@ func (t *templatePushStoreSeam) ListTemplatesPendingPush(ctx context.Context) ([
 	return t.inner.ListTemplatesPendingPush(ctx)
 }
 
-func (t *templatePushStoreSeam) SetTemplatePushState(ctx context.Context, id, state, errMsg string) error {
-	if err := t.inner.SetTemplatePushState(ctx, id, state, errMsg); err != nil {
-		return err
+func (t *templatePushStoreSeam) ClaimTemplatePush(ctx context.Context, id string) (*models.Template, time.Time, bool, error) {
+	tpl, claimedAt, ok, err := t.inner.ClaimTemplatePush(ctx, id)
+	if ok {
+		t.svc.MarkArtifactCatalogDirty(cluster.ArtifactKindTemplate)
 	}
-	t.svc.MarkArtifactCatalogDirty(cluster.ArtifactKindTemplate)
-	return nil
+	return tpl, claimedAt, ok, err
 }
 
-func (t *templatePushStoreSeam) UpdateTemplatePushDistribution(ctx context.Context, id, ref, digest string) error {
-	if err := t.inner.UpdateTemplatePushDistribution(ctx, id, ref, digest); err != nil {
-		return err
+func (t *templatePushStoreSeam) CompleteTemplatePush(ctx context.Context, id string, claimedAt time.Time, registryRef, digest string) (bool, error) {
+	applied, err := t.inner.CompleteTemplatePush(ctx, id, claimedAt, registryRef, digest)
+	if applied {
+		t.svc.MarkArtifactCatalogDirty(cluster.ArtifactKindTemplate)
 	}
-	t.svc.MarkArtifactCatalogDirty(cluster.ArtifactKindTemplate)
-	return nil
+	return applied, err
+}
+
+func (t *templatePushStoreSeam) ReleaseTemplatePush(ctx context.Context, id string, claimedAt time.Time, state, errMsg string) (bool, error) {
+	applied, err := t.inner.ReleaseTemplatePush(ctx, id, claimedAt, state, errMsg)
+	if applied {
+		t.svc.MarkArtifactCatalogDirty(cluster.ArtifactKindTemplate)
+	}
+	return applied, err
 }
 
 // TemplateArtifactPushReconciler walks rows the build success path
-// flagged `push_state IN ('pending', 'error')` and re-tries them. One
-// ticker per node; fan-out inside a single tick is capped so a
-// recovery storm doesn't saturate the local Docker daemon or AOCR.
-//
-// Like SnapshotPushReconciler, the type does not own a goroutine —
-// RunOnce is the unit of work and the ticker lives in main.go. That
-// keeps the type fully testable (table-driven, no time.Tick) and lets
-// an operator trigger an immediate retry from a debug endpoint.
+// flagged `push_state IN ('pending', 'error')` and re-tries them. Like
+// SnapshotPushReconciler it is the node's one template push worker: Run
+// sweeps on a ticker and on Kick, sweeps never overlap, and maxInFlight
+// bounds the pushes in flight on the node, so a recovery storm doesn't
+// saturate the local Docker daemon or AOCR.
 type TemplateArtifactPushReconciler struct {
 	pusher      *TemplateArtifactPusher
 	store       TemplateArtifactPushStore
 	logger      *slog.Logger
 	maxInFlight int
+	slots       chan struct{}
+	gate        *pushSweepGate
+	// testAfterList, when set, runs after the queue is listed. Nil in
+	// production.
+	testAfterList func()
 }
 
 // NewTemplateArtifactPushReconciler builds the reconciler. Returns nil
@@ -97,6 +114,8 @@ func NewTemplateArtifactPushReconciler(pusher *TemplateArtifactPusher, store Tem
 		store:       store,
 		logger:      logger,
 		maxInFlight: maxInFlight,
+		slots:       make(chan struct{}, maxInFlight),
+		gate:        newPushSweepGate(),
 	}
 }
 
@@ -107,21 +126,69 @@ type TemplateArtifactPushStats struct {
 	Succeeded int
 	Failed    int
 	Skipped   int
+	// Coalesced: a sweep was already running and took this request over.
+	Coalesced bool
 }
 
-// RunOnce processes one sweep of the template push-pending queue.
-// Blocks until all per-template attempts have returned. The bounded
-// semaphore caps in-flight Docker push streams; the AOCR side is
-// usually fine with the load but the local daemon's network/IO is not
-// infinitely parallel — and a template tar is much larger than a
-// snapshot's, so even a small fanout consumes real bandwidth.
-func (r *TemplateArtifactPushReconciler) RunOnce(ctx context.Context) (TemplateArtifactPushStats, error) {
+func (s *TemplateArtifactPushStats) add(o TemplateArtifactPushStats) {
+	s.Scanned += o.Scanned
+	s.Succeeded += o.Succeeded
+	s.Failed += o.Failed
+	s.Skipped += o.Skipped
+}
+
+// Kick wakes the worker started by Run without blocking; the build path
+// calls it once a template is marked for push.
+func (r *TemplateArtifactPushReconciler) Kick() {
 	if r == nil {
+		return
+	}
+	r.gate.kick()
+}
+
+// Run is the node's template push worker: a sweep every interval and on
+// every Kick until ctx ends. report, when non-nil, receives each outcome.
+func (r *TemplateArtifactPushReconciler) Run(ctx context.Context, interval time.Duration, report func(TemplateArtifactPushStats, error)) {
+	if r == nil || r.gate == nil {
+		return
+	}
+	runPushWorker(ctx, interval, r.gate.wake, func(ctx context.Context) {
+		stats, err := r.RunOnce(ctx)
+		if report != nil && !cutShortByShutdown(ctx, err) {
+			report(stats, err)
+		}
+	})
+}
+
+// RunOnce sweeps the template push queue and blocks until every push it
+// started has returned. A call that arrives while another sweep runs asks
+// that sweep to go round once more and returns at once (Coalesced) instead
+// of sweeping beside it. Templates are few per node, so the queue is read
+// in one go rather than paged.
+func (r *TemplateArtifactPushReconciler) RunOnce(ctx context.Context) (TemplateArtifactPushStats, error) {
+	if r == nil || r.gate == nil {
 		return TemplateArtifactPushStats{}, nil
 	}
+	if !r.gate.enter() {
+		return TemplateArtifactPushStats{Coalesced: true}, nil
+	}
+	var total TemplateArtifactPushStats
+	for {
+		stats, err := r.sweep(ctx)
+		total.add(stats)
+		if !r.gate.again(err != nil) {
+			return total, err
+		}
+	}
+}
+
+func (r *TemplateArtifactPushReconciler) sweep(ctx context.Context) (TemplateArtifactPushStats, error) {
 	pending, err := r.store.ListTemplatesPendingPush(ctx)
 	if err != nil {
 		return TemplateArtifactPushStats{}, err
+	}
+	if r.testAfterList != nil {
+		r.testAfterList()
 	}
 	// Sample the push-state gauges off the rows we already have. The
 	// list is filtered to push_state IN ('pending','error'); partitioning
@@ -132,26 +199,22 @@ func (r *TemplateArtifactPushReconciler) RunOnce(ctx context.Context) (TemplateA
 	}
 	recordTemplatePushGauges(gaugeRows)
 	stats := TemplateArtifactPushStats{Scanned: len(pending)}
-	if len(pending) == 0 {
-		return stats, nil
-	}
 
-	sem := make(chan struct{}, r.maxInFlight)
 	var wg sync.WaitGroup
 	var mu sync.Mutex
-
 	for _, tpl := range pending {
-		if err := ctx.Err(); err != nil {
+		if err := acquirePushSlot(ctx, r.slots); err != nil {
+			wg.Wait()
 			return stats, err
 		}
 		wg.Add(1)
-		sem <- struct{}{}
 		go func(tpl *models.Template) {
 			defer wg.Done()
-			defer func() { <-sem }()
+			defer func() { <-r.slots }()
 
 			outcome := r.pushOne(ctx, tpl)
 			mu.Lock()
+			defer mu.Unlock()
 			switch outcome {
 			case templatePushSucceeded:
 				stats.Succeeded++
@@ -162,7 +225,6 @@ func (r *TemplateArtifactPushReconciler) RunOnce(ctx context.Context) (TemplateA
 			case templatePushSkipped:
 				stats.Skipped++
 			}
-			mu.Unlock()
 		}(tpl)
 	}
 	wg.Wait()
@@ -177,74 +239,70 @@ const (
 	templatePushSkipped
 )
 
-// pushOne pushes a single template's artifacts. Errors are logged and
-// turned into `templatePushFailed` (the row stays in 'error' for the
-// next tick); they are not propagated up because one bad template
-// should not abort the whole sweep. Mirrors SnapshotPushReconciler's
-// pushOne — the failure-path consistency is the same: row stays in
-// 'error' with 'push_error' populated, next tick retries.
-func (r *TemplateArtifactPushReconciler) pushOne(ctx context.Context, tpl *models.Template) templatePushOutcome {
-	if tpl == nil {
+// pushOne claims and pushes a single template's artifacts. Errors are
+// logged and turned into `templatePushFailed` (the row goes to 'error' for
+// the next sweep); they are not propagated up because one bad template
+// should not abort the whole sweep. As for snapshots, the row is this call's
+// only between its claim and the write fenced by the claim's stamp.
+func (r *TemplateArtifactPushReconciler) pushOne(ctx context.Context, listed *models.Template) templatePushOutcome {
+	if listed == nil {
 		return templatePushSkipped
 	}
-	id := tpl.ID
-
-	// Defensive guard: a concurrent reconcile or operator-driven row
-	// flip may have moved the template out of 'ready' between the
-	// scan and this goroutine running. Pushing a non-ready template
-	// (e.g. an `unhealthy` row that someone is about to rebuild) would
-	// either propagate corrupt bytes to AOCR or race the rebuild.
-	if !TemplateNeedsPush(tpl) {
-		// Row is no longer push-eligible (e.g. transitioned to
-		// 'unhealthy'). Flip state to active so the reconciler stops
-		// picking it up — the rebuild path will re-mark it pending
-		// after the successful retry.
-		if err := r.store.SetTemplatePushState(ctx, id, models.TemplatePushStateActive, ""); err != nil {
-			r.logger.Warn("template push: clear non-ready row failed",
-				"template", id, "error", err)
-		}
-		return templatePushSkipped
-	}
-
-	// Claim the row so a concurrent RunOnce won't double-push. Mirrors
-	// the snapshot pusher's 'pushing' state machine — the column is
-	// the source of truth for "who is working on this".
-	if err := r.store.SetTemplatePushState(ctx, id, models.TemplatePushStatePushing, ""); err != nil {
-		r.logger.Warn("template push: claim row failed",
-			"template", id, "error", err)
-		return templatePushFailed
-	}
-
-	result, err := r.pusher.PushOnce(ctx, tpl)
+	id := listed.ID
+	tpl, claimedAt, claimed, err := r.store.ClaimTemplatePush(ctx, id)
 	if err != nil {
-		if setErr := r.store.SetTemplatePushState(ctx, id, models.TemplatePushStateError, err.Error()); setErr != nil {
-			r.logger.Warn("template push: record failure failed",
-				"template", id, "error", setErr, "push_error", err)
+		r.logger.Warn("template push: claim row failed", "template", id, "error", err)
+		return templatePushFailed
+	}
+	if !claimed {
+		return templatePushSkipped
+	}
+
+	// Defensive guard: the template may have left 'ready' between the
+	// scan and the claim. Pushing a non-ready template (e.g. an
+	// `unhealthy` row that someone is about to rebuild) would either
+	// propagate corrupt bytes to AOCR or race the rebuild; take it out of
+	// the queue instead — the rebuild path re-marks it pending.
+	if !TemplateNeedsPush(tpl) {
+		if _, err := r.store.ReleaseTemplatePush(ctx, id, claimedAt, models.TemplatePushStateActive, ""); err != nil {
+			r.logger.Warn("template push: clear non-ready row failed", "template", id, "error", err)
 		}
-		r.logger.Warn("template push: failed",
-			"template", id, "error", err)
+		return templatePushSkipped
+	}
+
+	// Capped at the claim's lease, as for snapshots: past it the push
+	// could only be fenced off, and a hung call must not hold its slot.
+	pushCtx, cancel := context.WithTimeout(ctx, store.PushClaimLease)
+	result, err := r.pusher.PushOnce(pushCtx, tpl)
+	cancel()
+	if err != nil {
+		r.release(ctx, id, claimedAt, err.Error())
+		r.logger.Warn("template push: failed", "template", id, "error", err)
 		return templatePushFailed
 	}
 
-	// Success — flip the distribution metadata first (so a crash
-	// between the two updates leaves the row still discoverable via
-	// the registry ref), then clear the push state. Digest may be
-	// empty for older daemons; we store "" rather than fabricating.
-	if err := r.store.UpdateTemplatePushDistribution(ctx, id, result.RegistryRef, result.Digest); err != nil {
-		if setErr := r.store.SetTemplatePushState(ctx, id, models.TemplatePushStateError, err.Error()); setErr != nil {
-			r.logger.Warn("template push: record post-success metadata failure failed",
-				"template", id, "error", setErr)
-		}
-		r.logger.Warn("template push: succeeded but metadata update failed",
-			"template", id, "error", err)
+	// Registry ref, digest and 'active' land in one fenced statement, so
+	// the pull side never sees a ref without its state or the reverse.
+	// Digest may be empty for older daemons; we store "" rather than
+	// fabricating.
+	applied, err := r.store.CompleteTemplatePush(ctx, id, claimedAt, result.RegistryRef, result.Digest)
+	if err != nil {
+		r.release(ctx, id, claimedAt, err.Error())
+		r.logger.Warn("template push: succeeded but metadata update failed", "template", id, "error", err)
 		return templatePushFailed
 	}
-	if err := r.store.SetTemplatePushState(ctx, id, models.TemplatePushStateActive, ""); err != nil {
-		r.logger.Warn("template push: succeeded but state-clear failed",
-			"template", id, "error", err)
-		return templatePushFailed
+	if !applied {
+		r.logger.Warn("template push: finished after losing its claim; the row's current owner decides",
+			"template", id, "registry_ref", result.RegistryRef)
+		return templatePushSkipped
 	}
-	r.logger.Info("template push: succeeded",
-		"template", id, "registry_ref", result.RegistryRef)
+	r.logger.Info("template push: succeeded", "template", id, "registry_ref", result.RegistryRef)
 	return templatePushSucceeded
+}
+
+// release moves a claimed template to 'error' with reason, fenced by the claim.
+func (r *TemplateArtifactPushReconciler) release(ctx context.Context, id string, claimedAt time.Time, reason string) {
+	if _, err := r.store.ReleaseTemplatePush(ctx, id, claimedAt, models.TemplatePushStateError, reason); err != nil {
+		r.logger.Warn("template push: record failure failed", "template", id, "error", err, "push_error", reason)
+	}
 }

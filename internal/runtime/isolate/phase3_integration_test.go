@@ -279,3 +279,84 @@ func TestPhase3ExecInvokeHandler(t *testing.T) {
 		t.Fatalf("files status = %d, want 501", rr.Code)
 	}
 }
+
+// TestPhase3LiveEgressPolicyUpdate proves a live policy change against real
+// workerd (plans/egress-domain-filtering.md §5.8): list to list swaps the
+// matcher in place, list to block-all frees the slot, and block-all back to a
+// list binds a new slot. The slot-reuse step is the attribution check: once
+// sb-live's freed slot belongs to sb-taker, sb-live must not inherit
+// sb-taker's allowlist through a cached isolate still bound to that slot.
+func TestPhase3LiveEgressPolicyUpdate(t *testing.T) {
+	workerd := requireWorkerd(t)
+	runDir := shortRunDir(t)
+	d := phase3Driver(t, workerd, runDir)
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
+	src := `export default { async fetch(req) {
+  const u = new URL(req.url);
+  try {
+    const r = await fetch(u.searchParams.get("t"));
+    return new Response("status=" + r.status);
+  } catch (e) {
+    return new Response("throw=" + (e && e.message ? e.message : String(e)));
+  }
+}};`
+	p := filepath.Join(t.TempDir(), "live.js")
+	if err := os.WriteFile(p, []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ref := "file://" + p
+	create := func(id string, allow []string) {
+		if _, err := d.Create(ctx, models.CreateSandboxRequest{
+			Runtime: models.RuntimeIsolate, ModuleRef: ref, TenantID: "live-tenant", MemoryMB: 128,
+			NetworkAllowOut: allow,
+		}, id, "", nil); err != nil {
+			t.Fatalf("create %s: %v", id, err)
+		}
+		t.Cleanup(func() { _ = d.Destroy(context.Background(), &models.Sandbox{ID: id}) })
+	}
+	denied := func(id, target string) bool {
+		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, "http://isolate/?t="+url.QueryEscape(target), nil)
+		resp, err := d.InvokeHTTP(ctx, id, req)
+		if err != nil {
+			t.Fatalf("invoke %s: %v", id, err)
+		}
+		b, _ := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		return strings.Contains(string(b), "status=403")
+	}
+	update := func(id string, blockAll bool, allow []string) {
+		if err := d.UpdateEgressPolicy(id, blockAll, allow, nil, false, nil, nil); err != nil {
+			t.Fatalf("update %s: %v", id, err)
+		}
+	}
+
+	create("sb-live", []string{"example.com"})
+	if denied("sb-live", "https://example.com/") || !denied("sb-live", "https://not-allowed.example/") {
+		t.Fatal("the create-time allowlist is not what is enforced")
+	}
+
+	update("sb-live", false, []string{"not-allowed.example"})
+	if !denied("sb-live", "https://example.com/") || denied("sb-live", "https://not-allowed.example/") {
+		t.Fatal("a list-to-list update did not swap the allowlist live")
+	}
+
+	update("sb-live", true, nil)
+	if !denied("sb-live", "https://not-allowed.example/") {
+		t.Fatal("block-all did not deny the previously allowed host")
+	}
+
+	create("sb-taker", []string{"example.com"})
+	if denied("sb-taker", "https://example.com/") {
+		t.Fatal("sb-taker's own allowlist is not enforced")
+	}
+	if !denied("sb-live", "https://example.com/") {
+		t.Fatal("sb-live reached sb-taker's allowed host through the slot it gave up")
+	}
+
+	update("sb-live", false, []string{"example.com"})
+	if denied("sb-live", "https://example.com/") {
+		t.Fatal("block-all back to a list did not bind a new slot")
+	}
+}

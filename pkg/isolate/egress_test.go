@@ -1,44 +1,84 @@
 package isolate
 
 import (
+	"context"
+	"errors"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/aerol-ai/microvm/pkg/egresspolicy"
 )
 
-func TestEgressAllowedAndHostMatches(t *testing.T) {
+func mustPolicy(t *testing.T, p EgressPolicy) *egresspolicy.Policy {
+	t.Helper()
+	cp, err := compileEgressPolicy(p)
+	if err != nil {
+		t.Fatalf("compile %+v: %v", p, err)
+	}
+	return cp
+}
+
+// TestEgressPolicyMatching is the isolate regression contract (D15, T1):
+// isolate is on the shared egresspolicy matcher. Every pre-migration row is
+// kept; the deny-precedence row now asserts allow-wins (D4), and hostname
+// deny entries moved to CIDRs because the shared grammar rejects them.
+func TestEgressPolicyMatching(t *testing.T) {
 	tests := []struct {
 		name string
 		p    EgressPolicy
 		host string
+		port uint16
 		want bool
 	}{
-		{"block-all denies", EgressPolicy{BlockAll: true}, "api.example.com", false},
-		{"empty allow = allow all", EgressPolicy{}, "api.example.com", true},
-		{"deny wins over empty allow", EgressPolicy{Deny: []string{"evil.com"}}, "evil.com", false},
-		{"exact allow match", EgressPolicy{Allow: []string{"api.example.com"}}, "api.example.com", true},
-		{"allow miss", EgressPolicy{Allow: []string{"api.example.com"}}, "other.com", false},
-		{"suffix wildcard", EgressPolicy{Allow: []string{".example.com"}}, "a.b.example.com", true},
-		{"suffix wildcard non-match", EgressPolicy{Allow: []string{".example.com"}}, "example.org", false},
-		{"deny precedence over allow", EgressPolicy{Allow: []string{".example.com"}, Deny: []string{"bad.example.com"}}, "bad.example.com", false},
-		{"cidr in-range", EgressPolicy{Allow: []string{"203.0.113.0/24"}}, "203.0.113.7", true},
-		{"cidr out-of-range", EgressPolicy{Allow: []string{"203.0.113.0/24"}}, "198.51.100.7", false},
-		{"case-insensitive host", EgressPolicy{Allow: []string{"api.example.com"}}, "API.Example.COM", true},
+		{"block-all denies", EgressPolicy{BlockAll: true}, "api.example.com", 443, false},
+		{"empty allow = allow all", EgressPolicy{}, "api.example.com", 443, true},
+		{"deny wins over empty allow", EgressPolicy{Deny: []string{"203.0.113.0/24"}}, "203.0.113.7", 443, false},
+		{"exact allow match", EgressPolicy{Allow: []string{"api.example.com"}}, "api.example.com", 443, true},
+		{"allow miss", EgressPolicy{Allow: []string{"api.example.com"}}, "other.com", 443, false},
+		{"suffix wildcard", EgressPolicy{Allow: []string{".example.com"}}, "a.b.example.com", 443, true},
+		{"suffix wildcard non-match", EgressPolicy{Allow: []string{".example.com"}}, "example.org", 443, false},
+		{"allow wins over deny (D4)", EgressPolicy{Allow: []string{"203.0.113.0/25"}, Deny: []string{"203.0.113.0/24"}}, "203.0.113.7", 443, true},
+		{"cidr in-range", EgressPolicy{Allow: []string{"203.0.113.0/24"}}, "203.0.113.7", 443, true},
+		{"cidr out-of-range", EgressPolicy{Allow: []string{"203.0.113.0/24"}}, "198.51.100.7", 443, false},
+		{"case-insensitive host", EgressPolicy{Allow: []string{"api.example.com"}}, "API.Example.COM", 443, true},
+		// New with the shared grammar.
+		{"star wildcard any depth", EgressPolicy{Allow: []string{"*.example.com"}}, "a.b.example.com", 443, true},
+		{"star wildcard not the apex (EF-22)", EgressPolicy{Allow: []string{"*.example.com"}}, "example.com", 443, false},
+		{"legacy suffix not the apex", EgressPolicy{Allow: []string{".example.com"}}, "example.com", 443, false},
+		{"bare host is 80/443 only (EF-45)", EgressPolicy{Allow: []string{"api.example.com"}}, "api.example.com", 8443, false},
+		{"host:port allows that port", EgressPolicy{Allow: []string{"api.example.com:8443"}}, "api.example.com", 8443, true},
+		{"host:port is not the web ports", EgressPolicy{Allow: []string{"api.example.com:8443"}}, "api.example.com", 443, false},
+		{"mixed lists default accept (D4)", EgressPolicy{Allow: []string{"api.example.com"}, Deny: []string{"203.0.113.0/24"}}, "other.com", 443, true},
+		{"allow plus deny-all is an allowlist", EgressPolicy{Allow: []string{"api.example.com"}, Deny: []string{"0.0.0.0/0"}}, "other.com", 443, false},
+		{"deny-all alone is block-all", EgressPolicy{Deny: []string{"0.0.0.0/0"}}, "other.com", 443, false},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := egressAllowed(tc.p, tc.host); got != tc.want {
-				t.Fatalf("egressAllowed(%+v, %q) = %v, want %v", tc.p, tc.host, got, tc.want)
+			if got, _ := mustPolicy(t, tc.p).MatchHostPort(tc.host, tc.port); got != tc.want {
+				t.Fatalf("MatchHostPort(%+v, %q, %d) = %v, want %v", tc.p, tc.host, tc.port, got, tc.want)
 			}
 		})
 	}
 }
 
-func TestIsBlockedEgressIP(t *testing.T) {
+// TestCompileEgressPolicyRejectsHostnameDeny is EF-45's grammar half: a
+// hostname in Deny no longer compiles (the service turns it into a 400).
+func TestCompileEgressPolicyRejectsHostnameDeny(t *testing.T) {
+	_, err := compileEgressPolicy(EgressPolicy{Allow: []string{".example.com"}, Deny: []string{"bad.example.com"}})
+	if !errors.Is(err, egresspolicy.ErrInvalid) || !strings.Contains(err.Error(), `"bad.example.com"`) {
+		t.Fatalf("err = %v, want ErrInvalid naming the entry", err)
+	}
+}
+
+// TestIsolateDialGuardBlocks keeps isolate's strict SSRF ranges (D15):
+// loopback, link-local, private (RFC 1918 + ULA), unspecified.
+func TestIsolateDialGuardBlocks(t *testing.T) {
 	blocked := []string{
 		"127.0.0.1",       // loopback (the sandboxd API)
 		"::1",             // loopback v6
@@ -51,14 +91,19 @@ func TestIsBlockedEgressIP(t *testing.T) {
 		"fc00::1",         // ULA
 	}
 	for _, s := range blocked {
-		if ip := net.ParseIP(s); ip == nil || !isBlockedEgressIP(ip) {
-			t.Errorf("isBlockedEgressIP(%s) = false, want true (must be blocked)", s)
+		if err := currentIsolateGuard().Check(nil, egresspolicy.DialTarget{Addr: netip.AddrPortFrom(netip.MustParseAddr(s), 443)}); err == nil {
+			t.Errorf("%s allowed, want blocked", s)
 		}
+	}
+	// Strict mode: a policy CIDR does not open a private range on isolate.
+	cidr := mustPolicy(t, EgressPolicy{Allow: []string{"10.0.0.0/8"}})
+	if err := currentIsolateGuard().Check(cidr, egresspolicy.DialTarget{Addr: netip.MustParseAddrPort("10.0.0.5:443")}); err == nil {
+		t.Error("CIDR-allowed private address reachable on isolate")
 	}
 	allowed := []string{"8.8.8.8", "203.0.113.10", "2606:4700:4700::1111"}
 	for _, s := range allowed {
-		if ip := net.ParseIP(s); ip == nil || isBlockedEgressIP(ip) {
-			t.Errorf("isBlockedEgressIP(%s) = true, want false (public address)", s)
+		if err := currentIsolateGuard().Check(nil, egresspolicy.DialTarget{Addr: netip.AddrPortFrom(netip.MustParseAddr(s), 443)}); err != nil {
+			t.Errorf("%s blocked (%v), want allowed (public address)", s, err)
 		}
 	}
 }
@@ -70,7 +115,7 @@ func TestProxyEgressBlocksLiteralSSRF(t *testing.T) {
 	for _, target := range []string{"http://127.0.0.1:21212/v1/sandboxes", "http://169.254.169.254/latest/meta-data/"} {
 		req := httptest.NewRequest(http.MethodGet, target, nil)
 		rec := httptest.NewRecorder()
-		h.proxyEgress(rec, req, "sb-ssrf", EgressPolicy{}) // allow-all policy
+		h.proxyEgress(rec, req, "sb-ssrf", mustPolicy(t, EgressPolicy{})) // allow-all policy
 		if rec.Code != http.StatusForbidden {
 			t.Fatalf("egress to %s = %d, want 403 (blocked)", target, rec.Code)
 		}
@@ -89,7 +134,7 @@ func TestProxyEgressPolicyDeny(t *testing.T) {
 	// Host not in the allowlist → 403 by policy.
 	req := httptest.NewRequest(http.MethodGet, "http://other.example/x", nil)
 	rec := httptest.NewRecorder()
-	h.proxyEgress(rec, req, "sb-1", EgressPolicy{Allow: []string{"only.example"}})
+	h.proxyEgress(rec, req, "sb-1", mustPolicy(t, EgressPolicy{Allow: []string{"only.example"}}))
 	if rec.Code != http.StatusForbidden {
 		t.Fatalf("non-allowlisted host = %d, want 403", rec.Code)
 	}
@@ -102,7 +147,7 @@ func TestProxyEgressPolicyDeny(t *testing.T) {
 	req.Host = ""
 	req.URL.Host = ""
 	rec = httptest.NewRecorder()
-	h.proxyEgress(rec, req, "sb-1", EgressPolicy{})
+	h.proxyEgress(rec, req, "sb-1", mustPolicy(t, EgressPolicy{}))
 	if rec.Code != http.StatusForbidden {
 		t.Fatalf("no-host = %d, want 403", rec.Code)
 	}
@@ -137,7 +182,7 @@ func TestProxyEgressObserverCapturesHost(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "http://api.example.com:8443/v1", nil)
 	req.Host = "api.example.com:8443"
 	rec := httptest.NewRecorder()
-	h.proxyEgress(rec, req, "sb-obs", EgressPolicy{})
+	h.proxyEgress(rec, req, "sb-obs", mustPolicy(t, EgressPolicy{}))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", rec.Code)
 	}
@@ -154,7 +199,7 @@ func TestProxyEgressObserverCapturesHost(t *testing.T) {
 	got.n = 0
 	rec = httptest.NewRecorder()
 	h.proxyEgress(rec, httptest.NewRequest(http.MethodGet, "http://other.example/", nil), "sb-obs",
-		EgressPolicy{Allow: []string{"only.example"}})
+		mustPolicy(t, EgressPolicy{Allow: []string{"only.example"}}))
 	if rec.Code != http.StatusForbidden {
 		t.Fatalf("deny status = %d", rec.Code)
 	}
@@ -168,7 +213,7 @@ func TestProxyEgressObserverCapturesHost(t *testing.T) {
 // slot has no attributed owner (a teardown race) or the owner has no registered
 // policy — the socket, not a header, is the attribution.
 func TestServeEgressSlotFailsClosed(t *testing.T) {
-	h := &Host{idBySlot: []string{""}, egressPolicy: map[string]EgressPolicy{}}
+	h := &Host{idBySlot: []string{""}, egressPolicy: map[string]*egresspolicy.Policy{}}
 	// Slot 0 has no owner → forbidden.
 	rec := httptest.NewRecorder()
 	h.serveEgressSlot(0, rec, httptest.NewRequest(http.MethodGet, "http://example.com/", nil))
@@ -181,5 +226,124 @@ func TestServeEgressSlotFailsClosed(t *testing.T) {
 	h.serveEgressSlot(0, rec, httptest.NewRequest(http.MethodGet, "http://example.com/", nil))
 	if rec.Code != http.StatusForbidden {
 		t.Fatalf("owner without policy = %d, want 403 (fail-closed)", rec.Code)
+	}
+}
+
+// TestProxyEgressDenialsExplainAndReport (P1-13, P1-7): every 403 names the
+// destination and why, and every denial for an attributed sandbox reaches
+// the denial observer with the shared reason.
+func TestProxyEgressDenialsExplainAndReport(t *testing.T) {
+	prev := egressTransport
+	t.Cleanup(func() { egressTransport = prev })
+	egressTransport = roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return nil, &net.OpError{Op: "dial", Err: egresspolicy.ErrDialRefused}
+	})
+	type denial struct{ id, dest, reason string }
+	var got []denial
+	h := &Host{}
+	h.SetEgressDenialObserver(func(id, dest, reason string) { got = append(got, denial{id, dest, reason}) })
+	cases := []struct {
+		url    string
+		p      EgressPolicy
+		reason string
+		body   string
+	}{
+		{"http://other.example/x", EgressPolicy{Allow: []string{"only.example"}}, DenyReasonHostNotAllowed, "host other.example not allowed (no rule matches)"},
+		{"http://198.51.100.7/x", EgressPolicy{Deny: []string{"198.51.100.0/24"}}, DenyReasonIPNotAllowed, "not allowed (rule 198.51.100.0/24)"},
+		{"http://169.254.169.254/x", EgressPolicy{}, DenyReasonBlockedIP, "is a blocked address"},
+		{"http://rebind.example/x", EgressPolicy{}, DenyReasonBlockedIP, "resolves to a blocked address"},
+	}
+	for _, tc := range cases {
+		rec := httptest.NewRecorder()
+		h.proxyEgress(rec, httptest.NewRequest(http.MethodGet, tc.url, nil), "sb-x", mustPolicy(t, tc.p))
+		if rec.Code != http.StatusForbidden || !strings.Contains(rec.Body.String(), tc.body) || !strings.HasPrefix(rec.Body.String(), "aerolvm egress policy:") {
+			t.Fatalf("%s: %d %q, want 403 containing %q", tc.url, rec.Code, rec.Body.String(), tc.body)
+		}
+		if last := got[len(got)-1]; last.id != "sb-x" || last.reason != tc.reason {
+			t.Fatalf("%s: observed %+v, want reason %s", tc.url, last, tc.reason)
+		}
+	}
+	// An unattributed request (empty id) still gets the 403 but no audit.
+	n := len(got)
+	rec := httptest.NewRecorder()
+	h.proxyEgress(rec, httptest.NewRequest(http.MethodGet, "http://other.example/", nil), "", mustPolicy(t, EgressPolicy{Allow: []string{"only.example"}}))
+	if rec.Code != http.StatusForbidden || len(got) != n {
+		t.Fatal("an unattributed denial must not be reported")
+	}
+	(*Host)(nil).SetEgressDenialObserver(nil)
+}
+
+// TestSetEgressDialGuard (§5.10): the operator guard stays strict; its floor
+// applies, and the internal zone only with the isolate opt-in, matched by
+// the name being dialed.
+func TestSetEgressDialGuard(t *testing.T) {
+	t.Cleanup(func() { isolateGuard.Store(nil) })
+	zone, err := egresspolicy.NewInternalZone([]string{"corp.bank.internal"}, []string{"10.0.0.0/8"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	SetEgressDialGuard(egresspolicy.DialGuard{Zone: zone})
+	g := currentIsolateGuard()
+	if !g.Strict {
+		t.Fatal("isolate stays strict")
+	}
+	art := egresspolicy.DialTarget{Name: "artifactory.corp.bank.internal", Addr: netip.MustParseAddrPort("10.1.2.3:443")}
+	if err := g.Check(nil, art); err == nil {
+		t.Fatal("the zone must not apply to isolate without the opt-in")
+	}
+	SetEgressDialGuard(egresspolicy.DialGuard{Zone: zone, ZoneInStrict: true, DenyFloor: []netip.Prefix{netip.MustParsePrefix("10.9.0.0/16")}})
+	g = currentIsolateGuard()
+	if err := g.Check(nil, art); err != nil {
+		t.Fatalf("opted-in zone name: %v", err)
+	}
+	if err := g.Check(nil, egresspolicy.DialTarget{Name: "evil.example", Addr: netip.MustParseAddrPort("10.1.2.3:443")}); err == nil {
+		t.Fatal("a name outside the zone resolving inside it is still refused")
+	}
+	if err := g.Check(nil, egresspolicy.DialTarget{Name: "x.corp.bank.internal", Addr: netip.MustParseAddrPort("10.9.0.1:443")}); err == nil {
+		t.Fatal("the floor wins over the zone")
+	}
+	// guardedDial hands the name to the guard: a zone name may dial its IP.
+	if _, err := guardedDial(context.Background(), "tcp", "127.0.0.1:1"); !errors.Is(err, egresspolicy.ErrDialRefused) {
+		t.Fatalf("loopback dial = %v", err)
+	}
+}
+
+// TestIsolateUpstream (§5.10 PC-4): the shared transport proxies names the
+// operator chains, and the proxy's own address skips the guard (it usually
+// sits in private space the guard refuses).
+func TestIsolateUpstream(t *testing.T) {
+	t.Cleanup(func() { SetEgressUpstream(nil) })
+	ln, _ := net.Listen("tcp", "127.0.0.1:0")
+	defer ln.Close()
+	go func() {
+		if c, err := ln.Accept(); err == nil {
+			_ = c.Close()
+		}
+	}()
+	up, err := egresspolicy.NewUpstream("http://"+ln.Addr().String(), "a:b", []string{"mirror.example"}, nil, netip.MustParsePrefix("198.18.0.0/15"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr := egressTransport.(*http.Transport)
+	if u, _ := tr.Proxy(httptest.NewRequest(http.MethodGet, "https://pypi.org/", nil)); u != nil {
+		t.Fatal("no upstream: direct")
+	}
+	SetEgressUpstream(up)
+	if u, _ := tr.Proxy(httptest.NewRequest(http.MethodGet, "https://pypi.org/", nil)); u == nil || u.Host != ln.Addr().String() {
+		t.Fatalf("proxied name: %v", u)
+	}
+	if u, _ := tr.Proxy(httptest.NewRequest(http.MethodGet, "https://mirror.example/", nil)); u != nil {
+		t.Fatal("no_proxy name goes direct")
+	}
+	if h, _ := tr.GetProxyConnectHeader(context.Background(), nil, "pypi.org:443"); h.Get("Proxy-Authorization") == "" {
+		t.Fatal("CONNECT carries the credentials")
+	}
+	c, err := guardedDial(context.Background(), "tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatalf("the proxy address must skip the guard: %v", err)
+	}
+	_ = c.Close()
+	if _, err := guardedDial(context.Background(), "tcp", "127.0.0.1:1"); !errors.Is(err, egresspolicy.ErrDialRefused) {
+		t.Fatal("every other loopback dial is still refused")
 	}
 }

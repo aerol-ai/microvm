@@ -3,6 +3,7 @@ package daytona
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"mime"
@@ -508,6 +509,13 @@ func TestWriteToolboxError(t *testing.T) {
 	if rr2.Code != http.StatusBadGateway {
 		t.Fatalf("generic err status = %d, want 502", rr2.Code)
 	}
+
+	// The sandbox stopped under the request: 409, as on /v1.
+	rr3 := httptest.NewRecorder()
+	h.writeToolboxError(rr3, fmt.Errorf("exec: %w", service.ErrSandboxStoppedMidRequest))
+	if rr3.Code != http.StatusConflict || !strings.Contains(rr3.Body.String(), "stopped while the request was in flight") {
+		t.Fatalf("stopped-sandbox status = %d %s, want 409", rr3.Code, rr3.Body.String())
+	}
 }
 
 func TestToolboxExtraCoverage(t *testing.T) {
@@ -852,4 +860,22 @@ func TestToolboxDirectCoverage(t *testing.T) {
 			t.Fatalf("expected Bad Gateway, got %s", buf.String())
 		}
 	})
+}
+
+// A guest error body is bounded so a sandbox cannot make the daemon buffer
+// gigabytes while reading a failure response (S11).
+func TestReadToolboxHTTPErrorIsBounded(t *testing.T) {
+	huge := strings.Repeat("x", maxToolboxErrorBytes+4096)
+	resp := &http.Response{
+		StatusCode: http.StatusBadGateway,
+		Body:       io.NopCloser(strings.NewReader(huge)),
+	}
+	err := readToolboxHTTPError(resp)
+	var terr *toolboxHTTPError
+	if !errors.As(err, &terr) {
+		t.Fatalf("readToolboxHTTPError = %T, want *toolboxHTTPError", err)
+	}
+	if len(terr.Message) > maxToolboxErrorBytes {
+		t.Fatalf("error message is %d bytes; want at most %d", len(terr.Message), maxToolboxErrorBytes)
+	}
 }

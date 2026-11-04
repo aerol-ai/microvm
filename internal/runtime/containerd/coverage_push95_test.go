@@ -24,6 +24,9 @@ import (
 
 // coverage_push95_test.go: hit remaining offline-reachable branches to clear 95%.
 
+// A running task whose address can't be read is still a running sandbox.
+// ListManaged used to skip it, and reconcile then deleted the live sandbox's
+// row (UC-320 gVisor neighbour). It is listed, started, with no address.
 func TestListManagedInspectFailPush95(t *testing.T) {
 	orig := containerIPv4FromTaskFn
 	containerIPv4FromTaskFn = func(context.Context, cntr.Task) (string, error) {
@@ -39,8 +42,11 @@ func TestListManagedInspectFailPush95(t *testing.T) {
 	d := newTestDriver(t)
 	d.SetClient(NewTestClient("aerolvm", tr))
 	got, err := d.ListManaged(context.Background())
-	if err != nil || len(got) != 0 {
+	if err != nil || len(got) != 1 {
 		t.Fatalf("got=%v err=%v", got, err)
+	}
+	if st := got["sb-badip"]; st == nil || st.Status != models.SandboxStatusStarted || st.ContainerIP != "" {
+		t.Fatalf("state=%+v, want started with no address", st)
 	}
 }
 
@@ -213,7 +219,7 @@ func TestWaitToolboxHTTPCancelDuringPollPush95(t *testing.T) {
 }
 
 func TestResourceSpecOptsTinyCPUPush95(t *testing.T) {
-	opts := resourceSpecOpts(models.CreateSandboxRequest{CPU: 0.001})
+	opts := resourceSpecOpts(models.CreateSandboxRequest{CPU: 0.001}, 0)
 	if len(opts) != 1 {
 		t.Fatalf("opts=%d", len(opts))
 	}
@@ -309,7 +315,11 @@ func TestContainerIDAndExitNilEventPush95(t *testing.T) {
 
 func TestStreamEventsCtxDonePush95(t *testing.T) {
 	d := newTestDriver(t)
-	d.SetClient(NewTestClient("aerolvm", newFakeTransport()))
+	// A stream that stays open: the fake transport closes its event channel
+	// from a goroutine, and when that won the race StreamEvents' select had
+	// a closed stream and a done context to pick from, and half the time
+	// returned nil.
+	d.SetClient(NewTestClient("aerolvm", &openSubscribeTransport{}))
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	out := make(chan docker.DockerEvent, 1)
@@ -351,18 +361,6 @@ func TestEnsureRunscConfigWriteFailPush95(t *testing.T) {
 	d.cfg.RunDir = runDir
 	if _, err := d.ensureRunscConfig(); err == nil {
 		t.Fatal("want write error")
-	}
-}
-
-func TestGenerateResolvConfShortLinePush95(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "resolv.conf")
-	if err := os.WriteFile(path, []byte("nameserver\nnameserver 1.1.1.1\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	body, err := generateResolvConf(path)
-	if err != nil || !strings.Contains(body, "1.1.1.1") {
-		t.Fatalf("body=%q err=%v", body, err)
 	}
 }
 
@@ -448,4 +446,12 @@ func TestEnsureImagePullSemCancelPush95(t *testing.T) {
 	if _, err := d.ensureImage(ctx, d.client, "alpine:3.20", nil); err == nil {
 		t.Fatal("want ctx cancel while waiting for pull sem")
 	}
+}
+
+// openSubscribeTransport's event stream never ends and never errors, so
+// only the caller's context can stop a reader.
+type openSubscribeTransport struct{ fakeTransport }
+
+func (*openSubscribeTransport) subscribe(context.Context, ...string) (<-chan *events.Envelope, <-chan error) {
+	return make(chan *events.Envelope), make(chan error)
 }

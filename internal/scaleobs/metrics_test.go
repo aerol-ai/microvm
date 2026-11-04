@@ -185,6 +185,21 @@ func TestNestedDurationBuckets_Observe(t *testing.T) {
 	}
 }
 
+func TestNestedDurationBucketsCacheAndBlankKey(t *testing.T) {
+	if Key("@@@") != "unknown" {
+		t.Fatalf("Key = %q", Key("@@@"))
+	}
+	if (&NestedDurationBuckets{}).Value("a", "b") != 0 {
+		t.Fatal("nil root")
+	}
+	n := NewNestedDurationBuckets("test_nested_cache_"+t.Name(), time.Millisecond)
+	n.Observe("warm", time.Millisecond)
+	n.Observe("warm", time.Millisecond)
+	if n.Value("warm", "le_1ms") != 2 {
+		t.Fatalf("cached observe = %d", n.Value("warm", "le_1ms"))
+	}
+}
+
 func TestNestedDurationBuckets_NilAndEmptyLabel(t *testing.T) {
 	var n *NestedDurationBuckets
 	n.Observe("fc_verify", time.Second)

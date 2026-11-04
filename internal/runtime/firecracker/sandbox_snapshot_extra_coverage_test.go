@@ -34,17 +34,17 @@ func TestSandboxSnapshot_ExtraCoverage(t *testing.T) {
 
 	// startFromSandboxSnapshot preconditions
 	dStart := &Driver{}
-	if _, err := dStart.startFromSandboxSnapshot(context.Background(), "test-sb"); err == nil || !strings.Contains(err.Error(), "TAP pool not registered") {
+	if _, err := dStart.startFromSandboxSnapshot(context.Background(), "test-sb", "tok"); err == nil || !strings.Contains(err.Error(), "TAP pool not registered") {
 		t.Errorf("expected pool nil error, got %v", err)
 	}
 
 	dStart.pool = newFakePool()
-	if _, err := dStart.startFromSandboxSnapshot(context.Background(), "test-sb"); err == nil || !strings.Contains(err.Error(), "TAP host manager not registered") {
+	if _, err := dStart.startFromSandboxSnapshot(context.Background(), "test-sb", "tok"); err == nil || !strings.Contains(err.Error(), "TAP host manager not registered") {
 		t.Errorf("expected tapHost nil error, got %v", err)
 	}
 
 	dStart.tapHost = &fakeTapHost{}
-	if _, err := dStart.startFromSandboxSnapshot(context.Background(), "test-sb"); err == nil || !strings.Contains(err.Error(), "vsock dialer not registered") {
+	if _, err := dStart.startFromSandboxSnapshot(context.Background(), "test-sb", "tok"); err == nil || !strings.Contains(err.Error(), "vsock dialer not registered") {
 		t.Errorf("expected vsockDial nil error, got %v", err)
 	}
 

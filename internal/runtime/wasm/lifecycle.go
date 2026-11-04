@@ -128,6 +128,7 @@ func (d *Driver) Start(ctx context.Context, sandboxID string) (*models.SandboxRu
 	if err := d.bindAuditCapability(sandboxID, &caps); err != nil {
 		return nil, err
 	}
+	d.bindNetworkBlocks(sandboxID, &caps)
 	if err := client.Instantiate(sandboxID, caps); err != nil {
 		return nil, fmt.Errorf("instantiate module: %w", err)
 	}
@@ -158,8 +159,10 @@ func (d *Driver) StartSandbox(ctx context.Context, sandbox *models.Sandbox, host
 		return nil, fmt.Errorf("wasm runtime: module resolver not configured: %w", models.ErrRuntimeNotImplemented)
 	}
 	// Boot the digest pinned at create, not whatever the alias/tag points at
-	// now (codex C2). On drift with no frozen copy this fails loudly.
-	resolved, err := d.resolvePinned(ctx, ref, sandbox.ModuleDigest, moduleAuthFromSandbox(sandbox))
+	// now (codex C2). On drift with no frozen copy this fails loudly. A
+	// catalogue id resolves in the sandbox owner's namespace even when an
+	// internal, caller-less context restarts it.
+	resolved, err := d.resolvePinned(wasmmod.WithCatalogueOwner(ctx, sandbox.OwnerRef), ref, sandbox.ModuleDigest, moduleAuthFromSandbox(sandbox))
 	if err != nil {
 		return nil, err
 	}

@@ -322,7 +322,7 @@ func TestHeadroomScoreSymmetricNeutral(t *testing.T) {
 func TestAdmitReservationCommandsRejectsMissingCapacityHeartbeat(t *testing.T) {
 	err := admitReservationCommands([]Member{
 		{NodeID: "worker-a", APIURL: "http://worker-a", Alive: true, Role: "worker"},
-	}, nil, nil, 32, []reservationCommand{
+	}, nil, nil, nil, 32, []reservationCommand{
 		{SandboxID: "sb1", OwnerNodeID: "worker-a", Spec: &models.CreateSandboxRequest{CPU: 1, MemoryMB: 128}},
 	})
 	if !errors.Is(err, ErrNoPlacementTarget) {
@@ -336,7 +336,7 @@ func TestAdmitReservationCommandsAppliesPerWorkerBackpressure(t *testing.T) {
 			HostCPUCores: 16, HostMemoryTotalMB: 32000,
 			CPUBudget: 16, MemoryBudgetMB: 32000,
 		}},
-	}, nil, map[string]int{"worker-a": 2}, 2, []reservationCommand{
+	}, nil, nil, map[string]int{"worker-a": 2}, 2, []reservationCommand{
 		{SandboxID: "sb1", OwnerNodeID: "worker-a", Spec: &models.CreateSandboxRequest{CPU: 1, MemoryMB: 128}},
 	})
 	if !errors.Is(err, ErrCreateBackpressure) {
@@ -350,7 +350,7 @@ func TestAdmitReservationCommandsAccountsForBatchCapacity(t *testing.T) {
 			HostCPUCores: 4, HostMemoryTotalMB: 4096,
 			CPUBudget: 2, MemoryBudgetMB: 4096,
 		}},
-	}, nil, nil, 32, []reservationCommand{
+	}, nil, nil, nil, 32, []reservationCommand{
 		{SandboxID: "sb1", OwnerNodeID: "worker-a", Spec: &models.CreateSandboxRequest{CPU: 1, MemoryMB: 128}},
 		{SandboxID: "sb2", OwnerNodeID: "worker-a", Spec: &models.CreateSandboxRequest{CPU: 1.5, MemoryMB: 128}},
 	})
@@ -746,15 +746,235 @@ func TestCatalogueTemplateHolderPassesTheTemplateFilter(t *testing.T) {
 	// catalogue applied, the reservation placement picked must be admitted.
 	spec := &models.CreateSandboxRequest{CPU: 1, MemoryMB: 100, TemplateID: "tpl-fresh"}
 	res := []reservationCommand{{SandboxID: "sb-1", OwnerNodeID: "fc-1", Spec: spec}}
-	if err := admitReservationCommands(members, nil, map[string]int{}, 0, res); err == nil {
+	if err := admitReservationCommands(members, nil, nil, map[string]int{}, 0, res); err == nil {
 		t.Fatal("precondition: admission on gossip alone must reject fc-1")
 	}
-	if err := admitReservationCommands(got, nil, map[string]int{}, 0, res); err != nil {
+	if err := admitReservationCommands(got, nil, nil, map[string]int{}, 0, res); err != nil {
 		t.Fatalf("admission with the catalogue applied rejected the holder: %v", err)
 	}
 
 	// No template, or one the catalogue doesn't know: members pass through.
 	if out := c.withCatalogueTemplateHolders(members, "", "tpl-nobody"); &out[0] != &members[0] {
 		t.Fatal("no holders should return the input slice untouched")
+	}
+}
+
+// warmFilledWorker is the node cluster-mixed-benchmark-with-obs left behind:
+// an 18-CPU budget with 17 reserved, 8 of them parked warm-pool slots its
+// admitter reclaims for a real sandbox.
+func warmFilledWorker(parkedCPU float64, parkedMemMB, parkedDiskGB int) Member {
+	return Member{
+		NodeID: "w1", APIURL: "http://w1", Role: "mixed", Alive: true,
+		Capacity: capacity.Snapshot{
+			HostCPUCores: 2, HostMemoryTotalMB: 7820,
+			CPUBudget: 18, MemoryBudgetMB: 66470, DiskBudgetGB: 180,
+			ReservedCPU: 17, ReservedMemoryMB: 17408, ReservedDiskGB: 170,
+			ParkedCPU: parkedCPU, ParkedMemoryMB: parkedMemMB, ParkedDiskGB: parkedDiskGB,
+			CanAdmit: true,
+		},
+	}
+}
+
+// Parked warm slots must not make a node look full. Counting them is what
+// stopped UC-95 density at 9 sandboxes a node and sent UC-104's isolate
+// creates to "capacity exceeded" on idle nodes. A peer that predates the
+// Parked* fields reads as zero parked and keeps the old answer.
+func TestNodeFitsTreatsParkedWarmSlotsAsFree(t *testing.T) {
+	two := capacity.Request{CPU: 1, MemoryMB: 1024, DiskGB: 10}
+	cases := []struct {
+		name  string
+		node  Member
+		extra capacity.Request
+		want  bool
+	}{
+		{"parked slots leave room", warmFilledWorker(8, 8192, 80), capacity.Request{}, true},
+		{"in-flight reservations still count", warmFilledWorker(8, 8192, 80), capacity.Request{CPU: 9}, false},
+		{"legacy peer without parked fields", warmFilledWorker(0, 0, 0), capacity.Request{CPU: 1}, false},
+		{"parked larger than reserved floors at zero", warmFilledWorker(40, 8192, 80), capacity.Request{CPU: 17}, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := nodeFits(tc.node, two, tc.extra); got != tc.want {
+				t.Fatalf("nodeFits = %v, want %v", got, tc.want)
+			}
+		})
+	}
+
+	// The leader's reservation check (run before the Raft propose, never in
+	// FSM apply) reads the same fit, so a reservation against the node is
+	// admitted rather than refused with ErrCapacityExceeded.
+	err := admitReservationCommands([]Member{warmFilledWorker(8, 8192, 80)}, nil, nil, nil, 0,
+		[]reservationCommand{{SandboxID: "sb-1", OwnerNodeID: "w1"}})
+	if err != nil {
+		t.Fatalf("reservation against a warm-filled worker = %v, want admitted", err)
+	}
+
+	// Scoring still counts parked capacity: a node with genuinely free room
+	// must outscore one that would have to give up warm slots.
+	free := warmFilledWorker(0, 0, 0)
+	free.Capacity.ReservedCPU, free.Capacity.ReservedMemoryMB, free.Capacity.ReservedDiskGB = 9, 9216, 90
+	if headroomScore(free, two, capacity.Request{}) <= headroomScore(warmFilledWorker(8, 8192, 80), two, capacity.Request{}) {
+		t.Fatal("a node with free room scored no better than one full of warm slots")
+	}
+}
+
+// egressPlacementCluster is heteroPlacementCluster's shape for capability-aware
+// egress placement (plans/egress-domain-filtering.md CEO D20): a control-plane
+// server plus docker workers whose gateway readiness the test controls. A nil
+// entry in ready models a legacy peer that omits egress_gateway_ready.
+func egressPlacementCluster(ready map[string]bool) *Cluster {
+	members := []Member{{NodeID: "server-a", APIURL: "http://server-a", Alive: true, Role: config.NodeRoleServer}}
+	for _, id := range []string{"worker-a", "worker-b", "worker-c"} {
+		m := heteroWorker(id, []string{models.RuntimeDocker})
+		m.Capacity.EgressGatewayReady = ready[id]
+		members = append(members, m)
+	}
+	index := newGossipMemberIndex()
+	index.replace(members)
+	return &Cluster{
+		nodeID: "server-a",
+		apiURL: "http://server-a",
+		fsm:    newPlacementFSM(),
+		gossip: &gossipNode{memberIndex: index},
+	}
+}
+
+// TestSelectPlacementRoutesGatewayModeToReadyNodes pins CEO D20: a
+// hostname-filtered create (and its failover recreate, which goes through
+// the same request builder) only lands on a node advertising a ready egress
+// gateway, and a plain create still uses every node.
+func TestSelectPlacementRoutesGatewayModeToReadyNodes(t *testing.T) {
+	c := egressPlacementCluster(map[string]bool{"worker-b": true})
+	gw := capacityRequestFromSpec(&models.CreateSandboxRequest{CPU: 1, MemoryMB: 100, NetworkAllowOut: []string{"pypi.org"}})
+	if !gw.NeedsEgressGateway {
+		t.Fatal("a hostname allow list must mark the request gateway-mode")
+	}
+	for i := 0; i < 200; i++ {
+		target, err := c.SelectPlacement(gw)
+		if err != nil {
+			t.Fatalf("iter %d: %v", i, err)
+		}
+		if target.NodeID != "worker-b" {
+			t.Fatalf("gateway-mode create placed on %q, want worker-b (the only ready gateway)", target.NodeID)
+		}
+	}
+	seen := map[string]bool{}
+	plain := capacityRequestFromSpec(&models.CreateSandboxRequest{CPU: 1, MemoryMB: 100, NetworkAllowOut: []string{"10.0.0.0/8"}})
+	if plain.NeedsEgressGateway {
+		t.Fatal("a CIDR-only allow list stays on netrules, not the gateway")
+	}
+	for i := 0; i < 300; i++ {
+		target, err := c.SelectPlacement(plain)
+		if err != nil {
+			t.Fatalf("plain iter %d: %v", i, err)
+		}
+		seen[target.NodeID] = true
+	}
+	if len(seen) < 2 {
+		t.Fatalf("plain creates must not be narrowed to gateway nodes, saw %v", seen)
+	}
+}
+
+// TestSelectPlacementGatewayModeNoReadyNode: with no ready gateway anywhere
+// (including legacy peers that never send the field), a gateway-mode create
+// fails with the specific sentinel, which is still an ErrNoPlacementTarget so
+// every 503 mapping holds. Never a fall back to an incapable node.
+func TestSelectPlacementGatewayModeNoReadyNode(t *testing.T) {
+	c := egressPlacementCluster(nil)
+	req := capacity.Request{CPU: 1, MemoryMB: 100, Runtime: models.RuntimeDocker, NeedsEgressGateway: true}
+	_, err := c.SelectPlacement(req)
+	if !errors.Is(err, ErrNoEgressGatewayTarget) || !errors.Is(err, ErrNoPlacementTarget) {
+		t.Fatalf("err = %v, want ErrNoEgressGatewayTarget wrapping ErrNoPlacementTarget", err)
+	}
+	// A cluster that is simply full answers the generic sentinel, even for a
+	// gateway-mode request: the gateway was not why it failed.
+	full := egressPlacementCluster(map[string]bool{"worker-a": true, "worker-b": true, "worker-c": true})
+	_, err = full.SelectPlacement(capacity.Request{CPU: 999, MemoryMB: 100, Runtime: models.RuntimeDocker, NeedsEgressGateway: true})
+	if !errors.Is(err, ErrNoPlacementTarget) || errors.Is(err, ErrNoEgressGatewayTarget) {
+		t.Fatalf("full cluster err = %v, want plain ErrNoPlacementTarget", err)
+	}
+}
+
+// TestCapacityRequestFromSpecEgressGateway covers which creates need the
+// gateway: hostnames on a container runtime or Firecracker (its TAPs reach
+// the gateway, Phase 4). WASM and isolate filter in their own mediators;
+// block-all redirects nothing; a list that doesn't compile is left to the
+// target's 400.
+func TestCapacityRequestFromSpecEgressGateway(t *testing.T) {
+	cases := []struct {
+		name string
+		spec models.CreateSandboxRequest
+		want bool
+	}{
+		{"docker hostname", models.CreateSandboxRequest{NetworkAllowOut: []string{"*.github.com"}}, true},
+		{"gvisor hostname", models.CreateSandboxRequest{Runtime: models.RuntimeGvisor, NetworkAllowOut: []string{"pypi.org:8443"}}, true},
+		{"mixed with deny cidr", models.CreateSandboxRequest{NetworkAllowOut: []string{"pypi.org"}, NetworkDenyOut: []string{"0.0.0.0/0"}}, true},
+		{"wasm hostname", models.CreateSandboxRequest{Runtime: models.RuntimeWasm, NetworkAllowOut: []string{"pypi.org"}}, false},
+		{"isolate hostname", models.CreateSandboxRequest{Runtime: models.RuntimeIsolate, NetworkAllowOut: []string{"pypi.org"}}, false},
+		{"firecracker hostname", models.CreateSandboxRequest{Runtime: models.RuntimeFirecracker, NetworkAllowOut: []string{"pypi.org"}}, true},
+		{"firecracker cidr", models.CreateSandboxRequest{Runtime: models.RuntimeFirecracker, NetworkAllowOut: []string{"10.0.0.0/8"}}, false},
+		{"block-all wins", models.CreateSandboxRequest{NetworkBlockAll: true, NetworkAllowOut: []string{"pypi.org"}}, false},
+		{"cidr only", models.CreateSandboxRequest{NetworkAllowOut: []string{"10.0.0.0/8"}}, false},
+		{"deny only", models.CreateSandboxRequest{NetworkDenyOut: []string{"10.0.0.0/8"}}, false},
+		{"invalid", models.CreateSandboxRequest{NetworkAllowOut: []string{"bad host!"}}, false},
+	}
+	for _, tc := range cases {
+		spec := tc.spec
+		if got := capacityRequestFromSpec(&spec).NeedsEgressGateway; got != tc.want {
+			t.Errorf("%s: NeedsEgressGateway = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+// TestMediatedEgressPlacement (review finding 10): a WASM or isolate create
+// that sets an egress field, and its recreate, lands only on a peer whose
+// mediators enforce egress policies; an older peer (no MediatedEgress)
+// stored the lists and ignored them. Without egress fields every peer fits.
+func TestMediatedEgressPlacement(t *testing.T) {
+	members := []Member{{NodeID: "server-a", APIURL: "http://server-a", Alive: true, Role: config.NodeRoleServer}}
+	for _, id := range []string{"worker-old", "worker-new"} {
+		m := heteroWorker(id, []string{models.RuntimeWasm, models.RuntimeIsolate})
+		m.Capacity.MediatedEgress = id == "worker-new"
+		members = append(members, m)
+	}
+	index := newGossipMemberIndex()
+	index.replace(members)
+	c := &Cluster{nodeID: "server-a", apiURL: "http://server-a", fsm: newPlacementFSM(), gossip: &gossipNode{memberIndex: index}}
+
+	for name, spec := range map[string]models.CreateSandboxRequest{
+		"wasm allow list":  {Runtime: models.RuntimeWasm, NetworkAllowOut: []string{"pypi.org"}},
+		"wasm block-all":   {Runtime: models.RuntimeWasm, NetworkBlockAll: true},
+		"isolate learn":    {Runtime: models.RuntimeIsolate, NetworkEgressMode: models.NetworkEgressModeLearn},
+		"isolate profiles": {Runtime: models.RuntimeIsolate, EgressProfiles: []string{"web"}},
+		"isolate rules":    {Runtime: models.RuntimeIsolate, NetworkEgressRules: []models.EgressRule{{Host: "x"}}},
+		"wasm deny CIDRs":  {Runtime: models.RuntimeWasm, NetworkDenyOut: []string{"10.0.0.0/8"}},
+	} {
+		spec.CPU, spec.MemoryMB = 1, 100
+		req := capacityRequestFromSpec(&spec)
+		if !req.NeedsMediatedEgress || req.NeedsEgressGateway {
+			t.Fatalf("%s: request = %+v", name, req)
+		}
+		for i := 0; i < 50; i++ {
+			target, err := c.SelectPlacement(req)
+			if err != nil || target.NodeID != "worker-new" {
+				t.Fatalf("%s: placed on %q (%v), want worker-new", name, target.NodeID, err)
+			}
+		}
+	}
+	plain := capacityRequestFromSpec(&models.CreateSandboxRequest{Runtime: models.RuntimeWasm, CPU: 1, MemoryMB: 100})
+	docker := capacityRequestFromSpec(&models.CreateSandboxRequest{Runtime: models.RuntimeDocker, CPU: 1, MemoryMB: 100, NetworkBlockAll: true})
+	if plain.NeedsMediatedEgress || docker.NeedsMediatedEgress {
+		t.Fatal("only mediated runtimes with egress fields need the capability")
+	}
+	seen := map[string]bool{}
+	for i := 0; i < 200; i++ {
+		target, err := c.SelectPlacement(plain)
+		if err != nil {
+			t.Fatal(err)
+		}
+		seen[target.NodeID] = true
+	}
+	if !seen["worker-old"] {
+		t.Fatal("a WASM create without egress fields still uses older peers")
 	}
 }

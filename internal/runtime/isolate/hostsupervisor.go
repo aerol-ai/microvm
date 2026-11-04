@@ -18,6 +18,16 @@ type workerdSupervisor struct {
 	useJail        bool
 	egressPoolSize int
 	egressObserver pkgisolate.EgressObserver
+	denialObserver pkgisolate.EgressDenialObserver
+	learnObserver  pkgisolate.LearnObserver
+}
+
+// SetLearnObserver installs learn-mode recording on every group host.
+func (s *workerdSupervisor) SetLearnObserver(obs pkgisolate.LearnObserver) {
+	if s == nil {
+		return
+	}
+	s.learnObserver = obs
 }
 
 // NewHostSupervisor builds the production supervisor over the isolate config.
@@ -37,6 +47,15 @@ func (s *workerdSupervisor) SetEgressObserver(obs pkgisolate.EgressObserver) {
 		return
 	}
 	s.egressObserver = obs
+}
+
+// SetEgressDenialObserver installs denial audit (H5) on every group host
+// this supervisor spawns.
+func (s *workerdSupervisor) SetEgressDenialObserver(obs pkgisolate.EgressDenialObserver) {
+	if s == nil {
+		return
+	}
+	s.denialObserver = obs
 }
 
 func (s *workerdSupervisor) SpawnGroup(ctx context.Context, spec JailSpec) (GroupHost, error) {
@@ -78,6 +97,12 @@ func (s *workerdSupervisor) SpawnGroup(ctx context.Context, spec JailSpec) (Grou
 	if s.egressObserver != nil {
 		host.SetEgressObserver(s.egressObserver)
 	}
+	if s.denialObserver != nil {
+		host.SetEgressDenialObserver(s.denialObserver)
+	}
+	if s.learnObserver != nil {
+		host.SetLearnObserver(s.learnObserver)
+	}
 	if err := host.Start(ctx); err != nil {
 		return nil, err
 	}
@@ -92,9 +117,20 @@ type hostAdapter struct {
 }
 
 func (a *hostAdapter) SetEgressPolicy(id string, p EgressPolicy) {
-	a.Host.SetEgressPolicy(id, pkgisolate.EgressPolicy{
+	a.Host.SetEgressPolicy(id, toHostEgressPolicy(p))
+}
+
+func (a *hostAdapter) ClaimEgressPolicy(id string, p EgressPolicy) error {
+	return a.Host.ClaimEgressPolicy(id, toHostEgressPolicy(p))
+}
+
+func toHostEgressPolicy(p EgressPolicy) pkgisolate.EgressPolicy {
+	return pkgisolate.EgressPolicy{
 		BlockAll: p.BlockAll,
 		Allow:    p.Allow,
 		Deny:     p.Deny,
-	})
+		Learn:    p.Learn,
+		Rules:    p.Rules,
+		Secrets:  p.Secrets,
+	}
 }

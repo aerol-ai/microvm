@@ -38,6 +38,13 @@ ingress:
   enable_custom_domains: true
   custom_domain_txt_prefix: "_aerol-verify"
   custom_domain_txt_value_prefix: "aerol-verify="
+  # Private network with no route to Let's Encrypt (§5.10 PC-5): issue every
+  # certificate from an internal ACME CA, or from Caddy's own CA for labs.
+  # acme_ca: "https://ca.corp.bank.internal/acme/acme/directory"
+  # acme_ca_root_pem: |
+  #   -----BEGIN CERTIFICATE-----
+  #   ...
+  # tls_issuer: "acme"   # or "internal"
 
 # --- OTEL exporter --------------------------------------------------------
 # Enable by setting metrics_endpoint and/or traces_endpoint. The *_enabled
@@ -202,9 +209,13 @@ wasm:
 #
 # push_host is the AOCR write vhost. It is required for snapshot distribution
 # (snapshot_push below): snapshots are pushed to
-# <push_host>/cluster/<auto_import.cluster_id>/snapshots/<name> so any node can
-# pull a sandbox created from a peer's snapshot. Without it a snapshot stays a
-# local-only commit and a derived sandbox placed on another node fails to pull.
+# <push_host>/cluster/<auto_import.cluster_id>/snapshots/tenant-<owner hash>/<name>
+# (operator snapshots, which have no owner, to .../snapshots/<name>) so any node
+# can pull a sandbox created from a peer's snapshot. Without it a snapshot stays
+# a local-only commit and a derived sandbox placed on another node fails to pull.
+# Tenant snapshots pushed by releases before the tenant- path stay at
+# .../snapshots/<name>; a user token reaches them only through the node that
+# took them, until they are taken again.
 mirror:
   host: "mirror.aocr.aerol.ai"
   push_host: "aocr.aerol.ai"

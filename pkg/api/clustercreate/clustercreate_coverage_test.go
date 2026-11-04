@@ -40,7 +40,7 @@ func TestCoverage95LiftPrepareAndCapacity(t *testing.T) {
 		_, ok := Prepare(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/v1/sandboxes", nil), svc, models.CreateSandboxRequest{
 			Runtime:   models.RuntimeIsolate,
 			ModuleRef: "sha256:abc",
-		}, func(_ http.ResponseWriter, code int, _ string) { status = code }, PrepareOptions{})
+		}, func(_ http.ResponseWriter, code int, _, _ string) { status = code }, PrepareOptions{})
 		if ok || status != http.StatusBadRequest {
 			t.Fatalf("ok=%v status=%d, want 400 for unbound isolate ref", ok, status)
 		}
@@ -56,7 +56,7 @@ func TestCoverage95LiftPrepareAndCapacity(t *testing.T) {
 		var status int
 		_, ok := Prepare(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/v1/sandboxes", nil), svc, models.CreateSandboxRequest{
 			Image: docker.BuiltImageNamespace + "/abc:latest",
-		}, func(_ http.ResponseWriter, code int, _ string) { status = code }, PrepareOptions{})
+		}, func(_ http.ResponseWriter, code int, _, _ string) { status = code }, PrepareOptions{})
 		if ok || status != http.StatusServiceUnavailable {
 			t.Fatalf("ok=%v status=%d, want 503 on drained local image", ok, status)
 		}
@@ -75,7 +75,7 @@ func TestCoverage95LiftPrepareAndCapacity(t *testing.T) {
 		var status int
 		_, ok := Prepare(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/v1/sandboxes", nil), svc, models.CreateSandboxRequest{
 			Image: docker.BuiltImageNamespace + "/abc:latest",
-		}, func(_ http.ResponseWriter, code int, _ string) { status = code }, PrepareOptions{})
+		}, func(_ http.ResponseWriter, code int, _, _ string) { status = code }, PrepareOptions{})
 		if ok || status != http.StatusServiceUnavailable {
 			t.Fatalf("ok=%v status=%d, want 503 on drained self placement", ok, status)
 		}
@@ -92,7 +92,7 @@ func TestCoverage95LiftPrepareAndCapacity(t *testing.T) {
 		rr := httptest.NewRecorder()
 		_, ok := Prepare(rr, httptest.NewRequest(http.MethodPost, "/v1/sandboxes", nil), svc, models.CreateSandboxRequest{
 			Image: docker.BuiltImageNamespace + "/abc:latest",
-		}, func(_ http.ResponseWriter, code int, _ string) { status = code }, PrepareOptions{})
+		}, func(_ http.ResponseWriter, code int, _, _ string) { status = code }, PrepareOptions{})
 		if ok || status != http.StatusServiceUnavailable || rr.Header().Get("Retry-After") == "" {
 			t.Fatalf("ok=%v status=%d retry=%q", ok, status, rr.Header().Get("Retry-After"))
 		}
@@ -109,7 +109,7 @@ func TestCoverage95LiftPrepareAndCapacity(t *testing.T) {
 		rr := httptest.NewRecorder()
 		_, ok := Prepare(rr, httptest.NewRequest(http.MethodPost, "/v1/sandboxes", nil), svc, models.CreateSandboxRequest{
 			Image: docker.BuiltImageNamespace + "/abc:latest",
-		}, func(_ http.ResponseWriter, code int, _ string) { status = code }, PrepareOptions{})
+		}, func(_ http.ResponseWriter, code int, _, _ string) { status = code }, PrepareOptions{})
 		if ok || status != http.StatusServiceUnavailable || rr.Header().Get("Retry-After") != "300" {
 			t.Fatalf("ok=%v status=%d retry=%q", ok, status, rr.Header().Get("Retry-After"))
 		}
@@ -243,7 +243,7 @@ func TestPrepareCoverage95Branches(t *testing.T) {
 			Image:                 docker.BuiltImageNamespace + "/abc:latest",
 			Failover:              &models.Failover{Policy: models.FailoverPolicyRecreate},
 			ImageDistributionMode: models.ImageDistributionLocalOnly,
-		}, func(_ http.ResponseWriter, code int, _ string) { status = code }, PrepareOptions{})
+		}, func(_ http.ResponseWriter, code int, _, _ string) { status = code }, PrepareOptions{})
 		if ok || status != http.StatusBadRequest {
 			t.Fatalf("ok=%v status=%d, want 400", ok, status)
 		}
@@ -257,7 +257,7 @@ func TestPrepareCoverage95Branches(t *testing.T) {
 		svc := testServiceWithCluster(stub)
 		w := httptest.NewRecorder()
 		var status int
-		_, ok := Prepare(w, httptest.NewRequest(http.MethodPost, "/v1/sandboxes", nil), svc, models.CreateSandboxRequest{Image: "alpine:3.20"}, func(_ http.ResponseWriter, code int, _ string) {
+		_, ok := Prepare(w, httptest.NewRequest(http.MethodPost, "/v1/sandboxes", nil), svc, models.CreateSandboxRequest{Image: "alpine:3.20"}, func(_ http.ResponseWriter, code int, _, _ string) {
 			status = code
 		}, PrepareOptions{})
 		if ok || status != http.StatusServiceUnavailable {
@@ -277,7 +277,7 @@ func TestPrepareCoverage95Branches(t *testing.T) {
 		svc := testServiceWithCluster(stub)
 		var status int
 		var message string
-		_, ok := Prepare(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/v1/sandboxes", nil), svc, models.CreateSandboxRequest{Image: "alpine:3.20"}, func(_ http.ResponseWriter, code int, msg string) {
+		_, ok := Prepare(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/v1/sandboxes", nil), svc, models.CreateSandboxRequest{Image: "alpine:3.20"}, func(_ http.ResponseWriter, code int, _, msg string) {
 			status = code
 			message = msg
 		}, PrepareOptions{})
@@ -322,7 +322,7 @@ func TestPrepareCoverage95Branches(t *testing.T) {
 		var status int
 		_, ok := Prepare(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/v1/sandboxes", nil), svc, models.CreateSandboxRequest{
 			Image: "foreign-snap:default",
-		}, func(_ http.ResponseWriter, code int, _ string) { status = code }, PrepareOptions{})
+		}, func(_ http.ResponseWriter, code int, _, _ string) { status = code }, PrepareOptions{})
 		if ok || status != http.StatusBadRequest {
 			t.Fatalf("ok=%v status=%d, want 400 for foreign arch", ok, status)
 		}
@@ -489,9 +489,12 @@ func TestCreateOnSelectedNodeReservedPlatformVolumeFailure(t *testing.T) {
 	t.Cleanup(func() { _ = st.Close() })
 
 	cfg := config.Config{
-		EnableCaddy: false,
-		ToolboxPort: 2280,
-		PATToken:    "operator-pat",
+		// A reservation only exists in cluster mode; production never
+		// attaches a cluster client with EnableCluster off.
+		EnableCluster: true,
+		EnableCaddy:   false,
+		ToolboxPort:   2280,
+		PATToken:      "operator-pat",
 		PlatformVolumes: config.PlatformVolumesConfig{
 			Enabled:  true,
 			Backend:  config.PlatformVolumesBackendS3,
@@ -528,7 +531,7 @@ func TestPrepareLocalImageInvalidTopologyOnSelect(t *testing.T) {
 	var status int
 	_, ok := Prepare(w, httptest.NewRequest(http.MethodPost, "/v1/sandboxes", nil), svc, models.CreateSandboxRequest{
 		Image: docker.BuiltImageNamespace + "/abc:latest",
-	}, func(_ http.ResponseWriter, code int, _ string) { status = code }, PrepareOptions{})
+	}, func(_ http.ResponseWriter, code int, _, _ string) { status = code }, PrepareOptions{})
 	if ok || status != http.StatusServiceUnavailable {
 		t.Fatalf("ok=%v status=%d, want 503", ok, status)
 	}

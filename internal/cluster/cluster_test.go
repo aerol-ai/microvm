@@ -300,17 +300,38 @@ func pickFreeTCPPort(t *testing.T) int {
 	return port
 }
 
-// waitForLeader blocks until the cluster reports a leader, or fails the test.
+// waitForLeader blocks until the cluster reports a leader and its placement
+// view has caught up with that leader (catch_up.go), or fails the test. Tests
+// read the FSM right after this returns; before catch-up a page is
+// deliberately non-authoritative and the owner watcher deliberately idle.
 func waitForLeader(t *testing.T, c *Cluster, max time.Duration) {
 	t.Helper()
 	deadline := time.Now().Add(max)
 	for time.Now().Before(deadline) {
-		if c.Leader() != "" {
+		if c.Leader() != "" && c.PlacementViewCaughtUp() {
 			return
 		}
-		time.Sleep(100 * time.Millisecond)
+		time.Sleep(20 * time.Millisecond)
 	}
-	t.Fatalf("cluster %q never elected a leader within %s", c.SelfNodeID(), max)
+	t.Fatalf("cluster %q never elected a leader and caught up within %s (leader %q, caught up %v)",
+		c.SelfNodeID(), max, c.Leader(), c.PlacementViewCaughtUp())
+}
+
+// waitForFollowerToReachLeader blocks until follower can forward a write to
+// leaderID: its Raft has heard from that leader, and gossip has brought it
+// the leader's internal URL. waitForVoter only proves the leader's side; a
+// follower promoted a moment ago may not have had a heartbeat yet, and then
+// a forward fails with ErrNotLeader on a slow runner.
+func waitForFollowerToReachLeader(t *testing.T, follower *Cluster, leaderID string, max time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(max)
+	for time.Now().Before(deadline) {
+		if follower.Leader() == leaderID && follower.gossip.peerInternalURL(leaderID) != "" {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("follower %q never learned leader %q and its internal URL within %s (knows %q)", follower.SelfNodeID(), leaderID, max, follower.Leader())
 }
 
 // waitForVoter blocks until nodeID appears in the leader's raft configuration

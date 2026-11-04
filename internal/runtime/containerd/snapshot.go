@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"strings"
 	"time"
 
@@ -50,6 +51,16 @@ type snapshotBackend interface {
 	// unpack realizes the image's layers in the snapshotter so it can back a new
 	// container via WithNewSnapshot.
 	unpack(ctx context.Context, name, snapshotter string) error
+	// writeLayer streams a tar into the store as a gzip layer (Firecracker
+	// snapshot import, image_import.go).
+	writeLayer(ctx context.Context, ref string, rootfs io.Reader) (ocispec.Descriptor, digest.Digest, error)
+	// updateImage repoints an existing image record.
+	updateImage(ctx context.Context, img images.Image) (images.Image, error)
+	// exportImage writes an image as an OCI archive.
+	exportImage(ctx context.Context, name string, w io.Writer) error
+	// deleteImage removes an image record (a GC root), so a commit or import
+	// that failed after writing one does not pin its content forever.
+	deleteImage(ctx context.Context, name string) error
 }
 
 type rawSnapshotBackend struct {
@@ -285,9 +296,31 @@ func (d *Driver) commitContainerSnapshotLive(ctx context.Context, client *Client
 	// it can back a new container via WithNewSnapshot — without this,
 	// create-from-snapshot fails with "parent snapshot ... does not exist".
 	if err := backend.unpack(ctx, imageRef, info.Snapshotter); err != nil {
-		return "", fmt.Errorf("snapshot unpack: %w", err)
+		// This call created the record, so it is this call's to take back:
+		// the caller sees a failed commit and writes no snapshot row.
+		return "", removeFailedImageRecord(ctx, backend, imageRef, fmt.Errorf("snapshot unpack: %w", err))
 	}
 	return imageDigestID(created.Target), nil
+}
+
+// removeFailedImageRecord deletes the image record a failed commit or import
+// wrote, and returns cause. The record is a GC root: left behind, it pins
+// the layers just written with no snapshot row naming it, and nothing would
+// ever remove it. Removed even when the caller gave up (the error may be that
+// cancellation); a delete that fails too is reported beside cause.
+func removeFailedImageRecord(ctx context.Context, backend snapshotBackend, name string, cause error) error {
+	if err := backend.deleteImage(context.WithoutCancel(ctx), name); err != nil && !errdefs.IsNotFound(err) {
+		return fmt.Errorf("%w (removing image record %s also failed: %v)", cause, name, err)
+	}
+	return cause
+}
+
+func (b *rawSnapshotBackend) deleteImage(ctx context.Context, name string) error {
+	raw := b.client.Raw()
+	if raw == nil {
+		return errors.New("image delete requires live containerd")
+	}
+	return raw.ImageService().Delete(ctx, name)
 }
 
 // assembleCommittedImage builds a runnable/pushable OCI image from the base

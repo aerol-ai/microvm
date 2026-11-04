@@ -1,0 +1,14 @@
+alice@acme.com
+role     runner
+team     payments
+via      Acme Okta
+expires  in 54m (15:04 UTC)
+
+Why:
+  binding 3 matched, in effect: okta group="payments-eng" -> runner/payments
+  binding 5 also matched: okta group="everyone" -> viewer/*
+
+Your sign-in carried (issuer okta):
+  username  alice@acme.com
+  groups    everyone, payments-eng
+  roles     (none)

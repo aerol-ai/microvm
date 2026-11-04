@@ -169,6 +169,7 @@ func TestNewClientCases(t *testing.T) {
 			name: "new_client_requires_pat_token",
 			run: func(t *testing.T) {
 				t.Setenv("SB_PAT_TOKEN", "")
+				t.Setenv("SB_API_TOKEN", "")
 				_, err := NewClientWithConfig(&sdktypes.MicroVMConfig{})
 				if err == nil {
 					t.Fatal("expected auth error")
@@ -946,5 +947,40 @@ func TestRebuildTemplate_412SurfacedAsError(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "not eligible for rebuild") {
 		t.Errorf("err = %v, want it to mention 'not eligible for rebuild'", err)
+	}
+}
+
+// TestCreateSendsIdempotencyKey: Create sends a fresh key per call and
+// CreateWithIdempotencyKey sends the caller's, through the public client.
+func TestCreateSendsIdempotencyKey(t *testing.T) {
+	ctx := context.Background()
+	var keys []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		keys = append(keys, r.Header.Get("Idempotency-Key"))
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(models.CreateSandboxResponse{Sandbox: models.Sandbox{ID: "sb-keyed"}, SSHPrivateKey: "PRIVATE"})
+	}))
+	defer server.Close()
+	client, err := NewClientWithConfig(&sdktypes.MicroVMConfig{APIUrl: server.URL, PATToken: "pat", HTTPClient: server.Client()})
+	if err != nil {
+		t.Fatalf("NewClientWithConfig: %v", err)
+	}
+
+	for range 2 {
+		if _, err := client.Create(ctx, sdktypes.CreateSandboxOptions{Image: "ubuntu:22.04"}); err != nil {
+			t.Fatalf("Create: %v", err)
+		}
+	}
+	sb, err := client.CreateWithIdempotencyKey(ctx, sdktypes.CreateSandboxOptions{Image: "ubuntu:22.04"}, "order-42")
+	if err != nil || sb.ID != "sb-keyed" || sb.SSHPrivateKey != "PRIVATE" {
+		t.Fatalf("CreateWithIdempotencyKey = %+v, %v", sb, err)
+	}
+	if len(keys) != 3 || len(keys[0]) != 32 || keys[0] == keys[1] || keys[2] != "order-42" {
+		t.Fatalf("keys = %q, want two different generated keys then order-42", keys)
+	}
+
+	server.Close()
+	if _, err := client.CreateWithIdempotencyKey(ctx, sdktypes.CreateSandboxOptions{Image: "ubuntu:22.04"}, "order-42"); err == nil {
+		t.Fatal("create against a closed server succeeded")
 	}
 }

@@ -90,9 +90,15 @@ func TestCreate_WiresReadySocketWhenEnabled(t *testing.T) {
 		t.Fatalf("binds missing ready socket: %v", binds)
 	}
 	envs, _ := captured["Env"].([]any)
-	var hasSocket, hasNonce, hasSandboxID bool
+	var hasSocket, hasNonce, hasSandboxID, clearsParked bool
 	for _, e := range envs {
 		s, _ := e.(string)
+		// A snapshot of a warm-pool container carries SB_POOL_PARKED=1 in
+		// its image config; the create must override it or this sandbox
+		// boots parked and is never adopted (UC-228 live).
+		if s == poolParkedEnv+"=" {
+			clearsParked = true
+		}
 		if strings.HasPrefix(s, readySocketEnv+"=") {
 			hasSocket = true
 		}
@@ -108,6 +114,9 @@ func TestCreate_WiresReadySocketWhenEnabled(t *testing.T) {
 	}
 	if !hasSandboxID {
 		t.Fatalf("env missing SB_SANDBOX_ID: %v", envs)
+	}
+	if !clearsParked {
+		t.Fatalf("env does not clear an inherited %s: %v", poolParkedEnv, envs)
 	}
 }
 

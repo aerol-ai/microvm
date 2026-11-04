@@ -7,12 +7,17 @@ import {
   sandboxCustomDomainPath as v1SandboxCustomDomainPath,
   sandboxCustomDomainsPath as v1SandboxCustomDomainsPath,
 } from "./api/v1/paths.js";
+import { MicroVMApiError } from "../errors.js";
 import { Image } from "../Image.js";
 import type {
   AddCustomDomainOptions,
+  APIToken,
+  APITokenList,
   BinaryLike,
   BuildImageOptions,
   BuildImageResult,
+  CreateAPITokenOptions,
+  CreatedAPIToken,
   CreateOptions,
   CreateSessionOptions,
   CreateTemplateOptions,
@@ -33,6 +38,7 @@ import type {
   ExposeProtocol,
   ExposeResult,
   Failover,
+  GPUOptions,
   HealthStatus,
   IngressTarget,
   Lifecycle,
@@ -41,8 +47,25 @@ import type {
   MountSpec,
   MountSpecRedacted,
   NetworkUsage,
+  AuditEvent,
+  AuditOptions,
+  AuditPage,
+  EgressProfile,
+  EgressProfileList,
+  EgressProfileOptions,
+  EgressProfileRef,
+  EgressRule,
+  ListEgressProfilesOptions,
+  NetworkLearned,
+  NetworkPolicy,
+  NetworkPolicyCheckOptions,
+  NetworkPolicyCheckResult,
+  NetworkPolicyOptions,
   PlatformVolumeMount,
+  ListSnapshotsOptions,
+  CreateSnapshotOptions,
   RegisterSnapshotOptions,
+  SnapshotList,
   SetNetworkLimitsOptions,
   ResizeOptions,
   Sandbox,
@@ -55,9 +78,16 @@ import type {
   TemplateStatus,
   WasmModule,
   WasmModuleStatus,
+  WhoAmI,
 } from "../types.js";
 
 type FetchLike = typeof fetch;
+
+/**
+ * The request header that selects which of a credential's teams a request
+ * acts for. Keep in sync with pkg/api.HeaderTeam on the server.
+ */
+export const TEAM_HEADER = "X-AerolVM-Team";
 
 /**
  * Wire version of the v1-style sandbox endpoints (`/v1/sandboxes`, etc.) this
@@ -101,11 +131,25 @@ export interface RetryConfig {
    * waits when `maxRetries` is high. Defaults to `5000`.
    */
   maxDelayMs?: number;
+  /**
+   * Cap in milliseconds on the wait before re-sending a 429 or 503. The SDK
+   * waits as long as the server's `Retry-After` header asks (seconds or an
+   * HTTP date), never less than its own backoff, plus up to a fifth more so
+   * clients told the same value spread out; a longer ask is cut to this. A
+   * missing or malformed header uses the backoff above. Defaults to
+   * `30000`; `0` ignores `Retry-After`.
+   */
+  maxRetryAfterMs?: number;
 }
 
 export interface APIClientConfig {
   baseURL: string;
   patToken?: string;
+  /**
+   * Sent as the {@link TEAM_HEADER} header on every HTTP request. Empty or
+   * absent sends no header.
+   */
+  team?: string;
   fetch?: FetchLike;
   /**
    * Wire version to call. Defaults to "v1". Pin this if you need a specific
@@ -115,10 +159,60 @@ export interface APIClientConfig {
   apiVersion?: APIVersion;
   /**
    * Retry policy for transient transport errors (socket closed, connection
-   * reset) and retryable HTTP status codes (421, 429, 502, 503, 504). Pass
-   * `{ maxRetries: 0 }` to disable retry entirely.
+   * reset) and retryable HTTP status codes (421, 429, 502, 503, 504). `exec`
+   * is narrower: it retries only failures that prove the command never
+   * reached the server (connection refused, connect timeout, DNS) and HTTP
+   * 429/503. Pass `{ maxRetries: 0 }` to disable retry entirely.
    */
   retry?: RetryConfig;
+  /**
+   * Cancels the client's HTTP requests: aborting it ends the request in
+   * flight and any retry wait, so a call never sits out a long
+   * `Retry-After` once aborted. WebSocket streams are not affected.
+   */
+  signal?: AbortSignal;
+}
+
+interface ApiWhoAmI {
+  principal: { kind: string; id: string; name?: string };
+  role: string;
+  team?: string;
+  expires_at?: string;
+}
+
+interface ApiAPIToken {
+  id: string;
+  name: string;
+  role: string;
+  team: string;
+  created_by: string;
+  created_at: string;
+  expires_at: string;
+  expired: boolean;
+}
+
+function fromApiWhoAmI(w: ApiWhoAmI): WhoAmI {
+  const out: WhoAmI = {
+    principal: { kind: w.principal.kind, id: w.principal.id },
+    role: w.role,
+  };
+  if (w.principal.name) out.principal.name = w.principal.name;
+  if (w.team) out.team = w.team;
+  if (w.expires_at) out.expiresAt = w.expires_at;
+  return out;
+}
+
+function fromApiAPIToken(t: ApiAPIToken): APIToken {
+  return {
+    id: t.id,
+    name: t.name,
+    role: t.role,
+    team: t.team,
+    createdBy: t.created_by,
+    createdAt: t.created_at,
+    expiresAt: t.expires_at,
+    expired: t.expired === true,
+  };
 }
 
 interface ApiExposedPort {
@@ -160,8 +254,44 @@ interface ApiFailover {
   policy?: string;
 }
 
+interface ApiEgressProfile {
+  name: string;
+  allow_out: string[] | null;
+  description?: string;
+  generation: number;
+  created_at: string;
+  updated_at: string;
+}
+
+function fromApiEgressProfile(p: ApiEgressProfile): EgressProfile {
+  const out: EgressProfile = {
+    name: p.name,
+    allowOut: p.allow_out ?? [],
+    generation: p.generation,
+    createdAt: p.created_at,
+    updatedAt: p.updated_at,
+  };
+  if (p.description) out.description = p.description;
+  return out;
+}
+
+// Only inject's secretRef is spelled differently on the wire, so a rule
+// otherwise goes through as written and the server applies its own port
+// default.
+type ApiEgressRule = Omit<EgressRule, "inject"> & { inject?: { header: string; secret_ref: string } };
+
+function toApiEgressRule({ inject, ...rule }: EgressRule): ApiEgressRule {
+  return inject ? { ...rule, inject: { header: inject.header, secret_ref: inject.secretRef } } : rule;
+}
+
+function fromApiEgressRule({ inject, ...rule }: ApiEgressRule): EgressRule {
+  return inject ? { ...rule, inject: { header: inject.header, secretRef: inject.secret_ref } } : rule;
+}
+
 interface ApiSandbox {
   id: string;
+  name?: string;
+  tags?: Record<string, string>;
   image: string;
   status: Sandbox["status"];
   public_url: string;
@@ -173,6 +303,11 @@ interface ApiSandbox {
   os_user: string;
   env?: Record<string, string>;
   network_block_all: boolean;
+  egress_status?: string;
+  egress_profiles?: string[];
+  egress_profiles_applied?: { name: string; generation: number }[];
+  network_egress_mode?: string;
+  network_egress_rules?: ApiEgressRule[] | null;
   toolbox_enabled: boolean;
   ssh_public_key?: string;
   exposed_ports?: ApiExposedPort[];
@@ -310,6 +445,26 @@ interface ApiPlatformVolumeMount {
   read_only?: boolean;
 }
 
+interface ApiAuditEvent {
+  time: string;
+  kind?: string;
+  result: string;
+  reason?: string;
+  destination?: string;
+  network?: string;
+  actor?: string;
+  ref?: string;
+  event_id?: string;
+  incarnation_id?: string;
+  dropped?: number;
+}
+
+interface ApiAuditPage {
+  events: ApiAuditEvent[] | null;
+  coverage?: { answered?: string[] | null; missing?: string[] | null; partial?: boolean };
+  next_cursor?: string;
+}
+
 interface ApiNetworkUsage {
   sandbox_id: string;
   bytes_in: number;
@@ -328,18 +483,116 @@ interface ApiNetworkUsage {
 // re-routes it (plans/ingress-proxy-routing.md, review 2A).
 const RETRYABLE_STATUS_CODES = new Set([421, 429, 502, 503, 504]);
 
+// The subset a non-idempotent request (exec) may retry: 429 and 503 are the
+// server turning the request away before doing any work. 421, 502 and 504 come
+// from forwarding/proxy hops, and the status alone can't prove that no hop
+// already handed the command to the sandbox, so exec surfaces them. They are
+// also the statuses whose Retry-After paces clients: 429 when this caller is
+// over its share, 503 when the node sheds load. A Retry-After on a 421, 502 or
+// 504 is a hop's, not the server's, so those use the normal backoff.
+const REFUSED_STATUS_CODES = new Set([429, 503]);
+
+/** Per-call options for {@link APIClient.request}. */
+interface RequestOptions {
+  /**
+   * `false` for a request the server must not receive twice: re-sending an
+   * exec runs the caller's command again. Only failures that prove the
+   * request never left the client, plus 429/503, are then retried. Defaults
+   * to `true` because the daemon designs every other endpoint for idempotent
+   * retry.
+   */
+  idempotent?: boolean;
+  /** Extra request headers, sent unchanged on every retry. */
+  headers?: Record<string, string>;
+}
+
+/**
+ * The header a sandbox create carries so the server can recognise a retry of
+ * it. Keep in sync with clustercreate.HeaderIdempotencyKey on the server.
+ */
+export const IDEMPOTENCY_KEY_HEADER = "Idempotency-Key";
+
+/** A fresh create key: 128 random bits as 32 lowercase hex characters. */
+export function newIdempotencyKey(): string {
+  // getRandomValues, unlike randomUUID, also works on a page served over
+  // plain http.
+  const bytes = new Uint8Array(16);
+  globalThis.crypto.getRandomValues(bytes);
+  return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
 /** Default retry settings when the caller doesn't supply a RetryConfig. */
 const DEFAULT_RETRY: Required<RetryConfig> = {
   maxRetries: 3,
   baseDelayMs: 200,
   maxDelayMs: 5_000,
+  // An overloaded node asks for about a second, so the cap only bites on a
+  // long ask (maintenance, a misconfigured proxy), which should not hold a
+  // call for minutes per retry.
+  maxRetryAfterMs: 30_000,
 };
+
+// IMF-fixdate, the HTTP-date form servers send ("Sun, 06 Nov 1994 08:49:37
+// GMT"). Date.parse alone would also take "1" or a date with no zone, read in
+// local time.
+const IMF_FIXDATE = /^[A-Za-z]{3}, \d{2} [A-Za-z]{3} \d{4} \d{2}:\d{2}:\d{2} GMT$/;
+
+/**
+ * Reads a `Retry-After` value in either form RFC 9110 allows: delta-seconds
+ * (`"120"`) or an HTTP date. Returns the wait in milliseconds (0 for a date
+ * already past), or `undefined` for an absent or malformed value.
+ */
+export function parseRetryAfter(value: string | null | undefined, nowMs: number): number | undefined {
+  const trimmed = (value ?? "").trim();
+  if (/^[0-9]+$/.test(trimmed)) {
+    return Number(trimmed) * 1000;
+  }
+  if (!IMF_FIXDATE.test(trimmed)) {
+    return undefined;
+  }
+  const when = Date.parse(trimmed);
+  return Number.isNaN(when) ? undefined : Math.max(when - nowMs, 0);
+}
+
+/**
+ * How long {@link APIClient.request} waits before re-sending. `attempt`
+ * counts from 0, `retryAfter` is a 429/503's `Retry-After` header (null
+ * otherwise) and `random` is uniform in [0, 1).
+ *
+ * Without a usable header it is the exponential backoff ±25%. With one, it
+ * never retries sooner than the server asked (nor sooner than the backoff)
+ * and adds up to a fifth so clients told the same value spread out.
+ * `maxRetryAfterMs` is a hard ceiling: when the server asks for at least
+ * that long the client is early anyway, so the spread goes below it instead.
+ */
+export function retryDelayMs(
+  config: Required<RetryConfig>,
+  attempt: number,
+  retryAfter: string | null,
+  nowMs: number,
+  random: number,
+): number {
+  const backoff = Math.min(config.baseDelayMs * 2 ** attempt, config.maxDelayMs);
+  const limit = config.maxRetryAfterMs;
+  const hint = limit > 0 ? parseRetryAfter(retryAfter, nowMs) : undefined;
+  if (hint === undefined) {
+    return backoff * (0.75 + 0.5 * random);
+  }
+  const target = Math.max(hint, backoff);
+  if (target >= limit) {
+    return limit - limit * 0.2 * random;
+  }
+  const upper = Math.min(target * 1.2, limit);
+  return target + (upper - target) * random;
+}
 
 /**
  * Returns `true` when the thrown `error` looks like a transport-level failure
  * that vanishes on retry (connection reset, socket closed by peer, DNS
  * blip). `undici` and Node core use several `cause.code` values; we check
- * the full cause chain.
+ * the full cause chain. A reset, EPIPE, read/headers/body timeout or "other
+ * side closed" can fire after the server already received the request, so
+ * this classification is only safe for idempotent requests.
  */
 function isTransientTransportError(error: unknown): boolean {
   const codes = new Set([
@@ -368,6 +621,48 @@ function isTransientTransportError(error: unknown): boolean {
 }
 
 /**
+ * Returns `true` only for transport failures that prove the request never
+ * left the client: the connection was refused, did not open before the
+ * connect timeout, or the host name did not resolve (transiently; ENOTFOUND
+ * is not retried for any request). Any other code in the cause chain means
+ * bytes may have reached the server, so the answer is `false`.
+ */
+function isUnsentTransportError(error: unknown): boolean {
+  let current: unknown = error;
+  for (let depth = 0; depth < 5 && current instanceof Error; depth++) {
+    const err = current as NodeJS.ErrnoException;
+    switch (err.code) {
+      case undefined:
+        break;
+      case "ECONNREFUSED":
+      case "EAI_AGAIN":
+      case "UND_ERR_CONNECT_TIMEOUT":
+        return true;
+      case "ETIMEDOUT":
+        // Node uses ETIMEDOUT both for a connect that never completed and for
+        // an open socket that stopped answering; only the first is unsent.
+        return failedWhileConnecting(err);
+      default:
+        return false;
+    }
+    current = err.cause;
+  }
+  return false;
+}
+
+function failedWhileConnecting(err: NodeJS.ErrnoException): boolean {
+  if (err.syscall === "connect") return true;
+  // With autoSelectFamily (Node's default), a host with several addresses
+  // fails with an AggregateError holding one error per connect attempt and no
+  // syscall of its own.
+  return (
+    err instanceof AggregateError &&
+    err.errors.length > 0 &&
+    err.errors.every((inner) => (inner as NodeJS.ErrnoException | undefined)?.syscall === "connect")
+  );
+}
+
+/**
  * Trim trailing slashes from a URL without a backtracking regex. The natural
  * `value.replace(/\/+$/, "")` is an anchored `+` quantifier — a polynomial
  * ReDoS shape that CodeQL flags — so we strip by index instead, which is O(n).
@@ -380,10 +675,23 @@ export function stripTrailingSlashes(value: string): string {
   return value.slice(0, end);
 }
 
-/** Sleep with ±25% jitter so concurrent callers don't thundering-herd. */
-function jitteredDelay(baseMs: number): Promise<void> {
-  const jitter = 1 + (Math.random() - 0.5) * 0.5; // 0.75 – 1.25
-  return new Promise((resolve) => setTimeout(resolve, Math.round(baseMs * jitter)));
+/** Waits `ms`, or rejects with the signal's reason as soon as it aborts. */
+function sleep(ms: number, signal: AbortSignal | undefined): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(signal.reason);
+      return;
+    }
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(signal?.reason);
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
 }
 
 export class APIClient {
@@ -391,13 +699,16 @@ export class APIClient {
   readonly apiVersion: APIVersion;
 
   private readonly patToken: string;
+  private readonly team: string;
   private readonly fetchFn: FetchLike;
   private readonly versionPrefix: string;
   private readonly retryConfig: Required<RetryConfig>;
+  private readonly signal: AbortSignal | undefined;
 
   constructor(config: APIClientConfig) {
     this.baseURL = stripTrailingSlashes(config.baseURL);
     this.patToken = config.patToken ?? "";
+    this.team = (config.team ?? "").trim();
     this.fetchFn = config.fetch ?? fetch;
     this.apiVersion = config.apiVersion ?? DEFAULT_API_VERSION;
     this.versionPrefix = PATH_PREFIXES[this.apiVersion];
@@ -405,7 +716,9 @@ export class APIClient {
       maxRetries: config.retry?.maxRetries ?? DEFAULT_RETRY.maxRetries,
       baseDelayMs: config.retry?.baseDelayMs ?? DEFAULT_RETRY.baseDelayMs,
       maxDelayMs: config.retry?.maxDelayMs ?? DEFAULT_RETRY.maxDelayMs,
+      maxRetryAfterMs: config.retry?.maxRetryAfterMs ?? DEFAULT_RETRY.maxRetryAfterMs,
     };
+    this.signal = config.signal;
   }
 
   /**
@@ -420,7 +733,13 @@ export class APIClient {
 
   async create(options: CreateOptions): Promise<SandboxResource> {
     const resolved = await this.resolveImage(options);
-    const response = await this.doJSON<ApiCreateSandboxResponse>("POST", this.versioned("/sandboxes"), toApiCreateOptions(resolved));
+    // One key per call, sent unchanged on each of its automatic retries: a
+    // create retried after a timeout gets back the sandbox the first attempt
+    // made instead of making a second one.
+    const key = options.idempotencyKey?.trim() || newIdempotencyKey();
+    const response = await this.doJSON<ApiCreateSandboxResponse>("POST", this.versioned("/sandboxes"), toApiCreateOptions(resolved), {
+      headers: { [IDEMPOTENCY_KEY_HEADER]: key },
+    });
     return new SandboxResource(this, fromApiCreateSandboxResponse(response));
   }
 
@@ -527,6 +846,32 @@ export class APIClient {
     throw new Error("incomplete cluster list: exceeded max pages");
   }
 
+  /**
+   * Looks up the caller's sandbox by name with one request. The reply is only
+   * trusted when it holds at most one sandbox and that sandbox carries the
+   * requested name: a server that predates `?name=` ignores the filter and
+   * returns an ordinary list page, and acting on its first row would target
+   * the wrong sandbox.
+   */
+  async getByName(name: string, options?: GetOptions): Promise<SandboxResource | null> {
+    const trimmed = name.trim();
+    if (trimmed === "") {
+      throw new Error("sandbox name is required");
+    }
+    const path = this.versioned("/sandboxes") + buildSandboxListQuery({ name: trimmed, includeEnv: options?.includeEnv });
+    const body = await this.doJSON<ApiSandbox[] | null>("GET", path);
+    const items = body ?? [];
+    if (items.length === 0) {
+      return null;
+    }
+    if (items.length > 1 || items[0].name !== trimmed) {
+      throw new Error(
+        `${this.baseURL} does not support sandbox name lookup; use the sandbox ID or upgrade the server`,
+      );
+    }
+    return this.wrap(items[0]);
+  }
+
   async get(id: string, options?: GetOptions): Promise<SandboxResource> {
     const q = buildIncludeEnvQuery(options?.includeEnv);
     const response = await this.doJSON<ApiSandbox>("GET", `${this.versionPrefix}/sandboxes/${id}${q}`);
@@ -543,8 +888,12 @@ export class APIClient {
     return this.wrap(response);
   }
 
-	async createSnapshot(id: string, name: string): Promise<SandboxSnapshot> {
-		const response = await this.doJSON<ApiSandboxSnapshot>("POST", `${this.versionPrefix}/sandboxes/${id}/snapshot`, { name });
+	async createSnapshot(id: string, name: string, options: CreateSnapshotOptions = {}): Promise<SandboxSnapshot> {
+		const body: { name: string; allow_pause?: boolean } = { name };
+		if (options.allowPause !== undefined) {
+			body.allow_pause = options.allowPause;
+		}
+		const response = await this.doJSON<ApiSandboxSnapshot>("POST", `${this.versionPrefix}/sandboxes/${id}/snapshot`, body);
 		return fromApiSandboxSnapshot(response);
 	}
 
@@ -589,6 +938,31 @@ export class APIClient {
     });
   }
 
+  async getSnapshot(name: string): Promise<SandboxSnapshot> {
+    return fromApiSandboxSnapshot(
+      await this.doJSON<ApiSandboxSnapshot>("GET", this.versioned(`/snapshots/${encodeURIComponent(name)}`)),
+    );
+  }
+
+  async listSnapshots(options: ListSnapshotsOptions = {}): Promise<SnapshotList> {
+    const params = new URLSearchParams();
+    if (options.limit) params.set("limit", String(options.limit));
+    if (options.startingAfter) params.set("starting_after", options.startingAfter);
+    const query = params.toString();
+    const response = await this.doJSON<{ snapshots: ApiSandboxSnapshot[] | null; has_more?: boolean }>(
+      "GET",
+      this.versioned(`/snapshots${query ? `?${query}` : ""}`),
+    );
+    return {
+      snapshots: (response.snapshots ?? []).map(fromApiSandboxSnapshot),
+      hasMore: response.has_more ?? false,
+    };
+  }
+
+  async deleteSnapshot(name: string): Promise<void> {
+    await this.doJSON<void>("DELETE", this.versioned(`/snapshots/${encodeURIComponent(name)}`));
+  }
+
   async destroy(id: string): Promise<void> {
     await this.doJSON<void>("DELETE", `${this.versionPrefix}/sandboxes/${id}`);
   }
@@ -604,7 +978,13 @@ export class APIClient {
   }
 
   async exec(id: string, request: ExecRequest): Promise<ExecResult> {
-    const response = await this.doJSON<ApiExecResult>("POST", `${this.versionPrefix}/sandboxes/${id}/toolbox/process/execute`, toApiExecRequest(request));
+    // Not idempotent: a re-sent exec runs the caller's command a second time.
+    const response = await this.doJSON<ApiExecResult>(
+      "POST",
+      `${this.versionPrefix}/sandboxes/${id}/toolbox/process/execute`,
+      toApiExecRequest(request),
+      { idempotent: false },
+    );
     return fromApiExecResult(response);
   }
 
@@ -764,6 +1144,27 @@ export class APIClient {
     return fromApiHealthStatus(response);
   }
 
+  async checkNetworkPolicy(options: NetworkPolicyCheckOptions): Promise<NetworkPolicyCheckResult> {
+    const response = await this.doJSON<{
+      allowed: boolean;
+      matched_rule: string;
+      default_verdict: string;
+      outside_ceiling?: string;
+    }>("POST", this.versioned("/network/policy/check"), {
+      network_block_all: options.networkBlockAll,
+      network_allow_out: options.networkAllowOut,
+      network_deny_out: options.networkDenyOut,
+      destination: options.destination,
+    });
+    const result: NetworkPolicyCheckResult = {
+      allowed: response.allowed,
+      matchedRule: response.matched_rule ?? "",
+      defaultVerdict: response.default_verdict,
+    };
+    if (response.outside_ceiling) result.outsideCeiling = response.outside_ceiling;
+    return result;
+  }
+
   async mounts(id: string): Promise<MountSpecRedacted[]> {
     const response = await this.doJSON<ApiMountList>("GET", `${this.versionPrefix}/sandboxes/${id}/mounts`);
     return response.mounts.map(fromApiMountSpecRedacted);
@@ -782,6 +1183,20 @@ export class APIClient {
     return fromApiNetworkUsage(response);
   }
 
+  async getAudit(id: string, options: AuditOptions = {}): Promise<AuditPage> {
+    const params = new URLSearchParams();
+    if (options.kind) params.set("kind", options.kind);
+    if (options.limit !== undefined) params.set("limit", String(options.limit));
+    if (options.cursor) params.set("cursor", options.cursor);
+    if (options.incarnationID) params.set("incarnation_id", options.incarnationID);
+    const query = params.toString();
+    const response = await this.doJSON<ApiAuditPage>(
+      "GET",
+      `${this.versionPrefix}/sandboxes/${id}/audit${query ? `?${query}` : ""}`,
+    );
+    return fromApiAuditPage(response);
+  }
+
   async setNetworkLimits(id: string, options: SetNetworkLimitsOptions): Promise<NetworkUsage> {
     const response = await this.doJSON<ApiNetworkUsage>(
       "PATCH",
@@ -789,6 +1204,89 @@ export class APIClient {
       toApiSetNetworkLimitsOptions(options),
     );
     return fromApiNetworkUsage(response);
+  }
+
+  async setNetworkPolicy(id: string, options: NetworkPolicyOptions): Promise<NetworkPolicy> {
+    const response = await this.doJSON<{
+      network_block_all: boolean;
+      network_allow_out: string[] | null;
+      network_deny_out: string[] | null;
+      egress_profiles?: string[] | null;
+      network_egress_mode?: string;
+      network_egress_rules?: ApiEgressRule[] | null;
+      effective_hostname_count?: number;
+      egress_status?: string;
+    }>("PUT", `${this.versionPrefix}/sandboxes/${id}/network/policy`, {
+      network_block_all: options.networkBlockAll ?? false,
+      network_allow_out: options.networkAllowOut ?? [],
+      network_deny_out: options.networkDenyOut ?? [],
+      egress_profiles: options.egressProfiles ?? [],
+      network_egress_mode: options.networkEgressMode,
+      network_egress_rules: options.networkEgressRules?.map(toApiEgressRule),
+    });
+    const policy: NetworkPolicy = {
+      networkBlockAll: response.network_block_all,
+      networkAllowOut: response.network_allow_out ?? [],
+      networkDenyOut: response.network_deny_out ?? [],
+      egressProfiles: response.egress_profiles ?? [],
+      networkEgressMode: response.network_egress_mode ?? "enforce",
+      networkEgressRules: (response.network_egress_rules ?? []).map(fromApiEgressRule),
+      effectiveHostnameCount: response.effective_hostname_count ?? 0,
+    };
+    if (response.egress_status) policy.egressStatus = response.egress_status;
+    return policy;
+  }
+
+  async getNetworkLearned(id: string): Promise<NetworkLearned> {
+    const r = await this.doJSON<{
+      mode: string;
+      truncated: boolean;
+      entries: { host: string; ports: number[] | null; first_seen: string; last_seen: string; hits: number }[] | null;
+      cidrs: string[] | null;
+      suggested_allow_out: string[] | null;
+      suggested_profile?: { allow_out: string[] | null; description?: string } | null;
+    }>("GET", `${this.versionPrefix}/sandboxes/${id}/network/learned`);
+    const learned: NetworkLearned = {
+      mode: r.mode,
+      truncated: r.truncated,
+      entries: (r.entries ?? []).map((e) => ({ host: e.host, ports: e.ports ?? [], firstSeen: e.first_seen, lastSeen: e.last_seen, hits: e.hits })),
+      cidrs: r.cidrs ?? [],
+      suggestedAllowOut: r.suggested_allow_out ?? [],
+    };
+    if (r.suggested_profile) {
+      learned.suggestedProfile = { allowOut: r.suggested_profile.allow_out ?? [], description: r.suggested_profile.description };
+    }
+    return learned;
+  }
+
+  async putEgressProfile(name: string, options: EgressProfileOptions): Promise<EgressProfile> {
+    const response = await this.doJSON<ApiEgressProfile>("PUT", this.versioned(`/egress-profiles/${encodeURIComponent(name)}`), {
+      allow_out: options.allowOut,
+      description: options.description,
+    });
+    return fromApiEgressProfile(response);
+  }
+
+  async getEgressProfile(name: string): Promise<EgressProfile> {
+    return fromApiEgressProfile(await this.doJSON<ApiEgressProfile>("GET", this.versioned(`/egress-profiles/${encodeURIComponent(name)}`)));
+  }
+
+  async listEgressProfiles(options: ListEgressProfilesOptions = {}): Promise<EgressProfileList> {
+    const params = new URLSearchParams();
+    if (options.cursor) params.set("cursor", options.cursor);
+    if (options.limit) params.set("limit", String(options.limit));
+    const query = params.toString();
+    const response = await this.doJSON<{ profiles: ApiEgressProfile[] | null; next_cursor?: string }>(
+      "GET",
+      this.versioned(`/egress-profiles${query ? `?${query}` : ""}`),
+    );
+    const list: EgressProfileList = { profiles: (response.profiles ?? []).map(fromApiEgressProfile) };
+    if (response.next_cursor) list.nextCursor = response.next_cursor;
+    return list;
+  }
+
+  async deleteEgressProfile(name: string): Promise<void> {
+    await this.doJSON<void>("DELETE", this.versioned(`/egress-profiles/${encodeURIComponent(name)}`));
   }
 
   async createTemplate(options: CreateTemplateOptions): Promise<Template> {
@@ -868,20 +1366,45 @@ export class APIClient {
     return fromApiTemplate(response);
   }
 
+  async whoami(): Promise<WhoAmI> {
+    return fromApiWhoAmI(await this.doJSON<ApiWhoAmI>("GET", this.versioned("/whoami")));
+  }
+
+  async createAPIToken(options: CreateAPITokenOptions): Promise<CreatedAPIToken> {
+    const response = await this.doJSON<ApiAPIToken & { token: string }>("POST", this.versioned("/tokens"), {
+      name: options.name,
+      role: options.role,
+      team: options.team,
+      expires_in: options.expiresIn,
+    });
+    return { ...fromApiAPIToken(response), token: response.token };
+  }
+
+  async listAPITokens(): Promise<APITokenList> {
+    const response = await this.doJSON<{ tokens: ApiAPIToken[] | null }>("GET", this.versioned("/tokens"));
+    return { tokens: (response.tokens ?? []).map(fromApiAPIToken) };
+  }
+
+  async revokeAPIToken(id: string): Promise<void> {
+    const trimmed = id.trim();
+    if (trimmed === "") {
+      throw new Error("token id is required");
+    }
+    await this.doJSON<void>("DELETE", this.versioned(`/tokens/${encodeURIComponent(trimmed)}`));
+  }
+
   private wrap(sandbox: ApiSandbox): SandboxResource {
     return new SandboxResource(this, fromApiSandbox(sandbox));
   }
 
-  private async doJSON<T>(method: string, path: string, body?: unknown): Promise<T> {
-    const init: RequestInit = {};
+  private async doJSON<T>(method: string, path: string, body?: unknown, options?: RequestOptions): Promise<T> {
+    const init: RequestInit = { headers: { ...options?.headers } };
     if (body !== undefined) {
       init.body = JSON.stringify(body);
-      init.headers = {
-        "Content-Type": "application/json",
-      };
+      init.headers = { ...init.headers, "Content-Type": "application/json" };
     }
 
-    const response = await this.request(method, path, init);
+    const response = await this.request(method, path, init, options);
     if (!response.ok) {
       throw await decodeError(response);
     }
@@ -902,52 +1425,60 @@ export class APIClient {
   /**
    * Low-level HTTP request with automatic retry for transient failures.
    *
-   * Transport-level errors (socket closed, connection reset, DNS blip) are
-   * always retried regardless of HTTP method — the request never reached the
-   * server so there is no idempotency concern.
+   * Transport-level errors (socket closed, connection reset, timeouts, DNS
+   * blip) and HTTP 421/429/502/503/504 are retried regardless of HTTP method.
+   * Several of those failures can happen after the server received the
+   * request, so a retry may deliver it twice; that is safe only because every
+   * mutating endpoint in the daemon is designed for idempotent retry (e.g.
+   * INSERT OR IGNORE + disambiguation).
    *
-   * HTTP-level retryable codes (421, 429, 502, 503, 504) are retried for ALL
-   * methods because every mutating endpoint in the daemon is already
-   * designed for idempotent retry (e.g. INSERT OR IGNORE + disambiguation).
+   * A request passed `{ idempotent: false }` (exec) retries only transport
+   * failures that prove the request never left the client and HTTP 429/503;
+   * everything else is surfaced to the caller rather than risk running the
+   * command twice.
+   *
+   * A 429 or 503 waits as long as its `Retry-After` asks (see
+   * {@link retryDelayMs}). The client's `signal` ends the request and any
+   * wait.
    */
-  private async request(method: string, path: string, init: RequestInit = {}): Promise<Response> {
+  private async request(method: string, path: string, init: RequestInit = {}, options: RequestOptions = {}): Promise<Response> {
     const headers = new Headers(init.headers);
     if (this.patToken !== "") {
       headers.set("Authorization", `Bearer ${this.patToken}`);
     }
-
-    const url = `${this.baseURL}${path}`;
-    const requestInit: RequestInit = { ...init, method, headers };
-    const { maxRetries, baseDelayMs, maxDelayMs } = this.retryConfig;
-
-    let lastError: unknown;
-    for (let attempt = 0; attempt <= maxRetries; attempt++) {
-      try {
-        const response = await this.fetchFn(url, requestInit);
-
-        // Retry on transient HTTP status codes.
-        if (RETRYABLE_STATUS_CODES.has(response.status) && attempt < maxRetries) {
-          const delay = Math.min(baseDelayMs * 2 ** attempt, maxDelayMs);
-          await jitteredDelay(delay);
-          continue;
-        }
-
-        return response;
-      } catch (error: unknown) {
-        lastError = error;
-
-        // Only retry transport-level failures; anything else propagates.
-        if (!isTransientTransportError(error) || attempt >= maxRetries) {
-          throw error;
-        }
-
-        const delay = Math.min(baseDelayMs * 2 ** attempt, maxDelayMs);
-        await jitteredDelay(delay);
-      }
+    if (this.team !== "") {
+      headers.set(TEAM_HEADER, this.team);
     }
 
-    // Should be unreachable — the loop always throws or returns.
-    throw lastError;
+    const url = `${this.baseURL}${path}`;
+    const signal = init.signal ?? this.signal;
+    const requestInit: RequestInit = { ...init, method, headers, ...(signal ? { signal } : {}) };
+    const { maxRetries } = this.retryConfig;
+    const idempotent = options.idempotent ?? true;
+    const retryableStatusCodes = idempotent ? RETRYABLE_STATUS_CODES : REFUSED_STATUS_CODES;
+    const isRetryableError = idempotent ? isTransientTransportError : isUnsentTransportError;
+
+    for (let attempt = 0; ; attempt++) {
+      let retryAfter: string | null = null;
+      try {
+        const response = await this.fetchFn(url, requestInit);
+        if (!retryableStatusCodes.has(response.status) || attempt >= maxRetries) {
+          return response;
+        }
+        if (REFUSED_STATUS_CODES.has(response.status)) {
+          retryAfter = response.headers.get("retry-after");
+        }
+        // Free the connection instead of holding it through the wait.
+        response.body?.cancel().catch(() => undefined);
+      } catch (error: unknown) {
+        // Only retry transport-level failures; anything else propagates. An
+        // aborted signal surfaces whatever fetch threw for it.
+        if (signal?.aborted || !isRetryableError(error) || attempt >= maxRetries) {
+          throw error;
+        }
+      }
+      await sleep(retryDelayMs(this.retryConfig, attempt, retryAfter, Date.now(), Math.random()), signal);
+    }
   }
 }
 
@@ -964,6 +1495,11 @@ export class SandboxResource implements Sandbox {
   declare osUser: string;
   declare env?: Record<string, string>;
   declare networkBlockAll: boolean;
+  declare egressStatus?: string;
+  declare egressProfiles?: string[];
+  declare egressProfilesApplied?: EgressProfileRef[];
+  declare networkEgressMode?: string;
+  declare networkEgressRules?: EgressRule[];
   declare toolboxEnabled: boolean;
   declare sshPublicKey?: string;
   declare sshPrivateKey?: string;
@@ -971,6 +1507,8 @@ export class SandboxResource implements Sandbox {
   declare createdAt: string;
   declare updatedAt: string;
   declare lastActiveAt: string;
+  declare name?: string;
+  declare tags?: Record<string, string>;
   declare lastError?: string;
   declare containerCommand?: string[];
   declare lifecycle: Lifecycle;
@@ -1085,8 +1623,8 @@ export class SandboxResource implements Sandbox {
     };
   }
 
-	async createSnapshot(name: string): Promise<SandboxSnapshot> {
-		return this.client.createSnapshot(this.id, name);
+	async createSnapshot(name: string, options: CreateSnapshotOptions = {}): Promise<SandboxSnapshot> {
+		return this.client.createSnapshot(this.id, name, options);
 	}
 
   async start(): Promise<this> {
@@ -1125,6 +1663,39 @@ export class SandboxResource implements Sandbox {
     return this.client.setNetworkLimits(this.id, options);
   }
 
+  /**
+   * Replaces this sandbox's egress policy while it runs. The call returns
+   * once the new policy is enforced; sending the same policy again is a
+   * no-op, so it is safe to retry.
+   */
+  async setNetworkPolicy(options: NetworkPolicyOptions): Promise<NetworkPolicy> {
+    const policy = await this.client.setNetworkPolicy(this.id, options);
+    this.networkBlockAll = policy.networkBlockAll;
+    this.egressStatus = policy.egressStatus;
+    this.egressProfiles = policy.egressProfiles.length ? policy.egressProfiles : undefined;
+    this.networkEgressMode = policy.networkEgressMode === "learn" ? "learn" : undefined;
+    this.networkEgressRules = policy.networkEgressRules.length ? policy.networkEgressRules : undefined;
+    return policy;
+  }
+
+  /**
+   * Reads what this sandbox reached in learn mode and the allow list that
+   * would have allowed it. A recording stays readable after the sandbox
+   * switches to enforce, until it is destroyed.
+   */
+  async learned(): Promise<NetworkLearned> {
+    return this.client.getNetworkLearned(this.id);
+  }
+
+  /**
+   * Reads this sandbox's audit log: outbound connections and egress denials
+   * (`kind: "egress"`), and secret reads. Denials carry `result: "failure"`
+   * and the policy `reason`.
+   */
+  async audit(options?: AuditOptions): Promise<AuditPage> {
+    return this.client.getAudit(this.id, options);
+  }
+
   toJSON(): Sandbox {
     return cloneSandbox(this);
   }
@@ -1136,6 +1707,8 @@ export class SandboxResource implements Sandbox {
 
 function toApiCreateOptions(options: CreateOptions): Record<string, unknown> {
   return {
+    name: options.name,
+    tags: options.tags,
     image: options.image,
     cpu: options.cpu,
     memory_mb: options.memoryMB,
@@ -1145,6 +1718,9 @@ function toApiCreateOptions(options: CreateOptions): Record<string, unknown> {
     network_block_all: options.networkBlockAll,
     network_allow_out: options.networkAllowOut,
     network_deny_out: options.networkDenyOut,
+    egress_profiles: options.egressProfiles,
+    network_egress_mode: options.networkEgressMode,
+    network_egress_rules: options.networkEgressRules?.map(toApiEgressRule),
     allow_public_traffic: options.allowPublicTraffic,
     mask_request_host: options.maskRequestHost,
     network_bytes_in_limit: options.networkBytesInLimit,
@@ -1160,6 +1736,16 @@ function toApiCreateOptions(options: CreateOptions): Record<string, unknown> {
     module_ref: options.moduleRef,
     tenant_id: options.tenantId,
     custom_domains: options.customDomains,
+    gpus: options.gpus ? toApiGPUOptions(options.gpus) : undefined,
+    template_id: options.templateId,
+  };
+}
+
+function toApiGPUOptions(gpus: GPUOptions): Record<string, unknown> {
+  return {
+    vendor: gpus.vendor,
+    count: gpus.count,
+    device_ids: gpus.deviceIDs,
   };
 }
 
@@ -1227,6 +1813,8 @@ function toApiFailover(failover: Failover): ApiFailover {
 function fromApiSandbox(sandbox: ApiSandbox): Sandbox {
   return {
     id: sandbox.id,
+    name: sandbox.name || undefined,
+    tags: sandbox.tags,
     image: sandbox.image,
     status: sandbox.status,
     publicURL: sandbox.public_url,
@@ -1238,6 +1826,11 @@ function fromApiSandbox(sandbox: ApiSandbox): Sandbox {
     osUser: sandbox.os_user,
     env: sandbox.env,
     networkBlockAll: sandbox.network_block_all,
+    egressStatus: sandbox.egress_status || undefined,
+    egressProfiles: sandbox.egress_profiles?.length ? sandbox.egress_profiles : undefined,
+    egressProfilesApplied: sandbox.egress_profiles_applied?.length ? sandbox.egress_profiles_applied : undefined,
+    networkEgressMode: sandbox.network_egress_mode || undefined,
+    networkEgressRules: sandbox.network_egress_rules?.length ? sandbox.network_egress_rules.map(fromApiEgressRule) : undefined,
     toolboxEnabled: sandbox.toolbox_enabled,
     sshPublicKey: sandbox.ssh_public_key,
     exposedPorts: sandbox.exposed_ports?.map(fromApiExposedPort),
@@ -1444,6 +2037,31 @@ function fromApiMountSpecRedacted(mount: ApiMountSpecRedacted): MountSpecRedacte
   };
 }
 
+function fromApiAuditPage(page: ApiAuditPage): AuditPage {
+  const out: AuditPage = {
+    events: (page.events ?? []).map((e): AuditEvent => ({
+      time: e.time,
+      kind: e.kind,
+      result: e.result,
+      reason: e.reason,
+      destination: e.destination,
+      network: e.network,
+      actor: e.actor,
+      ref: e.ref,
+      eventID: e.event_id,
+      incarnationID: e.incarnation_id,
+      dropped: e.dropped,
+    })),
+    coverage: {
+      answered: page.coverage?.answered ?? [],
+      missing: page.coverage?.missing ?? [],
+      partial: page.coverage?.partial ?? false,
+    },
+  };
+  if (page.next_cursor) out.nextCursor = page.next_cursor;
+  return out;
+}
+
 function fromApiNetworkUsage(usage: ApiNetworkUsage): NetworkUsage {
   return {
     sandboxID: usage.sandbox_id,
@@ -1513,14 +2131,15 @@ function buildIncludeEnvQuery(includeEnv: boolean | undefined): string {
 }
 
 function buildSandboxListQuery(options?: ListOptions): string {
-  const tags = buildTagQuery(options?.tags);
-  if (!options?.includeEnv) {
-    return tags;
+  let query = buildTagQuery(options?.tags);
+  if (options?.includeEnv) {
+    query = appendQueryParam(query, "include_env", "true");
   }
-  if (tags === "") {
-    return "?include_env=true";
+  const name = options?.name?.trim();
+  if (name) {
+    query = appendQueryParam(query, "name", name);
   }
-  return tags + "&include_env=true";
+  return query;
 }
 
 function appendQueryParam(path: string, key: string, value: string): string {
@@ -1535,6 +2154,7 @@ function cloneSandbox(sandbox: Sandbox): Sandbox {
   return {
     ...sandbox,
     env: sandbox.env ? { ...sandbox.env } : undefined,
+    tags: sandbox.tags ? { ...sandbox.tags } : undefined,
     exposedPorts: sandbox.exposedPorts?.map((port) => ({ ...port })),
     containerCommand: sandbox.containerCommand ? [...sandbox.containerCommand] : undefined,
     lifecycle: { ...sandbox.lifecycle },
@@ -1555,16 +2175,19 @@ function toBlob(data: BinaryLike): Blob {
   return new Blob([Uint8Array.from(data)]);
 }
 
-async function decodeError(response: Response): Promise<Error> {
+async function decodeError(response: Response): Promise<MicroVMApiError> {
+  const retryAfterMs = parseRetryAfter(response.headers.get("retry-after"), Date.now());
   try {
-    const payload = (await response.json()) as { error?: string };
+    const payload = (await response.json()) as { error?: unknown; code?: unknown };
     if (typeof payload.error === "string" && payload.error !== "") {
-      return new Error(payload.error);
+      const code = typeof payload.code === "string" && payload.code !== "" ? payload.code : undefined;
+      return new MicroVMApiError(response.status, payload.error, { code, retryAfterMs });
     }
   } catch {
-    // Fall through to status-based error.
+    // Not JSON (a proxy's error page) or no body: fall through to the
+    // status-based message, with no code.
   }
-  return new Error(`request failed with status ${response.status}`);
+  return new MicroVMApiError(response.status, `request failed with status ${response.status}`, { retryAfterMs });
 }
 
 const STREAM_PREFIX_STDOUT = 0x01;

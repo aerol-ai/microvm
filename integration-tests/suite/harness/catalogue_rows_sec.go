@@ -1,14 +1,16 @@
 package harness
 
 // Secrets, audit and the enterprise posture — the catalogue rows for
-// plans/integration-test-security.md's UC-110..UC-169.
+// plans/integration-test-security.md's UC-110..UC-169, plus UC-263..UC-265
+// (the S3 witness canary and the local tamper cases, plans/open-audit-witness.md
+// Phase 4).
 //
 // Kept in its own file because the SEC block is a whole programme rather than
 // an increment to an existing category, and because catalogue_rows.go is
 // already the longest file in the package.
 //
 // Every row references a use case. A catalogue row with no UCRef is a
-// question nobody has agreed to answer; for this block, all sixty have tests,
+// question nobody has agreed to answer; for this block, all of them have tests,
 // so leaving one unreferenced would be a bookkeeping slip rather than an
 // honest gap.
 
@@ -64,6 +66,9 @@ func secRows() []CatalogueRow {
 		rowAll("SEC-35", "Does a witness disagreement refuse an enterprise boot?", catSEC(), "Witness", "fail closed", scnBoth(), "UC-144"),
 		rowAll("SEC-36", "Does the ingest endpoint require a token, and is it loopback-only?", catSEC(), "Ingest", "loopback + tokened", scnBoth(), "UC-145"),
 		rowAll("SEC-37", "Does retention prune HOLD while export lags, then verify across the checkpoint?", catSEC(), "Retention", "gate holds", scnBoth(), "UC-145b"),
+		rowAll("SEC-62", "Can the node role delete or hide a witnessed head on the real bucket?", catSEC(), "Witness", "canary kept, no marker", scnBoth(), "UC-263"),
+		rowAll("SEC-63", "Does editing a record the witness already vouched for stop the node from booting?", catSEC(), "Witness", "boot refused, then boots", scnBoth(), "UC-264"),
+		rowAll("SEC-64", "Does deleting the local audit log stop the boot, and does the refusal name the new-SB_NODE_ID recovery?", catSEC(), "Witness", "refused + recovery named", scnBoth(), "UC-265"),
 
 		// G. Quota, rate limits, overflow.
 		rowAll("SEC-38", "Does the per-identity audit limit return Retry-After and then recover?", catSEC(), "Limits", "429 + recovery", scnBoth(), "UC-146"),

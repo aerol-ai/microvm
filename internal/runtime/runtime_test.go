@@ -10,9 +10,36 @@ import (
 	"github.com/aerol-ai/microvm/pkg/docker"
 )
 
+func TestAsToolboxAddresserAbsent(t *testing.T) {
+	if _, ok := runtime.AsToolboxAddresser(nil); ok {
+		t.Fatal("nil runtime has no toolbox address")
+	}
+}
+
 func TestDockerClientSatisfiesContainerRuntime(t *testing.T) {
 	var _ runtime.Runtime = (*docker.Client)(nil)
 	var _ runtime.ContainerRuntime = (*docker.Client)(nil)
+}
+
+// Docker and containerd re-adopt a warm-pool container on start (it keeps
+// the pool's parked env for life); Firecracker re-adopts a guest restored
+// from its stopped snapshot (its agent serves nothing without the sandbox's
+// token). The service has to find StartWithIdentity on each of them.
+func TestContainerAndFirecrackerDriversStartWithIdentity(t *testing.T) {
+	var _ runtime.IdentityStarter = (*docker.Client)(nil)
+	var _ runtime.IdentityStarter = (*firecracker.Driver)(nil)
+	var _ runtime.IdentityStarter = (*containerdruntime.Driver)(nil)
+	for name, rt := range map[string]runtime.Runtime{
+		"docker": (*docker.Client)(nil), "firecracker": (*firecracker.Driver)(nil),
+		"containerd": (*containerdruntime.Driver)(nil),
+	} {
+		if _, ok := runtime.AsIdentityStarter(rt); !ok {
+			t.Fatalf("%s must start with the sandbox's identity", name)
+		}
+	}
+	if _, ok := runtime.AsIdentityStarter((*wasmruntime.Driver)(nil)); ok {
+		t.Error("wasm unexpectedly starts with an identity")
+	}
 }
 
 func TestContainerdDriverSatisfiesContainerRuntime(t *testing.T) {

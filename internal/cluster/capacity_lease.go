@@ -117,6 +117,14 @@ type capacityLeaseCache struct {
 	localTemplateInventory   func() ([]string, bool)
 	localTemplateCatalog     func() ([]string, bool)
 	localWasmModuleInventory func() ([]string, bool)
+	// localEgressGatewayReady overlays EgressGatewayReady onto our own
+	// lease, which local SelectPlacement reads instead of /v1/capacity.
+	// nil = the node runs no egress gateway, so it never advertises one.
+	localEgressGatewayReady func() bool
+	// localSlotPools overlays SlotPools (this node's network-slot pools and
+	// their free counts) onto our own lease, as /v1/capacity does for peers.
+	// nil = no bounded pool here, which placement reads as "no slot limit".
+	localSlotPools func() []capacity.SlotPool
 }
 
 func newCapacityLeaseCache(selfID string, admitter *capacity.Admitter, interval time.Duration, logger *slog.Logger) *capacityLeaseCache {
@@ -194,6 +202,8 @@ func (c *capacityLeaseCache) refreshLocal(now time.Time) {
 	templateInventory := c.localTemplateInventory
 	templateCatalog := c.localTemplateCatalog
 	wasmModuleInventory := c.localWasmModuleInventory
+	egressGatewayReady := c.localEgressGatewayReady
+	slotPools := c.localSlotPools
 	c.mu.RUnlock()
 	if admitter == nil {
 		return
@@ -220,6 +230,12 @@ func (c *capacityLeaseCache) refreshLocal(now time.Time) {
 			snap.LocalWasmModuleInventoryKnown = true
 			snap.LocalWasmModuleIDs = refs
 		}
+	}
+	if egressGatewayReady != nil {
+		snap.EgressGatewayReady = egressGatewayReady()
+	}
+	if slotPools != nil {
+		snap.SlotPools = slotPools()
 	}
 	c.set(c.selfID, snap, now)
 }
@@ -257,6 +273,29 @@ func (c *capacityLeaseCache) SetLocalWasmModuleIDsProvider(fn func() ([]string, 
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.localWasmModuleInventory = fn
+}
+
+// SetEgressGatewayReadyProvider installs the egress gateway readiness
+// callback. It must be cheap (an atomic load): it runs every refresh tick.
+func (c *capacityLeaseCache) SetEgressGatewayReadyProvider(fn func() bool) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.localEgressGatewayReady = fn
+}
+
+// SetLocalSlotPoolsProvider installs the network-slot pool callback. It runs
+// on every refreshLocal, which placement calls per create on a mixed node, so
+// it must answer from a cache (Service.LocalSlotPools does).
+func (c *capacityLeaseCache) SetLocalSlotPoolsProvider(fn func() []capacity.SlotPool) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.localSlotPools = fn
 }
 
 func (c *capacityLeaseCache) set(nodeID string, snap capacity.Snapshot, updated time.Time) {

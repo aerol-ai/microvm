@@ -15,7 +15,7 @@ func TestVerifyCustomDomainOwnership_Success(t *testing.T) {
 		},
 	}
 
-	err := verifyCustomDomainOwnership(context.Background(), resolver, "api.acme.com", "_aerol-verify", "aerol-verify=")
+	err := verifyCustomDomainOwnership(context.Background(), resolver, "api.acme.com", "_aerol-verify", "aerol-verify=", "")
 	if err != nil {
 		t.Fatalf("expected nil, got %v", err)
 	}
@@ -26,7 +26,7 @@ func TestVerifyCustomDomainOwnership_NotFound(t *testing.T) {
 		records: map[string][]string{},
 	}
 
-	err := verifyCustomDomainOwnership(context.Background(), resolver, "api.acme.com", "_aerol-verify", "aerol-verify=")
+	err := verifyCustomDomainOwnership(context.Background(), resolver, "api.acme.com", "_aerol-verify", "aerol-verify=", "")
 	if !errors.Is(err, models.ErrCustomDomainVerificationFailed) {
 		t.Fatalf("expected ErrCustomDomainVerificationFailed, got %v", err)
 	}
@@ -41,7 +41,7 @@ func TestVerifyCustomDomainOwnership_Mismatch(t *testing.T) {
 		},
 	}
 
-	err := verifyCustomDomainOwnership(context.Background(), resolver, "api.acme.com", "_aerol-verify", "aerol-verify=")
+	err := verifyCustomDomainOwnership(context.Background(), resolver, "api.acme.com", "_aerol-verify", "aerol-verify=", "")
 	if !errors.Is(err, models.ErrCustomDomainVerificationFailed) {
 		t.Fatalf("expected ErrCustomDomainVerificationFailed, got %v", err)
 	}
@@ -54,7 +54,7 @@ func TestVerifyCustomDomainOwnership_MultipleRecords(t *testing.T) {
 		},
 	}
 
-	err := verifyCustomDomainOwnership(context.Background(), resolver, "api.acme.com", "_aerol-verify", "aerol-verify=")
+	err := verifyCustomDomainOwnership(context.Background(), resolver, "api.acme.com", "_aerol-verify", "aerol-verify=", "")
 	if err != nil {
 		t.Fatalf("expected nil, got %v", err)
 	}

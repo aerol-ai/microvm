@@ -42,6 +42,17 @@ export interface BuildImageResult {
   pushed?: string;
 }
 
+export interface CreateSnapshotOptions {
+  /**
+   * Whether the snapshot may pause a running sandbox. Defaults to true: a
+   * running sandbox is paused while it is copied (its disk writes wait;
+   * Docker pauses the container) and keeps running afterwards. Set false to
+   * have a sandbox that is not stopped refused with HTTP 409 instead, for a
+   * workload that must never stall. A stopped sandbox needs no pause.
+   */
+  allowPause?: boolean;
+}
+
 export interface RegisterSnapshotOptions {
   /** Human-readable identifier other callers use in `CreateOptions.snapshot`. */
   name: string;
@@ -161,6 +172,28 @@ import type { Image } from "./Image.js";
 
 export interface CreateOptions {
   /**
+   * Sent as the create's `Idempotency-Key` header, never in the body. A create
+   * sent again with the same key and the same options returns the sandbox the
+   * first one made instead of making a second; the same key with different
+   * options fails with a 422 `MicroVMApiError` whose `code` is
+   * `"idempotency_key_reused"`. Keys are scoped to the caller's account.
+   *
+   * Leave it unset and the SDK makes a random key for each `create` call and
+   * reuses it on that call's automatic retries, so a retry after a timeout
+   * cannot make a second sandbox. Set your own to make your own retries of
+   * the whole call safe too, such as after your process restarts.
+   */
+  idempotencyKey?: string;
+  /**
+   * Optional name, unique among the caller's sandboxes (another account may
+   * use the same name). A repeat create with a name the caller already holds
+   * returns HTTP 409. Names starting with `owner:` or shaped like a sandbox
+   * ID (`sb-` plus 16 hex) are rejected.
+   */
+  name?: string;
+  /** Free-form key/value labels; filter on them with `ListOptions.tags`. */
+  tags?: Record<string, string>;
+  /**
    * The base image for this sandbox. A bare image reference (e.g.
    * `"ubuntu:22.04"`) is pulled by the daemon as-is. An {@link Image} builder
    * is compiled to a Dockerfile and sent to the daemon's
@@ -177,21 +210,43 @@ export interface CreateOptions {
   osUser?: string;
   networkBlockAll?: boolean;
   /**
-   * Egress allowlist of CIDRs. When set, the sandbox may reach only these
-   * destinations; all other outbound traffic is dropped by the host firewall.
-   * Mutually exclusive with `networkDenyOut`. For a full block use
-   * `networkBlockAll` instead.
+   * Egress allowlist: CIDRs, hostnames (`pypi.org`), `*.suffix` wildcards and
+   * `host:port` entries. Alone, the sandbox may reach only these. With
+   * `networkDenyOut`, allow wins, then deny, then the default is allow; a
+   * deny of `0.0.0.0/0` makes it an allowlist. For a full block use
+   * `networkBlockAll`.
    */
   networkAllowOut?: string[];
   /**
-   * Egress blocklist of CIDRs. When set, the sandbox may reach anything except
-   * these destinations. Mutually exclusive with `networkAllowOut`.
+   * Egress blocklist of CIDRs (never hostnames). Alone, the sandbox may reach
+   * anything except these destinations.
    */
   networkDenyOut?: string[];
   /**
-   * Whether the sandbox may be exposed to the public internet. Omitted defaults
-   * to private (no public URL, `exposePort` fails). Set `true` to opt in to
-   * public exposure; `false` permanently refuses it for this sandbox.
+   * Named egress profiles whose entries join `networkAllowOut` (see
+   * `putEgressProfile`). A profile change reaches every sandbox that
+   * references it.
+   */
+  egressProfiles?: string[];
+  /**
+   * `"learn"` gives the sandbox open egress and records what it reaches, so
+   * `learned()` can suggest an allow list. Trusted runs only. Needs no lists,
+   * profiles or block-all. Omitted is `"enforce"`.
+   */
+  networkEgressMode?: "enforce" | "learn";
+  /**
+   * Method and path rules that refine hosts the allow list already admits
+   * (at most 32). A rule with `inspect: true` makes the egress gateway
+   * terminate TLS on 443 with the node's CA, which only a sandbox created
+   * with such a rule trusts, so set inspect rules here rather than adding
+   * them later.
+   */
+  networkEgressRules?: EgressRule[];
+  /**
+   * Whether the sandbox is public from boot. Omitted or `false` creates it
+   * private: no public URL and no ingress route. `true` makes it public from
+   * boot. Either way the first `exposePort` call makes the sandbox public, so
+   * `false` does not stop a later `exposePort`.
    */
   allowPublicTraffic?: boolean;
   /**
@@ -264,6 +319,13 @@ export interface CreateOptions {
    * `sandbox.customDomains.add(host)` for each entry after create.
    */
   customDomains?: string[];
+  /**
+   * Firecracker template id (from `createTemplate`); the template must be
+   * ready. Requires `runtime: "firecracker"` and `image`: pass the image the
+   * template was built from. The sandbox boots from the template's prepared
+   * rootfs instead of building one from `image` on every create.
+   */
+  templateId?: string;
 }
 
 export interface ResizeOptions {
@@ -286,6 +348,13 @@ export interface ListOptions {
    * Env is omitted by default — opt-in reads are audited server-side.
    */
   includeEnv?: boolean;
+  /**
+   * Filter to the caller's sandbox with exactly this name (`?name=<name>`);
+   * the result has zero or one entries. Names are unique per owner. Servers
+   * that predate name lookup ignore the filter and return a normal list, so
+   * prefer `MicroVM.getByName`, which checks the reply.
+   */
+  name?: string;
 }
 
 export interface GetOptions {
@@ -452,6 +521,21 @@ export interface SandboxSnapshot {
   diskGB?: number;
 }
 
+/** Options for {@link MicroVM.listSnapshots}: one name-ordered page. */
+export interface ListSnapshotsOptions {
+  /** Maximum snapshots to return in this page. */
+  limit?: number;
+  /** Exclusive name cursor — pass the last name of the previous page. */
+  startingAfter?: string;
+}
+
+/** One page of snapshots from {@link MicroVM.listSnapshots}. */
+export interface SnapshotList {
+  snapshots: SandboxSnapshot[];
+  /** True when more snapshots remain after this page. */
+  hasMore: boolean;
+}
+
 /**
  * Discriminated result from `exposePort`. Branch on `protocol` to access the
  * fields that are meaningful for the chosen wire protocol — only the raw-TCP
@@ -465,6 +549,10 @@ export type ExposeResult =
 
 export interface Sandbox {
   id: string;
+  /** Name set at create time, unique per owner. Absent for unnamed sandboxes. */
+  name?: string;
+  /** Labels set at create time. */
+  tags?: Record<string, string>;
   image: string;
   status: SandboxStatus;
   publicURL: string;
@@ -476,6 +564,24 @@ export interface Sandbox {
   osUser: string;
   env?: Record<string, string>;
   networkBlockAll: boolean;
+  /**
+   * Hostname-egress state on `get` for a sandbox whose allow list names
+   * hosts (container runtimes): "active", "held" or "unavailable";
+   * "unenforced" when the server's firewall is off and nothing filters the
+   * sandbox. Absent otherwise, and on list results.
+   */
+  egressStatus?: string;
+  /** Egress profiles this sandbox references. */
+  egressProfiles?: string[];
+  /**
+   * The generation of each referenced profile that is live on the sandbox,
+   * so a caller can see when a profile change has reached it.
+   */
+  egressProfilesApplied?: EgressProfileRef[];
+  /** `"learn"` while the sandbox records its egress; absent otherwise. */
+  networkEgressMode?: string;
+  /** Method and path rules on the sandbox's egress; absent when it has none. */
+  networkEgressRules?: EgressRule[];
   toolboxEnabled: boolean;
   sshPublicKey?: string;
   sshPrivateKey?: string;
@@ -521,6 +627,288 @@ export interface NetworkUsage {
   quotaExceededAt?: string;
   /** Absent until the netstats poller has produced at least one sample. */
   lastSampledAt?: string;
+}
+
+/** One record from a sandbox's audit log (`sandbox.audit()`). */
+export interface AuditEvent {
+  time: string;
+  /** "egress" for outbound connections and denials; secret kinds otherwise. */
+  kind?: string;
+  /** "success", or "failure" for a denial. */
+  result: string;
+  /** Why it was denied, e.g. "host_not_allowed", "sni_not_allowed". */
+  reason?: string;
+  /** host:port (or host) the sandbox tried to reach. */
+  destination?: string;
+  network?: string;
+  actor?: string;
+  ref?: string;
+  eventID?: string;
+  incarnationID?: string;
+  /** Records lost at this point (a gap record). */
+  dropped?: number;
+}
+
+export interface AuditPage {
+  events: AuditEvent[];
+  /** Which nodes answered; `partial` is true when some could not. */
+  coverage: { answered: string[]; missing: string[]; partial: boolean };
+  /** Pass to `audit({ cursor })` for the next page. */
+  nextCursor?: string;
+}
+
+export interface AuditOptions {
+  /** Only this kind, e.g. "egress". */
+  kind?: string;
+  limit?: number;
+  cursor?: string;
+  incarnationID?: string;
+}
+
+/**
+ * Would a sandbox created with these egress fields reach `destination`?
+ * `destination` is "host", "host:port", "IP" or "IP:port"; a bare host is
+ * checked as the web ports.
+ */
+export interface NetworkPolicyCheckOptions {
+  networkBlockAll?: boolean;
+  networkAllowOut?: string[];
+  networkDenyOut?: string[];
+  destination: string;
+}
+
+export interface NetworkPolicyCheckResult {
+  allowed: boolean;
+  /** The entry that decided; "" when the default verdict did. */
+  matchedRule: string;
+  /** "allow" or "deny": what happens to a destination no entry matches. */
+  defaultVerdict: string;
+  /** The first allow entry outside this deployment's ceiling, if any. */
+  outsideCeiling?: string;
+}
+
+/**
+ * A sandbox's whole egress policy, for `setNetworkPolicy`. It replaces the
+ * current policy: a field left out is cleared, so `{}` means open egress.
+ * The grammar is the create one (hostnames, `*.` wildcards, `host:port` and
+ * CIDRs in the allow list; CIDRs only in the deny list).
+ */
+export interface NetworkPolicyOptions {
+  networkBlockAll?: boolean;
+  networkAllowOut?: string[];
+  networkDenyOut?: string[];
+  egressProfiles?: string[];
+  networkEgressMode?: "enforce" | "learn";
+  /**
+   * Replaces the method and path rules. Adding an inspect rule to a
+   * container sandbox created without one is refused with 409: recreate it
+   * with the rule.
+   */
+  networkEgressRules?: EgressRule[];
+}
+
+/** The policy a sandbox enforces after `setNetworkPolicy`. */
+export interface NetworkPolicy {
+  networkBlockAll: boolean;
+  networkAllowOut: string[];
+  networkDenyOut: string[];
+  egressProfiles: string[];
+  /** `"enforce"` or `"learn"`. */
+  networkEgressMode: string;
+  networkEgressRules: EgressRule[];
+  /** Hostname entries in force: inline plus every profile's (at most 1024). */
+  effectiveHostnameCount: number;
+  /**
+   * "active", "held" or "unavailable" for hostname rules on a container;
+   * "unenforced" when the server's firewall is off.
+   */
+  egressStatus?: string;
+}
+
+/**
+ * One method, path or program rule. Rules refine a host the allow list
+ * already admits: a request to a ruled host passes when some rule for that
+ * host admits its program, method and path, and gets a 403 otherwise. A host
+ * no rule names keeps its allow-list decision.
+ */
+export interface EgressRule {
+  /** An exact name or `*.` wildcard, without a port. */
+  host: string;
+  /**
+   * `[80]` by default, or `[443]` with `inspect`; only 80 and 443, except
+   * that a rule with only `binaries` may name any port the allow list opens.
+   */
+  ports?: number[];
+  /** Exact, upper case (`GET`, `POST`); empty allows any. */
+  methods?: string[];
+  /**
+   * Path globs: `*` within one segment, `**` as a whole segment for any
+   * number of them. Empty allows any path.
+   */
+  paths?: string[];
+  /**
+   * Terminate TLS on 443 with the node's CA so the rule can see requests.
+   * The request's Host must then equal the TLS server name.
+   */
+  inspect?: boolean;
+  /**
+   * Replace a header on the requests this rule allows with a secret from
+   * the sandbox's own `env`, which the sandbox itself only sees as a
+   * placeholder. Needs `inspect: true`.
+   */
+  inject?: EgressInject;
+  /**
+   * Limit the rule to connections opened by these executables: clean
+   * absolute paths inside the sandbox, at most 16. For an interpreter
+   * (python, node, a shell) the script it runs counts too, so
+   * `/usr/local/bin/pip` works. A rule with only `binaries` decides whole
+   * connections, on any port the allow list opens. Runc sandboxes only
+   * (docker and containerd); least privilege for trusted tooling, not a
+   * security boundary.
+   */
+  binaries?: string[];
+}
+
+/**
+ * A rule's credential injection. The sandbox's env holds
+ * `aerolvm-placeholder:<KEY>` in place of the value, and the egress gateway
+ * replaces `header` with the real value on each request the rule allows, so
+ * code in the sandbox never holds the secret.
+ */
+export interface EgressInject {
+  /**
+   * The header to replace, such as `Authorization`. It is replaced, never
+   * added to a body or URL. Headers that frame or route the request, such as
+   * `Host` or `Content-Length`, can't be injected.
+   */
+  header: string;
+  /**
+   * `"env:<KEY>"`: a key in the create's `env`, whose value is the whole
+   * header value (for example `Bearer ghp_...`). Rotating it means
+   * recreating the sandbox.
+   */
+  secretRef: string;
+}
+
+/**
+ * A named allowlist sandboxes reference through `egressProfiles`. Profiles
+ * belong to your account; `generation` goes up by one on every change.
+ */
+export interface EgressProfile {
+  name: string;
+  /** Hostnames, `*.` wildcards, `host:port` entries and CIDRs (at most 512 hostnames). */
+  allowOut: string[];
+  description?: string;
+  generation: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/** The body of `putEgressProfile`: a full replace. */
+export interface EgressProfileOptions {
+  allowOut: string[];
+  description?: string;
+}
+
+export interface ListEgressProfilesOptions {
+  cursor?: string;
+  limit?: number;
+}
+
+export interface EgressProfileList {
+  profiles: EgressProfile[];
+  /** Pass back as `cursor` for the next page; absent on the last one. */
+  nextCursor?: string;
+}
+
+/** Who the caller is, as `microvm.whoami()` reports it. */
+export interface WhoAmIPrincipal {
+  /** `"operator"`, `"token"`, `"oidc"`, `"controlplane"`, ... */
+  kind: string;
+  /** Stable id: `"operator"`, `"tok_…"`, `"oidc:<issuer>:<sub>"`, ... */
+  id: string;
+  /** Display name; absent when the server has none. */
+  name?: string;
+}
+
+/** The body of `microvm.whoami()`: the caller's own resolved identity. */
+export interface WhoAmI {
+  principal: WhoAmIPrincipal;
+  /** `"viewer"`, `"runner"`, `"auditor"` or `"admin"`. */
+  role: string;
+  /** `"*"` for every team, a team name, or absent for a managed account. */
+  team?: string;
+  /** When the credential stops working (RFC 3339); absent if it never does. */
+  expiresAt?: string;
+}
+
+/** One scoped API token as `microvm.tokens.list()` returns it. Never the secret. */
+export interface APIToken {
+  /** Public id (`tok_…`): what `tokens.revoke` takes and audit records name. */
+  id: string;
+  name: string;
+  role: string;
+  /** A team name, or `"*"` for every team. */
+  team: string;
+  createdBy: string;
+  createdAt: string;
+  expiresAt: string;
+  /** Expired tokens no longer work; they stay listed for 30 days. */
+  expired: boolean;
+}
+
+/** `microvm.tokens.create()`'s result: the token plus its secret. */
+export interface CreatedAPIToken extends APIToken {
+  /** The secret (`avm_…`), returned this once and never stored by the server. */
+  token: string;
+}
+
+/** The body of `microvm.tokens.create()`. */
+export interface CreateAPITokenOptions {
+  /** 1 to 64 of `A-Z a-z 0-9 . _ -`, unique among the team's tokens. */
+  name: string;
+  /** `"viewer"`, `"runner"`, `"auditor"` or `"admin"`. */
+  role: string;
+  /** A team name, or `"*"` for every team. `auditor` and `admin` require `"*"`. */
+  team: string;
+  /** Required lifetime: `"90d"`, `"720h"` or any Go duration. */
+  expiresIn: string;
+}
+
+/** `microvm.tokens.list()`'s result. */
+export interface APITokenList {
+  tokens: APIToken[];
+}
+
+/** One destination a learn-mode sandbox reached. */
+export interface NetworkLearnedEntry {
+  host: string;
+  /** Connection ports; empty when the name was only resolved. */
+  ports: number[];
+  firstSeen: string;
+  lastSeen: string;
+  hits: number;
+}
+
+/**
+ * What a sandbox reached in learn mode, and the allow list that would have
+ * allowed it: `suggestedAllowOut` when it fits 64 hostnames, otherwise
+ * `suggestedProfile` (a body for `putEgressProfile`).
+ */
+export interface NetworkLearned {
+  mode: string;
+  /** Recording stopped at its cap. */
+  truncated: boolean;
+  entries: NetworkLearnedEntry[];
+  cidrs: string[];
+  suggestedAllowOut: string[];
+  suggestedProfile?: EgressProfileOptions;
+}
+
+/** A referenced profile and the generation of it that is live on a sandbox. */
+export interface EgressProfileRef {
+  name: string;
+  generation: number;
 }
 
 export interface SetNetworkLimitsOptions {

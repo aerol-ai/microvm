@@ -17,6 +17,63 @@
 #   {{ROOT_SITE_ADDRESS}}     — the apex domain ($DOMAIN)
 #   {{WILDCARD_SITE_ADDRESS}} — *.$DOMAIN
 #   {{DNS_PROVIDER}}          — DNS provider name passed to --dns-provider
+#
+# Two opt-in variants scripts/install.sh writes (plans/identity-and-access.md
+# §5.11); a default install writes neither:
+#
+#   --l4-proxy-protocol: caddy-l4's SNI fallback sends a PROXY v2 header to
+#     the HTTPS sites (SB_L4_FALLBACK_PROXY_PROTOCOL=true), so the global
+#     block gains
+#         servers 127.0.0.1:8443 {
+#             listener_wrappers {
+#                 proxy_protocol {
+#                     allow 127.0.0.1/32
+#                 }
+#                 tls
+#             }
+#         }
+#     and the API reverse_proxy block gains
+#         header_up X-AerolVM-Client-IP {remote_host}
+#     Write the wrapper before setting the flag, and unset the flag before
+#     removing the wrapper: the wrapper also accepts a connection with no
+#     header, while the flag without the wrapper fails every handshake.
+#
+#   --pat-scope host: the operator token works only from the host and
+#     cluster peers (SB_PAT_SCOPE=host), so the API reverse_proxy moves from
+#     127.0.0.1:21212 to sandboxd's public socket, where every request is
+#     public:
+#         reverse_proxy unix//run/sandboxd-public/api.sock {
+#     Any other reverse proxy on the host must use the socket too.
+#
+# One more opt-in variant, for a node behind a health-checked load balancer
+# (Terraform api_load_balancer = "nlb"):
+#
+#   --lb-health-port <port>: a plain-HTTP site the balancer's health check
+#     probes. GET /health walks the path a client takes (caddy-l4 on :443,
+#     its SNI fallback, the HTTPS API site, sandboxd), so it answers 502
+#     while any of them is down and the balancer stops sending the node new
+#     connections. The probe carries neither SNI nor the domain as Host, so
+#     the site supplies both; without the Host header the probe matches no
+#     site and Caddy answers an empty 200 even with sandboxd down.
+#         http://:<port> {
+#             handle /health {
+#                 reverse_proxy https://127.0.0.1:443 {
+#                     header_up Host {{ROOT_SITE_ADDRESS}}
+#                     stream_close_delay 10m
+#                     transport http {
+#                         tls_server_name {{ROOT_SITE_ADDRESS}}
+#                         tls_insecure_skip_verify
+#                     }
+#                 }
+#             }
+#             handle {
+#                 respond 404
+#             }
+#         }
+#     Keep it unbound (":<port>", not "<ip>:<port>"): Caddy names servers in
+#     sorted listen-address order, and the API site must stay srv0, the
+#     server sandboxd writes its routes into. Open the port to the balancer
+#     only.
 
 {
     admin localhost:2019
@@ -26,9 +83,16 @@ https://{{ROOT_SITE_ADDRESS}} {
     tls {
         dns {{DNS_PROVIDER}} {env.SB_DNS_API_TOKEN}
     }
-    @api path /health /v1 /v1/* /daytona /daytona/* /e2b /e2b/*
+    @api path /health /v1 /v1/* /daytona /daytona/* /e2b /e2b/* /runloop /runloop/* /mcp /ui /ui/* /.well-known/aerolvm-auth /.well-known/oauth-protected-resource*
     handle @api {
-        reverse_proxy 127.0.0.1:21212
+        # stream_close_delay: a Caddy reload closes each WebSocket this proxy
+        # carries (exec streams, aerolvm shell, session attach) with code
+        # 1001 unless a delay is set (#712). A stream that outlives a
+        # reload keeps the old config in memory until it closes or the delay
+        # ends.
+        reverse_proxy 127.0.0.1:21212 {
+            stream_close_delay 10m
+        }
     }
     handle {
         respond "Sandbox API not found" 404
@@ -39,5 +103,9 @@ https://{{WILDCARD_SITE_ADDRESS}} {
     tls {
         dns {{DNS_PROVIDER}} {env.SB_DNS_API_TOKEN}
     }
-    respond "Sandbox not found" 404
+    # close: caddy-l4 picks a backend once per TCP connection; a client that
+    # connected before its route existed must reconnect to be routed again.
+    respond "Sandbox not found" 404 {
+        close
+    }
 }

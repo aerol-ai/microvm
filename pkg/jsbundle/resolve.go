@@ -55,6 +55,12 @@ func (r *Resolver) Resolve(ctx context.Context, tenant, ref string) (*Bundle, er
 	return r.store.GetByName(tenant, ref)
 }
 
+// AsDigest reports whether ref is a content-digest reference ("sha256:<64hex>"
+// or a bare 64-hex string) and returns the bare hex. Exported so the create
+// path can tell a digest ref (which must be ownership-checked) from a name or
+// file ref before resolving it.
+func AsDigest(ref string) (string, bool) { return asDigest(ref) }
+
 // asDigest recognizes "sha256:<64hex>" or a bare 64-hex string and returns the
 // bare hex.
 func asDigest(ref string) (string, bool) {

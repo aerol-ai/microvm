@@ -30,6 +30,7 @@ type fakeDaemon struct {
 	containerGet func() *http.Response // GET /containers/{id}/json (waitForRuntime / inspect)
 	remove       func() *http.Response // DELETE /containers/{id}
 	removeCalls  int
+	createBody   map[string]any // the last POST /containers/create body
 }
 
 func (d *fakeDaemon) transport() roundTripFunc {
@@ -45,6 +46,9 @@ func (d *fakeDaemon) transport() roundTripFunc {
 				return d.pull(), nil
 			}
 		case r.Method == http.MethodPost && p == "/containers/create":
+			if r.Body != nil {
+				_ = json.NewDecoder(r.Body).Decode(&d.createBody)
+			}
 			if d.create != nil {
 				return d.create(), nil
 			}
@@ -254,9 +258,19 @@ func TestCreate_ImagePresentFullSuccess(t *testing.T) {
 	rt, err := c.Create(context.Background(), req, "sb", "tok", []mounts.ContainerBind{
 		{HostPath: "/h", ContainerPath: "/c", ReadOnly: true},
 		{HostPath: "/h2", ContainerPath: "/c2"},
+		{ContainerPath: "/run/aerolvm", Tmpfs: true},
 	})
 	if err != nil {
 		t.Fatalf("Create() = %v", err)
+	}
+	hc, _ := d.createBody["HostConfig"].(map[string]any)
+	if tmpfs, _ := hc["Tmpfs"].(map[string]any); tmpfs["/run/aerolvm"] != "nosuid,nodev,noexec,mode=1777,size=1048576" {
+		t.Fatalf("Tmpfs = %v", hc["Tmpfs"])
+	}
+	for _, b := range hc["Binds"].([]any) {
+		if strings.Contains(b.(string), "/run/aerolvm") {
+			t.Fatalf("a tmpfs must not become a bind: %v", hc["Binds"])
+		}
 	}
 	if rt.SandboxID != "sb" {
 		t.Fatalf("Create() runtime = %+v", rt)

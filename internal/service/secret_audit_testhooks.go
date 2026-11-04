@@ -23,3 +23,11 @@ func HoldSecretAuditVerifyForTest() (release func()) {
 	secretAuditVerifyMu.Lock()
 	return secretAuditVerifyMu.Unlock
 }
+
+// UseAuditSinkForTest makes sink this Service's audit writer, for a package
+// that drives the service over HTTP and must read the records it wrote
+// (pkg/api's api-record tests). Call it before anything opens the writer.
+func (s *Service) UseAuditSinkForTest(sink SecretAuditSink) {
+	s.secretAuditOnce.Do(func() {})
+	s.secretAudit = sink
+}

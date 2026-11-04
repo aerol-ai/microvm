@@ -60,7 +60,7 @@ func TestFleetControllerIsImplementable(t *testing.T) {
 
 func TestContextWithAccess(t *testing.T) {
 	ctx := context.Background()
-	access := Access{Identity: Identity{OwnerRef: "test-acc"}, Operator: false}
+	access := Access{Identity: Identity{OwnerRef: "test-acc"}, Fleet: false}
 
 	ctx2 := ContextWithAccess(ctx, access)
 	access2, ok := AccessFromContext(ctx2)

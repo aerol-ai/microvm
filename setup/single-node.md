@@ -124,7 +124,7 @@ ALLOW 22000-23000/TCP from anywhere     # Raw-TCP sandbox exposures (only if you
 One command:
 
 ```bash
-curl -fsSL https://github.com/aerol-ai/microvm/releases/latest/download/install.sh \
+curl -fsSL https://aerolvm.aerol.ai \
   | sudo bash -s -- \
       --domain sandbox.example.com \
       --pat-token your-secret-pat \
@@ -145,11 +145,13 @@ What the installer does:
 
 1. Installs Docker, fuse3 / sshfs / nfs-common / rclone / mountpoint-s3 (for
    external-storage mounts), and a custom Caddy build with the
-   `caddy-l4` and `caddy-dns/cloudflare` plugins.
+   `caddy-l4` and `caddy-dns/cloudflare` plugins. It disables the `rpcbind`
+   that nfs-common brings in, so nothing listens on port 111.
 2. Downloads `sandboxd` + `toolboxd` binaries.
 3. Writes `/etc/sandboxd/sandboxd.env` and `/etc/caddy/Caddyfile`.
 4. Registers `sandboxd.service` (always-restart, 5s backoff) and
-   `sandboxd-healthcheck.timer` (probes `/health` every 30s).
+   `sandboxd-healthcheck.timer` (probes the daemon's liveness socket every
+   30s).
 5. Starts everything.
 
 Verify:
@@ -189,12 +191,19 @@ languages.
 | Restart Caddy | `sudo systemctl restart caddy` |
 | Re-read PAT | `grep SB_PAT_TOKEN /etc/sandboxd/sandboxd.env` |
 | Re-read Cloudflare token | `cat /etc/default/caddy` |
-| Update binaries | Re-run the installer with the same flags. State and certs are preserved. |
+| Update binaries | Re-run the installer with the same flags, then `sudo systemctl restart sandboxd`. State and certs are preserved. |
 | List sandboxes | `curl -H "Authorization: Bearer $SB_PAT_TOKEN" https://sandbox.example.com/v1/sandboxes` |
 
-The systemd watchdog (`sandboxd-healthcheck.timer`) restarts the daemon if
-`/health` fails. The daemon itself restarts on any non-zero exit
-(`Restart=always`, max 10 restarts per 5 min).
+The systemd watchdog (`sandboxd-healthcheck.timer`) restarts the daemon only
+when it stops answering: it probes the liveness socket
+(`/run/sandboxd/live.sock`, which a busy daemon still answers) and restarts
+after 3 failed probes in a row over at least 90 s, never in the daemon's
+first 2 minutes and never while a start, stop or restart is already under
+way. A daemon that is merely slow to answer `/health` (readiness) is left
+running. The daemon itself restarts on any non-zero exit
+(`Restart=always`, max 10 restarts per 5 min); once systemd stops after
+those 10, the watchdog resets the failed unit and starts it again every 30 s.
+A unit you stopped with `systemctl stop` is not failed and stays stopped.
 
 **Switching the netrules backend** (`SB_NETRULES_BACKEND=exec|netlink` in
 `/etc/sandboxd/sandboxd.env`): check `iptables -V` first. On iptables-nft
@@ -251,11 +260,14 @@ its inclusion above.
 
 ## Updating
 
-Re-run the installer with the same flags. The daemon restarts in place; the
-state DB and certs are preserved.
+Re-run the installer with the same flags, then restart the daemon with
+`sudo systemctl restart sandboxd`. The state DB and certs are preserved. The
+installer restarts a running daemon on its own only when the run changed
+`/etc/sandboxd/sandboxd.env` or the unit; with the same flags neither
+changes, so the old binary keeps running until you restart it.
 
 ```bash
-curl -fsSL https://github.com/aerol-ai/microvm/releases/latest/download/install.sh \
+curl -fsSL https://aerolvm.aerol.ai \
   | sudo bash -s -- \
       --domain sandbox.example.com \
       --pat-token your-secret-pat \
@@ -295,5 +307,7 @@ docker ps -a --filter 'label=aerol.sandbox' -q | xargs -r docker rm -f
 | Sandbox creation 500 | Docker not running, or out of capacity | `docker ps`; check `/v1/admission` |
 | Mount errors | `fuse3` / sshfs / mountpoint-s3 missing | Re-run installer; it installs these |
 
-Health watchdog already auto-restarts on `/health` failure. For deeper
+The health watchdog restarts a daemon that stopped answering its liveness
+socket; `journalctl -t sandboxd-healthcheck` shows each failed probe and the
+streak it is on. For deeper
 issues, `journalctl -u sandboxd -f` is the first stop.

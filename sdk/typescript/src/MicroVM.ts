@@ -2,9 +2,12 @@ import { APIClient, stripTrailingSlashes, type APIVersion, type RetryConfig } fr
 import { Sandbox } from "./Sandbox.js";
 import { Image } from "./Image.js";
 import type {
+  APITokenList,
   BuildImageOptions,
   BuildImageResult,
   CloneGeneration,
+  CreateAPITokenOptions,
+  CreatedAPIToken,
   CreateOptions,
   CreateSessionOptions,
   CreateTemplateOptions,
@@ -14,12 +17,21 @@ import type {
   ExecStreamHandle,
   ExecStreamOptions,
   HealthStatus,
+  EgressProfile,
+  EgressProfileList,
+  EgressProfileOptions,
+  ListEgressProfilesOptions,
+  NetworkPolicyCheckOptions,
+  NetworkPolicyCheckResult,
   IngressTarget,
   Lifecycle,
   GetOptions,
   ListOptions,
   MountSpecRedacted,
+  CreateSnapshotOptions,
   RegisterSnapshotOptions,
+  ListSnapshotsOptions,
+  SnapshotList,
   ResizeOptions,
   Sandbox as SandboxData,
   SandboxSnapshot,
@@ -28,16 +40,47 @@ import type {
   SessionAttachOptions,
   Template,
   WasmModule,
+  WhoAmI,
 } from "./types.js";
 
 const defaultAPIURL = "http://127.0.0.1:21212";
-const authRequiredErrorMessage = "PAT token is required. Set patToken or SB_PAT_TOKEN.";
+const authRequiredErrorMessage = "PAT token is required. Set patToken, SB_PAT_TOKEN or SB_API_TOKEN.";
 
 type FetchLike = typeof fetch;
 
+/** Scoped API token calls, reached as `microvm.tokens`. */
+export interface Tokens {
+  /**
+   * Mint a token (admin only). The result's `token` is the secret, returned
+   * this once and never again. A 409 means the name is taken, possibly by an
+   * earlier attempt whose reply was lost; that secret cannot be recovered,
+   * so revoke the token and create it again.
+   */
+  create(options: CreateAPITokenOptions): Promise<CreatedAPIToken>;
+  /** List every token (auditor or admin); expired ones stay listed for 30 days. */
+  list(): Promise<APITokenList>;
+  /** Revoke a token by id (admin only). Revoking one already gone succeeds. */
+  revoke(id: string): Promise<void>;
+}
+
 export interface MicroVMConfig {
+  /**
+   * The bearer every request carries: the operator PAT, an `avm_` API token
+   * or an OIDC ID token. Defaults to `SB_PAT_TOKEN`, then its alias
+   * `SB_API_TOKEN`; when both are set, `SB_PAT_TOKEN` wins.
+   */
   patToken?: string;
   apiUrl?: string;
+  /**
+   * The team requests act for, sent as the `X-AerolVM-Team` header on every
+   * HTTP request. Defaults to `SB_TEAM`; with neither, no header is sent and
+   * the server uses the credential's first matching binding. The header only
+   * chooses among teams the credential is already bound to (a team it does
+   * not hold is refused with 403), and the operator PAT ignores it.
+   * WebSocket streams (`execStream`, `attachSession`) cannot carry custom
+   * headers from a browser or Node, so they go without it.
+   */
+  team?: string;
   fetch?: FetchLike;
   /**
    * Wire version of the sandbox daemon API to call. Defaults to the SDK's
@@ -49,21 +92,35 @@ export interface MicroVMConfig {
   /**
    * Retry policy for transient transport errors (socket closed, connection
    * reset) and retryable HTTP status codes (421, 429, 502, 503, 504). The SDK
-   * retries up to 3 times with exponential backoff by default. Pass
-   * `{ maxRetries: 0 }` to disable.
+   * retries up to 3 times with exponential backoff by default. `exec` retries
+   * only failures that prove the command never reached the server
+   * (connection refused, connect timeout, DNS) and HTTP 429/503, so a command
+   * never runs twice. Pass `{ maxRetries: 0 }` to disable. A 429 or 503
+   * waits as long as the server's `Retry-After` asks, up to
+   * `retry.maxRetryAfterMs` (30 s by default).
    */
   retry?: RetryConfig;
+  /**
+   * Cancels the client's HTTP requests: aborting it ends the request in
+   * flight and any retry wait, so a call never sits out a long
+   * `Retry-After` once aborted. Pass `AbortSignal.timeout(ms)` to bound
+   * how long the client may run. WebSocket streams are not affected.
+   */
+  signal?: AbortSignal;
 }
 
 export class MicroVM {
   readonly apiUrl: string;
   readonly patToken: string;
+  /** The team sent as `X-AerolVM-Team`, or `""` when none is. */
+  readonly team: string;
 
   private readonly client: APIClient;
 
   constructor(config: MicroVMConfig = {}) {
-    const patToken = config.patToken ?? readEnv("SB_PAT_TOKEN") ?? "";
+    const patToken = config.patToken ?? readEnv("SB_PAT_TOKEN") ?? readEnv("SB_API_TOKEN") ?? "";
     const apiUrl = normalizeURL(config.apiUrl ?? readEnv("SB_API_URL") ?? defaultAPIURL);
+    const team = (config.team ?? readEnv("SB_TEAM") ?? "").trim();
 
     if (patToken === "") {
       throw new Error(authRequiredErrorMessage);
@@ -71,12 +128,15 @@ export class MicroVM {
 
     this.apiUrl = apiUrl;
     this.patToken = patToken;
+    this.team = team;
     this.client = new APIClient({
       baseURL: apiUrl,
       patToken,
+      team,
       fetch: config.fetch,
       apiVersion: config.apiVersion,
       retry: config.retry,
+      signal: config.signal,
     });
   }
 
@@ -105,6 +165,16 @@ export class MicroVM {
     return this.wrap(sandbox.toJSON());
   }
 
+  /**
+   * Returns the caller's sandbox with this name, or `null` when there is none.
+   * Names are unique per owner. Throws when the server predates name lookup
+   * (it ignores `?name=`), rather than guessing from an unfiltered list.
+   */
+  async getByName(name: string, options?: GetOptions): Promise<Sandbox | null> {
+    const sandbox = await this.client.getByName(name, options);
+    return sandbox === null ? null : this.wrap(sandbox.toJSON());
+  }
+
   async start(id: string): Promise<Sandbox> {
     const sandbox = await this.client.start(id);
     return this.wrap(sandbox.toJSON());
@@ -115,8 +185,8 @@ export class MicroVM {
     return this.wrap(sandbox.toJSON());
   }
 
-	async createSnapshot(id: string, name: string): Promise<SandboxSnapshot> {
-		return this.client.createSnapshot(id, name);
+	async createSnapshot(id: string, name: string, options: CreateSnapshotOptions = {}): Promise<SandboxSnapshot> {
+		return this.client.createSnapshot(id, name, options);
 	}
 
   async registerSnapshot(options: RegisterSnapshotOptions): Promise<SandboxSnapshot> {
@@ -129,6 +199,21 @@ export class MicroVM {
     options: Omit<RegisterSnapshotOptions, "name" | "image" | "dockerfileContent"> = {},
   ): Promise<SandboxSnapshot> {
     return this.client.registerSnapshotFromImage(name, image, options);
+  }
+
+  /** Look a snapshot up by name. In a cluster the request is routed to the node holding the image. */
+  async getSnapshot(name: string): Promise<SandboxSnapshot> {
+    return this.client.getSnapshot(name);
+  }
+
+  /** List the caller's snapshots, one name-ordered page at a time. */
+  async listSnapshots(options: ListSnapshotsOptions = {}): Promise<SnapshotList> {
+    return this.client.listSnapshots(options);
+  }
+
+  /** Delete a snapshot by name (idempotent 404 if it does not exist). */
+  async deleteSnapshot(name: string): Promise<void> {
+    return this.client.deleteSnapshot(name);
   }
 
   async destroy(id: string): Promise<void> {
@@ -161,6 +246,37 @@ export class MicroVM {
 
   async health(): Promise<HealthStatus> {
     return this.client.health();
+  }
+
+  /**
+   * Asks whether a sandbox created with these egress fields would reach a
+   * destination, using the same matcher the filter enforces. No sandbox is
+   * needed.
+   */
+  async checkNetworkPolicy(options: NetworkPolicyCheckOptions): Promise<NetworkPolicyCheckResult> {
+    return this.client.checkNetworkPolicy(options);
+  }
+
+  /**
+   * Creates or replaces a named egress profile (a full replace: the same body
+   * twice is a no-op). Sandboxes reference it through `egressProfiles`, and a
+   * change reaches every one of them.
+   */
+  async putEgressProfile(name: string, options: EgressProfileOptions): Promise<EgressProfile> {
+    return this.client.putEgressProfile(name, options);
+  }
+
+  async getEgressProfile(name: string): Promise<EgressProfile> {
+    return this.client.getEgressProfile(name);
+  }
+
+  async listEgressProfiles(options?: ListEgressProfilesOptions): Promise<EgressProfileList> {
+    return this.client.listEgressProfiles(options);
+  }
+
+  /** Deletes a profile; one that sandboxes still reference is refused (409). */
+  async deleteEgressProfile(name: string): Promise<void> {
+    return this.client.deleteEgressProfile(name);
   }
 
   async mounts(sandboxID: string): Promise<MountSpecRedacted[]> {
@@ -299,6 +415,28 @@ export class MicroVM {
     const client = this.client;
     return {
       target: () => client.ingressDNS(),
+    };
+  }
+
+  /**
+   * Who the server says the caller is: principal, role, team and when the
+   * credential expires. Every valid credential may ask.
+   */
+  async whoami(): Promise<WhoAmI> {
+    return this.client.whoami();
+  }
+
+  /**
+   * Scoped API tokens (`avm_…`) for services and CI, as
+   * `microvm.tokens.create/list/revoke`. Same namespaced shape as
+   * {@link MicroVM.dns}.
+   */
+  get tokens(): Tokens {
+    const client = this.client;
+    return {
+      create: (options) => client.createAPIToken(options),
+      list: () => client.listAPITokens(),
+      revoke: (id) => client.revokeAPIToken(id),
     };
   }
 

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"os/exec"
 	"strings"
 	"testing"
@@ -107,8 +108,14 @@ func TestUC107_PrometheusSandboxdTargetsUp(t *testing.T) {
 }
 
 func sshHarnessOpts() []string {
-	// Mirror integration-tests/lib/common.sh SSH_OPTS for harness subprocesses.
-	return []string{
+	// Mirror integration-tests/lib/common.sh SSH_OPTS for harness subprocesses,
+	// with the key the rest of the harness uses (harness/host_ssh.go): without
+	// it this only worked when the key happened to sit in an ssh-agent.
+	var opts []string
+	if key := strings.TrimSpace(os.Getenv("AEROL_SSH_IDENTITY_FILE")); key != "" {
+		opts = append(opts, "-i", key, "-o", "IdentitiesOnly=yes")
+	}
+	return append(opts,
 		"-o", "StrictHostKeyChecking=no",
 		"-o", "UserKnownHostsFile=/dev/null",
 		"-o", "ConnectTimeout=10",
@@ -116,5 +123,5 @@ func sshHarnessOpts() []string {
 		// Suppress the "Warning: Permanently added ... to the list of known
 		// hosts" line ssh writes to stderr; belt-and-suspenders with .Output().
 		"-o", "LogLevel=ERROR",
-	}
+	)
 }

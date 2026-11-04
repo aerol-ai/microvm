@@ -13,44 +13,150 @@
 package api
 
 import (
+	"expvar"
 	"log/slog"
 	"net/http"
+	"sync"
+	"sync/atomic"
 
 	"github.com/aerol-ai/microvm/internal/config"
 	"github.com/aerol-ai/microvm/internal/service"
+	"github.com/aerol-ai/microvm/internal/version"
+	"github.com/aerol-ai/microvm/pkg/api/apihttp"
 	"github.com/aerol-ai/microvm/pkg/api/daytona"
 	"github.com/aerol-ai/microvm/pkg/api/e2b"
+	"github.com/aerol-ai/microvm/pkg/api/remotemcp"
+	"github.com/aerol-ai/microvm/pkg/api/runloop"
 	apiv1 "github.com/aerol-ai/microvm/pkg/api/v1"
 	"github.com/aerol-ai/microvm/pkg/controlplane"
 	"github.com/aerol-ai/microvm/pkg/docker"
+	"github.com/aerol-ai/microvm/pkg/identitywire"
 )
+
+// listGateMetrics are the cluster-list gate's series on /v1/metrics: lists
+// holding a slot now, lists admitted, lists refused 503 (node full) and 429
+// (the caller's tenant over its share), lists queued now, and tenants with a
+// list in flight or queued now. None is labelled by tenant.
+var listGateMetrics = apihttp.GateMetrics{
+	InFlight:    expvar.NewInt("aerolvm_api_list_inflight"),
+	Admitted:    expvar.NewInt("aerolvm_api_list_admitted_total"),
+	Shed:        expvar.NewInt("aerolvm_api_list_shed_total"),
+	RateLimited: expvar.NewInt("aerolvm_api_list_rate_limited_total"),
+	Queued:      expvar.NewInt("aerolvm_api_list_queued"),
+	Flows:       expvar.NewInt("aerolvm_api_list_tenants"),
+}
+
+// The gate's configured size, so a dashboard can plot in-flight against the
+// limit and a live test can read what it is up against.
+var (
+	listGateLimitMetric     = expvar.NewInt("aerolvm_api_list_max_inflight")
+	listGatePerTenantMetric = expvar.NewInt("aerolvm_api_list_max_inflight_per_tenant")
+)
+
+// listGateDebugTop is how many tenants /debug/vars names under api_list_gate.
+const listGateDebugTop = 10
+
+// listGateDebug is the gate /debug/vars (fleet admin only) shows as
+// api_list_gate: its totals and its busiest tenants by name, for an
+// operator chasing a noisy one. The name has no aerolvm_ prefix, so
+// /v1/metrics never turns tenant names into labels.
+var listGateDebug atomic.Pointer[apihttp.Gate]
+
+func init() {
+	expvar.Publish("api_list_gate", expvar.Func(func() any { return listGateDebug.Load().Snapshot(listGateDebugTop) }))
+}
 
 type Server struct {
 	logger          *slog.Logger
 	service         *service.Service
-	builder         apiv1.ImageBuilder
-	build           daytona.BuildConfig
 	containerEngine string
 	patToken        string
 	validator       controlplane.Validator
 	auditLimiter    *apiv1.AuditRateLimiter
-	clusterEnabled  bool
-	mux             *http.ServeMux
+	// listGate sheds cluster-wide lists past SB_API_LIST_MAX_INFLIGHT and
+	// a tenant's past SB_API_LIST_MAX_INFLIGHT_PER_TENANT (apihttp.Gate);
+	// nil with no limit.
+	listGate       *apihttp.Gate
+	clusterEnabled bool
+	mux            *http.ServeMux
+	root           http.Handler
+	mcp            *remotemcp.Handler
+
+	// authChain is the ordered authenticator list authenticate() tries
+	// (auth.go). NewServer builds it; a bare &Server{} falls back to the
+	// default PAT-then-provider chain.
+	authChain []authLink
+
+	// The PAT settings (pat_scope.go, plans/identity-and-access.md §5.11):
+	// the previous token accepted during a rotation, SB_PAT_SCOPE=host, and
+	// SB_L4_FALLBACK_PROXY_PROTOCOL, which makes Caddy's
+	// X-AerolVM-Client-IP trustworthy.
+	patTokenPrevious string
+	patScopeHost     bool
+	l4ProxyProtocol  bool
+
+	// Sign-in discovery (discovery.go): whether identity is on, the
+	// issuers to publish, and SB_DOMAIN for ui_url.
+	identityEnabled bool
+	discovery       func() []identitywire.DiscoveryIssuer
+	domain          string
+	// mcpResource is the identity file's /mcp OAuth resource (mcp_oauth.go);
+	// nil with identity off or without an identity file.
+	mcpResource func() MCPResource
+
+	// audit is the one seam that writes kind "api" chain records
+	// (apihttp.AuditHook, api_audit.go). registerRoutes hands it to every
+	// surface's Route, so setting it here covers every permission-tagged
+	// route. NewServer sets it to recordRoute unless SB_AUDIT_API_RECORDS
+	// is off; nil records nothing.
+	audit apihttp.AuditHook
+	// authDenied rate-limits auth_denied records to one per source address
+	// per minute (auth_denied.go).
+	authDenied *authDeniedLimiter
+	// The background work StartBackground runs and StopBackground ends
+	// (auth_denied.go): bgStop and bgDone are nil until it starts.
+	bgMu      sync.Mutex
+	bgStop    chan struct{}
+	bgDone    chan struct{}
+	bgStopped bool
+
+	// Facade config, read once from config.Config (not per request in the
+	// facades). Each facade parses its own format.
+	daytonaDefaultImage     string
+	e2bTemplateMapJSON      string
+	e2bClientID             string
+	runloopBlueprintMapJSON string
 }
 
 // NewServer constructs the API server. validator is the second-token (non-PAT)
 // validation path; pass controlplane.Noop().Validator (or any rejecting
 // validator) for the open-source PAT-only behavior. A nil validator is treated
 // as reject-all so callers can't accidentally open the door by omission.
+// opts adds named-credential authenticators (WithCredentialAuthenticator),
+// which take effect only with cfg.IdentityEnabled.
 //
-// builder is the image-builder the /images/build + snapshot-from-Dockerfile
-// paths use. On the dockerd engine this is the *docker.Client; on the
-// containerd engine the daemon passes a buildkit-backed builder. A nil builder
-// falls back to dockerClient so existing docker-only callers are unaffected;
-// when both are nil the build endpoints return 503 (builder not configured).
-func NewServer(logger *slog.Logger, service *service.Service, dockerClient *docker.Client, builder apiv1.ImageBuilder, cfg config.Config, patToken string, validator controlplane.Validator) *Server {
+// builder is the image builder the service builds with (every surface's
+// builds go through service.BuildImage). On the dockerd engine this is the
+// *docker.Client; on the containerd engine the daemon passes a
+// buildkit-backed builder. A nil builder falls back to dockerClient so
+// existing docker-only callers are unaffected; when both are nil the build
+// endpoints return 503 (builder not configured).
+func NewServer(logger *slog.Logger, service *service.Service, dockerClient *docker.Client, builder service.ImageBuilder, cfg config.Config, patToken string, validator controlplane.Validator, opts ...ServerOption) *Server {
 	if validator == nil {
 		validator = controlplane.Noop().Validator
+	}
+	var options serverOptions
+	for _, opt := range opts {
+		opt(&options)
+	}
+	if !cfg.IdentityEnabled {
+		// Identity off is byte for byte the pre-identity server (L8): no
+		// avm_ or JWT authenticator, whatever the caller passed, no issuer
+		// in the discovery document, and no OAuth metadata or challenge on
+		// /mcp.
+		options.credentials = nil
+		options.discovery = nil
+		options.mcpResource = nil
 	}
 	// A nil *docker.Client wrapped in the interface would be a non-nil
 	// interface holding a nil pointer, defeating the handlers' `Builder == nil`
@@ -58,65 +164,155 @@ func NewServer(logger *slog.Logger, service *service.Service, dockerClient *dock
 	if builder == nil && dockerClient != nil {
 		builder = dockerClient
 	}
+	if service != nil && builder != nil {
+		service.SetImageBuilder(builder)
+	}
 	s := &Server{
 		logger:          logger,
 		service:         service,
-		builder:         builder,
-		build:           daytona.BuildConfig{ContextEnabled: cfg.ImageBuildContextEnabled, Timeout: cfg.ImageBuildTimeout},
 		containerEngine: cfg.ContainerEngine,
 		patToken:        patToken,
 		validator:       validator,
+		identityEnabled: cfg.IdentityEnabled,
+		discovery:       options.discovery,
+		mcpResource:     options.mcpResource,
+		domain:          cfg.Domain,
 		clusterEnabled:  cfg.EnableCluster,
 		auditLimiter: apiv1.NewAuditRateLimiter(apiv1.AuditRateLimiterConfig{
 			IdentityRate: cfg.AuditRateLimitIdentity,
 			OperatorRate: cfg.AuditRateLimitOperator,
 			NodeRate:     cfg.AuditRateLimitNode,
 		}),
-		mux: http.NewServeMux(),
+		listGate:                apihttp.NewGate(cfg.APIListMaxInflight, cfg.APIListMaxInflightPerTenant, cfg.APIListQueueWait, listGateMetrics),
+		daytonaDefaultImage:     cfg.DaytonaDefaultImage,
+		e2bTemplateMapJSON:      cfg.E2BTemplateMapJSON,
+		e2bClientID:             cfg.E2BClientID,
+		runloopBlueprintMapJSON: cfg.RunloopBlueprintMapJSON,
+		mux:                     http.NewServeMux(),
+		authDenied:              newAuthDeniedLimiter(),
 	}
-	s.routes()
+	listGateDebug.Store(s.listGate)
+	listGateLimitMetric.Set(int64(s.listGate.Limit()))
+	listGatePerTenantMetric.Set(int64(s.listGate.PerFlowLimit()))
+	s.patTokenPrevious = cfg.PATTokenPrevious
+	s.patScopeHost = cfg.PATScopeHostOnly()
+	s.l4ProxyProtocol = cfg.L4FallbackProxyProtocol
+	s.authChain = buildAuthChain(s.patAuth(), validator, options.credentials)
+	if service != nil && service.APIRecordsConfigured() {
+		// Before registerRoutes: every surface captures the hook when it
+		// mounts its routes.
+		s.audit = s.recordRoute
+	}
+	if cfg.MCPEnabled {
+		s.mcp = remotemcp.New(remotemcp.Config{
+			AllowedOrigins: cfg.MCPAllowedOrigins,
+			AllowedHosts:   cfg.MCPAllowedHosts,
+			RateLimit:      cfg.MCPRateLimit,
+			Version:        version.Version,
+			Logger:         logger,
+		}, s.Handler)
+	}
+	s.registerRoutes(s.mux)
+	s.root = loggingMiddleware(s.logger, s.clusterControlHeaderGuard(s.mux))
 	return s
 }
 
 func (s *Server) Handler() http.Handler {
-	return loggingMiddleware(s.logger, s.clusterControlHeaderGuard(s.mux))
+	if s.root == nil {
+		// A Server built without NewServer (tests) still serves its mux.
+		return loggingMiddleware(s.logger, s.clusterControlHeaderGuard(s.mux))
+	}
+	return s.root
 }
 
-func (s *Server) routes() {
+// registerRoutes mounts every route on mux. Every one goes through a
+// surface's Route (authenticate → authorize → audit seam) except the public
+// allowlist in route_registry_test.go: /health, /ui, the sign-in discovery
+// document, the RFC 9728 metadata and the E2B runtime proxy. NewServer
+// passes the real mux; the registry test a recording one.
+func (s *Server) registerRoutes(mux apihttp.Mux) {
 	// /health is unversioned: it is meant for liveness probes (k8s, load
 	// balancers) which should keep working across API version rollouts.
-	s.mux.HandleFunc("GET /health", s.handleHealth)
+	// Public by design.
+	mux.Handle("GET /health", http.HandlerFunc(s.handleHealth))
+
+	// Sign-in discovery (§5.6): public by design, since a person reads it
+	// before holding any credential. It lists no issuer with identity off.
+	mux.Handle("GET "+identitywire.AuthDiscoveryPath, http.HandlerFunc(s.handleAuthDiscovery))
 
 	// Each registered version owns its own URL prefix and is responsible for
-	// every route under it. Auth is shared across versions via Deps.Auth.
-	daytona.RegisterRoutes(s.mux, daytona.Deps{
+	// every route under it. Authentication is shared across versions via
+	// Deps.Auth, which each package's Route composes with its permission.
+	daytona.RegisterRoutes(mux, daytona.Deps{
 		Service:         s.service,
 		Logger:          s.logger,
 		Auth:            s.requireAuth,
-		Builder:         s.builder,
-		Build:           s.build,
+		Audit:           s.audit,
 		ContainerEngine: s.containerEngine,
+		DefaultImage:    s.daytonaDefaultImage,
+		ListGate:        s.listGate,
 	})
 
-	e2b.RegisterRoutes(s.mux, e2b.Deps{
-		Service: s.service,
-		Logger:  s.logger,
-		Auth:    s.requireE2BAuth,
+	e2b.RegisterRoutes(mux, e2b.Deps{
+		Service:         s.service,
+		Logger:          s.logger,
+		Auth:            s.requireE2BAuth,
+		Audit:           s.audit,
+		TemplateMapJSON: s.e2bTemplateMapJSON,
+		ClientID:        s.e2bClientID,
+		ListGate:        s.listGate,
 	})
 
-	apiv1.RegisterRoutes(s.mux, apiv1.Deps{
+	runloop.RegisterRoutes(mux, runloop.Deps{
+		Service:          s.service,
+		Logger:           s.logger,
+		Auth:             s.requireRunloopAuth,
+		Audit:            s.audit,
+		BlueprintMapJSON: s.runloopBlueprintMapJSON,
+		ListGate:         s.listGate,
+	})
+
+	apiv1.RegisterRoutes(mux, apiv1.Deps{
 		Service:         s.service,
 		Logger:          s.logger,
 		Auth:            s.requireAuth,
+		Audit:           s.audit,
 		AuditLimiter:    s.auditLimiter,
-		Builder:         s.builder,
-		Build:           apiv1.BuildConfig{ContextEnabled: s.build.ContextEnabled, Timeout: s.build.Timeout},
 		ContainerEngine: s.containerEngine,
+		ListGate:        s.listGate,
 	})
 
-	// Operator dashboard + expvar. /ui is unauth (static HTML; PAT prompted
-	// in-page), /debug/vars is PAT-gated. See pkg/api/dashboard.go.
-	s.registerDashboard()
+	// Remote MCP (opt-in, SB_MCP_ENABLED). /mcp needs only a valid principal
+	// (pseudo-permission authenticated); its tools call back into this same
+	// handler in-process with the caller's Access handed over (remotemcp
+	// handoff.go), so each tool's inner API call is authorized by that
+	// route's own permission. The origin and host checks still run before
+	// authentication, as before. The outer request writes no api record:
+	// each tool's inner call writes its own, so one tool call is one record
+	// (§5.9). With identity on and an MCP resource in the identity file,
+	// the RFC 9728 metadata is public and the 401 points at it (§5.14).
+	if s.mcp != nil {
+		var authed http.Handler
+		outer := s.mcp.Wrap(func(next http.Handler) http.Handler {
+			authed = apihttp.Router{Authenticate: s.requireMCPAuth}.Route(controlplane.PermAuthenticated, next)
+			return authed
+		})
+		mux.Handle(remotemcp.Path, apihttp.PreAuth(outer, authed))
+		if s.mcpResource != nil {
+			s.registerMCPMetadata(mux)
+		}
+	}
+
+	// Operator dashboard + expvar. /ui is public (static HTML; sign-in
+	// happens in the page), the metrics endpoints are permission-gated. See
+	// pkg/api/dashboard.go.
+	s.registerDashboard(mux)
+}
+
+// route is Route for the routes pkg/api mounts itself (/mcp and the
+// dashboard's metrics): v1 authentication and the v1 403 body.
+func (s *Server) route(perm controlplane.Permission, next http.Handler) http.Handler {
+	return apihttp.Router{Authenticate: s.requireAuth, Audit: s.audit}.Route(perm, next)
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {

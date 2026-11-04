@@ -7,6 +7,8 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+
+	"github.com/aerol-ai/microvm/pkg/auditlog"
 )
 
 // proxyCache caches one ReverseProxy per peer identity and URL. The transport
@@ -80,11 +82,16 @@ func (pc *proxyCache) getForPeer(nodeID, baseURL string, rt http.RoundTripper) (
 			// Mark forwarded so the receiving node can detect a forwarding
 			// loop (would happen if its placement view is stale and it
 			// thinks the request belongs back at us). Receiver returns 421
-			// if it sees the header AND would forward again.
-			req.Header.Set("X-Cluster-Forwarded", "1")
+			// if it sees the header AND would forward again. StampForward
+			// also carries the selected team and the correlation id, the
+			// same markers every other forward path sets.
+			stampForwardFromContext(req)
 		},
 		Transport: rt,
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
+			// The peer never ran the call, so it wrote no record: the edge
+			// records the failed forward instead (§5.9).
+			auditlog.MarkForwardFailed(r.Context())
 			http.Error(w, "cluster: forward to "+baseURL+" failed: "+err.Error(), http.StatusBadGateway)
 		},
 	}
@@ -116,7 +123,7 @@ func forwardHTTPWithMetrics(mtlsProxies *proxyCache, peerClient func(string) *ht
 	var err error
 	done := beginOwnerForward()
 	defer func() { done(err) }()
-	if r.Header.Get("X-Cluster-Forwarded") == "1" {
+	if r.Header.Get(HeaderForwarded) == "1" {
 		// Loop detection: someone forwarded to us, and we're about to forward
 		// onward. Return 421 so the original client retries with fresh
 		// placement info instead of bouncing forever.

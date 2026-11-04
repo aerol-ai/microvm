@@ -9,10 +9,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/aerol-ai/microvm/pkg/auditexport"
-	"github.com/aerol-ai/microvm/pkg/controlplane"
 )
 
 func newTestReceiver(t *testing.T, token, hmacKey string) (*receiver, *httptest.Server) {
@@ -203,47 +201,6 @@ func TestReceiverRejectsBadSignatureAndToken(t *testing.T) {
 	}
 }
 
-// The witness surface mirrors controlplane.Witness: heads go in, a receipt
-// comes back, and an unknown node is 404 rather than an empty head — the
-// interface distinguishes "never recorded" from a transport error, and a
-// scenario asserts the former before the first witness interval elapses.
-func TestWitnessStoresHeadsAndReportsUnknownNode(t *testing.T) {
-	_, srv := newTestReceiver(t, "", "")
-
-	if resp, err := srv.Client().Get(srv.URL + "/witness/node-1"); err != nil {
-		t.Fatal(err)
-	} else {
-		resp.Body.Close()
-		if resp.StatusCode != http.StatusNotFound {
-			t.Fatalf("unknown node = %d, want 404", resp.StatusCode)
-		}
-	}
-
-	heads := []controlplane.AuditHead{{NodeID: "node-1", HeadHex: "deadbeef", EventID: "ae-9", Observed: time.Now().UTC()}}
-	blob, _ := json.Marshal(heads)
-	resp, err := srv.Client().Post(srv.URL+"/witness", "application/json", strings.NewReader(string(blob)))
-	if err != nil {
-		t.Fatal(err)
-	}
-	var rcpt controlplane.WitnessReceipt
-	_ = json.NewDecoder(resp.Body).Decode(&rcpt)
-	resp.Body.Close()
-	if rcpt.ReceiptID == "" {
-		t.Fatal("witness returned no receipt id")
-	}
-
-	resp2, err := srv.Client().Get(srv.URL + "/witness/node-1")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer resp2.Body.Close()
-	var got controlplane.AuditHead
-	_ = json.NewDecoder(resp2.Body).Decode(&got)
-	if got.HeadHex != "deadbeef" {
-		t.Fatalf("stored head = %q, want deadbeef", got.HeadHex)
-	}
-}
-
 func TestProbeReturnsLastN(t *testing.T) {
 	_, srv := newTestReceiver(t, "", "")
 	for i := range 3 {
@@ -284,7 +241,6 @@ func TestReceiverRejectsMalformedRequests(t *testing.T) {
 		body   string
 		want   int
 	}{
-		{"witness with non-JSON body", http.MethodPost, "/witness", "not json", http.StatusBadRequest},
 		{"probe with a non-numeric count", http.MethodGet, "/_probe/abc", "", http.StatusBadRequest},
 		{"probe with a negative count", http.MethodGet, "/_probe/-1", "", http.StatusBadRequest},
 		{"chaos with a non-numeric n", http.MethodPost, "/_chaos/fail?n=nope", "", http.StatusBadRequest},
@@ -326,39 +282,6 @@ func TestProbeClampsAndHandlesEmpty(t *testing.T) {
 	}
 	if len(out) != 0 {
 		t.Fatalf("empty receiver returned %d records", len(out))
-	}
-}
-
-// The witness must ignore a head with no node id rather than storing it under
-// "" — a nameless head is unattributable, and silently keeping it would let a
-// scenario "see a witnessed head" that belongs to nobody.
-func TestWitnessSkipsHeadsWithoutNodeID(t *testing.T) {
-	_, srv := newTestReceiver(t, "", "")
-	blob, _ := json.Marshal([]controlplane.AuditHead{{HeadHex: "abc"}, {NodeID: "n1", HeadHex: "def"}})
-	resp, err := srv.Client().Post(srv.URL+"/witness", "application/json", strings.NewReader(string(blob)))
-	if err != nil {
-		t.Fatal(err)
-	}
-	resp.Body.Close()
-	if got := stats(t, srv)["nodes"]; got != 1 {
-		t.Fatalf("nodes = %d, want 1 (the nameless head must be dropped)", got)
-	}
-}
-
-// An unauthorized witness POST must not record anything.
-func TestWitnessRequiresToken(t *testing.T) {
-	_, srv := newTestReceiver(t, "tok", "")
-	blob, _ := json.Marshal([]controlplane.AuditHead{{NodeID: "n1", HeadHex: "abc"}})
-	resp, err := srv.Client().Post(srv.URL+"/witness", "application/json", strings.NewReader(string(blob)))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusUnauthorized {
-		t.Fatalf("status = %d, want 401", resp.StatusCode)
-	}
-	if got := stats(t, srv)["nodes"]; got != 0 {
-		t.Fatalf("nodes = %d, want 0 after a rejected witness post", got)
 	}
 }
 

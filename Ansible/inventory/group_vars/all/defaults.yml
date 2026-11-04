@@ -71,6 +71,38 @@ sandboxd_auto_import_cluster_pat_path: "{{ sandboxd_secrets_dir }}/cluster-pat"
 sandboxd_ssh_host_key_path: /var/lib/sandboxd/ssh_host_ed25519_key
 sandboxd_ssh_host_key_src: ""
 
+# --- S3 Object Lock audit witness (plans/open-audit-witness.md) -------------
+# OFF by default: an empty backend leaves every SB_AUDIT_WITNESS_* line in the
+# env file exactly as it is. Skip-on-empty on purpose, unlike the cluster.yml
+# settings: Terraform writes this block at day 0 from the bucket it created,
+# and a day-2 run with these defaults must not erase it. To turn a witness off,
+# remove the SB_AUDIT_WITNESS_* lines from the env file by hand.
+#
+# Set sandboxd_audit_witness_backend: s3 in local.yml to manage the block from
+# here. The bucket is never created by Ansible; it needs Object Lock,
+# versioning, a default retention of at least SB_SECRET_AUDIT_RETENTION_DAYS,
+# and node-role IAM that includes s3:ListBucket (recipe:
+# setup/runbooks/secrets-and-audit.md, "S3 audit witness"). Empty region,
+# endpoint or path-style values leave the daemon defaults (AWS config region,
+# AWS endpoint, virtual-hosted addressing). The prefix must match the IAM
+# grant.
+sandboxd_audit_witness_backend: ""
+sandboxd_audit_witness_s3_bucket: ""
+sandboxd_audit_witness_s3_prefix: "witness/"
+sandboxd_audit_witness_s3_region: ""
+sandboxd_audit_witness_s3_endpoint: ""
+sandboxd_audit_witness_s3_path_style: false
+
+# Per-host SB_NODE_ID. Set it in host_vars for single servers that use the
+# witness: a single server without SB_NODE_ID witnesses as "standalone", so two
+# servers sharing a bucket would write the same keys, and sandboxd refuses that
+# combination at boot. Must be unique per server sharing the bucket. Cluster
+# nodes already have SB_NODE_ID in cluster.env from cluster-init/cluster-join;
+# leave this empty there. Empty never writes or removes the line, and the play
+# refuses to CHANGE an existing SB_NODE_ID: a new id is a rebuild (runbook:
+# secrets-and-audit, "Rebuild a node under a new SB_NODE_ID").
+sandboxd_node_id: ""
+
 # CNI plugins for SB_CONTAINER_ENGINE=containerd (plans/containerd-engine.md
 # Phase 5). Mirrors scripts/install.sh install_cni_plugins version pin.
 sandboxd_cni_plugins_version: "v1.5.1"

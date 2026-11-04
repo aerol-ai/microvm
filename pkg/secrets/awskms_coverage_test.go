@@ -38,11 +38,12 @@ func TestAWSKMSWrapUnwrapErrorAndContextBranches(t *testing.T) {
 	if err := mapAWSKMSError(nil); err != nil {
 		t.Fatalf("nil map = %v", err)
 	}
-	if !errors.Is(mapAWSKMSError(&types.NotFoundException{}), ErrProviderDenied) {
-		t.Fatal("NotFound must map to denied")
+	// Intended differences (eng D15): a deleted or disabled key is a revoke.
+	if !errors.Is(mapAWSKMSError(&types.NotFoundException{}), ErrKeyRevoked) {
+		t.Fatal("NotFound must map to revoked")
 	}
-	if !errors.Is(mapAWSKMSError(&types.DisabledException{}), ErrProviderUnavailable) {
-		t.Fatal("Disabled must map to unavailable")
+	if !errors.Is(mapAWSKMSError(&types.DisabledException{}), ErrKeyRevoked) {
+		t.Fatal("Disabled must map to revoked")
 	}
 	if !errors.Is(mapAWSKMSError(errors.New("other")), ErrProviderUnavailable) {
 		t.Fatal("unknown must map to unavailable")
@@ -65,6 +66,9 @@ func TestNewAWSKMSAndProviderFactoryGaps(t *testing.T) {
 	store := newMemBlobStore()
 	if _, _, err := NewProvider(ctx, ProviderOptions{Name: "vault", Store: store}); err == nil {
 		t.Fatal("vault must be rejected")
+	}
+	if _, _, err := NewProvider(ctx, ProviderOptions{Name: "pkcs11", Store: store}); err == nil {
+		t.Fatal("pkcs11 must be rejected")
 	}
 	if _, _, err := NewProvider(ctx, ProviderOptions{Name: "unknown", Store: store}); err == nil {
 		t.Fatal("unknown provider must fail")

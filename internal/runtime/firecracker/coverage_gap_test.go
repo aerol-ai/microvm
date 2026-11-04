@@ -764,7 +764,7 @@ func TestStart_PostResumeWarnContinues(t *testing.T) {
 	postResumeVsock := newFakeVsockDialer()
 	postResumeVsock.errOnDialIdx = 2
 	f.driver.SetVsockDialer(postResumeVsock)
-	state, err := f.driver.Start(ctx, "sb-post-resume-warn")
+	state, err := f.driver.StartWithIdentity(ctx, "sb-post-resume-warn", "sb-post-resume-warn", "tok")
 	if err != nil {
 		t.Fatalf("Start: %v", err)
 	}
@@ -814,7 +814,7 @@ func TestStartFromSandboxSnapshot_RollbackWarnPaths(t *testing.T) {
 	client := newFakeClient()
 	client.snapshotLoadErr = os.ErrPermission
 	d.SetClientFactory(func(string) VMMClient { return client })
-	if _, err := d.startFromSandboxSnapshot(context.Background(), sbID); err == nil {
+	if _, err := d.startFromSandboxSnapshot(context.Background(), sbID, "tok"); err == nil {
 		t.Fatal("expected restore failure")
 	}
 
@@ -825,7 +825,7 @@ func TestStartFromSandboxSnapshot_RollbackWarnPaths(t *testing.T) {
 	client.snapshotLoadErr = os.ErrPermission
 	d.SetClientFactory(func(string) VMMClient { return client })
 	d.tapHost = &fakeTapHost{removeErr: os.ErrPermission}
-	if _, err := d.startFromSandboxSnapshot(context.Background(), sbID); err == nil {
+	if _, err := d.startFromSandboxSnapshot(context.Background(), sbID, "tok"); err == nil {
 		t.Fatal("expected restore failure for tap-remove warn path")
 	}
 }
@@ -840,7 +840,7 @@ func TestWriteSandboxSnapshot_RotationPromotesSnapshot(t *testing.T) {
 	handle := &warmDestroyHandle{runDir: runDir}
 	ctx := context.Background()
 	for i := 0; i < 2; i++ {
-		if err := d.writeSandboxSnapshot(ctx, "sb-rotate", handle, client, 3); err != nil {
+		if err := d.writeSandboxSnapshot(ctx, "sb-rotate", handle, client, 3, guestFlushFailed); err != nil {
 			t.Fatalf("writeSandboxSnapshot pass %d: %v", i+1, err)
 		}
 	}
@@ -860,7 +860,7 @@ func TestWriteSandboxSnapshot_HappyPathWithOverlay(t *testing.T) {
 		t.Fatalf("write overlay: %v", err)
 	}
 	handle := &warmDestroyHandle{runDir: runDir}
-	if err := d.writeSandboxSnapshot(context.Background(), "sb-write-ok", handle, client, 42); err != nil {
+	if err := d.writeSandboxSnapshot(context.Background(), "sb-write-ok", handle, client, 42, guestFlushFailed); err != nil {
 		t.Fatalf("writeSandboxSnapshot: %v", err)
 	}
 	manifest, err := d.readSandboxSnapshotManifest("sb-write-ok")

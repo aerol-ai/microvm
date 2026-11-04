@@ -7,8 +7,6 @@ import (
 	"os"
 	"path/filepath"
 	"time"
-
-	"golang.org/x/sys/unix"
 )
 
 // The audit directory's durable overflow buffer. The daemon's audit writer
@@ -43,10 +41,10 @@ func WithFileLock(lockPath string, fn func() error) error {
 		return err
 	}
 	defer lf.Close()
-	if err := unix.Flock(int(lf.Fd()), unix.LOCK_EX); err != nil {
+	if err := lockExclusive(lf); err != nil {
 		return err
 	}
-	defer func() { _ = unix.Flock(int(lf.Fd()), unix.LOCK_UN) }()
+	defer func() { _ = unlock(lf) }()
 	return fn()
 }
 

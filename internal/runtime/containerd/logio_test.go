@@ -49,7 +49,7 @@ func TestCappedWriterBoundsFileSize(t *testing.T) {
 
 func TestTaskLogIOCreatesFile(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "sb.log")
-	creator, closeLog, err := taskLogIO(path)
+	creator, closeLog, err := (&Driver{}).taskLogIO(path)
 	if err != nil {
 		t.Fatalf("taskLogIO: %v", err)
 	}

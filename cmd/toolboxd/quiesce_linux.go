@@ -120,6 +120,57 @@ func (linuxQuiesceOps) SetWallclock(unixNs int64) error {
 	return nil
 }
 
+// SyncFilesystems is sync(2): it writes every filesystem's dirty pages and
+// metadata to disk and returns when the writes are queued to the devices.
+// With ext4's default data=ordered, a journal replay afterwards then finds
+// the file data the metadata points at.
+func (linuxQuiesceOps) SyncFilesystems() error {
+	unix.Sync()
+	return nil
+}
+
+// FIFREEZE and FITHAW are _IOWR('X', 119, int) and _IOWR('X', 120, int) from
+// <linux/fs.h>; golang.org/x/sys/unix does not export them. The encoding is
+// the same on amd64 and arm64.
+const (
+	ioctlFIFREEZE = 0xc0045877
+	ioctlFITHAW   = 0xc0045878
+)
+
+// rootFSPath is the mount point FreezeRoot and ThawRoot act on: the
+// sandbox's disk, the one the host copies. tmpfs mounts (/tmp) need no
+// freeze, and an optional data disk is not part of a snapshot.
+var rootFSPath = "/"
+
+// FreezeRoot is FIFREEZE on the root filesystem: the kernel flushes it,
+// commits the journal so the disk needs no replay, and blocks new writes
+// until FITHAW. Reads and processes carry on. Needs CAP_SYS_ADMIN, which
+// toolboxd has as the guest's PID 1.
+func (linuxQuiesceOps) FreezeRoot() error {
+	return rootFSIoctl(ioctlFIFREEZE, false)
+}
+
+// ThawRoot is FITHAW on the root filesystem. The kernel answers EINVAL for a
+// filesystem that is not frozen; that is success here.
+func (linuxQuiesceOps) ThawRoot() error {
+	return rootFSIoctl(ioctlFITHAW, true)
+}
+
+func rootFSIoctl(request uintptr, notFrozenOK bool) error {
+	f, err := os.Open(rootFSPath)
+	if err != nil {
+		return fmt.Errorf("open %s: %w", rootFSPath, err)
+	}
+	defer f.Close()
+	if errno := ioctlPtr(f.Fd(), request, 0); errno != 0 {
+		if notFrozenOK && errno == syscall.EINVAL {
+			return nil
+		}
+		return fmt.Errorf("ioctl %s: %w", rootFSPath, errno)
+	}
+	return nil
+}
+
 func (linuxQuiesceOps) ConfigureNetwork(cfg guestNetworkConfig) error {
 	if cfg.GuestIP == "" || cfg.GatewayIP == "" || cfg.PrefixLen <= 0 {
 		return fmt.Errorf("incomplete network config: %+v", cfg)

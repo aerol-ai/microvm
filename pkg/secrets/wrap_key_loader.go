@@ -61,17 +61,16 @@ func LoadUpstreamWrapKeyRing(path string) (*UpstreamWrapKeyRing, error) {
 	if path == "" {
 		return nil, errors.New("upstream wrap key path is empty")
 	}
+	if err := RefuseGroupOtherBits(path); err != nil {
+		return nil, err
+	}
 	info, err := os.Stat(path)
 	if err != nil {
 		return nil, err
 	}
-	// The mode check is intentionally strict: any group/world read or any
-	// write bit at all is rejected. Owner-execute is allowed but irrelevant
-	// (regular files shouldn't have it; we don't enforce its absence).
+	// Stricter than the shared rule: this file is never rewritten by
+	// sandboxd, so any write bit is rejected too (want 0400).
 	mode := info.Mode().Perm()
-	if mode&0o077 != 0 {
-		return nil, fmt.Errorf("upstream wrap key file %s has insecure mode %#o; want 0400", path, mode)
-	}
 	if mode&0o200 != 0 {
 		return nil, fmt.Errorf("upstream wrap key file %s is writable (%#o); want 0400", path, mode)
 	}
@@ -118,4 +117,21 @@ func ParseUpstreamWrapKeyRing(raw string) *UpstreamWrapKeyRing {
 		ring.Keys = append(ring.Keys, UpstreamWrapKey{ID: id, Bytes: decoded})
 	}
 	return ring
+}
+
+// RefuseGroupOtherBits refuses a secret file that anyone but its owner can
+// read, write or run. One rule, one message, for every secret file sandboxd
+// loads: the upstream wrap key, the PKCS#11 PIN file and the wrapped server
+// key (eng D14). A caller with a stricter rule adds it after this check.
+// A missing file returns the os.Stat error unchanged, so callers can still
+// test it with errors.Is(err, os.ErrNotExist).
+func RefuseGroupOtherBits(path string) error {
+	info, err := os.Stat(path)
+	if err != nil {
+		return err
+	}
+	if mode := info.Mode().Perm(); mode&0o077 != 0 {
+		return fmt.Errorf("secret file %s has group or other permission bits (%#o); allow only its owner (0400 or 0600)", path, mode)
+	}
+	return nil
 }

@@ -88,7 +88,7 @@ func TestClusterBuildImageWrapCoverageBranches(t *testing.T) {
 	builder := &fakeImageBuilder{}
 
 	t.Run("routed_header_runs_local", func(t *testing.T) {
-		h := &handlers{deps: Deps{Builder: builder, Logger: logger}}
+		h := &handlers{deps: Deps{Service: buildService(builder, buildConfig{}), Logger: logger}}
 		req := httptest.NewRequest(http.MethodPost, "/v1/images/build", strings.NewReader(string(body)))
 		req.Header.Set(clusterImageBuildRoutedHeader, "1")
 		rr := httptest.NewRecorder()
@@ -101,7 +101,7 @@ func TestClusterBuildImageWrapCoverageBranches(t *testing.T) {
 	t.Run("build_nil_cluster", func(t *testing.T) {
 		svc := service.New(config.Config{}, logger, nil, nil, nil, nil, nil, nil, nil)
 		svc.ClearClusterForTest()
-		h := &handlers{deps: Deps{Service: svc, Builder: builder, Logger: logger}}
+		h := &handlers{deps: Deps{Service: withBuilder(svc, builder), Logger: logger}}
 		rr := httptest.NewRecorder()
 		h.clusterBuildImageWrap(rr, httptest.NewRequest(http.MethodPost, "/v1/images/build", strings.NewReader(string(body))))
 		if rr.Code != http.StatusOK {
@@ -134,7 +134,7 @@ func TestClusterBuildImageWrapCoverageBranches(t *testing.T) {
 	t.Run("push_routes_to_worker", func(t *testing.T) {
 		svc := service.New(config.Config{EnableCluster: true, NodeRole: config.NodeRoleServer}, logger, nil, nil, nil, nil, nil, nil, nil)
 		svc.AttachCluster(dockerFanoutCluster("ingress-a", "http://worker.invalid"))
-		h := &handlers{deps: Deps{Service: svc, Builder: builder, Logger: logger}}
+		h := &handlers{deps: Deps{Service: withBuilder(svc, builder), Logger: logger}}
 		pushBody, _ := json.Marshal(buildImageRequest{
 			DockerfileContent: dockerfile,
 			Push:              &buildImagePushSpec{Registry: "registry.example.com", Username: "u", Password: "p"},
@@ -149,7 +149,7 @@ func TestClusterBuildImageWrapCoverageBranches(t *testing.T) {
 	t.Run("context_hashes_route_to_worker", func(t *testing.T) {
 		svc := service.New(config.Config{EnableCluster: true, NodeRole: config.NodeRoleServer}, logger, nil, nil, nil, nil, nil, nil, nil)
 		svc.AttachCluster(dockerFanoutCluster("ingress-a", "http://127.0.0.1:1"))
-		h := &handlers{deps: Deps{Service: svc, Builder: builder, Logger: logger}}
+		h := &handlers{deps: Deps{Service: withBuilder(svc, builder), Logger: logger}}
 		ctxBody, _ := json.Marshal(buildImageRequest{DockerfileContent: dockerfile, ContextHashes: []string{"abc"}})
 		rr := httptest.NewRecorder()
 		h.clusterBuildImageWrap(rr, httptest.NewRequest(http.MethodPost, "/v1/images/build", strings.NewReader(string(ctxBody))))
@@ -167,7 +167,7 @@ func TestClusterBuildImageWrapCoverageBranches(t *testing.T) {
 				{NodeID: "ingress-a", APIURL: "http://ingress-a", Alive: true, Role: config.NodeRoleServer},
 			},
 		})
-		h := &handlers{deps: Deps{Service: svc, Builder: builder, Logger: logger}}
+		h := &handlers{deps: Deps{Service: withBuilder(svc, builder), Logger: logger}}
 		rr := httptest.NewRecorder()
 		h.clusterBuildImageWrap(rr, httptest.NewRequest(http.MethodPost, "/v1/images/build", strings.NewReader(string(body))))
 		if rr.Code != http.StatusServiceUnavailable {
@@ -209,7 +209,7 @@ func TestRunImageBuildOnTargetCoverage(t *testing.T) {
 	builder := &fakeImageBuilder{}
 
 	t.Run("self_local_build", func(t *testing.T) {
-		h := &handlers{deps: Deps{Builder: builder, Logger: logger}}
+		h := &handlers{deps: Deps{Service: buildService(builder, buildConfig{}), Logger: logger}}
 		parent := httptest.NewRequest(http.MethodPost, "/v1/images/build", strings.NewReader(string(body)))
 		parent.Header.Set("Content-Type", "application/json")
 		status, header, respBody, err := h.runImageBuildOnTarget(nil, parent, body, cluster.Member{NodeID: "self"}, true)

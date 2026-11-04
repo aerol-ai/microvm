@@ -1,0 +1,20 @@
+version: 1
+issuers:
+  - name: okta
+    display_name: Acme Okta
+    url: https://acme.okta.com/oauth2/default
+    audiences: [0oa1cli]
+    clients: { cli: 0oa1cli }
+    claims: { username: email, groups: groups }
+  - name: github-actions
+    url: https://token.actions.githubusercontent.com
+    audiences: [aerolvm]
+    claims: { username: sub }
+bindings:                              # first match wins, top to bottom
+  - { issuer: okta, group: platform-admins, role: admin }
+  - { issuer: okta, group: secops, role: auditor }
+  - { issuer: okta, group: "eng | <b>all</b> [x](https://evil.example)", role: viewer, team: "*" }
+  - { issuer: okta, group: payments-eng, role: runner, team: payments }
+  - { issuer: okta, group: ops, role: runner, team: -ops }
+  - { issuer: github-actions, claim: { repository: acme/payments, ref: refs/heads/main }, role: runner, team: payments }
+deny_subjects: ["okta:00u9eve"]

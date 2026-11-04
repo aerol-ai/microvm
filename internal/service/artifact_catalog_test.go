@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/aerol-ai/microvm/internal/cluster"
 	"github.com/aerol-ai/microvm/internal/config"
@@ -582,14 +583,15 @@ func TestTemplatePushMetadataInvalidatesTheCatalogue(t *testing.T) {
 
 	// The reconciler's own store surface, as the daemon wires it.
 	pushStore := svc.TemplatePushStore(svc.store)
-	if err := pushStore.SetTemplatePushState(ctx, "tpl-push", models.TemplatePushStatePushing, ""); err != nil {
-		t.Fatal(err)
+	if changed, err := svc.store.MarkTemplatePushPending(ctx, "tpl-push"); err != nil || !changed {
+		t.Fatalf("mark pending = %v, %v", changed, err)
 	}
-	if err := pushStore.UpdateTemplatePushDistribution(ctx, "tpl-push", "aocr.example.com/tpl-push:latest", "sha256:abc"); err != nil {
-		t.Fatal(err)
+	_, claimedAt, claimed, err := pushStore.ClaimTemplatePush(ctx, "tpl-push")
+	if err != nil || !claimed {
+		t.Fatalf("claim = %v, %v", claimed, err)
 	}
-	if err := pushStore.SetTemplatePushState(ctx, "tpl-push", models.TemplatePushStateActive, ""); err != nil {
-		t.Fatal(err)
+	if applied, err := pushStore.CompleteTemplatePush(ctx, "tpl-push", claimedAt, "aocr.example.com/tpl-push:latest", "sha256:abc"); err != nil || !applied {
+		t.Fatalf("complete = %v, %v", applied, err)
 	}
 	svc.ReconcileArtifactCatalog(ctx)
 
@@ -679,9 +681,25 @@ func TestTemplatePushStoreSeamBehaviour(t *testing.T) {
 	if _, err := seam.ListTemplatesPendingPush(ctx); err != nil {
 		t.Fatalf("pending-push read through the seam: %v", err)
 	}
-	// A failing write is reported, not swallowed.
-	if err := seam.SetTemplatePushState(ctx, "tpl-missing", models.TemplatePushStateActive, ""); err == nil {
-		t.Fatal("a push-state write for a missing row reported success")
+	// A write that matches nothing is reported as such, not as a success.
+	if _, _, claimed, err := seam.ClaimTemplatePush(ctx, "tpl-missing"); err != nil || claimed {
+		t.Fatalf("claim of a missing row = %v, %v", claimed, err)
+	}
+	if applied, err := seam.ReleaseTemplatePush(ctx, "tpl-missing", time.Now(), models.TemplatePushStateError, "x"); err != nil || applied {
+		t.Fatalf("release of a missing row = %v, %v", applied, err)
+	}
+	if applied, err := seam.CompleteTemplatePush(ctx, "tpl-missing", time.Now(), "ref", "sha256:x"); err != nil || applied {
+		t.Fatalf("completion of a missing row = %v, %v", applied, err)
+	}
+	if changed, err := svc.store.MarkTemplatePushPending(ctx, "tpl-seam"); err != nil || !changed {
+		t.Fatalf("mark pending = %v, %v", changed, err)
+	}
+	_, claimedAt, claimed, err := seam.ClaimTemplatePush(ctx, "tpl-seam")
+	if err != nil || !claimed {
+		t.Fatalf("claim = %v, %v", claimed, err)
+	}
+	if applied, err := seam.ReleaseTemplatePush(ctx, "tpl-seam", claimedAt, models.TemplatePushStateError, "registry 502"); err != nil || !applied {
+		t.Fatalf("release = %v, %v", applied, err)
 	}
 
 	var none *Service
@@ -723,5 +741,48 @@ func TestArtifactCatalogHolderIdentityDistinguishesRetryFromReseed(t *testing.T)
 	// The untouched kind's retry stays idempotent.
 	if other := svc.artifactCatalogHolder(cluster.ArtifactKindJSBundle); other != svc.artifactCatalogHolder(cluster.ArtifactKindJSBundle) {
 		t.Fatal("the other kind's identity moved when this kind re-seeded")
+	}
+}
+
+// A bundle listed right after it was uploaded must be in the list. In cluster
+// mode the leader answers GET /v1/js-bundles for every worker that has
+// published from the replicated catalogue, without asking the worker, and the
+// maintenance tick republishes only every 30s, so a fresh upload was missing
+// from the list (UC-105, UC-168) and a deleted one stayed in it. Upload and
+// delete now publish before they return, as CreateTemplate does (#496).
+func TestJSBundleUploadAndDeletePublishTheCatalogueBeforeReturning(t *testing.T) {
+	svc, cl := newCatalogService(t)
+	bundleStore, err := jsbundle.NewStore(jsbundle.StoreConfig{Dir: filepath.Join(t.TempDir(), "bundles")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc.SetIsolateBundleStore(bundleStore)
+	svc.cfg.EnableIsolate = true
+	ctx := context.Background()
+	// The boot publish: from here on the aggregator answers for this node
+	// from the catalogue alone.
+	svc.ReconcileArtifactCatalog(ctx)
+
+	created, err := svc.CreateJSBundle(ctx, models.CreateJSBundleRequest{Name: "fresh", Source: jsBundleSrc})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cl.rowIDs(cluster.ArtifactKindJSBundle); len(got) != 1 || got[0] != created.Digest {
+		t.Fatalf("catalogue right after upload = %v, want [%s]: a list through the leader would miss it", got, created.Digest)
+	}
+
+	if err := svc.DeleteJSBundle(ctx, created.ModuleRef); err != nil {
+		t.Fatal(err)
+	}
+	if got := cl.rowIDs(cluster.ArtifactKindJSBundle); len(got) != 0 {
+		t.Fatalf("catalogue right after delete = %v, want none: a list through the leader would still show it", got)
+	}
+
+	// A publish failure must not fail the upload; the tick retries it.
+	cl.mu.Lock()
+	cl.failing = true
+	cl.mu.Unlock()
+	if _, err := svc.CreateJSBundle(ctx, models.CreateJSBundleRequest{Name: "later", Source: jsBundleSrc + "\n"}); err != nil {
+		t.Fatalf("a catalogue publish failure failed the upload: %v", err)
 	}
 }

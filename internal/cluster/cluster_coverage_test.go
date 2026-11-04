@@ -259,6 +259,18 @@ func TestAgentPlacementMutationsViaControlPlane(t *testing.T) {
 			}
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(PlacementLookupResponse{SandboxID: id, Placement: p})
+		case r.Method == http.MethodPost && r.URL.Path == PublicInternalPlacementsByIDsPath && r.URL.Query().Get("authoritative") == "true":
+			// CancelReservation's leader read.
+			var req placementsByIDsRequest
+			_ = json.NewDecoder(r.Body).Decode(&req)
+			out := map[string]Placement{}
+			for _, id := range req.IDs {
+				if p, ok := placements[id]; ok {
+					out[id] = p
+				}
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(out)
 		case r.Method == http.MethodPost && r.URL.Path == PublicInternalPlacementsByIDsPath:
 			http.Error(w, "batch unavailable", http.StatusServiceUnavailable)
 		default:
@@ -653,7 +665,7 @@ func TestNoopExtraBranches(t *testing.T) {
 	if row, created, err := n.VolumeUpsert(ctx, models.Volume{Tenant: "t", Name: "n", ID: "id-1"}, 0); err != nil || !created || row.ID != "id-1" {
 		t.Fatalf("VolumeUpsert row=%+v created=%v err=%v", row, created, err)
 	}
-	if _, _, err := n.OwnerOfName("missing"); !errors.Is(err, ErrUnknownSandbox) {
+	if _, _, err := n.OwnerOfName("", "missing"); !errors.Is(err, ErrUnknownSandbox) {
 		t.Fatalf("OwnerOfName error=%v", err)
 	}
 	if _, err := n.SelectPlacement(capacity.Request{CPU: 1, MemoryMB: 1}); err != nil {

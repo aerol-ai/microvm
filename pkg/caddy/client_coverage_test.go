@@ -47,7 +47,7 @@ func TestL4RouteSliceAndTLSMuxHelpers(t *testing.T) {
 			}}},
 		},
 	}
-	updated, changed := ensureTLSMuxFallback(server, ":443", "127.0.0.1:8443")
+	updated, changed := ensureTLSMuxFallback(server, ":443", "127.0.0.1:8443", false)
 	if !changed {
 		t.Fatal("expected server mutation")
 	}
@@ -214,7 +214,7 @@ func TestEnsureLayer4UpdatesExistingMuxServer(t *testing.T) {
 
 func TestEnsureLayer4SkipsWhenMuxAlreadyCurrent(t *testing.T) {
 	ctx := context.Background()
-	fallback := tlsMuxFallbackRoute("127.0.0.1:8443")
+	fallback := tlsMuxFallbackRoute("127.0.0.1:8443", false)
 	fake := newFakeCaddy(t)
 	fake.layer4Exists = true
 	fake.l4Servers[tlsMuxServerID] = map[string]any{

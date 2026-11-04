@@ -1,0 +1,15 @@
+name: cluster-3-mixed-wrapped-kms
+capabilities:
+  - docker
+  - domain
+  - cluster
+  - secrets
+  - secrets-kms
+  - cluster-mtls
+  # Built with Terraform key_custody = "wrapped": install.sh and
+  # cluster-init.sh get --key-custody wrapped, so the server key is only
+  # ever wrapped by the real KMS key (plans/customer-key-custody.md §3).
+  - key-custody-kms-wrapped
+disruptive: true
+
+expected_members: 3

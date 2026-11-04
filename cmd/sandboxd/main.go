@@ -7,8 +7,10 @@ import (
 	"os/signal"
 	"syscall"
 
+	"github.com/aerol-ai/microvm/internal/egress/gatewayd"
 	"github.com/aerol-ai/microvm/pkg/daemon"
 	"github.com/aerol-ai/microvm/pkg/isolate"
+	"github.com/aerol-ai/microvm/pkg/secrets/pkcs11"
 	"github.com/aerol-ai/microvm/pkg/wasm/worker"
 )
 
@@ -17,22 +19,17 @@ var (
 	runWasmWorkerCLI       = worker.RunCLI
 	runWasmResidentHostCLI = worker.RunCLIResident
 	runIsolateJailShim     = isolate.RunJailShim
+	runEgressGatewayCLI    = gatewayd.RunCLI
+	runPKCS11Helper        = pkcs11.RunHelper
 	osExit                 = os.Exit
 )
 
-// providerFactory is nil in every shipped build, which is what makes this the
-// open-source entrypoint (see the comment on main below). It is a variable
-// only so the integration harness can supply a real controlplane.Provider
-// behind an explicit build tag — enterprise mode requires a non-noop Witness,
-// and without one the daemon correctly refuses to start, which would make the
-// enterprise scenarios untestable.
-//
-// Default file: always nil. See provider_itest.go, which is compiled ONLY with
-// `-tags itestwitness`. A release build cannot pick it up by accident.
-var providerFactory daemon.ProviderFactory
-
+// run passes a nil provider factory, which is what makes this the open-source
+// entrypoint (see the comment on main below). There is no hook to change it:
+// enterprise mode gets its witness from SB_AUDIT_WITNESS_BACKEND, which
+// pkg/daemon resolves, so the integration harness runs this exact binary too.
 func run(ctx context.Context, logger *slog.Logger) error {
-	return runDaemon(ctx, logger, providerFactory)
+	return runDaemon(ctx, logger, nil)
 }
 
 // cmd/sandboxd is the open-source entrypoint. It passes a nil provider factory,
@@ -43,6 +40,28 @@ func run(ctx context.Context, logger *slog.Logger) error {
 func main() {
 	if len(os.Args) >= 2 && os.Args[1] == "--wasm-worker" {
 		if err := runWasmWorkerCLI(os.Args[2:]); err != nil {
+			os.Stderr.WriteString(err.Error() + "\n")
+			osExit(1)
+		}
+		return
+	}
+
+	// Server-key custody tool (plans/customer-key-custody.md §3). Runs
+	// outside systemd and never opens the database.
+	if len(os.Args) >= 2 && os.Args[1] == keySubcommand {
+		if err := runKeyCLI(os.Args[2:], os.Stdout); err != nil {
+			os.Stderr.WriteString("sandboxd key: " + err.Error() + "\n")
+			osExit(1)
+		}
+		return
+	}
+
+	// PKCS#11 helper: the only process that loads the HSM vendor library
+	// (plans/customer-key-custody.md §2, eng D5). Started and supervised by
+	// sandboxd over a 0600 Unix socket, so a vendor crash or hang costs a
+	// helper restart, never the daemon.
+	if len(os.Args) >= 2 && os.Args[1] == pkcs11.HelperFlag {
+		if err := runPKCS11Helper(os.Args[2:]); err != nil {
 			os.Stderr.WriteString(err.Error() + "\n")
 			osExit(1)
 		}
@@ -77,6 +96,17 @@ func main() {
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
+
+	// Egress gateway: its own long-lived process under its own systemd unit
+	// (plans/egress-domain-filtering.md D9), so sandboxd restarts never
+	// interrupt hostname-filtered egress. Same binary, new subcommand.
+	if len(os.Args) >= 2 && os.Args[1] == gatewayd.Subcommand {
+		if err := runEgressGatewayCLI(ctx, logger); err != nil {
+			logger.Error("egress gateway exited with error", "error", err)
+			osExit(1)
+		}
+		return
+	}
 
 	if err := run(ctx, logger); err != nil {
 		logger.Error("sandboxd exited with error", "error", err)

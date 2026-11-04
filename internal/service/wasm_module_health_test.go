@@ -277,7 +277,7 @@ func TestRunWasmModuleGC(t *testing.T) {
 
 	svc.runWasmModuleGC(ctx, time.Now())
 
-	_, err := st.GetWasmModule(ctx, "mod-1")
+	_, err := st.GetWasmModule(ctx, "", "mod-1")
 	if err == nil {
 		t.Fatal("expected module to be deleted")
 	}
@@ -316,7 +316,7 @@ func TestRunWasmModuleGCWithRuntimeRemovesImages(t *testing.T) {
 	if len(rt.removeImages) != 1 || rt.removeImages[0] != "rtdigest" {
 		t.Fatalf("removeImages = %v, want [rtdigest]", rt.removeImages)
 	}
-	if _, err := st.GetWasmModule(ctx, "mod-rt"); err == nil {
+	if _, err := st.GetWasmModule(ctx, "", "mod-rt"); err == nil {
 		t.Fatal("module should have been deleted")
 	}
 
@@ -447,7 +447,7 @@ func TestWasmModuleGCEdgeBranches(t *testing.T) {
 			logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
 		}
 		svc.runWasmModuleGC(ctx, time.Now())
-		if _, err := st.GetWasmModule(ctx, "mod-ref"); err != nil {
+		if _, err := st.GetWasmModule(ctx, "", "mod-ref"); err != nil {
 			t.Fatalf("module should remain after reference-check error: %v", err)
 		}
 	})
@@ -488,7 +488,7 @@ func TestWasmModuleGCEdgeBranches(t *testing.T) {
 			wasm:   wasmModuleGCRuntime{removeErr: errors.New("remove failed")},
 		}
 		svc.runWasmModuleGC(ctx, time.Now())
-		if _, err := st.GetWasmModule(ctx, "mod-rm"); err == nil {
+		if _, err := st.GetWasmModule(ctx, "", "mod-rm"); err == nil {
 			t.Fatal("row should be deleted despite remove failure")
 		}
 	})
@@ -591,10 +591,10 @@ func TestWasmModuleGCBranchCoverage(t *testing.T) {
 	}
 	svc.runWasmModuleGC(ctx, time.Now())
 
-	if _, err := st.GetWasmModule(ctx, "mod-ref"); err != nil {
+	if _, err := st.GetWasmModule(ctx, "", "mod-ref"); err != nil {
 		t.Fatalf("referenced module should remain: %v", err)
 	}
-	if _, err := st.GetWasmModule(ctx, "mod-orphan"); err == nil {
+	if _, err := st.GetWasmModule(ctx, "", "mod-orphan"); err == nil {
 		t.Fatal("unreferenced module should be deleted")
 	}
 	if !wasmPathUnderDir(dir, dir) {
@@ -651,7 +651,7 @@ func TestRunWasmModuleGCAdditionalBranches(t *testing.T) {
 		if _, err := os.Stat(modPath); !os.IsNotExist(err) {
 			t.Fatalf("module file should be deleted, stat err=%v", err)
 		}
-		if _, err := st.GetWasmModule(ctx, "mod-file"); err == nil {
+		if _, err := st.GetWasmModule(ctx, "", "mod-file"); err == nil {
 			t.Fatal("module row should be deleted")
 		}
 	})
@@ -704,7 +704,7 @@ func TestRunWasmModuleGCAdditionalBranches(t *testing.T) {
 		if len(rt.removeImages) != 1 || rt.removeImages[0] != "blankdigest" {
 			t.Fatalf("removeImages = %v, want [blankdigest]", rt.removeImages)
 		}
-		if _, err := st.GetWasmModule(ctx, "mod-digest"); err == nil {
+		if _, err := st.GetWasmModule(ctx, "", "mod-digest"); err == nil {
 			t.Fatal("digest module row should be deleted")
 		}
 	})
@@ -756,7 +756,7 @@ func TestRunWasmModuleGCAdditionalBranches(t *testing.T) {
 		if _, err := os.Stat(modPath); err != nil {
 			t.Fatalf("out-of-tree module file should remain, stat err=%v", err)
 		}
-		if _, err := st.GetWasmModule(ctx, "mod-outside"); err == nil {
+		if _, err := st.GetWasmModule(ctx, "", "mod-outside"); err == nil {
 			t.Fatal("out-of-tree module row should be deleted")
 		}
 	})

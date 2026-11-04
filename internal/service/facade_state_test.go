@@ -277,3 +277,51 @@ func expvarMapValue(metric *expvar.Map, key string) int64 {
 	}
 	return parsed
 }
+
+// ListCompatState is owner-scoped: a user token sees only its own sandboxes'
+// facade state, never another tenant's, and no longer scans the whole fleet's
+// rows on each list (D13). Operator callers still see everything.
+func TestListCompatStateOwnerScoped(t *testing.T) {
+	ctx := context.Background()
+	svc, st := newFacadeStateTestService(t)
+
+	mk := func(id, owner, state string) {
+		now := time.Now().UTC()
+		if err := st.Create(ctx, &models.Sandbox{
+			ID: id, Image: "alpine:3.20", Status: models.SandboxStatusStarted,
+			ContainerID: "ctr-" + id, ContainerIP: "10.0.0.1", OwnerRef: owner,
+			CPU: 1, MemoryMB: 256, CreatedAt: now, UpdatedAt: now, LastActiveAt: now,
+		}); err != nil {
+			t.Fatalf("create %s: %v", id, err)
+		}
+		if err := svc.UpsertCompatState(ctx, id, models.FacadeE2B, state); err != nil {
+			t.Fatalf("upsert %s: %v", id, err)
+		}
+	}
+	mk("sb-acme", "acme", `{"v":"a"}`)
+	mk("sb-globex", "globex", `{"v":"g"}`)
+
+	// A user token sees only its own row.
+	acme, err := svc.ListCompatState(userCtx("acme"), models.FacadeE2B)
+	if err != nil {
+		t.Fatalf("list acme: %v", err)
+	}
+	if len(acme) != 1 {
+		t.Fatalf("acme sees %d rows, want 1: %v", len(acme), acme)
+	}
+	if _, ok := acme["sb-acme"]; !ok {
+		t.Fatalf("acme missing its own row: %v", acme)
+	}
+	if _, leaked := acme["sb-globex"]; leaked {
+		t.Fatalf("acme leaked globex's compat state")
+	}
+
+	// The operator (unscoped) still sees every tenant's row.
+	all, err := svc.ListCompatState(operatorCtx(), models.FacadeE2B)
+	if err != nil {
+		t.Fatalf("list operator: %v", err)
+	}
+	if len(all) != 2 {
+		t.Fatalf("operator sees %d rows, want 2: %v", len(all), all)
+	}
+}

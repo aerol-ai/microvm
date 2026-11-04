@@ -28,7 +28,7 @@ func TestNoopAdditionalMethods(t *testing.T) {
 	if n.SelfAPIURL() != "http://localhost:21212" {
 		t.Fatalf("SelfAPIURL() = %q", n.SelfAPIURL())
 	}
-	if _, _, err := n.OwnerOfName("demo"); !errors.Is(err, ErrUnknownSandbox) {
+	if _, _, err := n.OwnerOfName("", "demo"); !errors.Is(err, ErrUnknownSandbox) {
 		t.Fatalf("OwnerOfName() error = %v, want ErrUnknownSandbox", err)
 	}
 	if n.SpecOf("demo") != nil {

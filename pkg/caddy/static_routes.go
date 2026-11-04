@@ -85,17 +85,21 @@ func (c *Client) StaticSandboxRoute(spec StaticRouteSpec) map[string]any {
 				},
 				// Taken whenever the responder answers NXDOMAIN: wake, 503,
 				// WASM/isolate mediators, masked hosts, unknown hosts.
-				"upstreams":      []map[string]any{{"dial": spec.RouterAddr}},
-				"flush_interval": -1,
+				"upstreams":          []map[string]any{{"dial": spec.RouterAddr}},
+				"flush_interval":     -1,
+				"stream_close_delay": streamCloseDelay,
 			},
 		},
 	}
 }
 
 // StaticIngressRoutes are the tls-mux routes, in order (see the file comment).
+// Routes 0 and 1 hand the connection to the same HTTPS site the tls-mux
+// fallback does, so they send the same PROXY header when the flag is on:
+// route 1 carries every API request on an ingress-proxy-routing node.
 func (c *Client) StaticIngressRoutes(spec StaticRouteSpec) []map[string]any {
 	fallback := func() []map[string]any {
-		return []map[string]any{{"handler": "proxy", "upstreams": []map[string]any{{"dial": []string{c.l4TLSFallback}}}}}
+		return []map[string]any{tlsFallbackProxy(c.l4TLSFallback, c.l4FallbackProxyProtocol)}
 	}
 	return []map[string]any{
 		{
@@ -180,12 +184,20 @@ func (c *Client) RemoveStaticRoutes(ctx context.Context) error {
 }
 
 // ensureRouteAt PATCHes /id/{id} if present, and otherwise inserts at
-// position(pos) in the route list.
+// position(pos) in the route list. The index is computed from a GET of the
+// list, so the whole sequence holds the admin lock: an insert by another
+// writer in between would shift the list under the computed index.
 func (c *Client) ensureRouteAt(ctx context.Context, id, routesPath string, route map[string]any, position func([]map[string]any) int) error {
 	body, err := json.Marshal(route)
 	if err != nil {
 		return fmt.Errorf("marshal static route %s: %w", id, err)
 	}
+	return c.withAdminLock(ctx, func(ctx context.Context) error {
+		return c.ensureRouteAtLocked(ctx, id, routesPath, body, position)
+	})
+}
+
+func (c *Client) ensureRouteAtLocked(ctx context.Context, id, routesPath string, body []byte, position func([]map[string]any) int) error {
 	status, err := c.sendJSON(ctx, http.MethodPatch, c.baseURL+"/id/"+id, body)
 	if err != nil {
 		return err

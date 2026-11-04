@@ -14,6 +14,7 @@ import (
 
 	"github.com/aerol-ai/microvm/internal/cluster"
 	"github.com/aerol-ai/microvm/internal/config"
+	"github.com/aerol-ai/microvm/internal/runtime"
 	storepkg "github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/caddy"
 	"github.com/aerol-ai/microvm/pkg/capacity"
@@ -34,6 +35,7 @@ type recordingRuntime struct {
 	createState      *models.SandboxRuntimeState
 	createErr        error
 	lastCreateReq    models.CreateSandboxRequest
+	lastCreateMounts []mounts.ContainerBind
 	lastCreateID     string
 	lastToolboxToken string
 
@@ -69,9 +71,10 @@ type leaderCluster struct {
 
 func (c *leaderCluster) Leader() string { return c.leader }
 
-func (r *recordingRuntime) Create(_ context.Context, req models.CreateSandboxRequest, sandboxID, toolboxToken string, _ []mounts.ContainerBind) (*models.SandboxRuntimeState, error) {
+func (r *recordingRuntime) Create(_ context.Context, req models.CreateSandboxRequest, sandboxID, toolboxToken string, binds []mounts.ContainerBind) (*models.SandboxRuntimeState, error) {
 	r.createCalls++
 	r.lastCreateReq = req
+	r.lastCreateMounts = binds
 	r.lastCreateID = sandboxID
 	r.lastToolboxToken = toolboxToken
 	if r.createErr != nil {
@@ -128,7 +131,8 @@ func (r *recordingRuntime) Inspect(_ context.Context, ref string) (*models.Sandb
 			return &copy, nil
 		}
 	}
-	return &models.SandboxRuntimeState{}, nil
+	// What a real driver answers for a container it has never heard of.
+	return nil, fmt.Errorf("container %s: %w", ref, runtime.ErrInstanceNotFound)
 }
 
 func (r *recordingRuntime) ListManaged(_ context.Context) (map[string]*models.SandboxRuntimeState, error) {

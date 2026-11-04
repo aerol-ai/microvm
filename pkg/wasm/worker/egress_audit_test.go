@@ -474,3 +474,45 @@ func TestPostOrSpillWorkerEgressTreatsThrottleAsFinal(t *testing.T) {
 		t.Fatalf("throttled +%d ipc_fail +%d, want 1/0", workerEgressThrottled.Value()-throttled, workerEgressIPCFail.Value()-ipcFail)
 	}
 }
+
+// TestWorkerEgressDenialOutcome (H5): a denial job tells the daemon its
+// outcome over the ingest and in the spill; a connection job sends none.
+func TestWorkerEgressDenialOutcome(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	port := strings.TrimPrefix(ln.Addr().String(), "127.0.0.1:")
+	gotCh := make(chan map[string]string, 2)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/internal/audit/egress", func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		var m map[string]string
+		_ = json.Unmarshal(raw, &m)
+		gotCh <- m
+		w.WriteHeader(http.StatusAccepted)
+	})
+	go http.Serve(ln, mux)
+	postOrSpillWorkerEgress(egressAuditJob{port: port, capability: "cap", sandboxID: "sb-1", network: "tcp",
+		address: "evil.example:443", deniedReason: "host_not_allowed"})
+	select {
+	case m := <-gotCh:
+		if m["result"] != "failure" || m["reason"] != "host_not_allowed" {
+			t.Fatalf("denial body = %+v", m)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("ingest not called")
+	}
+
+	dir := t.TempDir()
+	spill := newWorkerEgressSpiller(dir, "n1")
+	postOrSpillWorkerEgress(egressAuditJob{port: "1", capability: "cap", spill: spill, sandboxID: "sb-1",
+		network: "tcp", address: "evil.example:443", deniedReason: "sni_mismatch"})
+	if n, err := spill.drainOnce(nil); err != nil || n != 1 {
+		t.Fatalf("drain = %d, %v", n, err)
+	}
+	if got := readWorkerSpill(t, dir); len(got) != 1 || got[0].Result != "failure" || got[0].Reason != "sni_mismatch" {
+		t.Fatalf("spilled denial = %+v", got)
+	}
+}

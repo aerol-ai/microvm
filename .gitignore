@@ -13,6 +13,8 @@ config/secrets.yml
 node_modules/
 sdk/typescript/node_modules
 docs/.astro/
+# Local wrangler state from `npm run deploy` or `wrangler dev`.
+docs/.wrangler/
 # Shared Terraform tfvars (read by Terraform via scripts/terraform.sh).
 # The committed sibling is config/terraform.tfvars.example.
 config/terraform.tfvars

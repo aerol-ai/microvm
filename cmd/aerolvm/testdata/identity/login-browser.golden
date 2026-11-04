@@ -1,0 +1,3 @@
+aerolvm: sign in with  [1] Acme Okta  [2] Google
+Choose [1]: aerolvm: opening your browser to sign in with Acme Okta. If it doesn't open, visit: <url>
+aerolvm: logged in to https://api.acme.dev as alice@acme.com (role runner, team payments) through Acme Okta. The login is saved in <path>, readable only by you.

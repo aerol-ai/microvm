@@ -165,6 +165,20 @@ var ErrNoPlacementTarget = errors.New("cluster: no worker placement target avail
 // client can tell "re-create the artifact" from "wait for capacity".
 var ErrArtifactNodeUnavailable = fmt.Errorf("cluster: the node holding this artifact is unavailable: %w", ErrNoPlacementTarget)
 
+// ErrNoEgressGatewayTarget is ErrNoPlacementTarget's form for a gateway-mode
+// create (hostname egress rules) when no candidate node has a ready egress
+// gateway (plans/egress-domain-filtering.md CEO D20). It stays an
+// ErrNoPlacementTarget so every existing 503 mapping still applies.
+var ErrNoEgressGatewayTarget = fmt.Errorf("%w: no node has a ready egress gateway for hostname egress rules", ErrNoPlacementTarget)
+
+// ErrClusterAtCapacity is ErrNoPlacementTarget's form when every worker that
+// could run the request is full: its CPU, memory or disk budget is spent, or
+// its network-slot pool for the runtime has no free slot. It stays an
+// ErrNoPlacementTarget so every existing 503 + Retry-After mapping applies;
+// its message says "capacity", so a client reading it can tell a full fleet
+// from a fleet that cannot run the request at all.
+var ErrClusterAtCapacity = fmt.Errorf("%w: every worker that can run this sandbox is at capacity (cpu, memory, disk or network slots)", ErrNoPlacementTarget)
+
 // ErrInvalidTopology is returned when the live cluster shape violates a
 // production topology invariant. API layers translate this to 503 so clients
 // retry after the operator fixes membership instead of treating it as a
@@ -204,6 +218,10 @@ const (
 	// (promoting servers or adding workers). A long back-off keeps clients
 	// from busy-retrying while the human change is in flight.
 	InvalidTopologyRetryAfterSeconds = 300
+	// LeaderChangeRetryAfterSeconds is the hint for a write that found no
+	// reachable leader (IsLeaderUnavailable). An election settles within a
+	// few heartbeats, so a short back-off.
+	LeaderChangeRetryAfterSeconds = 2
 )
 
 // PlacementState distinguishes a reservation (capacity held, no docker yet)
@@ -386,9 +404,15 @@ type Placement struct {
 	// false means "not public, or recorded by a build that predates this
 	// field"; placementAllowsPublicTraffic still consults Spec when present,
 	// so a legacy row behaves exactly as before until its next write.
-	PublicTraffic bool   `json:"public_traffic,omitempty"`
-	SecretRef     string `json:"secret_ref,omitempty"`
-	SecretVersion int    `json:"secret_version,omitempty"`
+	PublicTraffic bool `json:"public_traffic,omitempty"`
+	// EgressProfiles / EgressInlineHostnames mirror Spec.EgressProfiles and
+	// the hostname count of Spec.NetworkAllowOut on the HOT row, for the
+	// FSM's profile reference index and union-cap check (D21). Empty for a
+	// sandbox without profiles.
+	EgressProfiles        []string `json:"egress_profiles,omitempty"`
+	EgressInlineHostnames int      `json:"egress_inline_hostnames,omitempty"`
+	SecretRef             string   `json:"secret_ref,omitempty"`
+	SecretVersion         int      `json:"secret_version,omitempty"`
 	// SecretRecipients is the seal recipient set recorded at reserve time
 	// (owner + N backups). The create target seals to this set and must not
 	// recompute it. It is empty only when the placement has no replicated
@@ -475,14 +499,20 @@ type Member struct {
 	// (config.EffectivePublicHost). Aggregated by Cluster.IngressTargets to
 	// answer the DNS-helper API. Empty for peers without a public host set
 	// or running pre-PublicHost builds.
-	PublicHost string            `json:"public_host,omitempty"`
-	Alive      bool              `json:"alive"`
-	Capacity   capacity.Snapshot `json:"capacity"`
+	PublicHost string `json:"public_host,omitempty"`
+	// FSMOpsVersion is the peer's gossiped FSM op set (0 for older builds).
+	FSMOpsVersion int               `json:"fsm_ops_version,omitempty"`
+	Alive         bool              `json:"alive"`
+	Capacity      capacity.Snapshot `json:"capacity"`
 	// CapacityUpdatedUnix is when this node's last capacity heartbeat was
 	// observed by the scheduler. CapacityStale means the last heartbeat is
 	// missing or too old for placement admission.
 	CapacityUpdatedUnix int64 `json:"capacity_updated_unix,omitempty"`
 	CapacityStale       bool  `json:"capacity_stale,omitempty"`
+	// PATScope is the peer's gossiped SB_PAT_SCOPE: "host", or empty for
+	// the default "any" (and for older builds). It feeds the
+	// aerolvm_pat_scope_drift gauge and grants nothing.
+	PATScope string `json:"pat_scope,omitempty"`
 }
 
 // LocalSandboxState is one entry in the boot-time AssertOwnership payload.
@@ -598,11 +628,17 @@ type Client interface {
 	// ErrUnknownSandbox if no placement record exists.
 	OwnerOf(sandboxID string) (OwnerInfo, error)
 
-	// OwnerOfName resolves a cluster-wide sandbox name to its sandbox ID and
-	// current owner. Names are indexed from replicated specs and exist for
-	// facade APIs that accept either ID or name. Returns ErrUnknownSandbox if
-	// no placement record claims name.
-	OwnerOfName(name string) (string, OwnerInfo, error)
+	// OwnerOfName resolves a sandbox name within ownerRef's namespace to its
+	// sandbox ID and current owner. Names are unique per owner and indexed
+	// from replicated specs (see name_key.go); ownerRef "" is the operator
+	// namespace. Returns ErrUnknownSandbox if no placement in that namespace
+	// claims name.
+	OwnerOfName(ownerRef, name string) (string, OwnerInfo, error)
+
+	// OwnerOfNameKey resolves one raw nameIndex key with no owner filtering.
+	// Only the cluster-internal placement-by-name endpoint uses it; callers
+	// that act for a user go through OwnerOfName.
+	OwnerOfNameKey(key string) (string, OwnerInfo, error)
 
 	// SelectPlacement chooses a node to host a new sandbox with the given
 	// resource request. In single-node mode it always returns self.
@@ -789,6 +825,17 @@ type Client interface {
 	VolumeAttachmentCount(ctx context.Context, tenant, id string) (int, error)
 	PutVolumeAttachments(ctx context.Context, attachments []models.VolumeAttachment) error
 	DeleteVolumeAttachmentsForSandbox(ctx context.Context, sandboxID, incarnationID string) error
+
+	// RegisterSnapshotNode records which node holds a snapshot's image, so a
+	// snapshot-by-id GET/DELETE that lands on another node can be routed to it.
+	// Idempotent and move-safe (re-register overwrites). ForgetSnapshotNode
+	// drops the entry on delete. SnapshotHomeNode resolves the holder, or
+	// returns ok=false when there is no entry (serve locally). Snapshots live in
+	// per-node SQLite with no node column, so this replicated index is the only
+	// cluster-wide home lookup.
+	RegisterSnapshotNode(ctx context.Context, snapshotName, nodeID string) error
+	ForgetSnapshotNode(ctx context.Context, snapshotName string) error
+	SnapshotHomeNode(ctx context.Context, snapshotName string) (string, bool, error)
 
 	// RemoveMember explicitly removes nodeID from the raft configuration after
 	// marking it drained and orphaning any placements it owned. Unknown raft

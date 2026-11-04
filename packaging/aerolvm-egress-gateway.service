@@ -1,0 +1,33 @@
+[Unit]
+Description=AerolVM egress gateway (filtering DNS + SNI/Host proxy)
+# Its own unit (D9): upgrading or restarting sandboxd never interrupts
+# hostname-filtered egress. Restart this unit on an operator schedule; the
+# restart is a brief fail-closed pause for gateway-mode sandboxes.
+After=network-online.target containerd.service docker.service
+Wants=network-online.target
+Requires=aerolvm-egress-gateway.socket
+
+[Service]
+Type=simple
+User=aerolvm-egress
+Group=aerolvm-egress
+EnvironmentFile=-/etc/sandboxd/egress-gateway.env
+ExecStart=/usr/local/bin/sandboxd egress-gateway
+# Only what the gateway needs: nftables, conntrack and its listeners.
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+StateDirectory=aerolvm-egress
+StateDirectoryMode=0700
+LimitCORE=0
+# Each proxied connection holds about 6 fds (two sockets plus a splice pipe
+# pair per direction); 16384 node-wide connections need ~98k (S11).
+LimitNOFILE=131072
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

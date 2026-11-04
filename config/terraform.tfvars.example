@@ -95,6 +95,20 @@ default_volume_type       = "gp3"
 # cloudflare_proxied     = false  # orange-cloud; set false for raw TCP ingress
 # cloudflare_record_ttl  = 1      # 1 = automatic (required when proxied)
 
+# --- Load balancer in front of the ingress nodes ----------------------------
+#
+# "none" (default): DNS round-robin, one A record per ingress node. A node
+# whose daemon is down still answers TCP and TLS, so clients sent to it get
+# 502 until it is back.
+# "nlb": a health-checked AWS Network Load Balancer (TCP passthrough, client
+# address preserved) on ports 80, 443 and the SSH gateway. A node leaves
+# rotation ~10 s after its daemon stops. <domain_name> and the wildcard point
+# at the balancer's Elastic IP; raw TCP ports move to tcp.<domain_name>.
+# Recommended for production. Set it when you CREATE the cluster: changing it
+# later changes every node's bootstrap, and Terraform replaces the nodes.
+# api_load_balancer        = "nlb"
+# api_lb_health_check_port = 21280   # balancer-only /health listener on each ingress node
+
 # --- Topology ----------------------------------------------------------------
 #
 # Roles: "server" | "worker" | "ingress" | "worker,ingress" |
@@ -141,8 +155,11 @@ nodes = {
 
 # --- Optional hardening / extras --------------------------------------------
 
-# Restrict admin access (SSH 22 and operator API 21212) to specific CIDRs.
-# admin_allowed_cidrs = ["203.0.113.42/32"]
+# Required: who may reach SSH (22) and the operator API (21212) from outside
+# the VPC. Your office or VPN ranges; 0.0.0.0/0 is refused unless
+# allow_admin_from_anywhere = true. The integration harness fills in the
+# runner's own address when this is unset.
+admin_allowed_cidrs = ["203.0.113.42/32"]
 
 # Override the public TCP ports opened on ingress-bearing nodes.
 # public_http_ports = [80, 443]

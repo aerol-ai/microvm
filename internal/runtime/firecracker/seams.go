@@ -29,6 +29,7 @@ import (
 	"time"
 
 	"github.com/aerol-ai/microvm/pkg/firecracker"
+	"github.com/aerol-ai/microvm/pkg/models"
 )
 
 // RootfsBuilder is the seam for turning an OCI image reference into a
@@ -49,7 +50,9 @@ type RootfsBuilder interface {
 // semantics match pkg/oci.BuildRequest exactly — see that doc comment
 // for the wire-shape contract.
 type RootfsBuildRequest struct {
-	ImageRef   string
+	ImageRef string
+	// Auth is the credential for ImageRef's registry; nil pulls anonymously.
+	Auth       *models.RegistryAuth
 	OutPath    string
 	MinSizeMiB int
 	Tag        string
@@ -242,3 +245,17 @@ const overlayFileName = "overlay.ext4"
 // occupies no real disk (sparse) — clones PATCH to their own
 // per-sandbox file whose size is governed by OverlaySizeGB.
 const overlayPlaceholderBytes int64 = 1 << 20
+
+// ImageStore is the node's container image store (the Docker or containerd
+// engine). A Firecracker snapshot goes into it, so the snapshot push,
+// catalogue, delete and image GC treat it like a container snapshot; and a
+// create reads from it a snapshot image this node holds but no registry has.
+type ImageStore interface {
+	// ImportRootfs makes the filesystem tree in rootfs (a tar stream) the
+	// single layer of a new image tagged ref, and returns the image's ID.
+	ImportRootfs(ctx context.Context, ref string, rootfs io.Reader) (string, error)
+	// OpenImage returns a skopeo source for the local image ref (such as
+	// "docker-daemon:<ref>" or "oci-archive:<file>") and a cleanup for
+	// anything it staged. ok is false when the store does not hold ref.
+	OpenImage(ctx context.Context, ref string) (source string, cleanup func(), ok bool, err error)
+}

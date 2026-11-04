@@ -41,7 +41,14 @@ check_safety() {
       ;;
   esac
 
-  # 2. Leased domain must not equal or be a suffix-match of the prod domain.
+  # 2. Leased domain must be present, and must not equal or be a suffix-match
+  #    of the prod domain. An empty name collides with nothing, so the
+  #    collision check alone would pass a run that leased no domain at all.
+  #    A scenario with no domain (local-mode) passes none.itest.invalid.
+  if [[ -z "$leased_domain" ]]; then
+    echo "TRIPWIRE: leased domain is empty — refusing. A scenario with no domain passes none.itest.invalid." >&2
+    return 1
+  fi
   if [[ -n "$prod_domain" ]]; then
     if [[ "$leased_domain" == "$prod_domain" || "$leased_domain" == *".${prod_domain}" ]]; then
       echo "TRIPWIRE: leased domain '$leased_domain' collides with prod domain '$prod_domain' — refusing." >&2

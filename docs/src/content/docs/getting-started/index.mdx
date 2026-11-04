@@ -1,0 +1,45 @@
+---
+title: Choose a setup
+description: Decide where to run the AerolVM server. Use your own computer, one server, or a group of servers.
+---
+
+import { CardGrid, LinkCard } from '@astrojs/starlight/components';
+
+AerolVM is a server program that you run yourself. Your app talks to it through an SDK. You can run the server in three places, and your SDK code is the same in all of them. Only the server address and token change.
+
+Most people start on their own computer. Move to a server when your sandboxes need web links that other people can open. Move to a cluster (a group of servers that work as one) when one server is not enough.
+
+## Compare the three setups
+
+| | Your computer | One server | A cluster |
+|---|---|---|---|
+| **Best for** | Trying AerolVM and building your app | Real use, with public web links | Many sandboxes, and staying up when a server fails |
+| **Runs on** | macOS or Linux | One Ubuntu or Debian server | Several Linux servers. The guide uses AWS. |
+| **You need** | Docker. On a Mac, Docker Desktop or OrbStack. | A domain name managed by Cloudflare | An AWS account, Terraform and a Cloudflare domain |
+| **How you install** | One command | One command | Edit three config files, then run Terraform |
+| **Server address** | `http://localhost:21212` | `https://sandbox.example.com` (your domain) | `https://sandbox.example.com` (your domain) |
+| **Public web links for sandboxes** | No | Yes, under your domain | Yes, under your domain |
+| **HTTPS** | No | Yes, set up for you | Yes, set up for you |
+| **Kinds of sandbox** | Containers | Containers, plus gVisor, Firecracker, WebAssembly, V8 isolates and GPUs if you turn them on | Same as one server |
+| **If a server fails** | Not a concern | Nothing takes over | Sandboxes that ask for it are recreated on a healthy server |
+
+## Which one should I pick?
+
+- **You want to try AerolVM or build your app.** Use [your computer](/getting-started/local-setup/). The [Quickstart](/quick-start/) does this in about five minutes.
+- **People on the internet need to open a sandbox's web page.** Use [one server](/getting-started/single-node-setup/). It gives each sandbox a link like `https://<sandbox-id>-3000.sandbox.example.com`.
+- **You run more sandboxes than one server can hold, or you cannot afford downtime.** Use a [cluster](/cluster-setup/).
+
+## Good to know
+
+- **Your code does not change when you move.** Set `SB_API_URL` to the new server's address and `SB_PAT_TOKEN` to its token.
+- **Sandboxes do not move with you.** Each setup has its own sandboxes. Create new ones on the new setup.
+- **The computer setup is for development only.** It does not apply network rules. On a Mac, it also ignores CPU, memory and disk limits. See [Install on your computer](/getting-started/local-setup/#good-to-know).
+
+## Next steps
+
+<CardGrid>
+  <LinkCard title="Install on your computer" description="Run the server on your Mac or Linux computer. No domain needed." href="/getting-started/local-setup/" />
+  <LinkCard title="Install on a server" description="One Linux server with your own domain, HTTPS and public links." href="/getting-started/single-node-setup/" />
+  <LinkCard title="Cluster setup" description="Spread sandboxes across many servers on AWS." href="/cluster-setup/" />
+  <LinkCard title="Quickstart" description="Install on your computer and run your first sandbox." href="/quick-start/" />
+</CardGrid>

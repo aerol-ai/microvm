@@ -18,6 +18,13 @@ import (
 // client + the socket path. Mirrors the cold_path_test harness.
 func serveResident(t *testing.T) (*Client, string) {
 	t.Helper()
+	return serveResidentWith(t, &ResidentServer{})
+}
+
+// serveResidentWith serves a caller-owned ResidentServer so tests can inspect
+// its state (e.g. the mediator) after driving it over the socket.
+func serveResidentWith(t *testing.T, srv *ResidentServer) (*Client, string) {
+	t.Helper()
 	socketPath := filepath.Join(os.TempDir(), fmt.Sprintf("aerol-wasm-res-%d.sock", time.Now().UnixNano()))
 	t.Cleanup(func() { _ = os.Remove(socketPath) })
 	_ = os.Remove(socketPath)
@@ -26,7 +33,6 @@ func serveResident(t *testing.T) (*Client, string) {
 		t.Fatalf("Listen: %v", err)
 	}
 	t.Cleanup(func() { _ = ln.Close() })
-	srv := &ResidentServer{}
 	go func() {
 		for {
 			conn, err := ln.Accept()

@@ -276,7 +276,7 @@ func (s *Service) AddCustomDomain(ctx context.Context, sandboxID, hostname strin
 	// keyed to the hostname, not the sandbox ID, so users can provision it
 	// once and attach the hostname to any sandbox (including a recreated
 	// one with a new ID).
-	if err := verifyCustomDomainOwnership(ctx, s.dnsResolver, canonical, s.cfg.CustomDomainVerifyPrefix, s.cfg.CustomDomainVerifyValuePrefix); err != nil {
+	if err := verifyCustomDomainOwnership(ctx, s.dnsResolver, canonical, s.cfg.CustomDomainVerifyPrefix, s.cfg.CustomDomainVerifyValuePrefix, customDomainProofToken(ctx, sandbox.OwnerRef)); err != nil {
 		return err
 	}
 
@@ -450,6 +450,29 @@ func hasCustomDomains(sandbox *models.Sandbox) bool {
 func (s *Service) persistCustomDomainsOnCreate(ctx context.Context, sandboxID string, hostnames []string) error {
 	if len(hostnames) == 0 {
 		return nil
+	}
+	// Prove zone control (TXT record) for each hostname BEFORE inserting any
+	// row — the same gate AddCustomDomain applies. Without this, a create with
+	// custom_domains claimed a hostname the caller does not own: once the real
+	// owner pointed DNS at the ingress, the squatter's sandbox served their
+	// domain (and on-demand TLS issued a cert for it). Verify every hostname
+	// first so a create either takes all of its domains or none.
+	//
+	// Every caller but a host-capable one must prove control: a tenant could
+	// squat another tenant's hostname, and so could a runner bound to every
+	// team. Operator/PAT and admin callers are trusted to control DNS
+	// (pr-review.md §5), and a stored-spec replay (failover recreate) carries
+	// no Access — its hostname was proven at the original create and the
+	// recreate has no caller who could provision DNS. hostCapable covers all
+	// three (eng review D3). Verify every hostname first, so a create takes
+	// all of its domains or none.
+	if !hostCapable(ctx) {
+		ownerToken := customDomainProofToken(ctx, ownerRefForCreate(ctx))
+		for _, h := range hostnames {
+			if err := verifyCustomDomainOwnership(ctx, s.dnsResolver, h, s.cfg.CustomDomainVerifyPrefix, s.cfg.CustomDomainVerifyValuePrefix, ownerToken); err != nil {
+				return err
+			}
+		}
 	}
 	added := make([]string, 0, len(hostnames))
 	rollback := func() {

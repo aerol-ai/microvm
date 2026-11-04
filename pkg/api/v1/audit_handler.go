@@ -94,6 +94,7 @@ func parseSecretAuditQuery(r *http.Request) service.SecretAuditQuery {
 	q := service.SecretAuditQuery{
 		Cursor:        strings.TrimSpace(r.URL.Query().Get("cursor")),
 		Kind:          strings.TrimSpace(r.URL.Query().Get("kind")),
+		Caller:        strings.TrimSpace(r.URL.Query().Get("caller")),
 		IncarnationID: strings.TrimSpace(r.URL.Query().Get("incarnation_id")),
 	}
 	if raw := strings.TrimSpace(r.URL.Query().Get("limit")); raw != "" {
@@ -106,8 +107,5 @@ func parseSecretAuditQuery(r *http.Request) service.SecretAuditQuery {
 
 // correlationIDFromRequest prefers X-Correlation-ID, then X-Request-ID.
 func correlationIDFromRequest(r *http.Request) string {
-	if v := strings.TrimSpace(r.Header.Get("X-Correlation-ID")); v != "" {
-		return v
-	}
-	return strings.TrimSpace(r.Header.Get("X-Request-ID"))
+	return apihttp.CorrelationID(r)
 }

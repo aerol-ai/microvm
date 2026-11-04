@@ -1,10 +1,33 @@
 export { MicroVM } from "./MicroVM.js";
 export { Sandbox } from "./Sandbox.js";
 export { Image } from "./Image.js";
-export type { MicroVMConfig } from "./MicroVM.js";
+export { MicroVMApiError } from "./errors.js";
+export type { MicroVMConfig, Tokens } from "./MicroVM.js";
 export type { RetryConfig } from "./internal/client.js";
 export type {
   AddCustomDomainOptions,
+  APIToken,
+  APITokenList,
+  CreateAPITokenOptions,
+  CreatedAPIToken,
+  WhoAmI,
+  WhoAmIPrincipal,
+  AuditEvent,
+  AuditOptions,
+  AuditPage,
+  EgressProfile,
+  EgressProfileList,
+  EgressProfileOptions,
+  EgressProfileRef,
+  EgressInject,
+  EgressRule,
+  ListEgressProfilesOptions,
+  NetworkLearned,
+  NetworkLearnedEntry,
+  NetworkPolicy,
+  NetworkPolicyCheckOptions,
+  NetworkPolicyCheckResult,
+  NetworkPolicyOptions,
   BinaryLike,
   BuildImageOptions,
   BuildImagePushOptions,
@@ -38,7 +61,10 @@ export type {
   MountSpecRedacted,
   MountType,
   PlatformVolumeMount,
+  CreateSnapshotOptions,
   RegisterSnapshotOptions,
+  ListSnapshotsOptions,
+  SnapshotList,
   RegistryAuth,
   ResizeOptions,
   Sandbox as SandboxData,

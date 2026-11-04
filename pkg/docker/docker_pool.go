@@ -14,6 +14,7 @@ import (
 
 	"github.com/aerol-ai/microvm/internal/pool/dockerpool"
 	"github.com/aerol-ai/microvm/pkg/createtiming"
+	"github.com/aerol-ai/microvm/pkg/gvisorpids"
 	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/aerol-ai/microvm/pkg/mounts"
 )
@@ -33,6 +34,25 @@ func isParkedContainerLabels(labels map[string]string) bool {
 // service orphan pass when the park label is missing after a partial adopt.
 func isParkedSandboxID(id string) bool {
 	return strings.HasPrefix(strings.TrimSpace(id), "park-")
+}
+
+// isParkedContainer reports whether a listed container is warm-pool
+// inventory: park-labelled AND still named park-<hex>. The label alone is
+// not enough. Docker can't change a container's labels, so an adopted
+// container keeps the park label for life; adoption renames it to its
+// sandbox ID, and the name is what tells a live sandbox from a parked slot.
+// Going by the label alone, the boot purge destroyed live sandboxes on every
+// sandboxd restart (UC-212) and reconcile never saw them.
+func isParkedContainer(summary containerSummary) bool {
+	if !isParkedContainerLabels(summary.Labels) {
+		return false
+	}
+	for _, name := range summary.Names {
+		if isParkedSandboxID(strings.TrimPrefix(name, "/")) {
+			return true
+		}
+	}
+	return false
 }
 
 // ErrSandboxContainerExists is returned when adopt-time rename finds the
@@ -229,6 +249,12 @@ func (c *Client) parkContainer(ctx context.Context, slotID string, key dockerpoo
 		"SB_TOOLBOX_TOKEN=" + bootstrapToken,
 	}
 	envValues = append(envValues, pl.EnvVars()...)
+	// A parked toolboxd caps a gVisor sentry at park time, sized for the
+	// park's default memory: the adopt handshake does not restart it.
+	hostPids, pidsEnv := gvisorpids.ForRuntime(ociRuntime, c.pidsLimit, models.DefaultMemoryMB)
+	if !c.resourceLimitsOff {
+		envValues = append(envValues, pidsEnv...)
+	}
 
 	labels := map[string]string{
 		managedLabelKey:  "true",
@@ -249,20 +275,18 @@ func (c *Client) parkContainer(ctx context.Context, slotID string, key dockerpoo
 		pl.BindSpec(),
 	}
 
-	hostConfig := map[string]any{
-		"Privileged": c.privileged,
-		"Binds":      binds,
-	}
+	hostConfig := sandboxHostConfig(c.privileged, binds)
 	if c.network != "" && c.network != "bridge" {
 		hostConfig["NetworkMode"] = c.network
 	}
+	setSandboxIPv6Off(hostConfig, c.network)
 	if ociRuntime != "" {
 		hostConfig["Runtime"] = ociRuntime
 	}
 	if !c.resourceLimitsOff {
 		// Inline, not nested under "Resources": HostConfig embeds the
 		// Resources fields in the Docker API JSON (see the cold path).
-		maps.Copy(hostConfig, parkDefaultResources(c))
+		maps.Copy(hostConfig, parkDefaultResources(hostPids))
 	}
 	if c.parkDiskGB > 0 && effectiveRuntime != models.RuntimeGvisor {
 		hostConfig["StorageOpt"] = map[string]string{"size": fmt.Sprintf("%dG", c.parkDiskGB)}
@@ -316,7 +340,7 @@ func (c *Client) parkContainer(ctx context.Context, slotID string, key dockerpoo
 	}, nil
 }
 
-func parkDefaultResources(c *Client) map[string]any {
+func parkDefaultResources(pidsLimit int64) map[string]any {
 	cpu := models.DefaultCPU
 	mem := models.DefaultMemoryMB
 	resources := map[string]any{}
@@ -327,6 +351,9 @@ func parkDefaultResources(c *Client) map[string]any {
 	if mem > 0 {
 		resources["Memory"] = int64(mem) * 1024 * 1024
 		resources["MemorySwap"] = int64(mem) * 1024 * 1024
+	}
+	if pidsLimit > 0 {
+		resources["PidsLimit"] = pidsLimit
 	}
 	return resources
 }
@@ -458,15 +485,19 @@ func (c *Client) applyAdoptNetworkPolicy(containerIP string, req models.CreateSa
 		// idempotent and re-asserts it in case it was lost.
 		return c.networkRules.BlockAllEgress(containerIP)
 	}
-	return c.networkRules.ClearBlockAllEgress(containerIP)
+	// The adopted sandbox keeps the slot's address: lift the park block.
+	return c.networkRules.LiftBlockAllEgress(containerIP)
 }
 
 func (c *Client) destroyParked(ctx context.Context, slot *dockerpool.ParkedSlot) error {
 	if slot == nil {
 		return nil
 	}
+	// The slot holds its address until it is removed: everything keyed by
+	// the address goes first (the park block, and anything an adopt
+	// that failed half way put there).
 	if slot.ContainerIP != "" {
-		_ = c.ClearNetworkRules(slot.ContainerIP)
+		_ = c.networkRules.ClearAddress(slot.ContainerIP)
 	}
 	if slot.Handle != nil {
 		_ = slot.Handle.Close()
@@ -540,7 +571,9 @@ func (c *Client) ListParkedContainers(ctx context.Context) ([]containerSummary, 
 	return containers, nil
 }
 
-// PurgeParkedContainers destroys all park-labeled containers and clears rules.
+// PurgeParkedContainers destroys the park inventory a previous run left and
+// clears its rules. Adopted containers carry the park label too and are live
+// sandboxes; isParkedContainer leaves them alone.
 func (c *Client) PurgeParkedContainers(ctx context.Context) (int, error) {
 	containers, err := c.ListParkedContainers(ctx)
 	if err != nil {
@@ -548,6 +581,9 @@ func (c *Client) PurgeParkedContainers(ctx context.Context) (int, error) {
 	}
 	purged := 0
 	for _, summary := range containers {
+		if !isParkedContainer(summary) {
+			continue
+		}
 		inspect, ierr := c.inspectContainer(ctx, summary.ID)
 		if ierr == nil {
 			if ip := getContainerIP(inspect, c.network); ip != "" {

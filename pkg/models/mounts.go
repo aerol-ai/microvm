@@ -135,6 +135,13 @@ var (
 	// more live sandboxes still have the volume attached. Facades map this to
 	// 409 Conflict.
 	ErrPlatformVolumeInUse = errors.New("volume is still attached to one or more sandboxes")
+
+	// ErrMountOperatorOnly is returned when an owner-scoped (non-operator)
+	// caller supplies raw mounts. Raw mounts execute host-side as the daemon
+	// user and are trusted only under the "PAT == operator" assumption
+	// (pr-review.md §5); a validated user token is not an operator. Tenants use
+	// owner-namespaced platform volumes instead. Mapped to 403 Forbidden.
+	ErrMountOperatorOnly = errors.New("raw mounts are operator-only; use platform_volumes for tenant storage")
 )
 
 // MaxCredentialKeys / MaxCredentialBytes bound credential payload size so a

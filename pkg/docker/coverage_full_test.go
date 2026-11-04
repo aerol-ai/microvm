@@ -175,7 +175,8 @@ func TestContainerPID(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Stop / Destroy / CreateSnapshot / Resize / Inspect / ListManaged / RemoveImage
+// Stop / Destroy / Resize / Inspect / ListManaged / RemoveImage
+// (CreateSnapshot: snapshot_commit_test.go)
 // ---------------------------------------------------------------------------
 
 func TestStop(t *testing.T) {
@@ -218,40 +219,6 @@ func TestDestroy(t *testing.T) {
 		sb := &models.Sandbox{ContainerID: "cid", ContainerIP: "172.17.0.2"}
 		if err := c.Destroy(context.Background(), sb); err != nil {
 			t.Fatalf("Destroy() = %v", err)
-		}
-	})
-}
-
-func TestCreateSnapshot(t *testing.T) {
-	t.Run("success", func(t *testing.T) {
-		c := &Client{httpClient: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
-			if r.URL.Path != "/commit" {
-				t.Fatalf("unexpected path %s", r.URL.Path)
-			}
-			if got := r.URL.Query().Get("tag"); got != "v1" {
-				t.Fatalf("tag query = %q", got)
-			}
-			return jsonResponse(http.StatusCreated, map[string]string{"Id": "img-sha"}), nil
-		})}}
-		id, err := c.CreateSnapshot(context.Background(), "cid", "snap-alpha:v1")
-		if err != nil || id != "img-sha" {
-			t.Fatalf("CreateSnapshot() = %q, %v", id, err)
-		}
-	})
-
-	t.Run("invalid_ref", func(t *testing.T) {
-		c := &Client{}
-		if _, err := c.CreateSnapshot(context.Background(), "cid", "bad@sha256:x"); err == nil {
-			t.Fatal("CreateSnapshot() expected ref error")
-		}
-	})
-
-	t.Run("commit_error", func(t *testing.T) {
-		c := &Client{httpClient: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
-			return textResponse(http.StatusInternalServerError, "boom"), nil
-		})}}
-		if _, err := c.CreateSnapshot(context.Background(), "cid", "snap-alpha"); err == nil {
-			t.Fatal("CreateSnapshot() expected commit error")
 		}
 	})
 }
@@ -324,13 +291,22 @@ func TestListManaged(t *testing.T) {
 					{"Id": "inspect-fails", "Labels": map[string]string{managedLabelKey: "true"}},
 					// Warm-pool park: managed label + park label. Must not
 					// appear in ListManaged or reconcile will destroy it.
-					{"Id": "parked", "Labels": map[string]string{
+					{"Id": "parked", "Names": []string{"/park-d316b60bc106a6f6"}, "Labels": map[string]string{
+						managedLabelKey:  "true",
+						poolParkLabelKey: poolParkLabelValue,
+					}},
+					// Adopted from the pool: Docker can't drop the park label,
+					// but adoption renamed it to its sandbox ID. A sandbox, so
+					// reconcile must see it.
+					{"Id": "adopted", "Names": []string{"/sb-adopted"}, "Labels": map[string]string{
 						managedLabelKey:  "true",
 						poolParkLabelKey: poolParkLabelValue,
 					}},
 				}), nil
 			case r.URL.Path == "/containers/managed/json":
 				return textResponse(http.StatusOK, inspectBody("managed", "/sb-managed", "172.17.0.2", true, "running", 1)), nil
+			case r.URL.Path == "/containers/adopted/json":
+				return textResponse(http.StatusOK, inspectBody("adopted", "/sb-adopted", "172.17.0.3", true, "running", 2)), nil
 			case r.URL.Path == "/containers/inspect-fails/json":
 				return textResponse(http.StatusInternalServerError, "boom"), nil
 			case r.URL.Path == "/containers/parked/json":
@@ -345,11 +321,14 @@ func TestListManaged(t *testing.T) {
 		if err != nil {
 			t.Fatalf("ListManaged() = %v", err)
 		}
-		if len(result) != 1 {
-			t.Fatalf("ListManaged() returned %d entries, want 1", len(result))
+		if len(result) != 2 {
+			t.Fatalf("ListManaged() returned %d entries, want 2", len(result))
 		}
 		if _, ok := result["sb-managed"]; !ok {
 			t.Fatalf("ListManaged() missing sb-managed: %+v", result)
+		}
+		if _, ok := result["sb-adopted"]; !ok {
+			t.Fatalf("ListManaged() missing the pool-adopted sandbox: %+v", result)
 		}
 		if _, ok := result["park-d316b60bc106a6f6"]; ok {
 			t.Fatal("ListManaged() must exclude parked containers")
@@ -378,6 +357,41 @@ func TestListManaged(t *testing.T) {
 		}
 		if len(result) != 0 {
 			t.Fatalf("ListManaged() = %+v, want empty (park-* name excluded)", result)
+		}
+	})
+
+	t.Run("skips_a_running_snapshots_helper", func(t *testing.T) {
+		// A snapshot helper inherits the sandbox's managed label from the
+		// committed image. A fresh one belongs to a snapshot in progress and
+		// must not reach the orphan sweep; a stale one was left by a crash and
+		// must, so it gets reaped.
+		now := time.Now().Unix()
+		c := &Client{httpClient: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			switch {
+			case r.URL.Path == "/containers/json":
+				return jsonResponse(http.StatusOK, []map[string]any{
+					{"Id": "fresh", "Names": []string{"/snapcommit-00aa"}, "Created": now - 5, "Labels": map[string]string{managedLabelKey: "true"}},
+					{"Id": "stale", "Names": []string{"/snapcommit-00bb"}, "Created": now - int64((snapshotHelperMaxAge + time.Minute).Seconds()), "Labels": map[string]string{managedLabelKey: "true"}},
+				}), nil
+			case r.URL.Path == "/containers/stale/json":
+				return textResponse(http.StatusOK, inspectBody("stale", "/snapcommit-00bb", "", false, "created", 0)), nil
+			case r.URL.Path == "/containers/fresh/json":
+				t.Fatal("ListManaged must not inspect a running snapshot's helper")
+				return nil, nil
+			default:
+				t.Fatalf("unexpected path %s", r.URL.Path)
+				return nil, nil
+			}
+		})}}
+		result, err := c.ListManaged(context.Background())
+		if err != nil {
+			t.Fatalf("ListManaged() = %v", err)
+		}
+		if _, ok := result["snapcommit-00aa"]; ok {
+			t.Fatalf("ListManaged() listed a running snapshot's helper: %+v", result)
+		}
+		if _, ok := result["snapcommit-00bb"]; !ok || len(result) != 1 {
+			t.Fatalf("ListManaged() = %+v, want only the stale helper", result)
 		}
 	})
 

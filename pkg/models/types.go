@@ -118,9 +118,35 @@ const (
 // an actionable error instead of a generic 500.
 var ErrRuntimeNotImplemented = errors.New("runtime not yet implemented on this build")
 
+// ErrSnapshotSourceNotReady is a snapshot request for a sandbox its runtime
+// cannot snapshot in the state it is in: a Firecracker sandbox must be
+// stopped, by an agent that flushed its disk first. The wrapping message
+// says what to do. HTTP 409.
+var ErrSnapshotSourceNotReady = errors.New("sandbox cannot be snapshotted in its current state")
+
 // ErrSandboxExists is returned when a sandbox row with the same primary key
 // already exists. Distinct from name conflicts (store.ErrSandboxNameConflict).
 var ErrSandboxExists = errors.New("sandbox already exists")
+
+// ErrIdempotencyKeyReused is returned when a create's Idempotency-Key was
+// already used with a different request. It is answered 422
+// (ErrorCodeIdempotencyKeyReused) with no sandbox data.
+var ErrIdempotencyKeyReused = errors.New("idempotency key was already used with a different request")
+
+// IdempotencyKeyReusedError is ErrIdempotencyKeyReused naming the key.
+type IdempotencyKeyReusedError struct {
+	Key string
+}
+
+func (e *IdempotencyKeyReusedError) Error() string {
+	if e == nil || e.Key == "" {
+		return "Idempotency-Key was already used with a different request"
+	}
+	return fmt.Sprintf("Idempotency-Key %q was already used with a different request", e.Key)
+}
+
+// Is makes errors.Is(err, ErrIdempotencyKeyReused) hold.
+func (e *IdempotencyKeyReusedError) Is(target error) bool { return target == ErrIdempotencyKeyReused }
 
 // ErrSnapshotCorrupt is returned when a runtime snapshot fails checksum
 // verification at load time — the on-disk artifact does not match the
@@ -213,6 +239,35 @@ func ValidRuntime(value string) (string, error) {
 		return "", fmt.Errorf("unsupported runtime %q (allowed: %s, %s, %s, %s, %s, %s)",
 			value, RuntimeDocker, RuntimeGvisor, RuntimeKata, RuntimeFirecracker, RuntimeWasm, RuntimeIsolate)
 	}
+}
+
+// RuntimeUsesEgressGateway reports whether hostname egress rules on this
+// runtime are enforced by the node's egress gateway. WASM and isolate filter
+// in their own host-side mediators; Firecracker guests reach the gateway
+// through their TAPs (plans/egress-domain-filtering.md Phase 4). Cluster
+// placement uses it to route gateway-mode creates only to nodes with a
+// ready gateway.
+func RuntimeUsesEgressGateway(runtime string) bool {
+	switch runtime {
+	case "", RuntimeDocker, RuntimeGvisor, RuntimeKata, RuntimeFirecracker:
+		return true
+	}
+	return false
+}
+
+// RuntimeMediatesEgress reports whether a runtime filters egress in its own
+// host-side mediator (WASM's worker, isolate's egress proxy) rather than the
+// node's egress gateway.
+func RuntimeMediatesEgress(runtime string) bool {
+	return runtime == RuntimeWasm || runtime == RuntimeIsolate
+}
+
+// CreateHasEgress reports whether a create sets any egress field. Cluster
+// placement sends such a mediated-runtime create only to peers that enforce
+// them (capacity Snapshot.MediatedEgress).
+func CreateHasEgress(req *CreateSandboxRequest) bool {
+	return req != nil && (req.NetworkBlockAll || len(req.NetworkAllowOut) > 0 || len(req.NetworkDenyOut) > 0 ||
+		req.NetworkEgressMode != "" || len(req.EgressProfiles) > 0 || len(req.NetworkEgressRules) > 0)
 }
 
 // ValidDurability normalizes and validates a durability class. Empty input
@@ -544,7 +599,15 @@ type CreateSandboxRequest struct {
 	NetworkBlockAll  bool              `json:"network_block_all"`
 	Registry         *RegistryAuth     `json:"registry,omitempty"`
 	ContainerCommand []string          `json:"container_command,omitempty"`
-	Mounts           []MountSpec       `json:"mounts,omitempty"`
+	// VerifyRegistryAccess forces the runtime to authorize the image against
+	// its registry even when it is already cached on the node, instead of
+	// trusting the local image. The service sets it for owner-scoped (validated
+	// user-token) callers so one tenant cannot start another tenant's private
+	// image just because it is already in the shared local cache. Internal-only
+	// (json:"-"): never on the wire, re-derived on the owner node after a
+	// cluster forward from the re-authenticated caller.
+	VerifyRegistryAccess bool        `json:"-"`
+	Mounts               []MountSpec `json:"mounts,omitempty"`
 	// PlatformVolumes references named, operator-backed persistent volumes by
 	// name only — the user never supplies storage coordinates or credentials.
 	// The service translates each entry into a synthesized, tenant-scoped
@@ -556,18 +619,31 @@ type CreateSandboxRequest struct {
 	Lifecycle       *Lifecycle            `json:"lifecycle,omitempty"`
 	Failover        *Failover             `json:"failover,omitempty"`
 	// Name is an optional human-readable identifier. When set, it must be
-	// unique across all sandboxes — the store enforces this with a partial
-	// unique index. Empty means no name; the sandbox can only be referenced
-	// by ID. The Daytona facade requires names; the native /v1 API and other
-	// facades may set or omit it.
+	// unique among the owner's sandboxes (a user token's account, or the
+	// operator namespace for PAT callers) — the store enforces this with a
+	// per-owner partial unique index, and cluster mode with an
+	// owner-qualified Raft name key. Two tenants may use the same name.
+	// Empty means no name; the sandbox can only be referenced by ID. The
+	// Daytona facade requires names; the native /v1 API and other facades
+	// may set or omit it.
 	//
-	// Duplicate names are rejected with HTTP 409 Conflict. Use a unique name
-	// per sandbox or omit this field to let the daemon assign an ID instead.
+	// Duplicate names within one owner are rejected with HTTP 409 Conflict.
+	// Names starting with "owner:" or shaped like a generated sandbox ID
+	// (sb- plus 16 hex) are reserved and rejected with HTTP 400 (see
+	// ValidateSandboxName).
 	Name string `json:"name,omitempty"`
 	// Tags is an optional free-form key/value map associated with the
 	// sandbox. Used by facades that expose label-style metadata (Daytona
 	// labels, E2B metadata).
 	Tags map[string]string `json:"tags,omitempty"`
+	// CompatState carries each facade's per-sandbox compatibility state
+	// (sandbox_compat_state) on the FSM-replicated spec so a failover recreate
+	// can restore it — the rows are node-local and would otherwise be lost with
+	// the dead owner (B11). It is replication-internal: the create path strips
+	// any client-supplied value (normalizeCreateRequest), and only the service's
+	// own UpsertCompatState write-through populates it. Keyed by facade name →
+	// that facade's state JSON.
+	CompatState map[string]string `json:"compatState,omitempty"`
 	// Runtime selects the container runtime for this sandbox. Empty falls back
 	// to the host default (SB_CONTAINER_RUNTIME). Allowed values: "docker"
 	// (standard runc-backed Docker runtime, default), "gvisor" (runsc-backed
@@ -588,21 +664,45 @@ type CreateSandboxRequest struct {
 	// Crossing the limit installs an egress DROP rule via the same primitive
 	// NetworkBlockAll uses.
 	NetworkBytesOutLimit int64 `json:"network_bytes_out_limit,omitempty"`
-	// NetworkAllowOut is an egress allowlist of CIDRs: when non-empty the
-	// sandbox may reach only these destinations and everything else is
-	// dropped. Mutually exclusive with NetworkDenyOut. Enforced by the host
-	// firewall (EnableNetworkRules) and a no-op when network rules are off.
+	// NetworkAllowOut is an egress allowlist: CIDRs, hostnames, *.suffix
+	// wildcards and host:port entries (plans/egress-domain-filtering.md §5.1).
+	// Alone it allows only these destinations. With NetworkDenyOut the
+	// precedence is allow-wins: an allow match passes, then a deny match
+	// drops, then the default is accept; a deny of 0.0.0.0/0 makes it an
+	// allowlist. Hostnames need the egress gateway on container runtimes.
 	NetworkAllowOut []string `json:"network_allow_out,omitempty"`
-	// NetworkDenyOut is an egress blocklist of CIDRs: the sandbox may reach
-	// anything except these destinations. Mutually exclusive with
-	// NetworkAllowOut. Blocking the entire space is expressed as
-	// NetworkBlockAll, not a denyOut of 0.0.0.0/0.
+	// NetworkDenyOut is an egress blocklist of CIDRs (never hostnames): alone,
+	// the sandbox may reach anything except these. A deny of 0.0.0.0/0 with
+	// no allow list is block-all and is stored as NetworkBlockAll.
 	NetworkDenyOut []string `json:"network_deny_out,omitempty"`
-	// AllowPublicTraffic controls whether the sandbox may be exposed to the
-	// public internet. On create, omitted (nil) defaults to private — no
-	// <id>.<domain> ingress route and empty public_url. Pass an explicit true
-	// to opt in at create time, or call expose_port later (which flips the
-	// sandbox public as the opt-in lever). False always refuses exposure.
+	// EgressProfiles names egress profiles whose entries join
+	// NetworkAllowOut; the union is capped at 1024 hostnames. A profile
+	// update re-applies to every sandbox that references it
+	// (plans/egress-domain-filtering.md D21).
+	EgressProfiles []string `json:"egress_profiles,omitempty"`
+	// NetworkEgressMode is "enforce" (the default) or "learn". Learn mode
+	// allows all outbound traffic and records what the sandbox reaches, for
+	// GET /network/learned to turn into an allow list. It is open egress by
+	// design: trusted runs only. It needs empty lists, no profiles and no
+	// block-all (plans/egress-domain-filtering.md CEO D2).
+	NetworkEgressMode string `json:"network_egress_mode,omitempty"`
+	// NetworkEgressRules are method and path rules that refine hosts the
+	// allow list admits (plans/egress-domain-filtering.md §5.9, P3-1). An
+	// inspect rule makes the egress gateway terminate TLS on 443 with the
+	// node's CA, which the sandbox is given to trust; it has to be set at
+	// create.
+	NetworkEgressRules []EgressRule `json:"network_egress_rules,omitempty"`
+	// EgressWithheldEnv lists env keys the sandbox gets placeholders for
+	// instead of values (P3-2). sandboxd keeps it in the replicated spec, so
+	// a key an inject rule withheld at create stays withheld after the rule
+	// is removed: a recreate on another node must not hand the sandbox a
+	// credential it never had. A create may set it to withhold keys itself.
+	EgressWithheldEnv []string `json:"egress_withheld_env,omitempty"`
+	// AllowPublicTraffic controls whether the sandbox is public from boot. On
+	// create, omitted (nil) and false both mean private — no <id>.<domain>
+	// ingress route and empty public_url. Pass true to be public from boot.
+	// A later expose_port is itself the opt-in: it flips a private sandbox
+	// public whether this was omitted or false (enableSandboxPublicTraffic).
 	// The sandbox stays reachable via the platform's own paths (toolbox
 	// exec/file proxy, SSH gateway), which do not route through the public
 	// ingress.
@@ -623,6 +723,14 @@ type CreateSandboxRequest struct {
 	// (Sandbox.CustomDomains) carries per-hostname status. Capped by
 	// MaxCustomDomainsPerCreateRequest.
 	CustomDomains []string `json:"custom_domains,omitempty"`
+	// CreateRequestDigests are keyed digests ("hmac:<key id>:<hex>", one per
+	// server key, the current key's first) of the request an Idempotency-Key
+	// create was made with, as the client sent it. Server-internal: the API
+	// edge sets it from the decoded request and replaces any client value; it
+	// rides a cluster forward and the replicated spec, so the node that runs
+	// the sandbox, and a failover recreate, can tell a retry of the same
+	// request from a reuse of the key for a different one.
+	CreateRequestDigests []string `json:"create_request_digests,omitempty"`
 	// TemplateID, when set alongside Runtime="firecracker", skips the
 	// per-create OCI→ext4 build and reuses a previously prepared
 	// rootfs.ext4 from a Firecracker template (POST /v1/templates). The
@@ -711,6 +819,10 @@ type Sandbox struct {
 	NetworkBlockAll bool              `json:"network_block_all"`
 	ToolboxEnabled  bool              `json:"toolbox_enabled"`
 	ToolboxToken    string            `json:"-"`
+	// CreateRequestDigest is the keyed digest of the request an
+	// Idempotency-Key create was made with (CreateSandboxRequest's current
+	// one). Stored in sandbox_create_digests, never on the wire.
+	CreateRequestDigest string `json:"-"`
 	// AuditIncarnationID scopes retained audit evidence to this exact sandbox
 	// lifecycle. It is persisted in sandbox_audit_acl, not on the sandbox row,
 	// and never crosses the public API or Raft recovery payload.
@@ -731,8 +843,9 @@ type Sandbox struct {
 	// the secret holder count meets HA (owner + ≥1 backup) or the recipient
 	// set is single-node (len≤1). Omitted for non-recreate sandboxes.
 	FailoverReady *bool `json:"failover_ready,omitempty"`
-	// Name is the optional unique identifier set at create time. Empty when
-	// the sandbox was created without one (the common path on /v1 today).
+	// Name is the optional identifier set at create time, unique per owner
+	// (see CreateSandboxRequest.Name). Empty when the sandbox was created
+	// without one (the common path on /v1 today).
 	Name string `json:"name,omitempty"`
 	// Tags is the optional key/value bag set at create time. Facades use it
 	// for label-style metadata (Daytona labels, E2B metadata) but the field
@@ -774,15 +887,38 @@ type Sandbox struct {
 	// created or patched with. Zero = unlimited.
 	NetworkBytesInLimit  int64 `json:"network_bytes_in_limit"`
 	NetworkBytesOutLimit int64 `json:"network_bytes_out_limit"`
-	// NetworkAllowOut / NetworkDenyOut are the egress CIDR policy the sandbox
-	// was created with, persisted so the start and reconcile paths can
-	// reinstall the host-firewall rules after a restart (parity with
-	// NetworkBlockAll). Mutually exclusive; at most one is non-empty.
+	// NetworkAllowOut / NetworkDenyOut are the egress policy the sandbox was
+	// created with, persisted so the start and reconcile paths can reinstall
+	// the rules after a restart (parity with NetworkBlockAll). Both may be set:
+	// allow-wins precedence (plans/egress-domain-filtering.md D4).
 	NetworkAllowOut []string `json:"network_allow_out,omitempty"`
 	NetworkDenyOut  []string `json:"network_deny_out,omitempty"`
-	// AllowPublicTraffic mirrors the create-time flag. Nil means "not set"
-	// (treated as allowed); a non-nil false makes ExposePort refuse to install
-	// a public route. Persisted so the gate survives restarts.
+	// EgressProfiles are the profiles this sandbox references, and
+	// EgressProfilesApplied the generation of each that is live, so a caller
+	// can see when a profile update has reached it. On the stored row
+	// NetworkAllowOut is the effective list (inline entries plus every
+	// profile's), which is what enforcement reads; API responses show the
+	// inline list instead.
+	EgressProfiles        []string           `json:"egress_profiles,omitempty"`
+	EgressProfilesApplied []EgressProfileRef `json:"egress_profiles_applied,omitempty"`
+	// NetworkEgressMode is "learn" for a sandbox recording its egress, and
+	// empty (enforce) otherwise.
+	NetworkEgressMode string `json:"network_egress_mode,omitempty"`
+	// NetworkEgressRules are the sandbox's method and path rules (P3-1).
+	NetworkEgressRules []EgressRule `json:"network_egress_rules,omitempty"`
+	// EgressStatus is the hostname-egress state on GET for a sandbox whose
+	// policy needs the egress gateway: "active", "held" (attach failed or the
+	// stored policy is invalid; no egress until it attaches) or
+	// "unavailable" (the gateway is down or lost its table). "unenforced" is
+	// any egress policy on a runtime whose host firewall is off on this node
+	// (SB_ENABLE_NETWORK_RULES=false): nothing filters the sandbox's traffic.
+	// Empty for every other sandbox, and on list responses
+	// (plans/egress-domain-filtering.md D16). Response-only: never stored.
+	EgressStatus string `json:"egress_status,omitempty"`
+	// AllowPublicTraffic is whether the sandbox currently has a public route:
+	// only true is public. It starts as the create-time flag and the first
+	// ExposePort sets it to true (enableSandboxPublicTraffic), so nil and
+	// false behave the same. Persisted so the state survives restarts.
 	AllowPublicTraffic *bool `json:"allow_public_traffic,omitempty"`
 	// MaskRequestHost mirrors the create-time flag: the value the ingress layer
 	// rewrites the upstream Host header to for exposed HTTP ports. Persisted so
@@ -891,6 +1027,180 @@ type NetworkUsage struct {
 }
 
 // UpdateNetworkLimitsRequest is the body for PATCH /v1/sandboxes/{id}/network/limits.
+// NetworkPolicyRequest is PUT /v1/sandboxes/{id}/network/policy
+// (plans/egress-domain-filtering.md §5.8): a full replace of the sandbox's
+// egress policy, with the same fields and rules as create. Sending the same
+// body twice is a no-op.
+type NetworkPolicyRequest struct {
+	NetworkBlockAll bool     `json:"network_block_all"`
+	NetworkAllowOut []string `json:"network_allow_out"`
+	NetworkDenyOut  []string `json:"network_deny_out"`
+	EgressProfiles  []string `json:"egress_profiles"`
+	// NetworkEgressMode is "enforce" (empty means the same) or "learn".
+	NetworkEgressMode string `json:"network_egress_mode,omitempty"`
+	// NetworkEgressRules replaces the method and path rules. Adding an
+	// inspect rule needs a sandbox created with one (409 otherwise).
+	NetworkEgressRules []EgressRule `json:"network_egress_rules,omitempty"`
+}
+
+// NetworkPolicy is the effective egress policy a PUT leaves in force. A 2xx
+// means it is stored, replicated in a cluster, and live on a running
+// sandbox. EgressStatus is set for a container sandbox in gateway mode, as
+// on GET; "unenforced" there means the node's host firewall is off and the
+// policy was accepted only under SB_ALLOW_UNENFORCED_NETWORK_POLICY.
+type NetworkPolicy struct {
+	NetworkBlockAll bool     `json:"network_block_all"`
+	NetworkAllowOut []string `json:"network_allow_out"`
+	NetworkDenyOut  []string `json:"network_deny_out"`
+	EgressProfiles  []string `json:"egress_profiles"`
+	// NetworkEgressMode is "enforce" or "learn".
+	NetworkEgressMode  string       `json:"network_egress_mode"`
+	NetworkEgressRules []EgressRule `json:"network_egress_rules,omitempty"`
+	// EffectiveHostnameCount counts the hostname entries in force: inline
+	// plus every referenced profile's (at most 1024).
+	EffectiveHostnameCount int    `json:"effective_hostname_count"`
+	EgressStatus           string `json:"egress_status,omitempty"`
+}
+
+// EgressRule is one method and path rule (plans/egress-domain-filtering.md
+// §5.9, P3-1). Rules for one host are alternatives: a request to a ruled
+// host passes when some rule admits its method and path, and is refused
+// with 403 otherwise. A host no rule names keeps its allow-list decision.
+type EgressRule struct {
+	// Host is an exact name or "*." wildcard the allow list already admits.
+	Host string `json:"host"`
+	// Ports is [80] by default, or [443] with Inspect; only 80 and 443.
+	Ports []uint16 `json:"ports,omitempty"`
+	// Methods are exact, upper case; empty allows any.
+	Methods []string `json:"methods,omitempty"`
+	// Paths are globs: "*" within a segment, "**" as a whole segment for
+	// any number of them; empty allows any.
+	Paths []string `json:"paths,omitempty"`
+	// Inspect terminates TLS on 443 with the node's CA so requests can be
+	// checked, and makes the gateway require Host to equal the SNI.
+	Inspect bool `json:"inspect,omitempty"`
+	// Inject replaces a header on the requests this rule allows with a
+	// secret from the sandbox's own env, which the sandbox itself only
+	// sees as a placeholder (P3-2). Needs Inspect.
+	Inject *EgressInject `json:"inject,omitempty"`
+	// Binaries limits the rule to connections opened by these executables
+	// (absolute paths inside the sandbox; an interpreter's script counts),
+	// on runc sandboxes only (P3-3). A rule with only binaries decides
+	// whole connections, on any port the allow list opens.
+	Binaries []string `json:"binaries,omitempty"`
+}
+
+// EgressInject is a rule's credential injection (plans/egress-domain-
+// filtering.md §5.9, P3-2).
+type EgressInject struct {
+	// Header is replaced, never added to or substituted inside bodies.
+	Header string `json:"header"`
+	// SecretRef is "env:<KEY>": a key in the sandbox's env, withheld from
+	// the sandbox (it gets "aerolvm-placeholder:<KEY>") and handed to the
+	// egress gateway instead. Rotating it means recreating the sandbox.
+	SecretRef string `json:"secret_ref"`
+}
+
+// Egress modes (NetworkEgressMode).
+const (
+	NetworkEgressModeEnforce = "enforce"
+	NetworkEgressModeLearn   = "learn"
+)
+
+// NetworkLearned is GET /v1/sandboxes/{id}/network/learned: what a sandbox
+// reached while in learn mode, and the allow list that would have allowed
+// it. Exactly one of SuggestedAllowOut and SuggestedProfile holds the list:
+// the inline list when it fits 64 hostnames, a profile body otherwise.
+// Truncated means recording stopped at the cap.
+type NetworkLearned struct {
+	Mode              string                `json:"mode"`
+	Truncated         bool                  `json:"truncated"`
+	Entries           []NetworkLearnedEntry `json:"entries"`
+	CIDRs             []string              `json:"cidrs"`
+	SuggestedAllowOut []string              `json:"suggested_allow_out"`
+	SuggestedProfile  *EgressProfileRequest `json:"suggested_profile"`
+}
+
+// NetworkLearnedEntry is one destination a learn-mode sandbox reached.
+type NetworkLearnedEntry struct {
+	Host      string    `json:"host"`
+	Ports     []uint16  `json:"ports"`
+	FirstSeen time.Time `json:"first_seen"`
+	LastSeen  time.Time `json:"last_seen"`
+	Hits      uint64    `json:"hits"`
+}
+
+// EgressProfile is a named allowlist sandboxes reference by name
+// (plans/egress-domain-filtering.md D21). Profiles are owner-scoped like
+// sandbox names; Generation goes up by one on every change.
+type EgressProfile struct {
+	Name        string    `json:"name"`
+	AllowOut    []string  `json:"allow_out"`
+	Description string    `json:"description,omitempty"`
+	Generation  int64     `json:"generation"`
+	CreatedAt   time.Time `json:"created_at"`
+	UpdatedAt   time.Time `json:"updated_at"`
+}
+
+// EgressProfileRequest is the body of PUT /v1/egress-profiles/{name}, a full
+// replace: the same body twice is a no-op.
+type EgressProfileRequest struct {
+	AllowOut    []string `json:"allow_out"`
+	Description string   `json:"description,omitempty"`
+}
+
+// EgressProfileList is one page of GET /v1/egress-profiles.
+type EgressProfileList struct {
+	Profiles   []EgressProfile `json:"profiles"`
+	NextCursor string          `json:"next_cursor,omitempty"`
+}
+
+// EgressProfileRef is a profile and the generation of it a sandbox has live.
+type EgressProfileRef struct {
+	Name       string `json:"name"`
+	Generation int64  `json:"generation"`
+}
+
+// ErrorCodeEgressSpecCommitFailed is returned (503) when a policy update
+// could not be committed to the cluster's replicated spec; nothing changed.
+const ErrorCodeEgressSpecCommitFailed = "spec_commit_failed"
+
+// ErrorCodeEgressApplyFailedHeld is returned (503) when a policy update is
+// stored but could not be made live; a container sandbox is held without
+// egress until a retry (the PUT is idempotent) or the reconcile pass
+// applies it.
+const ErrorCodeEgressApplyFailedHeld = "apply_failed_held"
+
+// ErrorCodeEgressProfileInUse is a profile DELETE while sandboxes reference it.
+const ErrorCodeEgressProfileInUse = "egress_profile_in_use"
+
+// ErrorCodeEgressProfileCapExceeded is a profile PUT that would push a
+// referencing sandbox past the 1024-hostname union cap.
+const ErrorCodeEgressProfileCapExceeded = "egress_profile_cap_exceeded"
+
+// NetworkPolicyCheckRequest is POST /v1/network/policy/check: would a sandbox
+// created with these egress fields reach Destination? Destination is "host",
+// "host:port", "IP" or "IP:port"; a bare host is checked as the web ports.
+// No sandbox is involved (plans/egress-domain-filtering.md P2-9, CEO D5).
+type NetworkPolicyCheckRequest struct {
+	NetworkBlockAll bool     `json:"network_block_all,omitempty"`
+	NetworkAllowOut []string `json:"network_allow_out,omitempty"`
+	NetworkDenyOut  []string `json:"network_deny_out,omitempty"`
+	Destination     string   `json:"destination"`
+}
+
+// NetworkPolicyCheckResponse answers a policy check. MatchedRule is the entry
+// that decided, "" when the default verdict did. The check does not resolve
+// DNS, so deny CIDRs that a hostname's address would hit at connect time are
+// not evaluated. OutsideCeiling names the first allow entry outside this
+// deployment's operator ceiling (a create with it would get 400).
+type NetworkPolicyCheckResponse struct {
+	Allowed        bool   `json:"allowed"`
+	MatchedRule    string `json:"matched_rule"`
+	DefaultVerdict string `json:"default_verdict"`
+	OutsideCeiling string `json:"outside_ceiling,omitempty"`
+}
+
 // Each field is a pointer so the handler can distinguish "leave alone" (nil)
 // from "set to unlimited" (pointer to zero). Negative values are rejected at
 // the service layer.
@@ -904,9 +1214,15 @@ type UpdateNetworkLimitsRequest struct {
 // — it is never persisted and never returned again. The corresponding public
 // key is stored on the sandbox record and is the only key authorized to SSH
 // into that sandbox.
+//
+// Replayed is server-side only: the create found a sandbox an earlier create
+// of the same ID made and answered with it. A caller that rolls a failed
+// create back must not roll back a replay — the sandbox is the earlier
+// create's, not this request's.
 type CreateSandboxResponse struct {
 	Sandbox
 	SSHPrivateKey string `json:"ssh_private_key,omitempty"`
+	Replayed      bool   `json:"-"`
 }
 
 // CreateSandboxSnapshotRequest creates a reusable local image snapshot from an
@@ -914,6 +1230,14 @@ type CreateSandboxResponse struct {
 // pass back into CreateSandboxRequest.Image.
 type CreateSandboxSnapshotRequest struct {
 	Name string `json:"name"`
+	// AllowPause says whether the snapshot may pause a running sandbox.
+	// Omitted or true: a running sandbox is paused for the copy (Docker
+	// pauses the container while it commits it; Firecracker holds the
+	// guest's disk writes while it copies the disk) and keeps running
+	// afterwards. False: a sandbox that is not stopped is refused with
+	// ErrSnapshotSourceNotReady (409) instead, for workloads that must never
+	// stall. A stopped sandbox needs no pause either way.
+	AllowPause *bool `json:"allow_pause,omitempty"`
 }
 
 // SandboxSnapshot is the persisted metadata for a committed sandbox image.
@@ -968,6 +1292,12 @@ type SandboxSnapshot struct {
 	// PushError is populated only when PushState is "error" — the last error
 	// the reconciler saw, surfaced to the Daytona facade's errorReason field.
 	PushError string `json:"push_error,omitempty"`
+	// OwnerRef is the account the snapshot belongs to, with the same meaning
+	// and scoping rule as Sandbox.OwnerRef. It lives on the snapshot because
+	// a snapshot outlives the sandbox it was taken from: once the source is
+	// destroyed there is nothing else left to check ownership against. Never
+	// exposed over the wire.
+	OwnerRef string `json:"-"`
 }
 
 func (s SandboxSnapshot) ImageDistribution() ImageDistributionMetadata {
@@ -1059,7 +1389,11 @@ type HealthStatus struct {
 	SSHGateway      string `json:"ssh_gateway"`
 	ClusterTopology string `json:"cluster_topology,omitempty"`
 	ClusterNodes    int    `json:"cluster_nodes,omitempty"`
-	Version         string `json:"version"`
+	// KeyCustody is "revoked" while the customer's key store has revoked
+	// the server key and the node has stopped processing their data;
+	// otherwise empty (plans/customer-key-custody.md §10).
+	KeyCustody string `json:"key_custody,omitempty"`
+	Version    string `json:"version"`
 }
 
 type ExecRequest struct {
@@ -1082,6 +1416,53 @@ type ErrorResponse struct {
 	// to act on programmatically (retry, re-upload, ...). Absent for errors
 	// that are only ever shown to a person.
 	Code string `json:"code,omitempty"`
+	// Reason is the standard refusal reason on a 401 for an avm_ token or a
+	// JWT (expired, not_yet_valid, wrong_audience, ...; plans/
+	// identity-and-access.md D17), mirrored in the RFC 6750 WWW-Authenticate
+	// error_description. On a 403 for a verified OIDC token that matched no
+	// role binding it is no_binding or group_overage (design review DR8).
+	// Absent on every other error, including the operator token's 401, so
+	// those bodies are byte for byte unchanged.
+	Reason string `json:"reason,omitempty"`
+	// RequiredPermission and Role are set only on a 403 for an avm_ token or
+	// an OIDC caller (plans/identity-and-access.md §5.3, D9): the permission
+	// the route needs and the role the caller holds; Error carries the hint.
+	// Absent for the operator token and managed callers, so their 403 bodies
+	// are byte for byte unchanged.
+	RequiredPermission string `json:"required_permission,omitempty"`
+	Role               string `json:"role,omitempty"`
+	// Issuer, Name and Groups are set only on the "no binding" 403 (Reason
+	// no_binding or group_overage): the identity-file name of the issuer
+	// the caller signed in through, the caller's display name, and the
+	// groups the caller's token carried (none on group_overage). All three
+	// are the caller's own claims, so the dashboard and the CLI can show
+	// what an admin needs to add a binding (D9, DR8).
+	Issuer string   `json:"issuer,omitempty"`
+	Name   string   `json:"name,omitempty"`
+	Groups []string `json:"groups,omitempty"`
+}
+
+// WhoAmI is the body of GET /v1/whoami: the caller's own resolved identity
+// (plans/identity-and-access.md §5.2). It only ever describes the caller.
+type WhoAmI struct {
+	Principal WhoAmIPrincipal `json:"principal"`
+	// Role is viewer, runner, auditor or admin.
+	Role string `json:"role"`
+	// Team is "*" for a caller that acts on every team, the team name for a
+	// team-bound credential, and absent for a managed account.
+	Team string `json:"team,omitempty"`
+	// ExpiresAt is when the presented credential stops working; absent for
+	// one that does not expire (the operator token).
+	ExpiresAt *time.Time `json:"expires_at,omitempty"`
+}
+
+// WhoAmIPrincipal names who the caller is. ID is stable ("operator",
+// "node:n3", "controlplane:<subject>", later "tok_…" or "oidc:<issuer>:<sub>");
+// Name is for display only.
+type WhoAmIPrincipal struct {
+	Kind string `json:"kind"`
+	ID   string `json:"id"`
+	Name string `json:"name,omitempty"`
 }
 
 // ErrorCodeArtifactNodeUnavailable is returned (503) when an operation needs
@@ -1091,12 +1472,107 @@ type ErrorResponse struct {
 // image), which yields a new node-bound ref.
 const ErrorCodeArtifactNodeUnavailable = "artifact_node_unavailable"
 
+// ErrorCodeEgressGatewayUnavailable is returned (503, with Retry-After) when
+// a sandbox with hostname egress rules can't be filtered right now: the
+// node's egress gateway is down, or in a cluster no node has a ready one
+// (plans/egress-domain-filtering.md G7, CEO D20). Retrying is the recovery.
+const ErrorCodeEgressGatewayUnavailable = "egress_gateway_unavailable"
+
+// ErrorCodeEgressOperatorConfigInvalid is returned (503) for every create
+// while the egress operator file is present but invalid at boot: the
+// deployment's default egress policy is unknown, so creates fail closed
+// (plans/egress-domain-filtering.md §5.10).
+const ErrorCodeEgressOperatorConfigInvalid = "egress_operator_config_invalid"
+
+// ErrorCodeIPv6FenceNotReady is returned (503, with Retry-After) for a
+// container or Firecracker create while this node's IPv6 fence, which keeps
+// IPv6 off the sandbox bridges and TAPs, is not installed for that runtime;
+// the node retries it every few seconds.
+const ErrorCodeIPv6FenceNotReady = "ipv6_fence_not_ready"
+
+// ErrorCodeNetworkPolicyUnenforced is returned (501) for a create, start,
+// policy update or byte-cap update that needs the host firewall on a node
+// where it is off (SB_ENABLE_NETWORK_RULES=false, or not a Linux host): the
+// docker, containerd and Firecracker runtimes enforce block-all, address
+// lists, hostname rules and byte caps with it. Retrying won't help; the
+// operator turns the firewall on, or the caller drops the policy or picks a
+// runtime that filters egress itself (wasm, isolate).
+const ErrorCodeNetworkPolicyUnenforced = "network_policy_unenforced"
+
+// ErrorCodeMountToolUnavailable is returned (501) for a create or start whose
+// external-storage or platform-volume mount needs a mount tool (mount-s3,
+// sshfs, rclone, mount) that is not installed on this node, as on a local
+// install. Retrying won't help, so it is not a 503 (every SDK retries those);
+// the operator installs the tool (the server installer does), or the caller
+// creates the sandbox without the mount.
+const ErrorCodeMountToolUnavailable = "mount_tool_unavailable"
+
+// ErrorCodeOverloaded is returned (503, with Retry-After) when the node shed
+// the request: it already runs as many requests of that kind (cluster-wide
+// sandbox lists) as it is configured to. Retrying after Retry-After is the
+// recovery; nothing is wrong with the request.
+const ErrorCodeOverloaded = "overloaded"
+
+// ErrorCodeRateLimited is returned (429, with Retry-After) when the caller's
+// own tenant already runs its share of the node's requests of that kind
+// (cluster-wide sandbox lists): the node has room, but not for one more from
+// this tenant. Other tenants are unaffected. Retrying after Retry-After is
+// the recovery; slowing down is the cure.
+const ErrorCodeRateLimited = "rate_limited"
+
+// ErrorCodeNodeGuardNotReady is returned (503, with Retry-After) for a
+// container or Firecracker create while this node's guard that keeps
+// sandboxes off the node's own services is not installed for that runtime;
+// the node retries it every few seconds.
+const ErrorCodeNodeGuardNotReady = "node_guard_not_ready"
+
+// ErrorCodeEgressFloorNotReady is returned (503, with Retry-After) for a
+// container or Firecracker create while this node's egress deny floor, which
+// keeps sandboxes off the cloud metadata endpoints and the operator's
+// deny_cidrs, is not installed for that runtime; the node retries it every
+// few seconds.
+const ErrorCodeEgressFloorNotReady = "egress_floor_not_ready"
+
+// ErrorCodeIdempotencyKeyReused is returned (422) for a create whose
+// Idempotency-Key was already used with a different request. Retrying the
+// same request cannot succeed: send the original request, or a new key.
+const ErrorCodeIdempotencyKeyReused = "idempotency_key_reused"
+
+// ErrorCodeCreateInProgress is returned (503, with Retry-After) for a create
+// that waited past its bound for another create of the same sandbox ID (the
+// same Idempotency-Key) running on the node. Nothing was created; the same
+// request retried later gets that create's sandbox.
+const ErrorCodeCreateInProgress = "create_in_progress"
+
+// Key-store error codes, each returned with 503 when the key store that wraps
+// sandbox secrets (SB_SECRET_PROVIDER) answers with one of its five error
+// classes (plans/customer-key-custody.md, eng review Section 2). The response
+// message is fixed text, never the key store's own response.
+const (
+	// ErrorCodeKeyStoreUnavailable: the key store could not be reached.
+	// Retrying after Retry-After is the recovery.
+	ErrorCodeKeyStoreUnavailable = "key_store_unavailable"
+	// ErrorCodeKeyStoreThrottled: the key store, or this node's cap on calls
+	// to it, is saturated. Retrying after Retry-After is the recovery.
+	ErrorCodeKeyStoreThrottled = "key_store_throttled"
+	// ErrorCodeKeyStoreDenied: the key store refused this node's credentials
+	// or policy. An operator has to fix the grant.
+	ErrorCodeKeyStoreDenied = "key_store_denied"
+	// ErrorCodeKeyRevoked: the key was disabled or deleted in the key store,
+	// so secrets stay sealed until the key owner restores it.
+	ErrorCodeKeyRevoked = "key_revoked"
+	// ErrorCodeKeyVersionRetired: the secret was wrapped under a key version
+	// the key store no longer allows.
+	ErrorCodeKeyVersionRetired = "key_version_retired"
+)
+
 // Facade names used by sandbox_compat_state, snapshot_aliases, and
 // request_idempotency. The string is the only thing persisted, so renaming
 // a facade later would require a one-shot UPDATE.
 const (
 	FacadeDaytona = "daytona"
 	FacadeE2B     = "e2b"
+	FacadeRunloop = "runloop"
 )
 
 // SandboxCompatState carries facade-private state that has no native
@@ -1118,10 +1594,17 @@ type SandboxCompatState struct {
 type SnapshotAlias struct {
 	Alias        string
 	SnapshotName string
-	Facade       string
-	ExtraNames   []string
-	CreatedAt    time.Time
-	UpdatedAt    time.Time
+	// OwnerRef is the tenant that owns the snapshot this alias points at.
+	// Snapshot names are unique per owner, so the alias carries the owner to
+	// name a single snapshot and to cascade-delete with the right one.
+	OwnerRef   string
+	Facade     string
+	ExtraNames []string
+	// StateJSON is facade-private state for the snapshot, opaque to the
+	// store (the snapshot counterpart of SandboxCompatState.StateJSON).
+	StateJSON string
+	CreatedAt time.Time
+	UpdatedAt time.Time
 }
 
 // Idempotent-request states for request_idempotency.state. Pending means

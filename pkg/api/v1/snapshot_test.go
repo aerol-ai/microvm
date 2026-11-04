@@ -32,7 +32,7 @@ type snapshotV1TestEnv struct {
 	handler http.Handler
 }
 
-func newSnapshotV1TestEnv(t *testing.T, builder *fakeImageBuilder, build BuildConfig) *snapshotV1TestEnv {
+func newSnapshotV1TestEnv(t *testing.T, builder *fakeImageBuilder, build buildConfig) *snapshotV1TestEnv {
 	t.Helper()
 	st, err := store.Open(filepath.Join(t.TempDir(), "state.db"))
 	if err != nil {
@@ -41,16 +41,14 @@ func newSnapshotV1TestEnv(t *testing.T, builder *fakeImageBuilder, build BuildCo
 	t.Cleanup(func() { _ = st.Close() })
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	svc := service.New(config.Config{}, logger, st, &noopRuntime{}, nil, nil, nil, nil, nil)
+	svc := service.New(config.Config{ImageBuildContextEnabled: build.ContextEnabled, ImageBuildTimeout: build.Timeout}, logger, st, &noopRuntime{}, nil, nil, nil, nil, nil)
 	if builder == nil {
 		builder = &fakeImageBuilder{}
 	}
 	mux := http.NewServeMux()
 	RegisterRoutes(mux, Deps{
-		Service: svc,
+		Service: withBuilder(svc, builder),
 		Logger:  logger,
-		Builder: builder,
-		Build:   build,
 		Auth:    func(h http.Handler) http.Handler { return h },
 	})
 	return &snapshotV1TestEnv{svc: svc, store: st, builder: builder, handler: mux}
@@ -60,7 +58,7 @@ func newSnapshotV1TestEnv(t *testing.T, builder *fakeImageBuilder, build BuildCo
 // pre-built registry image. We persist a snapshot row with the supplied
 // resources/region and respond 201 with the stored row.
 func TestRegisterSnapshotFromImage(t *testing.T) {
-	env := newSnapshotV1TestEnv(t, nil, BuildConfig{})
+	env := newSnapshotV1TestEnv(t, nil, buildConfig{})
 
 	body := `{
 		"name": "py-base",
@@ -114,7 +112,7 @@ func TestRegisterSnapshotFromImage(t *testing.T) {
 // — we just want to prove the persisted state is what the reconciler will
 // pick up on its next tick.
 func TestRegisterSnapshotWithPusherMarksPending(t *testing.T) {
-	env := newSnapshotV1TestEnv(t, nil, BuildConfig{})
+	env := newSnapshotV1TestEnv(t, nil, buildConfig{})
 
 	patPath := filepath.Join(t.TempDir(), "pat")
 	if err := writeTestFile(patPath, "token"); err != nil {
@@ -176,7 +174,7 @@ func writeTestFile(path, contents string) error {
 // the daemon runs the build through Builder.BuildImage and registers the
 // resulting content-addressed tag as the snapshot's image.
 func TestRegisterSnapshotFromDockerfile(t *testing.T) {
-	env := newSnapshotV1TestEnv(t, &fakeImageBuilder{}, BuildConfig{})
+	env := newSnapshotV1TestEnv(t, &fakeImageBuilder{}, buildConfig{})
 
 	dockerfile := "FROM debian:bookworm-slim\nRUN apt-get update"
 	wantTag := docker.BuildTagFor(dockerfile, nil)
@@ -206,7 +204,7 @@ func TestRegisterSnapshotFromDockerfile(t *testing.T) {
 // TestRegisterSnapshotSingleLineFROM is the fast-path: a one-liner FROM
 // dockerfile with no context returns the bare image without a build.
 func TestRegisterSnapshotSingleLineFROM(t *testing.T) {
-	env := newSnapshotV1TestEnv(t, nil, BuildConfig{})
+	env := newSnapshotV1TestEnv(t, nil, buildConfig{})
 
 	body := `{"name":"alpine","dockerfile_content":"FROM alpine:3.20"}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/snapshots", strings.NewReader(body))
@@ -234,7 +232,7 @@ func TestRegisterSnapshotCacheHitRefreshes(t *testing.T) {
 	dockerfile := "FROM alpine:3.20\nRUN echo cached"
 	wantTag := docker.BuildTagFor(dockerfile, nil)
 	builder := &fakeImageBuilder{exists: map[string]bool{wantTag: true}}
-	env := newSnapshotV1TestEnv(t, builder, BuildConfig{})
+	env := newSnapshotV1TestEnv(t, builder, buildConfig{})
 
 	body, _ := json.Marshal(map[string]any{
 		"name":               "cached",
@@ -261,7 +259,7 @@ func TestRegisterSnapshotValidationErrors(t *testing.T) {
 	cases := []struct {
 		name     string
 		body     string
-		build    BuildConfig
+		build    buildConfig
 		wantCode int
 		wantHint string
 	}{
@@ -292,9 +290,9 @@ func TestRegisterSnapshotValidationErrors(t *testing.T) {
 		{
 			name:     "context_hashes with flag returns not implemented",
 			body:     `{"name":"x","dockerfile_content":"FROM a\nCOPY . /app","context_hashes":["deadbeef"]}`,
-			build:    BuildConfig{ContextEnabled: true},
+			build:    buildConfig{ContextEnabled: true},
 			wantCode: http.StatusNotImplemented,
-			wantHint: "context_hashes",
+			wantHint: "context uploads",
 		},
 		{
 			name:     "invalid json",
@@ -320,10 +318,10 @@ func TestRegisterSnapshotValidationErrors(t *testing.T) {
 	}
 }
 
-// TestRegisterSnapshotMissingBuilderFor multilineDockerfile checks the
-// graceful 400 when the daemon was started without an image builder but a
-// caller asked for a multi-line dockerfile build. Single-line FROM still
-// works without a builder (pass-through).
+// TestRegisterSnapshotMissingBuilder checks the 503 a daemon started
+// without an image builder gives a multi-line Dockerfile build — the same
+// answer as POST /v1/images/build. Single-line FROM still works without a
+// builder (pass-through).
 func TestRegisterSnapshotMissingBuilder(t *testing.T) {
 	st, err := store.Open(filepath.Join(t.TempDir(), "state.db"))
 	if err != nil {
@@ -334,9 +332,8 @@ func TestRegisterSnapshotMissingBuilder(t *testing.T) {
 	svc := service.New(config.Config{}, logger, st, &noopRuntime{}, nil, nil, nil, nil, nil)
 	mux := http.NewServeMux()
 	RegisterRoutes(mux, Deps{
-		Service: svc,
-		Logger:  logger,
-		Builder: nil, // no builder configured
+		Service: withBuilder(svc, nil),
+		Logger:  logger, // no builder configured
 		Auth:    func(h http.Handler) http.Handler { return h },
 	})
 
@@ -344,8 +341,8 @@ func TestRegisterSnapshotMissingBuilder(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/v1/snapshots", strings.NewReader(body))
 	rr := httptest.NewRecorder()
 	mux.ServeHTTP(rr, req)
-	if rr.Code != http.StatusBadRequest {
-		t.Fatalf("status = %d, want 400; body=%s", rr.Code, rr.Body.String())
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503; body=%s", rr.Code, rr.Body.String())
 	}
 	if !strings.Contains(rr.Body.String(), "image builder") {
 		t.Errorf("body should explain missing builder; got %s", rr.Body.String())
@@ -353,15 +350,15 @@ func TestRegisterSnapshotMissingBuilder(t *testing.T) {
 }
 
 // TestRegisterSnapshotBuildErrorRollsBack covers the registration-failure
-// path: if RegisterSnapshot fails after a successful build, we must call
-// RemoveImage on the freshly built tag, otherwise the layer leaks (no
-// snapshot row points at it for the built-image janitor).
+// path: if RegisterSnapshot fails after a successful build, the fresh tag is
+// handed to the image GC (service.DiscardBuiltImage), not removed on the
+// spot — another request may have been handed the same tag from the cache.
 //
 // We trigger that path by registering "boom" once successfully, then asking
 // to register the same name with a *different* image — the second call
 // surfaces a conflict from the service layer, and the rollback should fire.
 func TestRegisterSnapshotBuildErrorRollsBack(t *testing.T) {
-	env := newSnapshotV1TestEnv(t, &fakeImageBuilder{}, BuildConfig{})
+	env := newSnapshotV1TestEnv(t, &fakeImageBuilder{}, buildConfig{})
 
 	// First call: pin name "boom" to a single-line FROM (no build, no
 	// builder.removes invocation).
@@ -386,8 +383,8 @@ func TestRegisterSnapshotBuildErrorRollsBack(t *testing.T) {
 	if second.Code == http.StatusCreated {
 		t.Fatalf("expected conflict, got 201; body=%s", second.Body.String())
 	}
-	if len(env.builder.removes) != 1 || env.builder.removes[0] != wantTag {
-		t.Errorf("expected rollback RemoveImage(%q), got %+v", wantTag, env.builder.removes)
+	if len(env.builder.builds) != 1 || env.builder.builds[0].Tag != wantTag || len(env.builder.removes) != 0 {
+		t.Errorf("builds %+v, removes %+v; want one build of %q and no direct removal", env.builder.builds, env.builder.removes, wantTag)
 	}
 }
 
@@ -395,7 +392,7 @@ func TestRegisterSnapshotBuildErrorRollsBack(t *testing.T) {
 // 504 via the writeBuildError sentinel mapping.
 func TestRegisterSnapshotBuildTimeout(t *testing.T) {
 	builder := &fakeImageBuilder{buildErr: context.DeadlineExceeded}
-	env := newSnapshotV1TestEnv(t, builder, BuildConfig{})
+	env := newSnapshotV1TestEnv(t, builder, buildConfig{})
 
 	body := `{"name":"slow","dockerfile_content":"FROM debian:bookworm\nRUN sleep 9999"}`
 	rr := httptest.NewRecorder()
@@ -411,7 +408,7 @@ func TestRegisterSnapshotBuildTimeout(t *testing.T) {
 // 502.
 func TestRegisterSnapshotBuildOperationalError(t *testing.T) {
 	builder := &fakeImageBuilder{buildErr: errors.New("docker daemon refused")}
-	env := newSnapshotV1TestEnv(t, builder, BuildConfig{})
+	env := newSnapshotV1TestEnv(t, builder, buildConfig{})
 
 	body := `{"name":"broken","dockerfile_content":"FROM debian:bookworm\nRUN false"}`
 	rr := httptest.NewRecorder()

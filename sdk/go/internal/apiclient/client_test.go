@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/aerol-ai/microvm/pkg/models"
+	sdktypes "github.com/aerol-ai/microvm/sdk/go/pkg/types"
 )
 
 func TestTransportClientCases(t *testing.T) {
@@ -110,7 +111,7 @@ func TestTransportClientCases(t *testing.T) {
 				defer server.Close()
 
 				client := NewClient(server.URL, ClientOptions{PATToken: "pat-token", HTTPClient: server.Client()})
-				snapshot, err := client.CreateSnapshot(ctx, "sb-snap", "snapshots/demo:v1")
+				snapshot, err := client.CreateSnapshot(ctx, "sb-snap", "snapshots/demo:v1", nil)
 				if err != nil {
 					t.Fatalf("CreateSnapshot() error = %v", err)
 				}
@@ -164,6 +165,27 @@ func TestTransportClientCases(t *testing.T) {
 				}
 				if usage.BytesIn != 1024 || usage.BytesOutLimit != 0 || usage.QuotaExceeded {
 					t.Fatalf("unexpected usage: %+v", usage)
+				}
+			},
+		},
+		{
+			name: "get_audit_without_options_sends_no_query_and_never_returns_nil_events",
+			run: func(t *testing.T) {
+				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					if r.Method != http.MethodGet || r.URL.Path != "/v1/sandboxes/sb-a/audit" || r.URL.RawQuery != "" {
+						t.Fatalf("unexpected request: %s %s?%s", r.Method, r.URL.Path, r.URL.RawQuery)
+					}
+					_, _ = w.Write([]byte(`{"events":null,"coverage":{"answered":[],"missing":[],"partial":false}}`))
+				}))
+				defer server.Close()
+				client := NewClient(server.URL, ClientOptions{PATToken: "pat-token", HTTPClient: server.Client()})
+				page, err := client.GetAudit(ctx, "sb-a", sdktypes.AuditOptions{})
+				if err != nil || page.Events == nil || len(page.Events) != 0 {
+					t.Fatalf("GetAudit() = %+v, %v", page, err)
+				}
+				server.Close()
+				if _, err := client.GetAudit(ctx, "sb-a", sdktypes.AuditOptions{}); err == nil {
+					t.Fatal("transport errors surface")
 				}
 			},
 		},
@@ -309,6 +331,56 @@ func TestCreateForwardsPlatformVolumes(t *testing.T) {
 	}
 	if ro, _ := raw[1].(map[string]any)["read_only"].(bool); !ro {
 		t.Fatalf("second volume read_only not serialized: %#v", raw[1])
+	}
+}
+
+// TestCreateForwardsGPUsAndTemplateID guards the gpus and template_id wire
+// shapes. Other SDKs silently dropped these at create; the Go SDK aliases
+// pkg/models, so this pins the snake_case keys and that unset fields stay
+// off the wire rather than arriving as null or "".
+func TestCreateForwardsGPUsAndTemplateID(t *testing.T) {
+	ctx := context.Background()
+	var bodies []map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var seen map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&seen); err != nil {
+			t.Fatalf("decode payload: %v", err)
+		}
+		bodies = append(bodies, seen)
+		_ = json.NewEncoder(w).Encode(models.CreateSandboxResponse{
+			Sandbox: models.Sandbox{ID: "sb-gpu", Image: "ubuntu:22.04", Status: models.SandboxStatusStarted},
+		})
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL, ClientOptions{PATToken: "pat", HTTPClient: server.Client()})
+	if _, _, err := client.Create(ctx, CreateOptions{
+		Image:      "ubuntu:22.04",
+		Runtime:    models.RuntimeFirecracker,
+		TemplateID: "tpl-1",
+		GPUs:       &models.GPURequest{Vendor: models.GPUVendorNVIDIA, Count: 2, DeviceIDs: []string{"0", "1"}},
+	}); err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+	if _, _, err := client.Create(ctx, CreateOptions{Image: "ubuntu:22.04"}); err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+
+	set := bodies[0]
+	if set["template_id"] != "tpl-1" {
+		t.Fatalf("template_id = %#v, want tpl-1", set["template_id"])
+	}
+	gpus, ok := set["gpus"].(map[string]any)
+	if !ok || gpus["vendor"] != "nvidia" || gpus["count"] != float64(2) {
+		t.Fatalf("gpus wire shape = %#v", set["gpus"])
+	}
+	if ids, _ := gpus["device_ids"].([]any); len(ids) != 2 || ids[0] != "0" || ids[1] != "1" {
+		t.Fatalf("gpus.device_ids = %#v, want [0 1]", gpus["device_ids"])
+	}
+	for _, key := range []string{"gpus", "template_id"} {
+		if _, present := bodies[1][key]; present {
+			t.Fatalf("unset %s sent on the wire: %#v", key, bodies[1][key])
+		}
 	}
 }
 

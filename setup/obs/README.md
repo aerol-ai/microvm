@@ -4,14 +4,30 @@ Terraform `deploy_obs=true` provisions a dedicated EC2 instance (not a sandboxd
 node) running Prometheus, Grafana, Pushgateway, and grafana-image-renderer via
 `docker compose` from this directory.
 
-## PAT at rest
+## The scrape credential at rest
 
-Prometheus authenticates to each sandboxd node's `GET /v1/metrics` with the
-cluster PAT. Terraform renders that token into `prometheus.yml` on the obs host
-filesystem. Anyone with SSH or disk access to the obs instance can read it.
-Integration-test clusters use throwaway PATs destroyed with the stack; do not
-reuse this pattern for long-lived production secrets without additional
-hardening (short-lived scrape tokens, Secrets Manager, etc.).
+Prometheus authenticates to each sandboxd node's `GET /v1/metrics` with a
+bearer token. Terraform renders that token into `prometheus.yml` on the obs host
+filesystem, so anyone with SSH or disk access to the obs instance can read it.
+
+- **`cluster.metrics_token` set** (in `config/secrets.yml`): the scrape uses
+  it. It must be an `avm_` API token, normally a `viewer` bound to every team:
+  `aerolvm token create --name prometheus --role viewer --team '*' --expires-in 90d`.
+  That token is **read-only, not metrics-only**: it cannot create, run or
+  delete anything, but it can also read every team's sandbox metadata and
+  audit records. It needs `SB_IDENTITY_ENABLED=true` on the nodes.
+- **`cluster.metrics_token` empty** (the default): the scrape uses the cluster
+  PAT, exactly as before. Integration-test clusters use throwaway PATs
+  destroyed with the stack; do not reuse this for long-lived production
+  secrets.
+- **`SB_PAT_SCOPE=host`** refuses the PAT from the obs host, so set
+  `metrics_token` before turning it on. The bootstrap is two steps: bring the
+  cluster up, mint the token on a node with the PAT
+  (`SB_API_URL=http://127.0.0.1:21212`), set `cluster.metrics_token`, and
+  re-apply.
+
+Rotation, the first admin token and turning on host scope are in
+[`setup/runbooks/identity-and-access.md`](../runbooks/identity-and-access.md).
 
 ## Pushgateway
 

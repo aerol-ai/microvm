@@ -5,11 +5,9 @@ import (
 	"errors"
 	"io"
 	"log/slog"
-	"net"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 
@@ -175,19 +173,6 @@ func TestEnsureTLSWakeListenerAndClose(t *testing.T) {
 	svc.closeAllTLSWakeListeners()
 }
 
-func TestProxyCopyAndCloseWrite(t *testing.T) {
-	client, server := net.Pipe()
-	defer client.Close()
-	defer server.Close()
-	done := make(chan struct{}, 1)
-	go proxyCopyAndCloseWrite(server, strings.NewReader("hello"), done)
-	buf := make([]byte, 5)
-	if _, err := io.ReadFull(client, buf); err != nil || string(buf) != "hello" {
-		t.Fatalf("read = %q, %v", buf, err)
-	}
-	<-done
-}
-
 // --- template_pull.go adapter ---
 
 func TestNewTemplateArtifactPullDockerAdapterNil(t *testing.T) {
@@ -266,7 +251,7 @@ func TestRegisterSnapshotAndKickReconciler(t *testing.T) {
 		t.Fatal("nil snapshot should fail")
 	}
 
-	row, err := st.GetSnapshot(ctx, "snap-reg")
+	row, err := st.GetSnapshot(ctx, "", "snap-reg")
 	if err != nil || row == nil {
 		t.Fatalf("GetSnapshot: %v", err)
 	}
@@ -290,7 +275,7 @@ func TestDeleteSnapshotPaths(t *testing.T) {
 
 	now := time.Now().UTC()
 	if err := st.CreateSnapshot(ctx, &models.SandboxSnapshot{
-		Name: "del-me", Image: "img:del", CreatedAt: now,
+		Name: "del-me", Image: "img:del", SourceSandboxID: "sb-gone", CreatedAt: now,
 	}); err != nil {
 		t.Fatalf("CreateSnapshot: %v", err)
 	}
@@ -302,7 +287,7 @@ func TestDeleteSnapshotPaths(t *testing.T) {
 	}
 
 	if err := st.CreateSnapshot(ctx, &models.SandboxSnapshot{
-		Name: "del-fail", Image: "img:fail", CreatedAt: now,
+		Name: "del-fail", Image: "img:fail", SourceSandboxID: "sb-gone", CreatedAt: now,
 	}); err != nil {
 		t.Fatalf("CreateSnapshot: %v", err)
 	}
@@ -435,23 +420,9 @@ func TestAddLocalIngressExpectedRoutes(t *testing.T) {
 
 // --- snapshot_push_retry pushOne edge cases ---
 
-type claimFailPushStore struct {
-	*fakePushStore
-	claimErr error
-}
-
-func (f *claimFailPushStore) SetSnapshotPushState(ctx context.Context, name, state, errMsg string) error {
-	if state == models.SnapshotPushStatePushing && f.claimErr != nil {
-		return f.claimErr
-	}
-	return f.fakePushStore.SetSnapshotPushState(ctx, name, state, errMsg)
-}
-
 func TestPushOneClaimFailure(t *testing.T) {
-	fs := &claimFailPushStore{
-		fakePushStore: newFakePushStore(),
-		claimErr:      errors.New("claim failed"),
-	}
+	fs := newFakePushStore()
+	fs.claimErr = errors.New("claim failed")
 	fs.seed(&models.SandboxSnapshot{
 		Name: "snap-claim", Image: "img:1",
 		PushState:             models.SnapshotPushStatePending,
@@ -468,7 +439,9 @@ func TestPushOneClaimFailure(t *testing.T) {
 
 func TestHandleDockerEventDestroyAndStart(t *testing.T) {
 	ctx := context.Background()
-	svc, admitter, st := newCapacityHarness(t, nil, nil)
+	svc, admitter, st := newCapacityHarness(t, nil, map[string]*models.SandboxRuntimeState{
+		"ctr-sb-evt": {SandboxID: "sb-evt", ContainerID: "ctr-sb-evt", Status: models.SandboxStatusStarted},
+	})
 	seedSandbox(t, st, "sb-evt", models.SandboxStatusStarted, 1, 512)
 	admitter.Reserve("sb-evt", capacity.Request{CPU: 1, MemoryMB: 512})
 

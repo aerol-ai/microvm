@@ -10,7 +10,6 @@ import (
 	"net"
 	"net/http"
 	"net/url"
-	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -24,6 +23,7 @@ import (
 	"github.com/aerol-ai/microvm/pkg/api/clustercreate"
 	"github.com/aerol-ai/microvm/pkg/api/clusterlist"
 	"github.com/aerol-ai/microvm/pkg/api/facadeutil"
+	"github.com/aerol-ai/microvm/pkg/controlplane"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
 
@@ -34,20 +34,26 @@ type handlers struct {
 	defaultDomain  *string
 	defaultEnvdVer string
 	snapshotMu     sync.Mutex
+	// legacyFingerprintsUntil ends the window in which a create still looks
+	// for a claim under the unkeyed fingerprint (legacyFingerprintWindow).
+	legacyFingerprintsUntil time.Time
 }
 
 func newHandlers(d Deps) *handlers {
 	return &handlers{
-		deps:           d,
-		templateMap:    loadTemplateMap(d.Logger),
-		clientID:       loadClientID(),
-		defaultEnvdVer: defaultEnvdVersion,
+		deps:                    d,
+		templateMap:             loadTemplateMap(d.TemplateMapJSON, d.Logger),
+		clientID:                loadClientID(d.ClientID),
+		defaultEnvdVer:          defaultEnvdVersion,
+		legacyFingerprintsUntil: time.Now().Add(legacyFingerprintWindow),
 	}
 }
 
 func (h *handlers) createSandbox(w http.ResponseWriter, r *http.Request) {
 	var req createSandboxRequest
-	if err := apihttp.DecodeJSON(w, r, &req); err != nil {
+	// Buffer the body: clustercreate may forward this request to the
+	// placement target, which re-reads the original E2B wire body (B2).
+	if _, err := apihttp.DecodeAndBufferJSON(w, r, &req); err != nil {
 		WriteError(w, http.StatusBadRequest, "Invalid JSON body")
 		return
 	}
@@ -59,19 +65,43 @@ func (h *handlers) createSandbox(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	fingerprint, err := createRequestFingerprint(svcmetrics.OwnerRefForCreate(r.Context()), req.TemplateID, serviceReq, meta)
+	fingerprints, err := createRequestFingerprints(h.deps.Service, svcmetrics.OwnerRefForCreate(r.Context()), req.TemplateID, serviceReq, meta,
+		time.Now().Before(h.legacyFingerprintsUntil))
 	if err != nil {
 		writeStoreAwareError(h.deps.Logger, w, err)
 		return
 	}
+	fingerprint := fingerprints.current
 	deterministicID := sandboxIDFromFingerprint(fingerprint)
-	decision, ok := clustercreate.Prepare(w, r, h.deps.Service, serviceReq, WriteError, clustercreate.PrepareOptions{PreferredSandboxID: deterministicID})
+	decision, ok := clustercreate.Prepare(w, r, h.deps.Service, serviceReq, writeErrorCode, clustercreate.PrepareOptions{PreferredSandboxID: deterministicID})
 	if !ok {
 		return
 	}
 	cleanupReservation := func() {
-		if err := h.deps.Service.DeleteIdempotentRequest(r.Context(), idempotencyScopeCreate, fingerprint); err != nil && !errors.Is(err, store.ErrNotFound) && h.deps.Logger != nil {
-			h.deps.Logger.Warn("e2b create reservation cleanup failed", "fingerprint", fingerprint, "error", err)
+		// Detach from the request context: a client that disconnected mid-create
+		// is exactly when this runs, and it must still free the idempotency key
+		// promptly rather than leave a pending row to age out on its TTL (D5).
+		// This mirrors the create rollback, which already uses a detached context.
+		if err := h.deps.Service.DeleteIdempotentRequest(context.WithoutCancel(r.Context()), idempotencyScopeCreate, fingerprint); err != nil && !errors.Is(err, store.ErrNotFound) && h.deps.Logger != nil {
+			h.deps.Logger.Warn("e2b create reservation cleanup failed", "sandbox_id", deterministicID, "error", err)
+		}
+	}
+
+	// A retry of a create claimed under an earlier fingerprint (the previous
+	// server key, or the unkeyed format before an upgrade) replays that
+	// create, or waits for it, as a claim under the current one would.
+	for _, earlier := range fingerprints.earlier {
+		sandbox, storedMeta, replayed, err := h.waitForCreateReplay(r.Context(), earlier)
+		if err != nil {
+			if !writeKnownError(w, err) {
+				writeStoreAwareError(h.deps.Logger, w, err)
+			}
+			return
+		}
+		if replayed {
+			svcmetrics.RecordFacadeIdempotencyReplay(idempotencyScopeCreate)
+			writeJSON(w, http.StatusCreated, h.toSandboxResponse(r, sandbox, storedMeta))
+			return
 		}
 	}
 
@@ -120,15 +150,21 @@ func (h *handlers) createSandbox(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// A replay (Replayed) answers with the sandbox an earlier create of the
+	// id made; a failure below must not roll that sandbox back.
 	if err := h.persistSandboxMeta(r.Context(), response.ID, meta); err != nil {
-		clustercreate.RollbackLocalCreate(context.Background(), h.deps.Service, h.deps.Logger, response.ID)
+		if !response.Replayed {
+			clustercreate.RollbackLocalCreate(context.Background(), h.deps.Service, h.deps.Logger, response.ID)
+		}
 		cleanupReservation()
 		writeStoreAwareError(h.deps.Logger, w, err)
 		return
 	}
 
 	if err := h.deps.Service.CompleteIdempotentRequest(r.Context(), idempotencyScopeCreate, fingerprint, response.ID, time.Now().UTC(), e2bCreateReplayWindow); err != nil {
-		clustercreate.RollbackLocalCreate(context.Background(), h.deps.Service, h.deps.Logger, response.ID)
+		if !response.Replayed {
+			clustercreate.RollbackLocalCreate(context.Background(), h.deps.Service, h.deps.Logger, response.ID)
+		}
 		cleanupReservation()
 		writeStoreAwareError(h.deps.Logger, w, err)
 		return
@@ -136,8 +172,11 @@ func (h *handlers) createSandbox(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, h.toSandboxResponse(r, &response.Sandbox, meta))
 }
 
+// sandboxIDFromFingerprint is "sb-" and the first 16 hex digits of a
+// fingerprint's digest ("hmac:<key id>:<hex>", or an older "fingerprint:<hex>").
 func sandboxIDFromFingerprint(fingerprint string) string {
-	hexPart := strings.TrimPrefix(strings.TrimSpace(fingerprint), "fingerprint:")
+	fingerprint = strings.TrimSpace(fingerprint)
+	hexPart := fingerprint[strings.LastIndex(fingerprint, ":")+1:]
 	if len(hexPart) < 16 {
 		return ""
 	}
@@ -149,81 +188,31 @@ func sandboxIDFromFingerprint(fingerprint string) string {
 //
 // Cluster mode is placement-cursor based (page_token/limit). Callers must 503
 // when viewReady is false, matching /v1/sandboxes.
+// listFacadeClusterItems delegates to the shared cluster-list glue, forwarding
+// the caller's X-API-KEY as well as Authorization so an X-API-KEY-only tenant's
+// remote sandboxes are not dropped (B9).
 func (h *handlers) listFacadeClusterItems(r *http.Request, local []listedSandboxResponse) ([]listedSandboxResponse, clusterlist.Coverage, string, bool) {
-	cov := clusterlist.Coverage{Answered: []string{"local"}, PlacementViewReady: true}
-	if h.deps.Service == nil || r.Header.Get("X-Cluster-Forwarded") == "1" {
-		return local, cov, "", true
+	var c cluster.Client
+	if h.deps.Service != nil {
+		c = h.deps.Service.Cluster()
 	}
-	c := h.deps.Service.Cluster()
-	if c == nil {
-		return local, cov, "", true
-	}
-	if _, ok := c.(*cluster.Noop); ok {
-		return local, cov, "", true
-	}
-	ownerRef := clusterlist.OwnerRefFromContext(r.Context())
-	limit, pageToken := clusterlist.ParsePageParams(r.URL)
-	peers, placements, next, viewReady, missingOwners := clusterlist.SelectPeersForPage(c, ownerRef, pageToken, limit)
-	if !viewReady {
-		cov.PlacementViewReady = false
-		cov.Partial = true
-		return nil, cov, "", false
-	}
-	local = filterE2BLocalToPage(local, placements, pageToken)
-	items, cov := clusterlist.MergeJSON(r.Context(), peers, local, func(it listedSandboxResponse) string { return it.SandboxID }, clusterlist.Options{
-		OwnerRef:   ownerRef,
-		AuthHeader: r.Header.Get("Authorization"),
-		// Peers must not re-apply nextToken/limit — ingress paginates after merge.
-		RawQuery:   clusterlist.StripFacadePagination(r.URL.RawQuery),
-		Path:       PathPrefix + "/sandboxes",
-		Transport:  clusterlist.TransportFromCluster(c),
-		SelfNodeID: c.SelfNodeID(),
-		WantIDs:    clusterlist.PlacementWantIDs(placements),
+	return clusterlist.FacadeListPage(r, c, local, func(it listedSandboxResponse) string { return it.SandboxID }, clusterlist.FacadeListOptions{
+		Path:         PathPrefix + "/sandboxes",
+		AuthHeader:   r.Header.Get("Authorization"),
+		APIKeyHeader: r.Header.Get("X-API-KEY"),
 		Warn: func(msg, peer string, peerErr error) {
 			if h.deps.Logger != nil {
 				h.deps.Logger.Warn(msg, "peer", peer, "error", peerErr)
 			}
 		},
 	})
-	cov.PlacementViewReady = viewReady
-	if len(missingOwners) > 0 {
-		cov.Missing = append(cov.Missing, missingOwners...)
-		cov.Partial = true
-	}
-	return items, cov, next, true
 }
 
-func filterE2BLocalToPage(local []listedSandboxResponse, placements []cluster.Placement, pageToken string) []listedSandboxResponse {
-	if placements == nil {
-		if strings.TrimSpace(pageToken) != "" {
-			return nil
-		}
-		return local
-	}
-	want := clusterlist.PlacementWantIDs(placements)
-	out := make([]listedSandboxResponse, 0, len(local))
-	for _, it := range local {
-		if _, ok := want[it.SandboxID]; ok {
-			out = append(out, it)
-		}
-	}
-	return out
-}
-
-// clusterListMode is true when a real cluster client is attached (not the
-// standalone Noop default from service.New) and this is not a forwarded peer hop.
 func clusterListMode(svc *svcmetrics.Service, r *http.Request) bool {
-	if svc == nil || r == nil || r.Header.Get("X-Cluster-Forwarded") == "1" {
+	if svc == nil {
 		return false
 	}
-	c := svc.Cluster()
-	if c == nil {
-		return false
-	}
-	if _, ok := c.(*cluster.Noop); ok {
-		return false
-	}
-	return true
+	return clusterlist.ListMode(svc.Cluster(), r)
 }
 
 func (h *handlers) listSandboxes(w http.ResponseWriter, r *http.Request) {
@@ -231,6 +220,12 @@ func (h *handlers) listSandboxes(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, []listedSandboxResponse{})
 		return
 	}
+	release, err := clusterlist.Admit(h.deps.ListGate, h.deps.Service.Cluster(), r)
+	if err != nil {
+		writeStoreAwareError(h.deps.Logger, w, err)
+		return
+	}
+	defer release()
 	sandboxes, err := h.deps.Service.ListSandboxes(r.Context(), nil)
 	if err != nil {
 		writeStoreAwareError(h.deps.Logger, w, err)
@@ -362,7 +357,14 @@ func (h *handlers) getSandbox(w http.ResponseWriter, r *http.Request) {
 		writeStoreAwareError(h.deps.Logger, w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, h.toSandboxDetailResponse(r, sandbox, meta))
+	detail := h.toSandboxDetailResponse(r, sandbox, meta)
+	if !apihttp.CallerCan(r.Context(), controlplane.PermSandboxExec) {
+		// The envd token opens the sandbox's toolbox (/e2b/runtime), so a
+		// caller that may read the sandbox but not exec in it (a viewer or
+		// auditor) gets the detail without it.
+		detail.EnvdAccessToken = ""
+	}
+	writeJSON(w, http.StatusOK, detail)
 }
 
 func (h *handlers) deleteSandbox(w http.ResponseWriter, r *http.Request) {
@@ -388,7 +390,11 @@ func (h *handlers) connectSandbox(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	sandbox, err := h.deps.Service.GetSandbox(r.Context(), r.PathValue("id"))
+	// Connect is E2B's resume: start a stopped sandbox, no-op a started one,
+	// 409 anything else — one locked transition in the service (D7). The 404
+	// keeps E2B's wording; the 409 (ErrSandboxNotResumable) is reworded by the
+	// classifier to "Sandbox is not available for connect".
+	sandbox, err := h.deps.Service.ResumeSandbox(r.Context(), r.PathValue("id"))
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			WriteError(w, http.StatusNotFound, "Sandbox not found")
@@ -403,26 +409,23 @@ func (h *handlers) connectSandbox(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if sandbox.Status == models.SandboxStatusStopped {
-		sandbox, err = h.deps.Service.StartSandbox(r.Context(), sandbox.ID)
-		if err != nil {
-			writeStoreAwareError(h.deps.Logger, w, err)
-			return
+	// Extend the timeout, but never shorten a longer one on reconnect — the
+	// patch reads the current Lifecycle under the sandbox lock and signals "no
+	// change" when the new deadline is not later.
+	updated, changed, err := h.deps.Service.ApplyLifecyclePatch(r.Context(), sandbox.ID, func(sb *models.Sandbox) (models.Lifecycle, bool, error) {
+		currentDeadline, hasDeadline := timeoutDeadline(sb, meta)
+		desiredLifecycle := lifecycleForTimeout(sb, meta.OnTimeout, req.Timeout)
+		desiredDeadline, _ := timeoutDeadline(&models.Sandbox{CreatedAt: sb.CreatedAt, Lifecycle: desiredLifecycle}, meta)
+		if hasDeadline && !desiredDeadline.After(currentDeadline) {
+			return models.Lifecycle{}, false, nil
 		}
-	} else if sandbox.Status != models.SandboxStatusStarted {
-		WriteError(w, http.StatusConflict, "Sandbox is not available for connect")
+		return desiredLifecycle, true, nil
+	})
+	if err != nil {
+		writeStoreAwareError(h.deps.Logger, w, err)
 		return
 	}
-
-	currentDeadline, hasDeadline := timeoutDeadline(sandbox, meta)
-	desiredLifecycle := lifecycleForTimeout(sandbox, meta.OnTimeout, req.Timeout)
-	desiredDeadline, _ := timeoutDeadline(&models.Sandbox{CreatedAt: sandbox.CreatedAt, Lifecycle: desiredLifecycle}, meta)
-	if !hasDeadline || desiredDeadline.After(currentDeadline) {
-		sandbox, err = h.deps.Service.UpdateLifecycle(r.Context(), sandbox.ID, desiredLifecycle)
-		if err != nil {
-			writeStoreAwareError(h.deps.Logger, w, err)
-			return
-		}
+	if changed {
 		meta.TimeoutSeconds = req.Timeout
 		if err := h.persistSandboxMeta(r.Context(), sandbox.ID, meta); err != nil {
 			writeStoreAwareError(h.deps.Logger, w, err)
@@ -430,28 +433,18 @@ func (h *handlers) connectSandbox(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	writeJSON(w, http.StatusOK, h.toSandboxResponse(r, sandbox, meta))
+	writeJSON(w, http.StatusOK, h.toSandboxResponse(r, updated, meta))
 }
 
 func (h *handlers) pauseSandbox(w http.ResponseWriter, r *http.Request) {
-	sandbox, err := h.deps.Service.GetSandbox(r.Context(), r.PathValue("id"))
-	if err != nil {
+	// The "running" precondition and the stop are one locked transition in the
+	// service (D7); an already-stopped sandbox is a no-op. The 404 keeps E2B's
+	// wording; the 409 (ErrSandboxNotRunning) is reworded by the classifier.
+	if _, err := h.deps.Service.PauseSandbox(r.Context(), r.PathValue("id")); err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			WriteError(w, http.StatusNotFound, "Sandbox not found")
 			return
 		}
-		writeStoreAwareError(h.deps.Logger, w, err)
-		return
-	}
-	if sandbox.Status == models.SandboxStatusStopped {
-		w.WriteHeader(http.StatusNoContent)
-		return
-	}
-	if sandbox.Status != models.SandboxStatusStarted {
-		WriteError(w, http.StatusConflict, "Sandbox is not running")
-		return
-	}
-	if _, err := h.deps.Service.StopSandbox(r.Context(), sandbox.ID); err != nil {
 		writeStoreAwareError(h.deps.Logger, w, err)
 		return
 	}
@@ -484,8 +477,12 @@ func (h *handlers) updateTimeout(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	lifecycle := lifecycleForTimeout(sandbox, meta.OnTimeout, req.Timeout)
-	if _, err := h.deps.Service.UpdateLifecycle(r.Context(), sandbox.ID, lifecycle); err != nil {
+	// Reset the timeout timers, reading the current Lifecycle under the sandbox
+	// lock so a concurrent idle-timer change can't be clobbered (D7). OnTimeout
+	// is fixed at create, so reading meta outside the lock is safe.
+	if _, _, err := h.deps.Service.ApplyLifecyclePatch(r.Context(), sandbox.ID, func(sb *models.Sandbox) (models.Lifecycle, bool, error) {
+		return lifecycleForTimeout(sb, meta.OnTimeout, req.Timeout), true, nil
+	}); err != nil {
 		writeStoreAwareError(h.deps.Logger, w, err)
 		return
 	}
@@ -495,6 +492,73 @@ func (h *handlers) updateTimeout(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// updateNetwork is E2B's PUT /sandboxes/{id}/network
+// (SandboxNetworkUpdateConfig): it replaces the sandbox's egress rules, and
+// an omitted field is cleared. The native policy changes first, through the
+// same live update as PUT /v1/.../network/policy; the E2B spelling GET echoes
+// is recorded after, and a retry of the same body converges both.
+func (h *handlers) updateNetwork(w http.ResponseWriter, r *http.Request) {
+	var req sandboxNetworkUpdateRequest
+	if err := apihttp.DecodeJSON(w, r, &req); err != nil {
+		WriteError(w, http.StatusBadRequest, "Invalid JSON body")
+		return
+	}
+	if err := unsupportedNetworkFields(req.EgressProxy, req.Rules); err != nil {
+		writeKnownError(w, err)
+		return
+	}
+	sandbox, err := h.deps.Service.GetSandbox(r.Context(), r.PathValue("id"))
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			WriteError(w, http.StatusNotFound, "Sandbox not found")
+			return
+		}
+		writeStoreAwareError(h.deps.Logger, w, err)
+		return
+	}
+	meta, err := h.loadSandboxMeta(r.Context(), sandbox)
+	if err != nil {
+		writeStoreAwareError(h.deps.Logger, w, err)
+		return
+	}
+	// E2B can't express egress profiles, so the update keeps the sandbox's
+	// (D19).
+	blockAll, allow, deny := e2bEgressPolicy(req.AllowOut, req.DenyOut, req.AllowInternetAccess)
+	if _, err := h.deps.Service.UpdateNetworkLists(r.Context(), sandbox.ID, blockAll, allow, deny); err != nil {
+		writeStoreAwareError(h.deps.Logger, w, err)
+		return
+	}
+	meta.NetworkAllowOut, meta.NetworkDenyOut = cloneStringSlice(req.AllowOut), cloneStringSlice(req.DenyOut)
+	if err := h.persistSandboxMeta(r.Context(), sandbox.ID, meta); err != nil {
+		writeStoreAwareError(h.deps.Logger, w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// unsupportedNetworkFields refuses E2B network features this server doesn't
+// have. Silently dropping either would leave traffic untunneled or requests
+// untransformed while the caller believes otherwise.
+func unsupportedNetworkFields(egressProxy, rules json.RawMessage) error {
+	if rawPresent(egressProxy) {
+		return notImplemented("network.egressProxy is not supported by this server")
+	}
+	if rawPresent(rules) {
+		return notImplemented("network.rules is not supported by this server")
+	}
+	return nil
+}
+
+// rawPresent reports whether an optional JSON field carries a value: absent,
+// null and an empty object or list all mean "not set".
+func rawPresent(raw json.RawMessage) bool {
+	switch strings.TrimSpace(string(raw)) {
+	case "", "null", "{}", "[]":
+		return false
+	}
+	return true
 }
 
 func (h *handlers) createSnapshot(w http.ResponseWriter, r *http.Request) {
@@ -521,7 +585,16 @@ func (h *handlers) createSnapshot(w http.ResponseWriter, r *http.Request) {
 	h.snapshotMu.Lock()
 	defer h.snapshotMu.Unlock()
 
-	snapshot, createdSnapshot, err := h.deps.Service.CreateSnapshotWithOwnership(r.Context(), sandbox.ID, models.CreateSandboxSnapshotRequest{Name: snapshotName})
+	// Commit the snapshot and its E2B alias in one service call — the alias
+	// id and names derive from the (stable) requested name (D8).
+	snapshotID := snapshotIDFromName(snapshotName)
+	snapshot, _, err := h.deps.Service.CreateSnapshotWithAlias(r.Context(), sandbox.ID,
+		models.CreateSandboxSnapshotRequest{Name: snapshotName},
+		models.SnapshotAlias{
+			Alias:      snapshotID,
+			Facade:     models.FacadeE2B,
+			ExtraNames: []string{canonicalSnapshotName(snapshotName)},
+		})
 	if err != nil {
 		if errors.Is(err, store.ErrSnapshotNameConflict) {
 			WriteError(w, http.StatusConflict, "Snapshot name already in use")
@@ -530,26 +603,10 @@ func (h *handlers) createSnapshot(w http.ResponseWriter, r *http.Request) {
 		writeStoreAwareError(h.deps.Logger, w, err)
 		return
 	}
-
-	resp := snapshotInfoResponse{
-		SnapshotID: snapshotIDFromName(snapshot.Name),
+	writeJSON(w, http.StatusCreated, snapshotInfoResponse{
+		SnapshotID: snapshotID,
 		Names:      []string{canonicalSnapshotName(snapshot.Name)},
-	}
-	if err := h.deps.Service.UpsertSnapshotAlias(r.Context(), models.SnapshotAlias{
-		Alias:        resp.SnapshotID,
-		SnapshotName: snapshot.Name,
-		Facade:       models.FacadeE2B,
-		ExtraNames:   resp.Names,
-	}); err != nil {
-		if createdSnapshot {
-			if deleteErr := h.deps.Service.DeleteSnapshot(r.Context(), snapshot.Name); deleteErr != nil && h.deps.Logger != nil {
-				h.deps.Logger.Warn("e2b snapshot metadata rollback failed", "snapshot_name", snapshot.Name, "error", deleteErr)
-			}
-		}
-		writeStoreAwareError(h.deps.Logger, w, err)
-		return
-	}
-	writeJSON(w, http.StatusCreated, resp)
+	})
 }
 
 func (h *handlers) listSnapshots(w http.ResponseWriter, r *http.Request) {
@@ -560,41 +617,31 @@ func (h *handlers) listSnapshots(w http.ResponseWriter, r *http.Request) {
 	}
 	sandboxFilter := strings.TrimSpace(r.URL.Query().Get("sandboxID"))
 
-	snapshots, err := h.deps.Service.ListSnapshots(r.Context())
+	// Page the caller's catalogue in the store with the E2B alias joined per
+	// row, instead of loading every tenant's snapshots and alias rows and
+	// filtering in Go (D9). The sandbox filter is pushed into the store scan.
+	pageRows, err := h.deps.Service.ListOwnedSnapshots(r.Context(), sandboxFilter, models.FacadeE2B)
 	if err != nil {
 		writeStoreAwareError(h.deps.Logger, w, err)
 		return
-	}
-	aliases, err := h.deps.Service.ListSnapshotAliases(r.Context(), models.FacadeE2B)
-	if err != nil {
-		writeStoreAwareError(h.deps.Logger, w, err)
-		return
-	}
-	// Index aliases by native snapshot name for the per-snapshot join below.
-	aliasesByName := make(map[string]models.SnapshotAlias, len(aliases))
-	for _, alias := range aliases {
-		aliasesByName[strings.TrimSpace(alias.SnapshotName)] = alias
 	}
 
 	type snapshotRow struct {
 		response  snapshotInfoResponse
 		createdAt time.Time
 	}
-	rows := make([]snapshotRow, 0, len(snapshots))
-	for _, snapshot := range snapshots {
+	rows := make([]snapshotRow, 0, len(pageRows))
+	for _, pageRow := range pageRows {
+		snapshot := pageRow.Snapshot
 		if snapshot == nil {
 			continue
 		}
-		if sandboxFilter != "" && snapshot.SourceSandboxID != sandboxFilter {
-			continue
-		}
-		alias, ok := aliasesByName[strings.TrimSpace(snapshot.Name)]
 		response := snapshotInfoResponse{
 			SnapshotID: snapshotIDFromName(snapshot.Name),
 			Names:      []string{canonicalSnapshotName(snapshot.Name)},
 		}
 		createdAt := snapshot.CreatedAt
-		if ok {
+		if alias := pageRow.Alias; alias != nil {
 			if strings.TrimSpace(alias.Alias) != "" {
 				response.SnapshotID = strings.TrimSpace(alias.Alias)
 			}
@@ -703,6 +750,9 @@ func (h *handlers) translateCreateSandboxRequest(ctx context.Context, req create
 	allowPublicTraffic := (*bool)(nil)
 	maskRequestHost := ""
 	if req.Network != nil {
+		if err := unsupportedNetworkFields(req.Network.EgressProxy, req.Network.Rules); err != nil {
+			return models.CreateSandboxRequest{}, sandboxMeta{}, err
+		}
 		networkAllowOut = cloneStringSlice(req.Network.AllowOut)
 		networkDenyOut = cloneStringSlice(req.Network.DenyOut)
 		allowPublicTraffic = cloneBoolPtr(req.Network.AllowPublicTraffic)
@@ -721,27 +771,10 @@ func (h *handlers) translateCreateSandboxRequest(ctx context.Context, req create
 		secure = *req.Secure
 	}
 	allowInternetAccess := cloneBoolPtr(req.AllowInternetAccess)
-	networkBlockAll := false
-	if allowInternetAccess != nil && !*allowInternetAccess {
-		networkBlockAll = true
-	}
-	if len(networkDenyOut) == 1 && networkDenyOut[0] == "0.0.0.0/0" {
-		networkBlockAll = true
-		if allowInternetAccess == nil {
-			value := false
-			allowInternetAccess = &value
-		}
-	}
-
-	// Effective egress CIDR policy handed to the service. A full block is
-	// carried by NetworkBlockAll (the blanket DROP), so we must not also pass a
-	// 0.0.0.0/0 deny — the service rejects it and it would duplicate the block.
-	// allowOut/denyOut are mutually exclusive per the E2B schema.
-	egressAllowOut := networkAllowOut
-	egressDenyOut := networkDenyOut
-	if networkBlockAll {
-		egressAllowOut = nil
-		egressDenyOut = nil
+	networkBlockAll, egressAllowOut, egressDenyOut := e2bEgressPolicy(networkAllowOut, networkDenyOut, allowInternetAccess)
+	if networkBlockAll && allowInternetAccess == nil {
+		value := false
+		allowInternetAccess = &value
 	}
 
 	timeoutSeconds := defaultSandboxTimeout
@@ -775,12 +808,11 @@ func (h *handlers) translateCreateSandboxRequest(ctx context.Context, req create
 	if wasmReq, ok, err := facadeutil.TranslateWasmCreate(ctx, h.deps.Service, templateID, metadata); err != nil {
 		return models.CreateSandboxRequest{}, sandboxMeta{}, err
 	} else if ok {
-		// WASM sandboxes are host-mediated with no container IP, so the
-		// DOCKER-USER egress rules cannot be enforced on them — reject rather
-		// than silently leave the workload unrestricted.
-		if len(egressAllowOut) > 0 || len(egressDenyOut) > 0 {
-			return models.CreateSandboxRequest{}, sandboxMeta{}, notImplemented("selective egress (network.allowOut / network.denyOut) is not supported for wasm sandboxes")
-		}
+		// WASM egress lists are enforced by the worker's mediator; the service
+		// owns that decision (and the 501 on builds without it), so the lists
+		// pass through like any other runtime's.
+		wasmReq.NetworkAllowOut = egressAllowOut
+		wasmReq.NetworkDenyOut = egressDenyOut
 		// WASM has no container filesystem, so a bind-mounted volume could
 		// never appear. Reject rather than silently drop it.
 		if len(platformVolumes) > 0 {
@@ -1058,6 +1090,24 @@ func lifecyclePayload(meta sandboxMeta) *sandboxLifecyclePayload {
 	return &sandboxLifecyclePayload{AutoResume: meta.AutoResume, OnTimeout: meta.OnTimeout}
 }
 
+// e2bEgressPolicy maps E2B's egress fields onto the native policy, the same
+// way for create and updateNetwork. allow_internet_access false, or denyOut
+// ["0.0.0.0/0"] with no allowOut (E2B's "no internet"), is block-all,
+// carried by the blanket DROP with no lists. Otherwise both lists pass
+// through: allowOut alone is an allowlist (stricter than E2B, D11), denyOut
+// alone a deny list, both together allow-wins (D4); allowOut plus denyOut
+// ["0.0.0.0/0"] is the portable allowlist spelling. Hostnames in allowOut
+// put a container sandbox in gateway mode.
+func e2bEgressPolicy(allowOut, denyOut []string, allowInternetAccess *bool) (blockAll bool, allow, deny []string) {
+	if allowInternetAccess != nil && !*allowInternetAccess {
+		return true, nil, nil
+	}
+	if len(allowOut) == 0 && len(denyOut) == 1 && denyOut[0] == "0.0.0.0/0" {
+		return true, nil, nil
+	}
+	return false, allowOut, denyOut
+}
+
 func networkPayload(meta sandboxMeta) *sandboxNetworkPayload {
 	if len(meta.NetworkAllowOut) == 0 && len(meta.NetworkDenyOut) == 0 && meta.AllowPublicTraffic == nil && strings.TrimSpace(meta.MaskRequestHost) == "" {
 		return nil
@@ -1277,9 +1327,9 @@ func stringMap(input map[string]any, field string) (map[string]string, error) {
 	return result, nil
 }
 
-func loadTemplateMap(logger *slog.Logger) map[string]string {
+func loadTemplateMap(raw string, logger *slog.Logger) map[string]string {
 	aliases := map[string]string{"base": "ubuntu:22.04"}
-	raw := strings.TrimSpace(os.Getenv("SB_E2B_TEMPLATE_MAP_JSON"))
+	raw = strings.TrimSpace(raw)
 	if raw == "" {
 		return aliases
 	}
@@ -1303,8 +1353,8 @@ func loadTemplateMap(logger *slog.Logger) map[string]string {
 	return aliases
 }
 
-func loadClientID() string {
-	clientID := strings.TrimSpace(os.Getenv("SB_E2B_CLIENT_ID"))
+func loadClientID(clientID string) string {
+	clientID = strings.TrimSpace(clientID)
 	if clientID == "" {
 		return defaultClientID
 	}

@@ -11,10 +11,11 @@ import (
 func TestColdBootInjectFiles_Exported(t *testing.T) {
 	slot := &TapSlot{GuestIP: "10.0.0.2", HostIP: "10.0.0.1", CIDR: "10.0.0.0/30"}
 
-	// With a non-empty binary path we should get 3 inject files.
+	// With a non-empty binary path we should get 4 inject files: the
+	// agent, its init shim, its env and the guest's resolv.conf.
 	files := ColdBootInjectFiles("/opt/toolboxd", "my-token", slot)
-	if len(files) != 3 {
-		t.Fatalf("want 3 files, got %d: %+v", len(files), files)
+	if len(files) != 4 {
+		t.Fatalf("want 4 files, got %d: %+v", len(files), files)
 	}
 
 	// Without a binary path the exported function returns nil too.

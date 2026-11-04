@@ -104,7 +104,7 @@ func TestHandleRemoteSessionRequestErrors(t *testing.T) {
 		done := make(chan struct{})
 		go func() {
 			defer close(done)
-			g.handleRemoteSession(context.Background(), "sb-remote", "default", channel, requests)
+			g.handleRemoteSession(context.Background(), "sb-remote", "default", nil, channel, requests)
 		}()
 		requests <- &ssh.Request{Type: "pty-req", Payload: []byte{0}}
 		requests <- &ssh.Request{Type: "shell"}
@@ -118,7 +118,7 @@ func TestHandleRemoteSessionRequestErrors(t *testing.T) {
 		done := make(chan struct{})
 		go func() {
 			defer close(done)
-			g.handleRemoteSession(context.Background(), "sb-remote", "default", channel, requests)
+			g.handleRemoteSession(context.Background(), "sb-remote", "default", nil, channel, requests)
 		}()
 		requests <- &ssh.Request{Type: "exec", Payload: []byte{0}}
 		close(requests)
@@ -131,7 +131,7 @@ func TestHandleRemoteSessionRequestErrors(t *testing.T) {
 		done := make(chan struct{})
 		go func() {
 			defer close(done)
-			g.handleRemoteSession(context.Background(), "sb-remote", "default", channel, requests)
+			g.handleRemoteSession(context.Background(), "sb-remote", "default", nil, channel, requests)
 		}()
 		requests <- &ssh.Request{Type: "subsystem"}
 		close(requests)
@@ -144,7 +144,7 @@ func TestHandleRemoteSessionRequestErrors(t *testing.T) {
 		done := make(chan struct{})
 		go func() {
 			defer close(done)
-			g.handleRemoteSession(context.Background(), "sb-remote", "default", channel, requests)
+			g.handleRemoteSession(context.Background(), "sb-remote", "default", nil, channel, requests)
 		}()
 		requests <- &ssh.Request{Type: "shell"}
 		time.Sleep(50 * time.Millisecond)
@@ -293,7 +293,7 @@ func TestHandleRemoteSessionEnvAndWindowChange(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		g.handleRemoteSession(context.Background(), "sb-remote", "default", channel, requests)
+		g.handleRemoteSession(context.Background(), "sb-remote", "default", nil, channel, requests)
 	}()
 	requests <- &ssh.Request{Type: "env", Payload: append(encodeString("LANG"), encodeString("C")...)}
 	requests <- &ssh.Request{Type: "env", Payload: append(encodeString("LD_PRELOAD"), encodeString("x")...)}

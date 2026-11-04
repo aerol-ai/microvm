@@ -235,10 +235,10 @@ func TestSnapshotPusherEdgeBranches(t *testing.T) {
 	if _, err := pusher.PushOnce(ctx, &models.SandboxSnapshot{Name: "snap", Image: " "}); err == nil {
 		t.Fatal("blank snapshot image should reject PushOnce")
 	}
-	if got := nilPusher.DestRefFor("snap"); got != "" {
+	if got := nilPusher.DestRefFor("", "snap"); got != "" {
 		t.Fatalf("nil pusher DestRefFor = %q, want empty", got)
 	}
-	if got := pusher.DestRefFor(" "); got != "" {
+	if got := pusher.DestRefFor("", " "); got != "" {
 		t.Fatalf("blank name DestRefFor = %q, want empty", got)
 	}
 
@@ -272,7 +272,7 @@ func TestSnapshotPusher_TagSuffix(t *testing.T) {
 	}
 
 	wantRef := "aocr.test/cluster/cluster-42/snapshots/snap:latest" + archTagSuffix(hostSnapshotArch()) + "--ttl-1h"
-	if got := pusher.DestRefFor("snap"); got != wantRef {
+	if got := pusher.DestRefFor("", "snap"); got != wantRef {
 		t.Fatalf("DestRefFor = %q, want %q", got, wantRef)
 	}
 
@@ -285,7 +285,7 @@ func TestSnapshotPusher_TagSuffix(t *testing.T) {
 
 	// Empty suffix keeps the plain latest tag (prod-default behavior).
 	plain := newTestPusher(t, patPath, &fakeSnapshotPushDocker{})
-	if got := plain.DestRefFor("snap"); got != "aocr.test/cluster/cluster-42/snapshots/snap:latest"+archTagSuffix(hostSnapshotArch()) {
+	if got := plain.DestRefFor("", "snap"); got != "aocr.test/cluster/cluster-42/snapshots/snap:latest"+archTagSuffix(hostSnapshotArch()) {
 		t.Fatalf("plain DestRefFor = %q, want :latest", got)
 	}
 

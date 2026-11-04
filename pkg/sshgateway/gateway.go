@@ -31,6 +31,24 @@ type SandboxLookup interface {
 	TouchSandbox(ctx context.Context, id string) error
 }
 
+// SessionRecorder is the slice of *service.Service that writes an SSH
+// session's audit record (plans/identity-and-access.md §5.9, CEO review D3):
+// SSH runs commands in a sandbox without touching the API, so without it
+// SSH would be the one way to run a command that leaves no record. The
+// gateway checks for it on its SandboxLookup, so a lookup that does not
+// implement it (tests) records nothing.
+type SessionRecorder interface {
+	RecordSSHSession(ctx context.Context, sandboxID, session string)
+}
+
+// OwnerSessionRecorder is the slice of *service.Service that says whether
+// the owner of a sandbox records the SSH sessions this gateway bridges to
+// it (cluster mode, once every member runs a build that does; see
+// bridgeSession). A lookup without it keeps the record on this node.
+type OwnerSessionRecorder interface {
+	SSHSessionsRecordedByOwner() bool
+}
+
 // DockerExec is the slice of *docker.Client the gateway needs. It exists so
 // the gateway can be tested with a fake.
 type DockerExec interface {
@@ -91,6 +109,40 @@ type Gateway struct {
 
 	// containerEngine gates the containerd one-shot-exec-via-toolbox path.
 	containerEngine string
+
+	// conns are the open client connections, so CloseAll can end every
+	// session when the customer revokes the key: each holds a toolbox token
+	// opened before the revoke (plans/customer-key-custody.md §10).
+	connMu sync.Mutex
+	conns  map[net.Conn]struct{}
+}
+
+// CloseAll closes every open SSH connection and returns how many it closed.
+func (g *Gateway) CloseAll() int {
+	g.connMu.Lock()
+	open := make([]net.Conn, 0, len(g.conns))
+	for c := range g.conns {
+		open = append(open, c)
+	}
+	g.connMu.Unlock()
+	for _, c := range open {
+		_ = c.Close()
+	}
+	return len(open)
+}
+
+func (g *Gateway) trackConn(c net.Conn) func() {
+	g.connMu.Lock()
+	if g.conns == nil {
+		g.conns = map[net.Conn]struct{}{}
+	}
+	g.conns[c] = struct{}{}
+	g.connMu.Unlock()
+	return func() {
+		g.connMu.Lock()
+		delete(g.conns, c)
+		g.connMu.Unlock()
+	}
 }
 
 // New constructs a Gateway. It loads or generates the host key. Returns an
@@ -149,6 +201,7 @@ func (g *Gateway) Start(ctx context.Context) error {
 
 func (g *Gateway) handleConn(ctx context.Context, nConn net.Conn) {
 	remote := nConn.RemoteAddr().String()
+	defer g.trackConn(nConn)()
 	defer func() {
 		_ = nConn.Close()
 	}()
@@ -190,8 +243,34 @@ func (g *Gateway) handleConn(ctx context.Context, nConn net.Conn) {
 			g.logger.Warn("ssh channel accept failed", "error", err)
 			continue
 		}
+		if !remoteOwned {
+			// A remote-owned session is recorded by bridgeSession: by
+			// the owner, where the sandbox's audit lives.
+			g.recordSession(ctx, sandboxID, mode, sessionName)
+		}
 		go g.handleSession(ctx, sandboxID, mode, sessionName, remoteOwned, channel, requests)
 	}
+}
+
+// recordSession writes one audit record per opened session channel, naming
+// the sandbox key that authenticated it and the toolbox session it attaches
+// to ("" for a one-shot exec). The record is buffered: opening the session
+// never waits on disk.
+func (g *Gateway) recordSession(ctx context.Context, sandboxID, mode, sessionName string) {
+	rec, ok := g.svc.(SessionRecorder)
+	if !ok || sandboxID == "" {
+		return
+	}
+	rec.RecordSSHSession(ctx, sandboxID, sessionRecordTarget(mode, sessionName))
+}
+
+// sessionRecordTarget is the toolbox session an ssh record names: the
+// session a "session" mode login attaches to, "" for a one-shot exec.
+func sessionRecordTarget(mode, sessionName string) string {
+	if mode != "session" {
+		return ""
+	}
+	return sessionName
 }
 
 // parseSSHUser splits the SSH username into (sandbox_id, mode, name).
@@ -312,7 +391,7 @@ func (g *Gateway) handleSession(ctx context.Context, sandboxID, mode, sessionNam
 	// v1 API, which forwards to the owner. Auth already happened at the edge in
 	// publicKeyCallback against the owner's authoritative key.
 	if remoteOwned {
-		g.handleRemoteSession(ctx, sandboxID, sessionName, channel, requests)
+		g.handleRemoteSession(ctx, sandboxID, sessionName, g.bridgeSession(ctx, sandboxID, mode, sessionName), channel, requests)
 		return
 	}
 

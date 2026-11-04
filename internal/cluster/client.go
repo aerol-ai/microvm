@@ -35,6 +35,11 @@ type Cluster struct {
 	raft   *raftNode
 	gossip *gossipNode
 
+	// authoritativePlacementsHook stands in for AuthoritativePlacementsByIDs
+	// in tests that need a lagging local replica next to a live leader.
+	// Always nil in production.
+	authoritativePlacementsHook func(context.Context, []string) (map[string]Placement, error)
+
 	// patToken authenticates leader-forwarded raft applies. Sourced from
 	// cfg.PATToken at construction; same value every node already shares for
 	// regular API auth, so no new secret-distribution surface. With mTLS
@@ -123,6 +128,17 @@ type Cluster struct {
 	// forever on a permanent local failure (image gone, runtime missing,
 	// disk full). Initialized in startOwnerWatcher.
 	recreateFailures *recreateFailureTracker
+
+	// catchingUp is true from New until this process's FSM has applied the
+	// leader's read index (catch_up.go). While it is set, a placement missing
+	// from the FSM is not evidence of absence. Zero value = caught up.
+	catchingUp  atomic.Bool
+	catchUpStop context.CancelFunc
+	// readIndexHook stands in for the leader read-index round trip in tests.
+	// Always nil in production.
+	readIndexHook func(context.Context) (uint64, error)
+	// catchUpLogEvery overrides catchUpStillWaitingLogEvery in tests.
+	catchUpLogEvery time.Duration
 }
 
 // New constructs the server-role Cluster for cfg.EnableCluster=true. Caller
@@ -194,6 +210,9 @@ func New(cfg config.Config, logger *slog.Logger, admitter *capacity.Admitter) (*
 		deadOwners:    newDeadOwnerTracker(),
 		tls:           clusterTLS,
 	}
+	// Not caught up from the first instant anything can read the FSM; the
+	// loop that clears it starts at the end of New (startCatchUpWatch).
+	c.catchingUp.Store(true)
 	fsm.recoveryResolver = c.fetchRecoveryBlob
 
 	// Build the cluster-internal HTTPS client + listener when TLS is loaded.
@@ -211,6 +230,7 @@ func New(cfg config.Config, logger *slog.Logger, admitter *capacity.Admitter) (*
 			_ = rn.Close()
 			return nil, fmt.Errorf("cluster.New: internal server: %w", err)
 		}
+		is.SetReadIndexHandler(c.LeaderReadIndex)
 		c.internalServer = is
 		c.internalURL = deriveInternalAdvertiseURL(cfg.ClusterInternalAdvertiseURL, cfg.ClusterInternalListenAddr, is.Addr())
 	}
@@ -255,6 +275,7 @@ func New(cfg config.Config, logger *slog.Logger, admitter *capacity.Admitter) (*
 		Events:         &voterAutoJoinDelegate{c: c},
 		OnLeave:        c.invalidatePeerClient,
 		PeerCacheDir:   cfg.RaftDataDir,
+		PATScope:       cfg.PATScope,
 	}, admitter, logger)
 	if err != nil {
 		if c.internalServer != nil {
@@ -299,6 +320,11 @@ func New(cfg config.Config, logger *slog.Logger, admitter *capacity.Admitter) (*
 	// service recreate hook. This is the consume side of the spec-replication
 	// pipeline written by RecordPlacement / UpsertSpec.
 	c.startOwnerWatcher()
+
+	// Restart catch-up: until the FSM has applied the leader's read index,
+	// a placement missing from it may still exist (catch_up.go). Armed last
+	// so the loop's first read index finds gossip and the internal client.
+	c.startCatchUpWatch()
 
 	return c, nil
 }
@@ -405,15 +431,30 @@ func (c *Cluster) OwnerOf(sandboxID string) (OwnerInfo, error) {
 	}, nil
 }
 
-// OwnerOfName resolves a replicated sandbox Name to its placement owner. This
-// is intentionally a local FSM read just like OwnerOf; the name index is
-// maintained inside the FSM apply path so it tracks the authoritative
-// placement map exactly.
-func (c *Cluster) OwnerOfName(name string) (string, OwnerInfo, error) {
-	sandboxID, ok := c.fsm.sandboxIDByName(name)
+// OwnerOfName resolves a sandbox name within ownerRef's namespace to its
+// placement owner (see name_key.go). This is intentionally a local FSM read
+// just like OwnerOf; the name index is maintained inside the FSM apply path so
+// it tracks the authoritative placement map exactly.
+func (c *Cluster) OwnerOfName(ownerRef, name string) (string, OwnerInfo, error) {
+	sandboxID, ok := c.fsm.sandboxIDByOwnerName(ownerRef, name)
 	if !ok {
 		return "", OwnerInfo{}, ErrUnknownSandbox
 	}
+	return c.ownerOfResolvedName(sandboxID)
+}
+
+// OwnerOfNameKey resolves one raw nameIndex key, with no owner filtering. It
+// backs the cluster-internal placement-by-name endpoint, which worker agents
+// call once per key (see Agent.OwnerOfName).
+func (c *Cluster) OwnerOfNameKey(key string) (string, OwnerInfo, error) {
+	sandboxID, ok := c.fsm.sandboxIDByName(key)
+	if !ok {
+		return "", OwnerInfo{}, ErrUnknownSandbox
+	}
+	return c.ownerOfResolvedName(sandboxID)
+}
+
+func (c *Cluster) ownerOfResolvedName(sandboxID string) (string, OwnerInfo, error) {
 	owner, err := c.OwnerOf(sandboxID)
 	if err != nil {
 		return sandboxID, OwnerInfo{}, err
@@ -472,7 +513,7 @@ func (c *Cluster) RecordPlacement(ctx context.Context, sandboxID string, spec *m
 		OwnerNodeID:           c.nodeID,
 		OwnerAPIURL:           c.apiURL,
 		OwnerDataPlaneHost:    c.dataPlaneHost,
-		Spec:                  spec,
+		Spec:                  c.qualifySpecForCommand(sandboxID, spec, secrets.OwnerRef),
 		SecretRef:             secrets.Ref,
 		SecretVersion:         secrets.Version,
 		SecretRecipients:      normalizeSecretRecipientIDs(secrets.Recipients),
@@ -482,6 +523,22 @@ func (c *Cluster) RecordPlacement(ctx context.Context, sandboxID string, spec *m
 		OwnerRef:              secrets.OwnerRef,
 	}
 	return c.applyCommand(ctx, cmd)
+}
+
+// qualifySpecForCommand writes the owner-qualified name key into spec before
+// it enters a Raft command (name_key.go). ownerRef is what the caller passed.
+// When it is empty and the spec carries a plain name, the replicated OwnerRef
+// of an existing placement is used instead (a reservation being promoted, an
+// orphan being claimed), because the FSM keeps that OwnerRef and the key has
+// to match it. The lookup reads only the hot placement row; operator creates
+// of a new name pay one map miss.
+func (c *Cluster) qualifySpecForCommand(sandboxID string, spec *models.CreateSandboxRequest, ownerRef string) *models.CreateSandboxRequest {
+	if strings.TrimSpace(ownerRef) == "" && specNeedsOwnerForName(spec) {
+		if ref, ok := c.fsm.ownerRefOf(sandboxID); ok {
+			ownerRef = ref
+		}
+	}
+	return QualifySpecName(spec, ownerRef)
 }
 
 // ClaimOrphan commits sandboxID -> self only if the existing placement is
@@ -511,7 +568,7 @@ func (c *Cluster) ClaimOrphan(ctx context.Context, sandboxID string, spec *model
 		OwnerNodeID:          c.nodeID,
 		OwnerAPIURL:          c.apiURL,
 		OwnerDataPlaneHost:   c.dataPlaneHost,
-		Spec:                 spec,
+		Spec:                 c.qualifySpecForCommand(sandboxID, spec, secrets.OwnerRef),
 		SecretRef:            secrets.Ref,
 		SecretVersion:        secrets.Version,
 		SecretRecipients:     normalizeSecretRecipientIDs(secrets.Recipients),
@@ -551,7 +608,7 @@ func (c *Cluster) UpsertSpec(ctx context.Context, sandboxID string, spec *models
 	cmd := command{
 		Op:                    opUpsertSpec,
 		SandboxID:             sandboxID,
-		Spec:                  spec,
+		Spec:                  c.qualifySpecForCommand(sandboxID, spec, secrets.OwnerRef),
 		SecretRef:             secrets.Ref,
 		SecretVersion:         secrets.Version,
 		SecretRecipients:      normalizeSecretRecipientIDs(secrets.Recipients),
@@ -901,7 +958,7 @@ func (c *Cluster) ReserveOnTarget(ctx context.Context, sandboxID string, target 
 		OwnerNodeID:          target.NodeID,
 		OwnerAPIURL:          target.APIURL,
 		OwnerDataPlaneHost:   target.DataPlaneHost,
-		Spec:                 redacted,
+		Spec:                 QualifySpecName(redacted, secrets.OwnerRef),
 		SecretRef:            secrets.Ref,
 		SecretVersion:        secrets.Version,
 		SecretSealGeneration: secrets.SealGeneration,
@@ -946,7 +1003,7 @@ func (c *Cluster) ReserveBatchOnTargets(ctx context.Context, reservations []Plac
 			OwnerNodeID:          r.Target.NodeID,
 			OwnerAPIURL:          r.Target.APIURL,
 			OwnerDataPlaneHost:   r.Target.DataPlaneHost,
-			Spec:                 r.Redacted,
+			Spec:                 QualifySpecName(r.Redacted, r.Secrets.OwnerRef),
 			SecretRef:            r.Secrets.Ref,
 			SecretVersion:        r.Secrets.Version,
 			SecretSealGeneration: r.Secrets.SealGeneration,
@@ -968,6 +1025,20 @@ func (c *Cluster) CancelReservation(ctx context.Context, sandboxID string) error
 		return nil
 	}
 	placement, ok := c.fsm.get(strings.TrimSpace(sandboxID))
+	if !ok {
+		// A local miss does not prove the reservation is gone. The proposer
+		// reserves through raft and forwards the create here; a create that
+		// fails within milliseconds cancels before this follower has applied
+		// the reservation, and returning nil then leaked the name until the
+		// reservation expired (every retry 409'd for two minutes in a live
+		// cluster run). Ask the leader. A row that IS present locally is
+		// conclusive either way: a replica can only lag the leader.
+		var err error
+		placement, ok, err = c.authoritativePlacement(ctx, strings.TrimSpace(sandboxID))
+		if err != nil {
+			return fmt.Errorf("cluster: cancel reservation: %w", err)
+		}
+	}
 	if !ok || !placement.IsReserved() {
 		return nil
 	}
@@ -1275,7 +1346,7 @@ func (c *Cluster) AssertOwnership(ctx context.Context, local []LocalSandboxState
 				if existing.Spec == nil {
 					spec = st.Spec
 				}
-				replaySecrets := PlacementSecrets{IncarnationID: incarnationID}
+				replaySecrets := PlacementSecrets{IncarnationID: incarnationID, OwnerRef: st.Secrets.OwnerRef}
 				if needsSecretBackfill {
 					replaySecrets = st.Secrets
 				}
@@ -1498,6 +1569,15 @@ func (c *Cluster) doLeaderApply(ctx context.Context, client *http.Client, endpoi
 	}
 	resp, err := client.Do(req)
 	if err != nil {
+		// The node this one took for the leader did not answer: it stopped,
+		// or lost the leadership along with its listener. That is a leader
+		// change in progress, which callers retry (IsLeaderUnavailable). It
+		// used to surface as an unclassified error, a 400 on the public API,
+		// so an SDK gave up on a write a retry seconds later would have
+		// committed. The caller's own cancellation stays what it is.
+		if ctx.Err() == nil {
+			return fmt.Errorf("%w: leader-forward apply: %v", ErrNotLeader, err)
+		}
 		return fmt.Errorf("cluster: leader-forward apply: %w", err)
 	}
 	defer resp.Body.Close()
@@ -1594,6 +1674,27 @@ func (c *Cluster) SetLocalWasmModuleIDsProvider(fn func() ([]string, bool)) {
 	c.capacityLeases.SetLocalWasmModuleIDsProvider(fn)
 }
 
+// SetEgressGatewayReadyProvider registers the egress gateway readiness
+// callback so this node's own lease advertises EgressGatewayReady
+// (plans/egress-domain-filtering.md CEO D20). Peers read the same flag from
+// this node's /v1/capacity.
+func (c *Cluster) SetEgressGatewayReadyProvider(fn func() bool) {
+	if c == nil || c.capacityLeases == nil {
+		return
+	}
+	c.capacityLeases.SetEgressGatewayReadyProvider(fn)
+}
+
+// SetLocalSlotPoolsProvider registers the network-slot pool callback whose
+// answer is overlaid onto this node's own capacity lease, matching what peers
+// read from its /v1/capacity.
+func (c *Cluster) SetLocalSlotPoolsProvider(fn func() []capacity.SlotPool) {
+	if c == nil || c.capacityLeases == nil {
+		return
+	}
+	c.capacityLeases.SetLocalSlotPoolsProvider(fn)
+}
+
 func (c *Cluster) membersWithCapacity() []Member {
 	members := c.gossip.members()
 	if c.capacityLeases == nil {
@@ -1617,6 +1718,12 @@ func (c *Cluster) PlacementPage(req PlacementPageRequest) PlacementPageResponse 
 	if c.fsm == nil {
 		return PlacementPageResponse{}
 	}
+	if !c.PlacementViewCaughtUp() {
+		// A page of a view that is still catching up is short of rows the
+		// cluster holds. Non-authoritative is the existing "do not read
+		// absence into this" answer: list fans out or 503s, reconcile skips.
+		return PlacementPageResponse{}
+	}
 	return c.fsm.placementPage(req)
 }
 
@@ -1628,6 +1735,25 @@ func (c *Cluster) PlacementOf(sandboxID string) (Placement, bool) {
 		return Placement{}, false
 	}
 	return c.fsm.get(sandboxID)
+}
+
+// authoritativePlacement reads one placement from the leader. Without raft
+// (a single-process FSM) the local FSM is already the whole truth, so a miss
+// there stands.
+func (c *Cluster) authoritativePlacement(ctx context.Context, sandboxID string) (Placement, bool, error) {
+	lookup := c.authoritativePlacementsHook
+	if lookup == nil {
+		if c.raft == nil || c.raft.raft == nil {
+			return Placement{}, false, nil
+		}
+		lookup = c.AuthoritativePlacementsByIDs
+	}
+	got, err := lookup(ctx, []string{sandboxID})
+	if err != nil {
+		return Placement{}, false, err
+	}
+	placement, ok := got[sandboxID]
+	return placement, ok, nil
 }
 
 // PlacementsByIDs returns hot placement rows for the given IDs (point lookups).
@@ -1768,6 +1894,9 @@ func (c *Cluster) Close() error {
 	if c.ownerWatcherStop != nil {
 		c.ownerWatcherStop()
 	}
+	if c.catchUpStop != nil {
+		c.catchUpStop()
+	}
 	if c.gossip != nil {
 		if err := c.gossip.Close(); err != nil {
 			firstErr = fmt.Errorf("cluster: gossip close: %w", err)
@@ -1866,9 +1995,8 @@ func isUnspecifiedHost(host string) bool {
 	return false
 }
 
-// HealthyForReads is true once the FSM has caught up to the leader's last
-// log index — i.e. our local OwnerOf reads are not stale by more than a
-// single round trip. Used by EnsureClusterReady.
+// HealthyForReads is true once a leader is known. It does NOT mean the FSM
+// has caught up with the leader; PlacementViewCaughtUp is that property.
 func (c *Cluster) HealthyForReads() bool {
 	if c.raft == nil {
 		return false

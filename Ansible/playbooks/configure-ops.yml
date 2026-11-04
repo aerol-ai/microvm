@@ -149,6 +149,19 @@
       SB_CONTAINERD_CNI_PLUGIN_DIR: "{{ containerd.cni_plugin_dir | default('/opt/cni/bin') }}"
       SB_CONTAINERD_NATIVE_NETNS_POOL_ENABLED: "{{ containerd.native_netns_pool_enabled | default(true) | bool | string | lower }}"
 
+    # S3 Object Lock audit witness (plans/open-audit-witness.md). Kept out of
+    # sandboxd_ops_env because it is written only when
+    # sandboxd_audit_witness_backend is set: Terraform writes the same block
+    # at day 0, and a day-2 run with the empty defaults must not erase it (see
+    # group_vars/all/defaults.yml).
+    sandboxd_audit_witness_env:
+      SB_AUDIT_WITNESS_BACKEND: "{{ sandboxd_audit_witness_backend }}"
+      SB_AUDIT_WITNESS_S3_BUCKET: "{{ sandboxd_audit_witness_s3_bucket }}"
+      SB_AUDIT_WITNESS_S3_PREFIX: "{{ sandboxd_audit_witness_s3_prefix }}"
+      SB_AUDIT_WITNESS_S3_REGION: "{{ sandboxd_audit_witness_s3_region }}"
+      SB_AUDIT_WITNESS_S3_ENDPOINT: "{{ sandboxd_audit_witness_s3_endpoint }}"
+      SB_AUDIT_WITNESS_S3_PATH_STYLE: "{{ sandboxd_audit_witness_s3_path_style | bool | string | lower }}"
+
   pre_tasks:
     - name: Check base sandboxd env file
       ansible.builtin.stat:
@@ -169,6 +182,80 @@
     - name: Pick env file to manage
       ansible.builtin.set_fact:
         sandboxd_ops_env_file: "{{ sandboxd_cluster_env_file if sandboxd_cluster_env.stat.exists else sandboxd_env_file }}"
+
+    # SB_NODE_ID is identity: the Raft member id and the node:<id> certificate
+    # SAN in a cluster, and the witness key on every node. Read the value the
+    # daemon boots with today (systemd keeps the last assignment, and the
+    # cluster.env drop-in loads after sandboxd.env) so the checks below compare
+    # against the real value, not a guess.
+    - name: Read the SB_NODE_ID sandboxd boots with
+      ansible.builtin.shell: >-
+        cat {{ sandboxd_env_file | quote }} {{ sandboxd_cluster_env_file | quote }} 2>/dev/null
+        | sed -n 's/^SB_NODE_ID=//p' | tail -n 1
+      register: sandboxd_current_node_id
+      changed_when: false
+      failed_when: false
+      check_mode: false
+
+    - name: Refuse to change an existing SB_NODE_ID
+      when:
+        - sandboxd_node_id | length > 0
+        - sandboxd_current_node_id.stdout | default('') | trim | length > 0
+      ansible.builtin.assert:
+        that:
+          - sandboxd_node_id == (sandboxd_current_node_id.stdout | trim)
+        fail_msg: >-
+          {{ inventory_hostname }} already boots as SB_NODE_ID={{ sandboxd_current_node_id.stdout | trim }}
+          and sandboxd_node_id asks for {{ sandboxd_node_id }}. A new node id is a
+          rebuild, not a config change: in a cluster it is a new Raft member and a
+          new certificate, and the witness history stays under the old id. Follow
+          setup/runbooks/secrets-and-audit.md, "Rebuild a node under a new SB_NODE_ID".
+
+    # sandboxd_node_id set in group_vars instead of per host would give every
+    # host the same id. Inventory vars are visible for all hosts even under
+    # serial: 1, so this catches it before the first host is touched.
+    - name: Refuse the same sandboxd_node_id on two hosts
+      run_once: true
+      vars:
+        sandboxd_requested_node_ids: >-
+          {{ ansible_play_hosts_all | map('extract', hostvars, 'sandboxd_node_id')
+             | select('string') | reject('equalto', '') | list }}
+      ansible.builtin.assert:
+        that:
+          - sandboxd_requested_node_ids | length == (sandboxd_requested_node_ids | unique | length)
+        fail_msg: >-
+          Two or more hosts ask for the same sandboxd_node_id
+          ({{ sandboxd_requested_node_ids | sort | join(', ') }}). Node ids must be
+          unique; set sandboxd_node_id per host (host_vars), never in group_vars.
+
+    # The daemon refuses these at boot too. Checking here stops the play before
+    # the restart handler takes a healthy node down into a refused boot.
+    - name: Refuse an incomplete S3 audit witness config
+      when: sandboxd_audit_witness_backend | length > 0
+      ansible.builtin.assert:
+        that:
+          - sandboxd_audit_witness_backend == 's3'
+          - sandboxd_audit_witness_s3_bucket | length > 0
+        fail_msg: >-
+          sandboxd_audit_witness_backend must be "s3" (or empty for no witness), and
+          s3 needs sandboxd_audit_witness_s3_bucket.
+
+    - name: Refuse an S3 audit witness without a unique SB_NODE_ID
+      when: sandboxd_audit_witness_backend | length > 0
+      vars:
+        sandboxd_effective_node_id: >-
+          {{ sandboxd_node_id if (sandboxd_node_id | length > 0)
+             else (sandboxd_current_node_id.stdout | default('') | trim) }}
+      ansible.builtin.assert:
+        that:
+          - sandboxd_effective_node_id | trim | length > 0
+          - sandboxd_effective_node_id | trim != 'standalone'
+        fail_msg: >-
+          {{ inventory_hostname }} has no SB_NODE_ID (or has "standalone"). The witness
+          files heads under the node id, and every single server without one is
+          "standalone", so two servers sharing a bucket would overwrite each other's
+          heads and refuse to restart. Set sandboxd_node_id for this host to an id
+          that is unique among servers sharing the bucket.
 
   tasks:
     - name: Deploy sandboxd backup/recovery helpers
@@ -693,6 +780,38 @@
         owner: root
         group: root
       loop: "{{ sandboxd_ops_env | dict2items }}"
+      notify: Apply sandboxd ops config
+
+    # Only ever written, never removed: an empty sandboxd_node_id leaves the
+    # line alone, because on a cluster node it is cluster-init/cluster-join's
+    # identity and an empty write would orphan the Raft member.
+    - name: Write SB_NODE_ID
+      when: sandboxd_node_id | length > 0
+      ansible.builtin.lineinfile:
+        path: "{{ sandboxd_ops_env_file }}"
+        regexp: "^SB_NODE_ID="
+        line: "SB_NODE_ID={{ sandboxd_node_id }}"
+        create: false
+        mode: "0600"
+        owner: root
+        group: root
+      notify: Apply sandboxd ops config
+
+    # With a backend set, Ansible owns the whole block: a non-empty value is
+    # written and an empty one is removed, so the daemon falls back to its
+    # default instead of reading an explicit empty string.
+    - name: Write S3 audit witness env vars
+      when: sandboxd_audit_witness_backend | length > 0
+      ansible.builtin.lineinfile:
+        path: "{{ sandboxd_ops_env_file }}"
+        regexp: "^{{ item.key }}="
+        line: "{{ item.key }}={{ item.value }}"
+        state: "{{ 'present' if (item.value | string | length > 0) else 'absent' }}"
+        create: false
+        mode: "0600"
+        owner: root
+        group: root
+      loop: "{{ sandboxd_audit_witness_env | dict2items }}"
       notify: Apply sandboxd ops config
 
     - name: Create backup output directory

@@ -1,0 +1,10 @@
+name: single-node-wrapped-kms
+capabilities:
+  - docker
+  - domain
+  - secrets
+  # install.sh --key-custody wrapped on one node, on a real AWS KMS key
+  # (plans/customer-key-custody.md §3).
+  - key-custody-single-wrapped
+# UC-315 restarts sandboxd on the node.
+disruptive: true

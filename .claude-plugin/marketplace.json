@@ -1,0 +1,17 @@
+{
+  "name": "aerol-ai",
+  "description": "Claude Code plugins for AerolVM sandboxes",
+  "owner": {
+    "name": "Aerol AI",
+    "url": "https://github.com/aerol-ai"
+  },
+  "plugins": [
+    {
+      "name": "aerolvm",
+      "source": "./plugins/aerolvm",
+      "description": "Run commands, edit files and expose ports in AerolVM sandboxes, through the aerolvm MCP server and CLI",
+      "category": "development",
+      "tags": ["sandbox", "mcp", "cli"]
+    }
+  ]
+}

@@ -1,0 +1,93 @@
+---
+// Page feedback through giscus (https://giscus.app). Each docs page maps to a
+// GitHub Discussion titled with its path, which giscus creates the first time
+// someone reacts or comments. Readers sign in with GitHub inside the widget,
+// and giscus.app makes the GitHub calls through its GitHub App, so this site
+// runs no backend for it. The app must be installed on the repo.
+//
+// The category is Announcements because only maintainers and giscus can open
+// discussions there, so readers can react and comment but not start threads.
+// To move the page discussions to their own category, create it in the repo
+// and put its name and id here (both are listed at https://giscus.app).
+const config = {
+  repo: 'aerol-ai/microvm',
+  'repo-id': 'R_kgDOSWfpcg',
+  category: 'Announcements',
+  'category-id': 'DIC_kwDOSWfpcs4C9w0V',
+  // Title each discussion with the page path. Strict matching looks the
+  // discussion up by a hash of the path instead of a title search, so
+  // "sandboxes/" can never pick up the discussion for "ghost-sandboxes/".
+  mapping: 'pathname',
+  strict: '1',
+  'reactions-enabled': '1',
+  // Posts the discussion's reaction counts to this page; PageFeedback.astro
+  // shows them at the top of the right column.
+  'emit-metadata': '1',
+  'input-position': 'top',
+  lang: 'en',
+}
+---
+
+<section class="page-discussion not-content" aria-labelledby="page-discussion-title">
+  <h2 id="page-discussion-title" class="page-discussion__title">Was this page helpful?</h2>
+  <p class="page-discussion__intro">
+    Sign in with GitHub to react with 👍 or 👎, or tell us what to fix. Reactions and comments are public, in this
+    project's GitHub Discussions.
+  </p>
+  <div class="giscus" id="page-feedback" data-config={JSON.stringify(config)}></div>
+</section>
+
+<script>
+  const GISCUS_ORIGIN = 'https://giscus.app'
+  const container = document.querySelector<HTMLElement>('#page-feedback')
+
+  // giscus has its own light and dark themes; follow the site's toggle, which
+  // always resolves <html data-theme> to "light" or "dark".
+  const theme = () => (document.documentElement.dataset.theme === 'light' ? 'light' : 'dark')
+
+  if (container) {
+    // giscus reads its settings from the attributes of its own <script> tag,
+    // so build that tag here, where the current theme is known.
+    const script = document.createElement('script')
+    script.src = `${GISCUS_ORIGIN}/client.js`
+    script.crossOrigin = 'anonymous'
+    script.async = true
+    const config: Record<string, string> = { ...JSON.parse(container.dataset.config!), theme: theme() }
+    for (const [key, value] of Object.entries(config)) script.setAttribute(`data-${key}`, value)
+    container.after(script)
+
+    new MutationObserver(() => {
+      const frame = document.querySelector<HTMLIFrameElement>('iframe.giscus-frame')
+      frame?.contentWindow?.postMessage({ giscus: { setConfig: { theme: theme() } } }, GISCUS_ORIGIN)
+    }).observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] })
+  }
+</script>
+
+<style>
+  .page-discussion {
+    margin: 2.5rem 0 1.5rem;
+    padding-top: 1.5rem;
+    border-top: var(--border);
+    scroll-margin-top: 90px;
+  }
+
+  .page-discussion__title {
+    margin: 0 0 6px;
+    color: var(--primary-text-color);
+    font-family: var(--font-sans);
+    font-size: 1.125rem;
+    font-weight: 600;
+  }
+
+  .page-discussion__intro {
+    margin: 0 0 1rem;
+    color: var(--secondary-text-color);
+    font-size: 0.875rem;
+    line-height: 1.5;
+  }
+
+  .giscus {
+    min-height: 120px;
+    scroll-margin-top: 90px;
+  }
+</style>

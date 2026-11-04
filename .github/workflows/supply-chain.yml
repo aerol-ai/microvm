@@ -1,6 +1,6 @@
-# Dependency review and gosec run on every pull request and on the merge
-# queue. They are required checks: a high-severity finding fails the job,
-# and the default-branch ruleset rejects the merge.
+# Dependency review and gosec run on every pull request into main and on
+# the merge queue. They are required checks: a high-severity finding fails
+# the job, and the default-branch ruleset rejects the merge.
 #
 # No `push` trigger and no `if:` on the jobs. Dependency review has no pull
 # request to diff on a branch push, and a conditional job is not a gate.
@@ -8,8 +8,24 @@
 name: Supply chain
 
 on:
+  # Only pull requests into main. A plain pull request into a feature
+  # branch runs nothing. A GitHub native stacked pull request still runs,
+  # because GitHub merges the whole stack under main's ruleset and these
+  # are required checks on every layer. `edited` is listed so a pull
+  # request retargeted to main gets its checks without a new push; a title
+  # or body edit also fires it.
   pull_request:
+    branches:
+      - main
+    types: [opened, synchronize, reopened, edited]
   merge_group:
+
+# A new push to a pull request cancels that pull request's older run, so
+# a rebased stack doesn't queue a stale run per layer ahead of the current
+# one. Pushes to main and merge-queue runs are never cancelled.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
@@ -28,7 +44,7 @@ jobs:
           persist-credentials: false
 
       - name: Review dependency changes
-        uses: actions/dependency-review-action@2031cfc080254a8a887f58cffee85186f0e49e48 # v4.9.0
+        uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
         with:
           fail-on-severity: high
           comment-summary-in-pr: never

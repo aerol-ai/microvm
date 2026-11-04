@@ -87,6 +87,7 @@ func TestSuperviseExitDoubleCrashDisables(t *testing.T) {
 		hostPath:  hostPath,
 		plan:      adapters.Plan{Argv: []string{"true"}},
 		cmd:       cmd,
+		exit:      watchExit(cmd),
 		lastCrash: time.Now().UTC().Add(-5 * time.Second),
 		restarts:  1,
 	}
@@ -123,6 +124,7 @@ func TestSuperviseExitRestartSpawnFailure(t *testing.T) {
 		hostPath:  hostPath,
 		plan:      adapters.Plan{Argv: []string{"/no/such/binary"}},
 		cmd:       cmd,
+		exit:      watchExit(cmd),
 	}
 	m.mu.Lock()
 	m.state["sb-spawn-fail"] = []*mountState{state}
@@ -262,7 +264,8 @@ func TestSuperviseExitRewritesCredOnRestart(t *testing.T) {
 			CredFile: credPath,
 			CredBody: []byte("secret"),
 		},
-		cmd: cmd,
+		cmd:  cmd,
+		exit: watchExit(cmd),
 	}
 	m.mu.Lock()
 	m.state["sb-cred"] = []*mountState{state}
@@ -283,7 +286,7 @@ func TestNewNilLoggerRejected(t *testing.T) {
 
 func TestMountOneFUSESuccessUnlinksCred(t *testing.T) {
 	oldProbe := waitForMountProbe
-	waitForMountProbe = func(string, time.Duration) error { return nil }
+	waitForMountProbe = func(string, time.Duration, <-chan struct{}) error { return nil }
 	t.Cleanup(func() { waitForMountProbe = oldProbe })
 
 	m := newTestManager(t, map[models.MountType]adapters.Adapter{

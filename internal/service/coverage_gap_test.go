@@ -80,13 +80,13 @@ func (dnsStringNotFoundResolver) LookupTXT(_ context.Context, _ string) ([]strin
 
 func TestVerifyCustomDomainOwnershipDNSErrors(t *testing.T) {
 	ctx := context.Background()
-	if err := verifyCustomDomainOwnership(ctx, dnsNotFoundResolver{}, "api.acme.com", "_aerol-verify", "aerol-verify="); !errors.Is(err, models.ErrCustomDomainVerificationFailed) {
+	if err := verifyCustomDomainOwnership(ctx, dnsNotFoundResolver{}, "api.acme.com", "_aerol-verify", "aerol-verify=", ""); !errors.Is(err, models.ErrCustomDomainVerificationFailed) {
 		t.Fatalf("not found err = %v", err)
 	}
-	if err := verifyCustomDomainOwnership(ctx, dnsGenericErrResolver{}, "api.acme.com", "_aerol-verify", "aerol-verify="); !errors.Is(err, models.ErrCustomDomainVerificationFailed) {
+	if err := verifyCustomDomainOwnership(ctx, dnsGenericErrResolver{}, "api.acme.com", "_aerol-verify", "aerol-verify=", ""); !errors.Is(err, models.ErrCustomDomainVerificationFailed) {
 		t.Fatalf("generic err = %v", err)
 	}
-	if err := verifyCustomDomainOwnership(ctx, dnsStringNotFoundResolver{}, "api.acme.com", "_aerol-verify", "aerol-verify="); !errors.Is(err, models.ErrCustomDomainVerificationFailed) {
+	if err := verifyCustomDomainOwnership(ctx, dnsStringNotFoundResolver{}, "api.acme.com", "_aerol-verify", "aerol-verify=", ""); !errors.Is(err, models.ErrCustomDomainVerificationFailed) {
 		t.Fatalf("string not found err = %v", err)
 	}
 }
@@ -283,7 +283,7 @@ func TestIngressDeltaHelpersAndGC(t *testing.T) {
 	}
 
 	svc.ingressRouteCache = map[string]ingressRouteIntent{}
-	ops, commit := svc.planClusterIngressDelta(intents)
+	ops, commit := svc.planClusterIngressDelta(intents, nil)
 	if len(ops) == 0 {
 		t.Fatal("expected delta ops on cold cache")
 	}
@@ -397,7 +397,7 @@ func TestBuildClusterIngressIntentsExecutesApplyAndDeleteClosures(t *testing.T) 
 	if !needL4 {
 		t.Fatal("expected L4 to be required for cluster ingress intents")
 	}
-	ops, commit := svc.planClusterIngressDelta(desired)
+	ops, commit := svc.planClusterIngressDelta(desired, nil)
 	if len(ops) == 0 {
 		t.Fatal("expected initial delta ops")
 	}
@@ -408,11 +408,11 @@ func TestBuildClusterIngressIntentsExecutesApplyAndDeleteClosures(t *testing.T) 
 	}
 	commit()
 
-	if ops, _ = svc.planClusterIngressDelta(desired); len(ops) != 0 {
+	if ops, _ = svc.planClusterIngressDelta(desired, nil); len(ops) != 0 {
 		t.Fatalf("identical desired state produced %d ops, want 0", len(ops))
 	}
 
-	ops, _ = svc.planClusterIngressDelta(map[string]ingressRouteIntent{})
+	ops, _ = svc.planClusterIngressDelta(map[string]ingressRouteIntent{}, nil)
 	if len(ops) == 0 {
 		t.Fatal("expected delete ops when desired state is empty")
 	}
@@ -952,7 +952,7 @@ func TestSnapshotPusherValidateAndReadPAT(t *testing.T) {
 	if !SnapshotNeedsPush(&models.SandboxSnapshot{ImageDistributionMode: models.ImageDistributionLocalOnly}) {
 		t.Fatal("local-only should need push")
 	}
-	if p.DestRefFor("snap") == "" {
+	if p.DestRefFor("", "snap") == "" {
 		t.Fatal("DestRefFor empty")
 	}
 }

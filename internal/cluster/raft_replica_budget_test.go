@@ -10,6 +10,13 @@ import (
 	"github.com/hashicorp/raft"
 )
 
+// The fake members below are never dialled successfully, so their addresses
+// only have to be distinct from the real one. Keep every fake port under
+// 32768: Linux hands out ephemeral ports from 32768 (macOS from 49152), and
+// the test cluster's own Raft listener binds an ephemeral port. A fake
+// address on 34003 collided with it on CI ("found duplicate address in
+// configuration").
+
 // newReplicaBudgetCluster is a real single-voter raft leader. The voter cap is
 // pinned to 1 so every admitted peer joins as a NON-VOTER: a non-voter still
 // receives the full log and FSM (the thing the budget exists to bound) but
@@ -23,16 +30,12 @@ func newReplicaBudgetCluster(t *testing.T, nodeID string) (*Cluster, func()) {
 	return c, cleanup
 }
 
-// seedGossipView installs a deterministic membership view on a real cluster so
-// the test controls the topology regime without standing up N memberlist
-// processes.
-//
-// The real gossip refresh loop must be stopped first: every
-// ClusterCapacityGossipInterval (1s here) it rewrites the current index from
-// memberlist, which knows only this node. A tick landing between the seed and
-// handleMemberJoin made peerRaftAddr return "" for every joiner, so none was
-// admitted — a flake that only needed a slow runner to widen the window.
-func seedGossipView(t *testing.T, c *Cluster, members []Member) {
+// stopGossipRefresh stops the real gossip refresh loop and waits until it has
+// returned, so a test that writes members into the index by hand keeps them:
+// every ClusterCapacityGossipInterval (1s in these tests) the loop rewrites
+// the index from memberlist, which knows only this node. Cancelling alone is
+// not enough; a tick already selected can still rewrite the index.
+func stopGossipRefresh(t *testing.T, c *Cluster) {
 	t.Helper()
 	if c.gossip.stopRefresh != nil {
 		c.gossip.stopRefresh()
@@ -44,6 +47,20 @@ func seedGossipView(t *testing.T, c *Cluster, members []Member) {
 			t.Fatal("gossip refresh loop did not stop; it would overwrite the seeded view")
 		}
 	}
+}
+
+// seedGossipView installs a deterministic membership view on a real cluster so
+// the test controls the topology regime without standing up N memberlist
+// processes.
+//
+// The real gossip refresh loop must be stopped first: every
+// ClusterCapacityGossipInterval (1s here) it rewrites the current index from
+// memberlist, which knows only this node. A tick landing between the seed and
+// handleMemberJoin made peerRaftAddr return "" for every joiner, so none was
+// admitted — a flake that only needed a slow runner to widen the window.
+func seedGossipView(t *testing.T, c *Cluster, members []Member) {
+	t.Helper()
+	stopGossipRefresh(t, c)
 	index := newGossipMemberIndex()
 	for _, m := range members {
 		index.upsert(m)
@@ -182,7 +199,7 @@ func TestRaftReplicaBudgetCountsDeadConfiguredServersUntilRemoval(t *testing.T) 
 	// frees when the removal commits.
 	for i := range MaxServerTierNodes - 2 {
 		id := fmt.Sprintf("srv-filler-dead-%d", i)
-		if err := c.raft.raft.AddNonvoter(raft.ServerID(id), raft.ServerAddress(fmt.Sprintf("127.0.0.1:%d", 43000+i)), 0, c.commitTimeout).Error(); err != nil {
+		if err := c.raft.raft.AddNonvoter(raft.ServerID(id), raft.ServerAddress(fmt.Sprintf("127.0.0.1:%d", 27000+i)), 0, c.commitTimeout).Error(); err != nil {
 			t.Fatalf("AddNonvoter(%s): %v", id, err)
 		}
 	}
@@ -242,7 +259,7 @@ func TestRaftReplicaAdmissionBoundedUnderConcurrentJoins(t *testing.T) {
 			NodeID:   fmt.Sprintf("join-%02d", i),
 			Role:     config.NodeRoleServer,
 			Alive:    true,
-			RaftAddr: fmt.Sprintf("127.0.0.1:%d", 33000+i),
+			RaftAddr: fmt.Sprintf("127.0.0.1:%d", 21000+i),
 		})
 	}
 	// Put the live count above MaxMixedClusterNodes so the dedicated-tier
@@ -256,7 +273,7 @@ func TestRaftReplicaAdmissionBoundedUnderConcurrentJoins(t *testing.T) {
 	// about, so none of them is discounted as dead.
 	for i := range MaxServerTierNodes - 2 {
 		id := fmt.Sprintf("existing-%d", i)
-		if err := c.raft.raft.AddNonvoter(raft.ServerID(id), raft.ServerAddress(fmt.Sprintf("127.0.0.1:%d", 34000+i)), 0, c.commitTimeout).Error(); err != nil {
+		if err := c.raft.raft.AddNonvoter(raft.ServerID(id), raft.ServerAddress(fmt.Sprintf("127.0.0.1:%d", 22000+i)), 0, c.commitTimeout).Error(); err != nil {
 			t.Fatalf("AddNonvoter(%s): %v", id, err)
 		}
 	}
@@ -300,7 +317,7 @@ func TestRaftMembershipMutationsSerializeWithRemoval(t *testing.T) {
 			NodeID:   fmt.Sprintf("churn-%02d", i),
 			Role:     config.NodeRoleServer,
 			Alive:    true,
-			RaftAddr: fmt.Sprintf("127.0.0.1:%d", 36000+i),
+			RaftAddr: fmt.Sprintf("127.0.0.1:%d", 23000+i),
 		})
 	}
 	for i := range 12 {
@@ -311,7 +328,7 @@ func TestRaftMembershipMutationsSerializeWithRemoval(t *testing.T) {
 	evictable := make([]string, 0, 3)
 	for i := range MaxServerTierNodes - 1 {
 		id := fmt.Sprintf("leaving-%d", i)
-		if err := c.raft.raft.AddNonvoter(raft.ServerID(id), raft.ServerAddress(fmt.Sprintf("127.0.0.1:%d", 37000+i)), 0, c.commitTimeout).Error(); err != nil {
+		if err := c.raft.raft.AddNonvoter(raft.ServerID(id), raft.ServerAddress(fmt.Sprintf("127.0.0.1:%d", 24000+i)), 0, c.commitTimeout).Error(); err != nil {
 			t.Fatalf("AddNonvoter(%s): %v", id, err)
 		}
 		if i < 3 {
@@ -401,7 +418,7 @@ func TestRaftReplicaBudgetCountsGossipDeadConfiguredReplicas(t *testing.T) {
 			NodeID:   fmt.Sprintf("srv-replacement-%d", i),
 			Role:     config.NodeRoleServer,
 			Alive:    true,
-			RaftAddr: fmt.Sprintf("127.0.0.1:%d", 41000+i),
+			RaftAddr: fmt.Sprintf("127.0.0.1:%d", 25000+i),
 		})
 	}
 	for i := range 12 {
@@ -412,12 +429,12 @@ func TestRaftReplicaBudgetCountsGossipDeadConfiguredReplicas(t *testing.T) {
 	var flapped []string
 	for i := range MaxServerTierNodes - 1 {
 		id := fmt.Sprintf("srv-existing-%d", i)
-		if err := c.raft.raft.AddNonvoter(raft.ServerID(id), raft.ServerAddress(fmt.Sprintf("127.0.0.1:%d", 42000+i)), 0, c.commitTimeout).Error(); err != nil {
+		if err := c.raft.raft.AddNonvoter(raft.ServerID(id), raft.ServerAddress(fmt.Sprintf("127.0.0.1:%d", 26000+i)), 0, c.commitTimeout).Error(); err != nil {
 			t.Fatalf("AddNonvoter(%s): %v", id, err)
 		}
 		if i < 2 {
 			flapped = append(flapped, id)
-			members = append(members, Member{NodeID: id, Role: config.NodeRoleServer, Alive: false, RaftAddr: fmt.Sprintf("127.0.0.1:%d", 42000+i)})
+			members = append(members, Member{NodeID: id, Role: config.NodeRoleServer, Alive: false, RaftAddr: fmt.Sprintf("127.0.0.1:%d", 26000+i)})
 		}
 	}
 	seedGossipView(t, c, members)

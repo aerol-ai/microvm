@@ -27,9 +27,11 @@ async function main() {
 
   console.log("Template is ready. Creating Firecracker sandbox...");
 
-  // 3. Create the sandbox using the template ID and specifying the firecracker runtime.
+  // 3. Create the sandbox from the template. The image is still required: pass
+  //    the one the template was built from (without the skopeo transport).
   const sandbox = await client.create({
-    image: template.id,
+    image: "ubuntu:22.04",
+    templateId: template.id,
     runtime: "firecracker",
     cpu: 2,
     memoryMB: 1024,

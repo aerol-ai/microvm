@@ -3,6 +3,8 @@ package clustercreate
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
@@ -14,9 +16,9 @@ import (
 
 	"github.com/aerol-ai/microvm/internal/cluster"
 	"github.com/aerol-ai/microvm/internal/service"
-	"github.com/aerol-ai/microvm/pkg/api/apihttp"
 	"github.com/aerol-ai/microvm/pkg/capacity"
 	"github.com/aerol-ai/microvm/pkg/docker"
+	"github.com/aerol-ai/microvm/pkg/egresspolicy"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
 
@@ -24,10 +26,38 @@ const (
 	HeaderTarget = "X-Cluster-Create-Target"
 	HeaderID     = "X-Cluster-Create-ID"
 
+	// HeaderIdempotencyKey is the client-supplied create idempotency key the
+	// v1 and Daytona surfaces honor. It is opt-in: a create without it keeps
+	// the default mint-fresh-every-call behaviour, so two deliberate identical
+	// POSTs still make two sandboxes (unlike E2B, which is content-addressed).
+	HeaderIdempotencyKey = "Idempotency-Key"
+
 	ReservationTTL = 120 * time.Second
 )
 
-type ErrorWriter func(w http.ResponseWriter, status int, message string)
+// DeterministicSandboxID derives a stable sandbox id from an owner reference
+// and a caller-supplied idempotency key, so a retried create (same owner, same
+// key) resolves to the same id and is deduplicated by the reservation /
+// CreateSandboxWithID fast path instead of minting a second sandbox. It returns
+// "" when key is blank — the caller then mints a fresh random id and the create
+// is not idempotent, which keeps the mechanism opt-in. The owner is mixed in so
+// two tenants that happen to choose the same key never collide, and so a
+// derived id satisfies CreateSandboxWithID's owner check on replay. The shape
+// ("sb-" + 16 hex) matches service.GenerateSandboxID, so the id is a valid
+// container name and is indistinguishable downstream from a random one.
+func DeterministicSandboxID(ownerRef, key string) string {
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(strings.TrimSpace(ownerRef) + "\x00" + key))
+	return "sb-" + hex.EncodeToString(sum[:8])
+}
+
+// ErrorWriter renders one error in the calling facade's envelope. code is
+// models.ErrorResponse.Code for surfaces that carry it (v1, Daytona); E2B and
+// Runloop ignore it and render their own shapes (and Runloop's x-should-retry).
+type ErrorWriter func(w http.ResponseWriter, status int, code, message string)
 
 type Decision struct {
 	ReservationID string
@@ -68,9 +98,14 @@ func (o PrepareOptions) metric(suffix string) string {
 
 func Prepare(w http.ResponseWriter, r *http.Request, svc *service.Service, req models.CreateSandboxRequest, writeError ErrorWriter, opts PrepareOptions) (Decision, bool) {
 	if writeError == nil {
-		writeError = func(w http.ResponseWriter, status int, message string) {
+		writeError = func(w http.ResponseWriter, status int, _, message string) {
 			http.Error(w, message, status)
 		}
+	}
+	// writeMsg is the common no-code path; the two coded cases below call
+	// writeError directly so a surface that carries a code keeps it.
+	writeMsg := func(w http.ResponseWriter, status int, message string) {
+		writeError(w, status, "", message)
 	}
 	if svc == nil {
 		return Decision{}, true
@@ -86,7 +121,7 @@ func Prepare(w http.ResponseWriter, r *http.Request, svc *service.Service, req m
 				opts.OnForwardStale()
 			}
 			service.RecordFacadeIdempotencyConflict(opts.metric("forward"))
-			writeError(w, http.StatusMisdirectedRequest, "cluster: forwarded create reached wrong target")
+			writeMsg(w, http.StatusMisdirectedRequest, "cluster: forwarded create reached wrong target")
 			return Decision{}, false
 		}
 		if service.ImageRequiresLocalPlacement(req) {
@@ -94,36 +129,57 @@ func Prepare(w http.ResponseWriter, r *http.Request, svc *service.Service, req m
 		}
 		sandboxID := strings.TrimSpace(r.Header.Get(HeaderID))
 		if sandboxID == "" {
-			writeError(w, http.StatusBadRequest, "cluster: forwarded create missing "+HeaderID)
+			writeMsg(w, http.StatusBadRequest, "cluster: forwarded create missing "+HeaderID)
 			return Decision{}, false
 		}
 		// The forward header is honored on the same handler the public listener
 		// serves (daemon mounts it on both), so reject a non-delimiter-safe id
 		// here rather than let it reach the mount manager as a host path.
 		if err := models.ValidateSandboxID(sandboxID); err != nil {
-			writeError(w, http.StatusBadRequest, "cluster: "+err.Error())
+			writeMsg(w, http.StatusBadRequest, "cluster: "+err.Error())
 			return Decision{}, false
 		}
 		return Decision{ReservationID: sandboxID}, true
 	}
 
-	if err := svc.NormalizeCreateImageDistribution(r.Context(), &req); err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
+	// A create naming a snapshot's committed tag that another node holds goes
+	// to that node: only its catalogue row can resolve and authorize the tag.
+	// This node skips the image normalization it cannot do (it would answer a
+	// tenant not-found and send an operator to pull the tag from Docker Hub),
+	// and the failover check that depends on its result; the home node runs
+	// both when the forward arrives.
+	snapshotHome, err := snapshotTagHome(r.Context(), svc, c, req)
+	if err != nil {
+		w.Header().Set("Retry-After", strconv.Itoa(cluster.CapacityRetryAfterSeconds))
+		writeMsg(w, http.StatusServiceUnavailable, "cluster: snapshot home lookup: "+err.Error())
 		return Decision{}, false
 	}
-	if err := service.NormalizeCreateFailover(&req); err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
-		return Decision{}, false
-	}
-	if opts.Normalize != nil {
-		if err := opts.Normalize(&req); err != nil {
-			writeError(w, http.StatusBadRequest, err.Error())
+	if snapshotHome == "" {
+		if err := svc.NormalizeCreateImageDistribution(r.Context(), &req); err != nil {
+			writeMsg(w, http.StatusBadRequest, err.Error())
+			return Decision{}, false
+		}
+		if err := service.NormalizeCreateFailover(&req); err != nil {
+			writeMsg(w, http.StatusBadRequest, err.Error())
 			return Decision{}, false
 		}
 	}
+	svc.NormalizeCreateEgressDefault(&req)
+	if opts.Normalize != nil {
+		if err := opts.Normalize(&req); err != nil {
+			writeMsg(w, http.StatusBadRequest, err.Error())
+			return Decision{}, false
+		}
+	}
+	// Reject reserved names before the reservation claims the name in Raft;
+	// the target node's create applies the same rule again.
+	if err := models.ValidateSandboxName(req.Name); err != nil {
+		writeMsg(w, http.StatusBadRequest, err.Error())
+		return Decision{}, false
+	}
 	if svc.ClusterEnabled() {
 		if err := service.ValidateClusterIsolateBundleRef(req); err != nil {
-			writeError(w, http.StatusBadRequest, err.Error())
+			writeMsg(w, http.StatusBadRequest, err.Error())
 			return Decision{}, false
 		}
 	}
@@ -132,27 +188,39 @@ func Prepare(w http.ResponseWriter, r *http.Request, svc *service.Service, req m
 	if opts.SyncBody {
 		normalized, err := json.Marshal(req)
 		if err != nil {
-			writeError(w, http.StatusInternalServerError, "cluster: normalize create body: "+err.Error())
+			writeMsg(w, http.StatusInternalServerError, "cluster: normalize create body: "+err.Error())
 			return Decision{}, false
 		}
 		r.Body = io.NopCloser(bytes.NewReader(normalized))
 		r.ContentLength = int64(len(normalized))
 	}
-	if service.ImageRequiresLocalPlacement(req) {
+	if snapshotHome != "" || service.ImageRequiresLocalPlacement(req) {
 		requiredNodeID, nodeBound := docker.BuiltImagePlacementNode(req.Image)
+		if snapshotHome != "" {
+			requiredNodeID, nodeBound = snapshotHome, true
+		}
 		if clusterCreateSelfCanOwnSandbox(c) && (!nodeBound || requiredNodeID == c.SelfNodeID()) {
 			if c.IsNodeDrained(c.SelfNodeID()) {
-				writeError(w, http.StatusServiceUnavailable, cluster.ErrNoPlacementTarget.Error())
+				writeMsg(w, http.StatusServiceUnavailable, cluster.ErrNoPlacementTarget.Error())
 				return Decision{}, false
 			}
 			return Decision{}, true
 		}
-		target, err := c.SelectPlacement(CapacityRequestFromCreate(req))
+		placementReq := CapacityRequestFromCreate(req)
+		if snapshotHome != "" {
+			// The snapshot's image is only on its home: a home that is gone
+			// fails as ErrArtifactNodeUnavailable below, like a built image's.
+			placementReq.RequiredNodeID = snapshotHome
+		}
+		target, err := c.SelectPlacement(placementReq)
 		if err != nil {
+			if writeNoEgressGateway(w, err, writeError) {
+				return Decision{}, false
+			}
 			if errors.Is(err, cluster.ErrArtifactNodeUnavailable) {
 				// The artifact went with its node; no Retry-After, the client
 				// must re-create it (re-upload the bundle / rebuild the image).
-				apihttp.WriteErrorCode(w, http.StatusServiceUnavailable, models.ErrorCodeArtifactNodeUnavailable, err.Error())
+				writeError(w, http.StatusServiceUnavailable, models.ErrorCodeArtifactNodeUnavailable, err.Error())
 				return Decision{}, false
 			}
 			if errors.Is(err, cluster.ErrNoPlacementTarget) || errors.Is(err, cluster.ErrInvalidTopology) {
@@ -161,24 +229,27 @@ func Prepare(w http.ResponseWriter, r *http.Request, svc *service.Service, req m
 				} else {
 					w.Header().Set("Retry-After", strconv.Itoa(cluster.CapacityRetryAfterSeconds))
 				}
-				writeError(w, http.StatusServiceUnavailable, err.Error())
+				writeMsg(w, http.StatusServiceUnavailable, err.Error())
 				return Decision{}, false
 			}
-			writeError(w, http.StatusInternalServerError, "placement: "+err.Error())
+			writeMsg(w, http.StatusInternalServerError, "placement: "+err.Error())
 			return Decision{}, false
 		}
 		if target.IsSelf {
 			if c.IsNodeDrained(c.SelfNodeID()) {
-				writeError(w, http.StatusServiceUnavailable, cluster.ErrNoPlacementTarget.Error())
+				writeMsg(w, http.StatusServiceUnavailable, cluster.ErrNoPlacementTarget.Error())
 				return Decision{}, false
 			}
 			return Decision{}, true
 		}
 		if target.APIURL == "" && target.InternalURL == "" {
-			writeError(w, http.StatusServiceUnavailable, cluster.ErrNoPlacementTarget.Error())
+			writeMsg(w, http.StatusServiceUnavailable, cluster.ErrNoPlacementTarget.Error())
 			return Decision{}, false
 		}
-		if opts.Logger != nil && strings.HasPrefix(strings.TrimSpace(req.Image), docker.BuiltImageNamespace+"/") {
+		if opts.Logger != nil && snapshotHome != "" {
+			opts.Logger.Info("cluster create: forwarding snapshot image to the node holding the snapshot",
+				"image", req.Image, "target", target.NodeID)
+		} else if opts.Logger != nil && strings.HasPrefix(strings.TrimSpace(req.Image), docker.BuiltImageNamespace+"/") {
 			opts.Logger.Info("cluster create: forwarding built local image to selected worker",
 				"image", req.Image, "target", target.NodeID)
 		}
@@ -195,7 +266,7 @@ func Prepare(w http.ResponseWriter, r *http.Request, svc *service.Service, req m
 	if sandboxID == "" {
 		generated, genErr := service.GenerateSandboxID()
 		if genErr != nil {
-			writeError(w, http.StatusInternalServerError, "cluster: generate sandbox id: "+genErr.Error())
+			writeMsg(w, http.StatusInternalServerError, "cluster: generate sandbox id: "+genErr.Error())
 			return Decision{}, false
 		}
 		sandboxID = generated
@@ -206,10 +277,13 @@ func Prepare(w http.ResponseWriter, r *http.Request, svc *service.Service, req m
 	}
 	target, recipients, err := c.SelectPlacementForCreate(CapacityRequestFromCreate(req), sandboxID, recipientBackups)
 	if err != nil {
+		if writeNoEgressGateway(w, err, writeError) {
+			return Decision{}, false
+		}
 		if errors.Is(err, cluster.ErrArtifactNodeUnavailable) {
 			// A node-bound js-bundle whose worker is gone: the client must
 			// re-upload, so no Retry-After — waiting changes nothing.
-			apihttp.WriteErrorCode(w, http.StatusServiceUnavailable, models.ErrorCodeArtifactNodeUnavailable, err.Error())
+			writeError(w, http.StatusServiceUnavailable, models.ErrorCodeArtifactNodeUnavailable, err.Error())
 			return Decision{}, false
 		}
 		if errors.Is(err, cluster.ErrNoPlacementTarget) || errors.Is(err, cluster.ErrInvalidTopology) {
@@ -218,20 +292,41 @@ func Prepare(w http.ResponseWriter, r *http.Request, svc *service.Service, req m
 			} else {
 				w.Header().Set("Retry-After", strconv.Itoa(cluster.CapacityRetryAfterSeconds))
 			}
-			writeError(w, http.StatusServiceUnavailable, err.Error())
+			writeMsg(w, http.StatusServiceUnavailable, err.Error())
 			return Decision{}, false
 		}
-		writeError(w, http.StatusInternalServerError, "placement: "+err.Error())
+		writeMsg(w, http.StatusInternalServerError, "placement: "+err.Error())
 		return Decision{}, false
 	}
+	// Names are unique per owner: the reservation claims the caller's
+	// owner-qualified key (internal/cluster/name_key.go). The owner comes
+	// from the request rather than opts.OwnerRef because the facades leave
+	// the reservation's secret handle untenanted but still need their names
+	// in the caller's namespace. The promote re-qualifies idempotently.
 	redacted := service.RedactClusterSecrets(req)
+	redacted.Name = cluster.QualifiedSandboxName(service.OwnerRefForCreate(r.Context()), redacted.Name)
 	reserveSecrets := cluster.PlacementSecrets{Recipients: recipients, OwnerRef: strings.TrimSpace(opts.OwnerRef)}
 	commitCtx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	err = c.ReserveOnTarget(commitCtx, sandboxID, target, &redacted, reserveSecrets, ReservationTTL)
 	cancel()
 	if err != nil {
-		if opts.PreferredSandboxID != "" && errors.Is(err, cluster.ErrReservationConflict) {
+		// A keyed retry that finds its id reserved goes to the reservation's
+		// node, which replays the sandbox, or holds the retry until the create
+		// running there settles and then replays it (service create_lease.go).
+		// The FSM answers a re-reserve of an unexpired reservation for the
+		// same target with ErrIncarnationConflict, since every ReserveOnTarget
+		// mints a fresh incarnation, and another target with
+		// ErrReservationConflict: both mean "this id's create is pending".
+		// The first used to fall through to a bare 503 the SDK gave up on
+		// while the create it was retrying was still running.
+		if opts.PreferredSandboxID != "" && (errors.Is(err, cluster.ErrReservationConflict) || errors.Is(err, cluster.ErrIncarnationConflict)) {
 			service.RecordFacadeIdempotencyConflict(opts.metric("reservation"))
+			// The verdict came from the leader, which holds the reservation.
+			// On a raft voter the owner read below is this node's own FSM
+			// copy, which can trail the leader by an apply, so give it a
+			// moment to show the reservation (UC-367 on cluster-3-mixed: a
+			// voter ingress read no owner yet and answered 409).
+			awaitOwner(r.Context(), c, sandboxID, ownerCatchUpWait)
 			handled, local := routeExistingPlacement(w, r, c, sandboxID, writeError)
 			if local {
 				return Decision{ReservationID: sandboxID}, true
@@ -239,35 +334,43 @@ func Prepare(w http.ResponseWriter, r *http.Request, svc *service.Service, req m
 			if handled {
 				return Decision{}, false
 			}
+			// Still no owner: the same key's create settled between the
+			// reserve and the read (it failed, or its reservation expired),
+			// or this node's copy is further behind. Either way the next
+			// retry of this key replays or reserves afresh; a 409 would
+			// tell the client its retry can never succeed.
+			w.Header().Set("Retry-After", "1")
+			writeMsg(w, http.StatusServiceUnavailable, "cluster: the sandbox's pending create settled while this retry was routed; retry")
+			return Decision{}, false
 		}
 		if errors.Is(err, cluster.ErrNameConflict) {
 			service.RecordFacadeIdempotencyConflict(opts.metric("name"))
-			writeError(w, http.StatusConflict, "sandbox name already in use cluster-wide")
+			writeMsg(w, http.StatusConflict, "sandbox name already in use cluster-wide")
 			return Decision{}, false
 		}
 		if errors.Is(err, cluster.ErrReservationConflict) {
 			service.RecordFacadeIdempotencyConflict(opts.metric("reservation"))
-			writeError(w, http.StatusConflict, "cluster: reservation conflict on sandbox id")
+			writeMsg(w, http.StatusConflict, "cluster: reservation conflict on sandbox id")
 			return Decision{}, false
 		}
 		if errors.Is(err, cluster.ErrCreateBackpressure) {
 			w.Header().Set("Retry-After", strconv.Itoa(cluster.CreateBackpressureRetryAfterSeconds))
-			writeError(w, http.StatusTooManyRequests, err.Error())
+			writeMsg(w, http.StatusTooManyRequests, err.Error())
 			return Decision{}, false
 		}
 		if errors.Is(err, cluster.ErrCapacityExceeded) || errors.Is(err, cluster.ErrNoPlacementTarget) {
 			w.Header().Set("Retry-After", strconv.Itoa(cluster.CapacityRetryAfterSeconds))
-			writeError(w, http.StatusServiceUnavailable, err.Error())
+			writeMsg(w, http.StatusServiceUnavailable, err.Error())
 			return Decision{}, false
 		}
 		// Oversized specs are a caller problem, not a cluster problem: the
 		// recovery payload rides inline in the raft entry and has a hard size
 		// cap with no fallback delivery path.
 		if errors.Is(err, cluster.ErrRecoveryPayloadTooLarge) {
-			writeError(w, http.StatusBadRequest, "sandbox spec too large to replicate across the cluster: "+err.Error())
+			writeMsg(w, http.StatusBadRequest, "sandbox spec too large to replicate across the cluster: "+err.Error())
 			return Decision{}, false
 		}
-		writeError(w, http.StatusServiceUnavailable, "cluster: reserve placement failed: "+err.Error())
+		writeMsg(w, http.StatusServiceUnavailable, "cluster: reserve placement failed: "+err.Error())
 		return Decision{}, false
 	}
 	r.Header.Set(HeaderTarget, target.NodeID)
@@ -277,11 +380,233 @@ func Prepare(w http.ResponseWriter, r *http.Request, svc *service.Service, req m
 		return Decision{ReservationID: sandboxID}, true
 	}
 	service.RecordCreateReservationState("reserve_remote")
-	c.ForwardHTTP(cluster.Endpoint{NodeID: target.NodeID, InternalURL: target.InternalURL, APIURL: target.APIURL}, w, r)
+	forwardReservedCreate(w, r, c, cluster.Endpoint{NodeID: target.NodeID, InternalURL: target.InternalURL, APIURL: target.APIURL},
+		sandboxID, opts.PreferredSandboxID == "", opts.Logger)
 	return Decision{}, false
 }
 
+// snapshotTagHome returns the node a create is forwarded to because its image
+// is a snapshot's committed tag (docker.SnapshotImageTagForOwner) held by
+// another node. The tag exists only in that node's image store, and only that
+// node's catalogue row says who may start it, so the home node runs the whole
+// create, ownership checks included; this lookup routes and never authorizes.
+//
+// "" keeps today's path: the image is not a snapshot tag; the caller also named
+// the pushed registry copy, which any node can start; this node holds the
+// snapshot, whatever the index says; or no home is registered (single-node,
+// the Noop client, or a home that left the cluster and took the snapshot with
+// it). The local catalogue is read first so a create on the home node never
+// waits on the index, which on an agent-role node is a control-plane call.
+func snapshotTagHome(ctx context.Context, svc *service.Service, c cluster.Client, req models.CreateSandboxRequest) (string, error) {
+	if !service.ImageRequiresLocalPlacement(req) || !docker.IsSnapshotImageRef(req.Image) {
+		return "", nil
+	}
+	held, err := svc.HoldsCommittedSnapshotImage(ctx, req.Image)
+	if err != nil || held {
+		// A catalogue read error is NormalizeCreateImageDistribution's to
+		// report: it makes the same read next.
+		return "", nil
+	}
+	node, ok, err := c.SnapshotHomeNode(ctx, cluster.SnapshotImageHomeKey(req.Image))
+	if err != nil {
+		return "", err
+	}
+	if !ok || node == c.SelfNodeID() {
+		return "", nil
+	}
+	return node, nil
+}
+
+// forwardReservedCreate forwards a create this router just reserved and, when
+// the target refuses it with a 4xx, releases the reservation before the
+// refusal reaches the client.
+//
+// A 4xx other than 409 means the target never made the sandbox: it refused
+// the request (validation, an auth 401 on a worker whose token mirror is one
+// poll behind, a stale target's 421, a rate limit) or failed the create and
+// retracted it. Keeping the reservation until ReservationTTL then only turns
+// the client's corrected retry into "409 sandbox name already in use
+// cluster-wide" for two minutes. The target already cancels after a failed
+// create leg; this also covers the refusals that never reach its create, and
+// is a no-op when the target cancelled first. The refusal is held until the
+// cancel commits, so a retry sent the moment the client reads the 4xx cannot
+// race it. A 409 is excluded and keeps today's behavior (see
+// rejectionHold.rejected).
+//
+// An Idempotency-Key id is shared by every replay of the key, and a replay
+// routes to the standing reservation (routeExistingPlacement) and may be
+// creating under it on the target right now. Its reservation is released
+// only on a refusal of the request itself (rejectionHold.refusedForEveryReplay),
+// which that replay, carrying the same request, would have met too before its
+// create began; a refusal of this attempt alone keeps it for the replay.
+// ReserveOnTarget succeeding means this request made the reservation: a
+// re-reserve of a standing one fails (ErrIncarnationConflict or
+// ErrReservationConflict) and never reaches here.
+//
+// A 5xx, a transport failure or a timeout keeps the reservation, as before:
+// the target may still be creating, and cancelling under a live create would
+// leave an untracked sandbox. The expiry sweep stays the safety net there.
+func forwardReservedCreate(w http.ResponseWriter, r *http.Request, c cluster.Client, target cluster.Endpoint, sandboxID string, freshID bool, logger *slog.Logger) {
+	hold := &rejectionHold{ResponseWriter: w}
+	defer hold.release()
+	c.ForwardHTTP(target, hold, r)
+	if !hold.rejected() || (!freshID && !hold.refusedForEveryReplay()) {
+		return
+	}
+	if freshID {
+		service.RecordCreateReservationState("release_rejected")
+	} else {
+		service.RecordCreateReservationState("release_rejected_keyed")
+	}
+	// WithoutCancel: a client that hangs up on the 4xx must not leave its
+	// name held for two minutes.
+	cancelReservation(context.WithoutCancel(r.Context()), c, logger, sandboxID)
+}
+
+// maxHeldRejectionBytes bounds the refusal body rejectionHold buffers. A
+// create's 4xx is a short JSON error; a larger one is let through rather than
+// held, and the release then still runs, only not ahead of the client.
+const maxHeldRejectionBytes = 64 << 10
+
+// rejectionHold passes a forwarded response through untouched unless its
+// status is a refusal (rejected), in which case it holds the status and body
+// until release.
+type rejectionHold struct {
+	http.ResponseWriter
+	status int
+	held   bool
+	body   bytes.Buffer
+}
+
+func (h *rejectionHold) WriteHeader(status int) {
+	if status < http.StatusOK {
+		// 1xx informational responses precede the final one.
+		h.ResponseWriter.WriteHeader(status)
+		return
+	}
+	if h.status != 0 {
+		return
+	}
+	h.status = status
+	if h.rejected() {
+		h.held = true
+		return
+	}
+	h.ResponseWriter.WriteHeader(status)
+}
+
+func (h *rejectionHold) Write(p []byte) (int, error) {
+	if h.status == 0 {
+		h.WriteHeader(http.StatusOK)
+	}
+	if !h.held {
+		return h.ResponseWriter.Write(p)
+	}
+	if h.body.Len()+len(p) > maxHeldRejectionBytes {
+		h.release()
+		return h.ResponseWriter.Write(p)
+	}
+	return h.body.Write(p)
+}
+
+// Flush forwards a proxy flush, except while a refusal is held.
+func (h *rejectionHold) Flush() {
+	if h.held {
+		return
+	}
+	if f, ok := h.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+// Unwrap lets http.ResponseController reach the underlying writer.
+func (h *rejectionHold) Unwrap() http.ResponseWriter { return h.ResponseWriter }
+
+// rejected reports a 4xx other than 409. A target's 409 can follow a create
+// that succeeded: the promote lost a name race (OverlapPhasePromote) and, if
+// retractFailedPromote's destroy then failed, the sandbox is still live under
+// the Reserved row. Cancelling that row is the "local sandbox outlives its
+// reservation" case retractReservedCreate refuses to cause, since ownership
+// replay would resurrect it. A real name conflict is a legitimate 409 anyway,
+// so a 409 keeps today's behavior.
+func (h *rejectionHold) rejected() bool {
+	return h.status >= http.StatusBadRequest && h.status < http.StatusInternalServerError &&
+		h.status != http.StatusConflict
+}
+
+// refusedForEveryReplay reports a refusal of the request itself, which every
+// replay of an Idempotency-Key carrying the same request meets too, so none
+// can be creating under the reservation. A refusal of this attempt alone is
+// not one: 401 (a worker whose token mirror is a poll behind), 407, 408 and
+// 425 (timing), 421 (a stale target) and 429 (a rate limit) — the SDK
+// retries those with the same key, and the retry needs the reservation. Nor
+// is 422 idempotency_key_reused: the key's reservation is then the create
+// of the request that used it first, which the target is running.
+func (h *rejectionHold) refusedForEveryReplay() bool {
+	if !h.rejected() {
+		return false
+	}
+	switch h.status {
+	case http.StatusUnauthorized, http.StatusProxyAuthRequired, http.StatusRequestTimeout,
+		http.StatusMisdirectedRequest, http.StatusUnprocessableEntity, http.StatusTooEarly,
+		http.StatusTooManyRequests:
+		return false
+	}
+	return true
+}
+
+// release sends a held refusal. Safe to call more than once.
+func (h *rejectionHold) release() {
+	if !h.held {
+		return
+	}
+	h.held = false
+	h.ResponseWriter.WriteHeader(h.status)
+	_, _ = h.ResponseWriter.Write(h.body.Bytes())
+	h.body.Reset()
+}
+
+// ownerCatchUpWait bounds how long a keyed reservation conflict waits for this
+// node's FSM copy to show the reservation the leader just reported. An apply
+// reaches a voter's copy within a heartbeat or two; a variable so tests can
+// shorten it.
+var ownerCatchUpWait = 2 * time.Second
+
+// awaitOwner returns once sandboxID has an owner in this node's view, or the
+// budget or ctx runs out. It backs off from 10ms to 200ms between reads: on a
+// non-voter OwnerOf is a control-plane request, and its first read already
+// sees the leader's state.
+func awaitOwner(ctx context.Context, c cluster.Client, sandboxID string, budget time.Duration) {
+	deadline := time.Now().Add(budget)
+	pause := 10 * time.Millisecond
+	for {
+		if _, err := c.OwnerOf(sandboxID); err == nil {
+			return
+		}
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return
+		}
+		if pause > remaining {
+			pause = remaining
+		}
+		timer := time.NewTimer(pause)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return
+		case <-timer.C:
+		}
+		if pause *= 2; pause > 200*time.Millisecond {
+			pause = 200 * time.Millisecond
+		}
+	}
+}
+
 func routeExistingPlacement(w http.ResponseWriter, r *http.Request, c cluster.Client, sandboxID string, writeError ErrorWriter) (handled bool, local bool) {
+	writeMsg := func(w http.ResponseWriter, status int, message string) {
+		writeError(w, status, "", message)
+	}
 	owner, err := c.OwnerOf(sandboxID)
 	if err != nil {
 		return false, false
@@ -293,7 +618,7 @@ func routeExistingPlacement(w http.ResponseWriter, r *http.Request, c cluster.Cl
 	}
 	if owner.APIURL == "" && owner.InternalURL == "" {
 		service.RecordRouteMiss()
-		writeError(w, http.StatusServiceUnavailable, "cluster: owner "+owner.NodeID+" URL unknown")
+		writeMsg(w, http.StatusServiceUnavailable, "cluster: owner "+owner.NodeID+" URL unknown")
 		return true, false
 	}
 	c.ForwardHTTP(cluster.Endpoint{NodeID: owner.NodeID, InternalURL: owner.InternalURL, APIURL: owner.APIURL}, w, r)
@@ -302,6 +627,12 @@ func routeExistingPlacement(w http.ResponseWriter, r *http.Request, c cluster.Cl
 
 type CreateOptions struct {
 	PromoteWithSpec bool
+	// SandboxID is the id an UNRESERVED create uses. Prepare deliberately
+	// returns no reservation for local-only images (local snapshots, mapped
+	// built images), so a facade that derives a retry-stable id must not
+	// pass that id as reservationID — no reservation exists under it and
+	// the reserved path would refuse the create. Empty generates an id.
+	SandboxID string
 }
 
 func CreateOnSelectedNode(ctx context.Context, svc *service.Service, logger *slog.Logger, req models.CreateSandboxRequest, reservationID string, opts CreateOptions) (*models.CreateSandboxResponse, error) {
@@ -311,30 +642,52 @@ func CreateOnSelectedNode(ctx context.Context, svc *service.Service, logger *slo
 	if err := service.NormalizeCreateFailover(&req); err != nil {
 		return nil, err
 	}
+	svc.NormalizeCreateEgressDefault(&req)
+	// Pin bare built-in profiles here, on the owner after any forward, so
+	// the spec promoted below carries this node's version (CEO D11).
+	service.NormalizeCreateEgressProfiles(&req)
 	c := svc.Cluster()
 
 	// Reserved path: overlap CreateSandboxWithID with the secrets seal, then
 	// promote after both legs join (the row must stay Reserved during the
-	// create — see OverlapCreateAndPromote). Resolve platform volumes first —
-	// store lookups only, no container — so PromoteWithSpec carries concrete
-	// MountSpecs (plans/warm-create-latency-tier1.5-seal-promote-overlap.md).
+	// create — see OverlapCreateAndPromote, which also resolves platform
+	// volumes for the promoted spec without stripping them from the create)
+	// (plans/warm-create-latency-tier1.5-seal-promote-overlap.md).
 	if reservationID != "" {
 		service.RecordCreateReservationState("promote_local")
-		if err := svc.ResolvePlatformVolumesForReplication(ctx, &req); err != nil {
-			if c != nil {
-				cancelReservation(context.Background(), c, logger, reservationID)
-			}
-			return nil, err
-		}
 		return OverlapCreateAndPromote(ctx, svc, logger, req, reservationID, OverlapOptions{
 			PromoteWithSpec: opts.PromoteWithSpec,
 		})
 	}
 
 	service.RecordCreateReservationState("self_local")
-	resp, err := svc.CreateSandbox(ctx, req)
+	// An id the caller names (an Idempotency-Key, a Runloop request id) holds
+	// its create lease (service create_lease.go) across the create AND the
+	// seal and promote below, so a retry arriving meanwhile waits for all
+	// three, then replays (resp.Replayed) or, after a rollback, creates
+	// afresh. A replay is never sealed, promoted or rolled back again. A
+	// generated id needs no lease.
+	id := strings.TrimSpace(opts.SandboxID)
+	ctx, release, err := svc.BeginSandboxCreate(ctx, id, req.CreateRequestDigests)
 	if err != nil {
 		return nil, err
+	}
+	defer release()
+	var resp *models.CreateSandboxResponse
+	if id != "" {
+		resp, err = svc.CreateSandboxWithID(ctx, req, id)
+	} else {
+		resp, err = svc.CreateSandbox(ctx, req)
+	}
+	if err != nil {
+		return nil, err
+	}
+	if c == nil || resp.Replayed {
+		// No cluster client (embedded/test wiring): nothing to seal or
+		// promote, the same as OverlapCreateAndPromote's nil-cluster leg.
+		// A replay was sealed and promoted by the create that made it, and
+		// is never this request's to roll back.
+		return resp, nil
 	}
 	if err := svc.ResolvePlatformVolumesForReplication(ctx, &req); err != nil {
 		RollbackLocalCreate(context.Background(), svc, logger, resp.Sandbox.ID)
@@ -369,6 +722,19 @@ func CancelReservationBestEffort(ctx context.Context, svc *service.Service, logg
 		return
 	}
 	cancelReservation(ctx, c, logger, sandboxID)
+}
+
+// writeNoEgressGateway answers a gateway-mode create that no node with a
+// ready egress gateway could take (plans/egress-domain-filtering.md CEO D20):
+// 503 with a code and Retry-After, since a gateway coming back re-advertises
+// within seconds. Reports whether it wrote.
+func writeNoEgressGateway(w http.ResponseWriter, err error, writeError ErrorWriter) bool {
+	if !errors.Is(err, cluster.ErrNoEgressGatewayTarget) {
+		return false
+	}
+	w.Header().Set("Retry-After", strconv.Itoa(cluster.CapacityRetryAfterSeconds))
+	writeError(w, http.StatusServiceUnavailable, models.ErrorCodeEgressGatewayUnavailable, err.Error())
+	return true
 }
 
 func CapacityRequestFromCreate(req models.CreateSandboxRequest) capacity.Request {
@@ -411,6 +777,12 @@ func CapacityRequestFromCreate(req models.CreateSandboxRequest) capacity.Request
 	if runtimeName == models.RuntimeWasm {
 		out.MemoryMB += 8
 	}
+	out.NeedsEgressGateway = models.RuntimeUsesEgressGateway(runtimeName) &&
+		egresspolicy.NeedsGatewayWith(req.NetworkAllowOut, req.NetworkDenyOut, req.NetworkBlockAll,
+			req.NetworkEgressMode == models.NetworkEgressModeLearn, len(req.EgressProfiles))
+	// WASM and isolate filter in their own mediators, which an older peer
+	// lacks: it would store the policy and ignore it (review finding 10).
+	out.NeedsMediatedEgress = models.RuntimeMediatesEgress(runtimeName) && models.CreateHasEgress(&req)
 	if req.GPUs != nil {
 		want := req.GPUs.Count
 		if want <= 0 {

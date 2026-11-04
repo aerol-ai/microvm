@@ -50,24 +50,6 @@ func TestPortGatewayEnsureAndProxy(t *testing.T) {
 	d.ReleaseHTTPListener("sb-1", 8080)
 }
 
-func TestEgressPolicyAllowDeny(t *testing.T) {
-	if egressAllowed(EgressPolicy{BlockAll: true}, "example.com") {
-		t.Fatal("BlockAll should deny")
-	}
-	if !egressAllowed(EgressPolicy{}, "example.com") {
-		t.Fatal("empty allow should allow-all")
-	}
-	if egressAllowed(EgressPolicy{Allow: []string{"api.example.com"}}, "evil.com") {
-		t.Fatal("non-allowlisted host should deny")
-	}
-	if !egressAllowed(EgressPolicy{Allow: []string{"api.example.com"}}, "api.example.com") {
-		t.Fatal("allowlisted host should allow")
-	}
-	if egressAllowed(EgressPolicy{Deny: []string{"evil.com"}}, "evil.com") {
-		t.Fatal("deny should win")
-	}
-}
-
 func TestAsPortGateway(t *testing.T) {
 	d := New(Config{}, nil)
 	pg, ok := AsPortGateway(d)

@@ -18,20 +18,6 @@ import (
 	"github.com/aerol-ai/microvm/pkg/models"
 )
 
-func TestFilterE2BLocalToPage(t *testing.T) {
-	local := []listedSandboxResponse{{SandboxID: "sb-1"}, {SandboxID: "sb-2"}}
-	if got := filterE2BLocalToPage(local, nil, ""); len(got) != 2 {
-		t.Fatalf("cold start = %d", len(got))
-	}
-	if got := filterE2BLocalToPage(local, nil, "tok"); got != nil {
-		t.Fatalf("terminal = %+v", got)
-	}
-	got := filterE2BLocalToPage(local, []cluster.Placement{{SandboxID: "sb-2"}}, "")
-	if len(got) != 1 || got[0].SandboxID != "sb-2" {
-		t.Fatalf("page filter = %+v", got)
-	}
-}
-
 // e2bFacadeListCluster is not *cluster.Noop so listFacadeClusterItems runs the
 // placement-page merge instead of the standalone short-circuit.
 // e2bFacadeListCluster is not *cluster.Noop so listFacadeClusterItems runs the
@@ -270,7 +256,9 @@ func TestTranslateCreateSandboxRequestWasmPaths(t *testing.T) {
 		t.Fatalf("expected default public traffic true")
 	}
 
-	_, _, err = h.translateCreateSandboxRequest(context.Background(), createSandboxRequest{
+	// WASM egress lists pass through to the service, which owns the decision
+	// (the mediator enforces them, plans/egress-domain-filtering.md P1-6).
+	wasmReq, _, err = h.translateCreateSandboxRequest(context.Background(), createSandboxRequest{
 		TemplateID: "wasm-mod",
 		Timeout:    intPtr(120),
 		Metadata: map[string]any{
@@ -279,13 +267,13 @@ func TestTranslateCreateSandboxRequestWasmPaths(t *testing.T) {
 		},
 		Network: &sandboxNetworkRequest{AllowOut: []string{"10.0.0.0/8"}},
 	})
-	if err == nil {
-		t.Fatal("expected wasm egress rejection")
+	if err != nil {
+		t.Fatalf("wasm egress lists must pass through: %v", err)
+	}
+	if len(wasmReq.NetworkAllowOut) != 1 || wasmReq.NetworkAllowOut[0] != "10.0.0.0/8" {
+		t.Fatalf("wasm allowOut = %v", wasmReq.NetworkAllowOut)
 	}
 	var reqErr requestError
-	if !errors.As(err, &reqErr) || reqErr.status != http.StatusNotImplemented {
-		t.Fatalf("err = %v, want 501 not implemented", err)
-	}
 
 	_, _, err = h.translateCreateSandboxRequest(context.Background(), createSandboxRequest{
 		TemplateID: "wasm-mod",
@@ -387,9 +375,8 @@ func TestLoadReplayableCreateResultSandboxDBError(t *testing.T) {
 
 func TestCreateSandboxFingerprintErrorPath(t *testing.T) {
 	h := newHandlers(Deps{Service: nil})
-	_, err := createRequestFingerprint("", "base", models.CreateSandboxRequest{}, sandboxMeta{})
-	if err != nil {
-		t.Fatalf("unexpected fingerprint error: %v", err)
+	if _, err := createRequestFingerprints(h.deps.Service, "", "base", models.CreateSandboxRequest{}, sandboxMeta{}, false); err == nil {
+		t.Fatal("a fingerprint without the server key succeeded")
 	}
 	// Exercise handler path where fingerprint succeeds but claim fails with closed DB.
 	_, st, handler := newE2BHandlerTestEnv(t)
@@ -409,7 +396,7 @@ func TestCreateSandboxReadyReplayLoadError(t *testing.T) {
 	id := createE2BSandbox(t, handler)
 
 	ctx := context.Background()
-	fingerprint, err := createRequestFingerprint("", "base", models.CreateSandboxRequest{
+	fps, err := createRequestFingerprints(svc, "", "base", models.CreateSandboxRequest{
 		Image: "ubuntu:22.04",
 		Env:   map[string]string{},
 	}, sandboxMeta{
@@ -419,10 +406,11 @@ func TestCreateSandboxReadyReplayLoadError(t *testing.T) {
 		Secure:          true,
 		NetworkAllowOut: []string{},
 		NetworkDenyOut:  []string{},
-	})
+	}, false)
 	if err != nil {
 		t.Fatalf("fingerprint: %v", err)
 	}
+	fingerprint := fps.current
 	now := time.Now().UTC()
 	if _, _, err := svc.ClaimIdempotentRequest(ctx, idempotencyScopeCreate, fingerprint, now, time.Minute); err != nil {
 		t.Fatalf("ClaimIdempotentRequest: %v", err)
@@ -590,7 +578,7 @@ func TestDeleteSnapshotResolveAndAliasErrors(t *testing.T) {
 		t.Fatalf("UpsertSnapshotAlias: %v", err)
 	}
 
-	if err := st.DeleteSnapshot(ctx, "del-snap:default"); err != nil {
+	if err := st.DeleteSnapshot(ctx, "", "del-snap:default"); err != nil {
 		t.Fatalf("DeleteSnapshot: %v", err)
 	}
 	if err := st.Close(); err != nil {
@@ -656,8 +644,7 @@ func TestParseMetadataFilterEmptyValue(t *testing.T) {
 
 func TestLoadTemplateMapInvalidJSONWithLogger(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	t.Setenv("SB_E2B_TEMPLATE_MAP_JSON", "{invalid")
-	m := loadTemplateMap(logger)
+	m := loadTemplateMap("{invalid", logger)
 	if _, ok := m["base"]; !ok {
 		t.Fatal("expected default base template after invalid JSON")
 	}
@@ -755,8 +742,7 @@ func TestWaitForCreateReplayLockedUntilShorterThanPoll(t *testing.T) {
 }
 
 func TestLoadTemplateMapAddsDefaultBase(t *testing.T) {
-	t.Setenv("SB_E2B_TEMPLATE_MAP_JSON", `{"custom":"custom:img"}`)
-	m := loadTemplateMap(nil)
+	m := loadTemplateMap(`{"custom":"custom:img"}`, nil)
 	if m["base"] != "ubuntu:22.04" {
 		t.Fatalf("base = %q, want default ubuntu:22.04", m["base"])
 	}
@@ -910,7 +896,7 @@ func TestDeleteSnapshotAliasCleanupStoreError(t *testing.T) {
 	if err := json.NewDecoder(rr.Body).Decode(&snap); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	if err := st.DeleteSnapshot(ctx, "alias-del:default"); err != nil {
+	if err := st.DeleteSnapshot(ctx, "", "alias-del:default"); err != nil {
 		t.Fatalf("DeleteSnapshot: %v", err)
 	}
 	if err := st.Close(); err != nil {

@@ -1,7 +1,9 @@
 package containerd
 
 import (
+	"bytes"
 	"context"
+	"io"
 	"os"
 	"strings"
 	"testing"
@@ -9,6 +11,7 @@ import (
 
 	runtimeoptions "github.com/containerd/containerd/api/types/runtimeoptions/v1"
 	cntr "github.com/containerd/containerd/v2/client"
+	"github.com/containerd/containerd/v2/core/content"
 	"github.com/containerd/containerd/v2/core/images"
 	"github.com/containerd/errdefs"
 	"github.com/opencontainers/go-digest"
@@ -137,6 +140,9 @@ func TestRawSnapshotBackendWithoutLiveClient(t *testing.T) {
 	if _, err := b.getImage(context.Background(), "x"); err == nil {
 		t.Fatal("want live error")
 	}
+	if err := b.deleteImage(context.Background(), "x"); err == nil {
+		t.Fatal("want live error")
+	}
 }
 
 func TestNilClientContentAccessors(t *testing.T) {
@@ -158,6 +164,7 @@ type fakeSnapshotBackend struct {
 	diffIDVal     digest.Digest
 	blobLabels    map[string]map[string]string // blob digest -> gc labels
 	blobTypes     map[string]string            // blob digest -> media type
+	blobData      map[string][]byte            // blob digest -> content
 	createErr     error
 	created       images.Image
 	createdArg    images.Image
@@ -169,7 +176,67 @@ type fakeSnapshotBackend struct {
 	manifestErr   error
 	diffIDErr     error
 	writeBlobErr  error
+	// Firecracker rootfs import/export (image_import.go).
+	layerData     []byte
+	writeLayerErr error
+	updated       images.Image
+	updateErr     error
+	exported      string
+	exportErr     error
+	// deleted records every image record deleteImage removed.
+	deleted   []string
+	deleteErr error
+	// writeBlobFailAt fails only that write (1-based) when writeBlobErr is set.
+	writeBlobFailAt int
+	blobWrites      int
 }
+
+func (f *fakeSnapshotBackend) writeLayer(ctx context.Context, _ string, rootfs io.Reader) (ocispec.Descriptor, digest.Digest, error) {
+	if f.writeLayerErr != nil {
+		return ocispec.Descriptor{}, "", f.writeLayerErr
+	}
+	w := &memLayerWriter{}
+	desc, diffID, err := gzipLayer(ctx, w, rootfs)
+	f.layerData = w.buf.Bytes()
+	return desc, diffID, err
+}
+
+func (f *fakeSnapshotBackend) updateImage(_ context.Context, img images.Image) (images.Image, error) {
+	f.updated = img
+	if f.updateErr != nil {
+		return images.Image{}, f.updateErr
+	}
+	return img, nil
+}
+
+func (f *fakeSnapshotBackend) exportImage(_ context.Context, name string, w io.Writer) error {
+	f.exported = name
+	if f.exportErr != nil {
+		return f.exportErr
+	}
+	_, err := io.WriteString(w, "oci-archive:"+name)
+	return err
+}
+
+func (f *fakeSnapshotBackend) deleteImage(_ context.Context, name string) error {
+	if f.deleteErr != nil {
+		return f.deleteErr
+	}
+	f.deleted = append(f.deleted, name)
+	return nil
+}
+
+// memLayerWriter is an in-memory content.Writer stand-in for gzipLayer.
+type memLayerWriter struct {
+	buf       bytes.Buffer
+	commitErr error
+}
+
+func (m *memLayerWriter) Write(p []byte) (int, error) { return m.buf.Write(p) }
+func (m *memLayerWriter) Commit(context.Context, int64, digest.Digest, ...content.Opt) error {
+	return m.commitErr
+}
+func (m *memLayerWriter) Digest() digest.Digest { return digest.FromBytes(m.buf.Bytes()) }
 
 func (f *fakeSnapshotBackend) loadContainer(context.Context, *Client, string) (cntr.Container, error) {
 	if f.container == nil {
@@ -196,7 +263,8 @@ func (f *fakeSnapshotBackend) diffID(context.Context, ocispec.Descriptor) (diges
 	return f.diffIDVal, nil
 }
 func (f *fakeSnapshotBackend) writeBlob(_ context.Context, mediaType string, data []byte, labels map[string]string) (ocispec.Descriptor, error) {
-	if f.writeBlobErr != nil {
+	f.blobWrites++
+	if f.writeBlobErr != nil && (f.writeBlobFailAt == 0 || f.blobWrites == f.writeBlobFailAt) {
 		return ocispec.Descriptor{}, f.writeBlobErr
 	}
 	if f.blobLabels == nil {
@@ -206,6 +274,10 @@ func (f *fakeSnapshotBackend) writeBlob(_ context.Context, mediaType string, dat
 	desc := ocispec.Descriptor{MediaType: mediaType, Digest: digest.FromBytes(data), Size: int64(len(data))}
 	f.blobLabels[desc.Digest.String()] = labels
 	f.blobTypes[desc.Digest.String()] = mediaType
+	if f.blobData == nil {
+		f.blobData = map[string][]byte{}
+	}
+	f.blobData[desc.Digest.String()] = append([]byte(nil), data...)
 	return desc, nil
 }
 func (f *fakeSnapshotBackend) createImage(_ context.Context, img images.Image) (images.Image, error) {

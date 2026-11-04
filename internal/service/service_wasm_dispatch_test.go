@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"errors"
+	"github.com/aerol-ai/microvm/pkg/egresspolicy"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -206,7 +207,6 @@ func TestWasmCreateSandboxSuccess(t *testing.T) {
 		Runtime:            models.RuntimeWasm,
 		Name:               "test-wasm",
 		NetworkBlockAll:    true,
-		NetworkAllowOut:    []string{"10.0.0.0/24"},
 		AllowPublicTraffic: &denyPublic,
 	}
 
@@ -231,9 +231,6 @@ func TestWasmCreateSandboxSuccess(t *testing.T) {
 	}
 	if !sandbox.NetworkBlockAll {
 		t.Fatal("expected NetworkBlockAll to be persisted")
-	}
-	if len(sandbox.NetworkAllowOut) != 1 || sandbox.NetworkAllowOut[0] != "10.0.0.0/24" {
-		t.Fatalf("NetworkAllowOut = %v, want [10.0.0.0/24]", sandbox.NetworkAllowOut)
 	}
 	if sandbox.AllowPublicTraffic == nil || *sandbox.AllowPublicTraffic {
 		t.Fatalf("AllowPublicTraffic = %v, want false", sandbox.AllowPublicTraffic)
@@ -492,4 +489,30 @@ func TestWasmCreateSandboxRollbackBranches(t *testing.T) {
 			t.Fatal("failed create should not leave a sandbox row")
 		}
 	})
+}
+
+// TestWasmCreateEgressLists: WASM lists use the shared grammar (P1-6). Valid
+// lists reach the driver; a hostname deny is a 400.
+func TestWasmCreateEgressLists(t *testing.T) {
+	rt := &wasmRecordingRuntime{}
+	svc, st, _ := newServiceRuntimeHarness(t, &recordingRuntime{})
+	svc.cfg.EnableWasm = true
+	svc.SetWasmRuntime(rt)
+	resp, err := svc.CreateSandboxWithID(context.Background(), models.CreateSandboxRequest{
+		ModuleRef: "hello.wasm", Runtime: models.RuntimeWasm,
+		NetworkAllowOut: []string{"pypi.org", "10.0.0.0/8"},
+	}, "sb-wasm-lists")
+	if err != nil {
+		t.Fatalf("valid wasm lists must be accepted: %v", err)
+	}
+	row, _ := st.Get(context.Background(), resp.ID)
+	if len(row.NetworkAllowOut) != 2 {
+		t.Fatalf("stored lists = %v", row.NetworkAllowOut)
+	}
+	_, err = svc.CreateSandboxWithID(context.Background(), models.CreateSandboxRequest{
+		ModuleRef: "hello.wasm", Runtime: models.RuntimeWasm, NetworkDenyOut: []string{"evil.com"},
+	}, "sb-wasm-bad")
+	if !errors.Is(err, egresspolicy.ErrInvalid) {
+		t.Fatalf("hostname deny err = %v, want ErrInvalid", err)
+	}
 }

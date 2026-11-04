@@ -330,7 +330,7 @@ func TestListSnapshotsEqualCreatedAtSorting(t *testing.T) {
 	for _, s := range snaps {
 		if s != nil {
 			s.CreatedAt = fixedTime
-			_ = st.DeleteSnapshot(ctx, s.Name)
+			_ = st.DeleteSnapshot(ctx, s.OwnerRef, s.Name)
 			_ = st.CreateSnapshot(ctx, s)
 		}
 	}
@@ -690,8 +690,7 @@ func TestLoadTemplateMapBaseOverwriteRestored(t *testing.T) {
 	// The "base" key IS present after the loop (set from JSON), so the guard
 	// is NOT triggered. But if we set "base" to empty and it gets filtered out
 	// (the trimmedValue == "" check), then base is missing and gets restored.
-	t.Setenv("SB_E2B_TEMPLATE_MAP_JSON", `{"base": ""}`)
-	templates := loadTemplateMap(nil)
+	templates := loadTemplateMap(`{"base": ""}`, nil)
 	if templates["base"] != "ubuntu:22.04" {
 		t.Fatalf("expected base to be restored to ubuntu:22.04 when value is empty, got %q", templates["base"])
 	}

@@ -26,13 +26,27 @@ type Client struct {
 	enabled       bool
 	l4TLSListen   string
 	l4TLSFallback string
-	httpClient    *http.Client
+	// l4PublicHost, when set, is the host raw-TCP exposures are dialled at
+	// instead of the domain (SB_L4_PUBLIC_HOST).
+	l4PublicHost string
+	// l4FallbackProxyProtocol makes every tls-mux route that hands a
+	// connection to l4TLSFallback send a PROXY v2 header first
+	// (SB_L4_FALLBACK_PROXY_PROTOCOL, CEO review D12).
+	l4FallbackProxyProtocol bool
+	httpClient              *http.Client
 
 	// gate/batch route admin requests into an open Batch (batch.go).
 	// batchMu serializes batches.
 	gate    sync.RWMutex
 	batch   *configEmulator
 	batchMu sync.Mutex
+
+	// adminMu serializes config mutations from every writer in the process
+	// (admin_lock.go). Lock order: adminMu before gate.
+	adminMu sync.Mutex
+
+	// onDemandIssuer issues custom-domain certificates (EnsureOnDemandTLS).
+	onDemandIssuer TLSIssuer
 }
 
 func New(cfg config.Config) *Client {
@@ -45,16 +59,20 @@ func New(cfg config.Config) *Client {
 		// DNS RR, etc.) so SDK-returned URLs resolve there rather than at
 		// this specific node. EffectivePublicHost falls back to PublicHost so
 		// single-node and pre-cluster deployments stay byte-identical.
-		publicHost:    cfg.EffectivePublicHost(),
-		enabled:       cfg.EnableCaddy,
-		l4TLSListen:   cfg.L4TLSListen,
-		l4TLSFallback: cfg.L4TLSFallback,
+		publicHost:              cfg.EffectivePublicHost(),
+		enabled:                 cfg.EnableCaddy,
+		l4TLSListen:             cfg.L4TLSListen,
+		l4TLSFallback:           cfg.L4TLSFallback,
+		l4PublicHost:            cfg.L4PublicHost,
+		l4FallbackProxyProtocol: cfg.L4FallbackProxyProtocol,
+		onDemandIssuer: TLSIssuer{Internal: cfg.TLSIssuer == config.TLSIssuerInternal,
+			CA: cfg.TLSACMECA, TrustedRoot: cfg.TLSACMECARoot},
 		// Every admin call rides this client, so the instrumenting transport
 		// (pkg/caddy/metrics.go) catches latency + error counters for all of
 		// them without per-call-site instrumentation drift.
 		httpClient: &http.Client{
 			Timeout:   cfg.HTTPClientTimeout,
-			Transport: wrapTransport(http.DefaultTransport),
+			Transport: wrapTransport(newAdminTransport()),
 		},
 	}
 }
@@ -83,10 +101,15 @@ func (c *Client) Enabled() bool {
 	return c.enabled
 }
 
-// PublicHost returns the dial target for raw-TCP exposures. In domain mode the
-// base domain is returned so TCP URLs are consistent with HTTP sandbox URLs;
-// otherwise falls back to the configured publicHost IP.
+// PublicHost returns the dial target for raw-TCP exposures. SB_L4_PUBLIC_HOST
+// wins when set: the domain then fronts a load balancer that cannot carry the
+// host-port pool, and raw TCP is dialled at a name that reaches the ingress
+// nodes directly. Otherwise, in domain mode the base domain is returned so TCP
+// URLs are consistent with HTTP sandbox URLs, and else the publicHost IP.
 func (c *Client) PublicHost() string {
+	if c.l4PublicHost != "" {
+		return c.l4PublicHost
+	}
 	if c.domain != "" {
 		return c.domain
 	}
@@ -127,15 +150,12 @@ func (c *Client) PortPublicURL(id string, port int) string {
 }
 
 // TCPPublicEndpoint returns the URL clients dial for a raw TCP exposure
-// allocated at hostPort. In domain mode the base domain is used as the dial
-// target (e.g. tcp://sandbox.aerol.cloud:22534); otherwise falls back to
-// publicHost.
+// allocated at hostPort, on PublicHost: in domain mode the base domain (e.g.
+// tcp://sandbox.aerol.cloud:22534), SB_L4_PUBLIC_HOST when set, and otherwise
+// publicHost. One function for the URL and the response's Host field, so the
+// two cannot disagree.
 func (c *Client) TCPPublicEndpoint(hostPort int) string {
-	host := c.publicHost
-	if c.domain != "" {
-		host = c.domain
-	}
-	return fmt.Sprintf("tcp://%s:%d", host, hostPort)
+	return fmt.Sprintf("tcp://%s:%d", c.PublicHost(), hostPort)
 }
 
 // TLSPublicEndpoint returns the dial target for a TLS-SNI multiplexed
@@ -150,6 +170,24 @@ func (c *Client) TLSPublicEndpoint(id string, port int, l4Listen string) string 
 	listenPort := strings.TrimPrefix(l4Listen, ":")
 	return fmt.Sprintf("tls://%s-%d.%s:%s", id, port, c.domain, listenPort)
 }
+
+// streamCloseDelay is set on every reverse_proxy handler sandboxd writes
+// (#712). Every admin-API write that changes the config is a full Caddy
+// reload, and on reload reverse_proxy closes every upgraded connection it
+// carries (a WebSocket: an exec stream, aerolvm shell, a session attach, a
+// user app's socket on an exposed port) with close code 1001 unless this is
+// set. One user exposing a port then cut every other user's open streams on
+// that node. With the delay, a stream that outlives a reload stays open for
+// up to this long.
+//
+// The cost is memory: each such stream pins the config it started under
+// until it closes or the delay ends, so Caddy holds at most one old config
+// per reload in the last 10 minutes, and no more than there are such
+// streams. SB_INGRESS_PROXY_ROUTING removes the per-sandbox reloads that
+// make that number large. A constant, not a setting: no operator needs
+// another value yet. scripts/install.sh sets the same value on the API
+// site's reverse_proxy.
+const streamCloseDelay = "10m"
 
 // CustomHostnameRoute describes one operator-attached public hostname plus
 // the in-container TCP port traffic should dial. TargetPort=0 means "use the
@@ -194,6 +232,7 @@ func (c *Client) UpsertSandboxRoute(ctx context.Context, id, containerIP string,
 			"upstreams": []map[string]string{{
 				"dial": fmt.Sprintf("%s:%d", containerIP, toolboxPort),
 			}},
+			"stream_close_delay": streamCloseDelay,
 		}},
 		"terminal": true,
 	}
@@ -294,6 +333,7 @@ func (c *Client) UpsertSandboxRouteToPeer(ctx context.Context, id, peerHost stri
 			"upstreams": []map[string]string{{
 				"dial": net.JoinHostPort(peerHost, "80"),
 			}},
+			"stream_close_delay": streamCloseDelay,
 		}},
 		"terminal": true,
 	}
@@ -345,6 +385,7 @@ func reverseProxyHandle(dial string, opts HTTPRouteOptions) map[string]any {
 		"upstreams": []map[string]string{{
 			"dial": dial,
 		}},
+		"stream_close_delay": streamCloseDelay,
 	}
 	if mask := strings.TrimSpace(opts.MaskRequestHost); mask != "" {
 		handle["headers"] = map[string]any{
@@ -433,6 +474,7 @@ func (c *Client) UpsertPortRouteToPeer(ctx context.Context, id string, port int,
 			"upstreams": []map[string]string{{
 				"dial": net.JoinHostPort(peerHost, "80"),
 			}},
+			"stream_close_delay": streamCloseDelay,
 		}},
 		"terminal": true,
 	}
@@ -473,6 +515,7 @@ func (c *Client) UpsertWakeHTTPPortRoute(ctx context.Context, id, ingressAddr st
 				"upstreams": []map[string]string{{
 					"dial": ingressAddr,
 				}},
+				"stream_close_delay": streamCloseDelay,
 			},
 		},
 		"terminal": true,
@@ -579,12 +622,20 @@ func (c *Client) inFluxMatchPort(id string, port int) []map[string]any {
 // it doesn't exist yet (404), we insert it at index 0 of the server's routes
 // list with PUT so it sits ahead of the fallback "Sandbox not found" route.
 // Per-route admin calls keep this O(1) regardless of how many sandboxes exist.
+//
+// The PATCH and the PUT run under one admin lock, so no other in-process
+// writer can insert the same @id between them.
 func (c *Client) upsertRoute(ctx context.Context, routeID string, route map[string]any) error {
 	body, err := json.Marshal(route)
 	if err != nil {
 		return fmt.Errorf("marshal caddy route: %w", err)
 	}
+	return c.withAdminLock(ctx, func(ctx context.Context) error {
+		return c.upsertRouteLocked(ctx, routeID, body)
+	})
+}
 
+func (c *Client) upsertRouteLocked(ctx context.Context, routeID string, body []byte) error {
 	patchURL := fmt.Sprintf("%s/id/%s", c.baseURL, routeID)
 	status, detail, err := c.sendJSONDetail(ctx, http.MethodPatch, patchURL, body)
 	if err != nil {
@@ -891,7 +942,14 @@ func (c *Client) EnsureOnDemandTLS(ctx context.Context, askURL string, burst int
 	if burst <= 0 || interval <= 0 {
 		return errors.New("burst and interval must be > 0")
 	}
+	// The policy check and the append run under one admin lock so two
+	// callers cannot both see "no policy" and both append one.
+	return c.withAdminLock(ctx, func(ctx context.Context) error {
+		return c.ensureOnDemandTLSLocked(ctx, askURL)
+	})
+}
 
+func (c *Client) ensureOnDemandTLSLocked(ctx context.Context, askURL string) error {
 	onDemand := map[string]any{"ask": askURL}
 	onDemandBody, err := json.Marshal(onDemand)
 	if err != nil {
@@ -907,16 +965,16 @@ func (c *Client) EnsureOnDemandTLS(ctx context.Context, askURL string, burst int
 		return fmt.Errorf("install on-demand settings failed: %d", status)
 	}
 
-	hasPolicy, err := c.hasOnDemandPolicy(ctx)
+	idx, stored, found, err := c.onDemandPolicy(ctx)
 	if err != nil {
 		return err
 	}
-	if hasPolicy {
-		return nil
+	if found {
+		return c.reconcileOnDemandIssuer(ctx, idx, stored)
 	}
 	policy := map[string]any{
 		"on_demand": true,
-		"issuers":   []map[string]any{{"module": "acme"}},
+		"issuers":   []map[string]any{c.onDemandIssuer.config()},
 	}
 	policyBody, err := json.Marshal(policy)
 	if err != nil {
@@ -938,38 +996,75 @@ func (c *Client) EnsureOnDemandTLS(ctx context.Context, askURL string, burst int
 // entry with on_demand=true. Returns false (no error) when policies is
 // absent — that's the fresh-Caddy case the caller handles by appending.
 func (c *Client) hasOnDemandPolicy(ctx context.Context) (bool, error) {
+	_, _, found, err := c.onDemandPolicy(ctx)
+	return found, err
+}
+
+// onDemandPolicy finds the on_demand=true policy: its index and its issuers
+// (nil when it has none).
+func (c *Client) onDemandPolicy(ctx context.Context) (idx int, issuers json.RawMessage, found bool, err error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/config/apps/tls/automation/policies", nil)
 	if err != nil {
-		return false, err
+		return 0, nil, false, err
 	}
 	resp, err := c.do(req)
 	if err != nil {
-		return false, fmt.Errorf("get policies: %w", err)
+		return 0, nil, false, fmt.Errorf("get policies: %w", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode == http.StatusNotFound {
-		return false, nil
+		return 0, nil, false, nil
 	}
 	if resp.StatusCode >= 400 {
-		return false, fmt.Errorf("get policies failed: %d", resp.StatusCode)
+		return 0, nil, false, fmt.Errorf("get policies failed: %d", resp.StatusCode)
 	}
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return false, fmt.Errorf("read policies body: %w", err)
+		return 0, nil, false, fmt.Errorf("read policies body: %w", err)
 	}
 	if strings.TrimSpace(string(body)) == "null" {
-		return false, nil
+		return 0, nil, false, nil
 	}
-	var policies []map[string]any
+	var policies []map[string]json.RawMessage
 	if err := json.Unmarshal(body, &policies); err != nil {
-		return false, fmt.Errorf("decode policies: %w", err)
+		return 0, nil, false, fmt.Errorf("decode policies: %w", err)
 	}
-	for _, p := range policies {
-		if v, ok := p["on_demand"].(bool); ok && v {
-			return true, nil
+	for i, p := range policies {
+		var onDemand bool
+		if raw, ok := p["on_demand"]; ok && json.Unmarshal(raw, &onDemand) == nil && onDemand {
+			return i, p["issuers"], true, nil
 		}
 	}
-	return false, nil
+	return 0, nil, false, nil
+}
+
+// reconcileOnDemandIssuer points an existing on-demand policy at the
+// configured issuer, so changing SB_TLS_ACME_CA or SB_TLS_ISSUER takes effect
+// on the next start and unsetting them goes back to public ACME. A policy
+// that already has it is left alone, extra fields (an account email)
+// included.
+func (c *Client) reconcileOnDemandIssuer(ctx context.Context, idx int, stored json.RawMessage) error {
+	if c.onDemandIssuer.matches(stored) {
+		return nil
+	}
+	body, err := json.Marshal([]map[string]any{c.onDemandIssuer.config()})
+	if err != nil {
+		return fmt.Errorf("marshal on-demand issuer: %w", err)
+	}
+	// PATCH replaces an existing key; PUT creates a missing one.
+	method := http.MethodPatch
+	if len(stored) == 0 || strings.TrimSpace(string(stored)) == "null" {
+		method = http.MethodPut
+	}
+	target := fmt.Sprintf("%s/config/apps/tls/automation/policies/%d/issuers", c.baseURL, idx)
+	status, err := c.sendJSON(ctx, method, target, body)
+	if err != nil {
+		return err
+	}
+	if status >= 400 {
+		return fmt.Errorf("update on-demand issuer failed: %d", status)
+	}
+	return nil
 }
 
 // EnsureLayer4 idempotently bootstraps the layer4 app and (when tlsListen is
@@ -994,7 +1089,15 @@ func (c *Client) EnsureLayer4(ctx context.Context, tlsListen, tlsFallback string
 	if tlsListen != "" && tlsFallback == "" {
 		return errors.New("tls fallback required when tls listen is set")
 	}
+	// One admin lock across the GETs and the write: the tls-mux update below
+	// POSTs the whole server back, so a route another goroutine inserted
+	// between the GET and the POST would be dropped.
+	return c.withAdminLock(ctx, func(ctx context.Context) error {
+		return c.ensureLayer4Locked(ctx, tlsListen, tlsFallback)
+	})
+}
 
+func (c *Client) ensureLayer4Locked(ctx context.Context, tlsListen, tlsFallback string) error {
 	// Ensure /config/apps/layer4 exists. We only PUT it if it isn't there;
 	// otherwise we'd clobber any servers added since last boot.
 	exists, err := c.pathExists(ctx, "/config/apps/layer4")
@@ -1028,9 +1131,9 @@ func (c *Client) EnsureLayer4(ctx context.Context, tlsListen, tlsFallback string
 	}
 	needsPut := true
 	if !exists {
-		server = newTLSMuxServer(tlsListen, tlsFallback)
+		server = newTLSMuxServer(tlsListen, tlsFallback, c.l4FallbackProxyProtocol)
 	} else {
-		server, needsPut = ensureTLSMuxFallback(server, tlsListen, tlsFallback)
+		server, needsPut = ensureTLSMuxFallback(server, tlsListen, tlsFallback, c.l4FallbackProxyProtocol)
 	}
 	if !needsPut {
 		return nil
@@ -1055,14 +1158,18 @@ func (c *Client) EnsureLayer4(ctx context.Context, tlsListen, tlsFallback string
 	return nil
 }
 
-func newTLSMuxServer(tlsListen, tlsFallback string) map[string]any {
+func newTLSMuxServer(tlsListen, tlsFallback string, proxyProtocol bool) map[string]any {
 	return map[string]any{
 		"listen": []string{tlsListen},
-		"routes": []any{tlsMuxFallbackRoute(tlsFallback)},
+		"routes": []any{tlsMuxFallbackRoute(tlsFallback, proxyProtocol)},
 	}
 }
 
-func ensureTLSMuxFallback(server map[string]any, tlsListen, tlsFallback string) (map[string]any, bool) {
+// ensureTLSMuxFallback puts the fallback route last, in its current shape.
+// A changed PROXY-protocol flag changes the route, so the next EnsureLayer4
+// after a restart with the flag flipped rewrites tls-mux once; with the flag
+// unchanged the server compares equal and nothing is written.
+func ensureTLSMuxFallback(server map[string]any, tlsListen, tlsFallback string, proxyProtocol bool) (map[string]any, bool) {
 	before, _ := json.Marshal(server)
 
 	server["listen"] = []string{tlsListen}
@@ -1079,7 +1186,7 @@ func ensureTLSMuxFallback(server map[string]any, tlsListen, tlsFallback string) 
 	// routes array; per-sandbox SNI routes inserted via UpsertTLSSNIRoute go
 	// to routes/0, so they always win over the fallback. Only connections
 	// whose SNI doesn't match any sandbox subdomain hit the proxy below.
-	server["routes"] = append(filtered, tlsMuxFallbackRoute(tlsFallback))
+	server["routes"] = append(filtered, tlsMuxFallbackRoute(tlsFallback, proxyProtocol))
 
 	after, _ := json.Marshal(server)
 	return server, !bytes.Equal(before, after)
@@ -1108,14 +1215,31 @@ func isTLSMuxFallbackRoute(route map[string]any) bool {
 	return !hasMatch
 }
 
-func tlsMuxFallbackRoute(tlsFallback string) map[string]any {
+func tlsMuxFallbackRoute(tlsFallback string, proxyProtocol bool) map[string]any {
 	return map[string]any{
-		"@id": tlsFallbackRouteID,
-		"handle": []map[string]any{{
-			"handler":   "proxy",
-			"upstreams": []map[string]any{{"dial": []string{tlsFallback}}},
-		}},
+		"@id":    tlsFallbackRouteID,
+		"handle": []map[string]any{tlsFallbackProxy(tlsFallback, proxyProtocol)},
 	}
+}
+
+// tlsFallbackProxy is the layer4 handler that hands a connection to the
+// local HTTPS site. caddy-l4 dials that site from 127.0.0.1, so without a
+// PROXY header Caddy, and sandboxd behind it, see every public caller as
+// 127.0.0.1 (CEO review D12). With proxyProtocol the handler first sends a
+// PROXY v2 header naming the real client. The site must then run the
+// proxy_protocol listener wrapper (install.sh writes both in one step): its
+// default policy also accepts a connection with no header, so the wrapper
+// can go in before the flag, and the flag must go off before the wrapper is
+// removed.
+func tlsFallbackProxy(tlsFallback string, proxyProtocol bool) map[string]any {
+	handler := map[string]any{
+		"handler":   "proxy",
+		"upstreams": []map[string]any{{"dial": []string{tlsFallback}}},
+	}
+	if proxyProtocol {
+		handler["proxy_protocol"] = "v2"
+	}
+	return handler
 }
 
 // UpsertTCPRoute creates (or replaces) the layer4 server bound to hostPort.
@@ -1305,28 +1429,46 @@ func (c *Client) UpsertTLSSNIRoute(ctx context.Context, id, sniHost, containerIP
 	if err != nil {
 		return fmt.Errorf("marshal tls sni route: %w", err)
 	}
+	return c.upsertTLSMuxRoute(ctx, "tls sni route", routeID, body)
+}
 
-	patchURL := fmt.Sprintf("%s/id/%s", c.baseURL, routeID)
-	status, err := c.sendJSON(ctx, http.MethodPatch, patchURL, body)
-	if err != nil {
-		return err
-	}
-	if status < 400 {
-		return nil
-	}
-	if status != http.StatusNotFound {
-		return fmt.Errorf("patch tls sni route failed: %d", status)
-	}
-
-	insertURL := fmt.Sprintf("%s/config/apps/layer4/servers/%s/routes/0", c.baseURL, tlsMuxServerID)
-	status, err = c.sendJSON(ctx, http.MethodPut, insertURL, body)
-	if err != nil {
-		return err
-	}
-	if status >= 400 {
-		return fmt.Errorf("insert tls sni route failed: %d", status)
-	}
-	return nil
+// upsertTLSMuxRoute is upsertRoute for the tls-mux layer4 server: PATCH
+// /id/<routeID> in place, or insert at routes/0 (ahead of the fallback) when
+// it is absent. Both requests run under one admin lock, and a "duplicate ID"
+// answer to the insert means the route is there after all (see upsertRoute),
+// so it is PATCHed instead of failing the caller.
+func (c *Client) upsertTLSMuxRoute(ctx context.Context, what, routeID string, body []byte) error {
+	return c.withAdminLock(ctx, func(ctx context.Context) error {
+		patchURL := fmt.Sprintf("%s/id/%s", c.baseURL, routeID)
+		status, detail, err := c.sendJSONDetail(ctx, http.MethodPatch, patchURL, body)
+		if err != nil {
+			return err
+		}
+		if status < 400 {
+			return nil
+		}
+		if status != http.StatusNotFound {
+			return caddyErr("patch "+what+" "+routeID, status, detail)
+		}
+		insertURL := fmt.Sprintf("%s/config/apps/layer4/servers/%s/routes/0", c.baseURL, tlsMuxServerID)
+		status, detail, err = c.sendJSONDetail(ctx, http.MethodPut, insertURL, body)
+		if err != nil {
+			return err
+		}
+		if status < 400 {
+			return nil
+		}
+		if isDuplicateRouteID(detail) {
+			status, detail, err = c.sendJSONDetail(ctx, http.MethodPatch, patchURL, body)
+			if err != nil {
+				return err
+			}
+			if status < 400 {
+				return nil
+			}
+		}
+		return caddyErr("insert "+what+" "+routeID, status, detail)
+	})
 }
 
 // UpsertWakeTLSSNIRoute publishes a TLS-SNI exposure in serverless mode. Caddy
@@ -1360,28 +1502,7 @@ func (c *Client) UpsertWakeTLSSNIRoute(ctx context.Context, id, sniHost, socketP
 	if err != nil {
 		return fmt.Errorf("marshal wake tls sni route: %w", err)
 	}
-
-	patchURL := fmt.Sprintf("%s/id/%s", c.baseURL, routeID)
-	status, err := c.sendJSON(ctx, http.MethodPatch, patchURL, body)
-	if err != nil {
-		return err
-	}
-	if status < 400 {
-		return nil
-	}
-	if status != http.StatusNotFound {
-		return fmt.Errorf("patch wake tls sni route failed: %d", status)
-	}
-
-	insertURL := fmt.Sprintf("%s/config/apps/layer4/servers/%s/routes/0", c.baseURL, tlsMuxServerID)
-	status, err = c.sendJSON(ctx, http.MethodPut, insertURL, body)
-	if err != nil {
-		return err
-	}
-	if status >= 400 {
-		return fmt.Errorf("insert wake tls sni route failed: %d", status)
-	}
-	return nil
+	return c.upsertTLSMuxRoute(ctx, "wake tls sni route", routeID, body)
 }
 
 // UpsertSNIPassthroughRoute publishes a layer4 SNI route that does not
@@ -1409,26 +1530,7 @@ func (c *Client) UpsertSNIPassthroughRoute(ctx context.Context, routeID, sniHost
 	if err != nil {
 		return fmt.Errorf("marshal sni passthrough route: %w", err)
 	}
-	patchURL := fmt.Sprintf("%s/id/%s", c.baseURL, routeID)
-	status, err := c.sendJSON(ctx, http.MethodPatch, patchURL, body)
-	if err != nil {
-		return err
-	}
-	if status < 400 {
-		return nil
-	}
-	if status != http.StatusNotFound {
-		return fmt.Errorf("patch sni passthrough route failed: %d", status)
-	}
-	insertURL := fmt.Sprintf("%s/config/apps/layer4/servers/%s/routes/0", c.baseURL, tlsMuxServerID)
-	status, err = c.sendJSON(ctx, http.MethodPut, insertURL, body)
-	if err != nil {
-		return err
-	}
-	if status >= 400 {
-		return fmt.Errorf("insert sni passthrough route failed: %d", status)
-	}
-	return nil
+	return c.upsertTLSMuxRoute(ctx, "sni passthrough route", routeID, body)
 }
 
 // DeleteTLSSNIRoute removes one SNI route by @id. 404 is treated as success

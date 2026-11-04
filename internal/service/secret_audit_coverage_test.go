@@ -624,10 +624,10 @@ func TestRemainingEasyGuardsWave31(t *testing.T) {
 		t.Fatal("empty correlation id")
 	}
 
-	if err := (*Service)(nil).attachWasmRegistryAuth(nil); err != nil {
+	if err := (*Service)(nil).attachWasmRegistryAuth(context.Background(), nil); err != nil {
 		t.Fatal(err)
 	}
-	if err := (&Service{}).attachWasmRegistryAuth(&models.Sandbox{ID: "sb", RegistryAuthSealed: []byte("bad")}); err == nil {
+	if err := (&Service{}).attachWasmRegistryAuth(context.Background(), &models.Sandbox{ID: "sb", RegistryAuthSealed: []byte("bad")}); err == nil {
 		t.Fatal("bad wasm registry unseal succeeded")
 	}
 

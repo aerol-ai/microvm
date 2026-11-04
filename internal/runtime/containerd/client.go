@@ -14,6 +14,11 @@ import (
 const (
 	managedLabelKey   = "aerolvm.managed"
 	sandboxIDLabelKey = "aerolvm.sandbox_id"
+	// containerIPLabelKey records the address the sandbox's netns slot was
+	// given, written at create, park and adopt. The probe can't read it back
+	// from a running gVisor sandbox (sandboxAddress), and the slot keeps it
+	// for the sandbox's life, so the label stays true.
+	containerIPLabelKey = "aerolvm.container_ip"
 )
 
 // Client wraps a namespaced containerd connection.

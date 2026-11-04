@@ -19,6 +19,10 @@ import (
 type KMSProvider struct {
 	wrapper DataKeyWrapper
 	store   BlobStore
+	// local is the server key. A node that switched from local to a key
+	// store still holds local rows; an untagged row is tried with it first,
+	// then with AWS KMS (§12, eng D22).
+	local *Cipher
 }
 
 // NewKMSProvider returns a Provider backed by wrapper + store.
@@ -88,11 +92,11 @@ func (p *KMSProvider) Put(ctx context.Context, sandboxID string, s Secrets, reci
 	return Handle{Ref: ref, Version: version, SealGeneration: gen}, nil
 }
 
-// Open resolves h to plaintext. sandboxID is verified against the v4 binding;
-// nodeID is accepted for the Provider contract (audit) but is not checked
-// against the envelope recipient set — KMS IAM is the authorization boundary.
+// Open resolves h to plaintext. sandboxID is verified against the v4 binding.
+// nodeID is checked against the recipient set only for a local row left from
+// before a switch to the key store; for key-store rows KMS IAM (or the Vault
+// policy, or the HSM login) is the authorization boundary.
 func (p *KMSProvider) Open(ctx context.Context, sandboxID string, h Handle, nodeID string) (Secrets, error) {
-	_ = nodeID
 	sandboxID = strings.TrimSpace(sandboxID)
 	if h.Ref == "" {
 		return Secrets{}, nil
@@ -141,6 +145,21 @@ func (p *KMSProvider) Open(ctx context.Context, sandboxID string, h Handle, node
 		Generation:    rec.SealGeneration,
 	}
 	encCtx := EncryptionContextForBinding(binding)
+	if p.local != nil {
+		if env, perr := parseEnvelope(rec.SealedPayload); perr == nil && WrappedKeyBackend(env.WrappedKey) == "" && opensLocally(env, p.local) {
+			// A local row from before the switch: the local rules apply,
+			// recipient check included.
+			bag, err := OpenEnvelopeBound(p.local, rec.SealedPayload, nodeID, binding)
+			if err != nil {
+				return Secrets{}, mapProviderWrapError(fmt.Errorf("decrypt cluster secrets: %w", err))
+			}
+			return bag, nil
+		} else if p.local.Revoked() && perr == nil && WrappedKeyBackend(env.WrappedKey) == "" {
+			// A revoked server key cannot tell a local row from an AWS KMS
+			// one; neither may be opened while the node is stopped.
+			return Secrets{}, fmt.Errorf("%w: the server key was dropped", ErrKeyRevoked)
+		}
+	}
 	plain, err := OpenRawEnvelopeExternalBound(rec.SealedPayload, binding, func(wrapped []byte) ([]byte, error) {
 		return p.wrapper.Unwrap(ctx, wrapped, encCtx)
 	})

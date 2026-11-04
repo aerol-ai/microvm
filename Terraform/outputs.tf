@@ -22,12 +22,17 @@ output "nodes" {
 }
 
 output "ingress_public_ips" {
-  description = "Public IPs of every node whose role set contains \"ingress\". These are pointed at <domain_name> + wildcard in Cloudflare."
+  description = "Public IPs of every node whose role set contains \"ingress\". Cloudflare points <domain_name> + wildcard at them, or, with api_load_balancer = \"nlb\", tcp.<domain_name> (the balancer takes the rest)."
   value       = [for n in local.ingress_node_names : local.all_instances[n].public_ip]
 }
 
 output "ingress_hostname" {
   value = local.domain_name
+}
+
+output "api_load_balancer" {
+  description = "The load balancer in front of the ingress nodes (api_load_balancer = \"nlb\"): its IP (what <domain_name> resolves to), DNS name, the raw-TCP host name, the health-check port and the target group ARN per listener port. null when api_load_balancer = \"none\"."
+  value       = local.api_lb_summary
 }
 
 # api_base_url is the single endpoint the integration harness points its SDK at.
@@ -64,6 +69,9 @@ output "integration_targets" {
     pushgateway_url = var.deploy_obs ? "http://${aws_instance.obs[0].public_ip}:9091" : ""
     obs_public_ip   = var.deploy_obs ? aws_instance.obs[0].public_ip : ""
     obs_private_ip  = var.deploy_obs ? aws_instance.obs[0].private_ip : ""
+    # UC-356 checks that the domain resolves to this address only (the run
+    # measures the balancer, not round-robin) and reads target health.
+    api_load_balancer = local.api_lb_summary
   }
 }
 
@@ -86,6 +94,31 @@ output "grafana_admin_password" {
 output "bundle_bucket" {
   description = "S3 bucket used to ferry the gossip key + TLS bundle from seed to joiners. Safe to leave empty after the cluster forms."
   value       = aws_s3_bucket.bundle.bucket
+}
+
+output "audit_witness_bucket" {
+  description = "S3 Object Lock bucket holding each node's witnessed audit heads. Empty when audit_witness_enabled=false."
+  value       = var.audit_witness_enabled ? aws_s3_bucket.witness[0].bucket : ""
+}
+
+output "audit_witness_prefix" {
+  description = "Key prefix the nodes write witness heads under (SB_AUDIT_WITNESS_S3_PREFIX). Pass s3://<audit_witness_bucket>/<prefix> to aerolvm audit verify --witness."
+  value       = var.audit_witness_enabled ? var.audit_witness_prefix : ""
+}
+
+output "audit_witness_auditor_policy_arn" {
+  description = "Unattached read-only IAM policy for running aerolvm audit verify. Empty unless audit_witness_auditor_policy_enabled."
+  value       = var.audit_witness_enabled && var.audit_witness_auditor_policy_enabled ? aws_iam_policy.audit_witness_auditor[0].arn : ""
+}
+
+output "audit_export_bucket" {
+  description = "S3 bucket the nodes export audit records to. Empty when audit_export_enabled=false. Pass s3://<audit_export_bucket>/<audit_export_prefix> to aerolvm audit search --export."
+  value       = var.audit_export_enabled ? aws_s3_bucket.audit[0].bucket : ""
+}
+
+output "audit_export_prefix" {
+  description = "Key prefix of the audit export (SB_AUDIT_EXPORT_S3_PREFIX). Empty when audit_export_enabled=false."
+  value       = var.audit_export_enabled ? var.cluster_name : ""
 }
 
 output "caddy_certs_bucket" {

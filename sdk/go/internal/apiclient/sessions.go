@@ -151,9 +151,7 @@ func (c *Client) AttachSession(ctx context.Context, sandboxID, sessionID string,
 		return nil, err
 	}
 	requestHeader := http.Header{}
-	if c.patToken != "" {
-		requestHeader.Set("Authorization", "Bearer "+c.patToken)
-	}
+	c.setAuthHeaders(requestHeader)
 	conn, resp, err := websocket.DefaultDialer.DialContext(ctx, wsURL, requestHeader)
 	if err != nil {
 		return nil, decorateHandshakeError("session attach", wsURL, resp, err)
@@ -241,7 +239,7 @@ func (h *SessionAttachHandle) readLoop(options SessionAttachOptions) {
 				if message.Message == "" {
 					message.Message = "session error"
 				}
-				h.finish(0, "", errors.New(message.Message))
+				h.finish(0, "", &StreamError{Message: message.Message})
 				_ = h.conn.Close()
 				return
 			}
