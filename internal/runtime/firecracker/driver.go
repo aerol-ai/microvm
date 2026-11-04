@@ -89,9 +89,9 @@ type Driver struct {
 	// snapshot this node holds but no registry has. Optional: without it
 	// CreateSnapshot is not implemented. Set via SetImageStore.
 	images ImageStore
-	// mounter mounts the copy of a saved disk CreateSnapshot reads. nil
-	// means the host's loop mount (loopMounter).
-	mounter DiskMounter
+	// helperImages caches the root image of the VM CreateSnapshot reads a
+	// disk in (snapshot_export_vm.go).
+	helperImages exportHelperImages
 	// gate lets Stop and a snapshot of a running VM take turns, so a Stop
 	// never saves a VM whose filesystem a snapshot has frozen.
 	gate vmGate

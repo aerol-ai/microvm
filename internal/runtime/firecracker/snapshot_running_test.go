@@ -22,14 +22,13 @@ import (
 // never runs while the filesystem is frozen.
 
 // runningSandboxForSnapshot creates a running sandbox with an image store and
-// a tree mounter wired in. Its live disk holds known bytes.
-func runningSandboxForSnapshot(t *testing.T, id string) (*driverFixture, *recordingImageStore, *treeMounter, string) {
+// the helper VM stand-in wired in. Its live disk holds known bytes.
+func runningSandboxForSnapshot(t *testing.T, id string) (*driverFixture, *recordingImageStore, *exportGuest, string) {
 	t.Helper()
 	f := stoppedFixtureSandbox(t, id)
 	store := &recordingImageStore{}
-	mounter := &treeMounter{fill: guestTree, t: t}
+	guest := &exportGuest{t: t, fill: guestTree}
 	f.driver.SetImageStore(store)
-	f.driver.SetDiskMounter(mounter)
 	f.driver.mu.Lock()
 	handle := f.driver.vmms[id]
 	f.driver.mu.Unlock()
@@ -37,7 +36,9 @@ func runningSandboxForSnapshot(t *testing.T, id string) (*driverFixture, *record
 	if err := os.WriteFile(live, []byte("live disk bytes"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	return f, store, mounter, live
+	// After the sandbox's own create: the stand-in routes only the helper.
+	guest.install(f)
+	return f, store, guest, live
 }
 
 // opsSince lists the vsock ops sent after the first n writes.
@@ -49,12 +50,12 @@ func opsSince(t *testing.T, f *driverFixture, n int) []string {
 func exportCopies(t *testing.T, f *driverFixture) []string {
 	t.Helper()
 	base, _ := f.driver.snapshotExportDir()
-	matches, _ := filepath.Glob(filepath.Join(base, "*", rootfsFileName))
+	matches, _ := filepath.Glob(filepath.Join(base, "*", exportDiskFileName))
 	return matches
 }
 
 func TestCreateSnapshotOfARunningSandboxFreezesForTheCopy(t *testing.T) {
-	f, store, mounter, live := runningSandboxForSnapshot(t, "sb-live")
+	f, store, guest, live := runningSandboxForSnapshot(t, "sb-live")
 	var copiedWhileFrozen bool
 	f.vsock.replyFor = func(op string) (bool, string) {
 		if op == "thaw_fs" {
@@ -96,10 +97,10 @@ func TestCreateSnapshotOfARunningSandboxFreezesForTheCopy(t *testing.T) {
 	if freeze.Data.ThawAfterMS != guestFreezeLimit.Milliseconds() {
 		t.Fatalf("freeze_fs thaw_after_ms = %d, want %d", freeze.Data.ThawAfterMS, guestFreezeLimit.Milliseconds())
 	}
-	// It mounted the copy, never the live disk, and left both the VM and its
-	// disk alone.
-	if mounter.image == live || filepath.Base(mounter.image) != rootfsFileName {
-		t.Fatalf("mounted %q, want a copy of %q", mounter.image, live)
+	// The helper VM read the copy, never the live disk, and both the VM and
+	// its disk were left alone.
+	if disk := guest.lastClient().drives[exportDriveID].PathOnHost; disk == live || string(guest.disks[0]) != "live disk bytes" {
+		t.Fatalf("the helper read %q (%q), want a copy of %q", disk, guest.disks[0], live)
 	}
 	if b, _ := os.ReadFile(live); string(b) != "live disk bytes" {
 		t.Fatalf("the live disk changed: %q", b)

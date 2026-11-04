@@ -454,7 +454,6 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 			fcDriver.SetImageStore(store)
 		}
 		configureAOCRPullAuth(logger, cfg, "firecracker", fcDriver)
-		fcDriver.SweepSnapshotExports()
 		// Not fatal: a node that booted before this keeps booting. Without
 		// it the guests have no NAT and the driver no firewall, so the
 		// service keeps refusing their egress options (501).
@@ -477,6 +476,9 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 		if n := fcDriver.AdoptRunningVMs(ctx, firecrackerVMKeeper(db)); n > 0 {
 			logger.Info("firecracker: running VMs taken over from the previous sandboxd", "vms", n)
 		}
+		// After the adoption, which kills a snapshot's helper VM a crash
+		// left running, so its dir can go.
+		fcDriver.SweepSnapshotExports()
 		// Phase 6 PR-A: warm-spawn corruption notifier. WarmSpawn runs
 		// outside any service-side call, so the runtime needs a back-
 		// channel to flip a corrupt template to unhealthy + kick rebuild.
