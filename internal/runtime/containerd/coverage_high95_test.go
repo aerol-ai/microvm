@@ -95,71 +95,49 @@ func withPushDeps(t *testing.T, deps pushLiveDeps) {
 	t.Cleanup(func() { pushLiveDepsFn = orig })
 }
 
-func TestLivePushCreatesDestAndPushes(t *testing.T) {
-	img := &fakePushImage{}
-	var created, pushed bool
-	withPushDeps(t, pushLiveDeps{
-		getImage: func(_ context.Context, ref string) (cntr.Image, error) {
-			if ref == "snap" || ref == "snap:latest" {
-				return img, nil
-			}
-			return nil, errdefs.ErrNotFound
-		},
-		imageGet: func(context.Context, string) (images.Image, error) { return images.Image{}, errdefs.ErrNotFound },
-		imageCreate: func(_ context.Context, got images.Image) (images.Image, error) {
-			created = true
-			return got, nil
-		},
-		push: func(_ context.Context, dest string, _ ocispec.Descriptor, _ ...cntr.RemoteOpt) error {
-			if dest != "aocr.example/snap:latest" {
-				t.Fatalf("dest=%q", dest)
-			}
-			pushed = true
-			return nil
-		},
-	})
-	p := &RegistryPusher{driver: newTestDriver(t)}
-	dgst, err := p.livePush(context.Background(), "snap", "aocr.example/snap:latest", models.RegistryAuth{
-		Username: "u", Password: "p", Server: "aocr.example",
-	})
-	if err != nil || !created || !pushed || dgst == "" {
-		t.Fatalf("dgst=%q created=%v pushed=%v err=%v", dgst, created, pushed, err)
+// pushRecordStore is the image-record view of the aerolvm namespace a push
+// runs against. livePush may read the source record; it must never leave one
+// named after the registry destination (a GC root that would keep the
+// snapshot's layers alive after its own tag is deleted).
+type pushRecordStore map[string]cntr.Image
+
+func (s pushRecordStore) getImage(_ context.Context, ref string) (cntr.Image, error) {
+	if img, ok := s[ref]; ok {
+		return img, nil
 	}
+	return nil, errdefs.ErrNotFound
 }
 
-func TestLivePushDestAlreadyExists(t *testing.T) {
-	img := &fakePushImage{}
-	withPushDeps(t, pushLiveDeps{
-		getImage: func(context.Context, string) (cntr.Image, error) { return img, nil },
-		imageGet: func(context.Context, string) (images.Image, error) { return images.Image{Name: "dst"}, nil },
-		imageUpdate: func(context.Context, images.Image, ...string) (images.Image, error) {
-			return images.Image{}, errors.New("ignored")
-		},
-		push: func(context.Context, string, ocispec.Descriptor, ...cntr.RemoteOpt) error { return nil },
-	})
-	p := &RegistryPusher{driver: newTestDriver(t)}
-	if _, err := p.livePush(context.Background(), "snap:local", "aocr.example/dst:latest", models.RegistryAuth{
-		Username: "u", Password: "p", Server: "aocr.example",
-	}); err != nil {
-		t.Fatal(err)
-	}
-}
-
-func TestLivePushCreateAlreadyExists(t *testing.T) {
-	img := &fakePushImage{}
-	withPushDeps(t, pushLiveDeps{
-		getImage: func(context.Context, string) (cntr.Image, error) { return img, nil },
-		imageGet: func(context.Context, string) (images.Image, error) { return images.Image{}, errdefs.ErrNotFound },
-		imageCreate: func(context.Context, images.Image) (images.Image, error) {
-			return images.Image{}, errdefs.ErrAlreadyExists
-		},
-		push: func(context.Context, string, ocispec.Descriptor, ...cntr.RemoteOpt) error { return nil },
-	})
-	p := &RegistryPusher{driver: newTestDriver(t)}
-	if _, err := p.livePush(context.Background(), "snap:local", "aocr.example/dst:latest", models.RegistryAuth{
-		Username: "u", Password: "p", Server: "aocr.example",
-	}); err != nil {
-		t.Fatal(err)
+func TestLivePushPushesBySourceDescriptorAndLeavesNoDestRecord(t *testing.T) {
+	const dest = "aocr.example/cluster/c/snapshots/snap:latest"
+	for _, pushErr := range []error{nil, errors.New("registry 500")} {
+		img := &fakePushImage{}
+		records := pushRecordStore{"snap:latest": img}
+		var pushedRef string
+		var pushedDesc ocispec.Descriptor
+		withPushDeps(t, pushLiveDeps{
+			getImage: records.getImage,
+			push: func(_ context.Context, ref string, desc ocispec.Descriptor, _ ...cntr.RemoteOpt) error {
+				pushedRef, pushedDesc = ref, desc
+				return pushErr
+			},
+		})
+		p := &RegistryPusher{driver: newTestDriver(t)}
+		dgst, err := p.livePush(context.Background(), "snap", dest, models.RegistryAuth{
+			Username: "u", Password: "p", Server: "aocr.example",
+		})
+		if (err != nil) != (pushErr != nil) {
+			t.Fatalf("push err %v: livePush = %q, %v", pushErr, dgst, err)
+		}
+		if pushErr == nil && dgst != img.Target().Digest.String() {
+			t.Fatalf("digest = %q, want the source manifest's", dgst)
+		}
+		if pushedRef != dest || pushedDesc.Digest != img.Target().Digest {
+			t.Fatalf("pushed %q %s, want %q with the source descriptor", pushedRef, pushedDesc.Digest, dest)
+		}
+		if len(records) != 1 || records["snap:latest"] != img {
+			t.Fatalf("push err %v: records = %v, want only the source", pushErr, records)
+		}
 	}
 }
 
@@ -180,28 +158,9 @@ func TestLivePushErrors(t *testing.T) {
 			},
 		},
 		{
-			name: "dest lookup fails",
-			deps: pushLiveDeps{
-				getImage: func(context.Context, string) (cntr.Image, error) { return &fakePushImage{}, nil },
-				imageGet: func(context.Context, string) (images.Image, error) { return images.Image{}, errors.New("boom") },
-			},
-		},
-		{
-			name: "create dest fails",
-			deps: pushLiveDeps{
-				getImage: func(context.Context, string) (cntr.Image, error) { return &fakePushImage{}, nil },
-				imageGet: func(context.Context, string) (images.Image, error) { return images.Image{}, errdefs.ErrNotFound },
-				imageCreate: func(context.Context, images.Image) (images.Image, error) {
-					return images.Image{}, errors.New("create failed")
-				},
-			},
-		},
-		{
 			name: "push fails",
 			deps: pushLiveDeps{
-				getImage:    func(context.Context, string) (cntr.Image, error) { return &fakePushImage{}, nil },
-				imageGet:    func(context.Context, string) (images.Image, error) { return images.Image{}, errdefs.ErrNotFound },
-				imageCreate: func(_ context.Context, img images.Image) (images.Image, error) { return img, nil },
+				getImage: func(context.Context, string) (cntr.Image, error) { return &fakePushImage{}, nil },
 				push: func(context.Context, string, ocispec.Descriptor, ...cntr.RemoteOpt) error {
 					return errors.New("push failed")
 				},
@@ -218,10 +177,8 @@ func TestLivePushErrors(t *testing.T) {
 	}
 
 	withPushDeps(t, pushLiveDeps{
-		getImage:    func(context.Context, string) (cntr.Image, error) { return &fakePushImage{}, nil },
-		imageGet:    func(context.Context, string) (images.Image, error) { return images.Image{}, errdefs.ErrNotFound },
-		imageCreate: func(_ context.Context, img images.Image) (images.Image, error) { return img, nil },
-		push:        func(context.Context, string, ocispec.Descriptor, ...cntr.RemoteOpt) error { return nil },
+		getImage: func(context.Context, string) (cntr.Image, error) { return &fakePushImage{}, nil },
+		push:     func(context.Context, string, ocispec.Descriptor, ...cntr.RemoteOpt) error { return nil },
 	})
 	if _, err := p.livePush(context.Background(), "snap:local", "bare-repo/img", models.RegistryAuth{Username: "u", Password: "p"}); err == nil {
 		t.Fatal("want cred scope error")
@@ -1578,24 +1535,6 @@ func TestStreamEventsContextDoneOnSend(t *testing.T) {
 	}
 }
 
-func TestLivePushExistingDest(t *testing.T) {
-	img := &fakePushImage{}
-	withPushDeps(t, pushLiveDeps{
-		getImage: func(context.Context, string) (cntr.Image, error) { return img, nil },
-		imageGet: func(context.Context, string) (images.Image, error) { return images.Image{Name: "dst"}, nil },
-		imageUpdate: func(context.Context, images.Image, ...string) (images.Image, error) {
-			return images.Image{}, errors.New("ignored")
-		},
-		push: func(context.Context, string, ocispec.Descriptor, ...cntr.RemoteOpt) error { return nil },
-	})
-	p := &RegistryPusher{driver: newTestDriver(t)}
-	if _, err := p.livePush(context.Background(), "snap:local", "aocr.example/dst:latest", models.RegistryAuth{
-		Username: "u", Password: "p", Server: "aocr.example",
-	}); err != nil {
-		t.Fatal(err)
-	}
-}
-
 func TestSetupReadySocketDirect(t *testing.T) {
 	d := newTestDriver(t)
 	d.cfg.ReadyDir = shortReadyDirForCreate(t)
@@ -2476,9 +2415,7 @@ func TestLivePushBareSourceRef(t *testing.T) {
 			}
 			return nil, errdefs.ErrNotFound
 		},
-		imageGet:    func(context.Context, string) (images.Image, error) { return images.Image{}, errdefs.ErrNotFound },
-		imageCreate: func(_ context.Context, got images.Image) (images.Image, error) { return got, nil },
-		push:        func(context.Context, string, ocispec.Descriptor, ...cntr.RemoteOpt) error { return nil },
+		push: func(context.Context, string, ocispec.Descriptor, ...cntr.RemoteOpt) error { return nil },
 	})
 	p := &RegistryPusher{driver: newTestDriver(t)}
 	if _, err := p.livePush(context.Background(), "snap", "aocr.example/dst:latest", models.RegistryAuth{
