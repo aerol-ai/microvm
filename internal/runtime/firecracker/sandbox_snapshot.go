@@ -190,12 +190,7 @@ func (d *Driver) stopToSandboxSnapshot(ctx context.Context, sandboxID string) er
 	}
 	vmmStopped = true
 
-	d.mu.Lock()
-	delete(d.clients, sandboxID)
-	delete(d.vmms, sandboxID)
-	delete(d.guestCID, sandboxID)
-	d.mu.Unlock()
-	d.rssUnregister(sandboxID)
+	d.unregister(sandboxID)
 
 	if err := d.tapHost.Remove(ctx, slot.TapName); err != nil {
 		d.logger.Warn("firecracker stop: tap remove failed",
@@ -514,12 +509,7 @@ func (d *Driver) startFromSandboxSnapshot(ctx context.Context, sandboxID, toolbo
 	}
 	d.probeToolboxTCP(ctx, "start", sandboxID, slot, true)
 
-	d.mu.Lock()
-	d.clients[sandboxID] = client
-	d.vmms[sandboxID] = handle
-	d.guestCID[sandboxID] = manifest.VsockCID
-	d.mu.Unlock()
-	d.rssRegister(sandboxID, handle.Pid())
+	d.register(sandboxID, client, handle, manifest.VsockCID, true)
 
 	tapCommitted = true
 	committed = true

@@ -1855,6 +1855,9 @@ Restart=always
 RestartSec=5
 TimeoutStartSec=60
 TimeoutStopSec=30
+# Stopping sandboxd stops what runs in its cgroup. Firecracker VMs are not
+# there: sandboxd moves each into the aerolvm-vmm cgroup, so a restart or an
+# upgrade leaves them running and the next sandboxd takes them over.
 KillMode=control-group
 
 [Install]

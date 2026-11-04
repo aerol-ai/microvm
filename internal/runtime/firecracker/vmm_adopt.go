@@ -1,0 +1,392 @@
+package firecracker
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io/fs"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"syscall"
+	"time"
+
+	"github.com/aerol-ai/microvm/pkg/firecracker"
+)
+
+// A running VM outlives the sandboxd that started it, as a Docker container
+// outlives dockerd. Three parts make that work:
+//
+//   - vmm.Start moves each VM into a cgroup of its own (vmmCgroupName), out
+//     of sandboxd's unit, so a restart or upgrade does not kill it.
+//   - register writes a record of each running VM under the run dir: its
+//     process (pid, start time, boot), API socket and vsock CID.
+//   - At boot, AdoptRunningVMs reads the records back, takes over the VMs
+//     whose sandboxes should still run, and kills every other process in
+//     the VMs' cgroup: nothing would ever manage it.
+//
+// The run dir is on tmpfs (/run), so a reboot, which ends every VM, also
+// ends every record.
+
+const (
+	// vmmCgroupName is the cgroup, under the cgroup v2 root, every VM
+	// runs in.
+	vmmCgroupName = "aerolvm-vmm"
+	// vmmRecordDirName holds one record per running VM, under the run dir.
+	vmmRecordDirName = "vmms"
+)
+
+var (
+	// errProcessGone: the process exited, or its pid now names another.
+	errProcessGone = errors.New("process is gone")
+	// errVMMAdoptionUnsupported: this host cannot hand a VM to the next
+	// sandboxd (not Linux).
+	errVMMAdoptionUnsupported = errors.New("VMs do not outlive sandboxd on this host")
+)
+
+// liveProcess is a running process held so that a signal reaches it and no
+// other process that later reuses its pid.
+type liveProcess interface {
+	Signal(sig syscall.Signal) error
+	// Done is closed once the process has exited.
+	Done() <-chan struct{}
+	Close() error
+}
+
+// Host seams, replaced in tests.
+var (
+	moveVMMToCgroup = moveToVMMCgroup
+	listVMMCgroup   = vmmCgroupPIDs
+	processStart    = procStartTicks
+	hostBootID      = currentBootID
+	openProcess     = openLiveProcess
+	killStrayVMM    = killCgroupStray
+)
+
+// vmmRecord is what a running VM leaves for the next sandboxd.
+type vmmRecord struct {
+	SandboxID string `json:"sandbox_id"`
+	PID       int    `json:"pid"`
+	// StartTicks and BootID tell this process from a later one with the
+	// same pid.
+	StartTicks uint64 `json:"start_ticks"`
+	BootID     string `json:"boot_id"`
+	APISocket  string `json:"api_socket"`
+	RunDir     string `json:"run_dir"`
+	VsockCID   uint32 `json:"vsock_cid"`
+	// OwnsRunDir: Destroy removes the run dir. A VM taken from the warm
+	// pool leaves its run dir to the pool, as warmDestroyHandle does.
+	OwnsRunDir bool `json:"owns_run_dir"`
+}
+
+func (d *Driver) vmmRecordDir() string {
+	if d.cfg.RunDir == "" {
+		return ""
+	}
+	return filepath.Join(d.cfg.RunDir, vmmRecordDirName)
+}
+
+// register makes a running VM the driver's: the maps every lifecycle call
+// reads, the RSS sampler, and the record a restarted sandboxd adopts it
+// from. The maps come first, so a sampler tick never sees a pid the rest of
+// the driver does not know.
+func (d *Driver) register(sandboxID string, client VMMClient, handle VMMHandle, guestCID uint32, ownsRunDir bool) {
+	d.mu.Lock()
+	d.clients[sandboxID] = client
+	d.vmms[sandboxID] = handle
+	d.guestCID[sandboxID] = guestCID
+	d.mu.Unlock()
+	d.rssRegister(sandboxID, handle.Pid())
+	if err := d.writeVMMRecord(sandboxID, handle, guestCID, ownsRunDir); err != nil {
+		d.logger.Warn("firecracker: running VM not recorded; a sandboxd restart will stop it",
+			"sandbox_id", sandboxID, "error", err)
+	}
+}
+
+// unregister forgets a VM: the maps, the sampler and its record. The
+// record goes before the VM does, so a sandboxd that dies in between finds
+// an unrecorded VM at boot and kills it rather than adopting one that is
+// being stopped or destroyed.
+func (d *Driver) unregister(sandboxID string) (VMMHandle, bool) {
+	d.mu.Lock()
+	handle, ok := d.vmms[sandboxID]
+	delete(d.clients, sandboxID)
+	delete(d.vmms, sandboxID)
+	delete(d.guestCID, sandboxID)
+	d.mu.Unlock()
+	d.rssUnregister(sandboxID)
+	d.removeVMMRecord(sandboxID)
+	return handle, ok
+}
+
+func (d *Driver) writeVMMRecord(sandboxID string, handle VMMHandle, guestCID uint32, ownsRunDir bool) error {
+	dir := d.vmmRecordDir()
+	pid := handle.Pid()
+	if dir == "" || pid <= 0 {
+		return nil
+	}
+	ticks, err := processStart(pid)
+	if errors.Is(err, errVMMAdoptionUnsupported) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("read start time of pid %d: %w", pid, err)
+	}
+	boot, err := hostBootID()
+	if err != nil {
+		return fmt.Errorf("read boot id: %w", err)
+	}
+	raw, err := json.Marshal(vmmRecord{
+		SandboxID: sandboxID, PID: pid, StartTicks: ticks, BootID: boot,
+		APISocket: handle.APISocket(), RunDir: handle.RunDir(), VsockCID: guestCID,
+		OwnsRunDir: ownsRunDir,
+	})
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(dir, ".record-*")
+	if err != nil {
+		return err
+	}
+	_, werr := tmp.Write(raw)
+	cerr := tmp.Close()
+	if werr == nil {
+		werr = cerr
+	}
+	if werr == nil {
+		werr = os.Rename(tmp.Name(), filepath.Join(dir, sandboxID+".json"))
+	}
+	if werr != nil {
+		_ = os.Remove(tmp.Name())
+	}
+	return werr
+}
+
+func (d *Driver) removeVMMRecord(sandboxID string) {
+	dir := d.vmmRecordDir()
+	if dir == "" {
+		return
+	}
+	if err := os.Remove(filepath.Join(dir, sandboxID+".json")); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		d.logger.Warn("firecracker: VM record not removed", "sandbox_id", sandboxID, "error", err)
+	}
+}
+
+// readVMMRecords returns the records under the record dir, dropping files
+// that are not one (a write cut short leaves only a .record-* temp file).
+func (d *Driver) readVMMRecords() []vmmRecord {
+	dir := d.vmmRecordDir()
+	if dir == "" {
+		return nil
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if !errors.Is(err, fs.ErrNotExist) {
+			d.logger.Warn("firecracker adopt: VM records unreadable", "dir", dir, "error", err)
+		}
+		return nil
+	}
+	var records []vmmRecord
+	for _, entry := range entries {
+		path := filepath.Join(dir, entry.Name())
+		id, isRecord := strings.CutSuffix(entry.Name(), ".json")
+		var rec vmmRecord
+		raw, err := os.ReadFile(path)
+		if err == nil && isRecord {
+			err = json.Unmarshal(raw, &rec)
+		}
+		if err != nil || !isRecord || rec.SandboxID != id || validateSandboxID(id) != nil || rec.PID <= 0 {
+			_ = os.Remove(path)
+			continue
+		}
+		records = append(records, rec)
+	}
+	return records
+}
+
+// VMMKeeper reports whether a sandbox's VM should still be running on this
+// node. An error means the answer is unknown.
+type VMMKeeper func(ctx context.Context, sandboxID string) (bool, error)
+
+// AdoptRunningVMs takes over the VMs a previous sandboxd left running. A VM
+// whose sandbox should still run is registered as if this sandboxd had
+// started it; any other recorded VM, and any process in the VMs' cgroup no
+// record vouches for (a warm-pool VM, a template's snapshot VM, a create
+// the restart cut short), is killed. Call it once at boot, before anything
+// creates, starts or reconciles a sandbox: reconcile reaps a started
+// sandbox whose VM the driver does not know.
+func (d *Driver) AdoptRunningVMs(ctx context.Context, keep VMMKeeper) int {
+	boot, bootErr := hostBootID()
+	adopted := map[int]bool{}
+	for _, rec := range d.readVMMRecords() {
+		if bootErr != nil || rec.BootID != boot {
+			d.removeVMMRecord(rec.SandboxID)
+			continue
+		}
+		proc, err := openProcess(rec.PID, rec.StartTicks)
+		if err != nil {
+			// The VM ended while sandboxd was down; reconcile handles
+			// its sandbox like any other whose VM is gone.
+			d.logger.Info("firecracker adopt: recorded VM is gone", "sandbox_id", rec.SandboxID, "error", err)
+			d.removeVMMRecord(rec.SandboxID)
+			continue
+		}
+		handle := &adoptedVMM{rec: rec, proc: proc, cleanupRoot: d.runDirRoot()}
+		want, err := keep(ctx, rec.SandboxID)
+		if err != nil {
+			// Unknown is not "stopped": keep the VM, and reconcile
+			// decides once the store answers.
+			d.logger.Warn("firecracker adopt: cannot tell whether a VM should run; keeping it",
+				"sandbox_id", rec.SandboxID, "error", err)
+			want = true
+		}
+		if !want {
+			d.logger.Info("firecracker adopt: stopping a VM whose sandbox is not running", "sandbox_id", rec.SandboxID)
+			_ = handle.Kill()
+			if err := handle.Cleanup(); err != nil {
+				d.logger.Warn("firecracker adopt: run dir not removed", "sandbox_id", rec.SandboxID, "error", err)
+			}
+			d.removeVMMRecord(rec.SandboxID)
+			continue
+		}
+		client := d.newClient(rec.APISocket)
+		d.resumeIfPaused(ctx, rec.SandboxID, client)
+		d.mu.Lock()
+		d.clients[rec.SandboxID] = client
+		d.vmms[rec.SandboxID] = handle
+		d.guestCID[rec.SandboxID] = rec.VsockCID
+		d.mu.Unlock()
+		d.rssRegister(rec.SandboxID, rec.PID)
+		adopted[rec.PID] = true
+		d.logger.Info("firecracker adopt: running VM taken over", "sandbox_id", rec.SandboxID, "pid", rec.PID)
+	}
+	pids, err := listVMMCgroup()
+	if err != nil {
+		d.logger.Warn("firecracker adopt: VM cgroup unreadable; leftover VMs may still run", "error", err)
+	}
+	for _, pid := range pids {
+		if adopted[pid] {
+			continue
+		}
+		if err := killStrayVMM(pid); err != nil {
+			d.logger.Warn("firecracker adopt: leftover VM not killed", "pid", pid, "error", err)
+			continue
+		}
+		d.logger.Info("firecracker adopt: killed a VM no sandbox owns", "pid", pid)
+	}
+	return len(adopted)
+}
+
+// resumeIfPaused resumes a VM a Stop paused and then never finished: the
+// sandboxd stopping it died first. Its sandbox is still running, so the VM
+// must be too; the next Stop saves it again.
+func (d *Driver) resumeIfPaused(ctx context.Context, sandboxID string, client VMMClient) {
+	ictx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	info, err := client.InstanceInfo(ictx)
+	if err != nil {
+		d.logger.Warn("firecracker adopt: VM state unknown", "sandbox_id", sandboxID, "error", err)
+		return
+	}
+	if info.State != "Paused" {
+		return
+	}
+	if err := client.PatchVM(ictx, firecracker.VM{State: firecracker.VMStateResumed}); err != nil {
+		d.logger.Warn("firecracker adopt: paused VM not resumed", "sandbox_id", sandboxID, "error", err)
+		return
+	}
+	d.logger.Info("firecracker adopt: resumed a VM an interrupted stop left paused", "sandbox_id", sandboxID)
+}
+
+// runDirRoot is the directory every VM's run dir is under.
+func (d *Driver) runDirRoot() string {
+	if d.cfg.UseJailer {
+		return d.cfg.JailerChrootBase
+	}
+	return d.cfg.RunDir
+}
+
+// adoptedVMM is a VM a previous sandboxd started. It has no exec.Cmd and
+// no output pipe; it is driven by signals through its pidfd.
+type adoptedVMM struct {
+	rec         vmmRecord
+	proc        liveProcess
+	cleanupRoot string
+	closeOnce   sync.Once
+}
+
+func (h *adoptedVMM) APISocket() string { return h.rec.APISocket }
+func (h *adoptedVMM) RunDir() string    { return h.rec.RunDir }
+
+func (h *adoptedVMM) Start(context.Context) error {
+	return errors.New("vmm: an adopted VM is already running")
+}
+
+func (h *adoptedVMM) WaitSocket(context.Context, time.Duration) error { return nil }
+
+// StderrTail is empty: the output pipe went with the sandboxd that started
+// the VM.
+func (h *adoptedVMM) StderrTail() string { return "" }
+
+func (h *adoptedVMM) Pid() int {
+	select {
+	case <-h.proc.Done():
+		return 0
+	default:
+		return h.rec.PID
+	}
+}
+
+// Shutdown sends SIGTERM, then SIGKILL after grace, as vmm.Shutdown does.
+func (h *adoptedVMM) Shutdown(ctx context.Context, grace time.Duration) error {
+	select {
+	case <-h.proc.Done():
+		h.close()
+		return nil
+	default:
+	}
+	_ = h.proc.Signal(syscall.SIGTERM)
+	if grace <= 0 {
+		grace = 3 * time.Second
+	}
+	timer := time.NewTimer(grace)
+	defer timer.Stop()
+	select {
+	case <-h.proc.Done():
+	case <-timer.C:
+		_ = h.proc.Signal(syscall.SIGKILL)
+		<-h.proc.Done()
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	h.close()
+	return nil
+}
+
+func (h *adoptedVMM) Kill() error {
+	_ = h.proc.Signal(syscall.SIGKILL)
+	<-h.proc.Done()
+	h.close()
+	return nil
+}
+
+func (h *adoptedVMM) close() {
+	h.closeOnce.Do(func() { _ = h.proc.Close() })
+}
+
+// Cleanup removes the run dir, with vmm.Cleanup's guard against a path
+// outside the run dir root.
+func (h *adoptedVMM) Cleanup() error {
+	if !h.rec.OwnsRunDir || h.rec.RunDir == "" {
+		return nil
+	}
+	if h.cleanupRoot == "" || !strings.HasPrefix(h.rec.RunDir, h.cleanupRoot+string(filepath.Separator)) {
+		return fmt.Errorf("vmm: refusing to clean up path outside %q: %s", h.cleanupRoot, h.rec.RunDir)
+	}
+	return os.RemoveAll(h.rec.RunDir)
+}

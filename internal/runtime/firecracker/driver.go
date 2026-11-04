@@ -969,19 +969,7 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 	// half-built state (the deferred closures run on panic).
 	released = true
 	tapRemoved = false // sandbox-owned now; Destroy will remove
-	d.mu.Lock()
-	d.clients[allocID] = client
-	d.vmms[allocID] = handle
-	d.guestCID[allocID] = handshakeCID
-	d.mu.Unlock()
-
-	// Phase 5: tell the RSS sampler about the new VMM so the next
-	// sampleOnce includes it in the host-pressure aggregate. Done
-	// AFTER the map writes so a sampler tick that races us doesn't
-	// see a registered pid the rest of the driver thinks doesn't
-	// exist yet. Nil-safe via rssRegister — daemons without Phase 5
-	// take no penalty.
-	d.rssRegister(allocID, handle.Pid())
+	d.register(allocID, client, handle, handshakeCID, true)
 
 	return &models.SandboxRuntimeState{
 		SandboxID: allocID,
@@ -1515,18 +1503,9 @@ func (d *Driver) Destroy(ctx context.Context, sandbox *models.Sandbox) error {
 		return nil
 	}
 	sandboxID := sandbox.ID
-	d.mu.Lock()
-	handle, hasHandle := d.vmms[sandboxID]
-	delete(d.vmms, sandboxID)
-	delete(d.clients, sandboxID)
-	delete(d.guestCID, sandboxID)
-	d.mu.Unlock()
-
-	// Phase 5: tell the RSS sampler the VMM is gone so the next
-	// sampleOnce drops its contribution to the host-pressure
-	// aggregate. Unregister before Shutdown so a slow Shutdown can't
-	// leave the sampler reading a dying pid for one extra tick.
-	d.rssUnregister(sandboxID)
+	// Before Shutdown, so a slow Shutdown can't leave the sampler reading
+	// a dying pid for one extra tick.
+	handle, hasHandle := d.unregister(sandboxID)
 
 	var firstErr error
 	rememberErr := func(err error) {

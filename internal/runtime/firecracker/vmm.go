@@ -51,6 +51,9 @@ const defaultSocketWait = 5 * time.Second
 // and we don't want to grow unboundedly on a chatty VMM.
 const stderrTailCap = 16 << 10 // 16 KiB
 
+// cgroupWarnOnce keeps a host without cgroup v2 to one warning.
+var cgroupWarnOnce sync.Once
+
 // vmm is a single Firecracker process's host-side handle. Unexported on
 // purpose: only Driver creates one, and the driver mediates all access.
 // Concurrency: Start is not safe to call twice; everything after Start
@@ -196,6 +199,17 @@ func (v *vmm) Start(ctx context.Context) error {
 
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("vmm: spawn %s: %w", v.cfg.FirecrackerBinary, err)
+	}
+	// Out of sandboxd's cgroup, so a sandboxd restart leaves the VM
+	// running (vmm_adopt.go).
+	if err := moveVMMToCgroup(cmd.Process.Pid); err != nil && !errors.Is(err, errVMMAdoptionUnsupported) {
+		cgroupWarnOnce.Do(func() {
+			logger := v.logger
+			if logger == nil {
+				logger = slog.Default()
+			}
+			logger.Warn("firecracker vmm: VMs stay in sandboxd's cgroup; a sandboxd restart stops them", "error", err)
+		})
 	}
 	v.cmd = cmd
 	v.waitCh = make(chan struct{})

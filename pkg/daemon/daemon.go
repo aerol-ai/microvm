@@ -470,6 +470,13 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 		// the same "no data, allow" cold-start behaviour the watermark
 		// check already protects against.
 		fcDriver.SetRSSSampler(rssSampler)
+		// The VMs a previous sandboxd left running (a restart or upgrade
+		// does not stop them). Before the warm pool fills and before the
+		// first reconcile, which reaps a started sandbox whose VM the
+		// driver does not know.
+		if n := fcDriver.AdoptRunningVMs(ctx, firecrackerVMKeeper(db)); n > 0 {
+			logger.Info("firecracker: running VMs taken over from the previous sandboxd", "vms", n)
+		}
 		// Phase 6 PR-A: warm-spawn corruption notifier. WarmSpawn runs
 		// outside any service-side call, so the runtime needs a back-
 		// channel to flip a corrupt template to unhealthy + kick rebuild.

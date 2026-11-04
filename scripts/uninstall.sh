@@ -8,6 +8,25 @@ if [[ $EUID -ne 0 ]]; then
 fi
 
 systemctl disable --now sandboxd >/dev/null 2>&1 || true
+
+# Firecracker VMs run in a cgroup of their own so a sandboxd restart leaves
+# them running; with sandboxd gone for good, nothing would manage them.
+vm_cgroup=/sys/fs/cgroup/aerolvm-vmm
+if [[ -d $vm_cgroup ]]; then
+	if [[ -f $vm_cgroup/cgroup.kill ]]; then
+		echo 1 >"$vm_cgroup/cgroup.kill" 2>/dev/null || true
+	else
+		while read -r pid; do
+			kill -KILL "$pid" 2>/dev/null || true
+		done <"$vm_cgroup/cgroup.procs"
+	fi
+	# cgroupfs files report size 0, so read rather than test -s.
+	for _ in $(seq 1 50); do
+		[[ -n $(cat "$vm_cgroup/cgroup.procs" 2>/dev/null) ]] || break
+		sleep 0.1
+	done
+	rmdir "$vm_cgroup" 2>/dev/null || true
+fi
 rm -f /etc/systemd/system/sandboxd.service
 rm -rf /etc/systemd/system/sandboxd.service.d
 rm -rf /etc/sandboxd

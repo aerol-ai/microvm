@@ -310,20 +310,15 @@ func (d *Driver) tryAcquireWarm(
 		apiSocket: slot.APISocket,
 		runDir:    slot.RunDir,
 	}
-	d.mu.Lock()
-	d.clients[sandboxID] = client
-	d.vmms[sandboxID] = wrapped
-	d.guestCID[sandboxID] = slot.VsockCID
-	d.mu.Unlock()
-
 	// Phase 5: re-key the RSS sampler entry from the warm slot's id
-	// to the claiming sandbox's id. WarmSpawn registered the slot
-	// under slot.ID so its RSS counted toward host pressure while it
-	// sat in the pool; now that a sandbox owns it, sampler metrics
-	// (and Destroy's eventual Unregister(sandboxID)) need to follow
-	// the sandbox. The pid is unchanged — same firecracker process.
+	// to the claiming sandbox's id (register adds the new one). WarmSpawn
+	// registered the slot under slot.ID so its RSS counted toward host
+	// pressure while it sat in the pool; now that a sandbox owns it,
+	// sampler metrics (and Destroy's eventual Unregister(sandboxID)) need
+	// to follow the sandbox. The pid is unchanged — same firecracker
+	// process. The run dir stays the pool's.
 	d.rssUnregister(slot.ID)
-	d.rssRegister(sandboxID, handle.Pid())
+	d.register(sandboxID, client, wrapped, slot.VsockCID, false)
 
 	committed = true
 	return &models.SandboxRuntimeState{
