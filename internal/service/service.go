@@ -4499,10 +4499,19 @@ func (s *Service) DeleteSnapshot(ctx context.Context, idOrName string) error {
 	default:
 		s.schedulePendingImageGC(ctx, "", snapshot.Image)
 	}
-	if err := s.store.DeleteSnapshot(ctx, snapshot.OwnerRef, snapshot.Name); err != nil {
+	// The row and the obligation to retire its registry copy go in one
+	// transaction, so a deleted snapshot never leaves a copy nothing will
+	// remove. Only the copy this node's pusher made for this snapshot is
+	// retired (the ref it would push to; "" without a registry, so no
+	// obligation); the push worker removes it by digest.
+	if err := s.store.DeleteSnapshotRetiringRegistryCopy(ctx, snapshot.OwnerRef, snapshot.Name,
+		s.snapshotPusher.DestRefFor(snapshot.OwnerRef, snapshot.Name)); err != nil {
 		return err
 	}
 	s.forgetSnapshotHome(ctx, snapshot)
+	if s.snapshotPushReconciler != nil {
+		s.snapshotPushReconciler.Kick()
+	}
 	return nil
 }
 

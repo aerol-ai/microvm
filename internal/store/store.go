@@ -531,6 +531,27 @@ func open(path string, secretCipher *secrets.Cipher) (*Store, error) {
 			PRIMARY KEY (engine, image)
 		);`,
 		`CREATE INDEX IF NOT EXISTS idx_pending_image_gc_scheduled_at ON pending_image_gc(scheduled_at);`,
+		// snapshot_registry_retirements is the obligation to remove the
+		// registry copy of a deleted snapshot. The push reconciler writes a
+		// plain `latest` tag the registry keeps forever, and another node
+		// resolves a bare snapshot name to that tag, so without this a
+		// deleted snapshot stayed bootable cluster-wide. Keyed by the
+		// manifest (ref + digest): the copy is removed by digest, so a
+		// re-created snapshot that pushed a new digest under the same tag is
+		// untouched. Written in the same transaction as the row delete
+		// (DeleteSnapshotRetiringRegistryCopy), or by a push that lands after
+		// its row is gone. scheduled_at is when the next attempt is due.
+		`CREATE TABLE IF NOT EXISTS snapshot_registry_retirements (
+			registry_ref TEXT NOT NULL,
+			digest TEXT NOT NULL,
+			owner_ref TEXT NOT NULL DEFAULT '',
+			name TEXT NOT NULL DEFAULT '',
+			scheduled_at DATETIME NOT NULL,
+			attempts INTEGER NOT NULL DEFAULT 0,
+			last_error TEXT NOT NULL DEFAULT '',
+			PRIMARY KEY (registry_ref, digest)
+		);`,
+		`CREATE INDEX IF NOT EXISTS idx_snapshot_registry_retirements_scheduled_at ON snapshot_registry_retirements(scheduled_at);`,
 		// firecracker_tap_pool is the pre-populated network-slot pool for
 		// the native Firecracker runtime. Each row is one "slot" — a
 		// (TAP-device, host-IP, guest-IP, /30 CIDR, vsock-CID) tuple. The
@@ -1628,6 +1649,9 @@ func ensureSnapshotPushQueueShape(db *sql.DB) error {
 		// The WHERE must stay word for word the first term of
 		// snapshotPushQueued, or SQLite cannot use the index for it.
 		`CREATE INDEX IF NOT EXISTS idx_sandbox_snapshots_push_queue ON sandbox_snapshots(created_at, owner_ref, name) WHERE push_state IN ('pending', 'error', 'pushing');`,
+		// SnapshotRegistryCopyInUse asks whether any row still names a
+		// registry copy before it is retired. Partial: only pushed rows.
+		`CREATE INDEX IF NOT EXISTS idx_sandbox_snapshots_registry_ref ON sandbox_snapshots(image_registry_ref) WHERE image_registry_ref <> '';`,
 	} {
 		if _, err := db.Exec(stmt); err != nil {
 			return fmt.Errorf("snapshot push queue index: %w", err)
@@ -4003,16 +4027,10 @@ func (s *Store) ListSnapshots(ctx context.Context) ([]*models.SandboxSnapshot, e
 	return items, nil
 }
 
+// DeleteSnapshot removes a snapshot row and records no registry
+// retirement; see DeleteSnapshotRetiringRegistryCopy.
 func (s *Store) DeleteSnapshot(ctx context.Context, ownerRef, name string) error {
-	result, err := s.db.ExecContext(ctx, `DELETE FROM sandbox_snapshots WHERE owner_ref = ? AND name = ?`, strings.TrimSpace(ownerRef), strings.TrimSpace(name))
-	if err != nil {
-		return fmt.Errorf("delete snapshot: %w", err)
-	}
-	affected, err := result.RowsAffected()
-	if err == nil && affected == 0 {
-		return ErrNotFound
-	}
-	return nil
+	return s.DeleteSnapshotRetiringRegistryCopy(ctx, ownerRef, name, "")
 }
 
 // maxSnapshotPageRows bounds one ListSnapshotPage read. Callers page with

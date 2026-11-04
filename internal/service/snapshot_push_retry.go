@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"sync"
 	"time"
@@ -23,11 +24,26 @@ type SnapshotPushStore interface {
 	ClaimSnapshotPush(ctx context.Context, ownerRef, name string) (*models.SandboxSnapshot, time.Time, bool, error)
 	CompleteSnapshotPush(ctx context.Context, ownerRef, name string, claimedAt time.Time, mode, registryRef, digest string) (bool, error)
 	ReleaseSnapshotPush(ctx context.Context, ownerRef, name string, claimedAt time.Time, state, errMsg string) (bool, error)
+
+	// The registry retirement ledger (internal/store/snapshot_retirement.go).
+	ScheduleSnapshotRegistryRetirement(ctx context.Context, r store.SnapshotRegistryRetirement) error
+	ListDueSnapshotRegistryRetirements(ctx context.Context, now time.Time, limit int) ([]store.SnapshotRegistryRetirement, error)
+	SnapshotRegistryCopyInUse(ctx context.Context, registryRef, digest, ownerRef, name string) (inUse, pushPending bool, err error)
+	DeferSnapshotRegistryRetirement(ctx context.Context, registryRef, digest, failure string) error
+	DeleteSnapshotRegistryRetirement(ctx context.Context, registryRef, digest string) error
 }
 
 // snapshotPushPageSize is how many queued rows one store read returns. A
 // sweep reads page after page, so it bounds memory, not the sweep.
 const snapshotPushPageSize = 64
+
+// snapshotRetireBatch bounds the registry retirements one sweep attempts;
+// the rest wait for the next tick. snapshotRetireTimeout caps one registry
+// delete so an unresponsive registry cannot hold the worker.
+const (
+	snapshotRetireBatch   = 32
+	snapshotRetireTimeout = 2 * time.Minute
+)
 
 // SnapshotPushReconciler pushes the rows the snapshot-create path flagged
 // `push_state IN ('pending', 'error')` (and claims whose lease ran out) to
@@ -81,6 +97,10 @@ type SnapshotPushReconcileStats struct {
 	Succeeded int
 	Failed    int
 	Skipped   int
+	// Retired / RetireFailed count registry copies of deleted snapshots
+	// removed, and removals that failed and will be retried.
+	Retired      int
+	RetireFailed int
 	// Coalesced is set when RunOnce found a sweep already running and
 	// handed its request to that sweep instead of sweeping itself.
 	Coalesced bool
@@ -91,6 +111,8 @@ func (s *SnapshotPushReconcileStats) add(o SnapshotPushReconcileStats) {
 	s.Succeeded += o.Succeeded
 	s.Failed += o.Failed
 	s.Skipped += o.Skipped
+	s.Retired += o.Retired
+	s.RetireFailed += o.RetireFailed
 }
 
 // Kick wakes the worker started by Run without blocking: the snapshot-create
@@ -185,6 +207,7 @@ func (r *SnapshotPushReconciler) sweep(ctx context.Context) (SnapshotPushReconci
 		}
 		if len(page) < r.pageSize {
 			wg.Wait()
+			r.retireRegistryCopies(ctx, &stats)
 			return stats, nil
 		}
 		cursor = store.SnapshotPushCursorAfter(page[len(page)-1])
@@ -259,7 +282,19 @@ func (r *SnapshotPushReconciler) pushOne(ctx context.Context, listed *models.San
 		return snapshotPushFailed
 	}
 	if !applied {
-		r.logger.Warn("snapshot push: finished after losing its claim; the row's current owner decides",
+		// A newer claim owns the row, or the row was deleted while this
+		// push ran — then nothing will ever name the copy just pushed.
+		// Either way it is recorded for retirement: the worker drops the
+		// obligation if a live row names this manifest, and waits while a
+		// row of this name still has a push to land (which may be this
+		// same digest), so a copy in use is never removed.
+		if err := r.store.ScheduleSnapshotRegistryRetirement(ctx, store.SnapshotRegistryRetirement{
+			RegistryRef: result.RegistryRef, Digest: result.Digest, OwnerRef: owner, Name: name,
+		}); err != nil {
+			r.logger.Warn("snapshot push: record retirement of an unclaimed push failed",
+				"snapshot", name, "registry_ref", result.RegistryRef, "error", err)
+		}
+		r.logger.Warn("snapshot push: finished after losing its claim; its copy is scheduled for retirement",
 			"snapshot", name, "registry_ref", result.RegistryRef, "digest", result.Digest)
 		return snapshotPushSkipped
 	}
@@ -271,5 +306,93 @@ func (r *SnapshotPushReconciler) pushOne(ctx context.Context, listed *models.San
 func (r *SnapshotPushReconciler) release(ctx context.Context, snapshot *models.SandboxSnapshot, claimedAt time.Time, reason string) {
 	if _, err := r.store.ReleaseSnapshotPush(ctx, snapshot.OwnerRef, snapshot.Name, claimedAt, models.SnapshotPushStateError, reason); err != nil {
 		r.logger.Warn("snapshot push: record failure failed", "snapshot", snapshot.Name, "error", err, "push_error", reason)
+	}
+}
+
+// retireRegistryCopies works through due retirement obligations: registry
+// copies of snapshots deleted on this node, or pushed after their row was
+// gone. Each is removed by digest (SnapshotPusher.RetireManifest) unless a
+// live row still names that manifest (the obligation is void) or a row of
+// the same name has a push still to land (it waits). A failed delete keeps
+// the obligation, with its reason, for the next sweep.
+//
+// Runs once the sweep's own pushes have returned, and sweeps never overlap,
+// so no push from this node can land a digest while it is being retired.
+func (r *SnapshotPushReconciler) retireRegistryCopies(ctx context.Context, stats *SnapshotPushReconcileStats) {
+	due, err := r.store.ListDueSnapshotRegistryRetirements(ctx, time.Now().UTC(), snapshotRetireBatch)
+	if err != nil {
+		r.logger.Warn("snapshot retire: list obligations failed", "error", err)
+		return
+	}
+	for _, ob := range due {
+		if ctx.Err() != nil {
+			return
+		}
+		switch r.retireOne(ctx, ob) {
+		case snapshotRetireDone:
+			stats.Retired++
+		case snapshotRetireFailed:
+			stats.RetireFailed++
+		}
+	}
+}
+
+type snapshotRetireOutcome int
+
+const (
+	snapshotRetireDone snapshotRetireOutcome = iota
+	snapshotRetireFailed
+	// snapshotRetireSettled: nothing was deleted, and nothing failed — the
+	// obligation was void, deferred, or could not be checked this time.
+	snapshotRetireSettled
+)
+
+func (r *SnapshotPushReconciler) retireOne(ctx context.Context, ob store.SnapshotRegistryRetirement) snapshotRetireOutcome {
+	inUse, pushPending, err := r.store.SnapshotRegistryCopyInUse(ctx, ob.RegistryRef, ob.Digest, ob.OwnerRef, ob.Name)
+	if err != nil {
+		// Unknown is not free: keep the obligation and look again.
+		r.logger.Warn("snapshot retire: in-use check failed; retained", "registry_ref", ob.RegistryRef, "error", err)
+		return snapshotRetireSettled
+	}
+	if inUse {
+		r.dropRetirement(ctx, ob, "a live snapshot still names this copy")
+		return snapshotRetireSettled
+	}
+	if pushPending {
+		if err := r.store.DeferSnapshotRegistryRetirement(ctx, ob.RegistryRef, ob.Digest, ""); err != nil {
+			r.logger.Warn("snapshot retire: defer failed", "registry_ref", ob.RegistryRef, "error", err)
+		}
+		return snapshotRetireSettled
+	}
+	retireCtx, cancel := context.WithTimeout(ctx, snapshotRetireTimeout)
+	err = r.pusher.RetireManifest(retireCtx, ob.RegistryRef, ob.Digest)
+	cancel()
+	switch {
+	case errors.Is(err, errRegistryCopyNotOurs):
+		// Never ours to delete; retrying would not change that.
+		r.dropRetirement(ctx, ob, err.Error())
+		return snapshotRetireSettled
+	case err != nil:
+		if derr := r.store.DeferSnapshotRegistryRetirement(ctx, ob.RegistryRef, ob.Digest, err.Error()); derr != nil {
+			r.logger.Warn("snapshot retire: record failure failed", "registry_ref", ob.RegistryRef, "error", derr)
+		}
+		r.logger.Warn("snapshot retire: registry delete failed; will retry",
+			"registry_ref", ob.RegistryRef, "digest", ob.Digest, "attempts", ob.Attempts+1, "error", err)
+		return snapshotRetireFailed
+	}
+	r.dropRetirement(ctx, ob, "")
+	r.logger.Info("snapshot retire: registry copy removed", "registry_ref", ob.RegistryRef, "digest", ob.Digest)
+	return snapshotRetireDone
+}
+
+// dropRetirement deletes a fulfilled or void obligation. If the delete
+// fails the next sweep meets it again and finds the copy gone (a delete of
+// a missing manifest succeeds) or still in use.
+func (r *SnapshotPushReconciler) dropRetirement(ctx context.Context, ob store.SnapshotRegistryRetirement, reason string) {
+	if reason != "" {
+		r.logger.Info("snapshot retire: obligation dropped", "registry_ref", ob.RegistryRef, "digest", ob.Digest, "reason", reason)
+	}
+	if err := r.store.DeleteSnapshotRegistryRetirement(ctx, ob.RegistryRef, ob.Digest); err != nil {
+		r.logger.Warn("snapshot retire: drop obligation failed", "registry_ref", ob.RegistryRef, "error", err)
 	}
 }

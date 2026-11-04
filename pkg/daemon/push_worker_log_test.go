@@ -25,6 +25,9 @@ func TestPushSweepLogs(t *testing.T) {
 		{"snapshot sweep", func(l *slog.Logger) {
 			logSnapshotPushSweep(l, service.SnapshotPushReconcileStats{Scanned: 2, Succeeded: 2}, nil)
 		}, "snapshot push reconcile sweep"},
+		{"snapshot retirements only", func(l *slog.Logger) {
+			logSnapshotPushSweep(l, service.SnapshotPushReconcileStats{RetireFailed: 1}, nil)
+		}, "retire_failed=1"},
 		{"snapshot idle", func(l *slog.Logger) {
 			logSnapshotPushSweep(l, service.SnapshotPushReconcileStats{}, nil)
 		}, ""},

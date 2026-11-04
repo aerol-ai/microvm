@@ -35,10 +35,106 @@ type fakePushStore struct {
 	claimErr    error
 	completeErr error
 	releaseErr  map[string]error
+
+	// The retirement ledger, keyed ref@digest, with its failure knobs.
+	retirements    map[string]store.SnapshotRegistryRetirement
+	scheduleErr    error
+	listRetireErr  error
+	inUseErr       error
+	deferErr       error
+	dropRetireErr  error
+	deferredCount  int
+	droppedRetires []string
 }
 
 func newFakePushStore() *fakePushStore {
-	return &fakePushStore{rows: map[string]*models.SandboxSnapshot{}, stamps: map[string]time.Time{}}
+	return &fakePushStore{
+		rows:        map[string]*models.SandboxSnapshot{},
+		stamps:      map[string]time.Time{},
+		retirements: map[string]store.SnapshotRegistryRetirement{},
+	}
+}
+
+func (f *fakePushStore) ScheduleSnapshotRegistryRetirement(_ context.Context, r store.SnapshotRegistryRetirement) error {
+	if f.scheduleErr != nil {
+		return f.scheduleErr
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	key := r.RegistryRef + "@" + r.Digest
+	if _, ok := f.retirements[key]; !ok && r.RegistryRef != "" && r.Digest != "" {
+		f.retirements[key] = r
+	}
+	return nil
+}
+
+func (f *fakePushStore) ListDueSnapshotRegistryRetirements(_ context.Context, _ time.Time, limit int) ([]store.SnapshotRegistryRetirement, error) {
+	if f.listRetireErr != nil {
+		return nil, f.listRetireErr
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []store.SnapshotRegistryRetirement
+	for _, r := range f.retirements {
+		out = append(out, r)
+	}
+	slices.SortFunc(out, func(a, b store.SnapshotRegistryRetirement) int { return strings.Compare(a.Digest, b.Digest) })
+	if len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
+}
+
+func (f *fakePushStore) SnapshotRegistryCopyInUse(_ context.Context, ref, digest, _, name string) (bool, bool, error) {
+	if f.inUseErr != nil {
+		return false, false, f.inUseErr
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var inUse, pending bool
+	for _, r := range f.rows {
+		if r.ImageRegistryRef == ref && r.ImageDigest == digest {
+			inUse = true
+		}
+		if r.Name == name && r.PushState != models.SnapshotPushStateActive {
+			pending = true
+		}
+	}
+	return inUse, pending, nil
+}
+
+func (f *fakePushStore) DeferSnapshotRegistryRetirement(_ context.Context, ref, digest, failure string) error {
+	if f.deferErr != nil {
+		return f.deferErr
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.deferredCount++
+	key := ref + "@" + digest
+	if r, ok := f.retirements[key]; ok && failure != "" {
+		r.Attempts++
+		r.LastError = failure
+		f.retirements[key] = r
+	}
+	return nil
+}
+
+func (f *fakePushStore) DeleteSnapshotRegistryRetirement(_ context.Context, ref, digest string) error {
+	if f.dropRetireErr != nil {
+		return f.dropRetireErr
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	delete(f.retirements, ref+"@"+digest)
+	f.droppedRetires = append(f.droppedRetires, ref+"@"+digest)
+	return nil
+}
+
+func (f *fakePushStore) retirement(ref, digest string) (store.SnapshotRegistryRetirement, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	r, ok := f.retirements[ref+"@"+digest]
+	return r, ok
 }
 
 func (f *fakePushStore) seed(snap *models.SandboxSnapshot) {

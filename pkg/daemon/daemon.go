@@ -1616,7 +1616,7 @@ func logSnapshotPushSweep(logger *slog.Logger, stats service.SnapshotPushReconci
 		logger.Warn("snapshot push reconcile sweep failed", "error", err)
 		return
 	}
-	if stats.Scanned == 0 {
+	if stats.Scanned == 0 && stats.Retired == 0 && stats.RetireFailed == 0 {
 		return
 	}
 	logger.Info("snapshot push reconcile sweep",
@@ -1624,6 +1624,8 @@ func logSnapshotPushSweep(logger *slog.Logger, stats service.SnapshotPushReconci
 		"succeeded", stats.Succeeded,
 		"failed", stats.Failed,
 		"skipped", stats.Skipped,
+		"retired", stats.Retired,
+		"retire_failed", stats.RetireFailed,
 	)
 }
 
