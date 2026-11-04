@@ -136,10 +136,14 @@ Server-side create from `Server-Timing` (excludes client↔cluster WAN). Artifac
 | **Isolate** | **4ms** | 6ms | 19ms | `single-node-isolate` · t3.medium | Warm path (same tenant group); API p50 266ms is WAN |
 | **WASM** (resident host) | **22ms** | 46ms | 50ms | `cluster-3-mixed-wasm` · t3.large | Flag-on resident host; no cold-compile tail |
 | **Firecracker** (warm pool) | **34ms** | 36ms | 37ms | `single-node-fc` · c5.metal | Post warm-pool path; cold/template builds are higher |
-| **containerd** (OCI default) | **189ms** | 225ms | 233ms | `cluster-3-mixed-containerd` · t3.medium | Default host engine; API runtime remains `docker` |
-| **gVisor** | **284ms** | 330ms | 346ms | `cluster-3-mixed-gvisor` · t3.medium | User-space kernel boot cost |
+| **containerd** (warm pool) | **31ms** | 33ms | 66ms | `cluster-mixed-benchmark-with-obs` · t3.large | All 10 samples came from the pool. Turn it on with `SB_CONTAINERD_POOL_ENABLED=true` (off by default) |
+| **containerd** (OCI default, cold) | **189ms** | 225ms | 233ms | `cluster-3-mixed-containerd` · t3.medium | Default host engine, pool off; API runtime remains `docker` |
+| **gVisor** (warm pool) | **34ms** | 310ms | 536ms | `cluster-mixed-benchmark-with-obs` · t3.large | Same containerd pool, with runsc. 8 of 10 samples came from the pool; the 2 misses were full creates and set the p90 and p99 |
+| **gVisor** (cold) | **284ms** | 330ms | 346ms | `cluster-3-mixed-gvisor` · t3.medium | User-space kernel boot cost, pool off |
 
-Reproduce: `make integration-benchmark-isolate`, `integration-benchmark-wasm`, `integration-benchmark-containerd`, `integration-benchmark-fc`, `integration-benchmark-gvisor`.
+The warm-pool rows come from one 10-sample run (2026-10-04) with the pool on for `alpine:3.20`. Only plain creates use the pool: no environment variables, mounts, custom command, private registry or GPUs, running as root, with a warm slot ready for that image. Every other create takes the cold path.
+
+Reproduce: `make integration-benchmark-isolate`, `integration-benchmark-wasm`, `integration-benchmark-containerd`, `integration-benchmark-fc`, `integration-benchmark-gvisor`, and `integration-cluster-mixed-obs` for the warm-pool rows.
 
 ## SDKs
 
