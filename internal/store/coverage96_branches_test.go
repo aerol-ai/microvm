@@ -940,7 +940,10 @@ func TestCov96bSandboxStoreFailures(t *testing.T) {
 		{
 			name:  "snapshots pending push iteration fails",
 			setup: func(t *testing.T, st *Store) { cov96bBreakRows(t, st, "sandbox_snapshots") },
-			call:  func(st *Store) error { _, err := st.ListSnapshotsPendingPush(ctx); return err },
+			call: func(st *Store) error {
+				_, err := st.ListSnapshotsPendingPushPage(ctx, SnapshotPushCursor{}, 10)
+				return err
+			},
 		},
 		{
 			name:  "templates iteration fails",

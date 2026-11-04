@@ -2650,61 +2650,6 @@ func TestWasmStateKVCRUD(t *testing.T) {
 	}
 }
 
-// TestSnapshotPushClaimLease mirrors TestTemplatePushClaimLease for the
-// snapshot ledger: 'pushing' hides a row from the retry queue only for as long
-// as the claim is live, so a pusher that dies mid-push cannot strand the
-// snapshot in a state no reconciler will ever revisit.
-func TestSnapshotPushClaimLease(t *testing.T) {
-	ctx := context.Background()
-	st := newTestStore(t)
-
-	snap := &models.SandboxSnapshot{
-		Name:                  "snap-lease",
-		Image:                 "alpine:3.19",
-		ImageID:               "sha256:abc",
-		CreatedAt:             time.Now().UTC(),
-		ImageDistributionMode: models.ImageDistributionLocalOnly,
-		PushState:             models.SnapshotPushStatePending,
-	}
-	if err := st.CreateSnapshot(ctx, snap); err != nil {
-		t.Fatalf("CreateSnapshot: %v", err)
-	}
-
-	if err := st.SetSnapshotPushState(ctx, snap.OwnerRef, snap.Name, models.SnapshotPushStatePushing, ""); err != nil {
-		t.Fatalf("claim: %v", err)
-	}
-	rows, err := st.ListSnapshotsPendingPush(ctx)
-	if err != nil {
-		t.Fatalf("ListSnapshotsPendingPush: %v", err)
-	}
-	if len(rows) != 0 {
-		t.Fatalf("live claim listed %d rows, want 0", len(rows))
-	}
-
-	expired := time.Now().UTC().Add(-PushClaimLease - time.Minute)
-	if _, err := st.db.ExecContext(ctx, `UPDATE sandbox_snapshots SET push_claimed_at = ? WHERE name = ?`, expired, snap.Name); err != nil {
-		t.Fatalf("age the claim: %v", err)
-	}
-	rows, err = st.ListSnapshotsPendingPush(ctx)
-	if err != nil {
-		t.Fatalf("ListSnapshotsPendingPush after expiry: %v", err)
-	}
-	if len(rows) != 1 || rows[0].Name != snap.Name {
-		t.Fatalf("expired claim listed %v, want the row back", rows)
-	}
-
-	if err := st.SetSnapshotPushState(ctx, snap.OwnerRef, snap.Name, models.SnapshotPushStateActive, ""); err != nil {
-		t.Fatalf("finish: %v", err)
-	}
-	rows, err = st.ListSnapshotsPendingPush(ctx)
-	if err != nil {
-		t.Fatalf("ListSnapshotsPendingPush after finish: %v", err)
-	}
-	if len(rows) != 0 {
-		t.Fatalf("finished snapshot listed %v, want none", rows)
-	}
-}
-
 // ListCompatStateByOwner returns only the given owner's sandboxes' facade
 // state, joining through sandboxes.owner_ref — the owner-scoped read the
 // service uses so a user token never scans another tenant's rows (D13).

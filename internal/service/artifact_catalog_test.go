@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/aerol-ai/microvm/internal/cluster"
 	"github.com/aerol-ai/microvm/internal/config"
@@ -582,14 +583,15 @@ func TestTemplatePushMetadataInvalidatesTheCatalogue(t *testing.T) {
 
 	// The reconciler's own store surface, as the daemon wires it.
 	pushStore := svc.TemplatePushStore(svc.store)
-	if err := pushStore.SetTemplatePushState(ctx, "tpl-push", models.TemplatePushStatePushing, ""); err != nil {
-		t.Fatal(err)
+	if changed, err := svc.store.MarkTemplatePushPending(ctx, "tpl-push"); err != nil || !changed {
+		t.Fatalf("mark pending = %v, %v", changed, err)
 	}
-	if err := pushStore.UpdateTemplatePushDistribution(ctx, "tpl-push", "aocr.example.com/tpl-push:latest", "sha256:abc"); err != nil {
-		t.Fatal(err)
+	_, claimedAt, claimed, err := pushStore.ClaimTemplatePush(ctx, "tpl-push")
+	if err != nil || !claimed {
+		t.Fatalf("claim = %v, %v", claimed, err)
 	}
-	if err := pushStore.SetTemplatePushState(ctx, "tpl-push", models.TemplatePushStateActive, ""); err != nil {
-		t.Fatal(err)
+	if applied, err := pushStore.CompleteTemplatePush(ctx, "tpl-push", claimedAt, "aocr.example.com/tpl-push:latest", "sha256:abc"); err != nil || !applied {
+		t.Fatalf("complete = %v, %v", applied, err)
 	}
 	svc.ReconcileArtifactCatalog(ctx)
 
@@ -679,9 +681,25 @@ func TestTemplatePushStoreSeamBehaviour(t *testing.T) {
 	if _, err := seam.ListTemplatesPendingPush(ctx); err != nil {
 		t.Fatalf("pending-push read through the seam: %v", err)
 	}
-	// A failing write is reported, not swallowed.
-	if err := seam.SetTemplatePushState(ctx, "tpl-missing", models.TemplatePushStateActive, ""); err == nil {
-		t.Fatal("a push-state write for a missing row reported success")
+	// A write that matches nothing is reported as such, not as a success.
+	if _, _, claimed, err := seam.ClaimTemplatePush(ctx, "tpl-missing"); err != nil || claimed {
+		t.Fatalf("claim of a missing row = %v, %v", claimed, err)
+	}
+	if applied, err := seam.ReleaseTemplatePush(ctx, "tpl-missing", time.Now(), models.TemplatePushStateError, "x"); err != nil || applied {
+		t.Fatalf("release of a missing row = %v, %v", applied, err)
+	}
+	if applied, err := seam.CompleteTemplatePush(ctx, "tpl-missing", time.Now(), "ref", "sha256:x"); err != nil || applied {
+		t.Fatalf("completion of a missing row = %v, %v", applied, err)
+	}
+	if changed, err := svc.store.MarkTemplatePushPending(ctx, "tpl-seam"); err != nil || !changed {
+		t.Fatalf("mark pending = %v, %v", changed, err)
+	}
+	_, claimedAt, claimed, err := seam.ClaimTemplatePush(ctx, "tpl-seam")
+	if err != nil || !claimed {
+		t.Fatalf("claim = %v, %v", claimed, err)
+	}
+	if applied, err := seam.ReleaseTemplatePush(ctx, "tpl-seam", claimedAt, models.TemplatePushStateError, "registry 502"); err != nil || !applied {
+		t.Fatalf("release = %v, %v", applied, err)
 	}
 
 	var none *Service

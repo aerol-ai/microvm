@@ -94,12 +94,16 @@ func (s failingTemplateArtifactPushStore) ListTemplatesPendingPush(context.Conte
 	return nil, s.err
 }
 
-func (s failingTemplateArtifactPushStore) SetTemplatePushState(context.Context, string, string, string) error {
-	return nil
+func (s failingTemplateArtifactPushStore) ClaimTemplatePush(context.Context, string) (*models.Template, time.Time, bool, error) {
+	return nil, time.Time{}, false, s.err
 }
 
-func (s failingTemplateArtifactPushStore) UpdateTemplatePushDistribution(context.Context, string, string, string) error {
-	return nil
+func (s failingTemplateArtifactPushStore) CompleteTemplatePush(context.Context, string, time.Time, string, string) (bool, error) {
+	return false, s.err
+}
+
+func (s failingTemplateArtifactPushStore) ReleaseTemplatePush(context.Context, string, time.Time, string, string) (bool, error) {
+	return false, s.err
 }
 
 func (s *serviceClusterStub) Leader() string { return s.leader }
@@ -763,15 +767,14 @@ func TestServiceHelperBranchCoverageRoundTwo(t *testing.T) {
 			t.Fatal("closed store should not mark template for push")
 		}
 
-		r := &TemplateArtifactPushReconciler{
-			pusher:      &TemplateArtifactPusher{},
-			store:       failingTemplateArtifactPushStore{err: errors.New("push list failed")},
-			logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
-			maxInFlight: 1,
-		}
+		r := NewTemplateArtifactPushReconciler(&TemplateArtifactPusher{},
+			failingTemplateArtifactPushStore{err: errors.New("push list failed")},
+			slog.New(slog.NewTextHandler(io.Discard, nil)), 1)
 		svc.templateArtifactPushReconciler = r
 		svc.kickTemplateArtifactPushReconciler("tpl-missing")
-		time.Sleep(20 * time.Millisecond)
+		if _, err := r.RunOnce(ctx); err == nil {
+			t.Fatal("a failing queue read must fail the sweep")
+		}
 	})
 
 	t.Run("cluster ownership and gc helpers", func(t *testing.T) {

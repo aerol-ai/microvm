@@ -1604,31 +1604,29 @@ func startSnapshotPushReconciler(ctx context.Context, logger *slog.Logger, cfg c
 		"interval", cfg.SnapshotPushReconcileInterval,
 		"max_in_flight", cfg.SnapshotPushMaxInFlight,
 	)
-	go func() {
-		t := time.NewTicker(cfg.SnapshotPushReconcileInterval)
-		defer t.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-t.C:
-				stats, err := r.RunOnce(ctx)
-				if err != nil {
-					logger.Warn("snapshot push reconcile sweep failed", "error", err)
-					continue
-				}
-				if stats.Scanned == 0 {
-					continue
-				}
-				logger.Info("snapshot push reconcile sweep",
-					"scanned", stats.Scanned,
-					"succeeded", stats.Succeeded,
-					"failed", stats.Failed,
-					"skipped", stats.Skipped,
-				)
-			}
-		}
-	}()
+	// The node's one snapshot push worker: the ticker and every create's
+	// Kick both feed it, and it never runs two sweeps at once.
+	go r.Run(ctx, cfg.SnapshotPushReconcileInterval, func(stats service.SnapshotPushReconcileStats, err error) {
+		logSnapshotPushSweep(logger, stats, err)
+	})
+}
+
+func logSnapshotPushSweep(logger *slog.Logger, stats service.SnapshotPushReconcileStats, err error) {
+	if err != nil {
+		logger.Warn("snapshot push reconcile sweep failed", "error", err)
+		return
+	}
+	if stats.Scanned == 0 && stats.Retired == 0 && stats.RetireFailed == 0 {
+		return
+	}
+	logger.Info("snapshot push reconcile sweep",
+		"scanned", stats.Scanned,
+		"succeeded", stats.Succeeded,
+		"failed", stats.Failed,
+		"skipped", stats.Skipped,
+		"retired", stats.Retired,
+		"retire_failed", stats.RetireFailed,
+	)
 }
 
 // startTemplateRotationReconciler kicks off the Phase 6 PR-E rotation
@@ -1777,31 +1775,25 @@ func startTemplateArtifactPushReconciler(ctx context.Context, logger *slog.Logge
 		"interval", cfg.SnapshotPushReconcileInterval,
 		"max_in_flight", cfg.SnapshotPushMaxInFlight,
 	)
-	go func() {
-		t := time.NewTicker(cfg.SnapshotPushReconcileInterval)
-		defer t.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-t.C:
-				stats, err := r.RunOnce(ctx)
-				if err != nil {
-					logger.Warn("template push reconcile sweep failed", "error", err)
-					continue
-				}
-				if stats.Scanned == 0 {
-					continue
-				}
-				logger.Info("template push reconcile sweep",
-					"scanned", stats.Scanned,
-					"succeeded", stats.Succeeded,
-					"failed", stats.Failed,
-					"skipped", stats.Skipped,
-				)
-			}
-		}
-	}()
+	go r.Run(ctx, cfg.SnapshotPushReconcileInterval, func(stats service.TemplateArtifactPushStats, err error) {
+		logTemplatePushSweep(logger, stats, err)
+	})
+}
+
+func logTemplatePushSweep(logger *slog.Logger, stats service.TemplateArtifactPushStats, err error) {
+	if err != nil {
+		logger.Warn("template push reconcile sweep failed", "error", err)
+		return
+	}
+	if stats.Scanned == 0 {
+		return
+	}
+	logger.Info("template push reconcile sweep",
+		"scanned", stats.Scanned,
+		"succeeded", stats.Succeeded,
+		"failed", stats.Failed,
+		"skipped", stats.Skipped,
+	)
 }
 
 // autoImportSpecResolver adapts the service+cluster surface to the
