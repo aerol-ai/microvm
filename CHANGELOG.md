@@ -19,7 +19,7 @@ timeline
 
 | Release line | Releases | Dates | Latest |
 |---|---|---|---|
-| [0.6](#06-release-line) | 12 | Sep 28, 2026 to Nov 3, 2026 | [v0.6.11](#v0611-firecracker-from-installsh-and-stopstart-that-works-and-stays-small) |
+| [0.6](#06-release-line) | 12 | Sep 28, 2026 to Nov 4, 2026 | [v0.6.11](#v0611-firecracker-from-installsh-snapshots-and-vms-that-survive-a-restart) |
 | [0.5](#05-release-line) | 7 | Jun 1, 2026 to Sep 28, 2026 | [v0.5.7](#v057-dependency-updates) |
 | [0.4](#04-release-line) | 1 | May 28, 2026 | [v0.4.1](#v041-firecracker-runtime-wiring) |
 | [0.3](#03-release-line) | 1 | May 24, 2026 | [v0.3.1](#v031-custom-domains-and-image-garbage-collection) |
@@ -28,20 +28,26 @@ timeline
 
 ## 0.6 release line
 
-### v0.6.11: Firecracker from install.sh, and Stop/Start that works and stays small
+### v0.6.11: Firecracker from install.sh, snapshots, and VMs that survive a restart
 
-*November 3, 2026* · [Full notes](https://github.com/aerol-ai/microvm/releases/tag/v0.6.11)
+*November 4, 2026* · [Full notes](https://github.com/aerol-ai/microvm/releases/tag/v0.6.11)
 
-This release is about Firecracker. `install.sh --with-firecracker` sets a server up for Firecracker sandboxes, the way `--with-gvisor` does for gVisor. A stopped Firecracker sandbox can be started again on servers that run the jailer, which is every production server. And Stop and Start now copy only a sandbox's data, so a stopped sandbox takes about as much disk as it holds, not its full disk size.
+This release is about Firecracker. `install.sh --with-firecracker` sets a server up for Firecracker sandboxes, the way `--with-gvisor` does for gVisor. Firecracker sandboxes can now be snapshotted like Docker ones: you take a snapshot from a stopped or a running sandbox, it is pushed to the cluster registry, and any server can start a Firecracker VM or a container from it. Running Firecracker sandboxes keep running when sandboxd restarts or is upgraded. And Stop and Start work on every server and copy only a sandbox's data.
 
-> **Stopped Firecracker sandboxes could not be started on earlier releases.** Start failed with `Permission denied (os error 13) rootfs.ext4` on every server that runs the jailer. v0.6.11 fixes Start; the saved format is unchanged, so sandboxes stopped on an earlier release can be started after the upgrade.
+> **This v0.6.11 replaces the first v0.6.11 build, published on 2026-11-03 and withdrawn.** Servers that installed v0.6.11 before 2026-11-04 should run `install.sh` again: each run downloads the binaries again, and running Firecracker sandboxes keep running through it.
 
-- **`install.sh --with-firecracker`.** The installer checks that the server has `/dev/kvm` before it installs anything, then installs Firecracker and its jailer v1.15.1 and guest kernel 5.10.245. Every download is checked against a SHA-256 written into the script. Virtual machines run as a new `sandboxd-jailer` system user. Running it again downloads nothing that is already installed.
-- **Stopped Firecracker sandboxes start again.** The restored disk is now handed to the VM's user before the VM opens it.
-- **Stop and Start keep disks small and are faster.** Copies skip empty space. On an AWS `m5zn.metal`, a sandbox with a 10 GiB disk and 1 GiB of memory that wrote 256 MiB: the saved copy went from 11,265 MiB to 597 MiB, Stop from 108 s to 15 s, and Start from 88 s to 3.6 s.
+- **`install.sh --with-firecracker`.** The installer checks that the server has `/dev/kvm` before it installs anything, then installs Firecracker and its jailer v1.15.1 and guest kernel 5.10.245. Every download is checked against a SHA-256 written into the script. Virtual machines run as a new `sandboxd-jailer` system user.
+- **Snapshots of Firecracker sandboxes.** A snapshot call on a Firecracker sandbox used to answer "not implemented". Now it saves every file in the sandbox as an image. The image is pushed to the cluster registry like a Docker snapshot, and any server can start it, as a Firecracker VM or as a container.
+- **Snapshots of running sandboxes.** A running Firecracker sandbox keeps running while it is saved. Only writes to its disk wait, while the disk is copied: 89 ms for a sandbox with 64 MB of data on an AWS `m5zn.metal`. Programs, reads and the network carry on. To get an error instead of any pause, send `allow_pause: false`. The SDKs get it as the `allowPause` option in their next release.
+- **Restarting or upgrading sandboxd keeps Firecracker sandboxes running.** Before, a restart stopped every running VM, and the new sandboxd then deleted their sandboxes. Now the VMs run outside sandboxd's service, and sandboxd takes them back over when it starts. With 9 VMs running, sandboxd answered 0.6 s after a restart.
+- **Stop and Start work on every server and keep disks small.** Start no longer fails on servers that run the jailer. Stop and Start copy only a sandbox's data, so a stopped sandbox takes about as much disk as it holds, not its full disk size.
 
 **Before you upgrade:**
 
+- **Upgrade with `install.sh` or the Ansible update playbook.** They move running Firecracker VMs out of sandboxd's service before restarting it, so the VMs keep running. Replacing the binary and restarting sandboxd by hand stops VMs started by an earlier release. A VM that an earlier release took from the warm pool cannot be matched to its sandbox, so it stops with the upgrade.
+- **Firecracker sandboxes created on an earlier release, including the first v0.6.11 build, cannot be snapshotted.** Start restores a VM's memory, so such a sandbox keeps its old agent, which cannot freeze the disk. The snapshot call answers 409, saying the sandbox "was created by an older release". Create a new sandbox to take snapshots.
+- **Deleting a snapshot deletes its registry copy.** Once the copy is gone, other servers can no longer start that snapshot.
+- **Stopping or restarting sandboxd no longer stops Firecracker VMs.** Stop their sandboxes to stop them. `uninstall.sh` stops all of them.
 - **Saved copies made by earlier releases stay full-size** until the sandbox's next Stop rewrites them.
 - **Pass `--with-firecracker` on every later run of the installer.** Each run rewrites `/etc/sandboxd/sandboxd.env`, so a run without it turns Firecracker off.
 - **Terraform and Ansible servers are unchanged.** They install Firecracker their own way and run the jailer as uid 1000.
