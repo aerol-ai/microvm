@@ -615,3 +615,57 @@ func mustAbs(t *testing.T, path string) string {
 	}
 	return abs
 }
+
+// Before install.sh restarts sandboxd it moves the Firecracker VMs an older
+// release started inside sandboxd's cgroup into the VMs' own, so the
+// restart does not stop them. Nothing else in the unit moves.
+func TestInstallShKeepsFirecrackerVMsThroughARestart(t *testing.T) {
+	src := installShSource(t)
+	fn := installShFunctions(t, src, "keep_firecracker_vms_running")
+	root := t.TempDir()
+	cgroups, procs := filepath.Join(root, "cgroup"), filepath.Join(root, "proc")
+	unit := filepath.Join(cgroups, "system.slice", "sandboxd.service")
+	for _, dir := range []string{unit, procs} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write := func(path, content string) {
+		t.Helper()
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write(filepath.Join(cgroups, "cgroup.controllers"), "cpu memory\n")
+	write(filepath.Join(unit, "cgroup.procs"), "100\n101\n102\n")
+	write(filepath.Join(procs, "100", "cmdline"), "/usr/local/bin/sandboxd\x00")
+	write(filepath.Join(procs, "101", "cmdline"), "/firecracker\x00--id\x00sb-a\x00--api-sock\x00api.socket\x00")
+	write(filepath.Join(procs, "102", "cmdline"), "/usr/bin/rclone\x00mount\x00")
+	run := func() string {
+		t.Helper()
+		script := "set -euo pipefail\nCGROUP_ROOT=" + cgroups + "\nPROC_ROOT=" + procs + "\n" +
+			"systemctl() { echo /system.slice/sandboxd.service; }\n" + fn + "\nkeep_firecracker_vms_running\n"
+		out, err := exec.Command("bash", "-c", script).CombinedOutput()
+		if err != nil {
+			t.Fatalf("keep_firecracker_vms_running: %v: %s", err, out)
+		}
+		moved, _ := os.ReadFile(filepath.Join(cgroups, "aerolvm-vmm", "cgroup.procs"))
+		return string(moved)
+	}
+	if got := run(); got != "101\n" {
+		t.Fatalf("moved %q, want only the VM (101)", got)
+	}
+	// No cgroup v2, or no unit cgroup: nothing to do, and no error under
+	// set -e.
+	if err := os.Remove(filepath.Join(unit, "cgroup.procs")); err != nil {
+		t.Fatal(err)
+	}
+	run()
+	if err := os.Remove(filepath.Join(cgroups, "cgroup.controllers")); err != nil {
+		t.Fatal(err)
+	}
+	run()
+}

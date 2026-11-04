@@ -152,6 +152,10 @@ LB_HEALTH_PORT=""
 # fills the two state variables before anything is written.
 SANDBOXD_ENV_FILE="/etc/sandboxd/sandboxd.env"
 SANDBOXD_UNIT_FILE="/etc/systemd/system/sandboxd.service"
+# The cgroup v2 and proc mounts keep_firecracker_vms_running reads (tests
+# point them at fixtures).
+CGROUP_ROOT="/sys/fs/cgroup"
+PROC_ROOT="/proc"
 SANDBOXD_HEALTH_URL="http://127.0.0.1:21212/health"
 SANDBOXD_READY_TRIES=60
 SANDBOXD_WAS_ACTIVE="false"
@@ -1898,6 +1902,27 @@ wait_for_sandboxd_ready() {
 	return 1
 }
 
+# keep_firecracker_vms_running moves running Firecracker VMs out of
+# sandboxd's cgroup before sandboxd restarts. Releases up to v0.6.11 started
+# them there, and the restart (KillMode=control-group) would stop them;
+# moved, they keep running, and the new sandboxd takes them over. Current
+# releases start every VM outside it already. Needs cgroup v2; a no-op
+# without it or without such VMs.
+keep_firecracker_vms_running() {
+	local cg pid argv0
+	[[ -f "$CGROUP_ROOT/cgroup.controllers" ]] || return 0
+	cg="$(systemctl show -p ControlGroup --value sandboxd 2>/dev/null || true)"
+	[[ -n "$cg" && -f "${CGROUP_ROOT}${cg}/cgroup.procs" ]] || return 0
+	mkdir -p "$CGROUP_ROOT/aerolvm-vmm" 2>/dev/null || return 0
+	while read -r pid; do
+		# A jailed VM's argv[0] is /firecracker; an unjailed one's the
+		# binary's path.
+		argv0="$(tr '\0' '\n' <"${PROC_ROOT}/${pid}/cmdline" 2>/dev/null | head -n1 || true)"
+		[[ "${argv0##*/}" == firecracker ]] || continue
+		echo "$pid" >"$CGROUP_ROOT/aerolvm-vmm/cgroup.procs" 2>/dev/null || true
+	done <"${CGROUP_ROOT}${cg}/cgroup.procs"
+}
+
 # restart_sandboxd_if_reconfigured restarts sandboxd when it was running
 # before this run and the run changed its settings file or unit.
 # `systemctl enable --now` only starts a stopped unit, so before this a
@@ -1915,6 +1940,7 @@ restart_sandboxd_if_reconfigured() {
 		return 0
 	fi
 	echo "sandboxd settings changed; restarting sandboxd before Caddy"
+	keep_firecracker_vms_running
 	systemctl restart sandboxd
 	if ! wait_for_sandboxd_ready; then
 		echo "warning: sandboxd is not answering ${SANDBOXD_HEALTH_URL} (or has not made ${PUBLIC_API_SOCKET}) ${SANDBOXD_READY_TRIES}s after its restart; starting Caddy anyway. Check: journalctl -u sandboxd" >&2

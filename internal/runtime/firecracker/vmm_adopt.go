@@ -63,6 +63,7 @@ var (
 	hostBootID      = currentBootID
 	openProcess     = openLiveProcess
 	killStrayVMM    = killCgroupStray
+	processCmdline  = procCmdline
 )
 
 // vmmRecord is what a running VM leaves for the next sandboxd.
@@ -138,11 +139,19 @@ func (d *Driver) writeVMMRecord(sandboxID string, handle VMMHandle, guestCID uin
 	if err != nil {
 		return fmt.Errorf("read boot id: %w", err)
 	}
-	raw, err := json.Marshal(vmmRecord{
+	return writeRecordFile(dir, vmmRecord{
 		SandboxID: sandboxID, PID: pid, StartTicks: ticks, BootID: boot,
 		APISocket: handle.APISocket(), RunDir: handle.RunDir(), VsockCID: guestCID,
 		OwnsRunDir: ownsRunDir,
 	})
+}
+
+// writeRecordFile writes rec under dir, whole or not at all.
+func writeRecordFile(dir string, rec vmmRecord) error {
+	if dir == "" {
+		return nil
+	}
+	raw, err := json.Marshal(rec)
 	if err != nil {
 		return err
 	}
@@ -159,7 +168,7 @@ func (d *Driver) writeVMMRecord(sandboxID string, handle VMMHandle, guestCID uin
 		werr = cerr
 	}
 	if werr == nil {
-		werr = os.Rename(tmp.Name(), filepath.Join(dir, sandboxID+".json"))
+		werr = os.Rename(tmp.Name(), filepath.Join(dir, rec.SandboxID+".json"))
 	}
 	if werr != nil {
 		_ = os.Remove(tmp.Name())
@@ -215,55 +224,28 @@ type VMMKeeper func(ctx context.Context, sandboxID string) (bool, error)
 
 // AdoptRunningVMs takes over the VMs a previous sandboxd left running. A VM
 // whose sandbox should still run is registered as if this sandboxd had
-// started it; any other recorded VM, and any process in the VMs' cgroup no
-// record vouches for (a warm-pool VM, a template's snapshot VM, a create
-// the restart cut short), is killed. Call it once at boot, before anything
-// creates, starts or reconciles a sandbox: reconcile reaps a started
-// sandbox whose VM the driver does not know.
+// started it; any other VM in the VMs' cgroup (a warm-pool VM, a template's
+// snapshot VM, a create the restart cut short, a stopped sandbox's) is
+// killed. Call it once at boot, before anything creates, starts or
+// reconciles a sandbox: reconcile reaps a started sandbox whose VM the
+// driver does not know.
+//
+// A VM is found by its record, or, without one, by its command line: a
+// release before records started its VMs in sandboxd's cgroup, and the
+// installer moves them out before it restarts sandboxd onto this one.
 func (d *Driver) AdoptRunningVMs(ctx context.Context, keep VMMKeeper) int {
 	boot, bootErr := hostBootID()
 	adopted := map[int]bool{}
+	recorded := map[string]bool{}
 	for _, rec := range d.readVMMRecords() {
+		recorded[rec.SandboxID] = true
 		if bootErr != nil || rec.BootID != boot {
 			d.removeVMMRecord(rec.SandboxID)
 			continue
 		}
-		proc, err := openProcess(rec.PID, rec.StartTicks)
-		if err != nil {
-			// The VM ended while sandboxd was down; reconcile handles
-			// its sandbox like any other whose VM is gone.
-			d.logger.Info("firecracker adopt: recorded VM is gone", "sandbox_id", rec.SandboxID, "error", err)
-			d.removeVMMRecord(rec.SandboxID)
-			continue
+		if d.adoptVM(ctx, rec, keep) {
+			adopted[rec.PID] = true
 		}
-		handle := &adoptedVMM{rec: rec, proc: proc, cleanupRoot: d.runDirRoot()}
-		want, err := keep(ctx, rec.SandboxID)
-		if err != nil {
-			// Unknown is not "stopped": keep the VM, and reconcile
-			// decides once the store answers.
-			d.logger.Warn("firecracker adopt: cannot tell whether a VM should run; keeping it",
-				"sandbox_id", rec.SandboxID, "error", err)
-			want = true
-		}
-		if !want {
-			d.logger.Info("firecracker adopt: stopping a VM whose sandbox is not running", "sandbox_id", rec.SandboxID)
-			_ = handle.Kill()
-			if err := handle.Cleanup(); err != nil {
-				d.logger.Warn("firecracker adopt: run dir not removed", "sandbox_id", rec.SandboxID, "error", err)
-			}
-			d.removeVMMRecord(rec.SandboxID)
-			continue
-		}
-		client := d.newClient(rec.APISocket)
-		d.resumeIfPaused(ctx, rec.SandboxID, client)
-		d.mu.Lock()
-		d.clients[rec.SandboxID] = client
-		d.vmms[rec.SandboxID] = handle
-		d.guestCID[rec.SandboxID] = rec.VsockCID
-		d.mu.Unlock()
-		d.rssRegister(rec.SandboxID, rec.PID)
-		adopted[rec.PID] = true
-		d.logger.Info("firecracker adopt: running VM taken over", "sandbox_id", rec.SandboxID, "pid", rec.PID)
 	}
 	pids, err := listVMMCgroup()
 	if err != nil {
@@ -273,6 +255,16 @@ func (d *Driver) AdoptRunningVMs(ctx context.Context, keep VMMKeeper) int {
 		if adopted[pid] {
 			continue
 		}
+		if rec, ok := d.discoverVM(ctx, pid, boot); ok && !recorded[rec.SandboxID] {
+			recorded[rec.SandboxID] = true
+			if d.adoptVM(ctx, rec, keep) {
+				adopted[pid] = true
+				if err := writeRecordFile(d.vmmRecordDir(), rec); err != nil {
+					d.logger.Warn("firecracker adopt: VM not recorded", "sandbox_id", rec.SandboxID, "error", err)
+				}
+				continue
+			}
+		}
 		if err := killStrayVMM(pid); err != nil {
 			d.logger.Warn("firecracker adopt: leftover VM not killed", "pid", pid, "error", err)
 			continue
@@ -280,6 +272,100 @@ func (d *Driver) AdoptRunningVMs(ctx context.Context, keep VMMKeeper) int {
 		d.logger.Info("firecracker adopt: killed a VM no sandbox owns", "pid", pid)
 	}
 	return len(adopted)
+}
+
+// adoptVM registers the VM rec describes if its sandbox should run, and
+// kills it otherwise. It reports whether the VM was adopted.
+func (d *Driver) adoptVM(ctx context.Context, rec vmmRecord, keep VMMKeeper) bool {
+	proc, err := openProcess(rec.PID, rec.StartTicks)
+	if err != nil {
+		// The VM ended while sandboxd was down; reconcile handles its
+		// sandbox like any other whose VM is gone.
+		d.logger.Info("firecracker adopt: recorded VM is gone", "sandbox_id", rec.SandboxID, "error", err)
+		d.removeVMMRecord(rec.SandboxID)
+		return false
+	}
+	handle := &adoptedVMM{rec: rec, proc: proc, cleanupRoot: d.runDirRoot()}
+	want, err := keep(ctx, rec.SandboxID)
+	if err != nil {
+		// Unknown is not "stopped": keep the VM, and reconcile decides
+		// once the store answers.
+		d.logger.Warn("firecracker adopt: cannot tell whether a VM should run; keeping it",
+			"sandbox_id", rec.SandboxID, "error", err)
+		want = true
+	}
+	if !want {
+		d.logger.Info("firecracker adopt: stopping a VM whose sandbox is not running", "sandbox_id", rec.SandboxID)
+		_ = handle.Kill()
+		if err := handle.Cleanup(); err != nil {
+			d.logger.Warn("firecracker adopt: run dir not removed", "sandbox_id", rec.SandboxID, "error", err)
+		}
+		d.removeVMMRecord(rec.SandboxID)
+		return false
+	}
+	client := d.newClient(rec.APISocket)
+	d.resumeIfPaused(ctx, rec.SandboxID, client)
+	d.mu.Lock()
+	d.clients[rec.SandboxID] = client
+	d.vmms[rec.SandboxID] = handle
+	d.guestCID[rec.SandboxID] = rec.VsockCID
+	d.mu.Unlock()
+	d.rssRegister(rec.SandboxID, rec.PID)
+	d.logger.Info("firecracker adopt: running VM taken over", "sandbox_id", rec.SandboxID, "pid", rec.PID)
+	return true
+}
+
+// discoverVM builds the record a VM with none would have had, from its
+// command line: the jailer starts firecracker with --id <sandbox>, and an
+// unjailed one's --api-sock is in its sandbox's run dir. The paths are the
+// ones this driver would give that sandbox, and the vsock CID is its TAP
+// slot's.
+func (d *Driver) discoverVM(ctx context.Context, pid int, boot string) (vmmRecord, bool) {
+	args, err := processCmdline(pid)
+	if err != nil {
+		return vmmRecord{}, false
+	}
+	id, ok := vmSandboxFromArgs(args, d.cfg.RunDir)
+	if !ok {
+		return vmmRecord{}, false
+	}
+	layout, err := newVMM(d.cfg, id, d.logger)
+	if err != nil {
+		return vmmRecord{}, false
+	}
+	ticks, err := processStart(pid)
+	if err != nil {
+		return vmmRecord{}, false
+	}
+	rec := vmmRecord{SandboxID: id, PID: pid, StartTicks: ticks, BootID: boot,
+		APISocket: layout.apiSocket, RunDir: layout.runDir, OwnsRunDir: true}
+	if d.pool != nil {
+		if slot, err := d.pool.Get(ctx, id); err == nil && slot != nil {
+			rec.VsockCID = slot.VsockCID
+		}
+	}
+	return rec, true
+}
+
+// vmSandboxFromArgs reads the sandbox ID off a firecracker command line.
+func vmSandboxFromArgs(args []string, runDir string) (string, bool) {
+	if len(args) == 0 || filepath.Base(args[0]) != "firecracker" {
+		return "", false
+	}
+	for i := 1; i+1 < len(args); i++ {
+		switch args[i] {
+		case "--id":
+			if validateSandboxID(args[i+1]) == nil {
+				return args[i+1], true
+			}
+		case "--api-sock":
+			dir := filepath.Dir(args[i+1])
+			if runDir != "" && filepath.Dir(dir) == filepath.Clean(runDir) && validateSandboxID(filepath.Base(dir)) == nil {
+				return filepath.Base(dir), true
+			}
+		}
+	}
+	return "", false
 }
 
 // resumeIfPaused resumes a VM a Stop paused and then never finished: the

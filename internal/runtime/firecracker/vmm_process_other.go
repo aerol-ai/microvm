@@ -15,3 +15,5 @@ func currentBootID() (string, error) { return "", errVMMAdoptionUnsupported }
 func openLiveProcess(int, uint64) (liveProcess, error) { return nil, errVMMAdoptionUnsupported }
 
 func killCgroupStray(int) error { return errVMMAdoptionUnsupported }
+
+func procCmdline(int) ([]string, error) { return nil, errVMMAdoptionUnsupported }

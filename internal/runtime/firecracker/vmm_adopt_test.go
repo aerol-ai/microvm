@@ -76,12 +76,19 @@ type vmmHost struct {
 	cgroupErr error
 	killErr   map[int]error
 	killed    []int
+	cmdlines  map[int][]string
 }
 
 func stubVMMHost(t *testing.T) *vmmHost {
 	t.Helper()
-	h := &vmmHost{boot: "boot-1", procs: map[int]*fakeProcess{}, killErr: map[int]error{}}
-	saved := []any{moveVMMToCgroup, listVMMCgroup, processStart, hostBootID, openProcess, killStrayVMM}
+	h := &vmmHost{boot: "boot-1", procs: map[int]*fakeProcess{}, killErr: map[int]error{}, cmdlines: map[int][]string{}}
+	saved := []any{moveVMMToCgroup, listVMMCgroup, processStart, hostBootID, openProcess, killStrayVMM, processCmdline}
+	processCmdline = func(pid int) ([]string, error) {
+		if args, ok := h.cmdlines[pid]; ok {
+			return args, nil
+		}
+		return nil, errors.New("no such process")
+	}
 	processStart = func(pid int) (uint64, error) {
 		if h.startErr != nil {
 			return 0, h.startErr
@@ -112,6 +119,7 @@ func stubVMMHost(t *testing.T) *vmmHost {
 		hostBootID = saved[3].(func() (string, error))
 		openProcess = saved[4].(func(int, uint64) (liveProcess, error))
 		killStrayVMM = saved[5].(func(int) error)
+		processCmdline = saved[6].(func(int) ([]string, error))
 	})
 	return h
 }
@@ -616,5 +624,104 @@ func TestRunDirRoot(t *testing.T) {
 	d.cfg.UseJailer = true
 	if d.runDirRoot() != "/srv/jailer" {
 		t.Fatal(d.runDirRoot())
+	}
+}
+
+// A VM with no record (started by a release before records, and moved out
+// of sandboxd's cgroup by the installer) is found by its command line and
+// adopted like a recorded one, then recorded.
+func TestAdoptRunningVMsDiscoversUnrecordedVMs(t *testing.T) {
+	host := stubVMMHost(t)
+	d, _, logs := adoptDriver(t)
+	d.cfg.FirecrackerBinary = "/usr/bin/firecracker"
+	pool := newFakePool()
+	d.SetPool(pool)
+	slot, err := pool.Allocate(context.Background(), "sb-old", time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	jailed := func(id string) []string {
+		return []string{"/firecracker", "--id", id, "--start-time-us", "1", "--", "--api-sock", "api.socket"}
+	}
+	host.cmdlines[301] = jailed("sb-old")
+	host.cmdlines[302] = []string{"/usr/bin/firecracker", "--api-sock", filepath.Join(d.cfg.RunDir, "sb-stopped", "api.sock")}
+	host.cmdlines[303] = []string{"/usr/bin/rclone", "mount"}
+	host.cmdlines[304] = jailed("sb-dup") // its sandbox's VM is recorded under another pid
+	for _, pid := range []int{301, 302, 303, 304, 101} {
+		host.procs[pid] = newFakeProcess(syscall.SIGKILL)
+	}
+	writeRecord(t, d, vmmRecord{SandboxID: "sb-dup", PID: 101, StartTicks: 1010, BootID: "boot-1", APISocket: "/s", VsockCID: 4})
+	host.cgroup = []int{101, 301, 302, 303, 304, 305}
+	keep := map[string]bool{"sb-old": true, "sb-dup": true}
+
+	n := d.AdoptRunningVMs(context.Background(), func(_ context.Context, id string) (bool, error) { return keep[id], nil })
+	if n != 2 {
+		t.Fatalf("adopted %d, want sb-dup by record and sb-old by its command line (%s)", n, logs)
+	}
+	rec, ok := readRecord(t, d, "sb-old")
+	want := vmmRecord{SandboxID: "sb-old", PID: 301, StartTicks: 3010, BootID: "boot-1",
+		APISocket: filepath.Join(d.cfg.RunDir, "sb-old", "api.sock"), RunDir: filepath.Join(d.cfg.RunDir, "sb-old"),
+		VsockCID: slot.VsockCID, OwnsRunDir: true}
+	if !ok || rec != want {
+		t.Fatalf("record %+v, want %+v", rec, want)
+	}
+	if d.guestCID["sb-old"] != slot.VsockCID {
+		t.Fatalf("guest CID %d", d.guestCID["sb-old"])
+	}
+	// The stopped sandbox's VM is killed through its handle, the others
+	// as strays; nothing touches the adopted ones.
+	if !reflect.DeepEqual(host.procs[302].sent(), []syscall.Signal{syscall.SIGKILL}) {
+		t.Fatalf("stopped sandbox's VM got %v", host.procs[302].sent())
+	}
+	if !reflect.DeepEqual(host.killed, []int{302, 303, 304, 305}) {
+		t.Fatalf("killed %v", host.killed)
+	}
+	if _, ok := readRecord(t, d, "sb-stopped"); ok {
+		t.Fatal("a killed VM was recorded")
+	}
+}
+
+func TestVMSandboxFromArgs(t *testing.T) {
+	run := "/run/sandboxd/firecracker"
+	for _, tc := range []struct {
+		args []string
+		want string
+	}{
+		{[]string{"/firecracker", "--id", "sb-a", "--start-time-us", "9", "--api-sock", "api.socket"}, "sb-a"},
+		{[]string{"firecracker", "--api-sock", run + "/sb-b/api.sock"}, "sb-b"},
+		{[]string{"/usr/bin/firecracker", "--api-sock", "/elsewhere/sb-c/api.sock"}, ""},
+		{[]string{"/firecracker", "--id", "../etc"}, ""},
+		{[]string{"/firecracker", "--id"}, ""},
+		{[]string{"/usr/bin/jailer", "--id", "sb-d"}, ""},
+		{nil, ""},
+	} {
+		got, ok := vmSandboxFromArgs(tc.args, run)
+		if got != tc.want || ok != (tc.want != "") {
+			t.Errorf("%v: %q, %v; want %q", tc.args, got, ok, tc.want)
+		}
+	}
+	if _, ok := vmSandboxFromArgs([]string{"firecracker", "--api-sock", "/sb-b/api.sock"}, ""); ok {
+		t.Error("an unjailed VM was placed with no run dir configured")
+	}
+}
+
+// A command line that names a sandbox the driver cannot lay out, or whose
+// start time cannot be read, is not adopted.
+func TestDiscoverVMFailures(t *testing.T) {
+	host := stubVMMHost(t)
+	d, _, _ := adoptDriver(t)
+	d.cfg.FirecrackerBinary = "/usr/bin/firecracker"
+	if _, ok := d.discoverVM(context.Background(), 9, "boot-1"); ok {
+		t.Fatal("a process with no command line was discovered")
+	}
+	host.cmdlines[9] = []string{"/firecracker", "--id", "sb-a"}
+	host.startErr = errors.New("gone")
+	if _, ok := d.discoverVM(context.Background(), 9, "boot-1"); ok {
+		t.Fatal("a process with no start time was discovered")
+	}
+	host.startErr = nil
+	d.cfg.RunDir = ""
+	if _, ok := d.discoverVM(context.Background(), 9, "boot-1"); ok {
+		t.Fatal("a VM the driver cannot lay out was discovered")
 	}
 }

@@ -267,3 +267,23 @@ func TestInVMMCgroup(t *testing.T) {
 		}
 	}
 }
+
+func TestProcCmdline(t *testing.T) {
+	args, err := procCmdline(os.Getpid())
+	if err != nil || len(args) == 0 || args[0] == "" {
+		t.Fatalf("own argv = %q, %v", args, err)
+	}
+	root := withProcRoot(t)
+	if err := os.MkdirAll(filepath.Join(root, "7"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "7", "cmdline"), []byte("/firecracker\x00--id\x00sb-a\x00"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if args, err := procCmdline(7); err != nil || !reflect.DeepEqual(args, []string{"/firecracker", "--id", "sb-a"}) {
+		t.Fatalf("argv = %q, %v", args, err)
+	}
+	if _, err := procCmdline(8); err == nil {
+		t.Fatal("a missing process was read")
+	}
+}

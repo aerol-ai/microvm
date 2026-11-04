@@ -218,3 +218,12 @@ func inVMMCgroup(procCgroup []byte) bool {
 	}
 	return false
 }
+
+// procCmdline is pid's argv.
+func procCmdline(pid int) ([]string, error) {
+	raw, err := os.ReadFile(filepath.Join(procRoot, strconv.Itoa(pid), "cmdline"))
+	if err != nil {
+		return nil, err
+	}
+	return strings.Split(strings.TrimRight(string(raw), "\x00"), "\x00"), nil
+}
