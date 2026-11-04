@@ -370,9 +370,6 @@ func TestVMMOutput(t *testing.T) {
 // The output file is cut back to its head once it outgrows its cap, and
 // appends land at the new end.
 func TestBoundVMMOutput(t *testing.T) {
-	savedMax, savedEvery := vmmOutputMax, vmmOutputCheckEvery
-	t.Cleanup(func() { vmmOutputMax, vmmOutputCheckEvery = savedMax, savedEvery })
-	vmmOutputMax, vmmOutputCheckEvery = int64(stderrTailCap+10), 5*time.Millisecond
 	out, err := openVMMOutput(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -380,7 +377,7 @@ func TestBoundVMMOutput(t *testing.T) {
 	defer out.file.Close()
 	done := make(chan struct{})
 	finished := make(chan struct{})
-	go func() { boundVMMOutput(out.path, done); close(finished) }()
+	go func() { boundOutput(out.path, done, int64(stderrTailCap+10), 5*time.Millisecond); close(finished) }()
 	if _, err := out.file.WriteString(strings.Repeat("y", stderrTailCap+100)); err != nil {
 		t.Fatal(err)
 	}

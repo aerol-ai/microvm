@@ -426,9 +426,9 @@ const vmmOutputName = "vmm.out"
 
 // vmmOutputMax bounds the output file. The guest's console writes to it for
 // as long as the VM runs; past this the file is cut back to its first
-// stderrTailCap bytes, which hold what a failed boot printed. A var for
-// tests, as is how often it is checked.
-var (
+// stderrTailCap bytes, which hold what a failed boot printed. It is checked
+// every vmmOutputCheckEvery.
+const (
 	vmmOutputMax        int64 = 256 << 10
 	vmmOutputCheckEvery       = 30 * time.Second
 )
@@ -480,14 +480,18 @@ func readOutputHead(path string) string {
 // boundVMMOutput keeps a VM's output file under vmmOutputMax until done is
 // closed (the VM exited).
 func boundVMMOutput(path string, done <-chan struct{}) {
-	t := time.NewTicker(vmmOutputCheckEvery)
+	boundOutput(path, done, vmmOutputMax, vmmOutputCheckEvery)
+}
+
+func boundOutput(path string, done <-chan struct{}, max int64, every time.Duration) {
+	t := time.NewTicker(every)
 	defer t.Stop()
 	for {
 		select {
 		case <-done:
 			return
 		case <-t.C:
-			if info, err := os.Stat(path); err == nil && info.Size() > vmmOutputMax {
+			if info, err := os.Stat(path); err == nil && info.Size() > max {
 				_ = os.Truncate(path, stderrTailCap)
 			}
 		}
