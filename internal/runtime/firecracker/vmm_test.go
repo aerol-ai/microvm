@@ -401,3 +401,46 @@ func TestBoundVMMOutput(t *testing.T) {
 	close(done)
 	<-finished
 }
+
+// A jailed VM's chroot is <base>/firecracker/<id>/root; Cleanup removes the
+// <id> dir too once it is empty, and nothing that is not the VM's own.
+func TestCleanupRemovesTheJailDir(t *testing.T) {
+	base := t.TempDir()
+	jail := filepath.Join(base, "firecracker", "sb-jail")
+	root := filepath.Join(jail, "root")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	v := &vmm{sandboxID: "sb-jail", runDir: root, cfg: Config{UseJailer: true, JailerChrootBase: base}}
+	if err := v.Cleanup(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(jail); !os.IsNotExist(err) {
+		t.Fatal("the jail dir is left")
+	}
+	// A dir holding something else, or named for another VM, stays.
+	other := filepath.Join(base, "firecracker", "sb-other")
+	if err := os.MkdirAll(filepath.Join(other, "root"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(other, "keep"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	removeJailDir(filepath.Join(other, "root"), "sb-other")
+	removeJailDir(filepath.Join(base, "firecracker", "sb-x", "root"), "sb-y")
+	if _, err := os.Stat(other); err != nil {
+		t.Fatal("a non-empty jail dir was removed")
+	}
+	// Adopted VMs clean up the same way.
+	adoptedRoot := filepath.Join(base, "firecracker", "sb-adopted", "root")
+	if err := os.MkdirAll(adoptedRoot, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	h := &adoptedVMM{rec: vmmRecord{SandboxID: "sb-adopted", RunDir: adoptedRoot, OwnsRunDir: true}, cleanupRoot: base}
+	if err := h.Cleanup(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Dir(adoptedRoot)); !os.IsNotExist(err) {
+		t.Fatal("the adopted VM's jail dir is left")
+	}
+}

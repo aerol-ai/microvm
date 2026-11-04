@@ -320,6 +320,13 @@ func (d *Driver) adoptVM(ctx context.Context, rec vmmRecord, keep VMMKeeper) boo
 	d.guestCID[rec.SandboxID] = rec.VsockCID
 	d.mu.Unlock()
 	d.rssRegister(rec.SandboxID, rec.PID)
+	// The sandboxd that died may have frozen the guest's disk (a snapshot's
+	// copy, or a Stop it never finished), and no one else will ever thaw
+	// it. Not waited for: an unresponsive guest must not hold up the boot,
+	// and its own timer thaws it in the end.
+	if d.vsockDial != nil {
+		go d.thawGuest(rec.SandboxID, filepath.Join(rec.RunDir, hostVsockUDSName), rec.VsockCID)
+	}
 	d.logger.Info("firecracker adopt: running VM taken over", "sandbox_id", rec.SandboxID, "pid", rec.PID)
 	return true
 }
@@ -488,5 +495,9 @@ func (h *adoptedVMM) Cleanup() error {
 	if h.cleanupRoot == "" || !strings.HasPrefix(h.rec.RunDir, h.cleanupRoot+string(filepath.Separator)) {
 		return fmt.Errorf("vmm: refusing to clean up path outside %q: %s", h.cleanupRoot, h.rec.RunDir)
 	}
-	return os.RemoveAll(h.rec.RunDir)
+	if err := os.RemoveAll(h.rec.RunDir); err != nil {
+		return err
+	}
+	removeJailDir(h.rec.RunDir, h.rec.SandboxID)
+	return nil
 }

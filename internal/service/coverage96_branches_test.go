@@ -2734,10 +2734,7 @@ func TestCB96TemplatePushOneStateFaults(t *testing.T) {
 		t.Fatalf("nil template = %v", got)
 	}
 
-	fs.stateErr = map[string]error{
-		models.TemplatePushStateActive:  errors.New("active refused"),
-		models.TemplatePushStatePushing: errors.New("claim refused"),
-	}
+	fs.releaseErr = map[string]error{models.TemplatePushStateActive: errors.New("active refused")}
 	unhealthy := &models.Template{ID: "cb96-unhealthy", Status: models.TemplateStatusUnhealthy, PushState: models.TemplatePushStatePending}
 	fs.seed(unhealthy)
 	if got := rec.pushOne(ctx, unhealthy); got != templatePushSkipped {
@@ -2745,18 +2742,22 @@ func TestCB96TemplatePushOneStateFaults(t *testing.T) {
 	}
 	ready := &models.Template{ID: "cb96-ready", Image: "img:1", Status: models.TemplateStatusReady, PushState: models.TemplatePushStatePending}
 	fs.seed(ready)
+	fs.claimErr = errors.New("claim refused")
 	if got := rec.pushOne(ctx, ready); got != templatePushFailed {
 		t.Fatalf("unclaimable template = %v", got)
 	}
+	fs.claimErr = nil
 
-	fs.stateErr = map[string]error{models.TemplatePushStateError: errors.New("error state refused")}
+	fs.releaseErr = map[string]error{models.TemplatePushStateError: errors.New("error state refused")}
 	if got := rec.pushOne(ctx, ready); got != templatePushFailed {
 		t.Fatalf("template without artifacts = %v", got)
 	}
 
+	// A completion whose claim is gone is not a success, and the seam
+	// marks nothing dirty for it.
 	seam := (&Service{}).TemplatePushStore(fs)
-	if err := seam.UpdateTemplatePushDistribution(ctx, "cb96-missing", "ref", "digest"); err == nil {
-		t.Fatal("seam swallowed a distribution write failure")
+	if applied, err := seam.CompleteTemplatePush(ctx, "cb96-missing", time.Now(), "ref", "digest"); err != nil || applied {
+		t.Fatalf("seam completion of a missing row = %v, %v", applied, err)
 	}
 }
 

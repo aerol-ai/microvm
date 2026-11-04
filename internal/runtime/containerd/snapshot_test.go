@@ -140,6 +140,9 @@ func TestRawSnapshotBackendWithoutLiveClient(t *testing.T) {
 	if _, err := b.getImage(context.Background(), "x"); err == nil {
 		t.Fatal("want live error")
 	}
+	if err := b.deleteImage(context.Background(), "x"); err == nil {
+		t.Fatal("want live error")
+	}
 }
 
 func TestNilClientContentAccessors(t *testing.T) {
@@ -180,6 +183,9 @@ type fakeSnapshotBackend struct {
 	updateErr     error
 	exported      string
 	exportErr     error
+	// deleted records every image record deleteImage removed.
+	deleted   []string
+	deleteErr error
 	// writeBlobFailAt fails only that write (1-based) when writeBlobErr is set.
 	writeBlobFailAt int
 	blobWrites      int
@@ -210,6 +216,14 @@ func (f *fakeSnapshotBackend) exportImage(_ context.Context, name string, w io.W
 	}
 	_, err := io.WriteString(w, "oci-archive:"+name)
 	return err
+}
+
+func (f *fakeSnapshotBackend) deleteImage(_ context.Context, name string) error {
+	if f.deleteErr != nil {
+		return f.deleteErr
+	}
+	f.deleted = append(f.deleted, name)
+	return nil
 }
 
 // memLayerWriter is an in-memory content.Writer stand-in for gzipLayer.

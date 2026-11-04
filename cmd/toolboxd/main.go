@@ -200,6 +200,12 @@ func main() {
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{}))
 
+	// The init of a snapshot export helper VM, not a sandbox's agent
+	// (export_helper.go).
+	if exportHelperRequested(os.Getpid(), os.Getenv) {
+		os.Exit(runExportHelper(logger))
+	}
+
 	srv := &server{
 		logger:       logger,
 		sandboxID:    readSandboxID(),

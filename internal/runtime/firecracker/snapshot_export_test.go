@@ -12,14 +12,13 @@ import (
 	"sync"
 	"testing"
 
-	"golang.org/x/sys/unix"
-
 	"github.com/aerol-ai/microvm/pkg/models"
 )
 
 // A Firecracker snapshot is the stopped sandbox's root filesystem as a
 // one-layer image in the node's image store. These tests stand in for the
-// loop mount with a directory tree, and for the image store with a recorder.
+// helper VM that reads the disk with exportGuest, and for the image store
+// with a recorder.
 
 // recordingImageStore is an ImageStore that keeps what it was given.
 type recordingImageStore struct {
@@ -57,27 +56,6 @@ func (s *recordingImageStore) OpenImage(_ context.Context, ref string) (string, 
 		return "", nil, false, nil
 	}
 	return src, func() { s.mu.Lock(); s.released++; s.mu.Unlock() }, true, nil
-}
-
-// treeMounter "mounts" by filling dir with a guest filesystem.
-type treeMounter struct {
-	fill       func(t *testing.T, dir string)
-	t          *testing.T
-	err        error
-	unmountErr error
-	image      string
-	unmounted  bool
-}
-
-func (m *treeMounter) Mount(_ context.Context, image, dir string) (func() error, error) {
-	m.image = image
-	if m.err != nil {
-		return nil, m.err
-	}
-	if m.fill != nil {
-		m.fill(m.t, dir)
-	}
-	return func() error { m.unmounted = true; return m.unmountErr }, nil
 }
 
 func writeGuestFile(t *testing.T, root, guestPath, content string) {
@@ -132,22 +110,23 @@ func tarEntries(t *testing.T, data []byte) (map[string]*tar.Header, map[string]s
 }
 
 // stoppedSandboxForSnapshot creates and stops a sandbox (the guest acks
-// sync_fs) and wires an image store and a tree mounter.
-func stoppedSandboxForSnapshot(t *testing.T, id string) (*driverFixture, *recordingImageStore, *treeMounter) {
+// freeze_fs) and wires an image store and the helper VM stand-in, which
+// reads guestTree off the disk copy.
+func stoppedSandboxForSnapshot(t *testing.T, id string) (*driverFixture, *recordingImageStore, *exportGuest) {
 	t.Helper()
 	f := stoppedFixtureSandbox(t, id)
 	if err := f.driver.Stop(context.Background(), id); err != nil {
 		t.Fatalf("Stop: %v", err)
 	}
 	store := &recordingImageStore{}
-	mounter := &treeMounter{fill: guestTree, t: t}
+	guest := &exportGuest{t: t, fill: guestTree}
 	f.driver.SetImageStore(store)
-	f.driver.SetDiskMounter(mounter)
-	return f, store, mounter
+	guest.install(f)
+	return f, store, guest
 }
 
 func TestCreateSnapshotExportsTheStoppedDisk(t *testing.T) {
-	f, store, mounter := stoppedSandboxForSnapshot(t, "sb-snap")
+	f, store, guest := stoppedSandboxForSnapshot(t, "sb-snap")
 	_, _, _, saved, _, _ := f.driver.sandboxSnapshotPaths("sb-snap")
 	savedBefore, err := os.ReadFile(saved)
 	if err != nil {
@@ -161,15 +140,16 @@ func TestCreateSnapshotExportsTheStoppedDisk(t *testing.T) {
 	if id != "sha256:img-aerolvm-snapshot/abc:latest" {
 		t.Fatalf("id = %q, want the store's image ID", id)
 	}
-	// It mounted a copy; Start still restores from the untouched saved disk.
-	if mounter.image == saved || filepath.Base(mounter.image) != rootfsFileName {
-		t.Fatalf("mounted %q, want a copy of the saved disk, not %q itself", mounter.image, saved)
+	// The helper VM read a copy; Start still restores from the untouched
+	// saved disk.
+	if disk := guest.lastClient().drives[exportDriveID].PathOnHost; disk == saved || len(guest.disks) != 1 || !bytes.Equal(guest.disks[0], savedBefore) {
+		t.Fatalf("the helper read %q, want a copy of the saved disk, not %q itself", disk, saved)
 	}
 	if after, _ := os.ReadFile(saved); !bytes.Equal(after, savedBefore) {
 		t.Fatal("the saved disk changed")
 	}
-	if !mounter.unmounted {
-		t.Fatal("the export mount was not removed")
+	if vm := guest.vms[0]; !vm.shutdown || !vm.cleaned {
+		t.Fatal("the helper VM was left")
 	}
 
 	headers, contents := tarEntries(t, store.imported["aerolvm-snapshot/abc:latest"])
@@ -216,12 +196,12 @@ func TestCreateSnapshotRefusesWhatItCannotSnapshot(t *testing.T) {
 			t.Fatalf("err = %v, want a 409", err)
 		}
 	})
-	// An agent from before sync_fs can never flush: it is the sandbox's
+	// An agent from before freeze_fs can never freeze: it is the sandbox's
 	// agent for life, so the 409 must not suggest a restart.
 	t.Run("a disk an older agent cannot flush", func(t *testing.T) {
 		f := stoppedFixtureSandbox(t, "sb-old")
 		f.vsock.mu.Lock()
-		f.vsock.guestRespOk, f.vsock.guestError = false, `unknown op \"sync_fs\"`
+		f.vsock.guestRespOk, f.vsock.guestError = false, `unknown op \"freeze_fs\"`
 		f.vsock.mu.Unlock()
 		if err := f.driver.Stop(context.Background(), "sb-old"); err != nil {
 			t.Fatal(err)
@@ -233,11 +213,11 @@ func TestCreateSnapshotRefusesWhatItCannotSnapshot(t *testing.T) {
 			t.Fatalf("err = %v, want a 409 that says the sandbox is too old, not to restart it", err)
 		}
 	})
-	// A current agent whose flush failed will flush on a later Stop.
+	// A current agent whose freeze failed will freeze on a later Stop.
 	t.Run("a disk whose flush failed", func(t *testing.T) {
 		f := stoppedFixtureSandbox(t, "sb-noflush")
 		f.vsock.mu.Lock()
-		f.vsock.guestRespOk, f.vsock.guestError = false, "sync filesystems: EIO"
+		f.vsock.guestRespOk, f.vsock.guestError = false, "freeze root filesystem: EIO"
 		f.vsock.mu.Unlock()
 		if err := f.driver.Stop(context.Background(), "sb-noflush"); err != nil {
 			t.Fatal(err)
@@ -265,28 +245,31 @@ func TestCreateSnapshotRefusesWhatItCannotSnapshot(t *testing.T) {
 
 func TestCreateSnapshotFailures(t *testing.T) {
 	boom := errors.New("boom")
-	t.Run("mount", func(t *testing.T) {
-		f, _, mounter := stoppedSandboxForSnapshot(t, "sb-mnt")
-		mounter.err = boom
-		if _, err := f.driver.CreateSnapshot(context.Background(), "sb-mnt", "r:1"); err == nil || !strings.Contains(err.Error(), "mount disk copy") {
-			t.Fatalf("err = %v", err)
-		}
-	})
 	t.Run("import", func(t *testing.T) {
-		f, store, mounter := stoppedSandboxForSnapshot(t, "sb-imp")
+		f, store, guest := stoppedSandboxForSnapshot(t, "sb-imp")
 		store.importErr = boom
 		if _, err := f.driver.CreateSnapshot(context.Background(), "sb-imp", "r:1"); err == nil || !strings.Contains(err.Error(), "import image") {
 			t.Fatalf("err = %v", err)
 		}
-		if !mounter.unmounted {
-			t.Fatal("a failed import left the mount")
+		if vm := guest.vms[0]; !vm.shutdown || !vm.cleaned {
+			t.Fatal("a failed import left the helper VM")
 		}
 	})
-	t.Run("a failed unmount is only logged", func(t *testing.T) {
-		f, _, mounter := stoppedSandboxForSnapshot(t, "sb-umnt")
-		mounter.unmountErr = boom
-		if _, err := f.driver.CreateSnapshot(context.Background(), "sb-umnt", "r:1"); err != nil {
+	t.Run("a helper dir that will not go is only logged", func(t *testing.T) {
+		f, _, guest := stoppedSandboxForSnapshot(t, "sb-stays")
+		guest.vmHook = func(vm *fakeVMM) { vm.cleanupErr = boom }
+		if _, err := f.driver.CreateSnapshot(context.Background(), "sb-stays", "r:1"); err != nil {
 			t.Fatalf("err = %v, want the snapshot to stand", err)
+		}
+	})
+	t.Run("a helper that will not stop is killed", func(t *testing.T) {
+		f, _, guest := stoppedSandboxForSnapshot(t, "sb-kill")
+		guest.vmHook = func(vm *fakeVMM) { vm.shutdownErr = boom }
+		if _, err := f.driver.CreateSnapshot(context.Background(), "sb-kill", "r:1"); err != nil {
+			t.Fatal(err)
+		}
+		if !guest.vms[0].shutdown {
+			t.Fatal("not killed")
 		}
 	})
 	t.Run("a corrupt manifest", func(t *testing.T) {
@@ -311,28 +294,6 @@ func TestCreateSnapshotFailures(t *testing.T) {
 	})
 }
 
-func TestWriteRootfsTarKeepsExtendedAttributes(t *testing.T) {
-	root := t.TempDir()
-	writeGuestFile(t, root, "/usr/bin/ping", "elf")
-	if err := unix.Lsetxattr(filepath.Join(root, "usr/bin/ping"), "user.aerolvm-test", []byte("cap"), 0); err != nil {
-		t.Skipf("this filesystem keeps no user xattrs: %v", err)
-	}
-	var buf bytes.Buffer
-	if err := writeRootfsTar(&buf, root); err != nil {
-		t.Fatal(err)
-	}
-	headers, _ := tarEntries(t, buf.Bytes())
-	if got := headers["usr/bin/ping"].PAXRecords["SCHILY.xattr.user.aerolvm-test"]; got != "cap" {
-		t.Fatalf("xattr in tar = %q, want cap", got)
-	}
-}
-
-func TestWriteRootfsTarFailsOnAMissingRoot(t *testing.T) {
-	if err := writeRootfsTar(io.Discard, filepath.Join(t.TempDir(), "missing")); err == nil {
-		t.Fatal("a missing root gave no error")
-	}
-}
-
 func TestSweepSnapshotExportsRemovesLeftovers(t *testing.T) {
 	f := newDriverFixture(t)
 	base, err := f.driver.sandboxSnapshotBase()
@@ -340,12 +301,39 @@ func TestSweepSnapshotExportsRemovesLeftovers(t *testing.T) {
 		t.Fatal(err)
 	}
 	dir := filepath.Join(filepath.Dir(base), snapshotExportDirName)
-	writeGuestFile(t, filepath.Join(dir, "sb-crashed-123", "mnt"), "/etc/passwd", "root:x:0:0")
+	writeGuestFile(t, filepath.Join(dir, "sb-crashed-123"), "/export.ext4", "disk")
 	writeGuestFile(t, dir, "/image-9.tar", "archive")
+	// A helper VM's run dir, and a sandbox's, which stays.
+	writeGuestFile(t, filepath.Join(f.runDir, exportHelperIDPrefix+"ab12"), "/export.ext4", "disk")
+	writeGuestFile(t, filepath.Join(f.runDir, "sb-running"), "/rootfs.ext4", "disk")
 	f.driver.SweepSnapshotExports()
 	if left, _ := os.ReadDir(dir); len(left) != 0 {
 		t.Fatalf("left after the sweep: %v", left)
 	}
+	if _, err := os.Stat(filepath.Join(f.runDir, exportHelperIDPrefix+"ab12")); !os.IsNotExist(err) {
+		t.Fatal("the helper's run dir is left")
+	}
+	if _, err := os.Stat(filepath.Join(f.runDir, "sb-running", "rootfs.ext4")); err != nil {
+		t.Fatal("the sweep removed a sandbox's run dir")
+	}
 	// Nothing to sweep is fine.
 	f.driver.SweepSnapshotExports()
+}
+
+// Jailed, a helper's dir is a chroot under the jailer base.
+func TestSweepSnapshotExportsRemovesJailedHelpers(t *testing.T) {
+	f := newDriverFixture(t)
+	f.driver.cfg.UseJailer = true
+	f.driver.cfg.JailerChrootBase = t.TempDir()
+	helper := filepath.Join(f.driver.cfg.JailerChrootBase, "firecracker", exportHelperIDPrefix+"cd34")
+	sandbox := filepath.Join(f.driver.cfg.JailerChrootBase, "firecracker", "sb-live")
+	writeGuestFile(t, helper, "/root/export.ext4", "disk")
+	writeGuestFile(t, sandbox, "/root/rootfs.ext4", "disk")
+	f.driver.SweepSnapshotExports()
+	if _, err := os.Stat(helper); !os.IsNotExist(err) {
+		t.Fatal("the jailed helper's chroot is left")
+	}
+	if _, err := os.Stat(sandbox); err != nil {
+		t.Fatal("the sweep removed a sandbox's chroot")
+	}
 }

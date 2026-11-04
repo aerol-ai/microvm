@@ -294,8 +294,9 @@ A Firecracker sandbox is saved the same way, running or stopped. A running one k
 
 - **Running or stopped.** A running sandbox's writes wait for the copy, about a second for a small sandbox and longer for a big disk (roughly 15 seconds per GB of data on standard cloud disks). Reads, programs and the network carry on. To never pause it, use [`allowPause: false`](#keep-a-sandbox-from-pausing).
 - **In a cluster it moves like any snapshot.** When the cluster pushes snapshots to its registry, a Firecracker snapshot is pushed too, and any server can start it.
-- **Created by an older release?** A sandbox created before this release runs an older agent inside, which cannot flush or pause its disk. Its snapshot is refused with `created by an older release`, and restarting it does not help, because a restart keeps the same agent. Create a new sandbox on this release to take snapshots.
-- **Refused with `start it and stop it again`?** The disk was not flushed the last time the sandbox stopped. Start it and stop it again, or save it while it runs.
+- **Created by an older release?** A sandbox created before this release runs an older agent inside, which cannot pause its disk. Its snapshot is refused with `created by an older release`, and restarting it does not help, because a restart keeps the same agent. Create a new sandbox on this release to take snapshots.
+- **Refused with `start it and stop it again`?** The sandbox's disk could not be paused the last time it stopped, so the saved disk may miss its last writes. Start it and stop it again, or save it while it runs.
+- **The server never opens the disk itself.** A small helper VM reads the copy of the disk and sends its files back, so a disk a program inside the sandbox damaged or crafted cannot reach the server's own kernel. It adds about a second to each snapshot.
 - **It saves the disk, not the memory.** Running programs are not saved, and neither are the variables you passed in `env`: they live in the VM's memory only. Neither is the optional extra data disk a Firecracker sandbox can have; keep data that must outlive the sandbox in [attached cloud storage](/external-storage/).
 - **Starting from it boots the VM.** It takes a few seconds, like any Firecracker sandbox started from an image. For starts under 100 ms, use a [template](#firecracker-use-a-template).
 
