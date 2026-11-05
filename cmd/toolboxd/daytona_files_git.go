@@ -593,6 +593,13 @@ func writeFilesystemError(w http.ResponseWriter, err error) {
 		status = http.StatusNotFound
 	case errors.Is(err, os.ErrPermission):
 		status = http.StatusForbidden
+	case errors.Is(err, syscall.ENOTDIR), errors.Is(err, syscall.EISDIR), errors.Is(err, syscall.ENOTEMPTY), errors.Is(err, os.ErrExist):
+		// The path is the wrong kind (file vs folder) or already taken.
+		status = http.StatusConflict
+	case errors.Is(err, syscall.ENOSPC), errors.Is(err, syscall.EDQUOT):
+		// A full sandbox disk is not a toolboxd fault; say so plainly.
+		writeError(w, http.StatusInsufficientStorage, "sandbox disk is full: "+err.Error())
+		return
 	}
 	writeError(w, status, err.Error())
 }

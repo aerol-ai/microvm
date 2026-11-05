@@ -461,6 +461,7 @@ func (s *server) routes() http.Handler {
 				return
 			}
 			if !s.handleEnvdRoute(w, r) {
+				markRouteMissing(w)
 				writeEnvdError(w, http.StatusNotFound, "not found")
 			}
 		case r.Method == http.MethodPost && r.URL.Path == "/process/execute":
@@ -488,7 +489,7 @@ func (s *server) routes() http.Handler {
 				return
 			}
 			if !s.handleDaytonaProcessRoute(w, r) {
-				writeError(w, http.StatusNotFound, "not found")
+				writeRouteNotFound(w)
 			}
 		case r.Method == http.MethodPost && r.URL.Path == "/files/upload":
 			if !s.requireAuth(w, r) {
@@ -515,6 +516,36 @@ func (s *server) routes() http.Handler {
 				return
 			}
 			s.handleDaytonaMoveFile(w, r)
+		case r.Method == http.MethodDelete && r.URL.Path == "/files":
+			if !s.requireAuth(w, r) {
+				return
+			}
+			s.handleDaytonaDeleteFile(w, r)
+		case r.Method == http.MethodPost && r.URL.Path == "/files/folder":
+			if !s.requireAuth(w, r) {
+				return
+			}
+			s.handleDaytonaCreateFolder(w, r)
+		case r.Method == http.MethodPost && r.URL.Path == "/files/replace":
+			if !s.requireAuth(w, r) {
+				return
+			}
+			s.handleDaytonaReplaceInFiles(w, r)
+		case r.Method == http.MethodPost && r.URL.Path == "/files/permissions":
+			if !s.requireAuth(w, r) {
+				return
+			}
+			s.handleDaytonaSetPermissions(w, r)
+		case isDaytonaLSPPath(r.URL.Path):
+			if !s.requireAuth(w, r) {
+				return
+			}
+			writeError(w, http.StatusNotImplemented, errDaytonaLSPUnsupported)
+		case isDaytonaPTYPath(r.URL.Path):
+			if !s.requireAuth(w, r) {
+				return
+			}
+			writeError(w, http.StatusNotImplemented, errDaytonaPTYUnsupported)
 		case r.Method == http.MethodGet && r.URL.Path == "/files/search":
 			if !s.requireAuth(w, r) {
 				return
@@ -530,7 +561,7 @@ func (s *server) routes() http.Handler {
 				return
 			}
 			if !s.handleDaytonaGitRoute(w, r) {
-				writeError(w, http.StatusNotFound, "not found")
+				writeRouteNotFound(w)
 			}
 		case r.Method == http.MethodPost && r.URL.Path == "/admin/allowed-ports":
 			if !s.requireAuth(w, r) {
@@ -547,12 +578,27 @@ func (s *server) routes() http.Handler {
 				return
 			}
 			if !s.handleSessionsRoute(w, r) {
-				writeError(w, http.StatusNotFound, "not found")
+				writeRouteNotFound(w)
 			}
 		default:
-			writeError(w, http.StatusNotFound, "not found")
+			writeRouteNotFound(w)
 		}
 	})
+}
+
+// routeMissingHeader marks a 404 that means "toolboxd has no such route", as
+// opposed to a route that answered 404 for a missing file or session. The
+// facade route inventory test (plan X2) uses it to prove every path a facade
+// forwards really exists here.
+const routeMissingHeader = "X-Toolbox-Route"
+
+func markRouteMissing(w http.ResponseWriter) {
+	w.Header().Set(routeMissingHeader, "none")
+}
+
+func writeRouteNotFound(w http.ResponseWriter) {
+	markRouteMissing(w)
+	writeError(w, http.StatusNotFound, "not found")
 }
 
 func (s *server) stripSandboxPrefix(r *http.Request) *http.Request {

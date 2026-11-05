@@ -119,9 +119,34 @@ func (h *Host) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		if !h.handleSessionsRoute(w, r) {
 			writeError(w, http.StatusNotFound, "not found")
 		}
+	case isUnsupportedWasmToolboxRoute(r):
+		// Routes the Daytona facade forwards that a WASM sandbox has no
+		// filesystem or terminal for. A 501 with a reason, not the default
+		// 404, which reads as a bug (plan B1).
+		if !h.requireAuth(w, r) {
+			return
+		}
+		writeError(w, http.StatusNotImplemented, "not supported on WASM sandboxes")
 	default:
 		writeError(w, http.StatusNotFound, "not found")
 	}
+}
+
+// isUnsupportedWasmToolboxRoute lists the toolbox routes toolboxd serves for
+// container and VM sandboxes but the WASM host does not.
+func isUnsupportedWasmToolboxRoute(r *http.Request) bool {
+	path := r.URL.Path
+	switch {
+	case r.Method == http.MethodDelete && path == "/files":
+		return true
+	case r.Method == http.MethodPost && (path == "/files/folder" || path == "/files/replace" || path == "/files/permissions"):
+		return true
+	case path == "/lsp" || strings.HasPrefix(path, "/lsp/"):
+		return true
+	case path == "/process/pty" || strings.HasPrefix(path, "/process/pty/"):
+		return true
+	}
+	return false
 }
 
 func (h *Host) requireAuth(w http.ResponseWriter, r *http.Request) bool {

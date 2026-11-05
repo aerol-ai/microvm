@@ -946,6 +946,8 @@ var Registry = []UseCase{
 	// Firecracker snapshots across nodes (fc_snapshot_cross_node_test.go):
 	// CreateSnapshot answered 501 for Firecracker until PR #911.
 	{ID: "UC-368", Title: "Firecracker snapshot on another node: a snapshot of a running Firecracker sandbox is refused with 409; once stopped, its snapshot is pushed to the cluster registry, outlives the source, and boots, in each direction across two Firecracker nodes, as a Firecracker sandbox and as a container on the node that did not take it, with the same data, hard link, symlink and nested file, and without the source's toolbox token file", Requires: []Capability{CapCluster, CapFirecracker}, Implemented: true},
+	// Agent-sandbox parity (parity_test.go; plans/agent-sandbox-feature-parity.md).
+	{ID: "UC-369", Title: "Daytona SDK file calls that used to 404 work live: createFolder with a mode, replaceInFiles as plain text with a per-file result, setFilePermissions, and deleteFile (a folder only with recursive=true); language servers and Daytona terminals answer a clear 501", Implemented: true},
 }
 
 // byID is a lookup built once for the report generator.
