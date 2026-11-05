@@ -1,5 +1,11 @@
 # AerolVM on Kubernetes, explained simply
 
+> **Note (2026-11-05).** The current plan is
+> [`kubernetes-v2-architecture.md`](kubernetes-v2-architecture.md). This guide
+> explains the earlier design. Its husk-pod phase (section 9b) is withdrawn,
+> and the worker no longer uses the machine's own containerd, network or
+> folders.
+
 **What this is:** a plain-language guide to how AerolVM would run inside
 Kubernetes, installed with Helm. It explains the design in
 [`kubernetes-deployment.md`](kubernetes-deployment.md) (PR #522). Read this
