@@ -1,5 +1,11 @@
 # Kubernetes deployment — run AerolVM on, and serve the Kubernetes Sandbox API from, Kubernetes
 
+> **Superseded in part (2026-11-05).** The design in sections 2 to 5 is
+> replaced by [`kubernetes-v2-architecture.md`](kubernetes-v2-architecture.md).
+> Husk pods (D4.1, D7) are withdrawn. The license gate (D9) is obsolete,
+> because PR #223 closed unmerged. D2, D5 and D12 are revised by K11 there.
+> Its section 2 lists which other decisions are kept.
+
 **Status:** CEO-REVIEWED (2026-09-30, SCOPE EXPANSION). Not eng-reviewed.
 Nothing below is built. Decisions D2–D14 from the review are binding and listed
 in §0; `/plan-eng-review` is the next required gate.

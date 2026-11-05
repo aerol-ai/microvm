@@ -1,5 +1,12 @@
 # AerolVM on Kubernetes (EKS and AKS): the complete guide
 
+> **Note (2026-11-05).** Section 10 (the worker DaemonSet, its rights list and
+> its traps) describes the earlier design. The new plan,
+> [`kubernetes-v2-architecture.md`](kubernetes-v2-architecture.md), replaces
+> it with one self-contained worker pod per machine that touches nothing on
+> the machine outside the pod. Most other sections still hold. Where the two
+> differ, the new plan wins.
+
 **Who this is for:** anyone who wants to understand, from the ground up, how
 AerolVM would run inside a bank's Kubernetes cluster on Amazon EKS or Azure
 AKS. It assumes you know what a server is and what a container is. Everything
