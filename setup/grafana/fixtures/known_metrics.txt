@@ -142,3 +142,4 @@ aerolvm_key_store_calls_total
 aerolvm_key_store_call_seconds_bucket
 aerolvm_key_store_limiter_wait_seconds_bucket
 aerolvm_server_key_rows
+aerolvm_toolbox_calls_total

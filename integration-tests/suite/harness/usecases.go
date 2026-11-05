@@ -950,6 +950,7 @@ var Registry = []UseCase{
 	{ID: "UC-369", Title: "Daytona SDK file calls that used to 404 work live: createFolder with a mode, replaceInFiles as plain text with a per-file result, setFilePermissions, and deleteFile (a folder only with recursive=true); language servers and Daytona terminals answer a clear 501", Implemented: true},
 	{ID: "UC-370", Title: "exec returns when the command ends: a background job keeps running and does not hold up the reply; a timeout stops the whole process group and reports timed_out; Daytona executeCommand behaves the same", Implemented: true},
 	{ID: "UC-371", Title: "exec on gVisor returns when the command ends, keeps background jobs running and stops the whole group on a timeout", Requires: []Capability{CapGvisor}, Implemented: true},
+	{ID: "UC-372", Title: "sandboxd counts toolbox calls by API, feature and result: a Daytona language-server call shows as daytona/lsp/501 and a v1 exec as v1/exec/2xx in aerolvm_toolbox_calls_total", Implemented: true},
 }
 
 // byID is a lookup built once for the report generator.

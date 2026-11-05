@@ -34,12 +34,18 @@ func (s *Service) ServeToolboxReverseProxy(ctx context.Context, sandboxID string
 	// this request or is what the read sees.
 	callCtx, release := s.TrackToolboxCall(ctx, sandboxID)
 	defer release()
-	err := s.serveToolboxReverseProxy(ctx, callCtx, sandboxID, w, r, path)
+	rec := NewToolboxStatusRecorder(w)
+	err := s.serveToolboxReverseProxy(ctx, callCtx, sandboxID, rec, r, path)
 	if err != nil {
 		if stopped := toolboxCallEnded(callCtx); stopped != nil {
-			return stopped
+			err = stopped
 		}
 	}
+	status := rec.Status()
+	if status == 0 && err != nil {
+		status = toolboxErrorStatus(err)
+	}
+	RecordToolboxCall(ctx, path, status)
 	return err
 }
 
@@ -204,10 +210,12 @@ func (s *Service) RoundTripToolbox(ctx context.Context, sandboxID, method, path 
 		stopped := toolboxCallEnded(callCtx)
 		release()
 		if stopped != nil {
-			return nil, stopped
+			err = stopped
 		}
+		RecordToolboxCall(ctx, path, toolboxErrorStatus(err))
 		return nil, err
 	}
+	RecordToolboxCall(ctx, path, resp.StatusCode)
 	if !held {
 		release()
 		return resp, nil

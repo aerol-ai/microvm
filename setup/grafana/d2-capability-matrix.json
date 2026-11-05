@@ -214,6 +214,26 @@
       ],
       "title": "Create Activity by Node",
       "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "description": "Toolbox calls through every API (key: v1, daytona, e2b, runloop) by feature (key2: files, watch, exec, exec_stream, sessions, pty, lsp, other) and result (key3: 2xx, 4xx, 501, 5xx). A new 4xx or 5xx after a release means a feature broke; 501s show which unsupported features callers try.",
+      "fieldConfig": { "defaults": { "unit": "reqps" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 25 },
+      "id": 6,
+      "options": {
+        "legend": { "displayMode": "table", "placement": "right" },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "expr": "sum by (key, key2, key3) (rate(aerolvm_toolbox_calls_total[5m]))",
+          "legendFormat": "{{key}} {{key2}} {{key3}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Toolbox Calls by API, Feature and Result",
+      "type": "timeseries"
     }
   ],
   "refresh": "10s",
@@ -224,5 +244,5 @@
   "timezone": "browser",
   "title": "D2 Capability Matrix",
   "uid": "aerolvm-d2-capability",
-  "version": 3
+  "version": 4
 }

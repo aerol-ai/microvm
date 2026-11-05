@@ -63,6 +63,7 @@ func (h *handlers) runtimeProxy(w http.ResponseWriter, r *http.Request) {
 		r.Header.Del("X-E2B-User-Authorization")
 	}
 	r.Header.Set("X-E2B-Sandbox-Id", sandboxID)
+	r = r.WithContext(service.WithToolboxSurface(r.Context(), service.ToolboxSurfaceE2B))
 
 	if sandbox.Runtime == models.RuntimeWasm {
 		if err := h.deps.Service.ServeToolboxReverseProxy(r.Context(), sandboxID, w, r, toolboxPath); err != nil {
@@ -119,5 +120,9 @@ func (h *handlers) runtimeProxy(w http.ResponseWriter, r *http.Request) {
 		}
 		WriteError(w, http.StatusBadGateway, "Sandbox runtime unavailable")
 	}
-	proxy.ServeHTTP(w, r.WithContext(callCtx))
+	// This proxy bypasses the service's toolbox proxy, so it counts its own
+	// calls (O4).
+	rec := service.NewToolboxStatusRecorder(w)
+	proxy.ServeHTTP(rec, r.WithContext(callCtx))
+	service.RecordToolboxCall(r.Context(), toolboxPath, rec.Status())
 }

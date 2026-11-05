@@ -189,3 +189,46 @@ func TestParityExecReturnsWithBackgroundJobGvisor(t *testing.T) {
 	waitRunning(t, sb)
 	assertExecReturnsWithBackgroundJob(t, sb)
 }
+
+// UC-372 — sandboxd counts toolbox calls by API, feature and result (plan
+// O4): a Daytona language-server call shows as daytona/lsp/501 and a v1
+// exec as v1/exec/2xx, summed over every node.
+func TestParityToolboxCallCounter(t *testing.T) {
+	harness.Require(t, sc, "UC-372")
+	targets := harness.LoadIntegrationTargets()
+	bases := map[string]string{}
+	for _, node := range targets.Nodes {
+		bases[node.Name] = nodeBase(t, node)
+	}
+	sum := func(labels map[string]string) float64 {
+		total := 0.0
+		for _, base := range bases {
+			total += harness.MetricValueOrZero(nodeMetrics(t, base), "aerolvm_toolbox_calls_total", labels)
+		}
+		return total
+	}
+	lspLabels := map[string]string{"key": "daytona", "key2": "lsp", "key3": "501"}
+	execLabels := map[string]string{"key": "v1", "key2": "exec", "key3": "2xx"}
+	lspBefore, execBefore := sum(lspLabels), sum(execLabels)
+
+	sb := paritySandbox(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	if st, body := daytonaToolbox(t, ctx, http.MethodPost, sb.ID, "/lsp/start", nil, map[string]any{}); st != http.StatusNotImplemented {
+		t.Fatalf("lsp/start = %d %s, want 501", st, body)
+	}
+	if _, err := sb.ExecCommand(ctx, "true"); err != nil {
+		t.Fatalf("exec: %v", err)
+	}
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		lsp, exec := sum(lspLabels), sum(execLabels)
+		if lsp >= lspBefore+1 && exec >= execBefore+1 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("toolbox call counter: daytona/lsp/501 %v -> %v, v1/exec/2xx %v -> %v", lspBefore, lsp, execBefore, exec)
+		}
+		time.Sleep(2 * time.Second)
+	}
+}

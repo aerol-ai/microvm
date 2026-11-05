@@ -159,6 +159,7 @@ func (h *handlers) toolbox(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	r = r.WithContext(service.WithToolboxSurface(r.Context(), service.ToolboxSurfaceDaytona))
 	path := normalizeToolboxPath(r.PathValue("path"))
 	for _, route := range toolboxRoutes {
 		if !route.matches(r.Method, path) {
