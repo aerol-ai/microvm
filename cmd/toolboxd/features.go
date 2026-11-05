@@ -1,0 +1,40 @@
+package main
+
+import "sort"
+
+// toolboxFeatures lists the request options this toolboxd understands that an
+// older toolboxd would silently ignore, keyed by the feature name it shows on
+// /version. A sandbox can run an older toolboxd than the SDK expects: a
+// Firecracker template keeps the toolboxd it was built with, and a running
+// container keeps its bind-mounted binary. toolboxd decodes requests
+// permissively, so an option it does not know is dropped, and an overwrite
+// guard or an output cap would quietly not apply. The SDKs read the feature
+// list from /version before sending such an option and fail closed instead
+// (plans/agent-sandbox-feature-parity.md, section 10, ER4).
+//
+// The values are the option names (query parameters or JSON fields) the
+// feature adds. TestEveryRequestOptionIsListed parses this package and fails
+// when a handler reads an option that is neither here nor in
+// baselineRequestOptions, so the list cannot drift from the handlers.
+var toolboxFeatures = map[string][]string{}
+
+// baselineRequestOptions are the options toolboxd understood before /version
+// listed features. Any agent honours them, so an SDK sends them unchecked.
+// Never add to this list: a new option belongs to a feature above.
+var baselineRequestOptions = []string{
+	// Query parameters.
+	"destination", "follow", "group", "mode", "owner", "path", "pattern", "recursive", "source", "username",
+	// Buffered exec (models.ExecRequest) and the exec stream's start message.
+	"command", "cols", "env", "rows", "timeout_seconds", "tty", "workdir",
+}
+
+// featureList is the sorted feature names, for /version.
+func featureList() []string {
+	// Never nil: an empty list must still serialize as [], not null.
+	out := make([]string, 0, len(toolboxFeatures))
+	for name := range toolboxFeatures {
+		out = append(out, name)
+	}
+	sort.Strings(out)
+	return out
+}

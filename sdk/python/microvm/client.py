@@ -158,6 +158,26 @@ class MicroVMError(Exception):
     pass
 
 
+class MicroVMUnsupportedFeatureError(MicroVMError):
+    """The sandbox's agent (toolboxd) is older than an option this call
+    needs. An older agent would silently ignore the option (an overwrite
+    guard, an output cap), so the SDK refuses instead of sending it.
+
+    Restart the sandbox, or re-create its Firecracker template, to get the
+    current agent. ``features`` lists what was missing.
+    """
+
+    def __init__(self, sandbox_id: str, features: List[str], agent_version: str = "") -> None:
+        self.sandbox_id = sandbox_id
+        self.features = features
+        self.agent_version = agent_version
+        agent = f"toolboxd {agent_version}" if agent_version else "an older toolboxd"
+        super().__init__(
+            f"sandbox {sandbox_id} runs {agent}, which does not support {', '.join(features)}; "
+            "restart the sandbox, or re-create its Firecracker template, to get the current agent"
+        )
+
+
 class MicroVMHTTPError(MicroVMError):
     """An HTTP error response from sandboxd. ``str(err)`` is the server's
     message, or the HTTP reason phrase when the body is not the server's
@@ -637,6 +657,10 @@ class MicroVM:
             raise MicroVMError(f"unsupported api_version {api_version!r}; supported: {sorted(_PATH_PREFIXES)}")
         self.api_version = api_version
         self._version_prefix = _PATH_PREFIXES[api_version]
+        # Features each sandbox's agent listed on /version (see
+        # _require_toolbox_features). Refreshed on a miss, because a restart
+        # can bring a newer agent.
+        self._toolbox_features: Dict[str, frozenset] = {}
 
     def _versioned(self, suffix: str) -> str:
         """Build a versioned API path. Pass the suffix beginning with "/" (e.g.
@@ -1252,6 +1276,27 @@ class MicroVM:
             ws.send(json.dumps({"type": "resize", "cols": cols, "rows": rows}))
 
         return SessionAttachHandle(websocket_module, ws, attach_options)
+
+    def _require_toolbox_features(self, sandbox_id: str, *features: str) -> None:
+        """Fail closed unless the sandbox's agent lists every feature.
+
+        toolboxd ignores request options it does not know, so sending a newer
+        option to an older agent would silently skip it. The agent lists the
+        options it understands on /version.
+        """
+        if not features:
+            return
+        have = self._toolbox_features.get(sandbox_id)
+        version = ""
+        if have is None or not set(features) <= have:
+            info = self._do_json("GET", f"{self._version_prefix}/sandboxes/{sandbox_id}/toolbox/version", None)
+            listed = info.get("features") if isinstance(info, dict) else None
+            have = frozenset(str(f) for f in listed) if isinstance(listed, list) else frozenset()
+            self._toolbox_features[sandbox_id] = have
+            version = str(info.get("version") or "") if isinstance(info, dict) else ""
+        missing = [f for f in features if f not in have]
+        if missing:
+            raise MicroVMUnsupportedFeatureError(sandbox_id, missing, version)
 
     def upload_file(self, sandbox_id: str, target_path: str, data: bytes) -> None:
         self._do_multipart(

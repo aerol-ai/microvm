@@ -115,6 +115,10 @@ public class MicroVMClient {
     private final HttpClient httpClient;
     private final WebSocketConnector webSocketConnector;
     private final ai.aerol.microvm.model.RetryConfig retryConfig;
+    // Each sandbox's agent feature list from /version (requireToolboxFeatures).
+    // A miss refreshes it, because a restart can bring a newer agent.
+    private final java.util.concurrent.ConcurrentHashMap<String, java.util.Set<String>> toolboxFeatures =
+        new java.util.concurrent.ConcurrentHashMap<>();
 
     /** One bounded fleet-list page plus the opaque token for the next page. */
     public static final class SandboxPage {
@@ -1346,6 +1350,34 @@ public class MicroVMClient {
         return copy;
     }
 
+    /**
+     * Fails closed unless the sandbox's agent lists every feature on
+     * /version. toolboxd ignores request options it does not know, so sending
+     * a newer option to an older agent would silently skip it.
+     */
+    void requireToolboxFeatures(String sandboxId, String... features) {
+        if (features.length == 0) {
+            return;
+        }
+        java.util.Set<String> have = toolboxFeatures.get(sandboxId);
+        String agentVersion = "";
+        if (have == null || !have.containsAll(java.util.Arrays.asList(features))) {
+            ToolboxVersion info = doJson("GET", sandboxPath(sandboxId) + "/toolbox/version", null, ToolboxVersion.class);
+            have = info == null || info.features == null ? java.util.Set.of() : java.util.Set.copyOf(info.features);
+            toolboxFeatures.put(sandboxId, have);
+            agentVersion = info == null || info.version == null ? "" : info.version;
+        }
+        List<String> missing = new ArrayList<>();
+        for (String feature : features) {
+            if (!have.contains(feature)) {
+                missing.add(feature);
+            }
+        }
+        if (!missing.isEmpty()) {
+            throw new MicroVMUnsupportedFeatureException(sandboxId, missing, agentVersion);
+        }
+    }
+
     private <T> T doJson(String method, String path, Object payload, Class<T> responseType) {
         return doJson(method, path, payload, responseType, RetryMode.IDEMPOTENT);
     }
@@ -1641,6 +1673,11 @@ public class MicroVMClient {
         abstract boolean retriesStatus(int status);
 
         abstract boolean retriesTransportFailure(IOException error);
+    }
+
+    private static final class ToolboxVersion {
+        public String version;
+        public List<String> features;
     }
 
     private static final class MountListResponse {

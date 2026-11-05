@@ -2787,3 +2787,49 @@ class IdentityTests(unittest.TestCase):
                     client_module._load_websocket_module = original_loader
                 self.assertEqual(exec_module.calls[0][1], want)
                 self.assertEqual(attach_module.calls[0][1], want)
+
+
+class ToolboxFeatureTests(unittest.TestCase):
+    """The SDK refuses an option an older sandbox agent would ignore."""
+
+    def _client(self, features):
+        client = MicroVM(api_url="https://sandbox.example.com", pat_token="pat-token")
+        calls = []
+
+        def fake(method, path, payload, *, idempotent=True, headers=None):
+            calls.append((method, path))
+            body = {"version": "v9"}
+            if features is not None:
+                body["features"] = features
+            return body
+
+        client._do_json = fake  # type: ignore[assignment]
+        return client, calls
+
+    def test_listed_features_pass_and_are_cached(self):
+        client, calls = self._client(["files.copy", "exec.argv"])
+        client._require_toolbox_features("sb-1", "files.copy")
+        client._require_toolbox_features("sb-1", "exec.argv", "files.copy")
+        self.assertEqual(calls, [("GET", "/v1/sandboxes/sb-1/toolbox/version")])
+
+    def test_missing_feature_fails_closed(self):
+        from microvm import MicroVMUnsupportedFeatureError
+
+        client, _ = self._client(["files.copy"])
+        with self.assertRaises(MicroVMUnsupportedFeatureError) as ctx:
+            client._require_toolbox_features("sb-1", "files.copy", "exec.argv")
+        self.assertEqual(ctx.exception.features, ["exec.argv"])
+        self.assertIn("toolboxd v9", str(ctx.exception))
+
+    def test_agent_without_a_features_list_fails_closed(self):
+        from microvm import MicroVMError, MicroVMUnsupportedFeatureError
+
+        client, _ = self._client(None)
+        with self.assertRaises(MicroVMUnsupportedFeatureError) as ctx:
+            client._require_toolbox_features("sb-1", "files.copy")
+        self.assertIsInstance(ctx.exception, MicroVMError)
+
+    def test_no_features_needs_no_call(self):
+        client, calls = self._client([])
+        client._require_toolbox_features("sb-1")
+        self.assertEqual(calls, [])

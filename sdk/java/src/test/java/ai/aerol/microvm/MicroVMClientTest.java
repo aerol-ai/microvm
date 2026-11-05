@@ -123,6 +123,60 @@ class MicroVMClientTest {
         }
     }
 
+    // ER4: a call that sends a newer option first checks the agent lists it
+    // and fails closed against an older toolboxd. The list is cached per
+    // sandbox and refetched on a miss.
+    @Test
+    void requireToolboxFeaturesFailsClosedOnAnOlderAgent() throws Exception {
+        java.util.concurrent.atomic.AtomicInteger hits = new java.util.concurrent.atomic.AtomicInteger();
+        AtomicReference<String> path = new AtomicReference<>();
+        HttpServer server = startServer(exchange -> {
+            path.set(exchange.getRequestURI().getPath());
+            if (!exchange.getRequestURI().getPath().equals("/v1/sandboxes/sb-1/toolbox/version")) {
+                writeJson(exchange, 404, mapOf("error", "sandbox not found"));
+                return;
+            }
+            if (hits.incrementAndGet() <= 2) {
+                writeJson(exchange, 200, mapOf("version", "0.6.12", "features", List.of("files.create_only")));
+            } else {
+                writeJson(exchange, 200, mapOf("version", "0.6.0"));
+            }
+        });
+        try {
+            MicroVMClient client = clientFor(server);
+            client.requireToolboxFeatures("sb-1");
+            assertEquals(0, hits.get());
+            client.requireToolboxFeatures("sb-1", "files.create_only");
+            client.requireToolboxFeatures("sb-1", "files.create_only");
+            assertEquals(1, hits.get());
+            assertEquals("/v1/sandboxes/sb-1/toolbox/version", path.get());
+
+            MicroVMUnsupportedFeatureException missing = org.junit.jupiter.api.Assertions.assertThrows(
+                MicroVMUnsupportedFeatureException.class,
+                () -> client.requireToolboxFeatures("sb-1", "files.create_only", "exec.max_output_bytes"));
+            assertEquals(2, hits.get());
+            assertEquals("sb-1", missing.getSandboxId());
+            assertEquals(List.of("exec.max_output_bytes"), missing.getFeatures());
+            assertEquals("0.6.12", missing.getAgentVersion());
+            assertTrue(missing.getMessage().contains("toolboxd 0.6.12"));
+
+            MicroVMUnsupportedFeatureException old = org.junit.jupiter.api.Assertions.assertThrows(
+                MicroVMUnsupportedFeatureException.class,
+                () -> client.requireToolboxFeatures("sb-1", "exec.max_output_bytes"));
+            assertEquals("0.6.0", old.getAgentVersion());
+            assertTrue(new MicroVMUnsupportedFeatureException("sb-1", List.of("a", "b"), "")
+                .getMessage().contains("runs an older toolboxd, which does not support a, b;"));
+
+            // A failed /version call is thrown as is, not as unsupported.
+            MicroVMApiException notFound = org.junit.jupiter.api.Assertions.assertThrows(
+                MicroVMApiException.class,
+                () -> client.requireToolboxFeatures("sb-missing", "files.create_only"));
+            assertEquals(404, notFound.getStatusCode());
+        } finally {
+            server.stop(0);
+        }
+    }
+
     @Test
     void createWithImageBuildsThenCreatesSandbox() throws Exception {
         AtomicReference<Map<String, Object>> buildPayload = new AtomicReference<>();

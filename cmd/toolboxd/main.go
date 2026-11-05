@@ -453,7 +453,7 @@ func (s *server) routes() http.Handler {
 				"exec_drainers_at_cap": execDrainersAtCap(),
 			})
 		case r.Method == http.MethodGet && r.URL.Path == "/version":
-			writeJSON(w, http.StatusOK, map[string]any{"version": version.Version})
+			writeJSON(w, http.StatusOK, map[string]any{"version": version.Version, "features": featureList()})
 		case r.Method == http.MethodGet && r.URL.Path == "/clone-generation":
 			// Unauthenticated like /health: the token is a non-sensitive
 			// change-detector for snapshot clones, and external access is

@@ -1,9 +1,10 @@
 mod image;
 mod types;
 
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::path::Path;
-use std::sync::{mpsc, Arc};
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -112,6 +113,10 @@ pub enum Error {
     /// WebSocket handshake or stream failure. Before 0.8.0 these were
     /// `Error::Api(String)`.
     Client(String),
+    /// The sandbox's agent (toolboxd) is older than an option the call
+    /// needs. An older agent would silently ignore the option (an overwrite
+    /// guard, an output cap), so the SDK refuses instead of sending it.
+    UnsupportedFeature(UnsupportedFeatureError),
     WebSocket(WebSocketError),
     Http(http::Error),
     SerdeJson(serde_json::Error),
@@ -130,6 +135,7 @@ impl fmt::Display for Error {
             Error::Api(err) => write!(f, "API error: {}", err),
             // The text these errors had as Error::Api(String) before 0.8.0.
             Error::Client(message) => write!(f, "API error: {}", message),
+            Error::UnsupportedFeature(err) => write!(f, "{}", err),
             Error::WebSocket(err) => write!(f, "WebSocket error: {}", err),
             Error::Http(err) => write!(f, "HTTP request build error: {}", err),
             Error::SerdeJson(err) => write!(f, "JSON error: {}", err),
@@ -140,6 +146,52 @@ impl fmt::Display for Error {
 }
 
 impl std::error::Error for Error {}
+
+/// The sandbox and the features its agent did not list on `/version`,
+/// returned as [`Error::UnsupportedFeature`]. Restart the sandbox, or
+/// re-create its Firecracker template, to get the current agent.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UnsupportedFeatureError {
+    sandbox_id: String,
+    features: Vec<String>,
+    agent_version: String,
+}
+
+impl UnsupportedFeatureError {
+    /// The sandbox whose agent is too old.
+    pub fn sandbox_id(&self) -> &str {
+        &self.sandbox_id
+    }
+
+    /// The features the agent did not list.
+    pub fn features(&self) -> &[String] {
+        &self.features
+    }
+
+    /// The agent's version, empty when it did not say.
+    pub fn agent_version(&self) -> &str {
+        &self.agent_version
+    }
+}
+
+impl fmt::Display for UnsupportedFeatureError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let agent = if self.agent_version.is_empty() {
+            "an older toolboxd".to_string()
+        } else {
+            format!("toolboxd {}", self.agent_version)
+        };
+        write!(
+            f,
+            "sandbox {} runs {}, which does not support {}; restart the sandbox, or re-create its Firecracker template, to get the current agent",
+            self.sandbox_id,
+            agent,
+            self.features.join(", ")
+        )
+    }
+}
+
+impl std::error::Error for UnsupportedFeatureError {}
 
 /// An HTTP error response from the AerolVM server, returned as
 /// [`Error::Api`].
@@ -539,6 +591,10 @@ pub struct Client {
     api_version: ApiVersion,
     inner: HttpClient,
     retry_config: RetryConfig,
+    /// Each sandbox's agent feature list from `/version`
+    /// ([`Client::require_toolbox_features`]). A miss refreshes it, because
+    /// a restart can bring a newer agent. Clones share it.
+    toolbox_features: Arc<Mutex<HashMap<String, HashSet<String>>>>,
 }
 
 #[derive(Clone, Debug)]
@@ -949,6 +1005,7 @@ impl Client {
             api_version,
             inner: build_http_client(None)?,
             retry_config: config.retry.unwrap_or_default(),
+            toolbox_features: Arc::default(),
         })
     }
 
@@ -2111,6 +2168,53 @@ impl Client {
 
     fn full_url(&self, path: &str) -> String {
         format!("{}{}", self.api_url, path)
+    }
+
+    /// Fails closed unless the sandbox's agent lists every feature on
+    /// `/version`. toolboxd ignores request options it does not know, so
+    /// sending a newer option to an older agent would silently skip it.
+    // Callers arrive with the parity file and exec options; until then only
+    // the tests use it.
+    #[allow(dead_code)]
+    pub(crate) fn require_toolbox_features(&self, sandbox_id: &str, features: &[&str]) -> Result<(), Error> {
+        if features.is_empty() {
+            return Ok(());
+        }
+        {
+            let cache = self.toolbox_features.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(have) = cache.get(sandbox_id) {
+                if features.iter().all(|feature| have.contains(*feature)) {
+                    return Ok(());
+                }
+            }
+        }
+        let info: Value = self.do_json::<Value, Value>(
+            Method::GET,
+            &format!("{}/sandboxes/{}/toolbox/version", self.version_prefix(), sandbox_id),
+            None,
+        )?;
+        let have: HashSet<String> = info
+            .get("features")
+            .and_then(Value::as_array)
+            .map(|list| list.iter().filter_map(Value::as_str).map(String::from).collect())
+            .unwrap_or_default();
+        let missing: Vec<String> = features
+            .iter()
+            .filter(|feature| !have.contains(**feature))
+            .map(|feature| feature.to_string())
+            .collect();
+        self.toolbox_features
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(sandbox_id.to_string(), have);
+        if missing.is_empty() {
+            return Ok(());
+        }
+        Err(Error::UnsupportedFeature(UnsupportedFeatureError {
+            sandbox_id: sandbox_id.to_string(),
+            features: missing,
+            agent_version: info.get("version").and_then(Value::as_str).unwrap_or_default().to_string(),
+        }))
     }
 
     fn do_json<T: Serialize, U: DeserializeOwned>(
@@ -5967,6 +6071,63 @@ mod tests {
         assert!(bare.headers().get(TEAM_HEADER).is_none());
 
         assert!(websocket_request("wss://sandbox.example.com/v1/x".into(), "pat", Some("bad\nteam")).is_err());
+    }
+
+    // ER4: a call that sends a newer option first checks the agent lists it
+    // and fails closed against an older toolboxd. The list is cached per
+    // sandbox and refetched on a miss.
+    #[test]
+    fn require_toolbox_features_fails_closed_on_an_older_agent() {
+        let (url, hits, requests) = spawn_recording_scripted_server(vec![
+            Reply::ok(r#"{"version":"0.6.12","features":["files.create_only"]}"#.to_string()),
+            Reply::ok(r#"{"version":"0.6.12","features":["files.create_only"]}"#.to_string()),
+            Reply::ok(r#"{"version":"0.6.0"}"#.to_string()),
+            Reply::status("404 Not Found"),
+        ]);
+        let client = no_retry_client(&url);
+
+        client.require_toolbox_features("sb-1", &[]).expect("no features needs no call");
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+        client
+            .require_toolbox_features("sb-1", &["files.create_only"])
+            .expect("listed feature is allowed");
+        client
+            .require_toolbox_features("sb-1", &["files.create_only"])
+            .expect("cached feature is allowed");
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        assert!(requests.lock().unwrap()[0].starts_with("GET /v1/sandboxes/sb-1/toolbox/version "));
+
+        match client.require_toolbox_features("sb-1", &["files.create_only", "exec.max_output_bytes"]) {
+            Err(Error::UnsupportedFeature(err)) => {
+                assert_eq!(err.sandbox_id(), "sb-1");
+                assert_eq!(err.features(), &["exec.max_output_bytes".to_string()]);
+                assert_eq!(err.agent_version(), "0.6.12");
+                assert!(err.to_string().contains("toolboxd 0.6.12"));
+            }
+            other => panic!("want UnsupportedFeature, got {:?}", other),
+        }
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+
+        // An agent older than the features list sends none.
+        match client.require_toolbox_features("sb-1", &["exec.max_output_bytes"]) {
+            Err(Error::UnsupportedFeature(err)) => {
+                assert_eq!(err.features(), &["exec.max_output_bytes".to_string()]);
+                assert!(err.to_string().contains("toolboxd 0.6.0"));
+            }
+            other => panic!("want UnsupportedFeature, got {:?}", other),
+        }
+        let unnamed = UnsupportedFeatureError {
+            sandbox_id: "sb-1".to_string(),
+            features: vec!["a".to_string(), "b".to_string()],
+            agent_version: String::new(),
+        };
+        assert!(unnamed.to_string().contains("runs an older toolboxd, which does not support a, b;"));
+
+        // A failed /version call is returned as is.
+        match client.require_toolbox_features("sb-missing", &["files.create_only"]) {
+            Err(Error::Api(err)) => assert_eq!(err.status(), 404),
+            other => panic!("want Api 404, got {:?}", other),
+        }
     }
 
     fn no_retry_client(url: &str) -> Client {

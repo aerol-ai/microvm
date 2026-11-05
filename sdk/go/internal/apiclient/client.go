@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/aerol-ai/microvm/pkg/models"
@@ -61,6 +62,12 @@ type Client struct {
 	apiVersion    APIVersion
 	versionPrefix string
 	retryConfig   RetryConfig
+
+	// toolboxFeatures caches each sandbox's agent feature list from
+	// /version (RequireToolboxFeatures). A miss refreshes it, because a
+	// restart can bring a newer agent.
+	featuresMu      sync.Mutex
+	toolboxFeatures map[string]map[string]struct{}
 }
 
 type ClientOptions struct {
@@ -1133,6 +1140,61 @@ func (s *Sandbox) UpdateLifecycle(ctx context.Context, lifecycle models.Lifecycl
 	}
 	s.Sandbox = updated.Sandbox
 	return nil
+}
+
+// RequireToolboxFeatures fails closed unless the sandbox's agent lists every
+// feature on /version. toolboxd ignores request options it does not know, so
+// sending a newer option to an older agent would silently skip it (an
+// overwrite guard, an output cap). The error is an *UnsupportedFeatureError.
+func (c *Client) RequireToolboxFeatures(ctx context.Context, id string, features ...string) error {
+	if len(features) == 0 {
+		return nil
+	}
+	if c.hasToolboxFeatures(id, features) {
+		return nil
+	}
+	var info struct {
+		Version  string   `json:"version"`
+		Features []string `json:"features"`
+	}
+	if err := c.doJSON(ctx, http.MethodGet, c.versionPrefix+"/sandboxes/"+url.PathEscape(id)+"/toolbox/version", nil, &info); err != nil {
+		return err
+	}
+	have := make(map[string]struct{}, len(info.Features))
+	for _, f := range info.Features {
+		have[f] = struct{}{}
+	}
+	c.featuresMu.Lock()
+	if c.toolboxFeatures == nil {
+		c.toolboxFeatures = map[string]map[string]struct{}{}
+	}
+	c.toolboxFeatures[id] = have
+	c.featuresMu.Unlock()
+	var missing []string
+	for _, f := range features {
+		if _, ok := have[f]; !ok {
+			missing = append(missing, f)
+		}
+	}
+	if len(missing) > 0 {
+		return &UnsupportedFeatureError{SandboxID: id, Features: missing, AgentVersion: info.Version}
+	}
+	return nil
+}
+
+func (c *Client) hasToolboxFeatures(id string, features []string) bool {
+	c.featuresMu.Lock()
+	defer c.featuresMu.Unlock()
+	have, ok := c.toolboxFeatures[id]
+	if !ok {
+		return false
+	}
+	for _, f := range features {
+		if _, ok := have[f]; !ok {
+			return false
+		}
+	}
+	return true
 }
 
 func (c *Client) doJSON(ctx context.Context, method, path string, requestBody any, responseBody any) error {

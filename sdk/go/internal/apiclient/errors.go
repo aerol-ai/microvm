@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/aerol-ai/microvm/pkg/models"
@@ -20,7 +21,31 @@ var (
 	// ErrNameLookupUnsupported means the server ignored ?name= (it predates
 	// name lookup), so its reply can't identify a sandbox.
 	ErrNameLookupUnsupported = errors.New("sandbox name lookup not supported by this server")
+	// ErrUnsupportedFeature means the sandbox's agent (toolboxd) is older
+	// than an option the call needs. An older agent would silently ignore
+	// the option, so the SDK refuses instead of sending it. Match the
+	// details with errors.As on *UnsupportedFeatureError.
+	ErrUnsupportedFeature = errors.New("sandbox agent does not support this feature")
 )
+
+// UnsupportedFeatureError names the sandbox and the features its agent did
+// not list on /version. errors.Is(err, ErrUnsupportedFeature) matches it.
+type UnsupportedFeatureError struct {
+	SandboxID    string
+	Features     []string
+	AgentVersion string
+}
+
+func (e *UnsupportedFeatureError) Error() string {
+	agent := "an older toolboxd"
+	if e.AgentVersion != "" {
+		agent = "toolboxd " + e.AgentVersion
+	}
+	return fmt.Sprintf("sandbox %s runs %s, which does not support %s; restart the sandbox, or re-create its Firecracker template, to get the current agent",
+		e.SandboxID, agent, strings.Join(e.Features, ", "))
+}
+
+func (e *UnsupportedFeatureError) Unwrap() error { return ErrUnsupportedFeature }
 
 // StreamError is a failure the toolbox reported on an exec or session
 // stream (an "error" frame: the command could not start, say), as opposed

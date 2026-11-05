@@ -4,7 +4,7 @@ import type { AddressInfo } from "node:net";
 import test from "node:test";
 
 import { APIClient, SandboxResource, newIdempotencyKey, parseRetryAfter, retryDelayMs } from "./client.js";
-import { MicroVMApiError } from "../errors.js";
+import { MicroVMApiError, MicroVMUnsupportedFeatureError } from "../errors.js";
 import { Image } from "../Image.js";
 import type { CreateOptions, Sandbox } from "../types.js";
 
@@ -2319,4 +2319,34 @@ test("newIdempotencyKey is 32 hex characters and unique", () => {
     seen.add(key);
   }
   assert.equal(seen.size, 1000);
+});
+
+test("requireToolboxFeatures passes listed features and caches them", async () => {
+  const seen: string[] = [];
+  const client = new APIClient({
+    baseURL: "https://api.example.com",
+    patToken: "pat-token",
+    fetch: async (input, init) => {
+      seen.push(new URL(new Request(input, init).url).pathname);
+      return jsonResponse({ version: "v9", features: ["files.copy", "exec.argv"] });
+    },
+  });
+  await client.requireToolboxFeatures("sb-1", "files.copy");
+  await client.requireToolboxFeatures("sb-1", "exec.argv", "files.copy");
+  assert.deepEqual(seen, ["/v1/sandboxes/sb-1/toolbox/version"]);
+});
+
+test("requireToolboxFeatures fails closed on a missing feature or an older agent", async () => {
+  for (const body of [{ version: "v9", features: ["files.copy"] }, { version: "v8" }]) {
+    const client = new APIClient({
+      baseURL: "https://api.example.com",
+      patToken: "pat-token",
+      fetch: async () => jsonResponse(body),
+    });
+    await assert.rejects(client.requireToolboxFeatures("sb-1", "exec.argv"), (err: unknown) => {
+      assert.ok(err instanceof MicroVMUnsupportedFeatureError);
+      assert.deepEqual(err.features, ["exec.argv"]);
+      return true;
+    });
+  }
 });

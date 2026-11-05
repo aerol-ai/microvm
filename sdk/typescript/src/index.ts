@@ -1,7 +1,7 @@
 export { MicroVM } from "./MicroVM.js";
 export { Sandbox } from "./Sandbox.js";
 export { Image } from "./Image.js";
-export { MicroVMApiError } from "./errors.js";
+export { MicroVMApiError, MicroVMUnsupportedFeatureError } from "./errors.js";
 export type { MicroVMConfig, Tokens } from "./MicroVM.js";
 export type { RetryConfig } from "./internal/client.js";
 export type {

@@ -22,13 +22,20 @@ type APIError = apiclient.APIError
 // dropping. Use errors.As to tell the two apart.
 type StreamError = apiclient.StreamError
 
+// UnsupportedFeatureError is returned when the sandbox's agent (toolboxd) is
+// older than an option the call needs; the SDK refuses rather than send an
+// option the agent would silently ignore. Restart the sandbox, or re-create
+// its Firecracker template, to get the current agent.
+type UnsupportedFeatureError = apiclient.UnsupportedFeatureError
+
 // Sentinels for errors.Is. ErrNotFound matches a 404 (and a GetByName miss),
-// ErrConflict a 409, and ErrNameLookupUnsupported a server that ignored
-// `?name=`.
+// ErrConflict a 409, ErrNameLookupUnsupported a server that ignored
+// `?name=`, and ErrUnsupportedFeature an *UnsupportedFeatureError.
 var (
 	ErrNotFound              = apiclient.ErrNotFound
 	ErrConflict              = apiclient.ErrConflict
 	ErrNameLookupUnsupported = apiclient.ErrNameLookupUnsupported
+	ErrUnsupportedFeature    = apiclient.ErrUnsupportedFeature
 )
 
 const defaultAPIURL = "http://127.0.0.1:21212"

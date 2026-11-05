@@ -7,7 +7,7 @@ import {
   sandboxCustomDomainPath as v1SandboxCustomDomainPath,
   sandboxCustomDomainsPath as v1SandboxCustomDomainsPath,
 } from "./api/v1/paths.js";
-import { MicroVMApiError } from "../errors.js";
+import { MicroVMApiError, MicroVMUnsupportedFeatureError } from "../errors.js";
 import { Image } from "../Image.js";
 import type {
   AddCustomDomainOptions,
@@ -705,6 +705,11 @@ export class APIClient {
   private readonly versionPrefix: string;
   private readonly retryConfig: Required<RetryConfig>;
   private readonly signal: AbortSignal | undefined;
+  /**
+   * Features each sandbox's agent listed on /version (requireToolboxFeatures).
+   * Refreshed on a miss, because a restart can bring a newer agent.
+   */
+  private readonly toolboxFeatures = new Map<string, Set<string>>();
 
   constructor(config: APIClientConfig) {
     this.baseURL = stripTrailingSlashes(config.baseURL);
@@ -976,6 +981,32 @@ export class APIClient {
   async updateLifecycle(id: string, lifecycle: Lifecycle): Promise<SandboxResource> {
     const response = await this.doJSON<ApiSandbox>("PUT", `${this.versionPrefix}/sandboxes/${id}/lifecycle`, toApiLifecycle(lifecycle));
     return this.wrap(response);
+  }
+
+  /**
+   * Fails closed unless the sandbox's agent lists every feature. toolboxd
+   * ignores request options it does not know, so sending a newer option to an
+   * older agent would silently skip it.
+   */
+  async requireToolboxFeatures(id: string, ...features: string[]): Promise<void> {
+    if (features.length === 0) {
+      return;
+    }
+    let have = this.toolboxFeatures.get(id);
+    let version = "";
+    if (!have || !features.every((feature) => have!.has(feature))) {
+      const info = await this.doJSON<{ version?: string; features?: unknown }>(
+        "GET",
+        `${this.versionPrefix}/sandboxes/${id}/toolbox/version`,
+      );
+      have = new Set(Array.isArray(info?.features) ? info.features.map(String) : []);
+      this.toolboxFeatures.set(id, have);
+      version = typeof info?.version === "string" ? info.version : "";
+    }
+    const missing = features.filter((feature) => !have!.has(feature));
+    if (missing.length > 0) {
+      throw new MicroVMUnsupportedFeatureError(id, missing, version);
+    }
   }
 
   async exec(id: string, request: ExecRequest): Promise<ExecResult> {

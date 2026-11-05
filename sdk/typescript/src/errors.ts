@@ -30,3 +30,30 @@ export class MicroVMApiError extends Error {
     this.retryAfterMs = options.retryAfterMs;
   }
 }
+
+/**
+ * The sandbox's agent (toolboxd) is older than an option this call needs. An
+ * older agent would silently ignore the option (an overwrite guard, an output
+ * cap), so the SDK refuses instead of sending it. Restart the sandbox, or
+ * re-create its Firecracker template, to get the current agent.
+ */
+export class MicroVMUnsupportedFeatureError extends Error {
+  /** The sandbox whose agent is too old. */
+  readonly sandboxID: string;
+  /** The features the agent did not list. */
+  readonly features: string[];
+  /** The agent's version when it reported one. */
+  readonly agentVersion: string;
+
+  constructor(sandboxID: string, features: string[], agentVersion = "") {
+    const agent = agentVersion ? `toolboxd ${agentVersion}` : "an older toolboxd";
+    super(
+      `sandbox ${sandboxID} runs ${agent}, which does not support ${features.join(", ")}; ` +
+        "restart the sandbox, or re-create its Firecracker template, to get the current agent",
+    );
+    this.name = "MicroVMUnsupportedFeatureError";
+    this.sandboxID = sandboxID;
+    this.features = features;
+    this.agentVersion = agentVersion;
+  }
+}

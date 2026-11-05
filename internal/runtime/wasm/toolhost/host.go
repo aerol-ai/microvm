@@ -64,7 +64,9 @@ func (h *Host) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	case r.Method == http.MethodGet && r.URL.Path == "/health":
 		writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "version": version.Version})
 	case r.Method == http.MethodGet && r.URL.Path == "/version":
-		writeJSON(w, http.StatusOK, map[string]any{"version": version.Version})
+		// The WASM host supports none of toolboxd's newer request options;
+		// an empty list makes the SDKs refuse them instead of sending them.
+		writeJSON(w, http.StatusOK, map[string]any{"version": version.Version, "features": []string{}})
 	case r.Method == http.MethodPost && r.URL.Path == "/process/execute":
 		if !h.requireAuth(w, r) {
 			return
