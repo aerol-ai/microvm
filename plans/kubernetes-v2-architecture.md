@@ -462,7 +462,7 @@ kubepods                                   (Kubernetes' box for all pods)
 ### 8.4 The network lives inside the pod
 
 ```mermaid
-flowchart LR
+flowchart TB
     subgraph POD["Worker pod network (one VPC address)"]
         S1["sandbox A<br/>own netns<br/>10.88.0.12"] --> BR["bridge aerolvm0"]
         S2["sandbox B<br/>own netns<br/>10.88.0.13"] --> BR
@@ -1001,7 +1001,7 @@ flowchart TB
 ### 13.1 The order
 
 ```mermaid
-flowchart LR
+flowchart TB
     O["1. Operator"] --> S["2. Servers<br/>one at a time,<br/>leader last"]
     S --> G["3. Gateways<br/>rolling, surge"]
     G --> A["4. Worker agents<br/>in place, a few per zone,<br/>0 sandbox restarts"]
