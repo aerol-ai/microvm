@@ -1875,6 +1875,7 @@ def _from_api_exec_result(result: Dict[str, Any]) -> ExecResult:
         "stderr": str(_first_of(result, "stderr") or ""),
         "exitCode": int(_first_of(result, "exit_code", "exitCode") or 0),
         "durationMS": int(_first_of(result, "duration_ms", "durationMS") or 0),
+        "timedOut": bool(_first_of(result, "timed_out", "timedOut") or False),
     }
 
 

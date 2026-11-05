@@ -1408,6 +1408,10 @@ type ExecResult struct {
 	Stderr     string `json:"stderr"`
 	ExitCode   int    `json:"exit_code"`
 	DurationMS int64  `json:"duration_ms"`
+	// TimedOut is true when the command ran past its timeout and toolboxd
+	// killed its whole process group. A sandbox agent older than this field
+	// never sets it.
+	TimedOut bool `json:"timed_out,omitempty"`
 }
 
 type ErrorResponse struct {

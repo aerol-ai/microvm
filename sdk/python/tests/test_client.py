@@ -924,8 +924,16 @@ class ClientTests(unittest.TestCase):
         )
         self.assertEqual(result["exitCode"], 0)
         self.assertEqual(result["durationMS"], 5)
+        self.assertFalse(result["timedOut"])
         self.assertEqual(health["status"], "ok")
         self.assertEqual(health["sshGateway"], "disabled")
+
+    def test_exec_result_maps_timed_out(self):
+        from microvm.client import _from_api_exec_result
+
+        timed_out = _from_api_exec_result({"stdout": "", "stderr": "", "exit_code": -1, "duration_ms": 1000, "timed_out": True})
+        self.assertTrue(timed_out["timedOut"])
+        self.assertEqual(timed_out["exitCode"], -1)
 
     def test_mounts_maps_redacted_mount_shapes(self):
         client = RecordingMicroVM()

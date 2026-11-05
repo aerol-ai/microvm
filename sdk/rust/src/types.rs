@@ -750,6 +750,10 @@ pub struct ExecResult {
     pub exit_code: i32,
     #[serde(rename = "duration_ms")]
     pub duration_ms: i64,
+    /// True when the command ran past its timeout and the sandbox killed its
+    /// whole process group. Older sandbox agents never set it.
+    #[serde(rename = "timed_out", default)]
+    pub timed_out: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -1466,4 +1470,17 @@ where
     D: serde::Deserializer<'de>,
 {
     Ok(Option::<Vec<ApiToken>>::deserialize(d)?.unwrap_or_default())
+}
+
+#[cfg(test)]
+mod exec_result_tests {
+    use super::ExecResult;
+
+    #[test]
+    fn timed_out_defaults_to_false_and_reads_true() {
+        let old: ExecResult = serde_json::from_str(r#"{"stdout":"","stderr":"","exit_code":0,"duration_ms":1}"#).unwrap();
+        assert!(!old.timed_out);
+        let new: ExecResult = serde_json::from_str(r#"{"stdout":"","stderr":"","exit_code":-1,"duration_ms":1000,"timed_out":true}"#).unwrap();
+        assert!(new.timed_out);
+    }
 }

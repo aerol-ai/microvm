@@ -120,6 +120,8 @@ test("Sandbox exec accepts a plain command string", async () => {
 
   assert.equal(result.stdout, "hello\n");
   assert.equal(result.exitCode, 0);
+  // An agent that predates timed_out leaves it out; it reads as false.
+  assert.equal(result.timedOut, false);
   assert.deepEqual(execBodies, [
     { command: "echo hello" },
     { command: "echo hello", workdir: "/tmp" },
@@ -1624,4 +1626,29 @@ test("MicroVM create failures are MicroVMApiError from the package entry point",
     assert.equal(err.code, "idempotency_key_reused");
     assert.equal(err.message, "Idempotency-Key reused");
   }
+});
+
+test("Sandbox exec reports a timed-out command", async () => {
+  const sdk = new MicroVM({
+    patToken: "pat-token",
+    apiUrl: "https://api.example.com",
+    fetch: async (input, init) => {
+      const request = new Request(input, init);
+      if (new URL(request.url).pathname.endsWith("/toolbox/process/execute")) {
+        return new Response(JSON.stringify({ stdout: "", stderr: "", exit_code: -1, duration_ms: 1000, timed_out: true }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      return new Response(JSON.stringify({
+        id: "sb-1", image: "ubuntu:22.04", status: "started", public_url: "", cpu: 1, memory_mb: 512, disk_gb: 1,
+        network_block_all: false, toolbox_enabled: true, exposed_ports: [],
+        created_at: "2026-05-07T10:00:00Z", updated_at: "2026-05-07T10:00:00Z", last_active_at: "2026-05-07T10:00:00Z",
+      }), { status: 200, headers: { "content-type": "application/json" } });
+    },
+  });
+  const sandbox = await sdk.get("sb-1");
+  const result = await sandbox.exec({ command: "sleep 30", timeoutSeconds: 1 });
+  assert.equal(result.timedOut, true);
+  assert.equal(result.exitCode, -1);
 });

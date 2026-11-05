@@ -196,7 +196,7 @@ Pass an options object instead of a string to choose where the command runs, add
 
 The tabs above show how each language spells these names. Python also accepts `workdir` and `timeout_seconds`.
 
-When the time limit runs out, the result has exit code `-1` and `stderr` says `signal: killed`.
+When the time limit runs out, the whole command stops, including anything it started in the background. The result has exit code `-1`, `stderr` says `signal: killed`, and `timedOut` is `true` (`timed_out` in Rust; sandboxes created before this field existed never set it).
 
 <Aside type="caution" title="The time limit stops the shell, not always what it started">
 `timeoutSeconds` stops the shell that runs your command. A program the shell started can keep running, and the call waits for it. On our test server, `sleep 10` with a 2-second limit still took 10 seconds to return. For a hard limit, put `timeout` in the command itself: `timeout 30 npm test` stops after 30 seconds and exits with code `124`.
@@ -537,7 +537,7 @@ For work that must keep going after you disconnect, such as a dev server or a lo
 
 ## Good to know
 
-- **Background jobs make `exec` wait.** If your command starts something with `&`, `exec` waits until that program ends too, because it still holds the output open. Start servers and other long-running programs in a [terminal session](/sessions/) instead.
+- **Background jobs do not hold up `exec`.** If your command starts something with `&`, `exec` returns soon after the command itself ends (within about a second), and the background program keeps running. Output it prints after `exec` returns is dropped. To watch a long-running program's output, start it in a [terminal session](/sessions/) instead. A sandbox keeps the output of up to 256 such programs open; past that, a new one's output is closed, so it may stop the next time it prints.
 - **`exec` keeps all output in memory** until the command ends. For commands that print a lot, use `execStream`.
 - **If the sandbox stops while a command runs**, the call fails within seconds instead of waiting. This covers a sandbox that crashes, is stopped or is deleted. The error is HTTP 409 with `sandbox is not running`. A crashed Firecracker sandbox can take up to 30 seconds to notice, and that call fails with HTTP 502. The command may have done part of its work, so the SDKs do not send it again. A command that is still running is never cut off, however long it stays quiet.
 - **WebAssembly sandboxes** support `exec`, but not `execStream` or terminals. What a command does there depends on the module. See [WebAssembly (WASM)](/wasm-sandbox/).

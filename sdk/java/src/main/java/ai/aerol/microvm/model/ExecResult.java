@@ -9,4 +9,7 @@ public class ExecResult {
     public int exitCode;
     @JsonProperty("duration_ms")
     public long durationMs;
+    /** True when the command ran past its timeout and the sandbox killed its whole process group. Older sandbox agents never set it. */
+    @JsonProperty("timed_out")
+    public boolean timedOut;
 }

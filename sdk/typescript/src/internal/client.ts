@@ -401,6 +401,7 @@ interface ApiExecResult {
   stderr: string;
   exit_code: number;
   duration_ms: number;
+  timed_out?: boolean;
 }
 
 interface ApiHealthStatus {
@@ -1986,6 +1987,7 @@ function fromApiExecResult(result: ApiExecResult): ExecResult {
     stderr: result.stderr,
     exitCode: result.exit_code,
     durationMS: result.duration_ms,
+    timedOut: result.timed_out ?? false,
   };
 }
 

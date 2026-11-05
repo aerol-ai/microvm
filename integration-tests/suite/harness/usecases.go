@@ -948,6 +948,8 @@ var Registry = []UseCase{
 	{ID: "UC-368", Title: "Firecracker snapshot on another node: a snapshot of a running Firecracker sandbox is refused with 409; once stopped, its snapshot is pushed to the cluster registry, outlives the source, and boots, in each direction across two Firecracker nodes, as a Firecracker sandbox and as a container on the node that did not take it, with the same data, hard link, symlink and nested file, and without the source's toolbox token file", Requires: []Capability{CapCluster, CapFirecracker}, Implemented: true},
 	// Agent-sandbox parity (parity_test.go; plans/agent-sandbox-feature-parity.md).
 	{ID: "UC-369", Title: "Daytona SDK file calls that used to 404 work live: createFolder with a mode, replaceInFiles as plain text with a per-file result, setFilePermissions, and deleteFile (a folder only with recursive=true); language servers and Daytona terminals answer a clear 501", Implemented: true},
+	{ID: "UC-370", Title: "exec returns when the command ends: a background job keeps running and does not hold up the reply; a timeout stops the whole process group and reports timed_out; Daytona executeCommand behaves the same", Implemented: true},
+	{ID: "UC-371", Title: "exec on gVisor returns when the command ends, keeps background jobs running and stops the whole group on a timeout", Requires: []Capability{CapGvisor}, Implemented: true},
 }
 
 // byID is a lookup built once for the report generator.

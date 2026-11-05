@@ -268,6 +268,9 @@ class ExecResult(TypedDict):
     stderr: str
     exitCode: int
     durationMS: int
+    # True when the command ran past its timeout and the sandbox killed its
+    # whole process group. Older sandbox agents never set it.
+    timedOut: bool
 
 
 ChunkCallback = Callable[[bytes], None]

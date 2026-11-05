@@ -113,3 +113,79 @@ func TestParityDaytonaFileCallsLive(t *testing.T) {
 		}
 	}
 }
+
+// assertExecReturnsWithBackgroundJob is plan B2: a command that starts a
+// background job returns when the command itself ends and the job keeps
+// running; a timeout stops the whole process group and says timed_out.
+func assertExecReturnsWithBackgroundJob(t *testing.T, sb *microvm.Sandbox) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+
+	start := time.Now()
+	res, err := sb.Exec(ctx, sdktypes.ExecRequest{Command: "sleep 120 >/dev/null 2>&1 </dev/null & sleep 120 & echo $!", TimeoutSeconds: 60})
+	if err != nil {
+		t.Fatalf("exec with a background job: %v", err)
+	}
+	if took := time.Since(start); took > 15*time.Second {
+		t.Fatalf("exec took %v; it waited for the background job", took)
+	}
+	pid := strings.TrimSpace(res.Stdout)
+	if res.ExitCode != 0 || res.TimedOut || pid == "" {
+		t.Fatalf("result = %+v", res)
+	}
+	if got := parityExec(t, ctx, sb, "kill -0 "+pid+" && echo alive || echo gone"); got != "alive" {
+		t.Fatalf("background job %s after exec returned: %s, want alive", pid, got)
+	}
+	_ = parityExec(t, ctx, sb, "kill "+pid+" 2>/dev/null; echo done")
+
+	start = time.Now()
+	res, err = sb.Exec(ctx, sdktypes.ExecRequest{Command: "sleep 120 & echo $!; sleep 120", TimeoutSeconds: 3})
+	if err != nil {
+		t.Fatalf("exec that times out: %v", err)
+	}
+	if took := time.Since(start); took > 30*time.Second {
+		t.Fatalf("timed-out exec took %v", took)
+	}
+	if !res.TimedOut {
+		t.Fatalf("timed_out not set: %+v", res)
+	}
+	pid = strings.TrimSpace(res.Stdout)
+	deadline := time.Now().Add(20 * time.Second)
+	for {
+		got := parityExec(t, ctx, sb, "kill -0 "+pid+" 2>/dev/null && echo alive || echo gone")
+		if got == "gone" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("background job %s survived the timeout", pid)
+		}
+		time.Sleep(time.Second)
+	}
+
+	// Daytona executeCommand shares the handler (eng review ER2).
+	start = time.Now()
+	st, body := daytonaToolbox(t, ctx, http.MethodPost, sb.ID, "/process/execute", nil, map[string]any{"command": "sh -c 'sleep 120 & echo daytona-started'", "timeout": 60})
+	if st != http.StatusOK || !strings.Contains(string(body), "daytona-started") {
+		t.Fatalf("Daytona executeCommand = %d %s", st, body)
+	}
+	if took := time.Since(start); took > 15*time.Second {
+		t.Fatalf("Daytona executeCommand took %v; it waited for the background job", took)
+	}
+	_ = parityExec(t, ctx, sb, "pkill -f 'sleep 120' 2>/dev/null; echo done")
+}
+
+// UC-370 — exec returns when the command ends, with background jobs kept
+// running and timeouts stopping the whole group, via v1 and Daytona.
+func TestParityExecReturnsWithBackgroundJob(t *testing.T) {
+	harness.Require(t, sc, "UC-370")
+	assertExecReturnsWithBackgroundJob(t, paritySandbox(t))
+}
+
+// UC-371 — the same on gVisor, where the reaper reports ESRCH (UC-335).
+func TestParityExecReturnsWithBackgroundJobGvisor(t *testing.T) {
+	harness.Require(t, sc, "UC-371")
+	sb := client(t).NewSandbox(t, sdktypes.CreateSandboxOptions{Name: harness.UniqueName(sc, t), Runtime: "gvisor"})
+	waitRunning(t, sb)
+	assertExecReturnsWithBackgroundJob(t, sb)
+}

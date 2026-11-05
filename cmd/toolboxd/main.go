@@ -444,7 +444,14 @@ func (s *server) routes() http.Handler {
 				"version":    version.Version,
 			})
 		case r.Method == http.MethodGet && r.URL.Path == "/health":
-			writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "version": version.Version})
+			writeJSON(w, http.StatusOK, map[string]any{
+				"status":  "ok",
+				"version": version.Version,
+				// Readers still soaking up background jobs' exec output,
+				// and whether new jobs lose their output (B2, ER3).
+				"exec_drainers":        execDrainers.Load(),
+				"exec_drainers_at_cap": execDrainersAtCap(),
+			})
 		case r.Method == http.MethodGet && r.URL.Path == "/version":
 			writeJSON(w, http.StatusOK, map[string]any{"version": version.Version})
 		case r.Method == http.MethodGet && r.URL.Path == "/clone-generation":
@@ -748,42 +755,24 @@ func (s *server) handleExec(w http.ResponseWriter, r *http.Request) {
 		cmd.Dir = req.WorkDir
 	}
 
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	stderr, err := cmd.StderrPipe()
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
+	// Own process group, so a timeout kills the background jobs the command
+	// started, not just the shell (B2).
+	prepareProcessGroup(cmd)
 
-	child, err := startTracked(cmd)
+	out, err := runBufferedExec(s.logger, cmd)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-
-	var stdoutBytes []byte
-	var stderrBytes []byte
-	var readWG sync.WaitGroup
-	readWG.Add(2)
-	go func() {
-		defer readWG.Done()
-		stdoutBytes, _ = io.ReadAll(stdout)
-	}()
-	go func() {
-		defer readWG.Done()
-		stderrBytes, _ = io.ReadAll(stderr)
-	}()
-	readWG.Wait()
-	waitErr := child.wait()
+	waitErr := out.waitErr
 
 	result := models.ExecResult{
-		Stdout:     string(stdoutBytes),
-		Stderr:     string(stderrBytes),
+		Stdout:     out.stdout,
+		Stderr:     out.stderr,
 		DurationMS: time.Since(start).Milliseconds(),
+		// Only the exec's own deadline counts; a caller that hung up is
+		// not a timeout.
+		TimedOut: errors.Is(ctx.Err(), context.DeadlineExceeded) && r.Context().Err() == nil,
 	}
 
 	result.ExitCode, _ = interpretWaitResult(waitErr)
