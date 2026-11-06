@@ -80,6 +80,7 @@ We checked this example with `@daytona/sdk` 0.223.1. AerolVM's own [Daytona exam
 | `process.executeCommand` | Works. A command that starts a background job with `&` returns when the command itself ends, and the job keeps running. A command that runs past its timeout is stopped together with its background jobs. Your operator can [limit how much output](/exec-streaming/#for-server-operators) it returns. |
 | `process.codeRun` | Works for `python`, `javascript` (Node.js), `typescript` (needs `ts-node` in the image) and `bash` or `sh`. The language's program must be installed in the image. |
 | Sessions: create, run commands, read command logs, send input, delete | Works. In command logs, each byte that is not valid UTF-8 reads as `?`. |
+| Terminals: `process.createPty`, connect, resize, kill, get and list | Works, except on WebAssembly sandboxes (HTTP 501). A terminal keeps running when its connection drops. Connect again to see what it printed while you were away. A sandbox can have 32 terminals at a time. One more fails with HTTP 429 until you kill one. A terminal that has ended still counts for 30 seconds. |
 | Files: list, get info, upload (one file or many), move, search by name, find text in files | Works. |
 | Files: delete (`fs.deleteFile`), create a folder (`fs.createFolder`), replace text in files (`fs.replaceInFiles`), set permissions (`fs.setFilePermissions`) | Works, except on WebAssembly sandboxes (HTTP 501). Deleting a folder needs `recursive: true`. `replaceInFiles` replaces plain text, not a regular expression. |
 | Git: clone, status, add, commit, branches, checkout, history, pull, push | Works when `git` is installed in the image. |
@@ -100,7 +101,6 @@ These calls fail. Most return HTTP 404 or 501, so your code gets an error rather
 | Daytona feature | What happens |
 |---|---|
 | Download files (`fs.downloadFile`, `fs.downloadFiles`) | Fails with `Target metadata missing for valid source` in our tests with SDK versions 0.175.0 and 0.223.1. Read a file with `process.executeCommand` instead, for example with `cat` or `base64`. |
-| Terminals (`process.createPty` and related calls) | Not supported yet (HTTP 501). Use a session, or the AerolVM SDK's [`execStream`](/exec-streaming/) with a terminal. |
 | Language servers (LSP) | Not supported (HTTP 501). |
 | `codeInterpreter` (Daytona's stateful notebook-style runner) | Not supported (HTTP 501). Use `process.codeRun` or `process.executeCommand`. |
 | `sandbox.archive()` | Not supported (no such route). |
