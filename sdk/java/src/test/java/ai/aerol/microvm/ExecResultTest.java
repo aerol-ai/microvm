@@ -24,4 +24,13 @@ class ExecResultTest {
         assertTrue(result.timedOut);
         assertEquals(-1, result.exitCode);
     }
+
+    @Test
+    void signalIsReadAndNullForOlderAgents() throws Exception {
+        ExecResult killed = mapper.readValue("{\"stdout\":\"\",\"stderr\":\"\",\"exit_code\":-1,\"duration_ms\":1000,\"timed_out\":true,\"signal\":\"SIGKILL\"}", ExecResult.class);
+        assertEquals("SIGKILL", killed.signal);
+        assertEquals(-1, killed.exitCode);
+        ExecResult older = mapper.readValue("{\"stdout\":\"\",\"stderr\":\"\",\"exit_code\":0,\"duration_ms\":1}", ExecResult.class);
+        assertEquals(null, older.signal);
+    }
 }

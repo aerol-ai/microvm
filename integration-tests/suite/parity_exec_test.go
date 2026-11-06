@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/aerol-ai/microvm/integration-tests/suite/harness"
+	microvm "github.com/aerol-ai/microvm/sdk/go/pkg/microvm"
 	sdktypes "github.com/aerol-ai/microvm/sdk/go/pkg/types"
 )
 
@@ -177,4 +178,52 @@ func TestParityExecArgvMissingProgram(t *testing.T) {
 	if err != nil || exit.Code != 127 || !strings.Contains(stderr.String(), "not found") {
 		t.Fatalf("missing program stream = %+v %v stderr %q", exit, err, stderr.String())
 	}
+}
+
+// assertExecReportsSignal is plan E3: the buffered exec result names the
+// signal that ended the process (exit_code stays -1), for argv, for a
+// timeout, and not when a shell outlives its killed child (137).
+func assertExecReportsSignal(t *testing.T, sb *microvm.Sandbox) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	res, err := sb.Exec(ctx, sdktypes.ExecRequest{Argv: []string{"sh", "-c", "kill -SEGV $$"}})
+	if err != nil {
+		t.Fatalf("crash: %v", err)
+	}
+	if res.Signal != "SIGSEGV" || res.ExitCode != -1 {
+		t.Fatalf("crashed program = signal %q exit %d, want SIGSEGV and -1", res.Signal, res.ExitCode)
+	}
+
+	res, err = sb.Exec(ctx, sdktypes.ExecRequest{Command: "sleep 120", TimeoutSeconds: 2})
+	if err != nil {
+		t.Fatalf("timeout: %v", err)
+	}
+	if res.Signal != "SIGKILL" || !res.TimedOut || res.ExitCode != -1 {
+		t.Fatalf("timed-out command = signal %q timed_out %v exit %d, want SIGKILL", res.Signal, res.TimedOut, res.ExitCode)
+	}
+
+	res, err = sb.Exec(ctx, sdktypes.ExecRequest{Command: "sh -c 'kill -KILL $$'; exit $?"})
+	if err != nil {
+		t.Fatalf("shell outlives child: %v", err)
+	}
+	if res.Signal != "" || res.ExitCode != 137 {
+		t.Fatalf("shell-reported kill = signal %q exit %d, want none and 137", res.Signal, res.ExitCode)
+	}
+}
+
+// UC-384 — exec reports the signal that ended a command (plan E3).
+func TestParityExecSignal(t *testing.T) {
+	harness.Require(t, sc, "UC-384")
+	assertExecReportsSignal(t, paritySandbox(t))
+}
+
+// UC-385 — the same on gVisor, where the reaper can win the wait and toolboxd
+// reads the status it collected (UC-335 history).
+func TestParityExecSignalGvisor(t *testing.T) {
+	harness.Require(t, sc, "UC-385")
+	sb := client(t).NewSandbox(t, sdktypes.CreateSandboxOptions{Name: harness.UniqueName(sc, t), Runtime: "gvisor"})
+	waitRunning(t, sb)
+	assertExecReportsSignal(t, sb)
 }

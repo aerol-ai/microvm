@@ -807,6 +807,7 @@ func (s *server) handleExec(w http.ResponseWriter, r *http.Request) {
 	}
 
 	result.ExitCode, _ = interpretWaitResult(waitErr)
+	result.Signal = waitSignal(waitErr)
 	if waitErr != nil {
 		var exitErr *exec.ExitError
 		if !errors.As(waitErr, &exitErr) && !reapedElsewhere(waitErr) {

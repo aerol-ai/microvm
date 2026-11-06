@@ -1944,6 +1944,7 @@ def _from_api_exec_result(result: Dict[str, Any]) -> ExecResult:
         "timedOut": bool(_first_of(result, "timed_out", "timedOut") or False),
         "stdoutTruncated": bool(_first_of(result, "stdout_truncated", "stdoutTruncated") or False),
         "stderrTruncated": bool(_first_of(result, "stderr_truncated", "stderrTruncated") or False),
+        "signal": str(_first_of(result, "signal") or ""),
     }
 
 

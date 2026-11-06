@@ -283,6 +283,10 @@ class ExecResult(TypedDict):
     # maxStderrBytes, or the server's own limit) and was cut.
     stdoutTruncated: bool
     stderrTruncated: bool
+    # The signal that ended the command, such as "SIGKILL"; "" when it
+    # exited on its own. exitCode is -1 then; a shell would say 128 + the
+    # signal's number (137 for SIGKILL).
+    signal: str
 
 
 ChunkCallback = Callable[[bytes], None]

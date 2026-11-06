@@ -205,3 +205,14 @@ test("execStream with argv survives the check failing before the socket opens", 
     assert.deepEqual(ws.sent, []);
   });
 });
+
+test("exec reads the signal that ended the command", async () => {
+  const { sdk } = fakeSandbox([], { exit_code: -1, timed_out: true, signal: "SIGKILL" });
+  const sandbox = await sdk.get("sb-1");
+  const result = await sandbox.exec({ command: "sleep 600", timeoutSeconds: 1 });
+  assert.equal(result.signal, "SIGKILL");
+  assert.equal(result.exitCode, -1);
+
+  const older = fakeSandbox([], { exit_code: 0 });
+  assert.equal((await (await older.sdk.get("sb-1")).exec("true")).signal, undefined);
+});

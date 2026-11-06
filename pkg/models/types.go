@@ -1437,6 +1437,14 @@ type ExecResult struct {
 	// dropped (B2) and never sets them.
 	StdoutTruncated bool `json:"stdout_truncated,omitempty"`
 	StderrTruncated bool `json:"stderr_truncated,omitempty"`
+	// Signal names the signal that ended the process toolboxd started, such
+	// as "SIGKILL" (a timeout) or "SIGSEGV"; empty when it exited on its
+	// own. ExitCode stays -1 then, as before this field; the shell
+	// convention for the same end is 128 + the signal's number (137 for
+	// SIGKILL). A command run by a shell that outlives it reports the
+	// shell's 128+n exit code and no signal. Response-only: an older agent
+	// leaves it out.
+	Signal string `json:"signal,omitempty"`
 }
 
 type ErrorResponse struct {

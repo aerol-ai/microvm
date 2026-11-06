@@ -18,4 +18,9 @@ public class ExecResult {
     /** True when stderr was longer than its cap and was cut. */
     @JsonProperty("stderr_truncated")
     public boolean stderrTruncated;
+    /**
+     * The signal that ended the command, such as "SIGKILL"; null when it exited on its own.
+     * exitCode is -1 then; a shell would say 128 + the signal's number (137 for SIGKILL).
+     */
+    public String signal;
 }

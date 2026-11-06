@@ -404,6 +404,7 @@ interface ApiExecResult {
   timed_out?: boolean;
   stdout_truncated?: boolean;
   stderr_truncated?: boolean;
+  signal?: string;
 }
 
 interface ApiHealthStatus {
@@ -2042,6 +2043,7 @@ function fromApiExecResult(result: ApiExecResult): ExecResult {
     timedOut: result.timed_out ?? false,
     stdoutTruncated: result.stdout_truncated ?? false,
     stderrTruncated: result.stderr_truncated ?? false,
+    signal: result.signal || undefined,
   };
 }
 

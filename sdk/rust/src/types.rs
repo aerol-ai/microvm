@@ -776,6 +776,11 @@ pub struct ExecResult {
     /// True when stderr was longer than its cap and was cut.
     #[serde(rename = "stderr_truncated", default)]
     pub stderr_truncated: bool,
+    /// The signal that ended the command, such as `"SIGKILL"`; `None` when
+    /// it exited on its own. `exit_code` is -1 then; a shell would say 128 +
+    /// the signal's number (137 for SIGKILL).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signal: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -1497,6 +1502,18 @@ where
 #[cfg(test)]
 mod exec_result_tests {
     use super::ExecResult;
+
+    #[test]
+    fn signal_reads_and_defaults_to_none() {
+        let killed: ExecResult = serde_json::from_str(
+            r#"{"stdout":"","stderr":"","exit_code":-1,"duration_ms":1000,"timed_out":true,"signal":"SIGKILL"}"#,
+        )
+        .unwrap();
+        assert_eq!(killed.signal.as_deref(), Some("SIGKILL"));
+        assert_eq!(killed.exit_code, -1);
+        let old: ExecResult = serde_json::from_str(r#"{"stdout":"","stderr":"","exit_code":0,"duration_ms":1}"#).unwrap();
+        assert!(old.signal.is_none());
+    }
 
     #[test]
     fn timed_out_defaults_to_false_and_reads_true() {

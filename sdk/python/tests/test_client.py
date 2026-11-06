@@ -2978,3 +2978,11 @@ class ExecOptionsTests(unittest.TestCase):
                 client.exec_stream("sb-1", options)
             self.assertEqual(str(ctx.exception), message)
         self.assertEqual((hits, fake_module.calls), ([], []))
+
+    def test_exec_result_reads_the_signal(self):
+        from microvm.client import _from_api_exec_result
+
+        killed = _from_api_exec_result({"stdout": "", "stderr": "", "exit_code": -1, "duration_ms": 1000, "timed_out": True, "signal": "SIGKILL"})
+        self.assertEqual((killed["signal"], killed["exitCode"]), ("SIGKILL", -1))
+        older = _from_api_exec_result({"stdout": "", "stderr": "", "exit_code": -1, "duration_ms": 1})
+        self.assertEqual(older["signal"], "")

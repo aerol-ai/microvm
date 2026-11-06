@@ -955,6 +955,8 @@ var Registry = []UseCase{
 	{ID: "UC-381", Title: "exec output caps are clamped on the way: a cap above the agent's 64 MiB ceiling (or the operator's maximum) is lowered, a caller's smaller cap is kept", Implemented: true},
 	{ID: "UC-382", Title: "exec with argv: arguments with spaces, quotes, $, ; and backticks reach the program unparsed on exec and the exec stream, and argv finds a program the login profile puts on PATH, as a command does", Implemented: true},
 	{ID: "UC-383", Title: "exec with argv naming a missing program answers like a shell: exit 127 and a not found line on stderr, on exec and the exec stream", Implemented: true},
+	{ID: "UC-384", Title: "exec reports the signal that ended the command: SIGSEGV for a crashed argv program, SIGKILL with timed_out for a timeout (exit_code -1), and no signal with exit 137 when a shell outlives its killed child", Implemented: true},
+	{ID: "UC-385", Title: "exec on gVisor reports the signal that ended the command, as UC-384", Requires: []Capability{CapGvisor}, Implemented: true},
 }
 
 // byID is a lookup built once for the report generator.

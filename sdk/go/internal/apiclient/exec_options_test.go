@@ -194,3 +194,16 @@ func TestExecStreamArgvValidation(t *testing.T) {
 		t.Fatalf("an invalid stream reached the server: %v", agent.calls)
 	}
 }
+
+// E3: the signal that ended the command comes back; older agents send none.
+func TestExecResultSignal(t *testing.T) {
+	client, _ := newExecAgent(t, nil, map[string]any{"exit_code": -1, "signal": "SIGSEGV"})
+	res, err := client.Exec(context.Background(), "sb-1", ExecRequest{Command: "./crash"})
+	if err != nil || res.Signal != "SIGSEGV" || res.ExitCode != -1 {
+		t.Fatalf("result = %+v, %v", res, err)
+	}
+	client, _ = newExecAgent(t, nil, nil)
+	if res, _ := client.Exec(context.Background(), "sb-1", ExecRequest{Command: "true"}); res.Signal != "" {
+		t.Fatalf("older agent signal = %q", res.Signal)
+	}
+}

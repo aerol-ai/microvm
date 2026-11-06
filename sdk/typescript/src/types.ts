@@ -950,6 +950,12 @@ export interface ExecResult {
   stdoutTruncated: boolean;
   /** True when stderr was longer than its cap and was cut. */
   stderrTruncated: boolean;
+  /**
+   * The signal that ended the command, such as "SIGKILL"; undefined when it
+   * exited on its own. exitCode is -1 then; a shell would say 128 + the
+   * signal's number (137 for SIGKILL).
+   */
+  signal?: string;
 }
 
 export interface ExecStreamOptions {
