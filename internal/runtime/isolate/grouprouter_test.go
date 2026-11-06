@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aerol-ai/microvm/internal/scaleobs"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
 
@@ -28,9 +29,13 @@ func TestSpawnGroupWarmPool(t *testing.T) {
 	d.SetWarmPool(warmPoolHost{host: warm, ok: true})
 	d.SetHostSupervisor(&fakeSupervisor{}) // should not be called
 
-	host, err := d.spawnGroup(context.Background(), "acme", 1, 128)
+	ctx, marked := scaleobs.WithWarmStart(context.Background())
+	host, err := d.spawnGroup(ctx, "acme", 1, 128)
 	if err != nil || host != warm {
 		t.Fatalf("spawnGroup warm = %v err=%v", host, err)
+	}
+	if !marked.Load() {
+		t.Fatal("a warm host did not mark the create warm")
 	}
 	// A blank was jailed with unlimited caps; the claiming tenant's caps are
 	// applied to it, so the pool never hands out an uncapped process.
@@ -113,5 +118,22 @@ func TestReleaseFromGroupEdgeCases(t *testing.T) {
 	d2.releaseFromGroup("acme", "sb-other")
 	if sup.hosts[0].stopped {
 		t.Fatal("host stopped for unknown member release")
+	}
+}
+
+// TestAcquireGroupMarksWarmStarts: the first create of a group spawns
+// workerd (cold); the next one joins it (warm, O1).
+func TestAcquireGroupMarksWarmStarts(t *testing.T) {
+	d := newCreateDriver(t, GroupPerTenant, &fakeSupervisor{})
+	first, firstWarm := scaleobs.WithWarmStart(context.Background())
+	if _, err := d.acquireGroup(first, "acme", "sb-1", 1, 128); err != nil {
+		t.Fatal(err)
+	}
+	second, secondWarm := scaleobs.WithWarmStart(context.Background())
+	if _, err := d.acquireGroup(second, "acme", "sb-2", 1, 128); err != nil {
+		t.Fatal(err)
+	}
+	if firstWarm.Load() || !secondWarm.Load() {
+		t.Fatalf("first warm=%v second warm=%v, want false/true", firstWarm.Load(), secondWarm.Load())
 	}
 }

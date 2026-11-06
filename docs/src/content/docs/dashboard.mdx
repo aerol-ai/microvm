@@ -165,6 +165,20 @@ Good first alerts to set up:
 - `aerolvm_image_pull_backoff_rejects_total`
 - the `aerolvm_host_pressure_*` gauges
 
+### Sandbox lifecycle metrics
+
+These counters show what happens to sandboxes over time. Each one has a `key` label with a small, fixed set of values. None of them has a label per sandbox.
+
+| Metric | `key` values | Counts |
+|---|---|---|
+| `aerolvm_sandbox_stops_total` | `user_stop`, `idle`, `max_age`, `out_of_memory`, `disk_limit`, `crashed`, `program_exited`, `reconcile` | Sandboxes that stopped, by their [stop reason](/lifecycle/#why-a-sandbox-stopped). |
+| `aerolvm_sandbox_starts_total` | `requested`, `restarted`, `failover` | Sandboxes that started again: by a call (including a wake), by `restartOnFailure`, or after a server failed. |
+| `aerolvm_sandbox_expired_total` | `idle`, `max_age`, `program_exited` | Sandboxes a lifecycle timer deleted, by the timer. `destroyAt` counts as `max_age`; `destroyAfterExitFor` counts as `program_exited`. |
+| `aerolvm_sandbox_finished_total` | `success`, `failure` | Main programs that ended, by whether the exit code was `0`. A sandbox that goes down with a non-zero code counts as a `crashed` stop, not here. So `failure` only counts programs the server watches for [`destroyAfterExitFor`](/lifecycle/#delete-when-the-program-ends), which end while the sandbox keeps running. |
+| `aerolvm_create_latency_by_start_seconds_bucket` | `warm`, `cold` (`key2` is the bucket) | How long successful creates took, split by whether a warm pool, a parked container or a running V8-isolate group served them. |
+
+A rise in `crashed` or `out_of_memory` stops together with `restarted` starts means sandboxes are crashing over and over. The D2 Capability Matrix dashboard in [`setup/grafana`](https://github.com/aerol-ai/microvm/tree/main/setup/grafana) has a panel with all four counters.
+
 ## Send metrics and traces with OpenTelemetry
 
 OpenTelemetry (OTEL) is a standard way to send metrics and traces (a timed record of each request) to a collector. Prometheus pulls numbers. OTEL pushes them, over OTLP/HTTP.

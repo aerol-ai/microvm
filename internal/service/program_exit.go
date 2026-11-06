@@ -121,6 +121,7 @@ func (s *Service) probeProgramExit(ctx context.Context, sb *models.Sandbox) {
 	}
 	sb.ProgramExitedAt = &at
 	sb.StatusReason, sb.ExitCode = models.StatusReasonProgramExited, program.ExitCode
+	recordSandboxFinished(*program.ExitCode)
 	s.logger.Info("main program exited", "sandbox_id", sb.ID, "exit_code", *program.ExitCode,
 		"state", program.State, "destroy_after", sb.Lifecycle.DestroyAfterExitFor.String())
 }

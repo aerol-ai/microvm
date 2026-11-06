@@ -257,6 +257,10 @@ func (s *Service) markSandboxStopped(ctx context.Context, sandbox *models.Sandbo
 	recordExit := func(error) {}
 	if mode == stopModeInvoluntary && event.Action == "die" && wasStarted {
 		recordExit = s.beginSystemActionReason(ctx, sandbox.ID, systemActionRuntimeExited, sandbox.StatusReason)
+		recordSandboxStop(sandbox.StatusReason)
+		if sandbox.StatusReason == models.StatusReasonProgramExited && sandbox.ExitCode != nil {
+			recordSandboxFinished(*sandbox.ExitCode)
+		}
 	}
 	if oomKilled {
 		sandbox.LastError = "container killed by OOM"

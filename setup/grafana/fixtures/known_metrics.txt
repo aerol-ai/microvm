@@ -143,3 +143,10 @@ aerolvm_key_store_call_seconds_bucket
 aerolvm_key_store_limiter_wait_seconds_bucket
 aerolvm_server_key_rows
 aerolvm_toolbox_calls_total
+# Lifecycle counters and the warm/cold create latency
+# (plans/agent-sandbox-feature-parity.md O1).
+aerolvm_create_latency_by_start_seconds_bucket
+aerolvm_sandbox_expired_total
+aerolvm_sandbox_finished_total
+aerolvm_sandbox_starts_total
+aerolvm_sandbox_stops_total

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	wasmpool "github.com/aerol-ai/microvm/internal/pool/wasm"
+	"github.com/aerol-ai/microvm/internal/scaleobs"
 	"github.com/aerol-ai/microvm/pkg/models"
 	wasmengine "github.com/aerol-ai/microvm/pkg/wasm"
 	"github.com/aerol-ai/microvm/pkg/wasm/worker"
@@ -107,9 +108,13 @@ func TestTryAcquireWarmErrNoSlot(t *testing.T) {
 func TestTryAcquireWarmHit(t *testing.T) {
 	d := New(Config{ModulesDir: t.TempDir()}, nil)
 	d.SetWarmPool(hitSlotPool{})
-	slot, err := d.tryAcquireWarm(context.Background(), "digest-hit", "/path/m.wasm", 256)
+	ctx, warm := scaleobs.WithWarmStart(context.Background())
+	slot, err := d.tryAcquireWarm(ctx, "digest-hit", "/path/m.wasm", 256)
 	if err != nil || slot == nil {
 		t.Fatalf("expected warm hit: slot=%v err=%v", slot, err)
+	}
+	if !warm.Load() {
+		t.Fatal("a warm pool hit did not mark the create warm")
 	}
 	if slot.ID != "warm-cov-1" {
 		t.Fatalf("slot.ID = %q, want warm-cov-1", slot.ID)

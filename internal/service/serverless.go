@@ -294,6 +294,10 @@ func (s *Service) stopSandboxForReason(ctx context.Context, id string, mode stop
 	cancelReason := ""
 	if alreadyStopped {
 		cancelReason = reason
+	} else {
+		// Counted here, not on the die event that follows: that event
+		// carries this stop's expectation and counts nothing.
+		recordSandboxStop(reason)
 	}
 	// A failed cancel fails the stop, so the caller retries it rather than
 	// see a "stopped" that the sweep's restart later undoes.

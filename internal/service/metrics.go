@@ -6,6 +6,7 @@ import (
 	"expvar"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/runtime"
@@ -123,7 +124,10 @@ var (
 	wakeCircuitOpen     = expvar.NewInt("aerolvm_wake_circuit_open")
 )
 
-func beginSandboxCreateMetric() func(error) {
+// beginSandboxCreateMetric starts a create's metrics. warm is the create's
+// warm marker (scaleobs.WithWarmStart): a successful create is also observed
+// as warm or cold (O1); nil counts as cold.
+func beginSandboxCreateMetric(warm *atomic.Bool) func(error) {
 	createQueueDepth.Add(1)
 	start := time.Now()
 	return func(err error) {
@@ -133,6 +137,7 @@ func beginSandboxCreateMetric() func(error) {
 		createLastNanos.Set(elapsed.Nanoseconds())
 		createLatency.Observe(elapsed)
 		if err == nil {
+			observeCreateStart(warm, elapsed)
 			return
 		}
 		reason := classifyServiceMetricError(err)

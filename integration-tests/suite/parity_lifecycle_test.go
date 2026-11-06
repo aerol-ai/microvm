@@ -290,3 +290,50 @@ func TestParityLifecycleAuditFeedLive(t *testing.T) {
 	}
 	t.Fatalf("no lifecycle.auto_stop record with reason idle; system records: %+v", last.Events)
 }
+
+// UC-401 — lifecycle counters (plan O1): a stop and a start of a sandbox
+// move aerolvm_sandbox_stops_total{key="user_stop"} and
+// aerolvm_sandbox_starts_total{key="requested"}, summed over every node.
+func TestParityLifecycleCountersLive(t *testing.T) {
+	harness.Require(t, sc, "UC-401")
+	targets := harness.LoadIntegrationTargets()
+	bases := map[string]string{}
+	for _, node := range targets.Nodes {
+		bases[node.Name] = nodeBase(t, node)
+	}
+	sum := func(name, key string) float64 {
+		total := 0.0
+		for _, base := range bases {
+			total += harness.MetricValueOrZero(nodeMetrics(t, base), name, map[string]string{"key": key})
+		}
+		return total
+	}
+	c := client(t)
+	sb := c.NewSandbox(t, sdktypes.CreateSandboxOptions{Name: harness.UniqueName(sc, t)})
+	waitRunning(t, sb)
+	stopsBefore := sum("aerolvm_sandbox_stops_total", sdktypes.StatusReasonUserStop)
+	startsBefore := sum("aerolvm_sandbox_starts_total", "requested")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+	if _, err := c.SDK().Stop(ctx, sb.ID); err != nil {
+		t.Fatalf("stop: %v", err)
+	}
+	waitReason(t, c, sb.ID, "stopped", sdktypes.StatusReasonUserStop, time.Minute)
+	if _, err := c.SDK().Start(ctx, sb.ID); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	waitReason(t, c, sb.ID, "started", "", 90*time.Second)
+
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		stops, starts := sum("aerolvm_sandbox_stops_total", sdktypes.StatusReasonUserStop), sum("aerolvm_sandbox_starts_total", "requested")
+		if stops >= stopsBefore+1 && starts >= startsBefore+1 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("lifecycle counters: stops{user_stop} %v -> %v, starts{requested} %v -> %v", stopsBefore, stops, startsBefore, starts)
+		}
+		time.Sleep(2 * time.Second)
+	}
+}

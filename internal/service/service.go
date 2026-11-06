@@ -31,6 +31,7 @@ import (
 	"github.com/aerol-ai/microvm/internal/netsplice"
 	"github.com/aerol-ai/microvm/internal/runtime"
 	wasmruntime "github.com/aerol-ai/microvm/internal/runtime/wasm"
+	"github.com/aerol-ai/microvm/internal/scaleobs"
 	"github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/internal/version"
 	"github.com/aerol-ai/microvm/pkg/auditexport"
@@ -1694,6 +1695,7 @@ func (s *Service) recordFailoverReason(ctx context.Context, id string) {
 	if err != nil && s.logger != nil {
 		s.logger.Warn("cluster: record failover status reason failed", "sandbox_id", id, "err", err)
 	}
+	recordSandboxStart(startKindFailover)
 	// The recreate is an automatic start the log should show (L3); ctx
 	// names system:failover.
 	s.beginSystemActionReason(ctx, id, systemActionFailoverRecreated, models.StatusReasonFailover)(nil)
@@ -1870,7 +1872,10 @@ func gpuVendorForCapacity(req *models.GPURequest) string {
 }
 
 func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxRequest, idOverride string) (resp *models.CreateSandboxResponse, err error) {
-	done := beginSandboxCreateMetric()
+	// The runtime that serves this create from something already running
+	// (a warm pool slot, a parked container) marks it warm (O1).
+	ctx, warm := scaleobs.WithWarmStart(ctx)
+	done := beginSandboxCreateMetric(warm)
 	defer func() { done(err) }()
 	// A caller-supplied id (CreateSandboxWithID / the X-Cluster-Create-ID
 	// forward header) becomes a host path component in the mount manager and the
@@ -2465,6 +2470,9 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 		return nil, capacity.AsNetworkSlotExhausted(networkSlotPool(chosenEngine), err)
 	}
 	s.releaseAdoptedParkReservation(state)
+	if state.AdoptedParkID != "" {
+		scaleobs.MarkWarmStart(ctx)
+	}
 	if gatewayMode {
 		cr, ok := runtime.AsContainerRuntime(ociRt)
 		attachSB := &models.Sandbox{ID: sandboxID, ContainerID: state.ContainerID, ContainerIP: state.ContainerIP, Runtime: chosenRuntime, Engine: chosenEngine,
@@ -3672,6 +3680,11 @@ func (s *Service) startSandbox(ctx context.Context, id string, cause startCause)
 		// Logged inside; a running sandbox is not restarted, and its next
 		// stop cancels again.
 		_ = s.cancelPendingRestart(ctx, sandbox, "")
+	}
+	if cause == startForRestart {
+		recordSandboxStart(startKindRestarted)
+	} else {
+		recordSandboxStart(startKindRequested)
 	}
 	s.settleEgressAttach(id)
 	s.settleEnforcedEgress(ctx, sandbox, clearGen)
@@ -6536,6 +6549,7 @@ func (s *Service) Reconcile(ctx context.Context) error {
 		recordFound := func(error) {}
 		if foundStopped && s.rowStillStarted(ctx, sandbox.ID) {
 			recordFound = s.beginSystemActionReason(ctx, sandbox.ID, systemActionFoundStopped, models.StatusReasonReconcile)
+			recordSandboxStop(models.StatusReasonReconcile)
 		}
 		err := s.store.Upsert(ctx, sandbox)
 		recordFound(err)
@@ -6860,6 +6874,7 @@ func (s *Service) runLifecycleSweep(ctx context.Context) {
 			if err != nil {
 				s.logger.Warn("auto-destroy failed", "sandbox_id", sandbox.ID, "error", err)
 			} else {
+				recordSandboxExpired(reason)
 				s.logger.Info("audit lifecycle auto-destroy", "sandbox_id", sandbox.ID)
 			}
 		case lifecycleStop:

@@ -10,6 +10,7 @@ import (
 	"time"
 
 	vmmpool "github.com/aerol-ai/microvm/internal/pool/vmm"
+	"github.com/aerol-ai/microvm/internal/scaleobs"
 	"github.com/aerol-ai/microvm/pkg/firecracker"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
@@ -164,7 +165,8 @@ func TestCreate_WarmHit(t *testing.T) {
 	pool, handle := stageWarmFixture(t, f)
 	stageWarmTemplate(t, f, false)
 
-	state, err := f.driver.Create(context.Background(), models.CreateSandboxRequest{
+	ctx, warm := scaleobs.WithWarmStart(context.Background())
+	state, err := f.driver.Create(ctx, models.CreateSandboxRequest{
 		Image:      "alpine:3.20",
 		CPU:        1,
 		MemoryMB:   128,
@@ -173,6 +175,9 @@ func TestCreate_WarmHit(t *testing.T) {
 	}, "sb-warm-hit", "tok", nil)
 	if err != nil {
 		t.Fatalf("Create: %v", err)
+	}
+	if !warm.Load() {
+		t.Fatal("a warm pool hit did not mark the create warm (O1)")
 	}
 	if state == nil || state.Status != models.SandboxStatusStarted {
 		t.Fatalf("state = %+v, want SandboxStatusStarted", state)
@@ -272,7 +277,8 @@ func TestCreate_WarmMissFallsBackToColdSpawn(t *testing.T) {
 	pool.acquireEr = vmmpool.ErrNoLoadedSlot
 	stageWarmTemplate(t, f, false)
 
-	state, err := f.driver.Create(context.Background(), models.CreateSandboxRequest{
+	ctx, warm := scaleobs.WithWarmStart(context.Background())
+	state, err := f.driver.Create(ctx, models.CreateSandboxRequest{
 		Image:      "alpine:3.20",
 		CPU:        1,
 		MemoryMB:   128,
@@ -281,6 +287,9 @@ func TestCreate_WarmMissFallsBackToColdSpawn(t *testing.T) {
 	}, "sb-warm-miss", "tok", nil)
 	if err != nil {
 		t.Fatalf("Create on miss: %v", err)
+	}
+	if warm.Load() {
+		t.Fatal("a warm pool miss marked the create warm")
 	}
 	if state == nil || state.Status != models.SandboxStatusStarted {
 		t.Fatalf("state = %+v, want SandboxStatusStarted", state)
