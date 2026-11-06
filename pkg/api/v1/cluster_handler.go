@@ -2297,13 +2297,27 @@ func (h *handlers) destroyAtUpgradeGate(next http.Handler) http.Handler {
 		}
 		r.Body = io.NopCloser(bytes.NewReader(raw))
 		r.ContentLength = int64(len(raw))
-		var fields map[string]json.RawMessage
-		if json.Unmarshal(raw, &fields) == nil {
-			if v, ok := fields["destroy_at"]; ok && string(v) != "null" && !gate.DestroyAtAllowed() {
-				apihttp.WriteError(w, http.StatusBadRequest, "destroy_at in a lifecycle update needs every cluster node on this release; finish upgrading the cluster first (a create with destroy_at works now)")
-				return
-			}
+		if setsDestroyAt(raw) && !gate.DestroyAtAllowed() {
+			apihttp.WriteError(w, http.StatusBadRequest, "destroy_at in a lifecycle update needs every cluster node on this release; finish upgrading the cluster first (a create with destroy_at works now)")
+			return
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+// setsDestroyAt reports whether a lifecycle body sets destroy_at to a value.
+// The key is matched without case, as encoding/json matches it when the
+// handler decodes the body: "Destroy_At" sets the field too, so an exact
+// match let it past the gate.
+func setsDestroyAt(raw []byte) bool {
+	var fields map[string]json.RawMessage
+	if json.Unmarshal(raw, &fields) != nil {
+		return false
+	}
+	for k, v := range fields {
+		if strings.EqualFold(k, "destroy_at") && string(v) != "null" {
+			return true
+		}
+	}
+	return false
 }

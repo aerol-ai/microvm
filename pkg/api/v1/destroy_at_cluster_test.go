@@ -109,7 +109,14 @@ func TestLifecycleUpdateDestroyAtWaitsForTheWholeCluster(t *testing.T) {
 	if rr := call(at); rr.Code != http.StatusBadRequest || !strings.Contains(rr.Body.String(), "finish upgrading") {
 		t.Fatalf("destroy_at with an older member = %d %s", rr.Code, rr.Body.String())
 	}
-	for _, body := range []string{`{"stop_if_idle_for":60000000000}`, `{"destroy_at":null}`} {
+	// encoding/json matches keys without case, so these set destroy_at too.
+	for _, key := range []string{"Destroy_At", "DESTROY_AT"} {
+		body := strings.Replace(at, "destroy_at", key, 1)
+		if rr := call(body); rr.Code != http.StatusBadRequest {
+			t.Fatalf("%s with an older member = %d %s, want 400", body, rr.Code, rr.Body.String())
+		}
+	}
+	for _, body := range []string{`{"stop_if_idle_for":60000000000}`, `{"destroy_at":null}`, `{"Destroy_At":null}`} {
 		if rr := call(body); rr.Code != http.StatusOK {
 			t.Fatalf("%s with an older member = %d %s", body, rr.Code, rr.Body.String())
 		}
@@ -118,7 +125,7 @@ func TestLifecycleUpdateDestroyAtWaitsForTheWholeCluster(t *testing.T) {
 	if rr := call(at); rr.Code != http.StatusOK {
 		t.Fatalf("destroy_at once every member is upgraded = %d %s", rr.Code, rr.Body.String())
 	}
-	if len(reached) != 3 || reached[2] != at {
+	if len(reached) != 4 || reached[3] != at {
 		t.Fatalf("bodies that reached the handler = %q", reached)
 	}
 }
