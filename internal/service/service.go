@@ -526,6 +526,16 @@ type Service struct {
 	// teamQuotas is the single-node team-quota ledger (team_quotas.go). A
 	// cluster decides quotas on its Raft leader and never uses it.
 	teamQuotas teamQuotaLedger
+	// resizeLocks runs one resize of a sandbox at a time, from its read
+	// through the runtime change and the store write to the quota settle
+	// (ResizeSandbox). Resizes of different sandboxes still run together.
+	resizeLocks ctxKeyedLocks
+	// specLocks serializes this node's read-modify-writes of one sandbox's
+	// replicated spec (replicateSpecPatch, commitPolicySpec, a resize's quota
+	// write and its undo), so one writer cannot put back a field, such as the
+	// size a team is charged for, that another has just changed. A sandbox's
+	// mutations run on its owner, so one node's lock covers them.
+	specLocks ctxKeyedLocks
 	// identity is the cloud-identity issuer state: signing keys, the lazy
 	// bootstrap latch and in-flight token pushes (identity.go).
 	identity identityState
@@ -4778,7 +4788,28 @@ func snapshotImageIsOwnedTag(snapshot *models.SandboxSnapshot) bool {
 		img == docker.SnapshotImageTag(snapshot.Name)
 }
 
+// ResizeSandbox changes a sandbox's CPU, memory or disk.
+//
+// One resize of a sandbox runs at a time, from the read below to the quota
+// settle at the end (resizeLocks); resizes of different sandboxes still run
+// together. Before, two resizes of one sandbox each read the old size, the
+// later one replaced the earlier one's quota claim while the earlier one was
+// still changing the runtime, and a create could be admitted into room the
+// earlier one then used: a 4-CPU team ended up holding 5.
+//
+// The team quota is held for the whole resize at the larger of the old and
+// new size (admitTeamQuotaResize) and settled at the size the store shows
+// at the end, so a downsize frees its room and a failed resize gives back
+// only what it took. If the runtime changed but the store write failed, the
+// runtime is put back first: only then is the hold undone. If that fails
+// too the hold stays at the larger size, so the team is never charged less
+// than the sandbox may hold.
 func (s *Service) ResizeSandbox(ctx context.Context, id string, req models.ResizeSandboxRequest) (*models.Sandbox, error) {
+	unlock, err := s.resizeLocks.lock(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
 	sandbox, err := s.scopedGet(ctx, id)
 	if err != nil {
 		return nil, err
@@ -4792,21 +4823,14 @@ func (s *Service) ResizeSandbox(ctx context.Context, id string, req models.Resiz
 	// A team's quota is checked before host capacity and before anything
 	// changes: resize used to re-admit against the host only, so a team
 	// could grow past its quota one resize at a time (plan item P2).
-	quotaCPU, quotaMem := sandbox.CPU, sandbox.MemoryMB
-	if req.CPU > 0 {
-		quotaCPU = req.CPU
-	}
-	if req.MemoryMB > 0 {
-		quotaMem = req.MemoryMB
-	}
-	undoQuota, quotaWroteSpec, err := s.admitTeamQuotaResize(ctx, sandbox, quotaCPU, quotaMem)
+	hold, err := s.admitTeamQuotaResize(ctx, sandbox, req)
 	if err != nil {
 		return nil, err
 	}
-	resized := false
+	settled := false
 	defer func() {
-		if !resized {
-			undoQuota()
+		if !settled {
+			hold.undo()
 		}
 	}()
 
@@ -4848,6 +4872,7 @@ func (s *Service) ResizeSandbox(ctx context.Context, id string, req models.Resiz
 		}
 		return nil, err
 	}
+	before := *sandbox
 	if req.CPU > 0 {
 		sandbox.CPU = req.CPU
 	}
@@ -4859,10 +4884,12 @@ func (s *Service) ResizeSandbox(ctx context.Context, id string, req models.Resiz
 	}
 	sandbox.UpdatedAt = time.Now().UTC()
 	if err := s.store.Upsert(ctx, sandbox); err != nil {
+		settled = !s.revertResizeAfterStoreFailure(ctx, rt, &before, req, err)
 		return nil, err
 	}
-	resized = true
-	if quotaWroteSpec {
+	settled = true
+	hold.settle(sandbox.CPU, sandbox.MemoryMB)
+	if hold.specHolds(req) {
 		// The quota admission already recorded the new size in the
 		// replicated spec; writing it again would only cost a Raft entry.
 		return s.store.Get(ctx, id)
@@ -4871,7 +4898,9 @@ func (s *Service) ResizeSandbox(ctx context.Context, id string, req models.Resiz
 	// recreate uses the post-resize footprint, not the create-time one. Lives
 	// in the service layer so v1, Daytona, and E2B all inherit the write-
 	// through; previously this was duplicated in the v1 handler and silently
-	// missing from the facades.
+	// missing from the facades. For a team's sandbox it is also where a
+	// cluster records a shrink: until it lands the team counts the larger
+	// size admission wrote, an overcharge, never an undercharge.
 	s.replicateSpecPatch(ctx, id, func(spec *models.CreateSandboxRequest) {
 		if req.CPU > 0 {
 			spec.CPU = req.CPU
@@ -4884,6 +4913,49 @@ func (s *Service) ResizeSandbox(ctx context.Context, id string, req models.Resiz
 		}
 	})
 	return s.store.Get(ctx, id)
+}
+
+// revertResizeAfterStoreFailure handles a resize whose runtime change took
+// but whose store write did not. Giving the quota back while the sandbox may
+// hold the new size would undercharge a resource that grew, so it first puts
+// the runtime back to the size the store still shows. It reports whether
+// that worked: then nothing changed and the caller undoes the quota hold.
+// If not, the sandbox's real size is unknown, so the hold stays at the
+// larger of the two sizes (a pending ledger entry a recount keeps, or the
+// spec admission wrote) and host capacity stays at the new size, and the
+// error is logged for an operator to resize the sandbox again.
+func (s *Service) revertResizeAfterStoreFailure(ctx context.Context, rt runtime.Runtime, before *models.Sandbox, req models.ResizeSandboxRequest, storeErr error) bool {
+	back := models.ResizeSandboxRequest{}
+	if req.CPU > 0 {
+		back.CPU = before.CPU
+	}
+	if req.MemoryMB > 0 {
+		back.MemoryMB = before.MemoryMB
+	}
+	if req.DiskGB > 0 {
+		back.DiskGB = before.DiskGB
+	}
+	// A size the row never recorded cannot be put back.
+	canRevert := (req.CPU <= 0 || back.CPU > 0) && (req.MemoryMB <= 0 || back.MemoryMB > 0) && (req.DiskGB <= 0 || back.DiskGB > 0)
+	var revertErr error
+	if canRevert {
+		// The request may be what ended (a cancelled context fails the
+		// store write too), so the revert gets its own deadline.
+		revertCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+		revertErr = rt.Resize(revertCtx, s.runtimeRef(before), back)
+		cancel()
+		if revertErr == nil {
+			if s.admitter != nil {
+				s.admitter.Reserve(before.ID, capacityRequestFromSandbox(before))
+			}
+			return true
+		}
+	}
+	if s.logger != nil {
+		s.logger.Error("resize: the runtime changed but the store write failed and the runtime could not be put back; the team quota keeps the larger size, resize the sandbox again",
+			"sandbox_id", before.ID, "store_err", storeErr, "revert_err", revertErr)
+	}
+	return false
 }
 
 // UpdateLifecycle replaces the lifecycle timers on an existing sandbox.

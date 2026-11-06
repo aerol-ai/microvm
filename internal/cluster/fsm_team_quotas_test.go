@@ -230,11 +230,11 @@ func TestQuotaAdmitMarking(t *testing.T) {
 	if markQuotaAdmit(context.Background(), command{Op: opPlace}).QuotaAdmit {
 		t.Fatal("an unmarked context must not mark")
 	}
-	if !needsTeamQuotaAdmission(command{Op: opUpsertSpec, QuotaAdmit: true}) || needsTeamQuotaAdmission(command{Op: opReserve, QuotaAdmit: true}) {
+	if !needsTeamQuotaAdmission(command{Op: opPlace, QuotaAdmit: true}) || needsTeamQuotaAdmission(command{Op: opReserve, QuotaAdmit: true}) {
 		t.Fatal("needsTeamQuotaAdmission")
 	}
 	b, _ := json.Marshal(command{Op: opPlace})
-	if strings.Contains(string(b), "quota_admit") || strings.Contains(string(b), "team_quota") {
+	if strings.Contains(string(b), "quota_admit") || strings.Contains(string(b), "team_quota") || strings.Contains(string(b), "quota_replay") {
 		t.Fatalf("an unmarked command grew quota fields on the wire: %s", b)
 	}
 }

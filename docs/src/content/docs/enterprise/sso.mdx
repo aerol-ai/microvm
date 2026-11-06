@@ -454,12 +454,12 @@ Leave a limit out to set no limit on it. Setting a quota needs the `admin` role 
 **What happens at the limit.**
 
 - A create that would go past the quota fails with `429` and the code `team_quota_exceeded`. The message names the team, the limit and what the team holds. There is no `Retry-After`: only deleting sandboxes or raising the quota makes room.
-- A resize that grows a sandbox past the quota fails the same way. A resize that shrinks one always works.
+- A resize that grows a sandbox past the quota fails the same way. A resize that shrinks one always works, and frees its room once it is done. Two resizes of the same sandbox run one after the other, never at once.
 - Lowering a quota removes nothing. The team keeps what it has, but it cannot create, grow or start sandboxes until it is back under the new limit.
 - Two creates racing for the last slot never both get it. On one server, one lock decides. In a cluster, the leader decides for every node, against the sandboxes the whole cluster has recorded, so the answer is the same whichever node you call.
 - A sandbox that a cluster moves to a healthy node after a failure is not counted twice and is never refused.
 
-**Safe to retry.** Setting the same limits twice changes nothing. Deleting a quota that is already gone succeeds. In a cluster, a quota can be set only once every server runs a release that has quotas. Until then the call answers `503`.
+**Safe to retry.** Setting the same limits twice changes nothing. Deleting a quota that is already gone succeeds. In a cluster, a quota can be set only once every node runs a release that has quotas: servers, workers and ingress nodes. Until then the call answers `503`, because a node on an older release can grow a sandbox without asking the leader first. For the same reason, do not roll a node back to such a release while a quota is set.
 
 ## Sign in with your company account
 

@@ -222,12 +222,19 @@ type command struct {
 	// TeamQuota carries the quota for opPutTeamQuota, and its team for
 	// opDeleteTeamQuota (fsm_team_quotas.go).
 	TeamQuota *TeamQuotaRecord `json:"team_quota,omitempty"`
-	// QuotaAdmit marks an opPlace or opUpsertSpec that can grow a team's
-	// usage (a create that skipped the reservation, a resize), so the leader
-	// admits it against the team's quota like a reservation. Every other
-	// promote or spec write is applied as before. Apply ignores it: an older
+	// QuotaAdmit marks an opPlace that can grow a team's usage (a create
+	// that skipped the reservation), so the leader admits it against the
+	// team's quota like a reservation. A spec write needs no mark: the leader
+	// checks every one that grows a team's sandbox (teamQuotaAsks), because a
+	// worker on an older build never sets it. Apply ignores it: an older
 	// replica reads the same state from the entry.
 	QuotaAdmit bool `json:"quota_admit,omitempty"`
+	// QuotaReplay marks an opUpsertSpec that records what a sandbox already
+	// is (the boot backfill of a spec the row never had), so the leader does
+	// not refuse it. It can only loosen the check for builds that know quotas;
+	// an older build never sets it, so its spec writes are always checked.
+	// Apply ignores it.
+	QuotaReplay bool `json:"quota_replay,omitempty"`
 }
 
 type reservationCommand struct {

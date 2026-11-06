@@ -28,7 +28,11 @@ const (
 
 // teamQuotaFSMOpsVersion: opPutTeamQuota, opDeleteTeamQuota. A leader writes
 // a quota only once every Raft server reports it, so no replica ever skips a
-// quota op, and once quotas exist every possible leader enforces them.
+// quota op, and once quotas exist every possible leader enforces them. It
+// sets one only once every live member, any role, reports it too
+// (teamQuotaWritesAllowed): a worker on an older build grows a sandbox
+// before it tells the leader, and a node on one reserves a facade create
+// without the caller's owner, so the leader could stop neither.
 const teamQuotaFSMOpsVersion = 9
 
 // ErrTeamQuotaExceeded is a reservation, promote or spec change the leader
@@ -184,10 +188,14 @@ type teamQuotaAsk struct {
 }
 
 // teamQuotaAsks lists what a command would add to team usage. Only the
-// commands that can grow a team are admitted: reservations, and a promote or
-// spec change the caller marked (QuotaAdmit) because it is a create or a
-// resize. Boot replay, orphan claims and failover moves are never refused:
-// they move a sandbox the team already holds.
+// commands that can grow a team are admitted: reservations, a promote the
+// caller marked (QuotaAdmit) because it is a create, and every spec write.
+// A spec write is checked whatever its sender says, because a worker on a
+// build before quotas resizes with an unmarked one; one that does not grow
+// the sandbox passes (checkTeamQuotasLocked checks growth only). Boot replay
+// (an unmarked promote, or a spec backfill marked QuotaReplay), orphan claims
+// and failover moves are never refused: they move or describe a sandbox the
+// team already holds.
 func teamQuotaAsks(cmd command) []teamQuotaAsk {
 	ask := func(id, ownerRef string, spec *models.CreateSandboxRequest) (teamQuotaAsk, bool) {
 		if spec == nil {
@@ -208,8 +216,14 @@ func teamQuotaAsks(cmd command) []teamQuotaAsk {
 				out = append(out, a)
 			}
 		}
-	case opPlace, opUpsertSpec:
+	case opPlace:
 		if cmd.QuotaAdmit {
+			if a, ok := ask(cmd.SandboxID, cmd.OwnerRef, cmd.Spec); ok {
+				out = append(out, a)
+			}
+		}
+	case opUpsertSpec:
+		if !cmd.QuotaReplay {
 			if a, ok := ask(cmd.SandboxID, cmd.OwnerRef, cmd.Spec); ok {
 				out = append(out, a)
 			}

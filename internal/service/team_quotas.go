@@ -236,56 +236,191 @@ func (s *Service) releaseTeamQuota(sandbox *models.Sandbox) {
 	}
 }
 
-// admitTeamQuotaResize checks a resize that grows a team's sandbox before
-// anything changes, and returns how to undo the claim if the resize then
-// fails. One node: the ledger. A cluster: the spec write that records the
-// new size goes first, admitted by the leader (QuotaAdmit); undo writes the
-// old size back. A sandbox no team owns, or a resize that does not grow,
-// takes the old path unchanged.
-func (s *Service) admitTeamQuotaResize(ctx context.Context, sandbox *models.Sandbox, cpu float64, memoryMB int) (undo func(), wroteSpec bool, err error) {
-	noop := func() {}
+// teamQuotaResize is a resize's hold on its team's quota, taken before the
+// runtime changes and settled once the store shows the result. It holds the
+// larger of the old and new size, per dimension, for as long as the resize
+// runs: growth is charged before the sandbox can grow, and a shrink frees
+// room only once it has happened. One node: a ledger entry (ledger). A
+// cluster: the size written into the replicated spec, which the leader
+// admitted. A nil hold (no team, or nothing to hold) does nothing.
+type teamQuotaResize struct {
+	s      *Service
+	ledger *teamResizeHold
+	// A cluster's spec write: what admission wrote, and what it replaced.
+	sandboxID        string
+	wroteCPU, oldCPU float64
+	wroteMem, oldMem int
+}
+
+// undo gives the hold back when the resize changed nothing.
+func (r *teamQuotaResize) undo() {
+	if r == nil {
+		return
+	}
+	if r.ledger != nil {
+		r.ledger.undo()
+		return
+	}
+	r.s.unwriteResizeSpec(r)
+}
+
+// settle records the size the resize left the sandbox at, once the store
+// shows it. One node only: a smaller size is recorded too, so a downsize
+// frees its room. A cluster records it with the resize's spec write-through.
+func (r *teamQuotaResize) settle(cpu float64, memoryMB int) {
+	if r == nil || r.ledger == nil {
+		return
+	}
+	cpu, memoryMB = models.QuotaSize(cpu, memoryMB)
+	r.ledger.settle(cpu, memoryMB)
+}
+
+// specHolds reports whether admission already wrote req's whole result into
+// the replicated spec, so the write-through after the resize would only cost
+// a Raft entry.
+func (r *teamQuotaResize) specHolds(req models.ResizeSandboxRequest) bool {
+	if r == nil || r.ledger != nil || r.sandboxID == "" || req.DiskGB > 0 {
+		return false
+	}
+	return (req.CPU <= 0 || req.CPU == r.wroteCPU) && (req.MemoryMB <= 0 || req.MemoryMB == r.wroteMem)
+}
+
+// admitTeamQuotaResize takes a resize's hold on its team's quota before
+// anything changes, refusing growth past the quota. A sandbox no team owns
+// has no hold.
+//
+// One node: the ledger holds the larger of the row's size and req's under
+// the sandbox's id until the hold settles; a shrink is held at the old size
+// and recorded at settle. A cluster: the leader counts the replicated spec,
+// so growth is judged against the spec, in the dimensions req changes. A
+// resize that grows writes the larger size into the spec first, and the
+// leader admits that write (fsm_team_quotas.go); one that does not writes
+// nothing here and is recorded by the write-through after it succeeds.
+func (s *Service) admitTeamQuotaResize(ctx context.Context, sandbox *models.Sandbox, req models.ResizeSandboxRequest) (*teamQuotaResize, error) {
 	team := models.TeamOfOwnerRef(sandbox.OwnerRef)
-	if team == "" || (cpu <= sandbox.CPU && memoryMB <= sandbox.MemoryMB) {
-		return noop, false, nil
+	if team == "" {
+		return nil, nil
 	}
 	if !s.ClusterEnabled() {
 		if s.store == nil {
-			return noop, false, nil
+			return nil, nil
 		}
-		undo, err := s.teamQuotas.resize(ctx, s.store, team, sandbox.ID, cpu, memoryMB)
-		return undo, false, err
+		cpu, memoryMB := sandbox.CPU, sandbox.MemoryMB
+		if req.CPU > 0 {
+			cpu = req.CPU
+		}
+		if req.MemoryMB > 0 {
+			memoryMB = req.MemoryMB
+		}
+		cpu, memoryMB = models.QuotaSize(cpu, memoryMB)
+		hold, err := s.teamQuotas.beginResize(ctx, s.store, team, sandbox.ID, cpu, memoryMB)
+		if err != nil || hold == nil {
+			return nil, err
+		}
+		return &teamQuotaResize{s: s, ledger: hold}, nil
+	}
+	if req.CPU <= 0 && req.MemoryMB <= 0 {
+		return nil, nil
 	}
 	c := s.Cluster()
 	if c == nil {
-		return noop, false, nil
+		return nil, nil
 	}
+	unlock, err := s.lockSpec(ctx, sandbox.ID)
+	if err != nil {
+		return nil, fmt.Errorf("%w: record the new size: %v", ErrTeamQuotaUnavailable, err)
+	}
+	defer unlock()
 	spec := c.SpecOf(sandbox.ID)
 	if spec == nil {
-		// No replicated spec to grow: nothing records the new size, so the
-		// leader has nothing to admit. The post-resize write-through stays
-		// best effort, exactly as before quotas.
-		return noop, false, nil
+		if req.CPU <= sandbox.CPU && req.MemoryMB <= sandbox.MemoryMB {
+			return nil, nil
+		}
+		// Nothing records this sandbox's size (a spec never replicated, or
+		// a worker that could not read it just now), so the leader has
+		// nothing to admit the growth against. Not knowing is not being
+		// under: refuse unless the team has no quota at all.
+		return nil, s.refuseUnadmittableGrowth(ctx, team, sandbox.ID)
 	}
-	old := *spec
-	spec.CPU, spec.MemoryMB = cpu, memoryMB
+	oldCPU, oldMem := models.QuotaSize(spec.CPU, spec.MemoryMB)
+	if req.CPU <= oldCPU && req.MemoryMB <= oldMem {
+		return nil, nil
+	}
+	held := &teamQuotaResize{s: s, sandboxID: sandbox.ID, oldCPU: spec.CPU, oldMem: spec.MemoryMB}
+	// Each dimension holds the larger size; one that does not grow keeps the
+	// spec's own value, so a default stays a default.
+	if req.CPU > oldCPU {
+		spec.CPU = req.CPU
+	}
+	if req.MemoryMB > oldMem {
+		spec.MemoryMB = req.MemoryMB
+	}
+	held.wroteCPU, held.wroteMem = spec.CPU, spec.MemoryMB
 	commitCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	if err := c.UpsertSpec(cluster.WithTeamQuotaAdmission(commitCtx), sandbox.ID, spec, cluster.PlacementSecrets{}); err != nil {
 		if errors.Is(err, ErrTeamQuotaExceeded) {
-			return noop, false, err
+			return nil, err
 		}
 		// The size could not be recorded, so it could not be admitted: a
 		// growth the quota never saw must not happen.
-		return noop, false, fmt.Errorf("%w: record the new size: %v", ErrTeamQuotaUnavailable, err)
+		return nil, fmt.Errorf("%w: record the new size: %v", ErrTeamQuotaUnavailable, err)
 	}
-	return func() {
-		rbCtx, rbCancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer rbCancel()
-		if err := c.UpsertSpec(rbCtx, sandbox.ID, &old, cluster.PlacementSecrets{}); err != nil && s.logger != nil {
-			s.logger.Warn("team quota: could not write back the old size after a failed resize; the team counts the larger size until the next spec write",
-				"sandbox_id", sandbox.ID, "err", err)
-		}
-	}, true, nil
+	return held, nil
+}
+
+// refuseUnadmittableGrowth answers a growing resize whose size the cluster
+// does not hold: nil when the team has no quota (nothing to admit against),
+// otherwise a retryable refusal. A quota read that fails refuses too.
+func (s *Service) refuseUnadmittableGrowth(ctx context.Context, team, sandboxID string) error {
+	qc, err := s.quotaCluster()
+	if err != nil {
+		return err
+	}
+	resp, err := qc.ReadTeamQuota(ctx, cluster.TeamQuotaReadRequest{Team: team})
+	if err != nil {
+		return quotaClusterError(err)
+	}
+	if !resp.Found {
+		return nil
+	}
+	return fmt.Errorf("%w: sandbox %s has no replicated size to admit its growth against; retry once it has one", ErrTeamQuotaUnavailable, sandboxID)
+}
+
+// unwriteResizeSpec puts back the size a failed resize's admission wrote,
+// but only while the spec still holds exactly that size: one that changed
+// since (a replay or a recreate wrote it) is newer than this resize, and
+// writing over it would undo that. Putting the old size back is a shrink,
+// which the leader never refuses. A failure leaves the larger size counted
+// until the next spec write: an overcharge, never an undercharge.
+func (s *Service) unwriteResizeSpec(r *teamQuotaResize) {
+	c := s.Cluster()
+	if c == nil || r.sandboxID == "" {
+		return
+	}
+	rbCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	unlock, err := s.lockSpec(rbCtx, r.sandboxID)
+	if err != nil {
+		s.warnResizeSpecUndo(r.sandboxID, err)
+		return
+	}
+	defer unlock()
+	spec := c.SpecOf(r.sandboxID)
+	if spec == nil || spec.CPU != r.wroteCPU || spec.MemoryMB != r.wroteMem {
+		return
+	}
+	spec.CPU, spec.MemoryMB = r.oldCPU, r.oldMem
+	if err := c.UpsertSpec(rbCtx, r.sandboxID, spec, cluster.PlacementSecrets{}); err != nil {
+		s.warnResizeSpecUndo(r.sandboxID, err)
+	}
+}
+
+func (s *Service) warnResizeSpecUndo(sandboxID string, err error) {
+	if s.logger != nil {
+		s.logger.Warn("team quota: could not write back the old size after a failed resize; the team counts the larger size until the next spec write",
+			"sandbox_id", sandboxID, "err", err)
+	}
 }
 
 // checkTeamQuotaForStart refuses to start a stopped sandbox of a team that
@@ -348,7 +483,15 @@ type teamLedger struct {
 type teamLedgerEntry struct {
 	cpu      float64
 	memoryMB int
-	pending  bool
+	// pending marks a charge the store does not show yet, so a recount
+	// from the store keeps it: a create still running (keyed pending:N), or
+	// a resize under the sandbox's id, holding its larger size until the
+	// store shows the result. Without it a refused create's recount dropped
+	// a running resize's growth and admitted a create into its room.
+	pending bool
+	// gen names the resize that wrote the entry, so only that resize settles
+	// or undoes it: a destroy, or a later resize, is never overwritten.
+	gen uint64
 }
 
 func (l *teamLedger) add(key string, e teamLedgerEntry) {
@@ -486,37 +629,78 @@ func (q *teamQuotaLedger) release(team, id string) {
 	}
 }
 
-// resize re-sizes a sandbox's share, refusing growth past the quota.
-func (q *teamQuotaLedger) resize(ctx context.Context, st *store.Store, team, id string, cpu float64, mem int) (func(), error) {
+// teamResizeHold is one resize's ledger entry, settled or undone by gen.
+type teamResizeHold struct {
+	ledger *teamQuotaLedger
+	team   string
+	id     string
+	gen    uint64
+	old    teamLedgerEntry
+	had    bool
+}
+
+// beginResize holds sandbox id at the larger of its counted size and
+// cpu/mem, per dimension, until the hold settles, refusing only growth past
+// the quota (a shrink of a team over a lowered quota must still pass, or it
+// could never get back under). nil for a team with no quota.
+func (q *teamQuotaLedger) beginResize(ctx context.Context, st *store.Store, team, id string, cpu float64, mem int) (*teamResizeHold, error) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
-	noop := func() {}
 	tl, limits, err := q.teamLocked(ctx, st, team)
 	if err != nil || tl == nil {
-		return noop, err
+		return nil, err
 	}
 	old, had := tl.entries[id]
-	grow := models.TeamQuotaUsage{CPU: max(cpu-old.cpu, 0), MemoryMB: max(mem-old.memoryMB, 0)}
+	held := teamLedgerEntry{cpu: max(old.cpu, cpu), memoryMB: max(old.memoryMB, mem), pending: true}
+	grow := models.TeamQuotaUsage{CPU: held.cpu - old.cpu, MemoryMB: held.memoryMB - old.memoryMB}
 	if !had {
+		held = teamLedgerEntry{cpu: cpu, memoryMB: mem, pending: true}
 		grow = models.TeamQuotaUsage{Sandboxes: 1, CPU: cpu, MemoryMB: mem}
 	}
-	if err := models.CheckTeamQuota(team, limits, tl.usage, grow); err != nil {
-		return noop, err
+	if grow != (models.TeamQuotaUsage{}) {
+		if err := models.CheckTeamQuota(team, limits, tl.usage, grow); err != nil {
+			return nil, err
+		}
 	}
-	tl.add(id, teamLedgerEntry{cpu: cpu, memoryMB: mem})
-	return func() {
-		q.mu.Lock()
-		defer q.mu.Unlock()
-		cur := q.teams[team]
-		if cur == nil {
+	q.seq++
+	held.gen = q.seq
+	tl.add(id, held)
+	return &teamResizeHold{ledger: q, team: team, id: id, gen: held.gen, old: old, had: had}, nil
+}
+
+// settle records the size the store now shows for the sandbox.
+func (h *teamResizeHold) settle(cpu float64, mem int) {
+	h.update(func(tl *teamLedger) {
+		tl.add(h.id, teamLedgerEntry{cpu: cpu, memoryMB: mem})
+	})
+}
+
+// undo puts back what the sandbox counted before the resize.
+func (h *teamResizeHold) undo() {
+	h.update(func(tl *teamLedger) {
+		if h.had {
+			tl.add(h.id, h.old)
 			return
 		}
-		if had {
-			cur.add(id, old)
-		} else if e, ok := cur.entries[id]; ok {
-			cur.remove(id, e)
-		}
-	}, nil
+		tl.remove(h.id, tl.entries[h.id])
+	})
+}
+
+// update applies fn while the sandbox's entry is still this resize's. An
+// entry that is gone (a destroy released it, the quota was dropped) or that
+// another resize wrote is left alone.
+func (h *teamResizeHold) update(fn func(*teamLedger)) {
+	q := h.ledger
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	tl := q.teams[h.team]
+	if tl == nil {
+		return
+	}
+	if e, ok := tl.entries[h.id]; !ok || e.gen != h.gen {
+		return
+	}
+	fn(tl)
 }
 
 // status returns a team's limits and usage.

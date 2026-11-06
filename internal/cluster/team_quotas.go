@@ -23,11 +23,13 @@ const (
 
 type teamQuotaAdmissionKey struct{}
 
-// WithTeamQuotaAdmission marks ctx so the next opPlace or opUpsertSpec it
-// carries is admitted against the sandbox's team quota (QuotaAdmit). The
-// create path sets it for a promote that had no reservation, and resize for
-// the spec write that grows a sandbox. The flag rides the command, so it
-// reaches the leader through any number of forwards.
+type teamQuotaReplayKey struct{}
+
+// WithTeamQuotaAdmission marks ctx so the next opPlace it carries is
+// admitted against the sandbox's team quota (QuotaAdmit): the create path
+// sets it for a promote that had no reservation. The flag rides the command,
+// so it reaches the leader through any number of forwards. A spec write is
+// checked without it; the resize path still sets it, which changes nothing.
 func WithTeamQuotaAdmission(ctx context.Context) context.Context {
 	return context.WithValue(ctx, teamQuotaAdmissionKey{}, true)
 }
@@ -37,19 +39,55 @@ func teamQuotaAdmission(ctx context.Context) bool {
 	return v
 }
 
-// markQuotaAdmit copies the context mark onto the command types it applies
+// withTeamQuotaReplay marks ctx so the next opUpsertSpec it carries is the
+// boot backfill of what a sandbox already is (QuotaReplay), never refused.
+func withTeamQuotaReplay(ctx context.Context) context.Context {
+	return context.WithValue(ctx, teamQuotaReplayKey{}, true)
+}
+
+func teamQuotaReplay(ctx context.Context) bool {
+	v, _ := ctx.Value(teamQuotaReplayKey{}).(bool)
+	return v
+}
+
+// markQuotaAdmit copies the context marks onto the command types they apply
 // to; every other command is left exactly as it was.
 func markQuotaAdmit(ctx context.Context, cmd command) command {
 	if (cmd.Op == opPlace || cmd.Op == opUpsertSpec) && teamQuotaAdmission(ctx) {
 		cmd.QuotaAdmit = true
 	}
+	if cmd.Op == opUpsertSpec && teamQuotaReplay(ctx) {
+		cmd.QuotaReplay = true
+	}
 	return cmd
 }
 
-// needsTeamQuotaAdmission reports whether a command must take the leader's
-// admission path for team quotas (reservations always take it already).
+// needsTeamQuotaAdmission reports whether a command can grow a team's usage
+// beyond a reservation (reservations always take the admission path): a
+// marked promote, or any spec write that is not a replay. It reads only the
+// command, so a leader decides the same for a command any build sent.
 func needsTeamQuotaAdmission(cmd command) bool {
-	return cmd.QuotaAdmit && (cmd.Op == opPlace || cmd.Op == opUpsertSpec)
+	switch cmd.Op {
+	case opPlace:
+		return cmd.QuotaAdmit
+	case opUpsertSpec:
+		return cmd.Spec != nil && !cmd.QuotaReplay
+	}
+	return false
+}
+
+// takesTeamQuotaAdmission reports whether the leader must admit cmd under
+// its admission queue: it can grow a team, and that team has a quota. A spec
+// write of a sandbox no limited team owns (most of them) keeps the plain
+// apply path, so lifecycle and policy write-throughs do not queue behind
+// creates. A quota put that lands between this read and the append only
+// orders the write before the quota, the same as a reservation admitted
+// just before it.
+func (c *Cluster) takesTeamQuotaAdmission(cmd command) bool {
+	if !needsTeamQuotaAdmission(cmd) || c.fsm == nil {
+		return false
+	}
+	return c.fsm.anyTeamQuotaFor(teamQuotaAsks(cmd))
 }
 
 // admitTeamQuotaCommand is the leader's quota answer for cmd. It runs under
@@ -110,9 +148,22 @@ func (c *Cluster) applyQuotaAdmittedEncodedLocal(ctx context.Context, payload []
 	return c.applyEncodedLocal(ctx, payload)
 }
 
-// teamQuotaWritesAllowed is the rolling-upgrade gate for quota ops.
-func (c *Cluster) teamQuotaWritesAllowed() error {
-	return c.raftServersSupport(teamQuotaFSMOpsVersion, "team quotas")
+// teamQuotaWritesAllowed is the rolling-upgrade gate for quota ops. Every
+// Raft server must apply them. A put also waits for every live member, any
+// role: until then a node on an older build could grow a team's sandbox the
+// leader never hears about first (a worker resizes, then writes the spec),
+// so setting a quota would promise a limit the cluster cannot keep. A delete
+// only loosens, so the Raft gate is enough for it. The boot-window rule of
+// liveMembersAtLeast applies: a leader that has just restarted and knows
+// only itself refuses a put until it has rejoined.
+func (c *Cluster) teamQuotaWritesAllowed(req TeamQuotaWriteRequest) error {
+	if err := c.raftServersSupport(teamQuotaFSMOpsVersion, "team quotas"); err != nil {
+		return err
+	}
+	if !req.Delete && !c.gossip.liveMembersAtLeast(teamQuotaFSMOpsVersion) {
+		return fmt.Errorf("%w: a live node runs a build that does not enforce team quotas; set the quota once every node is upgraded", ErrClusterVersion)
+	}
+	return nil
 }
 
 // WriteTeamQuota puts or deletes a team's quota. The leader checks the
@@ -128,7 +179,7 @@ func (c *Cluster) WriteTeamQuota(ctx context.Context, req TeamQuotaWriteRequest)
 		}
 		return out, out.err()
 	}
-	if err := c.teamQuotaWritesAllowed(); err != nil {
+	if err := c.teamQuotaWritesAllowed(req); err != nil {
 		return TeamQuotaWriteResponse{}, err
 	}
 	op := opPutTeamQuota

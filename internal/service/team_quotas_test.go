@@ -141,25 +141,25 @@ func TestTeamQuotaLedgerEdges(t *testing.T) {
 		t.Fatalf("after a failed create = %+v", usage)
 	}
 	// Resize of a sandbox the ledger never saw counts it whole; undo removes it.
-	undo, err := svc.teamQuotas.resize(ctx, st, "risk", "sb-x", 1, 128)
+	hold, err := svc.teamQuotas.beginResize(ctx, st, "risk", "sb-x", 1, 128)
 	if err != nil {
 		t.Fatal(err)
 	}
-	undo()
+	hold.undo()
 	if _, usage, _, _ = svc.teamQuotas.status(ctx, st, "risk"); usage.Sandboxes != 0 {
 		t.Fatalf("undo of an unseen sandbox = %+v", usage)
 	}
 	// Resize of a tracked sandbox; undo restores the old size.
 	tk, _ := svc.admitTeamQuotaCreate(ctx, "team:risk", models.CreateSandboxRequest{CPU: 1})
 	tk.settle(&models.CreateSandboxResponse{Sandbox: models.Sandbox{ID: "sb-y"}}, nil)
-	undo, err = svc.teamQuotas.resize(ctx, st, "risk", "sb-y", 2, models.DefaultMemoryMB)
+	hold, err = svc.teamQuotas.beginResize(ctx, st, "risk", "sb-y", 2, models.DefaultMemoryMB)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := svc.teamQuotas.resize(ctx, st, "risk", "sb-y", 3, models.DefaultMemoryMB); !errors.Is(err, models.ErrTeamQuotaExceeded) {
+	if _, err := svc.teamQuotas.beginResize(ctx, st, "risk", "sb-y", 3, models.DefaultMemoryMB); !errors.Is(err, models.ErrTeamQuotaExceeded) {
 		t.Fatalf("growth past the quota = %v", err)
 	}
-	undo()
+	hold.undo()
 	if _, usage, _, _ = svc.teamQuotas.status(ctx, st, "risk"); usage.CPU != 1 {
 		t.Fatalf("undo = %+v, want the old CPU 1", usage)
 	}
@@ -173,17 +173,24 @@ func TestTeamQuotaLedgerEdges(t *testing.T) {
 		t.Fatal(err)
 	}
 	tk.settle(&models.CreateSandboxResponse{Sandbox: models.Sandbox{ID: "sb-z"}}, nil)
-	undo()
+	hold.undo()
+	hold.settle(1, 1)
 	svc.releaseTeamQuota(&models.Sandbox{ID: "sb-z", OwnerRef: "team:risk"})
 	svc.releaseTeamQuota(nil)
 	var nilTicket *teamQuotaTicket
 	nilTicket.settle(nil, nil)
-	// A resize that does not grow, or of a sandbox no team owns, is not checked.
-	if _, wrote, err := svc.admitTeamQuotaResize(ctx, &models.Sandbox{ID: "a", OwnerRef: "team:risk", CPU: 2, MemoryMB: 512}, 1, 512); err != nil || wrote {
-		t.Fatalf("shrink = %v %v", wrote, err)
+	// A team with no quota, or a sandbox no team owns, takes no hold.
+	if h, err := svc.admitTeamQuotaResize(ctx, &models.Sandbox{ID: "a", OwnerRef: "team:risk", CPU: 2, MemoryMB: 512}, models.ResizeSandboxRequest{CPU: 1, MemoryMB: 512}); err != nil || h != nil {
+		t.Fatalf("resize with no quota = %v %v", h, err)
 	}
-	if _, wrote, err := svc.admitTeamQuotaResize(ctx, &models.Sandbox{ID: "a", CPU: 1}, 8, 8192); err != nil || wrote {
-		t.Fatalf("operator resize = %v %v", wrote, err)
+	if h, err := svc.admitTeamQuotaResize(ctx, &models.Sandbox{ID: "a", CPU: 1}, models.ResizeSandboxRequest{CPU: 8, MemoryMB: 8192}); err != nil || h != nil {
+		t.Fatalf("operator resize = %v %v", h, err)
+	}
+	var nilHold *teamQuotaResize
+	nilHold.undo()
+	nilHold.settle(1, 1)
+	if nilHold.specHolds(models.ResizeSandboxRequest{CPU: 1}) {
+		t.Fatal("a nil hold wrote nothing")
 	}
 	if err := svc.checkTeamQuotaForStart(ctx, &models.Sandbox{ID: "a"}); err != nil {
 		t.Fatalf("operator start = %v", err)
@@ -235,6 +242,8 @@ func (c *quotaStubCluster) UpsertSpec(_ context.Context, _ string, spec *models.
 		return err
 	}
 	c.upserts = append(c.upserts, *spec)
+	cp := *spec
+	c.spec = &cp
 	return nil
 }
 
@@ -320,25 +329,32 @@ func TestTeamQuotaClusterResizeAndStart(t *testing.T) {
 	}
 	svc.releaseTeamQuota(sb) // a no-op in a cluster
 
-	undo, wrote, err := svc.admitTeamQuotaResize(ctx, sb, 2, 512)
-	if err != nil || !wrote || len(stub.upserts) != 1 || stub.upserts[0].CPU != 2 {
-		t.Fatalf("grow = %v %v %+v", wrote, err, stub.upserts)
+	hold, err := svc.admitTeamQuotaResize(ctx, sb, models.ResizeSandboxRequest{CPU: 2, MemoryMB: 512})
+	if err != nil || hold == nil || len(stub.upserts) != 1 || stub.upserts[0].CPU != 2 {
+		t.Fatalf("grow = %v %v %+v", hold, err, stub.upserts)
 	}
-	undo()
+	if !hold.specHolds(models.ResizeSandboxRequest{CPU: 2}) || hold.specHolds(models.ResizeSandboxRequest{CPU: 2, DiskGB: 5}) {
+		t.Fatal("specHolds: the admitted write holds a CPU-only resize, not one that also changes disk")
+	}
+	hold.undo()
 	if len(stub.upserts) != 2 || stub.upserts[1].CPU != 1 {
 		t.Fatalf("undo must write the old size back: %+v", stub.upserts)
 	}
+	// A shrink writes nothing up front: the write-through records it.
+	if h, err := svc.admitTeamQuotaResize(ctx, sb, models.ResizeSandboxRequest{CPU: 0.5, MemoryMB: 512}); err != nil || h != nil || len(stub.upserts) != 2 {
+		t.Fatalf("shrink = %v %v %+v", h, err, stub.upserts)
+	}
 	stub.upsertErr = models.ErrTeamQuotaExceeded
-	if _, _, err := svc.admitTeamQuotaResize(ctx, sb, 4, 512); !errors.Is(err, models.ErrTeamQuotaExceeded) {
+	if _, err := svc.admitTeamQuotaResize(ctx, sb, models.ResizeSandboxRequest{CPU: 4, MemoryMB: 512}); !errors.Is(err, models.ErrTeamQuotaExceeded) {
 		t.Fatalf("grow past the quota = %v", err)
 	}
 	stub.upsertErr = errors.New("no leader")
-	if _, _, err := svc.admitTeamQuotaResize(ctx, sb, 4, 512); !errors.Is(err, ErrTeamQuotaUnavailable) {
+	if _, err := svc.admitTeamQuotaResize(ctx, sb, models.ResizeSandboxRequest{CPU: 4, MemoryMB: 512}); !errors.Is(err, ErrTeamQuotaUnavailable) {
 		t.Fatalf("grow with no leader = %v, want ErrTeamQuotaUnavailable (fail closed)", err)
 	}
 	stub.spec = nil
-	if _, wrote, err := svc.admitTeamQuotaResize(ctx, sb, 4, 512); err != nil || wrote {
-		t.Fatalf("no replicated spec = %v %v", wrote, err)
+	if h, err := svc.admitTeamQuotaResize(ctx, sb, models.ResizeSandboxRequest{CPU: 4, MemoryMB: 512}); err != nil || h != nil {
+		t.Fatalf("no replicated spec and no quota = %v %v", h, err)
 	}
 
 	// Start: refused only when the team is already over its quota.

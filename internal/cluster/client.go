@@ -1355,7 +1355,9 @@ func (c *Cluster) AssertOwnership(ctx context.Context, local []LocalSandboxState
 				if needsSecretBackfill {
 					replaySecrets = st.Secrets
 				}
-				if err := c.UpsertSpec(ctx, st.ID, spec, replaySecrets); err != nil && firstErr == nil {
+				// A backfill records what the sandbox already is, so a
+				// team over a lowered quota does not refuse it.
+				if err := c.UpsertSpec(withTeamQuotaReplay(ctx), st.ID, spec, replaySecrets); err != nil && firstErr == nil {
 					firstErr = err
 				}
 			}
@@ -1451,7 +1453,7 @@ func (c *Cluster) applyCommand(ctx context.Context, cmd command) error {
 		if cmd.Op == opReserve || cmd.Op == opReserveBatch {
 			return c.applyReservationEncodedLocal(ctx, payload, cmd)
 		}
-		if needsTeamQuotaAdmission(cmd) {
+		if c.takesTeamQuotaAdmission(cmd) {
 			return c.applyQuotaAdmittedEncodedLocal(ctx, payload, cmd)
 		}
 		return c.applyEncodedLocal(ctx, payload)
@@ -1484,7 +1486,7 @@ func (c *Cluster) ApplyEncoded(ctx context.Context, payload []byte) error {
 	if cmd.Op == opReserve || cmd.Op == opReserveBatch {
 		return c.applyReservationEncodedLocal(ctx, payload, cmd)
 	}
-	if needsTeamQuotaAdmission(cmd) {
+	if c.takesTeamQuotaAdmission(cmd) {
 		return c.applyQuotaAdmittedEncodedLocal(ctx, payload, cmd)
 	}
 	return c.applyEncodedLocal(ctx, payload)

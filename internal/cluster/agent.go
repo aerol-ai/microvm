@@ -1037,7 +1037,9 @@ func (a *Agent) AssertOwnership(ctx context.Context, local []LocalSandboxState) 
 				if needsSecretBackfill {
 					replaySecrets = st.Secrets
 				}
-				if err := a.UpsertSpec(ctx, st.ID, spec, replaySecrets); err != nil && firstErr == nil {
+				// A backfill records what the sandbox already is, so a
+				// team over a lowered quota does not refuse it.
+				if err := a.UpsertSpec(withTeamQuotaReplay(ctx), st.ID, spec, replaySecrets); err != nil && firstErr == nil {
 					firstErr = err
 				}
 			}
