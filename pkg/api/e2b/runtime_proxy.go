@@ -90,9 +90,10 @@ func (h *handlers) runtimeProxy(w http.ResponseWriter, r *http.Request) {
 	}
 
 	proxy := httputil.NewSingleHostReverseProxy(target)
-	// The shared toolbox transport: no connection pooled past its sandbox,
-	// and a dead sandbox noticed within the dead-peer bound.
-	proxy.Transport = toolboxhttp.Transport
+	// The shared toolbox proxy transport: no connection pooled past its
+	// sandbox, a dead sandbox noticed within the dead-peer bound, and a dial
+	// tried again while envd refuses the connection (I1).
+	proxy.Transport = toolboxhttp.ProxyTransport
 	originalDirector := proxy.Director
 	toolboxToken := endpoint.Token
 	proxy.Director = func(req *http.Request) {

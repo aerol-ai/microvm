@@ -112,7 +112,10 @@ func (s *Service) serveToolboxReverseProxy(ctx, callCtx context.Context, sandbox
 		return fmt.Errorf("invalid toolbox target: %w", err)
 	}
 	proxy := httputil.NewSingleHostReverseProxy(target)
-	proxy.Transport = toolboxhttp.Transport
+	// Dials again while toolboxd refuses the connection (I1): inside the
+	// dial, so no part of the request has gone out and the call is still
+	// counted once below.
+	proxy.Transport = toolboxhttp.ProxyTransport
 	originalDirector := proxy.Director
 	toolboxToken := endpoint.Token
 	proxy.Director = func(req *http.Request) {
@@ -279,7 +282,9 @@ func (s *Service) roundTripToolbox(ctx, callCtx context.Context, sandboxID, meth
 	if err != nil {
 		return nil, false, err
 	}
-	resp, err := toolboxhttp.Client(0).Do(req)
+	// The same refused-dial retry as the reverse proxy (I1): body is read
+	// only once the connection is made, so it is never sent twice.
+	resp, err := toolboxhttp.ProxyClient(0).Do(req)
 	if err != nil {
 		if stopped := s.toolboxBrokenCause(callCtx, sandbox); stopped != nil {
 			return nil, false, stopped

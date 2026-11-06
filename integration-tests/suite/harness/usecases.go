@@ -1020,6 +1020,11 @@ var Registry = []UseCase{
 	{ID: "UC-435", Title: "The token push route cannot be reached through the toolbox proxy, and identity env in a create that conflicts with the identity is refused with 400", Requires: []Capability{CapCloudIdentity}, Implemented: true},
 	{ID: "UC-436", Title: "In a cluster a token signed on the sandbox's owner verifies with the JWKS every node serves", Requires: []Capability{CapCloudIdentity, CapCluster}, Implemented: true},
 	{ID: "UC-437", Title: "Taking a role tag off the allow list stops new tokens: a restarted sandbox that used it gets none and says why", Requires: []Capability{CapCloudIdentity, CapDomain}, Implemented: true},
+	// Agent-sandbox parity, ops lane (parity_ops_test.go; plan I1, O3). The
+	// I1 cases make the owner node refuse sandboxd's connects to one
+	// sandbox's toolboxd with an OUTPUT rule (TCP reset), so they need SSH.
+	{ID: "UC-453", Title: "Toolbox dial retry: while the owner node refuses sandboxd's connects to a sandbox's toolboxd, an exec waits, reaches toolboxd once the refusal ends and answers 200, the command runs exactly once, and aerolvm_toolbox_dial_retries_total{key=connected} grows on the owner", Requires: []Capability{CapDocker}, Excludes: []Capability{CapNoHostFirewall}, Implemented: true},
+	{ID: "UC-454", Title: "Toolbox dial retry gives up: a toolboxd refused for longer than the retry window fails the exec with 502 after the 1.4 s of retries (not at once, not minutes later), 4 connects were refused, and the command never ran", Requires: []Capability{CapDocker}, Excludes: []Capability{CapNoHostFirewall}, Implemented: true},
 }
 
 // byID is a lookup built once for the report generator.
