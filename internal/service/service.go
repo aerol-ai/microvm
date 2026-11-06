@@ -7305,18 +7305,20 @@ func (s *Service) gcZombieCaddyEntries(ctx context.Context, sandboxes []*models.
 		s.logger.Warn("caddy snapshot for zombie gc failed", "error", err)
 		return
 	}
-	// The caller read its rows before this snapshot, so a sandbox created or
-	// a port exposed since then has routes in the snapshot that its rows
-	// don't explain. Read the rows again, after it, and expect both sets'
-	// routes; without the second read the sweep can't tell a new route from a
-	// zombie, so it waits for the next pass.
+	// Rows read before this snapshot can't explain a route made after them
+	// (a sandbox created, a port exposed), so the sweep reads the rows once,
+	// after the snapshot, and uses only those: every route in the snapshot
+	// is then either explained by a row or a real zombie (a create in flight
+	// is exempt below). The caller's rows are used only when there is no
+	// store to read (tests). One read, not two merged: at fleet scale each
+	// read is the whole sandboxes table.
 	if s.store != nil {
 		fresh, err := s.store.List(ctx)
 		if err != nil {
 			s.logger.Warn("zombie gc: sandbox list after the caddy snapshot failed; skipping this pass", "error", err)
 			return
 		}
-		sandboxes = append(append(make([]*models.Sandbox, 0, len(sandboxes)+len(fresh)), sandboxes...), fresh...)
+		sandboxes = fresh
 	}
 
 	expectedHTTP := make(map[string]struct{})
@@ -7874,11 +7876,8 @@ func (s *Service) applyInFluxRoute(ctx context.Context, p cluster.Placement) err
 }
 
 func (s *Service) gcClusterIngressRoutes(ctx context.Context) error {
-	known, err := s.store.List(ctx)
-	if err != nil {
-		return fmt.Errorf("cluster ingress gc list sandboxes: %w", err)
-	}
-	s.gcZombieCaddyEntries(ctx, known)
+	// gcZombieCaddyEntries reads the rows itself, after its Caddy snapshot.
+	s.gcZombieCaddyEntries(ctx, nil)
 	return nil
 }
 
