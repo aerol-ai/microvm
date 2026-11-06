@@ -329,9 +329,16 @@ func TestBankEgressFloorFailsClosedAndHeals(t *testing.T) {
 		t.Cleanup(func() {
 			if !healed {
 				// Never leave a node without its floor for the cases after
-				// this one: a restart installs it at boot.
-				t.Logf("floor %s on %s was not put back; restarting sandboxd there: %s", floor.Name, node.Name,
+				// this one: a restart installs it at boot. The node is
+				// wherever the sandbox landed, the seed included: a restart
+				// (not a stop) brings the daemon straight back and the other
+				// members keep a quorum, so it is safe on the seed too, as
+				// long as the next case waits for the node to rejoin.
+				t.Logf("floor %s on %s (seed: %v) was not put back; restarting sandboxd there: %s", floor.Name, node.Name, node.Seed,
 					nodeSSH(t, node, "sudo systemctl restart sandboxd && echo restarted"))
+				if err := waitNodeRejoined(t, node); err != nil {
+					t.Errorf("RESTORE INCOMPLETE: sandboxd was restarted on %s but it did not rejoin the cluster: %v; every later case in this run is against a smaller fleet", node.Name, err)
+				}
 			}
 		})
 		t.Logf("removed %s (the %s floor for %s, first in %s) on %s: %s", floor.Name, key, floor.Src, parent, node.Name, strings.TrimSpace(out))
