@@ -727,8 +727,8 @@ func (s *server) handleExec(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid JSON body")
 		return
 	}
-	if strings.TrimSpace(req.Command) == "" {
-		writeError(w, http.StatusBadRequest, "command is required")
+	if msg := validateArgvRequest(strings.TrimSpace(req.Command) != "", req.Argv); msg != "" {
+		writeError(w, http.StatusBadRequest, msg)
 		return
 	}
 	if req.MaxStdoutBytes < 0 || req.MaxStderrBytes < 0 {
@@ -744,17 +744,36 @@ func (s *server) handleExec(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), timeout)
 	defer cancel()
 
-	shell, err := detectShell()
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-
 	start := time.Now()
-	// A login shell, so profile setup applies; the image's PATH, which
-	// /etc/profile resets, goes back in front before the command runs.
-	cmd := exec.CommandContext(ctx, shell, "-lc", loginshell.Prefix(req.Command))
-	cmd.Env = append(append(childEnviron(), envMapToSlice(req.Env)...), loginshell.EnvFor(req.Env)...)
+	env := append(append(childEnviron(), envMapToSlice(req.Env)...), loginshell.EnvFor(req.Env)...)
+	shell, shellErr := detectShell()
+	var cmd *exec.Cmd
+	direct := false
+	switch {
+	case len(req.Argv) == 0:
+		if shellErr != nil {
+			writeError(w, http.StatusInternalServerError, shellErr.Error())
+			return
+		}
+		// A login shell, so profile setup applies; the image's PATH, which
+		// /etc/profile resets, goes back in front before the command runs.
+		cmd = exec.CommandContext(ctx, shell, "-lc", loginshell.Prefix(req.Command))
+	case shellErr == nil:
+		// The same login shell and PATH, with the arguments passed through
+		// "$@" unparsed (E2).
+		args := shellArgv(shell, true, req.Argv)
+		cmd = exec.CommandContext(ctx, args[0], args[1:]...)
+	default:
+		path, code, stderr := resolveArgvProgram(req.Argv[0], argvSearchPath(env, req.Env), req.WorkDir)
+		if code != 0 {
+			writeJSON(w, http.StatusOK, models.ExecResult{Stderr: stderr, ExitCode: code, DurationMS: time.Since(start).Milliseconds()})
+			return
+		}
+		cmd = exec.CommandContext(ctx, path, req.Argv[1:]...)
+		cmd.Args[0] = req.Argv[0]
+		direct = true
+	}
+	cmd.Env = env
 	if req.WorkDir != "" {
 		cmd.Dir = req.WorkDir
 	}
@@ -765,6 +784,12 @@ func (s *server) handleExec(w http.ResponseWriter, r *http.Request) {
 
 	out, err := runBufferedExecLimited(s.logger, cmd, execOutputLimits{stdout: req.MaxStdoutBytes, stderr: req.MaxStderrBytes})
 	if err != nil {
+		if direct {
+			if code, stderr, ok := argvStartFailure(req.Argv[0], req.WorkDir, err); ok {
+				writeJSON(w, http.StatusOK, models.ExecResult{Stderr: stderr, ExitCode: code, DurationMS: time.Since(start).Milliseconds()})
+				return
+			}
+		}
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}

@@ -102,3 +102,79 @@ func TestParityExecOutputCapClamp(t *testing.T) {
 		t.Fatalf("kept %d bytes (truncated %v), want the caller's 1024", len(res.Stdout), res.StdoutTruncated)
 	}
 }
+
+// parityArgv is a program and arguments a shell would mangle: spaces,
+// quotes, $, ; and backticks reach printf whole, or the output shows it.
+var parityArgv = []string{"printf", "%s|", "a b", "'single'", `"double"`, "$HOME", "; echo pwned", "`id`", "*"}
+
+const parityArgvWant = `a b|'single'|"double"|$HOME|; echo pwned|` + "`id`" + `|*|`
+
+// UC-382 — exec with argv (plan E2): hostile-looking arguments reach the
+// program with no shell parsing, on exec and on the exec stream, and argv
+// finds a program the login profile puts on PATH, as a command does.
+func TestParityExecArgv(t *testing.T) {
+	harness.Require(t, sc, "UC-382")
+	sb := paritySandbox(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	res, err := sb.Exec(ctx, sdktypes.ExecRequest{Argv: parityArgv})
+	if err != nil {
+		t.Fatalf("argv exec: %v", err)
+	}
+	if res.Stdout != parityArgvWant || res.ExitCode != 0 {
+		t.Fatalf("argv exec = %q exit %d, want %q", res.Stdout, res.ExitCode, parityArgvWant)
+	}
+
+	var out strings.Builder
+	handle, err := sb.ExecStream(ctx, sdktypes.ExecStreamOptions{Argv: parityArgv, OnStdout: func(b []byte) { out.Write(b) }})
+	if err != nil {
+		t.Fatalf("argv stream: %v", err)
+	}
+	exit, err := handle.Wait()
+	if err != nil || exit.Code != 0 || out.String() != parityArgvWant {
+		t.Fatalf("argv stream = %q exit %+v err %v, want %q", out.String(), exit, err, parityArgvWant)
+	}
+
+	// A tool only the login profile puts on PATH (conda, nix and sdkman do
+	// it this way) is found by argv exactly as by a command string.
+	setup := "mkdir -p /opt/uc382/bin && printf '#!/bin/sh\\nprintf \"tool:%%s\" \"$1\"\\n' > /opt/uc382/bin/uc382tool && " +
+		"chmod +x /opt/uc382/bin/uc382tool && echo 'PATH=\"$PATH:/opt/uc382/bin\"; export PATH' > /etc/profile.d/uc382.sh"
+	if res, err := sb.ExecCommand(ctx, setup); err != nil || res.ExitCode != 0 {
+		t.Fatalf("profile setup: %+v %v", res, err)
+	}
+	for _, req := range []sdktypes.ExecRequest{{Command: "uc382tool 'a b'"}, {Argv: []string{"uc382tool", "a b"}}} {
+		res, err := sb.Exec(ctx, req)
+		if err != nil || res.Stdout != "tool:a b" || res.ExitCode != 0 {
+			t.Fatalf("%+v = %+v %v, want the profile's tool", req, res, err)
+		}
+	}
+	_, _ = sb.ExecCommand(ctx, "rm -rf /opt/uc382 /etc/profile.d/uc382.sh")
+}
+
+// UC-383 — argv naming a missing program answers like a shell: exit 127
+// and a "not found" line on stderr, on exec and on the exec stream.
+func TestParityExecArgvMissingProgram(t *testing.T) {
+	harness.Require(t, sc, "UC-383")
+	sb := paritySandbox(t)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+
+	res, err := sb.Exec(ctx, sdktypes.ExecRequest{Argv: []string{"uc383-no-such-program", "x"}})
+	if err != nil {
+		t.Fatalf("exec: %v", err)
+	}
+	if res.ExitCode != 127 || !strings.Contains(res.Stderr, "not found") {
+		t.Fatalf("missing program = exit %d stderr %q, want 127 and not found", res.ExitCode, res.Stderr)
+	}
+
+	var stderr strings.Builder
+	handle, err := sb.ExecStream(ctx, sdktypes.ExecStreamOptions{Argv: []string{"uc383-no-such-program"}, OnStderr: func(b []byte) { stderr.Write(b) }})
+	if err != nil {
+		t.Fatalf("stream: %v", err)
+	}
+	exit, err := handle.Wait()
+	if err != nil || exit.Code != 127 || !strings.Contains(stderr.String(), "not found") {
+		t.Fatalf("missing program stream = %+v %v stderr %q", exit, err, stderr.String())
+	}
+}

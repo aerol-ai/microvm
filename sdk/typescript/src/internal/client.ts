@@ -1012,10 +1012,16 @@ export class APIClient {
   }
 
   async exec(id: string, request: ExecRequest): Promise<ExecResult> {
+    // An older agent ignores the caps and returns all output, and refuses
+    // argv with a confusing "command is required"; check first.
+    const features: string[] = [];
     if (request.maxStdoutBytes || request.maxStderrBytes) {
-      // An older agent ignores the caps and returns all output.
-      await this.requireToolboxFeatures(id, "exec.max_output_bytes");
+      features.push("exec.max_output_bytes");
     }
+    if (request.argv?.length) {
+      features.push("exec.argv");
+    }
+    await this.requireToolboxFeatures(id, ...features);
     // Not idempotent: a re-sent exec runs the caller's command a second time.
     const response = await this.doJSON<ApiExecResult>(
       "POST",
@@ -1027,7 +1033,13 @@ export class APIClient {
   }
 
   execStream(id: string, options: ExecStreamOptions): ExecStreamHandle {
-    return openExecStream(this.baseURL, this.versionPrefix, this.patToken, id, options);
+    if (options.command?.trim() && options.argv?.length) {
+      throw new Error("set command or argv, not both");
+    }
+    // argv waits for the feature check: the start message goes out only once
+    // the agent has listed exec.argv, so an older one never receives it.
+    const ready = options.argv?.length ? this.requireToolboxFeatures(id, "exec.argv") : undefined;
+    return openExecStream(this.baseURL, this.versionPrefix, this.patToken, id, options, ready);
   }
 
   async createSession(id: string, options: CreateSessionOptions): Promise<Session> {
@@ -1813,6 +1825,7 @@ function toApiResizeOptions(options: ResizeOptions): Record<string, unknown> {
 function toApiExecRequest(request: ExecRequest): Record<string, unknown> {
   return {
     command: request.command,
+    argv: request.argv,
     workdir: request.workDir,
     env: request.env,
     timeout_seconds: request.timeoutSeconds,
@@ -2266,7 +2279,14 @@ function toWebSocketBinaryFrame(data: Uint8Array | string): Uint8Array<ArrayBuff
   return frame;
 }
 
-function openExecStream(baseURL: string, versionPrefix: string, patToken: string, sandboxID: string, options: ExecStreamOptions): ExecStreamHandle {
+function openExecStream(
+  baseURL: string,
+  versionPrefix: string,
+  patToken: string,
+  sandboxID: string,
+  options: ExecStreamOptions,
+  ready?: Promise<void>,
+): ExecStreamHandle {
   const wsURL = baseURL.replace(/^http/, "ws") + `${versionPrefix}/sandboxes/${encodeURIComponent(sandboxID)}/toolbox/process/exec/stream`;
 
   const WS = (globalThis as { WebSocket?: typeof WebSocket }).WebSocket;
@@ -2298,21 +2318,59 @@ function openExecStream(baseURL: string, versionPrefix: string, patToken: string
     resolved = true;
     exitResolve?.(info);
   };
-  const failWith = (msg: string) => {
+  const failWith = (msg: string | Error) => {
     if (resolved) return;
     resolved = true;
-    exitReject?.(new Error(msg));
+    exitReject?.(typeof msg === "string" ? new Error(msg) : msg);
   };
 
-  ws.addEventListener("open", () => {
+  // Frames the caller sends after the socket opened but before a delayed
+  // start message (argv's feature check) wait here, so the start message is
+  // always first. Before the socket opens, send fails as it always has.
+  let started = false;
+  const pending: (string | Uint8Array<ArrayBuffer>)[] = [];
+  const send = (data: string | Uint8Array<ArrayBuffer>) => {
+    if (!started && ws.readyState === 1) {
+      pending.push(data);
+      return;
+    }
+    ws.send(data);
+  };
+  const sendStart = () => {
     ws.send(JSON.stringify({
       command: options.command,
+      argv: options.argv,
       workdir: options.workdir,
       env: options.env,
       tty: options.tty ?? false,
       cols: options.cols ?? 0,
       rows: options.rows ?? 0,
     }));
+    started = true;
+    for (const data of pending.splice(0)) {
+      ws.send(data);
+    }
+  };
+
+  // The check can fail before the socket opens; mark it handled now so
+  // Node does not report an unhandled rejection, and act on it at "open".
+  ready?.catch(() => undefined);
+  ws.addEventListener("open", () => {
+    if (!ready) {
+      sendStart();
+      return;
+    }
+    ready.then(
+      () => {
+        if (!resolved) {
+          sendStart();
+        }
+      },
+      (err: unknown) => {
+        failWith(err instanceof Error ? err : new Error(String(err)));
+        ws.close();
+      },
+    );
   });
 
   ws.addEventListener("message", (event: MessageEvent) => {
@@ -2360,19 +2418,19 @@ function openExecStream(baseURL: string, versionPrefix: string, patToken: string
   });
 
   const sendBinary = (data: Uint8Array | string) => {
-    ws.send(toWebSocketBinaryFrame(data));
+    send(toWebSocketBinaryFrame(data));
   };
 
   return {
     write: sendBinary,
     resize(cols: number, rows: number) {
-      ws.send(JSON.stringify({ type: "resize", cols, rows }));
+      send(JSON.stringify({ type: "resize", cols, rows }));
     },
     signal(name: string) {
-      ws.send(JSON.stringify({ type: "signal", signal: name }));
+      send(JSON.stringify({ type: "signal", signal: name }));
     },
     close() {
-      ws.send(JSON.stringify({ type: "close" }));
+      send(JSON.stringify({ type: "close" }));
     },
     done,
   };

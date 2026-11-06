@@ -72,7 +72,10 @@ var execStreamUpgrader = websocket.Upgrader{
 }
 
 type execStreamStartMsg struct {
-	Command string            `json:"command"`
+	Command string `json:"command"`
+	// Argv runs a program with these arguments instead of Command, with no
+	// shell parsing (E2); see exec_argv.go.
+	Argv    []string          `json:"argv,omitempty"`
 	Workdir string            `json:"workdir,omitempty"`
 	Env     map[string]string `json:"env,omitempty"`
 	TTY     bool              `json:"tty,omitempty"`
@@ -113,23 +116,46 @@ func (s *server) handleExecStream(w http.ResponseWriter, r *http.Request) {
 		writeStreamControl(conn, execStreamControlOut{Type: "error", Message: "invalid start message"})
 		return
 	}
-	if start.Command == "" {
-		writeStreamControl(conn, execStreamControlOut{Type: "error", Message: "command is required"})
+	if msg := validateArgvRequest(start.Command != "", start.Argv); msg != "" {
+		writeStreamControl(conn, execStreamControlOut{Type: "error", Message: msg})
 		return
 	}
 
+	env := mergeEnvForExec(start.Env)
 	// Without this an image with no shell fails at start with "fork/exec
 	// /bin/sh: no such file or directory", which reads as a toolboxd fault.
 	shell, err := detectShell()
-	if err != nil {
-		writeStreamControl(conn, execStreamControlOut{Type: "error", Message: err.Error()})
-		return
+	var cmd *exec.Cmd
+	switch {
+	case len(start.Argv) == 0:
+		if err != nil {
+			writeStreamControl(conn, execStreamControlOut{Type: "error", Message: err.Error()})
+			return
+		}
+		cmd = exec.Command(shell, "-c", start.Command)
+	case err == nil:
+		args := shellArgv(shell, false, start.Argv)
+		cmd = exec.Command(args[0], args[1:]...)
+	default:
+		path, code, stderr := resolveArgvProgram(start.Argv[0], argvSearchPath(env, start.Env), start.Workdir)
+		if code != 0 {
+			// What a shell would do: a line of error output, then the exit.
+			// A terminal has one output stream, so it goes there.
+			prefix := streamFramePrefixStderr
+			if start.TTY {
+				prefix = streamFramePrefixStdout
+			}
+			_ = conn.WriteMessage(websocket.BinaryMessage, append([]byte{prefix}, stderr...))
+			writeStreamControl(conn, execStreamControlOut{Type: "exit", Code: code})
+			return
+		}
+		cmd = exec.Command(path, start.Argv[1:]...)
+		cmd.Args[0] = start.Argv[0]
 	}
-	cmd := exec.Command(shell, "-c", start.Command)
 	if start.Workdir != "" {
 		cmd.Dir = start.Workdir
 	}
-	cmd.Env = mergeEnvForExec(start.Env)
+	cmd.Env = env
 
 	// New process group so client-initiated signals can target the whole tree.
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: start.TTY, Setpgid: !start.TTY}

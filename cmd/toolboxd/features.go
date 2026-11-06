@@ -21,6 +21,9 @@ var toolboxFeatures = map[string][]string{
 	// returns all output, which is what a caller that set a cap must never
 	// get by surprise (ER4).
 	"exec.max_output_bytes": {"max_stdout_bytes", "max_stderr_bytes"},
+	// A command as a list, with no shell parsing, on buffered exec and the
+	// exec stream (plan E2). An older agent answers "command is required".
+	"exec.argv": {"argv"},
 }
 
 // baselineRequestOptions are the options toolboxd understood before /version

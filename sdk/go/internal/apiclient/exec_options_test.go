@@ -7,8 +7,11 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"sync"
 	"testing"
+
+	"github.com/gorilla/websocket"
 )
 
 // execAgent is a fake sandboxd whose toolbox plays an agent listing
@@ -19,6 +22,7 @@ type execAgent struct {
 	result   map[string]any
 	calls    []string
 	bodies   []map[string]any
+	starts   []map[string]any // exec stream start messages
 }
 
 func (a *execAgent) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -32,6 +36,23 @@ func (a *execAgent) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			body["features"] = a.features
 		}
 		_ = json.NewEncoder(w).Encode(body)
+	case "/v1/sandboxes/sb-1/toolbox/process/exec/stream":
+		a.mu.Unlock()
+		defer a.mu.Lock()
+		var upgrader websocket.Upgrader
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		var start map[string]any
+		if err := conn.ReadJSON(&start); err != nil {
+			return
+		}
+		a.mu.Lock()
+		a.starts = append(a.starts, start)
+		a.mu.Unlock()
+		_ = conn.WriteJSON(map[string]any{"type": "exit", "code": 0})
 	case "/v1/sandboxes/sb-1/toolbox/process/execute":
 		raw, _ := io.ReadAll(r.Body)
 		var body map[string]any
@@ -107,5 +128,69 @@ func TestExecWithoutCapsSkipsTheVersionCall(t *testing.T) {
 	}
 	if _, ok := agent.bodies[0]["max_stdout_bytes"]; ok {
 		t.Fatalf("uncapped exec sent a cap: %v", agent.bodies[0])
+	}
+}
+
+// E2 + ER4: argv goes out only after the agent listed exec.argv, on exec
+// and on the exec stream; an older agent gets neither (mixed-version).
+func TestExecArgv(t *testing.T) {
+	ctx := context.Background()
+	argv := []string{"printf", "%s|", "a b", "$HOME", "; echo pwned"}
+	client, agent := newExecAgent(t, []string{"exec.argv"}, nil)
+	if _, err := client.Exec(ctx, "sb-1", ExecRequest{Argv: argv}); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := json.Marshal(agent.bodies[0]["argv"])
+	want, _ := json.Marshal(argv)
+	if string(got) != string(want) || agent.bodies[0]["command"] != "" {
+		t.Fatalf("exec body = %v", agent.bodies[0])
+	}
+	handle, err := client.ExecStream(ctx, "sb-1", ExecStreamOptions{Argv: argv})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := handle.Wait(); err != nil {
+		t.Fatal(err)
+	}
+	agent.mu.Lock()
+	start := agent.starts[0]
+	agent.mu.Unlock()
+	got, _ = json.Marshal(start["argv"])
+	if string(got) != string(want) {
+		t.Fatalf("stream start = %v", start)
+	}
+
+	for _, features := range [][]string{nil, {"exec.max_output_bytes"}} {
+		client, agent := newExecAgent(t, features, nil)
+		if _, err := client.Exec(ctx, "sb-1", ExecRequest{Argv: argv}); !errors.Is(err, ErrUnsupportedFeature) {
+			t.Fatalf("features %v: exec err = %v", features, err)
+		}
+		if _, err := client.ExecStream(ctx, "sb-1", ExecStreamOptions{Argv: argv}); !errors.Is(err, ErrUnsupportedFeature) {
+			t.Fatalf("features %v: stream err = %v", features, err)
+		}
+		agent.mu.Lock()
+		calls := slices.Clone(agent.calls)
+		agent.mu.Unlock()
+		if !slices.Equal(calls, []string{"GET /v1/sandboxes/sb-1/toolbox/version", "GET /v1/sandboxes/sb-1/toolbox/version"}) {
+			t.Fatalf("features %v: calls = %v, want only /version reads", features, calls)
+		}
+	}
+}
+
+func TestExecStreamArgvValidation(t *testing.T) {
+	client, agent := newExecAgent(t, []string{"exec.argv"}, nil)
+	for _, tc := range []struct {
+		options ExecStreamOptions
+		want    string
+	}{
+		{ExecStreamOptions{Command: "ls", Argv: []string{"ls"}}, "set command or argv, not both"},
+		{ExecStreamOptions{Command: "  "}, "command is required"},
+	} {
+		if _, err := client.ExecStream(context.Background(), "sb-1", tc.options); err == nil || err.Error() != tc.want {
+			t.Fatalf("%+v: err = %v, want %q", tc.options, err, tc.want)
+		}
+	}
+	if len(agent.calls) != 0 {
+		t.Fatalf("an invalid stream reached the server: %v", agent.calls)
 	}
 }

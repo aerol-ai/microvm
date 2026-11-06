@@ -844,15 +844,21 @@ func (c *Client) SetNetworkLimits(ctx context.Context, id string, request models
 // only when the connection never opened or the server refused it with 429 or
 // 503; any other failure is returned to the caller.
 //
-// MaxStdoutBytes and MaxStderrBytes are checked against the sandbox's agent
-// first: an agent older than them would ignore them and return all output,
-// so the call fails with *UnsupportedFeatureError instead.
+// MaxStdoutBytes, MaxStderrBytes and Argv are checked against the sandbox's
+// agent first: an agent older than them would ignore the caps and return all
+// output, or refuse argv with a confusing "command is required", so the call
+// fails with *UnsupportedFeatureError instead.
 func (c *Client) Exec(ctx context.Context, id string, request ExecRequest) (ExecResult, error) {
 	var response ExecResult
+	var features []string
 	if request.MaxStdoutBytes != 0 || request.MaxStderrBytes != 0 {
-		if err := c.RequireToolboxFeatures(ctx, id, "exec.max_output_bytes"); err != nil {
-			return response, err
-		}
+		features = append(features, "exec.max_output_bytes")
+	}
+	if len(request.Argv) > 0 {
+		features = append(features, "exec.argv")
+	}
+	if err := c.RequireToolboxFeatures(ctx, id, features...); err != nil {
+		return response, err
 	}
 	_, err := c.doJSONHeaders(ctx, http.MethodPost, c.versionPrefix+"/sandboxes/"+id+"/toolbox/process/execute", request, &response, retryUnsentOnly)
 	return response, err

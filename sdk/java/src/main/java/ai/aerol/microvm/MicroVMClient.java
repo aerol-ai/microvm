@@ -880,10 +880,16 @@ public class MicroVMClient {
      * caller, who knows whether the command is safe to repeat.
      */
     public ExecResult exec(String sandboxId, ExecRequest request) {
+        // An older agent ignores the caps and returns all output, and refuses
+        // argv with a confusing "command is required"; check first.
+        List<String> features = new ArrayList<>();
         if (request != null && (isSet(request.maxStdoutBytes) || isSet(request.maxStderrBytes))) {
-            // An older agent ignores the caps and returns all output.
-            requireToolboxFeatures(sandboxId, "exec.max_output_bytes");
+            features.add("exec.max_output_bytes");
         }
+        if (request != null && request.argv != null && !request.argv.isEmpty()) {
+            features.add("exec.argv");
+        }
+        requireToolboxFeatures(sandboxId, features.toArray(new String[0]));
         return doJson("POST", sandboxPath(sandboxId) + "/toolbox/process/execute", request, ExecResult.class, RetryMode.UNSENT_ONLY);
     }
 
@@ -1111,8 +1117,18 @@ public class MicroVMClient {
 
     public ExecStreamHandle execStream(String sandboxId, ExecStreamOptions options) {
         ExecStreamOptions effective = options == null ? new ExecStreamOptions() : options;
-        if (trimToNull(effective.command) == null) {
+        boolean hasCommand = trimToNull(effective.command) != null;
+        boolean hasArgv = effective.argv != null && !effective.argv.isEmpty();
+        if (hasCommand && hasArgv) {
+            throw new MicroVMException("set command or argv, not both");
+        }
+        if (!hasCommand && !hasArgv) {
             throw new MicroVMException("command is required");
+        }
+        if (hasArgv) {
+            // Before the socket opens, so an older agent never gets a start
+            // message it cannot run.
+            requireToolboxFeatures(sandboxId, "exec.argv");
         }
 
         CompletableFuture<ExecExitInfo> completion = new CompletableFuture<>();

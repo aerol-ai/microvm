@@ -2917,3 +2917,64 @@ class ExecOptionsTests(unittest.TestCase):
         self.assertFalse(old["stderrTruncated"])
         new = _from_api_exec_result({"stdout": "", "stderr": "e", "exit_code": 0, "duration_ms": 1, "stderr_truncated": True})
         self.assertTrue(new["stderrTruncated"])
+
+    def test_argv_is_sent_when_the_agent_lists_it(self):
+        argv = ["printf", "%s|", "a b", "$HOME", "; echo pwned"]
+        client, hits = self._serve(["exec.argv"])
+        client.exec("sb-1", {"argv": argv})
+        self.assertEqual(
+            hits,
+            [
+                ("GET", "/v1/sandboxes/sb-1/toolbox/version", None),
+                ("POST", _EXEC_PATH, {"argv": argv}),
+            ],
+        )
+
+    def test_mixed_version_agent_without_argv_is_refused_before_exec(self):
+        from microvm import MicroVMUnsupportedFeatureError
+
+        for features in (None, ["exec.max_output_bytes"]):
+            with self.subTest(features=features):
+                client, hits = self._serve(features)
+                with self.assertRaises(MicroVMUnsupportedFeatureError) as ctx:
+                    client.exec("sb-1", {"argv": ["ls", "-l"], "maxStdoutBytes": 10})
+                self.assertIn("exec.argv", ctx.exception.features)
+                self.assertEqual([method for method, _, _ in hits], ["GET"])
+
+    def _stream_module(self):
+        fake_ws = FakeWebSocket([json.dumps({"type": "exit", "code": 0})])
+        fake_module = FakeWebSocketModule(fake_ws)
+        original_loader = client_module._load_websocket_module
+        client_module._load_websocket_module = lambda: fake_module
+        self.addCleanup(setattr, client_module, "_load_websocket_module", original_loader)
+        return fake_module, fake_ws
+
+    def test_exec_stream_sends_argv_when_the_agent_lists_it(self):
+        fake_module, fake_ws = self._stream_module()
+        client, hits = self._serve(["exec.argv"])
+        handle = client.exec_stream("sb-1", {"argv": ["ls", "a b"]})
+        self.assertEqual(handle.wait(1)["code"], 0)
+        self.assertEqual(hits, [("GET", "/v1/sandboxes/sb-1/toolbox/version", None)])
+        self.assertEqual(json.loads(fake_ws.sent[0][0]), {"argv": ["ls", "a b"]})
+
+    def test_exec_stream_argv_on_an_older_agent_never_opens_the_stream(self):
+        from microvm import MicroVMUnsupportedFeatureError
+
+        fake_module, _ = self._stream_module()
+        client, _ = self._serve([])
+        with self.assertRaises(MicroVMUnsupportedFeatureError):
+            client.exec_stream("sb-1", {"argv": ["ls"]})
+        self.assertEqual(fake_module.calls, [])
+
+    def test_exec_stream_command_or_argv(self):
+        fake_module, _ = self._stream_module()
+        client, hits = self._serve(["exec.argv"])
+        for options, message in (
+            ({"command": "ls", "argv": ["ls"]}, "set command or argv, not both"),
+            ({"command": "  "}, "command is required"),
+            ({}, "command is required"),
+        ):
+            with self.assertRaises(MicroVMError) as ctx:
+                client.exec_stream("sb-1", options)
+            self.assertEqual(str(ctx.exception), message)
+        self.assertEqual((hits, fake_module.calls), ([], []))

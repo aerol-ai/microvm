@@ -258,6 +258,9 @@ class CreateSessionOptions(TypedDict, total=False):
 
 class ExecRequest(TypedDict, total=False):
     command: str
+    # Run a program with these arguments instead of a shell command: spaces,
+    # quotes, $ and ; reach it as written. Set command or argv, not both.
+    argv: List[str]
     workDir: str
     env: Dict[str, str]
     timeoutSeconds: int
@@ -288,6 +291,8 @@ ErrorCallback = Callable[[str], None]
 
 class ExecStreamOptions(TypedDict, total=False):
     command: str
+    # Same as ExecRequest.argv. Set command or argv, not both.
+    argv: List[str]
     workdir: str
     env: Dict[str, str]
     tty: bool

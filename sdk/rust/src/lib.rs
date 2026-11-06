@@ -74,6 +74,11 @@ pub type ExitCallback = Arc<dyn Fn(ExecExitInfo) + Send + Sync + 'static>;
 #[derive(Default)]
 pub struct ExecStreamOptions {
     pub command: String,
+    /// Run a program with these arguments instead of `command`, with no
+    /// shell parsing. Set `command` or `argv`, not both. A sandbox whose
+    /// agent predates argv returns `Error::UnsupportedFeature` before the
+    /// stream opens.
+    pub argv: Option<Vec<String>>,
     pub workdir: Option<String>,
     pub env: Option<std::collections::HashMap<String, String>>,
     pub tty: bool,
@@ -629,6 +634,8 @@ enum ControlMessage {
 #[derive(Serialize)]
 struct ExecStreamStartRequest {
     command: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    argv: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     workdir: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1797,13 +1804,19 @@ impl Client {
     /// 504) is returned rather than retried, because a re-send would run the
     /// command a second time; the command may or may not have run.
     ///
-    /// Output caps are checked against the sandbox's agent first: an agent
-    /// older than them would ignore them and return all output, so the call
-    /// fails with `Error::UnsupportedFeature` instead.
+    /// Output caps and argv are checked against the sandbox's agent first: an
+    /// agent older than them would ignore the caps and return all output, or
+    /// refuse argv with a confusing "command is required", so the call fails
+    /// with `Error::UnsupportedFeature` instead.
     pub fn exec(&self, id: &str, request: ExecRequest) -> Result<ExecResult, Error> {
+        let mut features = Vec::new();
         if request.max_stdout_bytes.unwrap_or(0) > 0 || request.max_stderr_bytes.unwrap_or(0) > 0 {
-            self.require_toolbox_features(id, &["exec.max_output_bytes"])?;
+            features.push("exec.max_output_bytes");
         }
+        if request.argv.as_ref().is_some_and(|argv| !argv.is_empty()) {
+            features.push("exec.argv");
+        }
+        self.require_toolbox_features(id, &features)?;
         let (body, _) = self.send_json::<ExecRequest, ExecResult>(
             Method::POST,
             &format!(
@@ -1974,8 +1987,18 @@ impl Client {
         id: &str,
         options: ExecStreamOptions,
     ) -> Result<ExecStreamHandle, Error> {
-        if options.command.trim().is_empty() {
+        let has_command = !options.command.trim().is_empty();
+        let has_argv = options.argv.as_ref().is_some_and(|argv| !argv.is_empty());
+        if has_command && has_argv {
+            return Err(Error::Client("set command or argv, not both".to_string()));
+        }
+        if !has_command && !has_argv {
             return Err(Error::Client("command is required".to_string()));
+        }
+        if has_argv {
+            // Before the stream opens, so an older agent never gets a start
+            // message it cannot run.
+            self.require_toolbox_features(id, &["exec.argv"])?;
         }
 
         let (control_tx, control_rx) = unbounded_channel();
@@ -2395,6 +2418,7 @@ async fn run_exec_stream(
 
     let start = ExecStreamStartRequest {
         command: options.command.clone(),
+        argv: options.argv.clone(),
         workdir: options.workdir.clone(),
         env: options.env.clone(),
         tty: options.tty,
@@ -6187,6 +6211,102 @@ mod tests {
         let result = no_retry_client(&url).exec("sb-1", "ls".into()).expect("plain exec");
         assert_eq!(hits.load(Ordering::SeqCst), 1);
         assert!(!result.stdout_truncated && !result.stderr_truncated);
+    }
+
+    /// Serves one HTTP `/version` answer, then accepts one exec-stream
+    /// WebSocket, reports its start message and answers exit 0.
+    fn spawn_version_then_stream_server(version: &'static str) -> (String, std::sync::mpsc::Receiver<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener should bind");
+        let addr = listener.local_addr().expect("listener address");
+        let (start_tx, start_rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let (mut first, _) = listener.accept().expect("version request");
+            let request = read_http_request(&mut first);
+            assert!(request.starts_with("GET /v1/sandboxes/sb-1/toolbox/version "), "{}", request);
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                version.len()
+            );
+            first.write_all(head.as_bytes()).expect("version head");
+            first.write_all(version.as_bytes()).expect("version body");
+            drop(first);
+            listener.set_nonblocking(true).expect("non-blocking");
+            let runtime = Builder::new_current_thread().enable_all().build().expect("runtime");
+            runtime.block_on(async move {
+                let listener = tokio::net::TcpListener::from_std(listener).expect("tokio listener");
+                let (stream, _) = listener.accept().await.expect("stream accept");
+                let ws = accept_async(stream).await.expect("websocket accept");
+                let (mut write, mut read) = ws.split();
+                if let Some(Ok(Message::Text(text))) = read.next().await {
+                    start_tx.send(text.to_string()).expect("start message");
+                }
+                write
+                    .send(Message::Text(serde_json::json!({ "type": "exit", "code": 0 }).to_string().into()))
+                    .await
+                    .expect("exit frame");
+            });
+        });
+        (format!("http://{}", addr), start_rx)
+    }
+
+    // E2 + ER4: argv on exec and the exec stream goes out only after the
+    // agent listed exec.argv; an older agent gets the /version read only.
+    #[test]
+    fn exec_argv_is_checked_against_the_agent() {
+        let argv: Vec<String> = ["printf", "%s|", "a b", "$HOME", "; echo pwned"].iter().map(|s| s.to_string()).collect();
+        let (url, hits, requests) = spawn_recording_scripted_server(vec![
+            Reply::ok(r#"{"version":"0.6.12","features":["exec.argv"]}"#.to_string()),
+            Reply::ok(r#"{"stdout":"","stderr":"","exit_code":0,"duration_ms":1}"#.to_string()),
+        ]);
+        no_retry_client(&url)
+            .exec("sb-1", ExecRequest { argv: Some(argv.clone()), ..Default::default() })
+            .expect("argv exec");
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        let exec = requests.lock().unwrap()[1].clone();
+        assert!(exec.contains(&serde_json::to_string(&argv).unwrap()), "{}", exec);
+
+        let (url, hits, requests) = spawn_recording_scripted_server(vec![Reply::ok(
+            r#"{"version":"0.6.11","features":["exec.max_output_bytes"]}"#.to_string(),
+        )]);
+        let client = no_retry_client(&url);
+        match client.exec("sb-1", ExecRequest { argv: Some(argv.clone()), ..Default::default() }) {
+            Err(Error::UnsupportedFeature(err)) => assert_eq!(err.features(), &["exec.argv".to_string()]),
+            other => panic!("want UnsupportedFeature, got {:?}", other.map(|r| r.exit_code)),
+        }
+        match client.exec_stream("sb-1", ExecStreamOptions { argv: Some(argv.clone()), ..Default::default() }) {
+            Err(Error::UnsupportedFeature(err)) => assert_eq!(err.features(), &["exec.argv".to_string()]),
+            Err(other) => panic!("want UnsupportedFeature, got {:?}", other),
+            Ok(_) => panic!("an older agent got an argv stream"),
+        }
+        assert_eq!(hits.load(Ordering::SeqCst), 2, "only /version may be called");
+        assert!(requests.lock().unwrap().iter().all(|r| r.starts_with("GET /v1/sandboxes/sb-1/toolbox/version ")));
+
+        let (url, start_rx) = spawn_version_then_stream_server(r#"{"version":"0.6.12","features":["exec.argv"]}"#);
+        let handle = no_retry_client(&url)
+            .exec_stream("sb-1", ExecStreamOptions { argv: Some(argv.clone()), ..Default::default() })
+            .expect("argv stream");
+        assert_eq!(handle.wait().expect("exit").code, 0);
+        let start: Value = serde_json::from_str(&start_rx.recv_timeout(Duration::from_secs(5)).expect("start")).unwrap();
+        assert_eq!(start["argv"], serde_json::json!(argv));
+    }
+
+    #[test]
+    fn exec_stream_needs_command_or_argv() {
+        let client = no_retry_client("http://127.0.0.1:9");
+        for (options, want) in [
+            (
+                ExecStreamOptions { command: "ls".into(), argv: Some(vec!["ls".into()]), ..Default::default() },
+                "set command or argv, not both",
+            ),
+            (ExecStreamOptions { command: " ".into(), ..Default::default() }, "command is required"),
+            (ExecStreamOptions { argv: Some(vec![]), ..Default::default() }, "command is required"),
+        ] {
+            match client.exec_stream("sb-1", options) {
+                Err(Error::Client(msg)) => assert_eq!(msg, want),
+                Err(other) => panic!("want Client error {:?}, got {:?}", want, other),
+                Ok(_) => panic!("want Client error {:?}", want),
+            }
+        }
     }
 
     fn no_retry_client(url: &str) -> Client {

@@ -918,7 +918,14 @@ export interface SetNetworkLimitsOptions {
 }
 
 export interface ExecRequest {
-  command: string;
+  /** A shell command. Set `command` or `argv`, not both. */
+  command?: string;
+  /**
+   * Run a program with these arguments instead of a shell command: spaces,
+   * quotes, `$` and `;` reach it as written. A sandbox whose agent predates
+   * argv throws MicroVMUnsupportedFeatureError before anything runs.
+   */
+  argv?: string[];
   workDir?: string;
   env?: Record<string, string>;
   timeoutSeconds?: number;
@@ -946,7 +953,10 @@ export interface ExecResult {
 }
 
 export interface ExecStreamOptions {
-  command: string;
+  /** A shell command. Set `command` or `argv`, not both. */
+  command?: string;
+  /** Same as ExecRequest.argv. */
+  argv?: string[];
   workdir?: string;
   env?: Record<string, string>;
   tty?: boolean;

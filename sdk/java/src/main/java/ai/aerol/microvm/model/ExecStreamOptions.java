@@ -1,5 +1,6 @@
 package ai.aerol.microvm.model;
 
+import java.util.List;
 import java.util.Map;
 import java.util.function.Consumer;
 
@@ -10,6 +11,12 @@ import com.fasterxml.jackson.annotation.JsonProperty;
 @JsonInclude(JsonInclude.Include.NON_NULL)
 public class ExecStreamOptions {
     public String command;
+    /**
+     * Runs a program with these arguments instead of {@link #command}, with no shell parsing: spaces,
+     * quotes, $ and ; reach it as written. Set command or argv, not both. A sandbox whose agent
+     * predates argv throws MicroVMUnsupportedFeatureException before anything runs.
+     */
+    public List<String> argv;
     @JsonProperty("workdir")
     public String workDir;
     public Map<String, String> env;
@@ -25,6 +32,11 @@ public class ExecStreamOptions {
 
     public ExecStreamOptions setCommand(String command) {
         this.command = command;
+        return this;
+    }
+
+    public ExecStreamOptions setArgv(List<String> argv) {
+        this.argv = argv;
         return this;
     }
 

@@ -719,7 +719,14 @@ pub struct HealthStatus {
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
 pub struct ExecRequest {
+    /// A shell command. Leave it empty when you set `argv`.
     pub command: String,
+    /// Run a program with these arguments instead of `command`: spaces,
+    /// quotes, `$` and `;` reach it as written. Set `command` or `argv`, not
+    /// both. A sandbox whose agent predates argv returns
+    /// `Error::UnsupportedFeature` before anything runs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub argv: Option<Vec<String>>,
     #[serde(rename = "workdir", skip_serializing_if = "Option::is_none")]
     pub work_dir: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

@@ -1397,7 +1397,14 @@ type HealthStatus struct {
 }
 
 type ExecRequest struct {
-	Command        string            `json:"command"`
+	Command string `json:"command"`
+	// Argv runs a program with these arguments instead of Command, with no
+	// shell parsing in between: spaces, quotes, $ and ; reach the program
+	// as written. It finds programs the same way Command does, including
+	// what the login profile adds to PATH. Set Command or Argv, not both.
+	// An agent older than Argv answers "command is required"; the SDKs
+	// check /version (exec.argv) first.
+	Argv           []string          `json:"argv,omitempty"`
 	WorkDir        string            `json:"workdir,omitempty"`
 	Env            map[string]string `json:"env,omitempty"`
 	TimeoutSeconds int               `json:"timeout_seconds,omitempty"`

@@ -196,6 +196,8 @@ Pass an options object instead of a string to choose where the command runs, add
 | `workDir` | The folder the command starts in. It must already exist. | The image's working folder, often `/` |
 | `env` | Extra environment variables for this one command. They are added to the sandbox's own variables. | None |
 | `timeoutSeconds` | The longest the command may run before it is stopped. | 300 (5 minutes) |
+| `argv` | A program and its arguments as a list, instead of `command`. See [Pass arguments without a shell](#pass-arguments-without-a-shell). | None |
+| `maxStdoutBytes`, `maxStderrBytes` | Keep only the start of the output. See [Limit how much output you get back](#limit-how-much-output-you-get-back). | No limit (64 MiB at most) |
 
 The tabs above show how each language spells these names. Python also accepts `workdir` and `timeout_seconds`.
 
@@ -204,6 +206,64 @@ When the time limit runs out, the whole command stops, including anything it sta
 <Aside type="caution" title="The time limit stops the shell, not always what it started">
 `timeoutSeconds` stops the shell that runs your command. A program the shell started can keep running, and the call waits for it. On our test server, `sleep 10` with a 2-second limit still took 10 seconds to return. For a hard limit, put `timeout` in the command itself: `timeout 30 npm test` stops after 30 seconds and exits with code `124`.
 </Aside>
+
+## Pass arguments without a shell
+
+`command` is one string, and a shell reads it. So spaces, quotes, `$` and `;` in it have special meanings. If an argument comes from somewhere you do not control, like a file name or a user's message, you have to quote it just right, or the shell may split it or even run part of it as a second command.
+
+Use `argv` instead. It is a list: the program first, then each argument. Each one reaches the program exactly as you wrote it.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const result = await sandbox.exec({ argv: ["echo", "it's $5; really"] });
+    console.log(result.stdout); // it's $5; really
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    result = sandbox.exec({"argv": ["echo", "it's $5; really"]})
+    print(result["stdout"])  # it's $5; really
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    result, err := sandbox.Exec(ctx, sdktypes.ExecRequest{
+        Argv: []string{"echo", "it's $5; really"},
+    })
+    if err != nil {
+        log.Fatal(err)
+    }
+    fmt.Print(result.Stdout) // it's $5; really
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    use aerolvm_sdk::ExecRequest;
+
+    let result = sandbox.exec(ExecRequest {
+        argv: Some(vec!["echo".into(), "it's $5; really".into()]),
+        ..Default::default()
+    })?;
+    print!("{}", result.stdout); // it's $5; really
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    ExecResult result = sandbox.exec(new ExecRequest()
+        .setArgv(List.of("echo", "it's $5; really")));
+    System.out.print(result.stdout); // it's $5; really
+    ```
+  </TabItem>
+</Tabs>
+
+- Set `command` or `argv`, not both.
+- `argv` finds programs the same way `command` does. It uses the same `PATH`, including folders the image's login setup adds, such as conda's.
+- Shell features like pipes (`|`), `&&` and `*` do nothing in `argv`. They are passed to the program as plain text.
+- If the program does not exist, the exit code is `127` and `stderr` says `not found`, as in a shell.
+- `argv` also works in images that have no shell at all, such as "distroless" images, where `command` cannot run. The sandbox then looks the program up on the image's `PATH`.
+- `execStream` takes `argv` too.
+- A sandbox started before `argv` existed runs an older agent. The SDK checks first and raises the same error as for [output limits](#limit-how-much-output-you-get-back), without running anything.
 
 ## Limit how much output you get back
 
@@ -370,7 +430,8 @@ Output arrives as raw bytes, in the pieces the command happened to print. A piec
 
 | Option | What it does |
 |---|---|
-| `command` | The shell command to run. Required. |
+| `command` | The shell command to run. Required, unless you set `argv`. |
+| `argv` | A program and its arguments as a list, run without a shell. See [Pass arguments without a shell](#pass-arguments-without-a-shell). |
 | `workdir` | The folder to start in. Note the spelling: `workdir` here, but `workDir` for `exec` in TypeScript and Python. |
 | `env` | Extra environment variables for this command. |
 | `onStdout`, `onStderr` | Called with each piece of output and error output. |

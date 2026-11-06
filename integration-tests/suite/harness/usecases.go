@@ -953,6 +953,8 @@ var Registry = []UseCase{
 	{ID: "UC-372", Title: "sandboxd counts toolbox calls by API, feature and result: a Daytona language-server call shows as daytona/lsp/501 and a v1 exec as v1/exec/2xx in aerolvm_toolbox_calls_total", Implemented: true},
 	{ID: "UC-380", Title: "exec output caps: each stream keeps its first N bytes and reports stdout_truncated / stderr_truncated, the command still exits 0 without being held up by the output it drops, and the agent lists exec.max_output_bytes on /version", Implemented: true},
 	{ID: "UC-381", Title: "exec output caps are clamped on the way: a cap above the agent's 64 MiB ceiling (or the operator's maximum) is lowered, a caller's smaller cap is kept", Implemented: true},
+	{ID: "UC-382", Title: "exec with argv: arguments with spaces, quotes, $, ; and backticks reach the program unparsed on exec and the exec stream, and argv finds a program the login profile puts on PATH, as a command does", Implemented: true},
+	{ID: "UC-383", Title: "exec with argv naming a missing program answers like a shell: exit 127 and a not found line on stderr, on exec and the exec stream", Implemented: true},
 }
 
 // byID is a lookup built once for the report generator.

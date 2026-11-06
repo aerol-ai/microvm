@@ -110,7 +110,10 @@ func TestHandleExecNonExitWaitMerge(t *testing.T) {
 		t.Fatalf("interpretWaitResult = (%d,%q)", code, sig)
 	}
 	srv := &server{logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
-	body := `{"command":"sh","argv":["-c","kill -9 $$"]}`
+	// Before argv existed this body also carried "argv", which toolboxd
+	// ignored; command and argv together are now refused (E2), so the
+	// command kills its own shell instead.
+	body := `{"command":"kill -9 $$"}`
 	rec := httptest.NewRecorder()
 	srv.handleExec(rec, httptest.NewRequest(http.MethodPost, "/process/execute", strings.NewReader(body)))
 	if rec.Code != http.StatusOK {

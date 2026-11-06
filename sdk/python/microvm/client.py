@@ -1208,9 +1208,14 @@ class MicroVM:
         # timeout or reset after the request went out surfaces instead of
         # retrying. Sandbox.exec and exec_command both end here.
         payload = _to_api_exec_request(request)
+        # An older agent ignores the caps and returns all output, and refuses
+        # argv with a confusing "command is required"; check first.
+        features = []
         if payload.get("max_stdout_bytes") or payload.get("max_stderr_bytes"):
-            # An older agent ignores the caps and returns all output.
-            self._require_toolbox_features(sandbox_id, "exec.max_output_bytes")
+            features.append("exec.max_output_bytes")
+        if payload.get("argv"):
+            features.append("exec.argv")
+        self._require_toolbox_features(sandbox_id, *features)
         response = self._do_json(
             "POST",
             f"{self._version_prefix}/sandboxes/{sandbox_id}/toolbox/process/execute",
@@ -1221,8 +1226,16 @@ class MicroVM:
 
     def exec_stream(self, sandbox_id: str, options: ExecStreamOptions) -> ExecStreamHandle:
         command = _first_of(options, "command")
-        if not isinstance(command, str) or command.strip() == "":
+        has_command = isinstance(command, str) and command.strip() != ""
+        argv = _first_of(options, "argv")
+        if has_command and argv:
+            raise MicroVMError("set command or argv, not both")
+        if not has_command and not argv:
             raise MicroVMError("command is required")
+        if argv:
+            # Before the socket opens, so an older agent never gets a start
+            # message it cannot run.
+            self._require_toolbox_features(sandbox_id, "exec.argv")
 
         websocket_module = _load_websocket_module()
         ws_url = _to_websocket_url(self.api_url, f"{self._version_prefix}/sandboxes/{urllib.parse.quote(sandbox_id, safe='')}/toolbox/process/exec/stream")
@@ -1867,6 +1880,7 @@ def _to_api_exec_request(request: ExecRequest) -> Dict[str, Any]:
     return _compact(
         {
             "command": _first_of(request, "command"),
+            "argv": _first_of(request, "argv"),
             "workdir": _first_of(request, "workDir", "workdir"),
             "env": _first_of(request, "env"),
             "timeout_seconds": _first_of(request, "timeoutSeconds", "timeout_seconds"),
@@ -1880,6 +1894,7 @@ def _to_api_exec_stream_request(options: ExecStreamOptions) -> Dict[str, Any]:
     return _compact(
         {
             "command": _first_of(options, "command"),
+            "argv": _first_of(options, "argv"),
             "workdir": _first_of(options, "workdir", "workDir"),
             "env": _first_of(options, "env"),
             "tty": _first_of(options, "tty"),

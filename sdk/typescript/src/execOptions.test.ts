@@ -71,3 +71,137 @@ test("exec without caps makes no /version call, and older agents read as untrunc
   assert.equal(result.stdoutTruncated, false);
   assert.equal(result.stderrTruncated, false);
 });
+
+test("exec sends argv when the agent lists it, and an older agent never gets it", async () => {
+  const argv = ["printf", "%s|", "a b", "$HOME", "; echo pwned"];
+  {
+    const { sdk, calls } = fakeSandbox(["exec.argv"]);
+    const sandbox = await sdk.get("sb-1");
+    await sandbox.exec({ argv });
+    assert.deepEqual(calls.slice(1), [
+      { method: "GET", path: versionPath, body: undefined },
+      { method: "POST", path: execPath, body: { argv } },
+    ]);
+  }
+  for (const features of [undefined, ["exec.max_output_bytes"]]) {
+    const { sdk, calls } = fakeSandbox(features);
+    const sandbox = await sdk.get("sb-1");
+    await assert.rejects(sandbox.exec({ argv, maxStdoutBytes: 10 }), (err: unknown) => {
+      assert.ok(err instanceof MicroVMUnsupportedFeatureError);
+      assert.ok(err.features.includes("exec.argv"));
+      return true;
+    });
+    assert.equal(calls.filter((call) => call.path === execPath).length, 0, "the exec was sent");
+  }
+});
+
+// A WebSocket stand-in that records frames and lets the test open it.
+class FakeWebSocket {
+  static instances: FakeWebSocket[] = [];
+  binaryType = "blob";
+  readyState = 0;
+  sent: Array<string | Uint8Array> = [];
+  closed = false;
+  private readonly listeners = new Map<string, Array<(event?: unknown) => void>>();
+
+  constructor() {
+    FakeWebSocket.instances.push(this);
+  }
+
+  addEventListener(name: string, listener: (event?: unknown) => void): void {
+    this.listeners.set(name, [...(this.listeners.get(name) ?? []), listener]);
+  }
+
+  send(data: string | Uint8Array): void {
+    if (this.readyState !== 1) {
+      throw new Error("InvalidStateError: still connecting");
+    }
+    this.sent.push(data);
+  }
+
+  close(): void {
+    this.closed = true;
+  }
+
+  emit(name: string, event?: unknown): void {
+    if (name === "open") {
+      this.readyState = 1;
+    }
+    for (const listener of this.listeners.get(name) ?? []) {
+      listener(event);
+    }
+  }
+}
+
+async function withFakeWebSocket(run: () => Promise<void>): Promise<void> {
+  const original = globalThis.WebSocket;
+  FakeWebSocket.instances = [];
+  globalThis.WebSocket = FakeWebSocket as unknown as typeof WebSocket;
+  try {
+    await run();
+  } finally {
+    globalThis.WebSocket = original;
+  }
+}
+
+const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+test("execStream sends argv only after the agent lists it, with early writes kept in order", async () => {
+  await withFakeWebSocket(async () => {
+    const { sdk, calls } = fakeSandbox(["exec.argv"]);
+    const sandbox = await sdk.get("sb-1");
+    const handle = sandbox.execStream({ argv: ["cat", "a b"] });
+    const ws = FakeWebSocket.instances[0];
+    ws.emit("open");
+    handle.write("typed early");
+    assert.equal(ws.sent.length, 0, "nothing may precede the start message");
+    await flush();
+    await flush();
+    assert.deepEqual(JSON.parse(ws.sent[0] as string), { argv: ["cat", "a b"], tty: false, cols: 0, rows: 0 });
+    assert.equal(new TextDecoder().decode(ws.sent[1] as Uint8Array), "typed early");
+    assert.equal(calls.filter((call) => call.path === versionPath).length, 1);
+    ws.emit("message", { data: JSON.stringify({ type: "exit", code: 0 }) });
+    assert.equal((await handle.done).code, 0);
+  });
+});
+
+test("execStream with argv on an older agent never sends the start message", async () => {
+  await withFakeWebSocket(async () => {
+    const { sdk } = fakeSandbox([]);
+    const sandbox = await sdk.get("sb-1");
+    const handle = sandbox.execStream({ argv: ["ls"] });
+    const ws = FakeWebSocket.instances[0];
+    ws.emit("open");
+    await assert.rejects(handle.done, (err: unknown) => {
+      assert.ok(err instanceof MicroVMUnsupportedFeatureError);
+      assert.deepEqual(err.features, ["exec.argv"]);
+      return true;
+    });
+    assert.deepEqual(ws.sent, []);
+    assert.equal(ws.closed, true);
+  });
+});
+
+test("execStream refuses command and argv together", async () => {
+  await withFakeWebSocket(async () => {
+    const { sdk } = fakeSandbox(["exec.argv"]);
+    const sandbox = await sdk.get("sb-1");
+    assert.throws(() => sandbox.execStream({ command: "ls", argv: ["ls"] }), /set command or argv, not both/);
+    assert.equal(FakeWebSocket.instances.length, 0);
+  });
+});
+
+test("execStream with argv survives the check failing before the socket opens", async () => {
+  await withFakeWebSocket(async () => {
+    const { sdk } = fakeSandbox(undefined);
+    const sandbox = await sdk.get("sb-1");
+    const handle = sandbox.execStream({ argv: ["ls"] });
+    // Let the /version check fail first, then open the socket.
+    await flush();
+    await flush();
+    const ws = FakeWebSocket.instances[0];
+    ws.emit("open");
+    await assert.rejects(handle.done, MicroVMUnsupportedFeatureError);
+    assert.deepEqual(ws.sent, []);
+  });
+});
