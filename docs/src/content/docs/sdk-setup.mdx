@@ -258,11 +258,83 @@ Each SDK stops a wait early in its own way:
 
 | SDK | How to stop waiting |
 |---|---|
-| TypeScript | Pass `signal` to `MicroVM`. Aborting it ends the request and any wait. |
-| Python | A signal handler that raises, such as Ctrl-C, ends the wait. |
+| TypeScript | Pass `signal` to `MicroVM`, or to one call (see below). Aborting it ends the request and any wait. |
+| Python | Pass `timeout=` to one call (see below). A signal handler that raises, such as Ctrl-C, also ends the wait. |
 | Go | Cancel the `ctx` you pass, or give it a deadline. |
 | Rust | The client blocks, so a wait cannot be stopped. Lower `max_retry_after_ms` to keep waits short. |
 | Java | Interrupt the thread, for example with `Future.cancel(true)`. |
+
+### Give one call a time limit
+
+Sometimes one call must not take long, while others may. Each SDK lets you limit a single call:
+
+- **TypeScript:** every call takes an optional last argument, `{ signal }`. Use `AbortSignal.timeout(ms)` for a time limit. The call fails with the signal's reason, a `TimeoutError`.
+- **Python:** every call takes `timeout=`, in seconds. The call fails with `MicroVMTimeoutError`. Its `status_code` is `0`, which tells it apart from a `504` sent by the server.
+- **Go:** give the call a `ctx` with a deadline.
+- **Java:** run the call on another thread and stop waiting with `Future.get(timeout)`.
+- **Rust:** there is no time limit for one call yet.
+
+The limit covers the whole call: every automatic retry and every wait between retries. A call that does more than one request, such as `getOrCreate`, gets one limit for all of them. For a call that opens a stream, such as running a command with live output or watching files, the limit covers opening the stream, not how long it runs.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const sandbox = await client.get("sb-1234", undefined, {
+      signal: AbortSignal.timeout(5_000),
+    });
+    const result = await sandbox.exec("make test", { signal: AbortSignal.timeout(60_000) });
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    from microvm import MicroVMTimeoutError
+
+    try:
+        sandbox = client.get("sb-1234", timeout=5)
+        result = sandbox.exec("make test", timeout=60)
+    except MicroVMTimeoutError:
+        print("too slow; try again later")
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    callCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+    defer cancel()
+    sandbox, err := client.Get(callCtx, "sb-1234")
+    if errors.Is(err, context.DeadlineExceeded) {
+        log.Print("too slow; try again later")
+    }
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    // The Rust client blocks and has no time limit for one call yet.
+    // Keep retry waits short instead:
+    let client = Client::with_config(
+        ClientConfig {
+            retry: Some(RetryConfig {
+                max_retry_after_ms: Some(5_000),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        ApiVersion::V1,
+    )?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    ExecutorService pool = Executors.newCachedThreadPool();
+    Future<Sandbox> call = pool.submit(() -> client.get("sb-1234"));
+    try {
+        Sandbox sandbox = call.get(5, TimeUnit.SECONDS);
+    } catch (TimeoutException e) {
+        call.cancel(true); // stops the request and any retry wait
+        System.out.println("too slow; try again later");
+    }
+    ```
+  </TabItem>
+</Tabs>
 
 ## When a request fails
 

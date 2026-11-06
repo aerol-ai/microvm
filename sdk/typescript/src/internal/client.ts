@@ -21,6 +21,7 @@ import {
 } from "../errors.js";
 import { Image } from "../Image.js";
 import type {
+  CallOptions,
   AddCustomDomainOptions,
   APIToken,
   APITokenList,
@@ -882,6 +883,21 @@ export function stripTrailingSlashes(value: string): string {
   return value.slice(0, end);
 }
 
+/** A signal that aborts when any of `signals` does, with that one's reason. */
+function anySignal(signals: AbortSignal[]): AbortSignal {
+  const native = (AbortSignal as unknown as { any?: (signals: AbortSignal[]) => AbortSignal }).any;
+  if (typeof native === "function") return native.call(AbortSignal, signals);
+  const controller = new AbortController();
+  for (const signal of signals) {
+    if (signal.aborted) {
+      controller.abort(signal.reason);
+      break;
+    }
+    signal.addEventListener("abort", () => controller.abort(signal.reason), { once: true });
+  }
+  return controller.signal;
+}
+
 /** Waits `ms`, or rejects with the signal's reason as soon as it aborts. */
 function sleep(ms: number, signal: AbortSignal | undefined): Promise<void> {
   return new Promise((resolve, reject) => {
@@ -911,6 +927,8 @@ export class APIClient {
   private readonly versionPrefix: string;
   private readonly retryConfig: Required<RetryConfig>;
   private readonly signal: AbortSignal | undefined;
+  /** The client a {@link withSignal} view was made from; unset on a real client. */
+  private readonly root: APIClient | undefined;
   /**
    * Features each sandbox's agent listed on /version (requireToolboxFeatures).
    * Refreshed on a miss, because a restart can bring a newer agent.
@@ -941,6 +959,22 @@ export class APIClient {
    */
   private versioned(suffix: string): string {
     return `${this.versionPrefix}${suffix}`;
+  }
+
+  /**
+   * This client with `signal` added to its own: either one aborting ends a
+   * request and any retry wait. A per-call signal (plan S6) rides on a view
+   * like this rather than a parameter on every internal method. The view
+   * shares everything else, the per-sandbox feature cache included, and the
+   * sandboxes it returns hold the real client, so the call's signal never
+   * outlives the call. Without a signal it is this client.
+   */
+  withSignal(signal: AbortSignal | undefined): APIClient {
+    if (!signal) return this;
+    const view = Object.create(this) as APIClient;
+    Object.defineProperty(view, "signal", { value: this.signal ? anySignal([this.signal, signal]) : signal });
+    Object.defineProperty(view, "root", { value: this.root ?? this });
+    return view;
   }
 
   async create(options: CreateOptions): Promise<SandboxResource> {
@@ -2135,7 +2169,7 @@ export class APIClient {
   }
 
   private wrap(sandbox: ApiSandbox): SandboxResource {
-    return new SandboxResource(this, fromApiSandbox(sandbox));
+    return new SandboxResource(this.root ?? this, fromApiSandbox(sandbox));
   }
 
   private async doJSON<T>(method: string, path: string, body?: unknown, options?: RequestOptions): Promise<T> {
@@ -2280,6 +2314,11 @@ export class SandboxResource implements Sandbox {
 
   private disposed = false;
 
+  /** The client for one call: the real one, or a view carrying the call's signal. */
+  private api(call?: CallOptions): APIClient {
+    return this.client.withSignal(call?.signal);
+  }
+
   constructor(client: APIClient, sandbox: Sandbox) {
     // Not enumerable: it holds the token, so it must never reach toJSON,
     // JSON.stringify or a log of the sandbox.
@@ -2303,14 +2342,14 @@ export class SandboxResource implements Sandbox {
     this.disposed = true;
   }
 
-  async refresh(): Promise<this> {
-    const updated = await this.client.get(this.id);
+  async refresh(call?: CallOptions): Promise<this> {
+    const updated = await this.api(call).get(this.id);
     this.apply(updated.toJSON());
     return this;
   }
 
-  async exec(command: string | ExecRequest): Promise<ExecResult> {
-    return this.client.exec(this.id, typeof command === "string" ? { command } : command);
+  async exec(command: string | ExecRequest, call?: CallOptions): Promise<ExecResult> {
+    return this.api(call).exec(this.id, typeof command === "string" ? { command } : command);
   }
 
   /**
@@ -2319,8 +2358,8 @@ export class SandboxResource implements Sandbox {
    * clone (e.g. to re-run setup). It does NOT reseed in-guest PRNGs — see the
    * "Randomness in cloned sandboxes" docs page for the in-guest pattern.
    */
-  async cloneGeneration(): Promise<CloneGeneration> {
-    return this.client.cloneGeneration(this.id);
+  async cloneGeneration(call?: CallOptions): Promise<CloneGeneration> {
+    return this.api(call).cloneGeneration(this.id);
   }
 
   execStream(options: ExecStreamOptions): ExecStreamHandle {
@@ -2335,36 +2374,36 @@ export class SandboxResource implements Sandbox {
     return this.client.watchFiles(this.id, path, onEvent, options);
   }
 
-  async createSession(options: CreateSessionOptions): Promise<Session> {
-    return this.client.createSession(this.id, options);
+  async createSession(options: CreateSessionOptions, call?: CallOptions): Promise<Session> {
+    return this.api(call).createSession(this.id, options);
   }
 
-  async listSessions(): Promise<Session[]> {
-    return this.client.listSessions(this.id);
+  async listSessions(call?: CallOptions): Promise<Session[]> {
+    return this.api(call).listSessions(this.id);
   }
 
-  async getSession(sessionID: string): Promise<Session> {
-    return this.client.getSession(this.id, sessionID);
+  async getSession(sessionID: string, call?: CallOptions): Promise<Session> {
+    return this.api(call).getSession(this.id, sessionID);
   }
 
-  async deleteSession(sessionID: string): Promise<void> {
-    await this.client.deleteSession(this.id, sessionID);
+  async deleteSession(sessionID: string, call?: CallOptions): Promise<void> {
+    await this.api(call).deleteSession(this.id, sessionID);
   }
 
-  async signalSession(sessionID: string, signal: string): Promise<void> {
-    await this.client.signalSession(this.id, sessionID, signal);
+  async signalSession(sessionID: string, signal: string, call?: CallOptions): Promise<void> {
+    await this.api(call).signalSession(this.id, sessionID, signal);
   }
 
-  async resizeSession(sessionID: string, cols: number, rows: number): Promise<void> {
-    await this.client.resizeSession(this.id, sessionID, cols, rows);
+  async resizeSession(sessionID: string, cols: number, rows: number, call?: CallOptions): Promise<void> {
+    await this.api(call).resizeSession(this.id, sessionID, cols, rows);
   }
 
-  async sessionLog(sessionID: string): Promise<Uint8Array> {
-    return this.client.sessionLog(this.id, sessionID);
+  async sessionLog(sessionID: string, call?: CallOptions): Promise<Uint8Array> {
+    return this.api(call).sessionLog(this.id, sessionID);
   }
 
-  async sessionRecording(sessionID: string): Promise<Uint8Array> {
-    return this.client.sessionRecording(this.id, sessionID);
+  async sessionRecording(sessionID: string, call?: CallOptions): Promise<Uint8Array> {
+    return this.api(call).sessionRecording(this.id, sessionID);
   }
 
   attachSession(sessionID: string, options: SessionAttachOptions = {}): SessionAttachHandle {
@@ -2372,22 +2411,22 @@ export class SandboxResource implements Sandbox {
   }
 
   /** Copy a local folder into the sandbox (Node.js only). See {@link APIClient.uploadDir}. */
-  async uploadDir(localDir: string, remoteDir: string): Promise<void> {
-    await this.client.uploadDir(this.id, localDir, remoteDir);
+  async uploadDir(localDir: string, remoteDir: string, call?: CallOptions): Promise<void> {
+    await this.api(call).uploadDir(this.id, localDir, remoteDir);
   }
 
   /** Upload a file. See {@link UploadFileOptions} for append, create-only, atomic and mode. */
-  async uploadFile(targetPath: string, data: BinaryLike, options: UploadFileOptions = {}): Promise<void> {
-    await this.client.uploadFile(this.id, targetPath, data, options);
+  async uploadFile(targetPath: string, data: BinaryLike, options: UploadFileOptions = {}, call?: CallOptions): Promise<void> {
+    await this.api(call).uploadFile(this.id, targetPath, data, options);
   }
 
-  async downloadFile(targetPath: string, options: DownloadFileOptions = {}): Promise<Uint8Array> {
-    return this.client.downloadFile(this.id, targetPath, options);
+  async downloadFile(targetPath: string, options: DownloadFileOptions = {}, call?: CallOptions): Promise<Uint8Array> {
+    return this.api(call).downloadFile(this.id, targetPath, options);
   }
 
   /** Read a file as a stream. See {@link APIClient.downloadFileStream}. */
-  async downloadFileStream(targetPath: string, options: DownloadFileOptions = {}): Promise<ReadableStream<Uint8Array>> {
-    return this.client.downloadFileStream(this.id, targetPath, options);
+  async downloadFileStream(targetPath: string, options: DownloadFileOptions = {}, call?: CallOptions): Promise<ReadableStream<Uint8Array>> {
+    return this.api(call).downloadFileStream(this.id, targetPath, options);
   }
 
   /** Upload from a stream, sent once. See {@link APIClient.uploadFileStream}. */
@@ -2395,61 +2434,62 @@ export class SandboxResource implements Sandbox {
     targetPath: string,
     data: ReadableStream<Uint8Array> | AsyncIterable<Uint8Array>,
     options: UploadFileOptions = {},
+    call?: CallOptions,
   ): Promise<void> {
-    await this.client.uploadFileStream(this.id, targetPath, data, options);
+    await this.api(call).uploadFileStream(this.id, targetPath, data, options);
   }
 
   /** List a folder. See {@link ListFilesOptions}; `truncated` means more entries exist. */
-  async listFiles(path: string, options: ListFilesOptions = {}): Promise<FileList> {
-    return this.client.listFiles(this.id, path, options);
+  async listFiles(path: string, options: ListFilesOptions = {}, call?: CallOptions): Promise<FileList> {
+    return this.api(call).listFiles(this.id, path, options);
   }
 
   /** Describe one path. A symlink is followed. */
-  async getFileInfo(path: string): Promise<FileInfo> {
-    return this.client.getFileInfo(this.id, path);
+  async getFileInfo(path: string, call?: CallOptions): Promise<FileInfo> {
+    return this.api(call).getFileInfo(this.id, path);
   }
 
   /** Whether a path exists. A missing sandbox throws; it is not `false`. */
-  async fileExists(path: string): Promise<boolean> {
-    return this.client.fileExists(this.id, path);
+  async fileExists(path: string, call?: CallOptions): Promise<boolean> {
+    return this.api(call).fileExists(this.id, path);
   }
 
   /** Delete a file, or a folder and its contents with `recursive: true`. */
-  async deleteFile(path: string, options: DeleteFileOptions = {}): Promise<void> {
-    await this.client.deleteFile(this.id, path, options);
+  async deleteFile(path: string, options: DeleteFileOptions = {}, call?: CallOptions): Promise<void> {
+    await this.api(call).deleteFile(this.id, path, options);
   }
 
   /** Make a folder; with `parents: true`, like `mkdir -p`. */
-  async makeDir(path: string, options: MakeDirOptions = {}): Promise<void> {
-    await this.client.makeDir(this.id, path, options);
+  async makeDir(path: string, options: MakeDirOptions = {}, call?: CallOptions): Promise<void> {
+    await this.api(call).makeDir(this.id, path, options);
   }
 
   /** Move or rename a file or folder. Without `overwrite`, an existing destination is refused (409). */
-  async moveFile(source: string, destination: string, options: MoveFileOptions = {}): Promise<void> {
-    await this.client.moveFile(this.id, source, destination, options);
+  async moveFile(source: string, destination: string, options: MoveFileOptions = {}, call?: CallOptions): Promise<void> {
+    await this.api(call).moveFile(this.id, source, destination, options);
   }
 
   /** Copy a file, or a folder with `recursive: true`. */
-  async copyFile(source: string, destination: string, options: CopyFileOptions = {}): Promise<void> {
-    await this.client.copyFile(this.id, source, destination, options);
+  async copyFile(source: string, destination: string, options: CopyFileOptions = {}, call?: CallOptions): Promise<void> {
+    await this.api(call).copyFile(this.id, source, destination, options);
   }
 
   /** Paths under `path` whose name matches a glob such as `*.ts`. */
-  async searchFiles(path: string, pattern: string): Promise<string[]> {
-    return this.client.searchFiles(this.id, path, pattern);
+  async searchFiles(path: string, pattern: string, call?: CallOptions): Promise<string[]> {
+    return this.api(call).searchFiles(this.id, path, pattern);
   }
 
   /** Each line under `path` that contains `text` (plain text). */
-  async findInFiles(path: string, text: string): Promise<FileMatch[]> {
-    return this.client.findInFiles(this.id, path, text);
+  async findInFiles(path: string, text: string, call?: CallOptions): Promise<FileMatch[]> {
+    return this.api(call).findInFiles(this.id, path, text);
   }
 
-  async exposePort(port: number, options?: ExposePortOptions): Promise<ExposeResult> {
-    return this.client.exposePort(this.id, port, options);
+  async exposePort(port: number, options?: ExposePortOptions, call?: CallOptions): Promise<ExposeResult> {
+    return this.api(call).exposePort(this.id, port, options);
   }
 
-  async unexposePort(port: number): Promise<void> {
-    await this.client.unexposePort(this.id, port);
+  async unexposePort(port: number, call?: CallOptions): Promise<void> {
+    await this.api(call).unexposePort(this.id, port);
   }
 
   /**
@@ -2457,8 +2497,8 @@ export class SandboxResource implements Sandbox {
    * end user. See {@link CreateSandboxTokenOptions}. Each call makes a new
    * token; the server keeps no copy.
    */
-  async createToken(options: CreateSandboxTokenOptions): Promise<SandboxToken> {
-    return this.client.createSandboxToken(this.id, options);
+  async createToken(options: CreateSandboxTokenOptions, call?: CallOptions): Promise<SandboxToken> {
+    return this.api(call).createSandboxToken(this.id, options);
   }
 
   /**
@@ -2470,60 +2510,60 @@ export class SandboxResource implements Sandbox {
    * so the closures always see the current `id` even after `refresh()`.
    */
   get customDomains(): {
-    add(hostname: string, options?: AddCustomDomainOptions): Promise<CustomDomain[]>;
-    remove(hostname: string): Promise<void>;
-    list(): Promise<CustomDomain[]>;
-    dns(): Promise<CustomDomainDNSRecords>;
+    add(hostname: string, options?: AddCustomDomainOptions, call?: CallOptions): Promise<CustomDomain[]>;
+    remove(hostname: string, call?: CallOptions): Promise<void>;
+    list(call?: CallOptions): Promise<CustomDomain[]>;
+    dns(call?: CallOptions): Promise<CustomDomainDNSRecords>;
   } {
     const client = this.client;
     const id = this.id;
     return {
-      add: (hostname: string, options?: AddCustomDomainOptions) =>
-        client.addCustomDomain(id, hostname, options),
-      remove: (hostname: string) => client.removeCustomDomain(id, hostname),
-      list: () => client.listCustomDomains(id),
-      dns: () => client.customDomainDNS(id),
+      add: (hostname: string, options?: AddCustomDomainOptions, call?: CallOptions) =>
+        client.withSignal(call?.signal).addCustomDomain(id, hostname, options),
+      remove: (hostname: string, call?: CallOptions) => client.withSignal(call?.signal).removeCustomDomain(id, hostname),
+      list: (call?: CallOptions) => client.withSignal(call?.signal).listCustomDomains(id),
+      dns: (call?: CallOptions) => client.withSignal(call?.signal).customDomainDNS(id),
     };
   }
 
-	async createSnapshot(name: string, options: CreateSnapshotOptions = {}): Promise<SandboxSnapshot> {
-		return this.client.createSnapshot(this.id, name, options);
+	async createSnapshot(name: string, options: CreateSnapshotOptions = {}, call?: CallOptions): Promise<SandboxSnapshot> {
+		return this.api(call).createSnapshot(this.id, name, options);
 	}
 
-  async start(): Promise<this> {
-    const updated = await this.client.start(this.id);
+  async start(call?: CallOptions): Promise<this> {
+    const updated = await this.api(call).start(this.id);
     this.apply(updated.toJSON());
     return this;
   }
 
-  async stop(): Promise<this> {
-    const updated = await this.client.stop(this.id);
+  async stop(call?: CallOptions): Promise<this> {
+    const updated = await this.api(call).stop(this.id);
     this.apply(updated.toJSON());
     return this;
   }
 
-  async destroy(): Promise<void> {
-    await this.client.destroy(this.id);
+  async destroy(call?: CallOptions): Promise<void> {
+    await this.api(call).destroy(this.id);
   }
 
-  async resize(options: ResizeOptions): Promise<this> {
-    const updated = await this.client.resize(this.id, options);
+  async resize(options: ResizeOptions, call?: CallOptions): Promise<this> {
+    const updated = await this.api(call).resize(this.id, options);
     this.apply(updated.toJSON());
     return this;
   }
 
-  async updateLifecycle(lifecycle: Lifecycle): Promise<this> {
-    const updated = await this.client.updateLifecycle(this.id, lifecycle);
+  async updateLifecycle(lifecycle: Lifecycle, call?: CallOptions): Promise<this> {
+    const updated = await this.api(call).updateLifecycle(this.id, lifecycle);
     this.apply(updated.toJSON());
     return this;
   }
 
-  async getNetworkUsage(): Promise<NetworkUsage> {
-    return this.client.getNetworkUsage(this.id);
+  async getNetworkUsage(call?: CallOptions): Promise<NetworkUsage> {
+    return this.api(call).getNetworkUsage(this.id);
   }
 
-  async setNetworkLimits(options: SetNetworkLimitsOptions): Promise<NetworkUsage> {
-    return this.client.setNetworkLimits(this.id, options);
+  async setNetworkLimits(options: SetNetworkLimitsOptions, call?: CallOptions): Promise<NetworkUsage> {
+    return this.api(call).setNetworkLimits(this.id, options);
   }
 
   /**
@@ -2531,8 +2571,8 @@ export class SandboxResource implements Sandbox {
    * once the new policy is enforced; sending the same policy again is a
    * no-op, so it is safe to retry.
    */
-  async setNetworkPolicy(options: NetworkPolicyOptions): Promise<NetworkPolicy> {
-    const policy = await this.client.setNetworkPolicy(this.id, options);
+  async setNetworkPolicy(options: NetworkPolicyOptions, call?: CallOptions): Promise<NetworkPolicy> {
+    const policy = await this.api(call).setNetworkPolicy(this.id, options);
     this.networkBlockAll = policy.networkBlockAll;
     this.egressStatus = policy.egressStatus;
     this.egressProfiles = policy.egressProfiles.length ? policy.egressProfiles : undefined;
@@ -2546,8 +2586,8 @@ export class SandboxResource implements Sandbox {
    * would have allowed it. A recording stays readable after the sandbox
    * switches to enforce, until it is destroyed.
    */
-  async learned(): Promise<NetworkLearned> {
-    return this.client.getNetworkLearned(this.id);
+  async learned(call?: CallOptions): Promise<NetworkLearned> {
+    return this.api(call).getNetworkLearned(this.id);
   }
 
   /**
@@ -2555,8 +2595,8 @@ export class SandboxResource implements Sandbox {
    * (`kind: "egress"`), and secret reads. Denials carry `result: "failure"`
    * and the policy `reason`.
    */
-  async audit(options?: AuditOptions): Promise<AuditPage> {
-    return this.client.getAudit(this.id, options);
+  async audit(options?: AuditOptions, call?: CallOptions): Promise<AuditPage> {
+    return this.api(call).getAudit(this.id, options);
   }
 
   toJSON(): Sandbox {

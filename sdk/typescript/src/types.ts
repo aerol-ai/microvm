@@ -469,6 +469,22 @@ export interface ResizeOptions {
   diskGB?: number;
 }
 
+/**
+ * The last, optional argument of every `MicroVM` and `Sandbox` call that
+ * talks to the server.
+ */
+export interface CallOptions {
+  /**
+   * Cancels this call: aborting it ends the request in flight and any retry
+   * wait, and the call rejects with the signal's reason. Pass
+   * `AbortSignal.timeout(ms)` to give one call a time limit. It works with
+   * the client-wide `signal`; either one aborting ends the call. Calls that
+   * open a stream (`execStream`, `attachSession`, `watchFiles`) take no
+   * `CallOptions`, as the client-wide signal does not cover streams either.
+   */
+  signal?: AbortSignal;
+}
+
 /** Options for {@link MicroVM.destroyAll}. */
 export interface DestroyAllOptions {
   /**

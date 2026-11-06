@@ -195,3 +195,44 @@ func TestParitySDKCloseLive(t *testing.T) {
 		t.Fatalf("second Close: %v", err)
 	}
 }
+
+// UC-450 — per-call timeouts (plan S6, a Python and TypeScript feature):
+// the server behaviour a per-call timeout leans on. A create whose caller
+// gives up after 50 ms (often after the request reached the server) and is
+// then sent again with the same Idempotency-Key ends with exactly one
+// sandbox of that name, and the retry returns it. The SDK side is covered
+// by unit tests in sdk/python/tests/test_timeouts.py and
+// sdk/typescript/src/callOptions.test.ts.
+func TestParitySDKTimedOutCreateRetriesOntoOneSandboxLive(t *testing.T) {
+	harness.Require(t, sc, "UC-450")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+	sdk := client(t).SDK()
+	name := harness.UniqueName(sc, t)
+	key := "uc450-" + name
+	public := true
+	opts := sdktypes.CreateSandboxOptions{Name: name, Image: harness.DefaultImage, AllowPublicTraffic: &public}
+
+	short, stop := context.WithTimeout(ctx, 50*time.Millisecond)
+	first, firstErr := sdk.CreateWithIdempotencyKey(short, opts, key)
+	stop()
+	if first != nil {
+		t.Cleanup(func() { _ = sdk.Destroy(context.Background(), first.ID) })
+		t.Logf("the create finished inside 50 ms (%s); the retry must still return it", first.ID)
+	} else if !errors.Is(firstErr, context.DeadlineExceeded) {
+		t.Fatalf("short create error = %v, want a deadline error", firstErr)
+	}
+
+	again, err := sdk.CreateWithIdempotencyKey(ctx, opts, key)
+	if err != nil {
+		t.Fatalf("retried create: %v", err)
+	}
+	t.Cleanup(func() { _ = sdk.Destroy(context.Background(), again.ID) })
+	if first != nil && first.ID != again.ID {
+		t.Fatalf("retry made %s, want the first create's %s", again.ID, first.ID)
+	}
+	byName, err := sdk.GetByName(ctx, name)
+	if err != nil || byName.ID != again.ID {
+		t.Fatalf("GetByName(%s) = (%v, %v), want the one sandbox %s", name, byName, err, again.ID)
+	}
+}

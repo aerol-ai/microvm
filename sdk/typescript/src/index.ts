@@ -54,6 +54,7 @@ export type {
   BinaryLike,
   BuildImageOptions,
   BuildImagePushOptions,
+  CallOptions,
   BuildImageResult,
   CloneGeneration,
   CreateOptions,
