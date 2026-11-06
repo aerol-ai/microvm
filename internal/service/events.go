@@ -28,7 +28,9 @@ func (s *Service) StartEventMonitor(ctx context.Context) {
 		return
 	}
 
-	go s.runEventMonitor(ctx)
+	// Records the events cause (an exit or removal nobody asked for) name
+	// system:runtime.
+	go s.runEventMonitor(withAuditSubsystem(ctx, auditSubsystemRuntime))
 }
 
 func (s *Service) runEventMonitor(ctx context.Context) {
@@ -131,7 +133,11 @@ func (s *Service) handleDockerEvent(ctx context.Context, event docker.DockerEven
 		}
 		sandbox = current
 		s.sandboxOOMs.forget(sandbox.ID)
-		if err := s.handleDestroyEvent(ctx, sandbox); err != nil {
+		// The row outlived any API destroy, so nobody asked for this one.
+		done := s.beginSystemAction(ctx, sandbox.ID, systemActionRuntimeRemoved)
+		err = s.handleDestroyEvent(ctx, sandbox)
+		done(err)
+		if err != nil {
 			return err
 		}
 		// Terminal: meter the final tail and forget the sandbox's cursor.
@@ -176,6 +182,7 @@ func (s *Service) handleDockerEvent(ctx context.Context, event docker.DockerEven
 // wake route and the subsequent die event silently deletes it.
 func (s *Service) markSandboxStopped(ctx context.Context, sandbox *models.Sandbox, event docker.DockerEvent) error {
 	previousIP := sandbox.ContainerIP
+	wasStarted := sandbox.Status == models.SandboxStatusStarted
 
 	// Invalidate the warm-preflight cache the moment we observe the
 	// stop event — this is the tightest possible signal that the
@@ -244,6 +251,13 @@ func (s *Service) markSandboxStopped(ctx context.Context, sandbox *models.Sandbo
 	} else {
 		sandbox.StatusReason, sandbox.ExitCode = reason, nil
 	}
+	// A stop nobody asked for is the runtime's to record (L3); a requested
+	// one has its caller's record, and the stop event after a die is the
+	// same exit again.
+	recordExit := func(error) {}
+	if mode == stopModeInvoluntary && event.Action == "die" && wasStarted {
+		recordExit = s.beginSystemActionReason(ctx, sandbox.ID, systemActionRuntimeExited, sandbox.StatusReason)
+	}
 	if oomKilled {
 		sandbox.LastError = "container killed by OOM"
 	} else if event.Action == "die" && event.ExitCode != 0 {
@@ -251,6 +265,7 @@ func (s *Service) markSandboxStopped(ctx context.Context, sandbox *models.Sandbo
 	}
 
 	err := s.store.Upsert(ctx, sandbox)
+	recordExit(err)
 	// Again for a request that read the row while it still said started
 	// (toolbox_calls.go).
 	s.endToolboxCalls(sandbox.ID, toolboxEndStopped, detail)

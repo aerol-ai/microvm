@@ -813,6 +813,9 @@ func (c *Client) GetAudit(ctx context.Context, id string, opts sdktypes.AuditOpt
 	if opts.IncarnationID != "" {
 		values.Set("incarnation_id", opts.IncarnationID)
 	}
+	if opts.Caller != "" {
+		values.Set("caller", opts.Caller)
+	}
 	path := c.versionPrefix + "/sandboxes/" + id + "/audit"
 	if len(values) > 0 {
 		path += "?" + values.Encode()

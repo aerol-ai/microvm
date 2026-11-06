@@ -1678,15 +1678,25 @@ func (s *Service) RecreateSandboxReport(ctx context.Context, id string, spec mod
 	return true, nil
 }
 
+// rowStillStarted reports whether the stored row still says started.
+func (s *Service) rowStillStarted(ctx context.Context, id string) bool {
+	cur, err := s.store.Get(ctx, id)
+	return err == nil && cur.Status == models.SandboxStatusStarted
+}
+
 // recordFailoverReason marks a sandbox the owner watcher just recreated
 // here: it is started, but as a fresh copy of its spec, so its programs and
 // anything outside a volume did not survive. A separate write after the
 // create rather than a field on the create's row, so the ordinary create path
 // is unchanged. Best effort: a lost reason costs a hint, not the sandbox.
 func (s *Service) recordFailoverReason(ctx context.Context, id string) {
-	if err := s.store.SetStatusReason(ctx, id, models.StatusReasonFailover, nil); err != nil && s.logger != nil {
+	err := s.store.SetStatusReason(ctx, id, models.StatusReasonFailover, nil)
+	if err != nil && s.logger != nil {
 		s.logger.Warn("cluster: record failover status reason failed", "sandbox_id", id, "err", err)
 	}
+	// The recreate is an automatic start the log should show (L3); ctx
+	// names system:failover.
+	s.beginSystemActionReason(ctx, id, systemActionFailoverRecreated, models.StatusReasonFailover)(nil)
 }
 
 // restoreCompatStateAfterRecreate re-materializes the facade compat-state rows a
@@ -6385,10 +6395,12 @@ func (s *Service) Reconcile(ctx context.Context) error {
 		// writes the reason only if the row still has the old status, so a
 		// stop the event path recorded since this pass read the row keeps
 		// its own reason.
+		foundStopped := false
 		if state.Status != sandbox.Status {
 			switch state.Status {
 			case models.SandboxStatusStopped:
 				sandbox.StatusReason, sandbox.ExitCode = models.StatusReasonReconcile, nil
+				foundStopped = sandbox.Status == models.SandboxStatusStarted
 			case models.SandboxStatusStarted:
 				sandbox.StatusReason, sandbox.ExitCode = "", nil
 			}
@@ -6518,7 +6530,16 @@ func (s *Service) Reconcile(ctx context.Context) error {
 				}
 			}
 		}
-		if err := s.store.Upsert(ctx, sandbox); err != nil {
+		// A stop only this pass saw gets a record (L3). The row is read
+		// again first: this pass's read may predate a stop the event path
+		// has recorded since, and that stop has its own record.
+		recordFound := func(error) {}
+		if foundStopped && s.rowStillStarted(ctx, sandbox.ID) {
+			recordFound = s.beginSystemActionReason(ctx, sandbox.ID, systemActionFoundStopped, models.StatusReasonReconcile)
+		}
+		err := s.store.Upsert(ctx, sandbox)
+		recordFound(err)
+		if err != nil {
 			return err
 		}
 	}
@@ -6833,7 +6854,7 @@ func (s *Service) runLifecycleSweep(ctx context.Context) {
 		action, reason := lifecycleDecision(sandbox, now, globalIdle, floor)
 		switch action {
 		case lifecycleDestroy:
-			done := s.beginSystemAction(ctx, sandbox.ID, systemActionAutoDelete)
+			done := s.beginSystemActionReason(ctx, sandbox.ID, systemActionAutoDelete, reason)
 			err := s.DestroySandbox(ctx, sandbox.ID)
 			done(err)
 			if err != nil {
@@ -6845,7 +6866,7 @@ func (s *Service) runLifecycleSweep(ctx context.Context) {
 			// Lifecycle stop: pass mode=stopModeLifecycle so serverless
 			// sandboxes arm wake (the next inbound HTTP request will
 			// resurrect the sandbox transparently).
-			done := s.beginSystemAction(ctx, sandbox.ID, systemActionAutoStop)
+			done := s.beginSystemActionReason(ctx, sandbox.ID, systemActionAutoStop, reason)
 			_, err := s.stopSandboxForReason(ctx, sandbox.ID, stopModeLifecycle, reason)
 			done(err)
 			if err != nil {
@@ -6987,10 +7008,12 @@ func lifecycleActionForWithFloor(sb *models.Sandbox, now time.Time, globalIdle t
 	return action
 }
 
-// lifecycleDecision is lifecycleActionForWithFloor plus the status reason a
-// stop records (models.StatusReasonIdle or StatusReasonMaxAge; "" for any
-// other action). Idle is checked first, as before, so a sandbox past both
-// timers reports idle.
+// lifecycleDecision is lifecycleActionForWithFloor plus why: for a stop,
+// the status reason it records (models.StatusReasonIdle or
+// StatusReasonMaxAge); for a destroy, the timer that fired (idle, max_age,
+// or program_exited for destroy_after_exit_for), which the audit record and
+// the expired counter name; "" for no action. Idle is checked first, as
+// before, so a sandbox past both timers reports idle.
 func lifecycleDecision(sb *models.Sandbox, now time.Time, globalIdle time.Duration, activityFloor time.Time) (lifecycleAction, string) {
 	if sb == nil || sb.Status == models.SandboxStatusDestroyed {
 		return lifecycleNone, ""
@@ -7005,15 +7028,15 @@ func lifecycleDecision(sb *models.Sandbox, now time.Time, globalIdle time.Durati
 	l := sb.Lifecycle
 	// Destroy first: if any destroy condition is met we go straight there.
 	if l.DestroyIfIdleFor > 0 && idle >= l.DestroyIfIdleFor {
-		return lifecycleDestroy, ""
+		return lifecycleDestroy, models.StatusReasonIdle
 	}
 	if l.DestroyAtAge > 0 && age >= l.DestroyAtAge {
-		return lifecycleDestroy, ""
+		return lifecycleDestroy, models.StatusReasonMaxAge
 	}
 	// The main program's end, as the sweep recorded it, counts whatever the
 	// status: a sandbox stopped after its program ended is still done.
 	if l.DestroyAfterExitFor > 0 && sb.ProgramExitedAt != nil && now.Sub(*sb.ProgramExitedAt) >= l.DestroyAfterExitFor {
-		return lifecycleDestroy, ""
+		return lifecycleDestroy, models.StatusReasonProgramExited
 	}
 	// Stop only applies to running sandboxes — re-stopping a stopped one
 	// is wasted Docker calls and noisy logs.

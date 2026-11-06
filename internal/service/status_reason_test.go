@@ -264,7 +264,8 @@ func TestLifecycleDecisionReasons(t *testing.T) {
 		{"age", models.Lifecycle{StopAtAge: time.Minute}, 0, 2 * time.Minute, 0, lifecycleStop, models.StatusReasonMaxAge},
 		{"idle wins over age", models.Lifecycle{StopIfIdleFor: time.Minute, StopAtAge: time.Minute}, 0, 2 * time.Minute, 2 * time.Minute, lifecycleStop, models.StatusReasonIdle},
 		{"server default", models.Lifecycle{}, time.Minute, 0, 2 * time.Minute, lifecycleStop, models.StatusReasonIdle},
-		{"destroy has no stop reason", models.Lifecycle{DestroyAtAge: time.Minute}, 0, 2 * time.Minute, 0, lifecycleDestroy, ""},
+		{"destroy names its timer: age", models.Lifecycle{DestroyAtAge: time.Minute}, 0, 2 * time.Minute, 0, lifecycleDestroy, models.StatusReasonMaxAge},
+		{"destroy names its timer: idle", models.Lifecycle{DestroyIfIdleFor: time.Minute}, 0, 0, 2 * time.Minute, lifecycleDestroy, models.StatusReasonIdle},
 		{"nothing due", models.Lifecycle{StopIfIdleFor: time.Hour}, 0, 0, 0, lifecycleNone, ""},
 	}
 	for _, tc := range cases {
@@ -278,6 +279,12 @@ func TestLifecycleDecisionReasons(t *testing.T) {
 	}
 	if a, r := lifecycleDecision(nil, now, 0, time.Time{}); a != lifecycleNone || r != "" {
 		t.Fatalf("nil sandbox: (%v, %q)", a, r)
+	}
+	exited := now.Add(-2 * time.Minute)
+	afterExit := &models.Sandbox{Status: models.SandboxStatusStopped, Lifecycle: models.Lifecycle{DestroyAfterExitFor: time.Minute},
+		ProgramExitedAt: &exited, CreatedAt: now, LastActiveAt: now}
+	if a, r := lifecycleDecision(afterExit, now, 0, time.Time{}); a != lifecycleDestroy || r != models.StatusReasonProgramExited {
+		t.Fatalf("after exit: (%v, %q)", a, r)
 	}
 }
 

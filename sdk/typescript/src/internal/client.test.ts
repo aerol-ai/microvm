@@ -1748,6 +1748,8 @@ test("sandbox.audit reads its own sandbox's log", async () => {
   const sandbox = await client.create({ image: "ubuntu:22.04" });
   await sandbox.audit({ kind: "egress" });
   assert.ok(urls[urls.length - 1].endsWith("/v1/sandboxes/sb-own/audit?kind=egress"));
+  await sandbox.audit({ caller: "system:*" });
+  assert.ok(urls[urls.length - 1].endsWith("/v1/sandboxes/sb-own/audit?caller=system%3A*"));
 });
 
 test("get maps egress_status for gateway-mode sandboxes", async () => {

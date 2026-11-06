@@ -413,6 +413,74 @@ A restart never fights you or your timers:
 
 If the server itself restarts while a sandbox waits, the wait is kept. The restart happens within about a minute of the server coming back, or later if the wait is longer.
 
+## See what happened to a sandbox
+
+The sandbox's audit log records everything the server does to a sandbox on its own: each automatic stop, delete, restart and re-create. Ask for the records whose caller is `system:*` to get just those, newest last.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const page = await sandbox.audit({ caller: "system:*" });
+    for (const event of page.events) {
+      console.log(event.time, event.ref, event.reason);
+    }
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    page = sandbox.audit({"caller": "system:*"})
+    for event in page["events"]:
+        print(event.get("time"), event.get("ref"), event.get("reason"))
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    page, err := sandbox.Audit(ctx, sdktypes.AuditOptions{Caller: "system:*"})
+    if err != nil {
+        log.Fatal(err)
+    }
+    for _, event := range page.Events {
+        fmt.Println(event.Time, event.Ref, event.Reason)
+    }
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    let page = sandbox.audit(AuditOptions {
+        caller: Some("system:*".into()),
+        ..Default::default()
+    })?;
+    for event in &page.events {
+        println!("{} {:?} {:?}", event.time, event.r#ref, event.reason);
+    }
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    AuditPage page = sandbox.audit(new AuditOptions().setCaller("system:*"));
+    for (AuditEvent event : page.events) {
+        System.out.println(event.time + " " + event.ref + " " + event.reason);
+    }
+    ```
+  </TabItem>
+</Tabs>
+
+Each record's `ref` says what happened, and `reason` says why, using the same words as `statusReason`. For one source only, ask for its caller by name, such as `system:lifecycle`.
+
+| `ref` | Caller | What happened |
+|---|---|---|
+| `SYSTEM lifecycle.auto_stop` | `system:lifecycle` | A stop timer ran out. `reason` is `idle` or `max_age`. |
+| `SYSTEM lifecycle.auto_delete` | `system:lifecycle` | A delete timer ran out. `reason` is `idle`, `max_age` (this includes `destroyAt`) or `program_exited`. |
+| `SYSTEM lifecycle.disk_limit_stop` | `system:lifecycle` | The sandbox wrote more than its disk size. |
+| `SYSTEM lifecycle.restart_on_failure` | `system:lifecycle` | `restartOnFailure` started it again. `reason` is the crash: `crashed` or `out_of_memory`. |
+| `SYSTEM runtime.exited` | `system:runtime` | The sandbox went down without anyone asking. `reason` is `crashed`, `out_of_memory` or `program_exited`. |
+| `SYSTEM runtime.removed` | `system:runtime` | The sandbox's container was removed outside the server. |
+| `SYSTEM reconcile.found_stopped` | `system:reconcile` | The server found the sandbox stopped without seeing it stop. |
+| `SYSTEM reconcile.reap` | `system:reconcile` | The sandbox's container was gone, so the server deleted the sandbox. |
+| `SYSTEM failover.recreated` | `system:failover` | The sandbox was created again on another server after its server failed. |
+
+A stop or delete that you ask for is in the same log, under your own caller. Reading the audit log needs the `audit.read` permission.
+
 ## Good to know
 
 - **The longest timer is 30 days.** A longer value is rejected.

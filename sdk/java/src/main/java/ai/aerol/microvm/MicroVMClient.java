@@ -764,6 +764,7 @@ public class MicroVMClient {
             appendQuery(query, "limit", options.getLimit() == null ? null : String.valueOf(options.getLimit()));
             appendQuery(query, "cursor", options.getCursor());
             appendQuery(query, "incarnation_id", options.getIncarnationId());
+            appendQuery(query, "caller", options.getCaller());
         }
         AuditPage page = doJson("GET", sandboxPath(sandboxId) + "/audit" + query, null, AuditPage.class);
         if (page == null) {

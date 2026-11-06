@@ -1874,6 +1874,9 @@ impl Client {
         if let Some(inc) = &opts.incarnation_id {
             path = append_query_param(&path, "incarnation_id", inc);
         }
+        if let Some(caller) = &opts.caller {
+            path = append_query_param(&path, "caller", caller);
+        }
         self.do_json::<(), AuditPage>(Method::GET, &path, None)
     }
 
@@ -4808,13 +4811,14 @@ mod tests {
                     limit: Some(50),
                     cursor: Some("c1".to_string()),
                     incarnation_id: Some("inc-1".to_string()),
+                    caller: Some("system:*".to_string()),
                 },
             )
             .expect("get_audit should succeed");
         let request = request_rx.recv().expect("request should be captured");
         assert!(
             request.starts_with(
-                "GET /v1/sandboxes/sb-1/audit?kind=egress&limit=50&cursor=c1&incarnation_id=inc-1 HTTP/1.1\r\n"
+                "GET /v1/sandboxes/sb-1/audit?kind=egress&limit=50&cursor=c1&incarnation_id=inc-1&caller=system%3A%2A HTTP/1.1\r\n"
             ),
             "unexpected request: {}",
             request

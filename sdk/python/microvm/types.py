@@ -671,6 +671,9 @@ class AuditOptions(TypedDict, total=False):
     limit: int
     cursor: str
     incarnationID: str
+    # Only records by this caller: an id such as "system:lifecycle", or
+    # "system:*" for everything the server did on its own.
+    caller: str
 
 
 class NetworkPolicyCheckOptions(TypedDict, total=False):

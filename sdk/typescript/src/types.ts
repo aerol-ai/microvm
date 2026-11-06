@@ -706,6 +706,12 @@ export interface AuditOptions {
   limit?: number;
   cursor?: string;
   incarnationID?: string;
+  /**
+   * Only records by this caller: an id such as `"system:lifecycle"`, or
+   * `"system:*"` for everything the server did on its own (automatic
+   * stops, deletes, restarts and recreates).
+   */
+  caller?: string;
 }
 
 /**

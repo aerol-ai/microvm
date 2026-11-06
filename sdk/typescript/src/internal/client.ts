@@ -1612,6 +1612,7 @@ export class APIClient {
     if (options.limit !== undefined) params.set("limit", String(options.limit));
     if (options.cursor) params.set("cursor", options.cursor);
     if (options.incarnationID) params.set("incarnation_id", options.incarnationID);
+    if (options.caller) params.set("caller", options.caller);
     const query = params.toString();
     const response = await this.doJSON<ApiAuditPage>(
       "GET",

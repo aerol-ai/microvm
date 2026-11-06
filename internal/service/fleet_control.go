@@ -37,6 +37,7 @@ var _ controlplane.FleetController = (*Service)(nil)
 // order means a stop that fails still leaves the sandbox marked and running,
 // and the retry re-attempts it.
 func (s *Service) StopByOwner(ctx context.Context, ownerRef string) error {
+	ctx = withAuditSubsystem(ctx, auditSubsystemFleet)
 	sandboxes, err := s.store.ListByOwner(ctx, ownerRef)
 	if err != nil {
 		return err
@@ -57,7 +58,10 @@ func (s *Service) StopByOwner(ctx context.Context, ownerRef string) error {
 			errs = append(errs, err)
 			continue
 		}
-		if _, err := s.StopSandbox(ctx, sb.ID); err != nil && !errors.Is(err, store.ErrNotFound) {
+		done := s.beginSystemActionReason(ctx, sb.ID, systemActionFleetSuspend, models.StatusReasonUserStop)
+		_, err = s.StopSandbox(ctx, sb.ID)
+		done(err)
+		if err != nil && !errors.Is(err, store.ErrNotFound) {
 			errs = append(errs, err)
 			continue
 		}
@@ -110,6 +114,7 @@ func (s *Service) RestoreByOwner(ctx context.Context, ownerRef string) error {
 // re-tick over a partially-deleted set converges. Errors on other sandboxes are
 // collected and returned so the loop retries the remainder.
 func (s *Service) DeleteByOwner(ctx context.Context, ownerRef string) error {
+	ctx = withAuditSubsystem(ctx, auditSubsystemFleet)
 	sandboxes, err := s.store.ListByOwner(ctx, ownerRef)
 	if err != nil {
 		return err
@@ -120,7 +125,10 @@ func (s *Service) DeleteByOwner(ctx context.Context, ownerRef string) error {
 		if sb == nil {
 			continue
 		}
-		if err := s.DestroySandbox(ctx, sb.ID); err != nil && !errors.Is(err, store.ErrNotFound) {
+		done := s.beginSystemAction(ctx, sb.ID, systemActionFleetDelete)
+		err := s.DestroySandbox(ctx, sb.ID)
+		done(err)
+		if err != nil && !errors.Is(err, store.ErrNotFound) {
 			errs = append(errs, err)
 			continue
 		}

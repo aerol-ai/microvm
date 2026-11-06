@@ -253,3 +253,40 @@ func TestParityDestroyAtLive(t *testing.T) {
 		t.Fatalf("deleted %v before its destroy_at", -late)
 	}
 }
+
+// UC-400 — the lifecycle event feed (plan L3): a sandbox stopped by its idle
+// timer has a system record for it, found with caller=system:*, with
+// reason idle; the records a caller made are not in that view.
+func TestParityLifecycleAuditFeedLive(t *testing.T) {
+	harness.Require(t, sc, "UC-400")
+	c := client(t)
+	sb := c.NewSandbox(t, sdktypes.CreateSandboxOptions{
+		Name:      harness.UniqueName(sc, t),
+		Lifecycle: &sdktypes.Lifecycle{StopIfIdleFor: time.Minute},
+	})
+	waitRunning(t, sb)
+	waitReason(t, c, sb.ID, "stopped", sdktypes.StatusReasonIdle, 4*time.Minute)
+
+	// Records are written as the stop finishes; give the log a moment.
+	deadline := time.Now().Add(time.Minute)
+	var last sdktypes.AuditPage
+	for time.Now().Before(deadline) {
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		page, err := sb.Audit(ctx, sdktypes.AuditOptions{Caller: "system:*"})
+		cancel()
+		if err != nil {
+			t.Fatalf("audit: %v", err)
+		}
+		last = page
+		for _, ev := range page.Events {
+			if !strings.HasPrefix(ev.Ref, "SYSTEM ") && ev.Kind != "gap" && ev.Result != "gap" {
+				t.Fatalf("caller=system:* returned a caller's record: %+v", ev)
+			}
+			if ev.Ref == "SYSTEM lifecycle.auto_stop" && ev.Reason == sdktypes.StatusReasonIdle {
+				return
+			}
+		}
+		time.Sleep(5 * time.Second)
+	}
+	t.Fatalf("no lifecycle.auto_stop record with reason idle; system records: %+v", last.Events)
+}

@@ -6,6 +6,7 @@ public class AuditOptions {
     private Integer limit;
     private String cursor;
     private String incarnationId;
+    private String caller;
 
     public String getKind() {
         return kind;
@@ -40,6 +41,19 @@ public class AuditOptions {
 
     public AuditOptions setIncarnationId(String incarnationId) {
         this.incarnationId = incarnationId;
+        return this;
+    }
+
+    public String getCaller() {
+        return caller;
+    }
+
+    /**
+     * Only records by this caller: an id such as {@code "system:lifecycle"},
+     * or {@code "system:*"} for everything the server did on its own.
+     */
+    public AuditOptions setCaller(String caller) {
+        this.caller = caller;
         return this;
     }
 }

@@ -33,7 +33,7 @@ func TestClientAndSandboxWrappers(t *testing.T) {
 			_ = json.NewEncoder(w).Encode(models.NetworkPolicyCheckResponse{Allowed: req.Destination == "api.github.com", MatchedRule: "*.github.com", DefaultVerdict: "deny"})
 		case r.Method == http.MethodGet && r.URL.Path == "/v1/sandboxes/sb1/audit":
 			q := r.URL.Query()
-			if q.Get("kind") != "egress" || q.Get("limit") != "50" || q.Get("cursor") != "c1" || q.Get("incarnation_id") != "inc-1" {
+			if q.Get("kind") != "egress" || q.Get("limit") != "50" || q.Get("cursor") != "c1" || q.Get("incarnation_id") != "inc-1" || q.Get("caller") != "system:*" {
 				http.Error(w, "bad query "+r.URL.RawQuery, http.StatusBadRequest)
 				return
 			}
@@ -207,7 +207,7 @@ func TestClientAndSandboxWrappers(t *testing.T) {
 	if err != nil || !check.Allowed || check.MatchedRule != "*.github.com" || check.DefaultVerdict != "deny" {
 		t.Fatalf("CheckNetworkPolicy() = %+v, %v", check, err)
 	}
-	page, err := sb.Audit(ctx, sdktypes.AuditOptions{Kind: "egress", Limit: 50, Cursor: "c1", IncarnationID: "inc-1"})
+	page, err := sb.Audit(ctx, sdktypes.AuditOptions{Kind: "egress", Limit: 50, Cursor: "c1", IncarnationID: "inc-1", Caller: "system:*"})
 	if err != nil || len(page.Events) != 1 || page.Events[0].Reason != "host_not_allowed" || page.Events[0].EventID != "ae-1" ||
 		page.NextCursor != "c2" || page.Coverage.Answered[0] != "n1" {
 		t.Fatalf("Sandbox.Audit() = %+v, %v", page, err)

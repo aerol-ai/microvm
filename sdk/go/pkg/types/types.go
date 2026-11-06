@@ -299,6 +299,10 @@ type AuditOptions struct {
 	Limit         int
 	Cursor        string
 	IncarnationID string
+	// Caller keeps only records by this caller: an id such as
+	// "system:lifecycle", or "system:*" for everything the server did on
+	// its own (automatic stops, deletes, restarts and recreates).
+	Caller string
 }
 
 // CustomDomain is the per-hostname row attached to a sandbox. Status moves

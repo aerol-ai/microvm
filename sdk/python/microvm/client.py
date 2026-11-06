@@ -1282,6 +1282,8 @@ class MicroVM:
             params["cursor"] = opts["cursor"]
         if opts.get("incarnationID"):
             params["incarnation_id"] = opts["incarnationID"]
+        if opts.get("caller"):
+            params["caller"] = opts["caller"]
         path = f"{self._version_prefix}/sandboxes/{sandbox_id}/audit"
         if params:
             path += "?" + urllib.parse.urlencode(params)

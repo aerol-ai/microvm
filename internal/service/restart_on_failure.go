@@ -267,7 +267,8 @@ func (s *Service) restartIfDue(ctx context.Context, id string) {
 		return
 	}
 
-	done := s.beginSystemAction(ctx, id, systemActionRestart)
+	// The record says what it answered: the crash or the OOM kill.
+	done := s.beginSystemActionReason(ctx, id, systemActionRestart, sb.StatusReason)
 	_, err = s.startSandbox(ctx, id, startForRestart)
 	done(err)
 	if err != nil {

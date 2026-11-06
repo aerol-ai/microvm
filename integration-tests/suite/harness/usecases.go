@@ -983,6 +983,7 @@ var Registry = []UseCase{
 	{ID: "UC-397", Title: "restartOnFailure is refused at create on Firecracker with a 400 that names the option", Requires: []Capability{CapFirecracker}, Implemented: true},
 	{ID: "UC-398", Title: "destroyAfterExitFor: the main program ends with code 3; the sandbox stays up and usable with status_reason program_exited and exit_code 3, then is deleted once the one-minute delay has passed", Implemented: true},
 	{ID: "UC-399", Title: "destroyAt: a time in the past is refused with a 400 naming destroy_at; a time two minutes ahead is stored as destroy_at_age and deletes the sandbox soon after it passes", Implemented: true},
+	{ID: "UC-400", Title: "lifecycle event feed: a sandbox stopped by a one-minute idle timer has a SYSTEM lifecycle.auto_stop record with reason idle on its audit page, read with caller=system:*, which returns only system records", Implemented: true},
 }
 
 // byID is a lookup built once for the report generator.

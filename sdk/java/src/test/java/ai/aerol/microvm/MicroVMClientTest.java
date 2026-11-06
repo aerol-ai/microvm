@@ -1448,8 +1448,8 @@ class MicroVMClientTest {
         });
         try {
             MicroVMClient client = clientFor(server);
-            AuditPage page = client.getAudit("sb-1", new AuditOptions().setKind("egress").setLimit(50).setCursor("c1").setIncarnationId("inc-1"));
-            assertEquals("kind=egress&limit=50&cursor=c1&incarnation_id=inc-1", query.get());
+            AuditPage page = client.getAudit("sb-1", new AuditOptions().setKind("egress").setLimit(50).setCursor("c1").setIncarnationId("inc-1").setCaller("system:*"));
+            assertEquals("kind=egress&limit=50&cursor=c1&incarnation_id=inc-1&caller=system%3A*", query.get());
             assertEquals("host_not_allowed", page.events.get(0).reason);
             assertEquals("ae-1", page.events.get(0).eventId);
             assertEquals(List.of("n1"), page.coverage.answered);

@@ -1218,6 +1218,9 @@ pub struct AuditOptions {
     pub limit: Option<u32>,
     pub cursor: Option<String>,
     pub incarnation_id: Option<String>,
+    /// Only records by this caller: an id such as `"system:lifecycle"`, or
+    /// `"system:*"` for everything the server did on its own.
+    pub caller: Option<String>,
 }
 
 fn null_as_empty<'de, D, T>(d: D) -> Result<Vec<T>, D::Error>

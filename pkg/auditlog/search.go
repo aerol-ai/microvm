@@ -19,7 +19,9 @@ import (
 type SearchFilter struct {
 	// Caller matches the record's caller id exactly ("tok_7Hq2…",
 	// "operator", "system:lifecycle") or its display name ignoring case
-	// ("ana@acme.com").
+	// ("ana@acme.com"). "system:*" matches every system caller: everything
+	// the daemon did on its own (the lifecycle event feed, plans/agent-
+	// sandbox-feature-parity.md L3).
 	Caller string
 	// Kind matches the record kind ("api", "secret_open", "auth_denied").
 	Kind string
@@ -61,9 +63,17 @@ func (f SearchFilter) Match(ev Event) bool {
 	return true
 }
 
+// SystemCallerWildcard is the Caller filter value that matches every
+// system:<subsystem> caller.
+const SystemCallerWildcard = "system:*"
+
 func callerMatches(c *Caller, want string) bool {
 	if c == nil {
 		return false
+	}
+	if want == SystemCallerWildcard {
+		// Only the system kind: no token or person id starts with "system:".
+		return c.Kind == "system" && strings.HasPrefix(c.ID, "system:")
 	}
 	return c.ID == want || (c.Name != "" && strings.EqualFold(c.Name, want))
 }

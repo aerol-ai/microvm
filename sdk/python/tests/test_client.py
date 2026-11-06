@@ -1066,11 +1066,11 @@ class ClientTests(unittest.TestCase):
     def test_get_audit_sends_filters_and_maps_page(self):
         client = RecordingMicroVM()
 
-        page = client.get_audit("sb-1", {"kind": "egress", "limit": 50, "cursor": "c1", "incarnationID": "inc-1"})
+        page = client.get_audit("sb-1", {"kind": "egress", "limit": 50, "cursor": "c1", "incarnationID": "inc-1", "caller": "system:*"})
 
         self.assertEqual(
             client.calls[0],
-            ("GET", "/v1/sandboxes/sb-1/audit?kind=egress&limit=50&cursor=c1&incarnation_id=inc-1", None),
+            ("GET", "/v1/sandboxes/sb-1/audit?kind=egress&limit=50&cursor=c1&incarnation_id=inc-1&caller=system%3A%2A", None),
         )
         self.assertEqual(page["events"][0]["reason"], "host_not_allowed")
         self.assertEqual(page["events"][0]["eventID"], "ae-1")
