@@ -5048,7 +5048,7 @@ func (s *Service) exposePort(ctx context.Context, id string, port int, protocol,
 	// not yet bound we warn and proceed rather than holding the caller until
 	// it does; the operator can retry expose_port or the client can retry
 	// the request once the process is up.
-	if existingBefore == nil && sandbox.ContainerIP != "" && sandbox.Status == models.SandboxStatusStarted {
+	if existingBefore == nil && sandbox.ContainerIP != "" && sandbox.Status == models.SandboxStatusStarted && !skipPortProbe(ctx) {
 		probeFn := s.probeContainerPortFn
 		if probeFn == nil {
 			probeFn = probeContainerPort
@@ -8214,6 +8214,23 @@ func validateMaskRequestHost(mask string) error {
 // scheduling jitter on a loaded host while short enough not to block
 // exposePort for slow-starting processes indefinitely.
 const portProbeTimeout = 2 * time.Second
+
+// skipPortProbeKey is the context key WithoutPortProbe sets.
+type skipPortProbeKey struct{}
+
+// WithoutPortProbe marks an expose whose port cannot be listening yet, so
+// exposePort skips its best-effort probe. E2B's mcp option exposes the
+// gateway port at create time, but the E2B SDK starts the gateway only after
+// the create returns: the probe could never succeed there, and a dropped SYN
+// made it wait out portProbeTimeout (2 s) on every such create.
+func WithoutPortProbe(ctx context.Context) context.Context {
+	return context.WithValue(ctx, skipPortProbeKey{}, true)
+}
+
+func skipPortProbe(ctx context.Context) bool {
+	skip, _ := ctx.Value(skipPortProbeKey{}).(bool)
+	return skip
+}
 
 // probeContainerPort dials containerIP:port to verify the in-container process
 // has bound its port before Caddy starts routing traffic to it. Called from

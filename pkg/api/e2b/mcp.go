@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 
+	"github.com/aerol-ai/microvm/internal/service"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
 
@@ -81,6 +82,8 @@ func (h *handlers) exposeMCPGateway(ctx context.Context, sandboxID string, meta 
 	if meta.AllowPublicTraffic != nil && !*meta.AllowPublicTraffic {
 		return nil
 	}
-	_, err := h.deps.Service.ExposePort(ctx, sandboxID, mcpGatewayPort, models.ExposedPortProtocolHTTP)
+	// The gateway is started by the E2B SDK after the create returns, so the
+	// port is never listening yet: skip the expose's probe.
+	_, err := h.deps.Service.ExposePort(service.WithoutPortProbe(ctx), sandboxID, mcpGatewayPort, models.ExposedPortProtocolHTTP)
 	return err
 }
