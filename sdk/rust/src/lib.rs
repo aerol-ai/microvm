@@ -1,3 +1,4 @@
+mod files;
 mod image;
 mod types;
 
@@ -23,6 +24,10 @@ use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::{Error as WebSocketError, Message};
 
+pub use files::{
+    CopyFileOptions, DeleteFileOptions, FileInfo, FileList, FileMatch, ListFilesOptions, MakeDirOptions,
+    MoveFileOptions, DEFAULT_LIST_LIMIT,
+};
 pub use image::Image;
 pub use types::CreateSandboxResponse;
 use types::{CustomDomainListWire, ExposePortResponseWire};
@@ -2415,6 +2420,23 @@ impl Client {
         policy: RetryPolicy,
         headers: &[(&str, &str)],
     ) -> Result<(U, reqwest::header::HeaderMap), Error> {
+        self.send_json_done(method, path, payload, policy, headers, None)
+    }
+
+    /// [`Client::send_json_with_headers`] for a call whose retry can find
+    /// its own work done: a delete finds the path gone, a mkdir its folder.
+    /// When a re-sent attempt (never the first) gets an error carrying the
+    /// toolbox error code `done_code`, the first attempt's reply was lost
+    /// and the call succeeds as an empty reply.
+    fn send_json_done<T: Serialize, U: DeserializeOwned>(
+        &self,
+        method: Method,
+        path: &str,
+        payload: Option<&T>,
+        policy: RetryPolicy,
+        headers: &[(&str, &str)],
+        done_code: Option<&str>,
+    ) -> Result<(U, reqwest::header::HeaderMap), Error> {
         let max_retries = self.retry_config.max_retries.unwrap_or(3);
 
         let mut attempt = 0;
@@ -2434,7 +2456,25 @@ impl Client {
 
             match builder.send() {
                 Ok(response) => {
-                    if attempt < max_retries && policy.retries_status(response.status()) {
+                    if let (Some(code), true) = (done_code, attempt > 0 && !response.status().is_success()) {
+                        let status = response.status();
+                        let hint = retry_after_hint(&response);
+                        let header_retry_after = response
+                            .headers()
+                            .get(reqwest::header::RETRY_AFTER)
+                            .and_then(|value| value.to_str().ok())
+                            .map(String::from);
+                        let body = response.text().unwrap_or_default();
+                        let err = ApiError::from_response(status, header_retry_after.as_deref(), &body);
+                        if err.code() == Some(code) {
+                            let body = serde_json::from_str("null").map_err(Error::SerdeJson)?;
+                            return Ok((body, reqwest::header::HeaderMap::new()));
+                        }
+                        if attempt >= max_retries || !policy.retries_status(status) {
+                            return Err(Error::Api(err));
+                        }
+                        retry_after = hint;
+                    } else if attempt < max_retries && policy.retries_status(response.status()) {
                         // Fall through to retry logic; dropping the response
                         // frees the connection before the wait.
                         retry_after = retry_after_hint(&response);
@@ -2445,8 +2485,11 @@ impl Client {
                             let body = serde_json::from_str("null").map_err(Error::SerdeJson)?;
                             return Ok((body, headers));
                         }
-                        let body = response.json().map_err(Error::Reqwest)?;
-                        return Ok((body, headers));
+                        // A success may come with no body at all (the
+                        // toolbox's mkdir answers a bare 201): read it as null.
+                        let text = response.text().map_err(Error::Reqwest)?;
+                        let text = if text.trim().is_empty() { "null" } else { text.as_str() };
+                        return Ok((serde_json::from_str(text).map_err(Error::SerdeJson)?, headers));
                     }
                 }
                 Err(err) => {

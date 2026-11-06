@@ -5,7 +5,6 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io/fs"
 	"net/http"
 	"net/url"
@@ -17,19 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
-	"time"
 )
-
-type daytonaFileInfoResponse struct {
-	Group       string `json:"group"`
-	IsDir       bool   `json:"isDir"`
-	ModTime     string `json:"modTime"`
-	Mode        string `json:"mode"`
-	Name        string `json:"name"`
-	Owner       string `json:"owner"`
-	Permissions string `json:"permissions"`
-	Size        int32  `json:"size"`
-}
 
 type daytonaMatchResponse struct {
 	Content string `json:"content"`
@@ -118,61 +105,6 @@ func (e *gitCommandError) Error() string {
 		return ""
 	}
 	return e.message
-}
-
-func (s *server) handleDaytonaFileInfo(w http.ResponseWriter, r *http.Request) {
-	targetPath, err := resolveDaytonaPath(r.URL.Query().Get("path"), false)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-	info, err := os.Stat(targetPath)
-	if err != nil {
-		writeFilesystemError(w, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, buildDaytonaFileInfo(targetPath, info))
-}
-
-func (s *server) handleDaytonaListFiles(w http.ResponseWriter, r *http.Request) {
-	targetPath, err := resolveDaytonaPath(r.URL.Query().Get("path"), true)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-	entries, err := os.ReadDir(targetPath)
-	if err != nil {
-		writeFilesystemError(w, err)
-		return
-	}
-	items := make([]daytonaFileInfoResponse, 0, len(entries))
-	for _, entry := range entries {
-		info, err := entry.Info()
-		if err != nil {
-			writeFilesystemError(w, err)
-			return
-		}
-		items = append(items, buildDaytonaFileInfo(filepath.Join(targetPath, entry.Name()), info))
-	}
-	writeJSON(w, http.StatusOK, items)
-}
-
-func (s *server) handleDaytonaMoveFile(w http.ResponseWriter, r *http.Request) {
-	source, err := resolveDaytonaPath(r.URL.Query().Get("source"), false)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-	destination, err := resolveDaytonaPath(r.URL.Query().Get("destination"), false)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-	if err := os.Rename(source, destination); err != nil {
-		writeFilesystemError(w, err)
-		return
-	}
-	w.WriteHeader(http.StatusNoContent)
 }
 
 func (s *server) handleDaytonaSearchFiles(w http.ResponseWriter, r *http.Request) {
@@ -498,20 +430,6 @@ func (s *server) handleDaytonaGitStatus(w http.ResponseWriter, r *http.Request) 
 	writeJSON(w, http.StatusOK, parseGitStatus(output))
 }
 
-func buildDaytonaFileInfo(path string, info os.FileInfo) daytonaFileInfoResponse {
-	owner, group := fileOwnerGroup(info)
-	return daytonaFileInfoResponse{
-		Group:       group,
-		IsDir:       info.IsDir(),
-		ModTime:     info.ModTime().UTC().Format(time.RFC3339),
-		Mode:        info.Mode().String(),
-		Name:        filepath.Base(path),
-		Owner:       owner,
-		Permissions: fmt.Sprintf("%04o", info.Mode().Perm()),
-		Size:        clampInt32(info.Size()),
-	}
-}
-
 func resolveDaytonaPath(raw string, defaultToWorkDir bool) (string, error) {
 	trimmed := strings.TrimSpace(raw)
 	if trimmed == "" {
@@ -584,24 +502,6 @@ func clampInt32(value int64) int32 {
 		return 0
 	}
 	return int32(value)
-}
-
-func writeFilesystemError(w http.ResponseWriter, err error) {
-	status := http.StatusInternalServerError
-	switch {
-	case errors.Is(err, os.ErrNotExist):
-		status = http.StatusNotFound
-	case errors.Is(err, os.ErrPermission):
-		status = http.StatusForbidden
-	case errors.Is(err, syscall.ENOTDIR), errors.Is(err, syscall.EISDIR), errors.Is(err, syscall.ENOTEMPTY), errors.Is(err, os.ErrExist):
-		// The path is the wrong kind (file vs folder) or already taken.
-		status = http.StatusConflict
-	case errors.Is(err, syscall.ENOSPC), errors.Is(err, syscall.EDQUOT):
-		// A full sandbox disk is not a toolboxd fault; say so plainly.
-		writeError(w, http.StatusInsufficientStorage, "sandbox disk is full: "+err.Error())
-		return
-	}
-	writeError(w, status, err.Error())
 }
 
 func writeGitError(w http.ResponseWriter, err error) {

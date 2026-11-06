@@ -1,4 +1,12 @@
-from .client import FileWatchHandle, MicroVM, MicroVMError, MicroVMHTTPError, MicroVMUnsupportedFeatureError, Tokens
+from .client import (
+    DEFAULT_LIST_LIMIT,
+    FileWatchHandle,
+    MicroVM,
+    MicroVMError,
+    MicroVMHTTPError,
+    MicroVMUnsupportedFeatureError,
+    Tokens,
+)
 from .image import Image
 from .types import (
     APIToken,
@@ -35,6 +43,9 @@ from .types import (
     Failover,
     FailoverPolicy,
     FileEvent,
+    FileInfo,
+    FileList,
+    FileMatch,
     IngressTarget,
     MicroVMConfig,
     RetryConfig,
@@ -43,6 +54,7 @@ from .types import (
 )
 
 __all__ = [
+    "DEFAULT_LIST_LIMIT",
     "APIToken",
     "APITokenList",
     "CreateAPITokenOptions",
@@ -84,6 +96,9 @@ __all__ = [
     "FailoverPolicy",
     "FileEvent",
     "FileWatchHandle",
+    "FileInfo",
+    "FileList",
+    "FileMatch",
     "IngressTarget",
     "MicroVMConfig",
     "RetryConfig",

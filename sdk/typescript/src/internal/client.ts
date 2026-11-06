@@ -40,6 +40,14 @@ import type {
   Failover,
   FileEvent,
   FileWatchHandle,
+  FileInfo,
+  FileList,
+  FileMatch,
+  ListFilesOptions,
+  DeleteFileOptions,
+  MakeDirOptions,
+  MoveFileOptions,
+  CopyFileOptions,
   GPUOptions,
   HealthStatus,
   IngressTarget,
@@ -499,8 +507,26 @@ const RETRYABLE_STATUS_CODES = new Set([421, 429, 502, 503, 504]);
 // 504 is a hop's, not the server's, so those use the normal backoff.
 const REFUSED_STATUS_CODES = new Set([429, 503]);
 
+/**
+ * The toolboxd feature (on /version) behind the file verbs' options: list
+ * depth and cap, the move and copy overwrite guard, mkdir without parents and
+ * the copy route. An older agent ignores those options (overwrite=false would
+ * overwrite), so the calls that send them check first.
+ */
+const FEATURE_FILE_VERBS = "files.verbs";
+
+/** The entry cap `listFiles` sends when the caller gives none. */
+export const DEFAULT_LIST_LIMIT = 10_000;
+
 /** Per-call options for {@link APIClient.request}. */
 interface RequestOptions {
+  /**
+   * For a call whose retry can find its own work done (a delete finds the
+   * path gone, a mkdir its folder): when a re-sent attempt, never the first,
+   * gets an error carrying this toolbox error code, the first attempt's reply
+   * was lost and the call succeeds with an empty 204.
+   */
+  doneCode?: string;
   /**
    * `false` for a request the server must not receive twice: re-sending an
    * exec runs the caller's command again. Only failures that prove the
@@ -1156,6 +1182,133 @@ export class APIClient {
     return new Uint8Array(await response.arrayBuffer());
   }
 
+  // File verbs beyond upload and download (plans/agent-sandbox-feature-
+  // parity.md, F1), through the sandbox's toolbox. A sandbox whose agent
+  // predates them fails closed with MicroVMUnsupportedFeatureError instead of
+  // ignoring a safety option; WASM and V8 isolate sandboxes answer 501.
+  //
+  // Retries: listFiles, getFileInfo, fileExists, searchFiles, findInFiles,
+  // deleteFile and makeDir are safe to re-send and retry on 421, 429, 502,
+  // 503 and 504 (a retried delete or mkdir whose work is already done counts
+  // as success). moveFile and copyFile retry only on 429 and 503, because a
+  // lost reply may hide a move that happened.
+
+  private toolboxPath(id: string, route: string, query: Record<string, string>): string {
+    return `${this.versionPrefix}/sandboxes/${encodeURIComponent(id)}/toolbox${route}?${new URLSearchParams(query).toString()}`;
+  }
+
+  /** Sends a body-less file call and discards a success reply. */
+  private async fileCall(method: string, path: string, options: RequestOptions): Promise<void> {
+    const response = await this.request(method, path, {}, options);
+    if (!response.ok) {
+      throw await decodeError(response);
+    }
+    await response.body?.cancel().catch(() => undefined);
+  }
+
+  async listFiles(id: string, path: string, options: ListFilesOptions = {}): Promise<FileList> {
+    const depth = options.depth ?? 1;
+    const limit = options.limit ?? DEFAULT_LIST_LIMIT;
+    if (depth < 1 || limit < 1) {
+      throw new Error("depth and limit must be at least 1");
+    }
+    await this.requireToolboxFeatures(id, FEATURE_FILE_VERBS);
+    const response = await this.request(
+      "GET",
+      this.toolboxPath(id, "/files", { path, depth: String(depth), limit: String(limit), extended: "true" }),
+    );
+    if (!response.ok) {
+      throw await decodeError(response);
+    }
+    const items = ((await response.json()) ?? []) as ApiFileInfo[];
+    const base = path.replace(/\/+$/, "");
+    return {
+      entries: items.map((item) => fromApiFileInfo(item, `${base}/${item.name ?? ""}`)),
+      truncated: response.headers.get("x-toolbox-truncated") === "true",
+    };
+  }
+
+  async getFileInfo(id: string, path: string): Promise<FileInfo> {
+    // extended=true only adds fields; an older agent that ignores it answers
+    // fields this still reads, so no /version check.
+    const item = await this.doJSON<ApiFileInfo>("GET", this.toolboxPath(id, "/files/info", { path, extended: "true" }));
+    return fromApiFileInfo(item ?? {}, path);
+  }
+
+  async fileExists(id: string, path: string): Promise<boolean> {
+    try {
+      await this.getFileInfo(id, path);
+      return true;
+    } catch (err) {
+      if (isMissingFile(err)) {
+        return false;
+      }
+      throw err;
+    }
+  }
+
+  async deleteFile(id: string, path: string, options: DeleteFileOptions = {}): Promise<void> {
+    const query: Record<string, string> = { path };
+    if (options.recursive) {
+      query.recursive = "true";
+    }
+    await this.fileCall("DELETE", this.toolboxPath(id, "/files", query), { doneCode: "file_not_found" });
+  }
+
+  async makeDir(id: string, path: string, options: MakeDirOptions = {}): Promise<void> {
+    const parents = options.parents ?? false;
+    if (!parents) {
+      // An older agent ignores parents=false and makes them anyway.
+      await this.requireToolboxFeatures(id, FEATURE_FILE_VERBS);
+    }
+    const query: Record<string, string> = { path, parents: String(parents) };
+    if (options.mode !== undefined) {
+      query.mode = options.mode.toString(8);
+    }
+    await this.fileCall("POST", this.toolboxPath(id, "/files/folder", query), { doneCode: "folder_exists" });
+  }
+
+  async moveFile(id: string, source: string, destination: string, options: MoveFileOptions = {}): Promise<void> {
+    const overwrite = options.overwrite ?? false;
+    if (!overwrite) {
+      // An older agent ignores overwrite=false and replaces the destination.
+      await this.requireToolboxFeatures(id, FEATURE_FILE_VERBS);
+    }
+    await this.fileCall(
+      "POST",
+      this.toolboxPath(id, "/files/move", { source, destination, overwrite: String(overwrite) }),
+      { idempotent: false },
+    );
+  }
+
+  async copyFile(id: string, source: string, destination: string, options: CopyFileOptions = {}): Promise<void> {
+    await this.requireToolboxFeatures(id, FEATURE_FILE_VERBS);
+    const query = {
+      source,
+      destination,
+      overwrite: String(options.overwrite ?? false),
+      recursive: String(options.recursive ?? false),
+    };
+    await this.fileCall("POST", this.toolboxPath(id, "/files/copy", query), { idempotent: false });
+  }
+
+  async searchFiles(id: string, path: string, pattern: string): Promise<string[]> {
+    const response = await this.doJSON<{ files?: unknown }>("GET", this.toolboxPath(id, "/files/search", { path, pattern }));
+    return Array.isArray(response?.files) ? response.files.map(String) : [];
+  }
+
+  async findInFiles(id: string, path: string, text: string): Promise<FileMatch[]> {
+    const response = await this.doJSON<unknown>("GET", this.toolboxPath(id, "/files/find", { path, pattern: text }));
+    if (!Array.isArray(response)) {
+      return [];
+    }
+    return response.map((m: { file?: unknown; line?: unknown; content?: unknown }) => ({
+      file: String(m.file ?? ""),
+      line: Number(m.line ?? 0),
+      content: String(m.content ?? ""),
+    }));
+  }
+
   /**
    * Publish a sandbox container port. The chosen wire protocol is selected by
    * `options.protocol` (defaults to `"http"`):
@@ -1573,6 +1726,10 @@ export class APIClient {
       let retryAfter: string | null = null;
       try {
         const response = await this.fetchFn(url, requestInit);
+        if (attempt > 0 && options.doneCode && !response.ok && (await errorCode(response)) === options.doneCode) {
+          response.body?.cancel().catch(() => undefined);
+          return new Response(null, { status: 204 });
+        }
         if (!retryableStatusCodes.has(response.status) || attempt >= maxRetries) {
           return response;
         }
@@ -1707,6 +1864,51 @@ export class SandboxResource implements Sandbox {
 
   async downloadFile(targetPath: string): Promise<Uint8Array> {
     return this.client.downloadFile(this.id, targetPath);
+  }
+
+  /** List a folder. See {@link ListFilesOptions}; `truncated` means more entries exist. */
+  async listFiles(path: string, options: ListFilesOptions = {}): Promise<FileList> {
+    return this.client.listFiles(this.id, path, options);
+  }
+
+  /** Describe one path. A symlink is followed. */
+  async getFileInfo(path: string): Promise<FileInfo> {
+    return this.client.getFileInfo(this.id, path);
+  }
+
+  /** Whether a path exists. A missing sandbox throws; it is not `false`. */
+  async fileExists(path: string): Promise<boolean> {
+    return this.client.fileExists(this.id, path);
+  }
+
+  /** Delete a file, or a folder and its contents with `recursive: true`. */
+  async deleteFile(path: string, options: DeleteFileOptions = {}): Promise<void> {
+    await this.client.deleteFile(this.id, path, options);
+  }
+
+  /** Make a folder; with `parents: true`, like `mkdir -p`. */
+  async makeDir(path: string, options: MakeDirOptions = {}): Promise<void> {
+    await this.client.makeDir(this.id, path, options);
+  }
+
+  /** Move or rename a file or folder. Without `overwrite`, an existing destination is refused (409). */
+  async moveFile(source: string, destination: string, options: MoveFileOptions = {}): Promise<void> {
+    await this.client.moveFile(this.id, source, destination, options);
+  }
+
+  /** Copy a file, or a folder with `recursive: true`. */
+  async copyFile(source: string, destination: string, options: CopyFileOptions = {}): Promise<void> {
+    await this.client.copyFile(this.id, source, destination, options);
+  }
+
+  /** Paths under `path` whose name matches a glob such as `*.ts`. */
+  async searchFiles(path: string, pattern: string): Promise<string[]> {
+    return this.client.searchFiles(this.id, path, pattern);
+  }
+
+  /** Each line under `path` that contains `text` (plain text). */
+  async findInFiles(path: string, text: string): Promise<FileMatch[]> {
+    return this.client.findInFiles(this.id, path, text);
   }
 
   async exposePort(port: number, options?: ExposePortOptions): Promise<ExposeResult> {
@@ -2299,6 +2501,65 @@ function toBlob(data: BinaryLike): Blob {
     return new Blob([new Uint8Array(data)]);
   }
   return new Blob([Uint8Array.from(data)]);
+}
+
+/** The `code` of a JSON error reply, read from a clone so the body stays readable. */
+async function errorCode(response: Response): Promise<string | undefined> {
+  try {
+    const payload = (await response.clone().json()) as { code?: unknown };
+    return typeof payload.code === "string" ? payload.code : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * A missing file, not a missing sandbox (also a 404). Current agents say
+ * file_not_found; older ones send no code, but their message is the OS
+ * error, which ends "no such file or directory".
+ */
+function isMissingFile(err: unknown): boolean {
+  if (!(err instanceof MicroVMApiError) || err.status !== 404) {
+    return false;
+  }
+  return err.code === "file_not_found" || (err.code === undefined && err.message.endsWith("no such file or directory"));
+}
+
+/** Wire shape of toolboxd's file info with extended=true. */
+interface ApiFileInfo {
+  name?: string;
+  path?: string;
+  isDir?: boolean;
+  size?: number;
+  size_bytes?: number;
+  mode?: string;
+  permissions?: string;
+  owner?: string;
+  group?: string;
+  modTime?: string;
+  symlink_target?: string;
+}
+
+/**
+ * An older agent ignores extended=true and sends only Daytona's fields (a
+ * 32-bit size, no path), so each extended field falls back.
+ */
+function fromApiFileInfo(item: ApiFileInfo, fallbackPath: string): FileInfo {
+  const info: FileInfo = {
+    name: item.name ?? "",
+    path: item.path || fallbackPath,
+    isDir: item.isDir ?? false,
+    size: item.size_bytes ?? item.size ?? 0,
+    mode: item.mode ?? "",
+    permissions: item.permissions ?? "",
+    owner: item.owner ?? "",
+    group: item.group ?? "",
+    modTime: item.modTime ?? "",
+  };
+  if (typeof item.symlink_target === "string") {
+    info.symlinkTarget = item.symlink_target;
+  }
+  return info;
 }
 
 async function decodeError(response: Response): Promise<MicroVMApiError> {

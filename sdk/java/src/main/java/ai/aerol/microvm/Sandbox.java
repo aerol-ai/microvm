@@ -5,6 +5,14 @@ import java.util.List;
 import ai.aerol.microvm.model.AuditOptions;
 import ai.aerol.microvm.model.AuditPage;
 import ai.aerol.microvm.model.CloneGeneration;
+import ai.aerol.microvm.model.CopyFileOptions;
+import ai.aerol.microvm.model.DeleteFileOptions;
+import ai.aerol.microvm.model.FileInfo;
+import ai.aerol.microvm.model.FileList;
+import ai.aerol.microvm.model.FileMatch;
+import ai.aerol.microvm.model.ListFilesOptions;
+import ai.aerol.microvm.model.MakeDirOptions;
+import ai.aerol.microvm.model.MoveFileOptions;
 import ai.aerol.microvm.model.CreateSnapshotOptions;
 import ai.aerol.microvm.model.CreateSessionOptions;
 import ai.aerol.microvm.model.CustomDomain;
@@ -115,6 +123,71 @@ public class Sandbox extends SandboxData {
 
     public byte[] downloadFile(String targetPath) {
         return client.downloadFile(id, targetPath);
+    }
+
+    /** Lists a folder. See {@link ListFilesOptions}; {@code truncated} means more entries exist. */
+    public FileList listFiles(String path, ListFilesOptions options) {
+        return client.listFiles(id, path, options);
+    }
+
+    public FileList listFiles(String path) {
+        return client.listFiles(id, path);
+    }
+
+    /** Describes one path. A symlink is followed. */
+    public FileInfo getFileInfo(String path) {
+        return client.getFileInfo(id, path);
+    }
+
+    /** Whether a path exists. */
+    public boolean fileExists(String path) {
+        return client.fileExists(id, path);
+    }
+
+    /** Deletes a file, or a folder with {@code recursive}. */
+    public void deleteFile(String path, DeleteFileOptions options) {
+        client.deleteFile(id, path, options);
+    }
+
+    public void deleteFile(String path) {
+        client.deleteFile(id, path);
+    }
+
+    /** Makes a folder; with {@code parents}, like {@code mkdir -p}. */
+    public void makeDir(String path, MakeDirOptions options) {
+        client.makeDir(id, path, options);
+    }
+
+    public void makeDir(String path) {
+        client.makeDir(id, path);
+    }
+
+    /** Moves or renames a file or folder. */
+    public void moveFile(String source, String destination, MoveFileOptions options) {
+        client.moveFile(id, source, destination, options);
+    }
+
+    public void moveFile(String source, String destination) {
+        client.moveFile(id, source, destination);
+    }
+
+    /** Copies a file, or a folder with {@code recursive}. */
+    public void copyFile(String source, String destination, CopyFileOptions options) {
+        client.copyFile(id, source, destination, options);
+    }
+
+    public void copyFile(String source, String destination) {
+        client.copyFile(id, source, destination);
+    }
+
+    /** Paths under {@code path} whose name matches a glob. */
+    public List<String> searchFiles(String path, String pattern) {
+        return client.searchFiles(id, path, pattern);
+    }
+
+    /** Each line under {@code path} that contains {@code text}. */
+    public List<FileMatch> findInFiles(String path, String text) {
+        return client.findInFiles(id, path, text);
     }
 
     public ExposeResult exposePort(int port) {

@@ -958,6 +958,73 @@ export interface ExecResult {
   signal?: string;
 }
 
+/** One file, folder or symlink in a sandbox. */
+export interface FileInfo {
+  name: string;
+  /** The full path in the sandbox. */
+  path: string;
+  isDir: boolean;
+  /** Bytes. */
+  size: number;
+  /** Type and permission string, such as `-rw-r--r--`. */
+  mode: string;
+  /** Octal permission bits, such as `0644`. */
+  permissions: string;
+  owner: string;
+  group: string;
+  /** Last change time, RFC 3339 in UTC. */
+  modTime: string;
+  /**
+   * Where a symlink points. Only on `listFiles` entries: `getFileInfo`
+   * follows a symlink and describes what it names.
+   */
+  symlinkTarget?: string;
+}
+
+/** The result of `listFiles`. `truncated` means the listing reached its limit and more entries exist. */
+export interface FileList {
+  entries: FileInfo[];
+  truncated: boolean;
+}
+
+export interface ListFilesOptions {
+  /** Levels to go down; 1 (the default) is the folder's own entries. Symlinked folders are listed but never entered. */
+  depth?: number;
+  /** The most entries to return. Defaults to 10,000. */
+  limit?: number;
+}
+
+export interface DeleteFileOptions {
+  /** Delete a folder and everything in it. Without it a folder is refused (HTTP 409). */
+  recursive?: boolean;
+}
+
+export interface MakeDirOptions {
+  /** Also make missing parent folders, and accept an existing folder (`mkdir -p`). */
+  parents?: boolean;
+  /** Permissions such as `0o750`. Defaults to 0755. */
+  mode?: number;
+}
+
+export interface MoveFileOptions {
+  /** Replace an existing destination. Without it an existing destination is refused (HTTP 409). */
+  overwrite?: boolean;
+}
+
+export interface CopyFileOptions {
+  /** Replace an existing destination. Without it an existing destination is refused (HTTP 409). */
+  overwrite?: boolean;
+  /** Copy a folder and everything in it, keeping modes and symlinks. Without it a folder is refused (HTTP 409). */
+  recursive?: boolean;
+}
+
+/** One line `findInFiles` found. */
+export interface FileMatch {
+  file: string;
+  line: number;
+  content: string;
+}
+
 export interface ExecStreamOptions {
   /** A shell command. Set `command` or `argv`, not both. */
   command?: string;

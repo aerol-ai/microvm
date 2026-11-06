@@ -1377,6 +1377,17 @@ func isRetryableStatusCode(code int) bool {
 // exponential backoff when policy allows the failure. A 429 or 503 waits as
 // long as its Retry-After asks instead (see retryWait), and ctx ends any wait.
 func (c *Client) doWithRetry(ctx context.Context, policy retryPolicy, makeReq func() (*http.Request, error)) (*http.Response, error) {
+	return c.doWithRetryDone(ctx, policy, "", makeReq)
+}
+
+// doWithRetryDone is doWithRetry for a call whose retry can find its own
+// work already done: a delete whose reply was lost finds the path gone, a
+// mkdir finds its folder made. When a re-sent attempt (never the first)
+// gets an error reply carrying the toolbox error code doneCode, the call
+// succeeds with an empty 204 (plan section 10, "Retries"). The first
+// attempt still reports the error: the caller asked to delete something
+// that was not there.
+func (c *Client) doWithRetryDone(ctx context.Context, policy retryPolicy, doneCode string, makeReq func() (*http.Request, error)) (*http.Response, error) {
 	maxRetries := *c.retryConfig.MaxRetries
 	if maxRetries < 0 {
 		maxRetries = 0
@@ -1390,6 +1401,10 @@ func (c *Client) doWithRetry(ctx context.Context, policy retryPolicy, makeReq fu
 		}
 
 		response, err := c.httpClient.Do(req)
+		if err == nil && attempt > 0 && doneCode != "" && response.StatusCode >= 400 && replyHasCode(response, doneCode) {
+			response.Body.Close()
+			return &http.Response{StatusCode: http.StatusNoContent, Header: http.Header{}, Body: http.NoBody, Request: req}, nil
+		}
 
 		var retryAfter string
 		if err == nil {
@@ -1412,6 +1427,16 @@ func (c *Client) doWithRetry(ctx context.Context, policy retryPolicy, makeReq fu
 		}
 	}
 	return nil, lastErr
+}
+
+// replyHasCode reports whether an error reply's JSON carries code. The body
+// stays readable for decodeError.
+func replyHasCode(response *http.Response, code string) bool {
+	body, _ := io.ReadAll(io.LimitReader(response.Body, 64<<10))
+	response.Body.Close()
+	response.Body = io.NopCloser(bytes.NewReader(body))
+	var reply models.ErrorResponse
+	return json.Unmarshal(body, &reply) == nil && reply.Code == code
 }
 
 func (c *Client) addAuth(request *http.Request) {

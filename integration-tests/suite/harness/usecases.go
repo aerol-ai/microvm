@@ -969,6 +969,10 @@ var Registry = []UseCase{
 	{ID: "UC-392", Title: "File watch on Firecracker (the guest's own kernel) sees create, write, chmod, rename and remove, and Stop ends the watch cleanly", Requires: []Capability{CapFirecracker}, Implemented: true},
 	{ID: "UC-393", Title: "File watch on a Docker sandbox answers a clear 501 naming gVisor and Firecracker (the node's inotify budget is shared), as an API error and not as an agent that is too old", Requires: []Capability{CapDocker}, Implemented: true},
 	{ID: "UC-394", Title: "E2B WatchDir through the live E2B facade on gVisor streams start and an EVENT_TYPE_CREATE named relative to the folder; CreateWatcher, GetWatcherEvents and RemoveWatcher work too", Requires: []Capability{CapGvisor}, Implemented: true},
+	// Agent-sandbox parity, files (parity_files_test.go; plan section 5.1).
+	{ID: "UC-373", Title: "File verbs through the SDK: list with a depth and an entry cap (truncated past it), info and exists, mkdir with and without parents (409 on an existing folder), move with overwrite=false refused with 409 and both files untouched, a move from /dev/shm across filesystems, recursive copy keeping modes and symlinks, recursive delete, search and find", Implemented: true},
+	{ID: "UC-374", Title: "The shared file core still answers Daytona's SDK in Daytona's shape: listFiles and getFileDetails carry exactly Daytona's fields (its Go client rejects others), moveFiles replaces the destination, createFolder accepts an existing folder", Implemented: true},
+	{ID: "UC-379", Title: "A WASM sandbox answers the file verbs (info, move, copy, folder, delete, search, find, list with depth) with a clear 501, and the SDK refuses ListFiles and a guarded MoveFile with ErrUnsupportedFeature before sending them", Requires: []Capability{CapWasm}, Implemented: true},
 }
 
 // byID is a lookup built once for the report generator.

@@ -143,13 +143,19 @@ func (h *Host) serveHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 // isUnsupportedWasmToolboxRoute lists the toolbox routes toolboxd serves for
-// container and VM sandboxes but the WASM host does not.
+// container and VM sandboxes but the WASM host does not. Beyond plain upload,
+// download and list, the file verbs the SDKs added (plan F1) answer 501 here
+// too: info, move, copy, search and find.
 func isUnsupportedWasmToolboxRoute(r *http.Request) bool {
 	path := r.URL.Path
 	switch {
 	case r.Method == http.MethodDelete && path == "/files":
 		return true
 	case r.Method == http.MethodPost && (path == "/files/folder" || path == "/files/replace" || path == "/files/permissions"):
+		return true
+	case r.Method == http.MethodPost && (path == "/files/move" || path == "/files/copy"):
+		return true
+	case r.Method == http.MethodGet && (path == "/files/info" || path == "/files/search" || path == "/files/find"):
 		return true
 	case path == "/lsp" || strings.HasPrefix(path, "/lsp/"):
 		return true

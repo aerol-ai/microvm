@@ -106,6 +106,12 @@ func (h *Host) handleDownload(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Host) handleListFiles(w http.ResponseWriter, r *http.Request) {
+	// toolboxd's listing options (plan F1). Ignoring them would hand back a
+	// one-level list of bare names as if a depth or cap had been applied.
+	if q := r.URL.Query(); q.Has("depth") || q.Has("limit") || q.Has("extended") {
+		writeError(w, http.StatusNotImplemented, "listing with depth, limit or extended is not supported on WASM sandboxes")
+		return
+	}
 	targetPath := strings.TrimSpace(r.URL.Query().Get("path"))
 	root, rel, _, err := openInWorkDir(h.workDir, targetPath)
 	if err != nil {

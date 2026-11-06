@@ -45,6 +45,9 @@ from .types import (
     FileEventCallback,
     ExposeResult,
     Failover,
+    FileInfo,
+    FileList,
+    FileMatch,
     GPUOptions,
     HealthStatus,
     IngressTarget,
@@ -105,6 +108,18 @@ _RETRY_STATUSES = frozenset({421, 429, 502, 503, 504})
 # 429 when this caller is over its share, 503 when the node sheds load. A
 # Retry-After on a 421, 502 or 504 is a hop's, so those use the backoff.
 _NOT_STARTED_STATUSES = frozenset({429, 503})
+# The toolboxd feature (on /version) behind the file verbs' options: list
+# depth and cap, the move and copy overwrite guard, mkdir without parents and
+# the copy route. An older agent ignores those options (overwrite=false would
+# overwrite), so the calls that send them check first.
+_FEATURE_FILE_VERBS = "files.verbs"
+# The entry cap list_files sends when the caller gives none.
+DEFAULT_LIST_LIMIT = 10000
+# Error codes toolboxd puts on the file errors a retry acts on: a retried
+# delete that finds the path gone, or a retried mkdir that finds its folder,
+# means the first attempt did the work and its reply was lost.
+_CODE_FILE_NOT_FOUND = "file_not_found"
+_CODE_FOLDER_EXISTS = "folder_exists"
 # An overloaded node asks for about a second, so the cap only bites on a long
 # ask (maintenance, a misconfigured proxy), which should not hold a call for
 # minutes per retry.
@@ -596,6 +611,33 @@ class Sandbox:
 
     def watch_files(self, path: str, on_event: FileEventCallback, recursive: bool = False) -> FileWatchHandle:
         return self._client.watch_files(self.id, path, on_event, recursive=recursive)
+
+    def list_files(self, path: str, *, depth: int = 1, limit: int = DEFAULT_LIST_LIMIT) -> FileList:
+        return self._client.list_files(self.id, path, depth=depth, limit=limit)
+
+    def get_file_info(self, path: str) -> FileInfo:
+        return self._client.get_file_info(self.id, path)
+
+    def file_exists(self, path: str) -> bool:
+        return self._client.file_exists(self.id, path)
+
+    def delete_file(self, path: str, *, recursive: bool = False) -> None:
+        self._client.delete_file(self.id, path, recursive=recursive)
+
+    def make_dir(self, path: str, *, parents: bool = False, mode: Optional[int] = None) -> None:
+        self._client.make_dir(self.id, path, parents=parents, mode=mode)
+
+    def move_file(self, source: str, destination: str, *, overwrite: bool = False) -> None:
+        self._client.move_file(self.id, source, destination, overwrite=overwrite)
+
+    def copy_file(self, source: str, destination: str, *, overwrite: bool = False, recursive: bool = False) -> None:
+        self._client.copy_file(self.id, source, destination, overwrite=overwrite, recursive=recursive)
+
+    def search_files(self, path: str, pattern: str) -> List[str]:
+        return self._client.search_files(self.id, path, pattern)
+
+    def find_in_files(self, path: str, text: str) -> List[FileMatch]:
+        return self._client.find_in_files(self.id, path, text)
 
     def expose_port(self, port: int, *, protocol: ExposeProtocol = "http") -> ExposeResult:
         return self._client.expose_port(self.id, port, protocol=protocol)
@@ -1476,6 +1518,110 @@ class MicroVM:
             settimeout(None)
         return FileWatchHandle(ws, on_event)
 
+    # File verbs beyond upload and download (plans/agent-sandbox-feature-
+    # parity.md, F1). They go through the sandbox's toolbox. A sandbox whose
+    # agent predates them fails closed with MicroVMUnsupportedFeatureError
+    # instead of ignoring a safety option; WASM and V8 isolate sandboxes
+    # answer them with HTTP 501.
+    #
+    # Retries: list_files, get_file_info, file_exists, search_files,
+    # find_in_files, delete_file and make_dir are safe to re-send and retry
+    # on 421, 429, 502, 503 and 504 (a retried delete or mkdir whose work is
+    # already done counts as success). move_file and copy_file retry only on
+    # 429 and 503, because a lost reply may hide a move that happened.
+
+    def _toolbox_path(self, sandbox_id: str, route: str, query: Dict[str, str]) -> str:
+        return f"{self._version_prefix}/sandboxes/{urllib.parse.quote(sandbox_id, safe='')}/toolbox{route}?{urllib.parse.urlencode(query)}"
+
+    def list_files(self, sandbox_id: str, path: str, *, depth: int = 1, limit: int = DEFAULT_LIST_LIMIT) -> FileList:
+        """List a folder, ``depth`` levels down (1 is the folder's own
+        entries), returning at most ``limit`` entries. Symlinked folders are
+        listed but never entered. ``truncated`` says more entries exist."""
+        if depth < 1 or limit < 1:
+            raise MicroVMError("depth and limit must be at least 1")
+        self._require_toolbox_features(sandbox_id, _FEATURE_FILE_VERBS)
+        query = {"path": path, "depth": str(depth), "limit": str(limit), "extended": "true"}
+        data, headers = self._do_json_headers("GET", self._toolbox_path(sandbox_id, "/files", query), None)
+        entries = [_from_api_file_info(item, path.rstrip("/") + "/" + str(item.get("name", ""))) for item in (data or []) if isinstance(item, dict)]
+        truncated = any(k.lower() == "x-toolbox-truncated" and v == "true" for k, v in headers.items())
+        return {"entries": entries, "truncated": truncated}
+
+    def get_file_info(self, sandbox_id: str, path: str) -> FileInfo:
+        """Describe one path. A symlink is followed."""
+        # extended=true only adds fields; an older agent that ignores it
+        # answers fields this still reads, so no /version check.
+        data = self._do_json("GET", self._toolbox_path(sandbox_id, "/files/info", {"path": path, "extended": "true"}), None)
+        return _from_api_file_info(data if isinstance(data, dict) else {}, path)
+
+    def file_exists(self, sandbox_id: str, path: str) -> bool:
+        """Whether ``path`` exists. A missing sandbox raises, it is not False."""
+        try:
+            self.get_file_info(sandbox_id, path)
+        except MicroVMHTTPError as err:
+            if _is_missing_file(err):
+                return False
+            raise
+        return True
+
+    def delete_file(self, sandbox_id: str, path: str, *, recursive: bool = False) -> None:
+        """Delete a file, or a folder and everything in it with
+        ``recursive=True``. A folder without it is refused (HTTP 409)."""
+        query = {"path": path}
+        if recursive:
+            query["recursive"] = "true"
+        self._request("DELETE", self._url(self._toolbox_path(sandbox_id, "/files", query)), done_code=_CODE_FILE_NOT_FOUND)
+
+    def make_dir(self, sandbox_id: str, path: str, *, parents: bool = False, mode: Optional[int] = None) -> None:
+        """Make a folder. ``parents=True`` also makes missing parents and
+        accepts an existing folder (``mkdir -p``). ``mode`` (such as
+        ``0o750``) defaults to 0755."""
+        if not parents:
+            # An older agent ignores parents=false and makes them anyway.
+            self._require_toolbox_features(sandbox_id, _FEATURE_FILE_VERBS)
+        query = {"path": path, "parents": "true" if parents else "false"}
+        if mode is not None:
+            query["mode"] = format(mode, "o")
+        self._request("POST", self._url(self._toolbox_path(sandbox_id, "/files/folder", query)), done_code=_CODE_FOLDER_EXISTS)
+
+    def move_file(self, sandbox_id: str, source: str, destination: str, *, overwrite: bool = False) -> None:
+        """Move or rename a file or folder. Without ``overwrite`` an existing
+        destination is refused (HTTP 409)."""
+        if not overwrite:
+            # An older agent ignores overwrite=false and replaces the file.
+            self._require_toolbox_features(sandbox_id, _FEATURE_FILE_VERBS)
+        query = {"source": source, "destination": destination, "overwrite": "true" if overwrite else "false"}
+        self._request("POST", self._url(self._toolbox_path(sandbox_id, "/files/move", query)), idempotent=False)
+
+    def copy_file(self, sandbox_id: str, source: str, destination: str, *, overwrite: bool = False, recursive: bool = False) -> None:
+        """Copy a file, or a folder with ``recursive=True`` (keeping modes
+        and symlinks). Without ``overwrite`` an existing destination is
+        refused (HTTP 409)."""
+        self._require_toolbox_features(sandbox_id, _FEATURE_FILE_VERBS)
+        query = {
+            "source": source,
+            "destination": destination,
+            "overwrite": "true" if overwrite else "false",
+            "recursive": "true" if recursive else "false",
+        }
+        self._request("POST", self._url(self._toolbox_path(sandbox_id, "/files/copy", query)), idempotent=False)
+
+    def search_files(self, sandbox_id: str, path: str, pattern: str) -> List[str]:
+        """Paths under ``path`` whose name matches a glob such as ``*.py``."""
+        data = self._do_json("GET", self._toolbox_path(sandbox_id, "/files/search", {"path": path, "pattern": pattern}), None)
+        files = data.get("files") if isinstance(data, dict) else None
+        return [str(f) for f in files] if isinstance(files, list) else []
+
+    def find_in_files(self, sandbox_id: str, path: str, text: str) -> List[FileMatch]:
+        """Each line under ``path`` that contains ``text`` (plain text)."""
+        data = self._do_json("GET", self._toolbox_path(sandbox_id, "/files/find", {"path": path, "pattern": text}), None)
+        if not isinstance(data, list):
+            return []
+        return [
+            {"file": str(m.get("file", "")), "line": int(m.get("line") or 0), "content": str(m.get("content", ""))}
+            for m in data
+            if isinstance(m, dict)
+        ]
+
     def expose_port(self, sandbox_id: str, port: int, *, protocol: ExposeProtocol = "http") -> ExposeResult:
         """Publish a sandbox container port.
 
@@ -1601,8 +1747,9 @@ class MicroVM:
         extra_headers: Optional[Dict[str, str]] = None,
         *,
         idempotent: bool = True,
+        done_code: Optional[str] = None,
     ) -> bytes:
-        raw, _ = self._request_headers(method, url, body, content_type, extra_headers, idempotent=idempotent)
+        raw, _ = self._request_headers(method, url, body, content_type, extra_headers, idempotent=idempotent, done_code=done_code)
         return raw
 
     def _request_headers(
@@ -1614,8 +1761,14 @@ class MicroVM:
         extra_headers: Optional[Dict[str, str]] = None,
         *,
         idempotent: bool = True,
+        done_code: Optional[str] = None,
     ) -> tuple[bytes, Dict[str, str]]:
         """Send one request, retrying transient failures with backoff.
+
+        ``done_code`` is for a call whose retry can find its own work done
+        (a delete finds the path gone, a mkdir its folder): when a re-sent
+        attempt, never the first, gets an error carrying that toolbox error
+        code, the first attempt's reply was lost and the call succeeds.
 
         ``idempotent=True`` (every endpoint but exec; the daemon designs them
         for duplicate calls) retries any transport failure and the statuses
@@ -1651,6 +1804,14 @@ class MicroVM:
                     return response.read(), headers
             except urllib.error.HTTPError as exc:
                 last_exc = exc
+                payload: Optional[bytes] = None
+                if done_code is not None and attempt > 0:
+                    try:
+                        payload = exc.read()
+                    finally:
+                        exc.close()
+                    if _error_code(payload) == done_code:
+                        return b"", {}
                 if exc.code in retry_statuses and attempt < max_retries:
                     if exc.code in _NOT_STARTED_STATUSES and exc.headers is not None:
                         retry_after = exc.headers.get("Retry-After")
@@ -1658,10 +1819,11 @@ class MicroVM:
                     exc.close()
                 else:
                     wait = _parse_retry_after(exc.headers.get("Retry-After"), time.time()) if exc.headers is not None else None
-                    try:
-                        payload = exc.read()
-                    finally:
-                        exc.close()
+                    if payload is None:
+                        try:
+                            payload = exc.read()
+                        finally:
+                            exc.close()
                     try:
                         data = json.loads(payload.decode("utf-8"))
                     except (ValueError, TypeError):
@@ -1939,6 +2101,45 @@ def _request_never_sent(exc: urllib.error.URLError) -> bool:
     """
     # socket.timeout is TimeoutError from 3.10; listed apart for 3.9.
     return isinstance(exc.reason, (ConnectionRefusedError, socket.gaierror, socket.timeout, TimeoutError))
+
+
+def _error_code(payload: Optional[bytes]) -> str:
+    """The ``code`` of a JSON error body, or "" when there is none."""
+    try:
+        data = json.loads((payload or b"").decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        return ""
+    return str(data.get("code") or "") if isinstance(data, dict) else ""
+
+
+def _is_missing_file(err: MicroVMHTTPError) -> bool:
+    """A missing file, not a missing sandbox (also a 404). Current agents say
+    file_not_found; older ones send no code, but their message is the OS
+    error, which ends "no such file or directory"."""
+    if err.status_code != 404:
+        return False
+    return err.code == _CODE_FILE_NOT_FOUND or (not err.code and str(err).endswith("no such file or directory"))
+
+
+def _from_api_file_info(data: Dict[str, Any], fallback_path: str) -> FileInfo:
+    """toolboxd's file info with extended=true. An older agent sends only
+    Daytona's fields (a 32-bit size, no path), so each extended field falls
+    back."""
+    size = data.get("size_bytes")
+    info: FileInfo = {
+        "name": str(data.get("name", "")),
+        "path": str(data.get("path") or fallback_path),
+        "isDir": bool(data.get("isDir", False)),
+        "size": int(size if size is not None else data.get("size") or 0),
+        "mode": str(data.get("mode", "")),
+        "permissions": str(data.get("permissions", "")),
+        "owner": str(data.get("owner", "")),
+        "group": str(data.get("group", "")),
+        "modTime": str(data.get("modTime", "")),
+    }
+    if data.get("symlink_target") is not None:
+        info["symlinkTarget"] = str(data["symlink_target"])
+    return info
 
 
 def _first_of(mapping: Dict[str, Any], *keys: str) -> Any:

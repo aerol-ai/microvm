@@ -2,6 +2,7 @@ export { MicroVM } from "./MicroVM.js";
 export { Sandbox } from "./Sandbox.js";
 export { Image } from "./Image.js";
 export { MicroVMApiError, MicroVMUnsupportedFeatureError } from "./errors.js";
+export { DEFAULT_LIST_LIMIT } from "./internal/client.js";
 export type { MicroVMConfig, Tokens } from "./MicroVM.js";
 export type { RetryConfig } from "./internal/client.js";
 export type {
@@ -54,6 +55,14 @@ export type {
   FileEvent,
   FileEventType,
   FileWatchHandle,
+  FileInfo,
+  FileList,
+  FileMatch,
+  ListFilesOptions,
+  DeleteFileOptions,
+  MakeDirOptions,
+  MoveFileOptions,
+  CopyFileOptions,
   GetOptions,
   HealthStatus,
   IngressTarget,

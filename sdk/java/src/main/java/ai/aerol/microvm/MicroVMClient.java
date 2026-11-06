@@ -68,6 +68,14 @@ import ai.aerol.microvm.model.ExposeOptions;
 import ai.aerol.microvm.model.ExposeProtocol;
 import ai.aerol.microvm.model.ExposeResult;
 import ai.aerol.microvm.model.FileEvent;
+import ai.aerol.microvm.model.CopyFileOptions;
+import ai.aerol.microvm.model.DeleteFileOptions;
+import ai.aerol.microvm.model.FileInfo;
+import ai.aerol.microvm.model.FileList;
+import ai.aerol.microvm.model.FileMatch;
+import ai.aerol.microvm.model.ListFilesOptions;
+import ai.aerol.microvm.model.MakeDirOptions;
+import ai.aerol.microvm.model.MoveFileOptions;
 import ai.aerol.microvm.model.HealthStatus;
 import ai.aerol.microvm.model.IngressTarget;
 import ai.aerol.microvm.model.Lifecycle;
@@ -928,6 +936,198 @@ public class MicroVMClient {
         return response.body();
     }
 
+    // File verbs beyond upload and download (plans/agent-sandbox-feature-
+    // parity.md, F1), through the sandbox's toolbox. A sandbox whose agent
+    // predates them fails closed with MicroVMUnsupportedFeatureException
+    // instead of ignoring a safety option; WASM and V8 isolate sandboxes
+    // answer HTTP 501.
+    //
+    // Retries: listFiles, getFileInfo, fileExists, searchFiles, findInFiles,
+    // deleteFile and makeDir are safe to re-send and retry on 421, 429, 502,
+    // 503 and 504 (a retried delete or mkdir whose work is already done counts
+    // as success). moveFile and copyFile retry only on 429 and 503, because a
+    // lost reply may hide a move that happened.
+
+    /**
+     * The toolboxd feature (on /version) behind the file verbs' options: list
+     * depth and cap, the move and copy overwrite guard, mkdir without parents
+     * and the copy route. An older agent ignores those options
+     * (overwrite=false would overwrite), so the calls that send them check
+     * first.
+     */
+    static final String FEATURE_FILE_VERBS = "files.verbs";
+
+    private String toolboxPath(String sandboxId, String route, Map<String, String> query) {
+        StringBuilder path = new StringBuilder(sandboxPath(sandboxId)).append("/toolbox").append(route);
+        char sep = '?';
+        for (Map.Entry<String, String> entry : query.entrySet()) {
+            path.append(sep).append(encodeQueryValue(entry.getKey())).append('=').append(encodeQueryValue(entry.getValue()));
+            sep = '&';
+        }
+        return path.toString();
+    }
+
+    /** Lists a folder. The listing's {@code truncated} says more entries exist. */
+    public FileList listFiles(String sandboxId, String path, ListFilesOptions options) {
+        ListFilesOptions opts = options == null ? new ListFilesOptions() : options;
+        if (opts.depth < 1 || opts.limit < 1) {
+            throw new MicroVMException("depth and limit must be at least 1");
+        }
+        requireToolboxFeatures(sandboxId, FEATURE_FILE_VERBS);
+        Map<String, String> query = new java.util.LinkedHashMap<>();
+        query.put("path", path);
+        query.put("depth", Integer.toString(opts.depth));
+        query.put("limit", Integer.toString(opts.limit));
+        query.put("extended", "true");
+        HttpResponse<byte[]> response = sendRequest("GET", toolboxPath(sandboxId, "/files", query), HttpRequest.BodyPublishers.noBody(), null);
+        ensureSuccess(response);
+        FileInfoWire[] items = response.body().length == 0 ? null : JsonSupport.read(response.body(), FileInfoWire[].class);
+        FileList list = new FileList();
+        String base = path.replaceAll("/+$", "");
+        if (items != null) {
+            for (FileInfoWire item : items) {
+                list.entries.add(item.toFileInfo(base + "/" + (item.name == null ? "" : item.name)));
+            }
+        }
+        list.truncated = "true".equals(response.headers().firstValue("X-Toolbox-Truncated").orElse(null));
+        return list;
+    }
+
+    public FileList listFiles(String sandboxId, String path) {
+        return listFiles(sandboxId, path, null);
+    }
+
+    /** Describes one path. A symlink is followed. */
+    public FileInfo getFileInfo(String sandboxId, String path) {
+        // extended=true only adds fields; an older agent that ignores it
+        // answers fields this still reads, so no /version check.
+        Map<String, String> query = new java.util.LinkedHashMap<>();
+        query.put("path", path);
+        query.put("extended", "true");
+        FileInfoWire wire = doJson("GET", toolboxPath(sandboxId, "/files/info", query), null, FileInfoWire.class);
+        return (wire == null ? new FileInfoWire() : wire).toFileInfo(path);
+    }
+
+    /** Whether a path exists. A missing sandbox throws; it is not {@code false}. */
+    public boolean fileExists(String sandboxId, String path) {
+        try {
+            getFileInfo(sandboxId, path);
+            return true;
+        } catch (MicroVMApiException err) {
+            if (isMissingFile(err)) {
+                return false;
+            }
+            throw err;
+        }
+    }
+
+    /**
+     * A missing file, not a missing sandbox (also a 404). Current agents say
+     * file_not_found; older ones send no code, but their message is the OS
+     * error, which ends "no such file or directory".
+     */
+    private static boolean isMissingFile(MicroVMApiException err) {
+        if (err.getStatusCode() != 404) {
+            return false;
+        }
+        return "file_not_found".equals(err.getCode())
+            || (err.getCode() == null && err.getMessage() != null && err.getMessage().endsWith("no such file or directory"));
+    }
+
+    /** Deletes a file, or a folder and its contents with {@code recursive}. */
+    public void deleteFile(String sandboxId, String path, DeleteFileOptions options) {
+        Map<String, String> query = new java.util.LinkedHashMap<>();
+        query.put("path", path);
+        if (options != null && options.recursive) {
+            query.put("recursive", "true");
+        }
+        fileCall("DELETE", toolboxPath(sandboxId, "/files", query), RetryMode.IDEMPOTENT, "file_not_found");
+    }
+
+    public void deleteFile(String sandboxId, String path) {
+        deleteFile(sandboxId, path, null);
+    }
+
+    /** Makes a folder; with {@code parents}, like {@code mkdir -p}. */
+    public void makeDir(String sandboxId, String path, MakeDirOptions options) {
+        MakeDirOptions opts = options == null ? new MakeDirOptions() : options;
+        if (!opts.parents) {
+            // An older agent ignores parents=false and makes them anyway.
+            requireToolboxFeatures(sandboxId, FEATURE_FILE_VERBS);
+        }
+        Map<String, String> query = new java.util.LinkedHashMap<>();
+        query.put("path", path);
+        query.put("parents", Boolean.toString(opts.parents));
+        if (opts.mode != null) {
+            query.put("mode", Integer.toOctalString(opts.mode));
+        }
+        fileCall("POST", toolboxPath(sandboxId, "/files/folder", query), RetryMode.IDEMPOTENT, "folder_exists");
+    }
+
+    public void makeDir(String sandboxId, String path) {
+        makeDir(sandboxId, path, null);
+    }
+
+    /** Moves or renames a file or folder. Without {@code overwrite}, an existing destination is refused (HTTP 409). */
+    public void moveFile(String sandboxId, String source, String destination, MoveFileOptions options) {
+        boolean overwrite = options != null && options.overwrite;
+        if (!overwrite) {
+            // An older agent ignores overwrite=false and replaces the file.
+            requireToolboxFeatures(sandboxId, FEATURE_FILE_VERBS);
+        }
+        Map<String, String> query = new java.util.LinkedHashMap<>();
+        query.put("source", source);
+        query.put("destination", destination);
+        query.put("overwrite", Boolean.toString(overwrite));
+        fileCall("POST", toolboxPath(sandboxId, "/files/move", query), RetryMode.UNSENT_ONLY, null);
+    }
+
+    public void moveFile(String sandboxId, String source, String destination) {
+        moveFile(sandboxId, source, destination, null);
+    }
+
+    /** Copies a file, or a folder with {@code recursive} (keeping modes and symlinks). */
+    public void copyFile(String sandboxId, String source, String destination, CopyFileOptions options) {
+        CopyFileOptions opts = options == null ? new CopyFileOptions() : options;
+        requireToolboxFeatures(sandboxId, FEATURE_FILE_VERBS);
+        Map<String, String> query = new java.util.LinkedHashMap<>();
+        query.put("source", source);
+        query.put("destination", destination);
+        query.put("overwrite", Boolean.toString(opts.overwrite));
+        query.put("recursive", Boolean.toString(opts.recursive));
+        fileCall("POST", toolboxPath(sandboxId, "/files/copy", query), RetryMode.UNSENT_ONLY, null);
+    }
+
+    public void copyFile(String sandboxId, String source, String destination) {
+        copyFile(sandboxId, source, destination, null);
+    }
+
+    /** Paths under {@code path} whose name matches a glob such as {@code *.java}. */
+    public List<String> searchFiles(String sandboxId, String path, String pattern) {
+        Map<String, String> query = new java.util.LinkedHashMap<>();
+        query.put("path", path);
+        query.put("pattern", pattern);
+        SearchFilesResponse found = doJson("GET", toolboxPath(sandboxId, "/files/search", query), null, SearchFilesResponse.class);
+        return found == null || found.files == null ? new ArrayList<>() : found.files;
+    }
+
+    /** Each line under {@code path} that contains {@code text} (plain text). */
+    public List<FileMatch> findInFiles(String sandboxId, String path, String text) {
+        Map<String, String> query = new java.util.LinkedHashMap<>();
+        query.put("path", path);
+        query.put("pattern", text);
+        FileMatch[] matches = doJson("GET", toolboxPath(sandboxId, "/files/find", query), null, FileMatch[].class);
+        return matches == null ? new ArrayList<>() : new ArrayList<>(java.util.Arrays.asList(matches));
+    }
+
+    /** A body-less file call whose success reply is discarded. */
+    private void fileCall(String method, String path, RetryMode retryMode, String doneCode) {
+        HttpResponse<byte[]> response = sendRequest(method, path, HttpRequest.BodyPublishers.noBody(), null, null, retryMode, doneCode);
+        if (response != null) {
+            ensureSuccess(response);
+        }
+    }
+
     /**
      * Publish a sandbox container port. {@link ExposeOptions} selects the wire
      * surface — pass {@link ExposeOptions#tcp()} for raw caddy-l4 routing
@@ -1516,6 +1716,17 @@ public class MicroVMClient {
     }
 
     private HttpResponse<byte[]> sendRequest(String method, String path, HttpRequest.BodyPublisher bodyPublisher, String contentType, Map<String, String> extraHeaders, RetryMode retryMode) {
+        return sendRequest(method, path, bodyPublisher, contentType, extraHeaders, retryMode, null);
+    }
+
+    /**
+     * {@code doneCode} is for a call whose retry can find its own work done
+     * (a delete finds the path gone, a mkdir its folder): when a re-sent
+     * attempt, never the first, gets an error carrying that toolbox error
+     * code, the first attempt's reply was lost and this returns {@code null}
+     * for success. Without a {@code doneCode} it never returns {@code null}.
+     */
+    private HttpResponse<byte[]> sendRequest(String method, String path, HttpRequest.BodyPublisher bodyPublisher, String contentType, Map<String, String> extraHeaders, RetryMode retryMode, String doneCode) {
         int maxRetries = retryConfig.maxRetries != null ? retryConfig.maxRetries : 3;
         int baseDelay = retryConfig.baseDelayMs != null ? retryConfig.baseDelayMs : 200;
         int maxDelay = retryConfig.maxDelayMs != null ? retryConfig.maxDelayMs : 5000;
@@ -1541,6 +1752,9 @@ public class MicroVMClient {
 
             try {
                 HttpResponse<byte[]> response = httpClient.send(builder.build(), HttpResponse.BodyHandlers.ofByteArray());
+                if (doneCode != null && attempt > 0 && response.statusCode() >= 400 && doneCode.equals(errorCode(response.body()))) {
+                    return null;
+                }
                 if (attempt < maxRetries && retryMode.retriesStatus(response.statusCode())) {
                     // Fall through to retry logic
                     retryAfter = RetryAfter.hint(response);
@@ -1576,6 +1790,11 @@ public class MicroVMClient {
             throw new MicroVMException("request failed after " + maxRetries + " retries", lastException);
         }
         throw new MicroVMException("request failed after " + maxRetries + " retries");
+    }
+
+    private static String errorCode(byte[] body) {
+        ErrorResponse error = JsonSupport.tryRead(body, ErrorResponse.class);
+        return error == null ? null : error.code;
     }
 
     private void ensureSuccess(HttpResponse<byte[]> response) {
@@ -1769,6 +1988,46 @@ public class MicroVMClient {
     private static final class ToolboxVersion {
         public String version;
         public List<String> features;
+    }
+
+    /**
+     * toolboxd's file info with extended=true. An older agent ignores
+     * extended and sends only Daytona's fields (a 32-bit size, no path), so
+     * each extended field falls back.
+     */
+    private static final class FileInfoWire {
+        public String name;
+        @com.fasterxml.jackson.annotation.JsonProperty("isDir")
+        public boolean isDir;
+        public long size;
+        public Long sizeBytes;
+        public String path;
+        public String mode;
+        public String permissions;
+        public String owner;
+        public String group;
+        @com.fasterxml.jackson.annotation.JsonProperty("modTime")
+        public String modTime;
+        public String symlinkTarget;
+
+        FileInfo toFileInfo(String fallbackPath) {
+            FileInfo info = new FileInfo();
+            info.name = name == null ? "" : name;
+            info.path = path == null || path.isEmpty() ? fallbackPath : path;
+            info.isDir = isDir;
+            info.size = sizeBytes != null ? sizeBytes : size;
+            info.mode = mode == null ? "" : mode;
+            info.permissions = permissions == null ? "" : permissions;
+            info.owner = owner == null ? "" : owner;
+            info.group = group == null ? "" : group;
+            info.modTime = modTime == null ? "" : modTime;
+            info.symlinkTarget = symlinkTarget;
+            return info;
+        }
+    }
+
+    private static final class SearchFilesResponse {
+        public List<String> files;
     }
 
     private static final class MountListResponse {

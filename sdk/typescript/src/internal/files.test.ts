@@ -1,0 +1,215 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+
+import { APIClient, DEFAULT_LIST_LIMIT, SandboxResource } from "./client.js";
+import { MicroVMApiError, MicroVMUnsupportedFeatureError } from "../errors.js";
+import type { Sandbox } from "../types.js";
+
+// File verbs beyond upload and download (plans/agent-sandbox-feature-
+// parity.md, F1): the toolbox routes they call, the /version check before an
+// option an older agent would ignore, and each verb's retry rule.
+
+interface Call {
+  method: string;
+  route: string;
+  query: Record<string, string>;
+}
+
+type Reply = (call: Call, n: number) => { status: number; body?: unknown; headers?: Record<string, string> };
+
+function fakeToolbox(reply: Reply, features: string[] = ["files.verbs"]) {
+  const calls: Call[] = [];
+  const counts = new Map<string, number>();
+  const client = new APIClient({
+    baseURL: "https://api.example.com",
+    patToken: "pat",
+    retry: { maxRetries: 3, baseDelayMs: 1, maxDelayMs: 1 },
+    fetch: async (input, init) => {
+      const request = new Request(input, init);
+      const url = new URL(request.url);
+      if (url.pathname.endsWith("/toolbox/version")) {
+        return new Response(JSON.stringify({ version: "test", features }), { status: 200 });
+      }
+      const call = {
+        method: request.method,
+        route: url.pathname.split("/toolbox")[1] ?? "",
+        query: Object.fromEntries(url.searchParams),
+      };
+      const key = `${call.method} ${call.route}`;
+      const n = counts.get(key) ?? 0;
+      counts.set(key, n + 1);
+      calls.push(call);
+      const { status, body, headers } = reply(call, n);
+      return new Response(body === undefined ? null : JSON.stringify(body), { status, headers });
+    },
+  });
+  return { client, calls };
+}
+
+const err = (error: string, code?: string) => (code ? { error, code } : { error });
+
+test("listFiles sends a depth and cap and reads the extended info", async () => {
+  const { client, calls } = fakeToolbox(() => ({
+    status: 200,
+    headers: { "X-Toolbox-Truncated": "true" },
+    body: [
+      { name: "a", isDir: true, size: 64, size_bytes: 64, path: "/w/a" },
+      { name: "big", size: 2147483647, size_bytes: 5 * 2 ** 30, path: "/w/big" },
+      { name: "link", size: 4, size_bytes: 4, path: "/w/link", symlink_target: "a" },
+      { name: "old", size: 7 },
+    ],
+  }));
+  const list = await client.listFiles("sb-1", "/w/");
+  assert.deepEqual(calls[0].query, { path: "/w/", depth: "1", limit: String(DEFAULT_LIST_LIMIT), extended: "true" });
+  assert.equal(list.truncated, true);
+  assert.deepEqual(
+    list.entries.map((e) => e.path),
+    ["/w/a", "/w/big", "/w/link", "/w/old"],
+  );
+  assert.equal(list.entries[1].size, 5 * 2 ** 30);
+  assert.equal(list.entries[2].symlinkTarget, "a");
+  assert.equal(list.entries[3].size, 7);
+  assert.equal(list.entries[0].isDir, true);
+
+  await client.listFiles("sb-1", "/w", { depth: 3, limit: 5 });
+  assert.equal(calls[1].query.depth, "3");
+  assert.equal(calls[1].query.limit, "5");
+  await assert.rejects(client.listFiles("sb-1", "/w", { depth: 0 }));
+});
+
+test("an older agent fails closed before any file call", async () => {
+  const { client, calls } = fakeToolbox(() => ({ status: 204 }), []);
+  for (const call of [
+    () => client.listFiles("sb-1", "/"),
+    () => client.moveFile("sb-1", "/a", "/b"),
+    () => client.copyFile("sb-1", "/a", "/b"),
+    () => client.makeDir("sb-1", "/d"),
+  ]) {
+    await assert.rejects(call(), (e: unknown) => e instanceof MicroVMUnsupportedFeatureError);
+  }
+  assert.equal(calls.length, 0);
+  // An older agent does what these ask anyway, so no check is needed.
+  await client.moveFile("sb-1", "/a", "/b", { overwrite: true });
+  await client.makeDir("sb-1", "/d", { parents: true });
+  assert.equal(calls[0].query.overwrite, "true");
+  assert.equal(calls[1].query.parents, "true");
+});
+
+test("getFileInfo falls back for an older agent; fileExists tells a missing file from a missing sandbox", async () => {
+  const answers: Record<string, { status: number; body: unknown }> = {
+    "/new": { status: 200, body: { name: "new", size: 2147483647, size_bytes: 3 * 2 ** 30, path: "/new" } },
+    "/old": { status: 200, body: { name: "old", size: 12 } },
+    "/gone": { status: 404, body: err("stat /gone: no such file or directory", "file_not_found") },
+    "/gone-old": { status: 404, body: err("stat /gone-old: no such file or directory") },
+    "/no-sandbox": { status: 404, body: err("sandbox not found") },
+    "/broken": { status: 403, body: err("permission denied") },
+  };
+  const { client, calls } = fakeToolbox((call) => answers[call.query.path]);
+  const info = await client.getFileInfo("sb-1", "/new");
+  assert.equal(info.size, 3 * 2 ** 30);
+  assert.equal(calls[0].query.extended, "true");
+  const old = await client.getFileInfo("sb-1", "/old");
+  assert.deepEqual([old.size, old.path], [12, "/old"]);
+  assert.equal(await client.fileExists("sb-1", "/new"), true);
+  assert.equal(await client.fileExists("sb-1", "/gone"), false);
+  assert.equal(await client.fileExists("sb-1", "/gone-old"), false);
+  await assert.rejects(client.fileExists("sb-1", "/no-sandbox"), MicroVMApiError);
+  await assert.rejects(client.fileExists("sb-1", "/broken"), MicroVMApiError);
+});
+
+test("a retried delete or mkdir counts work already done; the first attempt still reports it", async () => {
+  const { client, calls } = fakeToolbox((call, n) => {
+    const path = call.query.path;
+    if (path.startsWith("/lost")) {
+      if (n === 0) return { status: 502 };
+      return call.method === "DELETE"
+        ? { status: 404, body: err("lstat: no such file or directory", "file_not_found") }
+        : { status: 409, body: err(`${path} already exists`, "folder_exists") };
+    }
+    if (path === "/route-missing") return n === 0 ? { status: 503 } : { status: 404, body: err("not found") };
+    if (path === "/missing") return { status: 404, body: err("lstat /missing: no such file or directory", "file_not_found") };
+    if (path === "/a-file") return { status: 409, body: err("mkdir /a-file: file exists") };
+    return { status: 204 };
+  });
+  await client.deleteFile("sb-1", "/lost-del", { recursive: true });
+  assert.equal(calls[0].query.recursive, "true");
+  await client.makeDir("sb-1", "/lost-dir", { mode: 0o1750 });
+  assert.deepEqual(calls[2].query, { path: "/lost-dir", parents: "false", mode: "1750" });
+  await assert.rejects(client.deleteFile("sb-1", "/missing"), (e: unknown) => e instanceof MicroVMApiError && e.status === 404 && e.code === "file_not_found");
+  await assert.rejects(client.makeDir("sb-1", "/a-file"), (e: unknown) => e instanceof MicroVMApiError && e.status === 409);
+  // An uncoded 404 on a retry may be an agent without the route.
+  await assert.rejects(client.deleteFile("sb-1", "/route-missing"), MicroVMApiError);
+});
+
+test("move and copy retry only a 429 or 503", async () => {
+  const { client, calls } = fakeToolbox((call, n) => {
+    switch (call.query.source) {
+      case "/refused-once":
+        return n === 0 ? { status: 503 } : { status: 204 };
+      case "/bad-gateway":
+        return { status: 502 };
+      case "/taken":
+        return { status: 409, body: err("rename /taken /b: file exists") };
+    }
+    return { status: 204 };
+  });
+  await client.moveFile("sb-1", "/refused-once", "/b");
+  assert.equal(calls.length, 2);
+  await assert.rejects(client.moveFile("sb-1", "/bad-gateway", "/b"), (e: unknown) => e instanceof MicroVMApiError && e.status === 502);
+  assert.equal(calls.length, 3, "a 502 on a move was re-sent");
+  await assert.rejects(client.moveFile("sb-1", "/taken", "/b"), (e: unknown) => e instanceof MicroVMApiError && e.status === 409);
+  await assert.rejects(client.copyFile("sb-1", "/bad-gateway", "/c", { recursive: true }));
+  assert.deepEqual(calls[calls.length - 1], {
+    method: "POST",
+    route: "/files/copy",
+    query: { source: "/bad-gateway", destination: "/c", overwrite: "false", recursive: "true" },
+  });
+});
+
+test("searchFiles and findInFiles", async () => {
+  const { client } = fakeToolbox((call) => {
+    if (call.query.pattern === "none") {
+      return { status: 200, body: call.route.endsWith("/search") ? { files: null } : null };
+    }
+    return call.route.endsWith("/search")
+      ? { status: 200, body: { files: ["/w/a.ts"] } }
+      : { status: 200, body: [{ file: "/w/a.ts", line: 2, content: "import x" }] };
+  });
+  assert.deepEqual(await client.searchFiles("sb-1", "/w", "*.ts"), ["/w/a.ts"]);
+  assert.deepEqual(await client.findInFiles("sb-1", "/w", "import"), [{ file: "/w/a.ts", line: 2, content: "import x" }]);
+  assert.deepEqual(await client.searchFiles("sb-1", "/w", "none"), []);
+  assert.deepEqual(await client.findInFiles("sb-1", "/w", "none"), []);
+});
+
+test("file call errors surface", async () => {
+  const { client } = fakeToolbox(() => ({ status: 507, body: err("sandbox disk is full: write: no space left on device") }));
+  for (const call of [
+    () => client.listFiles("sb-1", "/"),
+    () => client.copyFile("sb-1", "/a", "/b"),
+    () => client.deleteFile("sb-1", "/a"),
+  ]) {
+    await assert.rejects(call(), (e: unknown) => e instanceof MicroVMApiError && e.status === 507 && e.message.includes("disk is full"));
+  }
+});
+
+test("SandboxResource file methods delegate", async () => {
+  const { client, calls } = fakeToolbox((call) => {
+    if (call.route === "/files/info") return { status: 200, body: { name: "x" } };
+    if (call.method === "GET") return { status: 200, body: call.route === "/files/search" ? { files: [] } : [] };
+    return { status: 204 };
+  });
+  const sandbox = new SandboxResource(client, { id: "sb-1" } as Sandbox);
+  await sandbox.listFiles("/");
+  await sandbox.getFileInfo("/x");
+  assert.equal(await sandbox.fileExists("/x"), true);
+  await sandbox.deleteFile("/x");
+  await sandbox.makeDir("/d", { parents: true });
+  await sandbox.moveFile("/a", "/b", { overwrite: true });
+  await sandbox.copyFile("/a", "/b");
+  await sandbox.searchFiles("/", "*");
+  await sandbox.findInFiles("/", "x");
+  assert.deepEqual(
+    calls.map((c) => c.route),
+    ["/files", "/files/info", "/files/info", "/files", "/files/folder", "/files/move", "/files/copy", "/files/search", "/files/find"],
+  );
+});

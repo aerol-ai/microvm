@@ -528,6 +528,11 @@ func (s *server) routes() http.Handler {
 				return
 			}
 			s.handleDaytonaMoveFile(w, r)
+		case r.Method == http.MethodPost && r.URL.Path == "/files/copy":
+			if !s.requireAuth(w, r) {
+				return
+			}
+			s.handleCopyFile(w, r)
 		case r.Method == http.MethodDelete && r.URL.Path == "/files":
 			if !s.requireAuth(w, r) {
 				return

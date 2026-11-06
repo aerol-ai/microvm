@@ -68,6 +68,34 @@ func TestServeToolboxTerminalsUnsupported(t *testing.T) {
 	}
 }
 
+// Every file call, the SDK verbs of plan F1 included, is a 501 with a JSON
+// reason the SDKs can show, as on WASM sandboxes.
+func TestServeToolboxFileRoutesAnswerJSON501(t *testing.T) {
+	d := New(Config{}, nil)
+	for _, route := range [][2]string{
+		{http.MethodGet, "/files"},
+		{http.MethodGet, "/files/info"},
+		{http.MethodPost, "/files/move"},
+		{http.MethodPost, "/files/copy"},
+		{http.MethodPost, "/files/folder"},
+		{http.MethodDelete, "/files"},
+		{http.MethodPost, "/files/upload"},
+		{http.MethodGet, "/files/download"},
+		{http.MethodGet, "/files/search"},
+		{http.MethodGet, "/version"},
+	} {
+		rec := httptest.NewRecorder()
+		d.ServeToolbox(context.Background(), "sb-1", "tok", rec, httptest.NewRequest(route[0], route[1], nil))
+		var body models.ErrorResponse
+		if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil || rec.Code != http.StatusNotImplemented || body.Error == "" {
+			t.Fatalf("%s %s = %d %q (%v), want a JSON 501", route[0], route[1], rec.Code, rec.Body.String(), err)
+		}
+		if strings.HasPrefix(route[1], "/files") && !strings.Contains(body.Error, "isolate") {
+			t.Fatalf("%s %s reason = %q", route[0], route[1], body.Error)
+		}
+	}
+}
+
 func TestServeExecInvokeHandler(t *testing.T) {
 	sup := &fakeSupervisor{}
 	d := newCreateDriver(t, GroupPerTenant, sup)

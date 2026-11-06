@@ -24,6 +24,11 @@ var toolboxFeatures = map[string][]string{
 	// A command as a list, with no shell parsing, on buffered exec and the
 	// exec stream (plan E2). An older agent answers "command is required".
 	"exec.argv": {"argv"},
+	// Files (plans/agent-sandbox-feature-parity.md, section 5.1).
+	// F1: list with a depth and an entry cap (and the extended file info),
+	// the move and copy overwrite guard, mkdir without parents, and the
+	// POST /files/copy route.
+	"files.verbs": {"depth", "extended", "limit", "overwrite", "parents"},
 }
 
 // baselineRequestOptions are the options toolboxd understood before /version

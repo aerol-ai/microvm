@@ -43,9 +43,21 @@ func (d *Driver) ServeToolbox(ctx context.Context, sandboxID, token string, w ht
 		http.Error(w, "isolate runtime has no shell: terminals and sessions are not supported", http.StatusNotImplemented)
 	case strings.Contains(path, "/exec") || strings.Contains(path, "/process"):
 		d.serveExec(ctx, sandboxID, w, r)
+	case path == "/files" || strings.HasPrefix(path, "/files/"):
+		// The file API (upload, download, list and the verbs the SDKs added
+		// in plan F1): an isolate has no filesystem. JSON like every other
+		// toolbox error, so the SDKs show this message, not just "501".
+		writeToolboxError(w, http.StatusNotImplemented, "file operations are not supported on V8 isolate sandboxes: an isolate has no filesystem")
 	default:
-		http.Error(w, "isolate runtime does not support this toolbox endpoint (no shell/filesystem; use exec as invoke-handler)", http.StatusNotImplemented)
+		writeToolboxError(w, http.StatusNotImplemented, "isolate runtime does not support this toolbox endpoint (no shell/filesystem; use exec as invoke-handler)")
 	}
+}
+
+// writeToolboxError answers in toolboxd's error shape ({"error": ...}).
+func writeToolboxError(w http.ResponseWriter, status int, message string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(models.ErrorResponse{Error: message})
 }
 
 // serveExec treats exec as "invoke the sandbox's fetch handler". The command

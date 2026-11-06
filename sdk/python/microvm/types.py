@@ -289,6 +289,40 @@ class ExecResult(TypedDict):
     signal: str
 
 
+class FileInfo(TypedDict, total=False):
+    """One file, folder or symlink in a sandbox."""
+
+    name: str
+    # The full path in the sandbox.
+    path: str
+    isDir: bool
+    # Bytes, 64-bit (no 2 GiB limit).
+    size: int
+    # Type and permission string, such as "-rw-r--r--".
+    mode: str
+    # Octal permission bits, such as "0644".
+    permissions: str
+    owner: str
+    group: str
+    # Last change time, RFC 3339 in UTC.
+    modTime: str
+    # Where a symlink points. Only on list_files entries: get_file_info
+    # follows a symlink and describes what it names.
+    symlinkTarget: str
+
+
+class FileList(TypedDict):
+    entries: List[FileInfo]
+    # True when the listing reached its limit and stopped; more exist.
+    truncated: bool
+
+
+class FileMatch(TypedDict):
+    file: str
+    line: int
+    content: str
+
+
 ChunkCallback = Callable[[bytes], None]
 ErrorCallback = Callable[[str], None]
 
