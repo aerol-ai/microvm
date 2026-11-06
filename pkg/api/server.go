@@ -19,6 +19,7 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/aerol-ai/microvm/internal/cloudidentity"
 	"github.com/aerol-ai/microvm/internal/config"
 	"github.com/aerol-ai/microvm/internal/service"
 	"github.com/aerol-ai/microvm/internal/version"
@@ -243,6 +244,13 @@ func (s *Server) registerRoutes(mux apihttp.Mux) {
 	// Sign-in discovery (§5.6): public by design, since a person reads it
 	// before holding any credential. It lists no issuer with identity off.
 	mux.Handle("GET "+identitywire.AuthDiscoveryPath, http.HandlerFunc(s.handleAuthDiscovery))
+
+	// Sandbox cloud identity (plans/sandbox-cloud-identity.md D1.1): the
+	// OIDC discovery document and the JWKS are public by design, because
+	// customers' clouds fetch them anonymously. They carry public keys
+	// only, and 404 when this deployment is not an issuer.
+	mux.Handle("GET "+cloudidentity.DiscoveryPath, http.HandlerFunc(s.handleIdentityDiscovery))
+	mux.Handle("GET "+cloudidentity.JWKSPath, http.HandlerFunc(s.handleIdentityJWKS))
 
 	// Each registered version owns its own URL prefix and is responsible for
 	// every route under it. Authentication is shared across versions via

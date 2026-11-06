@@ -599,6 +599,11 @@ func (s *server) routes() http.Handler {
 				return
 			}
 			s.handleSetAllowedPorts(w, r)
+		case r.Method == http.MethodPut && r.URL.Path == "/admin/identity/token":
+			if !s.requireAuth(w, r) {
+				return
+			}
+			s.handleIdentityToken(w, r)
 		case r.Method == http.MethodGet && r.URL.Path == "/process/exec/stream":
 			if !s.requireAuth(w, r) {
 				return

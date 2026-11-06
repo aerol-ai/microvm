@@ -522,6 +522,9 @@ type Service struct {
 	// egressProfiles stores named egress profiles; nil is the local store
 	// (single node). A cluster swaps in its Raft-backed store.
 	egressProfiles egressProfileBackend
+	// identity is the cloud-identity issuer state: signing keys, the lazy
+	// bootstrap latch and in-flight token pushes (identity.go).
+	identity identityState
 
 	// Warm-pool entries (warm_pools.go). warmPoolStore replaces the backend
 	// in tests; nil picks the store or the cluster. warmPoolTargets are this
@@ -2149,6 +2152,20 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 	if err := validateMaskRequestHost(req.MaskRequestHost); err != nil {
 		return nil, err
 	}
+	// Cloud identity (plans/sandbox-cloud-identity.md): checked before any
+	// runtime is touched, recorded once the row exists, first token pushed
+	// off the response path. Every runtime path below returns through here.
+	if req.Identity != nil {
+		if err := s.prepareCreateIdentity(ctx, &req, ownerRef, chosenRuntime); err != nil {
+			return nil, err
+		}
+		identityReq := *req.Identity
+		defer func() {
+			if err == nil && resp != nil {
+				err = s.recordCreateIdentity(ctx, &resp.Sandbox, &identityReq)
+			}
+		}()
+	}
 	// Translate named platform volumes into synthesized, tenant-scoped mounts
 	// appended to req.Mounts. Runs before the firecracker/wasm dispatch so the
 	// runtime gate applies uniformly, and before mount validation/seal/MountAll
@@ -3551,7 +3568,15 @@ const (
 	startForRestart
 )
 
-func (s *Service) startSandbox(ctx context.Context, id string, cause startCause) (*models.Sandbox, error) {
+func (s *Service) startSandbox(ctx context.Context, id string, cause startCause) (_ *models.Sandbox, err error) {
+	// A started sandbox gets a fresh identity token at once, a restart on
+	// failure included (no-op for one without an identity, or a deployment
+	// that is not an issuer).
+	defer func() {
+		if err == nil {
+			s.kickIdentityPush(id)
+		}
+	}()
 	sandbox, err := s.scopedGet(ctx, id)
 	if err != nil {
 		return nil, err

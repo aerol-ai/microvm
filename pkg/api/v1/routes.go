@@ -159,6 +159,14 @@ func RegisterRoutes(mux apihttp.Mux, d Deps) {
 	mux.Handle("GET "+PathPrefix+"/egress-profiles/{name}", d.Route(permRead, http.HandlerFunc(h.getEgressProfile)))
 	mux.Handle("DELETE "+PathPrefix+"/egress-profiles/{name}", d.Route(permWrite, http.HandlerFunc(h.deleteEgressProfile)))
 	mux.Handle("GET "+PathPrefix+"/egress-profiles", d.Route(permRead, http.HandlerFunc(h.listEgressProfiles)))
+	// Cloud identity (plans/sandbox-cloud-identity.md): each team's
+	// role-tag allow list is admin only (D1.5), key rotation is the
+	// operator's. Not sandbox-scoped, so no owner forwarding; in a cluster
+	// the service writes them through Raft. No route returns a token.
+	mux.Handle("PUT "+PathPrefix+"/identity/roles/{tag}", d.Route(permFleet, http.HandlerFunc(h.putIdentityRole)))
+	mux.Handle("DELETE "+PathPrefix+"/identity/roles/{tag}", d.Route(permFleet, http.HandlerFunc(h.deleteIdentityRole)))
+	mux.Handle("GET "+PathPrefix+"/identity/roles", d.Route(permFleet, http.HandlerFunc(h.listIdentityRoles)))
+	mux.Handle("POST "+PathPrefix+"/identity/keys/rotate", d.Route(permFleet, http.HandlerFunc(h.rotateIdentityKey)))
 	// Pure policy evaluation: no sandbox, no state change, so a read.
 	mux.Handle("POST "+PathPrefix+"/network/policy/check", d.Route(permRead, http.HandlerFunc(h.checkNetworkPolicy)))
 	// Warm pools (plans/agent-sandbox-feature-parity.md W1): fleet-wide
@@ -274,6 +282,8 @@ func RegisterRoutes(mux apihttp.Mux, d Deps) {
 	mux.Handle("POST "+cluster.PublicInternalArtifactCatalogEpochPath, internalOp(http.HandlerFunc(h.clusterInternalArtifactCatalogEpoch)))
 	mux.Handle("POST "+cluster.PublicInternalEgressProfileWritePath, internalOp(http.HandlerFunc(h.clusterInternalEgressProfileWrite)))
 	mux.Handle("POST "+cluster.PublicInternalEgressProfileReadPath, internalOp(http.HandlerFunc(h.clusterInternalEgressProfileRead)))
+	mux.Handle("POST "+cluster.PublicInternalIdentityWritePath, internalOp(http.HandlerFunc(h.clusterInternalIdentityWrite)))
+	mux.Handle("POST "+cluster.PublicInternalIdentityReadPath, internalOp(http.HandlerFunc(h.clusterInternalIdentityRead)))
 	mux.Handle("POST "+cluster.PublicInternalAPITokenWritePath, internalOp(http.HandlerFunc(h.clusterInternalAPITokenWrite)))
 	mux.Handle("POST "+cluster.PublicInternalWarmPoolWritePath, internalOp(http.HandlerFunc(h.clusterInternalWarmPoolWrite)))
 	mux.Handle("POST "+cluster.PublicInternalWarmPoolReadPath, internalOp(http.HandlerFunc(h.clusterInternalWarmPoolRead)))

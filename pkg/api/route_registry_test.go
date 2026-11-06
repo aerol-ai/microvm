@@ -34,6 +34,11 @@ var publicRoutes = map[string]string{
 	"GET /ui/":      "the static dashboard page; sign-in happens in the page",
 	"/e2b/runtime":  "envd runtime proxy: the sandbox's own envd token guards it",
 	"/e2b/runtime/": "envd runtime proxy: the sandbox's own envd token guards it",
+	// Sandbox cloud identity (plans/sandbox-cloud-identity.md D1.1, security
+	// point 4): clouds fetch both anonymously; public keys only, 404 when
+	// the deployment is not an issuer.
+	"GET /.well-known/openid-configuration": "OIDC discovery for sandbox cloud identity; names the issuer and the JWKS URL",
+	"GET /.well-known/jwks.json":            "the issuer's public signing keys; never private material",
 }
 
 // publicRoutePrefixes are public routes later tasks add: identity discovery
@@ -170,6 +175,12 @@ var routePermissions = map[string]string{
 	"POST /v1/cluster/internal/artifact-catalog":               "cluster.internal",
 	"POST /v1/cluster/internal/artifact-catalog/epoch":         "cluster.internal",
 	"POST /v1/cluster/internal/egress-profiles/read":           "cluster.internal",
+	"POST /v1/cluster/internal/identity/read":                  "cluster.internal",
+	"POST /v1/cluster/internal/identity/write":                 "cluster.internal",
+	"POST /v1/identity/keys/rotate":                            "fleet.admin",
+	"PUT /v1/identity/roles/{tag}":                             "fleet.admin",
+	"DELETE /v1/identity/roles/{tag}":                          "fleet.admin",
+	"GET /v1/identity/roles":                                   "fleet.admin",
 	"POST /v1/cluster/internal/egress-profiles/write":          "cluster.internal",
 	"POST /v1/cluster/internal/tokens/write":                   "cluster.internal",
 	"POST /v1/cluster/internal/warm-pools/read":                "cluster.internal",

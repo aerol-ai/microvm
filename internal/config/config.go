@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/aerol-ai/microvm/internal/cloudidentity"
 	"github.com/aerol-ai/microvm/pkg/auditexport"
 	"github.com/aerol-ai/microvm/pkg/auditwitness"
 	"github.com/aerol-ai/microvm/pkg/identitywire"
@@ -1552,6 +1553,13 @@ type Config struct {
 	// operator never believes SSO and the deny list are on when they are
 	// not. SB_IDENTITY_FILE.
 	IdentityFile string
+	// IdentityIssuerURL makes this deployment an OIDC issuer for sandbox
+	// cloud identities (plans/sandbox-cloud-identity.md D1.1): the HTTPS
+	// public URL of the API, with no path, that customers' clouds fetch
+	// /.well-known/openid-configuration and the JWKS from. Empty turns the
+	// feature off: create refuses `identity` and the documents 404. Every
+	// node of a cluster must carry the same value. SB_IDENTITY_ISSUER_URL.
+	IdentityIssuerURL string
 
 	// PATTokenPrevious is also accepted as the PAT during a rotation, in
 	// constant time; nodes always send PATToken. Set it on every node with
@@ -2014,6 +2022,22 @@ func validateIdentityFile(cfg Config) error {
 	return nil
 }
 
+// validateIdentityIssuer canonicalises SB_IDENTITY_ISSUER_URL, refusing one
+// the clouds could not use (not HTTPS, or with a path): a typo would
+// otherwise surface only as an AssumeRoleWithWebIdentity failure in a
+// customer's account.
+func validateIdentityIssuer(cfg *Config) error {
+	if cfg.IdentityIssuerURL == "" {
+		return nil
+	}
+	issuer, err := cloudidentity.ValidateIssuerURL(cfg.IdentityIssuerURL)
+	if err != nil {
+		return err
+	}
+	cfg.IdentityIssuerURL = issuer
+	return nil
+}
+
 func Load() (Config, error) {
 	return load(false)
 }
@@ -2303,6 +2327,7 @@ func load(keyTool bool) (Config, error) {
 		IdentitySyncInterval:          getEnvDuration("SB_IDENTITY_SYNC_INTERVAL", 5*time.Second),
 		IdentityMaxStale:              getEnvDuration("SB_IDENTITY_MAX_STALE", 60*time.Second),
 		IdentityFile:                  strings.TrimSpace(os.Getenv("SB_IDENTITY_FILE")),
+		IdentityIssuerURL:             strings.TrimSpace(os.Getenv("SB_IDENTITY_ISSUER_URL")),
 		MCPEnabled:                    getEnvBool("SB_MCP_ENABLED", false),
 		MCPAllowedOrigins:             splitEnvList("SB_MCP_ALLOWED_ORIGINS"),
 		MCPAllowedHosts:               splitEnvList("SB_MCP_ALLOWED_HOSTS"),
@@ -3041,6 +3066,9 @@ func load(keyTool bool) (Config, error) {
 		return Config{}, err
 	}
 	if err := validateIdentityFile(cfg); err != nil {
+		return Config{}, err
+	}
+	if err := validateIdentityIssuer(&cfg); err != nil {
 		return Config{}, err
 	}
 	if cfg.EnterpriseMode {

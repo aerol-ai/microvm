@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"strconv"
 
+	"github.com/aerol-ai/microvm/internal/cloudidentity"
 	"github.com/aerol-ai/microvm/internal/cluster"
 	"github.com/aerol-ai/microvm/internal/service"
 	"github.com/aerol-ai/microvm/internal/store"
@@ -239,6 +240,20 @@ func Classify(err error) Classification {
 		// node's log, the caller gets what to do.
 		return Classification{Status: http.StatusServiceUnavailable, RetryAfter: 5, Log: true, LogLevel: slog.LevelWarn,
 			Message: "warm pools are unavailable right now (no cluster leader, a rolling upgrade in progress, or the server tier out of reach); retry shortly"}
+	// Cloud identity per sandbox (plans/sandbox-cloud-identity.md): a tag
+	// not on the allow list, or a caller below its role, is 403 (D1.5);
+	// too many rotations inside the JWKS window is 409; a bad option, or
+	// identity on a deployment that is no issuer, is 400.
+	case errors.Is(err, service.ErrIdentityRoleDenied):
+		return Classification{Status: http.StatusForbidden, Message: truncate(err.Error())}
+	case errors.Is(err, cloudidentity.ErrTooManyKeys):
+		return Classification{Status: http.StatusConflict, Message: cloudidentity.ErrTooManyKeys.Error()}
+	case errors.Is(err, service.ErrIdentityInvalid), errors.Is(err, service.ErrIdentityDisabled):
+		return Classification{Status: http.StatusBadRequest, Message: truncate(err.Error())}
+	case errors.Is(err, service.ErrIdentityRoleNotFound):
+		return Classification{Status: http.StatusNotFound, Message: "identity role tag not found"}
+	case errors.Is(err, service.ErrIdentityUnavailable):
+		return Classification{Status: http.StatusServiceUnavailable, RetryAfter: 5, Message: truncate(err.Error())}
 
 	// API tokens (plans/identity-and-access.md §5.4, finding 5.6).
 	case errors.Is(err, service.ErrAPITokenInvalid):
