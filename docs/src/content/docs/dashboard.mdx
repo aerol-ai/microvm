@@ -179,6 +179,18 @@ These counters show what happens to sandboxes over time. Each one has a `key` la
 
 A rise in `crashed` or `out_of_memory` stops together with `restarted` starts means sandboxes are crashing over and over. The D2 Capability Matrix dashboard in [`setup/grafana`](https://github.com/aerol-ai/microvm/tree/main/setup/grafana) has a panel with all four counters.
 
+## Profile the server with pprof
+
+pprof is Go's built-in profiler. It shows where the server spends its CPU time, what holds its memory, and what each goroutine (a lightweight Go thread) is doing. It is off by default.
+
+To turn it on, set `SB_ENABLE_PPROF=true` and restart the server. The profiler then answers under `/debug/pprof/` on each server's own API port (port `21212` by default):
+
+- **Only admins can read it.** Use the server token or an `admin` API token. A request with no token gets `401`, and any other token gets `403`.
+- **It is per server.** Caddy does not forward `/debug/` from your API domain, so open each node's own port, the same way as `/debug/vars`.
+- **Turn it off again when you are done.** A profile shows the server's goroutines, memory and command line, and taking one costs CPU while it runs.
+
+Download a profile with your admin token, then open the file with Go's `go tool pprof`. `/debug/pprof/profile?seconds=30` records 30 seconds of CPU time, `/debug/pprof/heap` shows memory, and `/debug/pprof/goroutine?debug=2` lists every goroutine as text. `/debug/pprof/` lists every profile.
+
 ## Send metrics and traces with OpenTelemetry
 
 OpenTelemetry (OTEL) is a standard way to send metrics and traces (a timed record of each request) to a collector. Prometheus pulls numbers. OTEL pushes them, over OTLP/HTTP.

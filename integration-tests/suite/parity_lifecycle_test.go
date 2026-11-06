@@ -337,3 +337,33 @@ func TestParityLifecycleCountersLive(t *testing.T) {
 		time.Sleep(2 * time.Second)
 	}
 }
+
+// UC-402 — pprof (plan O2) is off by default and never served without
+// admin: on every node's own API port, /debug/pprof/ without a token is
+// refused, and with the operator token it is not served (404) because the
+// scenarios do not set SB_ENABLE_PPROF.
+func TestParityPprofOffByDefaultLive(t *testing.T) {
+	harness.Require(t, sc, "UC-402")
+	targets := harness.LoadIntegrationTargets()
+	for _, node := range targets.Nodes {
+		base := nodeBase(t, node)
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		anon, err := harness.NewAPIClient(base, "").Do(ctx, http.MethodGet, "/debug/pprof/", nil)
+		cancel()
+		if err != nil {
+			t.Fatalf("%s: GET /debug/pprof/ without a token: %v", node.Name, err)
+		}
+		if anon.Status == http.StatusOK {
+			t.Fatalf("%s: /debug/pprof/ served without a token", node.Name)
+		}
+		ctx, cancel = context.WithTimeout(context.Background(), 30*time.Second)
+		op, err := harness.NewAPIClient(base, sc.OperatorPAT).Do(ctx, http.MethodGet, "/debug/pprof/", nil)
+		cancel()
+		if err != nil {
+			t.Fatalf("%s: GET /debug/pprof/ as the operator: %v", node.Name, err)
+		}
+		if op.Status != http.StatusNotFound {
+			t.Fatalf("%s: /debug/pprof/ as the operator = %d, want 404 (off by default)", node.Name, op.Status)
+		}
+	}
+}

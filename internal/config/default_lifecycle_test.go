@@ -40,3 +40,16 @@ func TestDefaultLifecycleEnv(t *testing.T) {
 		})
 	}
 }
+
+// TestEnablePprofEnv: the profiler is off unless SB_ENABLE_PPROF says so
+// (plan O2).
+func TestEnablePprofEnv(t *testing.T) {
+	t.Setenv("SB_PAT_TOKEN", "token")
+	if cfg, err := Load(); err != nil || cfg.EnablePprof {
+		t.Fatalf("default: EnablePprof=%v err=%v", cfg.EnablePprof, err)
+	}
+	t.Setenv("SB_ENABLE_PPROF", "true")
+	if cfg, err := Load(); err != nil || !cfg.EnablePprof {
+		t.Fatalf("SB_ENABLE_PPROF=true: EnablePprof=%v err=%v", cfg.EnablePprof, err)
+	}
+}

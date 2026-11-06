@@ -149,8 +149,13 @@ type Config struct {
 	// sandboxes forever (plans/agent-sandbox-feature-parity.md L4). Like
 	// SB_IDLE_TIMEOUT_MIN they apply only to a sandbox created with no
 	// lifecycle timers of its own, and never touch one that has its own.
-	DefaultDestroyIfIdleFor     time.Duration
-	MaxAge                      time.Duration
+	DefaultDestroyIfIdleFor time.Duration
+	MaxAge                  time.Duration
+	// EnablePprof serves Go's profiler (net/http/pprof) at /debug/pprof/
+	// to fleet.admin callers (SB_ENABLE_PPROF, default false; plans/agent-
+	// sandbox-feature-parity.md O2). Off by default: a profile shows the
+	// daemon's goroutines, heap and command line, and taking one costs CPU.
+	EnablePprof                 bool
 	CreateSandboxTimeoutSeconds int
 	ContainerPrivileged         bool
 	ResourceLimitsOff           bool
@@ -2004,6 +2009,7 @@ func load(keyTool bool) (Config, error) {
 		IdleTimeoutMinutes:                getEnvInt("SB_IDLE_TIMEOUT_MIN", 0),
 		DefaultDestroyIfIdleFor:           getEnvDuration("SB_DEFAULT_DESTROY_IF_IDLE_FOR", 0),
 		MaxAge:                            getEnvDuration("SB_MAX_AGE", 0),
+		EnablePprof:                       getEnvBool("SB_ENABLE_PPROF", false),
 		CreateSandboxTimeoutSeconds:       getEnvInt("SB_CREATE_TIMEOUT_SEC", 600),
 		ContainerPrivileged:               getEnvBool("SB_CONTAINER_PRIVILEGED", false),
 		ResourceLimitsOff:                 getEnvBool("SB_RESOURCE_LIMITS_DISABLED", false),

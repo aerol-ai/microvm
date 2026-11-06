@@ -78,9 +78,12 @@ type Server struct {
 	// nil with no limit.
 	listGate       *apihttp.Gate
 	clusterEnabled bool
-	mux            *http.ServeMux
-	root           http.Handler
-	mcp            *remotemcp.Handler
+	// pprofEnabled mounts /debug/pprof/ for fleet.admin (SB_ENABLE_PPROF,
+	// pprof.go).
+	pprofEnabled bool
+	mux          *http.ServeMux
+	root         http.Handler
+	mcp          *remotemcp.Handler
 
 	// authChain is the ordered authenticator list authenticate() tries
 	// (auth.go). NewServer builds it; a bare &Server{} falls back to the
@@ -178,6 +181,7 @@ func NewServer(logger *slog.Logger, service *service.Service, dockerClient *dock
 		mcpResource:     options.mcpResource,
 		domain:          cfg.Domain,
 		clusterEnabled:  cfg.EnableCluster,
+		pprofEnabled:    cfg.EnablePprof,
 		auditLimiter: apiv1.NewAuditRateLimiter(apiv1.AuditRateLimiterConfig{
 			IdentityRate: cfg.AuditRateLimitIdentity,
 			OperatorRate: cfg.AuditRateLimitOperator,
@@ -307,6 +311,7 @@ func (s *Server) registerRoutes(mux apihttp.Mux) {
 	// happens in the page), the metrics endpoints are permission-gated. See
 	// pkg/api/dashboard.go.
 	s.registerDashboard(mux)
+	s.registerPprof(mux)
 }
 
 // route is Route for the routes pkg/api mounts itself (/mcp and the

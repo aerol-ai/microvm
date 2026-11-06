@@ -985,6 +985,7 @@ var Registry = []UseCase{
 	{ID: "UC-399", Title: "destroyAt: a time in the past is refused with a 400 naming destroy_at; a time two minutes ahead is stored as destroy_at_age and deletes the sandbox soon after it passes", Implemented: true},
 	{ID: "UC-400", Title: "lifecycle event feed: a sandbox stopped by a one-minute idle timer has a SYSTEM lifecycle.auto_stop record with reason idle on its audit page, read with caller=system:*, which returns only system records", Implemented: true},
 	{ID: "UC-401", Title: "lifecycle counters: a stop and a start move aerolvm_sandbox_stops_total{key=user_stop} and aerolvm_sandbox_starts_total{key=requested}, summed over every node", Implemented: true},
+	{ID: "UC-402", Title: "pprof is off by default and never served without admin: on every node's own API port, /debug/pprof/ without a token is refused and with the operator token is a 404", Implemented: true},
 }
 
 // byID is a lookup built once for the report generator.
