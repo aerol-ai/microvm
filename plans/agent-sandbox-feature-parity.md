@@ -1644,7 +1644,7 @@ that adds the code also has the fix), with a test that fails without it:
   F2 atomic-failure test; the O1 metric row, stale comments and five
   commit messages (fv and op numbers, O3's table).
 - Fixes that touch code later commits rewrote are commits on a 59th PR,
-  `fix/parity-review-findings`, on top of the benchmark PR #981: the SDK
+  #982 (`fix/parity-review-findings`), on top of the benchmark PR #981: the SDK
   "retry found its work done" rule now counts only after a lost reply
   (it fired after 429/503 too, so deleting a missing path reported
   success); get_or_create deletes on exit only what it created; `import
