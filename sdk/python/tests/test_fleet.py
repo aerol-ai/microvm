@@ -71,10 +71,14 @@ class FakeSandboxd:
                         if fake._barrier is not None and fake._barrier_left > 0:
                             fake._barrier_left -= 1
                             wait = True
+                        # Read the answer on arrival, before the barrier: no
+                        # caller can create until every gated lookup has
+                        # arrived, so all of them miss. Reading after the
+                        # wait let a slow caller see a sandbox another had
+                        # made since, and the test flaked.
+                        hit = [s for s in fake.sandboxes.values() if s["name"] == query["name"]]
                     if wait:
                         fake._barrier.wait(timeout=10)
-                    with fake.lock:
-                        hit = [s for s in fake.sandboxes.values() if s["name"] == query["name"]]
                     self._send(200, hit)
                     return
                 tags = {k[len("tag."):]: v for k, v in query.items() if k.startswith("tag.")}

@@ -61,12 +61,15 @@ class FakeSandboxd {
     if (request.method === "GET" && url.pathname === "/v1/sandboxes") {
       const name = url.searchParams.get("name");
       if (name !== null) {
+        // Read the answer on arrival, before the barrier: no caller can
+        // create until every gated lookup has arrived, so all of them miss.
+        const hits = [...this.sandboxes.values()].filter((s) => s.name === name);
         if (this.barrierLeft > 0) {
           this.barrierLeft--;
           if (this.barrierLeft === 0) this.release?.();
           await this.barrier;
         }
-        return json(200, [...this.sandboxes.values()].filter((s) => s.name === name));
+        return json(200, hits);
       }
       const tags = [...url.searchParams].filter(([k]) => k.startsWith("tag.")).map(([k, v]) => [k.slice(4), v]);
       const matched = [...this.sandboxes.values()]

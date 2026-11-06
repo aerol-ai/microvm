@@ -124,6 +124,14 @@ class FleetTest {
                         barrierLeft--;
                     }
                 }
+                // Read the answer on arrival, before the barrier: no caller
+                // can create until every gated lookup has arrived, so all of
+                // them miss. Reading after the wait could see a sandbox
+                // another caller had made since.
+                List<Object> hits = new ArrayList<>();
+                synchronized (sandboxes) {
+                    sandboxes.values().stream().filter(s -> query.get("name").equals(s.get("name"))).forEach(hits::add);
+                }
                 if (wait) {
                     barrier.countDown();
                     try {
@@ -131,10 +139,6 @@ class FleetTest {
                     } catch (InterruptedException e) {
                         Thread.currentThread().interrupt();
                     }
-                }
-                List<Object> hits = new ArrayList<>();
-                synchronized (sandboxes) {
-                    sandboxes.values().stream().filter(s -> query.get("name").equals(s.get("name"))).forEach(hits::add);
                 }
                 json(exchange, 200, hits);
             } else if (method.equals("GET") && path.equals("/v1/sandboxes")) {

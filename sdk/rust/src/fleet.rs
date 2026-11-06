@@ -247,12 +247,18 @@ pub(crate) mod tests {
                         false
                     }
                 };
+                // Read the answer on arrival, before the barrier: no caller
+                // can create until every gated lookup has arrived, so all of
+                // them miss. Reading after the wait could see a sandbox
+                // another caller had made since.
+                let name = param("name").unwrap();
+                let hits: Vec<Value> = {
+                    let st = state.lock().unwrap();
+                    st.sandboxes.values().filter(|s| s["name"] == name.as_str()).cloned().collect()
+                };
                 if wait {
                     barrier.wait();
                 }
-                let name = param("name").unwrap();
-                let st = state.lock().unwrap();
-                let hits: Vec<Value> = st.sandboxes.values().filter(|s| s["name"] == name.as_str()).cloned().collect();
                 (200, String::new(), Some(Value::Array(hits)))
             }
             ("GET", "/v1/sandboxes") => {

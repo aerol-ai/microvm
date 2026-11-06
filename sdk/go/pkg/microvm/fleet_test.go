@@ -89,10 +89,11 @@ func (f *fakeSandboxd) serve(w http.ResponseWriter, r *http.Request) {
 				close(f.release)
 			}
 		}
-		f.mu.Unlock()
-		<-f.release
+		// Read the answer on arrival, before the barrier: no caller can
+		// create until every gated lookup has arrived, so all of them miss.
+		// Reading after the wait let a slow caller see a sandbox another had
+		// made since, and the test flaked (12 in 300 runs).
 		name := r.URL.Query().Get("name")
-		f.mu.Lock()
 		hits := []models.Sandbox{}
 		for _, sb := range f.sandboxes {
 			if sb.Name == name {
@@ -100,6 +101,7 @@ func (f *fakeSandboxd) serve(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		f.mu.Unlock()
+		<-f.release
 		writeJSON(http.StatusOK, hits)
 	case r.Method == http.MethodGet && r.URL.Path == "/v1/sandboxes":
 		f.mu.Lock()
