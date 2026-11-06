@@ -1608,15 +1608,54 @@ reach them.
   limit stopped the first run).
 
 **O3 numbers** are in `performance-benchmark.mdx`, from the tool run on a
-node in us-east-1: Firecracker from a template 36.5 creates/s at 4 workers
-with p50 67 ms and p99 93 ms on one c5.metal; gVisor and Docker top out near
-6.7/s on 3 × t3.medium (2 CPUs each); the Docker warm pool cuts p50 from
-352 ms to 57 ms at 1 worker but cannot keep up at 4 on those servers.
+node in us-east-1. Firecracker from a template: 36.5 creates/s at 4
+workers, p50 67 ms, p99 93 ms, on one c5.metal. Docker and gVisor were
+measured again on fixed-performance servers (3 × c6i.2xlarge, PR #981),
+because the first run on burstable t3.medium servers was CPU-credit bound:
+gVisor 19.4/s at 4 workers (p50 171 ms); Docker 8.9/s (p50 303 ms), and
+the warm pool cuts p50 at 1 worker from 191 ms to 38 ms. The page has a
+"where the time goes" table from each create's Server-Timing header.
 
 **Live coverage.** Across the final runs every one of the 82 parity use
 cases (UC-369 to UC-467) passed in at least one scenario: cluster-3-mixed,
 cluster-3-mixed-docker, cluster-3-mixed-gvisor, single-node-fc and
 single-node-wasm.
+
+**Review guides (2026-11-06).** Writing each PR's step-by-step review
+guide (pr-review.md §A) meant reading every diff again, and that found
+more bugs. Each was fixed in the commit that made it (a fixup, so the PR
+that adds the code also has the fix), with a test that fails without it:
+- Security: a `safetar` link that only leads out of the folder once later
+  entries are in is now removed and the archive refused (F3); two expose
+  calls on one port can no longer interleave and leave a "token" row on the
+  open route, and the warm cache can no longer keep "not gated" after a
+  gate change (A2); a sandbox token is held to its own sandbox in the
+  service, not only to its owner (A1); the toolbox proxies no longer pass
+  the caller's `baggage` header into the sandbox (A3).
+- Correctness: a file copy keeps setuid/setgid (F1); Java's download cap
+  keeps the bytes under the limit (F4); a stop fails, instead of being
+  undone later, when it cannot cancel a pending restart (L1); a guest clock
+  that is behind no longer makes `destroyAfterExitFor` early, and the
+  probes get their own 10 s of the sweep (L5); a refused `destroyAt` no
+  longer holds a cluster create's name for 120 s, and the forwarded body
+  carries the age (L6); an env-pinned warm-pool key no longer keeps a
+  frozen image ID (W3); the identity role cache is capped (D1).
+- Tests and words: `TestIdentityRefresher`, the V1 best-effort test, the
+  F2 atomic-failure test; the O1 metric row, stale comments and five
+  commit messages (fv and op numbers, O3's table).
+- Fixes that touch code later commits rewrote are commits on a 59th PR,
+  `fix/parity-review-findings`, on top of the benchmark PR #981: the SDK
+  "retry found its work done" rule now counts only after a lost reply
+  (it fired after 429/503 too, so deleting a missing path reported
+  success); get_or_create deletes on exit only what it created; `import
+  microvm` no longer loads httpx; a Daytona text replace keeps owner,
+  mode and symlink; the E2B mcp create skips the port probe; smaller
+  items.
+- Still open, written in the PR bodies: a `destroyAt` lifecycle update
+  sent during a rolling upgrade (lifecycle.mdx says to finish the upgrade
+  first); the Rust SDK does not return a port's visibility (a field would
+  break matches); the TypeScript SDK on main still prints the token in
+  `JSON.stringify(sandbox)` (fixed in the stack; main needs a backport).
 
 **Owner decisions settled at build time:** P1 (F3), P2 (L5), P3 (V1),
 P4 (L1), ER5 (E1); see their rows. D1 and P1 have design docs:
