@@ -276,6 +276,10 @@ class CreateOptions(TypedDict, total=False):
     # A short-lived cloud identity token for the sandbox (AWS, GCP, Azure).
     # The role tag must be on your team's allow list (put_identity_role).
     identity: "IdentityOptions"
+    # Client-side only, never sent: the returned Sandbox deletes itself when
+    # a with block around it ends (Sandbox.close). Off by default, so leaving
+    # a block keeps the sandbox. destroyOnExit is accepted too.
+    destroy_on_exit: bool
 
 
 class IdentityOptions(TypedDict, total=False):

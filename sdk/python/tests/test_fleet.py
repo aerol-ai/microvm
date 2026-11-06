@@ -9,6 +9,7 @@ import unittest
 import urllib.parse
 
 from microvm import MicroVM, MicroVMConflictError, MicroVMHTTPError
+from microvm import client as client_module
 
 
 def _sandbox_json(sandbox_id, name, tags=None, image="alpine"):
@@ -251,6 +252,66 @@ class DestroyAllTests(unittest.TestCase):
             with self.subTest(tags=tags):
                 with self.assertRaises(ValueError):
                     client.destroy_all(tags=tags)
+
+
+
+class AutoCleanupTests(unittest.TestCase):
+    def test_leaving_a_with_block_keeps_the_sandbox_by_default(self):
+        fake = FakeSandboxd(self)
+        with fake.client().create(image="alpine", name="kept") as sandbox:
+            self.assertFalse(sandbox.destroy_on_exit)
+        self.assertEqual(fake.count("DELETE"), 0)
+        self.assertEqual(len(fake.sandboxes), 1)
+
+    def test_destroy_on_exit_deletes_when_the_block_ends(self):
+        fake = FakeSandboxd(self)
+        client = fake.client()
+        for spelling in ("destroy_on_exit", "destroyOnExit"):
+            with self.subTest(spelling=spelling):
+                with client.create({"image": "alpine", spelling: True}) as sandbox:
+                    self.assertTrue(sandbox.destroy_on_exit)
+                self.assertEqual(fake.sandboxes, {})
+        sandbox, _ = client.get_or_create("b", image="alpine", destroy_on_exit=True)
+        with sandbox:
+            pass
+        self.assertEqual(fake.sandboxes, {})
+
+    def test_the_flag_is_never_sent(self):
+        payload = client_module._to_api_create_options({"image": "alpine", "destroy_on_exit": True, "destroyOnExit": True})
+        self.assertNotIn("destroy_on_exit", payload)
+        self.assertNotIn("destroyOnExit", payload)
+
+    def test_the_block_error_wins_over_a_failed_delete(self):
+        fake = FakeSandboxd(self)
+        sandbox = fake.client().create(image="alpine", destroy_on_exit=True)
+        fake.delete_status[sandbox.id] = 500
+        with self.assertRaises(RuntimeError) as ctx:
+            with sandbox:
+                raise RuntimeError("work failed")
+        self.assertEqual(str(ctx.exception), "work failed")
+        notes = getattr(ctx.exception, "__notes__", None)
+        if notes is not None:  # add_note exists from Python 3.11
+            self.assertIn("destroying sandbox %s on exit also failed" % sandbox.id, notes[0])
+
+    def test_close_deletes_once_and_reports_a_failure(self):
+        fake = FakeSandboxd(self)
+        sandbox = fake.client().create(image="alpine")
+        sandbox.destroy_on_exit = True
+        fake.delete_status[sandbox.id] = 500
+        with self.assertRaises(MicroVMHTTPError):
+            sandbox.close()
+        fake.delete_status[sandbox.id] = 404
+        sandbox.close()
+        sandbox.close()
+        self.assertEqual(fake.count("DELETE"), 2)
+
+    def test_a_failed_delete_without_a_block_error_is_raised(self):
+        fake = FakeSandboxd(self)
+        sandbox = fake.client().create(image="alpine", destroy_on_exit=True)
+        fake.delete_status[sandbox.id] = 500
+        with self.assertRaises(MicroVMHTTPError):
+            with sandbox:
+                pass
 
 
 if __name__ == "__main__":

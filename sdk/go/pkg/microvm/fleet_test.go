@@ -324,3 +324,56 @@ func TestDestroyAll(t *testing.T) {
 		}
 	})
 }
+
+func TestSandboxClose(t *testing.T) {
+	newSandbox := func(t *testing.T) (*fakeSandboxd, *Sandbox) {
+		f, client := newFakeSandboxd(t, 0)
+		sb, _, err := client.GetOrCreate(context.Background(), "box", sdktypes.CreateSandboxOptions{Image: "alpine"})
+		if err != nil {
+			t.Fatalf("GetOrCreate: %v", err)
+		}
+		return f, sb
+	}
+	t.Run("does nothing by default", func(t *testing.T) {
+		f, sb := newSandbox(t)
+		if err := sb.Close(context.Background()); err != nil || f.count("DELETE") != 0 {
+			t.Fatalf("Close = %v, requests %q", err, f.requests)
+		}
+	})
+	t.Run("deletes once with DestroyOnClose, even after ctx is done", func(t *testing.T) {
+		f, sb := newSandbox(t)
+		sb.DestroyOnClose = true
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		if err := sb.Close(ctx); err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+		if err := sb.Close(ctx); err != nil {
+			t.Fatalf("second Close: %v", err)
+		}
+		if f.count("DELETE") != 1 || len(f.sandboxes) != 0 {
+			t.Fatalf("requests %q, left %v", f.requests, f.sandboxes)
+		}
+	})
+	t.Run("an already gone sandbox counts as deleted", func(t *testing.T) {
+		f, sb := newSandbox(t)
+		sb.DestroyOnClose = true
+		f.deleteStatus[sb.ID] = http.StatusNotFound
+		if err := sb.Close(context.Background()); err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+	})
+	t.Run("a failed delete is returned and can be retried", func(t *testing.T) {
+		f, sb := newSandbox(t)
+		sb.DestroyOnClose = true
+		f.deleteStatus[sb.ID] = http.StatusInternalServerError
+		var apiErr *APIError
+		if err := sb.Close(context.Background()); !errors.As(err, &apiErr) || apiErr.StatusCode != http.StatusInternalServerError {
+			t.Fatalf("Close error = %v", err)
+		}
+		delete(f.deleteStatus, sb.ID)
+		if err := sb.Close(context.Background()); err != nil || len(f.sandboxes) != 0 {
+			t.Fatalf("retried Close = %v, left %v", err, f.sandboxes)
+		}
+	})
+}

@@ -1046,6 +1046,7 @@ var Registry = []UseCase{
 	{ID: "UC-446", Title: "Typed errors: a missing sandbox matches the Go SDK's ErrNotFound, a create with a name already in use ErrConflict, and a wrong token ErrAuth (401), each still an *APIError", Implemented: true},
 	{ID: "UC-447", Title: "Get or create by name: eight GetOrCreate calls for one new name sent at once all return the same sandbox and exactly one reports created; GetByName finds it and a later GetOrCreate returns it without creating", Implemented: true},
 	{ID: "UC-448", Title: "Delete many by tag: DestroyAll with a tag unique to the run deletes the three sandboxes carrying it and returns their IDs, leaves a sandbox with another tag value, and a second call deletes nothing", Implemented: true},
+	{ID: "UC-449", Title: "Auto-cleanup: Close without DestroyOnClose leaves the sandbox running and usable; with DestroyOnClose it deletes the sandbox even with an already cancelled ctx, and a second Close is a no-op", Implemented: true},
 }
 
 // byID is a lookup built once for the report generator.

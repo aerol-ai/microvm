@@ -161,7 +161,9 @@ export class MicroVM {
 
   async create(options: CreateOptions): Promise<Sandbox> {
     const sandbox = await this.client.create(options);
-    return this.wrap(sandbox.toJSON());
+    const wrapped = this.wrap(sandbox.toJSON());
+    wrapped.destroyOnExit = options.destroyOnExit ?? false;
+    return wrapped;
   }
 
   async list(options?: ListOptions): Promise<Sandbox[]> {
@@ -205,7 +207,9 @@ export class MicroVM {
    */
   async getOrCreate(name: string, options: CreateOptions): Promise<GetOrCreateResult> {
     const result = await this.client.getOrCreate(name, options);
-    return { sandbox: this.wrap(result.sandbox.toJSON()), created: result.created };
+    const sandbox = this.wrap(result.sandbox.toJSON());
+    sandbox.destroyOnExit = options.destroyOnExit ?? false;
+    return { sandbox, created: result.created };
   }
 
   async start(id: string): Promise<Sandbox> {

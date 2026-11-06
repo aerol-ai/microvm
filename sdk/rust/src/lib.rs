@@ -25,6 +25,7 @@ pub use files::{
     CopyFileOptions, DeleteFileOptions, FileInfo, FileList, FileMatch, ListFilesOptions, MakeDirOptions,
     DownloadFileOptions, MoveFileOptions, UploadFileOptions, DEFAULT_LIST_LIMIT,
 };
+pub use fleet::SandboxGuard;
 pub use image::Image;
 pub use types::CreateSandboxResponse;
 pub use types::{

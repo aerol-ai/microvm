@@ -2268,11 +2268,39 @@ export class SandboxResource implements Sandbox {
   declare runtime: Sandbox["runtime"];
   declare identity?: SandboxIdentity;
 
-  protected readonly client: APIClient;
+  declare protected readonly client: APIClient;
+
+  /**
+   * When true, leaving an `await using` block deletes the sandbox (see
+   * `[Symbol.asyncDispose]`). Off by default, so the block ends without
+   * touching it; set it here or with `destroyOnExit` on `create` and
+   * `getOrCreate`.
+   */
+  destroyOnExit = false;
+
+  private disposed = false;
 
   constructor(client: APIClient, sandbox: Sandbox) {
-    this.client = client;
+    // Not enumerable: it holds the token, so it must never reach toJSON,
+    // JSON.stringify or a log of the sandbox.
+    Object.defineProperty(this, "client", { value: client, enumerable: false });
     this.apply(sandbox);
+  }
+
+  /**
+   * Called when an `await using` block holding this sandbox ends. Deletes the
+   * sandbox only when {@link destroyOnExit} is true; otherwise does nothing.
+   * A sandbox that is already gone counts as deleted, and a second call does
+   * nothing.
+   */
+  async [Symbol.asyncDispose](): Promise<void> {
+    if (!this.destroyOnExit || this.disposed) return;
+    try {
+      await this.client.destroy(this.id);
+    } catch (err) {
+      if (!(err instanceof MicroVMNotFoundError)) throw err;
+    }
+    this.disposed = true;
   }
 
   async refresh(): Promise<this> {
@@ -2532,7 +2560,9 @@ export class SandboxResource implements Sandbox {
   }
 
   toJSON(): Sandbox {
-    return cloneSandbox(this);
+    // Only the sandbox's own fields, not the SDK's flags on this object.
+    const { destroyOnExit: _destroyOnExit, disposed: _disposed, ...data } = this as unknown as Record<string, unknown>;
+    return cloneSandbox(data as unknown as Sandbox);
   }
 
   private apply(sandbox: Sandbox): void {

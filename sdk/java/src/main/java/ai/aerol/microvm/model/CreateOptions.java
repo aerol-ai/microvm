@@ -26,6 +26,14 @@ public class CreateOptions {
     @JsonIgnore
     public String idempotencyKey;
     /**
+     * Client-side only, never sent: when true, the returned sandbox deletes
+     * itself when a try-with-resources block around it ends
+     * ({@code Sandbox.close()}). False by default, so the block keeps the
+     * sandbox.
+     */
+    @JsonIgnore
+    public boolean destroyOnClose;
+    /**
      * Optional name, unique among the caller's sandboxes (another account may
      * use the same name); a repeat create with a held name returns HTTP 409.
      * Names starting with {@code owner:} or shaped like a sandbox ID
@@ -133,6 +141,12 @@ public class CreateOptions {
 
     public CreateOptions setImage(String image) {
         this.image = image;
+        return this;
+    }
+
+    /** See {@link #destroyOnClose}. */
+    public CreateOptions setDestroyOnClose(boolean destroyOnClose) {
+        this.destroyOnClose = destroyOnClose;
         return this;
     }
 

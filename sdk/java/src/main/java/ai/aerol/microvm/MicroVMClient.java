@@ -302,8 +302,9 @@ public class MicroVMClient {
         if (key == null) {
             key = newIdempotencyKey();
         }
-        return wrap(doJson("POST", versioned("/sandboxes"), options, SandboxData.class, RetryMode.IDEMPOTENT,
+        Sandbox sandbox = wrap(doJson("POST", versioned("/sandboxes"), options, SandboxData.class, RetryMode.IDEMPOTENT,
             Map.of(IDEMPOTENCY_KEY_HEADER, key)));
+        return sandbox.setDestroyOnClose(options != null && options.destroyOnClose);
     }
 
     /** A fresh create key: 128 random bits as 32 lowercase hex characters. */
@@ -539,9 +540,10 @@ public class MicroVMClient {
         if (!given.isEmpty() && !given.equals(wanted)) {
             throw new IllegalArgumentException("options name \"" + given + "\" differs from \"" + wanted + "\"");
         }
+        boolean destroyOnClose = options != null && options.destroyOnClose;
         java.util.Optional<Sandbox> existing = getByName(wanted);
         if (existing.isPresent()) {
-            return new GetOrCreateResult(existing.get(), false);
+            return new GetOrCreateResult(existing.get().setDestroyOnClose(destroyOnClose), false);
         }
         CreateOptions named = copyCreateOptions(options);
         named.name = wanted;
@@ -553,7 +555,7 @@ public class MicroVMClient {
             if (winner.isEmpty()) {
                 throw e;
             }
-            return new GetOrCreateResult(winner.get(), false);
+            return new GetOrCreateResult(winner.get().setDestroyOnClose(destroyOnClose), false);
         }
     }
 
@@ -2060,6 +2062,7 @@ public class MicroVMClient {
         copy.customDomains = source.customDomains;
         copy.templateId = source.templateId;
         copy.idempotencyKey = source.idempotencyKey;
+        copy.destroyOnClose = source.destroyOnClose;
         return copy;
     }
 

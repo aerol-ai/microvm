@@ -633,9 +633,50 @@ class FileWatchHandle:
 
 
 class Sandbox:
+    """A sandbox, as returned by :meth:`MicroVM.create`, :meth:`MicroVM.get`
+    and the other calls that return one.
+
+    It works as a context manager. Leaving a ``with`` block calls
+    :meth:`close`, which deletes the sandbox only when ``destroy_on_exit`` is
+    True (pass ``destroy_on_exit=True`` to :meth:`MicroVM.create` or
+    :meth:`MicroVM.get_or_create`, or set the attribute). By default the
+    sandbox keeps running after the block, as it would without one.
+    """
+
     def __init__(self, client: "MicroVM", data: SandboxData) -> None:
         self._client = client
         self._data = data
+        # Opt-in (plan S2): leaving a with block must not delete a sandbox
+        # nobody asked to delete.
+        self.destroy_on_exit = False
+        self._closed = False
+
+    def __enter__(self) -> "Sandbox":
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        if exc is None:
+            self.close()
+            return
+        # The block's own error is what the caller needs to see; a failed
+        # delete on the way out is added to it as a note, never raised over it.
+        try:
+            self.close()
+        except Exception as err:
+            if hasattr(exc, "add_note"):
+                exc.add_note(f"destroying sandbox {self.id} on exit also failed: {err}")
+
+    def close(self) -> None:
+        """Delete the sandbox when ``destroy_on_exit`` is True; otherwise do
+        nothing. A sandbox that is already gone counts as deleted, and a
+        second close does nothing."""
+        if not self.destroy_on_exit or self._closed:
+            return
+        try:
+            self._client.destroy(self.id)
+        except MicroVMNotFoundError:
+            pass
+        self._closed = True
 
     def to_dict(self) -> SandboxData:
         return dict(self._data)
@@ -944,6 +985,8 @@ class MicroVM:
         # and create({"image": "python:3.12"}) send the same request. A
         # keyword replaces the same key in the dict.
         resolved_options: Dict[str, Any] = {**(options or {}), **fields}
+        # Client-side only: _to_api_create_options never sends it.
+        destroy_on_exit = bool(_first_of(resolved_options, "destroy_on_exit", "destroyOnExit"))
         resolved_options["image"] = self._resolve_image(_first_of(resolved_options, "image"))
         # One key per call, sent unchanged on each of its automatic retries: a
         # create retried after a timeout gets back the sandbox the first
@@ -955,7 +998,9 @@ class MicroVM:
             _to_api_create_options(resolved_options),
             headers={IDEMPOTENCY_KEY_HEADER: key},
         )
-        return self._wrap_sandbox(sandbox)
+        wrapped = self._wrap_sandbox(sandbox)
+        wrapped.destroy_on_exit = destroy_on_exit
+        return wrapped
 
     def build_image(self, image: Image) -> str:
         result = self.build_image_with_push(image, push=None)
@@ -1090,8 +1135,10 @@ class MicroVM:
         if given and given != wanted:
             raise ValueError(f"options name {given!r} differs from {wanted!r}")
         resolved["name"] = wanted
+        destroy_on_exit = bool(_first_of(resolved, "destroy_on_exit", "destroyOnExit"))
         existing = self.get_by_name(wanted)
         if existing is not None:
+            existing.destroy_on_exit = destroy_on_exit
             return existing, False
         try:
             return self.create(resolved), True
@@ -1102,6 +1149,7 @@ class MicroVM:
             winner = self.get_by_name(wanted)
             if winner is None:
                 raise
+            winner.destroy_on_exit = destroy_on_exit
             return winner, False
 
     def get(self, sandbox_id: str, *, include_env: bool = False) -> Sandbox:

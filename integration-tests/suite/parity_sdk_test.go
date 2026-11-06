@@ -163,3 +163,35 @@ func TestParitySDKDestroyAllLive(t *testing.T) {
 		t.Fatalf("second DestroyAll = (%v, %v), want nothing to delete", again, err)
 	}
 }
+
+// UC-449 — auto-cleanup (plan S2): Close on a sandbox without
+// DestroyOnClose leaves it running and usable; with DestroyOnClose it
+// deletes the sandbox, even when the ctx it is given is already cancelled
+// (the usual state of a deferred Close), and a second Close is a no-op.
+func TestParitySDKCloseLive(t *testing.T) {
+	harness.Require(t, sc, "UC-449")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+	sdk := client(t).SDK()
+
+	sb := paritySandbox(t)
+	if err := sb.Close(ctx); err != nil {
+		t.Fatalf("Close without DestroyOnClose: %v", err)
+	}
+	if got := parityExec(t, ctx, sb, "echo still-here"); got != "still-here" {
+		t.Fatalf("sandbox after a plain Close answered %q", got)
+	}
+
+	sb.DestroyOnClose = true
+	done, stop := context.WithCancel(ctx)
+	stop()
+	if err := sb.Close(done); err != nil {
+		t.Fatalf("Close with DestroyOnClose and a cancelled ctx: %v", err)
+	}
+	if _, err := sdk.Get(ctx, sb.ID); !errors.Is(err, microvm.ErrNotFound) {
+		t.Fatalf("Get after Close = %v, want ErrNotFound", err)
+	}
+	if err := sb.Close(ctx); err != nil {
+		t.Fatalf("second Close: %v", err)
+	}
+}

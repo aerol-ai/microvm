@@ -243,6 +243,12 @@ export interface CreateOptions {
    */
   idempotencyKey?: string;
   /**
+   * Client-side only, never sent. When true, the returned sandbox deletes
+   * itself when an `await using` block around it ends. Off by default, so
+   * leaving the block keeps the sandbox.
+   */
+  destroyOnExit?: boolean;
+  /**
    * Optional name, unique among the caller's sandboxes (another account may
    * use the same name). A repeat create with a name the caller already holds
    * returns HTTP 409. Names starting with `owner:` or shaped like a sandbox

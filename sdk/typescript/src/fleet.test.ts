@@ -191,3 +191,63 @@ test("destroyAll needs a tag", async () => {
   await assert.rejects(fake.client().destroyAll({ tags: {} }), /at least one tag/);
   assert.equal(fake.requests.length, 0);
 });
+
+test("leaving an await using block keeps the sandbox by default", async () => {
+  const fake = new FakeSandboxd();
+  const client = fake.client();
+  {
+    await using sandbox = await client.create({ image: "alpine", name: "kept" });
+    assert.equal(sandbox.destroyOnExit, false);
+  }
+  assert.equal(fake.count("DELETE"), 0);
+  assert.equal(fake.sandboxes.size, 1);
+});
+
+test("destroyOnExit deletes the sandbox when the block ends, even on an error", async () => {
+  const fake = new FakeSandboxd();
+  const client = fake.client();
+  {
+    await using sandbox = await client.create({ image: "alpine", name: "a", destroyOnExit: true });
+    assert.equal(sandbox.destroyOnExit, true);
+  }
+  assert.equal(fake.sandboxes.size, 0);
+  await assert.rejects(
+    (async () => {
+      const { sandbox } = await client.getOrCreate("b", { image: "alpine", destroyOnExit: true });
+      await using held = sandbox;
+      throw new Error("work failed");
+    })(),
+    /work failed/,
+  );
+  assert.equal(fake.sandboxes.size, 0);
+  assert.equal(fake.count("DELETE"), 2);
+});
+
+test("asyncDispose deletes once and counts an already gone sandbox as deleted", async () => {
+  const fake = new FakeSandboxd();
+  const sandbox = await fake.client().create({ image: "alpine", name: "a" });
+  sandbox.destroyOnExit = true;
+  fake.deleteStatus.set(sandbox.id, 404);
+  await sandbox[Symbol.asyncDispose]();
+  await sandbox[Symbol.asyncDispose]();
+  assert.equal(fake.count("DELETE"), 1);
+});
+
+test("a failed delete on dispose is thrown", async () => {
+  const fake = new FakeSandboxd();
+  const sandbox = await fake.client().create({ image: "alpine", name: "a", destroyOnExit: true });
+  fake.deleteStatus.set(sandbox.id, 500);
+  await assert.rejects(sandbox[Symbol.asyncDispose](), (err: unknown) => err instanceof MicroVMApiError && err.status === 500);
+});
+
+test("a sandbox's JSON holds only its fields, never the client or its token", async () => {
+  const fake = new FakeSandboxd();
+  const sandbox = await fake.client().create({ image: "alpine", name: "a", destroyOnExit: true });
+  const json = JSON.stringify(sandbox);
+  assert.equal(json.includes("pat"), false, json);
+  const keys = Object.keys(sandbox.toJSON());
+  for (const hidden of ["client", "destroyOnExit", "disposed"]) {
+    assert.equal(keys.includes(hidden), false, hidden);
+  }
+  assert.equal(JSON.parse(json).name, "a");
+});

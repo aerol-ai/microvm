@@ -2,6 +2,8 @@ package ai.aerol.microvm;
 
 import java.util.List;
 
+import com.fasterxml.jackson.annotation.JsonIgnore;
+
 import ai.aerol.microvm.model.AuditOptions;
 import ai.aerol.microvm.model.AuditPage;
 import ai.aerol.microvm.model.CloneGeneration;
@@ -15,6 +17,7 @@ import ai.aerol.microvm.model.MakeDirOptions;
 import ai.aerol.microvm.model.MoveFileOptions;
 import ai.aerol.microvm.model.UploadFileOptions;
 import ai.aerol.microvm.model.DownloadFileOptions;
+import ai.aerol.microvm.model.CreateOptions;
 import ai.aerol.microvm.model.CreateSandboxTokenOptions;
 import ai.aerol.microvm.model.SandboxToken;
 import ai.aerol.microvm.model.CreateSnapshotOptions;
@@ -40,12 +43,57 @@ import ai.aerol.microvm.model.SessionAttachOptions;
 import ai.aerol.microvm.model.SetNetworkLimitsOptions;
 import ai.aerol.microvm.model.WatchOptions;
 
-public class Sandbox extends SandboxData {
+/**
+ * A sandbox, as returned by {@link MicroVMClient#create} and the other calls
+ * that return one.
+ *
+ * <p>It is {@link AutoCloseable}: a try-with-resources block calls
+ * {@link #close()} when it ends, which deletes the sandbox only when
+ * {@link #isDestroyOnClose()} is true. That is off by default, so the
+ * sandbox keeps running after the block, as it would without one. Turn it on
+ * with {@link CreateOptions#setDestroyOnClose(boolean)} or
+ * {@link #setDestroyOnClose(boolean)}.
+ */
+public class Sandbox extends SandboxData implements AutoCloseable {
     private final MicroVMClient client;
+    // Opt-in (plan S2): ending a try block must not delete a sandbox nobody
+    // asked to delete.
+    private boolean destroyOnClose;
+    private boolean closed;
 
     Sandbox(MicroVMClient client, SandboxData data) {
         this.client = client;
         apply(data);
+    }
+
+    /** Whether {@link #close()} deletes this sandbox. False by default. */
+    @JsonIgnore // a client-side flag, not sandbox data
+    public boolean isDestroyOnClose() {
+        return destroyOnClose;
+    }
+
+    /** Sets whether {@link #close()} deletes this sandbox; returns this sandbox. */
+    public Sandbox setDestroyOnClose(boolean destroyOnClose) {
+        this.destroyOnClose = destroyOnClose;
+        return this;
+    }
+
+    /**
+     * Deletes the sandbox when {@link #isDestroyOnClose()} is true; otherwise
+     * does nothing. A sandbox that is already gone counts as deleted, and a
+     * second close does nothing.
+     */
+    @Override
+    public void close() {
+        if (!destroyOnClose || closed) {
+            return;
+        }
+        try {
+            client.destroy(id);
+        } catch (MicroVMNotFoundException e) {
+            // Already gone, which is what close wanted.
+        }
+        closed = true;
     }
 
     public SandboxData toData() {

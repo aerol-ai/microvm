@@ -1,9 +1,75 @@
-//! Calls that act on sandboxes by name or by tag rather than by ID (plan
-//! section 5.3, S4 and S5).
+//! Calls that act on sandboxes by name or by tag rather than by ID, and the
+//! guard that deletes a sandbox when it goes out of scope (plan section 5.3,
+//! S2, S4 and S5).
 
 use std::collections::HashMap;
+use std::ops::{Deref, DerefMut};
 
 use crate::{Client, CreateOptions, Error, Sandbox};
+
+impl Sandbox {
+    /// Wraps the sandbox in a [`SandboxGuard`] that deletes it when the
+    /// guard is dropped, at the end of its scope or while unwinding from a
+    /// panic. Calling this is the opt-in: a plain [`Sandbox`] is never
+    /// deleted on drop. The guard derefs to the sandbox, so every method
+    /// still works through it.
+    pub fn destroy_on_drop(self) -> SandboxGuard {
+        SandboxGuard { sandbox: Some(self) }
+    }
+}
+
+/// A [`Sandbox`] that is deleted when this guard is dropped. Made by
+/// [`Sandbox::destroy_on_drop`].
+///
+/// `Drop` cannot return an error, so a failed delete on drop is ignored (a
+/// sandbox already gone counts as deleted). Call [`SandboxGuard::destroy`] to
+/// delete it and see the error, or [`SandboxGuard::keep`] to keep the sandbox.
+/// The guard is not `Clone`: one guard owns one delete, so a copy can never
+/// delete the sandbox while another handle still uses it.
+pub struct SandboxGuard {
+    sandbox: Option<Sandbox>,
+}
+
+impl SandboxGuard {
+    /// Deletes the sandbox now and returns the error, if any. A sandbox that
+    /// is already gone (404) counts as deleted.
+    pub fn destroy(mut self) -> Result<(), Error> {
+        match self.sandbox.take() {
+            Some(sandbox) => match sandbox.destroy() {
+                Err(err) if err.is_not_found() => Ok(()),
+                other => other,
+            },
+            None => Ok(()),
+        }
+    }
+
+    /// Keeps the sandbox: returns it and deletes nothing.
+    pub fn keep(mut self) -> Sandbox {
+        self.sandbox.take().expect("a live guard always holds its sandbox")
+    }
+}
+
+impl Deref for SandboxGuard {
+    type Target = Sandbox;
+
+    fn deref(&self) -> &Sandbox {
+        self.sandbox.as_ref().expect("a live guard always holds its sandbox")
+    }
+}
+
+impl DerefMut for SandboxGuard {
+    fn deref_mut(&mut self) -> &mut Sandbox {
+        self.sandbox.as_mut().expect("a live guard always holds its sandbox")
+    }
+}
+
+impl Drop for SandboxGuard {
+    fn drop(&mut self) {
+        if let Some(sandbox) = self.sandbox.take() {
+            let _ = sandbox.destroy();
+        }
+    }
+}
 
 impl Client {
     /// Deletes every sandbox of yours that carries all of `tags` and returns
@@ -391,5 +457,60 @@ pub(crate) mod tests {
         let err = fake_client(&url).destroy_all(&HashMap::new()).expect_err("no tags");
         assert!(matches!(err, Error::Client(_)), "{err}");
         assert!(state.lock().unwrap().requests.is_empty());
+    }
+
+    fn new_sandbox() -> (Arc<Mutex<FakeState>>, Sandbox) {
+        let (url, state) = spawn_fake(0);
+        let (sandbox, _) = fake_client(&url).get_or_create("box", opts("alpine")).expect("get_or_create");
+        (state, sandbox)
+    }
+
+    #[test]
+    fn a_plain_sandbox_is_not_deleted_on_drop() {
+        let (state, sandbox) = new_sandbox();
+        drop(sandbox);
+        assert_eq!(state.lock().unwrap().count("DELETE"), 0);
+    }
+
+    #[test]
+    fn the_guard_deletes_on_drop_and_derefs_to_the_sandbox() {
+        let (state, sandbox) = new_sandbox();
+        {
+            let guard = sandbox.destroy_on_drop();
+            assert_eq!(guard.data.name.as_deref(), Some("box"));
+        }
+        let st = state.lock().unwrap();
+        assert_eq!(st.count("DELETE"), 1);
+        assert!(st.sandboxes.is_empty());
+    }
+
+    #[test]
+    fn the_guard_deletes_while_unwinding_from_a_panic() {
+        let (state, sandbox) = new_sandbox();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _guard = sandbox.destroy_on_drop();
+            panic!("work failed");
+        }));
+        assert!(result.is_err());
+        assert!(state.lock().unwrap().sandboxes.is_empty());
+    }
+
+    #[test]
+    fn keep_disarms_the_guard() {
+        let (state, sandbox) = new_sandbox();
+        let kept = sandbox.destroy_on_drop().keep();
+        drop(kept);
+        assert_eq!(state.lock().unwrap().count("DELETE"), 0);
+    }
+
+    #[test]
+    fn destroy_reports_a_failure_and_counts_a_404_as_deleted() {
+        let (state, sandbox) = new_sandbox();
+        let id = sandbox.data.id.clone();
+        state.lock().unwrap().delete_status.insert(id.clone(), 500);
+        let err = sandbox.clone().destroy_on_drop().destroy().expect_err("500");
+        assert_eq!(err.api_error().map(|e| e.status()), Some(500));
+        state.lock().unwrap().delete_status.insert(id, 404);
+        sandbox.destroy_on_drop().destroy().expect("404 counts as deleted");
     }
 }

@@ -785,6 +785,86 @@ Resize works for container and WebAssembly sandboxes. Firecracker and V8 isolate
   </TabItem>
 </Tabs>
 
+### Delete it when your code is done
+
+Each SDK can delete a sandbox for you when a block of code ends, even when that code fails. You have to ask for it: by default, the end of the block leaves the sandbox running, just as if there were no block.
+
+| SDK | The block | Turn on delete |
+|---|---|---|
+| TypeScript | `await using sandbox = ...` | `destroyOnExit: true` on `create` or `getOrCreate`, or `sandbox.destroyOnExit = true` |
+| Python | `with ... as sandbox:` | `destroy_on_exit=True` on `create` or `get_or_create`, or `sandbox.destroy_on_exit = True` |
+| Go | `defer sandbox.Close(ctx)` | `sandbox.DestroyOnClose = true` |
+| Rust | the scope of a `SandboxGuard` | `sandbox.destroy_on_drop()` returns the guard |
+| Java | `try (Sandbox sandbox = ...)` | `setDestroyOnClose(true)` on `CreateOptions` or on the sandbox |
+
+A sandbox that is already gone counts as deleted. A few details:
+
+- **Python:** if your code raised an error and the delete also fails, you still get your error. The failed delete is added to it as a note.
+- **Go:** `Close` still deletes after your `ctx` was cancelled or ran out of time, which is when a `defer` often runs. It allows itself two minutes.
+- **Rust:** a failed delete when the guard drops is ignored, because `Drop` cannot return an error. Call `guard.destroy()` to see the error, or `guard.keep()` to keep the sandbox.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    {
+      await using sandbox = await client.create({
+        image: "ubuntu:22.04",
+        destroyOnExit: true,
+      });
+      await sandbox.exec("echo hello");
+    } // the sandbox is deleted here
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    with client.create(image="ubuntu:22.04", destroy_on_exit=True) as sandbox:
+        sandbox.exec("echo hello")
+    # the sandbox is deleted here
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    sandbox, err := client.Create(ctx, sdktypes.CreateSandboxOptions{Image: "ubuntu:22.04"})
+    if err != nil {
+        log.Fatal(err)
+    }
+    sandbox.DestroyOnClose = true
+    defer sandbox.Close(ctx) // deletes the sandbox when this function returns
+
+    if _, err := sandbox.ExecCommand(ctx, "echo hello"); err != nil {
+        log.Fatal(err)
+    }
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    {
+        let sandbox = client
+            .create(CreateOptions {
+                image: "ubuntu:22.04".to_string(),
+                ..Default::default()
+            })?
+            .destroy_on_drop();
+        sandbox.exec("echo hello")?;
+    } // the sandbox is deleted here
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    CreateOptions options = new CreateOptions()
+        .setImage("ubuntu:22.04")
+        .setDestroyOnClose(true);
+    try (Sandbox sandbox = client.create(options)) {
+        sandbox.exec("echo hello");
+    } // the sandbox is deleted here
+    ```
+  </TabItem>
+</Tabs>
+
+<Aside>
+If your program is killed, no block gets to finish. Use the server's [lifecycle timers](#stop-or-delete-it-automatically) as the backstop: they delete an idle sandbox even when your code never comes back.
+</Aside>
+
 ### Delete many sandboxes by tag
 
 `destroyAll` deletes every sandbox of yours that has all the [tags](/sandbox-tags/) you give it. It returns the IDs of the sandboxes it deleted. This is handy for cleaning up after a test run or a job, when you tagged each sandbox it made.

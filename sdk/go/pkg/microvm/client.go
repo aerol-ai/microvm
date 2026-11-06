@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 
 	apiclient "github.com/aerol-ai/microvm/sdk/go/internal/apiclient"
 	sdktypes "github.com/aerol-ai/microvm/sdk/go/pkg/types"
@@ -73,7 +74,12 @@ type Sandbox struct {
 	// it locally before discarding the create response, the server cannot
 	// regenerate it.
 	SSHPrivateKey string
-	client        *Client
+	// DestroyOnClose makes Close delete the sandbox. It is off by default,
+	// so `defer sb.Close(ctx)` alone leaves the sandbox running; set it to
+	// opt in to delete-on-exit (plan S2).
+	DestroyOnClose bool
+	client         *Client
+	closed         bool
 }
 
 type ExecStreamHandle struct {
@@ -981,6 +987,29 @@ func (s *Sandbox) Stop(ctx context.Context) error {
 
 func (s *Sandbox) Destroy(ctx context.Context) error {
 	return s.client.Destroy(ctx, s.ID)
+}
+
+// closeTimeout bounds the delete Close sends. It is not tied to the caller's
+// ctx: a deferred Close often runs after that ctx was cancelled or timed out,
+// which is exactly when the cleanup still has to happen.
+const closeTimeout = 2 * time.Minute
+
+// Close deletes the sandbox when DestroyOnClose is true and does nothing
+// otherwise, so `defer sb.Close(ctx)` is the Go form of a block that cleans
+// up after itself. The delete ignores ctx's cancellation and deadline (it
+// keeps ctx's values) and has its own two-minute bound. A sandbox that is
+// already gone counts as deleted, and a second Close does nothing.
+func (s *Sandbox) Close(ctx context.Context) error {
+	if !s.DestroyOnClose || s.closed {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), closeTimeout)
+	defer cancel()
+	if err := s.Destroy(ctx); err != nil && !errors.Is(err, ErrNotFound) {
+		return err
+	}
+	s.closed = true
+	return nil
 }
 
 func (s *Sandbox) Resize(ctx context.Context, opts sdktypes.ResizeSandboxOptions) error {

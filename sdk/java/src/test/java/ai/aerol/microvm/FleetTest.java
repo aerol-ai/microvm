@@ -316,4 +316,62 @@ class FleetTest {
         assertThrows(IllegalArgumentException.class, () -> fake.client.destroyAll(null));
         assertEquals(0, fake.requests.size());
     }
+
+    @Test
+    void leavingATryBlockKeepsTheSandboxByDefault() throws Exception {
+        FakeSandboxd fake = new FakeSandboxd(0);
+        try (Sandbox sandbox = fake.client.create(new CreateOptions().setImage("alpine"))) {
+            assertFalse(sandbox.isDestroyOnClose());
+        }
+        assertEquals(0, fake.count("DELETE"));
+        assertEquals(1, fake.sandboxes.size());
+    }
+
+    @Test
+    void destroyOnCloseDeletesWhenTheBlockEndsEvenOnAnError() throws Exception {
+        FakeSandboxd fake = new FakeSandboxd(0);
+        try (Sandbox sandbox = fake.client.create(new CreateOptions().setImage("alpine").setDestroyOnClose(true))) {
+            assertTrue(sandbox.isDestroyOnClose());
+        }
+        assertEquals(0, fake.sandboxes.size());
+        CreateOptions options = new CreateOptions().setImage("alpine").setDestroyOnClose(true);
+        IllegalStateException err = assertThrows(IllegalStateException.class, () -> {
+            try (Sandbox sandbox = fake.client.getOrCreate("b", options).getSandbox()) {
+                throw new IllegalStateException("work failed");
+            }
+        });
+        assertEquals("work failed", err.getMessage());
+        assertEquals(0, fake.sandboxes.size());
+        assertEquals(2, fake.count("DELETE"));
+    }
+
+    @Test
+    void closeDeletesOnceAndCountsAnAlreadyGoneSandboxAsDeleted() throws Exception {
+        FakeSandboxd fake = new FakeSandboxd(0);
+        Sandbox sandbox = fake.client.create(new CreateOptions().setImage("alpine")).setDestroyOnClose(true);
+        fake.deleteStatus.put(sandbox.id, 404);
+        sandbox.close();
+        sandbox.close();
+        assertEquals(1, fake.count("DELETE"));
+    }
+
+    @Test
+    void aFailedDeleteOnCloseIsThrown() throws Exception {
+        FakeSandboxd fake = new FakeSandboxd(0);
+        Sandbox sandbox = fake.client.create(new CreateOptions().setImage("alpine").setDestroyOnClose(true));
+        fake.deleteStatus.put(sandbox.id, 500);
+        MicroVMApiException err = assertThrows(MicroVMApiException.class, sandbox::close);
+        assertEquals(500, err.getStatusCode());
+    }
+
+    @Test
+    void theFlagIsNeverSentOrSerialized() throws Exception {
+        FakeSandboxd fake = new FakeSandboxd(0);
+        CreateOptions options = new CreateOptions().setImage("alpine").setDestroyOnClose(true);
+        String wire = new String(JsonSupport.writeBytes(options), StandardCharsets.UTF_8);
+        assertFalse(wire.contains("destroy"), wire);
+        Sandbox sandbox = fake.client.create(options);
+        String json = new String(JsonSupport.writeBytes(sandbox.toData()), StandardCharsets.UTF_8);
+        assertFalse(json.contains("destroyOnClose") || json.contains("closed"), json);
+    }
 }
