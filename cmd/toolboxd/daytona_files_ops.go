@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 )
 
 // The Daytona toolbox file routes below were forwarded by the Daytona facade
@@ -65,6 +66,12 @@ func replaceInFile(raw, pattern, newValue string) error {
 	if err != nil {
 		return err
 	}
+	// Edit the file a link points to, not the link: the rename below would
+	// otherwise turn a symlink into a plain file. Daytona's own toolbox
+	// writes in place, which keeps the link.
+	if real, err := filepath.EvalSymlinks(target); err == nil {
+		target = real
+	}
 	info, err := os.Stat(target)
 	if err != nil {
 		return err
@@ -80,12 +87,17 @@ func replaceInFile(raw, pattern, newValue string) error {
 	if replaced == string(content) {
 		return nil
 	}
-	return writeFileAtomic(target, []byte(replaced), info.Mode().Perm())
+	return writeFileAtomic(target, []byte(replaced), info)
 }
 
 // writeFileAtomic writes data to a temp file beside target and renames it
-// over target, so readers see the old or the new content, never a mix.
-func writeFileAtomic(target string, data []byte, perm os.FileMode) error {
+// over target, so readers see the old or the new content, never a mix. The
+// new file keeps the old one's mode (setuid, setgid and sticky included) and,
+// as far as toolboxd may, its owner and group, as the atomic upload does
+// (writeUploadAtomic): a rename otherwise leaves the file owned by toolboxd's
+// user. A chown that is refused (toolboxd not root) leaves that owner.
+func writeFileAtomic(target string, data []byte, previous os.FileInfo) error {
+	perm := previous.Mode() & (os.ModePerm | os.ModeSetuid | os.ModeSetgid | os.ModeSticky)
 	tmp, err := os.CreateTemp(filepath.Dir(target), "."+filepath.Base(target)+".replace-*")
 	if err != nil {
 		return err
@@ -97,6 +109,10 @@ func writeFileAtomic(target string, data []byte, perm os.FileMode) error {
 		cleanup()
 		return err
 	}
+	if stat, ok := previous.Sys().(*syscall.Stat_t); ok {
+		_ = tmp.Chown(int(stat.Uid), int(stat.Gid))
+	}
+	// After the chown: changing the owner clears setuid and setgid.
 	if err := tmp.Chmod(perm); err != nil {
 		_ = tmp.Close()
 		cleanup()

@@ -102,6 +102,49 @@ func TestDaytonaCreateFolderRoute(t *testing.T) {
 	}
 }
 
+// A replace edits the file a symlink points to and leaves the link a link;
+// the file keeps its setuid bit (a rename used to drop it with the owner).
+func TestDaytonaReplaceKeepsLinksAndModeBits(t *testing.T) {
+	h := authedRoutes(newDaytonaTestServer(t))
+	root := t.TempDir()
+	real := filepath.Join(root, "real.sh")
+	link := filepath.Join(root, "link.sh")
+	mustWrite(t, real, "echo a.b.c")
+	if err := os.Chmod(real, 0o4755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(real, link); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.Stat(real)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := json.Marshal(daytonaReplaceRequest{Files: []string{link}, Pattern: "a.b.c", NewValue: "X"})
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/files/replace", bytes.NewReader(body)))
+	var results []daytonaReplaceResult
+	if err := json.Unmarshal(rr.Body.Bytes(), &results); err != nil || len(results) != 1 || !results[0].Success {
+		t.Fatalf("replace = %d %s (%v)", rr.Code, rr.Body.String(), err)
+	}
+	if fi, err := os.Lstat(link); err != nil || fi.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("link.sh is no longer a symlink: %v %v", fi.Mode(), err)
+	}
+	if got := mustRead(t, real); got != "echo X" {
+		t.Fatalf("real.sh = %q, want the replace applied through the link", got)
+	}
+	after, err := os.Stat(real)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.Mode()&(os.ModePerm|os.ModeSetuid) != before.Mode()&(os.ModePerm|os.ModeSetuid) {
+		t.Fatalf("real.sh mode = %v, want %v kept", after.Mode(), before.Mode())
+	}
+	if b, a := before.Sys().(*syscall.Stat_t), after.Sys().(*syscall.Stat_t); b.Uid != a.Uid || b.Gid != a.Gid {
+		t.Fatalf("owner = %d:%d, want %d:%d kept", a.Uid, a.Gid, b.Uid, b.Gid)
+	}
+}
+
 func TestDaytonaReplaceInFilesRoute(t *testing.T) {
 	h := authedRoutes(newDaytonaTestServer(t))
 	root := t.TempDir()
@@ -303,14 +346,20 @@ func TestUnknownRouteIsMarkedMissing(t *testing.T) {
 
 func TestWriteFileAtomicFailuresLeaveNoTempFile(t *testing.T) {
 	root := t.TempDir()
-	if err := writeFileAtomic(filepath.Join(root, "missing-dir", "f"), []byte("x"), 0o644); err == nil {
+	ref := filepath.Join(t.TempDir(), "ref")
+	mustWrite(t, ref, "x")
+	info, err := os.Stat(ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writeFileAtomic(filepath.Join(root, "missing-dir", "f"), []byte("x"), info); err == nil {
 		t.Fatal("write into a missing folder succeeded")
 	}
 	// Renaming over a folder fails after the temp file is written; the temp
 	// file must be removed.
 	target := filepath.Join(root, "dir")
 	mustWrite(t, filepath.Join(target, "inner"), "x")
-	if err := writeFileAtomic(target, []byte("x"), 0o644); err == nil {
+	if err := writeFileAtomic(target, []byte("x"), info); err == nil {
 		t.Fatal("rename over a non-empty folder succeeded")
 	}
 	leftovers, _ := filepath.Glob(filepath.Join(root, ".*replace-*"))
