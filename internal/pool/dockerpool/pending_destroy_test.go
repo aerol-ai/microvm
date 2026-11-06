@@ -214,9 +214,10 @@ func TestFailedTeardownIsKeptChargedAndRetriedUntilGone(t *testing.T) {
 	}
 }
 
-// A retry never touches what the address keys: the first attempt cleared
-// it, and a container that is really gone may have passed the address on.
-func TestPendingTeardownRetryStripsAddressAndHandle(t *testing.T) {
+// A retry is marked as one and carries no handle (the first attempt closed
+// it). It keeps the address: containerd clears its rules only once the
+// container is confirmed gone, and docker skips the address on a retry.
+func TestPendingTeardownRetryIsMarkedAndKeepsAddress(t *testing.T) {
 	h := newPendingHarness(t, 1)
 	key := testKey()
 	h.p.NoteTarget(key)
@@ -226,13 +227,13 @@ func TestPendingTeardownRetryStripsAddressAndHandle(t *testing.T) {
 		t.Fatalf("teardown calls = %d, want the close plus its one retry", len(h.sp.seen))
 	}
 	first, retry := h.sp.seen[0], h.sp.seen[1]
-	if first.ContainerIP == "" || first.Handle == nil {
-		t.Fatal("the first teardown must get the full slot")
+	if first.ContainerIP == "" || first.Handle == nil || first.TeardownRetry {
+		t.Fatal("the first teardown must get the full, unmarked slot")
 	}
-	if retry.ContainerIP != "" || retry.Handle != nil || retry.BootstrapToken != "" {
-		t.Fatalf("retry carried address/handle state: %+v", retry)
+	if !retry.TeardownRetry || retry.Handle != nil || retry.BootstrapToken != "" {
+		t.Fatalf("retry = %+v, want marked, without handle or token", retry)
 	}
-	if retry.ID != "park-a" || retry.ContainerID != "ctr-a" || retry.ImageID != "img" || retry.Key != key {
+	if retry.ID != "park-a" || retry.ContainerID != "ctr-a" || retry.ContainerIP != "10.0.0.9" || retry.ImageID != "img" || retry.Key != key {
 		t.Fatalf("retry lost the container identity: %+v", retry)
 	}
 	if !h.wasReleased("park-a") {

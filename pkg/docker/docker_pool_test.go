@@ -624,6 +624,44 @@ func TestDestroyParkedClearsRulesAndContainer(t *testing.T) {
 	}
 }
 
+// Docker frees a container's address with the container, so the park's
+// address rules are cleared before the removal, and only on the first
+// attempt. A retry of a teardown that failed (TeardownRetry) only removes
+// the container: by then it may be gone and the address handed to another
+// container, whose rules a late clear would wipe.
+func TestDestroyParkedRetryLeavesAddressAlone(t *testing.T) {
+	const ip = "10.0.0.6"
+	parkDrop := []string{"-s", ip, "-j", "DROP"}
+	for _, tc := range []struct {
+		name      string
+		retry     bool
+		wantRules bool
+	}{
+		{"first attempt clears the address first", false, false},
+		{"retry leaves the address alone", true, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			backend := &memRuleBackend{}
+			rules := netrules.NewWithBackend(backend)
+			if err := rules.BlockAllEgress(ip); err != nil {
+				t.Fatal(err)
+			}
+			d := &poolFakeDaemon{t: t}
+			c := newPoolClient(t, d, func(c *Client) { c.networkRules = rules })
+			slot := &dockerpool.ParkedSlot{ID: "park-r", ContainerID: "cid-r", ContainerIP: ip, TeardownRetry: tc.retry}
+			if err := c.destroyParked(context.Background(), slot); err != nil {
+				t.Fatalf("destroy: %v", err)
+			}
+			if d.removeCalls != 1 {
+				t.Fatalf("remove calls = %d, want the container removed", d.removeCalls)
+			}
+			if got := backend.has(parkDrop...); got != tc.wantRules {
+				t.Fatalf("park DROP present = %v, want %v", got, tc.wantRules)
+			}
+		})
+	}
+}
+
 func TestApplyAdoptNetworkPolicyEgressLists(t *testing.T) {
 	c := &Client{networkRules: disabledRules(t)}
 	req := models.CreateSandboxRequest{

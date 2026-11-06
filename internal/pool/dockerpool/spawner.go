@@ -11,6 +11,12 @@ type ParkedSlot struct {
 	Key            Key
 	BootstrapToken string
 	Handle         SpawnerHandle
+	// TeardownRetry marks the copy the pool passes to DestroyParked when it
+	// retries a teardown that failed (pending_destroy.go). The engine's
+	// first attempt already closed the handle and did what must happen
+	// before the container goes; a retry only removes the container and
+	// what must wait for its absence.
+	TeardownRetry bool
 }
 
 // SpawnerHandle is the host-side parked connection and listener state.

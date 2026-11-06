@@ -25,11 +25,14 @@ import (
 // released. A restart drops the list; the boot purge covers that case, as
 // it always has.
 //
-// A retry passes a stripped copy of the slot: no address, no handle. Both
-// engines clear what is keyed by the address and close the handle before
-// the engine call that can fail, so that part is already done. And once the
-// container is really gone, its address may belong to another container,
-// whose rules a second clear would wipe.
+// A retry passes a copy of the slot marked TeardownRetry, without its handle
+// (the first attempt closed it). What the address keys depends on who owns
+// the address. Docker frees it with the container, so the docker engine
+// clears the address's rules before the removal, on the first attempt only:
+// on a retry the container may already be gone and the address another
+// container's. containerd's address belongs to the netns slot, so it clears
+// the rules and frees the slot only after the container is confirmed gone,
+// and the retry needs the address for that.
 
 const (
 	// parkDestroyTimeout bounds one engine teardown call, so a hung engine
@@ -107,7 +110,7 @@ func (p *Pool) retainFailedDestroy(slot *ParkedSlot, release func(string), err e
 	now := p.clock()
 	e := &pendingDestroy{
 		key:     key,
-		slot:    &ParkedSlot{ID: slot.ID, ContainerID: slot.ContainerID, ImageID: slot.ImageID, Key: slot.Key},
+		slot:    &ParkedSlot{ID: slot.ID, ContainerID: slot.ContainerID, ContainerIP: slot.ContainerIP, ImageID: slot.ImageID, Key: slot.Key, TeardownRetry: true},
 		release: release,
 		since:   now,
 		next:    now.Add(pendingDestroyDelay(1)),

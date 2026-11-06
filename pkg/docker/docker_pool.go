@@ -530,8 +530,13 @@ func (c *Client) destroyParked(ctx context.Context, slot *dockerpool.ParkedSlot)
 	}
 	// The slot holds its address until it is removed: everything keyed by
 	// the address goes first (the park block, and anything an adopt
-	// that failed half way put there).
-	if slot.ContainerIP != "" {
+	// that failed half way put there). Docker frees the address with the
+	// container, so this is the only safe moment: a clear after the removal
+	// could hit the next container given the address. If the removal then
+	// fails the container keeps its address (no other can share it) and the
+	// pool retries; a retry (TeardownRetry) skips the address, since by then
+	// the container may be gone and the address someone else's.
+	if slot.ContainerIP != "" && !slot.TeardownRetry {
 		_ = c.networkRules.ClearAddress(slot.ContainerIP)
 	}
 	if slot.Handle != nil {

@@ -11,6 +11,7 @@ import (
 
 	"github.com/aerol-ai/microvm/internal/pool/containerdpool"
 	"github.com/aerol-ai/microvm/pkg/createtiming"
+	"github.com/aerol-ai/microvm/pkg/docker/netrules"
 	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/aerol-ai/microvm/pkg/mounts"
 )
@@ -316,5 +317,58 @@ func TestDestroyParkedTreatsMissingContainerAsGone(t *testing.T) {
 				t.Fatalf("destroyParked err = %v, want error %v", err, tc.wantErr)
 			}
 		})
+	}
+}
+
+// A parked container whose delete fails keeps its netns slot and its park
+// block: freeing the slot while the container still runs in it would let
+// the pool hand the slot to another sandbox, two sandboxes on one network.
+// Once the container is confirmed gone (here on the pool's retry), the
+// rules are cleared while the slot still holds the address, and the slot is
+// released, once.
+func TestDestroyParkedHoldsNetnsSlotUntilContainerGone(t *testing.T) {
+	be := &netrulesMemBackend{}
+	d := New(Config{}, netrules.NewWithBackend(be), nil)
+	ns := &fakeNetnsHandoff{}
+	d.SetNetnsHandoff(ns)
+	const ip = "10.88.0.9"
+	if err := d.ApplyNetworkBlockAll(ip); err != nil {
+		t.Fatal(err)
+	}
+	blocked := func() bool {
+		for _, r := range be.rules {
+			if strings.Contains(r, ip) {
+				return true
+			}
+		}
+		return false
+	}
+	if !blocked() {
+		t.Fatal("setup: the park block is not in place")
+	}
+	slot := &containerdpool.ParkedSlot{ID: "park-n", ContainerID: "park-n", ContainerIP: ip}
+
+	stuck := newFakeTransport()
+	stuck.loadContainerFn = func(context.Context, string) (cntr.Container, error) { return nil, errors.New("engine busy") }
+	d.SetClient(NewTestClient("aerolvm", stuck))
+	if err := d.destroyParked(context.Background(), slot); err == nil {
+		t.Fatal("a failed delete must be reported so the pool retries it")
+	}
+	if ns.relCalls != 0 {
+		t.Fatalf("netns slot released %d times while the container may still run in it", ns.relCalls)
+	}
+	if !blocked() {
+		t.Fatal("the park block was cleared while the container may still run")
+	}
+
+	d.SetClient(NewTestClient("aerolvm", newFakeTransport())) // the retry finds it gone
+	if err := d.destroyParked(context.Background(), slot); err != nil {
+		t.Fatal(err)
+	}
+	if ns.relCalls != 1 {
+		t.Fatalf("netns slot released %d times on confirmed absence, want once", ns.relCalls)
+	}
+	if blocked() {
+		t.Fatal("the address's rules must be cleared once the container is gone")
 	}
 }
