@@ -137,6 +137,9 @@ _FEATURE_FILE_VERBS = "files.verbs"
 _FEATURE_WRITE_OPTIONS = "files.write_options"
 # The toolboxd feature behind upload's extract=true (upload_dir).
 _FEATURE_EXTRACT = "files.extract"
+# A safety cap on the pages one list reads (enough for 100k sandboxes at a
+# page size of 1), so a server that never ends a list cannot loop forever.
+_MAX_LIST_PAGES = 100000
 # The entry cap list_files sends when the caller gives none.
 DEFAULT_LIST_LIMIT = 10000
 # Error codes toolboxd puts on the file errors a retry acts on: a retried
@@ -710,7 +713,49 @@ class FileWatchHandle:
                 pass
 
 
-class Sandbox:
+class _SandboxBase:
+    """The state Sandbox and AsyncSandbox share: the server's record of the
+    sandbox, read as attributes, and the delete-on-exit flag."""
+
+    def __init__(self, client: Any, data: SandboxData) -> None:
+        self._client = client
+        self._data = data
+        # Opt-in (plan S2): leaving a with block must not delete a sandbox
+        # nobody asked to delete.
+        self.destroy_on_exit = False
+        self._closed = False
+
+    def to_dict(self) -> SandboxData:
+        return dict(self._data)
+
+    @property
+    def id(self) -> str:
+        return str(self._data.get("id", ""))
+
+    def __getattr__(self, name: str) -> Any:
+        if name in self._data:
+            return self._data[name]
+        raise AttributeError(f"Sandbox object has no attribute {name}")
+
+    def _apply_network_policy(self, policy: NetworkPolicy) -> None:
+        """Keeps this object's policy fields in step with a policy the
+        server just applied."""
+        self._data["networkBlockAll"] = policy["networkBlockAll"]
+        if policy.get("networkEgressMode") == "learn":
+            self._data["networkEgressMode"] = "learn"
+        else:
+            self._data.pop("networkEgressMode", None)
+        if policy.get("networkEgressRules"):
+            self._data["networkEgressRules"] = policy["networkEgressRules"]
+        else:
+            self._data.pop("networkEgressRules", None)
+        if "egressStatus" in policy:
+            self._data["egressStatus"] = policy["egressStatus"]
+        else:
+            self._data.pop("egressStatus", None)
+
+
+class Sandbox(_SandboxBase):
     """A sandbox, as returned by :meth:`MicroVM.create`, :meth:`MicroVM.get`
     and the other calls that return one.
 
@@ -720,14 +765,6 @@ class Sandbox:
     :meth:`MicroVM.get_or_create`, or set the attribute). By default the
     sandbox keeps running after the block, as it would without one.
     """
-
-    def __init__(self, client: "MicroVM", data: SandboxData) -> None:
-        self._client = client
-        self._data = data
-        # Opt-in (plan S2): leaving a with block must not delete a sandbox
-        # nobody asked to delete.
-        self.destroy_on_exit = False
-        self._closed = False
 
     def __enter__(self) -> "Sandbox":
         return self
@@ -756,9 +793,6 @@ class Sandbox:
         except MicroVMNotFoundError:
             pass
         self._closed = True
-
-    def to_dict(self) -> SandboxData:
-        return dict(self._data)
 
     @_timed
     def refresh(self, *, timeout: Optional[float] = None) -> "Sandbox":
@@ -1008,19 +1042,7 @@ class Sandbox:
         the new policy is enforced; the same policy again is a no-op, so it
         is safe to retry."""
         policy = self._client.set_network_policy(self.id, options)
-        self._data["networkBlockAll"] = policy["networkBlockAll"]
-        if policy.get("networkEgressMode") == "learn":
-            self._data["networkEgressMode"] = "learn"
-        else:
-            self._data.pop("networkEgressMode", None)
-        if policy.get("networkEgressRules"):
-            self._data["networkEgressRules"] = policy["networkEgressRules"]
-        else:
-            self._data.pop("networkEgressRules", None)
-        if "egressStatus" in policy:
-            self._data["egressStatus"] = policy["egressStatus"]
-        else:
-            self._data.pop("egressStatus", None)
+        self._apply_network_policy(policy)
         return policy
 
     @_timed
@@ -1035,26 +1057,35 @@ class Sandbox:
         denials (``kind="egress"``) and secret reads."""
         return self._client.get_audit(self.id, options)
 
-    @property
-    def id(self) -> str:
-        return str(self._data.get("id", ""))
 
-    def __getattr__(self, name: str) -> Any:
-        if name in self._data:
-            return self._data[name]
-        raise AttributeError(f"Sandbox object has no attribute {name}")
+class _Call:
+    """One I/O step an op asks its client to run: the transport method's
+    name and its arguments, passed through unchanged."""
+
+    __slots__ = ("name", "args", "kwargs")
+
+    def __init__(self, name: str, args: Tuple[Any, ...], kwargs: Dict[str, Any]) -> None:
+        self.name = name
+        self.args = args
+        self.kwargs = kwargs
 
 
-class MicroVM:
-    """A client for an AerolVM server.
+def _io(name: str, *args: Any, **kwargs: Any) -> _Call:
+    return _Call(name, args, kwargs)
 
-    Every method that talks to the server takes a keyword-only ``timeout``
-    in seconds. The whole call, its automatic retries and the waits between
-    them included, must finish within it, or it raises
-    :class:`MicroVMTimeoutError` (``status_code`` 0). A call that opens a
-    stream (:meth:`exec_stream`, :meth:`attach_session`, :meth:`watch_files`)
-    is bounded until the stream is open, never for its life. Without a
-    timeout a call waits as long as the server takes, as before.
+
+class _MicroVMCore:
+    """What MicroVM and AsyncMicroVM share: configuration, and every call
+    written once as an ``_op_*`` generator (plan S1).
+
+    An op builds its request and reads the answer; the I/O in between is a
+    ``yield _io(name, *args)`` naming one of the client's transport methods
+    (``_do_json``, ``_request``, ...). MicroVM's ``_run`` answers each with
+    its blocking urllib method; AsyncMicroVM's awaits its httpx one. Request
+    building, retry tiers, error mapping and the multi-step flows (the
+    /version check before an option, get_or_create's race handling) live
+    here once, so the two clients cannot drift; the transports differ only
+    in how bytes move.
     """
 
     default_api_url = "http://127.0.0.1:21212"
@@ -1141,8 +1172,7 @@ class MicroVM:
         """
         return f"{self._version_prefix}{suffix}"
 
-    @_timed
-    def create(self, options: Optional[CreateOptions] = None, *, timeout: Optional[float] = None, **fields: Any) -> Sandbox:
+    def _op_create(self, options: Optional[CreateOptions] = None, **fields: Any):
         # Keyword arguments are the same fields as the options dict, in either
         # spelling (memory_mb or memoryMB), so create(image="python:3.12")
         # and create({"image": "python:3.12"}) send the same request. A
@@ -1150,41 +1180,31 @@ class MicroVM:
         resolved_options: Dict[str, Any] = {**(options or {}), **fields}
         # Client-side only: _to_api_create_options never sends it.
         destroy_on_exit = bool(_first_of(resolved_options, "destroy_on_exit", "destroyOnExit"))
-        resolved_options["image"] = self._resolve_image(_first_of(resolved_options, "image"))
+        resolved_options["image"] = (yield from self._op_resolve_image(_first_of(resolved_options, "image")))
         # One key per call, sent unchanged on each of its automatic retries: a
         # create retried after a timeout gets back the sandbox the first
         # attempt made instead of making a second one.
         key = str(_first_of(resolved_options, "idempotency_key", "idempotencyKey") or "").strip() or _new_idempotency_key()
-        sandbox = self._do_json(
+        sandbox = (yield _io("_do_json",
             "POST",
             self._versioned("/sandboxes"),
             _to_api_create_options(resolved_options),
             headers={IDEMPOTENCY_KEY_HEADER: key},
-        )
+        ))
         wrapped = self._wrap_sandbox(sandbox)
         wrapped.destroy_on_exit = destroy_on_exit
         return wrapped
 
-    @_timed
-    def build_image(self, image: Image, *, timeout: Optional[float] = None) -> str:
-        result = self.build_image_with_push(image, push=None)
+    def _op_build_image(self, image: Image):
+        result = (yield from self._op_build_image_with_push(image, push=None))
         return result.image
 
-    @_timed
-    def build_image_with_push(
+    def _op_build_image_with_push(
         self,
         image: Image,
         *,
         push: Optional[BuildImagePushOptions] = None,
-        timeout: Optional[float] = None,
-    ) -> BuildImageResult:
-        """Build an Image and optionally push the result to a remote registry.
-
-        When ``push`` is ``None``, behavior matches :meth:`build_image`.
-        Push credentials are forwarded to the daemon as a one-shot
-        ``X-Registry-Auth`` header on the underlying push call and are never
-        persisted server-side.
-        """
+    ):
         if not isinstance(image, Image):
             raise TypeError("build_image expects an Image instance")
         body: Dict[str, Any] = {"dockerfile_content": image.dockerfile}
@@ -1211,7 +1231,7 @@ class MicroVM:
 
         path = self._versioned("/images/build")
         try:
-            payload = self._do_json("POST", path, body)
+            payload = (yield _io("_do_json", "POST", path, body))
         except MicroVMHTTPError as exc:
             if exc.status_code == 404:
                 raise MicroVMError(
@@ -1223,64 +1243,41 @@ class MicroVM:
         pushed: Optional[str] = str(pushed_value) if pushed_value else None
         return BuildImageResult(image=image_tag, pushed=pushed)
 
-    @_timed
-    def list(
+    def _op_list(
         self,
         *,
         tags: Optional[Dict[str, str]] = None,
         include_env: bool = False,
         name: Optional[str] = None,
-        timeout: Optional[float] = None,
-    ) -> List[Sandbox]:
-        """List sandboxes. ``name`` filters to the caller's sandbox with exactly
-        that name (``?name=``). Servers that predate name lookup ignore the
-        filter and return a normal list; prefer :meth:`get_by_name`, which
-        checks the reply."""
-        items: List[Sandbox] = []
-        for page in self.iter_pages(tags=tags, include_env=include_env, name=name):
-            items.extend(page)
-        return items
+    ):
+        return (yield from self._op_list_all(tags, include_env, name))
 
-    def iter_pages(
-        self,
-        *,
-        tags: Optional[Dict[str, str]] = None,
-        include_env: bool = False,
-        name: Optional[str] = None,
-        timeout: Optional[float] = None,
-    ) -> Iterator[List[Sandbox]]:
-        """Yield one server page at a time for bounded-memory fleet scans.
-        ``timeout`` bounds each page's request, not the whole scan."""
+    def _op_list_page(self, base_path: str, page_token: str):
+        path = _append_query_param(base_path, "page_token", page_token)
+        sandboxes, headers = (yield _io("_do_json_headers", "GET", path, None))
+        partial = headers.get("X-Cluster-List-Partial", "")
+        ready = headers.get("X-Cluster-List-Placement-Ready", "")
+        if partial == "true" or ready == "false":
+            raise MicroVMError("incomplete cluster list")
+        return [self._wrap_sandbox(item) for item in sandboxes or []], (headers.get("X-Cluster-List-Next-Page-Token") or "").strip()
+
+    def _op_list_all(self, tags: Optional[Dict[str, str]], include_env: bool, name: Optional[str]):
         base_path = self._versioned("/sandboxes") + _build_sandbox_query(tags, include_env, name)
+        items: List[Sandbox] = []
         page_token = ""
-        for _ in range(100000):
-            path = _append_query_param(base_path, "page_token", page_token)
-            # Not held across the yield: the caller's code between pages is
-            # not part of a request.
-            with _call_deadline(timeout):
-                sandboxes, headers = self._do_json_headers("GET", path, None)
-            partial = headers.get("X-Cluster-List-Partial", "")
-            ready = headers.get("X-Cluster-List-Placement-Ready", "")
-            if partial == "true" or ready == "false":
-                raise MicroVMError("incomplete cluster list")
-            yield [self._wrap_sandbox(item) for item in sandboxes or []]
-            page_token = (headers.get("X-Cluster-List-Next-Page-Token") or "").strip()
+        for _ in range(_MAX_LIST_PAGES):
+            page, page_token = (yield from self._op_list_page(base_path, page_token))
+            items.extend(page)
             if page_token == "":
-                return
+                return items
         raise MicroVMError("incomplete cluster list: exceeded max pages")
 
-    @_timed
-    def get_by_name(self, name: str, *, include_env: bool = False, timeout: Optional[float] = None) -> Optional[Sandbox]:
-        """Return the caller's sandbox with this name, or ``None`` if there is
-        none. Names are unique per owner. The reply is only trusted when it holds
-        at most one sandbox carrying the requested name: a server that predates
-        ``?name=`` ignores the filter and returns an ordinary list page, and
-        acting on its first row would target the wrong sandbox."""
+    def _op_get_by_name(self, name: str, *, include_env: bool = False):
         wanted = (name or "").strip()
         if not wanted:
             raise ValueError("sandbox name is required")
         path = self._versioned("/sandboxes") + _build_sandbox_query(None, include_env, wanted)
-        sandboxes = self._do_json("GET", path, None) or []
+        sandboxes = (yield _io("_do_json", "GET", path, None)) or []
         if not sandboxes:
             return None
         if len(sandboxes) > 1 or str(_first_of(sandboxes[0], "name") or "") != wanted:
@@ -1289,19 +1286,7 @@ class MicroVM:
             )
         return self._wrap_sandbox(sandboxes[0])
 
-    @_timed
-    def get_or_create(self, name: str, options: Optional[CreateOptions] = None, *, timeout: Optional[float] = None, **fields: Any) -> Tuple[Sandbox, bool]:
-        """Return the caller's sandbox called ``name``, creating it from
-        ``options`` (the same fields as :meth:`create`) when there is none.
-        Returns ``(sandbox, created)``; ``created`` is True only when this
-        call made the sandbox.
-
-        Safe to retry and to run at the same time from many processes. Names
-        are unique per owner, so when two callers race to create the same
-        name, one gets a 409 and reads the winner's sandbox instead. An
-        existing sandbox is returned as it is: its image and other settings
-        are not compared with ``options``.
-        """
+    def _op_get_or_create(self, name: str, options: Optional[CreateOptions] = None, **fields: Any):
         wanted = (name or "").strip()
         if not wanted:
             raise ValueError("sandbox name is required")
@@ -1311,56 +1296,45 @@ class MicroVM:
             raise ValueError(f"options name {given!r} differs from {wanted!r}")
         resolved["name"] = wanted
         destroy_on_exit = bool(_first_of(resolved, "destroy_on_exit", "destroyOnExit"))
-        existing = self.get_by_name(wanted)
+        existing = (yield from self._op_get_by_name(wanted))
         if existing is not None:
             existing.destroy_on_exit = destroy_on_exit
             return existing, False
         try:
-            return self.create(resolved), True
+            return (yield from self._op_create(resolved)), True
         except MicroVMConflictError:
             # Another caller created the name between the lookup and the
             # create. A 409 whose name still cannot be found is a conflict on
             # something else, so the create's own error stands.
-            winner = self.get_by_name(wanted)
+            winner = (yield from self._op_get_by_name(wanted))
             if winner is None:
                 raise
             winner.destroy_on_exit = destroy_on_exit
             return winner, False
 
-    @_timed
-    def get(self, sandbox_id: str, *, include_env: bool = False, timeout: Optional[float] = None) -> Sandbox:
+    def _op_get(self, sandbox_id: str, *, include_env: bool = False):
         path = f"{self._version_prefix}/sandboxes/{sandbox_id}" + _build_sandbox_query(None, include_env)
-        sandbox = self._do_json("GET", path, None)
+        sandbox = (yield _io("_do_json", "GET", path, None))
         return self._wrap_sandbox(sandbox)
 
-    @_timed
-    def start(self, sandbox_id: str, *, timeout: Optional[float] = None) -> Sandbox:
-        sandbox = self._do_json("POST", f"{self._version_prefix}/sandboxes/{sandbox_id}/start", None)
+    def _op_start(self, sandbox_id: str):
+        sandbox = (yield _io("_do_json", "POST", f"{self._version_prefix}/sandboxes/{sandbox_id}/start", None))
         return self._wrap_sandbox(sandbox)
 
-    @_timed
-    def stop(self, sandbox_id: str, *, timeout: Optional[float] = None) -> Sandbox:
-        sandbox = self._do_json("POST", f"{self._version_prefix}/sandboxes/{sandbox_id}/stop", None)
+    def _op_stop(self, sandbox_id: str):
+        sandbox = (yield _io("_do_json", "POST", f"{self._version_prefix}/sandboxes/{sandbox_id}/stop", None))
         return self._wrap_sandbox(sandbox)
 
-    @_timed
-    def create_snapshot(
-        self, sandbox_id: str, name: str, *, allow_pause: Optional[bool] = None, timeout: Optional[float] = None
-    ) -> SandboxSnapshot:
-        """Save a sandbox's files as a snapshot named ``name``.
-
-        A running sandbox is paused briefly while it is copied (its disk
-        writes wait) and keeps running. Pass ``allow_pause=False`` to have a
-        sandbox that is not stopped refused (HTTP 409) instead.
-        """
+    def _op_create_snapshot(
+        self, sandbox_id: str, name: str, *, allow_pause: Optional[bool] = None
+    ):
         body: Dict[str, Any] = {"name": name}
         if allow_pause is not None:
             body["allow_pause"] = allow_pause
-        response = self._do_json("POST", f"{self._version_prefix}/sandboxes/{sandbox_id}/snapshot", body)
+        response = (yield _io("_do_json", "POST", f"{self._version_prefix}/sandboxes/{sandbox_id}/snapshot", body))
         return _from_api_sandbox_snapshot(response)
 
-    @_timed
-    def register_snapshot(self, options: RegisterSnapshotOptions, *, timeout: Optional[float] = None) -> SandboxSnapshot:
+    def _op_register_snapshot(self, options: RegisterSnapshotOptions):
         name = str(_first_of(options, "name") or "").strip()
         if name == "":
             raise MicroVMError("name is required")
@@ -1372,7 +1346,7 @@ class MicroVM:
         if image != "" and dockerfile_content != "":
             raise MicroVMError("image and dockerfile_content are mutually exclusive")
 
-        response = self._do_json(
+        response = (yield _io("_do_json",
             "POST",
             self._versioned("/snapshots"),
             _to_api_register_snapshot_options(
@@ -1384,43 +1358,31 @@ class MicroVM:
                     "regionID": str(_first_of(options, "regionID", "region_id") or "").strip() or None,
                 }
             ),
-        )
+        ))
         return _from_api_sandbox_snapshot(response)
 
-    @_timed
-    def register_snapshot_from_image(
+    def _op_register_snapshot_from_image(
         self,
         name: str,
         image: Image,
         options: Optional[RegisterSnapshotOptions] = None,
-        *,
-        timeout: Optional[float] = None,
-    ) -> SandboxSnapshot:
+    ):
         if not isinstance(image, Image):
             raise TypeError("register_snapshot_from_image expects an Image instance")
         resolved_options: RegisterSnapshotOptions = dict(options or {})
         resolved_options["name"] = name
         resolved_options.pop("image", None)
         resolved_options["dockerfileContent"] = image.dockerfile
-        return self.register_snapshot(resolved_options)
+        return (yield from self._op_register_snapshot(resolved_options))
 
-    @_timed
-    def get_snapshot(self, name: str, *, timeout: Optional[float] = None) -> SandboxSnapshot:
-        """Look a snapshot up by name. In a cluster the request is routed to
-        the node holding the image."""
-        return _from_api_sandbox_snapshot(self._do_json("GET", self._snapshot_path(name), None) or {})
+    def _op_get_snapshot(self, name: str):
+        return _from_api_sandbox_snapshot((yield _io("_do_json", "GET", self._snapshot_path(name), None)) or {})
 
-    @_timed
-    def list_snapshots(
+    def _op_list_snapshots(
         self,
         limit: Optional[int] = None,
         starting_after: Optional[str] = None,
-        *,
-        timeout: Optional[float] = None,
-    ) -> SnapshotList:
-        """List the caller's snapshots, one name-ordered page at a time.
-        ``starting_after`` is the exclusive name cursor — pass the last name of
-        the previous page to fetch the next one."""
+    ):
         params: Dict[str, str] = {}
         if limit:
             params["limit"] = str(int(limit))
@@ -1429,62 +1391,35 @@ class MicroVM:
         path = self._versioned("/snapshots")
         if params:
             path += "?" + urllib.parse.urlencode(params)
-        payload = self._do_json("GET", path, None) or {}
+        payload = (yield _io("_do_json", "GET", path, None)) or {}
         return {
             "snapshots": [_from_api_sandbox_snapshot(s) for s in payload.get("snapshots") or []],
             "hasMore": bool(payload.get("has_more")),
         }
 
-    @_timed
-    def delete_snapshot(self, name: str, *, timeout: Optional[float] = None) -> None:
-        """Delete a snapshot by name (idempotent 404 if it does not exist)."""
-        self._do_json("DELETE", self._snapshot_path(name), None)
+    def _op_delete_snapshot(self, name: str):
+        yield _io("_do_json", "DELETE", self._snapshot_path(name), None)
 
     def _snapshot_path(self, name: str) -> str:
         return f"{self._version_prefix}/snapshots/{urllib.parse.quote(name, safe='')}"
 
-    @_timed
-    def destroy(self, sandbox_id: str, *, timeout: Optional[float] = None) -> None:
-        self._do_json("DELETE", f"{self._version_prefix}/sandboxes/{sandbox_id}", None)
+    def _op_destroy(self, sandbox_id: str):
+        yield _io("_do_json", "DELETE", f"{self._version_prefix}/sandboxes/{sandbox_id}", None)
 
-    @_timed
-    def destroy_all(self, *, tags: Dict[str, str], timeout: Optional[float] = None) -> List[str]:
-        """Delete every sandbox of yours that carries all of ``tags`` and
-        return the IDs of the ones that are now gone.
-
-        It lists the matches first (every page), then deletes them one at a
-        time. A sandbox that is already gone (404) counts as deleted, so a
-        second call, or two calls at once, is safe. If a delete fails any
-        other way, it stops and raises that error; the sandboxes it already
-        deleted stay deleted, and calling it again finishes the job.
-
-        ``tags`` must not be empty: with no filter this would delete every
-        sandbox you own.
-        """
+    def _op_destroy_all(self, *, tags: Dict[str, str]):
         if not tags:
             raise ValueError("destroy_all needs at least one tag; with none it would delete every sandbox you own")
-        ids = [sandbox.id for page in self.iter_pages(tags=tags) for sandbox in page]
+        ids = [sandbox.id for sandbox in (yield from self._op_list_all(tags, False, None))]
         gone: List[str] = []
         for sandbox_id in ids:
             try:
-                self.destroy(sandbox_id)
+                yield from self._op_destroy(sandbox_id)
             except MicroVMNotFoundError:
                 pass
             gone.append(sandbox_id)
         return gone
 
-    @_timed
-    def create_template(self, options: CreateTemplateOptions, *, timeout: Optional[float] = None) -> Template:
-        """Register a Firecracker rootfs template.
-
-        Returns a row in ``status: "pending"`` and kicks the daemon's
-        async build. Poll :meth:`get_template` until ``status`` reaches
-        ``"ready"`` (fast-boot available) or ``"ready_no_snapshot"``
-        (cold boot only).
-
-        Idempotent when ``options["id"]`` is set: a duplicate ID
-        returns 409 so a retried CI step does not create two rows.
-        """
+    def _op_create_template(self, options: CreateTemplateOptions):
         body: Dict[str, Any] = {}
         tpl_id = str(_first_of(options, "id") or "").strip()
         if tpl_id:
@@ -1496,35 +1431,25 @@ class MicroVM:
         min_size = _first_of(options, "minSizeMiB", "min_size_mib")
         if min_size is not None:
             body["min_size_mib"] = int(min_size)
-        response = self._do_json("POST", self._versioned("/templates"), body)
+        response = (yield _io("_do_json", "POST", self._versioned("/templates"), body))
         return _from_api_template(response)
 
-    @_timed
-    def list_templates(self, *, timeout: Optional[float] = None) -> List[Template]:
-        response = self._do_json("GET", self._versioned("/templates"), None)
+    def _op_list_templates(self):
+        response = (yield _io("_do_json", "GET", self._versioned("/templates"), None))
         if response is None:
             return []
         if not isinstance(response, list):
             raise MicroVMError("expected JSON array from /v1/templates")
         return [_from_api_template(item) for item in response]
 
-    @_timed
-    def get_template(self, template_id: str, *, timeout: Optional[float] = None) -> Template:
-        response = self._do_json("GET", f"{self._version_prefix}/templates/{template_id}", None)
+    def _op_get_template(self, template_id: str):
+        response = (yield _io("_do_json", "GET", f"{self._version_prefix}/templates/{template_id}", None))
         return _from_api_template(response)
 
-    @_timed
-    def delete_template(self, template_id: str, *, timeout: Optional[float] = None) -> None:
-        self._do_json("DELETE", f"{self._version_prefix}/templates/{template_id}", None)
+    def _op_delete_template(self, template_id: str):
+        yield _io("_do_json", "DELETE", f"{self._version_prefix}/templates/{template_id}", None)
 
-    @_timed
-    def create_wasm_module(self, options: CreateWasmModuleOptions, *, timeout: Optional[float] = None) -> WasmModule:
-        """Register a WASM module in the host catalogue.
-
-        Resolution is synchronous — the returned row is typically already
-        ``ready``. Idempotent when ``options["id"]`` is set and matches the
-        same ``moduleRef``.
-        """
+    def _op_create_wasm_module(self, options: CreateWasmModuleOptions):
         body: Dict[str, Any] = {}
         mod_id = str(_first_of(options, "id") or "").strip()
         if mod_id:
@@ -1536,34 +1461,25 @@ class MicroVM:
         entrypoint = _first_of(options, "entrypoint")
         if entrypoint not in (None, ""):
             body["entrypoint"] = str(entrypoint)
-        response = self._do_json("POST", self._versioned("/wasm-modules"), body)
+        response = (yield _io("_do_json", "POST", self._versioned("/wasm-modules"), body))
         return _from_api_wasm_module(response)
 
-    @_timed
-    def list_wasm_modules(self, *, timeout: Optional[float] = None) -> List[WasmModule]:
-        response = self._do_json("GET", self._versioned("/wasm-modules"), None)
+    def _op_list_wasm_modules(self):
+        response = (yield _io("_do_json", "GET", self._versioned("/wasm-modules"), None))
         if response is None:
             return []
         if not isinstance(response, list):
             raise MicroVMError("expected JSON array from /v1/wasm-modules")
         return [_from_api_wasm_module(item) for item in response]
 
-    @_timed
-    def get_wasm_module(self, module_id: str, *, timeout: Optional[float] = None) -> WasmModule:
-        response = self._do_json("GET", f"{self._version_prefix}/wasm-modules/{module_id}", None)
+    def _op_get_wasm_module(self, module_id: str):
+        response = (yield _io("_do_json", "GET", f"{self._version_prefix}/wasm-modules/{module_id}", None))
         return _from_api_wasm_module(response)
 
-    @_timed
-    def delete_wasm_module(self, module_id: str, *, timeout: Optional[float] = None) -> None:
-        self._do_json("DELETE", f"{self._version_prefix}/wasm-modules/{module_id}", None)
+    def _op_delete_wasm_module(self, module_id: str):
+        yield _io("_do_json", "DELETE", f"{self._version_prefix}/wasm-modules/{module_id}", None)
 
-    @_timed
-    def push_wasm_module(self, options: PushWasmModuleOptions, *, timeout: Optional[float] = None) -> PushWasmModuleResult:
-        """Upload a compiled core-wasip1 module to the registry under your own
-        credentials, returning the ``oci://`` ref to use as ``moduleRef`` on a
-        later ``create``. The daemon validates and forwards the bytes; it never
-        stores them.
-        """
+    def _op_push_wasm_module(self, options: PushWasmModuleOptions):
         name = options.get("name", "")
         query = urllib.parse.urlencode(
             {"name": name, "tag": options["tag"]} if options.get("tag") else {"name": name}
@@ -1573,13 +1489,13 @@ class MicroVM:
         if username:
             headers["X-Registry-Username"] = username
         url = f"{self._url(self._versioned('/wasm-modules/push'))}?{query}"
-        raw = self._request(
+        raw = (yield _io("_request",
             "POST",
             url,
             body=options.get("module", b""),
             content_type="application/octet-stream",
             extra_headers=headers,
-        )
+        ))
         data = json.loads(raw.decode("utf-8")) if raw else {}
         return PushWasmModuleResult(
             moduleRef=data.get("module_ref", ""),
@@ -1587,75 +1503,50 @@ class MicroVM:
             sizeBytes=data.get("size_bytes", 0),
         )
 
-    @_timed
-    def rebuild_template(self, template_id: str, *, timeout: Optional[float] = None) -> Template:
-        """Re-run the snapshot phase against an existing template.
-
-        Idempotent under concurrent retry — the daemon's CAS collapses
-        N parallel calls for the same ``ready`` template to one rebuild
-        kick. Returns the row in its post-transition state (typically
-        ``unhealthy``); poll :meth:`get_template` for the transition
-        back to ``ready``.
-
-        Raises :class:`MicroVMHTTPError` with status 412 when the
-        template is in a state where rebuild is not safe (build in
-        flight) or not supported (``ready_no_snapshot``/``failed`` —
-        those need delete+recreate today).
-        """
-        response = self._do_json("POST", f"{self._version_prefix}/templates/{template_id}/rebuild", None)
+    def _op_rebuild_template(self, template_id: str):
+        response = (yield _io("_do_json", "POST", f"{self._version_prefix}/templates/{template_id}/rebuild", None))
         return _from_api_template(response)
 
-    @_timed
-    def resize(self, sandbox_id: str, options: ResizeOptions, *, timeout: Optional[float] = None) -> Sandbox:
-        sandbox = self._do_json("POST", f"{self._version_prefix}/sandboxes/{sandbox_id}/resize", _to_api_resize_options(options))
+    def _op_resize(self, sandbox_id: str, options: ResizeOptions):
+        sandbox = (yield _io("_do_json", "POST", f"{self._version_prefix}/sandboxes/{sandbox_id}/resize", _to_api_resize_options(options)))
         return self._wrap_sandbox(sandbox)
 
-    @_timed
-    def update_lifecycle(self, sandbox_id: str, lifecycle: Lifecycle, *, timeout: Optional[float] = None) -> Sandbox:
-        sandbox = self._do_json("PUT", f"{self._version_prefix}/sandboxes/{sandbox_id}/lifecycle", _to_api_lifecycle(lifecycle))
+    def _op_update_lifecycle(self, sandbox_id: str, lifecycle: Lifecycle):
+        sandbox = (yield _io("_do_json", "PUT", f"{self._version_prefix}/sandboxes/{sandbox_id}/lifecycle", _to_api_lifecycle(lifecycle)))
         return self._wrap_sandbox(sandbox)
 
-    @_timed
-    def reconcile(self, *, timeout: Optional[float] = None) -> None:
-        self._do_json("POST", self._versioned("/admin/reconcile"), None)
+    def _op_reconcile(self):
+        yield _io("_do_json", "POST", self._versioned("/admin/reconcile"), None)
 
-    @_timed
-    def health(self, *, timeout: Optional[float] = None) -> HealthStatus:
-        return _from_api_health_status(self._do_json("GET", "/health", None))
+    def _op_health(self):
+        return _from_api_health_status((yield _io("_do_json", "GET", "/health", None)))
 
-    @_timed
-    def mounts(self, sandbox_id: str, *, timeout: Optional[float] = None) -> List[MountSpecRedacted]:
-        payload = self._do_json("GET", f"{self._version_prefix}/sandboxes/{sandbox_id}/mounts", None)
+    def _op_mounts(self, sandbox_id: str):
+        payload = (yield _io("_do_json", "GET", f"{self._version_prefix}/sandboxes/{sandbox_id}/mounts", None))
         mounts = _first_of(payload, "mounts") or []
         if not isinstance(mounts, list):
             return []
         return [_from_api_mount_spec_redacted(item) for item in mounts]
 
-    @_timed
-    def clone_generation(self, sandbox_id: str, *, timeout: Optional[float] = None) -> CloneGeneration:
-        payload = self._do_json("GET", f"{self._version_prefix}/sandboxes/{sandbox_id}/toolbox/clone-generation", None)
+    def _op_clone_generation(self, sandbox_id: str):
+        payload = (yield _io("_do_json", "GET", f"{self._version_prefix}/sandboxes/{sandbox_id}/toolbox/clone-generation", None))
         return CloneGeneration(
             generation=str(_first_of(payload, "generation") or ""),
             resumedAt=int(_first_of(payload, "resumed_at", "resumedAt") or 0),
         )
 
-    @_timed
-    def get_network_usage(self, sandbox_id: str, *, timeout: Optional[float] = None) -> NetworkUsage:
-        payload = self._do_json("GET", f"{self._version_prefix}/sandboxes/{sandbox_id}/network/usage", None)
+    def _op_get_network_usage(self, sandbox_id: str):
+        payload = (yield _io("_do_json", "GET", f"{self._version_prefix}/sandboxes/{sandbox_id}/network/usage", None))
         return _from_api_network_usage(payload)
 
-    @_timed
-    def check_network_policy(self, options: NetworkPolicyCheckOptions, *, timeout: Optional[float] = None) -> NetworkPolicyCheckResult:
-        """Ask whether a sandbox created with these egress fields would reach
-        a destination, with the same matcher the filter enforces. No sandbox
-        is needed."""
+    def _op_check_network_policy(self, options: NetworkPolicyCheckOptions):
         body = {
             "network_block_all": bool(options.get("networkBlockAll", False)),
             "network_allow_out": list(options.get("networkAllowOut") or []),
             "network_deny_out": list(options.get("networkDenyOut") or []),
             "destination": options.get("destination", ""),
         }
-        payload = self._do_json("POST", f"{self._version_prefix}/network/policy/check", body) or {}
+        payload = (yield _io("_do_json", "POST", f"{self._version_prefix}/network/policy/check", body)) or {}
         result: NetworkPolicyCheckResult = {
             "allowed": bool(payload.get("allowed", False)),
             "matchedRule": str(payload.get("matched_rule") or ""),
@@ -1665,8 +1556,7 @@ class MicroVM:
             result["outsideCeiling"] = str(payload["outside_ceiling"])
         return result
 
-    @_timed
-    def get_audit(self, sandbox_id: str, options: Optional[AuditOptions] = None, *, timeout: Optional[float] = None) -> AuditPage:
+    def _op_get_audit(self, sandbox_id: str, options: Optional[AuditOptions] = None):
         opts = options or {}
         params: Dict[str, str] = {}
         if opts.get("kind"):
@@ -1682,17 +1572,15 @@ class MicroVM:
         path = f"{self._version_prefix}/sandboxes/{sandbox_id}/audit"
         if params:
             path += "?" + urllib.parse.urlencode(params)
-        payload = self._do_json("GET", path, None)
+        payload = (yield _io("_do_json", "GET", path, None))
         return _from_api_audit_page(payload or {})
 
-    @_timed
-    def set_network_limits(self, sandbox_id: str, options: SetNetworkLimitsOptions, *, timeout: Optional[float] = None) -> NetworkUsage:
+    def _op_set_network_limits(self, sandbox_id: str, options: SetNetworkLimitsOptions):
         body = _to_api_set_network_limits_options(options)
-        payload = self._do_json("PATCH", f"{self._version_prefix}/sandboxes/{sandbox_id}/network/limits", body)
+        payload = (yield _io("_do_json", "PATCH", f"{self._version_prefix}/sandboxes/{sandbox_id}/network/limits", body))
         return _from_api_network_usage(payload)
 
-    @_timed
-    def set_network_policy(self, sandbox_id: str, options: NetworkPolicyOptions, *, timeout: Optional[float] = None) -> NetworkPolicy:
+    def _op_set_network_policy(self, sandbox_id: str, options: NetworkPolicyOptions):
         body = {
             "network_block_all": bool(_first_of(options, "networkBlockAll", "network_block_all") or False),
             "network_allow_out": list(_first_of(options, "networkAllowOut", "network_allow_out") or []),
@@ -1705,7 +1593,7 @@ class MicroVM:
         rules = _first_of(options, "networkEgressRules", "network_egress_rules")
         if rules is not None:
             body["network_egress_rules"] = _egress_rules(rules, wire=True)
-        payload = self._do_json("PUT", f"{self._version_prefix}/sandboxes/{sandbox_id}/network/policy", body) or {}
+        payload = (yield _io("_do_json", "PUT", f"{self._version_prefix}/sandboxes/{sandbox_id}/network/policy", body)) or {}
         policy: NetworkPolicy = {
             "networkBlockAll": bool(payload.get("network_block_all", False)),
             "networkAllowOut": list(payload.get("network_allow_out") or []),
@@ -1719,11 +1607,8 @@ class MicroVM:
             policy["egressStatus"] = str(payload["egress_status"])
         return policy
 
-    @_timed
-    def get_network_learned(self, sandbox_id: str, *, timeout: Optional[float] = None) -> NetworkLearned:
-        """Read what a sandbox reached in learn mode and the allow list that
-        would have allowed it."""
-        payload = self._do_json("GET", f"{self._version_prefix}/sandboxes/{sandbox_id}/network/learned", None) or {}
+    def _op_get_network_learned(self, sandbox_id: str):
+        payload = (yield _io("_do_json", "GET", f"{self._version_prefix}/sandboxes/{sandbox_id}/network/learned", None)) or {}
         result: NetworkLearned = {
             "mode": str(payload.get("mode") or "enforce"),
             "truncated": bool(payload.get("truncated", False)),
@@ -1745,23 +1630,18 @@ class MicroVM:
             result["suggestedProfile"] = {"allowOut": list(profile.get("allow_out") or []), "description": str(profile.get("description") or "")}
         return result
 
-    @_timed
-    def put_egress_profile(self, name: str, options: EgressProfileOptions, *, timeout: Optional[float] = None) -> EgressProfile:
-        """Create or replace a named egress profile (a full replace: the same
-        body twice is a no-op). A change reaches every sandbox using it."""
+    def _op_put_egress_profile(self, name: str, options: EgressProfileOptions):
         body: Dict[str, Any] = {"allow_out": list(_first_of(options, "allowOut", "allow_out") or [])}
         description = _first_of(options, "description")
         if description:
             body["description"] = str(description)
-        payload = self._do_json("PUT", self._egress_profile_path(name), body) or {}
+        payload = (yield _io("_do_json", "PUT", self._egress_profile_path(name), body)) or {}
         return _from_api_egress_profile(payload)
 
-    @_timed
-    def get_egress_profile(self, name: str, *, timeout: Optional[float] = None) -> EgressProfile:
-        return _from_api_egress_profile(self._do_json("GET", self._egress_profile_path(name), None) or {})
+    def _op_get_egress_profile(self, name: str):
+        return _from_api_egress_profile((yield _io("_do_json", "GET", self._egress_profile_path(name), None)) or {})
 
-    @_timed
-    def list_egress_profiles(self, options: Optional[ListEgressProfilesOptions] = None, *, timeout: Optional[float] = None) -> EgressProfileList:
+    def _op_list_egress_profiles(self, options: Optional[ListEgressProfilesOptions] = None):
         opts = options or {}
         params: Dict[str, str] = {}
         if opts.get("cursor"):
@@ -1771,27 +1651,21 @@ class MicroVM:
         path = f"{self._version_prefix}/egress-profiles"
         if params:
             path += "?" + urllib.parse.urlencode(params)
-        payload = self._do_json("GET", path, None) or {}
+        payload = (yield _io("_do_json", "GET", path, None)) or {}
         result: EgressProfileList = {"profiles": [_from_api_egress_profile(p) for p in payload.get("profiles") or []]}
         if payload.get("next_cursor"):
             result["nextCursor"] = str(payload["next_cursor"])
         return result
 
-    @_timed
-    def delete_egress_profile(self, name: str, *, timeout: Optional[float] = None) -> None:
-        """Delete a profile; one that sandboxes still reference is refused (409)."""
-        self._do_json("DELETE", self._egress_profile_path(name), None)
+    def _op_delete_egress_profile(self, name: str):
+        yield _io("_do_json", "DELETE", self._egress_profile_path(name), None)
 
     def _egress_profile_path(self, name: str) -> str:
         return f"{self._version_prefix}/egress-profiles/{urllib.parse.quote(name, safe='')}"
 
     # Warm pools are PUT/GET/DELETE of one entry: every call is safe to
     # retry, so they keep the default (idempotent) retry tier.
-    @_timed
-    def put_warm_pool(self, image: str, options: WarmPoolOptions, *, timeout: Optional[float] = None) -> WarmPool:
-        """Set how many ready sandboxes every server with a warm pool keeps
-        for an image (a full replace: the same call twice is a no-op). A
-        create that names the image then starts from a warm sandbox. Admin only."""
+    def _op_put_warm_pool(self, image: str, options: WarmPoolOptions):
         body: Dict[str, Any] = {"depth": int(_first_of(options, "depth") or 0)}
         for key, wire in (("minDepth", "min_depth"), ("maxDepth", "max_depth")):
             value = _first_of(options, key, wire)
@@ -1800,24 +1674,17 @@ class MicroVM:
         on_change = _first_of(options, "onImageChange", "on_image_change")
         if on_change:
             body["on_image_change"] = str(on_change)
-        return _from_api_warm_pool(self._do_json("PUT", self._warm_pool_path(image), body) or {})
+        return _from_api_warm_pool((yield _io("_do_json", "PUT", self._warm_pool_path(image), body)) or {})
 
-    @_timed
-    def get_warm_pool(self, image: str, *, timeout: Optional[float] = None) -> WarmPool:
-        """An image's warm-pool entry with its status (ready and target, per server)."""
-        return _from_api_warm_pool(self._do_json("GET", self._warm_pool_path(image), None) or {})
+    def _op_get_warm_pool(self, image: str):
+        return _from_api_warm_pool((yield _io("_do_json", "GET", self._warm_pool_path(image), None)) or {})
 
-    @_timed
-    def list_warm_pools(self, *, timeout: Optional[float] = None) -> List[WarmPool]:
-        """Every warm-pool entry, by image, with its status."""
-        payload = self._do_json("GET", f"{self._version_prefix}/warm-pools", None) or {}
+    def _op_list_warm_pools(self):
+        payload = (yield _io("_do_json", "GET", f"{self._version_prefix}/warm-pools", None)) or {}
         return [_from_api_warm_pool(p) for p in payload.get("pools") or []]
 
-    @_timed
-    def delete_warm_pool(self, image: str, *, timeout: Optional[float] = None) -> None:
-        """Delete an image's warm-pool entry; its warm sandboxes are removed.
-        Deleting a missing entry succeeds."""
-        self._do_json("DELETE", self._warm_pool_path(image), None)
+    def _op_delete_warm_pool(self, image: str):
+        yield _io("_do_json", "DELETE", self._warm_pool_path(image), None)
 
     def _warm_pool_path(self, image: str) -> str:
         # The image is the rest of the path: each segment is escaped and the
@@ -1887,20 +1754,16 @@ class MicroVM:
     def _team_quota_path(self, team: str) -> str:
         return f"{self._version_prefix}/teams/{urllib.parse.quote(team, safe='')}/quota"
 
-    @_timed
-    def whoami(self, *, timeout: Optional[float] = None) -> WhoAmI:
-        """Who the server says the caller is: principal, role, team and when
-        the credential expires. Every valid credential may ask."""
-        return _from_api_whoami(self._do_json("GET", self._versioned("/whoami"), None) or {})
+    def _op_whoami(self):
+        return _from_api_whoami((yield _io("_do_json", "GET", self._versioned("/whoami"), None)) or {})
 
     @property
-    def tokens(self) -> "Tokens":
+    def tokens(self) -> Any:
         """Scoped API tokens (avm_…) for services and CI:
         ``client.tokens.create/list/revoke``."""
-        return Tokens(self)
+        return self._tokens_class(self)
 
-    @_timed
-    def exec(self, sandbox_id: str, request: ExecRequest, *, timeout: Optional[float] = None) -> ExecResult:
+    def _op_exec(self, sandbox_id: str, request: ExecRequest):
         # Not idempotent: a re-sent POST runs the user's command again, so a
         # timeout or reset after the request went out surfaces instead of
         # retrying. Sandbox.exec and exec_command both end here.
@@ -1912,17 +1775,16 @@ class MicroVM:
             features.append("exec.max_output_bytes")
         if payload.get("argv"):
             features.append("exec.argv")
-        self._require_toolbox_features(sandbox_id, *features)
-        response = self._do_json(
+        yield from self._op_require_toolbox_features(sandbox_id, *features)
+        response = (yield _io("_do_json",
             "POST",
             f"{self._version_prefix}/sandboxes/{sandbox_id}/toolbox/process/execute",
             payload,
             idempotent=False,
-        )
+        ))
         return _from_api_exec_result(response)
 
-    @_timed
-    def exec_stream(self, sandbox_id: str, options: ExecStreamOptions, *, timeout: Optional[float] = None) -> ExecStreamHandle:
+    def _op_exec_stream(self, sandbox_id: str, options: ExecStreamOptions):
         command = _first_of(options, "command")
         has_command = isinstance(command, str) and command.strip() != ""
         argv = _first_of(options, "argv")
@@ -1933,89 +1795,72 @@ class MicroVM:
         if argv:
             # Before the socket opens, so an older agent never gets a start
             # message it cannot run.
-            self._require_toolbox_features(sandbox_id, "exec.argv")
+            yield from self._op_require_toolbox_features(sandbox_id, "exec.argv")
 
         websocket_module = _load_websocket_module()
         ws_url = _to_websocket_url(self.api_url, f"{self._version_prefix}/sandboxes/{urllib.parse.quote(sandbox_id, safe='')}/toolbox/process/exec/stream")
-        ws = _connect_websocket(websocket_module, ws_url, self._websocket_headers(), "exec stream", self._ssl_context)
-        ws.send(json.dumps(_to_api_exec_stream_request(options)))
-        return ExecStreamHandle(websocket_module, ws, options)
+        ws = (yield _io("_blocking", _open_exec_stream,
+            websocket_module, ws_url, self._websocket_headers(), self._ssl_context, json.dumps(_to_api_exec_stream_request(options))
+        ))
+        return self._exec_stream_handle(websocket_module, ws, options)
 
-    @_timed
-    def create_session(self, sandbox_id: str, options: CreateSessionOptions, *, timeout: Optional[float] = None) -> Session:
-        session = self._do_json("POST", f"{self._version_prefix}/sandboxes/{sandbox_id}/sessions", _to_api_create_session_options(options))
+    def _op_create_session(self, sandbox_id: str, options: CreateSessionOptions):
+        session = (yield _io("_do_json", "POST", f"{self._version_prefix}/sandboxes/{sandbox_id}/sessions", _to_api_create_session_options(options)))
         return _from_api_session(session)
 
-    @_timed
-    def list_sessions(self, sandbox_id: str, *, timeout: Optional[float] = None) -> List[Session]:
-        payload = self._do_json("GET", f"{self._version_prefix}/sandboxes/{sandbox_id}/sessions", None)
+    def _op_list_sessions(self, sandbox_id: str):
+        payload = (yield _io("_do_json", "GET", f"{self._version_prefix}/sandboxes/{sandbox_id}/sessions", None))
         sessions = _first_of(payload, "sessions") or []
         if not isinstance(sessions, list):
             return []
         return [_from_api_session(item) for item in sessions]
 
-    @_timed
-    def get_session(self, sandbox_id: str, session_id: str, *, timeout: Optional[float] = None) -> Session:
-        session = self._do_json("GET", f"{self._version_prefix}/sandboxes/{sandbox_id}/sessions/{session_id}", None)
+    def _op_get_session(self, sandbox_id: str, session_id: str):
+        session = (yield _io("_do_json", "GET", f"{self._version_prefix}/sandboxes/{sandbox_id}/sessions/{session_id}", None))
         return _from_api_session(session)
 
-    @_timed
-    def delete_session(self, sandbox_id: str, session_id: str, *, timeout: Optional[float] = None) -> None:
-        self._do_json("DELETE", f"{self._version_prefix}/sandboxes/{sandbox_id}/sessions/{session_id}", None)
+    def _op_delete_session(self, sandbox_id: str, session_id: str):
+        yield _io("_do_json", "DELETE", f"{self._version_prefix}/sandboxes/{sandbox_id}/sessions/{session_id}", None)
 
-    @_timed
-    def signal_session(self, sandbox_id: str, session_id: str, signal: str, *, timeout: Optional[float] = None) -> None:
-        self._do_json("POST", f"{self._version_prefix}/sandboxes/{sandbox_id}/sessions/{session_id}/signal", {"signal": signal})
+    def _op_signal_session(self, sandbox_id: str, session_id: str, signal: str):
+        yield _io("_do_json", "POST", f"{self._version_prefix}/sandboxes/{sandbox_id}/sessions/{session_id}/signal", {"signal": signal})
 
-    @_timed
-    def resize_session(self, sandbox_id: str, session_id: str, cols: int, rows: int, *, timeout: Optional[float] = None) -> None:
-        self._do_json("POST", f"{self._version_prefix}/sandboxes/{sandbox_id}/sessions/{session_id}/resize", {"cols": cols, "rows": rows})
+    def _op_resize_session(self, sandbox_id: str, session_id: str, cols: int, rows: int):
+        yield _io("_do_json", "POST", f"{self._version_prefix}/sandboxes/{sandbox_id}/sessions/{session_id}/resize", {"cols": cols, "rows": rows})
 
-    @_timed
-    def session_log(self, sandbox_id: str, session_id: str, *, timeout: Optional[float] = None) -> bytes:
-        return self._request("GET", self._url(f"{self._version_prefix}/sandboxes/{sandbox_id}/sessions/{session_id}/log"))
+    def _op_session_log(self, sandbox_id: str, session_id: str):
+        return (yield _io("_request", "GET", self._url(f"{self._version_prefix}/sandboxes/{sandbox_id}/sessions/{session_id}/log")))
 
-    @_timed
-    def session_recording(self, sandbox_id: str, session_id: str, *, timeout: Optional[float] = None) -> bytes:
-        return self._request("GET", self._url(f"{self._version_prefix}/sandboxes/{sandbox_id}/sessions/{session_id}/recording"))
+    def _op_session_recording(self, sandbox_id: str, session_id: str):
+        return (yield _io("_request", "GET", self._url(f"{self._version_prefix}/sandboxes/{sandbox_id}/sessions/{session_id}/recording")))
 
-    @_timed
-    def attach_session(
+    def _op_attach_session(
         self,
         sandbox_id: str,
         session_id: str,
         options: Optional[SessionAttachOptions] = None,
-        *,
-        timeout: Optional[float] = None,
-    ) -> SessionAttachHandle:
+    ):
         attach_options: SessionAttachOptions = options or {}
         websocket_module = _load_websocket_module()
         ws_url = _to_websocket_url(
             self.api_url,
             f"{self._version_prefix}/sandboxes/{urllib.parse.quote(sandbox_id, safe='')}/sessions/{urllib.parse.quote(session_id, safe='')}/attach",
         )
-        ws = _connect_websocket(websocket_module, ws_url, self._websocket_headers(), "session attach", self._ssl_context)
-
         cols = _first_of(attach_options, "cols")
         rows = _first_of(attach_options, "rows")
+        resize = None
         if isinstance(cols, int) and isinstance(rows, int) and cols > 0 and rows > 0:
-            ws.send(json.dumps({"type": "resize", "cols": cols, "rows": rows}))
+            resize = json.dumps({"type": "resize", "cols": cols, "rows": rows})
+        ws = (yield _io("_blocking", _open_session_attach, websocket_module, ws_url, self._websocket_headers(), self._ssl_context, resize))
+        return self._session_attach_handle(websocket_module, ws, attach_options)
 
-        return SessionAttachHandle(websocket_module, ws, attach_options)
-
-    def _require_toolbox_features(self, sandbox_id: str, *features: str) -> None:
-        """Fail closed unless the sandbox's agent lists every feature.
-
-        toolboxd ignores request options it does not know, so sending a newer
-        option to an older agent would silently skip it. The agent lists the
-        options it understands on /version.
-        """
+    def _op_require_toolbox_features(self, sandbox_id: str, *features: str):
         if not features:
             return
         have = self._toolbox_features.get(sandbox_id)
         version = ""
         if have is None or not set(features) <= have:
-            info = self._do_json("GET", f"{self._version_prefix}/sandboxes/{sandbox_id}/toolbox/version", None)
+            info = (yield _io("_do_json", "GET", f"{self._version_prefix}/sandboxes/{sandbox_id}/toolbox/version", None))
             listed = info.get("features") if isinstance(info, dict) else None
             have = frozenset(str(f) for f in listed) if isinstance(listed, list) else frozenset()
             self._toolbox_features[sandbox_id] = have
@@ -2027,8 +1872,7 @@ class MicroVM:
                 sandbox_id, missing, version, self._toolbox_runtimes.get(sandbox_id, "")
             )
 
-    @_timed
-    def upload_file(
+    def _op_upload_file(
         self,
         sandbox_id: str,
         target_path: str,
@@ -2038,22 +1882,7 @@ class MicroVM:
         create_only: bool = False,
         atomic: bool = False,
         mode: Optional[int] = None,
-        timeout: Optional[float] = None,
-    ) -> None:
-        """Upload ``data`` to ``target_path``; missing folders are made.
-
-        By default an existing file is replaced in place. ``append`` adds to
-        it instead. ``create_only`` writes only if the file does not exist
-        yet (HTTP 412 otherwise; of two racing uploads exactly one wins).
-        ``atomic`` writes a temp file and renames it into place, so readers
-        never see half a file. ``mode`` (such as ``0o600``) sets the
-        permissions. ``append`` cannot be combined with ``create_only`` or
-        ``atomic``.
-
-        Plain and atomic uploads retry on 421/429/502/503/504; ``append`` and
-        ``create_only`` only on 429/503, because a second send would append
-        twice or find the first one's file.
-        """
+    ):
         query: Dict[str, str] = {}
         for name, on in (("append", append), ("create_only", create_only), ("atomic", atomic)):
             if on:
@@ -2062,39 +1891,27 @@ class MicroVM:
             query["mode"] = format(mode, "o")
         if query:
             # An older agent ignores these; create_only would replace a file.
-            self._require_toolbox_features(sandbox_id, _FEATURE_WRITE_OPTIONS)
+            yield from self._op_require_toolbox_features(sandbox_id, _FEATURE_WRITE_OPTIONS)
         path = f"{self._version_prefix}/sandboxes/{sandbox_id}/toolbox/files/upload"
         if query:
             path += "?" + urllib.parse.urlencode(query)
-        self._do_multipart(path, {"path": target_path}, "file", target_path, data, idempotent=not (append or create_only))
+        yield _io("_do_multipart", path, {"path": target_path}, "file", target_path, data, idempotent=not (append or create_only))
 
-    @_timed
-    def upload_dir(self, sandbox_id: str, local_dir: str, remote_dir: str, *, timeout: Optional[float] = None) -> None:
-        """Copy the local folder ``local_dir`` into ``remote_dir`` in the
-        sandbox (made if missing). The folder is packed as a gzipped tar and
-        the sandbox unpacks it safely: no entry can land outside
-        ``remote_dir``. Symlinks are sent as links, hard-linked files as
-        separate files; devices, pipes and sockets are skipped. The archive
-        is held in memory and sent once, never retried (plan section 10).
-        """
+    def _op_upload_dir(self, sandbox_id: str, local_dir: str, remote_dir: str):
         if not os.path.isdir(local_dir):
             raise MicroVMError(f"{local_dir} is not a folder")
         # An older agent ignores extract and stores the archive as a file.
-        self._require_toolbox_features(sandbox_id, _FEATURE_EXTRACT)
-        archive = _tar_folder(local_dir)
+        yield from self._op_require_toolbox_features(sandbox_id, _FEATURE_EXTRACT)
+        archive = (yield _io("_blocking", _tar_folder, local_dir))
         path = f"{self._version_prefix}/sandboxes/{sandbox_id}/toolbox/files/upload?extract=true"
-        self._do_multipart(path, {"path": remote_dir}, "file", "upload.tar.gz", archive, idempotent=False, send_once=True)
+        yield _io("_do_multipart", path, {"path": remote_dir}, "file", "upload.tar.gz", archive, idempotent=False, send_once=True)
 
-    @_timed
-    def download_file(self, sandbox_id: str, target_path: str, *, max_bytes: Optional[int] = None, timeout: Optional[float] = None) -> bytes:
-        """Read a whole file. ``max_bytes`` refuses a larger one with
-        :class:`MicroVMFileTooLargeError`. Retries like any safe call."""
+    def _op_download_file(self, sandbox_id: str, target_path: str, *, max_bytes: Optional[int] = None):
         buf = BytesIO()
-        self.download_file_to(sandbox_id, target_path, buf, max_bytes=max_bytes)
+        yield from self._op_download_file_to(sandbox_id, target_path, buf, max_bytes=max_bytes)
         return buf.getvalue()
 
-    @_timed
-    def download_file_to(
+    def _op_download_file_to(
         self,
         sandbox_id: str,
         target_path: str,
@@ -2102,14 +1919,7 @@ class MicroVM:
         *,
         max_bytes: Optional[int] = None,
         chunk_size: int = 1 << 20,
-        timeout: Optional[float] = None,
-    ) -> int:
-        """Stream a file into ``dest`` (anything with ``write``, such as an
-        open file) a piece at a time, so a large file never sits in memory.
-        Returns the bytes written. ``max_bytes`` refuses a larger file:
-        before reading when the server states the size, otherwise as soon as
-        more arrives (what was written stays in ``dest``). The request
-        retries until the file starts to arrive, never after."""
+    ):
         url = self._url(f"{self._version_prefix}/sandboxes/{sandbox_id}/toolbox/files/download?path={urllib.parse.quote(target_path, safe='')}")
 
         def copy(response: Any, headers: Dict[str, str]) -> int:
@@ -2128,10 +1938,9 @@ class MicroVM:
                 dest.write(chunk)
                 written += len(chunk)
 
-        return int(self._request_reader("GET", url, copy))
+        return int((yield _io("_request_reader", "GET", url, copy)))
 
-    @_timed
-    def upload_file_from(
+    def _op_upload_file_from(
         self,
         sandbox_id: str,
         target_path: str,
@@ -2142,12 +1951,7 @@ class MicroVM:
         atomic: bool = False,
         mode: Optional[int] = None,
         chunk_size: int = 1 << 20,
-        timeout: Optional[float] = None,
-    ) -> None:
-        """Upload from ``src`` (anything with ``read``, such as an open
-        file) a piece at a time, so a large file never sits in memory. The
-        options are :meth:`upload_file`'s. The data is read as it is sent,
-        so the request is sent once and never retried."""
+    ):
         query: Dict[str, str] = {}
         for name, on in (("append", append), ("create_only", create_only), ("atomic", atomic)):
             if on:
@@ -2155,7 +1959,7 @@ class MicroVM:
         if mode is not None:
             query["mode"] = format(mode, "o")
         if query:
-            self._require_toolbox_features(sandbox_id, _FEATURE_WRITE_OPTIONS)
+            yield from self._op_require_toolbox_features(sandbox_id, _FEATURE_WRITE_OPTIONS)
         path = f"{self._version_prefix}/sandboxes/{sandbox_id}/toolbox/files/upload"
         if query:
             path += "?" + urllib.parse.urlencode(query)
@@ -2175,31 +1979,15 @@ class MicroVM:
             yield f"\r\n--{boundary}--\r\n".encode("utf-8")
 
         # No Content-Length: urllib sends an iterable body chunked.
-        self._request("POST", self._url(path), body(), f"multipart/form-data; boundary={boundary}", send_once=True)
+        yield _io("_request", "POST", self._url(path), body(), f"multipart/form-data; boundary={boundary}", send_once=True)
 
-    @_timed
-    def watch_files(
+    def _op_watch_files(
         self,
         sandbox_id: str,
         path: str,
         on_event: FileEventCallback,
         recursive: bool = False,
-        *,
-        timeout: Optional[float] = None,
-    ) -> FileWatchHandle:
-        """Watch a folder in the sandbox for changes.
-
-        Calls ``on_event`` with a :class:`FileEvent` for every create, write,
-        remove, rename and chmod under ``path`` (and in every subfolder, new
-        ones included, when ``recursive``). Returns once the watch is in
-        place, so a change made after this returns is always seen.
-
-        File watching works on gVisor and Firecracker sandboxes only; others
-        answer :class:`MicroVMHTTPError` with status 501. A sandbox whose
-        agent predates file watching raises
-        :class:`MicroVMUnsupportedFeatureError`. The connection is opened
-        once and never retried.
-        """
+    ):
         if not isinstance(path, str) or path.strip() == "":
             raise MicroVMError("path is required")
         if on_event is None:
@@ -2212,35 +2000,8 @@ class MicroVM:
             self.api_url,
             f"{self._version_prefix}/sandboxes/{urllib.parse.quote(sandbox_id, safe='')}/toolbox/files/watch",
         ) + "?" + urllib.parse.urlencode(query)
-        ws = _connect_watch_websocket(websocket_module, ws_url, self._websocket_headers(), sandbox_id, self._ssl_context)
-        # Return only once toolboxd says the watch is armed, so a change the
-        # caller makes right after this returns is never missed. The wait is
-        # bounded: a proxy that accepts the upgrade and then goes quiet would
-        # otherwise hang the caller forever. The bound is lifted afterwards,
-        # because a quiet folder sends nothing for as long as it stays quiet.
-        settimeout = getattr(ws, "settimeout", None)
-        left = _time_left()
-        start_wait = _WATCH_START_TIMEOUT_SECONDS if left is None else max(min(left, _WATCH_START_TIMEOUT_SECONDS), 0.001)
-        if callable(settimeout):
-            settimeout(start_wait)
-        try:
-            first = ws.recv()
-            frame = json.loads(first) if isinstance(first, str) else None
-        except Exception as exc:
-            _close_quietly(ws)
-            if left is not None and start_wait < _WATCH_START_TIMEOUT_SECONDS and "timeout" in type(exc).__name__.lower():
-                raise _deadline_error() from exc
-            if "timeout" in type(exc).__name__.lower():
-                raise MicroVMError(
-                    f"file watch did not start within {_WATCH_START_TIMEOUT_SECONDS:g}s"
-                ) from exc
-            raise MicroVMError(f"file watch closed before it started: {exc}") from exc
-        if not isinstance(frame, dict) or frame.get("type") != "start":
-            _close_quietly(ws)
-            raise MicroVMError(f"file watch did not start: unexpected first message {first!r}")
-        if callable(settimeout):
-            settimeout(None)
-        return FileWatchHandle(ws, on_event)
+        ws = (yield _io("_blocking", _open_file_watch, websocket_module, ws_url, self._websocket_headers(), sandbox_id, self._ssl_context))
+        return self._file_watch_handle(ws, on_event)
 
     # File verbs beyond upload and download (plans/agent-sandbox-feature-
     # parity.md, F1). They go through the sandbox's toolbox. A sandbox whose
@@ -2257,96 +2018,70 @@ class MicroVM:
     def _toolbox_path(self, sandbox_id: str, route: str, query: Dict[str, str]) -> str:
         return f"{self._version_prefix}/sandboxes/{urllib.parse.quote(sandbox_id, safe='')}/toolbox{route}?{urllib.parse.urlencode(query)}"
 
-    @_timed
-    def list_files(self, sandbox_id: str, path: str, *, depth: int = 1, limit: int = DEFAULT_LIST_LIMIT, timeout: Optional[float] = None) -> FileList:
-        """List a folder, ``depth`` levels down (1 is the folder's own
-        entries), returning at most ``limit`` entries. Symlinked folders are
-        listed but never entered. ``truncated`` says more entries exist."""
+    def _op_list_files(self, sandbox_id: str, path: str, *, depth: int = 1, limit: int = DEFAULT_LIST_LIMIT):
         if depth < 1 or limit < 1:
             raise MicroVMError("depth and limit must be at least 1")
-        self._require_toolbox_features(sandbox_id, _FEATURE_FILE_VERBS)
+        yield from self._op_require_toolbox_features(sandbox_id, _FEATURE_FILE_VERBS)
         query = {"path": path, "depth": str(depth), "limit": str(limit), "extended": "true"}
-        data, headers = self._do_json_headers("GET", self._toolbox_path(sandbox_id, "/files", query), None)
+        data, headers = (yield _io("_do_json_headers", "GET", self._toolbox_path(sandbox_id, "/files", query), None))
         entries = [_from_api_file_info(item, path.rstrip("/") + "/" + str(item.get("name", ""))) for item in (data or []) if isinstance(item, dict)]
         truncated = any(k.lower() == "x-toolbox-truncated" and v == "true" for k, v in headers.items())
         return {"entries": entries, "truncated": truncated}
 
-    @_timed
-    def get_file_info(self, sandbox_id: str, path: str, *, timeout: Optional[float] = None) -> FileInfo:
-        """Describe one path. A symlink is followed."""
+    def _op_get_file_info(self, sandbox_id: str, path: str):
         # extended=true only adds fields; an older agent that ignores it
         # answers fields this still reads, so no /version check.
-        data = self._do_json("GET", self._toolbox_path(sandbox_id, "/files/info", {"path": path, "extended": "true"}), None)
+        data = (yield _io("_do_json", "GET", self._toolbox_path(sandbox_id, "/files/info", {"path": path, "extended": "true"}), None))
         return _from_api_file_info(data if isinstance(data, dict) else {}, path)
 
-    @_timed
-    def file_exists(self, sandbox_id: str, path: str, *, timeout: Optional[float] = None) -> bool:
-        """Whether ``path`` exists. A missing sandbox raises, it is not False."""
+    def _op_file_exists(self, sandbox_id: str, path: str):
         try:
-            self.get_file_info(sandbox_id, path)
+            yield from self._op_get_file_info(sandbox_id, path)
         except MicroVMHTTPError as err:
             if _is_missing_file(err):
                 return False
             raise
         return True
 
-    @_timed
-    def delete_file(self, sandbox_id: str, path: str, *, recursive: bool = False, timeout: Optional[float] = None) -> None:
-        """Delete a file, or a folder and everything in it with
-        ``recursive=True``. A folder without it is refused (HTTP 409)."""
+    def _op_delete_file(self, sandbox_id: str, path: str, *, recursive: bool = False):
         query = {"path": path}
         if recursive:
             query["recursive"] = "true"
-        self._request("DELETE", self._url(self._toolbox_path(sandbox_id, "/files", query)), done_code=_CODE_FILE_NOT_FOUND)
+        yield _io("_request", "DELETE", self._url(self._toolbox_path(sandbox_id, "/files", query)), done_code=_CODE_FILE_NOT_FOUND)
 
-    @_timed
-    def make_dir(self, sandbox_id: str, path: str, *, parents: bool = False, mode: Optional[int] = None, timeout: Optional[float] = None) -> None:
-        """Make a folder. ``parents=True`` also makes missing parents and
-        accepts an existing folder (``mkdir -p``). ``mode`` (such as
-        ``0o750``) defaults to 0755."""
+    def _op_make_dir(self, sandbox_id: str, path: str, *, parents: bool = False, mode: Optional[int] = None):
         if not parents:
             # An older agent ignores parents=false and makes them anyway.
-            self._require_toolbox_features(sandbox_id, _FEATURE_FILE_VERBS)
+            yield from self._op_require_toolbox_features(sandbox_id, _FEATURE_FILE_VERBS)
         query = {"path": path, "parents": "true" if parents else "false"}
         if mode is not None:
             query["mode"] = format(mode, "o")
-        self._request("POST", self._url(self._toolbox_path(sandbox_id, "/files/folder", query)), done_code=_CODE_FOLDER_EXISTS)
+        yield _io("_request", "POST", self._url(self._toolbox_path(sandbox_id, "/files/folder", query)), done_code=_CODE_FOLDER_EXISTS)
 
-    @_timed
-    def move_file(self, sandbox_id: str, source: str, destination: str, *, overwrite: bool = False, timeout: Optional[float] = None) -> None:
-        """Move or rename a file or folder. Without ``overwrite`` an existing
-        destination is refused (HTTP 409)."""
+    def _op_move_file(self, sandbox_id: str, source: str, destination: str, *, overwrite: bool = False):
         if not overwrite:
             # An older agent ignores overwrite=false and replaces the file.
-            self._require_toolbox_features(sandbox_id, _FEATURE_FILE_VERBS)
+            yield from self._op_require_toolbox_features(sandbox_id, _FEATURE_FILE_VERBS)
         query = {"source": source, "destination": destination, "overwrite": "true" if overwrite else "false"}
-        self._request("POST", self._url(self._toolbox_path(sandbox_id, "/files/move", query)), idempotent=False)
+        yield _io("_request", "POST", self._url(self._toolbox_path(sandbox_id, "/files/move", query)), idempotent=False)
 
-    @_timed
-    def copy_file(self, sandbox_id: str, source: str, destination: str, *, overwrite: bool = False, recursive: bool = False, timeout: Optional[float] = None) -> None:
-        """Copy a file, or a folder with ``recursive=True`` (keeping modes
-        and symlinks). Without ``overwrite`` an existing destination is
-        refused (HTTP 409)."""
-        self._require_toolbox_features(sandbox_id, _FEATURE_FILE_VERBS)
+    def _op_copy_file(self, sandbox_id: str, source: str, destination: str, *, overwrite: bool = False, recursive: bool = False):
+        yield from self._op_require_toolbox_features(sandbox_id, _FEATURE_FILE_VERBS)
         query = {
             "source": source,
             "destination": destination,
             "overwrite": "true" if overwrite else "false",
             "recursive": "true" if recursive else "false",
         }
-        self._request("POST", self._url(self._toolbox_path(sandbox_id, "/files/copy", query)), idempotent=False)
+        yield _io("_request", "POST", self._url(self._toolbox_path(sandbox_id, "/files/copy", query)), idempotent=False)
 
-    @_timed
-    def search_files(self, sandbox_id: str, path: str, pattern: str, *, timeout: Optional[float] = None) -> List[str]:
-        """Paths under ``path`` whose name matches a glob such as ``*.py``."""
-        data = self._do_json("GET", self._toolbox_path(sandbox_id, "/files/search", {"path": path, "pattern": pattern}), None)
+    def _op_search_files(self, sandbox_id: str, path: str, pattern: str):
+        data = (yield _io("_do_json", "GET", self._toolbox_path(sandbox_id, "/files/search", {"path": path, "pattern": pattern}), None))
         files = data.get("files") if isinstance(data, dict) else None
         return [str(f) for f in files] if isinstance(files, list) else []
 
-    @_timed
-    def find_in_files(self, sandbox_id: str, path: str, text: str, *, timeout: Optional[float] = None) -> List[FileMatch]:
-        """Each line under ``path`` that contains ``text`` (plain text)."""
-        data = self._do_json("GET", self._toolbox_path(sandbox_id, "/files/find", {"path": path, "pattern": text}), None)
+    def _op_find_in_files(self, sandbox_id: str, path: str, text: str):
+        data = (yield _io("_do_json", "GET", self._toolbox_path(sandbox_id, "/files/find", {"path": path, "pattern": text}), None))
         if not isinstance(data, list):
             return []
         return [
@@ -2355,49 +2090,27 @@ class MicroVM:
             if isinstance(m, dict)
         ]
 
-    @_timed
-    def expose_port(
+    def _op_expose_port(
         self,
         sandbox_id: str,
         port: int,
         *,
         protocol: ExposeProtocol = "http",
         visibility: Optional[ExposeVisibility] = None,
-        timeout: Optional[float] = None,
-    ) -> ExposeResult:
-        """Publish a sandbox container port.
-
-        ``protocol`` selects the wire surface and defaults to ``"http"``:
-
-        - ``"http"``: Caddy HTTP reverse proxy at ``https://<id>-<port>.<domain>``.
-        - ``"tcp"``:  raw caddy-l4 listener on a parent-host port. Pair with
-                      native protocol clients (psql, redis-cli, mysql, mongosh).
-        - ``"tls"``:  caddy-l4 TLS-SNI route on the shared listener. Requires
-                      the daemon to have a domain configured AND
-                      ``SB_L4_TLS_LISTEN`` set.
-
-        ``visibility="token"`` makes the URL need a sandbox token for this
-        port (see :meth:`Sandbox.create_token`). Left out, a new port is
-        public and an exposed port keeps what it has; pass it to change it.
-
-        Returns an :class:`ExposeResult`. ``host`` and ``host_port`` are
-        populated only on the ``"tcp"`` path.
-        """
+    ):
         fields: Dict[str, Any] = {}
         if protocol and protocol != "http":
             fields["protocol"] = protocol
         if visibility:
             fields["visibility"] = visibility
         body: Optional[Dict[str, Any]] = fields or None
-        response = self._do_json("POST", f"{self._version_prefix}/sandboxes/{sandbox_id}/ports/{port}", body)
+        response = (yield _io("_do_json", "POST", f"{self._version_prefix}/sandboxes/{sandbox_id}/ports/{port}", body))
         return _from_api_expose_port_response(response)
 
-    @_timed
-    def unexpose_port(self, sandbox_id: str, port: int, *, timeout: Optional[float] = None) -> None:
-        self._do_json("DELETE", f"{self._version_prefix}/sandboxes/{sandbox_id}/ports/{port}", None)
+    def _op_unexpose_port(self, sandbox_id: str, port: int):
+        yield _io("_do_json", "DELETE", f"{self._version_prefix}/sandboxes/{sandbox_id}/ports/{port}", None)
 
-    @_timed
-    def create_sandbox_token(
+    def _op_create_sandbox_token(
         self,
         sandbox_id: str,
         *,
@@ -2405,21 +2118,7 @@ class MicroVM:
         port: Optional[int] = None,
         path_prefix: Optional[str] = None,
         methods: Optional[List[str]] = None,
-        timeout: Optional[float] = None,
-    ) -> SandboxToken:
-        """Issue a signed token scoped to one sandbox, to hand to a browser
-        or an end user (``POST /v1/sandboxes/{id}/tokens``).
-
-        ``expires_in`` is required ("15m", "2h", "1d"); the server caps it
-        (24 hours by default). With ``port`` the token opens that port's
-        public URL (a port exposed with ``visibility="token"``); without it
-        the token is for the toolbox: commands, files and sessions.
-        ``path_prefix`` and ``methods`` narrow it further.
-
-        Not idempotent by nature: every call makes a new token and the
-        server stores none. It uses the normal retry tier: a retry after a
-        lost answer makes a second token nobody holds, which simply expires.
-        """
+    ):
         body: Dict[str, Any] = {"expires_in": expires_in}
         if port:
             body["port"] = port
@@ -2427,99 +2126,79 @@ class MicroVM:
             body["path_prefix"] = path_prefix
         if methods:
             body["methods"] = list(methods)
-        payload = self._do_json("POST", f"{self._version_prefix}/sandboxes/{sandbox_id}/tokens", body) or {}
+        payload = (yield _io("_do_json", "POST", f"{self._version_prefix}/sandboxes/{sandbox_id}/tokens", body)) or {}
         return _from_api_sandbox_token(payload)
 
-    @_timed
-    def add_custom_domain(
+    def _op_add_custom_domain(
         self,
         sandbox_id: str,
         hostname: str,
         *,
         port: Optional[int] = None,
-        timeout: Optional[float] = None,
-    ) -> List[CustomDomain]:
-        """Attach a public hostname to a sandbox.
-
-        Returns the post-attach list of :class:`CustomDomain` rows so callers
-        can read the initial ``status`` (typically ``"pending_dns"``) without
-        a follow-up GET. Server lowercases the hostname; case is preserved
-        as-passed.
-
-        ``port`` pins the container port traffic to this hostname dials. Omit
-        (or pass ``0``) to route to the sandbox's toolbox port (the default).
-        Re-adding the same hostname with a different ``port`` returns 409 —
-        detach first.
-        """
+    ):
         body: Dict[str, Any] = {"hostname": hostname}
         if port is not None and port != 0:
             body["target_port"] = port
-        response = self._do_json(
+        response = (yield _io("_do_json",
             "POST",
             self._versioned(f"/sandboxes/{sandbox_id}/custom-domains"),
             body,
-        )
+        ))
         return _from_api_custom_domains_response(response)
 
-    @_timed
-    def list_custom_domains(self, sandbox_id: str, *, timeout: Optional[float] = None) -> List[CustomDomain]:
-        response = self._do_json(
+    def _op_list_custom_domains(self, sandbox_id: str):
+        response = (yield _io("_do_json",
             "GET",
             self._versioned(f"/sandboxes/{sandbox_id}/custom-domains"),
             None,
-        )
+        ))
         return _from_api_custom_domains_response(response)
 
-    @_timed
-    def remove_custom_domain(self, sandbox_id: str, hostname: str, *, timeout: Optional[float] = None) -> None:
+    def _op_remove_custom_domain(self, sandbox_id: str, hostname: str):
         # URL-encode the hostname segment — DNS labels never need it in
         # practice, but IDN/punycode hosts ("xn--…") and any operator-supplied
         # garbage we still want to send must survive an exact round-trip.
         encoded = urllib.parse.quote(hostname, safe="")
-        self._do_json(
+        (yield _io("_do_json",
             "DELETE",
             self._versioned(f"/sandboxes/{sandbox_id}/custom-domains/{encoded}"),
             None,
-        )
+        ))
 
-    @_timed
-    def dns_target(self, *, timeout: Optional[float] = None) -> IngressTarget:
-        """Return the DNS target operators should point custom hostnames at.
-
-        Surfaces the daemon's resolved ingress identity — typically a single
-        ``hostname`` (CNAME) or a list of ``ips`` (A/AAAA), plus a ``source``
-        tag describing how it was resolved. Use this when rendering generic
-        setup instructions; for per-sandbox per-hostname records call
-        :meth:`custom_domain_dns` instead.
-        """
-        response = self._do_json("GET", self._versioned("/ingress/dns"), None)
+    def _op_dns_target(self):
+        response = (yield _io("_do_json", "GET", self._versioned("/ingress/dns"), None))
         return _from_api_ingress_target(response)
 
-    @_timed
-    def custom_domain_dns(self, sandbox_id: str, *, timeout: Optional[float] = None) -> CustomDomainDNSRecords:
-        """Return the DNS records to publish for this sandbox's custom domains.
-
-        Returns one :class:`DNSRecord` per attached hostname (empty list if
-        no domains are attached) bundled with the underlying
-        :class:`IngressTarget`, so callers can render full DNS setup
-        instructions without a follow-up :meth:`dns_target` call.
-        """
-        response = self._do_json(
+    def _op_custom_domain_dns(self, sandbox_id: str):
+        response = (yield _io("_do_json",
             "GET",
             self._versioned(f"/sandboxes/{sandbox_id}/custom-domains/dns"),
             None,
-        )
+        ))
         return _from_api_custom_domain_dns_response(response)
 
-    def _resolve_image(self, image: Any) -> str:
+    def _op_resolve_image(self, image: Any):
         if isinstance(image, Image):
-            return self.build_image(image)
+            return (yield from self._op_build_image(image))
         if isinstance(image, str) and image.strip() != "":
             return image
         raise TypeError("CreateOptions.image must be a non-empty string or Image")
 
-    def _wrap_sandbox(self, response: Dict[str, Any]) -> Sandbox:
-        return Sandbox(self, _from_api_sandbox(response))
+    def _header_items(self, content_type: Optional[str], extra_headers: Optional[Dict[str, str]]) -> List[Tuple[str, str]]:
+        """Every request's headers, in the order they are set. The caller's
+        extra headers go first, so the SDK's own replace any clash rather
+        than the other way round."""
+        items = list(self._extra_headers.items())
+        items.append(("Authorization", f"Bearer {self.pat_token}"))
+        if self.team:
+            items.append((TEAM_HEADER, self.team))
+        if content_type is not None:
+            items.append(("Content-Type", content_type))
+        items.extend((extra_headers or {}).items())
+        return items
+
+    def _wrap_sandbox(self, response: Dict[str, Any]) -> Any:
+        return self._sandbox_class(self, _from_api_sandbox(response))
 
     def _url(self, path: str) -> str:
         return f"{self.api_url}{path}"
@@ -2530,6 +2209,99 @@ class MicroVM:
         if self.team:
             headers.append(f"{TEAM_HEADER}: {self.team}")
         return headers
+
+    def _retry_delay(self, attempt: int, retry_after: Optional[str], now: float, rand: float) -> float:
+        """Seconds to wait before re-sending. ``attempt`` counts from 0,
+        ``retry_after`` is a 429/503's header (``None`` otherwise) and
+        ``rand`` is uniform in [0, 1).
+
+        Without a usable header it is the exponential backoff ±25%. With one,
+        it never retries sooner than the server asked (nor sooner than the
+        backoff) and adds up to a fifth so clients told the same value spread
+        out. ``maxRetryAfterMs`` is a hard ceiling: when the server asks for
+        at least that long the client is early anyway, so the spread goes
+        below it instead.
+        """
+        backoff = min(self._retry_config["baseDelayMs"] * (2 ** attempt), self._retry_config["maxDelayMs"]) / 1000.0
+        limit = self._retry_config["maxRetryAfterMs"] / 1000.0
+        hint = _parse_retry_after(retry_after, now) if limit > 0 else None
+        if hint is None:
+            return backoff * (0.75 + 0.5 * rand)
+        target = max(hint, backoff)
+        if target >= limit:
+            return limit - limit * 0.2 * rand
+        upper = min(target * 1.2, limit)
+        return target + (upper - target) * rand
+
+
+    # Scoped API tokens, reached as client.tokens.
+    def _op_create_api_token(self, options: Optional[CreateAPITokenOptions] = None, **fields: Any):
+        resolved: Dict[str, Any] = {**(options or {}), **fields}
+        body = {
+            "name": str(_first_of(resolved, "name") or ""),
+            "role": str(_first_of(resolved, "role") or ""),
+            "team": str(_first_of(resolved, "team") or ""),
+            "expires_in": str(_first_of(resolved, "expiresIn", "expires_in") or ""),
+        }
+        payload = (yield _io("_do_json", "POST", self._versioned("/tokens"), body)) or {}
+        created: CreatedAPIToken = {**_from_api_api_token(payload), "token": str(payload.get("token") or "")}  # type: ignore[typeddict-item]
+        return created
+
+    def _op_list_api_tokens(self):
+        payload = (yield _io("_do_json", "GET", self._versioned("/tokens"), None)) or {}
+        tokens = payload.get("tokens") if isinstance(payload, dict) else None
+        return {"tokens": [_from_api_api_token(t) for t in tokens or [] if isinstance(t, dict)]}
+
+    def _op_revoke_api_token(self, token_id: str):
+        trimmed = (token_id or "").strip()
+        if not trimmed:
+            raise ValueError("token id is required")
+        yield _io("_do_json", "DELETE", self._versioned(f"/tokens/{urllib.parse.quote(trimmed, safe='')}"), None)
+
+
+class MicroVM(_MicroVMCore):
+    """A client for an AerolVM server.
+
+    Every method that talks to the server takes a keyword-only ``timeout``
+    in seconds. The whole call, its automatic retries and the waits between
+    them included, must finish within it, or it raises
+    :class:`MicroVMTimeoutError` (``status_code`` 0). A call that opens a
+    stream (:meth:`exec_stream`, :meth:`attach_session`, :meth:`watch_files`)
+    is bounded until the stream is open, never for its life. Without a
+    timeout a call waits as long as the server takes, as before.
+    """
+
+    _sandbox_class: Any = None  # Sandbox; set below, after the class exists
+    _tokens_class: Any = None  # Tokens; likewise
+
+    def _run(self, op: Any) -> Any:
+        """Drives an op: each I/O it yields runs on this client's blocking
+        transport, and the result (or the error) goes back into the op."""
+        result: Any = None
+        error: Optional[BaseException] = None
+        while True:
+            try:
+                call = op.throw(error) if error is not None else op.send(result)
+            except StopIteration as done:
+                return done.value
+            try:
+                result, error = getattr(self, call.name)(*call.args, **call.kwargs), None
+            except BaseException as exc:  # handed to the op, which may catch it
+                result, error = None, exc
+
+    def _blocking(self, fn: Any, *args: Any) -> Any:
+        return fn(*args)
+
+    def close(self) -> None:
+        """Does nothing: urllib keeps no connection open between calls. It
+        is here so code written for :class:`AsyncMicroVM`, which holds a
+        connection pool, reads the same."""
+
+    def __enter__(self) -> "MicroVM":
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        self.close()
 
     def _request(
         self,
@@ -2607,16 +2379,7 @@ class MicroVM:
             if self._ssl_context is not None:
                 open_kwargs["context"] = self._ssl_context
             request = urllib.request.Request(url, data=body, method=method)
-            # The caller's extra headers go first, so the SDK's own below
-            # replace any clash rather than the other way round.
-            for header_key, header_val in self._extra_headers.items():
-                request.add_header(header_key, header_val)
-            request.add_header("Authorization", f"Bearer {self.pat_token}")
-            if self.team:
-                request.add_header(TEAM_HEADER, self.team)
-            if content_type is not None:
-                request.add_header("Content-Type", content_type)
-            for header_key, header_val in (extra_headers or {}).items():
+            for header_key, header_val in self._header_items(content_type, extra_headers):
                 request.add_header(header_key, header_val)
 
             try:
@@ -2642,17 +2405,13 @@ class MicroVM:
                     # Free the socket before the backoff sleep.
                     exc.close()
                 else:
-                    wait = _parse_retry_after(exc.headers.get("Retry-After"), time.time()) if exc.headers is not None else None
                     if payload is None:
                         try:
                             payload = exc.read()
                         finally:
                             exc.close()
-                    try:
-                        data = json.loads(payload.decode("utf-8"))
-                    except (ValueError, TypeError):
-                        raise _new_http_error(exc.code, str(exc.reason), retry_after=wait) from exc
-                    raise _http_error(exc.code, data, str(exc.reason), wait) from exc
+                    retry_header = exc.headers.get("Retry-After") if exc.headers is not None else None
+                    raise _error_from_answer(exc.code, str(exc.reason), retry_header, payload) from exc
             except urllib.error.URLError as exc:
                 last_exc = exc
                 if left is not None and _is_timeout(exc):
@@ -2683,29 +2442,6 @@ class MicroVM:
         assert last_exc is not None
         raise last_exc
 
-    def _retry_delay(self, attempt: int, retry_after: Optional[str], now: float, rand: float) -> float:
-        """Seconds to wait before re-sending. ``attempt`` counts from 0,
-        ``retry_after`` is a 429/503's header (``None`` otherwise) and
-        ``rand`` is uniform in [0, 1).
-
-        Without a usable header it is the exponential backoff ±25%. With one,
-        it never retries sooner than the server asked (nor sooner than the
-        backoff) and adds up to a fifth so clients told the same value spread
-        out. ``maxRetryAfterMs`` is a hard ceiling: when the server asks for
-        at least that long the client is early anyway, so the spread goes
-        below it instead.
-        """
-        backoff = min(self._retry_config["baseDelayMs"] * (2 ** attempt), self._retry_config["maxDelayMs"]) / 1000.0
-        limit = self._retry_config["maxRetryAfterMs"] / 1000.0
-        hint = _parse_retry_after(retry_after, now) if limit > 0 else None
-        if hint is None:
-            return backoff * (0.75 + 0.5 * rand)
-        target = max(hint, backoff)
-        if target >= limit:
-            return limit - limit * 0.2 * rand
-        upper = min(target * 1.2, limit)
-        return target + (upper - target) * rand
-
     def _do_json(
         self,
         method: str,
@@ -2728,17 +2464,11 @@ class MicroVM:
         idempotent: bool = True,
         headers: Optional[Dict[str, str]] = None,
     ) -> tuple[Any, Dict[str, str]]:
-        body = None
-        content_type = None
-        if payload is not None:
-            body = json.dumps(payload).encode("utf-8")
-            content_type = "application/json"
+        body, content_type = _json_body(payload)
         raw, response_headers = self._request_headers(
             method, self._url(path), body, content_type, headers, idempotent=idempotent
         )
-        if raw == b"":
-            return {}, response_headers
-        return json.loads(raw.decode("utf-8")), response_headers
+        return _json_answer(raw), response_headers
 
     def _do_multipart(
         self,
@@ -2751,26 +2481,698 @@ class MicroVM:
         idempotent: bool = True,
         send_once: bool = False,
     ) -> None:
-        boundary = uuid.uuid4().hex
-        body = BytesIO()
-        encoder = body.write
+        body, content_type = _multipart_body(fields, file_field, filename, data)
+        self._request("POST", self._url(path), body, content_type, idempotent=idempotent, send_once=send_once)
 
-        for name, value in fields.items():
-            encoder(f"--{boundary}\r\n".encode("utf-8"))
-            encoder(f"Content-Disposition: form-data; name=\"{name}\"\r\n\r\n".encode("utf-8"))
-            encoder(value.encode("utf-8"))
-            encoder(b"\r\n")
+    def iter_pages(
+        self,
+        *,
+        tags: Optional[Dict[str, str]] = None,
+        include_env: bool = False,
+        name: Optional[str] = None,
+        timeout: Optional[float] = None,
+    ) -> Iterator[List[Sandbox]]:
+        """Yield one server page at a time for bounded-memory fleet scans.
+        ``timeout`` bounds each page's request, not the whole scan."""
+        base_path = self._versioned("/sandboxes") + _build_sandbox_query(tags, include_env, name)
+        page_token = ""
+        for _ in range(_MAX_LIST_PAGES):
+            # Not held across the yield: the caller's code between pages is
+            # not part of a request.
+            with _call_deadline(timeout):
+                page, page_token = self._run(self._op_list_page(base_path, page_token))
+            yield page
+            if page_token == "":
+                return
+        raise MicroVMError("incomplete cluster list: exceeded max pages")
 
-        encoder(f"--{boundary}\r\n".encode("utf-8"))
-        encoder(f"Content-Disposition: form-data; name=\"{file_field}\"; filename=\"{os.path.basename(filename)}\"\r\n".encode("utf-8"))
-        encoder(b"Content-Type: application/octet-stream\r\n\r\n")
-        encoder(data)
-        encoder(b"\r\n")
-        encoder(f"--{boundary}--\r\n".encode("utf-8"))
+    def _exec_stream_handle(self, websocket_module: Any, ws: Any, options: ExecStreamOptions) -> ExecStreamHandle:
+        return ExecStreamHandle(websocket_module, ws, options)
 
-        self._request(
-            "POST", self._url(path), body.getvalue(), f"multipart/form-data; boundary={boundary}", idempotent=idempotent, send_once=send_once
-        )
+    def _session_attach_handle(self, websocket_module: Any, ws: Any, options: SessionAttachOptions) -> SessionAttachHandle:
+        return SessionAttachHandle(websocket_module, ws, options)
+
+    def _file_watch_handle(self, ws: Any, on_event: FileEventCallback) -> FileWatchHandle:
+        return FileWatchHandle(ws, on_event)
+
+    @_timed
+    def create(self, options: Optional[CreateOptions] = None, *, timeout: Optional[float] = None, **fields: Any) -> Sandbox:
+        return self._run(self._op_create(options, **fields))
+
+    @_timed
+    def build_image(self, image: Image, *, timeout: Optional[float] = None) -> str:
+        return self._run(self._op_build_image(image))
+
+    @_timed
+    def build_image_with_push(
+        self,
+        image: Image,
+        *,
+        push: Optional[BuildImagePushOptions] = None,
+        timeout: Optional[float] = None,
+    ) -> BuildImageResult:
+        """Build an Image and optionally push the result to a remote registry.
+
+        When ``push`` is ``None``, behavior matches :meth:`build_image`.
+        Push credentials are forwarded to the daemon as a one-shot
+        ``X-Registry-Auth`` header on the underlying push call and are never
+        persisted server-side.
+        """
+        return self._run(self._op_build_image_with_push(image, push=push))
+
+    @_timed
+    def list(
+        self,
+        *,
+        tags: Optional[Dict[str, str]] = None,
+        include_env: bool = False,
+        name: Optional[str] = None,
+        timeout: Optional[float] = None,
+    ) -> List[Sandbox]:
+        """List sandboxes. ``name`` filters to the caller's sandbox with exactly
+        that name (``?name=``). Servers that predate name lookup ignore the
+        filter and return a normal list; prefer :meth:`get_by_name`, which
+        checks the reply."""
+        return self._run(self._op_list(tags=tags, include_env=include_env, name=name))
+
+    @_timed
+    def get_by_name(self, name: str, *, include_env: bool = False, timeout: Optional[float] = None) -> Optional[Sandbox]:
+        """Return the caller's sandbox with this name, or ``None`` if there is
+        none. Names are unique per owner. The reply is only trusted when it holds
+        at most one sandbox carrying the requested name: a server that predates
+        ``?name=`` ignores the filter and returns an ordinary list page, and
+        acting on its first row would target the wrong sandbox."""
+        return self._run(self._op_get_by_name(name, include_env=include_env))
+
+    @_timed
+    def get_or_create(self, name: str, options: Optional[CreateOptions] = None, *, timeout: Optional[float] = None, **fields: Any) -> Tuple[Sandbox, bool]:
+        """Return the caller's sandbox called ``name``, creating it from
+        ``options`` (the same fields as :meth:`create`) when there is none.
+        Returns ``(sandbox, created)``; ``created`` is True only when this
+        call made the sandbox.
+
+        Safe to retry and to run at the same time from many processes. Names
+        are unique per owner, so when two callers race to create the same
+        name, one gets a 409 and reads the winner's sandbox instead. An
+        existing sandbox is returned as it is: its image and other settings
+        are not compared with ``options``.
+        """
+        return self._run(self._op_get_or_create(name, options, **fields))
+
+    @_timed
+    def get(self, sandbox_id: str, *, include_env: bool = False, timeout: Optional[float] = None) -> Sandbox:
+        return self._run(self._op_get(sandbox_id, include_env=include_env))
+
+    @_timed
+    def start(self, sandbox_id: str, *, timeout: Optional[float] = None) -> Sandbox:
+        return self._run(self._op_start(sandbox_id))
+
+    @_timed
+    def stop(self, sandbox_id: str, *, timeout: Optional[float] = None) -> Sandbox:
+        return self._run(self._op_stop(sandbox_id))
+
+    @_timed
+    def create_snapshot(
+        self, sandbox_id: str, name: str, *, allow_pause: Optional[bool] = None, timeout: Optional[float] = None
+    ) -> SandboxSnapshot:
+        """Save a sandbox's files as a snapshot named ``name``.
+
+        A running sandbox is paused briefly while it is copied (its disk
+        writes wait) and keeps running. Pass ``allow_pause=False`` to have a
+        sandbox that is not stopped refused (HTTP 409) instead.
+        """
+        return self._run(self._op_create_snapshot(sandbox_id, name, allow_pause=allow_pause))
+
+    @_timed
+    def register_snapshot(self, options: RegisterSnapshotOptions, *, timeout: Optional[float] = None) -> SandboxSnapshot:
+        return self._run(self._op_register_snapshot(options))
+
+    @_timed
+    def register_snapshot_from_image(
+        self,
+        name: str,
+        image: Image,
+        options: Optional[RegisterSnapshotOptions] = None,
+        *,
+        timeout: Optional[float] = None,
+    ) -> SandboxSnapshot:
+        return self._run(self._op_register_snapshot_from_image(name, image, options))
+
+    @_timed
+    def get_snapshot(self, name: str, *, timeout: Optional[float] = None) -> SandboxSnapshot:
+        """Look a snapshot up by name. In a cluster the request is routed to
+        the node holding the image."""
+        return self._run(self._op_get_snapshot(name))
+
+    @_timed
+    def list_snapshots(
+        self,
+        limit: Optional[int] = None,
+        starting_after: Optional[str] = None,
+        *,
+        timeout: Optional[float] = None,
+    ) -> SnapshotList:
+        """List the caller's snapshots, one name-ordered page at a time.
+        ``starting_after`` is the exclusive name cursor — pass the last name of
+        the previous page to fetch the next one."""
+        return self._run(self._op_list_snapshots(limit, starting_after))
+
+    @_timed
+    def delete_snapshot(self, name: str, *, timeout: Optional[float] = None) -> None:
+        """Delete a snapshot by name (idempotent 404 if it does not exist)."""
+        return self._run(self._op_delete_snapshot(name))
+
+    @_timed
+    def destroy(self, sandbox_id: str, *, timeout: Optional[float] = None) -> None:
+        return self._run(self._op_destroy(sandbox_id))
+
+    @_timed
+    def destroy_all(self, *, tags: Dict[str, str], timeout: Optional[float] = None) -> List[str]:
+        """Delete every sandbox of yours that carries all of ``tags`` and
+        return the IDs of the ones that are now gone.
+
+        It lists the matches first (every page), then deletes them one at a
+        time. A sandbox that is already gone (404) counts as deleted, so a
+        second call, or two calls at once, is safe. If a delete fails any
+        other way, it stops and raises that error; the sandboxes it already
+        deleted stay deleted, and calling it again finishes the job.
+
+        ``tags`` must not be empty: with no filter this would delete every
+        sandbox you own.
+        """
+        return self._run(self._op_destroy_all(tags=tags))
+
+    @_timed
+    def create_template(self, options: CreateTemplateOptions, *, timeout: Optional[float] = None) -> Template:
+        """Register a Firecracker rootfs template.
+
+        Returns a row in ``status: "pending"`` and kicks the daemon's
+        async build. Poll :meth:`get_template` until ``status`` reaches
+        ``"ready"`` (fast-boot available) or ``"ready_no_snapshot"``
+        (cold boot only).
+
+        Idempotent when ``options["id"]`` is set: a duplicate ID
+        returns 409 so a retried CI step does not create two rows.
+        """
+        return self._run(self._op_create_template(options))
+
+    @_timed
+    def list_templates(self, *, timeout: Optional[float] = None) -> List[Template]:
+        return self._run(self._op_list_templates())
+
+    @_timed
+    def get_template(self, template_id: str, *, timeout: Optional[float] = None) -> Template:
+        return self._run(self._op_get_template(template_id))
+
+    @_timed
+    def delete_template(self, template_id: str, *, timeout: Optional[float] = None) -> None:
+        return self._run(self._op_delete_template(template_id))
+
+    @_timed
+    def create_wasm_module(self, options: CreateWasmModuleOptions, *, timeout: Optional[float] = None) -> WasmModule:
+        """Register a WASM module in the host catalogue.
+
+        Resolution is synchronous — the returned row is typically already
+        ``ready``. Idempotent when ``options["id"]`` is set and matches the
+        same ``moduleRef``.
+        """
+        return self._run(self._op_create_wasm_module(options))
+
+    @_timed
+    def list_wasm_modules(self, *, timeout: Optional[float] = None) -> List[WasmModule]:
+        return self._run(self._op_list_wasm_modules())
+
+    @_timed
+    def get_wasm_module(self, module_id: str, *, timeout: Optional[float] = None) -> WasmModule:
+        return self._run(self._op_get_wasm_module(module_id))
+
+    @_timed
+    def delete_wasm_module(self, module_id: str, *, timeout: Optional[float] = None) -> None:
+        return self._run(self._op_delete_wasm_module(module_id))
+
+    @_timed
+    def push_wasm_module(self, options: PushWasmModuleOptions, *, timeout: Optional[float] = None) -> PushWasmModuleResult:
+        """Upload a compiled core-wasip1 module to the registry under your own
+        credentials, returning the ``oci://`` ref to use as ``moduleRef`` on a
+        later ``create``. The daemon validates and forwards the bytes; it never
+        stores them.
+        """
+        return self._run(self._op_push_wasm_module(options))
+
+    @_timed
+    def rebuild_template(self, template_id: str, *, timeout: Optional[float] = None) -> Template:
+        """Re-run the snapshot phase against an existing template.
+
+        Idempotent under concurrent retry — the daemon's CAS collapses
+        N parallel calls for the same ``ready`` template to one rebuild
+        kick. Returns the row in its post-transition state (typically
+        ``unhealthy``); poll :meth:`get_template` for the transition
+        back to ``ready``.
+
+        Raises :class:`MicroVMHTTPError` with status 412 when the
+        template is in a state where rebuild is not safe (build in
+        flight) or not supported (``ready_no_snapshot``/``failed`` —
+        those need delete+recreate today).
+        """
+        return self._run(self._op_rebuild_template(template_id))
+
+    @_timed
+    def resize(self, sandbox_id: str, options: ResizeOptions, *, timeout: Optional[float] = None) -> Sandbox:
+        return self._run(self._op_resize(sandbox_id, options))
+
+    @_timed
+    def update_lifecycle(self, sandbox_id: str, lifecycle: Lifecycle, *, timeout: Optional[float] = None) -> Sandbox:
+        return self._run(self._op_update_lifecycle(sandbox_id, lifecycle))
+
+    @_timed
+    def reconcile(self, *, timeout: Optional[float] = None) -> None:
+        return self._run(self._op_reconcile())
+
+    @_timed
+    def health(self, *, timeout: Optional[float] = None) -> HealthStatus:
+        return self._run(self._op_health())
+
+    @_timed
+    def mounts(self, sandbox_id: str, *, timeout: Optional[float] = None) -> List[MountSpecRedacted]:
+        return self._run(self._op_mounts(sandbox_id))
+
+    @_timed
+    def clone_generation(self, sandbox_id: str, *, timeout: Optional[float] = None) -> CloneGeneration:
+        return self._run(self._op_clone_generation(sandbox_id))
+
+    @_timed
+    def get_network_usage(self, sandbox_id: str, *, timeout: Optional[float] = None) -> NetworkUsage:
+        return self._run(self._op_get_network_usage(sandbox_id))
+
+    @_timed
+    def check_network_policy(self, options: NetworkPolicyCheckOptions, *, timeout: Optional[float] = None) -> NetworkPolicyCheckResult:
+        """Ask whether a sandbox created with these egress fields would reach
+        a destination, with the same matcher the filter enforces. No sandbox
+        is needed."""
+        return self._run(self._op_check_network_policy(options))
+
+    @_timed
+    def get_audit(self, sandbox_id: str, options: Optional[AuditOptions] = None, *, timeout: Optional[float] = None) -> AuditPage:
+        return self._run(self._op_get_audit(sandbox_id, options))
+
+    @_timed
+    def set_network_limits(self, sandbox_id: str, options: SetNetworkLimitsOptions, *, timeout: Optional[float] = None) -> NetworkUsage:
+        return self._run(self._op_set_network_limits(sandbox_id, options))
+
+    @_timed
+    def set_network_policy(self, sandbox_id: str, options: NetworkPolicyOptions, *, timeout: Optional[float] = None) -> NetworkPolicy:
+        return self._run(self._op_set_network_policy(sandbox_id, options))
+
+    @_timed
+    def get_network_learned(self, sandbox_id: str, *, timeout: Optional[float] = None) -> NetworkLearned:
+        """Read what a sandbox reached in learn mode and the allow list that
+        would have allowed it."""
+        return self._run(self._op_get_network_learned(sandbox_id))
+
+    @_timed
+    def put_egress_profile(self, name: str, options: EgressProfileOptions, *, timeout: Optional[float] = None) -> EgressProfile:
+        """Create or replace a named egress profile (a full replace: the same
+        body twice is a no-op). A change reaches every sandbox using it."""
+        return self._run(self._op_put_egress_profile(name, options))
+
+    @_timed
+    def get_egress_profile(self, name: str, *, timeout: Optional[float] = None) -> EgressProfile:
+        return self._run(self._op_get_egress_profile(name))
+
+    @_timed
+    def list_egress_profiles(self, options: Optional[ListEgressProfilesOptions] = None, *, timeout: Optional[float] = None) -> EgressProfileList:
+        return self._run(self._op_list_egress_profiles(options))
+
+    @_timed
+    def delete_egress_profile(self, name: str, *, timeout: Optional[float] = None) -> None:
+        """Delete a profile; one that sandboxes still reference is refused (409)."""
+        return self._run(self._op_delete_egress_profile(name))
+
+    @_timed
+    def put_warm_pool(self, image: str, options: WarmPoolOptions, *, timeout: Optional[float] = None) -> WarmPool:
+        """Set how many ready sandboxes every server with a warm pool keeps
+        for an image (a full replace: the same call twice is a no-op). A
+        create that names the image then starts from a warm sandbox. Admin only."""
+        return self._run(self._op_put_warm_pool(image, options))
+
+    @_timed
+    def get_warm_pool(self, image: str, *, timeout: Optional[float] = None) -> WarmPool:
+        """An image's warm-pool entry with its status (ready and target, per server)."""
+        return self._run(self._op_get_warm_pool(image))
+
+    @_timed
+    def list_warm_pools(self, *, timeout: Optional[float] = None) -> List[WarmPool]:
+        """Every warm-pool entry, by image, with its status."""
+        return self._run(self._op_list_warm_pools())
+
+    @_timed
+    def delete_warm_pool(self, image: str, *, timeout: Optional[float] = None) -> None:
+        """Delete an image's warm-pool entry; its warm sandboxes are removed.
+        Deleting a missing entry succeeds."""
+        return self._run(self._op_delete_warm_pool(image))
+
+    @_timed
+    def whoami(self, *, timeout: Optional[float] = None) -> WhoAmI:
+        """Who the server says the caller is: principal, role, team and when
+        the credential expires. Every valid credential may ask."""
+        return self._run(self._op_whoami())
+
+    @_timed
+    def exec(self, sandbox_id: str, request: ExecRequest, *, timeout: Optional[float] = None) -> ExecResult:
+        return self._run(self._op_exec(sandbox_id, request))
+
+    @_timed
+    def exec_stream(self, sandbox_id: str, options: ExecStreamOptions, *, timeout: Optional[float] = None) -> ExecStreamHandle:
+        return self._run(self._op_exec_stream(sandbox_id, options))
+
+    @_timed
+    def create_session(self, sandbox_id: str, options: CreateSessionOptions, *, timeout: Optional[float] = None) -> Session:
+        return self._run(self._op_create_session(sandbox_id, options))
+
+    @_timed
+    def list_sessions(self, sandbox_id: str, *, timeout: Optional[float] = None) -> List[Session]:
+        return self._run(self._op_list_sessions(sandbox_id))
+
+    @_timed
+    def get_session(self, sandbox_id: str, session_id: str, *, timeout: Optional[float] = None) -> Session:
+        return self._run(self._op_get_session(sandbox_id, session_id))
+
+    @_timed
+    def delete_session(self, sandbox_id: str, session_id: str, *, timeout: Optional[float] = None) -> None:
+        return self._run(self._op_delete_session(sandbox_id, session_id))
+
+    @_timed
+    def signal_session(self, sandbox_id: str, session_id: str, signal: str, *, timeout: Optional[float] = None) -> None:
+        return self._run(self._op_signal_session(sandbox_id, session_id, signal))
+
+    @_timed
+    def resize_session(self, sandbox_id: str, session_id: str, cols: int, rows: int, *, timeout: Optional[float] = None) -> None:
+        return self._run(self._op_resize_session(sandbox_id, session_id, cols, rows))
+
+    @_timed
+    def session_log(self, sandbox_id: str, session_id: str, *, timeout: Optional[float] = None) -> bytes:
+        return self._run(self._op_session_log(sandbox_id, session_id))
+
+    @_timed
+    def session_recording(self, sandbox_id: str, session_id: str, *, timeout: Optional[float] = None) -> bytes:
+        return self._run(self._op_session_recording(sandbox_id, session_id))
+
+    @_timed
+    def attach_session(
+        self,
+        sandbox_id: str,
+        session_id: str,
+        options: Optional[SessionAttachOptions] = None,
+        *,
+        timeout: Optional[float] = None,
+    ) -> SessionAttachHandle:
+        return self._run(self._op_attach_session(sandbox_id, session_id, options))
+
+    def _require_toolbox_features(self, sandbox_id: str, *features: str) -> None:
+        """Fail closed unless the sandbox's agent lists every feature.
+
+        toolboxd ignores request options it does not know, so sending a newer
+        option to an older agent would silently skip it. The agent lists the
+        options it understands on /version.
+        """
+        return self._run(self._op_require_toolbox_features(sandbox_id, *features))
+
+    @_timed
+    def upload_file(
+        self,
+        sandbox_id: str,
+        target_path: str,
+        data: bytes,
+        *,
+        append: bool = False,
+        create_only: bool = False,
+        atomic: bool = False,
+        mode: Optional[int] = None,
+        timeout: Optional[float] = None,
+    ) -> None:
+        """Upload ``data`` to ``target_path``; missing folders are made.
+
+        By default an existing file is replaced in place. ``append`` adds to
+        it instead. ``create_only`` writes only if the file does not exist
+        yet (HTTP 412 otherwise; of two racing uploads exactly one wins).
+        ``atomic`` writes a temp file and renames it into place, so readers
+        never see half a file. ``mode`` (such as ``0o600``) sets the
+        permissions. ``append`` cannot be combined with ``create_only`` or
+        ``atomic``.
+
+        Plain and atomic uploads retry on 421/429/502/503/504; ``append`` and
+        ``create_only`` only on 429/503, because a second send would append
+        twice or find the first one's file.
+        """
+        return self._run(self._op_upload_file(sandbox_id, target_path, data, append=append, create_only=create_only, atomic=atomic, mode=mode))
+
+    @_timed
+    def upload_dir(self, sandbox_id: str, local_dir: str, remote_dir: str, *, timeout: Optional[float] = None) -> None:
+        """Copy the local folder ``local_dir`` into ``remote_dir`` in the
+        sandbox (made if missing). The folder is packed as a gzipped tar and
+        the sandbox unpacks it safely: no entry can land outside
+        ``remote_dir``. Symlinks are sent as links, hard-linked files as
+        separate files; devices, pipes and sockets are skipped. The archive
+        is held in memory and sent once, never retried (plan section 10).
+        """
+        return self._run(self._op_upload_dir(sandbox_id, local_dir, remote_dir))
+
+    @_timed
+    def download_file(self, sandbox_id: str, target_path: str, *, max_bytes: Optional[int] = None, timeout: Optional[float] = None) -> bytes:
+        """Read a whole file. ``max_bytes`` refuses a larger one with
+        :class:`MicroVMFileTooLargeError`. Retries like any safe call."""
+        return self._run(self._op_download_file(sandbox_id, target_path, max_bytes=max_bytes))
+
+    @_timed
+    def download_file_to(
+        self,
+        sandbox_id: str,
+        target_path: str,
+        dest: Any,
+        *,
+        max_bytes: Optional[int] = None,
+        chunk_size: int = 1 << 20,
+        timeout: Optional[float] = None,
+    ) -> int:
+        """Stream a file into ``dest`` (anything with ``write``, such as an
+        open file) a piece at a time, so a large file never sits in memory.
+        Returns the bytes written. ``max_bytes`` refuses a larger file:
+        before reading when the server states the size, otherwise as soon as
+        more arrives (what was written stays in ``dest``). The request
+        retries until the file starts to arrive, never after."""
+        return self._run(self._op_download_file_to(sandbox_id, target_path, dest, max_bytes=max_bytes, chunk_size=chunk_size))
+
+    @_timed
+    def upload_file_from(
+        self,
+        sandbox_id: str,
+        target_path: str,
+        src: Any,
+        *,
+        append: bool = False,
+        create_only: bool = False,
+        atomic: bool = False,
+        mode: Optional[int] = None,
+        chunk_size: int = 1 << 20,
+        timeout: Optional[float] = None,
+    ) -> None:
+        """Upload from ``src`` (anything with ``read``, such as an open
+        file) a piece at a time, so a large file never sits in memory. The
+        options are :meth:`upload_file`'s. The data is read as it is sent,
+        so the request is sent once and never retried."""
+        return self._run(self._op_upload_file_from(sandbox_id, target_path, src, append=append, create_only=create_only, atomic=atomic, mode=mode, chunk_size=chunk_size))
+
+    @_timed
+    def watch_files(
+        self,
+        sandbox_id: str,
+        path: str,
+        on_event: FileEventCallback,
+        recursive: bool = False,
+        *,
+        timeout: Optional[float] = None,
+    ) -> FileWatchHandle:
+        """Watch a folder in the sandbox for changes.
+
+        Calls ``on_event`` with a :class:`FileEvent` for every create, write,
+        remove, rename and chmod under ``path`` (and in every subfolder, new
+        ones included, when ``recursive``). Returns once the watch is in
+        place, so a change made after this returns is always seen.
+
+        File watching works on gVisor and Firecracker sandboxes only; others
+        answer :class:`MicroVMHTTPError` with status 501. A sandbox whose
+        agent predates file watching raises
+        :class:`MicroVMUnsupportedFeatureError`. The connection is opened
+        once and never retried.
+        """
+        return self._run(self._op_watch_files(sandbox_id, path, on_event, recursive))
+
+    @_timed
+    def list_files(self, sandbox_id: str, path: str, *, depth: int = 1, limit: int = DEFAULT_LIST_LIMIT, timeout: Optional[float] = None) -> FileList:
+        """List a folder, ``depth`` levels down (1 is the folder's own
+        entries), returning at most ``limit`` entries. Symlinked folders are
+        listed but never entered. ``truncated`` says more entries exist."""
+        return self._run(self._op_list_files(sandbox_id, path, depth=depth, limit=limit))
+
+    @_timed
+    def get_file_info(self, sandbox_id: str, path: str, *, timeout: Optional[float] = None) -> FileInfo:
+        """Describe one path. A symlink is followed."""
+        return self._run(self._op_get_file_info(sandbox_id, path))
+
+    @_timed
+    def file_exists(self, sandbox_id: str, path: str, *, timeout: Optional[float] = None) -> bool:
+        """Whether ``path`` exists. A missing sandbox raises, it is not False."""
+        return self._run(self._op_file_exists(sandbox_id, path))
+
+    @_timed
+    def delete_file(self, sandbox_id: str, path: str, *, recursive: bool = False, timeout: Optional[float] = None) -> None:
+        """Delete a file, or a folder and everything in it with
+        ``recursive=True``. A folder without it is refused (HTTP 409)."""
+        return self._run(self._op_delete_file(sandbox_id, path, recursive=recursive))
+
+    @_timed
+    def make_dir(self, sandbox_id: str, path: str, *, parents: bool = False, mode: Optional[int] = None, timeout: Optional[float] = None) -> None:
+        """Make a folder. ``parents=True`` also makes missing parents and
+        accepts an existing folder (``mkdir -p``). ``mode`` (such as
+        ``0o750``) defaults to 0755."""
+        return self._run(self._op_make_dir(sandbox_id, path, parents=parents, mode=mode))
+
+    @_timed
+    def move_file(self, sandbox_id: str, source: str, destination: str, *, overwrite: bool = False, timeout: Optional[float] = None) -> None:
+        """Move or rename a file or folder. Without ``overwrite`` an existing
+        destination is refused (HTTP 409)."""
+        return self._run(self._op_move_file(sandbox_id, source, destination, overwrite=overwrite))
+
+    @_timed
+    def copy_file(self, sandbox_id: str, source: str, destination: str, *, overwrite: bool = False, recursive: bool = False, timeout: Optional[float] = None) -> None:
+        """Copy a file, or a folder with ``recursive=True`` (keeping modes
+        and symlinks). Without ``overwrite`` an existing destination is
+        refused (HTTP 409)."""
+        return self._run(self._op_copy_file(sandbox_id, source, destination, overwrite=overwrite, recursive=recursive))
+
+    @_timed
+    def search_files(self, sandbox_id: str, path: str, pattern: str, *, timeout: Optional[float] = None) -> List[str]:
+        """Paths under ``path`` whose name matches a glob such as ``*.py``."""
+        return self._run(self._op_search_files(sandbox_id, path, pattern))
+
+    @_timed
+    def find_in_files(self, sandbox_id: str, path: str, text: str, *, timeout: Optional[float] = None) -> List[FileMatch]:
+        """Each line under ``path`` that contains ``text`` (plain text)."""
+        return self._run(self._op_find_in_files(sandbox_id, path, text))
+
+    @_timed
+    def expose_port(
+        self,
+        sandbox_id: str,
+        port: int,
+        *,
+        protocol: ExposeProtocol = "http",
+        visibility: Optional[ExposeVisibility] = None,
+        timeout: Optional[float] = None,
+    ) -> ExposeResult:
+        """Publish a sandbox container port.
+
+        ``protocol`` selects the wire surface and defaults to ``"http"``:
+
+        - ``"http"``: Caddy HTTP reverse proxy at ``https://<id>-<port>.<domain>``.
+        - ``"tcp"``:  raw caddy-l4 listener on a parent-host port. Pair with
+                      native protocol clients (psql, redis-cli, mysql, mongosh).
+        - ``"tls"``:  caddy-l4 TLS-SNI route on the shared listener. Requires
+                      the daemon to have a domain configured AND
+                      ``SB_L4_TLS_LISTEN`` set.
+
+        ``visibility="token"`` makes the URL need a sandbox token for this
+        port (see :meth:`Sandbox.create_token`). Left out, a new port is
+        public and an exposed port keeps what it has; pass it to change it.
+
+        Returns an :class:`ExposeResult`. ``host`` and ``host_port`` are
+        populated only on the ``"tcp"`` path.
+        """
+        return self._run(self._op_expose_port(sandbox_id, port, protocol=protocol, visibility=visibility))
+
+    @_timed
+    def unexpose_port(self, sandbox_id: str, port: int, *, timeout: Optional[float] = None) -> None:
+        return self._run(self._op_unexpose_port(sandbox_id, port))
+
+    @_timed
+    def create_sandbox_token(
+        self,
+        sandbox_id: str,
+        *,
+        expires_in: str,
+        port: Optional[int] = None,
+        path_prefix: Optional[str] = None,
+        methods: Optional[List[str]] = None,
+        timeout: Optional[float] = None,
+    ) -> SandboxToken:
+        """Issue a signed token scoped to one sandbox, to hand to a browser
+        or an end user (``POST /v1/sandboxes/{id}/tokens``).
+
+        ``expires_in`` is required ("15m", "2h", "1d"); the server caps it
+        (24 hours by default). With ``port`` the token opens that port's
+        public URL (a port exposed with ``visibility="token"``); without it
+        the token is for the toolbox: commands, files and sessions.
+        ``path_prefix`` and ``methods`` narrow it further.
+
+        Not idempotent by nature: every call makes a new token and the
+        server stores none. It uses the normal retry tier: a retry after a
+        lost answer makes a second token nobody holds, which simply expires.
+        """
+        return self._run(self._op_create_sandbox_token(sandbox_id, expires_in=expires_in, port=port, path_prefix=path_prefix, methods=methods))
+
+    @_timed
+    def add_custom_domain(
+        self,
+        sandbox_id: str,
+        hostname: str,
+        *,
+        port: Optional[int] = None,
+        timeout: Optional[float] = None,
+    ) -> List[CustomDomain]:
+        """Attach a public hostname to a sandbox.
+
+        Returns the post-attach list of :class:`CustomDomain` rows so callers
+        can read the initial ``status`` (typically ``"pending_dns"``) without
+        a follow-up GET. Server lowercases the hostname; case is preserved
+        as-passed.
+
+        ``port`` pins the container port traffic to this hostname dials. Omit
+        (or pass ``0``) to route to the sandbox's toolbox port (the default).
+        Re-adding the same hostname with a different ``port`` returns 409 —
+        detach first.
+        """
+        return self._run(self._op_add_custom_domain(sandbox_id, hostname, port=port))
+
+    @_timed
+    def list_custom_domains(self, sandbox_id: str, *, timeout: Optional[float] = None) -> List[CustomDomain]:
+        return self._run(self._op_list_custom_domains(sandbox_id))
+
+    @_timed
+    def remove_custom_domain(self, sandbox_id: str, hostname: str, *, timeout: Optional[float] = None) -> None:
+        return self._run(self._op_remove_custom_domain(sandbox_id, hostname))
+
+    @_timed
+    def dns_target(self, *, timeout: Optional[float] = None) -> IngressTarget:
+        """Return the DNS target operators should point custom hostnames at.
+
+        Surfaces the daemon's resolved ingress identity — typically a single
+        ``hostname`` (CNAME) or a list of ``ips`` (A/AAAA), plus a ``source``
+        tag describing how it was resolved. Use this when rendering generic
+        setup instructions; for per-sandbox per-hostname records call
+        :meth:`custom_domain_dns` instead.
+        """
+        return self._run(self._op_dns_target())
+
+    @_timed
+    def custom_domain_dns(self, sandbox_id: str, *, timeout: Optional[float] = None) -> CustomDomainDNSRecords:
+        """Return the DNS records to publish for this sandbox's custom domains.
+
+        Returns one :class:`DNSRecord` per attached hostname (empty list if
+        no domains are attached) bundled with the underlying
+        :class:`IngressTarget`, so callers can render full DNS setup
+        instructions without a follow-up :meth:`dns_target` call.
+        """
+        return self._run(self._op_custom_domain_dns(sandbox_id))
 
 
 class Tokens:
@@ -2791,34 +3193,23 @@ class Tokens:
         reply was lost; that secret cannot be recovered, so revoke the token
         and create it again.
         """
-        resolved: Dict[str, Any] = {**(options or {}), **fields}
-        body = {
-            "name": str(_first_of(resolved, "name") or ""),
-            "role": str(_first_of(resolved, "role") or ""),
-            "team": str(_first_of(resolved, "team") or ""),
-            "expires_in": str(_first_of(resolved, "expiresIn", "expires_in") or ""),
-        }
-        payload = self._client._do_json("POST", self._client._versioned("/tokens"), body) or {}
-        created: CreatedAPIToken = {**_from_api_api_token(payload), "token": str(payload.get("token") or "")}  # type: ignore[typeddict-item]
-        return created
+        return self._client._run(self._client._op_create_api_token(options, **fields))
 
     @_timed
     def list(self, *, timeout: Optional[float] = None) -> APITokenList:
         """Every token, expired ones included (``expired`` is True) until the
         server removes them 30 days after expiry. Never a secret."""
-        payload = self._client._do_json("GET", self._client._versioned("/tokens"), None) or {}
-        tokens = payload.get("tokens") if isinstance(payload, dict) else None
-        return {"tokens": [_from_api_api_token(t) for t in tokens or [] if isinstance(t, dict)]}
+        return self._client._run(self._client._op_list_api_tokens())
 
     @_timed
     def revoke(self, token_id: str, *, timeout: Optional[float] = None) -> None:
         """Revoke a token by id (tok_…). Revoking one that is already gone
         succeeds, so a retried revoke is safe."""
-        trimmed = (token_id or "").strip()
-        if not trimmed:
-            raise ValueError("token id is required")
-        self._client._do_json("DELETE", self._client._versioned(f"/tokens/{urllib.parse.quote(trimmed, safe='')}"), None)
+        return self._client._run(self._client._op_revoke_api_token(token_id))
 
+
+MicroVM._sandbox_class = Sandbox
+MicroVM._tokens_class = Tokens
 
 def _from_api_whoami(payload: Dict[str, Any]) -> WhoAmI:
     principal = payload.get("principal") or {}
@@ -2954,6 +3345,55 @@ def _websocket_tls(ssl_context: Optional[ssl.SSLContext]) -> Dict[str, Any]:
     return {} if ssl_context is None else {"sslopt": {"context": ssl_context}}
 
 
+def _open_exec_stream(websocket_module: Any, ws_url: str, headers: List[str], ssl_context: Any, start: str) -> Any:
+    """Opens an exec stream and sends its start message. Blocking, so the
+    async client runs it on a worker thread."""
+    ws = _connect_websocket(websocket_module, ws_url, headers, "exec stream", ssl_context)
+    ws.send(start)
+    return ws
+
+
+def _open_session_attach(websocket_module: Any, ws_url: str, headers: List[str], ssl_context: Any, resize: Optional[str]) -> Any:
+    """Attaches to a session, sending the first terminal size if given.
+    Blocking, like _open_exec_stream."""
+    ws = _connect_websocket(websocket_module, ws_url, headers, "session attach", ssl_context)
+    if resize is not None:
+        ws.send(resize)
+    return ws
+
+
+def _open_file_watch(websocket_module: Any, ws_url: str, headers: List[str], sandbox_id: str, ssl_context: Any) -> Any:
+    """Opens a file watch and returns once toolboxd says it is armed, so a
+    change the caller makes right after is never missed. Blocking, like
+    _open_exec_stream."""
+    ws = _connect_watch_websocket(websocket_module, ws_url, headers, sandbox_id, ssl_context)
+    # The wait for the start frame is bounded: a proxy that accepts the
+    # upgrade and then goes quiet would otherwise hang the caller forever.
+    # The bound is lifted afterwards, because a quiet folder sends nothing
+    # for as long as it stays quiet.
+    settimeout = getattr(ws, "settimeout", None)
+    left = _time_left()
+    start_wait = _WATCH_START_TIMEOUT_SECONDS if left is None else max(min(left, _WATCH_START_TIMEOUT_SECONDS), 0.001)
+    if callable(settimeout):
+        settimeout(start_wait)
+    try:
+        first = ws.recv()
+        frame = json.loads(first) if isinstance(first, str) else None
+    except Exception as exc:
+        _close_quietly(ws)
+        if left is not None and start_wait < _WATCH_START_TIMEOUT_SECONDS and "timeout" in type(exc).__name__.lower():
+            raise _deadline_error() from exc
+        if "timeout" in type(exc).__name__.lower():
+            raise MicroVMError(f"file watch did not start within {_WATCH_START_TIMEOUT_SECONDS:g}s") from exc
+        raise MicroVMError(f"file watch closed before it started: {exc}") from exc
+    if not isinstance(frame, dict) or frame.get("type") != "start":
+        _close_quietly(ws)
+        raise MicroVMError(f"file watch did not start: unexpected first message {first!r}")
+    if callable(settimeout):
+        settimeout(None)
+    return ws
+
+
 def _close_quietly(ws: Any) -> None:
     try:
         ws.close()
@@ -3068,6 +3508,44 @@ def _tar_folder(local_dir: str) -> bytes:
             # os.walk lists a symlink to a folder among the folders but does
             # not enter it; it was added above as a link.
     return buf.getvalue()
+
+
+def _error_from_answer(status: int, reason: str, retry_after: Optional[str], payload: Optional[bytes]) -> MicroVMHTTPError:
+    """The error for an HTTP error answer, whichever transport read it: the
+    server's JSON error when the body is one, else the reason phrase."""
+    wait = _parse_retry_after(retry_after, time.time())
+    try:
+        data = json.loads((payload or b"").decode("utf-8"))
+    except (ValueError, TypeError):
+        return _new_http_error(status, reason, retry_after=wait)
+    return _http_error(status, data, reason, wait)
+
+
+def _json_body(payload: Optional[Dict[str, Any]]) -> Tuple[Optional[bytes], Optional[str]]:
+    if payload is None:
+        return None, None
+    return json.dumps(payload).encode("utf-8"), "application/json"
+
+
+def _json_answer(raw: bytes) -> Any:
+    return {} if raw == b"" else json.loads(raw.decode("utf-8"))
+
+
+def _multipart_body(fields: Dict[str, str], file_field: str, filename: str, data: bytes) -> Tuple[bytes, str]:
+    boundary = uuid.uuid4().hex
+    body = BytesIO()
+    for name, value in fields.items():
+        body.write(f"--{boundary}\r\n".encode("utf-8"))
+        body.write(f"Content-Disposition: form-data; name=\"{name}\"\r\n\r\n".encode("utf-8"))
+        body.write(value.encode("utf-8"))
+        body.write(b"\r\n")
+    body.write(f"--{boundary}\r\n".encode("utf-8"))
+    body.write(f"Content-Disposition: form-data; name=\"{file_field}\"; filename=\"{os.path.basename(filename)}\"\r\n".encode("utf-8"))
+    body.write(b"Content-Type: application/octet-stream\r\n\r\n")
+    body.write(data)
+    body.write(b"\r\n")
+    body.write(f"--{boundary}--\r\n".encode("utf-8"))
+    return body.getvalue(), f"multipart/form-data; boundary={boundary}"
 
 
 def _error_code(payload: Optional[bytes]) -> str:

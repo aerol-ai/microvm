@@ -792,7 +792,7 @@ Each SDK can delete a sandbox for you when a block of code ends, even when that 
 | SDK | The block | Turn on delete |
 |---|---|---|
 | TypeScript | `await using sandbox = ...` | `destroyOnExit: true` on `create` or `getOrCreate`, or `sandbox.destroyOnExit = true` |
-| Python | `with ... as sandbox:` | `destroy_on_exit=True` on `create` or `get_or_create`, or `sandbox.destroy_on_exit = True` |
+| Python | `with ... as sandbox:`, or `async with` for a sandbox from `AsyncMicroVM` | `destroy_on_exit=True` on `create` or `get_or_create`, or `sandbox.destroy_on_exit = True` |
 | Go | `defer sandbox.Close(ctx)` | `sandbox.DestroyOnClose = true` |
 | Rust | the scope of a `SandboxGuard` | `sandbox.destroy_on_drop()` returns the guard |
 | Java | `try (Sandbox sandbox = ...)` | `setDestroyOnClose(true)` on `CreateOptions` or on the sandbox |

@@ -19,6 +19,12 @@ An SDK is a library that lets your code talk to the AerolVM server. There is one
     ```bash
     pip install aerolvm-sdk
     ```
+
+    For the asyncio client, `AsyncMicroVM`, add the `async` extra. It also installs `httpx`:
+
+    ```bash
+    pip install "aerolvm-sdk[async]"
+    ```
   </TabItem>
   <TabItem label="Go">
     ```bash
@@ -251,6 +257,90 @@ In Python, `ca_file` replaces the system's CA list for this client, like `verify
     // and KeyManagerFactory.
     HttpClient http = HttpClient.newBuilder().sslContext(sslContext).build();
     MicroVMClient client = new MicroVMClient(new MicroVMConfig().setHttpClient(http));
+    ```
+  </TabItem>
+</Tabs>
+
+## Run many calls at the same time
+
+An agent often runs many sandboxes at once. Each SDK lets you send calls side by side, in the way that is normal for its language:
+
+- **TypeScript:** every call returns a promise. Use `Promise.all`.
+- **Python:** use `AsyncMicroVM` with `asyncio`. It has every call `MicroVM` has, as coroutines, and runs the same request code, so the two always act the same. Close it with `async with`. Callbacks from live streams run on the event loop. The plain `MicroVM` also works from threads.
+- **Go:** the client is safe to share between goroutines.
+- **Rust:** the client blocks, so run calls on threads. Clone the client for each thread.
+- **Java:** the client is safe to share between threads. Run calls on an `ExecutorService`.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const sandboxes = await Promise.all(
+      ["a", "b", "c"].map((name) => client.getOrCreate(name, { image: "python:3.12" })),
+    );
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    import asyncio
+
+    from microvm import AsyncMicroVM
+
+
+    async def main():
+        async with AsyncMicroVM() as client:
+            results = await asyncio.gather(
+                *(client.get_or_create(name, image="python:3.12") for name in ["a", "b", "c"])
+            )
+            for sandbox, created in results:
+                print(sandbox.id, created)
+
+
+    asyncio.run(main())
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    var wg sync.WaitGroup
+    for _, name := range []string{"a", "b", "c"} {
+        wg.Add(1)
+        go func() {
+            defer wg.Done()
+            if _, _, err := client.GetOrCreate(ctx, name, sdktypes.CreateSandboxOptions{Image: "python:3.12"}); err != nil {
+                log.Print(err)
+            }
+        }()
+    }
+    wg.Wait()
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    std::thread::scope(|scope| {
+        for name in ["a", "b", "c"] {
+            let client = client.clone();
+            scope.spawn(move || {
+                client.get_or_create(
+                    name,
+                    CreateOptions {
+                        image: "python:3.12".to_string(),
+                        ..Default::default()
+                    },
+                )
+            });
+        }
+    });
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    ExecutorService pool = Executors.newFixedThreadPool(3);
+    List<Future<GetOrCreateResult>> calls = new ArrayList<>();
+    for (String name : List.of("a", "b", "c")) {
+        calls.add(pool.submit(() -> client.getOrCreate(name, new CreateOptions().setImage("python:3.12"))));
+    }
+    for (Future<GetOrCreateResult> call : calls) {
+        System.out.println(call.get().getSandbox().id);
+    }
     ```
   </TabItem>
 </Tabs>

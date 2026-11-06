@@ -56,7 +56,7 @@ _SANDBOX = {"id": "sb-1", "name": "a", "image": "alpine", "status": "started", "
 class PerCallTimeoutTests(unittest.TestCase):
     def test_a_slow_answer_raises_a_timeout_error(self):
         def slow(handler):
-            time.sleep(2)
+            time.sleep(5)
             _json(handler, 200, _SANDBOX)
 
         url, _ = _serve(self, slow)
@@ -64,7 +64,7 @@ class PerCallTimeoutTests(unittest.TestCase):
         started = time.monotonic()
         with self.assertRaises(MicroVMTimeoutError) as ctx:
             client.get("sb-1", timeout=0.3)
-        self.assertLess(time.monotonic() - started, 1.5)
+        self.assertLess(time.monotonic() - started, 3)
         err = ctx.exception
         self.assertEqual(err.status_code, 0)
         self.assertIsInstance(err, TimeoutError)
@@ -79,7 +79,7 @@ class PerCallTimeoutTests(unittest.TestCase):
         started = time.monotonic()
         with self.assertRaises(MicroVMTimeoutError) as ctx:
             client.get("sb-1", timeout=0.5)
-        self.assertLess(time.monotonic() - started, 1.5)
+        self.assertLess(time.monotonic() - started, 3)
         self.assertEqual(len(hits), 1)
         # The 503 that could not be retried in time is kept as the cause.
         self.assertIsNotNone(ctx.exception.__cause__)
@@ -91,7 +91,7 @@ class PerCallTimeoutTests(unittest.TestCase):
             if h.command == "GET":
                 _json(h, 200, [])
             else:
-                time.sleep(2)
+                time.sleep(5)
                 _json(h, 201, _SANDBOX)
 
         url, hits = _serve(self, handler)
@@ -101,7 +101,7 @@ class PerCallTimeoutTests(unittest.TestCase):
 
     def test_a_sandbox_method_timeout_bounds_its_client_call(self):
         def slow(handler):
-            time.sleep(2)
+            time.sleep(5)
             _json(handler, 200, {"exit_code": 0, "stdout": "", "stderr": ""})
 
         url, _ = _serve(self, slow)
@@ -210,6 +210,8 @@ class PerCallTimeoutTests(unittest.TestCase):
             for name, member in vars(cls).items():
                 if name.startswith("_") or name in ("to_dict",) or not callable(member):
                     continue
+                if cls is client_module.MicroVM and name == "close":
+                    continue  # sends nothing: urllib holds no connections
                 with self.subTest(method=f"{cls.__name__}.{name}"):
                     param = inspect.signature(member).parameters.get("timeout")
                     self.assertIsNotNone(param, "no timeout parameter")

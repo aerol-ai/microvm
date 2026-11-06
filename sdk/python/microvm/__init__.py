@@ -13,6 +13,14 @@ from .client import (
     MicroVMUnsupportedFeatureError,
     Tokens,
 )
+from .aio import (
+    AsyncExecStreamHandle,
+    AsyncFileWatchHandle,
+    AsyncMicroVM,
+    AsyncSandbox,
+    AsyncSessionAttachHandle,
+    AsyncTokens,
+)
 from .image import Image
 from .types import (
     APIToken,
@@ -78,6 +86,12 @@ from .types import (
 
 __all__ = [
     "DEFAULT_LIST_LIMIT",
+    "AsyncExecStreamHandle",
+    "AsyncFileWatchHandle",
+    "AsyncMicroVM",
+    "AsyncSandbox",
+    "AsyncSessionAttachHandle",
+    "AsyncTokens",
     "APIToken",
     "APITokenList",
     "CreateAPITokenOptions",

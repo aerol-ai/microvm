@@ -8,6 +8,13 @@ A lightweight Python SDK for the Aerol.ai MicroVM sandbox API.
 pip install aerolvm-sdk
 ```
 
+For the asyncio client, `AsyncMicroVM`, add the `async` extra. It pulls in
+`httpx`; the plain install needs only `websocket-client`:
+
+```bash
+pip install "aerolvm-sdk[async]"
+```
+
 For local development from this repository:
 
 ```bash
@@ -54,6 +61,33 @@ sandbox.update_lifecycle(
 	}
 )
 print(sandbox.lifecycle)
+```
+
+## Async client
+
+`AsyncMicroVM` has every call `MicroVM` has, as coroutines, built from the
+same request code. Use it with `async with` so its connection pool is
+closed. Stream callbacks (`onStdout`, file watch events) run on the event
+loop.
+
+```python
+import asyncio
+
+from microvm import AsyncMicroVM
+
+
+async def main() -> None:
+    async with AsyncMicroVM() as client:
+        sandboxes = await asyncio.gather(
+            *(client.create(image="python:3.12", destroy_on_exit=True) for _ in range(3))
+        )
+        for sandbox in sandboxes:
+            async with sandbox:
+                result = await sandbox.exec("python -c 'print(42)'", timeout=60)
+                print(result["stdout"])
+
+
+asyncio.run(main())
 ```
 
 ## Build Images
