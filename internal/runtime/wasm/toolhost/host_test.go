@@ -136,12 +136,12 @@ func TestHostFilesAndExec(t *testing.T) {
 		}
 	})
 
-	t.Run("sessions list empty", func(t *testing.T) {
+	t.Run("sessions list refused", func(t *testing.T) {
 		req := httptest.NewRequest(http.MethodGet, "/sessions", nil)
 		req.Header.Set("Authorization", "Bearer tok")
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, req)
-		if rec.Code != http.StatusOK {
+		if rec.Code != http.StatusNotImplemented {
 			t.Fatalf("sessions list status = %d body=%s", rec.Code, rec.Body.String())
 		}
 	})

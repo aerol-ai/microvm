@@ -6,7 +6,6 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/aerol-ai/microvm/cmd/toolboxd/sessions"
 	"github.com/aerol-ai/microvm/internal/version"
 )
 
@@ -17,8 +16,6 @@ type Host struct {
 	authToken string
 	exec      Executor
 	stateKV   StateKV
-	sessions  *sessions.Manager
-	daytona   *daytonaCompat
 }
 
 // Config wires a toolbox host for one sandbox.
@@ -28,23 +25,17 @@ type Config struct {
 	AuthToken string
 	Exec      Executor
 	StateKV   StateKV
-	Sessions  *sessions.Manager
 }
 
 // New constructs a toolbox host.
 func New(cfg Config) *Host {
-	h := &Host{
+	return &Host{
 		sandboxID: cfg.SandboxID,
 		workDir:   cfg.WorkDir,
 		authToken: cfg.AuthToken,
 		exec:      cfg.Exec,
 		stateKV:   cfg.StateKV,
-		sessions:  cfg.Sessions,
 	}
-	if h.sessions != nil {
-		h.daytona = newDaytonaCompat()
-	}
-	return h
 }
 
 // Handler returns an http.Handler implementing the core toolbox surface.
@@ -80,13 +71,11 @@ func (h *Host) serveHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeError(w, http.StatusNotImplemented, "codeInterpreter is not implemented for wasm runtime")
-	case strings.HasPrefix(r.URL.Path, "/process/session"):
+	case isSessionPath(r.URL.Path):
 		if !h.requireAuth(w, r) {
 			return
 		}
-		if !h.handleDaytonaProcessRoute(w, r) {
-			writeError(w, http.StatusNotFound, "not found")
-		}
+		h.handleSessions(w, r)
 	case r.Method == http.MethodPost && r.URL.Path == "/files/upload":
 		if !h.requireAuth(w, r) {
 			return
@@ -112,13 +101,6 @@ func (h *Host) serveHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		h.handleExecStream(w, r)
-	case strings.HasPrefix(r.URL.Path, "/sessions"):
-		if !h.requireAuth(w, r) {
-			return
-		}
-		if !h.handleSessionsRoute(w, r) {
-			writeError(w, http.StatusNotFound, "not found")
-		}
 	default:
 		writeError(w, http.StatusNotFound, "not found")
 	}

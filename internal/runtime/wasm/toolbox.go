@@ -23,6 +23,10 @@ func (d *Driver) ServeToolbox(_ context.Context, sandboxID, token string, w http
 		writeToolboxError(w, http.StatusNotFound, "wasm sandbox not found")
 		return
 	}
+	// Exec is the only command path, and it runs inside the wasm engine (the
+	// sandbox's worker). Nothing here may start a host process: this handler
+	// runs in sandboxd, so a host shell would run as the daemon, not in the
+	// sandbox. That is why there is no sessions Manager (toolhost/sessions.go).
 	cfg := toolhost.Config{
 		SandboxID: sandboxID,
 		WorkDir:   inst.workDir,
@@ -31,9 +35,6 @@ func (d *Driver) ServeToolbox(_ context.Context, sandboxID, token string, w http
 	}
 	if inst.durability == models.DurabilityDurable && d.stateKV != nil {
 		cfg.StateKV = d.stateKV
-	}
-	if mgr, err := d.sessionsFor(inst); err == nil {
-		cfg.Sessions = mgr
 	}
 	host := toolhost.New(cfg)
 	host.Handler().ServeHTTP(w, r)

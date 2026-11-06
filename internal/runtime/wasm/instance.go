@@ -5,7 +5,6 @@ import (
 	"path/filepath"
 	"sync"
 
-	"github.com/aerol-ai/microvm/cmd/toolboxd/sessions"
 	"github.com/aerol-ai/microvm/pkg/models"
 	wasmengine "github.com/aerol-ai/microvm/pkg/wasm"
 )
@@ -45,7 +44,6 @@ type sandboxInstance struct {
 	memoryMB         int
 	diskGB           int
 	durability       string
-	sessions         *sessions.Manager
 
 	// Guest HTTP: resolved host port after ephemeral wasip1 bind (0 in caps).
 	resolvedListenPort int

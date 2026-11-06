@@ -489,27 +489,6 @@ func TestServeToolboxWithInstance(t *testing.T) {
 	}
 }
 
-func TestSessionsFor(t *testing.T) {
-	dir := t.TempDir()
-	workDir := filepath.Join(dir, "sb-sess")
-	if err := os.MkdirAll(workDir, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	d := New(Config{ModulesDir: dir}, nil)
-	inst := &sandboxInstance{sandboxID: "sb-sess", workDir: workDir}
-	if _, err := d.sessionsFor(nil); err == nil {
-		t.Fatal("nil instance expected error")
-	}
-	m1, err := d.sessionsFor(inst)
-	if err != nil {
-		t.Fatalf("sessionsFor: %v", err)
-	}
-	m2, err := d.sessionsFor(inst)
-	if err != nil || m1 != m2 {
-		t.Fatalf("expected cached manager: m1=%p m2=%p err=%v", m1, m2, err)
-	}
-}
-
 func TestSyncGuestListenPorts(t *testing.T) {
 	dir := t.TempDir()
 	runDir := filepath.Join(dir, "run")
