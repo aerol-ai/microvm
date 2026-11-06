@@ -71,6 +71,7 @@ resource "aws_instance" "seed" {
     role                                     = local.seed_node.role
     is_seed                                  = true
     domain                                   = local.domain_name
+    identity_issuer_enabled                  = var.identity_issuer_enabled && local.has_domain
     enable_custom_domains                    = local.enable_custom_domains
     custom_domain_txt_prefix                 = local.custom_domain_txt_prefix
     custom_domain_txt_value_prefix           = local.custom_domain_txt_value_prefix
@@ -311,6 +312,7 @@ resource "aws_instance" "joiner" {
     role                                     = each.value.role
     is_seed                                  = false
     domain                                   = local.domain_name
+    identity_issuer_enabled                  = var.identity_issuer_enabled && local.has_domain
     enable_custom_domains                    = local.enable_custom_domains
     custom_domain_txt_prefix                 = local.custom_domain_txt_prefix
     custom_domain_txt_value_prefix           = local.custom_domain_txt_value_prefix

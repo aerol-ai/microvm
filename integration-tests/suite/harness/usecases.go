@@ -189,6 +189,11 @@ const (
 	// (static JWKS, since the nodes cannot reach the operator's machine)
 	// before the first OIDC case. Needs CapIdentity.
 	CapIdentityOIDC Capability = "identity-oidc"
+	// CapCloudIdentity means every node runs SB_IDENTITY_ISSUER_URL set to
+	// the deployment's https://<domain> (Terraform identity_issuer_enabled),
+	// so sandboxes can get cloud identity tokens
+	// (plans/sandbox-cloud-identity.md, UC-431..437).
+	CapCloudIdentity Capability = "cloud-identity"
 	// CapTokenMirror means the cluster has worker nodes without Raft state,
 	// which check avm_ tokens against the token mirror (role-separated
 	// topologies). UC-291's partition and the token spray need one: on a
@@ -306,7 +311,7 @@ var KnownCapabilities = map[Capability]bool{
 	CapSecrets: true, CapSecretsKMS: true, CapEnterprise: true,
 	CapClusterMTLS: true, CapAuditExport: true, CapAuditWitness: true,
 	CapRemoteMCP: true, CapEgressFQDN: true, CapPrivateCloud: true,
-	CapIdentity: true, CapIdentityOIDC: true, CapTokenMirror: true,
+	CapIdentity: true, CapIdentityOIDC: true, CapTokenMirror: true, CapCloudIdentity: true,
 	CapAuditExportS3: true, CapRollingUpgrade: true, CapPATScopeHost: true,
 	CapL4ProxyProtocol: true, CapPATRotation: true,
 	CapKeyCustodyVault: true, CapKeyCustodyPKCS11: true, CapKeyCustodyKMSWrapped: true,
@@ -1007,6 +1012,14 @@ var Registry = []UseCase{
 	{ID: "UC-420", Title: "Warm pools: deleting an entry drains it (no server reports it, its parked slots are given back), a GET is a 404 and a second DELETE succeeds", Requires: []Capability{CapDockerPool}, Implemented: true},
 	{ID: "UC-421", Title: "Warm pools are admin only: a runner and a viewer token get a 403 naming fleet.admin on list, get, put and delete; an admin token bound to every team lists them", Requires: []Capability{CapIdentity}, Implemented: true},
 	{ID: "UC-422", Title: "Warm pools follow demand: an entry with min_depth 0 and max_depth 2 starts at target 0 on every server; three creates from the image raise a serving server's target and ready above 0 (at most 2)", Requires: []Capability{CapDockerPool}, Implemented: true},
+	// Cloud identity per sandbox (plans/sandbox-cloud-identity.md, plan D1).
+	{ID: "UC-431", Title: "The OIDC discovery document and the JWKS are public: served without a credential, read-only, naming the issuer, and holding RSA public keys only", Requires: []Capability{CapCloudIdentity, CapDomain}, Implemented: true},
+	{ID: "UC-432", Title: "A sandbox created with an identity gets the token file soon after the create returns, with the AWS env, and a token that verifies with the public JWKS and carries the subject, audience, sandbox and one-hour lifetime; the gap is logged", Requires: []Capability{CapCloudIdentity, CapDomain}, Implemented: true},
+	{ID: "UC-433", Title: "A stopped and started sandbox gets a fresh identity token at once (a new jti and a later expiry)", Requires: []Capability{CapCloudIdentity, CapDomain}, Implemented: true},
+	{ID: "UC-434", Title: "A role tag not on the team's allow list is refused with 403, and a runner asking for an admin-only tag is refused with 403", Requires: []Capability{CapCloudIdentity, CapIdentity}, Implemented: true},
+	{ID: "UC-435", Title: "The token push route cannot be reached through the toolbox proxy, and identity env in a create that conflicts with the identity is refused with 400", Requires: []Capability{CapCloudIdentity}, Implemented: true},
+	{ID: "UC-436", Title: "In a cluster a token signed on the sandbox's owner verifies with the JWKS every node serves", Requires: []Capability{CapCloudIdentity, CapCluster}, Implemented: true},
+	{ID: "UC-437", Title: "Taking a role tag off the allow list stops new tokens: a restarted sandbox that used it gets none and says why", Requires: []Capability{CapCloudIdentity, CapDomain}, Implemented: true},
 }
 
 // byID is a lookup built once for the report generator.
