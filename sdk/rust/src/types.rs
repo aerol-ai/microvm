@@ -134,6 +134,16 @@ pub struct PlatformVolumeMount {
     pub path: String,
     #[serde(rename = "read_only", skip_serializing_if = "Option::is_none")]
     pub read_only: Option<bool>,
+    /// `Some(true)` deletes the volume (its files and its record) once the
+    /// last sandbox using it is deleted. It is set when the volume is first
+    /// made; a later sandbox naming the same volume must pass the same value,
+    /// or the create fails with HTTP 409. `None` is `false`: the volume
+    /// outlives its sandboxes.
+    #[serde(
+        rename = "delete_with_sandbox",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub delete_with_sandbox: Option<bool>,
 }
 
 /// GPU hardware vendor for sandbox GPU allocation.

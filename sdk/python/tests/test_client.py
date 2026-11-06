@@ -994,6 +994,8 @@ class ClientTests(unittest.TestCase):
                 "platformVolumes": [
                     {"name": "data", "path": "/workspace"},
                     {"name": "cache", "path": "/cache", "readOnly": True},
+                    {"name": "scratch", "path": "/scratch", "deleteWithSandbox": True},
+                    {"name": "tmp", "path": "/tmp/vol", "delete_with_sandbox": True},
                 ],
             }
         )
@@ -1003,6 +1005,8 @@ class ClientTests(unittest.TestCase):
             [
                 {"name": "data", "path": "/workspace"},
                 {"name": "cache", "path": "/cache", "read_only": True},
+                {"name": "scratch", "path": "/scratch", "delete_with_sandbox": True},
+                {"name": "tmp", "path": "/tmp/vol", "delete_with_sandbox": True},
             ],
         )
 

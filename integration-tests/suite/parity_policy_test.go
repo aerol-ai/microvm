@@ -240,3 +240,95 @@ func TestParityBlockPrivateByDefaultLive(t *testing.T) {
 		}
 	})
 }
+
+// volumeStatus is the Daytona facade's answer for a platform volume by name:
+// the one place the live API reads a volume's record (200 or 404).
+func volumeStatus(t *testing.T, name string) int {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	st, _ := fcDo(t, ctx, http.MethodGet, "", "/daytona/volumes/by-name/"+name, nil, nil)
+	return st
+}
+
+// UC-412 — a delete_with_sandbox volume goes with its sandbox (V1): it is
+// made on first use, holds what the sandbox writes, and its record is gone
+// once the sandbox is destroyed.
+func TestParityVolumeDeletedWithSandboxLive(t *testing.T) {
+	harness.Require(t, sc, "UC-412")
+	c := client(t)
+	vol := volumeName(t)
+	sb := c.NewSandbox(t, sdktypes.CreateSandboxOptions{
+		Name:            harness.UniqueName(sc, t),
+		PlatformVolumes: []sdktypes.PlatformVolumeMount{{Name: vol, Path: "/work", DeleteWithSandbox: true}},
+	})
+	waitRunning(t, sb)
+	execOK(t, sb, "echo scratch > /work/job.txt")
+	if st := volumeStatus(t, vol); st != http.StatusOK {
+		t.Fatalf("volume %s while in use = %d, want 200", vol, st)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	if err := c.SDK().Destroy(ctx, sb.ID); err != nil {
+		t.Fatalf("destroy: %v", err)
+	}
+	deadline := time.Now().Add(30 * time.Second)
+	for volumeStatus(t, vol) != http.StatusNotFound {
+		if time.Now().After(deadline) {
+			t.Fatalf("volume %s still has a record 30 s after its only sandbox was destroyed", vol)
+		}
+		time.Sleep(2 * time.Second)
+	}
+}
+
+// UC-413 — a normal volume survives (V1): on a sandbox that also has a
+// delete_with_sandbox volume, destroying it removes only that one; the
+// normal volume keeps its record and its file for the next sandbox, and a
+// create that names it with delete_with_sandbox is refused with 409.
+func TestParityNormalVolumeSurvivesLive(t *testing.T) {
+	harness.Require(t, sc, "UC-413")
+	c := client(t)
+	keep, scratch := volumeName(t), volumeName(t)+"-s"
+	sb := c.NewSandbox(t, sdktypes.CreateSandboxOptions{
+		Name: harness.UniqueName(sc, t),
+		PlatformVolumes: []sdktypes.PlatformVolumeMount{
+			{Name: keep, Path: "/keep"},
+			{Name: scratch, Path: "/scratch", DeleteWithSandbox: true},
+		},
+	})
+	waitRunning(t, sb)
+	execOK(t, sb, "echo kept-bytes > /keep/data.txt")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	if err := c.SDK().Destroy(ctx, sb.ID); err != nil {
+		t.Fatalf("destroy: %v", err)
+	}
+	deadline := time.Now().Add(30 * time.Second)
+	for volumeStatus(t, scratch) != http.StatusNotFound {
+		if time.Now().After(deadline) {
+			t.Fatalf("delete_with_sandbox volume %s still has a record after destroy", scratch)
+		}
+		time.Sleep(2 * time.Second)
+	}
+	if st := volumeStatus(t, keep); st != http.StatusOK {
+		t.Fatalf("normal volume %s after destroy = %d, want 200", keep, st)
+	}
+
+	_, err := c.SDK().Create(ctx, sdktypes.CreateSandboxOptions{
+		Image: "alpine:3.20", Name: harness.UniqueName(sc, t) + "-flip",
+		PlatformVolumes: []sdktypes.PlatformVolumeMount{{Name: keep, Path: "/keep", DeleteWithSandbox: true}},
+	})
+	var apiErr *microvm.APIError
+	if !errors.As(err, &apiErr) || apiErr.StatusCode != http.StatusConflict || !strings.Contains(apiErr.Message, "delete_with_sandbox") {
+		t.Fatalf("naming a kept volume with delete_with_sandbox = %v, want 409", err)
+	}
+
+	next := c.NewSandbox(t, sdktypes.CreateSandboxOptions{
+		Name:            harness.UniqueName(sc, t),
+		PlatformVolumes: []sdktypes.PlatformVolumeMount{{Name: keep, Path: "/keep"}},
+	})
+	waitRunning(t, next)
+	readBackWithRetry(t, next, "/keep/data.txt", "kept-bytes")
+}

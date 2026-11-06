@@ -3413,11 +3413,19 @@ mod tests {
                 name: "data".to_string(),
                 path: "/workspace".to_string(),
                 read_only: None,
+                delete_with_sandbox: None,
             },
             PlatformVolumeMount {
                 name: "cache".to_string(),
                 path: "/cache".to_string(),
                 read_only: Some(true),
+                delete_with_sandbox: None,
+            },
+            PlatformVolumeMount {
+                name: "scratch".to_string(),
+                path: "/scratch".to_string(),
+                delete_with_sandbox: Some(true),
+                ..Default::default()
             },
         ]);
         let value = serde_json::to_value(&opts).expect("serialize create options");
@@ -3430,6 +3438,14 @@ mod tests {
         assert!(value["platform_volumes"][0].get("read_only").is_none());
         assert_eq!(
             value["platform_volumes"][1]["read_only"],
+            serde_json::json!(true)
+        );
+        // delete_with_sandbox follows the same rule.
+        assert!(value["platform_volumes"][0]
+            .get("delete_with_sandbox")
+            .is_none());
+        assert_eq!(
+            value["platform_volumes"][2]["delete_with_sandbox"],
             serde_json::json!(true)
         );
         // Unset by default => skip_serializing_if omits the field.

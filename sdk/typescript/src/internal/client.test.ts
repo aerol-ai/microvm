@@ -80,15 +80,17 @@ test("internal client create serializes platform volumes", async () => {
     platformVolumes: [
       { name: "data", path: "/workspace" },
       { name: "cache", path: "/cache", readOnly: true },
+      { name: "scratch", path: "/scratch", deleteWithSandbox: true },
     ],
   });
   assert.ok(seenRequest);
   const body = (await seenRequest.json()) as Record<string, unknown>;
-  // read_only is omitted (undefined) for the read-write entry after JSON
-  // serialization, and present+true for the read-only one.
+  // read_only and delete_with_sandbox are omitted (undefined) when unset
+  // after JSON serialization, and present+true when set.
   assert.deepEqual(body.platform_volumes, [
     { name: "data", path: "/workspace" },
     { name: "cache", path: "/cache", read_only: true },
+    { name: "scratch", path: "/scratch", delete_with_sandbox: true },
   ]);
 });
 

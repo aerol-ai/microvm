@@ -2836,6 +2836,7 @@ def _to_api_platform_volume(volume: "PlatformVolumeMount") -> Dict[str, Any]:
             "name": _first_of(volume, "name"),
             "path": _first_of(volume, "path"),
             "read_only": _first_of(volume, "readOnly", "read_only"),
+            "delete_with_sandbox": _first_of(volume, "deleteWithSandbox", "delete_with_sandbox"),
         }
     )
 

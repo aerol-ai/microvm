@@ -823,6 +823,10 @@ type Client interface {
 	// volume. Put/Delete keep this index in the same raft log as volume metadata
 	// so Daytona delete cannot miss a sandbox that lives on another worker.
 	VolumeAttachmentCount(ctx context.Context, tenant, id string) (int, error)
+	// VolumeAttachmentsForSandbox lists the attachments one sandbox holds
+	// (a destroy finds its delete_with_sandbox volumes with it). Read-only;
+	// an agent asks a server, which answers from its replicated FSM.
+	VolumeAttachmentsForSandbox(ctx context.Context, sandboxID string) ([]models.VolumeAttachment, error)
 	PutVolumeAttachments(ctx context.Context, attachments []models.VolumeAttachment) error
 	DeleteVolumeAttachmentsForSandbox(ctx context.Context, sandboxID, incarnationID string) error
 

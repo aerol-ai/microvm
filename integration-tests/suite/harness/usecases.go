@@ -992,6 +992,8 @@ var Registry = []UseCase{
 	// mode) and skip without it.
 	{ID: "UC-410", Title: "Create policy: with SB_CREATE_POLICY_FILE on every node, a create over its CPU limit or asking for a GPU is refused with 403 create_policy_denied naming the rule, one inside the limits runs, and an edit to the file (only Firecracker allowed) refuses a container create within 45 s with no restart", Requires: []Capability{CapDocker}, Implemented: true},
 	{ID: "UC-411", Title: "Block private networks by default: with SB_EGRESS_BLOCK_PRIVATE_BY_DEFAULT on every node, a no-policy sandbox has the private-range deny list on its record, cannot reach a private address that answers with the flag off, still resolves names and reaches the internet; a sandbox with its own policy still reaches it; and its destroy leaves no egress rule for its address", Requires: []Capability{CapDocker}, Excludes: []Capability{CapNoHostFirewall}, Implemented: true},
+	{ID: "UC-412", Title: "Volume lifetime: a platform volume created with delete_with_sandbox holds what its sandbox writes, and its record is gone within 30 s of that sandbox being destroyed", Requires: []Capability{CapDocker, CapPlatformVolumes}, Implemented: true},
+	{ID: "UC-413", Title: "Volume lifetime: destroying a sandbox with a normal and a delete_with_sandbox volume removes only the latter; the normal volume keeps its record and file for the next sandbox, and naming it with delete_with_sandbox is refused with 409", Requires: []Capability{CapDocker, CapPlatformVolumes}, Implemented: true},
 }
 
 // byID is a lookup built once for the report generator.

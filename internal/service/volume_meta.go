@@ -27,6 +27,9 @@ type volumeMetaStore interface {
 	DeleteRow(ctx context.Context, tenant, id string) error
 	ExistsForSource(ctx context.Context, source string) (bool, error)
 	AttachmentCount(ctx context.Context, tenant, id string) (int, error)
+	// AttachmentsForSandbox lists the attachments one sandbox holds; a destroy
+	// reads them before they are released (delete_with_sandbox volumes).
+	AttachmentsForSandbox(ctx context.Context, sandboxID string) ([]models.VolumeAttachment, error)
 	PutAttachments(ctx context.Context, attachments []models.VolumeAttachment) error
 	DeleteAttachmentsForSandbox(ctx context.Context, sandboxID, incarnationID string) error
 }
@@ -63,13 +66,18 @@ func (m sqliteVolumeMeta) List(ctx context.Context, tenant string) ([]models.Vol
 	return m.store.ListVolumes(ctx, tenant)
 }
 func (m sqliteVolumeMeta) DeleteRow(ctx context.Context, tenant, id string) error {
-	return m.store.DeleteVolume(ctx, tenant, id)
+	// Refused while attached, like the FSM's opDeleteVolume: a sandbox that
+	// attached since the caller's count must keep its volume.
+	return m.store.DeleteVolumeIfNoAttachments(ctx, tenant, id)
 }
 func (m sqliteVolumeMeta) ExistsForSource(ctx context.Context, source string) (bool, error) {
 	return m.store.LiveVolumeExistsForSource(ctx, source)
 }
 func (m sqliteVolumeMeta) AttachmentCount(ctx context.Context, tenant, id string) (int, error) {
 	return m.store.CountVolumeAttachments(ctx, tenant, id)
+}
+func (m sqliteVolumeMeta) AttachmentsForSandbox(ctx context.Context, sandboxID string) ([]models.VolumeAttachment, error) {
+	return m.store.ListVolumeAttachmentsForSandbox(ctx, sandboxID)
 }
 func (m sqliteVolumeMeta) PutAttachments(ctx context.Context, attachments []models.VolumeAttachment) error {
 	return m.store.PutVolumeAttachments(ctx, attachments)
@@ -118,6 +126,9 @@ func (m clusterVolumeMeta) ExistsForSource(ctx context.Context, source string) (
 }
 func (m clusterVolumeMeta) AttachmentCount(ctx context.Context, tenant, id string) (int, error) {
 	return m.c.VolumeAttachmentCount(ctx, tenant, id)
+}
+func (m clusterVolumeMeta) AttachmentsForSandbox(ctx context.Context, sandboxID string) ([]models.VolumeAttachment, error) {
+	return m.c.VolumeAttachmentsForSandbox(ctx, sandboxID)
 }
 func (m clusterVolumeMeta) PutAttachments(ctx context.Context, attachments []models.VolumeAttachment) error {
 	if err := m.c.PutVolumeAttachments(ctx, attachments); err != nil {

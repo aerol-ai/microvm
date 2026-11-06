@@ -908,6 +908,10 @@ func open(path string, secretCipher *secrets.Cipher) (*Store, error) {
 		// config; new volumes store the resolved location so delete/reclaim
 		// targets exactly what was created even if config later changes.
 		`ALTER TABLE volumes ADD COLUMN source TEXT NOT NULL DEFAULT '';`,
+		// delete_with_sandbox (plans/agent-sandbox-feature-parity.md V1): the
+		// volume goes, row and bytes, once its last attachment does. 0 on every
+		// pre-migration row, which keeps those volumes as they always were.
+		`ALTER TABLE volumes ADD COLUMN delete_with_sandbox INTEGER NOT NULL DEFAULT 0;`,
 		`ALTER TABLE sandboxes ADD COLUMN net_bytes_in INTEGER NOT NULL DEFAULT 0;`,
 		`ALTER TABLE sandboxes ADD COLUMN net_bytes_out INTEGER NOT NULL DEFAULT 0;`,
 		`ALTER TABLE sandboxes ADD COLUMN net_bytes_in_limit INTEGER NOT NULL DEFAULT 0;`,

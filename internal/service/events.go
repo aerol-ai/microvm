@@ -366,6 +366,7 @@ func (s *Service) handleDestroyEvent(ctx context.Context, sandbox *models.Sandbo
 	if err := s.beginSelfOwnedClusterPlacementDeleteStrict(ctx, sandbox); err != nil {
 		return err
 	}
+	dwsVolumes := s.recordSandboxVolumeDeletes(ctx, sandbox)
 
 	// Secret tomb/outbox before store.Delete / placement delete so recipients
 	// can still be resolved from the sealed row or placement. Shared with
@@ -392,6 +393,7 @@ func (s *Service) handleDestroyEvent(ctx context.Context, sandbox *models.Sandbo
 	if err := s.store.Delete(ctx, sandbox.ID); err != nil && !errors.Is(err, store.ErrNotFound) {
 		return fmt.Errorf("delete sandbox: %w", err)
 	}
+	s.finishSandboxVolumeDeletes(ctx, sandbox.ID, dwsVolumes)
 	if s.admitter != nil {
 		s.admitter.Release(sandbox.ID)
 	}

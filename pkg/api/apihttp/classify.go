@@ -274,7 +274,7 @@ func Classify(err error) Classification {
 		return Classification{Status: http.StatusPreconditionFailed, Message: err.Error()}
 	case errors.Is(err, models.ErrPlatformVolumesUnsupportedRuntime):
 		return Classification{Status: http.StatusBadRequest, Message: err.Error()}
-	case errors.Is(err, models.ErrPlatformVolumeQuota):
+	case errors.Is(err, models.ErrPlatformVolumeQuota), errors.Is(err, models.ErrPlatformVolumeConflict):
 		return Classification{Status: http.StatusConflict, Message: err.Error()}
 
 	// Custom-domain sentinels (plans/custom-domains.md).

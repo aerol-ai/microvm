@@ -113,8 +113,13 @@ func (s *Service) reclaimOne(ctx context.Context, p models.PendingVolumeDeletion
 	if v, err := meta.ByID(ctx, p.Tenant, p.VolumeID); err == nil && v.Source == p.Source {
 		// The delete path writes the ledger before removing the user-visible row.
 		// If the janitor catches that in-between state, keep the row so the next
-		// tick can reclaim after the delete commits.
-		return
+		// tick can reclaim after the delete commits. A delete_with_sandbox
+		// volume's destroy may never get to remove it (a crash, the store
+		// unreachable, a replica that still counted the sandbox), so the sweep
+		// removes it itself once nothing holds it, and goes on to the bytes.
+		if !v.DeleteWithSandbox || !s.sweepDeleteWithSandbox(ctx, *v, p) {
+			return
+		}
 	} else if err != nil && !errors.Is(err, store.ErrNotFound) {
 		s.logger.Warn("volume reclaim live-row check failed", "volume_id", p.VolumeID, "error", err)
 		return

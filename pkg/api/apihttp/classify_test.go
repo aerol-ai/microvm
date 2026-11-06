@@ -48,6 +48,7 @@ func TestClassify(t *testing.T) {
 		// fail-closed 503 while a set file has not loaded.
 		{"create policy denied", &models.CreatePolicyError{Rule: "runtimes", Detail: "runtime \"docker\" is not allowed"}, http.StatusForbidden, 0, models.ErrorCodeCreatePolicyDenied, ErrKindOther},
 		{"create policy invalid", service.ErrCreatePolicyInvalid, http.StatusServiceUnavailable, 0, models.ErrorCodeCreatePolicyInvalid, ErrKindOther},
+		{"platform volume delete_with_sandbox conflict", models.ErrPlatformVolumeConflict, http.StatusConflict, 0, "", ErrKindOther},
 		{"admission unavailable", controlplane.ErrAdmissionUnavailable, http.StatusServiceUnavailable, admissionRetryAfterSeconds, "", ErrKindOther},
 		{"engine not registered", models.ErrContainerEngineNotRegistered, http.StatusServiceUnavailable, admissionRetryAfterSeconds, "", ErrKindOther},
 		{"cluster finalization", service.ErrClusterFinalizationUnavailable, http.StatusServiceUnavailable, 5, "", ErrKindOther},

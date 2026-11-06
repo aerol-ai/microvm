@@ -81,6 +81,11 @@ class PlatformVolumeMount(TypedDict, total=False):
     name: str
     path: str
     readOnly: bool
+    # Delete the volume (its files and its record) once the last sandbox
+    # using it is deleted. Set when the volume is first made; a later
+    # sandbox naming the same volume must pass the same value, or the create
+    # fails with 409. Also accepted as delete_with_sandbox.
+    deleteWithSandbox: bool
 
 
 class MountSpecRedacted(TypedDict, total=False):

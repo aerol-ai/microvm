@@ -470,6 +470,7 @@ interface ApiPlatformVolumeMount {
   name: string;
   path: string;
   read_only?: boolean;
+  delete_with_sandbox?: boolean;
 }
 
 interface ApiAuditEvent {
@@ -2544,6 +2545,7 @@ function toApiPlatformVolumeMount(volume: PlatformVolumeMount): ApiPlatformVolum
     name: volume.name,
     path: volume.path,
     read_only: volume.readOnly,
+    delete_with_sandbox: volume.deleteWithSandbox,
   };
 }
 

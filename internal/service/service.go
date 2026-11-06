@@ -3775,6 +3775,9 @@ func (s *Service) DestroySandbox(ctx context.Context, id string) error {
 	if err := s.beginSelfOwnedClusterPlacementDeleteStrict(ctx, sandbox); err != nil {
 		return err
 	}
+	// delete_with_sandbox volumes (platform_volumes_lifetime.go): recorded
+	// now, while the attachments still say which; deleted once they are gone.
+	dwsVolumes := s.recordSandboxVolumeDeletes(ctx, sandbox)
 	for _, port := range sandbox.ExposedPorts {
 		_ = s.deleteExposedPortRoute(ctx, sandbox, port)
 	}
@@ -3869,6 +3872,7 @@ func (s *Service) DestroySandbox(ctx context.Context, id string) error {
 	if err := s.deleteSandboxRowAndFenceAudit(ctx, id); err != nil && !errors.Is(err, store.ErrNotFound) {
 		return err
 	}
+	s.finishSandboxVolumeDeletes(ctx, id, dwsVolumes)
 	if s.testAfterStoreDeleteOnDestroy != nil {
 		s.testAfterStoreDeleteOnDestroy()
 	}
@@ -6356,6 +6360,7 @@ func (s *Service) Reconcile(ctx context.Context) error {
 			if err := s.beginSelfOwnedClusterPlacementDeleteStrict(ctx, sandbox); err != nil {
 				return err
 			}
+			dwsVolumes := s.recordSandboxVolumeDeletes(ctx, sandbox)
 			// Secret tomb/outbox before store/placement delete (no FK on
 			// cluster_secrets). Same finalizer as DestroySandbox / docker events.
 			if err := s.DeleteClusterSecrets(ctx, sandbox.ID, sandbox.AuditIncarnationID); err != nil {
@@ -6376,6 +6381,7 @@ func (s *Service) Reconcile(ctx context.Context) error {
 			if err := s.deleteSandboxRowAndFenceAudit(ctx, sandbox.ID); err != nil && !errors.Is(err, store.ErrNotFound) {
 				return err
 			}
+			s.finishSandboxVolumeDeletes(ctx, sandbox.ID, dwsVolumes)
 			s.forgetWakeFlight(sandbox.ID)
 			s.invalidateWarm(sandbox.ID)
 			s.forgetNetstatsActivity(sandbox.ID)

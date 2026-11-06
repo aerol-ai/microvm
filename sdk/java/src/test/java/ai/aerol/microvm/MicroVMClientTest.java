@@ -474,7 +474,8 @@ class MicroVMClientTest {
                     ))
                     .setPlatformVolumes(List.of(
                         new PlatformVolumeMount().setName("data").setPath("/workspace"),
-                        new PlatformVolumeMount().setName("cache").setPath("/cache").setReadOnly(true)
+                        new PlatformVolumeMount().setName("cache").setPath("/cache").setReadOnly(true),
+                        new PlatformVolumeMount().setName("scratch").setPath("/scratch").setDeleteWithSandbox(true)
                     ))
                     .setLifecycle(new Lifecycle()
                         .setStopIfIdleFor(3_600_000_000_000L)
@@ -504,13 +505,16 @@ class MicroVMClientTest {
             Map<String, Object> failover = castMap(payload.get("failover"));
             assertEquals("recreate", failover.get("policy"));
             List<?> platformVolumes = (List<?>) payload.get("platform_volumes");
-            assertEquals(2, platformVolumes.size());
+            assertEquals(3, platformVolumes.size());
             Map<String, Object> firstVolume = castMap(platformVolumes.get(0));
             assertEquals("data", firstVolume.get("name"));
             assertEquals("/workspace", firstVolume.get("path"));
             assertNull(firstVolume.get("read_only"));
+            assertFalse(firstVolume.containsKey("delete_with_sandbox"));
             Map<String, Object> secondVolume = castMap(platformVolumes.get(1));
             assertEquals(Boolean.TRUE, secondVolume.get("read_only"));
+            Map<String, Object> thirdVolume = castMap(platformVolumes.get(2));
+            assertEquals(Boolean.TRUE, thirdVolume.get("delete_with_sandbox"));
         } finally {
             server.stop(0);
         }

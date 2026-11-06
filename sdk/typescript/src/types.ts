@@ -124,6 +124,13 @@ export interface PlatformVolumeMount {
   path: string;
   /** Mount read-only. Defaults to read-write. */
   readOnly?: boolean;
+  /**
+   * Delete the volume, its files and its record, once the last sandbox using
+   * it is deleted. Set when the volume is first made; a later sandbox that
+   * names the same volume must pass the same value, or the create fails with
+   * 409. Defaults to false: the volume outlives its sandboxes.
+   */
+  deleteWithSandbox?: boolean;
 }
 
 export interface Lifecycle {

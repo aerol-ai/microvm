@@ -107,6 +107,12 @@ type scriptedVolumeMeta struct {
 	listErr            error
 	attachmentCount    int
 	attachmentCountErr error
+	forSandbox         []models.VolumeAttachment
+	forSandboxErr      error
+}
+
+func (m *scriptedVolumeMeta) AttachmentsForSandbox(context.Context, string) ([]models.VolumeAttachment, error) {
+	return m.forSandbox, m.forSandboxErr
 }
 
 func (m *scriptedVolumeMeta) GetOrCreate(context.Context, *models.Volume, int) (*models.Volume, bool, error) {
