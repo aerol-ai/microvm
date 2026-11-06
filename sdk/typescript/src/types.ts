@@ -583,6 +583,44 @@ export interface SnapshotList {
 }
 
 /**
+ * Options for `sandbox.createToken`: a signed token for this one sandbox that
+ * you can hand to a browser or an end user. Every field but `expiresIn`
+ * narrows it; leave one out and that part is not limited.
+ */
+export interface CreateSandboxTokenOptions {
+  /** Required lifetime: `"15m"`, `"2h"` or `"1d"`. The server caps it (24 hours by default). */
+  expiresIn: string;
+  /**
+   * A port token opens that port's public URL (a port exposed with
+   * `visibility: "token"`). Without a port the token is for the sandbox's
+   * toolbox: commands, files and terminal sessions.
+   */
+  port?: number;
+  /** Only paths under this one, for example `"/files"` (toolbox) or `"/app"` (public URL). */
+  pathPrefix?: string;
+  /** Only these HTTP methods, for example `["GET"]`. */
+  methods?: string[];
+}
+
+/**
+ * A sandbox token from `sandbox.createToken`. The server keeps no copy, so
+ * `token` is shown only here. Every call makes a new token; a token cannot be
+ * revoked, it stops working when it expires or its sandbox is deleted.
+ */
+export interface SandboxToken {
+  /** The token (`avmst_…`). Send it as the bearer credential. */
+  token: string;
+  /** Public id (`stk_…`): what audit records name. Safe to log. */
+  tokenID: string;
+  sandboxID: string;
+  port?: number;
+  pathPrefix?: string;
+  methods?: string[];
+  /** RFC 3339 time the token stops working. */
+  expiresAt: string;
+}
+
+/**
  * Discriminated result from `exposePort`. Branch on `protocol` to access the
  * fields that are meaningful for the chosen wire protocol — only the raw-TCP
  * variant carries `host` and `hostPort`, which are what native protocol

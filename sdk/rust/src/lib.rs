@@ -33,6 +33,7 @@ pub use types::{
 };
 use types::{CustomDomainListWire, ExposePortResponseWire};
 pub use types::{ApiToken, ApiTokenList, CreateApiTokenOptions, CreatedApiToken, WhoAmI, WhoAmIPrincipal};
+pub use types::{CreateSandboxTokenOptions, SandboxToken};
 pub use types::{
     AddCustomDomainOptions, AuditCoverage, AuditEvent, AuditOptions, AuditPage, BuildImageOptions,
     EgressInject, EgressProfile, EgressProfileList, EgressProfileOptions, EgressProfileRef, EgressRule,
@@ -950,6 +951,12 @@ impl Sandbox {
 
     pub fn unexpose_port(&self, port: u16) -> Result<(), Error> {
         self.client.unexpose_port(&self.data.id, port)
+    }
+
+    /// Issue a signed token for this sandbox only, to hand to a browser or
+    /// an end user. Each call makes a new token; the server keeps no copy.
+    pub fn create_token(&self, options: CreateSandboxTokenOptions) -> Result<SandboxToken, Error> {
+        self.client.create_sandbox_token(&self.data.id, options)
     }
 
     /// Attach a custom hostname to this sandbox. Returns the post-add list
@@ -2253,6 +2260,23 @@ impl Client {
             Method::DELETE,
             &format!("{}/sandboxes/{}/ports/{}", self.version_prefix(), id, port),
             None,
+        )
+    }
+
+    /// Issue a signed token scoped to one sandbox (`POST
+    /// /v1/sandboxes/{id}/tokens`). Not idempotent by nature: every call
+    /// makes a new token and the server stores none. It uses the normal
+    /// retry tier: a retry after a lost answer makes a second token nobody
+    /// holds, which simply expires.
+    pub fn create_sandbox_token(
+        &self,
+        id: &str,
+        options: CreateSandboxTokenOptions,
+    ) -> Result<SandboxToken, Error> {
+        self.do_json::<CreateSandboxTokenOptions, SandboxToken>(
+            Method::POST,
+            &format!("{}/sandboxes/{}/tokens", self.version_prefix(), id),
+            Some(&options),
         )
     }
 
@@ -5764,6 +5788,83 @@ mod tests {
             Error::Client(msg) => assert!(msg.contains("incomplete cluster list"), "msg={msg}"),
             other => panic!("unexpected error: {other:?}"),
         }
+    }
+
+    // Sandbox tokens: the body carries only the fields that were set, and
+    // the 201 maps onto SandboxToken. Mirrors the other SDKs' tests.
+    #[test]
+    fn create_sandbox_token_posts_scope_and_maps_answer() {
+        let body = serde_json::json!({
+            "token": "avmst_0.p.s",
+            "token_id": "stk_abc",
+            "sandbox_id": "sb-1",
+            "path_prefix": "/files",
+            "methods": ["GET"],
+            "expires_at": "2026-11-06T10:15:00Z"
+        })
+        .to_string();
+        let (url, request_rx) =
+            spawn_response_server("201 Created", "application/json", body.into_bytes());
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        let token = client
+            .create_sandbox_token(
+                "sb-1",
+                CreateSandboxTokenOptions {
+                    expires_in: "15m".into(),
+                    path_prefix: Some("/files".into()),
+                    methods: vec!["GET".into()],
+                    ..Default::default()
+                },
+            )
+            .expect("create_sandbox_token should succeed");
+        let request = request_rx.recv().expect("request should be captured");
+        assert!(
+            request.starts_with("POST /v1/sandboxes/sb-1/tokens HTTP/1.1\r\n"),
+            "unexpected request: {}",
+            request
+        );
+        assert_eq!(
+            request_json_body(&request),
+            serde_json::json!({"expires_in": "15m", "path_prefix": "/files", "methods": ["GET"]})
+        );
+        assert_eq!(token.token, "avmst_0.p.s");
+        assert_eq!(token.token_id, "stk_abc");
+        assert_eq!(token.sandbox_id, "sb-1");
+        assert_eq!(token.port, None);
+        assert_eq!(token.methods, vec!["GET".to_string()]);
+    }
+
+    #[test]
+    fn create_sandbox_token_sends_only_the_port() {
+        let (url, request_rx) = spawn_response_server(
+            "201 Created",
+            "application/json",
+            br#"{"token":"avmst_0.p.s","token_id":"stk_x","sandbox_id":"sb-1","port":3000,"expires_at":"t"}"#.to_vec(),
+        );
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        let token = client
+            .create_sandbox_token(
+                "sb-1",
+                CreateSandboxTokenOptions { expires_in: "1h".into(), port: Some(3000), ..Default::default() },
+            )
+            .expect("create_sandbox_token should succeed");
+        let request = request_rx.recv().expect("request should be captured");
+        assert_eq!(request_json_body(&request), serde_json::json!({"expires_in": "1h", "port": 3000}));
+        assert_eq!(token.port, Some(3000));
+    }
+
+    #[test]
+    fn create_sandbox_token_surfaces_400() {
+        let (url, _rx) = spawn_response_server(
+            "400 Bad Request",
+            "application/json",
+            br#"{"error":"invalid sandbox token request: expires_in is required"}"#.to_vec(),
+        );
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        let err = client
+            .create_sandbox_token("sb-1", CreateSandboxTokenOptions::default())
+            .expect_err("a 400 must be an error");
+        assert!(format!("{}", err).contains("expires_in"), "error: {}", err);
     }
 
     // Custom-domains: POST returns 201 with the post-add list envelope, body

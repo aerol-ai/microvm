@@ -240,6 +240,12 @@ func Classify(err error) Classification {
 		return Classification{Status: http.StatusServiceUnavailable, RetryAfter: 5, Log: true, LogLevel: slog.LevelWarn,
 			Message: "the token store did not confirm the write; after a create the token may exist: list tokens, revoke it by id, then create it again"}
 
+	// Sandbox tokens (A1). The 400 text names the bad field, never a token.
+	case errors.Is(err, service.ErrSandboxTokenInvalid):
+		return Classification{Status: http.StatusBadRequest, Message: err.Error()}
+	case errors.Is(err, service.ErrSandboxTokensUnavailable):
+		return Classification{Status: http.StatusServiceUnavailable, Message: service.ErrSandboxTokensUnavailable.Error(), Log: true, LogLevel: slog.LevelWarn}
+
 	case errors.Is(err, store.ErrSandboxNameConflict):
 		return Classification{Status: http.StatusConflict, Message: "sandbox name already in use", Kind: ErrKindSandboxNameConflict}
 	case errors.Is(err, models.ErrSandboxExists):

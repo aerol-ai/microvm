@@ -127,6 +127,10 @@ func RegisterRoutes(mux apihttp.Mux, d Deps) {
 	mux.Handle("PUT "+PathPrefix+"/sandboxes/{id}/lifecycle", d.Route(permWrite, wrap(http.HandlerFunc(h.updateLifecycle))))
 	mux.Handle("POST "+PathPrefix+"/sandboxes/{id}/ports/{port}", d.Route(permWrite, wrap(http.HandlerFunc(h.exposePort))))
 	mux.Handle("DELETE "+PathPrefix+"/sandboxes/{id}/ports/{port}", d.Route(permWrite, wrap(http.HandlerFunc(h.unexposePort))))
+	// Signed per-sandbox tokens (A1, pkg/sandboxtoken): sandbox.exec, the
+	// most a token can grant. Forwarded to the owner, which reads the row;
+	// not idempotent by nature (each call mints a new token).
+	mux.Handle("POST "+PathPrefix+"/sandboxes/{id}/tokens", d.Route(permExec, wrap(http.HandlerFunc(h.createSandboxToken))))
 	// Custom domains (plans/custom-domains.md). Gated server-side by
 	// SB_ENABLE_CUSTOM_DOMAINS — routes are always mounted (so a request
 	// hits a 412 rather than a 404 when the cluster has the feature off)

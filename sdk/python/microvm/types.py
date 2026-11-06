@@ -948,6 +948,25 @@ class APITokenList(TypedDict):
     tokens: List[APIToken]
 
 
+class SandboxToken(TypedDict, total=False):
+    """The result of ``sandbox.create_token()``: a signed token for one
+    sandbox, to hand to a browser or an end user. The server keeps no copy,
+    so ``token`` is shown only here. It cannot be revoked: it stops working
+    when it expires or its sandbox is deleted."""
+
+    # The token (avmst_…). Send it as the bearer credential.
+    token: str
+    # Public id (stk_…): what audit records name. Safe to log.
+    tokenID: str
+    sandboxID: str
+    # Set for a public-port token; absent for a toolbox token.
+    port: int
+    pathPrefix: str
+    methods: List[str]
+    # RFC 3339 time the token stops working.
+    expiresAt: str
+
+
 # Firecracker rootfs templates. The lifecycle mirrors the daemon's
 # state machine; see plans/snapshot-clone-fast-boot.md for the
 # transitions. A template is created once from an OCI image and

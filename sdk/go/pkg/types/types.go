@@ -260,6 +260,17 @@ type CreateAPITokenOptions = models.CreateAPITokenRequest
 // APITokenList is Tokens().List's result.
 type APITokenList = models.APITokenList
 
+// CreateSandboxTokenOptions is the body of Sandbox.CreateToken: a signed
+// token for one sandbox that can be handed to a browser or an end user.
+// ExpiresIn is required ("15m", "2h", "1d") and capped by the server (24h
+// by default). Port makes a public-port token; without it the token is for
+// the sandbox's toolbox. PathPrefix and Methods narrow it further.
+type CreateSandboxTokenOptions = models.CreateSandboxTokenRequest
+
+// SandboxToken is Sandbox.CreateToken's result. Token (avmst_…) is shown
+// only here: the server keeps no copy. TokenID (stk_…) is safe to log.
+type SandboxToken = models.SandboxToken
+
 // AuditEvent is one record from a sandbox's audit log (Sandbox.Audit). Kind
 // "egress" covers outbound connections and denials; a denial has Result
 // "failure" and the policy Reason ("host_not_allowed", "sni_not_allowed", …).

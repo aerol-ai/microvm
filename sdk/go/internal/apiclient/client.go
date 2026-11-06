@@ -908,6 +908,17 @@ func (c *Client) UnexposePort(ctx context.Context, id string, port int) error {
 	return c.doJSON(ctx, http.MethodDelete, fmt.Sprintf(c.versionPrefix+"/sandboxes/%s/ports/%d", id, port), nil, nil)
 }
 
+// CreateSandboxToken issues a signed token scoped to one sandbox (POST
+// /v1/sandboxes/{id}/tokens). Not idempotent by nature: every call makes a
+// new token and the server stores none. It uses the normal retry tier: a
+// retry after a lost answer makes a second token nobody holds, which simply
+// expires.
+func (c *Client) CreateSandboxToken(ctx context.Context, id string, req models.CreateSandboxTokenRequest) (models.SandboxToken, error) {
+	var out models.SandboxToken
+	err := c.doJSON(ctx, http.MethodPost, fmt.Sprintf(c.versionPrefix+"/sandboxes/%s/tokens", id), req, &out)
+	return out, err
+}
+
 // customDomainsEnvelope mirrors the {"custom_domains":[...]} shape used by
 // both the add and list responses, so a single decoder handles both routes.
 type customDomainsEnvelope struct {
@@ -1007,6 +1018,10 @@ func (s *Sandbox) DownloadFile(ctx context.Context, targetPath string) ([]byte, 
 
 func (s *Sandbox) ExposePort(ctx context.Context, port int, protocol string) (ExposeResult, error) {
 	return s.client.ExposePort(ctx, s.ID, port, protocol)
+}
+
+func (s *Sandbox) CreateToken(ctx context.Context, req models.CreateSandboxTokenRequest) (models.SandboxToken, error) {
+	return s.client.CreateSandboxToken(ctx, s.ID, req)
 }
 
 func (s *Sandbox) AddCustomDomain(ctx context.Context, hostname string, targetPort int) ([]models.CustomDomain, error) {

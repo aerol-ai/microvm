@@ -31,6 +31,8 @@ import ai.aerol.microvm.internal.api.v1.Paths;
 import ai.aerol.microvm.model.ApiTokenList;
 import ai.aerol.microvm.model.CreateApiTokenOptions;
 import ai.aerol.microvm.model.CreatedApiToken;
+import ai.aerol.microvm.model.CreateSandboxTokenOptions;
+import ai.aerol.microvm.model.SandboxToken;
 import ai.aerol.microvm.model.WhoAmI;
 import ai.aerol.microvm.model.AuditCoverage;
 import ai.aerol.microvm.model.EgressProfile;
@@ -1359,6 +1361,18 @@ public class MicroVMClient {
 
     public void unexposePort(String sandboxId, int port) {
         doNoContent("DELETE", sandboxPath(sandboxId) + "/ports/" + port, null);
+    }
+
+    /**
+     * Issue a signed token scoped to one sandbox ({@code POST
+     * /v1/sandboxes/{id}/tokens}), to hand to a browser or an end user. Not
+     * idempotent by nature: every call makes a new token and the server
+     * stores none. It uses the normal retry tier: a retry after a lost
+     * answer makes a second token nobody holds, which simply expires.
+     */
+    public SandboxToken createSandboxToken(String sandboxId, CreateSandboxTokenOptions options) {
+        CreateSandboxTokenOptions body = options == null ? new CreateSandboxTokenOptions() : options;
+        return doJson("POST", sandboxPath(sandboxId) + "/tokens", body, SandboxToken.class);
     }
 
     /**

@@ -39,6 +39,8 @@ func TestClassify(t *testing.T) {
 		kind       ErrKind
 	}{
 		{"not found", store.ErrNotFound, http.StatusNotFound, 0, "", ErrKindNotFound},
+		{"sandbox token request invalid", fmt.Errorf("%w: expires_in is required", service.ErrSandboxTokenInvalid), http.StatusBadRequest, 0, "", ErrKindOther},
+		{"sandbox tokens unavailable", service.ErrSandboxTokensUnavailable, http.StatusServiceUnavailable, 0, "", ErrKindOther},
 		// Load shedding: a fast retryable 503, never the 400 catch-all.
 		{"overloaded", ErrOverloaded, http.StatusServiceUnavailable, OverloadedRetryAfterSeconds, models.ErrorCodeOverloaded, ErrKindOther},
 		{"overloaded while the caller left", fmt.Errorf("%w: %w", ErrOverloaded, context.Canceled), http.StatusServiceUnavailable, OverloadedRetryAfterSeconds, models.ErrorCodeOverloaded, ErrKindOther},

@@ -15,6 +15,8 @@ import ai.aerol.microvm.model.MakeDirOptions;
 import ai.aerol.microvm.model.MoveFileOptions;
 import ai.aerol.microvm.model.UploadFileOptions;
 import ai.aerol.microvm.model.DownloadFileOptions;
+import ai.aerol.microvm.model.CreateSandboxTokenOptions;
+import ai.aerol.microvm.model.SandboxToken;
 import ai.aerol.microvm.model.CreateSnapshotOptions;
 import ai.aerol.microvm.model.CreateSessionOptions;
 import ai.aerol.microvm.model.CustomDomain;
@@ -234,6 +236,15 @@ public class Sandbox extends SandboxData {
 
     public void unexposePort(int port) {
         client.unexposePort(id, port);
+    }
+
+    /**
+     * Issue a signed token for this sandbox only, to hand to a browser or an
+     * end user. Each call makes a new token; the server keeps no copy, so
+     * {@link SandboxToken#token} is shown only in the result.
+     */
+    public SandboxToken createToken(CreateSandboxTokenOptions options) {
+        return client.createSandboxToken(id, options);
     }
 
     public List<CustomDomain> addCustomDomain(String hostname) {

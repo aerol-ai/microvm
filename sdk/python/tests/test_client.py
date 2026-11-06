@@ -2297,6 +2297,74 @@ class CustomDomainsTests(unittest.TestCase):
         self.assertEqual(payload["custom_domains"], ["api.acme.com", "edge.acme.com"])
 
 
+class SandboxTokenTests(unittest.TestCase):
+    """POST /v1/sandboxes/{id}/tokens: the body carries only the fields the
+    caller set, and the answer maps onto SandboxToken."""
+
+    def _client(self, answer=None, status=201):
+        captured = {"calls": []}
+
+        class FakeMicroVM(MicroVM):
+            def __init__(self) -> None:
+                super().__init__(api_url="https://sandbox.example.com", pat_token="pat-token")
+
+            def _do_json(self, method, path, payload):  # type: ignore[override]
+                captured["calls"].append((method, path, payload))
+                if status >= 400:
+                    raise client_module.MicroVMHTTPError(status, "invalid sandbox token request")
+                return answer
+
+        return FakeMicroVM(), captured
+
+    def test_create_token_sends_scope_and_maps_answer(self):
+        client, captured = self._client(
+            answer={
+                "token": "avmst_0.payload.sig",
+                "token_id": "stk_abc",
+                "sandbox_id": "sb-1",
+                "path_prefix": "/files",
+                "methods": ["GET"],
+                "expires_at": "2026-11-06T10:15:00Z",
+            }
+        )
+        sandbox = client_module.Sandbox(client, {"id": "sb-1"})  # type: ignore[typeddict-item]
+        tok = sandbox.create_token(expires_in="15m", path_prefix="/files", methods=["GET"])
+        self.assertEqual(
+            captured["calls"][0],
+            ("POST", "/v1/sandboxes/sb-1/tokens", {"expires_in": "15m", "path_prefix": "/files", "methods": ["GET"]}),
+        )
+        self.assertEqual(
+            tok,
+            {
+                "token": "avmst_0.payload.sig",
+                "tokenID": "stk_abc",
+                "sandboxID": "sb-1",
+                "pathPrefix": "/files",
+                "methods": ["GET"],
+                "expiresAt": "2026-11-06T10:15:00Z",
+            },
+        )
+
+    def test_port_token_sends_only_the_port(self):
+        client, captured = self._client(
+            answer={"token": "avmst_0.p.s", "token_id": "stk_x", "sandbox_id": "sb-1", "port": 3000, "expires_at": "t"}
+        )
+        tok = client.create_sandbox_token("sb-1", expires_in="1h", port=3000, methods=[])
+        self.assertEqual(captured["calls"][0][2], {"expires_in": "1h", "port": 3000})
+        self.assertEqual(tok["port"], 3000)
+        self.assertNotIn("pathPrefix", tok)
+
+    def test_create_token_surfaces_a_400(self):
+        client, _ = self._client(status=400)
+        with self.assertRaises(client_module.MicroVMHTTPError):
+            client.create_sandbox_token("sb-1", expires_in="")
+
+    def test_create_token_tolerates_an_empty_answer(self):
+        client, _ = self._client(answer=None)
+        tok = client.create_sandbox_token("sb-1", expires_in="1m")
+        self.assertEqual(tok["token"], "")
+
+
 class DNSRecordsTests(unittest.TestCase):
     """Covers the two DNS helper endpoints:
 

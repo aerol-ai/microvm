@@ -994,6 +994,10 @@ var Registry = []UseCase{
 	{ID: "UC-411", Title: "Block private networks by default: with SB_EGRESS_BLOCK_PRIVATE_BY_DEFAULT on every node, a no-policy sandbox has the private-range deny list on its record, cannot reach a private address that answers with the flag off, still resolves names and reaches the internet; a sandbox with its own policy still reaches it; and its destroy leaves no egress rule for its address", Requires: []Capability{CapDocker}, Excludes: []Capability{CapNoHostFirewall}, Implemented: true},
 	{ID: "UC-412", Title: "Volume lifetime: a platform volume created with delete_with_sandbox holds what its sandbox writes, and its record is gone within 30 s of that sandbox being destroyed", Requires: []Capability{CapDocker, CapPlatformVolumes}, Implemented: true},
 	{ID: "UC-413", Title: "Volume lifetime: destroying a sandbox with a normal and a delete_with_sandbox volume removes only the latter; the normal volume keeps its record and file for the next sandbox, and naming it with delete_with_sandbox is refused with 409", Requires: []Capability{CapDocker, CapPlatformVolumes}, Implemented: true},
+	// Agent-sandbox parity, scoped access (parity_access_test.go; plan §5.9 A1–A3).
+	{ID: "UC-423", Title: "Sandbox token: a token issued through POST /v1/sandboxes/{id}/tokens for /files and GET downloads a file from its sandbox's toolbox, as a raw bearer and a /sessions token works as the Go SDK credential (ListSessions)", Implemented: true},
+	{ID: "UC-424", Title: "Sandbox token refusals: the same token gets 403 on another sandbox, on a path or method it does not cover, on a sandbox read, a delete and a token mint (naming the part, never echoing the token), and 401 expired once its lifetime plus the 30 s skew has passed", Implemented: true},
+	{ID: "UC-425", Title: "Sandbox token across nodes: a token issued through any node works through every other node, with no database call (every node derives the signing key from the shared server key)", Requires: []Capability{CapCluster}, Implemented: true},
 }
 
 // byID is a lookup built once for the report generator.

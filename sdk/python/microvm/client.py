@@ -25,6 +25,7 @@ from .types import (
     APITokenList,
     CreateAPITokenOptions,
     CreatedAPIToken,
+    SandboxToken,
     WhoAmI,
     BuildImagePushOptions,
     BuildImageResult,
@@ -699,6 +700,20 @@ class Sandbox:
 
     def unexpose_port(self, port: int) -> None:
         self._client.unexpose_port(self.id, port)
+
+    def create_token(
+        self,
+        *,
+        expires_in: str,
+        port: Optional[int] = None,
+        path_prefix: Optional[str] = None,
+        methods: Optional[List[str]] = None,
+    ) -> SandboxToken:
+        """Issue a signed token for this sandbox only. See
+        :meth:`MicroVM.create_sandbox_token`."""
+        return self._client.create_sandbox_token(
+            self.id, expires_in=expires_in, port=port, path_prefix=path_prefix, methods=methods
+        )
 
     def add_custom_domain(
         self,
@@ -1834,6 +1849,38 @@ class MicroVM:
     def unexpose_port(self, sandbox_id: str, port: int) -> None:
         self._do_json("DELETE", f"{self._version_prefix}/sandboxes/{sandbox_id}/ports/{port}", None)
 
+    def create_sandbox_token(
+        self,
+        sandbox_id: str,
+        *,
+        expires_in: str,
+        port: Optional[int] = None,
+        path_prefix: Optional[str] = None,
+        methods: Optional[List[str]] = None,
+    ) -> SandboxToken:
+        """Issue a signed token scoped to one sandbox, to hand to a browser
+        or an end user (``POST /v1/sandboxes/{id}/tokens``).
+
+        ``expires_in`` is required ("15m", "2h", "1d"); the server caps it
+        (24 hours by default). With ``port`` the token opens that port's
+        public URL (a port exposed with ``visibility="token"``); without it
+        the token is for the toolbox: commands, files and sessions.
+        ``path_prefix`` and ``methods`` narrow it further.
+
+        Not idempotent by nature: every call makes a new token and the
+        server stores none. It uses the normal retry tier: a retry after a
+        lost answer makes a second token nobody holds, which simply expires.
+        """
+        body: Dict[str, Any] = {"expires_in": expires_in}
+        if port:
+            body["port"] = port
+        if path_prefix:
+            body["path_prefix"] = path_prefix
+        if methods:
+            body["methods"] = list(methods)
+        payload = self._do_json("POST", f"{self._version_prefix}/sandboxes/{sandbox_id}/tokens", body) or {}
+        return _from_api_sandbox_token(payload)
+
     def add_custom_domain(
         self,
         sandbox_id: str,
@@ -2202,6 +2249,22 @@ def _from_api_whoami(payload: Dict[str, Any]) -> WhoAmI:
     if payload.get("expires_at"):
         result["expiresAt"] = str(payload["expires_at"])
     return result
+
+
+def _from_api_sandbox_token(payload: Dict[str, Any]) -> SandboxToken:
+    token: SandboxToken = {
+        "token": str(payload.get("token") or ""),
+        "tokenID": str(payload.get("token_id") or ""),
+        "sandboxID": str(payload.get("sandbox_id") or ""),
+        "expiresAt": str(payload.get("expires_at") or ""),
+    }
+    if payload.get("port"):
+        token["port"] = int(payload["port"])
+    if payload.get("path_prefix"):
+        token["pathPrefix"] = str(payload["path_prefix"])
+    if payload.get("methods"):
+        token["methods"] = [str(m) for m in payload["methods"]]
+    return token
 
 
 def _from_api_api_token(payload: Dict[str, Any]) -> APIToken:

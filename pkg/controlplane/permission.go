@@ -115,6 +115,12 @@ func (a Access) EffectiveRole() Role {
 // runner bound to team payments Can(sandbox.exec) and is still fenced to
 // payments' sandboxes by the service layer.
 func (a Access) Can(p Permission) bool {
+	if a.Principal.Kind == PrincipalSandboxToken {
+		// One verb on one sandbox, whatever else the Access says: even
+		// "authenticated" is refused, so a sandbox token never reaches
+		// whoami, /mcp or any route the edge's scope check might miss.
+		return p == PermSandboxExec && a.SandboxToken != nil
+	}
 	switch p {
 	case PermAuthenticated:
 		return true
@@ -146,6 +152,8 @@ func (a Access) HostCapable() bool {
 	switch a.Principal.Kind {
 	case PrincipalOperator, PrincipalNode, PrincipalSystem:
 		return true
+	case PrincipalSandboxToken:
+		return false
 	}
 	return a.EffectiveRole() == RoleAdmin && a.Fleet
 }

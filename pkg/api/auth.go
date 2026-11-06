@@ -28,6 +28,7 @@ import (
 	"github.com/aerol-ai/microvm/pkg/controlplane"
 	"github.com/aerol-ai/microvm/pkg/identitywire"
 	"github.com/aerol-ai/microvm/pkg/models"
+	"github.com/aerol-ai/microvm/pkg/sandboxtoken"
 )
 
 // Authenticator recognises one credential kind. matched=false means "not
@@ -93,7 +94,7 @@ func WithCredentialAuthenticator(kind controlplane.PrincipalKind, a Authenticato
 // buildAuthChain orders the authenticators: pat, the named credentials, then
 // the managed provider, which is last because it claims every non-empty
 // bearer nothing before it recognised.
-func buildAuthChain(pat patAuthenticator, validator controlplane.Validator, credentials []authLink) []authLink {
+func buildAuthChain(pat patAuthenticator, sandboxTokens Authenticator, validator controlplane.Validator, credentials []authLink) []authLink {
 	providerKind := string(controlplane.PrincipalControlPlane)
 	if controlplane.IsNoopValidator(validator) {
 		// The open-source build has no provider: a refusal there means
@@ -103,8 +104,14 @@ func buildAuthChain(pat patAuthenticator, validator controlplane.Validator, cred
 	if validator == nil {
 		validator = controlplane.Noop().Validator
 	}
-	links := make([]authLink, 0, len(credentials)+2)
+	links := make([]authLink, 0, len(credentials)+3)
 	links = append(links, authLink{kind: string(controlplane.PrincipalOperator), auth: pat})
+	if sandboxTokens != nil {
+		// Identity on or off: a sandbox token is not a person's credential,
+		// and its avmst_ prefix is its own, so it changes nothing for any
+		// bearer that was accepted or refused before (L8).
+		links = append(links, authLink{kind: string(controlplane.PrincipalSandboxToken), auth: sandboxTokens})
+	}
 	links = append(links, credentials...)
 	return append(links, authLink{kind: providerKind, auth: providerAuthenticator{validator: validator}})
 }
@@ -115,7 +122,14 @@ func (s *Server) authLinks() []authLink {
 	if s.authChain != nil {
 		return s.authChain
 	}
-	return buildAuthChain(s.patAuth(), s.validator, nil)
+	return buildAuthChain(s.patAuth(), s.sandboxTokenAuth(), s.validator, nil)
+}
+
+// sandboxTokenAuth is the server's sandbox token authenticator: it checks a
+// token with the service's server key (no store read). A server with no
+// service still claims avmst_ bearers and refuses them.
+func (s *Server) sandboxTokenAuth() sandboxTokenAuthenticator {
+	return sandboxTokenAuthenticator{verify: s.service.VerifySandboxToken}
 }
 
 // patAuth is the server's PAT authenticator.
@@ -209,7 +223,7 @@ func (p providerAuthenticator) Authenticate(r *http.Request, bearer string) (con
 // order. Each may refine the Access or refuse the request.
 type postMatchStep func(r *http.Request, a controlplane.Access) (controlplane.Access, error)
 
-var postMatchSteps = []postMatchStep{attributeForward, enforceSurface, selectTeam}
+var postMatchSteps = []postMatchStep{enforceSandboxTokenScope, attributeForward, enforceSurface, selectTeam}
 
 // authenticate decides who the request is from. It never reads an identity
 // header: the credential, the verified mTLS peer and the request path are the
@@ -496,7 +510,7 @@ const identityUnavailableRetryAfter = 30
 func mapAuthFailure(linkKind string, err error) *authFailure {
 	if ce, ok := controlplane.AsCredentialError(err); ok {
 		switch ce.Kind {
-		case controlplane.PrincipalToken, controlplane.PrincipalOIDC:
+		case controlplane.PrincipalToken, controlplane.PrincipalOIDC, controlplane.PrincipalSandboxToken:
 			if ce.Reason.Valid() {
 				return &authFailure{status: http.StatusUnauthorized, kind: string(ce.Kind), reason: string(ce.Reason), invalidToken: ce.Reason, hint: ce.Hint}
 			}
@@ -508,6 +522,12 @@ func mapAuthFailure(linkKind string, err error) *authFailure {
 	}
 	var notBound *teamNotBoundError
 	switch {
+	case errors.Is(err, sandboxtoken.ErrOutOfScope):
+		// A good token used for a request it does not cover. The text
+		// names the part (sandbox, port, path or method), never a value.
+		return &authFailure{status: http.StatusForbidden, kind: linkKind, reason: "out_of_scope", message: "this sandbox token does not cover this request: " + scopePart(err)}
+	case errors.Is(err, errSandboxTokenRoute):
+		return &authFailure{status: http.StatusForbidden, kind: linkKind, reason: "wrong_route", message: errSandboxTokenRoute.Error()}
 	case errors.Is(err, controlplane.ErrIdentityStale):
 		// The token mirror on this node cannot vouch for any token right
 		// now (§5.4): the credential may be fine, so 503, not 401.

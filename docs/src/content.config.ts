@@ -93,6 +93,7 @@ const getDocsSidebarConfig = (): NavigationGroup[] => [
       link('/sessions', '- Terminal sessions'),
       link('/sandbox-tags', '- Tags'),
       link('/ssh-access', '- SSH access'),
+      link('/sandbox-tokens', '- Sandbox tokens'),
       
     ],
   },

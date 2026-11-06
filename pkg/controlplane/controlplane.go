@@ -16,6 +16,8 @@ import (
 	"encoding/json"
 	"errors"
 	"time"
+
+	"github.com/aerol-ai/microvm/pkg/sandboxtoken"
 )
 
 // ErrTokenRejected is returned by Validator.Validate for any token the control
@@ -95,6 +97,12 @@ type Access struct {
 	// ClaimNames, for an OIDC caller, names its issuer's claims, for
 	// `whoami --explain` (D22). nil for every other credential.
 	ClaimNames *ClaimNames
+	// SandboxToken is the verified claims of a sandbox token caller
+	// (PrincipalSandboxToken): the one sandbox, port, path prefix and
+	// methods it covers. The API edge refuses the token on every request
+	// they do not cover, and Can grants it sandbox.exec only. nil for every
+	// other credential.
+	SandboxToken *sandboxtoken.Claims
 }
 
 type accessCtxKey struct{}

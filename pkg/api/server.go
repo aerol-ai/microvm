@@ -201,7 +201,7 @@ func NewServer(logger *slog.Logger, service *service.Service, dockerClient *dock
 	s.patTokenPrevious = cfg.PATTokenPrevious
 	s.patScopeHost = cfg.PATScopeHostOnly()
 	s.l4ProxyProtocol = cfg.L4FallbackProxyProtocol
-	s.authChain = buildAuthChain(s.patAuth(), validator, options.credentials)
+	s.authChain = buildAuthChain(s.patAuth(), s.sandboxTokenAuth(), validator, options.credentials)
 	if service != nil && service.APIRecordsConfigured() {
 		// Before registerRoutes: every surface captures the hook when it
 		// mounts its routes.

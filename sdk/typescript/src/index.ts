@@ -11,6 +11,8 @@ export type {
   APITokenList,
   CreateAPITokenOptions,
   CreatedAPIToken,
+  CreateSandboxTokenOptions,
+  SandboxToken,
   WhoAmI,
   WhoAmIPrincipal,
   AuditEvent,

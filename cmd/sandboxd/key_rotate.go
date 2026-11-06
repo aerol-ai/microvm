@@ -231,9 +231,10 @@ next:
 			fmt.Fprintf(out, `promoted: key %d is current, key %d is decrypt only, in %s
 next:
   1. copy %s to every node%s; each node seals new data with key %d after its next re-read and reseals its rows
-  2. wait until aerolvm_server_key_rows{key="%d"} is 0 and aerolvm_server_key_ring{key="%d",key2="current"} shows on every member
+  2. wait until aerolvm_server_key_rows{key="%d"} is 0 and aerolvm_server_key_ring{key="%d",key2="current"} shows on every member,
+     and until SB_SANDBOX_TOKEN_MAX_TTL (default 24h) has passed: sandbox tokens signed with key %d stop working when it is retired
   3. sandboxd key rotate --retire %d, and copy the file again
-`, to, from, r.path, r.path, plaintextNote(cfg), to, from, to, from)
+`, to, from, r.path, r.path, plaintextNote(cfg), to, from, to, from, from)
 		case "retire":
 			next, err := secrets.RetireRingKey(r.entries, retireID)
 			if err != nil {

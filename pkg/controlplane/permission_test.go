@@ -3,6 +3,8 @@ package controlplane
 import (
 	"context"
 	"testing"
+
+	"github.com/aerol-ai/microvm/pkg/sandboxtoken"
 )
 
 // boundAccess is a token caller with role bound to team ("*" = every team).
@@ -234,5 +236,37 @@ func TestDenyHint(t *testing.T) {
 		if HintPrincipal(kind) != want {
 			t.Errorf("HintPrincipal(%q) = %v, want %v", kind, !want, want)
 		}
+	}
+}
+
+// A sandbox token holds sandbox.exec and nothing else, whatever role, fleet
+// or owner its Access might carry: even "authenticated" (whoami, /mcp) is
+// refused. Without its claims it holds nothing at all, and it is never
+// host-capable and never gets a deny hint.
+func TestSandboxTokenCanOnlyExec(t *testing.T) {
+	claims := &sandboxtoken.Claims{SandboxID: "sb-1"}
+	for _, a := range []Access{
+		{Principal: Principal{Kind: PrincipalSandboxToken, ID: "stk_1"}, SandboxToken: claims},
+		// A broken authenticator that also set a role or fleet gains nothing.
+		{Principal: Principal{Kind: PrincipalSandboxToken, ID: "stk_1"}, SandboxToken: claims, Role: RoleAdmin, Fleet: true},
+	} {
+		for _, p := range allPermissions {
+			if got, want := a.Can(p), p == PermSandboxExec; got != want {
+				t.Fatalf("Can(%s) = %v, want %v (access %+v)", p, got, want, a)
+			}
+		}
+		if a.Can(PermAuthenticated) || a.Can(PermClusterInternal) {
+			t.Fatal("a sandbox token holds a pseudo-permission")
+		}
+		if a.HostCapable() {
+			t.Fatal("a sandbox token is host-capable")
+		}
+	}
+	noClaims := Access{Principal: Principal{Kind: PrincipalSandboxToken, ID: "stk_1"}}
+	if noClaims.Can(PermSandboxExec) {
+		t.Fatal("a sandbox token without claims holds sandbox.exec")
+	}
+	if HintPrincipal(PrincipalSandboxToken) || DenyHint(noClaims, PermSandboxRead) != "" {
+		t.Fatal("a sandbox token refusal carries a hint")
 	}
 }

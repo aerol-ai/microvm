@@ -1556,6 +1556,43 @@ pub struct CreatedApiToken {
     pub token: String,
 }
 
+/// The body of `sandbox.create_token()`: a signed token for one sandbox
+/// that you can hand to a browser or an end user. Only `expires_in` is
+/// required ("15m", "2h", "1d"; the server caps it, 24 hours by default).
+/// `port` makes a public-port token; without it the token is for the
+/// sandbox's toolbox (commands, files, sessions). `path_prefix` and
+/// `methods` narrow it further.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+pub struct CreateSandboxTokenOptions {
+    pub expires_in: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path_prefix: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub methods: Vec<String>,
+}
+
+/// `sandbox.create_token()`'s result. `token` (`avmst_…`) is shown only
+/// here: the server keeps no copy. `token_id` (`stk_…`) is safe to log.
+/// A token cannot be revoked: it stops working when it expires or its
+/// sandbox is deleted.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+pub struct SandboxToken {
+    pub token: String,
+    pub token_id: String,
+    pub sandbox_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path_prefix: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub methods: Vec<String>,
+    /// RFC 3339 time the token stops working.
+    #[serde(default)]
+    pub expires_at: String,
+}
+
 /// The body of `client.tokens().create()`. All four fields are required.
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
 pub struct CreateApiTokenOptions {

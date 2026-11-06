@@ -73,6 +73,13 @@ func enforceOwner(ctx context.Context, sandbox *models.Sandbox) error {
 	if sandbox == nil || sandbox.OwnerRef != owner {
 		return store.ErrNotFound
 	}
+	// A sandbox token reaches one sandbox. The edge's scope step holds it
+	// to that sandbox's routes; this holds it here too. The owner check
+	// alone is weak for it: a token for a sandbox the operator made carries
+	// an empty owner, which every operator-made sandbox shares.
+	if access, ok := controlplane.AccessFromContext(ctx); ok && access.SandboxToken != nil && access.SandboxToken.SandboxID != sandbox.ID {
+		return store.ErrNotFound
+	}
 	return nil
 }
 

@@ -58,7 +58,9 @@ import ai.aerol.microvm.model.NetworkPolicyCheckResult;
 import ai.aerol.microvm.model.AuditPage;
 import ai.aerol.microvm.model.CreateOptions;
 import ai.aerol.microvm.model.CreateSessionOptions;
+import ai.aerol.microvm.model.CreateSandboxTokenOptions;
 import ai.aerol.microvm.model.CustomDomain;
+import ai.aerol.microvm.model.SandboxToken;
 import ai.aerol.microvm.model.CustomDomainDnsRecords;
 import ai.aerol.microvm.model.CustomDomainStatus;
 import ai.aerol.microvm.model.DnsRecord;
@@ -2286,6 +2288,58 @@ class MicroVMClientTest {
             assertEquals(1, page.sandboxes.size());
             assertEquals("sb-page", page.sandboxes.get(0).id);
             assertEquals("tok-next", page.nextPageToken);
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void createTokenPostsScopeAndMapsAnswer() throws Exception {
+        AtomicReference<String> path = new AtomicReference<>();
+        AtomicReference<Map<String, Object>> body = new AtomicReference<>();
+        HttpServer server = startServer(exchange -> {
+            path.set(exchange.getRequestMethod() + " " + exchange.getRequestURI().getRawPath());
+            body.set(castMap(JsonSupport.read(exchange.getRequestBody().readAllBytes(), Map.class)));
+            writeJson(exchange, 201, mapOf(
+                "token", "avmst_0.p.s",
+                "token_id", "stk_abc",
+                "sandbox_id", "sb-1",
+                "path_prefix", "/files",
+                "methods", List.of("GET"),
+                "expires_at", "2026-11-06T10:15:00Z"
+            ));
+        });
+        try {
+            MicroVMClient client = clientFor(server);
+            Sandbox sandbox = new Sandbox(client, new SandboxData());
+            sandbox.id = "sb-1";
+            SandboxToken token = sandbox.createToken(new CreateSandboxTokenOptions()
+                .setExpiresIn("15m").setPathPrefix("/files").setMethods(List.of("GET")));
+            assertEquals("POST /v1/sandboxes/sb-1/tokens", path.get());
+            assertEquals(mapOf("expires_in", "15m", "path_prefix", "/files", "methods", List.of("GET")), body.get());
+            assertEquals("avmst_0.p.s", token.token);
+            assertEquals("stk_abc", token.tokenId);
+            assertEquals("sb-1", token.sandboxId);
+            assertEquals("/files", token.pathPrefix);
+            assertEquals(List.of("GET"), token.methods);
+            assertNull(token.port);
+
+            // A port token sends only the port; an empty method list is left out.
+            client.createSandboxToken("sb-1", new CreateSandboxTokenOptions().setExpiresIn("1h").setPort(3000).setMethods(List.of()));
+            assertEquals(mapOf("expires_in", "1h", "port", 3000), body.get());
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void createTokenSurfacesBadRequest() throws Exception {
+        HttpServer server = startServer(exchange ->
+            writeJson(exchange, 400, mapOf("error", "invalid sandbox token request: expires_in is required")));
+        try {
+            MicroVMClient client = clientFor(server);
+            MicroVMException error = assertThrows(MicroVMException.class, () -> client.createSandboxToken("sb-1", null));
+            assertTrue(error.getMessage().contains("expires_in"));
         } finally {
             server.stop(0);
         }

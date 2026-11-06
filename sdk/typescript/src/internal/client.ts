@@ -23,6 +23,8 @@ import type {
   CreateAPITokenOptions,
   CreatedAPIToken,
   CreateOptions,
+  CreateSandboxTokenOptions,
+  SandboxToken,
   CreateSessionOptions,
   CreateTemplateOptions,
   CreateWasmModuleOptions,
@@ -245,6 +247,16 @@ interface ApiExposePortResponse {
   public_url: string;
   host?: string;
   host_port?: number;
+}
+
+interface ApiSandboxToken {
+  token: string;
+  token_id: string;
+  sandbox_id: string;
+  port?: number;
+  path_prefix?: string;
+  methods?: string[];
+  expires_at: string;
 }
 
 interface ApiCustomDomain {
@@ -1502,6 +1514,35 @@ export class APIClient {
   }
 
   /**
+   * Issue a signed token scoped to one sandbox (POST /v1/sandboxes/{id}/tokens).
+   * Not idempotent by nature: every call makes a new token, and the server
+   * stores none. It uses the normal retry tier: a retry after a lost answer
+   * makes a second token that nobody holds, which simply expires.
+   */
+  async createSandboxToken(id: string, options: CreateSandboxTokenOptions): Promise<SandboxToken> {
+    const body: Record<string, unknown> = { expires_in: options.expiresIn };
+    if (options.port !== undefined && options.port !== 0) {
+      body.port = options.port;
+    }
+    if (options.pathPrefix) {
+      body.path_prefix = options.pathPrefix;
+    }
+    if (options.methods && options.methods.length > 0) {
+      body.methods = options.methods;
+    }
+    const r = await this.doJSON<ApiSandboxToken>("POST", `${this.versionPrefix}/sandboxes/${id}/tokens`, body);
+    return {
+      token: r.token,
+      tokenID: r.token_id,
+      sandboxID: r.sandbox_id,
+      ...(r.port ? { port: r.port } : {}),
+      ...(r.path_prefix ? { pathPrefix: r.path_prefix } : {}),
+      ...(r.methods && r.methods.length > 0 ? { methods: r.methods } : {}),
+      expiresAt: r.expires_at,
+    };
+  }
+
+  /**
    * Bind a custom hostname to a sandbox. The server lowercases the hostname
    * and returns the post-add list of bindings (sorted by hostname). Calling
    * with an already-registered hostname is idempotent and returns the
@@ -2105,6 +2146,15 @@ export class SandboxResource implements Sandbox {
 
   async unexposePort(port: number): Promise<void> {
     await this.client.unexposePort(this.id, port);
+  }
+
+  /**
+   * Issue a signed token for this sandbox only, to hand to a browser or an
+   * end user. See {@link CreateSandboxTokenOptions}. Each call makes a new
+   * token; the server keeps no copy.
+   */
+  async createToken(options: CreateSandboxTokenOptions): Promise<SandboxToken> {
+    return this.client.createSandboxToken(this.id, options);
   }
 
   /**

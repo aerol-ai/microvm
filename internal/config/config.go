@@ -1539,6 +1539,12 @@ type Config struct {
 	// SB_TOKEN_MAX_TTL. Default 8760h (365 days); 2160h (90 days) in
 	// enterprise mode, which refuses anything longer.
 	TokenMaxTTL time.Duration
+	// SandboxTokenMaxTTL caps a sandbox token's lifetime (pkg/sandboxtoken,
+	// POST /v1/sandboxes/{id}/tokens). There is no revocation list, so this
+	// cap is how long a leaked token can work, and how long a rotation must
+	// wait between promoting a server key and retiring the old one.
+	// SB_SANDBOX_TOKEN_MAX_TTL. Default 24h; at most 720h (30 days).
+	SandboxTokenMaxTTL time.Duration
 	// IdentityFile is the identity file (plans/identity-and-access.md
 	// §5.5): the OIDC issuers this node trusts and the group-to-role
 	// bindings. Empty with IdentityEnabled is tokens-only mode (avm_ tokens,
@@ -1953,6 +1959,26 @@ const (
 	defaultTokenMaxTTL    = 365 * 24 * time.Hour
 	enterpriseTokenMaxTTL = 90 * 24 * time.Hour
 )
+
+// Sandbox token lifetime caps (plans/agent-sandbox-feature-parity.md A1).
+// The ceiling keeps a key rotation's promote-to-retire wait bounded: a
+// retire must wait out the longest token the old key may have signed.
+const (
+	defaultSandboxTokenMaxTTL = 24 * time.Hour
+	ceilingSandboxTokenMaxTTL = 30 * 24 * time.Hour
+)
+
+// validateSandboxTokens applies the sandbox token lifetime default and
+// refuses a cap above the ceiling.
+func validateSandboxTokens(cfg *Config) error {
+	if cfg.SandboxTokenMaxTTL == 0 {
+		cfg.SandboxTokenMaxTTL = defaultSandboxTokenMaxTTL
+	}
+	if cfg.SandboxTokenMaxTTL < 0 || cfg.SandboxTokenMaxTTL > ceilingSandboxTokenMaxTTL {
+		return fmt.Errorf("SB_SANDBOX_TOKEN_MAX_TTL must be between 1s and %s", ceilingSandboxTokenMaxTTL)
+	}
+	return nil
+}
 
 // validateIdentity checks the identity settings. Enterprise mode lowers the
 // token lifetime default to 90 days and refuses a longer cap.
@@ -2989,6 +3015,13 @@ func load(keyTool bool) (Config, error) {
 		}
 		cfg.TokenMaxTTL = ttl
 	}
+	if raw := strings.TrimSpace(os.Getenv("SB_SANDBOX_TOKEN_MAX_TTL")); raw != "" {
+		ttl, err := identitywire.ParseTokenTTL(raw)
+		if err != nil {
+			return Config{}, fmt.Errorf("SB_SANDBOX_TOKEN_MAX_TTL: %w", err)
+		}
+		cfg.SandboxTokenMaxTTL = ttl
+	}
 	if err := cfg.loadAuditAPIConfig(); err != nil {
 		return Config{}, err
 	}
@@ -2999,6 +3032,9 @@ func load(keyTool bool) (Config, error) {
 		return Config{}, err
 	}
 	if err := cfg.loadAPIAdmissionConfig(); err != nil {
+		return Config{}, err
+	}
+	if err := validateSandboxTokens(&cfg); err != nil {
 		return Config{}, err
 	}
 	if err := validateIdentity(&cfg); err != nil {

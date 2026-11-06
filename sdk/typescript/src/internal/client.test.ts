@@ -1042,6 +1042,65 @@ test("internal client create with bare image string skips build call", async () 
   assert.ok(seenURLs[0].endsWith("/v1/sandboxes"));
 });
 
+test("sandbox createToken POSTs the scope and maps the answer", async () => {
+  const seen: Request[] = [];
+  const bodies: unknown[] = [];
+  const client = new APIClient({
+    baseURL: "https://api.example.com",
+    patToken: "pat-token",
+    fetch: async (input, init) => {
+      const req = new Request(input, init);
+      seen.push(req);
+      if (req.url.endsWith("/tokens")) {
+        bodies.push(await req.json());
+        return jsonResponse(
+          {
+            token: "avmst_0.payload.sig",
+            token_id: "stk_abc",
+            sandbox_id: "sb-tok",
+            path_prefix: "/files",
+            methods: ["GET"],
+            expires_at: "2026-11-06T10:15:00Z",
+          },
+          201,
+        );
+      }
+      return jsonResponse(apiSandbox("sb-tok"));
+    },
+  });
+  const sandbox = await client.get("sb-tok");
+  const tok = await sandbox.createToken({ expiresIn: "15m", pathPrefix: "/files", methods: ["GET"] });
+  const post = seen[seen.length - 1];
+  assert.equal(post.method, "POST");
+  assert.equal(post.url, "https://api.example.com/v1/sandboxes/sb-tok/tokens");
+  assert.deepEqual(bodies[0], { expires_in: "15m", path_prefix: "/files", methods: ["GET"] });
+  assert.deepEqual(tok, {
+    token: "avmst_0.payload.sig",
+    tokenID: "stk_abc",
+    sandboxID: "sb-tok",
+    pathPrefix: "/files",
+    methods: ["GET"],
+    expiresAt: "2026-11-06T10:15:00Z",
+  });
+
+  // A port token sends only the port; empty options are left out.
+  await client.createSandboxToken("sb-tok", { expiresIn: "1h", port: 3000, methods: [] });
+  assert.deepEqual(bodies[1], { expires_in: "1h", port: 3000 });
+});
+
+test("sandbox createToken surfaces a 400 as an API error", async () => {
+  const client = new APIClient({
+    baseURL: "https://api.example.com",
+    patToken: "pat-token",
+    fetch: async () => jsonResponse({ error: "invalid sandbox token request: expires_in is required" }, 400),
+  });
+  await assert.rejects(client.createSandboxToken("sb-tok", { expiresIn: "" }), (err: unknown) => {
+    assert.ok(err instanceof MicroVMApiError);
+    assert.equal(err.status, 400);
+    return true;
+  });
+});
+
 test("internal client addCustomDomain POSTs hostname and parses list", async () => {
   let seenRequest: Request | undefined;
   const client = new APIClient({

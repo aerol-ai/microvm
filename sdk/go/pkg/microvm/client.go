@@ -757,6 +757,17 @@ func (s *Sandbox) UnexposePort(ctx context.Context, port int) error {
 	return s.client.inner.UnexposePort(ctx, s.ID, port)
 }
 
+// CreateToken issues a signed token for this sandbox only, to hand to a
+// browser or an end user. With opts.Port the token opens that port's public
+// URL (a port exposed with token visibility); without it the token is for
+// the toolbox: commands, files and sessions. Each call makes a new token,
+// and the server keeps no copy, so Token is shown only in the result. A
+// token cannot be revoked: it stops working when it expires or the sandbox
+// is deleted.
+func (s *Sandbox) CreateToken(ctx context.Context, opts sdktypes.CreateSandboxTokenOptions) (sdktypes.SandboxToken, error) {
+	return s.client.inner.CreateSandboxToken(ctx, s.ID, opts)
+}
+
 // CustomDomainOption customizes an AddCustomDomain call. Build values with
 // WithTargetPort; the variadic shape leaves room for future expansion.
 type CustomDomainOption func(*customDomainOptions)
