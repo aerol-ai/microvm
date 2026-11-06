@@ -121,6 +121,14 @@ func (h *Host) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		if !h.handleSessionsRoute(w, r) {
 			writeError(w, http.StatusNotFound, "not found")
 		}
+	case r.URL.Path == "/files/watch":
+		// A WASM sandbox's files live on the host and change only through
+		// this host's own handlers; there is no kernel to watch. Same answer
+		// as toolboxd on a shared kernel (plan F5, Q8).
+		if !h.requireAuth(w, r) {
+			return
+		}
+		writeError(w, http.StatusNotImplemented, "file watching needs a gVisor or Firecracker sandbox")
 	case isUnsupportedWasmToolboxRoute(r):
 		// Routes the Daytona facade forwards that a WASM sandbox has no
 		// filesystem or terminal for. A 501 with a reason, not the default

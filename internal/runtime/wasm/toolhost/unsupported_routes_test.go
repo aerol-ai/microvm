@@ -3,6 +3,7 @@ package toolhost
 import (
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -42,5 +43,23 @@ func TestUnsupportedDaytonaRoutesAnswer501(t *testing.T) {
 	handler.ServeHTTP(rec, req)
 	if rec.Code == http.StatusNotImplemented {
 		t.Fatalf("GET /files answered 501")
+	}
+}
+
+// File watching is offered on gVisor and Firecracker only (plan F5, Q8): a
+// WASM sandbox answers the same clear 501, after auth.
+func TestFileWatchAnswers501(t *testing.T) {
+	handler := New(Config{SandboxID: "sb", AuthToken: "tok", WorkDir: t.TempDir()}).Handler()
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/files/watch?path=/", nil))
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("watch without a token = %d, want 401", rec.Code)
+	}
+	rec = httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/files/watch?path=/", nil)
+	req.Header.Set("Authorization", "Bearer tok")
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotImplemented || !strings.Contains(rec.Body.String(), "gVisor or Firecracker") {
+		t.Fatalf("watch = %d %s, want the file-watching 501", rec.Code, rec.Body.String())
 	}
 }

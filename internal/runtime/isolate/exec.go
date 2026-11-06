@@ -30,6 +30,11 @@ func (d *Driver) ServeToolbox(ctx context.Context, sandboxID, token string, w ht
 	_ = token
 	path := r.URL.Path
 	switch {
+	case path == "/files/watch" || strings.HasSuffix(path, "/files/watch"):
+		// Same answer toolboxd gives on a shared kernel: watching is offered
+		// on gVisor and Firecracker only (plans/agent-sandbox-feature-parity.md
+		// F5, Q8).
+		http.Error(w, "file watching needs a gVisor or Firecracker sandbox", http.StatusNotImplemented)
 	case strings.Contains(path, "/exec") || strings.Contains(path, "/process"):
 		d.serveExec(ctx, sandboxID, w, r)
 	default:

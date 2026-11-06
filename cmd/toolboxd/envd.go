@@ -381,13 +381,13 @@ func (s *server) handleEnvdRoute(w http.ResponseWriter, r *http.Request) bool {
 	case r.Method == http.MethodPost && r.URL.Path == envdPrefix+"/filesystem.Filesystem/Remove":
 		s.handleEnvdFilesystemRemove(w, r)
 	case r.Method == http.MethodPost && r.URL.Path == envdPrefix+"/filesystem.Filesystem/WatchDir":
-		writeEnvdError(w, http.StatusNotImplemented, "filesystem watchers are not implemented")
+		s.handleEnvdWatchDir(w, r)
 	case r.Method == http.MethodPost && r.URL.Path == envdPrefix+"/filesystem.Filesystem/CreateWatcher":
-		writeEnvdError(w, http.StatusNotImplemented, "filesystem watchers are not implemented")
+		s.handleEnvdCreateWatcher(w, r)
 	case r.Method == http.MethodPost && r.URL.Path == envdPrefix+"/filesystem.Filesystem/GetWatcherEvents":
-		writeEnvdError(w, http.StatusNotImplemented, "filesystem watchers are not implemented")
+		s.handleEnvdGetWatcherEvents(w, r)
 	case r.Method == http.MethodPost && r.URL.Path == envdPrefix+"/filesystem.Filesystem/RemoveWatcher":
-		writeEnvdError(w, http.StatusNotImplemented, "filesystem watchers are not implemented")
+		s.handleEnvdRemoveWatcher(w, r)
 	default:
 		return false
 	}

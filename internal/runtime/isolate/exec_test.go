@@ -35,6 +35,19 @@ func TestServeToolboxUnsupportedEndpoint(t *testing.T) {
 	}
 }
 
+// An isolate has no filesystem to watch: a clear 501 naming the runtimes
+// that can (plan F5, Q8).
+func TestServeToolboxFileWatchUnsupported(t *testing.T) {
+	d := New(Config{}, nil)
+	for _, path := range []string{"/files/watch", "/v1/sandboxes/sb-1/toolbox/files/watch"} {
+		rec := httptest.NewRecorder()
+		d.ServeToolbox(context.Background(), "sb-1", "tok", rec, httptest.NewRequest(http.MethodGet, path+"?path=/", nil))
+		if rec.Code != http.StatusNotImplemented || !strings.Contains(rec.Body.String(), "gVisor or Firecracker") {
+			t.Fatalf("%s = %d %q, want the file-watching 501", path, rec.Code, rec.Body.String())
+		}
+	}
+}
+
 func TestServeExecInvokeHandler(t *testing.T) {
 	sup := &fakeSupervisor{}
 	d := newCreateDriver(t, GroupPerTenant, sup)

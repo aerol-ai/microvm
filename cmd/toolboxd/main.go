@@ -568,6 +568,11 @@ func (s *server) routes() http.Handler {
 				return
 			}
 			s.handleDaytonaFindInFiles(w, r)
+		case r.Method == http.MethodGet && r.URL.Path == "/files/watch":
+			if !s.requireAuth(w, r) {
+				return
+			}
+			s.handleFileWatch(w, r)
 		case strings.HasPrefix(r.URL.Path, "/git/"):
 			if !s.requireAuth(w, r) {
 				return
