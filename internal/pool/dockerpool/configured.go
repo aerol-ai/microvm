@@ -11,11 +11,17 @@ import (
 // defaultDepth, so the SB_*_POOL_* settings stay the default for images no
 // entry names.
 
-// Configured is one API warm-pool entry as this pool applies it.
+// Configured is one API warm-pool entry as this pool applies it. With
+// MaxDepth > 0 the depth follows demand between MinDepth and MaxDepth
+// (demand.go) and Depth is unused.
 type Configured struct {
-	Key   Key
-	Depth int
+	Key      Key
+	Depth    int
+	MinDepth int
+	MaxDepth int
 }
+
+func (c Configured) followsDemand() bool { return c.MaxDepth > 0 }
 
 // TargetStatus is one configured entry's state in this pool.
 type TargetStatus struct {
@@ -65,6 +71,7 @@ func (p *Pool) SetConfigured(entries []Configured) {
 		p.targets[ks] = e.Key
 	}
 	p.configured = next
+	p.reconcileDemandLocked()
 	p.publishParkedLocked()
 	p.kickRefillLocked()
 	p.mu.Unlock()
@@ -74,10 +81,17 @@ func (p *Pool) SetConfigured(entries []Configured) {
 // depthLocked is the depth refill aims for on ks: the entry's, else the
 // default.
 func (p *Pool) depthLocked(ks string) int {
-	if c, ok := p.configured[ks]; ok {
-		return c.Depth
+	c, ok := p.configured[ks]
+	if !ok {
+		return p.defaultDepth
 	}
-	return p.defaultDepth
+	if c.followsDemand() {
+		if st := p.demand[ks]; st != nil {
+			return st.target
+		}
+		return c.MinDepth
+	}
+	return c.Depth
 }
 
 // trimExcess takes the ready slots a configured key holds beyond its depth

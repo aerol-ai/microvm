@@ -771,6 +771,10 @@ class WarmPool(TypedDict, total=False):
     image: str
     # Warm slots each server keeps for this image; 0 turns warming off for it.
     depth: int
+    # With maxDepth, each server sets its own target from recent demand,
+    # never below minDepth and never above maxDepth.
+    minDepth: int
+    maxDepth: int
     # Goes up by one on every change; the same put twice leaves it alone.
     generation: int
     createdAt: str
@@ -780,10 +784,15 @@ class WarmPool(TypedDict, total=False):
 
 
 class WarmPoolOptions(TypedDict, total=False):
-    """The body of ``put_warm_pool``: a full replace."""
+    """The body of ``put_warm_pool``: a full replace. Set ``depth`` for a
+    fixed size, or ``minDepth`` and ``maxDepth`` to follow demand, not both."""
 
     # Warm slots each server keeps for this image (0 to 128).
     depth: int
+    # The fewest warm slots a server keeps when demand is low (0 lets it reach zero).
+    minDepth: int
+    # The most warm slots a server keeps when demand is high (1 to 128).
+    maxDepth: int
 
 
 class NetworkPolicyOptions(TypedDict, total=False):

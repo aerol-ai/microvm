@@ -28,16 +28,21 @@ var ErrWarmPoolLimit = errors.New("cluster: warm pool limit reached")
 // WarmPoolRecord is one replicated entry. Times come from the proposer's
 // stamp, never the applier's clock, so replicas agree.
 type WarmPoolRecord struct {
-	Image           string `json:"image"`
-	Depth           int    `json:"depth"`
-	Generation      int64  `json:"generation"`
-	CreatedUnixNano int64  `json:"created_unix_nano"`
-	UpdatedUnixNano int64  `json:"updated_unix_nano"`
+	Image string `json:"image"`
+	Depth int    `json:"depth"`
+	// MinDepth/MaxDepth: the depth follows demand between them (W2). They
+	// ship in the same release as the ops, so the fv 6 gate covers them: no
+	// server can drop them as unknown fields.
+	MinDepth        int   `json:"min_depth,omitempty"`
+	MaxDepth        int   `json:"max_depth,omitempty"`
+	Generation      int64 `json:"generation"`
+	CreatedUnixNano int64 `json:"created_unix_nano"`
+	UpdatedUnixNano int64 `json:"updated_unix_nano"`
 }
 
 // sameSettings compares what a PUT sets, not the bookkeeping.
 func (r WarmPoolRecord) sameSettings(o WarmPoolRecord) bool {
-	return r.Depth == o.Depth
+	return r.Depth == o.Depth && r.MinDepth == o.MinDepth && r.MaxDepth == o.MaxDepth
 }
 
 // warmPoolApplyResult is the leader FSM's answer to opPutWarmPool.

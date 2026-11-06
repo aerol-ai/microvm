@@ -5269,7 +5269,9 @@ mod tests {
         .to_string();
         let (url, request_rx) = spawn_json_server(body);
         let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
-        let pool = client.put_warm_pool("ghcr.io/acme/agent:1", WarmPoolOptions { depth: 2 }).expect("put should succeed");
+        let pool = client
+            .put_warm_pool("ghcr.io/acme/agent:1", WarmPoolOptions { depth: 2, ..Default::default() })
+            .expect("put should succeed");
         let request = request_rx.recv().expect("request should be captured");
         assert!(
             request.starts_with("PUT /v1/warm-pools/ghcr.io/acme/agent%3A1 HTTP/1.1\r\n"),
@@ -5312,6 +5314,17 @@ mod tests {
         client.delete_warm_pool("python:3.12").expect("delete should succeed");
         let request = request_rx.recv().expect("request should be captured");
         assert!(request.starts_with("DELETE /v1/warm-pools/python%3A3.12 HTTP/1.1\r\n"), "unexpected request: {}", request);
+
+        let (url, request_rx) = spawn_json_server(
+            serde_json::json!({"image": "python:3.12", "depth": 0, "min_depth": 1, "max_depth": 4, "generation": 1}).to_string(),
+        );
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        let pool = client
+            .put_warm_pool("python:3.12", WarmPoolOptions { min_depth: 1, max_depth: 4, ..Default::default() })
+            .expect("put should succeed");
+        let request = request_rx.recv().expect("request should be captured");
+        assert_eq!(request_json_body(&request), serde_json::json!({"depth": 0, "min_depth": 1, "max_depth": 4}));
+        assert_eq!((pool.min_depth, pool.max_depth), (1, 4));
     }
 
     #[test]

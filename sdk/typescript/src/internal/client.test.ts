@@ -1994,6 +1994,22 @@ test("warm pool CRUD maps the wire shape and keeps an image's slashes", async ()
   assert.deepEqual(seen[4], { method: "DELETE", url: "https://api.example.com/v1/warm-pools/python%3A3.12", body: undefined });
 });
 
+test("a warm pool that follows demand sends and maps its range", async () => {
+  let body: unknown;
+  const client = new APIClient({
+    baseURL: "https://api.example.com",
+    patToken: "pat-token",
+    fetch: async (input, init) => {
+      body = init?.body ? JSON.parse(String(init.body)) : undefined;
+      return jsonResponse({ image: "python:3.12", depth: 0, min_depth: 1, max_depth: 4, generation: 1, created_at: "c", updated_at: "u" });
+    },
+  });
+  const pool = await client.putWarmPool("python:3.12", { minDepth: 1, maxDepth: 4 });
+  assert.deepEqual(body, { depth: 0, min_depth: 1, max_depth: 4 });
+  assert.equal(pool.minDepth, 1);
+  assert.equal(pool.maxDepth, 4);
+});
+
 test("sandboxes carry their egress profiles", async () => {
   let body: Record<string, unknown> = {};
   const client = new APIClient({

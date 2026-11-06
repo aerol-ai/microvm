@@ -467,3 +467,39 @@ func TestClusterWarmPoolSyncLoopKick(t *testing.T) {
 	pool.waitFor(t, func(c []dockerpool.Configured) bool { return len(c) == 1 })
 	cancel()
 }
+
+// TestWarmPoolDemandRangeReachesPoolAndCluster (W2): a demand-following
+// entry's range is validated, stored, replicated and handed to the pool.
+func TestWarmPoolDemandRangeReachesPoolAndCluster(t *testing.T) {
+	svc := newWarmPoolService(t)
+	ctx := context.Background()
+	for _, bad := range []models.WarmPoolRequest{{Depth: 2, MaxDepth: 4}, {MinDepth: 1}, {MinDepth: 5, MaxDepth: 4}} {
+		if _, err := svc.PutWarmPool(ctx, "python:3.12", bad); !errors.Is(err, models.ErrWarmPoolInvalid) {
+			t.Fatalf("%+v = %v, want ErrWarmPoolInvalid", bad, err)
+		}
+	}
+	p, err := svc.PutWarmPool(ctx, "python:3.12", models.WarmPoolRequest{MinDepth: 1, MaxDepth: 4})
+	if err != nil || p.MinDepth != 1 || p.MaxDepth != 4 || p.Depth != 0 {
+		t.Fatalf("put = %+v %v", p, err)
+	}
+	pool := newFakeWarmPool()
+	svc.RegisterWarmPool(pool, "docker")
+	if err := svc.syncWarmPools(ctx); err != nil {
+		t.Fatal(err)
+	}
+	want := []dockerpool.Configured{{Key: dockerpool.Key{Image: "python:3.12", Runtime: "docker"}, MinDepth: 1, MaxDepth: 4}}
+	if got := pool.last(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("applied = %+v, want %+v", got, want)
+	}
+
+	csvc, c := newClusterWarmPoolService(t)
+	if p, err := csvc.PutWarmPool(ctx, "python:3.12", models.WarmPoolRequest{MaxDepth: 3}); err != nil || p.MaxDepth != 3 {
+		t.Fatalf("cluster put = %+v %v", p, err)
+	}
+	if rec := c.pools["python:3.12"]; rec.MaxDepth != 3 || rec.MinDepth != 0 {
+		t.Fatalf("replicated = %+v", rec)
+	}
+	if got, err := csvc.GetWarmPool(ctx, "python:3.12"); err != nil || got.MaxDepth != 3 {
+		t.Fatalf("cluster get = %+v %v", got, err)
+	}
+}

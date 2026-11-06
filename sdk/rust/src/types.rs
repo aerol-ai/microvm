@@ -1178,6 +1178,12 @@ pub struct WarmPool {
     /// Warm slots each server keeps for this image; 0 turns warming off for it.
     #[serde(default)]
     pub depth: u32,
+    /// With `max_depth`, each server sets its own target from recent
+    /// demand, never below `min_depth` and never above `max_depth`.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub min_depth: u32,
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub max_depth: u32,
     /// Goes up by one on every change; the same put twice leaves it alone.
     #[serde(default)]
     pub generation: i64,
@@ -1190,11 +1196,22 @@ pub struct WarmPool {
     pub status: Option<WarmPoolStatus>,
 }
 
-/// The body of `put_warm_pool`: a full replace.
+/// The body of `put_warm_pool`: a full replace. Set `depth` for a fixed
+/// size, or `min_depth` and `max_depth` to follow demand, not both.
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
 pub struct WarmPoolOptions {
     /// Warm slots each server keeps for this image (0 to 128).
     pub depth: u32,
+    /// The fewest warm slots a server keeps when demand is low (0 lets it reach zero).
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub min_depth: u32,
+    /// The most warm slots a server keeps when demand is high (1 to 128).
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub max_depth: u32,
+}
+
+fn is_zero_u32(v: &u32) -> bool {
+    *v == 0
 }
 
 /// Ready and target slots in total, and on each server that runs a warm pool.

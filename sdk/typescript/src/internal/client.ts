@@ -316,6 +316,8 @@ function fromApiEgressProfile(p: ApiEgressProfile): EgressProfile {
 interface ApiWarmPool {
   image: string;
   depth: number;
+  min_depth?: number;
+  max_depth?: number;
   generation: number;
   created_at: string;
   updated_at: string;
@@ -334,6 +336,8 @@ function fromApiWarmPool(p: ApiWarmPool): WarmPool {
     createdAt: p.created_at,
     updatedAt: p.updated_at,
   };
+  if (p.min_depth) out.minDepth = p.min_depth;
+  if (p.max_depth) out.maxDepth = p.max_depth;
   if (p.status) {
     const status: WarmPoolStatus = { ready: p.status.ready, target: p.status.target, servers: [] };
     for (const s of p.status.servers ?? []) {
@@ -1812,7 +1816,13 @@ export class APIClient {
   // Warm pools are PUT/GET/DELETE of one entry: every call is safe to retry,
   // so they keep the default (idempotent) retry tier.
   async putWarmPool(image: string, options: WarmPoolOptions): Promise<WarmPool> {
-    return fromApiWarmPool(await this.doJSON<ApiWarmPool>("PUT", this.versioned(warmPoolPath(image)), { depth: options.depth }));
+    return fromApiWarmPool(
+      await this.doJSON<ApiWarmPool>("PUT", this.versioned(warmPoolPath(image)), {
+        depth: options.depth ?? 0,
+        min_depth: options.minDepth,
+        max_depth: options.maxDepth,
+      }),
+    );
   }
 
   async getWarmPool(image: string): Promise<WarmPool> {

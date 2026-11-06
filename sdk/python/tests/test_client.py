@@ -1159,6 +1159,19 @@ class ClientTests(unittest.TestCase):
         # Every warm-pool call is safe to retry.
         self.assertTrue(all(c[3] for c in calls))
 
+    def test_warm_pool_follows_demand(self):
+        client = MicroVM(api_url="https://sandbox.example.com", pat_token="pat-token")
+        sent = []
+
+        def fake(method, path, payload, *, idempotent=True, headers=None):
+            sent.append(payload)
+            return {"image": "python:3.12", "depth": 0, "min_depth": 1, "max_depth": 4, "generation": 1}
+
+        client._do_json = fake  # type: ignore[assignment]
+        pool = client.put_warm_pool("python:3.12", {"minDepth": 1, "maxDepth": 4})
+        self.assertEqual(sent[0], {"depth": 0, "min_depth": 1, "max_depth": 4})
+        self.assertEqual((pool["minDepth"], pool["maxDepth"]), (1, 4))
+
     def test_learn_mode(self):
         client = RecordingMicroVM()
         sandbox = client.create({"image": "alpine", "networkEgressMode": "learn"})

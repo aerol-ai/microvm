@@ -1006,6 +1006,7 @@ var Registry = []UseCase{
 	{ID: "UC-419", Title: "Warm pools: in a cluster an entry written through any node reaches every node that runs sandboxes, each reporting it at its depth", Requires: []Capability{CapCluster, CapDockerPool}, Implemented: true},
 	{ID: "UC-420", Title: "Warm pools: deleting an entry drains it (no server reports it, its parked slots are given back), a GET is a 404 and a second DELETE succeeds", Requires: []Capability{CapDockerPool}, Implemented: true},
 	{ID: "UC-421", Title: "Warm pools are admin only: a runner and a viewer token get a 403 naming fleet.admin on list, get, put and delete; an admin token bound to every team lists them", Requires: []Capability{CapIdentity}, Implemented: true},
+	{ID: "UC-422", Title: "Warm pools follow demand: an entry with min_depth 0 and max_depth 2 starts at target 0 on every server; three creates from the image raise a serving server's target and ready above 0 (at most 2)", Requires: []Capability{CapDockerPool}, Implemented: true},
 }
 
 // byID is a lookup built once for the report generator.

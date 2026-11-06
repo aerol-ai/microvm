@@ -941,6 +941,10 @@ export interface WarmPool {
   image: string;
   /** Warm slots each server keeps for this image. 0 turns warming off for it. */
   depth: number;
+  /** With `maxDepth`, each server sets its own target from recent demand, never below this. */
+  minDepth?: number;
+  /** Set to follow demand: each server's target moves with its recent creates, up to this. */
+  maxDepth?: number;
   /** Goes up by one on every change; the same `putWarmPool` twice leaves it alone. */
   generation: number;
   createdAt: string;
@@ -949,10 +953,17 @@ export interface WarmPool {
   status?: WarmPoolStatus;
 }
 
-/** The body of `putWarmPool`: a full replace. */
+/**
+ * The body of `putWarmPool`: a full replace. Set `depth` for a fixed size, or
+ * `minDepth` and `maxDepth` to follow demand, not both.
+ */
 export interface WarmPoolOptions {
   /** Warm slots each server keeps for this image (0 to 128). */
-  depth: number;
+  depth?: number;
+  /** The fewest warm slots a server keeps when demand is low (0 lets it reach zero). */
+  minDepth?: number;
+  /** The most warm slots a server keeps when demand is high (1 to 128). */
+  maxDepth?: number;
 }
 
 /** Ready and target slots in total, and on each server that runs a warm pool. */

@@ -1449,6 +1449,11 @@ class MicroVMClientTest {
                 writeJson(exchange, 200, mapOf("pools", seen.size() < 4 ? List.of(mapOf("image", "python:3.12", "depth", 2, "status", status)) : null));
                 return;
             }
+            if ("PUT".equals(method) && rawPath.endsWith("/demand%3A1")) {
+                body.set(castMap(JsonSupport.read(exchange.getRequestBody().readAllBytes(), Map.class)));
+                writeJson(exchange, 200, mapOf("image", "demand:1", "depth", 0, "min_depth", 1, "max_depth", 4, "generation", 1));
+                return;
+            }
             if ("PUT".equals(method)) {
                 body.set(castMap(JsonSupport.read(exchange.getRequestBody().readAllBytes(), Map.class)));
                 writeJson(exchange, 200, mapOf("image", "ghcr.io/acme/agent:1", "depth", 2, "generation", 1, "created_at", "c", "updated_at", "u"));
@@ -1478,6 +1483,11 @@ class MicroVMClientTest {
                 "GET /v1/warm-pools",
                 "GET /v1/warm-pools",
                 "DELETE /v1/warm-pools/odd%20name/img%3A1"), seen);
+            WarmPool demand = client.putWarmPool("demand:1", new WarmPoolOptions().setMinDepth(1).setMaxDepth(4));
+            assertEquals(1, ((Number) body.get().get("min_depth")).intValue());
+            assertEquals(4, ((Number) body.get().get("max_depth")).intValue());
+            assertEquals(1, demand.minDepth);
+            assertEquals(4, demand.maxDepth);
         } finally {
             server.stop(0);
         }

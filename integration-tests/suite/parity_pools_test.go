@@ -314,3 +314,60 @@ func TestParityWarmPoolNonAdminRefused(t *testing.T) {
 		t.Fatalf("admin GET /v1/warm-pools = %s, %v; want 200", resp, err)
 	}
 }
+
+// UC-422 — An entry that follows demand (min 0, max 2) starts with no
+// warm sandboxes on any server; a few creates from the image raise the
+// target of the server that served them within a sample window, and its
+// pool then parks sandboxes to that target.
+func TestParityWarmPoolFollowsDemand(t *testing.T) {
+	harness.Require(t, sc, "UC-422")
+	c := client(t)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	pool, err := c.SDK().PutWarmPool(ctx, parityPoolImage, sdktypes.WarmPoolOptions{MinDepth: 0, MaxDepth: 2})
+	cancel()
+	if err != nil || pool.MaxDepth != 2 || pool.Depth != 0 {
+		t.Fatalf("PutWarmPool(min 0, max 2) = %+v, %v", pool, err)
+	}
+	t.Cleanup(func() {
+		cctx, ccancel := context.WithTimeout(context.Background(), time.Minute)
+		defer ccancel()
+		_ = c.SDK().DeleteWarmPool(cctx, parityPoolImage)
+	})
+	// The entry reaches each server at its floor: no target, nothing parked.
+	waitParityPool(t, c, "every server at target 0", func(s models.WarmPoolStatus) bool {
+		return len(s.Servers) > 0 && s.Target == 0 && s.Ready == 0
+	})
+	// Steady demand: a create every 10 s while polling, so whichever
+	// servers placement picks keep a non-zero average across the 15 s sample
+	// windows, the way a real queue of work would. A burst followed by
+	// silence decays back to zero within about a minute, which a status
+	// poll can miss. Each poll logs every server, so a failure shows whether
+	// targets never moved or slots never parked.
+	deadline := time.Now().Add(parityPoolWait)
+	for i := 1; ; i++ {
+		cctx, ccancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		sb, err := c.SDK().Create(cctx, sdktypes.CreateSandboxOptions{Name: harness.UniqueName(sc, t), Image: parityPoolImage})
+		ccancel()
+		if err != nil {
+			t.Fatalf("create %d from %s: %v", i, parityPoolImage, err)
+		}
+		destroyBest(c, sb.ID)
+
+		gctx, gcancel := context.WithTimeout(context.Background(), 30*time.Second)
+		pool, err := c.SDK().GetWarmPool(gctx, parityPoolImage)
+		gcancel()
+		if err == nil && pool.Status != nil {
+			t.Logf("UC-422: after create %d: %+v", i, pool.Status.Servers)
+			for _, srv := range pool.Status.Servers {
+				if srv.Target >= 1 && srv.Ready >= 1 && srv.Target <= 2 {
+					t.Logf("UC-422: server %s follows demand: target %d, ready %d", srv.NodeID, srv.Target, srv.Ready)
+					return
+				}
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("warm pool %s never reached a server's target and ready above 0 under steady demand; last = %+v (err %v)", parityPoolImage, statusOf(pool), err)
+		}
+		time.Sleep(10 * time.Second)
+	}
+}

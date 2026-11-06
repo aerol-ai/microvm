@@ -25,7 +25,11 @@ type Pool struct {
 	envPins map[string]struct{}
 	// configured are the API warm-pool entries (configured.go), by key
 	// string. Their depth replaces defaultDepth for that key.
-	configured    map[string]Configured
+	configured map[string]Configured
+	// demand is each demand-following entry's moving average and target
+	// (demand.go). now is the clock it samples on; nil is time.Now.
+	demand        map[string]*demandState
+	now           func() time.Time
 	targets       map[string]Key // keyString -> Key
 	lastUsed      map[string]time.Time
 	ready         map[string][]*ParkedSlot
@@ -48,6 +52,7 @@ func New(logger *slog.Logger) *Pool {
 		pinned:     make(map[string]struct{}),
 		envPins:    make(map[string]struct{}),
 		configured: make(map[string]Configured),
+		demand:     make(map[string]*demandState),
 		targets:    make(map[string]Key),
 		lastUsed:   make(map[string]time.Time),
 		ready:      make(map[string][]*ParkedSlot),
@@ -254,6 +259,7 @@ func (p *Pool) HasReady(key Key) bool {
 func (p *Pool) NoteMiss(key Key) {
 	p.NoteTarget(key)
 	p.mu.Lock()
+	p.countDemandLocked(key.KeyString())
 	if p.metrics != nil {
 		p.metrics.recordMiss()
 	}
@@ -276,6 +282,7 @@ func (p *Pool) Acquire(ctx context.Context, key Key, currentImageID string) (*Pa
 
 	p.mu.Lock()
 	p.lastUsed[ks] = time.Now().UTC()
+	p.countDemandLocked(ks)
 	q := p.ready[ks]
 	keep := q[:0]
 	for _, slot := range q {

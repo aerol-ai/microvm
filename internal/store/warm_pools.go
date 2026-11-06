@@ -46,15 +46,17 @@ func (s *Store) PutWarmPool(ctx context.Context, in models.WarmPool, now time.Ti
 		p = old
 		p.Generation++
 	}
-	p.Depth, p.UpdatedAt = in.Depth, now.UTC()
+	p.Depth, p.MinDepth, p.MaxDepth, p.UpdatedAt = in.Depth, in.MinDepth, in.MaxDepth, now.UTC()
 	if _, err := tx.ExecContext(ctx, `
-		INSERT INTO warm_pools (image, depth, generation, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?)
+		INSERT INTO warm_pools (image, depth, min_depth, max_depth, generation, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(image) DO UPDATE SET
 			depth = excluded.depth,
+			min_depth = excluded.min_depth,
+			max_depth = excluded.max_depth,
 			generation = excluded.generation,
 			updated_at = excluded.updated_at
-	`, p.Image, p.Depth, p.Generation, p.CreatedAt, p.UpdatedAt); err != nil {
+	`, p.Image, p.Depth, p.MinDepth, p.MaxDepth, p.Generation, p.CreatedAt, p.UpdatedAt); err != nil {
 		return models.WarmPool{}, false, fmt.Errorf("put warm pool: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
@@ -65,7 +67,7 @@ func (s *Store) PutWarmPool(ctx context.Context, in models.WarmPool, now time.Ti
 
 // warmPoolSettingsEqual compares what a PUT sets, not the bookkeeping.
 func warmPoolSettingsEqual(a, b models.WarmPool) bool {
-	return a.Depth == b.Depth
+	return a.Depth == b.Depth && a.MinDepth == b.MinDepth && a.MaxDepth == b.MaxDepth
 }
 
 // GetWarmPool returns the entry for an image.
@@ -76,8 +78,8 @@ func (s *Store) GetWarmPool(ctx context.Context, image string) (models.WarmPool,
 func getWarmPool(ctx context.Context, q queryRower, image string) (models.WarmPool, error) {
 	p := models.WarmPool{Image: image}
 	err := q.QueryRowContext(ctx, `
-		SELECT depth, generation, created_at, updated_at FROM warm_pools WHERE image = ?
-	`, image).Scan(&p.Depth, &p.Generation, &p.CreatedAt, &p.UpdatedAt)
+		SELECT depth, min_depth, max_depth, generation, created_at, updated_at FROM warm_pools WHERE image = ?
+	`, image).Scan(&p.Depth, &p.MinDepth, &p.MaxDepth, &p.Generation, &p.CreatedAt, &p.UpdatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return p, ErrWarmPoolNotFound
 	}
@@ -91,7 +93,7 @@ func getWarmPool(ctx context.Context, q queryRower, image string) (models.WarmPo
 // models.MaxWarmPools, so there is no paging.
 func (s *Store) ListWarmPools(ctx context.Context) ([]models.WarmPool, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT image, depth, generation, created_at, updated_at FROM warm_pools ORDER BY image
+		SELECT image, depth, min_depth, max_depth, generation, created_at, updated_at FROM warm_pools ORDER BY image
 	`)
 	if err != nil {
 		return nil, fmt.Errorf("list warm pools: %w", err)
@@ -100,7 +102,7 @@ func (s *Store) ListWarmPools(ctx context.Context) ([]models.WarmPool, error) {
 	out := []models.WarmPool{}
 	for rows.Next() {
 		var p models.WarmPool
-		if err := rows.Scan(&p.Image, &p.Depth, &p.Generation, &p.CreatedAt, &p.UpdatedAt); err != nil {
+		if err := rows.Scan(&p.Image, &p.Depth, &p.MinDepth, &p.MaxDepth, &p.Generation, &p.CreatedAt, &p.UpdatedAt); err != nil {
 			return nil, fmt.Errorf("scan warm pool: %w", err)
 		}
 		out = append(out, p)

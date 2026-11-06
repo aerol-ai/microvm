@@ -49,8 +49,10 @@ func (p *Pool) Run(ctx context.Context, cfg RefillConfig, spawner Spawner, gate 
 }
 
 func (p *Pool) refillTick(parent context.Context, cfg RefillConfig, spawner Spawner, gate RefillGate) {
-	// An entry whose depth went down gives its extra slots back first, so
-	// their park reservations are free before this tick parks anything.
+	// Demand-following entries move their targets first; then an entry
+	// whose depth went down gives its extra slots back, so their park
+	// reservations are free before this tick parks anything.
+	p.sampleDemand()
 	p.destroySlots(parent, p.trimExcess())
 	targets := p.ListTargets()
 	for _, key := range targets {

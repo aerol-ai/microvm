@@ -124,7 +124,7 @@ func (s *Service) PutWarmPool(ctx context.Context, image string, req models.Warm
 	if s.ClusterEnabled() && docker.IsLocalOnlyImageRef(image) {
 		return nil, fmt.Errorf("%w: %s exists on one node only; a cluster warm pool needs an image every node can pull", models.ErrWarmPoolInvalid, image)
 	}
-	p, changed, err := s.warmPoolBackend().PutWarmPool(ctx, models.WarmPool{Image: image, Depth: req.Depth}, time.Now())
+	p, changed, err := s.warmPoolBackend().PutWarmPool(ctx, models.WarmPool{Image: image, Depth: req.Depth, MinDepth: req.MinDepth, MaxDepth: req.MaxDepth}, time.Now())
 	if err != nil {
 		return nil, err
 	}
@@ -319,7 +319,10 @@ func (s *Service) syncWarmPools(ctx context.Context) error {
 	for _, reg := range pools {
 		configured := make([]dockerpool.Configured, 0, len(entries))
 		for _, e := range entries {
-			configured = append(configured, dockerpool.Configured{Key: dockerpool.Key{Image: e.Image, Runtime: reg.runtime}, Depth: e.Depth})
+			configured = append(configured, dockerpool.Configured{
+				Key:   dockerpool.Key{Image: e.Image, Runtime: reg.runtime},
+				Depth: e.Depth, MinDepth: e.MinDepth, MaxDepth: e.MaxDepth,
+			})
 		}
 		reg.pool.SetConfigured(configured)
 	}
@@ -368,7 +371,9 @@ func (s *Service) readWarmPoolsForSync(ctx context.Context) ([]models.WarmPool, 
 type clusterWarmPools struct{ c warmPoolCluster }
 
 func (b clusterWarmPools) PutWarmPool(ctx context.Context, in models.WarmPool, _ time.Time) (models.WarmPool, bool, error) {
-	resp, err := b.c.WriteWarmPool(ctx, cluster.WarmPoolWriteRequest{Pool: cluster.WarmPoolRecord{Image: in.Image, Depth: in.Depth}})
+	resp, err := b.c.WriteWarmPool(ctx, cluster.WarmPoolWriteRequest{Pool: cluster.WarmPoolRecord{
+		Image: in.Image, Depth: in.Depth, MinDepth: in.MinDepth, MaxDepth: in.MaxDepth,
+	}})
 	if err != nil {
 		return models.WarmPool{}, false, clusterWarmPoolError(err)
 	}
@@ -421,6 +426,8 @@ func warmPoolFromRecord(r cluster.WarmPoolRecord) models.WarmPool {
 	return models.WarmPool{
 		Image:      r.Image,
 		Depth:      r.Depth,
+		MinDepth:   r.MinDepth,
+		MaxDepth:   r.MaxDepth,
 		Generation: r.Generation,
 		CreatedAt:  time.Unix(0, r.CreatedUnixNano).UTC(),
 		UpdatedAt:  time.Unix(0, r.UpdatedUnixNano).UTC(),

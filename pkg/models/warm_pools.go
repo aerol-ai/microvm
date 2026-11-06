@@ -37,8 +37,13 @@ var ErrWarmPoolInvalid = errors.New("invalid warm pool")
 // every change, so the same PUT twice leaves it alone. Status is filled on
 // reads; a PUT answers without it.
 type WarmPool struct {
-	Image      string          `json:"image"`
-	Depth      int             `json:"depth"`
+	Image string `json:"image"`
+	Depth int    `json:"depth"`
+	// MinDepth and MaxDepth make the depth follow demand (W2): each server
+	// sets its own target from a moving average of the creates it served
+	// from the image, kept between them. MaxDepth 0 means a fixed Depth.
+	MinDepth   int             `json:"min_depth,omitempty"`
+	MaxDepth   int             `json:"max_depth,omitempty"`
 	Generation int64           `json:"generation"`
 	CreatedAt  time.Time       `json:"created_at"`
 	UpdatedAt  time.Time       `json:"updated_at"`
@@ -48,8 +53,14 @@ type WarmPool struct {
 // WarmPoolRequest is the body of PUT /v1/warm-pools/{image}, a full
 // replace: the same body twice is a no-op.
 type WarmPoolRequest struct {
-	Depth int `json:"depth"`
+	Depth    int `json:"depth"`
+	MinDepth int `json:"min_depth,omitempty"`
+	MaxDepth int `json:"max_depth,omitempty"`
 }
+
+// FollowsDemand reports an entry whose depth follows demand between
+// MinDepth and MaxDepth rather than staying at Depth.
+func (p WarmPool) FollowsDemand() bool { return p.MaxDepth > 0 }
 
 // WarmPoolStatus is how full an entry's pools are: the total over every
 // server that runs a warm pool, and each server on its own.
@@ -101,10 +112,25 @@ func ValidateWarmPoolImage(image string) error {
 	return nil
 }
 
-// Validate checks a PUT body.
+// Validate checks a PUT body. An entry is either a fixed depth, or a
+// min_depth/max_depth range to follow demand; asking for both is refused
+// rather than guessed at.
 func (r WarmPoolRequest) Validate() error {
-	if r.Depth < 0 || r.Depth > MaxWarmPoolDepth {
-		return fmt.Errorf("%w: depth must be between 0 and %d, got %d", ErrWarmPoolInvalid, MaxWarmPoolDepth, r.Depth)
+	for _, f := range []struct {
+		name string
+		v    int
+	}{{"depth", r.Depth}, {"min_depth", r.MinDepth}, {"max_depth", r.MaxDepth}} {
+		if f.v < 0 || f.v > MaxWarmPoolDepth {
+			return fmt.Errorf("%w: %s must be between 0 and %d, got %d", ErrWarmPoolInvalid, f.name, MaxWarmPoolDepth, f.v)
+		}
+	}
+	switch {
+	case r.MaxDepth == 0 && r.MinDepth > 0:
+		return fmt.Errorf("%w: min_depth needs max_depth (the most the depth may grow to)", ErrWarmPoolInvalid)
+	case r.MaxDepth > 0 && r.Depth > 0:
+		return fmt.Errorf("%w: set depth for a fixed size, or min_depth and max_depth to follow demand, not both", ErrWarmPoolInvalid)
+	case r.MinDepth > r.MaxDepth && r.MaxDepth > 0:
+		return fmt.Errorf("%w: min_depth %d is above max_depth %d", ErrWarmPoolInvalid, r.MinDepth, r.MaxDepth)
 	}
 	return nil
 }

@@ -91,6 +91,28 @@ func TestV1WarmPools(t *testing.T) {
 	}
 }
 
+// TestV1WarmPoolDemandRange (W2): a PUT with min_depth/max_depth answers
+// them, and the combinations that make no sense are 400s.
+func TestV1WarmPoolDemandRange(t *testing.T) {
+	env := newCustomDomainsV1Env(t, nil)
+	rr := do(t, env.mux, http.MethodPut, "/v1/warm-pools/python:3.12", map[string]int{"min_depth": 0, "max_depth": 4})
+	var p models.WarmPool
+	_ = json.Unmarshal(rr.Body.Bytes(), &p)
+	if rr.Code != http.StatusOK || p.MaxDepth != 4 || p.MinDepth != 0 || p.Depth != 0 {
+		t.Fatalf("PUT = %d %s", rr.Code, rr.Body.String())
+	}
+	for _, body := range []map[string]int{
+		{"depth": 2, "max_depth": 4},
+		{"min_depth": 1},
+		{"min_depth": 5, "max_depth": 4},
+		{"max_depth": models.MaxWarmPoolDepth + 1},
+	} {
+		if rr := do(t, env.mux, http.MethodPut, "/v1/warm-pools/python:3.12", body); rr.Code != http.StatusBadRequest {
+			t.Fatalf("PUT %v = %d %s, want 400", body, rr.Code, rr.Body.String())
+		}
+	}
+}
+
 // warmPoolStubCluster stands in for a server's replicated entry store.
 type warmPoolStubCluster struct {
 	*cluster.Noop

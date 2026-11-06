@@ -95,6 +95,45 @@ func TestFSMWarmPoolPutGenerations(t *testing.T) {
 	}
 }
 
+// TestFSMWarmPoolDemandRange (W2): the range is part of an entry's
+// settings, so changing it bumps the generation, the same range again does
+// not, and it survives a snapshot.
+func TestFSMWarmPoolDemandRange(t *testing.T) {
+	l := newWarmPoolLog(t)
+	put := func(min, max int) warmPoolApplyResult {
+		t.Helper()
+		res, ok := l.apply(command{Op: opPutWarmPool, StampUnixNano: int64(l.idx + 1), WarmPool: &WarmPoolRecord{Image: "python:3.12", MinDepth: min, MaxDepth: max}}).(warmPoolApplyResult)
+		if !ok {
+			t.Fatal("put refused")
+		}
+		return res
+	}
+	if res := put(0, 4); !res.Changed || res.Pool.MaxDepth != 4 {
+		t.Fatalf("create = %+v", res)
+	}
+	if res := put(0, 4); res.Changed {
+		t.Fatal("the same range again must be a no-op")
+	}
+	if res := put(1, 4); !res.Changed || res.Pool.Generation != 2 || res.Pool.MinDepth != 1 {
+		t.Fatalf("a new floor = %+v", res)
+	}
+	snap, err := l.fsm.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	sink := &memSnapshotSink{}
+	if err := snap.Persist(sink); err != nil {
+		t.Fatal(err)
+	}
+	restored := newPlacementFSM()
+	if err := restored.Restore(io.NopCloser(bytes.NewReader(sink.Bytes()))); err != nil {
+		t.Fatal(err)
+	}
+	if rec := restored.warmPools["python:3.12"]; rec == nil || rec.MinDepth != 1 || rec.MaxDepth != 4 {
+		t.Fatalf("restored = %+v", rec)
+	}
+}
+
 // TestFSMWarmPoolLimitIsDecidedAtApply: the limit holds however creates
 // race, because apply is serial and every replica counts the same set; an
 // update of an existing entry is never refused by it.

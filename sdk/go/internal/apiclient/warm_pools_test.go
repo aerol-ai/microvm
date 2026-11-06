@@ -34,6 +34,15 @@ func TestWarmPoolCalls(t *testing.T) {
 			want: pool,
 		},
 		{
+			name: "a demand-following entry sends its range", wantMethod: http.MethodPut,
+			wantPath: "/v1/warm-pools/python:3.12", wantBody: `{"depth":0,"min_depth":1,"max_depth":4}`, status: http.StatusOK,
+			reply: `{"image":"python:3.12","depth":0,"min_depth":1,"max_depth":4,"generation":1}`,
+			call: func(c *Client) (any, error) {
+				return c.PutWarmPool(ctx, "python:3.12", models.WarmPoolRequest{MinDepth: 1, MaxDepth: 4})
+			},
+			want: models.WarmPool{Image: "python:3.12", MinDepth: 1, MaxDepth: 4, Generation: 1},
+		},
+		{
 			name: "a segment with a space is escaped", wantMethod: http.MethodGet,
 			wantPath: "/v1/warm-pools/odd%20name/img:1", status: http.StatusOK, reply: string(poolJSON),
 			call: func(c *Client) (any, error) { return c.GetWarmPool(ctx, "odd name/img:1") },

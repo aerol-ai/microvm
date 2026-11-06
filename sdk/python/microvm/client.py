@@ -1412,6 +1412,10 @@ class MicroVM:
         for an image (a full replace: the same call twice is a no-op). A
         create that names the image then starts from a warm sandbox. Admin only."""
         body: Dict[str, Any] = {"depth": int(_first_of(options, "depth") or 0)}
+        for key, wire in (("minDepth", "min_depth"), ("maxDepth", "max_depth")):
+            value = _first_of(options, key, wire)
+            if value:
+                body[wire] = int(value)
         return _from_api_warm_pool(self._do_json("PUT", self._warm_pool_path(image), body) or {})
 
     def get_warm_pool(self, image: str) -> WarmPool:
@@ -3087,6 +3091,10 @@ def _from_api_warm_pool(payload: Dict[str, Any]) -> WarmPool:
         "createdAt": str(payload.get("created_at") or ""),
         "updatedAt": str(payload.get("updated_at") or ""),
     }
+    if payload.get("min_depth"):
+        result["minDepth"] = int(payload["min_depth"])
+    if payload.get("max_depth"):
+        result["maxDepth"] = int(payload["max_depth"])
     status = payload.get("status")
     if isinstance(status, dict):
         servers: List[WarmPoolServerStatus] = []

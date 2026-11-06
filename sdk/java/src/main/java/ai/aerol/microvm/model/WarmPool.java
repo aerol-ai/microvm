@@ -11,6 +11,12 @@ public class WarmPool {
     public String image;
     /** Warm slots each server keeps for this image; 0 turns warming off for it. */
     public int depth;
+    /**
+     * With {@code maxDepth}, each server sets its own target from recent
+     * demand, never below {@code minDepth} and never above {@code maxDepth}.
+     */
+    public int minDepth;
+    public int maxDepth;
     /** Goes up by one on every change; the same put twice leaves it alone. */
     public long generation;
     public String createdAt;
