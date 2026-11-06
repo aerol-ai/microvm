@@ -264,11 +264,11 @@ That is the timeout that killed buffered commands in our live test.
 
 | ID | Feature | agent-sandbox | AerolVM today | What we build | Size | Decision |
 |---|---|---|---|---|---|---|
-| D1 | **A cloud identity per sandbox.** Code inside gets short-lived AWS, Azure or GCP credentials for its own role, with no stored secret. **The most important item for banks.** | Through Kubernetes: a service account per pod, plus IRSA or Workload Identity (`examples/sandbox-ksa`, `examples/irsa-simulation-localstack`). "Identity at claim time" is still Planned on its roadmap. | Missing. A per-sandbox toolbox token exists, and egress can inject credentials (`pkg/models/types.go:695-700`), but nothing gives a sandbox its own cloud identity. | AerolVM acts as an OIDC issuer. Each sandbox gets a short-lived signed token (subject = team and sandbox, optional role tag) as a file that is refreshed before it expires. The customer's IAM trusts our issuer and maps it to a role, through `AssumeRoleWithWebIdentity`, Azure federated credentials or GCP Workload Identity Federation. This is how IRSA works. Needs its own design doc and a security review. | M–L | **Build 4** |
+| D1 | **A cloud identity per sandbox.** Code inside gets short-lived AWS, Azure or GCP credentials for its own role, with no stored secret. **The most important item for banks.** | Through Kubernetes: a service account per pod, plus IRSA or Workload Identity (`examples/sandbox-ksa`, `examples/irsa-simulation-localstack`). "Identity at claim time" is still Planned on its roadmap. | Missing. A per-sandbox toolbox token exists, and egress can inject credentials (`pkg/models/types.go:695-700`), but nothing gives a sandbox its own cloud identity. | AerolVM acts as an OIDC issuer. Each sandbox gets a short-lived signed token (subject = team and sandbox, optional role tag) as a file that is refreshed before it expires. The customer's IAM trusts our issuer and maps it to a role, through `AssumeRoleWithWebIdentity`, Azure federated credentials or GCP Workload Identity Federation. This is how IRSA works. Needs its own design doc and a security review: `plans/sandbox-cloud-identity.md` (2026-11-06). | M–L | **Build 4** |
 | A1 | **Signed per-sandbox scoped tokens.** A token you can hand to a browser or an end user. It works only for one sandbox, port, path and method, expires, and can be checked without a database call. | v1 HMAC and v2 Ed25519, bound to the sandbox and the request: `sandbox-router/authz/scopedtoken.go:115,240-331`, `scopedtoken_v2.go:56` | Personal access tokens carry role, team and expiry (`pkg/models/tokens.go`), but nothing scoped to one sandbox or path. | Ed25519 tokens with key IDs and rotation, issued by `/v1/sandboxes/{id}/tokens`, checked at ingress and the toolbox proxy. | M | **Build 4** |
 | A2 | **Share a port behind a sign-in.** `?token=` sets an HttpOnly cookie for that sandbox, then a 302 strips the token from the URL. | `sandbox-router/proxy/browsersession.go:33-80` (#1446) | A public URL is either open to anyone (`public-urls.mdx:10`) or not exposed. The Daytona preview token is `""` (`pkg/api/daytona/handlers.go:723-727`). | A `visibility: token` option on expose, using A1 tokens, in Caddy or the ingress proxy. | M | **Build 4** |
 | A3 | **Trace context into the sandbox agent.** | The router forwards W3C trace context (`sandbox-router/observability/tracing.go`) | API spans exist (`pkg/api/middleware.go:70-73`). None reach toolboxd. | Forward `traceparent`, and add simple toolboxd spans. | S | **Build 4** |
-| P1 | **Placement rules.** Run this sandbox in zone X, on instance type Y, on nodes with label Z. | Full pod scheduling: nodeSelector, affinity, tolerations | Placement filters on runtime, GPU, capacity and artifact affinity (`internal/cluster/placement.go:95-160,365`). No node labels and no zones. | Node labels in gossip, plus a `placement` field on create (labels and zone). Cluster code: needs regression tests and a cluster-correctness call-out. | M | **Build 4** |
+| P1 | **Placement rules.** Run this sandbox in zone X, on instance type Y, on nodes with label Z. | Full pod scheduling: nodeSelector, affinity, tolerations | Placement filters on runtime, GPU, capacity and artifact affinity (`internal/cluster/placement.go:95-160,365`). No node labels and no zones. | Node labels, plus a `placement` field on create (labels and zone). Cluster code: needs regression tests and a cluster-correctness call-out. Design: `plans/placement-rules.md` (2026-11-06); labels ride the capacity heartbeat, not gossip, because gossip metadata is capped at 512 bytes. | M | **Build 4** |
 | P2 | **Per-team quotas.** Maximum sandboxes, CPU and memory per team. Optional queue. | Kueue example (`examples/kueue-agent-sandbox`) | Admission per server only (`pkg/capacity/capacity.go`, `Admitter`), with 503 and Retry-After (`pkg/api/apihttp/admission.go:37`). The control-plane admission hook is a no-op in open source (`pkg/controlplane/controlplane.go:332`). | Quotas per team, stored like named egress profiles (store table, plus the cluster FSM when cluster mode is on), checked at create and again at resize, restart and recreate (resize today re-admits against host capacity only, `internal/service/service.go:4556`), with atomic admission under concurrent requests and a clear 429. A queue is out of scope. | M | **Build 4** |
 | P3 | **Swap for density.** | `examples/gke-swap` | Swap equals the memory limit, so it is off (`pkg/docker/client.go:691`). | An opt-in setting. | S | **Later** |
 | P4 | **One URL for a group of sandboxes.** | `examples/claimed-sandbox-service` | Missing | Load balancing across sandboxes with a tag. | M | **Later** |
@@ -536,12 +536,12 @@ PLAN_REALITY: phase=ceo rows=7/7 missing=none unverified=3 verdict=complete
 | R6 (T2) | T2's env and volume policies attach to a T1 template (section 5.6) | T2 cut; T3 unchanged | — | approved | D11 answer 2026-11-05: "Cut T2 too (recommended)". Scope: T2 removed; no env or volume rules added to T3. |
 | R7 (B1/X2 `process/pty`) | Spec review round 2: Daytona forwards `process/pty` (`pkg/api/daytona/toolbox.go:86`); toolboxd has no such route, so X2 fails on day one; docs say "Not supported (HTTP 404)" (`using-daytona-sdk.mdx:103`) | New item E8 (Phase 1, size M): Daytona terminals on toolboxd's TTY exec stream; B1 returns 501 for `process/pty` until E8 lands | — | approved | D14 answer 2026-11-06: "Build Daytona terminals" (review recommended a clear 501). Scope: E8 as described in section 5.2, its docs line, X2 expectations and a live use case; B1's interim 501. |
 | R8 (F5 watcher, host inotify) | Section 1: Docker/containerd sandboxes run as host root (no user namespaces in `pkg/docker/client.go` or `internal/runtime/containerd`); kernel default `fs.inotify.max_user_instances` = 128 per user (inotify(7)); nothing in `scripts/`, `setup/`, `Ansible/`, `Terraform/` raises it | F5 on gVisor and Firecracker only; Docker and containerd return a clear 501; B3 docs say so | — | approved | D16 answer 2026-11-06: "Offer F5 only on gVisor and Firecracker" (review recommended A, cap + raise host limits). Completeness 7/10, logged as an accepted shortcut. |
-| P1 (F3 partial extract) | Section 2: a failure mid-archive leaves earlier entries on disk | Unstated | Rollback rule (keep partial like `tar -x`, or all-or-nothing via a temp dir) | pending (owner: F3; non-blocking) | — required verification: a mid-archive failure returns an error naming the failing entry and the count written |
+| P1 (F3 partial extract) | Section 2: a failure mid-archive leaves earlier entries on disk | Unstated | Rollback rule (keep partial like `tar -x`, or all-or-nothing via a temp dir) | approved (owner F3, 2026-11-06): keep what was written, like `tar -x`; an all-or-nothing temp folder cannot be renamed over a folder that already holds files without losing them | a mid-archive failure returns an error naming the failing entry and the count written, with a test |
 | R9 (X4 download direction) | Section 3: `aerolvm cp -r box:/dir ./dir` unpacks a tar built inside an untrusted sandbox onto the user's machine | Tar over exec, every entry checked (no absolute, "..", escaping links, devices; caps; hostile-archive test) | — | approved | D17 answer 2026-11-06: "Unpack the tar, but check every entry (recommended)". Scope: X4 download direction only. |
 | R10 (observability) | Section 8: toolboxd has no metrics; sandboxd's only toolbox metric is `aerolvm_toolbox_calls_ended_total` (`internal/service/toolbox_calls.go:71`), calls ended by a stop | New item O4 in Phase 0: counter by route class x status class x surface, one Grafana panel | — | approved | D18 answer 2026-11-06: "Count every call by feature and result (recommended)". Scope: O4 as described in section 5.10. |
-| P2 (L5 exit signal) | Outside review #1: toolboxd keeps serving after the main program exits (`cmd/toolboxd/main.go:408-414`) | L5 assumes an exit stops the sandbox | How toolboxd reports main-program completion to sandboxd | pending (owner: L5; non-blocking) | — required verification: a test where the main program exits and `destroyAfterExitFor` fires; L2's "program exited" reason uses the same signal |
-| P3 (V1 size cap) | Outside review #4: platform volumes are S3/NFS mounts (`pkg/volumes/volumes.go:209`); guest writes bypass the toolbox | V1 promises `max_bytes` | Per-backend enforcement, or drop `max_bytes` | pending (owner: V1; non-blocking) | — required verification before V1 starts: a write past the cap fails on every supported backend, or the field is removed |
-| P4 (L1 on Firecracker) | Outside review #5: die events are wired only for Docker/containerd (`pkg/daemon/container_engine_wiring.go:30`) | L1 hooks the die-event path | Runtime-independent exit transition, or restrict L1 to Docker/containerd | pending (owner: L1; non-blocking) | — required verification: L1's test matrix lists each runtime as supported (with a crash test) or refused at create |
+| P2 (L5 exit signal) | Outside review #1: toolboxd keeps serving after the main program exits (`cmd/toolboxd/main.go:408-414`) | L5 assumes an exit stops the sandbox | How toolboxd reports main-program completion to sandboxd | approved (owner L5, 2026-11-06): toolboxd's reaper already sees the main program exit (`cmd/toolboxd/main.go`, `startReaper`); it shows the state, exit code or signal and time on `/health`, and sandboxd's existing one-minute lifecycle sweep reads it only for started sandboxes that set `destroyAfterExitFor`, with bounded concurrency and a short timeout. sandboxd stores the exit time and code, so a daemon restart keeps the timer; L2's "program exited" reason and `exit_code` come from the same record. Runtime independent for every toolboxd runtime; WASM and isolate refuse the option at create | — required verification: a test where the main program exits and `destroyAfterExitFor` fires; L2's "program exited" reason uses the same signal |
+| P3 (V1 size cap) | Outside review #4: platform volumes are S3/NFS mounts (`pkg/volumes/volumes.go:209`); guest writes bypass the toolbox | V1 promises `max_bytes` | Per-backend enforcement, or drop `max_bytes` | approved (owner V1, 2026-11-06): drop `max_bytes`. Platform volumes are S3 or NFS mounts (`pkg/volumes/volumes.go`, `Backend.Kind`) that the guest writes directly, so AerolVM cannot refuse a write past a cap; a cap it cannot enforce is worse than none. V1 ships `delete_with_sandbox` only, and the docs say how to cap size on the backend (NFS server quotas; S3 bucket-level limits) | — required verification before V1 starts: a write past the cap fails on every supported backend, or the field is removed |
+| P4 (L1 on Firecracker) | Outside review #5: die events are wired only for Docker/containerd (`pkg/daemon/container_engine_wiring.go:30`) | L1 hooks the die-event path | Runtime-independent exit transition, or restrict L1 to Docker/containerd | approved (owner L1, 2026-11-06): restrict L1 to Docker and containerd (gVisor included), whose die events reach `markSandboxStopped`; Firecracker, WASM and isolate refuse `restartOnFailure` at create with a clear 400. Firecracker support needs a VMM-exit event source that also covers adopted VMMs (`internal/runtime/firecracker/vmm_adopt.go`); it is a later item | — required verification: L1's test matrix lists each runtime as supported (with a crash test) or refused at create |
 | R11 (E8 limits) | Outside review #6: no session count gate; exited sessions keep their replay buffer; the sweeper deletes recordings only (`cmd/toolboxd/sessions/manager.go:345-356,412`) | E8 limits Daytona terminals per sandbox (429) and frees a finished terminal's buffer after a short retention; existing sessions unchanged | — | approved | D19 answer 2026-11-06: "Apply this change (recommended)". Scope: E8-created terminals only. |
 | R4 (F1, F2, S4 retry) | CLAUDE.md hard rule 1; SDK retry tiers (`sdk/python/microvm/client.py:95-105`); exec ledger (`internal/service/exec_ledger.go`) | Two retry tiers as for exec; rule in section 10; S4 race noted | — | approved | D12 answer 2026-11-05: "Two retry tiers, like exec (recommended)". Scope: SDK retry classification and docs for F1/F2 verbs, S4 race; no ledger. |
 | R5 (B1 `lsp/*`) | Plan B1: "either build it or return a clear 501"; docs already say "Not supported (HTTP 404)" (`using-daytona-sdk.mdx:104`) | Clear 501 for every `lsp/*` call; X2 expects 501; docs say 501 | — | approved | D13 answer 2026-11-05: "Return a clear 501 (recommended)". Scope: B1's `lsp/*` handling and one docs line; no LSP feature. |
@@ -950,10 +950,10 @@ No ASCII diagrams exist in the files this plan touches (`cmd/toolboxd/*`, `pkg/a
 
 ### Unresolved Decisions
 
-- P1 (owner F3): rollback rule when an archive fails partway (keep partial like `tar -x`, or all-or-nothing via a temp dir).
-- P2 (owner L5): how toolboxd reports main-program completion to sandboxd.
-- P3 (owner V1): per-backend enforcement of `max_bytes`, or drop the field.
-- P4 (owner L1): runtime-independent exit transition, or restrict L1 to Docker/containerd.
+- P1 (owner F3): settled 2026-11-06 — keep partial like `tar -x`, and the error names the failing entry and the count written.
+- P2 (owner L5): settled 2026-11-06 — toolboxd `/health` shows the main program's exit; the lifecycle sweep reads it for sandboxes that opted in, and sandboxd stores it.
+- P3 (owner V1): settled 2026-11-06 — drop `max_bytes`; V1 ships `delete_with_sandbox`; docs explain backend-side caps.
+- P4 (owner L1): settled 2026-11-06 — L1 on Docker and containerd (incl. gVisor) only; other runtimes refuse it at create; Firecracker later.
 
 ## Implementation Tasks
 
@@ -1155,9 +1155,9 @@ Completed (provider codex, model gpt-6-astra per the probe). 6 findings, all che
 Finding: eng outside voice #4, Medium, confidence 8/10, `cmd/toolboxd/main.go:37-42`, reviewer: codex
 Plan baseline: E1 "Add server settings for the default and maximum" (section 5.2)
 Runtime evidence: Docker sets the guest env at create (`pkg/docker/client.go:479`); Firecracker pushes env to children, not toolboxd's own settings
-State: pending (owner: E1; non-blocking for Phase 0)
-Actual answer: unanswered
-Accepted scope: none — required verification before E1 is coded: the operator's default and maximum apply on every runtime, after warm-pool adoption, on Firecracker templates and on already-running agents (one candidate: sandboxd fills in and clamps the limits in the exec request before forwarding)
+State: approved (owner E1, 2026-11-06, at the start of Phase 1)
+Actual answer: sandboxd fills in the operator's default and clamps to the operator's maximum in the exec request before it forwards it, on every path that reaches toolboxd's buffered exec (v1, the toolbox pass-through, Daytona, Runloop). The rule lives in sandboxd, so it holds on every runtime, after warm-pool adoption, on Firecracker templates and on already-running agents. No `/version` round trip on the exec path: an older agent ignores a default sandboxd adds, which is today's behaviour, and a cap the caller asked for is still refused by the SDK under ER4. toolboxd keeps its own hard ceiling as a last line.
+Accepted scope: the above, with a test per path that the default is filled in and a larger request is clamped
 History: none
 
 #### ER3: explicit budget for B2's detached drainers
@@ -1317,7 +1317,7 @@ Conflict flags: lanes A, B and E all edit `cmd/toolboxd/main.go` (route switch v
 
 ### Unresolved decisions (eng)
 
-- ER5 (owner E1): how E1's operator default and maximum reach toolboxd on every runtime, warm-pool adoption, Firecracker templates and running agents.
+- ER5 (owner E1): settled 2026-11-06 — sandboxd fills in and clamps the limits before forwarding (see the ER5 row).
 
 ### Completion summary (eng)
 
@@ -1378,6 +1378,249 @@ Effort assumes refactor ~20x, tests ~50x, features ~30x (human ÷ CC).
   - Surfaced by: eng outside voice #4 — `cmd/toolboxd/main.go:37-42`
   - Files: to be determined
   - Verify: E1's PR cites the settled ER5 row
+
+## Build notes (2026-11-06)
+
+What changed from the plan text while building, and why. Each PR cites
+its row here.
+
+**Phase 0 (B1, B2, B3, O4)** passed live on `cluster-3-mixed-gvisor`
+(UC-369 to UC-372). B1 also changed one older test that expected 500 for
+"already exists"; the plan's error mapping makes it 409.
+
+**Phase 1 foundation.** toolboxd lists its request options on `/version` as
+features (`cmd/toolboxd/features.go`), and a test parses the handlers so an
+option cannot ship unlisted (ET7). The five SDKs check the list before
+sending an option an older agent would drop (ER4).
+
+**Phase 1 deviations:**
+- F1: `size_bytes` (and `path`, `symlink_target`) come only with
+  `extended=true`. Daytona's Go client decodes file info with
+  `DisallowUnknownFields`, so a new field on the shared reply would break
+  every Daytona file call.
+- F1/F2/F3: one `/version` feature per plan item (`files.verbs`,
+  `files.write_options`, `files.extract`), because two verbs share the
+  `overwrite` option and the drift test allows each option in one feature.
+- F1: error codes `file_not_found` and `folder_exists` let a retried delete
+  or mkdir tell "already done" from an agent without the route (R4).
+- F3: owner decision P1 applied (keep partial, name the entry and count).
+  `internal/safetar` is the one unpacker for toolboxd and `aerolvm cp -r`.
+- F5: the SDK method is `watch_files` (`WatchFiles`, `watchFiles`), not
+  `watch`, which reads as ambiguous on a sandbox object. toolboxd tells
+  gVisor (uname version) and Firecracker (kernel command line) apart from
+  a shared kernel itself, so `CreateSandbox` is untouched; unknown means 501.
+  Limits: 16 watches per sandbox, 8,192 folders per watch, 16,384 per
+  sandbox, 4,096 events per batch. Every SDK gives up after 60 s if the
+  watch never starts.
+- E1: per-stream `stdout_truncated` and `stderr_truncated` instead of one
+  `truncated`, because the caps are per stream. toolboxd's own ceiling is
+  64 MiB per stream (what Daytona and Runloop already decode). ER5 applied:
+  `SB_EXEC_OUTPUT_DEFAULT_BYTES` and `SB_EXEC_OUTPUT_MAX_BYTES`, filled in
+  and clamped by sandboxd at both toolbox chokepoints.
+- E2: `argv[0]` may not start with "-" (a shell's `exec` would read it as
+  an option).
+- E3: buffered exec reports `signal` as "SIGKILL"; streams and sessions keep
+  their existing "killed" wording, because changing it would break their
+  wire format.
+- E8: 32 Daytona terminals per sandbox; a finished terminal frees its
+  buffer after 30 s and keeps its exit code. Isolate sandboxes answer 501
+  for terminals and sessions (they used to fall through to the fetch
+  handler).
+
+**Phase 2 lifecycle (L1–L6, O1, O2) deviations and decisions:**
+- L2: a fixed set of reasons (`user_stop`, `idle`, `max_age`,
+  `out_of_memory`, `disk_limit`, `crashed`, `reconcile`, `program_exited`,
+  `failover`, `restarted`). The store writes a reason only with the status
+  change that caused it, so Docker's "stop" event after "die" cannot
+  overwrite the true reason. An exit with code 0 nobody asked for reads as
+  `program_exited`; a non-zero one as `crashed`.
+- L1: the backoff state is stored, so a daemon restart neither loses a due
+  restart (the sweep picks it up within a minute) nor resets a crash loop
+  to full speed. A sandbox reconcile finds stopped is not restarted (its
+  exit is unknown). A stop cancels a pending restart after it writes the
+  stopped row, and the timer re-checks the reason under the per-sandbox
+  lock; a residual window needs two writes to interleave in well under a
+  millisecond.
+- L4: the defaults are written into a new sandbox's lifecycle at create,
+  not applied by the sweep (owner agreed): they show on GET, and turning
+  them on never deletes older sandboxes. Unit tests only, since setting them
+  on a shared live scenario would change every other use case.
+- L5: toolboxd `/health` gains `main_program`; the exit time is clamped so
+  a guest clock that is behind can only make a delete late.
+- L6: `destroyAt` becomes `destroyAtAge` before the spec is recorded, so the
+  replicated spec carries only an age; at most 30 days ahead.
+- L3: new records `runtime.exited`, `runtime.removed`,
+  `reconcile.found_stopped`, `failover.recreated`, `fleet.suspend`,
+  `fleet.delete`; the audit filter accepts `caller=system:*`.
+- O1: no alert (a crash-loop threshold depends on the workload); one
+  dashboard panel instead.
+
+**Phase 3 policy and storage (T3, T4, V1) decisions:**
+- T3: YAML file, reloaded like the egress operator file (10 s poll or
+  SIGHUP, a bad edit keeps the last good file); a set
+  `SB_CREATE_POLICY_FILE` with no file behind it is a boot error and every
+  create gets 503 until fixed (fail closed). Size limits apply to the size a
+  sandbox really gets, defaults included. `require_non_root` is checked
+  against the image's `USER` before the container exists (numeric non-0
+  only, the Kubernetes rule), and sends Docker and gVisor creates down the
+  cold path.
+- T4: the flag is a default, not a floor: a sandbox with its own policy
+  keeps exactly its own; the operator file's `deny_cidrs` stays the floor.
+  The node's DNS resolver in a blocked range gets a `/32` allow entry.
+- V1: `delete_with_sandbox` belongs to the volume (409 on a conflicting
+  reference); deletion goes through the reclaim ledger, so a failed backend
+  delete is retried by the sweep, never lost. Also fixed: the SQLite volume
+  record delete now refuses in one statement while any attachment holds it
+  (a count then a delete could drop another sandbox's attachment).
+- Rust SDK: `PlatformVolumeMount` (and other structs across the phases)
+  gained public fields; code that builds them without
+  `..Default::default()` needs that added. Release notes must say so.
+
+**Fixes found by the Phase 1 live run (cluster-3-mixed-gvisor, 23/24 parity
+use cases passed, 2 skipped for FC and WASM):**
+- UC-387: killing a Daytona terminal whose shell had started a job under job
+  control (`sleep 300 &`) never ended the session: the job sits in its own
+  process group, survives the kill of the shell's group, and keeps the
+  terminal open, so the output pump never saw end-of-file. The kill now
+  sends SIGHUP, waits the grace, then kills every process holding the
+  terminal's `/dev/pts/N` open (found through `/proc/*/fd`, while the
+  master is still open so the number cannot be reused), then hangs up.
+  Matching on `tty_nr` does not work: the kernel drops the controlling
+  terminal of the whole session when its leader exits.
+- `TestExecStreamDropKillsProcessGroup/pipes` fails on macOS about one run
+  in five (the orphaned background child is reaped late by launchd). It
+  passed 40 of 40 on Linux, where CI and toolboxd run; left as is.
+
+**Phase 2 access (A1–A3):**
+- A1: a sandbox token is signed, works for one sandbox, can be narrowed
+  to a path prefix and methods, lasts 24 h by default (30 days at most),
+  and is checked with no database call. A retry after a lost answer only
+  makes a second short-lived token.
+- A2: `visibility: "token"` sets a `__Host-aerolvm-token` cookie. A gated
+  port is left off toolboxd's `/proxy/<port>` list and a custom domain
+  cannot point at it. An older client's retry never opens a gated port:
+  only an explicit `public` or `token` changes the setting. In a cluster,
+  token ports wait until every server supports them (`TokenPortGate`).
+- A3: W3C trace context reaches toolboxd and is logged there; no spans and
+  no new dependency in toolboxd.
+
+**Warm pools (W1–W3):** entries live in the Raft FSM (ops 33/34) behind
+the rolling-upgrade gate, 32 entries at most, so any server answers a read
+without a fan-out. W2: an entry gives `min_depth` and `max_depth`, and each
+server follows its own creates (an average under 0.1 per interval counts
+as no demand). W3: `on_image_change` is `replace_now` (default) or
+`replace_as_used`.
+
+**FSM numbering.** The lanes picked ops versions on their own; the stack
+renumbered them at integration: 6 token ports, 7 warm pools, 8 identity,
+9 team quotas (`fsmOpsVersion = 9`). Some commit messages written before
+that still say "version 6" for warm pools; the code and PR bodies use the
+numbers above.
+
+**Identity (D1)** follows `plans/sandbox-cloud-identity.md`. Only a node
+that signs opens the signing key. The first token took 875 ms on the live
+run, so minting stays off the create path (D1.8).
+
+**Ops (I1, O3):** I1 dials toolboxd again only on "connection refused",
+three times, 200, 400 and 800 ms apart, before any byte of the request is
+sent, at both toolbox chokepoints and in E2B's proxy. It adds no time when
+the first dial works, and none to `CreateSandbox`. O3 is
+`cmd/aerolvm-bench` and `performance-benchmark.mdx`.
+
+**Placement and quotas (P1, P2)** follow `plans/placement-rules.md`; team
+quotas are FSM ops 38/39.
+
+**Recipes (G12, G8, G10, G9):** E2B's own API starts nothing for `mcp`;
+the E2B SDK runs E2B's `mcp-gateway` in the sandbox after the create and
+reaches it on port 50005. The facade now accepts `mcp` and exposes 50005
+(rolled back with the create if the expose fails). What AerolVM cannot do
+answers 501 by name: E2B's `mcp-gateway` template, unless an operator maps
+it, and WASM sandboxes. The computer-use and code-server images live
+under `images/` and are not pushed anywhere.
+
+**SDK (S1–S7):** the typed errors subclass each SDK's existing HTTP error,
+so old `except`/`catch` code keeps working. `AsyncMicroVM` uses `httpx`
+from the optional `[async]` extra; the sync client gained no dependency.
+A follow-up gave the identity and quota calls a per-call timeout, a
+TypeScript signal and an async form.
+
+**Integrations (G1, G2, G4, G5):** Python packages under `integrations/`,
+not published, with offline tests against a shared fake that must match
+every `MicroVM` signature. G5 tested NeMo Gym's Daytona provider first and
+found three facade bugs. All three are now fixed: create answers 200
+(Daytona's API does; the Python SDK reads a body only from a 200), the
+sandbox always carries `kvm`, and each bulk-download part, error parts
+too, is named by the full requested path. NeMo Gym's Daytona provider now
+works with Daytona Python SDK 0.179.0 and 0.230.0. The `aerolvm` provider
+stays, for AerolVM's own create options.
+
+**Fixes found by the cluster-3-mixed and cluster-3-mixed-docker live
+runs:**
+- Caddy's `@api` matcher did not forward `/.well-known/openid-configuration`
+  and `/.well-known/jwks.json`. A test now checks every public route
+  against both Caddyfiles.
+- A create that a cluster forwards skipped the operator create policy (T3).
+  `CheckCreatePolicy` now runs in `clustercreate.Prepare`.
+- `delete_with_sandbox` (V1) could find the volume still attached on a
+  lagging replica; the delete is retried in the background on "in use",
+  250 ms doubling to 8 s (about 16 s in all).
+- UC-389 and UC-424 test fixes. UC-427 (containerd) and UC-422 (warm-pool
+  demand) gained diagnostics.
+
+**Fixes found in the final local verification:**
+- The integration-tagged suite stopped compiling at G2 (a second
+  `apiStatus` helper); renamed in G2.
+- The integration fake lacked S6's per-call `timeout`; fixed in G1's copy
+  and in G2's shared copy, so each package passes at its own commit.
+- `TestWatcherBadFileRefusedThenFixed` (T3) raced the 5 ms poll by writing
+  the file in place; it now writes a temp file and renames it.
+
+**M1** is `docs/src/content/docs/moving-from-agent-sandbox.mdx`.
+
+**Fixes found by the final live runs (2026-11-06, all five scenarios).**
+Several are older than this stack; the parity use cases were the first to
+reach them.
+- WASM and isolate sandboxes answered 401 to every authenticated
+  `/v1/.../toolbox/` call: the pass-through handed their in-process host
+  the caller's PAT, not the sandbox's toolbox token (UC-379; same code on
+  main). Fixed as the container path does it.
+- A cluster image build forwarded to another node failed after about 30 s:
+  it used the shared peer client's limit, while a build answers only when
+  done (UC-464/465; older than the stack). The forward now gets
+  `2 × SB_IMAGE_BUILD_TIMEOUT + 1 min`.
+- An Idempotency-Key create whose client hung up mid-create left its
+  container, and the retry got 409 "sandbox already exists" (UC-450). Two
+  fixes: containerd's create undo now runs on a context that ignores the
+  client's cancel (as Docker's did), and a keyed create that still meets a
+  leftover (a hang-up inside Docker's `/containers/create` or containerd's
+  `NewContainer`) removes it under the create lease and creates again.
+  Docker's 409 name conflict now reads as `ErrSandboxContainerExists`.
+  Proven live: 10 of 10 UC-450 runs on the Docker engine removed a real
+  leftover and passed.
+- OpenCode and Codex CLI wait for their input to end, and a session keeps
+  it open, so both recipes hung (UC-467). Their commands end with
+  `< /dev/null` now.
+- Test fixes: UC-457 retries a create from a snapshot through the cluster's
+  registry push window (as UC-260 does); UC-454 holds the refusal for 30 s
+  and allows 20 s, since the runner's network added 8 s on its own;
+  `aerolvm-bench` gained `-template`, because a Firecracker create without
+  one rebuilds its disk and pulls the image every time (Docker Hub's pull
+  limit stopped the first run).
+
+**O3 numbers** are in `performance-benchmark.mdx`, from the tool run on a
+node in us-east-1: Firecracker from a template 36.5 creates/s at 4 workers
+with p50 67 ms and p99 93 ms on one c5.metal; gVisor and Docker top out near
+6.7/s on 3 × t3.medium (2 CPUs each); the Docker warm pool cuts p50 from
+352 ms to 57 ms at 1 worker but cannot keep up at 4 on those servers.
+
+**Live coverage.** Across the final runs every one of the 82 parity use
+cases (UC-369 to UC-467) passed in at least one scenario: cluster-3-mixed,
+cluster-3-mixed-docker, cluster-3-mixed-gvisor, single-node-fc and
+single-node-wasm.
+
+**Owner decisions settled at build time:** P1 (F3), P2 (L5), P3 (V1),
+P4 (L1), ER5 (E1); see their rows. D1 and P1 have design docs:
+`plans/sandbox-cloud-identity.md`, `plans/placement-rules.md`.
 
 ## GSTACK REVIEW REPORT
 
