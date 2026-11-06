@@ -947,7 +947,7 @@ var Registry = []UseCase{
 	// CreateSnapshot answered 501 for Firecracker until PR #911.
 	{ID: "UC-368", Title: "Firecracker snapshot on another node: a snapshot of a running Firecracker sandbox is refused with 409; once stopped, its snapshot is pushed to the cluster registry, outlives the source, and boots, in each direction across two Firecracker nodes, as a Firecracker sandbox and as a container on the node that did not take it, with the same data, hard link, symlink and nested file, and without the source's toolbox token file", Requires: []Capability{CapCluster, CapFirecracker}, Implemented: true},
 	// Agent-sandbox parity (parity_test.go; plans/agent-sandbox-feature-parity.md).
-	{ID: "UC-369", Title: "Daytona SDK file calls that used to 404 work live: createFolder with a mode, replaceInFiles as plain text with a per-file result, setFilePermissions, and deleteFile (a folder only with recursive=true); language servers and Daytona terminals answer a clear 501", Implemented: true},
+	{ID: "UC-369", Title: "Daytona SDK file calls that used to 404 work live: createFolder with a mode, replaceInFiles as plain text with a per-file result, setFilePermissions, and deleteFile (a folder only with recursive=true); language servers answer a clear 501", Implemented: true},
 	{ID: "UC-370", Title: "exec returns when the command ends: a background job keeps running and does not hold up the reply; a timeout stops the whole process group and reports timed_out; Daytona executeCommand behaves the same", Implemented: true},
 	{ID: "UC-371", Title: "exec on gVisor returns when the command ends, keeps background jobs running and stops the whole group on a timeout", Requires: []Capability{CapGvisor}, Implemented: true},
 	{ID: "UC-372", Title: "sandboxd counts toolbox calls by API, feature and result: a Daytona language-server call shows as daytona/lsp/501 and a v1 exec as v1/exec/2xx in aerolvm_toolbox_calls_total", Implemented: true},
@@ -957,6 +957,12 @@ var Registry = []UseCase{
 	{ID: "UC-383", Title: "exec with argv naming a missing program answers like a shell: exit 127 and a not found line on stderr, on exec and the exec stream", Implemented: true},
 	{ID: "UC-384", Title: "exec reports the signal that ended the command: SIGSEGV for a crashed argv program, SIGKILL with timed_out for a timeout (exit_code -1), and no signal with exit 137 when a shell outlives its killed child", Implemented: true},
 	{ID: "UC-385", Title: "exec on gVisor reports the signal that ended the command, as UC-384", Requires: []Capability{CapGvisor}, Implemented: true},
+	// Daytona SDK terminals (parity_pty_test.go; plan E8), driven by the
+	// Daytona Go SDK through the live /daytona facade.
+	{ID: "UC-386", Title: "Daytona SDK terminals: the Daytona Go SDK creates a terminal with a size and env, connects over WebSocket through the /daytona facade, runs a command and reads its output (TERM defaults to xterm-256color), and get and list describe it", Implemented: true},
+	{ID: "UC-387", Title: "Daytona SDK terminals: resize changes the real terminal size (stty), and kill ends the shell and a background job it started, closes the connected client with the end, and makes the terminal not found", Implemented: true},
+	{ID: "UC-388", Title: "Daytona SDK terminals: a sandbox holds 32 terminals; the 33rd create gets HTTP 429 naming the limit, and killing one makes room for it", Implemented: true},
+	{ID: "UC-389", Title: "Daytona SDK terminals: a terminal keeps running when its client disconnects; output written while away is replayed on reconnect, and the reconnected client drives the same shell (same pid and shell variables)", Implemented: true},
 }
 
 // byID is a lookup built once for the report generator.

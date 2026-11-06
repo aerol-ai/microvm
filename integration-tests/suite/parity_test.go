@@ -48,8 +48,8 @@ func parityExec(t *testing.T, ctx context.Context, sb *microvm.Sandbox, command 
 
 // UC-369 — Daytona SDK file calls that used to 404 now work live (plan B1):
 // create a folder with a mode, replace text in a file, set permissions, and
-// delete (a folder only with recursive=true). Language servers and Daytona
-// terminals answer a clear 501, not 404.
+// delete (a folder only with recursive=true). Language servers answer a
+// clear 501, not 404 (Daytona terminals work since E8: parity_pty_test.go).
 func TestParityDaytonaFileCallsLive(t *testing.T) {
 	harness.Require(t, sc, "UC-369")
 	sb := paritySandbox(t)
@@ -105,7 +105,6 @@ func TestParityDaytonaFileCallsLive(t *testing.T) {
 
 	for _, probe := range []struct{ method, path, want string }{
 		{http.MethodPost, "/lsp/start", "language servers"},
-		{http.MethodPost, "/process/pty", "terminals"},
 	} {
 		st, body := daytonaToolbox(t, ctx, probe.method, sb.ID, probe.path, nil, map[string]any{})
 		if st != http.StatusNotImplemented || !strings.Contains(string(body), probe.want) {
