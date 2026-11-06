@@ -1651,6 +1651,11 @@ that adds the code also has the fix), with a test that fails without it:
   microvm` no longer loads httpx; a Daytona text replace keeps owner,
   mode and symlink; the E2B mcp create skips the port probe; smaller
   items.
+- Live again after the fixes (2026-11-07, build dd5833ad45eb, the parity
+  use cases only): cluster-3-mixed 59 passed, 0 failed (15 skipped:
+  runtimes and the Docker warm pool it lacks); cluster-3-mixed-docker 58
+  passed, 0 failed (16 skipped: identity, gVisor, WASM, Firecracker). Both
+  stacks torn down.
 - Still open, written in the PR bodies: a `destroyAt` lifecycle update
   sent during a rolling upgrade (lifecycle.mdx says to finish the upgrade
   first); the Rust SDK does not return a port's visibility (a field would
