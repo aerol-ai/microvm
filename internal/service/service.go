@@ -1407,6 +1407,19 @@ func (s *Service) CreateSandboxWithID(ctx context.Context, req models.CreateSand
 		return &models.CreateSandboxResponse{Sandbox: *existing, Replayed: true}, nil
 	}
 	resp, err := s.createSandbox(ctx, req, id)
+	// A failed earlier create of this ID can leave its runtime instance
+	// behind (create_leftover.go). Its own rollback has run by now, and the
+	// lease is still held: remove the leftover and create once more.
+	var leftover *leftoverInstanceError
+	if errors.As(err, &leftover) {
+		if rmErr := s.removeLeftoverInstance(ctx, id, leftover); rmErr != nil {
+			if s.logger != nil {
+				s.logger.Warn("create: leftover instance not removed", "sandbox_id", id, "error", rmErr)
+			}
+		} else {
+			resp, err = s.createSandbox(ctx, req, id)
+		}
+	}
 	s.noteSandboxCreated(ctx, resp)
 	return resp, err
 }
@@ -2539,7 +2552,7 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 			return resp, nil
 		} else if !errors.Is(dupErr, err) {
 			releaseAdmission()
-			return nil, dupErr
+			return nil, s.asLeftoverInstance(ctx, dupErr, ociRt, sandboxID, chosenRuntime, chosenEngine)
 		}
 		releaseAdmission()
 		// A bridge or subnet that filled past the counted pool (a port

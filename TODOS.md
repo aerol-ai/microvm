@@ -639,30 +639,45 @@ Every entry was re-verified against `main` at `704c9e74` on 2026-10-06.
 
 ---
 
-## A create cut off inside containerd's NewContainer can still leave its container (idempotency, containerd)
+## A token-gated port's Caddy route went missing for a moment (single node, Caddy routes)
 
-- **What:** a keyed create (Idempotency-Key) whose client hangs up while
-  containerd is inside `NewContainer` may leave a container that the driver
-  never got a handle for, so it cannot undo it. The client's retry derives
-  the same sandbox ID and gets 409 "sandbox already exists" until the orphan
-  sweep removes the container.
-- **Status (2026-11-06):** the wider window is fixed. "fix(containerd): undo
-  a failed create even when its client hung up" (stack
-  `fix/parity-containerd-create-undo`) runs the undo on `undoContext`, so a
-  hang-up in NewTask, task start or the readiness wait is cleaned up before
-  the create returns (UC-450). The NewContainer call itself is the window
-  left; it is much smaller.
-- **Fix idea:** in the service, while it holds the ID's create lease
-  (`internal/service/create_lease.go`), a runtime instance with no store row
-  is an orphan of a failed create of this ID: destroy it and retry the
-  create once. This also covers the Docker engine, where a
-  `/containers/create` cut off after dockerd saved the container leaves one
-  behind (a Docker 409, shown as HTTP 400).
-- **Related:** the containerd warm pool's park path
-  (`internal/runtime/containerd/warm_park.go`) also undoes on the request
-  context. It cannot cause this 409 (slot IDs are fresh), but a cancelled
-  park can leave a slot's container until the sweep.
-- **Effort / priority:** S, P2.
+- **What:** on `single-node-fc` (per-sandbox Caddy routes, many tests in
+  parallel), UC-465's code-server port answered 401 to a visitor with no
+  token, then, a second later, Caddy's catch-all 404 "Sandbox not found" to
+  a visitor with a valid token cookie. The catch-all only matches a host
+  with no route, so the port's route was briefly gone. Issuing the token
+  does not touch routes (`internal/service/sandbox_tokens.go`).
+- **Seen once** (2026-11-06, build 813bce42). UC-426 (the same flow) passed
+  in the same run, and UC-465 passed on single-node-fc in the run before
+  and on every other scenario. The node was torn down before its logs were
+  read. UC-465 now retries only that catch-all answer, for up to 60 s,
+  and logs each retry, so a repeat shows in the report.
+- **Start:** look for a route delete and re-add on the Caddy routes path
+  (`pkg/caddy/client.go`) while another sandbox's route changes; the
+  ingress proxy routing mode (`SB_INGRESS_PROXY_ROUTING`, see "Ingress route
+  changes reset in-flight TLS connections" above) has no per-sandbox routes
+  and should not show it.
+- **Effort / priority:** S to investigate, P2.
+
+---
+
+## A cancelled warm-pool park can leave its slot's container (containerd)
+
+- **What:** the containerd warm pool's park path
+  (`internal/runtime/containerd/warm_park.go`) undoes a failed park on the
+  request context, the pattern "fix(containerd): undo a failed create even
+  when its client hung up" removed from `Driver.Create`. A park cancelled
+  mid-way can leave its slot's container until the orphan sweep.
+- **Why it is only a TODO:** slot IDs are fresh (`park-*`), so no create or
+  retry ever collides with one; it costs a container until the sweep, not a
+  failed call.
+- **Status (2026-11-06):** the create-side leftovers this came from are
+  fixed in the parity stack: the undo runs on `undoContext`, and a keyed
+  create that still meets a leftover (a hang-up inside Docker's
+  `/containers/create` or containerd's `NewContainer`) removes it under the
+  create lease and creates again (`internal/service/create_leftover.go`).
+- **Fix:** run the park undo on a context like `undoContext`.
+- **Effort / priority:** S, P3.
 
 ---
 

@@ -59,6 +59,22 @@ func isParkedContainer(summary containerSummary) bool {
 // sandbox name already taken — signals the §6 duplicate-create protocol.
 var ErrSandboxContainerExists = errors.New("docker: sandbox container name already exists")
 
+// nameConflictAsExists marks Docker's 409 "name is already in use" on a
+// container create as ErrSandboxContainerExists, the error the containerd
+// driver gives for the same case, so the service can tell a duplicate or a
+// failed create's leftover from any other failed create. Before, the raw
+// 409 reached the caller as a 400.
+func nameConflictAsExists(err error) error {
+	if err == nil {
+		return nil
+	}
+	msg := err.Error()
+	if strings.Contains(msg, "failed with status 409") && strings.Contains(msg, "is already in use") {
+		return fmt.Errorf("%w: %w", ErrSandboxContainerExists, err)
+	}
+	return err
+}
+
 // SetWarmPool wires the docker warm pool. Nil disables the fast path.
 func (c *Client) SetWarmPool(p *dockerpool.Pool) {
 	c.warmPool = p

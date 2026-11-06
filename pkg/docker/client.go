@@ -772,7 +772,7 @@ func (c *Client) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 	err = c.doJSON(ctx, http.MethodPost, "/containers/create", createQuery, createRequest, nil, &created)
 	CreateTimingFrom(ctx).RecordStage("docker_create", time.Since(createStart))
 	if err != nil {
-		return nil, fmt.Errorf("create container: %w", err)
+		return nil, fmt.Errorf("create container: %w", nameConflictAsExists(err))
 	}
 	if own != nil {
 		// The pause started alongside the workload's create; only what that

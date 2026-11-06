@@ -18,6 +18,7 @@ import (
 	storepkg "github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/caddy"
 	"github.com/aerol-ai/microvm/pkg/capacity"
+	"github.com/aerol-ai/microvm/pkg/docker"
 	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/aerol-ai/microvm/pkg/mounts"
 	"github.com/aerol-ai/microvm/pkg/secrets"
@@ -46,8 +47,12 @@ type recordingRuntime struct {
 	stopErr  error
 	stopRefs []string
 
-	destroyErr error
-	destroyIDs []string
+	destroyErr    error
+	destroyIDs    []string
+	lastDestroyed *models.Sandbox
+	// leftover holds IDs a failed earlier create left an instance under:
+	// Create refuses them as a name collision until Destroy removes them.
+	leftover map[string]bool
 
 	pingErr error
 	health  string
@@ -77,6 +82,9 @@ func (r *recordingRuntime) Create(_ context.Context, req models.CreateSandboxReq
 	r.lastCreateMounts = binds
 	r.lastCreateID = sandboxID
 	r.lastToolboxToken = toolboxToken
+	if r.leftover[sandboxID] {
+		return nil, fmt.Errorf("%w: sandbox container already exists", docker.ErrSandboxContainerExists)
+	}
 	if r.createErr != nil {
 		return nil, r.createErr
 	}
@@ -112,6 +120,11 @@ func (r *recordingRuntime) Stop(_ context.Context, containerRef string) error {
 func (r *recordingRuntime) Destroy(_ context.Context, sandbox *models.Sandbox) error {
 	if sandbox != nil {
 		r.destroyIDs = append(r.destroyIDs, sandbox.ID)
+		copied := *sandbox
+		r.lastDestroyed = &copied
+		if r.destroyErr == nil {
+			delete(r.leftover, sandbox.ID)
+		}
 	}
 	return r.destroyErr
 }
