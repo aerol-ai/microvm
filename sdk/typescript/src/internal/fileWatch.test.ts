@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
-import test from "node:test";
+import test, { mock } from "node:test";
 
-import { APIClient } from "./client.js";
+import { APIClient, WATCH_START_TIMEOUT_MS } from "./client.js";
 import { MicroVM } from "../MicroVM.js";
 import { MicroVMApiError, MicroVMUnsupportedFeatureError } from "../errors.js";
 import type { FileEvent } from "../types.js";
@@ -396,4 +396,32 @@ test("MicroVM.watchFiles and Sandbox.watchFiles watch the right sandbox", async 
     handle.stop();
     await handle.wait();
   });
+});
+
+test("watchFiles gives up when the start frame never comes, and a started watch has no such limit", async () => {
+  mock.timers.enable({ apis: ["setTimeout"] });
+  try {
+    await withFakeSocket(async () => {
+      const client = new APIClient({ baseURL: "https://api.example.com", patToken: "pat-token" });
+      const pending = client.watchFiles("sb-1", "/work", () => undefined);
+      const ws = lastSocket();
+      ws.emit("open");
+      mock.timers.tick(WATCH_START_TIMEOUT_MS - 1);
+      assert.equal(await settles(pending), false);
+      mock.timers.tick(1);
+      await assert.rejects(pending, /did not start within 60s/);
+      assert.equal(ws.closed, true);
+
+      const second = client.watchFiles("sb-1", "/work", () => undefined);
+      const ws2 = lastSocket();
+      ws2.emit("open");
+      ws2.frame({ type: "start", path: "/work", recursive: false });
+      const handle = await second;
+      mock.timers.tick(WATCH_START_TIMEOUT_MS * 2);
+      assert.equal(ws2.closed, false);
+      handle.stop();
+    });
+  } finally {
+    mock.timers.reset();
+  }
 });

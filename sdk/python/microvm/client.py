@@ -1452,16 +1452,28 @@ class MicroVM:
         ) + "?" + urllib.parse.urlencode(query)
         ws = _connect_watch_websocket(websocket_module, ws_url, self._websocket_headers(), sandbox_id)
         # Return only once toolboxd says the watch is armed, so a change the
-        # caller makes right after this returns is never missed.
+        # caller makes right after this returns is never missed. The wait is
+        # bounded: a proxy that accepts the upgrade and then goes quiet would
+        # otherwise hang the caller forever. The bound is lifted afterwards,
+        # because a quiet folder sends nothing for as long as it stays quiet.
+        settimeout = getattr(ws, "settimeout", None)
+        if callable(settimeout):
+            settimeout(_WATCH_START_TIMEOUT_SECONDS)
         try:
             first = ws.recv()
             frame = json.loads(first) if isinstance(first, str) else None
         except Exception as exc:
             _close_quietly(ws)
+            if "timeout" in type(exc).__name__.lower():
+                raise MicroVMError(
+                    f"file watch did not start within {_WATCH_START_TIMEOUT_SECONDS:g}s"
+                ) from exc
             raise MicroVMError(f"file watch closed before it started: {exc}") from exc
         if not isinstance(frame, dict) or frame.get("type") != "start":
             _close_quietly(ws)
             raise MicroVMError(f"file watch did not start: unexpected first message {first!r}")
+        if callable(settimeout):
+            settimeout(None)
         return FileWatchHandle(ws, on_event)
 
     def expose_port(self, sandbox_id: str, port: int, *, protocol: ExposeProtocol = "http") -> ExposeResult:
@@ -1867,6 +1879,10 @@ def _close_quietly(ws: Any) -> None:
         ws.close()
     except Exception:
         pass
+
+
+# How long watch_files waits for toolboxd to say the watch is armed.
+_WATCH_START_TIMEOUT_SECONDS = 60.0
 
 
 def _connect_watch_websocket(websocket_module: Any, ws_url: str, headers: List[str], sandbox_id: str) -> Any:

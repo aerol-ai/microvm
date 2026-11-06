@@ -262,6 +262,33 @@ class WatchFilesTests(unittest.TestCase):
         self.assertIn("did not start", str(ctx.exception))
         self.assertTrue(ws.closed)
 
+    def test_start_wait_is_bounded_then_lifted(self):
+        class TimedWebSocket(QueueWebSocket):
+            def __init__(self):
+                super().__init__()
+                self.timeouts = []
+
+            def settimeout(self, value):
+                self.timeouts.append(value)
+
+        ws = TimedWebSocket()
+        ws.push({"type": "start", "path": "/work", "recursive": False})
+        self.use(FakeModule(ws))
+        handle = self.client.watch_files("sb-1", "/work", lambda ev: None)
+        self.assertEqual(ws.timeouts, [client_module._WATCH_START_TIMEOUT_SECONDS, None])
+        handle.stop()
+
+        class WebSocketTimeoutException(Exception):
+            pass
+
+        ws = TimedWebSocket()
+        ws.push(WebSocketTimeoutException("timed out"))
+        self.use(FakeModule(ws))
+        with self.assertRaises(MicroVMError) as ctx:
+            self.client.watch_files("sb-1", "/work", lambda ev: None)
+        self.assertIn("did not start within 60s", str(ctx.exception))
+        self.assertTrue(ws.closed)
+
     def test_path_and_callback_are_required(self):
         module = self.use(FakeModule(self.started()))
         with self.assertRaises(MicroVMError):

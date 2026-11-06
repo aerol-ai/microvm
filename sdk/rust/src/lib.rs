@@ -2692,6 +2692,20 @@ async fn run_session_attach(
     }
 }
 
+/// How long a file watch waits for the agent to say the watch is armed.
+const FILE_WATCH_START_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Runs the wait for the start frame, giving up after `limit`.
+async fn within_file_watch_start<F>(limit: Duration, wait_for_start: F) -> Result<(), Error>
+where
+    F: std::future::Future<Output = Result<(), Error>>,
+{
+    match tokio::time::timeout(limit, wait_for_start).await {
+        Ok(started) => started,
+        Err(_) => Err(Error::Client(format!("file watch did not start within {:?}", limit))),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_file_watch(
     api_url: String,
@@ -2721,24 +2735,30 @@ async fn run_file_watch(
     let (mut write, mut read) = stream.split();
 
     // The watch is in place only once the start frame arrives; returning
-    // before it would lose a change the caller makes right away.
-    loop {
-        match read.next().await {
-            Some(Ok(Message::Text(text))) => {
-                let frame: FileWatchServerFrame = serde_json::from_str(text.as_ref())?;
-                match frame.kind.as_str() {
-                    "start" => break,
-                    "end" => return Err(file_watch_ended(frame.reason)),
-                    _ => {}
+    // before it would lose a change the caller makes right away. The wait is
+    // bounded: a proxy that accepts the upgrade and then goes quiet would
+    // otherwise block the caller forever. Later reads are not bounded, since
+    // a quiet folder sends nothing for as long as it stays quiet.
+    let wait_for_start = async {
+        loop {
+            match read.next().await {
+                Some(Ok(Message::Text(text))) => {
+                    let frame: FileWatchServerFrame = serde_json::from_str(text.as_ref())?;
+                    match frame.kind.as_str() {
+                        "start" => return Ok::<(), Error>(()),
+                        "end" => return Err(file_watch_ended(frame.reason)),
+                        _ => {}
+                    }
                 }
+                Some(Ok(Message::Close(_))) | None => {
+                    return Err(Error::Client("file watch closed before it started".to_string()))
+                }
+                Some(Ok(_)) => {}
+                Some(Err(err)) => return Err(Error::WebSocket(err)),
             }
-            Some(Ok(Message::Close(_))) | None => {
-                return Err(Error::Client("file watch closed before it started".to_string()))
-            }
-            Some(Ok(_)) => {}
-            Some(Err(err)) => return Err(Error::WebSocket(err)),
         }
-    }
+    };
+    within_file_watch_start(FILE_WATCH_START_TIMEOUT, wait_for_start).await?;
     if let Some(ready_tx) = ready.take() {
         let _ = ready_tx.send(Ok(()));
     }
@@ -7054,6 +7074,27 @@ mod tests {
             Err(other) => panic!("want the end reason, got {:?}", other),
             Ok(_) => panic!("want an error"),
         }
+    }
+
+    // The wait for the start frame is bounded; a result inside the limit
+    // passes through unchanged.
+    #[test]
+    fn file_watch_start_wait_is_bounded() {
+        let runtime = Builder::new_current_thread().enable_all().build().expect("runtime should build");
+        match runtime.block_on(within_file_watch_start(Duration::from_millis(20), std::future::pending())) {
+            Err(Error::Client(reason)) => assert_eq!(reason, "file watch did not start within 20ms"),
+            other => panic!("want the timeout, got {:?}", other),
+        }
+        assert!(runtime
+            .block_on(within_file_watch_start(Duration::from_millis(20), async { Ok(()) }))
+            .is_ok());
+        match runtime.block_on(within_file_watch_start(Duration::from_millis(20), async {
+            Err(Error::Client("gone".to_string()))
+        })) {
+            Err(Error::Client(reason)) => assert_eq!(reason, "gone"),
+            other => panic!("want the inner error, got {:?}", other),
+        }
+        assert_eq!(format!("{:?}", FILE_WATCH_START_TIMEOUT), "60s");
     }
 
     #[test]

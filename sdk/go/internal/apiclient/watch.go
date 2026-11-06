@@ -48,6 +48,10 @@ type watchFrame struct {
 // WatchFiles opens a watch on path through the toolbox pass-through. It
 // returns once the agent has armed the watch, so a change made after it
 // returns is reported. The handshake is sent once: a watch is a stream.
+// watchStartTimeout bounds the wait for the agent's "start" frame. A
+// variable for tests.
+var watchStartTimeout = 60 * time.Second
+
 func (c *Client) WatchFiles(ctx context.Context, id, path string, options WatchOptions) (*WatchHandle, error) {
 	if strings.TrimSpace(path) == "" {
 		return nil, errors.New("path is required")
@@ -68,15 +72,25 @@ func (c *Client) WatchFiles(ctx context.Context, id, path string, options WatchO
 	}
 
 	// Wait for "start": the agent sends it once the kernel watch is armed.
+	// The wait is bounded even when ctx has no deadline: a proxy that
+	// accepts the upgrade and then goes quiet would otherwise block the
+	// caller forever. Later reads are not bounded, since a quiet folder
+	// sends nothing for as long as it stays quiet.
 	var first watchFrame
 	readErr := make(chan error, 1)
 	go func() { readErr <- conn.ReadJSON(&first) }()
+	startTimer := time.NewTimer(watchStartTimeout)
+	defer startTimer.Stop()
 	select {
 	case err = <-readErr:
 	case <-ctx.Done():
 		_ = conn.Close()
 		<-readErr
 		return nil, ctx.Err()
+	case <-startTimer.C:
+		_ = conn.Close()
+		<-readErr
+		return nil, fmt.Errorf("file watch did not start within %s", watchStartTimeout)
 	}
 	if err != nil {
 		_ = conn.Close()

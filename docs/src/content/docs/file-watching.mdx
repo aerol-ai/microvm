@@ -13,7 +13,7 @@ File watching works on [gVisor](/gvisor-sandbox/) and [Firecracker](/firecracker
 
 ## Watch a folder
 
-Pass a folder and a function. The function is called once for every change, in order. The call returns once the watch is in place, so a change you make right after it is always seen.
+Pass a folder and a function. The function is called once for every change, in order. The call returns once the watch is in place, so a change you make right after it is always seen. If the sandbox does not confirm the watch within 60 seconds, the call fails with an error.
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">

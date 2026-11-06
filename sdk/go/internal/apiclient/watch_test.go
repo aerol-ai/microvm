@@ -253,3 +253,32 @@ func TestWatchFilesHandshakeErrors(t *testing.T) {
 		t.Fatalf("dial to nothing = %v", err)
 	}
 }
+
+// A watch whose agent accepts the upgrade and never says start gives up after
+// the bound, even when the caller's context has no deadline.
+func TestWatchFilesStartWaitIsBounded(t *testing.T) {
+	old := watchStartTimeout
+	watchStartTimeout = 50 * time.Millisecond
+	t.Cleanup(func() { watchStartTimeout = old })
+	var upgrader websocket.Upgrader
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		<-release
+	}))
+	defer srv.Close()
+	defer close(release)
+	client := NewClient(srv.URL, ClientOptions{PATToken: "pat", HTTPClient: srv.Client()})
+	start := time.Now()
+	_, err := client.WatchFiles(context.Background(), "sb", "/w", WatchOptions{})
+	if err == nil || !strings.Contains(err.Error(), "did not start within 50ms") {
+		t.Fatalf("err = %v, want the start timeout", err)
+	}
+	if took := time.Since(start); took > 5*time.Second {
+		t.Fatalf("gave up after %v", took)
+	}
+}

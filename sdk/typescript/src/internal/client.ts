@@ -2641,6 +2641,9 @@ function fromApiFileEvent(raw: unknown): FileEvent {
 // openFileWatch opens toolboxd's /files/watch stream and resolves with its
 // handle once the "start" frame says the watch is in place. `refusal`
 // explains a handshake that never opened.
+// How long a file watch waits for the agent to say the watch is armed.
+export const WATCH_START_TIMEOUT_MS = 60_000;
+
 function openFileWatch(
   baseURL: string,
   routePath: string,
@@ -2696,6 +2699,7 @@ function openFileWatch(
     },
   };
   const fail = (detail: string) => {
+    clearTimeout(startTimer);
     if (isStarted) {
       finish(new Error(`file watch stream closed${detail}`));
       return;
@@ -2708,6 +2712,18 @@ function openFileWatch(
     }
     void refusal(detail).then(startReject, startReject);
   };
+
+  // The wait for "start" is bounded: a proxy that accepts the upgrade and
+  // then goes quiet would otherwise leave the caller waiting forever. Later
+  // frames are not bounded, since a quiet folder sends nothing.
+  const startTimer = setTimeout(() => {
+    if (isStarted || startFailed) return;
+    startFailed = true;
+    startReject(new Error(`file watch did not start within ${WATCH_START_TIMEOUT_MS / 1000}s`));
+    ws.close();
+  }, WATCH_START_TIMEOUT_MS);
+  // In Node, the pending wait alone must not keep the process alive.
+  (startTimer as { unref?: () => void }).unref?.();
 
   ws.addEventListener("open", () => {
     opened = true;
@@ -2723,6 +2739,7 @@ function openFileWatch(
     }
     switch (msg.type) {
       case "start":
+        clearTimeout(startTimer);
         if (!isStarted && !startFailed) {
           isStarted = true;
           startResolve(handle);
