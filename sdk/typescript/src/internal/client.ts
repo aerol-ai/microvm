@@ -89,6 +89,7 @@ import type {
   Session,
   SessionAttachHandle,
   SessionAttachOptions,
+  StatusReason,
   Template,
   TemplatePushState,
   TemplateStatus,
@@ -332,6 +333,8 @@ interface ApiSandbox {
   updated_at: string;
   last_active_at: string;
   last_error?: string;
+  status_reason?: string;
+  exit_code?: number | null;
   container_command?: string[];
   lifecycle?: ApiLifecycle;
   failover?: ApiFailover;
@@ -1936,6 +1939,8 @@ export class SandboxResource implements Sandbox {
   declare name?: string;
   declare tags?: Record<string, string>;
   declare lastError?: string;
+  declare statusReason?: StatusReason;
+  declare exitCode?: number;
   declare containerCommand?: string[];
   declare lifecycle: Lifecycle;
   declare failover?: Failover;
@@ -2340,6 +2345,9 @@ function fromApiSandbox(sandbox: ApiSandbox): Sandbox {
     updatedAt: sandbox.updated_at,
     lastActiveAt: sandbox.last_active_at,
     lastError: sandbox.last_error,
+    statusReason: (sandbox.status_reason || undefined) as StatusReason | undefined,
+    // 0 is a real exit code; only an absent or null one is left out.
+    exitCode: sandbox.exit_code ?? undefined,
     containerCommand: sandbox.container_command,
     lifecycle: fromApiLifecycle(sandbox.lifecycle),
     failover: fromApiFailover(sandbox.failover),

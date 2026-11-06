@@ -1063,6 +1063,13 @@ func open(path string, secretCipher *secrets.Cipher) (*Store, error) {
 		// empty-string sentinels keep scanSandbox free of NullString
 		// plumbing). Unused by other runtimes today.
 		`ALTER TABLE sandboxes ADD COLUMN tenant_id TEXT NOT NULL DEFAULT '';`,
+		// Why the sandbox is in its current status (models.StatusReason*) and
+		// the exit code behind it (plans/agent-sandbox-feature-parity.md L2).
+		// '' and NULL for every pre-migration row: "nothing recorded", which
+		// is the truth for a stop that happened before the column existed.
+		// exit_code is nullable because 0 is a real exit code.
+		`ALTER TABLE sandboxes ADD COLUMN status_reason TEXT NOT NULL DEFAULT '';`,
+		`ALTER TABLE sandboxes ADD COLUMN exit_code INTEGER;`,
 		// Checkpoint pushes are async and outlive their sandbox: without the
 		// lifecycle they were started for, a push that lands after the id is
 		// reused writes the old incarnation's artifact into the new one.
@@ -2167,8 +2174,9 @@ func (s *Store) insertSandbox(ctx context.Context, exec dbExecer, sandbox *model
 			checkpoint_path, clone_generation,
 			wasm_registry_ref, wasm_registry_digest,
 			owner_ref, fleet_suspended,
-			tenant_id, audit_incarnation_id
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			tenant_id, audit_incarnation_id,
+			status_reason, exit_code
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`,
 		sandbox.ID,
 		sandbox.Image,
@@ -2226,6 +2234,8 @@ func (s *Store) insertSandbox(ctx context.Context, exec dbExecer, sandbox *model
 		boolToInt(sandbox.FleetSuspended),
 		strings.TrimSpace(sandbox.TenantID),
 		strings.TrimSpace(sandbox.AuditIncarnationID),
+		strings.TrimSpace(sandbox.StatusReason),
+		nullableInt(sandbox.ExitCode),
 	)
 	if err != nil {
 		if isSandboxNameConflict(err, sandbox.Name) {
@@ -2387,6 +2397,15 @@ func (s *Store) Upsert(ctx context.Context, sandbox *models.Sandbox) error {
 	// pass and written after the old key was retired would otherwise put
 	// back bytes nothing opens. Only Create, the reseal pass and a write
 	// with a new plaintext toolbox token (the last argument) change one.
+	//
+	// The same staleness rule covers status_reason and exit_code: the writer
+	// that changes the status says why, and a write that keeps the status
+	// keeps the reason. Every path that changes status (the API stop, the
+	// die event, reconcile, start) writes the whole row from its own earlier
+	// read, so without it a duplicate event, or a reconcile pass that read
+	// the row a moment before a stop, would replace "user_stop" with its own
+	// guess. A reason that changes with no status change goes through
+	// SetStatusReason.
 	_, err = exec.ExecContext(ctx, `
 		INSERT INTO sandboxes (
 			id, image, status, public_url, container_id, container_ip, cpu, memory_mb, disk_gb,
@@ -2407,8 +2426,9 @@ func (s *Store) Upsert(ctx context.Context, sandbox *models.Sandbox) error {
 			checkpoint_path, clone_generation,
 			wasm_registry_ref, wasm_registry_digest,
 			owner_ref, fleet_suspended,
-			tenant_id, audit_incarnation_id
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			tenant_id, audit_incarnation_id,
+			status_reason, exit_code
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			image = excluded.image,
 			status = excluded.status,
@@ -2468,6 +2488,14 @@ func (s *Store) Upsert(ctx context.Context, sandbox *models.Sandbox) error {
 			audit_incarnation_id = CASE
 				WHEN excluded.audit_incarnation_id <> '' THEN excluded.audit_incarnation_id
 				ELSE sandboxes.audit_incarnation_id
+			END,
+			status_reason = CASE
+				WHEN excluded.status <> sandboxes.status THEN excluded.status_reason
+				ELSE sandboxes.status_reason
+			END,
+			exit_code = CASE
+				WHEN excluded.status <> sandboxes.status THEN excluded.exit_code
+				ELSE sandboxes.exit_code
 			END
 	`,
 		sandbox.ID,
@@ -2526,6 +2554,8 @@ func (s *Store) Upsert(ctx context.Context, sandbox *models.Sandbox) error {
 		boolToInt(sandbox.FleetSuspended),
 		strings.TrimSpace(sandbox.TenantID),
 		incarnationID,
+		strings.TrimSpace(sandbox.StatusReason),
+		nullableInt(sandbox.ExitCode),
 		boolToInt(sandbox.ToolboxToken != ""),
 	)
 	if err != nil {
@@ -2578,7 +2608,8 @@ func (s *Store) Get(ctx context.Context, id string) (*models.Sandbox, error) {
 			checkpoint_path, clone_generation,
 			wasm_registry_ref, wasm_registry_digest,
 			owner_ref, fleet_suspended,
-			tenant_id, audit_incarnation_id
+			tenant_id, audit_incarnation_id,
+			status_reason, exit_code
 		FROM sandboxes
 		WHERE id = ?
 	`, id)
@@ -2647,7 +2678,8 @@ func (s *Store) List(ctx context.Context) ([]*models.Sandbox, error) {
 			checkpoint_path, clone_generation,
 			wasm_registry_ref, wasm_registry_digest,
 			owner_ref, fleet_suspended,
-			tenant_id, audit_incarnation_id
+			tenant_id, audit_incarnation_id,
+			status_reason, exit_code
 		FROM sandboxes
 		ORDER BY created_at DESC
 	`)
@@ -2718,7 +2750,8 @@ func (s *Store) ListByOwner(ctx context.Context, ownerRef string) ([]*models.San
 			checkpoint_path, clone_generation,
 			wasm_registry_ref, wasm_registry_digest,
 			owner_ref, fleet_suspended,
-			tenant_id, audit_incarnation_id
+			tenant_id, audit_incarnation_id,
+			status_reason, exit_code
 		FROM sandboxes
 		WHERE owner_ref = ?
 		ORDER BY created_at DESC
@@ -2776,7 +2809,8 @@ func (s *Store) ListByRuntime(ctx context.Context, runtime string) ([]*models.Sa
 			checkpoint_path, clone_generation,
 			wasm_registry_ref, wasm_registry_digest,
 			owner_ref, fleet_suspended,
-			tenant_id, audit_incarnation_id
+			tenant_id, audit_incarnation_id,
+			status_reason, exit_code
 		FROM sandboxes
 		WHERE runtime = ?
 		ORDER BY created_at DESC
@@ -4849,6 +4883,45 @@ func (s *Store) UpdateStatus(ctx context.Context, id string, status models.Sandb
 	return nil
 }
 
+// UpdateStatusWithReason is UpdateStatus for a path that also knows why the
+// status changed (models.StatusReason*): one statement, so the row is never
+// seen in its new status with the old reason.
+func (s *Store) UpdateStatusWithReason(ctx context.Context, id string, status models.SandboxStatus, lastError, reason string, exitCode *int) error {
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE sandboxes
+		SET status = ?, last_error = ?, status_reason = ?, exit_code = ?, updated_at = ?
+		WHERE id = ?
+	`, string(status), lastError, reason, nullableInt(exitCode), time.Now().UTC(), id)
+	if err != nil {
+		return fmt.Errorf("update sandbox status: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err == nil && affected == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// SetStatusReason records why a sandbox is in its status when the status
+// itself does not change: a failover recreate, a restart on failure, or a
+// main program that ended while the sandbox stays up. Upsert keeps the
+// reason on a write that keeps the status, so these need their own write.
+func (s *Store) SetStatusReason(ctx context.Context, id, reason string, exitCode *int) error {
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE sandboxes
+		SET status_reason = ?, exit_code = ?, updated_at = ?
+		WHERE id = ?
+	`, reason, nullableInt(exitCode), time.Now().UTC(), id)
+	if err != nil {
+		return fmt.Errorf("set sandbox status reason: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err == nil && affected == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
 func (s *Store) UpdateRuntime(ctx context.Context, id, containerID, containerIP, publicURL string) error {
 	result, err := s.db.ExecContext(ctx, `
 		UPDATE sandboxes
@@ -5315,6 +5388,7 @@ func (s *Store) scanSandbox(scanner interface {
 	var fleetSuspended int
 	var allowOutJSON, denyOutJSON string
 	var allowPublicTraffic int
+	var exitCode sql.NullInt64
 
 	err := scanner.Scan(
 		&sandbox.ID,
@@ -5373,10 +5447,13 @@ func (s *Store) scanSandbox(scanner interface {
 		&fleetSuspended,
 		&sandbox.TenantID,
 		&sandbox.AuditIncarnationID,
+		&sandbox.StatusReason,
+		&exitCode,
 	)
 	if err != nil {
 		return nil, err
 	}
+	sandbox.ExitCode = intFromNull(exitCode)
 	sandbox.FleetSuspended = fleetSuspended == 1
 	sandbox.NetworkQuotaExceeded = netQuotaExceeded == 1
 	if netQuotaExceededAt.Valid {
@@ -5632,6 +5709,24 @@ func nullableTime(t *time.Time) sql.NullTime {
 		return sql.NullTime{}
 	}
 	return sql.NullTime{Time: t.UTC(), Valid: true}
+}
+
+// nullableInt maps a *int to a sql.NullInt64: exit_code is NULL when there
+// is no exit, since 0 is a real exit code.
+func nullableInt(v *int) sql.NullInt64 {
+	if v == nil {
+		return sql.NullInt64{}
+	}
+	return sql.NullInt64{Int64: int64(*v), Valid: true}
+}
+
+// intFromNull is nullableInt's inverse for the read path.
+func intFromNull(v sql.NullInt64) *int {
+	if !v.Valid {
+		return nil
+	}
+	n := int(v.Int64)
+	return &n
 }
 
 func boolToInt(value bool) int {

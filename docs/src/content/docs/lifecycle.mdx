@@ -139,6 +139,73 @@ The SDKs take each time in nanoseconds (billionths of a second). One hour is `60
   </TabItem>
 </Tabs>
 
+## Why a sandbox stopped
+
+Every sandbox has a `statusReason`. It tells you why the sandbox is in its current state. When the reason comes from a program that ended, `exitCode` holds that program's exit code.
+
+| `statusReason` | Status | What happened |
+|---|---|---|
+| `user_stop` | stopped | Someone called `stop`: your code, the CLI, another SDK, or the server's operator. |
+| `idle` | stopped | `stopIfIdleFor` ran out, or the server's default idle stop did. |
+| `max_age` | stopped | `stopAtAge` ran out. |
+| `out_of_memory` | stopped | The sandbox used more memory than it has, and the system killed it. `exitCode` is set. |
+| `disk_limit` | stopped | The sandbox wrote more than its disk size. |
+| `crashed` | stopped | The sandbox went down on its own with a non-zero exit code. `exitCode` is set. |
+| `reconcile` | stopped | The server found the sandbox stopped but did not see it stop, so it cannot say why. This can happen after the server itself restarts. |
+| `program_exited` | stopped or started | The sandbox's main program ended. `exitCode` says how. |
+| `failover` | started | The server the sandbox ran on failed, so the sandbox was created again on another server. Running programs and files outside a volume were lost. |
+| `restarted` | started | The sandbox crashed and was started again for you. `exitCode` is the exit code of the crash. |
+
+A sandbox that you created or started yourself has no reason. Starting a sandbox clears the reason. `lastError` still holds the full message, such as `container exited with code 3`.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const info = await client.get(sandbox.id);
+    if (info.status === "stopped") {
+      console.log("stopped because:", info.statusReason, "exit code:", info.exitCode);
+    }
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    info = client.get(sandbox.id).to_dict()
+    if info["status"] == "stopped":
+        print("stopped because:", info.get("statusReason"), "exit code:", info.get("exitCode"))
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    info, err := client.Get(ctx, sandbox.ID)
+    if err != nil {
+        log.Fatal(err)
+    }
+    if info.Status == "stopped" {
+        fmt.Println("stopped because:", info.StatusReason)
+        if info.ExitCode != nil {
+            fmt.Println("exit code:", *info.ExitCode)
+        }
+    }
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    let info = client.get(&sandbox.data.id)?;
+    if info.data.status == "stopped" {
+        println!("stopped because: {:?}, exit code: {:?}", info.data.status_reason, info.data.exit_code);
+    }
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    Sandbox info = client.get(sandbox.id);
+    if ("stopped".equals(info.status)) {
+        System.out.println("stopped because: " + info.statusReason + ", exit code: " + info.exitCode);
+    }
+    ```
+  </TabItem>
+</Tabs>
+
 ## Good to know
 
 - **The longest timer is 30 days.** A longer value is rejected.

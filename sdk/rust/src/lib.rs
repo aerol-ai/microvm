@@ -26,6 +26,11 @@ pub use files::{
 };
 pub use image::Image;
 pub use types::CreateSandboxResponse;
+pub use types::{
+    STATUS_REASON_CRASHED, STATUS_REASON_DISK_LIMIT, STATUS_REASON_FAILOVER, STATUS_REASON_IDLE,
+    STATUS_REASON_MAX_AGE, STATUS_REASON_OUT_OF_MEMORY, STATUS_REASON_PROGRAM_EXITED,
+    STATUS_REASON_RECONCILE, STATUS_REASON_RESTARTED, STATUS_REASON_USER_STOP,
+};
 use types::{CustomDomainListWire, ExposePortResponseWire};
 pub use types::{ApiToken, ApiTokenList, CreateApiTokenOptions, CreatedApiToken, WhoAmI, WhoAmIPrincipal};
 pub use types::{

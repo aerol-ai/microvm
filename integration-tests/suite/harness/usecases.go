@@ -977,6 +977,8 @@ var Registry = []UseCase{
 	{ID: "UC-377", Title: "Downloads answer Range (206; 416 past the end) and HEAD (no body) through the v1 toolbox pass-through, the SDK's MaxBytes refuses a larger file, and a /proc file (size 0, content unknown in advance) streams with the cap holding as it arrives", Implemented: true},
 	{ID: "UC-378", Title: "A write that hits ENOSPC (an upload to /dev/full) answers 507 \"sandbox disk is full\", not a bare 500", Implemented: true},
 	{ID: "UC-379", Title: "A WASM sandbox answers the file verbs (info, move, copy, folder, delete, search, find, list with depth) with a clear 501, and the SDK refuses ListFiles and a guarded MoveFile with ErrUnsupportedFeature before sending them", Requires: []Capability{CapWasm}, Implemented: true},
+	// Agent-sandbox parity, lifecycle and observability (parity_lifecycle_test.go).
+	{ID: "UC-395", Title: "status_reason: a stop call records user_stop with no exit code and a start clears it; a one-minute stopIfIdleFor records idle", Implemented: true},
 }
 
 // byID is a lookup built once for the report generator.

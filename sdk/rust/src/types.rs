@@ -619,6 +619,14 @@ pub struct Sandbox {
     pub last_active_at: String,
     #[serde(rename = "last_error", skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
+    /// Why the sandbox is in its status (see the `STATUS_REASON_*`
+    /// constants). `None` when a call simply created or started it.
+    #[serde(default, rename = "status_reason", skip_serializing_if = "Option::is_none")]
+    pub status_reason: Option<String>,
+    /// Exit code behind `out_of_memory`, `crashed`, `program_exited` and
+    /// `restarted`. `Some(0)` is a real exit code.
+    #[serde(default, rename = "exit_code", skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
     #[serde(rename = "container_command", skip_serializing_if = "Option::is_none")]
     pub container_command: Option<Vec<String>>,
     #[serde(default)]
@@ -646,6 +654,21 @@ pub struct Sandbox {
     #[serde(rename = "tenant_id", skip_serializing_if = "Option::is_none")]
     pub tenant_id: Option<String>,
 }
+
+/// Status reasons: why a sandbox is in its current status
+/// (`Sandbox::status_reason`). The first seven are reasons a sandbox is
+/// stopped; `program_exited`, `failover` and `restarted` can also describe a
+/// started one.
+pub const STATUS_REASON_USER_STOP: &str = "user_stop";
+pub const STATUS_REASON_IDLE: &str = "idle";
+pub const STATUS_REASON_MAX_AGE: &str = "max_age";
+pub const STATUS_REASON_OUT_OF_MEMORY: &str = "out_of_memory";
+pub const STATUS_REASON_DISK_LIMIT: &str = "disk_limit";
+pub const STATUS_REASON_CRASHED: &str = "crashed";
+pub const STATUS_REASON_RECONCILE: &str = "reconcile";
+pub const STATUS_REASON_PROGRAM_EXITED: &str = "program_exited";
+pub const STATUS_REASON_FAILOVER: &str = "failover";
+pub const STATUS_REASON_RESTARTED: &str = "restarted";
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct CreateSandboxResponse {
@@ -1550,5 +1573,32 @@ mod exec_result_tests {
         assert!(!old.timed_out);
         let new: ExecResult = serde_json::from_str(r#"{"stdout":"","stderr":"","exit_code":-1,"duration_ms":1000,"timed_out":true}"#).unwrap();
         assert!(new.timed_out);
+    }
+}
+
+#[cfg(test)]
+mod status_reason_tests {
+    use super::{Sandbox, STATUS_REASON_CRASHED, STATUS_REASON_PROGRAM_EXITED};
+
+    fn sandbox(extra: &str) -> Sandbox {
+        let body = format!(
+            r#"{{"id":"sb","image":"i","status":"stopped","public_url":"","container_id":null,"container_ip":null,"cpu":1,"memory_mb":1,"disk_gb":1,"os_user":"root","network_block_all":false,"toolbox_enabled":true,"created_at":"","updated_at":"","last_active_at":""{}}}"#,
+            extra
+        );
+        serde_json::from_str(&body).unwrap()
+    }
+
+    #[test]
+    fn reads_status_reason_and_exit_code() {
+        let crashed = sandbox(r#","status_reason":"crashed","exit_code":3"#);
+        assert_eq!(crashed.status_reason.as_deref(), Some(STATUS_REASON_CRASHED));
+        assert_eq!(crashed.exit_code, Some(3));
+        // Exit code 0 is a real exit, not "no exit".
+        let exited = sandbox(r#","status_reason":"program_exited","exit_code":0"#);
+        assert_eq!(exited.status_reason.as_deref(), Some(STATUS_REASON_PROGRAM_EXITED));
+        assert_eq!(exited.exit_code, Some(0));
+        let plain = sandbox("");
+        assert_eq!(plain.status_reason, None);
+        assert_eq!(plain.exit_code, None);
     }
 }

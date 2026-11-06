@@ -52,6 +52,7 @@ from .types import (
     RetryConfig,
     SandboxSnapshot,
     SnapshotList,
+    StatusReason,
 )
 
 __all__ = [
@@ -106,4 +107,5 @@ __all__ = [
     "RetryConfig",
     "SandboxSnapshot",
     "SnapshotList",
+    "StatusReason",
 ]

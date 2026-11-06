@@ -84,6 +84,7 @@ export type {
   Sandbox as SandboxData,
   SandboxSnapshot,
   SandboxStatus,
+  StatusReason,
   Session,
   SessionAttachHandle,
   SessionAttachOptions,

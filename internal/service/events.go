@@ -195,7 +195,7 @@ func (s *Service) markSandboxStopped(ctx context.Context, sandbox *models.Sandbo
 	// rule teardown below: a killed gVisor sandbox never closes their
 	// connections.
 	s.endToolboxCalls(sandbox.ID, toolboxEndStopped, detail)
-	mode := s.classifyDockerStopEvent(sandbox.ID, oomKilled)
+	mode, reason := s.classifyDockerStopEvent(sandbox.ID, oomKilled)
 	arm := s.shouldArmWake(sandbox, mode)
 
 	// Release the admitter slot — a stopped container holds no host CPU/RAM
@@ -235,6 +235,15 @@ func (s *Service) markSandboxStopped(ctx context.Context, sandbox *models.Sandbo
 	sandbox.Status = models.SandboxStatusStopped
 	sandbox.UpdatedAt = time.Now().UTC()
 	sandbox.WakeArmed = arm
+	// A stop sandboxd asked for carries the reason the stop call recorded;
+	// anything else is named from the exit. Docker's stop event follows its
+	// die and finds the row already stopped, so the store keeps the die's
+	// reason (Upsert writes a reason only with a status change).
+	if mode == stopModeInvoluntary {
+		sandbox.StatusReason, sandbox.ExitCode = stopReasonForExit(oomKilled, event.ExitCode)
+	} else {
+		sandbox.StatusReason, sandbox.ExitCode = reason, nil
+	}
 	if oomKilled {
 		sandbox.LastError = "container killed by OOM"
 	} else if event.Action == "die" && event.ExitCode != 0 {
@@ -255,6 +264,7 @@ func (s *Service) markSandboxStopped(ctx context.Context, sandbox *models.Sandbo
 		"exit_code", event.ExitCode,
 		"oom_killed", oomKilled,
 		"status", string(sandbox.Status),
+		"status_reason", sandbox.StatusReason,
 		"stop_mode", mode.String(),
 		"wake_armed", arm,
 	)
@@ -405,6 +415,10 @@ func (s *Service) handleStartEvent(ctx context.Context, sandbox *models.Sandbox)
 	}
 
 	sandbox.ContainerIP = state.ContainerIP
+	if state.Status == models.SandboxStatusStarted && sandbox.Status != models.SandboxStatusStarted {
+		// A start answers whatever stopped it (as in StartSandbox).
+		sandbox.StatusReason, sandbox.ExitCode = "", nil
+	}
 	sandbox.Status = state.Status
 	sandbox.UpdatedAt = time.Now().UTC()
 	// The stop event cleared this sandbox's per-IP rules (the IP can be

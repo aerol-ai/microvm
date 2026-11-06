@@ -1613,6 +1613,7 @@ func (s *Service) RecreateSandboxReport(ctx context.Context, id string, spec mod
 		}
 		if attempted {
 			s.restoreCompatStateAfterRecreate(ctx, id, spec.CompatState)
+			s.recordFailoverReason(ctx, id)
 			s.logger.Info("cluster: recreated durable wasm sandbox after failover",
 				"sandbox_id", id, "replayed_ports", len(exposedPorts))
 		}
@@ -1655,12 +1656,24 @@ func (s *Service) RecreateSandboxReport(ctx context.Context, id string, spec mod
 		return true, err
 	}
 	s.restoreCompatStateAfterRecreate(ctx, id, spec.CompatState)
+	s.recordFailoverReason(ctx, id)
 	if err := s.replayClusterExposedPorts(ctx, id, exposedPorts); err != nil {
 		return true, err
 	}
 	s.logger.Info("cluster: recreated sandbox after failover",
 		"sandbox_id", id, "replayed_ports", len(exposedPorts))
 	return true, nil
+}
+
+// recordFailoverReason marks a sandbox the owner watcher just recreated
+// here: it is started, but as a fresh copy of its spec, so its programs and
+// anything outside a volume did not survive. A separate write after the
+// create rather than a field on the create's row, so the ordinary create path
+// is unchanged. Best effort: a lost reason costs a hint, not the sandbox.
+func (s *Service) recordFailoverReason(ctx context.Context, id string) {
+	if err := s.store.SetStatusReason(ctx, id, models.StatusReasonFailover, nil); err != nil && s.logger != nil {
+		s.logger.Warn("cluster: record failover status reason failed", "sandbox_id", id, "err", err)
+	}
 }
 
 // restoreCompatStateAfterRecreate re-materializes the facade compat-state rows a
@@ -3556,6 +3569,11 @@ func (s *Service) StartSandbox(ctx context.Context, id string) (*models.Sandbox,
 	sandbox.ContainerIP = state.ContainerIP
 	sandbox.Status = state.Status
 	sandbox.WakeArmed = false
+	// A start answers whatever stopped the sandbox. The store writes these
+	// only with the status change, so a start racing its own start event
+	// still lands one clean record.
+	sandbox.StatusReason = ""
+	sandbox.ExitCode = nil
 	sandbox.UpdatedAt = time.Now().UTC()
 	sandbox.LastActiveAt = time.Now().UTC()
 	// Put the stored egress policy back before the start reports success or
@@ -6284,6 +6302,19 @@ func (s *Service) Reconcile(ctx context.Context) error {
 			sandbox.ContainerID = state.ContainerID
 		}
 		sandbox.ContainerIP = observedIP
+		// A status change only this pass saw has no event behind it, so
+		// reconcile can only say it found the sandbox that way. The store
+		// writes the reason only if the row still has the old status, so a
+		// stop the event path recorded since this pass read the row keeps
+		// its own reason.
+		if state.Status != sandbox.Status {
+			switch state.Status {
+			case models.SandboxStatusStopped:
+				sandbox.StatusReason, sandbox.ExitCode = models.StatusReasonReconcile, nil
+			case models.SandboxStatusStarted:
+				sandbox.StatusReason, sandbox.ExitCode = "", nil
+			}
+		}
 		sandbox.Status = state.Status
 		sandbox.PublicURL = s.sandboxPublicURL(sandbox.ID, sandbox.AllowPublicTraffic)
 		sandbox.UpdatedAt = time.Now().UTC()
@@ -6712,7 +6743,8 @@ func (s *Service) runLifecycleSweep(ctx context.Context) {
 	}
 	for _, sandbox := range sandboxes {
 		floor := s.activityFloorFor(sandbox, netstatsFallback)
-		switch lifecycleActionForWithFloor(sandbox, now, globalIdle, floor) {
+		action, reason := lifecycleDecision(sandbox, now, globalIdle, floor)
+		switch action {
 		case lifecycleDestroy:
 			done := s.beginSystemAction(ctx, sandbox.ID, systemActionAutoDelete)
 			err := s.DestroySandbox(ctx, sandbox.ID)
@@ -6727,7 +6759,7 @@ func (s *Service) runLifecycleSweep(ctx context.Context) {
 			// sandboxes arm wake (the next inbound HTTP request will
 			// resurrect the sandbox transparently).
 			done := s.beginSystemAction(ctx, sandbox.ID, systemActionAutoStop)
-			_, err := s.stopSandboxInternal(ctx, sandbox.ID, stopModeLifecycle)
+			_, err := s.stopSandboxForReason(ctx, sandbox.ID, stopModeLifecycle, reason)
 			done(err)
 			if err != nil {
 				s.logger.Warn("auto-stop failed", "sandbox_id", sandbox.ID, "error", err)
@@ -6864,8 +6896,17 @@ func lifecycleActionFor(sb *models.Sandbox, now time.Time, globalIdle time.Durat
 // activityFloor; otherwise the function behaves identically to
 // lifecycleActionFor. Pure: callers compute the floor.
 func lifecycleActionForWithFloor(sb *models.Sandbox, now time.Time, globalIdle time.Duration, activityFloor time.Time) lifecycleAction {
+	action, _ := lifecycleDecision(sb, now, globalIdle, activityFloor)
+	return action
+}
+
+// lifecycleDecision is lifecycleActionForWithFloor plus the status reason a
+// stop records (models.StatusReasonIdle or StatusReasonMaxAge; "" for any
+// other action). Idle is checked first, as before, so a sandbox past both
+// timers reports idle.
+func lifecycleDecision(sb *models.Sandbox, now time.Time, globalIdle time.Duration, activityFloor time.Time) (lifecycleAction, string) {
 	if sb == nil || sb.Status == models.SandboxStatusDestroyed {
-		return lifecycleNone
+		return lifecycleNone, ""
 	}
 	floor := sb.LastActiveAt
 	if !activityFloor.IsZero() && activityFloor.After(floor) {
@@ -6877,30 +6918,30 @@ func lifecycleActionForWithFloor(sb *models.Sandbox, now time.Time, globalIdle t
 	l := sb.Lifecycle
 	// Destroy first: if any destroy condition is met we go straight there.
 	if l.DestroyIfIdleFor > 0 && idle >= l.DestroyIfIdleFor {
-		return lifecycleDestroy
+		return lifecycleDestroy, ""
 	}
 	if l.DestroyAtAge > 0 && age >= l.DestroyAtAge {
-		return lifecycleDestroy
+		return lifecycleDestroy, ""
 	}
 	// Stop only applies to running sandboxes — re-stopping a stopped one
 	// is wasted Docker calls and noisy logs.
 	if sb.Status != models.SandboxStatusStarted {
-		return lifecycleNone
+		return lifecycleNone, ""
 	}
 	if l.StopIfIdleFor > 0 && idle >= l.StopIfIdleFor {
-		return lifecycleStop
+		return lifecycleStop, models.StatusReasonIdle
 	}
 	if l.StopAtAge > 0 && age >= l.StopAtAge {
-		return lifecycleStop
+		return lifecycleStop, models.StatusReasonMaxAge
 	}
 	// Legacy global idle fallback: only applies when the sandbox has no
 	// per-sandbox config, so an explicit "no auto-stop" Lifecycle (e.g.
 	// just DestroyAtAge=24h with stop fields zero) doesn't accidentally
 	// inherit the operator's global timeout.
 	if l.IsZero() && globalIdle > 0 && idle >= globalIdle {
-		return lifecycleStop
+		return lifecycleStop, models.StatusReasonIdle
 	}
-	return lifecycleNone
+	return lifecycleNone, ""
 }
 
 // gcZombieCaddyEntries deletes caddy routes/servers whose @id (or layer4

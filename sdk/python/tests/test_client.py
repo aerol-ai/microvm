@@ -1019,6 +1019,19 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(_from_api_sandbox({"id": "sb", "egress_status": "unavailable"})["egressStatus"], "unavailable")
         self.assertNotIn("egressStatus", _from_api_sandbox({"id": "sb"}))
 
+    def test_sandbox_maps_status_reason_and_exit_code(self):
+        from microvm.client import _from_api_sandbox
+
+        crashed = _from_api_sandbox({"id": "sb", "status": "stopped", "status_reason": "crashed", "exit_code": 3})
+        self.assertEqual(crashed["statusReason"], "crashed")
+        self.assertEqual(crashed["exitCode"], 3)
+        # Exit code 0 is a real exit, not "no exit".
+        exited = _from_api_sandbox({"id": "sb", "status_reason": "program_exited", "exit_code": 0})
+        self.assertEqual(exited["exitCode"], 0)
+        plain = _from_api_sandbox({"id": "sb", "status": "started"})
+        self.assertNotIn("statusReason", plain)
+        self.assertNotIn("exitCode", plain)
+
     def test_get_audit_sends_filters_and_maps_page(self):
         client = RecordingMicroVM()
 

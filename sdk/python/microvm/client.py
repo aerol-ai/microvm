@@ -3039,6 +3039,13 @@ def _from_api_sandbox(sandbox: Dict[str, Any]) -> SandboxData:
     last_error = _first_of(sandbox, "last_error", "lastError")
     if last_error not in (None, ""):
         result["lastError"] = str(last_error)
+    status_reason = _first_of(sandbox, "status_reason", "statusReason")
+    if status_reason not in (None, ""):
+        result["statusReason"] = str(status_reason)  # type: ignore[typeddict-item]
+    # 0 is a real exit code, so only an absent value is skipped.
+    exit_code = _first_of(sandbox, "exit_code", "exitCode")
+    if exit_code is not None:
+        result["exitCode"] = int(exit_code)
     container_command = _first_of(sandbox, "container_command", "containerCommand")
     if isinstance(container_command, list) and len(container_command) > 0:
         result["containerCommand"] = [str(item) for item in container_command]

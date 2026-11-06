@@ -530,6 +530,24 @@ class ExposeResult:
     host_port: Optional[int] = None
 
 
+# Why a sandbox is in its current status. A stopped sandbox has one of the
+# first seven (plus "program_exited" when its init ended with code 0); a
+# started one may have "program_exited" (its main program ended and
+# lifecycle.destroyAfterExitFor is counting), "failover" or "restarted".
+StatusReason = Literal[
+    "user_stop",
+    "idle",
+    "max_age",
+    "out_of_memory",
+    "disk_limit",
+    "crashed",
+    "reconcile",
+    "program_exited",
+    "failover",
+    "restarted",
+]
+
+
 class SandboxData(TypedDict, total=False):
     id: str
     # Name set at create time, unique per owner. Absent for unnamed sandboxes.
@@ -567,6 +585,11 @@ class SandboxData(TypedDict, total=False):
     updatedAt: str
     lastActiveAt: str
     lastError: str
+    # Why the sandbox is in its status; absent when a call simply created or
+    # started it. exitCode is set for out_of_memory, crashed, program_exited
+    # and restarted.
+    statusReason: StatusReason
+    exitCode: int
     containerCommand: List[str]
     lifecycle: Lifecycle
     failover: Failover

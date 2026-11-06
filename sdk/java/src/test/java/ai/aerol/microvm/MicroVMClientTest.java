@@ -77,6 +77,7 @@ import ai.aerol.microvm.model.NetworkUsage;
 import ai.aerol.microvm.model.RegisterSnapshotOptions;
 import ai.aerol.microvm.model.RetryConfig;
 import ai.aerol.microvm.model.SandboxData;
+import ai.aerol.microvm.model.StatusReason;
 import ai.aerol.microvm.model.SandboxSnapshot;
 import ai.aerol.microvm.model.Session;
 import ai.aerol.microvm.model.SnapshotList;
@@ -1078,6 +1079,38 @@ class MicroVMClientTest {
             assertEquals(List.of("*.github.com"), body.get().get("network_allow_out"));
             assertEquals("api.github.com", body.get().get("destination"));
             assertTrue(!body.get().containsKey("network_block_all"), "unset fields are not sent");
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void getReadsStatusReasonAndExitCode() throws Exception {
+        HttpServer server = startServer(exchange -> {
+            String path = exchange.getRequestURI().getPath();
+            if ("/v1/sandboxes/sb-crash".equals(path)) {
+                writeJson(exchange, 200, mapOf("id", "sb-crash", "image", "alpine", "status", "stopped",
+                    "status_reason", "crashed", "exit_code", 3));
+                return;
+            }
+            if ("/v1/sandboxes/sb-done".equals(path)) {
+                writeJson(exchange, 200, mapOf("id", "sb-done", "image", "alpine", "status", "started",
+                    "status_reason", "program_exited", "exit_code", 0));
+                return;
+            }
+            writeJson(exchange, 200, mapOf("id", "sb-plain", "image", "alpine", "status", "started"));
+        });
+        try {
+            Sandbox crashed = clientFor(server).get("sb-crash");
+            assertEquals(StatusReason.CRASHED, crashed.statusReason);
+            assertEquals(Integer.valueOf(3), crashed.exitCode);
+            Sandbox done = clientFor(server).get("sb-done");
+            assertEquals(StatusReason.PROGRAM_EXITED, done.statusReason);
+            assertEquals(Integer.valueOf(0), done.exitCode, "exit code 0 is a real exit");
+            Sandbox plain = clientFor(server).get("sb-plain");
+            assertNull(plain.statusReason);
+            assertNull(plain.exitCode);
+            assertEquals(Integer.valueOf(3), crashed.toData().exitCode, "copy keeps the exit code");
         } finally {
             server.stop(0);
         }

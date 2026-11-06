@@ -1701,6 +1701,28 @@ test("get maps egress_status for gateway-mode sandboxes", async () => {
   assert.equal(sandbox.egressStatus, "held");
 });
 
+test("get maps status_reason and exit_code, keeping exit code 0", async () => {
+  const rows: Record<string, unknown> = {
+    "sb-crash": { ...apiSandbox("sb-crash"), status: "stopped", status_reason: "crashed", exit_code: 3 },
+    "sb-done": { ...apiSandbox("sb-done"), status_reason: "program_exited", exit_code: 0 },
+    "sb-plain": { ...apiSandbox("sb-plain"), exit_code: null },
+  };
+  const client = new APIClient({
+    baseURL: "https://api.example.com",
+    patToken: "pat-token",
+    fetch: async (input) => jsonResponse(rows[String(input).split("/").pop() as string]),
+  });
+  const crashed = await client.get("sb-crash");
+  assert.equal(crashed.statusReason, "crashed");
+  assert.equal(crashed.exitCode, 3);
+  const done = await client.get("sb-done");
+  assert.equal(done.statusReason, "program_exited");
+  assert.equal(done.exitCode, 0);
+  const plain = await client.get("sb-plain");
+  assert.equal(plain.statusReason, undefined);
+  assert.equal(plain.exitCode, undefined);
+});
+
 test("checkNetworkPolicy posts the policy and maps the answer", async () => {
   let seen: Request | undefined;
   let body: Record<string, unknown> = {};

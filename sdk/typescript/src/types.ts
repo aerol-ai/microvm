@@ -7,6 +7,24 @@ export type SandboxStatus =
   | "passivated"
   | "awaiting_runtime";
 
+/**
+ * Why a sandbox is in its current status. A stopped sandbox says what
+ * stopped it; a started one may say `"program_exited"` (its main program
+ * ended and `lifecycle.destroyAfterExitFor` is counting), `"failover"`
+ * (recreated on another node) or `"restarted"` (by `restartOnFailure`).
+ */
+export type StatusReason =
+  | "user_stop"
+  | "idle"
+  | "max_age"
+  | "out_of_memory"
+  | "disk_limit"
+  | "crashed"
+  | "reconcile"
+  | "program_exited"
+  | "failover"
+  | "restarted";
+
 export type Durability = "ephemeral" | "passivatable" | "durable";
 
 export interface RegistryAuth {
@@ -590,6 +608,10 @@ export interface Sandbox {
   updatedAt: string;
   lastActiveAt: string;
   lastError?: string;
+  /** Why the sandbox is in its status; absent when a call simply created or started it. */
+  statusReason?: StatusReason;
+  /** Exit code behind `out_of_memory`, `crashed`, `program_exited` and `restarted`. */
+  exitCode?: number;
   containerCommand?: string[];
   lifecycle: Lifecycle;
   failover?: Failover;

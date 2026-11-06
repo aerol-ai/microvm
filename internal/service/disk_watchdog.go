@@ -70,7 +70,7 @@ func (s *Service) stopForDiskLimit(ctx context.Context, sb *models.Sandbox, used
 	done := s.beginSystemAction(ctx, sb.ID, systemActionDiskStop)
 	// Manual: never armed for wake, so traffic does not restart a sandbox
 	// that is over its disk.
-	_, err := s.stopSandboxInternal(ctx, sb.ID, stopModeManual)
+	_, err := s.stopSandboxForReason(ctx, sb.ID, stopModeManual, models.StatusReasonDiskLimit)
 	done(err)
 	if err != nil {
 		s.logger.Warn("disk watchdog: stop failed", "sandbox_id", sb.ID, "used_bytes", used, "disk_gb", sb.DiskGB, "error", err)

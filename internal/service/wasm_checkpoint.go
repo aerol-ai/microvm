@@ -366,7 +366,9 @@ func (s *Service) rehydrateWasmIfNeeded(ctx context.Context, sandbox *models.San
 				"sandbox_id", sandbox.ID,
 				"error", err,
 			)
-			_ = s.store.UpdateStatus(ctx, sandbox.ID, models.SandboxStatusStopped, err.Error())
+			// Its saved state is gone: from the caller's side the sandbox
+			// crashed, and last_error says how.
+			_ = s.store.UpdateStatusWithReason(ctx, sandbox.ID, models.SandboxStatusStopped, err.Error(), models.StatusReasonCrashed, nil)
 			return nil, err
 		}
 		return nil, err

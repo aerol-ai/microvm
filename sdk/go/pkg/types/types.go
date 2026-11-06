@@ -114,6 +114,22 @@ type CreateSessionOptions = models.CreateSessionRequest
 type Session = models.Session
 type SessionStatus = models.SessionStatus
 
+// Status reasons say why a sandbox is in its current status
+// (Sandbox.StatusReason). ExitCode is set for out_of_memory, crashed,
+// program_exited and restarted.
+const (
+	StatusReasonUserStop      = models.StatusReasonUserStop
+	StatusReasonIdle          = models.StatusReasonIdle
+	StatusReasonMaxAge        = models.StatusReasonMaxAge
+	StatusReasonOutOfMemory   = models.StatusReasonOutOfMemory
+	StatusReasonDiskLimit     = models.StatusReasonDiskLimit
+	StatusReasonCrashed       = models.StatusReasonCrashed
+	StatusReasonReconcile     = models.StatusReasonReconcile
+	StatusReasonProgramExited = models.StatusReasonProgramExited
+	StatusReasonFailover      = models.StatusReasonFailover
+	StatusReasonRestarted     = models.StatusReasonRestarted
+)
+
 const (
 	SessionStatusRunning = models.SessionStatusRunning
 	SessionStatusExited  = models.SessionStatusExited

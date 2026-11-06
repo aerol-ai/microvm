@@ -39,6 +39,66 @@ const (
 	SandboxStatusPassivateFailed SandboxStatus = "passivate_failed"
 )
 
+// Status reasons say why a sandbox is in its current status
+// (Sandbox.StatusReason). The set is small and fixed on purpose: SDKs switch
+// on it and the lifecycle metrics use it as a label, so a new value is an API
+// change, not a log detail. last_error keeps the free-form detail.
+//
+// Reasons a sandbox is stopped:
+const (
+	// StatusReasonUserStop: a stop call (API, SDK, CLI, a facade, or the
+	// operator's fleet suspend).
+	StatusReasonUserStop = "user_stop"
+	// StatusReasonIdle: stopIfIdleFor, or the server's SB_IDLE_TIMEOUT_MIN.
+	StatusReasonIdle = "idle"
+	// StatusReasonMaxAge: stopAtAge.
+	StatusReasonMaxAge = "max_age"
+	// StatusReasonOutOfMemory: the sandbox's init was killed for using too
+	// much memory. ExitCode is set.
+	StatusReasonOutOfMemory = "out_of_memory"
+	// StatusReasonDiskLimit: the disk watchdog stopped it for writing more
+	// than its disk size.
+	StatusReasonDiskLimit = "disk_limit"
+	// StatusReasonCrashed: the sandbox went down on its own with a non-zero
+	// exit code that nobody asked for. ExitCode is set.
+	StatusReasonCrashed = "crashed"
+	// StatusReasonReconcile: sandboxd found the sandbox stopped when it
+	// checked, without having seen it stop (it was down, or missed the
+	// event), so it cannot say more.
+	StatusReasonReconcile = "reconcile"
+)
+
+// Reasons that also describe a started sandbox:
+const (
+	// StatusReasonProgramExited: the sandbox's main program ended. On a
+	// stopped sandbox, its init exited with code 0 on its own; on a started
+	// one, the program run under toolboxd ended and the sandbox is still up
+	// (lifecycle.destroyAfterExitFor). ExitCode is set.
+	StatusReasonProgramExited = "program_exited"
+	// StatusReasonFailover: the sandbox was recreated on another node after
+	// its owner node failed; its in-memory state did not survive.
+	StatusReasonFailover = "failover"
+	// StatusReasonRestarted: lifecycle.restartOnFailure started the sandbox
+	// again after a crash or an out-of-memory kill. ExitCode is the exit
+	// code of that crash.
+	StatusReasonRestarted = "restarted"
+)
+
+// StatusReasons lists every status reason, in documentation order. Tests and
+// the metrics use it so a reason cannot be added in one place only.
+var StatusReasons = []string{
+	StatusReasonUserStop,
+	StatusReasonIdle,
+	StatusReasonMaxAge,
+	StatusReasonOutOfMemory,
+	StatusReasonDiskLimit,
+	StatusReasonCrashed,
+	StatusReasonProgramExited,
+	StatusReasonReconcile,
+	StatusReasonFailover,
+	StatusReasonRestarted,
+}
+
 type RegistryAuth struct {
 	Server   string `json:"server"`
 	Username string `json:"username"`
@@ -836,9 +896,17 @@ type Sandbox struct {
 	UpdatedAt          time.Time     `json:"updated_at"`
 	LastActiveAt       time.Time     `json:"last_active_at"`
 	LastError          string        `json:"last_error,omitempty"`
-	ContainerCommand   []string      `json:"container_command,omitempty"`
-	Lifecycle          Lifecycle     `json:"lifecycle"`
-	Failover           *Failover     `json:"failover,omitempty"`
+	// StatusReason says why the sandbox is in its current status, one of the
+	// StatusReason* values. Empty when a call simply created or started it.
+	// The store writes it only with a status change (or through a targeted
+	// update), so a whole-row write from an older read cannot undo it.
+	StatusReason string `json:"status_reason,omitempty"`
+	// ExitCode is the exit code behind out_of_memory, crashed,
+	// program_exited and restarted; nil for every other reason.
+	ExitCode         *int      `json:"exit_code,omitempty"`
+	ContainerCommand []string  `json:"container_command,omitempty"`
+	Lifecycle        Lifecycle `json:"lifecycle"`
+	Failover         *Failover `json:"failover,omitempty"`
 	// FailoverReady is set on Get/List when failover.policy=recreate: true iff
 	// the secret holder count meets HA (owner + ≥1 backup) or the recipient
 	// set is single-node (len≤1). Omitted for non-recreate sandboxes.
