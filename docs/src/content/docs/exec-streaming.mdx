@@ -713,7 +713,7 @@ Two settings limit how much output `exec` returns, for every caller. Both are of
 | `SB_EXEC_OUTPUT_DEFAULT_BYTES` | The limit for each stream when a call sets none. |
 | `SB_EXEC_OUTPUT_MAX_BYTES` | The largest limit a call may ask for. A larger one, or none, is lowered to it. |
 
-The server applies them before the command reaches the sandbox, so they work on every runtime and on sandboxes that are already running. They cover `exec` from the AerolVM SDKs and the Daytona SDK's `process.executeCommand`, not `execStream` or sessions. A sandbox started before the limits existed ignores them. In a cluster, set the same values on every node. With a maximum set, an `exec` request bigger than 8 MiB is refused with HTTP 413. Linux limits a command and its variables to a few MiB, so no real command is that big.
+The server applies them before the command reaches the sandbox, so they work on Docker, gVisor and Firecracker sandboxes, including ones that are already running. WASM and V8 isolate sandboxes do not cap exec output yet. They cover `exec` from the AerolVM SDKs and the Daytona SDK's `process.executeCommand`, not `execStream` or sessions. A sandbox started before the limits existed ignores them. In a cluster, set the same values on every node. With a maximum set, an `exec` request bigger than 8 MiB is refused with HTTP 413. Linux limits a command and its variables to a few MiB, so no real command is that big.
 
 ## Next steps
 

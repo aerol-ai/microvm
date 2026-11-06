@@ -24,6 +24,11 @@ type WatchHandle struct {
 // an *APIError with status 501. A sandbox whose agent predates file watching
 // answers an *UnsupportedFeatureError (errors.Is(err, ErrUnsupportedFeature)).
 // The request is not retried: a watch is a stream.
+//
+// ctx bounds the whole watch, not only the call that arms it: cancelling it
+// (or its deadline passing) ends the stream, as Stop on the handle does. To
+// arm with a time limit and then watch for longer, pass a ctx without a
+// deadline and stop the watch through the handle.
 func (c *Client) WatchFiles(ctx context.Context, id, path string, options sdktypes.WatchOptions) (*WatchHandle, error) {
 	handle, err := c.inner.WatchFiles(ctx, id, path, options)
 	if err != nil {

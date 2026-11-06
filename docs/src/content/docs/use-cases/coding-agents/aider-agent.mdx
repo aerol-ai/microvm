@@ -324,21 +324,21 @@ This checks the session every 10 seconds until Aider exits, then prints what it 
 
 ## Step 5: Download the change and clean up
 
-This collects every change in the repository as a patch, downloads it, and deletes the sandbox.
+This collects every change in the repository as a patch, downloads it, and deletes the sandbox. Aider keeps its chat history and caches in `.aider*` files in the repository, and `--no-gitignore` stops it from hiding them, so the patch leaves them out.
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
     ```ts
     import { writeFile } from "node:fs/promises";
 
-    await sandbox.exec("cd /workspace/repo && git add -A && git diff --cached > /tmp/agent.patch");
+    await sandbox.exec("cd /workspace/repo && git add -A -- . ':(exclude).aider*' && git diff --cached > /tmp/agent.patch");
     await writeFile("agent.patch", await sandbox.downloadFile("/tmp/agent.patch"));
     await sandbox.destroy();
     ```
   </TabItem>
   <TabItem label="Python">
     ```python
-    sandbox.exec("cd /workspace/repo && git add -A && git diff --cached > /tmp/agent.patch")
+    sandbox.exec("cd /workspace/repo && git add -A -- . ':(exclude).aider*' && git diff --cached > /tmp/agent.patch")
     with open("agent.patch", "wb") as f:
         f.write(sandbox.download_file("/tmp/agent.patch"))
     sandbox.destroy()
@@ -346,7 +346,7 @@ This collects every change in the repository as a patch, downloads it, and delet
   </TabItem>
   <TabItem label="Go">
     ```go
-    if _, err := sandbox.ExecCommand(ctx, "cd /workspace/repo && git add -A && git diff --cached > /tmp/agent.patch"); err != nil {
+    if _, err := sandbox.ExecCommand(ctx, "cd /workspace/repo && git add -A -- . ':(exclude).aider*' && git diff --cached > /tmp/agent.patch"); err != nil {
         log.Fatal(err)
     }
     patch, err := sandbox.DownloadFile(ctx, "/tmp/agent.patch")
@@ -363,7 +363,7 @@ This collects every change in the repository as a patch, downloads it, and delet
   </TabItem>
   <TabItem label="Rust">
     ```rust
-    sandbox.exec("cd /workspace/repo && git add -A && git diff --cached > /tmp/agent.patch")?;
+    sandbox.exec("cd /workspace/repo && git add -A -- . ':(exclude).aider*' && git diff --cached > /tmp/agent.patch")?;
     let patch = sandbox.download_file("/tmp/agent.patch")?;
     std::fs::write("agent.patch", patch).expect("write agent.patch");
     sandbox.destroy()?;
@@ -371,7 +371,7 @@ This collects every change in the repository as a patch, downloads it, and delet
   </TabItem>
   <TabItem label="Java">
     ```java
-    sandbox.exec("cd /workspace/repo && git add -A && git diff --cached > /tmp/agent.patch");
+    sandbox.exec("cd /workspace/repo && git add -A -- . ':(exclude).aider*' && git diff --cached > /tmp/agent.patch");
     Files.write(Path.of("agent.patch"), sandbox.downloadFile("/tmp/agent.patch"));
     sandbox.destroy();
     ```

@@ -386,7 +386,8 @@ class MicroVMTimeoutError(MicroVMHTTPError, TimeoutError):
     """The call ran out of time: HTTP 408 or 504 (the server, or a proxy in
     front of it, gave up waiting), or the call's own ``timeout`` passed, in
     which case ``status_code`` is 0. It is also a builtin
-    :class:`TimeoutError`, so ``except TimeoutError`` catches it."""
+    :class:`TimeoutError`, so ``except TimeoutError`` catches it, and so
+    is ``except OSError``: that catches a 408 or 504 answer too."""
 
 
 class MicroVMAuthError(MicroVMHTTPError):
@@ -3333,7 +3334,18 @@ def _connect_websocket(
 # Headers the SDK sets itself. A caller's header of the same name would be
 # overwritten on HTTP but sent twice on a WebSocket handshake, so it is
 # refused up front instead.
-_RESERVED_HEADERS = frozenset({"authorization", TEAM_HEADER.lower(), "content-type", IDEMPOTENCY_KEY_HEADER.lower()})
+# Host, Content-Length and Transfer-Encoding are set by the HTTP layer from
+# the URL and the body; a caller's value would send a request the server
+# reads wrongly, so they are refused like the SDK's own headers.
+_RESERVED_HEADERS = frozenset({
+    "authorization",
+    TEAM_HEADER.lower(),
+    "content-type",
+    IDEMPOTENCY_KEY_HEADER.lower(),
+    "host",
+    "content-length",
+    "transfer-encoding",
+})
 
 
 def _checked_headers(headers: Optional[Dict[str, str]]) -> Dict[str, str]:

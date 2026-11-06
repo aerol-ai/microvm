@@ -195,7 +195,7 @@ Some company networks put a proxy between your code and the server. The proxy ma
 | Rust | Add the CA to the system's list | Not yet | Not yet |
 | Java | `setHttpClient` with an `SSLContext` | `setHttpClient` with an `SSLContext` | Not yet |
 
-In Python, `ca_file` replaces the system's CA list for this client, like `verify=` does in the `requests` library. `client_cert` takes one PEM file that holds the certificate and its key, or a pair of files `(cert_file, key_file)`. `headers` go on every request and on every live stream. They cannot replace the headers the SDK sets itself, such as `Authorization`. A file that cannot be read fails when you make the client, not on the first call.
+In Python, `ca_file` replaces the system's CA list for this client, like `verify=` does in the `requests` library. `client_cert` takes one PEM file that holds the certificate and its key, or a pair of files `(cert_file, key_file)`. `headers` go on every request and on every live stream. They cannot replace the headers the SDK or HTTP sets itself: `Authorization`, the team header, `Content-Type`, `Idempotency-Key`, `Host`, `Content-Length` and `Transfer-Encoding`. A file that cannot be read fails when you make the client, not on the first call.
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">

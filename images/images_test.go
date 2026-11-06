@@ -50,7 +50,10 @@ func parseDockerfile(t *testing.T, path string) []instruction {
 	return out
 }
 
-var versionedTag = regexp.MustCompile(`^[^:@\s]+(:[^\s]*\d[^\s]*|@sha256:[0-9a-f]{64})$`)
+// versionedTag accepts a digest, or a tag with at least major.minor: a tag
+// like "python:3" or "debian:12" moves with every minor release, so it is
+// not a pin.
+var versionedTag = regexp.MustCompile(`^[^:@\s]+(:[^\s]*\d+\.\d+[^\s]*|@sha256:[0-9a-f]{64})$`)
 
 // TestImagesBuildFromTheDockerfileAlone holds every ready-made image to
 // what its docs promise: the SDK image builder sends only the Dockerfile,
@@ -122,6 +125,10 @@ func TestParseDockerfileJoinsContinuations(t *testing.T) {
 		{"debian@sha256:" + strings.Repeat("a", 64), true},
 		{"python:latest", false},
 		{"ubuntu", false},
+		{"python:3", false},
+		{"debian:12", false},
+		{"node:22-bookworm", false},
+		{"ubuntu:24.04", true},
 	} {
 		if got := versionedTag.MatchString(tc.ref); got != tc.want {
 			t.Errorf("versionedTag(%q) = %v, want %v", tc.ref, got, tc.want)

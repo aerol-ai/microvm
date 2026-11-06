@@ -87,6 +87,7 @@ jobs:
               - 'cmd/**'
               - 'internal/**'
               - 'pkg/**'
+              - 'images/**'
               - 'go.mod'
               - 'go.sum'
               - 'integration-tests/suite/harness/**'
@@ -143,7 +144,7 @@ jobs:
 
       - name: Run unit tests with coverage
         run: |
-          AEROLVM_SCALE_GATES=1 go test -count=1 -timeout 20m -coverprofile=coverage.out ./cmd/... ./internal/... ./pkg/...
+          AEROLVM_SCALE_GATES=1 go test -count=1 -timeout 20m -coverprofile=coverage.out ./cmd/... ./internal/... ./pkg/... ./images/...
           go tool cover -func=coverage.out | tail -n 1
 
       - name: Upload coverage artifact
@@ -243,7 +244,7 @@ jobs:
           cache: true
 
       - name: Vet production packages
-        run: go vet ./cmd/... ./internal/... ./pkg/...
+        run: go vet ./cmd/... ./internal/... ./pkg/... ./images/...
 
       - name: Scan reachable Go vulnerabilities
         run: go run golang.org/x/vuln/cmd/govulncheck@v1.6.0 ./...
