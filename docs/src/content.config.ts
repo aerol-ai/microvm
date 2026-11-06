@@ -100,6 +100,14 @@ const getDocsSidebarConfig = (): NavigationGroup[] => [
       
     ],
   },
+  {
+    type: 'group',
+    label: 'Ready-made Images',
+    category: NavigationCategory.SANDBOXES,
+    entries: [
+      link('/computer-use', '- Computer use and browser'),
+    ],
+  },
   
   {
     type: 'group',

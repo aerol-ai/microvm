@@ -12,6 +12,8 @@ import (
 	"context"
 	"io"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -209,5 +211,98 @@ func TestParityMCPServerAsSession(t *testing.T) {
 	both := map[string]string{"Authorization": "Bearer " + key, "Cookie": "__Host-aerolvm-token=" + tok.Token}
 	if st, got := recipesHTTP(t, http.MethodPost, mcpURL, mcpHeaders(both), mcpInitialize); st != http.StatusOK || !strings.Contains(got, `"serverInfo"`) {
 		t.Fatalf("initialize with the key and the token cookie = %d %s", st, got)
+	}
+}
+
+// repoDockerfile reads images/<name>/Dockerfile from this checkout, so the
+// live check builds exactly the file the docs tell readers to build. The
+// suite runs from integration-tests/suite.
+func repoDockerfile(t *testing.T, name string) *microvm.Image {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join("..", "..", "images", name, "Dockerfile"))
+	if err != nil {
+		t.Fatalf("read images/%s/Dockerfile: %v", name, err)
+	}
+	img := microvm.FromDockerfile(string(data))
+	if err := img.Err(); err != nil {
+		t.Fatalf("images/%s/Dockerfile: %v", name, err)
+	}
+	return img
+}
+
+// recipesImageSandbox builds a repo image on the server with the SDK's
+// image builder and creates a sandbox from it, as the docs do. Builds of
+// these images download hundreds of MB, so the deadline is generous.
+func recipesImageSandbox(t *testing.T, ctx context.Context, name string, opts sdktypes.CreateSandboxOptions) *microvm.Sandbox {
+	t.Helper()
+	c := client(t)
+	opts.Name = harness.UniqueName(sc, t)
+	sb, err := c.SDK().CreateWithImage(ctx, repoDockerfile(t, name), opts)
+	if err != nil {
+		t.Fatalf("build images/%s and create from it: %v", name, err)
+	}
+	t.Cleanup(func() {
+		cctx, ccancel := context.WithTimeout(context.Background(), time.Minute)
+		defer ccancel()
+		_ = c.SDK().Destroy(cctx, sb.ID)
+	})
+	waitRunning(t, sb)
+	return sb
+}
+
+// recipesExecOut runs a command and returns its trimmed stdout, failing on
+// a transport error only (callers poll on the output).
+func recipesExecOut(t *testing.T, ctx context.Context, sb *microvm.Sandbox, command string) string {
+	t.Helper()
+	res, err := sb.Exec(ctx, sdktypes.ExecRequest{Command: command, TimeoutSeconds: 120})
+	if err != nil {
+		t.Fatalf("exec %q: %v", command, err)
+	}
+	return strings.TrimSpace(res.Stdout + res.Stderr)
+}
+
+// UC-464 — the computer-use image (plan G8): images/computer-use/Dockerfile
+// builds on the server through the SDK's image builder; in a sandbox from
+// it, Chrome's DevTools answers on 127.0.0.1:9222, noVNC serves on 6080, and
+// the docs' Playwright script drives the browser over CDP and writes a PNG.
+func TestParityComputerUseImage(t *testing.T) {
+	harness.Require(t, sc, "UC-464")
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+	defer cancel()
+	sb := recipesImageSandbox(t, ctx, "computer-use", sdktypes.CreateSandboxOptions{CPU: 2, MemoryMB: 2048})
+
+	recipesPoll(t, "DevTools on 9222", 2*time.Minute, func() (bool, string) {
+		out := recipesExecOut(t, ctx, sb, "curl -s http://127.0.0.1:9222/json/version")
+		return strings.Contains(out, "webSocketDebuggerUrl") && strings.Contains(out, "Chrome/"), out
+	})
+	if out := recipesExecOut(t, ctx, sb, "curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:6080/vnc.html"); out != "200" {
+		t.Fatalf("noVNC on 6080 = %q, want 200", out)
+	}
+	if out := recipesExecOut(t, ctx, sb, "id -u"); out != "1000" {
+		t.Fatalf("commands run as uid %q, want the image's non-root user 1000", out)
+	}
+
+	script := `from playwright.sync_api import sync_playwright
+
+with sync_playwright() as p:
+    browser = p.chromium.connect_over_cdp("http://127.0.0.1:9222")
+    page = browser.contexts[0].new_page()
+    page.set_content("<h1>uc464 from AerolVM</h1>")
+    print(page.inner_text("h1"))
+    page.screenshot(path="/tmp/uc464.png")
+    page.close()
+`
+	if err := sb.UploadFile(ctx, "/tmp/uc464.py", []byte(script)); err != nil {
+		t.Fatalf("upload the Playwright script: %v", err)
+	}
+	if out := recipesExecOut(t, ctx, sb, "python3 /tmp/uc464.py"); !strings.Contains(out, "uc464 from AerolVM") {
+		t.Fatalf("Playwright over CDP printed %q", out)
+	}
+	png, err := sb.DownloadFile(ctx, "/tmp/uc464.png")
+	if err != nil {
+		t.Fatalf("download the screenshot: %v", err)
+	}
+	if !bytes.HasPrefix(png, []byte("\x89PNG\r\n\x1a\n")) {
+		t.Fatalf("screenshot is not a PNG (%d bytes)", len(png))
 	}
 }
