@@ -97,6 +97,7 @@ We checked both examples with E2B SDK 2.50.0. With no template, the E2B SDK asks
 | Commands: run, run in the background, list, send input, kill, reconnect | Works. |
 | Terminals (`sandbox.pty`) | Works. |
 | Files: read, write, list, get info, make a folder, rename, remove | Works. |
+| Watching a folder (`files.watchDir`) | Works on gVisor and Firecracker sandboxes only. Other runtimes refuse it (HTTP 501); [File watching](/file-watching/#which-sandboxes-can-watch) says why. E2B has no "events were lost" event, so a watch that loses events ends with an error instead (`resource_exhausted`); watch the folder again and list it to catch up. |
 
 ### Snapshots and templates
 
@@ -113,7 +114,6 @@ We checked both examples with E2B SDK 2.50.0. With no template, the E2B SDK asks
 | Building templates (E2B's template build tools) | Not supported. Use a container image or an AerolVM [snapshot](/images-and-snapshots/#snapshots) as the template. |
 | `network.rules` (changing requests on the way out) | Refused (HTTP 501). AerolVM has its own [rules and inspection](/advanced-network-rules/#allow-only-some-requests). |
 | `network.egressProxy` | Refused (HTTP 501). |
-| Watching a folder (`files.watchDir`) | Not supported yet (HTTP 501). When file watching ships, it will work on gVisor and Firecracker sandboxes only. |
 | Starting MCP servers inside the sandbox (the `mcp` create option) | Refused (HTTP 501). |
 | Public addresses for a port (`getHost`) | Not supported: AerolVM does not serve the addresses the SDK builds. To share a port, use the AerolVM SDK's `exposePort`; see [Public URLs](/public-urls/). |
 | Traffic access tokens, metrics and logs | Not supported. |

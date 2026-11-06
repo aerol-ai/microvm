@@ -89,6 +89,7 @@ const getDocsSidebarConfig = (): NavigationGroup[] => [
       link('/durability', '- Durability and failover'),
       link('/exec-streaming', '- Run commands'),
       link('/file-system', '- Handle Files'),
+      link('/file-watching', '- Watch files'),
       link('/sessions', '- Terminal sessions'),
       link('/sandbox-tags', '- Tags'),
       link('/ssh-access', '- SSH access'),
