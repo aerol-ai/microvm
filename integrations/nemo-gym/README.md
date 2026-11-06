@@ -49,10 +49,11 @@ Config keys under `sandbox: aerolvm:`:
 | `status` | `get`, mapped to NeMo Gym's statuses (a missing sandbox is `stopped`) |
 | `close` | `destroy` (a sandbox that is already gone is fine) |
 
-Why not NeMo Gym's Daytona provider against AerolVM's Daytona layer? With
-the Daytona Python SDK that provider uses, sandbox create and file download
-fail there today. The docs page "NVIDIA NeMo Gym" lists every call and what
-happens.
+NeMo Gym's own Daytona provider also works against AerolVM's Daytona layer
+(set `DAYTONA_API_URL` to your server's address plus `/daytona`). This
+provider adds AerolVM's own features: tags, `ttl_s` as a self-delete age,
+and any create option such as the runtime. The docs page "NVIDIA NeMo Gym"
+compares the two.
 
 ## Limits
 

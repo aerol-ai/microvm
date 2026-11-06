@@ -429,7 +429,7 @@ func TestIdentityFacadesWithTeamToken(t *testing.T) {
 		made = append(made, created{"e2b", r.SandboxID})
 	}
 	if st, body := fcDo(t, ctx, http.MethodPost, "", "/daytona/sandbox", map[string]any{"snapshot": harness.DefaultImage},
-		map[string]string{"Authorization": "Bearer " + payments.Secret}); st != http.StatusCreated {
+		map[string]string{"Authorization": "Bearer " + payments.Secret}); st != http.StatusOK {
 		t.Errorf("Daytona create with a team token = %d %s", st, body)
 	} else {
 		var r idResponse

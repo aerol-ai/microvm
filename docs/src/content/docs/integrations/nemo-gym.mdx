@@ -71,19 +71,23 @@ The agent's config does not change.
 
 `create_options` takes any other create fields for every sandbox, for example `runtime: firecracker`, `networkBlockAll: true`, or a [lifecycle](/lifecycle/).
 
-## Why not NeMo Gym's Daytona provider?
+## Or use NeMo Gym's Daytona provider
 
-NeMo Gym also ships a provider for Daytona, and AerolVM [serves Daytona's API](/using-daytona-sdk/). We tested every Daytona call that provider makes against AerolVM. Most work, but two do not, and NeMo Gym needs both:
+NeMo Gym also ships a provider for Daytona, and AerolVM [serves Daytona's API](/using-daytona-sdk/). That works too. We tested every Daytona call the provider makes (create, get, status, commands with a folder, variables and a time limit, file upload and download, and delete) with the Daytona Python SDK 0.179.0 and 0.230.0.
 
-| Daytona call | Through AerolVM's Daytona layer |
-| --- | --- |
-| Get a sandbox, check its status, delete it | Works |
-| Run a command with a folder, variables and a time limit | Works |
-| Upload a file | Works |
-| Create a sandbox | Fails with the Daytona Python SDK, which NeMo Gym uses |
-| Download a file | Fails |
+Keep NeMo Gym's own `daytona.yaml`, and point the Daytona SDK at `/daytona` on your server:
 
-So use the `aerolvm` provider. It talks to AerolVM directly and avoids both calls.
+```bash
+export DAYTONA_API_KEY=$SB_PAT_TOKEN
+export DAYTONA_API_URL=$SB_API_URL/daytona
+
+gym env start \
+    --config responses_api_agents/mini_swe_agent_2/configs/mini_swe_agent_2.yaml \
+    --config nemo_gym/sandbox/providers/daytona/configs/daytona.yaml \
+    --config responses_api_models/vllm_model/configs/vllm_model.yaml
+```
+
+Pick the `aerolvm` provider when you want AerolVM's own features: tags on every sandbox, sandboxes that delete themselves at `ttl_s`, and `create_options` such as `runtime: firecracker`. Pick the Daytona provider when you already run NeMo Gym against Daytona and want to change only the address.
 
 ## Limits
 

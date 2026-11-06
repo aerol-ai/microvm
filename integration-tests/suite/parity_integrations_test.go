@@ -10,9 +10,13 @@ package suite
 // of the packages fails here.
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
+	"mime"
+	"mime/multipart"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -264,11 +268,11 @@ func TestParityGymnasiumEpisodes(t *testing.T) {
 // UC-460 — NVIDIA NeMo Gym through the Daytona facade (G5). NeMo Gym's
 // Daytona provider creates a sandbox with a name, labels, env and its
 // auto-stop and auto-delete intervals, reads it, runs commands with a
-// working folder, extra variables and a timeout, and deletes it. This sends
-// those calls with the Daytona Python SDK's field names. The SDK's create
-// and file download do not work through the facade today (see the docs
-// page integrations/nemo-gym); the provider in integrations/nemo-gym avoids
-// them, and the rest of the call set is pinned here.
+// working folder, extra variables and a timeout, downloads files, and
+// deletes it. This sends those calls with the Daytona Python SDK's field
+// names, and pins the three details that SDK needs: create answers 200
+// (it reads no body from a 201), the sandbox carries "kvm", and each
+// bulk-download part (error parts too) is named by the full requested path.
 func TestParityNeMoGymDaytonaCalls(t *testing.T) {
 	harness.Require(t, sc, "UC-460")
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
@@ -283,15 +287,19 @@ func TestParityNeMoGymDaytonaCalls(t *testing.T) {
 		"autoDeleteInterval": 600,
 		"buildInfo":          map[string]string{"dockerfileContent": "FROM " + harness.DefaultImage + "\n"},
 	}, nil)
-	if st/100 != 2 {
-		t.Fatalf("create = %d %s", st, body)
+	if st != http.StatusOK {
+		t.Fatalf("create = %d %s; the Daytona Python SDK reads a sandbox only from a 200", st, body)
 	}
 	var created struct {
 		ID    string `json:"id"`
 		State string `json:"state"`
+		Kvm   *bool  `json:"kvm"`
 	}
 	if err := json.Unmarshal(body, &created); err != nil || created.ID == "" {
 		t.Fatalf("create body %s: %v", body, err)
+	}
+	if created.Kvm == nil {
+		t.Fatalf("create body has no kvm field; Daytona Python SDK 0.230+ rejects that sandbox: %s", body)
 	}
 	t.Cleanup(func() {
 		cctx, ccancel := context.WithTimeout(context.Background(), time.Minute)
@@ -331,6 +339,27 @@ func TestParityNeMoGymDaytonaCalls(t *testing.T) {
 		t.Fatalf("process/execute = exit %d result %q; want exit 3 and the create env, the call env and the cwd", exec.ExitCode, exec.Result)
 	}
 
+	// fs.download_file: NeMo Gym reads its reward files back this way.
+	st, body = daytonaToolbox(t, ctx, http.MethodPost, created.ID, "/process/execute", nil, map[string]any{
+		"command": "mkdir -p /tmp/uc460 && printf reward=1 > /tmp/uc460/out.txt",
+	})
+	if st != http.StatusOK {
+		t.Fatalf("write the file = %d %s", st, body)
+	}
+	st, body = daytonaToolbox(t, ctx, http.MethodPost, created.ID, "/files/bulk-download", nil, map[string]any{
+		"paths": []string{"/tmp/uc460/out.txt", "/tmp/uc460/none.txt"},
+	})
+	if st != http.StatusOK {
+		t.Fatalf("files/bulk-download = %d %s", st, body)
+	}
+	parts := daytonaDownloadParts(t, body)
+	if got := parts["file:/tmp/uc460/out.txt"]; got != "reward=1" {
+		t.Fatalf("bulk-download parts %v: want a file part named /tmp/uc460/out.txt holding reward=1", parts)
+	}
+	if got, ok := parts["error:/tmp/uc460/none.txt"]; !ok || !strings.Contains(got, `"statusCode":404`) {
+		t.Fatalf("bulk-download parts %v: want an error part named /tmp/uc460/none.txt with statusCode 404", parts)
+	}
+
 	if st, body = fcDo(t, ctx, http.MethodDelete, "", "/daytona/sandbox/"+created.ID, nil, nil); st/100 != 2 {
 		t.Fatalf("delete = %d %s", st, body)
 	}
@@ -343,5 +372,35 @@ func TestParityNeMoGymDaytonaCalls(t *testing.T) {
 			t.Fatalf("sandbox %s still answers %d a minute after delete", created.ID, st)
 		}
 		time.Sleep(2 * time.Second)
+	}
+}
+
+// daytonaDownloadParts reads a Daytona bulk-download answer into
+// "<form name>:<filename>" -> body. The suite's request helper drops the
+// response headers, so the boundary comes from the body's first line.
+func daytonaDownloadParts(t *testing.T, body []byte) map[string]string {
+	t.Helper()
+	first, _, _ := bytes.Cut(body, []byte("\r\n"))
+	boundary := strings.TrimPrefix(string(first), "--")
+	if boundary == string(first) || boundary == "" {
+		t.Fatalf("bulk-download body is not multipart: %.200s", body)
+	}
+	parts := map[string]string{}
+	reader := multipart.NewReader(bytes.NewReader(body), boundary)
+	for {
+		part, err := reader.NextPart()
+		if err == io.EOF {
+			return parts
+		}
+		if err != nil {
+			t.Fatalf("read bulk-download part: %v", err)
+		}
+		// part.FileName() drops the folders; the SDKs need the full path.
+		_, params, err := mime.ParseMediaType(part.Header.Get("Content-Disposition"))
+		if err != nil {
+			t.Fatalf("part Content-Disposition %q: %v", part.Header.Get("Content-Disposition"), err)
+		}
+		data, _ := io.ReadAll(part)
+		parts[params["name"]+":"+params["filename"]] = string(data)
 	}
 }

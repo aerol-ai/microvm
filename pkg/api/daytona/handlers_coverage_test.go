@@ -743,7 +743,7 @@ func TestCreateSandboxImageRollbackOnCreateFailureCoverage95(t *testing.T) {
 	rr := httptest.NewRecorder()
 	mux.ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/daytona/sandbox",
 		strings.NewReader(`{"name":"rollback-img","buildInfo":{"dockerfileContent":"FROM alpine\nRUN echo hi"}}`)))
-	if rr.Code == http.StatusCreated {
+	if rr.Code == http.StatusOK {
 		t.Fatal("expected create failure")
 	}
 	if !b.buildsCalled || len(b.removed) != 0 {

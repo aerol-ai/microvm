@@ -19,8 +19,8 @@ func TestDaytonaCreateLive(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 	st, body := fcDo(t, ctx, http.MethodPost, "", "/daytona/sandbox", map[string]any{"snapshot": "alpine:3.20"}, nil)
-	if st != http.StatusCreated {
-		t.Fatalf("Daytona create = %d, want 201; body=%s", st, string(body))
+	if st != http.StatusOK {
+		t.Fatalf("Daytona create = %d, want 200 (Daytona's API answers 200); body=%s", st, string(body))
 	}
 	var r idResponse
 	fcDecode(t, body, &r)
@@ -56,8 +56,8 @@ func TestDaytonaCreateClusterPlaced(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 	st, body := fcDo(t, ctx, http.MethodPost, "", "/daytona/sandbox", map[string]any{"snapshot": "alpine:3.20"}, nil)
-	if st != http.StatusCreated {
-		t.Fatalf("Daytona cluster create = %d, want 201; body=%s", st, string(body))
+	if st != http.StatusOK {
+		t.Fatalf("Daytona cluster create = %d, want 200; body=%s", st, string(body))
 	}
 	var r idResponse
 	fcDecode(t, body, &r)

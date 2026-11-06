@@ -22,7 +22,7 @@ func daytonaCreateWithKey(t *testing.T, h *handlers, key string) (sandboxRespons
 	}
 	h.createSandbox(rr, req)
 	var resp sandboxResponse
-	if rr.Code == http.StatusCreated {
+	if rr.Code == http.StatusOK {
 		if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
 			t.Fatalf("decode create response: %v; body=%s", err, rr.Body.String())
 		}
@@ -48,16 +48,16 @@ func TestDaytonaCreateSandbox_IdempotencyKeyReplays(t *testing.T) {
 	h := &handlers{deps: Deps{Service: env.service, Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}}
 
 	first, code := daytonaCreateWithKey(t, h, "key-abc")
-	if code != http.StatusCreated {
-		t.Fatalf("first create status = %d, want 201", code)
+	if code != http.StatusOK {
+		t.Fatalf("first create status = %d, want 200", code)
 	}
 	if n := countSandboxes(t, env); n != 1 {
 		t.Fatalf("after first create, sandbox count = %d, want 1", n)
 	}
 
 	second, code := daytonaCreateWithKey(t, h, "key-abc")
-	if code != http.StatusCreated {
-		t.Fatalf("replay status = %d, want 201", code)
+	if code != http.StatusOK {
+		t.Fatalf("replay status = %d, want 200", code)
 	}
 	if n := countSandboxes(t, env); n != 1 {
 		t.Fatalf("after replay, sandbox count = %d, want 1 (replay must not build a second sandbox)", n)

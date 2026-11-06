@@ -54,14 +54,14 @@ func TestDaytonaConcurrentKeyedRetries(t *testing.T) {
 
 	var created sandboxResponse
 	rr := <-first
-	if rr.Code != http.StatusCreated || json.Unmarshal(rr.Body.Bytes(), &created) != nil || created.ID == "" {
+	if rr.Code != http.StatusOK || json.Unmarshal(rr.Body.Bytes(), &created) != nil || created.ID == "" {
 		t.Fatalf("first create = %d %s", rr.Code, rr.Body.String())
 	}
 	for range retries {
 		rr := <-retried
 		var again sandboxResponse
 		_ = json.Unmarshal(rr.Body.Bytes(), &again)
-		if rr.Code != http.StatusCreated || again.ID != created.ID {
+		if rr.Code != http.StatusOK || again.ID != created.ID {
 			t.Fatalf("retry = %d %s; want a replay of %s", rr.Code, rr.Body.String(), created.ID)
 		}
 	}

@@ -1,10 +1,10 @@
 """NeMo Gym sandbox provider backed by AerolVM.
 
-NeMo Gym's built-in Daytona provider can not run against AerolVM's Daytona
-layer today: with the Daytona Python SDK, every create and every file
-download fails there (see the docs page "NVIDIA NeMo Gym"). This provider
-talks to AerolVM with its own Python SDK instead. NeMo Gym finds it through
-the ``nemo_gym.sandbox_providers`` entry point, under the name ``aerolvm``.
+NeMo Gym's own Daytona provider also works against AerolVM's Daytona layer.
+This provider talks to AerolVM with its own Python SDK instead, for
+AerolVM's own create options (tags, a self-delete age, the runtime; see the
+docs page "NVIDIA NeMo Gym"). NeMo Gym finds it through the
+``nemo_gym.sandbox_providers`` entry point, under the name ``aerolvm``.
 
 The AerolVM SDK is synchronous; every call runs in a worker thread, so a
 long command never blocks NeMo Gym's event loop.

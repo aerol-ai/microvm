@@ -123,7 +123,7 @@ func TestDaytonaVolumeHandlersCRUD(t *testing.T) {
 	createRR := httptest.NewRecorder()
 	handler.ServeHTTP(createRR, httptest.NewRequest(http.MethodPost, "/daytona/volumes",
 		strings.NewReader(`{"name":"project-data"}`)))
-	if createRR.Code != http.StatusCreated {
+	if createRR.Code != http.StatusOK {
 		t.Fatalf("create status = %d, body=%s", createRR.Code, createRR.Body.String())
 	}
 	var created volumeResponse

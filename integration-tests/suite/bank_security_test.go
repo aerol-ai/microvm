@@ -1892,9 +1892,11 @@ func TestBankIdempotencyKeyReuseRefused(t *testing.T) {
 
 	for _, surface := range []struct {
 		name, path, imageField string
+		created                int
 	}{
-		{name: "v1", path: "/v1/sandboxes", imageField: "image"},
-		{name: "daytona", path: "/daytona/sandbox", imageField: "snapshot"},
+		{name: "v1", path: "/v1/sandboxes", imageField: "image", created: http.StatusCreated},
+		// Daytona's create answers 200, as Daytona's own API does.
+		{name: "daytona", path: "/daytona/sandbox", imageField: "snapshot", created: http.StatusOK},
 	} {
 		t.Run(surface.name, func(t *testing.T) {
 			key := "uc365-" + surface.name + "-" + harness.UniqueName(sc, t)
@@ -1905,8 +1907,8 @@ func TestBankIdempotencyKeyReuseRefused(t *testing.T) {
 			}
 
 			st, b := fcDo(t, ctx, http.MethodPost, "", surface.path, body(oldSecret), hdr)
-			if st != http.StatusCreated {
-				t.Fatalf("first create = %d; body=%s", st, b)
+			if st != surface.created {
+				t.Fatalf("first create = %d, want %d; body=%s", st, surface.created, b)
 			}
 			var first idResponse
 			fcDecode(t, b, &first)
@@ -1914,11 +1916,11 @@ func TestBankIdempotencyKeyReuseRefused(t *testing.T) {
 
 			st, b = fcDo(t, ctx, http.MethodPost, "", surface.path, body(oldSecret), hdr)
 			var replay idResponse
-			if st == http.StatusCreated {
+			if st == surface.created {
 				fcDecode(t, b, &replay)
 			}
-			if st != http.StatusCreated || replay.ID != first.ID {
-				t.Fatalf("retry with the same request = %d %s; want 201 and %s", st, b, first.ID)
+			if st != surface.created || replay.ID != first.ID {
+				t.Fatalf("retry with the same request = %d %s; want %d and %s", st, b, surface.created, first.ID)
 			}
 
 			st, b = fcDo(t, ctx, http.MethodPost, "", surface.path, body(newSecret), hdr)

@@ -91,16 +91,16 @@ func TestDaytonaCreateIdempotencyKeyReplays(t *testing.T) {
 	body := map[string]any{"snapshot": "alpine:3.20"}
 
 	st1, b1 := fcDo(t, ctx, http.MethodPost, "", "/daytona/sandbox", body, hdr)
-	if st1 != http.StatusCreated {
-		t.Fatalf("first Daytona create status = %d, want 201; body=%s", st1, string(b1))
+	if st1 != http.StatusOK {
+		t.Fatalf("first Daytona create status = %d, want 200; body=%s", st1, string(b1))
 	}
 	var first idResponse
 	fcDecode(t, b1, &first)
 	destroySandbox(t, first.ID)
 
 	st2, b2 := fcDo(t, ctx, http.MethodPost, "", "/daytona/sandbox", body, hdr)
-	if st2 != http.StatusCreated {
-		t.Fatalf("replay Daytona create status = %d, want 201; body=%s", st2, string(b2))
+	if st2 != http.StatusOK {
+		t.Fatalf("replay Daytona create status = %d, want 200; body=%s", st2, string(b2))
 	}
 	var second idResponse
 	fcDecode(t, b2, &second)

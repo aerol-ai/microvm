@@ -49,7 +49,7 @@ func TestDaytonaCreateSandbox_IdempotencyKeyMismatch(t *testing.T) {
 			env := newDaytonaContractEnv(t)
 			h := &handlers{deps: Deps{Service: env.service, Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}}
 			rr := daytonaPost(t, h, "job-42", first)
-			if rr.Code != http.StatusCreated {
+			if rr.Code != http.StatusOK {
 				t.Fatalf("first create = %d; body=%s", rr.Code, rr.Body.String())
 			}
 			var created sandboxResponse
@@ -62,7 +62,7 @@ func TestDaytonaCreateSandbox_IdempotencyKeyMismatch(t *testing.T) {
 			if tt.replay {
 				var again sandboxResponse
 				_ = json.Unmarshal(rr.Body.Bytes(), &again)
-				if rr.Code != http.StatusCreated || again.ID != created.ID {
+				if rr.Code != http.StatusOK || again.ID != created.ID {
 					t.Fatalf("retry = %d %s; want a replay of %s", rr.Code, rr.Body.String(), created.ID)
 				}
 			} else {
@@ -86,7 +86,7 @@ func TestDaytonaCreateSandbox_IdempotencyKeyMismatch(t *testing.T) {
 func TestDaytonaCreateSandbox_KeyReusedFromAnotherFacade(t *testing.T) {
 	env := newDaytonaContractEnv(t)
 	h := &handlers{deps: Deps{Service: env.service, Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}}
-	if rr := daytonaPost(t, h, "shared", `{"snapshot":"alpine:3.20"}`); rr.Code != http.StatusCreated {
+	if rr := daytonaPost(t, h, "shared", `{"snapshot":"alpine:3.20"}`); rr.Code != http.StatusOK {
 		t.Fatalf("first = %d", rr.Code)
 	}
 	v1Digests, err := env.service.CreateRequestDigests("v1", []byte(`{"snapshot":"alpine:3.20"}`))
@@ -119,10 +119,10 @@ func TestDaytonaForwardedRetryWithAReusedKey(t *testing.T) {
 		h.createSandbox(rr, req)
 		return rr
 	}
-	if rr := forward(`{"snapshot":"alpine:3.20","env":{"K":"1"}}`); rr.Code != http.StatusCreated {
+	if rr := forward(`{"snapshot":"alpine:3.20","env":{"K":"1"}}`); rr.Code != http.StatusOK {
 		t.Fatalf("first forwarded create = %d %s", rr.Code, rr.Body.String())
 	}
-	if rr := forward(`{"env":{"K":"1"},"snapshot":"alpine:3.20"}`); rr.Code != http.StatusCreated {
+	if rr := forward(`{"env":{"K":"1"},"snapshot":"alpine:3.20"}`); rr.Code != http.StatusOK {
 		t.Fatalf("forwarded retry, same request = %d %s", rr.Code, rr.Body.String())
 	}
 	rr := forward(`{"snapshot":"alpine:3.20","env":{"K":"2"}}`)

@@ -10,7 +10,6 @@ import (
 	"net/http"
 	"net/textproto"
 	"net/url"
-	"path/filepath"
 	"regexp"
 	"strings"
 
@@ -306,19 +305,19 @@ func (h *handlers) bulkDownload(w http.ResponseWriter, r *http.Request, sandboxI
 	for _, targetPath := range req.Paths {
 		resp, err := h.sendToolboxRequest(r.Context(), sandboxID, http.MethodGet, "/files/download", url.Values{"path": []string{targetPath}}, nil, nil)
 		if err != nil {
-			h.writeMultipartErrorPart(writer, errorPayload(err))
+			h.writeMultipartErrorPart(writer, targetPath, errorPayload(err))
 			continue
 		}
 
 		if resp.StatusCode >= http.StatusMultipleChoices {
 			body, _ := io.ReadAll(resp.Body)
 			_ = resp.Body.Close()
-			h.writeMultipartErrorPart(writer, responseErrorPayload(resp.StatusCode, body))
+			h.writeMultipartErrorPart(writer, targetPath, responseErrorPayload(resp.StatusCode, body))
 			continue
 		}
 
 		headers := textproto.MIMEHeader{
-			"Content-Disposition": []string{fmt.Sprintf(`form-data; name="file"; filename=%q`, filepath.Base(targetPath))},
+			"Content-Disposition": []string{downloadPartDisposition("file", targetPath)},
 			"Content-Type":        []string{"application/octet-stream"},
 		}
 		if resp.ContentLength >= 0 {
@@ -333,17 +332,30 @@ func (h *handlers) bulkDownload(w http.ResponseWriter, r *http.Request, sandboxI
 	_ = writer.Close()
 }
 
-func (h *handlers) writeMultipartErrorPart(writer *multipart.Writer, body []byte) {
+func (h *handlers) writeMultipartErrorPart(writer *multipart.Writer, targetPath string, body []byte) {
 	if len(body) == 0 {
 		body = responseErrorPayload(http.StatusBadGateway, nil)
 	}
 	part, err := writer.CreatePart(textproto.MIMEHeader{
-		"Content-Disposition": []string{`form-data; name="error"`},
+		"Content-Disposition": []string{downloadPartDisposition("error", targetPath)},
 		"Content-Type":        []string{"application/json"},
 	})
 	if err == nil {
 		_, _ = part.Write(body)
 	}
+}
+
+// downloadPartQuoter escapes a path for a quoted header parameter the way
+// mime/multipart's CreateFormFile does.
+var downloadPartQuoter = strings.NewReplacer("\\", "\\\\", `"`, "\\\"")
+
+// downloadPartDisposition names one bulk-download part. The filename is the
+// exact path the caller asked for, on file parts and error parts alike: the
+// Daytona SDKs match each part back to its request by that path (Python keys
+// a dict on it and refuses a part with no filename), so a base name or a
+// missing filename breaks every download, not only the failed one.
+func downloadPartDisposition(name, targetPath string) string {
+	return fmt.Sprintf(`form-data; name=%q; filename="%s"`, name, downloadPartQuoter.Replace(targetPath))
 }
 
 func (h *handlers) uploadSingleFile(ctx context.Context, sandboxID, targetPath string, fileHeader *multipart.FileHeader) error {
@@ -506,15 +518,33 @@ func readToolboxHTTPError(resp *http.Response) error {
 	return &toolboxHTTPError{StatusCode: resp.StatusCode, Message: message}
 }
 
+// downloadErrorBody is one bulk-download error part in the shape Daytona's
+// toolbox sends. The SDKs show message and read statusCode (the Python SDK
+// keeps it in the file's error details); error repeats message for readers
+// of this facade's older shape.
+type downloadErrorBody struct {
+	Message    string `json:"message"`
+	StatusCode int    `json:"statusCode"`
+	Error      string `json:"error"`
+}
+
+func downloadErrorJSON(statusCode int, message string) []byte {
+	body, _ := json.Marshal(downloadErrorBody{Message: message, StatusCode: statusCode, Error: message})
+	return body
+}
+
 func errorPayload(err error) []byte {
-	message := "toolbox unavailable"
+	message, statusCode := "toolbox unavailable", http.StatusBadGateway
 	var httpErr *toolboxHTTPError
 	if errors.As(err, &httpErr) {
 		message = httpErr.Error()
+		if httpErr.StatusCode > 0 {
+			statusCode = httpErr.StatusCode
+		}
 	} else if err != nil && strings.TrimSpace(err.Error()) != "" {
 		message = strings.TrimSpace(err.Error())
 	}
-	return []byte(fmt.Sprintf(`{"error":%q}`, message))
+	return downloadErrorJSON(statusCode, message)
 }
 
 func responseErrorPayload(statusCode int, body []byte) []byte {
@@ -530,7 +560,7 @@ func responseErrorPayload(statusCode int, body []byte) []byte {
 	if message == "" {
 		message = http.StatusText(statusCode)
 	}
-	return []byte(fmt.Sprintf(`{"error":%q}`, message))
+	return downloadErrorJSON(statusCode, message)
 }
 
 func copyResponseHeaders(dst, src http.Header) {

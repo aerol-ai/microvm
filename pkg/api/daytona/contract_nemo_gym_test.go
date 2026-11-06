@@ -21,14 +21,8 @@ import (
 // NVIDIA NeMo Gym's Daytona provider (plan G5) makes these Daytona SDK calls:
 // create, get, refresh, process.exec with a working folder, environment and
 // timeout, fs.upload_file, fs.download_file and delete. Create, get and
-// delete have cases in contract_test.go. These cases cover the command and
-// upload calls, end to end through the facade to a toolboxd.
-//
-// fs.download_file is not here: the facade names each part of its
-// bulk-download answer by the file's base name, while the SDKs look the
-// part up by the full path they asked for, so the call fails
-// (docs/src/content/docs/using-daytona-sdk.mdx lists it under "What does
-// not work").
+// delete have cases in contract_test.go. These cases cover the command,
+// upload and download calls, end to end through the facade to a toolboxd.
 
 // nemoGymToolbox is a toolboxd that runs each command for real (so the
 // working folder and environment are checked however the SDK sends them)
@@ -82,6 +76,15 @@ func (b *nemoGymToolbox) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		b.uploads[r.URL.Query().Get("path")] = data
 		b.mu.Unlock()
 		w.WriteHeader(http.StatusCreated)
+	case "/files/download":
+		b.mu.Lock()
+		data, ok := b.uploads[r.URL.Query().Get("path")]
+		b.mu.Unlock()
+		if !ok {
+			http.Error(w, `{"error":"file not found"}`, http.StatusNotFound)
+			return
+		}
+		_, _ = w.Write(data)
 	default:
 		b.t.Errorf("unexpected toolbox call %s %s", r.Method, r.URL.Path)
 		http.NotFound(w, r)
@@ -134,6 +137,39 @@ func TestDaytonaSDKContractsNeMoGym(t *testing.T) {
 				}
 				if got := string(toolbox.uploads["/workspace/task/input.txt"]); got != "task data" {
 					t.Fatalf("toolboxd got uploads %v, want /workspace/task/input.txt = %q", toolbox.uploads, "task data")
+				}
+			},
+		},
+		{
+			// The SDK sends one path to bulk-download and reads the answer
+			// part back; the bytes must survive the round trip.
+			name:    "fs_download_file_from_an_absolute_path",
+			toolbox: newToolbox,
+			run: func(t *testing.T, env *daytonaContractEnv) {
+				sandbox := nemoGymContractSandbox(t, env, "nemo-download")
+				toolbox.uploads["/workspace/task/output.txt"] = []byte("reward=1")
+				got, err := sandbox.FileSystem.DownloadFile(env.ctx, "/workspace/task/output.txt", nil)
+				if err != nil {
+					t.Fatalf("DownloadFile error = %v", err)
+				}
+				if string(got) != "reward=1" {
+					t.Fatalf("DownloadFile = %q, want %q", got, "reward=1")
+				}
+			},
+		},
+		{
+			// A missing file comes back as the error part, which the SDK
+			// turns into an error rather than empty bytes.
+			name:    "fs_download_file_that_does_not_exist",
+			toolbox: newToolbox,
+			run: func(t *testing.T, env *daytonaContractEnv) {
+				sandbox := nemoGymContractSandbox(t, env, "nemo-download-missing")
+				got, err := sandbox.FileSystem.DownloadFile(env.ctx, "/workspace/task/none.txt", nil)
+				if err == nil {
+					t.Fatalf("DownloadFile = %q, want an error", got)
+				}
+				if !strings.Contains(err.Error(), "not found") {
+					t.Fatalf("DownloadFile error = %v, want it to say not found", err)
 				}
 			},
 		},
