@@ -198,11 +198,14 @@ type command struct {
 	MaxPerTenant      int                       `json:"max_per_tenant,omitempty"`
 	VolumeAttachments []models.VolumeAttachment `json:"volume_attachments,omitempty"`
 	VolumeSandboxID   string                    `json:"volume_sandbox_id,omitempty"`
-	// VolumeReclaimNodeID, on opDelete, asks the FSM to record a
-	// VolumeReclaim (stamped StampUnixNano, drained by this node) for every
-	// delete_with_sandbox volume the deleted sandbox was the last holder of
-	// (fsm_volume_reclaims.go). Empty: no record, the older behaviour.
+	// VolumeReclaimNodeID asks the FSM to record a VolumeReclaim (stamped
+	// StampUnixNano, drained by this node; fsm_volume_reclaims.go): on
+	// opDelete for every delete_with_sandbox volume the deleted sandbox was
+	// the last holder of, on opDeleteVolume for the deleted volume.
+	// VolumeReclaimSource is opDeleteVolume's source for a row stored without
+	// one. Empty: no record, the older behaviour.
 	VolumeReclaimNodeID string `json:"volume_reclaim_node_id,omitempty"`
+	VolumeReclaimSource string `json:"volume_reclaim_source,omitempty"`
 	// VolumeReclaim names the entry opAckVolumeReclaim drops or
 	// opClaimVolumeReclaim moves to NodeID.
 	VolumeReclaim *VolumeReclaim `json:"volume_reclaim,omitempty"`
@@ -2022,6 +2025,11 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 		}
 		delete(f.volumes, key)
 		delete(f.volumeNameIndex, volumeNameKey(tenant, row.Name))
+		// The row was the last record of where the bytes are: record what
+		// they are owed in the same apply.
+		if cmd.VolumeReclaimNodeID != "" {
+			f.recordDeletedVolumeReclaimLocked(row, cmd)
+		}
 		return nil
 	case opRegisterSnapshotNode:
 		// Idempotent get-or-set-or-move: a re-register with the same name

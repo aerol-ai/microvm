@@ -138,6 +138,10 @@ func (m *scriptedVolumeMeta) DeleteRow(context.Context, string, string) error {
 	return m.deleteRowErr
 }
 
+func (m *scriptedVolumeMeta) DeleteRowOwingBytes(context.Context, models.Volume, string) error {
+	return m.deleteRowErr
+}
+
 func (m *scriptedVolumeMeta) ExistsForSource(context.Context, string) (bool, error) {
 	return m.exists, m.existsErr
 }

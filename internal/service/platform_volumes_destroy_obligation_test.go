@@ -102,6 +102,9 @@ type reclaimLedgerCluster struct {
 	ackErr   error
 	claims   []string
 	acks     []string
+	// olderServer reports a server that predates the replicated ledger.
+	olderServer bool
+	deletes     int
 }
 
 func newReclaimLedgerCluster() *reclaimLedgerCluster {
@@ -121,7 +124,28 @@ func (c *reclaimLedgerCluster) has(volumeID string) (cluster.VolumeReclaim, bool
 	return r, ok
 }
 
-func (c *reclaimLedgerCluster) VolumeReclaimsReplicated() bool { return true }
+func (c *reclaimLedgerCluster) VolumeReclaimsReplicated() bool { return !c.olderServer }
+
+// VolumeDeleteOwingBytes is opDeleteVolume with the record: the row goes and
+// the entry appears in one step, held by this node.
+func (c *reclaimLedgerCluster) VolumeDeleteOwingBytes(ctx context.Context, tenant, id, source string) error {
+	row, err := c.Noop.VolumeByID(ctx, tenant, id)
+	if err != nil {
+		return err
+	}
+	if err := c.Noop.VolumeDelete(ctx, tenant, id); err != nil {
+		return err
+	}
+	if row.Source != "" {
+		source = row.Source
+	}
+	c.mu.Lock()
+	c.deletes++
+	c.mu.Unlock()
+	c.put(cluster.VolumeReclaim{Tenant: tenant, VolumeID: id, Name: row.Name, Backend: row.Backend, Source: source,
+		NodeID: c.SelfNodeID(), RecordedUnixNano: time.Now().UnixNano()})
+	return nil
+}
 
 func (c *reclaimLedgerCluster) VolumeReclaimsFor(_ context.Context, nodeID string, limit int) ([]cluster.VolumeReclaim, error) {
 	c.mu.Lock()

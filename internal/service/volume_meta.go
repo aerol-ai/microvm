@@ -25,6 +25,10 @@ type volumeMetaStore interface {
 	ByName(ctx context.Context, tenant, name string) (*models.Volume, error)
 	List(ctx context.Context, tenant string) ([]models.Volume, error)
 	DeleteRow(ctx context.Context, tenant, id string) error
+	// DeleteRowOwingBytes deletes an unattached volume's row and records, in
+	// the same step, that its backend bytes (at the row's source, else
+	// source) are owed a delete. Refused while attached (ErrVolumeInUse).
+	DeleteRowOwingBytes(ctx context.Context, vol models.Volume, source string) error
 	ExistsForSource(ctx context.Context, source string) (bool, error)
 	AttachmentCount(ctx context.Context, tenant, id string) (int, error)
 	// AttachmentsForSandbox lists the attachments one sandbox holds; a destroy
@@ -44,7 +48,7 @@ func (s *Service) volumeMeta() volumeMetaStore {
 	}
 	if s.cfg.EnableCluster {
 		if c := s.Cluster(); c != nil {
-			return clusterVolumeMeta{c: c}
+			return clusterVolumeMeta{c: c, store: s.store}
 		}
 	}
 	return sqliteVolumeMeta{store: s.store}
@@ -70,6 +74,10 @@ func (m sqliteVolumeMeta) DeleteRow(ctx context.Context, tenant, id string) erro
 	// attached since the caller's count must keep its volume.
 	return m.store.DeleteVolumeIfNoAttachments(ctx, tenant, id)
 }
+func (m sqliteVolumeMeta) DeleteRowOwingBytes(ctx context.Context, vol models.Volume, source string) error {
+	// One transaction: the ledger row is written before the volume row goes.
+	return m.store.DeleteVolumeIfUnattached(ctx, vol.Tenant, vol.ID, source)
+}
 func (m sqliteVolumeMeta) ExistsForSource(ctx context.Context, source string) (bool, error) {
 	return m.store.LiveVolumeExistsForSource(ctx, source)
 }
@@ -88,8 +96,12 @@ func (m sqliteVolumeMeta) DeleteAttachmentsForSandbox(ctx context.Context, sandb
 
 // clusterVolumeMeta adapts the replicated cluster volume API to the service
 // interface, translating cluster.ErrUnknownVolume / ErrVolumeQuotaExceeded into
-// the store-level sentinels the service already branches on.
-type clusterVolumeMeta struct{ c cluster.Client }
+// the store-level sentinels the service already branches on. store is this
+// node's ledger, the fallback while a server predates the replicated one.
+type clusterVolumeMeta struct {
+	c     cluster.Client
+	store *store.Store
+}
 
 func (m clusterVolumeMeta) GetOrCreate(ctx context.Context, v *models.Volume, maxPerTenant int) (*models.Volume, bool, error) {
 	row, created, err := m.c.VolumeUpsert(ctx, *v, maxPerTenant)
@@ -120,6 +132,19 @@ func (m clusterVolumeMeta) List(ctx context.Context, tenant string) ([]models.Vo
 }
 func (m clusterVolumeMeta) DeleteRow(ctx context.Context, tenant, id string) error {
 	return mapVolumeNotFound(m.c.VolumeDelete(ctx, tenant, id))
+}
+func (m clusterVolumeMeta) DeleteRowOwingBytes(ctx context.Context, vol models.Volume, source string) error {
+	if rc, ok := m.c.(cluster.VolumeReclaimClient); ok && rc.VolumeReclaimsReplicated() {
+		// One apply deletes the row and records the reclaim, which a worker
+		// drains even when this node is an ingress or server node (no
+		// reclaim sweep) or dies before its next pass.
+		return mapVolumeNotFound(rc.VolumeDeleteOwingBytes(ctx, vol.Tenant, vol.ID, source))
+	}
+	// A server predates the replicated ledger: this node's ledger, as before.
+	if err := m.store.SchedulePendingVolumeDeletion(ctx, vol, source); err != nil {
+		return err
+	}
+	return m.DeleteRow(ctx, vol.Tenant, vol.ID)
 }
 func (m clusterVolumeMeta) ExistsForSource(ctx context.Context, source string) (bool, error) {
 	return m.c.VolumeExistsForSource(ctx, source)

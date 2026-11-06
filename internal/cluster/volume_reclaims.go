@@ -2,6 +2,7 @@ package cluster
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/url"
 	"strconv"
@@ -33,6 +34,11 @@ type VolumeReclaimClient interface {
 	ClaimVolumeReclaim(ctx context.Context, r VolumeReclaim, nodeID string) error
 	// AckVolumeReclaim drops r once its bytes are deleted. Idempotent.
 	AckVolumeReclaim(ctx context.Context, r VolumeReclaim) error
+	// VolumeDeleteOwingBytes deletes an unattached volume row and records
+	// its reclaim (source when the row has none) in the same apply, drained
+	// by a worker. The caller checks VolumeReclaimsReplicated first.
+	// ErrUnknownVolume / ErrVolumeInUse as VolumeDelete.
+	VolumeDeleteOwingBytes(ctx context.Context, tenant, id, source string) error
 }
 
 var (
@@ -117,6 +123,43 @@ func (a *Agent) ClaimVolumeReclaim(ctx context.Context, r VolumeReclaim, nodeID 
 
 func (a *Agent) AckVolumeReclaim(ctx context.Context, r VolumeReclaim) error {
 	return a.applyCommand(ctx, command{Op: opAckVolumeReclaim, VolumeReclaim: &r})
+}
+
+func (c *Cluster) VolumeDeleteOwingBytes(ctx context.Context, tenant, id, source string) error {
+	cmd, err := volumeDeleteOwingBytesCommand(tenant, id, source, c.nodeID)
+	if err != nil {
+		return err
+	}
+	err = c.applyCommand(ctx, cmd)
+	if errors.Is(err, ErrUnknownVolume) {
+		return ErrUnknownVolume
+	}
+	return err
+}
+
+func (a *Agent) VolumeDeleteOwingBytes(ctx context.Context, tenant, id, source string) error {
+	cmd, err := volumeDeleteOwingBytesCommand(tenant, id, source, a.nodeID)
+	if err != nil {
+		return err
+	}
+	err = a.applyCommand(ctx, cmd)
+	if errors.Is(err, ErrUnknownVolume) {
+		return ErrUnknownVolume
+	}
+	return err
+}
+
+// volumeDeleteOwingBytesCommand is opDeleteVolume asking for the record,
+// drained by nodeID: a worker drains its own; any worker takes over one
+// recorded by an ingress or server node at once (volumeReclaimsFor).
+func volumeDeleteOwingBytesCommand(tenant, id, source, nodeID string) (command, error) {
+	tenant, id = strings.TrimSpace(tenant), strings.TrimSpace(id)
+	if tenant == "" || id == "" {
+		return command{}, fmt.Errorf("cluster: VolumeDeleteOwingBytes requires tenant and id")
+	}
+	cmd := command{Op: opDeleteVolume, VolumeTenant: tenant, VolumeID: id, VolumeReclaimSource: strings.TrimSpace(source)}
+	stampVolumeReclaims(&cmd, true, nodeID)
+	return cmd, nil
 }
 
 func claimVolumeReclaimCommand(r VolumeReclaim, nodeID string) (command, error) {

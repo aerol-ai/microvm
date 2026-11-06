@@ -370,3 +370,138 @@ func TestClusterPlacementDeleteRecordsVolumeReclaimRoundTrip(t *testing.T) {
 		t.Fatalf("after ack = %+v", left)
 	}
 }
+
+// Same-pattern fix: a volume row deleted by opDeleteVolume (an API delete
+// on any node, a failed create's cleanup) records its reclaim in the same
+// apply when asked, so a worker drains the bytes even if the node that took
+// the request never runs the reclaim sweep or dies first.
+func TestFSMVolumeDeleteRecordsReclaim(t *testing.T) {
+	cases := []struct {
+		name      string
+		vol       models.Volume
+		attach    bool
+		cmd       command
+		wantErr   error
+		wantEntry *VolumeReclaim
+	}{
+		{
+			name:      "asked: recorded from the row",
+			vol:       models.Volume{ID: "v1", Tenant: "t", Name: "n1", Backend: "s3", Source: "b/n1"},
+			cmd:       command{Op: opDeleteVolume, VolumeTenant: "t", VolumeID: "v1", VolumeReclaimNodeID: "ing-a", StampUnixNano: 5, VolumeReclaimSource: "ignored"},
+			wantEntry: &VolumeReclaim{Tenant: "t", VolumeID: "v1", Name: "n1", Backend: "s3", Source: "b/n1", NodeID: "ing-a", RecordedUnixNano: 5},
+		},
+		{
+			name:      "a row stored without a source uses the caller's",
+			vol:       models.Volume{ID: "v2", Tenant: "t", Name: "n2", Backend: "nfs"},
+			cmd:       command{Op: opDeleteVolume, VolumeTenant: "t", VolumeID: "v2", VolumeReclaimNodeID: "wkr-a", StampUnixNano: 6, VolumeReclaimSource: "/exports/n2"},
+			wantEntry: &VolumeReclaim{Tenant: "t", VolumeID: "v2", Name: "n2", Backend: "nfs", Source: "/exports/n2", NodeID: "wkr-a", RecordedUnixNano: 6},
+		},
+		{
+			name: "no source anywhere: nothing to record",
+			vol:  models.Volume{ID: "v3", Tenant: "t", Name: "n3", Backend: "nfs"},
+			cmd:  command{Op: opDeleteVolume, VolumeTenant: "t", VolumeID: "v3", VolumeReclaimNodeID: "wkr-a", StampUnixNano: 7},
+		},
+		{
+			name: "not asked (an older proposer): no record",
+			vol:  models.Volume{ID: "v4", Tenant: "t", Name: "n4", Backend: "s3", Source: "b/n4"},
+			cmd:  command{Op: opDeleteVolume, VolumeTenant: "t", VolumeID: "v4"},
+		},
+		{
+			name:    "attached: refused, nothing recorded",
+			vol:     models.Volume{ID: "v5", Tenant: "t", Name: "n5", Backend: "s3", Source: "b/n5"},
+			attach:  true,
+			cmd:     command{Op: opDeleteVolume, VolumeTenant: "t", VolumeID: "v5", VolumeReclaimNodeID: "wkr-a", StampUnixNano: 8},
+			wantErr: ErrVolumeInUse,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newPlacementFSM()
+			idx := uint64(0)
+			apply := func(cmd command) any {
+				idx++
+				return f.Apply(&raft.Log{Index: idx, Data: mustEncode(t, cmd)})
+			}
+			if got := apply(volCmd(tc.vol, 0)); got != nil {
+				t.Fatal(got)
+			}
+			if tc.attach {
+				if got := apply(command{Op: opPlace, SandboxID: "sb", OwnerNodeID: "wkr-a", IncarnationID: "inc"}); got != nil {
+					t.Fatal(got)
+				}
+				if got := apply(command{Op: opPutVolumeAttach, VolumeAttachments: []models.VolumeAttachment{{
+					Tenant: "t", VolumeID: tc.vol.ID, SandboxID: "sb", IncarnationID: "inc", Target: "/v", Source: "b/v",
+				}}}); got != nil {
+					t.Fatal(got)
+				}
+			}
+			got := apply(tc.cmd)
+			if err, _ := got.(error); tc.wantErr != nil && !errors.Is(err, tc.wantErr) || tc.wantErr == nil && got != nil {
+				t.Fatalf("apply = %v, want %v", got, tc.wantErr)
+			}
+			rs := f.VolumeReclaims()
+			if tc.wantEntry == nil {
+				if len(rs) != 0 {
+					t.Fatalf("recorded %+v", rs)
+				}
+				return
+			}
+			if len(rs) != 1 || rs[0] != *tc.wantEntry {
+				t.Fatalf("reclaims = %+v, want %+v", rs, *tc.wantEntry)
+			}
+			if _, err := f.VolumeByID("t", tc.vol.ID); !errors.Is(err, ErrUnknownVolume) {
+				t.Fatalf("row still there: %v", err)
+			}
+		})
+	}
+}
+
+// A destroy's delete_with_sandbox finish deletes the row it recorded at
+// the release: the delete's record replaces that entry, it does not add one.
+func TestFSMVolumeDeleteReplacesDestroyRecord(t *testing.T) {
+	f, apply := reclaimFSM(t)
+	if got := apply(deleteWithReclaims("sb-1", "inc-1", "wkr-a", 100)); got != nil {
+		t.Fatal(got)
+	}
+	if got := apply(command{Op: opDeleteVolume, VolumeTenant: "t-a", VolumeID: "vol-d", VolumeReclaimNodeID: "wkr-a", StampUnixNano: 200}); got != nil {
+		t.Fatal(got)
+	}
+	rs := f.VolumeReclaims()
+	if len(rs) != 1 || rs[0].VolumeID != "vol-d" || rs[0].RecordedUnixNano != 200 {
+		t.Fatalf("reclaims = %+v, want the delete's record only", rs)
+	}
+}
+
+// The client entry points: a real single-server Raft, then the validation.
+func TestClusterVolumeDeleteOwingBytesRoundTrip(t *testing.T) {
+	if _, err := volumeDeleteOwingBytesCommand(" ", "v", "", "n"); err == nil {
+		t.Fatal("tenant is required")
+	}
+	if err := (&Cluster{}).VolumeDeleteOwingBytes(context.Background(), "", "v", ""); err == nil {
+		t.Fatal("Cluster: tenant is required")
+	}
+	if err := (&Agent{}).VolumeDeleteOwingBytes(context.Background(), "t", "", ""); err == nil {
+		t.Fatal("Agent: id is required")
+	}
+	if testing.Short() {
+		t.Skip("integration test: requires real raft sockets")
+	}
+	c, cleanup := newTestCluster(t, "ldr-vol-delete-reclaim", true, nil)
+	defer cleanup()
+	waitForLeader(t, c, 10*time.Second)
+	ctx := context.Background()
+	v := models.Volume{ID: "vol-api", Tenant: "t-a", Name: "data", Backend: "s3", Source: "bucket/t-a/data"}
+	if _, _, err := c.VolumeUpsert(ctx, v, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.VolumeDeleteOwingBytes(ctx, "t-a", "vol-api", ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.VolumeDeleteOwingBytes(ctx, "t-a", "vol-api", ""); !errors.Is(err, ErrUnknownVolume) {
+		t.Fatalf("second delete = %v, want ErrUnknownVolume", err)
+	}
+	mine, err := c.VolumeReclaimsFor(ctx, c.SelfNodeID(), 10)
+	if err != nil || len(mine) != 1 || mine[0].VolumeID != "vol-api" || mine[0].Source != v.Source {
+		t.Fatalf("reclaims = %+v, %v", mine, err)
+	}
+}

@@ -6,6 +6,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/aerol-ai/microvm/pkg/models"
 )
 
 // The replicated reclaim ledger for delete_with_sandbox volumes
@@ -20,7 +22,9 @@ import (
 // deleting placement (dead_owner.go) has no ledger at all.
 //
 // So opDelete itself records the obligation, in the same apply that drops
-// the last attachment: for every delete_with_sandbox volume the deleted
+// the last attachment (and opDeleteVolume, asked the same way, records it
+// for the volume row it deletes: an API delete or a failed create's cleanup,
+// on whichever node took the request): for every delete_with_sandbox volume the deleted
 // sandbox was the only holder of, a VolumeReclaim entry. It is replicated
 // and snapshotted with the volumes, so it survives the loss of any node and
 // any leader change. It is removed only by opAckVolumeReclaim, which a node
@@ -132,6 +136,26 @@ func (f *placementFSM) recordVolumeReclaimsLocked(sandboxID, nodeID string, stam
 			SandboxID: sandboxID, NodeID: nodeID, RecordedUnixNano: stamp,
 		})
 	}
+}
+
+// recordDeletedVolumeReclaimLocked records the reclaim of a volume whose
+// row opDeleteVolume just removed (an API delete, a failed create's cleanup,
+// a destroy's delete_with_sandbox finish), so its bytes are drained like a
+// destroy's, by a worker, whichever node took the request. It replaces an
+// entry a destroy recorded for the same volume.
+func (f *placementFSM) recordDeletedVolumeReclaimLocked(row models.Volume, cmd command) {
+	source := strings.TrimSpace(row.Source)
+	if source == "" {
+		source = strings.TrimSpace(cmd.VolumeReclaimSource)
+	}
+	node := strings.TrimSpace(cmd.VolumeReclaimNodeID)
+	if source == "" || node == "" {
+		return
+	}
+	f.putVolumeReclaimLocked(VolumeReclaim{
+		Tenant: strings.TrimSpace(row.Tenant), VolumeID: strings.TrimSpace(row.ID), Name: row.Name, Backend: row.Backend, Source: source,
+		NodeID: node, RecordedUnixNano: cmd.StampUnixNano,
+	})
 }
 
 func (f *placementFSM) volumeHeldByAnotherSandboxLocked(vKey, sandboxID string) bool {

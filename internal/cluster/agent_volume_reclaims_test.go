@@ -79,6 +79,22 @@ func TestAgentVolumeReclaimRoundTripThroughServer(t *testing.T) {
 	if all := server.fsm.VolumeReclaims(); len(all) != 0 {
 		t.Fatalf("after ack = %+v", all)
 	}
+
+	// An API delete that lands on this node records its reclaim through
+	// the server too, held by this node.
+	kept := models.Volume{ID: "vol-api", Tenant: "t-a", Name: "kept", Backend: "s3", Source: "bucket/t-a/kept"}
+	if _, _, err := agent.VolumeUpsert(ctx, kept, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := agent.VolumeDeleteOwingBytes(ctx, "t-a", "vol-api", ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := agent.VolumeDeleteOwingBytes(ctx, "t-a", "vol-api", ""); err == nil {
+		t.Fatal("deleting a row that is gone must fail")
+	}
+	if all := server.fsm.VolumeReclaims(); len(all) != 1 || all[0].VolumeID != "vol-api" || all[0].NodeID != "wkr-agent-rec" {
+		t.Fatalf("after an API delete = %+v", all)
+	}
 }
 
 // An empty ledger reads as an empty list; a worker with no server to ask

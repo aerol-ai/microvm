@@ -35,6 +35,9 @@ func (c *reclaimStubCluster) ClaimVolumeReclaim(context.Context, cluster.VolumeR
 func (c *reclaimStubCluster) AckVolumeReclaim(context.Context, cluster.VolumeReclaim) error {
 	return nil
 }
+func (c *reclaimStubCluster) VolumeDeleteOwingBytes(context.Context, string, string, string) error {
+	return nil
+}
 
 // A worker's reclaim sweep asks a server which delete_with_sandbox volumes
 // it should drain; a server without the ledger says it does not know the
