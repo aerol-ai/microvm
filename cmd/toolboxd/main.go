@@ -731,6 +731,10 @@ func (s *server) handleExec(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "command is required")
 		return
 	}
+	if req.MaxStdoutBytes < 0 || req.MaxStderrBytes < 0 {
+		writeError(w, http.StatusBadRequest, "max_stdout_bytes and max_stderr_bytes must be 0 (no cap) or more")
+		return
+	}
 
 	timeout := time.Duration(req.TimeoutSeconds) * time.Second
 	if timeout <= 0 {
@@ -759,7 +763,7 @@ func (s *server) handleExec(w http.ResponseWriter, r *http.Request) {
 	// started, not just the shell (B2).
 	prepareProcessGroup(cmd)
 
-	out, err := runBufferedExec(s.logger, cmd)
+	out, err := runBufferedExecLimited(s.logger, cmd, execOutputLimits{stdout: req.MaxStdoutBytes, stderr: req.MaxStderrBytes})
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -772,7 +776,9 @@ func (s *server) handleExec(w http.ResponseWriter, r *http.Request) {
 		DurationMS: time.Since(start).Milliseconds(),
 		// Only the exec's own deadline counts; a caller that hung up is
 		// not a timeout.
-		TimedOut: errors.Is(ctx.Err(), context.DeadlineExceeded) && r.Context().Err() == nil,
+		TimedOut:        errors.Is(ctx.Err(), context.DeadlineExceeded) && r.Context().Err() == nil,
+		StdoutTruncated: out.stdoutTruncated,
+		StderrTruncated: out.stderrTruncated,
 	}
 
 	result.ExitCode, _ = interpretWaitResult(waitErr)

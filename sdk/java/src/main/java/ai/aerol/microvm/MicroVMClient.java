@@ -880,7 +880,16 @@ public class MicroVMClient {
      * caller, who knows whether the command is safe to repeat.
      */
     public ExecResult exec(String sandboxId, ExecRequest request) {
+        if (request != null && (isSet(request.maxStdoutBytes) || isSet(request.maxStderrBytes))) {
+            // An older agent ignores the caps and returns all output.
+            requireToolboxFeatures(sandboxId, "exec.max_output_bytes");
+        }
         return doJson("POST", sandboxPath(sandboxId) + "/toolbox/process/execute", request, ExecResult.class, RetryMode.UNSENT_ONLY);
+    }
+
+    /** A cap of 0 or null means none, as on the wire. */
+    private static boolean isSet(Long cap) {
+        return cap != null && cap != 0;
     }
 
     public void uploadFile(String sandboxId, String targetPath, byte[] data) {

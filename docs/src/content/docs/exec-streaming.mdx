@@ -63,6 +63,8 @@ The command runs in a shell (`/bin/sh`), so pipes (`|`), `&&` and variables like
 | Error messages it printed | `stderr` | `Stderr` | `stderr` | `stderr` |
 | Exit code | `exitCode` | `ExitCode` | `exit_code` | `exitCode` |
 | How long it ran, in milliseconds | `durationMS` | `DurationMS` | `duration_ms` | `durationMs` |
+| Whether the time limit stopped it | `timedOut` | `TimedOut` | `timed_out` | `timedOut` |
+| Whether output was cut ([details](#limit-how-much-output-you-get-back)) | `stdoutTruncated`, `stderrTruncated` | `StdoutTruncated`, `StderrTruncated` | `stdout_truncated`, `stderr_truncated` | `stdoutTruncated`, `stderrTruncated` |
 
 In Python the result is a dictionary, so you read `result["stdout"]`. An exit code of `0` means the command worked. Any other number means it failed, and `-1` means it was stopped by a signal.
 
@@ -172,6 +174,7 @@ Pass an options object instead of a string to choose where the command runs, add
         work_dir: Some("/tmp".into()),
         env: Some(HashMap::from([("GREETING".to_string(), "hello".to_string())])),
         timeout_seconds: Some(30),
+        ..Default::default()
     })?;
     print!("{}", result.stdout); // hello from /tmp
     ```
@@ -201,6 +204,83 @@ When the time limit runs out, the whole command stops, including anything it sta
 <Aside type="caution" title="The time limit stops the shell, not always what it started">
 `timeoutSeconds` stops the shell that runs your command. A program the shell started can keep running, and the call waits for it. On our test server, `sleep 10` with a 2-second limit still took 10 seconds to return. For a hard limit, put `timeout` in the command itself: `timeout 30 npm test` stops after 30 seconds and exits with code `124`.
 </Aside>
+
+## Limit how much output you get back
+
+Some commands print far more than you want to read, like a long build log or `cat` on a big file. Set `maxStdoutBytes` and `maxStderrBytes` to keep only the start of each stream. The sandbox reads the rest and throws it away, so the command does not slow down or get stuck. The result tells you whether anything was cut.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const result = await sandbox.exec({
+      command: "cat /var/log/build.log",
+      maxStdoutBytes: 64_000,
+      maxStderrBytes: 16_000,
+    });
+    if (result.stdoutTruncated) {
+      console.log("The log is longer. This is only the start of it.");
+    }
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    result = sandbox.exec({
+        "command": "cat /var/log/build.log",
+        "maxStdoutBytes": 64_000,
+        "maxStderrBytes": 16_000,
+    })
+    if result["stdoutTruncated"]:
+        print("The log is longer. This is only the start of it.")
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    result, err := sandbox.Exec(ctx, sdktypes.ExecRequest{
+        Command:        "cat /var/log/build.log",
+        MaxStdoutBytes: 64_000,
+        MaxStderrBytes: 16_000,
+    })
+    if err != nil {
+        log.Fatal(err)
+    }
+    if result.StdoutTruncated {
+        fmt.Println("The log is longer. This is only the start of it.")
+    }
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    use aerolvm_sdk::ExecRequest;
+
+    let result = sandbox.exec(ExecRequest {
+        command: "cat /var/log/build.log".into(),
+        max_stdout_bytes: Some(64_000),
+        max_stderr_bytes: Some(16_000),
+        ..Default::default()
+    })?;
+    if result.stdout_truncated {
+        println!("The log is longer. This is only the start of it.");
+    }
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    ExecResult result = sandbox.exec(new ExecRequest()
+        .setCommand("cat /var/log/build.log")
+        .setMaxStdoutBytes(64_000L)
+        .setMaxStderrBytes(16_000L));
+    if (result.stdoutTruncated) {
+        System.out.println("The log is longer. This is only the start of it.");
+    }
+    ```
+  </TabItem>
+</Tabs>
+
+- The limits count bytes, not characters. A cut never splits a character in two, so you can get a few bytes less than the limit.
+- Leave a limit out, or set it to `0`, for no limit of your own. Even then, a sandbox keeps at most 64 MiB of each stream, and the flag tells you when that cut the output.
+- The exit code is the command's own. Cutting its output does not change it.
+- Output that a background job prints after `exec` returns is dropped, as always, and does not count as cut.
+- A sandbox started before these limits existed runs an older agent that would ignore them and send all the output. So the SDK checks first, and if the agent is too old, it raises an error and does not run the command. The error is `MicroVMUnsupportedFeatureError` in TypeScript and Python, `ErrUnsupportedFeature` in Go, `Error::UnsupportedFeature` in Rust and `MicroVMUnsupportedFeatureException` in Java. Restart the sandbox, or re-create its Firecracker template, to get the current agent.
 
 ## Watch output while a command runs
 
@@ -538,10 +618,21 @@ For work that must keep going after you disconnect, such as a dev server or a lo
 ## Good to know
 
 - **Background jobs do not hold up `exec`.** If your command starts something with `&`, `exec` returns soon after the command itself ends (within about a second), and the background program keeps running. Output it prints after `exec` returns is dropped. To watch a long-running program's output, start it in a [terminal session](/sessions/) instead. A sandbox keeps the output of up to 256 such programs open; past that, a new one's output is closed, so it may stop the next time it prints.
-- **`exec` keeps all output in memory** until the command ends. For commands that print a lot, use `execStream`.
+- **`exec` keeps the output in memory** until the command ends, up to 64 MiB of each stream. For commands that print a lot, [set a limit](#limit-how-much-output-you-get-back) or use `execStream`.
 - **If the sandbox stops while a command runs**, the call fails within seconds instead of waiting. This covers a sandbox that crashes, is stopped or is deleted. The error is HTTP 409 with `sandbox is not running`. A crashed Firecracker sandbox can take up to 30 seconds to notice, and that call fails with HTTP 502. The command may have done part of its work, so the SDKs do not send it again. A command that is still running is never cut off, however long it stays quiet.
 - **WebAssembly sandboxes** support `exec`, but not `execStream` or terminals. What a command does there depends on the module. See [WebAssembly (WASM)](/wasm-sandbox/).
 - **V8 isolate sandboxes** have no shell. There, `exec` calls the isolate's request handler, and the command is the URL path to request. See [V8 isolate](/isolate-sandbox/).
+
+## For server operators
+
+Two settings limit how much output `exec` returns, for every caller. Both are off by default.
+
+| Variable | What it does |
+|---|---|
+| `SB_EXEC_OUTPUT_DEFAULT_BYTES` | The limit for each stream when a call sets none. |
+| `SB_EXEC_OUTPUT_MAX_BYTES` | The largest limit a call may ask for. A larger one, or none, is lowered to it. |
+
+The server applies them before the command reaches the sandbox, so they work on every runtime and on sandboxes that are already running. They cover `exec` from the AerolVM SDKs and the Daytona SDK's `process.executeCommand`, not `execStream` or sessions. A sandbox started before the limits existed ignores them. In a cluster, set the same values on every node. With a maximum set, an `exec` request bigger than 8 MiB is refused with HTTP 413. Linux limits a command and its variables to a few MiB, so no real command is that big.
 
 ## Next steps
 

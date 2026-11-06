@@ -1796,7 +1796,14 @@ impl Client {
     /// after the request may have reached the sandbox (timeout, reset, 502,
     /// 504) is returned rather than retried, because a re-send would run the
     /// command a second time; the command may or may not have run.
+    ///
+    /// Output caps are checked against the sandbox's agent first: an agent
+    /// older than them would ignore them and return all output, so the call
+    /// fails with `Error::UnsupportedFeature` instead.
     pub fn exec(&self, id: &str, request: ExecRequest) -> Result<ExecResult, Error> {
+        if request.max_stdout_bytes.unwrap_or(0) > 0 || request.max_stderr_bytes.unwrap_or(0) > 0 {
+            self.require_toolbox_features(id, &["exec.max_output_bytes"])?;
+        }
         let (body, _) = self.send_json::<ExecRequest, ExecResult>(
             Method::POST,
             &format!(
@@ -2173,9 +2180,6 @@ impl Client {
     /// Fails closed unless the sandbox's agent lists every feature on
     /// `/version`. toolboxd ignores request options it does not know, so
     /// sending a newer option to an older agent would silently skip it.
-    // Callers arrive with the parity file and exec options; until then only
-    // the tests use it.
-    #[allow(dead_code)]
     pub(crate) fn require_toolbox_features(&self, sandbox_id: &str, features: &[&str]) -> Result<(), Error> {
         if features.is_empty() {
             return Ok(());
@@ -6128,6 +6132,61 @@ mod tests {
             Err(Error::Api(err)) => assert_eq!(err.status(), 404),
             other => panic!("want Api 404, got {:?}", other),
         }
+    }
+
+    // E1 + ER4 mixed-version: an exec with an output cap against an agent
+    // that does not list the caps reads /version and stops there; the
+    // command is never sent.
+    #[test]
+    fn exec_output_caps_fail_closed_on_an_older_agent() {
+        for version in [r#"{"version":"0.6.11","features":[]}"#, r#"{"version":"0.6.0"}"#] {
+            let (url, hits, requests) = spawn_recording_scripted_server(vec![Reply::ok(version.to_string())]);
+            let client = no_retry_client(&url);
+            let err = client
+                .exec(
+                    "sb-1",
+                    ExecRequest { command: "yes".into(), max_stderr_bytes: Some(1024), ..Default::default() },
+                )
+                .expect_err("an older agent must refuse the cap");
+            match err {
+                Error::UnsupportedFeature(err) => {
+                    assert_eq!(err.features(), &["exec.max_output_bytes".to_string()]);
+                    assert!(err.to_string().contains("restart the sandbox"));
+                }
+                other => panic!("want UnsupportedFeature, got {:?}", other),
+            }
+            assert_eq!(hits.load(Ordering::SeqCst), 1, "only /version may be called");
+            assert!(requests.lock().unwrap()[0].starts_with("GET /v1/sandboxes/sb-1/toolbox/version "));
+        }
+    }
+
+    #[test]
+    fn exec_sends_output_caps_when_the_agent_lists_them() {
+        let (url, hits, requests) = spawn_recording_scripted_server(vec![
+            Reply::ok(r#"{"version":"0.6.12","features":["exec.max_output_bytes"]}"#.to_string()),
+            Reply::ok(r#"{"stdout":"aaaa","stderr":"","exit_code":0,"duration_ms":1,"stdout_truncated":true}"#.to_string()),
+        ]);
+        let client = no_retry_client(&url);
+        let result = client
+            .exec(
+                "sb-1",
+                ExecRequest { command: "yes a".into(), max_stdout_bytes: Some(4), ..Default::default() },
+            )
+            .expect("capped exec");
+        assert!(result.stdout_truncated && !result.stderr_truncated);
+        assert_eq!(result.stdout, "aaaa");
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        let exec = requests.lock().unwrap()[1].clone();
+        assert!(exec.starts_with("POST /v1/sandboxes/sb-1/toolbox/process/execute "), "{}", exec);
+        assert!(exec.contains(r#""max_stdout_bytes":4"#) && !exec.contains("max_stderr_bytes"), "{}", exec);
+
+        // No cap, no /version call; an older agent's reply reads untruncated.
+        let (url, hits, _) = spawn_recording_scripted_server(vec![Reply::ok(
+            r#"{"stdout":"","stderr":"","exit_code":0,"duration_ms":1}"#.to_string(),
+        )]);
+        let result = no_retry_client(&url).exec("sb-1", "ls".into()).expect("plain exec");
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        assert!(!result.stdout_truncated && !result.stderr_truncated);
     }
 
     fn no_retry_client(url: &str) -> Client {

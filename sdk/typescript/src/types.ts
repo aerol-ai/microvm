@@ -922,6 +922,14 @@ export interface ExecRequest {
   workDir?: string;
   env?: Record<string, string>;
   timeoutSeconds?: number;
+  /**
+   * Keep only the first N bytes of stdout. The rest is dropped and the command
+   * is not slowed down. A sandbox whose agent predates the caps throws
+   * MicroVMUnsupportedFeatureError instead of returning everything.
+   */
+  maxStdoutBytes?: number;
+  /** Keep only the first N bytes of stderr. Same rules as maxStdoutBytes. */
+  maxStderrBytes?: number;
 }
 
 export interface ExecResult {
@@ -931,6 +939,10 @@ export interface ExecResult {
   durationMS: number;
   /** True when the command ran past its timeout and the sandbox killed its whole process group. Older sandbox agents never set it. */
   timedOut: boolean;
+  /** True when stdout was longer than its cap (maxStdoutBytes, or the server's own limit) and was cut. */
+  stdoutTruncated: boolean;
+  /** True when stderr was longer than its cap and was cut. */
+  stderrTruncated: boolean;
 }
 
 export interface ExecStreamOptions {

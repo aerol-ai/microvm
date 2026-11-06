@@ -103,6 +103,8 @@ func toolboxErrorStatus(err error) int {
 		return http.StatusNotFound
 	case errors.Is(err, context.Canceled):
 		return 499
+	case errors.Is(err, ErrExecRequestTooLarge):
+		return http.StatusRequestEntityTooLarge
 	}
 	return http.StatusBadGateway
 }

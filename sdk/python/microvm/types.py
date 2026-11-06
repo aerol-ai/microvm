@@ -261,6 +261,11 @@ class ExecRequest(TypedDict, total=False):
     workDir: str
     env: Dict[str, str]
     timeoutSeconds: int
+    # Keep only the first N bytes of stdout / stderr; the rest is dropped and
+    # the command is not slowed down. Sandboxes whose agent predates the caps
+    # raise MicroVMUnsupportedFeatureError instead of returning everything.
+    maxStdoutBytes: int
+    maxStderrBytes: int
 
 
 class ExecResult(TypedDict):
@@ -271,6 +276,10 @@ class ExecResult(TypedDict):
     # True when the command ran past its timeout and the sandbox killed its
     # whole process group. Older sandbox agents never set it.
     timedOut: bool
+    # True when the stream printed more than its cap (maxStdoutBytes /
+    # maxStderrBytes, or the server's own limit) and was cut.
+    stdoutTruncated: bool
+    stderrTruncated: bool
 
 
 ChunkCallback = Callable[[bytes], None]

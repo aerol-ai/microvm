@@ -166,6 +166,29 @@ flight or queued), `aerolvm_api_list_admitted_total`,
 Which tenants: `GET /debug/vars` (fleet admin only) has `api_list_gate`, the
 gate's totals and its 10 busiest tenants by name, most refused first.
 
+## Exec output limits (SB_EXEC_OUTPUT_*)
+
+Buffered exec (`POST /v1/sandboxes/{id}/toolbox/process/execute`, Daytona
+`process.executeCommand`) returns a command's whole output in one JSON reply.
+A caller can cap each stream (`max_stdout_bytes`, `max_stderr_bytes`); these
+two settings let the operator fill in a cap and bound it. sandboxd writes them
+into the exec request before forwarding it to the sandbox's agent, so they
+hold on every runtime and on agents already running, with no extra round trip
+(plan `agent-sandbox-feature-parity.md`, E1/ER5). Exec streams, sessions and
+E2B commands are not buffered and are not covered. Whatever is set, the agent
+keeps at most 64 MiB of each stream.
+
+| Env var | Default | Notes |
+|---|---|---|
+| `SB_EXEC_OUTPUT_DEFAULT_BYTES` | `0` (off) | The per-stream cap for an exec that sets none. |
+| `SB_EXEC_OUTPUT_MAX_BYTES` | `0` (off) | The largest cap an exec may ask for; a larger one, or none, is lowered to it. With it set, an exec body over 8 MiB is refused `413` (sandboxd reads the body to apply the cap and will not buffer more); with only a default, such a body passes through untouched. |
+
+A default above the maximum, a negative value, or anything but a whole number
+refuses the boot (unlike most numeric settings, which keep their default on a
+typo, because the default here is "no limit"). Off, the exec path is
+byte-for-byte unchanged. An agent older than the caps ignores them. In a
+cluster each node applies its own values, so set them the same everywhere.
+
 ## Audit export connectors (SB_AUDIT_EXPORT_BACKEND)
 
 Modeled on kube-apiserver's audit backends (`plans/audit-export-connectors.md`):

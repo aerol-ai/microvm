@@ -1401,6 +1401,15 @@ type ExecRequest struct {
 	WorkDir        string            `json:"workdir,omitempty"`
 	Env            map[string]string `json:"env,omitempty"`
 	TimeoutSeconds int               `json:"timeout_seconds,omitempty"`
+	// MaxStdoutBytes and MaxStderrBytes keep only the first N bytes of each
+	// stream; toolboxd reads and drops the rest, so the command never blocks
+	// on a full pipe. 0 means the caller sets no cap: sandboxd may fill in
+	// the operator's default (SB_EXEC_OUTPUT_DEFAULT_BYTES), and toolboxd
+	// still applies its own hard ceiling. An agent older than these fields
+	// ignores them, so the SDKs check /version (exec.max_output_bytes) and
+	// refuse rather than send them to it.
+	MaxStdoutBytes int64 `json:"max_stdout_bytes,omitempty"`
+	MaxStderrBytes int64 `json:"max_stderr_bytes,omitempty"`
 }
 
 type ExecResult struct {
@@ -1412,6 +1421,15 @@ type ExecResult struct {
 	// killed its whole process group. A sandbox agent older than this field
 	// never sets it.
 	TimedOut bool `json:"timed_out,omitempty"`
+	// StdoutTruncated and StderrTruncated report that the stream printed more
+	// than its cap and only the first bytes are in Stdout or Stderr. One flag
+	// per stream, because the caps are set per stream: a caller whose stdout
+	// is complete can trust it even when noisy stderr was cut, and a single
+	// flag would make it compare lengths, which fails when the output is
+	// exactly the cap. Output a background job prints after the reply is
+	// dropped (B2) and never sets them.
+	StdoutTruncated bool `json:"stdout_truncated,omitempty"`
+	StderrTruncated bool `json:"stderr_truncated,omitempty"`
 }
 
 type ErrorResponse struct {

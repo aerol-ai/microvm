@@ -726,6 +726,14 @@ pub struct ExecRequest {
     pub env: Option<std::collections::HashMap<String, String>>,
     #[serde(rename = "timeout_seconds", skip_serializing_if = "Option::is_none")]
     pub timeout_seconds: Option<u64>,
+    /// Keep only the first N bytes of stdout; the rest is dropped and the
+    /// command is not slowed down. A sandbox whose agent predates the caps
+    /// returns `Error::UnsupportedFeature` instead of all output.
+    #[serde(rename = "max_stdout_bytes", skip_serializing_if = "Option::is_none")]
+    pub max_stdout_bytes: Option<u64>,
+    /// Keep only the first N bytes of stderr. Same rules as `max_stdout_bytes`.
+    #[serde(rename = "max_stderr_bytes", skip_serializing_if = "Option::is_none")]
+    pub max_stderr_bytes: Option<u64>,
 }
 
 // A plain string is a shell command with default options, so
@@ -754,6 +762,13 @@ pub struct ExecResult {
     /// whole process group. Older sandbox agents never set it.
     #[serde(rename = "timed_out", default)]
     pub timed_out: bool,
+    /// True when stdout was longer than its cap (`max_stdout_bytes`, or the
+    /// server's own limit) and was cut.
+    #[serde(rename = "stdout_truncated", default)]
+    pub stdout_truncated: bool,
+    /// True when stderr was longer than its cap and was cut.
+    #[serde(rename = "stderr_truncated", default)]
+    pub stderr_truncated: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]

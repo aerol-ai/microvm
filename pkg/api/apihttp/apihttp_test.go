@@ -427,6 +427,14 @@ func TestWriteStoreAwareError_ModuleTooLarge(t *testing.T) {
 	}
 }
 
+// ER5: an exec body too large for sandboxd to apply the operator's maximum.
+func TestWriteStoreAwareError_ExecRequestTooLarge(t *testing.T) {
+	code, _ := storeAwareErr(t, fmt.Errorf("wrap: %w", service.ErrExecRequestTooLarge))
+	if code != http.StatusRequestEntityTooLarge {
+		t.Errorf("status = %d, want 413", code)
+	}
+}
+
 func TestWriteStoreAwareError_ComponentModelUnsupported(t *testing.T) {
 	code, _ := storeAwareErr(t, wasmmod.ErrComponentModelUnsupported)
 	if code != http.StatusUnprocessableEntity {

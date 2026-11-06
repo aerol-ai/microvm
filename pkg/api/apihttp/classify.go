@@ -291,7 +291,7 @@ func Classify(err error) Classification {
 		return Classification{Status: http.StatusForbidden, Message: err.Error()}
 	case errors.Is(err, wasmmod.ErrRegistryAuth):
 		return Classification{Status: http.StatusUnauthorized, Message: err.Error()}
-	case errors.Is(err, wasmmod.ErrModuleTooLarge):
+	case errors.Is(err, wasmmod.ErrModuleTooLarge), errors.Is(err, service.ErrExecRequestTooLarge):
 		return Classification{Status: http.StatusRequestEntityTooLarge, Message: err.Error()}
 	case errors.Is(err, wasmmod.ErrComponentModelUnsupported):
 		return Classification{Status: http.StatusUnprocessableEntity, Message: err.Error()}

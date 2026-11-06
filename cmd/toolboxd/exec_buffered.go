@@ -9,6 +9,7 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+	"unicode/utf8"
 )
 
 // Buffered exec (POST /process/execute) used to read stdout and stderr to EOF
@@ -44,27 +45,105 @@ var (
 	maxExecDrainers int64 = 256
 	// execDrainers counts detached readers in this process.
 	execDrainers atomic.Int64
+	// execOutputCeiling is the most toolboxd keeps of one stream of one
+	// buffered exec, whatever the request asks: the last line under the
+	// caller's cap and the operator's, which sandboxd writes into the
+	// request (E1, ER5) and an older sandboxd does not. Before it, toolboxd
+	// held all output in memory and then encoded it again as JSON, so one
+	// command printing a few GB could OOM-kill the agent, and with it every
+	// exec, file call and terminal of the sandbox. 64 MiB equals the JSON
+	// reply the Daytona and Runloop facades already refuse to decode past
+	// (maxToolboxJSONBytes, maxToolboxResponse), so no facade loses output
+	// it could read today. A variable for tests.
+	execOutputCeiling int64 = 64 << 20
 )
+
+// execOutputLimits are the per-stream byte caps of one buffered exec. Zero
+// means the ceiling alone.
+type execOutputLimits struct {
+	stdout, stderr int64
+}
+
+// effectiveLimit clamps a requested cap to the ceiling.
+func effectiveLimit(requested int64) int64 {
+	if requested > 0 && requested < execOutputCeiling {
+		return requested
+	}
+	return execOutputCeiling
+}
 
 // execDrainersAtCap reports whether new background jobs lose their output.
 func execDrainersAtCap() bool { return execDrainers.Load() >= maxExecDrainers }
 
 // bufferedExecOutput is what one buffered exec produced.
 type bufferedExecOutput struct {
-	stdout  string
-	stderr  string
-	waitErr error
+	stdout          string
+	stderr          string
+	stdoutTruncated bool
+	stderrTruncated bool
+	waitErr         error
+}
+
+// capturedStream keeps the first limit bytes of one output stream.
+type capturedStream struct {
+	data      []byte
+	limit     int64
+	truncated bool
+}
+
+// add keeps what fits under the limit. The reader goes on reading past it
+// and drops the rest, so the command never blocks on a full pipe.
+func (s *capturedStream) add(p []byte) {
+	room := s.limit - int64(len(s.data))
+	if int64(len(p)) <= room {
+		s.data = append(s.data, p...)
+		return
+	}
+	if room > 0 {
+		s.data = append(s.data, p[:room]...)
+	}
+	s.truncated = true
+}
+
+// text is the kept output. A cut can split a multi-byte UTF-8 character,
+// which JSON would turn into U+FFFD and so grow past the cap; the partial
+// character is dropped instead. Untruncated output is returned as the
+// command wrote it.
+func (s *capturedStream) text() string {
+	if !s.truncated {
+		return string(s.data)
+	}
+	return string(trimPartialRune(s.data))
+}
+
+// trimPartialRune drops an incomplete UTF-8 sequence at the end of b. Bytes
+// that are not UTF-8 at all are left alone: the output was binary, not cut
+// text.
+func trimPartialRune(b []byte) []byte {
+	for back := 1; back <= utf8.UTFMax && back <= len(b); back++ {
+		c := b[len(b)-back]
+		if c < utf8.RuneSelf {
+			return b // ASCII: whatever follows is a whole or invalid sequence
+		}
+		if utf8.RuneStart(c) {
+			if !utf8.FullRune(b[len(b)-back:]) {
+				return b[:len(b)-back]
+			}
+			return b
+		}
+	}
+	return b
 }
 
 // execCollector gathers output until the reply is sent, then discards it.
 type execCollector struct {
 	mu        sync.Mutex
-	stdout    []byte
-	stderr    []byte
+	stdout    capturedStream
+	stderr    capturedStream
 	responded bool
 }
 
-func (c *execCollector) read(f *os.File, dst *[]byte, wg *sync.WaitGroup) {
+func (c *execCollector) read(f *os.File, dst *capturedStream, wg *sync.WaitGroup) {
 	defer wg.Done()
 	defer f.Close()
 	buf := make([]byte, 32<<10)
@@ -73,7 +152,7 @@ func (c *execCollector) read(f *os.File, dst *[]byte, wg *sync.WaitGroup) {
 		if n > 0 {
 			c.mu.Lock()
 			if !c.responded {
-				*dst = append(*dst, buf[:n]...)
+				dst.add(buf[:n])
 			}
 			c.mu.Unlock()
 		}
@@ -83,12 +162,18 @@ func (c *execCollector) read(f *os.File, dst *[]byte, wg *sync.WaitGroup) {
 	}
 }
 
-// finish freezes the reply: later output is read and dropped.
-func (c *execCollector) finish() (string, string) {
+// finish freezes the reply: later output is read and dropped, and never
+// marks a stream truncated.
+func (c *execCollector) finish() bufferedExecOutput {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.responded = true
-	return string(c.stdout), string(c.stderr)
+	return bufferedExecOutput{
+		stdout:          c.stdout.text(),
+		stderr:          c.stderr.text(),
+		stdoutTruncated: c.stdout.truncated,
+		stderrTruncated: c.stderr.truncated,
+	}
 }
 
 // prepareProcessGroup puts cmd in its own process group and makes a context
@@ -115,6 +200,13 @@ func prepareProcessGroup(cmd *exec.Cmd) {
 // returns once the command itself has exited (plus the grace when a
 // background job still holds its output).
 func runBufferedExec(logger *slog.Logger, cmd *exec.Cmd) (bufferedExecOutput, error) {
+	return runBufferedExecLimited(logger, cmd, execOutputLimits{})
+}
+
+// runBufferedExecLimited is runBufferedExec keeping at most limits of each
+// stream (E1). The caps only bound what is kept; reading, the grace and the
+// drainers work exactly as without them.
+func runBufferedExecLimited(logger *slog.Logger, cmd *exec.Cmd, limits execOutputLimits) (bufferedExecOutput, error) {
 	stdoutR, stdoutW, err := os.Pipe()
 	if err != nil {
 		return bufferedExecOutput{}, err
@@ -138,7 +230,10 @@ func runBufferedExec(logger *slog.Logger, cmd *exec.Cmd) (bufferedExecOutput, er
 		return bufferedExecOutput{}, startErr
 	}
 
-	collector := &execCollector{}
+	collector := &execCollector{
+		stdout: capturedStream{limit: effectiveLimit(limits.stdout)},
+		stderr: capturedStream{limit: effectiveLimit(limits.stderr)},
+	}
 	var readers sync.WaitGroup
 	readers.Add(2)
 	go collector.read(stdoutR, &collector.stdout, &readers)
@@ -157,14 +252,15 @@ func runBufferedExec(logger *slog.Logger, cmd *exec.Cmd) (bufferedExecOutput, er
 	case <-timer.C:
 	}
 	timer.Stop()
-	stdout, stderr := collector.finish()
+	out := collector.finish()
+	out.waitErr = waitErr
 
 	select {
 	case <-allClosed:
 	default:
 		detachExecDrainers(logger, allClosed, stdoutR, stderrR)
 	}
-	return bufferedExecOutput{stdout: stdout, stderr: stderr, waitErr: waitErr}, nil
+	return out, nil
 }
 
 // detachExecDrainers leaves the readers running for a background job that

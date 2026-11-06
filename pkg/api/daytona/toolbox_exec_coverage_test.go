@@ -165,6 +165,13 @@ func TestToolboxBulkDownload_RequestError(t *testing.T) {
 
 func newToolboxExecEnvWithHandler(t *testing.T, executeFn http.HandlerFunc) (facadeURL, sandboxID string) {
 	t.Helper()
+	return newToolboxExecEnvWithConfig(t, executeFn, nil)
+}
+
+// newToolboxExecEnvWithConfig is newToolboxExecEnvWithHandler with the
+// service config adjusted.
+func newToolboxExecEnvWithConfig(t *testing.T, executeFn http.HandlerFunc, mutate func(*config.Config)) (facadeURL, sandboxID string) {
+	t.Helper()
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/process/execute", executeFn)
@@ -214,6 +221,9 @@ func newToolboxExecEnvWithHandler(t *testing.T, executeFn http.HandlerFunc) (fac
 		Runtime:           models.RuntimeDocker,
 		EnableCaddy:       false,
 		HTTPClientTimeout: 5 * time.Second,
+	}
+	if mutate != nil {
+		mutate(&cfg)
 	}
 	svc := service.New(cfg, logger, st, fakeToolboxRouteRuntime{}, nil, nil, newDaytonaTestCipher(t), mountManager, nil)
 

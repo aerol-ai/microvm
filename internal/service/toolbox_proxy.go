@@ -63,6 +63,10 @@ func (s *Service) serveToolboxReverseProxy(ctx, callCtx context.Context, sandbox
 	if err := refuseToolboxAdminPath(path); err != nil {
 		return err
 	}
+	// Before the wake, so a refused body does not start a stopped sandbox.
+	if err := s.applyExecOutputPolicyToRequest(r, path); err != nil {
+		return err
+	}
 	// Reuse the sandbox the wake helper already read (owner-scoped, post-wake)
 	// instead of a second scopedGet — one fewer store read per toolbox call (D15).
 	sandbox, err := s.EnsureSandboxAwakeForHTTP(ctx, sandboxID)
@@ -228,6 +232,10 @@ func (s *Service) RoundTripToolbox(ctx context.Context, sandboxID, method, path 
 // reports a response still streaming from the sandbox, whose registration
 // must last until its body is closed.
 func (s *Service) roundTripToolbox(ctx, callCtx context.Context, sandboxID, method, path string, query url.Values, body io.Reader, headers http.Header) (*http.Response, bool, error) {
+	body, err := s.applyExecOutputPolicy(method, path, body)
+	if err != nil {
+		return nil, false, err
+	}
 	// Reuse the sandbox the wake helper already read (D15). The wake runs
 	// on ctx so a stop that ends this request cannot abort a start half way.
 	sandbox, err := s.EnsureSandboxAwakeForHTTP(ctx, sandboxID)

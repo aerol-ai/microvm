@@ -1207,10 +1207,14 @@ class MicroVM:
         # Not idempotent: a re-sent POST runs the user's command again, so a
         # timeout or reset after the request went out surfaces instead of
         # retrying. Sandbox.exec and exec_command both end here.
+        payload = _to_api_exec_request(request)
+        if payload.get("max_stdout_bytes") or payload.get("max_stderr_bytes"):
+            # An older agent ignores the caps and returns all output.
+            self._require_toolbox_features(sandbox_id, "exec.max_output_bytes")
         response = self._do_json(
             "POST",
             f"{self._version_prefix}/sandboxes/{sandbox_id}/toolbox/process/execute",
-            _to_api_exec_request(request),
+            payload,
             idempotent=False,
         )
         return _from_api_exec_result(response)
@@ -1866,6 +1870,8 @@ def _to_api_exec_request(request: ExecRequest) -> Dict[str, Any]:
             "workdir": _first_of(request, "workDir", "workdir"),
             "env": _first_of(request, "env"),
             "timeout_seconds": _first_of(request, "timeoutSeconds", "timeout_seconds"),
+            "max_stdout_bytes": _first_of(request, "maxStdoutBytes", "max_stdout_bytes"),
+            "max_stderr_bytes": _first_of(request, "maxStderrBytes", "max_stderr_bytes"),
         }
     )
 
@@ -1921,6 +1927,8 @@ def _from_api_exec_result(result: Dict[str, Any]) -> ExecResult:
         "exitCode": int(_first_of(result, "exit_code", "exitCode") or 0),
         "durationMS": int(_first_of(result, "duration_ms", "durationMS") or 0),
         "timedOut": bool(_first_of(result, "timed_out", "timedOut") or False),
+        "stdoutTruncated": bool(_first_of(result, "stdout_truncated", "stdoutTruncated") or False),
+        "stderrTruncated": bool(_first_of(result, "stderr_truncated", "stderrTruncated") or False),
     }
 
 

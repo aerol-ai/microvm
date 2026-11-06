@@ -13,6 +13,16 @@ public class ExecRequest {
     public Map<String, String> env;
     @JsonProperty("timeout_seconds")
     public Integer timeoutSeconds;
+    /**
+     * Keep only the first N bytes of stdout; the rest is dropped and the command is not slowed
+     * down. A sandbox whose agent predates the caps throws MicroVMUnsupportedFeatureException
+     * instead of returning all output.
+     */
+    @JsonProperty("max_stdout_bytes")
+    public Long maxStdoutBytes;
+    /** Keep only the first N bytes of stderr. Same rules as {@link #maxStdoutBytes}. */
+    @JsonProperty("max_stderr_bytes")
+    public Long maxStderrBytes;
 
     public ExecRequest setCommand(String command) {
         this.command = command;
@@ -31,6 +41,16 @@ public class ExecRequest {
 
     public ExecRequest setTimeoutSeconds(Integer timeoutSeconds) {
         this.timeoutSeconds = timeoutSeconds;
+        return this;
+    }
+
+    public ExecRequest setMaxStdoutBytes(Long maxStdoutBytes) {
+        this.maxStdoutBytes = maxStdoutBytes;
+        return this;
+    }
+
+    public ExecRequest setMaxStderrBytes(Long maxStderrBytes) {
+        this.maxStderrBytes = maxStderrBytes;
         return this;
     }
 }

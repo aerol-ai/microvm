@@ -12,4 +12,10 @@ public class ExecResult {
     /** True when the command ran past its timeout and the sandbox killed its whole process group. Older sandbox agents never set it. */
     @JsonProperty("timed_out")
     public boolean timedOut;
+    /** True when stdout was longer than its cap (maxStdoutBytes, or the server's own limit) and was cut. */
+    @JsonProperty("stdout_truncated")
+    public boolean stdoutTruncated;
+    /** True when stderr was longer than its cap and was cut. */
+    @JsonProperty("stderr_truncated")
+    public boolean stderrTruncated;
 }

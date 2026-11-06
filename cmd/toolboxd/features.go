@@ -16,7 +16,12 @@ import "sort"
 // feature adds. TestEveryRequestOptionIsListed parses this package and fails
 // when a handler reads an option that is neither here nor in
 // baselineRequestOptions, so the list cannot drift from the handlers.
-var toolboxFeatures = map[string][]string{}
+var toolboxFeatures = map[string][]string{
+	// Buffered exec output caps (plan E1). An older agent drops them and
+	// returns all output, which is what a caller that set a cap must never
+	// get by surprise (ER4).
+	"exec.max_output_bytes": {"max_stdout_bytes", "max_stderr_bytes"},
+}
 
 // baselineRequestOptions are the options toolboxd understood before /version
 // listed features. Any agent honours them, so an SDK sends them unchecked.

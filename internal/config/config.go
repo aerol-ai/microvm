@@ -534,6 +534,18 @@ type Config struct {
 	ReconcileInterval     time.Duration
 	NetstatsPollInterval  time.Duration
 	UploadMaxBytes        int64
+	// ExecOutputDefaultBytes is the per-stream output cap sandboxd writes
+	// into a buffered exec (toolbox /process/execute) that sets none, and
+	// ExecOutputMaxBytes the largest cap a caller may ask for; a larger or
+	// missing one is lowered to it. sandboxd applies them on every path that
+	// reaches the sandbox's exec (v1, Daytona, Runloop), so they hold on every
+	// runtime and on agents already running (plan E1, ER5). An agent older
+	// than the caps ignores them, as it ignores the caller's own. 0 = off:
+	// no default cap and no maximum, only the agent's 64 MiB ceiling.
+	// SB_EXEC_OUTPUT_DEFAULT_BYTES, SB_EXEC_OUTPUT_MAX_BYTES; the default
+	// may not exceed the maximum.
+	ExecOutputDefaultBytes int64
+	ExecOutputMaxBytes     int64
 	// ToolboxDeadPeerTimeout bounds how long a toolbox connection (an exec,
 	// a file transfer, a session) lives on once its sandbox stops answering
 	// without closing it, as a killed gVisor sandbox or Firecracker VM does.
@@ -2103,6 +2115,8 @@ func load(keyTool bool) (Config, error) {
 		ReconcileInterval:             getEnvDuration("SB_RECONCILE_INTERVAL", 5*time.Minute),
 		NetstatsPollInterval:          getEnvDuration("SB_NETSTATS_POLL_INTERVAL", 10*time.Second),
 		UploadMaxBytes:                int64(getEnvInt("SB_UPLOAD_MAX_BYTES", 256*1024*1024)),
+		ExecOutputDefaultBytes:        getEnvInt64("SB_EXEC_OUTPUT_DEFAULT_BYTES", 0),
+		ExecOutputMaxBytes:            getEnvInt64("SB_EXEC_OUTPUT_MAX_BYTES", 0),
 		OTELMetricsEnabled:            getEnvBool("SB_OTEL_METRICS_ENABLED", false),
 		OTELMetricsEndpoint:           firstNonEmpty(os.Getenv("SB_OTEL_METRICS_ENDPOINT"), os.Getenv("OTEL_EXPORTER_OTLP_METRICS_ENDPOINT")),
 		OTELMetricsInterval:           getEnvDuration("SB_OTEL_METRICS_INTERVAL", 30*time.Second),
@@ -2407,6 +2421,22 @@ func load(keyTool bool) (Config, error) {
 	}
 	if cfg.OTELTracesEnabled && (cfg.OTELTracesSampleRatio < 0 || cfg.OTELTracesSampleRatio > 1) {
 		return Config{}, errors.New("SB_OTEL_TRACES_SAMPLE_RATIO must be between 0 and 1 when OTEL traces are enabled")
+	}
+	// Unlike most numeric settings, a value that does not parse refuses the
+	// boot instead of keeping the default: the default is "off", so a typo
+	// such as "10MB" would silently remove the limit the operator meant.
+	for _, name := range []string{"SB_EXEC_OUTPUT_DEFAULT_BYTES", "SB_EXEC_OUTPUT_MAX_BYTES"} {
+		if raw := strings.TrimSpace(os.Getenv(name)); raw != "" {
+			if _, err := strconv.ParseInt(raw, 10, 64); err != nil {
+				return Config{}, fmt.Errorf("%s must be a whole number of bytes, got %q", name, raw)
+			}
+		}
+	}
+	if cfg.ExecOutputDefaultBytes < 0 || cfg.ExecOutputMaxBytes < 0 {
+		return Config{}, errors.New("SB_EXEC_OUTPUT_DEFAULT_BYTES and SB_EXEC_OUTPUT_MAX_BYTES must be 0 (off) or more")
+	}
+	if cfg.ExecOutputMaxBytes > 0 && cfg.ExecOutputDefaultBytes > cfg.ExecOutputMaxBytes {
+		return Config{}, fmt.Errorf("SB_EXEC_OUTPUT_DEFAULT_BYTES (%d) must not exceed SB_EXEC_OUTPUT_MAX_BYTES (%d)", cfg.ExecOutputDefaultBytes, cfg.ExecOutputMaxBytes)
 	}
 	if cfg.ToolboxDeadPeerTimeout < 0 || (cfg.ToolboxDeadPeerTimeout > 0 && cfg.ToolboxDeadPeerTimeout < toolboxhttp.MinDeadPeerTimeout) {
 		return Config{}, fmt.Errorf("SB_TOOLBOX_DEAD_PEER_TIMEOUT must be 0 (off) or at least %s", toolboxhttp.MinDeadPeerTimeout)

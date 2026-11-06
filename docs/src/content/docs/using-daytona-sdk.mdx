@@ -77,7 +77,7 @@ We checked this example with `@daytona/sdk` 0.223.1. AerolVM's own [Daytona exam
 
 | Daytona feature | On AerolVM |
 |---|---|
-| `process.executeCommand` | Works. A command that starts a background job with `&` returns when the command itself ends, and the job keeps running. A command that runs past its timeout is stopped together with its background jobs. |
+| `process.executeCommand` | Works. A command that starts a background job with `&` returns when the command itself ends, and the job keeps running. A command that runs past its timeout is stopped together with its background jobs. Your operator can [limit how much output](/exec-streaming/#for-server-operators) it returns. |
 | `process.codeRun` | Works for `python`, `javascript` (Node.js), `typescript` (needs `ts-node` in the image) and `bash` or `sh`. The language's program must be installed in the image. |
 | Sessions: create, run commands, read command logs, send input, delete | Works. In command logs, each byte that is not valid UTF-8 reads as `?`. |
 | Files: list, get info, upload (one file or many), move, search by name, find text in files | Works. |

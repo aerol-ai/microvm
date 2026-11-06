@@ -951,6 +951,8 @@ var Registry = []UseCase{
 	{ID: "UC-370", Title: "exec returns when the command ends: a background job keeps running and does not hold up the reply; a timeout stops the whole process group and reports timed_out; Daytona executeCommand behaves the same", Implemented: true},
 	{ID: "UC-371", Title: "exec on gVisor returns when the command ends, keeps background jobs running and stops the whole group on a timeout", Requires: []Capability{CapGvisor}, Implemented: true},
 	{ID: "UC-372", Title: "sandboxd counts toolbox calls by API, feature and result: a Daytona language-server call shows as daytona/lsp/501 and a v1 exec as v1/exec/2xx in aerolvm_toolbox_calls_total", Implemented: true},
+	{ID: "UC-380", Title: "exec output caps: each stream keeps its first N bytes and reports stdout_truncated / stderr_truncated, the command still exits 0 without being held up by the output it drops, and the agent lists exec.max_output_bytes on /version", Implemented: true},
+	{ID: "UC-381", Title: "exec output caps are clamped on the way: a cap above the agent's 64 MiB ceiling (or the operator's maximum) is lowered, a caller's smaller cap is kept", Implemented: true},
 }
 
 // byID is a lookup built once for the report generator.

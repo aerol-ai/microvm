@@ -402,6 +402,8 @@ interface ApiExecResult {
   exit_code: number;
   duration_ms: number;
   timed_out?: boolean;
+  stdout_truncated?: boolean;
+  stderr_truncated?: boolean;
 }
 
 interface ApiHealthStatus {
@@ -1010,6 +1012,10 @@ export class APIClient {
   }
 
   async exec(id: string, request: ExecRequest): Promise<ExecResult> {
+    if (request.maxStdoutBytes || request.maxStderrBytes) {
+      // An older agent ignores the caps and returns all output.
+      await this.requireToolboxFeatures(id, "exec.max_output_bytes");
+    }
     // Not idempotent: a re-sent exec runs the caller's command a second time.
     const response = await this.doJSON<ApiExecResult>(
       "POST",
@@ -1810,6 +1816,8 @@ function toApiExecRequest(request: ExecRequest): Record<string, unknown> {
     workdir: request.workDir,
     env: request.env,
     timeout_seconds: request.timeoutSeconds,
+    max_stdout_bytes: request.maxStdoutBytes,
+    max_stderr_bytes: request.maxStderrBytes,
   };
 }
 
@@ -2019,6 +2027,8 @@ function fromApiExecResult(result: ApiExecResult): ExecResult {
     exitCode: result.exit_code,
     durationMS: result.duration_ms,
     timedOut: result.timed_out ?? false,
+    stdoutTruncated: result.stdout_truncated ?? false,
+    stderrTruncated: result.stderr_truncated ?? false,
   };
 }
 

@@ -2833,3 +2833,87 @@ class ToolboxFeatureTests(unittest.TestCase):
         client, calls = self._client([])
         client._require_toolbox_features("sb-1")
         self.assertEqual(calls, [])
+
+
+class ExecOptionsTests(unittest.TestCase):
+    """Exec options an older sandbox agent would ignore, against a real HTTP
+    server that plays the agent: the SDK reads /version first and refuses to
+    send what the agent does not list (plan section 10, ER4)."""
+
+    def _serve(self, features, result=None):
+        hits = []
+        body = json.dumps(result or {"stdout": "", "stderr": "", "exit_code": 0, "duration_ms": 1}).encode()
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def _reply(self, payload):
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def do_GET(self):
+                hits.append(("GET", self.path, None))
+                info = {"version": "0.6.11"}
+                if features is not None:
+                    info["features"] = features
+                self._reply(json.dumps(info).encode())
+
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length") or 0)
+                hits.append(("POST", self.path, json.loads(self.rfile.read(length))))
+                self._reply(body)
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
+        thread.start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        return MicroVM("http://127.0.0.1:%d" % server.server_port, "pat", config=_FAST_RETRY), hits
+
+    def test_output_caps_are_sent_when_the_agent_lists_them(self):
+        client, hits = self._serve(
+            ["exec.max_output_bytes"],
+            {"stdout": "aaaa", "stderr": "", "exit_code": 0, "duration_ms": 1, "stdout_truncated": True},
+        )
+        result = client.exec("sb-1", {"command": "yes a", "maxStdoutBytes": 4, "max_stderr_bytes": 100})
+        self.assertEqual(
+            hits,
+            [
+                ("GET", "/v1/sandboxes/sb-1/toolbox/version", None),
+                ("POST", _EXEC_PATH, {"command": "yes a", "max_stdout_bytes": 4, "max_stderr_bytes": 100}),
+            ],
+        )
+        self.assertEqual(result["stdout"], "aaaa")
+        self.assertTrue(result["stdoutTruncated"])
+        self.assertFalse(result["stderrTruncated"])
+
+    def test_mixed_version_agent_without_caps_is_refused_before_exec(self):
+        from microvm import MicroVMUnsupportedFeatureError
+
+        for features in ([], None, ["files.copy"]):
+            with self.subTest(features=features):
+                client, hits = self._serve(features)
+                with self.assertRaises(MicroVMUnsupportedFeatureError) as ctx:
+                    client.exec("sb-1", {"command": "yes", "maxStdoutBytes": 1024})
+                self.assertEqual(ctx.exception.features, ["exec.max_output_bytes"])
+                self.assertIn("restart the sandbox", str(ctx.exception))
+                # The command never ran: the only call was the /version read.
+                self.assertEqual([method for method, _, _ in hits], ["GET"])
+
+    def test_exec_without_caps_needs_no_version_call(self):
+        client, hits = self._serve([])
+        client.exec("sb-1", {"command": "ls", "maxStdoutBytes": 0})
+        self.assertEqual(hits, [("POST", _EXEC_PATH, {"command": "ls", "max_stdout_bytes": 0})])
+
+    def test_truncated_flags_default_to_false_for_older_agents(self):
+        from microvm.client import _from_api_exec_result
+
+        old = _from_api_exec_result({"stdout": "x", "stderr": "", "exit_code": 0, "duration_ms": 1})
+        self.assertFalse(old["stdoutTruncated"])
+        self.assertFalse(old["stderrTruncated"])
+        new = _from_api_exec_result({"stdout": "", "stderr": "e", "exit_code": 0, "duration_ms": 1, "stderr_truncated": True})
+        self.assertTrue(new["stderrTruncated"])
