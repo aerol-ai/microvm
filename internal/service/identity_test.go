@@ -259,7 +259,15 @@ func TestRotateIdentityKeyOverlapAndIdempotency(t *testing.T) {
 		t.Fatal(err)
 	}
 	first := h.svc.identity.signer.Load().signer.KeyID
-	old, err := h.svc.identity.signer.Load().signer.Issue(cloudidentity.IssueRequest{Issuer: testIssuer, SandboxID: "sb", RoleTag: "r", Audience: "a", Now: now})
+	// Bootstrapping and serving the JWKS open no private key; signing does.
+	if h.svc.identity.signer.Load().signer.Key != nil {
+		t.Fatal("the bootstrap opened the private key")
+	}
+	signer, err := h.svc.currentIdentitySigner(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	old, err := signer.signer.Issue(cloudidentity.IssueRequest{Issuer: testIssuer, SandboxID: "sb", RoleTag: "r", Audience: "a", Now: now})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -399,7 +407,13 @@ func TestIdentitySignerRefreshAndStaleness(t *testing.T) {
 	if _, err := h.st.WriteIdentityKeys(ctx, set.Generation, []cloudidentity.KeyRecord{rec}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := h.svc.loadIdentitySigner(ctx, false); !errors.Is(err, ErrIdentityUnavailable) || strings.Contains(err.Error(), string(rec.SealedPrivate)) {
+	h.svc.identity.signer.Store(nil)
+	// The JWKS needs only the public half, so it is still served...
+	if _, err := h.svc.IdentityJWKS(ctx); err != nil {
+		t.Fatalf("JWKS with a key this node cannot open = %v", err)
+	}
+	// ...but signing fails, naming the key and never its bytes.
+	if _, err := h.svc.currentIdentitySigner(ctx); !errors.Is(err, ErrIdentityUnavailable) || strings.Contains(err.Error(), string(rec.SealedPrivate)) {
 		t.Fatalf("foreign key = %v", err)
 	}
 	h.svc.cipher = nil
@@ -926,7 +940,7 @@ func TestResealIdentityKeys(t *testing.T) {
 		t.Fatal(err)
 	}
 	h.svc.identity.signer.Store(nil)
-	if _, err := h.svc.loadIdentitySigner(ctx, false); err != nil {
+	if _, err := h.svc.currentIdentitySigner(ctx); err != nil {
 		t.Fatalf("signing key after the old server key retired: %v", err)
 	}
 	// A key no ring key opens is reported, not dropped.

@@ -114,8 +114,9 @@ type identityState struct {
 	deliver func(ctx context.Context, sb *models.Sandbox, token string) error
 }
 
-// identitySigner is one read of the key set: the active key opened, and the
-// set (sealed) for the JWKS.
+// identitySigner is one read of the key set: the set (sealed) for the JWKS
+// and, once this node signs with it, the active key opened. A node that only
+// serves the JWKS (an ingress or server node) never opens a private key.
 type identitySigner struct {
 	set      cloudidentity.KeySet
 	signer   cloudidentity.Signer
@@ -199,11 +200,37 @@ func (s *Service) EnsureIdentityKeysReady(ctx context.Context) error {
 	return nil
 }
 
-// currentIdentitySigner returns the key set to sign and publish with,
-// re-read every identitySignerTTL. A failed re-read keeps the last set for
-// up to identitySignerMaxStale; refreshes are single-flight, and a caller
-// that finds one running uses the set it has while it is still usable.
+// currentIdentitySigner returns the key set with its active key opened, to
+// sign with. The key is opened once per read of the set, on the first
+// token a node signs.
 func (s *Service) currentIdentitySigner(ctx context.Context) (*identitySigner, error) {
+	cur, err := s.currentIdentityKeys(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if cur.signer.Key != nil {
+		return cur, nil
+	}
+	active, ok := cur.set.Active()
+	if !ok {
+		return nil, fmt.Errorf("%w: the key set has no active key", ErrIdentityUnavailable)
+	}
+	key, err := s.openIdentityKey(active)
+	if err != nil {
+		return nil, err
+	}
+	opened := &identitySigner{set: cur.set, signer: cloudidentity.Signer{KeyID: active.ID, Key: key}, loadedAt: cur.loadedAt}
+	// A refresh that landed meanwhile wins; this opened copy is still a
+	// correct signer for the set it was read from.
+	s.identity.signer.CompareAndSwap(cur, opened)
+	return opened, nil
+}
+
+// currentIdentityKeys returns the key set to sign and publish with, re-read
+// every identitySignerTTL. A failed re-read keeps the last set for up to
+// identitySignerMaxStale; refreshes are single-flight, and a caller that
+// finds one running uses the set it has while it is still usable.
+func (s *Service) currentIdentityKeys(ctx context.Context) (*identitySigner, error) {
 	if err := s.EnsureIdentityKeysReady(ctx); err != nil {
 		return nil, err
 	}
@@ -235,7 +262,7 @@ func (s *Service) currentIdentitySigner(ctx context.Context) (*identitySigner, e
 }
 
 // loadIdentitySigner reads the key set, makes the first key when create is
-// set and there is none, opens the active key and stores the result.
+// set and there is none, and stores the result. It opens no private key.
 func (s *Service) loadIdentitySigner(ctx context.Context, create bool) (*identitySigner, error) {
 	backend := s.identityBackend()
 	set, err := backend.ReadIdentityKeys(ctx)
@@ -263,11 +290,7 @@ func (s *Service) loadIdentitySigner(ctx context.Context, create bool) (*identit
 	if !ok {
 		return nil, fmt.Errorf("%w: the key set has no active key", ErrIdentityUnavailable)
 	}
-	key, err := s.openIdentityKey(active)
-	if err != nil {
-		return nil, err
-	}
-	signer := &identitySigner{set: set, signer: cloudidentity.Signer{KeyID: active.ID, Key: key}, loadedAt: s.identityNow()}
+	signer := &identitySigner{set: set, signer: cloudidentity.Signer{KeyID: active.ID}, loadedAt: s.identityNow()}
 	s.identity.signer.Store(signer)
 	return signer, nil
 }
@@ -338,7 +361,7 @@ func (s *Service) IdentityDiscovery() ([]byte, error) {
 // IdentityJWKS is the public key set: the active key and every key rotated
 // out less than two hours ago (D1.3). It holds public keys only.
 func (s *Service) IdentityJWKS(ctx context.Context) ([]byte, error) {
-	signer, err := s.currentIdentitySigner(ctx)
+	signer, err := s.currentIdentityKeys(ctx)
 	if err != nil {
 		return nil, err
 	}
