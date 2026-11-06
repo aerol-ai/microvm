@@ -50,6 +50,31 @@ def _public(cls):
     return {name for name in dir(cls) if not name.startswith("_")}
 
 
+class LazyAsyncImportTests(unittest.TestCase):
+    def test_importing_microvm_does_not_load_httpx(self):
+        # The sync client needs no httpx; the async names load it on first use.
+        import os
+        import subprocess
+        import sys
+
+        code = (
+            "import sys, microvm\n"
+            "print('httpx' in sys.modules)\n"
+            "from microvm import AsyncMicroVM\n"
+            "print(AsyncMicroVM.__name__)\n"
+        )
+        env = dict(os.environ)
+        env["PYTHONPATH"] = os.pathsep.join(p for p in [os.path.dirname(os.path.dirname(os.path.abspath(__file__))), env.get("PYTHONPATH", "")] if p)
+        out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, env=env, check=True).stdout.split()
+        self.assertEqual(out, ["False", "AsyncMicroVM"])
+
+    def test_an_unknown_name_is_still_an_attribute_error(self):
+        import microvm
+
+        with self.assertRaises(AttributeError):
+            microvm.NoSuchThing  # noqa: B018
+
+
 class AsyncParityTests(unittest.TestCase):
     """The two clients cannot drift: same public calls, same parameters."""
 
@@ -409,6 +434,29 @@ class AsyncClientTests(unittest.TestCase):
 
         listed = asyncio.run(go())
         self.assertEqual(listed["tokens"][0]["id"], "tok_1")
+
+    def test_a_passed_in_clients_own_timeout_is_a_microvm_timeout(self):
+        # A caller's httpx client keeps httpx's own limit (5 s by default);
+        # when it fires, the error must still be the SDK's timeout, which is
+        # also TimeoutError, not a bare httpx.ReadTimeout.
+        def handler(request):
+            raise httpx.ReadTimeout("timed out", request=request)
+
+        async def go():
+            async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+                client = AsyncMicroVM(
+                    "http://sandboxd.test", "pat", http_client=http,
+                    config={"retry": {"maxRetries": 1, "baseDelayMs": 1, "maxDelayMs": 1}},
+                )
+                try:
+                    await client.tokens.list()
+                finally:
+                    await client.close()
+
+        with self.assertRaises(MicroVMTimeoutError) as ctx:
+            asyncio.run(go())
+        self.assertIsInstance(ctx.exception, TimeoutError)
+        self.assertIsInstance(ctx.exception.__cause__, httpx.ReadTimeout)
 
 
 if __name__ == "__main__":

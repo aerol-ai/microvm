@@ -30,6 +30,7 @@ from .client import (
     MicroVM,
     MicroVMError,
     MicroVMNotFoundError,
+    MicroVMTimeoutError,
     SessionAttachHandle,
     Tokens,
     _call_deadline,
@@ -116,6 +117,15 @@ except ImportError:  # pragma: no cover - exercised only without the extra
     httpx = None  # type: ignore[assignment]
 
 _INSTALL_HINT = 'AsyncMicroVM needs httpx: pip install "aerolvm-sdk[async]"'
+
+
+def _transport_timeout(exc: BaseException) -> MicroVMTimeoutError:
+    """An httpx timeout from the client's own limit (a caller's http_client
+    keeps httpx's 5 s default) as the SDK's timeout error. httpx's timeouts
+    are not TimeoutError, so without this `except TimeoutError` and
+    `except MicroVMTimeoutError` missed them; the sync client's socket
+    timeouts are TimeoutError already."""
+    return MicroVMTimeoutError(0, f"the request timed out ({type(exc).__name__}: {exc})")
 
 
 def _on_loop(loop: asyncio.AbstractEventLoop, callback: Any) -> Any:
@@ -568,7 +578,10 @@ class AsyncMicroVM(_MicroVMCore):
 
     ``http_client`` is an optional ``httpx.AsyncClient`` to use instead of
     the one this client makes; its TLS settings then win over ``ca_file``
-    and ``client_cert``, and closing it is up to you.
+    and ``client_cert``, and closing it is up to you. Its own timeout
+    bounds every call made without ``timeout=`` (httpx's default is 5 s;
+    the client made here has none), and running out raises
+    :class:`MicroVMTimeoutError`.
     """
 
     def __init__(
@@ -744,7 +757,7 @@ class AsyncMicroVM(_MicroVMCore):
                 if left is not None:
                     raise _deadline_error() from exc
                 if attempt >= max_retries or not (idempotent or _never_sent(exc)):
-                    raise
+                    raise _transport_timeout(exc) from exc
             except httpx.TransportError as exc:
                 last_exc = exc
                 if attempt >= max_retries or not (idempotent or _never_sent(exc)):
@@ -774,7 +787,7 @@ class AsyncMicroVM(_MicroVMCore):
                     if left is not None:
                         raise _deadline_error() from exc
                     if attempt >= max_retries or not idempotent or body_started:
-                        raise
+                        raise _transport_timeout(exc) from exc
                 except httpx.TransportError as exc:
                     # The answer broke off while it was read: the server may
                     # already be acting on the request.
@@ -791,6 +804,8 @@ class AsyncMicroVM(_MicroVMCore):
             await asyncio.sleep(delay)
 
         assert last_exc is not None
+        if isinstance(last_exc, httpx.TimeoutException):
+            raise _transport_timeout(last_exc) from last_exc
         raise last_exc
 
     def _exec_stream_handle(self, websocket_module: Any, ws: Any, options: ExecStreamOptions) -> AsyncExecStreamHandle:
