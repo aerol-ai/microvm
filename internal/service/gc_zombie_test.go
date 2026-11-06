@@ -461,3 +461,13 @@ func TestGCZombieCaddyEntriesKeepsTokenGatedWakeRoutes(t *testing.T) {
 		t.Fatalf("http routes after gc: got %v, want %v", got, want)
 	}
 }
+
+// withGCCaddyFake points svc at a fake Caddy admin API, so the zombie sweep
+// gets past its Caddy snapshot and reaches its store read. With Caddy off
+// the sweep reads nothing, so a closed store would not show.
+func withGCCaddyFake(t *testing.T, svc *Service) {
+	t.Helper()
+	server := httptest.NewServer(newGCCaddyFake().handler(t))
+	t.Cleanup(server.Close)
+	svc.caddy = caddy.New(config.Config{CaddyAdminURL: server.URL, CaddyServerID: "srv0", EnableCaddy: true, HTTPClientTimeout: 5 * time.Second})
+}

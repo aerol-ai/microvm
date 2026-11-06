@@ -739,6 +739,7 @@ func TestServiceHelperErrorBranches(t *testing.T) {
 		if snap := admitter.Snapshot(); snap.SandboxesActive != 0 {
 			t.Fatalf("admitter snapshot = %+v, want unchanged", snap)
 		}
+		withGCCaddyFake(t, svc)
 		if err := svc.gcClusterIngressRoutes(ctx); err == nil {
 			t.Fatal("gcClusterIngressRoutes should fail when the store is closed")
 		}

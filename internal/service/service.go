@@ -6852,7 +6852,7 @@ func (s *Service) Reconcile(ctx context.Context) error {
 	// entry for a sandbox row that was deleted out-of-band (DB wipe,
 	// manual surgery) and no destroy ran. Without this, caddy accumulates
 	// dead routes forever.
-	s.gcZombieCaddyEntries(ctx, known)
+	_ = s.gcZombieCaddyEntries(ctx, known) // logged inside; reconcile goes on
 
 	// Stale-mount sweep. Anything under /var/lib/sandboxd/mounts/ that
 	// doesn't correspond to a sandbox we're going to keep is a leftover
@@ -7296,14 +7296,14 @@ func lifecycleDecision(sb *models.Sandbox, now time.Time, globalIdle time.Durati
 // failing DELETE doesn't abort the rest of the sweep. The legitimate-set
 // computation excludes destroyed sandboxes — by the time this runs, the
 // destroyed-loop earlier in Reconcile has already cleaned their routes.
-func (s *Service) gcZombieCaddyEntries(ctx context.Context, sandboxes []*models.Sandbox) {
+func (s *Service) gcZombieCaddyEntries(ctx context.Context, sandboxes []*models.Sandbox) error {
 	if !s.caddy.Enabled() {
-		return
+		return nil
 	}
 	snap, err := s.caddy.Snapshot(ctx)
 	if err != nil {
 		s.logger.Warn("caddy snapshot for zombie gc failed", "error", err)
-		return
+		return nil
 	}
 	// Rows read before this snapshot can't explain a route made after them
 	// (a sandbox created, a port exposed), so the sweep reads the rows once,
@@ -7316,7 +7316,7 @@ func (s *Service) gcZombieCaddyEntries(ctx context.Context, sandboxes []*models.
 		fresh, err := s.store.List(ctx)
 		if err != nil {
 			s.logger.Warn("zombie gc: sandbox list after the caddy snapshot failed; skipping this pass", "error", err)
-			return
+			return fmt.Errorf("zombie gc list sandboxes: %w", err)
 		}
 		sandboxes = fresh
 	}
@@ -7416,6 +7416,7 @@ func (s *Service) gcZombieCaddyEntries(ctx context.Context, sandboxes []*models.
 		}
 		s.logger.Info("audit zombie tls route removed", "route_id", id)
 	}
+	return nil
 }
 
 func (s *Service) addClusterIngressExpectedRoutes(expectedHTTP, expectedTCPServers, expectedTLSRoutes map[string]struct{}) {
@@ -7877,7 +7878,9 @@ func (s *Service) applyInFluxRoute(ctx context.Context, p cluster.Placement) err
 
 func (s *Service) gcClusterIngressRoutes(ctx context.Context) error {
 	// gcZombieCaddyEntries reads the rows itself, after its Caddy snapshot.
-	s.gcZombieCaddyEntries(ctx, nil)
+	if err := s.gcZombieCaddyEntries(ctx, nil); err != nil {
+		return fmt.Errorf("cluster ingress gc: %w", err)
+	}
 	return nil
 }
 
