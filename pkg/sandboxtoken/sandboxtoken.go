@@ -37,12 +37,20 @@
 //     grant, so a token never holds more than the person who issued it.
 //   - There is no revocation list (that would be the database call this
 //     design avoids). A token dies at expiry, when its sandbox is deleted
-//     (the sandbox id no longer resolves), or when the server key it was
-//     signed with is retired. Lifetimes are therefore short: expiry is
-//     required and capped by SB_SANDBOX_TOKEN_MAX_TTL (default 24h). An id
-//     reused after a delete is reachable only by the same owner (ids from an
-//     Idempotency-Key are namespaced by owner, others are random), and the
-//     toolbox side also fences the token to the issuing owner.
+//     (the sandbox id no longer resolves), when the server key it was
+//     signed with is retired, or when its sandbox's tokens are revoked.
+//     Lifetimes are still short: expiry is required and capped by
+//     SB_SANDBOX_TOKEN_MAX_TTL (default 24h).
+//   - Revoke is per sandbox, not per token: POST
+//     /v1/sandboxes/{id}/tokens/revoke stores a not-before second on the
+//     sandbox's row (NotBeforeAt), and every token issued before it is
+//     refused (CheckNotBefore). The check costs no extra read: the toolbox
+//     route already reads the row on the owner node, and a gated port reads
+//     it from the same warm-cache entry or row read as its gate. A new row
+//     (a create, a failover recreate on another node, a WASM migration)
+//     starts with a not-before of its creation, so a token from before it
+//     never reaches it: not a token for a deleted sandbox whose id was
+//     reused, nor one revoked on an owner that then died.
 //   - Replay inside the lifetime is by design: it is a bearer token, like a
 //     signed URL. It travels only over HTTPS (A2 refuses token visibility
 //     without a domain) and is never forwarded into the sandbox: the toolbox
@@ -70,8 +78,8 @@
 //     call's audit record names it, and a call made with a token records
 //     sandbox_token:<id> as its caller. Refusals say only the reason
 //     (malformed, invalid_signature, expired, not_yet_valid,
-//     too_long_lived) and, for a scope miss, which part (sandbox, port,
-//     path or method), never a claim value or a key id.
+//     too_long_lived, revoked) and, for a scope miss, which part (sandbox,
+//     port, path or method), never a claim value or a key id.
 package sandboxtoken
 
 import (
@@ -134,6 +142,9 @@ var (
 	ErrExpired          = errors.New("sandbox token: expired")
 	ErrNotYetValid      = errors.New("sandbox token: not yet valid")
 	ErrTooLongLived     = errors.New("sandbox token: lifetime is longer than this server allows")
+	// ErrRevoked is a good token issued before its sandbox's tokens were
+	// revoked (CheckNotBefore).
+	ErrRevoked = errors.New("sandbox token: revoked")
 	// ErrOutOfScope is a valid token used for a request it does not cover.
 	// ScopeError says which part.
 	ErrOutOfScope = errors.New("sandbox token: does not cover this request")
@@ -185,6 +196,37 @@ type Claims struct {
 
 // Expiry is ExpiresAt as a time.
 func (c Claims) Expiry() time.Time { return time.Unix(c.ExpiresAt, 0).UTC() }
+
+// NotBeforeAt is the not-before second a revoke (or a new row) made at now
+// stores: the second after now's. IssuedAt is whole seconds, so a token
+// issued earlier in now's own second carries the same IssuedAt as one
+// issued later in it; storing now's second would let the earlier one
+// through. The next second refuses both, and IssueTime lifts a token issued
+// after the revoke but inside that same second up to it, so that one works.
+func NotBeforeAt(now time.Time) int64 { return now.Unix() + 1 }
+
+// IssueTime is the time a token issued at now says it was issued, for a
+// sandbox whose tokens_not_before is notBefore: now, or notBefore when that
+// is later. It is later only for a token issued in the second of a revoke
+// or of the row's creation, and then by under a second (well inside
+// ClockSkew, so every node accepts it). After a clock step back on the
+// owner it can be further ahead; the token then reads not_yet_valid until
+// the clock catches up, rather than slipping under the revoke.
+func IssueTime(now time.Time, notBefore int64) time.Time {
+	if notBefore > now.Unix() {
+		return time.Unix(notBefore, 0)
+	}
+	return now
+}
+
+// CheckNotBefore refuses a token issued before notBefore, its sandbox's
+// tokens_not_before (0: nothing was ever revoked).
+func (c Claims) CheckNotBefore(notBefore int64) error {
+	if c.IssuedAt < notBefore {
+		return ErrRevoked
+	}
+	return nil
+}
 
 // Signer is the signing half of a key ring (secrets.Cipher).
 type Signer interface {

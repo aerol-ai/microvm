@@ -388,3 +388,63 @@ func TestKidLivesOutsideThePayload(t *testing.T) {
 		t.Fatal("kid segment missing")
 	}
 }
+
+// Revoke works in whole seconds. A revoke at 12:00:00.4 must refuse a
+// token issued at 12:00:00.1 (same IssuedAt second) and let one issued at
+// 12:00:00.7, after it, through: NotBeforeAt stores the next second, and
+// IssueTime lifts the later token's IssuedAt up to it.
+func TestRevokeSecondBoundary(t *testing.T) {
+	revokeAt := t0.Add(400 * time.Millisecond)
+	nb := NotBeforeAt(revokeAt)
+	if nb != t0.Unix()+1 {
+		t.Fatalf("NotBeforeAt = %d, want the second after %d", nb, t0.Unix())
+	}
+	issued := func(at time.Time, notBefore int64) Claims {
+		c := baseClaims()
+		c.IssuedAt = IssueTime(at, notBefore).Unix()
+		return c
+	}
+	cases := []struct {
+		name      string
+		claims    Claims
+		notBefore int64
+		want      error
+	}{
+		{"never revoked", issued(t0, 0), 0, nil},
+		{"issued a second before the revoke", issued(t0.Add(-time.Second), 0), nb, ErrRevoked},
+		{"issued earlier in the revoke's second", issued(t0.Add(100*time.Millisecond), 0), nb, ErrRevoked},
+		{"issued later in the revoke's second, after it", issued(t0.Add(700*time.Millisecond), nb), nb, nil},
+		{"issued the next second", issued(t0.Add(1100*time.Millisecond), nb), nb, nil},
+		{"issued long after", issued(t0.Add(time.Hour), nb), nb, nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := tc.claims.CheckNotBefore(tc.notBefore); !errors.Is(err, tc.want) || (tc.want == nil && err != nil) {
+				t.Fatalf("CheckNotBefore = %v, want %v", err, tc.want)
+			}
+		})
+	}
+
+	// IssueTime moves a token at most up to the not-before, never back.
+	if got := IssueTime(t0.Add(700*time.Millisecond), nb); got.Unix() != nb {
+		t.Fatalf("IssueTime in the revoke's second = %v", got)
+	}
+	later := t0.Add(5 * time.Second)
+	if got := IssueTime(later, nb); !got.Equal(later) {
+		t.Fatalf("IssueTime after the not-before = %v, want %v", got, later)
+	}
+
+	// A token lifted by IssueTime still signs and verifies: it is under a
+	// second ahead of the verifier's clock, inside ClockSkew.
+	ring := newRing(1, 1)
+	c := baseClaims()
+	at := IssueTime(t0.Add(700*time.Millisecond), nb)
+	c.IssuedAt, c.ExpiresAt = at.Unix(), at.Add(time.Minute).Unix()
+	raw, _, err := Sign(ring, c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Verify(ring, raw, t0.Add(700*time.Millisecond), time.Hour); err != nil {
+		t.Fatalf("a lifted token does not verify: %v", err)
+	}
+}
