@@ -218,8 +218,9 @@ When the person opens the link, the server checks the token, swaps it for a cook
 
 ## Step 4: End the access
 
-A token cannot be taken back. It stops working when it expires. To cut access sooner:
+A token stops working when it expires. To cut access sooner:
 
+- **Revoke the tokens** with `sandbox.revokeTokens()`. Every link and browser cookie for this sandbox stops working at once. Make a new token to share it again. See [Revoke tokens](/sandbox-tokens/#revoke-tokens).
 - **Remove the port** with `unexposePort(8080)`. The link stops working at once. Expose the port again and make a new token to share it again.
 - **Delete the sandbox** with `sandbox.destroy()` when the work is done.
 

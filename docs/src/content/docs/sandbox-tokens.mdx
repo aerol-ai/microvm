@@ -12,7 +12,8 @@ A sandbox token:
 - works for **one sandbox** only,
 - can be narrowed to **some paths** and **some HTTP methods**,
 - **expires** on its own, after at most 24 hours (the server's default limit),
-- is checked by the server with **no database lookup**, so it is fast and works on every server of a cluster.
+- can be **revoked**: one call stops every token of a sandbox,
+- is checked by the server with **no extra database lookup**, so it is fast and works on every server of a cluster.
 
 Use one to give a user a terminal or a file browser for their own sandbox, or to let a browser page talk to the sandbox directly.
 
@@ -181,9 +182,90 @@ A token is refused for anything outside its limits. Nothing reaches the sandbox.
 | Any call that is not the sandbox's helper program: get, list, start, stop or delete a sandbox, expose a port, make another token | `403` |
 | The Daytona, E2B or Runloop APIs | refused |
 | An expired token | `401` with reason `expired` |
+| A token made before a [revoke](#revoke-tokens) | `401` that says `revoked` |
 | A changed or damaged token, or one from another server | `401` with reason `invalid_signature` or `malformed` |
 
 Because a token can never make another token, a token can never be stretched past its limits or its expiry.
+
+## Revoke tokens
+
+If a token leaks, revoke it. A revoke works on the whole sandbox: every token made for that sandbox so far stops working at once. That includes toolbox tokens, port tokens, and the cookie a browser got from a port link. Tokens of other sandboxes keep working.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const result = await sandbox.revokeTokens();
+    console.log(result.tokensNotBefore);
+
+    // Make a new token for anyone who should keep access.
+    const tok = await sandbox.createToken({ expiresIn: "15m", pathPrefix: "/sessions" });
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    result = sandbox.revoke_tokens()
+    print(result["tokensNotBefore"])
+
+    # Make a new token for anyone who should keep access.
+    tok = sandbox.create_token(expires_in="15m", path_prefix="/sessions")
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    result, err := sandbox.RevokeTokens(ctx)
+    if err != nil {
+        log.Fatal(err)
+    }
+    fmt.Println(result.TokensNotBefore)
+
+    // Make a new token for anyone who should keep access.
+    tok, err := sandbox.CreateToken(ctx, sdktypes.CreateSandboxTokenOptions{
+        ExpiresIn:  "15m",
+        PathPrefix: "/sessions",
+    })
+    if err != nil {
+        log.Fatal(err)
+    }
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    let result = sandbox.revoke_tokens()?;
+    println!("{}", result.tokens_not_before);
+
+    // Make a new token for anyone who should keep access.
+    let tok = sandbox.create_token(CreateSandboxTokenOptions {
+        expires_in: "15m".into(),
+        path_prefix: Some("/sessions".into()),
+        ..Default::default()
+    })?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    RevokeSandboxTokensResult result = sandbox.revokeTokens();
+    System.out.println(result.tokensNotBefore);
+
+    // Make a new token for anyone who should keep access.
+    SandboxToken tok = sandbox.createToken(
+        new CreateSandboxTokenOptions().setExpiresIn("15m").setPathPrefix("/sessions")
+    );
+    ```
+  </TabItem>
+</Tabs>
+
+If you have only the sandbox id, call it on the client instead: `revokeSandboxTokens(id)` in TypeScript and Java, `revoke_sandbox_tokens(id)` in Python and Rust, `RevokeSandboxTokens(ctx, id)` in Go.
+
+What happens after the call:
+
+- Every token made **before** it gets `401` that says `revoked`. Nothing reaches the sandbox.
+- A token made **after** it works, even one made in the same second. So you can revoke, then hand new tokens to the people who should keep access.
+- Calling it again is safe. Each call stops every token made before that call.
+- The answer holds `tokensNotBefore`: tokens made before this time no longer work.
+
+You cannot stop just one token. Revoke them all, then make new ones for everyone else.
+
+Revoking needs the same permission as making a token (see below). A sandbox token cannot revoke tokens.
 
 ## Who can make a token
 
@@ -191,7 +273,8 @@ Making a token needs the `sandbox.exec` permission on that sandbox: the `runner`
 
 ## Good to know
 
-- **A token cannot be revoked.** It stops working when it expires, when its sandbox is deleted, or when the server key it was signed with is retired. Keep lifetimes short.
+- **A token stops working** when it expires, when its tokens are [revoked](#revoke-tokens), when its sandbox is deleted, or when the server key it was signed with is retired. Keep lifetimes short anyway: a revoke only helps once you know a token leaked.
+- **A sandbox that moves to another server starts fresh.** In a cluster, when a sandbox is made again on another server (after its server fails), every token made before the move stops working. Make new tokens after a failover.
 - **Lowering the limit takes effect at once.** If an operator lowers `SB_SANDBOX_TOKEN_MAX_TTL`, tokens that live longer than the new limit stop working.
 - **Clocks may drift a little.** Servers accept a token up to 30 seconds early or late, so servers whose clocks differ slightly still agree.
 - **The SDKs check option support** by calling the helper's `/version` path before some calls. A token with a narrow path prefix (for example `/files`) is refused there, so those calls fail. Use the options they need, or a wider prefix.
@@ -203,4 +286,5 @@ There is no separate key store for tokens. Each token is signed with an Ed25519 
 - **Key rotation.** After `sandboxd key rotate --promote`, new tokens are signed with the new key and old tokens keep working. Retiring the old key ends every token it signed, so wait at least `SB_SANDBOX_TOKEN_MAX_TTL` after the promote before you retire. See [Key custody](/enterprise/key-custody/).
 - **Key revoke.** If your key store revokes the server key, no token works until the key is back.
 - **Setting.** `SB_SANDBOX_TOKEN_MAX_TTL` caps a token's lifetime. Default `24h`, at most `720h` (30 days).
-- **Logs and audit.** The token is never written to a log, an audit record or a metric. The call that makes a token records the token id, and every call made with a token names `sandbox_token:stk_…` as its caller.
+- **Logs and audit.** The token is never written to a log, an audit record or a metric. The call that makes a token records the token id, and every call made with a token names `sandbox_token:stk_…` as its caller. A revoke is recorded like any other call on the sandbox.
+- **How a revoke is stored.** A revoke saves one time on the sandbox's record, on the server that runs the sandbox. A token made before that time is refused. Checking it costs nothing extra: the server already reads that record for every toolbox call and every visit to a token port. Every new record (a new sandbox, or one made again on another server after a failover) starts with its own creation time, so no older token reaches it.

@@ -210,7 +210,7 @@ A public URL works for anyone who has it. To share a port with one person only, 
 
 What happens when someone opens the link:
 
-1. The server checks the token. It must be for this sandbox and this port, and not expired.
+1. The server checks the token. It must be for this sandbox and this port, not expired, and not revoked.
 2. The server saves the token in a cookie in their browser, then sends them to the same address **without** the token. The token leaves the address bar, the browser history and the links the page makes.
 3. Every later visit sends the cookie, so the app works as usual until the token expires.
 
@@ -221,6 +221,7 @@ The cookie works only on that one port's address. It is `HttpOnly` (page scripts
 | has no token | `401` |
 | has a token for another sandbox or another port, or outside the token's path | `403` |
 | has an expired or broken token | `401` with the reason, such as `expired` |
+| has a token, or a cookie, from before a revoke | `401` that says `revoked` |
 
 Good to know:
 
@@ -231,7 +232,7 @@ Good to know:
 - **Rust does not report the setting back.** The other four SDKs return the port's visibility from the expose call. Rust's `ExposeResult::Http` holds only the URL: a new field there would break code that matches on it, so it waits for a release that may break code.
 - **No custom domain on a token port.** A custom domain goes straight to the port, so the two cannot be combined. The server refuses either one while the other is set.
 - **The `/proxy/<port>/` address does not serve a token port.** Use the port's own URL.
-- **A token cannot be taken back.** It stops working when it expires. Keep lifetimes short. See [Sandbox tokens](/sandbox-tokens/).
+- **You can take tokens back.** Call `sandbox.revokeTokens()` (`revoke_tokens()` in Python and Rust, `RevokeTokens(ctx)` in Go). Every token of the sandbox stops working at once, and so does the cookie a browser already holds. To let someone back in, send them a link with a new token: it replaces the old cookie. See [Revoke tokens](/sandbox-tokens/#revoke-tokens).
 
 ## Make a sandbox public from the start
 

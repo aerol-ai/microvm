@@ -376,7 +376,7 @@ The key is shared by everyone who has it. For a second lock that is tied to this
 
 Add the printed line to your agent's settings as a second header, next to `Authorization`. Now a request needs both: the AerolVM server checks the token before the request reaches the sandbox, and supergateway checks the key. Without the token the answer is `401` and the request never reaches your server.
 
-The token stops working when it expires, and it cannot be taken back sooner, so keep it short. To open the port to everyone with the key again, expose it with `visibility: "public"`. See [Share a port behind a token](/public-urls/#share-a-port-behind-a-token) for the rules.
+The token stops working when it expires, so keep it short. To stop it sooner, [revoke the sandbox's tokens](/sandbox-tokens/#revoke-tokens). To open the port to everyone with the key again, expose it with `visibility: "public"`. See [Share a port behind a token](/public-urls/#share-a-port-behind-a-token) for the rules.
 
 ## Clean up
 
