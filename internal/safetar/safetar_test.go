@@ -450,3 +450,38 @@ func TestExtractFailurePartWayRemovesLinksThatLeadOut(t *testing.T) {
 		})
 	}
 }
+
+// TestExtractLinkThatCannotBeRemovedIsAnEntryError: when a link that leads
+// out cannot be removed, that is the error on every exit (the end of the
+// archive, a failure part way, a broken stream), and it is an *EntryError
+// like every other Extract error. The two failure exits returned the
+// internal wrapper type, so errors.As(*EntryError) missed it there.
+func TestExtractLinkThatCannotBeRemovedIsAnEntryError(t *testing.T) {
+	prev := removeLink
+	removeLink = func(*os.Root, string) error { return errors.New("read-only file system") }
+	t.Cleanup(func() { removeLink = prev })
+
+	entries := []entry{symlink("a", "s/c/.."), dir("s"), symlink("s/c", ".."), file("after", "x")}
+	cases := []struct {
+		name  string
+		data  []byte
+		limit Limits
+	}{
+		{"the end of the archive", archive(t, entries...), Limits{}},
+		{"an entry limit", archive(t, entries...), Limits{MaxEntries: 3}},
+		{"a stream that breaks off", archive(t, entries...)[:3*512+100], Limits{}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newSandbox(t)
+			_, err := Extract(bytes.NewReader(tc.data), s.dest, tc.limit)
+			var entryErr *EntryError
+			if !errors.As(err, &entryErr) {
+				t.Fatalf("err = %T %v, want an *EntryError", err, err)
+			}
+			if !errors.Is(err, ErrUnsafe) || !strings.Contains(err.Error(), "could not be removed") || entryErr.Entry != "a" {
+				t.Fatalf("err = %v (entry %q), want the link that could not be removed", err, entryErr.Entry)
+			}
+		})
+	}
+}

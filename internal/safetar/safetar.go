@@ -122,7 +122,7 @@ func Extract(r io.Reader, dest string, limits Limits) (Result, error) {
 		}
 		if err != nil {
 			if out := removeEscapingLinks(root, links, res.Entries); out != nil && out.cannotRemove {
-				return res, out
+				return res, out.EntryError
 			}
 			return res, &EntryError{Written: res.Entries, Err: fmt.Errorf("%w: %v", ErrCorrupt, err)}
 		}
@@ -137,7 +137,7 @@ func Extract(r io.Reader, dest string, limits Limits) (Result, error) {
 			// before the failure can already have made one lead out, and
 			// the partial result stays on disk.
 			if out := removeEscapingLinks(root, links, res.Entries); out != nil && out.cannotRemove {
-				return res, out
+				return res, out.EntryError
 			}
 			return res, &EntryError{Entry: hdr.Name, Written: res.Entries, Err: err}
 		}
@@ -301,14 +301,15 @@ type linkOutError struct {
 // disk for whatever reads the folder next, such as the user's own tools after
 // `aerolvm cp -r` down. Extract runs this on EVERY exit, the end of the
 // archive and each failure part way, since a failure leaves what was written.
-// It answers nil when no link leads out.
+// It answers nil when no link leads out. Every exit returns the
+// *EntryError inside, the type Extract documents for all of its errors.
 func removeEscapingLinks(root *os.Root, links []string, written int) *linkOutError {
 	var first *linkOutError
 	for _, name := range links {
 		if _, err := root.Stat(name); err == nil || errors.Is(err, fs.ErrNotExist) {
 			continue
 		}
-		if err := root.Remove(name); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		if err := removeLink(root, name); err != nil && !errors.Is(err, fs.ErrNotExist) {
 			return &linkOutError{EntryError: &EntryError{Entry: name, Written: written, Err: fmt.Errorf("%w: symlink points outside the folder and could not be removed: %v", ErrUnsafe, err)}, cannotRemove: true}
 		}
 		if first == nil {
@@ -317,6 +318,9 @@ func removeEscapingLinks(root *os.Root, links []string, written int) *linkOutErr
 	}
 	return first
 }
+
+// removeLink is (*os.Root).Remove; tests make it fail.
+var removeLink = (*os.Root).Remove
 
 // escapes reports os.Root refusing a path that leaves the folder (through a
 // symlink that was already there, say). os.Root does not export the error,
