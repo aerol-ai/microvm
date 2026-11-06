@@ -46,6 +46,7 @@ import (
 	"github.com/aerol-ai/microvm/pkg/jsbundle"
 	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/aerol-ai/microvm/pkg/mounts"
+	"github.com/aerol-ai/microvm/pkg/sandboxtoken"
 	"github.com/aerol-ai/microvm/pkg/secrets"
 	"golang.org/x/crypto/ssh"
 )
@@ -3197,6 +3198,15 @@ func (s *Service) persistSandboxCreate(ctx context.Context, sandbox *models.Sand
 	}
 	if digests := createRequestDigestsFrom(ctx); sandbox.CreateRequestDigest == "" && len(digests) > 0 {
 		sandbox.CreateRequestDigest = digests[0]
+	}
+	// Every new row refuses the sandbox tokens issued before it. The
+	// not-before lives only in the owner's row, so a failover recreate (or
+	// a WASM recreate or migration) onto another node would otherwise come
+	// back with none and revive tokens revoked on the old owner; the same
+	// holds for an id reused after a delete. Set in the INSERT itself, so
+	// no request ever sees the row without it. A clock read, no I/O.
+	if notBefore := sandboxtoken.NotBeforeAt(sandboxTokenNow()); sandbox.TokensNotBefore < notBefore {
+		sandbox.TokensNotBefore = notBefore
 	}
 	if strings.TrimSpace(sandbox.AuditIncarnationID) == "" {
 		incarnationID, err := s.prepareAuditIncarnation(ctx, sandbox.ID, sandbox.ToolboxToken)

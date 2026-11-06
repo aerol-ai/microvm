@@ -42,3 +42,12 @@ type SandboxToken struct {
 	Methods    []string  `json:"methods,omitempty"`
 	ExpiresAt  time.Time `json:"expires_at"`
 }
+
+// RevokeSandboxTokensResponse is the 200 body of POST
+// /v1/sandboxes/{id}/tokens/revoke. Every token for the sandbox issued
+// before TokensNotBefore is refused from now on; a token issued after the
+// call works.
+type RevokeSandboxTokensResponse struct {
+	SandboxID       string    `json:"sandbox_id"`
+	TokensNotBefore time.Time `json:"tokens_not_before"`
+}

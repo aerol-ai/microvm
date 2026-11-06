@@ -83,6 +83,7 @@ func TestToolboxErrorStatus(t *testing.T) {
 		{ErrSandboxStoppedMidRequest, http.StatusConflict},
 		{fmt.Errorf("wrap: %w", store.ErrNotFound), http.StatusNotFound},
 		{context.Canceled, 499},
+		{ErrSandboxTokenRevoked, http.StatusUnauthorized},
 		{errors.New("dial tcp: refused"), http.StatusBadGateway},
 	} {
 		if got := toolboxErrorStatus(tc.err); got != tc.want {

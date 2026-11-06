@@ -70,6 +70,24 @@ func TestEnforceOwner(t *testing.T) {
 	if err := enforceOwner(tokenCtx, &models.Sandbox{ID: "sb3", OwnerRef: ""}); !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("a sandbox token on another owner-less sandbox: got %v, want ErrNotFound", err)
 	}
+	// A revoke refuses a token issued before the row's not-before, and only
+	// a sandbox token: other callers never carry an issue time.
+	issuedAt := func(iat int64) context.Context {
+		return controlplane.ContextWithAccess(context.Background(), controlplane.Access{
+			Principal:    controlplane.Principal{Kind: controlplane.PrincipalSandboxToken, ID: "stk_1"},
+			SandboxToken: &sandboxtoken.Claims{SandboxID: "sb2", IssuedAt: iat},
+		})
+	}
+	revoked := &models.Sandbox{ID: "sb2", OwnerRef: "", TokensNotBefore: 100}
+	if err := enforceOwner(issuedAt(99), revoked); !errors.Is(err, ErrSandboxTokenRevoked) {
+		t.Fatalf("a token from before the revoke: got %v, want ErrSandboxTokenRevoked", err)
+	}
+	if err := enforceOwner(issuedAt(100), revoked); err != nil {
+		t.Fatalf("a token from the not-before second: %v", err)
+	}
+	if err := enforceOwner(operatorCtx(), revoked); err != nil {
+		t.Fatalf("the operator on a revoked sandbox: %v", err)
+	}
 }
 
 func TestFilterByOwnerScope(t *testing.T) {

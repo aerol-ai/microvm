@@ -73,12 +73,23 @@ func enforceOwner(ctx context.Context, sandbox *models.Sandbox) error {
 	if sandbox == nil || sandbox.OwnerRef != owner {
 		return store.ErrNotFound
 	}
+	access, ok := controlplane.AccessFromContext(ctx)
+	if !ok || access.SandboxToken == nil {
+		return nil
+	}
 	// A sandbox token reaches one sandbox. The edge's scope step holds it
 	// to that sandbox's routes; this holds it here too. The owner check
 	// alone is weak for it: a token for a sandbox the operator made carries
 	// an empty owner, which every operator-made sandbox shares.
-	if access, ok := controlplane.AccessFromContext(ctx); ok && access.SandboxToken != nil && access.SandboxToken.SandboxID != sandbox.ID {
+	if access.SandboxToken.SandboxID != sandbox.ID {
 		return store.ErrNotFound
+	}
+	// A token issued before the sandbox's tokens were revoked. This is the
+	// one check that needs the row, and every toolbox and sessions request
+	// reads it here, on the owner: a forwarded request carries the caller's
+	// bearer, and the owner verifies it again into this same Access.
+	if err := access.SandboxToken.CheckNotBefore(sandbox.TokensNotBefore); err != nil {
+		return ErrSandboxTokenRevoked
 	}
 	return nil
 }

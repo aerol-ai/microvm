@@ -1547,9 +1547,11 @@ type Config struct {
 	// enterprise mode, which refuses anything longer.
 	TokenMaxTTL time.Duration
 	// SandboxTokenMaxTTL caps a sandbox token's lifetime (pkg/sandboxtoken,
-	// POST /v1/sandboxes/{id}/tokens). There is no revocation list, so this
-	// cap is how long a leaked token can work, and how long a rotation must
-	// wait between promoting a server key and retiring the old one.
+	// POST /v1/sandboxes/{id}/tokens). There is no per-token revocation
+	// list, only a per-sandbox revoke, so this cap is how long a leaked
+	// token works if nobody revokes its sandbox's tokens, and how long a
+	// rotation must wait between promoting a server key and retiring the
+	// old one.
 	// SB_SANDBOX_TOKEN_MAX_TTL. Default 24h; at most 720h (30 days).
 	SandboxTokenMaxTTL time.Duration
 	// IdentityFile is the identity file (plans/identity-and-access.md

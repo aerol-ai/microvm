@@ -28,7 +28,8 @@ import (
 //	expose(visibility=token) ─► store row "token" ─► route → ingress proxy
 //	public request ─► ingress proxy: PortAccess (warm cache or the one row
 //	                  read it already made) ─► gated? ─► token or cookie ─►
-//	                  verify (no store read) ─► strip ─► proxy
+//	                  verify (no store read) ─► not revoked (the not-before
+//	                  PortAccess returned) ─► strip ─► proxy
 
 var (
 	// ErrTokenVisibilityInvalid is a 400: an unknown visibility value.
@@ -152,17 +153,23 @@ type PortAccess struct {
 	// TokenGated means the port was exposed with visibility "token": the
 	// request needs a sandbox token for this port.
 	TokenGated bool
+	// TokensNotBefore is the sandbox's tokens_not_before: a port token
+	// issued before it was revoked (sandboxtoken.Claims.CheckNotBefore).
+	TokensNotBefore int64
 }
 
-// PortAccess answers IsSandboxStarted and the port's gate from one read:
-// the warm cache when it holds this sandbox's port list, else the sandbox
-// row (which carries its exposed ports). It adds no store read to the
-// ingress path. An entry cached without a port list (warmCacheSet) is never
-// trusted for the gate, so a gated port can never read as open from it.
+// PortAccess answers IsSandboxStarted, the port's gate and the sandbox's
+// token not-before from one read: the warm cache when it holds this
+// sandbox's port list, else the sandbox row (which carries its exposed
+// ports and the not-before). It adds no store read to the ingress path. An
+// entry cached without a port list (warmCacheSet) is never trusted for the
+// gate, so a gated port can never read as open from it, and a revoke drops
+// the entry (RevokeSandboxTokens), so a revoked token is never let in by a
+// not-before cached before it.
 func (s *Service) PortAccess(ctx context.Context, id string, port int) (PortAccess, error) {
 	if e, ok := s.warmEntryFor(id); ok && e.portsKnown {
 		_, gated := e.gated[port]
-		return PortAccess{Started: true, TokenGated: gated}, nil
+		return PortAccess{Started: true, TokenGated: gated, TokensNotBefore: e.notBefore}, nil
 	}
 	warmGen := s.warmGen.Load()
 	sb, err := s.scopedGet(ctx, id)
@@ -173,15 +180,17 @@ func (s *Service) PortAccess(ctx context.Context, id string, port int) (PortAcce
 	if started {
 		s.warmCacheSetSandbox(sb, warmGen)
 	}
-	return PortAccess{Started: started, TokenGated: portTokenGated(sb, port)}, nil
+	return PortAccess{Started: started, TokenGated: portTokenGated(sb, port), TokensNotBefore: sb.TokensNotBefore}, nil
 }
 
 // warmEntry is one warm-cache value: when it expires and, when the setter
-// had the row, which of the sandbox's ports are token-gated.
+// had the row, which of the sandbox's ports are token-gated and the
+// sandbox's token not-before.
 type warmEntry struct {
 	exp        int64
 	portsKnown bool
 	gated      map[int]struct{}
+	notBefore  int64
 }
 
 func (s *Service) warmEntryFor(id string) (warmEntry, bool) {
@@ -200,7 +209,7 @@ func (s *Service) warmEntryFor(id string) (warmEntry, bool) {
 // for up to warmCacheTTL. One counter for every sandbox keeps this an
 // atomic load; a skipped set costs only the next request a row read.
 func (s *Service) warmCacheSetSandbox(sb *models.Sandbox, gen uint64) {
-	e := warmEntry{exp: time.Now().Add(warmCacheTTL).UnixNano(), portsKnown: true}
+	e := warmEntry{exp: time.Now().Add(warmCacheTTL).UnixNano(), portsKnown: true, notBefore: sb.TokensNotBefore}
 	for _, p := range sb.ExposedPorts {
 		if p.TokenGated() {
 			if e.gated == nil {

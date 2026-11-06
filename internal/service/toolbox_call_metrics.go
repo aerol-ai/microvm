@@ -105,6 +105,10 @@ func toolboxErrorStatus(err error) int {
 		return 499
 	case errors.Is(err, ErrExecRequestTooLarge):
 		return http.StatusRequestEntityTooLarge
+	case errors.Is(err, ErrSandboxTokenRevoked):
+		// A caller's refused token, not a sandbox fault: counted as a
+		// 4xx so it never reads as a toolbox outage.
+		return http.StatusUnauthorized
 	}
 	return http.StatusBadGateway
 }

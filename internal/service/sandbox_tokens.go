@@ -18,7 +18,9 @@ import (
 // them on the sandbox's owner node (the route is owner-forwarded, so the
 // sandbox row and its owner are read where they live) and verifies them on
 // any node with no store read: the key is derived from the server key ring
-// every node already holds.
+// every node already holds. A revoke is a not-before second on the owner's
+// row, checked where a token request already reads that row: enforceOwner
+// for the toolbox, PortAccess for a gated port.
 
 var (
 	// ErrSandboxTokenInvalid is a 400: the request asked for a token the
@@ -27,6 +29,10 @@ var (
 	// ErrSandboxTokensUnavailable is a 503: this node has no server key to
 	// sign with (none configured, or a key-store revoke dropped it).
 	ErrSandboxTokensUnavailable = errors.New("sandbox tokens are unavailable: this server has no server key loaded")
+	// ErrSandboxTokenRevoked is a 401: a good token used on its sandbox's
+	// toolbox after that sandbox's tokens were revoked. The words match
+	// the public-port gate's refusal for the same token.
+	ErrSandboxTokenRevoked = errors.New("sandbox token refused: revoked")
 )
 
 // sandboxTokenNow is the clock tokens are issued and checked with; tests
@@ -77,7 +83,9 @@ func (s *Service) IssueSandboxToken(ctx context.Context, sandboxID string, req m
 	if err != nil {
 		return models.SandboxToken{}, err
 	}
-	now := sandboxTokenNow()
+	// A token issued in the same second as a revoke is lifted to the
+	// revoke's not-before, so the revoke refuses only the tokens before it.
+	now := sandboxtoken.IssueTime(sandboxTokenNow(), sandbox.TokensNotBefore)
 	raw, claims, err := sandboxtoken.Sign(s.cipher, sandboxtoken.Claims{
 		TokenID:    id,
 		SandboxID:  sandbox.ID,
@@ -107,6 +115,43 @@ func (s *Service) IssueSandboxToken(ctx context.Context, sandboxID string, req m
 		Methods:    claims.Methods,
 		ExpiresAt:  claims.Expiry(),
 	}, nil
+}
+
+// RevokeSandboxTokens refuses every token issued for sandboxID so far: it
+// moves the sandbox's tokens_not_before to the next second and returns it.
+// A token issued after the call works (IssueSandboxToken lifts one issued
+// in the same second up to the not-before). The route is owner-forwarded
+// and needs sandbox.exec, the same as issuing; a sandbox token cannot call
+// it (the edge holds a token to the toolbox).
+//
+// Idempotent in effect: the store keeps the larger not-before, so a retry
+// or a second call refuses the same tokens plus any issued in between, and
+// never brings one back. Nothing else changes: no route, no other row, no
+// cluster state, so there is nothing to roll back. The cost of the check
+// it arms is no extra read: the toolbox route reads this row on the owner
+// already (enforceOwner), and a gated port reads it with its gate
+// (PortAccess), whose warm-cache entry is dropped here.
+func (s *Service) RevokeSandboxTokens(ctx context.Context, sandboxID string) (models.RevokeSandboxTokensResponse, error) {
+	sandbox, err := s.scopedGet(ctx, sandboxID)
+	if err != nil {
+		return models.RevokeSandboxTokensResponse{}, err
+	}
+	if sandbox.Status == models.SandboxStatusDestroyed {
+		return models.RevokeSandboxTokensResponse{}, fmt.Errorf("%w: sandbox %s", store.ErrNotFound, sandboxID)
+	}
+	notBefore, err := s.store.RevokeSandboxTokens(ctx, sandbox.ID, sandboxtoken.NotBeforeAt(sandboxTokenNow()))
+	if err != nil {
+		return models.RevokeSandboxTokensResponse{}, err
+	}
+	// After the write: a PortAccess that read the row before it can no
+	// longer cache that read (warmGen moved), and the next one reads the
+	// new not-before.
+	s.invalidateWarm(sandbox.ID)
+	at := time.Unix(notBefore, 0).UTC()
+	if s.logger != nil {
+		s.logger.Info("sandbox tokens revoked", "sandbox_id", sandbox.ID, "tokens_not_before", at)
+	}
+	return models.RevokeSandboxTokensResponse{SandboxID: sandbox.ID, TokensNotBefore: at}, nil
 }
 
 // sandboxTokenTTL parses expires_in and applies the cap.
