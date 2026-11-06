@@ -16,26 +16,31 @@ import (
 // sandbox row it read earlier: start, reconcile (which walks every sandbox),
 // runtime start events, the serverless stop and wake paths, lifecycle flips,
 // failover replay. If that copy is from before a change to "token", acting on
-// it would put back a way around the ingress proxy's token check: the direct
-// port route, or the port's entry on toolboxd's /proxy allowlist. The Caddy
-// coalescer orders writes per (sandbox, port) but cannot tell an old intent
-// from a new one.
+// it would put back one of the three ways around the ingress proxy's token
+// check: the direct port route, a custom domain's route to the port, or the
+// port's entry on toolboxd's /proxy allowlist. The Caddy coalescer orders
+// writes per (sandbox, port) but cannot tell an old intent from a new one.
 //
 // So each way in is written under one lock that all of its writers share,
 // from state read from the store inside that lock:
 //
 //	way in            lock (all writers)           read inside the lock
 //	port route        httpRouteLocks (id, port)    GetPort
+//	custom domains    customDomainRouteLocks (id)  ListCustomDomains, ListPorts
 //	/proxy allowlist  allowlistLocks (id)          ListPorts
 //
 // Why that is enough. expose raises a gate in this order: store the row, then
 // write the route, then push the allowlist. A writer that read before the row
 // was stored finishes its write before expose's own write can start (same
 // lock), so expose's write is the last one. A writer that read after it sees
-// the gate.
+// the gate. Custom domains have no expose-side write; there the exclusion is
+// in the store instead: a port is never gated while a domain row targets it
+// (checkTokenVisibility and AddCustomDomain each check under lockExposedPort,
+// the lock expose holds), and a domain row is removed only under its lock
+// (RemoveCustomDomain), so no writer can still be holding an old read of it.
 //
 // Node-local locks and reads are enough in a cluster too: the v1 routes
-// forward expose and unexpose calls to the owner, and start,
+// forward expose, unexpose and custom-domain calls to the owner, and start,
 // reconcile, runtime events and failover replay run on the owner, whose
 // store holds the rows. Ingress nodes route to the owner, never to the app.
 
@@ -90,8 +95,10 @@ func (l *keyedLocks[K]) keys() int {
 
 // Stages testAfterRouteGateRead reports.
 const (
-	gateReadPortRoute = "port-route"
-	gateReadAllowlist = "allowlist"
+	gateReadPortRoute     = "port-route"
+	gateReadCustomDomains = "custom-domains"
+	gateReadAllowlist     = "allowlist"
+	gateReadDomainAttach  = "custom-domain-attach"
 )
 
 func (s *Service) afterRouteGateRead(stage string) {
@@ -117,6 +124,52 @@ func (s *Service) portGatedNow(ctx context.Context, sandbox *models.Sandbox, por
 		return portTokenGated(sandbox, port), nil
 	}
 	return row.TokenGated(), nil
+}
+
+// hasPortCustomDomain reports whether any of sandbox's custom domains dials
+// an app port (target port > 0). Only those can skip a port's gate: a domain
+// with target 0 dials the toolbox, like the sandbox's own root route.
+func hasPortCustomDomain(sandbox *models.Sandbox) bool {
+	for _, d := range sandbox.CustomDomains {
+		if d.TargetPort > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// withCurrentCustomDomains returns a copy of sandbox whose custom domains are
+// the ones stored now, minus any whose target port is gated now. The store
+// never holds both (see the top of this file); the filter is a second line
+// so a domain route can never be the open way into a gated port. The caller
+// holds customDomainRouteLocks for the sandbox.
+func (s *Service) withCurrentCustomDomains(ctx context.Context, sandbox *models.Sandbox) (*models.Sandbox, error) {
+	if s.store == nil {
+		return sandbox, nil
+	}
+	domains, err := s.store.ListCustomDomains(ctx, sandbox.ID)
+	if err != nil {
+		return nil, fmt.Errorf("read custom domains before writing their routes: %w", err)
+	}
+	ports, err := s.store.ListPorts(ctx, sandbox.ID)
+	if err != nil {
+		return nil, fmt.Errorf("read exposed ports before writing custom-domain routes: %w", err)
+	}
+	s.afterRouteGateRead(gateReadCustomDomains)
+	view := *sandbox
+	view.ExposedPorts = ports
+	view.CustomDomains = make([]models.CustomDomain, 0, len(domains))
+	for _, d := range domains {
+		if d.TargetPort > 0 && portTokenGated(&view, d.TargetPort) {
+			if s.logger != nil {
+				s.logger.Warn("custom-domain route not written: its port needs a sandbox token",
+					"sandbox_id", sandbox.ID, "hostname", d.Hostname, "port", d.TargetPort)
+			}
+			continue
+		}
+		view.CustomDomains = append(view.CustomDomains, d)
+	}
+	return &view, nil
 }
 
 // toolboxProxyPorts is the /proxy allowlist for ports: every exposed port

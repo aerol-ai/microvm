@@ -236,6 +236,115 @@ func (s *Service) AddCustomDomain(ctx context.Context, sandboxID, hostname strin
 	if err != nil {
 		return err
 	}
+	// Checked here so a request that cannot succeed fails before the DNS
+	// lookup, and checked again after it, under the locks.
+	if err := s.checkCustomDomainTarget(sandbox, canonical, targetPort); err != nil {
+		return err
+	}
+
+	// Verify DNS ownership (TXT record). The TXT proves zone control and is
+	// keyed to the hostname, not the sandbox ID, so users can provision it
+	// once and attach the hostname to any sandbox (including a recreated
+	// one with a new ID). No lock is held across this lookup: it can take
+	// as long as the resolver's timeout.
+	if err := verifyCustomDomainOwnership(ctx, s.dnsResolver, canonical, s.cfg.CustomDomainVerifyPrefix, s.cfg.CustomDomainVerifyValuePrefix, customDomainProofToken(ctx, sandbox.OwnerRef)); err != nil {
+		return err
+	}
+
+	// The custom-domain route dials the port directly, around the ingress
+	// proxy's token check (A2), so a domain and a gate on one port exclude
+	// each other. expose holds lockExposedPort from its row read to its
+	// last write, so under it the check and the insert below cannot
+	// interleave with a change to "token": one of the two calls sees the
+	// other's row and is refused. A domain on the toolbox (port 0) dials
+	// what the root route already dials and takes no port lock.
+	if targetPort > 0 {
+		unlockPort := s.lockExposedPort(sandboxID, targetPort)
+		defer unlockPort()
+	}
+	// From the insert to the last route write (or the rollback): a
+	// concurrent route writer either reads the domain and writes before a
+	// rollback deletes its route, or reads after the rollback.
+	unlockRoutes := s.customDomainRouteLocks.lock(sandboxID)
+	defer unlockRoutes()
+	if sandbox, err = s.scopedGet(ctx, sandboxID); err != nil {
+		return err
+	}
+	if err := s.checkCustomDomainTarget(sandbox, canonical, targetPort); err != nil {
+		return err
+	}
+	s.afterRouteGateRead(gateReadDomainAttach)
+	// Read under the route lock, which RemoveCustomDomain also takes, so
+	// it stays true until this call returns.
+	existed := false
+	for _, cd := range sandbox.CustomDomains {
+		if cd.Hostname == canonical {
+			existed = true
+			break
+		}
+	}
+
+	if err := s.store.AddCustomDomain(ctx, sandboxID, canonical, targetPort); err != nil {
+		return err
+	}
+	// rollback undoes this call's insert. The per-hostname route goes too:
+	// UpsertSandboxRoute writes the leaves one by one and can fail after
+	// writing this one, and a leaf left behind would keep dialing the port
+	// after the row is gone, even once the port is gated. A failed retry of
+	// a domain that was already attached leaves it attached.
+	rollback := func() {
+		if existed {
+			return
+		}
+		_ = s.removeClusterCustomDomain(ctx, sandboxID, canonical)
+		_ = s.store.RemoveCustomDomain(ctx, sandboxID, canonical)
+		_ = s.publicRoutes().DeleteCustomDomainHTTPRoute(ctx, sandboxID, canonical)
+	}
+
+	// Cluster-wide uniqueness gate. Without this two owners on different
+	// nodes can each accept the same hostname (local SQLite PK is per-node);
+	// the FSM is the cross-node tiebreaker. Run BEFORE the Caddy PATCH so a
+	// conflict rolls back cheaply — the local row goes away and Caddy was
+	// never told about the hostname. Noop returns nil so single-node mode
+	// short-circuits.
+	if err := s.recordClusterCustomDomain(ctx, sandboxID, canonical); err != nil {
+		if !existed {
+			_ = s.store.RemoveCustomDomain(ctx, sandboxID, canonical)
+		}
+		return err
+	}
+
+	// Re-read so the caddy PATCH sees the full union (existing + new). The
+	// store inserts with pending_dns status; Caddy's on-demand TLS does not
+	// look at status, only hostname presence, so the new hostname is route-
+	// matchable immediately.
+	refreshed, err := s.store.Get(ctx, sandboxID)
+	if err != nil {
+		rollback()
+		return fmt.Errorf("reload sandbox after custom-domain insert: %w", err)
+	}
+	if err := s.syncSandboxPublicRouteHeld(ctx, refreshed); err != nil {
+		// Store first / caddy second with rollback on caddy failure. Same
+		// shape as the create path. We deliberately keep the row OUT of the
+		// store on a partial failure rather than leaving an orphan row that
+		// the reconciler would have to clean up — the caller can simply
+		// retry the request.
+		rollback()
+		return fmt.Errorf("install caddy route for custom domain %q: %w", canonical, err)
+	}
+	if err := s.syncWasmCustomDomainRoutes(ctx, refreshed); err != nil {
+		rollback()
+		return err
+	}
+	evictCustomDomainNegativeCache(canonical)
+	return nil
+}
+
+// checkCustomDomainTarget refuses a custom domain sandbox cannot take: a
+// private sandbox, one with tcp/tls exposures (the IRON RULE), a WASM port
+// the module does not serve, a token-gated target port, or one more domain
+// than the per-sandbox cap.
+func (s *Service) checkCustomDomainTarget(sandbox *models.Sandbox, canonical string, targetPort int) error {
 	if !sandboxAllowsPublicTraffic(sandbox) {
 		return ErrPublicTrafficDisabled
 	}
@@ -265,67 +374,13 @@ func (s *Service) AddCustomDomain(ctx context.Context, sandboxID, hostname strin
 	if len(sandbox.CustomDomains) >= maxDomains {
 		// Idempotent re-add of an existing hostname must NOT trip the cap —
 		// the same row already counts in the slice.
-		alreadyHeld := false
 		for _, cd := range sandbox.CustomDomains {
 			if cd.Hostname == canonical {
-				alreadyHeld = true
-				break
+				return nil
 			}
 		}
-		if !alreadyHeld {
-			return ErrCustomDomainPerSandboxCap
-		}
+		return ErrCustomDomainPerSandboxCap
 	}
-
-	// Verify DNS ownership (TXT record). The TXT proves zone control and is
-	// keyed to the hostname, not the sandbox ID, so users can provision it
-	// once and attach the hostname to any sandbox (including a recreated
-	// one with a new ID).
-	if err := verifyCustomDomainOwnership(ctx, s.dnsResolver, canonical, s.cfg.CustomDomainVerifyPrefix, s.cfg.CustomDomainVerifyValuePrefix, customDomainProofToken(ctx, sandbox.OwnerRef)); err != nil {
-		return err
-	}
-
-	if err := s.store.AddCustomDomain(ctx, sandboxID, canonical, targetPort); err != nil {
-		return err
-	}
-
-	// Cluster-wide uniqueness gate. Without this two owners on different
-	// nodes can each accept the same hostname (local SQLite PK is per-node);
-	// the FSM is the cross-node tiebreaker. Run BEFORE the Caddy PATCH so a
-	// conflict rolls back cheaply — the local row goes away and Caddy was
-	// never told about the hostname. Noop returns nil so single-node mode
-	// short-circuits.
-	if err := s.recordClusterCustomDomain(ctx, sandboxID, canonical); err != nil {
-		_ = s.store.RemoveCustomDomain(ctx, sandboxID, canonical)
-		return err
-	}
-
-	// Re-read so the caddy PATCH sees the full union (existing + new). The
-	// store inserts with pending_dns status; Caddy's on-demand TLS does not
-	// look at status, only hostname presence, so the new hostname is route-
-	// matchable immediately.
-	refreshed, err := s.store.Get(ctx, sandboxID)
-	if err != nil {
-		_ = s.removeClusterCustomDomain(ctx, sandboxID, canonical)
-		_ = s.store.RemoveCustomDomain(ctx, sandboxID, canonical)
-		return fmt.Errorf("reload sandbox after custom-domain insert: %w", err)
-	}
-	if err := s.syncSandboxPublicRoute(ctx, refreshed); err != nil {
-		// Store first / caddy second with rollback on caddy failure. Same
-		// shape as the create path. We deliberately keep the row OUT of the
-		// store on a partial failure rather than leaving an orphan row that
-		// the reconciler would have to clean up — the caller can simply
-		// retry the request.
-		_ = s.removeClusterCustomDomain(ctx, sandboxID, canonical)
-		_ = s.store.RemoveCustomDomain(ctx, sandboxID, canonical)
-		return fmt.Errorf("install caddy route for custom domain %q: %w", canonical, err)
-	}
-	if err := s.syncWasmCustomDomainRoutes(ctx, refreshed); err != nil {
-		_ = s.removeClusterCustomDomain(ctx, sandboxID, canonical)
-		_ = s.store.RemoveCustomDomain(ctx, sandboxID, canonical)
-		return err
-	}
-	evictCustomDomainNegativeCache(canonical)
 	return nil
 }
 
@@ -362,6 +417,13 @@ func (s *Service) RemoveCustomDomain(ctx context.Context, sandboxID, hostname st
 	if !owned {
 		return store.ErrNotFound
 	}
+	// From the row delete to the route delete: a route writer that read
+	// this domain before the delete finishes its write first, and the
+	// route delete below then removes it. Without the lock it could write
+	// the route back after, a leaf that dials the port with no row behind
+	// it, which nothing stops once the port becomes token-gated.
+	unlock := s.customDomainRouteLocks.lock(sandboxID)
+	defer unlock()
 	if err := s.store.RemoveCustomDomain(ctx, sandboxID, canonical); err != nil {
 		return err
 	}
@@ -377,11 +439,19 @@ func (s *Service) RemoveCustomDomain(ctx context.Context, sandboxID, hostname st
 		s.logger.Warn("custom-domain cluster release failed; reconcile will retry",
 			"sandbox_id", sandboxID, "hostname", canonical, "error", err)
 	}
+	// UpsertSandboxRoute only writes; it does not GC the per-hostname route
+	// for the detached domain. Drop it explicitly so the dial target stops
+	// answering immediately rather than waiting on a reconcile sweep. It is
+	// tried first, so a failure in the steps below cannot skip it: a leaf
+	// with no row would dial the port around its gate if the port is later
+	// exposed with visibility "token", which checks only stored domains.
+	// Its error is reported last, after any from those steps.
+	leafErr := s.publicRoutes().DeleteCustomDomainHTTPRoute(ctx, sandboxID, canonical)
 	refreshed, err := s.store.Get(ctx, sandboxID)
 	if err != nil {
 		return fmt.Errorf("reload sandbox after custom-domain delete: %w", err)
 	}
-	if err := s.syncSandboxPublicRoute(ctx, refreshed); err != nil {
+	if err := s.syncSandboxPublicRouteHeld(ctx, refreshed); err != nil {
 		// Caddy is the source of truth for routing; if we couldn't refresh the
 		// route set, the row is gone from the store but Caddy may still serve
 		// the hostname. The next ingress reconcile (or AddCustomDomain
@@ -391,11 +461,8 @@ func (s *Service) RemoveCustomDomain(ctx context.Context, sandboxID, hostname st
 	if err := s.syncWasmCustomDomainRoutes(ctx, refreshed); err != nil {
 		return err
 	}
-	// UpsertSandboxRoute only writes; it does not GC the per-hostname route
-	// for the detached domain. Drop it explicitly so the dial target stops
-	// answering immediately rather than waiting on a reconcile sweep.
-	if err := s.publicRoutes().DeleteCustomDomainHTTPRoute(ctx, refreshed.ID, canonical); err != nil {
-		return fmt.Errorf("delete caddy per-hostname route for %q: %w", canonical, err)
+	if leafErr != nil {
+		return fmt.Errorf("delete caddy per-hostname route for %q: %w", canonical, leafErr)
 	}
 	return nil
 }

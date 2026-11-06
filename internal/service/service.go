@@ -682,8 +682,9 @@ type Service struct {
 	// The locks every writer of one way into a port shares while it reads
 	// the port's gate from the store and writes from it, so no writer acts
 	// on a copy from before a change to "token" (route_gate.go).
-	httpRouteLocks keyedLocks[portLockKey]
-	allowlistLocks keyedLocks[string]
+	httpRouteLocks         keyedLocks[portLockKey]
+	customDomainRouteLocks keyedLocks[string]
+	allowlistLocks         keyedLocks[string]
 	// testAfterRouteGateRead runs inside those locks, right after the read.
 	// Nil in production.
 	testAfterRouteGateRead func(stage string)
