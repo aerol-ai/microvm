@@ -963,6 +963,12 @@ var Registry = []UseCase{
 	{ID: "UC-387", Title: "Daytona SDK terminals: resize changes the real terminal size (stty), and kill ends the shell and a background job it started, closes the connected client with the end, and makes the terminal not found", Implemented: true},
 	{ID: "UC-388", Title: "Daytona SDK terminals: a sandbox holds 32 terminals; the 33rd create gets HTTP 429 naming the limit, and killing one makes room for it", Implemented: true},
 	{ID: "UC-389", Title: "Daytona SDK terminals: a terminal keeps running when its client disconnects; output written while away is replayed on reconnect, and the reconnected client drives the same shell (same pid and shell variables)", Implemented: true},
+	// File watching (parity_watch_test.go; plan F5, B3, CEO review R8).
+	{ID: "UC-390", Title: "File watch on gVisor: the Go SDK's WatchFiles sees create, write, chmod, rename (old name, then a create for the new one) and remove for changes made by exec, and Stop ends the watch cleanly", Requires: []Capability{CapGvisor}, Implemented: true},
+	{ID: "UC-391", Title: "Recursive file watch on gVisor sees a file in a subfolder that existed before, and a file in a nested folder made in the same command as the file; removing the watched folder ends the watch with the agent's reason", Requires: []Capability{CapGvisor}, Implemented: true},
+	{ID: "UC-392", Title: "File watch on Firecracker (the guest's own kernel) sees create, write, chmod, rename and remove, and Stop ends the watch cleanly", Requires: []Capability{CapFirecracker}, Implemented: true},
+	{ID: "UC-393", Title: "File watch on a Docker sandbox answers a clear 501 naming gVisor and Firecracker (the node's inotify budget is shared), as an API error and not as an agent that is too old", Requires: []Capability{CapDocker}, Implemented: true},
+	{ID: "UC-394", Title: "E2B WatchDir through the live E2B facade on gVisor streams start and an EVENT_TYPE_CREATE named relative to the folder; CreateWatcher, GetWatcherEvents and RemoveWatcher work too", Requires: []Capability{CapGvisor}, Implemented: true},
 }
 
 // byID is a lookup built once for the report generator.
