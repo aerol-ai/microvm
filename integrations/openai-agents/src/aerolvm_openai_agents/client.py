@@ -14,6 +14,7 @@ from agents.sandbox.session.sandbox_client import BaseSandboxClient
 from agents.sandbox.snapshot import SnapshotBase, SnapshotSpec, resolve_snapshot
 from microvm import MicroVM, MicroVMHTTPError
 
+from ._owned import create_sandbox
 from .options import AerolVMSandboxClientOptions, AerolVMSandboxSessionState
 from .session import AerolVMSandboxSession, create_request, is_not_found
 
@@ -25,6 +26,8 @@ class AerolVMSandboxClient(BaseSandboxClient[AerolVMSandboxClientOptions]):
 
     Pass a configured ``microvm.MicroVM``, or none to build one from
     ``SB_API_URL`` and ``SB_PAT_TOKEN``. Each ``create()`` makes one sandbox.
+    Cancelling ``create()`` or ``resume()`` while the sandbox is being made
+    destroys it once it is made, since the caller never got its id.
     """
 
     backend_id = "aerolvm"
@@ -72,7 +75,7 @@ class AerolVMSandboxClient(BaseSandboxClient[AerolVMSandboxClientOptions]):
             snapshot_name_prefix=options.snapshot_name_prefix,
             delete_superseded_snapshots=options.delete_superseded_snapshots,
         )
-        sandbox = await asyncio.to_thread(self._client.create, create_request(state))
+        sandbox = await create_sandbox(self._client, create_request(state))
         state.sandbox_id = sandbox.id
         inner = AerolVMSandboxSession(client=self._client, state=state)
         return self._wrap_session(inner, instrumentation=self._instrumentation)
@@ -145,9 +148,7 @@ class AerolVMSandboxClient(BaseSandboxClient[AerolVMSandboxClientOptions]):
         state.workspace_root_ready = False
         if state.last_snapshot:
             try:
-                sandbox = await asyncio.to_thread(
-                    self._client.create, create_request(state, image=state.last_snapshot)
-                )
+                sandbox = await create_sandbox(self._client, create_request(state, image=state.last_snapshot))
             except MicroVMHTTPError as e:
                 # A 4xx says the snapshot is gone or refused, and nothing was
                 # made. Any other failure may have made a sandbox already,
@@ -160,6 +161,6 @@ class AerolVMSandboxClient(BaseSandboxClient[AerolVMSandboxClientOptions]):
             else:
                 state.sandbox_id = sandbox.id
                 return state.last_snapshot
-        sandbox = await asyncio.to_thread(self._client.create, create_request(state))
+        sandbox = await create_sandbox(self._client, create_request(state))
         state.sandbox_id = sandbox.id
         return None

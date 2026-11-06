@@ -3,11 +3,14 @@ is this machine, and a workspace root in a fresh temp folder."""
 
 from __future__ import annotations
 
+import asyncio
 import os
 import shutil
 import sys
 import tempfile
+import time
 import unittest
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -45,6 +48,15 @@ class ProviderTestCase(unittest.IsolatedAsyncioTestCase):
         manifest = option_overrides.pop("manifest", None) or self.manifest()
         snapshot = option_overrides.pop("snapshot", None)
         return await self.client.create(manifest=manifest, snapshot=snapshot, options=self.options(**option_overrides))
+
+    async def eventually(self, check: Callable[[], object], timeout: float = 5.0) -> None:
+        """Wait for ``check()`` to hold: for work a worker thread finishes
+        after the awaiting task has gone."""
+        deadline = time.monotonic() + timeout
+        while not check():
+            if time.monotonic() > deadline:
+                self.fail("the background work did not finish in time")
+            await asyncio.sleep(0.01)
 
     def exec_requests(self) -> list[dict]:
         return [call[1][1] for call in self.fake.calls_to("exec")]

@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import random
+import threading
 import time
 from typing import Any, AsyncIterator, Dict, Iterator, List, Optional, Tuple, Union
 
@@ -240,6 +241,52 @@ class AsyncFileWatchHandle:
 
     async def wait(self, timeout: Optional[float] = None) -> None:
         await _wait(self._done, timeout, "the file watch to end")
+
+
+class _Handoff:
+    """A worker thread's result, handed to the task awaiting it under a lock.
+
+    Cancelling the task does not stop its thread. A stream the thread opens
+    then (an exec stream whose command already started) would be dropped
+    with the result, open, with nothing left to close it. Exactly one side
+    closes such a result: the thread, when it finishes after the task stopped
+    waiting, or the task, when the thread had already handed it over.
+    """
+
+    def __init__(self, fn: Any, args: Tuple[Any, ...]) -> None:
+        self._fn = fn
+        self._args = args
+        self._lock = threading.Lock()
+        self._abandoned = False
+        self._handed: List[Any] = []
+
+    def run(self) -> Any:
+        result = self._fn(*self._args)
+        with self._lock:
+            orphan = self._abandoned
+            if not orphan:
+                self._handed.append(result)
+        if orphan:
+            _close_quietly(result)
+        return result
+
+    def abandon(self) -> None:
+        with self._lock:
+            self._abandoned = True
+            handed, self._handed = self._handed, []
+        for result in handed:
+            # A websocket close waits for the server's reply; not on the loop.
+            threading.Thread(target=_close_quietly, args=(result,), daemon=True).start()
+
+
+def _close_quietly(result: Any) -> None:
+    close = getattr(result, "close", None)
+    if not callable(close):
+        return
+    try:
+        close()
+    except Exception:
+        pass
 
 
 class _SyncBody:
@@ -653,8 +700,14 @@ class AsyncMicroVM(_MicroVMCore):
 
     async def _blocking(self, fn: Any, *args: Any) -> Any:
         # to_thread copies this task's context, so the call's deadline holds
-        # in the thread too.
-        return await asyncio.to_thread(fn, *args)
+        # in the thread too. A cancelled caller's stream is closed, not lost
+        # (see _Handoff).
+        handoff = _Handoff(fn, args)
+        try:
+            return await asyncio.to_thread(handoff.run)
+        except BaseException:
+            handoff.abandon()
+            raise
 
     # The transport: the sync client's urllib methods, over httpx. Same
     # names and arguments, so the ops' I/O steps mean the same thing here.

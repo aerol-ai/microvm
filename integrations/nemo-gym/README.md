@@ -43,7 +43,7 @@ Config keys under `sandbox: aerolvm:`:
 
 | NeMo Gym | AerolVM |
 | --- | --- |
-| `create(spec)` | `MicroVM.create` with the spec's image, env, CPU, memory and disk; metadata becomes tags (plus `integration=nemo-gym`); `ttl_s` becomes `lifecycle.destroyAtAge`; `workdir` is made. Returns once a probe command runs; a failed probe destroys the sandbox. |
+| `create(spec)` | `MicroVM.create` with the spec's image, env, CPU, memory and disk; metadata becomes tags (plus `integration=nemo-gym`, and an `aerolvm-create-op` tag of its own that finds the sandbox when a create fails with no clear answer); `ttl_s` becomes `lifecycle.destroyAtAge`; `workdir` is made. Returns once a probe command runs; a failed probe destroys the sandbox, and so does a create cancelled while the sandbox is being made. |
 | `exec` | `exec` with `workDir`, `env` and `timeoutSeconds`; a timed-out command returns code 124 |
 | `upload_file`, `download_file`, `write_file`, `read_file` | `upload_file`, `download_file_to`, `download_file` |
 | `status` | `get`, mapped to NeMo Gym's statuses (a missing sandbox is `stopped`) |

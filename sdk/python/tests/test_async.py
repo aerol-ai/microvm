@@ -446,6 +446,69 @@ class AsyncClientTests(unittest.TestCase):
         self.assertEqual([(m, p) for m, p, _ in hits[1:]], [("POST", "/v1/sandboxes/sb-1/tokens/revoke")] * 2)
         self.assertEqual([body for _, _, body in hits[1:]], [b"", b""])
 
+    def test_a_cancelled_stream_open_closes_its_socket(self):
+        # Cancelling the caller does not stop the worker thread opening the
+        # socket. The exec it starts must not be left open with nobody to
+        # close it: toolboxd ends the command once its stream drops.
+        entered, release = threading.Event(), threading.Event()
+
+        class FakeWS:
+            closed = threading.Event()
+
+            def send(self, payload, opcode=None):
+                pass
+
+            def settimeout(self, value):
+                pass
+
+            def close(self):
+                self.closed.set()
+
+        ws = FakeWS()
+
+        class FakeModule:
+            class ABNF:
+                OPCODE_BINARY = 2
+
+            @staticmethod
+            def create_connection(url, **kwargs):
+                entered.set()
+                release.wait(5)
+                return ws
+
+        async def go():
+            async with AsyncMicroVM("http://127.0.0.1:9", "pat") as client:
+                task = asyncio.ensure_future(client.exec_stream("sb-1", {"command": "sleep 100"}))
+                self.assertTrue(await asyncio.to_thread(entered.wait, 5))
+                task.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+                self.assertFalse(ws.closed.is_set())
+                release.set()
+                return await asyncio.to_thread(ws.closed.wait, 5)
+
+        with unittest.mock.patch.object(client_module, "_load_websocket_module", lambda: FakeModule):
+            self.assertTrue(asyncio.run(go()))
+
+    def test_a_result_handed_over_to_a_cancelled_caller_is_closed(self):
+        # The other order: the thread handed the socket over, but the task was
+        # cancelled before it took it. Its side closes the socket instead.
+        closed = threading.Event()
+
+        class FakeWS:
+            def close(self):
+                closed.set()
+
+        handoff = aio_module._Handoff(FakeWS, ())
+        handoff.run()
+        self.assertFalse(closed.is_set())
+        handoff.abandon()
+        self.assertTrue(closed.wait(5))
+        # Something with no close (a folder's tar) is simply dropped.
+        bytes_handoff = aio_module._Handoff(bytes, (b"tar",))
+        bytes_handoff.abandon()
+        self.assertEqual(bytes_handoff.run(), b"tar")
+
     def test_tokens_and_a_passed_in_http_client(self):
         url, hits = _scripted_server(self, [(200, {"tokens": [{"id": "tok_1", "name": "ci"}]}, None)])
 

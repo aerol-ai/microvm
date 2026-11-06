@@ -3,15 +3,19 @@ status, and a run through NeMo Gym's own AsyncSandbox."""
 
 from __future__ import annotations
 
+import asyncio
 import inspect
+import threading
 import unittest
+from unittest import mock
 
 from microvm import MicroVMHTTPError
 from nemo_gym.sandbox.api import AsyncSandbox
 from nemo_gym.sandbox.providers.base import SandboxProvider, SandboxSpec, SandboxStatus
 from nemo_gym.sandbox.providers.registry import create_provider, get_provider_class
 
-from aerolvm_nemo_gym import AerolVMCreateError, AerolVMCreateVerificationError, AerolVMProvider
+from aerolvm_nemo_gym import AerolVMCreateError, AerolVMCreateVerificationError, AerolVMProvider, _owned
+from aerolvm_nemo_gym._owned import CREATE_OP_TAG
 from support import ProviderTestCase, assert_fake_matches_sdk
 
 
@@ -52,7 +56,9 @@ class CreateTest(ProviderTestCase):
         self.assertEqual(request["image"], "python:3.12")
         self.assertEqual(request["runtime"], "gvisor")
         self.assertEqual(request["env"], {"TASK": "1"})
-        self.assertEqual(request["tags"], {"integration": "nemo-gym", "team": "rl", "sandbox-api": "aerolvm", "episode": "7"})
+        tags = dict(request["tags"])
+        self.assertRegex(tags.pop(CREATE_OP_TAG), r"^[0-9a-f]{32}$")
+        self.assertEqual(tags, {"integration": "nemo-gym", "team": "rl", "sandbox-api": "aerolvm", "episode": "7"})
         self.assertEqual((request["cpu"], request["memoryMB"], request["diskGB"]), (2, 4096, 20))
         self.assertEqual(request["containerCommand"], ["sleep", "infinity"])
         self.assertEqual(request["osUser"], "coder")
@@ -72,6 +78,9 @@ class CreateTest(ProviderTestCase):
         self.assertNotIn("osUser", request)
         await self.provider().create(SandboxSpec(user="root"))
         self.assertNotIn("osUser", self.create_request())
+        # Each create has its own operation tag.
+        ops = {call[1][0]["tags"][CREATE_OP_TAG] for call in self.fake.calls_to("create")}
+        self.assertEqual(len(ops), 2)
 
     async def test_create_failure_is_a_create_error(self) -> None:
         self.fake.fail_next["create"] = MicroVMHTTPError(503, "no capacity")
@@ -106,6 +115,135 @@ class CreateTest(ProviderTestCase):
     def test_bad_settings_are_refused(self) -> None:
         with self.assertRaises(ValueError):
             self.provider(exec_timeout_s=0)
+
+
+class CancelledCreateTest(ProviderTestCase):
+    """Cancelling create while its request is out. The worker thread runs on
+    and the server makes the sandbox, so its result must not be dropped
+    before something destroys it."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        # Which thread destroyed each sandbox: the worker thread, when the
+        # create ends after the task stopped waiting, or a release thread,
+        # when the worker had already handed the sandbox over.
+        self.destroyed_on: list[str] = []
+        real = self.fake.destroy
+
+        def destroy(sandbox_id, *, timeout=None):
+            self.destroyed_on.append(threading.current_thread().name)
+            return real(sandbox_id, timeout=timeout)
+
+        self.fake.destroy = destroy
+
+    async def start_held_create(self, spec: SandboxSpec | None = None):
+        entered, release = self.fake.hold("create")
+        task = asyncio.create_task(self.provider().create(spec or SandboxSpec()))
+        self.assertTrue(await asyncio.to_thread(entered.wait, 5))
+        return task, release
+
+    async def test_cancel_during_create_destroys_the_sandbox(self) -> None:
+        task, release = await self.start_held_create()
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        self.assertEqual(self.fake.sandboxes, {})  # not made yet
+        release.set()
+        await self.eventually(lambda: self.destroyed_on)
+        self.assertEqual(self.fake.sandboxes, {})
+        self.assertEqual(len(self.fake.calls_to("create")), 1)
+        self.assertNotEqual(self.destroyed_on, ["aerolvm-release"])
+        # Nothing ran in it: no probe, no workdir.
+        self.assertEqual(self.exec_requests(), [])
+
+    async def test_cancel_as_create_returns_destroys_the_sandbox(self) -> None:
+        handed = threading.Event()
+
+        class Observed(_owned._Handoff):
+            def run(self):
+                try:
+                    return super().run()
+                finally:
+                    handed.set()
+
+        with mock.patch.object(_owned, "_Handoff", Observed):
+            task, release = await self.start_held_create()
+            release.set()
+            # Blocks the event loop on purpose: the worker hands the sandbox
+            # over, and the task is cancelled before it can take it.
+            self.assertTrue(handed.wait(5))
+            self.assertEqual(len(self.fake.sandboxes), 1)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+        await self.eventually(lambda: self.destroyed_on)
+        self.assertEqual(self.fake.sandboxes, {})
+        self.assertEqual(self.destroyed_on, ["aerolvm-release"])
+
+    async def test_nemo_gym_timeout_on_start_leaves_nothing_behind(self) -> None:
+        # The way it happens in a run: NeMo Gym's own AsyncSandbox, given up
+        # on by a timeout while the server is still making the sandbox.
+        entered, release = self.fake.hold("create")
+        with self.assertRaises(TimeoutError):
+            async with asyncio.timeout(0.2):
+                await AsyncSandbox(self.provider(), SandboxSpec()).start()
+        self.assertTrue(entered.is_set())
+        release.set()
+        await self.eventually(lambda: self.destroyed_on)
+        self.assertEqual(self.fake.sandboxes, {})
+
+    async def test_cancel_after_create_is_cleaned_up_by_create_itself(self) -> None:
+        # Once the sandbox is made, a cancel during the probe goes through
+        # create's own failure path, which destroys it before re-raising.
+        entered, release = self.fake.hold("exec")
+        task = asyncio.create_task(self.provider().create(SandboxSpec()))
+        self.assertTrue(await asyncio.to_thread(entered.wait, 5))
+        self.assertEqual(len(self.fake.sandboxes), 1)
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        self.assertEqual(self.fake.sandboxes, {})
+        release.set()
+
+    async def test_a_create_whose_reply_is_lost_is_found_by_its_tag(self) -> None:
+        for err in (MicroVMHTTPError(502, "bad gateway"), ConnectionResetError("reset by peer")):
+            with self.subTest(err=err):
+                self.fake.lose_reply("create", err)
+                with self.assertLogs("aerolvm_nemo_gym._owned", level="WARNING"):
+                    with self.assertRaises(AerolVMCreateError):
+                        await self.provider().create(SandboxSpec())
+                self.assertEqual(self.fake.sandboxes, {})
+                op = self.create_request()["tags"][CREATE_OP_TAG]
+                self.assertEqual(self.fake.calls_to("destroy_all")[-1][2]["tags"], {CREATE_OP_TAG: op})
+
+    async def test_a_cancelled_create_whose_reply_is_lost_is_found_by_its_tag(self) -> None:
+        self.fake.lose_reply("create", MicroVMHTTPError(504, "gateway timeout"))
+        task, release = await self.start_held_create()
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        release.set()
+        await self.eventually(lambda: self.fake.calls_to("destroy_all") and self.destroyed_on)
+        self.assertEqual(self.fake.sandboxes, {})
+
+    async def test_a_refused_create_is_not_searched_for(self) -> None:
+        for status in (400, 409, 503):
+            with self.subTest(status=status):
+                self.fake.fail_next["create"] = MicroVMHTTPError(status, "no")
+                with self.assertRaises(AerolVMCreateError):
+                    await self.provider().create(SandboxSpec())
+        self.assertEqual(self.fake.calls_to("list"), [])
+        self.assertEqual(self.fake.calls_to("destroy_all"), [])
+
+    async def test_a_failed_search_is_logged_with_the_tag(self) -> None:
+        self.fake.fail_next["create"] = ConnectionResetError("reset by peer")
+        self.fake.fail_next["list"] = MicroVMHTTPError(502, "still down")
+        with self.assertLogs("aerolvm_nemo_gym._owned", level="WARNING") as logs:
+            with self.assertRaises(AerolVMCreateError):
+                await self.provider().create(SandboxSpec())
+        op = self.create_request()["tags"][CREATE_OP_TAG]
+        self.assertIn(op, logs.output[0])
+        self.assertIn("destroy_all", logs.output[0])
 
 
 class ExecTest(ProviderTestCase):

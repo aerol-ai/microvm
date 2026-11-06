@@ -63,7 +63,7 @@ print(result.final_output)
 
 ## What it does with the sandbox
 
-Each run gets a new sandbox, tagged `integration=openai-agents`. Then:
+Each run gets a new sandbox, tagged `integration=openai-agents`. If the run is cancelled while the sandbox is being made, the sandbox is deleted as soon as it exists. Each create also gets its own `aerolvm-create-op` tag. If a create fails with no clear answer (a lost connection, say), the package looks for a sandbox with that tag and deletes it. Then:
 
 - **Commands** run with `exec`. The command goes as a list of words (`argv`), so spaces and quotes reach the program as written. It runs in the workspace folder (`/workspace` by default).
 - **Files** move with `upload_file` and `download_file`, so the bytes stay exact. Folder listings use `list_files`.

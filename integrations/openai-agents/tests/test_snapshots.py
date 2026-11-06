@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import io
 import json
 import os
@@ -154,6 +155,24 @@ class NativeSnapshotTest(SnapshotTestCase):
             await session.stop()
         (made,) = self.fake.calls_to("create_snapshot")
         self.assertEqual(self.fake.calls_to("delete_snapshot")[-1][1][0], made[1][1])
+        self.assertEqual(self.fake.snapshots, {})
+        self.assertIsNone(session.state.last_snapshot)
+
+    async def test_a_cancelled_save_deletes_its_snapshot(self) -> None:
+        # The snapshot's reference never reaches the store, so nothing could
+        # find the snapshot again: it is deleted once the server has made it.
+        session = await self.create(snapshot=self.spec(), on_shutdown="keep")
+        await session.start()
+        entered, release = self.fake.hold("create_snapshot")
+        task = asyncio.create_task(session.stop())
+        self.assertTrue(await asyncio.to_thread(entered.wait, 5))
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        release.set()
+        await self.eventually(lambda: self.fake.calls_to("delete_snapshot"))
+        (made,) = self.fake.calls_to("create_snapshot")
+        self.assertEqual(self.fake.calls_to("delete_snapshot")[0][1][0], made[1][1])
         self.assertEqual(self.fake.snapshots, {})
         self.assertIsNone(session.state.last_snapshot)
 
@@ -310,6 +329,35 @@ class ResumeTest(SnapshotTestCase):
             await self.client.resume(self.reload(session))
         self.assertEqual(len(self.fake.calls_to("create")), creates_before)
 
+    async def test_a_cancelled_resume_destroys_the_replacement(self) -> None:
+        session = await self.run_and_save()
+        state = self.reload(session)
+        self.assertEqual(self.fake.sandboxes, {})
+        entered, release = self.fake.hold("create")
+        task = asyncio.create_task(self.client.resume(state))
+        self.assertTrue(await asyncio.to_thread(entered.wait, 5))
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        release.set()
+        await self.eventually(lambda: len(self.fake.calls_to("destroy")) == 2)
+        self.assertEqual(self.fake.sandboxes, {})
+
+    async def test_a_cancelled_restore_destroys_the_new_sandbox_and_keeps_the_old(self) -> None:
+        session = await self.run_and_save(on_shutdown="keep")
+        name = session.state.last_snapshot
+        old_id = session.state.sandbox_id
+        entered, release = self.fake.hold("create")
+        task = asyncio.create_task(session.hydrate_workspace(io.BytesIO(encode_snapshot_ref(name))))
+        self.assertTrue(await asyncio.to_thread(entered.wait, 5))
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        release.set()
+        await self.eventually(lambda: self.fake.calls_to("destroy"))
+        self.assertEqual(list(self.fake.sandboxes), [old_id])
+        self.assertEqual(session.state.sandbox_id, old_id)
+
     async def test_failed_sandbox_is_destroyed_and_replaced(self) -> None:
         session = await self.run_and_save(on_shutdown="keep")
         old_id = session.state.sandbox_id
@@ -326,6 +374,8 @@ class ResumeTest(SnapshotTestCase):
             await self.client.resume(state)
         # No second create from the image, which could leave two sandboxes.
         self.assertEqual(self.fake.calls_to("create")[-1][1][0]["image"], session.state.last_snapshot)
+        # The one it may have made was searched for by its tag.
+        self.assertEqual(len(self.fake.calls_to("destroy_all")), 1)
 
     async def test_resume_refuses_foreign_state(self) -> None:
         with self.assertRaises(TypeError):

@@ -25,7 +25,7 @@ import tempfile
 import threading
 import uuid
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from microvm import (
     DEFAULT_LIST_LIMIT,
@@ -79,6 +79,44 @@ class FakeMicroVM:
     def calls_to(self, method: str) -> List[tuple]:
         return [c for c in self.calls if c[0] == method]
 
+    def hold(self, method: str) -> Tuple[threading.Event, threading.Event]:
+        """Make the next call to ``method`` wait before it does anything, as a
+        request still on the network does. Returns ``(entered, release)``:
+        the call sets ``entered`` once it waits, and goes on when ``release``
+        is set."""
+        entered, release = threading.Event(), threading.Event()
+
+        def held(real: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+            entered.set()
+            if not release.wait(10):
+                raise TimeoutError(f"the held {method} call was never released")
+            return real(*args, **kwargs)
+
+        self._wrap_next(method, held)
+        return entered, release
+
+    def lose_reply(self, method: str, err: BaseException) -> None:
+        """Make the next call to ``method`` do its work and then raise
+        ``err``, as when the reply is lost on its way back."""
+
+        def lost(real: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+            real(*args, **kwargs)
+            raise err
+
+        self._wrap_next(method, lost)
+
+    def _wrap_next(self, method: str, wrapper: Callable[..., Any]) -> None:
+        # An instance attribute shadows the method for one call, then removes
+        # itself. Wrapping twice nests: the outer wrapper calls the inner.
+        real = getattr(self, method)
+
+        def once(*args: Any, **kwargs: Any) -> Any:
+            if vars(self).get(method) is once:
+                del vars(self)[method]
+            return wrapper(real, *args, **kwargs)
+
+        setattr(self, method, once)
+
     def _record(self, method: str, *args: Any, **kwargs: Any) -> None:
         with self._lock:
             self.calls.append((method, args, kwargs))
@@ -121,6 +159,41 @@ class FakeMicroVM:
     def get(self, sandbox_id: str, *, include_env: bool = False, timeout: Optional[float] = None) -> Sandbox:
         self._record("get", sandbox_id, include_env=include_env)
         return Sandbox(self, dict(self._sandbox(sandbox_id)))  # type: ignore[arg-type]
+
+    def list(
+        self,
+        *,
+        tags: Optional[Dict[str, str]] = None,
+        include_env: bool = False,
+        name: Optional[str] = None,
+        timeout: Optional[float] = None,
+    ) -> List[Sandbox]:
+        self._record("list", tags=tags, include_env=include_env, name=name)
+
+        def matches(data: Dict[str, Any]) -> bool:
+            if name is not None and data.get("name") != name:
+                return False
+            return all(data["tags"].get(k) == v for k, v in (tags or {}).items())
+
+        # A copy: a test's background thread may destroy one meanwhile.
+        rows = tuple(self.sandboxes.values())
+        return [Sandbox(self, dict(data)) for data in rows if matches(data)]  # type: ignore[arg-type]
+
+    def destroy_all(self, *, tags: Dict[str, str], timeout: Optional[float] = None) -> List[str]:
+        # As the real one: list every match, then destroy each, counting one
+        # that is already gone as destroyed.
+        self._record("destroy_all", tags=tags)
+        if not tags:
+            raise ValueError("destroy_all needs at least one tag")
+        gone = []
+        for sandbox in self.list(tags=tags):
+            try:
+                self.destroy(sandbox.id)
+            except MicroVMHTTPError as e:
+                if e.status_code != 404:
+                    raise
+            gone.append(sandbox.id)
+        return gone
 
     def get_by_name(self, name: str, *, include_env: bool = False, timeout: Optional[float] = None) -> Optional[Sandbox]:
         self._record("get_by_name", name, include_env=include_env)
@@ -346,7 +419,7 @@ class FakeMicroVM:
         shutil.copytree(local_dir, remote_dir, symlinks=True, dirs_exist_ok=True)
 
 
-_HELPERS = {"cleanup", "calls_to"}
+_HELPERS = {"cleanup", "calls_to", "hold", "lose_reply"}
 
 
 def assert_fake_matches_sdk(test) -> None:

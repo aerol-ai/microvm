@@ -53,6 +53,7 @@ from microvm import (
     MicroVMUnsupportedFeatureError,
 )
 
+from ._owned import create_sandbox, run_owned
 from .options import AerolVMSandboxSessionState
 
 logger = logging.getLogger(__name__)
@@ -430,8 +431,14 @@ class AerolVMSandboxSession(BaseSandboxSession):
         try:
             # A running sandbox pauses for about a second while it is copied.
             # The name is new on every save, so a retried request finds the
-            # snapshot its first attempt made instead of failing.
-            await self._call(self._client.create_snapshot, self.sandbox_id, name)
+            # snapshot its first attempt made instead of failing. A save
+            # cancelled midway deletes its snapshot once it is made: its
+            # reference never reaches the snapshot store.
+            sandbox_id = self.sandbox_id
+            await run_owned(
+                lambda: self._client.create_snapshot(sandbox_id, name),
+                lambda _: _delete_abandoned_snapshot(self._client, name),
+            )
         except Exception as e:
             raise WorkspaceArchiveReadError(
                 path=error_root, context={"reason": "snapshot_failed"}, cause=e, retryable=_retryable(e)
@@ -576,7 +583,7 @@ class AerolVMSandboxSession(BaseSandboxSession):
         # Rollback rule: the new sandbox is made before the old one goes. A
         # failed create leaves the session on its old sandbox, still usable.
         try:
-            sandbox = await self._call(self._client.create, create_request(self.state, image=name))
+            sandbox = await create_sandbox(self._client, create_request(self.state, image=name))
         except Exception as e:
             raise WorkspaceArchiveWriteError(
                 path=posix_path_for_error(root),
@@ -616,6 +623,14 @@ class AerolVMSandboxSession(BaseSandboxSession):
         except Exception as e:
             if not is_not_found(e):
                 logger.warning("could not delete staged archive %s in sandbox %s: %s", path, self.sandbox_id, e)
+
+
+def _delete_abandoned_snapshot(client: MicroVM, name: str) -> None:
+    try:
+        client.delete_snapshot(name)
+    except Exception as e:
+        if not is_not_found(e):
+            logger.warning("could not delete AerolVM snapshot %s, whose save was cancelled: %s", name, e)
 
 
 def _file_entry(info: dict[str, Any]) -> FileEntry:

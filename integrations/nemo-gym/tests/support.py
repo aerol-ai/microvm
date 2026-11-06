@@ -3,11 +3,14 @@ work folder in a fresh temp folder."""
 
 from __future__ import annotations
 
+import asyncio
 import os
 import shutil
 import sys
 import tempfile
+import time
 import unittest
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -31,6 +34,15 @@ class ProviderTestCase(unittest.IsolatedAsyncioTestCase):
 
     def provider(self, **kwargs: Any) -> AerolVMProvider:
         return AerolVMProvider(client=self.fake, **kwargs)  # type: ignore[arg-type]
+
+    async def eventually(self, check: Callable[[], object], timeout: float = 5.0) -> None:
+        """Wait for ``check()`` to hold: for work a worker thread finishes
+        after the awaiting task has gone."""
+        deadline = time.monotonic() + timeout
+        while not check():
+            if time.monotonic() > deadline:
+                self.fail("the background work did not finish in time")
+            await asyncio.sleep(0.01)
 
     def create_request(self) -> dict:
         return self.fake.calls_to("create")[-1][1][0]

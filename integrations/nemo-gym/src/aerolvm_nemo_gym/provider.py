@@ -31,6 +31,8 @@ from nemo_gym.sandbox.providers.base import (
     SandboxStatus,
 )
 
+from ._owned import create_sandbox
+
 LOGGER = logging.getLogger(__name__)
 _T = TypeVar("_T")
 
@@ -110,12 +112,14 @@ class AerolVMProvider:
 
         A failure after the sandbox exists (the probe, the working folder)
         destroys it before raising, so a failed create leaves nothing
-        behind. ``spec.files`` are not written here: NeMo Gym's sandbox API
-        uploads them itself, through :meth:`upload_file`, right after.
+        behind. So does cancelling it: a create still running when the task
+        is cancelled destroys its sandbox as soon as it finishes.
+        ``spec.files`` are not written here: NeMo Gym's sandbox API uploads
+        them itself, through :meth:`upload_file`, right after.
         """
         request = self._create_request(spec)
         try:
-            sandbox = await self._call(self._client.create, request)
+            sandbox = await create_sandbox(self._client, request)
         except (MicroVMError, OSError) as e:
             raise AerolVMCreateError(f"AerolVM could not create a sandbox from {request['image']!r}: {e}") from e
         handle = SandboxHandle(sandbox_id=sandbox.id, provider_name=self.name, raw=sandbox)

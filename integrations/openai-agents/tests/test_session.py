@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import io
 import os
+import threading
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from agents.sandbox.errors import (
     ExecTimeoutError,
@@ -17,7 +20,8 @@ from agents.sandbox.files import EntryKind
 from agents.sandbox.manifest import Environment
 from microvm import MicroVMHTTPError
 
-from aerolvm_openai_agents import AerolVMSandboxClient, DEFAULT_EXEC_TIMEOUT_S
+from aerolvm_openai_agents import AerolVMSandboxClient, DEFAULT_EXEC_TIMEOUT_S, _owned
+from aerolvm_openai_agents._owned import CREATE_OP_TAG
 from support import IMAGE, ProviderTestCase, assert_fake_matches_sdk
 
 
@@ -52,7 +56,13 @@ class ExecTest(ProviderTestCase):
         request = call[1][0]
         self.assertEqual(request["image"], IMAGE)
         self.assertEqual(request["cpu"], 0.5)
-        self.assertEqual(request["tags"], {"integration": "openai-agents", "team": "ml"})
+        tags = dict(request["tags"])
+        self.assertRegex(tags.pop(CREATE_OP_TAG), r"^[0-9a-f]{32}$")
+        self.assertEqual(tags, {"integration": "openai-agents", "team": "ml"})
+        # The tag is per create, never saved with the session's options.
+        await self.create()
+        ops = {call[1][0]["tags"][CREATE_OP_TAG] for call in self.fake.calls_to("create")}
+        self.assertEqual(len(ops), 2)
 
     async def test_manifest_environment_reaches_every_command(self) -> None:
         session = await self.create(manifest=self.manifest(environment=Environment(value={"GREETING": "hello"})))
@@ -290,6 +300,98 @@ class LifecycleTest(ProviderTestCase):
                 else:
                     os.environ[key] = value
         self.assertEqual(client.client.api_url, "https://aerolvm.example")
+
+
+class CancelledCreateTest(ProviderTestCase):
+    """Cancelling create() while its request is out. The worker thread runs
+    on and the server makes the sandbox, so its result must not be dropped
+    before something destroys it."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        # Which thread destroyed each sandbox: the worker thread, when the
+        # create ends after the task stopped waiting, or a release thread,
+        # when the worker had already handed the sandbox over.
+        self.destroyed_on: list[str] = []
+        real = self.fake.destroy
+
+        def destroy(sandbox_id, *, timeout=None):
+            self.destroyed_on.append(threading.current_thread().name)
+            return real(sandbox_id, timeout=timeout)
+
+        self.fake.destroy = destroy
+
+    async def start_held_create(self):
+        entered, release = self.fake.hold("create")
+        task = asyncio.create_task(self.create())
+        self.assertTrue(await asyncio.to_thread(entered.wait, 5))
+        return task, release
+
+    async def test_cancel_during_create_destroys_the_sandbox(self) -> None:
+        task, release = await self.start_held_create()
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        self.assertEqual(self.fake.sandboxes, {})  # not made yet
+        release.set()
+        await self.eventually(lambda: self.destroyed_on)
+        self.assertEqual(self.fake.sandboxes, {})
+        self.assertEqual(len(self.fake.calls_to("create")), 1)
+        self.assertNotEqual(self.destroyed_on, ["aerolvm-release"])
+
+    async def test_cancel_as_create_returns_destroys_the_sandbox(self) -> None:
+        handed = threading.Event()
+
+        class Observed(_owned._Handoff):
+            def run(self):
+                try:
+                    return super().run()
+                finally:
+                    handed.set()
+
+        with mock.patch.object(_owned, "_Handoff", Observed):
+            task, release = await self.start_held_create()
+            release.set()
+            # Blocks the event loop on purpose: the worker hands the sandbox
+            # over, and the task is cancelled before it can take it.
+            self.assertTrue(handed.wait(5))
+            self.assertEqual(len(self.fake.sandboxes), 1)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+        await self.eventually(lambda: self.destroyed_on)
+        self.assertEqual(self.fake.sandboxes, {})
+        self.assertEqual(self.destroyed_on, ["aerolvm-release"])
+
+    async def test_cancel_after_create_leaves_cleanup_to_delete(self) -> None:
+        # create() returned, so the caller holds the session: a cancel later
+        # (here, while start() makes the workspace root) is the caller's to
+        # clean up, and delete() still destroys the sandbox.
+        session = await self.create()
+        entered, release = self.fake.hold("make_dir")
+        task = asyncio.create_task(session.start())
+        self.assertTrue(await asyncio.to_thread(entered.wait, 5))
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        release.set()
+        await self.client.delete(session)
+        self.assertEqual(self.fake.sandboxes, {})
+
+    async def test_a_create_whose_reply_is_lost_is_found_by_its_tag(self) -> None:
+        self.fake.lose_reply("create", ConnectionResetError("reset by peer"))
+        with self.assertLogs("aerolvm_openai_agents._owned", level="WARNING"):
+            with self.assertRaises(ConnectionResetError):
+                await self.create()
+        self.assertEqual(self.fake.sandboxes, {})
+        op = self.fake.calls_to("create")[-1][1][0]["tags"][CREATE_OP_TAG]
+        self.assertEqual(self.fake.calls_to("destroy_all")[-1][2]["tags"], {CREATE_OP_TAG: op})
+
+    async def test_a_refused_create_is_not_searched_for(self) -> None:
+        self.fake.fail_next["create"] = MicroVMHTTPError(422, "bad request")
+        with self.assertRaises(MicroVMHTTPError):
+            await self.create()
+        self.assertEqual(self.fake.calls_to("destroy_all"), [])
 
 
 if __name__ == "__main__":

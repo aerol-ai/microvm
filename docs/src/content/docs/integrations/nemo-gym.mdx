@@ -61,7 +61,7 @@ The agent's config does not change.
 
 | NeMo Gym asks for | AerolVM does |
 | --- | --- |
-| A new sandbox | Creates one from the spec's image (or `default_image`), with its environment variables, CPU, memory and disk. Its metadata becomes [tags](/sandbox-tags/), plus `integration=nemo-gym`. The call returns once the sandbox runs a command. |
+| A new sandbox | Creates one from the spec's image (or `default_image`), with its environment variables, CPU, memory and disk. Its metadata becomes [tags](/sandbox-tags/), plus `integration=nemo-gym`. The call returns once the sandbox runs a command. If NeMo Gym cancels the call while the sandbox is being made, the sandbox is deleted as soon as it exists. Each create also gets its own `aerolvm-create-op` tag. If a create fails with no clear answer (a lost connection, say), the provider looks for a sandbox with that tag and deletes it. |
 | The spec's `ttl_s` | Sets the sandbox to delete itself at that age, so a crashed training run does not leave sandboxes behind. |
 | The spec's `workdir` | Makes the folder, and runs commands there by default. |
 | A command | Runs it with the folder, variables and time limit NeMo Gym gives. A command that runs out of time returns exit code 124. |

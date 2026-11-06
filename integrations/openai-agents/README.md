@@ -76,7 +76,7 @@ would not store with your run state.
 
 | Agents SDK asks for | AerolVM does |
 | --- | --- |
-| `create` | `MicroVM.create`, tagged `integration=openai-agents` |
+| `create` | `MicroVM.create`, tagged `integration=openai-agents` and with an `aerolvm-create-op` tag of its own (it finds the sandbox when a create fails with no clear answer); a create cancelled while the sandbox is being made destroys it once it exists |
 | a command | `exec` with the command as a list (`argv`), run in the workspace folder |
 | read and write a file | `download_file` and `upload_file` (bytes stay exact) |
 | list a folder | `list_files` |
