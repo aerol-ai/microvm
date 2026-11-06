@@ -8,11 +8,9 @@ import (
 	"fmt"
 	"io"
 	"math/rand"
-	"mime/multipart"
 	"net"
 	"net/http"
 	"net/url"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -864,82 +862,15 @@ func (c *Client) Exec(ctx context.Context, id string, request ExecRequest) (Exec
 	return response, err
 }
 
+// UploadFile uploads data to targetPath with no write options.
 func (c *Client) UploadFile(ctx context.Context, id, targetPath string, data []byte) error {
-	var body bytes.Buffer
-	writer := multipart.NewWriter(&body)
-	_ = writer.WriteField("path", targetPath)
-	part, err := writer.CreateFormFile("file", filepath.Base(targetPath))
-	if err != nil {
-		return err
-	}
-	if _, err := part.Write(data); err != nil {
-		return err
-	}
-	if err := writer.Close(); err != nil {
-		return err
-	}
-
-	request, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+c.versionPrefix+"/sandboxes/"+id+"/toolbox/files/upload", &body)
-	if err != nil {
-		return err
-	}
-	request.Header.Set("Content-Type", writer.FormDataContentType())
-	c.addAuth(request)
-
-	response, err := c.httpClient.Do(request)
-	if err != nil {
-		return err
-	}
-	defer response.Body.Close()
-	if response.StatusCode >= 400 {
-		return decodeError(response)
-	}
-	return nil
+	return c.UploadFileWithOptions(ctx, id, targetPath, data, sdktypes.UploadFileOptions{})
 }
 
-// UploadFileStream uploads r to targetPath without holding the file in
-// memory: the multipart body is produced through an io.Pipe while the request
-// is sent, so memory stays at the copy buffer no matter the file size. Unlike
-// a []byte upload it can't be retried by the client (the reader is consumed),
-// which matches UploadFile, whose request is not retried either.
+// UploadFileStream uploads r to targetPath with no write options; see
+// UploadFileStreamWithOptions.
 func (c *Client) UploadFileStream(ctx context.Context, id, targetPath string, r io.Reader) error {
-	pr, pw := io.Pipe()
-	// Closing the read side unblocks the writer goroutine if the request
-	// fails before the body is fully read.
-	defer pr.Close()
-	writer := multipart.NewWriter(pw)
-	go func() {
-		pw.CloseWithError(func() error {
-			if err := writer.WriteField("path", targetPath); err != nil {
-				return err
-			}
-			part, err := writer.CreateFormFile("file", filepath.Base(targetPath))
-			if err != nil {
-				return err
-			}
-			if _, err := io.Copy(part, r); err != nil {
-				return err
-			}
-			return writer.Close()
-		}())
-	}()
-
-	request, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+c.versionPrefix+"/sandboxes/"+id+"/toolbox/files/upload", pr)
-	if err != nil {
-		return err
-	}
-	request.Header.Set("Content-Type", writer.FormDataContentType())
-	c.addAuth(request)
-
-	response, err := c.httpClient.Do(request)
-	if err != nil {
-		return err
-	}
-	defer response.Body.Close()
-	if response.StatusCode >= 400 {
-		return decodeError(response)
-	}
-	return nil
+	return c.UploadFileStreamWithOptions(ctx, id, targetPath, r, sdktypes.UploadFileOptions{})
 }
 
 // DownloadFileStream opens targetPath for reading without buffering it. The

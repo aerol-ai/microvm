@@ -972,6 +972,8 @@ var Registry = []UseCase{
 	// Agent-sandbox parity, files (parity_files_test.go; plan section 5.1).
 	{ID: "UC-373", Title: "File verbs through the SDK: list with a depth and an entry cap (truncated past it), info and exists, mkdir with and without parents (409 on an existing folder), move with overwrite=false refused with 409 and both files untouched, a move from /dev/shm across filesystems, recursive copy keeping modes and symlinks, recursive delete, search and find", Implemented: true},
 	{ID: "UC-374", Title: "The shared file core still answers Daytona's SDK in Daytona's shape: listFiles and getFileDetails carry exactly Daytona's fields (its Go client rejects others), moveFiles replaces the destination, createFolder accepts an existing folder", Implemented: true},
+	{ID: "UC-375", Title: "Upload write options: append adds to the file, create_only on an existing file is a 412 file_exists and leaves it untouched, a mode is applied, an atomic replace keeps the mode and leaves a hard link to the old file with the old content, append with atomic is a 400 naming both, and two create_only uploads at once (plain and atomic) give exactly one success and one 412", Implemented: true},
+	{ID: "UC-378", Title: "A write that hits ENOSPC (an upload to /dev/full) answers 507 \"sandbox disk is full\", not a bare 500", Implemented: true},
 	{ID: "UC-379", Title: "A WASM sandbox answers the file verbs (info, move, copy, folder, delete, search, find, list with depth) with a clear 501, and the SDK refuses ListFiles and a guarded MoveFile with ErrUnsupportedFeature before sending them", Requires: []Capability{CapWasm}, Implemented: true},
 }
 

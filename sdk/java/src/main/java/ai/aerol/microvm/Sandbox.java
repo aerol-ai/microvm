@@ -13,6 +13,7 @@ import ai.aerol.microvm.model.FileMatch;
 import ai.aerol.microvm.model.ListFilesOptions;
 import ai.aerol.microvm.model.MakeDirOptions;
 import ai.aerol.microvm.model.MoveFileOptions;
+import ai.aerol.microvm.model.UploadFileOptions;
 import ai.aerol.microvm.model.CreateSnapshotOptions;
 import ai.aerol.microvm.model.CreateSessionOptions;
 import ai.aerol.microvm.model.CustomDomain;
@@ -119,6 +120,11 @@ public class Sandbox extends SandboxData {
 
     public void uploadFile(String targetPath, byte[] data) {
         client.uploadFile(id, targetPath, data);
+    }
+
+    /** Uploads with write options: append, create-only, atomic replace and a mode. */
+    public void uploadFile(String targetPath, byte[] data, UploadFileOptions options) {
+        client.uploadFile(id, targetPath, data, options);
     }
 
     public byte[] downloadFile(String targetPath) {

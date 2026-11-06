@@ -1,8 +1,12 @@
 package toolhost
 
 import (
+	"bytes"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -69,5 +73,42 @@ func TestFileWatchAnswers501(t *testing.T) {
 	handler.ServeHTTP(rec, req)
 	if rec.Code != http.StatusNotImplemented || !strings.Contains(rec.Body.String(), "gVisor or Firecracker") {
 		t.Fatalf("watch = %d %s, want the file-watching 501", rec.Code, rec.Body.String())
+	}
+}
+
+// The WASM upload writes plainly; it refuses toolboxd's upload options (plan
+// F2, F3) with a 501 instead of ignoring them and answering 201.
+func TestUploadRefusesToolboxdOptions(t *testing.T) {
+	workDir := t.TempDir()
+	handler := New(Config{SandboxID: "sb", AuthToken: "tok", WorkDir: workDir}).Handler()
+	upload := func(query string) *httptest.ResponseRecorder {
+		var body bytes.Buffer
+		mw := multipart.NewWriter(&body)
+		_ = mw.WriteField("path", "/f.txt")
+		part, _ := mw.CreateFormFile("file", "f.txt")
+		_, _ = part.Write([]byte("data"))
+		_ = mw.Close()
+		req := httptest.NewRequest(http.MethodPost, "/files/upload?"+query, &body)
+		req.Header.Set("Content-Type", mw.FormDataContentType())
+		req.Header.Set("Authorization", "Bearer tok")
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		return rec
+	}
+	for _, query := range []string{"append=true", "create_only=true", "atomic=1", "extract=true", "mode=600"} {
+		rec := upload(query)
+		name := strings.SplitN(query, "=", 2)[0]
+		if rec.Code != http.StatusNotImplemented || !strings.Contains(rec.Body.String(), name) {
+			t.Fatalf("upload ?%s = %d %s, want a 501 naming %s", query, rec.Code, rec.Body.String(), name)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(workDir, "f.txt")); !os.IsNotExist(err) {
+		t.Fatalf("a refused upload wrote the file: %v", err)
+	}
+	// Plain uploads, and options turned off, still work.
+	for _, query := range []string{"", "append=false&create_only=0"} {
+		if rec := upload(query); rec.Code != http.StatusCreated {
+			t.Fatalf("upload ?%s = %d %s", query, rec.Code, rec.Body.String())
+		}
 	}
 }

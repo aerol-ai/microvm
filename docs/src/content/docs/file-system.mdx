@@ -43,8 +43,77 @@ To be told when files change instead of checking for them, see [File watching](/
 </Tabs>
 
 - Missing folders in the path are created for you. Here, `/workspace` does not need to exist yet.
-- If a file is already at that path, it is replaced.
+- If a file is already at that path, it is replaced, and it keeps its permissions.
 - In TypeScript you can pass a string, a `Uint8Array`, an `ArrayBuffer` or a `Blob`. The other SDKs take bytes.
+
+## Choose how the file is written
+
+Four options change how an upload writes its file:
+
+- **append** adds to the end of the file instead of replacing it. A missing file is created.
+- **create only** writes only if no file is there yet. Otherwise the call fails with HTTP 412 and the file is left alone. If two uploads race for the same new path, exactly one wins.
+- **atomic** writes to a temporary file first and then swaps it into place. Anyone reading the file sees the old version or the new one, never half of each.
+- **mode** sets the file's permissions, such as `0o600` for a private file.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    await sandbox.uploadFile("/workspace/log.txt", "one more line\n", { append: true });
+    await sandbox.uploadFile("/workspace/job.lock", "taken", { createOnly: true });
+    await sandbox.uploadFile("/workspace/config.json", JSON.stringify({ debug: true }), { atomic: true, mode: 0o600 });
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    sandbox.upload_file("/workspace/log.txt", b"one more line\n", append=True)
+    sandbox.upload_file("/workspace/job.lock", b"taken", create_only=True)
+    sandbox.upload_file("/workspace/config.json", b'{"debug": true}', atomic=True, mode=0o600)
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    err := sandbox.UploadFileWithOptions(ctx, "/workspace/job.lock", []byte("taken"),
+        sdktypes.UploadFileOptions{CreateOnly: true})
+    var apiErr *microvm.APIError
+    if errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusPreconditionFailed {
+        log.Fatal("another worker holds the lock")
+    }
+    err = sandbox.UploadFileWithOptions(ctx, "/workspace/config.json", []byte(`{"debug": true}`),
+        sdktypes.UploadFileOptions{Atomic: true, Mode: 0o600})
+    if err != nil {
+        log.Fatal(err)
+    }
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    use aerolvm_sdk::UploadFileOptions;
+
+    sandbox.upload_file_with_options(
+        "/workspace/log.txt",
+        b"one more line\n".to_vec(),
+        UploadFileOptions { append: true, ..Default::default() },
+    )?;
+    sandbox.upload_file_with_options(
+        "/workspace/config.json",
+        br#"{"debug": true}"#.to_vec(),
+        UploadFileOptions { atomic: true, mode: Some(0o600), ..Default::default() },
+    )?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    sandbox.uploadFile("/workspace/log.txt", "one more line\n".getBytes(StandardCharsets.UTF_8),
+        new UploadFileOptions().setAppend(true));
+    sandbox.uploadFile("/workspace/config.json", "{\"debug\": true}".getBytes(StandardCharsets.UTF_8),
+        new UploadFileOptions().setAtomic(true).setMode(0600));
+    ```
+  </TabItem>
+</Tabs>
+
+- `append` cannot be combined with `create only` or `atomic`. Asking for both is refused (HTTP 400) with a message that names both.
+- Without `mode`, a new file gets `rw-r--r--` and an existing file keeps its permissions. An atomic replace also keeps the old file's owner.
+- An atomic write never changes the old file's contents in place. If another path is a hard link to the old file, that path keeps the old contents.
 
 ## Read a file from a sandbox
 
@@ -523,7 +592,8 @@ Deleting a symlink deletes the link, never what it points to. Deleting `/` is re
 | The path does not exist | 404 |
 | The sandbox user may not read or change it | 403 |
 | The path is the wrong kind (a folder where a file was expected, or the reverse), a folder without `recursive`, or the destination already exists | 409 |
-| A request that cannot work, such as deleting `/` or copying a folder into itself | 400 |
+| A request that cannot work, such as deleting `/`, copying a folder into itself, or upload options that clash | 400 |
+| An upload with `create only` found a file already there | 412 |
 | The sandbox disk is full ("sandbox disk is full") | 507 |
 | The sandbox is a WASM or V8 isolate sandbox, which has no such call | 501 |
 
@@ -534,8 +604,10 @@ The SDKs retry a call that failed on the way. Calls that are safe to send twice 
 | Call | Retried on |
 |---|---|
 | `listFiles`, `getFileInfo`, `fileExists`, `searchFiles`, `findInFiles` | 421, 429, 502, 503, 504 and dropped connections |
+| `uploadFile`, plain or atomic | 421, 429, 502, 503, 504 and dropped connections: sending the same bytes again leaves the same file |
 | `deleteFile`, `makeDir` | The same. If a retry finds the work already done (the file is gone, the folder is there), the call succeeds. |
-| `moveFile`, `copyFile` | Only 429 and 503, when the server did nothing. After any other failure the move may have happened, so the SDK reports the error instead of guessing. |
+| `moveFile`, `copyFile`, `uploadFile` with append or create only | Only 429 and 503, when the server did nothing. After any other failure the work may have happened (a second append would add the data twice), so the SDK reports the error instead of guessing. |
+| Go `UploadFileStream` and `UploadFileStreamWithOptions` | Never: the data is read as it is sent, so it cannot be sent again. |
 
 ## Copy a whole folder
 
@@ -559,7 +631,7 @@ Most SDK calls hold the whole file in memory while they copy it. The Go SDK also
 - **Use full paths** that start with `/`.
 - **One upload can be up to 256 MB.** For bigger data, [attach cloud storage](/external-storage/) or a [platform volume](/platform-volumes/) instead.
 - **The sandbox must be running.** Start a stopped sandbox before you copy files.
-- **Uploaded files belong to `root`** and everyone can read them (`rw-r--r--`). If a program running as another user must change a file, fix its owner with `chown` through `exec`.
+- **A new uploaded file belongs to `root`** and everyone can read it (`rw-r--r--`), unless you pass a `mode`. If a program running as another user must change a file, fix its owner with `chown` through `exec`.
 - **The file calls above need a current sandbox agent.** A sandbox created before this release, or a Firecracker template built before it, runs an older agent. The SDK refuses the calls that need a newer one with an "unsupported feature" error that says to restart the sandbox or re-create the template. It never sends an option the older agent would ignore.
 - **WASM sandboxes** support only upload, download and a plain folder list. The other file calls answer HTTP 501.
 - **V8 isolate sandboxes have no files.** Every file call answers HTTP 501. See [V8 isolate](/isolate-sandbox/).

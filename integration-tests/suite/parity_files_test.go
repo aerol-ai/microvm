@@ -225,3 +225,91 @@ func TestParityWasmFileVerbs501(t *testing.T) {
 		t.Fatalf("SDK MoveFile on WASM = %v, want ErrUnsupportedFeature", err)
 	}
 }
+
+// UC-375 — upload write options live (F2): append, create_only refused with
+// 412 and the file untouched, a mode, an atomic replace that leaves a hard
+// link to the old file alone, a clash refused with 400, and two create_only
+// uploads at once giving exactly one success and one 412.
+func TestParityUploadWriteOptionsLive(t *testing.T) {
+	harness.Require(t, sc, "UC-375")
+	sb := paritySandbox(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+
+	root := "/tmp/uc375"
+	logPath := root + "/log.txt"
+	if err := sb.UploadFile(ctx, logPath, []byte("a")); err != nil {
+		t.Fatalf("upload: %v", err)
+	}
+	if err := sb.UploadFileWithOptions(ctx, logPath, []byte("b"), sdktypes.UploadFileOptions{Append: true}); err != nil {
+		t.Fatalf("append: %v", err)
+	}
+	var apiErr *microvm.APIError
+	err := sb.UploadFileWithOptions(ctx, logPath, []byte("x"), sdktypes.UploadFileOptions{CreateOnly: true})
+	if !errors.As(err, &apiErr) || apiErr.StatusCode != http.StatusPreconditionFailed || apiErr.Code != "file_exists" {
+		t.Fatalf("create_only on an existing file = %v, want 412 file_exists", err)
+	}
+	if got := parityExec(t, ctx, sb, "cat "+logPath); got != "ab" {
+		t.Fatalf("log after append and a refused create_only = %q, want ab", got)
+	}
+	if err := sb.UploadFileWithOptions(ctx, root+"/secret", []byte("s"), sdktypes.UploadFileOptions{Mode: 0o600}); err != nil {
+		t.Fatalf("upload with a mode: %v", err)
+	}
+	if got := parityExec(t, ctx, sb, "stat -c %a "+root+"/secret"); got != "600" {
+		t.Fatalf("mode = %s, want 600", got)
+	}
+	_ = parityExec(t, ctx, sb, "printf old > "+root+"/conf && chmod 640 "+root+"/conf && ln "+root+"/conf /tmp/uc375-outside-link && echo ok")
+	if err := sb.UploadFileWithOptions(ctx, root+"/conf", []byte("new"), sdktypes.UploadFileOptions{Atomic: true}); err != nil {
+		t.Fatalf("atomic upload: %v", err)
+	}
+	if got := parityExec(t, ctx, sb, "cat "+root+"/conf; echo; cat /tmp/uc375-outside-link; echo; stat -c %a "+root+"/conf"); got != "new\nold\n640" {
+		t.Fatalf("after an atomic replace: %q, want the new file, the hard link's old content and the mode kept", got)
+	}
+	err = sb.UploadFileWithOptions(ctx, root+"/clash", []byte("x"), sdktypes.UploadFileOptions{Append: true, Atomic: true})
+	if !errors.As(err, &apiErr) || apiErr.StatusCode != http.StatusBadRequest || !strings.Contains(apiErr.Message, "append") || !strings.Contains(apiErr.Message, "atomic") {
+		t.Fatalf("append with atomic = %v, want a 400 naming both", err)
+	}
+
+	for round, atomic := range []bool{false, true, false, true} {
+		target := root + "/race-" + string(rune('a'+round))
+		results := make(chan error, 2)
+		start := make(chan struct{})
+		for i := 0; i < 2; i++ {
+			go func() {
+				<-start
+				results <- sb.UploadFileWithOptions(ctx, target, []byte(strings.Repeat("x", 1<<16)), sdktypes.UploadFileOptions{CreateOnly: true, Atomic: atomic})
+			}()
+		}
+		close(start)
+		created, refused := 0, 0
+		for i := 0; i < 2; i++ {
+			err := <-results
+			switch {
+			case err == nil:
+				created++
+			case errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusPreconditionFailed:
+				refused++
+			default:
+				t.Fatalf("racing create_only (atomic=%v): %v", atomic, err)
+			}
+		}
+		if created != 1 || refused != 1 {
+			t.Fatalf("racing create_only (atomic=%v): %d created, %d refused; want exactly one of each", atomic, created, refused)
+		}
+	}
+}
+
+// UC-378 — a write that hits a full disk says "sandbox disk is full" with a
+// 507, not a bare 500. /dev/full answers every write with ENOSPC, the error
+// a full disk gives, without filling a real disk on the test host.
+func TestParityDiskFullIs507(t *testing.T) {
+	harness.Require(t, sc, "UC-378")
+	sb := paritySandbox(t)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	err := sb.UploadFile(ctx, "/dev/full", []byte("data"))
+	var apiErr *microvm.APIError
+	if !errors.As(err, &apiErr) || apiErr.StatusCode != http.StatusInsufficientStorage || !strings.Contains(apiErr.Message, "sandbox disk is full") {
+		t.Fatalf("upload to /dev/full = %v, want 507 sandbox disk is full", err)
+	}
+}

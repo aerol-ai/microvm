@@ -958,6 +958,21 @@ export interface ExecResult {
   signal?: string;
 }
 
+/**
+ * How an upload writes its file. With none set, missing folders are made and
+ * an existing file is replaced in place.
+ */
+export interface UploadFileOptions {
+  /** Add to the end of the file instead of replacing it. */
+  append?: boolean;
+  /** Write only if the file does not exist yet (HTTP 412 otherwise). Of two uploads racing for one new path, exactly one wins. */
+  createOnly?: boolean;
+  /** Write a temp file and rename it into place, so a reader never sees half a file. Cannot be combined with `append`. */
+  atomic?: boolean;
+  /** Permissions such as `0o600`. Without it a new file is 0644 and an existing one keeps its own. */
+  mode?: number;
+}
+
 /** One file, folder or symlink in a sandbox. */
 export interface FileInfo {
   name: string;

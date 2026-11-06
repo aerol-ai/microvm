@@ -299,7 +299,9 @@ func TestHandleUploadMissingFileAndMkdirFail(t *testing.T) {
 	req.Header.Set("Content-Type", w.FormDataContentType())
 	rec = httptest.NewRecorder()
 	srv.handleUpload(rec, req)
-	if rec.Code != http.StatusInternalServerError {
+	// A file where a parent folder should be: the wrong kind of path, a 409
+	// since plan F1/F2 mapped filesystem errors (it was a bare 500).
+	if rec.Code != http.StatusConflict {
 		t.Fatalf("mkdir fail status = %d body=%s", rec.Code, rec.Body.String())
 	}
 }

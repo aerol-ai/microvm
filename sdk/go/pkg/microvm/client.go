@@ -681,6 +681,21 @@ func (s *Sandbox) UploadFileStream(ctx context.Context, targetPath string, r io.
 	return s.client.inner.UploadFileStream(ctx, s.ID, targetPath, r)
 }
 
+// UploadFileWithOptions is UploadFile with write options: append,
+// create-only, atomic replace and a file mode (see UploadFileOptions). A
+// sandbox whose agent predates them fails with ErrUnsupportedFeature rather
+// than ignoring them. Plain and atomic uploads retry like UploadFile; append
+// and create-only retry only on 429 and 503.
+func (s *Sandbox) UploadFileWithOptions(ctx context.Context, targetPath string, data []byte, opts sdktypes.UploadFileOptions) error {
+	return s.client.inner.UploadFileWithOptions(ctx, s.ID, targetPath, data, opts)
+}
+
+// UploadFileStreamWithOptions is UploadFileStream with write options. It is
+// sent once and never retried.
+func (s *Sandbox) UploadFileStreamWithOptions(ctx context.Context, targetPath string, r io.Reader, opts sdktypes.UploadFileOptions) error {
+	return s.client.inner.UploadFileStreamWithOptions(ctx, s.ID, targetPath, r, opts)
+}
+
 // DownloadFileStream opens targetPath for reading without buffering it. The
 // caller must Close the returned body; closing early ends the transfer, so
 // reading only the head of a large file costs only the head.

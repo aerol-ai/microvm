@@ -29,6 +29,9 @@ var toolboxFeatures = map[string][]string{
 	// the move and copy overwrite guard, mkdir without parents, and the
 	// POST /files/copy route.
 	"files.verbs": {"depth", "extended", "limit", "overwrite", "parents"},
+	// F2: upload write options. mode is also a baseline option of the
+	// folder and permissions routes, but upload honours it only from here.
+	"files.write_options": {"append", "atomic", "create_only", "mode"},
 }
 
 // baselineRequestOptions are the options toolboxd understood before /version

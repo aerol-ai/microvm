@@ -43,6 +43,7 @@ import type {
   FileInfo,
   FileList,
   FileMatch,
+  UploadFileOptions,
   ListFilesOptions,
   DeleteFileOptions,
   MakeDirOptions,
@@ -514,6 +515,12 @@ const REFUSED_STATUS_CODES = new Set([429, 503]);
  * overwrite), so the calls that send them check first.
  */
 const FEATURE_FILE_VERBS = "files.verbs";
+
+/**
+ * The toolboxd feature behind upload's write options. An older agent ignores
+ * them: createOnly would replace an existing file.
+ */
+const FEATURE_WRITE_OPTIONS = "files.write_options";
 
 /** The entry cap `listFiles` sends when the caller gives none. */
 export const DEFAULT_LIST_LIMIT = 10_000;
@@ -1163,12 +1170,27 @@ export class APIClient {
     return openSessionAttach(this.baseURL, this.versionPrefix, this.patToken, id, sessionID, options);
   }
 
-  async uploadFile(id: string, targetPath: string, data: BinaryLike): Promise<void> {
+  /**
+   * Plain and atomic uploads retry on 421/429/502/503/504; `append` and
+   * `createOnly` only on 429/503, because a second send would append twice
+   * or find the first one's file.
+   */
+  async uploadFile(id: string, targetPath: string, data: BinaryLike, options: UploadFileOptions = {}): Promise<void> {
+    const query = new URLSearchParams();
+    if (options.append) query.set("append", "true");
+    if (options.createOnly) query.set("create_only", "true");
+    if (options.atomic) query.set("atomic", "true");
+    if (options.mode !== undefined) query.set("mode", options.mode.toString(8));
+    if (query.size > 0) {
+      // An older agent ignores these; createOnly would replace a file.
+      await this.requireToolboxFeatures(id, FEATURE_WRITE_OPTIONS);
+    }
     const form = new FormData();
     form.set("path", targetPath);
     form.set("file", toBlob(data), basename(targetPath));
 
-    const response = await this.request("POST", `${this.versionPrefix}/sandboxes/${id}/toolbox/files/upload`, { body: form });
+    const path = `${this.versionPrefix}/sandboxes/${id}/toolbox/files/upload${query.size > 0 ? `?${query.toString()}` : ""}`;
+    const response = await this.request("POST", path, { body: form }, { idempotent: !(options.append || options.createOnly) });
     if (!response.ok) {
       throw await decodeError(response);
     }
@@ -1858,8 +1880,9 @@ export class SandboxResource implements Sandbox {
     return this.client.attachSession(this.id, sessionID, options);
   }
 
-  async uploadFile(targetPath: string, data: BinaryLike): Promise<void> {
-    await this.client.uploadFile(this.id, targetPath, data);
+  /** Upload a file. See {@link UploadFileOptions} for append, create-only, atomic and mode. */
+  async uploadFile(targetPath: string, data: BinaryLike, options: UploadFileOptions = {}): Promise<void> {
+    await this.client.uploadFile(this.id, targetPath, data, options);
   }
 
   async downloadFile(targetPath: string): Promise<Uint8Array> {

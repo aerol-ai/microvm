@@ -76,6 +76,7 @@ import ai.aerol.microvm.model.FileMatch;
 import ai.aerol.microvm.model.ListFilesOptions;
 import ai.aerol.microvm.model.MakeDirOptions;
 import ai.aerol.microvm.model.MoveFileOptions;
+import ai.aerol.microvm.model.UploadFileOptions;
 import ai.aerol.microvm.model.HealthStatus;
 import ai.aerol.microvm.model.IngressTarget;
 import ai.aerol.microvm.model.Lifecycle;
@@ -914,13 +915,45 @@ public class MicroVMClient {
     }
 
     public void uploadFile(String sandboxId, String targetPath, byte[] data) {
+        uploadFile(sandboxId, targetPath, data, null);
+    }
+
+    /**
+     * Uploads {@code data} with write options: append, create-only, atomic
+     * replace and a file mode. A sandbox whose agent predates them fails with
+     * {@link MicroVMUnsupportedFeatureException} instead of ignoring them.
+     * Plain and atomic uploads retry on 421/429/502/503/504; append and
+     * create-only only on 429/503, because a second send would append twice
+     * or find the first one's file.
+     */
+    public void uploadFile(String sandboxId, String targetPath, byte[] data, UploadFileOptions options) {
+        UploadFileOptions opts = options == null ? new UploadFileOptions() : options;
+        Map<String, String> query = new java.util.LinkedHashMap<>();
+        if (opts.append) {
+            query.put("append", "true");
+        }
+        if (opts.createOnly) {
+            query.put("create_only", "true");
+        }
+        if (opts.atomic) {
+            query.put("atomic", "true");
+        }
+        if (opts.mode != null) {
+            query.put("mode", Integer.toOctalString(opts.mode));
+        }
+        if (!query.isEmpty()) {
+            // An older agent ignores these; create_only would replace a file.
+            requireToolboxFeatures(sandboxId, FEATURE_WRITE_OPTIONS);
+        }
         String boundary = "----microvm-" + UUID.randomUUID();
         byte[] body = buildMultipartBody(boundary, targetPath, data);
         HttpResponse<byte[]> response = sendRequest(
             "POST",
-            sandboxPath(sandboxId) + "/toolbox/files/upload",
+            toolboxPath(sandboxId, "/files/upload", query),
             HttpRequest.BodyPublishers.ofByteArray(body),
-            "multipart/form-data; boundary=" + boundary
+            "multipart/form-data; boundary=" + boundary,
+            null,
+            opts.append || opts.createOnly ? RetryMode.UNSENT_ONLY : RetryMode.IDEMPOTENT
         );
         ensureSuccess(response);
     }
@@ -956,6 +989,9 @@ public class MicroVMClient {
      * first.
      */
     static final String FEATURE_FILE_VERBS = "files.verbs";
+
+    /** The toolboxd feature behind upload's write options. */
+    static final String FEATURE_WRITE_OPTIONS = "files.write_options";
 
     private String toolboxPath(String sandboxId, String route, Map<String, String> query) {
         StringBuilder path = new StringBuilder(sandboxPath(sandboxId)).append("/toolbox").append(route);

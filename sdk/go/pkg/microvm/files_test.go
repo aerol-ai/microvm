@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/aerol-ai/microvm/pkg/models"
@@ -92,5 +93,39 @@ func TestSandboxFileMethods(t *testing.T) {
 		if !seen[route] {
 			t.Fatalf("%s was not called", route)
 		}
+	}
+}
+
+func TestSandboxUploadWithOptions(t *testing.T) {
+	ctx := context.Background()
+	var queries []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/sandboxes/sb1":
+			_ = json.NewEncoder(w).Encode(models.Sandbox{ID: "sb1"})
+		case "/v1/sandboxes/sb1/toolbox/version":
+			_ = json.NewEncoder(w).Encode(map[string]any{"version": "v", "features": []string{"files.write_options"}})
+		default:
+			queries = append(queries, r.URL.RawQuery)
+			w.WriteHeader(http.StatusCreated)
+		}
+	}))
+	defer server.Close()
+	client, err := NewClientWithConfig(&sdktypes.MicroVMConfig{PATToken: "pat", APIUrl: server.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sb, err := client.Get(ctx, "sb1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sb.UploadFileWithOptions(ctx, "/a", []byte("x"), sdktypes.UploadFileOptions{CreateOnly: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := sb.UploadFileStreamWithOptions(ctx, "/a", strings.NewReader("x"), sdktypes.UploadFileOptions{Append: true}); err != nil {
+		t.Fatal(err)
+	}
+	if len(queries) != 2 || queries[0] != "create_only=true" || queries[1] != "append=true" {
+		t.Fatalf("queries = %v", queries)
 	}
 }

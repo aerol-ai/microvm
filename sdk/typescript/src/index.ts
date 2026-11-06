@@ -57,6 +57,7 @@ export type {
   FileWatchHandle,
   FileInfo,
   FileList,
+  UploadFileOptions,
   FileMatch,
   ListFilesOptions,
   DeleteFileOptions,

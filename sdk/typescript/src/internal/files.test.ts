@@ -213,3 +213,31 @@ test("SandboxResource file methods delegate", async () => {
     ["/files", "/files/info", "/files/info", "/files", "/files/folder", "/files/move", "/files/copy", "/files/search", "/files/find"],
   );
 });
+
+test("uploadFile sends write options after the version check, on the right retry tier", async () => {
+  const { client, calls } = fakeToolbox(
+    (call, n) => (call.query.path === undefined && n === 0 ? { status: 502 } : { status: 201, body: {} }),
+    ["files.write_options"],
+  );
+  // A plain upload re-sends after a 502.
+  await client.uploadFile("sb-1", "/a", "x");
+  assert.equal(calls.length, 2);
+  assert.deepEqual(calls[0].query, {});
+  // createOnly is not re-sent after a 502: the first send may have made the file.
+  const second = fakeToolbox((_, n) => (n === 0 ? { status: 502 } : { status: 201, body: {} }), ["files.write_options"]);
+  await assert.rejects(second.client.uploadFile("sb-1", "/a", "x", { createOnly: true, atomic: true, mode: 0o600 }), (e: unknown) => e instanceof MicroVMApiError && e.status === 502);
+  assert.equal(second.calls.length, 1);
+  assert.deepEqual(second.calls[0].query, { create_only: "true", atomic: "true", mode: "600" });
+});
+
+test("uploadFile options fail closed on an older agent", async () => {
+  const { client, calls } = fakeToolbox(() => ({ status: 201, body: {} }), []);
+  for (const options of [{ append: true }, { createOnly: true }, { atomic: true }, { mode: 0o644 }]) {
+    await assert.rejects(client.uploadFile("sb-1", "/a", "x", options), (e: unknown) => e instanceof MicroVMUnsupportedFeatureError);
+  }
+  assert.equal(calls.length, 0);
+  await client.uploadFile("sb-1", "/a", "x");
+  assert.equal(calls.length, 1);
+  const sandbox = new SandboxResource(fakeToolbox(() => ({ status: 201, body: {} }), ["files.write_options"]).client, { id: "sb-1" } as Sandbox);
+  await sandbox.uploadFile("/a", "x", { append: true });
+});

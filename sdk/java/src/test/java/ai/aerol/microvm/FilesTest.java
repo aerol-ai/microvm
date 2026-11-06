@@ -130,7 +130,8 @@ class FilesTest {
                 Call call = new Call(exchange.getRequestMethod(), path.substring(path.indexOf("/toolbox") + "/toolbox".length()), query);
                 int n;
                 synchronized (counts) {
-                    String key = call.method() + " " + call.route();
+                    // Keyed by the full path, so each sandbox counts its own calls.
+                    String key = call.method() + " " + path;
                     n = counts.getOrDefault(key, 0);
                     counts.put(key, n + 1);
                 }
@@ -361,5 +362,41 @@ class FilesTest {
             List.of("/files", "/files", "/files/info", "/files/info", "/files", "/files", "/files/folder", "/files/move",
                 "/files/copy", "/files/copy", "/files/search", "/files/find"),
             calls.stream().map(Call::route).collect(Collectors.toList()));
+    }
+
+    @Test
+    void uploadOptionsAreSentAfterTheVersionCheckOnTheRightRetryTier() throws Exception {
+        MicroVMClient client = serve(List.of("files.write_options"), (call, n) -> n == 0 ? Reply.of(502, null) : Reply.of(201, Map.of()));
+        // A plain upload is re-sent after a 502.
+        client.uploadFile("sb-1", "/a", new byte[] {1});
+        assertEquals(2, calls.size());
+        assertTrue(calls.get(0).query().isEmpty());
+        // create_only is not: the first send may have made the file.
+        MicroVMApiException err = assertThrows(MicroVMApiException.class, () -> client.uploadFile("sb-2", "/a", new byte[] {1},
+            new ai.aerol.microvm.model.UploadFileOptions().setCreateOnly(true).setAtomic(true).setMode(0600)));
+        assertEquals(502, err.getStatusCode());
+        assertEquals(3, calls.size());
+        assertEquals(Map.of("create_only", "true", "atomic", "true", "mode", "600"), calls.get(2).query());
+    }
+
+    @Test
+    void uploadOptionsFailClosedOnAnOlderAgent() throws Exception {
+        MicroVMClient client = serve(List.of(), (call, n) -> Reply.of(201, Map.of()));
+        List<ai.aerol.microvm.model.UploadFileOptions> options = List.of(
+            new ai.aerol.microvm.model.UploadFileOptions().setAppend(true),
+            new ai.aerol.microvm.model.UploadFileOptions().setCreateOnly(true),
+            new ai.aerol.microvm.model.UploadFileOptions().setAtomic(true),
+            new ai.aerol.microvm.model.UploadFileOptions().setMode(0644));
+        for (ai.aerol.microvm.model.UploadFileOptions option : options) {
+            assertThrows(MicroVMUnsupportedFeatureException.class, () -> client.uploadFile("sb-1", "/a", new byte[] {1}, option));
+        }
+        assertTrue(calls.isEmpty());
+        SandboxData data = new SandboxData();
+        data.id = "sb-1";
+        Sandbox sandbox = new Sandbox(client, data);
+        sandbox.uploadFile("/a", new byte[] {1});
+        assertThrows(MicroVMUnsupportedFeatureException.class,
+            () -> sandbox.uploadFile("/a", new byte[] {1}, new ai.aerol.microvm.model.UploadFileOptions().setAppend(true)));
+        assertEquals(1, calls.size());
     }
 }

@@ -108,8 +108,10 @@ func TestHandleUploadWriteFailureBranch(t *testing.T) {
 	req.Header.Set("Content-Type", mw.FormDataContentType())
 	rr := httptest.NewRecorder()
 	s.handleUpload(rr, req)
-	if rr.Code != http.StatusInternalServerError {
-		t.Fatalf("handleUpload write failure status = %d, want 500", rr.Code)
+	// The target is a folder: the wrong kind of path, a 409 since plan F1/F2
+	// mapped filesystem errors (it was a bare 500).
+	if rr.Code != http.StatusConflict {
+		t.Fatalf("handleUpload write failure status = %d, want 409", rr.Code)
 	}
 
 	if _, err := os.Stat(filepath.Join(dir, "upload.txt")); !os.IsNotExist(err) {

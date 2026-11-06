@@ -4,16 +4,12 @@ mod types;
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
-use std::path::Path;
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures_util::{SinkExt, StreamExt};
-use reqwest::blocking::{
-    multipart::{Form, Part},
-    Client as HttpClient,
-};
+use reqwest::blocking::Client as HttpClient;
 use reqwest::Method;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -26,7 +22,7 @@ use tokio_tungstenite::tungstenite::{Error as WebSocketError, Message};
 
 pub use files::{
     CopyFileOptions, DeleteFileOptions, FileInfo, FileList, FileMatch, ListFilesOptions, MakeDirOptions,
-    MoveFileOptions, DEFAULT_LIST_LIMIT,
+    MoveFileOptions, UploadFileOptions, DEFAULT_LIST_LIMIT,
 };
 pub use image::Image;
 pub use types::CreateSandboxResponse;
@@ -885,6 +881,12 @@ impl Sandbox {
 
     pub fn upload_file(&self, target_path: &str, data: Vec<u8>) -> Result<(), Error> {
         self.client.upload_file(&self.data.id, target_path, data)
+    }
+
+    /// Upload with write options: append, create-only, atomic replace and a
+    /// file mode. See [`UploadFileOptions`].
+    pub fn upload_file_with_options(&self, target_path: &str, data: Vec<u8>, options: UploadFileOptions) -> Result<(), Error> {
+        self.client.upload_file_with_options(&self.data.id, target_path, data, options)
     }
 
     pub fn download_file(&self, target_path: &str) -> Result<Vec<u8>, Error> {
@@ -2148,24 +2150,10 @@ impl Client {
         Ok(FileWatchHandle { stop_tx, done_rx })
     }
 
+    /// Uploads `data` to `target_path` with no write options; see
+    /// [`Client::upload_file_with_options`].
     pub fn upload_file(&self, id: &str, target_path: &str, data: Vec<u8>) -> Result<(), Error> {
-        let file_name = Path::new(target_path)
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("file");
-
-        let form = Form::new()
-            .text("path", target_path.to_string())
-            .part("file", Part::bytes(data).file_name(file_name.to_string()));
-
-        self.do_multipart(
-            &format!(
-                "{}/sandboxes/{}/toolbox/files/upload",
-                self.version_prefix(),
-                id
-            ),
-            form,
-        )
+        self.upload_file_with_options(id, target_path, data, UploadFileOptions::default())
     }
 
     pub fn download_file(&self, id: &str, target_path: &str) -> Result<Vec<u8>, Error> {
@@ -2437,19 +2425,35 @@ impl Client {
         headers: &[(&str, &str)],
         done_code: Option<&str>,
     ) -> Result<(U, reqwest::header::HeaderMap), Error> {
+        self.send_with_retry(method, path, policy, headers, done_code, |builder| match payload {
+            Some(body) => builder.json(body),
+            None => builder,
+        })
+    }
+
+    /// The retry loop behind every request with a body that can be sent
+    /// again: `body` adds the body to each attempt's request, so a body that
+    /// is consumed when sent (a multipart form) is built afresh each time.
+    fn send_with_retry<U: DeserializeOwned>(
+        &self,
+        method: Method,
+        path: &str,
+        policy: RetryPolicy,
+        headers: &[(&str, &str)],
+        done_code: Option<&str>,
+        body: impl Fn(reqwest::blocking::RequestBuilder) -> reqwest::blocking::RequestBuilder,
+    ) -> Result<(U, reqwest::header::HeaderMap), Error> {
         let max_retries = self.retry_config.max_retries.unwrap_or(3);
 
         let mut attempt = 0;
         loop {
             let mut retry_after = None;
             let url = self.full_url(path);
-            let mut builder = self
-                .inner
-                .request(method.clone(), &url)
-                .authorize(self);
-            if let Some(body) = payload {
-                builder = builder.json(body);
-            }
+            let mut builder = body(
+                self.inner
+                    .request(method.clone(), &url)
+                    .authorize(self),
+            );
             for (name, value) in headers {
                 builder = builder.header(*name, *value);
             }
@@ -2510,17 +2514,6 @@ impl Client {
             ));
             attempt += 1;
         }
-    }
-
-    fn do_multipart(&self, path: &str, form: Form) -> Result<(), Error> {
-        let url = self.full_url(path);
-        let response = self
-            .inner
-            .post(&url)
-            .authorize(self)
-            .multipart(form)
-            .send()?;
-        self.handle_response(response).map(|_| ())
     }
 
     fn handle_response(

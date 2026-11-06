@@ -86,3 +86,22 @@ type FileMatch struct {
 	Line    int    `json:"line"`
 	Content string `json:"content"`
 }
+
+// UploadFileOptions controls how an upload writes its file. The zero value
+// is a plain upload: missing folders are made and an existing file is
+// replaced in place.
+type UploadFileOptions struct {
+	// Append adds to the end of the file instead of replacing it.
+	Append bool
+	// CreateOnly writes only if the file does not exist yet. Otherwise the
+	// upload fails with a 412, and of two uploads racing for one new path
+	// exactly one wins.
+	CreateOnly bool
+	// Atomic writes a temp file and renames it into place, so a reader sees
+	// the old file or the new one, never half of it. It cannot be combined
+	// with Append.
+	Atomic bool
+	// Mode is the file's permissions after the write, such as 0o600. 0
+	// leaves an existing file's permissions and gives a new file 0644.
+	Mode os.FileMode
+}

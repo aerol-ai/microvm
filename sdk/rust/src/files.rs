@@ -9,6 +9,9 @@
 //! is already done counts as success). `move_file` and `copy_file` retry only
 //! on 429 and 503, because a lost reply may hide a move that happened.
 
+use std::path::Path;
+
+use reqwest::blocking::multipart::{Form, Part};
 use reqwest::Method;
 use serde::Deserialize;
 use serde_json::Value;
@@ -20,6 +23,10 @@ use crate::{Client, Error, RetryPolicy, Sandbox};
 /// and the copy route. An older agent ignores those options (overwrite=false
 /// would overwrite), so the calls that send them check first.
 const FEATURE_FILE_VERBS: &str = "files.verbs";
+
+/// The toolboxd feature behind upload's write options. An older agent
+/// ignores them: create_only would replace an existing file.
+const FEATURE_WRITE_OPTIONS: &str = "files.write_options";
 
 /// Error codes toolboxd puts on the file errors a retry acts on.
 const CODE_FILE_NOT_FOUND: &str = "file_not_found";
@@ -103,6 +110,24 @@ pub struct CopyFileOptions {
     /// Copy a folder and everything in it, keeping modes and symlinks.
     /// Without it a folder is refused (HTTP 409).
     pub recursive: bool,
+}
+
+/// How [`Client::upload_file_with_options`] writes its file. The default is
+/// a plain upload: missing folders are made and an existing file is replaced
+/// in place.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct UploadFileOptions {
+    /// Add to the end of the file instead of replacing it.
+    pub append: bool,
+    /// Write only if the file does not exist yet (HTTP 412 otherwise). Of
+    /// two uploads racing for one new path, exactly one wins.
+    pub create_only: bool,
+    /// Write a temp file and rename it into place, so a reader never sees
+    /// half a file. Cannot be combined with `append`.
+    pub atomic: bool,
+    /// Permissions such as `0o600`. Without it a new file is 0644 and an
+    /// existing one keeps its own.
+    pub mode: Option<u32>,
 }
 
 /// One line [`Client::find_in_files`] found.
@@ -318,6 +343,58 @@ impl Client {
         let (matches, _): (Option<Vec<FileMatch>>, _) =
             self.send_json::<Value, _>(Method::GET, &route, None, RetryPolicy::Idempotent)?;
         Ok(matches.unwrap_or_default())
+    }
+
+    /// Upload `data` to `target_path`. Plain and atomic uploads retry on
+    /// 421/429/502/503/504; `append` and `create_only` only on 429/503,
+    /// because a second send would append twice or find the first one's
+    /// file. A sandbox whose agent predates the options fails with
+    /// [`Error::UnsupportedFeature`] instead of ignoring them.
+    pub fn upload_file_with_options(
+        &self,
+        id: &str,
+        target_path: &str,
+        data: Vec<u8>,
+        options: UploadFileOptions,
+    ) -> Result<(), Error> {
+        let mode = options.mode.map(|mode| format!("{:o}", mode));
+        let mut query = Vec::new();
+        if options.append {
+            query.push(("append", "true"));
+        }
+        if options.create_only {
+            query.push(("create_only", "true"));
+        }
+        if options.atomic {
+            query.push(("atomic", "true"));
+        }
+        if let Some(mode) = mode.as_deref() {
+            query.push(("mode", mode));
+        }
+        let route = if query.is_empty() {
+            format!("{}/sandboxes/{}/toolbox/files/upload", self.version_prefix(), urlencoding::encode(id))
+        } else {
+            self.require_toolbox_features(id, &[FEATURE_WRITE_OPTIONS])?;
+            self.toolbox_path(id, "/files/upload", &query)
+        };
+        let file_name = Path::new(target_path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("file")
+            .to_string();
+        let policy = if options.append || options.create_only {
+            RetryPolicy::UnsentOnly
+        } else {
+            RetryPolicy::Idempotent
+        };
+        let _: (Value, _) = self.send_with_retry(Method::POST, &route, policy, &[], None, |builder| {
+            builder.multipart(
+                Form::new()
+                    .text("path", target_path.to_string())
+                    .part("file", Part::bytes(data.clone()).file_name(file_name.clone())),
+            )
+        })?;
+        Ok(())
     }
 
     /// A body-less file call whose success reply is discarded.
@@ -697,5 +774,63 @@ mod tests {
                 "/files/search", "/files/find"
             ]
         );
+    }
+
+    #[test]
+    fn upload_options_are_sent_after_the_version_check_on_the_right_retry_tier() {
+        let (client, calls) = fake_toolbox(&["files.write_options"], |call, n| {
+            if call.method == "POST" && n == 0 {
+                return (502, None, vec![]);
+            }
+            (201, Some("{}".to_string()), vec![])
+        });
+        // A plain upload is re-sent after a 502.
+        client.upload_file("sb-1", "/a", b"x".to_vec()).expect("plain upload");
+        assert_eq!(calls.lock().unwrap().len(), 2);
+        assert!(calls.lock().unwrap()[0].query.is_empty());
+
+        let (client, calls) = fake_toolbox(&["files.write_options"], |_, n| {
+            if n == 0 {
+                return (502, None, vec![]);
+            }
+            (201, Some("{}".to_string()), vec![])
+        });
+        let options = UploadFileOptions { create_only: true, atomic: true, mode: Some(0o600), append: false };
+        // create_only is not re-sent after a 502: the first send may have made the file.
+        match client.upload_file_with_options("sb-1", "/a", b"x".to_vec(), options) {
+            Err(Error::Api(api)) => assert_eq!(api.status(), 502),
+            other => panic!("create_only through a 502 = {:?}", other),
+        }
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].query.get("create_only").map(String::as_str), Some("true"));
+        assert_eq!(calls[0].query.get("atomic").map(String::as_str), Some("true"));
+        assert_eq!(calls[0].query.get("mode").map(String::as_str), Some("600"));
+    }
+
+    #[test]
+    fn upload_options_fail_closed_on_an_older_agent() {
+        let (client, calls) = fake_toolbox(&[], |_, _| (201, Some("{}".to_string()), vec![]));
+        for options in [
+            UploadFileOptions { append: true, ..Default::default() },
+            UploadFileOptions { create_only: true, ..Default::default() },
+            UploadFileOptions { atomic: true, ..Default::default() },
+            UploadFileOptions { mode: Some(0o644), ..Default::default() },
+        ] {
+            let result = client.upload_file_with_options("sb-1", "/a", b"x".to_vec(), options);
+            assert!(matches!(result, Err(Error::UnsupportedFeature(_))), "got {:?}", result);
+        }
+        assert!(calls.lock().unwrap().is_empty());
+        let data: SandboxData = serde_json::from_value(serde_json::json!({
+            "id": "sb-1", "image": "x", "status": "started", "public_url": "", "cpu": 1, "memory_mb": 1, "disk_gb": 1,
+            "os_user": "root", "network_block_all": false, "toolbox_enabled": true, "created_at": "", "updated_at": "",
+            "last_active_at": "", "lifecycle": {}
+        }))
+        .expect("sandbox data");
+        let sandbox = Sandbox::new(client, data);
+        sandbox.upload_file("/a", b"x".to_vec()).expect("a plain upload needs no check");
+        assert!(sandbox
+            .upload_file_with_options("/a", b"x".to_vec(), UploadFileOptions { append: true, ..Default::default() })
+            .is_err());
     }
 }

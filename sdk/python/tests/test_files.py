@@ -249,3 +249,57 @@ class FileVerbTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class UploadOptionTests(unittest.TestCase):
+    """Upload write options (plan F2) and their retry tiers (section 10)."""
+
+    def serve(self, reply, features=("files.write_options",)):
+        fake = FakeToolbox(list(features), reply)
+        self.addCleanup(fake.close)
+        return fake
+
+    def test_options_are_sent_after_the_version_check(self):
+        fake = self.serve(lambda method, path, query, n: (201, {"path": "/a"}, {}))
+        fake.client.upload_file("sb-1", "/w/a.txt", b"x", create_only=True, atomic=True, mode=0o600)
+        self.assertEqual(fake.calls[0][2], {"create_only": "true", "atomic": "true", "mode": "600"})
+        fake.client.upload_file("sb-1", "/w/a.txt", b"x")
+        self.assertEqual(fake.calls[1][2], {})
+
+    def test_older_agent_fails_closed(self):
+        fake = self.serve(lambda method, path, query, n: (201, {}, {}), features=())
+        for kwargs in ({"append": True}, {"create_only": True}, {"atomic": True}, {"mode": 0o644}):
+            with self.subTest(kwargs):
+                with self.assertRaises(MicroVMUnsupportedFeatureError):
+                    fake.client.upload_file("sb-1", "/a", b"x", **kwargs)
+        self.assertEqual(fake.calls, [])
+        fake.client.upload_file("sb-1", "/a", b"x")
+        self.assertEqual(len(fake.calls), 1)
+
+    def test_retry_tiers(self):
+        def reply(method, path, query, n):
+            return (502, None, {}) if n == 0 else (201, {}, {})
+
+        fake = self.serve(reply)
+        # A plain upload re-sends after a 502.
+        fake.client.upload_file("sb-1", "/a", b"x")
+        self.assertEqual(len(fake.calls), 2)
+        # create_only does not: the first send may have made the file.
+        fake2 = self.serve(reply)
+        with self.assertRaises(MicroVMHTTPError) as ctx:
+            fake2.client.upload_file("sb-1", "/a", b"x", create_only=True)
+        self.assertEqual(ctx.exception.status_code, 502)
+        self.assertEqual(len(fake2.calls), 1)
+
+    def test_create_only_conflict_is_412(self):
+        fake = self.serve(lambda method, path, query, n: (412, _err("/a already exists and create_only is set", "file_exists"), {}))
+        with self.assertRaises(MicroVMHTTPError) as ctx:
+            fake.client.upload_file("sb-1", "/a", b"x", create_only=True)
+        self.assertEqual((ctx.exception.status_code, ctx.exception.code), (412, "file_exists"))
+
+    def test_sandbox_upload_passes_options(self):
+        from microvm.client import Sandbox
+
+        fake = self.serve(lambda method, path, query, n: (201, {}, {}))
+        Sandbox(fake.client, {"id": "sb-1"}).upload_file("/a", b"x", append=True)
+        self.assertEqual(fake.calls[0][2], {"append": "true"})

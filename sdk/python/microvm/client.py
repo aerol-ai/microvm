@@ -113,6 +113,9 @@ _NOT_STARTED_STATUSES = frozenset({429, 503})
 # the copy route. An older agent ignores those options (overwrite=false would
 # overwrite), so the calls that send them check first.
 _FEATURE_FILE_VERBS = "files.verbs"
+# The toolboxd feature behind upload's write options (append, create_only,
+# atomic, mode). An older agent ignores them: create_only would replace a file.
+_FEATURE_WRITE_OPTIONS = "files.write_options"
 # The entry cap list_files sends when the caller gives none.
 DEFAULT_LIST_LIMIT = 10000
 # Error codes toolboxd puts on the file errors a retry acts on: a retried
@@ -603,8 +606,17 @@ class Sandbox:
     def attach_session(self, session_id: str, options: Optional[SessionAttachOptions] = None) -> SessionAttachHandle:
         return self._client.attach_session(self.id, session_id, options)
 
-    def upload_file(self, target_path: str, data: bytes) -> None:
-        self._client.upload_file(self.id, target_path, data)
+    def upload_file(
+        self,
+        target_path: str,
+        data: bytes,
+        *,
+        append: bool = False,
+        create_only: bool = False,
+        atomic: bool = False,
+        mode: Optional[int] = None,
+    ) -> None:
+        self._client.upload_file(self.id, target_path, data, append=append, create_only=create_only, atomic=atomic, mode=mode)
 
     def download_file(self, target_path: str) -> bytes:
         return self._client.download_file(self.id, target_path)
@@ -1447,14 +1459,44 @@ class MicroVM:
         if missing:
             raise MicroVMUnsupportedFeatureError(sandbox_id, missing, version)
 
-    def upload_file(self, sandbox_id: str, target_path: str, data: bytes) -> None:
-        self._do_multipart(
-            f"{self._version_prefix}/sandboxes/{sandbox_id}/toolbox/files/upload",
-            {"path": target_path},
-            "file",
-            target_path,
-            data,
-        )
+    def upload_file(
+        self,
+        sandbox_id: str,
+        target_path: str,
+        data: bytes,
+        *,
+        append: bool = False,
+        create_only: bool = False,
+        atomic: bool = False,
+        mode: Optional[int] = None,
+    ) -> None:
+        """Upload ``data`` to ``target_path``; missing folders are made.
+
+        By default an existing file is replaced in place. ``append`` adds to
+        it instead. ``create_only`` writes only if the file does not exist
+        yet (HTTP 412 otherwise; of two racing uploads exactly one wins).
+        ``atomic`` writes a temp file and renames it into place, so readers
+        never see half a file. ``mode`` (such as ``0o600``) sets the
+        permissions. ``append`` cannot be combined with ``create_only`` or
+        ``atomic``.
+
+        Plain and atomic uploads retry on 421/429/502/503/504; ``append`` and
+        ``create_only`` only on 429/503, because a second send would append
+        twice or find the first one's file.
+        """
+        query: Dict[str, str] = {}
+        for name, on in (("append", append), ("create_only", create_only), ("atomic", atomic)):
+            if on:
+                query[name] = "true"
+        if mode is not None:
+            query["mode"] = format(mode, "o")
+        if query:
+            # An older agent ignores these; create_only would replace a file.
+            self._require_toolbox_features(sandbox_id, _FEATURE_WRITE_OPTIONS)
+        path = f"{self._version_prefix}/sandboxes/{sandbox_id}/toolbox/files/upload"
+        if query:
+            path += "?" + urllib.parse.urlencode(query)
+        self._do_multipart(path, {"path": target_path}, "file", target_path, data, idempotent=not (append or create_only))
 
     def download_file(self, sandbox_id: str, target_path: str) -> bytes:
         url = self._url(f"{self._version_prefix}/sandboxes/{sandbox_id}/toolbox/files/download?path={urllib.parse.quote(target_path, safe='')}")
@@ -1910,6 +1952,8 @@ class MicroVM:
         file_field: str,
         filename: str,
         data: bytes,
+        *,
+        idempotent: bool = True,
     ) -> None:
         boundary = uuid.uuid4().hex
         body = BytesIO()
@@ -1928,7 +1972,7 @@ class MicroVM:
         encoder(b"\r\n")
         encoder(f"--{boundary}--\r\n".encode("utf-8"))
 
-        self._request("POST", self._url(path), body.getvalue(), f"multipart/form-data; boundary={boundary}")
+        self._request("POST", self._url(path), body.getvalue(), f"multipart/form-data; boundary={boundary}", idempotent=idempotent)
 
 
 class Tokens:

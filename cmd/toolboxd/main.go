@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"mime/multipart"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -833,46 +832,6 @@ func (s *server) handleExec(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, result)
 }
 
-func (s *server) handleUpload(w http.ResponseWriter, r *http.Request) {
-	maxBytes := envInt64("SB_UPLOAD_MAX_BYTES", 256*1024*1024)
-	r.Body = http.MaxBytesReader(w, r.Body, maxBytes)
-	if err := r.ParseMultipartForm(64 << 20); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid multipart form (or too large)")
-		return
-	}
-
-	targetPath := strings.TrimSpace(r.FormValue("path"))
-	if targetPath == "" {
-		targetPath = strings.TrimSpace(r.URL.Query().Get("path"))
-	}
-	if targetPath == "" {
-		writeError(w, http.StatusBadRequest, "path is required")
-		return
-	}
-
-	file, header, err := r.FormFile("file")
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "file is required")
-		return
-	}
-	defer file.Close()
-
-	if err := os.MkdirAll(filepath.Dir(targetPath), 0o755); err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-
-	if err := writeMultipartFile(targetPath, file); err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-
-	writeJSON(w, http.StatusCreated, map[string]any{
-		"path": targetPath,
-		"name": header.Filename,
-	})
-}
-
 func (s *server) handleDownload(w http.ResponseWriter, r *http.Request) {
 	targetPath := strings.TrimSpace(r.URL.Query().Get("path"))
 	if targetPath == "" {
@@ -1003,7 +962,9 @@ func envMapToSlice(values map[string]string) []string {
 	return result
 }
 
-func writeMultipartFile(path string, file multipart.File) error {
+// writeMultipartFile is the plain upload: create or truncate path and copy
+// file into it.
+func writeMultipartFile(path string, file io.Reader) error {
 	tmp, err := os.Create(path)
 	if err != nil {
 		return err
