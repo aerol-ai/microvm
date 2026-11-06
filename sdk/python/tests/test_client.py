@@ -2297,6 +2297,37 @@ class CustomDomainsTests(unittest.TestCase):
         self.assertEqual(payload["custom_domains"], ["api.acme.com", "edge.acme.com"])
 
 
+class ExposeVisibilityTests(unittest.TestCase):
+    """A2: expose_port sends visibility only when set, and maps a token port."""
+
+    def test_visibility_is_sent_only_when_set(self):
+        calls = []
+
+        class FakeMicroVM(MicroVM):
+            def __init__(self) -> None:
+                super().__init__(api_url="https://sandbox.example.com", pat_token="pat-token")
+
+            def _do_json(self, method, path, payload):  # type: ignore[override]
+                calls.append(payload)
+                out = {"protocol": "http", "public_url": "https://sb-1-3000.example.com"}
+                if payload and payload.get("visibility") == "token":
+                    out["visibility"] = "token"
+                return out
+
+        client = FakeMicroVM()
+        gated = client.expose_port("sb-1", 3000, visibility="token")
+        plain = client.expose_port("sb-1", 3000)
+        client.expose_port("sb-1", 5432, protocol="tcp")
+        self.assertEqual(calls, [{"visibility": "token"}, None, {"protocol": "tcp"}])
+        self.assertEqual(gated.visibility, "token")
+        self.assertIsNone(plain.visibility)
+
+    def test_exposed_port_maps_visibility(self):
+        mapped = client_module._from_api_exposed_port({"sandbox_id": "sb", "port": 1, "visibility": "token"})
+        self.assertEqual(mapped["visibility"], "token")
+        self.assertNotIn("visibility", client_module._from_api_exposed_port({"port": 2, "visibility": "public"}))
+
+
 class SandboxTokenTests(unittest.TestCase):
     """POST /v1/sandboxes/{id}/tokens: the body carries only the fields the
     caller set, and the answer maps onto SandboxToken."""

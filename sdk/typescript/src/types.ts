@@ -446,6 +446,8 @@ export interface ExposedPort {
   port: number;
   publicURL: string;
   createdAt: string;
+  /** `"token"` when the URL needs a sandbox token; absent for a public port. */
+  visibility?: ExposeVisibility;
 }
 
 /**
@@ -548,9 +550,23 @@ export interface CustomDomainDNSRecords {
  */
 export type ExposeProtocol = "http" | "tcp" | "tls";
 
+/**
+ * Who can open a port's URL:
+ *   - "public": anyone with the URL.
+ *   - "token":  only a visitor with a sandbox token for this port (see
+ *               `sandbox.createToken({ port })`). HTTP ports on a server
+ *               with a domain only.
+ */
+export type ExposeVisibility = "public" | "token";
+
 export interface ExposePortOptions {
   /** Defaults to "http" when omitted. */
   protocol?: ExposeProtocol;
+  /**
+   * Left out, a new port is public and an exposed port keeps what it has.
+   * Pass it to change it.
+   */
+  visibility?: ExposeVisibility;
 }
 
 export interface SandboxSnapshot {
@@ -627,7 +643,7 @@ export interface SandboxToken {
  * clients (psql, redis-cli, mysql, mongosh, …) need to dial.
  */
 export type ExposeResult =
-  | { protocol: "http"; url: string }
+  | { protocol: "http"; url: string; visibility?: "token" }
   | { protocol: "tcp"; url: string; host: string; hostPort: number }
   | { protocol: "tls"; url: string };
 

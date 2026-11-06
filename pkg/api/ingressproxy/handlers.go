@@ -87,9 +87,21 @@ func (h *handlers) serveSandboxPort(w http.ResponseWriter, r *http.Request, id s
 		strings.Contains(strings.ToLower(r.Header.Get("Connection")), "upgrade") ||
 		r.Header.Get("Upgrade") != ""
 
-	started, startedErr := h.deps.Resolver.IsSandboxStarted(r.Context(), id)
+	access, startedErr := h.deps.Resolver.PortAccess(r.Context(), id, port)
 	if errors.Is(startedErr, store.ErrNotFound) {
 		apihttp.WriteError(w, http.StatusNotFound, "sandbox not found")
+		return
+	}
+	if startedErr != nil {
+		// Unknown gate: refuse rather than guess the port is open. Today
+		// any error fell through to the wake path, which reports it.
+		apihttp.WriteStoreAwareError(h.deps.Logger, w, startedErr)
+		return
+	}
+	started := access.Started
+	// The token gate runs before any body is buffered, a wake slot is
+	// taken or a stopped sandbox is started (A2, token_gate.go).
+	if access.TokenGated && !h.gatePort(w, r, id, port, upstreamPath) {
 		return
 	}
 

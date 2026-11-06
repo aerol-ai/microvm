@@ -31,7 +31,7 @@ const (
 // it once per release that adds such a feature, and give the feature its
 // own constant naming the version that introduced it.
 const (
-	fsmOpsVersion              = 5
+	fsmOpsVersion              = 6
 	egressProfileFSMOpsVersion = 1 // opPutEgressProfile, opDeleteEgressProfile
 	// auditCallerFSMOpsVersion: audit records carry a hash-covered caller
 	// field (AuditCallerWritesAllowed).
@@ -50,6 +50,11 @@ const (
 	// key-ring build, and a build with fv 4 and without this would drop the
 	// record the gateway handed it.
 	sshSessionOwnerRecordFSMOpsVersion = 5
+	// tokenPortFSMOpsVersion: the cluster's port record carries a port's
+	// visibility, so a failover recreate gates a token port again
+	// (TokenPortsAllowed). No FSM op: an older build decodes the record and
+	// drops the field, which would recreate the port as public.
+	tokenPortFSMOpsVersion = 6
 )
 
 var (

@@ -84,6 +84,19 @@ const (
 // ExposeProtocol selects the wire surface an exposure publishes through.
 type ExposeProtocol string
 
+// ExposeVisibility says who can open a port's URL (Sandbox.ExposePort's
+// WithVisibility). Token-gated URLs need a server with a domain and work
+// for HTTP ports only.
+type ExposeVisibility string
+
+const (
+	// ExposeVisibilityPublic: anyone with the URL.
+	ExposeVisibilityPublic ExposeVisibility = "public"
+	// ExposeVisibilityToken: only a visitor with a sandbox token for this
+	// port (Sandbox.CreateToken with Port set).
+	ExposeVisibilityToken ExposeVisibility = "token"
+)
+
 const (
 	FailoverPolicyNone     = models.FailoverPolicyNone
 	FailoverPolicyRecreate = models.FailoverPolicyRecreate

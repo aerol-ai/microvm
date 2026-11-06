@@ -140,6 +140,99 @@ Without a domain, the path form is the only one, and it is what `exposePort` ret
 
 Before you expose a port, its URLs refuse requests with an error such as `403` or `404`.
 
+## Share a port behind a token
+
+A public URL works for anyone who has it. To share a port with one person only, expose it with **`visibility: "token"`**. Its URL then needs a [sandbox token](/sandbox-tokens/) made for that port. You hand out a link with the token in it. Everyone else gets `401`.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const exposure = await sandbox.exposePort(3000, { visibility: "token" });
+    const tok = await sandbox.createToken({ port: 3000, expiresIn: "1h" });
+
+    // Give this link to the one person who should see the app.
+    console.log(`${exposure.url}?token=${tok.token}`);
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    exposure = sandbox.expose_port(3000, visibility="token")
+    tok = sandbox.create_token(port=3000, expires_in="1h")
+
+    # Give this link to the one person who should see the app.
+    print(f"{exposure.url}?token={tok['token']}")
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    exposure, err := sandbox.ExposePort(ctx, 3000, microvm.WithVisibility(sdktypes.ExposeVisibilityToken))
+    if err != nil {
+        log.Fatal(err)
+    }
+    tok, err := sandbox.CreateToken(ctx, sdktypes.CreateSandboxTokenOptions{Port: 3000, ExpiresIn: "1h"})
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    // Give this link to the one person who should see the app.
+    fmt.Println(exposure.PublicURL + "?token=" + tok.Token)
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    use aerolvm_sdk::{CreateSandboxTokenOptions, ExposeOptions, ExposeResult};
+
+    let exposure = sandbox.expose_port(3000, ExposeOptions::token())?;
+    let tok = sandbox.create_token(CreateSandboxTokenOptions {
+        port: Some(3000),
+        expires_in: "1h".into(),
+        ..Default::default()
+    })?;
+
+    // Give this link to the one person who should see the app.
+    if let ExposeResult::Http { url } = exposure {
+        println!("{}?token={}", url, tok.token);
+    }
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    ExposeResult exposure = sandbox.exposePort(3000, ExposeOptions.token());
+    SandboxToken tok = sandbox.createToken(
+        new CreateSandboxTokenOptions().setPort(3000).setExpiresIn("1h")
+    );
+
+    // Give this link to the one person who should see the app.
+    System.out.println(exposure.url + "?token=" + tok.token);
+    ```
+  </TabItem>
+</Tabs>
+
+What happens when someone opens the link:
+
+1. The server checks the token. It must be for this sandbox and this port, and not expired.
+2. The server saves the token in a cookie in their browser, then sends them to the same address **without** the token. The token leaves the address bar, the browser history and the links the page makes.
+3. Every later visit sends the cookie, so the app works as usual until the token expires.
+
+The cookie works only on that one port's address. It is `HttpOnly` (page scripts cannot read it), `Secure` (HTTPS only) and `SameSite=Lax`, and its name starts with `__Host-`, so a page from another sandbox can neither read it nor plant a fake one. The server removes the cookie and the token before the request reaches your app, so your app never sees them.
+
+| A visitor… | Gets |
+|---|---|
+| has no token | `401` |
+| has a token for another sandbox or another port, or outside the token's path | `403` |
+| has an expired or broken token | `401` with the reason, such as `expired` |
+
+Good to know:
+
+- **Exposing again keeps the setting.** Calling `exposePort` for the port without `visibility` keeps it token-only, so a retry never opens it to everyone. Pass `visibility: "public"` to open it again, or `"token"` to close a public port. Each is an explicit change.
+- **A cluster must be fully upgraded first.** While any node still runs a release from before token-only ports, `visibility: "token"` is refused with `400`. That older node would forget the setting if the sandbox moved to it, and the port would come back public. The same holds the other way: once token-only ports exist, do not roll a node back to such a release. The check only stops new token-only ports, so a sandbox that moves to the rolled-back node would come back public.
+- **You need a server with a domain.** The cookie needs HTTPS and its own address per port, so `"token"` is refused on a server without a domain, and on a server where the AerolVM ingress proxy is off (`SB_ENABLE_SERVERLESS=false` without ingress proxy routing).
+- **Web ports only.** TCP and TLS ports, and ports of WASM and V8 isolate sandboxes, cannot use `"token"` yet.
+- **Rust does not report the setting back.** The other four SDKs return the port's visibility from the expose call. Rust's `ExposeResult::Http` holds only the URL: a new field there would break code that matches on it, so it waits for a release that may break code.
+- **No custom domain on a token port.** A custom domain goes straight to the port, so the two cannot be combined. The server refuses either one while the other is set.
+- **The `/proxy/<port>/` address does not serve a token port.** Use the port's own URL.
+- **A token cannot be taken back.** It stops working when it expires. Keep lifetimes short. See [Sandbox tokens](/sandbox-tokens/).
+
 ## Make a sandbox public from the start
 
 By default, the sandbox becomes public on your first `exposePort` call. To have its main URL live as soon as it starts, set `allowPublicTraffic: true` when you create it.

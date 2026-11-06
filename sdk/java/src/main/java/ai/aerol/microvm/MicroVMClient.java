@@ -1341,7 +1341,12 @@ public class MicroVMClient {
      */
     public ExposeResult exposePort(String sandboxId, int port, ExposeOptions options) {
         ExposeProtocol protocol = (options != null && options.protocol != null) ? options.protocol : ExposeProtocol.HTTP;
-        Object body = protocol == ExposeProtocol.HTTP ? null : new ExposePortRequest(protocol.getWireValue());
+        String visibility = options != null && options.visibility != null && !options.visibility.isEmpty() ? options.visibility : null;
+        // Only what the caller set: an omitted visibility keeps an exposed
+        // port's gate, so a plain retry never opens a token port.
+        Object body = protocol == ExposeProtocol.HTTP && visibility == null
+            ? null
+            : new ExposePortRequest(protocol == ExposeProtocol.HTTP ? null : protocol.getWireValue(), visibility);
         ExposeResult response = doJson("POST", sandboxPath(sandboxId) + "/ports/" + port, body, ExposeResult.class);
         if (response == null) {
             ExposeResult empty = new ExposeResult();
@@ -1478,11 +1483,14 @@ public class MicroVMClient {
         public List<CustomDomain> customDomains;
     }
 
+    @com.fasterxml.jackson.annotation.JsonInclude(com.fasterxml.jackson.annotation.JsonInclude.Include.NON_NULL)
     static class ExposePortRequest {
         public final String protocol;
+        public final String visibility;
 
-        ExposePortRequest(String protocol) {
+        ExposePortRequest(String protocol, String visibility) {
             this.protocol = protocol;
+            this.visibility = visibility;
         }
     }
 

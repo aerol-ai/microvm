@@ -326,7 +326,7 @@ func (h *handlers) exposePort(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	id := r.PathValue("id")
-	resp, err := h.deps.Service.ExposePort(r.Context(), id, port, req.Protocol)
+	resp, err := h.deps.Service.ExposePortWithVisibility(r.Context(), id, port, req.Protocol, req.Visibility)
 	if err != nil {
 		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
 		return
@@ -335,9 +335,10 @@ func (h *handlers) exposePort(w http.ResponseWriter, r *http.Request) {
 	// request value) so a future failover-recreate uses the same protocol the
 	// user is seeing.
 	h.replicateAddExposedPort(r.Context(), id, port, cluster.ExposedPortRoute{
-		Protocol:  resp.Protocol,
-		HostPort:  resp.HostPort,
-		PublicURL: resp.PublicURL,
+		Protocol:   resp.Protocol,
+		HostPort:   resp.HostPort,
+		PublicURL:  resp.PublicURL,
+		Visibility: resp.Visibility,
 	})
 	apihttp.WriteJSON(w, http.StatusOK, resp)
 }

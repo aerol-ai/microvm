@@ -52,6 +52,7 @@ export type {
   ExposePortOptions,
   ExposeProtocol,
   ExposeResult,
+  ExposeVisibility,
   Failover,
   FailoverPolicy,
   FileEvent,

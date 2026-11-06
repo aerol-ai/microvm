@@ -240,6 +240,11 @@ func Classify(err error) Classification {
 		return Classification{Status: http.StatusServiceUnavailable, RetryAfter: 5, Log: true, LogLevel: slog.LevelWarn,
 			Message: "the token store did not confirm the write; after a create the token may exist: list tokens, revoke it by id, then create it again"}
 
+	// Token-gated ports (A2).
+	case errors.Is(err, service.ErrTokenVisibilityInvalid), errors.Is(err, service.ErrTokenVisibilityUnavailable):
+		return Classification{Status: http.StatusBadRequest, Message: err.Error()}
+	case errors.Is(err, service.ErrTokenVisibilityConflict):
+		return Classification{Status: http.StatusConflict, Message: err.Error()}
 	// Sandbox tokens (A1). The 400 text names the bad field, never a token.
 	case errors.Is(err, service.ErrSandboxTokenInvalid):
 		return Classification{Status: http.StatusBadRequest, Message: err.Error()}

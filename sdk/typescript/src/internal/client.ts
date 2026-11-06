@@ -240,6 +240,7 @@ interface ApiExposedPort {
   port: number;
   public_url: string;
   created_at: string;
+  visibility?: string;
 }
 
 interface ApiExposePortResponse {
@@ -247,6 +248,7 @@ interface ApiExposePortResponse {
   public_url: string;
   host?: string;
   host_port?: number;
+  visibility?: string;
 }
 
 interface ApiSandboxToken {
@@ -1500,7 +1502,16 @@ export class APIClient {
    * variant carries `host` / `hostPort` — everything else is in `url`.
    */
   async exposePort(id: string, port: number, options: ExposePortOptions = {}): Promise<ExposeResult> {
-    const body = options.protocol ? { protocol: options.protocol } : undefined;
+    // Only what the caller set: an omitted visibility keeps an exposed
+    // port's gate, so a plain retry never opens a token port.
+    const fields: { protocol?: ExposeProtocol; visibility?: string } = {};
+    if (options.protocol) {
+      fields.protocol = options.protocol;
+    }
+    if (options.visibility) {
+      fields.visibility = options.visibility;
+    }
+    const body = Object.keys(fields).length > 0 ? fields : undefined;
     const response = await this.doJSON<ApiExposePortResponse>(
       "POST",
       `${this.versionPrefix}/sandboxes/${id}/ports/${port}`,
@@ -2529,6 +2540,7 @@ function fromApiExposedPort(port: ApiExposedPort): ExposedPort {
     port: port.port,
     publicURL: port.public_url,
     createdAt: port.created_at,
+    ...(port.visibility === "token" ? { visibility: "token" as const } : {}),
   };
 }
 
@@ -2544,7 +2556,9 @@ function fromApiExposePortResponse(response: ApiExposePortResponse): ExposeResul
     case "tls":
       return { protocol: "tls", url: response.public_url };
     case "http":
-      return { protocol: "http", url: response.public_url };
+      return response.visibility === "token"
+        ? { protocol: "http", url: response.public_url, visibility: "token" }
+        : { protocol: "http", url: response.public_url };
   }
 }
 

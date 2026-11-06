@@ -1111,6 +1111,9 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 				// The static routes' fallback (NXDOMAIN): wake, 503, 421,
 				// mediators. nil unless ingress proxy routing is engaged.
 				Hosts: routingBoot.hostRoutes(),
+				// Token-gated ports (A2): checked with the server key, no
+				// store read.
+				Tokens: svc,
 			})
 		}
 		// Caddy on-demand TLS ask callback (plans/custom-domains.md).

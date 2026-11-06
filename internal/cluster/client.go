@@ -728,6 +728,7 @@ func (c *Cluster) addExposedPortForIncarnation(ctx context.Context, sandboxID, i
 		Protocol:              route.Protocol,
 		HostPort:              route.HostPort,
 		PublicURL:             route.PublicURL,
+		Visibility:            route.Visibility,
 	}
 	return c.applyCommand(ctx, cmd)
 }

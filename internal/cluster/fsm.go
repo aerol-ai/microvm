@@ -109,6 +109,10 @@ type command struct {
 	Protocol  string `json:"protocol,omitempty"`
 	HostPort  int    `json:"host_port,omitempty"`
 	PublicURL string `json:"public_url,omitempty"`
+	// Visibility is opAddExposedPort's port visibility ("token" for a
+	// sandbox-token-gated port, A2). Omitted for public, so commands from
+	// before it replay byte for byte.
+	Visibility string `json:"visibility,omitempty"`
 	// ExpiresUnix is set on opReserve to bound how long a reservation holds
 	// capacity before the leader GC sweep cancels it. Ignored by every other
 	// op; promotion via opPlace clears the reservation's expiry implicitly by
@@ -1475,9 +1479,10 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 			return err
 		}
 		route := ExposedPortRoute{
-			Protocol:  cmd.Protocol,
-			HostPort:  cmd.HostPort,
-			PublicURL: cmd.PublicURL,
+			Protocol:   cmd.Protocol,
+			HostPort:   cmd.HostPort,
+			PublicURL:  cmd.PublicURL,
+			Visibility: cmd.Visibility,
 		}
 		if route.Protocol == "" {
 			route.Protocol = existing.ExposedPorts[cmd.Port]

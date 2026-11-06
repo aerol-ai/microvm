@@ -366,6 +366,10 @@ type ExposedPortRoute struct {
 	Protocol  string `json:"protocol"`
 	HostPort  int    `json:"host_port,omitempty"`
 	PublicURL string `json:"public_url,omitempty"`
+	// Visibility is "token" for a port whose public URL needs a sandbox
+	// token (A2), so a failover recreate gates it again; omitted for a
+	// public port, so every placement written before it decodes the same.
+	Visibility string `json:"visibility,omitempty"`
 }
 
 // ExposedPorts is the legacy replicated set of port→protocol intents. Newer

@@ -998,6 +998,7 @@ var Registry = []UseCase{
 	{ID: "UC-423", Title: "Sandbox token: a token issued through POST /v1/sandboxes/{id}/tokens for /files and GET downloads a file from its sandbox's toolbox, as a raw bearer and a /sessions token works as the Go SDK credential (ListSessions)", Implemented: true},
 	{ID: "UC-424", Title: "Sandbox token refusals: the same token gets 403 on another sandbox, on a path or method it does not cover, on a sandbox read, a delete and a token mint (naming the part, never echoing the token), and 401 expired once its lifetime plus the 30 s skew has passed", Implemented: true},
 	{ID: "UC-425", Title: "Sandbox token across nodes: a token issued through any node works through every other node, with no database call (every node derives the signing key from the shared server key)", Requires: []Capability{CapCluster}, Implemented: true},
+	{ID: "UC-426", Title: "Token-gated port: a port exposed with visibility token answers 401 without a token (never the app), ?token= sets the host-only __Host-aerolvm-token cookie (Secure, HttpOnly, SameSite=Lax, no Domain) and 302s to the URL without the token, the cookie reaches the app, another sandbox's port token and a toolbox token get 403, a plain re-expose keeps the gate, and /proxy/<port>/ does not serve it", Requires: []Capability{CapDomain}, Implemented: true},
 }
 
 // byID is a lookup built once for the report generator.

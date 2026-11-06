@@ -337,9 +337,10 @@ func clusterPortsFromSandbox(sb *models.Sandbox) map[int]cluster.ExposedPortRout
 			continue
 		}
 		out[p.Port] = cluster.ExposedPortRoute{
-			Protocol:  p.Protocol,
-			HostPort:  p.HostPort,
-			PublicURL: p.PublicURL,
+			Protocol:   p.Protocol,
+			HostPort:   p.HostPort,
+			PublicURL:  p.PublicURL,
+			Visibility: p.Visibility,
 		}
 	}
 	return out

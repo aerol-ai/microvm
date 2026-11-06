@@ -27,12 +27,14 @@ type fakeResolver struct {
 	lastPrt   int
 	touchCnt  atomic.Int32
 	touchedID atomic.Value // string
-	// started flips IsSandboxStarted's return. Default false keeps
+	// started flips PortAccess's Started. Default false keeps
 	// the body-buffering branch live for tests that exercise it
 	// (oversize cap, replay, upgrade-skip); warm-bypass tests flip
 	// it to true to assert buffering is skipped.
 	started    bool
 	startedErr error
+	// gated marks the port token-gated (A2).
+	gated bool
 	// mask, when set, is returned as PortEndpoint.MaskRequestHost so wake-path
 	// Host-rewrite behavior can be exercised.
 	mask string
@@ -54,8 +56,8 @@ func (f *fakeResolver) TouchSandbox(_ context.Context, id string) error {
 	return nil
 }
 
-func (f *fakeResolver) IsSandboxStarted(_ context.Context, _ string) (bool, error) {
-	return f.started, f.startedErr
+func (f *fakeResolver) PortAccess(_ context.Context, _ string, _ int) (service.PortAccess, error) {
+	return service.PortAccess{Started: f.started, TokenGated: f.gated}, f.startedErr
 }
 
 func newHandler(resolver PortResolver, max int64) http.Handler {

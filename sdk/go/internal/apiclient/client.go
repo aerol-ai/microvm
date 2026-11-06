@@ -895,9 +895,24 @@ func (c *Client) DownloadFile(ctx context.Context, id, targetPath string) ([]byt
 // populated only on the "tcp" path. The first exposure makes a private
 // sandbox public (AllowPublicTraffic omitted or false at create alike).
 func (c *Client) ExposePort(ctx context.Context, id string, port int, protocol string) (ExposeResult, error) {
+	return c.ExposePortWithVisibility(ctx, id, port, protocol, "")
+}
+
+// ExposePortWithVisibility is ExposePort with a visibility: "token" makes the
+// URL need a sandbox token for this port, "public" opens it. Empty sends
+// none, so a new port is public and an exposed port keeps its gate (a plain
+// retry never opens a token port).
+func (c *Client) ExposePortWithVisibility(ctx context.Context, id string, port int, protocol, visibility string) (ExposeResult, error) {
 	var body any
+	fields := map[string]string{}
 	if protocol != "" && protocol != "http" {
-		body = map[string]string{"protocol": protocol}
+		fields["protocol"] = protocol
+	}
+	if visibility != "" {
+		fields["visibility"] = visibility
+	}
+	if len(fields) > 0 {
+		body = fields
 	}
 	var response ExposeResult
 	err := c.doJSON(ctx, http.MethodPost, fmt.Sprintf(c.versionPrefix+"/sandboxes/%s/ports/%d", id, port), body, &response)

@@ -540,23 +540,59 @@ impl Default for ExposeProtocol {
 #[derive(Default, Debug, Clone, Copy)]
 pub struct ExposeOptions {
     pub protocol: ExposeProtocol,
+    /// Who can open the URL. `None` sends nothing: a new port is public and
+    /// an exposed port keeps what it has. Pass a value to change it.
+    pub visibility: Option<ExposeVisibility>,
+}
+
+/// Who can open a port's URL. `Token` makes it need a sandbox token for
+/// that port (`sandbox.create_token` with `port`); HTTP ports on a server
+/// with a domain only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExposeVisibility {
+    Public,
+    Token,
+}
+
+impl ExposeVisibility {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ExposeVisibility::Public => "public",
+            ExposeVisibility::Token => "token",
+        }
+    }
 }
 
 impl ExposeOptions {
     pub fn http() -> Self {
         Self {
             protocol: ExposeProtocol::Http,
+            visibility: None,
         }
     }
     pub fn tcp() -> Self {
         Self {
             protocol: ExposeProtocol::Tcp,
+            visibility: None,
         }
     }
     pub fn tls() -> Self {
         Self {
             protocol: ExposeProtocol::Tls,
+            visibility: None,
         }
+    }
+    /// An HTTP port whose URL needs a sandbox token.
+    pub fn token() -> Self {
+        Self {
+            protocol: ExposeProtocol::Http,
+            visibility: Some(ExposeVisibility::Token),
+        }
+    }
+    /// Sets who can open the URL.
+    pub fn with_visibility(mut self, visibility: ExposeVisibility) -> Self {
+        self.visibility = Some(visibility);
+        self
     }
 }
 

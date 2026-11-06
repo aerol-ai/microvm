@@ -1461,6 +1461,11 @@ func (s *SandboxSnapshot) ApplyImageDistribution(meta ImageDistributionMetadata)
 // so old SDK callers keep working unchanged.
 type ExposePortRequest struct {
 	Protocol string `json:"protocol,omitempty"`
+	// Visibility is "public" (anyone with the URL) or "token" (the URL needs
+	// a sandbox token for this port, A2). Omitted, a new exposure is public
+	// and a re-expose keeps the visibility it has: only an explicit value
+	// changes it, so an older client's retry can never open a gated port.
+	Visibility string `json:"visibility,omitempty"`
 }
 
 // ExposePortResponse is the JSON body returned by POST /v1/sandboxes/{id}/ports/{port}.
@@ -1473,6 +1478,9 @@ type ExposePortResponse struct {
 	PublicURL string `json:"public_url"`
 	Host      string `json:"host,omitempty"`
 	HostPort  int    `json:"host_port,omitempty"`
+	// Visibility is set only for a token-gated port ("token"); a public
+	// port leaves it out, so the body is what it was before A2.
+	Visibility string `json:"visibility,omitempty"`
 }
 
 type ExposedPort struct {
@@ -1489,7 +1497,32 @@ type ExposedPort struct {
 	HostPort  int       `json:"host_port,omitempty"`
 	PublicURL string    `json:"public_url"`
 	CreatedAt time.Time `json:"created_at"`
+	// Visibility is "token" for a port whose public URL needs a sandbox
+	// token; empty (public) otherwise. Stored as "public" for every row
+	// written before A2 (the column default).
+	Visibility string `json:"visibility,omitempty"`
 }
+
+// Exposed port visibilities (A2). Public is the default and the meaning of
+// every row from before visibility existed.
+const (
+	ExposedPortVisibilityPublic = "public"
+	ExposedPortVisibilityToken  = "token"
+)
+
+// ValidExposedPortVisibility checks a requested visibility. "" stays "" (the
+// caller asked for no change); anything else must be public or token.
+func ValidExposedPortVisibility(value string) (string, error) {
+	switch value {
+	case "", ExposedPortVisibilityPublic, ExposedPortVisibilityToken:
+		return value, nil
+	default:
+		return "", fmt.Errorf("invalid port visibility %q (allowed: %s, %s)", value, ExposedPortVisibilityPublic, ExposedPortVisibilityToken)
+	}
+}
+
+// TokenGated reports whether the exposure's public URL needs a sandbox token.
+func (p ExposedPort) TokenGated() bool { return p.Visibility == ExposedPortVisibilityToken }
 
 // Exposed port protocols. http is the original behavior (Caddy HTTP reverse
 // proxy); tcp and tls are the caddy-l4 paths added with the L4 work.

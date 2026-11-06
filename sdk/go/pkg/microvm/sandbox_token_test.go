@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -57,5 +58,36 @@ func TestSandboxCreateToken(t *testing.T) {
 	status = http.StatusBadRequest
 	if _, err := sb.CreateToken(context.Background(), sdktypes.CreateSandboxTokenOptions{}); err == nil {
 		t.Fatal("a 400 was not an error")
+	}
+}
+
+// ExposePort sends visibility only when WithVisibility set it.
+func TestExposePortVisibility(t *testing.T) {
+	var bodies []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw := make([]byte, 256)
+		n, _ := r.Body.Read(raw)
+		bodies = append(bodies, string(raw[:n]))
+		resp := models.ExposePortResponse{Protocol: "http", PublicURL: "https://sb1-3000.example"}
+		if strings.Contains(string(raw[:n]), "token") {
+			resp.Visibility = "token"
+		}
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	defer server.Close()
+	client, err := NewClientWithConfig(&sdktypes.MicroVMConfig{APIUrl: server.URL, PATToken: "pat"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sb := &Sandbox{Sandbox: sdktypes.Sandbox{ID: "sb1"}, client: client}
+	got, err := sb.ExposePort(context.Background(), 3000, WithVisibility(sdktypes.ExposeVisibilityToken))
+	if err != nil || got.Visibility != "token" {
+		t.Fatalf("token expose = %+v, %v", got, err)
+	}
+	if _, err := sb.ExposePort(context.Background(), 3000); err != nil {
+		t.Fatal(err)
+	}
+	if len(bodies) != 2 || strings.TrimSpace(bodies[0]) != `{"visibility":"token"}` || bodies[1] != "" {
+		t.Fatalf("bodies = %q", bodies)
 	}
 }

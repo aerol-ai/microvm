@@ -1042,6 +1042,31 @@ test("internal client create with bare image string skips build call", async () 
   assert.ok(seenURLs[0].endsWith("/v1/sandboxes"));
 });
 
+test("exposePort sends visibility only when set and maps a token port", async () => {
+  const bodies: (string | null)[] = [];
+  const client = new APIClient({
+    baseURL: "https://api.example.com",
+    patToken: "pat-token",
+    fetch: async (input, init) => {
+      const req = new Request(input, init);
+      const text = await req.text();
+      bodies.push(text === "" ? null : text);
+      const sent = text === "" ? {} : JSON.parse(text);
+      return jsonResponse({
+        protocol: "http",
+        public_url: "https://sb-1-3000.example.com",
+        ...(sent.visibility === "token" ? { visibility: "token" } : {}),
+      });
+    },
+  });
+  const gated = await client.exposePort("sb-1", 3000, { visibility: "token" });
+  assert.deepEqual(gated, { protocol: "http", url: "https://sb-1-3000.example.com", visibility: "token" });
+  const plain = await client.exposePort("sb-1", 3000);
+  assert.deepEqual(plain, { protocol: "http", url: "https://sb-1-3000.example.com" });
+  await client.exposePort("sb-1", 5432, { protocol: "tcp" });
+  assert.deepEqual(bodies, ['{"visibility":"token"}', null, '{"protocol":"tcp"}']);
+});
+
 test("sandbox createToken POSTs the scope and maps the answer", async () => {
   const seen: Request[] = [];
   const bodies: unknown[] = [];

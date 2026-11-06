@@ -648,7 +648,17 @@ type Service struct {
 	// 503+Retry-After, which is identical to the cold-start race the
 	// readiness probe already handles.
 	warmCacheMu sync.RWMutex
-	warmCache   map[string]int64
+	warmCache   map[string]warmEntry
+	// warmGen counts invalidateWarm calls. A setter reads it before its
+	// row read and stores nothing if it moved, so a row read from before
+	// a stop or a port-gate change is never cached after the invalidation
+	// that change made (the entry also carries the port gate, A2).
+	warmGen atomic.Uint64
+
+	// portLocks serializes expose and unexpose on one sandbox port
+	// (lockExposedPort). Entries live only while a call holds or waits.
+	portLocksMu sync.Mutex
+	portLocks   map[portLockKey]*portLock
 
 	// toolboxCalls holds every in-flight network toolbox request by
 	// sandbox, so the stop and destroy paths can end them at once instead
@@ -1725,7 +1735,7 @@ func (s *Service) restoreCompatStateAfterRecreate(ctx context.Context, id string
 func (s *Service) replayClusterExposedPorts(ctx context.Context, id string, exposedPorts map[int]cluster.ExposedPortRoute) error {
 	var firstErr error
 	for port, route := range exposedPorts {
-		if _, err := s.exposePort(ctx, id, port, route.Protocol, route.HostPort); err != nil {
+		if _, err := s.exposePort(ctx, id, port, route.Protocol, route.Visibility, route.HostPort); err != nil {
 			s.logger.Warn("cluster: re-expose after recreate failed; owner watcher will retry",
 				"sandbox_id", id, "port", port, "protocol", route.Protocol, "host_port", route.HostPort, "err", err)
 			if firstErr == nil {
@@ -3706,6 +3716,7 @@ func (s *Service) startSandbox(ctx context.Context, id string, cause startCause)
 	}
 	s.settleEgressAttach(id)
 	s.settleEnforcedEgress(ctx, sandbox, clearGen)
+	warmGen := s.warmGen.Load()
 	refreshed, err := s.store.Get(ctx, id)
 	if err != nil {
 		return nil, err
@@ -3716,7 +3727,7 @@ func (s *Service) startSandbox(ctx context.Context, id string, cause startCause)
 	// the now-warm upstream. invalidateWarm fires from every stop /
 	// destroy path so a later transition out of Started invalidates.
 	if refreshed.Status == models.SandboxStatusStarted {
-		s.warmCacheSet(id)
+		s.warmCacheSetSandbox(refreshed, warmGen)
 	}
 	return refreshed, nil
 }
@@ -4845,10 +4856,24 @@ func (s *Service) writeLifecycleLocked(ctx context.Context, id string, l models.
 //     --domain (so the SNI hostname has a place to resolve) and a non-empty
 //     SB_L4_TLS_LISTEN. Returns tls://<id>-<port>.<domain>:<l4-port>.
 func (s *Service) ExposePort(ctx context.Context, id string, port int, protocol string) (models.ExposePortResponse, error) {
-	return s.exposePort(ctx, id, port, protocol, 0)
+	return s.exposePort(ctx, id, port, protocol, "", 0)
 }
 
-func (s *Service) exposePort(ctx context.Context, id string, port int, protocol string, preferredHostPort int) (models.ExposePortResponse, error) {
+// ExposePortWithVisibility is ExposePort with a visibility (A2): "public",
+// "token" (the public URL needs a sandbox token for this port), or "" (a new
+// exposure is public; a re-expose keeps what it has). Only an explicit
+// value changes a port's visibility, so a retry from a client that does not
+// know about visibility can never open a gated port.
+func (s *Service) ExposePortWithVisibility(ctx context.Context, id string, port int, protocol, visibility string) (models.ExposePortResponse, error) {
+	return s.exposePort(ctx, id, port, protocol, visibility, 0)
+}
+
+func (s *Service) exposePort(ctx context.Context, id string, port int, protocol, visibility string, preferredHostPort int) (models.ExposePortResponse, error) {
+	// From the row read below to the last write: the visibility this call
+	// writes depends on the row it read, so two calls on one port must not
+	// interleave (lockExposedPort says what goes wrong if they do).
+	unlock := s.lockExposedPort(id, port)
+	defer unlock()
 	sandbox, err := s.scopedGet(ctx, id)
 	if err != nil {
 		return models.ExposePortResponse{}, err
@@ -4859,6 +4884,10 @@ func (s *Service) exposePort(ctx context.Context, id string, port int, protocol 
 	canonicalProto, err := models.ValidExposedPortProtocol(protocol)
 	if err != nil {
 		return models.ExposePortResponse{}, err
+	}
+	requestedVisibility, err := models.ValidExposedPortVisibility(visibility)
+	if err != nil {
+		return models.ExposePortResponse{}, fmt.Errorf("%w: %v", ErrTokenVisibilityInvalid, err)
 	}
 	// IRON RULE (plans/custom-domains.md): a sandbox with custom domains
 	// cannot also publish protocol=tcp/tls exposures. The L4 listener is
@@ -4886,6 +4915,13 @@ func (s *Service) exposePort(ctx context.Context, id string, port int, protocol 
 		}
 		if existingProto != canonicalProto {
 			return models.ExposePortResponse{}, fmt.Errorf("port %d already exposed as %s; unexpose it first", port, existingProto)
+		}
+	}
+	gated := requestedVisibility == models.ExposedPortVisibilityToken ||
+		(requestedVisibility == "" && existingBefore != nil && existingBefore.TokenGated())
+	if gated {
+		if err := s.checkTokenVisibility(sandbox, port, canonicalProto); err != nil {
+			return models.ExposePortResponse{}, err
 		}
 	}
 	// expose_port is the opt-in lever for a sandbox created private: there is
@@ -4921,12 +4957,6 @@ func (s *Service) exposePort(ctx context.Context, id string, port int, protocol 
 	switch canonicalProto {
 	case models.ExposedPortProtocolHTTP:
 		publicURL := s.caddy.PortPublicURL(id, port)
-		if err := s.installHTTPPortRoute(ctx, sandbox, port); err != nil {
-			return models.ExposePortResponse{}, err
-		}
-		if s.testAfterHTTPPortInstall != nil {
-			s.testAfterHTTPPortInstall()
-		}
 		exposure := models.ExposedPort{
 			SandboxID: id,
 			Port:      port,
@@ -4934,19 +4964,52 @@ func (s *Service) exposePort(ctx context.Context, id string, port int, protocol 
 			PublicURL: publicURL,
 			CreatedAt: now,
 		}
-		if err := s.store.UpsertPort(ctx, exposure); err != nil {
-			_ = s.removeHTTPPortRoute(ctx, id, port)
-			return models.ExposePortResponse{}, err
+		if gated {
+			exposure.Visibility = models.ExposedPortVisibilityToken
 		}
-		if err := s.recordClusterExposedPort(ctx, id, port, cluster.ExposedPortRoute{Protocol: canonicalProto, PublicURL: publicURL}); err != nil {
+		// existingBefore points into sandbox.ExposedPorts, which setExposure
+		// overwrites: keep a copy of the row as it was, for the rollback.
+		var previous *models.ExposedPort
+		if existingBefore != nil {
+			cp := *existingBefore
+			previous = &cp
+		}
+		// The route installer reads the port's visibility from the row it
+		// is handed: give it the exposure this call is about to store.
+		setExposure(sandbox, exposure)
+		wasGated := previous != nil && previous.TokenGated()
+		if gated || wasGated {
+			// A gate change writes the row first and the route second: from
+			// the row write on, every request through the sandboxd ingress
+			// is checked, and until the route moves onto it the port is as
+			// public as it already was. A failed route write puts the old
+			// row back, so the store never says "token" while the route is
+			// still the open one.
+			if err := s.exposeGatedHTTPPort(ctx, sandbox, exposure, previous); err != nil {
+				return models.ExposePortResponse{}, err
+			}
+		} else {
+			if err := s.installHTTPPortRoute(ctx, sandbox, port); err != nil {
+				return models.ExposePortResponse{}, err
+			}
+			if s.testAfterHTTPPortInstall != nil {
+				s.testAfterHTTPPortInstall()
+			}
+			if err := s.store.UpsertPort(ctx, exposure); err != nil {
+				_ = s.removeHTTPPortRoute(ctx, id, port)
+				return models.ExposePortResponse{}, err
+			}
+		}
+		if err := s.recordClusterExposedPort(ctx, id, port, cluster.ExposedPortRoute{Protocol: canonicalProto, PublicURL: publicURL, Visibility: exposure.Visibility}); err != nil {
 			if existingBefore == nil {
 				_ = s.removeHTTPPortRoute(ctx, id, port)
 				_ = s.store.DeletePort(ctx, id, port)
+				s.invalidateWarm(id)
 			}
 			return models.ExposePortResponse{}, err
 		}
 		s.touchAllowedPorts(ctx, id)
-		return models.ExposePortResponse{Protocol: canonicalProto, PublicURL: publicURL}, nil
+		return models.ExposePortResponse{Protocol: canonicalProto, PublicURL: publicURL, Visibility: exposure.Visibility}, nil
 
 	case models.ExposedPortProtocolTCP:
 		// Lazy bootstrap: boot's EnsureLayer4 is best-effort, so retry here
@@ -5235,6 +5298,8 @@ func (s *Service) removeClusterExposedPort(ctx context.Context, sandboxID string
 }
 
 func (s *Service) UnexposePort(ctx context.Context, id string, port int) error {
+	unlock := s.lockExposedPort(id, port)
+	defer unlock()
 	sandbox, err := s.scopedGet(ctx, id)
 	if err != nil {
 		return err
@@ -5254,6 +5319,8 @@ func (s *Service) UnexposePort(ctx context.Context, id string, port int) error {
 	if err := s.store.DeletePort(ctx, id, port); err != nil {
 		return err
 	}
+	// The ingress proxy's cached port gates come from the row just deleted.
+	s.invalidateWarm(id)
 	s.touchAllowedPorts(ctx, id)
 	return nil
 }
@@ -5363,7 +5430,13 @@ func (s *Service) applyHTTPPortRoute(ctx context.Context, sandbox *models.Sandbo
 	// serverless wake route can't carry it (the loopback ingress proxy
 	// overwrites Host on re-dial), so that path masks in the proxy instead.
 	routeOpts := caddy.HTTPRouteOptions{MaskRequestHost: sandbox.MaskRequestHost}
-	switch s.chooseRouteShape(sandbox, RouteKindHTTP) {
+	shape := s.chooseRouteShape(sandbox, RouteKindHTTP)
+	if shape == RouteShapeDirect && portTokenGated(sandbox, port) {
+		// A token-gated port (A2) never gets the route that dials the
+		// container: only the ingress-proxy shape passes the token check.
+		shape = RouteShapeWake
+	}
+	switch shape {
 	case RouteShapeDirect:
 		// Non-serverless callers (and serverless-bypass-off callers)
 		// fall through to UpsertPortRoute byte-for-byte (empty mask emits no
@@ -5676,13 +5749,14 @@ func (s *Service) IsSandboxStarted(ctx context.Context, id string) (bool, error)
 	if s.warmCacheHit(id) {
 		return true, nil
 	}
+	warmGen := s.warmGen.Load()
 	sb, err := s.scopedGet(ctx, id)
 	if err != nil {
 		return false, err
 	}
 	started := sb.Status == models.SandboxStatusStarted
 	if started {
-		s.warmCacheSet(id)
+		s.warmCacheSetSandbox(sb, warmGen)
 	}
 	return started, nil
 }
@@ -5694,22 +5768,19 @@ func (s *Service) IsSandboxStarted(ctx context.Context, id string) (bool, error)
 const warmCacheTTL = 2 * time.Second
 
 func (s *Service) warmCacheHit(id string) bool {
-	s.warmCacheMu.RLock()
-	exp, ok := s.warmCache[id]
-	s.warmCacheMu.RUnlock()
-	if !ok {
-		return false
-	}
-	return time.Now().UnixNano() < exp
+	_, ok := s.warmEntryFor(id)
+	return ok
 }
 
+// warmCacheSet caches id as warm without its port list (tests). The port
+// gate never trusts such an entry (PortAccess re-reads the row); production
+// paths have the row and use warmCacheSetSandbox.
 func (s *Service) warmCacheSet(id string) {
-	exp := time.Now().Add(warmCacheTTL).UnixNano()
 	s.warmCacheMu.Lock()
 	if s.warmCache == nil {
-		s.warmCache = make(map[string]int64)
+		s.warmCache = make(map[string]warmEntry)
 	}
-	s.warmCache[id] = exp
+	s.warmCache[id] = warmEntry{exp: time.Now().Add(warmCacheTTL).UnixNano()}
 	s.warmCacheMu.Unlock()
 }
 
@@ -5720,6 +5791,7 @@ func (s *Service) warmCacheSet(id string) {
 func (s *Service) invalidateWarm(id string) {
 	s.warmCacheMu.Lock()
 	delete(s.warmCache, id)
+	s.warmGen.Add(1)
 	s.warmCacheMu.Unlock()
 }
 
@@ -7985,6 +8057,12 @@ func (s *Service) syncAllowedPorts(ctx context.Context, sandbox *models.Sandbox)
 	}
 	ports := make([]int, 0, len(sandbox.ExposedPorts))
 	for _, p := range sandbox.ExposedPorts {
+		if p.TokenGated() {
+			// toolboxd's /proxy/<port> path is served straight from the
+			// sandbox root route, around the ingress proxy's token check,
+			// so a gated port is never on its allowlist (A2).
+			continue
+		}
 		ports = append(ports, p.Port)
 	}
 	cr, err := s.containerRuntimeForSandbox(sandbox)

@@ -39,6 +39,9 @@ func TestClassify(t *testing.T) {
 		kind       ErrKind
 	}{
 		{"not found", store.ErrNotFound, http.StatusNotFound, 0, "", ErrKindNotFound},
+		{"token visibility invalid", service.ErrTokenVisibilityInvalid, http.StatusBadRequest, 0, "", ErrKindOther},
+		{"token visibility unavailable", fmt.Errorf("%w: needs a domain", service.ErrTokenVisibilityUnavailable), http.StatusBadRequest, 0, "", ErrKindOther},
+		{"token visibility conflict", service.ErrTokenVisibilityConflict, http.StatusConflict, 0, "", ErrKindOther},
 		{"sandbox token request invalid", fmt.Errorf("%w: expires_in is required", service.ErrSandboxTokenInvalid), http.StatusBadRequest, 0, "", ErrKindOther},
 		{"sandbox tokens unavailable", service.ErrSandboxTokensUnavailable, http.StatusServiceUnavailable, 0, "", ErrKindOther},
 		// Load shedding: a fast retryable 503, never the 400 catch-all.

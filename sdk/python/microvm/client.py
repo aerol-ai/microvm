@@ -45,6 +45,7 @@ from .types import (
     FileEvent,
     FileEventCallback,
     ExposeResult,
+    ExposeVisibility,
     Failover,
     FileInfo,
     FileList,
@@ -695,8 +696,10 @@ class Sandbox:
     def find_in_files(self, path: str, text: str) -> List[FileMatch]:
         return self._client.find_in_files(self.id, path, text)
 
-    def expose_port(self, port: int, *, protocol: ExposeProtocol = "http") -> ExposeResult:
-        return self._client.expose_port(self.id, port, protocol=protocol)
+    def expose_port(
+        self, port: int, *, protocol: ExposeProtocol = "http", visibility: Optional[ExposeVisibility] = None
+    ) -> ExposeResult:
+        return self._client.expose_port(self.id, port, protocol=protocol, visibility=visibility)
 
     def unexpose_port(self, port: int) -> None:
         self._client.unexpose_port(self.id, port)
@@ -1827,7 +1830,14 @@ class MicroVM:
             if isinstance(m, dict)
         ]
 
-    def expose_port(self, sandbox_id: str, port: int, *, protocol: ExposeProtocol = "http") -> ExposeResult:
+    def expose_port(
+        self,
+        sandbox_id: str,
+        port: int,
+        *,
+        protocol: ExposeProtocol = "http",
+        visibility: Optional[ExposeVisibility] = None,
+    ) -> ExposeResult:
         """Publish a sandbox container port.
 
         ``protocol`` selects the wire surface and defaults to ``"http"``:
@@ -1839,10 +1849,19 @@ class MicroVM:
                       the daemon to have a domain configured AND
                       ``SB_L4_TLS_LISTEN`` set.
 
+        ``visibility="token"`` makes the URL need a sandbox token for this
+        port (see :meth:`Sandbox.create_token`). Left out, a new port is
+        public and an exposed port keeps what it has; pass it to change it.
+
         Returns an :class:`ExposeResult`. ``host`` and ``host_port`` are
         populated only on the ``"tcp"`` path.
         """
-        body: Optional[Dict[str, Any]] = {"protocol": protocol} if protocol and protocol != "http" else None
+        fields: Dict[str, Any] = {}
+        if protocol and protocol != "http":
+            fields["protocol"] = protocol
+        if visibility:
+            fields["visibility"] = visibility
+        body: Optional[Dict[str, Any]] = fields or None
         response = self._do_json("POST", f"{self._version_prefix}/sandboxes/{sandbox_id}/ports/{port}", body)
         return _from_api_expose_port_response(response)
 
@@ -2760,6 +2779,7 @@ def _from_api_exposed_port(port: Dict[str, Any]) -> Dict[str, Any]:
         "port": int(_first_of(port, "port") or 0),
         "publicURL": str(_first_of(port, "public_url", "publicURL") or ""),
         "createdAt": str(_first_of(port, "created_at", "createdAt") or ""),
+        **({"visibility": "token"} if _first_of(port, "visibility") == "token" else {}),
     }
 
 
@@ -2877,7 +2897,8 @@ def _from_api_expose_port_response(response: Dict[str, Any]) -> ExposeResult:
             host=str(host_raw) if host_raw is not None else None,
             host_port=int(host_port_raw) if host_port_raw is not None else None,
         )
-    return ExposeResult(protocol=protocol, url=url)
+    visibility = "token" if _first_of(response, "visibility") == "token" else None
+    return ExposeResult(protocol=protocol, url=url, visibility=visibility)
 
 
 def _to_api_mount_spec(mount: MountSpec) -> Dict[str, Any]:

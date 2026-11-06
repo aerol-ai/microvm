@@ -735,7 +735,7 @@ func TestExposePortTCPClusterRollbackWave10(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := svc.exposePort(ctx, "sb-tcp-roll", 5432, models.ExposedPortProtocolTCP, 0); err == nil {
+	if _, err := svc.exposePort(ctx, "sb-tcp-roll", 5432, models.ExposedPortProtocolTCP, "", 0); err == nil {
 		t.Fatal("expected post-install cluster failure")
 	}
 }
@@ -1009,7 +1009,7 @@ func TestExposePortUpsertPortRollbackViaHookWave11(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := svc.exposePort(ctx, "sb-upsert-fail", 8080, models.ExposedPortProtocolHTTP, 0); err == nil {
+	if _, err := svc.exposePort(ctx, "sb-upsert-fail", 8080, models.ExposedPortProtocolHTTP, "", 0); err == nil {
 		t.Fatal("expected UpsertPort failure after install")
 	}
 }
@@ -5091,7 +5091,7 @@ func TestExposePortProtocolConflictAndWasmIsolateReject(t *testing.T) {
 	if err := st.AddCustomDomain(ctx, "sb-exp", "api.external.test", 0); err != nil {
 		t.Fatalf("AddCustomDomain: %v", err)
 	}
-	if _, err := svc.exposePort(ctx, "sb-exp", 5432, models.ExposedPortProtocolTCP, 0); !errors.Is(err, ErrCustomDomainProtocolConflict) {
+	if _, err := svc.exposePort(ctx, "sb-exp", 5432, models.ExposedPortProtocolTCP, "", 0); !errors.Is(err, ErrCustomDomainProtocolConflict) {
 		t.Fatalf("tcp+custom = %v", err)
 	}
 
@@ -5102,7 +5102,7 @@ func TestExposePortProtocolConflictAndWasmIsolateReject(t *testing.T) {
 	if err := st.Create(ctx, wasm); err != nil {
 		t.Fatalf("Create wasm: %v", err)
 	}
-	if _, err := svc.exposePort(ctx, "sb-w", 80, models.ExposedPortProtocolTCP, 0); err == nil {
+	if _, err := svc.exposePort(ctx, "sb-w", 80, models.ExposedPortProtocolTCP, "", 0); err == nil {
 		t.Fatal("expected wasm tcp reject")
 	}
 
@@ -5113,7 +5113,7 @@ func TestExposePortProtocolConflictAndWasmIsolateReject(t *testing.T) {
 	if err := st.Create(ctx, iso); err != nil {
 		t.Fatalf("Create iso: %v", err)
 	}
-	if _, err := svc.exposePort(ctx, "sb-i", 80, models.ExposedPortProtocolTLS, 0); err == nil {
+	if _, err := svc.exposePort(ctx, "sb-i", 80, models.ExposedPortProtocolTLS, "", 0); err == nil {
 		t.Fatal("expected isolate tls reject")
 	}
 }
@@ -5320,7 +5320,7 @@ func TestExposePortProbeAndClusterFailWave7(t *testing.T) {
 	}
 
 	// Probe warn arm + cluster record failure after HTTP UpsertPort.
-	if _, err := svc.exposePort(ctx, "sb-exp7", 8080, models.ExposedPortProtocolHTTP, 0); err == nil {
+	if _, err := svc.exposePort(ctx, "sb-exp7", 8080, models.ExposedPortProtocolHTTP, "", 0); err == nil {
 		t.Fatal("expected cluster record failure on http expose")
 	}
 
@@ -5330,7 +5330,7 @@ func TestExposePortProbeAndClusterFailWave7(t *testing.T) {
 		EnableCaddy: true, CaddyAdminURL: server.URL, CaddyServerID: "srv0",
 		L4TLSListen: "127.0.0.1:9443", HTTPClientTimeout: time.Second,
 	})
-	if _, err := svc.exposePort(ctx, "sb-exp7", 8443, models.ExposedPortProtocolTLS, 0); err == nil || !strings.Contains(err.Error(), "--domain") {
+	if _, err := svc.exposePort(ctx, "sb-exp7", 8443, models.ExposedPortProtocolTLS, "", 0); err == nil || !strings.Contains(err.Error(), "--domain") {
 		t.Fatalf("tls no domain = %v", err)
 	}
 
@@ -5339,7 +5339,7 @@ func TestExposePortProbeAndClusterFailWave7(t *testing.T) {
 		EnableCaddy: true, Domain: "sandbox.example.com",
 		CaddyAdminURL: server.URL, CaddyServerID: "srv0", HTTPClientTimeout: time.Second,
 	})
-	if _, err := svc.exposePort(ctx, "sb-exp7", 8444, models.ExposedPortProtocolTLS, 0); err == nil || !strings.Contains(err.Error(), "SB_L4_TLS_LISTEN") {
+	if _, err := svc.exposePort(ctx, "sb-exp7", 8444, models.ExposedPortProtocolTLS, "", 0); err == nil || !strings.Contains(err.Error(), "SB_L4_TLS_LISTEN") {
 		t.Fatalf("tls no listen = %v", err)
 	}
 }
@@ -5382,7 +5382,7 @@ func TestExposePortTCPReuseAndInstallFailWave7(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Re-expose existing TCP → installTCPPortRoute fails against broken caddy.
-	if _, err := svc.exposePort(ctx, "sb-tcp7", 5432, models.ExposedPortProtocolTCP, 0); err == nil {
+	if _, err := svc.exposePort(ctx, "sb-tcp7", 5432, models.ExposedPortProtocolTCP, "", 0); err == nil {
 		t.Fatal("expected TCP re-expose install failure")
 	}
 
@@ -5393,7 +5393,7 @@ func TestExposePortTCPReuseAndInstallFailWave7(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := svc.exposePort(ctx, "sb-tcp7b", 5432, models.ExposedPortProtocolTCP, 0); err == nil {
+	if _, err := svc.exposePort(ctx, "sb-tcp7b", 5432, models.ExposedPortProtocolTCP, "", 0); err == nil {
 		t.Fatal("expected TCP allocate+install failure")
 	}
 }
@@ -5794,7 +5794,7 @@ func TestExposePortTLSClusterAndHTTPInstallFailWave8(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := svc.exposePort(ctx, "sb-tls8", 8443, models.ExposedPortProtocolTLS, 0); err == nil {
+	if _, err := svc.exposePort(ctx, "sb-tls8", 8443, models.ExposedPortProtocolTLS, "", 0); err == nil {
 		t.Fatal("expected TLS cluster record failure")
 	}
 
@@ -5802,7 +5802,7 @@ func TestExposePortTLSClusterAndHTTPInstallFailWave8(t *testing.T) {
 		EnableCaddy: true, Domain: "sandbox.example.com",
 		CaddyAdminURL: failServer.URL, CaddyServerID: "srv0", HTTPClientTimeout: time.Second,
 	})
-	if _, err := svc.exposePort(ctx, "sb-tls8", 8080, models.ExposedPortProtocolHTTP, 0); err == nil {
+	if _, err := svc.exposePort(ctx, "sb-tls8", 8080, models.ExposedPortProtocolHTTP, "", 0); err == nil {
 		t.Fatal("expected HTTP install failure")
 	}
 }

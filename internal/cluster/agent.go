@@ -657,7 +657,7 @@ func (a *Agent) AddExposedPort(ctx context.Context, sandboxID string, port int, 
 }
 
 func (a *Agent) addExposedPortForIncarnation(ctx context.Context, sandboxID, incarnationID string, port int, route ExposedPortRoute) error {
-	cmd := command{Op: opAddExposedPort, SandboxID: sandboxID, ExpectedIncarnationID: incarnationID, Port: port, Protocol: route.Protocol, HostPort: route.HostPort, PublicURL: route.PublicURL}
+	cmd := command{Op: opAddExposedPort, SandboxID: sandboxID, ExpectedIncarnationID: incarnationID, Port: port, Protocol: route.Protocol, HostPort: route.HostPort, PublicURL: route.PublicURL, Visibility: route.Visibility}
 	return a.applyCommand(ctx, cmd)
 }
 

@@ -532,6 +532,9 @@ class SnapshotList(TypedDict, total=False):
 # Wire protocol an exposure publishes through. "http" maps to the Caddy HTTP
 # reverse proxy; "tcp" and "tls" map to caddy-l4 surfaces.
 ExposeProtocol = Literal["http", "tcp", "tls"]
+# Who can open a port's URL: "public" (anyone) or "token" (only a visitor
+# with a sandbox token for that port; HTTP ports on a server with a domain).
+ExposeVisibility = Literal["public", "token"]
 
 
 @dataclass(frozen=True)
@@ -548,6 +551,8 @@ class ExposeResult:
     url: str
     host: Optional[str] = None
     host_port: Optional[int] = None
+    # "token" when the URL needs a sandbox token; None for a public port.
+    visibility: Optional[str] = None
 
 
 # Why a sandbox is in its current status. A stopped sandbox has one of the

@@ -33,7 +33,7 @@ pub use types::{
 };
 use types::{CustomDomainListWire, ExposePortResponseWire};
 pub use types::{ApiToken, ApiTokenList, CreateApiTokenOptions, CreatedApiToken, WhoAmI, WhoAmIPrincipal};
-pub use types::{CreateSandboxTokenOptions, SandboxToken};
+pub use types::{CreateSandboxTokenOptions, ExposeVisibility, SandboxToken};
 pub use types::{
     AddCustomDomainOptions, AuditCoverage, AuditEvent, AuditOptions, AuditPage, BuildImageOptions,
     EgressInject, EgressProfile, EgressProfileList, EgressProfileOptions, EgressProfileRef, EgressRule,
@@ -2229,10 +2229,19 @@ impl Client {
             ExposeProtocol::Tcp => "tcp",
             ExposeProtocol::Tls => "tls",
         };
-        let body = if matches!(options.protocol, ExposeProtocol::Http) {
+        // Only what the caller set: an omitted visibility keeps an exposed
+        // port's gate, so a plain retry never opens a token port.
+        let mut fields = serde_json::Map::new();
+        if !matches!(options.protocol, ExposeProtocol::Http) {
+            fields.insert("protocol".into(), Value::from(protocol_str));
+        }
+        if let Some(visibility) = options.visibility {
+            fields.insert("visibility".into(), Value::from(visibility.as_str()));
+        }
+        let body = if fields.is_empty() {
             None
         } else {
-            Some(serde_json::json!({"protocol": protocol_str}))
+            Some(Value::Object(fields))
         };
         let wire = self.do_json::<Value, ExposePortResponseWire>(
             Method::POST,
@@ -5787,6 +5796,33 @@ mod tests {
         match err {
             Error::Client(msg) => assert!(msg.contains("incomplete cluster list"), "msg={msg}"),
             other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    // A2: expose_port sends visibility only when it is set.
+    #[test]
+    fn expose_port_sends_visibility_only_when_set() {
+        for (options, want) in [
+            (ExposeOptions::token(), Some(serde_json::json!({"visibility": "token"}))),
+            (
+                ExposeOptions::http().with_visibility(ExposeVisibility::Public),
+                Some(serde_json::json!({"visibility": "public"})),
+            ),
+            (ExposeOptions::default(), None),
+        ] {
+            let (url, request_rx) = spawn_response_server(
+                "200 OK",
+                "application/json",
+                br#"{"protocol":"http","public_url":"https://sb-1-3000.example.com","visibility":"token"}"#.to_vec(),
+            );
+            let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+            let result = client.expose_port("sb-1", 3000, options).expect("expose_port should succeed");
+            assert!(matches!(result, ExposeResult::Http { .. }));
+            let request = request_rx.recv().expect("request should be captured");
+            match want {
+                Some(body) => assert_eq!(request_json_body(&request), body),
+                None => assert!(request.ends_with("\r\n\r\n"), "unexpected body: {}", request),
+            }
         }
     }
 

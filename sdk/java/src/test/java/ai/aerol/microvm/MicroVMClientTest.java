@@ -60,6 +60,8 @@ import ai.aerol.microvm.model.CreateOptions;
 import ai.aerol.microvm.model.CreateSessionOptions;
 import ai.aerol.microvm.model.CreateSandboxTokenOptions;
 import ai.aerol.microvm.model.CustomDomain;
+import ai.aerol.microvm.model.ExposeResult;
+import ai.aerol.microvm.model.ExposeOptions;
 import ai.aerol.microvm.model.SandboxToken;
 import ai.aerol.microvm.model.CustomDomainDnsRecords;
 import ai.aerol.microvm.model.CustomDomainStatus;
@@ -2288,6 +2290,32 @@ class MicroVMClientTest {
             assertEquals(1, page.sandboxes.size());
             assertEquals("sb-page", page.sandboxes.get(0).id);
             assertEquals("tok-next", page.nextPageToken);
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void exposePortSendsVisibilityOnlyWhenSet() throws Exception {
+        List<String> bodies = new java.util.concurrent.CopyOnWriteArrayList<>();
+        HttpServer server = startServer(exchange -> {
+            String body = new String(exchange.getRequestBody().readAllBytes(), java.nio.charset.StandardCharsets.UTF_8);
+            bodies.add(body);
+            writeJson(exchange, 200, body.contains("token")
+                ? mapOf("protocol", "http", "public_url", "https://sb-1-3000.example.com", "visibility", "token")
+                : mapOf("protocol", "http", "public_url", "https://sb-1-3000.example.com"));
+        });
+        try {
+            MicroVMClient client = clientFor(server);
+            ExposeResult gated = client.exposePort("sb-1", 3000, ExposeOptions.token());
+            assertEquals("token", gated.visibility);
+            ExposeResult plain = client.exposePort("sb-1", 3000);
+            assertNull(plain.visibility);
+            client.exposePort("sb-1", 5432, ExposeOptions.tcp());
+            assertEquals(3, bodies.size());
+            assertEquals(mapOf("visibility", "token"), castMap(JsonSupport.read(bodies.get(0).getBytes(), Map.class)));
+            assertEquals("", bodies.get(1));
+            assertEquals(mapOf("protocol", "tcp"), castMap(JsonSupport.read(bodies.get(2).getBytes(), Map.class)));
         } finally {
             server.stop(0);
         }

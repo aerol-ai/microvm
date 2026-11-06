@@ -721,7 +721,16 @@ func (s *Sandbox) ToolboxRequest(ctx context.Context, method, path string, query
 type ExposeOption func(*exposeOptions)
 
 type exposeOptions struct {
-	protocol sdktypes.ExposeProtocol
+	protocol   sdktypes.ExposeProtocol
+	visibility sdktypes.ExposeVisibility
+}
+
+// WithVisibility sets who can open the port's URL. ExposeVisibilityToken
+// makes it need a sandbox token for this port (Sandbox.CreateToken with
+// Port). Without it a new port is public and an exposed port keeps what it
+// has; pass it to change it.
+func WithVisibility(v sdktypes.ExposeVisibility) ExposeOption {
+	return func(o *exposeOptions) { o.visibility = v }
 }
 
 // WithProtocol selects the wire surface the exposure publishes through.
@@ -750,7 +759,7 @@ func (s *Sandbox) ExposePort(ctx context.Context, port int, opts ...ExposeOption
 	for _, opt := range opts {
 		opt(&cfg)
 	}
-	return s.client.inner.ExposePort(ctx, s.ID, port, string(cfg.protocol))
+	return s.client.inner.ExposePortWithVisibility(ctx, s.ID, port, string(cfg.protocol), string(cfg.visibility))
 }
 
 func (s *Sandbox) UnexposePort(ctx context.Context, port int) error {

@@ -158,3 +158,114 @@ func TestParitySandboxTokenAcrossNodes(t *testing.T) {
 		}
 	}
 }
+
+// publicGet sends one GET to a public URL without following redirects.
+func publicGet(t *testing.T, target, cookie string) (int, http.Header, string) {
+	t.Helper()
+	hc := *harness.HTTPClient(30 * time.Second)
+	hc.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cookie != "" {
+		req.Header.Set("Cookie", cookie)
+	}
+	resp, err := hc.Do(req)
+	if err != nil {
+		return 0, nil, err.Error()
+	}
+	defer resp.Body.Close()
+	body := make([]byte, 4096)
+	n, _ := resp.Body.Read(body)
+	return resp.StatusCode, resp.Header, string(body[:n])
+}
+
+// UC-426 — a port exposed with visibility "token": without a token it is a
+// 401 (never the app); ?token= sets the host-only __Host- cookie and 302s
+// to the URL without the token; the cookie then reaches the app; another
+// sandbox's token and a toolbox token are refused; a plain re-expose keeps
+// the gate; the toolboxd /proxy/<port>/ path does not serve it.
+func TestParityTokenGatedPort(t *testing.T) {
+	harness.Require(t, sc, "UC-426")
+	c := client(t)
+	sb := privateHTTPServerSandbox(t, c)
+	other := paritySandbox(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
+	defer cancel()
+
+	res, err := sb.ExposePort(ctx, 8080, microvm.WithVisibility(sdktypes.ExposeVisibilityToken))
+	if err != nil {
+		t.Fatalf("expose with token visibility: %v", err)
+	}
+	if res.Visibility != "token" || res.PublicURL == "" {
+		t.Fatalf("expose = %+v", res)
+	}
+	tok := issueSandboxToken(t, ctx, sb, sdktypes.CreateSandboxTokenOptions{ExpiresIn: "10m", Port: 8080})
+
+	// Wait for the route: until it is live the answer is a 404 or a 5xx.
+	deadline := time.Now().Add(90 * time.Second)
+	for {
+		st, _, body := publicGet(t, res.PublicURL, "")
+		if st == http.StatusUnauthorized {
+			break
+		}
+		if st == http.StatusOK {
+			t.Fatalf("the token port answered without a token: %s", body)
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("token port never answered 401: last %d %s", st, body)
+		}
+		time.Sleep(3 * time.Second)
+	}
+
+	st, hdr, body := publicGet(t, res.PublicURL+"?a=1&token="+tok.Token, "")
+	if st != http.StatusFound {
+		t.Fatalf("?token= = %d %s, want 302", st, body)
+	}
+	if loc := hdr.Get("Location"); strings.Contains(loc, "token") || !strings.HasSuffix(loc, "?a=1") {
+		t.Fatalf("Location = %q, want the URL without the token", loc)
+	}
+	setCookie := hdr.Get("Set-Cookie")
+	for _, want := range []string{"__Host-aerolvm-token=", "Secure", "HttpOnly", "SameSite=Lax", "Path=/"} {
+		if !strings.Contains(setCookie, want) {
+			t.Fatalf("Set-Cookie lacks %q (has the attributes: %v)", want, strings.Contains(setCookie, "Secure"))
+		}
+	}
+	if strings.Contains(strings.ToLower(setCookie), "domain=") {
+		t.Fatal("the cookie names a Domain")
+	}
+	cookie := "__Host-aerolvm-token=" + tok.Token
+	if st, _, body := publicGet(t, res.PublicURL, cookie); st != http.StatusOK {
+		t.Fatalf("with the cookie = %d %s", st, body)
+	}
+
+	otherTok := issueSandboxToken(t, ctx, other, sdktypes.CreateSandboxTokenOptions{ExpiresIn: "10m", Port: 8080})
+	toolboxTok := issueSandboxToken(t, ctx, sb, sdktypes.CreateSandboxTokenOptions{ExpiresIn: "10m"})
+	for name, bad := range map[string]string{"another sandbox's token": otherTok.Token, "a toolbox token": toolboxTok.Token} {
+		if st, _, body := publicGet(t, res.PublicURL+"?token="+bad, ""); st != http.StatusForbidden {
+			t.Fatalf("%s = %d %s, want 403", name, st, body)
+		}
+		if st, _, _ := publicGet(t, res.PublicURL, "__Host-aerolvm-token="+bad); st != http.StatusForbidden {
+			t.Fatalf("%s as a cookie = %d, want 403", name, st)
+		}
+	}
+
+	// A retry that names no visibility keeps the gate.
+	if again, err := sb.ExposePort(ctx, 8080); err != nil || again.Visibility != "token" {
+		t.Fatalf("plain re-expose = %+v, %v", again, err)
+	}
+	if st, _, _ := publicGet(t, res.PublicURL, ""); st != http.StatusUnauthorized {
+		t.Fatalf("after a plain re-expose = %d, want 401", st)
+	}
+
+	// The path form through toolboxd never serves a gated port.
+	if root, err := url.Parse(res.PublicURL); err == nil {
+		host := strings.Replace(root.Host, sb.ID+"-8080.", sb.ID+".", 1)
+		if st, _, body := publicGet(t, root.Scheme+"://"+host+"/proxy/8080/", ""); st == http.StatusOK {
+			t.Fatalf("/proxy/8080/ served the gated port: %s", body)
+		}
+	}
+}

@@ -903,6 +903,11 @@ func open(path string, secretCipher *secrets.Cipher) (*Store, error) {
 		// rejects two reservations on the same host_port without preventing
 		// many rows at the default 0.
 		`ALTER TABLE exposed_ports ADD COLUMN host_port INTEGER NOT NULL DEFAULT 0;`,
+		// Visibility of an exposed port (A2): "public" (anyone with the URL,
+		// every row from before this column) or "token" (the URL needs a
+		// sandbox token). Read on the ingress path from the sandbox row the
+		// warm cache already loads, so it adds no query.
+		`ALTER TABLE exposed_ports ADD COLUMN visibility TEXT NOT NULL DEFAULT 'public';`,
 		// Backend coordinate frozen at volume-creation time. Pre-migration rows
 		// get '' and fall back to recomputing the source from current operator
 		// config; new volumes store the resolved location so delete/reclaim
@@ -2955,7 +2960,7 @@ func (s *Store) UpsertAccountMapping(ctx context.Context, ownerRef, externalID s
 // batches; the in-memory join below stays the same shape.
 func (s *Store) attachPortsBulk(ctx context.Context, byID map[string]*models.Sandbox) error {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT sandbox_id, port, protocol, host_port, public_url, created_at
+		SELECT sandbox_id, port, protocol, host_port, public_url, created_at, visibility
 		FROM exposed_ports
 		ORDER BY sandbox_id, port ASC
 	`)
@@ -2966,7 +2971,7 @@ func (s *Store) attachPortsBulk(ctx context.Context, byID map[string]*models.San
 
 	for rows.Next() {
 		var exposure models.ExposedPort
-		if err := rows.Scan(&exposure.SandboxID, &exposure.Port, &exposure.Protocol, &exposure.HostPort, &exposure.PublicURL, &exposure.CreatedAt); err != nil {
+		if err := scanExposedPort(rows.Scan, &exposure); err != nil {
 			return fmt.Errorf("scan exposed port: %w", err)
 		}
 		if sb, ok := byID[exposure.SandboxID]; ok {
@@ -5079,19 +5084,39 @@ func (s *Store) Touch(ctx context.Context, id string, at time.Time) error {
 	return nil
 }
 
+// scanExposedPort reads one exposed_ports row in the column order every
+// SELECT above uses. Visibility is "" for a public port (the stored
+// default), so a public exposure's JSON is what it was before A2.
+func scanExposedPort(scan func(dest ...any) error, exposure *models.ExposedPort) error {
+	var visibility string
+	if err := scan(&exposure.SandboxID, &exposure.Port, &exposure.Protocol, &exposure.HostPort, &exposure.PublicURL, &exposure.CreatedAt, &visibility); err != nil {
+		return err
+	}
+	exposure.Visibility = ""
+	if visibility == models.ExposedPortVisibilityToken {
+		exposure.Visibility = models.ExposedPortVisibilityToken
+	}
+	return nil
+}
+
 func (s *Store) UpsertPort(ctx context.Context, exposure models.ExposedPort) error {
 	if exposure.Protocol == "" {
 		exposure.Protocol = models.ExposedPortProtocolHTTP
 	}
+	visibility := models.ExposedPortVisibilityPublic
+	if exposure.TokenGated() {
+		visibility = models.ExposedPortVisibilityToken
+	}
 	_, err := s.db.ExecContext(ctx, `
-		INSERT INTO exposed_ports (sandbox_id, port, protocol, host_port, public_url, created_at)
-		VALUES (?, ?, ?, ?, ?, ?)
+		INSERT INTO exposed_ports (sandbox_id, port, protocol, host_port, public_url, created_at, visibility)
+		VALUES (?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(sandbox_id, port) DO UPDATE SET
 			protocol = excluded.protocol,
 			host_port = excluded.host_port,
 			public_url = excluded.public_url,
-			created_at = excluded.created_at
-	`, exposure.SandboxID, exposure.Port, exposure.Protocol, exposure.HostPort, exposure.PublicURL, exposure.CreatedAt.UTC())
+			created_at = excluded.created_at,
+			visibility = excluded.visibility
+	`, exposure.SandboxID, exposure.Port, exposure.Protocol, exposure.HostPort, exposure.PublicURL, exposure.CreatedAt.UTC(), visibility)
 	if err != nil {
 		return fmt.Errorf("upsert exposed port: %w", err)
 	}
@@ -5152,11 +5177,11 @@ func (s *Store) TryReserveHostPort(ctx context.Context, sandboxID string, contai
 // protocol destination port back to a sandbox/container port.
 func (s *Store) GetPortByHostPort(ctx context.Context, hostPort int) (*models.ExposedPort, error) {
 	var exposure models.ExposedPort
-	err := s.db.QueryRowContext(ctx, `
-		SELECT sandbox_id, port, protocol, host_port, public_url, created_at
+	err := scanExposedPort(s.db.QueryRowContext(ctx, `
+		SELECT sandbox_id, port, protocol, host_port, public_url, created_at, visibility
 		FROM exposed_ports
 		WHERE host_port = ?
-	`, hostPort).Scan(&exposure.SandboxID, &exposure.Port, &exposure.Protocol, &exposure.HostPort, &exposure.PublicURL, &exposure.CreatedAt)
+	`, hostPort).Scan, &exposure)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, nil
@@ -5169,11 +5194,11 @@ func (s *Store) GetPortByHostPort(ctx context.Context, hostPort int) (*models.Ex
 // getPort returns the exposure row for (sandboxID, port), or nil if absent.
 func (s *Store) getPort(ctx context.Context, sandboxID string, port int) (*models.ExposedPort, error) {
 	var exposure models.ExposedPort
-	err := s.db.QueryRowContext(ctx, `
-		SELECT sandbox_id, port, protocol, host_port, public_url, created_at
+	err := scanExposedPort(s.db.QueryRowContext(ctx, `
+		SELECT sandbox_id, port, protocol, host_port, public_url, created_at, visibility
 		FROM exposed_ports
 		WHERE sandbox_id = ? AND port = ?
-	`, sandboxID, port).Scan(&exposure.SandboxID, &exposure.Port, &exposure.Protocol, &exposure.HostPort, &exposure.PublicURL, &exposure.CreatedAt)
+	`, sandboxID, port).Scan, &exposure)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, nil
@@ -5188,7 +5213,7 @@ func (s *Store) getPort(ctx context.Context, sandboxID string, port int) (*model
 // without N+1 per-sandbox lookups.
 func (s *Store) ListAllExposedPorts(ctx context.Context) ([]models.ExposedPort, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT sandbox_id, port, protocol, host_port, public_url, created_at
+		SELECT sandbox_id, port, protocol, host_port, public_url, created_at, visibility
 		FROM exposed_ports
 		ORDER BY sandbox_id, port ASC
 	`)
@@ -5200,7 +5225,7 @@ func (s *Store) ListAllExposedPorts(ctx context.Context) ([]models.ExposedPort, 
 	var ports []models.ExposedPort
 	for rows.Next() {
 		var exposure models.ExposedPort
-		if err := rows.Scan(&exposure.SandboxID, &exposure.Port, &exposure.Protocol, &exposure.HostPort, &exposure.PublicURL, &exposure.CreatedAt); err != nil {
+		if err := scanExposedPort(rows.Scan, &exposure); err != nil {
 			return nil, fmt.Errorf("scan exposed port: %w", err)
 		}
 		ports = append(ports, exposure)
@@ -5470,7 +5495,7 @@ func (s *Store) attachCustomDomainsBulk(ctx context.Context, byID map[string]*mo
 
 func (s *Store) loadPorts(ctx context.Context, sandboxID string) ([]models.ExposedPort, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT sandbox_id, port, protocol, host_port, public_url, created_at
+		SELECT sandbox_id, port, protocol, host_port, public_url, created_at, visibility
 		FROM exposed_ports
 		WHERE sandbox_id = ?
 		ORDER BY port ASC
@@ -5483,7 +5508,7 @@ func (s *Store) loadPorts(ctx context.Context, sandboxID string) ([]models.Expos
 	var ports []models.ExposedPort
 	for rows.Next() {
 		var exposure models.ExposedPort
-		if err := rows.Scan(&exposure.SandboxID, &exposure.Port, &exposure.Protocol, &exposure.HostPort, &exposure.PublicURL, &exposure.CreatedAt); err != nil {
+		if err := scanExposedPort(rows.Scan, &exposure); err != nil {
 			return nil, fmt.Errorf("scan exposed port: %w", err)
 		}
 		ports = append(ports, exposure)

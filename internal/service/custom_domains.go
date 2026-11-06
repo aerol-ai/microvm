@@ -247,6 +247,11 @@ func (s *Service) AddCustomDomain(ctx context.Context, sandboxID, hostname strin
 			return err
 		}
 	}
+	if targetPort > 0 && portTokenGated(sandbox, targetPort) {
+		// The custom-domain route dials the port directly, around the
+		// ingress proxy's token check (A2).
+		return fmt.Errorf("%w: port %d needs a sandbox token; a custom domain would open it to anyone", ErrTokenVisibilityConflict, targetPort)
+	}
 	// Per-sandbox cap is enforced here rather than in the store so the error
 	// surfaces with the canonical sentinel; the store would otherwise just
 	// insert and the count check would race with concurrent adds. Reads
