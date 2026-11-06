@@ -159,3 +159,35 @@ func TestSandboxUploadDir(t *testing.T) {
 		t.Fatalf("UploadDir = %v, query %q", err, query)
 	}
 }
+
+func TestSandboxDownloadWithOptions(t *testing.T) {
+	ctx := context.Background()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/sandboxes/sb1" {
+			_ = json.NewEncoder(w).Encode(models.Sandbox{ID: "sb1"})
+			return
+		}
+		_, _ = w.Write([]byte("0123456789"))
+	}))
+	defer server.Close()
+	client, err := NewClientWithConfig(&sdktypes.MicroVMConfig{PATToken: "pat", APIUrl: server.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sb, err := client.Get(ctx, "sb1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sb.DownloadFileWithOptions(ctx, "/f", sdktypes.DownloadFileOptions{MaxBytes: 3}); !errors.Is(err, ErrFileTooLarge) {
+		t.Fatalf("DownloadFileWithOptions = %v", err)
+	}
+	body, err := sb.DownloadFileStreamWithOptions(ctx, "/f", sdktypes.DownloadFileOptions{MaxBytes: 100})
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, _ := io.ReadAll(body)
+	body.Close()
+	if string(data) != "0123456789" {
+		t.Fatalf("stream = %q", data)
+	}
+}

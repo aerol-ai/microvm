@@ -973,6 +973,15 @@ export interface UploadFileOptions {
   mode?: number;
 }
 
+export interface DownloadFileOptions {
+  /**
+   * Refuse a file larger than this many bytes with `MicroVMFileTooLargeError`:
+   * before reading when the server states the size, otherwise as soon as more
+   * arrives. A guard against a file larger than expected filling memory.
+   */
+  maxBytes?: number;
+}
+
 /** One file, folder or symlink in a sandbox. */
 export interface FileInfo {
   name: string;

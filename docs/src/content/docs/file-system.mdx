@@ -595,6 +595,7 @@ Deleting a symlink deletes the link, never what it points to. Deleting `/` is re
 | A request that cannot work, such as deleting `/`, copying a folder into itself, upload options that clash, or an unsafe entry in a folder archive | 400 |
 | An upload with `create only` found a file already there | 412 |
 | A folder archive has too many entries or too many bytes | 413 |
+| A download range starts past the end of the file | 416 |
 | The sandbox disk is full ("sandbox disk is full") | 507 |
 | The sandbox is a WASM or V8 isolate sandbox, which has no such call | 501 |
 
@@ -604,11 +605,12 @@ The SDKs retry a call that failed on the way. Calls that are safe to send twice 
 
 | Call | Retried on |
 |---|---|
-| `listFiles`, `getFileInfo`, `fileExists`, `searchFiles`, `findInFiles` | 421, 429, 502, 503, 504 and dropped connections |
+| `listFiles`, `getFileInfo`, `fileExists`, `searchFiles`, `findInFiles`, `downloadFile` | 421, 429, 502, 503, 504 and dropped connections |
+| Streamed downloads (`downloadFileStream`, `download_file_to`) | The same, until the file starts to arrive; never after. |
 | `uploadFile`, plain or atomic | 421, 429, 502, 503, 504 and dropped connections: sending the same bytes again leaves the same file |
 | `deleteFile`, `makeDir` | The same. If a retry finds the work already done (the file is gone, the folder is there), the call succeeds. |
 | `moveFile`, `copyFile`, `uploadFile` with append or create only | Only 429 and 503, when the server did nothing. After any other failure the work may have happened (a second append would add the data twice), so the SDK reports the error instead of guessing. |
-| `uploadDir`, Go `UploadFileStream` and `UploadFileStreamWithOptions` | Never: the data is built or read as it is sent, so the SDK sends it once. |
+| `uploadDir` and the streamed uploads (`uploadFileStream`, `upload_file_from`, Go `UploadFileStream`) | Never: the data is built or read as it is sent, so the SDK sends it once. |
 
 ## Copy a whole folder
 
@@ -655,10 +657,138 @@ To copy a folder out of a sandbox, use the [CLI](/cli/#copy-a-folder): `aerolvm 
 
 ## Move big files without filling memory
 
-Most SDK calls hold the whole file in memory while they copy it. The Go SDK also has streaming versions that copy a file piece by piece:
+`uploadFile` and `downloadFile` hold the whole file in memory. For big files, use the streaming calls: they copy the file a piece at a time, so memory stays small however big the file is.
 
-- `UploadFileStream(ctx, path, reader)` reads from any `io.Reader`, such as an open file.
-- `DownloadFileStream(ctx, path)` returns an `io.ReadCloser`. You must close it. Closing it early stops the download, so reading only the start of a big file is cheap.
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    import { createReadStream, createWriteStream } from "node:fs";
+    import { Readable, Writable } from "node:stream";
+
+    await sandbox.uploadFileStream("/workspace/data.bin", Readable.toWeb(createReadStream("./data.bin")) as ReadableStream<Uint8Array>);
+    const stream = await sandbox.downloadFileStream("/workspace/result.bin");
+    await stream.pipeTo(Writable.toWeb(createWriteStream("./result.bin")));
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    with open("data.bin", "rb") as src:
+        sandbox.upload_file_from("/workspace/data.bin", src)
+    with open("result.bin", "wb") as dest:
+        sandbox.download_file_to("/workspace/result.bin", dest)
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    src, err := os.Open("data.bin")
+    if err != nil {
+        log.Fatal(err)
+    }
+    defer src.Close()
+    if err := sandbox.UploadFileStream(ctx, "/workspace/data.bin", src); err != nil {
+        log.Fatal(err)
+    }
+    body, err := sandbox.DownloadFileStream(ctx, "/workspace/result.bin")
+    if err != nil {
+        log.Fatal(err)
+    }
+    defer body.Close()
+    dest, err := os.Create("result.bin")
+    if err != nil {
+        log.Fatal(err)
+    }
+    defer dest.Close()
+    if _, err := io.Copy(dest, body); err != nil {
+        log.Fatal(err)
+    }
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    use aerolvm_sdk::{DownloadFileOptions, UploadFileOptions};
+
+    let src = std::fs::File::open("data.bin")?;
+    sandbox.upload_file_from("/workspace/data.bin", src, UploadFileOptions::default())?;
+    let mut dest = std::fs::File::create("result.bin")?;
+    sandbox.download_file_to("/workspace/result.bin", &mut dest, DownloadFileOptions::default())?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    try (InputStream src = Files.newInputStream(Path.of("data.bin"))) {
+        sandbox.uploadFileStream("/workspace/data.bin", src, null);
+    }
+    try (InputStream body = sandbox.downloadFileStream("/workspace/result.bin", null)) {
+        Files.copy(body, Path.of("result.bin"), StandardCopyOption.REPLACE_EXISTING);
+    }
+    ```
+  </TabItem>
+</Tabs>
+
+- A streamed upload takes the same options as `uploadFile` (append, create only, atomic, mode).
+- A streamed upload is sent once and never retried: the data is read as it goes. A streamed download is retried until the file starts to arrive, never after.
+- Closing a download stream early stops the transfer, so reading only the start of a big file is cheap.
+- In TypeScript, streaming needs Node.js 18 or later.
+
+## Limit how much you download
+
+Pass a byte limit to refuse a file bigger than you expect, so a huge log or a runaway output file cannot fill your app's memory. When the sandbox reports the file's size, the call fails before reading any of it. Otherwise it fails as soon as more than the limit arrives.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    try {
+      const bytes = await sandbox.downloadFile("/workspace/out.log", { maxBytes: 10_000_000 });
+    } catch (err) {
+      if (err instanceof MicroVMFileTooLargeError) {
+        console.log("the log is over 10 MB");
+      }
+    }
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    from microvm import MicroVMFileTooLargeError
+
+    try:
+        data = sandbox.download_file("/workspace/out.log", max_bytes=10_000_000)
+    except MicroVMFileTooLargeError:
+        print("the log is over 10 MB")
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    data, err := sandbox.DownloadFileWithOptions(ctx, "/workspace/out.log",
+        sdktypes.DownloadFileOptions{MaxBytes: 10_000_000})
+    if errors.Is(err, microvm.ErrFileTooLarge) {
+        log.Fatal("the log is over 10 MB")
+    }
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    use aerolvm_sdk::DownloadFileOptions;
+
+    let data = sandbox.download_file_with_options(
+        "/workspace/out.log",
+        DownloadFileOptions { max_bytes: Some(10_000_000) },
+    )?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    try {
+        byte[] data = sandbox.downloadFile("/workspace/out.log", new DownloadFileOptions().setMaxBytes(10_000_000L));
+    } catch (MicroVMFileTooLargeException err) {
+        System.out.println("the log is over 10 MB");
+    }
+    ```
+  </TabItem>
+</Tabs>
+
+The streaming downloads take the same limit (`downloadFileStream`, `download_file_to`, `DownloadFileStreamWithOptions`, `download_file_to`, `downloadFileStream`).
+
+The sandbox also answers ranged and `HEAD` requests on downloads, so any HTTP client can resume a large download or check a file's size and change time without reading it. A range past the end of the file is HTTP 416.
 
 ## Good to know
 

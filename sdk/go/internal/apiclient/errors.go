@@ -26,6 +26,8 @@ var (
 	// the option, so the SDK refuses instead of sending it. Match the
 	// details with errors.As on *UnsupportedFeatureError.
 	ErrUnsupportedFeature = errors.New("sandbox agent does not support this feature")
+	// ErrFileTooLarge means a download was larger than its MaxBytes.
+	ErrFileTooLarge = errors.New("file is larger than the download limit")
 )
 
 // UnsupportedFeatureError names the sandbox and the features its agent did

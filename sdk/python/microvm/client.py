@@ -200,6 +200,16 @@ class MicroVMUnsupportedFeatureError(MicroVMError):
         )
 
 
+class MicroVMFileTooLargeError(MicroVMError):
+    """A download was larger than its ``max_bytes``. Raised before reading
+    when the server states the size, otherwise as soon as more arrives."""
+
+    def __init__(self, path: str, max_bytes: int) -> None:
+        self.path = path
+        self.max_bytes = max_bytes
+        super().__init__(f"{path} is larger than max_bytes ({max_bytes} bytes)")
+
+
 class MicroVMHTTPError(MicroVMError):
     """An HTTP error response from sandboxd. ``str(err)`` is the server's
     message, or the HTTP reason phrase when the body is not the server's
@@ -620,8 +630,23 @@ class Sandbox:
     ) -> None:
         self._client.upload_file(self.id, target_path, data, append=append, create_only=create_only, atomic=atomic, mode=mode)
 
-    def download_file(self, target_path: str) -> bytes:
-        return self._client.download_file(self.id, target_path)
+    def download_file(self, target_path: str, *, max_bytes: Optional[int] = None) -> bytes:
+        return self._client.download_file(self.id, target_path, max_bytes=max_bytes)
+
+    def download_file_to(self, target_path: str, dest: Any, *, max_bytes: Optional[int] = None) -> int:
+        return self._client.download_file_to(self.id, target_path, dest, max_bytes=max_bytes)
+
+    def upload_file_from(
+        self,
+        target_path: str,
+        src: Any,
+        *,
+        append: bool = False,
+        create_only: bool = False,
+        atomic: bool = False,
+        mode: Optional[int] = None,
+    ) -> None:
+        self._client.upload_file_from(self.id, target_path, src, append=append, create_only=create_only, atomic=atomic, mode=mode)
 
     def watch_files(self, path: str, on_event: FileEventCallback, recursive: bool = False) -> FileWatchHandle:
         return self._client.watch_files(self.id, path, on_event, recursive=recursive)
@@ -1519,9 +1544,91 @@ class MicroVM:
         path = f"{self._version_prefix}/sandboxes/{sandbox_id}/toolbox/files/upload?extract=true"
         self._do_multipart(path, {"path": remote_dir}, "file", "upload.tar.gz", archive, idempotent=False, send_once=True)
 
-    def download_file(self, sandbox_id: str, target_path: str) -> bytes:
+    def download_file(self, sandbox_id: str, target_path: str, *, max_bytes: Optional[int] = None) -> bytes:
+        """Read a whole file. ``max_bytes`` refuses a larger one with
+        :class:`MicroVMFileTooLargeError`. Retries like any safe call."""
+        buf = BytesIO()
+        self.download_file_to(sandbox_id, target_path, buf, max_bytes=max_bytes)
+        return buf.getvalue()
+
+    def download_file_to(
+        self,
+        sandbox_id: str,
+        target_path: str,
+        dest: Any,
+        *,
+        max_bytes: Optional[int] = None,
+        chunk_size: int = 1 << 20,
+    ) -> int:
+        """Stream a file into ``dest`` (anything with ``write``, such as an
+        open file) a piece at a time, so a large file never sits in memory.
+        Returns the bytes written. ``max_bytes`` refuses a larger file:
+        before reading when the server states the size, otherwise as soon as
+        more arrives (what was written stays in ``dest``). The request
+        retries until the file starts to arrive, never after."""
         url = self._url(f"{self._version_prefix}/sandboxes/{sandbox_id}/toolbox/files/download?path={urllib.parse.quote(target_path, safe='')}")
-        return self._request("GET", url)
+
+        def copy(response: Any, headers: Dict[str, str]) -> int:
+            length = next((v for k, v in headers.items() if k.lower() == "content-length"), None)
+            if max_bytes is not None and length is not None and length.isdigit() and int(length) > max_bytes:
+                raise MicroVMFileTooLargeError(target_path, max_bytes)
+            written = 0
+            while True:
+                chunk = response.read(chunk_size)
+                if not chunk:
+                    return written
+                if max_bytes is not None and written + len(chunk) > max_bytes:
+                    dest.write(chunk[: max_bytes - written])
+                    raise MicroVMFileTooLargeError(target_path, max_bytes)
+                dest.write(chunk)
+                written += len(chunk)
+
+        return int(self._request_reader("GET", url, copy))
+
+    def upload_file_from(
+        self,
+        sandbox_id: str,
+        target_path: str,
+        src: Any,
+        *,
+        append: bool = False,
+        create_only: bool = False,
+        atomic: bool = False,
+        mode: Optional[int] = None,
+        chunk_size: int = 1 << 20,
+    ) -> None:
+        """Upload from ``src`` (anything with ``read``, such as an open
+        file) a piece at a time, so a large file never sits in memory. The
+        options are :meth:`upload_file`'s. The data is read as it is sent,
+        so the request is sent once and never retried."""
+        query: Dict[str, str] = {}
+        for name, on in (("append", append), ("create_only", create_only), ("atomic", atomic)):
+            if on:
+                query[name] = "true"
+        if mode is not None:
+            query["mode"] = format(mode, "o")
+        if query:
+            self._require_toolbox_features(sandbox_id, _FEATURE_WRITE_OPTIONS)
+        path = f"{self._version_prefix}/sandboxes/{sandbox_id}/toolbox/files/upload"
+        if query:
+            path += "?" + urllib.parse.urlencode(query)
+        boundary = uuid.uuid4().hex
+
+        def body() -> Iterator[bytes]:
+            yield (
+                f"--{boundary}\r\nContent-Disposition: form-data; name=\"path\"\r\n\r\n{target_path}\r\n"
+                f"--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{os.path.basename(target_path)}\"\r\n"
+                "Content-Type: application/octet-stream\r\n\r\n"
+            ).encode("utf-8")
+            while True:
+                chunk = src.read(chunk_size)
+                if not chunk:
+                    break
+                yield chunk
+            yield f"\r\n--{boundary}--\r\n".encode("utf-8")
+
+        # No Content-Length: urllib sends an iterable body chunked.
+        self._request("POST", self._url(path), body(), f"multipart/form-data; boundary={boundary}", send_once=True)
 
     def watch_files(
         self,
@@ -1818,6 +1925,14 @@ class MicroVM:
         )
         return raw
 
+    def _request_reader(self, method: str, url: str, reader: Any) -> Any:
+        """Send a body-less request with the usual retries and hand the open
+        response to ``reader(response, headers)``, returning what it returns.
+        Retries stop once the body starts: a reader that wrote part of it
+        somewhere cannot be run again."""
+        result, _ = self._request_headers(method, url, reader=reader)
+        return result
+
     def _request_headers(
         self,
         method: str,
@@ -1829,7 +1944,8 @@ class MicroVM:
         idempotent: bool = True,
         done_code: Optional[str] = None,
         send_once: bool = False,
-    ) -> tuple[bytes, Dict[str, str]]:
+        reader: Any = None,
+    ) -> tuple[Any, Dict[str, str]]:
         """Send one request, retrying transient failures with backoff.
 
         ``done_code`` is for a call whose retry can find its own work done
@@ -1858,6 +1974,7 @@ class MicroVM:
 
         for attempt in range(max_retries + 1):
             retry_after: Optional[str] = None
+            body_started = False
             request = urllib.request.Request(url, data=body, method=method)
             request.add_header("Authorization", f"Bearer {self.pat_token}")
             if self.team:
@@ -1870,7 +1987,10 @@ class MicroVM:
             try:
                 with urllib.request.urlopen(request) as response:
                     headers = {k: v for k, v in response.headers.items()}
-                    return response.read(), headers
+                    if reader is None:
+                        return response.read(), headers
+                    body_started = True
+                    return reader(response, headers), headers
             except urllib.error.HTTPError as exc:
                 last_exc = exc
                 payload: Optional[bytes] = None
@@ -1907,7 +2027,7 @@ class MicroVM:
                 # timeout, a reset, the server closing without a reply): the
                 # server may already be acting on the request.
                 last_exc = exc
-                if attempt >= max_retries or not idempotent:
+                if attempt >= max_retries or not idempotent or body_started:
                     raise
 
             time.sleep(self._retry_delay(attempt, retry_after, time.time(), random.random()))

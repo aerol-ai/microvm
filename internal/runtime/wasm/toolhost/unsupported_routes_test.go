@@ -29,6 +29,7 @@ func TestUnsupportedDaytonaRoutesAnswer501(t *testing.T) {
 		{http.MethodGet, "/files?path=/&depth=2"},
 		{http.MethodGet, "/files?path=/&limit=10"},
 		{http.MethodGet, "/files?path=/&extended=true"},
+		{http.MethodHead, "/files/download?path=/f"},
 		{http.MethodPost, "/lsp/start"},
 		{http.MethodGet, "/lsp"},
 		{http.MethodPost, "/process/pty"},
@@ -109,6 +110,30 @@ func TestUploadRefusesToolboxdOptions(t *testing.T) {
 	for _, query := range []string{"", "append=false&create_only=0"} {
 		if rec := upload(query); rec.Code != http.StatusCreated {
 			t.Fatalf("upload ?%s = %d %s", query, rec.Code, rec.Body.String())
+		}
+	}
+}
+
+func TestDownloadRefusesRange(t *testing.T) {
+	workDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(workDir, "f"), []byte("0123456789"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	handler := New(Config{SandboxID: "sb", AuthToken: "tok", WorkDir: workDir}).Handler()
+	for _, rangeHeader := range []string{"bytes=0-3", ""} {
+		req := httptest.NewRequest(http.MethodGet, "/files/download?path=/f", nil)
+		req.Header.Set("Authorization", "Bearer tok")
+		if rangeHeader != "" {
+			req.Header.Set("Range", rangeHeader)
+		}
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		want := http.StatusOK
+		if rangeHeader != "" {
+			want = http.StatusNotImplemented
+		}
+		if rec.Code != want {
+			t.Fatalf("Range %q = %d, want %d", rangeHeader, rec.Code, want)
 		}
 	}
 }

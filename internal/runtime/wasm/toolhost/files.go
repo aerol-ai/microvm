@@ -64,6 +64,11 @@ func (h *Host) handleUpload(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Host) handleDownload(w http.ResponseWriter, r *http.Request) {
+	if r.Header.Get("Range") != "" {
+		// Plan F4: a clear 501 rather than the whole file for a range.
+		writeError(w, http.StatusNotImplemented, "range requests are not supported on WASM sandboxes")
+		return
+	}
 	targetPath := strings.TrimSpace(r.URL.Query().Get("path"))
 	if targetPath == "" {
 		writeError(w, http.StatusBadRequest, "path is required")

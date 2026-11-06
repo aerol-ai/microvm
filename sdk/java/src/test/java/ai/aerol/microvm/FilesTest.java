@@ -443,4 +443,119 @@ class FilesTest {
         new Sandbox(ok, data).uploadDir(root, "/w");
         assertEquals(1, calls.size());
     }
+
+    /** A raw server for the download and stream tests: path -> handler. */
+    private MicroVMClient rawServer(com.sun.net.httpserver.HttpHandler handler) throws IOException {
+        server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        server.createContext("/", exchange -> {
+            try {
+                if (exchange.getRequestURI().getPath().endsWith("/toolbox/version")) {
+                    write(exchange, Reply.of(200, Map.of("version", "t", "features", List.of("files.write_options"))));
+                    return;
+                }
+                handler.handle(exchange);
+            } finally {
+                exchange.close();
+            }
+        });
+        server.start();
+        return new MicroVMClient(
+            new MicroVMConfig().setApiUrl("http://127.0.0.1:" + server.getAddress().getPort()).setPatToken("pat")
+                .setRetry(new RetryConfig().setMaxRetries(3).setBaseDelayMs(1).setMaxDelayMs(1)),
+            HttpClient.newHttpClient(), null, name -> null);
+    }
+
+    @Test
+    void downloadsHonourMaxBytesAndRetryUntilTheFileStarts() throws Exception {
+        java.util.concurrent.atomic.AtomicInteger hits = new java.util.concurrent.atomic.AtomicInteger();
+        MicroVMClient client = rawServer(exchange -> {
+            int n = hits.incrementAndGet();
+            String query = exchange.getRequestURI().getQuery();
+            byte[] body = "0123456789".getBytes(StandardCharsets.UTF_8);
+            if (query.contains("/flaky") && n == 1) {
+                exchange.sendResponseHeaders(503, -1);
+                return;
+            }
+            // 0 is chunked: no Content-Length, the size shows only as it arrives.
+            exchange.sendResponseHeaders(200, query.contains("/streamed") ? 0 : body.length);
+            exchange.getResponseBody().write(body);
+        });
+        assertEquals("0123456789", new String(client.downloadFile("sb-1", "/flaky"), StandardCharsets.UTF_8));
+        assertEquals(2, hits.get());
+        ai.aerol.microvm.model.DownloadFileOptions five = new ai.aerol.microvm.model.DownloadFileOptions().setMaxBytes(5L);
+        MicroVMFileTooLargeException sized = assertThrows(MicroVMFileTooLargeException.class, () -> client.downloadFile("sb-1", "/sized", five));
+        assertEquals(5, sized.getMaxBytes());
+        assertEquals("/sized", sized.getPath());
+        assertEquals(10, client.downloadFile("sb-1", "/sized", new ai.aerol.microvm.model.DownloadFileOptions().setMaxBytes(10L)).length);
+        assertThrows(MicroVMFileTooLargeException.class, () -> client.downloadFile("sb-1", "/streamed", five));
+        try (java.io.InputStream in = client.downloadFileStream("sb-1", "/streamed", five)) {
+            byte[] got = new byte[5];
+            int total = 0;
+            while (total < 5) {
+                total += in.read(got, total, 5 - total);
+            }
+            assertEquals("01234", new String(got, StandardCharsets.UTF_8));
+            IOException err = assertThrows(IOException.class, () -> in.read());
+            assertTrue(err.getCause() instanceof MicroVMFileTooLargeException);
+        }
+        // A read with room for more than the limit still hands over the
+        // bytes under it; the read after that fails.
+        try (java.io.InputStream in = client.downloadFileStream("sb-1", "/streamed", five)) {
+            byte[] got = new byte[64];
+            int total = 0;
+            IOException err = null;
+            try {
+                for (int n; (n = in.read(got, total, got.length - total)) >= 0; ) {
+                    total += n;
+                }
+            } catch (IOException e) {
+                err = e;
+            }
+            assertEquals("01234", new String(got, 0, total, StandardCharsets.UTF_8));
+            assertTrue(err != null && err.getCause() instanceof MicroVMFileTooLargeException);
+        }
+        assertEquals(10, client.downloadFile("sb-1", "/streamed", new ai.aerol.microvm.model.DownloadFileOptions().setMaxBytes(10L)).length);
+        SandboxData data = new SandboxData();
+        data.id = "sb-1";
+        Sandbox sandbox = new Sandbox(client, data);
+        assertEquals(10, sandbox.downloadFile("/sized", null).length);
+        try (java.io.InputStream in = sandbox.downloadFileStream("/sized", null)) {
+            assertEquals(10, in.readAllBytes().length);
+        }
+    }
+
+    @Test
+    void downloadErrorsAreApiErrors() throws Exception {
+        MicroVMClient client = rawServer(exchange -> {
+            byte[] body = "{\"error\":\"open /x: no such file or directory\",\"code\":\"file_not_found\"}".getBytes(StandardCharsets.UTF_8);
+            exchange.sendResponseHeaders(404, body.length);
+            exchange.getResponseBody().write(body);
+        });
+        MicroVMApiException err = assertThrows(MicroVMApiException.class, () -> client.downloadFile("sb-1", "/x"));
+        assertEquals(404, err.getStatusCode());
+        assertEquals("file_not_found", err.getCode());
+    }
+
+    @Test
+    void uploadFileStreamSendsTheBodyOnce() throws Exception {
+        List<String> bodies = Collections.synchronizedList(new ArrayList<>());
+        List<String> queries = Collections.synchronizedList(new ArrayList<>());
+        MicroVMClient client = rawServer(exchange -> {
+            bodies.add(new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8));
+            queries.add(String.valueOf(exchange.getRequestURI().getQuery()));
+            exchange.sendResponseHeaders(bodies.size() == 1 ? 503 : 201, -1);
+        });
+        byte[] data = "a".repeat(5000).getBytes(StandardCharsets.UTF_8);
+        MicroVMApiException err = assertThrows(MicroVMApiException.class,
+            () -> client.uploadFileStream("sb-1", "/w/big.bin", new java.io.ByteArrayInputStream(data), null));
+        assertEquals(503, err.getStatusCode());
+        assertEquals(1, bodies.size(), "a streamed upload was re-sent");
+        assertTrue(bodies.get(0).contains("name=\"path\"\r\n\r\n/w/big.bin\r\n"));
+        assertTrue(bodies.get(0).contains("a".repeat(5000)));
+        SandboxData sandboxData = new SandboxData();
+        sandboxData.id = "sb-1";
+        new Sandbox(client, sandboxData).uploadFileStream("/w/x", new java.io.ByteArrayInputStream(new byte[] {1}),
+            new ai.aerol.microvm.model.UploadFileOptions().setCreateOnly(true));
+        assertEquals("create_only=true", queries.get(1));
+    }
 }

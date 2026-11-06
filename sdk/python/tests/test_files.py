@@ -397,3 +397,108 @@ class UploadDirTests(unittest.TestCase):
         client, captured = self._capture(201)
         Sandbox(client, {"id": "sb-1"}).upload_dir(self._folder(), "/w")
         self.assertEqual(len(captured["calls"]), 1)
+
+
+class StreamingTests(unittest.TestCase):
+    """Plan F4: streamed download and upload, and a max_bytes cap."""
+
+    def _serve(self, handler_body):
+        calls = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def _read_body(self):
+                if self.headers.get("Transfer-Encoding", "").lower() == "chunked":
+                    data = b""
+                    while True:
+                        size = int(self.rfile.readline().strip(), 16)
+                        if size == 0:
+                            self.rfile.readline()
+                            return data
+                        data += self.rfile.read(size)
+                        self.rfile.readline()
+                return self.rfile.read(int(self.headers.get("Content-Length") or 0))
+
+            def _handle(self):
+                parsed = urllib.parse.urlsplit(self.path)
+                query = dict(urllib.parse.parse_qsl(parsed.query))
+                if parsed.path.endswith("/toolbox/version"):
+                    body = json.dumps({"version": "t", "features": ["files.write_options"]}).encode()
+                    self.send_response(200)
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
+                calls.append((self.command, query, self.headers.get("Transfer-Encoding"), self._read_body()))
+                handler_body(self, query, len(calls))
+
+            do_GET = do_POST = _handle
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        return MicroVM(f"http://127.0.0.1:{server.server_address[1]}", "pat", config=_FAST_RETRY), calls
+
+    @staticmethod
+    def _send(handler, status, body, *, length=True):
+        handler.send_response(status)
+        if length:
+            handler.send_header("Content-Length", str(len(body)))
+        else:
+            handler.send_header("Connection", "close")
+        handler.end_headers()
+        handler.wfile.write(body)
+
+    def test_download_max_bytes_and_retry(self):
+        import io
+
+        from microvm import MicroVMFileTooLargeError
+
+        def reply(handler, query, n):
+            path = query["path"]
+            if path == "/flaky" and n == 1:
+                self._send(handler, 503, b"")
+            elif path == "/streamed":
+                # No Content-Length: the size shows only as it arrives.
+                self._send(handler, 200, b"x" * 10, length=False)
+            else:
+                self._send(handler, 200, b"0123456789")
+
+        client, calls = self._serve(reply)
+        self.assertEqual(client.download_file("sb-1", "/flaky"), b"0123456789")
+        self.assertEqual(len(calls), 2)
+        with self.assertRaises(MicroVMFileTooLargeError) as ctx:
+            client.download_file("sb-1", "/sized", max_bytes=5)
+        self.assertEqual(ctx.exception.max_bytes, 5)
+        self.assertEqual(client.download_file("sb-1", "/sized", max_bytes=10), b"0123456789")
+        dest = io.BytesIO()
+        with self.assertRaises(MicroVMFileTooLargeError):
+            client.download_file_to("sb-1", "/streamed", dest, max_bytes=4)
+        self.assertEqual(dest.getvalue(), b"xxxx")
+        dest = io.BytesIO()
+        self.assertEqual(client.download_file_to("sb-1", "/streamed", dest, chunk_size=3), 10)
+        self.assertEqual(dest.getvalue(), b"x" * 10)
+
+    def test_upload_file_from_streams_once(self):
+        import io
+
+        from microvm.client import Sandbox
+
+        client, calls = self._serve(lambda handler, query, n: self._send(handler, 503 if n == 1 else 201, b"{}"))
+        with self.assertRaises(MicroVMHTTPError):
+            client.upload_file_from("sb-1", "/w/big.bin", io.BytesIO(b"a" * 5000), chunk_size=1000)
+        self.assertEqual(len(calls), 1, "a streamed upload was re-sent")
+        method, query, encoding, body = calls[0]
+        self.assertEqual((method, encoding), ("POST", "chunked"))
+        self.assertIn(b'name="path"\r\n\r\n/w/big.bin\r\n', body)
+        self.assertIn(b"a" * 5000, body)
+        Sandbox(client, {"id": "sb-1"}).upload_file_from("/w/x", io.BytesIO(b"x"), create_only=True, mode=0o600)
+        self.assertEqual(calls[1][1], {"create_only": "true", "mode": "600"})
+        sandbox = Sandbox(client, {"id": "sb-1"})
+        self.assertEqual(sandbox.download_file("/w/x"), b"{}")
+        self.assertEqual(sandbox.download_file_to("/w/x", io.BytesIO()), 2)

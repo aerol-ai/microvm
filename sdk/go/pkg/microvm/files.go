@@ -2,6 +2,7 @@ package microvm
 
 import (
 	"context"
+	"io"
 
 	sdktypes "github.com/aerol-ai/microvm/sdk/go/pkg/types"
 )
@@ -72,4 +73,16 @@ func (s *Sandbox) FindInFiles(ctx context.Context, path, text string) ([]sdktype
 // once and never retried. It needs an agent that lists files.extract.
 func (s *Sandbox) UploadDir(ctx context.Context, localDir, remoteDir string) error {
 	return s.client.inner.UploadDir(ctx, s.ID, localDir, remoteDir)
+}
+
+// DownloadFileWithOptions reads a whole file, refusing one larger than
+// opts.MaxBytes with ErrFileTooLarge. It retries like DownloadFile.
+func (s *Sandbox) DownloadFileWithOptions(ctx context.Context, targetPath string, opts sdktypes.DownloadFileOptions) ([]byte, error) {
+	return s.client.inner.DownloadFileWithOptions(ctx, s.ID, targetPath, opts)
+}
+
+// DownloadFileStreamWithOptions is DownloadFileStream with a size limit:
+// the read that passes opts.MaxBytes fails with ErrFileTooLarge.
+func (s *Sandbox) DownloadFileStreamWithOptions(ctx context.Context, targetPath string, opts sdktypes.DownloadFileOptions) (io.ReadCloser, error) {
+	return s.client.inner.DownloadFileStreamWithOptions(ctx, s.ID, targetPath, opts)
 }

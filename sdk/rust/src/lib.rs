@@ -22,7 +22,7 @@ use tokio_tungstenite::tungstenite::{Error as WebSocketError, Message};
 
 pub use files::{
     CopyFileOptions, DeleteFileOptions, FileInfo, FileList, FileMatch, ListFilesOptions, MakeDirOptions,
-    MoveFileOptions, UploadFileOptions, DEFAULT_LIST_LIMIT,
+    DownloadFileOptions, MoveFileOptions, UploadFileOptions, DEFAULT_LIST_LIMIT,
 };
 pub use image::Image;
 pub use types::CreateSandboxResponse;
@@ -891,6 +891,26 @@ impl Sandbox {
 
     pub fn download_file(&self, target_path: &str) -> Result<Vec<u8>, Error> {
         self.client.download_file(&self.data.id, target_path)
+    }
+
+    /// Read a file with a size limit. See [`DownloadFileOptions`].
+    pub fn download_file_with_options(&self, target_path: &str, options: DownloadFileOptions) -> Result<Vec<u8>, Error> {
+        self.client.download_file_with_options(&self.data.id, target_path, options)
+    }
+
+    /// Stream a file into `dest`. See [`Client::download_file_to`].
+    pub fn download_file_to(&self, target_path: &str, dest: &mut impl std::io::Write, options: DownloadFileOptions) -> Result<u64, Error> {
+        self.client.download_file_to(&self.data.id, target_path, dest, options)
+    }
+
+    /// Upload from a reader, sent once. See [`Client::upload_file_from`].
+    pub fn upload_file_from(
+        &self,
+        target_path: &str,
+        reader: impl std::io::Read + Send + 'static,
+        options: UploadFileOptions,
+    ) -> Result<(), Error> {
+        self.client.upload_file_from(&self.data.id, target_path, reader, options)
     }
 
     /// Publish a sandbox container port. Pass [`ExposeOptions::default()`] (or
@@ -2156,22 +2176,10 @@ impl Client {
         self.upload_file_with_options(id, target_path, data, UploadFileOptions::default())
     }
 
+    /// Reads a whole file. It retries like any safe call; see
+    /// [`Client::download_file_with_options`] for a size limit.
     pub fn download_file(&self, id: &str, target_path: &str) -> Result<Vec<u8>, Error> {
-        let url = self.full_url(&format!(
-            "{}/sandboxes/{}/toolbox/files/download?path={}",
-            self.version_prefix(),
-            id,
-            urlencoding::encode(target_path)
-        ));
-        let response = self
-            .inner
-            .request(Method::GET, &url)
-            .authorize(self)
-            .send()?;
-        self.handle_response(response)?
-            .bytes()
-            .map_err(Error::Reqwest)
-            .map(|bytes| bytes.to_vec())
+        self.download_file_with_options(id, target_path, DownloadFileOptions::default())
     }
 
     pub fn expose_port(
@@ -2443,6 +2451,35 @@ impl Client {
         done_code: Option<&str>,
         body: impl Fn(reqwest::blocking::RequestBuilder) -> reqwest::blocking::RequestBuilder,
     ) -> Result<(U, reqwest::header::HeaderMap), Error> {
+        let Some(response) = self.send_raw_with_retry(method, path, policy, headers, done_code, body)? else {
+            let body = serde_json::from_str("null").map_err(Error::SerdeJson)?;
+            return Ok((body, reqwest::header::HeaderMap::new()));
+        };
+        let headers = response.headers().clone();
+        if response.status() == reqwest::StatusCode::NO_CONTENT {
+            let body = serde_json::from_str("null").map_err(Error::SerdeJson)?;
+            return Ok((body, headers));
+        }
+        // A success may come with no body at all (the toolbox's mkdir
+        // answers a bare 201): read it as null.
+        let text = response.text().map_err(Error::Reqwest)?;
+        let text = if text.trim().is_empty() { "null" } else { text.as_str() };
+        Ok((serde_json::from_str(text).map_err(Error::SerdeJson)?, headers))
+    }
+
+    /// The retry loop itself. It returns the first successful response with
+    /// its body unread (a download streams it), or `None` when a retry found
+    /// its work done (`done_code`). Nothing is retried once a response is
+    /// returned.
+    fn send_raw_with_retry(
+        &self,
+        method: Method,
+        path: &str,
+        policy: RetryPolicy,
+        headers: &[(&str, &str)],
+        done_code: Option<&str>,
+        body: impl Fn(reqwest::blocking::RequestBuilder) -> reqwest::blocking::RequestBuilder,
+    ) -> Result<Option<reqwest::blocking::Response>, Error> {
         let max_retries = self.retry_config.max_retries.unwrap_or(3);
 
         let mut attempt = 0;
@@ -2471,8 +2508,7 @@ impl Client {
                         let body = response.text().unwrap_or_default();
                         let err = ApiError::from_response(status, header_retry_after.as_deref(), &body);
                         if err.code() == Some(code) {
-                            let body = serde_json::from_str("null").map_err(Error::SerdeJson)?;
-                            return Ok((body, reqwest::header::HeaderMap::new()));
+                            return Ok(None);
                         }
                         if attempt >= max_retries || !policy.retries_status(status) {
                             return Err(Error::Api(err));
@@ -2483,17 +2519,7 @@ impl Client {
                         // frees the connection before the wait.
                         retry_after = retry_after_hint(&response);
                     } else {
-                        let response = self.handle_response(response)?;
-                        let headers = response.headers().clone();
-                        if response.status() == reqwest::StatusCode::NO_CONTENT {
-                            let body = serde_json::from_str("null").map_err(Error::SerdeJson)?;
-                            return Ok((body, headers));
-                        }
-                        // A success may come with no body at all (the
-                        // toolbox's mkdir answers a bare 201): read it as null.
-                        let text = response.text().map_err(Error::Reqwest)?;
-                        let text = if text.trim().is_empty() { "null" } else { text.as_str() };
-                        return Ok((serde_json::from_str(text).map_err(Error::SerdeJson)?, headers));
+                        return self.handle_response(response).map(Some);
                     }
                 }
                 Err(err) => {

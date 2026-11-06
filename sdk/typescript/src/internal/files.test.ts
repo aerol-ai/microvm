@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { APIClient, DEFAULT_LIST_LIMIT, SandboxResource } from "./client.js";
-import { MicroVMApiError, MicroVMUnsupportedFeatureError } from "../errors.js";
+import { MicroVMApiError, MicroVMFileTooLargeError, MicroVMUnsupportedFeatureError } from "../errors.js";
 import type { Sandbox } from "../types.js";
 
 // File verbs beyond upload and download (plans/agent-sandbox-feature-
@@ -295,4 +295,79 @@ test("uploadDir sends the folder as a gzipped tar with extract=true, once", asyn
   const ok = fakeToolbox(() => ({ status: 201, body: {} }), ["files.extract"]);
   await new SandboxResource(ok.client, { id: "sb-1" } as Sandbox).uploadDir(root, "/w");
   assert.equal(ok.calls.length, 1);
+});
+
+test("downloadFile and downloadFileStream honour maxBytes; downloads retry until the file starts", async () => {
+  let calls = 0;
+  const client = new APIClient({
+    baseURL: "https://api.example.com",
+    patToken: "pat",
+    retry: { maxRetries: 3, baseDelayMs: 1, maxDelayMs: 1 },
+    fetch: async (input) => {
+      calls++;
+      const path = new URL(String(input)).searchParams.get("path");
+      if (path === "/flaky" && calls === 1) return new Response(null, { status: 503 });
+      if (path === "/streamed") {
+        // No Content-Length: the size shows only as it arrives.
+        return new Response(new ReadableStream({ start(c) { c.enqueue(new TextEncoder().encode("xxxxx")); c.enqueue(new TextEncoder().encode("xxxxx")); c.close(); } }));
+      }
+      return new Response("0123456789", { headers: { "content-length": "10" } });
+    },
+  });
+  assert.equal(new TextDecoder().decode(await client.downloadFile("sb-1", "/flaky")), "0123456789");
+  assert.equal(calls, 2);
+  await assert.rejects(client.downloadFile("sb-1", "/sized", { maxBytes: 5 }), (e: unknown) => e instanceof MicroVMFileTooLargeError && e.maxBytes === 5);
+  assert.equal((await client.downloadFile("sb-1", "/sized", { maxBytes: 10 })).length, 10);
+  const stream = await client.downloadFileStream("sb-1", "/streamed", { maxBytes: 7 });
+  const reader = stream.getReader();
+  const got: number[] = [];
+  await assert.rejects(
+    (async () => {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) return;
+        got.push(...value);
+      }
+    })(),
+    MicroVMFileTooLargeError,
+  );
+  assert.equal(got.length, 7);
+  assert.equal((await client.downloadFile("sb-1", "/streamed", { maxBytes: 10 })).length, 10);
+  const unlimited = await client.downloadFileStream("sb-1", "/sized");
+  assert.equal(new TextDecoder().decode(new Uint8Array(await new Response(unlimited).arrayBuffer())), "0123456789");
+});
+
+test("uploadFileStream streams the body once", async () => {
+  const seen: { url: string; body: string }[] = [];
+  const client = new APIClient({
+    baseURL: "https://api.example.com",
+    patToken: "pat",
+    retry: { maxRetries: 3, baseDelayMs: 1, maxDelayMs: 1 },
+    fetch: async (input, init) => {
+      const request = new Request(input, init);
+      if (request.url.endsWith("/toolbox/version")) {
+        return new Response(JSON.stringify({ version: "t", features: ["files.write_options"] }));
+      }
+      seen.push({ url: request.url, body: await request.text() });
+      return new Response(null, { status: seen.length === 1 ? 503 : 201 });
+    },
+  });
+  async function* chunks() {
+    yield new TextEncoder().encode("a".repeat(3000));
+    yield new TextEncoder().encode("b".repeat(3000));
+  }
+  await assert.rejects(client.uploadFileStream("sb-1", "/w/big.bin", chunks()), (e: unknown) => e instanceof MicroVMApiError && e.status === 503);
+  assert.equal(seen.length, 1, "a streamed upload was re-sent");
+  assert.ok(seen[0].body.includes('name="path"\r\n\r\n/w/big.bin\r\n'));
+  assert.ok(seen[0].body.includes("a".repeat(3000) + "b".repeat(3000)));
+  const stream = new ReadableStream<Uint8Array>({ start(c) { c.enqueue(new TextEncoder().encode("s")); c.close(); } });
+  const sandbox = new SandboxResource(client, { id: "sb-1" } as Sandbox);
+  await sandbox.uploadFileStream("/w/s", stream, { createOnly: true });
+  assert.ok(seen[1].url.endsWith("?create_only=true"));
+  const read = new SandboxResource(
+    new APIClient({ baseURL: "https://api.example.com", patToken: "pat", fetch: async () => new Response("hi") }),
+    { id: "sb-1" } as Sandbox,
+  );
+  assert.equal(new TextDecoder().decode(await read.downloadFile("/w/s")), "hi");
+  assert.equal(await new Response(await read.downloadFileStream("/w/s")).text(), "hi");
 });

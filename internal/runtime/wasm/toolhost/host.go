@@ -157,6 +157,10 @@ func isUnsupportedWasmToolboxRoute(r *http.Request) bool {
 		return true
 	case r.Method == http.MethodGet && (path == "/files/info" || path == "/files/search" || path == "/files/find"):
 		return true
+	case r.Method == http.MethodHead && path == "/files/download":
+		// Plan F4: HEAD and Range are toolboxd's; this host serves the
+		// plain download only.
+		return true
 	case path == "/lsp" || strings.HasPrefix(path, "/lsp/"):
 		return true
 	case path == "/process/pty" || strings.HasPrefix(path, "/process/pty/"):

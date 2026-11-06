@@ -14,6 +14,7 @@ import ai.aerol.microvm.model.ListFilesOptions;
 import ai.aerol.microvm.model.MakeDirOptions;
 import ai.aerol.microvm.model.MoveFileOptions;
 import ai.aerol.microvm.model.UploadFileOptions;
+import ai.aerol.microvm.model.DownloadFileOptions;
 import ai.aerol.microvm.model.CreateSnapshotOptions;
 import ai.aerol.microvm.model.CreateSessionOptions;
 import ai.aerol.microvm.model.CustomDomain;
@@ -134,6 +135,21 @@ public class Sandbox extends SandboxData {
 
     public byte[] downloadFile(String targetPath) {
         return client.downloadFile(id, targetPath);
+    }
+
+    /** Reads a whole file with a size limit. See {@link DownloadFileOptions}. */
+    public byte[] downloadFile(String targetPath, DownloadFileOptions options) {
+        return client.downloadFile(id, targetPath, options);
+    }
+
+    /** Opens a file as a stream. See {@link MicroVMClient#downloadFileStream}. */
+    public java.io.InputStream downloadFileStream(String targetPath, DownloadFileOptions options) {
+        return client.downloadFileStream(id, targetPath, options);
+    }
+
+    /** Uploads from a stream, sent once. See {@link MicroVMClient#uploadFileStream}. */
+    public void uploadFileStream(String targetPath, java.io.InputStream data, UploadFileOptions options) {
+        client.uploadFileStream(id, targetPath, data, options);
     }
 
     /** Lists a folder. See {@link ListFilesOptions}; {@code truncated} means more entries exist. */

@@ -57,3 +57,19 @@ export class MicroVMUnsupportedFeatureError extends Error {
     this.agentVersion = agentVersion;
   }
 }
+
+/**
+ * A download was larger than its `maxBytes`. Thrown before reading when the
+ * server states the size, otherwise as soon as more arrives.
+ */
+export class MicroVMFileTooLargeError extends Error {
+  readonly path: string;
+  readonly maxBytes: number;
+
+  constructor(path: string, maxBytes: number) {
+    super(`${path} is larger than maxBytes (${maxBytes} bytes)`);
+    this.name = "MicroVMFileTooLargeError";
+    this.path = path;
+    this.maxBytes = maxBytes;
+  }
+}

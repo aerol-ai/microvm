@@ -878,42 +878,12 @@ func (c *Client) UploadFileStream(ctx context.Context, id, targetPath string, r 
 // first window of a large file, say) ends the transfer. The request retries
 // like any other GET until the response headers arrive.
 func (c *Client) DownloadFileStream(ctx context.Context, id, targetPath string) (io.ReadCloser, error) {
-	path := c.versionPrefix + "/sandboxes/" + id + "/toolbox/files/download?path=" + url.QueryEscape(targetPath)
-	response, err := c.doWithRetry(ctx, retryIdempotent, func() (*http.Request, error) {
-		request, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+path, nil)
-		if err != nil {
-			return nil, err
-		}
-		c.addAuth(request)
-		return request, nil
-	})
-	if err != nil {
-		return nil, err
-	}
-	if response.StatusCode >= 400 {
-		defer response.Body.Close()
-		return nil, decodeError(response)
-	}
-	return response.Body, nil
+	return c.DownloadFileStreamWithOptions(ctx, id, targetPath, sdktypes.DownloadFileOptions{})
 }
 
+// DownloadFile reads the whole of targetPath. It retries like any safe call.
 func (c *Client) DownloadFile(ctx context.Context, id, targetPath string) ([]byte, error) {
-	encodedPath := url.QueryEscape(targetPath)
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+c.versionPrefix+"/sandboxes/"+id+"/toolbox/files/download?path="+encodedPath, nil)
-	if err != nil {
-		return nil, err
-	}
-	c.addAuth(request)
-
-	response, err := c.httpClient.Do(request)
-	if err != nil {
-		return nil, err
-	}
-	defer response.Body.Close()
-	if response.StatusCode >= 400 {
-		return nil, decodeError(response)
-	}
-	return io.ReadAll(response.Body)
+	return c.DownloadFileWithOptions(ctx, id, targetPath, sdktypes.DownloadFileOptions{})
 }
 
 // ExposePort publishes a sandbox container port. Pass an empty protocol to

@@ -36,6 +36,8 @@ var (
 	ErrConflict              = apiclient.ErrConflict
 	ErrNameLookupUnsupported = apiclient.ErrNameLookupUnsupported
 	ErrUnsupportedFeature    = apiclient.ErrUnsupportedFeature
+	// ErrFileTooLarge means a download was larger than its MaxBytes.
+	ErrFileTooLarge = apiclient.ErrFileTooLarge
 )
 
 const defaultAPIURL = "http://127.0.0.1:21212"

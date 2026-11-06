@@ -507,7 +507,7 @@ func (s *server) routes() http.Handler {
 				return
 			}
 			s.handleUpload(w, r)
-		case r.Method == http.MethodGet && r.URL.Path == "/files/download":
+		case (r.Method == http.MethodGet || r.Method == http.MethodHead) && r.URL.Path == "/files/download":
 			if !s.requireAuth(w, r) {
 				return
 			}
@@ -865,11 +865,20 @@ func (s *server) handleDownload(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", filepath.Base(targetPath)))
-	if info.Mode().IsRegular() {
-		w.Header().Set("Content-Length", strconv.FormatInt(info.Size(), 10))
+	if info.Mode().IsRegular() && info.Size() > 0 {
+		// Range (206, 416 for a range past the end), HEAD, Last-Modified
+		// and If-Modified-Since, from the standard library (plan F4).
+		// ServeContent keeps the Content-Type set above.
+		http.ServeContent(w, r, filepath.Base(targetPath), info.ModTime(), f)
+		return
 	}
+	// A device, a pipe, or a file whose size the kernel reports as 0 while
+	// it has content (/proc): its length is unknown, so it streams to the
+	// end with no Content-Length and no Range.
 	w.WriteHeader(http.StatusOK)
-	_, _ = io.Copy(w, f)
+	if r.Method != http.MethodHead {
+		_, _ = io.Copy(w, f)
+	}
 }
 
 func (s *server) handleSetAllowedPorts(w http.ResponseWriter, r *http.Request) {

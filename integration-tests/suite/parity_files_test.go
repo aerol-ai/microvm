@@ -414,3 +414,49 @@ func TestParityUploadDirLive(t *testing.T) {
 		t.Fatalf("copied-out symlink = %q, %v", target, err)
 	}
 }
+
+// UC-377 — downloads through the v1 toolbox pass-through answer Range (206,
+// 416 past the end) and HEAD (no body), and the SDK's MaxBytes refuses a
+// file larger than asked for (F4).
+func TestParityDownloadRangeAndMaxBytes(t *testing.T) {
+	harness.Require(t, sc, "UC-377")
+	sb := paritySandbox(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	file := "/tmp/uc377/data.txt"
+	if err := sb.UploadFile(ctx, file, []byte("0123456789")); err != nil {
+		t.Fatalf("upload: %v", err)
+	}
+	path := "/v1/sandboxes/" + sb.ID + "/toolbox/files/download?path=" + url.QueryEscape(file)
+	if st, body := fcDo(t, ctx, http.MethodGet, "", path, nil, map[string]string{"Range": "bytes=2-5"}); st != http.StatusPartialContent || string(body) != "2345" {
+		t.Fatalf("Range bytes=2-5 = %d %q, want 206 \"2345\"", st, body)
+	}
+	if st, body := fcDo(t, ctx, http.MethodGet, "", path, nil, map[string]string{"Range": "bytes=-3"}); st != http.StatusPartialContent || string(body) != "789" {
+		t.Fatalf("Range bytes=-3 = %d %q", st, body)
+	}
+	if st, _ := fcDo(t, ctx, http.MethodGet, "", path, nil, map[string]string{"Range": "bytes=100-200"}); st != http.StatusRequestedRangeNotSatisfiable {
+		t.Fatalf("Range past the end = %d, want 416", st)
+	}
+	if st, body := fcDo(t, ctx, http.MethodHead, "", path, nil, nil); st != http.StatusOK || len(body) != 0 {
+		t.Fatalf("HEAD = %d with %d body bytes", st, len(body))
+	}
+
+	if _, err := sb.DownloadFileWithOptions(ctx, file, sdktypes.DownloadFileOptions{MaxBytes: 5}); !errors.Is(err, microvm.ErrFileTooLarge) {
+		t.Fatalf("MaxBytes 5 on a 10-byte file = %v, want ErrFileTooLarge", err)
+	}
+	if data, err := sb.DownloadFileWithOptions(ctx, file, sdktypes.DownloadFileOptions{MaxBytes: 10}); err != nil || string(data) != "0123456789" {
+		t.Fatalf("MaxBytes 10 = %q, %v", data, err)
+	}
+	// A file whose size reads as 0 but has content (/proc): it streams with
+	// no length, and the cap still holds as it arrives.
+	body, err := sb.DownloadFileStreamWithOptions(ctx, "/proc/self/status", sdktypes.DownloadFileOptions{MaxBytes: 16})
+	if err != nil {
+		t.Fatalf("open /proc/self/status: %v", err)
+	}
+	_, err = io.ReadAll(body)
+	body.Close()
+	if !errors.Is(err, microvm.ErrFileTooLarge) {
+		t.Fatalf("reading /proc/self/status capped at 16 bytes = %v, want ErrFileTooLarge", err)
+	}
+}

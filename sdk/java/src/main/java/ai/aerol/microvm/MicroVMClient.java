@@ -77,6 +77,7 @@ import ai.aerol.microvm.model.ListFilesOptions;
 import ai.aerol.microvm.model.MakeDirOptions;
 import ai.aerol.microvm.model.MoveFileOptions;
 import ai.aerol.microvm.model.UploadFileOptions;
+import ai.aerol.microvm.model.DownloadFileOptions;
 import ai.aerol.microvm.model.HealthStatus;
 import ai.aerol.microvm.model.IngressTarget;
 import ai.aerol.microvm.model.Lifecycle;
@@ -928,6 +929,23 @@ public class MicroVMClient {
      */
     public void uploadFile(String sandboxId, String targetPath, byte[] data, UploadFileOptions options) {
         UploadFileOptions opts = options == null ? new UploadFileOptions() : options;
+        Map<String, String> query = uploadQuery(sandboxId, opts);
+        String boundary = "----microvm-" + UUID.randomUUID();
+        byte[] body = buildMultipartBody(boundary, targetPath, data);
+        HttpResponse<byte[]> response = sendRequest(
+            "POST",
+            toolboxPath(sandboxId, "/files/upload", query),
+            HttpRequest.BodyPublishers.ofByteArray(body),
+            "multipart/form-data; boundary=" + boundary,
+            null,
+            opts.append || opts.createOnly ? RetryMode.UNSENT_ONLY : RetryMode.IDEMPOTENT
+        );
+        ensureSuccess(response);
+    }
+
+    /** The upload's write options as query, after the /version check they need. */
+    private Map<String, String> uploadQuery(String sandboxId, UploadFileOptions options) {
+        UploadFileOptions opts = options == null ? new UploadFileOptions() : options;
         Map<String, String> query = new java.util.LinkedHashMap<>();
         if (opts.append) {
             query.put("append", "true");
@@ -945,28 +963,138 @@ public class MicroVMClient {
             // An older agent ignores these; create_only would replace a file.
             requireToolboxFeatures(sandboxId, FEATURE_WRITE_OPTIONS);
         }
-        String boundary = "----microvm-" + UUID.randomUUID();
-        byte[] body = buildMultipartBody(boundary, targetPath, data);
-        HttpResponse<byte[]> response = sendRequest(
-            "POST",
-            toolboxPath(sandboxId, "/files/upload", query),
-            HttpRequest.BodyPublishers.ofByteArray(body),
-            "multipart/form-data; boundary=" + boundary,
-            null,
-            opts.append || opts.createOnly ? RetryMode.UNSENT_ONLY : RetryMode.IDEMPOTENT
-        );
-        ensureSuccess(response);
+        return query;
     }
 
     public byte[] downloadFile(String sandboxId, String targetPath) {
-        HttpResponse<byte[]> response = sendRequest(
+        return downloadFile(sandboxId, targetPath, null);
+    }
+
+    /** Reads a whole file, refusing one larger than {@code options.maxBytes}. Retries like any safe call. */
+    public byte[] downloadFile(String sandboxId, String targetPath, DownloadFileOptions options) {
+        try (java.io.InputStream in = downloadFileStream(sandboxId, targetPath, options)) {
+            return in.readAllBytes();
+        } catch (MicroVMException ex) {
+            throw ex;
+        } catch (IOException ex) {
+            if (ex.getCause() instanceof MicroVMFileTooLargeException) {
+                throw (MicroVMFileTooLargeException) ex.getCause();
+            }
+            throw new MicroVMException("read " + targetPath + ": " + ex.getMessage(), ex);
+        }
+    }
+
+    /**
+     * Opens a file for reading a piece at a time, so a large file never sits
+     * in memory; close the stream when done. With {@code maxBytes}, a larger
+     * file is refused before reading when the server states the size, and
+     * otherwise the read that passes the limit throws an IOException whose
+     * cause is a {@link MicroVMFileTooLargeException}. The request retries
+     * until the file starts to arrive (plans/agent-sandbox-feature-parity.md,
+     * F4).
+     */
+    public java.io.InputStream downloadFileStream(String sandboxId, String targetPath, DownloadFileOptions options) {
+        HttpResponse<java.io.InputStream> response = send(
             "GET",
-            sandboxPath(sandboxId) + "/toolbox/files/download?path=" + encodeQueryValue(targetPath),
+            toolboxPath(sandboxId, "/files/download", Map.of("path", targetPath)),
             HttpRequest.BodyPublishers.noBody(),
-            null
+            null,
+            null,
+            RetryMode.IDEMPOTENT,
+            null,
+            HttpResponse.BodyHandlers.ofInputStream()
         );
-        ensureSuccess(response);
-        return response.body();
+        java.io.InputStream body = response.body();
+        if (response.statusCode() >= 400) {
+            byte[] error;
+            try (java.io.InputStream in = body) {
+                error = in.readAllBytes();
+            } catch (IOException ex) {
+                error = new byte[0];
+            }
+            throwApiError(response.statusCode(), response.headers().firstValue("Retry-After").orElse(null), error);
+        }
+        Long max = options == null ? null : options.maxBytes;
+        if (max == null) {
+            return body;
+        }
+        long length = response.headers().firstValueAsLong("Content-Length").orElse(-1);
+        if (length > max) {
+            try {
+                body.close();
+            } catch (IOException ignored) {
+                // The refusal is the error that matters.
+            }
+            throw new MicroVMFileTooLargeException(targetPath, max);
+        }
+        return new CappedInputStream(body, targetPath, max);
+    }
+
+    /** Fails the read that would pass the limit, instead of quietly cutting the file short. */
+    private static final class CappedInputStream extends java.io.FilterInputStream {
+        private final String path;
+        private final long max;
+        private long left;
+        private boolean over;
+
+        CappedInputStream(java.io.InputStream in, String path, long max) {
+            super(in);
+            this.path = path;
+            this.max = max;
+            this.left = max;
+        }
+
+        @Override
+        public int read() throws IOException {
+            byte[] one = new byte[1];
+            int n = read(one, 0, 1);
+            return n < 0 ? -1 : one[0] & 0xff;
+        }
+
+        @Override
+        public int read(byte[] b, int off, int len) throws IOException {
+            if (over) {
+                throw new IOException(new MicroVMFileTooLargeException(path, max));
+            }
+            if (len == 0) {
+                return 0;
+            }
+            // Read one byte past the limit to tell "exactly the limit" from "more".
+            int n = super.read(b, off, (int) Math.min(len, left + 1));
+            if (n > left) {
+                // Past the limit: hand over the bytes under it first, as the
+                // other SDKs do, and fail the next read.
+                int under = (int) left;
+                left = 0;
+                over = true;
+                if (under == 0) {
+                    throw new IOException(new MicroVMFileTooLargeException(path, max));
+                }
+                return under;
+            }
+            if (n > 0) {
+                left -= n;
+            }
+            return n;
+        }
+    }
+
+    /**
+     * Uploads from {@code data} a piece at a time, so a large file never sits
+     * in memory. The options are {@link #uploadFile(String, String, byte[],
+     * UploadFileOptions)}'s. The data is read as it is sent, so it is sent
+     * once and never retried.
+     */
+    public void uploadFileStream(String sandboxId, String targetPath, java.io.InputStream data, UploadFileOptions options) {
+        String path = toolboxPath(sandboxId, "/files/upload", uploadQuery(sandboxId, options));
+        String boundary = "----microvm-" + UUID.randomUUID();
+        byte[] head = ("--" + boundary + "\r\nContent-Disposition: form-data; name=\"path\"\r\n\r\n" + targetPath + "\r\n"
+            + "--" + boundary + "\r\nContent-Disposition: form-data; name=\"file\"; filename=\"" + baseName(targetPath) + "\"\r\n"
+            + "Content-Type: application/octet-stream\r\n\r\n").getBytes(StandardCharsets.UTF_8);
+        byte[] tail = ("\r\n--" + boundary + "--\r\n").getBytes(StandardCharsets.UTF_8);
+        HttpRequest.BodyPublisher body = HttpRequest.BodyPublishers.ofInputStream(() -> new java.io.SequenceInputStream(
+            java.util.Collections.enumeration(List.of(new java.io.ByteArrayInputStream(head), data, new java.io.ByteArrayInputStream(tail)))));
+        ensureSuccess(sendRequest("POST", path, body, "multipart/form-data; boundary=" + boundary, null, RetryMode.NEVER));
     }
 
     // File verbs beyond upload and download (plans/agent-sandbox-feature-
@@ -1799,6 +1927,15 @@ public class MicroVMClient {
      * for success. Without a {@code doneCode} it never returns {@code null}.
      */
     private HttpResponse<byte[]> sendRequest(String method, String path, HttpRequest.BodyPublisher bodyPublisher, String contentType, Map<String, String> extraHeaders, RetryMode retryMode, String doneCode) {
+        return send(method, path, bodyPublisher, contentType, extraHeaders, retryMode, doneCode, HttpResponse.BodyHandlers.ofByteArray());
+    }
+
+    /**
+     * The retry loop itself, for any body handler: a download streams its
+     * body ({@code ofInputStream}) and is retried only until the response
+     * arrives. {@code doneCode} needs a byte[] body.
+     */
+    private <T> HttpResponse<T> send(String method, String path, HttpRequest.BodyPublisher bodyPublisher, String contentType, Map<String, String> extraHeaders, RetryMode retryMode, String doneCode, HttpResponse.BodyHandler<T> handler) {
         int maxRetries = retryConfig.maxRetries != null ? retryConfig.maxRetries : 3;
         int baseDelay = retryConfig.baseDelayMs != null ? retryConfig.baseDelayMs : 200;
         int maxDelay = retryConfig.maxDelayMs != null ? retryConfig.maxDelayMs : 5000;
@@ -1823,13 +1960,18 @@ public class MicroVMClient {
             }
 
             try {
-                HttpResponse<byte[]> response = httpClient.send(builder.build(), HttpResponse.BodyHandlers.ofByteArray());
-                if (doneCode != null && attempt > 0 && response.statusCode() >= 400 && doneCode.equals(errorCode(response.body()))) {
+                HttpResponse<T> response = httpClient.send(builder.build(), handler);
+                if (doneCode != null && attempt > 0 && response.statusCode() >= 400
+                    && response.body() instanceof byte[] && doneCode.equals(errorCode((byte[]) response.body()))) {
                     return null;
                 }
                 if (attempt < maxRetries && retryMode.retriesStatus(response.statusCode())) {
                     // Fall through to retry logic
                     retryAfter = RetryAfter.hint(response);
+                    if (response.body() instanceof java.io.InputStream) {
+                        // Free the connection before the wait.
+                        ((java.io.InputStream) response.body()).close();
+                    }
                 } else {
                     return response;
                 }
@@ -1873,6 +2015,12 @@ public class MicroVMClient {
         if (response.statusCode() >= 400) {
             throw apiException(response.statusCode(), response.headers().firstValue("Retry-After").orElse(null), response.body());
         }
+    }
+
+    // Throws the API error for a failed response; the streaming download
+    // paths call it where a value-returning helper would not read well.
+    private static void throwApiError(int status, String retryAfterHeader, byte[] body) {
+        throw apiException(status, retryAfterHeader, body);
     }
 
     private static MicroVMApiException apiException(int status, String retryAfterHeader, byte[] body) {

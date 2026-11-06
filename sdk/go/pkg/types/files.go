@@ -105,3 +105,12 @@ type UploadFileOptions struct {
 	// leaves an existing file's permissions and gives a new file 0644.
 	Mode os.FileMode
 }
+
+// DownloadFileOptions controls a download.
+type DownloadFileOptions struct {
+	// MaxBytes refuses a file larger than this many bytes (0 is no limit):
+	// before reading when the server states the size, and otherwise as soon
+	// as more arrives. A guard against filling memory with a file larger
+	// than expected.
+	MaxBytes int64
+}

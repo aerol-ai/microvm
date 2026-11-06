@@ -11,7 +11,7 @@ import {
   sandboxCustomDomainPath as v1SandboxCustomDomainPath,
   sandboxCustomDomainsPath as v1SandboxCustomDomainsPath,
 } from "./api/v1/paths.js";
-import { MicroVMApiError, MicroVMUnsupportedFeatureError } from "../errors.js";
+import { MicroVMApiError, MicroVMFileTooLargeError, MicroVMUnsupportedFeatureError } from "../errors.js";
 import { Image } from "../Image.js";
 import type {
   AddCustomDomainOptions,
@@ -48,6 +48,7 @@ import type {
   FileList,
   FileMatch,
   UploadFileOptions,
+  DownloadFileOptions,
   ListFilesOptions,
   DeleteFileOptions,
   MakeDirOptions,
@@ -1188,6 +1189,19 @@ export class APIClient {
    * or find the first one's file.
    */
   async uploadFile(id: string, targetPath: string, data: BinaryLike, options: UploadFileOptions = {}): Promise<void> {
+    const path = await this.uploadPath(id, options);
+    const form = new FormData();
+    form.set("path", targetPath);
+    form.set("file", toBlob(data), basename(targetPath));
+
+    const response = await this.request("POST", path, { body: form }, { idempotent: !(options.append || options.createOnly) });
+    if (!response.ok) {
+      throw await decodeError(response);
+    }
+  }
+
+  /** The upload route with the write options as query, after the /version check they need. */
+  private async uploadPath(id: string, options: UploadFileOptions): Promise<string> {
     const query = new URLSearchParams();
     if (options.append) query.set("append", "true");
     if (options.createOnly) query.set("create_only", "true");
@@ -1197,12 +1211,58 @@ export class APIClient {
       // An older agent ignores these; createOnly would replace a file.
       await this.requireToolboxFeatures(id, FEATURE_WRITE_OPTIONS);
     }
-    const form = new FormData();
-    form.set("path", targetPath);
-    form.set("file", toBlob(data), basename(targetPath));
+    return `${this.versionPrefix}/sandboxes/${id}/toolbox/files/upload${query.size > 0 ? `?${query.toString()}` : ""}`;
+  }
 
-    const path = `${this.versionPrefix}/sandboxes/${id}/toolbox/files/upload${query.size > 0 ? `?${query.toString()}` : ""}`;
-    const response = await this.request("POST", path, { body: form }, { idempotent: !(options.append || options.createOnly) });
+  /**
+   * Upload from a stream a piece at a time, so a large file never sits in
+   * memory. The options are {@link uploadFile}'s. The data is read as it is
+   * sent, so the request is sent once and never retried. Needs a `fetch` that
+   * can send a streamed body (Node.js 18 and later).
+   */
+  async uploadFileStream(
+    id: string,
+    targetPath: string,
+    data: ReadableStream<Uint8Array> | AsyncIterable<Uint8Array>,
+    options: UploadFileOptions = {},
+  ): Promise<void> {
+    const path = await this.uploadPath(id, options);
+    const boundary = `----aerolvm-${newIdempotencyKey()}`;
+    const encoder = new TextEncoder();
+    const head = encoder.encode(
+      `--${boundary}\r\nContent-Disposition: form-data; name="path"\r\n\r\n${targetPath}\r\n` +
+        `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="${basename(targetPath)}"\r\n` +
+        "Content-Type: application/octet-stream\r\n\r\n",
+    );
+    const tail = encoder.encode(`\r\n--${boundary}--\r\n`);
+    const parts = (async function* () {
+      yield head;
+      if (data instanceof ReadableStream) {
+        const reader = data.getReader();
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          yield value;
+        }
+      } else {
+        yield* data;
+      }
+      yield tail;
+    })();
+    const body = new ReadableStream<Uint8Array>({
+      async pull(controller) {
+        const next = await parts.next();
+        if (next.done) controller.close();
+        else controller.enqueue(next.value);
+      },
+    });
+    const init = {
+      body,
+      // Node's fetch sends a streamed body only with duplex "half".
+      duplex: "half",
+      headers: { "Content-Type": `multipart/form-data; boundary=${boundary}` },
+    } as RequestInit;
+    const response = await this.request("POST", path, init, { idempotent: false, sendOnce: true });
     if (!response.ok) {
       throw await decodeError(response);
     }
@@ -1236,12 +1296,46 @@ export class APIClient {
     }
   }
 
-  async downloadFile(id: string, targetPath: string): Promise<Uint8Array> {
+  async downloadFile(id: string, targetPath: string, options: DownloadFileOptions = {}): Promise<Uint8Array> {
+    const stream = await this.downloadFileStream(id, targetPath, options);
+    return new Uint8Array(await new Response(stream).arrayBuffer());
+  }
+
+  /**
+   * Open a file for reading a piece at a time, so a large file never sits in
+   * memory. With `maxBytes`, a larger file is refused before reading when the
+   * server states the size, and otherwise the stream errors as soon as more
+   * arrives. The request retries until the file starts to arrive.
+   */
+  async downloadFileStream(id: string, targetPath: string, options: DownloadFileOptions = {}): Promise<ReadableStream<Uint8Array>> {
     const response = await this.request("GET", `${this.versionPrefix}/sandboxes/${id}/toolbox/files/download?path=${encodeURIComponent(targetPath)}`);
     if (!response.ok) {
       throw await decodeError(response);
     }
-    return new Uint8Array(await response.arrayBuffer());
+    const body = response.body ?? new Response(new Uint8Array()).body!;
+    const max = options.maxBytes;
+    if (max === undefined) {
+      return body;
+    }
+    const length = response.headers.get("content-length");
+    if (length !== null && Number(length) > max) {
+      await body.cancel().catch(() => undefined);
+      throw new MicroVMFileTooLargeError(targetPath, max);
+    }
+    let seen = 0;
+    return body.pipeThrough(
+      new TransformStream<Uint8Array, Uint8Array>({
+        transform(chunk, controller) {
+          if (seen + chunk.length > max) {
+            controller.enqueue(chunk.subarray(0, max - seen));
+            controller.error(new MicroVMFileTooLargeError(targetPath, max));
+            return;
+          }
+          seen += chunk.length;
+          controller.enqueue(chunk);
+        },
+      }),
+    );
   }
 
   // File verbs beyond upload and download (plans/agent-sandbox-feature-
@@ -1930,8 +2024,22 @@ export class SandboxResource implements Sandbox {
     await this.client.uploadFile(this.id, targetPath, data, options);
   }
 
-  async downloadFile(targetPath: string): Promise<Uint8Array> {
-    return this.client.downloadFile(this.id, targetPath);
+  async downloadFile(targetPath: string, options: DownloadFileOptions = {}): Promise<Uint8Array> {
+    return this.client.downloadFile(this.id, targetPath, options);
+  }
+
+  /** Read a file as a stream. See {@link APIClient.downloadFileStream}. */
+  async downloadFileStream(targetPath: string, options: DownloadFileOptions = {}): Promise<ReadableStream<Uint8Array>> {
+    return this.client.downloadFileStream(this.id, targetPath, options);
+  }
+
+  /** Upload from a stream, sent once. See {@link APIClient.uploadFileStream}. */
+  async uploadFileStream(
+    targetPath: string,
+    data: ReadableStream<Uint8Array> | AsyncIterable<Uint8Array>,
+    options: UploadFileOptions = {},
+  ): Promise<void> {
+    await this.client.uploadFileStream(this.id, targetPath, data, options);
   }
 
   /** List a folder. See {@link ListFilesOptions}; `truncated` means more entries exist. */

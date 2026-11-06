@@ -137,6 +137,15 @@ pub struct UploadFileOptions {
     pub mode: Option<u32>,
 }
 
+/// Options for a download.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DownloadFileOptions {
+    /// Refuse a file larger than this many bytes: before reading when the
+    /// server states the size, otherwise as soon as more arrives. A guard
+    /// against a file larger than expected filling memory.
+    pub max_bytes: Option<u64>,
+}
+
 /// One line [`Client::find_in_files`] found.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
 pub struct FileMatch {
@@ -364,6 +373,99 @@ impl Client {
         data: Vec<u8>,
         options: UploadFileOptions,
     ) -> Result<(), Error> {
+        let (route, policy) = self.upload_route(id, options)?;
+        let file_name = Path::new(target_path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("file")
+            .to_string();
+        let _: (Value, _) = self.send_with_retry(Method::POST, &route, policy, &[], None, |builder| {
+            builder.multipart(
+                Form::new()
+                    .text("path", target_path.to_string())
+                    .part("file", Part::bytes(data.clone()).file_name(file_name.clone())),
+            )
+        })?;
+        Ok(())
+    }
+
+    /// Read a whole file, refusing one larger than `options.max_bytes`.
+    /// The request retries like any safe call.
+    pub fn download_file_with_options(&self, id: &str, target_path: &str, options: DownloadFileOptions) -> Result<Vec<u8>, Error> {
+        let mut out = Vec::new();
+        self.download_file_to(id, target_path, &mut out, options)?;
+        Ok(out)
+    }
+
+    /// Stream a file into `dest` a piece at a time, so a large file never
+    /// sits in memory, and return the bytes written. With `max_bytes`, a
+    /// larger file is refused before reading when the server states the
+    /// size, otherwise as soon as more arrives (what was written stays in
+    /// `dest`). The request retries until the file starts to arrive, never
+    /// after (plans/agent-sandbox-feature-parity.md, F4).
+    pub fn download_file_to(
+        &self,
+        id: &str,
+        target_path: &str,
+        dest: &mut impl io::Write,
+        options: DownloadFileOptions,
+    ) -> Result<u64, Error> {
+        let route = self.toolbox_path(id, "/files/download", &[("path", target_path)]);
+        let Some(mut response) = self.send_raw_with_retry(Method::GET, &route, RetryPolicy::Idempotent, &[], None, |builder| builder)? else {
+            return Ok(0);
+        };
+        let too_large = |max: u64| Error::Client(format!("{} is larger than max_bytes ({} bytes)", target_path, max));
+        if let (Some(max), Some(length)) = (options.max_bytes, response.content_length()) {
+            if length > max {
+                return Err(too_large(max));
+            }
+        }
+        let mut written = 0u64;
+        let mut buf = vec![0u8; 64 * 1024];
+        loop {
+            let n = io::Read::read(&mut response, &mut buf).map_err(|err| Error::Client(format!("read {}: {}", target_path, err)))?;
+            if n == 0 {
+                return Ok(written);
+            }
+            let chunk = &buf[..n];
+            if let Some(max) = options.max_bytes {
+                if written + n as u64 > max {
+                    let keep = (max - written) as usize;
+                    dest.write_all(&chunk[..keep]).map_err(|err| Error::Client(err.to_string()))?;
+                    return Err(too_large(max));
+                }
+            }
+            dest.write_all(chunk).map_err(|err| Error::Client(err.to_string()))?;
+            written += n as u64;
+        }
+    }
+
+    /// Upload from `reader` a piece at a time, so a large file never sits in
+    /// memory. The options are [`Client::upload_file_with_options`]'s. The
+    /// data is read as it is sent, so it is sent once and never retried.
+    pub fn upload_file_from(
+        &self,
+        id: &str,
+        target_path: &str,
+        reader: impl io::Read + Send + 'static,
+        options: UploadFileOptions,
+    ) -> Result<(), Error> {
+        let (route, _) = self.upload_route(id, options)?;
+        let file_name = Path::new(target_path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("file")
+            .to_string();
+        let form = Form::new()
+            .text("path", target_path.to_string())
+            .part("file", Part::reader(reader).file_name(file_name));
+        let response = self.inner.post(self.full_url(&route)).authorize(self).multipart(form).send()?;
+        self.handle_response(response).map(|_| ())
+    }
+
+    /// The upload route with the write options as query (after the /version
+    /// check they need) and the upload's retry tier.
+    fn upload_route(&self, id: &str, options: UploadFileOptions) -> Result<(String, RetryPolicy), Error> {
         let mode = options.mode.map(|mode| format!("{:o}", mode));
         let mut query = Vec::new();
         if options.append {
@@ -384,24 +486,12 @@ impl Client {
             self.require_toolbox_features(id, &[FEATURE_WRITE_OPTIONS])?;
             self.toolbox_path(id, "/files/upload", &query)
         };
-        let file_name = Path::new(target_path)
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("file")
-            .to_string();
         let policy = if options.append || options.create_only {
             RetryPolicy::UnsentOnly
         } else {
             RetryPolicy::Idempotent
         };
-        let _: (Value, _) = self.send_with_retry(Method::POST, &route, policy, &[], None, |builder| {
-            builder.multipart(
-                Form::new()
-                    .text("path", target_path.to_string())
-                    .part("file", Part::bytes(data.clone()).file_name(file_name.clone())),
-            )
-        })?;
-        Ok(())
+        Ok((route, policy))
     }
 
     /// Copy the local folder `local_dir` into `remote_dir` in the sandbox
@@ -645,6 +735,7 @@ mod tests {
                     continue;
                 }
                 let mut length = 0usize;
+                let mut chunked = false;
                 loop {
                     let mut header = String::new();
                     if reader.read_line(&mut header).is_err() || header.trim().is_empty() {
@@ -654,10 +745,26 @@ mod tests {
                         if name.trim().eq_ignore_ascii_case("content-length") {
                             length = value.trim().parse().unwrap_or(0);
                         }
+                        if name.trim().eq_ignore_ascii_case("transfer-encoding") && value.trim().eq_ignore_ascii_case("chunked") {
+                            chunked = true;
+                        }
                     }
                 }
                 let mut body = vec![0u8; length];
                 let _ = reader.read_exact(&mut body);
+                while chunked {
+                    let mut size_line = String::new();
+                    if reader.read_line(&mut size_line).is_err() {
+                        break;
+                    }
+                    let size = usize::from_str_radix(size_line.trim(), 16).unwrap_or(0);
+                    let mut chunk = vec![0u8; size + 2];
+                    let _ = reader.read_exact(&mut chunk);
+                    if size == 0 {
+                        break;
+                    }
+                    body.extend_from_slice(&chunk[..size]);
+                }
                 let mut parts = line.split_whitespace();
                 let method = parts.next().unwrap_or_default().to_string();
                 let target = parts.next().unwrap_or_default().to_string();
@@ -685,7 +792,12 @@ mod tests {
                     reply(&call, n)
                 };
                 let body = body.unwrap_or_default();
-                let mut head = format!("HTTP/1.1 {} X\r\nContent-Length: {}\r\nConnection: close\r\n", status, body.len());
+                // X-No-Length: a body whose size shows only as it arrives.
+                let mut head = if headers.iter().any(|(name, _)| *name == "X-No-Length") {
+                    format!("HTTP/1.1 {} X\r\nConnection: close\r\n", status)
+                } else {
+                    format!("HTTP/1.1 {} X\r\nContent-Length: {}\r\nConnection: close\r\n", status, body.len())
+                };
                 if !body.is_empty() {
                     head.push_str("Content-Type: application/json\r\n");
                 }
@@ -1118,5 +1230,55 @@ mod tests {
         Sandbox::new(ok, data).upload_dir(&dir, "/w").expect("upload_dir");
         assert_eq!(ok_calls.lock().unwrap().len(), 1);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn downloads_honour_max_bytes_and_retry_until_the_file_starts() {
+        let (client, calls) = fake_toolbox(&[], |call, n| match call.query.get("path").map(String::as_str) {
+            Some("/flaky") if n == 0 => (503, None, vec![]),
+            Some("/streamed") => (200, Some("x".repeat(10)), vec![("X-No-Length", "1")]),
+            _ => (200, Some("0123456789".to_string()), vec![]),
+        });
+        assert_eq!(client.download_file("sb-1", "/flaky").expect("download after a 503"), b"0123456789".to_vec());
+        assert_eq!(calls.lock().unwrap().len(), 2);
+        let capped = |max| DownloadFileOptions { max_bytes: Some(max) };
+        assert!(matches!(client.download_file_with_options("sb-1", "/sized", capped(5)), Err(Error::Client(msg)) if msg.contains("max_bytes")));
+        assert_eq!(client.download_file_with_options("sb-1", "/sized", capped(10)).expect("at the cap").len(), 10);
+        let mut dest = Vec::new();
+        assert!(matches!(client.download_file_to("sb-1", "/streamed", &mut dest, capped(4)), Err(Error::Client(_))));
+        assert_eq!(dest, b"xxxx".to_vec(), "what arrived up to the cap is kept");
+        let mut dest = Vec::new();
+        assert_eq!(client.download_file_to("sb-1", "/streamed", &mut dest, DownloadFileOptions::default()).expect("streamed"), 10);
+        assert_eq!(dest.len(), 10);
+    }
+
+    #[test]
+    fn upload_file_from_streams_the_body_once() {
+        let (client, calls) = fake_toolbox(&["files.write_options"], |_, n| if n == 0 { (503, None, vec![]) } else { (201, Some("{}".to_string()), vec![]) });
+        let data = std::io::Cursor::new(vec![b'a'; 5000]);
+        match client.upload_file_from("sb-1", "/w/big.bin", data, UploadFileOptions::default()) {
+            Err(Error::Api(api)) => assert_eq!(api.status(), 503),
+            other => panic!("streamed upload = {:?}", other),
+        }
+        {
+            let calls = calls.lock().unwrap();
+            assert_eq!(calls.len(), 1, "a streamed upload was re-sent");
+            let body = String::from_utf8_lossy(&calls[0].body);
+            assert!(body.contains("/w/big.bin") && body.contains(&"a".repeat(5000)));
+        }
+        let data: SandboxData = serde_json::from_value(serde_json::json!({
+            "id": "sb-1", "image": "x", "status": "started", "public_url": "", "cpu": 1, "memory_mb": 1, "disk_gb": 1,
+            "os_user": "root", "network_block_all": false, "toolbox_enabled": true, "created_at": "", "updated_at": "",
+            "last_active_at": "", "lifecycle": {}
+        }))
+        .expect("sandbox data");
+        let sandbox = Sandbox::new(client, data);
+        sandbox
+            .upload_file_from("/w/x", std::io::Cursor::new(b"x".to_vec()), UploadFileOptions { create_only: true, ..Default::default() })
+            .expect("upload with create_only");
+        assert_eq!(calls.lock().unwrap()[1].query.get("create_only").map(String::as_str), Some("true"));
+        assert_eq!(sandbox.download_file_with_options("/w/x", DownloadFileOptions::default()).expect("read").len(), 2);
+        let mut dest = Vec::new();
+        assert_eq!(sandbox.download_file_to("/w/x", &mut dest, DownloadFileOptions::default()).expect("read to"), 2);
     }
 }
