@@ -1036,6 +1036,9 @@ var Registry = []UseCase{
 	{ID: "UC-443", Title: "Team quotas: N creates at once for a team with K free slots grant exactly K and refuse the rest with 429, and usage reads K", Requires: []Capability{CapIdentity}, Implemented: true},
 	{ID: "UC-444", Title: "Team quotas: a resize that grows a sandbox past the team's CPU quota is refused with 429 and changes nothing; shrinking works and usage follows", Requires: []Capability{CapIdentity}, Implemented: true},
 	{ID: "UC-445", Title: "Team quotas: lowering a quota removes nothing, a stopped sandbox of a team over it cannot start (429), and it starts again once the quota is lifted", Requires: []Capability{CapIdentity}, Implemented: true},
+	// Agent-sandbox parity, images and recipes (parity_recipes_test.go; plan G8, G10, G12).
+	{ID: "UC-463", Title: "E2B mcp option through the live E2B facade: E2B's mcp-gateway template is refused with a 501 naming the missing gateway; with the base template the create succeeds, port 50005 is exposed public, and a server started on 50005 (as the E2B SDK starts mcp-gateway) answers on that URL", Requires: []Capability{CapDomain}, Implemented: true},
+	{ID: "UC-466", Title: "Host an MCP server recipe: the filesystem MCP server behind supergateway, started as a session, answers a JSON-RPC initialize through its exposed port with its key and 401s without it; exposed with visibility token it also needs the sandbox token cookie", Requires: []Capability{CapDomain}, Implemented: true},
 }
 
 // byID is a lookup built once for the report generator.

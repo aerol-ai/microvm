@@ -152,6 +152,14 @@ func (h *handlers) createSandbox(w http.ResponseWriter, r *http.Request) {
 
 	// A replay (Replayed) answers with the sandbox an earlier create of the
 	// id made; a failure below must not roll that sandbox back.
+	if err := h.exposeMCPGateway(r.Context(), response.ID, meta); err != nil {
+		if !response.Replayed {
+			clustercreate.RollbackLocalCreate(context.Background(), h.deps.Service, h.deps.Logger, response.ID)
+		}
+		cleanupReservation()
+		writeStoreAwareError(h.deps.Logger, w, err)
+		return
+	}
 	if err := h.persistSandboxMeta(r.Context(), response.ID, meta); err != nil {
 		if !response.Replayed {
 			clustercreate.RollbackLocalCreate(context.Background(), h.deps.Service, h.deps.Logger, response.ID)
@@ -715,8 +723,9 @@ func (h *handlers) translateCreateSandboxRequest(ctx context.Context, req create
 	if templateID == "" {
 		return models.CreateSandboxRequest{}, sandboxMeta{}, badRequest("templateID is required")
 	}
-	if req.MCP != nil {
-		return models.CreateSandboxRequest{}, sandboxMeta{}, notImplemented("MCP template startup is not implemented yet")
+	wantsMCP, err := parseMCPOption(req.MCP)
+	if err != nil {
+		return models.CreateSandboxRequest{}, sandboxMeta{}, err
 	}
 	// Translate E2B volumeMounts → the neutral platform-volume references the
 	// service resolves against the operator's shared backend. The facade only
@@ -818,6 +827,9 @@ func (h *handlers) translateCreateSandboxRequest(ctx context.Context, req create
 		if len(platformVolumes) > 0 {
 			return models.CreateSandboxRequest{}, sandboxMeta{}, notImplemented("volume mounts are not supported for wasm sandboxes")
 		}
+		if wantsMCP {
+			return models.CreateSandboxRequest{}, sandboxMeta{}, notImplemented(mcpWasmUnsupported)
+		}
 		wasmReq.Env = envVars
 		wasmReq.NetworkBlockAll = networkBlockAll
 		wasmReq.AllowPublicTraffic = allowPublicTraffic
@@ -842,6 +854,9 @@ func (h *handlers) translateCreateSandboxRequest(ctx context.Context, req create
 
 	resolvedImage, templateAlias, err := h.resolveTemplate(ctx, templateID)
 	if err != nil {
+		if wantsMCP {
+			err = mcpTemplateError(templateID, err)
+		}
 		return models.CreateSandboxRequest{}, sandboxMeta{}, err
 	}
 
@@ -874,6 +889,7 @@ func (h *handlers) translateCreateSandboxRequest(ctx context.Context, req create
 		AllowPublicTraffic:  allowPublicTraffic,
 		MaskRequestHost:     maskRequestHost,
 		VolumeMounts:        volumeMountPayloads,
+		MCP:                 wantsMCP,
 	}
 	return serviceReq, meta, nil
 }

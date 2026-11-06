@@ -89,6 +89,7 @@ We checked both examples with E2B SDK 2.50.0. With no template, the E2B SDK asks
 | `network.allowOut` and `network.denyOut`, on create and with `updateNetwork` | Works, with host names and `*.` wildcards. One case is stricter than on E2B; see [Allow only some websites](/advanced-network-rules/#from-the-e2b-sdk). |
 | `network.allowPublicTraffic` and `network.maskRequestHost` | Works. |
 | Volumes (`volumeMounts`) | Works when your operator has turned on [platform volumes](/platform-volumes/). They attach read-write. |
+| MCP servers (the `mcp` option) | Partly. The option is accepted and the gateway's port is shared, but AerolVM does not ship E2B's gateway program. See [MCP servers](#mcp-servers). |
 
 ### Inside the sandbox
 
@@ -114,10 +115,27 @@ We checked both examples with E2B SDK 2.50.0. With no template, the E2B SDK asks
 | Building templates (E2B's template build tools) | Not supported. Use a container image or an AerolVM [snapshot](/images-and-snapshots/#snapshots) as the template. |
 | `network.rules` (changing requests on the way out) | Refused (HTTP 501). AerolVM has its own [rules and inspection](/advanced-network-rules/#allow-only-some-requests). |
 | `network.egressProxy` | Refused (HTTP 501). |
-| Starting MCP servers inside the sandbox (the `mcp` create option) | Refused (HTTP 501). |
 | Public addresses for a port (`getHost`) | Not supported: AerolVM does not serve the addresses the SDK builds. To share a port, use the AerolVM SDK's `exposePort`; see [Public URLs](/public-urls/). |
 | Traffic access tokens, metrics and logs | Not supported. |
 | Volumes on WebAssembly sandboxes | Refused (HTTP 501), because they have no container file system. |
+
+## MCP servers
+
+With the `mcp` option, the E2B SDK starts MCP servers inside the sandbox through a gateway. MCP is how AI agents call tools. The gateway runs on port 50005 at `/mcp`. Here is how the option works on AerolVM:
+
+1. AerolVM creates the sandbox and shares port 50005. Its address is `https://<sandbox ID>-50005.<your sandbox domain>/mcp`.
+2. The E2B SDK then runs a program called `mcp-gateway` inside the sandbox, with your servers and a token it made. E2B's own `mcp-gateway` template has that program. AerolVM does not ship it.
+
+What that means for you:
+
+- **With no template,** the E2B SDK asks for E2B's `mcp-gateway` template. AerolVM refuses it with HTTP 501, unless your operator has mapped `mcp-gateway` to an image with `SB_E2B_TEMPLATE_MAP_JSON`.
+- **With your own template,** its image needs an `mcp-gateway` program that works like E2B's. It takes `--config` with your servers as JSON, reads its token from `GATEWAY_ACCESS_TOKEN`, keeps running in the background and listens on port 50005. If the program is missing, the SDK's start command fails, and the SDK deletes the sandbox.
+- **`getMcpUrl()` does not give a working address.** It builds E2B's shape, `50005-<sandbox>.<domain>`, which AerolVM does not serve. Use the address in step 1.
+- **`getMcpToken()` works.** The gateway checks that token, so the port is shared without an AerolVM sandbox token.
+- **A private sandbox stays private.** With `network.allowPublicTraffic: false`, port 50005 is not shared. Share it later with the AerolVM SDK's `exposePort`.
+- **WebAssembly sandboxes refuse `mcp`** (HTTP 501). They have no shell to start the gateway.
+
+The simplest way to run an MCP server on AerolVM is to start it yourself, with any MCP server you like. [Host an MCP server](/use-cases/coding-agents/host-mcp-server/) shows how.
 
 ## Templates
 

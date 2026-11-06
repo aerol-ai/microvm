@@ -243,6 +243,7 @@ const getUseCasesSidebarConfig = (): NavigationGroup[] => [
       link(`${uca}/pull-request-review-auto-fix-agent`, '- Review a pull request'),
       link(`${uca}/test-writing-failure-reproduction-agent`, '- Write 500 tests'),
       link(`${uca}/claude-code-security-vulnerability-remediation-agent`, '- Find and fix security problems'),
+      link(`${uca}/host-mcp-server`, '- Host an MCP server'),
     ],
   },
   {
