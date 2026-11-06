@@ -2635,3 +2635,31 @@ test("internal client create sends a placement rule", async () => {
   const plain = (await seenRequest.json()) as Record<string, unknown>;
   assert.equal("placement" in plain, false);
 });
+
+test("team quota calls map the wire shape", async () => {
+  const seen: { method: string; url: string; body?: unknown }[] = [];
+  const quota = {
+    team: "risk", max_sandboxes: 3, max_cpu: 4, generation: 1, created_at: "c", updated_at: "u",
+    usage: { sandboxes: 2, cpu: 1.5, memory_mb: 1024 },
+  };
+  const client = new APIClient({
+    baseURL: "https://api.example.com",
+    patToken: "pat-token",
+    fetch: async (input, init) => {
+      const req = new Request(input, init);
+      seen.push({ method: req.method, url: req.url, body: init?.body ? JSON.parse(String(init.body)) : undefined });
+      if (req.method === "DELETE") return new Response(null, { status: 204 });
+      return jsonResponse(quota);
+    },
+  });
+  const put = await client.putTeamQuota("risk", { maxSandboxes: 3, maxCPU: 4 });
+  assert.deepEqual(put, {
+    team: "risk", maxSandboxes: 3, maxCPU: 4, generation: 1, createdAt: "c", updatedAt: "u",
+    usage: { sandboxes: 2, cpu: 1.5, memoryMB: 1024 },
+  });
+  assert.deepEqual(seen[0], { method: "PUT", url: "https://api.example.com/v1/teams/risk/quota", body: { max_sandboxes: 3, max_cpu: 4 } });
+  assert.equal((await client.getTeamQuota("risk")).usage?.sandboxes, 2);
+  assert.equal(seen[1].method, "GET");
+  await client.deleteTeamQuota("risk");
+  assert.deepEqual({ method: seen[2].method, url: seen[2].url }, { method: "DELETE", url: "https://api.example.com/v1/teams/risk/quota" });
+});

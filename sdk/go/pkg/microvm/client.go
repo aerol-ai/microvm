@@ -453,6 +453,26 @@ func (c *Client) DeleteWarmPool(ctx context.Context, image string) error {
 	return c.inner.DeleteWarmPool(ctx, image)
 }
 
+// PutTeamQuota sets a team's quota: the most sandboxes, CPU and memory its
+// sandboxes may hold. Admin only. The same limits twice change nothing. A
+// create, resize or start past the quota fails with an *APIError whose
+// StatusCode is 429 and Code is "team_quota_exceeded".
+func (c *Client) PutTeamQuota(ctx context.Context, team string, opts sdktypes.TeamQuotaOptions) (sdktypes.TeamQuota, error) {
+	return c.inner.PutTeamQuota(ctx, team, opts)
+}
+
+// GetTeamQuota reads a team's quota and what the team holds now (Usage). A
+// team with no quota is a 404 *APIError.
+func (c *Client) GetTeamQuota(ctx context.Context, team string) (sdktypes.TeamQuota, error) {
+	return c.inner.GetTeamQuota(ctx, team)
+}
+
+// DeleteTeamQuota removes a team's quota. Removing one that is already gone
+// succeeds.
+func (c *Client) DeleteTeamQuota(ctx context.Context, team string) error {
+	return c.inner.DeleteTeamQuota(ctx, team)
+}
+
 func (c *Client) Start(ctx context.Context, id string) (*Sandbox, error) {
 	item, err := c.inner.Start(ctx, id)
 	if err != nil {

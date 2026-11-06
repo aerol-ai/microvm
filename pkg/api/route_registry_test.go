@@ -84,6 +84,7 @@ var routePermissions = map[string]string{
 	"DELETE /v1/js-bundles/{id}":                               "sandbox.write",
 	"DELETE /v1/sandboxes/{id}":                                "sandbox.write",
 	"DELETE /v1/sandboxes/{id}/custom-domains/{hostname}":      "sandbox.write",
+	"DELETE /v1/teams/{team}/quota":                            "fleet.admin",
 	"DELETE /v1/sandboxes/{id}/ports/{port}":                   "sandbox.write",
 	"DELETE /v1/tokens/{id}":                                   "token.write",
 	"DELETE /v1/snapshots/{id}":                                "sandbox.write",
@@ -132,6 +133,7 @@ var routePermissions = map[string]string{
 	"GET /v1/warm-pools":                                       "fleet.admin",
 	"GET /v1/warm-pools/{image...}":                            "fleet.admin",
 	"GET /v1/egress-profiles/{name}":                           "sandbox.read",
+	"GET /v1/teams/{team}/quota":                               "fleet.admin",
 	"GET /v1/ingress/dns":                                      "fleet.admin",
 	"GET /v1/js-bundles":                                       "sandbox.read",
 	"GET /v1/js-bundles/{id}":                                  "sandbox.read",
@@ -182,6 +184,8 @@ var routePermissions = map[string]string{
 	"DELETE /v1/identity/roles/{tag}":                          "fleet.admin",
 	"GET /v1/identity/roles":                                   "fleet.admin",
 	"POST /v1/cluster/internal/egress-profiles/write":          "cluster.internal",
+	"POST /v1/cluster/internal/team-quotas/read":               "cluster.internal",
+	"POST /v1/cluster/internal/team-quotas/write":              "cluster.internal",
 	"POST /v1/cluster/internal/tokens/write":                   "cluster.internal",
 	"POST /v1/cluster/internal/warm-pools/read":                "cluster.internal",
 	"POST /v1/cluster/internal/warm-pools/write":               "cluster.internal",
@@ -221,6 +225,7 @@ var routePermissions = map[string]string{
 	"PUT /v1/warm-pools/{image...}":                            "fleet.admin",
 	"PUT /v1/sandboxes/{id}/lifecycle":                         "sandbox.write",
 	"PUT /v1/sandboxes/{id}/network/policy":                    "sandbox.write",
+	"PUT /v1/teams/{team}/quota":                               "fleet.admin",
 }
 
 // registeredRoutes is every route a fully configured server mounts (remote

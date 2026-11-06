@@ -30,6 +30,10 @@ func ApplyErrorStatus(err error) int {
 		return http.StatusServiceUnavailable
 	case errors.Is(err, ErrCreateBackpressure):
 		return http.StatusTooManyRequests
+	case errors.Is(err, ErrTeamQuotaExceeded):
+		// A team at its quota. 429 like the API answer; the message names
+		// the sentinel so forwardApplyStatus restores it, not backpressure.
+		return http.StatusTooManyRequests
 	case errors.Is(err, ErrCapacityExceeded), errors.Is(err, ErrNoPlacementTarget):
 		return http.StatusServiceUnavailable
 	case errors.Is(err, ErrArtifactCatalogSuperseded):
@@ -86,6 +90,9 @@ func forwardApplyStatus(status int, message string) error {
 	case http.StatusOK, http.StatusNoContent:
 		return nil
 	case http.StatusTooManyRequests:
+		if strings.Contains(message, ErrTeamQuotaExceeded.Error()) {
+			return fmt.Errorf("%w: %s", ErrTeamQuotaExceeded, message)
+		}
 		return fmt.Errorf("%w: %s", ErrCreateBackpressure, message)
 	case http.StatusConflict:
 		// Restore whichever conflict sentinel the leader answered 409 with.

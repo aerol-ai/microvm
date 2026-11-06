@@ -800,6 +800,36 @@ class EgressProfileRef(TypedDict):
     generation: int
 
 
+class TeamQuotaOptions(TypedDict, total=False):
+    """A team quota's limits, the body of ``put_team_quota``. Leave a limit
+    out (or 0) for no limit on it. At least one must be set."""
+
+    # Most sandboxes the team may hold, running or stopped.
+    maxSandboxes: int
+    # Most CPU the team's sandboxes may ask for in total.
+    maxCPU: float
+    # Most memory, in MB, the team's sandboxes may ask for in total.
+    maxMemoryMB: int
+
+
+class TeamQuotaUsage(TypedDict):
+    """What a team holds now: every sandbox not deleted, at its asked size."""
+
+    sandboxes: int
+    cpu: float
+    memoryMB: int
+
+
+class TeamQuota(TeamQuotaOptions, total=False):
+    """A team's quota, and its usage when read back."""
+
+    team: str
+    generation: int
+    createdAt: str
+    updatedAt: str
+    usage: TeamQuotaUsage
+
+
 class EgressProfile(TypedDict, total=False):
     """A named allowlist sandboxes reference through ``egressProfiles``.
     Profiles belong to your account; ``generation`` goes up on every change."""

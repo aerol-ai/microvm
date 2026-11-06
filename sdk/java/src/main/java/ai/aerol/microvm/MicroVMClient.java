@@ -43,6 +43,8 @@ import ai.aerol.microvm.model.IdentityRoleList;
 import ai.aerol.microvm.model.IdentityRoleOptions;
 import ai.aerol.microvm.model.ListIdentityRolesOptions;
 import ai.aerol.microvm.model.ListEgressProfilesOptions;
+import ai.aerol.microvm.model.TeamQuota;
+import ai.aerol.microvm.model.TeamQuotaOptions;
 import ai.aerol.microvm.model.WarmPool;
 import ai.aerol.microvm.model.WarmPoolList;
 import ai.aerol.microvm.model.WarmPoolOptions;
@@ -850,6 +852,31 @@ public class MicroVMClient {
     /** Deletes a profile; one that sandboxes still reference is refused (409). */
     public void deleteEgressProfile(String name) {
         doNoContent("DELETE", egressProfilePath(name), null);
+    }
+
+    /**
+     * Sets a team's quota: the most sandboxes, CPU and memory its sandboxes
+     * may hold. Admin only. The same limits twice change nothing. A create,
+     * resize or start past the quota fails with a 429 whose code is
+     * {@code team_quota_exceeded}.
+     */
+    public TeamQuota putTeamQuota(String team, TeamQuotaOptions options) {
+        TeamQuotaOptions body = options == null ? new TeamQuotaOptions() : options;
+        return doJson("PUT", teamQuotaPath(team), body, TeamQuota.class);
+    }
+
+    /** Reads a team's quota and what the team holds now (404 if none). */
+    public TeamQuota getTeamQuota(String team) {
+        return doJson("GET", teamQuotaPath(team), null, TeamQuota.class);
+    }
+
+    /** Removes a team's quota. Removing one that is already gone succeeds. */
+    public void deleteTeamQuota(String team) {
+        doNoContent("DELETE", teamQuotaPath(team), null);
+    }
+
+    private String teamQuotaPath(String team) {
+        return versioned("/teams/" + URLEncoder.encode(team, StandardCharsets.UTF_8) + "/quota");
     }
 
     private String egressProfilePath(String name) {

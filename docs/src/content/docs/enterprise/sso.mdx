@@ -348,6 +348,119 @@ A person can be in more than one team. Their sign-in then matches several rules,
 - **In the CLI,** use `aerolvm login --team checkout` or `SB_TEAM`.
 - **TypeScript only:** live command streams (`execStream`, `attachSession`) cannot send the header. They use your first team.
 
+## Limit what a team can hold
+
+An admin can give a team a **quota**. A quota caps three things:
+
+- how many sandboxes the team holds,
+- how much CPU those sandboxes ask for in total,
+- how much memory they ask for in total.
+
+Leave a limit out to set no limit on it. Setting a quota needs the `admin` role or the server token.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    // At most 50 sandboxes, 100 CPUs and 200 GB of memory for payments.
+    const quota = await client.putTeamQuota("payments", {
+      maxSandboxes: 50,
+      maxCPU: 100,
+      maxMemoryMB: 204800,
+    });
+
+    const now = await client.getTeamQuota("payments");
+    console.log(now.usage); // { sandboxes, cpu, memoryMB }
+
+    await client.deleteTeamQuota("payments"); // no limit again
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    # At most 50 sandboxes, 100 CPUs and 200 GB of memory for payments.
+    quota = client.put_team_quota(
+        "payments",
+        {"maxSandboxes": 50, "maxCPU": 100, "maxMemoryMB": 204800},
+    )
+
+    now = client.get_team_quota("payments")
+    print(now["usage"])  # {"sandboxes", "cpu", "memoryMB"}
+
+    client.delete_team_quota("payments")  # no limit again
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    // At most 50 sandboxes, 100 CPUs and 200 GB of memory for payments.
+    quota, err := client.PutTeamQuota(ctx, "payments", sdktypes.TeamQuotaOptions{
+        MaxSandboxes: 50,
+        MaxCPU:       100,
+        MaxMemoryMB:  204800,
+    })
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    now, err := client.GetTeamQuota(ctx, "payments")
+    if err != nil {
+        log.Fatal(err)
+    }
+    fmt.Println(now.Usage.Sandboxes, now.Usage.CPU, now.Usage.MemoryMB)
+
+    // No limit again.
+    if err := client.DeleteTeamQuota(ctx, "payments"); err != nil {
+        log.Fatal(err)
+    }
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    use aerolvm_sdk::TeamQuotaOptions;
+
+    // At most 50 sandboxes, 100 CPUs and 200 GB of memory for payments.
+    let quota = client.put_team_quota("payments", TeamQuotaOptions {
+        max_sandboxes: Some(50),
+        max_cpu: Some(100.0),
+        max_memory_mb: Some(204800),
+    })?;
+
+    let now = client.get_team_quota("payments")?;
+    println!("{:?}", now.usage); // sandboxes, cpu, memory_mb
+
+    client.delete_team_quota("payments")?; // no limit again
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    import ai.aerol.microvm.model.TeamQuota;
+    import ai.aerol.microvm.model.TeamQuotaOptions;
+
+    // At most 50 sandboxes, 100 CPUs and 200 GB of memory for payments.
+    TeamQuota quota = client.putTeamQuota("payments",
+        new TeamQuotaOptions()
+            .setMaxSandboxes(50)
+            .setMaxCpu(100.0)
+            .setMaxMemoryMb(204800));
+
+    TeamQuota now = client.getTeamQuota("payments");
+    System.out.println(now.usage.sandboxes + " " + now.usage.cpu + " " + now.usage.memoryMb);
+
+    client.deleteTeamQuota("payments"); // no limit again
+    ```
+  </TabItem>
+</Tabs>
+
+**What counts.** Every sandbox the team holds that is not deleted counts, running or stopped. A stopped sandbox counts because it can start again at any time, so delete sandboxes you no longer need. Each sandbox counts at the CPU and memory it asked for, or the server's defaults if it asked for none. Sandboxes made with the server token, or by a caller on every team (`team: "*"`), belong to no team and are never limited.
+
+**What happens at the limit.**
+
+- A create that would go past the quota fails with `429` and the code `team_quota_exceeded`. The message names the team, the limit and what the team holds. There is no `Retry-After`: only deleting sandboxes or raising the quota makes room.
+- A resize that grows a sandbox past the quota fails the same way. A resize that shrinks one always works.
+- Lowering a quota removes nothing. The team keeps what it has, but it cannot create, grow or start sandboxes until it is back under the new limit.
+- Two creates racing for the last slot never both get it. On one server, one lock decides. In a cluster, the leader decides for every node, against the sandboxes the whole cluster has recorded, so the answer is the same whichever node you call.
+- A sandbox that a cluster moves to a healthy node after a failure is not counted twice and is never refused.
+
+**Safe to retry.** Setting the same limits twice changes nothing. Deleting a quota that is already gone succeeds. In a cluster, a quota can be set only once every server runs a release that has quotas. Until then the call answers `503`.
+
 ## Sign in with your company account
 
 People sign in through your identity provider. AerolVM never sees their password. It keeps no login session either. Instead, the provider signs a short-lived token, which lasts about an hour. Every AerolVM server checks that signature with the provider's public keys.
@@ -829,6 +942,7 @@ Every action that changes something is recorded, with one exception. Calls in th
 | `403` "role … cannot …; ask an admin for role …" | Your role is too small for this call. | Ask for the role it names. |
 | `403` "is not one of this credential's teams" | You picked a team you do not belong to. | Unset `SB_TEAM`, or pick one of your teams. |
 | `404` | The sandbox does not exist, or it belongs to another team. | Check the team you act for. |
+| `429` with code `team_quota_exceeded` | The team is at its quota. The message names the limit. | Delete sandboxes the team no longer needs, or ask an admin to raise the quota. |
 | `503` "identity data is stale on this node" | This server lost contact with the cluster's token list for over a minute. | Retry. The server token and SSO still work. |
 | `503` "sign-in with an identity provider is unavailable" | The identity file failed to load, or the provider's keys could not be fetched. | Retry, or use an API token. Operators: check the server log. |
 

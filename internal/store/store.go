@@ -428,6 +428,9 @@ func open(path string, secretCipher *secrets.Cipher) (*Store, error) {
 			updated_at DATETIME NOT NULL
 		);`,
 		`CREATE INDEX IF NOT EXISTS idx_sandbox_egress_hold ON sandbox_egress(hold_reason) WHERE hold_reason != '';`,
+		// team_quotas caps what each team may hold (plan item P2); the
+		// single-node store, a cluster keeps quotas in the Raft FSM.
+		teamQuotasDDL,
 		// egress_profiles are named allowlists sandboxes reference
 		// (plans/egress-domain-filtering.md D21). Owner-scoped like sandbox
 		// names; this table is the single-node store, a cluster keeps them in

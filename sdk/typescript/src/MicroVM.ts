@@ -26,6 +26,8 @@ import type {
   IdentityRoleList,
   IdentityRoleOptions,
   ListEgressProfilesOptions,
+  TeamQuota,
+  TeamQuotaOptions,
   WarmPool,
   WarmPoolOptions,
   ListIdentityRolesOptions,
@@ -333,6 +335,25 @@ export class MicroVM {
    */
   async deleteIdentityRole(tag: string, options?: { team?: string }): Promise<void> {
     return this.client.deleteIdentityRole(tag, options);
+  }
+
+  /**
+   * Sets a team's quota: the most sandboxes, CPU and memory its sandboxes
+   * may hold. Admin only. The same limits twice change nothing. A create,
+   * resize or start past the quota fails with 429 `team_quota_exceeded`.
+   */
+  async putTeamQuota(team: string, options: TeamQuotaOptions): Promise<TeamQuota> {
+    return this.client.putTeamQuota(team, options);
+  }
+
+  /** Reads a team's quota and what the team holds now. 404 if it has none. */
+  async getTeamQuota(team: string): Promise<TeamQuota> {
+    return this.client.getTeamQuota(team);
+  }
+
+  /** Removes a team's quota. Removing one that is already gone succeeds. */
+  async deleteTeamQuota(team: string): Promise<void> {
+    return this.client.deleteTeamQuota(team);
   }
 
   async mounts(sandboxID: string): Promise<MountSpecRedacted[]> {

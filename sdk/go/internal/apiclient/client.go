@@ -757,6 +757,30 @@ func (c *Client) DeleteEgressProfile(ctx context.Context, name string) error {
 	return c.doJSON(ctx, http.MethodDelete, c.egressProfilePath(name), nil, nil)
 }
 
+func (c *Client) teamQuotaPath(team string) string {
+	return c.versionPrefix + "/teams/" + url.PathEscape(team) + "/quota"
+}
+
+// PutTeamQuota sets a team's quota (admin only). Idempotent: the same
+// limits twice change nothing, so it retries like a read.
+func (c *Client) PutTeamQuota(ctx context.Context, team string, request models.TeamQuotaRequest) (models.TeamQuota, error) {
+	var response models.TeamQuota
+	err := c.doJSON(ctx, http.MethodPut, c.teamQuotaPath(team), request, &response)
+	return response, err
+}
+
+// GetTeamQuota reads a team's quota and what the team holds now.
+func (c *Client) GetTeamQuota(ctx context.Context, team string) (models.TeamQuota, error) {
+	var response models.TeamQuota
+	err := c.doJSON(ctx, http.MethodGet, c.teamQuotaPath(team), nil, &response)
+	return response, err
+}
+
+// DeleteTeamQuota removes a team's quota; one already gone is a success.
+func (c *Client) DeleteTeamQuota(ctx context.Context, team string) error {
+	return c.doJSON(ctx, http.MethodDelete, c.teamQuotaPath(team), nil, nil)
+}
+
 func (c *Client) snapshotPath(name string) string {
 	return c.versionPrefix + "/snapshots/" + url.PathEscape(name)
 }

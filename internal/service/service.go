@@ -522,6 +522,9 @@ type Service struct {
 	// egressProfiles stores named egress profiles; nil is the local store
 	// (single node). A cluster swaps in its Raft-backed store.
 	egressProfiles egressProfileBackend
+	// teamQuotas is the single-node team-quota ledger (team_quotas.go). A
+	// cluster decides quotas on its Raft leader and never uses it.
+	teamQuotas teamQuotaLedger
 	// identity is the cloud-identity issuer state: signing keys, the lazy
 	// bootstrap latch and in-flight token pushes (identity.go).
 	identity identityState
@@ -2026,6 +2029,15 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 			}
 		}
 	}
+	// Team quota (plan item P2): one node claims room in the team's quota
+	// here, in memory and under one lock, so two creates for the last slot
+	// cannot both pass; a failed create gives the claim back. A cluster's
+	// leader decided this at reservation time instead (team_quotas.go).
+	quotaTicket, err := s.admitTeamQuotaCreate(ctx, ownerRef, req)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { quotaTicket.settle(resp, err) }()
 	// Custom-domain validation runs early so an invalid or unsupported
 	// payload fails before admission/mounts/docker.Create burn resources.
 	// On success req.CustomDomains is rewritten with the canonical slice.
@@ -3623,6 +3635,11 @@ func (s *Service) startSandbox(ctx context.Context, id string, cause startCause)
 		return nil, err
 	}
 
+	// A team over its quota (an admin lowered it) does not bring stopped
+	// sandboxes back; a start adds nothing to usage otherwise (P2).
+	if err := s.checkTeamQuotaForStart(ctx, sandbox); err != nil {
+		return nil, err
+	}
 	// Re-Admit against the host budget before touching Docker. StopSandbox
 	// (and the die/stop/oom event handler) releases the reservation, so a
 	// stopped sandbox does not hold capacity. Admit is idempotent per ID:
@@ -3939,6 +3956,7 @@ func (s *Service) DestroySandbox(ctx context.Context, id string) error {
 	if s.admitter != nil {
 		s.admitter.Release(id)
 	}
+	s.releaseTeamQuota(sandbox)
 	if s.logger != nil {
 		s.logger.Info("audit sandbox destroyed", "sandbox_id", id, "image", sandbox.Image)
 	}
@@ -4738,6 +4756,27 @@ func (s *Service) ResizeSandbox(ctx context.Context, id string, req models.Resiz
 		return nil, err
 	}
 
+	// A team's quota is checked before host capacity and before anything
+	// changes: resize used to re-admit against the host only, so a team
+	// could grow past its quota one resize at a time (plan item P2).
+	quotaCPU, quotaMem := sandbox.CPU, sandbox.MemoryMB
+	if req.CPU > 0 {
+		quotaCPU = req.CPU
+	}
+	if req.MemoryMB > 0 {
+		quotaMem = req.MemoryMB
+	}
+	undoQuota, quotaWroteSpec, err := s.admitTeamQuotaResize(ctx, sandbox, quotaCPU, quotaMem)
+	if err != nil {
+		return nil, err
+	}
+	resized := false
+	defer func() {
+		if !resized {
+			undoQuota()
+		}
+	}()
+
 	// Decide what the post-resize footprint will be and re-admit against it
 	// before mutating Docker. Admit is idempotent per ID — it computes the
 	// delta against the existing reservation, so a downsize will free budget
@@ -4788,6 +4827,12 @@ func (s *Service) ResizeSandbox(ctx context.Context, id string, req models.Resiz
 	sandbox.UpdatedAt = time.Now().UTC()
 	if err := s.store.Upsert(ctx, sandbox); err != nil {
 		return nil, err
+	}
+	resized = true
+	if quotaWroteSpec {
+		// The quota admission already recorded the new size in the
+		// replicated spec; writing it again would only cost a Raft entry.
+		return s.store.Get(ctx, id)
 	}
 	// Mirror the resize into the FSM-replicated spec so a future failover
 	// recreate uses the post-resize footprint, not the create-time one. Lives

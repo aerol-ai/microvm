@@ -219,6 +219,15 @@ type command struct {
 	// (fsm_identity.go).
 	IdentityKeys *IdentityKeysWrite  `json:"identity_keys,omitempty"`
 	IdentityRole *IdentityRoleRecord `json:"identity_role,omitempty"`
+	// TeamQuota carries the quota for opPutTeamQuota, and its team for
+	// opDeleteTeamQuota (fsm_team_quotas.go).
+	TeamQuota *TeamQuotaRecord `json:"team_quota,omitempty"`
+	// QuotaAdmit marks an opPlace or opUpsertSpec that can grow a team's
+	// usage (a create that skipped the reservation, a resize), so the leader
+	// admits it against the team's quota like a reservation. Every other
+	// promote or spec write is applied as before. Apply ignores it: an older
+	// replica reads the same state from the entry.
+	QuotaAdmit bool `json:"quota_admit,omitempty"`
 }
 
 type reservationCommand struct {
@@ -551,6 +560,13 @@ type placementFSM struct {
 	// rebuilt on Restore from the rows.
 	egressProfiles    map[EgressProfileKey]*EgressProfileRecord
 	egressProfileRefs map[EgressProfileKey]map[string]struct{}
+	// teamQuotas are the replicated team quotas (snapshotted). teamUsage and
+	// teamUsageEntries are derived: each team's usage and each sandbox's
+	// share of it, kept in step with f.placements by
+	// reindexTeamUsageLocked and rebuilt on Restore (fsm_team_quotas.go).
+	teamQuotas       map[string]*TeamQuotaRecord
+	teamUsage        map[string]*models.TeamQuotaUsage
+	teamUsageEntries map[string]teamUsageEntry
 	// tokens is the replicated API-token table and its change ring
 	// (fsm_tokens.go, snapshotted rows, node-local ring). It has its own
 	// lock: token reads on the request path never take mu.
@@ -652,6 +668,9 @@ func newPlacementFSMWithRecoveryStore(store placementRecoveryStore) *placementFS
 		volumeAttachmentsBySandbox:   make(map[string]map[string]struct{}),
 		egressProfiles:               make(map[EgressProfileKey]*EgressProfileRecord),
 		egressProfileRefs:            make(map[EgressProfileKey]map[string]struct{}),
+		teamQuotas:                   make(map[string]*TeamQuotaRecord),
+		teamUsage:                    make(map[string]*models.TeamQuotaUsage),
+		teamUsageEntries:             make(map[string]teamUsageEntry),
 		tokens:                       newAPITokenState(),
 		warmPools:                    make(map[string]*WarmPoolRecord),
 	}
@@ -1096,6 +1115,7 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 		f.releaseVolumeAttachmentsForIncarnationLocked(cmd.SandboxID, expectedIncarnationID)
 		f.deletePlacementRecoveryLocked(cmd.SandboxID)
 		f.releaseEgressProfilesLocked(cmd.SandboxID)
+		f.reindexTeamUsageLocked(cmd.SandboxID, nil)
 		delete(f.placements, cmd.SandboxID)
 		delete(f.deletingIndex, cmd.SandboxID)
 		f.recordPlacementChangeLocked(cmd.SandboxID, true)
@@ -1178,6 +1198,7 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 		f.releaseVolumeAttachmentsForSandboxLocked(cmd.SandboxID)
 		f.deletePlacementRecoveryLocked(cmd.SandboxID)
 		f.releaseEgressProfilesLocked(cmd.SandboxID)
+		f.reindexTeamUsageLocked(cmd.SandboxID, nil)
 		delete(f.placements, cmd.SandboxID)
 		delete(f.deletingIndex, cmd.SandboxID)
 		f.recordPlacementChangeLocked(cmd.SandboxID, true)
@@ -1292,6 +1313,7 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 			f.releaseVolumeAttachmentsForIncarnationLocked(id, existing.IncarnationID)
 			f.deletePlacementRecoveryLocked(id)
 			f.releaseEgressProfilesLocked(id)
+			f.reindexTeamUsageLocked(id, nil)
 			delete(f.placements, id)
 			delete(f.deletingIndex, id)
 			f.recordPlacementChangeLocked(id, true)
@@ -1766,6 +1788,17 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 		}
 		state.Committed[nodeID] = pending
 		delete(state.Pending, nodeID)
+		return nil
+	case opPutTeamQuota:
+		result, err := f.applyPutTeamQuotaLocked(cmd)
+		if err != nil {
+			return err
+		}
+		return result
+	case opDeleteTeamQuota:
+		if err := f.applyDeleteTeamQuotaLocked(cmd); err != nil {
+			return err
+		}
 		return nil
 	case opPutEgressProfile:
 		result, err := f.applyPutEgressProfileLocked(cmd)
@@ -2760,6 +2793,7 @@ func (f *placementFSM) storePlacementLocked(id string, p Placement) error {
 	} else {
 		f.reindexEgressProfilesLocked(id, nil, &hot)
 	}
+	f.reindexTeamUsageLocked(id, &hot)
 	if rec.empty() {
 		if hot.RecoveryRef == "" {
 			delete(f.recovery, id)
@@ -2820,6 +2854,12 @@ func splitPlacement(p Placement) (Placement, placementRecovery) {
 		// hydrating the spec.
 		p.EgressProfiles = append([]string(nil), p.Spec.EgressProfiles...)
 		p.EgressInlineHostnames = egressInlineHostnames(p.Spec)
+		// A team's sandbox carries its size on the hot row, so the quota
+		// index is rebuilt on Restore without hydrating every spec. Other
+		// owners pay nothing for it.
+		if models.TeamOfOwnerRef(p.OwnerRef) != "" {
+			p.QuotaCPU, p.QuotaMemoryMB = models.QuotaSize(p.Spec.CPU, p.Spec.MemoryMB)
+		}
 	}
 	p.Spec = nil
 	p.SecretRef = ""
@@ -3477,6 +3517,9 @@ type fsmSnapshotPayload struct {
 	// them as nil, which reads as "no keys, no roles".
 	IdentityKeys  *cloudidentity.KeySet
 	IdentityRoles []IdentityRoleRecord
+	// TeamQuotas is the replicated team-quota set. Optional; an older
+	// snapshot decodes it as nil, which reads as "no quotas".
+	TeamQuotas []TeamQuotaRecord
 }
 
 type placementSnapshotRow struct {
@@ -3555,6 +3598,7 @@ func (f *placementFSM) Snapshot() (raft.FSMSnapshot, error) {
 		volumes:            f.volumesSnapshotLocked(),
 		volumeAttachments:  f.volumeAttachmentsSnapshotLocked(),
 		egressProfiles:     f.egressProfilesSnapshotLocked(),
+		teamQuotas:         f.teamQuotasSnapshotLocked(),
 		snapshotNodes:      snapshotNodes,
 		apiTokens:          f.apiTokens().snapshot(),
 		warmPools:          f.warmPoolsSnapshotLocked(),
@@ -3641,6 +3685,10 @@ func (f *placementFSM) Restore(rc io.ReadCloser) (err error) {
 	f.customHostnameIndex = make(map[string]string)
 	f.egressProfileRefs = make(map[EgressProfileKey]map[string]struct{})
 	f.restoreEgressProfilesLocked(payload.EgressProfiles)
+	// Usage is derived from the rows re-stored below; the quotas are state.
+	f.teamUsage = make(map[string]*models.TeamQuotaUsage)
+	f.teamUsageEntries = make(map[string]teamUsageEntry)
+	f.restoreTeamQuotasLocked(payload.TeamQuotas)
 	f.apiTokens().restore(payload.APITokens, payload.Version)
 	f.restoreWarmPoolsLocked(payload.WarmPools, payload.Version)
 	f.restoreIdentityLocked(payload.IdentityKeys, payload.IdentityRoles)
@@ -3799,6 +3847,7 @@ type fsmSnapshot struct {
 	warmPools          []WarmPoolRecord
 	identityKeys       *cloudidentity.KeySet
 	identityRoles      []IdentityRoleRecord
+	teamQuotas         []TeamQuotaRecord
 	recoveryStore      placementRecoveryStore
 	recoveryRefs       []string
 }
@@ -3827,6 +3876,7 @@ func (s *fsmSnapshot) Persist(sink raft.SnapshotSink) (err error) {
 		WarmPools:          s.warmPools,
 		IdentityKeys:       s.identityKeys,
 		IdentityRoles:      s.identityRoles,
+		TeamQuotas:         s.teamQuotas,
 	}); err != nil {
 		_ = sink.Cancel()
 		return fmt.Errorf("fsmSnapshot: encode: %w", err)

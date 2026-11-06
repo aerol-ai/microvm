@@ -72,6 +72,8 @@ import type {
   EgressProfileList,
   EgressProfileOptions,
   EgressProfileRef,
+  TeamQuota,
+  TeamQuotaOptions,
   IdentityOptions,
   IdentityRole,
   IdentityRoleList,
@@ -296,6 +298,26 @@ interface ApiLifecycle {
 
 interface ApiFailover {
   policy?: string;
+}
+
+interface ApiTeamQuota {
+  team: string;
+  max_sandboxes?: number;
+  max_cpu?: number;
+  max_memory_mb?: number;
+  generation: number;
+  created_at: string;
+  updated_at: string;
+  usage?: { sandboxes: number; cpu: number; memory_mb: number };
+}
+
+function fromApiTeamQuota(q: ApiTeamQuota): TeamQuota {
+  const out: TeamQuota = { team: q.team, generation: q.generation, createdAt: q.created_at, updatedAt: q.updated_at };
+  if (q.max_sandboxes) out.maxSandboxes = q.max_sandboxes;
+  if (q.max_cpu) out.maxCPU = q.max_cpu;
+  if (q.max_memory_mb) out.maxMemoryMB = q.max_memory_mb;
+  if (q.usage) out.usage = { sandboxes: q.usage.sandboxes, cpu: q.usage.cpu, memoryMB: q.usage.memory_mb };
+  return out;
 }
 
 interface ApiEgressProfile {
@@ -1925,6 +1947,23 @@ export class APIClient {
   private identityRolePath(tag: string, team?: string): string {
     const path = `/identity/roles/${encodeURIComponent(tag)}`;
     return this.versioned(team ? `${path}?team=${encodeURIComponent(team)}` : path);
+  }
+
+  async putTeamQuota(team: string, options: TeamQuotaOptions): Promise<TeamQuota> {
+    const response = await this.doJSON<ApiTeamQuota>("PUT", this.versioned(`/teams/${encodeURIComponent(team)}/quota`), {
+      max_sandboxes: options.maxSandboxes,
+      max_cpu: options.maxCPU,
+      max_memory_mb: options.maxMemoryMB,
+    });
+    return fromApiTeamQuota(response);
+  }
+
+  async getTeamQuota(team: string): Promise<TeamQuota> {
+    return fromApiTeamQuota(await this.doJSON<ApiTeamQuota>("GET", this.versioned(`/teams/${encodeURIComponent(team)}/quota`)));
+  }
+
+  async deleteTeamQuota(team: string): Promise<void> {
+    await this.doJSON<void>("DELETE", this.versioned(`/teams/${encodeURIComponent(team)}/quota`));
   }
 
   async createTemplate(options: CreateTemplateOptions): Promise<Template> {

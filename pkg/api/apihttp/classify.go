@@ -346,6 +346,15 @@ func Classify(err error) Classification {
 	case errors.Is(err, wasmmod.ErrRegistryUnavailable):
 		return Classification{Status: http.StatusBadGateway, RetryAfter: 5, Message: err.Error()}
 
+	// Team quotas (plan item P2): 429 with a code naming the limit, and no
+	// Retry-After: only a delete or a raised quota frees the room.
+	case errors.Is(err, models.ErrTeamQuotaExceeded):
+		return Classification{Status: http.StatusTooManyRequests, Code: models.ErrorCodeTeamQuotaExceeded, Message: truncate(err.Error())}
+	case errors.Is(err, models.ErrTeamQuotaNotFound):
+		return Classification{Status: http.StatusNotFound, Message: "team quota not found"}
+	case errors.Is(err, service.ErrTeamQuotaUnavailable):
+		return Classification{Status: http.StatusServiceUnavailable, RetryAfter: 5, Message: truncate(err.Error()), Log: true, LogLevel: slog.LevelWarn}
+
 	// Capacity / placement.
 	// A placement rule no node satisfies: 409 with a code and no
 	// Retry-After, because waiting does not give a node a label

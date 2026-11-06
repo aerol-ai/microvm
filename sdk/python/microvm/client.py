@@ -52,6 +52,8 @@ from .types import (
     FileMatch,
     GPUOptions,
     PlacementRule,
+    TeamQuota,
+    TeamQuotaOptions,
     HealthStatus,
     IngressTarget,
     Lifecycle,
@@ -1484,6 +1486,31 @@ class MicroVM:
     def _identity_role_path(self, tag: str, team: Any) -> str:
         path = f"{self._version_prefix}/identity/roles/{urllib.parse.quote(tag, safe='')}"
         return _append_query_param(path, "team", str(team or ""))
+
+    def put_team_quota(self, team: str, options: TeamQuotaOptions) -> TeamQuota:
+        """Set a team's quota: the most sandboxes, CPU and memory its
+        sandboxes may hold. Admin only. The same limits twice change nothing.
+        A create, resize or start past the quota fails with 429
+        ``team_quota_exceeded``."""
+        body = _compact(
+            {
+                "max_sandboxes": _first_of(options, "maxSandboxes", "max_sandboxes"),
+                "max_cpu": _first_of(options, "maxCPU", "max_cpu"),
+                "max_memory_mb": _first_of(options, "maxMemoryMB", "max_memory_mb"),
+            }
+        )
+        return _from_api_team_quota(self._do_json("PUT", self._team_quota_path(team), body) or {})
+
+    def get_team_quota(self, team: str) -> TeamQuota:
+        """Read a team's quota and what the team holds now (404 if none)."""
+        return _from_api_team_quota(self._do_json("GET", self._team_quota_path(team), None) or {})
+
+    def delete_team_quota(self, team: str) -> None:
+        """Remove a team's quota. Removing one that is already gone succeeds."""
+        self._do_json("DELETE", self._team_quota_path(team), None)
+
+    def _team_quota_path(self, team: str) -> str:
+        return f"{self._version_prefix}/teams/{urllib.parse.quote(team, safe='')}/quota"
 
     def whoami(self) -> WhoAmI:
         """Who the server says the caller is: principal, role, team and when
@@ -3165,6 +3192,29 @@ def _from_api_session(session: Dict[str, Any]) -> Session:
     exited_at = _first_of(session, "exited_at", "exitedAt")
     if exited_at not in (None, ""):
         result["exitedAt"] = str(exited_at)
+    return result
+
+
+def _from_api_team_quota(payload: Dict[str, Any]) -> TeamQuota:
+    result: TeamQuota = {
+        "team": str(payload.get("team") or ""),
+        "generation": int(payload.get("generation") or 0),
+        "createdAt": str(payload.get("created_at") or ""),
+        "updatedAt": str(payload.get("updated_at") or ""),
+    }
+    if payload.get("max_sandboxes"):
+        result["maxSandboxes"] = int(payload["max_sandboxes"])
+    if payload.get("max_cpu"):
+        result["maxCPU"] = float(payload["max_cpu"])
+    if payload.get("max_memory_mb"):
+        result["maxMemoryMB"] = int(payload["max_memory_mb"])
+    usage = payload.get("usage")
+    if isinstance(usage, dict):
+        result["usage"] = {
+            "sandboxes": int(usage.get("sandboxes") or 0),
+            "cpu": float(usage.get("cpu") or 0),
+            "memoryMB": int(usage.get("memory_mb") or 0),
+        }
     return result
 
 

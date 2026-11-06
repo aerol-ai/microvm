@@ -429,8 +429,14 @@ type Placement struct {
 	// sandbox without profiles.
 	EgressProfiles        []string `json:"egress_profiles,omitempty"`
 	EgressInlineHostnames int      `json:"egress_inline_hostnames,omitempty"`
-	SecretRef             string   `json:"secret_ref,omitempty"`
-	SecretVersion         int      `json:"secret_version,omitempty"`
+	// QuotaCPU / QuotaMemoryMB mirror the size a team's sandbox asked for
+	// (Spec.CPU / Spec.MemoryMB with server defaults) on the HOT row, so the
+	// FSM's team-usage index is rebuilt on Restore without hydrating specs
+	// (fsm_team_quotas.go). Zero for a sandbox no team owns.
+	QuotaCPU      float64 `json:"quota_cpu,omitempty"`
+	QuotaMemoryMB int     `json:"quota_memory_mb,omitempty"`
+	SecretRef     string  `json:"secret_ref,omitempty"`
+	SecretVersion int     `json:"secret_version,omitempty"`
 	// SecretRecipients is the seal recipient set recorded at reserve time
 	// (owner + N backups). The create target seals to this set and must not
 	// recompute it. It is empty only when the placement has no replicated

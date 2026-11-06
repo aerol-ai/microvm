@@ -75,6 +75,8 @@ import ai.aerol.microvm.model.ExecResult;
 import ai.aerol.microvm.model.ExecStreamOptions;
 import ai.aerol.microvm.model.Failover;
 import ai.aerol.microvm.model.PlacementRule;
+import ai.aerol.microvm.model.TeamQuota;
+import ai.aerol.microvm.model.TeamQuotaOptions;
 import ai.aerol.microvm.model.GpuOptions;
 import ai.aerol.microvm.model.Lifecycle;
 import ai.aerol.microvm.model.MountSpec;
@@ -1537,6 +1539,42 @@ class MicroVMClientTest {
             assertTrue(!body.get().containsKey("on_image_change"));
             client.putWarmPool("demand:1", new WarmPoolOptions().setDepth(1).setOnImageChange(WarmPoolOptions.REPLACE_AS_USED));
             assertEquals("replace_as_used", body.get().get("on_image_change"));
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void teamQuotaCallsMapWireShape() throws Exception {
+        AtomicReference<Map<String, Object>> body = new AtomicReference<>();
+        AtomicReference<String> deleted = new AtomicReference<>();
+        HttpServer server = startServer(exchange -> {
+            String path = exchange.getRequestURI().getPath();
+            String method = exchange.getRequestMethod();
+            if (!"/v1/teams/risk/quota".equals(path)) {
+                throw new AssertionError("unexpected request: " + method + " " + path);
+            }
+            if ("DELETE".equals(method)) {
+                deleted.set(path);
+                exchange.sendResponseHeaders(204, -1);
+                exchange.close();
+                return;
+            }
+            if ("PUT".equals(method)) {
+                body.set(castMap(JsonSupport.read(exchange.getRequestBody().readAllBytes(), Map.class)));
+            }
+            writeJson(exchange, 200, mapOf("team", "risk", "max_sandboxes", 3, "max_cpu", 4.0, "generation", 1,
+                "usage", mapOf("sandboxes", 2, "cpu", 1.5, "memory_mb", 1024)));
+        });
+        try {
+            MicroVMClient client = clientFor(server);
+            TeamQuota quota = client.putTeamQuota("risk", new TeamQuotaOptions().setMaxSandboxes(3).setMaxCpu(4.0));
+            assertEquals(Map.of("max_sandboxes", 3, "max_cpu", 4.0), body.get());
+            assertEquals(3, quota.maxSandboxes);
+            assertEquals(2, quota.usage.sandboxes);
+            assertEquals(1024, client.getTeamQuota("risk").usage.memoryMb);
+            client.deleteTeamQuota("risk");
+            assertEquals("/v1/teams/risk/quota", deleted.get());
         } finally {
             server.stop(0);
         }

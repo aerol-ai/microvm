@@ -71,7 +71,8 @@ type PrepareOptions struct {
 	// shape first and pass nil.
 	Normalize func(*models.CreateSandboxRequest) error
 	// OwnerRef is the tenant account recorded on the reservation's secret
-	// handle. Empty leaves the handle untenanted.
+	// handle. Empty takes the caller's owner (service.OwnerRefForCreate), so
+	// a team's reservation always counts against its quota.
 	OwnerRef string
 	// SyncBody re-marshals the normalized request into r.Body so a forwarded
 	// create carries the normalizations the router applied. Native v1 sets
@@ -323,12 +324,19 @@ func Prepare(w http.ResponseWriter, r *http.Request, svc *service.Service, req m
 	}
 	// Names are unique per owner: the reservation claims the caller's
 	// owner-qualified key (internal/cluster/name_key.go). The owner comes
-	// from the request rather than opts.OwnerRef because the facades leave
-	// the reservation's secret handle untenanted but still need their names
-	// in the caller's namespace. The promote re-qualifies idempotently.
+	// from the request, the same owner the reservation records below. The
+	// promote re-qualifies idempotently.
 	redacted := service.RedactClusterSecrets(req)
 	redacted.Name = cluster.QualifiedSandboxName(service.OwnerRefForCreate(r.Context()), redacted.Name)
-	reserveSecrets := cluster.PlacementSecrets{Recipients: recipients, OwnerRef: strings.TrimSpace(opts.OwnerRef)}
+	// The reservation names its owner even for a facade, whose handle used
+	// to stay untenanted until the promote: the leader counts a team's
+	// quota from the rows, and a reservation without its owner would let
+	// two facade creates both pass for the team's last slot (plan item P2).
+	reserveOwner := strings.TrimSpace(opts.OwnerRef)
+	if reserveOwner == "" {
+		reserveOwner = service.OwnerRefForCreate(r.Context())
+	}
+	reserveSecrets := cluster.PlacementSecrets{Recipients: recipients, OwnerRef: reserveOwner}
 	commitCtx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	err = c.ReserveOnTarget(commitCtx, sandboxID, target, &redacted, reserveSecrets, ReservationTTL)
 	cancel()
@@ -379,6 +387,12 @@ func Prepare(w http.ResponseWriter, r *http.Request, svc *service.Service, req m
 		if errors.Is(err, cluster.ErrReservationConflict) {
 			service.RecordFacadeIdempotencyConflict(opts.metric("reservation"))
 			writeMsg(w, http.StatusConflict, "cluster: reservation conflict on sandbox id")
+			return Decision{}, false
+		}
+		// A team at its quota: 429 with a code and no Retry-After, since
+		// only a delete or a raised quota frees the room.
+		if errors.Is(err, cluster.ErrTeamQuotaExceeded) {
+			writeError(w, http.StatusTooManyRequests, models.ErrorCodeTeamQuotaExceeded, err.Error())
 			return Decision{}, false
 		}
 		if errors.Is(err, cluster.ErrCreateBackpressure) {
@@ -738,7 +752,9 @@ func CreateOnSelectedNode(ctx context.Context, svc *service.Service, logger *slo
 	}
 	secrets.OwnerRef = resp.Sandbox.OwnerRef
 	redacted := service.RedactClusterSecrets(req)
-	if promoteErr := c.RecordPlacement(commitCtx, resp.Sandbox.ID, &redacted, secrets); promoteErr != nil {
+	// No reservation came first, so the promote is this create's team-quota
+	// admission: the leader checks it like a reservation (plan item P2).
+	if promoteErr := c.RecordPlacement(cluster.WithTeamQuotaAdmission(commitCtx), resp.Sandbox.ID, &redacted, secrets); promoteErr != nil {
 		RollbackLocalCreate(context.Background(), svc, logger, resp.Sandbox.ID)
 		return nil, promoteErr
 	}

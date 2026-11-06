@@ -50,6 +50,7 @@ pub use types::{
     ExposeProtocol, ExposeResult, ExposedPort, Failover, GPUOptions, GPUVendor, HealthStatus,
     IngressTarget, Lifecycle,
     MountSpec, MountSpecRedacted, MountType, NetworkUsage, PlacementRule, PlatformVolumeMount,
+    TeamQuota, TeamQuotaOptions, TeamQuotaUsage,
     RegisterSnapshotOptions, RegistryAuth,
     ResizeOptions, RetryConfig, Sandbox as SandboxData, SandboxSnapshot, Session, SessionList,
     SessionStatus, SetNetworkLimitsOptions, Template, TemplatePushState, TemplateStatus,
@@ -1929,6 +1930,28 @@ impl Client {
     /// already gone succeeds.
     pub fn delete_identity_role(&self, tag: &str, team: Option<&str>) -> Result<(), Error> {
         self.do_json::<(), ()>(Method::DELETE, &self.identity_role_path(tag, team), None)
+    }
+
+    fn team_quota_path(&self, team: &str) -> String {
+        format!("{}/teams/{}/quota", self.version_prefix(), urlencoding::encode(team))
+    }
+
+    /// Sets a team's quota: the most sandboxes, CPU and memory its sandboxes
+    /// may hold. Admin only. The same limits twice change nothing. A create,
+    /// resize or start past the quota fails with a 429 whose code is
+    /// `team_quota_exceeded`.
+    pub fn put_team_quota(&self, team: &str, opts: TeamQuotaOptions) -> Result<TeamQuota, Error> {
+        self.do_json::<TeamQuotaOptions, TeamQuota>(Method::PUT, &self.team_quota_path(team), Some(&opts))
+    }
+
+    /// Reads a team's quota and what the team holds now (404 if none).
+    pub fn get_team_quota(&self, team: &str) -> Result<TeamQuota, Error> {
+        self.do_json::<(), TeamQuota>(Method::GET, &self.team_quota_path(team), None)
+    }
+
+    /// Removes a team's quota. Removing one that is already gone succeeds.
+    pub fn delete_team_quota(&self, team: &str) -> Result<(), Error> {
+        self.do_json::<(), ()>(Method::DELETE, &self.team_quota_path(team), None)
     }
 
     /// Who the server says the caller is: principal, role, team and when
@@ -5518,6 +5541,33 @@ mod tests {
         assert_eq!(identity.subject, "team:payments:role:deploy");
         assert_eq!(identity.token_file, "/run/aerolvm/identity/token");
         assert!(identity.token_expires_at.is_none());
+    }
+
+    #[test]
+    fn team_quota_calls_map_wire_shape() {
+        let body = serde_json::json!({
+            "team": "risk", "max_sandboxes": 3, "max_cpu": 4.0, "generation": 1,
+            "created_at": "c", "updated_at": "u",
+            "usage": {"sandboxes": 2, "cpu": 1.5, "memory_mb": 1024}
+        })
+        .to_string();
+        let (url, request_rx) = spawn_json_server(body.clone());
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        let quota = client
+            .put_team_quota("risk", TeamQuotaOptions { max_sandboxes: Some(3), max_cpu: Some(4.0), max_memory_mb: None })
+            .expect("put should succeed");
+        let request = request_rx.recv().expect("request should be captured");
+        assert!(request.starts_with("PUT /v1/teams/risk/quota HTTP/1.1\r\n"), "unexpected request: {}", request);
+        assert_eq!(request_json_body(&request), serde_json::json!({"max_sandboxes": 3, "max_cpu": 4.0}));
+        assert_eq!(quota.max_sandboxes, Some(3));
+        assert_eq!(quota.usage.as_ref().map(|u| u.sandboxes), Some(2));
+
+        let (url, request_rx) = spawn_json_server(body);
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        let quota = client.get_team_quota("risk").expect("get should succeed");
+        let request = request_rx.recv().expect("request should be captured");
+        assert!(request.starts_with("GET /v1/teams/risk/quota HTTP/1.1\r\n"), "unexpected request: {}", request);
+        assert_eq!(quota.usage.map(|u| u.memory_mb), Some(1024));
     }
 
     #[test]

@@ -3,6 +3,7 @@ package microvm
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -1018,5 +1019,54 @@ func TestCreateSendsPlacementRule(t *testing.T) {
 	}
 	if _, ok := bodies[1]["placement"]; ok {
 		t.Fatalf("a create without a rule sent placement: %v", bodies[1])
+	}
+}
+
+// TestTeamQuotaCalls: the admin quota calls reach /v1/teams/{team}/quota with
+// the wire body, read the usage back, and a quota refusal is a 429 APIError
+// with the team_quota_exceeded code.
+func TestTeamQuotaCalls(t *testing.T) {
+	ctx := context.Background()
+	type call struct {
+		method, path string
+		body         map[string]any
+	}
+	var calls []call
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		calls = append(calls, call{r.Method, r.URL.Path, body})
+		switch {
+		case r.Method == http.MethodDelete:
+			w.WriteHeader(http.StatusNoContent)
+		case r.URL.Path == "/v1/teams/full/quota":
+			w.WriteHeader(http.StatusTooManyRequests)
+			_ = json.NewEncoder(w).Encode(models.ErrorResponse{Error: `team_quota_exceeded: team "full" holds 1 of its 1 sandboxes`, Code: models.ErrorCodeTeamQuotaExceeded})
+		default:
+			_ = json.NewEncoder(w).Encode(models.TeamQuota{Team: "risk", MaxSandboxes: 3, Generation: 1, Usage: &models.TeamQuotaUsage{Sandboxes: 2}})
+		}
+	}))
+	defer server.Close()
+	client, err := NewClientWithConfig(&sdktypes.MicroVMConfig{APIUrl: server.URL, PATToken: "pat", HTTPClient: server.Client()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	q, err := client.PutTeamQuota(ctx, "risk", sdktypes.TeamQuotaOptions{MaxSandboxes: 3})
+	if err != nil || q.MaxSandboxes != 3 || q.Usage == nil || q.Usage.Sandboxes != 2 {
+		t.Fatalf("put = %+v %v", q, err)
+	}
+	if calls[0].method != http.MethodPut || calls[0].path != "/v1/teams/risk/quota" || calls[0].body["max_sandboxes"] != float64(3) {
+		t.Fatalf("put call = %+v", calls[0])
+	}
+	if q, err := client.GetTeamQuota(ctx, "risk"); err != nil || q.Team != "risk" {
+		t.Fatalf("get = %+v %v", q, err)
+	}
+	if err := client.DeleteTeamQuota(ctx, "risk"); err != nil || calls[2].method != http.MethodDelete {
+		t.Fatalf("delete = %v %+v", err, calls)
+	}
+	_, err = client.GetTeamQuota(ctx, "full")
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) || apiErr.StatusCode != http.StatusTooManyRequests || apiErr.Code != models.ErrorCodeTeamQuotaExceeded {
+		t.Fatalf("refusal = %v", err)
 	}
 }

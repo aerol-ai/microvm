@@ -1031,6 +1031,11 @@ var Registry = []UseCase{
 	{ID: "UC-438", Title: "Placement rules: GET /v1/cluster/members shows each node's zone and labels from its capacity heartbeat, and the zone is the node's zone label", Requires: []Capability{CapCluster}, Implemented: true},
 	{ID: "UC-439", Title: "Placement rules: creates with a zone land only on nodes in that zone, every time, and a create with one node's zone and labels lands on that node", Requires: []Capability{CapCluster}, Implemented: true},
 	{ID: "UC-440", Title: "Placement rules: a rule no node satisfies is refused with 409 placement_unsatisfiable naming the rule and no Retry-After, a malformed rule is a 400, and nothing is created", Implemented: true},
+	{ID: "UC-441", Title: "Team quotas: the admin API is idempotent and admin-only: the same PUT twice keeps generation 1, GET shows usage, DELETE twice converges to 404, and a team runner cannot set its own quota", Requires: []Capability{CapIdentity}, Implemented: true},
+	{ID: "UC-442", Title: "Team quotas: a team at its quota is refused with 429 team_quota_exceeded naming the team and no Retry-After, and deleting a sandbox makes room", Requires: []Capability{CapIdentity}, Implemented: true},
+	{ID: "UC-443", Title: "Team quotas: N creates at once for a team with K free slots grant exactly K and refuse the rest with 429, and usage reads K", Requires: []Capability{CapIdentity}, Implemented: true},
+	{ID: "UC-444", Title: "Team quotas: a resize that grows a sandbox past the team's CPU quota is refused with 429 and changes nothing; shrinking works and usage follows", Requires: []Capability{CapIdentity}, Implemented: true},
+	{ID: "UC-445", Title: "Team quotas: lowering a quota removes nothing, a stopped sandbox of a team over it cannot start (429), and it starts again once the quota is lifted", Requires: []Capability{CapIdentity}, Implemented: true},
 }
 
 // byID is a lookup built once for the report generator.

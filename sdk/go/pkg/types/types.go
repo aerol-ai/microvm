@@ -240,6 +240,18 @@ type EgressProfile = models.EgressProfile
 // EgressProfileOptions is the body of PutEgressProfile: a full replace.
 type EgressProfileOptions = models.EgressProfileRequest
 
+// TeamQuotaOptions is the body of PutTeamQuota: MaxSandboxes, MaxCPU and
+// MaxMemoryMB. A zero limit is no limit; at least one must be set.
+type TeamQuotaOptions = models.TeamQuotaRequest
+
+// TeamQuota is a team's quota, with Usage (what the team holds now) when
+// read back.
+type TeamQuota = models.TeamQuota
+
+// TeamQuotaUsage is what a team holds: every sandbox not deleted, at the
+// size it asked for.
+type TeamQuotaUsage = models.TeamQuotaUsage
+
 // EgressProfileList is one page of ListEgressProfiles.
 type EgressProfileList = models.EgressProfileList
 

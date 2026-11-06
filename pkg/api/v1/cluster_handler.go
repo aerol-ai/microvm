@@ -318,7 +318,9 @@ func (h *handlers) createSandboxOnSelectedNode(w http.ResponseWriter, r *http.Re
 	}
 	secrets.OwnerRef = resp.Sandbox.OwnerRef
 	redacted := h.deps.Service.RedactClusterSecretsConfigured(req)
-	promoteErr := c.RecordPlacement(commitCtx, resp.Sandbox.ID, &redacted, secrets)
+	// No reservation came first, so the promote is this create's team-quota
+	// admission (plan item P2).
+	promoteErr := c.RecordPlacement(cluster.WithTeamQuotaAdmission(commitCtx), resp.Sandbox.ID, &redacted, secrets)
 
 	if promoteErr != nil {
 		h.deps.Logger.Error("cluster: RecordPlacement failed; rolling back create",
@@ -327,6 +329,11 @@ func (h *handlers) createSandboxOnSelectedNode(w http.ResponseWriter, r *http.Re
 		if errors.Is(promoteErr, cluster.ErrNameConflict) {
 			setCreateServerTiming(w, createStart, createTiming, h.deps.ContainerEngine)
 			apihttp.WriteError(w, http.StatusConflict, "sandbox name already in use cluster-wide")
+			return
+		}
+		if errors.Is(promoteErr, cluster.ErrTeamQuotaExceeded) {
+			setCreateServerTiming(w, createStart, createTiming, h.deps.ContainerEngine)
+			apihttp.WriteStoreAwareError(h.deps.Logger, w, promoteErr)
 			return
 		}
 		setCreateServerTiming(w, createStart, createTiming, h.deps.ContainerEngine)

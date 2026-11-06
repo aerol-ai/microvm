@@ -85,6 +85,12 @@ func TestClassify(t *testing.T) {
 		{"placement unsatisfiable", models.PlacementUnsatisfiableError(map[string]string{"zone": "z1"}), http.StatusConflict, 0, models.ErrorCodePlacementUnsatisfiable, ErrKindOther},
 		{"placement invalid", fmt.Errorf("%w: bad", models.ErrInvalidPlacement), http.StatusBadRequest, 0, "", ErrKindUnclassified},
 		{"control plane without placement rules", cluster.ErrPlacementRulesUnsupported, http.StatusServiceUnavailable, 0, "", ErrKindOther},
+		// Team quotas: 429 with its code and no Retry-After (only a delete or
+		// a raised quota frees room); a missing quota is 404; an unreachable
+		// quota store is a retryable 503.
+		{"team quota exceeded", models.CheckTeamQuota("risk", models.TeamQuotaRequest{MaxSandboxes: 1}, models.TeamQuotaUsage{Sandboxes: 1}, models.TeamQuotaUsage{Sandboxes: 1}), http.StatusTooManyRequests, 0, models.ErrorCodeTeamQuotaExceeded, ErrKindOther},
+		{"team quota not found", models.ErrTeamQuotaNotFound, http.StatusNotFound, 0, "", ErrKindOther},
+		{"team quota unavailable", service.ErrTeamQuotaUnavailable, http.StatusServiceUnavailable, 5, "", ErrKindOther},
 		{"backpressure", cluster.ErrCreateBackpressure, http.StatusTooManyRequests, cluster.CreateBackpressureRetryAfterSeconds, "", ErrKindOther},
 		{"not leader", cluster.ErrNotLeader, http.StatusServiceUnavailable, cluster.LeaderChangeRetryAfterSeconds, "", ErrKindOther},
 		{"no leader", fmt.Errorf("storage retirement: %w", cluster.ErrNoLeader), http.StatusServiceUnavailable, cluster.LeaderChangeRetryAfterSeconds, "", ErrKindOther},

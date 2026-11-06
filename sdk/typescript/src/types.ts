@@ -998,6 +998,35 @@ export interface EgressProfile {
   updatedAt: string;
 }
 
+/**
+ * A team quota's limits, the body of `putTeamQuota`. Omit a limit (or set
+ * 0) for no limit on it. At least one must be set.
+ */
+export interface TeamQuotaOptions {
+  /** Most sandboxes the team may hold, running or stopped. */
+  maxSandboxes?: number;
+  /** Most CPU the team's sandboxes may ask for in total. */
+  maxCPU?: number;
+  /** Most memory, in MB, the team's sandboxes may ask for in total. */
+  maxMemoryMB?: number;
+}
+
+/** What a team holds now: every sandbox not deleted, at the size it asked for. */
+export interface TeamQuotaUsage {
+  sandboxes: number;
+  cpu: number;
+  memoryMB: number;
+}
+
+/** A team's quota, and its usage when read back. */
+export interface TeamQuota extends TeamQuotaOptions {
+  team: string;
+  generation: number;
+  createdAt: string;
+  updatedAt: string;
+  usage?: TeamQuotaUsage;
+}
+
 /** The body of `putEgressProfile`: a full replace. */
 export interface EgressProfileOptions {
   allowOut: string[];

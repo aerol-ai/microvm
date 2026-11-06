@@ -1232,6 +1232,52 @@ pub struct EgressInject {
     pub secret_ref: String,
 }
 
+/// A team quota's limits, the body of `put_team_quota`. `None` (or 0) is no
+/// limit on that axis; at least one must be set.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
+pub struct TeamQuotaOptions {
+    /// Most sandboxes the team may hold, running or stopped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_sandboxes: Option<u32>,
+    /// Most CPU the team's sandboxes may ask for in total.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_cpu: Option<f64>,
+    /// Most memory, in MB, the team's sandboxes may ask for in total.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_memory_mb: Option<u32>,
+}
+
+/// What a team holds now: every sandbox not deleted, at the size it asked for.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
+pub struct TeamQuotaUsage {
+    #[serde(default)]
+    pub sandboxes: u32,
+    #[serde(default)]
+    pub cpu: f64,
+    #[serde(default)]
+    pub memory_mb: u32,
+}
+
+/// A team's quota, and its usage when read back.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
+pub struct TeamQuota {
+    pub team: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_sandboxes: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_cpu: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_memory_mb: Option<u32>,
+    #[serde(default)]
+    pub generation: i64,
+    #[serde(default)]
+    pub created_at: String,
+    #[serde(default)]
+    pub updated_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<TeamQuotaUsage>,
+}
+
 /// A named allowlist sandboxes reference through `egress_profiles`.
 /// Profiles belong to your account; `generation` goes up on every change.
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]

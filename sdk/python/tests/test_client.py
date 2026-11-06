@@ -134,6 +134,13 @@ class RecordingMicroVM(MicroVM):
                 "suggested_allow_out": [],
                 "suggested_profile": {"allow_out": ["x.example"], "description": "d"},
             }
+        if path.startswith("/v1/teams/"):
+            if method == "DELETE":
+                return None
+            return {
+                "team": "risk", "max_sandboxes": 3, "max_cpu": 4.0, "generation": 1, "created_at": "c", "updated_at": "u",
+                "usage": {"sandboxes": 2, "cpu": 1.5, "memory_mb": 1024},
+            }
         if path.startswith("/v1/egress-profiles"):
             if method == "DELETE":
                 return None
@@ -1196,6 +1203,24 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(sent[0], {"depth": 2, "on_image_change": "replace_as_used"})
         self.assertEqual(pool["onImageChange"], "replace_as_used")
         self.assertEqual((pool["status"]["outdated"], pool["status"]["servers"][0]["outdated"]), (1, 1))
+
+    def test_team_quota_calls(self):
+        client = RecordingMicroVM()
+        quota = client.put_team_quota("risk", {"maxSandboxes": 3, "maxCPU": 4})
+        self.assertEqual(client.calls[0], ("PUT", "/v1/teams/risk/quota", {"max_sandboxes": 3, "max_cpu": 4}))
+        self.assertEqual(
+            quota,
+            {
+                "team": "risk", "maxSandboxes": 3, "maxCPU": 4.0, "generation": 1, "createdAt": "c", "updatedAt": "u",
+                "usage": {"sandboxes": 2, "cpu": 1.5, "memoryMB": 1024},
+            },
+        )
+        self.assertEqual(client.get_team_quota("risk")["usage"]["sandboxes"], 2)
+        self.assertEqual(client.calls[1][:2], ("GET", "/v1/teams/risk/quota"))
+        client.delete_team_quota("risk")
+        self.assertEqual(client.calls[2][:2], ("DELETE", "/v1/teams/risk/quota"))
+        # Every quota call is safe to retry: PUT and DELETE converge.
+        self.assertEqual(client.non_idempotent_calls, [])
 
     def test_learn_mode(self):
         client = RecordingMicroVM()

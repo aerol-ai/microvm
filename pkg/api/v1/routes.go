@@ -159,6 +159,11 @@ func RegisterRoutes(mux apihttp.Mux, d Deps) {
 	mux.Handle("GET "+PathPrefix+"/egress-profiles/{name}", d.Route(permRead, http.HandlerFunc(h.getEgressProfile)))
 	mux.Handle("DELETE "+PathPrefix+"/egress-profiles/{name}", d.Route(permWrite, http.HandlerFunc(h.deleteEgressProfile)))
 	mux.Handle("GET "+PathPrefix+"/egress-profiles", d.Route(permRead, http.HandlerFunc(h.listEgressProfiles)))
+	// Team quotas (plan item P2): an admin caps what a team may hold. Not
+	// sandbox-scoped; in a cluster the service writes them through Raft.
+	mux.Handle("PUT "+PathPrefix+"/teams/{team}/quota", d.Route(permFleet, http.HandlerFunc(h.putTeamQuota)))
+	mux.Handle("GET "+PathPrefix+"/teams/{team}/quota", d.Route(permFleet, http.HandlerFunc(h.getTeamQuota)))
+	mux.Handle("DELETE "+PathPrefix+"/teams/{team}/quota", d.Route(permFleet, http.HandlerFunc(h.deleteTeamQuota)))
 	// Cloud identity (plans/sandbox-cloud-identity.md): each team's
 	// role-tag allow list is admin only (D1.5), key rotation is the
 	// operator's. Not sandbox-scoped, so no owner forwarding; in a cluster
@@ -282,6 +287,8 @@ func RegisterRoutes(mux apihttp.Mux, d Deps) {
 	mux.Handle("POST "+cluster.PublicInternalArtifactCatalogEpochPath, internalOp(http.HandlerFunc(h.clusterInternalArtifactCatalogEpoch)))
 	mux.Handle("POST "+cluster.PublicInternalEgressProfileWritePath, internalOp(http.HandlerFunc(h.clusterInternalEgressProfileWrite)))
 	mux.Handle("POST "+cluster.PublicInternalEgressProfileReadPath, internalOp(http.HandlerFunc(h.clusterInternalEgressProfileRead)))
+	mux.Handle("POST "+cluster.PublicInternalTeamQuotaWritePath, internalOp(http.HandlerFunc(h.clusterInternalTeamQuotaWrite)))
+	mux.Handle("POST "+cluster.PublicInternalTeamQuotaReadPath, internalOp(http.HandlerFunc(h.clusterInternalTeamQuotaRead)))
 	mux.Handle("POST "+cluster.PublicInternalIdentityWritePath, internalOp(http.HandlerFunc(h.clusterInternalIdentityWrite)))
 	mux.Handle("POST "+cluster.PublicInternalIdentityReadPath, internalOp(http.HandlerFunc(h.clusterInternalIdentityRead)))
 	mux.Handle("POST "+cluster.PublicInternalAPITokenWritePath, internalOp(http.HandlerFunc(h.clusterInternalAPITokenWrite)))

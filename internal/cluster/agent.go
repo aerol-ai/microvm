@@ -154,6 +154,8 @@ type Agent struct {
 	// profiles caches the egress profiles this worker's sandboxes use
 	// (egress_profiles.go): a worker holds no FSM.
 	profiles egressProfileCache
+	// teamQuotas caches team-quota reads for the start check (team_quotas.go).
+	teamQuotas teamQuotaCache
 	// identityRoles caches the role tags this worker's creates and token
 	// refreshes ask about (identity.go).
 	identityRoles identityRoleCache
@@ -1490,6 +1492,7 @@ func (a *Agent) applyCommand(ctx context.Context, cmd command) error {
 	if err := validateCommandLifecycle(cmd); err != nil {
 		return err
 	}
+	cmd = markQuotaAdmit(ctx, cmd)
 	payload, err := encodeCommand(cmd)
 	if err != nil {
 		return fmt.Errorf("cluster: encode command: %w", err)
@@ -1693,6 +1696,11 @@ func (a *Agent) doHTTPRequest(ctx context.Context, client *http.Client, endpoint
 			// Idempotency-Key retry's re-reserve that hits it is routed to
 			// the reservation's owner, which keys off errors.Is.
 			return fmt.Errorf("%w: %s", ErrIncarnationConflict, message)
+		}
+		if resp.StatusCode == http.StatusTooManyRequests && strings.Contains(message, ErrTeamQuotaExceeded.Error()) {
+			// A team at its quota is a verdict, not backpressure: the create
+			// path answers it as team_quota_exceeded.
+			return fmt.Errorf("%w: %s", ErrTeamQuotaExceeded, message)
 		}
 		if resp.StatusCode == http.StatusConflict && strings.Contains(message, ErrPlacementUnsatisfiable.Error()) {
 			// The leader refused a reservation outside the sandbox's
