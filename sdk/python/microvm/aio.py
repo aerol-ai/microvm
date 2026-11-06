@@ -23,6 +23,7 @@ from typing import Any, AsyncIterator, Dict, Iterator, List, Optional, Tuple, Un
 from .client import (
     _MAX_LIST_PAGES,
     _NOT_STARTED_STATUSES,
+    _REPLY_LOST_STATUSES,
     _RETRY_STATUSES,
     DEFAULT_LIST_LIMIT,
     ExecStreamHandle,
@@ -739,6 +740,7 @@ class AsyncMicroVM(_MicroVMCore):
         for key, value in self._header_items(content_type, extra_headers):
             headers[key] = value
         last_exc: Optional[BaseException] = None
+        may_have_run = False  # done_code: see MicroVM._request
 
         for attempt in range(max_retries + 1):
             retry_after: Optional[str] = None
@@ -758,10 +760,12 @@ class AsyncMicroVM(_MicroVMCore):
                     raise _deadline_error() from exc
                 if attempt >= max_retries or not (idempotent or _never_sent(exc)):
                     raise _transport_timeout(exc) from exc
+                may_have_run = may_have_run or not _never_sent(exc)
             except httpx.TransportError as exc:
                 last_exc = exc
                 if attempt >= max_retries or not (idempotent or _never_sent(exc)):
                     raise
+                may_have_run = may_have_run or not _never_sent(exc)
             else:
                 try:
                     if response.status_code < 400:
@@ -772,8 +776,10 @@ class AsyncMicroVM(_MicroVMCore):
                         result = await asyncio.to_thread(reader, _SyncBody(loop, response), response.headers)
                         return result, response.headers
                     payload = await response.aread()
-                    if done_code is not None and attempt > 0 and _error_code(payload) == done_code:
+                    if done_code is not None and may_have_run and _error_code(payload) == done_code:
                         return b"", {}
+                    if response.status_code in _REPLY_LOST_STATUSES:
+                        may_have_run = True
                     if response.status_code in retry_statuses and attempt < max_retries:
                         if response.status_code in _NOT_STARTED_STATUSES:
                             retry_after = response.headers.get("Retry-After")
@@ -788,12 +794,14 @@ class AsyncMicroVM(_MicroVMCore):
                         raise _deadline_error() from exc
                     if attempt >= max_retries or not idempotent or body_started:
                         raise _transport_timeout(exc) from exc
+                    may_have_run = True
                 except httpx.TransportError as exc:
                     # The answer broke off while it was read: the server may
                     # already be acting on the request.
                     last_exc = exc
                     if attempt >= max_retries or not idempotent or body_started:
                         raise
+                    may_have_run = True
                 finally:
                     await response.aclose()
 

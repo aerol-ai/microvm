@@ -2190,6 +2190,11 @@ public class MicroVMClient {
         int maxRetryAfter = retryConfig.maxRetryAfterMs != null ? retryConfig.maxRetryAfterMs : RetryAfter.DEFAULT_MAX_RETRY_AFTER_MS;
 
         Exception lastException = null;
+        // doneCode counts only after an attempt whose reply was lost (a
+        // dropped connection, 502 or 504): that attempt may have done the
+        // work. A 421, 429 or 503 is answered before any work, so after one
+        // a delete of a path that was never there still reports it.
+        boolean mayHaveRun = false;
 
         for (int attempt = 0; attempt <= maxRetries; attempt++) {
             String retryAfter = null;
@@ -2209,10 +2214,11 @@ public class MicroVMClient {
 
             try {
                 HttpResponse<T> response = httpClient.send(builder.build(), handler);
-                if (doneCode != null && attempt > 0 && response.statusCode() >= 400
+                if (doneCode != null && mayHaveRun && response.statusCode() >= 400
                     && response.body() instanceof byte[] && doneCode.equals(errorCode((byte[]) response.body()))) {
                     return null;
                 }
+                mayHaveRun |= response.statusCode() == 502 || response.statusCode() == 504;
                 if (attempt < maxRetries && retryMode.retriesStatus(response.statusCode())) {
                     // Fall through to retry logic
                     retryAfter = RetryAfter.hint(response);
@@ -2234,6 +2240,7 @@ public class MicroVMClient {
                 if (attempt >= maxRetries) {
                     break;
                 }
+                mayHaveRun |= !RetryMode.UNSENT_ONLY.retriesTransportFailure(ex);
             }
 
             // A 429 or 503 waits as long as its Retry-After asks, within

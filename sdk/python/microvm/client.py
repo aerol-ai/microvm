@@ -127,6 +127,10 @@ _RETRY_STATUSES = frozenset({421, 429, 502, 503, 504})
 # 429 when this caller is over its share, 503 when the node sheds load. A
 # Retry-After on a 421, 502 or 504 is a hop's, so those use the backoff.
 _NOT_STARTED_STATUSES = frozenset({429, 503})
+# Statuses after which the server may still have done the work: a gateway
+# gave up waiting for it. A done_code retry counts only after one of these
+# or a lost connection; 421, 429 and 503 are answered before any work.
+_REPLY_LOST_STATUSES = frozenset({502, 504})
 # The toolboxd feature (on /version) behind the file verbs' options: list
 # depth and cap, the move and copy overwrite guard, mkdir without parents and
 # the copy route. An older agent ignores those options (overwrite=false would
@@ -2333,8 +2337,10 @@ class MicroVM(_MicroVMCore):
 
         ``done_code`` is for a call whose retry can find its own work done
         (a delete finds the path gone, a mkdir its folder): when a re-sent
-        attempt, never the first, gets an error carrying that toolbox error
-        code, the first attempt's reply was lost and the call succeeds.
+        attempt gets an error carrying that toolbox error code after an
+        earlier attempt whose reply was lost (a dropped connection, 502 or
+        504), that attempt did the work and the call succeeds. After a 421,
+        429 or 503 the server did nothing, so the error stands.
 
         ``idempotent=True`` (every endpoint but exec; the daemon designs them
         for duplicate calls) retries any transport failure and the statuses
@@ -2354,6 +2360,7 @@ class MicroVM(_MicroVMCore):
         retry_statuses = _RETRY_STATUSES if idempotent else _NOT_STARTED_STATUSES
 
         last_exc: Optional[Exception] = None
+        may_have_run = False
 
         for attempt in range(max_retries + 1):
             retry_after: Optional[str] = None
@@ -2380,13 +2387,15 @@ class MicroVM(_MicroVMCore):
             except urllib.error.HTTPError as exc:
                 last_exc = exc
                 payload: Optional[bytes] = None
-                if done_code is not None and attempt > 0:
+                if done_code is not None and may_have_run:
                     try:
                         payload = exc.read()
                     finally:
                         exc.close()
                     if _error_code(payload) == done_code:
                         return b"", {}
+                if exc.code in _REPLY_LOST_STATUSES:
+                    may_have_run = True
                 if exc.code in retry_statuses and attempt < max_retries:
                     if exc.code in _NOT_STARTED_STATUSES and exc.headers is not None:
                         retry_after = exc.headers.get("Retry-After")
@@ -2406,6 +2415,8 @@ class MicroVM(_MicroVMCore):
                     raise _deadline_error() from exc
                 if attempt >= max_retries or not (idempotent or _request_never_sent(exc)):
                     raise
+                if not _request_never_sent(exc):
+                    may_have_run = True
             except MicroVMError:
                 # The reader's own refusal (a file over max_bytes, the
                 # call's deadline mid-download): never retried.
@@ -2419,6 +2430,7 @@ class MicroVM(_MicroVMCore):
                     raise _deadline_error() from exc
                 if attempt >= max_retries or not idempotent or body_started:
                     raise
+                may_have_run = True
 
             delay = self._retry_delay(attempt, retry_after, time.time(), random.random())
             left = _time_left()

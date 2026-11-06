@@ -608,7 +608,7 @@ The SDKs retry a call that failed on the way. Calls that are safe to send twice 
 | `listFiles`, `getFileInfo`, `fileExists`, `searchFiles`, `findInFiles`, `downloadFile` | 421, 429, 502, 503, 504 and dropped connections |
 | Streamed downloads (`downloadFileStream`, `download_file_to`) | The same, until the file starts to arrive; never after. |
 | `uploadFile`, plain or atomic | 421, 429, 502, 503, 504 and dropped connections: sending the same bytes again leaves the same file |
-| `deleteFile`, `makeDir` | The same. If a retry finds the work already done (the file is gone, the folder is there), the call succeeds. |
+| `deleteFile`, `makeDir` | The same. If an earlier try's answer was lost (the connection dropped, or a `502` or `504`) and the retry finds the work done (the file is gone, the folder is there), the call succeeds. After a `421`, `429` or `503` the server did nothing, so a missing file is still an error. |
 | `moveFile`, `copyFile`, `uploadFile` with append or create only | Only 429 and 503, when the server did nothing. After any other failure the work may have happened (a second append would add the data twice), so the SDK reports the error instead of guessing. |
 | `uploadDir` and the streamed uploads (`uploadFileStream`, `upload_file_from`, Go `UploadFileStream`) | Never: the data is built or read as it is sent, so the SDK sends it once. |
 

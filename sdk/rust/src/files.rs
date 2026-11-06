@@ -917,8 +917,19 @@ mod tests {
 
     #[test]
     fn a_retried_delete_or_mkdir_counts_work_already_done() {
+        // n counts per route and every delete is one route (the path is in
+        // the query), so the cases that fail only their first try count
+        // their own tries.
+        // Reply is a plain fn, so the count lives in a static.
+        static TRIES: Mutex<Option<std::collections::HashMap<String, usize>>> = Mutex::new(None);
         let (client, calls) = fake_toolbox(&["files.verbs"], |call, n| {
             let path = call.query.get("path").cloned().unwrap_or_default();
+            let tried = {
+                let mut tries = TRIES.lock().unwrap();
+                let t = tries.get_or_insert_with(Default::default).entry(path.clone()).or_insert(0);
+                *t += 1;
+                *t
+            };
             if path.starts_with("/lost") {
                 if n == 0 {
                     return (502, None, vec![]);
@@ -930,8 +941,11 @@ mod tests {
                 };
             }
             match path.as_str() {
-                "/route-missing" if n == 0 => (503, None, vec![]),
+                "/route-missing" if tried == 1 => (503, None, vec![("Retry-After", "0")]),
                 "/route-missing" => (404, err("not found", None), vec![]),
+                // A 429 is answered before any work: the path was never there.
+                "/refused" if tried == 1 => (429, None, vec![("Retry-After", "0")]),
+                "/refused" => (404, err("lstat: no such file or directory", Some("file_not_found")), vec![]),
                 "/missing" => (404, err("lstat /missing: no such file or directory", Some("file_not_found")), vec![]),
                 "/a-file" => (409, err("mkdir /a-file: file exists", None), vec![]),
                 "/new-dir" => (201, None, vec![]),
@@ -960,6 +974,12 @@ mod tests {
         assert_eq!(api_status(client.make_dir("sb-1", "/a-file", MakeDirOptions::default())), 409);
         // An uncoded 404 on a retry may be an agent without the route.
         assert_eq!(api_status(client.delete_file("sb-1", "/route-missing", DeleteFileOptions::default())), 404);
+        // After a 429 the server did nothing, so a coded 404 on the retry
+        // means the path never existed, not that this call deleted it.
+        match client.delete_file("sb-1", "/refused", DeleteFileOptions::default()) {
+            Err(Error::Api(api)) => assert_eq!((api.status(), api.code()), (404, Some("file_not_found"))),
+            other => panic!("delete of a missing path after a 429 = {:?}", other),
+        }
     }
 
     #[test]

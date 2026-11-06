@@ -2726,6 +2726,11 @@ impl Client {
     ) -> Result<Option<reqwest::blocking::Response>, Error> {
         let max_retries = self.retry_config.max_retries.unwrap_or(3);
 
+        // done_code counts only after an attempt whose reply was lost (a
+        // dropped connection, 502 or 504): that attempt may have done the
+        // work. A 421, 429 or 503 is answered before any work, so after one
+        // a delete of a path that was never there still reports it.
+        let mut may_have_run = false;
         let mut attempt = 0;
         loop {
             let mut retry_after = None;
@@ -2741,7 +2746,9 @@ impl Client {
 
             match builder.send() {
                 Ok(response) => {
-                    if let (Some(code), true) = (done_code, attempt > 0 && !response.status().is_success()) {
+                    let earlier_may_have_run = may_have_run;
+                    may_have_run |= matches!(response.status().as_u16(), 502 | 504);
+                    if let (Some(code), true) = (done_code, earlier_may_have_run && !response.status().is_success()) {
                         let status = response.status();
                         let hint = retry_after_hint(&response);
                         let header_retry_after = response
@@ -2770,6 +2777,8 @@ impl Client {
                     if attempt >= max_retries || !policy.retries_error(&err) {
                         return Err(Error::Reqwest(err));
                     }
+                    // is_connect fails before a byte of the request is written.
+                    may_have_run |= !err.is_connect();
                 }
             }
 

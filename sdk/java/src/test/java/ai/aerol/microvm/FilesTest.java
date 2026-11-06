@@ -250,8 +250,13 @@ class FilesTest {
 
     @Test
     void aRetriedDeleteOrMkdirCountsWorkAlreadyDone() throws Exception {
+        // n counts per route and every delete is one route (the path is in
+        // the query), so the cases that fail only their first try count
+        // their own tries.
+        Map<String, Integer> tries = new java.util.concurrent.ConcurrentHashMap<>();
         MicroVMClient client = serve(List.of("files.verbs"), (call, n) -> {
             String path = call.query().getOrDefault("path", "");
+            int tried = tries.merge(path, 1, Integer::sum);
             if (path.startsWith("/lost")) {
                 if (n == 0) {
                     return Reply.of(502, null);
@@ -262,7 +267,12 @@ class FilesTest {
             }
             switch (path) {
                 case "/route-missing":
-                    return n == 0 ? Reply.of(503, null) : Reply.of(404, err("not found", null));
+                    return tried == 1 ? new Reply(503, null, Map.of("Retry-After", "0")) : Reply.of(404, err("not found", null));
+                case "/refused":
+                    // A 429 is answered before any work: the path was never there.
+                    return tried == 1
+                        ? new Reply(429, null, Map.of("Retry-After", "0"))
+                        : Reply.of(404, err("lstat: no such file or directory", "file_not_found"));
                 case "/missing":
                     return Reply.of(404, err("lstat /missing: no such file or directory", "file_not_found"));
                 case "/a-file":
@@ -284,6 +294,12 @@ class FilesTest {
         assertEquals(409, assertThrows(MicroVMApiException.class, () -> client.makeDir("sb-1", "/a-file")).getStatusCode());
         // An uncoded 404 on a retry may be an agent without the route.
         assertEquals(404, assertThrows(MicroVMApiException.class, () -> client.deleteFile("sb-1", "/route-missing")).getStatusCode());
+        // After a 429 the server did nothing, so a coded 404 on the retry
+        // means the path never existed, not that this call deleted it.
+        MicroVMApiException refused = assertThrows(MicroVMApiException.class, () -> client.deleteFile("sb-1", "/refused"));
+        assertEquals(404, refused.getStatusCode());
+        assertEquals("file_not_found", refused.getCode());
+        assertEquals(2, tries.get("/refused"));
     }
 
     @Test

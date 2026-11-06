@@ -156,8 +156,14 @@ class FileVerbTests(unittest.TestCase):
         self.assertTrue(all(not p.endswith("/version") for _, p, _ in fake.calls))
 
     def test_retried_delete_and_mkdir_count_work_already_done(self):
+        # n counts per route and every delete is one route (the path is in
+        # the query), so the cases that fail only their first try count
+        # their own tries.
+        tries = {}
+
         def reply(method, path, query, n):
             target = query.get("path", "")
+            tries[target] = tries.get(target, 0) + 1
             if target.startswith("/lost"):
                 if n == 0:
                     return 502, None, {}
@@ -165,7 +171,12 @@ class FileVerbTests(unittest.TestCase):
                     return 404, _err("lstat: no such file or directory", "file_not_found"), {}
                 return 409, _err(target + " already exists", "folder_exists"), {}
             if target == "/route-missing":
-                return (503, None, {}) if n == 0 else (404, _err("not found"), {})
+                return (503, None, {"Retry-After": "0"}) if tries[target] == 1 else (404, _err("not found"), {})
+            if target == "/refused":
+                # A 429 is answered before any work: the path was never there.
+                if tries[target] == 1:
+                    return 429, None, {"Retry-After": "0"}
+                return 404, _err("lstat: no such file or directory", "file_not_found"), {}
             if target == "/missing":
                 return 404, _err("lstat /missing: no such file or directory", "file_not_found"), {}
             if target == "/a-file":
@@ -186,6 +197,11 @@ class FileVerbTests(unittest.TestCase):
         # An uncoded 404 on a retry may be an agent without the route.
         with self.assertRaises(MicroVMHTTPError):
             fake.client.delete_file("sb-1", "/route-missing")
+        # After a 429 the server did nothing, so a coded 404 on the retry
+        # means the path never existed, not that this call deleted it.
+        with self.assertRaises(MicroVMHTTPError) as ctx:
+            fake.client.delete_file("sb-1", "/refused")
+        self.assertEqual((ctx.exception.status_code, ctx.exception.code), (404, "file_not_found"))
 
     def test_move_and_copy_retry_only_refusals(self):
         def reply(method, path, query, n):

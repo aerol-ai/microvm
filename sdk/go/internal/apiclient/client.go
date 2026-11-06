@@ -1341,11 +1341,12 @@ func (c *Client) doWithRetry(ctx context.Context, policy retryPolicy, makeReq fu
 
 // doWithRetryDone is doWithRetry for a call whose retry can find its own
 // work already done: a delete whose reply was lost finds the path gone, a
-// mkdir finds its folder made. When a re-sent attempt (never the first)
-// gets an error reply carrying the toolbox error code doneCode, the call
-// succeeds with an empty 204 (plan section 10, "Retries"). The first
-// attempt still reports the error: the caller asked to delete something
-// that was not there.
+// mkdir finds its folder made. When a re-sent attempt gets an error reply
+// carrying the toolbox error code doneCode, the call succeeds with an empty
+// 204 (plan section 10, "Retries"), but only if an earlier attempt may have
+// done the work: its reply was lost (a dropped connection, 502 or 504). A
+// 421, 429 or 503 says the server did nothing, so a delete of a path that
+// was never there still reports it after one, as the first attempt does.
 func (c *Client) doWithRetryDone(ctx context.Context, policy retryPolicy, doneCode string, makeReq func() (*http.Request, error)) (*http.Response, error) {
 	maxRetries := *c.retryConfig.MaxRetries
 	if maxRetries < 0 {
@@ -1353,6 +1354,7 @@ func (c *Client) doWithRetryDone(ctx context.Context, policy retryPolicy, doneCo
 	}
 
 	var lastErr error
+	mayHaveRun := false
 	for attempt := 0; attempt <= maxRetries; attempt++ {
 		req, err := makeReq()
 		if err != nil {
@@ -1360,9 +1362,14 @@ func (c *Client) doWithRetryDone(ctx context.Context, policy retryPolicy, doneCo
 		}
 
 		response, err := c.httpClient.Do(req)
-		if err == nil && attempt > 0 && doneCode != "" && response.StatusCode >= 400 && replyHasCode(response, doneCode) {
+		if err == nil && mayHaveRun && doneCode != "" && response.StatusCode >= 400 && replyHasCode(response, doneCode) {
 			response.Body.Close()
 			return &http.Response{StatusCode: http.StatusNoContent, Header: http.Header{}, Body: http.NoBody, Request: req}, nil
+		}
+		// A connect-phase failure sent nothing (isUnsentTransportError), so,
+		// as in the other SDKs, it says nothing about the work.
+		if (err != nil && !isUnsentTransportError(err)) || (err == nil && replyMayBeLost(response.StatusCode)) {
+			mayHaveRun = true
 		}
 
 		var retryAfter string
@@ -1386,6 +1393,13 @@ func (c *Client) doWithRetryDone(ctx context.Context, policy retryPolicy, doneCo
 		}
 	}
 	return nil, lastErr
+}
+
+// replyMayBeLost reports a status after which the server may still have
+// done the work: a gateway gave up waiting for it (502, 504). 421, 429 and
+// 503 are answered before any work.
+func replyMayBeLost(code int) bool {
+	return code == http.StatusBadGateway || code == http.StatusGatewayTimeout
 }
 
 // replyHasCode reports whether an error reply's JSON carries code. The body

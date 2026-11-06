@@ -4,11 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 
 	"github.com/aerol-ai/microvm/pkg/models"
@@ -202,8 +204,13 @@ func TestGetFileInfoAndExists(t *testing.T) {
 func TestDeleteAndMakeDirRetryFindsWorkDone(t *testing.T) {
 	ctx := context.Background()
 	fake := &fakeToolbox{features: []string{FeatureFileVerbs}}
+	// n counts per route, and every delete is one route (the path is in
+	// the query), so the cases that fail only their first try count their
+	// own tries.
+	tries := map[string]int{}
 	fake.reply = func(r *http.Request, n int) (int, any, http.Header) {
 		path := r.URL.Query().Get("path")
+		tries[path]++
 		switch {
 		case strings.HasPrefix(path, "/lost-reply"):
 			// The first attempt did the work, but its reply was lost.
@@ -215,10 +222,16 @@ func TestDeleteAndMakeDirRetryFindsWorkDone(t *testing.T) {
 			}
 			return http.StatusConflict, errBody(path+" already exists", codeFolderExists), nil
 		case strings.HasPrefix(path, "/route-missing"):
-			if n == 0 {
-				return http.StatusServiceUnavailable, nil, nil
+			if tries[path] == 1 {
+				return http.StatusServiceUnavailable, nil, http.Header{"Retry-After": {"0"}}
 			}
 			return http.StatusNotFound, errBody("not found", ""), nil
+		case path == "/refused-then-missing":
+			// A 429 is sent before any work: the path was never there.
+			if tries[path] == 1 {
+				return http.StatusTooManyRequests, nil, http.Header{"Retry-After": {"0"}}
+			}
+			return http.StatusNotFound, errBody("lstat: no such file or directory", codeFileNotFound), nil
 		case path == "/missing":
 			return http.StatusNotFound, errBody("lstat /missing: no such file or directory", codeFileNotFound), nil
 		case path == "/a-file":
@@ -250,6 +263,11 @@ func TestDeleteAndMakeDirRetryFindsWorkDone(t *testing.T) {
 	// agent too old to have the route.
 	if err := client.DeleteFile(ctx, "sb-1", "/route-missing", sdktypes.DeleteFileOptions{}); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("retried delete with an uncoded 404 = %v", err)
+	}
+	// After a 429 the server did nothing, so a 404 on the retry means the
+	// path never existed, not that this call deleted it.
+	if err := client.DeleteFile(ctx, "sb-1", "/refused-then-missing", sdktypes.DeleteFileOptions{}); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("delete of a missing path after a 429 = %v, want ErrNotFound", err)
 	}
 }
 
@@ -376,5 +394,41 @@ func TestOctalMode(t *testing.T) {
 		if got := octalMode(mode); got != want {
 			t.Fatalf("octalMode(%v) = %s, want %s", mode, got, want)
 		}
+	}
+}
+
+// refuseFirstDelete fails the first DELETE with a dial error, as a refused
+// connection does, before any byte of the request is sent.
+type refuseFirstDelete struct {
+	next    http.RoundTripper
+	refused bool
+}
+
+func (r *refuseFirstDelete) RoundTrip(req *http.Request) (*http.Response, error) {
+	if req.Method == http.MethodDelete && !r.refused {
+		r.refused = true
+		return nil, &net.OpError{Op: "dial", Net: "tcp", Err: syscall.ECONNREFUSED}
+	}
+	return r.next.RoundTrip(req)
+}
+
+// A refused connection sent nothing, so a coded 404 on the retry still
+// means the path was never there, as in the other four SDKs.
+func TestDeleteAfterARefusedConnectionStillReportsTheMissingPath(t *testing.T) {
+	fake := &fakeToolbox{features: []string{FeatureFileVerbs}}
+	fake.reply = func(r *http.Request, n int) (int, any, http.Header) {
+		return http.StatusNotFound, errBody("lstat: no such file or directory", codeFileNotFound), nil
+	}
+	client, _ := fake.serve(t)
+	refuse := &refuseFirstDelete{next: client.httpClient.Transport}
+	if refuse.next == nil {
+		refuse.next = http.DefaultTransport
+	}
+	client.httpClient = &http.Client{Transport: refuse}
+	if err := client.DeleteFile(context.Background(), "sb-1", "/never", sdktypes.DeleteFileOptions{}); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("delete after a refused connection = %v, want ErrNotFound", err)
+	}
+	if !refuse.refused {
+		t.Fatal("the first attempt was not refused")
 	}
 }

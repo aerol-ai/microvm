@@ -118,15 +118,25 @@ test("getFileInfo falls back for an older agent; fileExists tells a missing file
 });
 
 test("a retried delete or mkdir counts work already done; the first attempt still reports it", async () => {
+  // n counts per route and every delete is one route (the path is in the
+  // query), so the cases that fail only their first try count their own.
+  const tries = new Map<string, number>();
   const { client, calls } = fakeToolbox((call, n) => {
     const path = call.query.path;
+    tries.set(path, (tries.get(path) ?? 0) + 1);
     if (path.startsWith("/lost")) {
       if (n === 0) return { status: 502 };
       return call.method === "DELETE"
         ? { status: 404, body: err("lstat: no such file or directory", "file_not_found") }
         : { status: 409, body: err(`${path} already exists`, "folder_exists") };
     }
-    if (path === "/route-missing") return n === 0 ? { status: 503 } : { status: 404, body: err("not found") };
+    if (path === "/route-missing") return tries.get(path) === 1 ? { status: 503, headers: { "Retry-After": "0" } } : { status: 404, body: err("not found") };
+    if (path === "/refused") {
+      // A 429 is answered before any work: the path was never there.
+      return tries.get(path) === 1
+        ? { status: 429, headers: { "Retry-After": "0" } }
+        : { status: 404, body: err("lstat: no such file or directory", "file_not_found") };
+    }
     if (path === "/missing") return { status: 404, body: err("lstat /missing: no such file or directory", "file_not_found") };
     if (path === "/a-file") return { status: 409, body: err("mkdir /a-file: file exists") };
     return { status: 204 };
@@ -139,6 +149,10 @@ test("a retried delete or mkdir counts work already done; the first attempt stil
   await assert.rejects(client.makeDir("sb-1", "/a-file"), (e: unknown) => e instanceof MicroVMApiError && e.status === 409);
   // An uncoded 404 on a retry may be an agent without the route.
   await assert.rejects(client.deleteFile("sb-1", "/route-missing"), MicroVMApiError);
+  // After a 429 the server did nothing, so a coded 404 on the retry means
+  // the path never existed, not that this call deleted it.
+  await assert.rejects(client.deleteFile("sb-1", "/refused"), (e: unknown) => e instanceof MicroVMApiError && e.status === 404 && e.code === "file_not_found");
+  assert.equal(tries.get("/refused"), 2);
 });
 
 test("move and copy retry only a 429 or 503", async () => {

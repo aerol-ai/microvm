@@ -695,9 +695,11 @@ export const DEFAULT_LIST_LIMIT = 10_000;
 interface RequestOptions {
   /**
    * For a call whose retry can find its own work done (a delete finds the
-   * path gone, a mkdir its folder): when a re-sent attempt, never the first,
-   * gets an error carrying this toolbox error code, the first attempt's reply
-   * was lost and the call succeeds with an empty 204.
+   * path gone, a mkdir its folder): when a re-sent attempt gets an error
+   * carrying this toolbox error code after an earlier attempt whose reply
+   * was lost (a dropped connection, 502 or 504), that attempt did the work
+   * and the call succeeds with an empty 204. After a 421, 429 or 503 the
+   * server did nothing, so the error stands.
    */
   doneCode?: string;
   /** Send the request once, never retried: a body plan section 10 says is never re-sent (a folder upload). */
@@ -2238,13 +2240,17 @@ export class APIClient {
     const retryableStatusCodes = idempotent ? RETRYABLE_STATUS_CODES : REFUSED_STATUS_CODES;
     const isRetryableError = idempotent ? isTransientTransportError : isUnsentTransportError;
 
+    let mayHaveRun = false;
     for (let attempt = 0; ; attempt++) {
       let retryAfter: string | null = null;
       try {
         const response = await this.fetchFn(url, requestInit);
-        if (attempt > 0 && options.doneCode && !response.ok && (await errorCode(response)) === options.doneCode) {
+        if (mayHaveRun && options.doneCode && !response.ok && (await errorCode(response)) === options.doneCode) {
           response.body?.cancel().catch(() => undefined);
           return new Response(null, { status: 204 });
+        }
+        if (response.status === 502 || response.status === 504) {
+          mayHaveRun = true;
         }
         if (!retryableStatusCodes.has(response.status) || attempt >= maxRetries) {
           return response;
@@ -2260,6 +2266,7 @@ export class APIClient {
         if (signal?.aborted || !isRetryableError(error) || attempt >= maxRetries) {
           throw error;
         }
+        mayHaveRun ||= !isUnsentTransportError(error);
       }
       await sleep(retryDelayMs(this.retryConfig, attempt, retryAfter, Date.now(), Math.random()), signal);
     }

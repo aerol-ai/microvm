@@ -210,7 +210,13 @@ class AsyncRetryParityTests(unittest.TestCase):
             ("exec retries 429", [(429, busy, {"Retry-After": "0"}), (200, {"exit_code": 0, "stdout": "", "stderr": ""}, None)], lambda c: c.exec("sb-1", {"command": "true"}), 2),
             (
                 "a retried delete that finds the file gone succeeds",
-                [(503, busy, None), (404, {"error": "gone", "code": "file_not_found"}, None)],
+                [(502, b"<html>bad</html>", None), (404, {"error": "gone", "code": "file_not_found"}, None)],
+                lambda c: c.delete_file("sb-1", "/f"),
+                2,
+            ),
+            (
+                "after a 503 the server did nothing, so the delete's 404 stands",
+                [(503, busy, {"Retry-After": "0"}), (404, {"error": "gone", "code": "file_not_found"}, None)],
                 lambda c: c.delete_file("sb-1", "/f"),
                 2,
             ),
@@ -219,6 +225,8 @@ class AsyncRetryParityTests(unittest.TestCase):
         for name, script, call, want in cases:
             with self.subTest(name):
                 (sync_outcome, sync_hits), (async_outcome, async_hits) = self.run_both(script, call)
+                if name.endswith("stands"):
+                    self.assertEqual(sync_outcome[:3], ("MicroVMNotFoundError", 404, "file_not_found"))
                 if sync_outcome[0] == "ok":
                     self.assertEqual(async_outcome[0], "ok")
                 else:
