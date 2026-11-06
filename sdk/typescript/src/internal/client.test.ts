@@ -1134,6 +1134,47 @@ test("sandbox createToken surfaces a 400 as an API error", async () => {
   });
 });
 
+test("sandbox revokeTokens POSTs no body to the revoke route and maps the answer", async () => {
+  const seen: Request[] = [];
+  const bodies: (string | null)[] = [];
+  const client = new APIClient({
+    baseURL: "https://api.example.com",
+    patToken: "pat-token",
+    fetch: async (input, init) => {
+      const req = new Request(input, init);
+      seen.push(req);
+      if (req.url.endsWith("/tokens/revoke")) {
+        bodies.push(await req.text());
+        return jsonResponse({ sandbox_id: "sb-tok", tokens_not_before: "2026-11-07T10:00:01Z" });
+      }
+      return jsonResponse(apiSandbox("sb-tok"));
+    },
+  });
+  const sandbox = await client.get("sb-tok");
+  const result = await sandbox.revokeTokens();
+  const post = seen[seen.length - 1];
+  assert.equal(post.method, "POST");
+  assert.equal(post.url, "https://api.example.com/v1/sandboxes/sb-tok/tokens/revoke");
+  assert.deepEqual(result, { sandboxID: "sb-tok", tokensNotBefore: "2026-11-07T10:00:01Z" });
+
+  // The client call by id is the same request.
+  assert.deepEqual(await client.revokeSandboxTokens("sb-tok"), result);
+  assert.deepEqual(bodies, ["", ""]);
+});
+
+test("sandbox revokeTokens surfaces a 404 as an API error", async () => {
+  const client = new APIClient({
+    baseURL: "https://api.example.com",
+    patToken: "pat-token",
+    fetch: async () => jsonResponse({ error: "sandbox not found" }, 404),
+  });
+  await assert.rejects(client.revokeSandboxTokens("sb-none"), (err: unknown) => {
+    assert.ok(err instanceof MicroVMApiError);
+    assert.equal(err.status, 404);
+    return true;
+  });
+});
+
 test("internal client addCustomDomain POSTs hostname and parses list", async () => {
   let seenRequest: Request | undefined;
   const client = new APIClient({

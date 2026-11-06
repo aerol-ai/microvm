@@ -734,8 +734,9 @@ export interface CreateSandboxTokenOptions {
 
 /**
  * A sandbox token from `sandbox.createToken`. The server keeps no copy, so
- * `token` is shown only here. Every call makes a new token; a token cannot be
- * revoked, it stops working when it expires or its sandbox is deleted.
+ * `token` is shown only here. Every call makes a new token. It stops working
+ * when it expires, when its sandbox is deleted, or when
+ * `sandbox.revokeTokens()` is called.
  */
 export interface SandboxToken {
   /** The token (`avmst_…`). Send it as the bearer credential. */
@@ -748,6 +749,16 @@ export interface SandboxToken {
   methods?: string[];
   /** RFC 3339 time the token stops working. */
   expiresAt: string;
+}
+
+/**
+ * The result of `sandbox.revokeTokens()`. Every token issued for the sandbox
+ * before `tokensNotBefore` no longer works; a token made after the call works.
+ */
+export interface RevokeSandboxTokensResult {
+  sandboxID: string;
+  /** RFC 3339 time. Tokens issued before it are refused. */
+  tokensNotBefore: string;
 }
 
 /**

@@ -21,6 +21,7 @@ export type {
   CreateAPITokenOptions,
   CreatedAPIToken,
   CreateSandboxTokenOptions,
+  RevokeSandboxTokensResult,
   SandboxToken,
   WhoAmI,
   WhoAmIPrincipal,

@@ -32,6 +32,7 @@ import ai.aerol.microvm.model.ApiTokenList;
 import ai.aerol.microvm.model.CreateApiTokenOptions;
 import ai.aerol.microvm.model.CreatedApiToken;
 import ai.aerol.microvm.model.CreateSandboxTokenOptions;
+import ai.aerol.microvm.model.RevokeSandboxTokensResult;
 import ai.aerol.microvm.model.SandboxToken;
 import ai.aerol.microvm.model.WhoAmI;
 import ai.aerol.microvm.model.AuditCoverage;
@@ -1599,6 +1600,17 @@ public class MicroVMClient {
     public SandboxToken createSandboxToken(String sandboxId, CreateSandboxTokenOptions options) {
         CreateSandboxTokenOptions body = options == null ? new CreateSandboxTokenOptions() : options;
         return doJson("POST", sandboxPath(sandboxId) + "/tokens", body, SandboxToken.class);
+    }
+
+    /**
+     * Make every token issued for one sandbox so far stop working ({@code
+     * POST /v1/sandboxes/{id}/tokens/revoke}), toolbox and port tokens
+     * alike. A token issued after it works. Safe to retry: a repeated call
+     * refuses the same tokens again (plus any issued in between), so it uses
+     * the normal retry tier.
+     */
+    public RevokeSandboxTokensResult revokeSandboxTokens(String sandboxId) {
+        return doJson("POST", sandboxPath(sandboxId) + "/tokens/revoke", null, RevokeSandboxTokensResult.class);
     }
 
     /**

@@ -429,6 +429,23 @@ class AsyncClientTests(unittest.TestCase):
         self.assertEqual(info, {"code": 3})
         self.assertIn('"resize"', sockets["attach"].sent[0])
 
+    def test_revoke_sandbox_tokens_from_the_client_and_a_sandbox(self):
+        answer = {"sandbox_id": "sb-1", "tokens_not_before": "2026-11-07T10:00:01Z"}
+        url, hits = _scripted_server(self, [(200, _SANDBOX, None), (200, answer, None)])
+
+        async def go():
+            async with AsyncMicroVM(url, "pat") as client:
+                sandbox = await client.get("sb-1")
+                first = await sandbox.revoke_tokens()
+                second = await client.revoke_sandbox_tokens("sb-1")
+                return first, second
+
+        first, second = asyncio.run(go())
+        want = {"sandboxID": "sb-1", "tokensNotBefore": "2026-11-07T10:00:01Z"}
+        self.assertEqual((first, second), (want, want))
+        self.assertEqual([(m, p) for m, p, _ in hits[1:]], [("POST", "/v1/sandboxes/sb-1/tokens/revoke")] * 2)
+        self.assertEqual([body for _, _, body in hits[1:]], [b"", b""])
+
     def test_tokens_and_a_passed_in_http_client(self):
         url, hits = _scripted_server(self, [(200, {"tokens": [{"id": "tok_1", "name": "ci"}]}, None)])
 

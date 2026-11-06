@@ -1145,8 +1145,8 @@ class APITokenList(TypedDict):
 class SandboxToken(TypedDict, total=False):
     """The result of ``sandbox.create_token()``: a signed token for one
     sandbox, to hand to a browser or an end user. The server keeps no copy,
-    so ``token`` is shown only here. It cannot be revoked: it stops working
-    when it expires or its sandbox is deleted."""
+    so ``token`` is shown only here. It stops working when it expires, when
+    its sandbox is deleted, or when ``sandbox.revoke_tokens()`` is called."""
 
     # The token (avmst_…). Send it as the bearer credential.
     token: str
@@ -1159,6 +1159,16 @@ class SandboxToken(TypedDict, total=False):
     methods: List[str]
     # RFC 3339 time the token stops working.
     expiresAt: str
+
+
+class RevokeSandboxTokensResult(TypedDict):
+    """The result of ``sandbox.revoke_tokens()``: every token issued for the
+    sandbox before ``tokensNotBefore`` no longer works. A token made after
+    the call works."""
+
+    sandboxID: str
+    # RFC 3339 time. Tokens issued before it are refused.
+    tokensNotBefore: str
 
 
 # Firecracker rootfs templates. The lifecycle mirrors the daemon's

@@ -403,6 +403,12 @@ func (c *Client) GetOrCreate(ctx context.Context, name string, opts sdktypes.Cre
 	return winner, false, nil
 }
 
+// RevokeSandboxTokens makes every token issued for the sandbox id so far
+// stop working (see Sandbox.RevokeTokens).
+func (c *Client) RevokeSandboxTokens(ctx context.Context, id string) (sdktypes.RevokeSandboxTokensResult, error) {
+	return c.inner.RevokeSandboxTokens(ctx, id)
+}
+
 // Mounts returns the redacted mount config for a sandbox. Credentials are
 // never included; this endpoint is for showing the user what their sandbox
 // has configured, not for retrieving secrets.
@@ -897,10 +903,17 @@ func (s *Sandbox) UnexposePort(ctx context.Context, port int) error {
 // URL (a port exposed with token visibility); without it the token is for
 // the toolbox: commands, files and sessions. Each call makes a new token,
 // and the server keeps no copy, so Token is shown only in the result. A
-// token cannot be revoked: it stops working when it expires or the sandbox
-// is deleted.
+// token stops working when it expires, when the sandbox is deleted, or when
+// RevokeTokens is called.
 func (s *Sandbox) CreateToken(ctx context.Context, opts sdktypes.CreateSandboxTokenOptions) (sdktypes.SandboxToken, error) {
 	return s.client.inner.CreateSandboxToken(ctx, s.ID, opts)
+}
+
+// RevokeTokens makes every token issued for this sandbox so far stop
+// working, toolbox and port tokens alike. A token made after the call
+// works. Safe to call again.
+func (s *Sandbox) RevokeTokens(ctx context.Context) (sdktypes.RevokeSandboxTokensResult, error) {
+	return s.client.RevokeSandboxTokens(ctx, s.ID)
 }
 
 // CustomDomainOption customizes an AddCustomDomain call. Build values with

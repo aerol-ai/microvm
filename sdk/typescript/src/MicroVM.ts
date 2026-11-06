@@ -40,6 +40,7 @@ import type {
   GetOptions,
   ListOptions,
   MountSpecRedacted,
+  RevokeSandboxTokensResult,
   CreateSnapshotOptions,
   RegisterSnapshotOptions,
   ListSnapshotsOptions,
@@ -407,6 +408,14 @@ export class MicroVM {
 
   async mounts(sandboxID: string, call?: CallOptions): Promise<MountSpecRedacted[]> {
     return this.clientFor(call).mounts(sandboxID);
+  }
+
+  /**
+   * Make every token issued for a sandbox so far stop working (see
+   * `sandbox.revokeTokens()`). A token made after the call works.
+   */
+  async revokeSandboxTokens(sandboxID: string, call?: CallOptions): Promise<RevokeSandboxTokensResult> {
+    return this.clientFor(call).revokeSandboxTokens(sandboxID);
   }
 
   /**

@@ -958,6 +958,16 @@ func (c *Client) CreateSandboxToken(ctx context.Context, id string, req models.C
 	return out, err
 }
 
+// RevokeSandboxTokens makes every token issued for one sandbox so far stop
+// working (POST /v1/sandboxes/{id}/tokens/revoke). A token issued after it
+// works. Safe to retry: a repeated call refuses the same tokens again (plus
+// any issued in between), so it uses the normal retry tier.
+func (c *Client) RevokeSandboxTokens(ctx context.Context, id string) (models.RevokeSandboxTokensResponse, error) {
+	var out models.RevokeSandboxTokensResponse
+	err := c.doJSON(ctx, http.MethodPost, fmt.Sprintf(c.versionPrefix+"/sandboxes/%s/tokens/revoke", id), nil, &out)
+	return out, err
+}
+
 // customDomainsEnvelope mirrors the {"custom_domains":[...]} shape used by
 // both the add and list responses, so a single decoder handles both routes.
 type customDomainsEnvelope struct {
@@ -1061,6 +1071,10 @@ func (s *Sandbox) ExposePort(ctx context.Context, port int, protocol string) (Ex
 
 func (s *Sandbox) CreateToken(ctx context.Context, req models.CreateSandboxTokenRequest) (models.SandboxToken, error) {
 	return s.client.CreateSandboxToken(ctx, s.ID, req)
+}
+
+func (s *Sandbox) RevokeTokens(ctx context.Context) (models.RevokeSandboxTokensResponse, error) {
+	return s.client.RevokeSandboxTokens(ctx, s.ID)
 }
 
 func (s *Sandbox) AddCustomDomain(ctx context.Context, hostname string, targetPort int) ([]models.CustomDomain, error) {

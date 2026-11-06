@@ -97,6 +97,7 @@ from .types import (
     PushWasmModuleResult,
     RegisterSnapshotOptions,
     ResizeOptions,
+    RevokeSandboxTokensResult,
     SandboxSnapshot,
     SandboxToken,
     Session,
@@ -523,6 +524,10 @@ class AsyncSandbox(_SandboxBase):
             return await self._client.create_sandbox_token(
             self.id, expires_in=expires_in, port=port, path_prefix=path_prefix, methods=methods
         )
+
+    async def revoke_tokens(self, *, timeout: Optional[float] = None) -> RevokeSandboxTokensResult:
+        with _call_deadline(timeout):
+            return await self._client.revoke_sandbox_tokens(self.id)
 
     async def add_custom_domain(
         self,
@@ -1275,6 +1280,10 @@ class AsyncMicroVM(_MicroVMCore):
     ) -> SandboxToken:
         with _call_deadline(timeout):
             return await self._run(self._op_create_sandbox_token(sandbox_id, expires_in=expires_in, port=port, path_prefix=path_prefix, methods=methods))
+
+    async def revoke_sandbox_tokens(self, sandbox_id: str, *, timeout: Optional[float] = None) -> RevokeSandboxTokensResult:
+        with _call_deadline(timeout):
+            return await self._run(self._op_revoke_sandbox_tokens(sandbox_id))
 
     async def add_custom_domain(
         self,

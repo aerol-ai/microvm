@@ -64,6 +64,7 @@ import ai.aerol.microvm.model.CreateSandboxTokenOptions;
 import ai.aerol.microvm.model.CustomDomain;
 import ai.aerol.microvm.model.ExposeResult;
 import ai.aerol.microvm.model.ExposeOptions;
+import ai.aerol.microvm.model.RevokeSandboxTokensResult;
 import ai.aerol.microvm.model.SandboxToken;
 import ai.aerol.microvm.model.CustomDomainDnsRecords;
 import ai.aerol.microvm.model.CustomDomainStatus;
@@ -2521,6 +2522,40 @@ class MicroVMClientTest {
             MicroVMClient client = clientFor(server);
             MicroVMException error = assertThrows(MicroVMException.class, () -> client.createSandboxToken("sb-1", null));
             assertTrue(error.getMessage().contains("expires_in"));
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void revokeTokensPostsNoBodyAndMapsAnswer() throws Exception {
+        List<String> seen = new java.util.concurrent.CopyOnWriteArrayList<>();
+        HttpServer server = startServer(exchange -> {
+            byte[] body = exchange.getRequestBody().readAllBytes();
+            seen.add(exchange.getRequestMethod() + " " + exchange.getRequestURI().getRawPath() + " " + body.length);
+            writeJson(exchange, 200, mapOf("sandbox_id", "sb-1", "tokens_not_before", "2026-11-07T10:00:01Z"));
+        });
+        try {
+            MicroVMClient client = clientFor(server);
+            Sandbox sandbox = new Sandbox(client, new SandboxData());
+            sandbox.id = "sb-1";
+            RevokeSandboxTokensResult result = sandbox.revokeTokens();
+            assertEquals("sb-1", result.sandboxId);
+            assertEquals("2026-11-07T10:00:01Z", result.tokensNotBefore);
+            assertEquals("2026-11-07T10:00:01Z", client.revokeSandboxTokens("sb-1").tokensNotBefore);
+            assertEquals(List.of("POST /v1/sandboxes/sb-1/tokens/revoke 0", "POST /v1/sandboxes/sb-1/tokens/revoke 0"), seen);
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void revokeTokensSurfacesNotFound() throws Exception {
+        HttpServer server = startServer(exchange -> writeJson(exchange, 404, mapOf("error", "sandbox not found")));
+        try {
+            MicroVMClient client = clientFor(server);
+            MicroVMException error = assertThrows(MicroVMException.class, () -> client.revokeSandboxTokens("sb-none"));
+            assertTrue(error.getMessage().contains("not found"));
         } finally {
             server.stop(0);
         }

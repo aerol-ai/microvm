@@ -32,6 +32,7 @@ import type {
   CreatedAPIToken,
   CreateOptions,
   CreateSandboxTokenOptions,
+  RevokeSandboxTokensResult,
   SandboxToken,
   CreateSessionOptions,
   CreateTemplateOptions,
@@ -278,6 +279,11 @@ interface ApiSandboxToken {
   path_prefix?: string;
   methods?: string[];
   expires_at: string;
+}
+
+interface ApiRevokeSandboxTokens {
+  sandbox_id: string;
+  tokens_not_before: string;
 }
 
 interface ApiCustomDomain {
@@ -1782,6 +1788,17 @@ export class APIClient {
   }
 
   /**
+   * Make every token issued for one sandbox so far stop working
+   * (POST /v1/sandboxes/{id}/tokens/revoke). A token issued after it works.
+   * Safe to retry: a repeated call refuses the same tokens again (plus any
+   * issued in between), so it uses the normal retry tier.
+   */
+  async revokeSandboxTokens(id: string): Promise<RevokeSandboxTokensResult> {
+    const r = await this.doJSON<ApiRevokeSandboxTokens>("POST", `${this.versionPrefix}/sandboxes/${id}/tokens/revoke`);
+    return { sandboxID: r.sandbox_id, tokensNotBefore: r.tokens_not_before };
+  }
+
+  /**
    * Bind a custom hostname to a sandbox. The server lowercases the hostname
    * and returns the post-add list of bindings (sorted by hostname). Calling
    * with an already-registered hostname is idempotent and returns the
@@ -2508,6 +2525,15 @@ export class SandboxResource implements Sandbox {
    */
   async createToken(options: CreateSandboxTokenOptions, call?: CallOptions): Promise<SandboxToken> {
     return this.api(call).createSandboxToken(this.id, options);
+  }
+
+  /**
+   * Make every token issued for this sandbox so far stop working, toolbox
+   * and port tokens alike. A token made after the call works. Safe to call
+   * again.
+   */
+  async revokeTokens(call?: CallOptions): Promise<RevokeSandboxTokensResult> {
+    return this.api(call).revokeSandboxTokens(this.id);
   }
 
   /**

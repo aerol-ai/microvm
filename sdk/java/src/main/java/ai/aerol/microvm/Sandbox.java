@@ -19,6 +19,7 @@ import ai.aerol.microvm.model.UploadFileOptions;
 import ai.aerol.microvm.model.DownloadFileOptions;
 import ai.aerol.microvm.model.CreateOptions;
 import ai.aerol.microvm.model.CreateSandboxTokenOptions;
+import ai.aerol.microvm.model.RevokeSandboxTokensResult;
 import ai.aerol.microvm.model.SandboxToken;
 import ai.aerol.microvm.model.CreateSnapshotOptions;
 import ai.aerol.microvm.model.CreateSessionOptions;
@@ -293,6 +294,15 @@ public class Sandbox extends SandboxData implements AutoCloseable {
      */
     public SandboxToken createToken(CreateSandboxTokenOptions options) {
         return client.createSandboxToken(id, options);
+    }
+
+    /**
+     * Make every token issued for this sandbox so far stop working, toolbox
+     * and port tokens alike. A token made after the call works. Safe to call
+     * again.
+     */
+    public RevokeSandboxTokensResult revokeTokens() {
+        return client.revokeSandboxTokens(id);
     }
 
     public List<CustomDomain> addCustomDomain(String hostname) {

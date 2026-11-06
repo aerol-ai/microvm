@@ -6,8 +6,8 @@ import java.util.List;
  * {@code sandbox.createToken()}'s result. {@link #token} ({@code avmst_…})
  * is shown only here: the server keeps no copy. {@link #tokenId}
  * ({@code stk_…}) is what audit records name and is safe to log. A token
- * cannot be revoked: it stops working when it expires or its sandbox is
- * deleted.
+ * stops working when it expires, when its sandbox is deleted, or when
+ * {@code sandbox.revokeTokens()} is called.
  */
 public class SandboxToken {
     public String token;

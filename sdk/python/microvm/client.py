@@ -29,6 +29,7 @@ from .types import (
     APITokenList,
     CreateAPITokenOptions,
     CreatedAPIToken,
+    RevokeSandboxTokensResult,
     SandboxToken,
     WhoAmI,
     BuildImagePushOptions,
@@ -972,6 +973,12 @@ class Sandbox(_SandboxBase):
         return self._client.create_sandbox_token(
             self.id, expires_in=expires_in, port=port, path_prefix=path_prefix, methods=methods
         )
+
+    @_timed
+    def revoke_tokens(self, *, timeout: Optional[float] = None) -> RevokeSandboxTokensResult:
+        """Make every token issued for this sandbox so far stop working. See
+        :meth:`MicroVM.revoke_sandbox_tokens`."""
+        return self._client.revoke_sandbox_tokens(self.id)
 
     @_timed
     def add_custom_domain(
@@ -2121,6 +2128,10 @@ class _MicroVMCore:
         payload = (yield _io("_do_json", "POST", f"{self._version_prefix}/sandboxes/{sandbox_id}/tokens", body)) or {}
         return _from_api_sandbox_token(payload)
 
+    def _op_revoke_sandbox_tokens(self, sandbox_id: str):
+        payload = (yield _io("_do_json", "POST", f"{self._version_prefix}/sandboxes/{sandbox_id}/tokens/revoke", None)) or {}
+        return _from_api_revoke_sandbox_tokens(payload)
+
     def _op_add_custom_domain(
         self,
         sandbox_id: str,
@@ -3162,6 +3173,17 @@ class MicroVM(_MicroVMCore):
         return self._run(self._op_create_sandbox_token(sandbox_id, expires_in=expires_in, port=port, path_prefix=path_prefix, methods=methods))
 
     @_timed
+    def revoke_sandbox_tokens(self, sandbox_id: str, *, timeout: Optional[float] = None) -> RevokeSandboxTokensResult:
+        """Make every token issued for one sandbox so far stop working
+        (``POST /v1/sandboxes/{id}/tokens/revoke``), toolbox and port tokens
+        alike. A token made after the call works.
+
+        Safe to retry: a repeated call refuses the same tokens again (plus
+        any issued in between), so it uses the normal retry tier.
+        """
+        return self._run(self._op_revoke_sandbox_tokens(sandbox_id))
+
+    @_timed
     def add_custom_domain(
         self,
         sandbox_id: str,
@@ -3281,6 +3303,13 @@ def _from_api_sandbox_token(payload: Dict[str, Any]) -> SandboxToken:
     if payload.get("methods"):
         token["methods"] = [str(m) for m in payload["methods"]]
     return token
+
+
+def _from_api_revoke_sandbox_tokens(payload: Dict[str, Any]) -> RevokeSandboxTokensResult:
+    return {
+        "sandboxID": str(payload.get("sandbox_id") or ""),
+        "tokensNotBefore": str(payload.get("tokens_not_before") or ""),
+    }
 
 
 def _from_api_api_token(payload: Dict[str, Any]) -> APIToken:

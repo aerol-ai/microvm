@@ -671,6 +671,17 @@ test("MicroVM.whoami maps the principal, role, team and expiry", async () => {
   assert.equal(seen.length, 1);
 });
 
+test("MicroVM.revokeSandboxTokens POSTs to the sandbox's revoke route", async () => {
+  const { seen, fetchFn } = recordingFetch((request) =>
+    new URL(request.url).pathname === "/v1/sandboxes/sb-1/tokens/revoke" && request.method === "POST"
+      ? jsonResponse(200, { sandbox_id: "sb-1", tokens_not_before: "2026-11-07T10:00:01Z" })
+      : jsonResponse(404, { error: "unexpected" }),
+  );
+  const sdk = new MicroVM({ patToken: "pat", apiUrl: "https://api.example.com", fetch: fetchFn });
+  assert.deepEqual(await sdk.revokeSandboxTokens("sb-1"), { sandboxID: "sb-1", tokensNotBefore: "2026-11-07T10:00:01Z" });
+  assert.equal(seen.length, 1);
+});
+
 test("MicroVM.tokens create/list/revoke hit /v1/tokens and send the team on every call", async () => {
   const stored = {
     id: "tok_abc123def456",

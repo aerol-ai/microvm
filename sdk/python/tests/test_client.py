@@ -2591,6 +2591,21 @@ class SandboxTokenTests(unittest.TestCase):
         tok = client.create_sandbox_token("sb-1", expires_in="1m")
         self.assertEqual(tok["token"], "")
 
+    def test_revoke_tokens_posts_no_body_and_maps_answer(self):
+        client, captured = self._client(answer={"sandbox_id": "sb-1", "tokens_not_before": "2026-11-07T10:00:01Z"}, status=200)
+        sandbox = client_module.Sandbox(client, {"id": "sb-1"})  # type: ignore[typeddict-item]
+        want = {"sandboxID": "sb-1", "tokensNotBefore": "2026-11-07T10:00:01Z"}
+        self.assertEqual(sandbox.revoke_tokens(), want)
+        self.assertEqual(client.revoke_sandbox_tokens("sb-1"), want)
+        self.assertEqual(captured["calls"], [("POST", "/v1/sandboxes/sb-1/tokens/revoke", None)] * 2)
+
+    def test_revoke_tokens_surfaces_a_404_and_an_empty_answer(self):
+        client, _ = self._client(status=404)
+        with self.assertRaises(client_module.MicroVMHTTPError):
+            client.revoke_sandbox_tokens("sb-none")
+        client, _ = self._client(answer=None, status=200)
+        self.assertEqual(client.revoke_sandbox_tokens("sb-1"), {"sandboxID": "", "tokensNotBefore": ""})
+
 
 class DNSRecordsTests(unittest.TestCase):
     """Covers the two DNS helper endpoints:

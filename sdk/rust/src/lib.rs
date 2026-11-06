@@ -35,7 +35,7 @@ pub use types::{
 };
 use types::{CustomDomainListWire, ExposePortResponseWire, WarmPoolListWire};
 pub use types::{ApiToken, ApiTokenList, CreateApiTokenOptions, CreatedApiToken, WhoAmI, WhoAmIPrincipal};
-pub use types::{CreateSandboxTokenOptions, ExposeVisibility, SandboxToken};
+pub use types::{CreateSandboxTokenOptions, ExposeVisibility, RevokeSandboxTokensResult, SandboxToken};
 pub use types::{
     AddCustomDomainOptions, AuditCoverage, AuditEvent, AuditOptions, AuditPage, BuildImageOptions,
     EgressInject, EgressProfile, EgressProfileList, EgressProfileOptions, EgressProfileRef, EgressRule,
@@ -1040,6 +1040,13 @@ impl Sandbox {
     /// an end user. Each call makes a new token; the server keeps no copy.
     pub fn create_token(&self, options: CreateSandboxTokenOptions) -> Result<SandboxToken, Error> {
         self.client.create_sandbox_token(&self.data.id, options)
+    }
+
+    /// Make every token issued for this sandbox so far stop working,
+    /// toolbox and port tokens alike. A token made after the call works.
+    /// Safe to call again.
+    pub fn revoke_tokens(&self) -> Result<RevokeSandboxTokensResult, Error> {
+        self.client.revoke_sandbox_tokens(&self.data.id)
     }
 
     /// Attach a custom hostname to this sandbox. Returns the post-add list
@@ -2467,6 +2474,18 @@ impl Client {
             Method::POST,
             &format!("{}/sandboxes/{}/tokens", self.version_prefix(), id),
             Some(&options),
+        )
+    }
+
+    /// Make every token issued for one sandbox so far stop working (`POST
+    /// /v1/sandboxes/{id}/tokens/revoke`). A token issued after it works.
+    /// Safe to retry: a repeated call refuses the same tokens again (plus
+    /// any issued in between), so it uses the normal retry tier.
+    pub fn revoke_sandbox_tokens(&self, id: &str) -> Result<RevokeSandboxTokensResult, Error> {
+        self.do_json::<(), RevokeSandboxTokensResult>(
+            Method::POST,
+            &format!("{}/sandboxes/{}/tokens/revoke", self.version_prefix(), id),
+            None,
         )
     }
 
@@ -6332,6 +6351,59 @@ mod tests {
             .create_sandbox_token("sb-1", CreateSandboxTokenOptions::default())
             .expect_err("a 400 must be an error");
         assert!(format!("{}", err).contains("expires_in"), "error: {}", err);
+    }
+
+    #[test]
+    fn revoke_sandbox_tokens_posts_no_body_and_maps_answer() {
+        let (url, request_rx) = spawn_response_server(
+            "200 OK",
+            "application/json",
+            br#"{"sandbox_id":"sb-1","tokens_not_before":"2026-11-07T10:00:01Z"}"#.to_vec(),
+        );
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        let result = client.revoke_sandbox_tokens("sb-1").expect("revoke_sandbox_tokens should succeed");
+        let request = request_rx.recv().expect("request should be captured");
+        assert!(
+            request.starts_with("POST /v1/sandboxes/sb-1/tokens/revoke HTTP/1.1\r\n"),
+            "unexpected request: {}",
+            request
+        );
+        assert!(request.ends_with("\r\n\r\n"), "unexpected body: {}", request);
+        assert_eq!(result.sandbox_id, "sb-1");
+        assert_eq!(result.tokens_not_before, "2026-11-07T10:00:01Z");
+    }
+
+    #[test]
+    fn sandbox_revoke_tokens_uses_its_own_id() {
+        let (url, request_rx) = spawn_response_server(
+            "200 OK",
+            "application/json",
+            br#"{"sandbox_id":"sb-1","tokens_not_before":"2026-11-07T10:00:01Z"}"#.to_vec(),
+        );
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        let data: SandboxData = serde_json::from_value(serde_json::json!({
+            "id": "sb-1", "image": "alpine", "status": "started", "public_url": "", "cpu": 1,
+            "memory_mb": 512, "disk_gb": 1, "os_user": "root", "network_block_all": false,
+            "toolbox_enabled": true, "created_at": "", "updated_at": "", "last_active_at": "",
+            "lifecycle": {}, "runtime": "docker"
+        }))
+        .expect("sandbox data should parse");
+        let result = Sandbox::new(client, data).revoke_tokens().expect("revoke_tokens should succeed");
+        let request = request_rx.recv().expect("request should be captured");
+        assert!(request.starts_with("POST /v1/sandboxes/sb-1/tokens/revoke HTTP/1.1\r\n"), "unexpected request: {}", request);
+        assert_eq!(result.tokens_not_before, "2026-11-07T10:00:01Z");
+    }
+
+    #[test]
+    fn revoke_sandbox_tokens_surfaces_404() {
+        let (url, _rx) = spawn_response_server(
+            "404 Not Found",
+            "application/json",
+            br#"{"error":"sandbox not found"}"#.to_vec(),
+        );
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        let err = client.revoke_sandbox_tokens("sb-none").expect_err("a 404 must be an error");
+        assert!(format!("{}", err).contains("not found"), "error: {}", err);
     }
 
     // Custom-domains: POST returns 201 with the post-add list envelope, body

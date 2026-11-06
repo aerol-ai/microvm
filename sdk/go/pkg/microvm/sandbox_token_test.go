@@ -61,6 +61,45 @@ func TestSandboxCreateToken(t *testing.T) {
 	}
 }
 
+// Sandbox.RevokeTokens and Client.RevokeSandboxTokens post to the revoke
+// route and return the not-before; a 404 is an error.
+func TestSandboxRevokeTokens(t *testing.T) {
+	var gotPaths []string
+	status := http.StatusOK
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPaths = append(gotPaths, r.Method+" "+r.URL.Path)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(status)
+		if status >= 400 {
+			_ = json.NewEncoder(w).Encode(models.ErrorResponse{Error: "sandbox not found"})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(models.RevokeSandboxTokensResponse{
+			SandboxID: "sb1", TokensNotBefore: time.Date(2026, 11, 7, 10, 0, 1, 0, time.UTC),
+		})
+	}))
+	defer server.Close()
+	client, err := NewClientWithConfig(&sdktypes.MicroVMConfig{APIUrl: server.URL, PATToken: "pat"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sb := &Sandbox{Sandbox: sdktypes.Sandbox{ID: "sb1"}, client: client}
+	got, err := sb.RevokeTokens(context.Background())
+	if err != nil || got.SandboxID != "sb1" || got.TokensNotBefore.IsZero() {
+		t.Fatalf("RevokeTokens = %+v, %v", got, err)
+	}
+	if _, err := client.RevokeSandboxTokens(context.Background(), "sb1"); err != nil {
+		t.Fatalf("RevokeSandboxTokens: %v", err)
+	}
+	if len(gotPaths) != 2 || gotPaths[0] != "POST /v1/sandboxes/sb1/tokens/revoke" || gotPaths[1] != gotPaths[0] {
+		t.Fatalf("requests = %v", gotPaths)
+	}
+	status = http.StatusNotFound
+	if _, err := sb.RevokeTokens(context.Background()); err == nil {
+		t.Fatal("a 404 was not an error")
+	}
+}
+
 // ExposePort sends visibility only when WithVisibility set it.
 func TestExposePortVisibility(t *testing.T) {
 	var bodies []string

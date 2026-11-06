@@ -1878,8 +1878,8 @@ pub struct CreateSandboxTokenOptions {
 
 /// `sandbox.create_token()`'s result. `token` (`avmst_…`) is shown only
 /// here: the server keeps no copy. `token_id` (`stk_…`) is safe to log.
-/// A token cannot be revoked: it stops working when it expires or its
-/// sandbox is deleted.
+/// A token stops working when it expires, when its sandbox is deleted, or
+/// when `sandbox.revoke_tokens()` is called.
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
 pub struct SandboxToken {
     pub token: String,
@@ -1894,6 +1894,17 @@ pub struct SandboxToken {
     /// RFC 3339 time the token stops working.
     #[serde(default)]
     pub expires_at: String,
+}
+
+/// `sandbox.revoke_tokens()`'s result: every token issued for the sandbox
+/// before `tokens_not_before` no longer works. A token made after the call
+/// works.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+pub struct RevokeSandboxTokensResult {
+    pub sandbox_id: String,
+    /// RFC 3339 time. Tokens issued before it are refused.
+    #[serde(default)]
+    pub tokens_not_before: String,
 }
 
 /// The body of `client.tokens().create()`. All four fields are required.

@@ -351,6 +351,10 @@ type CreateSandboxTokenOptions = models.CreateSandboxTokenRequest
 // only here: the server keeps no copy. TokenID (stk_…) is safe to log.
 type SandboxToken = models.SandboxToken
 
+// RevokeSandboxTokensResult is Sandbox.RevokeTokens' result: every token
+// issued for the sandbox before TokensNotBefore no longer works.
+type RevokeSandboxTokensResult = models.RevokeSandboxTokensResponse
+
 // AuditEvent is one record from a sandbox's audit log (Sandbox.Audit). Kind
 // "egress" covers outbound connections and denials; a denial has Result
 // "failure" and the policy Reason ("host_not_allowed", "sni_not_allowed", …).
