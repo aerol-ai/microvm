@@ -8,6 +8,8 @@ package suite
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"net/http"
 	"net/url"
@@ -267,5 +269,57 @@ func TestParityTokenGatedPort(t *testing.T) {
 		if st, _, body := publicGet(t, root.Scheme+"://"+host+"/proxy/8080/", ""); st == http.StatusOK {
 			t.Fatalf("/proxy/8080/ served the gated port: %s", body)
 		}
+	}
+}
+
+// UC-427 — sandboxd forwards W3C trace context to toolboxd: an exec sent
+// with a traceparent is logged by toolboxd with that trace id. toolboxd
+// logs to the container's output, which the suite reads over SSH on the
+// sandbox's owner node: `docker logs` on the dockerd engine, the task log
+// under /var/lib/sandboxd/containerd/logs on the containerd engine.
+func TestParityToolboxLogsTraceID(t *testing.T) {
+	harness.Require(t, sc, "UC-427")
+	targets := identityTargets(t)
+	sb := paritySandbox(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	var raw [16]byte
+	if _, err := rand.Read(raw[:]); err != nil {
+		t.Fatal(err)
+	}
+	traceID := hex.EncodeToString(raw[:])
+	traceparent := "00-" + traceID + "-00f067aa0ba902b7-01"
+	st, body := fcDo(t, ctx, http.MethodPost, "", "/v1/sandboxes/"+sb.ID+"/toolbox/process/execute",
+		map[string]any{"command": "true"}, map[string]string{"traceparent": traceparent})
+	if st != http.StatusOK {
+		t.Fatalf("exec = %d %s", st, body)
+	}
+
+	// Every node is searched: the owner lookup can miss (and used to fall
+	// back to the first node), and the line is on whichever node runs the
+	// sandbox. The task log is named by the sandbox, or by the warm slot it
+	// was adopted from, so every log is read.
+	script := "id=" + shellQuote(sb.ID) + "; tr=" + shellQuote(traceID) + `
+{ sudo docker logs "$id" 2>&1 || true; sudo sh -c 'cat /var/lib/sandboxd/containerd/logs/*.log' 2>/dev/null || true; } | grep -c "trace_id=$tr" || true`
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		for _, node := range targets.Nodes {
+			if out := strings.TrimSpace(nodeSSH(t, node, script)); out != "" && out != "0" {
+				return
+			}
+		}
+		if time.Now().After(deadline) {
+			// Say what is there, so a failure points at the cause.
+			diag := "id=" + shellQuote(sb.ID) + `
+echo "-- docker:"; sudo docker logs --tail 5 "$id" 2>&1 | tail -5
+echo "-- containerd logs:"; sudo sh -c 'ls -la /var/lib/sandboxd/containerd/logs/ 2>&1 | tail -8'
+echo "-- this sandbox's log:"; sudo sh -c "tail -5 /var/lib/sandboxd/containerd/logs/$id.log 2>&1"`
+			for _, node := range targets.Nodes {
+				t.Logf("UC-427 %s:\n%s", node.Name, nodeSSH(t, node, diag))
+			}
+			t.Fatalf("no node logged trace_id=%s for sandbox %s", traceID, sb.ID)
+		}
+		time.Sleep(3 * time.Second)
 	}
 }

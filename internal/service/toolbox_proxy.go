@@ -11,6 +11,7 @@ import (
 	pathpkg "path"
 	"strings"
 
+	"github.com/aerol-ai/microvm/internal/observability"
 	isolateruntime "github.com/aerol-ai/microvm/internal/runtime/isolate"
 	wasmruntime "github.com/aerol-ai/microvm/internal/runtime/wasm"
 	"github.com/aerol-ai/microvm/internal/store"
@@ -83,6 +84,7 @@ func (s *Service) serveToolboxReverseProxy(ctx, callCtx context.Context, sandbox
 		}
 		req := r.Clone(callCtx)
 		req.URL.Path = path
+		observability.InjectTraceContext(callCtx, req.Header)
 		host.ServeToolbox(callCtx, sandboxID, sandbox.ToolboxToken, w, req)
 		return nil
 	}
@@ -96,6 +98,7 @@ func (s *Service) serveToolboxReverseProxy(ctx, callCtx context.Context, sandbox
 		}
 		req := r.Clone(callCtx)
 		req.URL.Path = path
+		observability.InjectTraceContext(callCtx, req.Header)
 		host.ServeToolbox(callCtx, sandboxID, sandbox.ToolboxToken, w, req)
 		return nil
 	}
@@ -128,6 +131,9 @@ func (s *Service) serveToolboxReverseProxy(ctx, callCtx context.Context, sandbox
 			req.Header.Set("Authorization", "Bearer "+toolboxToken)
 		}
 		stripSmuggledBearerSubprotocol(req.Header)
+		// W3C trace context of this API call, so toolboxd's log line names
+		// the trace (A3). Replaces whatever the caller sent.
+		observability.InjectTraceContext(req.Context(), req.Header)
 	}
 	// ReverseProxy calls ErrorHandler only before it writes a response, so
 	// a stopped sandbox can still be answered by the caller.
@@ -336,6 +342,7 @@ func (s *Service) roundTripHostToolbox(ctx context.Context, sandbox *models.Sand
 	if sandbox.ToolboxToken != "" {
 		req.Header.Set("Authorization", "Bearer "+sandbox.ToolboxToken)
 	}
+	observability.InjectTraceContext(ctx, req.Header)
 	rec := httptest.NewRecorder()
 	host.ServeToolbox(ctx, sandbox.ID, sandbox.ToolboxToken, rec, req)
 	return rec.Result(), nil
@@ -363,5 +370,8 @@ func (s *Service) newNetworkToolboxRequest(ctx context.Context, sandbox *models.
 	if endpoint.Token != "" {
 		req.Header.Set("Authorization", "Bearer "+endpoint.Token)
 	}
+	// Daytona and Runloop toolbox calls build their request here: the
+	// caller's headers are copied, so the trace context is set last (A3).
+	observability.InjectTraceContext(ctx, req.Header)
 	return req, nil
 }

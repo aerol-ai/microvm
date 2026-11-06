@@ -210,6 +210,8 @@ What gets sent:
 - **Metrics:** the same `aerolvm_*` counters, as `aerolvm.expvar.int64` and `aerolvm.expvar.float64`. The original counter name is in the `metric` attribute. Map keys are in `key`, `key2` and so on.
 - **Traces:** one span (a timed step) per API request. The server reads incoming W3C trace context, so its spans join your app's traces. Each span is tagged with `http.route`, status code, node ID, node role, service name and server version.
 
+**Traces reach the sandbox's helper program.** Every call the server passes to a sandbox's helper program (`toolboxd`: commands, files, terminals, from the AerolVM API and the Daytona, E2B and Runloop APIs) carries a W3C `traceparent`. With tracing on it names the server's own span for the request; with tracing off it is your app's trace context, passed on unchanged. The helper program writes one log line per such request, with the `trace_id`, the method and the path (never the query), to the sandbox's output. So you can find the helper's side of a slow or failed call by its trace id. Only `traceparent` and `tracestate` go into the sandbox, never `baggage`. WASM and V8 isolate sandboxes have no helper program inside them, so for those the server's span is the only record.
+
 By default the server keeps 5% of the traces it starts itself (`0.05`). That way a large cluster can send traces without every burst flooding your collector.
 
 ## Grafana dashboards, alerts and runbooks

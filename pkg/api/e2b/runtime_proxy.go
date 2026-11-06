@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"strings"
 
+	"github.com/aerol-ai/microvm/internal/observability"
 	"github.com/aerol-ai/microvm/internal/service"
 	"github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/models"
@@ -109,6 +110,9 @@ func (h *handlers) runtimeProxy(w http.ResponseWriter, r *http.Request) {
 		} else {
 			req.Header.Del("Authorization")
 		}
+		// This proxy bypasses the service's toolbox proxy, so it sets the
+		// W3C trace context toolboxd logs itself (A3).
+		observability.InjectTraceContext(req.Context(), req.Header)
 	}
 	// A sandbox that stopped under the request keeps E2B's 502: the E2B SDK
 	// reads 502 from envd as "the sandbox was not found" (Connect's

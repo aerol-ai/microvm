@@ -242,7 +242,7 @@ func main() {
 
 	addr := fmt.Sprintf(":%d", srv.port)
 	httpServer := &http.Server{
-		Handler:           srv.routes(),
+		Handler:           withTraceLog(logger, srv.routes()),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
