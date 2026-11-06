@@ -31,6 +31,50 @@ export class MicroVMApiError extends Error {
   }
 }
 
+// The typed errors below extend MicroVMApiError, so code that catches
+// MicroVMApiError and reads `status` keeps working unchanged; new code can
+// test `instanceof` for the one case it handles instead of comparing numbers.
+// They keep `name` "MicroVMApiError": code that checks the name (often done
+// where two copies of the SDK make instanceof unreliable) keeps working too.
+
+/** HTTP 404: the sandbox, file, snapshot or other thing the call named does not exist (or is not yours). */
+export class MicroVMNotFoundError extends MicroVMApiError {}
+
+/** HTTP 409: the call clashes with what is there now, such as a sandbox name you already use. */
+export class MicroVMConflictError extends MicroVMApiError {}
+
+/**
+ * HTTP 503: the server has no room for the call right now or is shedding
+ * load. The SDK has already retried it; try again later.
+ */
+export class MicroVMCapacityError extends MicroVMApiError {}
+
+/** HTTP 408 or 504: the server, or a proxy in front of it, gave up waiting. */
+export class MicroVMTimeoutError extends MicroVMApiError {}
+
+/** HTTP 401 or 403: the token is missing, wrong or expired (401), or it may not do this (403). */
+export class MicroVMAuthError extends MicroVMApiError {}
+
+const API_ERROR_CLASSES: Record<number, typeof MicroVMApiError> = {
+  401: MicroVMAuthError,
+  403: MicroVMAuthError,
+  404: MicroVMNotFoundError,
+  408: MicroVMTimeoutError,
+  409: MicroVMConflictError,
+  503: MicroVMCapacityError,
+  504: MicroVMTimeoutError,
+};
+
+/** The most specific {@link MicroVMApiError} subclass for a status. */
+export function apiErrorFor(
+  status: number,
+  message: string,
+  options: { code?: string; retryAfterMs?: number } = {},
+): MicroVMApiError {
+  const ErrorClass = API_ERROR_CLASSES[status] ?? MicroVMApiError;
+  return new ErrorClass(status, message, options);
+}
+
 /**
  * The sandbox's agent (toolboxd) is older than an option this call needs. An
  * older agent would silently ignore the option (an overwrite guard, an output

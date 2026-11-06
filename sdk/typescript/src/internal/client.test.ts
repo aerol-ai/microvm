@@ -4,7 +4,15 @@ import type { AddressInfo } from "node:net";
 import test from "node:test";
 
 import { APIClient, SandboxResource, newIdempotencyKey, parseRetryAfter, retryDelayMs } from "./client.js";
-import { MicroVMApiError, MicroVMUnsupportedFeatureError } from "../errors.js";
+import {
+  MicroVMApiError,
+  MicroVMAuthError,
+  MicroVMCapacityError,
+  MicroVMConflictError,
+  MicroVMNotFoundError,
+  MicroVMTimeoutError,
+  MicroVMUnsupportedFeatureError,
+} from "../errors.js";
 import { Image } from "../Image.js";
 import type { CreateOptions, Sandbox } from "../types.js";
 
@@ -2442,6 +2450,48 @@ test("internal client errors carry status, code and Retry-After", async () => {
     assert.equal(err.message, tc.message, tc.name);
     assert.equal(err.retryAfterMs, tc.retryAfterMs, tc.name);
     assert.equal(attempts, tc.attempts, tc.name);
+  }
+});
+
+// Each common status throws its own MicroVMApiError subclass, so a caller can
+// test for the case it handles; MicroVMApiError (and its name) still match.
+test("internal client throws a typed error per status", async () => {
+  const cases: Array<[number, Function]> = [
+    [401, MicroVMAuthError],
+    [403, MicroVMAuthError],
+    [404, MicroVMNotFoundError],
+    [408, MicroVMTimeoutError],
+    [409, MicroVMConflictError],
+    [503, MicroVMCapacityError],
+    [504, MicroVMTimeoutError],
+    // Statuses without a class of their own stay MicroVMApiError.
+    [400, MicroVMApiError],
+    [412, MicroVMApiError],
+    [422, MicroVMApiError],
+    [500, MicroVMApiError],
+    [502, MicroVMApiError],
+  ];
+  const bodies: Array<[string, () => BodyInit, string, string | undefined]> = [
+    ["JSON body", () => JSON.stringify({ error: "nope", code: "some_code" }), "nope", "some_code"],
+    ["proxy page", () => "<html>error</html>", "", undefined],
+  ];
+  for (const [status, want] of cases) {
+    for (const [label, body, message, code] of bodies) {
+      const client = new APIClient({
+        baseURL: "https://api.example.com",
+        patToken: "pat-token",
+        retry: { maxRetries: 0 },
+        fetch: async () => new Response(body(), { status, headers: { "content-type": "application/json" } }),
+      });
+      const err = await client.get("sb-1").catch((e: unknown) => e);
+      const name = `${status} ${label}`;
+      assert.ok(err instanceof MicroVMApiError, name);
+      assert.equal(Object.getPrototypeOf(err).constructor, want, name);
+      assert.equal(err.name, "MicroVMApiError", name);
+      assert.equal(err.status, status, name);
+      assert.equal(err.code, code, name);
+      assert.equal(err.message, message || `request failed with status ${status}`, name);
+    }
   }
 });
 

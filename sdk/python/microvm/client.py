@@ -282,12 +282,60 @@ class MicroVMHTTPError(MicroVMError):
         self.groups: List[str] = list(groups or [])
 
 
+# The typed errors below are subclasses of MicroVMHTTPError, so code that
+# catches MicroVMHTTPError and reads status_code keeps working unchanged; new
+# code can catch the one case it handles instead of comparing numbers.
+
+
+class MicroVMNotFoundError(MicroVMHTTPError):
+    """HTTP 404: the sandbox, file, snapshot or other thing the call named
+    does not exist (or is not yours)."""
+
+
+class MicroVMConflictError(MicroVMHTTPError):
+    """HTTP 409: the call clashes with what is there now, such as a sandbox
+    name you already use or a move onto an existing file."""
+
+
+class MicroVMCapacityError(MicroVMHTTPError):
+    """HTTP 503: the server has no room for the call right now or is
+    shedding load. The SDK has already retried it; try again later."""
+
+
+class MicroVMTimeoutError(MicroVMHTTPError, TimeoutError):
+    """HTTP 408 or 504: the server, or a proxy in front of it, gave up
+    waiting. It is also a builtin :class:`TimeoutError`, so
+    ``except TimeoutError`` catches it."""
+
+
+class MicroVMAuthError(MicroVMHTTPError):
+    """HTTP 401 or 403: the token is missing, wrong or expired (401), or it
+    may not do this (403). ``reason``, ``required_permission`` and ``role``
+    say more when the server sent them."""
+
+
+_HTTP_ERROR_CLASSES: Dict[int, type] = {
+    401: MicroVMAuthError,
+    403: MicroVMAuthError,
+    404: MicroVMNotFoundError,
+    408: MicroVMTimeoutError,
+    409: MicroVMConflictError,
+    503: MicroVMCapacityError,
+    504: MicroVMTimeoutError,
+}
+
+
+def _new_http_error(status_code: int, message: str, **fields: Any) -> MicroVMHTTPError:
+    """The most specific MicroVMHTTPError subclass for a status."""
+    return _HTTP_ERROR_CLASSES.get(status_code, MicroVMHTTPError)(status_code, message, **fields)
+
+
 def _http_error(status_code: int, data: Any, fallback: str, retry_after: Optional[float] = None) -> MicroVMHTTPError:
     """Builds the error for a decoded JSON error body."""
     if not isinstance(data, dict):
-        return MicroVMHTTPError(status_code, fallback, retry_after=retry_after)
+        return _new_http_error(status_code, fallback, retry_after=retry_after)
     groups = data.get("groups")
-    return MicroVMHTTPError(
+    return _new_http_error(
         status_code,
         str(data.get("error", fallback)),
         retry_after=retry_after,
@@ -2213,7 +2261,7 @@ class MicroVM:
                     try:
                         data = json.loads(payload.decode("utf-8"))
                     except (ValueError, TypeError):
-                        raise MicroVMHTTPError(exc.code, str(exc.reason), retry_after=wait) from exc
+                        raise _new_http_error(exc.code, str(exc.reason), retry_after=wait) from exc
                     raise _http_error(exc.code, data, str(exc.reason), wait) from exc
             except urllib.error.URLError as exc:
                 last_exc = exc

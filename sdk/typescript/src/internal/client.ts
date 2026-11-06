@@ -11,7 +11,7 @@ import {
   sandboxCustomDomainPath as v1SandboxCustomDomainPath,
   sandboxCustomDomainsPath as v1SandboxCustomDomainsPath,
 } from "./api/v1/paths.js";
-import { MicroVMApiError, MicroVMFileTooLargeError, MicroVMUnsupportedFeatureError } from "../errors.js";
+import { MicroVMApiError, MicroVMFileTooLargeError, MicroVMUnsupportedFeatureError, apiErrorFor } from "../errors.js";
 import { Image } from "../Image.js";
 import type {
   AddCustomDomainOptions,
@@ -3059,13 +3059,13 @@ async function decodeError(response: Response): Promise<MicroVMApiError> {
     const payload = (await response.json()) as { error?: unknown; code?: unknown };
     if (typeof payload.error === "string" && payload.error !== "") {
       const code = typeof payload.code === "string" && payload.code !== "" ? payload.code : undefined;
-      return new MicroVMApiError(response.status, payload.error, { code, retryAfterMs });
+      return apiErrorFor(response.status, payload.error, { code, retryAfterMs });
     }
   } catch {
     // Not JSON (a proxy's error page) or no body: fall through to the
     // status-based message, with no code.
   }
-  return new MicroVMApiError(response.status, `request failed with status ${response.status}`, { retryAfterMs });
+  return apiErrorFor(response.status, `request failed with status ${response.status}`, { retryAfterMs });
 }
 
 const STREAM_PREFIX_STDOUT = 0x01;

@@ -379,6 +379,96 @@ Not every error has a code. Many errors are only meant for a person to read. An 
   </TabItem>
 </Tabs>
 
+### Catch one kind of error
+
+Some statuses come up often, so each SDK gives them their own error type. You can catch just the case you care about, such as "this sandbox does not exist", without checking numbers. Each one is a kind of the error above, so code that catches the general error still catches all of them.
+
+| Status | What it means | TypeScript | Python | Go (`errors.Is`) | Rust | Java |
+|---|---|---|---|---|---|---|
+| `404` | The thing you named does not exist, or is not yours. | `MicroVMNotFoundError` | `MicroVMNotFoundError` | `microvm.ErrNotFound` | `is_not_found()` | `MicroVMNotFoundException` |
+| `409` | It clashes with what is there now, such as a name you already use. | `MicroVMConflictError` | `MicroVMConflictError` | `microvm.ErrConflict` | `is_conflict()` | `MicroVMConflictException` |
+| `503` | The server is full or busy. The SDK already tried again. | `MicroVMCapacityError` | `MicroVMCapacityError` | `microvm.ErrCapacity` | `is_capacity()` | `MicroVMCapacityException` |
+| `408`, `504` | The server, or a proxy in front of it, stopped waiting. | `MicroVMTimeoutError` | `MicroVMTimeoutError` | `microvm.ErrTimeout` | `is_timeout()` | `MicroVMTimeoutException` |
+| `401`, `403` | The token is missing, wrong or expired (`401`), or it may not do this (`403`). | `MicroVMAuthError` | `MicroVMAuthError` | `microvm.ErrAuth` | `is_auth()` | `MicroVMAuthException` |
+
+Other statuses, such as `422` or `500`, use the general error type.
+
+A few details:
+
+- **Python:** `MicroVMTimeoutError` is also a built-in `TimeoutError`, so `except TimeoutError` catches it. A `TimeoutError` is an `OSError`, so code that catches `OSError` around a call now also catches a `408` or `504` answer.
+- **Rust:** the checks are methods on both `ApiError` and `Error`. `Error::is_timeout()` is also true when the HTTP client itself stopped waiting. `Error::Api(_)` still matches every HTTP error.
+- **TypeScript:** the error's `name` stays `"MicroVMApiError"`, so code that checks the name still works. Use `instanceof` to tell the types apart.
+- **Go:** a `ctx` that runs out of time gives `context.DeadlineExceeded`, not `ErrTimeout`.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    import { MicroVM, MicroVMNotFoundError } from "@aerol-ai/aerolvm-sdk";
+
+    const client = new MicroVM();
+
+    try {
+      await client.destroy("sb-1234");
+    } catch (err) {
+      if (!(err instanceof MicroVMNotFoundError)) throw err;
+      console.log("Already gone.");
+    }
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    from microvm import MicroVM, MicroVMNotFoundError
+
+    client = MicroVM()
+
+    try:
+        client.destroy("sb-1234")
+    except MicroVMNotFoundError:
+        print("Already gone.")
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    err := client.Destroy(ctx, "sb-1234")
+    switch {
+    case errors.Is(err, microvm.ErrNotFound):
+        fmt.Println("Already gone.")
+    case err != nil:
+        log.Fatal(err)
+    }
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    use aerolvm_sdk::Client;
+
+    let client = Client::new(None, None)?;
+
+    match client.destroy("sb-1234") {
+        Ok(()) => {}
+        Err(err) if err.is_not_found() => println!("Already gone."),
+        Err(err) => return Err(err.into()),
+    }
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    import ai.aerol.microvm.MicroVMClient;
+    import ai.aerol.microvm.MicroVMNotFoundException;
+
+    MicroVMClient client = new MicroVMClient();
+
+    try {
+        client.destroy("sb-1234");
+    } catch (MicroVMNotFoundException e) {
+        System.out.println("Already gone.");
+    }
+    ```
+  </TabItem>
+</Tabs>
+
+### Error codes
+
 Some codes you may see:
 
 | Code | Status | What it means | What to do |

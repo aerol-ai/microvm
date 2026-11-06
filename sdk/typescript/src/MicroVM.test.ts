@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { Image } from "./Image.js";
+import * as sdkIndex from "./index.js";
 import { MicroVMApiError as ExportedMicroVMApiError } from "./index.js";
 import { MicroVM } from "./MicroVM.js";
 import { Sandbox } from "./Sandbox.js";
@@ -1677,4 +1678,20 @@ test("MicroVM exposes the warm-pool admin calls", async () => {
     "GET /v1/warm-pools",
     "DELETE /v1/warm-pools/python%3A3.12",
   ]);
+});
+
+test("the typed errors are exported and thrown through MicroVM", async () => {
+  const sdk = new MicroVM({
+    patToken: "pat-token",
+    apiUrl: "https://api.example.com",
+    retry: { maxRetries: 0 },
+    fetch: async () => new Response(JSON.stringify({ error: "sandbox not found" }), { status: 404, headers: { "content-type": "application/json" } }),
+  });
+  const err = await sdk.get("sb-missing").catch((e: unknown) => e);
+  assert.ok(err instanceof sdkIndex.MicroVMNotFoundError);
+  assert.ok(err instanceof ExportedMicroVMApiError);
+  for (const name of ["MicroVMAuthError", "MicroVMCapacityError", "MicroVMConflictError", "MicroVMNotFoundError", "MicroVMTimeoutError"] as const) {
+    assert.equal(typeof sdkIndex[name], "function", name);
+    assert.ok(Object.prototype.isPrototypeOf.call(ExportedMicroVMApiError, sdkIndex[name]), name);
+  }
 });

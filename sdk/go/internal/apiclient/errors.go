@@ -18,6 +18,16 @@ var (
 	ErrNotFound = errors.New("not found")
 	// ErrConflict matches a 409, e.g. a create whose name the caller holds.
 	ErrConflict = errors.New("conflict")
+	// ErrCapacity matches a 503: the server has no room for the call right
+	// now or is shedding load. The client has already retried it.
+	ErrCapacity = errors.New("server is out of capacity")
+	// ErrTimeout matches a 408 or 504: the server, or a proxy in front of
+	// it, gave up waiting. A ctx deadline is context.DeadlineExceeded, not
+	// this.
+	ErrTimeout = errors.New("server timed out")
+	// ErrAuth matches a 401 (the token is missing, wrong or expired) and a
+	// 403 (the token may not do this).
+	ErrAuth = errors.New("not authorized")
 	// ErrNameLookupUnsupported means the server ignored ?name= (it predates
 	// name lookup), so its reply can't identify a sandbox.
 	ErrNameLookupUnsupported = errors.New("sandbox name lookup not supported by this server")
@@ -120,6 +130,12 @@ func (e *APIError) Is(target error) bool {
 		return e.StatusCode == http.StatusNotFound
 	case ErrConflict:
 		return e.StatusCode == http.StatusConflict
+	case ErrCapacity:
+		return e.StatusCode == http.StatusServiceUnavailable
+	case ErrTimeout:
+		return e.StatusCode == http.StatusRequestTimeout || e.StatusCode == http.StatusGatewayTimeout
+	case ErrAuth:
+		return e.StatusCode == http.StatusUnauthorized || e.StatusCode == http.StatusForbidden
 	}
 	return false
 }

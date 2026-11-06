@@ -29,11 +29,16 @@ type StreamError = apiclient.StreamError
 type UnsupportedFeatureError = apiclient.UnsupportedFeatureError
 
 // Sentinels for errors.Is. ErrNotFound matches a 404 (and a GetByName miss),
-// ErrConflict a 409, ErrNameLookupUnsupported a server that ignored
-// `?name=`, and ErrUnsupportedFeature an *UnsupportedFeatureError.
+// ErrConflict a 409, ErrCapacity a 503, ErrTimeout a 408 or 504, ErrAuth a
+// 401 or 403, ErrNameLookupUnsupported a server that ignored `?name=`, and
+// ErrUnsupportedFeature an *UnsupportedFeatureError. The status sentinels
+// match an *APIError, which errors.As still reads for the details.
 var (
 	ErrNotFound              = apiclient.ErrNotFound
 	ErrConflict              = apiclient.ErrConflict
+	ErrCapacity              = apiclient.ErrCapacity
+	ErrTimeout               = apiclient.ErrTimeout
+	ErrAuth                  = apiclient.ErrAuth
 	ErrNameLookupUnsupported = apiclient.ErrNameLookupUnsupported
 	ErrUnsupportedFeature    = apiclient.ErrUnsupportedFeature
 	// ErrFileTooLarge means a download was larger than its MaxBytes.

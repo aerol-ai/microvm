@@ -163,6 +163,48 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
+impl Error {
+    /// The [`ApiError`] behind this error when the server answered with an
+    /// HTTP error status, or `None` for any other failure.
+    pub fn api_error(&self) -> Option<&ApiError> {
+        match self {
+            Error::Api(err) => Some(err),
+            _ => None,
+        }
+    }
+
+    /// The server answered 404. See [`ApiError::is_not_found`].
+    pub fn is_not_found(&self) -> bool {
+        self.api_error().is_some_and(ApiError::is_not_found)
+    }
+
+    /// The server answered 409. See [`ApiError::is_conflict`].
+    pub fn is_conflict(&self) -> bool {
+        self.api_error().is_some_and(ApiError::is_conflict)
+    }
+
+    /// The server answered 503. See [`ApiError::is_capacity`].
+    pub fn is_capacity(&self) -> bool {
+        self.api_error().is_some_and(ApiError::is_capacity)
+    }
+
+    /// The call timed out: the server answered 408 or 504
+    /// ([`ApiError::is_timeout`]), or the HTTP client itself gave up
+    /// waiting (a connect or request timeout).
+    pub fn is_timeout(&self) -> bool {
+        match self {
+            Error::Api(err) => err.is_timeout(),
+            Error::Reqwest(err) => err.is_timeout(),
+            _ => false,
+        }
+    }
+
+    /// The server answered 401 or 403. See [`ApiError::is_auth`].
+    pub fn is_auth(&self) -> bool {
+        self.api_error().is_some_and(ApiError::is_auth)
+    }
+}
+
 /// The sandbox and the features its agent did not list on `/version`,
 /// returned as [`Error::UnsupportedFeature`]. Restart the sandbox, or
 /// re-create its Firecracker template, to get the current agent.
@@ -293,6 +335,41 @@ impl ApiError {
     /// wait, or `None` without a usable header.
     pub fn retry_after(&self) -> Option<Duration> {
         self.retry_after
+    }
+
+    // The predicates below name the common statuses, so a caller can branch
+    // on the case it handles instead of comparing numbers. They are methods,
+    // not new `Error` variants, so existing `Error::Api(_)` arms keep
+    // matching every HTTP error.
+
+    /// HTTP 404: the sandbox, file, snapshot or other thing the call named
+    /// does not exist (or is not yours).
+    pub fn is_not_found(&self) -> bool {
+        self.status() == 404
+    }
+
+    /// HTTP 409: the call clashes with what is there now, such as a sandbox
+    /// name you already use.
+    pub fn is_conflict(&self) -> bool {
+        self.status() == 409
+    }
+
+    /// HTTP 503: the server has no room for the call right now or is
+    /// shedding load. The client has already retried it.
+    pub fn is_capacity(&self) -> bool {
+        self.status() == 503
+    }
+
+    /// HTTP 408 or 504: the server, or a proxy in front of it, gave up
+    /// waiting.
+    pub fn is_timeout(&self) -> bool {
+        matches!(self.status(), 408 | 504)
+    }
+
+    /// HTTP 401 (the token is missing, wrong or expired) or 403 (the token
+    /// may not do this).
+    pub fn is_auth(&self) -> bool {
+        matches!(self.status(), 401 | 403)
     }
 }
 
@@ -7330,6 +7407,52 @@ mod tests {
                 case.name
             );
         }
+    }
+
+    #[test]
+    fn status_predicates_name_the_common_statuses() {
+        // (status line, not_found, conflict, capacity, timeout, auth)
+        let cases = [
+            ("401 Unauthorized", false, false, false, false, true),
+            ("403 Forbidden", false, false, false, false, true),
+            ("404 Not Found", true, false, false, false, false),
+            ("408 Request Timeout", false, false, false, true, false),
+            ("409 Conflict", false, true, false, false, false),
+            ("503 Service Unavailable", false, false, true, false, false),
+            ("504 Gateway Timeout", false, false, false, true, false),
+            ("400 Bad Request", false, false, false, false, false),
+            ("412 Precondition Failed", false, false, false, false, false),
+            ("500 Internal Server Error", false, false, false, false, false),
+            ("502 Bad Gateway", false, false, false, false, false),
+        ];
+        for (line, not_found, conflict, capacity, timeout, auth) in cases {
+            let (url, _rx) = spawn_response_server_with_headers(
+                line,
+                "application/json",
+                "",
+                br#"{"error":"no"}"#.to_vec(),
+            );
+            let err = no_retry_client(&url).get("sb-1").expect_err(line);
+            let got = (
+                err.is_not_found(),
+                err.is_conflict(),
+                err.is_capacity(),
+                err.is_timeout(),
+                err.is_auth(),
+            );
+            assert_eq!(got, (not_found, conflict, capacity, timeout, auth), "{line}");
+            let api = err.api_error().expect(line);
+            assert_eq!(
+                (api.is_not_found(), api.is_conflict(), api.is_capacity(), api.is_timeout(), api.is_auth()),
+                got,
+                "{line}"
+            );
+            // The existing Error::Api arm still matches every HTTP error.
+            assert!(matches!(err, Error::Api(_)), "{line}");
+        }
+        let client_err = Error::Client("bad argument".to_string());
+        assert!(client_err.api_error().is_none());
+        assert!(!client_err.is_not_found() && !client_err.is_timeout() && !client_err.is_auth());
     }
 
     #[test]

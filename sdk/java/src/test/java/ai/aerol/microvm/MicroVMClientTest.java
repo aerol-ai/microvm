@@ -3204,6 +3204,49 @@ class MicroVMClientTest {
         }
     }
 
+    // Each common status throws its own MicroVMApiException subclass, so a
+    // caller can catch the case it handles; MicroVMApiException still
+    // catches them all.
+    @Test
+    void eachCommonStatusThrowsItsOwnException() throws Exception {
+        Object[][] cases = {
+            {401, MicroVMAuthException.class},
+            {403, MicroVMAuthException.class},
+            {404, MicroVMNotFoundException.class},
+            {408, MicroVMTimeoutException.class},
+            {409, MicroVMConflictException.class},
+            {503, MicroVMCapacityException.class},
+            {504, MicroVMTimeoutException.class},
+            {400, MicroVMApiException.class},
+            {412, MicroVMApiException.class},
+            {422, MicroVMApiException.class},
+            {500, MicroVMApiException.class},
+            {502, MicroVMApiException.class},
+        };
+        String[][] bodies = {
+            // {content type, body, code, message (null: status message)}
+            {"application/json", "{\"error\":\"nope\",\"code\":\"some_code\"}", "some_code", "nope"},
+            {"text/html", "<html>error</html>", null, null},
+        };
+        for (Object[] c : cases) {
+            int status = (Integer) c[0];
+            for (String[] b : bodies) {
+                String name = status + " " + b[0];
+                HttpServer server = startServer(exchange -> writeResponse(exchange, status, b[0], b[1].getBytes(StandardCharsets.UTF_8)));
+                try {
+                    MicroVMClient client = clientFor(serverUrl(server), new RetryConfig().setMaxRetries(0), HttpClient.newHttpClient());
+                    MicroVMApiException err = assertThrows(MicroVMApiException.class, () -> client.get("sb-1"), name);
+                    assertEquals(c[1], err.getClass(), name);
+                    assertEquals(status, err.getStatusCode(), name);
+                    assertEquals(b[2], err.getCode(), name);
+                    assertEquals(b[3] == null ? "request failed with status " + status : b[3], err.getMessage(), name);
+                } finally {
+                    server.stop(0);
+                }
+            }
+        }
+    }
+
     @Test
     void idempotencyKeyReusedIsNotRetried() throws Exception {
         AtomicInteger hits = new AtomicInteger();

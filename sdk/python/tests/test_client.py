@@ -1744,6 +1744,100 @@ class HTTPErrorTests(unittest.TestCase):
 
         self.assertIs(microvm.MicroVMHTTPError, MicroVMHTTPError)
         self.assertIs(microvm.MicroVMError, MicroVMError)
+        for name in (
+            "MicroVMNotFoundError",
+            "MicroVMConflictError",
+            "MicroVMCapacityError",
+            "MicroVMTimeoutError",
+            "MicroVMAuthError",
+        ):
+            self.assertIs(getattr(microvm, name), getattr(client_module, name))
+            self.assertIn(name, microvm.__all__)
+
+
+class TypedErrorTests(unittest.TestCase):
+    """Each common status raises its own MicroVMHTTPError subclass, so a
+    caller can catch the case it handles; MicroVMHTTPError still catches
+    them all, with the status, code and message unchanged."""
+
+    def _serve(self, status, body, content_type):
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def _answer(self):
+                length = int(self.headers.get("Content-Length") or 0)
+                self.rfile.read(length)
+                self.send_response(status)
+                self.send_header("Content-Type", content_type)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            do_GET = do_POST = do_DELETE = _answer
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
+        thread.start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        return MicroVM("http://127.0.0.1:%d" % server.server_port, "pat", config={"retry": {"maxRetries": 0}})
+
+    def test_status_picks_the_error_class(self):
+        cases = [
+            # (status, want class, also a builtin TimeoutError)
+            (401, client_module.MicroVMAuthError, False),
+            (403, client_module.MicroVMAuthError, False),
+            (404, client_module.MicroVMNotFoundError, False),
+            (408, client_module.MicroVMTimeoutError, True),
+            (409, client_module.MicroVMConflictError, False),
+            (503, client_module.MicroVMCapacityError, False),
+            (504, client_module.MicroVMTimeoutError, True),
+            # Statuses without a class of their own stay MicroVMHTTPError.
+            (400, MicroVMHTTPError, False),
+            (412, MicroVMHTTPError, False),
+            (422, MicroVMHTTPError, False),
+            (500, MicroVMHTTPError, False),
+            (502, MicroVMHTTPError, False),
+        ]
+        bodies = [
+            ("JSON body", b'{"error": "nope", "code": "some_code"}', "application/json", "nope", "some_code"),
+            ("proxy page", b"<html>error</html>", "text/html", None, ""),
+        ]
+        for status, want, is_timeout in cases:
+            for label, body, ctype, message, code in bodies:
+                with self.subTest(status=status, body=label):
+                    client = self._serve(status, body, ctype)
+                    with self.assertRaises(MicroVMHTTPError) as ctx:
+                        client.get("sb-1")
+                    err = ctx.exception
+                    self.assertIs(type(err), want)
+                    self.assertEqual(err.status_code, status)
+                    self.assertEqual(err.code, code)
+                    if message is not None:
+                        self.assertEqual(str(err), message)
+                    self.assertEqual(isinstance(err, TimeoutError), is_timeout)
+
+    def test_typed_errors_keep_the_identity_fields(self):
+        err = client_module._http_error(
+            403,
+            {"error": "forbidden", "code": "forbidden", "reason": "no_binding", "role": "viewer", "groups": ["a"]},
+            "Forbidden",
+        )
+        self.assertIsInstance(err, client_module.MicroVMAuthError)
+        self.assertEqual((err.reason, err.role, err.groups), ("no_binding", "viewer", ["a"]))
+
+    def test_a_typed_error_is_caught_by_the_older_except_clauses(self):
+        # Code written before the typed errors existed catches these the
+        # same way: by MicroVMHTTPError or MicroVMError.
+        client = self._serve(404, b'{"error": "sandbox not found"}', "application/json")
+        try:
+            client.destroy("sb-1")
+        except MicroVMError as err:
+            self.assertIsInstance(err, MicroVMHTTPError)
+            self.assertEqual(err.status_code, 404)
+        else:
+            self.fail("destroy of a missing sandbox did not raise")
 
 
 class IdempotencyKeyTests(unittest.TestCase):

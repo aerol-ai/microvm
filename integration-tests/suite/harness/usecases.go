@@ -1042,6 +1042,8 @@ var Registry = []UseCase{
 	{ID: "UC-465", Title: "code-server image: images/code-server/Dockerfile builds on the server through the SDK image builder; the editor answers on 8080 inside as uid 1000 with no sudo; exposed with visibility token its URL is a 401 without a token and serves the health check with the token cookie", Requires: []Capability{CapDocker, CapDomain}, Implemented: true},
 	{ID: "UC-466", Title: "Host an MCP server recipe: the filesystem MCP server behind supergateway, started as a session, answers a JSON-RPC initialize through its exposed port with its key and 401s without it; exposed with visibility token it also needs the sandbox token cookie", Requires: []Capability{CapDomain}, Implemented: true},
 	{ID: "UC-467", Title: "Coding-agent recipes: OpenCode, Aider, Gemini CLI and Codex CLI each install at the pinned version in the documented image next to a cloned repository and, started as a session with the documented command and a dummy key, run headless to the model API (the log shows the provider refusing the key, not a usage, trust or missing-key error)", Requires: []Capability{CapDocker}, Implemented: true},
+	// Agent-sandbox parity, SDK experience (parity_sdk_test.go; plan §5.3 S1-S7).
+	{ID: "UC-446", Title: "Typed errors: a missing sandbox matches the Go SDK's ErrNotFound, a create with a name already in use ErrConflict, and a wrong token ErrAuth (401), each still an *APIError", Implemented: true},
 }
 
 // byID is a lookup built once for the report generator.

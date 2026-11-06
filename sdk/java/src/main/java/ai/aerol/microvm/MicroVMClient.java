@@ -2200,9 +2200,9 @@ public class MicroVMClient {
         ErrorResponse error = body == null ? null : JsonSupport.tryRead(body, ErrorResponse.class);
         if (error != null && error.error != null && !error.error.isEmpty()) {
             String code = error.code == null || error.code.isEmpty() ? null : error.code;
-            return new MicroVMApiException(status, code, error.error, retryAfter);
+            return MicroVMApiException.forStatus(status, code, error.error, retryAfter);
         }
-        return new MicroVMApiException(status, null, "request failed with status " + status, retryAfter);
+        return MicroVMApiException.forStatus(status, null, "request failed with status " + status, retryAfter);
     }
 
     private URI resolve(String path) {

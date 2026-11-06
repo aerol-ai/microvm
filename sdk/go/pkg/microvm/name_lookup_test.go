@@ -62,3 +62,24 @@ func TestClientNameLookup(t *testing.T) {
 		}
 	}
 }
+
+// TestClientStatusSentinels: the status sentinels re-exported here match the
+// errors a Client call returns.
+func TestClientStatusSentinels(t *testing.T) {
+	statuses := map[string]int{"auth": http.StatusForbidden, "busy": http.StatusServiceUnavailable, "slow": http.StatusGatewayTimeout}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(statuses[r.URL.Path[len("/v1/sandboxes/"):]])
+		_, _ = w.Write([]byte(`{"error":"no"}`))
+	}))
+	defer server.Close()
+	zero := 0
+	client, err := NewClientWithConfig(&sdktypes.MicroVMConfig{PATToken: "pat", APIUrl: server.URL, Retry: &sdktypes.RetryConfig{MaxRetries: &zero}})
+	if err != nil {
+		t.Fatalf("NewClientWithConfig: %v", err)
+	}
+	for id, want := range map[string]error{"auth": ErrAuth, "busy": ErrCapacity, "slow": ErrTimeout} {
+		if _, err := client.Get(context.Background(), id); !errors.Is(err, want) {
+			t.Fatalf("Get(%s) error = %v, want %v", id, err, want)
+		}
+	}
+}
