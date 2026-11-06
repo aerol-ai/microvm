@@ -121,6 +121,9 @@ func Extract(r io.Reader, dest string, limits Limits) (Result, error) {
 			break
 		}
 		if err != nil {
+			if out := removeEscapingLinks(root, links, res.Entries); out != nil && out.cannotRemove {
+				return res, out
+			}
 			return res, &EntryError{Written: res.Entries, Err: fmt.Errorf("%w: %v", ErrCorrupt, err)}
 		}
 		if hdr.Typeflag == tar.TypeXGlobalHeader {
@@ -129,6 +132,12 @@ func Extract(r io.Reader, dest string, limits Limits) (Result, error) {
 		fail := func(err error) (Result, error) {
 			if escapes(err) {
 				err = fmt.Errorf("%w: %v", ErrUnsafe, err)
+			}
+			// Links made so far are checked on this exit too: an entry
+			// before the failure can already have made one lead out, and
+			// the partial result stays on disk.
+			if out := removeEscapingLinks(root, links, res.Entries); out != nil && out.cannotRemove {
+				return res, out
 			}
 			return res, &EntryError{Entry: hdr.Name, Written: res.Entries, Err: err}
 		}
@@ -173,28 +182,9 @@ func Extract(r io.Reader, dest string, limits Limits) (Result, error) {
 		}
 		res.Entries++
 	}
-	// writeSymlink checks a link when it is made, but a later entry can
-	// change what the link resolves through: "a" -> "s/c/.." is dangling
-	// (so allowed) until a later "s/c" -> ".." makes it lead out of the
-	// folder. Writes never follow it out (os.Root), but the link would stay
-	// on disk for whatever reads the folder next, such as the user's own
-	// tools after `aerolvm cp -r` down. So every link is checked again once
-	// the whole archive is down, and one that now leads out is removed.
 	// Before the folder modes, which can make its folder read-only.
-	var firstOut *EntryError
-	for _, name := range links {
-		if _, err := root.Stat(name); err == nil || errors.Is(err, fs.ErrNotExist) {
-			continue
-		}
-		if err := root.Remove(name); err != nil && !errors.Is(err, fs.ErrNotExist) {
-			return res, &EntryError{Entry: name, Written: res.Entries, Err: fmt.Errorf("%w: symlink points outside the folder and could not be removed: %v", ErrUnsafe, err)}
-		}
-		if firstOut == nil {
-			firstOut = &EntryError{Entry: name, Written: res.Entries, Err: fmt.Errorf("%w: symlink points outside the folder once later entries are in place", ErrUnsafe)}
-		}
-	}
-	if firstOut != nil {
-		return res, firstOut
+	if out := removeEscapingLinks(root, links, res.Entries); out != nil {
+		return res, out.EntryError
 	}
 	// Folder modes go on last, deepest first, so a read-only folder does not
 	// stop its own contents being written.
@@ -293,6 +283,39 @@ func writeSymlink(root *os.Root, name, target string) error {
 		return fmt.Errorf("%w: symlink to %q points outside the folder", ErrUnsafe, target)
 	}
 	return nil
+}
+
+// linkOutError is removeEscapingLinks' answer: the refusal, and whether a
+// link that leads out could not be removed (then it is the error to return,
+// whatever else failed).
+type linkOutError struct {
+	*EntryError
+	cannotRemove bool
+}
+
+// removeEscapingLinks checks again every link the archive made and removes
+// any that now leads out of the folder. writeSymlink checks a link when it
+// is made, but a later entry can change what it resolves through: "a" ->
+// "s/c/.." is dangling (so allowed) until a later "s/c" -> ".." makes it
+// lead out. Writes never follow it out (os.Root), but the link would stay on
+// disk for whatever reads the folder next, such as the user's own tools after
+// `aerolvm cp -r` down. Extract runs this on EVERY exit, the end of the
+// archive and each failure part way, since a failure leaves what was written.
+// It answers nil when no link leads out.
+func removeEscapingLinks(root *os.Root, links []string, written int) *linkOutError {
+	var first *linkOutError
+	for _, name := range links {
+		if _, err := root.Stat(name); err == nil || errors.Is(err, fs.ErrNotExist) {
+			continue
+		}
+		if err := root.Remove(name); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return &linkOutError{EntryError: &EntryError{Entry: name, Written: written, Err: fmt.Errorf("%w: symlink points outside the folder and could not be removed: %v", ErrUnsafe, err)}, cannotRemove: true}
+		}
+		if first == nil {
+			first = &linkOutError{EntryError: &EntryError{Entry: name, Written: written, Err: fmt.Errorf("%w: symlink points outside the folder once later entries are in place", ErrUnsafe)}}
+		}
+	}
+	return first
 }
 
 // escapes reports os.Root refusing a path that leaves the folder (through a

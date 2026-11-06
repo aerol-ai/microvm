@@ -417,3 +417,36 @@ func TestExtractRechecksLinksAtTheEnd(t *testing.T) {
 		t.Fatalf("a dangling link inside the folder: %v", err)
 	}
 }
+
+// TestExtractFailurePartWayRemovesLinksThatLeadOut: a failure after a link
+// came to lead out of the folder (an entry limit, a stream that breaks off)
+// still removes that link. The partial result stays on disk, so a link left
+// there would lead the user's own tools outside. From an external review.
+func TestExtractFailurePartWayRemovesLinksThatLeadOut(t *testing.T) {
+	entries := []entry{symlink("a", "s/c/.."), dir("s"), symlink("s/c", ".."), file("after", "x")}
+	cases := []struct {
+		name  string
+		data  func(t *testing.T) []byte
+		limit Limits
+	}{
+		{"an entry limit", func(t *testing.T) []byte { return archive(t, entries...) }, Limits{MaxEntries: 3}},
+		{"a stream that breaks off", func(t *testing.T) []byte {
+			full := archive(t, entries...)
+			// Cut inside the last entry's header block: the first three
+			// entries are read, then the reader fails.
+			return full[:3*512+100]
+		}, Limits{}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newSandbox(t)
+			if _, err := Extract(bytes.NewReader(tc.data(t)), s.dest, tc.limit); err == nil {
+				t.Fatal("expected the extract to fail part way")
+			}
+			if _, err := os.Lstat(filepath.Join(s.dest, "a")); !errors.Is(err, fs.ErrNotExist) {
+				t.Fatalf("the link out of the folder was left on disk after a failure: %v", err)
+			}
+			s.assertOutsideUntouched(t)
+		})
+	}
+}
