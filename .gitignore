@@ -22,6 +22,11 @@ config/terraform.tfvars
 sdk/python/__pycache__/
 sdk/python/.venv/
 sdk/python/venv/
+# Virtualenvs and build/coverage output of the Python integration packages
+# (integrations/*).
+.venv/
+*.egg-info/
+.coverage
 *.pyc
 *.pyo
 *.pyd

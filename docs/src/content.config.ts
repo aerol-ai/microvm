@@ -64,6 +64,14 @@ const getDocsSidebarConfig = (): NavigationGroup[] => [
   },
   {
     type: 'group',
+    label: 'Agent Framework Integrations',
+    category: NavigationCategory.SDKS,
+    entries: [
+      link('/integrations/openai-agents', '- OpenAI Agents SDK'),
+    ],
+  },
+  {
+    type: 'group',
     label: 'Runtimes',
     category: NavigationCategory.RUNTIMES,
     entries: [

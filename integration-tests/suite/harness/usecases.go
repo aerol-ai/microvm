@@ -1048,6 +1048,10 @@ var Registry = []UseCase{
 	{ID: "UC-448", Title: "Delete many by tag: DestroyAll with a tag unique to the run deletes the three sandboxes carrying it and returns their IDs, leaves a sandbox with another tag value, and a second call deletes nothing", Implemented: true},
 	{ID: "UC-449", Title: "Auto-cleanup: Close without DestroyOnClose leaves the sandbox running and usable; with DestroyOnClose it deletes the sandbox even with an already cancelled ctx, and a second Close is a no-op", Implemented: true},
 	{ID: "UC-450", Title: "Per-call timeouts: a create whose caller gives up after 50 ms, sent again with the same Idempotency-Key, ends with exactly one sandbox of that name and the retry returns it", Implemented: true},
+	// Agent-framework integrations (plans/agent-sandbox-feature-parity.md
+	// §5.11). The packages are Python; these cases drive the server calls
+	// they rely on (parity_integrations_test.go).
+	{ID: "UC-457", Title: "OpenAI Agents provider (G1): a workspace made with make_dir(parents), written by upload and by an argv exec in it, saved as an AerolVM snapshot, comes back byte for byte in a new sandbox booted with the snapshot's name as its image, and list_files shows it", Requires: []Capability{CapDocker}, Implemented: true},
 }
 
 // byID is a lookup built once for the report generator.

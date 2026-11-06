@@ -1,0 +1,125 @@
+---
+title: OpenAI Agents SDK
+description: Run OpenAI Agents SDK sandbox agents in AerolVM sandboxes, and save their workspace as an AerolVM snapshot.
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+<Aside>
+This page shows Python only. The OpenAI Agents SDK sandbox API exists only in Python.
+</Aside>
+
+The [OpenAI Agents SDK](https://github.com/openai/openai-agents-python) can give an agent its own computer: a `SandboxAgent` runs shell commands and edits files in a sandbox. The `aerolvm-openai-agents` package makes that sandbox an AerolVM sandbox.
+
+Your agent does not change. You only name the AerolVM client in the run config.
+
+## Install
+
+The package is not on PyPI yet. Install it from the AerolVM repository:
+
+```bash
+pip install "git+https://github.com/aerol-ai/microvm.git#subdirectory=integrations/openai-agents"
+```
+
+It works with `openai-agents` 0.24. It talks to your server through the AerolVM Python SDK, so set the same two variables as for the SDK:
+
+```bash
+export SB_API_URL=https://sandbox.example.com
+export SB_PAT_TOKEN=your-token
+```
+
+## Run an agent
+
+```python
+import asyncio
+
+from agents import Runner
+from agents.run import RunConfig
+from agents.sandbox import SandboxAgent, SandboxRunConfig
+from agents.sandbox.capabilities import Shell
+from agents.sandbox.snapshot import LocalSnapshotSpec
+
+from aerolvm_openai_agents import AerolVMSandboxClient, AerolVMSandboxClientOptions
+
+agent = SandboxAgent(
+    name="builder",
+    instructions="Build the project in the workspace.",
+    capabilities=[Shell()],
+)
+
+run_config = RunConfig(
+    sandbox=SandboxRunConfig(
+        client=AerolVMSandboxClient(),
+        options=AerolVMSandboxClientOptions(image="python:3.12-slim"),
+        snapshot=LocalSnapshotSpec(base_path="./agent-snapshots"),
+    ),
+)
+
+result = asyncio.run(Runner.run(agent, "Make a hello.py and run it", run_config=run_config))
+print(result.final_output)
+```
+
+`AerolVMSandboxClient()` builds a `MicroVM` client from the environment. To use one you already have, pass it in: `AerolVMSandboxClient(MicroVM(...))`.
+
+## What it does with the sandbox
+
+Each run gets a new sandbox, tagged `integration=openai-agents`. Then:
+
+- **Commands** run with `exec`. The command goes as a list of words (`argv`), so spaces and quotes reach the program as written. It runs in the workspace folder (`/workspace` by default).
+- **Files** move with `upload_file` and `download_file`, so the bytes stay exact. Folder listings use `list_files`.
+- **Ports** the agent publishes go through `expose_port`. List them first in `exposed_ports`.
+- **When the run ends**, the workspace is saved (if you set `snapshot`), and then the sandbox is destroyed.
+
+### Save and restore the workspace
+
+With `snapshot=` in the run config, the workspace is saved when the run ends. By default it is saved as an [AerolVM snapshot](/images-and-snapshots/#snapshots) of the whole sandbox. The Agents SDK keeps only a small reference to it, in the place you chose (a local folder in the example). Installed packages are saved too.
+
+To pick up a run later, resume it from its saved state. The package looks for the old sandbox first. If it is gone, it starts a new one straight from the last snapshot. The new one starts with everything the old one had.
+
+Snapshots are never deleted for you, because a saved state may still need one. Every name starts with `openai-agents-`, so you can find old ones with `client.list_snapshots()` and remove them with `client.delete_snapshot(name)`. Set `delete_superseded_snapshots=True` to delete each older snapshot once a newer one is saved.
+
+Set `workspace_persistence="tar"` to save the workspace folder as a tar file instead. The SDK then stores the files themselves, outside the AerolVM server. The package also uses a tar by itself when the manifest marks some paths as ephemeral, because a snapshot can not leave paths out.
+
+### Keep the sandbox between runs
+
+`on_shutdown` picks what happens to the sandbox when a run ends:
+
+| Value | What happens | Resume |
+| --- | --- | --- |
+| `"destroy"` (default) | The sandbox is deleted. | Makes a new sandbox from the last snapshot. |
+| `"stop"` | The sandbox stops. It keeps its disk but uses no CPU or memory. | Starts the same sandbox again. No snapshot needed. |
+| `"keep"` | The sandbox keeps running. | Uses the same sandbox right away. |
+
+With `"stop"` or `"keep"`, set a [lifecycle](/lifecycle/) in `create_options` so a sandbox you forget does not live forever:
+
+```python
+options = AerolVMSandboxClientOptions(
+    image="python:3.12-slim",
+    on_shutdown="stop",
+    create_options={"lifecycle": {"destroyIfIdleFor": 24 * 3600 * 10**9}},  # one day, in nanoseconds
+)
+```
+
+## Options
+
+| Option | Default | What it does |
+| --- | --- | --- |
+| `image` | (required) | The image or snapshot name the sandbox starts from. It needs `sh`, `find` and `readlink`, and `tar` for `"tar"` saving. |
+| `create_options` | `{}` | Any other create fields, such as `cpu`, `memoryMB`, `runtime`, `env` or `lifecycle`. |
+| `exposed_ports` | `()` | Ports the agent may publish. |
+| `workspace_persistence` | `"snapshot"` | `"snapshot"` or `"tar"`. |
+| `on_shutdown` | `"destroy"` | `"destroy"`, `"stop"` or `"keep"`. |
+| `exec_timeout_s` | `3600` | Time limit for a command the agent runs without one. |
+| `max_output_bytes` | `None` | Keep at most this many bytes of each command's output. |
+| `snapshot_name_prefix` | `"openai-agents"` | Start of each snapshot name. |
+| `delete_superseded_snapshots` | `False` | Delete the older snapshot when a newer one is saved. |
+
+`create_options` is saved with the run state, so a resume can make the same kind of sandbox. Keep secrets you would not store with your run state out of it.
+
+## Limits
+
+- There is no terminal (PTY), so the agent does not get the `write_stdin` tool. Commands run to the end and return their output.
+- It needs a shell, so it works with container and Firecracker sandboxes, not WebAssembly or V8 isolate ones.
+- Command output is text. Binary files travel through the file calls.
+- Each file read or write holds the whole file in memory.
+- A sandbox whose agent is older than the server falls back to sending each command as one command line. A `max_output_bytes` cap on such a sandbox fails instead of being ignored. Restart the sandbox to get the current agent.
