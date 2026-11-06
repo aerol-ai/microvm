@@ -1,0 +1,395 @@
+---
+title: Run OpenCode in a sandbox
+description: Run the OpenCode coding agent headless in a sandbox, in a session that keeps going if your connection drops, and download its change as a patch.
+---
+
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+
+[OpenCode](https://opencode.ai) is an open-source coding agent for the terminal. It works with many model providers. This recipe uses Claude through your Anthropic API key.
+
+In this recipe OpenCode runs inside a sandbox, on a copy of a GitHub repository. It makes one change you describe in plain words, and you download that change as a patch: a file that lists every changed line. The agent can install tools and run commands there without touching your machine.
+
+The agent runs in a [session](/sessions/). A session keeps running when your program stops or your connection drops, so a long task is never cut off halfway.
+
+## What you need
+
+- An AerolVM server and an SDK for your language. See [SDK setup](/sdk-setup/).
+- These environment variables on your computer:
+
+| Variable | What it is | Default |
+|---|---|---|
+| `SB_API_URL` | The address of your AerolVM server. | `http://127.0.0.1:21212` |
+| `SB_PAT_TOKEN` | Your AerolVM token. | None. You must set it. |
+| `ANTHROPIC_API_KEY` | Your Anthropic API key. OpenCode uses it to call Claude. | None. You must set it. |
+
+```bash
+export SB_API_URL=http://localhost:21212
+export SB_PAT_TOKEN=your-secret-pat
+export ANTHROPIC_API_KEY=your-key
+```
+
+## Step 1: Create the sandbox
+
+OpenCode installs from npm, so the sandbox starts from a Node.js image. It also has Git. The API key goes in as an environment variable, so it never appears in a command. The lifecycle rule deletes the sandbox after 30 idle minutes, in case your program stops early.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const sandbox = await client.create({
+      image: "node:22-bookworm",
+      cpu: 1,
+      memoryMB: 2048,
+      env: { ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY! },
+      lifecycle: { destroyIfIdleFor: 30 * 60 * 1_000_000_000 }, // 30 minutes
+    });
+    console.log(sandbox.id);
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    import os
+
+    sandbox = client.create(
+        image="node:22-bookworm",
+        cpu=1,
+        memoryMB=2048,
+        env={"ANTHROPIC_API_KEY": os.environ["ANTHROPIC_API_KEY"]},
+        lifecycle={"destroyIfIdleFor": 30 * 60 * 1_000_000_000},  # 30 minutes
+    )
+    print(sandbox.id)
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    sandbox, err := client.Create(ctx, sdktypes.CreateSandboxOptions{
+        Image:     "node:22-bookworm",
+        CPU:       1,
+        MemoryMB:  2048,
+        Env:       map[string]string{"ANTHROPIC_API_KEY": os.Getenv("ANTHROPIC_API_KEY")},
+        Lifecycle: &sdktypes.Lifecycle{DestroyIfIdleFor: 30 * time.Minute},
+    })
+    if err != nil {
+        log.Fatal(err)
+    }
+    fmt.Println(sandbox.ID)
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    use aerolvm_sdk::Lifecycle;
+    use std::collections::HashMap;
+
+    let sandbox = client.create(CreateOptions {
+        image: "node:22-bookworm".into(),
+        cpu: Some(1),
+        memory_mb: Some(2048),
+        env: Some(HashMap::from([
+            ("ANTHROPIC_API_KEY".to_string(), std::env::var("ANTHROPIC_API_KEY").unwrap()),
+        ])),
+        lifecycle: Some(Lifecycle {
+            destroy_if_idle_for: 30 * 60 * 1_000_000_000, // 30 minutes
+            ..Default::default()
+        }),
+        ..Default::default()
+    })?;
+    println!("{}", sandbox.data.id);
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    Sandbox sandbox = client.create(new CreateOptions()
+        .setImage("node:22-bookworm")
+        .setCpu(1.0)
+        .setMemoryMb(2048)
+        .setEnv(Map.of("ANTHROPIC_API_KEY", System.getenv("ANTHROPIC_API_KEY")))
+        .setLifecycle(new Lifecycle().setDestroyIfIdleFor(Duration.ofMinutes(30).toNanos())));
+    System.out.println(sandbox.id);
+    ```
+  </TabItem>
+</Tabs>
+
+Keep the sandbox ID it prints. You need it to come back later.
+
+## Step 2: Install OpenCode and clone the repository
+
+This installs OpenCode at a fixed version and clones the repository into `/workspace/repo`. It fetches only the latest commit, which is faster.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const setup = await sandbox.exec({
+      command: "npm install -g opencode-ai@1.19.5 && git clone --depth=1 https://github.com/sindresorhus/slugify /workspace/repo",
+      timeoutSeconds: 300,
+    });
+    if (setup.exitCode !== 0) throw new Error(setup.stderr);
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    setup = sandbox.exec({
+        "command": "npm install -g opencode-ai@1.19.5 && git clone --depth=1 https://github.com/sindresorhus/slugify /workspace/repo",
+        "timeoutSeconds": 300,
+    })
+    if setup["exitCode"] != 0:
+        raise RuntimeError(setup["stderr"])
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    setup, err := sandbox.Exec(ctx, sdktypes.ExecRequest{
+        Command:        "npm install -g opencode-ai@1.19.5 && git clone --depth=1 https://github.com/sindresorhus/slugify /workspace/repo",
+        TimeoutSeconds: 300,
+    })
+    if err != nil {
+        log.Fatal(err)
+    }
+    if setup.ExitCode != 0 {
+        log.Fatal(setup.Stderr)
+    }
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    let setup = sandbox.exec(aerolvm_sdk::ExecRequest {
+        command: "npm install -g opencode-ai@1.19.5 && git clone --depth=1 https://github.com/sindresorhus/slugify /workspace/repo".to_string(),
+        timeout_seconds: Some(300),
+        ..Default::default()
+    })?;
+    assert_eq!(setup.exit_code, 0, "{}", setup.stderr);
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    ExecResult setup = sandbox.exec(new ExecRequest()
+        .setCommand("npm install -g opencode-ai@1.19.5 && git clone --depth=1 https://github.com/sindresorhus/slugify /workspace/repo")
+        .setTimeoutSeconds(300));
+    if (setup.exitCode != 0) throw new IllegalStateException(setup.stderr);
+    ```
+  </TabItem>
+</Tabs>
+
+## Step 3: Start OpenCode in a session
+
+The task goes in as the environment variable `TASK`, so quotes and other special characters in it are safe. The session starts in the repository's folder and returns at once. OpenCode keeps working in the sandbox.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const session = await sandbox.createSession({
+      name: "opencode",
+      command: 'opencode run --auto -m anthropic/claude-sonnet-4-6 "$TASK" < /dev/null',
+      workDir: "/workspace/repo",
+      env: { TASK: "Add a section to README.md that explains how to run the tests. Change no other file." },
+    });
+    console.log(session.id);
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    session = sandbox.create_session({
+        "name": "opencode",
+        "command": 'opencode run --auto -m anthropic/claude-sonnet-4-6 "$TASK" < /dev/null',
+        "workDir": "/workspace/repo",
+        "env": {"TASK": "Add a section to README.md that explains how to run the tests. Change no other file."},
+    })
+    print(session["id"])
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    session, err := sandbox.CreateSession(ctx, sdktypes.CreateSessionOptions{
+        Name:    "opencode",
+        Command: `opencode run --auto -m anthropic/claude-sonnet-4-6 "$TASK" < /dev/null`,
+        WorkDir: "/workspace/repo",
+        Env:     map[string]string{"TASK": "Add a section to README.md that explains how to run the tests. Change no other file."},
+    })
+    if err != nil {
+        log.Fatal(err)
+    }
+    fmt.Println(session.ID)
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    use aerolvm_sdk::CreateSessionOptions;
+
+    let session = sandbox.create_session(CreateSessionOptions {
+        name: Some("opencode".into()),
+        command: Some(r#"opencode run --auto -m anthropic/claude-sonnet-4-6 "$TASK" < /dev/null"#.into()),
+        work_dir: Some("/workspace/repo".into()),
+        env: Some(HashMap::from([(
+            "TASK".to_string(),
+            "Add a section to README.md that explains how to run the tests. Change no other file.".to_string(),
+        )])),
+        ..Default::default()
+    })?;
+    println!("{}", session.id);
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    Session session = sandbox.createSession(new CreateSessionOptions()
+        .setName("opencode")
+        .setCommand("opencode run --auto -m anthropic/claude-sonnet-4-6 \"$TASK\" < /dev/null")
+        .setWorkDir("/workspace/repo")
+        .setEnv(Map.of("TASK", "Add a section to README.md that explains how to run the tests. Change no other file.")));
+    System.out.println(session.id);
+    ```
+  </TabItem>
+</Tabs>
+
+What the command does:
+
+- `opencode run` runs one task with no chat window and exits when it is done.
+- `< /dev/null` gives it an empty input. A session keeps the program's input open, and `opencode run` waits for that input to end before it starts, so without this it never starts.
+- `--auto` approves every action OpenCode asks to take, such as editing a file or running a command. OpenCode's help calls this dangerous. It is safe enough here because the agent can only touch the sandbox.
+- `-m anthropic/claude-sonnet-4-6` picks the model, as `provider/model`.
+
+## Step 4: Wait for it to finish
+
+This checks the session every 10 seconds until OpenCode exits, then prints what it wrote.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    let s = await sandbox.getSession(session.id);
+    while (s.status === "running") {
+      await new Promise((resolve) => setTimeout(resolve, 10_000));
+      s = await sandbox.getSession(session.id);
+    }
+    console.log(new TextDecoder().decode(await sandbox.sessionLog(session.id)));
+    console.log(s.status, s.exitCode);
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    import time
+
+    s = sandbox.get_session(session["id"])
+    while s["status"] == "running":
+        time.sleep(10)
+        s = sandbox.get_session(session["id"])
+    print(sandbox.session_log(session["id"]).decode())
+    print(s["status"], s["exitCode"])
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    s, err := sandbox.GetSession(ctx, session.ID)
+    for err == nil && s.Status == sdktypes.SessionStatusRunning {
+        time.Sleep(10 * time.Second)
+        s, err = sandbox.GetSession(ctx, session.ID)
+    }
+    if err != nil {
+        log.Fatal(err)
+    }
+    out, err := sandbox.SessionLog(ctx, session.ID)
+    if err != nil {
+        log.Fatal(err)
+    }
+    fmt.Println(string(out))
+    fmt.Println(s.Status, s.ExitCode)
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    use aerolvm_sdk::SessionStatus;
+
+    let mut s = sandbox.get_session(&session.id)?;
+    while s.status == SessionStatus::Running {
+        std::thread::sleep(std::time::Duration::from_secs(10));
+        s = sandbox.get_session(&session.id)?;
+    }
+    println!("{}", String::from_utf8_lossy(&sandbox.session_log(&session.id)?));
+    println!("{:?} {}", s.status, s.exit_code);
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    Session s = sandbox.getSession(session.id);
+    while ("running".equals(s.status)) {
+        Thread.sleep(10_000);
+        s = sandbox.getSession(session.id);
+    }
+    System.out.println(new String(sandbox.sessionLog(session.id), StandardCharsets.UTF_8));
+    System.out.println(s.status + " " + s.exitCode);
+    ```
+  </TabItem>
+</Tabs>
+
+`exited` with exit code `0` means OpenCode finished the task.
+
+**If your program stops before this,** OpenCode keeps working. Run this step later with the IDs you kept: get the sandbox with `client.get(sandboxId)` (Go `client.Get(ctx, sandboxId)`), then check the session as above. To watch the output live instead, attach to the session; see [Terminal sessions](/sessions/).
+
+## Step 5: Download the change and clean up
+
+This collects every change in the repository as a patch, downloads it, and deletes the sandbox.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    import { writeFile } from "node:fs/promises";
+
+    await sandbox.exec("cd /workspace/repo && git add -A && git diff --cached > /tmp/agent.patch");
+    await writeFile("agent.patch", await sandbox.downloadFile("/tmp/agent.patch"));
+    await sandbox.destroy();
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    sandbox.exec("cd /workspace/repo && git add -A && git diff --cached > /tmp/agent.patch")
+    with open("agent.patch", "wb") as f:
+        f.write(sandbox.download_file("/tmp/agent.patch"))
+    sandbox.destroy()
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    if _, err := sandbox.ExecCommand(ctx, "cd /workspace/repo && git add -A && git diff --cached > /tmp/agent.patch"); err != nil {
+        log.Fatal(err)
+    }
+    patch, err := sandbox.DownloadFile(ctx, "/tmp/agent.patch")
+    if err != nil {
+        log.Fatal(err)
+    }
+    if err := os.WriteFile("agent.patch", patch, 0o644); err != nil {
+        log.Fatal(err)
+    }
+    if err := sandbox.Destroy(ctx); err != nil {
+        log.Fatal(err)
+    }
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    sandbox.exec("cd /workspace/repo && git add -A && git diff --cached > /tmp/agent.patch")?;
+    let patch = sandbox.download_file("/tmp/agent.patch")?;
+    std::fs::write("agent.patch", patch).expect("write agent.patch");
+    sandbox.destroy()?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    sandbox.exec("cd /workspace/repo && git add -A && git diff --cached > /tmp/agent.patch");
+    Files.write(Path.of("agent.patch"), sandbox.downloadFile("/tmp/agent.patch"));
+    sandbox.destroy();
+    ```
+  </TabItem>
+</Tabs>
+
+Apply the patch to your own copy of the repository with `git apply agent.patch`.
+
+## Good to know
+
+- **Another model.** Change `-m` to another `provider/model`, and pass that provider's key in step 1 instead, such as `OPENAI_API_KEY` for `openai/...` models. `opencode models` inside the sandbox lists the models for the keys it can see.
+- **The agent can read every environment variable you pass,** including its API key. Use a key with a spending limit.
+- **The sandbox can reach the internet,** which the agent needs for its model and for packages. To allow only the hosts it needs, see [Allow only some websites](/network-access/#allow-only-some-websites).
+- **The session log keeps the last 1 MB** of output. For everything, download the session's recording with `sessionRecording`; see [Terminal sessions](/sessions/#recordings).
+- **Lifecycle times are in nanoseconds,** except in Go, which takes a `time.Duration`.
+
+## Next steps
+
+- [Terminal sessions](/sessions/): attach to a session and watch it live.
+- [Run commands](/exec-streaming/): more on `exec`.
+- [Coding agents](/use-cases/coding-agents/): the other agent recipes.
+- [Host an MCP server](/use-cases/coding-agents/host-mcp-server/): give an agent tools that run in a sandbox.

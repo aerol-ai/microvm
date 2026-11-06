@@ -357,3 +357,66 @@ func TestParityCodeServerImage(t *testing.T) {
 		return true, got
 	})
 }
+
+// agentRecipe is one coding-agent docs page (plan G9): its image, install
+// command and session command, copied from the page, and what the agent's
+// log shows when the provider refuses the dummy key the check sends.
+// OpenCode and Codex read their input to the end before they start, and a
+// session keeps input open, so their pages end the command with
+// `< /dev/null` (without it both waited forever, live 2026-11-06).
+type agentRecipe struct {
+	name, image, keyEnv, install, command, refusal string
+}
+
+var agentRecipes = []agentRecipe{
+	{"opencode", "node:22-bookworm", "ANTHROPIC_API_KEY", "npm install -g opencode-ai@1.19.5",
+		`opencode run --auto -m anthropic/claude-sonnet-4-6 "$TASK" < /dev/null`, "invalid x-api-key"},
+	{"aider", "python:3.12-bookworm", "ANTHROPIC_API_KEY", "pip install --no-cache-dir aider-chat==0.86.2",
+		`aider --model anthropic/claude-sonnet-4-6 --message "$TASK" --yes-always --no-auto-commits --no-check-update --no-show-model-warnings --no-gitignore --no-pretty --no-analytics`, "authentication_error"},
+	{"gemini", "node:22-bookworm", "GEMINI_API_KEY", "npm install -g @google/gemini-cli@0.67.0",
+		`gemini -p "$TASK" --yolo --skip-trust`, "API key not valid"},
+	{"codex", "node:22-bookworm", "CODEX_API_KEY", "npm install -g @openai/codex@0.167.0",
+		`codex exec --dangerously-bypass-approvals-and-sandbox "$TASK" < /dev/null`, "Incorrect API key"},
+}
+
+// UC-467 — the coding-agent recipes (plan G9): each agent installs at its
+// pinned version in the page's image next to a cloned repository, and,
+// started as a session with the page's exact command and a dummy key, runs
+// headless all the way to its model API: the log ends with the provider
+// refusing the key, not with a usage, trust or missing-key error. A real
+// key would make it do the task; the suite has none to spend.
+func TestParityCodingAgentRecipes(t *testing.T) {
+	harness.Require(t, sc, "UC-467")
+	c := client(t)
+	for _, r := range agentRecipes {
+		t.Run(r.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 12*time.Minute)
+			defer cancel()
+			sb := c.NewSandbox(t, sdktypes.CreateSandboxOptions{
+				Name:     harness.UniqueName(sc, t),
+				Image:    r.image,
+				CPU:      1,
+				MemoryMB: 2048,
+				Env:      map[string]string{r.keyEnv: "uc467-not-a-real-key"},
+			})
+			waitRunning(t, sb)
+			recipesExec(t, ctx, sb, r.install+" && git clone --depth=1 https://github.com/sindresorhus/slugify /workspace/repo", 600)
+			session, err := sb.CreateSession(ctx, sdktypes.CreateSessionOptions{
+				Name:    r.name,
+				Command: r.command,
+				WorkDir: "/workspace/repo",
+				Env:     map[string]string{"TASK": "Say hello. Change no file."},
+			})
+			if err != nil {
+				t.Fatalf("start the %s session: %v", r.name, err)
+			}
+			recipesPoll(t, r.name+" reaches its model API", 5*time.Minute, func() (bool, string) {
+				log, err := sb.SessionLog(ctx, session.ID)
+				if err != nil {
+					t.Fatalf("session log: %v", err)
+				}
+				return strings.Contains(string(log), r.refusal), string(log)
+			})
+		})
+	}
+}
