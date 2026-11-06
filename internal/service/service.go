@@ -7523,54 +7523,7 @@ func (s *Service) gcZombieCaddyEntries(ctx context.Context, sandboxes []*models.
 		if !sandboxAllowsPublicTraffic(sb) {
 			continue
 		}
-		// The toolbox route lives at @id "sandbox-<id>"; per-port HTTP routes
-		// at "sandbox-<id>-port-<p>". Keep both unconditionally — the rest
-		// of Reconcile guarantees they're upserted for running sandboxes,
-		// but stopped sandboxes intentionally lack routes and should still
-		// not be GC'd here (they'll be rebuilt on Start).
-		expectedHTTP["sandbox-"+sb.ID] = struct{}{}
-		// Serverless sandboxes can have EITHER a direct port route (when
-		// started) or a wake-aware port route (when stopped+armed, and
-		// also when started under the wake-aware install path). The two
-		// shapes can briefly coexist during install-then-delete transitions
-		// in installHTTPPortRoute. Keep both @ids in the live set for any
-		// HTTP exposure on a serverless sandbox so the GC doesn't race
-		// the install cycle.
-		isServerless := s.cfg.EnableServerless && sb.Lifecycle.Serverless
-		for _, p := range sb.ExposedPorts {
-			switch p.Protocol {
-			case "", models.ExposedPortProtocolHTTP:
-				// A token-gated port (A2) has only the wake-aware route,
-				// serverless or not: only the ingress proxy checks the token.
-				// So the sweep keeps its wake route (without this it deleted
-				// it as a zombie every pass, and the gated URL answered
-				// Caddy's "Sandbox not found", UC-465 on single-node-fc) and
-				// does NOT keep a direct route for it: a direct route there
-				// skips the token, so one left behind by any writer goes.
-				if !p.TokenGated() {
-					expectedHTTP[fmt.Sprintf("sandbox-%s-port-%d", sb.ID, p.Port)] = struct{}{}
-				}
-				if isServerless || p.TokenGated() {
-					expectedHTTP[caddy.WakePortRouteID(sb.ID, p.Port)] = struct{}{}
-				}
-			case models.ExposedPortProtocolTCP:
-				if p.HostPort > 0 {
-					expectedTCPServers[fmt.Sprintf("tcp-port-%d", p.HostPort)] = struct{}{}
-				}
-			case models.ExposedPortProtocolTLS:
-				expectedTLSRoutes[fmt.Sprintf("sandbox-%s-port-%d-tls", sb.ID, p.Port)] = struct{}{}
-			}
-		}
-		// Custom-domain per-hostname HTTP routes share the same Caddy server
-		// as the default sandbox route, so they have to be enumerated as
-		// expected or the GC sweep will drop them on the next pass. The route
-		// ID matches what pkg/caddy installs in upsertCustomDomainHTTPRoute.
-		for _, cd := range sb.CustomDomains {
-			if cd.Hostname == "" {
-				continue
-			}
-			expectedHTTP[caddy.IngressCustomDomainHTTPRouteID(sb.ID, cd.Hostname)] = struct{}{}
-		}
+		s.expectLocalSandboxRoutes(expectedHTTP, expectedTCPServers, expectedTLSRoutes, sb)
 	}
 	s.addClusterIngressExpectedRoutes(expectedHTTP, expectedTCPServers, expectedTLSRoutes)
 
@@ -7612,6 +7565,67 @@ func (s *Service) gcZombieCaddyEntries(ctx context.Context, sandboxes []*models.
 		s.logger.Info("audit zombie tls route removed", "route_id", id)
 	}
 	return nil
+}
+
+// expectLocalSandboxRoutes adds the routes one local sandbox row explains to
+// a route sweep's keep sets. Both sweeps that delete the routes nothing
+// explains use it: gcZombieCaddyEntries and the cluster ingress audit
+// (gcUnexpectedClusterIngressRoutesIn, through
+// addLocalIngressExpectedRoutes). Each used to keep its own list, and a fix
+// to one missed the other: the ingress audit kept only the direct port
+// route, so it deleted a token-gated port's wake route, the port's only
+// route, and the gated URL answered Caddy's "Sandbox not found" (UC-426 on
+// single-node-fc). It also dropped custom-domain routes and the wake routes
+// of serverless sandboxes. The caller filters the rows.
+func (s *Service) expectLocalSandboxRoutes(expectedHTTP, expectedTCPServers, expectedTLSRoutes map[string]struct{}, sb *models.Sandbox) {
+	// The toolbox route lives at @id "sandbox-<id>"; per-port HTTP routes
+	// at "sandbox-<id>-port-<p>". Keep both unconditionally — the rest
+	// of Reconcile guarantees they're upserted for running sandboxes,
+	// but stopped sandboxes intentionally lack routes and should still
+	// not be GC'd here (they'll be rebuilt on Start).
+	expectedHTTP["sandbox-"+sb.ID] = struct{}{}
+	// Serverless sandboxes can have EITHER a direct port route (when
+	// started) or a wake-aware port route (when stopped+armed, and
+	// also when started under the wake-aware install path). The two
+	// shapes can briefly coexist during install-then-delete transitions
+	// in installHTTPPortRoute. Keep both @ids in the live set for any
+	// HTTP exposure on a serverless sandbox so the GC doesn't race
+	// the install cycle.
+	isServerless := s.cfg.EnableServerless && sb.Lifecycle.Serverless
+	for _, p := range sb.ExposedPorts {
+		switch p.Protocol {
+		case "", models.ExposedPortProtocolHTTP:
+			// A token-gated port (A2) has only the wake-aware route,
+			// serverless or not: only the ingress proxy checks the token.
+			// So the sweep keeps its wake route (without this it deleted
+			// it as a zombie every pass, and the gated URL answered
+			// Caddy's "Sandbox not found", UC-465 on single-node-fc) and
+			// does NOT keep a direct route for it: a direct route there
+			// skips the token, so one left behind by any writer goes.
+			if !p.TokenGated() {
+				expectedHTTP[fmt.Sprintf("sandbox-%s-port-%d", sb.ID, p.Port)] = struct{}{}
+			}
+			if isServerless || p.TokenGated() {
+				expectedHTTP[caddy.WakePortRouteID(sb.ID, p.Port)] = struct{}{}
+			}
+		case models.ExposedPortProtocolTCP:
+			if p.HostPort > 0 {
+				expectedTCPServers[fmt.Sprintf("tcp-port-%d", p.HostPort)] = struct{}{}
+			}
+		case models.ExposedPortProtocolTLS:
+			expectedTLSRoutes[fmt.Sprintf("sandbox-%s-port-%d-tls", sb.ID, p.Port)] = struct{}{}
+		}
+	}
+	// Custom-domain per-hostname HTTP routes share the same Caddy server
+	// as the default sandbox route, so they have to be enumerated as
+	// expected or the GC sweep will drop them on the next pass. The route
+	// ID matches what pkg/caddy installs in upsertCustomDomainHTTPRoute.
+	for _, cd := range sb.CustomDomains {
+		if cd.Hostname == "" {
+			continue
+		}
+		expectedHTTP[caddy.IngressCustomDomainHTTPRouteID(sb.ID, cd.Hostname)] = struct{}{}
+	}
 }
 
 func (s *Service) addClusterIngressExpectedRoutes(expectedHTTP, expectedTCPServers, expectedTLSRoutes map[string]struct{}) {
