@@ -82,10 +82,7 @@ func (s *Service) serveToolboxReverseProxy(ctx, callCtx context.Context, sandbox
 		if !ok {
 			return fmt.Errorf("wasm runtime does not implement toolbox host")
 		}
-		req := r.Clone(callCtx)
-		req.URL.Path = path
-		observability.InjectTraceContext(callCtx, req.Header)
-		host.ServeToolbox(callCtx, sandboxID, sandbox.ToolboxToken, w, req)
+		host.ServeToolbox(callCtx, sandboxID, sandbox.ToolboxToken, w, hostToolboxRequest(callCtx, r, path, sandbox.ToolboxToken))
 		return nil
 	}
 	if s.isIsolateSandbox(sandbox) {
@@ -96,10 +93,7 @@ func (s *Service) serveToolboxReverseProxy(ctx, callCtx context.Context, sandbox
 		if !ok {
 			return fmt.Errorf("isolate runtime does not implement toolbox host")
 		}
-		req := r.Clone(callCtx)
-		req.URL.Path = path
-		observability.InjectTraceContext(callCtx, req.Header)
-		host.ServeToolbox(callCtx, sandboxID, sandbox.ToolboxToken, w, req)
+		host.ServeToolbox(callCtx, sandboxID, sandbox.ToolboxToken, w, hostToolboxRequest(callCtx, r, path, sandbox.ToolboxToken))
 		return nil
 	}
 
@@ -164,6 +158,24 @@ func (s *Service) serveToolboxReverseProxy(ctx, callCtx context.Context, sandbox
 // a bearer token past the browser's inability to set Authorization on a
 // handshake: `Sec-WebSocket-Protocol: sandbox.bearer, <token>`.
 const bearerSubprotocol = "sandbox.bearer"
+
+// hostToolboxRequest is the caller's request as an in-process toolbox host
+// (WASM, isolate) must see it: the sandbox's own toolbox token in place of
+// the caller's credential, as the container path's Director sets it. The
+// host checks that token on every route, so passing the caller's PAT on
+// made every authenticated /v1 toolbox call answer 401. sandboxd has
+// already authenticated and authorized the caller by the time it gets here.
+func hostToolboxRequest(ctx context.Context, r *http.Request, path, toolboxToken string) *http.Request {
+	req := r.Clone(ctx)
+	req.URL.Path = path
+	req.Header.Del("Authorization")
+	if toolboxToken != "" {
+		req.Header.Set("Authorization", "Bearer "+toolboxToken)
+	}
+	stripSmuggledBearerSubprotocol(req.Header)
+	observability.InjectTraceContext(ctx, req.Header)
+	return req
+}
 
 // stripSmuggledBearerSubprotocol rewrites Sec-WebSocket-Protocol so the caller's
 // smuggled bearer token is removed before the request reaches the sandbox,

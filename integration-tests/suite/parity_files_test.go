@@ -200,6 +200,16 @@ func TestParityWasmFileVerbs501(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 
+	// What WASM does serve works through the /v1 toolbox pass-through. A
+	// caller's PAT used to reach the WASM host instead of the sandbox's
+	// toolbox token, so every call here answered 401.
+	if err := sb.UploadFile(ctx, "/uc379.txt", []byte("wasm-ok")); err != nil {
+		t.Fatalf("upload on WASM: %v", err)
+	}
+	if got, err := sb.DownloadFile(ctx, "/uc379.txt"); err != nil || string(got) != "wasm-ok" {
+		t.Fatalf("download on WASM = %q, %v; want wasm-ok", got, err)
+	}
+
 	for _, probe := range []struct {
 		method, path string
 		query        url.Values
