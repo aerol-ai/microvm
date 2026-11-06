@@ -161,6 +161,67 @@ func TestParitySandboxTokenAcrossNodes(t *testing.T) {
 	}
 }
 
+// UC-468 — revoking a sandbox's tokens: a token that works is refused right
+// after the revoke, and one issued right after it works. In a cluster the
+// revoke is written in the owner's row, so both must hold whichever node
+// the request lands on (each forwards the toolbox call to the owner).
+func TestParitySandboxTokenRevoke(t *testing.T) {
+	harness.Require(t, sc, "UC-468")
+	sb := paritySandbox(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+	if err := sb.UploadFile(ctx, "/tmp/uc468.txt", []byte("uc468")); err != nil {
+		t.Fatalf("upload: %v", err)
+	}
+	file := downloadPath(sb.ID, "/tmp/uc468.txt")
+	scope := sdktypes.CreateSandboxTokenOptions{ExpiresIn: "10m", PathPrefix: "/files", Methods: []string{"GET"}}
+	old := issueSandboxToken(t, ctx, sb, scope)
+	if st, body := tokenDo(t, ctx, http.MethodGet, "", file, old.Token, nil); st != http.StatusOK || string(body) != "uc468" {
+		t.Fatalf("before the revoke = %d %q", st, body)
+	}
+
+	revoked, err := sb.RevokeTokens(ctx)
+	if err != nil || revoked.SandboxID != sb.ID || revoked.TokensNotBefore.IsZero() {
+		t.Fatalf("RevokeTokens = %+v, %v", revoked, err)
+	}
+	fresh := issueSandboxToken(t, ctx, sb, scope)
+
+	// Every node when the scenario lists them, else the scenario's ingress.
+	bases := []string{""}
+	if targets := harness.LoadIntegrationTargets(); sc.Has(harness.CapCluster) && targets != nil && len(targets.Nodes) > 1 {
+		bases = bases[:0]
+		for _, node := range targets.Nodes {
+			bases = append(bases, nodeBase(t, node))
+		}
+	}
+	for _, base := range bases {
+		st, body := tokenDo(t, ctx, http.MethodGet, base, file, old.Token, nil)
+		if st != http.StatusUnauthorized || !strings.Contains(string(body), "revoked") || strings.Contains(string(body), old.Token) {
+			t.Fatalf("the revoked token through %q = %d %s, want 401 naming revoked", base, st, body)
+		}
+		if st, body := tokenDo(t, ctx, http.MethodGet, base, file, fresh.Token, nil); st != http.StatusOK || string(body) != "uc468" {
+			t.Fatalf("a token issued after the revoke, through %q = %d %q", base, st, body)
+		}
+	}
+
+	// A second revoke, a whole second later, also refuses the newer token
+	// (one issued in the same second as a revoke is lifted to it, so the
+	// wait makes this deterministic).
+	time.Sleep(1100 * time.Millisecond)
+	again, err := sb.RevokeTokens(ctx)
+	if err != nil || !again.TokensNotBefore.After(revoked.TokensNotBefore) {
+		t.Fatalf("second RevokeTokens = %+v, %v; want a later not-before than %s", again, err, revoked.TokensNotBefore)
+	}
+	for name, tok := range map[string]string{"old": old.Token, "newer": fresh.Token} {
+		if st, body := tokenDo(t, ctx, http.MethodGet, "", file, tok, nil); st != http.StatusUnauthorized || !strings.Contains(string(body), "revoked") {
+			t.Fatalf("the %s token after the second revoke = %d %s", name, st, body)
+		}
+	}
+	if _, err := sb.ExecCommand(ctx, "true"); err != nil {
+		t.Fatalf("the revokes harmed the sandbox: %v", err)
+	}
+}
+
 // publicGet sends one GET to a public URL without following redirects.
 func publicGet(t *testing.T, target, cookie string) (int, http.Header, string) {
 	t.Helper()
