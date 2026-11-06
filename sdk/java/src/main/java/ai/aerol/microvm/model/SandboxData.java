@@ -74,6 +74,8 @@ public class SandboxData {
     public String tenantId;
     /** GPU configuration this sandbox was created with. Null means no GPU. */
     public GpuOptions gpus;
+    /** The sandbox's cloud identity, when it was created with one. */
+    public SandboxIdentity identity;
 
     public SandboxData copy() {
         SandboxData copy = new SandboxData();
@@ -123,5 +125,6 @@ public class SandboxData {
         moduleDigest = other.moduleDigest;
         tenantId = other.tenantId;
         gpus = other.gpus == null ? null : other.gpus.copy();
+        identity = other.identity == null ? null : other.identity.copy();
     }
 }

@@ -72,6 +72,12 @@ import type {
   EgressProfileList,
   EgressProfileOptions,
   EgressProfileRef,
+  IdentityOptions,
+  IdentityRole,
+  IdentityRoleList,
+  IdentityRoleOptions,
+  ListIdentityRolesOptions,
+  SandboxIdentity,
   EgressRule,
   ListEgressProfilesOptions,
   WarmPool,
@@ -410,6 +416,54 @@ interface ApiSandbox {
   module_ref?: string;
   module_digest?: string;
   tenant_id?: string;
+  identity?: ApiSandboxIdentity;
+}
+
+interface ApiSandboxIdentity {
+  role_tag: string;
+  audience: string;
+  subject: string;
+  aws_role_arn?: string;
+  azure_client_id?: string;
+  azure_tenant_id?: string;
+  token_file: string;
+  token_expires_at?: string;
+  last_error?: string;
+}
+
+interface ApiIdentityRole {
+  tag: string;
+  min_role: string;
+  team?: string;
+  created_at: string;
+  updated_at: string;
+}
+
+function fromApiIdentityRole(r: ApiIdentityRole): IdentityRole {
+  const out: IdentityRole = { tag: r.tag, minRole: r.min_role, createdAt: r.created_at, updatedAt: r.updated_at };
+  if (r.team) out.team = r.team;
+  return out;
+}
+
+function fromApiSandboxIdentity(i: ApiSandboxIdentity | undefined): SandboxIdentity | undefined {
+  if (!i) return undefined;
+  const out: SandboxIdentity = { roleTag: i.role_tag, audience: i.audience, subject: i.subject, tokenFile: i.token_file };
+  if (i.aws_role_arn) out.awsRoleArn = i.aws_role_arn;
+  if (i.azure_client_id) out.azureClientId = i.azure_client_id;
+  if (i.azure_tenant_id) out.azureTenantId = i.azure_tenant_id;
+  if (i.token_expires_at) out.tokenExpiresAt = i.token_expires_at;
+  if (i.last_error) out.lastError = i.last_error;
+  return out;
+}
+
+function toApiIdentity(i: IdentityOptions): Record<string, unknown> {
+  return {
+    role_tag: i.roleTag,
+    audience: i.audience,
+    aws_role_arn: i.awsRoleArn,
+    azure_client_id: i.azureClientId,
+    azure_tenant_id: i.azureTenantId,
+  };
 }
 
 interface ApiCreateSandboxResponse extends ApiSandbox {
@@ -1842,6 +1896,37 @@ export class APIClient {
     await this.doJSON<void>("DELETE", this.versioned(warmPoolPath(image)));
   }
 
+  async putIdentityRole(tag: string, options: IdentityRoleOptions): Promise<IdentityRole> {
+    const response = await this.doJSON<ApiIdentityRole>("PUT", this.identityRolePath(tag, options.team), {
+      min_role: options.minRole,
+    });
+    return fromApiIdentityRole(response);
+  }
+
+  async listIdentityRoles(options: ListIdentityRolesOptions = {}): Promise<IdentityRoleList> {
+    const params = new URLSearchParams();
+    if (options.team) params.set("team", options.team);
+    if (options.cursor) params.set("cursor", options.cursor);
+    if (options.limit) params.set("limit", String(options.limit));
+    const query = params.toString();
+    const response = await this.doJSON<{ roles: ApiIdentityRole[] | null; next_cursor?: string }>(
+      "GET",
+      this.versioned(`/identity/roles${query ? `?${query}` : ""}`),
+    );
+    const list: IdentityRoleList = { roles: (response.roles ?? []).map(fromApiIdentityRole) };
+    if (response.next_cursor) list.nextCursor = response.next_cursor;
+    return list;
+  }
+
+  async deleteIdentityRole(tag: string, options: { team?: string } = {}): Promise<void> {
+    await this.doJSON<void>("DELETE", this.identityRolePath(tag, options.team));
+  }
+
+  private identityRolePath(tag: string, team?: string): string {
+    const path = `/identity/roles/${encodeURIComponent(tag)}`;
+    return this.versioned(team ? `${path}?team=${encodeURIComponent(team)}` : path);
+  }
+
   async createTemplate(options: CreateTemplateOptions): Promise<Template> {
     const response = await this.doJSON<ApiTemplate>("POST", this.versioned("/templates"), {
       id: options.id,
@@ -2078,6 +2163,7 @@ export class SandboxResource implements Sandbox {
   declare lifecycle: Lifecycle;
   declare failover?: Failover;
   declare runtime: Sandbox["runtime"];
+  declare identity?: SandboxIdentity;
 
   protected readonly client: APIClient;
 
@@ -2384,6 +2470,7 @@ function toApiCreateOptions(options: CreateOptions): Record<string, unknown> {
     custom_domains: options.customDomains,
     gpus: options.gpus ? toApiGPUOptions(options.gpus) : undefined,
     template_id: options.templateId,
+    identity: options.identity ? toApiIdentity(options.identity) : undefined,
   };
 }
 
@@ -2501,6 +2588,7 @@ function fromApiSandbox(sandbox: ApiSandbox): Sandbox {
     moduleRef: sandbox.module_ref,
     moduleDigest: sandbox.module_digest,
     tenantId: sandbox.tenant_id,
+    identity: fromApiSandboxIdentity(sandbox.identity),
   };
 }
 
@@ -2828,6 +2916,7 @@ function cloneSandbox(sandbox: Sandbox): Sandbox {
     containerCommand: sandbox.containerCommand ? [...sandbox.containerCommand] : undefined,
     lifecycle: { ...sandbox.lifecycle },
     failover: sandbox.failover ? { ...sandbox.failover } : undefined,
+    identity: sandbox.identity ? { ...sandbox.identity } : undefined,
   };
 }
 

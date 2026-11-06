@@ -37,6 +37,8 @@ pub use types::{CreateSandboxTokenOptions, ExposeVisibility, SandboxToken};
 pub use types::{
     AddCustomDomainOptions, AuditCoverage, AuditEvent, AuditOptions, AuditPage, BuildImageOptions,
     EgressInject, EgressProfile, EgressProfileList, EgressProfileOptions, EgressProfileRef, EgressRule,
+    IdentityOptions, IdentityRole, IdentityRoleList, IdentityRoleOptions, ListIdentityRolesOptions,
+    SandboxIdentity,
     ListEgressProfilesOptions, ListSnapshotsOptions, SnapshotList, NetworkLearned, NetworkLearnedEntry,
     NetworkPolicy, NetworkPolicyCheckOptions, NetworkPolicyCheckResult, NetworkPolicyOptions,
     BuildImagePushOptions, BuildImageResult,
@@ -1886,6 +1888,49 @@ impl Client {
         self.do_json::<(), ()>(Method::DELETE, &self.warm_pool_path(image), None)
     }
 
+    fn identity_role_path(&self, tag: &str, team: Option<&str>) -> String {
+        let path = format!("{}/identity/roles/{}", self.version_prefix(), urlencoding::encode(tag));
+        match team {
+            Some(team) if !team.is_empty() => append_query_param(&path, "team", team),
+            _ => path,
+        }
+    }
+
+    /// Puts a role tag on a team's cloud identity allow list, or changes its
+    /// minimum caller role (`"runner"` or `"admin"`). Admin only. The same
+    /// call twice changes nothing, so it is safe to retry.
+    pub fn put_identity_role(&self, tag: &str, opts: IdentityRoleOptions) -> Result<IdentityRole, Error> {
+        let body = serde_json::json!({ "min_role": opts.min_role });
+        self.do_json::<serde_json::Value, IdentityRole>(
+            Method::PUT,
+            &self.identity_role_path(tag, opts.team.as_deref()),
+            Some(&body),
+        )
+    }
+
+    /// Lists a team's cloud identity allow list, one page at a time. Admin only.
+    pub fn list_identity_roles(&self, opts: ListIdentityRolesOptions) -> Result<IdentityRoleList, Error> {
+        let mut path = format!("{}/identity/roles", self.version_prefix());
+        if let Some(team) = &opts.team {
+            path = append_query_param(&path, "team", team);
+        }
+        if let Some(cursor) = &opts.cursor {
+            path = append_query_param(&path, "cursor", cursor);
+        }
+        if let Some(limit) = opts.limit {
+            path = append_query_param(&path, "limit", &limit.to_string());
+        }
+        self.do_json::<(), IdentityRoleList>(Method::GET, &path, None)
+    }
+
+    /// Takes a role tag off a team's allow list (`None` is the operator
+    /// namespace). Admin only. Sandboxes that use it keep their current
+    /// token (at most one hour) and get no new one. Deleting a tag that is
+    /// already gone succeeds.
+    pub fn delete_identity_role(&self, tag: &str, team: Option<&str>) -> Result<(), Error> {
+        self.do_json::<(), ()>(Method::DELETE, &self.identity_role_path(tag, team), None)
+    }
+
     /// Who the server says the caller is: principal, role, team and when
     /// the credential expires. Every valid credential may ask.
     pub fn whoami(&self) -> Result<WhoAmI, Error> {
@@ -3442,6 +3487,7 @@ mod tests {
             name: None,
             tags: None,
             idempotency_key: None,
+            identity: None,
         }
     }
 
@@ -5345,6 +5391,90 @@ mod tests {
         assert_eq!(pool.on_image_change, "replace_as_used");
         let status = pool.status.expect("status");
         assert_eq!((status.outdated, status.servers[0].outdated), (1, 1));
+    }
+
+    #[test]
+    fn identity_role_calls_map_wire_shape() {
+        let role = serde_json::json!({
+            "tag": "deploy", "min_role": "runner", "team": "payments", "created_at": "c", "updated_at": "u"
+        })
+        .to_string();
+        let (url, request_rx) = spawn_json_server(role);
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        let got = client
+            .put_identity_role(
+                "deploy",
+                IdentityRoleOptions { min_role: "runner".to_string(), team: Some("payments".to_string()) },
+            )
+            .expect("put should succeed");
+        let request = request_rx.recv().expect("request should be captured");
+        assert!(
+            request.starts_with("PUT /v1/identity/roles/deploy?team=payments HTTP/1.1\r\n"),
+            "unexpected request: {}",
+            request
+        );
+        assert_eq!(request_json_body(&request), serde_json::json!({"min_role": "runner"}));
+        assert_eq!(got.min_role, "runner");
+        assert_eq!(got.team.as_deref(), Some("payments"));
+
+        let (url, request_rx) = spawn_json_server(serde_json::json!({"roles": null, "next_cursor": "z"}).to_string());
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        let page = client
+            .list_identity_roles(ListIdentityRolesOptions {
+                team: Some("payments".to_string()),
+                cursor: Some("a".to_string()),
+                limit: Some(5),
+            })
+            .expect("list should succeed");
+        let request = request_rx.recv().expect("request should be captured");
+        assert!(
+            request.starts_with("GET /v1/identity/roles?team=payments&cursor=a&limit=5 HTTP/1.1\r\n"),
+            "unexpected request: {}",
+            request
+        );
+        assert!(page.roles.is_empty());
+        assert_eq!(page.next_cursor.as_deref(), Some("z"));
+
+        let (url, request_rx) = spawn_response_server("204 No Content", "application/json", Vec::new());
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        client.delete_identity_role("ops", None).expect("delete should succeed");
+        let request = request_rx.recv().expect("request should be captured");
+        assert!(request.starts_with("DELETE /v1/identity/roles/ops HTTP/1.1\r\n"), "unexpected request: {}", request);
+    }
+
+    #[test]
+    fn create_sends_identity_and_reads_it_back() {
+        let body = serde_json::json!({
+            "id": "sb-1", "image": "alpine", "status": "started", "public_url": "", "cpu": 1, "memory_mb": 256,
+            "disk_gb": 5, "os_user": "root", "network_block_all": false, "toolbox_enabled": true,
+            "created_at": "c", "updated_at": "u", "last_active_at": "l",
+            "identity": {
+                "role_tag": "deploy", "audience": "sts.amazonaws.com", "subject": "team:payments:role:deploy",
+                "aws_role_arn": "arn:aws:iam::123456789012:role/deploy", "token_file": "/run/aerolvm/identity/token"
+            }
+        })
+        .to_string();
+        let (url, request_rx) = spawn_json_server(body);
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        let sandbox = client
+            .create(CreateOptions {
+                identity: Some(IdentityOptions {
+                    role_tag: "deploy".to_string(),
+                    aws_role_arn: "arn:aws:iam::123456789012:role/deploy".to_string(),
+                    ..Default::default()
+                }),
+                ..minimal_create_options()
+            })
+            .expect("create should succeed");
+        let sent = request_json_body(&request_rx.recv().expect("request should be captured"));
+        assert_eq!(
+            sent["identity"],
+            serde_json::json!({"role_tag": "deploy", "aws_role_arn": "arn:aws:iam::123456789012:role/deploy"})
+        );
+        let identity = sandbox.data.identity.clone().expect("identity should be read back");
+        assert_eq!(identity.subject, "team:payments:role:deploy");
+        assert_eq!(identity.token_file, "/run/aerolvm/identity/token");
+        assert!(identity.token_expires_at.is_none());
     }
 
     #[test]

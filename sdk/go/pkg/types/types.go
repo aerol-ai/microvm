@@ -268,6 +268,36 @@ type ListEgressProfilesOptions struct {
 	Limit  int
 }
 
+// IdentityOptions is CreateSandboxOptions.Identity: a short-lived cloud
+// identity token for the sandbox. RoleTag must be on the team's allow list
+// (PutIdentityRole); Audience defaults to "sts.amazonaws.com".
+type IdentityOptions = models.IdentityRequest
+
+// SandboxIdentity is Sandbox.Identity: what the sandbox's tokens say and
+// where the token is. It never carries the token.
+type SandboxIdentity = models.SandboxIdentity
+
+// IdentityRole is one role tag on a team's identity allow list.
+type IdentityRole = models.IdentityRole
+
+// IdentityRoleList is one page of ListIdentityRoles.
+type IdentityRoleList = models.IdentityRoleList
+
+// IdentityRoleOptions is PutIdentityRole's body and the team it changes.
+// MinRole is "runner" or "admin"; an empty Team is the operator namespace
+// (sandboxes the operator token creates).
+type IdentityRoleOptions struct {
+	MinRole string
+	Team    string
+}
+
+// ListIdentityRolesOptions pages ListIdentityRoles.
+type ListIdentityRolesOptions struct {
+	Team   string
+	Cursor string
+	Limit  int
+}
+
 // WhoAmI is Client.WhoAmI: the caller's own principal, role, team ("*" for
 // every team, absent for a managed account) and credential expiry (nil for
 // one that does not expire, such as the operator token).

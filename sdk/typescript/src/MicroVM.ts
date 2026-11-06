@@ -22,9 +22,13 @@ import type {
   EgressProfile,
   EgressProfileList,
   EgressProfileOptions,
+  IdentityRole,
+  IdentityRoleList,
+  IdentityRoleOptions,
   ListEgressProfilesOptions,
   WarmPool,
   WarmPoolOptions,
+  ListIdentityRolesOptions,
   NetworkPolicyCheckOptions,
   NetworkPolicyCheckResult,
   IngressTarget,
@@ -306,6 +310,29 @@ export class MicroVM {
   /** Deletes an image's warm-pool entry; its warm sandboxes are removed. Deleting a missing entry succeeds. */
   async deleteWarmPool(image: string): Promise<void> {
     return this.client.deleteWarmPool(image);
+  }
+
+  /**
+   * Puts a role tag on a team's cloud identity allow list, or changes its
+   * minimum caller role (`"runner"` or `"admin"`). Admin only. The same call
+   * twice changes nothing, so it is safe to retry.
+   */
+  async putIdentityRole(tag: string, options: IdentityRoleOptions): Promise<IdentityRole> {
+    return this.client.putIdentityRole(tag, options);
+  }
+
+  /** Lists a team's cloud identity allow list, one page at a time. Admin only. */
+  async listIdentityRoles(options?: ListIdentityRolesOptions): Promise<IdentityRoleList> {
+    return this.client.listIdentityRoles(options);
+  }
+
+  /**
+   * Takes a role tag off a team's allow list. Admin only. Sandboxes that use
+   * it keep their current token (at most one hour) and get no new one.
+   * Deleting a tag that is already gone succeeds.
+   */
+  async deleteIdentityRole(tag: string, options?: { team?: string }): Promise<void> {
+    return this.client.deleteIdentityRole(tag, options);
   }
 
   async mounts(sandboxID: string): Promise<MountSpecRedacted[]> {

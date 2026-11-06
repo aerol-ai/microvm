@@ -120,6 +120,11 @@ public class CreateOptions {
      */
     @JsonProperty("template_id")
     public String templateId;
+    /**
+     * A short-lived cloud identity token for the sandbox (AWS, GCP, Azure).
+     * The role tag must be on your team's allow list.
+     */
+    public IdentityOptions identity;
 
     public CreateOptions setImage(String image) {
         this.image = image;
@@ -268,6 +273,11 @@ public class CreateOptions {
 
     public CreateOptions setTemplateId(String templateId) {
         this.templateId = templateId;
+        return this;
+    }
+
+    public CreateOptions setIdentity(IdentityOptions identity) {
+        this.identity = identity;
         return this;
     }
 }

@@ -64,6 +64,12 @@ from .types import (
     EgressProfile,
     EgressProfileList,
     EgressProfileOptions,
+    IdentityOptions,
+    IdentityRole,
+    IdentityRoleList,
+    IdentityRoleOptions,
+    ListIdentityRolesOptions,
+    SandboxIdentity,
     EgressRule,
     ListEgressProfilesOptions,
     WarmPool,
@@ -1441,6 +1447,43 @@ class MicroVM:
         segments = "/".join(urllib.parse.quote(part, safe="") for part in image.split("/"))
         return f"{self._version_prefix}/warm-pools/{segments}"
 
+    def put_identity_role(self, tag: str, options: IdentityRoleOptions) -> IdentityRole:
+        """Put a role tag on a team's cloud identity allow list, or change its
+        minimum caller role ("runner" or "admin"). Admin only. The same call
+        twice changes nothing, so it is safe to retry."""
+        body = {"min_role": str(_first_of(options, "minRole", "min_role") or "")}
+        payload = self._do_json("PUT", self._identity_role_path(tag, _first_of(options, "team")), body) or {}
+        return _from_api_identity_role(payload)
+
+    def list_identity_roles(self, options: Optional[ListIdentityRolesOptions] = None) -> IdentityRoleList:
+        """List a team's cloud identity allow list, one page at a time. Admin only."""
+        opts = options or {}
+        params: Dict[str, str] = {}
+        if opts.get("team"):
+            params["team"] = str(opts["team"])
+        if opts.get("cursor"):
+            params["cursor"] = str(opts["cursor"])
+        if opts.get("limit"):
+            params["limit"] = str(int(opts["limit"]))
+        path = f"{self._version_prefix}/identity/roles"
+        if params:
+            path += "?" + urllib.parse.urlencode(params)
+        payload = self._do_json("GET", path, None) or {}
+        result: IdentityRoleList = {"roles": [_from_api_identity_role(r) for r in payload.get("roles") or []]}
+        if payload.get("next_cursor"):
+            result["nextCursor"] = str(payload["next_cursor"])
+        return result
+
+    def delete_identity_role(self, tag: str, options: Optional[IdentityRoleOptions] = None) -> None:
+        """Take a role tag off a team's allow list. Admin only. Sandboxes that
+        use it keep their current token (at most one hour) and get no new one.
+        Deleting a tag that is already gone succeeds."""
+        self._do_json("DELETE", self._identity_role_path(tag, _first_of(options or {}, "team")), None)
+
+    def _identity_role_path(self, tag: str, team: Any) -> str:
+        path = f"{self._version_prefix}/identity/roles/{urllib.parse.quote(tag, safe='')}"
+        return _append_query_param(path, "team", str(team or ""))
+
     def whoami(self) -> WhoAmI:
         """Who the server says the caller is: principal, role, team and when
         the credential expires. Every valid credential may ask."""
@@ -2562,6 +2605,7 @@ def _append_query_param(path: str, key: str, value: str) -> str:
 
 
 def _to_api_create_options(options: CreateOptions) -> Dict[str, Any]:
+    identity = _first_of(options, "identity")
     lifecycle = _first_of(options, "lifecycle")
     failover = _first_of(options, "failover")
     gpus = _first_of(options, "gpus")
@@ -2601,8 +2645,52 @@ def _to_api_create_options(options: CreateOptions) -> Dict[str, Any]:
             "custom_domains": _first_of(options, "customDomains", "custom_domains"),
             "gpus": _to_api_gpus(gpus) if isinstance(gpus, dict) else None,
             "template_id": _first_of(options, "templateId", "template_id"),
+            "identity": _to_api_identity(identity) if isinstance(identity, dict) else None,
         }
     )
+
+
+def _to_api_identity(identity: IdentityOptions) -> Dict[str, Any]:
+    return _compact(
+        {
+            "role_tag": _first_of(identity, "roleTag", "role_tag"),
+            "audience": _first_of(identity, "audience"),
+            "aws_role_arn": _first_of(identity, "awsRoleArn", "aws_role_arn"),
+            "azure_client_id": _first_of(identity, "azureClientId", "azure_client_id"),
+            "azure_tenant_id": _first_of(identity, "azureTenantId", "azure_tenant_id"),
+        }
+    )
+
+
+def _from_api_identity_role(payload: Dict[str, Any]) -> IdentityRole:
+    result: IdentityRole = {
+        "tag": str(payload.get("tag") or ""),
+        "minRole": str(payload.get("min_role") or ""),
+        "createdAt": str(payload.get("created_at") or ""),
+        "updatedAt": str(payload.get("updated_at") or ""),
+    }
+    if payload.get("team"):
+        result["team"] = str(payload["team"])
+    return result
+
+
+def _from_api_sandbox_identity(payload: Dict[str, Any]) -> SandboxIdentity:
+    result: SandboxIdentity = {
+        "roleTag": str(payload.get("role_tag") or ""),
+        "audience": str(payload.get("audience") or ""),
+        "subject": str(payload.get("subject") or ""),
+        "tokenFile": str(payload.get("token_file") or ""),
+    }
+    for wire, key in (
+        ("aws_role_arn", "awsRoleArn"),
+        ("azure_client_id", "azureClientId"),
+        ("azure_tenant_id", "azureTenantId"),
+        ("token_expires_at", "tokenExpiresAt"),
+        ("last_error", "lastError"),
+    ):
+        if payload.get(wire):
+            result[key] = str(payload[wire])  # type: ignore[literal-required]
+    return result
 
 
 def _to_api_gpus(gpus: GPUOptions) -> Dict[str, Any]:
@@ -3235,6 +3323,9 @@ def _from_api_sandbox(sandbox: Dict[str, Any]) -> SandboxData:
     durability = _first_of(sandbox, "durability")
     if durability not in (None, ""):
         result["durability"] = str(durability)  # type: ignore[typeddict-item]
+    identity = _first_of(sandbox, "identity")
+    if isinstance(identity, dict):
+        result["identity"] = _from_api_sandbox_identity(identity)
     module_ref = _first_of(sandbox, "module_ref", "moduleRef")
     if module_ref not in (None, ""):
         result["module_ref"] = str(module_ref)

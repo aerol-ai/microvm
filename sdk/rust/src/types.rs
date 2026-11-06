@@ -319,6 +319,100 @@ pub struct CreateOptions {
     /// Ignored by other runtimes.
     #[serde(rename = "tenant_id", skip_serializing_if = "Option::is_none")]
     pub tenant_id: Option<String>,
+    /// A short-lived cloud identity token for the sandbox (AWS, GCP,
+    /// Azure). The role tag must be on your team's allow list
+    /// ([`Client::put_identity_role`](crate::Client::put_identity_role)).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<IdentityOptions>,
+}
+
+/// A cloud identity for a sandbox. The server signs a one-hour token whose
+/// subject is your team and `role_tag`, writes it to
+/// `/run/aerolvm/identity/token` inside the sandbox and refreshes it.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+pub struct IdentityOptions {
+    pub role_tag: String,
+    /// The token's `aud`; empty means `"sts.amazonaws.com"`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub audience: String,
+    /// Also sets `AWS_ROLE_ARN` and `AWS_WEB_IDENTITY_TOKEN_FILE` for the AWS SDKs.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub aws_role_arn: String,
+    /// Set both to give the Azure SDKs `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`
+    /// and `AZURE_FEDERATED_TOKEN_FILE`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub azure_client_id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub azure_tenant_id: String,
+}
+
+/// A sandbox's cloud identity as `get` shows it. Never the token.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+pub struct SandboxIdentity {
+    pub role_tag: String,
+    pub audience: String,
+    /// The token's `sub`: what your cloud's trust policy matches.
+    pub subject: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aws_role_arn: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub azure_client_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub azure_tenant_id: Option<String>,
+    pub token_file: String,
+    /// When the token now in the sandbox expires; `None` until the first one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_expires_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+}
+
+/// One role tag on a team's identity allow list.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+pub struct IdentityRole {
+    pub tag: String,
+    /// The least caller role that may create a sandbox with this tag:
+    /// `"runner"` or `"admin"`.
+    pub min_role: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub team: Option<String>,
+    #[serde(default)]
+    pub created_at: String,
+    #[serde(default)]
+    pub updated_at: String,
+}
+
+/// The body of `put_identity_role`, and the team it changes (`None` is the
+/// operator namespace: sandboxes the operator token creates).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct IdentityRoleOptions {
+    pub min_role: String,
+    pub team: Option<String>,
+}
+
+/// Paging for `list_identity_roles`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ListIdentityRolesOptions {
+    pub team: Option<String>,
+    pub cursor: Option<String>,
+    pub limit: Option<u32>,
+}
+
+/// One page of a team's identity allow list.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+pub struct IdentityRoleList {
+    #[serde(default, deserialize_with = "null_as_empty_roles")]
+    pub roles: Vec<IdentityRole>,
+    /// Pass back as `cursor` for the next page; absent on the last one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
+fn null_as_empty_roles<'de, D>(d: D) -> Result<Vec<IdentityRole>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<Vec<IdentityRole>>::deserialize(d)?.unwrap_or_default())
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
@@ -719,6 +813,9 @@ pub struct Sandbox {
     /// Isolate-group key this sandbox was created under (`runtime = "isolate"` only).
     #[serde(rename = "tenant_id", skip_serializing_if = "Option::is_none")]
     pub tenant_id: Option<String>,
+    /// The sandbox's cloud identity, when it was created with one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<SandboxIdentity>,
 }
 
 /// Status reasons: why a sandbox is in its current status

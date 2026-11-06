@@ -38,6 +38,10 @@ import ai.aerol.microvm.model.AuditCoverage;
 import ai.aerol.microvm.model.EgressProfile;
 import ai.aerol.microvm.model.EgressProfileList;
 import ai.aerol.microvm.model.EgressProfileOptions;
+import ai.aerol.microvm.model.IdentityRole;
+import ai.aerol.microvm.model.IdentityRoleList;
+import ai.aerol.microvm.model.IdentityRoleOptions;
+import ai.aerol.microvm.model.ListIdentityRolesOptions;
 import ai.aerol.microvm.model.ListEgressProfilesOptions;
 import ai.aerol.microvm.model.WarmPool;
 import ai.aerol.microvm.model.WarmPoolList;
@@ -850,6 +854,58 @@ public class MicroVMClient {
 
     private String egressProfilePath(String name) {
         return versioned("/egress-profiles/" + URLEncoder.encode(name, StandardCharsets.UTF_8));
+    }
+
+    /**
+     * Puts a role tag on a team's cloud identity allow list, or changes its
+     * minimum caller role ({@code "runner"} or {@code "admin"}). Admin only.
+     * The same call twice changes nothing, so it is safe to retry.
+     */
+    public IdentityRole putIdentityRole(String tag, IdentityRoleOptions options) {
+        IdentityRoleOptions body = options == null ? new IdentityRoleOptions() : options;
+        return doJson("PUT", identityRolePath(tag, body.getTeam()), body, IdentityRole.class);
+    }
+
+    /** Lists a team's cloud identity allow list, one page at a time. Admin only. */
+    public IdentityRoleList listIdentityRoles(ListIdentityRolesOptions options) {
+        StringBuilder query = new StringBuilder();
+        if (options != null) {
+            appendQuery(query, "team", options.getTeam());
+            appendQuery(query, "cursor", options.getCursor());
+            appendQuery(query, "limit", options.getLimit() == null ? null : String.valueOf(options.getLimit()));
+        }
+        IdentityRoleList page = doJson("GET", versioned("/identity/roles") + query, null, IdentityRoleList.class);
+        if (page == null) {
+            page = new IdentityRoleList();
+        }
+        if (page.roles == null) {
+            page.roles = new ArrayList<>();
+        }
+        return page;
+    }
+
+    public IdentityRoleList listIdentityRoles() {
+        return listIdentityRoles(null);
+    }
+
+    /**
+     * Takes a role tag off a team's allow list (a null team is the operator
+     * namespace). Admin only. Sandboxes that use it keep their current token
+     * (at most one hour) and get no new one. Deleting a tag that is already
+     * gone succeeds.
+     */
+    public void deleteIdentityRole(String tag, String team) {
+        doNoContent("DELETE", identityRolePath(tag, team), null);
+    }
+
+    public void deleteIdentityRole(String tag) {
+        deleteIdentityRole(tag, null);
+    }
+
+    private String identityRolePath(String tag, String team) {
+        StringBuilder query = new StringBuilder();
+        appendQuery(query, "team", team);
+        return versioned("/identity/roles/" + URLEncoder.encode(tag, StandardCharsets.UTF_8)) + query;
     }
 
     private static EgressProfile withProfileDefaults(EgressProfile profile) {

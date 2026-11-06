@@ -372,6 +372,71 @@ export interface CreateOptions {
    * rootfs instead of building one from `image` on every create.
    */
   templateId?: string;
+  /**
+   * A short-lived cloud identity token for the sandbox (AWS, GCP, Azure).
+   * The role tag must be on your team's allow list (`putIdentityRole`).
+   */
+  identity?: IdentityOptions;
+}
+
+/**
+ * A cloud identity for a sandbox. The server signs a one-hour token whose
+ * subject is your team and `roleTag`, writes it to
+ * `/run/aerolvm/identity/token` inside the sandbox and refreshes it.
+ */
+export interface IdentityOptions {
+  roleTag: string;
+  /** The token's `aud`; default `"sts.amazonaws.com"`. */
+  audience?: string;
+  /** Also sets `AWS_ROLE_ARN` and `AWS_WEB_IDENTITY_TOKEN_FILE` for the AWS SDKs. */
+  awsRoleArn?: string;
+  /** Set both to give the Azure SDKs `AZURE_CLIENT_ID`, `AZURE_TENANT_ID` and `AZURE_FEDERATED_TOKEN_FILE`. */
+  azureClientId?: string;
+  azureTenantId?: string;
+}
+
+/** A sandbox's cloud identity as `get` shows it. Never the token. */
+export interface SandboxIdentity {
+  roleTag: string;
+  audience: string;
+  /** The token's `sub`: what your cloud's trust policy matches. */
+  subject: string;
+  awsRoleArn?: string;
+  azureClientId?: string;
+  azureTenantId?: string;
+  tokenFile: string;
+  /** When the token now in the sandbox expires; absent until the first one. */
+  tokenExpiresAt?: string;
+  lastError?: string;
+}
+
+/** One role tag on a team's identity allow list. */
+export interface IdentityRole {
+  tag: string;
+  /** The least caller role that may create a sandbox with this tag: `"runner"` or `"admin"`. */
+  minRole: string;
+  team?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/** The body of `putIdentityRole`. */
+export interface IdentityRoleOptions {
+  minRole: "runner" | "admin";
+  /** The team whose list to change; omit for sandboxes the operator token creates. */
+  team?: string;
+}
+
+export interface ListIdentityRolesOptions {
+  team?: string;
+  cursor?: string;
+  limit?: number;
+}
+
+export interface IdentityRoleList {
+  roles: IdentityRole[];
+  /** Pass back as `cursor` for the next page; absent on the last one. */
+  nextCursor?: string;
 }
 
 export interface ResizeOptions {
@@ -712,6 +777,8 @@ export interface Sandbox {
   tenantId?: string;
   /** GPU configuration this sandbox was created with. Absent means no GPU. */
   gpus?: GPUOptions;
+  /** The sandbox's cloud identity, when it was created with one. */
+  identity?: SandboxIdentity;
 }
 
 /**

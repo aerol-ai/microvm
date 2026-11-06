@@ -257,6 +257,74 @@ class CreateOptions(TypedDict, total=False):
     # Requires runtime="firecracker" and image; the template must be ready.
     # template_id is accepted too.
     templateId: str
+    # A short-lived cloud identity token for the sandbox (AWS, GCP, Azure).
+    # The role tag must be on your team's allow list (put_identity_role).
+    identity: "IdentityOptions"
+
+
+class IdentityOptions(TypedDict, total=False):
+    """A cloud identity for a sandbox. The server signs a one-hour token whose
+    subject is your team and ``roleTag``, writes it to
+    ``/run/aerolvm/identity/token`` inside the sandbox and refreshes it."""
+
+    roleTag: str
+    # The token's ``aud``; default "sts.amazonaws.com".
+    audience: str
+    # Also set AWS_ROLE_ARN and AWS_WEB_IDENTITY_TOKEN_FILE for the AWS SDKs.
+    awsRoleArn: str
+    # Set both to give the Azure SDKs AZURE_CLIENT_ID, AZURE_TENANT_ID and
+    # AZURE_FEDERATED_TOKEN_FILE.
+    azureClientId: str
+    azureTenantId: str
+
+
+class SandboxIdentity(TypedDict, total=False):
+    """A sandbox's cloud identity as ``get`` shows it. Never the token."""
+
+    roleTag: str
+    audience: str
+    # The token's ``sub``: what your cloud's trust policy matches.
+    subject: str
+    awsRoleArn: str
+    azureClientId: str
+    azureTenantId: str
+    tokenFile: str
+    # When the token now in the sandbox expires; absent until the first one.
+    tokenExpiresAt: str
+    lastError: str
+
+
+class IdentityRole(TypedDict, total=False):
+    """One role tag on a team's identity allow list."""
+
+    tag: str
+    # The least caller role that may create a sandbox with this tag:
+    # "runner" or "admin".
+    minRole: str
+    team: str
+    createdAt: str
+    updatedAt: str
+
+
+class IdentityRoleOptions(TypedDict, total=False):
+    """The body of ``put_identity_role``."""
+
+    minRole: str
+    # The team whose list to change; omit for sandboxes the operator token
+    # creates.
+    team: str
+
+
+class ListIdentityRolesOptions(TypedDict, total=False):
+    team: str
+    cursor: str
+    limit: int
+
+
+class IdentityRoleList(TypedDict, total=False):
+    roles: List[IdentityRole]
+    # Pass back as ``cursor`` for the next page; absent on the last one.
+    nextCursor: str
 
 
 class ResizeOptions(TypedDict, total=False):
@@ -628,6 +696,8 @@ class SandboxData(TypedDict, total=False):
     tenant_id: str
     # GPU configuration this sandbox was created with. Absent means no GPU.
     gpus: GPUOptions
+    # The sandbox's cloud identity, when it was created with one.
+    identity: SandboxIdentity
 
 
 class NetworkUsage(TypedDict, total=False):
