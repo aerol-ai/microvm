@@ -120,3 +120,39 @@ func TestCancelRestartReplacesTheCrashReasonOnlyWhenOnePending(t *testing.T) {
 		}
 	}
 }
+
+// TestSetStatusReasonIfStatus: the reason lands only on a row still in the
+// given status, so a restart's "restarted" never covers a die that came
+// first.
+func TestSetStatusReasonIfStatus(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	sb := sampleSandbox("sb-if")
+	if err := st.Create(ctx, sb); err != nil {
+		t.Fatal(err)
+	}
+	set, err := st.SetStatusReasonIfStatus(ctx, sb.ID, models.SandboxStatusStarted, models.StatusReasonRestarted, exitPtr(1))
+	if err != nil || !set {
+		t.Fatalf("started row: set=%v err=%v", set, err)
+	}
+	got, _ := st.Get(ctx, sb.ID)
+	assertReason(t, got, models.StatusReasonRestarted, exitPtr(1))
+
+	if err := st.UpdateStatusWithReason(ctx, sb.ID, models.SandboxStatusStopped, "", models.StatusReasonCrashed, exitPtr(2)); err != nil {
+		t.Fatal(err)
+	}
+	set, err = st.SetStatusReasonIfStatus(ctx, sb.ID, models.SandboxStatusStarted, models.StatusReasonRestarted, exitPtr(1))
+	if err != nil || set {
+		t.Fatalf("stopped row: set=%v err=%v", set, err)
+	}
+	got, _ = st.Get(ctx, sb.ID)
+	assertReason(t, got, models.StatusReasonCrashed, exitPtr(2))
+
+	if set, err := st.SetStatusReasonIfStatus(ctx, "missing", models.SandboxStatusStarted, "x", nil); err != nil || set {
+		t.Fatalf("missing row: set=%v err=%v", set, err)
+	}
+	_ = st.Close()
+	if _, err := st.SetStatusReasonIfStatus(ctx, sb.ID, models.SandboxStatusStarted, "x", nil); err == nil {
+		t.Fatal("closed store: no error")
+	}
+}

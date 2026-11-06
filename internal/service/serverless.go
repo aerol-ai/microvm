@@ -188,8 +188,20 @@ func (s *Service) stopSandboxInternal(ctx context.Context, id string, mode stopM
 // stopSandboxForReason is stopSandboxInternal with the status reason
 // (models.StatusReason*) the stopped row records: the lifecycle sweep tells
 // idle from max_age, and the disk watchdog stops with disk_limit while using
-// the manual mode's no-wake rule.
+// the manual mode's no-wake rule. Both take the lifecycle boundary
+// (lifecycle_boundary.go).
 func (s *Service) stopSandboxForReason(ctx context.Context, id string, mode stopMode, reason string) (*models.Sandbox, error) {
+	unlock, err := s.lifecycleLocks.lock(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
+	return s.stopSandboxLocked(ctx, id, mode, reason)
+}
+
+// stopSandboxLocked is the stop itself. The caller holds the lifecycle
+// boundary for id.
+func (s *Service) stopSandboxLocked(ctx context.Context, id string, mode stopMode, reason string) (*models.Sandbox, error) {
 	// scopedGet fences a user token to its own sandbox (cross-owner → 404).
 	// Internal idle-stop/lifecycle callers run with no Access in ctx, so this
 	// stays unscoped for them.
@@ -678,8 +690,13 @@ func (s *Service) EnsureSandboxAwakeForHTTP(ctx context.Context, id string) (*mo
 		finish(true, semErr)
 		return nil, semErr
 	}
-	started, startErr := s.StartSandbox(startCtx, id)
+	started, startErr := s.wakeSandbox(startCtx, id)
 	releaseSem()
+	if errors.Is(startErr, ErrSandboxManuallyStopped) {
+		// A manual stop won the lifecycle boundary first: not a failed wake.
+		finish(false, startErr)
+		return nil, startErr
+	}
 	if startErr != nil {
 		flight.recordFailure(time.Now())
 		finish(true, startErr)
@@ -689,6 +706,32 @@ func (s *Service) EnsureSandboxAwakeForHTTP(ctx context.Context, id string) (*mo
 	s.forgetWakeFlight(id)
 	finish(true, nil)
 	return started, nil
+}
+
+// wakeSandbox is the wake's start, inside the lifecycle boundary
+// (lifecycle_boundary.go). It decides again from the row read there: the
+// wake's own checks read it before the wait, and a manual stop that got the
+// boundary in between disarmed the wake (ErrSandboxManuallyStopped), which a
+// wake must not undo. A sandbox another call started meanwhile, or one that
+// is no longer a stopped serverless sandbox, is returned as it is, as the
+// wake's first checks do.
+func (s *Service) wakeSandbox(ctx context.Context, id string) (*models.Sandbox, error) {
+	unlock, err := s.lifecycleLocks.lock(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
+	sandbox, err := s.scopedGet(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	if sandbox.Status != models.SandboxStatusStopped || !s.cfg.EnableServerless || !sandbox.Lifecycle.Serverless {
+		return sandbox, nil
+	}
+	if !sandbox.WakeArmed {
+		return nil, ErrSandboxManuallyStopped
+	}
+	return s.startSandboxLocked(ctx, id, startRequested)
 }
 
 // allowAttempt returns false when the breaker is open at now and

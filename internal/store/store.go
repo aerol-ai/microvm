@@ -5056,6 +5056,28 @@ func (s *Store) SetStatusReason(ctx context.Context, id, reason string, exitCode
 	return nil
 }
 
+// SetStatusReasonIfStatus is SetStatusReason for a row that is still in
+// status. A reason that explains a status must not land on a row another
+// writer has moved since: a restart's "restarted" on a sandbox whose die
+// event already wrote "crashed" would hide the crash its restart on failure
+// answers. set reports whether the row was written (false for a row that
+// moved, or is gone).
+func (s *Store) SetStatusReasonIfStatus(ctx context.Context, id string, status models.SandboxStatus, reason string, exitCode *int) (bool, error) {
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE sandboxes
+		SET status_reason = ?, exit_code = ?, updated_at = ?
+		WHERE id = ? AND status = ?
+	`, reason, nullableInt(exitCode), time.Now().UTC(), id, string(status))
+	if err != nil {
+		return false, fmt.Errorf("set sandbox status reason: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("set sandbox status reason: %w", err)
+	}
+	return affected == 1, nil
+}
+
 // ScheduleRestart records a pending restart on failure: the consecutive
 // failure count the backoff was computed from and when the restart is due.
 func (s *Store) ScheduleRestart(ctx context.Context, id string, failures int, at time.Time) error {

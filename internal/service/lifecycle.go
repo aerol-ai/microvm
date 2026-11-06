@@ -23,13 +23,17 @@ var (
 	ErrSandboxNotResumable = errors.New("sandbox is not resumable")
 )
 
-// PauseSandbox stops a running sandbox under the per-sandbox lifecycle lock so
-// the state check and the stop are one critical section. An already-stopped
+// PauseSandbox stops a running sandbox inside the lifecycle boundary
+// (lifecycle_boundary.go) so the state check and the stop are one critical
+// section. An already-stopped
 // sandbox is a no-op (a retried pause is idempotent); any other state is
 // ErrSandboxNotRunning. This is the single definition of "can this be paused"
 // the E2B pause and Runloop suspend handlers used to each carry (D7).
 func (s *Service) PauseSandbox(ctx context.Context, id string) (*models.Sandbox, error) {
-	unlock := s.lifecycleLocks.lock(id)
+	unlock, err := s.lifecycleLocks.lock(ctx, id)
+	if err != nil {
+		return nil, err
+	}
 	defer unlock()
 	sandbox, err := s.scopedGet(ctx, id)
 	if err != nil {
@@ -47,19 +51,22 @@ func (s *Service) PauseSandbox(ctx context.Context, id string) (*models.Sandbox,
 		}
 		return sandbox, nil
 	case models.SandboxStatusStarted:
-		return s.stopSandboxInternal(ctx, id, stopModeManual)
+		return s.stopSandboxLocked(ctx, id, stopModeManual, defaultStopReason(stopModeManual))
 	default:
 		return nil, ErrSandboxNotRunning
 	}
 }
 
-// ResumeSandbox starts a stopped sandbox under the per-sandbox lifecycle lock.
+// ResumeSandbox starts a stopped sandbox inside the lifecycle boundary.
 // An already-started sandbox is a no-op (a retried resume is idempotent); any
 // other state is ErrSandboxNotResumable. This is the single definition of "can
 // this be resumed" the E2B connect and Runloop resume handlers used to each
 // carry (D7).
 func (s *Service) ResumeSandbox(ctx context.Context, id string) (*models.Sandbox, error) {
-	unlock := s.lifecycleLocks.lock(id)
+	unlock, err := s.lifecycleLocks.lock(ctx, id)
+	if err != nil {
+		return nil, err
+	}
 	defer unlock()
 	sandbox, err := s.scopedGet(ctx, id)
 	if err != nil {
@@ -69,7 +76,7 @@ func (s *Service) ResumeSandbox(ctx context.Context, id string) (*models.Sandbox
 	case models.SandboxStatusStarted:
 		return sandbox, nil
 	case models.SandboxStatusStopped:
-		return s.StartSandbox(ctx, id)
+		return s.startSandboxLocked(ctx, id, startRequested)
 	default:
 		return nil, ErrSandboxNotResumable
 	}
@@ -84,7 +91,10 @@ func (s *Service) ResumeSandbox(ctx context.Context, id string) (*models.Sandbox
 // patches on the same sandbox could each read the same base and the later
 // write would drop the earlier field (D7).
 func (s *Service) ApplyLifecyclePatch(ctx context.Context, id string, patch func(*models.Sandbox) (models.Lifecycle, bool, error)) (*models.Sandbox, bool, error) {
-	unlock := s.lifecycleLocks.lock(id)
+	unlock, err := s.lifecycleLocks.lock(ctx, id)
+	if err != nil {
+		return nil, false, err
+	}
 	defer unlock()
 	sandbox, err := s.scopedGet(ctx, id)
 	if err != nil {

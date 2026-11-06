@@ -420,12 +420,14 @@ type Service struct {
 	// handler raced it through the cluster placement delete and failed on
 	// the placement the API path had just removed, once per destroy.
 	destroyLocks egressPolicyLocks
-	// lifecycleLocks serializes a sandbox's lifecycle transitions — pause,
-	// resume, and the read-modify-write of its Lifecycle timers (D7). Without
-	// it two facade calls that each read the Lifecycle, patch one field and
-	// write the whole struct back (E2B timeout/connect, Daytona idle timers)
-	// race, and the later writer clobbers the earlier one's field.
-	lifecycleLocks egressPolicyLocks
+	// lifecycleLocks is the lifecycle boundary (lifecycle_boundary.go): one
+	// lock per sandbox around every start, stop, pause, resume, destroy,
+	// restart on failure, wake, timed stop or delete, die/stop/destroy event,
+	// and the read-modify-write of its Lifecycle timers (D7). Without it two
+	// facade calls that each read the Lifecycle, patch one field and write the
+	// whole struct back race, and an automatic restart already inside the
+	// runtime start undoes a stop that succeeded (review 2 finding 9).
+	lifecycleLocks sandboxLocks
 	// Restart on failure (restart_on_failure.go): one timer per sandbox
 	// waiting to restart, the daemon context they run under, and test seams
 	// for the clock and the timer.
@@ -3616,8 +3618,17 @@ func sandboxMatchesTags(sb *models.Sandbox, want map[string]string) bool {
 	return true
 }
 
+// StartSandbox starts a sandbox inside the lifecycle boundary
+// (lifecycle_boundary.go): it waits for any start, stop or restart of the
+// same sandbox already in flight, and a stop that comes during it waits for
+// it in turn.
 func (s *Service) StartSandbox(ctx context.Context, id string) (*models.Sandbox, error) {
-	return s.startSandbox(ctx, id, startRequested)
+	unlock, err := s.lifecycleLocks.lock(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
+	return s.startSandboxLocked(ctx, id, startRequested)
 }
 
 // startCause says who starts a sandbox: a call (API, facade, wake, fleet
@@ -3631,7 +3642,9 @@ const (
 	startForRestart
 )
 
-func (s *Service) startSandbox(ctx context.Context, id string, cause startCause) (_ *models.Sandbox, err error) {
+// startSandboxLocked is the start itself. The caller holds the lifecycle
+// boundary for id.
+func (s *Service) startSandboxLocked(ctx context.Context, id string, cause startCause) (_ *models.Sandbox, err error) {
 	// A started sandbox gets a fresh identity token at once, a restart on
 	// failure included (no-op for one without an identity, or a deployment
 	// that is not an issuer).
@@ -3856,12 +3869,28 @@ func egressUnsupportedOnStart(sb *models.Sandbox) error {
 // thin wrapper over stopSandboxInternal that pins the stop mode to manual:
 // wake_armed is always cleared, so a serverless sandbox stopped via this
 // path stays down until the operator explicitly starts it again.
-// See serverless.go for the full wake-arming policy.
+// See serverless.go for the full wake-arming policy. It runs inside the
+// lifecycle boundary: a restart on failure already starting the sandbox
+// finishes first, and this stop then stops it.
 func (s *Service) StopSandbox(ctx context.Context, id string) (*models.Sandbox, error) {
 	return s.stopSandboxInternal(ctx, id, stopModeManual)
 }
 
+// DestroySandbox deletes a sandbox inside the lifecycle boundary, so a start
+// or a restart on failure in flight cannot write the row back after the
+// delete (Upsert inserts a missing row).
 func (s *Service) DestroySandbox(ctx context.Context, id string) error {
+	unlock, err := s.lifecycleLocks.lock(ctx, id)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	return s.destroySandboxLocked(ctx, id)
+}
+
+// destroySandboxLocked is the destroy itself. The caller holds the lifecycle
+// boundary for id.
+func (s *Service) destroySandboxLocked(ctx context.Context, id string) error {
 	// A pending restart on failure is for a sandbox that is going away.
 	s.cancelRestartTimer(id)
 	unlock := s.destroyLocks.lock(id)
@@ -4970,7 +4999,10 @@ func (s *Service) UpdateLifecycle(ctx context.Context, id string, l models.Lifec
 			return nil, fmt.Errorf("invalid lifecycle: %w", err)
 		}
 	}
-	unlock := s.lifecycleLocks.lock(id)
+	unlock, err := s.lifecycleLocks.lock(ctx, id)
+	if err != nil {
+		return nil, err
+	}
 	defer unlock()
 	priorSandbox, err := s.scopedGet(ctx, id)
 	if err != nil {
@@ -5001,7 +5033,7 @@ func (s *Service) sandboxRuntime(sb *models.Sandbox) string {
 }
 
 // writeLifecycleLocked persists lifecycle l for id and replays the resulting
-// serverless route transition. The caller holds s.lifecycleLocks.lock(id) and
+// serverless route transition. The caller holds the lifecycle boundary for id and
 // passes the scoped prior read so the whole read→write is one critical section
 // (D7); l is already validated. It reports whether the write ran (always true
 // here; the bool lets ApplyLifecyclePatch tell a no-op apart).
@@ -7178,6 +7210,7 @@ func (s *Service) runLifecycleSweep(ctx context.Context) {
 	// Main programs that ended, for destroy_after_exit_for: asked first so
 	// a short delay can act in this same pass.
 	s.probeProgramExits(ctx, sandboxes)
+	var due []string
 	for _, sandbox := range sandboxes {
 		// A restart on failure that lost its timer (the daemon restarted
 		// while it waited) gets one now; a due one runs at once.
@@ -7185,33 +7218,65 @@ func (s *Service) runLifecycleSweep(ctx context.Context) {
 			s.ensureRestartArmed(sandbox)
 		}
 		floor := s.activityFloorFor(sandbox, netstatsFallback)
-		action, reason := lifecycleDecision(sandbox, now, globalIdle, floor)
-		switch action {
-		case lifecycleDestroy:
-			done := s.beginSystemActionReason(ctx, sandbox.ID, systemActionAutoDelete, reason)
-			err := s.DestroySandbox(ctx, sandbox.ID)
-			done(err)
-			if err != nil {
-				s.logger.Warn("auto-destroy failed", "sandbox_id", sandbox.ID, "error", err)
-			} else {
-				recordSandboxExpired(reason)
-				s.logger.Info("audit lifecycle auto-destroy", "sandbox_id", sandbox.ID)
-			}
-		case lifecycleStop:
-			// Lifecycle stop: pass mode=stopModeLifecycle so serverless
-			// sandboxes arm wake (the next inbound HTTP request will
-			// resurrect the sandbox transparently).
-			done := s.beginSystemActionReason(ctx, sandbox.ID, systemActionAutoStop, reason)
-			_, err := s.stopSandboxForReason(ctx, sandbox.ID, stopModeLifecycle, reason)
-			done(err)
-			if err != nil {
-				s.logger.Warn("auto-stop failed", "sandbox_id", sandbox.ID, "error", err)
-			} else {
-				s.logger.Info("audit lifecycle auto-stop",
-					formatStopAuditFields(sandbox.ID, stopModeLifecycle, s.shouldArmWake(sandbox, stopModeLifecycle))...)
-			}
+		if action, _ := lifecycleDecision(sandbox, now, globalIdle, floor); action != lifecycleNone {
+			due = append(due, sandbox.ID)
 		}
 	}
+	// Each one decides again inside the lifecycle boundary, which logs
+	// its failures.
+	for _, id := range due {
+		_ = s.runLifecycleAction(ctx, id, now, globalIdle, netstatsFallback)
+	}
+}
+
+// runLifecycleAction carries out one sandbox's timed stop or delete inside the
+// lifecycle boundary (lifecycle_boundary.go). It reads the row again there
+// and decides again from that read, with the pass's clock: the pass decided
+// from a list read before the exit probes and every action ahead of this one,
+// and a start, stop, restart or lifecycle update since may have changed the
+// answer. A sandbox started again after its main program ended no longer
+// carries that exit, so it is not deleted for it (review 2 finding 10). A
+// row that is gone, or no longer due, is nothing to do.
+func (s *Service) runLifecycleAction(ctx context.Context, id string, now time.Time, globalIdle time.Duration, netstatsFallback bool) error {
+	unlock, err := s.lifecycleLocks.lock(ctx, id)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	sandbox, err := s.store.Get(ctx, id)
+	if errors.Is(err, store.ErrNotFound) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	action, reason := lifecycleDecision(sandbox, now, globalIdle, s.activityFloorFor(sandbox, netstatsFallback))
+	switch action {
+	case lifecycleDestroy:
+		done := s.beginSystemActionReason(ctx, id, systemActionAutoDelete, reason)
+		err := s.destroySandboxLocked(ctx, id)
+		done(err)
+		if err != nil {
+			s.logger.Warn("auto-destroy failed", "sandbox_id", id, "error", err)
+			return err
+		}
+		recordSandboxExpired(reason)
+		s.logger.Info("audit lifecycle auto-destroy", "sandbox_id", id)
+	case lifecycleStop:
+		// Lifecycle stop: pass mode=stopModeLifecycle so serverless
+		// sandboxes arm wake (the next inbound HTTP request will
+		// resurrect the sandbox transparently).
+		done := s.beginSystemActionReason(ctx, id, systemActionAutoStop, reason)
+		_, err := s.stopSandboxLocked(ctx, id, stopModeLifecycle, reason)
+		done(err)
+		if err != nil {
+			s.logger.Warn("auto-stop failed", "sandbox_id", id, "error", err)
+			return err
+		}
+		s.logger.Info("audit lifecycle auto-stop",
+			formatStopAuditFields(id, stopModeLifecycle, s.shouldArmWake(sandbox, stopModeLifecycle))...)
+	}
+	return nil
 }
 
 type lifecycleAction int

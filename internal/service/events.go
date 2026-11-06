@@ -93,6 +93,22 @@ func (s *Service) consumeEvents(ctx context.Context, events <-chan docker.Docker
 }
 
 func (s *Service) handleDockerEvent(ctx context.Context, event docker.DockerEvent) error {
+	// An exit and a removal change whether the sandbox runs, so they are
+	// handled inside the lifecycle boundary (lifecycle_boundary.go), and the
+	// row is read only once it is held: an event that read it first and then
+	// waited out a stop, a start or a destroy would write that old read back
+	// (Upsert inserts a missing row). Holding it from the die's record to the
+	// restart it schedules means no stop or pause can come between them; one
+	// that came first has already written its reason, which the die keeps.
+	// A start or an OOM record changes nothing the boundary guards.
+	switch event.Action {
+	case "die", "stop", "destroy":
+		unlock, err := s.lifecycleLocks.lock(ctx, event.SandboxID)
+		if err != nil {
+			return fmt.Errorf("wait for the sandbox's lifecycle: %w", err)
+		}
+		defer unlock()
+	}
 	sandbox, err := s.store.Get(ctx, event.SandboxID)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
