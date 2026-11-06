@@ -107,8 +107,9 @@ type IdentityGate interface {
 
 // IdentityAllowed reports whether every live member, workers and ingress
 // included, understands cloud identity: the create option (an older worker
-// would drop it and run the sandbox with no identity), the token push, and
-// the audit field (an older reader would not verify the record's hash).
+// would drop it and run the sandbox with no identity) and the token push.
+// The identity.token_issued audit record needs no gate: it is a new Kind
+// with only existing fields, which every build hashes the same way.
 func (c *Cluster) IdentityAllowed() bool {
 	if c == nil {
 		return false

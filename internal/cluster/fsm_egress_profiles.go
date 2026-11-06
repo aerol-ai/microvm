@@ -59,8 +59,8 @@ const (
 	// (fsm_warm_pools.go).
 	warmPoolFSMOpsVersion = 7
 	// identityFSMOpsVersion: opPutIdentityKeys, opPutIdentityRole,
-	// opDeleteIdentityRole (fsm_identity.go), the identity create option a
-	// worker must understand, and the audit record's identity_token field
+	// opDeleteIdentityRole (fsm_identity.go) and the identity create option
+	// a worker must understand; the token_issued audit record needs no gate
 	// (IdentityAllowed).
 	identityFSMOpsVersion = 8
 )

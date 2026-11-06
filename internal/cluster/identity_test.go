@@ -16,9 +16,9 @@ import (
 	"github.com/aerol-ai/microvm/internal/cloudidentity"
 )
 
-// TestIdentityGateMixedVersions: no node accepts an identity create, or
-// writes the audit field, while any live member advertises a build older
-// than identityFSMOpsVersion; an older worker would drop the option.
+// TestIdentityGateMixedVersions: no node accepts an identity create while
+// any live member advertises a build older than identityFSMOpsVersion; an
+// older worker would drop the option.
 func TestIdentityGateMixedVersions(t *testing.T) {
 	index := newGossipMemberIndex()
 	index.replace([]Member{{NodeID: "self", Alive: true, FSMOpsVersion: fsmOpsVersion}})
