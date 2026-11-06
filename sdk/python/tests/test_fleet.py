@@ -1,4 +1,4 @@
-"""get_or_create against a fake sandboxd that keeps sandboxes by name, the
+"""get_or_create and destroy_all against a fake sandboxd that keeps sandboxes by name, the
 way the real one does (names unique per owner, a second create of a name is
 a 409)."""
 
@@ -203,6 +203,54 @@ class GetOrCreateTests(unittest.TestCase):
         sandbox, created = fake.client().get_or_create(" agent-1 ", {"name": "agent-1", "image": "alpine"})
         self.assertTrue(created)
         self.assertEqual(sandbox.name, "agent-1")
+
+
+
+class DestroyAllTests(unittest.TestCase):
+    def test_deletes_every_match_across_pages(self):
+        fake = FakeSandboxd(self, page_size=2)
+        doomed = [fake.add("a-%d" % i, {"run": "42", "team": "x"}) for i in range(5)]
+        kept = [fake.add("other", {"run": "41", "team": "x"}), fake.add("untagged")]
+        gone = fake.client().destroy_all(tags={"run": "42", "team": "x"})
+        self.assertEqual(gone, doomed)
+        self.assertEqual(sorted(fake.sandboxes), sorted(kept))
+        # Three list pages, then one delete per match.
+        self.assertEqual(fake.count("GET"), 3)
+        self.assertEqual(fake.count("DELETE"), 5)
+
+    def test_a_second_call_finds_nothing(self):
+        fake = FakeSandboxd(self)
+        fake.add("a", {"run": "42"})
+        client = fake.client()
+        self.assertEqual(len(client.destroy_all(tags={"run": "42"})), 1)
+        self.assertEqual(client.destroy_all(tags={"run": "42"}), [])
+
+    def test_an_already_gone_sandbox_counts_as_deleted(self):
+        fake = FakeSandboxd(self)
+        first = fake.add("a", {"run": "42"})
+        second = fake.add("b", {"run": "42"})
+        fake.delete_status[first] = 404
+        self.assertEqual(fake.client().destroy_all(tags={"run": "42"}), [first, second])
+
+    def test_stops_at_a_failed_delete(self):
+        fake = FakeSandboxd(self)
+        first = fake.add("a", {"run": "42"})
+        second = fake.add("b", {"run": "42"})
+        third = fake.add("c", {"run": "42"})
+        fake.delete_status[second] = 500
+        with self.assertRaises(MicroVMHTTPError) as ctx:
+            fake.client().destroy_all(tags={"run": "42"})
+        self.assertEqual(ctx.exception.status_code, 500)
+        self.assertNotIn(first, fake.sandboxes)
+        self.assertIn(third, fake.sandboxes)
+        self.assertEqual(fake.count("DELETE"), 2)
+
+    def test_needs_a_tag(self):
+        client = MicroVM("http://127.0.0.1:9", "pat")
+        for tags in ({}, None):
+            with self.subTest(tags=tags):
+                with self.assertRaises(ValueError):
+                    client.destroy_all(tags=tags)
 
 
 if __name__ == "__main__":

@@ -268,4 +268,52 @@ class FleetTest {
         assertThrows(IllegalArgumentException.class, () -> fake.client.getOrCreate("a", other));
         assertEquals(0, fake.requests.size());
     }
+
+    @Test
+    void destroyAllDeletesEveryMatchAcrossPages() throws Exception {
+        FakeSandboxd fake = new FakeSandboxd(0);
+        Map<String, String> tags = Map.of("run", "42", "team", "x");
+        List<String> doomed = new ArrayList<>();
+        for (int i = 0; i < 5; i++) {
+            doomed.add(fake.add("a-" + i, tags, "alpine"));
+        }
+        fake.add("other", Map.of("run", "41", "team", "x"), "alpine");
+        fake.add("untagged", Map.of(), "alpine");
+        assertEquals(doomed, fake.client.destroyAll(tags));
+        assertEquals(2, fake.sandboxes.size());
+        assertEquals(3, fake.count("GET"));
+        assertEquals(5, fake.count("DELETE"));
+        assertEquals(List.of(), fake.client.destroyAll(tags));
+    }
+
+    @Test
+    void destroyAllCountsAnAlreadyGoneSandboxAsDeleted() throws Exception {
+        FakeSandboxd fake = new FakeSandboxd(0);
+        String first = fake.add("a", Map.of("run", "42"), "alpine");
+        String second = fake.add("b", Map.of("run", "42"), "alpine");
+        fake.deleteStatus.put(first, 404);
+        assertEquals(List.of(first, second), fake.client.destroyAll(Map.of("run", "42")));
+    }
+
+    @Test
+    void destroyAllStopsAtAFailedDelete() throws Exception {
+        FakeSandboxd fake = new FakeSandboxd(0);
+        String first = fake.add("a", Map.of("run", "42"), "alpine");
+        String second = fake.add("b", Map.of("run", "42"), "alpine");
+        String third = fake.add("c", Map.of("run", "42"), "alpine");
+        fake.deleteStatus.put(second, 500);
+        MicroVMApiException err = assertThrows(MicroVMApiException.class, () -> fake.client.destroyAll(Map.of("run", "42")));
+        assertEquals(500, err.getStatusCode());
+        assertFalse(fake.sandboxes.containsKey(first));
+        assertTrue(fake.sandboxes.containsKey(third));
+        assertEquals(2, fake.count("DELETE"));
+    }
+
+    @Test
+    void destroyAllNeedsATag() throws Exception {
+        FakeSandboxd fake = new FakeSandboxd(0);
+        assertThrows(IllegalArgumentException.class, () -> fake.client.destroyAll(Map.of()));
+        assertThrows(IllegalArgumentException.class, () -> fake.client.destroyAll(null));
+        assertEquals(0, fake.requests.size());
+    }
 }

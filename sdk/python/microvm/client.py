@@ -1210,6 +1210,31 @@ class MicroVM:
     def destroy(self, sandbox_id: str) -> None:
         self._do_json("DELETE", f"{self._version_prefix}/sandboxes/{sandbox_id}", None)
 
+    def destroy_all(self, *, tags: Dict[str, str]) -> List[str]:
+        """Delete every sandbox of yours that carries all of ``tags`` and
+        return the IDs of the ones that are now gone.
+
+        It lists the matches first (every page), then deletes them one at a
+        time. A sandbox that is already gone (404) counts as deleted, so a
+        second call, or two calls at once, is safe. If a delete fails any
+        other way, it stops and raises that error; the sandboxes it already
+        deleted stay deleted, and calling it again finishes the job.
+
+        ``tags`` must not be empty: with no filter this would delete every
+        sandbox you own.
+        """
+        if not tags:
+            raise ValueError("destroy_all needs at least one tag; with none it would delete every sandbox you own")
+        ids = [sandbox.id for page in self.iter_pages(tags=tags) for sandbox in page]
+        gone: List[str] = []
+        for sandbox_id in ids:
+            try:
+                self.destroy(sandbox_id)
+            except MicroVMNotFoundError:
+                pass
+            gone.append(sandbox_id)
+        return gone
+
     def create_template(self, options: CreateTemplateOptions) -> Template:
         """Register a Firecracker rootfs template.
 

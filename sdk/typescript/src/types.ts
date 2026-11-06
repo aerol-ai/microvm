@@ -463,6 +463,16 @@ export interface ResizeOptions {
   diskGB?: number;
 }
 
+/** Options for {@link MicroVM.destroyAll}. */
+export interface DestroyAllOptions {
+  /**
+   * Delete only sandboxes whose `tags` hold every key/value pair given here.
+   * Required and must not be empty: with no filter the call would delete
+   * every sandbox you own.
+   */
+  tags: Record<string, string>;
+}
+
 export interface ListOptions {
   /**
    * Filter the result to only sandboxes whose `tags` map contains every

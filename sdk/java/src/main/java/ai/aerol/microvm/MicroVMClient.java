@@ -664,6 +664,37 @@ public class MicroVMClient {
         return versioned("/snapshots/" + encodePathSegment(name));
     }
 
+    /**
+     * Deletes every sandbox of yours that carries all of {@code tags} and
+     * returns the IDs of the ones now gone. It lists every page first, then
+     * deletes them one at a time. A sandbox that is already gone (404) counts
+     * as deleted, so a second call, or two calls at once, is safe. Any other
+     * failed delete stops the call and is thrown; the sandboxes already
+     * deleted stay deleted, and calling it again finishes the job.
+     *
+     * @throws IllegalArgumentException when {@code tags} is null or empty:
+     *     with no filter it would delete every sandbox you own
+     */
+    public List<String> destroyAll(java.util.Map<String, String> tags) {
+        if (tags == null || tags.isEmpty()) {
+            throw new IllegalArgumentException("destroyAll needs at least one tag; with none it would delete every sandbox you own");
+        }
+        List<String> ids = new ArrayList<>();
+        for (Sandbox sandbox : list(tags)) {
+            ids.add(sandbox.id);
+        }
+        List<String> gone = new ArrayList<>(ids.size());
+        for (String id : ids) {
+            try {
+                destroy(id);
+            } catch (MicroVMNotFoundException e) {
+                // Already gone: someone else deleted it, which is the goal.
+            }
+            gone.add(id);
+        }
+        return gone;
+    }
+
     public void destroy(String sandboxId) {
         doNoContent("DELETE", sandboxPath(sandboxId), null);
     }

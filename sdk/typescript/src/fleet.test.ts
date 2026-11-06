@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { MicroVM, MicroVMConflictError } from "./index.js";
+import { MicroVM, MicroVMApiError, MicroVMConflictError } from "./index.js";
 
 interface FakeSandbox {
   id: string;
@@ -147,3 +147,47 @@ test("getOrCreate rejects a missing or mismatched name", async () => {
   assert.equal(created, true);
 });
 
+
+test("destroyAll deletes every match across pages", async () => {
+  const fake = new FakeSandboxd();
+  const doomed = [0, 1, 2, 3, 4].map((i) => fake.add(`a-${i}`, { run: "42", team: "x" }));
+  const kept = [fake.add("other", { run: "41", team: "x" }), fake.add("untagged")];
+  const gone = await fake.client().destroyAll({ tags: { run: "42", team: "x" } });
+  assert.deepEqual(gone, doomed);
+  assert.deepEqual([...fake.sandboxes.keys()].sort(), kept.sort());
+  assert.equal(fake.count("GET"), 3);
+  assert.equal(fake.count("DELETE"), 5);
+});
+
+test("destroyAll is safe to repeat and counts a 404 as deleted", async () => {
+  const fake = new FakeSandboxd();
+  const first = fake.add("a", { run: "42" });
+  const second = fake.add("b", { run: "42" });
+  fake.deleteStatus.set(first, 404);
+  const client = fake.client();
+  assert.deepEqual(await client.destroyAll({ tags: { run: "42" } }), [first, second]);
+  fake.sandboxes.delete(first);
+  assert.deepEqual(await client.destroyAll({ tags: { run: "42" } }), []);
+});
+
+test("destroyAll stops at a failed delete", async () => {
+  const fake = new FakeSandboxd();
+  const first = fake.add("a", { run: "42" });
+  const second = fake.add("b", { run: "42" });
+  const third = fake.add("c", { run: "42" });
+  fake.deleteStatus.set(second, 500);
+  await assert.rejects(fake.client().destroyAll({ tags: { run: "42" } }), (err: unknown) => {
+    assert.ok(err instanceof MicroVMApiError);
+    assert.equal(err.status, 500);
+    return true;
+  });
+  assert.equal(fake.sandboxes.has(first), false);
+  assert.equal(fake.sandboxes.has(third), true);
+  assert.equal(fake.count("DELETE"), 2);
+});
+
+test("destroyAll needs a tag", async () => {
+  const fake = new FakeSandboxd();
+  await assert.rejects(fake.client().destroyAll({ tags: {} }), /at least one tag/);
+  assert.equal(fake.requests.length, 0);
+});

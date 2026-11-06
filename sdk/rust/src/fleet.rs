@@ -1,9 +1,39 @@
 //! Calls that act on sandboxes by name or by tag rather than by ID (plan
 //! section 5.3, S4 and S5).
 
+use std::collections::HashMap;
+
 use crate::{Client, CreateOptions, Error, Sandbox};
 
 impl Client {
+    /// Deletes every sandbox of yours that carries all of `tags` and returns
+    /// the IDs of the ones now gone.
+    ///
+    /// It lists every page first, then deletes them one at a time. A sandbox
+    /// that is already gone (404) counts as deleted, so a second call, or two
+    /// calls at once, is safe. Any other failed delete stops the call and is
+    /// returned; the sandboxes already deleted stay deleted, and calling it
+    /// again finishes the job. `tags` must not be empty: with no filter it
+    /// would delete every sandbox you own.
+    pub fn destroy_all(&self, tags: &HashMap<String, String>) -> Result<Vec<String>, Error> {
+        if tags.is_empty() {
+            return Err(Error::Client(
+                "destroy_all needs at least one tag; with none it would delete every sandbox you own".into(),
+            ));
+        }
+        let ids: Vec<String> = self.list_with_tags(tags)?.into_iter().map(|sandbox| sandbox.data.id).collect();
+        let mut gone = Vec::with_capacity(ids.len());
+        for id in ids {
+            match self.destroy(&id) {
+                Ok(()) => {}
+                Err(err) if err.is_not_found() => {}
+                Err(err) => return Err(err),
+            }
+            gone.push(id);
+        }
+        Ok(gone)
+    }
+
     /// Returns the caller's sandbox called `name`, creating it from `opts`
     /// when there is none. The `bool` is true only when this call made the
     /// sandbox.
@@ -302,6 +332,64 @@ pub(crate) mod tests {
             let err = client.get_or_create(name, options).expect_err(name);
             assert!(matches!(err, Error::Client(_)), "{err}");
         }
+        assert!(state.lock().unwrap().requests.is_empty());
+    }
+
+    fn tagged(pairs: &[(&str, &str)]) -> Value {
+        Value::Object(pairs.iter().map(|(k, v)| (k.to_string(), json!(v))).collect())
+    }
+
+    fn tag_map(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+    }
+
+    #[test]
+    fn destroy_all_deletes_every_match_across_pages() {
+        let (url, state) = spawn_fake(0);
+        let pairs = [("run", "42"), ("team", "x")];
+        let doomed: Vec<String> = (0..5).map(|i| state.lock().unwrap().add(&format!("a-{i}"), tagged(&pairs), "alpine")).collect();
+        state.lock().unwrap().add("other", tagged(&[("run", "41"), ("team", "x")]), "alpine");
+        state.lock().unwrap().add("untagged", json!({}), "alpine");
+        let client = fake_client(&url);
+        assert_eq!(client.destroy_all(&tag_map(&pairs)).expect("destroy_all"), doomed);
+        {
+            let st = state.lock().unwrap();
+            assert_eq!(st.sandboxes.len(), 2);
+            assert_eq!((st.count("GET"), st.count("DELETE")), (3, 5));
+        }
+        assert!(client.destroy_all(&tag_map(&pairs)).expect("second destroy_all").is_empty());
+    }
+
+    #[test]
+    fn destroy_all_counts_an_already_gone_sandbox_as_deleted() {
+        let (url, state) = spawn_fake(0);
+        let first = state.lock().unwrap().add("a", tagged(&[("run", "42")]), "alpine");
+        let second = state.lock().unwrap().add("b", tagged(&[("run", "42")]), "alpine");
+        state.lock().unwrap().delete_status.insert(first.clone(), 404);
+        let gone = fake_client(&url).destroy_all(&tag_map(&[("run", "42")])).expect("destroy_all");
+        assert_eq!(gone, vec![first, second]);
+    }
+
+    #[test]
+    fn destroy_all_stops_at_a_failed_delete() {
+        let (url, state) = spawn_fake(0);
+        let first = state.lock().unwrap().add("a", tagged(&[("run", "42")]), "alpine");
+        let second = state.lock().unwrap().add("b", tagged(&[("run", "42")]), "alpine");
+        let third = state.lock().unwrap().add("c", tagged(&[("run", "42")]), "alpine");
+        state.lock().unwrap().delete_status.insert(second, 500);
+        let err = fake_client(&url).destroy_all(&tag_map(&[("run", "42")])).expect_err("500");
+        assert_eq!(err.api_error().map(|e| e.status()), Some(500));
+        let st = state.lock().unwrap();
+        assert!(!st.sandboxes.contains_key(&first));
+        assert!(st.sandboxes.contains_key(&third));
+        assert_eq!(st.count("DELETE"), 2);
+    }
+
+    #[test]
+    fn destroy_all_needs_a_tag() {
+        let (url, state) = spawn_fake(0);
+        let err = fake_client(&url).destroy_all(&HashMap::new()).expect_err("no tags");
+        assert!(matches!(err, Error::Client(_)), "{err}");
         assert!(state.lock().unwrap().requests.is_empty());
     }
 }

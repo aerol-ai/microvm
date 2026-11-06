@@ -631,6 +631,31 @@ func (c *Client) Destroy(ctx context.Context, id string) error {
 	return c.inner.Destroy(ctx, id)
 }
 
+// DestroyAll deletes every sandbox of the caller's that carries all of tags
+// and returns the IDs of the ones now gone. It lists every page first, then
+// deletes them one at a time. A sandbox that is already gone (404) counts as
+// deleted, so a second call, or two calls at once, is safe. Any other failed
+// delete stops it: the error is returned with the IDs deleted so far, and
+// calling it again finishes the job. tags must not be empty, since with no
+// filter it would delete every sandbox the caller owns.
+func (c *Client) DestroyAll(ctx context.Context, tags map[string]string) ([]string, error) {
+	if len(tags) == 0 {
+		return nil, errors.New("DestroyAll needs at least one tag; with none it would delete every sandbox you own")
+	}
+	matches, err := c.List(ctx, WithTags(tags))
+	if err != nil {
+		return nil, err
+	}
+	gone := make([]string, 0, len(matches))
+	for _, sb := range matches {
+		if err := c.Destroy(ctx, sb.ID); err != nil && !errors.Is(err, ErrNotFound) {
+			return gone, fmt.Errorf("destroy %s: %w", sb.ID, err)
+		}
+		gone = append(gone, sb.ID)
+	}
+	return gone, nil
+}
+
 // CreateTemplate registers a Firecracker rootfs template. Returns immediately
 // with a status="pending" row; poll Client.GetTemplate until the row reaches
 // "ready" (fast-boot available) or "ready_no_snapshot" (cold boot only).

@@ -60,6 +60,7 @@ export type {
   CreateSessionOptions,
   CreateTemplateOptions,
   CreateWasmModuleOptions,
+  DestroyAllOptions,
   CustomDomain,
   CustomDomainDNSRecords,
   CustomDomainStatus,

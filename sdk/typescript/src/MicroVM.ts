@@ -3,6 +3,7 @@ import { Sandbox } from "./Sandbox.js";
 import { Image } from "./Image.js";
 import type {
   APITokenList,
+  DestroyAllOptions,
   BuildImageOptions,
   BuildImageResult,
   CloneGeneration,
@@ -250,6 +251,19 @@ export class MicroVM {
 
   async destroy(id: string): Promise<void> {
     await this.client.destroy(id);
+  }
+
+  /**
+   * Deletes every sandbox of yours that carries all of `options.tags` and
+   * returns the IDs of the ones now gone. It lists every page first, then
+   * deletes them one at a time. A sandbox that is already gone (404) counts
+   * as deleted, so a second call, or two calls at once, is safe. Any other
+   * failed delete stops the call and is thrown; the sandboxes already
+   * deleted stay deleted, and calling it again finishes the job. `tags`
+   * must not be empty.
+   */
+  async destroyAll(options: DestroyAllOptions): Promise<string[]> {
+    return this.client.destroyAll(options.tags);
   }
 
   async resize(id: string, options: ResizeOptions): Promise<Sandbox> {

@@ -255,3 +255,72 @@ func TestGetOrCreate(t *testing.T) {
 		}
 	})
 }
+
+func TestDestroyAll(t *testing.T) {
+	ctx := context.Background()
+	tags := map[string]string{"run": "42", "team": "x"}
+	t.Run("deletes every match across pages", func(t *testing.T) {
+		f, client := newFakeSandboxd(t, 0)
+		var doomed []string
+		for i := range 5 {
+			doomed = append(doomed, f.add(fmt.Sprintf("a-%d", i), tags, "alpine"))
+		}
+		kept := []string{f.add("other", map[string]string{"run": "41", "team": "x"}, "alpine"), f.add("untagged", nil, "alpine")}
+		gone, err := client.DestroyAll(ctx, tags)
+		if err != nil || strings.Join(gone, ",") != strings.Join(doomed, ",") {
+			t.Fatalf("DestroyAll = (%v, %v), want %v", gone, err, doomed)
+		}
+		if len(f.sandboxes) != len(kept) || f.count("GET") != 3 || f.count("DELETE") != 5 {
+			t.Fatalf("left %v after %q", f.sandboxes, f.requests)
+		}
+		again, err := client.DestroyAll(ctx, tags)
+		if err != nil || len(again) != 0 {
+			t.Fatalf("second DestroyAll = (%v, %v), want nothing", again, err)
+		}
+	})
+	t.Run("an already gone sandbox counts as deleted", func(t *testing.T) {
+		f, client := newFakeSandboxd(t, 0)
+		first, second := f.add("a", tags, "alpine"), f.add("b", tags, "alpine")
+		f.deleteStatus[first] = http.StatusNotFound
+		gone, err := client.DestroyAll(ctx, tags)
+		if err != nil || len(gone) != 2 || gone[0] != first || gone[1] != second {
+			t.Fatalf("DestroyAll = (%v, %v)", gone, err)
+		}
+	})
+	t.Run("a failed delete stops and reports what was deleted", func(t *testing.T) {
+		f, client := newFakeSandboxd(t, 0)
+		first, second, third := f.add("a", tags, "alpine"), f.add("b", tags, "alpine"), f.add("c", tags, "alpine")
+		f.deleteStatus[second] = http.StatusInternalServerError
+		gone, err := client.DestroyAll(ctx, tags)
+		var apiErr *APIError
+		if !errors.As(err, &apiErr) || apiErr.StatusCode != http.StatusInternalServerError || !strings.Contains(err.Error(), second) {
+			t.Fatalf("DestroyAll error = %v", err)
+		}
+		if len(gone) != 1 || gone[0] != first {
+			t.Fatalf("gone = %v, want [%s]", gone, first)
+		}
+		if _, ok := f.sandboxes[third]; !ok || f.count("DELETE") != 2 {
+			t.Fatalf("third sandbox touched: %q", f.requests)
+		}
+	})
+	t.Run("needs a tag", func(t *testing.T) {
+		f, client := newFakeSandboxd(t, 0)
+		if _, err := client.DestroyAll(ctx, nil); err == nil {
+			t.Fatal("DestroyAll(nil) succeeded")
+		}
+		if len(f.requests) != 0 {
+			t.Fatalf("requests = %q", f.requests)
+		}
+	})
+	t.Run("a list failure is returned", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = w.Write([]byte(`{"error":"no"}`))
+		}))
+		defer server.Close()
+		client, _ := NewClientWithConfig(&sdktypes.MicroVMConfig{PATToken: "pat", APIUrl: server.URL})
+		if _, err := client.DestroyAll(ctx, tags); !errors.Is(err, ErrAuth) {
+			t.Fatalf("DestroyAll error = %v, want ErrAuth", err)
+		}
+	})
+}

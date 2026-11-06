@@ -118,3 +118,48 @@ func TestParitySDKGetOrCreateLive(t *testing.T) {
 		t.Fatalf("second GetOrCreate = (%v, %v, %v), want %s not created", again, created, err, byName.ID)
 	}
 }
+
+// UC-448 — delete many by tag (plan S5): DestroyAll with a tag unique to
+// this run deletes the three sandboxes carrying it (and returns their IDs),
+// leaves a sandbox with another tag value alone, and a second call finds
+// nothing and returns no IDs.
+func TestParitySDKDestroyAllLive(t *testing.T) {
+	harness.Require(t, sc, "UC-448")
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Minute)
+	defer cancel()
+	c := client(t)
+	run := harness.UniqueName(sc, t)
+	var doomed []string
+	for range 3 {
+		sb := c.NewSandbox(t, sdktypes.CreateSandboxOptions{Name: harness.UniqueName(sc, t), Tags: map[string]string{"uc448": run}})
+		doomed = append(doomed, sb.ID)
+	}
+	kept := c.NewSandbox(t, sdktypes.CreateSandboxOptions{Name: harness.UniqueName(sc, t), Tags: map[string]string{"uc448": run + "-keep"}})
+
+	gone, err := c.SDK().DestroyAll(ctx, map[string]string{"uc448": run})
+	if err != nil {
+		t.Fatalf("DestroyAll: %v", err)
+	}
+	if len(gone) != len(doomed) {
+		t.Fatalf("DestroyAll returned %v, want the three sandboxes %v", gone, doomed)
+	}
+	want := map[string]bool{}
+	for _, id := range doomed {
+		want[id] = true
+	}
+	for _, id := range gone {
+		if !want[id] {
+			t.Fatalf("DestroyAll deleted %s, which does not carry the tag", id)
+		}
+		if _, err := c.SDK().Get(ctx, id); !errors.Is(err, microvm.ErrNotFound) {
+			t.Fatalf("Get(%s) after DestroyAll = %v, want ErrNotFound", id, err)
+		}
+	}
+	if _, err := c.SDK().Get(ctx, kept.ID); err != nil {
+		t.Fatalf("the sandbox with another tag value is gone: %v", err)
+	}
+	again, err := c.SDK().DestroyAll(ctx, map[string]string{"uc448": run})
+	if err != nil || len(again) != 0 {
+		t.Fatalf("second DestroyAll = (%v, %v), want nothing to delete", again, err)
+	}
+}

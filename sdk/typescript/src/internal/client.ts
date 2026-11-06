@@ -11,7 +11,14 @@ import {
   sandboxCustomDomainPath as v1SandboxCustomDomainPath,
   sandboxCustomDomainsPath as v1SandboxCustomDomainsPath,
 } from "./api/v1/paths.js";
-import { MicroVMApiError, MicroVMConflictError, MicroVMFileTooLargeError, MicroVMUnsupportedFeatureError, apiErrorFor } from "../errors.js";
+import {
+  MicroVMApiError,
+  MicroVMConflictError,
+  MicroVMFileTooLargeError,
+  MicroVMNotFoundError,
+  MicroVMUnsupportedFeatureError,
+  apiErrorFor,
+} from "../errors.js";
 import { Image } from "../Image.js";
 import type {
   AddCustomDomainOptions,
@@ -1202,6 +1209,31 @@ export class APIClient {
 
   async destroy(id: string): Promise<void> {
     await this.doJSON<void>("DELETE", `${this.versionPrefix}/sandboxes/${id}`);
+  }
+
+  /**
+   * Deletes every sandbox carrying all of `tags`, one at a time, after
+   * listing every page; returns the IDs now gone. A 404 counts as deleted,
+   * so the call is safe to repeat. Any other failure stops it and is thrown.
+   */
+  async destroyAll(tags: Record<string, string>): Promise<string[]> {
+    if (!tags || Object.keys(tags).length === 0) {
+      throw new Error("destroyAll needs at least one tag; with none it would delete every sandbox you own");
+    }
+    const ids: string[] = [];
+    for await (const page of this.listPages({ tags })) {
+      ids.push(...page.map((sandbox) => sandbox.id));
+    }
+    const gone: string[] = [];
+    for (const id of ids) {
+      try {
+        await this.destroy(id);
+      } catch (err) {
+        if (!(err instanceof MicroVMNotFoundError)) throw err;
+      }
+      gone.push(id);
+    }
+    return gone;
   }
 
   async resize(id: string, options: ResizeOptions): Promise<SandboxResource> {

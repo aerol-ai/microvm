@@ -785,6 +785,54 @@ Resize works for container and WebAssembly sandboxes. Firecracker and V8 isolate
   </TabItem>
 </Tabs>
 
+### Delete many sandboxes by tag
+
+`destroyAll` deletes every sandbox of yours that has all the [tags](/sandbox-tags/) you give it. It returns the IDs of the sandboxes it deleted. This is handy for cleaning up after a test run or a job, when you tagged each sandbox it made.
+
+- **It needs at least one tag.** With no tag it would delete every sandbox you own, so the SDK refuses.
+- **It is safe to run again.** A sandbox that is already gone counts as deleted. A second run finds nothing left and returns an empty list.
+- **It stops at the first real failure.** The sandboxes it already deleted stay deleted. Run it again to finish the job.
+- **It deletes one sandbox at a time,** after it has read the whole list.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const deleted = await client.destroyAll({ tags: { run: "nightly-42" } });
+    console.log(`deleted ${deleted.length} sandboxes`);
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    deleted = client.destroy_all(tags={"run": "nightly-42"})
+    print(f"deleted {len(deleted)} sandboxes")
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    deleted, err := client.DestroyAll(ctx, map[string]string{"run": "nightly-42"})
+    if err != nil {
+        log.Fatal(err)
+    }
+    fmt.Printf("deleted %d sandboxes\n", len(deleted))
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    let tags = HashMap::from([("run".to_string(), "nightly-42".to_string())]);
+    let deleted = client.destroy_all(&tags)?;
+    println!("deleted {} sandboxes", deleted.len());
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    List<String> deleted = client.destroyAll(Map.of("run", "nightly-42"));
+    System.out.println("deleted " + deleted.size() + " sandboxes");
+    ```
+  </TabItem>
+</Tabs>
+
+In Go, a failed delete also returns the IDs deleted before it.
+
 ## Sandbox states
 
 ```mermaid
