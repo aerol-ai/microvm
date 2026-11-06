@@ -133,6 +133,10 @@ func RegisterRoutes(mux apihttp.Mux, d Deps) {
 	// most a token can grant. Forwarded to the owner, which reads the row;
 	// not idempotent by nature (each call mints a new token).
 	mux.Handle("POST "+PathPrefix+"/sandboxes/{id}/tokens", d.Route(permExec, wrap(http.HandlerFunc(h.createSandboxToken))))
+	// Revoking every token issued so far: the same permission and the same
+	// owner forward (the owner's row holds the not-before every check
+	// reads). Idempotent in effect.
+	mux.Handle("POST "+PathPrefix+"/sandboxes/{id}/tokens/revoke", d.Route(permExec, wrap(http.HandlerFunc(h.revokeSandboxTokens))))
 	// Custom domains (plans/custom-domains.md). Gated server-side by
 	// SB_ENABLE_CUSTOM_DOMAINS — routes are always mounted (so a request
 	// hits a 412 rather than a 404 when the cluster has the feature off)

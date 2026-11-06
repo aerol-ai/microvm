@@ -198,6 +198,50 @@ func TestTokenGateRefusals(t *testing.T) {
 	}
 }
 
+// A revoke (the not-before PortAccess hands over) refuses a token issued
+// before it, as ?token= (no cookie is set) and as the cookie a browser
+// already holds, before the wake path or the app. A token issued after it
+// works. A revoked token for another port still names the part it does not
+// cover: scope is checked first.
+func TestTokenGateRefusesARevokedToken(t *testing.T) {
+	keys := newTestKeys()
+	up := &gateUpstream{}
+	ts := up.server(t)
+	old := keys.token(t, "sb1", 8080, "", time.Hour)
+	res := &fakeResolver{target: ts.URL, started: true, gated: true, notBefore: time.Now().Unix() + 1}
+	h := gatedHandler(res, keys, nil)
+
+	for name, rr := range map[string]*httptest.ResponseRecorder{
+		"?token=": gateDo(h, http.MethodGet, PathPrefix+"/sb1/8080/app?token="+old, ""),
+		"cookie":  gateDo(h, http.MethodGet, PathPrefix+"/sb1/8080/app", TokenCookieName+"="+old),
+	} {
+		if rr.Code != http.StatusUnauthorized || !strings.Contains(rr.Body.String(), "revoked") {
+			t.Fatalf("%s: %d %s, want 401 revoked", name, rr.Code, rr.Body.String())
+		}
+		if rr.Header().Get("Set-Cookie") != "" || strings.Contains(rr.Body.String(), old) {
+			t.Fatalf("%s: the refusal set a cookie or echoed the token", name)
+		}
+	}
+	if rr := gateDo(h, http.MethodGet, PathPrefix+"/sb1/8080/app?token="+keys.token(t, "sb1", 9090, "", time.Hour), ""); rr.Code != http.StatusForbidden || !strings.Contains(rr.Body.String(), "port") {
+		t.Fatalf("a revoked token for another port: %d %s", rr.Code, rr.Body.String())
+	}
+	if up.calls != 0 || res.callCnt != 0 {
+		t.Fatalf("a revoked token reached the app (%d) or the wake path (%d)", up.calls, res.callCnt)
+	}
+
+	// Issued after the revoke (the service lifts it to the not-before).
+	id, _ := sandboxtoken.NewTokenID()
+	fresh, _, err := sandboxtoken.Sign(keys, sandboxtoken.Claims{
+		TokenID: id, SandboxID: "sb1", Port: 8080, IssuedAt: res.notBefore, ExpiresAt: res.notBefore + 3600,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rr := gateDo(h, http.MethodGet, PathPrefix+"/sb1/8080/app", TokenCookieName+"="+fresh); rr.Code != http.StatusOK || up.calls != 1 {
+		t.Fatalf("a token issued after the revoke: %d %s", rr.Code, rr.Body.String())
+	}
+}
+
 // Two cookies of the name (one stale): the good one lets the request in.
 func TestTokenGateAnyGoodCookie(t *testing.T) {
 	keys := newTestKeys()

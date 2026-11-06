@@ -208,6 +208,7 @@ var routePermissions = map[string]string{
 	"POST /v1/sandboxes/{id}/custom-domains":                   "sandbox.write",
 	"POST /v1/sandboxes/{id}/ports/{port}":                     "sandbox.write",
 	"POST /v1/sandboxes/{id}/tokens":                           "sandbox.exec",
+	"POST /v1/sandboxes/{id}/tokens/revoke":                    "sandbox.exec",
 	"POST /v1/sandboxes/{id}/resize":                           "sandbox.write",
 	"POST /v1/sandboxes/{id}/snapshot":                         "sandbox.write",
 	"POST /v1/sandboxes/{id}/start":                            "sandbox.write",

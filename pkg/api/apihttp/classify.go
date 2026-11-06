@@ -278,6 +278,8 @@ func Classify(err error) Classification {
 		return Classification{Status: http.StatusBadRequest, Message: err.Error()}
 	case errors.Is(err, service.ErrSandboxTokensUnavailable):
 		return Classification{Status: http.StatusServiceUnavailable, Message: service.ErrSandboxTokensUnavailable.Error(), Log: true, LogLevel: slog.LevelWarn}
+	case errors.Is(err, service.ErrSandboxTokenRevoked):
+		return Classification{Status: http.StatusUnauthorized, Message: service.ErrSandboxTokenRevoked.Error()}
 
 	case errors.Is(err, store.ErrSandboxNameConflict):
 		return Classification{Status: http.StatusConflict, Message: "sandbox name already in use", Kind: ErrKindSandboxNameConflict}

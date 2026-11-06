@@ -35,6 +35,8 @@ type fakeResolver struct {
 	startedErr error
 	// gated marks the port token-gated (A2).
 	gated bool
+	// notBefore is the sandbox's tokens_not_before (a token revoke).
+	notBefore int64
 	// mask, when set, is returned as PortEndpoint.MaskRequestHost so wake-path
 	// Host-rewrite behavior can be exercised.
 	mask string
@@ -57,7 +59,7 @@ func (f *fakeResolver) TouchSandbox(_ context.Context, id string) error {
 }
 
 func (f *fakeResolver) PortAccess(_ context.Context, _ string, _ int) (service.PortAccess, error) {
-	return service.PortAccess{Started: f.started, TokenGated: f.gated}, f.startedErr
+	return service.PortAccess{Started: f.started, TokenGated: f.gated, TokensNotBefore: f.notBefore}, f.startedErr
 }
 
 func newHandler(resolver PortResolver, max int64) http.Handler {

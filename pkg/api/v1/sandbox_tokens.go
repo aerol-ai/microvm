@@ -11,7 +11,8 @@ import (
 // Sandbox tokens (plans/agent-sandbox-feature-parity.md §5.9, A1; threat
 // model in pkg/sandboxtoken).
 //
-//	POST /v1/sandboxes/{id}/tokens  sandbox.exec  201 {token once, token_id, scope, expires_at}
+//	POST /v1/sandboxes/{id}/tokens         sandbox.exec  201 {token once, token_id, scope, expires_at}
+//	POST /v1/sandboxes/{id}/tokens/revoke  sandbox.exec  200 {sandbox_id, tokens_not_before}
 //
 // sandbox.exec, because a toolbox token reaches exec and files, which is
 // sandbox.exec, and a port token reaches the sandbox's own web server; no
@@ -40,4 +41,19 @@ func (h *handlers) createSandboxToken(w http.ResponseWriter, r *http.Request) {
 	// The body holds a credential: never cache it anywhere on the way.
 	w.Header().Set("Cache-Control", "no-store")
 	apihttp.WriteJSON(w, http.StatusCreated, created)
+}
+
+// revokeSandboxTokens refuses every token issued for the sandbox so far
+// (service.RevokeSandboxTokens). Same permission as issuing, since it only
+// undoes what issuing grants, and owner-forwarded the same way: the owner
+// holds the row the check reads. No body. Idempotent in effect: a retry
+// refuses the same tokens again and answers the same shape. The call's api
+// record names the sandbox, from the path, like every per-sandbox route.
+func (h *handlers) revokeSandboxTokens(w http.ResponseWriter, r *http.Request) {
+	revoked, err := h.deps.Service.RevokeSandboxTokens(r.Context(), r.PathValue("id"))
+	if err != nil {
+		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
+		return
+	}
+	apihttp.WriteJSON(w, http.StatusOK, revoked)
 }

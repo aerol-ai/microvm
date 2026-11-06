@@ -101,7 +101,7 @@ func (h *handlers) serveSandboxPort(w http.ResponseWriter, r *http.Request, id s
 	started := access.Started
 	// The token gate runs before any body is buffered, a wake slot is
 	// taken or a stopped sandbox is started (A2, token_gate.go).
-	if access.TokenGated && !h.gatePort(w, r, id, port, upstreamPath) {
+	if access.TokenGated && !h.gatePort(w, r, id, port, upstreamPath, access.TokensNotBefore) {
 		return
 	}
 

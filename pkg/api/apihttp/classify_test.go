@@ -44,6 +44,7 @@ func TestClassify(t *testing.T) {
 		{"token visibility conflict", service.ErrTokenVisibilityConflict, http.StatusConflict, 0, "", ErrKindOther},
 		{"sandbox token request invalid", fmt.Errorf("%w: expires_in is required", service.ErrSandboxTokenInvalid), http.StatusBadRequest, 0, "", ErrKindOther},
 		{"sandbox tokens unavailable", service.ErrSandboxTokensUnavailable, http.StatusServiceUnavailable, 0, "", ErrKindOther},
+		{"sandbox token revoked", service.ErrSandboxTokenRevoked, http.StatusUnauthorized, 0, "", ErrKindOther},
 		// Load shedding: a fast retryable 503, never the 400 catch-all.
 		{"overloaded", ErrOverloaded, http.StatusServiceUnavailable, OverloadedRetryAfterSeconds, models.ErrorCodeOverloaded, ErrKindOther},
 		{"overloaded while the caller left", fmt.Errorf("%w: %w", ErrOverloaded, context.Canceled), http.StatusServiceUnavailable, OverloadedRetryAfterSeconds, models.ErrorCodeOverloaded, ErrKindOther},

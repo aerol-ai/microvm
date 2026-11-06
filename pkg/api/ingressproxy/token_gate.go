@@ -8,13 +8,18 @@ package ingressproxy
 // wake slot is taken and no sandbox is started for a request without a
 // good token.
 //
-//	?token=<t> ── verify + scope ── bad ─► 401 / 403, no cookie
+//	?token=<t> ── verify + scope + not revoked ── bad ─► 401 / 403, no cookie
 //	           └─ good ─► Set-Cookie __Host-aerolvm-token (Secure, HttpOnly,
 //	                      SameSite=Lax, Path=/, no Domain) + 302 to the same
 //	                      URL without the token
-//	cookie     ── verify + scope ── bad ─► 401 / 403
+//	cookie     ── verify + scope + not revoked ── bad ─► 401 / 403
 //	           └─ good ─► cookie removed from the request ─► proxy
 //	neither    ─► 401
+//
+// The cookie holds the token itself, so it is checked exactly like the
+// token on every request: a revoke refuses a cookie set before it. The
+// not-before comes from the same PortAccess read as the gate (no store
+// read of its own).
 //
 // The cookie is host-only (__Host- forbids a Domain), and each port has its
 // own host (<id>-<port>.<domain>), so a page on one sandbox's host can never
@@ -44,13 +49,14 @@ const TokenQueryParam = "token"
 // anything about the sandbox.
 const noTokenMessage = "this URL needs a sandbox token: open it with ?token=<token>"
 
-// gatePort checks a request for a token-gated port. It returns true when
-// the request may be proxied (and has removed the cookie from it), and
-// false when it wrote the answer itself (a refusal or the redirect).
-func (h *handlers) gatePort(w http.ResponseWriter, r *http.Request, id string, port int, upstreamPath string) bool {
+// gatePort checks a request for a token-gated port. notBefore is the
+// sandbox's tokens_not_before (PortAccess). It returns true when the request
+// may be proxied (and has removed the cookie from it), and false when it
+// wrote the answer itself (a refusal or the redirect).
+func (h *handlers) gatePort(w http.ResponseWriter, r *http.Request, id string, port int, upstreamPath string, notBefore int64) bool {
 	scope := sandboxtoken.Request{SandboxID: id, Port: port, Path: upstreamPath, Method: r.Method}
 	if raw, ok := tokenFromQuery(r.URL.RawQuery); ok {
-		claims, err := h.checkPortToken(raw, scope)
+		claims, err := h.checkPortToken(raw, scope, notBefore)
 		if err != nil {
 			writeGateRefusal(w, err)
 			return false
@@ -83,7 +89,7 @@ func (h *handlers) gatePort(w http.ResponseWriter, r *http.Request, id string, p
 	// on this same host set one; any that covers the request lets it in.
 	var lastErr error
 	for _, raw := range cookies {
-		if _, err := h.checkPortToken(raw, scope); err != nil {
+		if _, err := h.checkPortToken(raw, scope, notBefore); err != nil {
 			lastErr = err
 			continue
 		}
@@ -94,8 +100,9 @@ func (h *handlers) gatePort(w http.ResponseWriter, r *http.Request, id string, p
 	return false
 }
 
-// checkPortToken verifies raw (no store read) and checks it covers scope.
-func (h *handlers) checkPortToken(raw string, scope sandboxtoken.Request) (sandboxtoken.Claims, error) {
+// checkPortToken verifies raw (no store read), checks it covers scope and
+// was not issued before notBefore.
+func (h *handlers) checkPortToken(raw string, scope sandboxtoken.Request, notBefore int64) (sandboxtoken.Claims, error) {
 	if h.deps.Tokens == nil {
 		return sandboxtoken.Claims{}, sandboxtoken.ErrInvalidSignature
 	}
@@ -104,6 +111,11 @@ func (h *handlers) checkPortToken(raw string, scope sandboxtoken.Request) (sandb
 		return sandboxtoken.Claims{}, err
 	}
 	if err := claims.Allows(scope); err != nil {
+		return sandboxtoken.Claims{}, err
+	}
+	// After the scope check: a revoked token for another sandbox or port
+	// still says which part it does not cover, as it did before.
+	if err := claims.CheckNotBefore(notBefore); err != nil {
 		return sandboxtoken.Claims{}, err
 	}
 	return claims, nil
@@ -128,6 +140,8 @@ func writeGateRefusal(w http.ResponseWriter, err error) {
 		reason = "too_long_lived"
 	case errors.Is(err, sandboxtoken.ErrInvalidSignature):
 		reason = "invalid_signature"
+	case errors.Is(err, sandboxtoken.ErrRevoked):
+		reason = "revoked"
 	}
 	apihttp.WriteError(w, http.StatusUnauthorized, "sandbox token refused: "+reason)
 }
