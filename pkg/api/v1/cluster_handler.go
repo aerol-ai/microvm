@@ -2257,3 +2257,38 @@ func normalizeCreateRuntimeForPlacement(req *models.CreateSandboxRequest) error 
 	req.Runtime = chosenRuntime
 	return nil
 }
+
+// destroyAtUpgradeGate refuses a lifecycle update that sets destroy_at while
+// some live cluster member runs a build before L6 (cluster.DestroyAtGate):
+// forwarded to such an owner, the update would arrive without the field and
+// clear every timer the sandbox had. It runs before the forward, on the node
+// the caller reached. A single node, and a body without destroy_at, pass
+// through untouched.
+func (h *handlers) destroyAtUpgradeGate(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var gate cluster.DestroyAtGate
+		if h.deps.Service != nil {
+			gate, _ = h.deps.Service.Cluster().(cluster.DestroyAtGate)
+		}
+		if gate == nil {
+			next.ServeHTTP(w, r)
+			return
+		}
+		raw, err := apihttp.ReadJSONBody(w, r)
+		_ = r.Body.Close()
+		if err != nil {
+			apihttp.WriteError(w, http.StatusBadRequest, "read body: "+err.Error())
+			return
+		}
+		r.Body = io.NopCloser(bytes.NewReader(raw))
+		r.ContentLength = int64(len(raw))
+		var fields map[string]json.RawMessage
+		if json.Unmarshal(raw, &fields) == nil {
+			if v, ok := fields["destroy_at"]; ok && string(v) != "null" && !gate.DestroyAtAllowed() {
+				apihttp.WriteError(w, http.StatusBadRequest, "destroy_at in a lifecycle update needs every cluster node on this release; finish upgrading the cluster first (a create with destroy_at works now)")
+				return
+			}
+		}
+		next.ServeHTTP(w, r)
+	})
+}

@@ -206,7 +206,7 @@ The server rejects these with a `400` error:
 
 As with every timer, the delete can come up to a minute late.
 
-In a cluster that is part way through an upgrade, wait until every server runs this release before you send `destroyAt` to `updateLifecycle`. A server on an older release does not know `destroyAt`, so it would take the update as one with no timers and clear them all. A create is safe when the server you call runs this release: it turns the time into `destroyAtAge` before it passes the create on, and every release reads that. A server on an older release that you call directly drops `destroyAt`, so the sandbox gets no delete time.
+In a cluster that is part way through an upgrade, `updateLifecycle` with `destroyAt` is refused with a `400` until every server runs this release. A server on an older release does not know `destroyAt`, so it would take the update as one with no timers and clear them all. A create is safe when the server you call runs this release: it turns the time into `destroyAtAge` before it passes the create on, and every release reads that. A server on an older release that you call directly drops `destroyAt`, so the sandbox gets no delete time.
 
 ## Delete when the program ends
 

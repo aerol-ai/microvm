@@ -124,7 +124,9 @@ func RegisterRoutes(mux apihttp.Mux, d Deps) {
 	mux.Handle("DELETE "+PathPrefix+"/sandboxes/{id}", d.Route(permWrite, wrap(http.HandlerFunc(h.clusterDestroyWrap))))
 	mux.Handle("POST "+PathPrefix+"/sandboxes/{id}/resize", d.Route(permWrite, wrap(http.HandlerFunc(h.resizeSandbox))))
 	mux.Handle("POST "+PathPrefix+"/sandboxes/{id}/snapshot", d.Route(permWrite, wrap(http.HandlerFunc(h.createSnapshot))))
-	mux.Handle("PUT "+PathPrefix+"/sandboxes/{id}/lifecycle", d.Route(permWrite, wrap(http.HandlerFunc(h.updateLifecycle))))
+	// destroy_at is checked against the cluster's builds before the forward
+	// (an older owner would drop it and clear every timer).
+	mux.Handle("PUT "+PathPrefix+"/sandboxes/{id}/lifecycle", d.Route(permWrite, h.destroyAtUpgradeGate(wrap(http.HandlerFunc(h.updateLifecycle)))))
 	mux.Handle("POST "+PathPrefix+"/sandboxes/{id}/ports/{port}", d.Route(permWrite, wrap(http.HandlerFunc(h.exposePort))))
 	mux.Handle("DELETE "+PathPrefix+"/sandboxes/{id}/ports/{port}", d.Route(permWrite, wrap(http.HandlerFunc(h.unexposePort))))
 	// Signed per-sandbox tokens (A1, pkg/sandboxtoken): sandbox.exec, the
