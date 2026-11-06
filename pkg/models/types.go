@@ -981,10 +981,15 @@ type Sandbox struct {
 	// ProgramExitedAt is when the main program ended, as the lifecycle
 	// sweep recorded it from toolboxd (L5); nil while it runs, and cleared
 	// when the sandbox starts again. destroy_after_exit_for counts from it.
-	ProgramExitedAt  *time.Time `json:"-"`
-	ContainerCommand []string   `json:"container_command,omitempty"`
-	Lifecycle        Lifecycle  `json:"lifecycle"`
-	Failover         *Failover  `json:"failover,omitempty"`
+	ProgramExitedAt *time.Time `json:"-"`
+	// TokensNotBefore is the unix second before which a sandbox token for
+	// this sandbox is refused (pkg/sandboxtoken): set by a revoke and when
+	// a row is created, 0 when neither ever happened. It lives only in the
+	// owner node's row, never on the wire or in Raft.
+	TokensNotBefore  int64     `json:"-"`
+	ContainerCommand []string  `json:"container_command,omitempty"`
+	Lifecycle        Lifecycle `json:"lifecycle"`
+	Failover         *Failover `json:"failover,omitempty"`
 	// FailoverReady is set on Get/List when failover.policy=recreate: true iff
 	// the secret holder count meets HA (owner + ≥1 backup) or the recipient
 	// set is single-node (len≤1). Omitted for non-recreate sandboxes.

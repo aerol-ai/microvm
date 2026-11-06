@@ -1119,6 +1119,12 @@ func open(path string, secretCipher *secrets.Cipher) (*Store, error) {
 		// program runs.
 		`ALTER TABLE sandboxes ADD COLUMN destroy_after_exit_for_ns INTEGER NOT NULL DEFAULT 0;`,
 		`ALTER TABLE sandboxes ADD COLUMN program_exited_at DATETIME;`,
+		// Sandbox token revoke (pkg/sandboxtoken): the unix second before
+		// which every token issued for this sandbox is refused. 0 for every
+		// pre-migration row: nothing was ever revoked. It only moves forward
+		// (Upsert and RevokeSandboxTokens keep the larger value), so a
+		// whole-row write from a read taken before a revoke cannot undo it.
+		`ALTER TABLE sandboxes ADD COLUMN tokens_not_before INTEGER NOT NULL DEFAULT 0;`,
 		// Checkpoint pushes are async and outlive their sandbox: without the
 		// lifecycle they were started for, a push that lands after the id is
 		// reused writes the old incarnation's artifact into the new one.
@@ -2226,8 +2232,9 @@ func (s *Store) insertSandbox(ctx context.Context, exec dbExecer, sandbox *model
 			tenant_id, audit_incarnation_id,
 			status_reason, exit_code,
 			restart_on_failure, restart_failures, restart_at, last_restarted_at,
-			destroy_after_exit_for_ns, program_exited_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			destroy_after_exit_for_ns, program_exited_at,
+			tokens_not_before
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`,
 		sandbox.ID,
 		sandbox.Image,
@@ -2293,6 +2300,7 @@ func (s *Store) insertSandbox(ctx context.Context, exec dbExecer, sandbox *model
 		nullableTime(sandbox.LastRestartedAt),
 		int64(sandbox.Lifecycle.DestroyAfterExitFor),
 		nullableTime(sandbox.ProgramExitedAt),
+		sandbox.TokensNotBefore,
 	)
 	if err != nil {
 		if isSandboxNameConflict(err, sandbox.Name) {
@@ -2472,6 +2480,10 @@ func (s *Store) Upsert(ctx context.Context, sandbox *models.Sandbox) error {
 	// program_exited_at is written only by RecordProgramExit, and cleared
 	// here only on a write that starts the sandbox: a start runs the main
 	// program again, while a stop keeps the exit and its destroy timer.
+	//
+	// tokens_not_before keeps the larger of the two values: a whole-row
+	// write from a read taken before a token revoke would otherwise lower
+	// it and bring every revoked token back.
 	_, err = exec.ExecContext(ctx, `
 		INSERT INTO sandboxes (
 			id, image, status, public_url, container_id, container_ip, cpu, memory_mb, disk_gb,
@@ -2495,8 +2507,9 @@ func (s *Store) Upsert(ctx context.Context, sandbox *models.Sandbox) error {
 			tenant_id, audit_incarnation_id,
 			status_reason, exit_code,
 			restart_on_failure, restart_failures, restart_at, last_restarted_at,
-			destroy_after_exit_for_ns, program_exited_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			destroy_after_exit_for_ns, program_exited_at,
+			tokens_not_before
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			image = excluded.image,
 			status = excluded.status,
@@ -2570,7 +2583,8 @@ func (s *Store) Upsert(ctx context.Context, sandbox *models.Sandbox) error {
 			program_exited_at = CASE
 				WHEN excluded.status = 'started' AND sandboxes.status <> 'started' THEN NULL
 				ELSE sandboxes.program_exited_at
-			END
+			END,
+			tokens_not_before = MAX(sandboxes.tokens_not_before, excluded.tokens_not_before)
 	`,
 		sandbox.ID,
 		sandbox.Image,
@@ -2636,6 +2650,7 @@ func (s *Store) Upsert(ctx context.Context, sandbox *models.Sandbox) error {
 		nullableTime(sandbox.LastRestartedAt),
 		int64(sandbox.Lifecycle.DestroyAfterExitFor),
 		nullableTime(sandbox.ProgramExitedAt),
+		sandbox.TokensNotBefore,
 		boolToInt(sandbox.ToolboxToken != ""),
 	)
 	if err != nil {
@@ -2691,7 +2706,8 @@ func (s *Store) Get(ctx context.Context, id string) (*models.Sandbox, error) {
 			tenant_id, audit_incarnation_id,
 			status_reason, exit_code,
 			restart_on_failure, restart_failures, restart_at, last_restarted_at,
-			destroy_after_exit_for_ns, program_exited_at
+			destroy_after_exit_for_ns, program_exited_at,
+			tokens_not_before
 		FROM sandboxes
 		WHERE id = ?
 	`, id)
@@ -2763,7 +2779,8 @@ func (s *Store) List(ctx context.Context) ([]*models.Sandbox, error) {
 			tenant_id, audit_incarnation_id,
 			status_reason, exit_code,
 			restart_on_failure, restart_failures, restart_at, last_restarted_at,
-			destroy_after_exit_for_ns, program_exited_at
+			destroy_after_exit_for_ns, program_exited_at,
+			tokens_not_before
 		FROM sandboxes
 		ORDER BY created_at DESC
 	`)
@@ -2837,7 +2854,8 @@ func (s *Store) ListByOwner(ctx context.Context, ownerRef string) ([]*models.San
 			tenant_id, audit_incarnation_id,
 			status_reason, exit_code,
 			restart_on_failure, restart_failures, restart_at, last_restarted_at,
-			destroy_after_exit_for_ns, program_exited_at
+			destroy_after_exit_for_ns, program_exited_at,
+			tokens_not_before
 		FROM sandboxes
 		WHERE owner_ref = ?
 		ORDER BY created_at DESC
@@ -2898,7 +2916,8 @@ func (s *Store) ListByRuntime(ctx context.Context, runtime string) ([]*models.Sa
 			tenant_id, audit_incarnation_id,
 			status_reason, exit_code,
 			restart_on_failure, restart_failures, restart_at, last_restarted_at,
-			destroy_after_exit_for_ns, program_exited_at
+			destroy_after_exit_for_ns, program_exited_at,
+			tokens_not_before
 		FROM sandboxes
 		WHERE runtime = ?
 		ORDER BY created_at DESC
@@ -3379,6 +3398,29 @@ func (s *Store) SetWakeArmed(ctx context.Context, id string, armed bool) error {
 		return ErrNotFound
 	}
 	return nil
+}
+
+// RevokeSandboxTokens moves the sandbox's tokens_not_before forward to
+// notBefore and returns the value the row now holds. It never moves it
+// back: a second revoke with an older clock reading, or a retry, keeps the
+// later value, so a repeated call can only refuse more tokens, never bring
+// one back. updated_at is left alone, as nothing a caller reads about the
+// sandbox changed. Returns ErrNotFound if no row matches id.
+func (s *Store) RevokeSandboxTokens(ctx context.Context, id string, notBefore int64) (int64, error) {
+	var stored int64
+	err := s.db.QueryRowContext(ctx, `
+		UPDATE sandboxes
+		SET tokens_not_before = MAX(tokens_not_before, ?)
+		WHERE id = ?
+		RETURNING tokens_not_before
+	`, notBefore, id).Scan(&stored)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, ErrNotFound
+	}
+	if err != nil {
+		return 0, fmt.Errorf("revoke sandbox tokens: %w", err)
+	}
+	return stored, nil
 }
 
 // SetAllowPublicTraffic flips the public-exposure flag together with the
@@ -5653,6 +5695,7 @@ func (s *Store) scanSandbox(scanner interface {
 		&lastRestartedAt,
 		&destroyAfterExitNs,
 		&programExitedAt,
+		&sandbox.TokensNotBefore,
 	)
 	if err != nil {
 		return nil, err
