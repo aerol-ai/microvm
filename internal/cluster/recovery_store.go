@@ -104,12 +104,37 @@ type recoveryStoreSyncer interface {
 	SyncRef(ref string) error
 }
 
+// recoveryStoreSnapshotGuard keeps the blob GC that ends a snapshot
+// (RetainSnapshotRefs) off the blobs Put after that snapshot read its rows.
+// The GC keeps only the refs the last snapshots name, but the apply loop
+// goes on while a snapshot is encoded and written: a create applied in that
+// window has a live row whose blob no snapshot names yet, and the GC used to
+// delete it, so failover found no recovery spec for that sandbox.
+// placementFSM.Snapshot calls BeginSnapshot under the FSM lock, the same
+// lock every Put runs under, so no Put falls between the rows it reads and
+// the start of tracking; fsmSnapshot.Release calls EndSnapshot.
+type recoveryStoreSnapshotGuard interface {
+	BeginSnapshot()
+	EndSnapshot()
+}
+
 type placementRecoveryFileStore struct {
 	dir string
 
 	mu sync.Mutex
 	// dirty holds the blob paths Put since the last Sync.
 	dirty map[string]struct{}
+
+	// gcMu orders Put against the GC's remove of one blob: a Put that finds
+	// its blob already there and skips the write must not lose it to a
+	// remove that listed the directory before. It also guards the two
+	// fields below.
+	gcMu sync.Mutex
+	// openSnapshots counts the snapshots between BeginSnapshot and
+	// EndSnapshot. While any is open, putSince holds every ref Put, and the
+	// GC keeps those blobs.
+	openSnapshots int
+	putSince      map[string]struct{}
 }
 
 func newPlacementRecoveryFileStore(dir string) (*placementRecoveryFileStore, error) {
@@ -141,12 +166,19 @@ func (s *placementRecoveryFileStore) Put(sandboxID string, rec placementRecovery
 	if err := os.MkdirAll(s.dir, 0o700); err != nil {
 		return "", fmt.Errorf("placement recovery store: mkdir: %w", err)
 	}
+	s.gcMu.Lock()
+	defer s.gcMu.Unlock()
+	if s.openSnapshots > 0 {
+		s.putSince[ref] = struct{}{}
+	}
 	// The name is the payload's hash, so a blob already there with these
 	// bytes is this one: placement updates that keep a sandbox's recovery
 	// store it again on every change. Skipping the write also never renames
 	// unsynced bytes over a blob a snapshot already made durable. A blob
 	// with other bytes is one a crash cut short; it is written again.
 	if existing, err := os.ReadFile(path); err == nil && bytes.Equal(existing, payload) {
+		// Marked although it was already there: a sandboxd that crashed
+		// may have left it in the page cache only.
 		s.markDirty(path)
 		return ref, nil
 	}
@@ -166,10 +198,32 @@ func (s *placementRecoveryFileStore) Put(sandboxID string, rec placementRecovery
 	if err := os.Rename(tmpName, path); err != nil {
 		return "", fmt.Errorf("placement recovery store: rename: %w", err)
 	}
-	// Marked even when the blob was already there: a sandboxd that crashed
-	// may have left it in the page cache only.
 	s.markDirty(path)
 	return ref, nil
+}
+
+func (s *placementRecoveryFileStore) BeginSnapshot() {
+	s.gcMu.Lock()
+	defer s.gcMu.Unlock()
+	if s.openSnapshots == 0 {
+		s.putSince = make(map[string]struct{})
+	}
+	s.openSnapshots++
+}
+
+// EndSnapshot closes one BeginSnapshot. putSince is only dropped when no
+// snapshot is open: with two open, it holds the Puts since the older one,
+// more than the newer one needs, which only keeps a blob one GC longer.
+func (s *placementRecoveryFileStore) EndSnapshot() {
+	s.gcMu.Lock()
+	defer s.gcMu.Unlock()
+	if s.openSnapshots == 0 {
+		return
+	}
+	s.openSnapshots--
+	if s.openSnapshots == 0 {
+		s.putSince = nil
+	}
 }
 
 func (s *placementRecoveryFileStore) markDirty(path string) {
@@ -195,13 +249,11 @@ func (s *placementRecoveryFileStore) Sync() error {
 	if len(paths) == 0 {
 		return nil
 	}
-	for i, path := range paths {
-		if err := recoveryStoreFsync(path); err != nil {
-			for _, left := range paths[i:] {
-				s.markDirty(left)
-			}
-			return fmt.Errorf("placement recovery store: sync %s: %w", filepath.Base(path), err)
+	if failed, err := fsyncEach(paths); err != nil {
+		for _, left := range failed {
+			s.markDirty(left)
 		}
+		return fmt.Errorf("placement recovery store: %w", err)
 	}
 	if err := recoveryStoreFsync(s.dir); err != nil {
 		for _, left := range paths {
@@ -232,6 +284,44 @@ func (s *placementRecoveryFileStore) SyncRef(ref string) error {
 
 // recoveryStoreFsync is syncFile; tests count the fsyncs through it.
 var recoveryStoreFsync = syncFile
+
+// recoveryStoreSyncWorkers bounds the fsyncs a snapshot runs at once. A
+// snapshot can follow up to SnapshotThreshold entries, so up to ~1000 dirty
+// blobs; one after another at ~10 ms each on a busy gp3 disk that is ten
+// seconds, while concurrent fsyncs on one filesystem share journal commits.
+const recoveryStoreSyncWorkers = 16
+
+// fsyncEach fsyncs every path, recoveryStoreSyncWorkers at a time. It
+// returns the paths whose fsync failed and the first error.
+func fsyncEach(paths []string) (failed []string, firstErr error) {
+	work := make(chan string)
+	var (
+		mu sync.Mutex
+		wg sync.WaitGroup
+	)
+	for range min(recoveryStoreSyncWorkers, len(paths)) {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for path := range work {
+				if err := recoveryStoreFsync(path); err != nil {
+					mu.Lock()
+					failed = append(failed, path)
+					if firstErr == nil {
+						firstErr = fmt.Errorf("sync %s: %w", filepath.Base(path), err)
+					}
+					mu.Unlock()
+				}
+			}
+		}()
+	}
+	for _, path := range paths {
+		work <- path
+	}
+	close(work)
+	wg.Wait()
+	return failed, firstErr
+}
 
 // syncFile fsyncs path; a path already gone has nothing left to make
 // durable.
@@ -338,9 +428,24 @@ func (s *placementRecoveryFileStore) RetainSnapshotRefs(refs []string) error {
 		if _, ok := keep[ref]; ok {
 			continue
 		}
-		if err := os.Remove(filepath.Join(s.dir, entry.Name())); err != nil && !errors.Is(err, os.ErrNotExist) {
+		if err := s.removeUnlessPutSince(ref, filepath.Join(s.dir, entry.Name())); err != nil {
 			return fmt.Errorf("placement recovery store: gc: %w", err)
 		}
+	}
+	return nil
+}
+
+// removeUnlessPutSince removes a blob no kept snapshot names, unless it was
+// Put while a snapshot was open (recoveryStoreSnapshotGuard): then a live
+// row may name it that no snapshot has read yet.
+func (s *placementRecoveryFileStore) removeUnlessPutSince(ref, path string) error {
+	s.gcMu.Lock()
+	defer s.gcMu.Unlock()
+	if _, ok := s.putSince[ref]; ok {
+		return nil
+	}
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
 	}
 	return nil
 }

@@ -3666,7 +3666,20 @@ func (f *placementFSM) Snapshot() (raft.FSMSnapshot, error) {
 		identityRoles:      identityRoles,
 		recoveryStore:      f.recoveryStore,
 		recoveryRefs:       recoveryRefs,
+		guard:              beginRecoverySnapshot(f.recoveryStore),
 	}, nil
+}
+
+// beginRecoverySnapshot starts the store's tracking of Puts for a snapshot
+// (recoveryStoreSnapshotGuard). The caller holds the FSM lock, so no Put
+// can fall between the rows the snapshot read and this call.
+func beginRecoverySnapshot(store placementRecoveryStore) recoveryStoreSnapshotGuard {
+	guard, ok := store.(recoveryStoreSnapshotGuard)
+	if !ok {
+		return nil
+	}
+	guard.BeginSnapshot()
+	return guard
 }
 
 // Restore loads state from a previously written snapshot. Replaces in-memory
@@ -3912,6 +3925,10 @@ type fsmSnapshot struct {
 	teamQuotas         []TeamQuotaRecord
 	recoveryStore      placementRecoveryStore
 	recoveryRefs       []string
+	// guard is the store's Put tracking this snapshot began; Release ends
+	// it, once.
+	guard       recoveryStoreSnapshotGuard
+	releaseOnce sync.Once
 }
 
 func (s *fsmSnapshot) Persist(sink raft.SnapshotSink) (err error) {
@@ -3962,7 +3979,15 @@ func (s *fsmSnapshot) Persist(sink raft.SnapshotSink) (err error) {
 	return nil
 }
 
-func (s *fsmSnapshot) Release() {}
+// Release ends the store's Put tracking (recoveryStoreSnapshotGuard). Raft
+// calls it after Persist, whether Persist worked or not.
+func (s *fsmSnapshot) Release() {
+	s.releaseOnce.Do(func() {
+		if s.guard != nil {
+			s.guard.EndSnapshot()
+		}
+	})
+}
 
 type countingSnapshotSink struct {
 	raft.SnapshotSink
