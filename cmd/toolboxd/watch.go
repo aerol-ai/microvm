@@ -399,6 +399,13 @@ func watchOpenFailure(path string, err error) *watchRequestError {
 
 // handleFileWatch is GET /files/watch.
 func (s *server) handleFileWatch(w http.ResponseWriter, r *http.Request) {
+	// The runtime gate answers before any option is read, so an unsupported
+	// sandbox says 501 whatever the request holds (openFileWatch checks it
+	// again for the envd callers).
+	if !fileWatchAllowed() {
+		writeError(w, http.StatusNotImplemented, fileWatchUnsupportedMsg)
+		return
+	}
 	q := r.URL.Query()
 	recursive := false
 	if raw := strings.TrimSpace(q.Get("recursive")); raw != "" {

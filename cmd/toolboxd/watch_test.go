@@ -343,6 +343,7 @@ func TestFileWatchRefusedOnSharedKernel(t *testing.T) {
 	requests := []*http.Request{
 		httptest.NewRequest(http.MethodGet, "/files/watch?path=/does/not/matter", nil),
 		httptest.NewRequest(http.MethodGet, "/files/watch", nil),
+		httptest.NewRequest(http.MethodGet, "/files/watch?path=/tmp&recursive=sometimes", nil),
 	}
 	for _, rpc := range []string{"WatchDir", "CreateWatcher", "GetWatcherEvents", "RemoveWatcher"} {
 		requests = append(requests, httptest.NewRequest(http.MethodPost, envdPrefix+"/filesystem.Filesystem/"+rpc, strings.NewReader("not even json")))
