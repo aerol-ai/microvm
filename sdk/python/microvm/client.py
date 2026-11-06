@@ -11,6 +11,7 @@ import os
 import random
 import secrets
 import socket
+import ssl
 import threading
 import time
 import urllib.error
@@ -1067,6 +1068,9 @@ class MicroVM:
         api_version: str = _DEFAULT_API_VERSION,
         config: Optional[MicroVMConfig] = None,
         team: Optional[str] = None,
+        ca_file: Optional[str] = None,
+        client_cert: Union[str, Tuple[str, str], None] = None,
+        headers: Optional[Dict[str, str]] = None,
     ) -> None:
         """``pat_token`` is the bearer every request carries: the operator
         PAT, an avm_ API token or an OIDC ID token. It defaults to
@@ -1079,11 +1083,24 @@ class MicroVM:
         first matching binding. The header only chooses among teams the
         credential is already bound to: a team it does not hold is refused
         (403), and the operator PAT ignores it.
+
+        ``ca_file`` is a PEM file of the certificate authorities to trust
+        for ``https`` instead of the system's list: what a network that
+        inspects TLS (a company proxy) needs. ``client_cert`` is a client
+        certificate for servers or proxies that ask for one: a PEM file
+        holding the certificate and its key, or a ``(cert_file, key_file)``
+        pair. ``headers`` are sent on every request, WebSocket handshakes
+        included; they cannot replace the headers the SDK sets itself
+        (``Authorization``, ``X-AerolVM-Team``, ``Content-Type``,
+        ``Idempotency-Key``).
         """
         if config is not None:
             api_url = api_url or config.get("apiUrl")
             pat_token = pat_token or config.get("patToken")
             team = team or config.get("team")
+            ca_file = ca_file or config.get("caFile")
+            client_cert = client_cert or config.get("clientCert")
+            headers = headers if headers is not None else config.get("headers")
 
         self.api_url = _normalize_url(api_url or _read_env("SB_API_URL") or self.default_api_url)
         self.pat_token = pat_token or _read_env("SB_PAT_TOKEN") or _read_env("SB_API_TOKEN") or ""
@@ -1099,6 +1116,11 @@ class MicroVM:
 
         if not self.pat_token:
             raise MicroVMError(self.auth_required_error_message)
+
+        self._extra_headers: Dict[str, str] = _checked_headers(headers)
+        # Built once: loading a CA bundle per request would cost a file read
+        # and a parse on every call. None keeps urllib's default context.
+        self._ssl_context: Optional[ssl.SSLContext] = _build_ssl_context(ca_file, client_cert)
 
         if api_version not in _PATH_PREFIXES:
             raise MicroVMError(f"unsupported api_version {api_version!r}; supported: {sorted(_PATH_PREFIXES)}")
@@ -1915,7 +1937,7 @@ class MicroVM:
 
         websocket_module = _load_websocket_module()
         ws_url = _to_websocket_url(self.api_url, f"{self._version_prefix}/sandboxes/{urllib.parse.quote(sandbox_id, safe='')}/toolbox/process/exec/stream")
-        ws = _connect_websocket(websocket_module, ws_url, self._websocket_headers(), "exec stream")
+        ws = _connect_websocket(websocket_module, ws_url, self._websocket_headers(), "exec stream", self._ssl_context)
         ws.send(json.dumps(_to_api_exec_stream_request(options)))
         return ExecStreamHandle(websocket_module, ws, options)
 
@@ -1972,7 +1994,7 @@ class MicroVM:
             self.api_url,
             f"{self._version_prefix}/sandboxes/{urllib.parse.quote(sandbox_id, safe='')}/sessions/{urllib.parse.quote(session_id, safe='')}/attach",
         )
-        ws = _connect_websocket(websocket_module, ws_url, self._websocket_headers(), "session attach")
+        ws = _connect_websocket(websocket_module, ws_url, self._websocket_headers(), "session attach", self._ssl_context)
 
         cols = _first_of(attach_options, "cols")
         rows = _first_of(attach_options, "rows")
@@ -2190,7 +2212,7 @@ class MicroVM:
             self.api_url,
             f"{self._version_prefix}/sandboxes/{urllib.parse.quote(sandbox_id, safe='')}/toolbox/files/watch",
         ) + "?" + urllib.parse.urlencode(query)
-        ws = _connect_watch_websocket(websocket_module, ws_url, self._websocket_headers(), sandbox_id)
+        ws = _connect_watch_websocket(websocket_module, ws_url, self._websocket_headers(), sandbox_id, self._ssl_context)
         # Return only once toolboxd says the watch is armed, so a change the
         # caller makes right after this returns is never missed. The wait is
         # bounded: a proxy that accepts the upgrade and then goes quiet would
@@ -2503,7 +2525,8 @@ class MicroVM:
         return f"{self.api_url}{path}"
 
     def _websocket_headers(self) -> List[str]:
-        headers = [f"Authorization: Bearer {self.pat_token}"]
+        headers = [f"{name}: {value}" for name, value in self._extra_headers.items()]
+        headers.append(f"Authorization: Bearer {self.pat_token}")
         if self.team:
             headers.append(f"{TEAM_HEADER}: {self.team}")
         return headers
@@ -2581,7 +2604,13 @@ class MicroVM:
             if left is not None and left <= 0:
                 raise _deadline_error() from last_exc
             open_kwargs: Dict[str, Any] = {} if left is None else {"timeout": left}
+            if self._ssl_context is not None:
+                open_kwargs["context"] = self._ssl_context
             request = urllib.request.Request(url, data=body, method=method)
+            # The caller's extra headers go first, so the SDK's own below
+            # replace any clash rather than the other way round.
+            for header_key, header_val in self._extra_headers.items():
+                request.add_header(header_key, header_val)
             request.add_header("Authorization", f"Bearer {self.pat_token}")
             if self.team:
                 request.add_header(TEAM_HEADER, self.team)
@@ -2839,7 +2868,9 @@ def _load_websocket_module() -> Any:
     return importlib.import_module("websocket")
 
 
-def _connect_websocket(websocket_module: Any, ws_url: str, headers: List[str], label: str) -> Any:
+def _connect_websocket(
+    websocket_module: Any, ws_url: str, headers: List[str], label: str, ssl_context: Optional[ssl.SSLContext] = None
+) -> Any:
     """create_connection wrapper that surfaces HTTP status/body on bad
     handshake. websocket-client raises WebSocketBadStatusException for non-101
     responses, which carries .status_code and .resp_body but stringifies as
@@ -2848,12 +2879,13 @@ def _connect_websocket(websocket_module: Any, ws_url: str, headers: List[str], l
     are decipherable without a packet capture.
     """
     left = _time_left()
+    extra = _websocket_tls(ssl_context)
     try:
         if left is None:
-            return websocket_module.create_connection(ws_url, header=headers, enable_multithread=True)
+            return websocket_module.create_connection(ws_url, header=headers, enable_multithread=True, **extra)
         if left <= 0:
             raise _deadline_error()
-        ws = websocket_module.create_connection(ws_url, header=headers, enable_multithread=True, timeout=left)
+        ws = websocket_module.create_connection(ws_url, header=headers, enable_multithread=True, timeout=left, **extra)
         # The call's timeout covered opening the stream; the stream itself
         # runs as long as its command does.
         settimeout = getattr(ws, "settimeout", None)
@@ -2879,6 +2911,49 @@ def _connect_websocket(websocket_module: Any, ws_url: str, headers: List[str], l
         raise MicroVMError(" | ".join(parts)) from exc
 
 
+# Headers the SDK sets itself. A caller's header of the same name would be
+# overwritten on HTTP but sent twice on a WebSocket handshake, so it is
+# refused up front instead.
+_RESERVED_HEADERS = frozenset({"authorization", TEAM_HEADER.lower(), "content-type", IDEMPOTENCY_KEY_HEADER.lower()})
+
+
+def _checked_headers(headers: Optional[Dict[str, str]]) -> Dict[str, str]:
+    """The caller's extra headers, refused when one could break a request:
+    a name the SDK sets itself, or a line break (header injection)."""
+    checked: Dict[str, str] = {}
+    for name, value in (headers or {}).items():
+        if not isinstance(name, str) or not isinstance(value, str):
+            raise ValueError(f"header {name!r} must be a string name and value")
+        if not name.strip() or any(c in name for c in "\r\n:") or any(c in value for c in "\r\n"):
+            raise ValueError(f"header {name!r} has an empty name, a colon or a line break")
+        if name.strip().lower() in _RESERVED_HEADERS:
+            raise ValueError(f"header {name!r} is set by the SDK and cannot be replaced")
+        checked[name.strip()] = value
+    return checked
+
+
+def _build_ssl_context(ca_file: Optional[str], client_cert: Union[str, Tuple[str, str], None]) -> Optional[ssl.SSLContext]:
+    """An SSL context trusting ``ca_file`` (instead of the system's CAs) and
+    presenting ``client_cert``, or None when neither is set. Errors in the
+    files surface here, at construction, not on the first call."""
+    if not ca_file and not client_cert:
+        return None
+    context = ssl.create_default_context(cafile=ca_file or None)
+    if client_cert:
+        if isinstance(client_cert, (tuple, list)):
+            if len(client_cert) != 2:
+                raise ValueError("client_cert must be a PEM file or a (cert_file, key_file) pair")
+            context.load_cert_chain(certfile=client_cert[0], keyfile=client_cert[1])
+        else:
+            context.load_cert_chain(certfile=client_cert)
+    return context
+
+
+def _websocket_tls(ssl_context: Optional[ssl.SSLContext]) -> Dict[str, Any]:
+    """websocket-client takes a ready SSL context in sslopt["context"]."""
+    return {} if ssl_context is None else {"sslopt": {"context": ssl_context}}
+
+
 def _close_quietly(ws: Any) -> None:
     try:
         ws.close()
@@ -2890,18 +2965,21 @@ def _close_quietly(ws: Any) -> None:
 _WATCH_START_TIMEOUT_SECONDS = 60.0
 
 
-def _connect_watch_websocket(websocket_module: Any, ws_url: str, headers: List[str], sandbox_id: str) -> Any:
+def _connect_watch_websocket(
+    websocket_module: Any, ws_url: str, headers: List[str], sandbox_id: str, ssl_context: Optional[ssl.SSLContext] = None
+) -> Any:
     """Opens the file-watch WebSocket, turning a refused handshake into the
     error a caller can act on. websocket-client raises
     WebSocketBadStatusException for a non-101 answer, with the status, the
     headers (lowercased) and the body."""
     left = _time_left()
+    extra = _websocket_tls(ssl_context)
     try:
         if left is None:
-            return websocket_module.create_connection(ws_url, header=headers, enable_multithread=True)
+            return websocket_module.create_connection(ws_url, header=headers, enable_multithread=True, **extra)
         if left <= 0:
             raise _deadline_error()
-        return websocket_module.create_connection(ws_url, header=headers, enable_multithread=True, timeout=left)
+        return websocket_module.create_connection(ws_url, header=headers, enable_multithread=True, timeout=left, **extra)
     except MicroVMTimeoutError:
         raise
     except Exception as exc:

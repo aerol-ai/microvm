@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import datetime
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Callable, Dict, List, Literal, Optional, TypedDict, Union
+from typing import TYPE_CHECKING, Callable, Dict, List, Literal, Optional, Tuple, TypedDict, Union
 
 if TYPE_CHECKING:
     from .image import Image
@@ -1069,6 +1069,15 @@ class MicroVMConfig(TypedDict, total=False):
     # request. Defaults to SB_TEAM; with neither, no header is sent.
     team: str
     retry: RetryConfig
+    # A PEM file of the certificate authorities to trust for https, used
+    # instead of the system's list (a company proxy that inspects TLS).
+    caFile: str
+    # A client certificate: one PEM file with the certificate and key, or a
+    # (cert_file, key_file) pair.
+    clientCert: Union[str, Tuple[str, str]]
+    # Extra headers for every request and WebSocket handshake. They cannot
+    # replace Authorization, X-AerolVM-Team, Content-Type or Idempotency-Key.
+    headers: Dict[str, str]
 
 
 class WhoAmIPrincipal(TypedDict, total=False):

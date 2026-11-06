@@ -177,6 +177,84 @@ This lists your sandboxes. If the address or token is wrong, it fails with a cle
 | `unauthorized` | The token does not match the one the server was installed with. |
 | `Connection refused` | The server is not running, or `SB_API_URL` points to the wrong address. |
 
+## Connect through a company network
+
+Some company networks put a proxy between your code and the server. The proxy may check TLS with its own certificate authority (CA), ask for a client certificate, or need an extra header. Each SDK can handle this:
+
+| SDK | Trust another CA | Send a client certificate | Add headers |
+|---|---|---|---|
+| TypeScript | Start Node with `NODE_EXTRA_CA_CERTS` | Pass a `fetch` that uses an undici `Agent` with `connect: { cert, key }` | Pass a `fetch` that adds them |
+| Python | `ca_file=` | `client_cert=` | `headers=` |
+| Go | `HTTPClient` with `tls.Config.RootCAs` | `HTTPClient` with `tls.Config.Certificates` | `HTTPClient` with a `RoundTripper` that adds them |
+| Rust | Add the CA to the system's list | Not yet | Not yet |
+| Java | `setHttpClient` with an `SSLContext` | `setHttpClient` with an `SSLContext` | Not yet |
+
+In Python, `ca_file` replaces the system's CA list for this client, like `verify=` does in the `requests` library. `client_cert` takes one PEM file that holds the certificate and its key, or a pair of files `(cert_file, key_file)`. `headers` go on every request and on every live stream. They cannot replace the headers the SDK sets itself, such as `Authorization`. A file that cannot be read fails when you make the client, not on the first call.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    // Run with: NODE_EXTRA_CA_CERTS=/etc/ssl/company-ca.pem node app.js
+    const client = new MicroVM({
+      fetch: (input, init) => {
+        const headers = new Headers(init?.headers);
+        headers.set("X-Proxy-Auth", process.env.PROXY_TOKEN ?? "");
+        return fetch(input, { ...init, headers });
+      },
+    });
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    import os
+
+    from microvm import MicroVM
+
+    client = MicroVM(
+        ca_file="/etc/ssl/company-ca.pem",
+        client_cert=("/etc/ssl/me.pem", "/etc/ssl/me.key"),
+        headers={"X-Proxy-Auth": os.environ["PROXY_TOKEN"]},
+    )
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    caPEM, err := os.ReadFile("/etc/ssl/company-ca.pem")
+    if err != nil {
+        log.Fatal(err)
+    }
+    roots := x509.NewCertPool()
+    roots.AppendCertsFromPEM(caPEM)
+    cert, err := tls.LoadX509KeyPair("/etc/ssl/me.pem", "/etc/ssl/me.key")
+    if err != nil {
+        log.Fatal(err)
+    }
+    client, err := microvm.NewClientWithConfig(&sdktypes.MicroVMConfig{
+        HTTPClient: &http.Client{Transport: &http.Transport{
+            TLSClientConfig: &tls.Config{RootCAs: roots, Certificates: []tls.Certificate{cert}},
+        }},
+    })
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    // The Rust client trusts the system's CA list. Add your company CA to
+    // it (on Linux, for example, with update-ca-certificates).
+    // Client certificates and extra headers are not supported yet.
+    let client = Client::new(None, None)?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    // sslContext trusts your company CA and holds your client key,
+    // for example loaded from a KeyStore with TrustManagerFactory
+    // and KeyManagerFactory.
+    HttpClient http = HttpClient.newBuilder().sslContext(sslContext).build();
+    MicroVMClient client = new MicroVMClient(new MicroVMConfig().setHttpClient(http));
+    ```
+  </TabItem>
+</Tabs>
+
 ## When the server is busy
 
 A busy server can turn a request away and say when to try again. It answers `503` when it is overloaded, and `429` when your code sends more than its fair share. Both answers can carry a `Retry-After` header: the number of seconds to wait, or a date and time.
