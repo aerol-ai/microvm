@@ -220,3 +220,36 @@ func TestParityDestroyAfterExitLive(t *testing.T) {
 	waitGone(t, c, sb.ID, 3*time.Minute)
 	t.Logf("deleted %v after the exit showed", time.Since(seen).Round(time.Second))
 }
+
+// UC-399 — destroyAt (plan L6): a time in the past is refused with a 400
+// that names the option; a time two minutes ahead is stored as an age and
+// deletes the sandbox soon after it passes.
+func TestParityDestroyAtLive(t *testing.T) {
+	harness.Require(t, sc, "UC-399")
+	c := client(t)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	past := time.Now().UTC().Add(-time.Minute)
+	createRefused(t, ctx, sdktypes.CreateSandboxOptions{
+		Name:      harness.UniqueName(sc, t) + "-past",
+		Image:     harness.DefaultImage,
+		Lifecycle: &sdktypes.Lifecycle{DestroyAt: &past},
+	}, "destroy_at")
+
+	at := time.Now().UTC().Add(2 * time.Minute)
+	sb := c.NewSandbox(t, sdktypes.CreateSandboxOptions{
+		Name:      harness.UniqueName(sc, t),
+		Lifecycle: &sdktypes.Lifecycle{DestroyAt: &at},
+	})
+	if sb.Lifecycle.DestroyAt != nil || sb.Lifecycle.DestroyAtAge <= 0 {
+		t.Fatalf("created lifecycle = %+v, want an age and no destroy_at", sb.Lifecycle)
+	}
+	if got := sb.CreatedAt.Add(sb.Lifecycle.DestroyAtAge); got.Sub(at).Abs() > 30*time.Second {
+		t.Fatalf("created_at + destroy_at_age = %v, want about %v", got, at)
+	}
+	waitRunning(t, sb)
+	waitGone(t, c, sb.ID, 5*time.Minute)
+	if late := time.Since(at); late < 0 {
+		t.Fatalf("deleted %v before its destroy_at", -late)
+	}
+}

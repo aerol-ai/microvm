@@ -760,6 +760,20 @@ class ClientTests(unittest.TestCase):
         client.create({"image": "ubuntu:22.04", "lifecycle": {"restartOnFailure": False, "stopAtAge": 5}})
         self.assertEqual(client.calls[1][2]["lifecycle"], {"restart_on_failure": False, "stop_at_age": 5})
 
+    def test_destroy_at_goes_out_as_rfc3339(self):
+        import datetime as dt
+
+        client = RecordingMicroVM()
+        at = dt.datetime(2026, 11, 6, 18, 0, tzinfo=dt.timezone.utc)
+        client.create({"image": "ubuntu:22.04", "lifecycle": {"destroyAt": at}})
+        self.assertEqual(client.calls[0][2]["lifecycle"], {"destroy_at": "2026-11-06T18:00:00+00:00"})
+        client.create({"image": "ubuntu:22.04", "lifecycle": {"destroyAt": dt.datetime(2026, 11, 6, 18, 0)}})
+        self.assertEqual(client.calls[1][2]["lifecycle"], {"destroy_at": "2026-11-06T18:00:00+00:00"})
+        client.create({"image": "ubuntu:22.04", "lifecycle": {"destroyAt": "2026-11-06T18:00:00Z"}})
+        self.assertEqual(client.calls[2][2]["lifecycle"], {"destroy_at": "2026-11-06T18:00:00Z"})
+        with self.assertRaises(TypeError):
+            client.create({"image": "ubuntu:22.04", "lifecycle": {"destroyAt": 12345}})
+
     def test_create_round_trips_destroy_after_exit_for(self):
         client = RecordingMicroVM()
         sandbox = client.create({"image": "ubuntu:22.04", "lifecycle": {"destroyAfterExitFor": 60_000_000_000}})

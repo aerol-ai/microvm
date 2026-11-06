@@ -268,6 +268,7 @@ interface ApiLifecycle {
   serverless?: boolean;
   restart_on_failure?: boolean;
   destroy_after_exit_for?: number;
+  destroy_at?: string;
 }
 
 interface ApiFailover {
@@ -2312,6 +2313,7 @@ function toApiLifecycle(lifecycle: Lifecycle): ApiLifecycle {
     serverless: lifecycle.serverless,
     restart_on_failure: lifecycle.restartOnFailure,
     destroy_after_exit_for: lifecycle.destroyAfterExitFor,
+    destroy_at: lifecycle.destroyAt instanceof Date ? lifecycle.destroyAt.toISOString() : lifecycle.destroyAt,
   };
 }
 

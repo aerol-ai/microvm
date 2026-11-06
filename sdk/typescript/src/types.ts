@@ -156,6 +156,13 @@ export interface Lifecycle {
    * WebAssembly or V8-isolate sandboxes, which have no main program (400).
    */
   destroyAfterExitFor?: number;
+  /**
+   * Delete the sandbox at this clock time: a `Date`, or an RFC 3339 string
+   * such as `"2026-11-06T18:00:00Z"`. The server turns it into
+   * `destroyAtAge`, so the sandbox you get back shows `destroyAtAge`, not
+   * this. A time in the past is refused with a 400, as is setting both.
+   */
+  destroyAt?: Date | string;
 }
 
 export type UpdateLifecycleOptions = Lifecycle;

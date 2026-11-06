@@ -46,6 +46,10 @@ func TestStatusReasonsDecode(t *testing.T) {
 	if exit, _ := json.Marshal(Lifecycle{DestroyAfterExitFor: time.Minute}); string(exit) != `{"destroy_after_exit_for":60000000000}` {
 		t.Fatalf("Lifecycle{DestroyAfterExitFor} = %s", exit)
 	}
+	at := time.Date(2026, 11, 6, 18, 0, 0, 0, time.UTC)
+	if b, _ := json.Marshal(Lifecycle{DestroyAt: &at}); string(b) != `{"destroy_at":"2026-11-06T18:00:00Z"}` {
+		t.Fatalf("Lifecycle{DestroyAt} = %s", b)
+	}
 	if off, _ := json.Marshal(Lifecycle{}); string(off) != `{}` {
 		t.Fatalf("empty Lifecycle = %s", off)
 	}

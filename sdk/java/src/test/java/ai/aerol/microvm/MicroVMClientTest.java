@@ -623,6 +623,11 @@ class MicroVMClientTest {
             Map<String, Object> wire = castMap(JsonSupport.read(JsonSupport.writeBytes(exit), Map.class));
             assertEquals(60_000_000_000L, ((Number) wire.get("destroy_after_exit_for")).longValue());
             assertEquals(Long.valueOf(60_000_000_000L), exit.copy().destroyAfterExitFor);
+
+            Lifecycle at = new Lifecycle().setDestroyAt(java.time.Instant.parse("2026-11-06T18:00:00Z"));
+            Map<String, Object> atWire = castMap(JsonSupport.read(JsonSupport.writeBytes(at), Map.class));
+            assertEquals("2026-11-06T18:00:00Z", atWire.get("destroy_at"));
+            assertEquals(at.destroyAt, at.copy().destroyAt);
         } finally {
             server.stop(0);
         }

@@ -2049,6 +2049,11 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 	if chosenRuntime == models.RuntimeKata {
 		return nil, fmt.Errorf("runtime %q: %w", chosenRuntime, models.ErrRuntimeNotImplemented)
 	}
+	// destroy_at becomes destroy_at_age from now (L6), before the defaults
+	// look at whether the create set timers of its own. In memory only.
+	if err := NormalizeCreateLifecycle(&req, time.Now().UTC()); err != nil {
+		return nil, err
+	}
 	// The server's default destroy timers (L4) for a create with no timers
 	// of its own. In memory only: it fills the request's lifecycle.
 	req.Lifecycle = s.withDefaultLifecycle(req.Lifecycle)
@@ -4701,14 +4706,26 @@ func (s *Service) ResizeSandbox(ctx context.Context, id string, req models.Resiz
 // The sweep picks up the new values on its next tick (within ~1 minute),
 // so a tightened deadline can fire as soon as the next sweep runs.
 func (s *Service) UpdateLifecycle(ctx context.Context, id string, l models.Lifecycle) (*models.Sandbox, error) {
-	if err := s.validateLifecycle(l); err != nil {
-		return nil, fmt.Errorf("invalid lifecycle: %w", err)
+	// A destroy_at needs the sandbox's creation time, so it is checked
+	// after the read; everything else fails before the lock as before.
+	if l.DestroyAt == nil {
+		if err := s.validateLifecycle(l); err != nil {
+			return nil, fmt.Errorf("invalid lifecycle: %w", err)
+		}
 	}
 	unlock := s.lifecycleLocks.lock(id)
 	defer unlock()
 	priorSandbox, err := s.scopedGet(ctx, id)
 	if err != nil {
 		return nil, err
+	}
+	if l.DestroyAt != nil {
+		if err := resolveLifecycleUpdate(&l, priorSandbox); err != nil {
+			return nil, err
+		}
+		if err := s.validateLifecycle(l); err != nil {
+			return nil, fmt.Errorf("invalid lifecycle: %w", err)
+		}
 	}
 	if err := validateLifecycleRuntime(l, s.sandboxRuntime(priorSandbox)); err != nil {
 		return nil, err

@@ -446,6 +446,11 @@ type Lifecycle struct {
 	// Zero is off. WASM and isolate sandboxes have no main program and
 	// refuse it.
 	DestroyAfterExitFor time.Duration `json:"destroy_after_exit_for,omitempty"`
+	// DestroyAt is an input-only clock time (RFC 3339) to destroy the
+	// sandbox at (L6). ResolveDestroyAt turns it into DestroyAtAge measured
+	// from the sandbox's creation, so only the age is stored, replicated and
+	// returned; Validate refuses one left unconverted.
+	DestroyAt *time.Time `json:"destroy_at,omitempty"`
 }
 
 // MaxLifecycleDuration caps each Lifecycle field. 30 days is generous for
@@ -460,6 +465,11 @@ const MaxLifecycleDuration = 30 * 24 * time.Hour
 //     not fire before stop. Without this we could surprise a user who set
 //     "stop at 2h, destroy at 1h" by skipping the stop entirely.
 func (l Lifecycle) Validate() error {
+	if l.DestroyAt != nil {
+		// A path that forgot ResolveDestroyAt would otherwise store the
+		// lifecycle without the time the caller asked for.
+		return errors.New("destroy_at must be converted to destroy_at_age before validation")
+	}
 	if l.StopIfIdleFor < 0 || l.DestroyIfIdleFor < 0 || l.StopAtAge < 0 || l.DestroyAtAge < 0 || l.DestroyAfterExitFor < 0 {
 		return errors.New("lifecycle durations must be non-negative")
 	}
@@ -493,6 +503,31 @@ func (l Lifecycle) Validate() error {
 	if l.Serverless && l.StopIfIdleFor == 0 {
 		return errors.New("serverless requires stop_if_idle_for to be set explicitly")
 	}
+	return nil
+}
+
+// ResolveDestroyAt turns DestroyAt into DestroyAtAge, the age the sandbox
+// created at createdAt has at that time, and clears DestroyAt. now is the
+// current time: a DestroyAt that is not after it is refused, as is one set
+// together with DestroyAtAge (which would win is unclear) and one more than
+// MaxLifecycleDuration after createdAt. A nil DestroyAt is a no-op.
+func (l *Lifecycle) ResolveDestroyAt(createdAt, now time.Time) error {
+	if l == nil || l.DestroyAt == nil {
+		return nil
+	}
+	at := l.DestroyAt.UTC()
+	if l.DestroyAtAge != 0 {
+		return errors.New("set destroy_at or destroy_at_age, not both")
+	}
+	if !at.After(now) {
+		return fmt.Errorf("destroy_at %s is not in the future", at.Format(time.RFC3339))
+	}
+	age := at.Sub(createdAt)
+	if age > MaxLifecycleDuration {
+		return fmt.Errorf("destroy_at %s is more than %s after the sandbox was created", at.Format(time.RFC3339), MaxLifecycleDuration)
+	}
+	l.DestroyAtAge = age
+	l.DestroyAt = nil
 	return nil
 }
 

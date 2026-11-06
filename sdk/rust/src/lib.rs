@@ -4171,6 +4171,7 @@ mod tests {
                 serverless: false,
                 restart_on_failure: false,
                 destroy_after_exit_for: 0,
+                destroy_at: None,
             }
         );
         assert_eq!(
@@ -4242,6 +4243,7 @@ mod tests {
                 serverless: false,
                 restart_on_failure: false,
                 destroy_after_exit_for: 0,
+                destroy_at: None,
             }
         );
     }
@@ -4353,6 +4355,18 @@ mod tests {
         let back: Lifecycle = serde_json::from_value(wire).unwrap();
         assert_eq!(back, lc);
         assert_eq!(serde_json::to_value(Lifecycle::default()).unwrap(), serde_json::json!({}));
+    }
+
+    #[test]
+    fn lifecycle_destroy_at_goes_out_as_a_string() {
+        let lc = Lifecycle {
+            destroy_at: Some("2026-11-06T18:00:00Z".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            serde_json::to_value(&lc).unwrap(),
+            serde_json::json!({ "destroy_at": "2026-11-06T18:00:00Z" })
+        );
     }
 
     #[test]

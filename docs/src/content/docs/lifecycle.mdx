@@ -18,6 +18,7 @@ Every timer is optional, and a timer you leave out is off.
 | `stopAtAge` | Stop the sandbox this long after it was created. |
 | `destroyAtAge` | Delete the sandbox this long after it was created. |
 | `destroyAfterExitFor` | Delete the sandbox this long after its main program ends. See [below](#delete-when-the-program-ends). |
+| `destroyAt` | Delete the sandbox at a set clock time. See [below](#delete-at-a-set-time). |
 | `serverless` | Start the sandbox again by itself when a request reaches it. Needs `stopIfIdleFor`. See [Ghost sandboxes](/ghost-sandboxes/). |
 
 Activity means anything that reaches the sandbox: a command, a file read or write, a terminal or SSH session, or traffic to its public URL.
@@ -139,6 +140,73 @@ The SDKs take each time in nanoseconds (billionths of a second). One hour is `60
     ```
   </TabItem>
 </Tabs>
+
+## Delete at a set time
+
+`destroyAt` deletes the sandbox at a clock time instead of after a length of time. Pass a time in RFC 3339 format, such as `2026-11-06T18:00:00Z`. You can set it when you create a sandbox or with `updateLifecycle`.
+
+The server turns the time into `destroyAtAge`: how old the sandbox will be at that time. So when you read the sandbox back, you see `destroyAtAge`, not `destroyAt`.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const sandbox = await client.create({
+      image: "ubuntu:22.04",
+      lifecycle: { destroyAt: new Date("2026-11-06T18:00:00Z") },
+    });
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    from datetime import datetime, timezone
+
+    sandbox = client.create(
+        image="ubuntu:22.04",
+        lifecycle={"destroyAt": datetime(2026, 11, 6, 18, 0, tzinfo=timezone.utc)},
+    )
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    at := time.Date(2026, 11, 6, 18, 0, 0, 0, time.UTC)
+
+    sandbox, err := client.Create(ctx, sdktypes.CreateSandboxOptions{
+        Image:     "ubuntu:22.04",
+        Lifecycle: &sdktypes.Lifecycle{DestroyAt: &at},
+    })
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    let sandbox = client.create(CreateOptions {
+        image: "ubuntu:22.04".into(),
+        lifecycle: Some(Lifecycle {
+            destroy_at: Some("2026-11-06T18:00:00Z".into()),
+            ..Default::default()
+        }),
+        ..Default::default()
+    })?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    Sandbox sandbox = client.create(new CreateOptions()
+        .setImage("ubuntu:22.04")
+        .setLifecycle(new Lifecycle()
+            .setDestroyAt(Instant.parse("2026-11-06T18:00:00Z")))); // java.time.Instant
+    ```
+  </TabItem>
+</Tabs>
+
+The server rejects these with a `400` error:
+
+- **A time that is not in the future.**
+- **Both `destroyAt` and `destroyAtAge`.** Pick one.
+- **A time more than 30 days after the sandbox was created**, the same limit as every other timer.
+
+As with every timer, the delete can come up to a minute late.
+
+In a cluster that is part way through an upgrade, wait until every server runs this release before you send `destroyAt` to `updateLifecycle`. A server on an older release does not know `destroyAt`, so it would take the update as one with no timers and clear them all. Creates are safe: the server you call turns the time into `destroyAtAge` first, which every release reads.
 
 ## Delete when the program ends
 

@@ -1,5 +1,7 @@
 package ai.aerol.microvm.model;
 
+import java.time.Instant;
+
 import com.fasterxml.jackson.annotation.JsonInclude;
 
 @JsonInclude(JsonInclude.Include.NON_NULL)
@@ -22,6 +24,10 @@ public class Lifecycle {
     // its main program ends; checked about once a minute. Not for
     // WebAssembly or V8-isolate sandboxes (400).
     public Long destroyAfterExitFor;
+    // destroyAt deletes the sandbox at this clock time. The server turns it
+    // into destroyAtAge, which is what the sandbox shows; a past time is
+    // refused with a 400.
+    public Instant destroyAt;
 
     public Lifecycle setStopIfIdleFor(Long stopIfIdleFor) {
         this.stopIfIdleFor = stopIfIdleFor;
@@ -58,6 +64,11 @@ public class Lifecycle {
         return this;
     }
 
+    public Lifecycle setDestroyAt(Instant destroyAt) {
+        this.destroyAt = destroyAt;
+        return this;
+    }
+
     public Lifecycle copy() {
         return new Lifecycle()
             .setStopIfIdleFor(stopIfIdleFor)
@@ -66,6 +77,7 @@ public class Lifecycle {
             .setDestroyAtAge(destroyAtAge)
             .setServerless(serverless)
             .setRestartOnFailure(restartOnFailure)
-            .setDestroyAfterExitFor(destroyAfterExitFor);
+            .setDestroyAfterExitFor(destroyAfterExitFor)
+            .setDestroyAt(destroyAt);
     }
 }

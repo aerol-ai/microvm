@@ -642,6 +642,10 @@ func CreateOnSelectedNode(ctx context.Context, svc *service.Service, logger *slo
 	if err := service.NormalizeCreateFailover(&req); err != nil {
 		return nil, err
 	}
+	// destroy_at becomes an age before the spec is promoted (L6).
+	if err := service.NormalizeCreateLifecycle(&req, time.Now().UTC()); err != nil {
+		return nil, err
+	}
 	svc.NormalizeCreateEgressDefault(&req)
 	// Pin bare built-in profiles here, on the owner after any forward, so
 	// the spec promoted below carries this node's version (CEO D11).

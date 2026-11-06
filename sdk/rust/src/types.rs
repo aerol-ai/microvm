@@ -354,6 +354,11 @@ pub struct Lifecycle {
         skip_serializing_if = "is_zero_u64"
     )]
     pub destroy_after_exit_for: u64,
+    /// Deletes the sandbox at this clock time, an RFC 3339 string such as
+    /// `"2026-11-06T18:00:00Z"`. The server turns it into `destroy_at_age`,
+    /// which is what the sandbox shows; a past time is refused with a 400.
+    #[serde(rename = "destroy_at", default, skip_serializing_if = "Option::is_none")]
+    pub destroy_at: Option<String>,
 }
 
 fn is_false(b: &bool) -> bool {

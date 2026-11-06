@@ -162,6 +162,15 @@ func (h *handlers) clusterCreateWrap(w http.ResponseWriter, r *http.Request) {
 		h.createSandbox(w, r)
 		return
 	}
+	// destroy_at becomes an age here, after the digests (a retry must match
+	// the client's request, not an age that moves with the clock) and before
+	// Prepare: a refused time must not hold the name in a reservation, and
+	// SyncBody then forwards destroy_at_age, which an owner on an older
+	// build reads too, where it would drop destroy_at (L6).
+	if err := service.NormalizeCreateLifecycle(&req, time.Now().UTC()); err != nil {
+		apihttp.WriteError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 
 	// Placement, reservation and forwarding are the same decision for native
 	// v1 as for the daytona/e2b facades, so they run through one
@@ -209,6 +218,12 @@ func (h *handlers) createSandboxOnSelectedNode(w http.ResponseWriter, r *http.Re
 		return
 	}
 	if err := service.NormalizeCreateFailover(&req); err != nil {
+		apihttp.WriteError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	// destroy_at becomes an age before the spec is promoted, so a failover
+	// replays the age (L6).
+	if err := service.NormalizeCreateLifecycle(&req, time.Now().UTC()); err != nil {
 		apihttp.WriteError(w, http.StatusBadRequest, err.Error())
 		return
 	}

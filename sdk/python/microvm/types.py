@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import datetime
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable, Dict, List, Literal, Optional, TypedDict, Union
 
@@ -111,6 +112,11 @@ class Lifecycle(TypedDict, total=False):
     # program ends; checked about once a minute. Not for WebAssembly or
     # V8-isolate sandboxes (400).
     destroyAfterExitFor: int
+    # Delete the sandbox at this clock time: a timezone-aware datetime, or an
+    # RFC 3339 string such as "2026-11-06T18:00:00Z" (a naive datetime is
+    # taken as UTC). The server turns it into destroyAtAge, which is what
+    # the sandbox shows; a past time is refused with a 400.
+    destroyAt: Union[str, datetime.datetime]
 
 
 UpdateLifecycleOptions = Lifecycle

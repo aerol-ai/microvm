@@ -399,6 +399,27 @@ test("internal client create round-trips restartOnFailure", async () => {
   assert.equal(sandbox.lifecycle.restartOnFailure, true);
 });
 
+test("internal client sends destroyAt as an RFC 3339 string", async () => {
+  const bodies: Record<string, unknown>[] = [];
+  const client = new APIClient({
+    baseURL: "https://api.example.com",
+    patToken: "pat-token",
+    fetch: async (input, init) => {
+      bodies.push((await new Request(input, init).json()) as Record<string, unknown>);
+      return jsonResponse(apiSandbox("sb-at", { lifecycle: { destroy_at_age: 3_600_000_000_000 } }));
+    },
+  });
+
+  const sandbox = await client.create({ image: "ubuntu:22.04", lifecycle: { destroyAt: new Date("2026-11-06T18:00:00Z") } });
+  await sandbox.updateLifecycle({ destroyAt: "2026-11-06T19:00:00+05:30" });
+
+  assert.deepEqual(bodies[0].lifecycle, { destroy_at: "2026-11-06T18:00:00.000Z" });
+  assert.deepEqual(bodies[1], { destroy_at: "2026-11-06T19:00:00+05:30" });
+  // The server answers with the age it stored.
+  assert.equal(sandbox.lifecycle.destroyAtAge, 3_600_000_000_000);
+  assert.equal(sandbox.lifecycle.destroyAt, undefined);
+});
+
 test("internal client create round-trips destroyAfterExitFor", async () => {
   let seenRequest: Request | undefined;
   const client = new APIClient({

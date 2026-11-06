@@ -2571,6 +2571,17 @@ def _to_api_create_session_options(options: CreateSessionOptions) -> Dict[str, A
     )
 
 
+def _destroy_at_wire(value: Any) -> Optional[str]:
+    """destroyAt goes on the wire as RFC 3339. A naive datetime is UTC."""
+    if value is None or isinstance(value, str):
+        return value
+    if isinstance(value, datetime.datetime):
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=datetime.timezone.utc)
+        return value.isoformat()
+    raise TypeError("destroyAt must be a datetime or an RFC 3339 string")
+
+
 def _to_api_lifecycle(lifecycle: Lifecycle) -> Dict[str, Any]:
     return _compact(
         {
@@ -2581,6 +2592,7 @@ def _to_api_lifecycle(lifecycle: Lifecycle) -> Dict[str, Any]:
             "serverless": _first_of(lifecycle, "serverless"),
             "restart_on_failure": _first_of(lifecycle, "restartOnFailure", "restart_on_failure"),
             "destroy_after_exit_for": _first_of(lifecycle, "destroyAfterExitFor", "destroy_after_exit_for"),
+            "destroy_at": _destroy_at_wire(_first_of(lifecycle, "destroyAt", "destroy_at")),
         }
     )
 

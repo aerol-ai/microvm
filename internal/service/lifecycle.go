@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/aerol-ai/microvm/pkg/models"
 )
@@ -96,6 +97,9 @@ func (s *Service) ApplyLifecyclePatch(ctx context.Context, id string, patch func
 	if !changed {
 		return sandbox, false, nil
 	}
+	if err := resolveLifecycleUpdate(&desired, sandbox); err != nil {
+		return nil, false, err
+	}
 	if err := s.validateLifecycle(desired); err != nil {
 		return nil, false, fmt.Errorf("invalid lifecycle: %w", err)
 	}
@@ -133,4 +137,31 @@ func (s *Service) withDefaultLifecycle(l *models.Lifecycle) *models.Lifecycle {
 		out.StopIfIdleFor = g
 	}
 	return &out
+}
+
+// NormalizeCreateLifecycle turns a create's lifecycle.destroy_at (L6) into
+// destroy_at_age, measured from now, the sandbox's creation. It runs where
+// a create request enters: createSandbox, and the cluster create paths
+// before they record the replicated spec, so the spec only ever carries the
+// age. It works on a copy: the caller's request struct is not changed
+// behind its back. A past time, or destroy_at with destroy_at_age, is a 400.
+func NormalizeCreateLifecycle(req *models.CreateSandboxRequest, now time.Time) error {
+	if req == nil || req.Lifecycle == nil || req.Lifecycle.DestroyAt == nil {
+		return nil
+	}
+	l := *req.Lifecycle
+	if err := l.ResolveDestroyAt(now, now); err != nil {
+		return fmt.Errorf("invalid lifecycle: %w", err)
+	}
+	req.Lifecycle = &l
+	return nil
+}
+
+// resolveLifecycleUpdate turns an update's destroy_at into destroy_at_age
+// from the sandbox's own creation time.
+func resolveLifecycleUpdate(l *models.Lifecycle, sb *models.Sandbox) error {
+	if err := l.ResolveDestroyAt(sb.CreatedAt, time.Now().UTC()); err != nil {
+		return fmt.Errorf("invalid lifecycle: %w", err)
+	}
+	return nil
 }
