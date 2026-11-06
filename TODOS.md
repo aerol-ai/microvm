@@ -639,6 +639,33 @@ Every entry was re-verified against `main` at `704c9e74` on 2026-10-06.
 
 ---
 
+## A create cut off inside containerd's NewContainer can still leave its container (idempotency, containerd)
+
+- **What:** a keyed create (Idempotency-Key) whose client hangs up while
+  containerd is inside `NewContainer` may leave a container that the driver
+  never got a handle for, so it cannot undo it. The client's retry derives
+  the same sandbox ID and gets 409 "sandbox already exists" until the orphan
+  sweep removes the container.
+- **Status (2026-11-06):** the wider window is fixed. "fix(containerd): undo
+  a failed create even when its client hung up" (stack
+  `fix/parity-containerd-create-undo`) runs the undo on `undoContext`, so a
+  hang-up in NewTask, task start or the readiness wait is cleaned up before
+  the create returns (UC-450). The NewContainer call itself is the window
+  left; it is much smaller.
+- **Fix idea:** in the service, while it holds the ID's create lease
+  (`internal/service/create_lease.go`), a runtime instance with no store row
+  is an orphan of a failed create of this ID: destroy it and retry the
+  create once. This also covers the Docker engine, where a
+  `/containers/create` cut off after dockerd saved the container leaves one
+  behind (a Docker 409, shown as HTTP 400).
+- **Related:** the containerd warm pool's park path
+  (`internal/runtime/containerd/warm_park.go`) also undoes on the request
+  context. It cannot cause this 409 (slot IDs are fresh), but a cancelled
+  park can leave a slot's container until the sweep.
+- **Effort / priority:** S, P2.
+
+---
+
 ## Done
 
 Kept for the record. Each entry names the fix and where it lives.

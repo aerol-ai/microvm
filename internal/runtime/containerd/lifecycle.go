@@ -121,6 +121,8 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		if committed || lostRace {
 			return
 		}
+		ctx, cancel := undoContext(ctx)
+		defer cancel()
 		// Undo in the order that keeps the sandbox shut and its address
 		// clean: the workload dies first; then whatever the create keyed by
 		// the address (the egress gateway attach) is told and lets go; then
@@ -148,6 +150,8 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		if committed || leaseID == "" {
 			return
 		}
+		ctx, cancel := undoContext(ctx)
+		defer cancel()
 		d.releaseImageLease(ctx, client, map[string]string{imageLeaseLabelKey: leaseID})
 	}()
 
@@ -1117,6 +1121,26 @@ func (d *Driver) recreateResumeReadySocket(spec *specs.Spec) *dockerpkg.ReadyLis
 		return nil
 	}
 	return rl
+}
+
+// createUndoTimeout bounds the undo of a failed create, as the service bounds
+// its own create rollback, so a containerd that stops answering cannot hold
+// the create, and the service's create lease of the ID around it, forever.
+const createUndoTimeout = 30 * time.Second
+
+// undoContext is the context a failed create undoes itself on: ctx's values
+// (the address observer the egress attach listens on) without its
+// cancellation. The request that failed is often the reason it failed: a
+// client that hangs up mid-create (an SDK timeout, a closed proxy connection)
+// cancels ctx, and the create stops at its next containerd call. An undo on
+// that same ctx failed every call at once and left the container, its
+// snapshot, its task, the netns slot and the image lease under the sandbox
+// ID, so the client's retry of its Idempotency-Key, which derives the same
+// ID, met the container as AlreadyExists and was answered 409 "sandbox
+// already exists" (UC-450). The docker driver removes a failed create's
+// workload the same way (removeWorkload).
+func undoContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(ctx), createUndoTimeout)
 }
 
 func (d *Driver) lifoTeardown(ctx context.Context, client *Client, container cntr.Container, task cntr.Task, logPath string, hostFiles *sandboxHostFiles) {
