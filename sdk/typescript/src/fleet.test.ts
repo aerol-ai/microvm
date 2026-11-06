@@ -269,3 +269,18 @@ test("a sandbox's JSON holds only its fields, never the client or its token", as
   }
   assert.equal(JSON.parse(json).name, "a");
 });
+
+test("a client never serializes its token", async () => {
+  const fake = new FakeSandboxd();
+  const client = fake.client();
+  const json = JSON.stringify(client);
+  assert.equal(json.includes("pat"), false, json);
+  assert.equal(Object.keys(client).includes("patToken"), false);
+  assert.equal(Object.keys(client).includes("client"), false);
+  // Still readable by name, so existing code that reads it keeps working.
+  assert.equal(typeof client.patToken, "string");
+  assert.notEqual(client.patToken, "");
+  // And the client still works.
+  const sandbox = await client.create({ image: "alpine", name: "after-json" });
+  assert.equal(sandbox.name, "after-json");
+});

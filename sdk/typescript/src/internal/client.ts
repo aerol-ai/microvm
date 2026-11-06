@@ -923,7 +923,9 @@ export class APIClient {
   readonly baseURL: string;
   readonly apiVersion: APIVersion;
 
-  private readonly patToken: string;
+  // Not enumerable (set in the constructor): JSON.stringify, object spread
+  // and Object.keys of a client must never carry the token.
+  declare private readonly patToken: string;
   private readonly team: string;
   private readonly fetchFn: FetchLike;
   private readonly versionPrefix: string;
@@ -939,7 +941,7 @@ export class APIClient {
 
   constructor(config: APIClientConfig) {
     this.baseURL = stripTrailingSlashes(config.baseURL);
-    this.patToken = config.patToken ?? "";
+    Object.defineProperty(this, "patToken", { value: config.patToken ?? "", enumerable: false });
     this.team = (config.team ?? "").trim();
     this.fetchFn = config.fetch ?? fetch;
     this.apiVersion = config.apiVersion ?? DEFAULT_API_VERSION;

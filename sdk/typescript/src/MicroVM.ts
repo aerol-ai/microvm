@@ -133,11 +133,14 @@ export interface MicroVMConfig {
 
 export class MicroVM {
   readonly apiUrl: string;
-  readonly patToken: string;
+  // patToken and client are set in the constructor as non-enumerable
+  // properties: still readable by name, but JSON.stringify, object spread
+  // and Object.keys of a MicroVM never carry the token.
+  declare readonly patToken: string;
   /** The team sent as `X-AerolVM-Team`, or `""` when none is. */
   readonly team: string;
 
-  private readonly client: APIClient;
+  declare private readonly client: APIClient;
 
   constructor(config: MicroVMConfig = {}) {
     const patToken = config.patToken ?? readEnv("SB_PAT_TOKEN") ?? readEnv("SB_API_TOKEN") ?? "";
@@ -149,9 +152,9 @@ export class MicroVM {
     }
 
     this.apiUrl = apiUrl;
-    this.patToken = patToken;
+    Object.defineProperty(this, "patToken", { value: patToken, enumerable: false });
     this.team = team;
-    this.client = new APIClient({
+    const client = new APIClient({
       baseURL: apiUrl,
       patToken,
       team,
@@ -160,6 +163,7 @@ export class MicroVM {
       retry: config.retry,
       signal: config.signal,
     });
+    Object.defineProperty(this, "client", { value: client, enumerable: false });
   }
 
   async create(options: CreateOptions, call?: CallOptions): Promise<Sandbox> {
