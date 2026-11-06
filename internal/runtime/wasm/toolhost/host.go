@@ -66,7 +66,9 @@ func (h *Host) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	case r.Method == http.MethodGet && r.URL.Path == "/version":
 		// The WASM host supports none of toolboxd's newer request options;
 		// an empty list makes the SDKs refuse them instead of sending them.
-		writeJSON(w, http.StatusOK, map[string]any{"version": version.Version, "features": []string{}})
+		// "runtime" lets the SDKs say why: a restart or a new template, the
+		// advice for an older toolboxd, cannot add them here.
+		writeJSON(w, http.StatusOK, map[string]any{"version": version.Version, "features": []string{}, "runtime": "wasm"})
 	case r.Method == http.MethodPost && r.URL.Path == "/process/execute":
 		if !h.requireAuth(w, r) {
 			return

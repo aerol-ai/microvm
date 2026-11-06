@@ -2834,6 +2834,17 @@ class ToolboxFeatureTests(unittest.TestCase):
         client._require_toolbox_features("sb-1")
         self.assertEqual(calls, [])
 
+    def test_a_runtime_that_cannot_offer_the_feature_says_so(self):
+        from microvm import MicroVMUnsupportedFeatureError
+
+        client = MicroVM(api_url="https://sandbox.example.com", pat_token="pat-token")
+        client._do_json = lambda *a, **k: {"version": "v9", "features": [], "runtime": "wasm"}  # type: ignore[assignment]
+        with self.assertRaises(MicroVMUnsupportedFeatureError) as ctx:
+            client._require_toolbox_features("sb-w", "files.verbs")
+        self.assertEqual(ctx.exception.runtime, "wasm")
+        self.assertIn("is a WebAssembly sandbox, which does not support files.verbs", str(ctx.exception))
+        self.assertNotIn("restart", str(ctx.exception))
+
 
 class ExecOptionsTests(unittest.TestCase):
     """Exec options an older sandbox agent would ignore, against a real HTTP

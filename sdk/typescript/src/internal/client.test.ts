@@ -2350,3 +2350,19 @@ test("requireToolboxFeatures fails closed on a missing feature or an older agent
     });
   }
 });
+
+test("requireToolboxFeatures names a runtime that cannot offer the feature", async () => {
+  const client = new APIClient({
+    baseURL: "https://api.example.com",
+    patToken: "pat-token",
+    fetch: async () => jsonResponse({ version: "v9", features: [], runtime: "wasm" }),
+  });
+  await assert.rejects(client.requireToolboxFeatures("sb-w", "files.verbs"), (err: unknown) => {
+    assert.ok(err instanceof MicroVMUnsupportedFeatureError);
+    assert.equal(err.runtime, "wasm");
+    assert.match(err.message, /is a WebAssembly sandbox, which does not support files\.verbs/);
+    assert.doesNotMatch(err.message, /restart/);
+    return true;
+  });
+  assert.match(new MicroVMUnsupportedFeatureError("s", ["x"], "", "isolate").message, /V8 isolate/);
+});

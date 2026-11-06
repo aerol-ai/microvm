@@ -1851,11 +1851,13 @@ public class MicroVMClient {
         }
         java.util.Set<String> have = toolboxFeatures.get(sandboxId);
         String agentVersion = "";
+        String runtime = "";
         if (have == null || !have.containsAll(java.util.Arrays.asList(features))) {
             ToolboxVersion info = doJson("GET", sandboxPath(sandboxId) + "/toolbox/version", null, ToolboxVersion.class);
             have = info == null || info.features == null ? java.util.Set.of() : java.util.Set.copyOf(info.features);
             toolboxFeatures.put(sandboxId, have);
             agentVersion = info == null || info.version == null ? "" : info.version;
+            runtime = info == null || info.runtime == null ? "" : info.runtime;
         }
         List<String> missing = new ArrayList<>();
         for (String feature : features) {
@@ -1864,7 +1866,7 @@ public class MicroVMClient {
             }
         }
         if (!missing.isEmpty()) {
-            throw new MicroVMUnsupportedFeatureException(sandboxId, missing, agentVersion);
+            throw new MicroVMUnsupportedFeatureException(sandboxId, missing, agentVersion, runtime);
         }
     }
 
@@ -2223,6 +2225,7 @@ public class MicroVMClient {
     private static final class ToolboxVersion {
         public String version;
         public List<String> features;
+        public String runtime;
     }
 
     /**

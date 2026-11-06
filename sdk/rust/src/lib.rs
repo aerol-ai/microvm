@@ -161,6 +161,7 @@ pub struct UnsupportedFeatureError {
     sandbox_id: String,
     features: Vec<String>,
     agent_version: String,
+    runtime: String,
 }
 
 impl UnsupportedFeatureError {
@@ -178,10 +179,30 @@ impl UnsupportedFeatureError {
     pub fn agent_version(&self) -> &str {
         &self.agent_version
     }
+
+    /// Set (for example `"wasm"`) when the sandbox's runtime cannot offer
+    /// the features at all; a restart does not help there.
+    pub fn runtime(&self) -> &str {
+        &self.runtime
+    }
 }
 
 impl fmt::Display for UnsupportedFeatureError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if !self.runtime.is_empty() {
+            let runtime = match self.runtime.as_str() {
+                "wasm" => "WebAssembly",
+                "isolate" => "V8 isolate",
+                other => other,
+            };
+            return write!(
+                f,
+                "sandbox {} is a {} sandbox, which does not support {}",
+                self.sandbox_id,
+                runtime,
+                self.features.join(", ")
+            );
+        }
         let agent = if self.agent_version.is_empty() {
             "an older toolboxd".to_string()
         } else {
@@ -2353,6 +2374,7 @@ impl Client {
             sandbox_id: sandbox_id.to_string(),
             features: missing,
             agent_version: info.get("version").and_then(Value::as_str).unwrap_or_default().to_string(),
+            runtime: info.get("runtime").and_then(Value::as_str).unwrap_or_default().to_string(),
         }))
     }
 
@@ -2890,6 +2912,7 @@ fn file_watch_handshake_error(sandbox_id: &str, err: WebSocketError) -> Error {
             sandbox_id: sandbox_id.to_string(),
             features: vec![FILE_WATCH_FEATURE.to_string()],
             agent_version: String::new(),
+            runtime: String::new(),
         });
     }
     Error::Api(api)
@@ -6462,7 +6485,16 @@ mod tests {
             sandbox_id: "sb-1".to_string(),
             features: vec!["a".to_string(), "b".to_string()],
             agent_version: String::new(),
+            runtime: String::new(),
         };
+        let wasm = UnsupportedFeatureError {
+            sandbox_id: "sb-w".to_string(),
+            features: vec!["files.verbs".to_string()],
+            agent_version: "v9".to_string(),
+            runtime: "wasm".to_string(),
+        };
+        assert_eq!(wasm.runtime(), "wasm");
+        assert_eq!(wasm.to_string(), "sandbox sb-w is a WebAssembly sandbox, which does not support files.verbs");
         assert!(unnamed.to_string().contains("runs an older toolboxd, which does not support a, b;"));
 
         // A failed /version call is returned as is.

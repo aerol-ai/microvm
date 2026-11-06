@@ -1046,18 +1046,20 @@ export class APIClient {
     }
     let have = this.toolboxFeatures.get(id);
     let version = "";
+    let runtime = "";
     if (!have || !features.every((feature) => have!.has(feature))) {
-      const info = await this.doJSON<{ version?: string; features?: unknown }>(
+      const info = await this.doJSON<{ version?: string; features?: unknown; runtime?: unknown }>(
         "GET",
         `${this.versionPrefix}/sandboxes/${id}/toolbox/version`,
       );
       have = new Set(Array.isArray(info?.features) ? info.features.map(String) : []);
       this.toolboxFeatures.set(id, have);
       version = typeof info?.version === "string" ? info.version : "";
+      runtime = typeof info?.runtime === "string" ? info.runtime : "";
     }
     const missing = features.filter((feature) => !have!.has(feature));
     if (missing.length > 0) {
-      throw new MicroVMUnsupportedFeatureError(id, missing, version);
+      throw new MicroVMUnsupportedFeatureError(id, missing, version, runtime);
     }
   }
 

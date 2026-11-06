@@ -166,6 +166,9 @@ class MicroVMClientTest {
             assertEquals("0.6.0", old.getAgentVersion());
             assertTrue(new MicroVMUnsupportedFeatureException("sb-1", List.of("a", "b"), "")
                 .getMessage().contains("runs an older toolboxd, which does not support a, b;"));
+            MicroVMUnsupportedFeatureException wasm = new MicroVMUnsupportedFeatureException("sb-w", List.of("files.verbs"), "v9", "wasm");
+            assertEquals("wasm", wasm.getRuntime());
+            assertEquals("sandbox sb-w is a WebAssembly sandbox, which does not support files.verbs", wasm.getMessage());
 
             // A failed /version call is thrown as is, not as unsupported.
             MicroVMApiException notFound = org.junit.jupiter.api.Assertions.assertThrows(

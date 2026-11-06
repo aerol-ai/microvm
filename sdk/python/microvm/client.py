@@ -186,18 +186,31 @@ class MicroVMUnsupportedFeatureError(MicroVMError):
     guard, an output cap), so the SDK refuses instead of sending it.
 
     Restart the sandbox, or re-create its Firecracker template, to get the
-    current agent. ``features`` lists what was missing.
+    current agent. ``features`` lists what was missing. ``runtime`` is set
+    (for example ``"wasm"``) when the sandbox's runtime cannot offer the
+    features at all; a restart does not help there.
     """
 
-    def __init__(self, sandbox_id: str, features: List[str], agent_version: str = "") -> None:
+    def __init__(self, sandbox_id: str, features: List[str], agent_version: str = "", runtime: str = "") -> None:
         self.sandbox_id = sandbox_id
         self.features = features
         self.agent_version = agent_version
+        self.runtime = runtime
+        if runtime:
+            super().__init__(
+                f"sandbox {sandbox_id} is a {_runtime_display_name(runtime)} sandbox, "
+                f"which does not support {', '.join(features)}"
+            )
+            return
         agent = f"toolboxd {agent_version}" if agent_version else "an older toolboxd"
         super().__init__(
             f"sandbox {sandbox_id} runs {agent}, which does not support {', '.join(features)}; "
             "restart the sandbox, or re-create its Firecracker template, to get the current agent"
         )
+
+
+def _runtime_display_name(runtime: str) -> str:
+    return {"wasm": "WebAssembly", "isolate": "V8 isolate"}.get(runtime, runtime)
 
 
 class MicroVMFileTooLargeError(MicroVMError):
@@ -835,6 +848,8 @@ class MicroVM:
         # _require_toolbox_features). Refreshed on a miss, because a restart
         # can bring a newer agent.
         self._toolbox_features: Dict[str, frozenset] = {}
+        # The runtime a sandbox's /version named ("wasm"), for the error text.
+        self._toolbox_runtimes: Dict[str, str] = {}
 
     def _versioned(self, suffix: str) -> str:
         """Build a versioned API path. Pass the suffix beginning with "/" (e.g.
@@ -1485,9 +1500,12 @@ class MicroVM:
             have = frozenset(str(f) for f in listed) if isinstance(listed, list) else frozenset()
             self._toolbox_features[sandbox_id] = have
             version = str(info.get("version") or "") if isinstance(info, dict) else ""
+            self._toolbox_runtimes[sandbox_id] = str(info.get("runtime") or "") if isinstance(info, dict) else ""
         missing = [f for f in features if f not in have]
         if missing:
-            raise MicroVMUnsupportedFeatureError(sandbox_id, missing, version)
+            raise MicroVMUnsupportedFeatureError(
+                sandbox_id, missing, version, self._toolbox_runtimes.get(sandbox_id, "")
+            )
 
     def upload_file(
         self,

@@ -36,9 +36,16 @@ type UnsupportedFeatureError struct {
 	SandboxID    string
 	Features     []string
 	AgentVersion string
+	// Runtime is set (for example "wasm") when the sandbox's runtime cannot
+	// offer the features at all; a restart does not help there.
+	Runtime string
 }
 
 func (e *UnsupportedFeatureError) Error() string {
+	if e.Runtime != "" {
+		return fmt.Sprintf("sandbox %s is a %s sandbox, which does not support %s",
+			e.SandboxID, runtimeDisplayName(e.Runtime), strings.Join(e.Features, ", "))
+	}
 	agent := "an older toolboxd"
 	if e.AgentVersion != "" {
 		agent = "toolboxd " + e.AgentVersion
@@ -48,6 +55,16 @@ func (e *UnsupportedFeatureError) Error() string {
 }
 
 func (e *UnsupportedFeatureError) Unwrap() error { return ErrUnsupportedFeature }
+
+func runtimeDisplayName(runtime string) string {
+	switch runtime {
+	case "wasm":
+		return "WebAssembly"
+	case "isolate":
+		return "V8 isolate"
+	}
+	return runtime
+}
 
 // StreamError is a failure the toolbox reported on an exec or session
 // stream (an "error" frame: the command could not start, say), as opposed

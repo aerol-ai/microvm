@@ -1072,6 +1072,7 @@ func (c *Client) RequireToolboxFeatures(ctx context.Context, id string, features
 	var info struct {
 		Version  string   `json:"version"`
 		Features []string `json:"features"`
+		Runtime  string   `json:"runtime"`
 	}
 	if err := c.doJSON(ctx, http.MethodGet, c.versionPrefix+"/sandboxes/"+url.PathEscape(id)+"/toolbox/version", nil, &info); err != nil {
 		return err
@@ -1093,7 +1094,7 @@ func (c *Client) RequireToolboxFeatures(ctx context.Context, id string, features
 		}
 	}
 	if len(missing) > 0 {
-		return &UnsupportedFeatureError{SandboxID: id, Features: missing, AgentVersion: info.Version}
+		return &UnsupportedFeatureError{SandboxID: id, Features: missing, AgentVersion: info.Version, Runtime: info.Runtime}
 	}
 	return nil
 }

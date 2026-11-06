@@ -44,18 +44,32 @@ export class MicroVMUnsupportedFeatureError extends Error {
   readonly features: string[];
   /** The agent's version when it reported one. */
   readonly agentVersion: string;
+  /**
+   * Set (for example "wasm") when the sandbox's runtime cannot offer the
+   * features at all; a restart does not help there.
+   */
+  readonly runtime: string;
 
-  constructor(sandboxID: string, features: string[], agentVersion = "") {
+  constructor(sandboxID: string, features: string[], agentVersion = "", runtime = "") {
     const agent = agentVersion ? `toolboxd ${agentVersion}` : "an older toolboxd";
     super(
-      `sandbox ${sandboxID} runs ${agent}, which does not support ${features.join(", ")}; ` +
-        "restart the sandbox, or re-create its Firecracker template, to get the current agent",
+      runtime
+        ? `sandbox ${sandboxID} is a ${runtimeDisplayName(runtime)} sandbox, which does not support ${features.join(", ")}`
+        : `sandbox ${sandboxID} runs ${agent}, which does not support ${features.join(", ")}; ` +
+            "restart the sandbox, or re-create its Firecracker template, to get the current agent",
     );
     this.name = "MicroVMUnsupportedFeatureError";
     this.sandboxID = sandboxID;
     this.features = features;
     this.agentVersion = agentVersion;
+    this.runtime = runtime;
   }
+}
+
+function runtimeDisplayName(runtime: string): string {
+  if (runtime === "wasm") return "WebAssembly";
+  if (runtime === "isolate") return "V8 isolate";
+  return runtime;
 }
 
 /**

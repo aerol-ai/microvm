@@ -71,3 +71,27 @@ func TestRequireToolboxFeatures(t *testing.T) {
 		t.Fatalf("missing sandbox: %v", err)
 	}
 }
+
+// A runtime that cannot offer a feature says so instead of advising a
+// restart that cannot help.
+func TestRequireToolboxFeaturesNamesTheRuntime(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"version": "v9", "features": []string{}, "runtime": "wasm"})
+	}))
+	defer server.Close()
+	client := NewClient(server.URL, ClientOptions{PATToken: "t", HTTPClient: server.Client()})
+	err := client.RequireToolboxFeatures(context.Background(), "sb-w", "files.verbs")
+	var unsupported *UnsupportedFeatureError
+	if !errors.As(err, &unsupported) || unsupported.Runtime != "wasm" {
+		t.Fatalf("err = %v, want an UnsupportedFeatureError naming wasm", err)
+	}
+	if got := err.Error(); !strings.Contains(got, "is a WebAssembly sandbox, which does not support files.verbs") || strings.Contains(got, "restart") {
+		t.Fatalf("message = %q", got)
+	}
+	if got := (&UnsupportedFeatureError{SandboxID: "s", Features: []string{"x"}, Runtime: "isolate"}).Error(); !strings.Contains(got, "V8 isolate") {
+		t.Fatalf("isolate message = %q", got)
+	}
+	if got := (&UnsupportedFeatureError{SandboxID: "s", Features: []string{"x"}, Runtime: "other"}).Error(); !strings.Contains(got, "is a other sandbox") {
+		t.Fatalf("raw runtime message = %q", got)
+	}
+}

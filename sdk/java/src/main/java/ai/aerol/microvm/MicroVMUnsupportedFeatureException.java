@@ -16,15 +16,25 @@ public class MicroVMUnsupportedFeatureException extends MicroVMException {
     private final String sandboxId;
     private final List<String> features;
     private final String agentVersion;
+    private final String runtime;
 
     public MicroVMUnsupportedFeatureException(String sandboxId, List<String> features, String agentVersion) {
-        super(message(sandboxId, features, agentVersion));
+        this(sandboxId, features, agentVersion, "");
+    }
+
+    public MicroVMUnsupportedFeatureException(String sandboxId, List<String> features, String agentVersion, String runtime) {
+        super(message(sandboxId, features, agentVersion, runtime));
         this.sandboxId = sandboxId;
         this.features = Collections.unmodifiableList(List.copyOf(features));
         this.agentVersion = agentVersion == null ? "" : agentVersion;
+        this.runtime = runtime == null ? "" : runtime;
     }
 
-    private static String message(String sandboxId, List<String> features, String agentVersion) {
+    private static String message(String sandboxId, List<String> features, String agentVersion, String runtime) {
+        if (runtime != null && !runtime.isEmpty()) {
+            String name = "wasm".equals(runtime) ? "WebAssembly" : "isolate".equals(runtime) ? "V8 isolate" : runtime;
+            return "sandbox " + sandboxId + " is a " + name + " sandbox, which does not support " + String.join(", ", features);
+        }
         String agent = agentVersion == null || agentVersion.isEmpty() ? "an older toolboxd" : "toolboxd " + agentVersion;
         return "sandbox " + sandboxId + " runs " + agent + ", which does not support " + String.join(", ", features)
             + "; restart the sandbox, or re-create its Firecracker template, to get the current agent";
@@ -43,5 +53,13 @@ public class MicroVMUnsupportedFeatureException extends MicroVMException {
     /** The agent's version, empty when it did not say. */
     public String getAgentVersion() {
         return agentVersion;
+    }
+
+    /**
+     * Set (for example "wasm") when the sandbox's runtime cannot offer the
+     * features at all; a restart does not help there. Empty otherwise.
+     */
+    public String getRuntime() {
+        return runtime;
     }
 }
