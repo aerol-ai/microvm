@@ -223,6 +223,21 @@ test("destroyOnExit deletes the sandbox when the block ends, even on an error", 
   assert.equal(fake.count("DELETE"), 2);
 });
 
+test("a sandbox getOrCreate found is never deleted on exit", async () => {
+  // Another program may be using the sandbox it shares a name with.
+  const fake = new FakeSandboxd();
+  const client = fake.client();
+  await client.create({ image: "alpine", name: "shared" });
+  {
+    const { sandbox, created } = await client.getOrCreate("shared", { image: "alpine", destroyOnExit: true });
+    assert.equal(created, false);
+    assert.equal(sandbox.destroyOnExit, false);
+    await using held = sandbox;
+  }
+  assert.equal(fake.count("DELETE"), 0);
+  assert.equal(fake.sandboxes.size, 1);
+});
+
 test("asyncDispose deletes once and counts an already gone sandbox as deleted", async () => {
   const fake = new FakeSandboxd();
   const sandbox = await fake.client().create({ image: "alpine", name: "a" });

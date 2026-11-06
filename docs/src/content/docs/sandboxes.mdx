@@ -799,6 +799,8 @@ Each SDK can delete a sandbox for you when a block of code ends, even when that 
 
 A sandbox that is already gone counts as deleted. A few details:
 
+- **`getOrCreate` deletes only what it made.** The flag applies when the call creates the sandbox. When it finds one that already has the name, that sandbox is never deleted on exit, because another program may be using it. Set the flag on the sandbox yourself if you do want it gone.
+
 - **Python:** if your code raised an error and the delete also fails, you still get your error. The failed delete is added to it as a note.
 - **Go:** `Close` still deletes after your `ctx` was cancelled or ran out of time, which is when a `defer` often runs. It allows itself two minutes.
 - **Rust:** a failed delete when the guard drops is ignored, because `Drop` cannot return an error. Call `guard.destroy()` to see the error, or `guard.keep()` to keep the sandbox.

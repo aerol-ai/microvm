@@ -211,7 +211,9 @@ export class MicroVM {
   async getOrCreate(name: string, options: CreateOptions, call?: CallOptions): Promise<GetOrCreateResult> {
     const result = await this.clientFor(call).getOrCreate(name, options);
     const sandbox = this.wrap(result.sandbox.toJSON());
-    sandbox.destroyOnExit = options.destroyOnExit ?? false;
+    // destroyOnExit applies only to a sandbox this call created. One it found
+    // may be in use by another program that shares the name.
+    sandbox.destroyOnExit = result.created ? (options.destroyOnExit ?? false) : false;
     return { sandbox, created: result.created };
   }
 

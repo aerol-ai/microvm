@@ -276,6 +276,19 @@ class AutoCleanupTests(unittest.TestCase):
             pass
         self.assertEqual(fake.sandboxes, {})
 
+    def test_a_found_sandbox_is_never_deleted_on_exit(self):
+        # Another program may be using the sandbox it shares a name with.
+        fake = FakeSandboxd(self)
+        client = fake.client()
+        client.create(image="alpine", name="shared")
+        sandbox, created = client.get_or_create("shared", image="alpine", destroy_on_exit=True)
+        self.assertFalse(created)
+        self.assertFalse(sandbox.destroy_on_exit)
+        with sandbox:
+            pass
+        self.assertEqual(fake.count("DELETE"), 0)
+        self.assertEqual(len(fake.sandboxes), 1)
+
     def test_the_flag_is_never_sent(self):
         payload = client_module._to_api_create_options({"image": "alpine", "destroy_on_exit": True, "destroyOnExit": True})
         self.assertNotIn("destroy_on_exit", payload)

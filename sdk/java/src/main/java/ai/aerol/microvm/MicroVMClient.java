@@ -540,10 +540,12 @@ public class MicroVMClient {
         if (!given.isEmpty() && !given.equals(wanted)) {
             throw new IllegalArgumentException("options name \"" + given + "\" differs from \"" + wanted + "\"");
         }
-        boolean destroyOnClose = options != null && options.destroyOnClose;
+        // destroyOnClose applies only to a sandbox this call creates (create()
+        // sets it). One it finds may be in use by another program that shares
+        // the name, so it is never deleted on close.
         java.util.Optional<Sandbox> existing = getByName(wanted);
         if (existing.isPresent()) {
-            return new GetOrCreateResult(existing.get().setDestroyOnClose(destroyOnClose), false);
+            return new GetOrCreateResult(existing.get().setDestroyOnClose(false), false);
         }
         CreateOptions named = copyCreateOptions(options);
         named.name = wanted;
@@ -555,7 +557,7 @@ public class MicroVMClient {
             if (winner.isEmpty()) {
                 throw e;
             }
-            return new GetOrCreateResult(winner.get().setDestroyOnClose(destroyOnClose), false);
+            return new GetOrCreateResult(winner.get().setDestroyOnClose(false), false);
         }
     }
 

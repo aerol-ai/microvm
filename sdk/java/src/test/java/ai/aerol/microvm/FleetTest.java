@@ -229,6 +229,21 @@ class FleetTest {
     }
 
     @Test
+    void getOrCreateNeverDeletesAFoundSandboxOnClose() throws Exception {
+        // Another program may be using the sandbox it shares a name with.
+        FakeSandboxd fake = new FakeSandboxd(0);
+        fake.add("shared", Map.of(), "alpine");
+        CreateOptions options = new CreateOptions().setImage("alpine").setDestroyOnClose(true);
+        GetOrCreateResult result = fake.client.getOrCreate("shared", options);
+        assertFalse(result.isCreated());
+        assertFalse(result.getSandbox().isDestroyOnClose());
+        try (Sandbox held = result.getSandbox()) {
+            assertEquals("shared", held.name);
+        }
+        assertEquals(0, fake.count("DELETE"));
+    }
+
+    @Test
     void getOrCreateGivesConcurrentCallersOneSandbox() throws Exception {
         int callers = 8;
         FakeSandboxd fake = new FakeSandboxd(callers);

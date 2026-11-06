@@ -1295,10 +1295,11 @@ class _MicroVMCore:
         if given and given != wanted:
             raise ValueError(f"options name {given!r} differs from {wanted!r}")
         resolved["name"] = wanted
-        destroy_on_exit = bool(_first_of(resolved, "destroy_on_exit", "destroyOnExit"))
+        # destroy_on_exit applies only to a sandbox this call creates. One it
+        # finds may be in use by another program that shares the name, and
+        # deleting it on exit would pull it out from under that program.
         existing = (yield from self._op_get_by_name(wanted))
         if existing is not None:
-            existing.destroy_on_exit = destroy_on_exit
             return existing, False
         try:
             return (yield from self._op_create(resolved)), True
@@ -1309,7 +1310,6 @@ class _MicroVMCore:
             winner = (yield from self._op_get_by_name(wanted))
             if winner is None:
                 raise
-            winner.destroy_on_exit = destroy_on_exit
             return winner, False
 
     def _op_get(self, sandbox_id: str, *, include_env: bool = False):
