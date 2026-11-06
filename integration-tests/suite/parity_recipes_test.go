@@ -306,3 +306,54 @@ with sync_playwright() as p:
 		t.Fatalf("screenshot is not a PNG (%d bytes)", len(png))
 	}
 }
+
+// UC-465 — the code-server image (plan G10): images/code-server/Dockerfile
+// builds on the server through the SDK's image builder; the editor answers
+// on 8080 inside the sandbox as uid 1000 with no sudo; and once 8080 is
+// exposed with visibility token, its public URL is a 401 without a token
+// and serves code-server's health check with the token cookie.
+func TestParityCodeServerImage(t *testing.T) {
+	harness.Require(t, sc, "UC-465")
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+	defer cancel()
+	sb := recipesImageSandbox(t, ctx, "code-server", sdktypes.CreateSandboxOptions{CPU: 2, MemoryMB: 2048})
+
+	recipesPoll(t, "code-server on 8080 inside", 2*time.Minute, func() (bool, string) {
+		out := recipesExecOut(t, ctx, sb, "curl -s http://127.0.0.1:8080/healthz")
+		return strings.Contains(out, `"status"`), out
+	})
+	if out := recipesExecOut(t, ctx, sb, "id -u; sudo -n true >/dev/null 2>&1 && echo has-sudo || echo no-sudo"); out != "1000\nno-sudo" {
+		t.Fatalf("user and sudo = %q, want uid 1000 without sudo", out)
+	}
+
+	exposure, err := sb.ExposePort(ctx, 8080, microvm.WithVisibility(sdktypes.ExposeVisibilityToken))
+	if err != nil {
+		t.Fatalf("expose 8080 with visibility token: %v", err)
+	}
+	health := strings.TrimRight(exposure.PublicURL, "/") + "/healthz"
+	recipesPoll(t, "the editor URL refuses a visitor without a token", 90*time.Second, func() (bool, string) {
+		st, got := recipesHTTP(t, http.MethodGet, health, nil, nil)
+		if st == http.StatusOK {
+			t.Fatalf("the editor answered without a token: %s", got)
+		}
+		return st == http.StatusUnauthorized, got
+	})
+	tok := issueSandboxToken(t, ctx, sb, sdktypes.CreateSandboxTokenOptions{Port: 8080, ExpiresIn: "10m"})
+	cookie := map[string]string{"Cookie": "__Host-aerolvm-token=" + tok.Token}
+	// Only Caddy's own catch-all ("Sandbox not found", for a host with no
+	// route) is retried: on a single node with per-sandbox Caddy routes the
+	// port's route once went missing for a moment right after it had
+	// answered 401 (single-node-fc, 2026-11-06; TODOS.md). Any other
+	// answer fails at once.
+	recipesPoll(t, "health with the token cookie", 60*time.Second, func() (bool, string) {
+		st, got := recipesHTTP(t, http.MethodGet, health, cookie, nil)
+		if st == http.StatusNotFound && strings.Contains(got, "Sandbox not found") {
+			t.Logf("health with the token cookie hit the route-less fallback; retrying: %s", got)
+			return false, got
+		}
+		if st != http.StatusOK || !strings.Contains(got, `"status"`) {
+			t.Fatalf("health with the token cookie = %d %s", st, got)
+		}
+		return true, got
+	})
+}

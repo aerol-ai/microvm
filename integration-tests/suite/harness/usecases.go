@@ -1039,6 +1039,7 @@ var Registry = []UseCase{
 	// Agent-sandbox parity, images and recipes (parity_recipes_test.go; plan G8, G10, G12).
 	{ID: "UC-463", Title: "E2B mcp option through the live E2B facade: E2B's mcp-gateway template is refused with a 501 naming the missing gateway; with the base template the create succeeds, port 50005 is exposed public, and a server started on 50005 (as the E2B SDK starts mcp-gateway) answers on that URL", Requires: []Capability{CapDomain}, Implemented: true},
 	{ID: "UC-464", Title: "Computer-use image: images/computer-use/Dockerfile builds on the server through the SDK image builder; in a sandbox from it Chrome's DevTools answers on 127.0.0.1:9222, noVNC serves on 6080, commands run as the image's non-root user, and Playwright drives the browser over CDP and writes a PNG screenshot", Requires: []Capability{CapDocker}, Implemented: true},
+	{ID: "UC-465", Title: "code-server image: images/code-server/Dockerfile builds on the server through the SDK image builder; the editor answers on 8080 inside as uid 1000 with no sudo; exposed with visibility token its URL is a 401 without a token and serves the health check with the token cookie", Requires: []Capability{CapDocker, CapDomain}, Implemented: true},
 	{ID: "UC-466", Title: "Host an MCP server recipe: the filesystem MCP server behind supergateway, started as a session, answers a JSON-RPC initialize through its exposed port with its key and 401s without it; exposed with visibility token it also needs the sandbox token cookie", Requires: []Capability{CapDomain}, Implemented: true},
 }
 

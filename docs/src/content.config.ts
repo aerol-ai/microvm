@@ -106,6 +106,7 @@ const getDocsSidebarConfig = (): NavigationGroup[] => [
     category: NavigationCategory.SANDBOXES,
     entries: [
       link('/computer-use', '- Computer use and browser'),
+      link('/vscode-in-browser', '- VS Code in the browser'),
     ],
   },
   
