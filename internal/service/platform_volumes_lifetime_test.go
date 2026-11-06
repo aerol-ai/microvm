@@ -340,7 +340,7 @@ func TestSweepDeleteWithSandboxBranches(t *testing.T) {
 	svc, st, _ := lifetimeHarness(t)
 	ctx := context.Background()
 	vol := models.Volume{ID: "v", Tenant: "t", Source: "b/v", DeleteWithSandbox: true}
-	young := models.PendingVolumeDeletion{VolumeID: "v", Tenant: "t", Source: "b/v", CreatedAt: time.Now()}
+	young := localVolumeObligation(models.PendingVolumeDeletion{VolumeID: "v", Tenant: "t", Source: "b/v", CreatedAt: time.Now()})
 	old := young
 	old.CreatedAt = time.Now().Add(-2 * deleteWithSandboxPendingGrace)
 	if err := st.SchedulePendingVolumeDeletion(ctx, vol, vol.Source); err != nil {

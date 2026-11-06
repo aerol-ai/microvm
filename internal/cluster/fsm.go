@@ -56,8 +56,10 @@ const (
 	// the leader (storage_obligations.go).
 	// 26 is opReportStorageObligations (storage_obligations.go); 27/28 are the
 	// egress-profile ops (fsm_egress_profiles.go); 31/32 are the API-token
-	// ops (fsm_tokens.go); 33/34 are the warm-pool ops (fsm_warm_pools.go).
-	// The next free code is 35.
+	// ops (fsm_tokens.go); 33/34 are the warm-pool ops (fsm_warm_pools.go);
+	// 35-37 are the identity ops (fsm_identity.go); 38/39 are the team-quota
+	// ops (fsm_team_quotas.go); 40/41 are the volume-reclaim ops
+	// (fsm_volume_reclaims.go). The next free code is 42.
 	opRegisterSnapshotNode opCode = 29 // record which node holds a snapshot's image (name → node, cluster-wide)
 	opForgetSnapshotNode   opCode = 30 // drop a snapshot's name → node entry (on delete / node death)
 )
@@ -196,6 +198,14 @@ type command struct {
 	MaxPerTenant      int                       `json:"max_per_tenant,omitempty"`
 	VolumeAttachments []models.VolumeAttachment `json:"volume_attachments,omitempty"`
 	VolumeSandboxID   string                    `json:"volume_sandbox_id,omitempty"`
+	// VolumeReclaimNodeID, on opDelete, asks the FSM to record a
+	// VolumeReclaim (stamped StampUnixNano, drained by this node) for every
+	// delete_with_sandbox volume the deleted sandbox was the last holder of
+	// (fsm_volume_reclaims.go). Empty: no record, the older behaviour.
+	VolumeReclaimNodeID string `json:"volume_reclaim_node_id,omitempty"`
+	// VolumeReclaim names the entry opAckVolumeReclaim drops or
+	// opClaimVolumeReclaim moves to NodeID.
+	VolumeReclaim *VolumeReclaim `json:"volume_reclaim,omitempty"`
 	// EgressProfile carries the profile for opPutEgressProfile, and its owner
 	// and name for opDeleteEgressProfile (fsm_egress_profiles.go).
 	EgressProfile *EgressProfileRecord `json:"egress_profile,omitempty"`
@@ -561,6 +571,12 @@ type placementFSM struct {
 	volumeAttachments          map[string]models.VolumeAttachment
 	volumeAttachmentsByVolume  map[string]map[string]struct{}
 	volumeAttachmentsBySandbox map[string]map[string]struct{}
+	// volumeReclaims are the delete_with_sandbox volumes still owed a
+	// backend delete, by volumeKey (fsm_volume_reclaims.go, snapshotted).
+	// volumeReclaimsByNode indexes them by the node that drains them
+	// (derived, rebuilt on Restore).
+	volumeReclaims       map[string]VolumeReclaim
+	volumeReclaimsByNode map[string]map[string]struct{}
 	// egressProfiles are the replicated named egress profiles (snapshotted).
 	// egressProfileRefs is derived: which placements reference each profile,
 	// kept in step with f.placements by reindexEgressProfilesLocked and
@@ -673,6 +689,8 @@ func newPlacementFSMWithRecoveryStore(store placementRecoveryStore) *placementFS
 		volumeAttachments:            make(map[string]models.VolumeAttachment),
 		volumeAttachmentsByVolume:    make(map[string]map[string]struct{}),
 		volumeAttachmentsBySandbox:   make(map[string]map[string]struct{}),
+		volumeReclaims:               make(map[string]VolumeReclaim),
+		volumeReclaimsByNode:         make(map[string]map[string]struct{}),
 		egressProfiles:               make(map[EgressProfileKey]*EgressProfileRecord),
 		egressProfileRefs:            make(map[EgressProfileKey]map[string]struct{}),
 		teamQuotas:                   make(map[string]*TeamQuotaRecord),
@@ -1201,6 +1219,11 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 				f.releasePendingReservationLocked(cmd.SandboxID)
 				f.releasePendingReservationOwnerLocked(cmd.SandboxID, existing.OwnerNodeID)
 			}
+		}
+		// The attachments below are the last link from a sandbox to a
+		// delete_with_sandbox volume: record what they leave owed first.
+		if cmd.VolumeReclaimNodeID != "" {
+			f.recordVolumeReclaimsLocked(cmd.SandboxID, cmd.VolumeReclaimNodeID, cmd.StampUnixNano)
 		}
 		f.releaseVolumeAttachmentsForSandboxLocked(cmd.SandboxID)
 		f.deletePlacementRecoveryLocked(cmd.SandboxID)
@@ -1837,6 +1860,16 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 		return result
 	case opDeleteWarmPool:
 		if err := f.applyDeleteWarmPoolLocked(cmd); err != nil {
+			return err
+		}
+		return nil
+	case opAckVolumeReclaim:
+		if err := f.applyAckVolumeReclaimLocked(cmd); err != nil {
+			return err
+		}
+		return nil
+	case opClaimVolumeReclaim:
+		if err := f.applyClaimVolumeReclaimLocked(cmd); err != nil {
 			return err
 		}
 		return nil
@@ -3527,6 +3560,12 @@ type fsmSnapshotPayload struct {
 	// TeamQuotas is the replicated team-quota set. Optional; an older
 	// snapshot decodes it as nil, which reads as "no quotas".
 	TeamQuotas []TeamQuotaRecord
+	// VolumeReclaims are the delete_with_sandbox volumes still owed a
+	// backend delete. Optional; an older snapshot decodes it as nil, which
+	// reads as "none owed". An older build ignores the field, which is safe
+	// because no entry is written until every server runs a build with it
+	// (volumeReclaimFSMOpsVersion).
+	VolumeReclaims []VolumeReclaim
 }
 
 type placementSnapshotRow struct {
@@ -3604,6 +3643,7 @@ func (f *placementFSM) Snapshot() (raft.FSMSnapshot, error) {
 		auditACLs:          auditACLs,
 		volumes:            f.volumesSnapshotLocked(),
 		volumeAttachments:  f.volumeAttachmentsSnapshotLocked(),
+		volumeReclaims:     f.volumeReclaimsSnapshotLocked(),
 		egressProfiles:     f.egressProfilesSnapshotLocked(),
 		teamQuotas:         f.teamQuotasSnapshotLocked(),
 		snapshotNodes:      snapshotNodes,
@@ -3745,6 +3785,7 @@ func (f *placementFSM) Restore(rc io.ReadCloser) (err error) {
 		}
 		f.putVolumeAttachmentLocked(a)
 	}
+	f.restoreVolumeReclaimsLocked(payload.VolumeReclaims)
 	for id, p := range payload.Placements {
 		full := p
 		if full.SandboxID == "" {
@@ -3848,6 +3889,7 @@ type fsmSnapshot struct {
 	auditACLs          map[string]AuditACL
 	volumes            []models.Volume
 	volumeAttachments  []models.VolumeAttachment
+	volumeReclaims     []VolumeReclaim
 	egressProfiles     []EgressProfileRecord
 	snapshotNodes      map[string]string
 	apiTokens          []identity.TokenRecord
@@ -3877,6 +3919,7 @@ func (s *fsmSnapshot) Persist(sink raft.SnapshotSink) (err error) {
 		AuditACLs:          s.auditACLs,
 		Volumes:            s.volumes,
 		VolumeAttachments:  s.volumeAttachments,
+		VolumeReclaims:     s.volumeReclaims,
 		EgressProfiles:     s.egressProfiles,
 		SnapshotNodes:      s.snapshotNodes,
 		APITokens:          s.apiTokens,

@@ -1396,7 +1396,7 @@ func (h *handlers) writeInternalPlacement(w http.ResponseWriter, id string) {
 
 // clusterInternalVolume answers an agent-role node's volume metadata read from
 // this server node's replicated FSM. Kinds: id, name, list, source,
-// attachment_count, sandbox. Writes never
+// attachment_count, sandbox, reclaims. Writes never
 // hit this path — they flow through the generic apply endpoint.
 func (h *handlers) clusterInternalVolume(w http.ResponseWriter, r *http.Request) {
 	c := h.deps.Service.Cluster()
@@ -1449,6 +1449,21 @@ func (h *handlers) clusterInternalVolume(w http.ResponseWriter, r *http.Request)
 			return
 		}
 		apihttp.WriteJSON(w, http.StatusOK, cluster.VolumeQueryResponse{Attachments: attachments})
+	case "reclaims":
+		// The delete_with_sandbox volumes the asking worker should drain
+		// (cluster/fsm_volume_reclaims.go).
+		rc, ok := c.(cluster.VolumeReclaimClient)
+		if !ok {
+			apihttp.WriteError(w, http.StatusBadRequest, "unknown volume query kind")
+			return
+		}
+		limit, _ := strconv.Atoi(q.Get("limit"))
+		reclaims, err := rc.VolumeReclaimsFor(r.Context(), q.Get("node_id"), limit)
+		if err != nil {
+			apihttp.WriteError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		apihttp.WriteJSON(w, http.StatusOK, cluster.VolumeQueryResponse{Reclaims: reclaims})
 	default:
 		apihttp.WriteError(w, http.StatusBadRequest, "unknown volume query kind")
 	}

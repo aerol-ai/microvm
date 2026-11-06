@@ -69,9 +69,9 @@ func TestVolumeReclaimCancelAndFailWave15(t *testing.T) {
 		s2.logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
 	_ = s2.store.Close()
-	s2.reclaimOne(context.Background(), models.PendingVolumeDeletion{
+	s2.reclaimOne(context.Background(), localVolumeObligation(models.PendingVolumeDeletion{
 		VolumeID: "v", Tenant: "op", Backend: "local", Source: "/nope",
-	})
+	}))
 }
 
 // blockingVolumeReclaimer holds the first Reclaim until released so
@@ -199,7 +199,7 @@ func TestVolumeReclaimCancelSweepLimitAndMetaWave20(t *testing.T) {
 	s3.logger = s.logger
 	s3.SetVolumeReclaimer(&fakeReclaimer{})
 	s3.testVolumeMeta = &scriptedVolumeMeta{byIDErr: store.ErrNotFound, existsErr: errors.New("exists boom")}
-	s3.reclaimOne(ctx, models.PendingVolumeDeletion{VolumeID: "v", Tenant: "op", Source: "/x", Backend: "local"})
+	s3.reclaimOne(ctx, localVolumeObligation(models.PendingVolumeDeletion{VolumeID: "v", Tenant: "op", Source: "/x", Backend: "local"}))
 
 	// reclaimOne: live source + DeletePending failure (close store after meta says live).
 	s4 := enabledVolumeService(t)
@@ -207,7 +207,7 @@ func TestVolumeReclaimCancelSweepLimitAndMetaWave20(t *testing.T) {
 	s4.SetVolumeReclaimer(&fakeReclaimer{})
 	s4.testVolumeMeta = &scriptedVolumeMeta{byIDErr: store.ErrNotFound, exists: true}
 	_ = s4.store.Close()
-	s4.reclaimOne(ctx, models.PendingVolumeDeletion{VolumeID: "v2", Tenant: "op", Source: "/y", Backend: "local"})
+	s4.reclaimOne(ctx, localVolumeObligation(models.PendingVolumeDeletion{VolumeID: "v2", Tenant: "op", Source: "/y", Backend: "local"}))
 
 	// reclaimOne: reclaim ok + DeletePending failure.
 	s5 := enabledVolumeService(t)
@@ -215,7 +215,7 @@ func TestVolumeReclaimCancelSweepLimitAndMetaWave20(t *testing.T) {
 	s5.SetVolumeReclaimer(&fakeReclaimer{})
 	s5.testVolumeMeta = &scriptedVolumeMeta{byIDErr: store.ErrNotFound, exists: false}
 	_ = s5.store.Close()
-	s5.reclaimOne(ctx, models.PendingVolumeDeletion{VolumeID: "v3", Tenant: "op", Source: "/z", Backend: "local"})
+	s5.reclaimOne(ctx, localVolumeObligation(models.PendingVolumeDeletion{VolumeID: "v3", Tenant: "op", Source: "/z", Backend: "local"}))
 }
 
 func itoaWave20(i int) string {
@@ -259,5 +259,5 @@ func TestReclaimOneLiveSourceCheckError(t *testing.T) {
 		VolumeID: "v-err", Tenant: "t-a", Name: "n-err",
 		Backend: "s3", Source: "aerol-volumes/volumes/t-a/n-err",
 	}
-	s.reclaimOne(ctx, pending)
+	s.reclaimOne(ctx, localVolumeObligation(pending))
 }

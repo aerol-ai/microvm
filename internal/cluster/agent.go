@@ -800,11 +800,13 @@ func (a *Agent) DeletePlacementExact(ctx context.Context, sandboxID, expectedOwn
 	if expectedIncarnationID == "" {
 		return fmt.Errorf("%w: exact placement delete requires current incarnation", ErrIncarnationConflict)
 	}
-	return a.applyCommand(ctx, command{
+	cmd := command{
 		Op: opDelete, SandboxID: sandboxID,
 		ExpectedOwnerNodeID: expectedOwnerNodeID, ExpectedOwnerNodeIDSet: true, ExpectedIncarnationID: expectedIncarnationID,
 		ExpiresUnix: auditACLExpiryUnix(a.cfg.AuditDeletedGrace), AuditIndexMax: int64(a.cfg.AuditDeletedIndexMax),
-	})
+	}
+	stampVolumeReclaims(&cmd, a.VolumeReclaimsReplicated(), a.nodeID)
+	return a.applyCommand(ctx, cmd)
 }
 
 func (a *Agent) BeginDeletePlacementExact(ctx context.Context, sandboxID, expectedOwnerNodeID, expectedIncarnationID string) error {

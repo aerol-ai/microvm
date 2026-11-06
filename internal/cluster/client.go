@@ -865,6 +865,10 @@ func (c *Cluster) DeletePlacementExact(ctx context.Context, sandboxID, expectedO
 		ExpectedOwnerNodeID: expectedOwnerNodeID, ExpectedOwnerNodeIDSet: true, ExpectedIncarnationID: expectedIncarnationID,
 		ExpiresUnix: auditACLExpiryUnix(c.cfg.AuditDeletedGrace), AuditIndexMax: int64(c.cfg.AuditDeletedIndexMax),
 	}
+	// Every path that deletes a placement (a destroy, the leader expiring an
+	// abandoned delete, an operator's orphan delete) goes through here, so
+	// the volumes it leaves owed are recorded on all of them.
+	stampVolumeReclaims(&cmd, c.VolumeReclaimsReplicated(), c.nodeID)
 	return c.applyCommand(ctx, cmd)
 }
 

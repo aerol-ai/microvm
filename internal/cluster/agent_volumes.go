@@ -27,6 +27,9 @@ type VolumeQueryResponse struct {
 	// 400 (unknown kind), which the agent reports as an error: the caller
 	// then keeps the volumes rather than guess.
 	Attachments []models.VolumeAttachment `json:"attachments,omitempty"`
+	// Reclaims answers kind=reclaims (fsm_volume_reclaims.go). A server
+	// that predates it answers 400; the agent's sweep skips that pass.
+	Reclaims []VolumeReclaim `json:"reclaims,omitempty"`
 }
 
 func (a *Agent) VolumeUpsert(ctx context.Context, v models.Volume, maxPerTenant int) (models.Volume, bool, error) {

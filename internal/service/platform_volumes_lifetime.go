@@ -15,22 +15,34 @@ import (
 //
 // The attachment index is what says "last": SQLite drops a sandbox's
 // attachments with its row (FK cascade), the cluster FSM with its placement
-// delete. Both happen late in a destroy, so a destroy works in two steps
-// around them:
+// delete. Once they are gone nothing links the volume to any sandbox, so
+// the cleanup obligation is written by that same transition, never only by
+// the destroy around it (review 2 finding 7):
+//
+//   - single node: store.Delete writes the reclaim-ledger row
+//     (pending_volume_deletions) of every delete_with_sandbox volume the
+//     sandbox was the last holder of, in the transaction that deletes the
+//     sandbox row.
+//   - cluster: opDelete records a replicated cluster.VolumeReclaim for each
+//     such volume, in the apply that releases the attachments
+//     (cluster/fsm_volume_reclaims.go). It survives the loss of the worker
+//     that destroyed the sandbox and covers the leader's expiry of an
+//     abandoned delete; it goes only when a node acks the deleted bytes.
+//
+// Around that, a destroy still works in two steps, the fast path:
 //
 //  1. recordSandboxVolumeDeletes, once the destroy is committed (its delete
 //     fence is in) and before the attachments go: find the sandbox's
-//     delete_with_sandbox volumes and write each into the reclaim ledger
-//     (pending_volume_deletions). This is the durable record: a crash or an
-//     unreachable store after this point is retried by the reclaim sweep.
+//     delete_with_sandbox volumes and write each into this node's ledger.
+//     A failed lookup here loses nothing; the transition above records it.
 //  2. finishSandboxVolumeDeletes, after the row or placement is gone: delete
 //     each volume's row unless another sandbox still holds it. The sweep
 //     deletes the bytes, as for any deleted volume.
 //
 // Rollback rule: nothing is undone. A row delete that fails, or is refused
 // because a lagging replica still counts this sandbox's attachment, leaves
-// the ledger row; the sweep (reclaimOne) deletes the volume row once nothing
-// holds it and then the bytes. A ledger row for a volume another sandbox
+// the obligation; the sweep (reclaimOne) deletes the volume row once nothing
+// holds it and then the bytes. An obligation for a volume another sandbox
 // still holds is dropped after deleteWithSandboxPendingGrace, since that
 // sandbox's own destroy records it again.
 
@@ -53,8 +65,9 @@ var deleteWithSandboxRetryDelays = []time.Duration{
 
 // recordSandboxVolumeDeletes writes the reclaim-ledger row of every
 // delete_with_sandbox volume sb is attached to and returns those volumes for
-// finishSandboxVolumeDeletes. Best effort: a destroy never fails on it, and
-// a volume it misses is kept, the safe direction.
+// finishSandboxVolumeDeletes. Best effort: a destroy never fails on it. A
+// volume it misses is not lost: the row or placement delete records it
+// (see above), and the sweep deletes it a pass later instead of now.
 func (s *Service) recordSandboxVolumeDeletes(ctx context.Context, sb *models.Sandbox) []models.Volume {
 	if s == nil || sb == nil || !s.cfg.PlatformVolumes.Enabled || s.store == nil {
 		return nil
@@ -167,10 +180,10 @@ func (s *Service) volumeSource(vol models.Volume) (string, error) {
 	return volumes.MountSource(volumeBackendFor(s.cfg.PlatformVolumes, vol.Backend), vol.Tenant, vol.Name)
 }
 
-// sweepDeleteWithSandbox is the reclaim sweep's retry for a ledger row whose
+// sweepDeleteWithSandbox is the reclaim sweep's retry for an obligation whose
 // delete_with_sandbox volume row is still there. It reports whether the row
 // is gone, so the caller goes on to delete the bytes.
-func (s *Service) sweepDeleteWithSandbox(ctx context.Context, vol models.Volume, p models.PendingVolumeDeletion) bool {
+func (s *Service) sweepDeleteWithSandbox(ctx context.Context, vol models.Volume, p volumeObligation) bool {
 	meta := s.volumeMeta()
 	n, err := meta.AttachmentCount(ctx, vol.Tenant, vol.ID)
 	if err != nil {
@@ -178,10 +191,12 @@ func (s *Service) sweepDeleteWithSandbox(ctx context.Context, vol models.Volume,
 		return false
 	}
 	if n > 0 {
-		if time.Since(p.CreatedAt) > deleteWithSandboxPendingGrace {
-			if err := s.store.DeletePendingVolumeDeletion(ctx, p.VolumeID); err != nil {
-				s.logger.Warn("volume reclaim stale row clear failed", "volume_id", p.VolumeID, "error", err)
-			}
+		// Held again, by a sandbox that attached it after the release (its
+		// own destroy records the volume again), or, for a moment, by a
+		// replica that has not applied the release yet. The grace tells the
+		// two apart.
+		if time.Since(p.recordedAt()) > deleteWithSandboxPendingGrace {
+			s.clearVolumeObligation(ctx, p)
 		}
 		return false
 	}

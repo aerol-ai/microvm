@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -171,6 +172,10 @@ func startAgentControlPlaneServerWithVolumes(t *testing.T, c *Cluster, ln net.Li
 				return
 			}
 			_ = json.NewEncoder(w).Encode(VolumeQueryResponse{Attachments: attachments})
+		case "reclaims":
+			limit, _ := strconv.Atoi(q.Get("limit"))
+			reclaims, _ := c.VolumeReclaimsFor(r.Context(), q.Get("node_id"), limit)
+			_ = json.NewEncoder(w).Encode(VolumeQueryResponse{Reclaims: reclaims})
 		default:
 			http.Error(w, "unknown volume query kind", http.StatusBadRequest)
 		}

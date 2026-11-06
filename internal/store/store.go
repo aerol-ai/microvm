@@ -3514,14 +3514,50 @@ func (s *Store) ListAutoImportPendingIDs(ctx context.Context) ([]string, error) 
 	return ids, rows.Err()
 }
 
+// Delete removes a sandbox row. The FK cascade takes its volume attachments
+// with it, which can be the last link from any sandbox to a
+// delete_with_sandbox volume; so the same transaction writes the reclaim
+// ledger row (pending_volume_deletions) of every such volume this sandbox
+// was the only holder of. Whatever the caller did or failed to do before,
+// the volume can no longer lose its cleanup record: the reclaim sweep
+// deletes its row and then its bytes. A volume another sandbox still holds
+// is left to that sandbox's delete.
 func (s *Store) Delete(ctx context.Context, id string) error {
-	result, err := s.db.ExecContext(ctx, `DELETE FROM sandboxes WHERE id = ?`, id)
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin delete sandbox: %w", err)
+	}
+	defer tx.Rollback()
+	// WHERE is required before the upsert clause of an INSERT ... SELECT.
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO pending_volume_deletions (volume_id, tenant, name, backend, source, created_at)
+		SELECT DISTINCT v.id, v.tenant, v.name, v.backend, v.source, ?
+		FROM volume_attachments a
+		JOIN volumes v ON v.id = a.volume_id AND v.tenant = a.tenant
+		WHERE a.sandbox_id = ? AND v.delete_with_sandbox = 1 AND v.source <> ''
+			AND NOT EXISTS (
+				SELECT 1 FROM volume_attachments o
+				WHERE o.tenant = v.tenant AND o.volume_id = v.id AND o.sandbox_id <> ?
+			)
+		ON CONFLICT(volume_id) DO UPDATE SET
+			tenant = excluded.tenant,
+			name = excluded.name,
+			backend = excluded.backend,
+			source = excluded.source,
+			created_at = excluded.created_at
+	`, time.Now().UTC(), id, id); err != nil {
+		return fmt.Errorf("record delete_with_sandbox volumes: %w", err)
+	}
+	result, err := tx.ExecContext(ctx, `DELETE FROM sandboxes WHERE id = ?`, id)
 	if err != nil {
 		return fmt.Errorf("delete sandbox: %w", err)
 	}
 	affected, err := result.RowsAffected()
 	if err == nil && affected == 0 {
 		return ErrNotFound
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit delete sandbox: %w", err)
 	}
 	return nil
 }
