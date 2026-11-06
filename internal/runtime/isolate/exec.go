@@ -35,6 +35,12 @@ func (d *Driver) ServeToolbox(ctx context.Context, sandboxID, token string, w ht
 		// on gVisor and Firecracker only (plans/agent-sandbox-feature-parity.md
 		// F5, Q8).
 		http.Error(w, "file watching needs a gVisor or Firecracker sandbox", http.StatusNotImplemented)
+	case strings.Contains(path, "/process/pty") || strings.Contains(path, "/process/session") || strings.Contains(path, "/sessions"):
+		// Terminals and shell sessions need a shell. Without this case the
+		// "/process" match below would run them as a fetch-handler invoke and
+		// answer 200 with the handler's output, which a Daytona terminal
+		// client cannot tell from a working terminal.
+		http.Error(w, "isolate runtime has no shell: terminals and sessions are not supported", http.StatusNotImplemented)
 	case strings.Contains(path, "/exec") || strings.Contains(path, "/process"):
 		d.serveExec(ctx, sandboxID, w, r)
 	default:

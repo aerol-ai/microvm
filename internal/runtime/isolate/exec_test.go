@@ -48,6 +48,26 @@ func TestServeToolboxFileWatchUnsupported(t *testing.T) {
 	}
 }
 
+// Terminals and sessions answer 501 instead of falling through to the
+// fetch-handler exec that every other "/process" path reaches.
+func TestServeToolboxTerminalsUnsupported(t *testing.T) {
+	d := New(Config{}, nil)
+	for _, tc := range []struct{ method, path string }{
+		{http.MethodPost, "/process/pty"},
+		{http.MethodGet, "/process/pty/t1/connect"},
+		{http.MethodPost, "/process/session"},
+		{http.MethodPost, "/process/session/s1/exec"},
+		{http.MethodPost, "/sessions"},
+		{http.MethodPost, "/sessions/s1/exec"},
+	} {
+		rec := httptest.NewRecorder()
+		d.ServeToolbox(context.Background(), "sb-1", "tok", rec, httptest.NewRequest(tc.method, tc.path, strings.NewReader("{}")))
+		if rec.Code != http.StatusNotImplemented || !strings.Contains(rec.Body.String(), "no shell") {
+			t.Fatalf("%s %s = %d %q, want the terminals 501", tc.method, tc.path, rec.Code, rec.Body.String())
+		}
+	}
+}
+
 func TestServeExecInvokeHandler(t *testing.T) {
 	sup := &fakeSupervisor{}
 	d := newCreateDriver(t, GroupPerTenant, sup)
