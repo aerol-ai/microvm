@@ -2049,6 +2049,9 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 	if chosenRuntime == models.RuntimeKata {
 		return nil, fmt.Errorf("runtime %q: %w", chosenRuntime, models.ErrRuntimeNotImplemented)
 	}
+	// The server's default destroy timers (L4) for a create with no timers
+	// of its own. In memory only: it fills the request's lifecycle.
+	req.Lifecycle = s.withDefaultLifecycle(req.Lifecycle)
 	// Lifecycle options a runtime cannot honour are refused before any work
 	// (restart_on_failure needs die events). A field check, nothing more.
 	if req.Lifecycle != nil {

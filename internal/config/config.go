@@ -129,20 +129,28 @@ type Config struct {
 	// EnterpriseMode enables a fail-fast production profile. It validates that
 	// secret sealing, audit durability, resource isolation, and cluster mTLS
 	// cannot be accidentally disabled. SB_ENTERPRISE_MODE.
-	EnterpriseMode              bool
-	PATToken                    string
-	APIHost                     string
-	APIPort                     int
-	Domain                      string
-	PublicHost                  string
-	CaddyAdminURL               string
-	CaddyServerID               string
-	DBPath                      string
-	DockerNetwork               string
-	ToolboxBinaryPath           string
-	ToolboxMountPath            string
-	ToolboxPort                 int
-	IdleTimeoutMinutes          int
+	EnterpriseMode     bool
+	PATToken           string
+	APIHost            string
+	APIPort            int
+	Domain             string
+	PublicHost         string
+	CaddyAdminURL      string
+	CaddyServerID      string
+	DBPath             string
+	DockerNetwork      string
+	ToolboxBinaryPath  string
+	ToolboxMountPath   string
+	ToolboxPort        int
+	IdleTimeoutMinutes int
+	// DefaultDestroyIfIdleFor and MaxAge are server-wide default destroy
+	// timers (SB_DEFAULT_DESTROY_IF_IDLE_FOR, SB_MAX_AGE; 0 = off, at most
+	// 30 days), so a client that crashes before cleaning up cannot leak
+	// sandboxes forever (plans/agent-sandbox-feature-parity.md L4). Like
+	// SB_IDLE_TIMEOUT_MIN they apply only to a sandbox created with no
+	// lifecycle timers of its own, and never touch one that has its own.
+	DefaultDestroyIfIdleFor     time.Duration
+	MaxAge                      time.Duration
 	CreateSandboxTimeoutSeconds int
 	ContainerPrivileged         bool
 	ResourceLimitsOff           bool
@@ -1994,6 +2002,8 @@ func load(keyTool bool) (Config, error) {
 		ToolboxPort:                       getEnvInt("SB_TOOLBOX_PORT", defaultToolboxPort),
 		ToolboxDeadPeerTimeout:            getEnvDuration("SB_TOOLBOX_DEAD_PEER_TIMEOUT", toolboxhttp.DefaultDeadPeerTimeout),
 		IdleTimeoutMinutes:                getEnvInt("SB_IDLE_TIMEOUT_MIN", 0),
+		DefaultDestroyIfIdleFor:           getEnvDuration("SB_DEFAULT_DESTROY_IF_IDLE_FOR", 0),
+		MaxAge:                            getEnvDuration("SB_MAX_AGE", 0),
 		CreateSandboxTimeoutSeconds:       getEnvInt("SB_CREATE_TIMEOUT_SEC", 600),
 		ContainerPrivileged:               getEnvBool("SB_CONTAINER_PRIVILEGED", false),
 		ResourceLimitsOff:                 getEnvBool("SB_RESOURCE_LIMITS_DISABLED", false),
@@ -2440,6 +2450,9 @@ func load(keyTool bool) (Config, error) {
 	}
 	if cfg.ToolboxDeadPeerTimeout < 0 || (cfg.ToolboxDeadPeerTimeout > 0 && cfg.ToolboxDeadPeerTimeout < toolboxhttp.MinDeadPeerTimeout) {
 		return Config{}, fmt.Errorf("SB_TOOLBOX_DEAD_PEER_TIMEOUT must be 0 (off) or at least %s", toolboxhttp.MinDeadPeerTimeout)
+	}
+	if err := validateDefaultLifecycle(cfg); err != nil {
+		return Config{}, err
 	}
 	if cfg.ImagePullMaxConcurrent < 0 {
 		return Config{}, errors.New("SB_IMAGE_PULL_MAX_CONCURRENT must be >= 0")
@@ -3269,6 +3282,25 @@ func (c Config) EffectivePublicHost() string {
 		return c.IngressAdvertiseHost
 	}
 	return c.PublicHost
+}
+
+// validateDefaultLifecycle holds the default destroy timers to the same
+// bounds a sandbox's own lifecycle has (models.MaxLifecycleDuration), so a
+// typo cannot stamp an out-of-range timer onto every new sandbox: the
+// create would then fail its own lifecycle check.
+func validateDefaultLifecycle(cfg Config) error {
+	for _, d := range []struct {
+		name string
+		v    time.Duration
+	}{
+		{"SB_DEFAULT_DESTROY_IF_IDLE_FOR", cfg.DefaultDestroyIfIdleFor},
+		{"SB_MAX_AGE", cfg.MaxAge},
+	} {
+		if d.v < 0 || d.v > models.MaxLifecycleDuration {
+			return fmt.Errorf("%s must be between 0 (off) and %s, got %s", d.name, models.MaxLifecycleDuration, d.v)
+		}
+	}
+	return nil
 }
 
 func (c Config) IdleTimeout() time.Duration {

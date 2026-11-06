@@ -66,6 +66,14 @@ feature is still mid-rollout.
 | `SB_DISK_LIMIT_CHECK_INTERVAL` | How often a container sandbox's writable layer is checked against its disk size; one past it is stopped. Default `15s`, `0` = off. |
 | `SB_ALLOW_UNENFORCED_NETWORK_POLICY` | With the host firewall off, accepts network policy (block-all, address lists, hostname rules, byte caps) that nothing enforces: the sandbox runs unfiltered while GET shows the policy (with `egress_status: "unenforced"`). Local development only; boot logs a warning and every accepted sandbox logs one. Refused when `SB_ENTERPRISE_MODE=true`. `install.sh --local` does not set it. |
 
+## Lifecycle defaults
+
+| Env var | Default | Notes |
+|---|---|---|
+| `SB_IDLE_TIMEOUT_MIN` | `0` (off) | Stops a running sandbox idle this many minutes, if it has no lifecycle timers of its own. Applied by the lifecycle sweep, so it reaches every such sandbox, old ones included. |
+| `SB_DEFAULT_DESTROY_IF_IDLE_FOR` | `0` (off) | Go duration (`2h`), at most `720h`. Written as `destroy_if_idle_for` into a new sandbox created with no lifecycle timers of its own, so a crashed client cannot leak sandboxes. Off by default because turning on a delete timer is the operator's choice; it never reaches sandboxes created before it was set. |
+| `SB_MAX_AGE` | `0` (off) | Go duration (`168h`), at most `720h`. Written as `destroy_at_age` the same way. When either is set and `SB_IDLE_TIMEOUT_MIN` comes before the idle delete, that idle stop is written in too. |
+
 ## Secret provider (SB_SECRET_PROVIDER)
 
 | Env var | Default | Notes |

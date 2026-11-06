@@ -356,6 +356,23 @@ If the server itself restarts while a sandbox waits, the wait is kept. The resta
 
 `SB_IDLE_TIMEOUT_MIN` sets a default idle stop for the whole server. It stops any running sandbox that has been idle for that many minutes. It only applies to sandboxes with no lifecycle timers of their own. The default is `0` (off).
 
+Two more settings give every new sandbox a default delete timer. Use them so a client that crashes before it cleans up cannot leave sandboxes running forever.
+
+| Setting | What it does |
+|---|---|
+| `SB_DEFAULT_DESTROY_IF_IDLE_FOR` | Gives a new sandbox `destroyIfIdleFor` of this length. |
+| `SB_MAX_AGE` | Gives a new sandbox `destroyAtAge` of this length. |
+
+Both take a length such as `30m`, `2h` or `168h` (there is no `d` for days). Both are off by default (`0`). The most you can set is `720h` (30 days). The server refuses to start with a value outside that range.
+
+They follow the same rule as `SB_IDLE_TIMEOUT_MIN`: they only apply to a sandbox created with no lifecycle timers of its own. A sandbox that sets any timer keeps exactly its own timers.
+
+Unlike `SB_IDLE_TIMEOUT_MIN`, the defaults are written into the new sandbox's lifecycle when it is created:
+
+- **You can see them.** `get` shows them in the sandbox's lifecycle, and `updateLifecycle` can change them.
+- **They never reach older sandboxes.** Turning them on does not delete sandboxes that were created before.
+- **They keep the idle stop.** If `SB_IDLE_TIMEOUT_MIN` is also set and comes before the delete, it is written in as `stopIfIdleFor`, so the sandbox still stops first.
+
 ## Next steps
 
 - [Ghost sandboxes](/ghost-sandboxes/): stop when idle, start again on the next request.

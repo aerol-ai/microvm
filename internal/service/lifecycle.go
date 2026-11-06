@@ -104,3 +104,33 @@ func (s *Service) ApplyLifecyclePatch(ctx context.Context, id string, patch func
 	}
 	return s.writeLifecycleLocked(ctx, id, desired, sandbox)
 }
+
+// withDefaultLifecycle applies the server's default destroy timers
+// (SB_DEFAULT_DESTROY_IF_IDLE_FOR, SB_MAX_AGE; plans/agent-sandbox-feature-
+// parity.md L4) to a create that sets no lifecycle timers of its own, the
+// same condition SB_IDLE_TIMEOUT_MIN uses. A sandbox with any timer of its
+// own keeps exactly its own: the defaults never destroy it.
+//
+// The defaults are written into the new sandbox's lifecycle, not applied at
+// sweep time like SB_IDLE_TIMEOUT_MIN, so a caller sees them on GET and can
+// change them, and turning them on never reaches sandboxes created before:
+// setting SB_MAX_AGE cannot delete every old sandbox on the next sweep.
+// Because a written lifecycle is no longer "no timers", the legacy idle stop
+// would stop applying; it is written alongside when it comes first, so a
+// server that has both keeps both. Pure: no I/O on the create path.
+func (s *Service) withDefaultLifecycle(l *models.Lifecycle) *models.Lifecycle {
+	idle, age := s.cfg.DefaultDestroyIfIdleFor, s.cfg.MaxAge
+	if (idle <= 0 && age <= 0) || (l != nil && !l.IsZero()) {
+		return l
+	}
+	out := models.Lifecycle{}
+	if l != nil {
+		// Only non-timer fields can be set here (restart_on_failure).
+		out = *l
+	}
+	out.DestroyIfIdleFor, out.DestroyAtAge = idle, age
+	if g := s.cfg.IdleTimeout(); g > 0 && g <= models.MaxLifecycleDuration && (idle <= 0 || g <= idle) {
+		out.StopIfIdleFor = g
+	}
+	return &out
+}
