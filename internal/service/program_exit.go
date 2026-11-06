@@ -25,9 +25,14 @@ import (
 //
 // The read is cheap and bounded: an unauthenticated GET to the sandbox's
 // own toolboxd (no token to decrypt), at most programExitProbeConcurrency at
-// once and programExitProbeTimeout each, inside the sweep's own deadline. A
-// sandbox that does not answer (busy, or an older toolboxd without
-// main_program) is asked again next minute.
+// once and programExitProbeTimeout each, inside programExitProbeBudget.
+//
+// Fair across passes (review 2 finding 11; sweep_rotation.go): each pass asks
+// the sandboxes it asked least recently first, so the ones a pass did not
+// reach go first next pass, and a sandbox that does not answer (busy, or an
+// older toolboxd without main_program) is asked again after 1, 2, 4, then
+// every 8 passes. Before, every pass asked the same newest-first list, and
+// about 40 agents that never answer used the whole budget, every pass.
 //
 // Bound to the run it asked (review 2 finding 10): the exit is stored only if
 // the sandbox is still in the run it was in when the pass read the row
@@ -78,58 +83,80 @@ func wantsProgramExitProbe(sb *models.Sandbox) bool {
 		sb.Runtime != models.RuntimeWasm && sb.Runtime != models.RuntimeIsolate
 }
 
-// probeProgramExits asks each selected sandbox's toolboxd whether its main
-// program has ended, records the ends it finds, and sets ProgramExitedAt on
-// the listed rows so this same sweep can act on them.
+// probeProgramExits asks the selected sandboxes' toolboxd whether their main
+// program has ended, least recently asked first, records the ends it finds,
+// and sets ProgramExitedAt on the listed rows so this same sweep can act on
+// them.
 func (s *Service) probeProgramExits(ctx context.Context, sandboxes []*models.Sandbox) {
 	ctx, cancel := context.WithTimeout(ctx, programExitProbeBudget)
 	defer cancel()
-	var wg sync.WaitGroup
-	sem := make(chan struct{}, programExitProbeConcurrency)
+	byID := make(map[string]*models.Sandbox)
+	var ids []string
 	for _, sb := range sandboxes {
 		if !wantsProgramExitProbe(sb) {
 			continue
 		}
+		if _, dup := byID[sb.ID]; !dup {
+			byID[sb.ID] = sb
+			ids = append(ids, sb.ID)
+		}
+	}
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, programExitProbeConcurrency)
+	for _, id := range s.programExitRotation.plan(ids) {
 		select {
 		case sem <- struct{}{}:
 		case <-ctx.Done():
-			wg.Wait()
-			return
 		}
+		// Checked after the select too: with a slot free and the budget
+		// spent, select may still pick the slot.
+		if ctx.Err() != nil {
+			break
+		}
+		sb := byID[id]
+		s.programExitRotation.tried(id)
 		wg.Add(1)
-		go func(sb *models.Sandbox) {
+		go func() {
 			defer wg.Done()
 			defer func() { <-sem }()
-			s.probeProgramExit(ctx, sb)
-		}(sb)
+			answered := s.probeProgramExit(ctx, sb)
+			// A probe the budget cut short says nothing about the agent.
+			if answered || ctx.Err() == nil {
+				s.programExitRotation.done(sb.ID, answered)
+			}
+		}()
 	}
 	wg.Wait()
 }
 
-func (s *Service) probeProgramExit(ctx context.Context, sb *models.Sandbox) {
+// probeProgramExit asks one sandbox and records an end it reports. It says
+// whether toolboxd gave a usable answer (an end, or a program still running),
+// which is what the rotation's backoff counts.
+func (s *Service) probeProgramExit(ctx context.Context, sb *models.Sandbox) bool {
 	program, err := s.readMainProgram(ctx, sb)
 	if err != nil {
 		s.logger.Debug("program exit probe: no answer", "sandbox_id", sb.ID, "error", err)
-		return
+		return false
 	}
 	if !program.ended() {
-		return
+		return true
 	}
 	at := programExitTime(program, sb)
 	// sb.RunGeneration is the run this pass read the row in, before asking.
 	recorded, err := s.store.RecordProgramExit(ctx, sb.ID, sb.RunGeneration, at, *program.ExitCode)
 	if err != nil {
 		s.logger.Warn("program exit not recorded", "sandbox_id", sb.ID, "error", err)
-		return
+		return true
 	}
 	if !recorded {
-		return
+		return true
 	}
 	sb.ProgramExitedAt = &at
 	sb.StatusReason, sb.ExitCode = models.StatusReasonProgramExited, program.ExitCode
 	recordSandboxFinished(*program.ExitCode)
 	s.logger.Info("main program exited", "sandbox_id", sb.ID, "exit_code", *program.ExitCode,
 		"state", program.State, "destroy_after", sb.Lifecycle.DestroyAfterExitFor.String())
+	return true
 }
 
 // readMainProgram GETs the sandbox's toolboxd /health. It is unauthenticated,

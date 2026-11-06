@@ -428,6 +428,11 @@ type Service struct {
 	// whole struct back race, and an automatic restart already inside the
 	// runtime start undoes a stop that succeeded (review 2 finding 9).
 	lifecycleLocks sandboxLocks
+	// programExitRotation and lifecycleRotation keep the lifecycle sweep's
+	// exit probes and its stops and deletes fair across passes
+	// (sweep_rotation.go; review 2 finding 11).
+	programExitRotation sweepRotation
+	lifecycleRotation   sweepRotation
 	// Restart on failure (restart_on_failure.go): one timer per sandbox
 	// waiting to restart, the daemon context they run under, and test seams
 	// for the clock and the timer.
@@ -7222,10 +7227,19 @@ func (s *Service) runLifecycleSweep(ctx context.Context) {
 			due = append(due, sandbox.ID)
 		}
 	}
-	// Each one decides again inside the lifecycle boundary, which logs
-	// its failures.
-	for _, id := range due {
-		_ = s.runLifecycleAction(ctx, id, now, globalIdle, netstatsFallback)
+	// One at a time, least recently tried first (sweep_rotation.go): a
+	// delete or stop that keeps failing, slowly or not, cannot use every
+	// pass's deadline while the ones behind it wait (review 2 finding 11).
+	for _, id := range s.lifecycleRotation.plan(due) {
+		if ctx.Err() != nil {
+			// The rest are untried, so they go first next pass.
+			return
+		}
+		s.lifecycleRotation.tried(id)
+		err := s.runLifecycleAction(ctx, id, now, globalIdle, netstatsFallback)
+		if err == nil || ctx.Err() == nil {
+			s.lifecycleRotation.done(id, err == nil)
+		}
 	}
 }
 
