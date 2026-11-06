@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import inspect
 import io
 import os
 import unittest
@@ -16,30 +15,17 @@ from agents.sandbox.errors import (
 )
 from agents.sandbox.files import EntryKind
 from agents.sandbox.manifest import Environment
-from microvm import MicroVM, MicroVMHTTPError
+from microvm import MicroVMHTTPError
 
 from aerolvm_openai_agents import AerolVMSandboxClient, DEFAULT_EXEC_TIMEOUT_S
-from fake_microvm import FakeMicroVM
-from support import IMAGE, ProviderTestCase
+from support import IMAGE, ProviderTestCase, assert_fake_matches_sdk
 
 
 class FakeMatchesSDKTest(unittest.TestCase):
     def test_fake_matches_sdk(self) -> None:
         # The provider is tested against the fake, so the fake must take
         # exactly the arguments the real client takes.
-        for name, method in vars(FakeMicroVM).items():
-            if name.startswith("_") or not callable(method) or name in ("cleanup", "calls_to"):
-                continue
-            real = getattr(MicroVM, name)
-            self.assertEqual(
-                list(inspect.signature(method).parameters.items()).__len__(),
-                len(inspect.signature(real).parameters),
-                name,
-            )
-            for (fake_name, fake_param), (real_name, real_param) in zip(
-                inspect.signature(method).parameters.items(), inspect.signature(real).parameters.items()
-            ):
-                self.assertEqual((fake_name, fake_param.kind), (real_name, real_param.kind), name)
+        assert_fake_matches_sdk(self)
 
 
 class ExecTest(ProviderTestCase):

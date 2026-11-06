@@ -68,6 +68,7 @@ const getDocsSidebarConfig = (): NavigationGroup[] => [
     category: NavigationCategory.SDKS,
     entries: [
       link('/integrations/openai-agents', '- OpenAI Agents SDK'),
+      link('/integrations/deepagents', '- LangChain DeepAgents'),
     ],
   },
   {

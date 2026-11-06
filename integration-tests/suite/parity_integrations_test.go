@@ -11,6 +11,8 @@ package suite
 
 import (
 	"context"
+	"errors"
+	"net/http"
 	"strings"
 	"testing"
 	"time"
@@ -103,5 +105,86 @@ func TestParityOpenAIAgentsSnapshotRoundTrip(t *testing.T) {
 	}
 	if !strings.HasPrefix(list.Entries[0].Path, "/workspace/") {
 		t.Fatalf("listing paths are not absolute: %+v", list.Entries[0])
+	}
+}
+
+// apiStatusMessage is the HTTP status and message of an SDK error, or 0 when err is
+// not an API error.
+func apiStatusMessage(err error) (int, string) {
+	var apiErr *microvm.APIError
+	if errors.As(err, &apiErr) {
+		return apiErr.StatusCode, apiErr.Message
+	}
+	return 0, ""
+}
+
+// UC-458 — LangChain DeepAgents backend (G2). The backend turns server
+// answers into DeepAgents' per-file error codes, so this pins exactly those
+// answers: a missing file is 404 (file_not_found), a folder downloaded is
+// "is a directory" (is_directory) and a file uploaded onto a folder is 409
+// (is_directory). It also runs a shell command the way execute() does (in
+// the root, with a timeout and an output cap) and the ls and delete calls.
+func TestParityDeepAgentsBackendCalls(t *testing.T) {
+	harness.Require(t, sc, "UC-458")
+	sb := paritySandbox(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+
+	if err := sb.MakeDir(ctx, "/workspace", sdktypes.MakeDirOptions{Parents: true}); err != nil {
+		t.Fatalf("make root: %v", err)
+	}
+	res, err := sb.Exec(ctx, sdktypes.ExecRequest{
+		Command:        "echo out; echo bad >&2; printf 0123456789; exit 3",
+		WorkDir:        "/workspace",
+		TimeoutSeconds: 30,
+		MaxStdoutBytes: 6,
+	})
+	if err != nil {
+		t.Fatalf("exec: %v", err)
+	}
+	if res.ExitCode != 3 || res.Stdout != "out\n01" || !res.StdoutTruncated || strings.TrimSpace(res.Stderr) != "bad" {
+		t.Fatalf("exec = exit %d stdout %q truncated %v stderr %q", res.ExitCode, res.Stdout, res.StdoutTruncated, res.Stderr)
+	}
+	res, err = sb.Exec(ctx, sdktypes.ExecRequest{Command: "sleep 30", WorkDir: "/workspace", TimeoutSeconds: 1})
+	if err != nil || !res.TimedOut {
+		t.Fatalf("timed-out exec = %+v, %v; want TimedOut", res, err)
+	}
+
+	// Upload makes the missing folders (the backend skips the write
+	// preflight script because of it).
+	if err := sb.UploadFile(ctx, "/workspace/deep/a/b.txt", []byte("x")); err != nil {
+		t.Fatalf("upload into missing folders: %v", err)
+	}
+	if _, err := sb.DownloadFile(ctx, "/workspace/missing.txt"); func() bool {
+		st, _ := apiStatusMessage(err)
+		return st != http.StatusNotFound
+	}() {
+		t.Fatalf("download of a missing file: %v; want 404", err)
+	}
+	if _, err := sb.DownloadFile(ctx, "/workspace/deep"); func() bool {
+		_, msg := apiStatusMessage(err)
+		return !strings.HasSuffix(strings.ToLower(msg), "is a directory")
+	}() {
+		t.Fatalf("download of a folder: %v; want an error ending \"is a directory\"", err)
+	}
+	if err := sb.UploadFile(ctx, "/workspace/deep", []byte("x")); func() bool {
+		st, msg := apiStatusMessage(err)
+		return st != http.StatusConflict || !strings.HasSuffix(strings.ToLower(msg), "is a directory")
+	}() {
+		t.Fatalf("upload onto a folder: %v; want 409 ending \"is a directory\"", err)
+	}
+
+	list, err := sb.ListFiles(ctx, "/workspace", sdktypes.ListFilesOptions{Depth: 1})
+	if err != nil || len(list.Entries) != 1 || list.Entries[0].Path != "/workspace/deep" || !list.Entries[0].IsDir {
+		t.Fatalf("ls /workspace = %+v, %v", list.Entries, err)
+	}
+	if err := sb.DeleteFile(ctx, "/workspace/deep", sdktypes.DeleteFileOptions{Recursive: true}); err != nil {
+		t.Fatalf("recursive delete: %v", err)
+	}
+	if err := sb.DeleteFile(ctx, "/workspace/deep", sdktypes.DeleteFileOptions{Recursive: true}); func() bool {
+		st, _ := apiStatusMessage(err)
+		return st != http.StatusNotFound
+	}() {
+		t.Fatalf("delete of a missing path: %v; want 404", err)
 	}
 }

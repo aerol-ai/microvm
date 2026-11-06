@@ -5,15 +5,19 @@ from __future__ import annotations
 
 import os
 import shutil
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 from typing import Any
 
-from agents.sandbox.manifest import Manifest
+# The fake AerolVM client is shared by every package in integrations/.
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "testing"))
 
-from aerolvm_openai_agents import AerolVMSandboxClient, AerolVMSandboxClientOptions
-from fake_microvm import FakeMicroVM
+from agents.sandbox.manifest import Manifest  # noqa: E402
+
+from aerolvm_openai_agents import AerolVMSandboxClient, AerolVMSandboxClientOptions  # noqa: E402
+from fake_microvm import FakeMicroVM, assert_fake_matches_sdk  # noqa: E402,F401
 
 IMAGE = "python:3.12-slim"
 

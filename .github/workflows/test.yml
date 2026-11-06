@@ -431,6 +431,7 @@ jobs:
       matrix:
         package:
           - openai-agents
+          - deepagents
     defaults:
       run:
         working-directory: integrations/${{ matrix.package }}

@@ -1,16 +1,18 @@
 """A stand-in for ``microvm.MicroVM`` where the sandbox is this machine.
 
-exec runs real local processes and the file calls touch real local paths, so
-the Agents SDK's own machinery (the shell helpers start() installs, path
-checks, manifest writes, tar archives) runs for real against the provider.
+Shared by the tests of every package in integrations/. exec runs real local
+processes and the file calls touch real local paths, so each framework's own
+machinery (the Agents SDK's shell helpers and tar archives, the DeepAgents
+read and edit scripts) runs for real against the integration.
 
-A snapshot copies the workspace root aside; booting a sandbox from it puts
-that copy back. That is the part of an AerolVM snapshot the provider relies
+A snapshot copies the workspace folder aside; booting a sandbox from it puts
+that copy back. That is the part of an AerolVM snapshot the integrations rely
 on: the workspace comes back exactly as it was saved.
 
-Every method has the real SDK method's signature; test_fake_matches_sdk
-checks that, so the provider can not call the fake in a way the real client
-would reject.
+Every method has the real SDK method's signature, which
+assert_fake_matches_sdk checks, so an integration can not call the fake in a
+way the real client would reject. The per-call ``timeout`` is accepted and
+ignored: nothing here waits on a network.
 """
 
 from __future__ import annotations
@@ -33,6 +35,7 @@ from microvm import (
     MicroVMHTTPError,
     MicroVMUnsupportedFeatureError,
 )
+from microvm import MicroVM
 from microvm.client import Sandbox
 
 ALL_FEATURES = frozenset({"exec.argv", "exec.max_output_bytes", "files.verbs", "files.write_options", "files.extract"})
@@ -99,14 +102,26 @@ class FakeMicroVM:
             shutil.copytree(self.snapshots[image], self.workspace, symlinks=True)
         elif str(image).startswith("missing-"):
             raise MicroVMHTTPError(404, f"image {image} not found")
+        name = opts.get("name")
+        if name and any(d.get("name") == name for d in self.sandboxes.values()):
+            raise MicroVMHTTPError(409, f"sandbox name {name} is already in use")
         sandbox_id = f"sb-{uuid.uuid4().hex[:16]}"
         data = {"id": sandbox_id, "status": "started", "image": image, "tags": dict(opts.get("tags") or {})}
+        if name:
+            data["name"] = name
         self.sandboxes[sandbox_id] = data
         return Sandbox(self, dict(data))  # type: ignore[arg-type]
 
     def get(self, sandbox_id: str, *, include_env: bool = False, timeout: Optional[float] = None) -> Sandbox:
         self._record("get", sandbox_id, include_env=include_env)
         return Sandbox(self, dict(self._sandbox(sandbox_id)))  # type: ignore[arg-type]
+
+    def get_by_name(self, name: str, *, include_env: bool = False, timeout: Optional[float] = None) -> Optional[Sandbox]:
+        self._record("get_by_name", name, include_env=include_env)
+        for data in self.sandboxes.values():
+            if data.get("name") == name:
+                return Sandbox(self, dict(data))  # type: ignore[arg-type]
+        return None
 
     def start(self, sandbox_id: str, *, timeout: Optional[float] = None) -> Sandbox:
         self._record("start", sandbox_id)
@@ -210,15 +225,28 @@ class FakeMicroVM:
     ) -> None:
         self._record("upload_file", sandbox_id, target_path, len(data), append=append)
         self._sandbox(sandbox_id)
-        Path(target_path).parent.mkdir(parents=True, exist_ok=True)
-        with open(target_path, "ab" if append else "wb") as f:
-            f.write(data)
+        try:
+            Path(target_path).parent.mkdir(parents=True, exist_ok=True)
+            with open(target_path, "ab" if append else "wb") as f:
+                f.write(data)
+        except IsADirectoryError as e:
+            raise MicroVMHTTPError(409, f"open {target_path}: is a directory") from e
+        except PermissionError as e:
+            raise MicroVMHTTPError(403, f"open {target_path}: permission denied") from e
+
+    def _check_readable(self, target_path: str) -> None:
+        # toolboxd's download answers these as it does (main.go handleDownload).
+        if not os.path.exists(target_path):
+            raise self._missing(target_path)
+        if os.path.isdir(target_path):
+            raise MicroVMHTTPError(500, f"read {target_path}: is a directory")
+        if not os.access(target_path, os.R_OK):
+            raise MicroVMHTTPError(500, f"open {target_path}: permission denied")
 
     def download_file(self, sandbox_id: str, target_path: str, *, max_bytes: Optional[int] = None, timeout: Optional[float] = None) -> bytes:
         self._record("download_file", sandbox_id, target_path, max_bytes=max_bytes)
         self._sandbox(sandbox_id)
-        if not os.path.isfile(target_path):
-            raise self._missing(target_path)
+        self._check_readable(target_path)
         if max_bytes is not None and os.path.getsize(target_path) > max_bytes:
             raise MicroVMFileTooLargeError(target_path, max_bytes)
         return Path(target_path).read_bytes()
@@ -229,8 +257,7 @@ class FakeMicroVM:
     ) -> int:
         self._record("download_file_to", sandbox_id, target_path, max_bytes=max_bytes)
         self._sandbox(sandbox_id)
-        if not os.path.isfile(target_path):
-            raise self._missing(target_path)
+        self._check_readable(target_path)
         written = 0
         with open(target_path, "rb") as f:
             # Small chunks by default, so a bounded read is seen to stop early.
@@ -265,6 +292,21 @@ class FakeMicroVM:
             entries.append(info)
         return {"entries": entries[:limit], "truncated": len(entries) > limit}
 
+    def get_file_info(self, sandbox_id: str, path: str, *, timeout: Optional[float] = None) -> dict:
+        self._record("get_file_info", sandbox_id, path)
+        self._sandbox(sandbox_id)
+        if not os.path.exists(path):
+            raise self._missing(path)
+        st = os.stat(path)
+        return {
+            "name": os.path.basename(path),
+            "path": path,
+            "isDir": stat.S_ISDIR(st.st_mode),
+            "size": st.st_size,
+            "mode": _go_mode(st),
+            "permissions": "%04o" % stat.S_IMODE(st.st_mode),
+        }
+
     def delete_file(self, sandbox_id: str, path: str, *, recursive: bool = False, timeout: Optional[float] = None) -> None:
         self._record("delete_file", sandbox_id, path, recursive=recursive)
         self._sandbox(sandbox_id)
@@ -288,3 +330,27 @@ class FakeMicroVM:
             os.mkdir(path)
         except FileExistsError as e:
             raise MicroVMHTTPError(409, "folder exists", code="folder_exists") from e
+
+    def upload_dir(self, sandbox_id: str, local_dir: str, remote_dir: str, *, timeout: Optional[float] = None) -> None:
+        self._record("upload_dir", sandbox_id, local_dir, remote_dir)
+        self._sandbox(sandbox_id)
+        self._require(sandbox_id, "files.extract")
+        if not os.path.isdir(local_dir):
+            raise MicroVMError(f"{local_dir} is not a folder")
+        shutil.copytree(local_dir, remote_dir, symlinks=True, dirs_exist_ok=True)
+
+
+_HELPERS = {"cleanup", "calls_to"}
+
+
+def assert_fake_matches_sdk(test) -> None:
+    """Fail ``test`` (a unittest.TestCase) when a fake method's parameters
+    differ from the real ``MicroVM`` method's in name, order or kind."""
+    import inspect
+
+    for name, method in vars(FakeMicroVM).items():
+        if name.startswith("_") or not callable(method) or name in _HELPERS:
+            continue
+        fake = [(p.name, p.kind) for p in inspect.signature(method).parameters.values()]
+        real = [(p.name, p.kind) for p in inspect.signature(getattr(MicroVM, name)).parameters.values()]
+        test.assertEqual(fake, real, f"FakeMicroVM.{name} does not match MicroVM.{name}")

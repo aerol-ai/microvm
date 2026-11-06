@@ -1052,6 +1052,7 @@ var Registry = []UseCase{
 	// §5.11). The packages are Python; these cases drive the server calls
 	// they rely on (parity_integrations_test.go).
 	{ID: "UC-457", Title: "OpenAI Agents provider (G1): a workspace made with make_dir(parents), written by upload and by an argv exec in it, saved as an AerolVM snapshot, comes back byte for byte in a new sandbox booted with the snapshot's name as its image, and list_files shows it", Requires: []Capability{CapDocker}, Implemented: true},
+	{ID: "UC-458", Title: "DeepAgents backend (G2): a shell command runs in the root with its exit code, stderr apart, a capped and flagged stdout and a timeout; upload makes missing folders; the server answers a missing file 404, a folder download \"is a directory\" and an upload onto a folder 409 \"is a directory\" (the per-file error codes the backend maps); list and recursive delete work and a second delete is 404", Requires: []Capability{CapDocker}, Implemented: true},
 }
 
 // byID is a lookup built once for the report generator.

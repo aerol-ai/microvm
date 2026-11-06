@@ -1,0 +1,88 @@
+---
+title: LangChain DeepAgents
+description: Give a LangChain DeepAgents agent an AerolVM sandbox to run its shell commands and file tools in.
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+<Aside>
+This page shows Python only. The DeepAgents backend API exists only in Python.
+</Aside>
+
+[DeepAgents](https://github.com/langchain-ai/deepagents) is LangChain's agent harness. Its agents get tools to run shell commands and to read, write, edit and search files. A *backend* decides where those tools act. The `aerolvm-deepagents` package is a backend that makes them act inside an AerolVM sandbox, not on your machine.
+
+## Install
+
+The package is not on PyPI yet. Install it from the AerolVM repository:
+
+```bash
+pip install "git+https://github.com/aerol-ai/microvm.git#subdirectory=integrations/deepagents"
+```
+
+It works with `deepagents` 0.7 (0.7.34 or newer). Set the same two variables as for the [Python SDK](/sdk-setup/):
+
+```bash
+export SB_API_URL=https://sandbox.example.com
+export SB_PAT_TOKEN=your-token
+```
+
+## Run an agent
+
+```python
+from deepagents import create_deep_agent
+from aerolvm_deepagents import AerolVMSandbox
+
+with AerolVMSandbox.create(image="python:3.12-slim") as backend:
+    agent = create_deep_agent(model="anthropic:claude-sonnet-4-5", backend=backend)
+    result = agent.invoke(
+        {"messages": [{"role": "user", "content": "Write hello.py, run it, and tell me what it printed."}]}
+    )
+    print(result["messages"][-1].content)
+```
+
+`AerolVMSandbox.create` makes a new sandbox. Leaving the `with` block destroys it. Extra keyword arguments are create options, such as `cpu`, `memoryMB`, `env` or `networkAllowOut`.
+
+### Keep one sandbox per conversation
+
+In a LangGraph app, each conversation thread usually needs its own sandbox, and the same one on every turn. Use `for_name` with one name per thread:
+
+```python
+backend = AerolVMSandbox.for_name(
+    f"thread-{thread_id}",
+    image="python:3.12-slim",
+    lifecycle={"destroyIfIdleFor": 24 * 3600 * 10**9},  # one day, in nanoseconds
+)
+```
+
+The first call makes a sandbox with that name. Later calls find it, and start it again if it was stopped. Sandbox names are unique per account, so two runs that start at the same moment still share one sandbox. `close()` does not destroy it, so set a [lifecycle](/lifecycle/) to clean up old threads.
+
+To use a sandbox you already have, wrap it: `AerolVMSandbox(client.get(sandbox_id))`. The backend never destroys a sandbox it did not make.
+
+## What it does with the sandbox
+
+| The agent uses | AerolVM does |
+| --- | --- |
+| `execute` | Runs the command in `/workspace` (made on first use), with a time limit |
+| `write_file`, file uploads | Writes the file with the SDK's upload. Missing folders are made. |
+| file downloads | Reads the file with the SDK's download |
+| `ls` | Lists the folder with `list_files` |
+| `read_file`, `edit_file`, `grep`, `glob` | Runs DeepAgents' own small scripts through `execute` |
+
+Command output looks the same as with DeepAgents' local shell: stdout, then each stderr line marked `[stderr]`, then `Exit code: N` when it is not 0. A command that runs out of time returns exit code 124.
+
+File errors come back as DeepAgents' codes: `file_not_found`, `permission_denied`, `is_directory` and `invalid_path`. Each file gets its own result, so one bad path does not fail the rest.
+
+## Settings
+
+| Setting | Default | What it does |
+| --- | --- | --- |
+| `root_dir` | `/workspace` | Folder commands run in. Relative file paths start here too. |
+| `default_timeout` | `1800` | Seconds a command may run when the agent sets no time limit, or sets 0. |
+| `max_output_bytes` | `None` | Keep at most this many bytes of a command's stdout and of its stderr. The result then says `truncated`. |
+
+## Limits
+
+- `read_file`, `edit_file` and `glob` run Python scripts, and `grep` runs `grep`. Use an image that has `python3` and `grep`. Listing, writing, deleting, upload and download need neither.
+- It needs a shell, so it works with container and Firecracker sandboxes, not WebAssembly or V8 isolate ones.
+- Each upload or download holds the whole file in memory.
+- If a request fails (the server can not be reached, or the sandbox is gone), `execute` raises an error instead of returning output, because the command's result is unknown.
