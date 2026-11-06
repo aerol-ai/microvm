@@ -97,6 +97,23 @@ result = handle.wait()
 print(result)
 ```
 
+## Watching files
+
+Works on gVisor and Firecracker sandboxes. Other runtimes answer with a
+`MicroVMHTTPError` whose `status_code` is 501.
+
+```python
+handle = sandbox.watch_files(
+	"/workspace",
+	lambda event: print(event.type, event.path),
+	recursive=True,
+)
+sandbox.exec("touch /workspace/new.txt")
+handle.stop()
+```
+
+An event with type `overflow` means some changes were lost. List the folder again to catch up.
+
 ## Sessions
 
 ```python

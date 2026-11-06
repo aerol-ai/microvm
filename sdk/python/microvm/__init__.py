@@ -1,4 +1,4 @@
-from .client import MicroVM, MicroVMError, MicroVMHTTPError, MicroVMUnsupportedFeatureError, Tokens
+from .client import FileWatchHandle, MicroVM, MicroVMError, MicroVMHTTPError, MicroVMUnsupportedFeatureError, Tokens
 from .image import Image
 from .types import (
     APIToken,
@@ -34,6 +34,7 @@ from .types import (
     ExposeResult,
     Failover,
     FailoverPolicy,
+    FileEvent,
     IngressTarget,
     MicroVMConfig,
     RetryConfig,
@@ -81,6 +82,8 @@ __all__ = [
     "ExposeResult",
     "Failover",
     "FailoverPolicy",
+    "FileEvent",
+    "FileWatchHandle",
     "IngressTarget",
     "MicroVMConfig",
     "RetryConfig",

@@ -3,7 +3,6 @@ package ai.aerol.microvm;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.net.URI;
-import java.net.URISyntaxException;
 import java.net.URLEncoder;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
@@ -17,6 +16,7 @@ import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Consumer;
 import java.util.stream.Collectors;
 
 import ai.aerol.microvm.internal.Environment;
@@ -26,6 +26,7 @@ import ai.aerol.microvm.internal.StreamControlMessage;
 import ai.aerol.microvm.internal.StreamingWebSocket;
 import ai.aerol.microvm.internal.StreamingWebSocketListener;
 import ai.aerol.microvm.internal.WebSocketConnector;
+import ai.aerol.microvm.internal.WebSocketHandshakeFailure;
 import ai.aerol.microvm.internal.api.v1.Paths;
 import ai.aerol.microvm.model.ApiTokenList;
 import ai.aerol.microvm.model.CreateApiTokenOptions;
@@ -66,6 +67,7 @@ import ai.aerol.microvm.model.ExecStreamOptions;
 import ai.aerol.microvm.model.ExposeOptions;
 import ai.aerol.microvm.model.ExposeProtocol;
 import ai.aerol.microvm.model.ExposeResult;
+import ai.aerol.microvm.model.FileEvent;
 import ai.aerol.microvm.model.HealthStatus;
 import ai.aerol.microvm.model.IngressTarget;
 import ai.aerol.microvm.model.Lifecycle;
@@ -81,6 +83,7 @@ import ai.aerol.microvm.model.SessionAttachOptions;
 import ai.aerol.microvm.model.SetNetworkLimitsOptions;
 import ai.aerol.microvm.model.Template;
 import ai.aerol.microvm.model.WasmModule;
+import ai.aerol.microvm.model.WatchOptions;
 
 public class MicroVMClient {
     static final String DEFAULT_API_URL = "http://127.0.0.1:21212";
@@ -100,6 +103,10 @@ public class MicroVMClient {
     public static final String IDEMPOTENCY_KEY_HEADER = "Idempotency-Key";
 
     private static final java.security.SecureRandom IDEMPOTENCY_KEY_RANDOM = new java.security.SecureRandom();
+    // How long watchFiles waits for the server's start frame. toolboxd sends
+    // it once every folder is watched; a recursive walk of a large tree can
+    // take seconds.
+    private static final java.time.Duration WATCH_START_TIMEOUT = java.time.Duration.ofSeconds(60);
     private static final int STREAM_PREFIX_STDOUT = 0x01;
     private static final int STREAM_PREFIX_STDERR = 0x02;
 
@@ -1189,6 +1196,64 @@ public class MicroVMClient {
         return new ExecStreamHandle(socket, completion);
     }
 
+    /**
+     * Watches a folder in the sandbox for changes and calls {@code onEvent}
+     * for each one, in order, on the socket's reader thread. Returns once the
+     * watch is in place, so a file changed after this returns is seen.
+     *
+     * <p>Watching works on gVisor and Firecracker sandboxes only; others
+     * answer 501 ({@link MicroVMApiException}). A sandbox whose agent predates
+     * file watching throws {@link MicroVMUnsupportedFeatureException}. The
+     * handshake is a stream, so it is sent once and never retried.
+     */
+    public FileWatchHandle watchFiles(String sandboxId, String path, WatchOptions options, Consumer<FileEvent> onEvent) {
+        if (trimToNull(sandboxId) == null) {
+            throw new MicroVMException("sandbox id is required");
+        }
+        if (trimToNull(path) == null) {
+            throw new MicroVMException("path is required");
+        }
+        if (onEvent == null) {
+            throw new MicroVMException("onEvent is required");
+        }
+        String query = "?path=" + encodeQueryValue(path);
+        if (options != null && options.recursive) {
+            query += "&recursive=true";
+        }
+        FileWatchHandle handle = new FileWatchHandle(onEvent);
+        StreamingWebSocket socket;
+        try {
+            socket = webSocketConnector.connect(
+                webSocketUri(sandboxPath(sandboxId) + "/toolbox/files/watch" + query),
+                webSocketHeaders(),
+                handle.listener()
+            );
+        } catch (WebSocketHandshakeFailure failure) {
+            throw watchHandshakeError(sandboxId, failure);
+        }
+        handle.attach(socket);
+        handle.awaitStart(WATCH_START_TIMEOUT);
+        return handle;
+    }
+
+    /**
+     * A 404 that says the route itself is missing (toolboxd marks it with
+     * {@code X-Toolbox-Route: none}; one built before that mark says just
+     * "not found") means the agent predates file watching. sandboxd's own 404
+     * says "sandbox not found", and a missing folder "path not found: ...",
+     * so neither is mistaken for it.
+     */
+    private RuntimeException watchHandshakeError(String sandboxId, WebSocketHandshakeFailure failure) {
+        int status = failure.getStatusCode();
+        byte[] body = failure.getBody().getBytes(StandardCharsets.UTF_8);
+        ErrorResponse error = JsonSupport.tryRead(body, ErrorResponse.class);
+        String route = failure.header("X-Toolbox-Route");
+        if (status == 404 && (route != null && "none".equals(route.trim()) || error != null && "not found".equals(error.error))) {
+            return new MicroVMUnsupportedFeatureException(sandboxId, List.of("files.watch"), "");
+        }
+        return apiException(status, failure.header("Retry-After"), body);
+    }
+
     public Session createSession(String sandboxId, CreateSessionOptions options) {
         return doJson("POST", sandboxPath(sandboxId) + "/sessions", options, Session.class);
     }
@@ -1515,16 +1580,18 @@ public class MicroVMClient {
 
     private void ensureSuccess(HttpResponse<byte[]> response) {
         if (response.statusCode() >= 400) {
-            int status = response.statusCode();
-            java.time.Duration retryAfter = RetryAfter.parse(
-                response.headers().firstValue("Retry-After").orElse(null), java.time.Instant.now());
-            ErrorResponse error = JsonSupport.tryRead(response.body(), ErrorResponse.class);
-            if (error != null && error.error != null && !error.error.isEmpty()) {
-                String code = error.code == null || error.code.isEmpty() ? null : error.code;
-                throw new MicroVMApiException(status, code, error.error, retryAfter);
-            }
-            throw new MicroVMApiException(status, null, "request failed with status " + status, retryAfter);
+            throw apiException(response.statusCode(), response.headers().firstValue("Retry-After").orElse(null), response.body());
         }
+    }
+
+    private static MicroVMApiException apiException(int status, String retryAfterHeader, byte[] body) {
+        java.time.Duration retryAfter = RetryAfter.parse(retryAfterHeader, java.time.Instant.now());
+        ErrorResponse error = body == null ? null : JsonSupport.tryRead(body, ErrorResponse.class);
+        if (error != null && error.error != null && !error.error.isEmpty()) {
+            String code = error.code == null || error.code.isEmpty() ? null : error.code;
+            return new MicroVMApiException(status, code, error.error, retryAfter);
+        }
+        return new MicroVMApiException(status, null, "request failed with status " + status, retryAfter);
     }
 
     private URI resolve(String path) {
@@ -1545,11 +1612,10 @@ public class MicroVMClient {
             throw new MicroVMException("unsupported base URL scheme \"" + scheme + "\"");
         }
 
-        try {
-            return new URI(websocketScheme, uri.getUserInfo(), uri.getHost(), uri.getPort(), uri.getPath(), uri.getQuery(), uri.getFragment());
-        } catch (URISyntaxException ex) {
-            throw new MicroVMException("invalid websocket URL", ex);
-        }
+        // Swap the scheme on the raw text: rebuilding from the decoded parts
+        // would turn an escaped '&' or '=' in a query value (a watched path)
+        // into a real separator.
+        return URI.create(websocketScheme + uri.toString().substring(scheme.length()));
     }
 
     private String authorizationHeaderValue() {

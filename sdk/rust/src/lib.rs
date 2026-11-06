@@ -37,7 +37,7 @@ pub use types::{
     CreateSnapshotOptions, CreateWasmModuleOptions,
     CustomDomain,
     CustomDomainDnsRecords,
-    CustomDomainStatus, DnsRecord, ExecExitInfo, ExecRequest, ExecResult, ExposeOptions,
+    CustomDomainStatus, DnsRecord, ExecExitInfo, ExecRequest, ExecResult, ExposeOptions, FileEvent,
     ExposeProtocol, ExposeResult, ExposedPort, Failover, GPUOptions, GPUVendor, HealthStatus,
     IngressTarget, Lifecycle,
     MountSpec, MountSpecRedacted, MountType, NetworkUsage, PlatformVolumeMount,
@@ -45,7 +45,7 @@ pub use types::{
     ResizeOptions, RetryConfig, Sandbox as SandboxData, SandboxSnapshot, Session, SessionList,
     SessionStatus, SetNetworkLimitsOptions, Template, TemplatePushState, TemplateStatus,
     UpdateLifecycleOptions, WasmModule, WasmModuleStatus, PushWasmModuleOptions,
-    PushWasmModuleResponse,
+    PushWasmModuleResponse, WatchOptions,
 };
 
 const DEFAULT_API_URL: &str = "http://127.0.0.1:21212";
@@ -626,6 +626,26 @@ pub struct SessionAttachHandle {
     done_rx: mpsc::Receiver<Result<ExecExitInfo, Error>>,
 }
 
+/// A running file watch, from [`Client::watch_files`]. Dropping it stops
+/// the watch, so keep it for as long as you want events.
+pub struct FileWatchHandle {
+    stop_tx: UnboundedSender<()>,
+    done_rx: mpsc::Receiver<Result<(), Error>>,
+}
+
+/// The feature name an agent too old to watch files is reported with.
+const FILE_WATCH_FEATURE: &str = "files.watch";
+
+#[derive(serde::Deserialize)]
+struct FileWatchServerFrame {
+    #[serde(rename = "type")]
+    kind: String,
+    #[serde(default)]
+    events: Vec<FileEvent>,
+    #[serde(default)]
+    reason: Option<String>,
+}
+
 enum ControlMessage {
     Binary(Vec<u8>),
     Text(String),
@@ -740,6 +760,28 @@ impl SessionAttachHandle {
     }
 }
 
+impl FileWatchHandle {
+    /// Stops the watch. Calling it again, or after the watch ended, does
+    /// nothing.
+    pub fn stop(&self) {
+        // The stream task is gone once the watch ended; nothing to stop.
+        let _ = self.stop_tx.send(());
+    }
+
+    /// Blocks until the watch ends. It returns `Ok(())` after [`stop`], and
+    /// an [`Error::Client`] carrying the reason when the sandbox ended the
+    /// watch (the folder was removed or moved) or the connection dropped.
+    ///
+    /// [`stop`]: FileWatchHandle::stop
+    pub fn wait(self) -> Result<(), Error> {
+        // Held until the end: dropping the sender stops the watch.
+        let FileWatchHandle { stop_tx, done_rx } = self;
+        let result = done_rx.recv().map_err(|_| Error::ChannelClosed)?;
+        drop(stop_tx);
+        result
+    }
+}
+
 impl Sandbox {
     fn new(client: Client, data: SandboxData) -> Self {
         Sandbox {
@@ -781,6 +823,16 @@ impl Sandbox {
 
     pub fn exec_stream(&self, options: ExecStreamOptions) -> Result<ExecStreamHandle, Error> {
         self.client.exec_stream(&self.data.id, options)
+    }
+
+    /// Watches a folder in this sandbox. See [`Client::watch_files`].
+    pub fn watch_files(
+        &self,
+        path: &str,
+        options: WatchOptions,
+        on_event: impl FnMut(FileEvent) + Send + 'static,
+    ) -> Result<FileWatchHandle, Error> {
+        self.client.watch_files(&self.data.id, path, options, on_event)
     }
 
     pub fn create_session(&self, options: CreateSessionOptions) -> Result<Session, Error> {
@@ -2032,6 +2084,65 @@ impl Client {
         })
     }
 
+    /// Watches a folder in a sandbox and calls `on_event` once per change,
+    /// in order, on a background thread. Events arrive in batches at most
+    /// every 250 ms. It returns once the watch is in place, so a change made
+    /// after it returns is reported.
+    ///
+    /// File watching needs a gVisor or Firecracker sandbox; any other
+    /// runtime answers [`Error::Api`] with status 501. A sandbox whose agent
+    /// predates file watching gives [`Error::UnsupportedFeature`] naming
+    /// `files.watch`. The request is sent once and never retried.
+    pub fn watch_files(
+        &self,
+        id: &str,
+        path: &str,
+        options: WatchOptions,
+        on_event: impl FnMut(FileEvent) + Send + 'static,
+    ) -> Result<FileWatchHandle, Error> {
+        let (stop_tx, stop_rx) = unbounded_channel();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let api_url = self.api_url.clone();
+        let pat_token = self.pat_token.clone();
+        let team = self.team.clone();
+        let api_version = self.api_version;
+        let sandbox_id = id.to_string();
+        let path = path.to_string();
+
+        thread::spawn(move || {
+            // ready_tx answers watch_files: an error before the start frame,
+            // or Ok once the watch is in place. Later results go to wait().
+            let mut ready = Some(ready_tx);
+            let result = match Builder::new_current_thread().enable_all().build() {
+                Ok(runtime) => runtime.block_on(run_file_watch(
+                    api_url,
+                    api_version,
+                    pat_token,
+                    team,
+                    sandbox_id,
+                    path,
+                    options,
+                    on_event,
+                    &mut ready,
+                    stop_rx,
+                )),
+                Err(err) => Err(Error::Runtime(err)),
+            };
+            match ready {
+                Some(ready_tx) => {
+                    let _ = ready_tx.send(result);
+                }
+                None => {
+                    let _ = done_tx.send(result);
+                }
+            }
+        });
+
+        ready_rx.recv().map_err(|_| Error::ChannelClosed)??;
+        Ok(FileWatchHandle { stop_tx, done_rx })
+    }
+
     pub fn upload_file(&self, id: &str, target_path: &str, data: Vec<u8>) -> Result<(), Error> {
         let file_name = Path::new(target_path)
             .file_name()
@@ -2579,6 +2690,127 @@ async fn run_session_attach(
             }
         }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_file_watch(
+    api_url: String,
+    api_version: ApiVersion,
+    pat_token: String,
+    team: Option<String>,
+    sandbox_id: String,
+    path: String,
+    options: WatchOptions,
+    mut on_event: impl FnMut(FileEvent),
+    ready: &mut Option<mpsc::Sender<Result<(), Error>>>,
+    mut stop_rx: tokio::sync::mpsc::UnboundedReceiver<()>,
+) -> Result<(), Error> {
+    let mut route = format!(
+        "{}/sandboxes/{}/toolbox/files/watch?path={}",
+        api_version.path_prefix(),
+        urlencoding::encode(&sandbox_id),
+        urlencoding::encode(&path)
+    );
+    if options.recursive {
+        route.push_str("&recursive=true");
+    }
+    let request = websocket_request(websocket_url(&api_url, &route)?, &pat_token, team.as_deref())?;
+    let (stream, _) = connect_async(request)
+        .await
+        .map_err(|err| file_watch_handshake_error(&sandbox_id, err))?;
+    let (mut write, mut read) = stream.split();
+
+    // The watch is in place only once the start frame arrives; returning
+    // before it would lose a change the caller makes right away.
+    loop {
+        match read.next().await {
+            Some(Ok(Message::Text(text))) => {
+                let frame: FileWatchServerFrame = serde_json::from_str(text.as_ref())?;
+                match frame.kind.as_str() {
+                    "start" => break,
+                    "end" => return Err(file_watch_ended(frame.reason)),
+                    _ => {}
+                }
+            }
+            Some(Ok(Message::Close(_))) | None => {
+                return Err(Error::Client("file watch closed before it started".to_string()))
+            }
+            Some(Ok(_)) => {}
+            Some(Err(err)) => return Err(Error::WebSocket(err)),
+        }
+    }
+    if let Some(ready_tx) = ready.take() {
+        let _ = ready_tx.send(Ok(()));
+    }
+
+    loop {
+        tokio::select! {
+            // stop(), or the handle dropped (recv gives None).
+            _ = stop_rx.recv() => {
+                let _ = write.send(Message::Close(None)).await;
+                return Ok(());
+            }
+            message = read.next() => {
+                match message {
+                    Some(Ok(Message::Text(text))) => {
+                        let frame: FileWatchServerFrame = serde_json::from_str(text.as_ref())?;
+                        match frame.kind.as_str() {
+                            "events" => frame.events.into_iter().for_each(&mut on_event),
+                            "end" => return Err(file_watch_ended(frame.reason)),
+                            _ => {}
+                        }
+                    }
+                    Some(Ok(Message::Close(_))) | None => {
+                        return Err(Error::Client("file watch stream closed before the watch ended".to_string()))
+                    }
+                    Some(Ok(_)) => {}
+                    Some(Err(err)) => return Err(Error::WebSocket(err)),
+                }
+            }
+        }
+    }
+}
+
+/// The sandbox ended the watch on its own: the folder was removed or moved.
+fn file_watch_ended(reason: Option<String>) -> Error {
+    Error::Client(
+        reason
+            .filter(|reason| !reason.trim().is_empty())
+            .unwrap_or_else(|| "file watch ended".to_string()),
+    )
+}
+
+/// Maps a refused watch handshake to an error. A 404 that toolboxd marks
+/// as "no such route" (the `X-Toolbox-Route: none` header, or the bare
+/// `not found` an agent sends from before the header existed) means the
+/// agent predates file watching. sandboxd's own 404 says "sandbox not
+/// found" and a missing path "path not found: ...", so neither is taken for
+/// it. Every other refusal is the server's [`ApiError`].
+fn file_watch_handshake_error(sandbox_id: &str, err: WebSocketError) -> Error {
+    let response = match err {
+        WebSocketError::Http(response) => response,
+        other => return Error::WebSocket(other),
+    };
+    let status = response.status();
+    let header = |name: &str| {
+        response
+            .headers()
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .map(String::from)
+    };
+    let route_missing = header("X-Toolbox-Route").is_some_and(|value| value.trim() == "none");
+    let retry_after = header("Retry-After");
+    let body = String::from_utf8_lossy(response.body().as_deref().unwrap_or_default()).to_string();
+    let api = ApiError::from_response(status, retry_after.as_deref(), &body);
+    if status == reqwest::StatusCode::NOT_FOUND && (route_missing || api.message() == "not found") {
+        return Error::UnsupportedFeature(UnsupportedFeatureError {
+            sandbox_id: sandbox_id.to_string(),
+            features: vec![FILE_WATCH_FEATURE.to_string()],
+            agent_version: String::new(),
+        });
+    }
+    Error::Api(api)
 }
 
 // decorate_ws_handshake unwraps tungstenite's Http error variant so the
@@ -6575,5 +6807,314 @@ mod tests {
         let keys: std::collections::HashSet<String> = (0..1000).map(|_| new_idempotency_key()).collect();
         assert_eq!(keys.len(), 1000);
         assert!(keys.iter().all(|k| is_generated_key(k)));
+    }
+
+    /// How the fake file-watch server ends its side.
+    enum WatchServerEnd {
+        /// Send `{"type":"end","reason":...}` and close normally.
+        EndFrame(&'static str),
+        /// Wait for the client to close, then report "client closed".
+        AwaitClientClose,
+        /// Drop the connection without a close frame.
+        Drop,
+    }
+
+    // tungstenite fixes the handshake callback's error type (a whole HTTP
+    // response), which clippy calls large.
+    #[allow(clippy::result_large_err)]
+    /// A toolboxd-like file-watch WebSocket. It reports the handshake's URI
+    /// and Authorization header, waits `delay`, sends `frames` in order, then
+    /// ends as `end` says.
+    fn spawn_watch_server(
+        delay: Duration,
+        frames: Vec<serde_json::Value>,
+        end: WatchServerEnd,
+    ) -> (String, std::sync::mpsc::Receiver<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener should bind");
+        let addr = listener.local_addr().expect("listener address");
+        listener.set_nonblocking(true).expect("listener should be non-blocking");
+        let (seen_tx, seen_rx) = std::sync::mpsc::channel();
+
+        thread::spawn(move || {
+            let runtime = Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime should build");
+            runtime.block_on(async move {
+                let listener = tokio::net::TcpListener::from_std(listener)
+                    .expect("tokio listener should build");
+                let (stream, _) = listener.accept().await.expect("server should accept");
+                let handshake_tx = seen_tx.clone();
+                let ws_stream = tokio_tungstenite::accept_hdr_async(
+                    stream,
+                    move |request: &tokio_tungstenite::tungstenite::handshake::server::Request,
+                          response: tokio_tungstenite::tungstenite::handshake::server::Response| {
+                        let auth = request
+                            .headers()
+                            .get("authorization")
+                            .and_then(|value| value.to_str().ok())
+                            .unwrap_or_default()
+                            .to_string();
+                        let _ = handshake_tx.send(format!("uri {}", request.uri()));
+                        let _ = handshake_tx.send(format!("auth {}", auth));
+                        Ok(response)
+                    },
+                )
+                .await
+                .expect("websocket should accept");
+                let (mut write, mut read) = ws_stream.split();
+                tokio::time::sleep(delay).await;
+                for frame in frames {
+                    write
+                        .send(Message::Text(frame.to_string().into()))
+                        .await
+                        .expect("frame should send");
+                }
+                match end {
+                    WatchServerEnd::EndFrame(reason) => {
+                        write
+                            .send(Message::Text(
+                                serde_json::json!({ "type": "end", "reason": reason }).to_string().into(),
+                            ))
+                            .await
+                            .expect("end frame should send");
+                        let _ = write.send(Message::Close(None)).await;
+                    }
+                    WatchServerEnd::AwaitClientClose => loop {
+                        match read.next().await {
+                            Some(Ok(Message::Close(_))) | Some(Err(_)) | None => {
+                                let _ = seen_tx.send("client closed".to_string());
+                                break;
+                            }
+                            Some(Ok(_)) => {}
+                        }
+                    },
+                    WatchServerEnd::Drop => {}
+                }
+            });
+        });
+
+        (format!("http://{}", addr), seen_rx)
+    }
+
+    /// A server that refuses the WebSocket handshake with one write, so the
+    /// client reads the head and the body together.
+    fn spawn_handshake_refusal(status_line: &str, extra_headers: &str, body: &str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener should bind");
+        let addr = listener.local_addr().expect("listener address");
+        let response = format!(
+            "HTTP/1.1 {}\r\n{}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            status_line,
+            extra_headers,
+            body.len(),
+            body
+        );
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("server should accept");
+            let _ = read_http_request(&mut stream);
+            stream.write_all(response.as_bytes()).expect("response should write");
+        });
+        format!("http://{}", addr)
+    }
+
+    fn watch_start(path: &str, recursive: bool) -> serde_json::Value {
+        serde_json::json!({ "type": "start", "path": path, "recursive": recursive })
+    }
+
+    fn recorded_events() -> (Arc<Mutex<Vec<FileEvent>>>, impl FnMut(FileEvent) + Send + 'static) {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let capture = Arc::clone(&events);
+        (events, move |event| capture.lock().expect("events lock").push(event))
+    }
+
+    #[test]
+    fn watch_files_returns_after_start_and_delivers_events_in_order() {
+        let (url, seen) = spawn_watch_server(
+            Duration::from_millis(150),
+            vec![
+                watch_start("/work dir", true),
+                serde_json::json!({ "type": "events", "events": [
+                    { "type": "create", "path": "/work dir/a.txt" },
+                    { "type": "write", "path": "/work dir/a.txt" },
+                    { "type": "create", "path": "/work dir/sub", "is_dir": true },
+                    { "type": "overflow", "reason": "kernel_queue" },
+                ]}),
+                serde_json::json!({ "type": "something_new" }),
+                serde_json::json!({ "type": "events", "events": [
+                    { "type": "future_kind", "path": "/work dir/b" },
+                ]}),
+            ],
+            WatchServerEnd::EndFrame("the watched folder was removed"),
+        );
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        let (events, on_event) = recorded_events();
+        let started = std::time::Instant::now();
+        let handle = client
+            .watch_files("sb-1", "/work dir", WatchOptions { recursive: true }, on_event)
+            .expect("watch should start");
+        assert!(
+            started.elapsed() >= Duration::from_millis(150),
+            "watch_files returned before the start frame"
+        );
+        assert_eq!(
+            seen.recv().expect("uri"),
+            "uri /v1/sandboxes/sb-1/toolbox/files/watch?path=%2Fwork%20dir&recursive=true"
+        );
+        assert_eq!(seen.recv().expect("auth"), "auth Bearer pat-token");
+
+        match handle.wait() {
+            Err(Error::Client(reason)) => assert_eq!(reason, "the watched folder was removed"),
+            other => panic!("want the end reason, got {:?}", other),
+        }
+        let event = |kind: &str, path: &str, is_dir: bool, reason: Option<&str>| FileEvent {
+            kind: kind.to_string(),
+            path: path.to_string(),
+            is_dir,
+            reason: reason.map(String::from),
+        };
+        assert_eq!(
+            events.lock().expect("events lock").clone(),
+            vec![
+                event("create", "/work dir/a.txt", false, None),
+                event("write", "/work dir/a.txt", false, None),
+                event("create", "/work dir/sub", true, None),
+                event("overflow", "", false, Some("kernel_queue")),
+                event("future_kind", "/work dir/b", false, None),
+            ]
+        );
+    }
+
+    #[test]
+    fn watch_files_stop_closes_the_socket_and_wait_returns_ok() {
+        let (url, seen) = spawn_watch_server(
+            Duration::ZERO,
+            vec![watch_start("/work", false)],
+            WatchServerEnd::AwaitClientClose,
+        );
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        let (_, on_event) = recorded_events();
+        let sandbox_handle = client
+            .watch_files("sb-1", "/work", WatchOptions::default(), on_event)
+            .expect("watch should start");
+        // Not recursive: the query has no recursive parameter at all.
+        assert_eq!(seen.recv().expect("uri"), "uri /v1/sandboxes/sb-1/toolbox/files/watch?path=%2Fwork");
+        sandbox_handle.stop();
+        sandbox_handle.stop();
+        sandbox_handle.wait().expect("wait after stop should be Ok");
+        let _ = seen.recv().expect("auth");
+        assert_eq!(
+            seen.recv_timeout(Duration::from_secs(5)).expect("server should see the close"),
+            "client closed"
+        );
+    }
+
+    #[test]
+    fn dropping_the_watch_handle_stops_the_watch() {
+        let (url, seen) = spawn_watch_server(
+            Duration::ZERO,
+            vec![watch_start("/work", false)],
+            WatchServerEnd::AwaitClientClose,
+        );
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        let (_, on_event) = recorded_events();
+        let handle = client
+            .watch_files("sb-1", "/work", WatchOptions::default(), on_event)
+            .expect("watch should start");
+        drop(handle);
+        let _ = seen.recv().expect("uri");
+        let _ = seen.recv().expect("auth");
+        assert_eq!(
+            seen.recv_timeout(Duration::from_secs(5)).expect("server should see the close"),
+            "client closed"
+        );
+    }
+
+    #[test]
+    fn watch_files_reports_a_dropped_connection() {
+        let (url, _seen) = spawn_watch_server(
+            Duration::ZERO,
+            vec![watch_start("/work", false)],
+            WatchServerEnd::Drop,
+        );
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        let (_, on_event) = recorded_events();
+        let handle = client
+            .watch_files("sb-1", "/work", WatchOptions::default(), on_event)
+            .expect("watch should start");
+        assert!(handle.wait().is_err(), "a dropped connection must not look like a clean stop");
+    }
+
+    #[test]
+    fn watch_files_fails_when_the_watch_ends_before_it_starts() {
+        let (url, _seen) = spawn_watch_server(Duration::ZERO, vec![], WatchServerEnd::EndFrame("gone"));
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        let (_, on_event) = recorded_events();
+        match client.watch_files("sb-1", "/work", WatchOptions::default(), on_event) {
+            Err(Error::Client(reason)) => assert_eq!(reason, "gone"),
+            Err(other) => panic!("want the end reason, got {:?}", other),
+            Ok(_) => panic!("want an error"),
+        }
+    }
+
+    #[test]
+    fn watch_files_on_an_agent_without_the_route_is_unsupported() {
+        for (headers, body) in [
+            ("X-Toolbox-Route: none\r\n", r#"{"error":"not found"}"#),
+            ("X-Toolbox-Route: none\r\n", ""),
+            ("", r#"{"error":"not found"}"#),
+        ] {
+            let url = spawn_handshake_refusal("404 Not Found", headers, body);
+            let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+            let (_, on_event) = recorded_events();
+            match client.watch_files("sb-1", "/work", WatchOptions::default(), on_event) {
+                Err(Error::UnsupportedFeature(err)) => {
+                    assert_eq!(err.sandbox_id(), "sb-1");
+                    assert_eq!(err.features(), ["files.watch".to_string()]);
+                    assert!(err.to_string().contains("restart the sandbox"), "{}", err);
+                }
+                Err(other) => panic!("headers {:?} body {:?}: want UnsupportedFeature, got {:?}", headers, body, other),
+                Ok(_) => panic!("want an error"),
+            }
+        }
+    }
+
+    #[test]
+    fn watch_files_refusals_are_api_errors() {
+        for (status_line, body, status, message) in [
+            (
+                "501 Not Implemented",
+                r#"{"error":"file watching needs a gVisor or Firecracker sandbox"}"#,
+                501,
+                "file watching needs a gVisor or Firecracker sandbox",
+            ),
+            ("404 Not Found", r#"{"error":"path not found: /x"}"#, 404, "path not found: /x"),
+            ("404 Not Found", r#"{"error":"sandbox not found"}"#, 404, "sandbox not found"),
+            ("409 Conflict", r#"{"error":"not a folder: /x"}"#, 409, "not a folder: /x"),
+        ] {
+            let url = spawn_handshake_refusal(status_line, "", body);
+            let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+            let (_, on_event) = recorded_events();
+            match client.watch_files("sb-1", "/x", WatchOptions::default(), on_event) {
+                Err(Error::Api(err)) => {
+                    assert_eq!(err.status(), status);
+                    assert_eq!(err.message(), message);
+                }
+                Err(other) => panic!("{}: want Error::Api, got {:?}", status_line, other),
+                Ok(_) => panic!("want an error"),
+            }
+        }
+    }
+
+    #[test]
+    fn file_event_reads_the_wire_shape() {
+        let event: FileEvent =
+            serde_json::from_str(r#"{"type":"overflow","reason":"watch_limit","path":"/w/deep"}"#)
+                .expect("event should parse");
+        assert_eq!(event.kind, "overflow");
+        assert_eq!(event.reason.as_deref(), Some("watch_limit"));
+        assert!(!event.is_dir);
+        let bare: FileEvent = serde_json::from_str(r#"{"type":"chmod"}"#).expect("event should parse");
+        assert_eq!(bare.path, "");
+        assert_eq!(bare.reason, None);
     }
 }

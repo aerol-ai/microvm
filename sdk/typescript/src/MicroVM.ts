@@ -16,6 +16,8 @@ import type {
   PushWasmModuleResult,
   ExecStreamHandle,
   ExecStreamOptions,
+  FileEvent,
+  FileWatchHandle,
   HealthStatus,
   EgressProfile,
   EgressProfileList,
@@ -40,6 +42,7 @@ import type {
   SessionAttachOptions,
   Template,
   WasmModule,
+  WatchFilesOptions,
   WhoAmI,
 } from "./types.js";
 
@@ -295,6 +298,18 @@ export class MicroVM {
 
   execStream(sandboxID: string, options: ExecStreamOptions): ExecStreamHandle {
     return this.client.execStream(sandboxID, options);
+  }
+
+  /**
+   * Watch a folder in a sandbox for changes: `onEvent` gets each create,
+   * write, remove, rename and chmod, in batches every 250 ms. Resolves once
+   * the watch is in place. gVisor and Firecracker sandboxes only; Docker,
+   * containerd, WASM and isolate sandboxes reject with a 501
+   * `MicroVMApiError`. A sandbox whose agent predates file watching rejects
+   * with `MicroVMUnsupportedFeatureError`.
+   */
+  async watchFiles(sandboxID: string, path: string, onEvent: (event: FileEvent) => void, options: WatchFilesOptions = {}): Promise<FileWatchHandle> {
+    return this.client.watchFiles(sandboxID, path, onEvent, options);
   }
 
   async createSession(sandboxID: string, options: CreateSessionOptions): Promise<Session> {

@@ -38,6 +38,8 @@ import type {
   ExposeProtocol,
   ExposeResult,
   Failover,
+  FileEvent,
+  FileWatchHandle,
   GPUOptions,
   HealthStatus,
   IngressTarget,
@@ -79,6 +81,7 @@ import type {
   WasmModule,
   WasmModuleStatus,
   WhoAmI,
+  WatchFilesOptions,
 } from "../types.js";
 
 type FetchLike = typeof fetch;
@@ -1043,6 +1046,58 @@ export class APIClient {
     return openExecStream(this.baseURL, this.versionPrefix, this.patToken, id, options, ready);
   }
 
+  /**
+   * Watch a folder in the sandbox for changes. Resolves once the watch is in
+   * place, so a change made after it resolves is reported. gVisor and
+   * Firecracker sandboxes only: the others answer 501. Not retried: a stream
+   * is opened once.
+   */
+  async watchFiles(id: string, path: string, onEvent: (event: FileEvent) => void, options: WatchFilesOptions = {}): Promise<FileWatchHandle> {
+    const query = `path=${encodeURIComponent(path)}${options.recursive ? "&recursive=true" : ""}`;
+    const routePath = `${this.versioned(`/sandboxes/${encodeURIComponent(id)}/toolbox/files/watch`)}?${query}`;
+    return openFileWatch(this.baseURL, routePath, this.patToken, onEvent, (detail) => this.fileWatchRefusal(id, routePath, detail));
+  }
+
+  /**
+   * Explains a watch whose WebSocket handshake failed. The WebSocket API
+   * hides a refused handshake's status and body, so the same request is sent
+   * again as plain HTTP: toolboxd checks the runtime, the path and its limits
+   * before the upgrade, so it answers with the real reason (501 on Docker or
+   * containerd, 404 for a missing folder, 429 at the watch limit). That GET
+   * is a diagnosis, sent once, never a retry of the stream.
+   */
+  private async fileWatchRefusal(id: string, routePath: string, detail: string): Promise<Error> {
+    const fallback = new Error(`file watch failed to start${detail}`);
+    let response: Response;
+    let text: string;
+    try {
+      response = await this.fetchFn(`${this.baseURL}${routePath}`, {
+        method: "GET",
+        headers: this.authHeaders(),
+        ...(this.signal ? { signal: this.signal } : {}),
+      });
+      text = await response.text();
+    } catch {
+      return fallback;
+    }
+    let message: unknown;
+    try {
+      message = (JSON.parse(text) as { error?: unknown }).error;
+    } catch {
+      // Not JSON: a proxy's error page, or the upgrade's own refusal.
+    }
+    // An agent that predates file watching has no such route.
+    if (response.status === 404 && (response.headers.get(TOOLBOX_ROUTE_HEADER) === "none" || message === "not found")) {
+      return new MicroVMUnsupportedFeatureError(id, [FILE_WATCH_FEATURE]);
+    }
+    // toolboxd accepted the watch and only refused the plain-HTTP upgrade:
+    // the stream failed for some other reason, which `detail` holds.
+    if (response.ok || response.headers.has("sec-websocket-version")) {
+      return fallback;
+    }
+    return decodeError(new Response(text, { status: response.status, headers: response.headers }));
+  }
+
   async createSession(id: string, options: CreateSessionOptions): Promise<Session> {
     const response = await this.doJSON<ApiSession>("POST", `${this.versionPrefix}/sandboxes/${id}/sessions`, toApiCreateSessionOptions(options));
     return fromApiSession(response);
@@ -1492,14 +1547,19 @@ export class APIClient {
    * {@link retryDelayMs}). The client's `signal` ends the request and any
    * wait.
    */
-  private async request(method: string, path: string, init: RequestInit = {}, options: RequestOptions = {}): Promise<Response> {
-    const headers = new Headers(init.headers);
+  private authHeaders(base?: HeadersInit): Headers {
+    const headers = new Headers(base);
     if (this.patToken !== "") {
       headers.set("Authorization", `Bearer ${this.patToken}`);
     }
     if (this.team !== "") {
       headers.set(TEAM_HEADER, this.team);
     }
+    return headers;
+  }
+
+  private async request(method: string, path: string, init: RequestInit = {}, options: RequestOptions = {}): Promise<Response> {
+    const headers = this.authHeaders(init.headers);
 
     const url = `${this.baseURL}${path}`;
     const signal = init.signal ?? this.signal;
@@ -1595,6 +1655,14 @@ export class SandboxResource implements Sandbox {
 
   execStream(options: ExecStreamOptions): ExecStreamHandle {
     return this.client.execStream(this.id, options);
+  }
+
+  /**
+   * Watch a folder in this sandbox for changes; see
+   * {@link APIClient.watchFiles}. gVisor and Firecracker sandboxes only.
+   */
+  async watchFiles(path: string, onEvent: (event: FileEvent) => void, options: WatchFilesOptions = {}): Promise<FileWatchHandle> {
+    return this.client.watchFiles(this.id, path, onEvent, options);
   }
 
   async createSession(options: CreateSessionOptions): Promise<Session> {
@@ -2251,6 +2319,11 @@ async function decodeError(response: Response): Promise<MicroVMApiError> {
 const STREAM_PREFIX_STDOUT = 0x01;
 const STREAM_PREFIX_STDERR = 0x02;
 
+// toolboxd marks a 404 that means "no such route" with this header, as
+// opposed to a route that answered 404 for a missing file.
+const TOOLBOX_ROUTE_HEADER = "x-toolbox-route";
+const FILE_WATCH_FEATURE = "files.watch";
+
 // Pull whatever diagnostic detail the runtime gave us off a WebSocket "error"
 // event. Node 22's native WebSocket fires an ErrorEvent with `.error` /
 // `.message`; browsers' base WebSocket fires a bare Event. Returns "" when
@@ -2550,4 +2623,145 @@ function openSessionAttach(
     },
     done,
   };
+}
+
+function fromApiFileEvent(raw: unknown): FileEvent {
+  const e = (raw ?? {}) as { type?: unknown; path?: unknown; is_dir?: unknown; reason?: unknown };
+  const event: FileEvent = {
+    type: typeof e.type === "string" ? e.type : "",
+    path: typeof e.path === "string" ? e.path : "",
+    isDir: e.is_dir === true,
+  };
+  if (typeof e.reason === "string" && e.reason !== "") {
+    event.reason = e.reason;
+  }
+  return event;
+}
+
+// openFileWatch opens toolboxd's /files/watch stream and resolves with its
+// handle once the "start" frame says the watch is in place. `refusal`
+// explains a handshake that never opened.
+function openFileWatch(
+  baseURL: string,
+  routePath: string,
+  patToken: string,
+  onEvent: (event: FileEvent) => void,
+  refusal: (detail: string) => Promise<Error>,
+): Promise<FileWatchHandle> {
+  const WS = (globalThis as { WebSocket?: typeof WebSocket }).WebSocket;
+  if (!WS) {
+    return Promise.reject(new Error("WebSocket is not available in this runtime — Node 22+ or a browser is required"));
+  }
+  // The PAT rides the subprotocol, as on execStream: browsers cannot set
+  // Authorization on a WebSocket handshake.
+  const ws = new WS(baseURL.replace(/^http/, "ws") + routePath, ["sandbox.bearer", patToken]);
+
+  let startResolve!: (handle: FileWatchHandle) => void;
+  let startReject!: (err: Error) => void;
+  const started = new Promise<FileWatchHandle>((resolve, reject) => {
+    startResolve = resolve;
+    startReject = reject;
+  });
+  let endResolve!: () => void;
+  let endReject!: (err: Error) => void;
+  const ended = new Promise<void>((resolve, reject) => {
+    endResolve = resolve;
+    endReject = reject;
+  });
+  // A caller that never calls wait() must not see an unhandled rejection.
+  ended.catch(() => undefined);
+
+  let opened = false;
+  let isStarted = false;
+  let startFailed = false;
+  let settled = false;
+  let lastErrorDetail = "";
+
+  const finish = (err?: Error) => {
+    if (settled) return;
+    settled = true;
+    if (err) {
+      endReject(err);
+    } else {
+      endResolve();
+    }
+  };
+  const handle: FileWatchHandle = {
+    stop() {
+      finish();
+      ws.close();
+    },
+    wait() {
+      return ended;
+    },
+  };
+  const fail = (detail: string) => {
+    if (isStarted) {
+      finish(new Error(`file watch stream closed${detail}`));
+      return;
+    }
+    if (startFailed) return;
+    startFailed = true;
+    if (opened) {
+      startReject(new Error(`file watch closed before it started${detail}`));
+      return;
+    }
+    void refusal(detail).then(startReject, startReject);
+  };
+
+  ws.addEventListener("open", () => {
+    opened = true;
+  });
+
+  ws.addEventListener("message", (event: MessageEvent) => {
+    if (typeof event.data !== "string") return;
+    let msg: { type?: unknown; events?: unknown; reason?: unknown };
+    try {
+      msg = JSON.parse(event.data) as typeof msg;
+    } catch {
+      return;
+    }
+    switch (msg.type) {
+      case "start":
+        if (!isStarted && !startFailed) {
+          isStarted = true;
+          startResolve(handle);
+        }
+        return;
+      case "events":
+        if (!Array.isArray(msg.events)) return;
+        for (const raw of msg.events) {
+          // stop() inside the callback ends delivery at once.
+          if (settled) return;
+          try {
+            onEvent(fromApiFileEvent(raw));
+          } catch (err: unknown) {
+            // A throwing callback ends the watch; wait() reports why.
+            finish(err instanceof Error ? err : new Error(String(err)));
+            ws.close();
+            return;
+          }
+        }
+        return;
+      case "end":
+        finish(new Error(typeof msg.reason === "string" && msg.reason !== "" ? msg.reason : "file watch ended"));
+        ws.close();
+        return;
+    }
+  });
+
+  ws.addEventListener("close", (event) => {
+    const parts = [lastErrorDetail, describeWSClose(event)].filter((s) => s !== "");
+    fail(parts.length > 0 ? ` (${parts.join("; ")})` : "");
+  });
+
+  ws.addEventListener("error", (event) => {
+    const detail = describeWSError(event);
+    if (detail !== "") {
+      lastErrorDetail = detail;
+    }
+    fail(detail !== "" ? ` (${detail})` : "");
+  });
+
+  return started;
 }

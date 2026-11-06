@@ -14,7 +14,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
-from concurrent.futures import Future, TimeoutError as FutureTimeoutError
+from concurrent.futures import Future, InvalidStateError, TimeoutError as FutureTimeoutError
 from io import BytesIO
 from typing import Any, Dict, Iterator, List, Optional, Union
 
@@ -41,6 +41,8 @@ from .types import (
     ExecResult,
     ExecStreamOptions,
     ExposeProtocol,
+    FileEvent,
+    FileEventCallback,
     ExposeResult,
     Failover,
     GPUOptions,
@@ -439,6 +441,91 @@ class SessionAttachHandle:
                 self._done.set_exception(MicroVMError(error_message))
 
 
+class FileWatchHandle:
+    """A running file watch (:meth:`MicroVM.watch_files`).
+
+    Events reach the callback on a background thread, in order, about every
+    250 ms. ``stop()`` ends the watch; ``wait()`` then returns. ``wait()``
+    raises :class:`MicroVMError` when the watch ends any other way: the
+    sandbox ended it (the watched folder was removed or moved; the message
+    says which), the connection dropped, or the callback raised.
+    """
+
+    def __init__(self, ws: Any, on_event: FileEventCallback) -> None:
+        self._ws = ws
+        self._on_event = on_event
+        self._done: Future[None] = Future()
+        self._stopped = threading.Event()
+        self._reader = threading.Thread(target=self._read_loop, daemon=True)
+        self._reader.start()
+
+    @property
+    def done(self) -> Future[None]:
+        return self._done
+
+    def stop(self) -> None:
+        """Ends the watch. Safe to call more than once."""
+        self._stopped.set()
+        self._finish(None)
+        try:
+            self._ws.close()
+        except Exception:
+            # The peer may already have closed the socket.
+            pass
+
+    def wait(self, timeout: Optional[float] = None) -> None:
+        try:
+            self._done.result(timeout)
+        except FutureTimeoutError as exc:
+            raise TimeoutError("timed out waiting for the file watch to end") from exc
+
+    def _finish(self, error: Optional[BaseException]) -> None:
+        # The reader and stop() race to finish; the first one wins.
+        try:
+            if error is None:
+                self._done.set_result(None)
+            else:
+                self._done.set_exception(error)
+        except InvalidStateError:
+            pass
+
+    def _read_loop(self) -> None:
+        try:
+            while True:
+                message = self._ws.recv()
+                if not isinstance(message, str):
+                    # toolboxd sends text frames only.
+                    continue
+                try:
+                    frame = json.loads(message)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(frame, dict):
+                    continue
+                kind = frame.get("type")
+                if kind == "events":
+                    events = frame.get("events")
+                    for item in events if isinstance(events, list) else []:
+                        if isinstance(item, dict):
+                            self._on_event(_from_api_file_event(item))
+                elif kind == "end":
+                    reason = str(frame.get("reason") or "the sandbox ended the file watch")
+                    self._finish(MicroVMError(reason))
+                    break
+                # Unknown frame types are ignored: a newer toolboxd may add some.
+        except Exception as exc:
+            if self._stopped.is_set():
+                self._finish(None)
+            else:
+                self._finish(MicroVMError(f"file watch stream closed: {exc}"))
+        finally:
+            try:
+                self._ws.close()
+            except Exception:
+                # The peer may already have closed the socket.
+                pass
+
+
 class Sandbox:
     def __init__(self, client: "MicroVM", data: SandboxData) -> None:
         self._client = client
@@ -506,6 +593,9 @@ class Sandbox:
 
     def download_file(self, target_path: str) -> bytes:
         return self._client.download_file(self.id, target_path)
+
+    def watch_files(self, path: str, on_event: FileEventCallback, recursive: bool = False) -> FileWatchHandle:
+        return self._client.watch_files(self.id, path, on_event, recursive=recursive)
 
     def expose_port(self, port: int, *, protocol: ExposeProtocol = "http") -> ExposeResult:
         return self._client.expose_port(self.id, port, protocol=protocol)
@@ -1328,6 +1418,52 @@ class MicroVM:
         url = self._url(f"{self._version_prefix}/sandboxes/{sandbox_id}/toolbox/files/download?path={urllib.parse.quote(target_path, safe='')}")
         return self._request("GET", url)
 
+    def watch_files(
+        self,
+        sandbox_id: str,
+        path: str,
+        on_event: FileEventCallback,
+        recursive: bool = False,
+    ) -> FileWatchHandle:
+        """Watch a folder in the sandbox for changes.
+
+        Calls ``on_event`` with a :class:`FileEvent` for every create, write,
+        remove, rename and chmod under ``path`` (and in every subfolder, new
+        ones included, when ``recursive``). Returns once the watch is in
+        place, so a change made after this returns is always seen.
+
+        File watching works on gVisor and Firecracker sandboxes only; others
+        answer :class:`MicroVMHTTPError` with status 501. A sandbox whose
+        agent predates file watching raises
+        :class:`MicroVMUnsupportedFeatureError`. The connection is opened
+        once and never retried.
+        """
+        if not isinstance(path, str) or path.strip() == "":
+            raise MicroVMError("path is required")
+        if on_event is None:
+            raise MicroVMError("on_event is required")
+        query = {"path": path}
+        if recursive:
+            query["recursive"] = "true"
+        websocket_module = _load_websocket_module()
+        ws_url = _to_websocket_url(
+            self.api_url,
+            f"{self._version_prefix}/sandboxes/{urllib.parse.quote(sandbox_id, safe='')}/toolbox/files/watch",
+        ) + "?" + urllib.parse.urlencode(query)
+        ws = _connect_watch_websocket(websocket_module, ws_url, self._websocket_headers(), sandbox_id)
+        # Return only once toolboxd says the watch is armed, so a change the
+        # caller makes right after this returns is never missed.
+        try:
+            first = ws.recv()
+            frame = json.loads(first) if isinstance(first, str) else None
+        except Exception as exc:
+            _close_quietly(ws)
+            raise MicroVMError(f"file watch closed before it started: {exc}") from exc
+        if not isinstance(frame, dict) or frame.get("type") != "start":
+            _close_quietly(ws)
+            raise MicroVMError(f"file watch did not start: unexpected first message {first!r}")
+        return FileWatchHandle(ws, on_event)
+
     def expose_port(self, sandbox_id: str, port: int, *, protocol: ExposeProtocol = "http") -> ExposeResult:
         """Publish a sandbox container port.
 
@@ -1726,6 +1862,46 @@ def _connect_websocket(websocket_module: Any, ws_url: str, headers: List[str], l
         raise MicroVMError(" | ".join(parts)) from exc
 
 
+def _close_quietly(ws: Any) -> None:
+    try:
+        ws.close()
+    except Exception:
+        pass
+
+
+def _connect_watch_websocket(websocket_module: Any, ws_url: str, headers: List[str], sandbox_id: str) -> Any:
+    """Opens the file-watch WebSocket, turning a refused handshake into the
+    error a caller can act on. websocket-client raises
+    WebSocketBadStatusException for a non-101 answer, with the status, the
+    headers (lowercased) and the body."""
+    try:
+        return websocket_module.create_connection(ws_url, header=headers, enable_multithread=True)
+    except Exception as exc:
+        status = getattr(exc, "status_code", None)
+        if not isinstance(status, int):
+            raise MicroVMError(f"file watch websocket connect to {ws_url} failed: {exc}") from exc
+        body = getattr(exc, "resp_body", None)
+        if isinstance(body, (bytes, bytearray)):
+            body = body.decode("utf-8", errors="replace")
+        text = body.strip() if isinstance(body, str) else ""
+        try:
+            data = json.loads(text) if text else None
+        except json.JSONDecodeError:
+            data = None
+        resp_headers = getattr(exc, "resp_headers", None)
+        lowered = {str(k).lower(): str(v) for k, v in resp_headers.items()} if isinstance(resp_headers, dict) else {}
+        # An agent built before file watching has no such route. toolboxd marks
+        # that 404 with X-Toolbox-Route: none; one older still says only
+        # "not found". sandboxd's own 404 says "sandbox not found", and a
+        # missing folder "path not found: ...", so neither matches.
+        if status == 404 and (
+            lowered.get("x-toolbox-route") == "none" or (isinstance(data, dict) and data.get("error") == "not found")
+        ):
+            raise MicroVMUnsupportedFeatureError(sandbox_id, ["files.watch"]) from exc
+        retry_after = _parse_retry_after(lowered.get("retry-after"), time.time())
+        raise _http_error(status, data, text or f"file watch failed with status {status}", retry_after) from exc
+
+
 def _to_websocket_url(base_url: str, path: str) -> str:
     parsed = urllib.parse.urlparse(base_url)
     scheme = {"http": "ws", "https": "wss", "ws": "ws", "wss": "wss"}.get(parsed.scheme)
@@ -1887,6 +2063,16 @@ def _to_api_exec_request(request: ExecRequest) -> Dict[str, Any]:
             "max_stdout_bytes": _first_of(request, "maxStdoutBytes", "max_stdout_bytes"),
             "max_stderr_bytes": _first_of(request, "maxStderrBytes", "max_stderr_bytes"),
         }
+    )
+
+
+def _from_api_file_event(payload: Dict[str, Any]) -> FileEvent:
+    reason = payload.get("reason")
+    return FileEvent(
+        type=str(payload.get("type") or ""),
+        path=str(payload.get("path") or ""),
+        is_dir=bool(payload.get("is_dir", False)),
+        reason=str(reason) if isinstance(reason, str) and reason != "" else None,
     )
 
 

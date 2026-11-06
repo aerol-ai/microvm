@@ -790,6 +790,35 @@ pub struct ExecExitInfo {
     pub signal: Option<String>,
 }
 
+/// Options for [`crate::Client::watch_files`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WatchOptions {
+    /// Also watch every folder below the path, including folders made
+    /// after the watch starts.
+    pub recursive: bool,
+}
+
+/// One change a file watch reports.
+///
+/// `kind` is `create`, `write`, `remove`, `rename` or `chmod`, or
+/// `overflow` when events were lost (list the folder again to catch up). A
+/// rename shows as `rename` for the old name and `create` for the new one.
+/// A newer agent may send other kinds; they are passed through unchanged.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct FileEvent {
+    #[serde(rename = "type")]
+    pub kind: String,
+    /// The absolute path that changed. Empty for most overflow events.
+    #[serde(default)]
+    pub path: String,
+    #[serde(default)]
+    pub is_dir: bool,
+    /// Why events were lost, on an overflow only: `kernel_queue`,
+    /// `event_buffer` or `watch_limit`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
 pub struct CreateSessionOptions {
     #[serde(skip_serializing_if = "Option::is_none")]

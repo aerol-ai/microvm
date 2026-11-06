@@ -51,6 +51,9 @@ export type {
   ExposeResult,
   Failover,
   FailoverPolicy,
+  FileEvent,
+  FileEventType,
+  FileWatchHandle,
   GetOptions,
   HealthStatus,
   IngressTarget,
@@ -82,4 +85,5 @@ export type {
   PushWasmModuleOptions,
   PushWasmModuleResult,
   UpdateLifecycleOptions,
+  WatchFilesOptions,
 } from "./types.js";

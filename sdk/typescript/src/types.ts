@@ -1013,6 +1013,45 @@ export interface SessionAttachHandle {
   done: Promise<ExecExitInfo>;
 }
 
+/**
+ * The kinds of change a file watch reports. `overflow` means some events were
+ * lost (the kernel's queue filled, too many changes in one batch, or a folder
+ * could not be watched): list the folder again to catch up. A rename is
+ * reported as `rename` for the old name and `create` for the new one.
+ */
+export type FileEventType = "create" | "write" | "remove" | "rename" | "chmod" | "overflow";
+
+/** One change reported by {@link FileWatchHandle}'s watch. */
+export interface FileEvent {
+  /**
+   * One of {@link FileEventType}. A newer sandbox agent may add kinds; they
+   * are passed through as they come rather than dropped.
+   */
+  type: FileEventType | (string & {});
+  /** The entry's absolute path in the sandbox. Empty on most overflow events. */
+  path: string;
+  /** True when the entry is a folder. */
+  isDir: boolean;
+  /** Overflow events only: `kernel_queue`, `event_buffer` or `watch_limit`. */
+  reason?: string;
+}
+
+export interface WatchFilesOptions {
+  /** Also watch every subfolder, including ones made after the watch starts. */
+  recursive?: boolean;
+}
+
+export interface FileWatchHandle {
+  /** Stop watching. Safe to call more than once; `wait()` then resolves. */
+  stop(): void;
+  /**
+   * Resolves after `stop()`. Rejects when the sandbox ends the watch (the
+   * watched folder was removed or moved; the error message says which), when
+   * the connection drops, or with the error `onEvent` threw.
+   */
+  wait(): Promise<void>;
+}
+
 export interface HealthStatus {
   status: string;
   sandboxes: number;

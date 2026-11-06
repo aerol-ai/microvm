@@ -38,8 +38,26 @@ public final class JavaNetWebSocketConnector implements WebSocketConnector {
             return new AdapterSocket(webSocket);
         } catch (CompletionException ex) {
             Throwable cause = resolveCause(ex);
-            throw new MicroVMException(describeConnectFailure(uri, cause), cause);
+            String message = describeConnectFailure(uri, cause);
+            if (cause instanceof WebSocketHandshakeException) {
+                HttpResponse<?> response = ((WebSocketHandshakeException) cause).getResponse();
+                if (response != null) {
+                    // Keep the status, headers and body: a caller tells a route
+                    // an older agent lacks from the route's own error by them.
+                    throw new WebSocketHandshakeFailure(message, cause, response.statusCode(),
+                        response.headers().map(), responseBody(response));
+                }
+            }
+            throw new MicroVMException(message, cause);
         }
+    }
+
+    private static String responseBody(HttpResponse<?> response) {
+        Object rawBody = response.body();
+        if (rawBody instanceof byte[]) {
+            return new String((byte[]) rawBody, java.nio.charset.StandardCharsets.UTF_8);
+        }
+        return rawBody == null ? "" : rawBody.toString();
     }
 
     // describeConnectFailure pulls HTTP status / body off WebSocketHandshakeException

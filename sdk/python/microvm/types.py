@@ -312,6 +312,28 @@ class ExecExitInfo(TypedDict, total=False):
     signal: str
 
 
+@dataclass(frozen=True)
+class FileEvent:
+    """One change a file watch reports (:meth:`MicroVM.watch_files`).
+
+    ``type`` is ``create``, ``write``, ``remove``, ``rename`` or ``chmod``, or
+    ``overflow`` when events were lost: the kernel's queue filled up
+    (``reason`` ``kernel_queue``), too many changes came at once
+    (``event_buffer``), or a folder could not be watched (``watch_limit``,
+    ``path`` names it). After an overflow, list the folder again to catch up.
+    A rename shows as ``rename`` for the old name and ``create`` for the new
+    one. ``path`` is absolute inside the sandbox.
+    """
+
+    type: str
+    path: str = ""
+    is_dir: bool = False
+    reason: Optional[str] = None
+
+
+FileEventCallback = Callable[[FileEvent], None]
+
+
 SessionStatus = Literal["running", "exited", "killed", "failed"]
 
 

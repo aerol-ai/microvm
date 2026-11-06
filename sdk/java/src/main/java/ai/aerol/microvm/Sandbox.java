@@ -17,6 +17,7 @@ import ai.aerol.microvm.model.NetworkLearned;
 import ai.aerol.microvm.model.NetworkPolicy;
 import ai.aerol.microvm.model.NetworkPolicyOptions;
 import ai.aerol.microvm.model.ExposeResult;
+import ai.aerol.microvm.model.FileEvent;
 import ai.aerol.microvm.model.Lifecycle;
 import ai.aerol.microvm.model.NetworkUsage;
 import ai.aerol.microvm.model.ResizeOptions;
@@ -25,6 +26,7 @@ import ai.aerol.microvm.model.SandboxSnapshot;
 import ai.aerol.microvm.model.Session;
 import ai.aerol.microvm.model.SessionAttachOptions;
 import ai.aerol.microvm.model.SetNetworkLimitsOptions;
+import ai.aerol.microvm.model.WatchOptions;
 
 public class Sandbox extends SandboxData {
     private final MicroVMClient client;
@@ -93,6 +95,14 @@ public class Sandbox extends SandboxData {
 
     public byte[] sessionRecording(String sessionId) {
         return client.sessionRecording(id, sessionId);
+    }
+
+    /**
+     * Watches a folder in this sandbox for changes; see
+     * {@link MicroVMClient#watchFiles(String, String, WatchOptions, java.util.function.Consumer)}.
+     */
+    public FileWatchHandle watchFiles(String path, WatchOptions options, java.util.function.Consumer<FileEvent> onEvent) {
+        return client.watchFiles(id, path, options, onEvent);
     }
 
     public SessionAttachHandle attachSession(String sessionId, SessionAttachOptions options) {
