@@ -7,17 +7,23 @@ package suite
 // toolbox pass-through, as a customer's would.
 
 import (
+	"archive/tar"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"io"
+	"mime/multipart"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/aerol-ai/microvm/integration-tests/suite/harness"
+	"github.com/aerol-ai/microvm/internal/safetar"
 	microvm "github.com/aerol-ai/microvm/sdk/go/pkg/microvm"
 	sdktypes "github.com/aerol-ai/microvm/sdk/go/pkg/types"
 )
@@ -311,5 +317,100 @@ func TestParityDiskFullIs507(t *testing.T) {
 	var apiErr *microvm.APIError
 	if !errors.As(err, &apiErr) || apiErr.StatusCode != http.StatusInsufficientStorage || !strings.Contains(apiErr.Message, "sandbox disk is full") {
 		t.Fatalf("upload to /dev/full = %v, want 507 sandbox disk is full", err)
+	}
+}
+
+// UC-376 — folders as tar archives (F3, X4): UploadDir lands a local folder
+// with its modes and symlink; a hostile archive sent with extract=true is
+// refused with a 400 naming the entry and the count written, keeps the
+// entry before it, and writes nothing outside the folder; and tar streamed
+// out over exec unpacks here through internal/safetar, the code path
+// `aerolvm cp -r` uses to copy a folder out.
+func TestParityUploadDirLive(t *testing.T) {
+	harness.Require(t, sc, "UC-376")
+	sb := paritySandbox(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+
+	local := t.TempDir()
+	for name, body := range map[string]string{"a.txt": "alpha", "pkg/b.sh": "#!/bin/sh"} {
+		path := filepath.Join(local, name)
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Chmod(filepath.Join(local, "pkg", "b.sh"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("a.txt", filepath.Join(local, "link")); err != nil {
+		t.Fatal(err)
+	}
+	remote := "/tmp/uc376/app"
+	if err := sb.UploadDir(ctx, local, remote); err != nil {
+		t.Fatalf("UploadDir: %v", err)
+	}
+	if got := parityExec(t, ctx, sb, "cat "+remote+"/a.txt; echo; readlink "+remote+"/link; stat -c %a "+remote+"/pkg/b.sh"); got != "alpha\na.txt\n750" {
+		t.Fatalf("uploaded folder: %q", got)
+	}
+
+	var archive bytes.Buffer
+	tw := tar.NewWriter(&archive)
+	for _, e := range []struct{ name, body string }{{"ok.txt", "kept"}, {"../../escape-uc376", "pwned"}} {
+		_ = tw.WriteHeader(&tar.Header{Name: e.name, Mode: 0o644, Typeflag: tar.TypeReg, Size: int64(len(e.body))})
+		_, _ = tw.Write([]byte(e.body))
+	}
+	_ = tw.Close()
+	var body bytes.Buffer
+	mw := multipart.NewWriter(&body)
+	_ = mw.WriteField("path", "/tmp/uc376/hostile")
+	part, _ := mw.CreateFormFile("file", "evil.tar")
+	_, _ = part.Write(archive.Bytes())
+	_ = mw.Close()
+	resp, err := sb.ToolboxRequest(ctx, http.MethodPost, "/files/upload", url.Values{"extract": {"true"}}, body.Bytes(), mw.FormDataContentType())
+	if err == nil {
+		resp.Body.Close()
+		t.Fatalf("a hostile archive was accepted: %d", resp.StatusCode)
+	}
+	var apiErr *microvm.APIError
+	if !errors.As(err, &apiErr) || apiErr.StatusCode != http.StatusBadRequest ||
+		!strings.Contains(apiErr.Message, "../../escape-uc376") || !strings.Contains(apiErr.Message, "1 entries written") {
+		t.Fatalf("hostile archive = %v, want a 400 naming the entry and the count", err)
+	}
+	if got := parityExec(t, ctx, sb, "cat /tmp/uc376/hostile/ok.txt; echo; test -e /tmp/escape-uc376 && echo escaped || echo contained"); got != "kept\ncontained" {
+		t.Fatalf("after the hostile archive: %q", got)
+	}
+
+	// Copy the folder back out over exec, unpacked here safely.
+	pr, pw := io.Pipe()
+	done := make(chan error, 1)
+	dest := t.TempDir()
+	go func() {
+		_, err := safetar.Extract(pr, dest, safetar.Limits{MaxEntries: 1000, MaxBytes: 1 << 20})
+		_, _ = io.Copy(io.Discard, pr)
+		done <- err
+	}()
+	handle, err := sb.ExecStream(ctx, sdktypes.ExecStreamOptions{
+		Command:  "tar -C " + remote + " -cf - .",
+		OnStdout: func(b []byte) { _, _ = pw.Write(b) },
+	})
+	if err != nil {
+		t.Fatalf("exec stream: %v", err)
+	}
+	exit, err := handle.Wait()
+	_ = pw.Close()
+	if err != nil || exit.Code != 0 {
+		t.Fatalf("tar over exec = %+v, %v", exit, err)
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("unpacking the folder: %v", err)
+	}
+	if data, err := os.ReadFile(filepath.Join(dest, "pkg", "b.sh")); err != nil || string(data) != "#!/bin/sh" {
+		t.Fatalf("copied out: %q, %v", data, err)
+	}
+	if target, err := os.Readlink(filepath.Join(dest, "link")); err != nil || target != "a.txt" {
+		t.Fatalf("copied-out symlink = %q, %v", target, err)
 	}
 }

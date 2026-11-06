@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -127,5 +128,34 @@ func TestSandboxUploadWithOptions(t *testing.T) {
 	}
 	if len(queries) != 2 || queries[0] != "create_only=true" || queries[1] != "append=true" {
 		t.Fatalf("queries = %v", queries)
+	}
+}
+
+func TestSandboxUploadDir(t *testing.T) {
+	ctx := context.Background()
+	var query string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/sandboxes/sb1":
+			_ = json.NewEncoder(w).Encode(models.Sandbox{ID: "sb1"})
+		case "/v1/sandboxes/sb1/toolbox/version":
+			_ = json.NewEncoder(w).Encode(map[string]any{"version": "v", "features": []string{"files.extract"}})
+		default:
+			query = r.URL.RawQuery
+			_, _ = io.Copy(io.Discard, r.Body)
+			w.WriteHeader(http.StatusCreated)
+		}
+	}))
+	defer server.Close()
+	client, err := NewClientWithConfig(&sdktypes.MicroVMConfig{PATToken: "pat", APIUrl: server.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sb, err := client.Get(ctx, "sb1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sb.UploadDir(ctx, t.TempDir(), "/work"); err != nil || query != "extract=true" {
+		t.Fatalf("UploadDir = %v, query %q", err, query)
 	}
 }

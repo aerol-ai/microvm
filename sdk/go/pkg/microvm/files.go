@@ -64,3 +64,12 @@ func (s *Sandbox) SearchFiles(ctx context.Context, path, pattern string) ([]stri
 func (s *Sandbox) FindInFiles(ctx context.Context, path, text string) ([]sdktypes.FileMatch, error) {
 	return s.client.inner.FindInFiles(ctx, s.ID, path, text)
 }
+
+// UploadDir copies the local folder localDir into remoteDir in the sandbox,
+// made if missing (a gzipped tar the sandbox unpacks safely: no entry can
+// land outside remoteDir). Symlinks are sent as links and hard-linked files
+// as separate files; devices, pipes and sockets are skipped. It is sent
+// once and never retried. It needs an agent that lists files.extract.
+func (s *Sandbox) UploadDir(ctx context.Context, localDir, remoteDir string) error {
+	return s.client.inner.UploadDir(ctx, s.ID, localDir, remoteDir)
+}

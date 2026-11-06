@@ -303,3 +303,97 @@ class UploadOptionTests(unittest.TestCase):
         fake = self.serve(lambda method, path, query, n: (201, {}, {}))
         Sandbox(fake.client, {"id": "sb-1"}).upload_file("/a", b"x", append=True)
         self.assertEqual(fake.calls[0][2], {"append": "true"})
+
+
+class UploadDirTests(unittest.TestCase):
+    """upload_dir (plan F3): the folder goes as a gzipped tar with
+    extract=true, after the /version check, and is sent once."""
+
+    def _capture(self, status, features=("files.extract",)):
+        captured = {}
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                body = json.dumps({"version": "test", "features": list(features)}).encode()
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length") or 0)
+                captured.setdefault("calls", []).append((self.path, self.headers.get("Content-Type"), self.rfile.read(length)))
+                self.send_response(status)
+                self.send_header("Content-Length", "2")
+                self.end_headers()
+                self.wfile.write(b"{}")
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        client = MicroVM(f"http://127.0.0.1:{server.server_address[1]}", "pat", config=_FAST_RETRY)
+        return client, captured
+
+    def _folder(self):
+        import os
+        import tempfile
+
+        root = tempfile.mkdtemp()
+        self.addCleanup(__import__("shutil").rmtree, root, True)
+        os.makedirs(os.path.join(root, "pkg"))
+        with open(os.path.join(root, "a.txt"), "w") as f:
+            f.write("one")
+        with open(os.path.join(root, "pkg", "b.py"), "w") as f:
+            f.write("two")
+        os.chmod(os.path.join(root, "pkg", "b.py"), 0o750)
+        os.symlink("a.txt", os.path.join(root, "link"))
+        os.link(os.path.join(root, "a.txt"), os.path.join(root, "hard.txt"))
+        if hasattr(os, "mkfifo"):
+            os.mkfifo(os.path.join(root, "pipe"))
+        return root
+
+    def test_sends_the_folder_as_a_tar_once(self):
+        import email.parser
+        import io
+        import tarfile
+
+        client, captured = self._capture(503)
+        with self.assertRaises(MicroVMHTTPError) as ctx:
+            client.upload_dir("sb-1", self._folder(), "/work/app")
+        self.assertEqual(ctx.exception.status_code, 503)
+        self.assertEqual(len(captured["calls"]), 1, "a folder upload was re-sent")
+        path, content_type, body = captured["calls"][0]
+        self.assertTrue(path.endswith("/toolbox/files/upload?extract=true"))
+        message = email.parser.BytesParser().parsebytes(b"Content-Type: " + content_type.encode() + b"\r\n\r\n" + body)
+        parts = {p.get_param("name", header="content-disposition"): p.get_payload(decode=True) for p in message.get_payload()}
+        self.assertEqual(parts["path"], b"/work/app")
+        with tarfile.open(fileobj=io.BytesIO(parts["file"]), mode="r:gz") as tar:
+            members = {m.name: m for m in tar.getmembers()}
+            self.assertEqual(sorted(members), ["a.txt", "hard.txt", "link", "pkg", "pkg/b.py"])
+            self.assertTrue(members["hard.txt"].isreg())
+            self.assertEqual(tar.extractfile("hard.txt").read(), b"one")
+            self.assertTrue(members["link"].issym())
+            self.assertEqual(members["link"].linkname, "a.txt")
+            self.assertTrue(members["pkg"].isdir())
+            self.assertEqual(members["pkg/b.py"].mode, 0o750)
+
+    def test_refusals(self):
+        import tempfile
+
+        client, captured = self._capture(201, features=())
+        with self.assertRaises(MicroVMUnsupportedFeatureError):
+            client.upload_dir("sb-1", tempfile.mkdtemp(), "/w")
+        with self.assertRaises(MicroVMError):
+            client.upload_dir("sb-1", "/definitely/not/here", "/w")
+        self.assertNotIn("calls", captured)
+
+    def test_sandbox_upload_dir(self):
+        from microvm.client import Sandbox
+
+        client, captured = self._capture(201)
+        Sandbox(client, {"id": "sb-1"}).upload_dir(self._folder(), "/w")
+        self.assertEqual(len(captured["calls"]), 1)

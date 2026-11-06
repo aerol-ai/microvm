@@ -116,6 +116,8 @@ _FEATURE_FILE_VERBS = "files.verbs"
 # The toolboxd feature behind upload's write options (append, create_only,
 # atomic, mode). An older agent ignores them: create_only would replace a file.
 _FEATURE_WRITE_OPTIONS = "files.write_options"
+# The toolboxd feature behind upload's extract=true (upload_dir).
+_FEATURE_EXTRACT = "files.extract"
 # The entry cap list_files sends when the caller gives none.
 DEFAULT_LIST_LIMIT = 10000
 # Error codes toolboxd puts on the file errors a retry acts on: a retried
@@ -623,6 +625,9 @@ class Sandbox:
 
     def watch_files(self, path: str, on_event: FileEventCallback, recursive: bool = False) -> FileWatchHandle:
         return self._client.watch_files(self.id, path, on_event, recursive=recursive)
+
+    def upload_dir(self, local_dir: str, remote_dir: str) -> None:
+        self._client.upload_dir(self.id, local_dir, remote_dir)
 
     def list_files(self, path: str, *, depth: int = 1, limit: int = DEFAULT_LIST_LIMIT) -> FileList:
         return self._client.list_files(self.id, path, depth=depth, limit=limit)
@@ -1498,6 +1503,22 @@ class MicroVM:
             path += "?" + urllib.parse.urlencode(query)
         self._do_multipart(path, {"path": target_path}, "file", target_path, data, idempotent=not (append or create_only))
 
+    def upload_dir(self, sandbox_id: str, local_dir: str, remote_dir: str) -> None:
+        """Copy the local folder ``local_dir`` into ``remote_dir`` in the
+        sandbox (made if missing). The folder is packed as a gzipped tar and
+        the sandbox unpacks it safely: no entry can land outside
+        ``remote_dir``. Symlinks are sent as links, hard-linked files as
+        separate files; devices, pipes and sockets are skipped. The archive
+        is held in memory and sent once, never retried (plan section 10).
+        """
+        if not os.path.isdir(local_dir):
+            raise MicroVMError(f"{local_dir} is not a folder")
+        # An older agent ignores extract and stores the archive as a file.
+        self._require_toolbox_features(sandbox_id, _FEATURE_EXTRACT)
+        archive = _tar_folder(local_dir)
+        path = f"{self._version_prefix}/sandboxes/{sandbox_id}/toolbox/files/upload?extract=true"
+        self._do_multipart(path, {"path": remote_dir}, "file", "upload.tar.gz", archive, idempotent=False, send_once=True)
+
     def download_file(self, sandbox_id: str, target_path: str) -> bytes:
         url = self._url(f"{self._version_prefix}/sandboxes/{sandbox_id}/toolbox/files/download?path={urllib.parse.quote(target_path, safe='')}")
         return self._request("GET", url)
@@ -1790,8 +1811,11 @@ class MicroVM:
         *,
         idempotent: bool = True,
         done_code: Optional[str] = None,
+        send_once: bool = False,
     ) -> bytes:
-        raw, _ = self._request_headers(method, url, body, content_type, extra_headers, idempotent=idempotent, done_code=done_code)
+        raw, _ = self._request_headers(
+            method, url, body, content_type, extra_headers, idempotent=idempotent, done_code=done_code, send_once=send_once
+        )
         return raw
 
     def _request_headers(
@@ -1804,6 +1828,7 @@ class MicroVM:
         *,
         idempotent: bool = True,
         done_code: Optional[str] = None,
+        send_once: bool = False,
     ) -> tuple[bytes, Dict[str, str]]:
         """Send one request, retrying transient failures with backoff.
 
@@ -1824,7 +1849,9 @@ class MicroVM:
         signal handler that raises (Ctrl-C, a ``signal.alarm`` timeout) ends
         it at once.
         """
-        max_retries = self._retry_config["maxRetries"]
+        # send_once: a body plan section 10 says is never re-sent (a folder
+        # upload).
+        max_retries = 0 if send_once else self._retry_config["maxRetries"]
         retry_statuses = _RETRY_STATUSES if idempotent else _NOT_STARTED_STATUSES
 
         last_exc: Optional[Exception] = None
@@ -1954,6 +1981,7 @@ class MicroVM:
         data: bytes,
         *,
         idempotent: bool = True,
+        send_once: bool = False,
     ) -> None:
         boundary = uuid.uuid4().hex
         body = BytesIO()
@@ -1972,7 +2000,9 @@ class MicroVM:
         encoder(b"\r\n")
         encoder(f"--{boundary}--\r\n".encode("utf-8"))
 
-        self._request("POST", self._url(path), body.getvalue(), f"multipart/form-data; boundary={boundary}", idempotent=idempotent)
+        self._request(
+            "POST", self._url(path), body.getvalue(), f"multipart/form-data; boundary={boundary}", idempotent=idempotent, send_once=send_once
+        )
 
 
 class Tokens:
@@ -2145,6 +2175,43 @@ def _request_never_sent(exc: urllib.error.URLError) -> bool:
     """
     # socket.timeout is TimeoutError from 3.10; listed apart for 3.9.
     return isinstance(exc.reason, (ConnectionRefusedError, socket.gaierror, socket.timeout, TimeoutError))
+
+
+def _tar_folder(local_dir: str) -> bytes:
+    """The contents of ``local_dir`` as a gzipped tar, names relative to it.
+    Built entry by entry rather than with TarFile.add, which would store a
+    second name of a hard-linked file as a hard link: the sandbox refuses
+    those, so each name is sent as its own file."""
+    import stat
+    import tarfile
+
+    buf = BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz", format=tarfile.PAX_FORMAT) as tar:
+        for current, dirnames, filenames in os.walk(local_dir):
+            dirnames.sort()
+            for name in sorted(dirnames) + sorted(filenames):
+                full = os.path.join(current, name)
+                rel = os.path.relpath(full, local_dir).replace(os.sep, "/")
+                st = os.lstat(full)
+                info = tarfile.TarInfo(rel)
+                info.mode = stat.S_IMODE(st.st_mode)
+                info.mtime = int(st.st_mtime)
+                if stat.S_ISLNK(st.st_mode):
+                    info.type = tarfile.SYMTYPE
+                    info.linkname = os.readlink(full)
+                    tar.addfile(info)
+                elif stat.S_ISDIR(st.st_mode):
+                    info.type = tarfile.DIRTYPE
+                    tar.addfile(info)
+                elif stat.S_ISREG(st.st_mode):
+                    info.size = st.st_size
+                    with open(full, "rb") as f:
+                        tar.addfile(info, f)
+                # Devices, pipes and sockets are skipped: the sandbox
+                # refuses them, and they mean nothing on another machine.
+            # os.walk lists a symlink to a folder among the folders but does
+            # not enter it; it was added above as a link.
+    return buf.getvalue()
 
 
 def _error_code(payload: Optional[bytes]) -> str:

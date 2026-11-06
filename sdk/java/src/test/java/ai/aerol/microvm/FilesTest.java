@@ -399,4 +399,48 @@ class FilesTest {
             () -> sandbox.uploadFile("/a", new byte[] {1}, new ai.aerol.microvm.model.UploadFileOptions().setAppend(true)));
         assertEquals(1, calls.size());
     }
+
+    @Test
+    void uploadDirSendsTheFolderOnceWithExtract(@org.junit.jupiter.api.io.TempDir java.nio.file.Path root) throws Exception {
+        java.nio.file.Files.write(root.resolve("a.txt"), "alpha".getBytes(StandardCharsets.UTF_8));
+        List<byte[]> bodies = Collections.synchronizedList(new ArrayList<>());
+        MicroVMClient client = serve(List.of("files.extract"), (call, n) -> Reply.of(503, null));
+        server.removeContext("/");
+        server.createContext("/", exchange -> {
+            try {
+                String path = exchange.getRequestURI().getPath();
+                if (path.endsWith("/toolbox/version")) {
+                    write(exchange, Reply.of(200, Map.of("version", "t", "features", List.of("files.extract"))));
+                    return;
+                }
+                calls.add(new Call(exchange.getRequestMethod(), path, Map.of("query", String.valueOf(exchange.getRequestURI().getRawQuery()))));
+                bodies.add(exchange.getRequestBody().readAllBytes());
+                write(exchange, Reply.of(503, null));
+            } finally {
+                exchange.close();
+            }
+        });
+        MicroVMApiException err = assertThrows(MicroVMApiException.class, () -> client.uploadDir("sb-1", root, "/work/app"));
+        assertEquals(503, err.getStatusCode());
+        assertEquals(1, calls.size(), "a folder upload was re-sent");
+        assertEquals("extract=true", calls.get(0).query().get("query"));
+        String body = new String(bodies.get(0), StandardCharsets.ISO_8859_1);
+        assertTrue(body.contains("/work/app"));
+        int start = body.indexOf("\r\n\r\n", body.indexOf("name=\"file\"")) + 4;
+        byte[] archive = java.util.Arrays.copyOfRange(bodies.get(0), start, bodies.get(0).length);
+        assertTrue(new String(ai.aerol.microvm.internal.TarWriterTestAccess.gunzip(archive), StandardCharsets.ISO_8859_1).contains("alpha"));
+    }
+
+    @Test
+    void uploadDirRefusals(@org.junit.jupiter.api.io.TempDir java.nio.file.Path root) throws Exception {
+        MicroVMClient client = serve(List.of(), (call, n) -> Reply.of(201, Map.of()));
+        assertThrows(MicroVMUnsupportedFeatureException.class, () -> client.uploadDir("sb-1", root, "/w"));
+        assertThrows(MicroVMException.class, () -> client.uploadDir("sb-1", root.resolve("missing"), "/w"));
+        assertTrue(calls.isEmpty());
+        MicroVMClient ok = serve(List.of("files.extract"), (call, n) -> Reply.of(201, Map.of()));
+        SandboxData data = new SandboxData();
+        data.id = "sb-1";
+        new Sandbox(ok, data).uploadDir(root, "/w");
+        assertEquals(1, calls.size());
+    }
 }

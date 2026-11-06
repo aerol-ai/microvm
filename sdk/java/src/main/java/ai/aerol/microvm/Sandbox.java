@@ -127,6 +127,11 @@ public class Sandbox extends SandboxData {
         client.uploadFile(id, targetPath, data, options);
     }
 
+    /** Copies a local folder into the sandbox. See {@link MicroVMClient#uploadDir}. */
+    public void uploadDir(java.nio.file.Path localDir, String remoteDir) {
+        client.uploadDir(id, localDir, remoteDir);
+    }
+
     public byte[] downloadFile(String targetPath) {
         return client.downloadFile(id, targetPath);
     }

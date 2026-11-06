@@ -107,6 +107,11 @@ func (c *Client) UploadFileStreamWithOptions(ctx context.Context, id, targetPath
 	if err != nil {
 		return err
 	}
+	return c.sendUploadStream(ctx, target, targetPath, filepath.Base(targetPath), r)
+}
+
+// sendUploadStream sends one streamed multipart upload to the URL target.
+func (c *Client) sendUploadStream(ctx context.Context, target, targetPath, fileName string, r io.Reader) error {
 	pr, pw := io.Pipe()
 	// Closing the read side unblocks the writer goroutine if the request
 	// fails before the body is fully read.
@@ -117,7 +122,7 @@ func (c *Client) UploadFileStreamWithOptions(ctx context.Context, id, targetPath
 			if err := writer.WriteField("path", targetPath); err != nil {
 				return err
 			}
-			part, err := writer.CreateFormFile("file", filepath.Base(targetPath))
+			part, err := writer.CreateFormFile("file", fileName)
 			if err != nil {
 				return err
 			}

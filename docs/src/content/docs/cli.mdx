@@ -68,7 +68,7 @@ aerolvm cp ./data.csv build-box:/tmp/data.csv
 aerolvm cp build-box:/tmp/data.csv ./copy.csv
 ```
 
-Write a path inside the sandbox as `<sandbox>:<path>`. `cp` copies one file at a time.
+Write a path inside the sandbox as `<sandbox>:<path>`. `cp` copies one file at a time; add `-r` to copy a whole folder.
 
 ### Step 4: Share a web server
 
@@ -110,6 +110,7 @@ More in [Shell details](#shell-details).
 | Stop a sandbox and keep its files | `aerolvm stop build-box` |
 | Start it again | `aerolvm start build-box` |
 | List a folder | `aerolvm ls build-box:/tmp` |
+| Copy a folder in, or out | `aerolvm cp -r ./src build-box:/work/` or `aerolvm cp -r build-box:/work/out ./results` |
 | Follow a background command's output | `aerolvm logs build-box <session-id> --follow` |
 | Save a sandbox as an image | `aerolvm snapshot build-box my-image` |
 | Run a command in a folder, with a time limit | `aerolvm exec build-box --cwd /app --timeout 10m -- npm test` |
@@ -311,9 +312,17 @@ Every sandbox the CLI creates gets the tag `aerolvm.created_by=cli`. Find them w
 - **Interactive programs:** `aerolvm exec build-box -it -- htop` works like `docker exec -it`.
 - **Stopping:** `--timeout` and `Ctrl-C` stop the command inside the sandbox, not just on your machine. A dropped connection stops it too. See [If the connection drops](/exec-streaming/#if-the-connection-drops).
 
+### Copy a folder
+
+`aerolvm cp -r` copies a folder as a `tar` archive. Into a sandbox, the sandbox unpacks it. Out of a sandbox, `tar` runs inside the sandbox and the CLI unpacks the archive on your machine.
+
+- A destination that is an existing folder gets the copy inside it (`./results/out`). Any other name becomes the copy. In the sandbox, end the path with `/` to put the folder inside it.
+- Copying out checks every entry, because the archive comes from the sandbox. An absolute path, a `..`, a link that leads outside the destination, a hard link, or a device file is refused, and nothing is written outside the destination. Entries before the refused one are kept, like `tar -x`.
+- Copying out needs `tar` in the sandbox image. Without it, the copy fails with "the sandbox image has no tar".
+
 ### Sandbox types
 
-- **WebAssembly sandboxes** run a command and print the output when it ends. They pass no input, and `-i`, `-t` and `shell` are refused.
+- **WebAssembly sandboxes** run a command and print the output when it ends. They pass no input, and `-i`, `-t` and `shell` are refused. `cp -r` is refused too: a WebAssembly sandbox has no `tar`.
 - **V8 isolate sandboxes** run one request handler, with no shell and no files. `shell`, `exec`, `cp` and `ls` fail with `unsupported_runtime`. Call the handler from an SDK instead. See [V8 isolate](/isolate-sandbox/).
 
 ### Check an audit log against its witness

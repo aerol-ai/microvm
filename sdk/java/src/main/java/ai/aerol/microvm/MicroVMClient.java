@@ -993,6 +993,42 @@ public class MicroVMClient {
     /** The toolboxd feature behind upload's write options. */
     static final String FEATURE_WRITE_OPTIONS = "files.write_options";
 
+    /** The toolboxd feature behind upload's extract=true ({@link #uploadDir}). */
+    static final String FEATURE_EXTRACT = "files.extract";
+
+    /**
+     * Copies the local folder {@code localDir} into {@code remoteDir} in the
+     * sandbox (made if missing). The folder is packed as a gzipped tar and the
+     * sandbox unpacks it safely: no entry can land outside {@code remoteDir}.
+     * Symlinks are sent as links, hard-linked files as separate files;
+     * devices, pipes and sockets are skipped. The archive is built in memory
+     * and sent once, never retried.
+     */
+    public void uploadDir(String sandboxId, java.nio.file.Path localDir, String remoteDir) {
+        if (!java.nio.file.Files.isDirectory(localDir)) {
+            throw new MicroVMException(localDir + " is not a folder");
+        }
+        // An older agent ignores extract and stores the archive as a file.
+        requireToolboxFeatures(sandboxId, FEATURE_EXTRACT);
+        byte[] archive;
+        try {
+            archive = ai.aerol.microvm.internal.TarWriter.gzippedFolder(localDir);
+        } catch (IOException ex) {
+            throw new MicroVMException("pack " + localDir + ": " + ex.getMessage(), ex);
+        }
+        String boundary = "----microvm-" + UUID.randomUUID();
+        byte[] body = buildMultipartBody(boundary, remoteDir, archive);
+        HttpResponse<byte[]> response = sendRequest(
+            "POST",
+            toolboxPath(sandboxId, "/files/upload", Map.of("extract", "true")),
+            HttpRequest.BodyPublishers.ofByteArray(body),
+            "multipart/form-data; boundary=" + boundary,
+            null,
+            RetryMode.NEVER
+        );
+        ensureSuccess(response);
+    }
+
     private String toolboxPath(String sandboxId, String route, Map<String, String> query) {
         StringBuilder path = new StringBuilder(sandboxPath(sandboxId)).append("/toolbox").append(route);
         char sep = '?';
@@ -1995,6 +2031,21 @@ public class MicroVMClient {
          * not start either, so they surface. Of transport failures, only
          * connect-phase ones are retried.
          */
+        /**
+         * For a body plan section 10 says is sent once and never re-sent (a
+         * folder upload): no status and no transport failure is retried.
+         */
+        NEVER {
+            @Override
+            boolean retriesStatus(int status) {
+                return false;
+            }
+
+            @Override
+            boolean retriesTransportFailure(IOException error) {
+                return false;
+            }
+        },
         UNSENT_ONLY {
             @Override
             boolean retriesStatus(int status) {

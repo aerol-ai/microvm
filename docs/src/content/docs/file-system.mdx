@@ -592,8 +592,9 @@ Deleting a symlink deletes the link, never what it points to. Deleting `/` is re
 | The path does not exist | 404 |
 | The sandbox user may not read or change it | 403 |
 | The path is the wrong kind (a folder where a file was expected, or the reverse), a folder without `recursive`, or the destination already exists | 409 |
-| A request that cannot work, such as deleting `/`, copying a folder into itself, or upload options that clash | 400 |
+| A request that cannot work, such as deleting `/`, copying a folder into itself, upload options that clash, or an unsafe entry in a folder archive | 400 |
 | An upload with `create only` found a file already there | 412 |
+| A folder archive has too many entries or too many bytes | 413 |
 | The sandbox disk is full ("sandbox disk is full") | 507 |
 | The sandbox is a WASM or V8 isolate sandbox, which has no such call | 501 |
 
@@ -607,17 +608,50 @@ The SDKs retry a call that failed on the way. Calls that are safe to send twice 
 | `uploadFile`, plain or atomic | 421, 429, 502, 503, 504 and dropped connections: sending the same bytes again leaves the same file |
 | `deleteFile`, `makeDir` | The same. If a retry finds the work already done (the file is gone, the folder is there), the call succeeds. |
 | `moveFile`, `copyFile`, `uploadFile` with append or create only | Only 429 and 503, when the server did nothing. After any other failure the work may have happened (a second append would add the data twice), so the SDK reports the error instead of guessing. |
-| Go `UploadFileStream` and `UploadFileStreamWithOptions` | Never: the data is read as it is sent, so it cannot be sent again. |
+| `uploadDir`, Go `UploadFileStream` and `UploadFileStreamWithOptions` | Never: the data is built or read as it is sent, so the SDK sends it once. |
 
 ## Copy a whole folder
 
-Upload and download work on one file at a time. To move a folder, pack it into one file with `tar` inside the sandbox, then download that file:
+`uploadDir` copies a folder from your machine into the sandbox. The SDK packs it as a `tar` archive, and the sandbox unpacks it into the folder you name, making it if needed.
 
-```bash
-tar czf /tmp/results.tar.gz -C /workspace results
-```
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    await sandbox.uploadDir("./my-project", "/workspace/my-project");
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    sandbox.upload_dir("./my-project", "/workspace/my-project")
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    err := sandbox.UploadDir(ctx, "./my-project", "/workspace/my-project")
+    if err != nil {
+        log.Fatal(err)
+    }
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    sandbox.upload_dir("./my-project", "/workspace/my-project")?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    sandbox.uploadDir(Path.of("./my-project"), "/workspace/my-project");
+    ```
+  </TabItem>
+</Tabs>
 
-Run that line with `exec`, then download `/tmp/results.tar.gz`. To send a folder in, do the reverse: upload a `.tar.gz` file, then unpack it with `tar xzf`.
+- Files already in the destination with the same name are replaced; other files stay.
+- Symlinks are copied as links. A file with several hard links is copied as separate files. Devices, pipes and sockets are skipped.
+- The sandbox checks every entry: an absolute path, a `..`, a link that leads outside the folder, a hard link, or a device file is refused (HTTP 400), and nothing is written outside the folder. If the archive fails part way, the files before the bad entry stay, and the error names the entry and how many were written.
+- An archive can hold up to 200,000 entries and 4 GB of file content once unpacked (HTTP 413 past that). The upload itself is capped at 256 MB, like any upload.
+- In TypeScript this needs Node.js. The TypeScript, Python, Rust and Java SDKs build the archive in memory; the Go SDK builds it while it sends.
+
+To copy a folder out of a sandbox, use the [CLI](/cli/#copy-a-folder): `aerolvm cp -r my-box:/workspace/out ./out`. It checks every entry the same way before it writes to your disk.
 
 ## Move big files without filling memory
 

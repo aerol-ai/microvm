@@ -7,6 +7,9 @@
 package agenttoolstest
 
 import (
+	"archive/tar"
+	"bytes"
+	"compress/gzip"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -95,6 +98,10 @@ type Server struct {
 	// DropAfterCreate drops the connection this many times right after a
 	// create succeeds, so the client never sees the reply (lost reply, D5).
 	DropAfterCreate int
+	// ToolboxFeatures is what GET /toolbox/version lists. Nil lists every
+	// feature the CLI and the Go SDK check for; set an empty slice to play
+	// an agent too old to list any.
+	ToolboxFeatures []string
 	// ExecFunc overrides the built-in command interpreter.
 	ExecFunc Exec
 	// ExecStartError makes a streamed exec answer its start message with
@@ -504,6 +511,14 @@ func (s *Server) toolbox(w http.ResponseWriter, r *http.Request, sb *Sandbox, pa
 	wasm := sb.Runtime == models.RuntimeWasm
 	q := r.URL.Query()
 	switch {
+	case path == "/version" && r.Method == http.MethodGet && !wasm:
+		s.mu.Lock()
+		features := s.ToolboxFeatures
+		s.mu.Unlock()
+		if features == nil {
+			features = []string{"files.extract", "files.verbs", "files.write_options"}
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"version": "fake", "features": features})
 	case path == "/files/download" && r.Method == http.MethodGet:
 		s.mu.Lock()
 		data, ok := sb.Files[q.Get("path")]
@@ -606,11 +621,56 @@ func (s *Server) upload(w http.ResponseWriter, r *http.Request, sb *Sandbox) {
 		writeErr(w, http.StatusBadRequest, "path is required")
 		return
 	}
+	if r.URL.Query().Get("extract") == "true" {
+		s.extract(w, sb, target, data)
+		return
+	}
 	s.mu.Lock()
 	sb.Files[target] = data
 	s.UploadedBodies++
 	s.mu.Unlock()
 	writeJSON(w, http.StatusCreated, map[string]any{"path": target})
+}
+
+// extract stores each regular file of an uploaded tar (gzip detected) at
+// target/<name>, as toolboxd's extract=true would write it. A folder is
+// recorded as target/<name>/. It does no safety checks: that is toolboxd's
+// and internal/safetar's job, tested there.
+func (s *Server) extract(w http.ResponseWriter, sb *Sandbox, target string, data []byte) {
+	var src io.Reader = bytes.NewReader(data)
+	if len(data) > 1 && data[0] == 0x1f && data[1] == 0x8b {
+		gz, err := gzip.NewReader(src)
+		if err != nil {
+			writeErr(w, http.StatusBadRequest, "bad gzip")
+			return
+		}
+		src = gz
+	}
+	tr := tar.NewReader(src)
+	entries := 0
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for {
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			writeErr(w, http.StatusBadRequest, "bad tar: "+err.Error())
+			return
+		}
+		name := strings.TrimSuffix(target, "/") + "/" + strings.TrimPrefix(hdr.Name, "./")
+		switch hdr.Typeflag {
+		case tar.TypeReg:
+			body, _ := io.ReadAll(tr)
+			sb.Files[name] = body
+		case tar.TypeDir:
+			sb.Files[strings.TrimSuffix(name, "/")+"/"] = nil
+		}
+		entries++
+	}
+	s.UploadedBodies++
+	writeJSON(w, http.StatusCreated, map[string]any{"path": target, "entries": entries})
 }
 
 func (s *Server) listFiles(w http.ResponseWriter, sb *Sandbox, dir string, wasm bool) {

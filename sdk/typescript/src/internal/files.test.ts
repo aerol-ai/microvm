@@ -241,3 +241,58 @@ test("uploadFile options fail closed on an older agent", async () => {
   const sandbox = new SandboxResource(fakeToolbox(() => ({ status: 201, body: {} }), ["files.write_options"]).client, { id: "sb-1" } as Sandbox);
   await sandbox.uploadFile("/a", "x", { append: true });
 });
+
+test("uploadDir sends the folder as a gzipped tar with extract=true, once", async () => {
+  const { mkdtemp, mkdir, writeFile, symlink, link, chmod } = await import("node:fs/promises");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const { gunzipSync } = await import("node:zlib");
+  const root = await mkdtemp(join(tmpdir(), "uploaddir-"));
+  await mkdir(join(root, "pkg"));
+  await writeFile(join(root, "a.txt"), "alpha");
+  await writeFile(join(root, "pkg", "b.ts"), "beta");
+  await chmod(join(root, "pkg", "b.ts"), 0o750);
+  await symlink("a.txt", join(root, "link"));
+  await link(join(root, "a.txt"), join(root, "hard.txt"));
+
+  const seen: { url: string; path: string; archive: Uint8Array }[] = [];
+  const client = new APIClient({
+    baseURL: "https://api.example.com",
+    patToken: "pat",
+    retry: { maxRetries: 3, baseDelayMs: 1, maxDelayMs: 1 },
+    fetch: async (input, init) => {
+      const request = new Request(input, init);
+      if (request.url.endsWith("/toolbox/version")) {
+        return new Response(JSON.stringify({ version: "t", features: ["files.extract"] }));
+      }
+      const form = await request.formData();
+      const file = form.get("file") as Blob;
+      seen.push({ url: request.url, path: String(form.get("path")), archive: gunzipSync(new Uint8Array(await file.arrayBuffer())) });
+      return new Response(null, { status: 503 });
+    },
+  });
+  await assert.rejects(client.uploadDir("sb-1", root, "/work/app"), (e: unknown) => e instanceof MicroVMApiError && e.status === 503);
+  assert.equal(seen.length, 1, "a folder upload was re-sent");
+  assert.ok(seen[0].url.endsWith("/v1/sandboxes/sb-1/toolbox/files/upload?extract=true"));
+  assert.equal(seen[0].path, "/work/app");
+  const archive = seen[0].archive;
+  const text = new TextDecoder().decode(archive);
+  const names: string[] = [];
+  for (let offset = 0; offset + 512 <= archive.length && archive[offset] !== 0; ) {
+    const name = text.slice(offset, offset + 100).replace(/\0.*$/s, "");
+    const size = parseInt(text.slice(offset + 124, offset + 136), 8);
+    names.push(`${name}:${text[offset + 156]}`);
+    offset += 512 + Math.ceil(size / 512) * 512;
+  }
+  // Walk order; the hard link is a plain file ("0"), the link a symlink ("2").
+  assert.deepEqual(names, ["a.txt:0", "hard.txt:0", "link:2", "pkg/:5", "pkg/b.ts:0"]);
+  assert.ok(text.includes("alpha") && text.includes("beta"));
+
+  const old = fakeToolbox(() => ({ status: 201 }), []);
+  await assert.rejects(old.client.uploadDir("sb-1", root, "/w"), (e: unknown) => e instanceof MicroVMUnsupportedFeatureError);
+  await assert.rejects(old.client.uploadDir("sb-1", join(root, "a.txt"), "/w"), /not a folder/);
+  assert.equal(old.calls.length, 0);
+  const ok = fakeToolbox(() => ({ status: 201, body: {} }), ["files.extract"]);
+  await new SandboxResource(ok.client, { id: "sb-1" } as Sandbox).uploadDir(root, "/w");
+  assert.equal(ok.calls.length, 1);
+});

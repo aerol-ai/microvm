@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+
+	"github.com/aerol-ai/microvm/internal/safetar"
 )
 
 // errCodeFileExists marks the 412 a create_only upload gets when the file is
@@ -34,6 +36,9 @@ type uploadOptions struct {
 	// it a new file is 0644 and an existing one keeps its own.
 	Mode    os.FileMode
 	modeSet bool
+	// Extract unpacks the uploaded tar (gzip detected) into path, a folder
+	// (plan F3), through internal/safetar.
+	Extract bool
 }
 
 // parseUploadOptions reads the options from the query or the form. Options
@@ -43,7 +48,7 @@ func parseUploadOptions(r *http.Request) (uploadOptions, error) {
 	for _, flag := range []struct {
 		name string
 		dst  *bool
-	}{{"append", &opts.Append}, {"create_only", &opts.CreateOnly}, {"atomic", &opts.Atomic}} {
+	}{{"append", &opts.Append}, {"create_only", &opts.CreateOnly}, {"atomic", &opts.Atomic}, {"extract", &opts.Extract}} {
 		value, err := parseOptionalBool(r.FormValue(flag.name))
 		if err != nil {
 			return opts, fmt.Errorf("%s must be true or false", flag.name)
@@ -56,6 +61,18 @@ func parseUploadOptions(r *http.Request) (uploadOptions, error) {
 			return opts, err
 		}
 		opts.Mode, opts.modeSet = mode, true
+	}
+	if opts.Extract {
+		// The write options shape one file; an archive writes many, each
+		// through a temp file and a rename already.
+		for _, other := range []struct {
+			name string
+			set  bool
+		}{{"append", opts.Append}, {"create_only", opts.CreateOnly}, {"atomic", opts.Atomic}, {"mode", opts.modeSet}} {
+			if other.set {
+				return opts, fmt.Errorf("extract and %s cannot be used together: extract unpacks an archive into a folder, %s shapes one file", other.name, other.name)
+			}
+		}
 	}
 	switch {
 	case opts.Append && opts.CreateOnly:
@@ -96,6 +113,10 @@ func (s *server) handleUpload(w http.ResponseWriter, r *http.Request) {
 	}
 	defer file.Close()
 
+	if opts.Extract {
+		s.extractUpload(w, targetPath, header.Filename, file)
+		return
+	}
 	if err := os.MkdirAll(filepath.Dir(targetPath), 0o755); err != nil {
 		writeFilesystemError(w, err)
 		return
@@ -199,4 +220,37 @@ func writeUploadAtomic(target string, src io.Reader, opts uploadOptions) error {
 		return err
 	}
 	return nil
+}
+
+// extractUpload unpacks an uploaded tar into the folder dest, made if
+// missing. The caps stop a small gzip from filling the sandbox disk. On a
+// failure part way, what was written stays (owner decision P1) and the
+// error names the failing entry and the count written.
+func (s *server) extractUpload(w http.ResponseWriter, dest, name string, archive io.Reader) {
+	if err := os.MkdirAll(dest, 0o755); err != nil {
+		writeFilesystemError(w, err)
+		return
+	}
+	limits := safetar.Limits{
+		MaxEntries: envInt("SB_EXTRACT_MAX_ENTRIES", 200_000),
+		MaxBytes:   envInt64("SB_EXTRACT_MAX_BYTES", 4<<30),
+	}
+	res, err := safetar.Extract(archive, dest, limits)
+	if err != nil {
+		switch {
+		case errors.Is(err, safetar.ErrUnsafe), errors.Is(err, safetar.ErrCorrupt):
+			writeError(w, http.StatusBadRequest, err.Error())
+		case errors.Is(err, safetar.ErrTooLarge):
+			writeError(w, http.StatusRequestEntityTooLarge, err.Error())
+		default:
+			writeFilesystemError(w, err)
+		}
+		return
+	}
+	writeJSON(w, http.StatusCreated, map[string]any{
+		"path":    dest,
+		"name":    name,
+		"entries": res.Entries,
+		"bytes":   res.Bytes,
+	})
 }

@@ -32,6 +32,8 @@ var toolboxFeatures = map[string][]string{
 	// F2: upload write options. mode is also a baseline option of the
 	// folder and permissions routes, but upload honours it only from here.
 	"files.write_options": {"append", "atomic", "create_only", "mode"},
+	// F3: upload a tar and unpack it into a folder (extract=true).
+	"files.extract": {"extract"},
 }
 
 // baselineRequestOptions are the options toolboxd understood before /version

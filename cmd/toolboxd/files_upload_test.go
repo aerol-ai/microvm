@@ -1,8 +1,11 @@
 package main
 
 import (
+	"archive/tar"
 	"bytes"
+	"compress/gzip"
 	"encoding/json"
+	"io"
 	"io/fs"
 	"mime/multipart"
 	"net/http"
@@ -292,5 +295,101 @@ func TestWriteUploadBodyFailure(t *testing.T) {
 	left, _ := filepath.Glob(filepath.Join(dir, ".*.upload-*"))
 	if len(left) != 0 {
 		t.Fatalf("temp files left: %v", left)
+	}
+}
+
+// tarOf builds a tar (gzipped when zip is set) of name/body pairs; a body
+// starting with "->" makes a symlink to the rest.
+func tarOf(t *testing.T, zip bool, pairs ...string) string {
+	t.Helper()
+	var buf bytes.Buffer
+	var out io.Writer = &buf
+	var gz *gzip.Writer
+	if zip {
+		gz = gzip.NewWriter(&buf)
+		out = gz
+	}
+	tw := tar.NewWriter(out)
+	for i := 0; i+1 < len(pairs); i += 2 {
+		name, body := pairs[i], pairs[i+1]
+		hdr := &tar.Header{Name: name, Mode: 0o644, Typeflag: tar.TypeReg, Size: int64(len(body))}
+		if strings.HasPrefix(body, "->") {
+			hdr = &tar.Header{Name: name, Typeflag: tar.TypeSymlink, Linkname: strings.TrimPrefix(body, "->")}
+		}
+		if err := tw.WriteHeader(hdr); err != nil {
+			t.Fatal(err)
+		}
+		if hdr.Typeflag == tar.TypeReg {
+			_, _ = tw.Write([]byte(body))
+		}
+	}
+	_ = tw.Close()
+	if gz != nil {
+		_ = gz.Close()
+	}
+	return buf.String()
+}
+
+// Plan F3: upload a tar with extract=true and it is unpacked into the
+// folder, through the same safe extraction the CLI uses.
+func TestUploadExtract(t *testing.T) {
+	h := authedRoutes(newDaytonaTestServer(t))
+	base := t.TempDir()
+	outside := filepath.Join(base, "outside.txt")
+	mustWrite(t, outside, "untouched")
+	extract := url.Values{"extract": {"true"}}
+	post := func(target, archive string, query url.Values) (*httptest.ResponseRecorder, map[string]any) {
+		rr := httptest.NewRecorder()
+		h.ServeHTTP(rr, uploadRequest(t, target, archive, query))
+		var body map[string]any
+		_ = json.Unmarshal(rr.Body.Bytes(), &body)
+		return rr, body
+	}
+
+	dest := filepath.Join(base, "made", "here")
+	rr, body := post(dest, tarOf(t, true, "a.txt", "one", "sub/b.txt", "two", "link", "->a.txt"), extract)
+	if rr.Code != http.StatusCreated || body["entries"] != float64(3) || body["bytes"] != float64(6) {
+		t.Fatalf("extract = %d %s", rr.Code, rr.Body.String())
+	}
+	if mustRead(t, filepath.Join(dest, "sub", "b.txt")) != "two" || mustRead(t, filepath.Join(dest, "link")) != "one" {
+		t.Fatal("archive not unpacked")
+	}
+
+	cases := []struct {
+		name    string
+		target  string
+		archive string
+		query   url.Values
+		env     map[string]string
+		want    int
+		mention string
+	}{
+		{name: "dot-dot", target: dest, archive: tarOf(t, false, "ok.txt", "1", "../outside.txt", "pwned"), query: extract, want: http.StatusBadRequest, mention: `entry \"../outside.txt\"`},
+		{name: "escaping symlink", target: dest, archive: tarOf(t, false, "up", "->../../outside.txt"), query: extract, want: http.StatusBadRequest, mention: `entry \"up\"`},
+		{name: "too many entries", target: dest, archive: tarOf(t, false, "x1", "1", "x2", "2"), query: extract, env: map[string]string{"SB_EXTRACT_MAX_ENTRIES": "1"}, want: http.StatusRequestEntityTooLarge, mention: "1 entries written"},
+		{name: "too many bytes", target: dest, archive: tarOf(t, true, "big", strings.Repeat("z", 100)), query: extract, env: map[string]string{"SB_EXTRACT_MAX_BYTES": "10"}, want: http.StatusRequestEntityTooLarge},
+		{name: "not an archive", target: dest, archive: strings.Repeat("garbage ", 200), query: extract, want: http.StatusBadRequest},
+		{name: "into a file", target: outside, archive: tarOf(t, false, "a", "1"), query: extract, want: http.StatusConflict},
+		{name: "extract with append", target: dest, archive: tarOf(t, false, "a", "1"), query: url.Values{"extract": {"true"}, "append": {"true"}}, want: http.StatusBadRequest, mention: "append"},
+		{name: "extract with mode", target: dest, archive: tarOf(t, false, "a", "1"), query: url.Values{"extract": {"true"}, "mode": {"600"}}, want: http.StatusBadRequest, mention: "mode"},
+		{name: "bad extract", target: dest, archive: "x", query: url.Values{"extract": {"perhaps"}}, want: http.StatusBadRequest},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			for k, v := range tc.env {
+				t.Setenv(k, v)
+			}
+			rr, _ := post(tc.target, tc.archive, tc.query)
+			if rr.Code != tc.want || !strings.Contains(rr.Body.String(), tc.mention) {
+				t.Fatalf("status = %d %s, want %d mentioning %q", rr.Code, rr.Body.String(), tc.want, tc.mention)
+			}
+		})
+	}
+	if mustRead(t, outside) != "untouched" {
+		t.Fatal("a hostile archive wrote outside its folder")
+	}
+	// The failure part way kept the entry before it (owner decision P1).
+	if mustRead(t, filepath.Join(dest, "ok.txt")) != "1" {
+		t.Fatal("the entry before the failing one was not kept")
 	}
 }

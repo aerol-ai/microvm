@@ -9,14 +9,17 @@
 //! is already done counts as success). `move_file` and `copy_file` retry only
 //! on 429 and 503, because a lost reply may hide a move that happened.
 
+use std::fs;
+use std::io;
 use std::path::Path;
+use std::time::UNIX_EPOCH;
 
 use reqwest::blocking::multipart::{Form, Part};
 use reqwest::Method;
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::{Client, Error, RetryPolicy, Sandbox};
+use crate::{Authorize, Client, Error, RetryPolicy, Sandbox};
 
 /// The toolboxd feature (on `/version`) behind the file verbs' options: list
 /// depth and cap, the move and copy overwrite guard, mkdir without parents
@@ -27,6 +30,10 @@ const FEATURE_FILE_VERBS: &str = "files.verbs";
 /// The toolboxd feature behind upload's write options. An older agent
 /// ignores them: create_only would replace an existing file.
 const FEATURE_WRITE_OPTIONS: &str = "files.write_options";
+
+/// The toolboxd feature behind upload's extract=true (`upload_dir`). An
+/// older agent ignores extract and would store the archive as a file.
+const FEATURE_EXTRACT: &str = "files.extract";
 
 /// Error codes toolboxd puts on the file errors a retry acts on.
 const CODE_FILE_NOT_FOUND: &str = "file_not_found";
@@ -397,6 +404,35 @@ impl Client {
         Ok(())
     }
 
+    /// Copy the local folder `local_dir` into `remote_dir` in the sandbox
+    /// (made if missing). The folder is packed as a tar and the sandbox
+    /// unpacks it safely: no entry can land outside `remote_dir`. Symlinks
+    /// are sent as links, hard-linked files as separate files; devices,
+    /// pipes and sockets are skipped. The archive is built in memory and
+    /// sent once, never retried.
+    pub fn upload_dir(&self, id: &str, local_dir: impl AsRef<Path>, remote_dir: &str) -> Result<(), Error> {
+        let local_dir = local_dir.as_ref();
+        let is_dir = fs::metadata(local_dir).map(|meta| meta.is_dir()).map_err(|err| {
+            Error::Client(format!("{}: {}", local_dir.display(), err))
+        })?;
+        if !is_dir {
+            return Err(Error::Client(format!("{} is not a folder", local_dir.display())));
+        }
+        self.require_toolbox_features(id, &[FEATURE_EXTRACT])?;
+        let archive = tar_folder(local_dir).map_err(|err| Error::Client(format!("pack {}: {}", local_dir.display(), err)))?;
+        let route = self.toolbox_path(id, "/files/upload", &[("extract", "true")]);
+        let form = Form::new()
+            .text("path", remote_dir.to_string())
+            .part("file", Part::bytes(archive).file_name("upload.tar"));
+        let response = self
+            .inner
+            .post(self.full_url(&route))
+            .authorize(self)
+            .multipart(form)
+            .send()?;
+        self.handle_response(response).map(|_| ())
+    }
+
     /// A body-less file call whose success reply is discarded.
     fn file_call(&self, method: Method, route: &str, policy: RetryPolicy, done_code: Option<&str>) -> Result<(), Error> {
         let _: (Value, _) = self.send_json_done::<Value, Value>(method, route, None, policy, &[], done_code)?;
@@ -404,7 +440,126 @@ impl Client {
     }
 }
 
+/// The contents of `root` as an uncompressed tar (ustar, with PAX records
+/// for names past 100 bytes), names relative to `root`. The SDK takes no tar
+/// crate; toolboxd reads plain tar as well as gzip.
+fn tar_folder(root: &Path) -> io::Result<Vec<u8>> {
+    let mut out = Vec::new();
+    tar_walk(root, "", &mut out)?;
+    out.extend_from_slice(&[0u8; 1024]);
+    Ok(out)
+}
+
+fn tar_walk(root: &Path, prefix: &str, out: &mut Vec<u8>) -> io::Result<()> {
+    let dir = if prefix.is_empty() { root.to_path_buf() } else { root.join(prefix) };
+    let mut names: Vec<String> = fs::read_dir(&dir)?
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    for name in names {
+        let rel = if prefix.is_empty() { name } else { format!("{}/{}", prefix, name) };
+        let full = root.join(&rel);
+        let meta = fs::symlink_metadata(&full)?;
+        let mtime = meta
+            .modified()
+            .ok()
+            .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+            .map(|elapsed| elapsed.as_secs())
+            .unwrap_or(0);
+        let kind = meta.file_type();
+        let mode = file_mode(&meta, kind.is_dir());
+        if kind.is_symlink() {
+            let target = fs::read_link(&full)?.to_string_lossy().into_owned();
+            tar_entry(out, &rel, b'2', mode, mtime, &[], &target);
+        } else if kind.is_dir() {
+            tar_entry(out, &format!("{}/", rel), b'5', mode, mtime, &[], "");
+            tar_walk(root, &rel, out)?;
+        } else if kind.is_file() {
+            tar_entry(out, &rel, b'0', mode, mtime, &fs::read(&full)?, "");
+        }
+        // Devices, pipes and sockets are skipped: the sandbox refuses them.
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn file_mode(meta: &fs::Metadata, _is_dir: bool) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    meta.permissions().mode() & 0o7777
+}
+
+#[cfg(not(unix))]
+fn file_mode(_meta: &fs::Metadata, is_dir: bool) -> u32 {
+    if is_dir { 0o755 } else { 0o644 }
+}
+
+fn tar_entry(out: &mut Vec<u8>, name: &str, typeflag: u8, mode: u32, mtime: u64, data: &[u8], link: &str) {
+    let mut records = Vec::new();
+    if name.len() > 100 {
+        records.extend(pax_record("path", name));
+    }
+    if link.len() > 100 {
+        records.extend(pax_record("linkpath", link));
+    }
+    if !records.is_empty() {
+        out.extend_from_slice(&tar_header("PaxHeader", b'x', 0o644, records.len(), mtime, ""));
+        tar_padded(out, &records);
+    }
+    out.extend_from_slice(&tar_header(name, typeflag, mode, data.len(), mtime, link));
+    tar_padded(out, data);
+}
+
+fn tar_padded(out: &mut Vec<u8>, data: &[u8]) {
+    out.extend_from_slice(data);
+    let rest = data.len() % 512;
+    if rest != 0 {
+        out.extend(std::iter::repeat_n(0u8, 512 - rest));
+    }
+}
+
+fn tar_header(name: &str, typeflag: u8, mode: u32, size: usize, mtime: u64, link: &str) -> [u8; 512] {
+    fn put(block: &mut [u8; 512], offset: usize, len: usize, value: &[u8]) {
+        let n = value.len().min(len);
+        block[offset..offset + n].copy_from_slice(&value[..n]);
+    }
+    fn octal(block: &mut [u8; 512], offset: usize, len: usize, value: u64) {
+        put(block, offset, len - 1, format!("{:0width$o}", value, width = len - 1).as_bytes());
+    }
+    let mut block = [0u8; 512];
+    put(&mut block, 0, 100, name.as_bytes());
+    octal(&mut block, 100, 8, u64::from(mode & 0o7777));
+    octal(&mut block, 108, 8, 0);
+    octal(&mut block, 116, 8, 0);
+    octal(&mut block, 124, 12, size as u64);
+    octal(&mut block, 136, 12, mtime);
+    block[148..156].fill(b' ');
+    block[156] = typeflag;
+    put(&mut block, 157, 100, link.as_bytes());
+    put(&mut block, 257, 6, b"ustar\0");
+    put(&mut block, 263, 2, b"00");
+    let sum: u32 = block.iter().map(|&b| u32::from(b)).sum();
+    put(&mut block, 148, 8, format!("{:06o}\0 ", sum).as_bytes());
+    block
+}
+
+/// A PAX record: "<length> <key>=<value>\n", the length counting itself.
+fn pax_record(key: &str, value: &str) -> Vec<u8> {
+    let body = format!(" {}={}\n", key, value);
+    let mut length = body.len() + body.len().to_string().len();
+    if length.to_string().len() != body.len().to_string().len() {
+        // Adding the digits made the number one digit longer (98 -> 100).
+        length = body.len() + length.to_string().len();
+    }
+    format!("{}{}", length, body).into_bytes()
+}
+
 impl Sandbox {
+    /// Copy a local folder into the sandbox. See [`Client::upload_dir`].
+    pub fn upload_dir(&self, local_dir: impl AsRef<Path>, remote_dir: &str) -> Result<(), Error> {
+        self.client.upload_dir(&self.data.id, local_dir, remote_dir)
+    }
+
     /// List a folder. See [`ListFilesOptions`]; `truncated` means more
     /// entries exist.
     pub fn list_files(&self, path: &str, options: ListFilesOptions) -> Result<FileList, Error> {
@@ -467,6 +622,7 @@ mod tests {
         method: String,
         route: String,
         query: HashMap<String, String>,
+        body: Vec<u8>,
     }
 
     type Reply = fn(&Call, usize) -> (u16, Option<String>, Vec<(&'static str, &'static str)>);
@@ -520,6 +676,7 @@ mod tests {
                         method: method.clone(),
                         route: path.split_once("/toolbox").map(|(_, r)| r.to_string()).unwrap_or_default(),
                         query,
+                        body: body.clone(),
                     };
                     let key = format!("{} {}", method, call.route);
                     let n = *counts.get(&key).unwrap_or(&0);
@@ -832,5 +989,134 @@ mod tests {
         assert!(sandbox
             .upload_file_with_options("/a", b"x".to_vec(), UploadFileOptions { append: true, ..Default::default() })
             .is_err());
+    }
+
+    /// Reads a tar back the way a tar reader does, checking each checksum:
+    /// (name, typeflag, mode, data, link) per entry, PAX names applied.
+    fn parse_tar(archive: &[u8]) -> Vec<(String, u8, u32, Vec<u8>, String)> {
+        let field = |block: &[u8], offset: usize, len: usize| -> String {
+            let raw = &block[offset..offset + len];
+            let end = raw.iter().position(|&b| b == 0).unwrap_or(len);
+            String::from_utf8_lossy(&raw[..end]).into_owned()
+        };
+        let mut out = Vec::new();
+        let mut pax: HashMap<String, String> = HashMap::new();
+        let mut offset = 0;
+        while offset + 512 <= archive.len() {
+            let block = &archive[offset..offset + 512];
+            if block.iter().all(|&b| b == 0) {
+                break;
+            }
+            let sum: u32 = block.iter().enumerate().map(|(i, &b)| if (148..156).contains(&i) { 32 } else { u32::from(b) }).sum();
+            assert_eq!(u32::from_str_radix(field(block, 148, 7).trim(), 8).unwrap(), sum, "checksum");
+            assert_eq!(field(block, 257, 6), "ustar");
+            let size = usize::from_str_radix(&field(block, 124, 12), 8).unwrap();
+            let data = archive[offset + 512..offset + 512 + size].to_vec();
+            let typeflag = block[156];
+            offset += 512 + size.div_ceil(512) * 512;
+            if typeflag == b'x' {
+                let mut rest = String::from_utf8(data).unwrap();
+                while !rest.is_empty() {
+                    let length: usize = rest.split(' ').next().unwrap().parse().unwrap();
+                    let record: String = rest.drain(..length).collect();
+                    assert!(record.ends_with('\n'), "a PAX record's length must count the whole record");
+                    let (key, value) = record[record.find(' ').unwrap() + 1..record.len() - 1].split_once('=').unwrap();
+                    pax.insert(key.to_string(), value.to_string());
+                }
+                continue;
+            }
+            let name = pax.remove("path").unwrap_or_else(|| field(block, 0, 100));
+            let link = pax.remove("linkpath").unwrap_or_else(|| field(block, 157, 100));
+            let mode = u32::from_str_radix(&field(block, 100, 8), 8).unwrap();
+            out.push((name, typeflag, mode, data, link));
+        }
+        out
+    }
+
+    fn temp_folder() -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("aerolvm-upload-dir-{}-{}", std::process::id(), rand::random::<u64>()));
+        std::fs::create_dir_all(dir.join("pkg")).unwrap();
+        std::fs::write(dir.join("a.txt"), "alpha").unwrap();
+        std::fs::write(dir.join("pkg").join("b.rs"), "beta").unwrap();
+        let long = "x".repeat(120);
+        std::fs::write(dir.join("pkg").join(&long), "long").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir.join("pkg").join("b.rs"), std::fs::Permissions::from_mode(0o750)).unwrap();
+            std::os::unix::fs::symlink("a.txt", dir.join("link")).unwrap();
+            std::fs::hard_link(dir.join("a.txt"), dir.join("hard.txt")).unwrap();
+        }
+        dir
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tar_folder_writes_files_folders_symlinks_and_long_names() {
+        let dir = temp_folder();
+        let archive = tar_folder(&dir).expect("tar");
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(archive.len() % 512, 0);
+        let entries = parse_tar(&archive);
+        let long = format!("pkg/{}", "x".repeat(120));
+        let names: Vec<(String, u8)> = entries.iter().map(|e| (e.0.clone(), e.1)).collect();
+        assert_eq!(
+            names,
+            vec![
+                ("a.txt".to_string(), b'0'),
+                ("hard.txt".to_string(), b'0'),
+                ("link".to_string(), b'2'),
+                ("pkg/".to_string(), b'5'),
+                ("pkg/b.rs".to_string(), b'0'),
+                (long, b'0'),
+            ]
+        );
+        assert_eq!(entries[1].3, b"alpha".to_vec(), "a hard-linked file is sent as its own file");
+        assert_eq!(entries[2].4, "a.txt");
+        assert_eq!(entries[4].2, 0o750);
+        assert_eq!(entries[5].3, b"long".to_vec());
+    }
+
+    #[test]
+    fn a_pax_record_length_counts_its_own_digits() {
+        for n in 80..1010 {
+            let record = pax_record("path", &"v".repeat(n));
+            let length: usize = String::from_utf8_lossy(&record).split(' ').next().unwrap().parse().unwrap();
+            assert_eq!(length, record.len(), "value length {}", n);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn upload_dir_sends_the_folder_once_with_extract() {
+        let dir = temp_folder();
+        let (client, calls) = fake_toolbox(&["files.extract"], |_, _| (503, None, vec![]));
+        match client.upload_dir("sb-1", &dir, "/work/app") {
+            Err(Error::Api(api)) => assert_eq!(api.status(), 503),
+            other => panic!("upload_dir = {:?}", other),
+        }
+        let calls = calls.lock().unwrap().clone();
+        assert_eq!(calls.len(), 1, "a folder upload was re-sent");
+        assert_eq!(calls[0].route, "/files/upload");
+        assert_eq!(calls[0].query.get("extract").map(String::as_str), Some("true"));
+        let body = String::from_utf8_lossy(&calls[0].body);
+        assert!(body.contains("/work/app") && body.contains("pkg/b.rs") && body.contains("alpha"));
+
+        let (old, old_calls) = fake_toolbox(&[], |_, _| (201, Some("{}".to_string()), vec![]));
+        assert!(matches!(old.upload_dir("sb-1", &dir, "/w"), Err(Error::UnsupportedFeature(_))));
+        assert!(matches!(old.upload_dir("sb-1", dir.join("a.txt"), "/w"), Err(Error::Client(_))));
+        assert!(matches!(old.upload_dir("sb-1", dir.join("missing"), "/w"), Err(Error::Client(_))));
+        assert!(old_calls.lock().unwrap().is_empty());
+
+        let (ok, ok_calls) = fake_toolbox(&["files.extract"], |_, _| (201, Some("{}".to_string()), vec![]));
+        let data: SandboxData = serde_json::from_value(serde_json::json!({
+            "id": "sb-1", "image": "x", "status": "started", "public_url": "", "cpu": 1, "memory_mb": 1, "disk_gb": 1,
+            "os_user": "root", "network_block_all": false, "toolbox_enabled": true, "created_at": "", "updated_at": "",
+            "last_active_at": "", "lifecycle": {}
+        }))
+        .expect("sandbox data");
+        Sandbox::new(ok, data).upload_dir(&dir, "/w").expect("upload_dir");
+        assert_eq!(ok_calls.lock().unwrap().len(), 1);
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

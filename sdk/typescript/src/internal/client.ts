@@ -1,4 +1,8 @@
-import { basename } from "node:path";
+import { lstat, readdir, readFile, readlink, stat } from "node:fs/promises";
+import { basename, join } from "node:path";
+import { gzipSync } from "node:zlib";
+
+import { tarArchive, type TarEntry } from "./tar.js";
 
 import {
   PATH_PREFIX as V1_PATH_PREFIX,
@@ -522,6 +526,12 @@ const FEATURE_FILE_VERBS = "files.verbs";
  */
 const FEATURE_WRITE_OPTIONS = "files.write_options";
 
+/**
+ * The toolboxd feature behind upload's extract=true (uploadDir). An older
+ * agent ignores extract and would store the archive itself as a file.
+ */
+const FEATURE_EXTRACT = "files.extract";
+
 /** The entry cap `listFiles` sends when the caller gives none. */
 export const DEFAULT_LIST_LIMIT = 10_000;
 
@@ -534,6 +544,8 @@ interface RequestOptions {
    * was lost and the call succeeds with an empty 204.
    */
   doneCode?: string;
+  /** Send the request once, never retried: a body plan section 10 says is never re-sent (a folder upload). */
+  sendOnce?: boolean;
   /**
    * `false` for a request the server must not receive twice: re-sending an
    * exec runs the caller's command again. Only failures that prove the
@@ -1196,6 +1208,34 @@ export class APIClient {
     }
   }
 
+  /**
+   * Copy the local folder `localDir` into `remoteDir` in the sandbox (made if
+   * missing). The folder is packed as a gzipped tar and the sandbox unpacks it
+   * safely: no entry can land outside `remoteDir`. Symlinks are sent as links,
+   * hard-linked files as separate files; devices, pipes and sockets are
+   * skipped. The archive is built in memory and sent once, never retried.
+   * Node.js only.
+   */
+  async uploadDir(id: string, localDir: string, remoteDir: string): Promise<void> {
+    if (!(await stat(localDir)).isDirectory()) {
+      throw new Error(`${localDir} is not a folder`);
+    }
+    await this.requireToolboxFeatures(id, FEATURE_EXTRACT);
+    const archive = gzipSync(tarArchive(await folderEntries(localDir, "")));
+    const form = new FormData();
+    form.set("path", remoteDir);
+    form.set("file", new Blob([archive]), "upload.tar.gz");
+    const response = await this.request(
+      "POST",
+      `${this.versionPrefix}/sandboxes/${id}/toolbox/files/upload?extract=true`,
+      { body: form },
+      { idempotent: false, sendOnce: true },
+    );
+    if (!response.ok) {
+      throw await decodeError(response);
+    }
+  }
+
   async downloadFile(id: string, targetPath: string): Promise<Uint8Array> {
     const response = await this.request("GET", `${this.versionPrefix}/sandboxes/${id}/toolbox/files/download?path=${encodeURIComponent(targetPath)}`);
     if (!response.ok) {
@@ -1739,7 +1779,7 @@ export class APIClient {
     const url = `${this.baseURL}${path}`;
     const signal = init.signal ?? this.signal;
     const requestInit: RequestInit = { ...init, method, headers, ...(signal ? { signal } : {}) };
-    const { maxRetries } = this.retryConfig;
+    const maxRetries = options.sendOnce ? 0 : this.retryConfig.maxRetries;
     const idempotent = options.idempotent ?? true;
     const retryableStatusCodes = idempotent ? RETRYABLE_STATUS_CODES : REFUSED_STATUS_CODES;
     const isRetryableError = idempotent ? isTransientTransportError : isUnsentTransportError;
@@ -1878,6 +1918,11 @@ export class SandboxResource implements Sandbox {
 
   attachSession(sessionID: string, options: SessionAttachOptions = {}): SessionAttachHandle {
     return this.client.attachSession(this.id, sessionID, options);
+  }
+
+  /** Copy a local folder into the sandbox (Node.js only). See {@link APIClient.uploadDir}. */
+  async uploadDir(localDir: string, remoteDir: string): Promise<void> {
+    await this.client.uploadDir(this.id, localDir, remoteDir);
   }
 
   /** Upload a file. See {@link UploadFileOptions} for append, create-only, atomic and mode. */
@@ -2524,6 +2569,27 @@ function toBlob(data: BinaryLike): Blob {
     return new Blob([new Uint8Array(data)]);
   }
   return new Blob([Uint8Array.from(data)]);
+}
+
+/** The folder's contents as tar entries, names relative to it, sorted. */
+async function folderEntries(root: string, prefix: string): Promise<TarEntry[]> {
+  const entries: TarEntry[] = [];
+  const names = (await readdir(join(root, prefix))).sort();
+  for (const name of names) {
+    const rel = prefix === "" ? name : `${prefix}/${name}`;
+    const full = join(root, rel);
+    const info = await lstat(full);
+    const base = { name: rel, mode: info.mode & 0o7777, mtime: Math.floor(info.mtimeMs / 1000) };
+    if (info.isSymbolicLink()) {
+      entries.push({ ...base, type: "symlink", linkname: await readlink(full) });
+    } else if (info.isDirectory()) {
+      entries.push({ ...base, type: "dir" }, ...(await folderEntries(root, rel)));
+    } else if (info.isFile()) {
+      entries.push({ ...base, type: "file", data: await readFile(full) });
+    }
+    // Devices, pipes and sockets are skipped: the sandbox refuses them.
+  }
+  return entries;
 }
 
 /** The `code` of a JSON error reply, read from a clone so the body stays readable. */
