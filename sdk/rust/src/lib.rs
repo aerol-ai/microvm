@@ -1,4 +1,5 @@
 mod files;
+mod fleet;
 mod image;
 mod types;
 

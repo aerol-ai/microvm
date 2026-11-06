@@ -242,9 +242,77 @@ Rules for names:
   </TabItem>
 </Tabs>
 
-Names make "get or create" safe to retry. Look the name up. If it is missing, create it. If the create fails with 409, another call won the race, so look it up again.
-
 An older server that does not support name lookup returns a normal list instead. Every SDK notices this and raises a "does not support sandbox name lookup" error. It never guesses which sandbox you meant. Use the ID with that server, or upgrade it.
+
+### Get or create by name
+
+`getOrCreate` gives you your sandbox with a name, and makes it first if you have none. It also tells you whether this call made it, so you can set the sandbox up only once.
+
+It is safe to call again and again, and from many programs at the same time:
+
+1. It looks the name up. If you have that sandbox, it returns it.
+2. If not, it creates one with your options and that name.
+3. If two calls race, the server lets only one of them create the name. The other gets `409` and looks the name up again, so both end up with the same sandbox.
+
+An existing sandbox comes back as it is. The SDK does not compare its image or settings with your options.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const { sandbox, created } = await client.getOrCreate("build-box", {
+      image: "ubuntu:22.04",
+    });
+    if (created) {
+      await sandbox.exec("apt-get update");
+    }
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    sandbox, created = client.get_or_create("build-box", image="ubuntu:22.04")
+    if created:
+        sandbox.exec("apt-get update")
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    sandbox, created, err := client.GetOrCreate(ctx, "build-box", sdktypes.CreateSandboxOptions{
+        Image: "ubuntu:22.04",
+    })
+    if err != nil {
+        log.Fatal(err)
+    }
+    if created {
+        if _, err := sandbox.ExecCommand(ctx, "apt-get update"); err != nil {
+            log.Fatal(err)
+        }
+    }
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    let (sandbox, created) = client.get_or_create(
+        "build-box",
+        CreateOptions {
+            image: "ubuntu:22.04".to_string(),
+            ..Default::default()
+        },
+    )?;
+    if created {
+        sandbox.exec("apt-get update")?;
+    }
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    GetOrCreateResult result = client.getOrCreate(
+        "build-box", new CreateOptions().setImage("ubuntu:22.04"));
+    if (result.isCreated()) {
+        result.getSandbox().exec("apt-get update");
+    }
+    ```
+  </TabItem>
+</Tabs>
 
 ## Retry a create safely
 

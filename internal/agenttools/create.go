@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/base32"
-	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -91,28 +90,17 @@ func (t *Tools) GetOrCreate(ctx context.Context, spec CreateSpec) (CreateResult,
 		return CreateResult{}, &Error{Code: CodeInvalidArgument, Message: err.Error(), cause: err}
 	}
 
-	if existing, err := t.client.GetByName(ctx, name); err == nil {
-		t.warnIfDifferent(existing, spec)
-		return CreateResult{Sandbox: existing}, nil
-	} else if !errors.Is(err, microvm.ErrNotFound) {
+	// The lookup, create and 409-then-lookup flow lives in the SDK
+	// (Client.GetOrCreate, plan S4), so the CLI, MCP and SDK callers share
+	// one implementation of the race handling.
+	sb, created, err := t.client.GetOrCreate(ctx, name, t.createOptions(name, spec))
+	if err != nil {
 		return CreateResult{}, Classify(err)
 	}
-
-	created, err := t.client.Create(ctx, t.createOptions(name, spec))
-	if err == nil {
-		return CreateResult{Sandbox: created, Created: true}, nil
+	if !created {
+		t.warnIfDifferent(sb, spec)
 	}
-	if !errors.Is(err, microvm.ErrConflict) {
-		return CreateResult{}, Classify(err)
-	}
-	existing, lookupErr := t.client.GetByName(ctx, name)
-	if lookupErr != nil {
-		// A 409 whose name then can't be found is a conflict on something
-		// other than the name (the ID, a reservation); report the create's
-		// own error.
-		return CreateResult{}, Classify(err)
-	}
-	return CreateResult{Sandbox: existing}, nil
+	return CreateResult{Sandbox: sb, Created: created}, nil
 }
 
 func (t *Tools) createOptions(name string, spec CreateSpec) sdktypes.CreateSandboxOptions {

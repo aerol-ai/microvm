@@ -16,7 +16,7 @@ import urllib.request
 import uuid
 from concurrent.futures import Future, InvalidStateError, TimeoutError as FutureTimeoutError
 from io import BytesIO
-from typing import Any, Dict, Iterator, List, Optional, Union
+from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
 
 from ._internal.api.v1.paths import PATH_PREFIX as _V1_PATH_PREFIX
 from .image import Image
@@ -1069,6 +1069,40 @@ class MicroVM:
                 f"{self.api_url} does not support sandbox name lookup; use the sandbox ID or upgrade the server"
             )
         return self._wrap_sandbox(sandboxes[0])
+
+    def get_or_create(self, name: str, options: Optional[CreateOptions] = None, **fields: Any) -> Tuple[Sandbox, bool]:
+        """Return the caller's sandbox called ``name``, creating it from
+        ``options`` (the same fields as :meth:`create`) when there is none.
+        Returns ``(sandbox, created)``; ``created`` is True only when this
+        call made the sandbox.
+
+        Safe to retry and to run at the same time from many processes. Names
+        are unique per owner, so when two callers race to create the same
+        name, one gets a 409 and reads the winner's sandbox instead. An
+        existing sandbox is returned as it is: its image and other settings
+        are not compared with ``options``.
+        """
+        wanted = (name or "").strip()
+        if not wanted:
+            raise ValueError("sandbox name is required")
+        resolved: Dict[str, Any] = {**(options or {}), **fields}
+        given = str(resolved.get("name") or "").strip()
+        if given and given != wanted:
+            raise ValueError(f"options name {given!r} differs from {wanted!r}")
+        resolved["name"] = wanted
+        existing = self.get_by_name(wanted)
+        if existing is not None:
+            return existing, False
+        try:
+            return self.create(resolved), True
+        except MicroVMConflictError:
+            # Another caller created the name between the lookup and the
+            # create. A 409 whose name still cannot be found is a conflict on
+            # something else, so the create's own error stands.
+            winner = self.get_by_name(wanted)
+            if winner is None:
+                raise
+            return winner, False
 
     def get(self, sandbox_id: str, *, include_env: bool = False) -> Sandbox:
         path = f"{self._version_prefix}/sandboxes/{sandbox_id}" + _build_sandbox_query(None, include_env)

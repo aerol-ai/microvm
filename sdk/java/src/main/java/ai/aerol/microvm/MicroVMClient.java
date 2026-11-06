@@ -517,6 +517,46 @@ public class MicroVMClient {
         return java.util.Optional.of(wrap(response[0]));
     }
 
+    /**
+     * Returns the caller's sandbox called {@code name}, creating it from
+     * {@code options} when there is none. {@link GetOrCreateResult#isCreated()}
+     * is true only when this call made the sandbox.
+     *
+     * <p>Safe to retry and to run at the same time from many processes. Names
+     * are unique per owner, so when two callers race to create the same name,
+     * one gets a 409 and reads the winner's sandbox instead; a 409 whose name
+     * still cannot be found is a conflict on something else and is thrown as
+     * is. An existing sandbox is returned as it is: its image and settings
+     * are not compared with {@code options}. {@code options.name} may be null
+     * or repeat {@code name}; {@code options} is not changed.
+     */
+    public GetOrCreateResult getOrCreate(String name, CreateOptions options) {
+        String wanted = name == null ? "" : name.trim();
+        if (wanted.isEmpty()) {
+            throw new IllegalArgumentException("sandbox name is required");
+        }
+        String given = options == null || options.name == null ? "" : options.name.trim();
+        if (!given.isEmpty() && !given.equals(wanted)) {
+            throw new IllegalArgumentException("options name \"" + given + "\" differs from \"" + wanted + "\"");
+        }
+        java.util.Optional<Sandbox> existing = getByName(wanted);
+        if (existing.isPresent()) {
+            return new GetOrCreateResult(existing.get(), false);
+        }
+        CreateOptions named = copyCreateOptions(options);
+        named.name = wanted;
+        try {
+            return new GetOrCreateResult(create(named), true);
+        } catch (MicroVMConflictException e) {
+            // Another caller created the name after the lookup.
+            java.util.Optional<Sandbox> winner = getByName(wanted);
+            if (winner.isEmpty()) {
+                throw e;
+            }
+            return new GetOrCreateResult(winner.get(), false);
+        }
+    }
+
     public Sandbox get(String sandboxId) {
         return get(sandboxId, false);
     }

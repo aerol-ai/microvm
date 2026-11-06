@@ -3,6 +3,7 @@ package microvm
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/url"
@@ -349,6 +350,51 @@ func (c *Client) GetByName(ctx context.Context, name string, opts ...GetOption) 
 		return nil, err
 	}
 	return wrapSandbox(c, item), nil
+}
+
+// GetOrCreate returns the caller's sandbox called name, creating it from opts
+// when there is none; created is true only when this call made it. It is
+// safe to retry and to run concurrently:
+//
+//	GET ?name=name ── hit ──► (existing, false)
+//	      │ miss
+//	POST {opts, name}
+//	      ├─ 201 ──────────────► (new, true)
+//	      ├─ 409 ─► GET ?name= ─► (the winner, false)
+//	      └─ lost reply ─► the client retries the same POST (same
+//	         Idempotency-Key) ─► 201, or 409 as above
+//
+// Names are unique per owner, so of two callers racing to create a name one
+// gets a 409 and reads the other's sandbox. A 409 whose name still cannot be
+// found is a conflict on something else and is returned as is. An existing
+// sandbox is returned unchanged: its image and settings are not compared with
+// opts. opts.Name may be empty or repeat name.
+func (c *Client) GetOrCreate(ctx context.Context, name string, opts sdktypes.CreateSandboxOptions) (*Sandbox, bool, error) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return nil, false, errors.New("sandbox name is required")
+	}
+	if given := strings.TrimSpace(opts.Name); given != "" && given != name {
+		return nil, false, fmt.Errorf("options name %q differs from %q", given, name)
+	}
+	if existing, err := c.GetByName(ctx, name); err == nil {
+		return existing, false, nil
+	} else if !errors.Is(err, ErrNotFound) {
+		return nil, false, err
+	}
+	opts.Name = name
+	created, err := c.Create(ctx, opts)
+	if err == nil {
+		return created, true, nil
+	}
+	if !errors.Is(err, ErrConflict) {
+		return nil, false, err
+	}
+	winner, lookupErr := c.GetByName(ctx, name)
+	if lookupErr != nil {
+		return nil, false, err
+	}
+	return winner, false, nil
 }
 
 // Mounts returns the redacted mount config for a sandbox. Credentials are

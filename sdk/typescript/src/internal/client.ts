@@ -11,7 +11,7 @@ import {
   sandboxCustomDomainPath as v1SandboxCustomDomainPath,
   sandboxCustomDomainsPath as v1SandboxCustomDomainsPath,
 } from "./api/v1/paths.js";
-import { MicroVMApiError, MicroVMFileTooLargeError, MicroVMUnsupportedFeatureError, apiErrorFor } from "../errors.js";
+import { MicroVMApiError, MicroVMConflictError, MicroVMFileTooLargeError, MicroVMUnsupportedFeatureError, apiErrorFor } from "../errors.js";
 import { Image } from "../Image.js";
 import type {
   AddCustomDomainOptions,
@@ -1075,6 +1075,38 @@ export class APIClient {
       );
     }
     return this.wrap(items[0]);
+  }
+
+  /**
+   * The caller's sandbox called `name`, created from `options` when there is
+   * none; `created` is true only when this call made it. Safe to retry and to
+   * run concurrently: names are unique per owner, so a caller that loses a
+   * race to create the name gets a 409 and reads the winner's sandbox.
+   */
+  async getOrCreate(name: string, options: CreateOptions): Promise<{ sandbox: SandboxResource; created: boolean }> {
+    const wanted = name.trim();
+    if (wanted === "") {
+      throw new Error("sandbox name is required");
+    }
+    const given = options.name?.trim() ?? "";
+    if (given !== "" && given !== wanted) {
+      throw new Error(`options name "${given}" differs from "${wanted}"`);
+    }
+    const existing = await this.getByName(wanted);
+    if (existing !== null) {
+      return { sandbox: existing, created: false };
+    }
+    try {
+      return { sandbox: await this.create({ ...options, name: wanted }), created: true };
+    } catch (err) {
+      if (!(err instanceof MicroVMConflictError)) throw err;
+      // Another caller created the name after the lookup. A 409 whose name
+      // still cannot be found is a conflict on something else, so the
+      // create's own error stands.
+      const winner = await this.getByName(wanted);
+      if (winner === null) throw err;
+      return { sandbox: winner, created: false };
+    }
   }
 
   async get(id: string, options?: GetOptions): Promise<SandboxResource> {

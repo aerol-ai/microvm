@@ -74,6 +74,13 @@ export interface Tokens {
   revoke(id: string): Promise<void>;
 }
 
+/** What {@link MicroVM.getOrCreate} found or made. */
+export interface GetOrCreateResult {
+  sandbox: Sandbox;
+  /** True only when this call created the sandbox. */
+  created: boolean;
+}
+
 export interface MicroVMConfig {
   /**
    * The bearer every request carries: the operator PAT, an `avm_` API token
@@ -184,6 +191,20 @@ export class MicroVM {
   async getByName(name: string, options?: GetOptions): Promise<Sandbox | null> {
     const sandbox = await this.client.getByName(name, options);
     return sandbox === null ? null : this.wrap(sandbox.toJSON());
+  }
+
+  /**
+   * Returns the caller's sandbox called `name`, creating it from `options`
+   * when there is none. `created` is true only when this call made the
+   * sandbox. Safe to retry and to run at the same time from many processes:
+   * names are unique per owner, so when two callers race to create the same
+   * name, one gets a 409 and reads the winner's sandbox instead. An existing
+   * sandbox is returned as it is; its image and settings are not compared
+   * with `options`.
+   */
+  async getOrCreate(name: string, options: CreateOptions): Promise<GetOrCreateResult> {
+    const result = await this.client.getOrCreate(name, options);
+    return { sandbox: this.wrap(result.sandbox.toJSON()), created: result.created };
   }
 
   async start(id: string): Promise<Sandbox> {

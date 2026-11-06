@@ -12,7 +12,7 @@ export {
   MicroVMUnsupportedFeatureError,
 } from "./errors.js";
 export { DEFAULT_LIST_LIMIT } from "./internal/client.js";
-export type { MicroVMConfig, Tokens } from "./MicroVM.js";
+export type { GetOrCreateResult, MicroVMConfig, Tokens } from "./MicroVM.js";
 export type { RetryConfig } from "./internal/client.js";
 export type {
   AddCustomDomainOptions,

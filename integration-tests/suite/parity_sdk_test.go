@@ -53,3 +53,68 @@ func TestParitySDKTypedErrorsLive(t *testing.T) {
 		t.Fatalf("Get with a wrong token error = %v, want ErrAuth (401)", err)
 	}
 }
+
+// UC-447 — get or create by name (plan S4, CEO review R4): eight
+// GetOrCreate calls for one new name, sent at once through the live server,
+// all return the same sandbox and exactly one reports that it created it;
+// the name then maps to that one sandbox, and a later call returns it
+// without creating.
+func TestParitySDKGetOrCreateLive(t *testing.T) {
+	harness.Require(t, sc, "UC-447")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+	sdk := client(t).SDK()
+	name := harness.UniqueName(sc, t)
+	public := true
+	opts := sdktypes.CreateSandboxOptions{Image: harness.DefaultImage, AllowPublicTraffic: &public}
+
+	const callers = 8
+	type result struct {
+		id      string
+		created bool
+		err     error
+	}
+	results := make(chan result, callers)
+	for range callers {
+		go func() {
+			sb, created, err := sdk.GetOrCreate(ctx, name, opts)
+			r := result{created: created, err: err}
+			if sb != nil {
+				r.id = sb.ID
+			}
+			results <- r
+		}()
+	}
+	ids := map[string]bool{}
+	made := 0
+	var firstErr error
+	for range callers {
+		r := <-results
+		if r.err != nil && firstErr == nil {
+			firstErr = r.err
+		}
+		if r.id != "" {
+			ids[r.id] = true
+		}
+		if r.created {
+			made++
+		}
+	}
+	for id := range ids {
+		t.Cleanup(func() { _ = sdk.Destroy(context.Background(), id) })
+	}
+	if firstErr != nil {
+		t.Fatalf("GetOrCreate: %v", firstErr)
+	}
+	if len(ids) != 1 || made != 1 {
+		t.Fatalf("%d concurrent GetOrCreate calls gave sandboxes %v with %d created, want one sandbox created once", callers, ids, made)
+	}
+	byName, err := sdk.GetByName(ctx, name)
+	if err != nil || !ids[byName.ID] {
+		t.Fatalf("GetByName(%s) = (%v, %v), want one of %v", name, byName, err, ids)
+	}
+	again, created, err := sdk.GetOrCreate(ctx, name, opts)
+	if err != nil || created || again.ID != byName.ID {
+		t.Fatalf("second GetOrCreate = (%v, %v, %v), want %s not created", again, created, err, byName.ID)
+	}
+}

@@ -1044,6 +1044,7 @@ var Registry = []UseCase{
 	{ID: "UC-467", Title: "Coding-agent recipes: OpenCode, Aider, Gemini CLI and Codex CLI each install at the pinned version in the documented image next to a cloned repository and, started as a session with the documented command and a dummy key, run headless to the model API (the log shows the provider refusing the key, not a usage, trust or missing-key error)", Requires: []Capability{CapDocker}, Implemented: true},
 	// Agent-sandbox parity, SDK experience (parity_sdk_test.go; plan §5.3 S1-S7).
 	{ID: "UC-446", Title: "Typed errors: a missing sandbox matches the Go SDK's ErrNotFound, a create with a name already in use ErrConflict, and a wrong token ErrAuth (401), each still an *APIError", Implemented: true},
+	{ID: "UC-447", Title: "Get or create by name: eight GetOrCreate calls for one new name sent at once all return the same sandbox and exactly one reports created; GetByName finds it and a later GetOrCreate returns it without creating", Implemented: true},
 }
 
 // byID is a lookup built once for the report generator.
