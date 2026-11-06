@@ -208,6 +208,9 @@ func (s *Service) NormalizeCreateEgressDefault(req *models.CreateSandboxRequest)
 	if op := s.egressOperator(); op != nil && !hasEgressFields(req) {
 		applyOperatorDefault(op, req)
 	}
+	// SB_EGRESS_BLOCK_PRIVATE_BY_DEFAULT, for a create the operator file
+	// left open: the same place, so it rides the same replicated spec.
+	s.applyPrivateDefault(req)
 }
 
 // applyOperatorDefault writes the operator's default policy into a request

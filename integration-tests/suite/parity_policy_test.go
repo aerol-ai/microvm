@@ -12,6 +12,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -125,5 +126,117 @@ func TestParityCreatePolicyRefusesLive(t *testing.T) {
 			time.Sleep(3 * time.Second)
 		}
 		requirePolicyRefusal(t, err, "runtimes")
+	})
+}
+
+// privateProbeTargets are private addresses a sandbox on an AWS node can
+// normally reach: Amazon's link-local DNS on TCP 53, and each other node's
+// private address on the ingress port.
+func privateProbeTargets(targets *harness.IntegrationTargets) [][2]string {
+	out := [][2]string{{"169.254.169.253", "53"}}
+	for _, n := range targets.Nodes {
+		if n.PrivateIP != "" {
+			out = append(out, [2]string{n.PrivateIP, "443"})
+		}
+	}
+	return out
+}
+
+// reachablePrivate returns the private targets sb reaches. Its own node's
+// address is left out: that traffic is the node's input, which the
+// per-sandbox egress rules do not govern, so it proves nothing either way.
+func reachablePrivate(t *testing.T, c *harness.Client, sb *microvm.Sandbox, cands [][2]string) map[[2]string]bool {
+	t.Helper()
+	self := sandboxNode(t, c, sb).PrivateIP
+	out := map[[2]string]bool{}
+	for _, cand := range cands {
+		if cand[0] == self {
+			continue
+		}
+		port, _ := strconv.Atoi(cand[1])
+		out[cand] = tcpProbe(t, sb, cand[0], port)
+	}
+	return out
+}
+
+// UC-411 — block private networks by default (T4). Without the flag a
+// no-policy sandbox reaches a private address; with
+// SB_EGRESS_BLOCK_PRIVATE_BY_DEFAULT on every node, a new no-policy sandbox
+// gets the private-range deny list on its record, cannot reach any private
+// address that answered with the flag off, still resolves names and reaches
+// the internet; a sandbox that sets its own policy keeps it and still
+// reaches them; and destroying the default sandbox leaves no egress rule for
+// its address on its node.
+func TestParityBlockPrivateByDefaultLive(t *testing.T) {
+	harness.Require(t, sc, "UC-411")
+	targets := policyTargets(t)
+	c := client(t)
+
+	// The private addresses this deployment answers on, flag off.
+	before := c.NewSandbox(t, sdktypes.CreateSandboxOptions{Name: harness.UniqueName(sc, t) + "-before"})
+	waitRunning(t, before)
+	var open [][2]string
+	for cand, ok := range reachablePrivate(t, c, before, privateProbeTargets(targets)) {
+		if ok {
+			open = append(open, cand)
+		}
+	}
+	if len(open) == 0 {
+		t.Skip("no private address answers a sandbox here, so a block can't be told from a closed port")
+	}
+
+	harness.WithClusterEnv(t, targets, map[string]string{"SB_EGRESS_BLOCK_PRIVATE_BY_DEFAULT": "true"}, func(res map[string]harness.NodeBootResult) {
+		requireStarted(t, res)
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer cancel()
+
+		sb := c.NewSandbox(t, sdktypes.CreateSandboxOptions{Name: harness.UniqueName(sc, t)})
+		waitRunning(t, sb)
+		got, err := c.SDK().Get(ctx, sb.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !slices.Contains(got.NetworkDenyOut, "10.0.0.0/8") || !slices.Contains(got.NetworkDenyOut, "169.254.0.0/16") {
+			t.Fatalf("the default sandbox's record has deny %v, want the private ranges", got.NetworkDenyOut)
+		}
+		for cand, ok := range reachablePrivate(t, c, sb, open) {
+			if ok {
+				t.Fatalf("%s:%s is private and must be blocked for a no-policy sandbox", cand[0], cand[1])
+			}
+		}
+		if !tcpProbe(t, sb, cloudflareDNS, 443) {
+			t.Fatal("the internet must stay open")
+		}
+		if out := egressExec(t, sb, "getent hosts example.com >/dev/null; echo dns_rc=$?"); !strings.Contains(out, "dns_rc=0") {
+			t.Fatalf("name lookups must keep working (the resolver stays open):\n%s", out)
+		}
+
+		own := c.NewSandbox(t, sdktypes.CreateSandboxOptions{Name: harness.UniqueName(sc, t) + "-own", NetworkDenyOut: []string{"203.0.113.0/24"}})
+		waitRunning(t, own)
+		ownProbes := reachablePrivate(t, c, own, open)
+		reached := false
+		for _, ok := range ownProbes {
+			reached = reached || ok
+		}
+		if len(ownProbes) > 0 && !reached {
+			t.Fatal("a sandbox that sets its own policy keeps it: the flag is a default, not a floor")
+		}
+
+		node := sandboxNode(t, c, sb)
+		ip := containerIP(t, c, sb)
+		if err := sb.Destroy(ctx); err != nil {
+			t.Fatal(err)
+		}
+		deadline := time.Now().Add(30 * time.Second)
+		for {
+			rules := hostEgressRules(t, node, ip)
+			if len(rules) == 0 {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("egress rules left for %s after destroy:\n%s", ip, strings.Join(rules, "\n"))
+			}
+			time.Sleep(2 * time.Second)
+		}
 	})
 }

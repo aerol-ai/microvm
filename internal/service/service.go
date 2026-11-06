@@ -500,6 +500,9 @@ type Service struct {
 	// createPolicyWatcher holds the operator's create policy
 	// (SB_CREATE_POLICY_FILE); nil = no file, today's behavior.
 	createPolicyWatcher *createpolicy.Watcher
+	// blockPrivateDefault is SB_EGRESS_BLOCK_PRIVATE_BY_DEFAULT's state, set
+	// once at boot (egress_private_default.go); nil = off.
+	blockPrivateDefault atomic.Pointer[privateDefault]
 	// egressControlPushed is the control-port guard list last pushed to the
 	// gateway; nil after a full sync, so a restarted gateway gets it again.
 	egressControlPushed atomic.Pointer[string]

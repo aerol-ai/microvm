@@ -277,6 +277,13 @@ type Config struct {
 	// EgressOperatorFile is the private-cloud operator policy (§5.10,
 	// SB_EGRESS_OPERATOR_FILE). Empty keeps today's behavior.
 	EgressOperatorFile string
+	// EgressBlockPrivateByDefault gives a container, gVisor or Firecracker
+	// create that sets no egress policy a deny list of the private and
+	// link-local ranges (RFC 1918, 169.254/16), with the sandbox's own DNS
+	// resolvers left open, instead of no filter at all
+	// (SB_EGRESS_BLOCK_PRIVATE_BY_DEFAULT, plans/agent-sandbox-feature-parity.md
+	// T4). A create that sets any policy keeps its own. Off by default.
+	EgressBlockPrivateByDefault bool
 	// CreatePolicyFile is the operator's create policy
 	// (SB_CREATE_POLICY_FILE, internal/createpolicy): allowed images,
 	// registries and runtimes, size limits, non-root and GPU rules, checked
@@ -2051,6 +2058,7 @@ func load(keyTool bool) (Config, error) {
 		EgressGatewayUser:                 strings.TrimSpace(getEnv("SB_EGRESS_GATEWAY_USER", "aerolvm-egress")),
 		EgressOperatorFile:                strings.TrimSpace(getEnv("SB_EGRESS_OPERATOR_FILE", "")),
 		CreatePolicyFile:                  strings.TrimSpace(getEnv("SB_CREATE_POLICY_FILE", "")),
+		EgressBlockPrivateByDefault:       getEnvBool("SB_EGRESS_BLOCK_PRIVATE_BY_DEFAULT", false),
 		EgressProfileApplyQPS:             getEnvInt("SB_EGRESS_PROFILE_APPLY_QPS", 50),
 		EgressDNSPort:                     getEnvInt("SB_EGRESS_DNS_PORT", 53054),
 		EgressProxyPort:                   getEnvInt("SB_EGRESS_PROXY_PORT", 15080),
@@ -2553,6 +2561,13 @@ func load(keyTool bool) (Config, error) {
 
 	if cfg.Domain == "" && cfg.PublicHost == "" {
 		return Config{}, errors.New("SB_PUBLIC_HOST is required when SB_DOMAIN is empty")
+	}
+
+	// The private-range default is host firewall rules: on a node with the
+	// firewall off every default create would get a policy nothing enforces
+	// (refused with 501, or accepted unenforced), so refuse the pair at boot.
+	if cfg.EgressBlockPrivateByDefault && !cfg.EnableNetworkRules {
+		return Config{}, errors.New("SB_EGRESS_BLOCK_PRIVATE_BY_DEFAULT=true needs SB_ENABLE_NETWORK_RULES=true: the private-range default is enforced by the host firewall")
 	}
 
 	// SB_CONTAINER_RUNTIME must be one of the runtimes we know how to drive.
