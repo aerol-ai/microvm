@@ -31,7 +31,7 @@ pub use types::{
     STATUS_REASON_MAX_AGE, STATUS_REASON_OUT_OF_MEMORY, STATUS_REASON_PROGRAM_EXITED,
     STATUS_REASON_RECONCILE, STATUS_REASON_RESTARTED, STATUS_REASON_USER_STOP,
 };
-use types::{CustomDomainListWire, ExposePortResponseWire};
+use types::{CustomDomainListWire, ExposePortResponseWire, WarmPoolListWire};
 pub use types::{ApiToken, ApiTokenList, CreateApiTokenOptions, CreatedApiToken, WhoAmI, WhoAmIPrincipal};
 pub use types::{CreateSandboxTokenOptions, ExposeVisibility, SandboxToken};
 pub use types::{
@@ -54,6 +54,7 @@ pub use types::{
     UpdateLifecycleOptions, WasmModule, WasmModuleStatus, PushWasmModuleOptions,
     PushWasmModuleResponse, WatchOptions,
 };
+pub use types::{WarmPool, WarmPoolOptions, WarmPoolServerStatus, WarmPoolStatus};
 
 const DEFAULT_API_URL: &str = "http://127.0.0.1:21212";
 
@@ -1850,6 +1851,39 @@ impl Client {
     /// Deletes a profile; one that sandboxes still reference is refused (409).
     pub fn delete_egress_profile(&self, name: &str) -> Result<(), Error> {
         self.do_json::<(), ()>(Method::DELETE, &self.egress_profile_path(name), None)
+    }
+
+    // An image is the rest of the warm-pool path: each segment is escaped and
+    // the slashes kept, so no proxy has an encoded slash to rewrite. Every
+    // warm-pool call is a PUT, GET or DELETE of one entry, safe to retry.
+    fn warm_pool_path(&self, image: &str) -> String {
+        let segments: Vec<String> = image.split('/').map(|s| urlencoding::encode(s).into_owned()).collect();
+        format!("{}/warm-pools/{}", self.version_prefix(), segments.join("/"))
+    }
+
+    /// Sets how many ready sandboxes every server with a warm pool keeps for
+    /// an image (a full replace: the same call twice is a no-op). A create
+    /// that names the image then starts from a warm sandbox. Admin only.
+    pub fn put_warm_pool(&self, image: &str, opts: WarmPoolOptions) -> Result<WarmPool, Error> {
+        self.do_json::<WarmPoolOptions, WarmPool>(Method::PUT, &self.warm_pool_path(image), Some(&opts))
+    }
+
+    /// Reads an image's warm-pool entry with its status (ready and target,
+    /// in total and per server).
+    pub fn get_warm_pool(&self, image: &str) -> Result<WarmPool, Error> {
+        self.do_json::<(), WarmPool>(Method::GET, &self.warm_pool_path(image), None)
+    }
+
+    /// Reads every warm-pool entry, by image, with its status.
+    pub fn list_warm_pools(&self) -> Result<Vec<WarmPool>, Error> {
+        let wire = self.do_json::<(), WarmPoolListWire>(Method::GET, &format!("{}/warm-pools", self.version_prefix()), None)?;
+        Ok(wire.pools)
+    }
+
+    /// Deletes an image's warm-pool entry; its warm sandboxes are removed.
+    /// Deleting a missing entry succeeds.
+    pub fn delete_warm_pool(&self, image: &str) -> Result<(), Error> {
+        self.do_json::<(), ()>(Method::DELETE, &self.warm_pool_path(image), None)
     }
 
     /// Who the server says the caller is: principal, role, team and when
@@ -5225,6 +5259,59 @@ mod tests {
         assert!(request.starts_with("GET /v1/egress-profiles?cursor=a&limit=5 HTTP/1.1\r\n"), "unexpected request: {}", request);
         assert!(page.profiles.is_empty());
         assert_eq!(page.next_cursor.as_deref(), Some("z"));
+    }
+
+    #[test]
+    fn warm_pool_crud_maps_wire_shape() {
+        let body = serde_json::json!({
+            "image": "ghcr.io/acme/agent:1", "depth": 2, "generation": 1, "created_at": "c", "updated_at": "u"
+        })
+        .to_string();
+        let (url, request_rx) = spawn_json_server(body);
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        let pool = client.put_warm_pool("ghcr.io/acme/agent:1", WarmPoolOptions { depth: 2 }).expect("put should succeed");
+        let request = request_rx.recv().expect("request should be captured");
+        assert!(
+            request.starts_with("PUT /v1/warm-pools/ghcr.io/acme/agent%3A1 HTTP/1.1\r\n"),
+            "an image keeps its slashes and each segment is escaped: {}",
+            request
+        );
+        assert_eq!(request_json_body(&request), serde_json::json!({"depth": 2}));
+        assert_eq!(pool.depth, 2);
+        assert!(pool.status.is_none());
+
+        let got = serde_json::json!({
+            "image": "python:3.12", "depth": 2, "generation": 3,
+            "status": {"ready": 3, "target": 4, "servers": [
+                {"node_id": "n1", "ready": 2, "target": 2},
+                {"node_id": "n2", "ready": 1, "target": 2, "stale": true}
+            ]}
+        });
+        let (url, request_rx) = spawn_json_server(got.to_string());
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        let pool = client.get_warm_pool("python:3.12").expect("get should succeed");
+        let request = request_rx.recv().expect("request should be captured");
+        assert!(request.starts_with("GET /v1/warm-pools/python%3A3.12 HTTP/1.1\r\n"), "unexpected request: {}", request);
+        let status = pool.status.expect("a GET carries status");
+        assert_eq!((status.ready, status.target, status.servers.len()), (3, 4, 2));
+        assert!(status.servers[1].stale && !status.servers[0].stale);
+
+        let (url, request_rx) = spawn_json_server(serde_json::json!({"pools": [got]}).to_string());
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        let pools = client.list_warm_pools().expect("list should succeed");
+        let request = request_rx.recv().expect("request should be captured");
+        assert!(request.starts_with("GET /v1/warm-pools HTTP/1.1\r\n"), "unexpected request: {}", request);
+        assert_eq!(pools.len(), 1);
+
+        let (url, _rx) = spawn_json_server(serde_json::json!({"pools": null}).to_string());
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        assert!(client.list_warm_pools().expect("list should succeed").is_empty());
+
+        let (url, request_rx) = spawn_response_server("204 No Content", "application/json", Vec::new());
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        client.delete_warm_pool("python:3.12").expect("delete should succeed");
+        let request = request_rx.recv().expect("request should be captured");
+        assert!(request.starts_with("DELETE /v1/warm-pools/python%3A3.12 HTTP/1.1\r\n"), "unexpected request: {}", request);
     }
 
     #[test]

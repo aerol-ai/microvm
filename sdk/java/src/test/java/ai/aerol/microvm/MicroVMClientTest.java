@@ -49,6 +49,8 @@ import ai.aerol.microvm.model.EgressProfileOptions;
 import ai.aerol.microvm.model.EgressInject;
 import ai.aerol.microvm.model.EgressRule;
 import ai.aerol.microvm.model.ListEgressProfilesOptions;
+import ai.aerol.microvm.model.WarmPool;
+import ai.aerol.microvm.model.WarmPoolOptions;
 import ai.aerol.microvm.model.ListSnapshotsOptions;
 import ai.aerol.microvm.model.NetworkLearned;
 import ai.aerol.microvm.model.NetworkPolicy;
@@ -1422,6 +1424,60 @@ class MicroVMClientTest {
             assertEquals("z", page.nextCursor);
             assertTrue(client.listEgressProfiles().profiles.isEmpty());
             client.deleteEgressProfile("python");
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void warmPoolCrudKeepsImageSlashesAndMapsStatus() throws Exception {
+        List<String> seen = new java.util.ArrayList<>();
+        AtomicReference<Map<String, Object>> body = new AtomicReference<>();
+        Map<String, Object> status = mapOf("ready", 3, "target", 4, "servers", List.of(
+            mapOf("node_id", "n1", "ready", 2, "target", 2),
+            mapOf("node_id", "n2", "ready", 1, "target", 2, "stale", true)));
+        HttpServer server = startServer(exchange -> {
+            String rawPath = exchange.getRequestURI().getRawPath();
+            String method = exchange.getRequestMethod();
+            seen.add(method + " " + rawPath);
+            if ("DELETE".equals(method)) {
+                exchange.sendResponseHeaders(204, -1);
+                exchange.close();
+                return;
+            }
+            if ("GET".equals(method) && "/v1/warm-pools".equals(rawPath)) {
+                writeJson(exchange, 200, mapOf("pools", seen.size() < 4 ? List.of(mapOf("image", "python:3.12", "depth", 2, "status", status)) : null));
+                return;
+            }
+            if ("PUT".equals(method)) {
+                body.set(castMap(JsonSupport.read(exchange.getRequestBody().readAllBytes(), Map.class)));
+                writeJson(exchange, 200, mapOf("image", "ghcr.io/acme/agent:1", "depth", 2, "generation", 1, "created_at", "c", "updated_at", "u"));
+                return;
+            }
+            writeJson(exchange, 200, mapOf("image", "ghcr.io/acme/agent:1", "depth", 2, "generation", 1, "status", status));
+        });
+        try {
+            MicroVMClient client = clientFor(server);
+            WarmPool put = client.putWarmPool("ghcr.io/acme/agent:1", new WarmPoolOptions().setDepth(2));
+            assertEquals(2, put.depth);
+            assertEquals(1, put.generation);
+            assertEquals("c", put.createdAt);
+            assertEquals(null, put.status);
+            assertEquals(2, ((Number) body.get().get("depth")).intValue());
+            WarmPool got = client.getWarmPool("ghcr.io/acme/agent:1");
+            assertEquals(3, got.status.ready);
+            assertEquals(4, got.status.target);
+            assertEquals("n2", got.status.servers.get(1).nodeId);
+            assertTrue(got.status.servers.get(1).stale);
+            assertEquals(1, client.listWarmPools().size());
+            assertTrue(client.listWarmPools().isEmpty());
+            client.deleteWarmPool("odd name/img:1");
+            assertEquals(List.of(
+                "PUT /v1/warm-pools/ghcr.io/acme/agent%3A1",
+                "GET /v1/warm-pools/ghcr.io/acme/agent%3A1",
+                "GET /v1/warm-pools",
+                "GET /v1/warm-pools",
+                "DELETE /v1/warm-pools/odd%20name/img%3A1"), seen);
         } finally {
             server.stop(0);
         }

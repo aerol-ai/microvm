@@ -240,6 +240,21 @@ type Snapshot struct {
 	LocalWasmModuleInventoryKnown bool `json:"local_wasm_module_inventory_known,omitempty"`
 	// LocalWasmModuleIDs lists module_ref values cached on this host.
 	LocalWasmModuleIDs []string `json:"local_wasm_module_ids,omitempty"`
+	// WarmPools is this host's warm-pool status for each API warm-pool
+	// entry (plans/agent-sandbox-feature-parity.md W1). It rides the
+	// capacity heartbeat so any server can answer GET /v1/warm-pools per
+	// server without a fan-out. Only entries are listed, never miss-driven
+	// targets, and models.MaxWarmPools bounds them, so it stays small.
+	// Omitted by a host with no warm pool and by a peer that predates it.
+	WarmPools []WarmPoolStatus `json:"warm_pools,omitempty"`
+}
+
+// WarmPoolStatus is one warm-pool entry's state on one host: slots parked
+// and ready for a create, and how many the host is aiming for.
+type WarmPoolStatus struct {
+	Image  string `json:"image"`
+	Ready  int    `json:"ready"`
+	Target int    `json:"target"`
 }
 
 // MemProbe reports live free memory in MB. The default implementation reads

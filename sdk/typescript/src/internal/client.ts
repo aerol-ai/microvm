@@ -74,6 +74,9 @@ import type {
   EgressProfileRef,
   EgressRule,
   ListEgressProfilesOptions,
+  WarmPool,
+  WarmPoolOptions,
+  WarmPoolStatus,
   NetworkLearned,
   NetworkPolicy,
   NetworkPolicyCheckOptions,
@@ -308,6 +311,46 @@ function fromApiEgressProfile(p: ApiEgressProfile): EgressProfile {
   };
   if (p.description) out.description = p.description;
   return out;
+}
+
+interface ApiWarmPool {
+  image: string;
+  depth: number;
+  generation: number;
+  created_at: string;
+  updated_at: string;
+  status?: {
+    ready: number;
+    target: number;
+    servers: { node_id: string; ready: number; target: number; stale?: boolean }[] | null;
+  };
+}
+
+function fromApiWarmPool(p: ApiWarmPool): WarmPool {
+  const out: WarmPool = {
+    image: p.image,
+    depth: p.depth,
+    generation: p.generation,
+    createdAt: p.created_at,
+    updatedAt: p.updated_at,
+  };
+  if (p.status) {
+    const status: WarmPoolStatus = { ready: p.status.ready, target: p.status.target, servers: [] };
+    for (const s of p.status.servers ?? []) {
+      const server: WarmPoolStatus["servers"][number] = { nodeId: s.node_id, ready: s.ready, target: s.target };
+      if (s.stale) server.stale = true;
+      status.servers.push(server);
+    }
+    out.status = status;
+  }
+  return out;
+}
+
+// An image is the rest of the warm-pool path. Each segment is escaped and the
+// slashes are kept, so ghcr.io/acme/agent:1 reaches the server as written and
+// no proxy has an encoded slash to rewrite.
+function warmPoolPath(image: string): string {
+  return `/warm-pools/${image.split("/").map(encodeURIComponent).join("/")}`;
 }
 
 // Only inject's secretRef is spelled differently on the wire, so a rule
@@ -1764,6 +1807,25 @@ export class APIClient {
 
   async deleteEgressProfile(name: string): Promise<void> {
     await this.doJSON<void>("DELETE", this.versioned(`/egress-profiles/${encodeURIComponent(name)}`));
+  }
+
+  // Warm pools are PUT/GET/DELETE of one entry: every call is safe to retry,
+  // so they keep the default (idempotent) retry tier.
+  async putWarmPool(image: string, options: WarmPoolOptions): Promise<WarmPool> {
+    return fromApiWarmPool(await this.doJSON<ApiWarmPool>("PUT", this.versioned(warmPoolPath(image)), { depth: options.depth }));
+  }
+
+  async getWarmPool(image: string): Promise<WarmPool> {
+    return fromApiWarmPool(await this.doJSON<ApiWarmPool>("GET", this.versioned(warmPoolPath(image))));
+  }
+
+  async listWarmPools(): Promise<WarmPool[]> {
+    const response = await this.doJSON<{ pools: ApiWarmPool[] | null }>("GET", this.versioned("/warm-pools"));
+    return (response.pools ?? []).map(fromApiWarmPool);
+  }
+
+  async deleteWarmPool(image: string): Promise<void> {
+    await this.doJSON<void>("DELETE", this.versioned(warmPoolPath(image)));
   }
 
   async createTemplate(options: CreateTemplateOptions): Promise<Template> {

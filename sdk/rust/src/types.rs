@@ -1167,6 +1167,82 @@ where
     Ok(Option::<Vec<EgressProfile>>::deserialize(d)?.unwrap_or_default())
 }
 
+/// A warm-pool entry: how many ready sandboxes every server with a warm pool
+/// keeps for one image. The server's `SB_DOCKER_POOL_*` /
+/// `SB_CONTAINERD_POOL_*` settings stay the default for every other image.
+/// Admin only.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+pub struct WarmPool {
+    /// The image, exactly as creates name it (`python:3.12`, `ghcr.io/acme/agent:1`).
+    pub image: String,
+    /// Warm slots each server keeps for this image; 0 turns warming off for it.
+    #[serde(default)]
+    pub depth: u32,
+    /// Goes up by one on every change; the same put twice leaves it alone.
+    #[serde(default)]
+    pub generation: i64,
+    #[serde(default)]
+    pub created_at: String,
+    #[serde(default)]
+    pub updated_at: String,
+    /// How full the pools are. Set by `get_warm_pool` and `list_warm_pools`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<WarmPoolStatus>,
+}
+
+/// The body of `put_warm_pool`: a full replace.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+pub struct WarmPoolOptions {
+    /// Warm slots each server keeps for this image (0 to 128).
+    pub depth: u32,
+}
+
+/// Ready and target slots in total, and on each server that runs a warm pool.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+pub struct WarmPoolStatus {
+    #[serde(default)]
+    pub ready: u32,
+    #[serde(default)]
+    pub target: u32,
+    #[serde(default, deserialize_with = "null_as_empty_servers")]
+    pub servers: Vec<WarmPoolServerStatus>,
+}
+
+/// One server's pool for an image.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+pub struct WarmPoolServerStatus {
+    pub node_id: String,
+    #[serde(default)]
+    pub ready: u32,
+    #[serde(default)]
+    pub target: u32,
+    /// The server's last report is too old to trust; the numbers are its last ones.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub stale: bool,
+}
+
+fn null_as_empty_servers<'de, D>(d: D) -> Result<Vec<WarmPoolServerStatus>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<Vec<WarmPoolServerStatus>>::deserialize(d)?.unwrap_or_default())
+}
+
+/// The wire shape of `GET /v1/warm-pools`; `list_warm_pools` returns the
+/// entries themselves.
+#[derive(Deserialize, Debug, Default)]
+pub(crate) struct WarmPoolListWire {
+    #[serde(default, deserialize_with = "null_as_empty_pools")]
+    pub pools: Vec<WarmPool>,
+}
+
+fn null_as_empty_pools<'de, D>(d: D) -> Result<Vec<WarmPool>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<Vec<WarmPool>>::deserialize(d)?.unwrap_or_default())
+}
+
 /// One destination a learn-mode sandbox reached.
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
 pub struct NetworkLearnedEntry {

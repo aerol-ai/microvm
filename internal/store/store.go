@@ -456,6 +456,17 @@ func open(path string, secretCipher *secrets.Cipher) (*Store, error) {
 			PRIMARY KEY (sandbox_id, profile)
 		);`,
 		`CREATE INDEX IF NOT EXISTS idx_sandbox_egress_profiles_ref ON sandbox_egress_profiles(owner_ref, profile);`,
+		// warm_pools are the API warm-pool entries (plans/agent-sandbox-
+		// feature-parity.md W1): one row per image, fleet-wide operator
+		// config with no owner. This table is the single-node store; a
+		// cluster keeps them in the Raft FSM (fsm_warm_pools.go).
+		`CREATE TABLE IF NOT EXISTS warm_pools (
+			image TEXT PRIMARY KEY,
+			depth INTEGER NOT NULL DEFAULT 0,
+			generation INTEGER NOT NULL DEFAULT 1,
+			created_at DATETIME NOT NULL,
+			updated_at DATETIME NOT NULL
+		);`,
 		// api_tokens are scoped API tokens (plans/identity-and-access.md
 		// §5.4): this table is the single-node store, a cluster keeps them
 		// in the Raft FSM. Only SHA-256 of the secret is stored, never the

@@ -49,6 +49,9 @@ func (p *Pool) Run(ctx context.Context, cfg RefillConfig, spawner Spawner, gate 
 }
 
 func (p *Pool) refillTick(parent context.Context, cfg RefillConfig, spawner Spawner, gate RefillGate) {
+	// An entry whose depth went down gives its extra slots back first, so
+	// their park reservations are free before this tick parks anything.
+	p.destroySlots(parent, p.trimExcess())
 	targets := p.ListTargets()
 	for _, key := range targets {
 		ks := key.KeyString()
@@ -89,7 +92,16 @@ func (p *Pool) refillTick(parent context.Context, cfg RefillConfig, spawner Spaw
 				break
 			}
 			p.ClearSpawnFailures(ks)
-			p.RecordLoaded(slot)
+			if !p.recordParked(slot) {
+				// The entry was deleted while this park ran: nothing will
+				// ever acquire this slot, so give back its container and
+				// the reservation this tick took for it.
+				_ = spawner.DestroyParked(context.WithoutCancel(parent), slot)
+				if gate != nil {
+					gate.ReleasePark(slotID)
+				}
+				break
+			}
 			if p.metrics != nil {
 				p.metrics.recordRefill()
 			}

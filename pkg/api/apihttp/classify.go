@@ -227,6 +227,19 @@ func Classify(err error) Classification {
 	case errors.Is(err, service.ErrPublicTrafficDisabled):
 		return Classification{Status: http.StatusConflict, Message: err.Error()}
 
+	// Warm pools (plans/agent-sandbox-feature-parity.md W1).
+	case errors.Is(err, service.ErrWarmPoolNotFound):
+		return Classification{Status: http.StatusNotFound, Message: "warm pool not found"}
+	case errors.Is(err, models.ErrWarmPoolInvalid):
+		return Classification{Status: http.StatusBadRequest, Message: truncate(err.Error())}
+	case errors.Is(err, service.ErrWarmPoolLimit):
+		return Classification{Status: http.StatusConflict, Message: service.ErrWarmPoolLimit.Error()}
+	case errors.Is(err, service.ErrWarmPoolsUnavailable):
+		// The cause can name a peer's internal address: it goes to this
+		// node's log, the caller gets what to do.
+		return Classification{Status: http.StatusServiceUnavailable, RetryAfter: 5, Log: true, LogLevel: slog.LevelWarn,
+			Message: "warm pools are unavailable right now (no cluster leader, a rolling upgrade in progress, or the server tier out of reach); retry shortly"}
+
 	// API tokens (plans/identity-and-access.md §5.4, finding 5.6).
 	case errors.Is(err, service.ErrAPITokenInvalid):
 		return Classification{Status: http.StatusBadRequest, Message: err.Error()}

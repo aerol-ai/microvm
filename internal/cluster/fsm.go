@@ -55,7 +55,8 @@ const (
 	// the leader (storage_obligations.go).
 	// 26 is opReportStorageObligations (storage_obligations.go); 27/28 are the
 	// egress-profile ops (fsm_egress_profiles.go); 31/32 are the API-token
-	// ops (fsm_tokens.go). The next free code is 33.
+	// ops (fsm_tokens.go); 33/34 are the warm-pool ops (fsm_warm_pools.go).
+	// The next free code is 35.
 	opRegisterSnapshotNode opCode = 29 // record which node holds a snapshot's image (name → node, cluster-wide)
 	opForgetSnapshotNode   opCode = 30 // drop a snapshot's name → node entry (on delete / node death)
 )
@@ -209,6 +210,9 @@ type command struct {
 	// (fsm_tokens.go).
 	APIToken   *identity.TokenRecord `json:"api_token,omitempty"`
 	APITokenID string                `json:"api_token_id,omitempty"`
+	// WarmPool carries the entry for opPutWarmPool, and its image for
+	// opDeleteWarmPool (fsm_warm_pools.go).
+	WarmPool *WarmPoolRecord `json:"warm_pool,omitempty"`
 }
 
 type reservationCommand struct {
@@ -546,6 +550,11 @@ type placementFSM struct {
 	// lock: token reads on the request path never take mu.
 	tokens       *apiTokenState
 	apiTokenInit sync.Once
+	// warmPools are the replicated warm-pool entries by image
+	// (fsm_warm_pools.go, snapshotted). warmPoolsVersion is the Raft index
+	// of the last change to them, the cursor workers poll with.
+	warmPools        map[string]*WarmPoolRecord
+	warmPoolsVersion uint64
 
 	// subMu guards subscribers. Separate from mu so a slow subscriber accept
 	// can't block FSM reads — Apply takes mu briefly to write, releases it,
@@ -635,6 +644,7 @@ func newPlacementFSMWithRecoveryStore(store placementRecoveryStore) *placementFS
 		egressProfiles:               make(map[EgressProfileKey]*EgressProfileRecord),
 		egressProfileRefs:            make(map[EgressProfileKey]map[string]struct{}),
 		tokens:                       newAPITokenState(),
+		warmPools:                    make(map[string]*WarmPoolRecord),
 	}
 }
 
@@ -1767,6 +1777,17 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 		return result
 	case opDeleteAPIToken:
 		if err := f.applyDeleteAPITokenLocked(cmd); err != nil {
+			return err
+		}
+		return nil
+	case opPutWarmPool:
+		result, err := f.applyPutWarmPoolLocked(cmd)
+		if err != nil {
+			return err
+		}
+		return result
+	case opDeleteWarmPool:
+		if err := f.applyDeleteWarmPoolLocked(cmd); err != nil {
 			return err
 		}
 		return nil
@@ -3419,6 +3440,12 @@ type fsmSnapshotPayload struct {
 	// Optional; an older snapshot decodes it as nil, which reads as "no
 	// tokens". An older build decoding a newer snapshot ignores the field.
 	APITokens []identity.TokenRecord
+	// WarmPools is the replicated warm-pool entry set. Optional; an older
+	// snapshot decodes it as nil, which reads as "no entries". An older
+	// build decoding a newer snapshot ignores the field, which is safe
+	// because no entry can be written until every server runs a build with
+	// it (warmPoolFSMOpsVersion).
+	WarmPools []WarmPoolRecord
 }
 
 type placementSnapshotRow struct {
@@ -3498,6 +3525,7 @@ func (f *placementFSM) Snapshot() (raft.FSMSnapshot, error) {
 		egressProfiles:     f.egressProfilesSnapshotLocked(),
 		snapshotNodes:      snapshotNodes,
 		apiTokens:          f.apiTokens().snapshot(),
+		warmPools:          f.warmPoolsSnapshotLocked(),
 		recoveryStore:      f.recoveryStore,
 		recoveryRefs:       recoveryRefs,
 	}, nil
@@ -3580,6 +3608,7 @@ func (f *placementFSM) Restore(rc io.ReadCloser) (err error) {
 	f.egressProfileRefs = make(map[EgressProfileKey]map[string]struct{})
 	f.restoreEgressProfilesLocked(payload.EgressProfiles)
 	f.apiTokens().restore(payload.APITokens, payload.Version)
+	f.restoreWarmPoolsLocked(payload.WarmPools, payload.Version)
 	f.auditACLs = make(map[string]AuditACL, len(payload.AuditACLs))
 	f.auditACLLatest = make(map[string]string)
 	f.auditACLBySandbox = make(map[string]map[string]struct{})
@@ -3732,6 +3761,7 @@ type fsmSnapshot struct {
 	egressProfiles     []EgressProfileRecord
 	snapshotNodes      map[string]string
 	apiTokens          []identity.TokenRecord
+	warmPools          []WarmPoolRecord
 	recoveryStore      placementRecoveryStore
 	recoveryRefs       []string
 }
@@ -3757,6 +3787,7 @@ func (s *fsmSnapshot) Persist(sink raft.SnapshotSink) (err error) {
 		EgressProfiles:     s.egressProfiles,
 		SnapshotNodes:      s.snapshotNodes,
 		APITokens:          s.apiTokens,
+		WarmPools:          s.warmPools,
 	}); err != nil {
 		_ = sink.Cancel()
 		return fmt.Errorf("fsmSnapshot: encode: %w", err)

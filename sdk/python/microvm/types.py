@@ -745,6 +745,47 @@ class EgressProfileList(TypedDict, total=False):
     nextCursor: str
 
 
+class WarmPoolServerStatus(TypedDict, total=False):
+    nodeId: str
+    ready: int
+    target: int
+    # The server's last report is too old to trust; the numbers are its last ones.
+    stale: bool
+
+
+class WarmPoolStatus(TypedDict):
+    """Ready and target slots in total, and on each server that runs a warm pool."""
+
+    ready: int
+    target: int
+    servers: List[WarmPoolServerStatus]
+
+
+class WarmPool(TypedDict, total=False):
+    """A warm-pool entry: how many ready sandboxes every server with a warm
+    pool keeps for one image. The server's SB_DOCKER_POOL_* /
+    SB_CONTAINERD_POOL_* settings stay the default for every other image.
+    Admin only."""
+
+    # The image, exactly as creates name it (python:3.12, ghcr.io/acme/agent:1).
+    image: str
+    # Warm slots each server keeps for this image; 0 turns warming off for it.
+    depth: int
+    # Goes up by one on every change; the same put twice leaves it alone.
+    generation: int
+    createdAt: str
+    updatedAt: str
+    # How full the pools are. Set by get_warm_pool and list_warm_pools.
+    status: WarmPoolStatus
+
+
+class WarmPoolOptions(TypedDict, total=False):
+    """The body of ``put_warm_pool``: a full replace."""
+
+    # Warm slots each server keeps for this image (0 to 128).
+    depth: int
+
+
 class NetworkPolicyOptions(TypedDict, total=False):
     """A sandbox's whole egress policy, for ``set_network_policy``.
 

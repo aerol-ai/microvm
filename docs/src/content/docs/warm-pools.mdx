@@ -1,0 +1,192 @@
+---
+title: Warm pools
+description: Keep ready sandboxes waiting for the images you use most, so a create starts in tens of milliseconds.
+---
+
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+
+A warm pool keeps a few sandboxes started and waiting for an image. When you create a sandbox from that image, AerolVM hands you one of the waiting sandboxes instead of starting a new one. On our test servers that takes about 40 ms instead of a few hundred.
+
+A **warm-pool entry** tells every server how many waiting sandboxes to keep for one image. You add, change and remove entries with the SDK. Only an admin can do this: the server token, or a token or sign-in with the `admin` role for every team.
+
+## Before you start
+
+Warm pools are off by default. A server keeps waiting sandboxes only when its operator turned the pool on:
+
+- Docker servers: `SB_DOCKER_POOL_ENABLED=true`
+- containerd servers: `SB_CONTAINERD_POOL_ENABLED=true`
+
+Both also need the ready socket, which is on unless the operator set `SB_DOCKER_READY_SOCKET_ENABLED=false`. A server with the pool off keeps your entries but warms nothing. Its settings `SB_DOCKER_POOL_DEPTH` and `SB_DOCKER_POOL_IMAGES` (or the `SB_CONTAINERD_POOL_*` ones) stay the default for every image that has no entry.
+
+## Add an entry
+
+Name the image exactly as your creates name it, and say how many waiting sandboxes each server should keep. Calling it again with the same values changes nothing, so it is safe to run on every deploy.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const pool = await client.putWarmPool('python:3.12', { depth: 4 })
+    console.log(pool.image, pool.depth, pool.generation)
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    pool = client.put_warm_pool('python:3.12', {'depth': 4})
+    print(pool['image'], pool['depth'], pool['generation'])
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    pool, err := client.PutWarmPool(ctx, "python:3.12", sdktypes.WarmPoolOptions{Depth: 4})
+    if err != nil {
+        return err
+    }
+    fmt.Println(pool.Image, pool.Depth, pool.Generation)
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    let pool = client.put_warm_pool("python:3.12", WarmPoolOptions { depth: 4 })?;
+    println!("{} {} {}", pool.image, pool.depth, pool.generation);
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    WarmPool pool = client.putWarmPool("python:3.12", new WarmPoolOptions().setDepth(4));
+    System.out.println(pool.image + " " + pool.depth + " " + pool.generation);
+    ```
+  </TabItem>
+</Tabs>
+
+`depth` is per server, from 0 to 128. A cluster of three servers with `depth: 4` keeps up to 12 waiting sandboxes for that image. A depth of 0 turns warming off for that image, even if the server's own settings would warm it.
+
+Each waiting sandbox holds the CPU, memory and disk of a default sandbox. When a server is full, it gives waiting sandboxes back to make room for a real create, so a warm pool never blocks a create.
+
+A deployment can have at most 32 entries. Adding one more fails with HTTP 409.
+
+## Check how full the pools are
+
+`getWarmPool` and `listWarmPools` return each entry with its `status`: how many sandboxes are `ready` and the `target`, in total and for each server. Right after you add an entry, `ready` is 0. It climbs to the target as each server starts its sandboxes, which takes a few seconds per sandbox.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const pool = await client.getWarmPool('python:3.12')
+    console.log(`${pool.status?.ready} of ${pool.status?.target} ready`)
+    for (const server of pool.status?.servers ?? []) {
+      console.log(server.nodeId, server.ready, server.target)
+    }
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    pool = client.get_warm_pool('python:3.12')
+    status = pool['status']
+    print(f"{status['ready']} of {status['target']} ready")
+    for server in status['servers']:
+        print(server['nodeId'], server['ready'], server['target'])
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    pool, err := client.GetWarmPool(ctx, "python:3.12")
+    if err != nil {
+        return err
+    }
+    fmt.Printf("%d of %d ready\n", pool.Status.Ready, pool.Status.Target)
+    for _, server := range pool.Status.Servers {
+        fmt.Println(server.NodeID, server.Ready, server.Target)
+    }
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    let pool = client.get_warm_pool("python:3.12")?;
+    if let Some(status) = &pool.status {
+        println!("{} of {} ready", status.ready, status.target);
+        for server in &status.servers {
+            println!("{} {} {}", server.node_id, server.ready, server.target);
+        }
+    }
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    WarmPool pool = client.getWarmPool("python:3.12");
+    System.out.println(pool.status.ready + " of " + pool.status.target + " ready");
+    for (WarmPoolServerStatus server : pool.status.servers) {
+        System.out.println(server.nodeId + " " + server.ready + " " + server.target);
+    }
+    ```
+  </TabItem>
+</Tabs>
+
+Only servers that run a warm pool appear in `servers`. A server marked `stale` has not reported for a while; its numbers are the last ones it sent.
+
+## Create from a warm pool
+
+There is nothing new to call. Create a sandbox from the image as usual, and a server with a waiting sandbox hands it to you.
+
+A create can only take a waiting sandbox when it asks for nothing that a waiting sandbox does not already have. These settings make the create start a new sandbox instead:
+
+- environment variables, mounts or volumes
+- a user other than `root`, or a custom start command
+- a private-registry login
+- a GPU
+- on Docker servers that limit disk size, a disk size other than the default
+
+The image name must match the entry exactly. An entry for `python:3.12` does not serve a create of `docker.io/library/python:3.12`.
+
+## Remove an entry
+
+Removing an entry stops the servers from keeping sandboxes for that image, and removes the ones that were waiting. If the image is also in the server's own `SB_DOCKER_POOL_IMAGES` list, the server goes back to its default depth instead. Removing an entry that does not exist succeeds, so it is safe to retry.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    await client.deleteWarmPool('python:3.12')
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    client.delete_warm_pool('python:3.12')
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    if err := client.DeleteWarmPool(ctx, "python:3.12"); err != nil {
+        return err
+    }
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    client.delete_warm_pool("python:3.12")?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    client.deleteWarmPool("python:3.12");
+    ```
+  </TabItem>
+</Tabs>
+
+## In a cluster
+
+Entries are stored once for the whole cluster, so you can call any server. Every server with a warm pool picks up a change within about 10 seconds; the server you called usually picks it up at once.
+
+While a cluster is being upgraded, adding or removing an entry fails with HTTP 503 until every control-plane server runs a version that knows about warm pools. Try again once the upgrade is done.
+
+A cluster refuses an image that only one server has, such as an image you built with `buildImage` or a snapshot's image, because the other servers could never start it.
+
+## Errors
+
+| Status | Meaning |
+|---|---|
+| 400 | The image name or the depth is not valid. |
+| 403 | Your credential is not an admin for every team. |
+| 404 | `getWarmPool`: there is no entry for that image. |
+| 409 | `putWarmPool`: there are already 32 entries. |
+| 503 | The cluster cannot store the change right now (no leader yet, or an upgrade in progress). Try again. |
+
+Every call is safe to retry, and the SDKs retry the same errors they retry for other calls.

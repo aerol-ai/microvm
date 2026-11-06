@@ -39,6 +39,9 @@ import ai.aerol.microvm.model.EgressProfile;
 import ai.aerol.microvm.model.EgressProfileList;
 import ai.aerol.microvm.model.EgressProfileOptions;
 import ai.aerol.microvm.model.ListEgressProfilesOptions;
+import ai.aerol.microvm.model.WarmPool;
+import ai.aerol.microvm.model.WarmPoolList;
+import ai.aerol.microvm.model.WarmPoolOptions;
 import ai.aerol.microvm.model.ListSnapshotsOptions;
 import ai.aerol.microvm.model.NetworkLearned;
 import ai.aerol.microvm.model.NetworkLearnedEntry;
@@ -854,6 +857,63 @@ public class MicroVMClient {
             profile.allowOut = new ArrayList<>();
         }
         return profile;
+    }
+
+    // Warm pools are PUT/GET/DELETE of one entry: every call is safe to
+    // retry, so they keep the default (idempotent) retry tier.
+
+    /**
+     * Sets how many ready sandboxes every server with a warm pool keeps for an
+     * image (a full replace: the same call twice is a no-op). A create that
+     * names the image then starts from a warm sandbox. Admin only.
+     */
+    public WarmPool putWarmPool(String image, WarmPoolOptions options) {
+        WarmPoolOptions body = options == null ? new WarmPoolOptions() : options;
+        return withWarmPoolDefaults(doJson("PUT", warmPoolPath(image), body, WarmPool.class));
+    }
+
+    /** Reads an image's warm-pool entry with its status (ready and target, in total and per server). */
+    public WarmPool getWarmPool(String image) {
+        return withWarmPoolDefaults(doJson("GET", warmPoolPath(image), null, WarmPool.class));
+    }
+
+    /** Reads every warm-pool entry, by image, with its status. */
+    public List<WarmPool> listWarmPools() {
+        WarmPoolList list = doJson("GET", versioned("/warm-pools"), null, WarmPoolList.class);
+        List<WarmPool> out = new ArrayList<>();
+        if (list != null && list.pools != null) {
+            for (WarmPool pool : list.pools) {
+                out.add(withWarmPoolDefaults(pool));
+            }
+        }
+        return out;
+    }
+
+    /** Deletes an image's warm-pool entry; its warm sandboxes are removed. Deleting a missing entry succeeds. */
+    public void deleteWarmPool(String image) {
+        doNoContent("DELETE", warmPoolPath(image), null);
+    }
+
+    // An image is the rest of the path: each segment is escaped and the
+    // slashes kept, so no proxy has an encoded slash to rewrite. URLEncoder is
+    // a form encoder, so its '+' for a space becomes %20 for a path.
+    private String warmPoolPath(String image) {
+        String[] segments = (image == null ? "" : image).split("/", -1);
+        StringBuilder path = new StringBuilder("/warm-pools/");
+        for (int i = 0; i < segments.length; i++) {
+            if (i > 0) {
+                path.append('/');
+            }
+            path.append(URLEncoder.encode(segments[i], StandardCharsets.UTF_8).replace("+", "%20"));
+        }
+        return versioned(path.toString());
+    }
+
+    private static WarmPool withWarmPoolDefaults(WarmPool pool) {
+        if (pool != null && pool.status != null && pool.status.servers == null) {
+            pool.status.servers = new ArrayList<>();
+        }
+        return pool;
     }
 
     public AuditPage getAudit(String sandboxId) {

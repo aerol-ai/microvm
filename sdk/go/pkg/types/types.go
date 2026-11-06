@@ -242,6 +242,20 @@ type EgressProfileList = models.EgressProfileList
 // a sandbox (Sandbox.EgressProfilesApplied).
 type EgressProfileRef = models.EgressProfileRef
 
+// WarmPool is a warm-pool entry: how many ready sandboxes every server with a
+// warm pool keeps for one image. Status is set by GetWarmPool and
+// ListWarmPools.
+type WarmPool = models.WarmPool
+
+// WarmPoolOptions is the body of PutWarmPool: a full replace.
+type WarmPoolOptions = models.WarmPoolRequest
+
+// WarmPoolStatus is ready and target slots in total and per server.
+type WarmPoolStatus = models.WarmPoolStatus
+
+// WarmPoolServerStatus is one server's pool for an image.
+type WarmPoolServerStatus = models.WarmPoolServerStatus
+
 // ListEgressProfilesOptions pages ListEgressProfiles.
 type ListEgressProfilesOptions struct {
 	Cursor string

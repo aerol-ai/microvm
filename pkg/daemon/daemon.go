@@ -354,6 +354,11 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 	} else if ctd != nil {
 		ctdWiring = ctd
 		defer ctd.Stop()
+		if ctd.warm != nil {
+			// API warm-pool entries (W1) configure this pool per image;
+			// StartWarmPoolSync below applies them.
+			svc.RegisterWarmPool(ctd.warm, cfg.Runtime)
+		}
 	}
 	// Wire the control-plane usage reporter into the service's background loops
 	// (reconcile / event monitor / netstats / live sampler). Under
@@ -387,6 +392,9 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 	dockerWarmPool := wireDockerWarmPool(ctx, cfg, logger, dockerClient, admitter)
 	if dockerWarmPool != nil {
 		defer func() { drainDockerWarmPool(dockerWarmPool, logger) }()
+		// Keys carry cfg.Runtime, as the SB_DOCKER_POOL_IMAGES pins do, so
+		// an entry's slots match a create that names only the image.
+		svc.RegisterWarmPool(dockerWarmPool, cfg.Runtime)
 	}
 	netnsPool := wireDockerNetnsPool(ctx, cfg, logger, dockerClient)
 	if netnsPool != nil {
@@ -1024,6 +1032,10 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 	if err := svc.StartAPITokens(ctx); err != nil {
 		return err
 	}
+	// API warm-pool entries (plans/agent-sandbox-feature-parity.md W1).
+	// After AttachCluster, so a cluster node reads the replicated entries
+	// rather than its own store. A node with no warm pool starts nothing.
+	svc.StartWarmPoolSync(ctx)
 	// The chain runs the avm_ token authenticator before the OIDC verifier
 	// (§5.2). The verifier and the sign-in discovery issuers are wired only
 	// when an identity file is configured (SB_IDENTITY_FILE).

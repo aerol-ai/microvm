@@ -1954,6 +1954,46 @@ test("egress profile CRUD maps the wire shape", async () => {
   assert.equal(seen[4].method, "DELETE");
 });
 
+test("warm pool CRUD maps the wire shape and keeps an image's slashes", async () => {
+  const seen: { method: string; url: string; body?: unknown }[] = [];
+  const wire = {
+    image: "ghcr.io/acme/agent:1",
+    depth: 2,
+    generation: 1,
+    created_at: "c",
+    updated_at: "u",
+    status: { ready: 3, target: 4, servers: [{ node_id: "n1", ready: 2, target: 2 }, { node_id: "n2", ready: 1, target: 2, stale: true }] },
+  };
+  const client = new APIClient({
+    baseURL: "https://api.example.com",
+    patToken: "pat-token",
+    fetch: async (input, init) => {
+      const req = new Request(input, init);
+      seen.push({ method: req.method, url: req.url, body: init?.body ? JSON.parse(String(init.body)) : undefined });
+      if (req.method === "DELETE") return new Response(null, { status: 204 });
+      if (req.method === "PUT") return jsonResponse({ ...wire, status: undefined });
+      if (req.url.endsWith("/warm-pools")) return jsonResponse({ pools: seen.length > 3 ? null : [wire] });
+      return jsonResponse(wire);
+    },
+  });
+  const put = await client.putWarmPool("ghcr.io/acme/agent:1", { depth: 2 });
+  assert.deepEqual(put, { image: "ghcr.io/acme/agent:1", depth: 2, generation: 1, createdAt: "c", updatedAt: "u" });
+  assert.deepEqual(seen[0], { method: "PUT", url: "https://api.example.com/v1/warm-pools/ghcr.io/acme/agent%3A1", body: { depth: 2 } });
+  const got = await client.getWarmPool("ghcr.io/acme/agent:1");
+  assert.deepEqual(got.status, {
+    ready: 3,
+    target: 4,
+    servers: [
+      { nodeId: "n1", ready: 2, target: 2 },
+      { nodeId: "n2", ready: 1, target: 2, stale: true },
+    ],
+  });
+  assert.equal((await client.listWarmPools())[0].status?.servers.length, 2);
+  assert.deepEqual(await client.listWarmPools(), []);
+  await client.deleteWarmPool("python:3.12");
+  assert.deepEqual(seen[4], { method: "DELETE", url: "https://api.example.com/v1/warm-pools/python%3A3.12", body: undefined });
+});
+
 test("sandboxes carry their egress profiles", async () => {
   let body: Record<string, unknown> = {};
   const client = new APIClient({

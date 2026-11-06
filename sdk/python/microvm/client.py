@@ -66,6 +66,10 @@ from .types import (
     EgressProfileOptions,
     EgressRule,
     ListEgressProfilesOptions,
+    WarmPool,
+    WarmPoolOptions,
+    WarmPoolServerStatus,
+    WarmPoolStatus,
     NetworkLearned,
     NetworkPolicy,
     NetworkPolicyCheckOptions,
@@ -1400,6 +1404,35 @@ class MicroVM:
 
     def _egress_profile_path(self, name: str) -> str:
         return f"{self._version_prefix}/egress-profiles/{urllib.parse.quote(name, safe='')}"
+
+    # Warm pools are PUT/GET/DELETE of one entry: every call is safe to
+    # retry, so they keep the default (idempotent) retry tier.
+    def put_warm_pool(self, image: str, options: WarmPoolOptions) -> WarmPool:
+        """Set how many ready sandboxes every server with a warm pool keeps
+        for an image (a full replace: the same call twice is a no-op). A
+        create that names the image then starts from a warm sandbox. Admin only."""
+        body: Dict[str, Any] = {"depth": int(_first_of(options, "depth") or 0)}
+        return _from_api_warm_pool(self._do_json("PUT", self._warm_pool_path(image), body) or {})
+
+    def get_warm_pool(self, image: str) -> WarmPool:
+        """An image's warm-pool entry with its status (ready and target, per server)."""
+        return _from_api_warm_pool(self._do_json("GET", self._warm_pool_path(image), None) or {})
+
+    def list_warm_pools(self) -> List[WarmPool]:
+        """Every warm-pool entry, by image, with its status."""
+        payload = self._do_json("GET", f"{self._version_prefix}/warm-pools", None) or {}
+        return [_from_api_warm_pool(p) for p in payload.get("pools") or []]
+
+    def delete_warm_pool(self, image: str) -> None:
+        """Delete an image's warm-pool entry; its warm sandboxes are removed.
+        Deleting a missing entry succeeds."""
+        self._do_json("DELETE", self._warm_pool_path(image), None)
+
+    def _warm_pool_path(self, image: str) -> str:
+        # The image is the rest of the path: each segment is escaped and the
+        # slashes kept, so no proxy has an encoded slash to rewrite.
+        segments = "/".join(urllib.parse.quote(part, safe="") for part in image.split("/"))
+        return f"{self._version_prefix}/warm-pools/{segments}"
 
     def whoami(self) -> WhoAmI:
         """Who the server says the caller is: principal, role, team and when
@@ -3043,6 +3076,35 @@ def _from_api_egress_profile(payload: Dict[str, Any]) -> EgressProfile:
     }
     if payload.get("description"):
         result["description"] = str(payload["description"])
+    return result
+
+
+def _from_api_warm_pool(payload: Dict[str, Any]) -> WarmPool:
+    result: WarmPool = {
+        "image": str(payload.get("image") or ""),
+        "depth": int(payload.get("depth") or 0),
+        "generation": int(payload.get("generation") or 0),
+        "createdAt": str(payload.get("created_at") or ""),
+        "updatedAt": str(payload.get("updated_at") or ""),
+    }
+    status = payload.get("status")
+    if isinstance(status, dict):
+        servers: List[WarmPoolServerStatus] = []
+        for srv in status.get("servers") or []:
+            server: WarmPoolServerStatus = {
+                "nodeId": str(srv.get("node_id") or ""),
+                "ready": int(srv.get("ready") or 0),
+                "target": int(srv.get("target") or 0),
+            }
+            if srv.get("stale"):
+                server["stale"] = True
+            servers.append(server)
+        status_out: WarmPoolStatus = {
+            "ready": int(status.get("ready") or 0),
+            "target": int(status.get("target") or 0),
+            "servers": servers,
+        }
+        result["status"] = status_out
     return result
 
 

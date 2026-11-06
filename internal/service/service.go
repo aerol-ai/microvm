@@ -523,6 +523,19 @@ type Service struct {
 	// (single node). A cluster swaps in its Raft-backed store.
 	egressProfiles egressProfileBackend
 
+	// Warm-pool entries (warm_pools.go). warmPoolStore replaces the backend
+	// in tests; nil picks the store or the cluster. warmPoolTargets are this
+	// node's pools; the sync loop's cursor and failure state sit beside them
+	// under warmPoolMu.
+	warmPoolStore       warmPoolBackend
+	warmPoolMu          sync.Mutex
+	warmPoolTargets     []registeredWarmPool
+	warmPoolSyncVersion uint64
+	warmPoolSyncBehind  int
+	warmPoolSyncFailing bool
+	warmPoolKick        chan struct{}
+	warmPoolKickOnce    sync.Once
+
 	// API tokens (api_tokens.go). apiTokenSet is the single-node in-memory
 	// index the request path reads; apiTokenMirror is the token copy on a
 	// cluster node without Raft state (nil elsewhere). apiTokenEntropy and
@@ -6012,6 +6025,9 @@ func (s *Service) Capacity() capacity.Snapshot {
 		snap.LocalWasmModuleIDs = refs
 	}
 	snap.EgressGatewayReady = s.EgressGatewayReady()
+	// Warm-pool entry status: how GET /v1/warm-pools on any node reports
+	// this one, with no fan-out (W1).
+	snap.WarmPools = s.localWarmPoolStatus()
 	// Network-slot pools: a peer with CPU and memory to spare can still be
 	// full for a runtime, and placement can only skip it if we say so.
 	snap.SlotPools = s.LocalSlotPools(context.Background())

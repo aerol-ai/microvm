@@ -931,6 +931,45 @@ export interface EgressProfileList {
   nextCursor?: string;
 }
 
+/**
+ * A warm-pool entry: how many ready sandboxes every server with a warm pool
+ * keeps for one image. The server's `SB_DOCKER_POOL_*` / `SB_CONTAINERD_POOL_*`
+ * settings stay the default for every other image. Admin only.
+ */
+export interface WarmPool {
+  /** The image, exactly as creates name it (`python:3.12`, `ghcr.io/acme/agent:1`). */
+  image: string;
+  /** Warm slots each server keeps for this image. 0 turns warming off for it. */
+  depth: number;
+  /** Goes up by one on every change; the same `putWarmPool` twice leaves it alone. */
+  generation: number;
+  createdAt: string;
+  updatedAt: string;
+  /** How full the pools are. Set by `getWarmPool` and `listWarmPools`. */
+  status?: WarmPoolStatus;
+}
+
+/** The body of `putWarmPool`: a full replace. */
+export interface WarmPoolOptions {
+  /** Warm slots each server keeps for this image (0 to 128). */
+  depth: number;
+}
+
+/** Ready and target slots in total, and on each server that runs a warm pool. */
+export interface WarmPoolStatus {
+  ready: number;
+  target: number;
+  servers: WarmPoolServerStatus[];
+}
+
+export interface WarmPoolServerStatus {
+  nodeId: string;
+  ready: number;
+  target: number;
+  /** The server's last report is too old to trust; the numbers are its last ones. */
+  stale?: boolean;
+}
+
 /** Who the caller is, as `microvm.whoami()` reports it. */
 export interface WhoAmIPrincipal {
   /** `"operator"`, `"token"`, `"oidc"`, `"controlplane"`, ... */

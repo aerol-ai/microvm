@@ -1652,3 +1652,29 @@ test("Sandbox exec reports a timed-out command", async () => {
   assert.equal(result.timedOut, true);
   assert.equal(result.exitCode, -1);
 });
+
+test("MicroVM exposes the warm-pool admin calls", async () => {
+  const calls: string[] = [];
+  const pool = { image: "python:3.12", depth: 1, generation: 1, created_at: "c", updated_at: "u" };
+  const sdk = new MicroVM({
+    patToken: "pat-token",
+    apiUrl: "https://api.example.com",
+    fetch: async (input, init) => {
+      const request = new Request(input, init);
+      calls.push(`${request.method} ${new URL(request.url).pathname}`);
+      if (request.method === "DELETE") return new Response(null, { status: 204 });
+      const body = request.method === "GET" && request.url.endsWith("/warm-pools") ? { pools: [pool] } : pool;
+      return new Response(JSON.stringify(body), { status: 200, headers: { "content-type": "application/json" } });
+    },
+  });
+  assert.equal((await sdk.putWarmPool("python:3.12", { depth: 1 })).depth, 1);
+  assert.equal((await sdk.getWarmPool("python:3.12")).image, "python:3.12");
+  assert.equal((await sdk.listWarmPools()).length, 1);
+  await sdk.deleteWarmPool("python:3.12");
+  assert.deepEqual(calls, [
+    "PUT /v1/warm-pools/python%3A3.12",
+    "GET /v1/warm-pools/python%3A3.12",
+    "GET /v1/warm-pools",
+    "DELETE /v1/warm-pools/python%3A3.12",
+  ]);
+});

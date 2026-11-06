@@ -429,6 +429,30 @@ func (c *Client) DeleteEgressProfile(ctx context.Context, name string) error {
 	return c.inner.DeleteEgressProfile(ctx, name)
 }
 
+// PutWarmPool sets how many ready sandboxes every server with a warm pool
+// keeps for an image (a full replace: the same call twice is a no-op). A
+// create that names the image then starts from a warm sandbox. Admin only.
+func (c *Client) PutWarmPool(ctx context.Context, image string, opts sdktypes.WarmPoolOptions) (sdktypes.WarmPool, error) {
+	return c.inner.PutWarmPool(ctx, image, opts)
+}
+
+// GetWarmPool reads an image's warm-pool entry with its status (ready and
+// target, in total and per server).
+func (c *Client) GetWarmPool(ctx context.Context, image string) (sdktypes.WarmPool, error) {
+	return c.inner.GetWarmPool(ctx, image)
+}
+
+// ListWarmPools reads every warm-pool entry, by image, with its status.
+func (c *Client) ListWarmPools(ctx context.Context) ([]sdktypes.WarmPool, error) {
+	return c.inner.ListWarmPools(ctx)
+}
+
+// DeleteWarmPool deletes an image's warm-pool entry; its warm sandboxes are
+// removed. Deleting a missing entry succeeds.
+func (c *Client) DeleteWarmPool(ctx context.Context, image string) error {
+	return c.inner.DeleteWarmPool(ctx, image)
+}
+
 func (c *Client) Start(ctx context.Context, id string) (*Sandbox, error) {
 	item, err := c.inner.Start(ctx, id)
 	if err != nil {

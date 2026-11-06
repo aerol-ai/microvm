@@ -53,6 +53,9 @@ func (h *handlers) capacity(w http.ResponseWriter, r *http.Request) {
 		// not leak through this tenant-visible endpoint either.
 		snapshot.LocalWasmModuleInventoryKnown = false
 		snapshot.LocalWasmModuleIDs = nil
+		// Warm-pool entries name the images an operator runs; like the
+		// warm-pool API itself they are for fleet admins only.
+		snapshot.WarmPools = nil
 	}
 	apihttp.WriteJSON(w, http.StatusOK, snapshot)
 }

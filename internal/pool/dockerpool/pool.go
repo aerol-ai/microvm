@@ -14,11 +14,18 @@ import (
 type Pool struct {
 	logger *slog.Logger
 
-	mu            sync.Mutex
-	defaultDepth  int
-	maxImages     int
-	idleTTL       time.Duration
-	pinned        map[string]struct{}
+	mu           sync.Mutex
+	defaultDepth int
+	maxImages    int
+	idleTTL      time.Duration
+	pinned       map[string]struct{}
+	// envPins are the pins from SB_*_POOL_IMAGES. An API entry pins its key
+	// too; envPins is how removing that entry tells "fall back to the env
+	// pin at the default depth" from "stop warming this image".
+	envPins map[string]struct{}
+	// configured are the API warm-pool entries (configured.go), by key
+	// string. Their depth replaces defaultDepth for that key.
+	configured    map[string]Configured
 	targets       map[string]Key // keyString -> Key
 	lastUsed      map[string]time.Time
 	ready         map[string][]*ParkedSlot
@@ -39,6 +46,8 @@ func New(logger *slog.Logger) *Pool {
 	return &Pool{
 		logger:     logger,
 		pinned:     make(map[string]struct{}),
+		envPins:    make(map[string]struct{}),
+		configured: make(map[string]Configured),
 		targets:    make(map[string]Key),
 		lastUsed:   make(map[string]time.Time),
 		ready:      make(map[string][]*ParkedSlot),
@@ -130,6 +139,7 @@ func (p *Pool) PinTarget(key Key) {
 	ks := key.KeyString()
 	p.mu.Lock()
 	p.pinned[ks] = struct{}{}
+	p.envPins[ks] = struct{}{}
 	p.targets[ks] = key
 	p.mu.Unlock()
 }
@@ -455,7 +465,7 @@ func (p *Pool) UnmarkSpawning(ks string) {
 func (p *Pool) SpawnBudget(ks string) int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	depth := p.defaultDepth
+	depth := p.depthLocked(ks)
 	if depth <= 0 {
 		return 0
 	}

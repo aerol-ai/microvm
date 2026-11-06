@@ -31,7 +31,7 @@ const (
 // it once per release that adds such a feature, and give the feature its
 // own constant naming the version that introduced it.
 const (
-	fsmOpsVersion              = 6
+	fsmOpsVersion              = 7
 	egressProfileFSMOpsVersion = 1 // opPutEgressProfile, opDeleteEgressProfile
 	// auditCallerFSMOpsVersion: audit records carry a hash-covered caller
 	// field (AuditCallerWritesAllowed).
@@ -55,6 +55,9 @@ const (
 	// (TokenPortsAllowed). No FSM op: an older build decodes the record and
 	// drops the field, which would recreate the port as public.
 	tokenPortFSMOpsVersion = 6
+	// warmPoolFSMOpsVersion: opPutWarmPool, opDeleteWarmPool
+	// (fsm_warm_pools.go).
+	warmPoolFSMOpsVersion = 7
 )
 
 var (

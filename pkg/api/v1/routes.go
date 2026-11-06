@@ -161,6 +161,15 @@ func RegisterRoutes(mux apihttp.Mux, d Deps) {
 	mux.Handle("GET "+PathPrefix+"/egress-profiles", d.Route(permRead, http.HandlerFunc(h.listEgressProfiles)))
 	// Pure policy evaluation: no sandbox, no state change, so a read.
 	mux.Handle("POST "+PathPrefix+"/network/policy/check", d.Route(permRead, http.HandlerFunc(h.checkNetworkPolicy)))
+	// Warm pools (plans/agent-sandbox-feature-parity.md W1): fleet-wide
+	// operator config, so fleet.admin even to read (an entry names the
+	// images an operator runs). Not sandbox-scoped, so no owner forwarding;
+	// in a cluster the service writes them through Raft. {image...} takes
+	// the rest of the path, so an image's slashes need no escaping.
+	mux.Handle("GET "+PathPrefix+"/warm-pools", d.Route(permFleet, http.HandlerFunc(h.listWarmPools)))
+	mux.Handle("GET "+PathPrefix+"/warm-pools/{image...}", d.Route(permFleet, http.HandlerFunc(h.getWarmPool)))
+	mux.Handle("PUT "+PathPrefix+"/warm-pools/{image...}", d.Route(permFleet, http.HandlerFunc(h.putWarmPool)))
+	mux.Handle("DELETE "+PathPrefix+"/warm-pools/{image...}", d.Route(permFleet, http.HandlerFunc(h.deleteWarmPool)))
 	// Secret audit history: local JSONL + live fan-out. NOT clusterForwardWrap —
 	// owner-forward would drop pre-failover history (plans/secrets-hardening §E1b).
 	mux.Handle("GET "+PathPrefix+"/sandboxes/{id}/audit", d.Route(controlplane.PermAuditRead, withAuditLimit(d, http.HandlerFunc(h.getSandboxAudit))))
@@ -266,6 +275,8 @@ func RegisterRoutes(mux apihttp.Mux, d Deps) {
 	mux.Handle("POST "+cluster.PublicInternalEgressProfileWritePath, internalOp(http.HandlerFunc(h.clusterInternalEgressProfileWrite)))
 	mux.Handle("POST "+cluster.PublicInternalEgressProfileReadPath, internalOp(http.HandlerFunc(h.clusterInternalEgressProfileRead)))
 	mux.Handle("POST "+cluster.PublicInternalAPITokenWritePath, internalOp(http.HandlerFunc(h.clusterInternalAPITokenWrite)))
+	mux.Handle("POST "+cluster.PublicInternalWarmPoolWritePath, internalOp(http.HandlerFunc(h.clusterInternalWarmPoolWrite)))
+	mux.Handle("POST "+cluster.PublicInternalWarmPoolReadPath, internalOp(http.HandlerFunc(h.clusterInternalWarmPoolRead)))
 	mux.Handle("GET "+cluster.PublicInternalAPITokenChangesPath, internalOp(http.HandlerFunc(h.clusterInternalAPITokenChanges)))
 	mux.Handle("GET "+cluster.PublicInternalAPITokenPagePath, internalOp(http.HandlerFunc(h.clusterInternalAPITokenPage)))
 	mux.Handle("GET "+cluster.PublicInternalAuditACLPath+"{id}", internalOp(http.HandlerFunc(h.clusterInternalAuditACL)))

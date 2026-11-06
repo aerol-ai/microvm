@@ -51,6 +51,12 @@ func TestClientAndSandboxWrappers(t *testing.T) {
 			w.WriteHeader(http.StatusNoContent)
 		case r.URL.Path == "/v1/egress-profiles/python":
 			_ = json.NewEncoder(w).Encode(models.EgressProfile{Name: "python", AllowOut: []string{"pypi.org"}, Generation: 2})
+		case r.Method == http.MethodDelete && r.URL.Path == "/v1/warm-pools/python:3.12":
+			w.WriteHeader(http.StatusNoContent)
+		case r.URL.Path == "/v1/warm-pools/python:3.12":
+			_ = json.NewEncoder(w).Encode(models.WarmPool{Image: "python:3.12", Depth: 2, Generation: 1})
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/warm-pools":
+			_, _ = w.Write([]byte(`{"pools":[{"image":"python:3.12","depth":2}]}`))
 		case r.Method == http.MethodGet && r.URL.Path == "/v1/egress-profiles":
 			if r.URL.Query().Get("cursor") != "a" || r.URL.Query().Get("limit") != "5" {
 				http.Error(w, "bad query "+r.URL.RawQuery, http.StatusBadRequest)
@@ -275,6 +281,18 @@ func TestClientAndSandboxWrappers(t *testing.T) {
 	}
 	if err := client.DeleteEgressProfile(ctx, "python"); err != nil {
 		t.Fatalf("DeleteEgressProfile() error = %v", err)
+	}
+	if pool, err := client.PutWarmPool(ctx, "python:3.12", sdktypes.WarmPoolOptions{Depth: 2}); err != nil || pool.Depth != 2 {
+		t.Fatalf("PutWarmPool() = %+v, %v", pool, err)
+	}
+	if pool, err := client.GetWarmPool(ctx, "python:3.12"); err != nil || pool.Image != "python:3.12" {
+		t.Fatalf("GetWarmPool() = %+v, %v", pool, err)
+	}
+	if pools, err := client.ListWarmPools(ctx); err != nil || len(pools) != 1 {
+		t.Fatalf("ListWarmPools() = %+v, %v", pools, err)
+	}
+	if err := client.DeleteWarmPool(ctx, "python:3.12"); err != nil {
+		t.Fatalf("DeleteWarmPool() error = %v", err)
 	}
 	if err := sb.UpdateLifecycle(ctx, sdktypes.Lifecycle{StopIfIdleFor: time.Minute}); err != nil {
 		t.Fatalf("Sandbox.UpdateLifecycle() error = %v", err)

@@ -23,6 +23,8 @@ import type {
   EgressProfileList,
   EgressProfileOptions,
   ListEgressProfilesOptions,
+  WarmPool,
+  WarmPoolOptions,
   NetworkPolicyCheckOptions,
   NetworkPolicyCheckResult,
   IngressTarget,
@@ -280,6 +282,30 @@ export class MicroVM {
   /** Deletes a profile; one that sandboxes still reference is refused (409). */
   async deleteEgressProfile(name: string): Promise<void> {
     return this.client.deleteEgressProfile(name);
+  }
+
+  /**
+   * Sets how many ready sandboxes every server with a warm pool keeps for an
+   * image (a full replace: the same call twice is a no-op). A create that names
+   * the image then starts from a warm sandbox. Admin only.
+   */
+  async putWarmPool(image: string, options: WarmPoolOptions): Promise<WarmPool> {
+    return this.client.putWarmPool(image, options);
+  }
+
+  /** Returns an image's warm-pool entry with its status (ready and target, per server). */
+  async getWarmPool(image: string): Promise<WarmPool> {
+    return this.client.getWarmPool(image);
+  }
+
+  /** Returns every warm-pool entry, by image, with its status. */
+  async listWarmPools(): Promise<WarmPool[]> {
+    return this.client.listWarmPools();
+  }
+
+  /** Deletes an image's warm-pool entry; its warm sandboxes are removed. Deleting a missing entry succeeds. */
+  async deleteWarmPool(image: string): Promise<void> {
+    return this.client.deleteWarmPool(image);
   }
 
   async mounts(sandboxID: string): Promise<MountSpecRedacted[]> {

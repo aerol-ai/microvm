@@ -1000,6 +1000,12 @@ var Registry = []UseCase{
 	{ID: "UC-425", Title: "Sandbox token across nodes: a token issued through any node works through every other node, with no database call (every node derives the signing key from the shared server key)", Requires: []Capability{CapCluster}, Implemented: true},
 	{ID: "UC-426", Title: "Token-gated port: a port exposed with visibility token answers 401 without a token (never the app), ?token= sets the host-only __Host-aerolvm-token cookie (Secure, HttpOnly, SameSite=Lax, no Domain) and 302s to the URL without the token, the cookie reaches the app, another sandbox's port token and a toolbox token get 403, a plain re-expose keeps the gate, and /proxy/<port>/ does not serve it", Requires: []Capability{CapDomain}, Implemented: true},
 	{ID: "UC-427", Title: "Trace context into toolboxd: an exec sent with a W3C traceparent is logged by the sandbox's toolboxd with that trace id (read from the container's output over SSH on the owner node)", Requires: []Capability{CapDocker}, Implemented: true},
+	// Warm pools as an API object (parity_pools_test.go; plan W1-W3).
+	{ID: "UC-417", Title: "Warm pools: an admin PUTs an entry for an image; the same PUT again keeps its generation, and every server with a warm pool parks that many sandboxes until the entry's status shows ready == target in total and per server", Requires: []Capability{CapDockerPool}, Implemented: true},
+	{ID: "UC-418", Title: "Warm pools: a create from an image with an entry is a warm hit (Server-Timing has docker_pool and no docker_create)", Requires: []Capability{CapDockerPool}, Implemented: true},
+	{ID: "UC-419", Title: "Warm pools: in a cluster an entry written through any node reaches every node that runs sandboxes, each reporting it at its depth", Requires: []Capability{CapCluster, CapDockerPool}, Implemented: true},
+	{ID: "UC-420", Title: "Warm pools: deleting an entry drains it (no server reports it, its parked slots are given back), a GET is a 404 and a second DELETE succeeds", Requires: []Capability{CapDockerPool}, Implemented: true},
+	{ID: "UC-421", Title: "Warm pools are admin only: a runner and a viewer token get a 403 naming fleet.admin on list, get, put and delete; an admin token bound to every team lists them", Requires: []Capability{CapIdentity}, Implemented: true},
 }
 
 // byID is a lookup built once for the report generator.
