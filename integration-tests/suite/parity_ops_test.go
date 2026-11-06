@@ -7,12 +7,21 @@ package suite
 // create-throughput benchmark tool).
 
 import (
+	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -234,5 +243,191 @@ func TestParityToolboxDialRetryGivesUpLive(t *testing.T) {
 	}
 	if st, body, _ := rt.exec("test -e " + marker + " && echo ran || echo never"); st != http.StatusOK || !strings.Contains(string(body), "never") {
 		t.Fatalf("after the refusal: %d %s, want the command never to have run", st, body)
+	}
+}
+
+// --- O3: the create-throughput benchmark tool ------------------------------
+
+var (
+	benchOnce sync.Once
+	benchPath string
+	benchErr  error
+)
+
+// benchBinary builds cmd/aerolvm-bench from this tree once per run, so a
+// run tests the branch.
+func benchBinary(t *testing.T) string {
+	t.Helper()
+	benchOnce.Do(func() {
+		dir, err := os.MkdirTemp("", "aerolvm-bench-itest-")
+		if err != nil {
+			benchErr = err
+			return
+		}
+		benchPath = filepath.Join(dir, "aerolvm-bench")
+		if out, err := exec.Command("go", "build", "-o", benchPath, "../../cmd/aerolvm-bench").CombinedOutput(); err != nil {
+			benchErr = fmt.Errorf("go build ./cmd/aerolvm-bench: %v\n%s", err, out)
+		}
+	})
+	if benchErr != nil {
+		t.Fatal(benchErr)
+	}
+	return benchPath
+}
+
+// throughputReport is the part of aerolvm-bench's -json report the cases read.
+type throughputReport struct {
+	RunID            string  `json:"run_id"`
+	Interrupted      bool    `json:"interrupted"`
+	ElapsedSeconds   float64 `json:"elapsed_seconds"`
+	CreatesPerSecond float64 `json:"creates_per_second"`
+	Creates          struct {
+		Succeeded int `json:"succeeded"`
+		Failed    int `json:"failed"`
+	} `json:"creates"`
+	CreateLatencyMs struct {
+		Samples int     `json:"samples"`
+		P50     float64 `json:"p50"`
+		P90     float64 `json:"p90"`
+		P99     float64 `json:"p99"`
+		Max     float64 `json:"max"`
+	} `json:"create_latency_ms"`
+	Errors     []json.RawMessage `json:"errors"`
+	LeftBehind int               `json:"left_behind"`
+}
+
+// benchRun is one aerolvm-bench process against the scenario's API.
+type benchRun struct {
+	t      *testing.T
+	runID  string
+	cmd    *exec.Cmd
+	stdout bytes.Buffer
+	stderr bytes.Buffer
+}
+
+func startBench(t *testing.T, uc string, args ...string) *benchRun {
+	t.Helper()
+	var raw [3]byte
+	_, _ = rand.Read(raw[:])
+	br := &benchRun{t: t, runID: strings.ToLower(uc) + "-" + hex.EncodeToString(raw[:])}
+	br.cmd = exec.Command(benchBinary(t), append([]string{"-json", "-run-id", br.runID, "-image", harness.DefaultImage}, args...)...)
+	br.cmd.Env = append(os.Environ(), "SB_API_URL="+sc.BaseURL, "SB_PAT_TOKEN="+sc.PAT, "SB_API_TOKEN=")
+	br.cmd.Stdout, br.cmd.Stderr = &br.stdout, &br.stderr
+	if err := br.cmd.Start(); err != nil {
+		t.Fatalf("start aerolvm-bench: %v", err)
+	}
+	// Whatever the test does, nothing of this run outlives it.
+	t.Cleanup(func() {
+		_ = br.cmd.Process.Kill()
+		_ = exec.Command(benchBinary(t), "-cleanup", br.runID).Run()
+	})
+	return br
+}
+
+// wait returns the exit code and the parsed report.
+func (br *benchRun) wait(timeout time.Duration) (int, throughputReport) {
+	br.t.Helper()
+	done := make(chan error, 1)
+	go func() { done <- br.cmd.Wait() }()
+	var err error
+	select {
+	case err = <-done:
+	case <-time.After(timeout):
+		_ = br.cmd.Process.Kill()
+		br.t.Fatalf("aerolvm-bench still running after %v\nstderr: %s", timeout, br.stderr.String())
+	}
+	code := 0
+	var exit *exec.ExitError
+	if errors.As(err, &exit) {
+		code = exit.ExitCode()
+	} else if err != nil {
+		br.t.Fatalf("aerolvm-bench: %v", err)
+	}
+	var rep throughputReport
+	if jerr := json.Unmarshal(br.stdout.Bytes(), &rep); jerr != nil {
+		br.t.Fatalf("aerolvm-bench exit %d, stdout is not the JSON report: %v\nstdout: %s\nstderr: %s", code, jerr, br.stdout.String(), br.stderr.String())
+	}
+	return code, rep
+}
+
+// runSandboxes lists the sandboxes tagged with the run's id, through the
+// SDK and not through the tool.
+func (br *benchRun) runSandboxes() int {
+	br.t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	items, err := client(br.t).SDK().List(ctx, microvm.WithTags(map[string]string{"aerolvm-bench-run": br.runID}))
+	if err != nil {
+		br.t.Fatalf("list the run's sandboxes: %v", err)
+	}
+	return len(items)
+}
+
+func checkBenchPercentiles(t *testing.T, rep throughputReport) {
+	t.Helper()
+	l := rep.CreateLatencyMs
+	if rep.Creates.Succeeded < 1 || l.Samples != rep.Creates.Succeeded || rep.CreatesPerSecond <= 0 || rep.ElapsedSeconds <= 0 {
+		t.Fatalf("report %+v: want at least one create, a sample per create and a rate", rep)
+	}
+	if !(l.P50 > 0 && l.P50 <= l.P90 && l.P90 <= l.P99 && l.P99 <= l.Max) {
+		t.Fatalf("create latency %+v: want 0 < p50 <= p90 <= p99 <= max", l)
+	}
+	// Two workers, one create each at a time, cannot beat two creates per
+	// median create time by much; a rate far above that is a counting
+	// bug, not a fast server.
+	if pace := 2 * 1000 / l.P50; rep.CreatesPerSecond > 2*pace {
+		t.Fatalf("%.2f creates per second with 2 workers at p50 %.1f ms (about %.2f expected)", rep.CreatesPerSecond, l.P50, pace)
+	}
+}
+
+// UC-455 — O3: aerolvm-bench runs a few seconds at low concurrency against
+// the live API, reports a create rate and sane create-time percentiles,
+// and leaves none of its sandboxes behind.
+func TestParityBenchReportsAndCleansUp(t *testing.T) {
+	harness.Require(t, sc, "UC-455")
+	br := startBench(t, "UC-455", "-concurrency", "2", "-duration", "5s")
+	code, rep := br.wait(5 * time.Minute)
+	if code != 0 || rep.RunID != br.runID || rep.Interrupted {
+		t.Fatalf("exit %d, report %+v\nstderr: %s", code, rep, br.stderr.String())
+	}
+	if rep.Creates.Failed != 0 {
+		t.Fatalf("%d creates failed at concurrency 2: %s", rep.Creates.Failed, rep.Errors)
+	}
+	checkBenchPercentiles(t, rep)
+	if rep.LeftBehind != 0 {
+		t.Fatalf("the tool reports %d sandboxes left behind", rep.LeftBehind)
+	}
+	if n := br.runSandboxes(); n != 0 {
+		t.Fatalf("the API still lists %d sandboxes tagged with run %s", n, br.runID)
+	}
+}
+
+// UC-456 — O3: aerolvm-bench stopped with one interrupt mid-run waits for
+// the creates in flight, deletes every sandbox it made and reports the
+// interrupted run; the API lists none of them afterwards.
+func TestParityBenchInterruptedCleansUp(t *testing.T) {
+	harness.Require(t, sc, "UC-456")
+	br := startBench(t, "UC-456", "-concurrency", "2", "-duration", "10m", "-hold")
+	// -hold keeps every sandbox until the end, so the interrupt has
+	// several to delete.
+	deadline := time.Now().Add(3 * time.Minute)
+	for br.runSandboxes() < 2 {
+		if time.Now().After(deadline) {
+			t.Fatalf("no sandboxes of the run appeared\nstderr: %s", br.stderr.String())
+		}
+		time.Sleep(2 * time.Second)
+	}
+	if err := br.cmd.Process.Signal(syscall.SIGINT); err != nil {
+		t.Fatal(err)
+	}
+	code, rep := br.wait(5 * time.Minute)
+	if code != 0 || !rep.Interrupted || rep.LeftBehind != 0 || rep.Creates.Succeeded < 2 {
+		t.Fatalf("exit %d, report %+v\nstderr: %s", code, rep, br.stderr.String())
+	}
+	if !strings.Contains(br.stderr.String(), "stopping") {
+		t.Fatalf("stderr does not say it is stopping: %s", br.stderr.String())
+	}
+	if n := br.runSandboxes(); n != 0 {
+		t.Fatalf("the API still lists %d sandboxes tagged with run %s after the interrupt", n, br.runID)
 	}
 }

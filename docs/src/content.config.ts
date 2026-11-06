@@ -85,6 +85,7 @@ const getDocsSidebarConfig = (): NavigationGroup[] => [
       link('/ghost-sandboxes', '- Ghost(Vercel) Mode'),
       link('/images-and-snapshots', '- Images and Snapshots'),
       link('/warm-pools', '- Warm pools'),
+      link('/performance-benchmark', '- Create throughput'),
       link('/lifecycle', '- Lifecycle'),
       link('/sandbox-env', '- Secured Env variables'),
       link('/sandbox-cloud-identity', '- Cloud identity (AWS, GCP, Azure)'),

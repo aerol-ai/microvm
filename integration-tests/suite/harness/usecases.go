@@ -1025,6 +1025,8 @@ var Registry = []UseCase{
 	// sandbox's toolboxd with an OUTPUT rule (TCP reset), so they need SSH.
 	{ID: "UC-453", Title: "Toolbox dial retry: while the owner node refuses sandboxd's connects to a sandbox's toolboxd, an exec waits, reaches toolboxd once the refusal ends and answers 200, the command runs exactly once, and aerolvm_toolbox_dial_retries_total{key=connected} grows on the owner", Requires: []Capability{CapDocker}, Excludes: []Capability{CapNoHostFirewall}, Implemented: true},
 	{ID: "UC-454", Title: "Toolbox dial retry gives up: a toolboxd refused for longer than the retry window fails the exec with 502 after the 1.4 s of retries (not at once, not minutes later), 4 connects were refused, and the command never ran", Requires: []Capability{CapDocker}, Excludes: []Capability{CapNoHostFirewall}, Implemented: true},
+	{ID: "UC-455", Title: "Create throughput benchmark: aerolvm-bench (built from this tree) runs 5 s at concurrency 2 against the live API, exits 0, reports creates per second and create times with 0 < p50 <= p90 <= p99 <= max and a sample per create, no failed create, and leaves none of its sandboxes (by its run tag, through the SDK)", Requires: []Capability{CapBenchmark}, Implemented: true},
+	{ID: "UC-456", Title: "Create throughput benchmark interrupted: one SIGINT to a long aerolvm-bench run holding its sandboxes waits for the creates in flight, deletes every sandbox the run made, reports interrupted with left_behind 0 and exits 0; the API lists none of the run's sandboxes", Requires: []Capability{CapBenchmark}, Implemented: true},
 }
 
 // byID is a lookup built once for the report generator.
