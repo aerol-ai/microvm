@@ -1625,3 +1625,36 @@ test("MicroVM create failures are MicroVMApiError from the package entry point",
     assert.equal(err.message, "Idempotency-Key reused");
   }
 });
+
+test("a sandbox never serializes its API client or token", async () => {
+  const sdk = new MicroVM({
+    patToken: "secret-pat-token",
+    apiUrl: "https://api.example.com/",
+    fetch: async () =>
+      new Response(JSON.stringify({
+        id: "sb-json",
+        name: "job",
+        image: "alpine",
+        status: "started",
+        public_url: "",
+        cpu: 1,
+        memory_mb: 512,
+        disk_gb: 10,
+        os_user: "root",
+        network_block_all: false,
+        toolbox_enabled: true,
+        exposed_ports: [],
+        created_at: "2026-05-07T10:00:00Z",
+        updated_at: "2026-05-07T10:00:00Z",
+        last_active_at: "2026-05-07T10:00:00Z",
+      }), { status: 200, headers: { "content-type": "application/json" } }),
+  });
+  const sandbox = await sdk.get("sb-json");
+  const json = JSON.stringify(sandbox);
+  assert.equal(json.includes("secret-pat-token"), false, json);
+  assert.equal(Object.keys(sandbox.toJSON()).includes("client"), false);
+  assert.equal(JSON.parse(json).id, "sb-json");
+  // The sandbox still works: the client is only hidden, not gone.
+  await sandbox.refresh();
+  assert.equal(sandbox.id, "sb-json");
+});

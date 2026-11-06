@@ -1515,10 +1515,12 @@ export class SandboxResource implements Sandbox {
   declare failover?: Failover;
   declare runtime: Sandbox["runtime"];
 
-  protected readonly client: APIClient;
+  declare protected readonly client: APIClient;
 
   constructor(client: APIClient, sandbox: Sandbox) {
-    this.client = client;
+    // Not enumerable: it holds the token, so it must never reach toJSON,
+    // JSON.stringify or a log of the sandbox.
+    Object.defineProperty(this, "client", { value: client, enumerable: false });
     this.apply(sandbox);
   }
 
