@@ -87,6 +87,7 @@ const getDocsSidebarConfig = (): NavigationGroup[] => [
       link('/warm-pools', '- Warm pools'),
       link('/lifecycle', '- Lifecycle'),
       link('/sandbox-env', '- Secured Env variables'),
+      link('/sandbox-cloud-identity', '- Cloud identity (AWS, GCP, Azure)'),
       link('/durability', '- Durability and failover'),
       link('/exec-streaming', '- Run commands'),
       link('/file-system', '- Handle Files'),
