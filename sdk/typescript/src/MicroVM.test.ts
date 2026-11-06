@@ -1658,3 +1658,13 @@ test("a sandbox never serializes its API client or token", async () => {
   await sandbox.refresh();
   assert.equal(sandbox.id, "sb-json");
 });
+
+test("a MicroVM client never serializes its token", () => {
+  const sdk = new MicroVM({ patToken: "secret-pat-token", apiUrl: "https://api.example.com/" });
+  const json = JSON.stringify(sdk);
+  assert.equal(json.includes("secret-pat-token"), false, json);
+  assert.equal(Object.keys(sdk).includes("patToken"), false);
+  assert.equal(Object.keys(sdk).includes("client"), false);
+  // Still readable by name.
+  assert.equal(sdk.patToken, "secret-pat-token");
+});
