@@ -7,10 +7,13 @@ import (
 	"io"
 	"log/slog"
 	"maps"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
 	"slices"
+	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -253,6 +256,10 @@ type daytonaContractEnv struct {
 	api     *apiclient.APIClient
 	sdk     *daytonasdk.Client
 	baseURL string
+	// toolbox is the case's fake toolboxd, when it has one, and toolboxHost
+	// its address: a sandbox seeded with it as ContainerIP reaches it.
+	toolbox     http.Handler
+	toolboxHost string
 }
 
 type contractSandboxSeed struct {
@@ -299,6 +306,28 @@ type contractSnapshotSeed struct {
 
 func newDaytonaContractEnv(t *testing.T) *daytonaContractEnv {
 	t.Helper()
+	return newDaytonaContractEnvWithToolbox(t, nil)
+}
+
+// newDaytonaContractEnvWithToolbox is newDaytonaContractEnv whose sandboxd
+// sends toolbox calls to toolbox, a fake toolboxd on a real listener, so a
+// Daytona SDK call runs end to end through the facade (WebSockets included).
+func newDaytonaContractEnvWithToolbox(t *testing.T, toolbox http.Handler) *daytonaContractEnv {
+	t.Helper()
+
+	toolboxHost, toolboxPort := "", 2280
+	if toolbox != nil {
+		toolboxServer := httptest.NewServer(toolbox)
+		t.Cleanup(toolboxServer.Close)
+		host, port, err := net.SplitHostPort(strings.TrimPrefix(toolboxServer.URL, "http://"))
+		if err != nil {
+			t.Fatalf("split toolbox address: %v", err)
+		}
+		toolboxHost = host
+		if toolboxPort, err = strconv.Atoi(port); err != nil {
+			t.Fatalf("toolbox port: %v", err)
+		}
+	}
 
 	ctx := context.Background()
 	tmpDir := t.TempDir()
@@ -327,7 +356,7 @@ func newDaytonaContractEnv(t *testing.T) *daytonaContractEnv {
 		CaddyAdminURL:               "http://127.0.0.1:2019",
 		CaddyServerID:               "srv0",
 		ToolboxMountPath:            "/usr/local/bin/toolboxd",
-		ToolboxPort:                 2280,
+		ToolboxPort:                 toolboxPort,
 		Runtime:                     models.RuntimeDocker,
 		EnableCaddy:                 false,
 		MountsRootPath:              filepath.Join(tmpDir, "mounts"),
@@ -375,6 +404,9 @@ func newDaytonaContractEnv(t *testing.T) *daytonaContractEnv {
 		api:     api,
 		sdk:     sdk,
 		baseURL: server.URL + PathPrefix,
+
+		toolbox:     toolbox,
+		toolboxHost: toolboxHost,
 	}
 }
 
