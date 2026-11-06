@@ -362,13 +362,13 @@ export class MicroVM {
    * minimum caller role (`"runner"` or `"admin"`). Admin only. The same call
    * twice changes nothing, so it is safe to retry.
    */
-  async putIdentityRole(tag: string, options: IdentityRoleOptions): Promise<IdentityRole> {
-    return this.client.putIdentityRole(tag, options);
+  async putIdentityRole(tag: string, options: IdentityRoleOptions, call?: CallOptions): Promise<IdentityRole> {
+    return this.clientFor(call).putIdentityRole(tag, options);
   }
 
   /** Lists a team's cloud identity allow list, one page at a time. Admin only. */
-  async listIdentityRoles(options?: ListIdentityRolesOptions): Promise<IdentityRoleList> {
-    return this.client.listIdentityRoles(options);
+  async listIdentityRoles(options?: ListIdentityRolesOptions, call?: CallOptions): Promise<IdentityRoleList> {
+    return this.clientFor(call).listIdentityRoles(options);
   }
 
   /**
@@ -376,8 +376,8 @@ export class MicroVM {
    * it keep their current token (at most one hour) and get no new one.
    * Deleting a tag that is already gone succeeds.
    */
-  async deleteIdentityRole(tag: string, options?: { team?: string }): Promise<void> {
-    return this.client.deleteIdentityRole(tag, options);
+  async deleteIdentityRole(tag: string, options?: { team?: string }, call?: CallOptions): Promise<void> {
+    return this.clientFor(call).deleteIdentityRole(tag, options);
   }
 
   /**
@@ -385,18 +385,18 @@ export class MicroVM {
    * may hold. Admin only. The same limits twice change nothing. A create,
    * resize or start past the quota fails with 429 `team_quota_exceeded`.
    */
-  async putTeamQuota(team: string, options: TeamQuotaOptions): Promise<TeamQuota> {
-    return this.client.putTeamQuota(team, options);
+  async putTeamQuota(team: string, options: TeamQuotaOptions, call?: CallOptions): Promise<TeamQuota> {
+    return this.clientFor(call).putTeamQuota(team, options);
   }
 
   /** Reads a team's quota and what the team holds now. 404 if it has none. */
-  async getTeamQuota(team: string): Promise<TeamQuota> {
-    return this.client.getTeamQuota(team);
+  async getTeamQuota(team: string, call?: CallOptions): Promise<TeamQuota> {
+    return this.clientFor(call).getTeamQuota(team);
   }
 
   /** Removes a team's quota. Removing one that is already gone succeeds. */
-  async deleteTeamQuota(team: string): Promise<void> {
-    return this.client.deleteTeamQuota(team);
+  async deleteTeamQuota(team: string, call?: CallOptions): Promise<void> {
+    return this.clientFor(call).deleteTeamQuota(team);
   }
 
   async mounts(sandboxID: string, call?: CallOptions): Promise<MountSpecRedacted[]> {

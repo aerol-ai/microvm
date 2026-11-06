@@ -1692,16 +1692,12 @@ class _MicroVMCore:
         segments = "/".join(urllib.parse.quote(part, safe="") for part in image.split("/"))
         return f"{self._version_prefix}/warm-pools/{segments}"
 
-    def put_identity_role(self, tag: str, options: IdentityRoleOptions) -> IdentityRole:
-        """Put a role tag on a team's cloud identity allow list, or change its
-        minimum caller role ("runner" or "admin"). Admin only. The same call
-        twice changes nothing, so it is safe to retry."""
+    def _op_put_identity_role(self, tag: str, options: IdentityRoleOptions):
         body = {"min_role": str(_first_of(options, "minRole", "min_role") or "")}
-        payload = self._do_json("PUT", self._identity_role_path(tag, _first_of(options, "team")), body) or {}
+        payload = (yield _io("_do_json", "PUT", self._identity_role_path(tag, _first_of(options, "team")), body)) or {}
         return _from_api_identity_role(payload)
 
-    def list_identity_roles(self, options: Optional[ListIdentityRolesOptions] = None) -> IdentityRoleList:
-        """List a team's cloud identity allow list, one page at a time. Admin only."""
+    def _op_list_identity_roles(self, options: Optional[ListIdentityRolesOptions] = None):
         opts = options or {}
         params: Dict[str, str] = {}
         if opts.get("team"):
@@ -1713,27 +1709,20 @@ class _MicroVMCore:
         path = f"{self._version_prefix}/identity/roles"
         if params:
             path += "?" + urllib.parse.urlencode(params)
-        payload = self._do_json("GET", path, None) or {}
+        payload = (yield _io("_do_json", "GET", path, None)) or {}
         result: IdentityRoleList = {"roles": [_from_api_identity_role(r) for r in payload.get("roles") or []]}
         if payload.get("next_cursor"):
             result["nextCursor"] = str(payload["next_cursor"])
         return result
 
-    def delete_identity_role(self, tag: str, options: Optional[IdentityRoleOptions] = None) -> None:
-        """Take a role tag off a team's allow list. Admin only. Sandboxes that
-        use it keep their current token (at most one hour) and get no new one.
-        Deleting a tag that is already gone succeeds."""
-        self._do_json("DELETE", self._identity_role_path(tag, _first_of(options or {}, "team")), None)
+    def _op_delete_identity_role(self, tag: str, options: Optional[IdentityRoleOptions] = None):
+        yield _io("_do_json", "DELETE", self._identity_role_path(tag, _first_of(options or {}, "team")), None)
 
     def _identity_role_path(self, tag: str, team: Any) -> str:
         path = f"{self._version_prefix}/identity/roles/{urllib.parse.quote(tag, safe='')}"
         return _append_query_param(path, "team", str(team or ""))
 
-    def put_team_quota(self, team: str, options: TeamQuotaOptions) -> TeamQuota:
-        """Set a team's quota: the most sandboxes, CPU and memory its
-        sandboxes may hold. Admin only. The same limits twice change nothing.
-        A create, resize or start past the quota fails with 429
-        ``team_quota_exceeded``."""
+    def _op_put_team_quota(self, team: str, options: TeamQuotaOptions):
         body = _compact(
             {
                 "max_sandboxes": _first_of(options, "maxSandboxes", "max_sandboxes"),
@@ -1741,15 +1730,13 @@ class _MicroVMCore:
                 "max_memory_mb": _first_of(options, "maxMemoryMB", "max_memory_mb"),
             }
         )
-        return _from_api_team_quota(self._do_json("PUT", self._team_quota_path(team), body) or {})
+        return _from_api_team_quota((yield _io("_do_json", "PUT", self._team_quota_path(team), body)) or {})
 
-    def get_team_quota(self, team: str) -> TeamQuota:
-        """Read a team's quota and what the team holds now (404 if none)."""
-        return _from_api_team_quota(self._do_json("GET", self._team_quota_path(team), None) or {})
+    def _op_get_team_quota(self, team: str):
+        return _from_api_team_quota((yield _io("_do_json", "GET", self._team_quota_path(team), None)) or {})
 
-    def delete_team_quota(self, team: str) -> None:
-        """Remove a team's quota. Removing one that is already gone succeeds."""
-        self._do_json("DELETE", self._team_quota_path(team), None)
+    def _op_delete_team_quota(self, team: str):
+        yield _io("_do_json", "DELETE", self._team_quota_path(team), None)
 
     def _team_quota_path(self, team: str) -> str:
         return f"{self._version_prefix}/teams/{urllib.parse.quote(team, safe='')}/quota"
@@ -2807,6 +2794,47 @@ class MicroVM(_MicroVMCore):
     def delete_egress_profile(self, name: str, *, timeout: Optional[float] = None) -> None:
         """Delete a profile; one that sandboxes still reference is refused (409)."""
         return self._run(self._op_delete_egress_profile(name))
+
+    @_timed
+    def put_identity_role(self, tag: str, options: IdentityRoleOptions, *, timeout: Optional[float] = None) -> IdentityRole:
+        """Put a role tag on a team's cloud identity allow list, or change its
+        minimum caller role ("runner" or "admin"). Admin only. The same call
+        twice changes nothing, so it is safe to retry."""
+        return self._run(self._op_put_identity_role(tag, options))
+
+    @_timed
+    def list_identity_roles(
+        self, options: Optional[ListIdentityRolesOptions] = None, *, timeout: Optional[float] = None
+    ) -> IdentityRoleList:
+        """List a team's cloud identity allow list, one page at a time. Admin only."""
+        return self._run(self._op_list_identity_roles(options))
+
+    @_timed
+    def delete_identity_role(
+        self, tag: str, options: Optional[IdentityRoleOptions] = None, *, timeout: Optional[float] = None
+    ) -> None:
+        """Take a role tag off a team's allow list. Admin only. Sandboxes that
+        use it keep their current token (at most one hour) and get no new one.
+        Deleting a tag that is already gone succeeds."""
+        return self._run(self._op_delete_identity_role(tag, options))
+
+    @_timed
+    def put_team_quota(self, team: str, options: TeamQuotaOptions, *, timeout: Optional[float] = None) -> TeamQuota:
+        """Set a team's quota: the most sandboxes, CPU and memory its
+        sandboxes may hold. Admin only. The same limits twice change nothing.
+        A create, resize or start past the quota fails with 429
+        ``team_quota_exceeded``."""
+        return self._run(self._op_put_team_quota(team, options))
+
+    @_timed
+    def get_team_quota(self, team: str, *, timeout: Optional[float] = None) -> TeamQuota:
+        """Read a team's quota and what the team holds now (404 if none)."""
+        return self._run(self._op_get_team_quota(team))
+
+    @_timed
+    def delete_team_quota(self, team: str, *, timeout: Optional[float] = None) -> None:
+        """Remove a team's quota. Removing one that is already gone succeeds."""
+        return self._run(self._op_delete_team_quota(team))
 
     @_timed
     def put_warm_pool(self, image: str, options: WarmPoolOptions, *, timeout: Optional[float] = None) -> WarmPool:

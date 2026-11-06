@@ -54,11 +54,11 @@ from .types import (
     BuildImageResult,
     CloneGeneration,
     CreateAPITokenOptions,
-    CreatedAPIToken,
     CreateOptions,
     CreateSessionOptions,
     CreateTemplateOptions,
     CreateWasmModuleOptions,
+    CreatedAPIToken,
     CustomDomain,
     CustomDomainDNSRecords,
     EgressProfile,
@@ -76,9 +76,13 @@ from .types import (
     FileList,
     FileMatch,
     HealthStatus,
+    IdentityRole,
+    IdentityRoleList,
+    IdentityRoleOptions,
     IngressTarget,
     Lifecycle,
     ListEgressProfilesOptions,
+    ListIdentityRolesOptions,
     MicroVMConfig,
     MountSpecRedacted,
     NetworkLearned,
@@ -97,6 +101,8 @@ from .types import (
     SessionAttachOptions,
     SetNetworkLimitsOptions,
     SnapshotList,
+    TeamQuota,
+    TeamQuotaOptions,
     Template,
     WarmPool,
     WarmPoolOptions,
@@ -1015,6 +1021,34 @@ class AsyncMicroVM(_MicroVMCore):
     async def delete_egress_profile(self, name: str, *, timeout: Optional[float] = None) -> None:
         with _call_deadline(timeout):
             return await self._run(self._op_delete_egress_profile(name))
+
+    async def put_identity_role(self, tag: str, options: IdentityRoleOptions, *, timeout: Optional[float] = None) -> IdentityRole:
+        with _call_deadline(timeout):
+            return await self._run(self._op_put_identity_role(tag, options))
+
+    async def list_identity_roles(
+        self, options: Optional[ListIdentityRolesOptions] = None, *, timeout: Optional[float] = None
+    ) -> IdentityRoleList:
+        with _call_deadline(timeout):
+            return await self._run(self._op_list_identity_roles(options))
+
+    async def delete_identity_role(
+        self, tag: str, options: Optional[IdentityRoleOptions] = None, *, timeout: Optional[float] = None
+    ) -> None:
+        with _call_deadline(timeout):
+            return await self._run(self._op_delete_identity_role(tag, options))
+
+    async def put_team_quota(self, team: str, options: TeamQuotaOptions, *, timeout: Optional[float] = None) -> TeamQuota:
+        with _call_deadline(timeout):
+            return await self._run(self._op_put_team_quota(team, options))
+
+    async def get_team_quota(self, team: str, *, timeout: Optional[float] = None) -> TeamQuota:
+        with _call_deadline(timeout):
+            return await self._run(self._op_get_team_quota(team))
+
+    async def delete_team_quota(self, team: str, *, timeout: Optional[float] = None) -> None:
+        with _call_deadline(timeout):
+            return await self._run(self._op_delete_team_quota(team))
 
     async def put_warm_pool(self, image: str, options: WarmPoolOptions, *, timeout: Optional[float] = None) -> WarmPool:
         with _call_deadline(timeout):
