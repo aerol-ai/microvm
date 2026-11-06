@@ -861,6 +861,7 @@ func open(path string, secretCipher *secrets.Cipher) (*Store, error) {
 				PRIMARY KEY (scope, ip)
 			);`,
 	}
+	stmts = append(stmts, identitySchema...)
 
 	for _, stmt := range stmts {
 		if _, err := db.Exec(stmt); err != nil {
@@ -2715,7 +2716,7 @@ func (s *Store) Get(ctx context.Context, id string) (*models.Sandbox, error) {
 	}
 	sandbox.CustomDomains = customDomains
 
-	if err := s.attachEgressModes(ctx, map[string]*models.Sandbox{id: sandbox}); err != nil {
+	if err := s.attachSandboxSideState(ctx, map[string]*models.Sandbox{id: sandbox}); err != nil {
 		return nil, err
 	}
 	return sandbox, nil
@@ -2794,7 +2795,7 @@ func (s *Store) List(ctx context.Context) ([]*models.Sandbox, error) {
 		if err := s.attachCustomDomainsBulk(ctx, byID); err != nil {
 			return nil, err
 		}
-		if err := s.attachEgressModes(ctx, byID); err != nil {
+		if err := s.attachSandboxSideState(ctx, byID); err != nil {
 			return nil, err
 		}
 	}
@@ -2856,7 +2857,7 @@ func (s *Store) ListByOwner(ctx context.Context, ownerRef string) ([]*models.San
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("iterate sandboxes by owner: %w", err)
 	}
-	if err := s.attachEgressModes(ctx, byID); err != nil {
+	if err := s.attachSandboxSideState(ctx, byID); err != nil {
 		return nil, err
 	}
 	return sandboxes, nil
@@ -2917,7 +2918,7 @@ func (s *Store) ListByRuntime(ctx context.Context, runtime string) ([]*models.Sa
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("iterate sandboxes by runtime: %w", err)
 	}
-	if err := s.attachEgressModes(ctx, byID); err != nil {
+	if err := s.attachSandboxSideState(ctx, byID); err != nil {
 		return nil, err
 	}
 	return sandboxes, nil

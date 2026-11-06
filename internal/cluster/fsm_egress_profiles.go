@@ -31,7 +31,7 @@ const (
 // it once per release that adds such a feature, and give the feature its
 // own constant naming the version that introduced it.
 const (
-	fsmOpsVersion              = 7
+	fsmOpsVersion              = 8
 	egressProfileFSMOpsVersion = 1 // opPutEgressProfile, opDeleteEgressProfile
 	// auditCallerFSMOpsVersion: audit records carry a hash-covered caller
 	// field (AuditCallerWritesAllowed).
@@ -58,6 +58,11 @@ const (
 	// warmPoolFSMOpsVersion: opPutWarmPool, opDeleteWarmPool
 	// (fsm_warm_pools.go).
 	warmPoolFSMOpsVersion = 7
+	// identityFSMOpsVersion: opPutIdentityKeys, opPutIdentityRole,
+	// opDeleteIdentityRole (fsm_identity.go), the identity create option a
+	// worker must understand, and the audit record's identity_token field
+	// (IdentityAllowed).
+	identityFSMOpsVersion = 8
 )
 
 var (

@@ -891,6 +891,10 @@ type CreateSandboxRequest struct {
 	// identity is not authorized to use; when empty, the group key falls back
 	// to the authenticated API identity. Ignored by other runtimes today.
 	TenantID string `json:"tenant_id,omitempty"`
+	// Identity gives the sandbox a short-lived cloud identity token
+	// (plans/sandbox-cloud-identity.md). It rides the replicated spec, so a
+	// failover recreate keeps it; it holds no secret.
+	Identity *IdentityRequest `json:"identity,omitempty"`
 }
 
 func (r CreateSandboxRequest) ImageDistribution() ImageDistributionMetadata {
@@ -1137,6 +1141,9 @@ type Sandbox struct {
 	// process the security posture is stated in terms of
 	// (plans/isolate-runtime.md §2.1).
 	TenantID string `json:"tenant_id,omitempty"`
+	// Identity is the sandbox's cloud identity, when it was created with
+	// one (plans/sandbox-cloud-identity.md). It never carries the token.
+	Identity *SandboxIdentity `json:"identity,omitempty"`
 }
 
 // ModuleRefForCreate returns the WASM module reference from a create request.

@@ -142,6 +142,9 @@ type Agent struct {
 	// profiles caches the egress profiles this worker's sandboxes use
 	// (egress_profiles.go): a worker holds no FSM.
 	profiles egressProfileCache
+	// identityRoles caches the role tags this worker's creates and token
+	// refreshes ask about (identity.go).
+	identityRoles identityRoleCache
 
 	// feed is the placement delta feed (agent_placement_feed.go), started
 	// only with SB_INGRESS_PROXY_ROUTING. nil means the page walk.

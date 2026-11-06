@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/aerol-ai/microvm/internal/cloudidentity"
 	"github.com/aerol-ai/microvm/internal/identity"
 	"github.com/aerol-ai/microvm/pkg/capacity"
 	"github.com/aerol-ai/microvm/pkg/models"
@@ -213,6 +214,11 @@ type command struct {
 	// WarmPool carries the entry for opPutWarmPool, and its image for
 	// opDeleteWarmPool (fsm_warm_pools.go).
 	WarmPool *WarmPoolRecord `json:"warm_pool,omitempty"`
+	// IdentityKeys carries opPutIdentityKeys; IdentityRole carries
+	// opPutIdentityRole and names the tag opDeleteIdentityRole removes
+	// (fsm_identity.go).
+	IdentityKeys *IdentityKeysWrite  `json:"identity_keys,omitempty"`
+	IdentityRole *IdentityRoleRecord `json:"identity_role,omitempty"`
 }
 
 type reservationCommand struct {
@@ -555,6 +561,9 @@ type placementFSM struct {
 	// of the last change to them, the cursor workers poll with.
 	warmPools        map[string]*WarmPoolRecord
 	warmPoolsVersion uint64
+	// identity is the cloud-identity signing keys and role allow lists
+	// (fsm_identity.go, snapshotted). nil until the first write.
+	identity *identityState
 
 	// subMu guards subscribers. Separate from mu so a slow subscriber accept
 	// can't block FSM reads — Apply takes mu briefly to write, releases it,
@@ -1788,6 +1797,23 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 		return result
 	case opDeleteWarmPool:
 		if err := f.applyDeleteWarmPoolLocked(cmd); err != nil {
+			return err
+		}
+		return nil
+	case opPutIdentityKeys:
+		result, err := f.applyPutIdentityKeysLocked(cmd)
+		if err != nil {
+			return err
+		}
+		return result
+	case opPutIdentityRole:
+		result, err := f.applyPutIdentityRoleLocked(cmd)
+		if err != nil {
+			return err
+		}
+		return result
+	case opDeleteIdentityRole:
+		if err := f.applyDeleteIdentityRoleLocked(cmd); err != nil {
 			return err
 		}
 		return nil
@@ -3446,6 +3472,11 @@ type fsmSnapshotPayload struct {
 	// because no entry can be written until every server runs a build with
 	// it (warmPoolFSMOpsVersion).
 	WarmPools []WarmPoolRecord
+	// IdentityKeys and IdentityRoles are the cloud-identity signing keys
+	// (sealed) and role allow lists. Optional; an older snapshot decodes
+	// them as nil, which reads as "no keys, no roles".
+	IdentityKeys  *cloudidentity.KeySet
+	IdentityRoles []IdentityRoleRecord
 }
 
 type placementSnapshotRow struct {
@@ -3511,6 +3542,7 @@ func (f *placementFSM) Snapshot() (raft.FSMSnapshot, error) {
 			Issued:    cloneArtifactCatalogIssued(state.Issued),
 		}
 	}
+	identityKeys, identityRoles := f.identitySnapshotLocked()
 	return &fsmSnapshot{
 		version:            version,
 		rows:               rows,
@@ -3526,6 +3558,8 @@ func (f *placementFSM) Snapshot() (raft.FSMSnapshot, error) {
 		snapshotNodes:      snapshotNodes,
 		apiTokens:          f.apiTokens().snapshot(),
 		warmPools:          f.warmPoolsSnapshotLocked(),
+		identityKeys:       identityKeys,
+		identityRoles:      identityRoles,
 		recoveryStore:      f.recoveryStore,
 		recoveryRefs:       recoveryRefs,
 	}, nil
@@ -3609,6 +3643,7 @@ func (f *placementFSM) Restore(rc io.ReadCloser) (err error) {
 	f.restoreEgressProfilesLocked(payload.EgressProfiles)
 	f.apiTokens().restore(payload.APITokens, payload.Version)
 	f.restoreWarmPoolsLocked(payload.WarmPools, payload.Version)
+	f.restoreIdentityLocked(payload.IdentityKeys, payload.IdentityRoles)
 	f.auditACLs = make(map[string]AuditACL, len(payload.AuditACLs))
 	f.auditACLLatest = make(map[string]string)
 	f.auditACLBySandbox = make(map[string]map[string]struct{})
@@ -3762,6 +3797,8 @@ type fsmSnapshot struct {
 	snapshotNodes      map[string]string
 	apiTokens          []identity.TokenRecord
 	warmPools          []WarmPoolRecord
+	identityKeys       *cloudidentity.KeySet
+	identityRoles      []IdentityRoleRecord
 	recoveryStore      placementRecoveryStore
 	recoveryRefs       []string
 }
@@ -3788,6 +3825,8 @@ func (s *fsmSnapshot) Persist(sink raft.SnapshotSink) (err error) {
 		SnapshotNodes:      s.snapshotNodes,
 		APITokens:          s.apiTokens,
 		WarmPools:          s.warmPools,
+		IdentityKeys:       s.identityKeys,
+		IdentityRoles:      s.identityRoles,
 	}); err != nil {
 		_ = sink.Cancel()
 		return fmt.Errorf("fsmSnapshot: encode: %w", err)
