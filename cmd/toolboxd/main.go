@@ -361,11 +361,16 @@ func startUserCommand(logger *slog.Logger, args []string) {
 	cmd.Stderr = os.Stderr
 	cmd.Env = childEnviron()
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	// Held from fork until the pid is recorded: the reaper waits on it, so a
+	// command that exits at once is still known as the main program.
+	mainProgram.lockForStart()
 	if err := cmd.Start(); err != nil {
+		mainProgram.failedToStart()
 		logger.Error("failed to start user command", "args", args, "error", err)
 		return
 	}
 	userCommandPID.Store(int64(cmd.Process.Pid))
+	mainProgram.started(cmd.Process.Pid)
 	if err := cmd.Process.Release(); err != nil {
 		logger.Warn("failed to release user command handle", "error", err)
 	}
@@ -409,16 +414,18 @@ func startReaper(logger *slog.Logger) {
 				if !ok {
 					break
 				}
-				commandPID := int(userCommandPID.Load())
 				switch {
 				case tracked:
 					logger.Debug("reaped exec child", "pid", pid)
-				case pid == commandPID && status.Exited():
-					userCommandPID.CompareAndSwap(int64(commandPID), 0)
-					logger.Info("user command exited", "pid", pid, "code", status.ExitStatus())
-				case pid == commandPID && status.Signaled():
-					userCommandPID.CompareAndSwap(int64(commandPID), 0)
-					logger.Info("user command killed", "pid", pid, "signal", status.Signal())
+				case mainProgram.noteExit(pid, status):
+					// The main program's end is on /health from here on
+					// (main_program.go).
+					userCommandPID.CompareAndSwap(int64(pid), 0)
+					if status.Signaled() {
+						logger.Info("user command killed", "pid", pid, "signal", status.Signal())
+					} else {
+						logger.Info("user command exited", "pid", pid, "code", status.ExitStatus())
+					}
 				default:
 					logger.Debug("reaped orphan", "pid", pid)
 				}
@@ -455,6 +462,9 @@ func (s *server) routes() http.Handler {
 				// and whether new jobs lose their output (B2, ER3).
 				"exec_drainers":        execDrainers.Load(),
 				"exec_drainers_at_cap": execDrainersAtCap(),
+				// The main program's state, exit code or signal and times
+				// (L5): sandboxd reads it for destroyAfterExitFor.
+				"main_program": mainProgram.snapshot(),
 			})
 		case r.Method == http.MethodGet && r.URL.Path == "/version":
 			writeJSON(w, http.StatusOK, map[string]any{"version": version.Version, "features": featureList()})

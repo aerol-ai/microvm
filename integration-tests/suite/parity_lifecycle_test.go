@@ -170,3 +170,53 @@ func createRefused(t *testing.T, ctx context.Context, opts sdktypes.CreateSandbo
 	}
 	wantBadRequest(t, err, option)
 }
+
+// waitGone polls until the sandbox is deleted (404), and returns how long
+// that took.
+func waitGone(t *testing.T, c *harness.Client, id string, timeout time.Duration) time.Duration {
+	t.Helper()
+	start := time.Now()
+	for time.Since(start) < timeout {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		_, err := c.SDK().Get(ctx, id)
+		cancel()
+		if errors.Is(err, microvm.ErrNotFound) {
+			return time.Since(start)
+		}
+		if err != nil {
+			t.Fatalf("get %s: %v", id, err)
+		}
+		time.Sleep(5 * time.Second)
+	}
+	t.Fatalf("sandbox %s still exists after %v", id, timeout)
+	return 0
+}
+
+// UC-398 — destroyAfterExitFor (plan L5, P2): the main program ends with
+// code 3; the sandbox stays up with status_reason program_exited and
+// exit_code 3, then is deleted once the delay has passed.
+func TestParityDestroyAfterExitLive(t *testing.T) {
+	harness.Require(t, sc, "UC-398")
+	c := client(t)
+	sb := c.NewSandbox(t, sdktypes.CreateSandboxOptions{
+		Name:             harness.UniqueName(sc, t),
+		ContainerCommand: []string{"/bin/sh", "-c", "sleep 15; exit 3"},
+		Lifecycle:        &sdktypes.Lifecycle{DestroyAfterExitFor: time.Minute},
+	})
+	waitRunning(t, sb)
+
+	// The sweep looks once a minute: the exit shows within about two.
+	got := waitReason(t, c, sb.ID, "started", sdktypes.StatusReasonProgramExited, 3*time.Minute)
+	if got.ExitCode == nil || *got.ExitCode != 3 {
+		t.Fatalf("exit_code = %v, want 3", got.ExitCode)
+	}
+	seen := time.Now()
+	// Still usable while the timer runs: its files can be read.
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	if out := parityExec(t, ctx, sb, "echo still-here"); out != "still-here" {
+		t.Fatalf("exec after the program ended: %q", out)
+	}
+	waitGone(t, c, sb.ID, 3*time.Minute)
+	t.Logf("deleted %v after the exit showed", time.Since(seen).Round(time.Second))
+}

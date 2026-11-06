@@ -399,6 +399,25 @@ test("internal client create round-trips restartOnFailure", async () => {
   assert.equal(sandbox.lifecycle.restartOnFailure, true);
 });
 
+test("internal client create round-trips destroyAfterExitFor", async () => {
+  let seenRequest: Request | undefined;
+  const client = new APIClient({
+    baseURL: "https://api.example.com",
+    patToken: "pat-token",
+    fetch: async (input, init) => {
+      seenRequest = new Request(input, init);
+      return jsonResponse(apiSandbox("sb-exit", { lifecycle: { destroy_after_exit_for: 60_000_000_000 } }));
+    },
+  });
+
+  const sandbox = await client.create({ image: "ubuntu:22.04", lifecycle: { destroyAfterExitFor: 60_000_000_000 } });
+
+  assert.ok(seenRequest);
+  const body = (await seenRequest.json()) as { lifecycle?: Record<string, unknown> };
+  assert.deepEqual(body.lifecycle, { destroy_after_exit_for: 60_000_000_000 });
+  assert.equal(sandbox.lifecycle.destroyAfterExitFor, 60_000_000_000);
+});
+
 test("internal client uploadFile sends multipart form", async () => {
   let request: Request | undefined;
   const client = new APIClient({

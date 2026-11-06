@@ -760,6 +760,13 @@ class ClientTests(unittest.TestCase):
         client.create({"image": "ubuntu:22.04", "lifecycle": {"restartOnFailure": False, "stopAtAge": 5}})
         self.assertEqual(client.calls[1][2]["lifecycle"], {"restart_on_failure": False, "stop_at_age": 5})
 
+    def test_create_round_trips_destroy_after_exit_for(self):
+        client = RecordingMicroVM()
+        sandbox = client.create({"image": "ubuntu:22.04", "lifecycle": {"destroyAfterExitFor": 60_000_000_000}})
+
+        self.assertEqual(client.calls[0][2]["lifecycle"], {"destroy_after_exit_for": 60_000_000_000})
+        self.assertEqual(sandbox.lifecycle, {"destroyAfterExitFor": 60_000_000_000})
+
     def test_create_snapshot_maps_request_and_response_shapes(self):
         client = RecordingMicroVM()
         snapshot = client.create_snapshot("sb-1", "snapshots/demo:v1")

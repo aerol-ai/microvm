@@ -3,6 +3,7 @@ package types
 import (
 	"encoding/json"
 	"testing"
+	"time"
 
 	"github.com/aerol-ai/microvm/pkg/models"
 )
@@ -41,6 +42,9 @@ func TestStatusReasonsDecode(t *testing.T) {
 	on, err := json.Marshal(Lifecycle{RestartOnFailure: true})
 	if err != nil || string(on) != `{"restart_on_failure":true}` {
 		t.Fatalf("Lifecycle{RestartOnFailure} = %s, %v", on, err)
+	}
+	if exit, _ := json.Marshal(Lifecycle{DestroyAfterExitFor: time.Minute}); string(exit) != `{"destroy_after_exit_for":60000000000}` {
+		t.Fatalf("Lifecycle{DestroyAfterExitFor} = %s", exit)
 	}
 	if off, _ := json.Marshal(Lifecycle{}); string(off) != `{}` {
 		t.Fatalf("empty Lifecycle = %s", off)

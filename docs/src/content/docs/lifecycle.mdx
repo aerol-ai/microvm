@@ -17,6 +17,7 @@ Every timer is optional, and a timer you leave out is off.
 | `destroyIfIdleFor` | Delete the sandbox after it has had no activity for this long. |
 | `stopAtAge` | Stop the sandbox this long after it was created. |
 | `destroyAtAge` | Delete the sandbox this long after it was created. |
+| `destroyAfterExitFor` | Delete the sandbox this long after its main program ends. See [below](#delete-when-the-program-ends). |
 | `serverless` | Start the sandbox again by itself when a request reaches it. Needs `stopIfIdleFor`. See [Ghost sandboxes](/ghost-sandboxes/). |
 
 Activity means anything that reaches the sandbox: a command, a file read or write, a terminal or SSH session, or traffic to its public URL.
@@ -138,6 +139,79 @@ The SDKs take each time in nanoseconds (billionths of a second). One hour is `60
     ```
   </TabItem>
 </Tabs>
+
+## Delete when the program ends
+
+A sandbox's main program is the command it starts with: the image's own start command, or the `containerCommand` you pass. When that program ends, the sandbox keeps running, so you can still read its files. Set `destroyAfterExitFor` to delete the sandbox a while after the program ends.
+
+This example runs a job and deletes the sandbox 10 minutes after the job ends. In the meantime you can download its results.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const MINUTE = 60 * 1_000_000_000; // one minute in nanoseconds
+
+    const sandbox = await client.create({
+      image: "python:3.12-slim",
+      containerCommand: ["python3", "/work/job.py"],
+      lifecycle: { destroyAfterExitFor: 10 * MINUTE },
+    });
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    MINUTE = 60 * 1_000_000_000  # one minute in nanoseconds
+
+    sandbox = client.create(
+        image="python:3.12-slim",
+        container_command=["python3", "/work/job.py"],
+        lifecycle={"destroyAfterExitFor": 10 * MINUTE},
+    )
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    sandbox, err := client.Create(ctx, sdktypes.CreateSandboxOptions{
+        Image:            "python:3.12-slim",
+        ContainerCommand: []string{"python3", "/work/job.py"},
+        Lifecycle:        &sdktypes.Lifecycle{DestroyAfterExitFor: 10 * time.Minute},
+    })
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    let minute: u64 = 60 * 1_000_000_000; // one minute in nanoseconds
+
+    let sandbox = client.create(CreateOptions {
+        image: "python:3.12-slim".into(),
+        container_command: Some(vec!["python3".into(), "/work/job.py".into()]),
+        lifecycle: Some(Lifecycle {
+            destroy_after_exit_for: 10 * minute,
+            ..Default::default()
+        }),
+        ..Default::default()
+    })?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    long minute = Duration.ofMinutes(1).toNanos(); // java.time.Duration
+
+    Sandbox sandbox = client.create(new CreateOptions()
+        .setImage("python:3.12-slim")
+        .setContainerCommand(List.of("python3", "/work/job.py"))
+        .setLifecycle(new Lifecycle().setDestroyAfterExitFor(10 * minute)));
+    ```
+  </TabItem>
+</Tabs>
+
+Once the program has ended, `statusReason` is `program_exited` and `exitCode` is its exit code, while the sandbox is still running. A program killed by a signal gets `128` plus the signal number, the way a shell reports it. A start command that could not start at all counts as ended with `127`.
+
+- **The server checks about once a minute**, so the delete can come up to a minute late.
+- **Stopping the sandbox does not cancel the timer.** The program has already ended. Starting the sandbox again runs the program again, which cancels it.
+- **The timer survives a server restart.** The server saves the time the program ended.
+- **It works on Docker, gVisor, containerd and Firecracker sandboxes.** WebAssembly and V8-isolate sandboxes have no main program and reject it with a `400` error.
+- **A sandbox needs an agent from this release or later.** A Firecracker template keeps the agent it was built with, so rebuild older templates. Without a new agent the option does nothing.
 
 ## Why a sandbox stopped
 

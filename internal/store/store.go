@@ -1079,6 +1079,12 @@ func open(path string, secretCipher *secrets.Cipher) (*Store, error) {
 		`ALTER TABLE sandboxes ADD COLUMN restart_failures INTEGER NOT NULL DEFAULT 0;`,
 		`ALTER TABLE sandboxes ADD COLUMN restart_at DATETIME;`,
 		`ALTER TABLE sandboxes ADD COLUMN last_restarted_at DATETIME;`,
+		// Destroy after the main program exits (L5): the lifecycle timer, and
+		// when the sweep saw the program end. The exit is stored, not kept in
+		// memory, so the timer survives a daemon restart; NULL while the
+		// program runs.
+		`ALTER TABLE sandboxes ADD COLUMN destroy_after_exit_for_ns INTEGER NOT NULL DEFAULT 0;`,
+		`ALTER TABLE sandboxes ADD COLUMN program_exited_at DATETIME;`,
 		// Checkpoint pushes are async and outlive their sandbox: without the
 		// lifecycle they were started for, a push that lands after the id is
 		// reused writes the old incarnation's artifact into the new one.
@@ -2185,8 +2191,9 @@ func (s *Store) insertSandbox(ctx context.Context, exec dbExecer, sandbox *model
 			owner_ref, fleet_suspended,
 			tenant_id, audit_incarnation_id,
 			status_reason, exit_code,
-			restart_on_failure, restart_failures, restart_at, last_restarted_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			restart_on_failure, restart_failures, restart_at, last_restarted_at,
+			destroy_after_exit_for_ns, program_exited_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`,
 		sandbox.ID,
 		sandbox.Image,
@@ -2250,6 +2257,8 @@ func (s *Store) insertSandbox(ctx context.Context, exec dbExecer, sandbox *model
 		sandbox.RestartFailures,
 		nullableTime(sandbox.RestartAt),
 		nullableTime(sandbox.LastRestartedAt),
+		int64(sandbox.Lifecycle.DestroyAfterExitFor),
+		nullableTime(sandbox.ProgramExitedAt),
 	)
 	if err != nil {
 		if isSandboxNameConflict(err, sandbox.Name) {
@@ -2425,6 +2434,10 @@ func (s *Store) Upsert(ctx context.Context, sandbox *models.Sandbox) error {
 	// last_restarted_at) is not updated here at all: only ScheduleRestart,
 	// MarkRestarted and CancelRestart write it, so a whole-row write from a
 	// read taken before a crash cannot drop the restart that crash scheduled.
+	//
+	// program_exited_at is written only by RecordProgramExit, and cleared
+	// here only on a write that starts the sandbox: a start runs the main
+	// program again, while a stop keeps the exit and its destroy timer.
 	_, err = exec.ExecContext(ctx, `
 		INSERT INTO sandboxes (
 			id, image, status, public_url, container_id, container_ip, cpu, memory_mb, disk_gb,
@@ -2447,8 +2460,9 @@ func (s *Store) Upsert(ctx context.Context, sandbox *models.Sandbox) error {
 			owner_ref, fleet_suspended,
 			tenant_id, audit_incarnation_id,
 			status_reason, exit_code,
-			restart_on_failure, restart_failures, restart_at, last_restarted_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			restart_on_failure, restart_failures, restart_at, last_restarted_at,
+			destroy_after_exit_for_ns, program_exited_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			image = excluded.image,
 			status = excluded.status,
@@ -2517,7 +2531,12 @@ func (s *Store) Upsert(ctx context.Context, sandbox *models.Sandbox) error {
 				WHEN excluded.status <> sandboxes.status THEN excluded.exit_code
 				ELSE sandboxes.exit_code
 			END,
-			restart_on_failure = excluded.restart_on_failure
+			restart_on_failure = excluded.restart_on_failure,
+			destroy_after_exit_for_ns = excluded.destroy_after_exit_for_ns,
+			program_exited_at = CASE
+				WHEN excluded.status = 'started' AND sandboxes.status <> 'started' THEN NULL
+				ELSE sandboxes.program_exited_at
+			END
 	`,
 		sandbox.ID,
 		sandbox.Image,
@@ -2581,6 +2600,8 @@ func (s *Store) Upsert(ctx context.Context, sandbox *models.Sandbox) error {
 		sandbox.RestartFailures,
 		nullableTime(sandbox.RestartAt),
 		nullableTime(sandbox.LastRestartedAt),
+		int64(sandbox.Lifecycle.DestroyAfterExitFor),
+		nullableTime(sandbox.ProgramExitedAt),
 		boolToInt(sandbox.ToolboxToken != ""),
 	)
 	if err != nil {
@@ -2635,7 +2656,8 @@ func (s *Store) Get(ctx context.Context, id string) (*models.Sandbox, error) {
 			owner_ref, fleet_suspended,
 			tenant_id, audit_incarnation_id,
 			status_reason, exit_code,
-			restart_on_failure, restart_failures, restart_at, last_restarted_at
+			restart_on_failure, restart_failures, restart_at, last_restarted_at,
+			destroy_after_exit_for_ns, program_exited_at
 		FROM sandboxes
 		WHERE id = ?
 	`, id)
@@ -2706,7 +2728,8 @@ func (s *Store) List(ctx context.Context) ([]*models.Sandbox, error) {
 			owner_ref, fleet_suspended,
 			tenant_id, audit_incarnation_id,
 			status_reason, exit_code,
-			restart_on_failure, restart_failures, restart_at, last_restarted_at
+			restart_on_failure, restart_failures, restart_at, last_restarted_at,
+			destroy_after_exit_for_ns, program_exited_at
 		FROM sandboxes
 		ORDER BY created_at DESC
 	`)
@@ -2779,7 +2802,8 @@ func (s *Store) ListByOwner(ctx context.Context, ownerRef string) ([]*models.San
 			owner_ref, fleet_suspended,
 			tenant_id, audit_incarnation_id,
 			status_reason, exit_code,
-			restart_on_failure, restart_failures, restart_at, last_restarted_at
+			restart_on_failure, restart_failures, restart_at, last_restarted_at,
+			destroy_after_exit_for_ns, program_exited_at
 		FROM sandboxes
 		WHERE owner_ref = ?
 		ORDER BY created_at DESC
@@ -2839,7 +2863,8 @@ func (s *Store) ListByRuntime(ctx context.Context, runtime string) ([]*models.Sa
 			owner_ref, fleet_suspended,
 			tenant_id, audit_incarnation_id,
 			status_reason, exit_code,
-			restart_on_failure, restart_failures, restart_at, last_restarted_at
+			restart_on_failure, restart_failures, restart_at, last_restarted_at,
+			destroy_after_exit_for_ns, program_exited_at
 		FROM sandboxes
 		WHERE runtime = ?
 		ORDER BY created_at DESC
@@ -3177,6 +3202,7 @@ func (s *Store) UpdateLifecycle(ctx context.Context, id string, l models.Lifecyc
 		    destroy_at_age_ns = ?,
 		    serverless = ?,
 		    restart_on_failure = ?,
+		    destroy_after_exit_for_ns = ?,
 		    updated_at = ?
 		WHERE id = ?
 	`,
@@ -3186,6 +3212,7 @@ func (s *Store) UpdateLifecycle(ctx context.Context, id string, l models.Lifecyc
 		int64(l.DestroyAtAge),
 		boolToInt(l.Serverless),
 		boolToInt(l.RestartOnFailure),
+		int64(l.DestroyAfterExitFor),
 		time.Now().UTC(),
 		id,
 	)
@@ -4985,6 +5012,27 @@ func (s *Store) CancelRestart(ctx context.Context, id, reason string) error {
 	`, reason, reason, reason, id)
 }
 
+// RecordProgramExit stores the end of a started sandbox's main program: when
+// it ended, status_reason program_exited and its exit code. Only the first
+// report counts (program_exited_at must still be NULL) and only while the
+// row is started, so a sandbox that stopped or restarted meanwhile is left
+// alone. recorded reports whether this call stored it.
+func (s *Store) RecordProgramExit(ctx context.Context, id string, at time.Time, exitCode int) (bool, error) {
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE sandboxes
+		SET program_exited_at = ?, status_reason = ?, exit_code = ?, updated_at = ?
+		WHERE id = ? AND status = ? AND program_exited_at IS NULL
+	`, at.UTC(), models.StatusReasonProgramExited, exitCode, time.Now().UTC(), id, string(models.SandboxStatusStarted))
+	if err != nil {
+		return false, fmt.Errorf("record program exit: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("record program exit: %w", err)
+	}
+	return affected == 1, nil
+}
+
 // execOneSandbox runs a single-row sandboxes UPDATE and maps "no row" to
 // ErrNotFound.
 func (s *Store) execOneSandbox(ctx context.Context, what, query string, args ...any) error {
@@ -5468,6 +5516,8 @@ func (s *Store) scanSandbox(scanner interface {
 	var exitCode sql.NullInt64
 	var restartOnFailure int
 	var restartAt, lastRestartedAt sql.NullTime
+	var destroyAfterExitNs int64
+	var programExitedAt sql.NullTime
 
 	err := scanner.Scan(
 		&sandbox.ID,
@@ -5532,6 +5582,8 @@ func (s *Store) scanSandbox(scanner interface {
 		&sandbox.RestartFailures,
 		&restartAt,
 		&lastRestartedAt,
+		&destroyAfterExitNs,
+		&programExitedAt,
 	)
 	if err != nil {
 		return nil, err
@@ -5539,6 +5591,7 @@ func (s *Store) scanSandbox(scanner interface {
 	sandbox.ExitCode = intFromNull(exitCode)
 	sandbox.RestartAt = timeFromNull(restartAt)
 	sandbox.LastRestartedAt = timeFromNull(lastRestartedAt)
+	sandbox.ProgramExitedAt = timeFromNull(programExitedAt)
 	sandbox.FleetSuspended = fleetSuspended == 1
 	sandbox.NetworkQuotaExceeded = netQuotaExceeded == 1
 	if netQuotaExceededAt.Valid {
@@ -5585,12 +5638,13 @@ func (s *Store) scanSandbox(scanner interface {
 	sandbox.AllowPublicTraffic = &allowPublic
 	sandbox.ToolboxEnabled = toolboxEnabled == 1
 	sandbox.Lifecycle = models.Lifecycle{
-		StopIfIdleFor:    time.Duration(stopIfIdleNs),
-		DestroyIfIdleFor: time.Duration(destroyIfIdleNs),
-		StopAtAge:        time.Duration(stopAtAgeNs),
-		DestroyAtAge:     time.Duration(destroyAtAgeNs),
-		Serverless:       serverless == 1,
-		RestartOnFailure: restartOnFailure == 1,
+		StopIfIdleFor:       time.Duration(stopIfIdleNs),
+		DestroyIfIdleFor:    time.Duration(destroyIfIdleNs),
+		StopAtAge:           time.Duration(stopAtAgeNs),
+		DestroyAtAge:        time.Duration(destroyAtAgeNs),
+		Serverless:          serverless == 1,
+		RestartOnFailure:    restartOnFailure == 1,
+		DestroyAfterExitFor: time.Duration(destroyAfterExitNs),
 	}
 	if policy, err := models.NormalizeFailoverPolicy(failoverPolicy); err == nil && policy == models.FailoverPolicyRecreate {
 		sandbox.Failover = &models.Failover{Policy: policy}

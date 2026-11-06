@@ -439,6 +439,13 @@ type Lifecycle struct {
 	// runtimes. Not a timer, so it does not count for IsZero: a sandbox
 	// with only this flag still gets the server's default timers.
 	RestartOnFailure bool `json:"restart_on_failure,omitempty"`
+	// DestroyAfterExitFor destroys the sandbox this long after its main
+	// program (the container command toolboxd runs) ends (L5, owner row
+	// P2). The lifecycle sweep reads the program's state from toolboxd's
+	// /health and stores the exit, so a daemon restart keeps the timer.
+	// Zero is off. WASM and isolate sandboxes have no main program and
+	// refuse it.
+	DestroyAfterExitFor time.Duration `json:"destroy_after_exit_for,omitempty"`
 }
 
 // MaxLifecycleDuration caps each Lifecycle field. 30 days is generous for
@@ -453,7 +460,7 @@ const MaxLifecycleDuration = 30 * 24 * time.Hour
 //     not fire before stop. Without this we could surprise a user who set
 //     "stop at 2h, destroy at 1h" by skipping the stop entirely.
 func (l Lifecycle) Validate() error {
-	if l.StopIfIdleFor < 0 || l.DestroyIfIdleFor < 0 || l.StopAtAge < 0 || l.DestroyAtAge < 0 {
+	if l.StopIfIdleFor < 0 || l.DestroyIfIdleFor < 0 || l.StopAtAge < 0 || l.DestroyAtAge < 0 || l.DestroyAfterExitFor < 0 {
 		return errors.New("lifecycle durations must be non-negative")
 	}
 	checks := []struct {
@@ -464,6 +471,7 @@ func (l Lifecycle) Validate() error {
 		{"destroy_if_idle_for", l.DestroyIfIdleFor},
 		{"stop_at_age", l.StopAtAge},
 		{"destroy_at_age", l.DestroyAtAge},
+		{"destroy_after_exit_for", l.DestroyAfterExitFor},
 	}
 	for _, c := range checks {
 		if c.v > MaxLifecycleDuration {
@@ -519,11 +527,12 @@ func (l Lifecycle) ValidateWithBypassFloor(pollInterval, reconcileInterval time.
 	return nil
 }
 
-// IsZero reports whether all four timers are disabled. Useful for skipping
-// Lifecycle inspection in the sweep when there's nothing to evaluate.
+// IsZero reports whether every timer is disabled and the sandbox is not
+// serverless: a sandbox with no lifecycle of its own, which the server-wide
+// defaults apply to. RestartOnFailure is not a timer and does not count.
 func (l Lifecycle) IsZero() bool {
 	return l.StopIfIdleFor == 0 && l.DestroyIfIdleFor == 0 &&
-		l.StopAtAge == 0 && l.DestroyAtAge == 0 && !l.Serverless
+		l.StopAtAge == 0 && l.DestroyAtAge == 0 && l.DestroyAfterExitFor == 0 && !l.Serverless
 }
 
 // UpdateLifecycleRequest is the body for PUT /v1/sandboxes/{id}/lifecycle.
@@ -916,9 +925,13 @@ type Sandbox struct {
 	// failure backoff state (L1): consecutive failures, when the pending
 	// restart is due (nil when none is pending), and when the last restart
 	// ran. Stored so a daemon restart keeps the backoff; never on the wire.
-	RestartFailures  int        `json:"-"`
-	RestartAt        *time.Time `json:"-"`
-	LastRestartedAt  *time.Time `json:"-"`
+	RestartFailures int        `json:"-"`
+	RestartAt       *time.Time `json:"-"`
+	LastRestartedAt *time.Time `json:"-"`
+	// ProgramExitedAt is when the main program ended, as the lifecycle
+	// sweep recorded it from toolboxd (L5); nil while it runs, and cleared
+	// when the sandbox starts again. destroy_after_exit_for counts from it.
+	ProgramExitedAt  *time.Time `json:"-"`
 	ContainerCommand []string   `json:"container_command,omitempty"`
 	Lifecycle        Lifecycle  `json:"lifecycle"`
 	Failover         *Failover  `json:"failover,omitempty"`

@@ -150,6 +150,12 @@ export interface Lifecycle {
    * and V8-isolate sandboxes refuse it with a 400.
    */
   restartOnFailure?: boolean;
+  /**
+   * Delete the sandbox this long (integer nanoseconds) after its main
+   * program ends. The server checks about once a minute. Not for
+   * WebAssembly or V8-isolate sandboxes, which have no main program (400).
+   */
+  destroyAfterExitFor?: number;
 }
 
 export type UpdateLifecycleOptions = Lifecycle;

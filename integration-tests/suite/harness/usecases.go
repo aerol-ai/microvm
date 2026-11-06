@@ -981,6 +981,7 @@ var Registry = []UseCase{
 	{ID: "UC-395", Title: "status_reason: a stop call records user_stop with no exit code and a start clears it; a one-minute stopIfIdleFor records idle", Implemented: true},
 	{ID: "UC-396", Title: "restartOnFailure restarts a crashed Docker sandbox after 5 s, then 10 s, with status_reason restarted and the crash's exit code; a stop afterwards stays stopped", Requires: []Capability{CapDocker}, Implemented: true},
 	{ID: "UC-397", Title: "restartOnFailure is refused at create on Firecracker with a 400 that names the option", Requires: []Capability{CapFirecracker}, Implemented: true},
+	{ID: "UC-398", Title: "destroyAfterExitFor: the main program ends with code 3; the sandbox stays up and usable with status_reason program_exited and exit_code 3, then is deleted once the one-minute delay has passed", Implemented: true},
 }
 
 // byID is a lookup built once for the report generator.

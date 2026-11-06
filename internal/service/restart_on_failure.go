@@ -86,7 +86,7 @@ func validateLifecycleRuntime(l models.Lifecycle, runtime string) error {
 	if l.RestartOnFailure && !restartOnFailureRuntimeSupported(runtime) {
 		return fmt.Errorf("invalid lifecycle: restart_on_failure is not supported on runtime %q; only docker, gvisor and containerd sandboxes restart on failure", runtime)
 	}
-	return nil
+	return validateLifecycleExitRuntime(l, runtime)
 }
 
 // isRestartFailureReason reports whether a stop reason is a failure restart

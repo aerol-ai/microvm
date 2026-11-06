@@ -4170,6 +4170,7 @@ mod tests {
                 destroy_at_age: 86400000000000,
                 serverless: false,
                 restart_on_failure: false,
+                destroy_after_exit_for: 0,
             }
         );
         assert_eq!(
@@ -4240,6 +4241,7 @@ mod tests {
                 destroy_at_age: 172800000000000,
                 serverless: false,
                 restart_on_failure: false,
+                destroy_after_exit_for: 0,
             }
         );
     }
@@ -4338,6 +4340,19 @@ mod tests {
             })
         );
         assert!(sandbox.data.lifecycle.restart_on_failure);
+    }
+
+    #[test]
+    fn lifecycle_destroy_after_exit_for_round_trips() {
+        let lc = Lifecycle {
+            destroy_after_exit_for: 60_000_000_000,
+            ..Default::default()
+        };
+        let wire = serde_json::to_value(&lc).unwrap();
+        assert_eq!(wire, serde_json::json!({ "destroy_after_exit_for": 60_000_000_000u64 }));
+        let back: Lifecycle = serde_json::from_value(wire).unwrap();
+        assert_eq!(back, lc);
+        assert_eq!(serde_json::to_value(Lifecycle::default()).unwrap(), serde_json::json!({}));
     }
 
     #[test]

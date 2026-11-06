@@ -18,6 +18,10 @@ public class Lifecycle {
     // the wait goes back to 5 s after 10 minutes of running. Docker, gVisor
     // and containerd sandboxes only (others answer 400).
     public Boolean restartOnFailure;
+    // destroyAfterExitFor deletes the sandbox this long (nanoseconds) after
+    // its main program ends; checked about once a minute. Not for
+    // WebAssembly or V8-isolate sandboxes (400).
+    public Long destroyAfterExitFor;
 
     public Lifecycle setStopIfIdleFor(Long stopIfIdleFor) {
         this.stopIfIdleFor = stopIfIdleFor;
@@ -49,6 +53,11 @@ public class Lifecycle {
         return this;
     }
 
+    public Lifecycle setDestroyAfterExitFor(Long destroyAfterExitFor) {
+        this.destroyAfterExitFor = destroyAfterExitFor;
+        return this;
+    }
+
     public Lifecycle copy() {
         return new Lifecycle()
             .setStopIfIdleFor(stopIfIdleFor)
@@ -56,6 +65,7 @@ public class Lifecycle {
             .setStopAtAge(stopAtAge)
             .setDestroyAtAge(destroyAtAge)
             .setServerless(serverless)
-            .setRestartOnFailure(restartOnFailure);
+            .setRestartOnFailure(restartOnFailure)
+            .setDestroyAfterExitFor(destroyAfterExitFor);
     }
 }

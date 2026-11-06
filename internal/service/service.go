@@ -13,6 +13,7 @@ import (
 	"log/slog"
 	mathrand "math/rand"
 	"net"
+	"net/http"
 	"net/url"
 	"path"
 	"slices"
@@ -431,6 +432,9 @@ type Service struct {
 	restartBase      context.Context
 	restartClock     func() time.Time
 	restartAfterFunc func(time.Duration, func()) restartTimer
+	// programExitHTTP is a test seam for the destroy-after-exit probe of
+	// toolboxd's /health (program_exit.go); nil uses the toolbox client.
+	programExitHTTP *http.Client
 	// egressBlocksPending holds sandboxes whose last gateway block write
 	// failed; they are re-applied from the store until one succeeds.
 	egressBlocksPending egressBlockPending
@@ -6796,6 +6800,9 @@ func (s *Service) runLifecycleSweep(ctx context.Context) {
 		s.logger.Warn("idle sweep using LastActiveAt fallback",
 			"reason", "netstats_poll_failed", "netstats_fallback", true)
 	}
+	// Main programs that ended, for destroy_after_exit_for: asked first so
+	// a short delay can act in this same pass.
+	s.probeProgramExits(ctx, sandboxes)
 	for _, sandbox := range sandboxes {
 		// A restart on failure that lost its timer (the daemon restarted
 		// while it waited) gets one now; a due one runs at once.
@@ -6981,6 +6988,11 @@ func lifecycleDecision(sb *models.Sandbox, now time.Time, globalIdle time.Durati
 		return lifecycleDestroy, ""
 	}
 	if l.DestroyAtAge > 0 && age >= l.DestroyAtAge {
+		return lifecycleDestroy, ""
+	}
+	// The main program's end, as the sweep recorded it, counts whatever the
+	// status: a sandbox stopped after its program ended is still done.
+	if l.DestroyAfterExitFor > 0 && sb.ProgramExitedAt != nil && now.Sub(*sb.ProgramExitedAt) >= l.DestroyAfterExitFor {
 		return lifecycleDestroy, ""
 	}
 	// Stop only applies to running sandboxes — re-stopping a stopped one

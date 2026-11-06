@@ -618,6 +618,11 @@ class MicroVMClientTest {
             assertEquals(Map.of("restart_on_failure", Boolean.TRUE), lifecycle);
             assertEquals(Boolean.TRUE, sandbox.lifecycle.restartOnFailure);
             assertEquals(Boolean.TRUE, sandbox.lifecycle.copy().restartOnFailure, "copy keeps the flag");
+
+            Lifecycle exit = new Lifecycle().setDestroyAfterExitFor(60_000_000_000L);
+            Map<String, Object> wire = castMap(JsonSupport.read(JsonSupport.writeBytes(exit), Map.class));
+            assertEquals(60_000_000_000L, ((Number) wire.get("destroy_after_exit_for")).longValue());
+            assertEquals(Long.valueOf(60_000_000_000L), exit.copy().destroyAfterExitFor);
         } finally {
             server.stop(0);
         }

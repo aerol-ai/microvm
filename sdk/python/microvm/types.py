@@ -107,6 +107,10 @@ class Lifecycle(TypedDict, total=False):
     # the wait goes back to 5 s after 10 minutes of running. Docker, gVisor
     # and containerd sandboxes only (others answer 400).
     restartOnFailure: bool
+    # Delete the sandbox this long (integer nanoseconds) after its main
+    # program ends; checked about once a minute. Not for WebAssembly or
+    # V8-isolate sandboxes (400).
+    destroyAfterExitFor: int
 
 
 UpdateLifecycleOptions = Lifecycle

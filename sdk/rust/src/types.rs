@@ -345,6 +345,15 @@ pub struct Lifecycle {
     /// containerd sandboxes only (others answer 400).
     #[serde(rename = "restart_on_failure", default, skip_serializing_if = "is_false")]
     pub restart_on_failure: bool,
+    /// Deletes the sandbox this long (nanoseconds) after its main program
+    /// ends; checked about once a minute. Not for WebAssembly or V8-isolate
+    /// sandboxes (400).
+    #[serde(
+        rename = "destroy_after_exit_for",
+        default,
+        skip_serializing_if = "is_zero_u64"
+    )]
+    pub destroy_after_exit_for: u64,
 }
 
 fn is_false(b: &bool) -> bool {
