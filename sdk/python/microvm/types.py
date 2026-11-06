@@ -102,6 +102,11 @@ class Lifecycle(TypedDict, total=False):
     # stopIfIdleFor must also be set explicitly — the server rejects
     # serverless=True without an idle window.
     serverless: bool
+    # restartOnFailure=True starts the sandbox again when it crashes or runs
+    # out of memory, waiting 5 s, then 10 s, 20 s and so on up to 5 minutes;
+    # the wait goes back to 5 s after 10 minutes of running. Docker, gVisor
+    # and containerd sandboxes only (others answer 400).
+    restartOnFailure: bool
 
 
 UpdateLifecycleOptions = Lifecycle

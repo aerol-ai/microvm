@@ -197,6 +197,10 @@ func (s *Service) stopSandboxForReason(ctx context.Context, id string, mode stop
 	if err != nil {
 		return nil, err
 	}
+	// Read before anything changes: a sandbox already down and waiting for
+	// a restart on failure takes this stop's reason, since its status will
+	// not change and Upsert keeps the reason of a write that changes none.
+	alreadyStopped := sandbox.Status == models.SandboxStatusStopped
 
 	// Drop the warm-preflight cache up front. From this moment on the
 	// ingress proxy must take the slow path (store hit → cold-start
@@ -283,6 +287,17 @@ func (s *Service) stopSandboxForReason(ctx context.Context, id string, mode stop
 	}
 	sandbox.UpdatedAt = time.Now().UTC()
 	if err := s.store.Upsert(ctx, sandbox); err != nil {
+		return nil, err
+	}
+	// A stop is never undone by a restart on failure: drop any pending one,
+	// including one a crash scheduled while this stop was on its way.
+	cancelReason := ""
+	if alreadyStopped {
+		cancelReason = reason
+	}
+	// A failed cancel fails the stop, so the caller retries it rather than
+	// see a "stopped" that the sweep's restart later undoes.
+	if err := s.cancelPendingRestart(ctx, sandbox, cancelReason); err != nil {
 		return nil, err
 	}
 	return sandbox, nil

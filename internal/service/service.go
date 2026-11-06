@@ -422,6 +422,15 @@ type Service struct {
 	// write the whole struct back (E2B timeout/connect, Daytona idle timers)
 	// race, and the later writer clobbers the earlier one's field.
 	lifecycleLocks egressPolicyLocks
+	// Restart on failure (restart_on_failure.go): one timer per sandbox
+	// waiting to restart, the daemon context they run under, and test seams
+	// for the clock and the timer.
+	restartMu        sync.Mutex
+	restartTimers    map[string]restartTimerEntry
+	restartGen       uint64
+	restartBase      context.Context
+	restartClock     func() time.Time
+	restartAfterFunc func(time.Duration, func()) restartTimer
 	// egressBlocksPending holds sandboxes whose last gateway block write
 	// failed; they are re-applied from the store until one succeeds.
 	egressBlocksPending egressBlockPending
@@ -2036,6 +2045,13 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 	if chosenRuntime == models.RuntimeKata {
 		return nil, fmt.Errorf("runtime %q: %w", chosenRuntime, models.ErrRuntimeNotImplemented)
 	}
+	// Lifecycle options a runtime cannot honour are refused before any work
+	// (restart_on_failure needs die events). A field check, nothing more.
+	if req.Lifecycle != nil {
+		if err := validateLifecycleRuntime(*req.Lifecycle, chosenRuntime); err != nil {
+			return nil, err
+		}
+	}
 	// Fail closed: no sandbox on a runtime whose node guard failed to
 	// install, since it could reach every service on the node. One atomic
 	// map read (node_guard.go).
@@ -3450,6 +3466,21 @@ func sandboxMatchesTags(sb *models.Sandbox, want map[string]string) bool {
 }
 
 func (s *Service) StartSandbox(ctx context.Context, id string) (*models.Sandbox, error) {
+	return s.startSandbox(ctx, id, startRequested)
+}
+
+// startCause says who starts a sandbox: a call (API, facade, wake, fleet
+// restore) or a restart on failure.
+type startCause int
+
+const (
+	startRequested startCause = iota
+	// startForRestart keeps LastActiveAt: a restart is not activity, so a
+	// sandbox that keeps crashing still reaches its idle timer.
+	startForRestart
+)
+
+func (s *Service) startSandbox(ctx context.Context, id string, cause startCause) (*models.Sandbox, error) {
 	sandbox, err := s.scopedGet(ctx, id)
 	if err != nil {
 		return nil, err
@@ -3575,7 +3606,9 @@ func (s *Service) StartSandbox(ctx context.Context, id string) (*models.Sandbox,
 	sandbox.StatusReason = ""
 	sandbox.ExitCode = nil
 	sandbox.UpdatedAt = time.Now().UTC()
-	sandbox.LastActiveAt = time.Now().UTC()
+	if cause != startForRestart {
+		sandbox.LastActiveAt = time.Now().UTC()
+	}
 	// Put the stored egress policy back before the start reports success or
 	// publishes a route: the stop event cleared it, since the IP can be
 	// reassigned to another container. Fail closed: a sandbox whose isolation
@@ -3610,6 +3643,13 @@ func (s *Service) StartSandbox(ctx context.Context, id string) (*models.Sandbox,
 
 	if err := s.store.Upsert(ctx, sandbox); err != nil {
 		return nil, err
+	}
+	// A start by a call answers a crash too: a restart still waiting for
+	// its backoff would only start it a second time.
+	if cause == startRequested && sandbox.RestartAt != nil {
+		// Logged inside; a running sandbox is not restarted, and its next
+		// stop cancels again.
+		_ = s.cancelPendingRestart(ctx, sandbox, "")
 	}
 	s.settleEgressAttach(id)
 	s.settleEnforcedEgress(ctx, sandbox, clearGen)
@@ -3652,6 +3692,8 @@ func (s *Service) StopSandbox(ctx context.Context, id string) (*models.Sandbox, 
 }
 
 func (s *Service) DestroySandbox(ctx context.Context, id string) error {
+	// A pending restart on failure is for a sandbox that is going away.
+	s.cancelRestartTimer(id)
 	unlock := s.destroyLocks.lock(id)
 	defer unlock()
 	sandbox, err := s.scopedGet(ctx, id)
@@ -4661,8 +4703,20 @@ func (s *Service) UpdateLifecycle(ctx context.Context, id string, l models.Lifec
 	if err != nil {
 		return nil, err
 	}
+	if err := validateLifecycleRuntime(l, s.sandboxRuntime(priorSandbox)); err != nil {
+		return nil, err
+	}
 	updated, _, err := s.writeLifecycleLocked(ctx, id, l, priorSandbox)
 	return updated, err
+}
+
+// sandboxRuntime is the runtime a sandbox runs on; a pre-migration row with
+// none runs on the host default.
+func (s *Service) sandboxRuntime(sb *models.Sandbox) string {
+	if sb.Runtime != "" {
+		return sb.Runtime
+	}
+	return s.cfg.Runtime
 }
 
 // writeLifecycleLocked persists lifecycle l for id and replays the resulting
@@ -6717,6 +6771,7 @@ func (s *Service) startPeriodic(ctx context.Context, interval, timeout time.Dura
 }
 
 func (s *Service) StartLifecycleSweep(ctx context.Context) {
+	s.setRestartBase(ctx)
 	s.startPeriodic(withAuditSubsystem(ctx, auditSubsystemLifecycle), time.Minute, 30*time.Second, s.runLifecycleSweep)
 }
 
@@ -6742,6 +6797,11 @@ func (s *Service) runLifecycleSweep(ctx context.Context) {
 			"reason", "netstats_poll_failed", "netstats_fallback", true)
 	}
 	for _, sandbox := range sandboxes {
+		// A restart on failure that lost its timer (the daemon restarted
+		// while it waited) gets one now; a due one runs at once.
+		if restartPending(sandbox) {
+			s.ensureRestartArmed(sandbox)
+		}
 		floor := s.activityFloorFor(sandbox, netstatsFallback)
 		action, reason := lifecycleDecision(sandbox, now, globalIdle, floor)
 		switch action {

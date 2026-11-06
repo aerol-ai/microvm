@@ -380,6 +380,25 @@ test("internal client create round-trips serverless lifecycle flag", async () =>
   assert.equal(sandbox.lifecycle.stopIfIdleFor, 300_000_000_000);
 });
 
+test("internal client create round-trips restartOnFailure", async () => {
+  let seenRequest: Request | undefined;
+  const client = new APIClient({
+    baseURL: "https://api.example.com",
+    patToken: "pat-token",
+    fetch: async (input, init) => {
+      seenRequest = new Request(input, init);
+      return jsonResponse(apiSandbox("sb-restart", { lifecycle: { restart_on_failure: true } }));
+    },
+  });
+
+  const sandbox = await client.create({ image: "ubuntu:22.04", lifecycle: { restartOnFailure: true } });
+
+  assert.ok(seenRequest);
+  const body = (await seenRequest.json()) as { lifecycle?: Record<string, unknown> };
+  assert.deepEqual(body.lifecycle, { restart_on_failure: true });
+  assert.equal(sandbox.lifecycle.restartOnFailure, true);
+});
+
 test("internal client uploadFile sends multipart form", async () => {
   let request: Request | undefined;
   const client = new APIClient({

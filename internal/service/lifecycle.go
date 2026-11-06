@@ -36,6 +36,14 @@ func (s *Service) PauseSandbox(ctx context.Context, id string) (*models.Sandbox,
 	}
 	switch sandbox.Status {
 	case models.SandboxStatusStopped:
+		// Already down, but maybe waiting for a restart on failure: a pause
+		// means stay down.
+		if restartPending(sandbox) {
+			if err := s.cancelPendingRestart(ctx, sandbox, models.StatusReasonUserStop); err != nil {
+				return nil, err
+			}
+			return s.scopedGet(ctx, id)
+		}
 		return sandbox, nil
 	case models.SandboxStatusStarted:
 		return s.stopSandboxInternal(ctx, id, stopModeManual)
@@ -90,6 +98,9 @@ func (s *Service) ApplyLifecyclePatch(ctx context.Context, id string, patch func
 	}
 	if err := s.validateLifecycle(desired); err != nil {
 		return nil, false, fmt.Errorf("invalid lifecycle: %w", err)
+	}
+	if err := validateLifecycleRuntime(desired, s.sandboxRuntime(sandbox)); err != nil {
+		return nil, false, err
 	}
 	return s.writeLifecycleLocked(ctx, id, desired, sandbox)
 }

@@ -266,6 +266,7 @@ interface ApiLifecycle {
   stop_at_age?: number;
   destroy_at_age?: number;
   serverless?: boolean;
+  restart_on_failure?: boolean;
 }
 
 interface ApiFailover {
@@ -2308,6 +2309,7 @@ function toApiLifecycle(lifecycle: Lifecycle): ApiLifecycle {
     stop_at_age: lifecycle.stopAtAge,
     destroy_at_age: lifecycle.destroyAtAge,
     serverless: lifecycle.serverless,
+    restart_on_failure: lifecycle.restartOnFailure,
   };
 }
 
@@ -2612,6 +2614,9 @@ function fromApiLifecycle(lifecycle?: ApiLifecycle): Lifecycle {
   }
   if (lifecycle?.serverless) {
     result.serverless = true;
+  }
+  if (lifecycle?.restart_on_failure) {
+    result.restartOnFailure = true;
   }
   return result;
 }

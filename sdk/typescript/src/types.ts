@@ -142,6 +142,14 @@ export interface Lifecycle {
    * without an idle window. TCP and TLS exposures stay always-on.
    */
   serverless?: boolean;
+  /**
+   * Start the sandbox again when it crashes or runs out of memory, waiting
+   * 5 s, then 10 s, 20 s and so on up to 5 minutes between tries. The wait
+   * goes back to 5 s once it has run for 10 minutes. Off by default.
+   * Docker, gVisor and containerd sandboxes only: Firecracker, WebAssembly
+   * and V8-isolate sandboxes refuse it with a 400.
+   */
+  restartOnFailure?: boolean;
 }
 
 export type UpdateLifecycleOptions = Lifecycle;

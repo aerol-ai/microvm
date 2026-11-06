@@ -431,6 +431,14 @@ type Lifecycle struct {
 	// Requires StopIfIdleFor to be set explicitly; there is no implicit
 	// default — see Validate.
 	Serverless bool `json:"serverless,omitempty"`
+	// RestartOnFailure starts the sandbox again after it crashes or its init
+	// is OOM-killed, with a backoff from 5 s to 5 min that resets after 10
+	// minutes of running fine (plans/agent-sandbox-feature-parity.md L1).
+	// Off by default. Docker and containerd (gVisor included) only: their
+	// die events are the failure signal; the service refuses it for other
+	// runtimes. Not a timer, so it does not count for IsZero: a sandbox
+	// with only this flag still gets the server's default timers.
+	RestartOnFailure bool `json:"restart_on_failure,omitempty"`
 }
 
 // MaxLifecycleDuration caps each Lifecycle field. 30 days is generous for
@@ -903,10 +911,17 @@ type Sandbox struct {
 	StatusReason string `json:"status_reason,omitempty"`
 	// ExitCode is the exit code behind out_of_memory, crashed,
 	// program_exited and restarted; nil for every other reason.
-	ExitCode         *int      `json:"exit_code,omitempty"`
-	ContainerCommand []string  `json:"container_command,omitempty"`
-	Lifecycle        Lifecycle `json:"lifecycle"`
-	Failover         *Failover `json:"failover,omitempty"`
+	ExitCode *int `json:"exit_code,omitempty"`
+	// RestartFailures, RestartAt and LastRestartedAt are the restart-on-
+	// failure backoff state (L1): consecutive failures, when the pending
+	// restart is due (nil when none is pending), and when the last restart
+	// ran. Stored so a daemon restart keeps the backoff; never on the wire.
+	RestartFailures  int        `json:"-"`
+	RestartAt        *time.Time `json:"-"`
+	LastRestartedAt  *time.Time `json:"-"`
+	ContainerCommand []string   `json:"container_command,omitempty"`
+	Lifecycle        Lifecycle  `json:"lifecycle"`
+	Failover         *Failover  `json:"failover,omitempty"`
 	// FailoverReady is set on Get/List when failover.policy=recreate: true iff
 	// the secret holder count meets HA (owner + ≥1 backup) or the recipient
 	// set is single-node (len≤1). Omitted for non-recreate sandboxes.

@@ -2579,6 +2579,7 @@ def _to_api_lifecycle(lifecycle: Lifecycle) -> Dict[str, Any]:
             "stop_at_age": _first_of(lifecycle, "stopAtAge", "stop_at_age"),
             "destroy_at_age": _first_of(lifecycle, "destroyAtAge", "destroy_at_age"),
             "serverless": _first_of(lifecycle, "serverless"),
+            "restart_on_failure": _first_of(lifecycle, "restartOnFailure", "restart_on_failure"),
         }
     )
 
@@ -3092,6 +3093,9 @@ def _from_api_lifecycle(lifecycle: Dict[str, Any]) -> Lifecycle:
     serverless = _first_of(lifecycle, "serverless")
     if serverless:
         result["serverless"] = True
+
+    if _first_of(lifecycle, "restart_on_failure", "restartOnFailure"):
+        result["restartOnFailure"] = True
 
     return result
 

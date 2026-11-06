@@ -257,6 +257,13 @@ func (s *Service) markSandboxStopped(ctx context.Context, sandbox *models.Sandbo
 	if err != nil {
 		return fmt.Errorf("update sandbox status: %w", err)
 	}
+	// A crash or OOM kill of a sandbox that asked to restart on failure.
+	// Only the die carries the exit; the stop event that follows it is the
+	// same exit again.
+	if event.Action == "die" && mode == stopModeInvoluntary && sandbox.Lifecycle.RestartOnFailure &&
+		isRestartFailureReason(sandbox.StatusReason) {
+		s.scheduleRestartAfterFailure(ctx, sandbox.ID)
+	}
 
 	s.logger.Info("audit sandbox stopped via docker event",
 		"sandbox_id", sandbox.ID,
@@ -282,6 +289,7 @@ func (s *Service) markSandboxStopped(ctx context.Context, sandbox *models.Sandbo
 // stuck indefinitely.
 func (s *Service) handleDestroyEvent(ctx context.Context, sandbox *models.Sandbox) error {
 	previousIP := sandbox.ContainerIP
+	s.cancelRestartTimer(sandbox.ID)
 
 	// Mirror the API DestroySandbox path: drop the warm-preflight cache
 	// so the ingress proxy stops treating this id as Started.

@@ -206,6 +206,71 @@ A sandbox that you created or started yourself has no reason. Starting a sandbox
   </TabItem>
 </Tabs>
 
+## Restart after a crash
+
+Set `restartOnFailure` and the server starts the sandbox again when it crashes or runs out of memory. It is off by default.
+
+The server waits before each restart, so a sandbox that keeps crashing does not use up the server. The first wait is 5 seconds. Each crash after that doubles the wait: 10 seconds, 20 seconds, and so on, up to 5 minutes. Once the sandbox has run for 10 minutes without a crash, the wait goes back to 5 seconds.
+
+After a restart, `statusReason` is `restarted` and `exitCode` is the exit code of the crash. `lastError` keeps the crash message.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const sandbox = await client.create({
+      image: "ubuntu:22.04",
+      lifecycle: { restartOnFailure: true },
+    });
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    sandbox = client.create(
+        image="ubuntu:22.04",
+        lifecycle={"restartOnFailure": True},
+    )
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    sandbox, err := client.Create(ctx, sdktypes.CreateSandboxOptions{
+        Image:     "ubuntu:22.04",
+        Lifecycle: &sdktypes.Lifecycle{RestartOnFailure: true},
+    })
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    let sandbox = client.create(CreateOptions {
+        image: "ubuntu:22.04".into(),
+        lifecycle: Some(Lifecycle {
+            restart_on_failure: true,
+            ..Default::default()
+        }),
+        ..Default::default()
+    })?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    Sandbox sandbox = client.create(new CreateOptions()
+        .setImage("ubuntu:22.04")
+        .setLifecycle(new Lifecycle().setRestartOnFailure(true)));
+    ```
+  </TabItem>
+</Tabs>
+
+A restart never fights you or your timers:
+
+- **A stop you ask for is never undone.** If you stop a sandbox, it stays stopped. Stopping a sandbox that is waiting for a restart cancels the restart.
+- **Timers still win.** A sandbox whose idle or age timer has run out is not restarted. A restart does not count as activity, so a sandbox that keeps crashing still stops when it has been idle long enough.
+- **Deleting a sandbox cancels its restart.**
+- **Only real crashes count.** A stop by a timer, by the disk limit, or by you is not a crash. Neither is a program that ends with exit code `0`.
+
+`restartOnFailure` works on Docker, gVisor and containerd sandboxes. Firecracker, WebAssembly and V8-isolate sandboxes reject it with a `400` error.
+
+If the server itself restarts while a sandbox waits, the wait is kept. The restart happens within about a minute of the server coming back, or later if the wait is longer.
+
 ## Good to know
 
 - **The longest timer is 30 days.** A longer value is rejected.

@@ -4169,6 +4169,7 @@ mod tests {
                 stop_at_age: 0,
                 destroy_at_age: 86400000000000,
                 serverless: false,
+                restart_on_failure: false,
             }
         );
         assert_eq!(
@@ -4238,6 +4239,7 @@ mod tests {
                 stop_at_age: 0,
                 destroy_at_age: 172800000000000,
                 serverless: false,
+                restart_on_failure: false,
             }
         );
     }
@@ -4292,6 +4294,50 @@ mod tests {
             })
         );
         assert!(sandbox.data.lifecycle.serverless);
+    }
+
+    #[test]
+    fn create_round_trips_restart_on_failure() {
+        let body = serde_json::json!({
+            "id": "sb-restart",
+            "image": "ubuntu:22.04",
+            "status": "started",
+            "public_url": "",
+            "cpu": 1,
+            "memory_mb": 1024,
+            "disk_gb": 10,
+            "os_user": "root",
+            "network_block_all": false,
+            "toolbox_enabled": true,
+            "created_at": "2026-11-06T10:00:00Z",
+            "updated_at": "2026-11-06T10:00:00Z",
+            "last_active_at": "2026-11-06T10:00:00Z",
+            "lifecycle": { "restart_on_failure": true }
+        })
+        .to_string();
+        let (url, request_rx) = spawn_json_server(body);
+
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        let sandbox = client
+            .create(CreateOptions {
+                lifecycle: Some(Lifecycle {
+                    restart_on_failure: true,
+                    ..Default::default()
+                }),
+                ..minimal_create_options()
+            })
+            .expect("create should succeed");
+        let request = request_rx.recv().expect("request should be captured");
+        let wire = request_json_body(&request);
+
+        assert_eq!(
+            wire,
+            serde_json::json!({
+                "image": "ubuntu:22.04",
+                "lifecycle": { "restart_on_failure": true }
+            })
+        );
+        assert!(sandbox.data.lifecycle.restart_on_failure);
     }
 
     #[test]

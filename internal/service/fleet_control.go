@@ -44,7 +44,9 @@ func (s *Service) StopByOwner(ctx context.Context, ownerRef string) error {
 	var errs []error
 	stopped := 0
 	for _, sb := range sandboxes {
-		if sb == nil || sb.Status != models.SandboxStatusStarted {
+		// A sandbox waiting for a restart on failure is about to run again,
+		// so it is suspended too: its stop cancels the restart.
+		if sb == nil || (sb.Status != models.SandboxStatusStarted && !restartPending(sb)) {
 			continue
 		}
 		err := s.store.SetFleetSuspended(ctx, sb.ID, true)

@@ -979,6 +979,8 @@ var Registry = []UseCase{
 	{ID: "UC-379", Title: "A WASM sandbox answers the file verbs (info, move, copy, folder, delete, search, find, list with depth) with a clear 501, and the SDK refuses ListFiles and a guarded MoveFile with ErrUnsupportedFeature before sending them", Requires: []Capability{CapWasm}, Implemented: true},
 	// Agent-sandbox parity, lifecycle and observability (parity_lifecycle_test.go).
 	{ID: "UC-395", Title: "status_reason: a stop call records user_stop with no exit code and a start clears it; a one-minute stopIfIdleFor records idle", Implemented: true},
+	{ID: "UC-396", Title: "restartOnFailure restarts a crashed Docker sandbox after 5 s, then 10 s, with status_reason restarted and the crash's exit code; a stop afterwards stays stopped", Requires: []Capability{CapDocker}, Implemented: true},
+	{ID: "UC-397", Title: "restartOnFailure is refused at create on Firecracker with a 400 that names the option", Requires: []Capability{CapFirecracker}, Implemented: true},
 }
 
 // byID is a lookup built once for the report generator.

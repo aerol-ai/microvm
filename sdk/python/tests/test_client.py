@@ -750,6 +750,16 @@ class ClientTests(unittest.TestCase):
             },
         )
 
+    def test_create_round_trips_restart_on_failure(self):
+        client = RecordingMicroVM()
+        sandbox = client.create({"image": "ubuntu:22.04", "lifecycle": {"restartOnFailure": True}})
+
+        self.assertEqual(client.calls[0][2]["lifecycle"], {"restart_on_failure": True})
+        self.assertEqual(sandbox.lifecycle, {"restartOnFailure": True})
+        # An explicit False goes on the wire as false, which the server reads as off.
+        client.create({"image": "ubuntu:22.04", "lifecycle": {"restartOnFailure": False, "stopAtAge": 5}})
+        self.assertEqual(client.calls[1][2]["lifecycle"], {"restart_on_failure": False, "stop_at_age": 5})
+
     def test_create_snapshot_maps_request_and_response_shapes(self):
         client = RecordingMicroVM()
         snapshot = client.create_snapshot("sb-1", "snapshots/demo:v1")

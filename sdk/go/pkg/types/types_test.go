@@ -37,6 +37,15 @@ func TestStatusReasonsDecode(t *testing.T) {
 	if exited.StatusReason != StatusReasonProgramExited || exited.ExitCode == nil || *exited.ExitCode != 0 {
 		t.Fatalf("decoded %q %v", exited.StatusReason, exited.ExitCode)
 	}
+	// restartOnFailure is a plain lifecycle field: sent only when set.
+	on, err := json.Marshal(Lifecycle{RestartOnFailure: true})
+	if err != nil || string(on) != `{"restart_on_failure":true}` {
+		t.Fatalf("Lifecycle{RestartOnFailure} = %s, %v", on, err)
+	}
+	if off, _ := json.Marshal(Lifecycle{}); string(off) != `{}` {
+		t.Fatalf("empty Lifecycle = %s", off)
+	}
+
 	var plain Sandbox
 	if err := json.Unmarshal([]byte(`{"id":"sb","status":"started"}`), &plain); err != nil {
 		t.Fatal(err)

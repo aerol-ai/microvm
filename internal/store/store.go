@@ -1070,6 +1070,15 @@ func open(path string, secretCipher *secrets.Cipher) (*Store, error) {
 		// exit_code is nullable because 0 is a real exit code.
 		`ALTER TABLE sandboxes ADD COLUMN status_reason TEXT NOT NULL DEFAULT '';`,
 		`ALTER TABLE sandboxes ADD COLUMN exit_code INTEGER;`,
+		// Restart on failure (L1): the lifecycle flag, then the backoff
+		// state. The state is stored rather than held in memory so a daemon
+		// restart keeps a crash-looping sandbox's backoff instead of
+		// restarting it at full speed after every daemon restart. restart_at
+		// is NULL when no restart is pending.
+		`ALTER TABLE sandboxes ADD COLUMN restart_on_failure INTEGER NOT NULL DEFAULT 0;`,
+		`ALTER TABLE sandboxes ADD COLUMN restart_failures INTEGER NOT NULL DEFAULT 0;`,
+		`ALTER TABLE sandboxes ADD COLUMN restart_at DATETIME;`,
+		`ALTER TABLE sandboxes ADD COLUMN last_restarted_at DATETIME;`,
 		// Checkpoint pushes are async and outlive their sandbox: without the
 		// lifecycle they were started for, a push that lands after the id is
 		// reused writes the old incarnation's artifact into the new one.
@@ -2175,8 +2184,9 @@ func (s *Store) insertSandbox(ctx context.Context, exec dbExecer, sandbox *model
 			wasm_registry_ref, wasm_registry_digest,
 			owner_ref, fleet_suspended,
 			tenant_id, audit_incarnation_id,
-			status_reason, exit_code
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			status_reason, exit_code,
+			restart_on_failure, restart_failures, restart_at, last_restarted_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`,
 		sandbox.ID,
 		sandbox.Image,
@@ -2236,6 +2246,10 @@ func (s *Store) insertSandbox(ctx context.Context, exec dbExecer, sandbox *model
 		strings.TrimSpace(sandbox.AuditIncarnationID),
 		strings.TrimSpace(sandbox.StatusReason),
 		nullableInt(sandbox.ExitCode),
+		boolToInt(sandbox.Lifecycle.RestartOnFailure),
+		sandbox.RestartFailures,
+		nullableTime(sandbox.RestartAt),
+		nullableTime(sandbox.LastRestartedAt),
 	)
 	if err != nil {
 		if isSandboxNameConflict(err, sandbox.Name) {
@@ -2406,6 +2420,11 @@ func (s *Store) Upsert(ctx context.Context, sandbox *models.Sandbox) error {
 	// the row a moment before a stop, would replace "user_stop" with its own
 	// guess. A reason that changes with no status change goes through
 	// SetStatusReason.
+	//
+	// The restart-on-failure backoff state (restart_failures, restart_at,
+	// last_restarted_at) is not updated here at all: only ScheduleRestart,
+	// MarkRestarted and CancelRestart write it, so a whole-row write from a
+	// read taken before a crash cannot drop the restart that crash scheduled.
 	_, err = exec.ExecContext(ctx, `
 		INSERT INTO sandboxes (
 			id, image, status, public_url, container_id, container_ip, cpu, memory_mb, disk_gb,
@@ -2427,8 +2446,9 @@ func (s *Store) Upsert(ctx context.Context, sandbox *models.Sandbox) error {
 			wasm_registry_ref, wasm_registry_digest,
 			owner_ref, fleet_suspended,
 			tenant_id, audit_incarnation_id,
-			status_reason, exit_code
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			status_reason, exit_code,
+			restart_on_failure, restart_failures, restart_at, last_restarted_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			image = excluded.image,
 			status = excluded.status,
@@ -2496,7 +2516,8 @@ func (s *Store) Upsert(ctx context.Context, sandbox *models.Sandbox) error {
 			exit_code = CASE
 				WHEN excluded.status <> sandboxes.status THEN excluded.exit_code
 				ELSE sandboxes.exit_code
-			END
+			END,
+			restart_on_failure = excluded.restart_on_failure
 	`,
 		sandbox.ID,
 		sandbox.Image,
@@ -2556,6 +2577,10 @@ func (s *Store) Upsert(ctx context.Context, sandbox *models.Sandbox) error {
 		incarnationID,
 		strings.TrimSpace(sandbox.StatusReason),
 		nullableInt(sandbox.ExitCode),
+		boolToInt(sandbox.Lifecycle.RestartOnFailure),
+		sandbox.RestartFailures,
+		nullableTime(sandbox.RestartAt),
+		nullableTime(sandbox.LastRestartedAt),
 		boolToInt(sandbox.ToolboxToken != ""),
 	)
 	if err != nil {
@@ -2609,7 +2634,8 @@ func (s *Store) Get(ctx context.Context, id string) (*models.Sandbox, error) {
 			wasm_registry_ref, wasm_registry_digest,
 			owner_ref, fleet_suspended,
 			tenant_id, audit_incarnation_id,
-			status_reason, exit_code
+			status_reason, exit_code,
+			restart_on_failure, restart_failures, restart_at, last_restarted_at
 		FROM sandboxes
 		WHERE id = ?
 	`, id)
@@ -2679,7 +2705,8 @@ func (s *Store) List(ctx context.Context) ([]*models.Sandbox, error) {
 			wasm_registry_ref, wasm_registry_digest,
 			owner_ref, fleet_suspended,
 			tenant_id, audit_incarnation_id,
-			status_reason, exit_code
+			status_reason, exit_code,
+			restart_on_failure, restart_failures, restart_at, last_restarted_at
 		FROM sandboxes
 		ORDER BY created_at DESC
 	`)
@@ -2751,7 +2778,8 @@ func (s *Store) ListByOwner(ctx context.Context, ownerRef string) ([]*models.San
 			wasm_registry_ref, wasm_registry_digest,
 			owner_ref, fleet_suspended,
 			tenant_id, audit_incarnation_id,
-			status_reason, exit_code
+			status_reason, exit_code,
+			restart_on_failure, restart_failures, restart_at, last_restarted_at
 		FROM sandboxes
 		WHERE owner_ref = ?
 		ORDER BY created_at DESC
@@ -2810,7 +2838,8 @@ func (s *Store) ListByRuntime(ctx context.Context, runtime string) ([]*models.Sa
 			wasm_registry_ref, wasm_registry_digest,
 			owner_ref, fleet_suspended,
 			tenant_id, audit_incarnation_id,
-			status_reason, exit_code
+			status_reason, exit_code,
+			restart_on_failure, restart_failures, restart_at, last_restarted_at
 		FROM sandboxes
 		WHERE runtime = ?
 		ORDER BY created_at DESC
@@ -3147,6 +3176,7 @@ func (s *Store) UpdateLifecycle(ctx context.Context, id string, l models.Lifecyc
 		    stop_at_age_ns = ?,
 		    destroy_at_age_ns = ?,
 		    serverless = ?,
+		    restart_on_failure = ?,
 		    updated_at = ?
 		WHERE id = ?
 	`,
@@ -3155,6 +3185,7 @@ func (s *Store) UpdateLifecycle(ctx context.Context, id string, l models.Lifecyc
 		int64(l.StopAtAge),
 		int64(l.DestroyAtAge),
 		boolToInt(l.Serverless),
+		boolToInt(l.RestartOnFailure),
 		time.Now().UTC(),
 		id,
 	)
@@ -4922,6 +4953,52 @@ func (s *Store) SetStatusReason(ctx context.Context, id, reason string, exitCode
 	return nil
 }
 
+// ScheduleRestart records a pending restart on failure: the consecutive
+// failure count the backoff was computed from and when the restart is due.
+func (s *Store) ScheduleRestart(ctx context.Context, id string, failures int, at time.Time) error {
+	return s.execOneSandbox(ctx, "schedule sandbox restart", `
+		UPDATE sandboxes SET restart_failures = ?, restart_at = ? WHERE id = ?
+	`, failures, at.UTC(), id)
+}
+
+// MarkRestarted records that a pending restart ran at at: nothing is pending
+// any more, and at is what the next failure measures "ran fine for 10
+// minutes" from.
+func (s *Store) MarkRestarted(ctx context.Context, id string, at time.Time) error {
+	return s.execOneSandbox(ctx, "mark sandbox restarted", `
+		UPDATE sandboxes SET restart_at = NULL, last_restarted_at = ? WHERE id = ?
+	`, at.UTC(), id)
+}
+
+// CancelRestart drops a pending restart (a stop, a start, or a timer that
+// wins over it). The failure count stays, so a sandbox that crashes again
+// soon keeps backing off. A non-empty reason replaces the crash's reason on
+// a row that was stopped waiting for the restart: a stop of a sandbox that
+// is already down changes no status, so Upsert would keep "crashed".
+func (s *Store) CancelRestart(ctx context.Context, id, reason string) error {
+	return s.execOneSandbox(ctx, "cancel sandbox restart", `
+		UPDATE sandboxes SET
+			status_reason = CASE WHEN ? <> '' AND restart_at IS NOT NULL AND status = 'stopped' THEN ? ELSE status_reason END,
+			exit_code = CASE WHEN ? <> '' AND restart_at IS NOT NULL AND status = 'stopped' THEN NULL ELSE exit_code END,
+			restart_at = NULL
+		WHERE id = ?
+	`, reason, reason, reason, id)
+}
+
+// execOneSandbox runs a single-row sandboxes UPDATE and maps "no row" to
+// ErrNotFound.
+func (s *Store) execOneSandbox(ctx context.Context, what, query string, args ...any) error {
+	result, err := s.db.ExecContext(ctx, query, args...)
+	if err != nil {
+		return fmt.Errorf("%s: %w", what, err)
+	}
+	affected, err := result.RowsAffected()
+	if err == nil && affected == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
 func (s *Store) UpdateRuntime(ctx context.Context, id, containerID, containerIP, publicURL string) error {
 	result, err := s.db.ExecContext(ctx, `
 		UPDATE sandboxes
@@ -5389,6 +5466,8 @@ func (s *Store) scanSandbox(scanner interface {
 	var allowOutJSON, denyOutJSON string
 	var allowPublicTraffic int
 	var exitCode sql.NullInt64
+	var restartOnFailure int
+	var restartAt, lastRestartedAt sql.NullTime
 
 	err := scanner.Scan(
 		&sandbox.ID,
@@ -5449,11 +5528,17 @@ func (s *Store) scanSandbox(scanner interface {
 		&sandbox.AuditIncarnationID,
 		&sandbox.StatusReason,
 		&exitCode,
+		&restartOnFailure,
+		&sandbox.RestartFailures,
+		&restartAt,
+		&lastRestartedAt,
 	)
 	if err != nil {
 		return nil, err
 	}
 	sandbox.ExitCode = intFromNull(exitCode)
+	sandbox.RestartAt = timeFromNull(restartAt)
+	sandbox.LastRestartedAt = timeFromNull(lastRestartedAt)
 	sandbox.FleetSuspended = fleetSuspended == 1
 	sandbox.NetworkQuotaExceeded = netQuotaExceeded == 1
 	if netQuotaExceededAt.Valid {
@@ -5505,6 +5590,7 @@ func (s *Store) scanSandbox(scanner interface {
 		StopAtAge:        time.Duration(stopAtAgeNs),
 		DestroyAtAge:     time.Duration(destroyAtAgeNs),
 		Serverless:       serverless == 1,
+		RestartOnFailure: restartOnFailure == 1,
 	}
 	if policy, err := models.NormalizeFailoverPolicy(failoverPolicy); err == nil && policy == models.FailoverPolicyRecreate {
 		sandbox.Failover = &models.Failover{Policy: policy}
@@ -5718,6 +5804,15 @@ func nullableInt(v *int) sql.NullInt64 {
 		return sql.NullInt64{}
 	}
 	return sql.NullInt64{Int64: int64(*v), Valid: true}
+}
+
+// timeFromNull is nullableTime's inverse for the read path.
+func timeFromNull(v sql.NullTime) *time.Time {
+	if !v.Valid {
+		return nil
+	}
+	t := v.Time.UTC()
+	return &t
 }
 
 // intFromNull is nullableInt's inverse for the read path.

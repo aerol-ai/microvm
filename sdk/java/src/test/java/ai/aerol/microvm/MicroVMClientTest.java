@@ -596,6 +596,34 @@ class MicroVMClientTest {
     }
 
     @Test
+    void createRoundTripsRestartOnFailure() throws Exception {
+        AtomicReference<Map<String, Object>> requestBody = new AtomicReference<>();
+        HttpServer server = startServer(exchange -> {
+            requestBody.set(castMap(JsonSupport.read(exchange.getRequestBody().readAllBytes(), Map.class)));
+            writeJson(exchange, 200, mapOf(
+                "id", "sb-restart",
+                "image", "ubuntu:22.04",
+                "status", "started",
+                "lifecycle", mapOf("restart_on_failure", true)
+            ));
+        });
+
+        try {
+            Sandbox sandbox = clientFor(server).create(
+                new CreateOptions()
+                    .setImage("ubuntu:22.04")
+                    .setLifecycle(new Lifecycle().setRestartOnFailure(Boolean.TRUE))
+            );
+            Map<String, Object> lifecycle = castMap(requestBody.get().get("lifecycle"));
+            assertEquals(Map.of("restart_on_failure", Boolean.TRUE), lifecycle);
+            assertEquals(Boolean.TRUE, sandbox.lifecycle.restartOnFailure);
+            assertEquals(Boolean.TRUE, sandbox.lifecycle.copy().restartOnFailure, "copy keeps the flag");
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
     void createSnapshotMapsRequestAndResponseShapes() throws Exception {
         List<Map<String, Object>> requestBodies = new ArrayList<>();
         HttpServer server = startServer(exchange -> {
