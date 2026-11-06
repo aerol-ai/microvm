@@ -64,8 +64,22 @@ func TestExposedPortVisibilityRoundTrips(t *testing.T) {
 		t.Fatal(err)
 	}
 	check("ListAllExposedPorts", all)
+	ports, err := st.ListPorts(ctx, sb.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	check("ListPorts", ports)
 	if byHost, err := st.GetPortByHostPort(ctx, 22001); err != nil || byHost == nil || byHost.TokenGated() {
 		t.Fatalf("GetPortByHostPort = %+v, %v", byHost, err)
+	}
+	for port, gated := range want {
+		p, err := st.GetPort(ctx, sb.ID, port)
+		if err != nil || p == nil || p.TokenGated() != gated {
+			t.Fatalf("GetPort(%d) = %+v, %v; want gated=%v", port, p, err, gated)
+		}
+	}
+	if p, err := st.GetPort(ctx, sb.ID, 9999); err != nil || p != nil {
+		t.Fatalf("GetPort of an unexposed port = %+v, %v; want nil, nil", p, err)
 	}
 
 	// An explicit re-upsert flips it back to public.

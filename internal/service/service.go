@@ -679,6 +679,15 @@ type Service struct {
 	portLocksMu sync.Mutex
 	portLocks   map[portLockKey]*portLock
 
+	// The locks every writer of one way into a port shares while it reads
+	// the port's gate from the store and writes from it, so no writer acts
+	// on a copy from before a change to "token" (route_gate.go).
+	httpRouteLocks keyedLocks[portLockKey]
+	allowlistLocks keyedLocks[string]
+	// testAfterRouteGateRead runs inside those locks, right after the read.
+	// Nil in production.
+	testAfterRouteGateRead func(stage string)
+
 	// toolboxCalls holds every in-flight network toolbox request by
 	// sandbox, so the stop and destroy paths can end them at once instead
 	// of leaving them to wait on a sandbox that is gone (toolbox_calls.go).
@@ -5523,6 +5532,12 @@ func (s *Service) installHTTPPortRoute(ctx context.Context, sandbox *models.Sand
 // (sandbox, port) install intent. Extracted from installHTTPPortRoute
 // so the coalescer's drain can invoke it with a stable sandbox
 // snapshot. Not called directly outside the coalescer path.
+//
+// The snapshot decides the shape except for the port's token gate, which
+// is read from the store under httpRouteLocks (route_gate.go): two drains
+// can run ops for one key at once, and the coalescer cannot tell an old
+// intent from a new one, so only the lock plus a fresh read keep an old
+// public intent from replacing a newer gated route.
 func (s *Service) applyHTTPPortRoute(ctx context.Context, sandbox *models.Sandbox, port int) error {
 	if s.isWasmSandbox(sandbox) {
 		return s.installWasmHTTPPortRoute(ctx, sandbox, port)
@@ -5530,15 +5545,29 @@ func (s *Service) applyHTTPPortRoute(ctx context.Context, sandbox *models.Sandbo
 	if s.isIsolateSandbox(sandbox) {
 		return s.installIsolateHTTPPortRoute(ctx, sandbox, port)
 	}
+	// Every shape takes the lock, not just the direct one: a writer that
+	// read the gate before an expose stored "token" must finish before
+	// that expose's wake write starts, or its direct write lands last.
+	unlock := s.httpRouteLocks.lock(portLockKey{id: sandbox.ID, port: port})
+	defer unlock()
 	// The direct route is where DIRECT-path Host masking is enforced; the
 	// serverless wake route can't carry it (the loopback ingress proxy
 	// overwrites Host on re-dial), so that path masks in the proxy instead.
 	routeOpts := caddy.HTTPRouteOptions{MaskRequestHost: sandbox.MaskRequestHost}
 	shape := s.chooseRouteShape(sandbox, RouteKindHTTP)
-	if shape == RouteShapeDirect && portTokenGated(sandbox, port) {
+	if shape == RouteShapeDirect {
 		// A token-gated port (A2) never gets the route that dials the
 		// container: only the ingress-proxy shape passes the token check.
-		shape = RouteShapeWake
+		// The gate is read from the store here, not from sandbox, which
+		// reconcile or a start may have read before an expose changed it.
+		gated, err := s.portGatedNow(ctx, sandbox, port)
+		if err != nil {
+			return err
+		}
+		s.afterRouteGateRead(gateReadPortRoute)
+		if gated {
+			shape = RouteShapeWake
+		}
 	}
 	switch shape {
 	case RouteShapeDirect:
@@ -5674,8 +5703,8 @@ func (s *Service) removeHTTPPortRoute(ctx context.Context, id string, port int) 
 }
 
 // touchAllowedPorts is a small wrapper that refreshes the toolbox's allowlist
-// after a port-table mutation. The store round-trip pulls the fresh ExposedPorts
-// so syncAllowedPorts sees post-write state.
+// after a port-table mutation. The store round-trip gets the current status,
+// address and token; syncAllowedPorts reads the ports under its own lock.
 func (s *Service) touchAllowedPorts(ctx context.Context, id string) {
 	if updated, err := s.store.Get(ctx, id); err == nil {
 		s.syncAllowedPorts(ctx, updated)
@@ -8161,6 +8190,11 @@ func (s *Service) imageGCWhitelisted(image string) bool {
 // syncAllowedPorts pushes the sandbox's current set of exposed ports to
 // toolboxd's in-memory allowlist. Best-effort — logged on failure. Without
 // this, /proxy/<port>/ on the public sandbox URL refuses every request.
+//
+// sandbox says where to push; the list itself is read from the store under
+// allowlistLocks (route_gate.go). Reconcile and the start paths pass a row
+// read earlier, and pushing its ports could put a port that has since
+// become token-gated back on the allowlist, around the gate.
 func (s *Service) syncAllowedPorts(ctx context.Context, sandbox *models.Sandbox) {
 	if sandbox == nil || sandbox.Status != models.SandboxStatusStarted || sandbox.ContainerIP == "" {
 		return
@@ -8173,21 +8207,22 @@ func (s *Service) syncAllowedPorts(ctx context.Context, sandbox *models.Sandbox)
 		s.syncIsolateAllowedPorts(ctx, sandbox)
 		return
 	}
-	ports := make([]int, 0, len(sandbox.ExposedPorts))
-	for _, p := range sandbox.ExposedPorts {
-		if p.TokenGated() {
-			// toolboxd's /proxy/<port> path is served straight from the
-			// sandbox root route, around the ingress proxy's token check,
-			// so a gated port is never on its allowlist (A2).
-			continue
-		}
-		ports = append(ports, p.Port)
-	}
 	cr, err := s.containerRuntimeForSandbox(sandbox)
 	if err != nil {
 		return
 	}
-	if err := cr.PushAllowedPorts(ctx, sandbox.ContainerIP, sandbox.ToolboxToken, ports); err != nil {
+	unlock := s.allowlistLocks.lock(sandbox.ID)
+	defer unlock()
+	exposed := sandbox.ExposedPorts
+	if s.store != nil {
+		if exposed, err = s.store.ListPorts(ctx, sandbox.ID); err != nil {
+			// Push nothing rather than the old copy; the next push fixes it.
+			s.logger.Warn("allowed ports not synced: could not read the exposed ports", "sandbox_id", sandbox.ID, "error", err)
+			return
+		}
+	}
+	s.afterRouteGateRead(gateReadAllowlist)
+	if err := cr.PushAllowedPorts(ctx, sandbox.ContainerIP, sandbox.ToolboxToken, toolboxProxyPorts(exposed)); err != nil {
 		s.logger.Warn("failed to sync allowed ports", "sandbox_id", sandbox.ID, "error", err)
 	}
 }

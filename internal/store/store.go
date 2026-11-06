@@ -5216,6 +5216,21 @@ func (s *Store) GetPortByHostPort(ctx context.Context, hostPort int) (*models.Ex
 	return &exposure, nil
 }
 
+// GetPort returns the exposure row for (sandboxID, port), or nil if absent.
+// One primary-key lookup: the service's route writers read a port's gate
+// here right before they write its route, rather than trusting the copy in
+// a sandbox row they read earlier.
+func (s *Store) GetPort(ctx context.Context, sandboxID string, port int) (*models.ExposedPort, error) {
+	return s.getPort(ctx, sandboxID, port)
+}
+
+// ListPorts returns every exposure row of one sandbox, ordered by port.
+// The narrow read (no sandbox row, no token decrypt) the toolboxd
+// allowlist push makes under its lock.
+func (s *Store) ListPorts(ctx context.Context, sandboxID string) ([]models.ExposedPort, error) {
+	return s.loadPorts(ctx, sandboxID)
+}
+
 // getPort returns the exposure row for (sandboxID, port), or nil if absent.
 func (s *Store) getPort(ctx context.Context, sandboxID string, port int) (*models.ExposedPort, error) {
 	var exposure models.ExposedPort
