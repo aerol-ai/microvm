@@ -986,6 +986,11 @@ var Registry = []UseCase{
 	{ID: "UC-400", Title: "lifecycle event feed: a sandbox stopped by a one-minute idle timer has a SYSTEM lifecycle.auto_stop record with reason idle on its audit page, read with caller=system:*, which returns only system records", Implemented: true},
 	{ID: "UC-401", Title: "lifecycle counters: a stop and a start move aerolvm_sandbox_stops_total{key=user_stop} and aerolvm_sandbox_starts_total{key=requested}, summed over every node", Implemented: true},
 	{ID: "UC-402", Title: "pprof is off by default and never served without admin: on every node's own API port, /debug/pprof/ without a token is refused and with the operator token is a 404", Implemented: true},
+	// Agent-sandbox parity, policy and storage lane (parity_policy_test.go).
+	// T3 and T4 are server settings: their cases set them on every node for
+	// the length of the case and restore them, so they need SSH (not local
+	// mode) and skip without it.
+	{ID: "UC-410", Title: "Create policy: with SB_CREATE_POLICY_FILE on every node, a create over its CPU limit or asking for a GPU is refused with 403 create_policy_denied naming the rule, one inside the limits runs, and an edit to the file (only Firecracker allowed) refuses a container create within 45 s with no restart", Requires: []Capability{CapDocker}, Implemented: true},
 }
 
 // byID is a lookup built once for the report generator.

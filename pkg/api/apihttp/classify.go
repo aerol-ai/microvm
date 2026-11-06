@@ -107,6 +107,15 @@ func Classify(err error) Classification {
 	case errors.Is(err, controlplane.ErrAdmissionUnavailable):
 		return Classification{Status: http.StatusServiceUnavailable, RetryAfter: admissionRetryAfterSeconds, Message: "fleet access validation temporarily unavailable; retry shortly"}
 
+	// The operator's create policy (SB_CREATE_POLICY_FILE): a definite 403
+	// whose message names the rule, so the caller knows which limit it hit
+	// and a retry is pointless; and the fail-closed 503 while a set file has
+	// not loaded, which clears when the operator fixes it.
+	case errors.Is(err, models.ErrCreatePolicyDenied):
+		return Classification{Status: http.StatusForbidden, Code: models.ErrorCodeCreatePolicyDenied, Message: truncate(err.Error())}
+	case errors.Is(err, service.ErrCreatePolicyInvalid):
+		return Classification{Status: http.StatusServiceUnavailable, Code: models.ErrorCodeCreatePolicyInvalid, Message: service.ErrCreatePolicyInvalid.Error(), Log: true, LogLevel: slog.LevelError}
+
 	// A sandbox whose container engine is not wired on this node: host
 	// wiring state, not client fault. 503+Retry-After so SDKs back off.
 	case errors.Is(err, models.ErrContainerEngineNotRegistered):

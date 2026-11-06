@@ -470,6 +470,13 @@ func (c *Client) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		imageSource = "verified"
 	}
 	CreateTimingFrom(ctx).RecordStageDesc("docker_image", time.Since(imageStart), imageSource)
+	// The operator create policy's require_non_root rule: the image config is
+	// the first place the user is known, and nothing exists yet to undo.
+	if req.RequireNonRootUser {
+		if err := models.CheckImageUserNonRoot(req.Image, imageInspect.Config.User); err != nil {
+			return nil, err
+		}
+	}
 
 	workingDir := strings.TrimSpace(imageInspect.Config.WorkingDir)
 	if workingDir == "" {
@@ -1921,6 +1928,10 @@ type imageInspect struct {
 		WorkingDir string   `json:"WorkingDir"`
 		Entrypoint []string `json:"Entrypoint"`
 		Cmd        []string `json:"Cmd"`
+		// User is the image's USER, the user the container runs as (the
+		// create body sets none): the create policy's require_non_root rule
+		// reads it.
+		User string `json:"User"`
 	} `json:"Config"`
 	Metadata struct {
 		// LastTagTime is updated by the daemon every time the image is

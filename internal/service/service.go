@@ -25,6 +25,7 @@ import (
 
 	"github.com/aerol-ai/microvm/internal/cluster"
 	"github.com/aerol-ai/microvm/internal/config"
+	"github.com/aerol-ai/microvm/internal/createpolicy"
 	"github.com/aerol-ai/microvm/internal/egress"
 	"github.com/aerol-ai/microvm/internal/egress/operator"
 	"github.com/aerol-ai/microvm/internal/identity"
@@ -496,6 +497,9 @@ type Service struct {
 	// egressOperatorWatcher holds the private-cloud operator file (§5.10);
 	// nil = no file, today's behavior.
 	egressOperatorWatcher *operator.Watcher
+	// createPolicyWatcher holds the operator's create policy
+	// (SB_CREATE_POLICY_FILE); nil = no file, today's behavior.
+	createPolicyWatcher *createpolicy.Watcher
 	// egressControlPushed is the control-port guard list last pushed to the
 	// gateway; nil after a full sync, so a restarted gateway gets it again.
 	egressControlPushed atomic.Pointer[string]
@@ -2078,6 +2082,17 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 		if err := validateLifecycleRuntime(*req.Lifecycle, chosenRuntime); err != nil {
 			return nil, err
 		}
+	}
+	// Operator create policy (SB_CREATE_POLICY_FILE, create_policy.go): in
+	// memory, once the runtime and the image are settled and before any
+	// work, so every create path gets the same 403. Failover replays are
+	// exempt. require_non_root is enforced by the container runtime once it
+	// has read the image; its refusal is counted on the way out.
+	if err := s.applyCreatePolicy(&req, chosenRuntime, memoryWasOmitted, isStoredSpecReplay(ctx)); err != nil {
+		return nil, err
+	}
+	if req.RequireNonRootUser {
+		defer noteNonRootRefusal(&err)
 	}
 	// Fail closed: no sandbox on a runtime whose node guard failed to
 	// install, since it could reach every service on the node. One atomic
@@ -4651,6 +4666,11 @@ func snapshotImageIsOwnedTag(snapshot *models.SandboxSnapshot) bool {
 func (s *Service) ResizeSandbox(ctx context.Context, id string, req models.ResizeSandboxRequest) (*models.Sandbox, error) {
 	sandbox, err := s.scopedGet(ctx, id)
 	if err != nil {
+		return nil, err
+	}
+	// The create policy's size limits hold for a resize too, or a sandbox
+	// could be made small and then grown past them.
+	if err := s.checkResizePolicy(req); err != nil {
 		return nil, err
 	}
 

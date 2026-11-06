@@ -44,6 +44,10 @@ func TestClassify(t *testing.T) {
 		{"overloaded while the caller left", fmt.Errorf("%w: %w", ErrOverloaded, context.Canceled), http.StatusServiceUnavailable, OverloadedRetryAfterSeconds, models.ErrorCodeOverloaded, ErrKindOther},
 		{"rate limited (the tenant's own share)", ErrRateLimited, http.StatusTooManyRequests, RateLimitedRetryAfterSeconds, models.ErrorCodeRateLimited, ErrKindOther},
 		{"admission denied", controlplane.ErrAdmissionDenied, http.StatusForbidden, 0, "", ErrKindOther},
+		// The operator create policy: a definite 403 naming the rule, and a
+		// fail-closed 503 while a set file has not loaded.
+		{"create policy denied", &models.CreatePolicyError{Rule: "runtimes", Detail: "runtime \"docker\" is not allowed"}, http.StatusForbidden, 0, models.ErrorCodeCreatePolicyDenied, ErrKindOther},
+		{"create policy invalid", service.ErrCreatePolicyInvalid, http.StatusServiceUnavailable, 0, models.ErrorCodeCreatePolicyInvalid, ErrKindOther},
 		{"admission unavailable", controlplane.ErrAdmissionUnavailable, http.StatusServiceUnavailable, admissionRetryAfterSeconds, "", ErrKindOther},
 		{"engine not registered", models.ErrContainerEngineNotRegistered, http.StatusServiceUnavailable, admissionRetryAfterSeconds, "", ErrKindOther},
 		{"cluster finalization", service.ErrClusterFinalizationUnavailable, http.StatusServiceUnavailable, 5, "", ErrKindOther},

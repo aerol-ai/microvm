@@ -277,6 +277,11 @@ type Config struct {
 	// EgressOperatorFile is the private-cloud operator policy (§5.10,
 	// SB_EGRESS_OPERATOR_FILE). Empty keeps today's behavior.
 	EgressOperatorFile string
+	// CreatePolicyFile is the operator's create policy
+	// (SB_CREATE_POLICY_FILE, internal/createpolicy): allowed images,
+	// registries and runtimes, size limits, non-root and GPU rules, checked
+	// at create and resize. Empty keeps today's behavior.
+	CreatePolicyFile string
 	// EgressProfileApplyQPS bounds how many sandboxes per second this node
 	// re-applies after an egress profile changes, so one profile edit can't
 	// flood the gateway and firewall (SB_EGRESS_PROFILE_APPLY_QPS, D21).
@@ -2045,6 +2050,7 @@ func load(keyTool bool) (Config, error) {
 		EgressProcidSocket:                strings.TrimSpace(getEnv("SB_EGRESS_PROCID_SOCKET", "/run/aerolvm/egress-procid.sock")),
 		EgressGatewayUser:                 strings.TrimSpace(getEnv("SB_EGRESS_GATEWAY_USER", "aerolvm-egress")),
 		EgressOperatorFile:                strings.TrimSpace(getEnv("SB_EGRESS_OPERATOR_FILE", "")),
+		CreatePolicyFile:                  strings.TrimSpace(getEnv("SB_CREATE_POLICY_FILE", "")),
 		EgressProfileApplyQPS:             getEnvInt("SB_EGRESS_PROFILE_APPLY_QPS", 50),
 		EgressDNSPort:                     getEnvInt("SB_EGRESS_DNS_PORT", 53054),
 		EgressProxyPort:                   getEnvInt("SB_EGRESS_PROXY_PORT", 15080),

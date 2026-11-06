@@ -35,6 +35,11 @@ func poolEligible(req models.CreateSandboxRequest, hostMounts []mounts.Container
 	if user := strings.TrimSpace(req.OSUser); user != "" && !strings.EqualFold(user, "root") {
 		return false
 	}
+	// A parked container's image user was never checked against the create
+	// policy's require_non_root rule; the cold path checks it first.
+	if req.RequireNonRootUser {
+		return false
+	}
 	if len(req.ContainerCommand) > 0 {
 		return false
 	}

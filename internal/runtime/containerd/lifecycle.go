@@ -157,6 +157,17 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		return nil, err
 	}
 	createtiming.From(ctx).RecordStageDesc("containerd_image", time.Since(imageStart), "resolved")
+	// The operator create policy's require_non_root rule: the image config is
+	// the first place the user is known, before any host file or container.
+	if req.RequireNonRootUser {
+		user, err := imageUser(ctx, client, image)
+		if err != nil {
+			return nil, fmt.Errorf("read image user: %w", err)
+		}
+		if err := models.CheckImageUserNonRoot(req.Image, user); err != nil {
+			return nil, err
+		}
+	}
 
 	hostFiles, err = prepareSandboxHostFiles(d.cfg.RunDir, sandboxID)
 	if err != nil {

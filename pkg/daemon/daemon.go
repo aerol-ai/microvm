@@ -738,6 +738,7 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 	}
 	routingBoot := startIngressRouting(ctx, cfg, svc, hostPortForwarder, logger)
 	wireEgressOperator(ctx, cfg, svc, logger)
+	wireCreatePolicy(ctx, cfg, svc, logger)
 	wireEgressGateway(ctx, cfg, svc, dockerClient, logger)
 	// After the gateway is wired: whether its ports are open depends on it.
 	wireNodeGuard(ctx, cfg, svc)

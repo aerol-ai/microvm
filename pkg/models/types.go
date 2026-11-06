@@ -718,8 +718,14 @@ type CreateSandboxRequest struct {
 	// image just because it is already in the shared local cache. Internal-only
 	// (json:"-"): never on the wire, re-derived on the owner node after a
 	// cluster forward from the re-authenticated caller.
-	VerifyRegistryAccess bool        `json:"-"`
-	Mounts               []MountSpec `json:"mounts,omitempty"`
+	VerifyRegistryAccess bool `json:"-"`
+	// RequireNonRootUser tells a container runtime to refuse an image whose
+	// configured user is root, after it has the image config and before the
+	// container exists (the operator create policy's require_non_root rule,
+	// CheckImageUserNonRoot). Internal-only (json:"-"): the node that runs the
+	// sandbox sets it from its own policy file.
+	RequireNonRootUser bool        `json:"-"`
+	Mounts             []MountSpec `json:"mounts,omitempty"`
 	// PlatformVolumes references named, operator-backed persistent volumes by
 	// name only — the user never supplies storage coordinates or credentials.
 	// The service translates each entry into a synthesized, tenant-scoped

@@ -171,6 +171,20 @@ func Prepare(w http.ResponseWriter, r *http.Request, svc *service.Service, req m
 			return Decision{}, false
 		}
 	}
+	// The operator's create policy before placement: a create too big for
+	// every node must be refused for the rule it breaks (403), not answered
+	// 503 because no node has room for it. The owner checks again.
+	if err := svc.CheckCreatePolicy(req); err != nil {
+		switch {
+		case errors.Is(err, models.ErrCreatePolicyDenied):
+			writeError(w, http.StatusForbidden, models.ErrorCodeCreatePolicyDenied, err.Error())
+		case errors.Is(err, service.ErrCreatePolicyInvalid):
+			writeError(w, http.StatusServiceUnavailable, models.ErrorCodeCreatePolicyInvalid, service.ErrCreatePolicyInvalid.Error())
+		default:
+			writeMsg(w, http.StatusInternalServerError, err.Error())
+		}
+		return Decision{}, false
+	}
 	// Reject reserved names before the reservation claims the name in Raft;
 	// the target node's create applies the same rule again.
 	if err := models.ValidateSandboxName(req.Name); err != nil {

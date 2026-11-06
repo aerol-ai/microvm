@@ -294,6 +294,7 @@ const getEnterpriseSidebarConfig = (): NavigationGroup[] => [
     entries: [
       link(`${ent}/security-controls`, '- Security baseline'),
       link(`${ent}/hardening`, '- Hardening guide'),
+      link(`${ent}/create-policy`, '- Limit what users create'),
       { ...link(`${ent}/sso`, '- SSO'), children: ssoProviders },
       link(`${ent}/key-custody`, '- Use your own key store'),
       link(`${ent}/enterprise-mode`, '- Enterprise mode'),
