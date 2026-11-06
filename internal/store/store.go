@@ -1125,6 +1125,13 @@ func open(path string, secretCipher *secrets.Cipher) (*Store, error) {
 		// (Upsert and RevokeSandboxTokens keep the larger value), so a
 		// whole-row write from a read taken before a revoke cannot undo it.
 		`ALTER TABLE sandboxes ADD COLUMN tokens_not_before INTEGER NOT NULL DEFAULT 0;`,
+		// Which run of the sandbox the row describes: one more each time a
+		// write moves it to started (Upsert). An exit read from toolboxd is
+		// stored only for the run it was asked of (RecordProgramExit), so a
+		// reply that comes back after a stop and a start cannot mark the new
+		// run exited (review 2 finding 10). 0 on every pre-migration row; the
+		// next start makes it 1.
+		`ALTER TABLE sandboxes ADD COLUMN run_generation INTEGER NOT NULL DEFAULT 0;`,
 		// Checkpoint pushes are async and outlive their sandbox: without the
 		// lifecycle they were started for, a push that lands after the id is
 		// reused writes the old incarnation's artifact into the new one.
@@ -2484,6 +2491,10 @@ func (s *Store) Upsert(ctx context.Context, sandbox *models.Sandbox) error {
 	// tokens_not_before keeps the larger of the two values: a whole-row
 	// write from a read taken before a token revoke would otherwise lower
 	// it and bring every revoked token back.
+	// run_generation is never taken from the caller's (older) read: the same
+	// start transition adds one to the stored value, so every start path
+	// (the API start, a restart on failure, a wake, the start event) counts
+	// each run once, whichever of them writes it first.
 	_, err = exec.ExecContext(ctx, `
 		INSERT INTO sandboxes (
 			id, image, status, public_url, container_id, container_ip, cpu, memory_mb, disk_gb,
@@ -2584,7 +2595,11 @@ func (s *Store) Upsert(ctx context.Context, sandbox *models.Sandbox) error {
 				WHEN excluded.status = 'started' AND sandboxes.status <> 'started' THEN NULL
 				ELSE sandboxes.program_exited_at
 			END,
-			tokens_not_before = MAX(sandboxes.tokens_not_before, excluded.tokens_not_before)
+			tokens_not_before = MAX(sandboxes.tokens_not_before, excluded.tokens_not_before),
+			run_generation = CASE
+				WHEN excluded.status = 'started' AND sandboxes.status <> 'started' THEN sandboxes.run_generation + 1
+				ELSE sandboxes.run_generation
+			END
 	`,
 		sandbox.ID,
 		sandbox.Image,
@@ -2707,7 +2722,8 @@ func (s *Store) Get(ctx context.Context, id string) (*models.Sandbox, error) {
 			status_reason, exit_code,
 			restart_on_failure, restart_failures, restart_at, last_restarted_at,
 			destroy_after_exit_for_ns, program_exited_at,
-			tokens_not_before
+			tokens_not_before,
+			run_generation
 		FROM sandboxes
 		WHERE id = ?
 	`, id)
@@ -2780,7 +2796,8 @@ func (s *Store) List(ctx context.Context) ([]*models.Sandbox, error) {
 			status_reason, exit_code,
 			restart_on_failure, restart_failures, restart_at, last_restarted_at,
 			destroy_after_exit_for_ns, program_exited_at,
-			tokens_not_before
+			tokens_not_before,
+			run_generation
 		FROM sandboxes
 		ORDER BY created_at DESC
 	`)
@@ -2855,7 +2872,8 @@ func (s *Store) ListByOwner(ctx context.Context, ownerRef string) ([]*models.San
 			status_reason, exit_code,
 			restart_on_failure, restart_failures, restart_at, last_restarted_at,
 			destroy_after_exit_for_ns, program_exited_at,
-			tokens_not_before
+			tokens_not_before,
+			run_generation
 		FROM sandboxes
 		WHERE owner_ref = ?
 		ORDER BY created_at DESC
@@ -2917,7 +2935,8 @@ func (s *Store) ListByRuntime(ctx context.Context, runtime string) ([]*models.Sa
 			status_reason, exit_code,
 			restart_on_failure, restart_failures, restart_at, last_restarted_at,
 			destroy_after_exit_for_ns, program_exited_at,
-			tokens_not_before
+			tokens_not_before,
+			run_generation
 		FROM sandboxes
 		WHERE runtime = ?
 		ORDER BY created_at DESC
@@ -5112,15 +5131,18 @@ func (s *Store) CancelRestart(ctx context.Context, id, reason string) error {
 
 // RecordProgramExit stores the end of a started sandbox's main program: when
 // it ended, status_reason program_exited and its exit code. Only the first
-// report counts (program_exited_at must still be NULL) and only while the
-// row is started, so a sandbox that stopped or restarted meanwhile is left
-// alone. recorded reports whether this call stored it.
-func (s *Store) RecordProgramExit(ctx context.Context, id string, at time.Time, exitCode int) (bool, error) {
+// report counts (program_exited_at must still be NULL), only while the row is
+// started, and only for the run the report was read from (runGeneration, the
+// row's run_generation when the caller asked toolboxd). A sandbox that
+// stopped meanwhile is left alone, and so is one that stopped and started
+// again: its new run has a new generation, so the old run's exit cannot land
+// on it. recorded reports whether this call stored it.
+func (s *Store) RecordProgramExit(ctx context.Context, id string, runGeneration int64, at time.Time, exitCode int) (bool, error) {
 	result, err := s.db.ExecContext(ctx, `
 		UPDATE sandboxes
 		SET program_exited_at = ?, status_reason = ?, exit_code = ?, updated_at = ?
-		WHERE id = ? AND status = ? AND program_exited_at IS NULL
-	`, at.UTC(), models.StatusReasonProgramExited, exitCode, time.Now().UTC(), id, string(models.SandboxStatusStarted))
+		WHERE id = ? AND status = ? AND program_exited_at IS NULL AND run_generation = ?
+	`, at.UTC(), models.StatusReasonProgramExited, exitCode, time.Now().UTC(), id, string(models.SandboxStatusStarted), runGeneration)
 	if err != nil {
 		return false, fmt.Errorf("record program exit: %w", err)
 	}
@@ -5718,6 +5740,7 @@ func (s *Store) scanSandbox(scanner interface {
 		&destroyAfterExitNs,
 		&programExitedAt,
 		&sandbox.TokensNotBefore,
+		&sandbox.RunGeneration,
 	)
 	if err != nil {
 		return nil, err

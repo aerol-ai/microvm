@@ -28,10 +28,10 @@ func TestRecordProgramExit(t *testing.T) {
 	stale := *got
 
 	first := time.Date(2026, 11, 6, 10, 0, 0, 0, time.UTC)
-	if ok, err := st.RecordProgramExit(ctx, sb.ID, first, 3); err != nil || !ok {
+	if ok, err := st.RecordProgramExit(ctx, sb.ID, got.RunGeneration, first, 3); err != nil || !ok {
 		t.Fatalf("first report: %v %v", ok, err)
 	}
-	if ok, err := st.RecordProgramExit(ctx, sb.ID, first.Add(time.Minute), 9); err != nil || ok {
+	if ok, err := st.RecordProgramExit(ctx, sb.ID, got.RunGeneration, first.Add(time.Minute), 9); err != nil || ok {
 		t.Fatalf("second report recorded: %v %v", ok, err)
 	}
 	got, _ = st.Get(ctx, sb.ID)
@@ -56,7 +56,7 @@ func TestRecordProgramExit(t *testing.T) {
 	if got, _ = st.Get(ctx, sb.ID); got.ProgramExitedAt == nil || got.StatusReason != models.StatusReasonUserStop {
 		t.Fatalf("after stop: exited=%v reason=%q", got.ProgramExitedAt, got.StatusReason)
 	}
-	if ok, _ := st.RecordProgramExit(ctx, sb.ID, first, 1); ok {
+	if ok, _ := st.RecordProgramExit(ctx, sb.ID, got.RunGeneration, first, 1); ok {
 		t.Fatal("recorded an exit on a stopped sandbox")
 	}
 	started := *got
@@ -77,7 +77,7 @@ func TestRecordProgramExit(t *testing.T) {
 	if got, _ = st.Get(ctx, sb.ID); got.Lifecycle.DestroyAfterExitFor != time.Hour {
 		t.Fatalf("UpdateLifecycle: %s", got.Lifecycle.DestroyAfterExitFor)
 	}
-	if ok, err := st.RecordProgramExit(ctx, "missing", first, 0); err != nil || ok {
+	if ok, err := st.RecordProgramExit(ctx, "missing", 0, first, 0); err != nil || ok {
 		t.Fatalf("missing row: %v %v", ok, err)
 	}
 }

@@ -28,6 +28,11 @@ import (
 // once and programExitProbeTimeout each, inside the sweep's own deadline. A
 // sandbox that does not answer (busy, or an older toolboxd without
 // main_program) is asked again next minute.
+//
+// Bound to the run it asked (review 2 finding 10): the exit is stored only if
+// the sandbox is still in the run it was in when the pass read the row
+// (run_generation). A reply from run A that comes back after a stop and a
+// start of run B is dropped, so it cannot start run B's destroy timer.
 const (
 	programExitProbeConcurrency = 8
 	programExitProbeTimeout     = 3 * time.Second
@@ -111,7 +116,8 @@ func (s *Service) probeProgramExit(ctx context.Context, sb *models.Sandbox) {
 		return
 	}
 	at := programExitTime(program, sb)
-	recorded, err := s.store.RecordProgramExit(ctx, sb.ID, at, *program.ExitCode)
+	// sb.RunGeneration is the run this pass read the row in, before asking.
+	recorded, err := s.store.RecordProgramExit(ctx, sb.ID, sb.RunGeneration, at, *program.ExitCode)
 	if err != nil {
 		s.logger.Warn("program exit not recorded", "sandbox_id", sb.ID, "error", err)
 		return

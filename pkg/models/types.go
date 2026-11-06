@@ -986,7 +986,11 @@ type Sandbox struct {
 	// this sandbox is refused (pkg/sandboxtoken): set by a revoke and when
 	// a row is created, 0 when neither ever happened. It lives only in the
 	// owner node's row, never on the wire or in Raft.
-	TokensNotBefore  int64     `json:"-"`
+	TokensNotBefore int64 `json:"-"`
+	// RunGeneration says which run of the sandbox this row was read in: the
+	// store adds one each time the sandbox starts. A main-program exit is
+	// stored only for the run it was read from. Never on the wire.
+	RunGeneration    int64     `json:"-"`
 	ContainerCommand []string  `json:"container_command,omitempty"`
 	Lifecycle        Lifecycle `json:"lifecycle"`
 	Failover         *Failover `json:"failover,omitempty"`
