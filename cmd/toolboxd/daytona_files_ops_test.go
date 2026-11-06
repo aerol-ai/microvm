@@ -211,14 +211,13 @@ func TestDaytonaSetPermissionsRoute(t *testing.T) {
 	})
 }
 
+// Language servers answer a clear 501. Daytona terminals used to as well,
+// until plan E8 built them (daytona_pty_test.go).
 func TestDaytonaUnsupportedRoutesAnswer501(t *testing.T) {
 	h := authedRoutes(newDaytonaTestServer(t))
 	for _, tc := range []struct{ method, path, want string }{
 		{http.MethodPost, "/lsp/start", "language servers"},
 		{http.MethodPost, "/lsp/completions", "language servers"},
-		{http.MethodGet, "/process/pty", "terminals"},
-		{http.MethodPost, "/process/pty", "terminals"},
-		{http.MethodGet, "/process/pty/abc/connect", "terminals"},
 	} {
 		rr := httptest.NewRecorder()
 		h.ServeHTTP(rr, httptest.NewRequest(tc.method, tc.path, nil))

@@ -57,6 +57,9 @@ type Session struct {
 	recorder *recorder
 	pumpWG   sync.WaitGroup
 
+	// replayReleased is set once ReleaseReplay has freed buf.
+	replayReleased bool
+
 	mu          sync.Mutex
 	subscribers map[uint64]chan Frame
 	nextSubID   uint64
@@ -73,6 +76,10 @@ type Session struct {
 	exitSignal string
 	failed     bool
 	doneCh     chan struct{}
+
+	// ttyPath is a PTY session's terminal ("/dev/pts/N"), read once at
+	// start ("" elsewhere). KillTerminal finds the terminal's holders by it.
+	ttyPath string
 }
 
 // Snapshot returns the metadata view of the session.
@@ -130,6 +137,35 @@ func (s *Session) IsPTY() bool { return s.pty }
 // Done returns a channel that closes when the underlying process exits.
 func (s *Session) Done() <-chan struct{} { return s.doneCh }
 
+// KillTerminal SIGKILLs every process that holds this PTY session's
+// terminal open: the shell and every job it started under job control.
+// Such jobs sit in process groups of their own, which a kill of the shell's
+// group misses, and once the shell is gone they have no controlling terminal
+// either; while one holds the terminal open, the output pump never sees
+// end-of-file and the session never finishes. Call it before Hangup: while
+// the session holds the master, the terminal's number cannot be handed to
+// another terminal, so only this session's holders match. It returns how
+// many processes it signalled; a pipe session, a session already hung up,
+// or a system without /proc signals none.
+func (s *Session) KillTerminal() int {
+	if !s.pty {
+		return 0
+	}
+	s.mu.Lock()
+	hungUp := s.ptmx == nil
+	s.mu.Unlock()
+	if hungUp {
+		return 0
+	}
+	return killTerminalHolders(s.ttyPath)
+}
+
+// Exited reports whether the process has exited. It turns true before the
+// subscriber streams close, while Done closes only after the recorder and
+// the terminal are shut, so a client that saw its stream end and then asks
+// about the session must be answered from Exited, not Done.
+func (s *Session) Exited() bool { return s.exited.Load() }
+
 // RecordingPath returns the absolute path to the session's asciinema cast
 // file, or "" if recording is disabled.
 func (s *Session) RecordingPath() string { return s.recorder.Path() }
@@ -152,6 +188,51 @@ func (s *Session) Replay() []byte {
 	replay := s.buf.Snapshot()
 	s.mu.Unlock()
 	return replay
+}
+
+// Size returns the window size the session's terminal has now: the create
+// size, or the last successful Resize.
+func (s *Session) Size() (cols, rows int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.cols, s.rows
+}
+
+// ReleaseReplay frees the replay buffer of a session that has exited and
+// reports whether it did. The exit status, metadata and recording stay, so
+// an attacher afterwards gets the exit but no replayed output. Sessions keep
+// their buffer for as long as they are tracked; only toolboxd's Daytona
+// terminals call this, after a short retention, so a sandbox that churns
+// terminals does not hold a buffer for every finished one (plan E8, R11).
+// A running session keeps its buffer: its pumps still write to it.
+func (s *Session) ReleaseReplay() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.exited.Load() || s.replayReleased {
+		return false
+	}
+	// An empty one-byte ring stands in for the buffer, so every reader of
+	// s.buf works unchanged and finds nothing to replay.
+	s.buf = newRing(0)
+	s.replayReleased = true
+	return true
+}
+
+// Hangup closes a PTY session's terminal the way closing a terminal window
+// does: the kernel sends SIGHUP to the shell, which passes it on to its jobs
+// before it exits. It also ends the output pump even when a job that ignores
+// SIGHUP still holds the terminal open, so the session can finish and free
+// its memory; Signal and Manager.Delete reach only the shell's own process
+// group, and an interactive shell puts each job in a group of its own. A
+// no-op for pipe sessions and after exit.
+func (s *Session) Hangup() {
+	s.mu.Lock()
+	ptmx := s.ptmx
+	s.ptmx = nil
+	s.mu.Unlock()
+	if ptmx != nil {
+		_ = ptmx.Close()
+	}
 }
 
 // Subscribe registers a new attacher. The returned channel first receives a

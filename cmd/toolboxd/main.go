@@ -89,6 +89,11 @@ type server struct {
 	envd     *envdCompat
 	cloneGen *clonegen.Generation
 
+	// ptys is the Daytona SDK's terminals (plan E8), made on first use by
+	// daytonaPTYs().
+	ptyOnce sync.Once
+	ptys    *daytonaPTYs
+
 	// execLiveness overrides the exec-stream keepalive timings; the zero value
 	// means defaultExecStreamLiveness. Only tests set it.
 	execLiveness execStreamLiveness
@@ -552,7 +557,7 @@ func (s *server) routes() http.Handler {
 			if !s.requireAuth(w, r) {
 				return
 			}
-			writeError(w, http.StatusNotImplemented, errDaytonaPTYUnsupported)
+			s.handleDaytonaPTYRoute(w, r)
 		case r.Method == http.MethodGet && r.URL.Path == "/files/search":
 			if !s.requireAuth(w, r) {
 				return

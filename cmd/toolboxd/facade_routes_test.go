@@ -81,14 +81,15 @@ func facadeProbes(t *testing.T) []facadeProbe {
 // TestFacadeToolboxRoutesExistInToolboxd is plan X2: every path the Daytona,
 // Runloop and E2B facades send to toolboxd must reach a real toolboxd route.
 // Bad inputs, missing files and missing sessions may still fail; only "no
-// such route" (routeMissingHeader) fails the test. Language servers and
-// Daytona terminals must answer a clear 501 until they are built.
+// such route" (routeMissingHeader) fails the test. Language servers must
+// answer a clear 501; Daytona terminals (plan E8) must answer for real.
 func TestFacadeToolboxRoutesExistInToolboxd(t *testing.T) {
 	h := authedRoutes(newDaytonaTestServer(t))
 	probes := facadeProbes(t)
 	if len(probes) < 40 {
 		t.Fatalf("only %d probes; the facade inventories look empty", len(probes))
 	}
+	ptyProbes := 0
 	for _, p := range probes {
 		var body *strings.Reader
 		if p.method == http.MethodPost {
@@ -104,10 +105,17 @@ func TestFacadeToolboxRoutesExistInToolboxd(t *testing.T) {
 			t.Errorf("%s forwards %s %s, but toolboxd has no such route (status %d)", p.facade, p.method, p.path, rr.Code)
 			continue
 		}
-		if isDaytonaLSPPath(p.path) || isDaytonaPTYPath(p.path) {
-			if rr.Code != http.StatusNotImplemented {
-				t.Errorf("%s %s = %d, want a clear 501", p.method, p.path, rr.Code)
+		if isDaytonaLSPPath(p.path) && rr.Code != http.StatusNotImplemented {
+			t.Errorf("%s %s = %d, want a clear 501", p.method, p.path, rr.Code)
+		}
+		if isDaytonaPTYPath(p.path) {
+			ptyProbes++
+			if rr.Code == http.StatusNotImplemented || rr.Code == http.StatusMethodNotAllowed {
+				t.Errorf("%s %s = %d %s, want the terminal route to answer", p.method, p.path, rr.Code, rr.Body.String())
 			}
 		}
+	}
+	if ptyProbes != 6 {
+		t.Errorf("probed %d Daytona terminal calls, want all 6 (create, list, info, kill, resize, connect)", ptyProbes)
 	}
 }

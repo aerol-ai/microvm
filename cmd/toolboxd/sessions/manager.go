@@ -306,6 +306,7 @@ func (m *Manager) Create(ctx context.Context, req models.CreateSessionRequest) (
 		}
 		s.ptmx = ptmx
 		s.wait = wait
+		s.ttyPath = ptsPath(ptmx)
 		s.startedAt = time.Now().UTC()
 		s.pumpWG.Add(1)
 		go s.runPump(ptmx, StreamStdout)

@@ -290,17 +290,10 @@ func lookupGroupID(raw string) (int, error) {
 	return strconv.Atoi(found.Gid)
 }
 
-// Daytona routes AerolVM does not implement answer 501 with a reason instead
-// of the default 404, which reads as a toolboxd bug. Language servers are not
-// planned; terminals are plan item E8.
-const (
-	errDaytonaLSPUnsupported = "language servers are not supported on AerolVM"
-	errDaytonaPTYUnsupported = "Daytona terminals (process.createPty) are not supported yet; use a session or execStream with a terminal"
-)
-
-func isDaytonaPTYPath(path string) bool {
-	return path == "/process/pty" || strings.HasPrefix(path, "/process/pty/")
-}
+// Language servers answer 501 with a reason instead of the default 404,
+// which reads as a toolboxd bug. They are not planned. (Daytona terminals
+// are served by daytona_pty.go.)
+const errDaytonaLSPUnsupported = "language servers are not supported on AerolVM"
 
 func isDaytonaLSPPath(path string) bool {
 	return path == "/lsp" || strings.HasPrefix(path, "/lsp/")
