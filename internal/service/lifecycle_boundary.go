@@ -35,9 +35,10 @@ import (
 //
 // The lock is one per sandbox, not a shared stripe: a step can hold it across
 // a runtime start or stop (seconds, up to restartStartTimeout), and a shared
-// stripe would make unrelated sandboxes, and the one goroutine that handles
-// runtime events for the whole node, wait for it. Waiting honours ctx, so a
-// caller that gives up stops waiting.
+// stripe would make unrelated sandboxes wait for it. Runtime events wait on
+// their sandbox's own event queue (event_queues.go), so a sandbox held by a
+// long step never holds up another sandbox's events. Waiting honours ctx, so
+// a caller that gives up stops waiting.
 type sandboxLocks struct {
 	mu    sync.Mutex
 	locks map[string]*sandboxLock

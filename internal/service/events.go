@@ -35,6 +35,10 @@ func (s *Service) StartEventMonitor(ctx context.Context) {
 
 func (s *Service) runEventMonitor(ctx context.Context) {
 	backoff := eventReconnectInitial
+	// One set of per-sandbox queues for the monitor's life, so events
+	// still queued when a stream ends are handled, not dropped, and in
+	// order with what the next stream brings.
+	queues := s.newEventQueues(ctx)
 	for {
 		if ctx.Err() != nil {
 			return
@@ -49,8 +53,8 @@ func (s *Service) runEventMonitor(ctx context.Context) {
 			close(events)
 		}()
 
-		// Drain events until the stream returns.
-		s.consumeEvents(streamCtx, events)
+		// Read events until the stream returns.
+		s.feedEvents(streamCtx, events, queues)
 		err := <-streamDone
 		cancel()
 
@@ -77,11 +81,29 @@ func (s *Service) runEventMonitor(ctx context.Context) {
 	}
 }
 
+// consumeEvents handles a stream's events on per-sandbox queues
+// (event_queues.go) and returns once the stream has ended and every event it
+// gave has been handled.
 func (s *Service) consumeEvents(ctx context.Context, events <-chan docker.DockerEvent) {
+	queues := s.newEventQueues(ctx)
+	s.feedEvents(ctx, events, queues)
+	queues.wait()
+}
+
+// feedEvents hands each event to its sandbox's queue until the stream ends
+// or ctx does. It waits only when one sandbox's queue is full, never for a
+// sandbox's lifecycle boundary: a sandbox held by a long step delays its own
+// events, not the node's.
+func (s *Service) feedEvents(ctx context.Context, events <-chan docker.DockerEvent, queues *sandboxEventQueues) {
 	for event := range events {
-		if ctx.Err() != nil {
+		if ctx.Err() != nil || !queues.add(ctx, event) {
 			return
 		}
+	}
+}
+
+func (s *Service) newEventQueues(ctx context.Context) *sandboxEventQueues {
+	return newSandboxEventQueues(ctx, maxQueuedEventsPerSandbox, func(ctx context.Context, event docker.DockerEvent) {
 		if err := s.handleDockerEvent(ctx, event); err != nil {
 			s.logger.Warn("handle docker event failed",
 				"sandbox_id", event.SandboxID,
@@ -89,13 +111,15 @@ func (s *Service) consumeEvents(ctx context.Context, events <-chan docker.Docker
 				"error", err,
 			)
 		}
-	}
+	})
 }
 
 func (s *Service) handleDockerEvent(ctx context.Context, event docker.DockerEvent) error {
 	// An exit and a removal change whether the sandbox runs, so they are
 	// handled inside the lifecycle boundary (lifecycle_boundary.go), and the
-	// row is read only once it is held: an event that read it first and then
+	// row is read only once it is held. The wait holds up only this
+	// sandbox's queue (event_queues.go), not other sandboxes' events. The
+	// row is read after the wait because an event that read it first and then
 	// waited out a stop, a start or a destroy would write that old read back
 	// (Upsert inserts a missing row). Holding it from the die's record to the
 	// restart it schedules means no stop or pause can come between them; one
