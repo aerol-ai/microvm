@@ -20,6 +20,9 @@ var (
 	metricTargetEvict = expvar.NewInt("aerolvm_docker_pool_target_evictions_total")
 	metricReclaim     = expvar.NewInt("aerolvm_docker_pool_reclaims_total")
 	metricReplaced    = expvar.NewInt("aerolvm_docker_pool_replaced_total")
+	// metricDestroyFail counts failed parked-container teardowns, each retry
+	// included. The pending gauges are in pending_destroy.go.
+	metricDestroyFail = expvar.NewInt("aerolvm_docker_pool_destroy_failures_total")
 	adoptMS           = expvar.NewFloat("aerolvm_docker_pool_adopt_ms")
 )
 
@@ -34,6 +37,7 @@ type Metrics struct {
 	targetEvicts atomic.Int64
 	reclaims     atomic.Int64
 	replaced     atomic.Int64
+	destroyFails atomic.Int64
 }
 
 // Snapshot is a point-in-time view of pool counters.
@@ -51,6 +55,9 @@ type Snapshot struct {
 	// Replaced counts parked slots destroyed because their entry's image
 	// changed (on_image_change replace_now), before any create used them.
 	Replaced int64
+	// DestroyFailures counts parked-container teardowns that failed, retries
+	// included. Each failed container is kept and retried until it is gone.
+	DestroyFailures int64
 }
 
 func (m *Metrics) recordHit() {
@@ -98,6 +105,11 @@ func (m *Metrics) recordReplaced(n int) {
 	metricReplaced.Add(int64(n))
 }
 
+func (m *Metrics) recordDestroyFail() {
+	m.destroyFails.Add(1)
+	metricDestroyFail.Add(1)
+}
+
 func (m *Metrics) setParked(n int) { metricParked.Set(int64(n)) }
 
 // RecordAdoptMS publishes the latest successful adopt handshake duration.
@@ -124,5 +136,7 @@ func (m *Metrics) Stats() Snapshot {
 		TargetEvicts: m.targetEvicts.Load(),
 		Reclaims:     m.reclaims.Load(),
 		Replaced:     m.replaced.Load(),
+
+		DestroyFailures: m.destroyFails.Load(),
 	}
 }

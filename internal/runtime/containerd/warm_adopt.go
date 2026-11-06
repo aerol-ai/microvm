@@ -266,6 +266,13 @@ func (d *Driver) destroyParked(ctx context.Context, slot *containerdpool.ParkedS
 			return err
 		}
 		container, err := client.LoadContainer(ctx, slot.ContainerID)
+		if errdefs.IsNotFound(err) {
+			// Already gone: the teardown's goal holds. The warm pool keeps a
+			// failed teardown and retries it until this returns nil
+			// (dockerpool pending_destroy.go), so absence must read as done,
+			// like docker's 404 on remove.
+			return nil
+		}
 		if err != nil {
 			return err
 		}
@@ -278,7 +285,9 @@ func (d *Driver) destroyParked(ctx context.Context, slot *containerdpool.ParkedS
 			_ = task.Kill(ctx, syscall.SIGKILL)
 			_, _ = task.Delete(ctx)
 		}
-		return container.Delete(ctx)
+		if err := container.Delete(ctx); err != nil && !errdefs.IsNotFound(err) {
+			return err
+		}
 	}
 	return nil
 }

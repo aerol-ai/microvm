@@ -6,6 +6,9 @@ import (
 	"strings"
 	"testing"
 
+	cntr "github.com/containerd/containerd/v2/client"
+	"github.com/containerd/errdefs"
+
 	"github.com/aerol-ai/microvm/internal/pool/containerdpool"
 	"github.com/aerol-ai/microvm/pkg/createtiming"
 	"github.com/aerol-ai/microvm/pkg/models"
@@ -273,5 +276,45 @@ func TestAdoptParkedIncompleteSlot(t *testing.T) {
 	}
 	if _, err := d.adoptParked(context.Background(), models.CreateSandboxRequest{}, "sb", "tok", &containerdpool.ParkedSlot{ID: "x"}); err == nil {
 		t.Fatal("want incomplete error")
+	}
+}
+
+// deleteErrContainer is a parked container whose Delete fails with err.
+type deleteErrContainer struct {
+	*fakeContainer
+	err error
+}
+
+func (c deleteErrContainer) Delete(context.Context, ...cntr.DeleteOpts) error { return c.err }
+
+// The warm pool retries a failed park teardown until destroyParked returns
+// nil (dockerpool pending_destroy.go), so a container that is already gone
+// must read as torn down, at load or at delete. Any other error still fails,
+// so the pool keeps the slot and its reservation.
+func TestDestroyParkedTreatsMissingContainerAsGone(t *testing.T) {
+	cases := []struct {
+		name    string
+		load    func(context.Context, string) (cntr.Container, error)
+		wantErr bool
+	}{
+		{"never loaded", nil, false},
+		{"gone before delete", func(context.Context, string) (cntr.Container, error) {
+			return deleteErrContainer{&fakeContainer{id: "park-x"}, errdefs.ErrNotFound}, nil
+		}, false},
+		{"delete refused", func(context.Context, string) (cntr.Container, error) {
+			return deleteErrContainer{&fakeContainer{id: "park-x"}, errors.New("busy")}, nil
+		}, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tr := newFakeTransport()
+			tr.loadContainerFn = tc.load
+			d := newTestDriver(t)
+			d.SetClient(NewTestClient("aerolvm", tr))
+			err := d.destroyParked(context.Background(), &containerdpool.ParkedSlot{ID: "park-x", ContainerID: "park-x"})
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("destroyParked err = %v, want error %v", err, tc.wantErr)
+			}
+		})
 	}
 }
