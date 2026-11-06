@@ -425,8 +425,9 @@ func equalSorted(a, b []string) bool {
 // A token-gated port on an ordinary (not serverless) sandbox has only the
 // wake-aware route: the ingress proxy is what checks the token. The sweep
 // must keep it, or the gated URL answers Caddy's "Sandbox not found" until
-// the next expose (UC-465 on single-node-fc). A public port on the same
-// sandbox still loses a stray wake route.
+// the next expose (UC-465 on single-node-fc), and must remove a direct
+// route on it, which would skip the token. A public port on the same
+// sandbox keeps its direct route and loses a stray wake route.
 func TestGCZombieCaddyEntriesKeepsTokenGatedWakeRoutes(t *testing.T) {
 	fake := newGCCaddyFake()
 	sb := &models.Sandbox{
@@ -440,6 +441,8 @@ func TestGCZombieCaddyEntriesKeepsTokenGatedWakeRoutes(t *testing.T) {
 	}
 	fake.httpRouteIDs[caddy.SandboxRouteID(sb.ID)] = struct{}{}
 	fake.httpRouteIDs[caddy.WakePortRouteID(sb.ID, 8080)] = struct{}{}
+	// A direct route on the gated port skips the token: it must go.
+	fake.httpRouteIDs[caddy.PortRouteID(sb.ID, 8080)] = struct{}{}
 	fake.httpRouteIDs[caddy.PortRouteID(sb.ID, 3000)] = struct{}{}
 	fake.httpRouteIDs[caddy.WakePortRouteID(sb.ID, 3000)] = struct{}{}
 

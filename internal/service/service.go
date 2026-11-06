@@ -7349,12 +7349,16 @@ func (s *Service) gcZombieCaddyEntries(ctx context.Context, sandboxes []*models.
 		for _, p := range sb.ExposedPorts {
 			switch p.Protocol {
 			case "", models.ExposedPortProtocolHTTP:
-				expectedHTTP[fmt.Sprintf("sandbox-%s-port-%d", sb.ID, p.Port)] = struct{}{}
-				// A token-gated port (A2) always takes the wake-aware shape,
-				// serverless or not, since only the ingress proxy checks the
-				// token. Without this the sweep deleted that route as a
-				// zombie on every pass, and the gated URL answered Caddy's
-				// "Sandbox not found" (UC-465 on single-node-fc).
+				// A token-gated port (A2) has only the wake-aware route,
+				// serverless or not: only the ingress proxy checks the token.
+				// So the sweep keeps its wake route (without this it deleted
+				// it as a zombie every pass, and the gated URL answered
+				// Caddy's "Sandbox not found", UC-465 on single-node-fc) and
+				// does NOT keep a direct route for it: a direct route there
+				// skips the token, so one left behind by any writer goes.
+				if !p.TokenGated() {
+					expectedHTTP[fmt.Sprintf("sandbox-%s-port-%d", sb.ID, p.Port)] = struct{}{}
+				}
 				if isServerless || p.TokenGated() {
 					expectedHTTP[caddy.WakePortRouteID(sb.ID, p.Port)] = struct{}{}
 				}
