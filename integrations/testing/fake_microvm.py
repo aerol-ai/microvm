@@ -67,6 +67,12 @@ class FakeMicroVM:
         self._stash = Path(tempfile.mkdtemp(prefix="fake-microvm-snapshots-"))
         self._lock = threading.Lock()
 
+    def __deepcopy__(self, memo: dict) -> "FakeMicroVM":
+        # gymnasium's EnvSpec.make() deep-copies the kwargs an environment
+        # was made with, client included. Every copy must keep talking to
+        # this one fake, as copies of a real client reach one server.
+        return self
+
     def cleanup(self) -> None:
         shutil.rmtree(self._stash, ignore_errors=True)
 

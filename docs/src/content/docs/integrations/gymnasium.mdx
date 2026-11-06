@@ -1,0 +1,149 @@
+---
+title: Gymnasium
+description: Train or test terminal agents with reinforcement learning, in a Gymnasium environment where every episode is a fresh AerolVM sandbox.
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+<Aside>
+This page shows Python only. Gymnasium is a Python library.
+</Aside>
+
+[Gymnasium](https://gymnasium.farama.org/) is the standard Python API for reinforcement learning environments. The `aerolvm-gymnasium` package gives you one where:
+
+- each episode runs in a **new AerolVM sandbox**, so no episode sees another's files,
+- the agent **acts by sending shell commands**,
+- the agent **sees the command output**,
+- a **reward function you choose** scores each step.
+
+Use it for agents that work in a terminal: fix a bug, set up a project, pass a test suite.
+
+## Install
+
+The package is not on PyPI yet. Install it from the AerolVM repository:
+
+```bash
+pip install "git+https://github.com/aerol-ai/microvm.git#subdirectory=integrations/gymnasium"
+```
+
+It works with Gymnasium 1.4. Set the same two variables as for the [Python SDK](/sdk-setup/):
+
+```bash
+export SB_API_URL=https://sandbox.example.com
+export SB_PAT_TOKEN=your-token
+```
+
+## Run an episode
+
+```python
+import gymnasium as gym
+import aerolvm_gymnasium  # registers AerolVM/ShellSandbox-v0
+from aerolvm_gymnasium import CommandReward, CommandTermination
+
+env = gym.make(
+    "AerolVM/ShellSandbox-v0",
+    image="python:3.12-slim",
+    reward_fn=CommandReward("test -f hello.txt"),
+    termination_fn=CommandTermination("test -f hello.txt"),
+    max_episode_steps=10,
+)
+
+obs, info = env.reset(options={"task": "Create a file called hello.txt"})
+print(obs)  # the task is the first observation
+
+obs, reward, terminated, truncated, info = env.step("touch hello.txt")
+print(reward, terminated)  # 1.0 True
+
+env.close()  # destroys the sandbox
+```
+
+## What it does with the sandbox
+
+| Gymnasium call | AerolVM does |
+| --- | --- |
+| `reset()` | Makes a new sandbox and the work folder (`/workspace`). The previous episode's sandbox is destroyed in the background. |
+| `step(command)` | Runs the command in the work folder, with a time limit (`step_timeout`, 60 seconds by default). |
+| `close()` | Destroys the sandbox, and the start snapshot if the environment built one. |
+
+The observation is the command's stdout, then `[stderr]` and its stderr, cut to `max_obs_length` characters. Characters outside the printable ASCII set become `?`, so every observation fits the observation space. `info` holds the exit code, stdout, stderr, whether the command timed out, and the sandbox id.
+
+If the server fails during a step, `step` does not raise. The observation says what went wrong, `info["env_error"]` is `True`, and the exit code is -1. If it fails during a reward or termination check that runs a command, the step gets reward 0, the episode does not end, and `info["env_error"]` is `True`. Training keeps going.
+
+## Rewards
+
+A reward function takes a `Step` and returns a number. A termination function takes a `Step` and returns `True` when the task is done. A `Step` holds the command, its output and exit code, the step number and the task. `step.run(command)` runs another command in the same sandbox, so a reward can check the real result, for example by running the task's tests.
+
+| Function | What it does |
+| --- | --- |
+| `exit_code_reward` (the default) | 1.0 when the command exits 0, else 0.0 |
+| `CommandReward(cmd, success=1.0, failure=0.0)` | Runs `cmd` after each step. Gives `success` when it exits 0. |
+| `CommandTermination(cmd)` | Ends the episode when `cmd` exits 0 |
+
+Any callable works. If it has a `reset(task)` method, that runs when each episode starts:
+
+```python
+class FewerStepsIsBetter:
+    def reset(self, task):
+        pass
+
+    def __call__(self, step):
+        return 1.0 - 0.1 * step.step if step.exit_code == 0 else 0.0
+
+env = gym.make("AerolVM/ShellSandbox-v0", image="python:3.12-slim", reward_fn=FewerStepsIsBetter())
+```
+
+## Make resets fast
+
+A reset makes a new sandbox, so it is as fast as a sandbox create. Two things help:
+
+**Start from a snapshot.** Give the environment the task files and setup steps. The first reset builds a [snapshot](/images-and-snapshots/#snapshots) from them, and every episode boots straight into that state:
+
+```python
+env = gym.make(
+    "AerolVM/ShellSandbox-v0",
+    image="python:3.12-slim",
+    workspace_dir="./task",                      # copied into /workspace
+    setup_commands=["pip install -r requirements.txt"],
+)
+```
+
+For many environments at once, build the snapshot one time and pass its name as the image:
+
+```python
+from aerolvm_gymnasium import make_snapshot
+
+start = make_snapshot(
+    "python:3.12-slim",
+    "my-task-start",
+    workspace_dir="./task",
+    setup_commands=["pip install -r requirements.txt"],
+)
+envs = gym.make_vec("AerolVM/ShellSandbox-v0", num_envs=8, image=start)
+```
+
+An environment deletes only a snapshot it built itself. Delete `my-task-start` with `client.delete_snapshot("my-task-start")` when you are done.
+
+**Use a [warm pool](/warm-pools/).** With a warm pool set for the image or snapshot, a create takes a sandbox that is already running.
+
+## Settings
+
+| Setting | Default | What it does |
+| --- | --- | --- |
+| `image` | (required) | Image or snapshot name each episode starts from |
+| `reward_fn` | `exit_code_reward` | Scores each step |
+| `termination_fn` | `None` | Ends an episode early when it returns `True` |
+| `client` | built from the environment variables | A `microvm.MicroVM` |
+| `create_options` | `{}` | Other create fields, such as `cpu`, `memoryMB` or `networkBlockAll` |
+| `workspace_dir`, `setup_commands` | none | Build a start snapshot on the first reset |
+| `work_dir` | `/workspace` | Folder commands run in |
+| `step_timeout` | `60` | Seconds one command may run |
+| `max_episode_steps` | `20` | Steps before an episode is cut off |
+| `max_obs_length` | `4096` | Characters kept from each command's output |
+| `max_action_length` | `4096` | Longest command allowed |
+| `max_output_bytes` | `None` | Cap stdout and stderr inside the sandbox, so a noisy command sends little |
+
+## Limits
+
+- The sandbox does not use the seed. `reset(seed=...)` only seeds `env.np_random`, so the environment is registered as nondeterministic.
+- It needs a shell, so it works with container and Firecracker sandboxes, not WebAssembly or V8 isolate ones.
+- A `CommandReward` and a `CommandTermination` each run their own check, so using both runs it twice per step.

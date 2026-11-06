@@ -432,6 +432,7 @@ jobs:
         package:
           - openai-agents
           - deepagents
+          - gymnasium
     defaults:
       run:
         working-directory: integrations/${{ matrix.package }}

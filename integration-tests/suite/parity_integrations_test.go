@@ -13,6 +13,8 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -186,5 +188,74 @@ func TestParityDeepAgentsBackendCalls(t *testing.T) {
 		return st != http.StatusNotFound
 	}() {
 		t.Fatalf("delete of a missing path: %v; want 404", err)
+	}
+}
+
+// UC-459 — Gymnasium environment (G4). make_snapshot builds the start state
+// once: a sandbox gets the task folder through upload_dir and runs a setup
+// command, and is saved as a snapshot. Every episode then boots from it.
+// The case runs two episodes: each sees the task and setup files, a check
+// command's exit code reports whether the work is done (CommandReward), and
+// the second episode does not see what the first one wrote.
+func TestParityGymnasiumEpisodes(t *testing.T) {
+	harness.Require(t, sc, "UC-459")
+	c := client(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Minute)
+	defer cancel()
+
+	task := t.TempDir()
+	if err := os.WriteFile(filepath.Join(task, "README.txt"), []byte("create done.txt"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	build := paritySandbox(t)
+	if err := build.MakeDir(ctx, "/workspace", sdktypes.MakeDirOptions{Parents: true}); err != nil {
+		t.Fatalf("make work folder: %v", err)
+	}
+	if err := build.UploadDir(ctx, task, "/workspace"); err != nil {
+		t.Fatalf("upload task folder: %v", err)
+	}
+	if res, err := build.Exec(ctx, sdktypes.ExecRequest{Command: "echo built > setup.txt", WorkDir: "/workspace", TimeoutSeconds: 60}); err != nil || res.ExitCode != 0 {
+		t.Fatalf("setup command: %+v, %v", res, err)
+	}
+	start := fcSnapshotName(t, "uc459")
+	if _, err := build.CreateSnapshot(ctx, start); err != nil {
+		t.Fatalf("create start snapshot: %v", err)
+	}
+	t.Cleanup(func() {
+		cctx, ccancel := context.WithTimeout(context.Background(), time.Minute)
+		defer ccancel()
+		if derr := c.SDK().DeleteSnapshot(cctx, start); derr != nil {
+			t.Logf("cleanup: delete snapshot %s: %v", start, derr)
+		}
+	})
+	if err := c.SDK().Destroy(ctx, build.ID); err != nil {
+		t.Fatalf("destroy the build sandbox: %v", err)
+	}
+
+	run := func(sb *microvm.Sandbox, command string) sdktypes.ExecResult {
+		t.Helper()
+		res, err := sb.Exec(ctx, sdktypes.ExecRequest{Command: command, WorkDir: "/workspace", TimeoutSeconds: 60})
+		if err != nil {
+			t.Fatalf("exec %q in %s: %v", command, sb.ID, err)
+		}
+		return res
+	}
+	for episode := 1; episode <= 2; episode++ {
+		sb := c.NewSandbox(t, sdktypes.CreateSandboxOptions{Name: harness.UniqueName(sc, t), Image: start})
+		waitRunning(t, sb)
+		if got := run(sb, "cat README.txt setup.txt").Stdout; got != "create done.txtbuilt\n" {
+			t.Fatalf("episode %d start state = %q", episode, got)
+		}
+		// Nothing from an earlier episode, and the task is not done yet.
+		if res := run(sb, "test -f done.txt"); res.ExitCode == 0 {
+			t.Fatalf("episode %d starts with done.txt from an earlier episode", episode)
+		}
+		run(sb, "touch done.txt")
+		if res := run(sb, "test -f done.txt"); res.ExitCode != 0 {
+			t.Fatalf("episode %d: the check does not see the agent's work", episode)
+		}
+		if err := c.SDK().Destroy(ctx, sb.ID); err != nil {
+			t.Fatalf("destroy episode %d: %v", episode, err)
+		}
 	}
 }

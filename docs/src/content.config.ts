@@ -69,6 +69,7 @@ const getDocsSidebarConfig = (): NavigationGroup[] => [
     entries: [
       link('/integrations/openai-agents', '- OpenAI Agents SDK'),
       link('/integrations/deepagents', '- LangChain DeepAgents'),
+      link('/integrations/gymnasium', '- Gymnasium'),
     ],
   },
   {
