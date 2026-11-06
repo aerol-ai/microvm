@@ -1,0 +1,41 @@
+[project]
+name = "aerolvm-nemo-gym"
+version = "0.1.0"
+description = "Run NVIDIA NeMo Gym sandboxes on AerolVM."
+readme = "README.md"
+# NeMo Gym itself asks for >=3.13.14, which in practice means 3.14.
+requires-python = ">=3.13"
+license = "MIT"
+authors = [{ name = "Aerol AI" }]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Operating System :: OS Independent",
+]
+dependencies = [
+  # The provider protocol and the entry-point registry exist only in NeMo
+  # Gym's source from 0.7 (not yet on PyPI, whose latest is 0.4.0). The
+  # tests run against the commit pinned in requirements-ci-nodeps.txt.
+  "nemo-gym>=0.7.0rc0",
+  # Uses the exec timedOut flag and make_dir, added after aerolvm-sdk
+  # 0.8.1. Raise this floor to the first release that has them before
+  # publishing this package.
+  "aerolvm-sdk>=0.8.1",
+]
+
+[project.urls]
+Documentation = "https://microvm.aerol.ai/integrations/nemo-gym/"
+
+# NeMo Gym finds third-party sandbox providers through this group
+# (nemo_gym/sandbox/providers/registry.py), so installing this package makes
+# `aerolvm` a provider name with no registration code.
+[project.entry-points."nemo_gym.sandbox_providers"]
+aerolvm = "aerolvm_nemo_gym.provider:AerolVMProvider"
+
+# Only the package goes in the wheel; tests stay out so they never shadow a
+# user's own "tests" package.
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"

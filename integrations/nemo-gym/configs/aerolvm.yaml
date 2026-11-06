@@ -1,0 +1,32 @@
+# AerolVM sandbox provider config for NVIDIA NeMo Gym.
+#
+# `sandbox` is the instance name an agent references with
+# `sandbox_provider: sandbox`; the child key `aerolvm` selects this provider
+# (published by aerolvm-nemo-gym through the `nemo_gym.sandbox_providers`
+# entry point), and its value is passed to the provider's constructor.
+#
+# Every NeMo Gym provider config binds the same name `sandbox`, so switching
+# to AerolVM is switching this config path:
+#
+#   gym env start \
+#       --config responses_api_agents/mini_swe_agent_2/configs/mini_swe_agent_2.yaml \
+#       --config /path/to/integrations/nemo-gym/configs/aerolvm.yaml \
+#       --config responses_api_models/vllm_model/configs/vllm_model.yaml
+sandbox:
+  default_metadata:
+    sandbox-api: aerolvm
+  aerolvm:
+    api_url: ${oc.env:SB_API_URL}
+    api_token: ${oc.env:SB_PAT_TOKEN}
+    # Used when an agent's sandbox_spec names no image.
+    default_image: python:3.12-slim
+    # Command time limit when the agent gives none.
+    exec_timeout_s: 180
+    # How long a new sandbox may take to run its first command.
+    probe_deadline_s: 60
+    # Any other MicroVM.create fields, applied to every sandbox.
+    create_options: {}
+    #   runtime: firecracker
+    #   networkBlockAll: true
+    #   lifecycle:
+    #     destroyIfIdleFor: 3600000000000   # one hour, in nanoseconds

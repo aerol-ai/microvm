@@ -101,6 +101,7 @@ These calls fail. Most return HTTP 404 or 501, so your code gets an error rather
 | Daytona feature | What happens |
 |---|---|
 | Download files (`fs.downloadFile`, `fs.downloadFiles`) | Fails with `Target metadata missing for valid source` in our tests with SDK versions 0.175.0 and 0.223.1. Read a file with `process.executeCommand` instead, for example with `cat` or `base64`. |
+| Create a sandbox with the Daytona **Python** SDK (`daytona` on PyPI) | Fails: the SDK reads no sandbox back from the create (tested with 0.179.0 and 0.230.0). From 0.230.0, `get` fails too. The TypeScript and Go SDKs are not affected. |
 | Language servers (LSP) | Not supported (HTTP 501). |
 | `codeInterpreter` (Daytona's stateful notebook-style runner) | Not supported (HTTP 501). Use `process.codeRun` or `process.executeCommand`. |
 | `sandbox.archive()` | Not supported (no such route). |

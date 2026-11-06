@@ -70,6 +70,7 @@ const getDocsSidebarConfig = (): NavigationGroup[] => [
       link('/integrations/openai-agents', '- OpenAI Agents SDK'),
       link('/integrations/deepagents', '- LangChain DeepAgents'),
       link('/integrations/gymnasium', '- Gymnasium'),
+      link('/integrations/nemo-gym', '- NVIDIA NeMo Gym'),
     ],
   },
   {

@@ -429,10 +429,16 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        package:
-          - openai-agents
-          - deepagents
-          - gymnasium
+        include:
+          - package: openai-agents
+            python: '3.12'
+          - package: deepagents
+            python: '3.12'
+          - package: gymnasium
+            python: '3.12'
+          # NeMo Gym asks for Python >=3.13.14, which only 3.14 meets.
+          - package: nemo-gym
+            python: '3.14'
     defaults:
       run:
         working-directory: integrations/${{ matrix.package }}
@@ -443,15 +449,21 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
         with:
-          python-version: '3.12'
+          python-version: ${{ matrix.python }}
           cache: pip
-          cache-dependency-path: integrations/${{ matrix.package }}/requirements-ci.txt
+          cache-dependency-path: integrations/${{ matrix.package }}/requirements-ci*.txt
 
       - name: Install the package and its pinned dependencies
         run: |
           # Hash-pin third-party packages, then install the SDK and the
           # package from this checkout with --no-deps, as the SDK job does.
           python -m pip install --require-hashes -r requirements-ci.txt
+          # A framework installed without its own dependencies (NeMo Gym's
+          # are a training stack its provider API never imports), still by
+          # hash.
+          if [ -f requirements-ci-nodeps.txt ]; then
+            python -m pip install --no-deps --no-build-isolation --require-hashes -r requirements-ci-nodeps.txt
+          fi
           python -m pip install --no-deps --no-build-isolation -e ../../sdk/python -e .
 
       - name: Run the package's tests

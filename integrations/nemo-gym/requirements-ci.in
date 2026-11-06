@@ -1,0 +1,17 @@
+# CI install set for this package's tests. The hash-pinned output is
+# requirements-ci.txt; regenerate it under Python 3.14 with:
+#   pip-compile --allow-unsafe --generate-hashes --strip-extras \
+#     --output-file=requirements-ci.txt requirements-ci.in
+# NeMo Gym itself comes from requirements-ci-nodeps.txt, installed without
+# its dependencies (ray, mlflow, wandb and more, none of which the provider
+# API touches). These are the few its provider modules import.
+pyyaml
+pydantic
+omegaconf
+# The AerolVM SDK's only dependency. The SDK itself is installed from
+# sdk/python with --no-deps.
+websocket-client>=1.8.0,<2
+# Build backend for NeMo Gym's source archive and for this package.
+setuptools>=77
+setuptools-scm
+wheel

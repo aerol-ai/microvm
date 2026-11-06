@@ -11,6 +11,7 @@ package suite
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"os"
@@ -257,5 +258,90 @@ func TestParityGymnasiumEpisodes(t *testing.T) {
 		if err := c.SDK().Destroy(ctx, sb.ID); err != nil {
 			t.Fatalf("destroy episode %d: %v", episode, err)
 		}
+	}
+}
+
+// UC-460 — NVIDIA NeMo Gym through the Daytona facade (G5). NeMo Gym's
+// Daytona provider creates a sandbox with a name, labels, env and its
+// auto-stop and auto-delete intervals, reads it, runs commands with a
+// working folder, extra variables and a timeout, and deletes it. This sends
+// those calls with the Daytona Python SDK's field names. The SDK's create
+// and file download do not work through the facade today (see the docs
+// page integrations/nemo-gym); the provider in integrations/nemo-gym avoids
+// them, and the rest of the call set is pinned here.
+func TestParityNeMoGymDaytonaCalls(t *testing.T) {
+	harness.Require(t, sc, "UC-460")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	name := harness.UniqueName(sc, t)
+	st, body := fcDo(t, ctx, http.MethodPost, "", "/daytona/sandbox", map[string]any{
+		"name":               name,
+		"labels":             map[string]string{"sandbox-api": "daytona-sdk", "sandbox_id": name, "code-toolbox-language": "python"},
+		"env":                map[string]string{"TASK_ID": "7"},
+		"autoStopInterval":   30,
+		"autoDeleteInterval": 600,
+		"buildInfo":          map[string]string{"dockerfileContent": "FROM " + harness.DefaultImage + "\n"},
+	}, nil)
+	if st/100 != 2 {
+		t.Fatalf("create = %d %s", st, body)
+	}
+	var created struct {
+		ID    string `json:"id"`
+		State string `json:"state"`
+	}
+	if err := json.Unmarshal(body, &created); err != nil || created.ID == "" {
+		t.Fatalf("create body %s: %v", body, err)
+	}
+	t.Cleanup(func() {
+		cctx, ccancel := context.WithTimeout(context.Background(), time.Minute)
+		defer ccancel()
+		if st, body := fcDo(t, cctx, http.MethodDelete, "", "/daytona/sandbox/"+created.ID, nil, nil); st/100 != 2 && st != http.StatusNotFound {
+			t.Logf("cleanup: delete %s = %d %s", created.ID, st, body)
+		}
+	})
+
+	deadline := time.Now().Add(2 * time.Minute)
+	for created.State != "started" {
+		if time.Now().After(deadline) {
+			t.Fatalf("sandbox %s never reached started (last %q)", created.ID, created.State)
+		}
+		time.Sleep(2 * time.Second)
+		st, body = fcDo(t, ctx, http.MethodGet, "", "/daytona/sandbox/"+created.ID, nil, nil)
+		if st != http.StatusOK {
+			t.Fatalf("get = %d %s", st, body)
+		}
+		_ = json.Unmarshal(body, &created)
+	}
+
+	st, body = daytonaToolbox(t, ctx, http.MethodPost, created.ID, "/process/execute", nil, map[string]any{
+		"command": `echo "$TASK_ID|$FOO"; pwd; exit 3`,
+		"cwd":     "/tmp",
+		"envs":    map[string]string{"FOO": "bar"},
+		"timeout": 30,
+	})
+	var exec struct {
+		ExitCode int    `json:"exitCode"`
+		Result   string `json:"result"`
+	}
+	if st != http.StatusOK || json.Unmarshal(body, &exec) != nil {
+		t.Fatalf("process/execute = %d %s", st, body)
+	}
+	if exec.ExitCode != 3 || exec.Result != "7|bar\n/tmp\n" {
+		t.Fatalf("process/execute = exit %d result %q; want exit 3 and the create env, the call env and the cwd", exec.ExitCode, exec.Result)
+	}
+
+	if st, body = fcDo(t, ctx, http.MethodDelete, "", "/daytona/sandbox/"+created.ID, nil, nil); st/100 != 2 {
+		t.Fatalf("delete = %d %s", st, body)
+	}
+	deadline = time.Now().Add(time.Minute)
+	for {
+		if st, _ = fcDo(t, ctx, http.MethodGet, "", "/daytona/sandbox/"+created.ID, nil, nil); st == http.StatusNotFound {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("sandbox %s still answers %d a minute after delete", created.ID, st)
+		}
+		time.Sleep(2 * time.Second)
 	}
 }
