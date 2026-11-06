@@ -1,6 +1,7 @@
 package cluster
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -87,8 +88,28 @@ func encodePlacementRecoveryRecord(record placementRecoveryStoreRecord) (string,
 	return placementRecoveryRefPrefix + hex.EncodeToString(sum[:]), payload, nil
 }
 
+// recoveryStoreSyncer makes Put's blobs durable. Put leaves a blob in the
+// page cache: it runs on the raft FSM's apply loop, one entry at a time, and
+// an fsync there (~10 ms on a busy gp3 root disk) held up every reserve and
+// promote queued behind it and capped the cluster's create rate. A blob only
+// has to be durable once a raft snapshot stands in for the log entry that
+// wrote it: until then a restart replays the entry and Put writes the blob
+// again. So the snapshot syncs them (fsmSnapshot.Persist), before the
+// snapshot can let raft compact those entries away.
+type recoveryStoreSyncer interface {
+	// Sync makes every blob Put so far durable.
+	Sync() error
+	// SyncRef makes one blob durable now, for a blob no log entry here
+	// would write again (one fetched from a peer).
+	SyncRef(ref string) error
+}
+
 type placementRecoveryFileStore struct {
 	dir string
+
+	mu sync.Mutex
+	// dirty holds the blob paths Put since the last Sync.
+	dirty map[string]struct{}
 }
 
 func newPlacementRecoveryFileStore(dir string) (*placementRecoveryFileStore, error) {
@@ -120,6 +141,15 @@ func (s *placementRecoveryFileStore) Put(sandboxID string, rec placementRecovery
 	if err := os.MkdirAll(s.dir, 0o700); err != nil {
 		return "", fmt.Errorf("placement recovery store: mkdir: %w", err)
 	}
+	// The name is the payload's hash, so a blob already there with these
+	// bytes is this one: placement updates that keep a sandbox's recovery
+	// store it again on every change. Skipping the write also never renames
+	// unsynced bytes over a blob a snapshot already made durable. A blob
+	// with other bytes is one a crash cut short; it is written again.
+	if existing, err := os.ReadFile(path); err == nil && bytes.Equal(existing, payload) {
+		s.markDirty(path)
+		return ref, nil
+	}
 	tmp, err := os.CreateTemp(s.dir, ".tmp-recovery-*")
 	if err != nil {
 		return "", fmt.Errorf("placement recovery store: create temp: %w", err)
@@ -130,17 +160,94 @@ func (s *placementRecoveryFileStore) Put(sandboxID string, rec placementRecovery
 		_ = tmp.Close()
 		return "", fmt.Errorf("placement recovery store: write: %w", err)
 	}
-	if err := tmp.Sync(); err != nil {
-		_ = tmp.Close()
-		return "", fmt.Errorf("placement recovery store: sync: %w", err)
-	}
 	if err := tmp.Close(); err != nil {
 		return "", fmt.Errorf("placement recovery store: close: %w", err)
 	}
 	if err := os.Rename(tmpName, path); err != nil {
 		return "", fmt.Errorf("placement recovery store: rename: %w", err)
 	}
+	// Marked even when the blob was already there: a sandboxd that crashed
+	// may have left it in the page cache only.
+	s.markDirty(path)
 	return ref, nil
+}
+
+func (s *placementRecoveryFileStore) markDirty(path string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.dirty == nil {
+		s.dirty = make(map[string]struct{})
+	}
+	s.dirty[path] = struct{}{}
+}
+
+// Sync fsyncs every blob Put since the last Sync, then the directory that
+// names them. A blob removed since (GC, Delete) is skipped. On failure the
+// blobs not yet synced stay dirty for the next Sync.
+func (s *placementRecoveryFileStore) Sync() error {
+	s.mu.Lock()
+	paths := make([]string, 0, len(s.dirty))
+	for path := range s.dirty {
+		paths = append(paths, path)
+	}
+	s.dirty = nil
+	s.mu.Unlock()
+	if len(paths) == 0 {
+		return nil
+	}
+	for i, path := range paths {
+		if err := recoveryStoreFsync(path); err != nil {
+			for _, left := range paths[i:] {
+				s.markDirty(left)
+			}
+			return fmt.Errorf("placement recovery store: sync %s: %w", filepath.Base(path), err)
+		}
+	}
+	if err := recoveryStoreFsync(s.dir); err != nil {
+		for _, left := range paths {
+			s.markDirty(left)
+		}
+		return fmt.Errorf("placement recovery store: sync dir: %w", err)
+	}
+	return nil
+}
+
+// SyncRef fsyncs one blob and the directory.
+func (s *placementRecoveryFileStore) SyncRef(ref string) error {
+	path, err := s.pathForRef(ref)
+	if err != nil {
+		return err
+	}
+	if err := recoveryStoreFsync(path); err != nil {
+		return fmt.Errorf("placement recovery store: sync %s: %w", filepath.Base(path), err)
+	}
+	if err := recoveryStoreFsync(s.dir); err != nil {
+		return fmt.Errorf("placement recovery store: sync dir: %w", err)
+	}
+	s.mu.Lock()
+	delete(s.dirty, path)
+	s.mu.Unlock()
+	return nil
+}
+
+// recoveryStoreFsync is syncFile; tests count the fsyncs through it.
+var recoveryStoreFsync = syncFile
+
+// syncFile fsyncs path; a path already gone has nothing left to make
+// durable.
+func syncFile(path string) error {
+	f, err := os.Open(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	err = f.Sync()
+	if closeErr := f.Close(); err == nil {
+		err = closeErr
+	}
+	return err
 }
 
 func (s *placementRecoveryFileStore) Get(ref string) (placementRecovery, bool, error) {

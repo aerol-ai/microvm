@@ -2828,6 +2828,11 @@ func (f *placementFSM) storeRecoveryBlob(blob RecoveryBlob) error {
 	if ref != blob.Ref {
 		return fmt.Errorf("placement recovery blob ref mismatch: got %s want %s", ref, blob.Ref)
 	}
+	// A fetched blob belongs to a snapshot row: no log entry here would
+	// write it again after a crash, so it is made durable now.
+	if syncer, ok := f.recoveryStore.(recoveryStoreSyncer); ok {
+		return syncer.SyncRef(ref)
+	}
 	return nil
 }
 
@@ -3915,6 +3920,15 @@ func (s *fsmSnapshot) Persist(sink raft.SnapshotSink) (err error) {
 	defer func() {
 		recordSnapshotPersist(time.Since(start), counting.bytes, len(s.rows), err)
 	}()
+	// The snapshot stands in for the log entries that wrote its rows'
+	// recovery blobs once it is closed, and raft may then compact them
+	// away, so the blobs go to disk first (recoveryStoreSyncer).
+	if syncer, ok := s.recoveryStore.(recoveryStoreSyncer); ok {
+		if err := syncer.Sync(); err != nil {
+			_ = sink.Cancel()
+			return fmt.Errorf("fsmSnapshot: %w", err)
+		}
+	}
 	enc := gob.NewEncoder(counting)
 	if err := enc.Encode(fsmSnapshotPayload{
 		Version:            s.version,
