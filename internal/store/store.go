@@ -465,6 +465,7 @@ func open(path string, secretCipher *secrets.Cipher) (*Store, error) {
 			depth INTEGER NOT NULL DEFAULT 0,
 			min_depth INTEGER NOT NULL DEFAULT 0,
 			max_depth INTEGER NOT NULL DEFAULT 0,
+			on_image_change TEXT NOT NULL DEFAULT '',
 			generation INTEGER NOT NULL DEFAULT 1,
 			created_at DATETIME NOT NULL,
 			updated_at DATETIME NOT NULL
@@ -966,6 +967,9 @@ func open(path string, secretCipher *secrets.Cipher) (*Store, error) {
 		// depth, so an entry stored before the columns keeps its meaning.
 		`ALTER TABLE warm_pools ADD COLUMN min_depth INTEGER NOT NULL DEFAULT 0;`,
 		`ALTER TABLE warm_pools ADD COLUMN max_depth INTEGER NOT NULL DEFAULT 0;`,
+		// What a pool does when its image changes (W3); '' reads as
+		// replace_now, the behaviour before the column.
+		`ALTER TABLE warm_pools ADD COLUMN on_image_change TEXT NOT NULL DEFAULT '';`,
 		// auto_import_pending is set when the post-pull AOCR auto-import
 		// (F21) failed and a background reconciler should retry. It is
 		// local-node bookkeeping only — never replicated, never user-visible.

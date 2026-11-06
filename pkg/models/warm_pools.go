@@ -29,6 +29,23 @@ const (
 	maxWarmPoolImageLen = 512
 )
 
+// What a pool does when the image its tag names changes on a server (W3):
+// replace every warm slot holding the old image at once, or keep handing
+// the old slots out and replace each one as it is used. Empty means
+// WarmPoolReplaceNow.
+const (
+	WarmPoolReplaceNow    = "replace_now"
+	WarmPoolReplaceAsUsed = "replace_as_used"
+)
+
+// NormalizeWarmPoolOnImageChange spells out the default.
+func NormalizeWarmPoolOnImageChange(v string) string {
+	if v == "" {
+		return WarmPoolReplaceNow
+	}
+	return v
+}
+
 // ErrWarmPoolInvalid is a warm-pool PUT the server refuses as malformed
 // (400).
 var ErrWarmPoolInvalid = errors.New("invalid warm pool")
@@ -42,20 +59,23 @@ type WarmPool struct {
 	// MinDepth and MaxDepth make the depth follow demand (W2): each server
 	// sets its own target from a moving average of the creates it served
 	// from the image, kept between them. MaxDepth 0 means a fixed Depth.
-	MinDepth   int             `json:"min_depth,omitempty"`
-	MaxDepth   int             `json:"max_depth,omitempty"`
-	Generation int64           `json:"generation"`
-	CreatedAt  time.Time       `json:"created_at"`
-	UpdatedAt  time.Time       `json:"updated_at"`
-	Status     *WarmPoolStatus `json:"status,omitempty"`
+	MinDepth int `json:"min_depth,omitempty"`
+	MaxDepth int `json:"max_depth,omitempty"`
+	// OnImageChange is WarmPoolReplaceNow or WarmPoolReplaceAsUsed.
+	OnImageChange string          `json:"on_image_change,omitempty"`
+	Generation    int64           `json:"generation"`
+	CreatedAt     time.Time       `json:"created_at"`
+	UpdatedAt     time.Time       `json:"updated_at"`
+	Status        *WarmPoolStatus `json:"status,omitempty"`
 }
 
 // WarmPoolRequest is the body of PUT /v1/warm-pools/{image}, a full
 // replace: the same body twice is a no-op.
 type WarmPoolRequest struct {
-	Depth    int `json:"depth"`
-	MinDepth int `json:"min_depth,omitempty"`
-	MaxDepth int `json:"max_depth,omitempty"`
+	Depth         int    `json:"depth"`
+	MinDepth      int    `json:"min_depth,omitempty"`
+	MaxDepth      int    `json:"max_depth,omitempty"`
+	OnImageChange string `json:"on_image_change,omitempty"`
 }
 
 // FollowsDemand reports an entry whose depth follows demand between
@@ -65,19 +85,23 @@ func (p WarmPool) FollowsDemand() bool { return p.MaxDepth > 0 }
 // WarmPoolStatus is how full an entry's pools are: the total over every
 // server that runs a warm pool, and each server on its own.
 type WarmPoolStatus struct {
-	Ready   int                    `json:"ready"`
-	Target  int                    `json:"target"`
-	Servers []WarmPoolServerStatus `json:"servers"`
+	Ready  int `json:"ready"`
+	Target int `json:"target"`
+	// Outdated is how many ready slots hold an image older than the one the
+	// tag names now (a replace_as_used rollout in progress).
+	Outdated int                    `json:"outdated,omitempty"`
+	Servers  []WarmPoolServerStatus `json:"servers"`
 }
 
 // WarmPoolServerStatus is one server's pool for an image. Stale marks a
 // server whose last capacity report is too old to trust; its numbers are
 // the last ones it sent.
 type WarmPoolServerStatus struct {
-	NodeID string `json:"node_id"`
-	Ready  int    `json:"ready"`
-	Target int    `json:"target"`
-	Stale  bool   `json:"stale,omitempty"`
+	NodeID   string `json:"node_id"`
+	Ready    int    `json:"ready"`
+	Target   int    `json:"target"`
+	Outdated int    `json:"outdated,omitempty"`
+	Stale    bool   `json:"stale,omitempty"`
 }
 
 // WarmPoolList is GET /v1/warm-pools: every entry, by image.
@@ -131,6 +155,11 @@ func (r WarmPoolRequest) Validate() error {
 		return fmt.Errorf("%w: set depth for a fixed size, or min_depth and max_depth to follow demand, not both", ErrWarmPoolInvalid)
 	case r.MinDepth > r.MaxDepth && r.MaxDepth > 0:
 		return fmt.Errorf("%w: min_depth %d is above max_depth %d", ErrWarmPoolInvalid, r.MinDepth, r.MaxDepth)
+	}
+	switch NormalizeWarmPoolOnImageChange(r.OnImageChange) {
+	case WarmPoolReplaceNow, WarmPoolReplaceAsUsed:
+	default:
+		return fmt.Errorf("%w: on_image_change must be %q or %q, got %q", ErrWarmPoolInvalid, WarmPoolReplaceNow, WarmPoolReplaceAsUsed, r.OnImageChange)
 	}
 	return nil
 }

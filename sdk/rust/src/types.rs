@@ -1184,6 +1184,10 @@ pub struct WarmPool {
     pub min_depth: u32,
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub max_depth: u32,
+    /// What happens to warm sandboxes when the image changes:
+    /// `"replace_now"` or `"replace_as_used"`.
+    #[serde(default)]
+    pub on_image_change: String,
     /// Goes up by one on every change; the same put twice leaves it alone.
     #[serde(default)]
     pub generation: i64,
@@ -1208,6 +1212,11 @@ pub struct WarmPoolOptions {
     /// The most warm slots a server keeps when demand is high (1 to 128).
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub max_depth: u32,
+    /// When the image changes: `"replace_now"` (the default, when empty)
+    /// swaps every waiting sandbox at once; `"replace_as_used"` hands the
+    /// old ones out first and replaces each as it is used.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub on_image_change: String,
 }
 
 fn is_zero_u32(v: &u32) -> bool {
@@ -1221,6 +1230,9 @@ pub struct WarmPoolStatus {
     pub ready: u32,
     #[serde(default)]
     pub target: u32,
+    /// Ready sandboxes still on an older image.
+    #[serde(default)]
+    pub outdated: u32,
     #[serde(default, deserialize_with = "null_as_empty_servers")]
     pub servers: Vec<WarmPoolServerStatus>,
 }
@@ -1233,6 +1245,8 @@ pub struct WarmPoolServerStatus {
     pub ready: u32,
     #[serde(default)]
     pub target: u32,
+    #[serde(default)]
+    pub outdated: u32,
     /// The server's last report is too old to trust; the numbers are its last ones.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub stale: bool,

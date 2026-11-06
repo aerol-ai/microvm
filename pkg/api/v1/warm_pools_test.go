@@ -113,6 +113,28 @@ func TestV1WarmPoolDemandRange(t *testing.T) {
 	}
 }
 
+// TestV1WarmPoolOnImageChange (W3): the strategy defaults to replace_now
+// in the answer, replace_as_used is kept, and anything else is a 400.
+func TestV1WarmPoolOnImageChange(t *testing.T) {
+	env := newCustomDomainsV1Env(t, nil)
+	for _, tc := range []struct {
+		body any
+		want string
+		code int
+	}{
+		{map[string]any{"depth": 1}, models.WarmPoolReplaceNow, http.StatusOK},
+		{map[string]any{"depth": 1, "on_image_change": "replace_as_used"}, models.WarmPoolReplaceAsUsed, http.StatusOK},
+		{map[string]any{"depth": 1, "on_image_change": "recreate"}, "", http.StatusBadRequest},
+	} {
+		rr := do(t, env.mux, http.MethodPut, "/v1/warm-pools/python:3.12", tc.body)
+		var p models.WarmPool
+		_ = json.Unmarshal(rr.Body.Bytes(), &p)
+		if rr.Code != tc.code || (tc.code == http.StatusOK && p.OnImageChange != tc.want) {
+			t.Fatalf("PUT %v = %d %s", tc.body, rr.Code, rr.Body.String())
+		}
+	}
+}
+
 // warmPoolStubCluster stands in for a server's replicated entry store.
 type warmPoolStubCluster struct {
 	*cluster.Noop

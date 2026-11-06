@@ -53,6 +53,7 @@ func (p *Pool) refillTick(parent context.Context, cfg RefillConfig, spawner Spaw
 	// whose depth went down gives its extra slots back, so their park
 	// reservations are free before this tick parks anything.
 	p.sampleDemand()
+	p.destroySlots(parent, p.refreshImages(parent))
 	p.destroySlots(parent, p.trimExcess())
 	targets := p.ListTargets()
 	for _, key := range targets {

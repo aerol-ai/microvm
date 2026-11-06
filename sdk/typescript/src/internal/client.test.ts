@@ -1977,15 +1977,16 @@ test("warm pool CRUD maps the wire shape and keeps an image's slashes", async ()
     },
   });
   const put = await client.putWarmPool("ghcr.io/acme/agent:1", { depth: 2 });
-  assert.deepEqual(put, { image: "ghcr.io/acme/agent:1", depth: 2, generation: 1, createdAt: "c", updatedAt: "u" });
+  assert.deepEqual(put, { image: "ghcr.io/acme/agent:1", depth: 2, onImageChange: "replace_now", generation: 1, createdAt: "c", updatedAt: "u" });
   assert.deepEqual(seen[0], { method: "PUT", url: "https://api.example.com/v1/warm-pools/ghcr.io/acme/agent%3A1", body: { depth: 2 } });
   const got = await client.getWarmPool("ghcr.io/acme/agent:1");
   assert.deepEqual(got.status, {
     ready: 3,
     target: 4,
+    outdated: 0,
     servers: [
-      { nodeId: "n1", ready: 2, target: 2 },
-      { nodeId: "n2", ready: 1, target: 2, stale: true },
+      { nodeId: "n1", ready: 2, target: 2, outdated: 0 },
+      { nodeId: "n2", ready: 1, target: 2, outdated: 0, stale: true },
     ],
   });
   assert.equal((await client.listWarmPools())[0].status?.servers.length, 2);
@@ -2008,6 +2009,26 @@ test("a warm pool that follows demand sends and maps its range", async () => {
   assert.deepEqual(body, { depth: 0, min_depth: 1, max_depth: 4 });
   assert.equal(pool.minDepth, 1);
   assert.equal(pool.maxDepth, 4);
+});
+
+test("a warm pool sends its image-change strategy and maps outdated slots", async () => {
+  let body: unknown;
+  const client = new APIClient({
+    baseURL: "https://api.example.com",
+    patToken: "pat-token",
+    fetch: async (input, init) => {
+      body = init?.body ? JSON.parse(String(init.body)) : undefined;
+      return jsonResponse({
+        image: "python:3.12", depth: 2, on_image_change: "replace_as_used", generation: 1, created_at: "c", updated_at: "u",
+        status: { ready: 2, target: 2, outdated: 1, servers: [{ node_id: "n1", ready: 2, target: 2, outdated: 1 }] },
+      });
+    },
+  });
+  const pool = await client.putWarmPool("python:3.12", { depth: 2, onImageChange: "replace_as_used" });
+  assert.deepEqual(body, { depth: 2, on_image_change: "replace_as_used" });
+  assert.equal(pool.onImageChange, "replace_as_used");
+  assert.equal(pool.status?.outdated, 1);
+  assert.equal(pool.status?.servers[0].outdated, 1);
 });
 
 test("sandboxes carry their egress profiles", async () => {

@@ -255,6 +255,9 @@ type WarmPoolStatus struct {
 	Image  string `json:"image"`
 	Ready  int    `json:"ready"`
 	Target int    `json:"target"`
+	// Outdated counts ready slots holding an older image than the tag
+	// names now (W3); omitted when none.
+	Outdated int `json:"outdated,omitempty"`
 }
 
 // MemProbe reports live free memory in MB. The default implementation reads

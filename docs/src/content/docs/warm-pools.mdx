@@ -107,6 +107,54 @@ Each server decides on its own, from the creates it served, so a busy server kee
 
 You can switch an entry between a fixed `depth` and a range at any time. Setting both `depth` and `maxDepth`, or `minDepth` without `maxDepth`, fails with HTTP 400.
 
+## When the image changes
+
+An image name like `python:3.12` or `myorg/agent:latest` can come to mean a newer image on a server, for example after the server pulls the newer image or builds one under that name. Waiting sandboxes still run the old image. `onImageChange` decides what happens to them:
+
+- `replace_now` (the default): within about 10 seconds, each server removes every waiting sandbox that runs the old image and starts new ones. A create never gets the old image, but creates in those few seconds may start cold.
+- `replace_as_used`: the old waiting sandboxes stay and are handed out first, oldest first, so creates keep starting warm. Each one that is used is replaced with the new image. Until they are all used, some creates get the old image.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    await client.putWarmPool('myorg/agent:latest', { depth: 4, onImageChange: 'replace_as_used' })
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    client.put_warm_pool('myorg/agent:latest', {'depth': 4, 'onImageChange': 'replace_as_used'})
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    _, err := client.PutWarmPool(ctx, "myorg/agent:latest", sdktypes.WarmPoolOptions{
+        Depth:         4,
+        OnImageChange: sdktypes.WarmPoolReplaceAsUsed,
+    })
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    client.put_warm_pool("myorg/agent:latest", WarmPoolOptions {
+        depth: 4,
+        on_image_change: "replace_as_used".to_string(),
+        ..Default::default()
+    })?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    client.putWarmPool("myorg/agent:latest", new WarmPoolOptions()
+        .setDepth(4)
+        .setOnImageChange(WarmPoolOptions.REPLACE_AS_USED));
+    ```
+  </TabItem>
+</Tabs>
+
+While old sandboxes are waiting, `status.outdated` counts them, in total and for each server, so you can watch the change roll through.
+
+A server only notices a new image once the image is on that server. Pushing a new image to your registry does nothing until a server pulls it.
+
 ## Check how full the pools are
 
 `getWarmPool` and `listWarmPools` return each entry with its `status`: how many sandboxes are `ready` and the `target`, in total and for each server. For an entry that follows demand, `target` is each server's current number. Right after you add an entry, `ready` is 0. It climbs to the target as each server starts its sandboxes, which takes a few seconds per sandbox.
@@ -226,7 +274,7 @@ A cluster refuses an image that only one server has, such as an image you built 
 
 | Status | Meaning |
 |---|---|
-| 400 | The image name, the depth or the depth range is not valid. |
+| 400 | The image name, the depth, the depth range or `onImageChange` is not valid. |
 | 403 | Your credential is not an admin for every team. |
 | 404 | `getWarmPool`: there is no entry for that image. |
 | 409 | `putWarmPool`: there are already 32 entries. |

@@ -1144,13 +1144,13 @@ class ClientTests(unittest.TestCase):
 
         client._do_json = fake  # type: ignore[assignment]
         pool = client.put_warm_pool("ghcr.io/acme/agent:1", {"depth": 2})
-        self.assertEqual(pool, {"image": "ghcr.io/acme/agent:1", "depth": 2, "generation": 1, "createdAt": "c", "updatedAt": "u"})
+        self.assertEqual(pool, {"image": "ghcr.io/acme/agent:1", "depth": 2, "onImageChange": "replace_now", "generation": 1, "createdAt": "c", "updatedAt": "u"})
         # The image's slashes stay slashes; each segment is escaped.
         self.assertEqual(calls[0], ("PUT", "/v1/warm-pools/ghcr.io/acme/agent%3A1", {"depth": 2}, True))
         got = client.get_warm_pool("ghcr.io/acme/agent:1")
         self.assertEqual(
             got["status"],
-            {"ready": 3, "target": 4, "servers": [{"nodeId": "n1", "ready": 2, "target": 2}, {"nodeId": "n2", "ready": 1, "target": 2, "stale": True}]},
+            {"ready": 3, "target": 4, "outdated": 0, "servers": [{"nodeId": "n1", "ready": 2, "target": 2, "outdated": 0}, {"nodeId": "n2", "ready": 1, "target": 2, "outdated": 0, "stale": True}]},
         )
         self.assertEqual(len(client.list_warm_pools()), 1)
         self.assertEqual(client.list_warm_pools(), [])
@@ -1171,6 +1171,21 @@ class ClientTests(unittest.TestCase):
         pool = client.put_warm_pool("python:3.12", {"minDepth": 1, "maxDepth": 4})
         self.assertEqual(sent[0], {"depth": 0, "min_depth": 1, "max_depth": 4})
         self.assertEqual((pool["minDepth"], pool["maxDepth"]), (1, 4))
+
+    def test_warm_pool_on_image_change(self):
+        client = MicroVM(api_url="https://sandbox.example.com", pat_token="pat-token")
+        sent = []
+
+        def fake(method, path, payload, *, idempotent=True, headers=None):
+            sent.append(payload)
+            return {"image": "python:3.12", "depth": 2, "on_image_change": "replace_as_used",
+                    "status": {"ready": 2, "target": 2, "outdated": 1, "servers": [{"node_id": "n1", "ready": 2, "target": 2, "outdated": 1}]}}
+
+        client._do_json = fake  # type: ignore[assignment]
+        pool = client.put_warm_pool("python:3.12", {"depth": 2, "onImageChange": "replace_as_used"})
+        self.assertEqual(sent[0], {"depth": 2, "on_image_change": "replace_as_used"})
+        self.assertEqual(pool["onImageChange"], "replace_as_used")
+        self.assertEqual((pool["status"]["outdated"], pool["status"]["servers"][0]["outdated"]), (1, 1))
 
     def test_learn_mode(self):
         client = RecordingMicroVM()

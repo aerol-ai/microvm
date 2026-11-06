@@ -26,6 +26,7 @@ export type {
   EgressRule,
   ListEgressProfilesOptions,
   WarmPool,
+  WarmPoolOnImageChange,
   WarmPoolOptions,
   WarmPoolServerStatus,
   WarmPoolStatus,

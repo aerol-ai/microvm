@@ -12,6 +12,7 @@ import (
 
 	cntr "github.com/containerd/containerd/v2/client"
 	"github.com/containerd/containerd/v2/pkg/oci"
+	refdocker "github.com/distribution/reference"
 	"github.com/opencontainers/runtime-spec/specs-go"
 
 	"github.com/aerol-ai/microvm/internal/pool/containerdpool"
@@ -318,6 +319,36 @@ func parkDefaultCreateRequest() models.CreateSandboxRequest {
 		CPU:      models.DefaultCPU,
 		MemoryMB: models.DefaultMemoryMB,
 	}
+}
+
+// PoolImageID is the digest a ref names in containerd's image store now,
+// for the warm pool's image-change check (plans/agent-sandbox-feature-
+// parity.md W3). It tries the same local names ensureImage tries before it
+// pulls (the exact ref, ":latest" for a tagless one, the registry-normalized
+// form) and never pulls: a missing image is an error, so the pool keeps
+// what it had. The answer is in the form parkContainer records.
+func (d *Driver) PoolImageID(ctx context.Context, ref string) (string, error) {
+	client, err := d.ensureClient()
+	if err != nil {
+		return "", err
+	}
+	ref = strings.TrimSpace(ref)
+	candidates := []string{ref}
+	if !refHasTag(ref) {
+		candidates = append(candidates, ref+":latest")
+	}
+	if named, nerr := refdocker.ParseDockerRef(ref); nerr == nil {
+		candidates = append(candidates, named.String())
+	}
+	var lastErr error
+	for _, c := range candidates {
+		image, err := client.GetImage(ctx, c)
+		if err == nil {
+			return imageDigestString(image)
+		}
+		lastErr = err
+	}
+	return "", fmt.Errorf("pool image %s: %w", ref, lastErr)
 }
 
 func imageDigestString(image cntr.Image) (string, error) {

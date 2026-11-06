@@ -945,6 +945,8 @@ export interface WarmPool {
   minDepth?: number;
   /** Set to follow demand: each server's target moves with its recent creates, up to this. */
   maxDepth?: number;
+  /** What happens to warm sandboxes when the image changes. */
+  onImageChange: WarmPoolOnImageChange;
   /** Goes up by one on every change; the same `putWarmPool` twice leaves it alone. */
   generation: number;
   createdAt: string;
@@ -964,12 +966,24 @@ export interface WarmPoolOptions {
   minDepth?: number;
   /** The most warm slots a server keeps when demand is high (1 to 128). */
   maxDepth?: number;
+  /** What happens to warm sandboxes when the image changes. Default `"replace_now"`. */
+  onImageChange?: WarmPoolOnImageChange;
 }
+
+/**
+ * What a warm pool does when the image its name points to changes on a
+ * server. `"replace_now"` swaps every waiting sandbox for one on the new
+ * image at once; `"replace_as_used"` keeps handing out the old ones and
+ * replaces each as it is used.
+ */
+export type WarmPoolOnImageChange = "replace_now" | "replace_as_used";
 
 /** Ready and target slots in total, and on each server that runs a warm pool. */
 export interface WarmPoolStatus {
   ready: number;
   target: number;
+  /** Ready sandboxes still on an older image (a `"replace_as_used"` change in progress). */
+  outdated: number;
   servers: WarmPoolServerStatus[];
 }
 
@@ -977,6 +991,7 @@ export interface WarmPoolServerStatus {
   nodeId: string;
   ready: number;
   target: number;
+  outdated: number;
   /** The server's last report is too old to trust; the numbers are its last ones. */
   stale?: boolean;
 }

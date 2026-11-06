@@ -17,6 +17,8 @@ public class WarmPool {
      */
     public int minDepth;
     public int maxDepth;
+    /** What happens to warm sandboxes when the image changes: {@code replace_now} or {@code replace_as_used}. */
+    public String onImageChange;
     /** Goes up by one on every change; the same put twice leaves it alone. */
     public long generation;
     public String createdAt;

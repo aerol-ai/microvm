@@ -1433,8 +1433,8 @@ class MicroVMClientTest {
     void warmPoolCrudKeepsImageSlashesAndMapsStatus() throws Exception {
         List<String> seen = new java.util.ArrayList<>();
         AtomicReference<Map<String, Object>> body = new AtomicReference<>();
-        Map<String, Object> status = mapOf("ready", 3, "target", 4, "servers", List.of(
-            mapOf("node_id", "n1", "ready", 2, "target", 2),
+        Map<String, Object> status = mapOf("ready", 3, "target", 4, "outdated", 1, "servers", List.of(
+            mapOf("node_id", "n1", "ready", 2, "target", 2, "outdated", 1),
             mapOf("node_id", "n2", "ready", 1, "target", 2, "stale", true)));
         HttpServer server = startServer(exchange -> {
             String rawPath = exchange.getRequestURI().getRawPath();
@@ -1473,6 +1473,8 @@ class MicroVMClientTest {
             assertEquals(3, got.status.ready);
             assertEquals(4, got.status.target);
             assertEquals("n2", got.status.servers.get(1).nodeId);
+            assertEquals(1, got.status.outdated);
+            assertEquals(1, got.status.servers.get(0).outdated);
             assertTrue(got.status.servers.get(1).stale);
             assertEquals(1, client.listWarmPools().size());
             assertTrue(client.listWarmPools().isEmpty());
@@ -1488,6 +1490,10 @@ class MicroVMClientTest {
             assertEquals(4, ((Number) body.get().get("max_depth")).intValue());
             assertEquals(1, demand.minDepth);
             assertEquals(4, demand.maxDepth);
+            assertEquals(WarmPoolOptions.REPLACE_NOW, demand.onImageChange);
+            assertTrue(!body.get().containsKey("on_image_change"));
+            client.putWarmPool("demand:1", new WarmPoolOptions().setDepth(1).setOnImageChange(WarmPoolOptions.REPLACE_AS_USED));
+            assertEquals("replace_as_used", body.get().get("on_image_change"));
         } finally {
             server.stop(0);
         }

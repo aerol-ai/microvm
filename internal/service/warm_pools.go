@@ -124,7 +124,10 @@ func (s *Service) PutWarmPool(ctx context.Context, image string, req models.Warm
 	if s.ClusterEnabled() && docker.IsLocalOnlyImageRef(image) {
 		return nil, fmt.Errorf("%w: %s exists on one node only; a cluster warm pool needs an image every node can pull", models.ErrWarmPoolInvalid, image)
 	}
-	p, changed, err := s.warmPoolBackend().PutWarmPool(ctx, models.WarmPool{Image: image, Depth: req.Depth, MinDepth: req.MinDepth, MaxDepth: req.MaxDepth}, time.Now())
+	p, changed, err := s.warmPoolBackend().PutWarmPool(ctx, models.WarmPool{
+		Image: image, Depth: req.Depth, MinDepth: req.MinDepth, MaxDepth: req.MaxDepth,
+		OnImageChange: models.NormalizeWarmPoolOnImageChange(req.OnImageChange),
+	}, time.Now())
 	if err != nil {
 		return nil, err
 	}
@@ -187,6 +190,7 @@ func (s *Service) localWarmPoolStatus() []capacity.WarmPoolStatus {
 			cur.Image = st.Key.Image
 			cur.Ready += st.Ready
 			cur.Target += st.Target
+			cur.Outdated += st.Outdated
 			byImage[st.Key.Image] = cur
 		}
 	}
@@ -206,7 +210,7 @@ type warmPoolStatusSet map[string][]models.WarmPoolServerStatus
 
 func (set warmPoolStatusSet) add(nodeID string, stale bool, statuses []capacity.WarmPoolStatus) {
 	for _, st := range statuses {
-		set[st.Image] = append(set[st.Image], models.WarmPoolServerStatus{NodeID: nodeID, Ready: st.Ready, Target: st.Target, Stale: stale})
+		set[st.Image] = append(set[st.Image], models.WarmPoolServerStatus{NodeID: nodeID, Ready: st.Ready, Target: st.Target, Outdated: st.Outdated, Stale: stale})
 	}
 }
 
@@ -217,6 +221,7 @@ func (set warmPoolStatusSet) forImage(image string) *models.WarmPoolStatus {
 	for _, srv := range set[image] {
 		out.Ready += srv.Ready
 		out.Target += srv.Target
+		out.Outdated += srv.Outdated
 		out.Servers = append(out.Servers, srv)
 	}
 	sort.Slice(out.Servers, func(i, j int) bool { return out.Servers[i].NodeID < out.Servers[j].NodeID })
@@ -322,6 +327,7 @@ func (s *Service) syncWarmPools(ctx context.Context) error {
 			configured = append(configured, dockerpool.Configured{
 				Key:   dockerpool.Key{Image: e.Image, Runtime: reg.runtime},
 				Depth: e.Depth, MinDepth: e.MinDepth, MaxDepth: e.MaxDepth,
+				ReplaceAsUsed: e.OnImageChange == models.WarmPoolReplaceAsUsed,
 			})
 		}
 		reg.pool.SetConfigured(configured)
@@ -372,7 +378,7 @@ type clusterWarmPools struct{ c warmPoolCluster }
 
 func (b clusterWarmPools) PutWarmPool(ctx context.Context, in models.WarmPool, _ time.Time) (models.WarmPool, bool, error) {
 	resp, err := b.c.WriteWarmPool(ctx, cluster.WarmPoolWriteRequest{Pool: cluster.WarmPoolRecord{
-		Image: in.Image, Depth: in.Depth, MinDepth: in.MinDepth, MaxDepth: in.MaxDepth,
+		Image: in.Image, Depth: in.Depth, MinDepth: in.MinDepth, MaxDepth: in.MaxDepth, OnImageChange: in.OnImageChange,
 	}})
 	if err != nil {
 		return models.WarmPool{}, false, clusterWarmPoolError(err)
@@ -424,13 +430,14 @@ func clusterWarmPoolError(err error) error {
 
 func warmPoolFromRecord(r cluster.WarmPoolRecord) models.WarmPool {
 	return models.WarmPool{
-		Image:      r.Image,
-		Depth:      r.Depth,
-		MinDepth:   r.MinDepth,
-		MaxDepth:   r.MaxDepth,
-		Generation: r.Generation,
-		CreatedAt:  time.Unix(0, r.CreatedUnixNano).UTC(),
-		UpdatedAt:  time.Unix(0, r.UpdatedUnixNano).UTC(),
+		Image:         r.Image,
+		Depth:         r.Depth,
+		MinDepth:      r.MinDepth,
+		MaxDepth:      r.MaxDepth,
+		OnImageChange: models.NormalizeWarmPoolOnImageChange(r.OnImageChange),
+		Generation:    r.Generation,
+		CreatedAt:     time.Unix(0, r.CreatedUnixNano).UTC(),
+		UpdatedAt:     time.Unix(0, r.UpdatedUnixNano).UTC(),
 	}
 }
 

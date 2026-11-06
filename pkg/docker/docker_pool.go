@@ -410,6 +410,19 @@ func (c *Client) resolveImageIDForWarm(ctx context.Context, imageRef string) (st
 	return id, ok, nil
 }
 
+// PoolImageID is the image ID a tag names on this host now, for the warm
+// pool's image-change check (plans/agent-sandbox-feature-parity.md W3). It
+// never pulls and records no create timing: a cache hit (the image-ID
+// warmer refreshes every pool target each refill interval), else one
+// inspect through the same generation fence the warmer uses.
+func (c *Client) PoolImageID(ctx context.Context, image string) (string, error) {
+	if id, ok := c.imageIDs.Get(image); ok {
+		return id, nil
+	}
+	id, _, err := c.resolveImageIDForWarm(ctx, image)
+	return id, err
+}
+
 func (c *Client) adoptParked(ctx context.Context, req models.CreateSandboxRequest, sandboxID, toolboxToken string, slot *dockerpool.ParkedSlot) (*SandboxRuntime, error) {
 	if slot == nil || slot.Handle == nil {
 		return nil, errors.New("parked slot is incomplete")

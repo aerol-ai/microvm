@@ -913,6 +913,9 @@ public class MicroVMClient {
         if (pool != null && pool.status != null && pool.status.servers == null) {
             pool.status.servers = new ArrayList<>();
         }
+        if (pool != null && (pool.onImageChange == null || pool.onImageChange.isEmpty())) {
+            pool.onImageChange = WarmPoolOptions.REPLACE_NOW;
+        }
         return pool;
     }
 

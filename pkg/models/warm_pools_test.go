@@ -55,6 +55,9 @@ func TestWarmPoolRequestValidate(t *testing.T) {
 		{"depth and a range", WarmPoolRequest{Depth: 2, MaxDepth: 4}, false},
 		{"negative min", WarmPoolRequest{MinDepth: -1, MaxDepth: 4}, false},
 		{"max past the limit", WarmPoolRequest{MaxDepth: MaxWarmPoolDepth + 1}, false},
+		{"replace now", WarmPoolRequest{Depth: 1, OnImageChange: WarmPoolReplaceNow}, true},
+		{"replace as used", WarmPoolRequest{Depth: 1, OnImageChange: WarmPoolReplaceAsUsed}, true},
+		{"an unknown strategy", WarmPoolRequest{Depth: 1, OnImageChange: "recreate"}, false},
 	} {
 		err := tc.req.Validate()
 		if (err == nil) != tc.ok || (err != nil && !errors.Is(err, ErrWarmPoolInvalid)) {
@@ -63,5 +66,8 @@ func TestWarmPoolRequestValidate(t *testing.T) {
 	}
 	if (WarmPool{Depth: 3}).FollowsDemand() || !(WarmPool{MaxDepth: 1}).FollowsDemand() {
 		t.Fatal("FollowsDemand is MaxDepth > 0")
+	}
+	if NormalizeWarmPoolOnImageChange("") != WarmPoolReplaceNow || NormalizeWarmPoolOnImageChange(WarmPoolReplaceAsUsed) != WarmPoolReplaceAsUsed {
+		t.Fatal("the default is replace_now and a set value is kept")
 	}
 }

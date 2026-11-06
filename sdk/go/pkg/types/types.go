@@ -256,6 +256,12 @@ type WarmPoolStatus = models.WarmPoolStatus
 // WarmPoolServerStatus is one server's pool for an image.
 type WarmPoolServerStatus = models.WarmPoolServerStatus
 
+// What a warm pool does when its image changes (WarmPoolOptions.OnImageChange).
+const (
+	WarmPoolReplaceNow    = models.WarmPoolReplaceNow
+	WarmPoolReplaceAsUsed = models.WarmPoolReplaceAsUsed
+)
+
 // ListEgressProfilesOptions pages ListEgressProfiles.
 type ListEgressProfilesOptions struct {
 	Cursor string

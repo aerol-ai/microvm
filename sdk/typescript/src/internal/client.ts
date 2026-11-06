@@ -318,13 +318,15 @@ interface ApiWarmPool {
   depth: number;
   min_depth?: number;
   max_depth?: number;
+  on_image_change?: string;
   generation: number;
   created_at: string;
   updated_at: string;
   status?: {
     ready: number;
     target: number;
-    servers: { node_id: string; ready: number; target: number; stale?: boolean }[] | null;
+    outdated?: number;
+    servers: { node_id: string; ready: number; target: number; outdated?: number; stale?: boolean }[] | null;
   };
 }
 
@@ -332,6 +334,7 @@ function fromApiWarmPool(p: ApiWarmPool): WarmPool {
   const out: WarmPool = {
     image: p.image,
     depth: p.depth,
+    onImageChange: (p.on_image_change || "replace_now") as WarmPool["onImageChange"],
     generation: p.generation,
     createdAt: p.created_at,
     updatedAt: p.updated_at,
@@ -339,9 +342,9 @@ function fromApiWarmPool(p: ApiWarmPool): WarmPool {
   if (p.min_depth) out.minDepth = p.min_depth;
   if (p.max_depth) out.maxDepth = p.max_depth;
   if (p.status) {
-    const status: WarmPoolStatus = { ready: p.status.ready, target: p.status.target, servers: [] };
+    const status: WarmPoolStatus = { ready: p.status.ready, target: p.status.target, outdated: p.status.outdated ?? 0, servers: [] };
     for (const s of p.status.servers ?? []) {
-      const server: WarmPoolStatus["servers"][number] = { nodeId: s.node_id, ready: s.ready, target: s.target };
+      const server: WarmPoolStatus["servers"][number] = { nodeId: s.node_id, ready: s.ready, target: s.target, outdated: s.outdated ?? 0 };
       if (s.stale) server.stale = true;
       status.servers.push(server);
     }
@@ -1821,6 +1824,7 @@ export class APIClient {
         depth: options.depth ?? 0,
         min_depth: options.minDepth,
         max_depth: options.maxDepth,
+        on_image_change: options.onImageChange,
       }),
     );
   }

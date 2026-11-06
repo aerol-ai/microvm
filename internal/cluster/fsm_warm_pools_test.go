@@ -134,6 +134,27 @@ func TestFSMWarmPoolDemandRange(t *testing.T) {
 	}
 }
 
+// TestFSMWarmPoolOnImageChange (W3): "" and replace_now are the same
+// setting on every replica, and a switch of strategy is a change.
+func TestFSMWarmPoolOnImageChange(t *testing.T) {
+	l := newWarmPoolLog(t)
+	put := func(v string) warmPoolApplyResult {
+		t.Helper()
+		res, ok := l.apply(command{Op: opPutWarmPool, StampUnixNano: int64(l.idx + 1), WarmPool: &WarmPoolRecord{Image: "python:3.12", Depth: 1, OnImageChange: v}}).(warmPoolApplyResult)
+		if !ok {
+			t.Fatal("put refused")
+		}
+		return res
+	}
+	put("")
+	if res := put(models.WarmPoolReplaceNow); res.Changed {
+		t.Fatal("replace_now spelled out is the default, not a change")
+	}
+	if res := put(models.WarmPoolReplaceAsUsed); !res.Changed || res.Pool.Generation != 2 || res.Pool.OnImageChange != models.WarmPoolReplaceAsUsed {
+		t.Fatalf("switch = %+v", res)
+	}
+}
+
 // TestFSMWarmPoolLimitIsDecidedAtApply: the limit holds however creates
 // race, because apply is serial and every replica counts the same set; an
 // update of an existing entry is never refused by it.

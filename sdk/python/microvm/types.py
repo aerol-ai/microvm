@@ -749,6 +749,8 @@ class WarmPoolServerStatus(TypedDict, total=False):
     nodeId: str
     ready: int
     target: int
+    # Ready sandboxes still on an older image.
+    outdated: int
     # The server's last report is too old to trust; the numbers are its last ones.
     stale: bool
 
@@ -758,6 +760,8 @@ class WarmPoolStatus(TypedDict):
 
     ready: int
     target: int
+    # Ready sandboxes still on an older image (a replace_as_used change in progress).
+    outdated: int
     servers: List[WarmPoolServerStatus]
 
 
@@ -775,6 +779,9 @@ class WarmPool(TypedDict, total=False):
     # never below minDepth and never above maxDepth.
     minDepth: int
     maxDepth: int
+    # What happens to warm sandboxes when the image changes:
+    # "replace_now" or "replace_as_used".
+    onImageChange: str
     # Goes up by one on every change; the same put twice leaves it alone.
     generation: int
     createdAt: str
@@ -793,6 +800,9 @@ class WarmPoolOptions(TypedDict, total=False):
     minDepth: int
     # The most warm slots a server keeps when demand is high (1 to 128).
     maxDepth: int
+    # When the image changes: "replace_now" (the default) swaps every waiting
+    # sandbox at once; "replace_as_used" hands the old ones out first.
+    onImageChange: str
 
 
 class NetworkPolicyOptions(TypedDict, total=False):

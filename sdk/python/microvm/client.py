@@ -1416,6 +1416,9 @@ class MicroVM:
             value = _first_of(options, key, wire)
             if value:
                 body[wire] = int(value)
+        on_change = _first_of(options, "onImageChange", "on_image_change")
+        if on_change:
+            body["on_image_change"] = str(on_change)
         return _from_api_warm_pool(self._do_json("PUT", self._warm_pool_path(image), body) or {})
 
     def get_warm_pool(self, image: str) -> WarmPool:
@@ -3087,6 +3090,7 @@ def _from_api_warm_pool(payload: Dict[str, Any]) -> WarmPool:
     result: WarmPool = {
         "image": str(payload.get("image") or ""),
         "depth": int(payload.get("depth") or 0),
+        "onImageChange": str(payload.get("on_image_change") or "replace_now"),
         "generation": int(payload.get("generation") or 0),
         "createdAt": str(payload.get("created_at") or ""),
         "updatedAt": str(payload.get("updated_at") or ""),
@@ -3103,6 +3107,7 @@ def _from_api_warm_pool(payload: Dict[str, Any]) -> WarmPool:
                 "nodeId": str(srv.get("node_id") or ""),
                 "ready": int(srv.get("ready") or 0),
                 "target": int(srv.get("target") or 0),
+                "outdated": int(srv.get("outdated") or 0),
             }
             if srv.get("stale"):
                 server["stale"] = True
@@ -3110,6 +3115,7 @@ def _from_api_warm_pool(payload: Dict[str, Any]) -> WarmPool:
         status_out: WarmPoolStatus = {
             "ready": int(status.get("ready") or 0),
             "target": int(status.get("target") or 0),
+            "outdated": int(status.get("outdated") or 0),
             "servers": servers,
         }
         result["status"] = status_out

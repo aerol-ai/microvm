@@ -5325,6 +5325,26 @@ mod tests {
         let request = request_rx.recv().expect("request should be captured");
         assert_eq!(request_json_body(&request), serde_json::json!({"depth": 0, "min_depth": 1, "max_depth": 4}));
         assert_eq!((pool.min_depth, pool.max_depth), (1, 4));
+
+        let (url, request_rx) = spawn_json_server(
+            serde_json::json!({
+                "image": "python:3.12", "depth": 2, "on_image_change": "replace_as_used",
+                "status": {"ready": 2, "target": 2, "outdated": 1, "servers": [{"node_id": "n1", "ready": 2, "target": 2, "outdated": 1}]}
+            })
+            .to_string(),
+        );
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        let pool = client
+            .put_warm_pool(
+                "python:3.12",
+                WarmPoolOptions { depth: 2, on_image_change: "replace_as_used".to_string(), ..Default::default() },
+            )
+            .expect("put should succeed");
+        let request = request_rx.recv().expect("request should be captured");
+        assert_eq!(request_json_body(&request), serde_json::json!({"depth": 2, "on_image_change": "replace_as_used"}));
+        assert_eq!(pool.on_image_change, "replace_as_used");
+        let status = pool.status.expect("status");
+        assert_eq!((status.outdated, status.servers[0].outdated), (1, 1));
     }
 
     #[test]

@@ -19,15 +19,20 @@ type Configured struct {
 	Depth    int
 	MinDepth int
 	MaxDepth int
+	// ReplaceAsUsed keeps slots holding an older image and hands them out
+	// until they are used up (W3); false replaces them at once.
+	ReplaceAsUsed bool
 }
 
 func (c Configured) followsDemand() bool { return c.MaxDepth > 0 }
 
-// TargetStatus is one configured entry's state in this pool.
+// TargetStatus is one configured entry's state in this pool. Outdated is
+// the ready slots holding an older image than the tag names now.
 type TargetStatus struct {
-	Key    Key
-	Ready  int
-	Target int
+	Key      Key
+	Ready    int
+	Target   int
+	Outdated int
 }
 
 // SetConfigured replaces the configured entries. A new entry is pinned (it
@@ -53,7 +58,18 @@ func (p *Pool) SetConfigured(entries []Configured) {
 		if _, kept := next[ks]; kept {
 			continue
 		}
+		// The image check follows entries only, so nothing reads this key's
+		// image again. A key that stays (an env pin, below) must not keep
+		// the last ID: containerd's Acquire falls back to it and, after a
+		// retag, would throw away every newly parked slot as stale.
+		delete(p.currentImage, ks)
 		if _, env := p.envPins[ks]; env {
+			// Back to the env pin at the default depth. trimExcess only
+			// walks entries, so give back what the entry held above it here.
+			if q := p.ready[ks]; len(q) > p.defaultDepth {
+				drained = append(drained, q[p.defaultDepth:]...)
+				p.ready[ks] = q[:p.defaultDepth:p.defaultDepth]
+			}
 			continue
 		}
 		drained = append(drained, p.ready[ks]...)
@@ -96,7 +112,9 @@ func (p *Pool) depthLocked(ks string) int {
 
 // trimExcess takes the ready slots a configured key holds beyond its depth
 // (after its depth was lowered), newest first, so the slots that are left
-// are the ones parked longest ago. Only entries are trimmed: a default-depth
+// are the ones parked longest ago. A replace_as_used entry gives back its
+// outdated slots before its current ones, so a shrink also moves the
+// rollout along. Only entries are trimmed: a default-depth
 // target keeps today's behaviour.
 func (p *Pool) trimExcess() []*ParkedSlot {
 	var out []*ParkedSlot
@@ -106,6 +124,9 @@ func (p *Pool) trimExcess() []*ParkedSlot {
 		depth := p.depthLocked(ks)
 		if len(q) <= depth {
 			continue
+		}
+		if p.configured[ks].ReplaceAsUsed {
+			q = p.currentFirstLocked(ks, q)
 		}
 		out = append(out, q[depth:]...)
 		p.ready[ks] = q[:depth:depth]
@@ -147,7 +168,7 @@ func (p *Pool) ConfiguredStatus() []TargetStatus {
 	p.mu.Lock()
 	out := make([]TargetStatus, 0, len(p.configured))
 	for ks, c := range p.configured {
-		out = append(out, TargetStatus{Key: c.Key, Ready: len(p.ready[ks]), Target: p.depthLocked(ks)})
+		out = append(out, TargetStatus{Key: c.Key, Ready: len(p.ready[ks]), Target: p.depthLocked(ks), Outdated: p.outdatedLocked(ks)})
 	}
 	p.mu.Unlock()
 	sort.Slice(out, func(i, j int) bool { return out[i].Key.KeyString() < out[j].Key.KeyString() })

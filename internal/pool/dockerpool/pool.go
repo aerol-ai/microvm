@@ -28,18 +28,23 @@ type Pool struct {
 	configured map[string]Configured
 	// demand is each demand-following entry's moving average and target
 	// (demand.go). now is the clock it samples on; nil is time.Now.
-	demand        map[string]*demandState
-	now           func() time.Time
-	targets       map[string]Key // keyString -> Key
-	lastUsed      map[string]time.Time
-	ready         map[string][]*ParkedSlot
-	spawning      map[string]int
-	spawnFails    map[string]int // keyString -> consecutive park failures
-	spawner       Spawner
-	onReleasePark func(slotID string)
-	onParkReady   func(slotID string, ready bool)
-	metrics       *Metrics
-	refillKick    chan struct{}
+	demand map[string]*demandState
+	now    func() time.Time
+	// resolver, currentImage and lastImageCheck are the image-change check
+	// (replace.go): what each entry's tag names now, and when it was read.
+	resolver       ImageResolver
+	currentImage   map[string]string
+	lastImageCheck time.Time
+	targets        map[string]Key // keyString -> Key
+	lastUsed       map[string]time.Time
+	ready          map[string][]*ParkedSlot
+	spawning       map[string]int
+	spawnFails     map[string]int // keyString -> consecutive park failures
+	spawner        Spawner
+	onReleasePark  func(slotID string)
+	onParkReady    func(slotID string, ready bool)
+	metrics        *Metrics
+	refillKick     chan struct{}
 }
 
 // New constructs a warm pool.
@@ -48,18 +53,19 @@ func New(logger *slog.Logger) *Pool {
 		logger = slog.Default()
 	}
 	return &Pool{
-		logger:     logger,
-		pinned:     make(map[string]struct{}),
-		envPins:    make(map[string]struct{}),
-		configured: make(map[string]Configured),
-		demand:     make(map[string]*demandState),
-		targets:    make(map[string]Key),
-		lastUsed:   make(map[string]time.Time),
-		ready:      make(map[string][]*ParkedSlot),
-		spawning:   make(map[string]int),
-		spawnFails: make(map[string]int),
-		metrics:    &Metrics{},
-		refillKick: make(chan struct{}, 1),
+		logger:       logger,
+		pinned:       make(map[string]struct{}),
+		envPins:      make(map[string]struct{}),
+		configured:   make(map[string]Configured),
+		demand:       make(map[string]*demandState),
+		currentImage: make(map[string]string),
+		targets:      make(map[string]Key),
+		lastUsed:     make(map[string]time.Time),
+		ready:        make(map[string][]*ParkedSlot),
+		spawning:     make(map[string]int),
+		spawnFails:   make(map[string]int),
+		metrics:      &Metrics{},
+		refillKick:   make(chan struct{}, 1),
 	}
 }
 
@@ -283,6 +289,14 @@ func (p *Pool) Acquire(ctx context.Context, key Key, currentImageID string) (*Pa
 	p.mu.Lock()
 	p.lastUsed[ks] = time.Now().UTC()
 	p.countDemandLocked(ks)
+	// A caller that cannot afford an image lookup on the create path (the
+	// containerd driver passes "") still gets an entry's stale slots left
+	// out, from what the refill tick last resolved. A replace_as_used entry
+	// hands its old slots out on purpose, oldest first.
+	if currentImageID == "" {
+		currentImageID = p.currentImage[ks]
+	}
+	keepStale := p.configured[ks].ReplaceAsUsed
 	q := p.ready[ks]
 	keep := q[:0]
 	for _, slot := range q {
@@ -291,7 +305,7 @@ func (p *Pool) Acquire(ctx context.Context, key Key, currentImageID string) (*Pa
 			if slot != nil {
 				discardDead = append(discardDead, slot)
 			}
-		case currentImageID != "" && slot.ImageID != "" && slot.ImageID != currentImageID:
+		case !keepStale && currentImageID != "" && slot.ImageID != "" && slot.ImageID != currentImageID:
 			discardStale = append(discardStale, slot)
 		case picked == nil:
 			picked = slot

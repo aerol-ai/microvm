@@ -177,3 +177,36 @@ func TestWarmPoolUpgradeAddsDemandColumns(t *testing.T) {
 		t.Fatalf("old row = %+v %v", got, err)
 	}
 }
+
+// TestWarmPoolOnImageChange (W3): the strategy round-trips, an empty one is
+// stored and read as replace_now, so sending the default explicitly is the
+// same setting, and switching strategy is a change.
+func TestWarmPoolOnImageChange(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now()
+	p, changed, err := st.PutWarmPool(ctx, models.WarmPool{Image: "python:3.12", Depth: 2}, now)
+	if err != nil || !changed || p.OnImageChange != models.WarmPoolReplaceNow {
+		t.Fatalf("create = %+v %v %v", p, changed, err)
+	}
+	if _, changed, _ := st.PutWarmPool(ctx, models.WarmPool{Image: "python:3.12", Depth: 2, OnImageChange: models.WarmPoolReplaceNow}, now); changed {
+		t.Fatal("the default spelled out is the same setting")
+	}
+	p, changed, _ = st.PutWarmPool(ctx, models.WarmPool{Image: "python:3.12", Depth: 2, OnImageChange: models.WarmPoolReplaceAsUsed}, now)
+	if !changed || p.Generation != 2 {
+		t.Fatalf("switching strategy = %+v %v", p, changed)
+	}
+	if got, _ := st.GetWarmPool(ctx, "python:3.12"); got.OnImageChange != models.WarmPoolReplaceAsUsed {
+		t.Fatalf("get = %+v", got)
+	}
+	// A row written before the column reads as replace_now.
+	if _, err := st.db.ExecContext(ctx, `UPDATE warm_pools SET on_image_change = '' WHERE image = ?`, "python:3.12"); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := st.GetWarmPool(ctx, "python:3.12"); got.OnImageChange != models.WarmPoolReplaceNow {
+		t.Fatalf("old row = %+v", got)
+	}
+	if list, _ := st.ListWarmPools(ctx); len(list) != 1 || list[0].OnImageChange != models.WarmPoolReplaceNow {
+		t.Fatalf("list = %+v", list)
+	}
+}

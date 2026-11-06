@@ -33,16 +33,20 @@ type WarmPoolRecord struct {
 	// MinDepth/MaxDepth: the depth follows demand between them (W2). They
 	// ship in the same release as the ops, so the fv 6 gate covers them: no
 	// server can drop them as unknown fields.
-	MinDepth        int   `json:"min_depth,omitempty"`
-	MaxDepth        int   `json:"max_depth,omitempty"`
-	Generation      int64 `json:"generation"`
-	CreatedUnixNano int64 `json:"created_unix_nano"`
-	UpdatedUnixNano int64 `json:"updated_unix_nano"`
+	MinDepth int `json:"min_depth,omitempty"`
+	MaxDepth int `json:"max_depth,omitempty"`
+	// OnImageChange is replace_now or replace_as_used (W3); same release,
+	// same gate. "" reads as replace_now.
+	OnImageChange   string `json:"on_image_change,omitempty"`
+	Generation      int64  `json:"generation"`
+	CreatedUnixNano int64  `json:"created_unix_nano"`
+	UpdatedUnixNano int64  `json:"updated_unix_nano"`
 }
 
 // sameSettings compares what a PUT sets, not the bookkeeping.
 func (r WarmPoolRecord) sameSettings(o WarmPoolRecord) bool {
-	return r.Depth == o.Depth && r.MinDepth == o.MinDepth && r.MaxDepth == o.MaxDepth
+	return r.Depth == o.Depth && r.MinDepth == o.MinDepth && r.MaxDepth == o.MaxDepth &&
+		models.NormalizeWarmPoolOnImageChange(r.OnImageChange) == models.NormalizeWarmPoolOnImageChange(o.OnImageChange)
 }
 
 // warmPoolApplyResult is the leader FSM's answer to opPutWarmPool.

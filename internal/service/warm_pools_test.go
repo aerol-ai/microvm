@@ -503,3 +503,53 @@ func TestWarmPoolDemandRangeReachesPoolAndCluster(t *testing.T) {
 		t.Fatalf("cluster get = %+v %v", got, err)
 	}
 }
+
+// TestWarmPoolOnImageChangeAndOutdated (W3): the strategy is validated,
+// answered spelled out, handed to the pool, and each pool's outdated count
+// is summed into the server's and the entry's status.
+func TestWarmPoolOnImageChangeAndOutdated(t *testing.T) {
+	svc := newWarmPoolService(t)
+	ctx := context.Background()
+	if _, err := svc.PutWarmPool(ctx, "python:3.12", models.WarmPoolRequest{Depth: 1, OnImageChange: "recreate"}); !errors.Is(err, models.ErrWarmPoolInvalid) {
+		t.Fatalf("unknown strategy = %v", err)
+	}
+	p, err := svc.PutWarmPool(ctx, "python:3.12", models.WarmPoolRequest{Depth: 2})
+	if err != nil || p.OnImageChange != models.WarmPoolReplaceNow {
+		t.Fatalf("default = %+v %v", p, err)
+	}
+	if _, err := svc.PutWarmPool(ctx, "node:22", models.WarmPoolRequest{Depth: 1, OnImageChange: models.WarmPoolReplaceAsUsed}); err != nil {
+		t.Fatal(err)
+	}
+	pool := newFakeWarmPool()
+	pool.status = []dockerpool.TargetStatus{{Key: dockerpool.Key{Image: "node:22"}, Ready: 2, Target: 2, Outdated: 1}}
+	svc.RegisterWarmPool(pool, "docker")
+	if err := svc.syncWarmPools(ctx); err != nil {
+		t.Fatal(err)
+	}
+	asUsed := map[string]bool{}
+	for _, c := range pool.last() {
+		asUsed[c.Key.Image] = c.ReplaceAsUsed
+	}
+	if !asUsed["node:22"] || asUsed["python:3.12"] {
+		t.Fatalf("applied strategies = %v", asUsed)
+	}
+	got, err := svc.GetWarmPool(ctx, "node:22")
+	if err != nil || got.Status.Outdated != 1 || got.Status.Servers[0].Outdated != 1 || got.OnImageChange != models.WarmPoolReplaceAsUsed {
+		t.Fatalf("status = %+v %v", got.Status, err)
+	}
+	if snap := svc.Capacity(); len(snap.WarmPools) != 1 || snap.WarmPools[0].Outdated != 1 {
+		t.Fatalf("capacity = %+v", snap.WarmPools)
+	}
+
+	csvc, c := newClusterWarmPoolService(t)
+	if _, err := csvc.PutWarmPool(ctx, "python:3.12", models.WarmPoolRequest{Depth: 1, OnImageChange: models.WarmPoolReplaceAsUsed}); err != nil {
+		t.Fatal(err)
+	}
+	if rec := c.pools["python:3.12"]; rec.OnImageChange != models.WarmPoolReplaceAsUsed {
+		t.Fatalf("replicated = %+v", rec)
+	}
+	c.pools["old:1"] = cluster.WarmPoolRecord{Image: "old:1", Depth: 1}
+	if got, err := csvc.GetWarmPool(ctx, "old:1"); err != nil || got.OnImageChange != models.WarmPoolReplaceNow {
+		t.Fatalf("a record with no strategy reads as replace_now: %+v %v", got, err)
+	}
+}
