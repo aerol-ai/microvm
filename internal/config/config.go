@@ -1149,7 +1149,13 @@ type Config struct {
 	// the dashboard (e.g. "node1", "wrk2"). Display-only; raft/gossip identity
 	// stays on NodeID. SB_NODE_NAME; empty falls back to NodeID at display
 	// time so single-node and pre-existing deployments need no config change.
-	NodeName            string
+	NodeName string
+	// NodeLabels are this node's placement labels: SB_NODE_LABELS ("k=v,k=v")
+	// with SB_NODE_ZONE folded in under "zone". Validated at boot (Kubernetes
+	// label syntax, at most 16, 63 characters each) and reported on the
+	// capacity heartbeat for placement rules (plans/placement-rules.md).
+	// nil = no labels; such a node never satisfies a rule.
+	NodeLabels          map[string]string
 	RaftBindAddr        string
 	RaftAdvertiseAddr   string
 	RaftDataDir         string
@@ -3051,6 +3057,9 @@ func load(keyTool bool) (Config, error) {
 		return Config{}, err
 	}
 	if err := cfg.loadPATScopeConfig(); err != nil {
+		return Config{}, err
+	}
+	if err := cfg.loadNodeLabelsConfig(); err != nil {
 		return Config{}, err
 	}
 	if err := cfg.loadLivenessConfig(); err != nil {

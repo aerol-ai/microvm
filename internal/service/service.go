@@ -1989,6 +1989,14 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 			return nil, err
 		}
 	}
+	// Placement rule (plans/placement-rules.md): this node refuses a create
+	// its own labels do not satisfy. In single-node mode that is the whole
+	// check (P1.6); in a cluster the router already filtered, and this
+	// catches a router on an older build or labels changed by a restart. An
+	// in-memory map compare, so no boot-path cost.
+	if err := s.checkPlacementRule(&req); err != nil {
+		return nil, err
+	}
 
 	// Owner attribution: a validated user token stamps its account onto the
 	// new sandbox; operator/PAT and internal creates are owner-less (""). The

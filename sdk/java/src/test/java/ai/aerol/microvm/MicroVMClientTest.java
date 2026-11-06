@@ -74,6 +74,7 @@ import ai.aerol.microvm.model.ExecRequest;
 import ai.aerol.microvm.model.ExecResult;
 import ai.aerol.microvm.model.ExecStreamOptions;
 import ai.aerol.microvm.model.Failover;
+import ai.aerol.microvm.model.PlacementRule;
 import ai.aerol.microvm.model.GpuOptions;
 import ai.aerol.microvm.model.Lifecycle;
 import ai.aerol.microvm.model.MountSpec;
@@ -553,6 +554,48 @@ class MicroVMClientTest {
             MicroVMClient client = clientFor(server);
             client.create(new CreateOptions().setImage("ubuntu:22.04"));
             assertNull(requestBody.get().get("allow_public_traffic"));
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void createSendsPlacementRule() throws Exception {
+        AtomicReference<Map<String, Object>> requestBody = new AtomicReference<>();
+        HttpServer server = startServer(exchange -> {
+            requestBody.set(castMap(JsonSupport.read(exchange.getRequestBody().readAllBytes(), Map.class)));
+            writeJson(exchange, 200, mapOf(
+                "id", "sb-placed",
+                "image", "ubuntu:22.04",
+                "status", "started",
+                "public_url", "",
+                "cpu", 1,
+                "memory_mb", 1024,
+                "disk_gb", 10,
+                "os_user", "root",
+                "network_block_all", false,
+                "toolbox_enabled", true,
+                "exposed_ports", List.of(),
+                "created_at", "2026-11-06T10:00:00Z",
+                "updated_at", "2026-11-06T10:00:00Z",
+                "last_active_at", "2026-11-06T10:00:00Z"
+            ));
+        });
+
+        try {
+            MicroVMClient client = clientFor(server);
+            client.create(new CreateOptions()
+                .setImage("ubuntu:22.04")
+                .setPlacement(new PlacementRule().setZone("eu-west-1a").setLabels(Map.of("tier", "pci"))));
+            Map<String, Object> placement = castMap(requestBody.get().get("placement"));
+            assertEquals("eu-west-1a", placement.get("zone"));
+            assertEquals(Map.of("tier", "pci"), placement.get("labels"));
+
+            // A zone alone sends no labels key, and no rule sends no placement.
+            client.create(new CreateOptions().setImage("ubuntu:22.04").setPlacement(new PlacementRule().setZone("eu-west-1a")));
+            assertEquals(Map.of("zone", "eu-west-1a"), requestBody.get().get("placement"));
+            client.create(new CreateOptions().setImage("ubuntu:22.04"));
+            assertNull(requestBody.get().get("placement"));
         } finally {
             server.stop(0);
         }

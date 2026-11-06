@@ -79,6 +79,7 @@ export type {
   MakeDirOptions,
   MoveFileOptions,
   CopyFileOptions,
+  PlacementRule,
   GetOptions,
   HealthStatus,
   IngressTarget,

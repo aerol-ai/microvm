@@ -88,6 +88,11 @@ public class CreateOptions {
     public List<PlatformVolumeMount> platformVolumes;
     public Lifecycle lifecycle;
     public Failover failover;
+    /**
+     * Limit which nodes may run the sandbox, by zone and node labels. Kept on
+     * failover. No matching node gives a 409 {@code placement_unsatisfiable}.
+     */
+    public PlacementRule placement;
     public String runtime;
     /** Survival class across daemon restarts. Null uses the runtime default. */
     public String durability;
@@ -238,6 +243,11 @@ public class CreateOptions {
 
     public CreateOptions setFailover(Failover failover) {
         this.failover = failover;
+        return this;
+    }
+
+    public CreateOptions setPlacement(PlacementRule placement) {
+        this.placement = placement;
         return this;
     }
 

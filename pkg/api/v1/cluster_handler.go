@@ -696,6 +696,12 @@ func (h *handlers) clusterDestroyWrap(w http.ResponseWriter, r *http.Request) {
 type memberView struct {
 	cluster.Member
 	Drained bool `json:"drained,omitempty"`
+	// Zone and Labels lift the node's placement labels out of its capacity
+	// heartbeat so an operator can see what a placement rule can target
+	// (plans/placement-rules.md P1.7). Empty for a node with no labels, an
+	// older build, or no heartbeat yet.
+	Zone   string            `json:"zone,omitempty"`
+	Labels map[string]string `json:"labels,omitempty"`
 }
 
 // clusterMembers returns the gossiped member list (observability only).
@@ -708,7 +714,8 @@ func (h *handlers) clusterMembers(w http.ResponseWriter, r *http.Request) {
 	members := c.Members()
 	view := make([]memberView, 0, len(members))
 	for _, m := range members {
-		view = append(view, memberView{Member: m, Drained: c.IsNodeDrained(m.NodeID)})
+		view = append(view, memberView{Member: m, Drained: c.IsNodeDrained(m.NodeID),
+			Zone: m.Capacity.Labels[models.PlacementZoneLabel], Labels: m.Capacity.Labels})
 	}
 	resp := map[string]any{"members": view}
 	// `sandboxd key rotate --stage` reads this (plans/customer-key-custody.md
@@ -1775,13 +1782,17 @@ func (h *handlers) clusterInternalSelectPlacement(w http.ResponseWriter, r *http
 	// worker back to the caller so IT can pick two of them made each create's
 	// response scale with the fleet; only an agent on the previous build
 	// still needs that shape.
+	// Every answer below went through the label filter, so it says so: an
+	// agent that sent a rule and hears nothing back is talking to an older
+	// server and must not trust its target.
+	labelsChecked := len(req.Request.Labels) > 0
 	if sandboxID := strings.TrimSpace(req.SandboxID); sandboxID != "" {
 		target, recipients, err := c.SelectPlacementForCreate(req.Request, sandboxID, req.RecipientBackups)
 		if err != nil {
 			apihttp.WriteJSON(w, http.StatusOK, cluster.SelectPlacementErrorResponse(err))
 			return
 		}
-		apihttp.WriteJSON(w, http.StatusOK, cluster.SelectPlacementResponse{Target: target, Recipients: recipients})
+		apihttp.WriteJSON(w, http.StatusOK, cluster.SelectPlacementResponse{Target: target, Recipients: recipients, LabelsChecked: labelsChecked})
 		return
 	}
 	// Target-only callers (build, template, JS bundle, local-image routing)
@@ -1794,7 +1805,7 @@ func (h *handlers) clusterInternalSelectPlacement(w http.ResponseWriter, r *http
 			apihttp.WriteJSON(w, http.StatusOK, cluster.SelectPlacementErrorResponse(err))
 			return
 		}
-		apihttp.WriteJSON(w, http.StatusOK, cluster.SelectPlacementResponse{Target: target})
+		apihttp.WriteJSON(w, http.StatusOK, cluster.SelectPlacementResponse{Target: target, LabelsChecked: labelsChecked})
 		return
 	}
 	target, candidates, err := c.SelectPlacementWithCandidates(req.Request)
@@ -1802,7 +1813,7 @@ func (h *handlers) clusterInternalSelectPlacement(w http.ResponseWriter, r *http
 		apihttp.WriteJSON(w, http.StatusOK, cluster.SelectPlacementErrorResponse(err))
 		return
 	}
-	apihttp.WriteJSON(w, http.StatusOK, cluster.SelectPlacementResponse{Target: target, Candidates: candidates})
+	apihttp.WriteJSON(w, http.StatusOK, cluster.SelectPlacementResponse{Target: target, Candidates: candidates, LabelsChecked: labelsChecked})
 }
 
 // A public JSON create is capped at 1 MiB. Encrypting its credentials and then

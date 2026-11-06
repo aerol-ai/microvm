@@ -227,10 +227,13 @@ func (c *Cluster) tryReassignStuckPlacement(ctx context.Context, id string, p Pl
 		// self-exclusion so a server that just failed it isn't re-elected.
 		stuckOwner = c.nodeID
 	}
-	target, ok := c.selectRecreationTarget(p, stuckOwner)
-	if !ok {
+	target, err := c.selectRecreationTargetFor(p, stuckOwner)
+	if err != nil {
+		if errors.Is(err, ErrPlacementUnsatisfiable) {
+			c.reportFailoverRefused(p, stuckOwner, err)
+		}
 		c.logger.Warn("cluster: no alternate node available for stuck placement; will keep retrying locally",
-			"sandbox_id", id, "stuck_owner", stuckOwner)
+			"sandbox_id", id, "stuck_owner", stuckOwner, "reason", err)
 		return ErrNoReassignTarget
 	}
 	cmd := command{
@@ -269,12 +272,21 @@ func (c *Cluster) tryReassignStuckPlacement(ctx context.Context, id string, p Pl
 // can both hold and decrypt the local-provider row. Placements without a
 // secret handle retain ordinary fleet-wide placement behavior.
 func (c *Cluster) selectRecreationTarget(p Placement, exclude ...string) (PlacementTarget, bool) {
+	target, err := c.selectRecreationTargetFor(p, exclude...)
+	return target, err == nil
+}
+
+// selectRecreationTargetFor is selectRecreationTarget with the reason it
+// found none. ErrPlacementUnsatisfiable means the sandbox's placement rule
+// excludes every candidate: the failover must not move it (P1.5), and the
+// caller says so in a counter and an audit record rather than a bare log.
+func (c *Cluster) selectRecreationTargetFor(p Placement, exclude ...string) (PlacementTarget, error) {
 	spec := p.Spec
 	if spec == nil {
-		return PlacementTarget{}, false
+		return PlacementTarget{}, ErrNoReassignTarget
 	}
 	if spec.ImageDistributionMode == models.ImageDistributionLocalOnly {
-		return PlacementTarget{}, false
+		return PlacementTarget{}, ErrNoReassignTarget
 	}
 	excluded := make(map[string]struct{}, len(exclude))
 	for _, id := range exclude {
@@ -286,8 +298,7 @@ func (c *Cluster) selectRecreationTarget(p Placement, exclude ...string) (Placem
 	// is needed only when exclusions apply or a small recipient set constrains
 	// the candidates.
 	if !placementHasSecretHandle(p) && len(exclude) == 0 {
-		target, err := c.SelectPlacement(req)
-		return target, err == nil
+		return c.SelectPlacement(req)
 	}
 	drained := c.fsm.drainedNodesSnapshot()
 	// Score every eligible candidate that isn't excluded and pick the one with
@@ -299,14 +310,24 @@ func (c *Cluster) selectRecreationTarget(p Placement, exclude ...string) (Placem
 	var best Member
 	bestScore := -1.0
 	found := false
+	labelMatched := false
 	for _, m := range all {
 		if !m.Alive {
 			continue
 		}
-		if _, skip := excluded[m.NodeID]; skip {
+		if !CanOwnSandboxRole(m.Role) {
 			continue
 		}
-		if !CanOwnSandboxRole(m.Role) {
+		// Labels are checked before the exclusion: a stuck owner that is the
+		// only node in the rule makes the rule satisfiable, so having no
+		// alternative is "stay put and retry", not a refused failover.
+		if len(req.Labels) > 0 {
+			if !models.LabelsSatisfy(m.Capacity.Labels, req.Labels) {
+				continue
+			}
+			labelMatched = true
+		}
+		if _, skip := excluded[m.NodeID]; skip {
 			continue
 		}
 		if req.RequiredNodeID != "" && m.NodeID != req.RequiredNodeID {
@@ -333,12 +354,15 @@ func (c *Cluster) selectRecreationTarget(p Placement, exclude ...string) (Placem
 		}
 	}
 	if !found {
-		return PlacementTarget{}, false
+		if len(req.Labels) > 0 && !labelMatched {
+			return PlacementTarget{}, models.PlacementUnsatisfiableError(req.Labels)
+		}
+		return PlacementTarget{}, ErrNoReassignTarget
 	}
 	if best.NodeID == c.nodeID {
-		return PlacementTarget{NodeID: c.nodeID, APIURL: c.apiURL, DataPlaneHost: c.dataPlaneHost, IsSelf: true}, true
+		return PlacementTarget{NodeID: c.nodeID, APIURL: c.apiURL, DataPlaneHost: c.dataPlaneHost, IsSelf: true}, nil
 	}
-	return PlacementTarget{NodeID: best.NodeID, APIURL: best.APIURL, DataPlaneHost: best.DataPlaneHost, IsSelf: false}, true
+	return PlacementTarget{NodeID: best.NodeID, APIURL: best.APIURL, DataPlaneHost: best.DataPlaneHost, IsSelf: false}, nil
 }
 
 // recreationCandidates returns the existing fleet gossip view for a stuck

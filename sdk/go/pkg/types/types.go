@@ -10,6 +10,11 @@ type CreateSandboxOptions = models.CreateSandboxRequest
 type ResizeSandboxOptions = models.ResizeSandboxRequest
 type Lifecycle = models.Lifecycle
 type Failover = models.Failover
+
+// PlacementRule limits which cluster nodes may run a sandbox, by zone and
+// node labels (CreateSandboxOptions.Placement). No matching node makes the
+// create fail with 409 placement_unsatisfiable.
+type PlacementRule = models.PlacementRule
 type UpdateLifecycleOptions = models.UpdateLifecycleRequest
 type ExecRequest = models.ExecRequest
 type ExecResult = models.ExecResult

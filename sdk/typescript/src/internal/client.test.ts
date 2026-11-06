@@ -2612,3 +2612,26 @@ test("requireToolboxFeatures names a runtime that cannot offer the feature", asy
   });
   assert.match(new MicroVMUnsupportedFeatureError("s", ["x"], "", "isolate").message, /V8 isolate/);
 });
+
+test("internal client create sends a placement rule", async () => {
+  let seenRequest: Request | undefined;
+  const client = new APIClient({
+    baseURL: "https://api.example.com",
+    patToken: "pat-token",
+    fetch: async (input, init) => {
+      seenRequest = new Request(input, init);
+      return jsonResponse(apiSandbox("sb-placed"));
+    },
+  });
+  await client.create({
+    image: "ubuntu:22.04",
+    placement: { zone: "eu-west-1a", labels: { tier: "pci" } },
+  });
+  assert.ok(seenRequest);
+  const body = (await seenRequest.json()) as Record<string, unknown>;
+  assert.deepEqual(body.placement, { zone: "eu-west-1a", labels: { tier: "pci" } });
+
+  await client.create({ image: "ubuntu:22.04" });
+  const plain = (await seenRequest.json()) as Record<string, unknown>;
+  assert.equal("placement" in plain, false);
+});

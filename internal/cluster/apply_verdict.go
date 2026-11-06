@@ -48,6 +48,11 @@ func ApplyErrorStatus(err error) int {
 		// a retry of an Idempotency-Key create on a multi-node cluster 503s
 		// instead of replaying the existing sandbox.
 		return http.StatusConflict
+	case errors.Is(err, ErrPlacementUnsatisfiable):
+		// The leader refused a reservation onto a node the sandbox's
+		// placement rule excludes. A verdict, not a fault: as a 500 the
+		// router would answer a retryable 503 for a rule no retry satisfies.
+		return http.StatusConflict
 	case errors.Is(err, ErrIncarnationConflict):
 		// An incarnation fence is a verdict too: the placement moved to
 		// another incarnation, and re-sending the same write cannot succeed.
@@ -95,6 +100,8 @@ func forwardApplyStatus(status int, message string) error {
 			return fmt.Errorf("%w: %s", ErrNameConflict, message)
 		case strings.Contains(message, ErrIncarnationConflict.Error()):
 			return fmt.Errorf("%w: %s", ErrIncarnationConflict, message)
+		case strings.Contains(message, ErrPlacementUnsatisfiable.Error()):
+			return fmt.Errorf("%w: %s", ErrPlacementUnsatisfiable, message)
 		}
 	case http.StatusServiceUnavailable:
 		switch {

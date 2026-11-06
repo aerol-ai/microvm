@@ -285,6 +285,11 @@ pub struct CreateOptions {
     /// cluster recreation from the replicated create spec.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub failover: Option<Failover>,
+    /// Limit which nodes may run the sandbox, by zone and node labels. Kept
+    /// on failover. No matching node fails the create with 409
+    /// `placement_unsatisfiable`; it never falls back to another node.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub placement: Option<PlacementRule>,
     /// Container runtime for this sandbox. Omit to inherit the host default
     /// (SB_CONTAINER_RUNTIME). Use `"gvisor"` for runsc-backed isolation when
     /// running untrusted workloads. `"kata"` is reserved and rejected by the
@@ -475,6 +480,18 @@ pub type UpdateLifecycleOptions = Lifecycle;
 pub struct Failover {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub policy: String,
+}
+
+/// Where a sandbox may run in a cluster. Every field you set must match the
+/// node's labels exactly.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+pub struct PlacementRule {
+    /// Run only on nodes in this zone (the node's `SB_NODE_ZONE`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub zone: Option<String>,
+    /// Run only on nodes that have all of these labels (`SB_NODE_LABELS`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub labels: Option<std::collections::HashMap<String, String>>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]

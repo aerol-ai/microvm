@@ -179,6 +179,20 @@ var ErrNoEgressGatewayTarget = fmt.Errorf("%w: no node has a ready egress gatewa
 // from a fleet that cannot run the request at all.
 var ErrClusterAtCapacity = fmt.Errorf("%w: every worker that can run this sandbox is at capacity (cpu, memory, disk or network slots)", ErrNoPlacementTarget)
 
+// ErrPlacementUnsatisfiable is a create whose placement rule (zone and node
+// labels, plans/placement-rules.md) no live worker's heartbeat satisfies. It
+// is deliberately NOT an ErrNoPlacementTarget: that is a retryable 503, and
+// waiting does not make a node grow a label. The API answers 409
+// placement_unsatisfiable naming the rule.
+var ErrPlacementUnsatisfiable = models.ErrPlacementUnsatisfiable
+
+// ErrPlacementRulesUnsupported is a create with a placement rule that reached
+// a control plane too old to filter on labels (it answered without saying it
+// checked them). The agent fails closed rather than trust a target picked
+// without the rule; it stays an ErrNoPlacementTarget, so the create is a
+// retryable 503 that succeeds once the server tier is upgraded.
+var ErrPlacementRulesUnsupported = fmt.Errorf("%w: the control plane runs a build that cannot apply placement rules yet", ErrNoPlacementTarget)
+
 // ErrInvalidTopology is returned when the live cluster shape violates a
 // production topology invariant. API layers translate this to 503 so clients
 // retry after the operator fixes membership instead of treating it as a

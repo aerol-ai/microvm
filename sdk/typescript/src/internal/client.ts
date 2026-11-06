@@ -2463,6 +2463,7 @@ function toApiCreateOptions(options: CreateOptions): Record<string, unknown> {
     platform_volumes: options.platformVolumes?.map(toApiPlatformVolumeMount),
     lifecycle: options.lifecycle ? toApiLifecycle(options.lifecycle) : undefined,
     failover: options.failover ? toApiFailover(options.failover) : undefined,
+    placement: options.placement ? { zone: options.placement.zone, labels: options.placement.labels } : undefined,
     runtime: options.runtime,
     durability: options.durability,
     module_ref: options.moduleRef,

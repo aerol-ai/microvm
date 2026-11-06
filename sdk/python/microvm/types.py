@@ -136,6 +136,19 @@ class Failover(TypedDict, total=False):
     policy: FailoverPolicy
 
 
+class PlacementRule(TypedDict, total=False):
+    """Where a sandbox may run in a cluster.
+
+    Every field you set must match the node's labels exactly. If no node
+    matches, create fails with 409 ``placement_unsatisfiable``; it never
+    falls back to another node.
+    """
+    # Run only on nodes in this zone (the node's SB_NODE_ZONE).
+    zone: str
+    # Run only on nodes that have all of these labels (SB_NODE_LABELS).
+    labels: Dict[str, str]
+
+
 GPUVendor = Literal["nvidia", "amd", "apple"]
 
 
@@ -231,6 +244,9 @@ class CreateOptions(TypedDict, total=False):
     platformVolumes: List[PlatformVolumeMount]
     lifecycle: Lifecycle
     failover: Failover
+    # Limit which nodes may run the sandbox, by zone and node labels. Kept on
+    # failover. No matching node gives a 409 placement_unsatisfiable error.
+    placement: PlacementRule
     # Container runtime to use for this sandbox. Omit to inherit the host
     # default (SB_CONTAINER_RUNTIME). Use "gvisor" for runsc-backed isolation
     # when running untrusted workloads. "kata" is reserved and rejected by the

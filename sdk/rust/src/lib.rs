@@ -49,7 +49,7 @@ pub use types::{
     CustomDomainStatus, DnsRecord, ExecExitInfo, ExecRequest, ExecResult, ExposeOptions, FileEvent,
     ExposeProtocol, ExposeResult, ExposedPort, Failover, GPUOptions, GPUVendor, HealthStatus,
     IngressTarget, Lifecycle,
-    MountSpec, MountSpecRedacted, MountType, NetworkUsage, PlatformVolumeMount,
+    MountSpec, MountSpecRedacted, MountType, NetworkUsage, PlacementRule, PlatformVolumeMount,
     RegisterSnapshotOptions, RegistryAuth,
     ResizeOptions, RetryConfig, Sandbox as SandboxData, SandboxSnapshot, Session, SessionList,
     SessionStatus, SetNetworkLimitsOptions, Template, TemplatePushState, TemplateStatus,
@@ -3477,6 +3477,7 @@ mod tests {
             platform_volumes: None,
             lifecycle: None,
             failover: None,
+            placement: None,
             runtime: None,
             template_id: None,
             gpus: None,
@@ -4310,6 +4311,48 @@ mod tests {
             sandbox.data.failover,
             Some(Failover {
                 policy: "recreate".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn create_sends_placement_rule() {
+        let body = serde_json::json!({
+            "id": "sb-placed",
+            "image": "ubuntu:22.04",
+            "status": "running",
+            "public_url": "",
+            "cpu": 1,
+            "memory_mb": 512,
+            "disk_gb": 10,
+            "os_user": "root",
+            "network_block_all": false,
+            "toolbox_enabled": true,
+            "created_at": "2026-05-07T10:00:00Z",
+            "updated_at": "2026-05-07T10:00:00Z",
+            "last_active_at": "2026-05-07T10:00:00Z"
+        })
+        .to_string();
+        let (url, request_rx) = spawn_json_server(body);
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        let mut labels = std::collections::HashMap::new();
+        labels.insert("tier".to_string(), "pci".to_string());
+        client
+            .create(CreateOptions {
+                placement: Some(PlacementRule {
+                    zone: Some("eu-west-1a".to_string()),
+                    labels: Some(labels),
+                }),
+                ..minimal_create_options()
+            })
+            .expect("create should succeed");
+        let request = request_rx.recv().expect("request should be captured");
+        let body = request_json_body(&request);
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "image": "ubuntu:22.04",
+                "placement": { "zone": "eu-west-1a", "labels": { "tier": "pci" } }
             })
         );
     }

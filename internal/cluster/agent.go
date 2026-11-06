@@ -117,12 +117,24 @@ type SelectPlacementResponse struct {
 	// build matches — it keeps answering a 503 during a rolling upgrade —
 	// while a current agent restores ErrClusterAtCapacity from this flag.
 	AtCapacity bool `json:"at_capacity,omitempty"`
+	// PlacementUnsatisfiable marks a refusal because no worker carries the
+	// request's labels (ErrPlacementUnsatisfiable); Error names the rule.
+	PlacementUnsatisfiable bool `json:"placement_unsatisfiable,omitempty"`
+	// LabelsChecked says this control plane filtered on Request.Labels. A
+	// server on an older build drops the field it cannot read and places as
+	// if there were no rule; an agent that sent labels and does not get this
+	// back fails closed (ErrPlacementRulesUnsupported) instead of creating
+	// the sandbox wherever that server chose.
+	LabelsChecked bool `json:"labels_checked,omitempty"`
 }
 
 // SelectPlacementErrorResponse renders a placement failure for an agent.
 func SelectPlacementErrorResponse(err error) SelectPlacementResponse {
 	if errors.Is(err, ErrClusterAtCapacity) {
 		return SelectPlacementResponse{Error: ErrNoPlacementTarget.Error(), AtCapacity: true}
+	}
+	if errors.Is(err, ErrPlacementUnsatisfiable) {
+		return SelectPlacementResponse{Error: err.Error(), PlacementUnsatisfiable: true, LabelsChecked: true}
 	}
 	return SelectPlacementResponse{Error: err.Error()}
 }
@@ -451,6 +463,9 @@ func (a *Agent) selectPlacement(body SelectPlacementRequest) (PlacementTarget, [
 		if resp.AtCapacity {
 			return PlacementTarget{}, nil, nil, ErrClusterAtCapacity
 		}
+		if resp.PlacementUnsatisfiable {
+			return PlacementTarget{}, nil, nil, fmt.Errorf("%w: %s", ErrPlacementUnsatisfiable, strings.TrimPrefix(resp.Error, ErrPlacementUnsatisfiable.Error()+": "))
+		}
 		if resp.Error == ErrNoPlacementTarget.Error() {
 			return PlacementTarget{}, nil, nil, ErrNoPlacementTarget
 		}
@@ -461,6 +476,9 @@ func (a *Agent) selectPlacement(body SelectPlacementRequest) (PlacementTarget, [
 			return PlacementTarget{}, nil, nil, err
 		}
 		return PlacementTarget{}, nil, nil, errors.New(resp.Error)
+	}
+	if len(body.Request.Labels) > 0 && !resp.LabelsChecked {
+		return PlacementTarget{}, nil, nil, ErrPlacementRulesUnsupported
 	}
 	if resp.Target.NodeID == a.nodeID {
 		resp.Target.APIURL = a.apiURL
@@ -1675,6 +1693,12 @@ func (a *Agent) doHTTPRequest(ctx context.Context, client *http.Client, endpoint
 			// Idempotency-Key retry's re-reserve that hits it is routed to
 			// the reservation's owner, which keys off errors.Is.
 			return fmt.Errorf("%w: %s", ErrIncarnationConflict, message)
+		}
+		if resp.StatusCode == http.StatusConflict && strings.Contains(message, ErrPlacementUnsatisfiable.Error()) {
+			// The leader refused a reservation outside the sandbox's
+			// placement rule (admitReservationCommands): a 409 the create
+			// path answers as placement_unsatisfiable, not a reserve failure.
+			return fmt.Errorf("%w: %s", ErrPlacementUnsatisfiable, message)
 		}
 		if resp.StatusCode == http.StatusConflict && strings.Contains(message, ErrMemberStillAlive.Error()) {
 			return ErrMemberStillAlive

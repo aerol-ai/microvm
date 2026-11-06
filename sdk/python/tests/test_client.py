@@ -659,6 +659,16 @@ class ClientTests(unittest.TestCase):
         )
         self.assertEqual(sandbox.failover, {"policy": "recreate"})
 
+    def test_create_sends_placement_rule(self):
+        client = RecordingMicroVM()
+        client.create({"image": "ubuntu:22.04", "placement": {"zone": "eu-west-1a", "labels": {"tier": "pci"}}})
+        self.assertEqual(client.calls[0][2]["placement"], {"zone": "eu-west-1a", "labels": {"tier": "pci"}})
+        # A zone alone sends only the zone, and no rule sends no key at all.
+        client.create({"image": "ubuntu:22.04", "placement": {"zone": "eu-west-1a"}})
+        self.assertEqual(client.calls[1][2]["placement"], {"zone": "eu-west-1a"})
+        client.create({"image": "ubuntu:22.04"})
+        self.assertNotIn("placement", client.calls[2][2])
+
     def test_update_lifecycle_maps_request_and_updates_sandbox_state(self):
         client = RecordingMicroVM()
 

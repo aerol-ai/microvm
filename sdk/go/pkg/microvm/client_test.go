@@ -984,3 +984,39 @@ func TestCreateSendsIdempotencyKey(t *testing.T) {
 		t.Fatal("create against a closed server succeeded")
 	}
 }
+
+// TestCreateSendsPlacementRule: the rule reaches the wire under "placement",
+// and a create without one sends no placement key.
+func TestCreateSendsPlacementRule(t *testing.T) {
+	ctx := context.Background()
+	var bodies []map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		bodies = append(bodies, body)
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(models.CreateSandboxResponse{Sandbox: models.Sandbox{ID: "sb-placed"}})
+	}))
+	defer server.Close()
+	client, err := NewClientWithConfig(&sdktypes.MicroVMConfig{APIUrl: server.URL, PATToken: "pat", HTTPClient: server.Client()})
+	if err != nil {
+		t.Fatalf("NewClientWithConfig: %v", err)
+	}
+	rule := &sdktypes.PlacementRule{Zone: "eu-west-1a", Labels: map[string]string{"tier": "pci"}}
+	if _, err := client.Create(ctx, sdktypes.CreateSandboxOptions{Image: "ubuntu:22.04", Placement: rule}); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if _, err := client.Create(ctx, sdktypes.CreateSandboxOptions{Image: "ubuntu:22.04"}); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if len(bodies) != 2 {
+		t.Fatalf("bodies = %d", len(bodies))
+	}
+	got, _ := json.Marshal(bodies[0]["placement"])
+	if string(got) != `{"labels":{"tier":"pci"},"zone":"eu-west-1a"}` {
+		t.Fatalf("placement = %s", got)
+	}
+	if _, ok := bodies[1]["placement"]; ok {
+		t.Fatalf("a create without a rule sent placement: %v", bodies[1])
+	}
+}

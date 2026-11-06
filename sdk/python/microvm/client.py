@@ -51,6 +51,7 @@ from .types import (
     FileList,
     FileMatch,
     GPUOptions,
+    PlacementRule,
     HealthStatus,
     IngressTarget,
     Lifecycle,
@@ -2608,6 +2609,7 @@ def _to_api_create_options(options: CreateOptions) -> Dict[str, Any]:
     identity = _first_of(options, "identity")
     lifecycle = _first_of(options, "lifecycle")
     failover = _first_of(options, "failover")
+    placement = _first_of(options, "placement")
     gpus = _first_of(options, "gpus")
     return _compact(
         {
@@ -2638,6 +2640,7 @@ def _to_api_create_options(options: CreateOptions) -> Dict[str, Any]:
             ],
             "lifecycle": _to_api_lifecycle(lifecycle) if isinstance(lifecycle, dict) else None,
             "failover": _to_api_failover(failover) if isinstance(failover, dict) else None,
+            "placement": _to_api_placement(placement) if isinstance(placement, dict) else None,
             "runtime": _first_of(options, "runtime"),
             "durability": _first_of(options, "durability"),
             "module_ref": _first_of(options, "moduleRef", "module_ref"),
@@ -2691,6 +2694,10 @@ def _from_api_sandbox_identity(payload: Dict[str, Any]) -> SandboxIdentity:
         if payload.get(wire):
             result[key] = str(payload[wire])  # type: ignore[literal-required]
     return result
+
+
+def _to_api_placement(placement: PlacementRule) -> Dict[str, Any]:
+    return _compact({"zone": _first_of(placement, "zone"), "labels": _first_of(placement, "labels")})
 
 
 def _to_api_gpus(gpus: GPUOptions) -> Dict[str, Any]:

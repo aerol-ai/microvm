@@ -255,6 +255,7 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 	host.GPUCount = cfg.HostGPUCount
 	host.GPUVendor = cfg.HostGPUVendor
 	host.SupportedRuntimes = supportedRuntimesForConfig(cfg)
+	host.Labels = cfg.NodeLabels
 	// Phase 5: the per-VMM RSS sampler is constructed up front when
 	// firecracker is enabled so admission can be wired against it from
 	// the start (capacity holds the RSSSource by reference, not value).
@@ -297,6 +298,7 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 		"host_gpu_count", host.GPUCount,
 		"host_gpu_vendor", host.GPUVendor,
 		"host_supported_runtimes", host.SupportedRuntimes,
+		"node_labels", host.Labels,
 		"cpu_reservation_ratio", cfg.CPUReservationRatio,
 		"memory_reservation_ratio", cfg.MemoryReservationRatio,
 		"disk_reservation_ratio", cfg.DiskReservationRatio,

@@ -80,6 +80,11 @@ func TestClassify(t *testing.T) {
 		{"egress gateway", service.ErrEgressGatewayUnavailable, http.StatusServiceUnavailable, 5, models.ErrorCodeEgressGatewayUnavailable, ErrKindOther},
 		{"egress inspect recreate", service.ErrEgressInspectRecreate, http.StatusConflict, 0, "", ErrKindOther},
 		{"capacity", cluster.ErrCapacityExceeded, http.StatusServiceUnavailable, cluster.CapacityRetryAfterSeconds, "", ErrKindOther},
+		// A placement rule no node satisfies: 409 with its code and no
+		// Retry-After (waiting gives no node a label); malformed is a 400.
+		{"placement unsatisfiable", models.PlacementUnsatisfiableError(map[string]string{"zone": "z1"}), http.StatusConflict, 0, models.ErrorCodePlacementUnsatisfiable, ErrKindOther},
+		{"placement invalid", fmt.Errorf("%w: bad", models.ErrInvalidPlacement), http.StatusBadRequest, 0, "", ErrKindUnclassified},
+		{"control plane without placement rules", cluster.ErrPlacementRulesUnsupported, http.StatusServiceUnavailable, 0, "", ErrKindOther},
 		{"backpressure", cluster.ErrCreateBackpressure, http.StatusTooManyRequests, cluster.CreateBackpressureRetryAfterSeconds, "", ErrKindOther},
 		{"not leader", cluster.ErrNotLeader, http.StatusServiceUnavailable, cluster.LeaderChangeRetryAfterSeconds, "", ErrKindOther},
 		{"no leader", fmt.Errorf("storage retirement: %w", cluster.ErrNoLeader), http.StatusServiceUnavailable, cluster.LeaderChangeRetryAfterSeconds, "", ErrKindOther},

@@ -3,7 +3,7 @@ title: Placement and failover
 description: How a cluster picks a server for each sandbox, agrees on who owns it, and recovers sandboxes when a server dies.
 ---
 
-import { Tabs, TabItem } from '@astrojs/starlight/components';
+import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
 
 AerolVM is one program. It runs as the standalone daemon and as a cluster node: the same `sandboxd`, with different config. (A daemon is a program that runs in the background on a server.) There is no separate scheduler process and no etcd.
 
@@ -198,6 +198,7 @@ The score is `(budget − reserved − pending − request) / budget`, averaged 
 - Its GPU or runtime (container, gVisor, Firecracker and so on) does not match the request.
 - It lacks the requested template. Older peers that do not report templates are let through (the "unknown-allow" rule).
 - Its network-slot pool for the runtime has no free slot after its pending reservations are counted (see [Network slots](#network-slots)).
+- It lacks a label the create's placement rule asks for (see [Choose where a sandbox runs](#choose-where-a-sandbox-runs)).
 
 **The first pick wins ties.** The comparison in `placement.go` uses `>`, not `>=`. So `a` (the first pick) wins unless `b` has strictly more headroom. When `a` is the local node, the local node keeps the sandbox.
 
@@ -209,9 +210,11 @@ This is the whole choice, from the full member list down to one winner:
 flowchart TB
     ALL["Every node this server knows about"] --> F1["Drop nodes that are dead, drained,<br/>cannot own sandboxes or have no API address"]
     F1 --> F2["Drop nodes whose capacity report is stale"]
-    F2 --> F3["Drop nodes that cannot fit the request<br/>after subtracting pending reservations"]
+    F2 --> FL["Drop nodes without every label<br/>the placement rule asks for"]
+    FL --> F3["Drop nodes that cannot fit the request<br/>after subtracting pending reservations"]
     F3 --> F4["Drop nodes whose network-slot pool<br/>for the runtime is full"]
     F4 --> ANY{"Any nodes left?"}
+    ANY -- "no, and no node has the labels" --> RULE["Answer 409 placement_unsatisfiable<br/>naming the rule"]
     ANY -- "no" --> NONE["Answer 503 + Retry-After<br/>'at capacity' when a node that could<br/>run it was only full"]
     ANY -- "yes" --> PICK["Pick two of them at random"]
     PICK --> CMP{"Does the second pick have<br/>strictly more headroom?"}
@@ -231,6 +234,181 @@ Draining is a hard admission rule, not a scoring penalty. (Draining a node tells
 > soft-scoring penalty.
 
 > **Invariant.** A placement decision uses the freshest information the deciding node has. That is the capacity report, minus in-flight reservations, minus drain marks. The leader sees reservations at once; other replicas see them once their FSM apply catches up. Nodes with stale capacity drop out of the candidate set until their next successful report.
+
+## Choose where a sandbox runs
+
+Sometimes a sandbox must run on certain servers. A bank may need regulated work to stay on approved hosts. You may want to spread work across zones (separate parts of a data center), or send a job to a node with a certain GPU. A **placement rule** does this.
+
+It works in two parts:
+
+1. **The operator labels each node.** A label is a `key=value` pair, such as `tier=pci`. A zone is a label with the key `zone`.
+2. **The create asks for labels.** The sandbox runs only on a node that has every label it asks for, with the same value.
+
+### Label the nodes
+
+Set these on each node, next to its other settings. A node reads them when it starts.
+
+| Setting | What it does | Example |
+|---|---|---|
+| `SB_NODE_ZONE` | The node's zone. It becomes the label `zone`. | `eu-west-1a` |
+| `SB_NODE_LABELS` | Other labels, as `key=value` pairs split by commas. | `tier=pci,gpu=a10` |
+
+The rules for labels:
+
+- Keys and values follow the Kubernetes label rules. They use letters, digits, `-`, `_` and `.`, and start and end with a letter or digit. A key may have a prefix, like `example.com/tier`.
+- A node can have at most 16 labels, the zone included. Each key and each value is at most 63 characters.
+- A mistake stops the node from starting. A typo, a key set twice with two values, or a zone set two different ways all fail the boot. That is on purpose. A node that quietly dropped a bad label would never match the rules written for it.
+
+The cluster members list (`GET /v1/cluster/members`) shows each node's `zone` and `labels`, so you can see what a rule can target.
+
+### Ask for a node in the create
+
+Add `placement` to the create. Set `zone`, `labels`, or both:
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    import { MicroVM } from '@aerol-ai/aerolvm-sdk'
+
+    const client = new MicroVM({
+      apiUrl: process.env.SB_API_URL,
+      patToken: process.env.SB_PAT_TOKEN,
+    })
+
+    // Run only on a node in zone eu-west-1a that has the label tier=pci.
+    const sandbox = await client.create({
+      image: 'ubuntu:22.04',
+      placement: { zone: 'eu-west-1a', labels: { tier: 'pci' } },
+    })
+
+    console.log(sandbox.id)
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    import os
+    from microvm import MicroVM
+
+    client = MicroVM(
+        api_url=os.environ['SB_API_URL'],
+        pat_token=os.environ['SB_PAT_TOKEN'],
+    )
+
+    # Run only on a node in zone eu-west-1a that has the label tier=pci.
+    sandbox = client.create({
+        'image': 'ubuntu:22.04',
+        'placement': {'zone': 'eu-west-1a', 'labels': {'tier': 'pci'}},
+    })
+
+    print(sandbox.id)
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    import (
+        "context"
+        "fmt"
+        "log"
+        "os"
+
+        microvm  "github.com/aerol-ai/microvm/sdk/go/pkg/microvm"
+        sdktypes "github.com/aerol-ai/microvm/sdk/go/pkg/types"
+    )
+
+    client, err := microvm.NewClientWithConfig(&sdktypes.MicroVMConfig{
+        APIUrl:   os.Getenv("SB_API_URL"),
+        PATToken: os.Getenv("SB_PAT_TOKEN"),
+    })
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    // Run only on a node in zone eu-west-1a that has the label tier=pci.
+    sandbox, err := client.Create(context.Background(), sdktypes.CreateSandboxOptions{
+        Image: "ubuntu:22.04",
+        Placement: &sdktypes.PlacementRule{
+            Zone:   "eu-west-1a",
+            Labels: map[string]string{"tier": "pci"},
+        },
+    })
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    fmt.Println(sandbox.ID)
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    use std::collections::HashMap;
+    use aerolvm_sdk::{Client, CreateOptions, PlacementRule};
+
+    let client = Client::new(
+        std::env::var("SB_API_URL").ok().as_deref(),
+        std::env::var("SB_PAT_TOKEN").ok().as_deref(),
+    )?;
+
+    // Run only on a node in zone eu-west-1a that has the label tier=pci.
+    let sandbox = client.create(CreateOptions {
+        image: "ubuntu:22.04".to_string(),
+        placement: Some(PlacementRule {
+            zone: Some("eu-west-1a".to_string()),
+            labels: Some(HashMap::from([("tier".to_string(), "pci".to_string())])),
+        }),
+        ..Default::default()
+    })?;
+
+    println!("{}", sandbox.data.id);
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    import java.util.Map;
+
+    import ai.aerol.microvm.MicroVMClient;
+    import ai.aerol.microvm.MicroVMConfig;
+    import ai.aerol.microvm.Sandbox;
+    import ai.aerol.microvm.model.CreateOptions;
+    import ai.aerol.microvm.model.PlacementRule;
+
+    MicroVMClient client = new MicroVMClient(
+        new MicroVMConfig()
+            .setApiUrl(System.getenv("SB_API_URL"))
+            .setPatToken(System.getenv("SB_PAT_TOKEN"))
+    );
+
+    // Run only on a node in zone eu-west-1a that has the label tier=pci.
+    Sandbox sandbox = client.create(
+        new CreateOptions()
+            .setImage("ubuntu:22.04")
+            .setPlacement(new PlacementRule()
+                .setZone("eu-west-1a")
+                .setLabels(Map.of("tier", "pci")))
+    );
+
+    System.out.println(sandbox.id);
+    ```
+  </TabItem>
+</Tabs>
+
+### What happens
+
+- **Every label must match.** The node must have each key you ask for, with exactly that value. A node may have more labels than you ask for. There is no "one of" or "not" in this version.
+- **No match is a refusal, never a fallback.** If no live node has the labels, the create fails with `409` and the code `placement_unsatisfiable`. The message names the rule. Retrying does not help, because waiting does not give a node a label.
+- **A busy match is a normal wait.** If a node has the labels but is full, drained, or its capacity report is late, you get the usual `503` with `Retry-After`. The SDKs retry it.
+- **One server works the same way.** On a single server, a rule that the server's own labels do not match gets the same `409`.
+- **The rule survives failover.** The rule is saved with the sandbox, so a [recreate after a node dies](/durability/) only picks a node that matches. If no live node matches, the sandbox is not moved. It is orphaned, like any sandbox with nowhere to go, and its old node takes it back if it returns. The counter `aerolvm_cluster_failover_refused_total{reason="placement_unsatisfiable"}` goes up, and the audit log gets a `failover_refused` record that names the sandbox, the node it could not leave, and the rule.
+
+How it works inside:
+
+- Labels travel in each node's capacity report (`labels` on `/v1/capacity`), not in gossip. Gossip data per node is capped at 512 bytes, and going over it once broke Raft joins. Placement already needs a fresh capacity report from each node, so the labels are always there when placement runs.
+- The label filter runs before the two random picks, so the picks only ever see nodes that match.
+- The leader checks the rule again when it records the reservation, and the chosen node checks its own labels before it creates anything. A router on an older release, which does not know about rules, cannot slip a sandbox onto the wrong node.
+- A node on an older release sends no labels, so it never matches a rule. During an upgrade a create with a rule fails closed instead of landing on an unlabelled node. A create without a rule places as before.
+
+<Aside type="caution">
+A server older than the release with placement rules ignores the `placement` field and places the sandbox anywhere. Upgrade every server before you depend on rules.
+</Aside>
 
 ## Network slots
 

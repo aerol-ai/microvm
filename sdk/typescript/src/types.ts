@@ -184,6 +184,18 @@ export interface Failover {
   policy: FailoverPolicy;
 }
 
+/**
+ * Where a sandbox may run in a cluster. Every field you set must match the
+ * node's labels exactly. If no node matches, create fails with 409
+ * `placement_unsatisfiable`; it never falls back to another node.
+ */
+export interface PlacementRule {
+  /** Run only on nodes in this zone (the node's `SB_NODE_ZONE`). */
+  zone?: string;
+  /** Run only on nodes that have all of these labels (`SB_NODE_LABELS`). */
+  labels?: Record<string, string>;
+}
+
 export type GPUVendor = "nvidia" | "amd" | "apple";
 
 export interface GPUOptions {
@@ -327,6 +339,11 @@ export interface CreateOptions {
   platformVolumes?: PlatformVolumeMount[];
   lifecycle?: Lifecycle;
   failover?: Failover;
+  /**
+   * Limit which nodes may run the sandbox, by zone and node labels. Kept on
+   * failover. No matching node gives a 409 `placement_unsatisfiable` error.
+   */
+  placement?: PlacementRule;
   /**
    * Container runtime to use for this sandbox. Omit to inherit the host
    * default (`SB_CONTAINER_RUNTIME`). Use `"gvisor"` for runsc-backed

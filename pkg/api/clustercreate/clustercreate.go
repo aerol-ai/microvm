@@ -171,6 +171,15 @@ func Prepare(w http.ResponseWriter, r *http.Request, svc *service.Service, req m
 			return Decision{}, false
 		}
 	}
+	// The rule is validated and made canonical before placement reads it,
+	// and before SyncBody, so the target and the replicated spec carry the
+	// same rule the router filtered on.
+	placement, err := models.NormalizePlacementRule(req.Placement)
+	if err != nil {
+		writeMsg(w, http.StatusBadRequest, err.Error())
+		return Decision{}, false
+	}
+	req.Placement = placement
 	// The operator's create policy before placement: a create too big for
 	// every node must be refused for the rule it breaks (403), not answered
 	// 503 because no node has room for it. The owner checks again.
@@ -228,7 +237,7 @@ func Prepare(w http.ResponseWriter, r *http.Request, svc *service.Service, req m
 		}
 		target, err := c.SelectPlacement(placementReq)
 		if err != nil {
-			if writeNoEgressGateway(w, err, writeError) {
+			if writeNoEgressGateway(w, err, writeError) || writePlacementUnsatisfiable(w, err, writeError) {
 				return Decision{}, false
 			}
 			if errors.Is(err, cluster.ErrArtifactNodeUnavailable) {
@@ -291,7 +300,7 @@ func Prepare(w http.ResponseWriter, r *http.Request, svc *service.Service, req m
 	}
 	target, recipients, err := c.SelectPlacementForCreate(CapacityRequestFromCreate(req), sandboxID, recipientBackups)
 	if err != nil {
-		if writeNoEgressGateway(w, err, writeError) {
+		if writeNoEgressGateway(w, err, writeError) || writePlacementUnsatisfiable(w, err, writeError) {
 			return Decision{}, false
 		}
 		if errors.Is(err, cluster.ErrArtifactNodeUnavailable) {
@@ -360,6 +369,11 @@ func Prepare(w http.ResponseWriter, r *http.Request, svc *service.Service, req m
 		if errors.Is(err, cluster.ErrNameConflict) {
 			service.RecordFacadeIdempotencyConflict(opts.metric("name"))
 			writeMsg(w, http.StatusConflict, "sandbox name already in use cluster-wide")
+			return Decision{}, false
+		}
+		// The leader re-checks the rule against the target's heartbeat; a
+		// refusal there is the same 409 the router would have given.
+		if writePlacementUnsatisfiable(w, err, writeError) {
 			return Decision{}, false
 		}
 		if errors.Is(err, cluster.ErrReservationConflict) {
@@ -809,7 +823,19 @@ func CapacityRequestFromCreate(req models.CreateSandboxRequest) capacity.Request
 		out.GPUs = want
 		out.GPUVendor = string(req.GPUs.Vendor)
 	}
+	out.Labels = req.Placement.RequiredLabels()
 	return out
+}
+
+// writePlacementUnsatisfiable answers a create whose placement rule no node
+// satisfies: 409 with a code and no Retry-After, since waiting does not give
+// a node a label (plans/placement-rules.md P1.4). Reports whether it wrote.
+func writePlacementUnsatisfiable(w http.ResponseWriter, err error, writeError ErrorWriter) bool {
+	if !errors.Is(err, cluster.ErrPlacementUnsatisfiable) {
+		return false
+	}
+	writeError(w, http.StatusConflict, models.ErrorCodePlacementUnsatisfiable, err.Error())
+	return true
 }
 
 func diskGBForCapacity(base int, runtimeName string, overlaySizeGB int) int {

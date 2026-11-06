@@ -347,6 +347,11 @@ func Classify(err error) Classification {
 		return Classification{Status: http.StatusBadGateway, RetryAfter: 5, Message: err.Error()}
 
 	// Capacity / placement.
+	// A placement rule no node satisfies: 409 with a code and no
+	// Retry-After, because waiting does not give a node a label
+	// (plans/placement-rules.md P1.4). The message names the rule.
+	case errors.Is(err, models.ErrPlacementUnsatisfiable):
+		return Classification{Status: http.StatusConflict, Code: models.ErrorCodePlacementUnsatisfiable, Message: truncate(err.Error())}
 	case errors.Is(err, capacity.ErrCapacityExceeded), errors.Is(err, cluster.ErrCapacityExceeded):
 		return Classification{Status: http.StatusServiceUnavailable, RetryAfter: cluster.CapacityRetryAfterSeconds, Message: truncate(err.Error()), LogLevel: slog.LevelInfo, Log: true}
 	case errors.Is(err, cluster.ErrCreateBackpressure):

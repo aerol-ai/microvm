@@ -772,6 +772,11 @@ type CreateSandboxRequest struct {
 	// is not supported with the gVisor runtime — the API returns an error if
 	// both GPUs and runtime="gvisor" are set.
 	GPUs *GPURequest `json:"gpus,omitempty"`
+	// Placement limits which nodes may run the sandbox: a zone and/or exact
+	// node labels (plans/placement-rules.md). It rides the replicated spec,
+	// so failover and recreate keep it. No node matching gives 409
+	// placement_unsatisfiable, never a quiet fallback.
+	Placement *PlacementRule `json:"placement,omitempty"`
 	// NetworkBytesInLimit caps lifetime ingress bytes for the sandbox. Zero
 	// means unlimited. When the cumulative counter crosses the limit, the
 	// reconcile loop installs an ingress DROP rule. The "we already paid for

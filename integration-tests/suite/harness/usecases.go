@@ -1027,6 +1027,10 @@ var Registry = []UseCase{
 	{ID: "UC-454", Title: "Toolbox dial retry gives up: a toolboxd refused for longer than the retry window fails the exec with 502 after the 1.4 s of retries (not at once, not minutes later), 4 connects were refused, and the command never ran", Requires: []Capability{CapDocker}, Excludes: []Capability{CapNoHostFirewall}, Implemented: true},
 	{ID: "UC-455", Title: "Create throughput benchmark: aerolvm-bench (built from this tree) runs 5 s at concurrency 2 against the live API, exits 0, reports creates per second and create times with 0 < p50 <= p90 <= p99 <= max and a sample per create, no failed create, and leaves none of its sandboxes (by its run tag, through the SDK)", Requires: []Capability{CapBenchmark}, Implemented: true},
 	{ID: "UC-456", Title: "Create throughput benchmark interrupted: one SIGINT to a long aerolvm-bench run holding its sandboxes waits for the creates in flight, deletes every sandbox the run made, reports interrupted with left_behind 0 and exits 0; the API lists none of the run's sandboxes", Requires: []Capability{CapBenchmark}, Implemented: true},
+	// Placement rules and team quotas (parity_placement_test.go; plan P1, P2).
+	{ID: "UC-438", Title: "Placement rules: GET /v1/cluster/members shows each node's zone and labels from its capacity heartbeat, and the zone is the node's zone label", Requires: []Capability{CapCluster}, Implemented: true},
+	{ID: "UC-439", Title: "Placement rules: creates with a zone land only on nodes in that zone, every time, and a create with one node's zone and labels lands on that node", Requires: []Capability{CapCluster}, Implemented: true},
+	{ID: "UC-440", Title: "Placement rules: a rule no node satisfies is refused with 409 placement_unsatisfiable naming the rule and no Retry-After, a malformed rule is a 400, and nothing is created", Implemented: true},
 }
 
 // byID is a lookup built once for the report generator.
