@@ -60,6 +60,7 @@ const getDocsSidebarConfig = (): NavigationGroup[] => [
       link('/using-daytona-sdk', '- Use the Daytona SDK'),
       link('/using-e2b-sdk', '- Use the E2B SDK'),
       link('/using-runloop-sdk', '- Use the Runloop SDK'),
+      link('/moving-from-agent-sandbox', '- Move from agent-sandbox'),
     ],
   },
   {
