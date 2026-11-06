@@ -639,28 +639,6 @@ Every entry was re-verified against `main` at `704c9e74` on 2026-10-06.
 
 ---
 
-## A token-gated port's Caddy route went missing for a moment (single node, Caddy routes)
-
-- **What:** on `single-node-fc` (per-sandbox Caddy routes, many tests in
-  parallel), UC-465's code-server port answered 401 to a visitor with no
-  token, then, a second later, Caddy's catch-all 404 "Sandbox not found" to
-  a visitor with a valid token cookie. The catch-all only matches a host
-  with no route, so the port's route was briefly gone. Issuing the token
-  does not touch routes (`internal/service/sandbox_tokens.go`).
-- **Seen once** (2026-11-06, build 813bce42). UC-426 (the same flow) passed
-  in the same run, and UC-465 passed on single-node-fc in the run before
-  and on every other scenario. The node was torn down before its logs were
-  read. UC-465 now retries only that catch-all answer, for up to 60 s,
-  and logs each retry, so a repeat shows in the report.
-- **Start:** look for a route delete and re-add on the Caddy routes path
-  (`pkg/caddy/client.go`) while another sandbox's route changes; the
-  ingress proxy routing mode (`SB_INGRESS_PROXY_ROUTING`, see "Ingress route
-  changes reset in-flight TLS connections" above) has no per-sandbox routes
-  and should not show it.
-- **Effort / priority:** S to investigate, P2.
-
----
-
 ## A cancelled warm-pool park can leave its slot's container (containerd)
 
 - **What:** the containerd warm pool's park path

@@ -340,22 +340,14 @@ func TestParityCodeServerImage(t *testing.T) {
 	})
 	tok := issueSandboxToken(t, ctx, sb, sdktypes.CreateSandboxTokenOptions{Port: 8080, ExpiresIn: "10m"})
 	cookie := map[string]string{"Cookie": "__Host-aerolvm-token=" + tok.Token}
-	// Only Caddy's own catch-all ("Sandbox not found", for a host with no
-	// route) is retried: on a single node with per-sandbox Caddy routes the
-	// port's route once went missing for a moment right after it had
-	// answered 401 (single-node-fc, 2026-11-06; TODOS.md). Any other
-	// answer fails at once.
-	recipesPoll(t, "health with the token cookie", 60*time.Second, func() (bool, string) {
-		st, got := recipesHTTP(t, http.MethodGet, health, cookie, nil)
-		if st == http.StatusNotFound && strings.Contains(got, "Sandbox not found") {
-			t.Logf("health with the token cookie hit the route-less fallback; retrying: %s", got)
-			return false, got
-		}
-		if st != http.StatusOK || !strings.Contains(got, `"status"`) {
-			t.Fatalf("health with the token cookie = %d %s", st, got)
-		}
-		return true, got
-	})
+	// No retry: Caddy's "Sandbox not found" here meant the reconcile sweep
+	// had deleted the gated port's route as a zombie (servers with
+	// per-sandbox Caddy routes, such as single-node-fc). The sweep now keeps
+	// it; TestGCZombieCaddyEntriesKeepsTokenGatedWakeRoutes guards that, and
+	// any answer but the health check fails here at once.
+	if st, got := recipesHTTP(t, http.MethodGet, health, cookie, nil); st != http.StatusOK || !strings.Contains(got, `"status"`) {
+		t.Fatalf("health with the token cookie = %d %s", st, got)
+	}
 }
 
 // agentRecipe is one coding-agent docs page (plan G9): its image, install
