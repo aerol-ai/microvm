@@ -93,6 +93,10 @@ release:
         - 7
     upgrade_from_min: v0.6.12
     version: v0.6.13
+restart_losers:
+    counted: true
+    isolate: 1
+    wasm: 2
 rollback_after_finalize: false
 skew:
     upgrade_from_min: v0.6.12
@@ -113,4 +117,5 @@ tiers:
       steps: 3
 warnings:
     - 'down nodes are skipped and upgraded when they come back; finalize waits for them: wkr-2'
+    - '2 WASM and 1 V8-isolate sandbox(es) run now: each node''s restart stops its WASM sandboxes and deletes its isolate sandboxes'
 --- stderr

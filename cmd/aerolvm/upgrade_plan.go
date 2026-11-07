@@ -10,7 +10,9 @@ import (
 	"text/tabwriter"
 	"time"
 
+	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/aerol-ai/microvm/pkg/release"
+	"github.com/aerol-ai/microvm/sdk/go/pkg/microvm"
 )
 
 // `aerolvm upgrade plan` (plans/kubectl-style-cluster-ops.md §6.1): what
@@ -29,7 +31,9 @@ var planRuntimes = [][2]string{
 	{"containerd, docker, gVisor sandboxes", "keep running; sandboxd adopts them again"},
 	{"Firecracker VMs", "keep running (moved out of sandboxd's cgroup first)"},
 	{"external-storage mounts", "keep serving (their helpers run in their own cgroup)"},
-	{"WASM and V8-isolate sandboxes", "may restart with sandboxd (not measured yet)"},
+	// Measured live (T14, single-node-wasm-isolate): neither survives.
+	{"WASM sandboxes", "STOP: marked stopped; `aerolvm start` keeps their files but may not run them again; passivatable ones fail their checkpoint"},
+	{"V8-isolate sandboxes", "are LOST: sandboxd deletes them when it starts again"},
 	{"toolboxd in running sandboxes", "the old one keeps running; new sandboxes get the new one"},
 	{"the node's sandboxd API", "down for a few seconds while sandboxd restarts"},
 	{"Caddy", "restarts only when its file changes"},
@@ -53,6 +57,18 @@ type upgradePlan struct {
 	Batch                 string            `json:"batch,omitempty"`
 	BatchSize             int               `json:"batch_size,omitempty"`
 	Tiers                 []planTier        `json:"tiers"`
+	RestartLosers         planLosers        `json:"restart_losers"`
+}
+
+// planLosers counts the sandboxes a node restart stops or loses (WASM and
+// V8 isolate, planRuntimes), so plan can say how many before anything runs.
+type planLosers struct {
+	WASM    int  `json:"wasm"`
+	Isolate int  `json:"isolate"`
+	Counted bool `json:"counted"`
+	// Capped is set when the count stopped at maxLoserPages pages: the
+	// numbers are then a lower bound.
+	Capped bool `json:"capped,omitempty"`
 }
 
 type planNode struct {
@@ -163,6 +179,7 @@ func runUpgradePlan(ctx context.Context, a *app, args []string) int {
 	}
 	fetch := a.releaseFetcher(c, releaseURL)
 	p.judge(ctx, fetch, set)
+	p.countLosers(countRestartLosers(ctx, a, c))
 	if format != "" {
 		a.printValue(format, p)
 	} else {
@@ -541,4 +558,63 @@ func (a *app) printPlan(p upgradePlan) {
 		return
 	}
 	fmt.Fprintf(a.stdout, "\nTo go ahead: aerolvm upgrade apply %s\n", p.Target)
+}
+
+// maxLoserPages bounds countRestartLosers' list pass: plan is a read-only
+// look, and a fleet of 100k sandboxes should not make it slow.
+const maxLoserPages = 40
+
+// countRestartLosers lists sandboxes once and counts the WASM and isolate
+// ones. Tests replace it.
+var countRestartLosers = func(ctx context.Context, a *app, c *commonFlags) (planLosers, error) {
+	tools, err := a.tools(ctx, c)
+	if err != nil {
+		return planLosers{}, err
+	}
+	var out planLosers
+	token := ""
+	seen := map[string]bool{}
+	for page := 0; ; page++ {
+		if page == maxLoserPages {
+			out.Capped = true
+			break
+		}
+		items, next, err := tools.Client().ListPage(ctx, token, microvm.WithLimit(sandboxListPage))
+		if err != nil {
+			return planLosers{}, err
+		}
+		for _, sb := range items {
+			switch sb.Runtime {
+			case models.RuntimeWasm:
+				out.WASM++
+			case models.RuntimeIsolate:
+				out.Isolate++
+			}
+		}
+		if next == "" || seen[next] {
+			break
+		}
+		seen[next] = true
+		token = next
+	}
+	out.Counted = true
+	return out, nil
+}
+
+// countLosers records the count and warns when a restart would stop or lose
+// any sandbox. A failed count is a warning too: plan never hides it.
+func (p *upgradePlan) countLosers(l planLosers, err error) {
+	if err != nil {
+		p.Warnings = append(p.Warnings, "could not count WASM and V8-isolate sandboxes ("+err.Error()+"); a node restart stops or loses them")
+		return
+	}
+	p.RestartLosers = l
+	if l.WASM+l.Isolate == 0 {
+		return
+	}
+	atLeast := ""
+	if l.Capped {
+		atLeast = "at least "
+	}
+	p.Warnings = append(p.Warnings, fmt.Sprintf("%s%d WASM and %d V8-isolate sandbox(es) run now: each node's restart stops its WASM sandboxes and deletes its isolate sandboxes", atLeast, l.WASM, l.Isolate))
 }

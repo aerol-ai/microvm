@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -161,6 +162,10 @@ type fakeUpgrade struct {
 	dropped    bool
 	nodeReqs   []upgradewire.NodeUpgradeRequest
 
+	// sandboxPages answers GET /v1/sandboxes, one page per call, with
+	// X-Cluster-List-Next-Page-Token pointing at the next; nil answers 404.
+	sandboxPages [][]map[string]any
+
 	// Cluster.
 	rollout *upgradewire.Rollout
 	advance bool
@@ -216,6 +221,16 @@ func (f *fakeUpgrade) serve(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case path == "/v1/cluster/members":
 		writeFakeJSON(w, http.StatusOK, map[string]any{"members": f.members})
+	case path == "/v1/sandboxes" && f.sandboxPages != nil:
+		page, _ := strconv.Atoi(r.URL.Query().Get("page_token"))
+		if page >= len(f.sandboxPages) {
+			writeFakeJSON(w, http.StatusOK, []any{})
+			return
+		}
+		if page+1 < len(f.sandboxPages) {
+			w.Header().Set("X-Cluster-List-Next-Page-Token", strconv.Itoa(page+1))
+		}
+		writeFakeJSON(w, http.StatusOK, f.sandboxPages[page])
 	case strings.HasPrefix(path, upgradewire.NodeUpgradeFilesPath+"/"):
 		if f.cluster {
 			f.refuse(w, http.StatusConflict, upgradewire.ErrCodeClusterMode, "this node runs in a cluster", "aerolvm upgrade apply <version>")

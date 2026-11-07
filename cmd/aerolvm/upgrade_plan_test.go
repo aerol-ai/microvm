@@ -23,6 +23,11 @@ func planHarness(t *testing.T, cluster bool, running string) (*harness, *fakeUpg
 func TestUpgradePlanCluster(t *testing.T) {
 	h, f, _ := planHarness(t, true, "v0.6.12")
 	stdFleet(f, "v0.6.12")
+	// Two pages: two WASM and one isolate sandbox among others.
+	f.sandboxPages = [][]map[string]any{
+		{{"id": "sb-1", "runtime": "wasm"}, {"id": "sb-2", "runtime": "docker"}},
+		{{"id": "sb-3", "runtime": "isolate"}, {"id": "sb-4", "runtime": "wasm"}, {"id": "sb-5", "runtime": "firecracker"}},
+	}
 	// wkr-2 is down; wkr-3 already runs the target; the leader is srv-a.
 	f.members[5]["alive"] = false
 	f.members[6]["version"] = "v0.6.13"
@@ -59,7 +64,8 @@ func TestUpgradePlanCluster(t *testing.T) {
 }
 
 func TestUpgradePlanSingleNodeAndRefusals(t *testing.T) {
-	h, _, r := planHarness(t, false, "v0.6.12")
+	h, f, r := planHarness(t, false, "v0.6.12")
+	f.sandboxPages = [][]map[string]any{{{"id": "sb-1", "runtime": "docker"}}}
 	code := h.run("upgrade", "plan", "v0.6.13")
 	if code != exitOK {
 		t.Fatal(h.stderr.String())
@@ -194,5 +200,48 @@ func TestStepChain(t *testing.T) {
 	}
 	if tierOf("") != tierServers || tierOf("mixed") != tierServers || tierOf("ingress") != tierIngress {
 		t.Fatal("tierOf")
+	}
+}
+
+// The count of sandboxes a restart stops or loses: paged, capped, and a
+// failed count is a warning, never silence.
+func TestUpgradePlanCountsRestartLosers(t *testing.T) {
+	var p upgradePlan
+	p.countLosers(planLosers{}, errors.New("boom"))
+	if len(p.Warnings) != 1 || !strings.Contains(p.Warnings[0], "could not count") {
+		t.Fatalf("warnings = %v", p.Warnings)
+	}
+	p = upgradePlan{}
+	p.countLosers(planLosers{Counted: true}, nil)
+	if len(p.Warnings) != 0 || !p.RestartLosers.Counted {
+		t.Fatalf("none: %+v", p)
+	}
+	p = upgradePlan{}
+	p.countLosers(planLosers{WASM: 3, Isolate: 1, Counted: true, Capped: true}, nil)
+	if len(p.Warnings) != 1 || !strings.HasPrefix(p.Warnings[0], "at least 3 WASM and 1 V8-isolate") {
+		t.Fatalf("capped: %v", p.Warnings)
+	}
+
+	// Against the fake: the cap stops a list that never ends.
+	h, f, _ := planHarness(t, true, "v0.6.12")
+	stdFleet(f, "v0.6.12")
+	pages := make([][]map[string]any, maxLoserPages+5)
+	for i := range pages {
+		pages[i] = []map[string]any{{"id": "w", "runtime": "wasm"}}
+	}
+	f.sandboxPages = pages
+	if code := h.run("upgrade", "plan", "v0.6.13", "-o", "json"); code != exitOK {
+		t.Fatal(h.stderr.String())
+	}
+	var got upgradePlan
+	h.jsonOut(&got)
+	if !got.RestartLosers.Capped || got.RestartLosers.WASM != maxLoserPages {
+		t.Fatalf("capped count = %+v", got.RestartLosers)
+	}
+	// No list route: the plan still prints, with the warning.
+	h2, f2, _ := planHarness(t, true, "v0.6.12")
+	stdFleet(f2, "v0.6.12")
+	if code := h2.run("upgrade", "plan", "v0.6.13"); code != exitOK || !strings.Contains(h2.stdout.String(), "could not count WASM and V8-isolate sandboxes") {
+		t.Fatalf("no list = %d %q", code, h2.stdout.String())
 	}
 }

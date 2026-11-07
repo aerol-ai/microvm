@@ -18,13 +18,15 @@ What a running sandbox sees while sandboxd restarts, on every node:
   containerd, docker, gVisor sandboxes   keep running; sandboxd adopts them again
   Firecracker VMs                        keep running (moved out of sandboxd's cgroup first)
   external-storage mounts                keep serving (their helpers run in their own cgroup)
-  WASM and V8-isolate sandboxes          may restart with sandboxd (not measured yet)
+  WASM sandboxes                         STOP: marked stopped; `aerolvm start` keeps their files but may not run them again; passivatable ones fail their checkpoint
+  V8-isolate sandboxes                   are LOST: sandboxd deletes them when it starts again
   toolboxd in running sandboxes          the old one keeps running; new sandboxes get the new one
   the node's sandboxd API                down for a few seconds while sandboxd restarts
   Caddy                                  restarts only when its file changes
 
 Warnings:
   - a single node's API is down while sandboxd restarts; its sandboxes keep running
+  - could not count WASM and V8-isolate sandboxes (no route); a node restart stops or loses them
 
 Refused:
   - v0.6.14 can't be reached straight from v0.6.10 (it needs v0.6.13 or later); step through v0.6.11, then v0.6.12, then v0.6.13, then v0.6.14

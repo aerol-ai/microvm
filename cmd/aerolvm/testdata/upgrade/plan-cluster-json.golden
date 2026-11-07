@@ -117,7 +117,8 @@ exit 0
   ],
   "allowed": true,
   "warnings": [
-    "down nodes are skipped and upgraded when they come back; finalize waits for them: wkr-2"
+    "down nodes are skipped and upgraded when they come back; finalize waits for them: wkr-2",
+    "2 WASM and 1 V8-isolate sandbox(es) run now: each node's restart stops its WASM sandboxes and deletes its isolate sandboxes"
   ],
   "skew": {
     "upgrade_from_min": "v0.6.12"
@@ -149,6 +150,11 @@ exit 0
       "steps": 3,
       "estimate": "about 3 min"
     }
-  ]
+  ],
+  "restart_losers": {
+    "wasm": 2,
+    "isolate": 1,
+    "counted": true
+  }
 }
 --- stderr
