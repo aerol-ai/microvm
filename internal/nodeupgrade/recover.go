@@ -23,8 +23,10 @@ type RecoverResult struct {
 // (§6.3, "a reboot mid-swap"): an op whose new files are all in place is
 // marked done, and any other has the files it already swapped put back and
 // is marked failed, so a node never runs a half-swapped set. An op whose
-// upgrader still holds the lock is left to it. It never restores a
-// database backup: it cannot tell what the new binary did.
+// upgrader still holds the lock is left to it. It restores a database
+// backup only on a single node, when the files going back could not open
+// the database otherwise (oneway.go); in a cluster it cannot tell what the
+// new binary's boot work already did.
 func Recover(ctx context.Context, stateDir string, host Host, out io.Writer) ([]RecoverResult, error) {
 	if _, err := os.Stat(stateDir); err != nil {
 		if os.IsNotExist(err) {
@@ -81,7 +83,7 @@ func (u *Upgrader) resolve(ctx context.Context, st *State) (bool, error) {
 		if st.HostApply == HostApplyPending {
 			u.logf("warning: upgrade op %s finished at boot without its host setup; run `sudo sandboxd host apply` and restart sandboxd", st.Op)
 		}
-		st.Phase, st.Result = PhaseDone, ResultCompletedAtBoot
+		st.Phase, st.Result, st.RestoreStarted = PhaseDone, ResultCompletedAtBoot, false
 		u.logf("upgrade op %s to %s was interrupted at %s with every new file in place; marked done", st.Op, st.Version, phase)
 	} else {
 		// A revert under way is carried on; anything else short of every
@@ -106,6 +108,22 @@ func (u *Upgrader) resolve(ctx context.Context, st *State) (bool, error) {
 			f.Swapped = false
 			if f.Role == roleSandboxd {
 				revertedSandboxd = true
+			}
+		}
+		// The files going back need a database they can open (oneway.go):
+		// a single-node rollback that put an older backup in place needs
+		// the database as the op found it, and a single-node upgrade whose
+		// new binary ran one-way migrations needs the backup.
+		restore := st.RestoreStarted
+		if !restore && !st.Rollback && !st.BackupRestored && st.BackupPath != "" {
+			restore = len(u.singleNodeOneWaySince(ctx, st, st.BackupPath, st.DBPath)) > 0
+		}
+		if restore && st.BackupPath != "" && st.DBPath != "" {
+			if err := restoreBackup(st.BackupPath, st.DBPath); err != nil {
+				problems = append(problems, fmt.Errorf("restore %s: %w", st.BackupPath, err))
+			} else {
+				st.BackupRestored, st.RestoreStarted = true, false
+				u.logf("upgrade op %s: restored the database from %s", st.Op, st.BackupPath)
 			}
 		}
 		// Services restarted onto the new files run them; restart them

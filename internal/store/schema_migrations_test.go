@@ -494,3 +494,33 @@ func TestSchemaMigrationsClosedStore(t *testing.T) {
 		t.Fatal("PendingOneWayMigrations on a closed store succeeded")
 	}
 }
+
+// AppliedOneWayMigrations reads the record: the finalize-gated one-way
+// numbers, whoever wrote them, never the legacy steps or n1Safe ones. The
+// node upgrader diffs a database and its backup through it.
+func TestAppliedOneWayMigrations(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "state.db")
+	raw := rawDB(t, path)
+	if got, err := AppliedOneWayMigrations(ctx, raw); err != nil || len(got) != 0 || got == nil {
+		t.Fatalf("no table = %#v, %v; want an empty list", got, err)
+	}
+	st, err := openWith(path, nil, nil)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	_ = st.Close()
+	for number, n1Safe := range map[int]bool{legacyMigrationBaseline + 7: false, legacyMigrationBaseline + 1: true, legacyMigrationBaseline + 2: false} {
+		if _, err := raw.Exec(`INSERT INTO schema_migrations (number, name, n1_safe, applied_at) VALUES (?, 'newer', ?, CURRENT_TIMESTAMP)`, number, n1Safe); err != nil {
+			t.Fatalf("seed %d: %v", number, err)
+		}
+	}
+	got, err := AppliedOneWayMigrations(ctx, raw)
+	if err != nil || !slices.Equal(got, []int{legacyMigrationBaseline + 2, legacyMigrationBaseline + 7}) {
+		t.Fatalf("AppliedOneWayMigrations = %v, %v", got, err)
+	}
+	_ = raw.Close()
+	if _, err := AppliedOneWayMigrations(ctx, raw); err == nil {
+		t.Fatal("a closed database answered")
+	}
+}

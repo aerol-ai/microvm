@@ -51,6 +51,10 @@ type fakeHost struct {
 	nextPID    int
 	cgroup     string
 	hostApply  func() ([]byte, error)
+	// openStore, when set, is the started binary opening its database
+	// (content is the binary's file); false means it refused the database
+	// and died before its marker, as on ErrSchemaFromNewerRelease.
+	openStore func(content string) bool
 }
 
 func newFakeHost(t *testing.T, p *Paths) *fakeHost {
@@ -105,6 +109,9 @@ func (h *fakeHost) boot() {
 	h.running = ""
 	if strings.Contains(content, "BROKEN") {
 		return // dies before its store opens
+	}
+	if h.openStore != nil && !h.openStore(content) {
+		return
 	}
 	_ = WriteStoreOpenedMarker(h.paths.DBPath, binaryVersion(content))
 	if strings.Contains(content, "UNHEALTHY") {

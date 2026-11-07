@@ -68,6 +68,18 @@ type State struct {
 	BackupPath string `json:"backup_path,omitempty"`
 	// BackupRestored is true when the failure path put it back.
 	BackupRestored bool `json:"backup_restored,omitempty"`
+	// SingleNode records that cluster mode was off when the op began, so
+	// the one-way migration rules (oneway.go) apply to it at failure and
+	// at boot recovery alike. DBPath is the database the op worked on.
+	SingleNode bool   `json:"single_node,omitempty"`
+	DBPath     string `json:"db_path,omitempty"`
+	// RestoreBackup is the backup a single-node rollback puts back before
+	// the older binary starts (one-way migrations ran since it was taken).
+	// RestoreStarted is saved just before that restore: from then on a
+	// failure, here or at boot, puts BackupPath back, the database as this
+	// op found it.
+	RestoreBackup  string `json:"restore_backup,omitempty"`
+	RestoreStarted bool   `json:"restore_started,omitempty"`
 	// HostApply is not-needed, skipped, pending or done; HostSetupSHA256 is
 	// the target's install.sh hash from its release.json.
 	HostApply       string `json:"host_apply,omitempty"`

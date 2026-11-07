@@ -295,6 +295,28 @@ func (s *Store) PendingOneWayMigrations(ctx context.Context) ([]int, error) {
 	return pending, nil
 }
 
+// AppliedOneWayMigrations lists the finalize-gated one-way migrations
+// recorded on db, sorted: numbers above the legacy steps whose record says
+// not n1Safe. It reads the record, not this build's list, so it also
+// answers for a database a newer build migrated. The node upgrader
+// compares a database with its backup through it: a number the backup
+// lacks is a one-way change made since, which an older build that does
+// not know it refuses (ErrSchemaFromNewerRelease).
+func AppliedOneWayMigrations(ctx context.Context, db *sql.DB) ([]int, error) {
+	applied, err := appliedSchemaMigrations(ctx, db)
+	if err != nil {
+		return nil, err
+	}
+	out := []int{}
+	for number, n1Safe := range applied {
+		if number > legacyMigrationBaseline && !n1Safe {
+			out = append(out, number)
+		}
+	}
+	slices.Sort(out)
+	return out, nil
+}
+
 // OneWayMigrations lists the numbers of this build's one-way migrations
 // that wait for finalize (newer than legacyMigrationBaseline and not
 // n1Safe). release.json carries it as one_way_migrations.

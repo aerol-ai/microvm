@@ -142,13 +142,15 @@ func (u *Upgrader) Run(ctx context.Context, req Request) (*State, error) {
 
 	now := u.now().UTC()
 	st := &State{
-		Format:    stateFormat,
-		Op:        req.Op,
-		Version:   req.Version,
-		Rollback:  req.Rollback,
-		Phase:     PhaseStaging,
-		WasActive: u.Host.UnitActive(ctx, sandboxdUnit),
-		StartedAt: now,
+		Format:     stateFormat,
+		Op:         req.Op,
+		Version:    req.Version,
+		Rollback:   req.Rollback,
+		Phase:      PhaseStaging,
+		WasActive:  u.Host.UnitActive(ctx, sandboxdUnit),
+		SingleNode: u.singleNode(),
+		DBPath:     u.Paths.DBPath,
+		StartedAt:  now,
 	}
 	files, rolledBack, err := u.fileSet(req, specs)
 	if err != nil {
@@ -210,6 +212,9 @@ func (u *Upgrader) Run(ctx context.Context, req Request) (*State, error) {
 		return u.failEarly(st, err)
 	}
 	u.planServices(ctx, st, meta, rolledBack)
+	if err := u.planRollbackRestore(ctx, st, rolledBack); err != nil {
+		return u.failEarly(st, err)
+	}
 	if err := u.save(st); err != nil {
 		return nil, err
 	}
@@ -696,6 +701,23 @@ func (u *Upgrader) apply(ctx context.Context, st *State, stageDir string, req Re
 		st.BackupPath = dest
 		u.logf("backed up %s to %s in %s", u.Paths.DBPath, dest, u.now().Sub(start).Round(time.Millisecond))
 	}
+	if st.RestoreBackup != "" {
+		// Before the swap: a crash from here on, with sandboxd not yet
+		// swapped, is reverted at boot by the newer binary, which puts
+		// BackupPath back with the files (resolve).
+		if st.BackupPath == "" {
+			return u.revert(st, errors.New("no backup of the current database was taken, so the rollback cannot put an older one in its place"), p)
+		}
+		st.RestoreStarted = true
+		if err := u.save(st); err != nil {
+			return u.revert(st, err, p)
+		}
+		if err := restoreBackup(st.RestoreBackup, u.Paths.DBPath); err != nil {
+			return u.revert(st, fmt.Errorf("put back the database backup %s: %w", st.RestoreBackup, err), p)
+		}
+		u.at("restored")
+		u.logf("put back the database backup %s, from before the one-way schema migrations %s cannot open", st.RestoreBackup, st.Version)
+	}
 
 	st.Phase = PhaseSwapping
 	if err := u.save(st); err != nil {
@@ -772,7 +794,8 @@ func (u *Upgrader) apply(ctx context.Context, st *State, stageDir string, req Re
 			u.logf("warning: %v", err)
 		}
 	}
-	st.Phase, st.Result = PhaseDone, ResultUpgraded
+	// The older database a rollback put back is the one in use now.
+	st.Phase, st.Result, st.RestoreStarted = PhaseDone, ResultUpgraded, false
 	if err := u.save(st); err != nil {
 		return st, err
 	}
@@ -826,6 +849,12 @@ func orAny(v string) string {
 // secret outbox may already have reached peers, and the previous binary
 // reads the database as it is (only n1_safe migrations run before
 // finalize, CEO D16). A rollback never restores a backup (§6.8).
+//
+// A single node (cluster mode off) is the exception (oneway.go): it has no
+// peers, and it runs one-way migrations at boot, so when they ran since the
+// backup the backup goes back too, or the previous binary could not open
+// the database. A single-node rollback that put an older backup in place
+// puts the database as it found it back.
 func (u *Upgrader) revert(st *State, cause error, p progress) (*State, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), revertTimeout)
 	defer cancel()
@@ -842,10 +871,24 @@ func (u *Upgrader) revert(st *State, cause error, p progress) (*State, error) {
 		}
 	}
 	restoreDB := p.started && !st.Rollback && st.BackupPath != ""
+	why := "the new sandboxd never opened its store"
 	if restoreDB {
 		if _, err := os.Stat(StoreOpenedMarkerPath(u.Paths.DBPath)); err == nil {
 			restoreDB = false
+			// A single node has no peers to have reached, and the
+			// previous binary refuses one-way migrations it does not know
+			// (oneway.go).
+			if since := u.singleNodeOneWaySince(ctx, st, st.BackupPath, u.Paths.DBPath); len(since) > 0 {
+				restoreDB = true
+				why = fmt.Sprintf("one-way schema migrations %v ran since it was taken, which %s cannot open", since, orAny(st.FromVersion))
+			}
 		}
+	}
+	if st.RestoreStarted && st.BackupPath != "" {
+		// This rollback put an older backup in place: put back the
+		// database as the op found it, for the binary going back in.
+		restoreDB = true
+		why = "the rollback had put an older backup in its place"
 	}
 	for i := len(swapOrder) - 1; i >= 0; i-- {
 		f := st.file(swapOrder[i])
@@ -862,8 +905,8 @@ func (u *Upgrader) revert(st *State, cause error, p progress) (*State, error) {
 		if err := restoreBackup(st.BackupPath, u.Paths.DBPath); err != nil {
 			problems = append(problems, fmt.Errorf("restore %s: %w", st.BackupPath, err))
 		} else {
-			st.BackupRestored = true
-			u.logf("restored the database from %s: the new sandboxd never opened its store", st.BackupPath)
+			st.BackupRestored, st.RestoreStarted = true, false
+			u.logf("restored the database from %s: %s", st.BackupPath, why)
 		}
 	}
 	if st.GatewayRestarted {

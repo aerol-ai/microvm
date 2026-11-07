@@ -102,7 +102,8 @@ type storeOpened struct {
 // binary; if the new binary then fails and left no marker, nothing past the
 // store ran and restoring the backup taken before the swap loses nothing.
 // With a marker, boot work may already have reached peers, so the backup is
-// never restored (§6.3 step 9).
+// never restored (§6.3 step 9), except on a single node whose boot ran
+// one-way migrations the previous binary cannot read (oneway.go).
 func WriteStoreOpenedMarker(dbPath, version string) error {
 	data, err := json.Marshal(storeOpened{Version: version, PID: os.Getpid(), At: time.Now().UTC()})
 	if err != nil {
