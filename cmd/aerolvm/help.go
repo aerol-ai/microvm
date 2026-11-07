@@ -150,7 +150,8 @@ One argument after -- runs as a shell command line ("make test | tail");
 several are quoted and joined. Exit code: the command's own, 128+n if a
 signal killed it, 124 on --timeout, 125 if aerolvm itself failed.
 
-For an interactive shell, use "aerolvm shell" instead.
+For an interactive shell, use "aerolvm shell" instead. "exec -it <sandbox>"
+with no command does the same, as kubectl exec -it does.
 
 Stdin is forwarded when it is not a terminal (echo x | aerolvm exec sb -- cat).
 Some agent harnesses leave stdin open forever; pass --no-stdin there or a
