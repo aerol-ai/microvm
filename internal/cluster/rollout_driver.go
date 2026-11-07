@@ -277,8 +277,14 @@ func (d *rolloutDriver) adoptMembers(ctx context.Context, r *RolloutRecord, memb
 			n.State = upgradewire.NodeDone
 		}
 		n.WasCordoned = d.host.drained()[id]
-		if _, err := d.host.nodeUpdate(ctx, RolloutNodeUpdate{RolloutID: r.ID, NodeID: id, Add: n}); err != nil {
+		res, err := d.host.nodeUpdate(ctx, RolloutNodeUpdate{RolloutID: r.ID, NodeID: id, Add: n})
+		if err != nil {
 			d.warnf("cluster: rollout could not add a new member", "rollout_id", r.ID, "node_id", id, "err", err)
+			continue
+		}
+		if !res.Changed {
+			// Refused: deleted since gossip last saw it, or the rollout
+			// changed. Nothing to cordon.
 			continue
 		}
 		if n.State == upgradewire.NodePending && !n.WasCordoned {

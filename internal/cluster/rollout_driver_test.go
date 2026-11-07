@@ -983,6 +983,57 @@ func TestRolloutDriverResendKeepsQuorum(t *testing.T) {
 	}
 }
 
+// hookedNodes runs onApply inside a node's apply call, before it answers.
+type hookedNodes struct {
+	*fakeNodes
+	onApply func(m Member) error
+}
+
+func (h *hookedNodes) Step(ctx context.Context, m Member, req UpgradeStepRequest) (UpgradeStepResponse, error) {
+	if req.Step == UpgradeStepApply && h.onApply != nil {
+		if err := h.onApply(m); err != nil {
+			return UpgradeStepResponse{}, err
+		}
+	}
+	return h.fakeNodes.Step(ctx, m, req)
+}
+
+// R4 with R12: a stop and a rollback land while an apply call is out. The
+// node's answer (a refusal because the record moved on, or a real error)
+// then belongs to a pass that is over: it fails nothing, and the node is
+// followed from the record and rolled back.
+func TestRolloutDriverApplyAnswerAfterRollbackFailsNothing(t *testing.T) {
+	for name, answer := range map[string]error{
+		"refused, the record moved on": &UpgradeStepError{Status: http.StatusForbidden, Code: upgradeCodeNotInRecord, Reason: "rollout r1 is a rollback"},
+		"a real error":                 &UpgradeStepError{Status: http.StatusUnprocessableEntity, Reason: "get sandboxd: no server holds it"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			g := newRolloutRig(t, 1, 0, 2)
+			hooked := &hookedNodes{fakeNodes: g.nodes}
+			hooked.onApply = func(m Member) error {
+				if m.NodeID != "w1" || g.host.rollout().Direction == upgradewire.DirectionRollback {
+					return nil
+				}
+				g.host.event(context.Background(), RolloutCommand{Event: evStop, RolloutID: "r1"})
+				g.host.event(context.Background(), RolloutCommand{Event: evRollback, RolloutID: "r1"})
+				return answer
+			}
+			g.driver = newRolloutDriver(g.host, hooked, nil)
+			g.driver.inline, g.driver.applyResendAfter = true, time.Hour
+			g.start(func(r *RolloutRecord) { r.AllowDowntime = true; r.Batch = "1" })
+			g.run(upgradewire.StateRollingBack)
+			if n := g.host.rollout().Nodes["w1"]; n.State != upgradewire.NodeUpgrading {
+				t.Fatalf("the answer of an earlier pass moved w1: %+v", n)
+			}
+			g.host.advance(3 * time.Minute)
+			r := g.run(upgradewire.StateRolledBack)
+			if g.nodes.nodes["w1"].applies != 0 || r.Nodes["w1"].State != upgradewire.NodeDone {
+				t.Fatalf("w1: %d applies, %s", g.nodes.nodes["w1"].applies, describeNodes(r))
+			}
+		})
+	}
+}
+
 // gatedNodes holds every worker's stage call until gate closes, and counts
 // the calls in flight.
 type gatedNodes struct {
@@ -1111,6 +1162,24 @@ func (g *rolloutRig) deleteNode(id string) {
 	}
 	if e, ok := g.fsm.Apply(&raft.Log{Index: idx, Data: data}).(error); ok {
 		g.t.Fatal(e)
+	}
+}
+
+// R3: a node deleted while the leader's gossip view still shows it alive is
+// refused by the FSM when the leader tries to adopt it, and nothing else
+// happens: it is not cordoned and not counted as joined.
+func TestRolloutDriverDoesNotAdoptADeletedNode(t *testing.T) {
+	g := newRolloutRig(t, 1, 0, 1)
+	g.start(func(r *RolloutRecord) { r.AllowDowntime = true; r.Hold = true })
+	g.host.memberM["w7"] = Member{NodeID: "w7", Role: "worker", Alive: true, Version: "v1"}
+	g.nodes.nodes["w7"] = &fakeNode{version: "v1"}
+	g.deleteNode("w7")
+	g.host.memberM["w7"] = Member{NodeID: "w7", Role: "worker", Alive: true, Version: "v1"} // gossip lags the delete
+	if g.driver.adoptMembers(context.Background(), g.host.rollout(), g.host.members()) {
+		t.Fatal("a deleted node counted as joined")
+	}
+	if r := g.host.rollout(); r.Nodes["w7"] != nil || g.host.drain["w7"] {
+		t.Fatalf("deleted node adopted: %s, cordoned %v", describeNodes(r), g.host.drain["w7"])
 	}
 }
 
