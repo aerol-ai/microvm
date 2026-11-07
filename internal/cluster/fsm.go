@@ -60,7 +60,8 @@ const (
 	// ops (fsm_tokens.go); 33/34 are the warm-pool ops (fsm_warm_pools.go);
 	// 35-37 are the identity ops (fsm_identity.go); 38/39 are the team-quota
 	// ops (fsm_team_quotas.go); 40/41 are the volume-reclaim ops
-	// (fsm_volume_reclaims.go). The next free code is 42.
+	// (fsm_volume_reclaims.go); 42 is opDenyNode (fsm_node_deny.go). The
+	// next free code is 43.
 	opRegisterSnapshotNode opCode = 29 // record which node holds a snapshot's image (name → node, cluster-wide)
 	opForgetSnapshotNode   opCode = 30 // drop a snapshot's name → node entry (on delete / node death)
 )
@@ -257,6 +258,8 @@ type command struct {
 	// (deletedLifecycleFenceFSMOpsVersion), so a mixed-version server tier
 	// never splits on one entry.
 	RefuseDeletedLifecycle bool `json:"refuse_deleted_lifecycle,omitempty"`
+	// NodeDeny carries the deleted node for opDenyNode (fsm_node_deny.go).
+	NodeDeny *NodeDenyRecord `json:"node_deny,omitempty"`
 }
 
 type reservationCommand struct {
@@ -615,6 +618,11 @@ type placementFSM struct {
 	// identity is the cloud-identity signing keys and role allow lists
 	// (fsm_identity.go, snapshotted). nil until the first write.
 	identity *identityState
+	// deniedNodes are the deleted node IDs (fsm_node_deny.go, snapshotted).
+	// deniedNodesVersion is the Raft index of the last change to them, the
+	// cursor workers poll with.
+	deniedNodes        map[string]NodeDenyRecord
+	deniedNodesVersion uint64
 
 	// subMu guards subscribers. Separate from mu so a slow subscriber accept
 	// can't block FSM reads — Apply takes mu briefly to write, releases it,
@@ -718,6 +726,7 @@ func newPlacementFSMWithRecoveryStore(store placementRecoveryStore) *placementFS
 		teamUsageEntries:             make(map[string]teamUsageEntry),
 		tokens:                       newAPITokenState(),
 		warmPools:                    make(map[string]*WarmPoolRecord),
+		deniedNodes:                  make(map[string]NodeDenyRecord),
 	}
 }
 
@@ -2003,6 +2012,12 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 			return err
 		}
 		return nil
+	case opDenyNode:
+		result, err := f.applyDenyNodeLocked(cmd, log.Index)
+		if err != nil {
+			return err
+		}
+		return result
 	case opAckVolumeReclaim:
 		if err := f.applyAckVolumeReclaimLocked(cmd); err != nil {
 			return err
@@ -3942,6 +3957,11 @@ type fsmSnapshotPayload struct {
 	// because no entry is written until every server runs a build with it
 	// (volumeReclaimFSMOpsVersion).
 	VolumeReclaims []VolumeReclaim
+	// DeniedNodes are the deleted node IDs. Optional; an older snapshot
+	// decodes it as nil, which reads as "none denied". An older build ignores
+	// the field, which is safe because no record is written until every
+	// server runs a build with it (nodeDenyFSMOpsVersion).
+	DeniedNodes []NodeDenyRecord
 }
 
 type placementSnapshotRow struct {
@@ -4027,6 +4047,7 @@ func (f *placementFSM) Snapshot() (raft.FSMSnapshot, error) {
 		warmPools:          f.warmPoolsSnapshotLocked(),
 		identityKeys:       identityKeys,
 		identityRoles:      identityRoles,
+		deniedNodes:        f.deniedNodesSnapshotLocked(),
 		recoveryStore:      f.recoveryStore,
 		recoveryRefs:       recoveryRefs,
 		guard:              beginRecoverySnapshot(f.recoveryStore),
@@ -4128,6 +4149,7 @@ func (f *placementFSM) Restore(rc io.ReadCloser) (err error) {
 	f.apiTokens().restore(payload.APITokens, payload.Version)
 	f.restoreWarmPoolsLocked(payload.WarmPools, payload.Version)
 	f.restoreIdentityLocked(payload.IdentityKeys, payload.IdentityRoles)
+	f.restoreDeniedNodesLocked(payload.DeniedNodes, payload.Version)
 	f.auditACLs = make(map[string]AuditACL, len(payload.AuditACLs))
 	f.auditACLLatest = make(map[string]string)
 	f.auditACLBySandbox = make(map[string]map[string]struct{})
@@ -4286,6 +4308,7 @@ type fsmSnapshot struct {
 	identityKeys       *cloudidentity.KeySet
 	identityRoles      []IdentityRoleRecord
 	teamQuotas         []TeamQuotaRecord
+	deniedNodes        []NodeDenyRecord
 	recoveryStore      placementRecoveryStore
 	recoveryRefs       []string
 	// guard is the store's Put tracking this snapshot began; Release ends
@@ -4329,6 +4352,7 @@ func (s *fsmSnapshot) Persist(sink raft.SnapshotSink) (err error) {
 		IdentityKeys:       s.identityKeys,
 		IdentityRoles:      s.identityRoles,
 		TeamQuotas:         s.teamQuotas,
+		DeniedNodes:        s.deniedNodes,
 	}); err != nil {
 		_ = sink.Cancel()
 		return fmt.Errorf("fsmSnapshot: encode: %w", err)

@@ -1519,6 +1519,12 @@ func (c *Cluster) ApplyEncoded(ctx context.Context, payload []byte) error {
 	if err := validateCommandLifecycle(cmd); err != nil {
 		return err
 	}
+	if cmd.Op == opDenyNode {
+		// Only this leader's node-delete path writes a deny record, after
+		// its upgrade gate (writeNodeDeny). A peer's raw forward could carry
+		// the op past that gate, or deny another node outright.
+		return errDenyNodeNotForwardable
+	}
 	if isRawObligationReport(cmd) {
 		c.obligations.add(cmd.ObligationReports)
 		return nil

@@ -31,7 +31,7 @@ const (
 // it once per release that adds such a feature, and give the feature its
 // own constant naming the version that introduced it.
 const (
-	fsmOpsVersion              = 11
+	fsmOpsVersion              = 12
 	egressProfileFSMOpsVersion = 1 // opPutEgressProfile, opDeleteEgressProfile
 	// auditCallerFSMOpsVersion: audit records carry a hash-covered caller
 	// field (AuditCallerWritesAllowed).
@@ -69,7 +69,8 @@ const (
 // fsm_team_quotas.go); 10 is the delete_with_sandbox volume reclaim ledger
 // (volumeReclaimFSMOpsVersion in fsm_volume_reclaims.go); 11 is the
 // deleted-lifecycle fence on opPlace (deletedLifecycleFenceFSMOpsVersion in
-// deleted_lifecycle.go). Versions 6 to 8 are the gates in the block above.
+// deleted_lifecycle.go); 12 is the node deny records (nodeDenyFSMOpsVersion
+// in fsm_node_deny.go). Versions 6 to 8 are the gates in the block above.
 
 // FSMOpsVersion returns fsmOpsVersion, so `sandboxd version` can print it
 // without a cluster: an operator compares it across nodes before and during
