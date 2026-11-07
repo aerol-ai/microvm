@@ -271,6 +271,31 @@ UC-630..634 as PASS or FAIL:
 integration-tests/run.sh cluster-join-adopt --adopt-from v0.6.11
 ```
 
+## Release gate: Terraform used by URL
+
+Terraform/ is a module; every scenario runs it through `Terraform/root`,
+the root a checkout runs (`run.sh` `tf_root`). `plans/kubectl-style-cluster-ops.md`
+Phase 5 asks for a cluster built with the module used by URL, with no
+checkout behind it. A scenario with the `module-url` capability gets that:
+`run.sh` makes a root of its own under `.tf/<scenario>/root` (only `.tf`
+files) whose module block fetches `Terraform/` by git URL, and leaves the
+join to the module's default (one line per node). The URL is
+`AEROL_TF_MODULE_SOURCE` when set (for example the real
+`git::https://github.com/aerol-ai/microvm//Terraform?ref=<tag>` after a
+release), or else a bare clone of this branch's **committed** head, so
+commit `Terraform/` changes before a run.
+
+`cluster-module-url` (3 servers, the seed is `server,ingress`, 1 worker and
+1 blank machine, t3.medium) runs UC-683..687 (`TestModuleURL*`): the module
+came by URL, every node joined with one line, `aerolvm get nodes` shows
+every node Ready, a sandbox answers exec, the module's three tokens are
+registered, and the line `aerolvm join-command` prints adds the blank
+machine as a worker:
+
+```bash
+AEROL_TEST_RUN='TestModuleURL' integration-tests/run.sh cluster-module-url
+```
+
 ## Key custody scenarios
 
 Customer key custody (`plans/customer-key-custody.md` Phase 6) has five

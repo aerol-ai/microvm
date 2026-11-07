@@ -290,6 +290,11 @@ const (
 	// servers sign certs with SB_CLUSTER_NODE_CERT_TTL=10m so renewal is
 	// seen in a run. Gates UC-620..625.
 	CapOneLineJoin Capability = "one-line-join"
+	// CapModuleURL: the scenario provisions through a root of its own whose
+	// module block fetches Terraform/ by git URL (run.sh
+	// prepare_module_root), not through Terraform/root, and leaves the join
+	// to the module's default: one line per node. Gates UC-683..687.
+	CapModuleURL Capability = "module-url"
 )
 
 // UseCase is one row of the coverage matrix.
@@ -342,6 +347,7 @@ var KnownCapabilities = map[Capability]bool{
 	CapKeyCustodyVault: true, CapKeyCustodyPKCS11: true, CapKeyCustodyKMSWrapped: true,
 	CapKeyCustodyKMSSwitch: true, CapKeyCustodySingleWrapped: true,
 	CapAPILoadBalancer: true, CapAPIListFairness: true, CapClusterChaos: true, CapOneLineJoin: true,
+	CapModuleURL: true,
 }
 
 // Registry is the full use-case catalogue. Order is the matrix row order.
@@ -1135,6 +1141,14 @@ var Registry = []UseCase{
 	{ID: "UC-680", Title: "sandboxd backup then sandboxd restore on a single node: the archive is 0600 and its manifest says VACUUM INTO; restore refuses while sandboxd runs; after stop, restore --start, sandboxd is healthy, a sandbox and a snapshot from before the backup are back and work (exec, create from the snapshot), and a sandbox and a snapshot made after the backup are gone", Excludes: []Capability{CapCluster}, Implemented: true},
 	{ID: "UC-681", Title: "sandboxd backup of a state.db near 1 GiB built from the node's own schema on the node's disk: the VACUUM INTO time (what an upgrade adds to a node's downtime, eng review T15) is measured and under 5 minutes", Excludes: []Capability{CapCluster}, Implemented: true},
 	{ID: "UC-682", Title: "Lost quorum: with two of three servers stopped there is no leader and a create fails; sandboxd recover-quorum --start on the surviving seed (refused while sandboxd runs; --rejoin refused on the seed) backs up, makes it the only voter and it leads and serves creates, a sandbox from before still answers exec; recover-quorum --rejoin --start on each lost server brings it back as a voter, ending with 3 voters and 1 leader", Requires: []Capability{CapCluster}, Implemented: true},
+	// Terraform used by URL, the Phase 5 gate (plans/kubectl-style-cluster-
+	// ops.md §7, §9; zz_module_url_test.go). The cluster-module-url scenario
+	// fetches the module by git URL from a root with no checkout behind it.
+	{ID: "UC-683", Title: "The cluster came from the Terraform module fetched by URL: the scenario's root holds only Terraform files, its module source is a git:: URL that Terraform's module manifest says it fetched, and every member joined with one line (install.sh init on the seed, install.sh join on the rest) with none of the old two-pass join's files", Requires: []Capability{CapModuleURL, CapCluster}, Implemented: true},
+	{ID: "UC-684", Title: "aerolvm get nodes lists every member of the module-url cluster, and every one is Ready", Requires: []Capability{CapModuleURL, CapCluster}, Implemented: true},
+	{ID: "UC-685", Title: "A sandbox runs on the module-url cluster and answers exec", Requires: []Capability{CapModuleURL, CapCluster}, Implemented: true},
+	{ID: "UC-686", Title: "The module made one join token per role and the seed registered them: reusable worker and ingress tokens that never expire and a reusable server token that ends within 24 hours", Requires: []Capability{CapModuleURL, CapCluster}, Implemented: true},
+	{ID: "UC-687", Title: "The line aerolvm join-command prints, run on a blank machine, makes it one more worker under its host name, and aerolvm get nodes lists it Ready", Requires: []Capability{CapModuleURL, CapCluster}, Implemented: true},
 	// Cluster rollouts, Phase 3b live gate and the Phase 3a cluster-side
 	// items (plans/kubectl-style-cluster-ops.md §6, §9; zz_rollout_test.go).
 	// Build B is this tree with another version stamp; the cases run in
