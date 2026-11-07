@@ -1656,13 +1656,13 @@ func (h *handlers) clusterInternalReassignStuck(w http.ResponseWriter, r *http.R
 		return
 	}
 	reassigner, ok := c.(interface {
-		ReassignStuckPlacement(context.Context, string, string, string) error
+		ReassignStuckPlacement(context.Context, string, string, string, bool) error
 	})
 	if !ok {
 		apihttp.WriteError(w, http.StatusServiceUnavailable, "cluster: node holds no placement state")
 		return
 	}
-	if err := reassigner.ReassignStuckPlacement(r.Context(), requesterID, req.SandboxID, req.IncarnationID); err != nil {
+	if err := reassigner.ReassignStuckPlacement(r.Context(), requesterID, req.SandboxID, req.IncarnationID, req.CapacityRefused); err != nil {
 		switch {
 		case errors.Is(err, cluster.ErrUnknownSandbox):
 			apihttp.WriteError(w, http.StatusNotFound, "no placement record")

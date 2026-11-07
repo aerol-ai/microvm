@@ -66,6 +66,22 @@ func seedGossipView(t *testing.T, c *Cluster, members []Member) {
 		index.upsert(m)
 	}
 	c.gossip.setMemberIndex(index)
+	seedCapacityHeartbeats(c, members)
+}
+
+// seedCapacityHeartbeats stores each member's capacity snapshot as a fresh
+// heartbeat, which is where capacity reaches placement in production: a
+// gossip member carries none. A member without a snapshot is left without a
+// lease, as a peer that never answered would be.
+func seedCapacityHeartbeats(c *Cluster, members []Member) {
+	if c.capacityLeases == nil {
+		return
+	}
+	for _, m := range members {
+		if hasCapacitySnapshot(m.Capacity) {
+			c.capacityLeases.set(m.NodeID, m.Capacity, time.Now())
+		}
+	}
 }
 
 func raftServerIDs(t *testing.T, c *Cluster) []string {
