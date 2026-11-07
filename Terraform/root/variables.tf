@@ -1,0 +1,1027 @@
+###############################################################################
+# Cluster identity
+###############################################################################
+
+variable "cluster_name" {
+  description = "Logical cluster name. Used to namespace AWS resources and the Cloudflare DNS records."
+  type        = string
+  default     = "aerolvm"
+}
+
+# pat_token has moved to ../config/secrets.yml as cluster.pat_token. It's a
+# cluster-wide secret (every node uses the same value), so the shared SoT
+# pattern applies — Ansible can roll a rotated value into /etc/sandboxd at
+# day-2 from the same file. See locals.tf:pat_token.
+
+###############################################################################
+# AWS credentials / region
+###############################################################################
+
+variable "aws_region" {
+  description = "AWS region to deploy the cluster into."
+  type        = string
+  default     = "us-east-1"
+}
+
+# config_dir lets a caller point Terraform at an alternative directory holding
+# cluster.yml + secrets.yml instead of the repo's ../config. The integration
+# test harness uses this to feed a scenario-specific overlay (generated at
+# runtime) WITHOUT touching the operator's real config/. Default preserves the
+# original hardcoded path exactly, so prod behaviour is unchanged.
+variable "config_dir" {
+  description = "Directory containing cluster.yml + secrets.yml. Defaults to the repo ../config. Override only for integration tests."
+  type        = string
+  default     = ""
+}
+
+variable "aws_profile" {
+  description = "Optional AWS shared-credentials profile name. Empty to use the default chain (env vars, instance role, etc)."
+  type        = string
+  default     = ""
+}
+
+variable "aws_shared_credentials_files" {
+  description = "Optional explicit shared-credentials file paths. Empty list to use the default."
+  type        = list(string)
+  default     = []
+}
+
+variable "extra_tags" {
+  description = "Additional default tags applied to every AWS resource."
+  type        = map(string)
+  default     = {}
+}
+
+###############################################################################
+# Networking
+###############################################################################
+
+variable "vpc_cidr" {
+  description = "CIDR for the new VPC."
+  type        = string
+  default     = "10.42.0.0/16"
+}
+
+variable "subnet_cidr" {
+  description = "CIDR for the single public subnet that hosts cluster nodes."
+  type        = string
+  default     = "10.42.1.0/24"
+}
+
+variable "availability_zone" {
+  description = "AZ for the subnet. Empty string picks the first AZ in the region."
+  type        = string
+  default     = ""
+}
+
+variable "admin_allowed_cidrs" {
+  description = "IPv4 CIDRs allowed to reach SSH (22), the operator/SDK API (21212) and the observability node from outside the VPC. Required: set your office or VPN ranges, e.g. [\"203.0.113.0/24\"]. A world-open range (any /0, such as 0.0.0.0/0) is refused unless allow_admin_from_anywhere = true. Inside the VPC the API is always reachable (monitoring, peers)."
+  type        = list(string)
+
+  validation {
+    condition     = length(var.admin_allowed_cidrs) > 0 && alltrue([for c in var.admin_allowed_cidrs : try(cidrsubnet(c, 0, 0) == c && cidrnetmask(c) != "", false)])
+    error_message = "admin_allowed_cidrs must list at least one IPv4 CIDR written as its network address (your office or VPN range, e.g. \"203.0.113.0/24\")."
+  }
+}
+
+variable "allow_admin_from_anywhere" {
+  description = "Accept a world-open admin_allowed_cidrs (0.0.0.0/0), opening SSH and the daemon API to the whole internet. Off by default."
+  type        = bool
+  default     = false
+}
+
+variable "public_http_ports" {
+  description = "Public TCP ports opened on ingress-bearing nodes. Defaults to 80/443."
+  type        = list(number)
+  default     = [80, 443]
+}
+
+variable "l4_port_range" {
+  description = "Public TCP port pool for raw-TCP (L4) sandbox exposures. Must match SB_L4_PORT_RANGE_START/END on the daemon (defaults 22000-23000). Opened on ingress-bearing nodes."
+  type = object({
+    start = number
+    end   = number
+  })
+  default = {
+    start = 22000
+    end   = 23000
+  }
+}
+
+variable "ssh_gateway_port" {
+  description = "Public TCP port for the per-sandbox SSH gateway. Must match SB_SSH_LISTEN_ADDR on the daemon (default 0.0.0.0:2220). Opened on ingress-bearing nodes."
+  type        = number
+  default     = 2220
+}
+
+variable "api_load_balancer" {
+  description = <<-EOT
+    What sits in front of the ingress nodes. "none" (the default) is DNS
+    round-robin: <domain> and *.<domain> get one A record per ingress node,
+    exactly as before. A client that DNS sends to a node whose sandboxd is
+    down gets 502 until it is back, because the TCP and TLS handshakes with
+    that node's Caddy still succeed and nothing makes the client try the next
+    record.
+
+    "nlb" creates an internet-facing AWS Network Load Balancer (TCP
+    passthrough, so Caddy keeps terminating TLS and caddy-l4 keeps routing by
+    SNI) on public_http_ports and ssh_gateway_port, with the client address
+    preserved. Its health check probes each ingress node's Caddy
+    (install.sh --lb-health-port), which walks caddy-l4 on :443 to sandboxd,
+    so a node leaves rotation about 10 s after its daemon stops. <domain> and
+    *.<domain> then point at the balancer's Elastic IP. The raw-TCP port
+    pool cannot ride an NLB (at most 50 listeners), so raw TCP moves to
+    tcp.<domain>, which keeps one A record per ingress node, and every node
+    gets SB_L4_PUBLIC_HOST.
+
+    Recommended for production. Changing it on a running cluster changes
+    every node's bootstrap, so Terraform replaces the nodes: choose it when
+    you create the cluster.
+  EOT
+  type        = string
+  default     = "none"
+
+  validation {
+    condition     = contains(["none", "nlb"], var.api_load_balancer)
+    error_message = "api_load_balancer must be \"none\" or \"nlb\"."
+  }
+}
+
+variable "api_lb_health_check_port" {
+  description = "Port of the plain-HTTP /health listener each ingress node opens for the load balancer's health check (install.sh --lb-health-port) when api_load_balancer = \"nlb\". Only the balancer's security group may reach it. It must be a port the node does not otherwise use."
+  type        = number
+  default     = 21280
+
+  validation {
+    condition     = var.api_lb_health_check_port >= 1024 && var.api_lb_health_check_port <= 65535 && floor(var.api_lb_health_check_port) == var.api_lb_health_check_port
+    error_message = "api_lb_health_check_port must be a port number from 1024 to 65535."
+  }
+}
+
+variable "ssh_host_key_pem" {
+  description = "Optional shared OpenSSH ed25519 PRIVATE host key (PEM) written to every ingress-bearing node so clients see a stable SSH host identity as the leased domain load-balances them across nodes (UC-22). Leave empty to keep per-node keys generated by sandboxd on first boot."
+  type        = string
+  default     = ""
+  sensitive   = true
+}
+
+variable "cluster_internal_tcp_ports" {
+  description = "Cluster-internal TCP ports (raft / gossip-tcp / internal-mtls). Restricted to the VPC CIDR."
+  type        = list(number)
+  default     = [7000, 7001, 7002]
+}
+
+variable "cluster_internal_udp_ports" {
+  description = "Cluster-internal UDP ports (SWIM gossip). Restricted to the VPC CIDR."
+  type        = list(number)
+  default     = [7001]
+}
+
+###############################################################################
+# SSH key
+###############################################################################
+
+variable "ssh_key_name" {
+  description = "Name of an existing EC2 key pair to use. Leave empty to upload ssh_public_key / ssh_public_key_path as a new key pair."
+  type        = string
+  default     = ""
+}
+
+variable "ssh_public_key" {
+  description = "SSH public key material. Used only when ssh_key_name is empty AND ssh_public_key_path is empty."
+  type        = string
+  default     = ""
+}
+
+variable "ssh_public_key_path" {
+  description = "Path to an SSH public key file. Used only when ssh_key_name is empty."
+  type        = string
+  default     = "~/.ssh/id_rsa.pub"
+}
+
+###############################################################################
+# AMI / instance defaults
+###############################################################################
+
+variable "ami_id" {
+  description = "Optional cluster-wide AMI override for amd64 nodes. Empty string auto-resolves the latest Canonical Ubuntu 22.04 LTS amd64 in the region. arm64 nodes always resolve the matching arm64 AMI unless nodes[*].ami_id overrides."
+  type        = string
+  default     = ""
+}
+
+variable "default_instance_type" {
+  description = "Instance type used for any node that does not override it."
+  type        = string
+  default     = "t3.medium"
+}
+
+variable "default_volume_size_gb" {
+  description = "Root EBS volume size (GiB) used for any node that does not override it."
+  type        = number
+  default     = 64
+}
+
+variable "default_volume_type" {
+  description = "Root EBS volume type (gp3, gp2, io2, ...)."
+  type        = string
+  default     = "gp3"
+}
+
+variable "default_volume_iops" {
+  description = "Root EBS volume IOPS for gp3/io2. Ignored for gp2."
+  type        = number
+  default     = 3000
+}
+
+variable "default_volume_throughput" {
+  description = "Root EBS volume throughput (MiB/s) for gp3. Ignored otherwise."
+  type        = number
+  default     = 125
+}
+
+###############################################################################
+# Cluster topology
+#
+# Roles recognised by AerolVM (see docs/cluster-setup-step-by-step.mdx):
+#   - "server"          : Raft voter, no sandboxes, no public traffic
+#   - "worker"          : owns sandboxes, never votes
+#   - "ingress"         : holds public route table, never votes, no sandboxes
+#   - "worker,ingress"  : edge node (sandboxes + ingress, non-voter)
+#   - "server,worker"   : voter + sandboxes
+#   - "server,ingress"  : voter + public traffic
+#   - "mixed"           : equivalent to "server,worker,ingress" (the 3-node default)
+#
+# Exactly one node must set seed = true.
+###############################################################################
+
+variable "shard_aware_ingress" {
+  description = <<-EOT
+    Declares that the router in front of the ingress tier resolves each
+    sandbox's owners through GET /v1/cluster/ingress-route/{id} before
+    forwarding. Required, and only correct, for more than 10 ingress-capable
+    nodes: above that size each ingress node holds only its share of the
+    public route table, so DNS round-robin, an NLB, or a BGP VIP would
+    black-hole most sandbox traffic, and the daemon fails closed without this
+    flag (SB_CLUSTER_SHARD_AWARE_INGRESS). Setting it true with a plain LB in
+    front silences that check and breaks traffic silently. Runbook:
+    setup/runbooks/cluster-ingress-topology.md.
+  EOT
+  type        = bool
+  default     = false
+}
+
+variable "nodes" {
+  description = <<-EOT
+    Map of node-name => node config. Each entry supports:
+      role             (string,  default "mixed")
+      seed             (bool,    default false; exactly one node must be true)
+      instance_type    (string,  default var.default_instance_type)
+      volume_size_gb   (number,  default var.default_volume_size_gb)
+      volume_type      (string,  default var.default_volume_type)
+      volume_iops      (number,  default var.default_volume_iops)
+      volume_throughput(number,  default var.default_volume_throughput)
+      ami_id           (string,  default var.ami_id resolved to Ubuntu 22.04 for the node's arch)
+      arch             (string,  optional "amd64" or "arm64"; derived from instance_type when unset)
+      with_firecracker (bool,    default var.default_with_firecracker)
+      with_gvisor      (bool,    default var.default_with_gvisor)
+      with_isolate     (bool,    default var.default_with_isolate)
+      ingress_proxy_routing (bool, default var.default_ingress_proxy_routing)
+      with_nvidia_gpu  (bool,    default var.default_with_nvidia_gpu)
+      with_amd_gpu     (bool,    default var.default_with_amd_gpu)
+      idle_timeout_min (number,  default var.default_idle_timeout_min; 0 disables)
+      extra_user_data  (string,  default ""; appended to bootstrap.sh)
+      sandboxd_env     (map(string), default {}; merged over var.extra_sandboxd_env)
+      tags             (map(string), default {})
+      blank            (bool,    default false; plain Ubuntu, nothing installed,
+                        for a test to join by hand. Not a member, so it
+                        gets no DNS record and is not counted.)
+  EOT
+  type = map(object({
+    role                  = optional(string, "mixed")
+    seed                  = optional(bool, false)
+    instance_type         = optional(string)
+    volume_size_gb        = optional(number)
+    volume_type           = optional(string)
+    volume_iops           = optional(number)
+    volume_throughput     = optional(number)
+    ami_id                = optional(string)
+    arch                  = optional(string)
+    with_firecracker      = optional(bool)
+    with_gvisor           = optional(bool)
+    with_isolate          = optional(bool)
+    ingress_proxy_routing = optional(bool)
+    with_nvidia_gpu       = optional(bool)
+    with_amd_gpu          = optional(bool)
+    idle_timeout_min      = optional(number)
+    extra_user_data       = optional(string, "")
+    # sandboxd_env is merged OVER var.extra_sandboxd_env for this node, so a
+    # hetero topology can give ingress-only and worker-only nodes different
+    # SB_* profiles (audit rate limits, jail settings) from one node map.
+    sandboxd_env = optional(map(string), {})
+    tags         = optional(map(string), {})
+    blank        = optional(bool, false)
+    # spot requests this node as an EC2 spot instance (one-time, terminate on
+    # reclaim). Default false → on-demand, identical to prior behaviour. Only
+    # the integration test harness sets this true; prod node maps omit it.
+    spot = optional(bool, false)
+  }))
+  default = {
+    node1 = { role = "mixed", seed = true }
+    node2 = { role = "mixed" }
+    node3 = { role = "mixed" }
+  }
+
+  validation {
+    condition     = length([for k, v in var.nodes : k if try(v.seed, false)]) == 1
+    error_message = "Exactly one node in var.nodes must have seed = true."
+  }
+
+  # Node names become SB_NODE_ID and are stamped into each node cert as
+  # DNS:node:<id> by cluster-sign-node.sh, which enforces exactly this charset
+  # and rejects anything else. Catching it here keeps a bad name from failing
+  # 5 minutes into cloud-init, on the box, where the message is only visible
+  # in /var/log/aerolvm-bootstrap.log.
+  validation {
+    condition     = alltrue([for k, _ in var.nodes : can(regex("^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$", k))])
+    error_message = "Every node name must start with an alphanumeric and contain only alphanumerics, dot, underscore, or hyphen (max 128 chars) — cluster-sign-node.sh rejects anything else."
+  }
+
+  # Mirror cluster-init.sh + cluster-join.sh validate_node_role(): every role
+  # token must be in {server, worker, ingress, mixed}, and "mixed" cannot be
+  # combined with other tokens. Catches typos at plan-time instead of at
+  # cloud-init time on the instance.
+  validation {
+    condition = alltrue([
+      for k, v in var.nodes : alltrue([
+        for tok in split(",", replace(coalesce(v.role, "mixed"), " ", "")) :
+        contains(["server", "worker", "ingress", "mixed"], tok)
+      ])
+    ])
+    error_message = "Each node's role must be a comma-separated set of {server, worker, ingress, mixed}. Examples: \"mixed\", \"server\", \"worker,ingress\"."
+  }
+
+  validation {
+    condition = alltrue([
+      for k, v in var.nodes :
+      length(split(",", replace(coalesce(v.role, "mixed"), " ", ""))) == 1 ||
+      !contains(split(",", replace(coalesce(v.role, "mixed"), " ", "")), "mixed")
+    ])
+    error_message = "\"mixed\" is shorthand for server,worker,ingress and cannot be combined with other tokens."
+  }
+
+  # cluster-init.sh refuses to bootstrap a fresh cluster from a node whose role
+  # set lacks "server"/"mixed". Catching it here avoids a failed cloud-init.
+  validation {
+    condition = alltrue([
+      for k, v in var.nodes :
+      !try(v.seed, false) ||
+      contains(
+        split(",", replace(coalesce(v.role, "mixed"), " ", "")),
+        "server",
+      ) ||
+      coalesce(v.role, "mixed") == "mixed"
+    ])
+    error_message = "The seed node's role must contain \"server\" or equal \"mixed\" (cluster-init.sh refuses to bootstrap from a pure worker/ingress node)."
+  }
+
+  validation {
+    condition = alltrue([
+      for k, v in var.nodes :
+      !coalesce(v.with_firecracker, false) ||
+      contains(
+        split(",", replace(coalesce(v.role, "mixed"), " ", "")),
+        "worker",
+      ) ||
+      coalesce(v.role, "mixed") == "mixed"
+    ])
+    error_message = "nodes[*].with_firecracker may only be set on worker-capable nodes (role contains \"worker\" or equals \"mixed\")."
+  }
+
+  validation {
+    condition = alltrue([
+      for k, v in var.nodes :
+      try(v.arch, null) == null || contains(["amd64", "arm64"], v.arch)
+    ])
+    error_message = "nodes[*].arch must be \"amd64\" or \"arm64\" when set."
+  }
+}
+
+###############################################################################
+# Install.sh feature defaults (per-node overrides live in var.nodes)
+###############################################################################
+
+variable "force_on_demand" {
+  description = "When true, firecracker (bare-metal) nodes are launched on-demand even if their node spec sets spot=true. The integration harness sets this via --metal-on-demand when *.metal spot capacity is scarce. Cheap t3 spot nodes are unaffected. Defaults false so production (which never sets spot) renders identically."
+  type        = bool
+  default     = false
+}
+
+variable "default_with_firecracker" {
+  description = "Enable Firecracker runtime wiring on nodes that do not override it. Worker-capable nodes only. Bootstrap installs host deps, optionally downloads firecracker/jailer/kernel artifacts, and writes SB_ENABLE_FIRECRACKER + related SB_FIRECRACKER_* env."
+  type        = bool
+  default     = false
+}
+
+variable "default_with_gvisor" {
+  description = "Install gVisor runsc and register it as an alternative OCI runtime. Per-node override via nodes[*].with_gvisor."
+  type        = bool
+  default     = false
+}
+
+variable "default_with_isolate" {
+  description = "Install Cloudflare workerd (version-pinned, SHA-256 verified) and write SB_ENABLE_ISOLATE=true so sandboxes can opt into the V8-isolate runtime (plans/isolate-runtime.md). Per-node override via nodes[*].with_isolate."
+  type        = bool
+  default     = false
+}
+
+variable "default_ingress_proxy_routing" {
+  description = "Route sandboxes without per-sandbox Caddy writes (plans/ingress-proxy-routing.md): install.sh --ingress-proxy-routing writes SB_INGRESS_PROXY_ROUTING=true and routes *.rt.internal to the sandboxd route responder. Per-node, no flag-day; per-node override via nodes[*].ingress_proxy_routing. Default off (setup/config-defaults.md)."
+  type        = bool
+  default     = false
+}
+
+variable "default_with_nvidia_gpu" {
+  description = "Install nvidia-container-toolkit and configure Docker for NVIDIA GPUs. Host must already have NVIDIA drivers."
+  type        = bool
+  default     = false
+}
+
+variable "default_with_amd_gpu" {
+  description = "Install AMD ROCm so containers can access AMD GPUs via /dev/kfd and /dev/dri. x86_64 only."
+  type        = bool
+  default     = false
+}
+
+variable "default_idle_timeout_min" {
+  description = "Idle auto-stop timeout in minutes for sandboxes (install.sh --idle-timeout-min). 0 disables."
+  type        = number
+  default     = 0
+}
+
+variable "firecracker" {
+  description = <<-EOT
+    Firecracker bootstrap settings for Terraform-managed hosts.
+
+    Nodes opt in with nodes[*].with_firecracker or default_with_firecracker.
+    When a node opts in, bootstrap installs distro dependencies
+    (skopeo, umoci, e2fsprogs, iproute2), optionally downloads the
+    firecracker/jailer/kernel artifacts from the URLs below, and writes the
+    matching SB_ENABLE_FIRECRACKER / SB_FIRECRACKER_* env vars into
+    /etc/sandboxd/cluster.env before restarting sandboxd.
+
+    The *_url fields are optional so pre-baked AMIs remain supported:
+    leave them empty if the AMI already ships the artifacts at the matching
+    *_path values. When all *_url fields are empty and auto_install_artifacts
+    is true (default), bootstrap downloads the arch-matched upstream Firecracker
+    release + spec.ccfc.min guest kernel (same pins as Ansible configure-ops.yml).
+    kernel_path must point at a real vmlinux image on the host
+    and kernel_path.config must point at that image's kernel config by the time
+    sandboxd restarts or health will degrade because vmgenid support cannot be
+    proven.
+  EOT
+  type = object({
+    binary_url                   = optional(string, "")
+    jailer_url                   = optional(string, "")
+    kernel_url                   = optional(string, "")
+    kernel_config_url            = optional(string, "")
+    version                      = optional(string, "v1.15.1")
+    kernel_ci_version            = optional(string, "v1.15")
+    kernel_version               = optional(string, "5.10.245")
+    auto_install_artifacts       = optional(bool, true)
+    binary_path                  = optional(string, "/usr/local/bin/firecracker")
+    jailer_path                  = optional(string, "/usr/local/bin/jailer")
+    kernel_path                  = optional(string, "/var/lib/sandboxd/firecracker/vmlinux")
+    run_dir                      = optional(string, "/run/sandboxd/firecracker")
+    templates_dir                = optional(string, "/var/lib/sandboxd/firecracker/templates")
+    use_jailer                   = optional(bool, true)
+    jailer_chroot_base           = optional(string, "/srv/jailer")
+    jailer_uid                   = optional(number, 1000)
+    jailer_gid                   = optional(number, 1000)
+    tap_base_cidr                = optional(string, "172.16.0.0/20")
+    tap_pool_size                = optional(number, 256)
+    skopeo_bin                   = optional(string, "/usr/bin/skopeo")
+    umoci_bin                    = optional(string, "/usr/bin/umoci")
+    mkfs_bin                     = optional(string, "/sbin/mkfs.ext4")
+    ip_binary                    = optional(string, "")
+    template_gc_enabled          = optional(bool, true)
+    template_gc_interval         = optional(string, "1h")
+    template_gc_ttl              = optional(string, "168h")
+    snapshot_enabled             = optional(bool, true)
+    template_build_timeout       = optional(string, "45m")
+    template_rotation_interval   = optional(string, "0s")
+    template_max_age             = optional(string, "0s")
+    template_memory_mb           = optional(number, 512)
+    template_vcpu                = optional(number, 1)
+    snapshot_verify_on_load      = optional(bool, true)
+    overlay_enabled              = optional(bool, true)
+    overlay_mkfs                 = optional(bool, false)
+    snapshot_post_resume_timeout = optional(string, "2s")
+    vmm_pool_enabled             = optional(bool, false)
+    vmm_pool_depth_default       = optional(number, 0)
+    vmm_pool_gc_interval         = optional(string, "5m")
+    vmm_pool_gc_ttl              = optional(string, "1h")
+    vmm_pool_refill_interval     = optional(string, "5s")
+    rss_sampler_interval         = optional(string, "1s")
+    rss_watermark_ratio          = optional(number, 0)
+  })
+  default = {}
+
+  validation {
+    condition = (
+      var.firecracker.tap_pool_size > 0
+      && var.firecracker.template_memory_mb > 0
+      && var.firecracker.template_vcpu > 0
+      && var.firecracker.vmm_pool_depth_default >= 0
+      && var.firecracker.rss_watermark_ratio >= 0
+      && var.firecracker.rss_watermark_ratio <= 1
+    )
+    error_message = "firecracker.tap_pool_size and template resource knobs must be positive, vmm_pool_depth_default must be >= 0, and rss_watermark_ratio must be between 0 and 1."
+  }
+}
+
+###############################################################################
+# Observability stack (integration-test obs node)
+###############################################################################
+
+variable "deploy_obs" {
+  description = "When true, provision a dedicated obs EC2 (Prometheus + Grafana + Pushgateway) outside var.nodes. The integration harness sets this when the scenario advertises the observability capability."
+  type        = bool
+  default     = false
+}
+
+variable "obs_instance_type" {
+  description = "Instance type for the dedicated observability node."
+  type        = string
+  default     = "t3.medium"
+}
+
+variable "obs_prometheus_volume_size_gb" {
+  description = "Persistent EBS volume size (GiB) for Prometheus TSDB on the obs node."
+  type        = number
+  default     = 50
+}
+
+###############################################################################
+# Observability and operational hardening
+###############################################################################
+
+# Observability, image-pull controls, image-GC, mirror/auto-import config —
+# everything except secrets — lives in ../config/cluster.yml. That file is
+# the single source of truth both Terraform and Ansible read from, so
+# day-0 (scripts/terraform.sh apply) and day-2 (configure-ops.yml) cannot
+# drift. See locals.tf:cluster_ops and
+# resource.terraform_data.validate_cluster_ops.
+#
+# Cluster SECRETS (pat_token, cloudflare api_token, aocr secrets, fleet
+# token) live in ../config/secrets.yml, also shared with Ansible. See
+# locals.tf:cluster_secrets.
+
+###############################################################################
+# Cloudflare DNS
+###############################################################################
+
+# cloudflare_api_token has moved to ../config/secrets.yml (cloudflare.api_token).
+# It's a real secret — the rest of secrets.yml holds cluster.pat_token,
+# aocr.*, and fleet.token, so the Cloudflare token belongs there too rather
+# than in the non-secret config/terraform.tfvars. providers.tf reads it via
+# local.cloudflare_api_token; locals.tf validates it is non-empty.
+
+variable "cloudflare_zone_id" {
+  description = "Cloudflare zone ID for the apex domain (the 'region key' shown on the zone overview page). Leave empty to auto-resolve from domain_name (requires Zone:Read on the API token)."
+  type        = string
+  default     = ""
+}
+
+# domain_name and acme_email have moved to ../config/cluster.yml under the
+# ingress: section. Both feed into Caddy / DNS / sandboxd at runtime, so
+# Ansible reading from the same source lets day-2 reconfig stay in sync with
+# day-0 provisioning. See locals.tf:domain_name and locals.tf:acme_email.
+
+variable "create_wildcard_record" {
+  description = "Whether to create a wildcard *.<domain_name> A record alongside the apex."
+  type        = bool
+  default     = true
+}
+
+variable "cloudflare_proxied" {
+  description = "Whether the Cloudflare DNS records should be orange-clouded (proxied). Set false for raw TCP ingress / non-HTTP."
+  type        = bool
+  default     = false
+}
+
+variable "cloudflare_record_ttl" {
+  description = "TTL for the A records. 1 == automatic (required when proxied)."
+  type        = number
+  default     = 1
+}
+
+###############################################################################
+# Bootstrap behavior
+###############################################################################
+
+variable "install_script_url" {
+  description = "URL of the single-node install.sh."
+  type        = string
+  default     = "https://aerolvm.aerol.ai"
+}
+
+# null (the default) renders the bootstrap exactly as before, so a cluster that
+# never set this keeps byte-identical user_data and no node is replaced
+# (user_data_replace_on_change). Setting it changes user_data once: the next
+# apply replaces each node.
+variable "download_mirror" {
+  description = "Download mirror the node bootstrap falls back to when a file's own source fails: AerolVM release files (install.sh, cluster-init.sh, cluster-join.sh, cluster-sign-node.sh) and the CNI plugins, BuildKit and Firecracker it downloads, with the CNI plugins and BuildKit checked against install.sh's pinned SHA-256. The public mirror is https://aerolvm-downloads.s3.us-east-1.amazonaws.com (scripts/mirror-sync.sh fills it). null (default): no fallback, GitHub only, as before. Setting it replaces each node once. See Terraform/README.md, \"Download mirror\"."
+  type        = string
+  default     = null
+  nullable    = true
+
+  validation {
+    condition     = var.download_mirror == null || can(regex("^https://[A-Za-z0-9.-]+(:[0-9]+)?(/[A-Za-z0-9._~/-]*)?$", var.download_mirror))
+    error_message = "download_mirror must be an https:// URL with no query, quotes or spaces (it is written into the bootstrap script), or null."
+  }
+}
+
+variable "caddy_binary_url" {
+  description = "Optional URL of a prebuilt custom Caddy binary containing caddy-l4, caddy-dns/cloudflare, and certmagic-s3. When empty, install.sh uses the matching release asset if present and then falls back to Caddy's build service."
+  type        = string
+  default     = ""
+}
+
+# Real AWS KMS for the cluster secret provider (plans/integration-test-security.md §5.3).
+#
+# D3: this is deliberately a REAL key, not the offline fake. pkg/secrets'
+# fake_kms.go already covers the provider contract offline, so a fake here
+# would prove nothing new — what is untested is the daemon reaching a real CMK
+# through the instance role, which only a real key exercises.
+#
+# Off by default, so a production render is byte-identical and no key is ever
+# created for a deployment that did not ask for one. Cost when on is ~$1/month
+# prorated plus $0.03/10k requests.
+variable "secret_kms_enabled" {
+  description = "Create a KMS CMK and point sandboxd's secret provider at it (SB_SECRET_PROVIDER=awskms)."
+  type        = bool
+  default     = false
+}
+
+# Strict boot makes the daemon FAIL to start when the awskms boot canary does
+# not round-trip, instead of silently continuing with a provider that cannot
+# decrypt. config.go additionally REQUIRES it for awskms whenever
+# SB_ENTERPRISE_MODE is true, so defaulting it on keeps an enterprise scenario
+# from failing at daemon start with a config error. A scenario can still turn
+# it off through extra_sandboxd_env, which is rendered after this block.
+# Server-key custody (plans/customer-key-custody.md §3). "wrapped" keeps the
+# server key that seals env, registry, mount and toolbox secrets only wrapped
+# by the KMS key above: install.sh and cluster-init.sh never write it in
+# plaintext, and the S3 cred bundle object then holds only the wrapped file.
+# Needs secret_kms_enabled (this module provisions only AWS KMS; Vault and
+# HSM key stores are the customer's own).
+variable "key_custody" {
+  description = "Server-key custody: \"file\" (default, plaintext key) or \"wrapped\" (wrapped by the secret_kms_enabled key; needs a release whose scripts have --key-custody)."
+  type        = string
+  default     = "file"
+
+  validation {
+    condition     = contains(["file", "wrapped"], var.key_custody)
+    error_message = "key_custody must be \"file\" or \"wrapped\"."
+  }
+}
+
+variable "secret_kms_strict_boot" {
+  description = "Set SB_SECRET_PROVIDER_STRICT_BOOT when secret_kms_enabled. Required by config.go for awskms + enterprise mode."
+  type        = bool
+  default     = true
+}
+
+# Audit export sinks (plans/integration-test-security.md §5.4).
+#
+# IMPORTANT, and not what the plan originally assumed: SB_AUDIT_EXPORT_BACKEND
+# selects exactly ONE of noop|stdout|file|webhook|s3|bus
+# (pkg/auditexport/config.go). There is no fan-out backend, so a single node
+# cannot ship to file AND s3 at once. A scenario that wants both proves them on
+# DIFFERENT NODES, via each node's own sandboxd_env — which is precisely what
+# the per-node override exists for.
+#
+# Note also that pkg/auditexport rejects file and stdout when enterprise mode
+# is on ("keeps audit evidence on this node"), so enterprise scenarios must
+# pick webhook, s3 or bus.
+variable "audit_export_enabled" {
+  description = "Create the audit-export S3 bucket and grant nodes PutObject on it."
+  type        = bool
+  default     = false
+}
+
+variable "audit_export_backend" {
+  description = "Value for SB_AUDIT_EXPORT_BACKEND. Empty leaves the daemon default (noop, or webhook when an export URL is set)."
+  type        = string
+  default     = ""
+
+  validation {
+    # Mirrors pkg/auditexport's backend set. Catching a typo here beats a
+    # daemon that starts with the backend silently resolved to noop and a
+    # scenario that then asserts on records nothing ever shipped.
+    condition     = contains(["", "noop", "stdout", "file", "webhook", "s3", "bus"], var.audit_export_backend)
+    error_message = "audit_export_backend must be one of: noop, stdout, file, webhook, s3, bus (or empty)."
+  }
+}
+
+variable "audit_export_file_path" {
+  description = "SB_AUDIT_EXPORT_FILE_PATH. Written whenever audit_export_backend is set, so flipping to the file backend needs no other change."
+  type        = string
+  default     = "/var/log/aerol-audit-export.jsonl"
+}
+
+# S3 Object Lock audit witness (plans/open-audit-witness.md, audit_witness.tf).
+#
+# Off by default, so a production render is byte-identical and no bucket is
+# ever created for a deployment that did not ask for one. On, it creates the
+# locked bucket, grants both node roles the witness IAM, and sets
+# SB_AUDIT_WITNESS_BACKEND=s3 on every node. It does NOT turn on
+# SB_ENTERPRISE_MODE or SB_SECRET_AUDIT_EXTERNAL_WITNESS; set those through
+# extra_sandboxd_env.
+variable "audit_witness_enabled" {
+  description = "Create the S3 Object Lock audit-witness bucket, grant nodes the witness IAM, and set SB_AUDIT_WITNESS_* on every node."
+  type        = bool
+  default     = false
+}
+
+# One value feeds both the IAM resource paths and SB_AUDIT_WITNESS_S3_PREFIX,
+# so the grant and the keys the daemon writes cannot drift apart.
+variable "audit_witness_prefix" {
+  description = "SB_AUDIT_WITNESS_S3_PREFIX, and the key prefix the node-role IAM is scoped to."
+  type        = string
+  default     = "witness/"
+
+  validation {
+    # A leading slash would put every key under an empty path segment, and
+    # '*', '?' or '$' would turn the IAM resource into a wider wildcard or a
+    # policy variable than intended.
+    condition     = can(regex("^[^/*?$\\s][^*?$\\s]*$", var.audit_witness_prefix))
+    error_message = "audit_witness_prefix must be non-empty, must not start with '/', and must not contain whitespace, '*', '?' or '$'."
+  }
+}
+
+# COMPLIANCE: no one, the AWS account root included, can delete a head before
+# its lock ends. That is the claim production wants (founder F1). GOVERNANCE:
+# a principal with s3:BypassGovernanceRetention can, which is what makes a
+# trial or an integration bucket deletable (D13). The node role never holds
+# that permission, and the daemon's boot canary refuses a role that does.
+variable "witness_lock_mode" {
+  description = "Default Object Lock retention mode for the witness bucket: COMPLIANCE (production) or GOVERNANCE (trials, integration runs)."
+  type        = string
+  default     = "COMPLIANCE"
+
+  validation {
+    condition     = contains(["COMPLIANCE", "GOVERNANCE"], var.witness_lock_mode)
+    error_message = "witness_lock_mode must be COMPLIANCE or GOVERNANCE."
+  }
+}
+
+# Must be at least SB_SECRET_AUDIT_RETENTION_DAYS (daemon default 30) or the
+# daemon refuses to boot; audit_witness.tf checks that at plan time. Also the
+# noncurrent-version expiry, so it bounds how far back the offline verifier
+# can see witnessed heads.
+variable "witness_lock_days" {
+  description = "Default Object Lock retention, in days, for every witnessed head. Must be >= SB_SECRET_AUDIT_RETENTION_DAYS."
+  type        = number
+  default     = 30
+
+  validation {
+    condition     = var.witness_lock_days >= 1 && floor(var.witness_lock_days) == var.witness_lock_days
+    error_message = "witness_lock_days must be a whole number of days, at least 1."
+  }
+}
+
+variable "audit_witness_auditor_policy_enabled" {
+  description = "Also create an unattached read-only IAM policy (witness bucket, plus the audit-export bucket when audit_export_enabled) for whoever runs `aerolvm audit verify`."
+  type        = bool
+  default     = false
+}
+
+# Audit receiver fixture (plans/integration-test-security.md §6.4).
+#
+# One small binary, built by the same pipeline and shipped over the same
+# presigned URL, run as a systemd unit on the seed. Webhook export needs
+# something listening; without it a scenario can only assert that the daemon
+# TRIED to export. (The audit witness is the S3 Object Lock bucket above, not
+# this fixture.)
+variable "audit_receiver_enabled" {
+  description = "Run the audit-receiver fixture on the seed and point webhook export at it."
+  type        = bool
+  default     = false
+}
+
+variable "audit_receiver_port" {
+  description = "Port the audit receiver listens on (VPC-internal only)."
+  type        = number
+  default     = 9099
+}
+
+variable "audit_receiver_url" {
+  description = "Download URL for the audit-receiver binary. Emitted by integration-tests/lib/build.sh publish."
+  type        = string
+  default     = ""
+}
+
+# Extra SB_* environment for sandboxd, rendered into /etc/sandboxd/cluster.env
+# BEFORE the bootstrap's final `systemctl restart sandboxd`.
+#
+# WHY this exists: the branch's 55 new SB_* knobs (secrets provider, audit
+# sinks, enterprise gates, mTLS) had NO provisioning path. config/cluster.yml
+# has no secrets/audit section, and the only lever was extra_user_data — which
+# runs AFTER the final restart, so a scenario had to append to the env file and
+# restart a second time. That is workable for one flag and unusable as the
+# mechanism for a profile matrix.
+#
+# Values that are only known at apply time (a KMS key ARN, an audit bucket
+# name, a webhook URL) stay as dedicated template vars; this map is for the
+# static per-scenario profile.
+#
+# identity_issuer_enabled makes every node an OIDC issuer for sandbox cloud
+# identities (plans/sandbox-cloud-identity.md): SB_IDENTITY_ISSUER_URL is the
+# deployment's public API URL, https://<domain>, which a static
+# extra_sandboxd_env entry cannot name because the domain is leased at apply
+# time. Off by default and rendered only when on (and the deployment has a
+# domain), so a production render is byte-identical to before.
+variable "identity_issuer_enabled" {
+  description = "Set SB_IDENTITY_ISSUER_URL=https://<domain> on every node so sandboxes can get cloud identity tokens. Needs a domain."
+  type        = bool
+  default     = false
+}
+
+# Empty by default, so a production render is byte-identical to before.
+variable "extra_sandboxd_env" {
+  description = "Extra SB_* env vars written to /etc/sandboxd/cluster.env before the final sandboxd restart. Merged under each node's own sandboxd_env."
+  type        = map(string)
+  default     = {}
+
+  # A newline would let one entry inject arbitrary additional variables into
+  # the env file, and '=' in a KEY would silently produce an unreadable line.
+  validation {
+    condition = alltrue([
+      for k, v in var.extra_sandboxd_env :
+      can(regex("^[A-Za-z_][A-Za-z0-9_]*$", k)) && !can(regex("[\n\r]", v))
+    ])
+    error_message = "extra_sandboxd_env keys must be valid shell identifiers and values must not contain newlines."
+  }
+}
+
+# Where the operator token works, and the client address through Caddy
+# (plans/identity-and-access.md §5.11). These are install.sh flags, not env
+# vars, because each writes a Caddy half that must match its sandboxd half:
+# --pat-scope host points Caddy's API proxy at the public Unix socket, and
+# --l4-proxy-protocol adds the PROXY listener wrapper on the 8443 site. Set
+# through extra_sandboxd_env alone, the sandboxd half would run against a
+# Caddyfile that undoes it. Both default off, so a default render is
+# byte-identical to before.
+variable "pat_scope" {
+  description = "install.sh --pat-scope: \"any\" (default) accepts the PAT from any peer; \"host\" accepts it only from this host's loopback and from mTLS cluster peers, with Caddy on the public socket. Enterprise mode requires \"host\". Needs a release whose install.sh has the flag."
+  type        = string
+  default     = "any"
+
+  validation {
+    condition     = contains(["any", "host"], var.pat_scope)
+    error_message = "pat_scope must be \"any\" or \"host\"."
+  }
+}
+
+variable "l4_proxy_protocol" {
+  description = "install.sh --l4-proxy-protocol: caddy-l4's fallback sends PROXY v2 to the HTTPS site and Caddy forwards the client address to sandboxd, so audit records see the real caller. Domain mode only. Needs a release whose install.sh has the flag."
+  type        = bool
+  default     = false
+}
+
+# Locally-built artifact overrides (integration harness, plans/integration-test-security.md §4.3).
+#
+# All three default to "" so a production render is byte-identical to before
+# this block existed: install.sh falls back to its own releases/latest
+# resolution when no --sandboxd-url is passed.
+#
+# These exist because the security matrix must provision an UNMERGED branch.
+# The harness cross-compiles locally and presigns the artifacts, and
+# install.sh already strips the query string off the URL when deriving the
+# asset name, so a presigned S3 URL needs no installer change.
+#
+# sandboxd_url and toolboxd_url must be set together: checksums_url names ONE
+# file that has to carry an entry for every asset install.sh verifies, so a
+# half-override would fail verification on the node rather than here.
+variable "sandboxd_url" {
+  description = "Override URL for the sandboxd binary. Empty => install.sh resolves the release asset."
+  type        = string
+  default     = ""
+}
+
+variable "toolboxd_url" {
+  description = "Override URL for the toolboxd binary. Empty => install.sh resolves the release asset."
+  type        = string
+  default     = ""
+}
+
+variable "checksums_url" {
+  description = "Override URL for the checksums file covering sandboxd_url/toolboxd_url. Required when either is set — install.sh refuses an unverified install."
+  type        = string
+  default     = ""
+}
+
+variable "cluster_init_script_url" {
+  description = "URL of cluster-init.sh."
+  type        = string
+  default     = "https://github.com/aerol-ai/microvm/releases/latest/download/cluster-init.sh"
+}
+
+variable "cluster_join_script_url" {
+  description = "URL of cluster-join.sh."
+  type        = string
+  default     = "https://github.com/aerol-ai/microvm/releases/latest/download/cluster-join.sh"
+}
+
+# Only the SEED downloads this. It signs joiner CSRs with the cluster CA key,
+# which never leaves the seed, so joiners have no use for it.
+variable "cluster_sign_node_script_url" {
+  description = "URL of cluster-sign-node.sh (seed only; signs joiner CSRs with ca.key)."
+  type        = string
+  default     = "https://github.com/aerol-ai/microvm/releases/latest/download/cluster-sign-node.sh"
+}
+
+variable "bundle_bucket_force_destroy" {
+  description = "Whether `terraform destroy` may delete the bundle S3 bucket even if it still has objects."
+  type        = bool
+  default     = true
+}
+
+variable "caddy_certs_bucket_force_destroy" {
+  description = "Whether `terraform destroy` may delete the managed Caddy cert S3 bucket even if it still has object versions."
+  type        = bool
+  default     = false
+}
+
+variable "seed_wait_max_seconds" {
+  description = "How long a joiner will poll S3 for the seed's gossip key + TLS bundle before giving up."
+  type        = number
+  default     = 1800
+}
+
+variable "caddy_shared_cert_storage" {
+  description = <<-EOT
+    Shared S3-backed Caddy cert storage. Lets every ingress node read the
+    wildcard cert issued by one node, sidestepping Let's Encrypt rate
+    limits when the cluster has 10+ ingress-bearing nodes. Disabled by
+    default; each node issues its own cert when off (the existing
+    behaviour, fine up to a handful of nodes).
+
+    mode = "managed": Terraform creates a dedicated S3 bucket + IAM
+                      grants, and generates the encryption_key
+                      automatically (stored in TF state).
+    mode = "byo":     Operator supplies bucket / region / encryption_key
+                      (and optional creds for non-EC2-instance-role auth).
+                      Useful when the bucket already exists, lives in
+                      another account, or is Cloudflare R2 / MinIO.
+
+    encryption_key must be a base64-encoded 32-byte secret and identical
+    on every node. Losing it makes existing stored certs unreadable.
+    See setup/multi-node-cert-sharing.md.
+  EOT
+  type = object({
+    enabled        = bool
+    mode           = optional(string, "managed")
+    bucket         = optional(string, "")
+    region         = optional(string, "")
+    endpoint       = optional(string, "")
+    prefix         = optional(string, "caddy")
+    access_key     = optional(string, "")
+    secret_key     = optional(string, "")
+    encryption_key = optional(string, "")
+  })
+  default = {
+    enabled = false
+  }
+
+  validation {
+    condition     = !var.caddy_shared_cert_storage.enabled || contains(["managed", "byo"], var.caddy_shared_cert_storage.mode)
+    error_message = "caddy_shared_cert_storage.mode must be either \"managed\" or \"byo\"."
+  }
+
+  validation {
+    condition = (
+      !var.caddy_shared_cert_storage.enabled
+      || var.caddy_shared_cert_storage.mode != "byo"
+      || (
+        var.caddy_shared_cert_storage.bucket != ""
+        && var.caddy_shared_cert_storage.region != ""
+        && var.caddy_shared_cert_storage.encryption_key != ""
+      )
+    )
+    error_message = "When caddy_shared_cert_storage.mode = \"byo\", bucket, region, and encryption_key are all required."
+  }
+}
+
+###############################################################################
+# AOCR (Aerol OCI Registry) — Authenticated mirror + auto-import (Phase 4 F17-F21)
+#
+# All AOCR config has moved out of variables.tf:
+#   - Non-secret knobs (mirror host, upstreams, auto_import toggle, cluster_id,
+#     hooks_url, retention/timeout) live in ../config/cluster.yml.
+#   - Secrets (upstream_wrap_key, cluster_pat) live in ../config/secrets.yml.
+# Both files are read at the top of locals.tf and Ansible's configure-ops.yml,
+# so day-0 (terraform apply) and day-2 (ansible-playbook) cannot drift.
+# See sandbox-library/AUTHENTICATED_MIRROR.md for the full operator reference.
+###############################################################################

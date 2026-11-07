@@ -74,7 +74,7 @@ step "1/6 provision $SCENARIO on $FROM_TAG with the old scripts (no suite cases)
 AEROL_TEST_RUN='^$' "$RUN" "$SCENARIO" --version "$FROM_TAG" --keep || true
 
 step "2/6 read targets"
-targets="$(TF_DATA_DIR="$SDIR" terraform -chdir="$REPO_ROOT/Terraform" output -json integration_targets)" \
+targets="$(TF_DATA_DIR="$SDIR" terraform -chdir="$REPO_ROOT/Terraform/root" output -json integration_targets)" \
   || { echo "could not read integration_targets from $SDIR" >&2; exit 2; }
 BASE="$(jq -r '.base_url // empty' <<<"$targets")"
 TOKEN="$(yq -r '.cluster.pat_token' "$SECRETS")"
