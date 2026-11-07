@@ -140,6 +140,12 @@ func OverlapCreateAndPromote(
 	// reservation, so the binding below answers ErrReservedPlacementGone
 	// (503): the client's next retry reserves afresh.
 	if existing, err := svc.GetSandbox(ctx, reservationID); err == nil && existing != nil {
+		if existing.RollbackPending {
+			// The create it would replay failed and is still being rolled
+			// back (service rollback_pending.go): 503, and the retry after
+			// reconcile has destroyed it creates afresh.
+			return nil, service.ErrCreateRollbackPending
+		}
 		return &models.CreateSandboxResponse{Sandbox: *existing, Replayed: true}, nil
 	}
 
@@ -280,6 +286,10 @@ func OverlapCreateAndPromote(
 // client was told failed. Only after the local truth is gone do we release
 // the reservation and the sealed secrets. The original leg error is what the
 // caller surfaces; retract failures are operational (metric + log).
+//
+// Before the destroy, the local row (when the create leg left one) is marked
+// rollback-pending: if the destroy cannot finish, the replay skips the row
+// and reconcile retries the destroy (markRollbackPending).
 func retractReservedCreate(
 	ctx context.Context,
 	svc *service.Service,
@@ -292,13 +302,14 @@ func retractReservedCreate(
 	defer cancel()
 
 	result := "ok"
+	markRollbackPending(rbCtx, svc, logger, sandboxID)
 	destroyErr := svc.DestroySandbox(rbCtx, sandboxID)
 	if destroyErr != nil {
 		switch {
 		case errors.Is(destroyErr, service.ErrClusterFinalizationUnavailable):
 			result = "delete_placement_failed"
 			if logger != nil {
-				logger.Error("cluster: rollback placement finalization failed; retaining local row",
+				logger.Error("cluster: rollback placement finalization failed; local row kept for the reconcile rollback sweep",
 					"sandbox_id", sandboxID, "err", destroyErr)
 			}
 		case createErr == nil:
@@ -374,6 +385,12 @@ func retractReservedCreate(
 // create+seal. DestroySandbox performs the owner+incarnation-fenced placement
 // delete after runtime/secret finalization and before removing the local row,
 // so an ambiguous Raft promote cannot leave a recreatable ghost placement.
+//
+// A promote that failed because the leader is gone usually means the destroy
+// fails too: its fence needs the same leader. So the row is marked
+// rollback-pending first (markRollbackPending), and a destroy that cannot
+// finish is retried by reconcile instead of the row being published by the
+// ownership replay.
 func retractFailedPromote(
 	ctx context.Context,
 	svc *service.Service,
@@ -384,6 +401,7 @@ func retractFailedPromote(
 	defer cancel()
 
 	result := "ok"
+	markRollbackPending(rbCtx, svc, logger, sandboxID)
 	destroyErr := svc.DestroySandbox(rbCtx, sandboxID)
 	if destroyErr != nil {
 		result = "destroy_failed"
@@ -397,6 +415,18 @@ func retractFailedPromote(
 	}
 
 	service.RecordPromoteRetract(result)
+}
+
+// markRollbackPending marks the local row of a failed create before its
+// rollback destroys it (plan item C5). Marking first covers both ways the
+// destroy can fail to finish: an error (no leader for its fence) and the
+// daemon dying before it ends. A failed mark is logged and the destroy runs
+// anyway: it is still the primary cleanup.
+func markRollbackPending(ctx context.Context, svc *service.Service, logger *slog.Logger, sandboxID string) {
+	if err := svc.MarkRollbackPending(ctx, sandboxID); err != nil && logger != nil {
+		logger.Error("cluster: could not mark failed create rollback-pending; if its destroy also fails, ownership replay may publish it",
+			"sandbox_id", sandboxID, "err", err)
+	}
 }
 
 func errString(err error) string {

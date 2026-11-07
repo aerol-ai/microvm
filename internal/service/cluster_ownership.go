@@ -51,6 +51,12 @@ func (s *Service) assertClusterOwnership(ctx context.Context, sandboxes []*model
 		if sb == nil || sb.ID == "" || sb.Status == models.SandboxStatusDestroyed {
 			continue
 		}
+		if sb.RollbackPending {
+			// The client was told this create failed. Publishing the row
+			// would promote its reservation or place it afresh: the failed
+			// create would come back. reconcileRollbackPending destroys it.
+			continue
+		}
 		if managed != nil {
 			if _, ok := managed[sb.ID]; !ok {
 				if !isStoppedFirecrackerSnapshotRow(sb) {
