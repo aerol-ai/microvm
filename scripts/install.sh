@@ -134,6 +134,12 @@ PAT_SCOPE="any"
 KEY_CUSTODY="file"
 SECRET_PROVIDER_ENV=""
 NO_START="false"
+# `init` or `join` as a word on the command line (plans/kubectl-style-
+# cluster-ops.md §3.1, §7): install this host, then hand the rest of the
+# arguments to `sandboxd init` / `sandboxd join`.
+NODE_COMMAND=""
+NODE_COMMAND_ARGS=()
+PRINT_JOIN_VERSION="false"
 PUBLIC_API_SOCKET="/run/sandboxd-public/api.sock"
 L4_PROXY_PROTOCOL="false"
 # --lb-health-port: a plain-HTTP /health listener for a load balancer's
@@ -552,7 +558,18 @@ Options:
                                every server option.
   --cli-url <url>              Download URL for the aerolvm binary
                                (--cli-only).
+  --print-join-version         With join: print the version the cluster asks
+                               new nodes to install, and stop.
   --help                       Show this help
+
+Starting or joining a cluster (one line per machine):
+  install.sh [options] init [sandboxd init options]
+  install.sh [options] join <url> --token <id.secret> [--ca-cert-hash sha256:<hex>] [--node-id <id>]
+  Installs this host (sandboxd is left for the command to start), then runs
+  `sandboxd init` or `sandboxd join` with everything after the word. For
+  join, the installer first asks the cluster which version to install
+  (checked with the token), unless --version or --sandboxd-url says. Get a
+  join line from `aerolvm join-command`; install options go before the word.
 
 Re-running (Linux):
   Each run saves every option except secrets and download choices to
@@ -1273,7 +1290,135 @@ install_cli() {
 	echo "Add it to an MCP client: aerolvm mcp config claude-code"
 }
 
+# join_cluster_version asks the join server which build a new node installs
+# (plans/kubectl-style-cluster-ops.md §6.5): GET /v1/join/cluster-info.
+# TLS is not checked yet; the answer is, with a key only the token derives
+# (HKDF, then HMAC over the CA and over the version and join URLs), so a man
+# in the middle can't pick the build. Prints the version; fails with a
+# message on any refusal. Without python3 it prints nothing and warns.
+join_cluster_version() {
+	if ! command -v python3 >/dev/null 2>&1; then
+		echo "python3 not found: installing $VERSION without asking the cluster which version it runs" >&2
+		return 0
+	fi
+	python3 - "$1" "$2" <<'PY'
+import base64, hashlib, hmac, json, re, ssl, sys, urllib.error, urllib.parse, urllib.request
+url, token = sys.argv[1].strip(), sys.argv[2].strip()
+m = re.fullmatch(r"([a-z0-9]{6})\.([a-z0-9]{32})", token)
+if not m:
+    sys.exit("the join token must look like <6 chars>.<32 chars>, lowercase letters and digits")
+tid, secret = m.group(1), m.group(2)
+if "://" not in url:
+    url = "https://" + url
+u = urllib.parse.urlsplit(url)
+if u.scheme != "https" or not u.hostname:
+    sys.exit("the join URL %s must be https://<server>:7003" % url)
+host = u.netloc if u.port else u.netloc + ":7003"
+ctx = ssl._create_unverified_context()  # trust comes from the MACs below
+try:
+    with urllib.request.urlopen("https://%s/v1/join/cluster-info?token_id=%s" % (host, tid), context=ctx, timeout=20) as r:
+        info = json.load(r)
+except urllib.error.HTTPError as e:
+    sys.exit("the join server refused the token (%d): %s; make a new one with: aerolvm join-command" % (e.code, e.read().decode(errors="replace").strip()))
+except Exception as e:
+    sys.exit("can't reach the join server %s: %s; open TCP 7003 to the servers" % (host, e))
+def mac(key, msg):
+    return hmac.new(key, msg, hashlib.sha256).digest()
+key = mac(mac(("aerolvm-join:" + tid).encode(), secret.encode()), b"aerolvm join discovery v1\x01")
+ca = info.get("ca_cert") or ""
+signed = "\n".join(["aerolvm-cluster-info-v1", ca, info.get("cluster_id") or "", info.get("version") or "", ",".join(info.get("join_urls") or [])])
+try:
+    ok = hmac.compare_digest(mac(key, ca.encode()), base64.b64decode(info.get("mac") or "")) and \
+        hmac.compare_digest(mac(key, signed.encode()), base64.b64decode(info.get("info_mac") or ""))
+except Exception:
+    ok = False
+if not ok:
+    sys.exit("the join server could not prove it knows the token: a wrong token, or not this cluster")
+print(info.get("version") or "")
+PY
+}
+
+# resolve_join_version sets VERSION to the cluster's build for `join`,
+# unless the operator chose one (--version or --sandboxd-url).
+resolve_join_version() {
+	local url="" token="" arg prev=""
+	for arg in ${NODE_COMMAND_ARGS[@]+"${NODE_COMMAND_ARGS[@]}"}; do
+		case "$arg" in
+			--token=*) token="${arg#--token=}"; prev=""; continue ;;
+			-*) ;;
+			*)
+				if [[ "$prev" == "--token" ]]; then
+					token="$arg"
+				elif [[ -z "$url" && "$prev" != -* ]]; then
+					url="$arg"
+				fi
+				;;
+		esac
+		prev="$arg"
+	done
+	if [[ -z "$url" || -z "$token" ]]; then
+		echo "join needs the join URL and a token: install.sh join https://<server>:7003 --token <id.secret> (aerolvm join-command prints the whole line)" >&2
+		exit 1
+	fi
+	if [[ "$PRINT_JOIN_VERSION" != "true" ]] && { [[ -n "$SANDBOXD_URL" ]] || flag_given --version; }; then
+		return 0
+	fi
+	local want
+	want="$(join_cluster_version "$url" "$token")" || exit 1
+	if [[ "$PRINT_JOIN_VERSION" == "true" ]]; then
+		echo "$want"
+		exit 0
+	fi
+	[[ -n "$want" ]] || return 0
+	if [[ ! "$want" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.+-][0-9A-Za-z.-]+)?$ ]]; then
+		echo "the cluster runs $want, which is not a release this installer can download; pass --sandboxd-url, --toolboxd-url and --checksums-url for that build (before the word join)" >&2
+		exit 1
+	fi
+	VERSION="$want"
+	echo "The cluster runs $want; installing that version."
+}
+
+# check_node_command refuses init and join where they can't work, before
+# anything on the machine changes.
+check_node_command() {
+	if [[ "$CLI_ONLY" == "true" || "$LOCAL_MODE" == "true" || "$CONFIG_ONLY" == "true" ]]; then
+		echo "$NODE_COMMAND sets up a cluster node; it does not work with --cli-only, --local or --config-only" >&2
+		exit 1
+	fi
+	if [[ "$NODE_COMMAND" == "join" ]]; then
+		resolve_join_version
+	fi
+	if [[ "$(uname -s)" != "Linux" ]]; then
+		echo "$NODE_COMMAND sets up a Linux cluster node; this is $(uname -s)" >&2
+		exit 1
+	fi
+	# sandboxd init and join start sandboxd once the cluster's config and
+	# keys are in place. Booted before that, as a lone node, it would make
+	# a server key of its own.
+	NO_START="true"
+}
+
+# run_node_command hands over to sandboxd init or join with the arguments
+# after the word. A release older than the command can't run it.
+run_node_command() {
+	local bin="$INSTALL_PREFIX/sandboxd"
+	if ! "$bin" version -o json 2>/dev/null | grep -q "\"$NODE_COMMAND\""; then
+		echo "the sandboxd installed here ($("$bin" version 2>/dev/null | head -n1)) has no 'sandboxd $NODE_COMMAND'; install a newer release" >&2
+		exit 1
+	fi
+	echo "Running sandboxd $NODE_COMMAND"
+	exec "$bin" "$NODE_COMMAND" ${NODE_COMMAND_ARGS[@]+"${NODE_COMMAND_ARGS[@]}"}
+}
+
 while [[ $# -gt 0 ]]; do
+	# init and join end the installer's options: everything after the word
+	# belongs to sandboxd, so it is never parsed here.
+	if [[ "$1" == "init" || "$1" == "join" ]]; then
+		NODE_COMMAND="$1"
+		shift
+		NODE_COMMAND_ARGS=("$@")
+		break
+	fi
 	# Every arm shifts its value away, so $1 here is always a flag.
 	GIVEN_FLAGS+="$1 "
 	case "$1" in
@@ -1475,6 +1620,10 @@ while [[ $# -gt 0 ]]; do
 			SECRET_PROVIDER_ENV="$2"
 			shift 2
 			;;
+		--print-join-version)
+			PRINT_JOIN_VERSION="true"
+			shift
+			;;
 		--help)
 			usage
 			exit 0
@@ -1491,6 +1640,14 @@ done
 # --cli-only run installs no node and must not pick up a node's settings.
 if [[ "$CLI_ONLY" != "true" ]]; then
 	load_saved_node_settings
+fi
+
+if [[ "$PRINT_JOIN_VERSION" == "true" && "$NODE_COMMAND" != "join" ]]; then
+	echo "--print-join-version goes with join: install.sh --print-join-version join <url> --token <id.secret>" >&2
+	exit 1
+fi
+if [[ -n "$NODE_COMMAND" ]]; then
+	check_node_command
 fi
 
 # --config-only re-renders a node that exists: it never makes a PAT, and with
@@ -4060,11 +4217,17 @@ else
 fi
 
 echo "AerolVM installed"
-if [[ "$NO_START" == "true" ]]; then
+if [[ -n "$NODE_COMMAND" ]]; then
+	echo "sandboxd: enabled, not started; sandboxd $NODE_COMMAND starts it"
+elif [[ "$NO_START" == "true" ]]; then
 	echo "sandboxd: enabled, not started (--no-start); cluster-join.sh starts it"
 fi
-echo "PAT token: $PAT_TOKEN"
-echo "Use header: Authorization: Bearer <PAT token>"
+# A joining node takes the cluster's PAT from its join answer, so this
+# machine's own one is never the one to use.
+if [[ "$NODE_COMMAND" != "join" ]]; then
+	echo "PAT token: $PAT_TOKEN"
+	echo "Use header: Authorization: Bearer <PAT token>"
+fi
 if [[ -n "$DOMAIN" ]]; then
 	echo "API URL: https://$DOMAIN"
 	echo "Health URL: https://$DOMAIN/health"
@@ -4087,3 +4250,8 @@ echo "  kernel never hands these out as outbound source ports — eliminates ran
 echo "  failures on ExposeTCPPort. 1000 slots = max concurrent TCP exposures per host."
 echo "systemd restart policy: always (5 second backoff, 10 restarts per 5 minutes)"
 echo "Health watchdog: sandboxd-healthcheck.timer probes the liveness socket every 30 seconds and restarts sandboxd only after 3 failed probes in a row over 90 seconds"
+
+# init or join: the host is set up; sandboxd does the rest.
+if [[ -n "$NODE_COMMAND" ]]; then
+	run_node_command
+fi
