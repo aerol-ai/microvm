@@ -10,6 +10,13 @@ package suite
 // sandboxd, so the file sorts after the rest of the suite. The cases share
 // one state and run in order; each skips when the one before left nothing
 // to build on.
+//
+// Terraform runs cluster-init.sh even on a one-node scenario, so the
+// harness's "single node" is a cluster of one server, where the single-node
+// routes answer 409 cluster_mode. A node installed with install.sh alone
+// runs with cluster mode off. UC-660 turns the scenario's node into that
+// (a systemd drop-in that sets SB_ENABLE_CLUSTER=false after cluster.env),
+// and UC-666's cleanup turns cluster mode back on.
 
 import (
 	"archive/tar"
@@ -36,6 +43,70 @@ var upgradeLive struct {
 	versionA, versionB, dirB string
 	keep                     *microvm.Sandbox
 	op                       nodeOpView
+	// standaloneTarget is the node UC-660 took out of cluster mode, for
+	// UC-666's cleanup to put back.
+	standaloneTarget string
+}
+
+// standaloneDropIn is read after cluster-init.sh's cluster.conf (drop-ins
+// apply in name order, and a later EnvironmentFile wins).
+const standaloneDropIn = `set -e
+printf 'SB_ENABLE_CLUSTER=false\n' | sudo tee /etc/sandboxd/standalone.env >/dev/null
+sudo mkdir -p /etc/systemd/system/sandboxd.service.d
+printf '[Service]\nEnvironmentFile=/etc/sandboxd/standalone.env\n' | sudo tee /etc/systemd/system/sandboxd.service.d/zz-standalone.conf >/dev/null
+sudo systemctl daemon-reload
+sudo systemctl restart sandboxd`
+
+const clusterAgain = `set -e
+sudo rm -f /etc/systemd/system/sandboxd.service.d/zz-standalone.conf /etc/sandboxd/standalone.env
+sudo systemctl daemon-reload
+sudo systemctl restart sandboxd`
+
+// healthMode waits until /health answers, and says whether the node runs
+// in cluster mode.
+func healthMode(t *testing.T, c *harness.Client) (cluster bool) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Minute)
+	for {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		var h struct {
+			Version         string `json:"version"`
+			ClusterTopology string `json:"cluster_topology"`
+		}
+		err := c.GetJSON(ctx, "/health", &h)
+		cancel()
+		if err == nil && h.Version != "" {
+			return h.ClusterTopology != ""
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("/health did not answer: %v", err)
+		}
+		time.Sleep(3 * time.Second)
+	}
+}
+
+// makeStandalone turns the scenario's one node into a node with cluster
+// mode off, as install.sh alone leaves it.
+func makeStandalone(t *testing.T, c *harness.Client) {
+	t.Helper()
+	if !healthMode(t, c) {
+		return
+	}
+	targets := harness.LoadIntegrationTargets()
+	if targets == nil || len(targets.Nodes) != 1 {
+		t.Skip("the single-node routes need a one-node deployment to take out of cluster mode")
+	}
+	target, ok := harness.SSHTarget(targets.Nodes[0])
+	if !ok {
+		t.Skipf("no SSH address for %s", targets.Nodes[0].Name)
+	}
+	if out, err := harness.SSHRun(t, target, standaloneDropIn); err != nil {
+		t.Fatalf("turn cluster mode off on %s: %v\n%s", targets.Nodes[0].Name, err, out)
+	}
+	upgradeLive.standaloneTarget = target
+	if healthMode(t, c) {
+		t.Fatal("the node still reports cluster mode after the standalone drop-in")
+	}
 }
 
 type nodeOpView struct {
@@ -51,7 +122,8 @@ type nodeOpView struct {
 // node's restart.
 func aerolvmLong(t *testing.T, args ...string) cliResult {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Minute)
+	// A slow uplink moves the 110 MiB sandboxd at about 1 Mbit/s.
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Minute)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, aerolvmBinary(t), args...)
 	cmd.Env = tokenEnv(t)
@@ -134,6 +206,7 @@ func TestUpgradeCLIPlanSingleNode(t *testing.T) {
 		t.Skip("needs the node to run this tree's local build (run.sh without --released/--version)")
 	}
 	c := client(t)
+	makeStandalone(t, c)
 	upgradeLive.versionA = runningVersion(t, c)
 	if upgradeLive.versionA != "itest-"+buildID {
 		t.Fatalf("the node runs %q, not this tree's build itest-%s", upgradeLive.versionA, buildID)
@@ -336,6 +409,19 @@ func TestUpgradeCLIReleasePullAndTamperedBundle(t *testing.T) {
 
 // UC-666: the node's upload route checks every file against its name.
 func TestUpgradeCLINodeFileRoutes(t *testing.T) {
+	// The last case puts cluster mode back, whatever happened before.
+	t.Cleanup(func() {
+		if upgradeLive.standaloneTarget == "" {
+			return
+		}
+		if out, err := harness.SSHRun(t, upgradeLive.standaloneTarget, clusterAgain); err != nil {
+			t.Errorf("RESTORE: turn cluster mode back on: %v\n%s", err, out)
+			return
+		}
+		if !healthMode(t, client(t)) {
+			t.Error("RESTORE: the node did not come back in cluster mode")
+		}
+	})
 	harness.Require(t, sc, "UC-666")
 	requireUpgradeDisruptive(t)
 	body := []byte("uc666 " + time.Now().String())
