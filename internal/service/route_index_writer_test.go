@@ -185,3 +185,29 @@ func TestIndexRouteWriterFeedsTheResponder(t *testing.T) {
 		t.Fatal("sanity: derived port")
 	}
 }
+
+// Under proxy routing the fence's 503 is the port host in flux, recorded
+// under the port route's id: the next UpsertPortRoute puts the live target
+// back, and DeletePortRoute (a destroy while fenced) removes it.
+func TestIndexRouteWriterFencedPortRoute(t *testing.T) {
+	table := routedns.NewOwnerTable()
+	w := newIndexRouteWriter(table, "d.test")
+	ctx := context.Background()
+
+	_ = w.UpsertPortRoute(ctx, "sb", "10.0.0.9", 8080)
+	if err := w.UpsertFencedPortRoute(ctx, "sb", 8080); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := table.Lookup("sb-8080.d.test"); got.State != routedns.TargetInFlux {
+		t.Fatalf("fenced port = %+v, want in flux (503)", got)
+	}
+	_ = w.UpsertPortRoute(ctx, "sb", "10.0.0.9", 8080)
+	if got, _ := table.Lookup("sb-8080.d.test"); got.State == routedns.TargetInFlux || got.Port != 8080 {
+		t.Fatalf("after the swap back the port = %+v, want the live target", got)
+	}
+	_ = w.UpsertFencedPortRoute(ctx, "sb", 8080)
+	_ = w.DeletePortRoute(ctx, "sb", 8080)
+	if _, ok := table.Lookup("sb-8080.d.test"); ok {
+		t.Fatal("DeletePortRoute left the fenced port behind")
+	}
+}

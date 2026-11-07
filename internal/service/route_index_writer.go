@@ -186,6 +186,14 @@ func (w *indexRouteWriter) UpsertPortRouteToPeer(context.Context, string, int, s
 	return nil
 }
 
+// UpsertFencedPortRoute puts the port's host in flux (503) under the port
+// route's id, as Caddy does, so the next UpsertPortRoute* replaces it and
+// DeletePortRoute removes it.
+func (w *indexRouteWriter) UpsertFencedPortRoute(_ context.Context, id string, port int) error {
+	w.set(caddy.PortRouteID(id, port), "", w.portHost(id, port), routedns.OwnerTarget{State: routedns.TargetInFlux, SandboxID: id, GuestPort: port})
+	return nil
+}
+
 func (w *indexRouteWriter) DeletePortRoute(_ context.Context, id string, port int) error {
 	w.remove(caddy.PortRouteID(id, port), w.portHost(id, port))
 	return nil

@@ -2,6 +2,7 @@ package caddy
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -241,5 +242,45 @@ func TestPingAndSnapshot(t *testing.T) {
 
 	if _, err := client.Snapshot(ctx); err != nil {
 		t.Fatalf("Snapshot: %v", err)
+	}
+}
+
+// UpsertFencedPortRoute writes a 503 + Retry-After under the port route's own
+// @id and host matcher, so it replaces the proxy route in place. It is a
+// no-op when Caddy is off or in IP mode, like UpsertPortRoute.
+func TestUpsertFencedPortRoute(t *testing.T) {
+	ctx := context.Background()
+	fake := newFakeCaddy(t)
+	for _, off := range []*Client{
+		{enabled: false, domain: "d.test", serverID: "srv0", baseURL: fake.URL, httpClient: fake.Client},
+		{enabled: true, serverID: "srv0", baseURL: fake.URL, httpClient: fake.Client},
+	} {
+		if err := off.UpsertFencedPortRoute(ctx, "abc", 8080); err != nil {
+			t.Fatalf("UpsertFencedPortRoute (off) = %v", err)
+		}
+	}
+	if len(fake.routes) != 0 {
+		t.Fatalf("a disabled or IP-mode client wrote routes: %v", fake.routes)
+	}
+
+	client := &Client{enabled: true, domain: "d.test", serverID: "srv0", baseURL: fake.URL, httpClient: fake.Client}
+	if err := client.UpsertPortRoute(ctx, "abc", "10.0.0.1", 8080); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.UpsertFencedPortRoute(ctx, "abc", 8080); err != nil {
+		t.Fatalf("UpsertFencedPortRoute: %v", err)
+	}
+	route, ok := fake.routes[PortRouteID("abc", 8080)]
+	if !ok || len(fake.routes) != 1 {
+		t.Fatalf("routes = %v, want only the port route, rewritten in place", fake.routes)
+	}
+	body, _ := json.Marshal(route)
+	for _, want := range []string{`"static_response"`, `"status_code":503`, `"Retry-After":["2"]`, `"abc-8080.d.test"`} {
+		if !strings.Contains(string(body), want) {
+			t.Fatalf("fenced route %s lacks %s", body, want)
+		}
+	}
+	if strings.Contains(string(body), "reverse_proxy") {
+		t.Fatalf("fenced route still proxies: %s", body)
 	}
 }
