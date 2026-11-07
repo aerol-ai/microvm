@@ -1685,6 +1685,25 @@ type Config struct {
 	// RPCs. Falls back to https://<derived-host>:<internal-port> when empty.
 	// Must be HTTPS — plaintext defeats the purpose. SB_CLUSTER_INTERNAL_ADVERTISE.
 	ClusterInternalAdvertiseURL string
+	// ClusterJoinListenAddr is the join listener (plans/kubectl-style-
+	// cluster-ops.md eng D3): TLS with this server's node cert, no client
+	// cert, and only the three join paths. Server roles in cluster mode
+	// default to 0.0.0.0:7003; workers and ingress nodes never open it, and
+	// "off" turns it off on a server. 7002 keeps requiring a client cert.
+	// SB_CLUSTER_JOIN_LISTEN_ADDR.
+	ClusterJoinListenAddr string
+	// ClusterCADir is the CA store on server nodes: ca.crt and ca.key, the
+	// signer for joins and cert renewal (D5). Never SB_CLUSTER_TLS_DIR,
+	// which enterprise mode keeps free of ca.key. A server without ca.key
+	// here serves cluster-info but refuses to sign until `sandboxd adopt`
+	// puts one there. SB_CLUSTER_CA_DIR, default /etc/sandboxd/cluster-ca
+	// (where cluster-init.sh keeps it).
+	ClusterCADir string
+	// ClusterNodeCertTTL is how long a node cert signed by a join or a
+	// renewal lasts. 90 days by default; shorter values (at least 5
+	// minutes) exist to exercise renewal. Never longer than 90 days: the
+	// deny tombstones assume no cert outlives that. SB_CLUSTER_NODE_CERT_TTL.
+	ClusterNodeCertTTL time.Duration
 	// ImageBuildContextEnabled is the operator opt-in for the contextHashes
 	// upload path — image builds whose context includes caller-supplied
 	// local files (COPY/ADD). Off by default because the resolution path
@@ -2369,6 +2388,9 @@ func load(keyTool bool) (Config, error) {
 		ClusterTLSDir:                 strings.TrimSpace(os.Getenv("SB_CLUSTER_TLS_DIR")),
 		ClusterInternalListenAddr:     getEnv("SB_CLUSTER_INTERNAL_LISTEN", "0.0.0.0:7002"),
 		ClusterInternalAdvertiseURL:   strings.TrimSpace(os.Getenv("SB_CLUSTER_INTERNAL_ADVERTISE")),
+		ClusterJoinListenAddr:         strings.TrimSpace(os.Getenv("SB_CLUSTER_JOIN_LISTEN_ADDR")),
+		ClusterCADir:                  getEnv("SB_CLUSTER_CA_DIR", "/etc/sandboxd/cluster-ca"),
+		ClusterNodeCertTTL:            getEnvDuration("SB_CLUSTER_NODE_CERT_TTL", maxClusterNodeCertTTL),
 		ImageBuildContextEnabled:      getEnvBool("SB_IMAGE_BUILD_CONTEXT_ENABLED", false),
 		ImageBuildTimeout:             getEnvDuration("SB_IMAGE_BUILD_TIMEOUT", 10*time.Minute),
 		ImageBuildGCEnabled:           getEnvBool("SB_IMAGE_BUILD_GC_ENABLED", true),
@@ -2897,6 +2919,7 @@ func load(keyTool bool) (Config, error) {
 	if cfg.NodeRole != NodeRoleMixed && !cfg.EnableCluster {
 		return Config{}, fmt.Errorf("SB_NODE_ROLE=%q requires SB_ENABLE_CLUSTER=true (single-node mode is implicitly %q)", cfg.NodeRole, NodeRoleMixed)
 	}
+	cfg.ClusterJoinListenAddr = resolveJoinListenAddr(cfg.ClusterJoinListenAddr, cfg.EnableCluster && cfg.IsServer())
 
 	// Cluster-mode invariants. Single-node mode (EnableCluster=false) skips
 	// all of this — defaults are non-load-bearing in that case.
@@ -2961,6 +2984,9 @@ func load(keyTool bool) (Config, error) {
 		}
 		if cfg.ClusterTLSDir == "" {
 			return Config{}, errors.New("SB_CLUSTER_TLS_DIR is required when SB_ENABLE_CLUSTER=true")
+		}
+		if cfg.ClusterNodeCertTTL < minClusterNodeCertTTL || cfg.ClusterNodeCertTTL > maxClusterNodeCertTTL {
+			return Config{}, fmt.Errorf("SB_CLUSTER_NODE_CERT_TTL must be between %s and %s (got %s)", minClusterNodeCertTTL, maxClusterNodeCertTTL, cfg.ClusterNodeCertTTL)
 		}
 		if cfg.SecretRecipientBackupCount < 1 {
 			return Config{}, errors.New("SB_SECRET_RECIPIENT_BACKUP_COUNT must be >= 1 when SB_ENABLE_CLUSTER=true")
@@ -3320,6 +3346,34 @@ func firstNonEmpty(values ...string) string {
 		}
 	}
 	return ""
+}
+
+// Bounds on SB_CLUSTER_NODE_CERT_TTL. The upper bound is the 90 days
+// cluster-sign-node.sh always used.
+const (
+	minClusterNodeCertTTL = 5 * time.Minute
+	maxClusterNodeCertTTL = 90 * 24 * time.Hour
+)
+
+// defaultClusterJoinListenAddr is the join port on server nodes (eng D3).
+const defaultClusterJoinListenAddr = "0.0.0.0:7003"
+
+// resolveJoinListenAddr applies SB_CLUSTER_JOIN_LISTEN_ADDR: unset means
+// the default on a cluster server and off elsewhere; "off" (or false,
+// disabled, none) means off. Only server roles ever listen: joins are
+// signed by a CA key that workers never hold, so a worker never sees join
+// traffic and there is no relay.
+func resolveJoinListenAddr(raw string, clusterServer bool) string {
+	if !clusterServer {
+		return ""
+	}
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "":
+		return defaultClusterJoinListenAddr
+	case "off", "false", "disabled", "none", strings.ToLower(envClearSentinel):
+		return ""
+	}
+	return strings.TrimSpace(raw)
 }
 
 // KeyRingPath is custody=file's server-key ring: SB_CREDENTIAL_KEY_RING_PATH,
