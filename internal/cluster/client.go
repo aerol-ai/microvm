@@ -173,6 +173,11 @@ func New(cfg config.Config, logger *slog.Logger, admitter *capacity.Admitter) (*
 	if err != nil {
 		return nil, fmt.Errorf("cluster.New: recovery store: %w", err)
 	}
+	// Installed before raft starts so every entry this server applies is
+	// recorded. The capacity lease cache built below shares it and clears
+	// what each heartbeat covers (capacity_unreported.go).
+	unreported := newUnreportedLoad()
+	fsm.unreported.Store(unreported)
 
 	// Load cluster TLS material first — both raft transport and the internal
 	// HTTPS listener need it. Cluster configuration rejects an empty TLS dir.
@@ -295,7 +300,9 @@ func New(cfg config.Config, logger *slog.Logger, admitter *capacity.Admitter) (*
 			return ok && m.Alive
 		})
 	}
-	c.capacityLeases = newCapacityLeaseCache(c.nodeID, admitter, cfg.ClusterCapacityGossipInterval, logger)
+	leases := newCapacityLeaseCache(c.nodeID, admitter, cfg.ClusterCapacityGossipInterval, logger)
+	leases.unreported = unreported
+	c.capacityLeases = leases
 	c.startCapacityLeaseLoop(cfg.ClusterCapacityGossipInterval)
 
 	// Slow reconcile loop: catches the "joined too fast" race where the
@@ -1722,6 +1729,28 @@ func (c *Cluster) membersWithCapacity() []Member {
 		return members
 	}
 	return c.capacityLeases.apply(members, time.Now())
+}
+
+// pendingLoadByNode is the load placement adds to each node's last capacity
+// heartbeat: reservations still in flight (the FSM) plus load the FSM stopped
+// counting at a promote or failover reassign that the heartbeat does not show
+// yet (capacity_unreported.go). Without the second part a promoted sandbox
+// counted nowhere until the next heartbeat (plan item C7).
+//
+// Look nodes up with of only AFTER reading the members the load is added to.
+// That read re-reads this server's own admitter, which clears the entries the
+// admitter now shows; looked up first, this server's last promote would count
+// twice on the next create here. The cost of this order is a peer heartbeat
+// stored between the two reads: its entries are gone while the copied member
+// still has the older snapshot, so that one decision misses them, as every
+// decision did before this change.
+func (c *Cluster) pendingLoadByNode(now int64) pendingLoad {
+	reserved, runtimes := c.fsm.pendingReservationLoadByNode(now)
+	load := pendingLoad{reserved: reserved, runtimes: runtimes}
+	if c.capacityLeases != nil {
+		load.unreported = c.capacityLeases.unreported
+	}
+	return load
 }
 
 func (c *Cluster) Placements() []Placement {

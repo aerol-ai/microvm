@@ -128,7 +128,9 @@ func (c *Cluster) SelectPlacementWithCandidates(req capacity.Request) (Placement
 	// arrive between gossip ticks both pick the same "best" node and double-
 	// book it. The FSM serializes opReserve through raft, so the second
 	// SelectPlacement on the same leader sees the first reservation here.
-	pending, pendingRuntimes := c.fsm.pendingReservationLoadByNode(time.Now().Unix())
+	// Promoted and failed-over sandboxes the heartbeat does not show yet are
+	// counted too: that window is the same double-booking one step later.
+	pending := c.pendingLoadByNode(time.Now().Unix())
 	// Drained nodes are excluded from the candidate set entirely. Cheaper and
 	// clearer than threading the flag through nodeFits — drain is a hard
 	// admission rule (operator says "don't put more work here"), not a
@@ -206,7 +208,8 @@ func (c *Cluster) SelectPlacementWithCandidates(req capacity.Request) (Placement
 			rejects["mediated_egress"]++
 			continue
 		}
-		switch nodeFitVerdict(m, req, pending[m.NodeID]) {
+		extra, extraByRuntime := pending.of(m.NodeID)
+		switch nodeFitVerdict(m, req, extra) {
 		case fitIncompatible:
 			rejects["capacity"]++
 			continue
@@ -218,7 +221,7 @@ func (c *Cluster) SelectPlacementWithCandidates(req capacity.Request) (Placement
 		// A node with CPU and memory to spare is still full for this
 		// runtime when its network-slot pool is: the create would fail
 		// there with "no free slot" (bank density run, 2026-11-01).
-		if !slotsFit(m, req, pendingRuntimes[m.NodeID]) {
+		if !slotsFit(m, req, extraByRuntime) {
 			rejects["network_slots"]++
 			full = true
 			continue
@@ -235,8 +238,12 @@ func (c *Cluster) SelectPlacementWithCandidates(req capacity.Request) (Placement
 	// Power-of-two-choices.
 	a, b := pickTwo(candidates)
 	winner := a
-	if !sameNode(a, b) && placementScore(b, req, pending[b.NodeID], pendingRuntimes[b.NodeID]) > placementScore(a, req, pending[a.NodeID], pendingRuntimes[a.NodeID]) {
-		winner = b
+	if !sameNode(a, b) {
+		extraA, byRuntimeA := pending.of(a.NodeID)
+		extraB, byRuntimeB := pending.of(b.NodeID)
+		if placementScore(b, req, extraB, byRuntimeB) > placementScore(a, req, extraA, byRuntimeA) {
+			winner = b
+		}
 	}
 
 	if winner.NodeID == c.nodeID {
@@ -504,10 +511,11 @@ func freeSlotsAfterPending(m Member, req capacity.Request, pendingByRuntime map[
 // empty SupportedRuntimes), so a rolling upgrade places exactly as before.
 //
 // The heartbeat can lag a create that has already been promoted (the pending
-// claim is gone, the next pull has not run): within one capacity interval a
-// node can still be picked for its last slots. The worker then refuses with
-// its pool's capacity error (503 + Retry-After) and the retry is placed again;
-// that is the same window CPU and memory accounting have.
+// claim is gone, the next pull has not run). pendingByRuntime carries those
+// creates too until a heartbeat requested after the promote is stored
+// (capacity_unreported.go), so the window that remains is a failover recreate
+// the new owner has not started yet. There the worker refuses with its pool's
+// capacity error (503 + Retry-After), the same as for CPU and memory.
 func slotsFit(m Member, req capacity.Request, pendingByRuntime map[string]int) bool {
 	free, _, ok := freeSlotsAfterPending(m, req, pendingByRuntime)
 	return !ok || free >= 1
@@ -591,21 +599,25 @@ func (c *Cluster) admitReservationCommand(cmd command) error {
 	if len(reservations) == 0 {
 		return nil
 	}
-	now := time.Now().Unix()
-	pending, pendingRuntimes := c.fsm.pendingReservationLoadByNode(now)
-	pendingCounts := make(map[string]int, len(reservations))
-	for _, r := range reservations {
-		if _, ok := pendingCounts[r.OwnerNodeID]; !ok {
-			pendingCounts[r.OwnerNodeID] = c.fsm.livePendingReservationCount(r.OwnerNodeID, now)
-		}
-	}
 	templateIDs := make([]string, 0, len(reservations))
 	for _, r := range reservations {
 		if r.Spec != nil {
 			templateIDs = append(templateIDs, r.Spec.TemplateID)
 		}
 	}
+	// Heartbeats before pending lookups, as pendingLoadByNode requires.
 	members := c.withCatalogueTemplateHolders(c.membersWithCapacity(), templateIDs...)
+	now := time.Now().Unix()
+	load := c.pendingLoadByNode(now)
+	pending := make(map[string]capacity.Request, len(reservations))
+	pendingRuntimes := make(map[string]map[string]int, len(reservations))
+	pendingCounts := make(map[string]int, len(reservations))
+	for _, r := range reservations {
+		if _, ok := pendingCounts[r.OwnerNodeID]; !ok {
+			pending[r.OwnerNodeID], pendingRuntimes[r.OwnerNodeID] = load.of(r.OwnerNodeID)
+			pendingCounts[r.OwnerNodeID] = c.fsm.livePendingReservationCount(r.OwnerNodeID, now)
+		}
+	}
 	return admitReservationCommands(members, pending, pendingRuntimes, pendingCounts, c.cfg.ClusterCreateMaxPendingPerWorker, reservations)
 }
 
