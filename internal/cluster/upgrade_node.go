@@ -74,6 +74,15 @@ const (
 	UpgradeNodeMigrated = "migrated"
 )
 
+// materializeTimeout bounds getting an apply's files into place (a copy
+// from a server when the store lacks one); launchTimeout bounds starting
+// the upgrader. Both outlive the leader's call on purpose; tests shorten
+// them.
+var (
+	materializeTimeout = 45 * time.Second
+	launchTimeout      = 30 * time.Second
+)
+
 // UpgradeStepRequest is the leader's call to one node.
 type UpgradeStepRequest struct {
 	RolloutID string `json:"rollout_id"`
@@ -466,7 +475,11 @@ func (u *upgradeNode) apply(ctx context.Context, p nodeupgrade.Paths, req Upgrad
 		nreq.HealthTimeout = d
 	}
 	if len(req.Files) > 0 {
-		dir, err := u.materialize(ctx, p, req, rollback)
+		// The leader's call may give up before a slow copy ends; the work
+		// must not die with it, or a rollback would lose its fallback.
+		mctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), materializeTimeout)
+		dir, err := u.materialize(mctx, p, req, rollback)
+		cancel()
 		switch {
 		case err == nil:
 			nreq.SHA256, nreq.From = cloneStringMap(req.Files), dir
@@ -480,7 +493,14 @@ func (u *upgradeNode) apply(ctx context.Context, p nodeupgrade.Paths, req Upgrad
 			return resp, stepErr(http.StatusUnprocessableEntity, "", "%v", err)
 		}
 	}
-	op, err := u.launch(ctx, u.host, p.Sandboxd, nreq)
+	lctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), launchTimeout)
+	defer cancel()
+	if u.host.UnitActive(lctx, nodeupgrade.LaunchUnit(nreq.Op)) {
+		// Launched by an earlier call whose answer was lost.
+		resp.State = UpgradeNodeStarted
+		return resp, nil
+	}
+	op, err := u.launch(lctx, u.host, p.Sandboxd, nreq)
 	if err != nil {
 		if errors.Is(err, nodeupgrade.ErrUsage) {
 			return resp, stepErr(http.StatusBadRequest, "", "%v", err)

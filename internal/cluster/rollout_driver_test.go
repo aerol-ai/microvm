@@ -753,8 +753,17 @@ func TestRolloutDriverHelpers(t *testing.T) {
 	if stepCode(errors.New("x")) != "" || stepCode(&UpgradeStepError{Code: "c"}) != "c" {
 		t.Fatal("stepCode")
 	}
-	if prevFiles(nil, "amd64") != nil || prevFiles(map[string]string{"a": "b"}, "") != nil {
+	if prevFiles(nil, "amd64", nil) != nil || prevFiles(map[string]string{"a": "b"}, "", nil) != nil {
 		t.Fatal("prevFiles")
+	}
+	// Only binaries the target replaces count for a rollback.
+	got := prevFiles(map[string]string{"sandboxd": "s", "toolboxd": "t", "caddy": "c"}, "arm64",
+		map[string]string{"sandboxd_linux_arm64": "x", "toolboxd": "y", "release.json": "z"})
+	if len(got) != 2 || got["sandboxd_linux_arm64"] != "s" || got["toolboxd_linux_arm64"] != "t" || got["caddy_linux_arm64"] != "" {
+		t.Fatalf("prevFiles = %v", got)
+	}
+	if prevFiles(map[string]string{"caddy": "c"}, "amd64", map[string]string{"sandboxd": "x"}) != nil {
+		t.Fatal("prevFiles kept a binary the target does not replace")
 	}
 	if !majorityUp([]string{"a", "b", "c"}, "b", "a", map[string]Member{"c": {Alive: true}}) ||
 		majorityUp([]string{"a", "b", "c"}, "b", "a", map[string]Member{}) {

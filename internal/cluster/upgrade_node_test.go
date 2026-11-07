@@ -391,10 +391,19 @@ func TestUpgradeNodeRollbackApply(t *testing.T) {
 	g.u.servers = func() []Member { return nil }
 	req.Files, req.Op = missing, "op2"
 	r.Nodes["n1"].Op = "op2"
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
-	defer cancel()
-	if _, err := g.u.Step(ctx, "lead", req); err != nil || len(g.launched) != 2 || g.launched[1].SHA256 != nil || !g.launched[1].Rollback {
+	saved := materializeTimeout
+	materializeTimeout = 20 * time.Millisecond
+	defer func() { materializeTimeout = saved }()
+	if _, err := g.u.Step(context.Background(), "lead", req); err != nil || len(g.launched) != 2 || g.launched[1].SHA256 != nil || !g.launched[1].Rollback {
 		t.Fatalf("fallback rollback = %v %+v", err, g.launched)
+	}
+	// The leader's earlier call launched the unit but its answer was lost:
+	// the running unit answers started, and nothing launches twice.
+	req.Op = "op3"
+	r.Nodes["n1"].Op = "op3"
+	g.host.active[nodeupgrade.LaunchUnit("op3")] = true
+	if resp, err := g.u.Step(context.Background(), "lead", req); err != nil || resp.State != UpgradeNodeStarted || len(g.launched) != 2 {
+		t.Fatalf("apply while its unit runs = %+v %v (%d launches)", resp, err, len(g.launched))
 	}
 }
 

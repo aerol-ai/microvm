@@ -340,7 +340,7 @@ func (d *rolloutDriver) afterStage(ctx context.Context, rolloutID string, n Roll
 		d.update(ctx, RolloutNodeUpdate{RolloutID: rolloutID, NodeID: n.NodeID, State: upgradewire.NodeDone, ExpectState: upgradewire.NodePending, Version: resp.Version, Arch: resp.Arch, ClearError: true})
 	case err == nil:
 		d.update(ctx, RolloutNodeUpdate{RolloutID: rolloutID, NodeID: n.NodeID, State: upgradewire.NodeStaged, ExpectState: upgradewire.NodePending,
-			Version: resp.Version, Arch: resp.Arch, PrevFiles: prevFiles(resp.Installed, resp.Arch), ClearError: true})
+			Version: resp.Version, Arch: resp.Arch, PrevFiles: prevFiles(resp.Installed, resp.Arch, req.Files), ClearError: true})
 		d.logf("cluster: rollout node staged", "rollout_id", rolloutID, "node_id", n.NodeID, "fetched", len(resp.Fetched), "bytes", resp.Bytes)
 	case stepCode(err) == upgradewire.ErrCodeRemoteUpgradeDisabled:
 		d.update(ctx, RolloutNodeUpdate{RolloutID: rolloutID, NodeID: n.NodeID, State: upgradewire.NodeManual, ExpectState: upgradewire.NodePending,
@@ -799,14 +799,28 @@ func failedSummary(r *RolloutRecord, what string) string {
 }
 
 // prevFiles names the binaries a node reported at staging as the previous
-// version's assets for its CPU type.
-func prevFiles(installed map[string]string, arch string) map[string]string {
+// version's assets for its CPU type. Only binaries the target replaces
+// count: a rollback puts back what the upgrade changed, and a binary the
+// upgrade never touched (Caddy, when the release leaves it out) would only
+// make a rollback hunt for a copy it does not need.
+func prevFiles(installed map[string]string, arch string, target map[string]string) map[string]string {
 	if len(installed) == 0 || arch == "" {
 		return nil
 	}
+	replaced := map[string]bool{}
+	for name := range target {
+		if m := rolloutAssetRe.FindStringSubmatch(name); m != nil {
+			replaced[m[1]] = true
+		}
+	}
 	out := map[string]string{}
 	for role, sum := range installed {
-		out[role+"_linux_"+arch] = sum
+		if replaced[role] {
+			out[role+"_linux_"+arch] = sum
+		}
+	}
+	if len(out) == 0 {
+		return nil
 	}
 	return out
 }
