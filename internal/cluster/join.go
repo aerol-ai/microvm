@@ -99,6 +99,10 @@ type JoinTokenCreateRequest struct {
 	TTL       string `json:"ttl,omitempty"`
 	Reusable  bool   `json:"reusable,omitempty"`
 	CreatedBy string `json:"created_by,omitempty"`
+	// Token registers a token the caller made (`sandboxd init --token`,
+	// Terraform's random_password) instead of a random one. Registering the
+	// same token again answers the stored row, so a re-run of init is safe.
+	Token string `json:"token,omitempty"`
 }
 
 // JoinTokenCreated is the answer: the only time the secret is shown.
@@ -218,6 +222,11 @@ type JoinResponse struct {
 	Version        string           `json:"version"`
 	Replay         bool             `json:"replay,omitempty"`
 	DialBack       []DialBackResult `json:"dial_back,omitempty"`
+	// PATToken is the cluster's shared SB_PAT_TOKEN. Peers prove they are
+	// nodes with it on every internal call (pkg/api/auth.go), so a node with
+	// another PAT is refused everywhere; an operator used to copy it by hand
+	// with the other join secrets (C1). Replacing it is out of scope (§12).
+	PATToken string `json:"pat_token,omitempty"`
 }
 
 // DialBackResult is one port the join server dialled on the caller.
@@ -234,6 +243,11 @@ type PreflightRequest struct {
 	Token string     `json:"token"`
 	Role  string     `json:"role,omitempty"`
 	Ports *JoinPorts `json:"ports,omitempty"`
+	// NodeID asks whether the ID is free (§4.3's node ID check). KeyHash
+	// is the caller's node key when it already has one: an ID admitted for
+	// that very key is a re-run, not a clash.
+	NodeID  string `json:"node_id,omitempty"`
+	KeyHash string `json:"key_hash,omitempty"`
 }
 
 // PreflightResponse reports the dial-back and the server's clock.
@@ -243,6 +257,8 @@ type PreflightResponse struct {
 	DialBack   []DialBackResult `json:"dial_back"`
 	ServerTime time.Time        `json:"server_time"`
 	Version    string           `json:"version"`
+	// NodeIDInUse: a live member, or another admitted key, holds NodeID.
+	NodeIDInUse bool `json:"node_id_in_use,omitempty"`
 }
 
 // JoinDialBackError carries the per-port results of a failed dial-back.
@@ -510,12 +526,21 @@ func (c *Cluster) CreateJoinToken(ctx context.Context, req JoinTokenCreateReques
 	if err != nil {
 		return JoinTokenCreated{}, err
 	}
+	given := strings.TrimSpace(req.Token)
+	if given != "" {
+		if _, _, err := ParseJoinToken(given); err != nil {
+			return JoinTokenCreated{}, fmt.Errorf("%w: %v", ErrJoinBadRequest, err)
+		}
+	}
 	// A random id colliding is ~2^-31 per pair; retry a couple of times
-	// rather than surface it.
+	// rather than surface it. A given token is never retried: its id is the
+	// caller's.
 	for attempt := 0; ; attempt++ {
-		token, err := GenerateJoinToken()
-		if err != nil {
-			return JoinTokenCreated{}, err
+		token := given
+		if token == "" {
+			if token, err = GenerateJoinToken(); err != nil {
+				return JoinTokenCreated{}, err
+			}
 		}
 		id, secret, _ := ParseJoinToken(token)
 		disc, err := joinDiscoveryKey(id, secret)
@@ -530,18 +555,26 @@ func (c *Cluster) CreateJoinToken(ctx context.Context, req JoinTokenCreateReques
 		if ttl > 0 {
 			rec.ExpiresUnixNano = now.Add(ttl).UnixNano()
 		}
-		_, err = c.WriteJoin(ctx, JoinWriteRequest{Kind: joinWritePutToken, Token: &rec})
-		if errors.Is(err, ErrJoinTokenIDTaken) && attempt < 3 {
+		written, err := c.WriteJoin(ctx, JoinWriteRequest{Kind: joinWritePutToken, Token: &rec})
+		if errors.Is(err, ErrJoinTokenIDTaken) && given == "" && attempt < 3 {
 			continue
 		}
 		if err != nil {
 			return JoinTokenCreated{}, err
 		}
+		// The FSM answers the stored row: on a repeat of a given token that
+		// is the first registration, whose role and expiry stand.
+		if stored := written.Token; stored != nil {
+			if stored.Role != role || stored.Reusable != req.Reusable {
+				return JoinTokenCreated{}, fmt.Errorf("%w: %s is already registered as a %s token (reusable %t)", ErrJoinTokenIDTaken, id, stored.Role, stored.Reusable)
+			}
+			rec = *stored
+		}
 		out := JoinTokenCreated{
 			Token: token, ID: id, Role: role, Reusable: req.Reusable,
 			CACertHash: c.clusterID(), JoinURLs: c.joinURLs(), Warning: warning,
 		}
-		if ttl > 0 {
+		if rec.ExpiresUnixNano != 0 {
 			exp := time.Unix(0, rec.ExpiresUnixNano).UTC()
 			out.ExpiresAt = &exp
 		}
@@ -837,7 +870,24 @@ func (c *Cluster) JoinPreflight(ctx context.Context, req PreflightRequest, sourc
 		return PreflightResponse{}, err
 	}
 	results, ok := dialBack(ctx, c.joinDial, source, ports)
-	return PreflightResponse{OK: ok, Role: role, DialBack: results, ServerTime: time.Now().UTC(), Version: c.joinVersion()}, nil
+	inUse := c.nodeIDTaken(strings.TrimSpace(req.NodeID), strings.TrimSpace(req.KeyHash))
+	return PreflightResponse{
+		OK: ok && !inUse, Role: role, DialBack: results, ServerTime: time.Now().UTC(), Version: c.joinVersion(), NodeIDInUse: inUse,
+	}, nil
+}
+
+// nodeIDTaken is preflight's node ID check: a join for nodeID would be
+// refused because another key is admitted for it, or a live member holds
+// it with no admitted record (a scripted node). keyHash's own record is a
+// re-run, not a clash.
+func (c *Cluster) nodeIDTaken(nodeID, keyHash string) bool {
+	if nodeID == "" {
+		return false
+	}
+	if rec, ok := c.fsm.admittedNode(nodeID); ok {
+		return rec.KeyHash != keyHash
+	}
+	return c.liveMemberHoldsID(nodeID, keyHash) != nil
 }
 
 // Join admits one node: checks, dial-back, one Raft op, then the signature
@@ -900,7 +950,7 @@ func (c *Cluster) Join(ctx context.Context, req JoinRequest, source netip.Addr) 
 		NodeCert: string(certPEM), CACert: string(signer.CertPEM()),
 		GossipKey: c.cfg.ClusterGossipSecretKey, BootstrapPeers: c.bootstrapPeers(), JoinURLs: c.joinURLs(),
 		Credentials: c.credentialBundle(), NotAfter: leaf.NotAfter.UTC(), Version: c.joinVersion(),
-		Replay: admitted.Replay, DialBack: results,
+		Replay: admitted.Replay, DialBack: results, PATToken: c.patToken,
 	}
 	// The CA key goes to servers only (D5), by the token's role.
 	if admitted.Node.IsServer() {

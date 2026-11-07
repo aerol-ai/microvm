@@ -221,7 +221,7 @@ func (s *joinServer) preflight(w http.ResponseWriter, r *http.Request, src netip
 		s.fail(w, ev, fmt.Errorf("%w: invalid JSON body", ErrJoinBadRequest), nil)
 		return
 	}
-	ev.TokenID, ev.Role = publicTokenID(req.Token), strings.TrimSpace(req.Role)
+	ev.TokenID, ev.Role, ev.NodeID = publicTokenID(req.Token), strings.TrimSpace(req.Role), strings.TrimSpace(req.NodeID)
 	ctx, cancel := context.WithTimeout(r.Context(), joinRequestTimeout)
 	defer cancel()
 	resp, err := s.svc.JoinPreflight(ctx, req, src)
@@ -232,6 +232,9 @@ func (s *joinServer) preflight(w http.ResponseWriter, r *http.Request, src netip
 	ev.Role = resp.Role
 	if !resp.OK {
 		ev.Reason = "dial_back"
+		if resp.NodeIDInUse {
+			ev.Reason = "node_id_in_use"
+		}
 		s.record(ev, "failure")
 	} else {
 		s.record(ev, "success")
