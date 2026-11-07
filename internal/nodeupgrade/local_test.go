@@ -112,8 +112,9 @@ func TestLocalStartLaunchesOnceAndRetriesGetTheSameOp(t *testing.T) {
 	if _, _, err := r.l.Start(ctx, releaseRequest("v0.6.14")); !errors.As(err, &running) || running.Op != resp.Op || running.Version != "v0.6.13" {
 		t.Fatalf("other version = %v", err)
 	}
-	// The upgrader writes its record: GET reads it.
+	// The upgrader, running in its unit, writes its record: GET reads it.
 	r.clock = r.clock.Add(time.Second)
+	r.host.active[LaunchUnit(resp.Op)] = true
 	r.writeState(resp.Op, "v0.6.13", PhaseSwapping, r.clock)
 	if got, _ := r.l.Latest(ctx); got.State != string(PhaseSwapping) || got.From != "v0.6.11" {
 		t.Fatalf("latest with a record = %+v", got)
@@ -150,6 +151,66 @@ func TestLocalPendingThatNeverWroteARecordFails(t *testing.T) {
 	// It no longer blocks a new upgrade.
 	if _, started, err := r.l.Start(ctx, releaseRequest("v0.6.14")); err != nil || !started {
 		t.Fatalf("after vanished = %v %v", started, err)
+	}
+}
+
+// J15: an upgrader that dies after its first record but before its last
+// (OOM, kill -9) left the API answering "running" until sandboxd restarted,
+// and refusing every other version. With its unit gone and the lock free,
+// the op now reads as failed and no longer blocks a new upgrade; a
+// hand-run upgrader (no unit) that still holds the lock still counts.
+func TestLocalReportsADeadUpgraderAsFailed(t *testing.T) {
+	r := newLocalRig(t)
+	ctx := context.Background()
+	resp, _, err := r.l.Start(ctx, releaseRequest("v0.6.13"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.clock = r.clock.Add(time.Second)
+	r.host.active[LaunchUnit(resp.Op)] = true
+	r.writeState(resp.Op, "v0.6.13", PhaseStaging, r.clock)
+	if got, _ := r.l.Latest(ctx); got.State != string(PhaseStaging) {
+		t.Fatalf("live upgrader = %+v", got)
+	}
+	// The unit is gone, but a process still holds the lock: running.
+	r.host.active[LaunchUnit(resp.Op)] = false
+	lk, err := acquireLock(r.l.StateDir, resp.Op)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := r.l.Latest(ctx); got.State != string(PhaseStaging) {
+		t.Fatalf("lock held = %+v", got)
+	}
+	var running *ErrRunning
+	if _, _, err := r.l.Start(ctx, releaseRequest("v0.6.14")); !errors.As(err, &running) {
+		t.Fatalf("other version while the lock is held = %v", err)
+	}
+	// The upgrader dies: unit gone, lock free, record unfinished.
+	lk.release()
+	got, ok := r.l.Latest(ctx)
+	if !ok || got.State != upgradewire.NodeOpFailed || got.Op != resp.Op ||
+		!strings.Contains(got.Error, "stopped at staging") || !strings.Contains(got.Error, "journalctl -u "+LaunchUnit(resp.Op)) {
+		t.Fatalf("dead upgrader = %+v %v", got, ok)
+	}
+	// A retry of the same version is no longer "the same op, running".
+	if again, started, err := r.l.Start(ctx, releaseRequest("v0.6.13")); err != nil || !started || again.Op == resp.Op {
+		t.Fatalf("same version after the death = %+v %v %v", again, started, err)
+	}
+	// And another version starts too (a fresh rig: the one above launched).
+	r2 := newLocalRig(t)
+	r2.writeState("20261107t100000-deadbeef", "v0.6.13", PhaseSwapping, r2.clock)
+	if got, _ := r2.l.Latest(ctx); got.State != upgradewire.NodeOpFailed {
+		t.Fatalf("dead hand-run upgrader = %+v", got)
+	}
+	if _, started, err := r2.l.Start(ctx, releaseRequest("v0.6.14")); err != nil || !started {
+		t.Fatalf("other version after the death = %v %v", started, err)
+	}
+	// A record that finished between the look and the lock check is not
+	// called dead.
+	stale := &State{Op: "20261107t100000-deadbeef", Phase: PhaseStaging}
+	r2.writeState(stale.Op, "v0.6.13", PhaseDone, r2.clock)
+	if r2.l.upgraderGone(ctx, stale) || r2.l.upgraderGone(ctx, nil) {
+		t.Fatal("a finished op read as dead")
 	}
 }
 

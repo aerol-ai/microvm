@@ -276,14 +276,47 @@ func (l *Local) Latest(ctx context.Context) (resp upgradewire.NodeUpgradeRespons
 	if st == nil {
 		return resp, false
 	}
-	return toResponse(st), true
+	return l.answer(ctx, st), true
+}
+
+// answer is a record's answer, failed when its upgrader died before it
+// wrote a final record (J15): without this the API said "running" until
+// sandboxd restarted, and refused every other version meanwhile.
+func (l *Local) answer(ctx context.Context, st *State) upgradewire.NodeUpgradeResponse {
+	r := toResponse(st)
+	if l.upgraderGone(ctx, st) {
+		r.State = upgradewire.NodeOpFailed
+		r.Error = fmt.Sprintf("the upgrader stopped at %s without finishing (see journalctl -u %s); the next upgrade, or the next sandboxd start, settles the files it left",
+			st.Phase, LaunchUnit(st.Op))
+		if st.Error != "" {
+			r.Error = st.Error + "; " + r.Error
+		}
+	}
+	return r
+}
+
+// upgraderGone reports whether st is unfinished and its upgrader is no
+// longer running: its systemd unit is not active and nobody holds the
+// upgrade lock. Every upgrader takes the lock before it writes its first
+// record and holds it to its last, so an unfinished record with the lock
+// free is an upgrader that died. The record is read again once the lock
+// is seen free, since the upgrader may have finished in between.
+func (l *Local) upgraderGone(ctx context.Context, st *State) bool {
+	if st == nil || st.terminal() || l.Host.UnitActive(ctx, LaunchUnit(st.Op)) {
+		return false
+	}
+	if _, held := l.lockHolder(); held {
+		return false
+	}
+	cur, err := LoadState(l.StateDir, st.Op)
+	return err == nil && !cur.terminal()
 }
 
 // statusOf is a launched operation's answer: its record once the upgrader
 // wrote one, else pending while it can still be starting.
 func (l *Local) statusOf(ctx context.Context, p *launched) (upgradewire.NodeUpgradeResponse, bool) {
 	if st, err := LoadState(l.StateDir, p.op); err == nil {
-		return toResponse(st), true
+		return l.answer(ctx, st), true
 	}
 	r := upgradewire.NodeUpgradeResponse{Op: p.op, State: upgradewire.NodeOpPending, Version: p.version,
 		From: p.from, Rollback: p.rollback, StartedAt: p.at, UpdatedAt: p.at}
@@ -308,7 +341,7 @@ func (l *Local) activePending(ctx context.Context) *launched {
 		return nil
 	}
 	if st, err := LoadState(l.StateDir, p.op); err == nil {
-		if st.terminal() {
+		if st.terminal() || l.upgraderGone(ctx, st) {
 			return nil
 		}
 		return p
@@ -336,8 +369,9 @@ func (l *Local) opVersion(op string) string {
 
 // lockHolder reports whether an upgrader holds the node's lock, and its op.
 // It takes the lock for a moment to find out, so it runs only where no
-// upgrader this process launched can be starting (Start checks
-// activePending first).
+// upgrader this process launched can be starting: Start checks
+// activePending first, and upgraderGone asks only about a record that
+// exists, which its upgrader writes only once it holds the lock.
 func (l *Local) lockHolder() (string, bool) {
 	if _, err := os.Stat(l.StateDir); err != nil {
 		return "", false

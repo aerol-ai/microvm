@@ -53,15 +53,19 @@ func Recover(ctx context.Context, stateDir string, host Host, out io.Writer) ([]
 		if st.terminal() {
 			continue
 		}
-		reverted, err := u.resolve(ctx, st)
+		// At boot nothing has opened the store yet, so a database restore
+		// is safe.
+		reverted, err := u.resolve(ctx, st, true)
 		results = append(results, RecoverResult{Op: st.Op, Result: st.Result, RevertedSandboxd: reverted, Err: err})
 	}
 	return results, nil
 }
 
 // resolve finishes an op whose upgrader is gone. It reports whether it put
-// the sandboxd binary back.
-func (u *Upgrader) resolve(ctx context.Context, st *State) (bool, error) {
+// the sandboxd binary back. dbSafe says no sandboxd has the database open,
+// so the single-node restore (oneway.go) may run; it never runs under a
+// live daemon.
+func (u *Upgrader) resolve(ctx context.Context, st *State, dbSafe bool) (bool, error) {
 	phase := st.Phase
 	var problems []error
 	revertedSandboxd := false
@@ -113,12 +117,19 @@ func (u *Upgrader) resolve(ctx context.Context, st *State) (bool, error) {
 		// The files going back need a database they can open (oneway.go):
 		// a single-node rollback that put an older backup in place needs
 		// the database as the op found it, and a single-node upgrade whose
-		// new binary ran one-way migrations needs the backup.
+		// new binary ran one-way migrations needs the backup. Only while
+		// the sandboxd on disk is the one this op replaced: a record left
+		// behind by a dead upgrader and settled later, after another
+		// upgrade moved the node on, must never bring a stale backup back.
 		restore := st.RestoreStarted
 		if !restore && !st.Rollback && !st.BackupRestored && st.BackupPath != "" {
 			restore = len(u.singleNodeOneWaySince(ctx, st, st.BackupPath, st.DBPath)) > 0
 		}
-		if restore && st.BackupPath != "" && st.DBPath != "" {
+		if restore && !dbSafe {
+			u.logf("warning: upgrade op %s: sandboxd is running, so its database backup %s was not put back; restart sandboxd to settle it at boot", st.Op, st.BackupPath)
+			restore = false
+		}
+		if restore && st.BackupPath != "" && st.DBPath != "" && onOpsPrevSandboxd(st) {
 			if err := restoreBackup(st.BackupPath, st.DBPath); err != nil {
 				problems = append(problems, fmt.Errorf("restore %s: %w", st.BackupPath, err))
 			} else {
@@ -155,6 +166,37 @@ func (u *Upgrader) resolve(ctx context.Context, st *State) (bool, error) {
 		problems = append(problems, err)
 	}
 	return revertedSandboxd, errors.Join(problems...)
+}
+
+// resolveAbandoned settles every unfinished op in the state directory. The
+// caller holds the lock, so each was left by an upgrader that is gone.
+func (u *Upgrader) resolveAbandoned(ctx context.Context) error {
+	states, err := listStates(u.Paths.StateDir)
+	if err != nil {
+		return err
+	}
+	dbSafe := !u.Host.UnitActive(ctx, sandboxdUnit)
+	for _, st := range states {
+		if st.terminal() {
+			continue
+		}
+		u.logf("op %s was left at %s by an upgrader that is gone; settling it first", st.Op, st.Phase)
+		if _, err := u.resolve(ctx, st, dbSafe); err != nil {
+			return fmt.Errorf("settle op %s, left by an upgrader that is gone: %w", st.Op, err)
+		}
+	}
+	return nil
+}
+
+// onOpsPrevSandboxd reports whether the sandboxd on disk is the one st
+// replaced, the binary that runs once its files are back.
+func onOpsPrevSandboxd(st *State) bool {
+	f := st.file(roleSandboxd)
+	if f == nil || !f.Changed || f.PrevSHA256 == "" {
+		return false
+	}
+	cur, err := fileSHA256(f.Path)
+	return err == nil && cur == f.PrevSHA256
 }
 
 // allNewInPlace reports whether every file the op changes is installed

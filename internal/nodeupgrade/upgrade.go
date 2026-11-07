@@ -133,11 +133,19 @@ func (u *Upgrader) Run(ctx context.Context, req Request) (*State, error) {
 	if prev, err := loadState(statePath(u.Paths.StateDir, req.Op)); err == nil {
 		if !prev.terminal() {
 			u.logf("op %s was left at %s by an upgrader that is gone; resolving it", prev.Op, prev.Phase)
-			if _, err := u.resolve(ctx, prev); err != nil {
+			if _, err := u.resolve(ctx, prev, !u.Host.UnitActive(ctx, sandboxdUnit)); err != nil {
 				return prev, err
 			}
 		}
 		return prev, finishedErr(prev)
+	}
+	// Any other unfinished op was left by an upgrader that is gone (this
+	// process holds the lock): settle it first, as boot recovery would, so
+	// this op starts from settled files and the old record can never be
+	// settled later, after this op moved the node on. The single-node API
+	// starts a new op once it sees the old upgrader is gone.
+	if err := u.resolveAbandoned(ctx); err != nil {
+		return nil, err
 	}
 
 	now := u.now().UTC()
