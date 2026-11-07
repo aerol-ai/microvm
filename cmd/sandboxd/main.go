@@ -63,6 +63,15 @@ func main() {
 		}
 		return
 	}
+	// Backup, restore and lost-quorum recovery (§3.1, Phase 5): the
+	// node's day-2 tools. They read and write the state directory from
+	// outside the daemon, so they never boot one.
+	if len(os.Args) >= 2 && opsCommands[os.Args[1]] != nil {
+		if code := opsCommands[os.Args[1]](os.Args[2:], os.Stdout, os.Stderr); code != 0 {
+			osExit(code)
+		}
+		return
+	}
 
 	if len(os.Args) >= 2 && os.Args[1] == "--wasm-worker" {
 		if err := runWasmWorkerCLI(os.Args[2:]); err != nil {
