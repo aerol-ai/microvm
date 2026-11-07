@@ -406,13 +406,16 @@ func TestKubectlAPIResourcesAndTop(t *testing.T) {
 	harness.Require(t, sc, "UC-676")
 	env := tokenEnv(t)
 	res := mustBoth(t, env, "api-resources", "-o", "wide").stdout
-	for _, want := range []string{"nodes", "sandboxes", "sb", "snapshots", "snap", "tokens", "tok", "get,describe,delete"} {
+	for _, want := range []string{"nodes", "sandboxes", "sb", "snapshots", "snap", "tokens", "tok", "jointokens", "jt", "get,describe,delete"} {
 		if !strings.Contains(res, want) {
 			t.Fatalf("api-resources is missing %q:\n%s", want, res)
 		}
 	}
 	// api-resources needs no login.
-	if r := both(t, cliEnv("XDG_CONFIG_HOME="+t.TempDir()), "api-resources", "-o", "name"); r.code != 0 || lines(r.stdout)[0] != "nodes" {
+	// The names come sorted, so check membership, not the first line
+	// (jointokens sorts before nodes).
+	if r := both(t, cliEnv("XDG_CONFIG_HOME="+t.TempDir()), "api-resources", "-o", "name"); r.code != 0 ||
+		!slices.Contains(lines(r.stdout), "nodes") || !slices.Contains(lines(r.stdout), "jointokens") {
 		t.Fatalf("api-resources with no login = %d %q %q", r.code, r.stdout, r.stderr)
 	}
 	top := mustCLI(t, env, "top", "nodes").stdout
