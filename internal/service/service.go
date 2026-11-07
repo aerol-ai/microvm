@@ -1428,6 +1428,11 @@ func (s *Service) CreateSandboxWithID(ctx context.Context, req models.CreateSand
 		if err := s.checkStoredCreateDigest(ctx, id); err != nil {
 			return nil, err
 		}
+		// A create of this id was reported failed and is still being rolled
+		// back (rollback_pending.go): not a sandbox to hand back.
+		if existing.RollbackPending {
+			return nil, ErrCreateRollbackPending
+		}
 		// Already present locally — recreate is a no-op. The watcher tick that
 		// noticed the FSM-only entry must have raced with a local create.
 		auditlog.NoteSandboxIdentity(ctx, id, existing.AuditIncarnationID, existing.OwnerRef)
@@ -6489,6 +6494,11 @@ func (s *Service) Reconcile(ctx context.Context) error {
 	// new owner has already recreated the sandbox; keeping the old copy
 	// running would double-bill capacity and serve stale state.
 	s.reconcileStaleOwnership(ctx)
+
+	// Creates reported as failed whose rollback did not finish (no leader
+	// for the placement fence at the time): finish them before the list
+	// below, so a destroyed row is not reconciled as a live one.
+	s.reconcileRollbackPending(ctx)
 
 	known, err := s.store.List(ctx)
 	if err != nil {

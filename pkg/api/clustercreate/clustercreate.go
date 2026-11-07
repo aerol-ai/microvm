@@ -878,12 +878,17 @@ func clusterCreateSelfCanOwnSandbox(c cluster.Client) bool {
 // is conditional on complete local destruction: retaining the row and its
 // lifecycle identity is safer than creating an untracked live runtime when a
 // runtime, secret, or store finalizer fails.
+//
+// The retained row is marked rollback-pending first, so the ownership replay
+// does not place it (here there is no placement at all, so the replay would
+// create one) and reconcile finishes the destroy (markRollbackPending).
 func RollbackLocalCreate(ctx context.Context, svc *service.Service, logger *slog.Logger, sandboxID string) {
 	if svc == nil || strings.TrimSpace(sandboxID) == "" {
 		return
 	}
 	rbCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
+	markRollbackPending(rbCtx, svc, logger, sandboxID)
 	if err := svc.DestroySandbox(rbCtx, sandboxID); err != nil {
 		if logger != nil {
 			logger.Error("cluster: rollback destroy failed; retaining placement for reconciliation",
