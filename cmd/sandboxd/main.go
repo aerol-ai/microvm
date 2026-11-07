@@ -38,6 +38,16 @@ func run(ctx context.Context, logger *slog.Logger) error {
 // entire boot sequence lives in pkg/daemon.Run, which a managed build reuses by
 // supplying a real provider factory.
 func main() {
+	// Checked first, and never falls through to run(): a version query on a
+	// live node must not boot a second daemon on its state directory.
+	if len(os.Args) >= 2 && isVersionArg(os.Args[1]) {
+		if err := runVersionCLI(os.Args[2:], os.Stdout); err != nil {
+			os.Stderr.WriteString("sandboxd version: " + err.Error() + "\n" + versionUsage)
+			osExit(2)
+		}
+		return
+	}
+
 	if len(os.Args) >= 2 && os.Args[1] == "--wasm-worker" {
 		if err := runWasmWorkerCLI(os.Args[2:]); err != nil {
 			os.Stderr.WriteString(err.Error() + "\n")

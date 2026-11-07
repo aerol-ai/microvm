@@ -71,6 +71,13 @@ const (
 // deleted-lifecycle fence on opPlace (deletedLifecycleFenceFSMOpsVersion in
 // deleted_lifecycle.go). Versions 6 to 8 are the gates in the block above.
 
+// FSMOpsVersion returns fsmOpsVersion, so `sandboxd version` can print it
+// without a cluster: an operator compares it across nodes before and during
+// a rolling upgrade, when gossip may not be up yet. A function, not an
+// exported constant, so code outside this package cannot gate on it at
+// compile time and skip the per-member checks.
+func FSMOpsVersion() int { return fsmOpsVersion }
+
 var (
 	// ErrEgressProfileInUse is a delete of a profile placements reference.
 	ErrEgressProfileInUse = errors.New("cluster: egress profile is referenced by sandboxes")
