@@ -97,8 +97,11 @@ PAT_TOKEN_EXPLICIT="false"
 # Linux VM (OrbStack / Docker Desktop) shares with containers, so the Linux
 # toolboxd bind-mounts into sandboxes from here (a /usr/local/bin path would
 # arrive as an empty directory). sandboxd runs as a LaunchAgent.
-DARWIN_HOME="$HOME/.aerolvm"
-DARWIN_LAUNCH_AGENT="$HOME/Library/LaunchAgents/com.aerol.sandboxd.plist"
+# ${HOME:-}: these run before any OS check, and under `set -u` an unset HOME
+# (EC2 user data, which cloud-init runs without one) would stop a Linux
+# install here. Only the macOS path reads them, and macOS always sets HOME.
+DARWIN_HOME="${HOME:-}/.aerolvm"
+DARWIN_LAUNCH_AGENT="${HOME:-}/Library/LaunchAgents/com.aerol.sandboxd.plist"
 
 # Bound every bootstrap download. Without low-speed and total timeouts, a dead
 # CDN/GitHub connection can sit at 0 bytes forever and leave cloud-init running
@@ -227,6 +230,8 @@ Options:
                                and writes SB_CONTAINER_ENGINE=containerd into
                                sandboxd.env. Requires a system containerd
                                socket (usually /run/containerd/containerd.sock).
+                               Server install only: refused with --local and
+                               --cli-only.
   --runsc-path <path>          Absolute path to a pre-installed runsc binary.
                                Skips the download step and registers this
                                binary instead. Only consulted with
@@ -782,6 +787,13 @@ done
 # Refused before either branch runs, so neither half-installs it.
 if [[ "$WITH_FIRECRACKER" == "true" && ("$CLI_ONLY" == "true" || "$LOCAL_MODE" == "true") ]]; then
 	echo "--with-firecracker sets up a server node; it does not work with --cli-only or --local" >&2
+	exit 1
+fi
+# The containerd engine is a server-node setting too: only the server path
+# writes SB_CONTAINER_ENGINE=containerd and installs the CNI plugins, so with
+# --local the flag used to be ignored and the node silently ran Docker.
+if [[ "$WITH_CONTAINERD_ENGINE" == "true" && ("$CLI_ONLY" == "true" || "$LOCAL_MODE" == "true") ]]; then
+	echo "--with-containerd-engine sets up a server node; it does not work with --cli-only or --local" >&2
 	exit 1
 fi
 
