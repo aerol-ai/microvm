@@ -61,7 +61,8 @@ const (
 	// 35-37 are the identity ops (fsm_identity.go); 38/39 are the team-quota
 	// ops (fsm_team_quotas.go); 40/41 are the volume-reclaim ops
 	// (fsm_volume_reclaims.go); 42 is opDenyNode (fsm_node_deny.go); 43-47
-	// are the join ops (fsm_join.go). The next free code is 48.
+	// are the join ops (fsm_join.go); 48-50 are the active version and
+	// rollout ops (fsm_rollout.go). The next free code is 51.
 	opRegisterSnapshotNode opCode = 29 // record which node holds a snapshot's image (name → node, cluster-wide)
 	opForgetSnapshotNode   opCode = 30 // drop a snapshot's name → node entry (on delete / node death)
 )
@@ -268,6 +269,11 @@ type command struct {
 	JoinAdmit   *JoinAdmitCommand `json:"join_admit,omitempty"`
 	JoinAdopt   *JoinAdoptCommand `json:"join_adopt,omitempty"`
 	JoinRekey   *JoinRekeyCommand `json:"join_rekey,omitempty"`
+	// ActiveVersion carries opSetActiveVersion, RolloutCmd opRolloutCommand
+	// and RolloutNode opRolloutNode (fsm_rollout.go).
+	ActiveVersion *ActiveVersionCommand `json:"active_version,omitempty"`
+	RolloutCmd    *RolloutCommand       `json:"rollout_cmd,omitempty"`
+	RolloutNode   *RolloutNodeUpdate    `json:"rollout_node,omitempty"`
 }
 
 type reservationCommand struct {
@@ -644,6 +650,14 @@ type placementFSM struct {
 	admittedByKey map[string]string
 	revokedKeys   map[string]RevokedKey
 	peerTrust     atomic.Pointer[peerTrustView]
+	// The active cluster version and the one rollout (fsm_rollout.go,
+	// snapshotted). activeFV is the active version's FV, published for the
+	// lock-free readers (write gates, voter auto-join); rolloutVersion
+	// counts changes to the rollout.
+	activeVersion  *ActiveVersion
+	activeFV       atomic.Int64
+	rollout        *RolloutRecord
+	rolloutVersion uint64
 
 	// subMu guards subscribers. Separate from mu so a slow subscriber accept
 	// can't block FSM reads — Apply takes mu briefly to write, releases it,
@@ -2068,6 +2082,24 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 		return result
 	case opRekeyNode:
 		result, err := f.applyRekeyNodeLocked(cmd)
+		if err != nil {
+			return err
+		}
+		return result
+	case opSetActiveVersion:
+		result, err := f.applySetActiveVersionLocked(cmd)
+		if err != nil {
+			return err
+		}
+		return result
+	case opRolloutCommand:
+		result, err := f.applyRolloutCommandLocked(cmd)
+		if err != nil {
+			return err
+		}
+		return result
+	case opRolloutNode:
+		result, err := f.applyRolloutNodeLocked(cmd)
 		if err != nil {
 			return err
 		}
@@ -4024,6 +4056,13 @@ type fsmSnapshotPayload struct {
 	JoinTokens    []JoinTokenRecord
 	AdmittedNodes []AdmittedNode
 	RevokedKeys   []RevokedKey
+	// ActiveVersion and Rollout are the active cluster version and the
+	// rollout (fsm_rollout.go). Optional; an older snapshot decodes them as
+	// nil, which reads as "never written, no rollout". An older build
+	// ignores them, which is safe because nothing is written until every
+	// server runs a build with them (rolloutFSMOpsVersion).
+	ActiveVersion *ActiveVersion
+	Rollout       *RolloutRecord
 }
 
 type placementSnapshotRow struct {
@@ -4090,6 +4129,7 @@ func (f *placementFSM) Snapshot() (raft.FSMSnapshot, error) {
 		}
 	}
 	identityKeys, identityRoles := f.identitySnapshotLocked()
+	activeVersion, rollout := f.rolloutSnapshotLocked()
 	return &fsmSnapshot{
 		version:            version,
 		rows:               rows,
@@ -4113,6 +4153,8 @@ func (f *placementFSM) Snapshot() (raft.FSMSnapshot, error) {
 		joinTokens:         f.joinTokensSnapshotLocked(),
 		admittedNodes:      f.admittedSnapshotLocked(),
 		revokedKeys:        f.revokedSnapshotLocked(),
+		activeVersion:      activeVersion,
+		rollout:            rollout,
 		recoveryStore:      f.recoveryStore,
 		recoveryRefs:       recoveryRefs,
 		guard:              beginRecoverySnapshot(f.recoveryStore),
@@ -4216,6 +4258,7 @@ func (f *placementFSM) Restore(rc io.ReadCloser) (err error) {
 	f.restoreIdentityLocked(payload.IdentityKeys, payload.IdentityRoles)
 	f.restoreJoinStateLocked(payload.JoinTokens, payload.AdmittedNodes, payload.RevokedKeys)
 	f.restoreDeniedNodesLocked(payload.DeniedNodes, payload.Version, len(payload.RevokedKeys) > 0)
+	f.restoreRolloutLocked(payload.ActiveVersion, payload.Rollout)
 	f.auditACLs = make(map[string]AuditACL, len(payload.AuditACLs))
 	f.auditACLLatest = make(map[string]string)
 	f.auditACLBySandbox = make(map[string]map[string]struct{})
@@ -4378,6 +4421,8 @@ type fsmSnapshot struct {
 	joinTokens         []JoinTokenRecord
 	admittedNodes      []AdmittedNode
 	revokedKeys        []RevokedKey
+	activeVersion      *ActiveVersion
+	rollout            *RolloutRecord
 	recoveryStore      placementRecoveryStore
 	recoveryRefs       []string
 	// guard is the store's Put tracking this snapshot began; Release ends
@@ -4425,6 +4470,8 @@ func (s *fsmSnapshot) Persist(sink raft.SnapshotSink) (err error) {
 		JoinTokens:         s.joinTokens,
 		AdmittedNodes:      s.admittedNodes,
 		RevokedKeys:        s.revokedKeys,
+		ActiveVersion:      s.activeVersion,
+		Rollout:            s.rollout,
 	}); err != nil {
 		_ = sink.Cancel()
 		return fmt.Errorf("fsmSnapshot: encode: %w", err)
