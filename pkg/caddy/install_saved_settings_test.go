@@ -521,7 +521,7 @@ func TestInstallSortsEveryFlag(t *testing.T) {
 	secrets := []string{"--pat-token", "--dns-api-token", "--caddy-storage-s3-access-key", "--caddy-storage-s3-secret-key",
 		"--caddy-storage-s3-encryption-key", "--secret-provider-env"}
 	perRun := []string{"--version", "--sandboxd-url", "--toolboxd-url", "--checksums-url", "--caddy-binary-url",
-		"--build-from-source", "--no-start", "--cli-only", "--cli-url", "--download-mirror", "--help"}
+		"--build-from-source", "--no-start", "--cli-only", "--cli-url", "--config-only", "--download-mirror", "--help"}
 	start := strings.Index(src, "\nwhile [[ $# -gt 0 ]]; do\n")
 	end := strings.Index(src[start:], "\ndone\n")
 	if start < 0 || end < 0 {

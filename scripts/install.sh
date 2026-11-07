@@ -300,6 +300,21 @@ download_pins() {
 	echo "cni-plugins ${v} cni-plugins-linux-arm64-${v}.tgz.sha512 705b6aa2498e03eef13df8a5993852e1d3e9ac64606c98a60f7551d9d905f2c5 ${cni}/cni-plugins-linux-arm64-${v}.tgz.sha512"
 }
 # --- END DOWNLOAD PINS --------------------------------------------------------
+# --config-only re-renders an installed node's configuration and touches
+# nothing else (apply_config_only); `sandboxd host apply` runs it.
+CONFIG_ONLY="false"
+# The upgrader hand-off (plans/kubectl-style-cluster-ops.md eng D7). When the
+# installed sandboxd has `sandboxd upgrade node`, a re-run downloads and
+# checks the files as before, puts them in HANDOFF_DIR instead of over the
+# installed ones, and hands them to the upgrader, so every binary swap keeps
+# the *.prev copies, the database backup and running VMs, and is put back if
+# the new set does not come up. A first install, and a node whose sandboxd
+# predates the command, install the files directly as before.
+RELEASE_JSON_URL=""
+UPGRADER_HANDOFF="false"
+HANDOFF_DIR=""
+HANDOFF_VERSION=""
+HANDOFF_UPGRADED="false"
 
 usage() {
 	cat <<'EOF'
@@ -482,6 +497,13 @@ Options:
                                /run/sandboxd-public/api.sock. Enterprise
                                mode requires "host". Turn it on only after
                                every node runs a release that has it.
+  --config-only                Re-render this node's configuration (env files,
+                               Caddyfile, systemd units) from node.json and the
+                               secrets saved in the env files. Downloads
+                               nothing, replaces no binary, installs no package
+                               and starts or restarts no service; it only runs
+                               systemctl daemon-reload. Restart sandboxd to use
+                               the new settings. `sandboxd host apply` runs it.
   --no-start                   Install and enable everything but leave sandboxd
                                stopped, for a node cluster-join.sh will start
                                once it has the cluster's config and server key.
@@ -540,6 +562,12 @@ Re-running (Linux):
   when its binary or settings changed. Options you pass win over saved
   ones. To turn a saved switch such as --with-gvisor off, set it to false
   in node.json.
+
+  When the installed sandboxd has `sandboxd upgrade node`, a re-run hands
+  the downloaded and checked binaries to it instead of copying them over
+  the installed ones: the swap keeps the old files as *.prev and a backup
+  of the database, keeps Firecracker VMs running, and puts the old files
+  back if the new sandboxd does not come up.
 
 Examples:
 	curl -fsSL https://aerolvm.aerol.ai | sudo bash -s -- --domain sandbox.example.com --pat-token my-pat-token
@@ -613,6 +641,10 @@ resolve_release_urls() {
 		CHECKSUMS_URL="${CHECKSUMS_URL:-${release_base}/download/${VERSION}/checksums.txt}"
 		CADDY_BINARY_URL="${CADDY_BINARY_URL:-${release_base}/download/${VERSION}/caddy_${platform}}"
 	fi
+	# release.json sits beside the binaries in every release since it was
+	# added; for an explicit --sandboxd-url it is looked for in the same
+	# place. Only the upgrader hand-off reads it.
+	RELEASE_JSON_URL="${RELEASE_JSON_URL:-${SANDBOXD_URL%/*}/release.json}"
 }
 
 download_asset() {
@@ -873,9 +905,9 @@ resolve_ingress_proxy_routing() {
 #     flags, --secret-provider-env): node.json is not where secrets live;
 #     load_saved_node_settings reads them back from the env files;
 #   - what one run fetches or does (--version, the --*-url flags,
-#     --build-from-source, --no-start, --cli-only): a re-run with no flags
-#     installs the latest release, which is how a node is upgraded, and
-#     --no-start is only for a joiner's first install.
+#     --build-from-source, --no-start, --cli-only, --config-only): a re-run
+#     with no flags installs the latest release, which is how a node is
+#     upgraded, and --no-start is only for a joiner's first install.
 # Types: string; bool, a switch saved as true or false; auto, a switch whose
 # default depends on other settings, saved as true or false only when a flag
 # gave it and as "auto" otherwise, so a re-run derives it again. A --no-<flag>
@@ -1435,6 +1467,10 @@ while [[ $# -gt 0 ]]; do
 			NO_START="true"
 			shift
 			;;
+		--config-only)
+			CONFIG_ONLY="true"
+			shift
+			;;
 		--secret-provider-env)
 			SECRET_PROVIDER_ENV="$2"
 			shift 2
@@ -1455,6 +1491,23 @@ done
 # --cli-only run installs no node and must not pick up a node's settings.
 if [[ "$CLI_ONLY" != "true" ]]; then
 	load_saved_node_settings
+fi
+
+# --config-only re-renders a node that exists: it never makes a PAT, and with
+# nothing saved there is nothing to re-render.
+if [[ "$CONFIG_ONLY" == "true" ]]; then
+	if [[ "$CLI_ONLY" == "true" || "$(uname -s)" != "Linux" ]]; then
+		echo "--config-only re-renders a Linux node's configuration; it does not work with --cli-only or on $(uname -s)" >&2
+		exit 1
+	fi
+	if [[ ! -f "$NODE_SETTINGS_FILE" && ! -f "$SANDBOXD_ENV_FILE" ]]; then
+		echo "--config-only re-renders an installed node, and this one has neither $NODE_SETTINGS_FILE nor $SANDBOXD_ENV_FILE. Run install.sh without it first." >&2
+		exit 1
+	fi
+	if [[ -z "$PAT_TOKEN" ]]; then
+		echo "--config-only found no SB_PAT_TOKEN in $SANDBOXD_ENV_FILE and never makes a new one: every client holds the old one. Pass --pat-token." >&2
+		exit 1
+	fi
 fi
 
 # Firecracker is a runtime for a server node: --cli-only installs no daemon,
@@ -1958,6 +2011,14 @@ install_custom_caddy() {
 				rm -rf "$prebuilt_dir"
 				exit 1
 			fi
+			# Checked against the release's checksums.txt, so the upgrader
+			# can be given its hash: it swaps Caddy, and restarts it, only
+			# when the file changed.
+			if [[ "$UPGRADER_HANDOFF" == "true" && "$CADDY_BINARY_URL_EXPLICIT" != "true" ]]; then
+				handoff_add "$tmp_binary" "$prebuilt_asset" "$prebuilt_dir/checksums.txt" caddy
+				rm -rf "$prebuilt_dir"
+				return
+			fi
 			systemctl stop caddy >/dev/null 2>&1 || true
 			install -m 0755 "$tmp_binary" "$caddy_path"
 			rm -rf "$prebuilt_dir"
@@ -2030,6 +2091,13 @@ install_binaries() {
 		download_asset "$TOOLBOXD_URL" "$tmp_dir/$toolboxd_asset"
 		verify_downloads "$tmp_dir" "$sandboxd_asset" "$toolboxd_asset"
 
+		if [[ "$UPGRADER_HANDOFF" == "true" ]]; then
+			# hand_off_to_upgrader installs them.
+			handoff_add "$tmp_dir/$sandboxd_asset" "$sandboxd_asset" "$tmp_dir/checksums.txt" sandboxd
+			handoff_add "$tmp_dir/$toolboxd_asset" "$toolboxd_asset" "$tmp_dir/checksums.txt" toolboxd
+			rm -rf "$tmp_dir"
+			return 0
+		fi
 		install -m 0755 "$tmp_dir/$sandboxd_asset" "$INSTALL_PREFIX/sandboxd"
 		install -m 0755 "$tmp_dir/$toolboxd_asset" "$TOOLBOX_BINARY_PATH"
 		rm -rf "$tmp_dir"
@@ -2496,12 +2564,21 @@ write_route_dns_resolver() {
 		return
 	fi
 	mkdir -p /etc/systemd/network
+	local units_before
+	units_before="$({ cat /etc/systemd/network/10-aerolvm-rt.netdev /etc/systemd/network/10-aerolvm-rt.network 2>/dev/null || true; } | cksum)"
 	cat > /etc/systemd/network/10-aerolvm-rt.netdev <<'EOF'
 [NetDev]
 Name=aerolvm-rt
 Kind=dummy
 EOF
 	route_dns_network_unit > /etc/systemd/network/10-aerolvm-rt.network
+	# --config-only restarts nothing; it says when a restart is owed.
+	if [[ "$CONFIG_ONLY" == "true" ]]; then
+		if [[ "$({ cat /etc/systemd/network/10-aerolvm-rt.netdev /etc/systemd/network/10-aerolvm-rt.network 2>/dev/null || true; } | cksum)" != "$units_before" ]]; then
+			echo "Note: the aerolvm-rt network units changed; apply them with: systemctl restart systemd-networkd systemd-resolved"
+		fi
+		return
+	fi
 	systemctl restart systemd-networkd
 	systemctl restart systemd-resolved
 	local i
@@ -2639,6 +2716,11 @@ restart_sandboxd_if_reconfigured() {
 	if [[ "$SANDBOXD_WAS_ACTIVE" != "true" ]]; then
 		return 0
 	fi
+	# The upgrader restarted it onto the new binary, after this run wrote
+	# the settings and the unit.
+	if [[ "${HANDOFF_UPGRADED:-}" == "true" ]]; then
+		return 0
+	fi
 	if [[ "$(sandboxd_config_fingerprint)" == "$SANDBOXD_CONFIG_BEFORE" ]]; then
 		return 0
 	fi
@@ -2648,6 +2730,121 @@ restart_sandboxd_if_reconfigured() {
 	if ! wait_for_sandboxd_ready; then
 		echo "warning: sandboxd is not answering ${SANDBOXD_HEALTH_URL} (or has not made ${PUBLIC_API_SOCKET}) ${SANDBOXD_READY_TRIES}s after its restart; starting Caddy anyway. Check: journalctl -u sandboxd" >&2
 	fi
+}
+
+# prepare_upgrader_handoff decides whether this run hands the binaries to
+# `sandboxd upgrade node` (eng D7): only when the installed sandboxd has the
+# command and the release ships a release.json its checksums.txt vouches
+# for, which names the version to pass. Anything else keeps the direct
+# install, so first installs and older nodes work as before.
+prepare_upgrader_handoff() {
+	UPGRADER_HANDOFF="false"
+	[[ "$BUILD_FROM_SOURCE" != "true" && "$(uname -s)" == "Linux" ]] || return 0
+	local bin="$INSTALL_PREFIX/sandboxd"
+	[[ -x "$bin" ]] || return 0
+	# A sandboxd from before the command takes "upgrade" as no argument at
+	# all and boots a second daemon on the live state directory, so it is
+	# only run when it carries the command's usage text.
+	grep -aqF 'usage: sandboxd upgrade node' "$bin" || return 0
+	"$bin" upgrade node --help >/dev/null 2>&1 || return 0
+	HANDOFF_DIR="$(mktemp -d)"
+	# Few retries: an older release has no release.json, and the direct
+	# install is a fine answer to that.
+	if ! curl -fsSL --retry 3 --retry-delay 2 --connect-timeout "$DOWNLOAD_CONNECT_TIMEOUT" --max-time 120 \
+		"$RELEASE_JSON_URL" -o "$HANDOFF_DIR/release.json" 2>/dev/null ||
+		! verify_downloads "$HANDOFF_DIR" release.json >/dev/null 2>&1; then
+		echo "The release has no release.json that checksums.txt vouches for; installing the binaries directly"
+		rm -rf "$HANDOFF_DIR"
+		HANDOFF_DIR=""
+		return 0
+	fi
+	HANDOFF_VERSION="$(sed -n 's/^ *"version": *"\([^"]*\)",* *$/\1/p' "$HANDOFF_DIR/release.json" | head -n1)"
+	if [[ -z "$HANDOFF_VERSION" ]]; then
+		echo "release.json names no version; installing the binaries directly"
+		rm -rf "$HANDOFF_DIR"
+		HANDOFF_DIR=""
+		return 0
+	fi
+	handoff_add "$HANDOFF_DIR/release.json" release.json "$HANDOFF_DIR/checksums.txt" release.json
+	UPGRADER_HANDOFF="true"
+	echo "The installed sandboxd has 'sandboxd upgrade node'; it will install $HANDOFF_VERSION"
+}
+
+# handoff_add puts a downloaded, checked file into HANDOFF_DIR under the name
+# the upgrader takes ($4), and notes its hash from the checksums file it was
+# checked against.
+handoff_add() {
+	local file="$1" asset="$2" sums="$3" name="$4" hash
+	hash="$(awk -v name="$asset" '$2 == name { print $1 }' "$sums" | head -n1)"
+	if [[ -z "$hash" ]]; then
+		echo "No checksum for $asset in $sums" >&2
+		exit 1
+	fi
+	if [[ "$file" != "$HANDOFF_DIR/$name" ]]; then
+		mv -f "$file" "$HANDOFF_DIR/$name"
+	fi
+	echo "$hash $name" >>"$HANDOFF_DIR/handoff.sha256"
+}
+
+# hand_off_to_upgrader runs `sandboxd upgrade node` on the files this run
+# staged. It runs after the settings and units are written and loaded, so
+# the restart it does starts the new binary on them, and it tells the
+# upgrader the host setup is applied: this run just did that. A failure is
+# put back by the upgrader and ends the run.
+hand_off_to_upgrader() {
+	[[ "$UPGRADER_HANDOFF" == "true" ]] || return 0
+	local args=() hash name out
+	while read -r hash name; do
+		[[ -n "$name" ]] && args+=(--sha256 "$name=$hash")
+	done <"$HANDOFF_DIR/handoff.sha256"
+	echo "Handing the new binaries to sandboxd upgrade node $HANDOFF_VERSION"
+	if ! out="$("$INSTALL_PREFIX/sandboxd" upgrade node "$HANDOFF_VERSION" --from "$HANDOFF_DIR" "${args[@]}" --skip-host-apply -o json)"; then
+		printf '%s\n' "$out"
+		rm -rf "$HANDOFF_DIR"
+		echo "sandboxd upgrade node failed and kept (or put back) the previous binaries; see its output above" >&2
+		exit 1
+	fi
+	printf '%s\n' "$out"
+	if grep -q '"result": "upgraded"' <<<"$out"; then
+		HANDOFF_UPGRADED="true"
+	fi
+	rm -rf "$HANDOFF_DIR"
+}
+
+# apply_config_only is --config-only: every file a full run writes from the
+# settings, and nothing else (plans/kubectl-style-cluster-ops.md §6.3 step 7).
+# It never downloads or replaces a binary, never installs a package, and
+# never starts or restarts a service; `sandboxd upgrade node`, which runs it
+# through `sandboxd host apply`, owns the binaries and every restart. So a
+# host change must keep working with the previous binary too.
+apply_config_only() {
+	# What register_isolate_runtime resolves, without its download.
+	if [[ -n "$WORKERD_PATH" ]]; then
+		WORKERD_BIN_RESOLVED="$WORKERD_PATH"
+	elif command -v workerd >/dev/null 2>&1; then
+		WORKERD_BIN_RESOLVED="$(command -v workerd)"
+	else
+		WORKERD_BIN_RESOLVED="/usr/local/bin/workerd"
+	fi
+	if [[ "$LOCAL_MODE" == "true" ]]; then
+		write_local_environment
+		write_node_settings
+		write_local_systemd_unit
+	else
+		write_environment
+		write_node_settings
+		prepare_key_custody
+		write_caddy_env
+		write_caddy_systemd_dropin
+		write_route_dns_resolver
+		write_caddyfile
+		write_systemd_unit
+	fi
+	write_egress_gateway_units
+	write_healthcheck_script
+	write_healthcheck_units
+	systemctl daemon-reload
+	echo "Configuration re-rendered from $NODE_SETTINGS_FILE; no binary or service was touched. Restart sandboxd to use it."
 }
 
 write_healthcheck_script() {
@@ -3741,6 +3938,15 @@ install_darwin_local() {
 	echo "Stop: launchctl bootout $domain/com.aerol.sandboxd"
 }
 
+if [[ "$CONFIG_ONLY" == "true" ]]; then
+	if [[ $EUID -ne 0 ]]; then
+		echo "install.sh --config-only must run as root" >&2
+		exit 1
+	fi
+	apply_config_only
+	exit 0
+fi
+
 if [[ "$LOCAL_MODE" == "true" ]]; then
 	if [[ -n "$DOMAIN" || -n "$DNS_PROVIDER" ]]; then
 		echo "--local is incompatible with --domain and --dns-provider" >&2
@@ -3754,6 +3960,7 @@ if [[ "$LOCAL_MODE" == "true" ]]; then
 		echo "install.sh must run as root (use sudo)" >&2
 		exit 1
 	fi
+	prepare_upgrader_handoff
 	# Before install_binaries, so the restart check sees a new binary too.
 	record_sandboxd_state
 	install_binaries
@@ -3772,6 +3979,7 @@ if [[ "$LOCAL_MODE" == "true" ]]; then
 	write_healthcheck_units
 	systemctl daemon-reload
 	systemctl enable --now aerolvm-egress-gateway.socket aerolvm-egress-gateway.service
+	hand_off_to_upgrader
 	restart_sandboxd_if_reconfigured
 	systemctl enable --now sandboxd sandboxd-healthcheck.timer
 	echo "AerolVM installed (local mode)"
@@ -3818,6 +4026,7 @@ fi
 # caddy-l4 (TCP routing for sandbox-exposed ports). DNS plugin gets folded
 # into the same build when --dns-provider is set so we make exactly one
 # trip to the Caddy build server.
+prepare_upgrader_handoff
 install_custom_caddy "$DNS_PROVIDER"
 # Before install_binaries, so the restart check sees a new binary too.
 record_sandboxd_state
@@ -3836,6 +4045,7 @@ write_healthcheck_units
 
 systemctl daemon-reload
 systemctl enable --now aerolvm-egress-gateway.socket aerolvm-egress-gateway.service
+hand_off_to_upgrader
 if [[ "$NO_START" == "true" ]]; then
 	# A joiner: cluster-join.sh starts sandboxd once cluster.env and the
 	# cluster's server key are in place (see --no-start).
