@@ -49,6 +49,22 @@ func releaseShipped(t *testing.T) func(name string) bool {
 	for _, m := range shippedCopy.FindAllStringSubmatch(string(release), -1) {
 		copied[m[1]] = true
 	}
+	// cmd/aerolvmdist writes the Krew manifest and the Homebrew formula into
+	// dist/, which the release uploads whole. Their names are the tool's
+	// constants, so a rename there is seen here.
+	if strings.Contains(string(release), "./cmd/aerolvmdist") {
+		src, err := os.ReadFile(filepath.Join(repoRoot(t), "cmd", "aerolvmdist", "main.go"))
+		if err != nil {
+			t.Fatalf("read cmd/aerolvmdist/main.go: %v", err)
+		}
+		names := regexp.MustCompile(`(?m)^\s*(?:krewManifestFile|brewFormulaFile)\s*=\s*"([^"]+)"`).FindAllStringSubmatch(string(src), -1)
+		if len(names) != 2 {
+			t.Fatalf("cmd/aerolvmdist/main.go: found %d of the krewManifestFile and brewFormulaFile names, want 2", len(names))
+		}
+		for _, m := range names {
+			copied[m[1]] = true
+		}
+	}
 	var builtPrefixes []string
 	for _, m := range shippedBuild.FindAllStringSubmatch(string(release), -1) {
 		builtPrefixes = append(builtPrefixes, m[1]+"_")
