@@ -36,7 +36,8 @@ import (
 //     check, the start and the cancel all run inside the lifecycle boundary
 //     (lifecycle_boundary.go), so a stop that comes while a restart is
 //     starting the sandbox waits for it and then stops it;
-//   - a start: StartSandbox cancels a pending restart;
+//   - a start: StartSandbox cancels a pending restart, and the die of the
+//     run before it, if handled after it, schedules nothing (run_starts.go);
 //   - the idle and age timers: a restart does not count as activity
 //     (LastActiveAt is kept), and a restart that comes due after a stop or
 //     destroy timer has run out is dropped, leaving that timer to act;

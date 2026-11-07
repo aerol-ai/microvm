@@ -716,6 +716,11 @@ type Service struct {
 	// not a stop.
 	sandboxOOMs sandboxOOMTracker
 
+	// runStarts holds when each sandbox's current run started, on the
+	// engine's clock, so a die or stop event of an earlier run changes
+	// nothing (run_starts.go).
+	runStarts sandboxRunStarts
+
 	// touchCoalescer debounces last_active_at flushes per sandbox so a
 	// burst of HTTP requests (wake-aware ingress proxy, toolbox/session/
 	// runtime proxies, SSH gateway) does not become one SQLite UPDATE
@@ -1597,6 +1602,7 @@ func (s *Service) finalizeStaleLocalSandbox(ctx context.Context, sandbox *models
 	s.forgetWakeFlight(sandbox.ID)
 	s.invalidateWarm(sandbox.ID)
 	s.forgetNetstatsActivity(sandbox.ID)
+	s.runStarts.forget(sandbox.ID)
 	if s.admitter != nil {
 		s.admitter.Release(sandbox.ID)
 	}
@@ -3777,6 +3783,10 @@ func (s *Service) startSandboxLocked(ctx context.Context, id string, cause start
 			return nil, err
 		}
 	}
+	// The runtime has a new run from here, whatever fails below: an exit
+	// event of an earlier run, queued behind this start, is told apart from
+	// now on (run_starts.go).
+	s.noteRunStart(id, state.StartedAt)
 	sandbox.ContainerID = state.ContainerID
 	sandbox.ContainerIP = state.ContainerIP
 	sandbox.Status = state.Status
@@ -4029,6 +4039,7 @@ func (s *Service) destroySandboxLocked(ctx context.Context, id string) error {
 	s.forgetWakeFlight(id)
 	s.invalidateWarm(id)
 	s.forgetNetstatsActivity(id)
+	s.runStarts.forget(id)
 	if s.admitter != nil {
 		s.admitter.Release(id)
 	}
@@ -6716,6 +6727,7 @@ func (s *Service) Reconcile(ctx context.Context) error {
 			s.forgetWakeFlight(sandbox.ID)
 			s.invalidateWarm(sandbox.ID)
 			s.forgetNetstatsActivity(sandbox.ID)
+			s.runStarts.forget(sandbox.ID)
 			// Again for a request that read the row before it went.
 			s.endToolboxCalls(sandbox.ID, toolboxEndGone, "runtime gone")
 			if s.admitter != nil {

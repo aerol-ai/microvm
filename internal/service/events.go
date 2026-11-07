@@ -169,6 +169,21 @@ func (s *Service) handleDockerEvent(ctx context.Context, event docker.DockerEven
 		s.noteSandboxOOM(sandbox)
 		return nil
 	case "die", "stop":
+		// An exit of a run before the current one (its event waited out a
+		// start) says nothing about this run: no status, exit, restart or
+		// teardown (run_starts.go). An oom noted before it is that run's
+		// too, so it cannot label this run's exit.
+		if runStart, old := s.runStarts.predates(sandbox.ID, event.Time); old {
+			s.sandboxOOMs.forget(sandbox.ID)
+			s.logger.Info("ignore exit event of an earlier run",
+				"sandbox_id", sandbox.ID,
+				"action", event.Action,
+				"exit_code", event.ExitCode,
+				"event_time", event.Time,
+				"run_started_at", runStart,
+			)
+			return nil
+		}
 		if err := s.markSandboxStopped(ctx, sandbox, event); err != nil {
 			return err
 		}
@@ -451,6 +466,7 @@ func (s *Service) handleDestroyEvent(ctx context.Context, sandbox *models.Sandbo
 	if err := s.store.Delete(ctx, sandbox.ID); err != nil && !errors.Is(err, store.ErrNotFound) {
 		return fmt.Errorf("delete sandbox: %w", err)
 	}
+	s.runStarts.forget(sandbox.ID)
 	s.finishSandboxVolumeDeletes(ctx, sandbox.ID, dwsVolumes)
 	if s.admitter != nil {
 		s.admitter.Release(sandbox.ID)
