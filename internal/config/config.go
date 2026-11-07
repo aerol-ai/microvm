@@ -134,7 +134,11 @@ type Config struct {
 	// RemoteUpgrade is SB_REMOTE_UPGRADE: whether this node accepts upgrade
 	// commands over the API. Default true, false in enterprise mode unless
 	// set (remote_upgrade.go).
-	RemoteUpgrade      bool
+	RemoteUpgrade bool
+	// UpgradeServeMBPS is SB_UPGRADE_SERVE_MBPS: the cap, in MB/s, on the
+	// release-file copies one server serves to other nodes during a
+	// rollout (CEO D15). Default DefaultUpgradeServeMBPS.
+	UpgradeServeMBPS   int
 	PATToken           string
 	APIHost            string
 	APIPort            int
