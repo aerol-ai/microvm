@@ -100,6 +100,7 @@ jobs:
               - 'npm/**'
               - 'server.json'
               - '.github/workflows/release.yml'
+              - '.github/darwin-cross/**'
             go_sdk:
               - 'sdk/go/**'
               - 'go.mod'
@@ -182,6 +183,8 @@ jobs:
   # PKCS#11 helper's miekg/pkcs11 since plans/customer-key-custody.md Phase
   # 3). Same toolchains as release.yml's build matrix, so a cgo dependency
   # that breaks a cross-compile fails here instead of at release time.
+  # darwin also cross-compiles on Linux, with zig as the C toolchain
+  # (.github/darwin-cross/setup.sh), because the org has no macOS runners.
   sandboxd-cgo-matrix:
     needs: paths
     if: needs.paths.outputs.go_main == 'true'
@@ -196,7 +199,7 @@ jobs:
           - { runner: ubuntu-latest, goos: linux, goarch: arm64, goarm: "", suffix: linux_arm64, cc: aarch64-linux-gnu-gcc, apt_pkgs: "build-essential gcc-aarch64-linux-gnu" }
           - { runner: ubuntu-latest, goos: linux, goarch: arm, goarm: "7", suffix: linux_armv7, cc: arm-linux-gnueabihf-gcc, apt_pkgs: "build-essential gcc-arm-linux-gnueabihf" }
           - { runner: ubuntu-latest, goos: linux, goarch: arm, goarm: "6", suffix: linux_armv6, cc: arm-linux-gnueabi-gcc, apt_pkgs: "build-essential gcc-arm-linux-gnueabi" }
-          - { runner: macos-14, goos: darwin, goarch: arm64, goarm: "", suffix: darwin_arm64, cc: "", apt_pkgs: "" }
+          - { runner: ubuntu-latest, goos: darwin, goarch: arm64, goarm: "", suffix: darwin_arm64, cc: "zig cc -target aarch64-macos.14.0", apt_pkgs: llvm }
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -213,6 +216,10 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y ${{ matrix.apt_pkgs }}
 
+      - name: Set up darwin cross toolchain
+        if: matrix.goos == 'darwin'
+        run: bash .github/darwin-cross/setup.sh
+
       - name: Build sandboxd
         env:
           CGO_ENABLED: "1"
@@ -221,6 +228,14 @@ jobs:
           GOARM: ${{ matrix.goarm }}
           CC: ${{ matrix.cc }}
         run: go build -trimpath -o /tmp/sandboxd_${{ matrix.suffix }} ./cmd/sandboxd
+
+      # macOS kills an arm64 binary that has no code signature at launch. The
+      # zig link adds an ad-hoc one; a toolchain bump must not lose it.
+      - name: Check the darwin binary is signed
+        if: matrix.suffix == 'darwin_arm64'
+        run: |
+          llvm-objdump --macho --private-headers /tmp/sandboxd_${{ matrix.suffix }} | grep LC_CODE_SIGNATURE >/dev/null ||
+            { echo "::error::sandboxd_${{ matrix.suffix }} has no code signature; macOS will not run it"; exit 1; }
 
   go-security:
     needs: paths
