@@ -85,17 +85,17 @@ ansible-playbook playbooks/update-sandboxd.yml --limit aerolvm_role_worker -e ..
 # Reachability check (run this first to verify SSH + sudo work):
 ansible-playbook playbooks/ping.yml
 
-# Push the LATEST released sandboxd binary across the fleet (most common):
+# Push a released sandboxd binary across the fleet (most common). The
+# SHA-256 is required: take the first field of that file's line in the
+# same release's checksums.txt.
 ansible-playbook playbooks/update-sandboxd.yml \
-  -e sandboxd_remote_url=https://github.com/aerol-ai/microvm/releases/latest/download/sandboxd_linux_amd64
+  -e sandboxd_remote_url=https://github.com/aerol-ai/microvm/releases/download/vX.Y.Z/sandboxd_linux_amd64 \
+  -e sandboxd_remote_sha256=<sha256 of sandboxd_linux_amd64>
 
 # arm64 / Graviton nodes:
 ansible-playbook playbooks/update-sandboxd.yml \
-  -e sandboxd_remote_url=https://github.com/aerol-ai/microvm/releases/latest/download/sandboxd_linux_arm64
-
-# Pin to a specific release instead of "latest":
-ansible-playbook playbooks/update-sandboxd.yml \
-  -e sandboxd_remote_url=https://github.com/aerol-ai/microvm/releases/download/v0.2.2/sandboxd_linux_amd64
+  -e sandboxd_remote_url=https://github.com/aerol-ai/microvm/releases/download/vX.Y.Z/sandboxd_linux_arm64 \
+  -e sandboxd_remote_sha256=<sha256 of sandboxd_linux_arm64>
 
 # Push a locally-built binary (dev loop):
 make -C .. build-sandboxd
@@ -125,9 +125,16 @@ shows up under `@aerolvm_false`):
 
 ```bash
 ansible-playbook playbooks/update-sandboxd.yml \
-  -e sandboxd_remote_url=https://github.com/aerol-ai/microvm/releases/latest/download/sandboxd_linux_amd64 \
+  -e sandboxd_remote_url=https://github.com/aerol-ai/microvm/releases/download/vX.Y.Z/sandboxd_linux_amd64 \
+  -e sandboxd_remote_sha256=<sha256 of sandboxd_linux_amd64> \
   --limit aerolvm-node3
 ```
+
+Use a URL with a release tag, not `releases/latest/`: the SHA-256 names one
+file, and `latest` moves to a new file at the next release. A hash that does
+not match fails the host before its binary is swapped. Each host's last step
+prints `sandboxd --version`, so the output shows the version every node runs
+from disk.
 
 Release asset names come from `.github/workflows/release.yml` and follow
 `sandboxd_<goos>_<goarch>` - `linux_amd64`, `linux_arm64`, `linux_armv7`,

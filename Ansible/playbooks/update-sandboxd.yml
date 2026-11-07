@@ -6,9 +6,11 @@
 #   ansible-playbook playbooks/update-sandboxd.yml \
 #     -e sandboxd_local_binary=../bin/sandboxd
 #
-#   # Or fetch from a GitHub release URL on each node:
+#   # Or fetch from a GitHub release URL on each node. The SHA-256 is the
+#   # line for that file in the release's checksums.txt, and is required:
 #   ansible-playbook playbooks/update-sandboxd.yml \
-#     -e sandboxd_remote_url=https://github.com/aerol-ai/microvm/releases/download/v0.2.2/sandboxd_linux_amd64
+#     -e sandboxd_remote_url=https://github.com/aerol-ai/microvm/releases/download/v0.2.2/sandboxd_linux_amd64 \
+#     -e sandboxd_remote_sha256=<64 hex characters>
 #
 #   # Limit to a single host while testing:
 #   ansible-playbook playbooks/update-sandboxd.yml -e ... --limit aerolvm-srv1
@@ -37,6 +39,24 @@
         fail_msg: >-
           Set exactly one of -e sandboxd_local_binary=<path> or
           -e sandboxd_remote_url=<url>.
+
+    # install.sh refuses a download its checksums.txt does not vouch for;
+    # this playbook installs the same binary as root on every node, so it
+    # holds the remote fetch to the same rule. Pinned here, not fetched from
+    # the release beside the binary: a checksum from the same place as the
+    # file cannot catch a replaced file.
+    - name: Require a SHA-256 for the remote binary
+      delegate_to: localhost
+      become: false
+      run_once: true
+      when: sandboxd_remote_url is defined
+      ansible.builtin.assert:
+        that:
+          - sandboxd_remote_sha256 is defined
+          - sandboxd_remote_sha256 is match('^[0-9a-fA-F]{64}$')
+        fail_msg: >-
+          -e sandboxd_remote_url needs -e sandboxd_remote_sha256=<64 hex
+          characters>: the file's line in the release's checksums.txt.
 
     - name: Confirm local binary exists
       delegate_to: localhost
@@ -78,6 +98,9 @@
       ansible.builtin.get_url:
         url: "{{ sandboxd_remote_url }}"
         dest: /tmp/sandboxd.new
+        # get_url deletes the file and fails the host when the hash does not
+        # match, so a bad download never reaches the swap below.
+        checksum: "sha256:{{ sandboxd_remote_sha256 | lower }}"
         mode: "0755"
         owner: root
         group: root
@@ -146,13 +169,21 @@
       delay: 1
 
   post_tasks:
+    # A binary older than `sandboxd version` treats --version as no argument
+    # at all and boots a second daemon on this node's live state directory.
+    # So ask only a binary that carries the command's usage text; a rollback
+    # to an older release reports that instead of running it.
     - name: "[{{ inventory_hostname }}] Report installed version"
-      ansible.builtin.command:
-        cmd: "{{ sandboxd_binary_path }} --version"
+      ansible.builtin.shell: |
+        set -eu
+        if grep -aq 'usage: sandboxd version' {{ sandboxd_binary_path | quote }}; then
+          {{ sandboxd_binary_path | quote }} --version
+        else
+          echo "(this sandboxd predates 'sandboxd version'; not asking it)"
+        fi
       register: ver
       changed_when: false
-      failed_when: false
 
     - name: "[{{ inventory_hostname }}] sandboxd version"
       ansible.builtin.debug:
-        msg: "{{ ver.stdout | default(ver.stderr) | default('(--version unsupported)') }}"
+        msg: "{{ ver.stdout_lines }}"
