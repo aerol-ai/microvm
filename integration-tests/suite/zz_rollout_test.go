@@ -495,8 +495,8 @@ func TestRolloutLive03StageFailureStopsEarly(t *testing.T) {
 		rl.sandboxes[sb.ID] = liveSandbox{sb: sb, owner: owner, start: pid1Start(t, sb)}
 	}
 	rl.stageFail = workers[len(workers)-1]
-	sshRoot(t, rl.stageFail, "mkdir -p /var/lib/sandboxd/upgrade && chattr +i /var/lib/sandboxd/upgrade")
-	defer sshRoot(t, rl.stageFail, "chattr -i /var/lib/sandboxd/upgrade")
+	sshRoot(t, rl.stageFail, "mkdir -p /var/lib/sandboxd/upgrade/files && rm -f /var/lib/sandboxd/upgrade/files/* && chattr +i /var/lib/sandboxd/upgrade/files")
+	defer sshRoot(t, rl.stageFail, "chattr -i /var/lib/sandboxd/upgrade/files")
 	rl.firstLeader = currentLeader(t, c)
 
 	code, b := upgradeCall(t, http.MethodPost, upgradewire.ClusterUpgradePath, applyB(upgradewire.SourceUpload))
