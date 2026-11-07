@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"expvar"
 	"sync"
 
 	"github.com/aerol-ai/microvm/pkg/docker"
@@ -14,7 +15,19 @@ import (
 // sandbox emits a handful of events: our own starts need the boundary, so
 // only out-of-band starts can add new runs, and a run of OOM kills folds into
 // one entry. 64 is far above that.
+//
+// If a sandbox does reach it (out-of-band starts in a loop, say), its oldest
+// pending event makes room for the new one: the stream loop never waits for
+// one sandbox, so a single busy sandbox cannot hold up every other
+// sandbox's events. The newest events say most about where the sandbox is
+// now, and reconcile, which reads the runtime itself, covers what a dropped
+// event would have said. Each drop is counted in
+// aerolvm_sandbox_events_dropped_total and logged.
 const maxQueuedEventsPerSandbox = 64
+
+// sandboxEventsDropped counts events dropped from a full per-sandbox queue
+// (an entry of folded OOM kills counts each kill).
+var sandboxEventsDropped = expvar.NewInt("aerolvm_sandbox_events_dropped_total")
 
 // sandboxEventQueues hands each runtime event to its sandbox's own queue, so
 // the one loop that reads the node's event stream never waits for a sandbox
@@ -30,11 +43,10 @@ const maxQueuedEventsPerSandbox = 64
 // ipClaimedByOther, because stop events were always allowed to arrive
 // late).
 //
-// No event is dropped while the queues run. The memory is bounded: one queue
-// holds at most limit entries, and back-to-back OOM kills of one container
-// fold into one entry that is handled once per kill. Only a sandbox whose
-// queue is full makes the stream loop wait, for room in that queue; nothing
-// in the runtime paths gets near the limit.
+// The memory is bounded: one queue holds at most limit entries, and
+// back-to-back OOM kills of one container fold into one entry that is
+// handled once per kill. A full queue drops its oldest pending entry
+// (maxQueuedEventsPerSandbox); the stream loop never waits.
 //
 // The queues live as long as ctx (the event monitor), not one stream, so a
 // stream reconnect drops nothing; when ctx ends the workers stop and what is
@@ -43,6 +55,8 @@ type sandboxEventQueues struct {
 	ctx    context.Context
 	handle func(context.Context, docker.DockerEvent)
 	limit  int
+	// dropped hears about each event a full queue dropped; nil is fine.
+	dropped func(docker.DockerEvent, int)
 
 	mu     sync.Mutex
 	queues map[string]*sandboxEventQueue
@@ -51,9 +65,6 @@ type sandboxEventQueues struct {
 
 type sandboxEventQueue struct {
 	items []queuedEvent
-	// room is closed when the worker takes an entry, waking a stream loop
-	// that waits for space; nil while nobody waits.
-	room chan struct{}
 }
 
 // queuedEvent is one entry: an event, and how many times it came in a row
@@ -67,45 +78,45 @@ func newSandboxEventQueues(ctx context.Context, limit int, handle func(context.C
 	return &sandboxEventQueues{ctx: ctx, handle: handle, limit: limit, queues: make(map[string]*sandboxEventQueue)}
 }
 
-// add queues ev behind its sandbox's earlier events. It returns at once
-// unless that sandbox's queue is full; then it waits for room, and gives up
-// (false, the event not queued) only when ctx or the queues' own context
-// ends.
+// add queues ev behind its sandbox's earlier events and returns at once. A
+// full queue drops its oldest pending entry to make room (the entry a
+// worker is handling is no longer in the queue). It returns false, the
+// event not queued, only when ctx or the queues' own context has ended.
 func (q *sandboxEventQueues) add(ctx context.Context, ev docker.DockerEvent) bool {
-	for {
-		q.mu.Lock()
-		sq := q.queues[ev.SandboxID]
-		if sq == nil {
-			sq = &sandboxEventQueue{}
-			q.queues[ev.SandboxID] = sq
-			q.wg.Add(1)
-			// The worker cannot take the queue's lock before this
-			// append releases it, so it always finds ev.
-			go q.run(ev.SandboxID, sq)
+	if ctx.Err() != nil || q.ctx.Err() != nil {
+		return false
+	}
+	var dropped *queuedEvent
+	q.mu.Lock()
+	sq := q.queues[ev.SandboxID]
+	if sq == nil {
+		sq = &sandboxEventQueue{}
+		q.queues[ev.SandboxID] = sq
+		q.wg.Add(1)
+		// The worker cannot take the queue's lock before this append
+		// releases it, so it always finds ev.
+		go q.run(ev.SandboxID, sq)
+	}
+	switch n := len(sq.items); {
+	case n > 0 && foldsInto(sq.items[n-1].event, ev):
+		sq.items[n-1].times++
+	default:
+		if n >= q.limit && n > 0 {
+			oldest := sq.items[0]
+			dropped = &oldest
+			sq.items[0] = queuedEvent{}
+			sq.items = sq.items[1:]
 		}
-		if n := len(sq.items); n > 0 && foldsInto(sq.items[n-1].event, ev) {
-			sq.items[n-1].times++
-			q.mu.Unlock()
-			return true
-		}
-		if len(sq.items) < q.limit {
-			sq.items = append(sq.items, queuedEvent{event: ev, times: 1})
-			q.mu.Unlock()
-			return true
-		}
-		if sq.room == nil {
-			sq.room = make(chan struct{})
-		}
-		room := sq.room
-		q.mu.Unlock()
-		select {
-		case <-room:
-		case <-ctx.Done():
-			return false
-		case <-q.ctx.Done():
-			return false
+		sq.items = append(sq.items, queuedEvent{event: ev, times: 1})
+	}
+	q.mu.Unlock()
+	if dropped != nil {
+		sandboxEventsDropped.Add(int64(dropped.times))
+		if q.dropped != nil {
+			q.dropped(dropped.event, dropped.times)
 		}
 	}
+	return true
 }
 
 // foldsInto reports whether next can join the pending entry last: OOM kills
@@ -123,27 +134,16 @@ func (q *sandboxEventQueues) run(id string, sq *sandboxEventQueue) {
 		q.mu.Lock()
 		if len(sq.items) == 0 || q.ctx.Err() != nil {
 			delete(q.queues, id)
-			sq.wake()
 			q.mu.Unlock()
 			return
 		}
 		item := sq.items[0]
 		sq.items[0] = queuedEvent{}
 		sq.items = sq.items[1:]
-		sq.wake()
 		q.mu.Unlock()
 		for i := 0; i < item.times && q.ctx.Err() == nil; i++ {
 			q.handle(q.ctx, item.event)
 		}
-	}
-}
-
-// wake lets a stream loop waiting for room look again. Called with the
-// queues' lock held.
-func (sq *sandboxEventQueue) wake() {
-	if sq.room != nil {
-		close(sq.room)
-		sq.room = nil
 	}
 }
 
