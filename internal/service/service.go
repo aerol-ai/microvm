@@ -7668,9 +7668,11 @@ func (s *Service) addClusterIngressExpectedRoutes(expectedHTTP, expectedTCPServe
 		if !placementAllowsPublicTraffic(p) {
 			continue
 		}
-		// Orphaned placement: the in-flux 503 routes are the expected
-		// state. Keep them; the live routes are intentionally absent.
-		if p.OwnerNodeID == "" {
+		// Orphaned placement, or an owner this ingress cannot confirm (its
+		// addresses blanked past the age limit): the in-flux 503 routes are
+		// the expected state. Keep them; the live routes are intentionally
+		// absent. Same test as buildClusterIngressIntents.
+		if p.OwnerNodeID == "" || dataPlaneHostForPlacement(p) == "" {
 			expectedHTTP[caddy.InFluxSandboxRouteID(p.SandboxID)] = struct{}{}
 			for port, route := range cluster.ExposedPortRoutesForPlacement(p) {
 				if route.Protocol == models.ExposedPortProtocolTCP {

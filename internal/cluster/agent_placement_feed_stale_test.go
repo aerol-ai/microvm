@@ -265,3 +265,87 @@ func TestPlacementFeedPollingFitsTheAgeLimit(t *testing.T) {
 		t.Fatalf("feedWait without an age limit = %s, want %s", got, MaxPlacementChangesWait)
 	}
 }
+
+// TestAgentPageWalkMarksEveryEntryInFluxWhenTheControlPlaneStops is the I7
+// regression for an ingress WITHOUT SB_INGRESS_PROXY_ROUTING, which is the
+// default and what the live cluster-chaos scenario runs (UC-470, 2026-11-08).
+// That ingress has no feed: PlacementsForShards walks the pages, and when
+// the walk fails it falls back to the rows of the last walk that worked,
+// with no age limit. A cut-off ingress therefore kept its SNI route to the
+// old owner; the owner had paused the sandbox (C4 part 1), and the paused
+// process took the connection but never answered, so the probe hung until
+// its 10 s timeout instead of getting a quick 503. After the lease without
+// an answered walk, the cached rows must come back in flux, and the real
+// rows must come back on the next walk that works.
+func TestAgentPageWalkMarksEveryEntryInFluxWhenTheControlPlaneStops(t *testing.T) {
+	srv, cleanup := newTestCluster(t, "srv-walk-stale", true, nil)
+	defer cleanup()
+	waitForLeader(t, srv, 10*time.Second)
+	ctx := context.Background()
+	for _, cmd := range []command{placeAt("sb1", "w1", "10.0.0.1"), placeAt("sb2", "w2", "10.0.0.2")} {
+		if err := srv.applyCommand(ctx, cmd); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	var offline atomic.Bool
+	agent := newAgentControlPlaneHarness(t, feedControlPlane(srv, nil, &offline), Member{NodeID: "worker-self", Alive: true, Role: config.NodeRoleWorker})
+	// No IngressProxyRouting: no feed, the page walk serves every read.
+	// A 1s grace makes the lease 500ms.
+	agent.cfg.ClusterDeadOwnerGrace = time.Second
+	allRoutable := func(rows []Placement, want bool) bool {
+		if len(rows) != 2 {
+			return false
+		}
+		for _, p := range rows {
+			if routable(p) != want {
+				return false
+			}
+		}
+		return true
+	}
+	// The lease runs from the start of the last answered walk.
+	lastWalk := time.Now()
+	if rows := agent.PlacementsForShards(PlacementShardFilter{}); !allRoutable(rows, true) {
+		t.Fatalf("the first walk = %v, want both sandboxes routed", ownerHosts(rows))
+	}
+
+	// The control plane stops answering: every walk fails from now on.
+	offline.Store(true)
+	cutOff := time.Now()
+	if rows := agent.PlacementsForShards(PlacementShardFilter{}); !allRoutable(rows, true) {
+		t.Fatalf("one failed walk inside the lease = %v, want the cached rows still routed", ownerHosts(rows))
+	}
+	deadline := cutOff.Add(5 * time.Second)
+	for {
+		rows := agent.PlacementsForShards(PlacementShardFilter{})
+		if allRoutable(rows, false) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%s after the last answered walk the ingress still routes by its cached rows %v; want every entry in flux after the 500ms lease",
+				time.Since(cutOff).Round(time.Millisecond), ownerHosts(rows))
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if got := time.Since(lastWalk); got < 500*time.Millisecond {
+		t.Fatalf("entries went in flux %s after the last answered walk began, before the 500ms lease ran out", got)
+	}
+	// In flux, not gone and not orphaned: the owner id stays, so the router
+	// answers 503 + Retry-After rather than 404 or 410.
+	for _, p := range agent.PlacementsForShards(PlacementShardFilter{}) {
+		if p.OwnerNodeID == "" {
+			t.Fatalf("in-flux row %s lost its owner; it must read as in flux, not orphaned", p.SandboxID)
+		}
+	}
+	// Only the copies handed out are in flux: the cache keeps the real rows.
+	if cached := agent.cachedPlacementsForShards(PlacementShardFilter{}); !allRoutable(cached, true) {
+		t.Fatalf("the cached rows were rewritten: %v", ownerHosts(cached))
+	}
+
+	// The control plane answers again: the next walk routes by the real rows.
+	offline.Store(false)
+	if rows := agent.PlacementsForShards(PlacementShardFilter{}); !allRoutable(rows, true) {
+		t.Fatalf("the first answered walk = %v, want both sandboxes routed again", ownerHosts(rows))
+	}
+}
