@@ -1123,11 +1123,7 @@ func (c *Cluster) startRolloutLoop() {
 			}
 			if now.Sub(lastPrune) >= upgradePruneEvery {
 				r, _ := c.fsm.rolloutView()
-				keep := map[string]bool{}
-				if !rolloutTerminal(r) {
-					keep = rolloutFileSet(r)
-				}
-				pruneUpgradeFiles(c.upgrade.paths, keep, now)
+				pruneUpgradeFiles(c.upgrade.paths, rolloutKeepSet(r), now)
 				lastPrune = now
 			}
 			c.refreshRolloutGauges()

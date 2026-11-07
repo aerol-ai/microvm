@@ -3,6 +3,9 @@ package cluster
 import (
 	"bytes"
 	"context"
+	"errors"
+	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -12,6 +15,7 @@ import (
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/nodeupgrade"
+	"github.com/aerol-ai/microvm/pkg/upgradewire"
 	"golang.org/x/time/rate"
 )
 
@@ -106,6 +110,76 @@ func TestCopyRateLimited(t *testing.T) {
 type failWriter struct{}
 
 func (failWriter) Write([]byte) (int, error) { return 0, os.ErrClosed }
+
+// R8: a worker holds no rollout record. It used to prune every staged file
+// after an hour, so in a big fleet a late worker batch had to copy all its
+// files again within the 45 s an apply allows, all at once. It now keeps
+// the open rollout's files (target and previous version), asking a server
+// for the rollout only when something is old enough to prune, and prunes
+// nothing when no server answers.
+func TestWorkerPruneKeepsTheOpenRolloutsFiles(t *testing.T) {
+	g := newUpgradeNodeRig(t, false)
+	store := nodeupgrade.FileStore{Dir: nodeupgrade.FileStoreDir(g.paths.StateDir)}
+	old := time.Now().Add(-2 * time.Hour)
+	put := func(b []byte) string {
+		t.Helper()
+		if _, _, err := store.Put(sumOf(b), bytes.NewReader(b)); err != nil {
+			t.Fatal(err)
+		}
+		path, _ := store.Path(sumOf(b))
+		_ = os.Chtimes(path, old, old)
+		return sumOf(b)
+	}
+	target, prev, stray := put([]byte("v2 sandboxd")), put([]byte("v1 sandboxd")), put([]byte("an old upload"))
+	r := stepRollout(upgradewire.StateRunning, upgradewire.NodeStaged, map[string]string{"sandboxd_linux_amd64": target})
+	r.PrevFiles = map[string]string{"sandboxd_linux_amd64": prev}
+	reads := 0
+	g.u.fence = func(_ context.Context, rolloutID string) (UpgradeFence, error) {
+		reads++
+		if rolloutID != "" {
+			t.Fatalf("the prune asked for rollout %q, want the current one", rolloutID)
+		}
+		return UpgradeFence{Leader: "lead", Term: 1, Rollout: r}, g.fenceErr
+	}
+	if n := g.u.pruneKeepingRollout(context.Background(), time.Now()); n != 1 || !store.Has(target) || !store.Has(prev) || store.Has(stray) {
+		t.Fatalf("pruned %d; target kept %v, previous kept %v, stray kept %v", n, store.Has(target), store.Has(prev), store.Has(stray))
+	}
+	// A stopped rollout may be applied again: still kept.
+	r.State = upgradewire.StateStopped
+	if n := g.u.pruneKeepingRollout(context.Background(), time.Now()); n != 0 {
+		t.Fatalf("a stopped rollout's files were pruned: %d", n)
+	}
+	// No server answers: nothing goes.
+	g.fenceErr = errors.New("no server answered")
+	g.u.logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+	if n := g.u.pruneKeepingRollout(context.Background(), time.Now()); n != 0 || !store.Has(target) {
+		t.Fatalf("pruned %d with no rollout to check", n)
+	}
+	saved := g.u.fence
+	g.u.fence = nil
+	if n := g.u.pruneKeepingRollout(context.Background(), time.Now()); n != 0 {
+		t.Fatalf("pruned %d before the node can read a rollout", n)
+	}
+	g.u.fence = saved
+	if storeHasOlder(filepath.Join(t.TempDir(), "nowhere"), time.Now()) {
+		t.Fatal("a missing store holds an old file")
+	}
+	// Finalized: everything old goes.
+	g.fenceErr = nil
+	r.State = upgradewire.StateFinalized
+	if n := g.u.pruneKeepingRollout(context.Background(), time.Now()); n != 2 || store.Has(target) || store.Has(prev) {
+		t.Fatalf("after finalize pruned %d", n)
+	}
+	// Nothing old enough: no call to a server at all.
+	reads = 0
+	put([]byte("fresh"))
+	path, _ := store.Path(sumOf([]byte("fresh")))
+	now := time.Now()
+	_ = os.Chtimes(path, now, now)
+	if n := g.u.pruneKeepingRollout(context.Background(), now); n != 0 || reads != 0 {
+		t.Fatalf("a store with nothing old asked a server %d times, pruned %d", reads, n)
+	}
+}
 
 func TestUploadStoreQuotaAndPrune(t *testing.T) {
 	dir := t.TempDir()

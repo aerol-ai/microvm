@@ -365,10 +365,7 @@ func (a *Agent) startUpgradeNode() {
 			case <-ctx.Done():
 				return
 			case now := <-t.C:
-				// A worker holds no rollout record: files it staged and has
-				// not installed within the hour are pruned, and apply copies
-				// a missing one again.
-				pruneUpgradeFiles(a.upgrade.paths, nil, now)
+				a.upgrade.pruneKeepingRollout(ctx, now)
 			}
 		}
 	}()

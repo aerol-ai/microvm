@@ -240,6 +240,55 @@ func storeBytes(dir string) int64 {
 	return total
 }
 
+// rolloutKeepSet is what every node's prune keeps: the open rollout's
+// files, target and previous version. A stopped or failed rollout still
+// keeps them, since apply may restart it; a finalized or rolled-back one
+// keeps nothing (§6.7).
+func rolloutKeepSet(r *RolloutRecord) map[string]bool {
+	if rolloutTerminal(r) {
+		return map[string]bool{}
+	}
+	return rolloutFileSet(r)
+}
+
+// pruneKeepingRollout prunes the file store of a worker or ingress node,
+// which holds no rollout record. A late worker batch can come hours after
+// staging and must find its files still there: an apply allows only
+// materializeTimeout to copy a missing one, and a whole batch copying at
+// once from the servers would not make it. So the node asks a server for
+// the open rollout (the fence route, which answers the current rollout
+// for an empty ID) and keeps its files. It asks only when a file is old
+// enough to prune, and prunes nothing while no server answers.
+func (u *upgradeNode) pruneKeepingRollout(ctx context.Context, now time.Time) int {
+	p, err := u.paths()
+	if err != nil || u.fence == nil || !storeHasOlder(nodeupgrade.FileStoreDir(p.StateDir), now.Add(-uploadPruneAge)) {
+		return 0
+	}
+	f, err := u.fence(ctx, "")
+	if err != nil {
+		if u.logger != nil {
+			u.logger.Warn("cluster: upgrade file prune skipped; no server said which rollout is open", "err", err)
+		}
+		return 0
+	}
+	return pruneUpgradeFiles(u.paths, rolloutKeepSet(f.Rollout), now)
+}
+
+// storeHasOlder reports whether dir holds a regular file last changed
+// before cutoff.
+func storeHasOlder(dir string, cutoff time.Time) bool {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return false
+	}
+	for _, e := range entries {
+		if info, err := e.Info(); err == nil && info.Mode().IsRegular() && info.ModTime().Before(cutoff) {
+			return true
+		}
+	}
+	return false
+}
+
 // pruneUpgradeFiles deletes stored files no rollout uses that are older
 // than an hour (§6.6), on every node. A finalized or rolled-back rollout
 // keeps nothing.
