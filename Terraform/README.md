@@ -77,8 +77,8 @@ Nothing is copied between nodes: the servers sign every node's certificate.
 
 **Keep the state safe.** The join tokens are in the Terraform state and in
 user data, like the admin PAT. A join token can make a node, and a node
-receives the cluster's keys. Treat the state like the PAT: an encrypted
-backend with tight access.
+receives the cluster's admin PAT and keys. Treat the state like the PAT: an
+encrypted backend with tight access.
 
 `one_line_join = false` is the old way (an S3 bundle hand-off and a
 certificate-signing loop on the seed, through `cluster-init.sh` and

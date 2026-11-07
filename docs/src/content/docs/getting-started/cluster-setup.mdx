@@ -189,8 +189,8 @@ Without failover, a sandbox on a dead server is gone. Calls for it return `410 G
 
 A cluster is many moving parts that must agree with each other. This is the work behind it:
 
-- **Voting and quorum.** Server nodes agree on every change by majority vote. If too many go down at once, every change stops until they return. Restarts and upgrades must go one node at a time, in the right order. Getting a cluster back after it loses its majority is a manual recovery.
-- **Your own certificate authority.** Every node needs a certificate signed by the cluster's private authority, plus a shared encryption key for discovery traffic. You keep the signing key offline and rotate everything after a leak.
+- **Voting and quorum.** Server nodes agree on every change by majority vote. If too many go down at once, every change stops until they return. Restarts and upgrades must go one node at a time, in the right order: `aerolvm upgrade apply` does that for you, but a server that is down stops it. Getting a cluster back after it loses its majority is a manual recovery.
+- **Your own certificate authority.** Every node needs a certificate signed by the cluster's private authority, plus a shared encryption key for discovery traffic. `sandboxd init` makes them, a new machine joins with one line, and certificates renew themselves. You still guard the signing key and the join tokens, and after a leak you rebuild the cluster's keys.
 - **Secrets that survive failover.** Encrypted passwords must reach backup nodes before a sandbox is safe to move. You choose where the keys live and give each worker only the access it needs.
 - **Private networking.** The voting, discovery and node-to-node ports must sit on a private network that the internet cannot reach.
 - **Traffic in front.** A load balancer or DNS sits in front of the ingress nodes. Their HTTPS certificates are shared through a storage bucket. Past 10 ingress nodes, a plain load balancer silently drops most traffic. You need a router that knows where each sandbox lives.

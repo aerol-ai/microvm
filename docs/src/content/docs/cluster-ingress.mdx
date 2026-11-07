@@ -134,53 +134,44 @@ Never set this flag just to silence the check while a plain load balancer sits i
 
 ## Start a split cluster by hand
 
-Terraform does all of this for you (see [Cluster setup](/cluster-setup/)). Use these steps only when you set up machines yourself. The scripts live in the repository's `scripts/` folder. Run [`install.sh`](/getting-started/single-node-setup/) on every machine first.
+Terraform does all of this for you (see [Cluster setup](/cluster-setup/#build-a-cluster-on-aws-with-terraform)). Use these steps only when you set up machines yourself. Each machine runs one command, and you need no copy of the repository. [Cluster setup](/cluster-setup/#build-a-cluster-with-one-command-per-machine) explains each step in full.
 
 This example builds three servers, two workers and two ingress nodes.
 
 ### Step 1: Start the cluster on the first server
 
 ```sh
-sudo ./cluster-init.sh \
-    --role server \
-    --ingress-advertise-host ingress.sandbox.example.com \
-    --gossip-key "$(openssl rand -base64 32)"
+curl -fsSL https://aerolvm.aerol.ai | sudo bash -s -- \
+    --domain sandbox.example.com --pat-token your-secret-pat \
+    --dns-provider cloudflare --dns-api-token your-cloudflare-api-token \
+    init --role server --ingress-advertise-host ingress.sandbox.example.com
 ```
 
-The gossip key is a shared secret. Nodes use gossip (a light protocol for finding each other) and the key stops strangers from joining. Save the key the script prints.
-
-The script also writes two files: `aerolvm-tls-bundle.tar.gz` (the cluster's certificate authority) and `aerolvm-cred-bundle.tar.gz` (the key for sealed secrets). Copy both to every other node, for example into `/tmp`.
+`init` makes the cluster's certificate authority, the gossip key (a shared secret that stops strangers joining) and the key for sealed secrets. Then copy `/etc/sandboxd/admin-context.json` from the server to your computer and run `aerolvm config import admin-context.json --use`.
 
 ### Step 2: Join every other node
 
-Run this on each of the other nodes. Change `--role` to match the node: `server` on the other two servers, `worker` on each worker, `ingress` on each ingress node.
+On your computer, make one join command per machine, with its role:
 
 ```sh
-sudo ./cluster-join.sh \
-    --role worker \
-    --ingress-advertise-host ingress.sandbox.example.com \
-    --gossip-key '<key>' \
-    --peers '<seed-ip>:7001' \
-    --tls-bundle /tmp/aerolvm-tls-bundle.tar.gz \
-    --cred-bundle /tmp/aerolvm-cred-bundle.tar.gz
+aerolvm join-command --role server     # the other two servers
+aerolvm join-command --role worker     # each worker
+aerolvm join-command --role ingress    # each ingress node
 ```
 
-The first run stops early. It writes a certificate request for the node and prints where it is.
-
-### Step 3: Sign each node's certificate on the seed
-
-Copy the node's request to the seed (the first server) and sign it there:
+On each machine, run the line it printed, with your domain options before the word `join`, and the same `--ingress-advertise-host` at the end:
 
 ```sh
-sudo ./cluster-sign-node.sh \
-    --csr /tmp/<node-id>.csr \
-    --node-id <node-id> \
-    --out /tmp/<node-id>.crt
+curl -fsSL https://aerolvm.aerol.ai | sudo bash -s -- \
+    --domain sandbox.example.com \
+    --dns-provider cloudflare --dns-api-token your-cloudflare-api-token \
+    join https://<first-server-ip>:7003 --token <token> --ca-cert-hash sha256:<hash> \
+    --ingress-advertise-host ingress.sandbox.example.com
 ```
 
-Copy the signed `.crt` file back to the node. Then run the same `cluster-join.sh` command again, adding `--signed-cert /tmp/node.crt`. The cluster's signing key never leaves the seed.
+The token decides the role. The servers sign each node's certificate, so nothing is copied between machines. `aerolvm get nodes` shows every node `Ready` when you are done.
 
-### Step 4: Point DNS at the ingress nodes
+### Step 3: Point DNS at the ingress nodes
 
 Point your wildcard DNS record (`*.sandbox.example.com`) at the ingress nodes, or at the load balancer in front of them. Point `ingress.sandbox.example.com` at the same place.
 
@@ -188,19 +179,19 @@ Sandbox URLs from the SDK then lead there. Each ingress node reads the SNI (the 
 
 ### A smaller layout with edge nodes
 
-For 10 nodes or fewer, you can skip the separate ingress tier. This layout uses three servers and five `worker,ingress` edge nodes. Start and join the servers as above. On each edge node, join with:
+For 10 nodes or fewer, you can skip the separate ingress tier. This layout uses three servers and five `worker,ingress` edge nodes. Start and join the servers as above. For each edge node, make a worker token, and add `--role worker,ingress` to the end of the line it prints:
 
 ```sh
-sudo ./cluster-join.sh \
-    --role worker,ingress \
-    --ingress-advertise-host ingress.sandbox.example.com \
-    --gossip-key '<key>' \
-    --peers '<seed-ip>:7001' \
-    --tls-bundle /tmp/aerolvm-tls-bundle.tar.gz \
-    --cred-bundle /tmp/aerolvm-cred-bundle.tar.gz
+aerolvm join-command --role worker
+# then on the edge node:
+curl -fsSL https://aerolvm.aerol.ai | sudo bash -s -- \
+    --domain sandbox.example.com \
+    --dns-provider cloudflare --dns-api-token your-cloudflare-api-token \
+    join https://<first-server-ip>:7003 --token <token> --ca-cert-hash sha256:<hash> \
+    --role worker,ingress --ingress-advertise-host ingress.sandbox.example.com
 ```
 
-Point the DNS or load balancer for `ingress.sandbox.example.com` at every edge node. Each one holds the full route table, so any of them can answer for any sandbox. Before the cluster grows past 10 live nodes, move to dedicated `worker` and `ingress` nodes.
+`--role` sets the node's full role when it is more than its token's. Point the DNS or load balancer for `ingress.sandbox.example.com` at every edge node. Each one holds the full route table, so any of them can answer for any sandbox. Before the cluster grows past 10 live nodes, move to dedicated `worker` and `ingress` nodes.
 
 ## What runs where
 

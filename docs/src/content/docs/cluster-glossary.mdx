@@ -61,7 +61,7 @@ Always use an **odd number** of voting nodes. An even number raises the majority
 
 ## Cluster settings
 
-Terraform writes these settings to `/etc/sandboxd/cluster.env` on each node when you run `scripts/terraform.sh apply`. You do not need to set them yourself. They help when you read logs or fix problems.
+`sandboxd init` and `sandboxd join` write these settings to `/etc/sandboxd/cluster.env` on each node, whether you run them yourself or Terraform does. You do not need to set them yourself. They help when you read logs or fix problems.
 
 ### Node identity
 
@@ -124,7 +124,7 @@ Raft keeps its records on disk, so they survive restarts.
 
 GPU passthrough lets a sandbox use a physical NVIDIA or AMD GPU on its worker. The cluster sends GPU sandboxes only to nodes with a matching GPU.
 
-To add GPU support, set `with_nvidia_gpu = true` or `with_amd_gpu = true` on a worker in `terraform.tfvars`. Terraform then passes `--with-nvidia-gpu` or `--with-amd-gpu` to the node's install script. The script installs the GPU tools and sets up Docker to use them.
+To add GPU support, set `with_nvidia_gpu = true` or `with_amd_gpu = true` on a worker in Terraform's `nodes`. Terraform then passes `--with-nvidia-gpu` or `--with-amd-gpu` to the node's install script. The script installs the GPU tools and sets up Docker to use them.
 
 There is no extra setting to add. Each node shares its GPUs over gossip, next to its CPU and memory.
 
@@ -137,13 +137,13 @@ A sandbox can use a GPU or gVisor, but not both.
 
 gVisor puts a small kernel of its own between each container and the server. That is a stronger wall than a plain container, and it needs no bare-metal hardware. It works on any EC2 instance type.
 
-To add it, set `with_gvisor = true` on a worker in `terraform.tfvars`. Terraform passes `--with-gvisor` to the node's install script. The script installs gVisor's `runsc` runtime (the program that runs gVisor containers) and sets up Docker to offer it.
+To add it, set `with_gvisor = true` on a worker in Terraform's `nodes`. Terraform passes `--with-gvisor` to the node's install script. The script installs gVisor's `runsc` runtime (the program that runs gVisor containers) and sets up Docker to offer it.
 
 The node then tells the cluster it supports `gvisor`. The cluster sends `runtime: "gvisor"` sandboxes only to such nodes. There is no extra setting to add.
 
 ## Firecracker settings
 
-Terraform writes these when a node has `with_firecracker = true` in `terraform.tfvars`. Firecracker runs each sandbox in a microVM (a small, fast virtual machine).
+Terraform writes these when a node has `with_firecracker = true` in Terraform's `nodes`. Firecracker runs each sandbox in a microVM (a small, fast virtual machine).
 
 ### Core settings
 

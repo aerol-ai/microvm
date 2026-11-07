@@ -119,17 +119,17 @@ sudo systemctl start sandboxd
 
 # Cluster: the same program on three servers.
 # On node A, turn the running daemon into the first cluster node:
-sudo ./scripts/cluster-init.sh
+sudo sandboxd init --role server
 
-# On nodes B and C, join node A with the key and trust bundles it printed:
-sudo ./scripts/cluster-join.sh \
-    --gossip-key '<key from node A>' \
-    --peers <node-A-address>:7001 \
-    --tls-bundle <bundle from node A> \
-    --cred-bundle <key bundle from node A>
+# From your laptop, make a join command for each other node:
+aerolvm join-command --role server
+
+# On nodes B and C, run the line it printed:
+curl -fsSL https://aerolvm.aerol.ai | sudo bash -s -- \
+    join https://<node-A-address>:7003 --token <token> --ca-cert-hash sha256:<hash>
 ```
 
-There is no external database to run, no companion service and no Helm chart. [Cluster setup](/cluster-setup/) has the full steps, and on AWS, Terraform runs them for you.
+There is no external database to run, no companion service and no Helm chart. [Cluster setup](/cluster-setup/) has the full steps, and on AWS, a Terraform module used by its URL runs them for you.
 
 **Why nobody else did this.** There are two reasons, and both are honest:
 

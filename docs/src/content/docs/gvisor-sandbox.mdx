@@ -221,7 +221,7 @@ Add `--with-gvisor` to the install command (see [Install on a server](/getting-s
 
 Use `--runsc-path /path/to/runsc` with `--with-gvisor` to register a `runsc` you installed yourself.
 
-On a cluster, set `with_gvisor = true` on each worker in `terraform.tfvars` (see [Cluster setup](/cluster-setup/)). Workers without it keep running normal containers only.
+On a cluster, set `with_gvisor = true` on each worker in Terraform's `nodes` (see [Cluster setup](/cluster-setup/)). Workers without it keep running normal containers only.
 
 If a create fails with `runtime "gvisor" not supported on this host`, the server does not list gVisor in `SB_HOST_RUNTIMES`. Add it there and restart the server.
 

@@ -1,6 +1,6 @@
 ---
 title: Runbooks
-description: Find the step-by-step guide for each kind of outage or alert, and the scripts and playbooks those guides use.
+description: Find the step-by-step guide for each kind of outage or alert, and the tools those guides use.
 ---
 
 import { Aside } from '@astrojs/starlight/components';
@@ -14,6 +14,7 @@ Most runbooks follow the same pattern: how serious the problem is, safety rules,
 | Runbook | Use it when |
 |---|---|
 | [Backup and restore](https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/backup-restore.md) | You need to restore a node, recover lost local data, or prove your backups work. |
+| [Cluster upgrades](https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/cluster-upgrades.md) | An upgrade rollout failed, is stuck, or waits on a node marked `manual` or `skipped`, or you need to finalize or roll back. |
 | [Lost-quorum recovery](https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/lost-quorum-recovery.md) | The cluster has no leader because too many voting servers are gone, and you cannot bring a majority back. This is a last resort. |
 | [SLO breach](https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/slo-breach.md) | Any service-level alert fires and the cause is not clear. Start here, then move to a narrower runbook. |
 | [Image-pull storm](https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/image-pull-storm.md) | Image downloads are queued, failing, rate-limited, or held back after repeated failures. |
@@ -36,49 +37,43 @@ The [runbook overview](https://github.com/aerol-ai/microvm/blob/main/setup/runbo
 
 1. Find the alert that fired and the cluster it affects.
 2. Open the Grafana dashboard and the current Prometheus alerts page.
-3. Save the cluster leader, the member list and the metrics from one server, one worker and one ingress node (a node that takes public traffic). The [Dashboard](/dashboard/) shows the leader and members.
+3. Save the cluster leader, the member list and the metrics from one server, one worker and one ingress node (a node that takes public traffic). `aerolvm cluster-info` and `aerolvm get nodes -o wide` print the leader and members; so does the [Dashboard](/dashboard/).
 4. Stop deploys and changes to the cluster's nodes until the incident lead says it is safe.
 5. Pick the narrowest runbook above. Follow its checks before you change anything.
 
 It also names four incident roles. The **incident lead** makes decisions and keeps the timeline. The **operator** runs the commands. **Comms** keeps users updated. The **observer** records metrics before, during and after the fix. On a small team one person can hold several roles, but keep one lead and one log of commands.
 
-## Scripts the runbooks use
+## Tools the runbooks use
 
-Most run on a node, with `sudo`. `terraform.sh` runs on your own computer.
+You need no copy of the repository. Every tool below ships in a release or inside a program you already have.
 
-Use the copy that matches the release your servers run, not the one on `main`: `main` can hold changes your release does not have. `sudo sandboxd version` prints the release, such as `v0.6.12`.
-
-- **Shipped with every release.** The links below are the latest release's copies. For another release, use `https://github.com/aerol-ai/microvm/releases/download/<release>/<script>`.
-- **In the source only.** Open `https://github.com/aerol-ai/microvm/tree/<release>/scripts` and take the script from there.
-
-| Script | Where to get it | What it does |
+| Tool | Where it runs | What it does |
 |---|---|---|
-| [`install.sh`](https://github.com/aerol-ai/microvm/releases/latest/download/install.sh) | Every release | Installs or upgrades AerolVM on one machine. See [Install on a server](/getting-started/single-node-setup/). |
-| [`uninstall.sh`](https://github.com/aerol-ai/microvm/releases/latest/download/uninstall.sh) | Every release | Removes the AerolVM server from a machine. |
-| [`cluster-init.sh`](https://github.com/aerol-ai/microvm/releases/latest/download/cluster-init.sh) | Every release | Starts a new cluster on its first server node. |
-| [`cluster-join.sh`](https://github.com/aerol-ai/microvm/releases/latest/download/cluster-join.sh) | Every release | Joins a node to an existing cluster. |
-| [`cluster-sign-node.sh`](https://github.com/aerol-ai/microvm/releases/latest/download/cluster-sign-node.sh) | Every release | On the seed, signs a joining node's certificate request. The signing key never leaves the seed. |
-| `terraform.sh` | Source, at your release | Runs Terraform with your `config/` files. See [Cluster setup](/cluster-setup/). |
-| `sandboxd-node-lifecycle.sh` | Source, at your release | Drains or uncordons a node, removes a member, or empties a node before a role change. |
-| `sandboxd-backup.sh` | Source, at your release | Saves a node's database, Raft data and settings into one archive. |
-| `sandboxd-restore.sh` | Source, at your release | Puts that archive back on a node. It writes nothing unless you pass `--force`. |
-| `raft-lost-quorum-recover.sh` | Source, at your release | Writes the recovery file (`peers.json`) that makes one surviving server the only voter. |
+| `aerolvm` | Your computer | The cluster commands: `get nodes`, `cordon`, `drain`, `delete node`, `join-command`, `upgrade`, `release pull`. See [the aerolvm CLI](/cli/#run-a-cluster). |
+| `sudo sandboxd init`, `join`, `preflight`, `adopt`, `reset` | On a node | Start a cluster, add a machine, check a machine first, bring an older cluster onto one-line joins, take a machine out. See [Cluster setup](/cluster-setup/). |
+| `sudo sandboxd backup`, `restore`, `recover-quorum` | On a node | Save a node's database, Raft data and settings into one archive, put it back, and the last-resort lost-quorum recovery. |
+| `sudo sandboxd upgrade node` | On a node | Upgrades this one node. Only for a node that takes no remote upgrade, or the first hop from an old release. |
+| [`install.sh`](https://github.com/aerol-ai/microvm/releases/latest/download/install.sh) | On a node | Installs AerolVM on one machine. With `init` or `join` at the end, it also starts or joins a cluster. |
+| [`uninstall.sh`](https://github.com/aerol-ai/microvm/releases/latest/download/uninstall.sh) | On a node | Removes the AerolVM server from a machine. |
+| `aerolvm-ops-<release>.tar.gz` | Your monitoring | Every release ships one: the Prometheus alert rules, the Grafana dashboards, the Alertmanager example and these runbooks, for that release. |
+
+Use the copies that match the release your servers run. `sudo sandboxd version` prints it, such as `v0.6.12`. For another release's files, use `https://github.com/aerol-ai/microvm/releases/download/<release>/<file>`.
 
 <Aside type="caution">
-Use `raft-lost-quorum-recover.sh` only while you follow the lost-quorum runbook. It can make the cluster keep changes that a majority never agreed on. Try to bring the original voting servers back first.
+Use `sandboxd recover-quorum` only while you follow the lost-quorum runbook. It can make the cluster keep changes that a majority never agreed on. Try to bring the original voting servers back first.
 </Aside>
+
+**The old scripts are going away.** `cluster-init.sh` and `cluster-join.sh` still ship in this release, as thin wrappers over `sandboxd init` and `sandboxd join`, with `cluster-sign-node.sh` for the old two-step join. All three leave in a later release. `sandboxd-backup.sh`, `sandboxd-restore.sh` and `raft-lost-quorum-recover.sh` in the source now call `sandboxd backup`, `restore` and `recover-quorum`.
 
 ## Ansible playbooks
 
-Ansible is a tool that runs the same steps on many servers over SSH. The playbooks live in [`Ansible/playbooks/`](https://github.com/aerol-ai/microvm/tree/main/Ansible/playbooks). Run them from the `Ansible` folder, which holds the server list and settings. The [Ansible README](https://github.com/aerol-ai/microvm/blob/main/Ansible/README.md) has the full guide.
+Ansible is a tool that runs the same steps on many servers over SSH. You do not need it to upgrade: `aerolvm upgrade apply` upgrades every node from your computer. The playbooks live in [`Ansible/playbooks/`](https://github.com/aerol-ai/microvm/tree/main/Ansible/playbooks), for host settings only. Run them from the `Ansible` folder, which holds the server list and settings. The [Ansible README](https://github.com/aerol-ai/microvm/blob/main/Ansible/README.md) has the full guide.
 
 | Playbook | What it does |
 |---|---|
 | `ping.yml` | Checks that Ansible can reach every node with SSH and `sudo`. Run it before anything risky. |
 | `configure-ops.yml` | Pushes operations settings to every node, plus the Grafana dashboard, alert rules, Alertmanager example and the main runbooks. |
-| `prepare-role-change.yml` | Drains a node and waits until it owns no sandboxes, before you change its role or replace it. It fails if sandboxes are still there. |
-| `update-sandboxd.yml` | Rolls a new AerolVM server program out across the cluster. |
-| `update-toolboxd.yml` | Rolls a new toolbox (the helper program inside each sandbox) out across the cluster. |
+| `prepare-role-change.yml` | Drains a node and waits until it owns no sandboxes, before you change its role or replace it. `aerolvm drain` does the same from your computer. |
 | `tail-logs.yml` | Shows the latest server log lines from every node. |
 | `stage-wasm-modules.yml` | Copies the standard WASM modules onto every node ahead of time, and checks each file's checksum. |
 
