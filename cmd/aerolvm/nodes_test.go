@@ -474,7 +474,10 @@ func TestDrainFailures(t *testing.T) {
 	if code := h.run("drain", "srv-a", "--timeout", "30ms", "--json"); code != exitError {
 		t.Fatalf("timeout = %d", code)
 	}
-	if e := h.errorEnvelope(); e.Code != agenttools.CodeTimeout || !strings.Contains(e.Message, "still has 1 sandbox(es)") {
+	// The deadline may land between polls ("still has 1 sandbox(es)") or
+	// during a node read on a loaded machine ("still has sandboxes"); both
+	// are the same timeout.
+	if e := h.errorEnvelope(); e.Code != agenttools.CodeTimeout || !strings.Contains(e.Message, "node srv-a still has") || !strings.Contains(e.Message, "after 30ms") {
 		t.Fatalf("timeout envelope = %+v", e)
 	}
 	if !f.cordoned["srv-a"] {
