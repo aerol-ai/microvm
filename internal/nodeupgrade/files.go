@@ -121,14 +121,19 @@ func copyFile(src, dst string, mode os.FileMode) error {
 // buffer in memory (eng review Section 4), and refuses more than
 // MaxFileBytes. It returns the size and the hex SHA-256.
 func streamToFile(r io.Reader, dst string, mode os.FileMode) (int64, string, error) {
+	return streamToFileMax(r, dst, mode, maxFileBytes)
+}
+
+// streamToFileMax is streamToFile with its own cap (FileStore.MaxBytes).
+func streamToFileMax(r io.Reader, dst string, mode os.FileMode, max int64) (int64, string, error) {
 	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, mode)
 	if err != nil {
 		return 0, "", err
 	}
 	h := sha256.New()
-	n, err := io.Copy(io.MultiWriter(out, h), io.LimitReader(r, maxFileBytes+1))
-	if err == nil && n > maxFileBytes {
-		err = fmt.Errorf("larger than %d bytes", maxFileBytes)
+	n, err := io.Copy(io.MultiWriter(out, h), io.LimitReader(r, max+1))
+	if err == nil && n > max {
+		err = fmt.Errorf("larger than %d bytes", max)
 	}
 	if err == nil {
 		err = out.Sync()
