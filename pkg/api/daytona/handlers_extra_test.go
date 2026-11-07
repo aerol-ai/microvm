@@ -1365,6 +1365,25 @@ func TestToSandboxResponse_Extra(t *testing.T) {
 	}
 }
 
+// Every sandbox answer carries "kvm": false. Daytona Python SDK 0.230 and
+// later rejects a sandbox without the field, so it is never left out.
+func TestSandboxResponseAlwaysSendsKvm(t *testing.T) {
+	h := newHandlers(Deps{})
+	req := httptest.NewRequest(http.MethodGet, "/test", nil)
+	resp := h.toSandboxResponse(req, &models.Sandbox{ID: "sb-kvm"}, sandboxMeta{})
+	raw, err := json.Marshal(resp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fields map[string]any
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		t.Fatal(err)
+	}
+	if v, ok := fields["kvm"]; !ok || v != false {
+		t.Fatalf("kvm = %v (present %v), want false and always present: %s", v, ok, raw)
+	}
+}
+
 func TestParseSnapshotListFilters_Errors(t *testing.T) {
 	// 1. limit > 200
 	req1 := httptest.NewRequest(http.MethodGet, "/snapshots?limit=250", nil)
@@ -1541,7 +1560,7 @@ func TestHTTPListHandlers_ExtraErrorsAndPagination(t *testing.T) {
 	req7 := httptest.NewRequest(http.MethodPost, "/daytona/sandbox", strings.NewReader(body))
 	rr7 := httptest.NewRecorder()
 	handler2.ServeHTTP(rr7, req7)
-	if rr7.Code != http.StatusCreated {
-		t.Fatalf("expected 201, got %d (body: %s)", rr7.Code, rr7.Body.String())
+	if rr7.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d (body: %s)", rr7.Code, rr7.Body.String())
 	}
 }

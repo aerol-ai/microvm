@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"math"
+	"reflect"
 	"strconv"
 	"strings"
 	"testing"
@@ -280,7 +281,9 @@ func TestCapacityRequestFromSpecPopulatesAllAxes(t *testing.T) {
 	}
 	got := capacityRequestFromSpec(spec)
 	want := capacity.Request{CPU: 2, MemoryMB: 4096, DiskGB: 50, Runtime: "gvisor", GPUs: 2, GPUVendor: "nvidia"}
-	if got != want {
+	// capacity.Request holds the placement-rule label map, so it is compared
+	// with DeepEqual rather than ==.
+	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("capacityRequestFromSpec drift: got %+v want %+v", got, want)
 	}
 }

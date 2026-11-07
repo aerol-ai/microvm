@@ -11,6 +11,7 @@ import (
 	pathpkg "path"
 	"strings"
 
+	"github.com/aerol-ai/microvm/internal/observability"
 	isolateruntime "github.com/aerol-ai/microvm/internal/runtime/isolate"
 	wasmruntime "github.com/aerol-ai/microvm/internal/runtime/wasm"
 	"github.com/aerol-ai/microvm/internal/store"
@@ -34,12 +35,18 @@ func (s *Service) ServeToolboxReverseProxy(ctx context.Context, sandboxID string
 	// this request or is what the read sees.
 	callCtx, release := s.TrackToolboxCall(ctx, sandboxID)
 	defer release()
-	err := s.serveToolboxReverseProxy(ctx, callCtx, sandboxID, w, r, path)
+	rec := NewToolboxStatusRecorder(w)
+	err := s.serveToolboxReverseProxy(ctx, callCtx, sandboxID, rec, r, path)
 	if err != nil {
 		if stopped := toolboxCallEnded(callCtx); stopped != nil {
-			return stopped
+			err = stopped
 		}
 	}
+	status := rec.Status()
+	if status == 0 && err != nil {
+		status = toolboxErrorStatus(err)
+	}
+	RecordToolboxCall(ctx, path, status)
 	return err
 }
 
@@ -57,6 +64,10 @@ func (s *Service) serveToolboxReverseProxy(ctx, callCtx context.Context, sandbox
 	if err := refuseToolboxAdminPath(path); err != nil {
 		return err
 	}
+	// Before the wake, so a refused body does not start a stopped sandbox.
+	if err := s.applyExecOutputPolicyToRequest(r, path); err != nil {
+		return err
+	}
 	// Reuse the sandbox the wake helper already read (owner-scoped, post-wake)
 	// instead of a second scopedGet — one fewer store read per toolbox call (D15).
 	sandbox, err := s.EnsureSandboxAwakeForHTTP(ctx, sandboxID)
@@ -71,9 +82,7 @@ func (s *Service) serveToolboxReverseProxy(ctx, callCtx context.Context, sandbox
 		if !ok {
 			return fmt.Errorf("wasm runtime does not implement toolbox host")
 		}
-		req := r.Clone(callCtx)
-		req.URL.Path = path
-		host.ServeToolbox(callCtx, sandboxID, sandbox.ToolboxToken, w, req)
+		host.ServeToolbox(callCtx, sandboxID, sandbox.ToolboxToken, w, hostToolboxRequest(callCtx, r, path, sandbox.ToolboxToken))
 		return nil
 	}
 	if s.isIsolateSandbox(sandbox) {
@@ -84,9 +93,7 @@ func (s *Service) serveToolboxReverseProxy(ctx, callCtx context.Context, sandbox
 		if !ok {
 			return fmt.Errorf("isolate runtime does not implement toolbox host")
 		}
-		req := r.Clone(callCtx)
-		req.URL.Path = path
-		host.ServeToolbox(callCtx, sandboxID, sandbox.ToolboxToken, w, req)
+		host.ServeToolbox(callCtx, sandboxID, sandbox.ToolboxToken, w, hostToolboxRequest(callCtx, r, path, sandbox.ToolboxToken))
 		return nil
 	}
 
@@ -99,7 +106,10 @@ func (s *Service) serveToolboxReverseProxy(ctx, callCtx context.Context, sandbox
 		return fmt.Errorf("invalid toolbox target: %w", err)
 	}
 	proxy := httputil.NewSingleHostReverseProxy(target)
-	proxy.Transport = toolboxhttp.Transport
+	// Dials again while toolboxd refuses the connection (I1): inside the
+	// dial, so no part of the request has gone out and the call is still
+	// counted once below.
+	proxy.Transport = toolboxhttp.ProxyTransport
 	originalDirector := proxy.Director
 	toolboxToken := endpoint.Token
 	proxy.Director = func(req *http.Request) {
@@ -118,6 +128,9 @@ func (s *Service) serveToolboxReverseProxy(ctx, callCtx context.Context, sandbox
 			req.Header.Set("Authorization", "Bearer "+toolboxToken)
 		}
 		stripSmuggledBearerSubprotocol(req.Header)
+		// W3C trace context of this API call, so toolboxd's log line names
+		// the trace (A3). Replaces whatever the caller sent.
+		observability.InjectTraceContext(req.Context(), req.Header)
 	}
 	// ReverseProxy calls ErrorHandler only before it writes a response, so
 	// a stopped sandbox can still be answered by the caller.
@@ -145,6 +158,24 @@ func (s *Service) serveToolboxReverseProxy(ctx, callCtx context.Context, sandbox
 // a bearer token past the browser's inability to set Authorization on a
 // handshake: `Sec-WebSocket-Protocol: sandbox.bearer, <token>`.
 const bearerSubprotocol = "sandbox.bearer"
+
+// hostToolboxRequest is the caller's request as an in-process toolbox host
+// (WASM, isolate) must see it: the sandbox's own toolbox token in place of
+// the caller's credential, as the container path's Director sets it. The
+// host checks that token on every route, so passing the caller's PAT on
+// made every authenticated /v1 toolbox call answer 401. sandboxd has
+// already authenticated and authorized the caller by the time it gets here.
+func hostToolboxRequest(ctx context.Context, r *http.Request, path, toolboxToken string) *http.Request {
+	req := r.Clone(ctx)
+	req.URL.Path = path
+	req.Header.Del("Authorization")
+	if toolboxToken != "" {
+		req.Header.Set("Authorization", "Bearer "+toolboxToken)
+	}
+	stripSmuggledBearerSubprotocol(req.Header)
+	observability.InjectTraceContext(ctx, req.Header)
+	return req
+}
 
 // stripSmuggledBearerSubprotocol rewrites Sec-WebSocket-Protocol so the caller's
 // smuggled bearer token is removed before the request reaches the sandbox,
@@ -204,10 +235,12 @@ func (s *Service) RoundTripToolbox(ctx context.Context, sandboxID, method, path 
 		stopped := toolboxCallEnded(callCtx)
 		release()
 		if stopped != nil {
-			return nil, stopped
+			err = stopped
 		}
+		RecordToolboxCall(ctx, path, toolboxErrorStatus(err))
 		return nil, err
 	}
+	RecordToolboxCall(ctx, path, resp.StatusCode)
 	if !held {
 		release()
 		return resp, nil
@@ -220,6 +253,10 @@ func (s *Service) RoundTripToolbox(ctx context.Context, sandboxID, method, path 
 // reports a response still streaming from the sandbox, whose registration
 // must last until its body is closed.
 func (s *Service) roundTripToolbox(ctx, callCtx context.Context, sandboxID, method, path string, query url.Values, body io.Reader, headers http.Header) (*http.Response, bool, error) {
+	body, err := s.applyExecOutputPolicy(method, path, body)
+	if err != nil {
+		return nil, false, err
+	}
 	// Reuse the sandbox the wake helper already read (D15). The wake runs
 	// on ctx so a stop that ends this request cannot abort a start half way.
 	sandbox, err := s.EnsureSandboxAwakeForHTTP(ctx, sandboxID)
@@ -257,7 +294,9 @@ func (s *Service) roundTripToolbox(ctx, callCtx context.Context, sandboxID, meth
 	if err != nil {
 		return nil, false, err
 	}
-	resp, err := toolboxhttp.Client(0).Do(req)
+	// The same refused-dial retry as the reverse proxy (I1): body is read
+	// only once the connection is made, so it is never sent twice.
+	resp, err := toolboxhttp.ProxyClient(0).Do(req)
 	if err != nil {
 		if stopped := s.toolboxBrokenCause(callCtx, sandbox); stopped != nil {
 			return nil, false, stopped
@@ -320,6 +359,7 @@ func (s *Service) roundTripHostToolbox(ctx context.Context, sandbox *models.Sand
 	if sandbox.ToolboxToken != "" {
 		req.Header.Set("Authorization", "Bearer "+sandbox.ToolboxToken)
 	}
+	observability.InjectTraceContext(ctx, req.Header)
 	rec := httptest.NewRecorder()
 	host.ServeToolbox(ctx, sandbox.ID, sandbox.ToolboxToken, rec, req)
 	return rec.Result(), nil
@@ -347,5 +387,8 @@ func (s *Service) newNetworkToolboxRequest(ctx context.Context, sandbox *models.
 	if endpoint.Token != "" {
 		req.Header.Set("Authorization", "Bearer "+endpoint.Token)
 	}
+	// Daytona and Runloop toolbox calls build their request here: the
+	// caller's headers are copied, so the trace context is set last (A3).
+	observability.InjectTraceContext(ctx, req.Header)
 	return req, nil
 }

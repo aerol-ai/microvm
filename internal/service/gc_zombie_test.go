@@ -421,3 +421,56 @@ func equalSorted(a, b []string) bool {
 	}
 	return true
 }
+
+// A token-gated port on an ordinary (not serverless) sandbox has only the
+// wake-aware route: the ingress proxy is what checks the token. The sweep
+// must keep it, or the gated URL answers Caddy's "Sandbox not found" until
+// the next expose (UC-465 on single-node-fc), and must remove a direct
+// route on it, which would skip the token. A public port on the same
+// sandbox keeps its direct route and loses a stray wake route.
+func TestGCZombieCaddyEntriesKeepsTokenGatedWakeRoutes(t *testing.T) {
+	fake := newGCCaddyFake()
+	sb := &models.Sandbox{
+		ID:                 "gated",
+		Status:             models.SandboxStatusStarted,
+		AllowPublicTraffic: privateFlag(true),
+		ExposedPorts: []models.ExposedPort{
+			{SandboxID: "gated", Port: 8080, Protocol: models.ExposedPortProtocolHTTP, Visibility: models.ExposedPortVisibilityToken},
+			{SandboxID: "gated", Port: 3000, Protocol: models.ExposedPortProtocolHTTP},
+		},
+	}
+	fake.httpRouteIDs[caddy.SandboxRouteID(sb.ID)] = struct{}{}
+	fake.httpRouteIDs[caddy.WakePortRouteID(sb.ID, 8080)] = struct{}{}
+	// A direct route on the gated port skips the token: it must go.
+	fake.httpRouteIDs[caddy.PortRouteID(sb.ID, 8080)] = struct{}{}
+	fake.httpRouteIDs[caddy.PortRouteID(sb.ID, 3000)] = struct{}{}
+	fake.httpRouteIDs[caddy.WakePortRouteID(sb.ID, 3000)] = struct{}{}
+
+	server := httptest.NewServer(fake.handler(t))
+	t.Cleanup(server.Close)
+	svc := &Service{
+		logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		caddy: caddy.New(config.Config{
+			CaddyAdminURL:     server.URL,
+			CaddyServerID:     "srv0",
+			EnableCaddy:       true,
+			HTTPClientTimeout: 5 * time.Second,
+		}),
+	}
+	svc.gcZombieCaddyEntries(context.Background(), []*models.Sandbox{sb})
+
+	want := []string{caddy.SandboxRouteID(sb.ID), caddy.PortRouteID(sb.ID, 3000), caddy.WakePortRouteID(sb.ID, 8080)} // sorted
+	if got := fake.keys(fake.httpRouteIDs); !equalSorted(got, want) {
+		t.Fatalf("http routes after gc: got %v, want %v", got, want)
+	}
+}
+
+// withGCCaddyFake points svc at a fake Caddy admin API, so the zombie sweep
+// gets past its Caddy snapshot and reaches its store read. With Caddy off
+// the sweep reads nothing, so a closed store would not show.
+func withGCCaddyFake(t *testing.T, svc *Service) {
+	t.Helper()
+	server := httptest.NewServer(newGCCaddyFake().handler(t))
+	t.Cleanup(server.Close)
+	svc.caddy = caddy.New(config.Config{CaddyAdminURL: server.URL, CaddyServerID: "srv0", EnableCaddy: true, HTTPClientTimeout: 5 * time.Second})
+}

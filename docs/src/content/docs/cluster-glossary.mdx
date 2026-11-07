@@ -70,6 +70,8 @@ Terraform writes these settings to `/etc/sandboxd/cluster.env` on each node when
 | `SB_ENABLE_CLUSTER` | Set to `true` to turn on cluster mode. | `false` |
 | `SB_NODE_ID` | A fixed name for this node, such as `node1`. Never change it after the node joins. A new ID leaves a "ghost" entry for the old one in the cluster's records. | Required |
 | `SB_NODE_ROLE` | This node's role. See [Node roles](#node-roles). | `mixed` |
+| `SB_NODE_ZONE` | This node's zone, such as `eu-west-1a`. A create can ask for a zone. See [Choose where a sandbox runs](/engineering-placement-failover/#choose-where-a-sandbox-runs). | Empty (no zone) |
+| `SB_NODE_LABELS` | This node's labels, as `key=value` pairs split by commas, such as `tier=pci,gpu=a10`. A create can ask for labels. A bad label stops the node from starting. | Empty (no labels) |
 | `SB_CLUSTER_BOOTSTRAP` | `true` only on the seed, `false` on all other nodes. Only a role with `server` (or `mixed`) may be the seed. | `false` |
 | `SB_CLUSTER_MAX_AUTO_VOTERS` | The most server nodes that become voters on their own. Extra server nodes join as non-voters. `0` means no cap. | `5` |
 

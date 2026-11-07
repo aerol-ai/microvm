@@ -63,8 +63,26 @@ The command runs in a shell (`/bin/sh`), so pipes (`|`), `&&` and variables like
 | Error messages it printed | `stderr` | `Stderr` | `stderr` | `stderr` |
 | Exit code | `exitCode` | `ExitCode` | `exit_code` | `exitCode` |
 | How long it ran, in milliseconds | `durationMS` | `DurationMS` | `duration_ms` | `durationMs` |
+| Whether the time limit stopped it | `timedOut` | `TimedOut` | `timed_out` | `timedOut` |
+| Whether output was cut ([details](#limit-how-much-output-you-get-back)) | `stdoutTruncated`, `stderrTruncated` | `StdoutTruncated`, `StderrTruncated` | `stdout_truncated`, `stderr_truncated` | `stdoutTruncated`, `stderrTruncated` |
+| The signal that stopped it, if any | `signal` | `Signal` | `signal` | `signal` |
 
-In Python the result is a dictionary, so you read `result["stdout"]`. An exit code of `0` means the command worked. Any other number means it failed, and `-1` means it was stopped by a signal.
+In Python the result is a dictionary, so you read `result["stdout"]`. An exit code of `0` means the command worked. Any other number means it failed.
+
+### When a signal stops the command
+
+A signal is a message from the system that stops a program, for example when it crashes or runs out of time. Then the exit code is `-1`, and `signal` names the signal, like `SIGKILL`. When the command ends on its own, `signal` is empty (`None` in Rust, `null` in Java, `undefined` in TypeScript). Sandboxes created before this field existed never set it.
+
+A shell reports the same thing differently: as exit code 128 plus the signal's number. To compare with a script that checks for, say, `137`, use this table:
+
+| `signal` | Number | A shell's exit code | Common cause |
+|---|---|---|---|
+| `SIGINT` | 2 | 130 | Ctrl-C |
+| `SIGKILL` | 9 | 137 | The time limit ran out, or the system ran out of memory |
+| `SIGSEGV` | 11 | 139 | The program crashed |
+| `SIGTERM` | 15 | 143 | Something asked it to stop |
+
+You always see `signal` with [`argv`](#pass-arguments-without-a-shell). With `command`, a shell sits between the sandbox and your program. You see `signal` when the shell itself is stopped, for example by the time limit. Some shells also run the last program of a command in their own place, and then you see its signal too. But if the shell keeps running after your program is killed, the shell exits with 128 plus the number, and `signal` is empty.
 
 ## Check whether a command worked
 
@@ -172,6 +190,7 @@ Pass an options object instead of a string to choose where the command runs, add
         work_dir: Some("/tmp".into()),
         env: Some(HashMap::from([("GREETING".to_string(), "hello".to_string())])),
         timeout_seconds: Some(30),
+        ..Default::default()
     })?;
     print!("{}", result.stdout); // hello from /tmp
     ```
@@ -193,14 +212,151 @@ Pass an options object instead of a string to choose where the command runs, add
 | `workDir` | The folder the command starts in. It must already exist. | The image's working folder, often `/` |
 | `env` | Extra environment variables for this one command. They are added to the sandbox's own variables. | None |
 | `timeoutSeconds` | The longest the command may run before it is stopped. | 300 (5 minutes) |
+| `argv` | A program and its arguments as a list, instead of `command`. See [Pass arguments without a shell](#pass-arguments-without-a-shell). | None |
+| `maxStdoutBytes`, `maxStderrBytes` | Keep only the start of the output. See [Limit how much output you get back](#limit-how-much-output-you-get-back). | No limit (64 MiB at most) |
 
 The tabs above show how each language spells these names. Python also accepts `workdir` and `timeout_seconds`.
 
-When the time limit runs out, the result has exit code `-1` and `stderr` says `signal: killed`.
+When the time limit runs out, the whole command stops, including anything it started in the background. The result has exit code `-1`, `signal` is `SIGKILL`, and `timedOut` is `true` (`timed_out` in Rust; sandboxes created before these fields existed never set them).
 
-<Aside type="caution" title="The time limit stops the shell, not always what it started">
-`timeoutSeconds` stops the shell that runs your command. A program the shell started can keep running, and the call waits for it. On our test server, `sleep 10` with a 2-second limit still took 10 seconds to return. For a hard limit, put `timeout` in the command itself: `timeout 30 npm test` stops after 30 seconds and exits with code `124`.
+<Aside type="caution" title="A program that leaves its process group keeps running">
+The time limit stops every program in the command's process group. A program that starts a new group of its own, as daemons do, is not stopped. To stop such a program on time too, put `timeout` in the command itself: `timeout 30 npm test` stops after 30 seconds and exits with code `124`.
 </Aside>
+
+## Pass arguments without a shell
+
+`command` is one string, and a shell reads it. So spaces, quotes, `$` and `;` in it have special meanings. If an argument comes from somewhere you do not control, like a file name or a user's message, you have to quote it just right, or the shell may split it or even run part of it as a second command.
+
+Use `argv` instead. It is a list: the program first, then each argument. Each one reaches the program exactly as you wrote it.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const result = await sandbox.exec({ argv: ["echo", "it's $5; really"] });
+    console.log(result.stdout); // it's $5; really
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    result = sandbox.exec({"argv": ["echo", "it's $5; really"]})
+    print(result["stdout"])  # it's $5; really
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    result, err := sandbox.Exec(ctx, sdktypes.ExecRequest{
+        Argv: []string{"echo", "it's $5; really"},
+    })
+    if err != nil {
+        log.Fatal(err)
+    }
+    fmt.Print(result.Stdout) // it's $5; really
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    use aerolvm_sdk::ExecRequest;
+
+    let result = sandbox.exec(ExecRequest {
+        argv: Some(vec!["echo".into(), "it's $5; really".into()]),
+        ..Default::default()
+    })?;
+    print!("{}", result.stdout); // it's $5; really
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    ExecResult result = sandbox.exec(new ExecRequest()
+        .setArgv(List.of("echo", "it's $5; really")));
+    System.out.print(result.stdout); // it's $5; really
+    ```
+  </TabItem>
+</Tabs>
+
+- Set `command` or `argv`, not both.
+- `argv` finds programs the same way `command` does. It uses the same `PATH`, including folders the image's login setup adds, such as conda's.
+- Shell features like pipes (`|`), `&&` and `*` do nothing in `argv`. They are passed to the program as plain text.
+- If the program does not exist, the exit code is `127` and `stderr` says `not found`, as in a shell.
+- `argv` also works in images that have no shell at all, such as "distroless" images, where `command` cannot run. The sandbox then looks the program up on the image's `PATH`.
+- `execStream` takes `argv` too.
+- A sandbox started before `argv` existed runs an older agent. The SDK checks first and raises the same error as for [output limits](#limit-how-much-output-you-get-back), without running anything.
+
+## Limit how much output you get back
+
+Some commands print far more than you want to read, like a long build log or `cat` on a big file. Set `maxStdoutBytes` and `maxStderrBytes` to keep only the start of each stream. The sandbox reads the rest and throws it away, so the command does not slow down or get stuck. The result tells you whether anything was cut.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const result = await sandbox.exec({
+      command: "cat /var/log/build.log",
+      maxStdoutBytes: 64_000,
+      maxStderrBytes: 16_000,
+    });
+    if (result.stdoutTruncated) {
+      console.log("The log is longer. This is only the start of it.");
+    }
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    result = sandbox.exec({
+        "command": "cat /var/log/build.log",
+        "maxStdoutBytes": 64_000,
+        "maxStderrBytes": 16_000,
+    })
+    if result["stdoutTruncated"]:
+        print("The log is longer. This is only the start of it.")
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    result, err := sandbox.Exec(ctx, sdktypes.ExecRequest{
+        Command:        "cat /var/log/build.log",
+        MaxStdoutBytes: 64_000,
+        MaxStderrBytes: 16_000,
+    })
+    if err != nil {
+        log.Fatal(err)
+    }
+    if result.StdoutTruncated {
+        fmt.Println("The log is longer. This is only the start of it.")
+    }
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    use aerolvm_sdk::ExecRequest;
+
+    let result = sandbox.exec(ExecRequest {
+        command: "cat /var/log/build.log".into(),
+        max_stdout_bytes: Some(64_000),
+        max_stderr_bytes: Some(16_000),
+        ..Default::default()
+    })?;
+    if result.stdout_truncated {
+        println!("The log is longer. This is only the start of it.");
+    }
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    ExecResult result = sandbox.exec(new ExecRequest()
+        .setCommand("cat /var/log/build.log")
+        .setMaxStdoutBytes(64_000L)
+        .setMaxStderrBytes(16_000L));
+    if (result.stdoutTruncated) {
+        System.out.println("The log is longer. This is only the start of it.");
+    }
+    ```
+  </TabItem>
+</Tabs>
+
+- The limits count bytes, not characters. A cut never splits a character in two, so you can get a few bytes less than the limit.
+- Leave a limit out, or set it to `0`, for no limit of your own. Even then, a sandbox keeps at most 64 MiB of each stream, and the flag tells you when that cut the output.
+- The exit code is the command's own. Cutting its output does not change it.
+- Output that a background job prints after `exec` returns is dropped, as always, and does not count as cut.
+- A sandbox started before these limits existed runs an older agent that would ignore them and send all the output. So the SDK checks first, and if the agent is too old, it raises an error and does not run the command. The error is `MicroVMUnsupportedFeatureError` in TypeScript and Python, `ErrUnsupportedFeature` in Go, `Error::UnsupportedFeature` in Rust and `MicroVMUnsupportedFeatureException` in Java. Restart the sandbox, or re-create its Firecracker template, to get the current agent.
 
 ## Watch output while a command runs
 
@@ -290,7 +446,8 @@ Output arrives as raw bytes, in the pieces the command happened to print. A piec
 
 | Option | What it does |
 |---|---|
-| `command` | The shell command to run. Required. |
+| `command` | The shell command to run. Required, unless you set `argv`. |
+| `argv` | A program and its arguments as a list, run without a shell. See [Pass arguments without a shell](#pass-arguments-without-a-shell). |
 | `workdir` | The folder to start in. Note the spelling: `workdir` here, but `workDir` for `exec` in TypeScript and Python. |
 | `env` | Extra environment variables for this command. |
 | `onStdout`, `onStderr` | Called with each piece of output and error output. |
@@ -302,6 +459,10 @@ The exit info has a `code`, and a `signal` name when a signal stopped the comman
 ## Send input to a command
 
 `write` sends text to the command's input (stdin), as if you typed it. `close` ends the input, like pressing Ctrl-D. The command then keeps running until it exits on its own.
+
+<Aside type="note" title="In a terminal, send Ctrl-D instead of close">
+With `tty: true`, `close` does nothing: a terminal has no separate input to end. Instead, `write` Ctrl-D (the byte `\x04`) at the start of a line. The program reads it as the end of its input, as it would from a keyboard.
+</Aside>
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
@@ -537,11 +698,22 @@ For work that must keep going after you disconnect, such as a dev server or a lo
 
 ## Good to know
 
-- **Background jobs make `exec` wait.** If your command starts something with `&`, `exec` waits until that program ends too, because it still holds the output open. Start servers and other long-running programs in a [terminal session](/sessions/) instead.
-- **`exec` keeps all output in memory** until the command ends. For commands that print a lot, use `execStream`.
+- **Background jobs do not hold up `exec`.** If your command starts something with `&`, `exec` returns soon after the command itself ends (within about a second), and the background program keeps running. Output it prints after `exec` returns is dropped. To watch a long-running program's output, start it in a [terminal session](/sessions/) instead. A sandbox keeps the output of up to 256 such programs open; past that, a new one's output is closed, so it may stop the next time it prints.
+- **`exec` keeps the output in memory** until the command ends, up to 64 MiB of each stream. For commands that print a lot, [set a limit](#limit-how-much-output-you-get-back) or use `execStream`.
 - **If the sandbox stops while a command runs**, the call fails within seconds instead of waiting. This covers a sandbox that crashes, is stopped or is deleted. The error is HTTP 409 with `sandbox is not running`. A crashed Firecracker sandbox can take up to 30 seconds to notice, and that call fails with HTTP 502. The command may have done part of its work, so the SDKs do not send it again. A command that is still running is never cut off, however long it stays quiet.
 - **WebAssembly sandboxes** support `exec`, but not `execStream` or terminals. What a command does there depends on the module. See [WebAssembly (WASM)](/wasm-sandbox/).
 - **V8 isolate sandboxes** have no shell. There, `exec` calls the isolate's request handler, and the command is the URL path to request. See [V8 isolate](/isolate-sandbox/).
+
+## For server operators
+
+Two settings limit how much output `exec` returns, for every caller. Both are off by default.
+
+| Variable | What it does |
+|---|---|
+| `SB_EXEC_OUTPUT_DEFAULT_BYTES` | The limit for each stream when a call sets none. |
+| `SB_EXEC_OUTPUT_MAX_BYTES` | The largest limit a call may ask for. A larger one, or none, is lowered to it. |
+
+The server applies them before the command reaches the sandbox, so they work on Docker, gVisor and Firecracker sandboxes, including ones that are already running. WASM and V8 isolate sandboxes do not cap exec output yet. They cover `exec` from the AerolVM SDKs and the Daytona SDK's `process.executeCommand`, not `execStream` or sessions. A sandbox started before the limits existed ignores them. In a cluster, set the same values on every node. With a maximum set, an `exec` request bigger than 8 MiB is refused with HTTP 413. Linux limits a command and its variables to a few MiB, so no real command is that big.
 
 ## Next steps
 

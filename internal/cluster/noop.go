@@ -262,6 +262,19 @@ func (n *Noop) VolumeAttachmentCount(_ context.Context, tenant, id string) (int,
 	return n.volumeAttachmentCountLocked(strings.TrimSpace(tenant), strings.TrimSpace(id)), nil
 }
 
+func (n *Noop) VolumeAttachmentsForSandbox(_ context.Context, sandboxID string) ([]models.VolumeAttachment, error) {
+	n.volMu.Lock()
+	defer n.volMu.Unlock()
+	out := []models.VolumeAttachment{}
+	for key := range n.volAttachmentsBySandbox[strings.TrimSpace(sandboxID)] {
+		if a, ok := n.volAttachments[key]; ok {
+			out = append(out, a)
+		}
+	}
+	sortVolumeAttachments(out)
+	return out, nil
+}
+
 func (n *Noop) PutVolumeAttachments(_ context.Context, attachments []models.VolumeAttachment) error {
 	if len(attachments) == 0 {
 		return nil

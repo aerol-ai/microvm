@@ -1,5 +1,7 @@
 package ai.aerol.microvm.model;
 
+import java.time.Instant;
+
 import com.fasterxml.jackson.annotation.JsonInclude;
 
 @JsonInclude(JsonInclude.Include.NON_NULL)
@@ -13,6 +15,19 @@ public class Lifecycle {
     // stopIfIdleFor to be set; the server rejects serverless=true without
     // an idle window.
     public Boolean serverless;
+    // restartOnFailure=true starts the sandbox again when it crashes or runs
+    // out of memory, waiting 5 s, then 10 s, 20 s and so on up to 5 minutes;
+    // the wait goes back to 5 s after 10 minutes of running. Docker, gVisor
+    // and containerd sandboxes only (others answer 400).
+    public Boolean restartOnFailure;
+    // destroyAfterExitFor deletes the sandbox this long (nanoseconds) after
+    // its main program ends; checked about once a minute. Not for
+    // WebAssembly or V8-isolate sandboxes (400).
+    public Long destroyAfterExitFor;
+    // destroyAt deletes the sandbox at this clock time. The server turns it
+    // into destroyAtAge, which is what the sandbox shows; a past time is
+    // refused with a 400.
+    public Instant destroyAt;
 
     public Lifecycle setStopIfIdleFor(Long stopIfIdleFor) {
         this.stopIfIdleFor = stopIfIdleFor;
@@ -39,12 +54,30 @@ public class Lifecycle {
         return this;
     }
 
+    public Lifecycle setRestartOnFailure(Boolean restartOnFailure) {
+        this.restartOnFailure = restartOnFailure;
+        return this;
+    }
+
+    public Lifecycle setDestroyAfterExitFor(Long destroyAfterExitFor) {
+        this.destroyAfterExitFor = destroyAfterExitFor;
+        return this;
+    }
+
+    public Lifecycle setDestroyAt(Instant destroyAt) {
+        this.destroyAt = destroyAt;
+        return this;
+    }
+
     public Lifecycle copy() {
         return new Lifecycle()
             .setStopIfIdleFor(stopIfIdleFor)
             .setDestroyIfIdleFor(destroyIfIdleFor)
             .setStopAtAge(stopAtAge)
             .setDestroyAtAge(destroyAtAge)
-            .setServerless(serverless);
+            .setServerless(serverless)
+            .setRestartOnFailure(restartOnFailure)
+            .setDestroyAfterExitFor(destroyAfterExitFor)
+            .setDestroyAt(destroyAt);
     }
 }

@@ -51,9 +51,9 @@ func (s *Store) CreateVolume(ctx context.Context, v *models.Volume) error {
 	}
 	source := strings.TrimSpace(v.Source)
 	_, err := s.db.ExecContext(ctx, `
-		INSERT INTO volumes (id, tenant, name, backend, source, created_at)
-		VALUES (?, ?, ?, ?, ?, ?)
-	`, id, tenant, name, backend, source, created.UTC())
+		INSERT INTO volumes (id, tenant, name, backend, source, created_at, delete_with_sandbox)
+		VALUES (?, ?, ?, ?, ?, ?, ?)
+	`, id, tenant, name, backend, source, created.UTC(), v.DeleteWithSandbox)
 	if err != nil {
 		if isSQLiteUniqueConstraint(err) {
 			return ErrVolumeExists
@@ -88,7 +88,7 @@ func (s *Store) GetOrCreateVolume(ctx context.Context, v *models.Volume, maxPerT
 	defer func() { _ = tx.Rollback() }()
 
 	existing, err := scanVolumeRow(tx.QueryRowContext(ctx, `
-		SELECT id, tenant, name, backend, source, created_at
+		SELECT id, tenant, name, backend, source, created_at, delete_with_sandbox
 		FROM volumes
 		WHERE tenant = ? AND name = ?
 	`, tenant, name), "get existing volume")
@@ -134,14 +134,14 @@ func (s *Store) GetOrCreateVolume(ctx context.Context, v *models.Volume, maxPerT
 		afterVolumeMissSelect(tx)
 	}
 	if _, err := tx.ExecContext(ctx, `
-		INSERT INTO volumes (id, tenant, name, backend, source, created_at)
-		VALUES (?, ?, ?, ?, ?, ?)
-	`, id, tenant, name, backend, source, created.UTC()); err != nil {
+		INSERT INTO volumes (id, tenant, name, backend, source, created_at, delete_with_sandbox)
+		VALUES (?, ?, ?, ?, ?, ?, ?)
+	`, id, tenant, name, backend, source, created.UTC(), v.DeleteWithSandbox); err != nil {
 		if isSQLiteUniqueConstraint(err) {
 			// A duplicate can only happen if another process wrote the same DB
 			// concurrently. Return the winner so callers remain idempotent.
 			existing, getErr := scanVolumeRow(tx.QueryRowContext(ctx, `
-				SELECT id, tenant, name, backend, source, created_at
+				SELECT id, tenant, name, backend, source, created_at, delete_with_sandbox
 				FROM volumes
 				WHERE tenant = ? AND name = ?
 			`, tenant, name), "get raced volume")
@@ -155,7 +155,7 @@ func (s *Store) GetOrCreateVolume(ctx context.Context, v *models.Volume, maxPerT
 		}
 		return nil, false, fmt.Errorf("insert volume: %w", err)
 	}
-	out := &models.Volume{ID: id, Tenant: tenant, Name: name, Backend: backend, Source: source, CreatedAt: created.UTC()}
+	out := &models.Volume{ID: id, Tenant: tenant, Name: name, Backend: backend, Source: source, CreatedAt: created.UTC(), DeleteWithSandbox: v.DeleteWithSandbox}
 	if err := tx.Commit(); err != nil {
 		return nil, false, fmt.Errorf("commit new volume: %w", err)
 	}
@@ -165,7 +165,7 @@ func (s *Store) GetOrCreateVolume(ctx context.Context, v *models.Volume, maxPerT
 // GetVolume returns the volume named name owned by tenant, or ErrNotFound.
 func (s *Store) GetVolume(ctx context.Context, tenant, name string) (*models.Volume, error) {
 	row := s.db.QueryRowContext(ctx, `
-		SELECT id, tenant, name, backend, source, created_at
+		SELECT id, tenant, name, backend, source, created_at, delete_with_sandbox
 		FROM volumes
 		WHERE tenant = ? AND name = ?
 	`, strings.TrimSpace(tenant), strings.TrimSpace(name))
@@ -176,7 +176,7 @@ func (s *Store) GetVolume(ctx context.Context, tenant, name string) (*models.Vol
 // tenant cannot resolve another's id), or ErrNotFound.
 func (s *Store) GetVolumeByID(ctx context.Context, tenant, id string) (*models.Volume, error) {
 	row := s.db.QueryRowContext(ctx, `
-		SELECT id, tenant, name, backend, source, created_at
+		SELECT id, tenant, name, backend, source, created_at, delete_with_sandbox
 		FROM volumes
 		WHERE tenant = ? AND id = ?
 	`, strings.TrimSpace(tenant), strings.TrimSpace(id))
@@ -187,7 +187,7 @@ func (s *Store) GetVolumeByID(ctx context.Context, tenant, id string) (*models.V
 // is a zero-length slice, never nil.
 func (s *Store) ListVolumes(ctx context.Context, tenant string) ([]models.Volume, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT id, tenant, name, backend, source, created_at
+		SELECT id, tenant, name, backend, source, created_at, delete_with_sandbox
 		FROM volumes
 		WHERE tenant = ?
 		ORDER BY created_at DESC, name ASC
@@ -243,6 +243,39 @@ func (s *Store) DeleteVolume(ctx context.Context, tenant, id string) error {
 		return ErrNotFound
 	}
 	return nil
+}
+
+// DeleteVolumeIfNoAttachments removes the volume row only while no
+// attachment references it, in one statement, so an attach racing the delete
+// either lands first (ErrVolumeInUse, the row stays) or finds the row gone
+// (its FK fails and that create rolls back). A count read before a plain
+// DeleteVolume cannot promise that: the FK cascade would silently remove the
+// racing sandbox's attachment along with the row. This is the rule the
+// cluster FSM's opDeleteVolume already applies. ErrNotFound when no such row.
+func (s *Store) DeleteVolumeIfNoAttachments(ctx context.Context, tenant, id string) error {
+	tenant, id = strings.TrimSpace(tenant), strings.TrimSpace(id)
+	res, err := s.db.ExecContext(ctx, `
+		DELETE FROM volumes WHERE tenant = ? AND id = ?
+		AND NOT EXISTS (SELECT 1 FROM volume_attachments WHERE tenant = ? AND volume_id = ?)
+	`, tenant, id, tenant, id)
+	if err != nil {
+		return fmt.Errorf("delete volume: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("delete volume rows affected: %w", err)
+	}
+	if n > 0 {
+		return nil
+	}
+	attachers, err := s.CountVolumeAttachments(ctx, tenant, id)
+	if err != nil {
+		return err
+	}
+	if attachers > 0 {
+		return fmt.Errorf("%w: %d attachments", ErrVolumeInUse, attachers)
+	}
+	return ErrNotFound
 }
 
 // PutVolumeAttachments upserts the platform-volume attachments for a sandbox.
@@ -328,6 +361,36 @@ func (s *Store) CountVolumeAttachments(ctx context.Context, tenant, volumeID str
 	return n, nil
 }
 
+// ListVolumeAttachmentsForSandbox returns the platform-volume attachments
+// sandboxID holds, through idx_volume_attachments_sandbox. A destroy reads
+// them before the sandbox row goes (the FK cascade removes them with it) to
+// find the delete_with_sandbox volumes it may be the last user of. Never nil.
+func (s *Store) ListVolumeAttachmentsForSandbox(ctx context.Context, sandboxID string) ([]models.VolumeAttachment, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT tenant, volume_id, sandbox_id, incarnation_id, target, source, created_at
+		FROM volume_attachments
+		WHERE sandbox_id = ?
+		ORDER BY volume_id, target
+	`, strings.TrimSpace(sandboxID))
+	if err != nil {
+		return nil, fmt.Errorf("list volume attachments for sandbox: %w", err)
+	}
+	defer rows.Close()
+	out := []models.VolumeAttachment{}
+	for rows.Next() {
+		var a models.VolumeAttachment
+		if err := rows.Scan(&a.Tenant, &a.VolumeID, &a.SandboxID, &a.IncarnationID, &a.Target, &a.Source, &a.CreatedAt); err != nil {
+			return nil, fmt.Errorf("scan volume attachment: %w", err)
+		}
+		a.CreatedAt = a.CreatedAt.UTC()
+		out = append(out, a)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate volume attachments: %w", err)
+	}
+	return out, nil
+}
+
 // DeleteVolumeAttachmentsForSandbox removes the indexed platform-volume
 // references for sandboxID. SQLite normally reaches this through the sandbox FK
 // cascade, but the explicit method lets service code share the cluster-mode
@@ -365,7 +428,7 @@ func (s *Store) DeleteVolumeIfUnattached(ctx context.Context, tenant, id, fallba
 	defer func() { _ = tx.Rollback() }()
 
 	vol, err := scanVolumeRow(tx.QueryRowContext(ctx, `
-		SELECT id, tenant, name, backend, source, created_at
+		SELECT id, tenant, name, backend, source, created_at, delete_with_sandbox
 		FROM volumes
 		WHERE tenant = ? AND id = ?
 	`, tenant, id), "get volume for delete")
@@ -522,7 +585,7 @@ func scanVolume(scanner interface {
 	Scan(dest ...any) error
 }) (*models.Volume, error) {
 	var v models.Volume
-	if err := scanner.Scan(&v.ID, &v.Tenant, &v.Name, &v.Backend, &v.Source, &v.CreatedAt); err != nil {
+	if err := scanner.Scan(&v.ID, &v.Tenant, &v.Name, &v.Backend, &v.Source, &v.CreatedAt, &v.DeleteWithSandbox); err != nil {
 		return nil, err
 	}
 	v.CreatedAt = v.CreatedAt.UTC()

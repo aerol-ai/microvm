@@ -18,6 +18,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/config"
@@ -79,6 +80,9 @@ type Client struct {
 	pullFailures       map[string]imagePullFailure
 	warmPool           *dockerpool.Pool
 	netnsPool          *NetnsPool
+	// coldCreates counts the creates on this node past the warm pool, so a
+	// create can tell whether it runs alone (netnsPoolBusy).
+	coldCreates atomic.Int64
 	// pauseImage is the image of the pause container a restricted create
 	// starts for itself when the pool has no slot for it
 	// (netns_pause_on_demand.go).
@@ -425,6 +429,9 @@ func (c *Client) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		}
 	}
 
+	c.coldCreates.Add(1)
+	defer c.endColdCreate()
+
 	// Locally-built images (BuildImage tags them with content-addressed
 	// names that don't exist on any registry) must skip the pull, otherwise
 	// the daemon would 401/404 trying to fetch them from Docker Hub. We
@@ -470,6 +477,13 @@ func (c *Client) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		imageSource = "verified"
 	}
 	CreateTimingFrom(ctx).RecordStageDesc("docker_image", time.Since(imageStart), imageSource)
+	// The operator create policy's require_non_root rule: the image config is
+	// the first place the user is known, and nothing exists yet to undo.
+	if req.RequireNonRootUser {
+		if err := models.CheckImageUserNonRoot(req.Image, imageInspect.Config.User); err != nil {
+			return nil, err
+		}
+	}
 
 	workingDir := strings.TrimSpace(imageInspect.Config.WorkingDir)
 	if workingDir == "" {
@@ -604,9 +618,11 @@ func (c *Client) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 	}
 	if c.netnsPool != nil && effectiveRuntime == models.RuntimeDocker {
 		netnsStart := time.Now()
-		adoptedNetns, netnsAdopted = c.netnsPool.Adopt(ctx, sandboxID)
 		desc := "miss"
-		if netnsAdopted {
+		if c.netnsPoolBusy(req, effectiveRuntime) {
+			desc = "busy"
+			netnsPoolBusySkips.Add(1)
+		} else if adoptedNetns, netnsAdopted = c.netnsPool.Adopt(ctx, sandboxID); netnsAdopted {
 			desc = "hit"
 		}
 		CreateTimingFrom(ctx).RecordStageDesc("docker_netns", time.Since(netnsStart), desc)
@@ -765,7 +781,7 @@ func (c *Client) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 	err = c.doJSON(ctx, http.MethodPost, "/containers/create", createQuery, createRequest, nil, &created)
 	CreateTimingFrom(ctx).RecordStage("docker_create", time.Since(createStart))
 	if err != nil {
-		return nil, fmt.Errorf("create container: %w", err)
+		return nil, fmt.Errorf("create container: %w", nameConflictAsExists(err))
 	}
 	if own != nil {
 		// The pause started alongside the workload's create; only what that
@@ -1921,6 +1937,10 @@ type imageInspect struct {
 		WorkingDir string   `json:"WorkingDir"`
 		Entrypoint []string `json:"Entrypoint"`
 		Cmd        []string `json:"Cmd"`
+		// User is the image's USER, the user the container runs as (the
+		// create body sets none): the create policy's require_non_root rule
+		// reads it.
+		User string `json:"User"`
 	} `json:"Config"`
 	Metadata struct {
 		// LastTagTime is updated by the daemon every time the image is

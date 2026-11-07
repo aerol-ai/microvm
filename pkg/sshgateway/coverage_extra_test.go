@@ -351,4 +351,12 @@ func TestAuthorizeLocalSSHBranches(t *testing.T) {
 	}, key); err != nil {
 		t.Fatalf("valid local auth: %v", err)
 	}
+	// WASM and isolate sandboxes have no shell: refused even with the right key.
+	for _, rt := range []string{models.RuntimeWasm, models.RuntimeIsolate} {
+		if err := authorizeLocalSSH(&models.Sandbox{
+			Status: models.SandboxStatusStarted, ContainerID: "wasm:x", SSHPublicKey: authorized, Runtime: rt,
+		}, key); err == nil {
+			t.Fatalf("runtime %s was let in", rt)
+		}
+	}
 }

@@ -14,6 +14,15 @@ public class PlatformVolumeMount {
     public String path;
     @JsonProperty("read_only")
     public Boolean readOnly;
+    /**
+     * {@code true} deletes the volume (its files and its record) once the last
+     * sandbox using it is deleted. It is set when the volume is first made; a
+     * later sandbox naming the same volume must pass the same value, or the
+     * create fails with HTTP 409. Null is false: the volume outlives its
+     * sandboxes.
+     */
+    @JsonProperty("delete_with_sandbox")
+    public Boolean deleteWithSandbox;
 
     public PlatformVolumeMount setName(String name) {
         this.name = name;
@@ -27,6 +36,11 @@ public class PlatformVolumeMount {
 
     public PlatformVolumeMount setReadOnly(Boolean readOnly) {
         this.readOnly = readOnly;
+        return this;
+    }
+
+    public PlatformVolumeMount setDeleteWithSandbox(Boolean deleteWithSandbox) {
+        this.deleteWithSandbox = deleteWithSandbox;
         return this;
     }
 }

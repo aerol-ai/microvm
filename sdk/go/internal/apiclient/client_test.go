@@ -317,13 +317,21 @@ func TestCreateForwardsPlatformVolumes(t *testing.T) {
 		PlatformVolumes: []models.PlatformVolumeMount{
 			{Name: "data", Path: "/workspace"},
 			{Name: "cache", Path: "/cache", ReadOnly: true},
+			{Name: "scratch", Path: "/scratch", DeleteWithSandbox: true},
 		},
 	}); err != nil {
 		t.Fatalf("Create() error = %v", err)
 	}
 	raw, ok := seen["platform_volumes"].([]any)
-	if !ok || len(raw) != 2 {
+	if !ok || len(raw) != 3 {
 		t.Fatalf("platform_volumes wire shape = %#v", seen["platform_volumes"])
+	}
+	// delete_with_sandbox is omitted unless set, like read_only.
+	if _, present := raw[0].(map[string]any)["delete_with_sandbox"]; present {
+		t.Fatalf("unset delete_with_sandbox must stay off the wire: %#v", raw[0])
+	}
+	if dws, _ := raw[2].(map[string]any)["delete_with_sandbox"].(bool); !dws {
+		t.Fatalf("third volume delete_with_sandbox not serialized: %#v", raw[2])
 	}
 	first := raw[0].(map[string]any)
 	if first["name"] != "data" || first["path"] != "/workspace" {

@@ -197,6 +197,11 @@
           "expr": "rate(aerolvm_docker_netns_pool_misses_total[5m])",
           "legendFormat": "netns misses",
           "refId": "B"
+        },
+        {
+          "expr": "rate(aerolvm_docker_netns_pool_busy_skips_total[5m])",
+          "legendFormat": "netns busy skips",
+          "refId": "C"
         }
       ],
       "title": "Netns pool hits/misses",

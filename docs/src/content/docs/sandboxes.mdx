@@ -242,9 +242,77 @@ Rules for names:
   </TabItem>
 </Tabs>
 
-Names make "get or create" safe to retry. Look the name up. If it is missing, create it. If the create fails with 409, another call won the race, so look it up again.
-
 An older server that does not support name lookup returns a normal list instead. Every SDK notices this and raises a "does not support sandbox name lookup" error. It never guesses which sandbox you meant. Use the ID with that server, or upgrade it.
+
+### Get or create by name
+
+`getOrCreate` gives you your sandbox with a name, and makes it first if you have none. It also tells you whether this call made it, so you can set the sandbox up only once.
+
+It is safe to call again and again, and from many programs at the same time:
+
+1. It looks the name up. If you have that sandbox, it returns it.
+2. If not, it creates one with your options and that name.
+3. If two calls race, the server lets only one of them create the name. The other gets `409` and looks the name up again, so both end up with the same sandbox.
+
+An existing sandbox comes back as it is. The SDK does not compare its image or settings with your options.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const { sandbox, created } = await client.getOrCreate("build-box", {
+      image: "ubuntu:22.04",
+    });
+    if (created) {
+      await sandbox.exec("apt-get update");
+    }
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    sandbox, created = client.get_or_create("build-box", image="ubuntu:22.04")
+    if created:
+        sandbox.exec("apt-get update")
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    sandbox, created, err := client.GetOrCreate(ctx, "build-box", sdktypes.CreateSandboxOptions{
+        Image: "ubuntu:22.04",
+    })
+    if err != nil {
+        log.Fatal(err)
+    }
+    if created {
+        if _, err := sandbox.ExecCommand(ctx, "apt-get update"); err != nil {
+            log.Fatal(err)
+        }
+    }
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    let (sandbox, created) = client.get_or_create(
+        "build-box",
+        CreateOptions {
+            image: "ubuntu:22.04".to_string(),
+            ..Default::default()
+        },
+    )?;
+    if created {
+        sandbox.exec("apt-get update")?;
+    }
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    GetOrCreateResult result = client.getOrCreate(
+        "build-box", new CreateOptions().setImage("ubuntu:22.04"));
+    if (result.isCreated()) {
+        result.getSandbox().exec("apt-get update");
+    }
+    ```
+  </TabItem>
+</Tabs>
 
 ## Retry a create safely
 
@@ -716,6 +784,136 @@ Resize works for container and WebAssembly sandboxes. Firecracker and V8 isolate
     ```
   </TabItem>
 </Tabs>
+
+### Delete it when your code is done
+
+Each SDK can delete a sandbox for you when a block of code ends, even when that code fails. You have to ask for it: by default, the end of the block leaves the sandbox running, just as if there were no block.
+
+| SDK | The block | Turn on delete |
+|---|---|---|
+| TypeScript | `await using sandbox = ...` | `destroyOnExit: true` on `create` or `getOrCreate`, or `sandbox.destroyOnExit = true` |
+| Python | `with ... as sandbox:`, or `async with` for a sandbox from `AsyncMicroVM` | `destroy_on_exit=True` on `create` or `get_or_create`, or `sandbox.destroy_on_exit = True` |
+| Go | `defer sandbox.Close(ctx)` | `sandbox.DestroyOnClose = true` |
+| Rust | the scope of a `SandboxGuard` | `sandbox.destroy_on_drop()` returns the guard |
+| Java | `try (Sandbox sandbox = ...)` | `setDestroyOnClose(true)` on `CreateOptions` or on the sandbox |
+
+A sandbox that is already gone counts as deleted. A few details:
+
+- **`getOrCreate` deletes only what it made.** The flag applies when the call creates the sandbox. When it finds one that already has the name, that sandbox is never deleted on exit, because another program may be using it. Set the flag on the sandbox yourself if you do want it gone.
+
+- **Python:** if your code raised an error and the delete also fails, you still get your error. The failed delete is added to it as a note.
+- **Go:** `Close` still deletes after your `ctx` was cancelled or ran out of time, which is when a `defer` often runs. It allows itself two minutes.
+- **Rust:** a failed delete when the guard drops is ignored, because `Drop` cannot return an error. Call `guard.destroy()` to see the error, or `guard.keep()` to keep the sandbox.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    {
+      await using sandbox = await client.create({
+        image: "ubuntu:22.04",
+        destroyOnExit: true,
+      });
+      await sandbox.exec("echo hello");
+    } // the sandbox is deleted here
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    with client.create(image="ubuntu:22.04", destroy_on_exit=True) as sandbox:
+        sandbox.exec("echo hello")
+    # the sandbox is deleted here
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    sandbox, err := client.Create(ctx, sdktypes.CreateSandboxOptions{Image: "ubuntu:22.04"})
+    if err != nil {
+        log.Fatal(err)
+    }
+    sandbox.DestroyOnClose = true
+    defer sandbox.Close(ctx) // deletes the sandbox when this function returns
+
+    if _, err := sandbox.ExecCommand(ctx, "echo hello"); err != nil {
+        log.Fatal(err)
+    }
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    {
+        let sandbox = client
+            .create(CreateOptions {
+                image: "ubuntu:22.04".to_string(),
+                ..Default::default()
+            })?
+            .destroy_on_drop();
+        sandbox.exec("echo hello")?;
+    } // the sandbox is deleted here
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    CreateOptions options = new CreateOptions()
+        .setImage("ubuntu:22.04")
+        .setDestroyOnClose(true);
+    try (Sandbox sandbox = client.create(options)) {
+        sandbox.exec("echo hello");
+    } // the sandbox is deleted here
+    ```
+  </TabItem>
+</Tabs>
+
+<Aside>
+If your program is killed, no block gets to finish. Use the server's [lifecycle timers](#stop-or-delete-it-automatically) as the backstop: they delete an idle sandbox even when your code never comes back.
+</Aside>
+
+### Delete many sandboxes by tag
+
+`destroyAll` deletes every sandbox of yours that has all the [tags](/sandbox-tags/) you give it. It returns the IDs of the sandboxes it deleted. This is handy for cleaning up after a test run or a job, when you tagged each sandbox it made.
+
+- **It needs at least one tag.** With no tag it would delete every sandbox you own, so the SDK refuses.
+- **It is safe to run again.** A sandbox that is already gone counts as deleted. A second run finds nothing left and returns an empty list.
+- **It stops at the first real failure.** The sandboxes it already deleted stay deleted. Run it again to finish the job.
+- **It deletes one sandbox at a time,** after it has read the whole list.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const deleted = await client.destroyAll({ tags: { run: "nightly-42" } });
+    console.log(`deleted ${deleted.length} sandboxes`);
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    deleted = client.destroy_all(tags={"run": "nightly-42"})
+    print(f"deleted {len(deleted)} sandboxes")
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    deleted, err := client.DestroyAll(ctx, map[string]string{"run": "nightly-42"})
+    if err != nil {
+        log.Fatal(err)
+    }
+    fmt.Printf("deleted %d sandboxes\n", len(deleted))
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    let tags = HashMap::from([("run".to_string(), "nightly-42".to_string())]);
+    let deleted = client.destroy_all(&tags)?;
+    println!("deleted {} sandboxes", deleted.len());
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    List<String> deleted = client.destroyAll(Map.of("run", "nightly-42"));
+    System.out.println("deleted " + deleted.size() + " sandboxes");
+    ```
+  </TabItem>
+</Tabs>
+
+In Go, a failed delete also returns the IDs deleted before it.
 
 ## Sandbox states
 

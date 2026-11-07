@@ -13,12 +13,17 @@ import (
 	"github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/models"
 	apiclient "github.com/daytonaio/daytona/libs/api-client-go"
+	daytonasdk "github.com/daytonaio/daytona/libs/sdk-go/pkg/daytona"
+	sdkerrors "github.com/daytonaio/daytona/libs/sdk-go/pkg/errors"
+	sdkoptions "github.com/daytonaio/daytona/libs/sdk-go/pkg/options"
 	sdktypes "github.com/daytonaio/daytona/libs/sdk-go/pkg/types"
 )
 
 type contractCase struct {
 	name string
 	run  func(t *testing.T, env *daytonaContractEnv)
+	// toolbox, when set, is the fake toolboxd the case's sandboxes reach.
+	toolbox func(t *testing.T) http.Handler
 }
 
 func TestDaytonaGeneratedSandboxContracts(t *testing.T) {
@@ -1326,9 +1331,163 @@ func TestDaytonaSDKContracts(t *testing.T) {
 				assertRemovedImage(t, env, seed.Image)
 			},
 		},
+		// Daytona terminals (plan E8): every call, the WebSocket included,
+		// goes through the facade to the sandbox's toolboxd.
+		{
+			name:    "sandbox_process_pty_create_connect_resize_exit",
+			toolbox: ptyContractToolbox,
+			run: func(t *testing.T, env *daytonaContractEnv) {
+				sandbox := ptyContractSandbox(t, env, "sdk-pty")
+				fake := env.toolbox.(*fakePTYToolbox)
+
+				handle, err := sandbox.Process.CreatePty(env.ctx, "term",
+					sdkoptions.WithCreatePtySize(sdktypes.PtySize{Cols: 100, Rows: 30}),
+					sdkoptions.WithCreatePtyEnv(map[string]string{"TERM": "xterm"}))
+				if err != nil {
+					t.Fatalf("Process.CreatePty() error = %v", err)
+				}
+				defer handle.Disconnect()
+				if err := handle.WaitForConnection(env.ctx); err != nil {
+					t.Fatalf("WaitForConnection() error = %v", err)
+				}
+				creates := fake.createBodies()
+				if len(creates) != 1 || creates[0]["id"] != "term" || creates[0]["cols"] != float64(100) ||
+					creates[0]["rows"] != float64(30) || creates[0]["envs"].(map[string]any)["TERM"] != "xterm" {
+					t.Fatalf("toolboxd got create bodies %v", creates)
+				}
+				if got := fake.connectPaths(); len(got) != 1 || got[0] != "/process/pty/term/connect" {
+					t.Fatalf("toolboxd got WebSocket upgrades %v, want /process/pty/term/connect", got)
+				}
+				readPTYContract(t, handle, "replay:term")
+				if err := handle.SendInput([]byte("ls\n")); err != nil {
+					t.Fatalf("SendInput() error = %v", err)
+				}
+				readPTYContract(t, handle, "echo:ls")
+
+				info, err := sandbox.Process.GetPtySessionInfo(env.ctx, "term")
+				if err != nil || info.ID != "term" || info.Cols != 100 || info.Rows != 30 {
+					t.Fatalf("GetPtySessionInfo() = %+v, %v", info, err)
+				}
+				list, err := sandbox.Process.ListPtySessions(env.ctx)
+				if err != nil || len(list) != 1 || list[0].ID != "term" {
+					t.Fatalf("ListPtySessions() = %+v, %v", list, err)
+				}
+				resized, err := handle.Resize(env.ctx, 120, 40)
+				if err != nil || resized.Cols != 120 || resized.Rows != 40 {
+					t.Fatalf("Resize() = %+v, %v", resized, err)
+				}
+
+				if err := handle.SendInput([]byte("exit\n")); err != nil {
+					t.Fatalf("SendInput(exit) error = %v", err)
+				}
+				result, err := handle.Wait(env.ctx)
+				if err != nil || result.ExitCode == nil || *result.ExitCode != 0 || result.Error != nil {
+					t.Fatalf("Wait() = %+v, %v; want exit code 0 from the close frame", result, err)
+				}
+			},
+		},
+		{
+			name:    "sandbox_process_pty_reconnect_and_kill",
+			toolbox: ptyContractToolbox,
+			run: func(t *testing.T, env *daytonaContractEnv) {
+				sandbox := ptyContractSandbox(t, env, "sdk-pty-kill")
+
+				if _, err := sandbox.Process.CreatePtySession(env.ctx, "shell"); err != nil {
+					t.Fatalf("CreatePtySession() error = %v", err)
+				}
+				first, err := sandbox.Process.ConnectPty(env.ctx, "shell")
+				if err != nil {
+					t.Fatalf("ConnectPty() error = %v", err)
+				}
+				if err := first.WaitForConnection(env.ctx); err != nil {
+					t.Fatalf("WaitForConnection() error = %v", err)
+				}
+				readPTYContract(t, first, "replay:shell")
+				if err := first.Disconnect(); err != nil {
+					t.Fatalf("Disconnect() error = %v", err)
+				}
+
+				again, err := sandbox.Process.ConnectPty(env.ctx, "shell")
+				if err != nil {
+					t.Fatalf("reconnect error = %v", err)
+				}
+				defer again.Disconnect()
+				if err := again.WaitForConnection(env.ctx); err != nil {
+					t.Fatalf("reconnect WaitForConnection() error = %v", err)
+				}
+				readPTYContract(t, again, "replay:shell")
+
+				if err := again.Kill(env.ctx); err != nil {
+					t.Fatalf("Kill() error = %v", err)
+				}
+				result, err := again.Wait(env.ctx)
+				if err != nil || result.ExitCode == nil || *result.ExitCode != -1 || result.Error == nil || !strings.Contains(*result.Error, "signal") {
+					t.Fatalf("Wait() after Kill = %+v, %v; want the signal from the close frame", result, err)
+				}
+				var notFound *sdkerrors.DaytonaNotFoundError
+				if _, err := sandbox.Process.GetPtySessionInfo(env.ctx, "shell"); !errors.As(err, &notFound) {
+					t.Fatalf("GetPtySessionInfo() after Kill = %v, want not found", err)
+				}
+				if _, err := sandbox.Process.ConnectPty(env.ctx, "shell"); err == nil {
+					t.Fatal("ConnectPty() to a killed terminal succeeded")
+				}
+			},
+		},
+		{
+			name:    "sandbox_process_pty_limit_is_429",
+			toolbox: ptyContractToolbox,
+			run: func(t *testing.T, env *daytonaContractEnv) {
+				sandbox := ptyContractSandbox(t, env, "sdk-pty-limit")
+				for _, id := range []string{"a", "b"} {
+					if _, err := sandbox.Process.CreatePtySession(env.ctx, id); err != nil {
+						t.Fatalf("CreatePtySession(%s) error = %v", id, err)
+					}
+				}
+				var limited *sdkerrors.DaytonaRateLimitError
+				_, err := sandbox.Process.CreatePtySession(env.ctx, "c")
+				if !errors.As(err, &limited) || !strings.Contains(err.Error(), "terminals") {
+					t.Fatalf("CreatePtySession() over the limit = %v, want toolboxd's 429 with its message", err)
+				}
+			},
+		},
 	}
 
 	runContractCases(t, cases)
+}
+
+// ptyContractToolbox is the fake toolboxd for the terminal cases: it takes
+// only the token ptyContractSandbox seeds, and holds two terminals.
+func ptyContractToolbox(t *testing.T) http.Handler {
+	return newFakePTYToolbox(t, "token-pty", 2)
+}
+
+// ptyContractSandbox seeds a sandbox whose toolbox is the case's fake and
+// opens it with the Daytona SDK.
+func ptyContractSandbox(t *testing.T, env *daytonaContractEnv, id string) *daytonasdk.Sandbox {
+	t.Helper()
+	seed := env.seedSandbox(contractSandboxSeed{ID: id, Name: id, ContainerIP: env.toolboxHost, ToolboxToken: "token-pty"})
+	sandbox, err := env.sdk.Get(env.ctx, seed.ID)
+	if err != nil {
+		t.Fatalf("sdk.Get(%s) error = %v", seed.ID, err)
+	}
+	return sandbox
+}
+
+func readPTYContract(t *testing.T, handle *daytonasdk.PtyHandle, want string) {
+	t.Helper()
+	var out strings.Builder
+	timeout := time.After(5 * time.Second)
+	for !strings.Contains(out.String(), want) {
+		select {
+		case data, ok := <-handle.DataChan():
+			if !ok {
+				t.Fatalf("terminal closed before %q; output %q", want, out.String())
+			}
+			out.Write(data)
+		case <-timeout:
+			t.Fatalf("no %q in 5s; output %q", want, out.String())
+		}
+	}
 }
 
 func runContractCases(t *testing.T, cases []contractCase) {
@@ -1336,7 +1495,11 @@ func runContractCases(t *testing.T, cases []contractCase) {
 	for _, tc := range cases {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
-			env := newDaytonaContractEnv(t)
+			var toolbox http.Handler
+			if tc.toolbox != nil {
+				toolbox = tc.toolbox(t)
+			}
+			env := newDaytonaContractEnvWithToolbox(t, toolbox)
 			tc.run(t, env)
 		})
 	}

@@ -24,15 +24,26 @@ import (
 //
 // No-op when the cluster doesn't carry a spec for this sandbox yet
 // (pre-cluster sandbox; Noop client in single-node mode also returns nil).
-// Same-sandbox concurrent mutations can clobber each other in the FSM, but
-// the worst case is a stale spec on a node that hasn't died — the next
-// mutating call fixes it. Single-sandbox mutations serialize at the docker
-// layer anyway.
+// The read, patch and write run under the sandbox's spec lock, so two
+// patches of the same sandbox on this node (a lifecycle update and a
+// resize, say) cannot each read the old spec and put back the field the
+// other changed. Before the lock a lifecycle write could put back a
+// sandbox's old size after a resize had recorded the new one, and its
+// team's quota then counted the old size.
 func (s *Service) replicateSpecPatch(ctx context.Context, id string, patch func(*models.CreateSandboxRequest)) {
 	c := s.Cluster()
 	if c == nil {
 		return
 	}
+	unlock, err := s.lockSpec(ctx, id)
+	if err != nil {
+		if s.logger != nil {
+			s.logger.Warn("cluster: spec write-through skipped; FSM spec stale until next mutation",
+				"sandbox_id", id, "err", err)
+		}
+		return
+	}
+	defer unlock()
 	spec := c.SpecOf(id)
 	if spec == nil {
 		return
@@ -44,6 +55,20 @@ func (s *Service) replicateSpecPatch(ctx context.Context, id string, patch func(
 		s.logger.Warn("cluster: spec write-through failed; FSM spec stale until next mutation",
 			"sandbox_id", id, "err", err)
 	}
+}
+
+// lockSpec takes id's spec lock (specLocks) in a cluster. A single node has
+// no replicated spec to protect, so it takes nothing and its paths (a facade
+// create's state write-through among them) are unchanged.
+func (s *Service) lockSpec(ctx context.Context, id string) (func(), error) {
+	if !s.ClusterEnabled() {
+		return func() {}, nil
+	}
+	// A caller that already left starts nothing, even on a free lock.
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return s.specLocks.lockCtx(ctx, id)
 }
 
 // provider returns the provider installed by New or ConfigureSecretProvider.

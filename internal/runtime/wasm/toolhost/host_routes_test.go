@@ -3,6 +3,7 @@ package toolhost
 import (
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -28,6 +29,11 @@ func TestHostRoutesAndAuth(t *testing.T) {
 	handler.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("GET /version expected 200, got %d", rec.Code)
+	}
+	// No toolboxd features, and the runtime named, so an SDK's refusal says
+	// this is a WASM sandbox instead of advising a restart.
+	if body := rec.Body.String(); !strings.Contains(body, `"features":[]`) || !strings.Contains(body, `"runtime":"wasm"`) {
+		t.Fatalf("GET /version body = %s", body)
 	}
 
 	// 3. GET /process/interpreter/foo (auth required, first test auth fail)

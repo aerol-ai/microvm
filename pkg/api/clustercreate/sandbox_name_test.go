@@ -36,19 +36,21 @@ func TestPrepareRejectsReservedNames(t *testing.T) {
 }
 
 // TestPrepareReservesOwnerQualifiedName pins D4 on the cluster create path:
-// the reservation claims the caller's owner-qualified key, also for facades
-// that leave the reservation's secret handle untenanted.
+// the reservation claims the caller's owner-qualified key, also for facades.
+// Since team quotas (plan item P2) a facade's reservation also records the
+// caller's owner, like v1's: the leader counts a team's quota from the rows.
 func TestPrepareReservesOwnerQualifiedName(t *testing.T) {
 	tests := []struct {
-		name     string
-		access   *controlplane.Access
-		opts     PrepareOptions
-		wantName string
+		name      string
+		access    *controlplane.Access
+		opts      PrepareOptions
+		wantName  string
+		wantOwner string
 	}{
 		{name: "operator keeps plain name", access: &controlplane.Access{Fleet: true}, wantName: "agent"},
 		{name: "internal caller keeps plain name", wantName: "agent"},
-		{name: "tenant via v1", access: &controlplane.Access{Identity: controlplane.Identity{OwnerRef: "acct-a"}}, opts: PrepareOptions{OwnerRef: "acct-a"}, wantName: cluster.QualifiedSandboxName("acct-a", "agent")},
-		{name: "tenant via facade", access: &controlplane.Access{Identity: controlplane.Identity{OwnerRef: "acct-a"}}, wantName: cluster.QualifiedSandboxName("acct-a", "agent")},
+		{name: "tenant via v1", access: &controlplane.Access{Identity: controlplane.Identity{OwnerRef: "acct-a"}}, opts: PrepareOptions{OwnerRef: "acct-a"}, wantName: cluster.QualifiedSandboxName("acct-a", "agent"), wantOwner: "acct-a"},
+		{name: "tenant via facade", access: &controlplane.Access{Identity: controlplane.Identity{OwnerRef: "acct-a"}}, wantName: cluster.QualifiedSandboxName("acct-a", "agent"), wantOwner: "acct-a"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -72,8 +74,8 @@ func TestPrepareReservesOwnerQualifiedName(t *testing.T) {
 			if got := stub.reserveCalls[0].redacted.Name; got != tt.wantName {
 				t.Fatalf("reserved name = %q, want %q", got, tt.wantName)
 			}
-			if got := stub.reserveCalls[0].secrets.OwnerRef; got != tt.opts.OwnerRef {
-				t.Fatalf("reservation secret owner = %q, want %q (unchanged)", got, tt.opts.OwnerRef)
+			if got := stub.reserveCalls[0].secrets.OwnerRef; got != tt.wantOwner {
+				t.Fatalf("reservation owner = %q, want %q", got, tt.wantOwner)
 			}
 			if req.Name != "agent" {
 				t.Fatalf("caller's request was mutated: %q", req.Name)

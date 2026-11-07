@@ -38,6 +38,14 @@ func (s *Service) sandboxPublicURL(id string, allowPublicTraffic *bool) string {
 	return s.caddy.SandboxPublicURL(id)
 }
 
+// syncSandboxPublicRoute writes the sandbox's root route and its custom-domain
+// routes, or deletes them for a private sandbox. A custom domain that dials an
+// app port is a way into that port around its token gate, so when sandbox has
+// one, the domains written are the ones stored now, read under
+// customDomainRouteLocks (route_gate.go): reconcile or a start may hold a
+// copy with a domain that was removed before the port became gated. Domains
+// that all dial the toolbox (every create-time domain) skip the read and the
+// lock.
 func (s *Service) syncSandboxPublicRoute(ctx context.Context, sandbox *models.Sandbox) error {
 	if sandbox == nil || sandbox.ID == "" || s == nil || s.caddy == nil {
 		return nil
@@ -45,7 +53,29 @@ func (s *Service) syncSandboxPublicRoute(ctx context.Context, sandbox *models.Sa
 	if !sandboxAllowsPublicTraffic(sandbox) {
 		return s.deleteSandboxPublicRoutes(ctx, sandbox)
 	}
-	return s.publicRoutes().UpsertSandboxRoute(ctx, sandbox.ID, sandbox.ContainerIP, s.cfg.ToolboxPort, sandboxCustomHostnames(sandbox))
+	if !hasPortCustomDomain(sandbox) {
+		return s.publicRoutes().UpsertSandboxRoute(ctx, sandbox.ID, sandbox.ContainerIP, s.cfg.ToolboxPort, sandboxCustomHostnames(sandbox))
+	}
+	unlock := s.customDomainRouteLocks.lock(sandbox.ID)
+	defer unlock()
+	return s.syncSandboxPublicRouteHeld(ctx, sandbox)
+}
+
+// syncSandboxPublicRouteHeld is syncSandboxPublicRoute for a caller that
+// holds customDomainRouteLocks for the sandbox (AddCustomDomain,
+// RemoveCustomDomain). It always writes the stored domains.
+func (s *Service) syncSandboxPublicRouteHeld(ctx context.Context, sandbox *models.Sandbox) error {
+	if sandbox == nil || sandbox.ID == "" || s == nil || s.caddy == nil {
+		return nil
+	}
+	if !sandboxAllowsPublicTraffic(sandbox) {
+		return s.deleteSandboxPublicRoutes(ctx, sandbox)
+	}
+	current, err := s.withCurrentCustomDomains(ctx, sandbox)
+	if err != nil {
+		return err
+	}
+	return s.publicRoutes().UpsertSandboxRoute(ctx, current.ID, current.ContainerIP, s.cfg.ToolboxPort, sandboxCustomHostnames(current))
 }
 
 // enableSandboxPublicTraffic flips a private sandbox to public in place:

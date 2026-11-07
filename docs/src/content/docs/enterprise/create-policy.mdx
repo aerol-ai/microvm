@@ -1,0 +1,173 @@
+---
+title: Limit what users can create
+description: An operator file that says which images, registries and runtimes a sandbox may use, how big it may be, whether it must run as a non-root user and whether it may have a GPU.
+---
+
+import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
+
+By default, anyone who can create a sandbox can pick any image, any runtime the server offers and any size up to what the server has free. A create policy lets you, the operator, narrow that down. You write one small file on each server. The server reads it when it starts, and checks every new sandbox against it. A create that breaks a rule is refused with `403` and a message that names the rule.
+
+The file is optional. Without it, nothing changes.
+
+## Turn it on
+
+Write the file, then point the server at it: add `SB_CREATE_POLICY_FILE=/etc/sandboxd/create-policy.yaml` to the server's environment (`/etc/sandboxd/sandboxd.env`) and restart `sandboxd`.
+
+This file allows only images from your own registry plus official Python images, only gVisor and Firecracker, at most 4 CPUs, 8 GB of memory and 50 GB of disk, no root images and no GPUs:
+
+```yaml
+version: 1
+images:
+  allowed_registries: [registry.corp.example]
+  allowed: ["python:3.12*"]
+runtimes: [gvisor, firecracker]
+limits:
+  max_cpu: 4
+  max_memory_mb: 8192
+  max_disk_gb: 50
+require_non_root: true
+allow_gpu: false
+```
+
+Every setting is optional. Leave one out and that rule is off.
+
+## The rules
+
+| Setting | What it does | Rule name in a refusal |
+|---|---|---|
+| `images.allowed_registries` | An image from one of these registries is allowed. Write the host, with its port if it has one: `ghcr.io`, `registry.corp.example:5000`. Docker Hub is `docker.io`. | `images` |
+| `images.allowed` | An image that matches one of these patterns is allowed. `*` matches any run of characters, `/` included. | `images` |
+| `runtimes` | The runtimes a sandbox may use: `docker`, `gvisor`, `firecracker`, `wasm`, `isolate`. | `runtimes` |
+| `limits.max_cpu` | The most CPUs one sandbox may have. Fractions are fine: `0.5`. | `limits.max_cpu` |
+| `limits.max_memory_mb` | The most memory, in MB. | `limits.max_memory_mb` |
+| `limits.max_disk_gb` | The most disk, in GB. A Firecracker overlay disk counts too. | `limits.max_disk_gb` |
+| `require_non_root` | Container images must run as a non-root user. | `require_non_root` |
+| `allow_gpu` | Set `false` to refuse every create that asks for a GPU. | `allow_gpu` |
+
+When you set both image lists, an image needs to pass only one of them. When you set neither, any image is allowed.
+
+The limits apply to the size a sandbox really gets. A create that leaves out `cpu`, `memoryMB` or `diskGB` gets the server's default size, and that default is checked too. So keep your limits at or above the defaults (1 CPU, 1024 MB, 10 GB), or every create that leaves them out is refused.
+
+## How images are matched
+
+- **Every spelling of an image gets the same answer.** `python:3.12`, `docker.io/library/python:3.12` and `index.docker.io/library/python:3.12` are one image. A pattern can use the short name or the full one: both `python:3.12*` and `docker.io/library/python:3.12*` match it.
+- **A pattern must match the whole name.** `ghcr.io/acme/*` matches `ghcr.io/acme/app:1` and `ghcr.io/acme/team/app:1`, but not `evil.io/ghcr.io/acme/app`.
+- **Snapshots are checked by the image they hold.** A sandbox started from a snapshot is checked against the image the snapshot points to, so a snapshot name cannot sneak in an image the policy refuses.
+- **Images made on the server need a pattern.** Snapshots you commit live under `aerolvm-snapshot/`, and images you build under `aerolvm-build/`. They never came from a registry, so `allowed_registries` cannot allow them. To allow them, add `aerolvm-snapshot/*` or `aerolvm-build/*` to `images.allowed`. A built image can start from any base image, so allow `aerolvm-build/*` only if you trust what people build.
+- **Image IDs are refused.** A create that names an image by its ID (`sha256:...`) names no repository, so no rule can allow it.
+- **WebAssembly and V8 isolate sandboxes run a module, not an image.** The image rules do not apply to them. Use `runtimes` to allow or refuse those runtimes.
+
+## Non-root images
+
+With `require_non_root: true`, a Docker or gVisor sandbox starts only if its image runs as a non-root user. The server reads the `USER` line from the image after it pulls it, before it makes the container.
+
+- **Use a number.** `USER 1000` passes. `USER app` is refused, because a name can stand for user 0 inside the image, and the server would have to unpack the image to find out. This is the same rule Kubernetes uses for `runAsNonRoot`.
+- **No `USER` line means root,** so it is refused.
+- **Firecracker, WebAssembly and V8 isolate sandboxes are not checked.** Root inside a container is user 0 on the server's own kernel. A Firecracker VM has its own kernel, and the other two have no operating-system user at all.
+- **Creates skip the warm pool.** A parked container in the warm pool was started before its user could be checked, so with this rule on, Docker and gVisor creates take the normal (cold) path.
+
+## Where the policy applies
+
+- **Every way a sandbox is made:** the SDKs, the CLI and MCP server, the Daytona, E2B and Runloop SDKs, and starts from a snapshot.
+- **Resizes.** A resize is held to the size limits too. Only the sizes the resize changes are checked, so a sandbox made before a limit can still shrink.
+- **Not running sandboxes.** A new policy never stops or changes a sandbox that already runs.
+- **Not failover.** When a sandbox moves to another server after its first server dies, it comes back as it was. A policy you tightened since then does not strand it.
+
+## Change the file
+
+Edit the file in place. The server notices the change within 10 seconds. To load it at once, send `sandboxd` a hang-up signal (`systemctl kill --signal=SIGHUP sandboxd`). You never need to restart the server for a change.
+
+- **A bad edit is ignored.** If the new file has a mistake, the server keeps using the last good one and writes the error to its log.
+- **A bad file at start refuses every create.** If the file is missing or has a mistake when `sandboxd` starts, every create and resize fails with `503` and the code `create_policy_invalid` until you fix the file. The server picks up the fix by itself. It does not fall back to "no rules", because you asked for rules.
+- **Typos are mistakes.** An unknown setting, such as `max_cpus` for `max_cpu`, makes the file invalid. So does an empty list, such as `runtimes: []`: to turn a rule off, remove the line.
+
+In a cluster, put the same file on every server. The server that runs the sandbox is the one that checks it.
+
+## What a refused create looks like
+
+A refused create fails with status `403` and the code `create_policy_denied`. The message names the rule, for example `create refused by policy rule "limits.max_cpu": cpu 8 is above this server's limit of 4`. Trying again cannot help, so the SDKs do not retry it.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    import { MicroVMApiError } from "@aerol-ai/aerolvm-sdk";
+
+    try {
+      await client.create({ image: "python:3.12", cpu: 8 });
+    } catch (err) {
+      if (!(err instanceof MicroVMApiError) || err.code !== "create_policy_denied") throw err;
+      console.error(err.message); // names the rule that refused it
+    }
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    from microvm import MicroVMHTTPError
+
+    try:
+        client.create(image="python:3.12", cpu=8)
+    except MicroVMHTTPError as err:
+        if err.code != "create_policy_denied":
+            raise
+        print(err)  # names the rule that refused it
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    _, err := client.Create(ctx, sdktypes.CreateSandboxOptions{
+        Image: "python:3.12",
+        CPU:   8,
+    })
+    var apiErr *microvm.APIError
+    if errors.As(err, &apiErr) && apiErr.Code == "create_policy_denied" {
+        log.Print(apiErr.Message) // names the rule that refused it
+    } else if err != nil {
+        log.Fatal(err)
+    }
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    use aerolvm_sdk::{CreateOptions, Error};
+
+    match client.create(CreateOptions {
+        image: "python:3.12".into(),
+        cpu: Some(8),
+        ..Default::default()
+    }) {
+        Ok(_) => {}
+        Err(Error::Api(err)) if err.code() == Some("create_policy_denied") => {
+            eprintln!("{err}") // names the rule that refused it
+        }
+        Err(err) => return Err(err.into()),
+    }
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    import ai.aerol.microvm.MicroVMApiException;
+
+    try {
+        client.create(new CreateOptions()
+            .setImage("python:3.12")
+            .setCpu(8.0));
+    } catch (MicroVMApiException e) {
+        if (!"create_policy_denied".equals(e.getCode())) {
+            throw e;
+        }
+        System.err.println(e.getMessage()); // names the rule that refused it
+    }
+    ```
+  </TabItem>
+</Tabs>
+
+## Watch it
+
+| Metric | What it shows |
+|---|---|
+| `aerolvm_create_policy_denied_total` | Refusals, with the rule in the `key` label. A rule that refuses a lot may be set too tight, or someone is trying to get around it. |
+| `aerolvm_create_policy_load_failures_total` | Times the file failed to load. Anything above 0 means the server is still on an older file, or refusing every create. |
+
+<Aside type="note" title="This is not a network policy">
+The create policy decides what a sandbox may be. Where its traffic may go is set separately: see [Network access](/network-access/) and the egress operator file in [Fencing the network](/engineering-network-defenses/#for-server-operators).
+</Aside>

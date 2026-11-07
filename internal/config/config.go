@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/aerol-ai/microvm/internal/cloudidentity"
 	"github.com/aerol-ai/microvm/pkg/auditexport"
 	"github.com/aerol-ai/microvm/pkg/auditwitness"
 	"github.com/aerol-ai/microvm/pkg/identitywire"
@@ -129,20 +130,33 @@ type Config struct {
 	// EnterpriseMode enables a fail-fast production profile. It validates that
 	// secret sealing, audit durability, resource isolation, and cluster mTLS
 	// cannot be accidentally disabled. SB_ENTERPRISE_MODE.
-	EnterpriseMode              bool
-	PATToken                    string
-	APIHost                     string
-	APIPort                     int
-	Domain                      string
-	PublicHost                  string
-	CaddyAdminURL               string
-	CaddyServerID               string
-	DBPath                      string
-	DockerNetwork               string
-	ToolboxBinaryPath           string
-	ToolboxMountPath            string
-	ToolboxPort                 int
-	IdleTimeoutMinutes          int
+	EnterpriseMode     bool
+	PATToken           string
+	APIHost            string
+	APIPort            int
+	Domain             string
+	PublicHost         string
+	CaddyAdminURL      string
+	CaddyServerID      string
+	DBPath             string
+	DockerNetwork      string
+	ToolboxBinaryPath  string
+	ToolboxMountPath   string
+	ToolboxPort        int
+	IdleTimeoutMinutes int
+	// DefaultDestroyIfIdleFor and MaxAge are server-wide default destroy
+	// timers (SB_DEFAULT_DESTROY_IF_IDLE_FOR, SB_MAX_AGE; 0 = off, at most
+	// 30 days), so a client that crashes before cleaning up cannot leak
+	// sandboxes forever (plans/agent-sandbox-feature-parity.md L4). Like
+	// SB_IDLE_TIMEOUT_MIN they apply only to a sandbox created with no
+	// lifecycle timers of its own, and never touch one that has its own.
+	DefaultDestroyIfIdleFor time.Duration
+	MaxAge                  time.Duration
+	// EnablePprof serves Go's profiler (net/http/pprof) at /debug/pprof/
+	// to fleet.admin callers (SB_ENABLE_PPROF, default false; plans/agent-
+	// sandbox-feature-parity.md O2). Off by default: a profile shows the
+	// daemon's goroutines, heap and command line, and taking one costs CPU.
+	EnablePprof                 bool
 	CreateSandboxTimeoutSeconds int
 	ContainerPrivileged         bool
 	ResourceLimitsOff           bool
@@ -264,6 +278,18 @@ type Config struct {
 	// EgressOperatorFile is the private-cloud operator policy (§5.10,
 	// SB_EGRESS_OPERATOR_FILE). Empty keeps today's behavior.
 	EgressOperatorFile string
+	// EgressBlockPrivateByDefault gives a container, gVisor or Firecracker
+	// create that sets no egress policy a deny list of the private and
+	// link-local ranges (RFC 1918, 169.254/16), with the sandbox's own DNS
+	// resolvers left open, instead of no filter at all
+	// (SB_EGRESS_BLOCK_PRIVATE_BY_DEFAULT, plans/agent-sandbox-feature-parity.md
+	// T4). A create that sets any policy keeps its own. Off by default.
+	EgressBlockPrivateByDefault bool
+	// CreatePolicyFile is the operator's create policy
+	// (SB_CREATE_POLICY_FILE, internal/createpolicy): allowed images,
+	// registries and runtimes, size limits, non-root and GPU rules, checked
+	// at create and resize. Empty keeps today's behavior.
+	CreatePolicyFile string
 	// EgressProfileApplyQPS bounds how many sandboxes per second this node
 	// re-applies after an egress profile changes, so one profile edit can't
 	// flood the gateway and firewall (SB_EGRESS_PROFILE_APPLY_QPS, D21).
@@ -534,6 +560,18 @@ type Config struct {
 	ReconcileInterval     time.Duration
 	NetstatsPollInterval  time.Duration
 	UploadMaxBytes        int64
+	// ExecOutputDefaultBytes is the per-stream output cap sandboxd writes
+	// into a buffered exec (toolbox /process/execute) that sets none, and
+	// ExecOutputMaxBytes the largest cap a caller may ask for; a larger or
+	// missing one is lowered to it. sandboxd applies them on every path that
+	// reaches the sandbox's exec (v1, Daytona, Runloop), so they hold on every
+	// runtime and on agents already running (plan E1, ER5). An agent older
+	// than the caps ignores them, as it ignores the caller's own. 0 = off:
+	// no default cap and no maximum, only the agent's 64 MiB ceiling.
+	// SB_EXEC_OUTPUT_DEFAULT_BYTES, SB_EXEC_OUTPUT_MAX_BYTES; the default
+	// may not exceed the maximum.
+	ExecOutputDefaultBytes int64
+	ExecOutputMaxBytes     int64
 	// ToolboxDeadPeerTimeout bounds how long a toolbox connection (an exec,
 	// a file transfer, a session) lives on once its sandbox stops answering
 	// without closing it, as a killed gVisor sandbox or Firecracker VM does.
@@ -1111,7 +1149,13 @@ type Config struct {
 	// the dashboard (e.g. "node1", "wrk2"). Display-only; raft/gossip identity
 	// stays on NodeID. SB_NODE_NAME; empty falls back to NodeID at display
 	// time so single-node and pre-existing deployments need no config change.
-	NodeName            string
+	NodeName string
+	// NodeLabels are this node's placement labels: SB_NODE_LABELS ("k=v,k=v")
+	// with SB_NODE_ZONE folded in under "zone". Validated at boot (Kubernetes
+	// label syntax, at most 16, 63 characters each) and reported on the
+	// capacity heartbeat for placement rules (plans/placement-rules.md).
+	// nil = no labels; such a node never satisfies a rule.
+	NodeLabels          map[string]string
 	RaftBindAddr        string
 	RaftAdvertiseAddr   string
 	RaftDataDir         string
@@ -1502,6 +1546,14 @@ type Config struct {
 	// SB_TOKEN_MAX_TTL. Default 8760h (365 days); 2160h (90 days) in
 	// enterprise mode, which refuses anything longer.
 	TokenMaxTTL time.Duration
+	// SandboxTokenMaxTTL caps a sandbox token's lifetime (pkg/sandboxtoken,
+	// POST /v1/sandboxes/{id}/tokens). There is no per-token revocation
+	// list, only a per-sandbox revoke, so this cap is how long a leaked
+	// token works if nobody revokes its sandbox's tokens, and how long a
+	// rotation must wait between promoting a server key and retiring the
+	// old one.
+	// SB_SANDBOX_TOKEN_MAX_TTL. Default 24h; at most 720h (30 days).
+	SandboxTokenMaxTTL time.Duration
 	// IdentityFile is the identity file (plans/identity-and-access.md
 	// §5.5): the OIDC issuers this node trusts and the group-to-role
 	// bindings. Empty with IdentityEnabled is tokens-only mode (avm_ tokens,
@@ -1509,6 +1561,13 @@ type Config struct {
 	// operator never believes SSO and the deny list are on when they are
 	// not. SB_IDENTITY_FILE.
 	IdentityFile string
+	// IdentityIssuerURL makes this deployment an OIDC issuer for sandbox
+	// cloud identities (plans/sandbox-cloud-identity.md D1.1): the HTTPS
+	// public URL of the API, with no path, that customers' clouds fetch
+	// /.well-known/openid-configuration and the JWKS from. Empty turns the
+	// feature off: create refuses `identity` and the documents 404. Every
+	// node of a cluster must carry the same value. SB_IDENTITY_ISSUER_URL.
+	IdentityIssuerURL string
 
 	// PATTokenPrevious is also accepted as the PAT during a rotation, in
 	// constant time; nodes always send PATToken. Set it on every node with
@@ -1917,6 +1976,26 @@ const (
 	enterpriseTokenMaxTTL = 90 * 24 * time.Hour
 )
 
+// Sandbox token lifetime caps (plans/agent-sandbox-feature-parity.md A1).
+// The ceiling keeps a key rotation's promote-to-retire wait bounded: a
+// retire must wait out the longest token the old key may have signed.
+const (
+	defaultSandboxTokenMaxTTL = 24 * time.Hour
+	ceilingSandboxTokenMaxTTL = 30 * 24 * time.Hour
+)
+
+// validateSandboxTokens applies the sandbox token lifetime default and
+// refuses a cap above the ceiling.
+func validateSandboxTokens(cfg *Config) error {
+	if cfg.SandboxTokenMaxTTL == 0 {
+		cfg.SandboxTokenMaxTTL = defaultSandboxTokenMaxTTL
+	}
+	if cfg.SandboxTokenMaxTTL < 0 || cfg.SandboxTokenMaxTTL > ceilingSandboxTokenMaxTTL {
+		return fmt.Errorf("SB_SANDBOX_TOKEN_MAX_TTL must be between 1s and %s", ceilingSandboxTokenMaxTTL)
+	}
+	return nil
+}
+
 // validateIdentity checks the identity settings. Enterprise mode lowers the
 // token lifetime default to 90 days and refuses a longer cap.
 func validateIdentity(cfg *Config) error {
@@ -1951,6 +2030,22 @@ func validateIdentityFile(cfg Config) error {
 	return nil
 }
 
+// validateIdentityIssuer canonicalises SB_IDENTITY_ISSUER_URL, refusing one
+// the clouds could not use (not HTTPS, or with a path): a typo would
+// otherwise surface only as an AssumeRoleWithWebIdentity failure in a
+// customer's account.
+func validateIdentityIssuer(cfg *Config) error {
+	if cfg.IdentityIssuerURL == "" {
+		return nil
+	}
+	issuer, err := cloudidentity.ValidateIssuerURL(cfg.IdentityIssuerURL)
+	if err != nil {
+		return err
+	}
+	cfg.IdentityIssuerURL = issuer
+	return nil
+}
+
 func Load() (Config, error) {
 	return load(false)
 }
@@ -1982,6 +2077,9 @@ func load(keyTool bool) (Config, error) {
 		ToolboxPort:                       getEnvInt("SB_TOOLBOX_PORT", defaultToolboxPort),
 		ToolboxDeadPeerTimeout:            getEnvDuration("SB_TOOLBOX_DEAD_PEER_TIMEOUT", toolboxhttp.DefaultDeadPeerTimeout),
 		IdleTimeoutMinutes:                getEnvInt("SB_IDLE_TIMEOUT_MIN", 0),
+		DefaultDestroyIfIdleFor:           getEnvDuration("SB_DEFAULT_DESTROY_IF_IDLE_FOR", 0),
+		MaxAge:                            getEnvDuration("SB_MAX_AGE", 0),
+		EnablePprof:                       getEnvBool("SB_ENABLE_PPROF", false),
 		CreateSandboxTimeoutSeconds:       getEnvInt("SB_CREATE_TIMEOUT_SEC", 600),
 		ContainerPrivileged:               getEnvBool("SB_CONTAINER_PRIVILEGED", false),
 		ResourceLimitsOff:                 getEnvBool("SB_RESOURCE_LIMITS_DISABLED", false),
@@ -2017,6 +2115,8 @@ func load(keyTool bool) (Config, error) {
 		EgressProcidSocket:                strings.TrimSpace(getEnv("SB_EGRESS_PROCID_SOCKET", "/run/aerolvm/egress-procid.sock")),
 		EgressGatewayUser:                 strings.TrimSpace(getEnv("SB_EGRESS_GATEWAY_USER", "aerolvm-egress")),
 		EgressOperatorFile:                strings.TrimSpace(getEnv("SB_EGRESS_OPERATOR_FILE", "")),
+		CreatePolicyFile:                  strings.TrimSpace(getEnv("SB_CREATE_POLICY_FILE", "")),
+		EgressBlockPrivateByDefault:       getEnvBool("SB_EGRESS_BLOCK_PRIVATE_BY_DEFAULT", false),
 		EgressProfileApplyQPS:             getEnvInt("SB_EGRESS_PROFILE_APPLY_QPS", 50),
 		EgressDNSPort:                     getEnvInt("SB_EGRESS_DNS_PORT", 53054),
 		EgressProxyPort:                   getEnvInt("SB_EGRESS_PROXY_PORT", 15080),
@@ -2103,6 +2203,8 @@ func load(keyTool bool) (Config, error) {
 		ReconcileInterval:             getEnvDuration("SB_RECONCILE_INTERVAL", 5*time.Minute),
 		NetstatsPollInterval:          getEnvDuration("SB_NETSTATS_POLL_INTERVAL", 10*time.Second),
 		UploadMaxBytes:                int64(getEnvInt("SB_UPLOAD_MAX_BYTES", 256*1024*1024)),
+		ExecOutputDefaultBytes:        getEnvInt64("SB_EXEC_OUTPUT_DEFAULT_BYTES", 0),
+		ExecOutputMaxBytes:            getEnvInt64("SB_EXEC_OUTPUT_MAX_BYTES", 0),
 		OTELMetricsEnabled:            getEnvBool("SB_OTEL_METRICS_ENABLED", false),
 		OTELMetricsEndpoint:           firstNonEmpty(os.Getenv("SB_OTEL_METRICS_ENDPOINT"), os.Getenv("OTEL_EXPORTER_OTLP_METRICS_ENDPOINT")),
 		OTELMetricsInterval:           getEnvDuration("SB_OTEL_METRICS_INTERVAL", 30*time.Second),
@@ -2233,6 +2335,7 @@ func load(keyTool bool) (Config, error) {
 		IdentitySyncInterval:          getEnvDuration("SB_IDENTITY_SYNC_INTERVAL", 5*time.Second),
 		IdentityMaxStale:              getEnvDuration("SB_IDENTITY_MAX_STALE", 60*time.Second),
 		IdentityFile:                  strings.TrimSpace(os.Getenv("SB_IDENTITY_FILE")),
+		IdentityIssuerURL:             strings.TrimSpace(os.Getenv("SB_IDENTITY_ISSUER_URL")),
 		MCPEnabled:                    getEnvBool("SB_MCP_ENABLED", false),
 		MCPAllowedOrigins:             splitEnvList("SB_MCP_ALLOWED_ORIGINS"),
 		MCPAllowedHosts:               splitEnvList("SB_MCP_ALLOWED_HOSTS"),
@@ -2408,8 +2511,27 @@ func load(keyTool bool) (Config, error) {
 	if cfg.OTELTracesEnabled && (cfg.OTELTracesSampleRatio < 0 || cfg.OTELTracesSampleRatio > 1) {
 		return Config{}, errors.New("SB_OTEL_TRACES_SAMPLE_RATIO must be between 0 and 1 when OTEL traces are enabled")
 	}
+	// Unlike most numeric settings, a value that does not parse refuses the
+	// boot instead of keeping the default: the default is "off", so a typo
+	// such as "10MB" would silently remove the limit the operator meant.
+	for _, name := range []string{"SB_EXEC_OUTPUT_DEFAULT_BYTES", "SB_EXEC_OUTPUT_MAX_BYTES"} {
+		if raw := strings.TrimSpace(os.Getenv(name)); raw != "" {
+			if _, err := strconv.ParseInt(raw, 10, 64); err != nil {
+				return Config{}, fmt.Errorf("%s must be a whole number of bytes, got %q", name, raw)
+			}
+		}
+	}
+	if cfg.ExecOutputDefaultBytes < 0 || cfg.ExecOutputMaxBytes < 0 {
+		return Config{}, errors.New("SB_EXEC_OUTPUT_DEFAULT_BYTES and SB_EXEC_OUTPUT_MAX_BYTES must be 0 (off) or more")
+	}
+	if cfg.ExecOutputMaxBytes > 0 && cfg.ExecOutputDefaultBytes > cfg.ExecOutputMaxBytes {
+		return Config{}, fmt.Errorf("SB_EXEC_OUTPUT_DEFAULT_BYTES (%d) must not exceed SB_EXEC_OUTPUT_MAX_BYTES (%d)", cfg.ExecOutputDefaultBytes, cfg.ExecOutputMaxBytes)
+	}
 	if cfg.ToolboxDeadPeerTimeout < 0 || (cfg.ToolboxDeadPeerTimeout > 0 && cfg.ToolboxDeadPeerTimeout < toolboxhttp.MinDeadPeerTimeout) {
 		return Config{}, fmt.Errorf("SB_TOOLBOX_DEAD_PEER_TIMEOUT must be 0 (off) or at least %s", toolboxhttp.MinDeadPeerTimeout)
+	}
+	if err := validateDefaultLifecycle(cfg); err != nil {
+		return Config{}, err
 	}
 	if cfg.ImagePullMaxConcurrent < 0 {
 		return Config{}, errors.New("SB_IMAGE_PULL_MAX_CONCURRENT must be >= 0")
@@ -2498,6 +2620,13 @@ func load(keyTool bool) (Config, error) {
 
 	if cfg.Domain == "" && cfg.PublicHost == "" {
 		return Config{}, errors.New("SB_PUBLIC_HOST is required when SB_DOMAIN is empty")
+	}
+
+	// The private-range default is host firewall rules: on a node with the
+	// firewall off every default create would get a policy nothing enforces
+	// (refused with 501, or accepted unenforced), so refuse the pair at boot.
+	if cfg.EgressBlockPrivateByDefault && !cfg.EnableNetworkRules {
+		return Config{}, errors.New("SB_EGRESS_BLOCK_PRIVATE_BY_DEFAULT=true needs SB_ENABLE_NETWORK_RULES=true: the private-range default is enforced by the host firewall")
 	}
 
 	// SB_CONTAINER_RUNTIME must be one of the runtimes we know how to drive.
@@ -2919,10 +3048,20 @@ func load(keyTool bool) (Config, error) {
 		}
 		cfg.TokenMaxTTL = ttl
 	}
+	if raw := strings.TrimSpace(os.Getenv("SB_SANDBOX_TOKEN_MAX_TTL")); raw != "" {
+		ttl, err := identitywire.ParseTokenTTL(raw)
+		if err != nil {
+			return Config{}, fmt.Errorf("SB_SANDBOX_TOKEN_MAX_TTL: %w", err)
+		}
+		cfg.SandboxTokenMaxTTL = ttl
+	}
 	if err := cfg.loadAuditAPIConfig(); err != nil {
 		return Config{}, err
 	}
 	if err := cfg.loadPATScopeConfig(); err != nil {
+		return Config{}, err
+	}
+	if err := cfg.loadNodeLabelsConfig(); err != nil {
 		return Config{}, err
 	}
 	if err := cfg.loadLivenessConfig(); err != nil {
@@ -2931,10 +3070,16 @@ func load(keyTool bool) (Config, error) {
 	if err := cfg.loadAPIAdmissionConfig(); err != nil {
 		return Config{}, err
 	}
+	if err := validateSandboxTokens(&cfg); err != nil {
+		return Config{}, err
+	}
 	if err := validateIdentity(&cfg); err != nil {
 		return Config{}, err
 	}
 	if err := validateIdentityFile(cfg); err != nil {
+		return Config{}, err
+	}
+	if err := validateIdentityIssuer(&cfg); err != nil {
 		return Config{}, err
 	}
 	if cfg.EnterpriseMode {
@@ -3239,6 +3384,25 @@ func (c Config) EffectivePublicHost() string {
 		return c.IngressAdvertiseHost
 	}
 	return c.PublicHost
+}
+
+// validateDefaultLifecycle holds the default destroy timers to the same
+// bounds a sandbox's own lifecycle has (models.MaxLifecycleDuration), so a
+// typo cannot stamp an out-of-range timer onto every new sandbox: the
+// create would then fail its own lifecycle check.
+func validateDefaultLifecycle(cfg Config) error {
+	for _, d := range []struct {
+		name string
+		v    time.Duration
+	}{
+		{"SB_DEFAULT_DESTROY_IF_IDLE_FOR", cfg.DefaultDestroyIfIdleFor},
+		{"SB_MAX_AGE", cfg.MaxAge},
+	} {
+		if d.v < 0 || d.v > models.MaxLifecycleDuration {
+			return fmt.Errorf("%s must be between 0 (off) and %s, got %s", d.name, models.MaxLifecycleDuration, d.v)
+		}
+	}
+	return nil
 }
 
 func (c Config) IdleTimeout() time.Duration {

@@ -8,13 +8,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	iofs "io/fs"
 	"net/http"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/aerol-ai/microvm/cmd/toolboxd/sessions"
@@ -381,13 +381,13 @@ func (s *server) handleEnvdRoute(w http.ResponseWriter, r *http.Request) bool {
 	case r.Method == http.MethodPost && r.URL.Path == envdPrefix+"/filesystem.Filesystem/Remove":
 		s.handleEnvdFilesystemRemove(w, r)
 	case r.Method == http.MethodPost && r.URL.Path == envdPrefix+"/filesystem.Filesystem/WatchDir":
-		writeEnvdError(w, http.StatusNotImplemented, "filesystem watchers are not implemented")
+		s.handleEnvdWatchDir(w, r)
 	case r.Method == http.MethodPost && r.URL.Path == envdPrefix+"/filesystem.Filesystem/CreateWatcher":
-		writeEnvdError(w, http.StatusNotImplemented, "filesystem watchers are not implemented")
+		s.handleEnvdCreateWatcher(w, r)
 	case r.Method == http.MethodPost && r.URL.Path == envdPrefix+"/filesystem.Filesystem/GetWatcherEvents":
-		writeEnvdError(w, http.StatusNotImplemented, "filesystem watchers are not implemented")
+		s.handleEnvdGetWatcherEvents(w, r)
 	case r.Method == http.MethodPost && r.URL.Path == envdPrefix+"/filesystem.Filesystem/RemoveWatcher":
-		writeEnvdError(w, http.StatusNotImplemented, "filesystem watchers are not implemented")
+		s.handleEnvdRemoveWatcher(w, r)
 	default:
 		return false
 	}
@@ -907,7 +907,7 @@ func (s *server) handleEnvdFilesystemMakeDir(w http.ResponseWriter, r *http.Requ
 		writeEnvdFilesystemError(w, err)
 		return
 	}
-	if err := os.MkdirAll(targetPath, 0o755); err != nil {
+	if err := makeDir(targetPath, fileOptions{CreateParents: true}); err != nil {
 		writeEnvdFilesystemError(w, err)
 		return
 	}
@@ -935,11 +935,9 @@ func (s *server) handleEnvdFilesystemMove(w http.ResponseWriter, r *http.Request
 		writeEnvdError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if err := os.MkdirAll(filepath.Dir(destination), 0o755); err != nil {
-		writeEnvdFilesystemError(w, err)
-		return
-	}
-	if err := os.Rename(source, destination); err != nil {
+	// E2B's Move has always made the destination's folder and replaced an
+	// existing destination.
+	if err := movePath(source, destination, fileOptions{CreateParents: true, Overwrite: true}); err != nil {
 		writeEnvdFilesystemError(w, err)
 		return
 	}
@@ -984,11 +982,8 @@ func (s *server) handleEnvdFilesystemRemove(w http.ResponseWriter, r *http.Reque
 		writeEnvdError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if _, err := os.Lstat(targetPath); err != nil {
-		writeEnvdFilesystemError(w, err)
-		return
-	}
-	if err := os.RemoveAll(targetPath); err != nil {
+	// E2B's Remove deletes a folder with its contents.
+	if err := removePath(targetPath, fileOptions{Recursive: true}); err != nil {
 		writeEnvdFilesystemError(w, err)
 		return
 	}
@@ -1004,10 +999,14 @@ func buildEnvdEntryInfo(path string) (envdEntryInfo, error) {
 }
 
 func buildEnvdEntryInfoAt(path, displayPath string) (envdEntryInfo, error) {
-	info, err := os.Lstat(path)
+	info, err := statPath(path, false)
 	if err != nil {
 		return envdEntryInfo{}, err
 	}
+	return envdEntryFromInfo(path, displayPath, info), nil
+}
+
+func envdEntryFromInfo(path, displayPath string, info os.FileInfo) envdEntryInfo {
 	owner, group := fileOwnerGroup(info)
 	entry := envdEntryInfo{
 		Name:         filepath.Base(displayPath),
@@ -1028,7 +1027,7 @@ func buildEnvdEntryInfoAt(path, displayPath string) (envdEntryInfo, error) {
 			entry.SymlinkTarget = &target
 		}
 	}
-	return entry, nil
+	return entry
 }
 
 func envdPermissionString(mode os.FileMode) string {
@@ -1039,42 +1038,16 @@ func envdPermissionString(mode os.FileMode) string {
 	return text[1:]
 }
 
+// listEnvdEntries is ListDir's listing: the shared walk with no entry cap,
+// sorted by path as E2B's envd returns it.
 func listEnvdEntries(root string, depth int) ([]envdEntryInfo, error) {
-	walkRoot := root
-	if resolvedRoot, err := filepath.EvalSymlinks(root); err == nil {
-		if info, statErr := os.Stat(resolvedRoot); statErr == nil && info.IsDir() {
-			walkRoot = resolvedRoot
-		}
-	}
-	entries := []envdEntryInfo{}
-	err := filepath.WalkDir(walkRoot, func(path string, entry iofs.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
-		}
-		if path == walkRoot {
-			return nil
-		}
-		rel, err := filepath.Rel(walkRoot, path)
-		if err != nil {
-			return err
-		}
-		level := strings.Count(rel, string(os.PathSeparator)) + 1
-		if level > depth {
-			if entry.IsDir() {
-				return iofs.SkipDir
-			}
-			return nil
-		}
-		displayPath := filepath.Join(root, rel)
-		info, err := buildEnvdEntryInfoAt(path, displayPath)
-		if err != nil {
-			return err
-		}
-		entries = append(entries, info)
-		return nil
-	})
+	listed, _, err := listFolder(root, fileOptions{Depth: depth})
 	if err != nil {
 		return nil, err
+	}
+	entries := make([]envdEntryInfo, 0, len(listed))
+	for _, item := range listed {
+		entries = append(entries, envdEntryFromInfo(item.path, item.path, item.info))
 	}
 	sort.Slice(entries, func(i, j int) bool { return entries[i].Path < entries[j].Path })
 	return entries, nil
@@ -1210,15 +1183,27 @@ func writeEnvdError(w http.ResponseWriter, status int, message string) {
 	writeJSON(w, status, envdErrorResponse{Code: status, Message: message})
 }
 
+// writeEnvdFilesystemError answers a failed file operation in envd's error
+// shape, with the same status mapping as the REST routes (writeFilesystem
+// Error). E2B's SDK raises its NotEnoughSpaceException on the 507.
 func writeEnvdFilesystemError(w http.ResponseWriter, err error) {
+	var requestErr *fileRequestError
+	var kindErr *fileKindError
 	status := http.StatusInternalServerError
 	switch {
+	case errors.As(err, &requestErr):
+		status = http.StatusBadRequest
+	case errors.As(err, &kindErr):
+		status = http.StatusConflict
 	case errors.Is(err, os.ErrNotExist):
 		status = http.StatusNotFound
 	case errors.Is(err, os.ErrPermission):
 		status = http.StatusForbidden
-	case errors.Is(err, os.ErrExist):
+	case errors.Is(err, syscall.ENOTDIR), errors.Is(err, syscall.EISDIR), errors.Is(err, syscall.ENOTEMPTY), errors.Is(err, os.ErrExist):
 		status = http.StatusConflict
+	case isDiskFull(err):
+		writeEnvdError(w, http.StatusInsufficientStorage, "sandbox disk is full: "+err.Error())
+		return
 	}
 	writeEnvdError(w, status, err.Error())
 }

@@ -31,7 +31,7 @@ const (
 // it once per release that adds such a feature, and give the feature its
 // own constant naming the version that introduced it.
 const (
-	fsmOpsVersion              = 5
+	fsmOpsVersion              = 10
 	egressProfileFSMOpsVersion = 1 // opPutEgressProfile, opDeleteEgressProfile
 	// auditCallerFSMOpsVersion: audit records carry a hash-covered caller
 	// field (AuditCallerWritesAllowed).
@@ -50,7 +50,25 @@ const (
 	// key-ring build, and a build with fv 4 and without this would drop the
 	// record the gateway handed it.
 	sshSessionOwnerRecordFSMOpsVersion = 5
+	// tokenPortFSMOpsVersion: the cluster's port record carries a port's
+	// visibility, so a failover recreate gates a token port again
+	// (TokenPortsAllowed). No FSM op: an older build decodes the record and
+	// drops the field, which would recreate the port as public.
+	tokenPortFSMOpsVersion = 6
+	// warmPoolFSMOpsVersion: opPutWarmPool, opDeleteWarmPool
+	// (fsm_warm_pools.go).
+	warmPoolFSMOpsVersion = 7
+	// identityFSMOpsVersion: opPutIdentityKeys, opPutIdentityRole,
+	// opDeleteIdentityRole (fsm_identity.go) and the identity create option
+	// a worker must understand; the token_issued audit record needs no gate
+	// (IdentityAllowed).
+	identityFSMOpsVersion = 8
 )
+
+// fsmOpsVersion 9 is P2's team quotas (teamQuotaFSMOpsVersion in
+// fsm_team_quotas.go); 10 is the delete_with_sandbox volume reclaim ledger
+// (volumeReclaimFSMOpsVersion in fsm_volume_reclaims.go). Versions 6 to 8
+// are the gates in the block above.
 
 var (
 	// ErrEgressProfileInUse is a delete of a profile placements reference.

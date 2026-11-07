@@ -14,6 +14,8 @@ import (
 	"sync"
 
 	"github.com/aerol-ai/microvm/pkg/models"
+
+	"github.com/aerol-ai/microvm/internal/service"
 )
 
 // maxUploadBytes matches toolboxd's default SB_UPLOAD_MAX_BYTES, so the
@@ -164,7 +166,7 @@ func (h *handlers) serveFile(w http.ResponseWriter, r *http.Request, devboxID, f
 		h.writeToolboxError(w, err)
 		return
 	}
-	resp, err := h.deps.Service.RoundTripToolbox(r.Context(), devboxID, http.MethodGet, "/files/download", url.Values{"path": {target}}, nil, nil)
+	resp, err := h.deps.Service.RoundTripToolbox(service.WithToolboxSurface(r.Context(), service.ToolboxSurfaceRunloop), devboxID, http.MethodGet, "/files/download", url.Values{"path": {target}}, nil, nil)
 	if err != nil {
 		h.writeToolboxError(w, err)
 		return
@@ -251,7 +253,7 @@ func (h *handlers) uploadToToolbox(ctx context.Context, devboxID, target, filena
 		_ = writer.CloseWithError(err)
 		errCh <- err
 	}()
-	resp, err := h.deps.Service.RoundTripToolbox(ctx, devboxID, http.MethodPost, "/files/upload", url.Values{"path": {target}}, reader, headers)
+	resp, err := h.deps.Service.RoundTripToolbox(service.WithToolboxSurface(ctx, service.ToolboxSurfaceRunloop), devboxID, http.MethodPost, "/files/upload", url.Values{"path": {target}}, reader, headers)
 	if err != nil {
 		_ = reader.CloseWithError(err)
 		<-errCh

@@ -49,6 +49,8 @@ feature is still mid-rollout.
 | `SB_TLS_ACME_CA` / `SB_TLS_ACME_CA_ROOT` | unset — ACME directory (https) and its root PEM for custom-domain certificates on a network with no route to Let's Encrypt (plans/egress-domain-filtering.md §5.10 PC-5). install.sh `--acme-ca` / `--acme-ca-root` set these and the Caddyfile's `acme_ca` / `acme_ca_root` for the wildcard certs. Re-read at every start; unset goes back to public ACME. |
 | `SB_TLS_ISSUER` | `acme` — `internal` makes Caddy's own CA issue custom-domain certificates (labs); install.sh `--tls-issuer internal` also switches the wildcard sites to `tls internal`, with no DNS provider. |
 | `SB_EGRESS_OPERATOR_FILE` | unset — the private-cloud operator file (default policy, ceiling, deny floor, internal zone, upstream proxy, control-port guard, org profiles, built-in profile switch); see `setup/runbooks/egress-gateway.md`. Unset keeps every default. An invalid file at boot refuses creates (503) until fixed. |
+| `SB_EGRESS_BLOCK_PRIVATE_BY_DEFAULT` | false — `true` gives a container, gVisor or Firecracker create that sets no egress policy (and gets no operator `default_policy`) a deny list of 10/8, 172.16/12, 192.168/16 and 169.254/16, with the node's private DNS resolvers (read at boot) left open as /32 allows; stored on the sandbox. A create with its own policy keeps it. Needs `SB_ENABLE_NETWORK_RULES=true` (boot refuses otherwise). Plan T4; whether it becomes the default is a later release's call. |
+| `SB_CREATE_POLICY_FILE` | unset — the operator create policy (allowed images, registries and runtimes; max cpu, memory and disk; `require_non_root`; `allow_gpu`), checked at every create and resize; see `docs/src/content/docs/enterprise/create-policy.mdx`. Unset keeps every default. Reloaded within 10 s of an edit or on SIGHUP (a bad edit keeps the last good file); missing or invalid at boot refuses creates and resizes (503 `create_policy_invalid`) until fixed. |
 | `SB_EGRESS_PROFILE_APPLY_QPS` | 50 — sandboxes per second a node re-applies after an egress profile changes, so one profile edit can't flood the gateway and firewall (D21). |
 | Egress gateway (`/etc/sandboxd/egress-gateway.env`) | `SB_EGRESS_DNS_PORT` 53054, `SB_EGRESS_PROXY_PORT` 15080, `SB_EGRESS_DNS_UPSTREAMS` (host resolver), `SB_EGRESS_DNS_QPS` 50 per sandbox, `SB_EGRESS_PROXY_MAX_CONNS` 16384 per node, `SB_EGRESS_PROXY_MAX_CONNS_PER_SANDBOX` 512, `SB_EGRESS_LEARNED_MAX` 512 per sandbox, `SB_EGRESS_AUDIT_BUFFER` 10000 events, `SB_EGRESS_INSPECT_MAX_BODY_BYTES` 268435456 (256 MiB, the largest request body to a host with an inspect rule; larger gets 413), `SB_EGRESS_STATE_DIR` `/var/lib/aerolvm-egress`, `SB_EGRESS_PEER_CGROUP` `sandboxd.service`. Sized for the 100k-sandbox fleet budget (plans/egress-domain-filtering.md §8.2). |
 
@@ -64,7 +66,16 @@ feature is still mid-rollout.
 | `SB_SANDBOX_INTERCONNECT` | `true` lets sandboxes on one server reach each other; default `false` (isolated, refused in enterprise mode). |
 | `SB_SANDBOX_NODE_PORTS_ALLOW` | Extra ports of the server itself every sandbox on it may reach, such as `8080,5353/udp` (tcp when bare). Default empty: sandboxes are default-denied from their own server (the node guard, `AEROLVM-NODE` in INPUT), except the egress gateway's DNS and proxy ports (when the gateway runs), DNS on a server address the sandboxes' resolver names, and 80/443 on a server that serves ingress. No ranges. A control or host-service port (API, SSH gateway, Raft, gossip, cluster mTLS, host-port redirect, 22, 111) or the gateway's own port refuses the boot; any entry refuses it in enterprise mode. Logged at every boot. |
 | `SB_DISK_LIMIT_CHECK_INTERVAL` | How often a container sandbox's writable layer is checked against its disk size; one past it is stopped. Default `15s`, `0` = off. |
+| `SB_ENABLE_PPROF` | Serves Go's profiler at `/debug/pprof/` to `admin` callers only (`fleet.admin`, like `/debug/vars`); `401` without a token, `403` for any other role, `404` while off. Off because a profile exposes the daemon's goroutines, heap and command line and costs CPU to take. Not forwarded by Caddy, so it is per node on the API port. Turn on to debug, then off. |
 | `SB_ALLOW_UNENFORCED_NETWORK_POLICY` | With the host firewall off, accepts network policy (block-all, address lists, hostname rules, byte caps) that nothing enforces: the sandbox runs unfiltered while GET shows the policy (with `egress_status: "unenforced"`). Local development only; boot logs a warning and every accepted sandbox logs one. Refused when `SB_ENTERPRISE_MODE=true`. `install.sh --local` does not set it. |
+
+## Lifecycle defaults
+
+| Env var | Default | Notes |
+|---|---|---|
+| `SB_IDLE_TIMEOUT_MIN` | `0` (off) | Stops a running sandbox idle this many minutes, if it has no lifecycle timers of its own. Applied by the lifecycle sweep, so it reaches every such sandbox, old ones included. |
+| `SB_DEFAULT_DESTROY_IF_IDLE_FOR` | `0` (off) | Go duration (`2h`), at most `720h`. Written as `destroy_if_idle_for` into a new sandbox created with no lifecycle timers of its own, so a crashed client cannot leak sandboxes. Off by default because turning on a delete timer is the operator's choice; it never reaches sandboxes created before it was set. |
+| `SB_MAX_AGE` | `0` (off) | Go duration (`168h`), at most `720h`. Written as `destroy_at_age` the same way. When either is set and `SB_IDLE_TIMEOUT_MIN` comes before the idle delete, that idle stop is written in too. |
 
 ## Secret provider (SB_SECRET_PROVIDER)
 
@@ -165,6 +176,29 @@ flight or queued), `aerolvm_api_list_admitted_total`,
 `aerolvm_api_list_max_inflight` and `aerolvm_api_list_max_inflight_per_tenant`.
 Which tenants: `GET /debug/vars` (fleet admin only) has `api_list_gate`, the
 gate's totals and its 10 busiest tenants by name, most refused first.
+
+## Exec output limits (SB_EXEC_OUTPUT_*)
+
+Buffered exec (`POST /v1/sandboxes/{id}/toolbox/process/execute`, Daytona
+`process.executeCommand`) returns a command's whole output in one JSON reply.
+A caller can cap each stream (`max_stdout_bytes`, `max_stderr_bytes`); these
+two settings let the operator fill in a cap and bound it. sandboxd writes them
+into the exec request before forwarding it to the sandbox's agent, so they
+hold on every runtime and on agents already running, with no extra round trip
+(plan `agent-sandbox-feature-parity.md`, E1/ER5). Exec streams, sessions and
+E2B commands are not buffered and are not covered. Whatever is set, the agent
+keeps at most 64 MiB of each stream.
+
+| Env var | Default | Notes |
+|---|---|---|
+| `SB_EXEC_OUTPUT_DEFAULT_BYTES` | `0` (off) | The per-stream cap for an exec that sets none. |
+| `SB_EXEC_OUTPUT_MAX_BYTES` | `0` (off) | The largest cap an exec may ask for; a larger one, or none, is lowered to it. With it set, an exec body over 8 MiB is refused `413` (sandboxd reads the body to apply the cap and will not buffer more); with only a default, such a body passes through untouched. |
+
+A default above the maximum, a negative value, or anything but a whole number
+refuses the boot (unlike most numeric settings, which keep their default on a
+typo, because the default here is "no limit"). Off, the exec path is
+byte-for-byte unchanged. An agent older than the caps ignores them. In a
+cluster each node applies its own values, so set them the same everywhere.
 
 ## Audit export connectors (SB_AUDIT_EXPORT_BACKEND)
 
@@ -304,8 +338,8 @@ the pool widens the ready-socket gate), **not** incompleteness. Clusters opt in
 via Terraform/Ansible — do not flip the code default on.
 | Env var | Status |
 |---|---|
-| `SB_DOCKER_POOL_ENABLED` | SHIPPED & VERIFIED v0.5.33 (2026-07-11): warm-hit p50 **43ms**, beats the ≤100ms gate. Holds pre-started containers resident; enabling also widens `DockerReadySocketEffective`. See `plans/docker-warm-pool.md` §12. |
-| `SB_DOCKER_NETNS_POOL_ENABLED` | Companion pause-netns pool shipped/deployed (PR #300, v0.5.30–32). Terraform plumbs it per-node. With it off (or empty), a Docker create with network rules starts a pause container of its own so its rules are on before its workload runs (`docker_pause` stage); `SB_DOCKER_NETNS_POOL_PAUSE_IMAGE` (default `registry.k8s.io/pause:3.10`) is that container's image too, pulled in the background at boot, so an air-gapped node must point it at a mirror. |
+| `SB_DOCKER_POOL_ENABLED` | SHIPPED & VERIFIED v0.5.33 (2026-07-11): warm-hit p50 **43ms**, beats the ≤100ms gate. Holds pre-started containers resident; enabling also widens `DockerReadySocketEffective`. See `plans/docker-warm-pool.md` §12. Admins can set a depth per image at runtime with warm-pool entries (SDK `putWarmPool`, docs page `warm-pools`); `SB_DOCKER_POOL_DEPTH` / `SB_DOCKER_POOL_IMAGES` stay the default for images with no entry, and the same holds for the `SB_CONTAINERD_POOL_*` settings. An entry does nothing on a node whose pool is off. |
+| `SB_DOCKER_NETNS_POOL_ENABLED` | Companion pause-netns pool shipped/deployed (PR #300, v0.5.30–32). Terraform plumbs it per-node. A create takes a slot only when no other create is running on the node: a slot is a second container per sandbox, and when creates overlap that extra dockerd work (container config fsyncs, containerd metadata commits, overlay unmounts on the root disk) costs more than the ~20 ms it saves, so those creates take Docker's own path (`docker_netns;desc=busy`, `aerolvm_docker_netns_pool_busy_skips_total`). Creates with network rules still take a slot, and the pool refills only between creates. With it off (or empty), a Docker create with network rules starts a pause container of its own so its rules are on before its workload runs (`docker_pause` stage); `SB_DOCKER_NETNS_POOL_PAUSE_IMAGE` (default `registry.k8s.io/pause:3.10`) is that container's image too, pulled in the background at boot, so an air-gapped node must point it at a mirror. |
 
 ## 🟠 Mid-rollout / not soaked — flip only with soak data
 | Env var | Status |
@@ -323,6 +357,7 @@ via Terraform/Ansible — do not flip the code default on.
 | `SB_IDENTITY_SYNC_INTERVAL` | `5s`: how often a cluster node without Raft state (worker, ingress) polls the server tier for token changes. A poll that finds nothing new is a 304 from an in-memory compare, so 2,000 nodes cost the server tier ~400 req/s of next to nothing; a revoke reaches every node within one interval (target ≤ 15 s). |
 | `SB_IDENTITY_MAX_STALE` | `60s`: a token mirror that has not synced for this long refuses API tokens with 503 (the PAT is unaffected), except on routes that need only `metrics.read`, so worker metrics keep flowing through a server-tier outage (CEO review D16). A server tier down for 60 s already blocks creates, so this adds no new outage class. Must be at least `SB_IDENTITY_SYNC_INTERVAL`. |
 | `SB_TOKEN_MAX_TTL` | `8760h` (365 days); `2160h` (90 days) in enterprise mode, which refuses anything longer. Every API token must expire, and `expires_in` above this cap is a 400. Accepts days (`90d`) as well as Go durations; an unparsable value fails the boot rather than silently falling back. |
+| `SB_SANDBOX_TOKEN_MAX_TTL` | `24h`. The longest lifetime a sandbox token (`POST /v1/sandboxes/{id}/tokens`) may have; `expires_in` above it is a 400, and a token whose lifetime is above it is refused when it is checked. It is how long a leaked token can work until someone revokes its sandbox's tokens (`POST /v1/sandboxes/{id}/tokens/revoke`, which stops every token of that sandbox), and how long a server-key rotation must wait between `--promote` and `--retire` (retiring a key ends the tokens it signed). At most `720h` (30 days). Accepts days (`1d`) as well as Go durations; an unparsable value fails the boot. |
 | `SB_IDENTITY_FILE` | The identity file (`plans/identity-and-access.md` §5.5): the OIDC issuers people and CI sign in with, the group / app-role / claim to role bindings, and the emergency `deny_subjects` list. **Default empty**: empty with `SB_IDENTITY_ENABLED=true` is tokens-only mode (no SSO), and config load refuses the file without `SB_IDENTITY_ENABLED=true`, so a deploy never believes SSO or the deny list is on when it is not. Strict YAML (an unknown key fails the load), 1 MiB cap, and an empty file is invalid. Polled every 10 s and reloaded on SIGHUP; an invalid reload keeps the last good file (`aerolvm_identity_file_load_errors_total`), and an invalid file at boot leaves OIDC sign-in at 503 while the PAT and API tokens keep working. Each node writes one `identity_config` audit record per effective change. Ship the same file to every node (Terraform, Ansible); distinct `aerolvm_identity_file_info` hashes across nodes show drift. |
 | `SB_PAT_SCOPE` | `any`: where the operator token (PAT) works. `any` is today's behavior, everywhere the API answers. `host` accepts it only from a loopback TCP peer on the API listener (setup scripts, runbooks, the SSH gateway) and from mTLS cluster peers, so remote people must use SSO or a named `avm_` token; a refused PAT gets 401 "the operator token works only on this host; sign in with `aerolvm login --sso` or use a named token". **Default `any`** because every existing remote PAT user (dashboard, remote MCP, SDK scripts, the Prometheus scrape) would break; enterprise mode requires `host`. Under `host` Caddy must proxy to `SB_PUBLIC_API_SOCKET` (`install.sh --pat-scope host` writes both halves), because Caddy's own traffic also comes from loopback. A forwarded PAT carries `X-Cluster-PAT-Origin`, and an owner under `host` refuses a missing marker, so turn it on only after every node runs the release. Nodes gossip their scope; `aerolvm_pat_scope_drift` counts members that differ. `SB_API_HOST` is unchanged (`0.0.0.0` on domain installs): host scope works by the peer address, not by the bind, so remote SSO and `avm_` callers and a token-based scrape of `private_ip:21212` keep working. Runbook: `setup/runbooks/identity-and-access.md` (TurnOnHostScope). |
 | `SB_PUBLIC_API_SOCKET` | `/run/sandboxd-public/api.sock`: the Unix socket Caddy proxies to under `SB_PAT_SCOPE=host`; every request on it is public, so the PAT is refused there. Unused under `any`. sandboxd creates the directory `root:caddy 0750` and the socket `root:caddy 0660` on every boot (`/run/sandboxd` is `0700`, which Caddy cannot enter). Must be absolute. Any other reverse proxy on the host must use this socket too. |

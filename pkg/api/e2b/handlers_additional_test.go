@@ -20,11 +20,13 @@ import (
 func TestE2BCreateSandboxNotImplemented(t *testing.T) {
 	_, _, handler := newE2BHandlerTestEnv(t)
 
+	// The mcp option itself is accepted since G12 (mcp_test.go); what stays
+	// unimplemented is E2B's own mcp-gateway template image.
 	cases := []struct {
 		name string
 		body string
 	}{
-		{"mcp", `{"templateID":"base","mcp":{}}`},
+		{"mcp-gateway template", `{"templateID":"mcp-gateway","mcp":{}}`},
 	}
 
 	for _, tc := range cases {

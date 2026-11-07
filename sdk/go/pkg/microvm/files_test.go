@@ -1,0 +1,193 @@
+package microvm
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+
+	"github.com/aerol-ai/microvm/pkg/models"
+	sdktypes "github.com/aerol-ai/microvm/sdk/go/pkg/types"
+)
+
+// Each Sandbox file method reaches its toolbox route; the request details
+// and retry rules are tested in internal/apiclient.
+func TestSandboxFileMethods(t *testing.T) {
+	ctx := context.Background()
+	seen := map[string]bool{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen[r.Method+" "+r.URL.Path] = true
+		switch r.Method + " " + r.URL.Path {
+		case "GET /v1/sandboxes/sb1":
+			_ = json.NewEncoder(w).Encode(models.Sandbox{ID: "sb1"})
+		case "GET /v1/sandboxes/sb1/toolbox/version":
+			_ = json.NewEncoder(w).Encode(map[string]any{"version": "v", "features": []string{"files.verbs"}})
+		case "GET /v1/sandboxes/sb1/toolbox/files":
+			_ = json.NewEncoder(w).Encode([]map[string]any{{"name": "a", "path": "/w/a", "size_bytes": 3}})
+		case "GET /v1/sandboxes/sb1/toolbox/files/info":
+			if r.URL.Query().Get("path") == "/missing" {
+				w.WriteHeader(http.StatusNotFound)
+				_ = json.NewEncoder(w).Encode(models.ErrorResponse{Error: "stat /missing: no such file or directory", Code: "file_not_found"})
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"name": "a", "path": "/w/a", "size_bytes": 3})
+		case "GET /v1/sandboxes/sb1/toolbox/files/search":
+			_ = json.NewEncoder(w).Encode(map[string]any{"files": []string{"/w/a"}})
+		case "GET /v1/sandboxes/sb1/toolbox/files/find":
+			_ = json.NewEncoder(w).Encode([]sdktypes.FileMatch{{File: "/w/a", Line: 1, Content: "x"}})
+		case "POST /v1/sandboxes/sb1/toolbox/files/move":
+			w.WriteHeader(http.StatusConflict)
+			_ = json.NewEncoder(w).Encode(models.ErrorResponse{Error: "rename: file exists"})
+		default:
+			w.WriteHeader(http.StatusNoContent)
+		}
+	}))
+	defer server.Close()
+	client, err := NewClientWithConfig(&sdktypes.MicroVMConfig{PATToken: "pat", APIUrl: server.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sb, err := client.Get(ctx, "sb1")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if list, err := sb.ListFiles(ctx, "/w", sdktypes.ListFilesOptions{}); err != nil || len(list.Entries) != 1 || list.Entries[0].Size != 3 {
+		t.Fatalf("ListFiles = %+v, %v", list, err)
+	}
+	if info, err := sb.GetFileInfo(ctx, "/w/a"); err != nil || info.Path != "/w/a" {
+		t.Fatalf("GetFileInfo = %+v, %v", info, err)
+	}
+	if ok, err := sb.FileExists(ctx, "/w/a"); err != nil || !ok {
+		t.Fatalf("FileExists = %v, %v", ok, err)
+	}
+	if ok, err := sb.FileExists(ctx, "/missing"); err != nil || ok {
+		t.Fatalf("FileExists(missing) = %v, %v", ok, err)
+	}
+	if err := sb.DeleteFile(ctx, "/w/a", sdktypes.DeleteFileOptions{Recursive: true}); err != nil {
+		t.Fatalf("DeleteFile: %v", err)
+	}
+	if err := sb.MakeDir(ctx, "/w/d", sdktypes.MakeDirOptions{Parents: true, Mode: 0o700}); err != nil {
+		t.Fatalf("MakeDir: %v", err)
+	}
+	if err := sb.MoveFile(ctx, "/w/a", "/w/b", sdktypes.MoveFileOptions{}); !errors.Is(err, ErrConflict) {
+		t.Fatalf("MoveFile onto an existing file = %v, want ErrConflict", err)
+	}
+	if err := sb.CopyFile(ctx, "/w/a", "/w/c", sdktypes.CopyFileOptions{Recursive: true}); err != nil {
+		t.Fatalf("CopyFile: %v", err)
+	}
+	if files, err := sb.SearchFiles(ctx, "/w", "*"); err != nil || len(files) != 1 {
+		t.Fatalf("SearchFiles = %v, %v", files, err)
+	}
+	if matches, err := sb.FindInFiles(ctx, "/w", "x"); err != nil || len(matches) != 1 {
+		t.Fatalf("FindInFiles = %v, %v", matches, err)
+	}
+	for _, route := range []string{
+		"DELETE /v1/sandboxes/sb1/toolbox/files",
+		"POST /v1/sandboxes/sb1/toolbox/files/folder",
+		"POST /v1/sandboxes/sb1/toolbox/files/copy",
+	} {
+		if !seen[route] {
+			t.Fatalf("%s was not called", route)
+		}
+	}
+}
+
+func TestSandboxUploadWithOptions(t *testing.T) {
+	ctx := context.Background()
+	var queries []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/sandboxes/sb1":
+			_ = json.NewEncoder(w).Encode(models.Sandbox{ID: "sb1"})
+		case "/v1/sandboxes/sb1/toolbox/version":
+			_ = json.NewEncoder(w).Encode(map[string]any{"version": "v", "features": []string{"files.write_options"}})
+		default:
+			queries = append(queries, r.URL.RawQuery)
+			w.WriteHeader(http.StatusCreated)
+		}
+	}))
+	defer server.Close()
+	client, err := NewClientWithConfig(&sdktypes.MicroVMConfig{PATToken: "pat", APIUrl: server.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sb, err := client.Get(ctx, "sb1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sb.UploadFileWithOptions(ctx, "/a", []byte("x"), sdktypes.UploadFileOptions{CreateOnly: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := sb.UploadFileStreamWithOptions(ctx, "/a", strings.NewReader("x"), sdktypes.UploadFileOptions{Append: true}); err != nil {
+		t.Fatal(err)
+	}
+	if len(queries) != 2 || queries[0] != "create_only=true" || queries[1] != "append=true" {
+		t.Fatalf("queries = %v", queries)
+	}
+}
+
+func TestSandboxUploadDir(t *testing.T) {
+	ctx := context.Background()
+	var query string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/sandboxes/sb1":
+			_ = json.NewEncoder(w).Encode(models.Sandbox{ID: "sb1"})
+		case "/v1/sandboxes/sb1/toolbox/version":
+			_ = json.NewEncoder(w).Encode(map[string]any{"version": "v", "features": []string{"files.extract"}})
+		default:
+			query = r.URL.RawQuery
+			_, _ = io.Copy(io.Discard, r.Body)
+			w.WriteHeader(http.StatusCreated)
+		}
+	}))
+	defer server.Close()
+	client, err := NewClientWithConfig(&sdktypes.MicroVMConfig{PATToken: "pat", APIUrl: server.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sb, err := client.Get(ctx, "sb1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sb.UploadDir(ctx, t.TempDir(), "/work"); err != nil || query != "extract=true" {
+		t.Fatalf("UploadDir = %v, query %q", err, query)
+	}
+}
+
+func TestSandboxDownloadWithOptions(t *testing.T) {
+	ctx := context.Background()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/sandboxes/sb1" {
+			_ = json.NewEncoder(w).Encode(models.Sandbox{ID: "sb1"})
+			return
+		}
+		_, _ = w.Write([]byte("0123456789"))
+	}))
+	defer server.Close()
+	client, err := NewClientWithConfig(&sdktypes.MicroVMConfig{PATToken: "pat", APIUrl: server.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sb, err := client.Get(ctx, "sb1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sb.DownloadFileWithOptions(ctx, "/f", sdktypes.DownloadFileOptions{MaxBytes: 3}); !errors.Is(err, ErrFileTooLarge) {
+		t.Fatalf("DownloadFileWithOptions = %v", err)
+	}
+	body, err := sb.DownloadFileStreamWithOptions(ctx, "/f", sdktypes.DownloadFileOptions{MaxBytes: 100})
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, _ := io.ReadAll(body)
+	body.Close()
+	if string(data) != "0123456789" {
+		t.Fatalf("stream = %q", data)
+	}
+}

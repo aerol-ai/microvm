@@ -17,6 +17,7 @@ aerolvm_create_latency_seconds_bucket
 aerolvm_create_queue_depth
 aerolvm_create_requests_total
 aerolvm_create_stage_latency_seconds_bucket
+aerolvm_docker_netns_pool_busy_skips_total
 aerolvm_docker_netns_pool_hits_total
 aerolvm_docker_netns_pool_misses_total
 aerolvm_docker_pool_adopt_ms
@@ -142,3 +143,13 @@ aerolvm_key_store_calls_total
 aerolvm_key_store_call_seconds_bucket
 aerolvm_key_store_limiter_wait_seconds_bucket
 aerolvm_server_key_rows
+aerolvm_toolbox_calls_total
+# Re-dials of a toolbox that refused the connection (plans/agent-sandbox-feature-parity.md I1).
+aerolvm_toolbox_dial_retries_total
+# Lifecycle counters and the warm/cold create latency
+# (plans/agent-sandbox-feature-parity.md O1).
+aerolvm_create_latency_by_start_seconds_bucket
+aerolvm_sandbox_expired_total
+aerolvm_sandbox_finished_total
+aerolvm_sandbox_starts_total
+aerolvm_sandbox_stops_total

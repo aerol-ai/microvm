@@ -49,6 +49,15 @@ func (p *Pool) Run(ctx context.Context, cfg RefillConfig, spawner Spawner, gate 
 }
 
 func (p *Pool) refillTick(parent context.Context, cfg RefillConfig, spawner Spawner, gate RefillGate) {
+	// Demand-following entries move their targets first; then an entry
+	// whose depth went down gives its extra slots back, so their park
+	// reservations are free before this tick parks anything.
+	p.sampleDemand()
+	// Containers whose teardown failed before still hold their reservation;
+	// one that is gone now frees it for the parks below.
+	p.retryPendingDestroys(parent, false)
+	p.destroySlots(parent, p.refreshImages(parent))
+	p.destroySlots(parent, p.trimExcess())
 	targets := p.ListTargets()
 	for _, key := range targets {
 		ks := key.KeyString()
@@ -89,7 +98,18 @@ func (p *Pool) refillTick(parent context.Context, cfg RefillConfig, spawner Spaw
 				break
 			}
 			p.ClearSpawnFailures(ks)
-			p.RecordLoaded(slot)
+			if !p.recordParked(slot) {
+				// The entry was deleted while this park ran: nothing will
+				// ever acquire this slot, so give back its container and
+				// the reservation this tick took for it (kept and retried
+				// if the teardown fails).
+				p.destroySlot(context.WithoutCancel(parent), spawner, slot, func(id string) {
+					if gate != nil {
+						gate.ReleasePark(id)
+					}
+				})
+				break
+			}
 			if p.metrics != nil {
 				p.metrics.recordRefill()
 			}

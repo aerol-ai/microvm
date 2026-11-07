@@ -109,6 +109,12 @@ type Request struct {
 	// NeedsMediatedEgress marks a WASM or isolate create that sets an egress
 	// field. Placement sends it only to peers advertising MediatedEgress.
 	NeedsMediatedEgress bool
+	// Labels are the node labels the request requires, zone included under
+	// "zone" (plans/placement-rules.md). Placement keeps only peers whose
+	// heartbeat Labels carry every one with the same value. nil = no rule.
+	// It crosses the agent's select-placement RPC as part of this struct, so
+	// it keeps a JSON name a control plane can read.
+	Labels map[string]string `json:"Labels,omitempty"`
 }
 
 // Snapshot is a read-only view of admitter state, suitable for an HTTP
@@ -240,6 +246,31 @@ type Snapshot struct {
 	LocalWasmModuleInventoryKnown bool `json:"local_wasm_module_inventory_known,omitempty"`
 	// LocalWasmModuleIDs lists module_ref values cached on this host.
 	LocalWasmModuleIDs []string `json:"local_wasm_module_ids,omitempty"`
+	// WarmPools is this host's warm-pool status for each API warm-pool
+	// entry (plans/agent-sandbox-feature-parity.md W1). It rides the
+	// capacity heartbeat so any server can answer GET /v1/warm-pools per
+	// server without a fan-out. Only entries are listed, never miss-driven
+	// targets, and models.MaxWarmPools bounds them, so it stays small.
+	// Omitted by a host with no warm pool and by a peer that predates it.
+	WarmPools []WarmPoolStatus `json:"warm_pools,omitempty"`
+	// Labels are this node's operator-declared labels (SB_NODE_LABELS, plus
+	// SB_NODE_ZONE under "zone"). They ride this authenticated heartbeat, not
+	// gossip meta: memberlist meta is capped at 512 bytes and overflowing it
+	// once stripped Raft addresses (plans/placement-rules.md P1.2). A peer
+	// that predates the field reports none, so it never satisfies a placement
+	// rule: a rule fails closed rather than landing on an unlabelled node.
+	Labels map[string]string `json:"labels,omitempty"`
+}
+
+// WarmPoolStatus is one warm-pool entry's state on one host: slots parked
+// and ready for a create, and how many the host is aiming for.
+type WarmPoolStatus struct {
+	Image  string `json:"image"`
+	Ready  int    `json:"ready"`
+	Target int    `json:"target"`
+	// Outdated counts ready slots holding an older image than the tag
+	// names now (W3); omitted when none.
+	Outdated int `json:"outdated,omitempty"`
 }
 
 // MemProbe reports live free memory in MB. The default implementation reads
@@ -285,6 +316,9 @@ type HostInfo struct {
 	// Empty defaults to []{"docker"} at Admitter construction so a node
 	// that doesn't set the field still admits the common case.
 	SupportedRuntimes []string
+	// Labels are the node's placement labels (SB_NODE_LABELS + SB_NODE_ZONE),
+	// validated at boot. Static like GPUCount: the admitter only reports them.
+	Labels map[string]string
 }
 
 // Admitter is the thread-safe admission controller. Construct with New and
@@ -447,6 +481,20 @@ func NewWithRSSSource(host HostInfo, limits Limits, probe MemProbe, rss RSSSourc
 		rss:          rss,
 		reservations: make(map[string]Request),
 	}
+}
+
+// cloneLabels gives each snapshot its own map: snapshots cross goroutines and
+// are stored in the lease cache, and a shared map would let a reader's
+// mutation reach the admitter.
+func cloneLabels(labels map[string]string) map[string]string {
+	if len(labels) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(labels))
+	for k, v := range labels {
+		out[k] = v
+	}
+	return out
 }
 
 // DetectHost returns CPU core count from runtime and memory total from
@@ -815,6 +863,7 @@ func (a *Admitter) Snapshot() Snapshot {
 		GPUCount:                  a.host.GPUCount,
 		GPUVendor:                 a.host.GPUVendor,
 		SupportedRuntimes:         a.host.SupportedRuntimes,
+		Labels:                    cloneLabels(a.host.Labels),
 		ActualRSSMB:               actualRSS,
 		EffectiveMemoryFreeMB:     effectiveFree,
 		RSSWatermarkMB:            a.rssWatermarkMB(),

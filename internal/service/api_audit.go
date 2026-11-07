@@ -245,20 +245,37 @@ func (s *Service) SSHSessionsRecordedByOwner() bool {
 // be slog lines only; now "who deleted this sandbox" always has an answer,
 // caller system:<subsystem> (§5.9, "System actions").
 const (
-	systemActionAutoStop    = "lifecycle.auto_stop"
-	systemActionDiskStop    = "lifecycle.disk_limit_stop"
-	systemActionAutoDelete  = "lifecycle.auto_delete"
-	systemActionReap        = "reconcile.reap"
-	systemActionOrphanReap  = "reconcile.orphan_delete"
-	systemActionMarkError   = "reconcile.mark_error"
-	systemActionMethod      = "SYSTEM"
-	auditSubsystemAuditMode = "audit"
+	systemActionAutoStop   = "lifecycle.auto_stop"
+	systemActionDiskStop   = "lifecycle.disk_limit_stop"
+	systemActionAutoDelete = "lifecycle.auto_delete"
+	systemActionReap       = "reconcile.reap"
+	systemActionOrphanReap = "reconcile.orphan_delete"
+	systemActionMarkError  = "reconcile.mark_error"
+	// The automatic stops and deletes the log missed (plans/agent-sandbox-
+	// feature-parity.md L3): an exit or removal the runtime reported that
+	// nobody asked for, a stop only reconcile found, a failover recreate,
+	// and the fleet directives.
+	systemActionRuntimeExited     = "runtime.exited"
+	systemActionRuntimeRemoved    = "runtime.removed"
+	systemActionFoundStopped      = "reconcile.found_stopped"
+	systemActionFailoverRecreated = "failover.recreated"
+	systemActionFleetSuspend      = "fleet.suspend"
+	systemActionFleetDelete       = "fleet.delete"
+	systemActionMethod            = "SYSTEM"
+	auditSubsystemAuditMode       = "audit"
 )
 
 // beginSystemAction resolves the sandbox's lifecycle and owner now, before
 // the action can end the lifecycle, and returns the function that writes
 // the record once the outcome is known. A no-op when records are off.
 func (s *Service) beginSystemAction(ctx context.Context, sandboxID, action string) func(error) {
+	return s.beginSystemActionReason(ctx, sandboxID, action, "")
+}
+
+// beginSystemActionReason is beginSystemAction with the record's reason: the
+// status reason a stop records, or the timer behind an automatic delete, so
+// the sandbox's audit page says why, not only what.
+func (s *Service) beginSystemActionReason(ctx context.Context, sandboxID, action, reason string) func(error) {
 	if s == nil || s.apiRecordsMode() == config.AuditAPIRecordsOff {
 		return func(error) {}
 	}
@@ -273,6 +290,7 @@ func (s *Service) beginSystemAction(ctx context.Context, sandboxID, action strin
 		}
 		ev := s.apiEvent(ctx, APICall{Method: systemActionMethod, Route: action, Status: status, SandboxID: sandboxID, IncarnationID: inc, OwnerRef: owner})
 		ev.Caller = AuditCallerFromContext(ctx)
+		ev.Reason = reason
 		s.emitAPIEvent(ev, false)
 	}
 }

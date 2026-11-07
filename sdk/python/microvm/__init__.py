@@ -1,10 +1,27 @@
-from .client import MicroVM, MicroVMError, MicroVMHTTPError, Tokens
+from typing import TYPE_CHECKING, Any
+from .client import (
+    DEFAULT_LIST_LIMIT,
+    FileWatchHandle,
+    MicroVM,
+    MicroVMAuthError,
+    MicroVMCapacityError,
+    MicroVMConflictError,
+    MicroVMError,
+    MicroVMFileTooLargeError,
+    MicroVMHTTPError,
+    MicroVMNotFoundError,
+    MicroVMTimeoutError,
+    MicroVMUnsupportedFeatureError,
+    Tokens,
+)
 from .image import Image
 from .types import (
     APIToken,
     APITokenList,
     CreateAPITokenOptions,
     CreatedAPIToken,
+    RevokeSandboxTokensResult,
+    SandboxToken,
     WhoAmI,
     WhoAmIPrincipal,
     AuditEvent,
@@ -18,6 +35,10 @@ from .types import (
     EgressInject,
     EgressRule,
     ListEgressProfilesOptions,
+    WarmPool,
+    WarmPoolOptions,
+    WarmPoolServerStatus,
+    WarmPoolStatus,
     NetworkLearned,
     NetworkLearnedEntry,
     NetworkPolicy,
@@ -32,20 +53,45 @@ from .types import (
     DNSRecord,
     ExposeProtocol,
     ExposeResult,
+    ExposeVisibility,
     Failover,
     FailoverPolicy,
+    FileEvent,
+    FileInfo,
+    FileList,
+    FileMatch,
+    IdentityOptions,
+    IdentityRole,
+    IdentityRoleList,
+    IdentityRoleOptions,
+    PlacementRule,
+    TeamQuota,
+    TeamQuotaOptions,
+    TeamQuotaUsage,
     IngressTarget,
+    ListIdentityRolesOptions,
     MicroVMConfig,
     RetryConfig,
+    SandboxIdentity,
     SandboxSnapshot,
     SnapshotList,
+    StatusReason,
 )
 
 __all__ = [
+    "DEFAULT_LIST_LIMIT",
+    "AsyncExecStreamHandle",
+    "AsyncFileWatchHandle",
+    "AsyncMicroVM",
+    "AsyncSandbox",
+    "AsyncSessionAttachHandle",
+    "AsyncTokens",
     "APIToken",
     "APITokenList",
     "CreateAPITokenOptions",
     "CreatedAPIToken",
+    "RevokeSandboxTokensResult",
+    "SandboxToken",
     "Tokens",
     "WhoAmI",
     "WhoAmIPrincipal",
@@ -59,6 +105,10 @@ __all__ = [
     "EgressInject",
     "EgressRule",
     "ListEgressProfilesOptions",
+    "WarmPool",
+    "WarmPoolOptions",
+    "WarmPoolServerStatus",
+    "WarmPoolStatus",
     "NetworkLearned",
     "NetworkLearnedEntry",
     "NetworkPolicy",
@@ -74,15 +124,72 @@ __all__ = [
     "DNSRecord",
     "Image",
     "MicroVM",
+    "MicroVMAuthError",
+    "MicroVMCapacityError",
+    "MicroVMConflictError",
     "MicroVMError",
+    "MicroVMFileTooLargeError",
     "MicroVMHTTPError",
+    "MicroVMNotFoundError",
+    "MicroVMTimeoutError",
+    "MicroVMUnsupportedFeatureError",
     "ExposeProtocol",
     "ExposeResult",
+    "ExposeVisibility",
     "Failover",
     "FailoverPolicy",
+    "FileEvent",
+    "FileWatchHandle",
+    "FileInfo",
+    "FileList",
+    "FileMatch",
+    "IdentityOptions",
+    "IdentityRole",
+    "IdentityRoleList",
+    "IdentityRoleOptions",
+    "PlacementRule",
+    "TeamQuota",
+    "TeamQuotaOptions",
+    "TeamQuotaUsage",
     "IngressTarget",
+    "ListIdentityRolesOptions",
     "MicroVMConfig",
     "RetryConfig",
+    "SandboxIdentity",
     "SandboxSnapshot",
     "SnapshotList",
+    "StatusReason",
 ]
+
+# The async client lives in .aio, which loads httpx (the optional [async]
+# extra) when it is installed. Importing it only on first use keeps
+# `import microvm` as light as the sync client needs: with httpx installed,
+# an eager import took `import microvm` from about 58 ms to 212 ms.
+_ASYNC_NAMES = (
+    "AsyncExecStreamHandle",
+    "AsyncFileWatchHandle",
+    "AsyncMicroVM",
+    "AsyncSandbox",
+    "AsyncSessionAttachHandle",
+    "AsyncTokens",
+)
+
+if TYPE_CHECKING:  # pragma: no cover - for type checkers only
+    from .aio import (
+        AsyncExecStreamHandle,
+        AsyncFileWatchHandle,
+        AsyncMicroVM,
+        AsyncSandbox,
+        AsyncSessionAttachHandle,
+        AsyncTokens,
+    )
+
+
+def __getattr__(name: str) -> Any:
+    if name in _ASYNC_NAMES:
+        from . import aio
+
+        value = getattr(aio, name)
+        globals()[name] = value
+        return value
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

@@ -90,3 +90,47 @@ func setSecureEnterpriseEnv(t *testing.T) {
 	t.Setenv("SB_SECRET_AUDIT_EXPORT_URL", "https://audit.example/export")
 	t.Setenv("SB_SECRET_AUDIT_EXPORT_BEARER_TOKEN", strings.Repeat("e", minEnterpriseCredentialBytes))
 }
+
+// TestSandboxTokenMaxTTL is the boot table for SB_SANDBOX_TOKEN_MAX_TTL: a
+// 24h default, days or Go durations, and a strict parse and a 30-day
+// ceiling, so a typo never mints tokens that outlive a key rotation's wait.
+func TestSandboxTokenMaxTTL(t *testing.T) {
+	cases := []struct {
+		name    string
+		value   string
+		want    time.Duration
+		wantErr string
+	}{
+		{name: "default", value: "", want: 24 * time.Hour},
+		{name: "minutes", value: "15m", want: 15 * time.Minute},
+		{name: "days", value: "7d", want: 7 * 24 * time.Hour},
+		{name: "the ceiling itself", value: "30d", want: 30 * 24 * time.Hour},
+		{name: "above the ceiling", value: "31d", wantErr: "SB_SANDBOX_TOKEN_MAX_TTL must be between"},
+		{name: "garbage refused, not defaulted", value: "forever", wantErr: "SB_SANDBOX_TOKEN_MAX_TTL"},
+		{name: "zero refused", value: "0s", wantErr: "SB_SANDBOX_TOKEN_MAX_TTL"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("SB_ENTERPRISE_MODE", "false")
+			t.Setenv("SB_PAT_TOKEN", "pat-token")
+			t.Setenv("SB_SANDBOX_TOKEN_MAX_TTL", tc.value)
+			cfg, err := Load()
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("Load error = %v, want %q", err, tc.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			if cfg.SandboxTokenMaxTTL != tc.want {
+				t.Fatalf("SandboxTokenMaxTTL = %v, want %v", cfg.SandboxTokenMaxTTL, tc.want)
+			}
+		})
+	}
+	// A negative cap set in code (not the env, which refuses it) fails too.
+	if err := validateSandboxTokens(&Config{SandboxTokenMaxTTL: -time.Second}); err == nil {
+		t.Fatal("a negative cap passed")
+	}
+}

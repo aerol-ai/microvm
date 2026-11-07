@@ -572,10 +572,12 @@ func TestTeamSelectionStatusesOnEachSurface(t *testing.T) {
 	}
 }
 
-// TestCredentialAuthenticatorChain checks the order (pat, named credentials,
-// provider), that the first match wins, and that identity off drops the
-// named credentials entirely so a token-shaped bearer still reaches the
-// managed provider (L8).
+// TestCredentialAuthenticatorChain checks the order (pat, sandbox tokens,
+// named credentials, provider), that the first match wins, and that
+// identity off drops the named credentials entirely so a token-shaped
+// bearer still reaches the managed provider (L8). The sandbox token
+// authenticator (A1) stays with identity off: it claims only its own
+// avmst_ prefix, so no bearer that reached the provider before changes.
 func TestCredentialAuthenticatorChain(t *testing.T) {
 	oidc := stubCredential{prefix: "eyJ", kind: controlplane.PrincipalOIDC}
 	claimAll := stubCredential{prefix: "", kind: controlplane.PrincipalToken}
@@ -590,13 +592,13 @@ func TestCredentialAuthenticatorChain(t *testing.T) {
 		WithCredentialAuthenticator(controlplane.PrincipalToken, stubTokens()),
 		WithCredentialAuthenticator(controlplane.PrincipalOIDC, oidc),
 		WithCredentialAuthenticator(controlplane.PrincipalOIDC, nil))
-	if got := strings.Join(kinds(on), ","); got != "operator,token,oidc,unknown" {
+	if got := strings.Join(kinds(on), ","); got != "operator,sandbox_token,token,oidc,unknown" {
 		t.Fatalf("identity-on chain = %s", got)
 	}
 	managed := stubValidator{accept: "avm_payments", identity: controlplane.Identity{OwnerRef: "acct"}}
 	off := NewServer(discardLogger(), nil, nil, nil, config.Config{}, "pat-token", managed,
 		WithCredentialAuthenticator(controlplane.PrincipalToken, stubTokens()))
-	if got := strings.Join(kinds(off), ","); got != "operator,controlplane" {
+	if got := strings.Join(kinds(off), ","); got != "operator,sandbox_token,controlplane" {
 		t.Fatalf("identity-off chain = %s; named credentials must be dropped", got)
 	}
 	// With identity off, an avm_-looking bearer is the managed provider's.

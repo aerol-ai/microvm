@@ -4,7 +4,15 @@ import type { AddressInfo } from "node:net";
 import test from "node:test";
 
 import { APIClient, SandboxResource, newIdempotencyKey, parseRetryAfter, retryDelayMs } from "./client.js";
-import { MicroVMApiError } from "../errors.js";
+import {
+  MicroVMApiError,
+  MicroVMAuthError,
+  MicroVMCapacityError,
+  MicroVMConflictError,
+  MicroVMNotFoundError,
+  MicroVMTimeoutError,
+  MicroVMUnsupportedFeatureError,
+} from "../errors.js";
 import { Image } from "../Image.js";
 import type { CreateOptions, Sandbox } from "../types.js";
 
@@ -80,15 +88,17 @@ test("internal client create serializes platform volumes", async () => {
     platformVolumes: [
       { name: "data", path: "/workspace" },
       { name: "cache", path: "/cache", readOnly: true },
+      { name: "scratch", path: "/scratch", deleteWithSandbox: true },
     ],
   });
   assert.ok(seenRequest);
   const body = (await seenRequest.json()) as Record<string, unknown>;
-  // read_only is omitted (undefined) for the read-write entry after JSON
-  // serialization, and present+true for the read-only one.
+  // read_only and delete_with_sandbox are omitted (undefined) when unset
+  // after JSON serialization, and present+true when set.
   assert.deepEqual(body.platform_volumes, [
     { name: "data", path: "/workspace" },
     { name: "cache", path: "/cache", read_only: true },
+    { name: "scratch", path: "/scratch", delete_with_sandbox: true },
   ]);
 });
 
@@ -378,6 +388,65 @@ test("internal client create round-trips serverless lifecycle flag", async () =>
   });
   assert.equal(sandbox.lifecycle.serverless, true);
   assert.equal(sandbox.lifecycle.stopIfIdleFor, 300_000_000_000);
+});
+
+test("internal client create round-trips restartOnFailure", async () => {
+  let seenRequest: Request | undefined;
+  const client = new APIClient({
+    baseURL: "https://api.example.com",
+    patToken: "pat-token",
+    fetch: async (input, init) => {
+      seenRequest = new Request(input, init);
+      return jsonResponse(apiSandbox("sb-restart", { lifecycle: { restart_on_failure: true } }));
+    },
+  });
+
+  const sandbox = await client.create({ image: "ubuntu:22.04", lifecycle: { restartOnFailure: true } });
+
+  assert.ok(seenRequest);
+  const body = (await seenRequest.json()) as { lifecycle?: Record<string, unknown> };
+  assert.deepEqual(body.lifecycle, { restart_on_failure: true });
+  assert.equal(sandbox.lifecycle.restartOnFailure, true);
+});
+
+test("internal client sends destroyAt as an RFC 3339 string", async () => {
+  const bodies: Record<string, unknown>[] = [];
+  const client = new APIClient({
+    baseURL: "https://api.example.com",
+    patToken: "pat-token",
+    fetch: async (input, init) => {
+      bodies.push((await new Request(input, init).json()) as Record<string, unknown>);
+      return jsonResponse(apiSandbox("sb-at", { lifecycle: { destroy_at_age: 3_600_000_000_000 } }));
+    },
+  });
+
+  const sandbox = await client.create({ image: "ubuntu:22.04", lifecycle: { destroyAt: new Date("2026-11-06T18:00:00Z") } });
+  await sandbox.updateLifecycle({ destroyAt: "2026-11-06T19:00:00+05:30" });
+
+  assert.deepEqual(bodies[0].lifecycle, { destroy_at: "2026-11-06T18:00:00.000Z" });
+  assert.deepEqual(bodies[1], { destroy_at: "2026-11-06T19:00:00+05:30" });
+  // The server answers with the age it stored.
+  assert.equal(sandbox.lifecycle.destroyAtAge, 3_600_000_000_000);
+  assert.equal(sandbox.lifecycle.destroyAt, undefined);
+});
+
+test("internal client create round-trips destroyAfterExitFor", async () => {
+  let seenRequest: Request | undefined;
+  const client = new APIClient({
+    baseURL: "https://api.example.com",
+    patToken: "pat-token",
+    fetch: async (input, init) => {
+      seenRequest = new Request(input, init);
+      return jsonResponse(apiSandbox("sb-exit", { lifecycle: { destroy_after_exit_for: 60_000_000_000 } }));
+    },
+  });
+
+  const sandbox = await client.create({ image: "ubuntu:22.04", lifecycle: { destroyAfterExitFor: 60_000_000_000 } });
+
+  assert.ok(seenRequest);
+  const body = (await seenRequest.json()) as { lifecycle?: Record<string, unknown> };
+  assert.deepEqual(body.lifecycle, { destroy_after_exit_for: 60_000_000_000 });
+  assert.equal(sandbox.lifecycle.destroyAfterExitFor, 60_000_000_000);
 });
 
 test("internal client uploadFile sends multipart form", async () => {
@@ -979,6 +1048,131 @@ test("internal client create with bare image string skips build call", async () 
   await client.create({ image: "ubuntu:22.04" });
   assert.equal(seenURLs.length, 1);
   assert.ok(seenURLs[0].endsWith("/v1/sandboxes"));
+});
+
+test("exposePort sends visibility only when set and maps a token port", async () => {
+  const bodies: (string | null)[] = [];
+  const client = new APIClient({
+    baseURL: "https://api.example.com",
+    patToken: "pat-token",
+    fetch: async (input, init) => {
+      const req = new Request(input, init);
+      const text = await req.text();
+      bodies.push(text === "" ? null : text);
+      const sent = text === "" ? {} : JSON.parse(text);
+      return jsonResponse({
+        protocol: "http",
+        public_url: "https://sb-1-3000.example.com",
+        ...(sent.visibility === "token" ? { visibility: "token" } : {}),
+      });
+    },
+  });
+  const gated = await client.exposePort("sb-1", 3000, { visibility: "token" });
+  assert.deepEqual(gated, { protocol: "http", url: "https://sb-1-3000.example.com", visibility: "token" });
+  const plain = await client.exposePort("sb-1", 3000);
+  assert.deepEqual(plain, { protocol: "http", url: "https://sb-1-3000.example.com" });
+  await client.exposePort("sb-1", 5432, { protocol: "tcp" });
+  assert.deepEqual(bodies, ['{"visibility":"token"}', null, '{"protocol":"tcp"}']);
+});
+
+test("sandbox createToken POSTs the scope and maps the answer", async () => {
+  const seen: Request[] = [];
+  const bodies: unknown[] = [];
+  const client = new APIClient({
+    baseURL: "https://api.example.com",
+    patToken: "pat-token",
+    fetch: async (input, init) => {
+      const req = new Request(input, init);
+      seen.push(req);
+      if (req.url.endsWith("/tokens")) {
+        bodies.push(await req.json());
+        return jsonResponse(
+          {
+            token: "avmst_0.payload.sig",
+            token_id: "stk_abc",
+            sandbox_id: "sb-tok",
+            path_prefix: "/files",
+            methods: ["GET"],
+            expires_at: "2026-11-06T10:15:00Z",
+          },
+          201,
+        );
+      }
+      return jsonResponse(apiSandbox("sb-tok"));
+    },
+  });
+  const sandbox = await client.get("sb-tok");
+  const tok = await sandbox.createToken({ expiresIn: "15m", pathPrefix: "/files", methods: ["GET"] });
+  const post = seen[seen.length - 1];
+  assert.equal(post.method, "POST");
+  assert.equal(post.url, "https://api.example.com/v1/sandboxes/sb-tok/tokens");
+  assert.deepEqual(bodies[0], { expires_in: "15m", path_prefix: "/files", methods: ["GET"] });
+  assert.deepEqual(tok, {
+    token: "avmst_0.payload.sig",
+    tokenID: "stk_abc",
+    sandboxID: "sb-tok",
+    pathPrefix: "/files",
+    methods: ["GET"],
+    expiresAt: "2026-11-06T10:15:00Z",
+  });
+
+  // A port token sends only the port; empty options are left out.
+  await client.createSandboxToken("sb-tok", { expiresIn: "1h", port: 3000, methods: [] });
+  assert.deepEqual(bodies[1], { expires_in: "1h", port: 3000 });
+});
+
+test("sandbox createToken surfaces a 400 as an API error", async () => {
+  const client = new APIClient({
+    baseURL: "https://api.example.com",
+    patToken: "pat-token",
+    fetch: async () => jsonResponse({ error: "invalid sandbox token request: expires_in is required" }, 400),
+  });
+  await assert.rejects(client.createSandboxToken("sb-tok", { expiresIn: "" }), (err: unknown) => {
+    assert.ok(err instanceof MicroVMApiError);
+    assert.equal(err.status, 400);
+    return true;
+  });
+});
+
+test("sandbox revokeTokens POSTs no body to the revoke route and maps the answer", async () => {
+  const seen: Request[] = [];
+  const bodies: (string | null)[] = [];
+  const client = new APIClient({
+    baseURL: "https://api.example.com",
+    patToken: "pat-token",
+    fetch: async (input, init) => {
+      const req = new Request(input, init);
+      seen.push(req);
+      if (req.url.endsWith("/tokens/revoke")) {
+        bodies.push(await req.text());
+        return jsonResponse({ sandbox_id: "sb-tok", tokens_not_before: "2026-11-07T10:00:01Z" });
+      }
+      return jsonResponse(apiSandbox("sb-tok"));
+    },
+  });
+  const sandbox = await client.get("sb-tok");
+  const result = await sandbox.revokeTokens();
+  const post = seen[seen.length - 1];
+  assert.equal(post.method, "POST");
+  assert.equal(post.url, "https://api.example.com/v1/sandboxes/sb-tok/tokens/revoke");
+  assert.deepEqual(result, { sandboxID: "sb-tok", tokensNotBefore: "2026-11-07T10:00:01Z" });
+
+  // The client call by id is the same request.
+  assert.deepEqual(await client.revokeSandboxTokens("sb-tok"), result);
+  assert.deepEqual(bodies, ["", ""]);
+});
+
+test("sandbox revokeTokens surfaces a 404 as an API error", async () => {
+  const client = new APIClient({
+    baseURL: "https://api.example.com",
+    patToken: "pat-token",
+    fetch: async () => jsonResponse({ error: "sandbox not found" }, 404),
+  });
+  await assert.rejects(client.revokeSandboxTokens("sb-none"), (err: unknown) => {
+    assert.ok(err instanceof MicroVMApiError);
+    assert.equal(err.status, 404);
+    return true;
+  });
 });
 
 test("internal client addCustomDomain POSTs hostname and parses list", async () => {
@@ -1689,6 +1883,8 @@ test("sandbox.audit reads its own sandbox's log", async () => {
   const sandbox = await client.create({ image: "ubuntu:22.04" });
   await sandbox.audit({ kind: "egress" });
   assert.ok(urls[urls.length - 1].endsWith("/v1/sandboxes/sb-own/audit?kind=egress"));
+  await sandbox.audit({ caller: "system:*" });
+  assert.ok(urls[urls.length - 1].endsWith("/v1/sandboxes/sb-own/audit?caller=system%3A*"));
 });
 
 test("get maps egress_status for gateway-mode sandboxes", async () => {
@@ -1699,6 +1895,28 @@ test("get maps egress_status for gateway-mode sandboxes", async () => {
   });
   const sandbox = await client.get("sb-eg");
   assert.equal(sandbox.egressStatus, "held");
+});
+
+test("get maps status_reason and exit_code, keeping exit code 0", async () => {
+  const rows: Record<string, unknown> = {
+    "sb-crash": { ...apiSandbox("sb-crash"), status: "stopped", status_reason: "crashed", exit_code: 3 },
+    "sb-done": { ...apiSandbox("sb-done"), status_reason: "program_exited", exit_code: 0 },
+    "sb-plain": { ...apiSandbox("sb-plain"), exit_code: null },
+  };
+  const client = new APIClient({
+    baseURL: "https://api.example.com",
+    patToken: "pat-token",
+    fetch: async (input) => jsonResponse(rows[String(input).split("/").pop() as string]),
+  });
+  const crashed = await client.get("sb-crash");
+  assert.equal(crashed.statusReason, "crashed");
+  assert.equal(crashed.exitCode, 3);
+  const done = await client.get("sb-done");
+  assert.equal(done.statusReason, "program_exited");
+  assert.equal(done.exitCode, 0);
+  const plain = await client.get("sb-plain");
+  assert.equal(plain.statusReason, undefined);
+  assert.equal(plain.exitCode, undefined);
 });
 
 test("checkNetworkPolicy posts the policy and maps the answer", async () => {
@@ -1783,6 +2001,83 @@ test("egress profile CRUD maps the wire shape", async () => {
   assert.deepEqual(await client.listEgressProfiles(), { profiles: [] });
   await client.deleteEgressProfile("python");
   assert.equal(seen[4].method, "DELETE");
+});
+
+test("warm pool CRUD maps the wire shape and keeps an image's slashes", async () => {
+  const seen: { method: string; url: string; body?: unknown }[] = [];
+  const wire = {
+    image: "ghcr.io/acme/agent:1",
+    depth: 2,
+    generation: 1,
+    created_at: "c",
+    updated_at: "u",
+    status: { ready: 3, target: 4, servers: [{ node_id: "n1", ready: 2, target: 2 }, { node_id: "n2", ready: 1, target: 2, stale: true }] },
+  };
+  const client = new APIClient({
+    baseURL: "https://api.example.com",
+    patToken: "pat-token",
+    fetch: async (input, init) => {
+      const req = new Request(input, init);
+      seen.push({ method: req.method, url: req.url, body: init?.body ? JSON.parse(String(init.body)) : undefined });
+      if (req.method === "DELETE") return new Response(null, { status: 204 });
+      if (req.method === "PUT") return jsonResponse({ ...wire, status: undefined });
+      if (req.url.endsWith("/warm-pools")) return jsonResponse({ pools: seen.length > 3 ? null : [wire] });
+      return jsonResponse(wire);
+    },
+  });
+  const put = await client.putWarmPool("ghcr.io/acme/agent:1", { depth: 2 });
+  assert.deepEqual(put, { image: "ghcr.io/acme/agent:1", depth: 2, onImageChange: "replace_now", generation: 1, createdAt: "c", updatedAt: "u" });
+  assert.deepEqual(seen[0], { method: "PUT", url: "https://api.example.com/v1/warm-pools/ghcr.io/acme/agent%3A1", body: { depth: 2 } });
+  const got = await client.getWarmPool("ghcr.io/acme/agent:1");
+  assert.deepEqual(got.status, {
+    ready: 3,
+    target: 4,
+    outdated: 0,
+    servers: [
+      { nodeId: "n1", ready: 2, target: 2, outdated: 0 },
+      { nodeId: "n2", ready: 1, target: 2, outdated: 0, stale: true },
+    ],
+  });
+  assert.equal((await client.listWarmPools())[0].status?.servers.length, 2);
+  assert.deepEqual(await client.listWarmPools(), []);
+  await client.deleteWarmPool("python:3.12");
+  assert.deepEqual(seen[4], { method: "DELETE", url: "https://api.example.com/v1/warm-pools/python%3A3.12", body: undefined });
+});
+
+test("a warm pool that follows demand sends and maps its range", async () => {
+  let body: unknown;
+  const client = new APIClient({
+    baseURL: "https://api.example.com",
+    patToken: "pat-token",
+    fetch: async (input, init) => {
+      body = init?.body ? JSON.parse(String(init.body)) : undefined;
+      return jsonResponse({ image: "python:3.12", depth: 0, min_depth: 1, max_depth: 4, generation: 1, created_at: "c", updated_at: "u" });
+    },
+  });
+  const pool = await client.putWarmPool("python:3.12", { minDepth: 1, maxDepth: 4 });
+  assert.deepEqual(body, { depth: 0, min_depth: 1, max_depth: 4 });
+  assert.equal(pool.minDepth, 1);
+  assert.equal(pool.maxDepth, 4);
+});
+
+test("a warm pool sends its image-change strategy and maps outdated slots", async () => {
+  let body: unknown;
+  const client = new APIClient({
+    baseURL: "https://api.example.com",
+    patToken: "pat-token",
+    fetch: async (input, init) => {
+      body = init?.body ? JSON.parse(String(init.body)) : undefined;
+      return jsonResponse({
+        image: "python:3.12", depth: 2, on_image_change: "replace_as_used", generation: 1, created_at: "c", updated_at: "u",
+        status: { ready: 2, target: 2, outdated: 1, servers: [{ node_id: "n1", ready: 2, target: 2, outdated: 1 }] },
+      });
+    },
+  });
+  const pool = await client.putWarmPool("python:3.12", { depth: 2, onImageChange: "replace_as_used" });
+  assert.deepEqual(body, { depth: 2, on_image_change: "replace_as_used" });
+  assert.equal(pool.onImageChange, "replace_as_used");
+  assert.equal(pool.status?.outdated, 1);
+  assert.equal(pool.status?.servers[0].outdated, 1);
 });
 
 test("sandboxes carry their egress profiles", async () => {
@@ -2199,6 +2494,48 @@ test("internal client errors carry status, code and Retry-After", async () => {
   }
 });
 
+// Each common status throws its own MicroVMApiError subclass, so a caller can
+// test for the case it handles; MicroVMApiError (and its name) still match.
+test("internal client throws a typed error per status", async () => {
+  const cases: Array<[number, Function]> = [
+    [401, MicroVMAuthError],
+    [403, MicroVMAuthError],
+    [404, MicroVMNotFoundError],
+    [408, MicroVMTimeoutError],
+    [409, MicroVMConflictError],
+    [503, MicroVMCapacityError],
+    [504, MicroVMTimeoutError],
+    // Statuses without a class of their own stay MicroVMApiError.
+    [400, MicroVMApiError],
+    [412, MicroVMApiError],
+    [422, MicroVMApiError],
+    [500, MicroVMApiError],
+    [502, MicroVMApiError],
+  ];
+  const bodies: Array<[string, () => BodyInit, string, string | undefined]> = [
+    ["JSON body", () => JSON.stringify({ error: "nope", code: "some_code" }), "nope", "some_code"],
+    ["proxy page", () => "<html>error</html>", "", undefined],
+  ];
+  for (const [status, want] of cases) {
+    for (const [label, body, message, code] of bodies) {
+      const client = new APIClient({
+        baseURL: "https://api.example.com",
+        patToken: "pat-token",
+        retry: { maxRetries: 0 },
+        fetch: async () => new Response(body(), { status, headers: { "content-type": "application/json" } }),
+      });
+      const err = await client.get("sb-1").catch((e: unknown) => e);
+      const name = `${status} ${label}`;
+      assert.ok(err instanceof MicroVMApiError, name);
+      assert.equal(Object.getPrototypeOf(err).constructor, want, name);
+      assert.equal(err.name, "MicroVMApiError", name);
+      assert.equal(err.status, status, name);
+      assert.equal(err.code, code, name);
+      assert.equal(err.message, message || `request failed with status ${status}`, name);
+    }
+  }
+});
+
 test("internal client error Retry-After reads seconds and HTTP dates", async () => {
   const at = Date.now() + 60_000;
   const cases: Array<[string, (ms: number | undefined) => boolean]> = [
@@ -2319,4 +2656,101 @@ test("newIdempotencyKey is 32 hex characters and unique", () => {
     seen.add(key);
   }
   assert.equal(seen.size, 1000);
+});
+
+test("requireToolboxFeatures passes listed features and caches them", async () => {
+  const seen: string[] = [];
+  const client = new APIClient({
+    baseURL: "https://api.example.com",
+    patToken: "pat-token",
+    fetch: async (input, init) => {
+      seen.push(new URL(new Request(input, init).url).pathname);
+      return jsonResponse({ version: "v9", features: ["files.copy", "exec.argv"] });
+    },
+  });
+  await client.requireToolboxFeatures("sb-1", "files.copy");
+  await client.requireToolboxFeatures("sb-1", "exec.argv", "files.copy");
+  assert.deepEqual(seen, ["/v1/sandboxes/sb-1/toolbox/version"]);
+});
+
+test("requireToolboxFeatures fails closed on a missing feature or an older agent", async () => {
+  for (const body of [{ version: "v9", features: ["files.copy"] }, { version: "v8" }]) {
+    const client = new APIClient({
+      baseURL: "https://api.example.com",
+      patToken: "pat-token",
+      fetch: async () => jsonResponse(body),
+    });
+    await assert.rejects(client.requireToolboxFeatures("sb-1", "exec.argv"), (err: unknown) => {
+      assert.ok(err instanceof MicroVMUnsupportedFeatureError);
+      assert.deepEqual(err.features, ["exec.argv"]);
+      return true;
+    });
+  }
+});
+
+test("requireToolboxFeatures names a runtime that cannot offer the feature", async () => {
+  const client = new APIClient({
+    baseURL: "https://api.example.com",
+    patToken: "pat-token",
+    fetch: async () => jsonResponse({ version: "v9", features: [], runtime: "wasm" }),
+  });
+  await assert.rejects(client.requireToolboxFeatures("sb-w", "files.verbs"), (err: unknown) => {
+    assert.ok(err instanceof MicroVMUnsupportedFeatureError);
+    assert.equal(err.runtime, "wasm");
+    assert.match(err.message, /is a WebAssembly sandbox, which does not support files\.verbs/);
+    assert.doesNotMatch(err.message, /restart/);
+    return true;
+  });
+  assert.match(new MicroVMUnsupportedFeatureError("s", ["x"], "", "isolate").message, /V8 isolate/);
+});
+
+test("internal client create sends a placement rule", async () => {
+  let seenRequest: Request | undefined;
+  const client = new APIClient({
+    baseURL: "https://api.example.com",
+    patToken: "pat-token",
+    fetch: async (input, init) => {
+      seenRequest = new Request(input, init);
+      return jsonResponse(apiSandbox("sb-placed"));
+    },
+  });
+  await client.create({
+    image: "ubuntu:22.04",
+    placement: { zone: "eu-west-1a", labels: { tier: "pci" } },
+  });
+  assert.ok(seenRequest);
+  const body = (await seenRequest.json()) as Record<string, unknown>;
+  assert.deepEqual(body.placement, { zone: "eu-west-1a", labels: { tier: "pci" } });
+
+  await client.create({ image: "ubuntu:22.04" });
+  const plain = (await seenRequest.json()) as Record<string, unknown>;
+  assert.equal("placement" in plain, false);
+});
+
+test("team quota calls map the wire shape", async () => {
+  const seen: { method: string; url: string; body?: unknown }[] = [];
+  const quota = {
+    team: "risk", max_sandboxes: 3, max_cpu: 4, generation: 1, created_at: "c", updated_at: "u",
+    usage: { sandboxes: 2, cpu: 1.5, memory_mb: 1024 },
+  };
+  const client = new APIClient({
+    baseURL: "https://api.example.com",
+    patToken: "pat-token",
+    fetch: async (input, init) => {
+      const req = new Request(input, init);
+      seen.push({ method: req.method, url: req.url, body: init?.body ? JSON.parse(String(init.body)) : undefined });
+      if (req.method === "DELETE") return new Response(null, { status: 204 });
+      return jsonResponse(quota);
+    },
+  });
+  const put = await client.putTeamQuota("risk", { maxSandboxes: 3, maxCPU: 4 });
+  assert.deepEqual(put, {
+    team: "risk", maxSandboxes: 3, maxCPU: 4, generation: 1, createdAt: "c", updatedAt: "u",
+    usage: { sandboxes: 2, cpu: 1.5, memoryMB: 1024 },
+  });
+  assert.deepEqual(seen[0], { method: "PUT", url: "https://api.example.com/v1/teams/risk/quota", body: { max_sandboxes: 3, max_cpu: 4 } });
+  assert.equal((await client.getTeamQuota("risk")).usage?.sandboxes, 2);
+  assert.equal(seen[1].method, "GET");
+  await client.deleteTeamQuota("risk");
+  assert.deepEqual({ method: seen[2].method, url: seen[2].url }, { method: "DELETE", url: "https://api.example.com/v1/teams/risk/quota" });
 });

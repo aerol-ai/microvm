@@ -427,6 +427,14 @@ func TestWriteStoreAwareError_ModuleTooLarge(t *testing.T) {
 	}
 }
 
+// ER5: an exec body too large for sandboxd to apply the operator's maximum.
+func TestWriteStoreAwareError_ExecRequestTooLarge(t *testing.T) {
+	code, _ := storeAwareErr(t, fmt.Errorf("wrap: %w", service.ErrExecRequestTooLarge))
+	if code != http.StatusRequestEntityTooLarge {
+		t.Errorf("status = %d, want 413", code)
+	}
+}
+
 func TestWriteStoreAwareError_ComponentModelUnsupported(t *testing.T) {
 	code, _ := storeAwareErr(t, wasmmod.ErrComponentModelUnsupported)
 	if code != http.StatusUnprocessableEntity {
@@ -505,6 +513,18 @@ func TestWriteStoreAwareError_EgressOperatorConfigInvalid(t *testing.T) {
 	_ = json.Unmarshal(rr.Body.Bytes(), &body)
 	if rr.Code != http.StatusServiceUnavailable || body.Code != models.ErrorCodeEgressOperatorConfigInvalid {
 		t.Fatalf("status=%d code=%q", rr.Code, body.Code)
+	}
+}
+
+// TestWriteStoreAwareError_CreatePolicyDenied: the wire body a refused
+// create gets carries the code and a message that names the rule.
+func TestWriteStoreAwareError_CreatePolicyDenied(t *testing.T) {
+	rr := httptest.NewRecorder()
+	WriteStoreAwareError(discardLogger(), rr, fmt.Errorf("create: %w", &models.CreatePolicyError{Rule: "limits.max_cpu", Detail: "cpu 8 is above this server's limit of 4"}))
+	var body models.ErrorResponse
+	_ = json.Unmarshal(rr.Body.Bytes(), &body)
+	if rr.Code != http.StatusForbidden || body.Code != models.ErrorCodeCreatePolicyDenied || !strings.Contains(body.Error, `"limits.max_cpu"`) {
+		t.Fatalf("status=%d code=%q error=%q", rr.Code, body.Code, body.Error)
 	}
 }
 

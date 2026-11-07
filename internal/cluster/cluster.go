@@ -179,6 +179,20 @@ var ErrNoEgressGatewayTarget = fmt.Errorf("%w: no node has a ready egress gatewa
 // from a fleet that cannot run the request at all.
 var ErrClusterAtCapacity = fmt.Errorf("%w: every worker that can run this sandbox is at capacity (cpu, memory, disk or network slots)", ErrNoPlacementTarget)
 
+// ErrPlacementUnsatisfiable is a create whose placement rule (zone and node
+// labels, plans/placement-rules.md) no live worker's heartbeat satisfies. It
+// is deliberately NOT an ErrNoPlacementTarget: that is a retryable 503, and
+// waiting does not make a node grow a label. The API answers 409
+// placement_unsatisfiable naming the rule.
+var ErrPlacementUnsatisfiable = models.ErrPlacementUnsatisfiable
+
+// ErrPlacementRulesUnsupported is a create with a placement rule that reached
+// a control plane too old to filter on labels (it answered without saying it
+// checked them). The agent fails closed rather than trust a target picked
+// without the rule; it stays an ErrNoPlacementTarget, so the create is a
+// retryable 503 that succeeds once the server tier is upgraded.
+var ErrPlacementRulesUnsupported = fmt.Errorf("%w: the control plane runs a build that cannot apply placement rules yet", ErrNoPlacementTarget)
+
 // ErrInvalidTopology is returned when the live cluster shape violates a
 // production topology invariant. API layers translate this to 503 so clients
 // retry after the operator fixes membership instead of treating it as a
@@ -366,6 +380,10 @@ type ExposedPortRoute struct {
 	Protocol  string `json:"protocol"`
 	HostPort  int    `json:"host_port,omitempty"`
 	PublicURL string `json:"public_url,omitempty"`
+	// Visibility is "token" for a port whose public URL needs a sandbox
+	// token (A2), so a failover recreate gates it again; omitted for a
+	// public port, so every placement written before it decodes the same.
+	Visibility string `json:"visibility,omitempty"`
 }
 
 // ExposedPorts is the legacy replicated set of port→protocol intents. Newer
@@ -411,8 +429,14 @@ type Placement struct {
 	// sandbox without profiles.
 	EgressProfiles        []string `json:"egress_profiles,omitempty"`
 	EgressInlineHostnames int      `json:"egress_inline_hostnames,omitempty"`
-	SecretRef             string   `json:"secret_ref,omitempty"`
-	SecretVersion         int      `json:"secret_version,omitempty"`
+	// QuotaCPU / QuotaMemoryMB mirror the size a team's sandbox asked for
+	// (Spec.CPU / Spec.MemoryMB with server defaults) on the HOT row, so the
+	// FSM's team-usage index is rebuilt on Restore without hydrating specs
+	// (fsm_team_quotas.go). Zero for a sandbox no team owns.
+	QuotaCPU      float64 `json:"quota_cpu,omitempty"`
+	QuotaMemoryMB int     `json:"quota_memory_mb,omitempty"`
+	SecretRef     string  `json:"secret_ref,omitempty"`
+	SecretVersion int     `json:"secret_version,omitempty"`
 	// SecretRecipients is the seal recipient set recorded at reserve time
 	// (owner + N backups). The create target seals to this set and must not
 	// recompute it. It is empty only when the placement has no replicated
@@ -823,6 +847,10 @@ type Client interface {
 	// volume. Put/Delete keep this index in the same raft log as volume metadata
 	// so Daytona delete cannot miss a sandbox that lives on another worker.
 	VolumeAttachmentCount(ctx context.Context, tenant, id string) (int, error)
+	// VolumeAttachmentsForSandbox lists the attachments one sandbox holds
+	// (a destroy finds its delete_with_sandbox volumes with it). Read-only;
+	// an agent asks a server, which answers from its replicated FSM.
+	VolumeAttachmentsForSandbox(ctx context.Context, sandboxID string) ([]models.VolumeAttachment, error)
 	PutVolumeAttachments(ctx context.Context, attachments []models.VolumeAttachment) error
 	DeleteVolumeAttachmentsForSandbox(ctx context.Context, sandboxID, incarnationID string) error
 

@@ -39,11 +39,22 @@ func TestClassify(t *testing.T) {
 		kind       ErrKind
 	}{
 		{"not found", store.ErrNotFound, http.StatusNotFound, 0, "", ErrKindNotFound},
+		{"token visibility invalid", service.ErrTokenVisibilityInvalid, http.StatusBadRequest, 0, "", ErrKindOther},
+		{"token visibility unavailable", fmt.Errorf("%w: needs a domain", service.ErrTokenVisibilityUnavailable), http.StatusBadRequest, 0, "", ErrKindOther},
+		{"token visibility conflict", service.ErrTokenVisibilityConflict, http.StatusConflict, 0, "", ErrKindOther},
+		{"sandbox token request invalid", fmt.Errorf("%w: expires_in is required", service.ErrSandboxTokenInvalid), http.StatusBadRequest, 0, "", ErrKindOther},
+		{"sandbox tokens unavailable", service.ErrSandboxTokensUnavailable, http.StatusServiceUnavailable, 0, "", ErrKindOther},
+		{"sandbox token revoked", service.ErrSandboxTokenRevoked, http.StatusUnauthorized, 0, "", ErrKindOther},
 		// Load shedding: a fast retryable 503, never the 400 catch-all.
 		{"overloaded", ErrOverloaded, http.StatusServiceUnavailable, OverloadedRetryAfterSeconds, models.ErrorCodeOverloaded, ErrKindOther},
 		{"overloaded while the caller left", fmt.Errorf("%w: %w", ErrOverloaded, context.Canceled), http.StatusServiceUnavailable, OverloadedRetryAfterSeconds, models.ErrorCodeOverloaded, ErrKindOther},
 		{"rate limited (the tenant's own share)", ErrRateLimited, http.StatusTooManyRequests, RateLimitedRetryAfterSeconds, models.ErrorCodeRateLimited, ErrKindOther},
 		{"admission denied", controlplane.ErrAdmissionDenied, http.StatusForbidden, 0, "", ErrKindOther},
+		// The operator create policy: a definite 403 naming the rule, and a
+		// fail-closed 503 while a set file has not loaded.
+		{"create policy denied", &models.CreatePolicyError{Rule: "runtimes", Detail: "runtime \"docker\" is not allowed"}, http.StatusForbidden, 0, models.ErrorCodeCreatePolicyDenied, ErrKindOther},
+		{"create policy invalid", service.ErrCreatePolicyInvalid, http.StatusServiceUnavailable, 0, models.ErrorCodeCreatePolicyInvalid, ErrKindOther},
+		{"platform volume delete_with_sandbox conflict", models.ErrPlatformVolumeConflict, http.StatusConflict, 0, "", ErrKindOther},
 		{"admission unavailable", controlplane.ErrAdmissionUnavailable, http.StatusServiceUnavailable, admissionRetryAfterSeconds, "", ErrKindOther},
 		{"engine not registered", models.ErrContainerEngineNotRegistered, http.StatusServiceUnavailable, admissionRetryAfterSeconds, "", ErrKindOther},
 		{"cluster finalization", service.ErrClusterFinalizationUnavailable, http.StatusServiceUnavailable, 5, "", ErrKindOther},
@@ -70,6 +81,17 @@ func TestClassify(t *testing.T) {
 		{"egress gateway", service.ErrEgressGatewayUnavailable, http.StatusServiceUnavailable, 5, models.ErrorCodeEgressGatewayUnavailable, ErrKindOther},
 		{"egress inspect recreate", service.ErrEgressInspectRecreate, http.StatusConflict, 0, "", ErrKindOther},
 		{"capacity", cluster.ErrCapacityExceeded, http.StatusServiceUnavailable, cluster.CapacityRetryAfterSeconds, "", ErrKindOther},
+		// A placement rule no node satisfies: 409 with its code and no
+		// Retry-After (waiting gives no node a label); malformed is a 400.
+		{"placement unsatisfiable", models.PlacementUnsatisfiableError(map[string]string{"zone": "z1"}), http.StatusConflict, 0, models.ErrorCodePlacementUnsatisfiable, ErrKindOther},
+		{"placement invalid", fmt.Errorf("%w: bad", models.ErrInvalidPlacement), http.StatusBadRequest, 0, "", ErrKindUnclassified},
+		{"control plane without placement rules", cluster.ErrPlacementRulesUnsupported, http.StatusServiceUnavailable, 0, "", ErrKindOther},
+		// Team quotas: 429 with its code and no Retry-After (only a delete or
+		// a raised quota frees room); a missing quota is 404; an unreachable
+		// quota store is a retryable 503.
+		{"team quota exceeded", models.CheckTeamQuota("risk", models.TeamQuotaRequest{MaxSandboxes: 1}, models.TeamQuotaUsage{Sandboxes: 1}, models.TeamQuotaUsage{Sandboxes: 1}), http.StatusTooManyRequests, 0, models.ErrorCodeTeamQuotaExceeded, ErrKindOther},
+		{"team quota not found", models.ErrTeamQuotaNotFound, http.StatusNotFound, 0, "", ErrKindOther},
+		{"team quota unavailable", service.ErrTeamQuotaUnavailable, http.StatusServiceUnavailable, 5, "", ErrKindOther},
 		{"backpressure", cluster.ErrCreateBackpressure, http.StatusTooManyRequests, cluster.CreateBackpressureRetryAfterSeconds, "", ErrKindOther},
 		{"not leader", cluster.ErrNotLeader, http.StatusServiceUnavailable, cluster.LeaderChangeRetryAfterSeconds, "", ErrKindOther},
 		{"no leader", fmt.Errorf("storage retirement: %w", cluster.ErrNoLeader), http.StatusServiceUnavailable, cluster.LeaderChangeRetryAfterSeconds, "", ErrKindOther},

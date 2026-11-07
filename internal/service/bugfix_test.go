@@ -448,3 +448,26 @@ func TestCreateSandboxNameConflictReturnsError(t *testing.T) {
 		t.Fatalf("error = %v, want ErrSandboxNameConflict", err)
 	}
 }
+
+// An expose marked WithoutPortProbe (E2B's mcp gateway, whose process the
+// SDK starts only after the create) skips the probe; the route still goes in.
+func TestExposePortWithoutPortProbeSkipsTheProbe(t *testing.T) {
+	ctx := context.Background()
+	var probeCalls int
+	svc, st := newProbeSvc(t, func(_ context.Context, ip string, port int) error {
+		probeCalls++
+		return nil
+	})
+	seedStartedSandboxAt(t, ctx, st, "sb-probe-skip", "10.0.0.11")
+
+	resp, err := svc.ExposePort(WithoutPortProbe(ctx), "sb-probe-skip", 50005, models.ExposedPortProtocolHTTP)
+	if err != nil {
+		t.Fatalf("ExposePort: %v", err)
+	}
+	if probeCalls != 0 {
+		t.Fatalf("probe calls = %d, want 0", probeCalls)
+	}
+	if resp.PublicURL == "" {
+		t.Fatalf("ExposePort answered no URL: %+v", resp)
+	}
+}

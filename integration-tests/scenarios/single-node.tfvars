@@ -44,3 +44,8 @@ nodes = {
     spot = true
   }
 }
+
+# Sandbox cloud identity (plans/sandbox-cloud-identity.md, UC-431..437):
+# every node is an OIDC issuer at https://<domain> (capability
+# cloud-identity).
+identity_issuer_enabled = true

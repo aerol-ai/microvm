@@ -816,6 +816,18 @@ variable "audit_receiver_url" {
 # name, a webhook URL) stay as dedicated template vars; this map is for the
 # static per-scenario profile.
 #
+# identity_issuer_enabled makes every node an OIDC issuer for sandbox cloud
+# identities (plans/sandbox-cloud-identity.md): SB_IDENTITY_ISSUER_URL is the
+# deployment's public API URL, https://<domain>, which a static
+# extra_sandboxd_env entry cannot name because the domain is leased at apply
+# time. Off by default and rendered only when on (and the deployment has a
+# domain), so a production render is byte-identical to before.
+variable "identity_issuer_enabled" {
+  description = "Set SB_IDENTITY_ISSUER_URL=https://<domain> on every node so sandboxes can get cloud identity tokens. Needs a domain."
+  type        = bool
+  default     = false
+}
+
 # Empty by default, so a production render is byte-identical to before.
 variable "extra_sandboxd_env" {
   description = "Extra SB_* env vars written to /etc/sandboxd/cluster.env before the final sandboxd restart. Merged under each node's own sandboxd_env."

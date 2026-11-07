@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"strconv"
 
+	"github.com/aerol-ai/microvm/internal/cloudidentity"
 	"github.com/aerol-ai/microvm/internal/cluster"
 	"github.com/aerol-ai/microvm/internal/service"
 	"github.com/aerol-ai/microvm/internal/store"
@@ -106,6 +107,15 @@ func Classify(err error) Classification {
 		return Classification{Status: http.StatusForbidden, Message: "account access is not currently permitted"}
 	case errors.Is(err, controlplane.ErrAdmissionUnavailable):
 		return Classification{Status: http.StatusServiceUnavailable, RetryAfter: admissionRetryAfterSeconds, Message: "fleet access validation temporarily unavailable; retry shortly"}
+
+	// The operator's create policy (SB_CREATE_POLICY_FILE): a definite 403
+	// whose message names the rule, so the caller knows which limit it hit
+	// and a retry is pointless; and the fail-closed 503 while a set file has
+	// not loaded, which clears when the operator fixes it.
+	case errors.Is(err, models.ErrCreatePolicyDenied):
+		return Classification{Status: http.StatusForbidden, Code: models.ErrorCodeCreatePolicyDenied, Message: truncate(err.Error())}
+	case errors.Is(err, service.ErrCreatePolicyInvalid):
+		return Classification{Status: http.StatusServiceUnavailable, Code: models.ErrorCodeCreatePolicyInvalid, Message: service.ErrCreatePolicyInvalid.Error(), Log: true, LogLevel: slog.LevelError}
 
 	// A sandbox whose container engine is not wired on this node: host
 	// wiring state, not client fault. 503+Retry-After so SDKs back off.
@@ -218,6 +228,33 @@ func Classify(err error) Classification {
 	case errors.Is(err, service.ErrPublicTrafficDisabled):
 		return Classification{Status: http.StatusConflict, Message: err.Error()}
 
+	// Warm pools (plans/agent-sandbox-feature-parity.md W1).
+	case errors.Is(err, service.ErrWarmPoolNotFound):
+		return Classification{Status: http.StatusNotFound, Message: "warm pool not found"}
+	case errors.Is(err, models.ErrWarmPoolInvalid):
+		return Classification{Status: http.StatusBadRequest, Message: truncate(err.Error())}
+	case errors.Is(err, service.ErrWarmPoolLimit):
+		return Classification{Status: http.StatusConflict, Message: service.ErrWarmPoolLimit.Error()}
+	case errors.Is(err, service.ErrWarmPoolsUnavailable):
+		// The cause can name a peer's internal address: it goes to this
+		// node's log, the caller gets what to do.
+		return Classification{Status: http.StatusServiceUnavailable, RetryAfter: 5, Log: true, LogLevel: slog.LevelWarn,
+			Message: "warm pools are unavailable right now (no cluster leader, a rolling upgrade in progress, or the server tier out of reach); retry shortly"}
+	// Cloud identity per sandbox (plans/sandbox-cloud-identity.md): a tag
+	// not on the allow list, or a caller below its role, is 403 (D1.5);
+	// too many rotations inside the JWKS window is 409; a bad option, or
+	// identity on a deployment that is no issuer, is 400.
+	case errors.Is(err, service.ErrIdentityRoleDenied):
+		return Classification{Status: http.StatusForbidden, Message: truncate(err.Error())}
+	case errors.Is(err, cloudidentity.ErrTooManyKeys):
+		return Classification{Status: http.StatusConflict, Message: cloudidentity.ErrTooManyKeys.Error()}
+	case errors.Is(err, service.ErrIdentityInvalid), errors.Is(err, service.ErrIdentityDisabled):
+		return Classification{Status: http.StatusBadRequest, Message: truncate(err.Error())}
+	case errors.Is(err, service.ErrIdentityRoleNotFound):
+		return Classification{Status: http.StatusNotFound, Message: "identity role tag not found"}
+	case errors.Is(err, service.ErrIdentityUnavailable):
+		return Classification{Status: http.StatusServiceUnavailable, RetryAfter: 5, Message: truncate(err.Error())}
+
 	// API tokens (plans/identity-and-access.md §5.4, finding 5.6).
 	case errors.Is(err, service.ErrAPITokenInvalid):
 		return Classification{Status: http.StatusBadRequest, Message: err.Error()}
@@ -230,6 +267,19 @@ func Classify(err error) Classification {
 		// to recover, never the raw cluster error.
 		return Classification{Status: http.StatusServiceUnavailable, RetryAfter: 5, Log: true, LogLevel: slog.LevelWarn,
 			Message: "the token store did not confirm the write; after a create the token may exist: list tokens, revoke it by id, then create it again"}
+
+	// Token-gated ports (A2).
+	case errors.Is(err, service.ErrTokenVisibilityInvalid), errors.Is(err, service.ErrTokenVisibilityUnavailable):
+		return Classification{Status: http.StatusBadRequest, Message: err.Error()}
+	case errors.Is(err, service.ErrTokenVisibilityConflict):
+		return Classification{Status: http.StatusConflict, Message: err.Error()}
+	// Sandbox tokens (A1). The 400 text names the bad field, never a token.
+	case errors.Is(err, service.ErrSandboxTokenInvalid):
+		return Classification{Status: http.StatusBadRequest, Message: err.Error()}
+	case errors.Is(err, service.ErrSandboxTokensUnavailable):
+		return Classification{Status: http.StatusServiceUnavailable, Message: service.ErrSandboxTokensUnavailable.Error(), Log: true, LogLevel: slog.LevelWarn}
+	case errors.Is(err, service.ErrSandboxTokenRevoked):
+		return Classification{Status: http.StatusUnauthorized, Message: service.ErrSandboxTokenRevoked.Error()}
 
 	case errors.Is(err, store.ErrSandboxNameConflict):
 		return Classification{Status: http.StatusConflict, Message: "sandbox name already in use", Kind: ErrKindSandboxNameConflict}
@@ -265,7 +315,7 @@ func Classify(err error) Classification {
 		return Classification{Status: http.StatusPreconditionFailed, Message: err.Error()}
 	case errors.Is(err, models.ErrPlatformVolumesUnsupportedRuntime):
 		return Classification{Status: http.StatusBadRequest, Message: err.Error()}
-	case errors.Is(err, models.ErrPlatformVolumeQuota):
+	case errors.Is(err, models.ErrPlatformVolumeQuota), errors.Is(err, models.ErrPlatformVolumeConflict):
 		return Classification{Status: http.StatusConflict, Message: err.Error()}
 
 	// Custom-domain sentinels (plans/custom-domains.md).
@@ -291,14 +341,28 @@ func Classify(err error) Classification {
 		return Classification{Status: http.StatusForbidden, Message: err.Error()}
 	case errors.Is(err, wasmmod.ErrRegistryAuth):
 		return Classification{Status: http.StatusUnauthorized, Message: err.Error()}
-	case errors.Is(err, wasmmod.ErrModuleTooLarge):
+	case errors.Is(err, wasmmod.ErrModuleTooLarge), errors.Is(err, service.ErrExecRequestTooLarge):
 		return Classification{Status: http.StatusRequestEntityTooLarge, Message: err.Error()}
 	case errors.Is(err, wasmmod.ErrComponentModelUnsupported):
 		return Classification{Status: http.StatusUnprocessableEntity, Message: err.Error()}
 	case errors.Is(err, wasmmod.ErrRegistryUnavailable):
 		return Classification{Status: http.StatusBadGateway, RetryAfter: 5, Message: err.Error()}
 
+	// Team quotas (plan item P2): 429 with a code naming the limit, and no
+	// Retry-After: only a delete or a raised quota frees the room.
+	case errors.Is(err, models.ErrTeamQuotaExceeded):
+		return Classification{Status: http.StatusTooManyRequests, Code: models.ErrorCodeTeamQuotaExceeded, Message: truncate(err.Error())}
+	case errors.Is(err, models.ErrTeamQuotaNotFound):
+		return Classification{Status: http.StatusNotFound, Message: "team quota not found"}
+	case errors.Is(err, service.ErrTeamQuotaUnavailable):
+		return Classification{Status: http.StatusServiceUnavailable, RetryAfter: 5, Message: truncate(err.Error()), Log: true, LogLevel: slog.LevelWarn}
+
 	// Capacity / placement.
+	// A placement rule no node satisfies: 409 with a code and no
+	// Retry-After, because waiting does not give a node a label
+	// (plans/placement-rules.md P1.4). The message names the rule.
+	case errors.Is(err, models.ErrPlacementUnsatisfiable):
+		return Classification{Status: http.StatusConflict, Code: models.ErrorCodePlacementUnsatisfiable, Message: truncate(err.Error())}
 	case errors.Is(err, capacity.ErrCapacityExceeded), errors.Is(err, cluster.ErrCapacityExceeded):
 		return Classification{Status: http.StatusServiceUnavailable, RetryAfter: cluster.CapacityRetryAfterSeconds, Message: truncate(err.Error()), LogLevel: slog.LevelInfo, Log: true}
 	case errors.Is(err, cluster.ErrCreateBackpressure):

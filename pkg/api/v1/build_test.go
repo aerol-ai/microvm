@@ -578,3 +578,63 @@ var errPushBoom = pushBoomErr{}
 type pushBoomErr struct{}
 
 func (pushBoomErr) Error() string { return "boom" }
+
+// A build forwarded to another node waits for that node's answer even when
+// it comes after the shared peer client's limit: a build answers only when
+// it is done. The peer here answers after 300 ms against a 100 ms client
+// limit; before the fix the forward failed with the client's own timeout
+// instead of the peer's answer (UC-464/465 live, 2026-11-06).
+func TestClusterBuildImageWrapOutlivesPeerClientTimeout(t *testing.T) {
+	remote := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(300 * time.Millisecond)
+		http.Error(w, "remote build answered", http.StatusInternalServerError)
+	}))
+	defer remote.Close()
+	short := remote.Client()
+	short.Timeout = 100 * time.Millisecond
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	svc := service.New(config.Config{EnableCluster: true, NodeRole: config.NodeRoleServer, ImageBuildTimeout: time.Minute}, logger, nil, nil, nil, nil, nil, nil, nil)
+	svc.AttachCluster(&membersStubCluster{
+		Noop:           cluster.NewNoop("ingress-a", "http://ingress-a", ""),
+		internalClient: short,
+		placement:      cluster.PlacementTarget{NodeID: "worker-docker", APIURL: remote.URL, InternalURL: remote.URL},
+		members: []cluster.Member{
+			{NodeID: "ingress-a", APIURL: "http://ingress-a", Alive: true, Role: config.NodeRoleServer},
+			{
+				NodeID: "worker-docker", APIURL: remote.URL, InternalURL: remote.URL, Alive: true, Role: config.NodeRoleWorker,
+				Capacity: capacity.Snapshot{SupportedRuntimes: []string{models.RuntimeDocker}},
+			},
+		},
+	})
+	mux := http.NewServeMux()
+	RegisterRoutes(mux, Deps{Service: svc, Logger: logger, Auth: func(h http.Handler) http.Handler { return h }})
+
+	body, _ := json.Marshal(buildImageRequest{DockerfileContent: "FROM alpine"})
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/v1/images/build", strings.NewReader(string(body))))
+	if !strings.Contains(rr.Body.String(), "remote build answered") {
+		t.Fatalf("status %d body %q, want the peer's own answer, not a client timeout", rr.Code, rr.Body.String())
+	}
+	if short.Timeout != 100*time.Millisecond {
+		t.Fatal("the shared peer client must keep its own limit")
+	}
+}
+
+func TestPeerBuildClientLimit(t *testing.T) {
+	base := &http.Client{Timeout: 30 * time.Second}
+	for _, tc := range []struct {
+		build, want time.Duration
+	}{
+		{0, 0},
+		{10 * time.Minute, 21 * time.Minute},
+		{time.Minute, 3 * time.Minute},
+	} {
+		if got := peerBuildClient(base, tc.build).Timeout; got != tc.want {
+			t.Fatalf("peerBuildClient(build %v).Timeout = %v, want %v", tc.build, got, tc.want)
+		}
+	}
+	if base.Timeout != 30*time.Second {
+		t.Fatal("peerBuildClient must not change the client it copies")
+	}
+}

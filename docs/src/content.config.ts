@@ -60,6 +60,18 @@ const getDocsSidebarConfig = (): NavigationGroup[] => [
       link('/using-daytona-sdk', '- Use the Daytona SDK'),
       link('/using-e2b-sdk', '- Use the E2B SDK'),
       link('/using-runloop-sdk', '- Use the Runloop SDK'),
+      link('/moving-from-agent-sandbox', '- Move from agent-sandbox'),
+    ],
+  },
+  {
+    type: 'group',
+    label: 'Agent Framework Integrations',
+    category: NavigationCategory.SDKS,
+    entries: [
+      link('/integrations/openai-agents', '- OpenAI Agents SDK'),
+      link('/integrations/deepagents', '- LangChain DeepAgents'),
+      link('/integrations/gymnasium', '- Gymnasium'),
+      link('/integrations/nemo-gym', '- NVIDIA NeMo Gym'),
     ],
   },
   {
@@ -84,15 +96,29 @@ const getDocsSidebarConfig = (): NavigationGroup[] => [
       link('/sandboxes', '- Create and Manage'),
       link('/ghost-sandboxes', '- Ghost(Vercel) Mode'),
       link('/images-and-snapshots', '- Images and Snapshots'),
+      link('/warm-pools', '- Warm pools'),
+      link('/performance-benchmark', '- Create throughput'),
       link('/lifecycle', '- Lifecycle'),
       link('/sandbox-env', '- Secured Env variables'),
+      link('/sandbox-cloud-identity', '- Cloud identity (AWS, GCP, Azure)'),
       link('/durability', '- Durability and failover'),
       link('/exec-streaming', '- Run commands'),
       link('/file-system', '- Handle Files'),
+      link('/file-watching', '- Watch files'),
       link('/sessions', '- Terminal sessions'),
       link('/sandbox-tags', '- Tags'),
       link('/ssh-access', '- SSH access'),
+      link('/sandbox-tokens', '- Sandbox tokens'),
       
+    ],
+  },
+  {
+    type: 'group',
+    label: 'Ready-made Images',
+    category: NavigationCategory.SANDBOXES,
+    entries: [
+      link('/computer-use', '- Computer use and browser'),
+      link('/vscode-in-browser', '- VS Code in the browser'),
     ],
   },
   
@@ -238,6 +264,11 @@ const getUseCasesSidebarConfig = (): NavigationGroup[] => [
       link(`${uca}/pull-request-review-auto-fix-agent`, '- Review a pull request'),
       link(`${uca}/test-writing-failure-reproduction-agent`, '- Write 500 tests'),
       link(`${uca}/claude-code-security-vulnerability-remediation-agent`, '- Find and fix security problems'),
+      link(`${uca}/opencode-agent`, '- Run OpenCode'),
+      link(`${uca}/aider-agent`, '- Run Aider'),
+      link(`${uca}/gemini-cli-agent`, '- Run Gemini CLI'),
+      link(`${uca}/codex-cli-agent`, '- Run Codex CLI'),
+      link(`${uca}/host-mcp-server`, '- Host an MCP server'),
     ],
   },
   {
@@ -293,6 +324,7 @@ const getEnterpriseSidebarConfig = (): NavigationGroup[] => [
     entries: [
       link(`${ent}/security-controls`, '- Security baseline'),
       link(`${ent}/hardening`, '- Hardening guide'),
+      link(`${ent}/create-policy`, '- Limit what users create'),
       { ...link(`${ent}/sso`, '- SSO'), children: ssoProviders },
       link(`${ent}/key-custody`, '- Use your own key store'),
       link(`${ent}/enterprise-mode`, '- Enterprise mode'),

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/docker"
@@ -236,6 +237,15 @@ func (s *Service) RegisterSnapshotFromDockerfile(ctx context.Context, snapshot *
 		return nil, err
 	}
 	return registered, nil
+}
+
+// ImageBuildTimeout is the most one image build, or one push, may take on
+// this node (SB_IMAGE_BUILD_TIMEOUT). 0 means no limit.
+func (s *Service) ImageBuildTimeout() time.Duration {
+	if s == nil {
+		return 0
+	}
+	return s.cfg.ImageBuildTimeout
 }
 
 func (s *Service) buildContext(ctx context.Context) (context.Context, context.CancelFunc) {

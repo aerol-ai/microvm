@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/aerol-ai/microvm/internal/cloudidentity"
 	"github.com/aerol-ai/microvm/internal/identity"
 	"github.com/aerol-ai/microvm/pkg/capacity"
 	"github.com/aerol-ai/microvm/pkg/models"
@@ -55,7 +56,10 @@ const (
 	// the leader (storage_obligations.go).
 	// 26 is opReportStorageObligations (storage_obligations.go); 27/28 are the
 	// egress-profile ops (fsm_egress_profiles.go); 31/32 are the API-token
-	// ops (fsm_tokens.go). The next free code is 33.
+	// ops (fsm_tokens.go); 33/34 are the warm-pool ops (fsm_warm_pools.go);
+	// 35-37 are the identity ops (fsm_identity.go); 38/39 are the team-quota
+	// ops (fsm_team_quotas.go); 40/41 are the volume-reclaim ops
+	// (fsm_volume_reclaims.go). The next free code is 42.
 	opRegisterSnapshotNode opCode = 29 // record which node holds a snapshot's image (name → node, cluster-wide)
 	opForgetSnapshotNode   opCode = 30 // drop a snapshot's name → node entry (on delete / node death)
 )
@@ -109,6 +113,10 @@ type command struct {
 	Protocol  string `json:"protocol,omitempty"`
 	HostPort  int    `json:"host_port,omitempty"`
 	PublicURL string `json:"public_url,omitempty"`
+	// Visibility is opAddExposedPort's port visibility ("token" for a
+	// sandbox-token-gated port, A2). Omitted for public, so commands from
+	// before it replay byte for byte.
+	Visibility string `json:"visibility,omitempty"`
 	// ExpiresUnix is set on opReserve to bound how long a reservation holds
 	// capacity before the leader GC sweep cancels it. Ignored by every other
 	// op; promotion via opPlace clears the reservation's expiry implicitly by
@@ -190,6 +198,17 @@ type command struct {
 	MaxPerTenant      int                       `json:"max_per_tenant,omitempty"`
 	VolumeAttachments []models.VolumeAttachment `json:"volume_attachments,omitempty"`
 	VolumeSandboxID   string                    `json:"volume_sandbox_id,omitempty"`
+	// VolumeReclaimNodeID asks the FSM to record a VolumeReclaim (stamped
+	// StampUnixNano, drained by this node; fsm_volume_reclaims.go): on
+	// opDelete for every delete_with_sandbox volume the deleted sandbox was
+	// the last holder of, on opDeleteVolume for the deleted volume.
+	// VolumeReclaimSource is opDeleteVolume's source for a row stored without
+	// one. Empty: no record, the older behaviour.
+	VolumeReclaimNodeID string `json:"volume_reclaim_node_id,omitempty"`
+	VolumeReclaimSource string `json:"volume_reclaim_source,omitempty"`
+	// VolumeReclaim names the entry opAckVolumeReclaim drops or
+	// opClaimVolumeReclaim moves to NodeID.
+	VolumeReclaim *VolumeReclaim `json:"volume_reclaim,omitempty"`
 	// EgressProfile carries the profile for opPutEgressProfile, and its owner
 	// and name for opDeleteEgressProfile (fsm_egress_profiles.go).
 	EgressProfile *EgressProfileRecord `json:"egress_profile,omitempty"`
@@ -205,6 +224,30 @@ type command struct {
 	// (fsm_tokens.go).
 	APIToken   *identity.TokenRecord `json:"api_token,omitempty"`
 	APITokenID string                `json:"api_token_id,omitempty"`
+	// WarmPool carries the entry for opPutWarmPool, and its image for
+	// opDeleteWarmPool (fsm_warm_pools.go).
+	WarmPool *WarmPoolRecord `json:"warm_pool,omitempty"`
+	// IdentityKeys carries opPutIdentityKeys; IdentityRole carries
+	// opPutIdentityRole and names the tag opDeleteIdentityRole removes
+	// (fsm_identity.go).
+	IdentityKeys *IdentityKeysWrite  `json:"identity_keys,omitempty"`
+	IdentityRole *IdentityRoleRecord `json:"identity_role,omitempty"`
+	// TeamQuota carries the quota for opPutTeamQuota, and its team for
+	// opDeleteTeamQuota (fsm_team_quotas.go).
+	TeamQuota *TeamQuotaRecord `json:"team_quota,omitempty"`
+	// QuotaAdmit marks an opPlace that can grow a team's usage (a create
+	// that skipped the reservation), so the leader admits it against the
+	// team's quota like a reservation. A spec write needs no mark: the leader
+	// checks every one that grows a team's sandbox (teamQuotaAsks), because a
+	// worker on an older build never sets it. Apply ignores it: an older
+	// replica reads the same state from the entry.
+	QuotaAdmit bool `json:"quota_admit,omitempty"`
+	// QuotaReplay marks an opUpsertSpec that records what a sandbox already
+	// is (the boot backfill of a spec the row never had), so the leader does
+	// not refuse it. It can only loosen the check for builds that know quotas;
+	// an older build never sets it, so its spec writes are always checked.
+	// Apply ignores it.
+	QuotaReplay bool `json:"quota_replay,omitempty"`
 }
 
 type reservationCommand struct {
@@ -531,17 +574,38 @@ type placementFSM struct {
 	volumeAttachments          map[string]models.VolumeAttachment
 	volumeAttachmentsByVolume  map[string]map[string]struct{}
 	volumeAttachmentsBySandbox map[string]map[string]struct{}
+	// volumeReclaims are the delete_with_sandbox volumes still owed a
+	// backend delete, by volumeKey (fsm_volume_reclaims.go, snapshotted).
+	// volumeReclaimsByNode indexes them by the node that drains them
+	// (derived, rebuilt on Restore).
+	volumeReclaims       map[string]VolumeReclaim
+	volumeReclaimsByNode map[string]map[string]struct{}
 	// egressProfiles are the replicated named egress profiles (snapshotted).
 	// egressProfileRefs is derived: which placements reference each profile,
 	// kept in step with f.placements by reindexEgressProfilesLocked and
 	// rebuilt on Restore from the rows.
 	egressProfiles    map[EgressProfileKey]*EgressProfileRecord
 	egressProfileRefs map[EgressProfileKey]map[string]struct{}
+	// teamQuotas are the replicated team quotas (snapshotted). teamUsage and
+	// teamUsageEntries are derived: each team's usage and each sandbox's
+	// share of it, kept in step with f.placements by
+	// reindexTeamUsageLocked and rebuilt on Restore (fsm_team_quotas.go).
+	teamQuotas       map[string]*TeamQuotaRecord
+	teamUsage        map[string]*models.TeamQuotaUsage
+	teamUsageEntries map[string]teamUsageEntry
 	// tokens is the replicated API-token table and its change ring
 	// (fsm_tokens.go, snapshotted rows, node-local ring). It has its own
 	// lock: token reads on the request path never take mu.
 	tokens       *apiTokenState
 	apiTokenInit sync.Once
+	// warmPools are the replicated warm-pool entries by image
+	// (fsm_warm_pools.go, snapshotted). warmPoolsVersion is the Raft index
+	// of the last change to them, the cursor workers poll with.
+	warmPools        map[string]*WarmPoolRecord
+	warmPoolsVersion uint64
+	// identity is the cloud-identity signing keys and role allow lists
+	// (fsm_identity.go, snapshotted). nil until the first write.
+	identity *identityState
 
 	// subMu guards subscribers. Separate from mu so a slow subscriber accept
 	// can't block FSM reads — Apply takes mu briefly to write, releases it,
@@ -628,9 +692,15 @@ func newPlacementFSMWithRecoveryStore(store placementRecoveryStore) *placementFS
 		volumeAttachments:            make(map[string]models.VolumeAttachment),
 		volumeAttachmentsByVolume:    make(map[string]map[string]struct{}),
 		volumeAttachmentsBySandbox:   make(map[string]map[string]struct{}),
+		volumeReclaims:               make(map[string]VolumeReclaim),
+		volumeReclaimsByNode:         make(map[string]map[string]struct{}),
 		egressProfiles:               make(map[EgressProfileKey]*EgressProfileRecord),
 		egressProfileRefs:            make(map[EgressProfileKey]map[string]struct{}),
+		teamQuotas:                   make(map[string]*TeamQuotaRecord),
+		teamUsage:                    make(map[string]*models.TeamQuotaUsage),
+		teamUsageEntries:             make(map[string]teamUsageEntry),
 		tokens:                       newAPITokenState(),
+		warmPools:                    make(map[string]*WarmPoolRecord),
 	}
 }
 
@@ -1073,6 +1143,7 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 		f.releaseVolumeAttachmentsForIncarnationLocked(cmd.SandboxID, expectedIncarnationID)
 		f.deletePlacementRecoveryLocked(cmd.SandboxID)
 		f.releaseEgressProfilesLocked(cmd.SandboxID)
+		f.reindexTeamUsageLocked(cmd.SandboxID, nil)
 		delete(f.placements, cmd.SandboxID)
 		delete(f.deletingIndex, cmd.SandboxID)
 		f.recordPlacementChangeLocked(cmd.SandboxID, true)
@@ -1152,9 +1223,15 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 				f.releasePendingReservationOwnerLocked(cmd.SandboxID, existing.OwnerNodeID)
 			}
 		}
+		// The attachments below are the last link from a sandbox to a
+		// delete_with_sandbox volume: record what they leave owed first.
+		if cmd.VolumeReclaimNodeID != "" {
+			f.recordVolumeReclaimsLocked(cmd.SandboxID, cmd.VolumeReclaimNodeID, cmd.StampUnixNano)
+		}
 		f.releaseVolumeAttachmentsForSandboxLocked(cmd.SandboxID)
 		f.deletePlacementRecoveryLocked(cmd.SandboxID)
 		f.releaseEgressProfilesLocked(cmd.SandboxID)
+		f.reindexTeamUsageLocked(cmd.SandboxID, nil)
 		delete(f.placements, cmd.SandboxID)
 		delete(f.deletingIndex, cmd.SandboxID)
 		f.recordPlacementChangeLocked(cmd.SandboxID, true)
@@ -1269,6 +1346,7 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 			f.releaseVolumeAttachmentsForIncarnationLocked(id, existing.IncarnationID)
 			f.deletePlacementRecoveryLocked(id)
 			f.releaseEgressProfilesLocked(id)
+			f.reindexTeamUsageLocked(id, nil)
 			delete(f.placements, id)
 			delete(f.deletingIndex, id)
 			f.recordPlacementChangeLocked(id, true)
@@ -1475,9 +1553,10 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 			return err
 		}
 		route := ExposedPortRoute{
-			Protocol:  cmd.Protocol,
-			HostPort:  cmd.HostPort,
-			PublicURL: cmd.PublicURL,
+			Protocol:   cmd.Protocol,
+			HostPort:   cmd.HostPort,
+			PublicURL:  cmd.PublicURL,
+			Visibility: cmd.Visibility,
 		}
 		if route.Protocol == "" {
 			route.Protocol = existing.ExposedPorts[cmd.Port]
@@ -1743,6 +1822,17 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 		state.Committed[nodeID] = pending
 		delete(state.Pending, nodeID)
 		return nil
+	case opPutTeamQuota:
+		result, err := f.applyPutTeamQuotaLocked(cmd)
+		if err != nil {
+			return err
+		}
+		return result
+	case opDeleteTeamQuota:
+		if err := f.applyDeleteTeamQuotaLocked(cmd); err != nil {
+			return err
+		}
+		return nil
 	case opPutEgressProfile:
 		result, err := f.applyPutEgressProfileLocked(cmd)
 		if err != nil {
@@ -1762,6 +1852,44 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 		return result
 	case opDeleteAPIToken:
 		if err := f.applyDeleteAPITokenLocked(cmd); err != nil {
+			return err
+		}
+		return nil
+	case opPutWarmPool:
+		result, err := f.applyPutWarmPoolLocked(cmd)
+		if err != nil {
+			return err
+		}
+		return result
+	case opDeleteWarmPool:
+		if err := f.applyDeleteWarmPoolLocked(cmd); err != nil {
+			return err
+		}
+		return nil
+	case opAckVolumeReclaim:
+		if err := f.applyAckVolumeReclaimLocked(cmd); err != nil {
+			return err
+		}
+		return nil
+	case opClaimVolumeReclaim:
+		if err := f.applyClaimVolumeReclaimLocked(cmd); err != nil {
+			return err
+		}
+		return nil
+	case opPutIdentityKeys:
+		result, err := f.applyPutIdentityKeysLocked(cmd)
+		if err != nil {
+			return err
+		}
+		return result
+	case opPutIdentityRole:
+		result, err := f.applyPutIdentityRoleLocked(cmd)
+		if err != nil {
+			return err
+		}
+		return result
+	case opDeleteIdentityRole:
+		if err := f.applyDeleteIdentityRoleLocked(cmd); err != nil {
 			return err
 		}
 		return nil
@@ -1897,6 +2025,11 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 		}
 		delete(f.volumes, key)
 		delete(f.volumeNameIndex, volumeNameKey(tenant, row.Name))
+		// The row was the last record of where the bytes are: record what
+		// they are owed in the same apply.
+		if cmd.VolumeReclaimNodeID != "" {
+			f.recordDeletedVolumeReclaimLocked(row, cmd)
+		}
 		return nil
 	case opRegisterSnapshotNode:
 		// Idempotent get-or-set-or-move: a re-register with the same name
@@ -2695,6 +2828,11 @@ func (f *placementFSM) storeRecoveryBlob(blob RecoveryBlob) error {
 	if ref != blob.Ref {
 		return fmt.Errorf("placement recovery blob ref mismatch: got %s want %s", ref, blob.Ref)
 	}
+	// A fetched blob belongs to a snapshot row: no log entry here would
+	// write it again after a crash, so it is made durable now.
+	if syncer, ok := f.recoveryStore.(recoveryStoreSyncer); ok {
+		return syncer.SyncRef(ref)
+	}
 	return nil
 }
 
@@ -2708,6 +2846,7 @@ func (f *placementFSM) storePlacementLocked(id string, p Placement) error {
 	} else {
 		f.reindexEgressProfilesLocked(id, nil, &hot)
 	}
+	f.reindexTeamUsageLocked(id, &hot)
 	if rec.empty() {
 		if hot.RecoveryRef == "" {
 			delete(f.recovery, id)
@@ -2768,6 +2907,12 @@ func splitPlacement(p Placement) (Placement, placementRecovery) {
 		// hydrating the spec.
 		p.EgressProfiles = append([]string(nil), p.Spec.EgressProfiles...)
 		p.EgressInlineHostnames = egressInlineHostnames(p.Spec)
+		// A team's sandbox carries its size on the hot row, so the quota
+		// index is rebuilt on Restore without hydrating every spec. Other
+		// owners pay nothing for it.
+		if models.TeamOfOwnerRef(p.OwnerRef) != "" {
+			p.QuotaCPU, p.QuotaMemoryMB = models.QuotaSize(p.Spec.CPU, p.Spec.MemoryMB)
+		}
 	}
 	p.Spec = nil
 	p.SecretRef = ""
@@ -3414,6 +3559,26 @@ type fsmSnapshotPayload struct {
 	// Optional; an older snapshot decodes it as nil, which reads as "no
 	// tokens". An older build decoding a newer snapshot ignores the field.
 	APITokens []identity.TokenRecord
+	// WarmPools is the replicated warm-pool entry set. Optional; an older
+	// snapshot decodes it as nil, which reads as "no entries". An older
+	// build decoding a newer snapshot ignores the field, which is safe
+	// because no entry can be written until every server runs a build with
+	// it (warmPoolFSMOpsVersion).
+	WarmPools []WarmPoolRecord
+	// IdentityKeys and IdentityRoles are the cloud-identity signing keys
+	// (sealed) and role allow lists. Optional; an older snapshot decodes
+	// them as nil, which reads as "no keys, no roles".
+	IdentityKeys  *cloudidentity.KeySet
+	IdentityRoles []IdentityRoleRecord
+	// TeamQuotas is the replicated team-quota set. Optional; an older
+	// snapshot decodes it as nil, which reads as "no quotas".
+	TeamQuotas []TeamQuotaRecord
+	// VolumeReclaims are the delete_with_sandbox volumes still owed a
+	// backend delete. Optional; an older snapshot decodes it as nil, which
+	// reads as "none owed". An older build ignores the field, which is safe
+	// because no entry is written until every server runs a build with it
+	// (volumeReclaimFSMOpsVersion).
+	VolumeReclaims []VolumeReclaim
 }
 
 type placementSnapshotRow struct {
@@ -3479,6 +3644,7 @@ func (f *placementFSM) Snapshot() (raft.FSMSnapshot, error) {
 			Issued:    cloneArtifactCatalogIssued(state.Issued),
 		}
 	}
+	identityKeys, identityRoles := f.identitySnapshotLocked()
 	return &fsmSnapshot{
 		version:            version,
 		rows:               rows,
@@ -3490,12 +3656,30 @@ func (f *placementFSM) Snapshot() (raft.FSMSnapshot, error) {
 		auditACLs:          auditACLs,
 		volumes:            f.volumesSnapshotLocked(),
 		volumeAttachments:  f.volumeAttachmentsSnapshotLocked(),
+		volumeReclaims:     f.volumeReclaimsSnapshotLocked(),
 		egressProfiles:     f.egressProfilesSnapshotLocked(),
+		teamQuotas:         f.teamQuotasSnapshotLocked(),
 		snapshotNodes:      snapshotNodes,
 		apiTokens:          f.apiTokens().snapshot(),
+		warmPools:          f.warmPoolsSnapshotLocked(),
+		identityKeys:       identityKeys,
+		identityRoles:      identityRoles,
 		recoveryStore:      f.recoveryStore,
 		recoveryRefs:       recoveryRefs,
+		guard:              beginRecoverySnapshot(f.recoveryStore),
 	}, nil
+}
+
+// beginRecoverySnapshot starts the store's tracking of Puts for a snapshot
+// (recoveryStoreSnapshotGuard). The caller holds the FSM lock, so no Put
+// can fall between the rows the snapshot read and this call.
+func beginRecoverySnapshot(store placementRecoveryStore) recoveryStoreSnapshotGuard {
+	guard, ok := store.(recoveryStoreSnapshotGuard)
+	if !ok {
+		return nil
+	}
+	guard.BeginSnapshot()
+	return guard
 }
 
 // Restore loads state from a previously written snapshot. Replaces in-memory
@@ -3574,7 +3758,13 @@ func (f *placementFSM) Restore(rc io.ReadCloser) (err error) {
 	f.customHostnameIndex = make(map[string]string)
 	f.egressProfileRefs = make(map[EgressProfileKey]map[string]struct{})
 	f.restoreEgressProfilesLocked(payload.EgressProfiles)
+	// Usage is derived from the rows re-stored below; the quotas are state.
+	f.teamUsage = make(map[string]*models.TeamQuotaUsage)
+	f.teamUsageEntries = make(map[string]teamUsageEntry)
+	f.restoreTeamQuotasLocked(payload.TeamQuotas)
 	f.apiTokens().restore(payload.APITokens, payload.Version)
+	f.restoreWarmPoolsLocked(payload.WarmPools, payload.Version)
+	f.restoreIdentityLocked(payload.IdentityKeys, payload.IdentityRoles)
 	f.auditACLs = make(map[string]AuditACL, len(payload.AuditACLs))
 	f.auditACLLatest = make(map[string]string)
 	f.auditACLBySandbox = make(map[string]map[string]struct{})
@@ -3621,6 +3811,7 @@ func (f *placementFSM) Restore(rc io.ReadCloser) (err error) {
 		}
 		f.putVolumeAttachmentLocked(a)
 	}
+	f.restoreVolumeReclaimsLocked(payload.VolumeReclaims)
 	for id, p := range payload.Placements {
 		full := p
 		if full.SandboxID == "" {
@@ -3724,11 +3915,20 @@ type fsmSnapshot struct {
 	auditACLs          map[string]AuditACL
 	volumes            []models.Volume
 	volumeAttachments  []models.VolumeAttachment
+	volumeReclaims     []VolumeReclaim
 	egressProfiles     []EgressProfileRecord
 	snapshotNodes      map[string]string
 	apiTokens          []identity.TokenRecord
+	warmPools          []WarmPoolRecord
+	identityKeys       *cloudidentity.KeySet
+	identityRoles      []IdentityRoleRecord
+	teamQuotas         []TeamQuotaRecord
 	recoveryStore      placementRecoveryStore
 	recoveryRefs       []string
+	// guard is the store's Put tracking this snapshot began; Release ends
+	// it, once.
+	guard       recoveryStoreSnapshotGuard
+	releaseOnce sync.Once
 }
 
 func (s *fsmSnapshot) Persist(sink raft.SnapshotSink) (err error) {
@@ -3737,6 +3937,15 @@ func (s *fsmSnapshot) Persist(sink raft.SnapshotSink) (err error) {
 	defer func() {
 		recordSnapshotPersist(time.Since(start), counting.bytes, len(s.rows), err)
 	}()
+	// The snapshot stands in for the log entries that wrote its rows'
+	// recovery blobs once it is closed, and raft may then compact them
+	// away, so the blobs go to disk first (recoveryStoreSyncer).
+	if syncer, ok := s.recoveryStore.(recoveryStoreSyncer); ok {
+		if err := syncer.Sync(); err != nil {
+			_ = sink.Cancel()
+			return fmt.Errorf("fsmSnapshot: %w", err)
+		}
+	}
 	enc := gob.NewEncoder(counting)
 	if err := enc.Encode(fsmSnapshotPayload{
 		Version:            s.version,
@@ -3749,9 +3958,14 @@ func (s *fsmSnapshot) Persist(sink raft.SnapshotSink) (err error) {
 		AuditACLs:          s.auditACLs,
 		Volumes:            s.volumes,
 		VolumeAttachments:  s.volumeAttachments,
+		VolumeReclaims:     s.volumeReclaims,
 		EgressProfiles:     s.egressProfiles,
 		SnapshotNodes:      s.snapshotNodes,
 		APITokens:          s.apiTokens,
+		WarmPools:          s.warmPools,
+		IdentityKeys:       s.identityKeys,
+		IdentityRoles:      s.identityRoles,
+		TeamQuotas:         s.teamQuotas,
 	}); err != nil {
 		_ = sink.Cancel()
 		return fmt.Errorf("fsmSnapshot: encode: %w", err)
@@ -3765,7 +3979,15 @@ func (s *fsmSnapshot) Persist(sink raft.SnapshotSink) (err error) {
 	return nil
 }
 
-func (s *fsmSnapshot) Release() {}
+// Release ends the store's Put tracking (recoveryStoreSnapshotGuard). Raft
+// calls it after Persist, whether Persist worked or not.
+func (s *fsmSnapshot) Release() {
+	s.releaseOnce.Do(func() {
+		if s.guard != nil {
+			s.guard.EndSnapshot()
+		}
+	})
+}
 
 type countingSnapshotSink struct {
 	raft.SnapshotSink

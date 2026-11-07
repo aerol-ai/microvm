@@ -35,6 +35,11 @@ func poolEligible(req models.CreateSandboxRequest, hostMounts []mounts.Container
 	if user := strings.TrimSpace(req.OSUser); user != "" && !strings.EqualFold(user, "root") {
 		return false
 	}
+	// A parked container's image user was never checked against the create
+	// policy's require_non_root rule; the cold path checks it first.
+	if req.RequireNonRootUser {
+		return false
+	}
 	if len(req.ContainerCommand) > 0 {
 		return false
 	}
@@ -223,6 +228,15 @@ func (d *Driver) findContainerBySandboxID(ctx context.Context, client *Client, s
 	return containers[0], nil
 }
 
+// destroyParked tears a parked container down in Destroy's order: the
+// container first; then, only once it is confirmed gone, the address's rules
+// (while the netns slot still holds the address, so they cannot be the next
+// owner's), the netns slot, and the host files. A failed delete returns
+// before any of those, so the container keeps its slot, its park block and
+// its files: no other sandbox can be handed the slot while it still runs.
+// The warm pool keeps that slot and retries until this returns nil
+// (dockerpool pending_destroy.go), so the slot is released exactly once, on
+// confirmed absence.
 func (d *Driver) destroyParked(ctx context.Context, slot *containerdpool.ParkedSlot) error {
 	if slot == nil {
 		return nil
@@ -234,15 +248,18 @@ func (d *Driver) destroyParked(ctx context.Context, slot *containerdpool.ParkedS
 	if parkKey == "" {
 		parkKey = strings.TrimSpace(slot.ContainerID)
 	}
-	d.removeContainerFiles(parkKey)
-	if slot.ContainerIP != "" {
-		_ = d.ClearNetworkRules(slot.ContainerIP)
-	}
+	// The host-side listener is this process's alone.
 	if slot.Handle != nil {
 		_ = slot.Handle.Close()
 	}
 	if pl, ok := slot.Handle.(*dockerpkg.ParkedListener); ok {
 		dockerpkg.RemoveParkSocket(pl.HostSocketPath())
+	}
+	if err := d.deleteParkedContainer(ctx, slot.ContainerID); err != nil {
+		return err
+	}
+	if slot.ContainerIP != "" {
+		_ = d.ClearNetworkRules(slot.ContainerIP)
 	}
 	// Release the prepaid netns slot the park held (keyed by the park slot id,
 	// which equals ContainerID for a parked container). Without this, every park
@@ -255,25 +272,39 @@ func (d *Driver) destroyParked(ctx context.Context, slot *containerdpool.ParkedS
 	if d.netns != nil && parkKey != "" {
 		_ = d.netns.Release(ctx, parkKey)
 	}
-	if slot.ContainerID != "" {
-		client, err := d.ensureClient()
-		if err != nil {
-			return err
-		}
-		container, err := client.LoadContainer(ctx, slot.ContainerID)
-		if err != nil {
-			return err
-		}
-		// Release the image lease the park pinned, or GC can never reclaim the
-		// pinned layers (mirror Destroy's release).
-		if labels, lerr := container.Labels(ctx); lerr == nil {
-			d.releaseImageLease(ctx, client, labels)
-		}
-		if task, taskErr := container.Task(ctx, nil); taskErr == nil {
-			_ = task.Kill(ctx, syscall.SIGKILL)
-			_, _ = task.Delete(ctx)
-		}
-		return container.Delete(ctx)
+	d.removeContainerFiles(parkKey)
+	return nil
+}
+
+// deleteParkedContainer kills a parked container's task and deletes the
+// container. A container containerd does not have is already gone, which
+// counts as done (like docker's 404 on remove).
+func (d *Driver) deleteParkedContainer(ctx context.Context, containerID string) error {
+	if strings.TrimSpace(containerID) == "" {
+		return nil
+	}
+	client, err := d.ensureClient()
+	if err != nil {
+		return err
+	}
+	container, err := client.LoadContainer(ctx, containerID)
+	if errdefs.IsNotFound(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	// Release the image lease the park pinned, or GC can never reclaim the
+	// pinned layers (mirror Destroy's release).
+	if labels, lerr := container.Labels(ctx); lerr == nil {
+		d.releaseImageLease(ctx, client, labels)
+	}
+	if task, taskErr := container.Task(ctx, nil); taskErr == nil {
+		_ = task.Kill(ctx, syscall.SIGKILL)
+		_, _ = task.Delete(ctx)
+	}
+	if err := container.Delete(ctx); err != nil && !errdefs.IsNotFound(err) {
+		return err
 	}
 	return nil
 }

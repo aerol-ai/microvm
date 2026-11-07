@@ -1,0 +1,624 @@
+---
+title: Move from agent-sandbox
+description: Map your Kubernetes agent-sandbox client code to AerolVM, call by call, with the same task in all five SDKs.
+---
+
+import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
+
+[agent-sandbox](https://github.com/kubernetes-sigs/agent-sandbox) runs each sandbox as a pod in your Kubernetes cluster. To use it, you keep a `SandboxTemplate`, a `SandboxWarmPool`, a router, and a way in: a Gateway, a `kubectl port-forward` tunnel or an in-cluster address. Your code then asks for a sandbox with a `SandboxClaim`.
+
+AerolVM is a server with one API. You give the SDK the server's address and a token, and that is all. There are no Kubernetes objects to keep, no router and no tunnel.
+
+The idea stays the same. You ask for a sandbox, run commands in it, move files in and out, and delete it when you are done. This page shows the AerolVM call for each agent-sandbox call you use today.
+
+## Connect
+
+Install the AerolVM SDK for your language. See [SDK setup](/sdk-setup/). Then set your server's address and token:
+
+```bash
+export SB_API_URL=https://sandbox.example.com
+export SB_PAT_TOKEN=your-secret-pat
+```
+
+With these set, a client made with no arguments finds the server by itself. You can also pass both values in code:
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    import { MicroVM } from "@aerol-ai/aerolvm-sdk";
+
+    const client = new MicroVM({
+      apiUrl: "https://sandbox.example.com",
+      patToken: "your-secret-pat",
+    });
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    from microvm import MicroVM
+
+    client = MicroVM(
+        api_url="https://sandbox.example.com",
+        pat_token="your-secret-pat",
+    )
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    import (
+        "github.com/aerol-ai/microvm/sdk/go/pkg/microvm"
+        sdktypes "github.com/aerol-ai/microvm/sdk/go/pkg/types"
+    )
+
+    client, err := microvm.NewClientWithConfig(&sdktypes.MicroVMConfig{
+        APIUrl:   "https://sandbox.example.com",
+        PATToken: "your-secret-pat",
+    })
+    if err != nil {
+        log.Fatal(err)
+    }
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    use aerolvm_sdk::Client;
+
+    let client = Client::new(Some("https://sandbox.example.com"), Some("your-secret-pat"))?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    import ai.aerol.microvm.MicroVMClient;
+    import ai.aerol.microvm.MicroVMConfig;
+
+    MicroVMClient client = new MicroVMClient(
+        new MicroVMConfig()
+            .setApiUrl("https://sandbox.example.com")
+            .setPatToken("your-secret-pat")
+    );
+    ```
+  </TabItem>
+</Tabs>
+
+Your code can run anywhere that can reach the server: your laptop, a CI job, or a pod in a cluster. It does not need `kubectl` or a kubeconfig.
+
+## The calls side by side
+
+The left column uses the agent-sandbox Python client. The right column uses the AerolVM Python SDK. The agent-sandbox Go client (`CreateSandbox`, `Run`, `Write`, `Read`, `DeleteAll`) and TypeScript client (`createSandbox`, `commands.run`, `files.write`) map the same way. The sections after the tables show each AerolVM call in all five SDKs.
+
+### Connect and clients
+
+| agent-sandbox call | AerolVM call |
+|---|---|
+| `SandboxClient(connection_config=...)`, with a Gateway, tunnel, in-cluster or direct URL config | `MicroVM(api_url=..., pat_token=...)`, or `MicroVM()` with `SB_API_URL` and `SB_PAT_TOKEN` set |
+| `SandboxDirectConnectionConfig(extra_headers=..., client_cert=(crt, key), ca_cert=...)` | `MicroVM(headers=..., client_cert=(cert, key), ca_file=...)`. For the other SDKs, see [Connect through a company network](/sdk-setup/#connect-through-a-company-network). |
+| `AsyncSandboxClient` | `AsyncMicroVM`, from `pip install "aerolvm-sdk[async]"`. See [Run many calls at the same time](/sdk-setup/#run-many-calls-at-the-same-time). |
+
+### Create and find sandboxes
+
+| agent-sandbox call | AerolVM call |
+|---|---|
+| `create_sandbox(warmpool, namespace)` | `create(image=...)`. You name the image and options on each create. |
+| `labels=` | `tags=` |
+| `list_all_sandboxes(namespace, label_selector=...)` | `list(tags=...)`. A sandbox must have every tag you pass. See [Tags](/sandbox-tags/). |
+| `shutdown_after_seconds=` | `lifecycle={"destroyAtAge": ...}`, in nanoseconds. See [Lifecycle](/lifecycle/). |
+| `env=` | `env=` |
+| `claim_name=..., adopt_existing=True` | `get_or_create(name, ...)` |
+| `get_sandbox(claim_name, namespace)` | `get_by_name(name)`, or `get(id)` |
+| `volume_claim_templates=` | `platformVolumes=[...]`. See [Platform volumes](/platform-volumes/). |
+| `pod_labels=`, `pod_annotations=` | No match, because there are no pods. Use `tags`. |
+| A runtime class on the template (gVisor or Kata) | `runtime="gvisor"` or `runtime="firecracker"` on the create |
+
+### Run commands
+
+| agent-sandbox call | AerolVM call |
+|---|---|
+| `sandbox.commands.run(cmd, command_timeout=..., env=..., cwd=...)` | `sandbox.exec({"command": cmd, "timeoutSeconds": ..., "env": ..., "workDir": ...})` |
+| `result.stdout`, `.stderr`, `.exit_code`, `.timed_out` | `result["stdout"]`, `["stderr"]`, `["exitCode"]`, `["timedOut"]` |
+| `sandbox.commands.start(cmd)`, then `handle.events()` | `sandbox.exec_stream({"command": cmd, "onStdout": ..., "onStderr": ...})`, then `handle.wait()`. See [Watch output while a command runs](/exec-streaming/#watch-output-while-a-command-runs). |
+| `handle.signal(sig)` | `handle.signal("INT")`. See [Stop a command](/exec-streaming/#stop-a-command). |
+| `commands.start(..., pty=...)` | `exec_stream` with `"tty": True` ([details](/exec-streaming/#run-an-interactive-program)), or a [terminal session](/sessions/) that keeps running after you disconnect |
+
+### Files
+
+| agent-sandbox call | AerolVM call |
+|---|---|
+| `files.write(path, content)` | `upload_file(path, data)` |
+| `files.read(path)` | `download_file(path)`, with `max_bytes=` to set a limit |
+| `files.read_to(path, dest, max_bytes=...)` | `download_file_to(path, dest, max_bytes=...)`. See [Move big files without filling memory](/file-system/#move-big-files-without-filling-memory). |
+| `SandboxFileConfig(max_download_size=...)` | No setting for the whole client. Pass `max_bytes=` on each download. |
+| `files.list(path)` | `list_files(path)` |
+| `files.exists(path)` | `file_exists(path)` |
+| `files.delete(path, recursive=True)` | `delete_file(path, recursive=True)` |
+| `sandbox.watcher` | `watch_files(path, on_event)`. See [File watching](/file-watching/). |
+
+### Ports
+
+| agent-sandbox call | AerolVM call |
+|---|---|
+| `server_port=` on the connection config | Not needed for commands and files: the SDK reaches the sandbox through the server. To reach your own app on a port, call `sandbox.expose_port(port)`. Add `visibility="token"` so only people with a [sandbox token](/sandbox-tokens/) get in. See [Public URLs](/public-urls/). |
+
+### Delete sandboxes
+
+| agent-sandbox call | AerolVM call |
+|---|---|
+| `sandbox.terminate()` | `sandbox.destroy()` |
+| `delete_sandbox(claim_name, namespace)` | `client.destroy(id)` |
+| `delete_all()` | `destroy_all(tags={...})`. It needs at least one tag. |
+| `with SandboxClient(...) as client:`, or Go's `EnableAutoCleanup()` | `with client.create(..., destroy_on_exit=True) as sandbox:`. Every SDK has a block like this. See [Delete it when your code is done](#delete-it-when-your-code-is-done). |
+
+## Create a sandbox
+
+In agent-sandbox, a create names a warm pool, and the template behind it sets the image. In AerolVM, a create names the image itself. This example also adds tags, an environment variable and a one-hour age limit, like agent-sandbox's `labels`, `env` and `shutdown_after_seconds`.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const HOUR = 60 * 60 * 1_000_000_000; // one hour in nanoseconds
+
+    const sandbox = await client.create({
+      image: "python:3.12-slim",
+      tags: { team: "agents", run: "run-42" },
+      env: { FOO: "bar" },
+      lifecycle: { destroyAtAge: HOUR },
+    });
+    console.log(sandbox.id); // sb-1a2b3c4d5e6f7a8b
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    HOUR = 60 * 60 * 1_000_000_000  # one hour in nanoseconds
+
+    sandbox = client.create(
+        image="python:3.12-slim",
+        tags={"team": "agents", "run": "run-42"},
+        env={"FOO": "bar"},
+        lifecycle={"destroyAtAge": HOUR},
+    )
+    print(sandbox.id)  # sb-1a2b3c4d5e6f7a8b
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    sandbox, err := client.Create(ctx, sdktypes.CreateSandboxOptions{
+        Image:     "python:3.12-slim",
+        Tags:      map[string]string{"team": "agents", "run": "run-42"},
+        Env:       map[string]string{"FOO": "bar"},
+        Lifecycle: &sdktypes.Lifecycle{DestroyAtAge: time.Hour},
+    })
+    if err != nil {
+        log.Fatal(err)
+    }
+    fmt.Println(sandbox.ID) // sb-1a2b3c4d5e6f7a8b
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    use aerolvm_sdk::{CreateOptions, Lifecycle};
+    use std::collections::HashMap;
+
+    let hour: u64 = 60 * 60 * 1_000_000_000; // one hour in nanoseconds
+
+    let sandbox = client.create(CreateOptions {
+        image: "python:3.12-slim".into(),
+        tags: Some(HashMap::from([
+            ("team".to_string(), "agents".to_string()),
+            ("run".to_string(), "run-42".to_string()),
+        ])),
+        env: Some(HashMap::from([("FOO".to_string(), "bar".to_string())])),
+        lifecycle: Some(Lifecycle { destroy_at_age: hour, ..Default::default() }),
+        ..Default::default()
+    })?;
+    println!("{}", sandbox.data.id); // sb-1a2b3c4d5e6f7a8b
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    long hour = Duration.ofHours(1).toNanos(); // java.time.Duration
+
+    CreateOptions options = new CreateOptions()
+        .setImage("python:3.12-slim")
+        .setEnv(Map.of("FOO", "bar"))
+        .setLifecycle(new Lifecycle().setDestroyAtAge(hour));
+    options.tags = Map.of("team", "agents", "run", "run-42"); // there is no setTags()
+    Sandbox sandbox = client.create(options);
+    System.out.println(sandbox.id); // sb-1a2b3c4d5e6f7a8b
+    ```
+  </TabItem>
+</Tabs>
+
+- **The sandbox is running when the call returns.** There is no ready timeout to set.
+- **Warm pools work by image.** Your server operator sets up [warm pools](/warm-pools/), one per image. A create for that image gets a waiting sandbox by itself. You do not name the pool.
+- **`env` skips the warm pool,** as it does in agent-sandbox. So do mounts, volumes and a few other settings ([the full list](/warm-pools/#create-from-a-warm-pool)). To keep the fast start, leave `env` out and pass variables to each command instead, as in the next section.
+- **Times are in nanoseconds** in TypeScript, Python, Rust and Java. Go takes a `time.Duration`. [Lifecycle](/lifecycle/) has other timers too, such as delete after an idle hour.
+- **Pick the isolation per sandbox** with `runtime`: `"gvisor"` for a [gVisor sandbox](/gvisor-sandbox/), or `"firecracker"` for a [microVM](/firecracker-sandbox/). Leave it out for a [container](/container-sandbox/).
+
+### Reuse a sandbox by name
+
+agent-sandbox uses `claim_name` with `adopt_existing=True` to pick up a sandbox that is already there. In AerolVM, `getOrCreate` does this. It returns your sandbox with that name, or creates it. `created` tells you which one happened, so you set the sandbox up only once.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const { sandbox, created } = await client.getOrCreate("build-box", {
+      image: "python:3.12-slim",
+    });
+    if (created) {
+      await sandbox.exec("pip install requests");
+    }
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    sandbox, created = client.get_or_create("build-box", image="python:3.12-slim")
+    if created:
+        sandbox.exec("pip install requests")
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    sandbox, created, err := client.GetOrCreate(ctx, "build-box", sdktypes.CreateSandboxOptions{
+        Image: "python:3.12-slim",
+    })
+    if err != nil {
+        log.Fatal(err)
+    }
+    if created {
+        if _, err := sandbox.ExecCommand(ctx, "pip install requests"); err != nil {
+            log.Fatal(err)
+        }
+    }
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    let (sandbox, created) = client.get_or_create(
+        "build-box",
+        CreateOptions {
+            image: "python:3.12-slim".to_string(),
+            ..Default::default()
+        },
+    )?;
+    if created {
+        sandbox.exec("pip install requests")?;
+    }
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    GetOrCreateResult result = client.getOrCreate(
+        "build-box", new CreateOptions().setImage("python:3.12-slim"));
+    if (result.isCreated()) {
+        result.getSandbox().exec("pip install requests");
+    }
+    ```
+  </TabItem>
+</Tabs>
+
+It is safe to call from many programs at once: they all end up with the same sandbox. An existing sandbox comes back as it is, even if your options are different. See [Get or create by name](/sandboxes/#get-or-create-by-name).
+
+## Run a command
+
+`exec` runs a command and waits for it to end. Pass the working folder, extra environment variables and a time limit, like `cwd`, `env` and `command_timeout` in agent-sandbox.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const result = await sandbox.exec({
+      command: "echo $GREETING from $(pwd)",
+      workDir: "/tmp",
+      env: { GREETING: "hello" },
+      timeoutSeconds: 30,
+    });
+    console.log(result.stdout);   // hello from /tmp
+    console.log(result.stderr);   // (empty)
+    console.log(result.exitCode); // 0
+    console.log(result.timedOut); // false
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    result = sandbox.exec({
+        "command": "echo $GREETING from $(pwd)",
+        "workDir": "/tmp",
+        "env": {"GREETING": "hello"},
+        "timeoutSeconds": 30,
+    })
+    print(result["stdout"])    # hello from /tmp
+    print(result["stderr"])    # (empty)
+    print(result["exitCode"])  # 0
+    print(result["timedOut"])  # False
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    result, err := sandbox.Exec(ctx, sdktypes.ExecRequest{
+        Command:        "echo $GREETING from $(pwd)",
+        WorkDir:        "/tmp",
+        Env:            map[string]string{"GREETING": "hello"},
+        TimeoutSeconds: 30,
+    })
+    if err != nil {
+        log.Fatal(err)
+    }
+    fmt.Print(result.Stdout)     // hello from /tmp
+    fmt.Print(result.Stderr)     // (empty)
+    fmt.Println(result.ExitCode) // 0
+    fmt.Println(result.TimedOut) // false
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    use aerolvm_sdk::ExecRequest;
+    use std::collections::HashMap;
+
+    let result = sandbox.exec(ExecRequest {
+        command: "echo $GREETING from $(pwd)".into(),
+        work_dir: Some("/tmp".into()),
+        env: Some(HashMap::from([("GREETING".to_string(), "hello".to_string())])),
+        timeout_seconds: Some(30),
+        ..Default::default()
+    })?;
+    print!("{}", result.stdout);      // hello from /tmp
+    print!("{}", result.stderr);      // (empty)
+    println!("{}", result.exit_code); // 0
+    println!("{}", result.timed_out); // false
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    ExecResult result = sandbox.exec(new ExecRequest()
+        .setCommand("echo $GREETING from $(pwd)")
+        .setWorkDir("/tmp")
+        .setEnv(Map.of("GREETING", "hello"))
+        .setTimeoutSeconds(30));
+    System.out.print(result.stdout);     // hello from /tmp
+    System.out.print(result.stderr);     // (empty)
+    System.out.println(result.exitCode); // 0
+    System.out.println(result.timedOut); // false
+    ```
+  </TabItem>
+</Tabs>
+
+- **A failed command is not an error.** Check the exit code, as you do with agent-sandbox's `exit_code`.
+- **When the time limit runs out,** the command and everything it started are stopped. The exit code is `-1`, `signal` is `SIGKILL`, and `timedOut` is true. Without a limit, a command may run for 300 seconds (5 minutes).
+- **The time limit is for the command, not the call.** agent-sandbox's `timeout` sets how long your code waits for an answer. To limit the wait in AerolVM, see [Give one call a time limit](/sdk-setup/#give-one-call-a-time-limit).
+- **To see output while it runs,** use `execStream` in place of agent-sandbox's `commands.start`. See [Run commands](/exec-streaming/#watch-output-while-a-command-runs).
+
+## Move files
+
+Upload a file, download it with a size limit, and list a folder. These match `files.write`, `files.read` and `files.list`.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    await sandbox.uploadFile("/workspace/data.csv", "a,b\n1,2\n");
+
+    const bytes = await sandbox.downloadFile("/workspace/data.csv", { maxBytes: 10_000_000 });
+    console.log(new TextDecoder().decode(bytes));
+
+    const listing = await sandbox.listFiles("/workspace");
+    for (const entry of listing.entries) {
+      console.log(entry.path, entry.isDir, entry.size);
+    }
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    sandbox.upload_file("/workspace/data.csv", b"a,b\n1,2\n")
+
+    data = sandbox.download_file("/workspace/data.csv", max_bytes=10_000_000)
+    print(data.decode())
+
+    listing = sandbox.list_files("/workspace")
+    for entry in listing["entries"]:
+        print(entry["path"], entry["isDir"], entry["size"])
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    if err := sandbox.UploadFile(ctx, "/workspace/data.csv", []byte("a,b\n1,2\n")); err != nil {
+        log.Fatal(err)
+    }
+
+    data, err := sandbox.DownloadFileWithOptions(ctx, "/workspace/data.csv",
+        sdktypes.DownloadFileOptions{MaxBytes: 10_000_000})
+    if err != nil {
+        log.Fatal(err)
+    }
+    fmt.Print(string(data))
+
+    listing, err := sandbox.ListFiles(ctx, "/workspace", sdktypes.ListFilesOptions{})
+    if err != nil {
+        log.Fatal(err)
+    }
+    for _, entry := range listing.Entries {
+        fmt.Println(entry.Path, entry.IsDir, entry.Size)
+    }
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    use aerolvm_sdk::{DownloadFileOptions, ListFilesOptions};
+
+    sandbox.upload_file("/workspace/data.csv", b"a,b\n1,2\n".to_vec())?;
+
+    let data = sandbox.download_file_with_options(
+        "/workspace/data.csv",
+        DownloadFileOptions { max_bytes: Some(10_000_000) },
+    )?;
+    print!("{}", String::from_utf8_lossy(&data));
+
+    let listing = sandbox.list_files("/workspace", ListFilesOptions::default())?;
+    for entry in &listing.entries {
+        println!("{} {} {}", entry.path, entry.is_dir, entry.size);
+    }
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    sandbox.uploadFile("/workspace/data.csv", "a,b\n1,2\n".getBytes(StandardCharsets.UTF_8));
+
+    byte[] data = sandbox.downloadFile("/workspace/data.csv",
+        new DownloadFileOptions().setMaxBytes(10_000_000L));
+    System.out.print(new String(data, StandardCharsets.UTF_8));
+
+    FileList listing = sandbox.listFiles("/workspace");
+    for (FileInfo entry : listing.entries) {
+        System.out.println(entry.path + " " + entry.isDir + " " + entry.size);
+    }
+    ```
+  </TabItem>
+</Tabs>
+
+- **Use full paths** that start with `/`. agent-sandbox takes paths inside the sandbox's working folder. AerolVM does not.
+- **Missing folders are made for you** on upload. Here, `/workspace` does not need to exist yet.
+- **A file over the limit fails** with an error, never with part of the file. See [Limit how much you download](/file-system/#limit-how-much-you-download) for the error in each SDK.
+- **For big files,** stream them to and from disk, like agent-sandbox's `read_to`. See [Move big files without filling memory](/file-system/#move-big-files-without-filling-memory).
+
+[Files](/file-system/) covers the rest: check a path, delete, make folders, move, copy and search.
+
+## Clean up
+
+Delete one sandbox, or every sandbox with a tag. `destroyAll` takes the place of agent-sandbox's `delete_all`. agent-sandbox deletes the sandboxes that one client tracks. AerolVM deletes every sandbox of yours that has the tags you pass, so tag each run's sandboxes, as in [Create a sandbox](#create-a-sandbox). It returns the IDs it deleted.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    await sandbox.destroy();
+
+    // Delete every sandbox that has this tag.
+    const deleted = await client.destroyAll({ tags: { run: "run-42" } });
+    console.log(`deleted ${deleted.length} sandboxes`);
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    sandbox.destroy()
+
+    # Delete every sandbox that has this tag.
+    deleted = client.destroy_all(tags={"run": "run-42"})
+    print(f"deleted {len(deleted)} sandboxes")
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    if err := sandbox.Destroy(ctx); err != nil {
+        log.Fatal(err)
+    }
+
+    // Delete every sandbox that has this tag.
+    deleted, err := client.DestroyAll(ctx, map[string]string{"run": "run-42"})
+    if err != nil {
+        log.Fatal(err)
+    }
+    fmt.Printf("deleted %d sandboxes\n", len(deleted))
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    sandbox.destroy()?;
+
+    // Delete every sandbox that has this tag.
+    let tags = HashMap::from([("run".to_string(), "run-42".to_string())]);
+    let deleted = client.destroy_all(&tags)?;
+    println!("deleted {} sandboxes", deleted.len());
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    sandbox.destroy();
+
+    // Delete every sandbox that has this tag.
+    List<String> deleted = client.destroyAll(Map.of("run", "run-42"));
+    System.out.println("deleted " + deleted.size() + " sandboxes");
+    ```
+  </TabItem>
+</Tabs>
+
+`destroyAll` needs at least one tag, so it can never delete all your sandboxes by mistake. A sandbox that is already gone counts as deleted, so it is safe to run again.
+
+### Delete it when your code is done
+
+agent-sandbox's Python client deletes the sandboxes it tracks when its `with` block ends. Go's `EnableAutoCleanup` deletes them when the program gets Ctrl-C or `SIGTERM`. In AerolVM, the block is around one sandbox, and you turn the delete on yourself. Without it, the sandbox keeps running after the block.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    {
+      await using sandbox = await client.create({
+        image: "python:3.12-slim",
+        destroyOnExit: true,
+      });
+      await sandbox.exec("echo hello");
+    } // the sandbox is deleted here
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    with client.create(image="python:3.12-slim", destroy_on_exit=True) as sandbox:
+        sandbox.exec("echo hello")
+    # the sandbox is deleted here
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    sandbox, err := client.Create(ctx, sdktypes.CreateSandboxOptions{Image: "python:3.12-slim"})
+    if err != nil {
+        log.Fatal(err)
+    }
+    sandbox.DestroyOnClose = true
+    defer sandbox.Close(ctx) // deletes the sandbox when this function returns
+
+    if _, err := sandbox.ExecCommand(ctx, "echo hello"); err != nil {
+        log.Fatal(err)
+    }
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    {
+        let sandbox = client
+            .create(CreateOptions {
+                image: "python:3.12-slim".to_string(),
+                ..Default::default()
+            })?
+            .destroy_on_drop();
+        sandbox.exec("echo hello")?;
+    } // the sandbox is deleted here
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    CreateOptions options = new CreateOptions()
+        .setImage("python:3.12-slim")
+        .setDestroyOnClose(true);
+    try (Sandbox sandbox = client.create(options)) {
+        sandbox.exec("echo hello");
+    } // the sandbox is deleted here
+    ```
+  </TabItem>
+</Tabs>
+
+<Aside>
+If your program is killed, no block gets to finish. Set a [lifecycle](/lifecycle/) timer such as `destroyAtAge` as well. The server then deletes the sandbox even if your code never comes back.
+</Aside>
+
+## What is different
+
+- **No templates or warm pool names.** Each create names its image and options. To start many sandboxes from one prepared setup, save a [snapshot](/images-and-snapshots/#snapshots) and create from it.
+- **No namespaces.** Use tags to group sandboxes. With [access control](/enterprise/sso/) on, each sandbox also belongs to a team, and callers from other teams cannot see it.
+- **IDs and names.** Each sandbox has an ID like `sb-1a2b3c4d5e6f7a8b`. A name is optional, and it is unique for your account.
+- **Commands run in a shell.** `command` is one string that `/bin/sh` reads, like agent-sandbox's Python `commands.run`. The agent-sandbox TypeScript client's `commands.run("echo", ["hello"])` runs a program with no shell. For that, pass `argv: ["echo", "hello"]`. See [Pass arguments without a shell](/exec-streaming/#pass-arguments-without-a-shell).
+- **Clean-up blocks are opt-in and per sandbox.** The client itself never deletes anything when it closes.
+- **No Kata.** For a sandbox with its own kernel, use [Firecracker](/firecracker-sandbox/). [gVisor](/gvisor-sandbox/) works on any normal Linux server.
+- **Private by default.** A new sandbox has no public address. Your code still runs commands and moves files through the server. Call `exposePort` only to share an app. See [Public URLs](/public-urls/).
+
+## Next steps
+
+- [SDK setup](/sdk-setup/): install an SDK, and handle errors and retries.
+- [Create and manage sandboxes](/sandboxes/): every create option, and stop, start and resize.
+- [Run commands](/exec-streaming/): streams, input, terminals and signals.
+- [Files](/file-system/): every file call.
+- [Warm pools](/warm-pools/): how your operator keeps sandboxes ready for fast starts.
+- [Lifecycle](/lifecycle/): stop or delete sandboxes on a timer.

@@ -32,6 +32,12 @@ const (
 	// auditSubsystemEgress is the egress gateway reading a sandbox's
 	// environment to inject a credential into its outbound traffic.
 	auditSubsystemEgress = "egress"
+	// auditSubsystemRuntime is the runtime event monitor: a sandbox that
+	// exited, or was removed, without sandboxd asking.
+	auditSubsystemRuntime = "runtime"
+	// auditSubsystemFleet is the managed control plane's standing
+	// directives (suspend, delete) acting on an owner's sandboxes.
+	auditSubsystemFleet = "fleet"
 )
 
 // withAuditSubsystem tags ctx as background work by subsystem. A request's

@@ -82,6 +82,9 @@ func capacityRequestFromSpec(spec *models.CreateSandboxRequest) capacity.Request
 		out.GPUs = want
 		out.GPUVendor = string(spec.GPUs.Vendor)
 	}
+	// The placement rule rides the replicated spec, so a failover recreate
+	// filters on the same labels the first create did (P1.5).
+	out.Labels = spec.Placement.RequiredLabels()
 	return out
 }
 
@@ -143,6 +146,11 @@ func (c *Cluster) SelectPlacementWithCandidates(req capacity.Request) (Placement
 	// network-slot pool). An empty candidate set with one is a cluster at
 	// capacity — ErrClusterAtCapacity — not an unexplained "no target".
 	full := false
+	// labelMatched records that some live, role-eligible worker's last-known
+	// heartbeat carries every label the rule asks for. Without one the rule
+	// is unsatisfiable (409), not a capacity wait (503): no amount of waiting
+	// gives a node a label its operator did not set.
+	labelMatched := false
 	for _, m := range all {
 		if !m.Alive {
 			rejects["dead"]++
@@ -163,11 +171,26 @@ func (c *Cluster) SelectPlacementWithCandidates(req capacity.Request) (Placement
 			continue
 		}
 		if m.CapacityStale || !hasCapacitySnapshot(m.Capacity) {
+			// A stale lease still says what the node is: if its labels
+			// match, the rule is satisfiable and this is a heartbeat wait.
+			if len(req.Labels) > 0 && hasCapacitySnapshot(m.Capacity) && models.LabelsSatisfy(m.Capacity.Labels, req.Labels) {
+				labelMatched = true
+			}
 			rejects["capacity_heartbeat"]++
 			continue
 		}
 		if req.RequiredNodeID != "" && m.NodeID == req.RequiredNodeID {
 			requiredReachable = true
+		}
+		// Placement rules filter BEFORE power-of-two-choices (P1.4), and
+		// before drain and capacity so an empty set can tell "no node has
+		// these labels" from "the nodes that have them are busy".
+		if len(req.Labels) > 0 {
+			if !models.LabelsSatisfy(m.Capacity.Labels, req.Labels) {
+				rejects["placement_rule"]++
+				continue
+			}
+			labelMatched = true
 		}
 		if drained[m.NodeID] {
 			rejects["drained"]++
@@ -206,7 +229,7 @@ func (c *Cluster) SelectPlacementWithCandidates(req capacity.Request) (Placement
 	self := PlacementTarget{NodeID: c.nodeID, APIURL: c.apiURL, DataPlaneHost: c.dataPlaneHost, InternalURL: c.internalURL, IsSelf: true}
 	if len(candidates) == 0 {
 		recordSchedulerDecision("no_target", 0, rejects)
-		return PlacementTarget{}, nil, noPlacementTargetError(req, requiredReachable, rejects["egress_gateway"] > 0, full)
+		return PlacementTarget{}, nil, noPlacementTargetError(req, requiredReachable, labelMatched, rejects["egress_gateway"] > 0, full)
 	}
 
 	// Power-of-two-choices.
@@ -385,6 +408,12 @@ func nodeFitVerdict(m Member, req capacity.Request, extraReserved capacity.Reque
 		if req.GPUVendor != "" && cap.GPUVendor != "" && req.GPUVendor != cap.GPUVendor {
 			return fitIncompatible
 		}
+	}
+	// A node without the rule's labels can never run the request. Callers
+	// that need to name the rule check it first; this keeps every other
+	// caller (failover scoring, reservation re-admission) from forgetting.
+	if !models.LabelsSatisfy(cap.Labels, req.Labels) {
+		return fitIncompatible
 	}
 	if req.Runtime != "" && len(cap.SupportedRuntimes) > 0 {
 		supported := false
@@ -669,6 +698,12 @@ func admitReservationCommands(members []Member, pending map[string]capacity.Requ
 				ErrCreateBackpressure, r.OwnerNodeID, pendingCounts[r.OwnerNodeID]+batchCounts[r.OwnerNodeID], maxPendingPerWorker)
 		}
 		req := capacityRequestFromSpec(r.Spec)
+		// The router filtered on labels, but a router on an older build did
+		// not: the leader refuses a reservation onto a node the rule
+		// excludes, so a mixed-version cluster fails closed.
+		if !models.LabelsSatisfy(m.Capacity.Labels, req.Labels) {
+			return fmt.Errorf("worker %s: %w", r.OwnerNodeID, models.PlacementUnsatisfiableError(req.Labels))
+		}
 		extra := pending[r.OwnerNodeID]
 		batchExtra := batchPending[r.OwnerNodeID]
 		extra.CPU += batchExtra.CPU
@@ -772,12 +807,19 @@ var _ = func() error {
 // fails as ErrNoEgressGatewayTarget so the client is told why: some node may
 // have had room, none could filter hostnames.
 //
+// A request with a placement rule that no live worker's labels satisfy fails
+// as ErrPlacementUnsatisfiable naming the rule: a 409, because waiting does
+// not change a node's labels, and never a fallback to an unlabelled node.
+//
 // Otherwise, when a worker that could run the request was turned away only
 // for room (full), the cluster is at capacity: ErrClusterAtCapacity says so,
 // and stays an ErrNoPlacementTarget for every existing 503 mapping.
-func noPlacementTargetError(req capacity.Request, requiredReachable, gatewayRejected, full bool) error {
+func noPlacementTargetError(req capacity.Request, requiredReachable, labelMatched, gatewayRejected, full bool) error {
 	if req.RequiredNodeID != "" && !requiredReachable {
 		return fmt.Errorf("%w (node %q)", ErrArtifactNodeUnavailable, req.RequiredNodeID)
+	}
+	if len(req.Labels) > 0 && !labelMatched {
+		return models.PlacementUnsatisfiableError(req.Labels)
 	}
 	if req.NeedsEgressGateway && gatewayRejected {
 		return ErrNoEgressGatewayTarget

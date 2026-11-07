@@ -134,6 +134,13 @@ class RecordingMicroVM(MicroVM):
                 "suggested_allow_out": [],
                 "suggested_profile": {"allow_out": ["x.example"], "description": "d"},
             }
+        if path.startswith("/v1/teams/"):
+            if method == "DELETE":
+                return None
+            return {
+                "team": "risk", "max_sandboxes": 3, "max_cpu": 4.0, "generation": 1, "created_at": "c", "updated_at": "u",
+                "usage": {"sandboxes": 2, "cpu": 1.5, "memory_mb": 1024},
+            }
         if path.startswith("/v1/egress-profiles"):
             if method == "DELETE":
                 return None
@@ -659,6 +666,16 @@ class ClientTests(unittest.TestCase):
         )
         self.assertEqual(sandbox.failover, {"policy": "recreate"})
 
+    def test_create_sends_placement_rule(self):
+        client = RecordingMicroVM()
+        client.create({"image": "ubuntu:22.04", "placement": {"zone": "eu-west-1a", "labels": {"tier": "pci"}}})
+        self.assertEqual(client.calls[0][2]["placement"], {"zone": "eu-west-1a", "labels": {"tier": "pci"}})
+        # A zone alone sends only the zone, and no rule sends no key at all.
+        client.create({"image": "ubuntu:22.04", "placement": {"zone": "eu-west-1a"}})
+        self.assertEqual(client.calls[1][2]["placement"], {"zone": "eu-west-1a"})
+        client.create({"image": "ubuntu:22.04"})
+        self.assertNotIn("placement", client.calls[2][2])
+
     def test_update_lifecycle_maps_request_and_updates_sandbox_state(self):
         client = RecordingMicroVM()
 
@@ -749,6 +766,37 @@ class ClientTests(unittest.TestCase):
                 "serverless": True,
             },
         )
+
+    def test_create_round_trips_restart_on_failure(self):
+        client = RecordingMicroVM()
+        sandbox = client.create({"image": "ubuntu:22.04", "lifecycle": {"restartOnFailure": True}})
+
+        self.assertEqual(client.calls[0][2]["lifecycle"], {"restart_on_failure": True})
+        self.assertEqual(sandbox.lifecycle, {"restartOnFailure": True})
+        # An explicit False goes on the wire as false, which the server reads as off.
+        client.create({"image": "ubuntu:22.04", "lifecycle": {"restartOnFailure": False, "stopAtAge": 5}})
+        self.assertEqual(client.calls[1][2]["lifecycle"], {"restart_on_failure": False, "stop_at_age": 5})
+
+    def test_destroy_at_goes_out_as_rfc3339(self):
+        import datetime as dt
+
+        client = RecordingMicroVM()
+        at = dt.datetime(2026, 11, 6, 18, 0, tzinfo=dt.timezone.utc)
+        client.create({"image": "ubuntu:22.04", "lifecycle": {"destroyAt": at}})
+        self.assertEqual(client.calls[0][2]["lifecycle"], {"destroy_at": "2026-11-06T18:00:00+00:00"})
+        client.create({"image": "ubuntu:22.04", "lifecycle": {"destroyAt": dt.datetime(2026, 11, 6, 18, 0)}})
+        self.assertEqual(client.calls[1][2]["lifecycle"], {"destroy_at": "2026-11-06T18:00:00+00:00"})
+        client.create({"image": "ubuntu:22.04", "lifecycle": {"destroyAt": "2026-11-06T18:00:00Z"}})
+        self.assertEqual(client.calls[2][2]["lifecycle"], {"destroy_at": "2026-11-06T18:00:00Z"})
+        with self.assertRaises(TypeError):
+            client.create({"image": "ubuntu:22.04", "lifecycle": {"destroyAt": 12345}})
+
+    def test_create_round_trips_destroy_after_exit_for(self):
+        client = RecordingMicroVM()
+        sandbox = client.create({"image": "ubuntu:22.04", "lifecycle": {"destroyAfterExitFor": 60_000_000_000}})
+
+        self.assertEqual(client.calls[0][2]["lifecycle"], {"destroy_after_exit_for": 60_000_000_000})
+        self.assertEqual(sandbox.lifecycle, {"destroyAfterExitFor": 60_000_000_000})
 
     def test_create_snapshot_maps_request_and_response_shapes(self):
         client = RecordingMicroVM()
@@ -924,8 +972,16 @@ class ClientTests(unittest.TestCase):
         )
         self.assertEqual(result["exitCode"], 0)
         self.assertEqual(result["durationMS"], 5)
+        self.assertFalse(result["timedOut"])
         self.assertEqual(health["status"], "ok")
         self.assertEqual(health["sshGateway"], "disabled")
+
+    def test_exec_result_maps_timed_out(self):
+        from microvm.client import _from_api_exec_result
+
+        timed_out = _from_api_exec_result({"stdout": "", "stderr": "", "exit_code": -1, "duration_ms": 1000, "timed_out": True})
+        self.assertTrue(timed_out["timedOut"])
+        self.assertEqual(timed_out["exitCode"], -1)
 
     def test_mounts_maps_redacted_mount_shapes(self):
         client = RecordingMicroVM()
@@ -955,6 +1011,8 @@ class ClientTests(unittest.TestCase):
                 "platformVolumes": [
                     {"name": "data", "path": "/workspace"},
                     {"name": "cache", "path": "/cache", "readOnly": True},
+                    {"name": "scratch", "path": "/scratch", "deleteWithSandbox": True},
+                    {"name": "tmp", "path": "/tmp/vol", "delete_with_sandbox": True},
                 ],
             }
         )
@@ -964,6 +1022,8 @@ class ClientTests(unittest.TestCase):
             [
                 {"name": "data", "path": "/workspace"},
                 {"name": "cache", "path": "/cache", "read_only": True},
+                {"name": "scratch", "path": "/scratch", "delete_with_sandbox": True},
+                {"name": "tmp", "path": "/tmp/vol", "delete_with_sandbox": True},
             ],
         )
 
@@ -1011,14 +1071,27 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(_from_api_sandbox({"id": "sb", "egress_status": "unavailable"})["egressStatus"], "unavailable")
         self.assertNotIn("egressStatus", _from_api_sandbox({"id": "sb"}))
 
+    def test_sandbox_maps_status_reason_and_exit_code(self):
+        from microvm.client import _from_api_sandbox
+
+        crashed = _from_api_sandbox({"id": "sb", "status": "stopped", "status_reason": "crashed", "exit_code": 3})
+        self.assertEqual(crashed["statusReason"], "crashed")
+        self.assertEqual(crashed["exitCode"], 3)
+        # Exit code 0 is a real exit, not "no exit".
+        exited = _from_api_sandbox({"id": "sb", "status_reason": "program_exited", "exit_code": 0})
+        self.assertEqual(exited["exitCode"], 0)
+        plain = _from_api_sandbox({"id": "sb", "status": "started"})
+        self.assertNotIn("statusReason", plain)
+        self.assertNotIn("exitCode", plain)
+
     def test_get_audit_sends_filters_and_maps_page(self):
         client = RecordingMicroVM()
 
-        page = client.get_audit("sb-1", {"kind": "egress", "limit": 50, "cursor": "c1", "incarnationID": "inc-1"})
+        page = client.get_audit("sb-1", {"kind": "egress", "limit": 50, "cursor": "c1", "incarnationID": "inc-1", "caller": "system:*"})
 
         self.assertEqual(
             client.calls[0],
-            ("GET", "/v1/sandboxes/sb-1/audit?kind=egress&limit=50&cursor=c1&incarnation_id=inc-1", None),
+            ("GET", "/v1/sandboxes/sb-1/audit?kind=egress&limit=50&cursor=c1&incarnation_id=inc-1&caller=system%3A%2A", None),
         )
         self.assertEqual(page["events"][0]["reason"], "host_not_allowed")
         self.assertEqual(page["events"][0]["eventID"], "ae-1")
@@ -1063,6 +1136,91 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(page["nextCursor"], "python")
         client.delete_egress_profile("python")
         self.assertEqual(client.calls[3][:2], ("DELETE", "/v1/egress-profiles/python"))
+
+    def test_warm_pool_crud(self):
+        client = MicroVM(api_url="https://sandbox.example.com", pat_token="pat-token")
+        calls = []
+        wire = {
+            "image": "ghcr.io/acme/agent:1",
+            "depth": 2,
+            "generation": 1,
+            "created_at": "c",
+            "updated_at": "u",
+            "status": {"ready": 3, "target": 4, "servers": [{"node_id": "n1", "ready": 2, "target": 2}, {"node_id": "n2", "ready": 1, "target": 2, "stale": True}]},
+        }
+
+        def fake(method, path, payload, *, idempotent=True, headers=None):
+            calls.append((method, path, payload, idempotent))
+            if method == "DELETE":
+                return None
+            if method == "PUT":
+                return {k: v for k, v in wire.items() if k != "status"}
+            if path.endswith("/warm-pools"):
+                return {"pools": [wire] if len(calls) < 4 else None}
+            return wire
+
+        client._do_json = fake  # type: ignore[assignment]
+        pool = client.put_warm_pool("ghcr.io/acme/agent:1", {"depth": 2})
+        self.assertEqual(pool, {"image": "ghcr.io/acme/agent:1", "depth": 2, "onImageChange": "replace_now", "generation": 1, "createdAt": "c", "updatedAt": "u"})
+        # The image's slashes stay slashes; each segment is escaped.
+        self.assertEqual(calls[0], ("PUT", "/v1/warm-pools/ghcr.io/acme/agent%3A1", {"depth": 2}, True))
+        got = client.get_warm_pool("ghcr.io/acme/agent:1")
+        self.assertEqual(
+            got["status"],
+            {"ready": 3, "target": 4, "outdated": 0, "servers": [{"nodeId": "n1", "ready": 2, "target": 2, "outdated": 0}, {"nodeId": "n2", "ready": 1, "target": 2, "outdated": 0, "stale": True}]},
+        )
+        self.assertEqual(len(client.list_warm_pools()), 1)
+        self.assertEqual(client.list_warm_pools(), [])
+        client.delete_warm_pool("python:3.12")
+        self.assertEqual(calls[-1], ("DELETE", "/v1/warm-pools/python%3A3.12", None, True))
+        # Every warm-pool call is safe to retry.
+        self.assertTrue(all(c[3] for c in calls))
+
+    def test_warm_pool_follows_demand(self):
+        client = MicroVM(api_url="https://sandbox.example.com", pat_token="pat-token")
+        sent = []
+
+        def fake(method, path, payload, *, idempotent=True, headers=None):
+            sent.append(payload)
+            return {"image": "python:3.12", "depth": 0, "min_depth": 1, "max_depth": 4, "generation": 1}
+
+        client._do_json = fake  # type: ignore[assignment]
+        pool = client.put_warm_pool("python:3.12", {"minDepth": 1, "maxDepth": 4})
+        self.assertEqual(sent[0], {"depth": 0, "min_depth": 1, "max_depth": 4})
+        self.assertEqual((pool["minDepth"], pool["maxDepth"]), (1, 4))
+
+    def test_warm_pool_on_image_change(self):
+        client = MicroVM(api_url="https://sandbox.example.com", pat_token="pat-token")
+        sent = []
+
+        def fake(method, path, payload, *, idempotent=True, headers=None):
+            sent.append(payload)
+            return {"image": "python:3.12", "depth": 2, "on_image_change": "replace_as_used",
+                    "status": {"ready": 2, "target": 2, "outdated": 1, "servers": [{"node_id": "n1", "ready": 2, "target": 2, "outdated": 1}]}}
+
+        client._do_json = fake  # type: ignore[assignment]
+        pool = client.put_warm_pool("python:3.12", {"depth": 2, "onImageChange": "replace_as_used"})
+        self.assertEqual(sent[0], {"depth": 2, "on_image_change": "replace_as_used"})
+        self.assertEqual(pool["onImageChange"], "replace_as_used")
+        self.assertEqual((pool["status"]["outdated"], pool["status"]["servers"][0]["outdated"]), (1, 1))
+
+    def test_team_quota_calls(self):
+        client = RecordingMicroVM()
+        quota = client.put_team_quota("risk", {"maxSandboxes": 3, "maxCPU": 4})
+        self.assertEqual(client.calls[0], ("PUT", "/v1/teams/risk/quota", {"max_sandboxes": 3, "max_cpu": 4}))
+        self.assertEqual(
+            quota,
+            {
+                "team": "risk", "maxSandboxes": 3, "maxCPU": 4.0, "generation": 1, "createdAt": "c", "updatedAt": "u",
+                "usage": {"sandboxes": 2, "cpu": 1.5, "memoryMB": 1024},
+            },
+        )
+        self.assertEqual(client.get_team_quota("risk")["usage"]["sandboxes"], 2)
+        self.assertEqual(client.calls[1][:2], ("GET", "/v1/teams/risk/quota"))
+        client.delete_team_quota("risk")
+        self.assertEqual(client.calls[2][:2], ("DELETE", "/v1/teams/risk/quota"))
+        # Every quota call is safe to retry: PUT and DELETE converge.
+        self.assertEqual(client.non_idempotent_calls, [])
 
     def test_learn_mode(self):
         client = RecordingMicroVM()
@@ -1586,6 +1744,100 @@ class HTTPErrorTests(unittest.TestCase):
 
         self.assertIs(microvm.MicroVMHTTPError, MicroVMHTTPError)
         self.assertIs(microvm.MicroVMError, MicroVMError)
+        for name in (
+            "MicroVMNotFoundError",
+            "MicroVMConflictError",
+            "MicroVMCapacityError",
+            "MicroVMTimeoutError",
+            "MicroVMAuthError",
+        ):
+            self.assertIs(getattr(microvm, name), getattr(client_module, name))
+            self.assertIn(name, microvm.__all__)
+
+
+class TypedErrorTests(unittest.TestCase):
+    """Each common status raises its own MicroVMHTTPError subclass, so a
+    caller can catch the case it handles; MicroVMHTTPError still catches
+    them all, with the status, code and message unchanged."""
+
+    def _serve(self, status, body, content_type):
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def _answer(self):
+                length = int(self.headers.get("Content-Length") or 0)
+                self.rfile.read(length)
+                self.send_response(status)
+                self.send_header("Content-Type", content_type)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            do_GET = do_POST = do_DELETE = _answer
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
+        thread.start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        return MicroVM("http://127.0.0.1:%d" % server.server_port, "pat", config={"retry": {"maxRetries": 0}})
+
+    def test_status_picks_the_error_class(self):
+        cases = [
+            # (status, want class, also a builtin TimeoutError)
+            (401, client_module.MicroVMAuthError, False),
+            (403, client_module.MicroVMAuthError, False),
+            (404, client_module.MicroVMNotFoundError, False),
+            (408, client_module.MicroVMTimeoutError, True),
+            (409, client_module.MicroVMConflictError, False),
+            (503, client_module.MicroVMCapacityError, False),
+            (504, client_module.MicroVMTimeoutError, True),
+            # Statuses without a class of their own stay MicroVMHTTPError.
+            (400, MicroVMHTTPError, False),
+            (412, MicroVMHTTPError, False),
+            (422, MicroVMHTTPError, False),
+            (500, MicroVMHTTPError, False),
+            (502, MicroVMHTTPError, False),
+        ]
+        bodies = [
+            ("JSON body", b'{"error": "nope", "code": "some_code"}', "application/json", "nope", "some_code"),
+            ("proxy page", b"<html>error</html>", "text/html", None, ""),
+        ]
+        for status, want, is_timeout in cases:
+            for label, body, ctype, message, code in bodies:
+                with self.subTest(status=status, body=label):
+                    client = self._serve(status, body, ctype)
+                    with self.assertRaises(MicroVMHTTPError) as ctx:
+                        client.get("sb-1")
+                    err = ctx.exception
+                    self.assertIs(type(err), want)
+                    self.assertEqual(err.status_code, status)
+                    self.assertEqual(err.code, code)
+                    if message is not None:
+                        self.assertEqual(str(err), message)
+                    self.assertEqual(isinstance(err, TimeoutError), is_timeout)
+
+    def test_typed_errors_keep_the_identity_fields(self):
+        err = client_module._http_error(
+            403,
+            {"error": "forbidden", "code": "forbidden", "reason": "no_binding", "role": "viewer", "groups": ["a"]},
+            "Forbidden",
+        )
+        self.assertIsInstance(err, client_module.MicroVMAuthError)
+        self.assertEqual((err.reason, err.role, err.groups), ("no_binding", "viewer", ["a"]))
+
+    def test_a_typed_error_is_caught_by_the_older_except_clauses(self):
+        # Code written before the typed errors existed catches these the
+        # same way: by MicroVMHTTPError or MicroVMError.
+        client = self._serve(404, b'{"error": "sandbox not found"}', "application/json")
+        try:
+            client.destroy("sb-1")
+        except MicroVMError as err:
+            self.assertIsInstance(err, MicroVMHTTPError)
+            self.assertEqual(err.status_code, 404)
+        else:
+            self.fail("destroy of a missing sandbox did not raise")
 
 
 class IdempotencyKeyTests(unittest.TestCase):
@@ -2241,6 +2493,120 @@ class CustomDomainsTests(unittest.TestCase):
         self.assertEqual(payload["custom_domains"], ["api.acme.com", "edge.acme.com"])
 
 
+class ExposeVisibilityTests(unittest.TestCase):
+    """A2: expose_port sends visibility only when set, and maps a token port."""
+
+    def test_visibility_is_sent_only_when_set(self):
+        calls = []
+
+        class FakeMicroVM(MicroVM):
+            def __init__(self) -> None:
+                super().__init__(api_url="https://sandbox.example.com", pat_token="pat-token")
+
+            def _do_json(self, method, path, payload):  # type: ignore[override]
+                calls.append(payload)
+                out = {"protocol": "http", "public_url": "https://sb-1-3000.example.com"}
+                if payload and payload.get("visibility") == "token":
+                    out["visibility"] = "token"
+                return out
+
+        client = FakeMicroVM()
+        gated = client.expose_port("sb-1", 3000, visibility="token")
+        plain = client.expose_port("sb-1", 3000)
+        client.expose_port("sb-1", 5432, protocol="tcp")
+        self.assertEqual(calls, [{"visibility": "token"}, None, {"protocol": "tcp"}])
+        self.assertEqual(gated.visibility, "token")
+        self.assertIsNone(plain.visibility)
+
+    def test_exposed_port_maps_visibility(self):
+        mapped = client_module._from_api_exposed_port({"sandbox_id": "sb", "port": 1, "visibility": "token"})
+        self.assertEqual(mapped["visibility"], "token")
+        self.assertNotIn("visibility", client_module._from_api_exposed_port({"port": 2, "visibility": "public"}))
+
+
+class SandboxTokenTests(unittest.TestCase):
+    """POST /v1/sandboxes/{id}/tokens: the body carries only the fields the
+    caller set, and the answer maps onto SandboxToken."""
+
+    def _client(self, answer=None, status=201):
+        captured = {"calls": []}
+
+        class FakeMicroVM(MicroVM):
+            def __init__(self) -> None:
+                super().__init__(api_url="https://sandbox.example.com", pat_token="pat-token")
+
+            def _do_json(self, method, path, payload):  # type: ignore[override]
+                captured["calls"].append((method, path, payload))
+                if status >= 400:
+                    raise client_module.MicroVMHTTPError(status, "invalid sandbox token request")
+                return answer
+
+        return FakeMicroVM(), captured
+
+    def test_create_token_sends_scope_and_maps_answer(self):
+        client, captured = self._client(
+            answer={
+                "token": "avmst_0.payload.sig",
+                "token_id": "stk_abc",
+                "sandbox_id": "sb-1",
+                "path_prefix": "/files",
+                "methods": ["GET"],
+                "expires_at": "2026-11-06T10:15:00Z",
+            }
+        )
+        sandbox = client_module.Sandbox(client, {"id": "sb-1"})  # type: ignore[typeddict-item]
+        tok = sandbox.create_token(expires_in="15m", path_prefix="/files", methods=["GET"])
+        self.assertEqual(
+            captured["calls"][0],
+            ("POST", "/v1/sandboxes/sb-1/tokens", {"expires_in": "15m", "path_prefix": "/files", "methods": ["GET"]}),
+        )
+        self.assertEqual(
+            tok,
+            {
+                "token": "avmst_0.payload.sig",
+                "tokenID": "stk_abc",
+                "sandboxID": "sb-1",
+                "pathPrefix": "/files",
+                "methods": ["GET"],
+                "expiresAt": "2026-11-06T10:15:00Z",
+            },
+        )
+
+    def test_port_token_sends_only_the_port(self):
+        client, captured = self._client(
+            answer={"token": "avmst_0.p.s", "token_id": "stk_x", "sandbox_id": "sb-1", "port": 3000, "expires_at": "t"}
+        )
+        tok = client.create_sandbox_token("sb-1", expires_in="1h", port=3000, methods=[])
+        self.assertEqual(captured["calls"][0][2], {"expires_in": "1h", "port": 3000})
+        self.assertEqual(tok["port"], 3000)
+        self.assertNotIn("pathPrefix", tok)
+
+    def test_create_token_surfaces_a_400(self):
+        client, _ = self._client(status=400)
+        with self.assertRaises(client_module.MicroVMHTTPError):
+            client.create_sandbox_token("sb-1", expires_in="")
+
+    def test_create_token_tolerates_an_empty_answer(self):
+        client, _ = self._client(answer=None)
+        tok = client.create_sandbox_token("sb-1", expires_in="1m")
+        self.assertEqual(tok["token"], "")
+
+    def test_revoke_tokens_posts_no_body_and_maps_answer(self):
+        client, captured = self._client(answer={"sandbox_id": "sb-1", "tokens_not_before": "2026-11-07T10:00:01Z"}, status=200)
+        sandbox = client_module.Sandbox(client, {"id": "sb-1"})  # type: ignore[typeddict-item]
+        want = {"sandboxID": "sb-1", "tokensNotBefore": "2026-11-07T10:00:01Z"}
+        self.assertEqual(sandbox.revoke_tokens(), want)
+        self.assertEqual(client.revoke_sandbox_tokens("sb-1"), want)
+        self.assertEqual(captured["calls"], [("POST", "/v1/sandboxes/sb-1/tokens/revoke", None)] * 2)
+
+    def test_revoke_tokens_surfaces_a_404_and_an_empty_answer(self):
+        client, _ = self._client(status=404)
+        with self.assertRaises(client_module.MicroVMHTTPError):
+            client.revoke_sandbox_tokens("sb-none")
+        client, _ = self._client(answer=None, status=200)
+        self.assertEqual(client.revoke_sandbox_tokens("sb-1"), {"sandboxID": "", "tokensNotBefore": ""})
+
+
 class DNSRecordsTests(unittest.TestCase):
     """Covers the two DNS helper endpoints:
 
@@ -2779,3 +3145,213 @@ class IdentityTests(unittest.TestCase):
                     client_module._load_websocket_module = original_loader
                 self.assertEqual(exec_module.calls[0][1], want)
                 self.assertEqual(attach_module.calls[0][1], want)
+
+
+class ToolboxFeatureTests(unittest.TestCase):
+    """The SDK refuses an option an older sandbox agent would ignore."""
+
+    def _client(self, features):
+        client = MicroVM(api_url="https://sandbox.example.com", pat_token="pat-token")
+        calls = []
+
+        def fake(method, path, payload, *, idempotent=True, headers=None):
+            calls.append((method, path))
+            body = {"version": "v9"}
+            if features is not None:
+                body["features"] = features
+            return body
+
+        client._do_json = fake  # type: ignore[assignment]
+        return client, calls
+
+    def test_listed_features_pass_and_are_cached(self):
+        client, calls = self._client(["files.copy", "exec.argv"])
+        client._require_toolbox_features("sb-1", "files.copy")
+        client._require_toolbox_features("sb-1", "exec.argv", "files.copy")
+        self.assertEqual(calls, [("GET", "/v1/sandboxes/sb-1/toolbox/version")])
+
+    def test_missing_feature_fails_closed(self):
+        from microvm import MicroVMUnsupportedFeatureError
+
+        client, _ = self._client(["files.copy"])
+        with self.assertRaises(MicroVMUnsupportedFeatureError) as ctx:
+            client._require_toolbox_features("sb-1", "files.copy", "exec.argv")
+        self.assertEqual(ctx.exception.features, ["exec.argv"])
+        self.assertIn("toolboxd v9", str(ctx.exception))
+
+    def test_agent_without_a_features_list_fails_closed(self):
+        from microvm import MicroVMError, MicroVMUnsupportedFeatureError
+
+        client, _ = self._client(None)
+        with self.assertRaises(MicroVMUnsupportedFeatureError) as ctx:
+            client._require_toolbox_features("sb-1", "files.copy")
+        self.assertIsInstance(ctx.exception, MicroVMError)
+
+    def test_no_features_needs_no_call(self):
+        client, calls = self._client([])
+        client._require_toolbox_features("sb-1")
+        self.assertEqual(calls, [])
+
+    def test_a_runtime_that_cannot_offer_the_feature_says_so(self):
+        from microvm import MicroVMUnsupportedFeatureError
+
+        client = MicroVM(api_url="https://sandbox.example.com", pat_token="pat-token")
+        client._do_json = lambda *a, **k: {"version": "v9", "features": [], "runtime": "wasm"}  # type: ignore[assignment]
+        with self.assertRaises(MicroVMUnsupportedFeatureError) as ctx:
+            client._require_toolbox_features("sb-w", "files.verbs")
+        self.assertEqual(ctx.exception.runtime, "wasm")
+        self.assertIn("is a WebAssembly sandbox, which does not support files.verbs", str(ctx.exception))
+        self.assertNotIn("restart", str(ctx.exception))
+
+
+class ExecOptionsTests(unittest.TestCase):
+    """Exec options an older sandbox agent would ignore, against a real HTTP
+    server that plays the agent: the SDK reads /version first and refuses to
+    send what the agent does not list (plan section 10, ER4)."""
+
+    def _serve(self, features, result=None):
+        hits = []
+        body = json.dumps(result or {"stdout": "", "stderr": "", "exit_code": 0, "duration_ms": 1}).encode()
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def _reply(self, payload):
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def do_GET(self):
+                hits.append(("GET", self.path, None))
+                info = {"version": "0.6.11"}
+                if features is not None:
+                    info["features"] = features
+                self._reply(json.dumps(info).encode())
+
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length") or 0)
+                hits.append(("POST", self.path, json.loads(self.rfile.read(length))))
+                self._reply(body)
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
+        thread.start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        return MicroVM("http://127.0.0.1:%d" % server.server_port, "pat", config=_FAST_RETRY), hits
+
+    def test_output_caps_are_sent_when_the_agent_lists_them(self):
+        client, hits = self._serve(
+            ["exec.max_output_bytes"],
+            {"stdout": "aaaa", "stderr": "", "exit_code": 0, "duration_ms": 1, "stdout_truncated": True},
+        )
+        result = client.exec("sb-1", {"command": "yes a", "maxStdoutBytes": 4, "max_stderr_bytes": 100})
+        self.assertEqual(
+            hits,
+            [
+                ("GET", "/v1/sandboxes/sb-1/toolbox/version", None),
+                ("POST", _EXEC_PATH, {"command": "yes a", "max_stdout_bytes": 4, "max_stderr_bytes": 100}),
+            ],
+        )
+        self.assertEqual(result["stdout"], "aaaa")
+        self.assertTrue(result["stdoutTruncated"])
+        self.assertFalse(result["stderrTruncated"])
+
+    def test_mixed_version_agent_without_caps_is_refused_before_exec(self):
+        from microvm import MicroVMUnsupportedFeatureError
+
+        for features in ([], None, ["files.copy"]):
+            with self.subTest(features=features):
+                client, hits = self._serve(features)
+                with self.assertRaises(MicroVMUnsupportedFeatureError) as ctx:
+                    client.exec("sb-1", {"command": "yes", "maxStdoutBytes": 1024})
+                self.assertEqual(ctx.exception.features, ["exec.max_output_bytes"])
+                self.assertIn("restart the sandbox", str(ctx.exception))
+                # The command never ran: the only call was the /version read.
+                self.assertEqual([method for method, _, _ in hits], ["GET"])
+
+    def test_exec_without_caps_needs_no_version_call(self):
+        client, hits = self._serve([])
+        client.exec("sb-1", {"command": "ls", "maxStdoutBytes": 0})
+        self.assertEqual(hits, [("POST", _EXEC_PATH, {"command": "ls", "max_stdout_bytes": 0})])
+
+    def test_truncated_flags_default_to_false_for_older_agents(self):
+        from microvm.client import _from_api_exec_result
+
+        old = _from_api_exec_result({"stdout": "x", "stderr": "", "exit_code": 0, "duration_ms": 1})
+        self.assertFalse(old["stdoutTruncated"])
+        self.assertFalse(old["stderrTruncated"])
+        new = _from_api_exec_result({"stdout": "", "stderr": "e", "exit_code": 0, "duration_ms": 1, "stderr_truncated": True})
+        self.assertTrue(new["stderrTruncated"])
+
+    def test_argv_is_sent_when_the_agent_lists_it(self):
+        argv = ["printf", "%s|", "a b", "$HOME", "; echo pwned"]
+        client, hits = self._serve(["exec.argv"])
+        client.exec("sb-1", {"argv": argv})
+        self.assertEqual(
+            hits,
+            [
+                ("GET", "/v1/sandboxes/sb-1/toolbox/version", None),
+                ("POST", _EXEC_PATH, {"argv": argv}),
+            ],
+        )
+
+    def test_mixed_version_agent_without_argv_is_refused_before_exec(self):
+        from microvm import MicroVMUnsupportedFeatureError
+
+        for features in (None, ["exec.max_output_bytes"]):
+            with self.subTest(features=features):
+                client, hits = self._serve(features)
+                with self.assertRaises(MicroVMUnsupportedFeatureError) as ctx:
+                    client.exec("sb-1", {"argv": ["ls", "-l"], "maxStdoutBytes": 10})
+                self.assertIn("exec.argv", ctx.exception.features)
+                self.assertEqual([method for method, _, _ in hits], ["GET"])
+
+    def _stream_module(self):
+        fake_ws = FakeWebSocket([json.dumps({"type": "exit", "code": 0})])
+        fake_module = FakeWebSocketModule(fake_ws)
+        original_loader = client_module._load_websocket_module
+        client_module._load_websocket_module = lambda: fake_module
+        self.addCleanup(setattr, client_module, "_load_websocket_module", original_loader)
+        return fake_module, fake_ws
+
+    def test_exec_stream_sends_argv_when_the_agent_lists_it(self):
+        fake_module, fake_ws = self._stream_module()
+        client, hits = self._serve(["exec.argv"])
+        handle = client.exec_stream("sb-1", {"argv": ["ls", "a b"]})
+        self.assertEqual(handle.wait(1)["code"], 0)
+        self.assertEqual(hits, [("GET", "/v1/sandboxes/sb-1/toolbox/version", None)])
+        self.assertEqual(json.loads(fake_ws.sent[0][0]), {"argv": ["ls", "a b"]})
+
+    def test_exec_stream_argv_on_an_older_agent_never_opens_the_stream(self):
+        from microvm import MicroVMUnsupportedFeatureError
+
+        fake_module, _ = self._stream_module()
+        client, _ = self._serve([])
+        with self.assertRaises(MicroVMUnsupportedFeatureError):
+            client.exec_stream("sb-1", {"argv": ["ls"]})
+        self.assertEqual(fake_module.calls, [])
+
+    def test_exec_stream_command_or_argv(self):
+        fake_module, _ = self._stream_module()
+        client, hits = self._serve(["exec.argv"])
+        for options, message in (
+            ({"command": "ls", "argv": ["ls"]}, "set command or argv, not both"),
+            ({"command": "  "}, "command is required"),
+            ({}, "command is required"),
+        ):
+            with self.assertRaises(MicroVMError) as ctx:
+                client.exec_stream("sb-1", options)
+            self.assertEqual(str(ctx.exception), message)
+        self.assertEqual((hits, fake_module.calls), ([], []))
+
+    def test_exec_result_reads_the_signal(self):
+        from microvm.client import _from_api_exec_result
+
+        killed = _from_api_exec_result({"stdout": "", "stderr": "", "exit_code": -1, "duration_ms": 1000, "timed_out": True, "signal": "SIGKILL"})
+        self.assertEqual((killed["signal"], killed["exitCode"]), ("SIGKILL", -1))
+        older = _from_api_exec_result({"stdout": "", "stderr": "", "exit_code": -1, "duration_ms": 1})
+        self.assertEqual(older["signal"], "")

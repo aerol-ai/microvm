@@ -1,0 +1,520 @@
+"""File verbs beyond upload and download (plans/agent-sandbox-feature-
+parity.md, F1): the toolbox routes they call, the /version check before an
+option an older agent would ignore, and each verb's retry rule."""
+
+import http.server
+import json
+import threading
+import unittest
+import urllib.parse
+
+from microvm import DEFAULT_LIST_LIMIT, MicroVM, MicroVMError, MicroVMHTTPError, MicroVMUnsupportedFeatureError
+
+_FAST_RETRY = {"retry": {"maxRetries": 3, "baseDelayMs": 1, "maxDelayMs": 1}}
+
+
+class FakeToolbox:
+    """A local server standing in for sandboxd's toolbox pass-through.
+    ``reply(method, path, query, n)`` answers call ``n`` (from 0) of one
+    method and path with ``(status, body, headers)``."""
+
+    def __init__(self, features, reply):
+        self.features = features
+        self.reply = reply
+        self.calls = []
+        counts = {}
+        outer = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def _handle(self):
+                parsed = urllib.parse.urlsplit(self.path)
+                query = dict(urllib.parse.parse_qsl(parsed.query))
+                if parsed.path.endswith("/toolbox/version"):
+                    self._send(200, {"version": "test", "features": outer.features}, {})
+                    return
+                key = (self.command, parsed.path)
+                n = counts.get(key, 0)
+                counts[key] = n + 1
+                outer.calls.append((self.command, parsed.path, query))
+                status, body, headers = outer.reply(self.command, parsed.path, query, n)
+                self._send(status, body, headers)
+
+            def _send(self, status, body, headers):
+                data = b"" if body is None else json.dumps(body).encode("utf-8")
+                self.send_response(status)
+                for name, value in headers.items():
+                    self.send_header(name, value)
+                if data:
+                    self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            do_GET = do_POST = do_DELETE = _handle
+
+            def log_message(self, *args):
+                pass
+
+        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.client = MicroVM(f"http://127.0.0.1:{self.server.server_address[1]}", "pat", config=_FAST_RETRY)
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+    def routes(self):
+        return [(method, path.split("/toolbox", 1)[1]) for method, path, _ in self.calls]
+
+
+def _err(message, code=""):
+    body = {"error": message}
+    if code:
+        body["code"] = code
+    return body
+
+
+class FileVerbTests(unittest.TestCase):
+    def serve(self, reply, features=("files.verbs",)):
+        fake = FakeToolbox(list(features), reply)
+        self.addCleanup(fake.close)
+        return fake
+
+    def test_list_files_sends_depth_and_cap_and_reads_extended_info(self):
+        def reply(method, path, query, n):
+            entries = [
+                {"name": "a", "isDir": True, "size": 64, "path": "/w/a", "size_bytes": 64, "mode": "drwxr-xr-x"},
+                {"name": "big", "size": 2147483647, "path": "/w/big", "size_bytes": 5 << 30},
+                {"name": "link", "size": 4, "path": "/w/link", "size_bytes": 4, "symlink_target": "a"},
+                {"name": "old"},
+            ]
+            return 200, entries, {"X-Toolbox-Truncated": "true"}
+
+        fake = self.serve(reply)
+        listing = fake.client.list_files("sb-1", "/w")
+        _, _, query = fake.calls[0]
+        self.assertEqual(query, {"path": "/w", "depth": "1", "limit": str(DEFAULT_LIST_LIMIT), "extended": "true"})
+        self.assertTrue(listing["truncated"])
+        self.assertEqual([e["path"] for e in listing["entries"]], ["/w/a", "/w/big", "/w/link", "/w/old"])
+        self.assertEqual(listing["entries"][1]["size"], 5 << 30)
+        self.assertEqual(listing["entries"][2]["symlinkTarget"], "a")
+        self.assertTrue(listing["entries"][0]["isDir"])
+        self.assertNotIn("symlinkTarget", listing["entries"][0])
+
+        fake.client.list_files("sb-1", "/w", depth=3, limit=5)
+        self.assertEqual(fake.calls[1][2]["depth"], "3")
+        self.assertEqual(fake.calls[1][2]["limit"], "5")
+        with self.assertRaises(MicroVMError):
+            fake.client.list_files("sb-1", "/w", depth=0)
+
+    def test_untruncated_listing(self):
+        fake = self.serve(lambda method, path, query, n: (200, [], {}))
+        self.assertEqual(fake.client.list_files("sb-1", "/"), {"entries": [], "truncated": False})
+
+    def test_older_agent_fails_closed_before_any_file_call(self):
+        fake = self.serve(lambda method, path, query, n: (204, None, {}), features=())
+        calls = {
+            "list_files": lambda: fake.client.list_files("sb-1", "/"),
+            "move_file": lambda: fake.client.move_file("sb-1", "/a", "/b"),
+            "copy_file": lambda: fake.client.copy_file("sb-1", "/a", "/b"),
+            "make_dir": lambda: fake.client.make_dir("sb-1", "/d"),
+        }
+        for name, call in calls.items():
+            with self.subTest(name):
+                with self.assertRaises(MicroVMUnsupportedFeatureError) as ctx:
+                    call()
+                self.assertEqual(ctx.exception.features, ["files.verbs"])
+        self.assertEqual(fake.calls, [])
+        # An older agent does what these ask anyway, so no check is needed.
+        fake.client.move_file("sb-1", "/a", "/b", overwrite=True)
+        fake.client.make_dir("sb-1", "/d", parents=True)
+        self.assertEqual(fake.calls[0][2]["overwrite"], "true")
+        self.assertEqual(fake.calls[1][2]["parents"], "true")
+
+    def test_get_file_info_and_exists(self):
+        answers = {
+            "/new": (200, {"name": "new", "size": 2147483647, "size_bytes": 3 << 30, "path": "/new", "isDir": False}),
+            "/old": (200, {"name": "old", "size": 12}),
+            "/gone": (404, _err("stat /gone: no such file or directory", "file_not_found")),
+            "/gone-old": (404, _err("stat /gone-old: no such file or directory")),
+            "/no-sandbox": (404, _err("sandbox not found")),
+            "/broken": (403, _err("permission denied")),
+        }
+        fake = self.serve(lambda method, path, query, n: (*answers[query["path"]], {}))
+        info = fake.client.get_file_info("sb-1", "/new")
+        self.assertEqual((info["size"], info["path"]), (3 << 30, "/new"))
+        self.assertEqual(fake.calls[0][2]["extended"], "true")
+        old = fake.client.get_file_info("sb-1", "/old")
+        self.assertEqual((old["size"], old["path"]), (12, "/old"))
+        self.assertTrue(fake.client.file_exists("sb-1", "/new"))
+        self.assertFalse(fake.client.file_exists("sb-1", "/gone"))
+        self.assertFalse(fake.client.file_exists("sb-1", "/gone-old"))
+        for path in ("/no-sandbox", "/broken"):
+            with self.assertRaises(MicroVMHTTPError):
+                fake.client.file_exists("sb-1", path)
+        # No /version round trip: extended only adds fields.
+        self.assertTrue(all(not p.endswith("/version") for _, p, _ in fake.calls))
+
+    def test_retried_delete_and_mkdir_count_work_already_done(self):
+        # n counts per route and every delete is one route (the path is in
+        # the query), so the cases that fail only their first try count
+        # their own tries.
+        tries = {}
+
+        def reply(method, path, query, n):
+            target = query.get("path", "")
+            tries[target] = tries.get(target, 0) + 1
+            if target.startswith("/lost"):
+                if n == 0:
+                    return 502, None, {}
+                if method == "DELETE":
+                    return 404, _err("lstat: no such file or directory", "file_not_found"), {}
+                return 409, _err(target + " already exists", "folder_exists"), {}
+            if target == "/route-missing":
+                return (503, None, {"Retry-After": "0"}) if tries[target] == 1 else (404, _err("not found"), {})
+            if target == "/refused":
+                # A 429 is answered before any work: the path was never there.
+                if tries[target] == 1:
+                    return 429, None, {"Retry-After": "0"}
+                return 404, _err("lstat: no such file or directory", "file_not_found"), {}
+            if target == "/missing":
+                return 404, _err("lstat /missing: no such file or directory", "file_not_found"), {}
+            if target == "/a-file":
+                return 409, _err("mkdir /a-file: file exists"), {}
+            return 204, None, {}
+
+        fake = self.serve(reply)
+        fake.client.delete_file("sb-1", "/lost-del", recursive=True)
+        self.assertEqual(fake.calls[0][2]["recursive"], "true")
+        fake.client.make_dir("sb-1", "/lost-dir", mode=0o1750)
+        self.assertEqual(fake.calls[2][2], {"path": "/lost-dir", "parents": "false", "mode": "1750"})
+        with self.assertRaises(MicroVMHTTPError) as ctx:
+            fake.client.delete_file("sb-1", "/missing")
+        self.assertEqual((ctx.exception.status_code, ctx.exception.code), (404, "file_not_found"))
+        with self.assertRaises(MicroVMHTTPError) as ctx:
+            fake.client.make_dir("sb-1", "/a-file")
+        self.assertEqual(ctx.exception.status_code, 409)
+        # An uncoded 404 on a retry may be an agent without the route.
+        with self.assertRaises(MicroVMHTTPError):
+            fake.client.delete_file("sb-1", "/route-missing")
+        # After a 429 the server did nothing, so a coded 404 on the retry
+        # means the path never existed, not that this call deleted it.
+        with self.assertRaises(MicroVMHTTPError) as ctx:
+            fake.client.delete_file("sb-1", "/refused")
+        self.assertEqual((ctx.exception.status_code, ctx.exception.code), (404, "file_not_found"))
+
+    def test_move_and_copy_retry_only_refusals(self):
+        def reply(method, path, query, n):
+            source = query.get("source")
+            if source == "/refused-once" and n == 0:
+                return 503, None, {}
+            if source == "/bad-gateway":
+                return 502, None, {}
+            if source == "/taken":
+                return 409, _err("rename /taken /b: file exists"), {}
+            return 204, None, {}
+
+        fake = self.serve(reply)
+        fake.client.move_file("sb-1", "/refused-once", "/b")
+        self.assertEqual(len(fake.calls), 2)
+        with self.assertRaises(MicroVMHTTPError) as ctx:
+            fake.client.move_file("sb-1", "/bad-gateway", "/b")
+        self.assertEqual(ctx.exception.status_code, 502)
+        self.assertEqual(len(fake.calls), 3, "a 502 on a move was re-sent")
+        with self.assertRaises(MicroVMHTTPError) as ctx:
+            fake.client.move_file("sb-1", "/taken", "/b")
+        self.assertEqual(ctx.exception.status_code, 409)
+        with self.assertRaises(MicroVMHTTPError):
+            fake.client.copy_file("sb-1", "/bad-gateway", "/c", recursive=True)
+        self.assertEqual(fake.calls[-1][2], {"source": "/bad-gateway", "destination": "/c", "overwrite": "false", "recursive": "true"})
+        self.assertEqual(fake.routes()[-1], ("POST", "/files/copy"))
+
+    def test_search_and_find(self):
+        def reply(method, path, query, n):
+            if query.get("pattern") == "none":
+                return 200, ({"files": None} if path.endswith("/search") else None), {}
+            if path.endswith("/search"):
+                return 200, {"files": ["/w/a.py"]}, {}
+            return 200, [{"file": "/w/a.py", "line": 2, "content": "import os"}], {}
+
+        fake = self.serve(reply)
+        self.assertEqual(fake.client.search_files("sb-1", "/w", "*.py"), ["/w/a.py"])
+        self.assertEqual(fake.client.find_in_files("sb-1", "/w", "import"), [{"file": "/w/a.py", "line": 2, "content": "import os"}])
+        self.assertEqual(fake.client.search_files("sb-1", "/w", "none"), [])
+        self.assertEqual(fake.client.find_in_files("sb-1", "/w", "none"), [])
+
+    def test_sandbox_methods_delegate(self):
+        from microvm.client import Sandbox
+
+        fake = self.serve(lambda method, path, query, n: (200, {"name": "x"} if path.endswith("/info") else [] if method == "GET" else None, {}))
+        sandbox = Sandbox(fake.client, {"id": "sb-1"})
+        sandbox.list_files("/")
+        sandbox.get_file_info("/x")
+        self.assertTrue(sandbox.file_exists("/x"))
+        sandbox.delete_file("/x")
+        sandbox.make_dir("/d", parents=True)
+        sandbox.move_file("/a", "/b", overwrite=True)
+        sandbox.copy_file("/a", "/b")
+        sandbox.search_files("/", "*")
+        sandbox.find_in_files("/", "x")
+        self.assertEqual(
+            [route for _, route in fake.routes()],
+            ["/files", "/files/info", "/files/info", "/files", "/files/folder", "/files/move", "/files/copy", "/files/search", "/files/find"],
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+class UploadOptionTests(unittest.TestCase):
+    """Upload write options (plan F2) and their retry tiers (section 10)."""
+
+    def serve(self, reply, features=("files.write_options",)):
+        fake = FakeToolbox(list(features), reply)
+        self.addCleanup(fake.close)
+        return fake
+
+    def test_options_are_sent_after_the_version_check(self):
+        fake = self.serve(lambda method, path, query, n: (201, {"path": "/a"}, {}))
+        fake.client.upload_file("sb-1", "/w/a.txt", b"x", create_only=True, atomic=True, mode=0o600)
+        self.assertEqual(fake.calls[0][2], {"create_only": "true", "atomic": "true", "mode": "600"})
+        fake.client.upload_file("sb-1", "/w/a.txt", b"x")
+        self.assertEqual(fake.calls[1][2], {})
+
+    def test_older_agent_fails_closed(self):
+        fake = self.serve(lambda method, path, query, n: (201, {}, {}), features=())
+        for kwargs in ({"append": True}, {"create_only": True}, {"atomic": True}, {"mode": 0o644}):
+            with self.subTest(kwargs):
+                with self.assertRaises(MicroVMUnsupportedFeatureError):
+                    fake.client.upload_file("sb-1", "/a", b"x", **kwargs)
+        self.assertEqual(fake.calls, [])
+        fake.client.upload_file("sb-1", "/a", b"x")
+        self.assertEqual(len(fake.calls), 1)
+
+    def test_retry_tiers(self):
+        def reply(method, path, query, n):
+            return (502, None, {}) if n == 0 else (201, {}, {})
+
+        fake = self.serve(reply)
+        # A plain upload re-sends after a 502.
+        fake.client.upload_file("sb-1", "/a", b"x")
+        self.assertEqual(len(fake.calls), 2)
+        # create_only does not: the first send may have made the file.
+        fake2 = self.serve(reply)
+        with self.assertRaises(MicroVMHTTPError) as ctx:
+            fake2.client.upload_file("sb-1", "/a", b"x", create_only=True)
+        self.assertEqual(ctx.exception.status_code, 502)
+        self.assertEqual(len(fake2.calls), 1)
+
+    def test_create_only_conflict_is_412(self):
+        fake = self.serve(lambda method, path, query, n: (412, _err("/a already exists and create_only is set", "file_exists"), {}))
+        with self.assertRaises(MicroVMHTTPError) as ctx:
+            fake.client.upload_file("sb-1", "/a", b"x", create_only=True)
+        self.assertEqual((ctx.exception.status_code, ctx.exception.code), (412, "file_exists"))
+
+    def test_sandbox_upload_passes_options(self):
+        from microvm.client import Sandbox
+
+        fake = self.serve(lambda method, path, query, n: (201, {}, {}))
+        Sandbox(fake.client, {"id": "sb-1"}).upload_file("/a", b"x", append=True)
+        self.assertEqual(fake.calls[0][2], {"append": "true"})
+
+
+class UploadDirTests(unittest.TestCase):
+    """upload_dir (plan F3): the folder goes as a gzipped tar with
+    extract=true, after the /version check, and is sent once."""
+
+    def _capture(self, status, features=("files.extract",)):
+        captured = {}
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                body = json.dumps({"version": "test", "features": list(features)}).encode()
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length") or 0)
+                captured.setdefault("calls", []).append((self.path, self.headers.get("Content-Type"), self.rfile.read(length)))
+                self.send_response(status)
+                self.send_header("Content-Length", "2")
+                self.end_headers()
+                self.wfile.write(b"{}")
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        client = MicroVM(f"http://127.0.0.1:{server.server_address[1]}", "pat", config=_FAST_RETRY)
+        return client, captured
+
+    def _folder(self):
+        import os
+        import tempfile
+
+        root = tempfile.mkdtemp()
+        self.addCleanup(__import__("shutil").rmtree, root, True)
+        os.makedirs(os.path.join(root, "pkg"))
+        with open(os.path.join(root, "a.txt"), "w") as f:
+            f.write("one")
+        with open(os.path.join(root, "pkg", "b.py"), "w") as f:
+            f.write("two")
+        os.chmod(os.path.join(root, "pkg", "b.py"), 0o750)
+        os.symlink("a.txt", os.path.join(root, "link"))
+        os.link(os.path.join(root, "a.txt"), os.path.join(root, "hard.txt"))
+        if hasattr(os, "mkfifo"):
+            os.mkfifo(os.path.join(root, "pipe"))
+        return root
+
+    def test_sends_the_folder_as_a_tar_once(self):
+        import email.parser
+        import io
+        import tarfile
+
+        client, captured = self._capture(503)
+        with self.assertRaises(MicroVMHTTPError) as ctx:
+            client.upload_dir("sb-1", self._folder(), "/work/app")
+        self.assertEqual(ctx.exception.status_code, 503)
+        self.assertEqual(len(captured["calls"]), 1, "a folder upload was re-sent")
+        path, content_type, body = captured["calls"][0]
+        self.assertTrue(path.endswith("/toolbox/files/upload?extract=true"))
+        message = email.parser.BytesParser().parsebytes(b"Content-Type: " + content_type.encode() + b"\r\n\r\n" + body)
+        parts = {p.get_param("name", header="content-disposition"): p.get_payload(decode=True) for p in message.get_payload()}
+        self.assertEqual(parts["path"], b"/work/app")
+        with tarfile.open(fileobj=io.BytesIO(parts["file"]), mode="r:gz") as tar:
+            members = {m.name: m for m in tar.getmembers()}
+            self.assertEqual(sorted(members), ["a.txt", "hard.txt", "link", "pkg", "pkg/b.py"])
+            self.assertTrue(members["hard.txt"].isreg())
+            self.assertEqual(tar.extractfile("hard.txt").read(), b"one")
+            self.assertTrue(members["link"].issym())
+            self.assertEqual(members["link"].linkname, "a.txt")
+            self.assertTrue(members["pkg"].isdir())
+            self.assertEqual(members["pkg/b.py"].mode, 0o750)
+
+    def test_refusals(self):
+        import tempfile
+
+        client, captured = self._capture(201, features=())
+        with self.assertRaises(MicroVMUnsupportedFeatureError):
+            client.upload_dir("sb-1", tempfile.mkdtemp(), "/w")
+        with self.assertRaises(MicroVMError):
+            client.upload_dir("sb-1", "/definitely/not/here", "/w")
+        self.assertNotIn("calls", captured)
+
+    def test_sandbox_upload_dir(self):
+        from microvm.client import Sandbox
+
+        client, captured = self._capture(201)
+        Sandbox(client, {"id": "sb-1"}).upload_dir(self._folder(), "/w")
+        self.assertEqual(len(captured["calls"]), 1)
+
+
+class StreamingTests(unittest.TestCase):
+    """Plan F4: streamed download and upload, and a max_bytes cap."""
+
+    def _serve(self, handler_body):
+        calls = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def _read_body(self):
+                if self.headers.get("Transfer-Encoding", "").lower() == "chunked":
+                    data = b""
+                    while True:
+                        size = int(self.rfile.readline().strip(), 16)
+                        if size == 0:
+                            self.rfile.readline()
+                            return data
+                        data += self.rfile.read(size)
+                        self.rfile.readline()
+                return self.rfile.read(int(self.headers.get("Content-Length") or 0))
+
+            def _handle(self):
+                parsed = urllib.parse.urlsplit(self.path)
+                query = dict(urllib.parse.parse_qsl(parsed.query))
+                if parsed.path.endswith("/toolbox/version"):
+                    body = json.dumps({"version": "t", "features": ["files.write_options"]}).encode()
+                    self.send_response(200)
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
+                calls.append((self.command, query, self.headers.get("Transfer-Encoding"), self._read_body()))
+                handler_body(self, query, len(calls))
+
+            do_GET = do_POST = _handle
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        return MicroVM(f"http://127.0.0.1:{server.server_address[1]}", "pat", config=_FAST_RETRY), calls
+
+    @staticmethod
+    def _send(handler, status, body, *, length=True):
+        handler.send_response(status)
+        if length:
+            handler.send_header("Content-Length", str(len(body)))
+        else:
+            handler.send_header("Connection", "close")
+        handler.end_headers()
+        handler.wfile.write(body)
+
+    def test_download_max_bytes_and_retry(self):
+        import io
+
+        from microvm import MicroVMFileTooLargeError
+
+        def reply(handler, query, n):
+            path = query["path"]
+            if path == "/flaky" and n == 1:
+                self._send(handler, 503, b"")
+            elif path == "/streamed":
+                # No Content-Length: the size shows only as it arrives.
+                self._send(handler, 200, b"x" * 10, length=False)
+            else:
+                self._send(handler, 200, b"0123456789")
+
+        client, calls = self._serve(reply)
+        self.assertEqual(client.download_file("sb-1", "/flaky"), b"0123456789")
+        self.assertEqual(len(calls), 2)
+        with self.assertRaises(MicroVMFileTooLargeError) as ctx:
+            client.download_file("sb-1", "/sized", max_bytes=5)
+        self.assertEqual(ctx.exception.max_bytes, 5)
+        self.assertEqual(client.download_file("sb-1", "/sized", max_bytes=10), b"0123456789")
+        dest = io.BytesIO()
+        with self.assertRaises(MicroVMFileTooLargeError):
+            client.download_file_to("sb-1", "/streamed", dest, max_bytes=4)
+        self.assertEqual(dest.getvalue(), b"xxxx")
+        dest = io.BytesIO()
+        self.assertEqual(client.download_file_to("sb-1", "/streamed", dest, chunk_size=3), 10)
+        self.assertEqual(dest.getvalue(), b"x" * 10)
+
+    def test_upload_file_from_streams_once(self):
+        import io
+
+        from microvm.client import Sandbox
+
+        client, calls = self._serve(lambda handler, query, n: self._send(handler, 503 if n == 1 else 201, b"{}"))
+        with self.assertRaises(MicroVMHTTPError):
+            client.upload_file_from("sb-1", "/w/big.bin", io.BytesIO(b"a" * 5000), chunk_size=1000)
+        self.assertEqual(len(calls), 1, "a streamed upload was re-sent")
+        method, query, encoding, body = calls[0]
+        self.assertEqual((method, encoding), ("POST", "chunked"))
+        self.assertIn(b'name="path"\r\n\r\n/w/big.bin\r\n', body)
+        self.assertIn(b"a" * 5000, body)
+        Sandbox(client, {"id": "sb-1"}).upload_file_from("/w/x", io.BytesIO(b"x"), create_only=True, mode=0o600)
+        self.assertEqual(calls[1][1], {"create_only": "true", "mode": "600"})
+        sandbox = Sandbox(client, {"id": "sb-1"})
+        self.assertEqual(sandbox.download_file("/w/x"), b"{}")
+        self.assertEqual(sandbox.download_file_to("/w/x", io.BytesIO()), 2)

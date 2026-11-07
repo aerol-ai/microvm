@@ -35,6 +35,67 @@ func TestServeToolboxUnsupportedEndpoint(t *testing.T) {
 	}
 }
 
+// An isolate has no filesystem to watch: a clear 501 naming the runtimes
+// that can (plan F5, Q8).
+func TestServeToolboxFileWatchUnsupported(t *testing.T) {
+	d := New(Config{}, nil)
+	for _, path := range []string{"/files/watch", "/v1/sandboxes/sb-1/toolbox/files/watch"} {
+		rec := httptest.NewRecorder()
+		d.ServeToolbox(context.Background(), "sb-1", "tok", rec, httptest.NewRequest(http.MethodGet, path+"?path=/", nil))
+		if rec.Code != http.StatusNotImplemented || !strings.Contains(rec.Body.String(), "gVisor or Firecracker") {
+			t.Fatalf("%s = %d %q, want the file-watching 501", path, rec.Code, rec.Body.String())
+		}
+	}
+}
+
+// Terminals and sessions answer 501 instead of falling through to the
+// fetch-handler exec that every other "/process" path reaches.
+func TestServeToolboxTerminalsUnsupported(t *testing.T) {
+	d := New(Config{}, nil)
+	for _, tc := range []struct{ method, path string }{
+		{http.MethodPost, "/process/pty"},
+		{http.MethodGet, "/process/pty/t1/connect"},
+		{http.MethodPost, "/process/session"},
+		{http.MethodPost, "/process/session/s1/exec"},
+		{http.MethodPost, "/sessions"},
+		{http.MethodPost, "/sessions/s1/exec"},
+	} {
+		rec := httptest.NewRecorder()
+		d.ServeToolbox(context.Background(), "sb-1", "tok", rec, httptest.NewRequest(tc.method, tc.path, strings.NewReader("{}")))
+		if rec.Code != http.StatusNotImplemented || !strings.Contains(rec.Body.String(), "no shell") {
+			t.Fatalf("%s %s = %d %q, want the terminals 501", tc.method, tc.path, rec.Code, rec.Body.String())
+		}
+	}
+}
+
+// Every file call, the SDK verbs of plan F1 included, is a 501 with a JSON
+// reason the SDKs can show, as on WASM sandboxes.
+func TestServeToolboxFileRoutesAnswerJSON501(t *testing.T) {
+	d := New(Config{}, nil)
+	for _, route := range [][2]string{
+		{http.MethodGet, "/files"},
+		{http.MethodGet, "/files/info"},
+		{http.MethodPost, "/files/move"},
+		{http.MethodPost, "/files/copy"},
+		{http.MethodPost, "/files/folder"},
+		{http.MethodDelete, "/files"},
+		{http.MethodPost, "/files/upload"},
+		{http.MethodGet, "/files/download"},
+		{http.MethodGet, "/files/search"},
+		{http.MethodGet, "/version"},
+	} {
+		rec := httptest.NewRecorder()
+		d.ServeToolbox(context.Background(), "sb-1", "tok", rec, httptest.NewRequest(route[0], route[1], nil))
+		var body models.ErrorResponse
+		if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil || rec.Code != http.StatusNotImplemented || body.Error == "" {
+			t.Fatalf("%s %s = %d %q (%v), want a JSON 501", route[0], route[1], rec.Code, rec.Body.String(), err)
+		}
+		if strings.HasPrefix(route[1], "/files") && !strings.Contains(body.Error, "isolate") {
+			t.Fatalf("%s %s reason = %q", route[0], route[1], body.Error)
+		}
+	}
+}
+
 func TestServeExecInvokeHandler(t *testing.T) {
 	sup := &fakeSupervisor{}
 	d := newCreateDriver(t, GroupPerTenant, sup)

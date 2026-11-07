@@ -150,8 +150,8 @@ func TestWarmCacheInvalidateClearsEntry(t *testing.T) {
 func TestWarmCacheExpiresAfterTTL(t *testing.T) {
 	svc := &Service{}
 	svc.warmCacheMu.Lock()
-	svc.warmCache = map[string]int64{
-		"sb-stale": time.Now().Add(-1 * time.Second).UnixNano(),
+	svc.warmCache = map[string]warmEntry{
+		"sb-stale": {exp: time.Now().Add(-1 * time.Second).UnixNano()},
 	}
 	svc.warmCacheMu.Unlock()
 	if svc.warmCacheHit("sb-stale") {

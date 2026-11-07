@@ -127,14 +127,15 @@ func (s *Service) DeletePlatformVolume(ctx context.Context, id string) error {
 	return nil
 }
 
-// deleteVolumeRowIfUnattached enforces the no-live-attacher rule, schedules
-// backend reclaim, then removes the metadata row (from SQLite or the cluster FSM
-// per volumeMeta). In cluster mode both the metadata row and attachment count are
-// read from raft, so a delete cannot miss an attachment created on another
-// worker. The pending-deletion ledger is written BEFORE the row is removed so
-// backend bytes never lose their reconciliation coordinates; the row's frozen
-// Source is authoritative, falling back to a recompute only for pre-migration
-// rows.
+// deleteVolumeRowIfUnattached enforces the no-live-attacher rule, then
+// removes the metadata row and records that its backend bytes are owed a
+// delete, in one step (volumeMetaStore.DeleteRowOwingBytes): one SQLite
+// transaction on a single node, one Raft apply in a cluster, so the bytes
+// never lose their reconciliation coordinates and, in a cluster, are drained
+// by a worker whichever node took the request. In cluster mode both the
+// metadata row and attachment count are read from raft, so a delete cannot
+// miss an attachment created on another worker. The row's frozen Source is
+// authoritative, falling back to a recompute only for pre-migration rows.
 func (s *Service) deleteVolumeRowIfUnattached(ctx context.Context, vol models.Volume) error {
 	meta := s.volumeMeta()
 	attachers, err := meta.AttachmentCount(ctx, vol.Tenant, vol.ID)
@@ -151,10 +152,7 @@ func (s *Service) deleteVolumeRowIfUnattached(ctx context.Context, vol models.Vo
 			return err
 		}
 	}
-	if err := s.store.SchedulePendingVolumeDeletion(ctx, vol, source); err != nil {
-		return err
-	}
-	return meta.DeleteRow(ctx, vol.Tenant, vol.ID)
+	return meta.DeleteRowOwingBytes(ctx, vol, source)
 }
 
 // volumeTenant resolves the calling tenant's scope segment from the request

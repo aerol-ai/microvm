@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"strings"
 
+	"github.com/aerol-ai/microvm/internal/observability"
 	"github.com/aerol-ai/microvm/internal/service"
 	"github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/models"
@@ -63,6 +64,7 @@ func (h *handlers) runtimeProxy(w http.ResponseWriter, r *http.Request) {
 		r.Header.Del("X-E2B-User-Authorization")
 	}
 	r.Header.Set("X-E2B-Sandbox-Id", sandboxID)
+	r = r.WithContext(service.WithToolboxSurface(r.Context(), service.ToolboxSurfaceE2B))
 
 	if sandbox.Runtime == models.RuntimeWasm {
 		if err := h.deps.Service.ServeToolboxReverseProxy(r.Context(), sandboxID, w, r, toolboxPath); err != nil {
@@ -88,9 +90,10 @@ func (h *handlers) runtimeProxy(w http.ResponseWriter, r *http.Request) {
 	}
 
 	proxy := httputil.NewSingleHostReverseProxy(target)
-	// The shared toolbox transport: no connection pooled past its sandbox,
-	// and a dead sandbox noticed within the dead-peer bound.
-	proxy.Transport = toolboxhttp.Transport
+	// The shared toolbox proxy transport: no connection pooled past its
+	// sandbox, a dead sandbox noticed within the dead-peer bound, and a dial
+	// tried again while envd refuses the connection (I1).
+	proxy.Transport = toolboxhttp.ProxyTransport
 	originalDirector := proxy.Director
 	toolboxToken := endpoint.Token
 	proxy.Director = func(req *http.Request) {
@@ -108,6 +111,9 @@ func (h *handlers) runtimeProxy(w http.ResponseWriter, r *http.Request) {
 		} else {
 			req.Header.Del("Authorization")
 		}
+		// This proxy bypasses the service's toolbox proxy, so it sets the
+		// W3C trace context toolboxd logs itself (A3).
+		observability.InjectTraceContext(req.Context(), req.Header)
 	}
 	// A sandbox that stopped under the request keeps E2B's 502: the E2B SDK
 	// reads 502 from envd as "the sandbox was not found" (Connect's
@@ -119,5 +125,9 @@ func (h *handlers) runtimeProxy(w http.ResponseWriter, r *http.Request) {
 		}
 		WriteError(w, http.StatusBadGateway, "Sandbox runtime unavailable")
 	}
-	proxy.ServeHTTP(w, r.WithContext(callCtx))
+	// This proxy bypasses the service's toolbox proxy, so it counts its own
+	// calls (O4).
+	rec := service.NewToolboxStatusRecorder(w)
+	proxy.ServeHTTP(rec, r.WithContext(callCtx))
+	service.RecordToolboxCall(r.Context(), toolboxPath, rec.Status())
 }

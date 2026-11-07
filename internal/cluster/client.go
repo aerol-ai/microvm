@@ -105,6 +105,10 @@ type Cluster struct {
 	// appending opReserve/opReserveBatch. Otherwise two routers can both
 	// validate against the same pending snapshot and overfill a worker.
 	reservationAdmissionMu sync.Mutex
+	// quotaBarrierTerm is the Raft term this leader last ran its team-quota
+	// barrier in (team_quotas.go): quota admission reads usage only once the
+	// FSM holds every entry committed before the term began.
+	quotaBarrierTerm atomic.Uint64
 	// authoritativeBarrierOnce/authoritativeBarrier admit ONE fsm barrier at
 	// a time. A raft barrier cannot be cancelled, so the goroutine waiting on
 	// one outlives an abandoned read; holding the slot until raft returns is
@@ -728,6 +732,7 @@ func (c *Cluster) addExposedPortForIncarnation(ctx context.Context, sandboxID, i
 		Protocol:              route.Protocol,
 		HostPort:              route.HostPort,
 		PublicURL:             route.PublicURL,
+		Visibility:            route.Visibility,
 	}
 	return c.applyCommand(ctx, cmd)
 }
@@ -860,6 +865,10 @@ func (c *Cluster) DeletePlacementExact(ctx context.Context, sandboxID, expectedO
 		ExpectedOwnerNodeID: expectedOwnerNodeID, ExpectedOwnerNodeIDSet: true, ExpectedIncarnationID: expectedIncarnationID,
 		ExpiresUnix: auditACLExpiryUnix(c.cfg.AuditDeletedGrace), AuditIndexMax: int64(c.cfg.AuditDeletedIndexMax),
 	}
+	// Every path that deletes a placement (a destroy, the leader expiring an
+	// abandoned delete, an operator's orphan delete) goes through here, so
+	// the volumes it leaves owed are recorded on all of them.
+	stampVolumeReclaims(&cmd, c.VolumeReclaimsReplicated(), c.nodeID)
 	return c.applyCommand(ctx, cmd)
 }
 
@@ -1350,7 +1359,9 @@ func (c *Cluster) AssertOwnership(ctx context.Context, local []LocalSandboxState
 				if needsSecretBackfill {
 					replaySecrets = st.Secrets
 				}
-				if err := c.UpsertSpec(ctx, st.ID, spec, replaySecrets); err != nil && firstErr == nil {
+				// A backfill records what the sandbox already is, so a
+				// team over a lowered quota does not refuse it.
+				if err := c.UpsertSpec(withTeamQuotaReplay(ctx), st.ID, spec, replaySecrets); err != nil && firstErr == nil {
 					firstErr = err
 				}
 			}
@@ -1431,6 +1442,7 @@ func (c *Cluster) applyCommand(ctx context.Context, cmd command) error {
 	if err := validateCommandLifecycle(cmd); err != nil {
 		return err
 	}
+	cmd = markQuotaAdmit(ctx, cmd)
 	payload, err := encodeCommand(cmd)
 	if err != nil {
 		return fmt.Errorf("cluster: encode command: %w", err)
@@ -1444,6 +1456,9 @@ func (c *Cluster) applyCommand(ctx context.Context, cmd command) error {
 		}
 		if cmd.Op == opReserve || cmd.Op == opReserveBatch {
 			return c.applyReservationEncodedLocal(ctx, payload, cmd)
+		}
+		if c.takesTeamQuotaAdmission(cmd) {
+			return c.applyQuotaAdmittedEncodedLocal(ctx, payload, cmd)
 		}
 		return c.applyEncodedLocal(ctx, payload)
 	}
@@ -1475,6 +1490,9 @@ func (c *Cluster) ApplyEncoded(ctx context.Context, payload []byte) error {
 	if cmd.Op == opReserve || cmd.Op == opReserveBatch {
 		return c.applyReservationEncodedLocal(ctx, payload, cmd)
 	}
+	if c.takesTeamQuotaAdmission(cmd) {
+		return c.applyQuotaAdmittedEncodedLocal(ctx, payload, cmd)
+	}
 	return c.applyEncodedLocal(ctx, payload)
 }
 
@@ -1485,6 +1503,9 @@ func (c *Cluster) applyReservationEncodedLocal(ctx context.Context, payload []by
 		return ErrNotLeader
 	}
 	if err := c.admitReservationCommand(cmd); err != nil {
+		return err
+	}
+	if err := c.admitTeamQuotaCommand(cmd); err != nil {
 		return err
 	}
 	return c.applyEncodedLocal(ctx, payload)

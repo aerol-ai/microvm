@@ -8,6 +8,8 @@ import (
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/config"
+	"github.com/aerol-ai/microvm/internal/pool/dockerpool"
+	cntr "github.com/aerol-ai/microvm/internal/runtime/containerd"
 	"github.com/aerol-ai/microvm/pkg/capacity"
 	"github.com/aerol-ai/microvm/pkg/docker"
 	"github.com/aerol-ai/microvm/pkg/docker/netrules"
@@ -77,4 +79,36 @@ func TestWireDockerWarmPoolEnabled(t *testing.T) {
 
 func TestDrainDockerWarmPoolNil(t *testing.T) {
 	drainDockerWarmPool(nil, testLogger())
+}
+
+// TestPoolImageResolvers (W3): each engine's resolver asks its engine for
+// the key's image, so an unreachable engine is an error the pool keeps its
+// slots on, never an empty ID.
+func TestPoolImageResolvers(t *testing.T) {
+	rules, err := netrules.New(false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("DOCKER_HOST", "unix://"+filepath.Join(t.TempDir(), "no-docker.sock"))
+	toolbox := filepath.Join(t.TempDir(), "toolboxd")
+	if err := os.WriteFile(toolbox, []byte("bin"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	c, err := docker.New(testLogger(), config.Config{
+		Runtime:           models.RuntimeDocker,
+		ToolboxBinaryPath: toolbox,
+		HTTPClientTimeout: time.Second,
+	}, rules)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if id, err := dockerPoolImageResolver(c)(ctx, dockerpool.Key{Image: "alpine:3.20"}); err == nil || id != "" {
+		t.Fatalf("docker resolver with no engine = %q %v", id, err)
+	}
+	d := cntr.New(cntr.Config{Socket: filepath.Join(t.TempDir(), "no-containerd.sock")}, nil, nil)
+	if id, err := containerdPoolImageResolver(d)(ctx, dockerpool.Key{Image: "alpine:3.20"}); err == nil || id != "" {
+		t.Fatalf("containerd resolver with no engine = %q %v", id, err)
+	}
 }

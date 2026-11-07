@@ -19,6 +19,10 @@ var (
 	metricSpawnFail   = expvar.NewInt("aerolvm_docker_pool_spawn_fails_total")
 	metricTargetEvict = expvar.NewInt("aerolvm_docker_pool_target_evictions_total")
 	metricReclaim     = expvar.NewInt("aerolvm_docker_pool_reclaims_total")
+	metricReplaced    = expvar.NewInt("aerolvm_docker_pool_replaced_total")
+	// metricDestroyFail counts failed parked-container teardowns, each retry
+	// included. The pending gauges are in pending_destroy.go.
+	metricDestroyFail = expvar.NewInt("aerolvm_docker_pool_destroy_failures_total")
 	adoptMS           = expvar.NewFloat("aerolvm_docker_pool_adopt_ms")
 )
 
@@ -32,6 +36,8 @@ type Metrics struct {
 	spawnFail    atomic.Int64
 	targetEvicts atomic.Int64
 	reclaims     atomic.Int64
+	replaced     atomic.Int64
+	destroyFails atomic.Int64
 }
 
 // Snapshot is a point-in-time view of pool counters.
@@ -46,6 +52,12 @@ type Snapshot struct {
 	// Reclaims counts parked slots given back to admit a real sandbox. A
 	// steady rate means the pool is sized past what the node can spare.
 	Reclaims int64
+	// Replaced counts parked slots destroyed because their entry's image
+	// changed (on_image_change replace_now), before any create used them.
+	Replaced int64
+	// DestroyFailures counts parked-container teardowns that failed, retries
+	// included. Each failed container is kept and retried until it is gone.
+	DestroyFailures int64
 }
 
 func (m *Metrics) recordHit() {
@@ -88,6 +100,16 @@ func (m *Metrics) recordReclaim(n int) {
 	metricReclaim.Add(int64(n))
 }
 
+func (m *Metrics) recordReplaced(n int) {
+	m.replaced.Add(int64(n))
+	metricReplaced.Add(int64(n))
+}
+
+func (m *Metrics) recordDestroyFail() {
+	m.destroyFails.Add(1)
+	metricDestroyFail.Add(1)
+}
+
 func (m *Metrics) setParked(n int) { metricParked.Set(int64(n)) }
 
 // RecordAdoptMS publishes the latest successful adopt handshake duration.
@@ -113,5 +135,8 @@ func (m *Metrics) Stats() Snapshot {
 		SpawnFail:    m.spawnFail.Load(),
 		TargetEvicts: m.targetEvicts.Load(),
 		Reclaims:     m.reclaims.Load(),
+		Replaced:     m.replaced.Load(),
+
+		DestroyFailures: m.destroyFails.Load(),
 	}
 }

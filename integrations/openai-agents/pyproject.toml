@@ -1,0 +1,35 @@
+[project]
+name = "aerolvm-openai-agents"
+version = "0.1.0"
+description = "Run OpenAI Agents SDK sandbox agents in AerolVM sandboxes."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+authors = [{ name = "Aerol AI" }]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Operating System :: OS Independent",
+]
+dependencies = [
+  # The Agents SDK's sandbox API is new and changes between minor releases,
+  # so the range is the one the tests run against. Widen it only after the
+  # tests pass on the new release.
+  "openai-agents>=0.24,<0.25",
+  # The provider uses the file verbs (list_files, make_dir, delete_file) and
+  # the exec options (argv, output caps, timedOut) added after aerolvm-sdk
+  # 0.8.1. Raise this floor to the first release that has them before
+  # publishing this package.
+  "aerolvm-sdk>=0.8.1",
+]
+
+[project.urls]
+Documentation = "https://microvm.aerol.ai/integrations/openai-agents/"
+
+# Only the package goes in the wheel; tests stay out so they never shadow a
+# user's own "tests" package.
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"

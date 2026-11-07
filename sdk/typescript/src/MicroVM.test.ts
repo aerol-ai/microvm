@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { Image } from "./Image.js";
+import * as sdkIndex from "./index.js";
 import { MicroVMApiError as ExportedMicroVMApiError } from "./index.js";
 import { MicroVM } from "./MicroVM.js";
 import { Sandbox } from "./Sandbox.js";
@@ -120,6 +121,8 @@ test("Sandbox exec accepts a plain command string", async () => {
 
   assert.equal(result.stdout, "hello\n");
   assert.equal(result.exitCode, 0);
+  // An agent that predates timed_out leaves it out; it reads as false.
+  assert.equal(result.timedOut, false);
   assert.deepEqual(execBodies, [
     { command: "echo hello" },
     { command: "echo hello", workdir: "/tmp" },
@@ -665,6 +668,17 @@ test("MicroVM.whoami maps the principal, role, team and expiry", async () => {
     fetch: async () => jsonResponse(200, { principal: { kind: "operator", id: "operator" }, role: "admin" }),
   });
   assert.deepEqual(await operator.whoami(), { principal: { kind: "operator", id: "operator" }, role: "admin" });
+  assert.equal(seen.length, 1);
+});
+
+test("MicroVM.revokeSandboxTokens POSTs to the sandbox's revoke route", async () => {
+  const { seen, fetchFn } = recordingFetch((request) =>
+    new URL(request.url).pathname === "/v1/sandboxes/sb-1/tokens/revoke" && request.method === "POST"
+      ? jsonResponse(200, { sandbox_id: "sb-1", tokens_not_before: "2026-11-07T10:00:01Z" })
+      : jsonResponse(404, { error: "unexpected" }),
+  );
+  const sdk = new MicroVM({ patToken: "pat", apiUrl: "https://api.example.com", fetch: fetchFn });
+  assert.deepEqual(await sdk.revokeSandboxTokens("sb-1"), { sandboxID: "sb-1", tokensNotBefore: "2026-11-07T10:00:01Z" });
   assert.equal(seen.length, 1);
 });
 
@@ -1624,4 +1638,114 @@ test("MicroVM create failures are MicroVMApiError from the package entry point",
     assert.equal(err.code, "idempotency_key_reused");
     assert.equal(err.message, "Idempotency-Key reused");
   }
+});
+
+test("Sandbox exec reports a timed-out command", async () => {
+  const sdk = new MicroVM({
+    patToken: "pat-token",
+    apiUrl: "https://api.example.com",
+    fetch: async (input, init) => {
+      const request = new Request(input, init);
+      if (new URL(request.url).pathname.endsWith("/toolbox/process/execute")) {
+        return new Response(JSON.stringify({ stdout: "", stderr: "", exit_code: -1, duration_ms: 1000, timed_out: true }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      return new Response(JSON.stringify({
+        id: "sb-1", image: "ubuntu:22.04", status: "started", public_url: "", cpu: 1, memory_mb: 512, disk_gb: 1,
+        network_block_all: false, toolbox_enabled: true, exposed_ports: [],
+        created_at: "2026-05-07T10:00:00Z", updated_at: "2026-05-07T10:00:00Z", last_active_at: "2026-05-07T10:00:00Z",
+      }), { status: 200, headers: { "content-type": "application/json" } });
+    },
+  });
+  const sandbox = await sdk.get("sb-1");
+  const result = await sandbox.exec({ command: "sleep 30", timeoutSeconds: 1 });
+  assert.equal(result.timedOut, true);
+  assert.equal(result.exitCode, -1);
+});
+
+test("MicroVM exposes the warm-pool admin calls", async () => {
+  const calls: string[] = [];
+  const pool = { image: "python:3.12", depth: 1, generation: 1, created_at: "c", updated_at: "u" };
+  const sdk = new MicroVM({
+    patToken: "pat-token",
+    apiUrl: "https://api.example.com",
+    fetch: async (input, init) => {
+      const request = new Request(input, init);
+      calls.push(`${request.method} ${new URL(request.url).pathname}`);
+      if (request.method === "DELETE") return new Response(null, { status: 204 });
+      const body = request.method === "GET" && request.url.endsWith("/warm-pools") ? { pools: [pool] } : pool;
+      return new Response(JSON.stringify(body), { status: 200, headers: { "content-type": "application/json" } });
+    },
+  });
+  assert.equal((await sdk.putWarmPool("python:3.12", { depth: 1 })).depth, 1);
+  assert.equal((await sdk.getWarmPool("python:3.12")).image, "python:3.12");
+  assert.equal((await sdk.listWarmPools()).length, 1);
+  await sdk.deleteWarmPool("python:3.12");
+  assert.deepEqual(calls, [
+    "PUT /v1/warm-pools/python%3A3.12",
+    "GET /v1/warm-pools/python%3A3.12",
+    "GET /v1/warm-pools",
+    "DELETE /v1/warm-pools/python%3A3.12",
+  ]);
+});
+
+test("the typed errors are exported and thrown through MicroVM", async () => {
+  const sdk = new MicroVM({
+    patToken: "pat-token",
+    apiUrl: "https://api.example.com",
+    retry: { maxRetries: 0 },
+    fetch: async () => new Response(JSON.stringify({ error: "sandbox not found" }), { status: 404, headers: { "content-type": "application/json" } }),
+  });
+  const err = await sdk.get("sb-missing").catch((e: unknown) => e);
+  assert.ok(err instanceof sdkIndex.MicroVMNotFoundError);
+  assert.ok(err instanceof ExportedMicroVMApiError);
+  for (const name of ["MicroVMAuthError", "MicroVMCapacityError", "MicroVMConflictError", "MicroVMNotFoundError", "MicroVMTimeoutError"] as const) {
+    assert.equal(typeof sdkIndex[name], "function", name);
+    assert.ok(Object.prototype.isPrototypeOf.call(ExportedMicroVMApiError, sdkIndex[name]), name);
+  }
+});
+
+test("a sandbox never serializes its API client or token", async () => {
+  const sdk = new MicroVM({
+    patToken: "secret-pat-token",
+    apiUrl: "https://api.example.com/",
+    fetch: async () =>
+      new Response(JSON.stringify({
+        id: "sb-json",
+        name: "job",
+        image: "alpine",
+        status: "started",
+        public_url: "",
+        cpu: 1,
+        memory_mb: 512,
+        disk_gb: 10,
+        os_user: "root",
+        network_block_all: false,
+        toolbox_enabled: true,
+        exposed_ports: [],
+        created_at: "2026-05-07T10:00:00Z",
+        updated_at: "2026-05-07T10:00:00Z",
+        last_active_at: "2026-05-07T10:00:00Z",
+      }), { status: 200, headers: { "content-type": "application/json" } }),
+  });
+  const sandbox = await sdk.get("sb-json");
+  const json = JSON.stringify(sandbox);
+  assert.equal(json.includes("secret-pat-token"), false, json);
+  assert.equal(Object.keys(sandbox.toJSON()).includes("client"), false);
+  assert.equal(JSON.parse(json).id, "sb-json");
+  // The sandbox still works: the client is only hidden, not gone.
+  await sandbox.refresh();
+  assert.equal(sandbox.id, "sb-json");
+});
+
+test("a MicroVM client never serializes its token", () => {
+  const sdk = new MicroVM({ patToken: "secret-pat-token", apiUrl: "https://api.example.com/" });
+  const json = JSON.stringify(sdk);
+  assert.equal(json.includes("secret-pat-token"), false, json);
+  assert.equal(Object.keys(sdk).includes("patToken"), false);
+  assert.equal(Object.keys(sdk).includes("client"), false);
+  // Still readable by name.
+  assert.equal(sdk.patToken, "secret-pat-token");
 });

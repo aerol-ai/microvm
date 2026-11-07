@@ -2,6 +2,7 @@ package cluster
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"sync"
 	"time"
@@ -173,10 +174,17 @@ func (c *Cluster) evictDeadOwner(ctx context.Context, nodeID string) {
 		if !placementWantsFailoverRecreate(p) {
 			continue
 		}
-		target, ok := c.selectRecreationTarget(p)
-		if !ok {
+		target, err := c.selectRecreationTargetFor(p)
+		if err != nil {
+			// A placement rule no live node satisfies is not a reason to
+			// move the sandbox somewhere it must not run: it is orphaned
+			// like any other, so the node it ran on reclaims it when it
+			// returns, and the refusal is counted and audited (P1.5).
+			if errors.Is(err, ErrPlacementUnsatisfiable) {
+				c.reportFailoverRefused(p, nodeID, err)
+			}
 			c.logger.Warn("cluster: no failover recreation target; placement will be orphaned",
-				"sandbox_id", id, "dead_node", nodeID)
+				"sandbox_id", id, "dead_node", nodeID, "reason", err)
 			continue
 		}
 		cmd := command{

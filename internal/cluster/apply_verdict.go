@@ -30,6 +30,10 @@ func ApplyErrorStatus(err error) int {
 		return http.StatusServiceUnavailable
 	case errors.Is(err, ErrCreateBackpressure):
 		return http.StatusTooManyRequests
+	case errors.Is(err, ErrTeamQuotaExceeded):
+		// A team at its quota. 429 like the API answer; the message names
+		// the sentinel so forwardApplyStatus restores it, not backpressure.
+		return http.StatusTooManyRequests
 	case errors.Is(err, ErrCapacityExceeded), errors.Is(err, ErrNoPlacementTarget):
 		return http.StatusServiceUnavailable
 	case errors.Is(err, ErrArtifactCatalogSuperseded):
@@ -47,6 +51,11 @@ func ApplyErrorStatus(err error) int {
 		// they already do when the apply lands on the local leader. Without it
 		// a retry of an Idempotency-Key create on a multi-node cluster 503s
 		// instead of replaying the existing sandbox.
+		return http.StatusConflict
+	case errors.Is(err, ErrPlacementUnsatisfiable):
+		// The leader refused a reservation onto a node the sandbox's
+		// placement rule excludes. A verdict, not a fault: as a 500 the
+		// router would answer a retryable 503 for a rule no retry satisfies.
 		return http.StatusConflict
 	case errors.Is(err, ErrIncarnationConflict):
 		// An incarnation fence is a verdict too: the placement moved to
@@ -81,6 +90,9 @@ func forwardApplyStatus(status int, message string) error {
 	case http.StatusOK, http.StatusNoContent:
 		return nil
 	case http.StatusTooManyRequests:
+		if strings.Contains(message, ErrTeamQuotaExceeded.Error()) {
+			return fmt.Errorf("%w: %s", ErrTeamQuotaExceeded, message)
+		}
 		return fmt.Errorf("%w: %s", ErrCreateBackpressure, message)
 	case http.StatusConflict:
 		// Restore whichever conflict sentinel the leader answered 409 with.
@@ -95,6 +107,8 @@ func forwardApplyStatus(status int, message string) error {
 			return fmt.Errorf("%w: %s", ErrNameConflict, message)
 		case strings.Contains(message, ErrIncarnationConflict.Error()):
 			return fmt.Errorf("%w: %s", ErrIncarnationConflict, message)
+		case strings.Contains(message, ErrPlacementUnsatisfiable.Error()):
+			return fmt.Errorf("%w: %s", ErrPlacementUnsatisfiable, message)
 		}
 	case http.StatusServiceUnavailable:
 		switch {

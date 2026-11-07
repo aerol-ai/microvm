@@ -71,7 +71,8 @@ type PrepareOptions struct {
 	// shape first and pass nil.
 	Normalize func(*models.CreateSandboxRequest) error
 	// OwnerRef is the tenant account recorded on the reservation's secret
-	// handle. Empty leaves the handle untenanted.
+	// handle. Empty takes the caller's owner (service.OwnerRefForCreate), so
+	// a team's reservation always counts against its quota.
 	OwnerRef string
 	// SyncBody re-marshals the normalized request into r.Body so a forwarded
 	// create carries the normalizations the router applied. Native v1 sets
@@ -171,6 +172,29 @@ func Prepare(w http.ResponseWriter, r *http.Request, svc *service.Service, req m
 			return Decision{}, false
 		}
 	}
+	// The rule is validated and made canonical before placement reads it,
+	// and before SyncBody, so the target and the replicated spec carry the
+	// same rule the router filtered on.
+	placement, err := models.NormalizePlacementRule(req.Placement)
+	if err != nil {
+		writeMsg(w, http.StatusBadRequest, err.Error())
+		return Decision{}, false
+	}
+	req.Placement = placement
+	// The operator's create policy before placement: a create too big for
+	// every node must be refused for the rule it breaks (403), not answered
+	// 503 because no node has room for it. The owner checks again.
+	if err := svc.CheckCreatePolicy(req); err != nil {
+		switch {
+		case errors.Is(err, models.ErrCreatePolicyDenied):
+			writeError(w, http.StatusForbidden, models.ErrorCodeCreatePolicyDenied, err.Error())
+		case errors.Is(err, service.ErrCreatePolicyInvalid):
+			writeError(w, http.StatusServiceUnavailable, models.ErrorCodeCreatePolicyInvalid, service.ErrCreatePolicyInvalid.Error())
+		default:
+			writeMsg(w, http.StatusInternalServerError, err.Error())
+		}
+		return Decision{}, false
+	}
 	// Reject reserved names before the reservation claims the name in Raft;
 	// the target node's create applies the same rule again.
 	if err := models.ValidateSandboxName(req.Name); err != nil {
@@ -214,7 +238,7 @@ func Prepare(w http.ResponseWriter, r *http.Request, svc *service.Service, req m
 		}
 		target, err := c.SelectPlacement(placementReq)
 		if err != nil {
-			if writeNoEgressGateway(w, err, writeError) {
+			if writeNoEgressGateway(w, err, writeError) || writePlacementUnsatisfiable(w, err, writeError) {
 				return Decision{}, false
 			}
 			if errors.Is(err, cluster.ErrArtifactNodeUnavailable) {
@@ -277,7 +301,7 @@ func Prepare(w http.ResponseWriter, r *http.Request, svc *service.Service, req m
 	}
 	target, recipients, err := c.SelectPlacementForCreate(CapacityRequestFromCreate(req), sandboxID, recipientBackups)
 	if err != nil {
-		if writeNoEgressGateway(w, err, writeError) {
+		if writeNoEgressGateway(w, err, writeError) || writePlacementUnsatisfiable(w, err, writeError) {
 			return Decision{}, false
 		}
 		if errors.Is(err, cluster.ErrArtifactNodeUnavailable) {
@@ -300,12 +324,19 @@ func Prepare(w http.ResponseWriter, r *http.Request, svc *service.Service, req m
 	}
 	// Names are unique per owner: the reservation claims the caller's
 	// owner-qualified key (internal/cluster/name_key.go). The owner comes
-	// from the request rather than opts.OwnerRef because the facades leave
-	// the reservation's secret handle untenanted but still need their names
-	// in the caller's namespace. The promote re-qualifies idempotently.
+	// from the request, the same owner the reservation records below. The
+	// promote re-qualifies idempotently.
 	redacted := service.RedactClusterSecrets(req)
 	redacted.Name = cluster.QualifiedSandboxName(service.OwnerRefForCreate(r.Context()), redacted.Name)
-	reserveSecrets := cluster.PlacementSecrets{Recipients: recipients, OwnerRef: strings.TrimSpace(opts.OwnerRef)}
+	// The reservation names its owner even for a facade, whose handle used
+	// to stay untenanted until the promote: the leader counts a team's
+	// quota from the rows, and a reservation without its owner would let
+	// two facade creates both pass for the team's last slot (plan item P2).
+	reserveOwner := strings.TrimSpace(opts.OwnerRef)
+	if reserveOwner == "" {
+		reserveOwner = service.OwnerRefForCreate(r.Context())
+	}
+	reserveSecrets := cluster.PlacementSecrets{Recipients: recipients, OwnerRef: reserveOwner}
 	commitCtx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	err = c.ReserveOnTarget(commitCtx, sandboxID, target, &redacted, reserveSecrets, ReservationTTL)
 	cancel()
@@ -348,9 +379,20 @@ func Prepare(w http.ResponseWriter, r *http.Request, svc *service.Service, req m
 			writeMsg(w, http.StatusConflict, "sandbox name already in use cluster-wide")
 			return Decision{}, false
 		}
+		// The leader re-checks the rule against the target's heartbeat; a
+		// refusal there is the same 409 the router would have given.
+		if writePlacementUnsatisfiable(w, err, writeError) {
+			return Decision{}, false
+		}
 		if errors.Is(err, cluster.ErrReservationConflict) {
 			service.RecordFacadeIdempotencyConflict(opts.metric("reservation"))
 			writeMsg(w, http.StatusConflict, "cluster: reservation conflict on sandbox id")
+			return Decision{}, false
+		}
+		// A team at its quota: 429 with a code and no Retry-After, since
+		// only a delete or a raised quota frees the room.
+		if errors.Is(err, cluster.ErrTeamQuotaExceeded) {
+			writeError(w, http.StatusTooManyRequests, models.ErrorCodeTeamQuotaExceeded, err.Error())
 			return Decision{}, false
 		}
 		if errors.Is(err, cluster.ErrCreateBackpressure) {
@@ -642,6 +684,10 @@ func CreateOnSelectedNode(ctx context.Context, svc *service.Service, logger *slo
 	if err := service.NormalizeCreateFailover(&req); err != nil {
 		return nil, err
 	}
+	// destroy_at becomes an age before the spec is promoted (L6).
+	if err := service.NormalizeCreateLifecycle(&req, time.Now().UTC()); err != nil {
+		return nil, err
+	}
 	svc.NormalizeCreateEgressDefault(&req)
 	// Pin bare built-in profiles here, on the owner after any forward, so
 	// the spec promoted below carries this node's version (CEO D11).
@@ -706,7 +752,9 @@ func CreateOnSelectedNode(ctx context.Context, svc *service.Service, logger *slo
 	}
 	secrets.OwnerRef = resp.Sandbox.OwnerRef
 	redacted := service.RedactClusterSecrets(req)
-	if promoteErr := c.RecordPlacement(commitCtx, resp.Sandbox.ID, &redacted, secrets); promoteErr != nil {
+	// No reservation came first, so the promote is this create's team-quota
+	// admission: the leader checks it like a reservation (plan item P2).
+	if promoteErr := c.RecordPlacement(cluster.WithTeamQuotaAdmission(commitCtx), resp.Sandbox.ID, &redacted, secrets); promoteErr != nil {
 		RollbackLocalCreate(context.Background(), svc, logger, resp.Sandbox.ID)
 		return nil, promoteErr
 	}
@@ -791,7 +839,19 @@ func CapacityRequestFromCreate(req models.CreateSandboxRequest) capacity.Request
 		out.GPUs = want
 		out.GPUVendor = string(req.GPUs.Vendor)
 	}
+	out.Labels = req.Placement.RequiredLabels()
 	return out
+}
+
+// writePlacementUnsatisfiable answers a create whose placement rule no node
+// satisfies: 409 with a code and no Retry-After, since waiting does not give
+// a node a label (plans/placement-rules.md P1.4). Reports whether it wrote.
+func writePlacementUnsatisfiable(w http.ResponseWriter, err error, writeError ErrorWriter) bool {
+	if !errors.Is(err, cluster.ErrPlacementUnsatisfiable) {
+		return false
+	}
+	writeError(w, http.StatusConflict, models.ErrorCodePlacementUnsatisfiable, err.Error())
+	return true
 }
 
 func diskGBForCapacity(base int, runtimeName string, overlaySizeGB int) int {

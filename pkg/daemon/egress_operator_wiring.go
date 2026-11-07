@@ -52,10 +52,14 @@ func wireEgressOperator(ctx context.Context, cfg config.Config, svc *service.Ser
 	}
 	svc.SetEgressOperator(w)
 	go w.Run(ctx, egressOperatorPoll)
-	go reloadOnSIGHUP(ctx, w, logger)
+	go reloadOnSIGHUP(ctx, w, "egress operator file", logger)
 }
 
-func reloadOnSIGHUP(ctx context.Context, w *operator.Watcher, logger *slog.Logger) {
+// reloader is an operator file a SIGHUP re-reads: the egress operator file
+// and the create policy file reload the same way.
+type reloader interface{ Reload() error }
+
+func reloadOnSIGHUP(ctx context.Context, w reloader, what string, logger *slog.Logger) {
 	ch := make(chan os.Signal, 1)
 	signal.Notify(ch, syscall.SIGHUP)
 	defer signal.Stop(ch)
@@ -65,7 +69,7 @@ func reloadOnSIGHUP(ctx context.Context, w *operator.Watcher, logger *slog.Logge
 			return
 		case <-ch:
 			if err := w.Reload(); err != nil {
-				logger.Warn("egress operator file reload failed; keeping the last good file", "error", err)
+				logger.Warn(what+" reload failed; keeping the last good file", "error", err)
 			}
 		}
 	}

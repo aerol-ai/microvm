@@ -15,4 +15,6 @@ public class ExposeResult {
     public String host;
     @JsonProperty("host_port")
     public Integer hostPort;
+    /** {@code "token"} when the URL needs a sandbox token; {@code null} for a public port. */
+    public String visibility;
 }

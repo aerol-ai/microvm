@@ -67,6 +67,14 @@ type PlatformVolumeMount struct {
 	Name     string `json:"name"`
 	Path     string `json:"path"`
 	ReadOnly bool   `json:"read_only,omitempty"`
+	// DeleteWithSandbox makes a volume created by this reference go away,
+	// files and record, once the last sandbox attached to it is destroyed
+	// (plans/agent-sandbox-feature-parity.md V1). It is a property of the
+	// volume, fixed when the volume is made: a reference to an existing volume
+	// must name the same value or the create is refused
+	// (ErrPlatformVolumeConflict), so nobody deletes a volume they meant to
+	// keep, or keeps one they meant to delete.
+	DeleteWithSandbox bool `json:"delete_with_sandbox,omitempty"`
 }
 
 // Volume is a first-class, operator-backed persistent volume object. E2B
@@ -88,6 +96,11 @@ type Volume struct {
 	// rows created before this column existed; callers fall back to recompute.
 	Source    string    `json:"source"`
 	CreatedAt time.Time `json:"created_at"`
+	// DeleteWithSandbox: delete this volume once its last attachment goes
+	// (PlatformVolumeMount.DeleteWithSandbox). It rides the cluster FSM's
+	// volume rows as JSON, so a node that predates it reads false and keeps
+	// the volume: the safe direction.
+	DeleteWithSandbox bool `json:"delete_with_sandbox,omitempty"`
 }
 
 // VolumeAttachment is the indexed store-side reference from a sandbox to a
@@ -135,6 +148,12 @@ var (
 	// more live sandboxes still have the volume attached. Facades map this to
 	// 409 Conflict.
 	ErrPlatformVolumeInUse = errors.New("volume is still attached to one or more sandboxes")
+
+	// ErrPlatformVolumeConflict is returned when a create names an existing
+	// platform volume with a different delete_with_sandbox than the volume was
+	// made with, or names one volume twice with different values. Mapped to
+	// 409 Conflict.
+	ErrPlatformVolumeConflict = errors.New("platform volume already exists with a different delete_with_sandbox")
 
 	// ErrMountOperatorOnly is returned when an owner-scoped (non-operator)
 	// caller supplies raw mounts. Raw mounts execute host-side as the daemon

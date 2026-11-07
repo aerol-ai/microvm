@@ -28,11 +28,17 @@ func (s *Service) StartEventMonitor(ctx context.Context) {
 		return
 	}
 
-	go s.runEventMonitor(ctx)
+	// Records the events cause (an exit or removal nobody asked for) name
+	// system:runtime.
+	go s.runEventMonitor(withAuditSubsystem(ctx, auditSubsystemRuntime))
 }
 
 func (s *Service) runEventMonitor(ctx context.Context) {
 	backoff := eventReconnectInitial
+	// One set of per-sandbox queues for the monitor's life, so events
+	// still queued when a stream ends are handled, not dropped, and in
+	// order with what the next stream brings.
+	queues := s.newEventQueues(ctx)
 	for {
 		if ctx.Err() != nil {
 			return
@@ -47,8 +53,8 @@ func (s *Service) runEventMonitor(ctx context.Context) {
 			close(events)
 		}()
 
-		// Drain events until the stream returns.
-		s.consumeEvents(streamCtx, events)
+		// Read events until the stream returns.
+		s.feedEvents(streamCtx, events, queues)
 		err := <-streamDone
 		cancel()
 
@@ -75,11 +81,29 @@ func (s *Service) runEventMonitor(ctx context.Context) {
 	}
 }
 
+// consumeEvents handles a stream's events on per-sandbox queues
+// (event_queues.go) and returns once the stream has ended and every event it
+// gave has been handled.
 func (s *Service) consumeEvents(ctx context.Context, events <-chan docker.DockerEvent) {
+	queues := s.newEventQueues(ctx)
+	s.feedEvents(ctx, events, queues)
+	queues.wait()
+}
+
+// feedEvents hands each event to its sandbox's queue until the stream ends
+// or ctx does. It waits only when one sandbox's queue is full, never for a
+// sandbox's lifecycle boundary: a sandbox held by a long step delays its own
+// events, not the node's.
+func (s *Service) feedEvents(ctx context.Context, events <-chan docker.DockerEvent, queues *sandboxEventQueues) {
 	for event := range events {
-		if ctx.Err() != nil {
+		if ctx.Err() != nil || !queues.add(ctx, event) {
 			return
 		}
+	}
+}
+
+func (s *Service) newEventQueues(ctx context.Context) *sandboxEventQueues {
+	return newSandboxEventQueues(ctx, maxQueuedEventsPerSandbox, func(ctx context.Context, event docker.DockerEvent) {
 		if err := s.handleDockerEvent(ctx, event); err != nil {
 			s.logger.Warn("handle docker event failed",
 				"sandbox_id", event.SandboxID,
@@ -87,10 +111,28 @@ func (s *Service) consumeEvents(ctx context.Context, events <-chan docker.Docker
 				"error", err,
 			)
 		}
-	}
+	})
 }
 
 func (s *Service) handleDockerEvent(ctx context.Context, event docker.DockerEvent) error {
+	// An exit and a removal change whether the sandbox runs, so they are
+	// handled inside the lifecycle boundary (lifecycle_boundary.go), and the
+	// row is read only once it is held. The wait holds up only this
+	// sandbox's queue (event_queues.go), not other sandboxes' events. The
+	// row is read after the wait because an event that read it first and then
+	// waited out a stop, a start or a destroy would write that old read back
+	// (Upsert inserts a missing row). Holding it from the die's record to the
+	// restart it schedules means no stop or pause can come between them; one
+	// that came first has already written its reason, which the die keeps.
+	// A start or an OOM record changes nothing the boundary guards.
+	switch event.Action {
+	case "die", "stop", "destroy":
+		unlock, err := s.lifecycleLocks.lockCtx(ctx, event.SandboxID)
+		if err != nil {
+			return fmt.Errorf("wait for the sandbox's lifecycle: %w", err)
+		}
+		defer unlock()
+	}
 	sandbox, err := s.store.Get(ctx, event.SandboxID)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
@@ -131,7 +173,11 @@ func (s *Service) handleDockerEvent(ctx context.Context, event docker.DockerEven
 		}
 		sandbox = current
 		s.sandboxOOMs.forget(sandbox.ID)
-		if err := s.handleDestroyEvent(ctx, sandbox); err != nil {
+		// The row outlived any API destroy, so nobody asked for this one.
+		done := s.beginSystemAction(ctx, sandbox.ID, systemActionRuntimeRemoved)
+		err = s.handleDestroyEvent(ctx, sandbox)
+		done(err)
+		if err != nil {
 			return err
 		}
 		// Terminal: meter the final tail and forget the sandbox's cursor.
@@ -176,6 +222,7 @@ func (s *Service) handleDockerEvent(ctx context.Context, event docker.DockerEven
 // wake route and the subsequent die event silently deletes it.
 func (s *Service) markSandboxStopped(ctx context.Context, sandbox *models.Sandbox, event docker.DockerEvent) error {
 	previousIP := sandbox.ContainerIP
+	wasStarted := sandbox.Status == models.SandboxStatusStarted
 
 	// Invalidate the warm-preflight cache the moment we observe the
 	// stop event — this is the tightest possible signal that the
@@ -195,7 +242,7 @@ func (s *Service) markSandboxStopped(ctx context.Context, sandbox *models.Sandbo
 	// rule teardown below: a killed gVisor sandbox never closes their
 	// connections.
 	s.endToolboxCalls(sandbox.ID, toolboxEndStopped, detail)
-	mode := s.classifyDockerStopEvent(sandbox.ID, oomKilled)
+	mode, reason := s.classifyDockerStopEvent(sandbox.ID, oomKilled)
 	arm := s.shouldArmWake(sandbox, mode)
 
 	// Release the admitter slot — a stopped container holds no host CPU/RAM
@@ -235,6 +282,26 @@ func (s *Service) markSandboxStopped(ctx context.Context, sandbox *models.Sandbo
 	sandbox.Status = models.SandboxStatusStopped
 	sandbox.UpdatedAt = time.Now().UTC()
 	sandbox.WakeArmed = arm
+	// A stop sandboxd asked for carries the reason the stop call recorded;
+	// anything else is named from the exit. Docker's stop event follows its
+	// die and finds the row already stopped, so the store keeps the die's
+	// reason (Upsert writes a reason only with a status change).
+	if mode == stopModeInvoluntary {
+		sandbox.StatusReason, sandbox.ExitCode = stopReasonForExit(oomKilled, event.ExitCode)
+	} else {
+		sandbox.StatusReason, sandbox.ExitCode = reason, nil
+	}
+	// A stop nobody asked for is the runtime's to record (L3); a requested
+	// one has its caller's record, and the stop event after a die is the
+	// same exit again.
+	recordExit := func(error) {}
+	if mode == stopModeInvoluntary && event.Action == "die" && wasStarted {
+		recordExit = s.beginSystemActionReason(ctx, sandbox.ID, systemActionRuntimeExited, sandbox.StatusReason)
+		recordSandboxStop(sandbox.StatusReason)
+		if sandbox.StatusReason == models.StatusReasonProgramExited && sandbox.ExitCode != nil {
+			recordSandboxFinished(*sandbox.ExitCode)
+		}
+	}
 	if oomKilled {
 		sandbox.LastError = "container killed by OOM"
 	} else if event.Action == "die" && event.ExitCode != 0 {
@@ -242,11 +309,19 @@ func (s *Service) markSandboxStopped(ctx context.Context, sandbox *models.Sandbo
 	}
 
 	err := s.store.Upsert(ctx, sandbox)
+	recordExit(err)
 	// Again for a request that read the row while it still said started
 	// (toolbox_calls.go).
 	s.endToolboxCalls(sandbox.ID, toolboxEndStopped, detail)
 	if err != nil {
 		return fmt.Errorf("update sandbox status: %w", err)
+	}
+	// A crash or OOM kill of a sandbox that asked to restart on failure.
+	// Only the die carries the exit; the stop event that follows it is the
+	// same exit again.
+	if event.Action == "die" && mode == stopModeInvoluntary && sandbox.Lifecycle.RestartOnFailure &&
+		isRestartFailureReason(sandbox.StatusReason) {
+		s.scheduleRestartAfterFailure(ctx, sandbox.ID)
 	}
 
 	s.logger.Info("audit sandbox stopped via docker event",
@@ -255,6 +330,7 @@ func (s *Service) markSandboxStopped(ctx context.Context, sandbox *models.Sandbo
 		"exit_code", event.ExitCode,
 		"oom_killed", oomKilled,
 		"status", string(sandbox.Status),
+		"status_reason", sandbox.StatusReason,
 		"stop_mode", mode.String(),
 		"wake_armed", arm,
 	)
@@ -272,6 +348,7 @@ func (s *Service) markSandboxStopped(ctx context.Context, sandbox *models.Sandbo
 // stuck indefinitely.
 func (s *Service) handleDestroyEvent(ctx context.Context, sandbox *models.Sandbox) error {
 	previousIP := sandbox.ContainerIP
+	s.cancelRestartTimer(sandbox.ID)
 
 	// Mirror the API DestroySandbox path: drop the warm-preflight cache
 	// so the ingress proxy stops treating this id as Started.
@@ -329,6 +406,7 @@ func (s *Service) handleDestroyEvent(ctx context.Context, sandbox *models.Sandbo
 	if err := s.beginSelfOwnedClusterPlacementDeleteStrict(ctx, sandbox); err != nil {
 		return err
 	}
+	dwsVolumes := s.recordSandboxVolumeDeletes(ctx, sandbox)
 
 	// Secret tomb/outbox before store.Delete / placement delete so recipients
 	// can still be resolved from the sealed row or placement. Shared with
@@ -355,6 +433,7 @@ func (s *Service) handleDestroyEvent(ctx context.Context, sandbox *models.Sandbo
 	if err := s.store.Delete(ctx, sandbox.ID); err != nil && !errors.Is(err, store.ErrNotFound) {
 		return fmt.Errorf("delete sandbox: %w", err)
 	}
+	s.finishSandboxVolumeDeletes(ctx, sandbox.ID, dwsVolumes)
 	if s.admitter != nil {
 		s.admitter.Release(sandbox.ID)
 	}
@@ -405,6 +484,10 @@ func (s *Service) handleStartEvent(ctx context.Context, sandbox *models.Sandbox)
 	}
 
 	sandbox.ContainerIP = state.ContainerIP
+	if state.Status == models.SandboxStatusStarted && sandbox.Status != models.SandboxStatusStarted {
+		// A start answers whatever stopped it (as in StartSandbox).
+		sandbox.StatusReason, sandbox.ExitCode = "", nil
+	}
 	sandbox.Status = state.Status
 	sandbox.UpdatedAt = time.Now().UTC()
 	// The stop event cleared this sandbox's per-IP rules (the IP can be

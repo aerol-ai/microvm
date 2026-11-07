@@ -26,6 +26,34 @@ public class MicroVMApiException extends MicroVMException {
         this.retryAfter = retryAfter;
     }
 
+    /**
+     * The most specific subclass for a status: {@link MicroVMNotFoundException}
+     * (404), {@link MicroVMConflictException} (409),
+     * {@link MicroVMCapacityException} (503), {@link MicroVMTimeoutException}
+     * (408, 504), {@link MicroVMAuthException} (401, 403), or this class for
+     * any other status. The subclasses let a caller catch the one case it
+     * handles instead of comparing numbers; catching this class still
+     * catches them all.
+     */
+    public static MicroVMApiException forStatus(int statusCode, String code, String message, Duration retryAfter) {
+        switch (statusCode) {
+            case 401:
+            case 403:
+                return new MicroVMAuthException(statusCode, code, message, retryAfter);
+            case 404:
+                return new MicroVMNotFoundException(statusCode, code, message, retryAfter);
+            case 408:
+            case 504:
+                return new MicroVMTimeoutException(statusCode, code, message, retryAfter);
+            case 409:
+                return new MicroVMConflictException(statusCode, code, message, retryAfter);
+            case 503:
+                return new MicroVMCapacityException(statusCode, code, message, retryAfter);
+            default:
+                return new MicroVMApiException(statusCode, code, message, retryAfter);
+        }
+    }
+
     /** The HTTP status of the final attempt, such as 422 or 503. */
     public int getStatusCode() {
         return statusCode;

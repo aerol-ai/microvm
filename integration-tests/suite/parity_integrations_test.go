@@ -1,0 +1,406 @@
+//go:build integration
+
+package suite
+
+// Live checks for the agent-framework integrations of
+// plans/agent-sandbox-feature-parity.md (section 5.11: G1, G2, G4, G5).
+// The packages under integrations/ are Python and their own tests run
+// offline against a fake. These cases send the same server calls, in the
+// same order, through the Go SDK, so a server change that would break one
+// of the packages fails here.
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"io"
+	"mime"
+	"mime/multipart"
+	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/aerol-ai/microvm/integration-tests/suite/harness"
+	microvm "github.com/aerol-ai/microvm/sdk/go/pkg/microvm"
+	sdktypes "github.com/aerol-ai/microvm/sdk/go/pkg/types"
+)
+
+// UC-457 — OpenAI Agents provider (G1). The provider's default
+// workspace_persistence="snapshot": start() makes the workspace root with
+// make_dir(parents), commands run as argv in it, the end of a run saves an
+// AerolVM snapshot, and resume() boots a new sandbox with the snapshot's
+// name as its image. The new sandbox must hold the workspace exactly, and
+// list it with the structured listing the provider's ls() uses.
+func TestParityOpenAIAgentsSnapshotRoundTrip(t *testing.T) {
+	harness.Require(t, sc, "UC-457")
+	c := client(t)
+	sb := paritySandbox(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	if err := sb.MakeDir(ctx, "/workspace", sdktypes.MakeDirOptions{Parents: true}); err != nil {
+		t.Fatalf("make workspace root: %v", err)
+	}
+	if err := sb.UploadFile(ctx, "/workspace/notes/a.txt", []byte("saved")); err != nil {
+		t.Fatalf("upload: %v", err)
+	}
+	// A word with a space and a quote must reach the program unchanged.
+	res, err := sb.Exec(ctx, sdktypes.ExecRequest{
+		Argv:           []string{"sh", "-c", `printf %s "$1" > b.txt`, "sh", "it's a b"},
+		WorkDir:        "/workspace",
+		TimeoutSeconds: 30,
+	})
+	if err != nil || res.ExitCode != 0 {
+		t.Fatalf("argv exec in the workspace: err=%v exit=%d stderr=%q", err, res.ExitCode, res.Stderr)
+	}
+
+	name := fcSnapshotName(t, "uc457")
+	if _, err := sb.CreateSnapshot(ctx, name); err != nil {
+		t.Fatalf("create snapshot: %v", err)
+	}
+	t.Cleanup(func() {
+		cctx, ccancel := context.WithTimeout(context.Background(), time.Minute)
+		defer ccancel()
+		if derr := c.SDK().DeleteSnapshot(cctx, name); derr != nil {
+			t.Logf("cleanup: delete snapshot %s: %v", name, derr)
+		}
+	})
+
+	// In a cluster the snapshot reaches the registry by a background push,
+	// so a create from it that lands on another node can fail until the push
+	// is done. Retry as UC-260 does; a single node succeeds at once.
+	var restored *microvm.Sandbox
+	for deadline := time.Now().Add(4 * time.Minute); ; time.Sleep(5 * time.Second) {
+		var err error
+		restored, err = c.SDK().Create(ctx, sdktypes.CreateSandboxOptions{Name: harness.UniqueName(sc, t), Image: name})
+		if err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("create from snapshot %s never worked: %v", name, err)
+		}
+	}
+	t.Cleanup(func() {
+		cctx, ccancel := context.WithTimeout(context.Background(), time.Minute)
+		defer ccancel()
+		_ = c.SDK().Destroy(cctx, restored.ID)
+	})
+	waitRunning(t, restored)
+	for path, want := range map[string]string{"/workspace/notes/a.txt": "saved", "/workspace/b.txt": "it's a b"} {
+		got, err := restored.DownloadFile(ctx, path)
+		if err != nil || string(got) != want {
+			t.Fatalf("restored %s = %q, %v; want %q", path, got, err, want)
+		}
+	}
+	list, err := restored.ListFiles(ctx, "/workspace", sdktypes.ListFilesOptions{Depth: 1})
+	if err != nil {
+		t.Fatalf("list restored workspace: %v", err)
+	}
+	kinds := map[string]bool{}
+	for _, e := range list.Entries {
+		kinds[e.Name] = e.IsDir
+	}
+	if isDir, ok := kinds["notes"]; !ok || !isDir {
+		t.Fatalf("restored listing has no notes folder: %+v", list.Entries)
+	}
+	if isDir, ok := kinds["b.txt"]; !ok || isDir {
+		t.Fatalf("restored listing has no b.txt file: %+v", list.Entries)
+	}
+	if !strings.HasPrefix(list.Entries[0].Path, "/workspace/") {
+		t.Fatalf("listing paths are not absolute: %+v", list.Entries[0])
+	}
+}
+
+// apiStatusMessage is the HTTP status and message of an SDK error, or 0 when err is
+// not an API error.
+func apiStatusMessage(err error) (int, string) {
+	var apiErr *microvm.APIError
+	if errors.As(err, &apiErr) {
+		return apiErr.StatusCode, apiErr.Message
+	}
+	return 0, ""
+}
+
+// UC-458 — LangChain DeepAgents backend (G2). The backend turns server
+// answers into DeepAgents' per-file error codes, so this pins exactly those
+// answers: a missing file is 404 (file_not_found), a folder downloaded is
+// "is a directory" (is_directory) and a file uploaded onto a folder is 409
+// (is_directory). It also runs a shell command the way execute() does (in
+// the root, with a timeout and an output cap) and the ls and delete calls.
+func TestParityDeepAgentsBackendCalls(t *testing.T) {
+	harness.Require(t, sc, "UC-458")
+	sb := paritySandbox(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+
+	if err := sb.MakeDir(ctx, "/workspace", sdktypes.MakeDirOptions{Parents: true}); err != nil {
+		t.Fatalf("make root: %v", err)
+	}
+	res, err := sb.Exec(ctx, sdktypes.ExecRequest{
+		Command:        "echo out; echo bad >&2; printf 0123456789; exit 3",
+		WorkDir:        "/workspace",
+		TimeoutSeconds: 30,
+		MaxStdoutBytes: 6,
+	})
+	if err != nil {
+		t.Fatalf("exec: %v", err)
+	}
+	if res.ExitCode != 3 || res.Stdout != "out\n01" || !res.StdoutTruncated || strings.TrimSpace(res.Stderr) != "bad" {
+		t.Fatalf("exec = exit %d stdout %q truncated %v stderr %q", res.ExitCode, res.Stdout, res.StdoutTruncated, res.Stderr)
+	}
+	res, err = sb.Exec(ctx, sdktypes.ExecRequest{Command: "sleep 30", WorkDir: "/workspace", TimeoutSeconds: 1})
+	if err != nil || !res.TimedOut {
+		t.Fatalf("timed-out exec = %+v, %v; want TimedOut", res, err)
+	}
+
+	// Upload makes the missing folders (the backend skips the write
+	// preflight script because of it).
+	if err := sb.UploadFile(ctx, "/workspace/deep/a/b.txt", []byte("x")); err != nil {
+		t.Fatalf("upload into missing folders: %v", err)
+	}
+	if _, err := sb.DownloadFile(ctx, "/workspace/missing.txt"); func() bool {
+		st, _ := apiStatusMessage(err)
+		return st != http.StatusNotFound
+	}() {
+		t.Fatalf("download of a missing file: %v; want 404", err)
+	}
+	if _, err := sb.DownloadFile(ctx, "/workspace/deep"); func() bool {
+		_, msg := apiStatusMessage(err)
+		return !strings.HasSuffix(strings.ToLower(msg), "is a directory")
+	}() {
+		t.Fatalf("download of a folder: %v; want an error ending \"is a directory\"", err)
+	}
+	if err := sb.UploadFile(ctx, "/workspace/deep", []byte("x")); func() bool {
+		st, msg := apiStatusMessage(err)
+		return st != http.StatusConflict || !strings.HasSuffix(strings.ToLower(msg), "is a directory")
+	}() {
+		t.Fatalf("upload onto a folder: %v; want 409 ending \"is a directory\"", err)
+	}
+
+	list, err := sb.ListFiles(ctx, "/workspace", sdktypes.ListFilesOptions{Depth: 1})
+	if err != nil || len(list.Entries) != 1 || list.Entries[0].Path != "/workspace/deep" || !list.Entries[0].IsDir {
+		t.Fatalf("ls /workspace = %+v, %v", list.Entries, err)
+	}
+	if err := sb.DeleteFile(ctx, "/workspace/deep", sdktypes.DeleteFileOptions{Recursive: true}); err != nil {
+		t.Fatalf("recursive delete: %v", err)
+	}
+	if err := sb.DeleteFile(ctx, "/workspace/deep", sdktypes.DeleteFileOptions{Recursive: true}); func() bool {
+		st, _ := apiStatusMessage(err)
+		return st != http.StatusNotFound
+	}() {
+		t.Fatalf("delete of a missing path: %v; want 404", err)
+	}
+}
+
+// UC-459 — Gymnasium environment (G4). make_snapshot builds the start state
+// once: a sandbox gets the task folder through upload_dir and runs a setup
+// command, and is saved as a snapshot. Every episode then boots from it.
+// The case runs two episodes: each sees the task and setup files, a check
+// command's exit code reports whether the work is done (CommandReward), and
+// the second episode does not see what the first one wrote.
+func TestParityGymnasiumEpisodes(t *testing.T) {
+	harness.Require(t, sc, "UC-459")
+	c := client(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Minute)
+	defer cancel()
+
+	task := t.TempDir()
+	if err := os.WriteFile(filepath.Join(task, "README.txt"), []byte("create done.txt"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	build := paritySandbox(t)
+	if err := build.MakeDir(ctx, "/workspace", sdktypes.MakeDirOptions{Parents: true}); err != nil {
+		t.Fatalf("make work folder: %v", err)
+	}
+	if err := build.UploadDir(ctx, task, "/workspace"); err != nil {
+		t.Fatalf("upload task folder: %v", err)
+	}
+	if res, err := build.Exec(ctx, sdktypes.ExecRequest{Command: "echo built > setup.txt", WorkDir: "/workspace", TimeoutSeconds: 60}); err != nil || res.ExitCode != 0 {
+		t.Fatalf("setup command: %+v, %v", res, err)
+	}
+	start := fcSnapshotName(t, "uc459")
+	if _, err := build.CreateSnapshot(ctx, start); err != nil {
+		t.Fatalf("create start snapshot: %v", err)
+	}
+	t.Cleanup(func() {
+		cctx, ccancel := context.WithTimeout(context.Background(), time.Minute)
+		defer ccancel()
+		if derr := c.SDK().DeleteSnapshot(cctx, start); derr != nil {
+			t.Logf("cleanup: delete snapshot %s: %v", start, derr)
+		}
+	})
+	if err := c.SDK().Destroy(ctx, build.ID); err != nil {
+		t.Fatalf("destroy the build sandbox: %v", err)
+	}
+
+	run := func(sb *microvm.Sandbox, command string) sdktypes.ExecResult {
+		t.Helper()
+		res, err := sb.Exec(ctx, sdktypes.ExecRequest{Command: command, WorkDir: "/workspace", TimeoutSeconds: 60})
+		if err != nil {
+			t.Fatalf("exec %q in %s: %v", command, sb.ID, err)
+		}
+		return res
+	}
+	for episode := 1; episode <= 2; episode++ {
+		sb := c.NewSandbox(t, sdktypes.CreateSandboxOptions{Name: harness.UniqueName(sc, t), Image: start})
+		waitRunning(t, sb)
+		if got := run(sb, "cat README.txt setup.txt").Stdout; got != "create done.txtbuilt\n" {
+			t.Fatalf("episode %d start state = %q", episode, got)
+		}
+		// Nothing from an earlier episode, and the task is not done yet.
+		if res := run(sb, "test -f done.txt"); res.ExitCode == 0 {
+			t.Fatalf("episode %d starts with done.txt from an earlier episode", episode)
+		}
+		run(sb, "touch done.txt")
+		if res := run(sb, "test -f done.txt"); res.ExitCode != 0 {
+			t.Fatalf("episode %d: the check does not see the agent's work", episode)
+		}
+		if err := c.SDK().Destroy(ctx, sb.ID); err != nil {
+			t.Fatalf("destroy episode %d: %v", episode, err)
+		}
+	}
+}
+
+// UC-460 — NVIDIA NeMo Gym through the Daytona facade (G5). NeMo Gym's
+// Daytona provider creates a sandbox with a name, labels, env and its
+// auto-stop and auto-delete intervals, reads it, runs commands with a
+// working folder, extra variables and a timeout, downloads files, and
+// deletes it. This sends those calls with the Daytona Python SDK's field
+// names, and pins the three details that SDK needs: create answers 200
+// (it reads no body from a 201), the sandbox carries "kvm", and each
+// bulk-download part (error parts too) is named by the full requested path.
+func TestParityNeMoGymDaytonaCalls(t *testing.T) {
+	harness.Require(t, sc, "UC-460")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	name := harness.UniqueName(sc, t)
+	st, body := fcDo(t, ctx, http.MethodPost, "", "/daytona/sandbox", map[string]any{
+		"name":               name,
+		"labels":             map[string]string{"sandbox-api": "daytona-sdk", "sandbox_id": name, "code-toolbox-language": "python"},
+		"env":                map[string]string{"TASK_ID": "7"},
+		"autoStopInterval":   30,
+		"autoDeleteInterval": 600,
+		"buildInfo":          map[string]string{"dockerfileContent": "FROM " + harness.DefaultImage + "\n"},
+	}, nil)
+	if st != http.StatusOK {
+		t.Fatalf("create = %d %s; the Daytona Python SDK reads a sandbox only from a 200", st, body)
+	}
+	var created struct {
+		ID    string `json:"id"`
+		State string `json:"state"`
+		Kvm   *bool  `json:"kvm"`
+	}
+	if err := json.Unmarshal(body, &created); err != nil || created.ID == "" {
+		t.Fatalf("create body %s: %v", body, err)
+	}
+	if created.Kvm == nil {
+		t.Fatalf("create body has no kvm field; Daytona Python SDK 0.230+ rejects that sandbox: %s", body)
+	}
+	t.Cleanup(func() {
+		cctx, ccancel := context.WithTimeout(context.Background(), time.Minute)
+		defer ccancel()
+		if st, body := fcDo(t, cctx, http.MethodDelete, "", "/daytona/sandbox/"+created.ID, nil, nil); st/100 != 2 && st != http.StatusNotFound {
+			t.Logf("cleanup: delete %s = %d %s", created.ID, st, body)
+		}
+	})
+
+	deadline := time.Now().Add(2 * time.Minute)
+	for created.State != "started" {
+		if time.Now().After(deadline) {
+			t.Fatalf("sandbox %s never reached started (last %q)", created.ID, created.State)
+		}
+		time.Sleep(2 * time.Second)
+		st, body = fcDo(t, ctx, http.MethodGet, "", "/daytona/sandbox/"+created.ID, nil, nil)
+		if st != http.StatusOK {
+			t.Fatalf("get = %d %s", st, body)
+		}
+		_ = json.Unmarshal(body, &created)
+	}
+
+	st, body = daytonaToolbox(t, ctx, http.MethodPost, created.ID, "/process/execute", nil, map[string]any{
+		"command": `echo "$TASK_ID|$FOO"; pwd; exit 3`,
+		"cwd":     "/tmp",
+		"envs":    map[string]string{"FOO": "bar"},
+		"timeout": 30,
+	})
+	var exec struct {
+		ExitCode int    `json:"exitCode"`
+		Result   string `json:"result"`
+	}
+	if st != http.StatusOK || json.Unmarshal(body, &exec) != nil {
+		t.Fatalf("process/execute = %d %s", st, body)
+	}
+	if exec.ExitCode != 3 || exec.Result != "7|bar\n/tmp\n" {
+		t.Fatalf("process/execute = exit %d result %q; want exit 3 and the create env, the call env and the cwd", exec.ExitCode, exec.Result)
+	}
+
+	// fs.download_file: NeMo Gym reads its reward files back this way.
+	st, body = daytonaToolbox(t, ctx, http.MethodPost, created.ID, "/process/execute", nil, map[string]any{
+		"command": "mkdir -p /tmp/uc460 && printf reward=1 > /tmp/uc460/out.txt",
+	})
+	if st != http.StatusOK {
+		t.Fatalf("write the file = %d %s", st, body)
+	}
+	st, body = daytonaToolbox(t, ctx, http.MethodPost, created.ID, "/files/bulk-download", nil, map[string]any{
+		"paths": []string{"/tmp/uc460/out.txt", "/tmp/uc460/none.txt"},
+	})
+	if st != http.StatusOK {
+		t.Fatalf("files/bulk-download = %d %s", st, body)
+	}
+	parts := daytonaDownloadParts(t, body)
+	if got := parts["file:/tmp/uc460/out.txt"]; got != "reward=1" {
+		t.Fatalf("bulk-download parts %v: want a file part named /tmp/uc460/out.txt holding reward=1", parts)
+	}
+	if got, ok := parts["error:/tmp/uc460/none.txt"]; !ok || !strings.Contains(got, `"statusCode":404`) {
+		t.Fatalf("bulk-download parts %v: want an error part named /tmp/uc460/none.txt with statusCode 404", parts)
+	}
+
+	if st, body = fcDo(t, ctx, http.MethodDelete, "", "/daytona/sandbox/"+created.ID, nil, nil); st/100 != 2 {
+		t.Fatalf("delete = %d %s", st, body)
+	}
+	deadline = time.Now().Add(time.Minute)
+	for {
+		if st, _ = fcDo(t, ctx, http.MethodGet, "", "/daytona/sandbox/"+created.ID, nil, nil); st == http.StatusNotFound {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("sandbox %s still answers %d a minute after delete", created.ID, st)
+		}
+		time.Sleep(2 * time.Second)
+	}
+}
+
+// daytonaDownloadParts reads a Daytona bulk-download answer into
+// "<form name>:<filename>" -> body. The suite's request helper drops the
+// response headers, so the boundary comes from the body's first line.
+func daytonaDownloadParts(t *testing.T, body []byte) map[string]string {
+	t.Helper()
+	first, _, _ := bytes.Cut(body, []byte("\r\n"))
+	boundary := strings.TrimPrefix(string(first), "--")
+	if boundary == string(first) || boundary == "" {
+		t.Fatalf("bulk-download body is not multipart: %.200s", body)
+	}
+	parts := map[string]string{}
+	reader := multipart.NewReader(bytes.NewReader(body), boundary)
+	for {
+		part, err := reader.NextPart()
+		if err == io.EOF {
+			return parts
+		}
+		if err != nil {
+			t.Fatalf("read bulk-download part: %v", err)
+		}
+		// part.FileName() drops the folders; the SDKs need the full path.
+		_, params, err := mime.ParseMediaType(part.Header.Get("Content-Disposition"))
+		if err != nil {
+			t.Fatalf("part Content-Disposition %q: %v", part.Header.Get("Content-Disposition"), err)
+		}
+		data, _ := io.ReadAll(part)
+		parts[params["name"]+":"+params["filename"]] = string(data)
+	}
+}

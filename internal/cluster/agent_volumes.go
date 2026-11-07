@@ -23,6 +23,13 @@ type VolumeQueryResponse struct {
 	Volumes []models.Volume `json:"volumes,omitempty"`
 	Exists  bool            `json:"exists,omitempty"`
 	Count   int             `json:"count,omitempty"`
+	// Attachments answers kind=sandbox. A server that predates it answers
+	// 400 (unknown kind), which the agent reports as an error: the caller
+	// then keeps the volumes rather than guess.
+	Attachments []models.VolumeAttachment `json:"attachments,omitempty"`
+	// Reclaims answers kind=reclaims (fsm_volume_reclaims.go). A server
+	// that predates it answers 400; the agent's sweep skips that pass.
+	Reclaims []VolumeReclaim `json:"reclaims,omitempty"`
 }
 
 func (a *Agent) VolumeUpsert(ctx context.Context, v models.Volume, maxPerTenant int) (models.Volume, bool, error) {
@@ -129,6 +136,18 @@ func (a *Agent) VolumeAttachmentCount(ctx context.Context, tenant, id string) (i
 		return 0, err
 	}
 	return resp.Count, nil
+}
+
+func (a *Agent) VolumeAttachmentsForSandbox(ctx context.Context, sandboxID string) ([]models.VolumeAttachment, error) {
+	q := url.Values{"kind": {"sandbox"}, "sandbox_id": {sandboxID}}
+	resp, err := a.queryVolumes(ctx, q)
+	if err != nil {
+		return nil, err
+	}
+	if resp.Attachments == nil {
+		return []models.VolumeAttachment{}, nil
+	}
+	return resp.Attachments, nil
 }
 
 func (a *Agent) PutVolumeAttachments(ctx context.Context, attachments []models.VolumeAttachment) error {

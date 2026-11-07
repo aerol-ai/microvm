@@ -20,6 +20,7 @@ locals {
     role = "x"
     is_seed = false
     domain = "x"
+    identity_issuer_enabled = false
     enable_custom_domains = false
     custom_domain_txt_prefix = "x"
     custom_domain_txt_value_prefix = "x"

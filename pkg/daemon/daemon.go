@@ -255,6 +255,7 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 	host.GPUCount = cfg.HostGPUCount
 	host.GPUVendor = cfg.HostGPUVendor
 	host.SupportedRuntimes = supportedRuntimesForConfig(cfg)
+	host.Labels = cfg.NodeLabels
 	// Phase 5: the per-VMM RSS sampler is constructed up front when
 	// firecracker is enabled so admission can be wired against it from
 	// the start (capacity holds the RSSSource by reference, not value).
@@ -297,6 +298,7 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 		"host_gpu_count", host.GPUCount,
 		"host_gpu_vendor", host.GPUVendor,
 		"host_supported_runtimes", host.SupportedRuntimes,
+		"node_labels", host.Labels,
 		"cpu_reservation_ratio", cfg.CPUReservationRatio,
 		"memory_reservation_ratio", cfg.MemoryReservationRatio,
 		"disk_reservation_ratio", cfg.DiskReservationRatio,
@@ -354,6 +356,11 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 	} else if ctd != nil {
 		ctdWiring = ctd
 		defer ctd.Stop()
+		if ctd.warm != nil {
+			// API warm-pool entries (W1) configure this pool per image;
+			// StartWarmPoolSync below applies them.
+			svc.RegisterWarmPool(ctd.warm, cfg.Runtime)
+		}
 	}
 	// Wire the control-plane usage reporter into the service's background loops
 	// (reconcile / event monitor / netstats / live sampler). Under
@@ -387,6 +394,9 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 	dockerWarmPool := wireDockerWarmPool(ctx, cfg, logger, dockerClient, admitter)
 	if dockerWarmPool != nil {
 		defer func() { drainDockerWarmPool(dockerWarmPool, logger) }()
+		// Keys carry cfg.Runtime, as the SB_DOCKER_POOL_IMAGES pins do, so
+		// an entry's slots match a create that names only the image.
+		svc.RegisterWarmPool(dockerWarmPool, cfg.Runtime)
 	}
 	netnsPool := wireDockerNetnsPool(ctx, cfg, logger, dockerClient)
 	if netnsPool != nil {
@@ -738,10 +748,15 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 	}
 	routingBoot := startIngressRouting(ctx, cfg, svc, hostPortForwarder, logger)
 	wireEgressOperator(ctx, cfg, svc, logger)
+	wireCreatePolicy(ctx, cfg, svc, logger)
+	if cfg.EgressBlockPrivateByDefault {
+		svc.EnableBlockPrivateByDefault()
+	}
 	wireEgressGateway(ctx, cfg, svc, dockerClient, logger)
 	// After the gateway is wired: whether its ports are open depends on it.
 	wireNodeGuard(ctx, cfg, svc)
 	wireEgressProfiles(ctx, cfg, svc)
+	wireCloudIdentity(ctx, cfg, svc, logger)
 	ownerReasserted := !cfg.IsWorker()
 	// Bootstrap the netstats poller at boot so the first /network/usage call
 	// doesn't pay for it. Best-effort by design — failure here just means
@@ -1020,6 +1035,10 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 	if err := svc.StartAPITokens(ctx); err != nil {
 		return err
 	}
+	// API warm-pool entries (plans/agent-sandbox-feature-parity.md W1).
+	// After AttachCluster, so a cluster node reads the replicated entries
+	// rather than its own store. A node with no warm pool starts nothing.
+	svc.StartWarmPoolSync(ctx)
 	// The chain runs the avm_ token authenticator before the OIDC verifier
 	// (§5.2). The verifier and the sign-in discovery issuers are wired only
 	// when an identity file is configured (SB_IDENTITY_FILE).
@@ -1107,6 +1126,9 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 				// The static routes' fallback (NXDOMAIN): wake, 503, 421,
 				// mediators. nil unless ingress proxy routing is engaged.
 				Hosts: routingBoot.hostRoutes(),
+				// Token-gated ports (A2): checked with the server key, no
+				// store read.
+				Tokens: svc,
 			})
 		}
 		// Caddy on-demand TLS ask callback (plans/custom-domains.md).

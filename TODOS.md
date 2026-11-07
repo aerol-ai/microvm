@@ -639,6 +639,26 @@ Every entry was re-verified against `main` at `704c9e74` on 2026-10-06.
 
 ---
 
+## A cancelled warm-pool park can leave its slot's container (containerd)
+
+- **What:** the containerd warm pool's park path
+  (`internal/runtime/containerd/warm_park.go`) undoes a failed park on the
+  request context, the pattern "fix(containerd): undo a failed create even
+  when its client hung up" removed from `Driver.Create`. A park cancelled
+  mid-way can leave its slot's container until the orphan sweep.
+- **Why it is only a TODO:** slot IDs are fresh (`park-*`), so no create or
+  retry ever collides with one; it costs a container until the sweep, not a
+  failed call.
+- **Status (2026-11-06):** the create-side leftovers this came from are
+  fixed in the parity stack: the undo runs on `undoContext`, and a keyed
+  create that still meets a leftover (a hang-up inside Docker's
+  `/containers/create` or containerd's `NewContainer`) removes it under the
+  create lease and creates again (`internal/service/create_leftover.go`).
+- **Fix:** run the park undo on a context like `undoContext`.
+- **Effort / priority:** S, P3.
+
+---
+
 ## Done
 
 Kept for the record. Each entry names the fix and where it lives.

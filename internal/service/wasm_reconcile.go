@@ -35,7 +35,9 @@ func (s *Service) reconcileWasmOfflineRow(ctx context.Context, sandbox *models.S
 			if s.admitter != nil {
 				s.admitter.Release(sandbox.ID)
 			}
-			_ = s.store.UpdateStatus(ctx, sandbox.ID, models.SandboxStatusStopped, "ephemeral wasm lost on daemon restart")
+			done := s.beginSystemActionReason(ctx, sandbox.ID, systemActionFoundStopped, models.StatusReasonReconcile)
+			recordSandboxStop(models.StatusReasonReconcile)
+			done(s.store.UpdateStatusWithReason(ctx, sandbox.ID, models.SandboxStatusStopped, "ephemeral wasm lost on daemon restart", models.StatusReasonReconcile, nil))
 			return true
 		}
 	}

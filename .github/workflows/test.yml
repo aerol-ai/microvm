@@ -43,6 +43,7 @@ jobs:
       go_sdk: ${{ (github.event_name != 'pull_request' || github.base_ref == 'main') && steps.filter.outputs.go_sdk || 'false' }}
       java_sdk: ${{ (github.event_name != 'pull_request' || github.base_ref == 'main') && steps.filter.outputs.java_sdk || 'false' }}
       python_sdk: ${{ (github.event_name != 'pull_request' || github.base_ref == 'main') && steps.filter.outputs.python_sdk || 'false' }}
+      python_integrations: ${{ (github.event_name != 'pull_request' || github.base_ref == 'main') && steps.filter.outputs.python_integrations || 'false' }}
       typescript_sdk: ${{ (github.event_name != 'pull_request' || github.base_ref == 'main') && steps.filter.outputs.typescript_sdk || 'false' }}
       rust_sdk: ${{ (github.event_name != 'pull_request' || github.base_ref == 'main') && steps.filter.outputs.rust_sdk || 'false' }}
     steps:
@@ -86,6 +87,7 @@ jobs:
               - 'cmd/**'
               - 'internal/**'
               - 'pkg/**'
+              - 'images/**'
               - 'go.mod'
               - 'go.sum'
               - 'integration-tests/suite/harness/**'
@@ -108,6 +110,11 @@ jobs:
             java_sdk:
               - 'sdk/java/**'
             python_sdk:
+              - 'sdk/python/**'
+            # The integration packages run on the Python SDK, so an SDK
+            # change re-runs their tests too.
+            python_integrations:
+              - 'integrations/**'
               - 'sdk/python/**'
             typescript_sdk:
               - 'sdk/typescript/**'
@@ -138,7 +145,7 @@ jobs:
 
       - name: Run unit tests with coverage
         run: |
-          AEROLVM_SCALE_GATES=1 go test -count=1 -timeout 20m -coverprofile=coverage.out ./cmd/... ./internal/... ./pkg/...
+          AEROLVM_SCALE_GATES=1 go test -count=1 -timeout 20m -coverprofile=coverage.out ./cmd/... ./internal/... ./pkg/... ./images/...
           go tool cover -func=coverage.out | tail -n 1
 
       - name: Upload coverage artifact
@@ -252,7 +259,7 @@ jobs:
           cache: true
 
       - name: Vet production packages
-        run: go vet ./cmd/... ./internal/... ./pkg/...
+        run: go vet ./cmd/... ./internal/... ./pkg/... ./images/...
 
       - name: Scan reachable Go vulnerabilities
         run: go run golang.org/x/vuln/cmd/govulncheck@v1.6.0 ./...
@@ -426,6 +433,56 @@ jobs:
           python -m pip install --no-deps --no-build-isolation -e .
 
       - name: Run Python SDK tests
+        run: python -m unittest discover -s tests -v
+
+  # One leg per agent-framework package in integrations/. Each pins its
+  # framework in its own hash-locked requirements-ci.txt, so the legs never
+  # share a dependency set.
+  python-integrations-tests:
+    needs: paths
+    if: needs.paths.outputs.python_integrations == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - package: openai-agents
+            python: '3.12'
+          - package: deepagents
+            python: '3.12'
+          - package: gymnasium
+            python: '3.12'
+          # NeMo Gym asks for Python >=3.13.14, which only 3.14 meets.
+          - package: nemo-gym
+            python: '3.14'
+    defaults:
+      run:
+        working-directory: integrations/${{ matrix.package }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+          cache-dependency-path: integrations/${{ matrix.package }}/requirements-ci*.txt
+
+      - name: Install the package and its pinned dependencies
+        run: |
+          # Hash-pin third-party packages, then install the SDK and the
+          # package from this checkout with --no-deps, as the SDK job does.
+          python -m pip install --require-hashes -r requirements-ci.txt
+          # A framework installed without its own dependencies (NeMo Gym's
+          # are a training stack its provider API never imports), still by
+          # hash.
+          if [ -f requirements-ci-nodeps.txt ]; then
+            python -m pip install --no-deps --no-build-isolation --require-hashes -r requirements-ci-nodeps.txt
+          fi
+          python -m pip install --no-deps --no-build-isolation -e ../../sdk/python -e .
+
+      - name: Run the package's tests
         run: python -m unittest discover -s tests -v
 
   typescript-sdk-tests:

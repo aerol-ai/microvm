@@ -52,6 +52,10 @@ func (g *Gateway) authorizeRemoteSSH(ctx context.Context, sandboxID, mode, sessi
 		g.logger.Info("ssh auth: remote sandbox not running", "sandbox_id", sandboxID, "forward_id", forwardID, "status", string(remote.Status))
 		return nil, false
 	}
+	if err := sshRuntimeSupported(remote.Runtime); err != nil {
+		g.logger.Info("ssh auth: remote sandbox has no shell", "sandbox_id", sandboxID, "forward_id", forwardID, "error", err)
+		return nil, false
+	}
 	if authErr := authorizeKey(remote.SSHPublicKey, key); authErr != nil {
 		g.logger.Info("ssh auth: remote sandbox not authorized", "sandbox_id", sandboxID, "forward_id", forwardID, "error", authErr)
 		return nil, false

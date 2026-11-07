@@ -1,0 +1,243 @@
+---
+title: VS Code in the browser
+description: Build a ready-made code-server image and give one person a private VS Code editor that runs inside a sandbox.
+---
+
+import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
+
+code-server is VS Code that runs on a server and opens in a web browser. With AerolVM's ready-made image, each person can get their own editor in their own sandbox. The code, the terminal and every program they run stay in the sandbox, not on their laptop.
+
+The editor is shared with one person through a link with a [sandbox token](/sandbox-tokens/) in it. Anyone without a token gets `401`.
+
+## What you need
+
+- **An AerolVM server with a domain.** Token-only ports need HTTPS and a domain. See [Single node setup](/getting-started/single-node-setup/).
+- **`SB_API_URL` and `SB_PAT_TOKEN`** set in your terminal, and an SDK for your language. See [SDK setup](/sdk-setup/).
+- **The image's Dockerfile.** Save [`images/code-server/Dockerfile`](https://github.com/aerol-ai/microvm/blob/main/images/code-server/Dockerfile) from the AerolVM repository on your computer. The image is not in a registry: your server builds it from this one file.
+
+The image starts from the official `codercom/code-server` image with two changes. It has no sign-in page, because the token does that job. And its user, `coder`, has no `sudo`, so everything in the editor runs as a normal user.
+
+## Step 1: Build the image
+
+`buildImage` sends the Dockerfile to your server, which builds it and returns the image's name. The first build downloads about 1 GB. After that, the same Dockerfile reuses the finished image at once.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    import { Image } from "@aerol-ai/aerolvm-sdk";
+    import { readFile } from "node:fs/promises";
+
+    const dockerfile = await readFile("Dockerfile", "utf8");
+    const { image } = await client.buildImage(Image.fromDockerfile(dockerfile));
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    from microvm import Image
+
+    with open("Dockerfile", encoding="utf-8") as f:
+        image = client.build_image(Image.from_dockerfile(f.read()))
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    dockerfile, err := os.ReadFile("Dockerfile")
+    if err != nil {
+        log.Fatal(err)
+    }
+    image, err := client.BuildImage(ctx, microvm.FromDockerfile(string(dockerfile)))
+    if err != nil {
+        log.Fatal(err)
+    }
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    use aerolvm_sdk::Image;
+
+    let dockerfile = std::fs::read_to_string("Dockerfile").expect("read Dockerfile");
+    let image = client.build_image(&Image::from_dockerfile(&dockerfile))?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    String dockerfile = Files.readString(Path.of("Dockerfile"));
+    String image = client.buildImage(Image.fromDockerfile(dockerfile));
+    ```
+  </TabItem>
+</Tabs>
+
+## Step 2: Create a sandbox and add code
+
+The editor starts by itself and opens the folder `/home/coder/project`. This creates the sandbox, then clones a repository into that folder. The lifecycle rule stops the sandbox after an idle hour. A stopped sandbox keeps its files, so the person can pick up where they left off after you start it again.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const HOUR = 60 * 60 * 1_000_000_000; // one hour in nanoseconds
+
+    const sandbox = await client.create({
+      image,
+      cpu: 2,
+      memoryMB: 2048,
+      lifecycle: { stopIfIdleFor: HOUR },
+    });
+    await sandbox.exec("git clone --depth=1 https://github.com/octocat/Hello-World /home/coder/project/hello");
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    HOUR = 60 * 60 * 1_000_000_000  # one hour in nanoseconds
+
+    sandbox = client.create(
+        image=image,
+        cpu=2,
+        memoryMB=2048,
+        lifecycle={"stopIfIdleFor": HOUR},
+    )
+    sandbox.exec("git clone --depth=1 https://github.com/octocat/Hello-World /home/coder/project/hello")
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    sandbox, err := client.Create(ctx, sdktypes.CreateSandboxOptions{
+        Image:     image,
+        CPU:       2,
+        MemoryMB:  2048,
+        Lifecycle: &sdktypes.Lifecycle{StopIfIdleFor: time.Hour},
+    })
+    if err != nil {
+        log.Fatal(err)
+    }
+    if _, err := sandbox.ExecCommand(ctx, "git clone --depth=1 https://github.com/octocat/Hello-World /home/coder/project/hello"); err != nil {
+        log.Fatal(err)
+    }
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    use aerolvm_sdk::Lifecycle;
+
+    let hour: u64 = 60 * 60 * 1_000_000_000; // one hour in nanoseconds
+
+    let sandbox = client.create(CreateOptions {
+        image: image.clone(),
+        cpu: Some(2),
+        memory_mb: Some(2048),
+        lifecycle: Some(Lifecycle {
+            stop_if_idle_for: hour,
+            ..Default::default()
+        }),
+        ..Default::default()
+    })?;
+    sandbox.exec("git clone --depth=1 https://github.com/octocat/Hello-World /home/coder/project/hello")?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    long hour = Duration.ofHours(1).toNanos(); // java.time.Duration
+
+    Sandbox sandbox = client.create(new CreateOptions()
+        .setImage(image)
+        .setCpu(2.0)
+        .setMemoryMb(2048)
+        .setLifecycle(new Lifecycle().setStopIfIdleFor(hour)));
+    sandbox.exec("git clone --depth=1 https://github.com/octocat/Hello-World /home/coder/project/hello");
+    ```
+  </TabItem>
+</Tabs>
+
+## Step 3: Share the editor with one person
+
+Share port 8080 with `visibility: "token"`, then make a token for that port. The link is the port's address with the token on the end.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const exposure = await sandbox.exposePort(8080, { visibility: "token" });
+    const tok = await sandbox.createToken({ port: 8080, expiresIn: "8h" });
+
+    // Give this link to the one person who should use the editor.
+    console.log(`${exposure.url}?token=${tok.token}`);
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    exposure = sandbox.expose_port(8080, visibility="token")
+    tok = sandbox.create_token(port=8080, expires_in="8h")
+
+    # Give this link to the one person who should use the editor.
+    print(f"{exposure.url}?token={tok['token']}")
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    exposure, err := sandbox.ExposePort(ctx, 8080, microvm.WithVisibility(sdktypes.ExposeVisibilityToken))
+    if err != nil {
+        log.Fatal(err)
+    }
+    tok, err := sandbox.CreateToken(ctx, sdktypes.CreateSandboxTokenOptions{Port: 8080, ExpiresIn: "8h"})
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    // Give this link to the one person who should use the editor.
+    fmt.Println(exposure.PublicURL + "?token=" + tok.Token)
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    use aerolvm_sdk::{CreateSandboxTokenOptions, ExposeOptions, ExposeResult};
+
+    let exposure = sandbox.expose_port(8080, ExposeOptions::token())?;
+    let tok = sandbox.create_token(CreateSandboxTokenOptions {
+        port: Some(8080),
+        expires_in: "8h".into(),
+        ..Default::default()
+    })?;
+
+    // Give this link to the one person who should use the editor.
+    if let ExposeResult::Http { url } = exposure {
+        println!("{}?token={}", url, tok.token);
+    }
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    ExposeResult exposure = sandbox.exposePort(8080, ExposeOptions.token());
+    SandboxToken tok = sandbox.createToken(
+        new CreateSandboxTokenOptions().setPort(8080).setExpiresIn("8h"));
+
+    // Give this link to the one person who should use the editor.
+    System.out.println(exposure.url + "?token=" + tok.token);
+    ```
+  </TabItem>
+</Tabs>
+
+When the person opens the link, the server checks the token, swaps it for a cookie in their browser and takes it out of the address. Then VS Code opens with the project folder. The cookie lasts until the token expires, so they can reload the page or come back later the same day.
+
+## Step 4: End the access
+
+A token stops working when it expires. To cut access sooner:
+
+- **Revoke the tokens** with `sandbox.revokeTokens()`. Every link and browser cookie for this sandbox stops working at once. Make a new token to share it again. See [Revoke tokens](/sandbox-tokens/#revoke-tokens).
+- **Remove the port** with `unexposePort(8080)`. The link stops working at once. Expose the port again and make a new token to share it again.
+- **Delete the sandbox** with `sandbox.destroy()` when the work is done.
+
+## Good to know
+
+<Aside type="caution">
+Never share port 8080 as public. The editor has no sign-in page of its own, and its terminal runs any command. The token is the only lock.
+</Aside>
+
+- **Need more tools?** Add `RUN` lines to the Dockerfile above `USER 1000`, such as `RUN apt-get update && apt-get install -y python3`, and build it again. The editor's user has no `sudo`, so it cannot install system packages itself.
+- **Extensions** install from the editor as usual. code-server uses the Open VSX extension store, which has most popular extensions.
+- **Give each person their own sandbox.** Everyone who opens the same editor shares one machine, one terminal and one set of files.
+- **Files stay with the sandbox.** Stopping keeps them. Deleting removes them. To keep work longer than the sandbox, push it to Git or use a [platform volume](/platform-volumes/).
+
+## Next steps
+
+- [Sandbox tokens](/sandbox-tokens/): what a token can and cannot open.
+- [Public URLs](/public-urls/#share-a-port-behind-a-token): the rules for token-only ports.
+- [Lifecycle](/lifecycle/): stop and delete sandboxes on a timer.
+- [Computer use and browser automation](/computer-use/): the other ready-made image.

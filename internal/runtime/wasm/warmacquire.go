@@ -5,6 +5,7 @@ import (
 	"errors"
 
 	wasmpool "github.com/aerol-ai/microvm/internal/pool/wasm"
+	"github.com/aerol-ai/microvm/internal/scaleobs"
 )
 
 // WarmPool is the seam Driver.Create uses for pre-compiled worker hits.
@@ -27,6 +28,8 @@ func (d *Driver) tryAcquireWarm(ctx context.Context, digest, modulePath string, 
 	if err == nil {
 		d.logger.Info("wasm create: warm pool hit",
 			"digest", digest, "slot_id", slot.ID, "socket", slot.SocketPath)
+		// The create's latency is labelled warm (O1).
+		scaleobs.MarkWarmStart(ctx)
 		return slot, nil
 	}
 	if errors.Is(err, wasmpool.ErrNoSlot) {

@@ -124,9 +124,19 @@ func RegisterRoutes(mux apihttp.Mux, d Deps) {
 	mux.Handle("DELETE "+PathPrefix+"/sandboxes/{id}", d.Route(permWrite, wrap(http.HandlerFunc(h.clusterDestroyWrap))))
 	mux.Handle("POST "+PathPrefix+"/sandboxes/{id}/resize", d.Route(permWrite, wrap(http.HandlerFunc(h.resizeSandbox))))
 	mux.Handle("POST "+PathPrefix+"/sandboxes/{id}/snapshot", d.Route(permWrite, wrap(http.HandlerFunc(h.createSnapshot))))
-	mux.Handle("PUT "+PathPrefix+"/sandboxes/{id}/lifecycle", d.Route(permWrite, wrap(http.HandlerFunc(h.updateLifecycle))))
+	// destroy_at is checked against the cluster's builds before the forward
+	// (an older owner would drop it and clear every timer).
+	mux.Handle("PUT "+PathPrefix+"/sandboxes/{id}/lifecycle", d.Route(permWrite, h.destroyAtUpgradeGate(wrap(http.HandlerFunc(h.updateLifecycle)))))
 	mux.Handle("POST "+PathPrefix+"/sandboxes/{id}/ports/{port}", d.Route(permWrite, wrap(http.HandlerFunc(h.exposePort))))
 	mux.Handle("DELETE "+PathPrefix+"/sandboxes/{id}/ports/{port}", d.Route(permWrite, wrap(http.HandlerFunc(h.unexposePort))))
+	// Signed per-sandbox tokens (A1, pkg/sandboxtoken): sandbox.exec, the
+	// most a token can grant. Forwarded to the owner, which reads the row;
+	// not idempotent by nature (each call mints a new token).
+	mux.Handle("POST "+PathPrefix+"/sandboxes/{id}/tokens", d.Route(permExec, wrap(http.HandlerFunc(h.createSandboxToken))))
+	// Revoking every token issued so far: the same permission and the same
+	// owner forward (the owner's row holds the not-before every check
+	// reads). Idempotent in effect.
+	mux.Handle("POST "+PathPrefix+"/sandboxes/{id}/tokens/revoke", d.Route(permExec, wrap(http.HandlerFunc(h.revokeSandboxTokens))))
 	// Custom domains (plans/custom-domains.md). Gated server-side by
 	// SB_ENABLE_CUSTOM_DOMAINS — routes are always mounted (so a request
 	// hits a 412 rather than a 404 when the cluster has the feature off)
@@ -155,8 +165,30 @@ func RegisterRoutes(mux apihttp.Mux, d Deps) {
 	mux.Handle("GET "+PathPrefix+"/egress-profiles/{name}", d.Route(permRead, http.HandlerFunc(h.getEgressProfile)))
 	mux.Handle("DELETE "+PathPrefix+"/egress-profiles/{name}", d.Route(permWrite, http.HandlerFunc(h.deleteEgressProfile)))
 	mux.Handle("GET "+PathPrefix+"/egress-profiles", d.Route(permRead, http.HandlerFunc(h.listEgressProfiles)))
+	// Team quotas (plan item P2): an admin caps what a team may hold. Not
+	// sandbox-scoped; in a cluster the service writes them through Raft.
+	mux.Handle("PUT "+PathPrefix+"/teams/{team}/quota", d.Route(permFleet, http.HandlerFunc(h.putTeamQuota)))
+	mux.Handle("GET "+PathPrefix+"/teams/{team}/quota", d.Route(permFleet, http.HandlerFunc(h.getTeamQuota)))
+	mux.Handle("DELETE "+PathPrefix+"/teams/{team}/quota", d.Route(permFleet, http.HandlerFunc(h.deleteTeamQuota)))
+	// Cloud identity (plans/sandbox-cloud-identity.md): each team's
+	// role-tag allow list is admin only (D1.5), key rotation is the
+	// operator's. Not sandbox-scoped, so no owner forwarding; in a cluster
+	// the service writes them through Raft. No route returns a token.
+	mux.Handle("PUT "+PathPrefix+"/identity/roles/{tag}", d.Route(permFleet, http.HandlerFunc(h.putIdentityRole)))
+	mux.Handle("DELETE "+PathPrefix+"/identity/roles/{tag}", d.Route(permFleet, http.HandlerFunc(h.deleteIdentityRole)))
+	mux.Handle("GET "+PathPrefix+"/identity/roles", d.Route(permFleet, http.HandlerFunc(h.listIdentityRoles)))
+	mux.Handle("POST "+PathPrefix+"/identity/keys/rotate", d.Route(permFleet, http.HandlerFunc(h.rotateIdentityKey)))
 	// Pure policy evaluation: no sandbox, no state change, so a read.
 	mux.Handle("POST "+PathPrefix+"/network/policy/check", d.Route(permRead, http.HandlerFunc(h.checkNetworkPolicy)))
+	// Warm pools (plans/agent-sandbox-feature-parity.md W1): fleet-wide
+	// operator config, so fleet.admin even to read (an entry names the
+	// images an operator runs). Not sandbox-scoped, so no owner forwarding;
+	// in a cluster the service writes them through Raft. {image...} takes
+	// the rest of the path, so an image's slashes need no escaping.
+	mux.Handle("GET "+PathPrefix+"/warm-pools", d.Route(permFleet, http.HandlerFunc(h.listWarmPools)))
+	mux.Handle("GET "+PathPrefix+"/warm-pools/{image...}", d.Route(permFleet, http.HandlerFunc(h.getWarmPool)))
+	mux.Handle("PUT "+PathPrefix+"/warm-pools/{image...}", d.Route(permFleet, http.HandlerFunc(h.putWarmPool)))
+	mux.Handle("DELETE "+PathPrefix+"/warm-pools/{image...}", d.Route(permFleet, http.HandlerFunc(h.deleteWarmPool)))
 	// Secret audit history: local JSONL + live fan-out. NOT clusterForwardWrap —
 	// owner-forward would drop pre-failover history (plans/secrets-hardening §E1b).
 	mux.Handle("GET "+PathPrefix+"/sandboxes/{id}/audit", d.Route(controlplane.PermAuditRead, withAuditLimit(d, http.HandlerFunc(h.getSandboxAudit))))
@@ -261,7 +293,13 @@ func RegisterRoutes(mux apihttp.Mux, d Deps) {
 	mux.Handle("POST "+cluster.PublicInternalArtifactCatalogEpochPath, internalOp(http.HandlerFunc(h.clusterInternalArtifactCatalogEpoch)))
 	mux.Handle("POST "+cluster.PublicInternalEgressProfileWritePath, internalOp(http.HandlerFunc(h.clusterInternalEgressProfileWrite)))
 	mux.Handle("POST "+cluster.PublicInternalEgressProfileReadPath, internalOp(http.HandlerFunc(h.clusterInternalEgressProfileRead)))
+	mux.Handle("POST "+cluster.PublicInternalTeamQuotaWritePath, internalOp(http.HandlerFunc(h.clusterInternalTeamQuotaWrite)))
+	mux.Handle("POST "+cluster.PublicInternalTeamQuotaReadPath, internalOp(http.HandlerFunc(h.clusterInternalTeamQuotaRead)))
+	mux.Handle("POST "+cluster.PublicInternalIdentityWritePath, internalOp(http.HandlerFunc(h.clusterInternalIdentityWrite)))
+	mux.Handle("POST "+cluster.PublicInternalIdentityReadPath, internalOp(http.HandlerFunc(h.clusterInternalIdentityRead)))
 	mux.Handle("POST "+cluster.PublicInternalAPITokenWritePath, internalOp(http.HandlerFunc(h.clusterInternalAPITokenWrite)))
+	mux.Handle("POST "+cluster.PublicInternalWarmPoolWritePath, internalOp(http.HandlerFunc(h.clusterInternalWarmPoolWrite)))
+	mux.Handle("POST "+cluster.PublicInternalWarmPoolReadPath, internalOp(http.HandlerFunc(h.clusterInternalWarmPoolRead)))
 	mux.Handle("GET "+cluster.PublicInternalAPITokenChangesPath, internalOp(http.HandlerFunc(h.clusterInternalAPITokenChanges)))
 	mux.Handle("GET "+cluster.PublicInternalAPITokenPagePath, internalOp(http.HandlerFunc(h.clusterInternalAPITokenPage)))
 	mux.Handle("GET "+cluster.PublicInternalAuditACLPath+"{id}", internalOp(http.HandlerFunc(h.clusterInternalAuditACL)))

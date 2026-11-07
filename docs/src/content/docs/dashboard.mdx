@@ -165,6 +165,32 @@ Good first alerts to set up:
 - `aerolvm_image_pull_backoff_rejects_total`
 - the `aerolvm_host_pressure_*` gauges
 
+### Sandbox lifecycle metrics
+
+These counters show what happens to sandboxes over time. Each one has a `key` label with a small, fixed set of values. None of them has a label per sandbox.
+
+| Metric | `key` values | Counts |
+|---|---|---|
+| `aerolvm_sandbox_stops_total` | `user_stop`, `idle`, `max_age`, `out_of_memory`, `disk_limit`, `crashed`, `program_exited`, `reconcile` | Sandboxes that stopped, by their [stop reason](/lifecycle/#why-a-sandbox-stopped). |
+| `aerolvm_sandbox_starts_total` | `requested`, `restarted`, `failover` | Sandboxes that started again: by a call (including a wake), by `restartOnFailure`, or after a server failed. |
+| `aerolvm_sandbox_expired_total` | `idle`, `max_age`, `program_exited` | Sandboxes a lifecycle timer deleted, by the timer. `destroyAt` counts as `max_age`; `destroyAfterExitFor` counts as `program_exited`. |
+| `aerolvm_sandbox_finished_total` | `success`, `failure` | Main programs that ended, by whether the exit code was `0`. A sandbox that goes down with a non-zero code counts as a `crashed` stop, not here. So `failure` only counts programs the server watches for [`destroyAfterExitFor`](/lifecycle/#delete-when-the-program-ends), which end while the sandbox keeps running. |
+| `aerolvm_create_latency_by_start_seconds_bucket` | `warm`, `cold` (`key2` is the bucket) | How long successful creates took, split by whether a warm pool, a parked container or a running V8-isolate group served them. |
+
+A rise in `crashed` or `out_of_memory` stops together with `restarted` starts means sandboxes are crashing over and over. The D2 Capability Matrix dashboard in [`setup/grafana`](https://github.com/aerol-ai/microvm/tree/main/setup/grafana) has a panel with all four counters.
+
+## Profile the server with pprof
+
+pprof is Go's built-in profiler. It shows where the server spends its CPU time, what holds its memory, and what each goroutine (a lightweight Go thread) is doing. It is off by default.
+
+To turn it on, set `SB_ENABLE_PPROF=true` and restart the server. The profiler then answers under `/debug/pprof/` on each server's own API port (port `21212` by default):
+
+- **Only admins can read it.** Use the server token or an `admin` API token. A request with no token gets `401`, and any other token gets `403`.
+- **It is per server.** Caddy does not forward `/debug/` from your API domain, so open each node's own port, the same way as `/debug/vars`.
+- **Turn it off again when you are done.** A profile shows the server's goroutines, memory and command line, and taking one costs CPU while it runs.
+
+Download a profile with your admin token, then open the file with Go's `go tool pprof`. `/debug/pprof/profile?seconds=30` records 30 seconds of CPU time, `/debug/pprof/heap` shows memory, and `/debug/pprof/goroutine?debug=2` lists every goroutine as text. `/debug/pprof/` lists every profile.
+
 ## Send metrics and traces with OpenTelemetry
 
 OpenTelemetry (OTEL) is a standard way to send metrics and traces (a timed record of each request) to a collector. Prometheus pulls numbers. OTEL pushes them, over OTLP/HTTP.
@@ -183,6 +209,8 @@ What gets sent:
 
 - **Metrics:** the same `aerolvm_*` counters, as `aerolvm.expvar.int64` and `aerolvm.expvar.float64`. The original counter name is in the `metric` attribute. Map keys are in `key`, `key2` and so on.
 - **Traces:** one span (a timed step) per API request. The server reads incoming W3C trace context, so its spans join your app's traces. Each span is tagged with `http.route`, status code, node ID, node role, service name and server version.
+
+**Traces reach the sandbox's helper program.** Every call the server passes to a sandbox's helper program (`toolboxd`: commands, files, terminals, from the AerolVM API and the Daytona, E2B and Runloop APIs) carries a W3C `traceparent`. With tracing on it names the server's own span for the request; with tracing off it is your app's trace context, passed on unchanged. The helper program writes one log line per such request, with the `trace_id`, the method and the path (never the query), to the sandbox's output. So you can find the helper's side of a slow or failed call by its trace id. Only `traceparent` and `tracestate` go into the sandbox, never `baggage`. WASM and V8 isolate sandboxes have no helper program inside them, so for those the server's span is the only record.
 
 By default the server keeps 5% of the traces it starts itself (`0.05`). That way a large cluster can send traces without every burst flooding your collector.
 

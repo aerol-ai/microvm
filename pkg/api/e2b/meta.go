@@ -89,6 +89,9 @@ type sandboxMeta struct {
 	// name+path are kept (never credentials/storage coordinates) so GET/list
 	// can surface them after a restart from the sealed compat blob.
 	VolumeMounts []sandboxVolumeMountPayload
+	// MCP is true when the create asked for E2B's MCP gateway (mcp.go). It
+	// drives this create only (port 50005 is exposed), so it is not stored.
+	MCP bool
 }
 
 // compatBlob is the persisted JSON shape inside sandbox_compat_state.state_json
@@ -323,6 +326,10 @@ type createFingerprintPayload struct {
 	NetworkDenyOut      []string          `json:"networkDenyOut,omitempty"`
 	AllowPublicTraffic  bool              `json:"allowPublicTraffic"`
 	MaskRequestHost     string            `json:"maskRequestHost,omitempty"`
+	// MCP keeps a create that exposes the gateway port from replaying one
+	// that did not. omitempty leaves every other create's payload, and so
+	// its fingerprint and sandbox ID, exactly as before.
+	MCP bool `json:"mcp,omitempty"`
 }
 
 // createFingerprints are one create's idempotency fingerprints.
@@ -397,6 +404,7 @@ func createFingerprintPayloadJSON(ownerRef, templateID string, serviceReq models
 		NetworkDenyOut:      sortedStringSlice(meta.NetworkDenyOut),
 		AllowPublicTraffic:  meta.AllowPublicTraffic == nil || *meta.AllowPublicTraffic,
 		MaskRequestHost:     strings.TrimSpace(meta.MaskRequestHost),
+		MCP:                 meta.MCP,
 	}
 	return json.Marshal(payload)
 }

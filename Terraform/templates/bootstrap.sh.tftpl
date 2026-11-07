@@ -1055,6 +1055,14 @@ SB_AUDIT_WITNESS_S3_REGION=${aws_region}
 SB_L4_PUBLIC_HOST=${l4_public_host}
 
 %{ endif ~}
+%{ if identity_issuer_enabled ~}
+# Managed by Terraform bootstrap: sandbox cloud identity
+# (plans/sandbox-cloud-identity.md). The public API URL is the OIDC issuer
+# customers' clouds fetch the signing keys from; every node carries the same
+# value. Template var identity_issuer_enabled renders nothing when off.
+SB_IDENTITY_ISSUER_URL=https://${domain}
+
+%{ endif ~}
 # Managed by Terraform bootstrap: extra_sandboxd_env (global) merged under this
 # node's own sandboxd_env. Rendered LAST inside this block so a per-node entry
 # wins over anything above it, and written BEFORE the final

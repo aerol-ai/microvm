@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"time"
+
+	"github.com/aerol-ai/microvm/internal/scaleobs"
 )
 
 // The group router (plans/isolate-runtime.md §2.1). Sandboxes are placed into
@@ -44,6 +46,8 @@ func (d *Driver) acquireGroup(ctx context.Context, groupKey, sandboxID string, c
 			g.members[sandboxID] = struct{}{}
 			g.lastUsed = timeNow()
 			d.groupsMu.Unlock()
+			// Joining a running workerd is the warm path (O1).
+			scaleobs.MarkWarmStart(ctx)
 			return g.host, nil
 		}
 		// A spawn is already in flight for this key: wait for it and re-check
@@ -92,6 +96,7 @@ var timeNow = func() time.Time { return time.Now() }
 func (d *Driver) spawnGroup(ctx context.Context, groupKey string, cpu float64, memMB int) (GroupHost, error) {
 	if d.warmPool != nil {
 		if host, ok := d.warmPool.Acquire(ctx); ok && host != nil {
+			scaleobs.MarkWarmStart(ctx)
 			// A blank host was jailed with unlimited caps; it now belongs to
 			// this tenant and takes theirs (cgroup v2 applies them live).
 			// pids.max moves with the other caps: a blank host is spawned

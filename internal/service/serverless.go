@@ -51,8 +51,39 @@ const (
 // involuntary, which is the safe default — a late-arriving event for a
 // reaped entry then re-arms wake under the involuntary policy.
 type expectedStopRecord struct {
-	mode       stopMode
+	mode stopMode
+	// reason is the status reason (models.StatusReason*) the stop is for, so
+	// the die event that follows records the same one as the stop call:
+	// whichever of the two writes the stopped row first names the reason.
+	reason     string
 	recordedAt time.Time
+}
+
+// defaultStopReason is the status reason a stop of this mode records when
+// its caller names none. An involuntary stop has no default: its reason
+// comes from the exit (stopReasonForExit).
+func defaultStopReason(mode stopMode) string {
+	switch mode {
+	case stopModeManual:
+		return models.StatusReasonUserStop
+	case stopModeLifecycle:
+		return models.StatusReasonIdle
+	}
+	return ""
+}
+
+// stopReasonForExit names an exit nobody asked for: an OOM kill of the init,
+// a clean exit, or a crash. Every one carries the exit code.
+func stopReasonForExit(oomKilled bool, exitCode int) (string, *int) {
+	code := exitCode
+	switch {
+	case oomKilled:
+		return models.StatusReasonOutOfMemory, &code
+	case exitCode == 0:
+		return models.StatusReasonProgramExited, &code
+	default:
+		return models.StatusReasonCrashed, &code
+	}
 }
 
 // expectedStopMaxAge bounds how long an expectation lives without a
@@ -74,6 +105,12 @@ const expectedStopMaxAge = 5 * time.Minute
 // lock is already held; the scan cost is bounded by the number of
 // concurrently in-flight stops, which is small in practice.
 func (s *Service) recordExpectedStop(id string, mode stopMode) {
+	s.recordExpectedStopReason(id, mode, defaultStopReason(mode))
+}
+
+// recordExpectedStopReason is recordExpectedStop with the status reason the
+// stop is for.
+func (s *Service) recordExpectedStopReason(id string, mode stopMode, reason string) {
 	s.expectedStopsMu.Lock()
 	defer s.expectedStopsMu.Unlock()
 	if s.expectedStops == nil {
@@ -85,7 +122,7 @@ func (s *Service) recordExpectedStop(id string, mode stopMode) {
 			delete(s.expectedStops, staleID)
 		}
 	}
-	s.expectedStops[id] = expectedStopRecord{mode: mode, recordedAt: now}
+	s.expectedStops[id] = expectedStopRecord{mode: mode, reason: reason, recordedAt: now}
 }
 
 // consumeExpectedStop returns the mode recorded by recordExpectedStop and
@@ -93,17 +130,24 @@ func (s *Service) recordExpectedStop(id string, mode stopMode) {
 // aged out), it returns stopModeInvoluntary so the caller treats the
 // event as an unplanned exit.
 func (s *Service) consumeExpectedStop(id string) stopMode {
+	mode, _ := s.consumeExpectedStopReason(id)
+	return mode
+}
+
+// consumeExpectedStopReason is consumeExpectedStop that also returns the
+// status reason recorded with the expectation ("" for an involuntary stop).
+func (s *Service) consumeExpectedStopReason(id string) (stopMode, string) {
 	s.expectedStopsMu.Lock()
 	defer s.expectedStopsMu.Unlock()
 	rec, ok := s.expectedStops[id]
 	if !ok {
-		return stopModeInvoluntary
+		return stopModeInvoluntary, ""
 	}
 	delete(s.expectedStops, id)
 	if time.Since(rec.recordedAt) > expectedStopMaxAge {
-		return stopModeInvoluntary
+		return stopModeInvoluntary, ""
 	}
-	return rec.mode
+	return rec.mode, rec.reason
 }
 
 // stopSandboxInternal is the single code path for stopping a sandbox row.
@@ -138,6 +182,26 @@ func (s *Service) consumeExpectedStop(id string) stopMode {
 // recordExpectedStop must be called before docker.Stop so the events
 // handler does not race the stop and classify it as involuntary.
 func (s *Service) stopSandboxInternal(ctx context.Context, id string, mode stopMode) (*models.Sandbox, error) {
+	return s.stopSandboxForReason(ctx, id, mode, defaultStopReason(mode))
+}
+
+// stopSandboxForReason is stopSandboxInternal with the status reason
+// (models.StatusReason*) the stopped row records: the lifecycle sweep tells
+// idle from max_age, and the disk watchdog stops with disk_limit while using
+// the manual mode's no-wake rule. Both take the lifecycle boundary
+// (lifecycle_boundary.go).
+func (s *Service) stopSandboxForReason(ctx context.Context, id string, mode stopMode, reason string) (*models.Sandbox, error) {
+	unlock, err := s.lifecycleLocks.lockCtx(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
+	return s.stopSandboxLocked(ctx, id, mode, reason)
+}
+
+// stopSandboxLocked is the stop itself. The caller holds the lifecycle
+// boundary for id.
+func (s *Service) stopSandboxLocked(ctx context.Context, id string, mode stopMode, reason string) (*models.Sandbox, error) {
 	// scopedGet fences a user token to its own sandbox (cross-owner → 404).
 	// Internal idle-stop/lifecycle callers run with no Access in ctx, so this
 	// stays unscoped for them.
@@ -145,6 +209,10 @@ func (s *Service) stopSandboxInternal(ctx context.Context, id string, mode stopM
 	if err != nil {
 		return nil, err
 	}
+	// Read before anything changes: a sandbox already down and waiting for
+	// a restart on failure takes this stop's reason, since its status will
+	// not change and Upsert keeps the reason of a write that changes none.
+	alreadyStopped := sandbox.Status == models.SandboxStatusStopped
 
 	// Drop the warm-preflight cache up front. From this moment on the
 	// ingress proxy must take the slow path (store hit → cold-start
@@ -154,7 +222,7 @@ func (s *Service) stopSandboxInternal(ctx context.Context, id string, mode stopM
 	// 503+Retry-After the cold-start race already produces.
 	s.invalidateWarm(id)
 	arm := s.shouldArmWake(sandbox, mode)
-	s.recordExpectedStop(id, mode)
+	s.recordExpectedStopReason(id, mode, reason)
 
 	rt, err := s.runtimeForSandbox(sandbox)
 	if err != nil {
@@ -218,6 +286,11 @@ func (s *Service) stopSandboxInternal(ctx context.Context, id string, mode stopM
 	}
 
 	sandbox.Status = models.SandboxStatusStopped
+	// Written only if this write is what moves the row to stopped; when the
+	// die event got there first it already recorded the same reason (from
+	// the expectation above), or a truer one (an OOM kill), and keeps it.
+	sandbox.StatusReason = reason
+	sandbox.ExitCode = nil
 	sandbox.WakeArmed = armedValue
 	if s.isFirecrackerSandbox(sandbox) {
 		s.shutStoppedGuest(rt, sandbox)
@@ -226,6 +299,21 @@ func (s *Service) stopSandboxInternal(ctx context.Context, id string, mode stopM
 	}
 	sandbox.UpdatedAt = time.Now().UTC()
 	if err := s.store.Upsert(ctx, sandbox); err != nil {
+		return nil, err
+	}
+	// A stop is never undone by a restart on failure: drop any pending one,
+	// including one a crash scheduled while this stop was on its way.
+	cancelReason := ""
+	if alreadyStopped {
+		cancelReason = reason
+	} else {
+		// Counted here, not on the die event that follows: that event
+		// carries this stop's expectation and counts nothing.
+		recordSandboxStop(reason)
+	}
+	// A failed cancel fails the stop, so the caller retries it rather than
+	// see a "stopped" that the sweep's restart later undoes.
+	if err := s.cancelPendingRestart(ctx, sandbox, cancelReason); err != nil {
 		return nil, err
 	}
 	return sandbox, nil
@@ -424,15 +512,15 @@ func (s *Service) ReconstructWakeArmedIfNeeded(ctx context.Context, sandbox *mod
 // operator. Otherwise we trust the expected-stop bookkeeping populated by
 // stopSandboxInternal. An oom event on its own never gets here: it is not
 // an exit.
-func (s *Service) classifyDockerStopEvent(id string, oomKilled bool) stopMode {
+func (s *Service) classifyDockerStopEvent(id string, oomKilled bool) (stopMode, string) {
 	if oomKilled {
 		// Drop any expectation so the slot is freed for a retry.
 		s.expectedStopsMu.Lock()
 		delete(s.expectedStops, id)
 		s.expectedStopsMu.Unlock()
-		return stopModeInvoluntary
+		return stopModeInvoluntary, ""
 	}
-	return s.consumeExpectedStop(id)
+	return s.consumeExpectedStopReason(id)
 }
 
 // ErrSandboxManuallyStopped is returned by the wake helper when the
@@ -602,8 +690,13 @@ func (s *Service) EnsureSandboxAwakeForHTTP(ctx context.Context, id string) (*mo
 		finish(true, semErr)
 		return nil, semErr
 	}
-	started, startErr := s.StartSandbox(startCtx, id)
+	started, startErr := s.wakeSandbox(startCtx, id)
 	releaseSem()
+	if errors.Is(startErr, ErrSandboxManuallyStopped) {
+		// A manual stop won the lifecycle boundary first: not a failed wake.
+		finish(false, startErr)
+		return nil, startErr
+	}
 	if startErr != nil {
 		flight.recordFailure(time.Now())
 		finish(true, startErr)
@@ -613,6 +706,32 @@ func (s *Service) EnsureSandboxAwakeForHTTP(ctx context.Context, id string) (*mo
 	s.forgetWakeFlight(id)
 	finish(true, nil)
 	return started, nil
+}
+
+// wakeSandbox is the wake's start, inside the lifecycle boundary
+// (lifecycle_boundary.go). It decides again from the row read there: the
+// wake's own checks read it before the wait, and a manual stop that got the
+// boundary in between disarmed the wake (ErrSandboxManuallyStopped), which a
+// wake must not undo. A sandbox another call started meanwhile, or one that
+// is no longer a stopped serverless sandbox, is returned as it is, as the
+// wake's first checks do.
+func (s *Service) wakeSandbox(ctx context.Context, id string) (*models.Sandbox, error) {
+	unlock, err := s.lifecycleLocks.lockCtx(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
+	sandbox, err := s.scopedGet(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	if sandbox.Status != models.SandboxStatusStopped || !s.cfg.EnableServerless || !sandbox.Lifecycle.Serverless {
+		return sandbox, nil
+	}
+	if !sandbox.WakeArmed {
+		return nil, ErrSandboxManuallyStopped
+	}
+	return s.startSandboxLocked(ctx, id, startRequested)
 }
 
 // allowAttempt returns false when the breaker is open at now and

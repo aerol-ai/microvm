@@ -14,21 +14,41 @@ import (
 type Pool struct {
 	logger *slog.Logger
 
-	mu            sync.Mutex
-	defaultDepth  int
-	maxImages     int
-	idleTTL       time.Duration
-	pinned        map[string]struct{}
-	targets       map[string]Key // keyString -> Key
-	lastUsed      map[string]time.Time
-	ready         map[string][]*ParkedSlot
-	spawning      map[string]int
-	spawnFails    map[string]int // keyString -> consecutive park failures
-	spawner       Spawner
-	onReleasePark func(slotID string)
-	onParkReady   func(slotID string, ready bool)
-	metrics       *Metrics
-	refillKick    chan struct{}
+	mu           sync.Mutex
+	defaultDepth int
+	maxImages    int
+	idleTTL      time.Duration
+	pinned       map[string]struct{}
+	// envPins are the pins from SB_*_POOL_IMAGES. An API entry pins its key
+	// too; envPins is how removing that entry tells "fall back to the env
+	// pin at the default depth" from "stop warming this image".
+	envPins map[string]struct{}
+	// configured are the API warm-pool entries (configured.go), by key
+	// string. Their depth replaces defaultDepth for that key.
+	configured map[string]Configured
+	// demand is each demand-following entry's moving average and target
+	// (demand.go). now is the clock it samples on; nil is time.Now.
+	demand map[string]*demandState
+	now    func() time.Time
+	// resolver, currentImage and lastImageCheck are the image-change check
+	// (replace.go): what each entry's tag names now, and when it was read.
+	resolver       ImageResolver
+	currentImage   map[string]string
+	lastImageCheck time.Time
+	targets        map[string]Key // keyString -> Key
+	lastUsed       map[string]time.Time
+	ready          map[string][]*ParkedSlot
+	spawning       map[string]int
+	spawnFails     map[string]int // keyString -> consecutive park failures
+	spawner        Spawner
+	onReleasePark  func(slotID string)
+	onParkReady    func(slotID string, ready bool)
+	metrics        *Metrics
+	refillKick     chan struct{}
+	// pending are parked containers whose teardown failed, by slot ID
+	// (pending_destroy.go). They stay charged until the engine confirms
+	// they are gone.
+	pending map[string]*pendingDestroy
 }
 
 // New constructs a warm pool.
@@ -37,15 +57,20 @@ func New(logger *slog.Logger) *Pool {
 		logger = slog.Default()
 	}
 	return &Pool{
-		logger:     logger,
-		pinned:     make(map[string]struct{}),
-		targets:    make(map[string]Key),
-		lastUsed:   make(map[string]time.Time),
-		ready:      make(map[string][]*ParkedSlot),
-		spawning:   make(map[string]int),
-		spawnFails: make(map[string]int),
-		metrics:    &Metrics{},
-		refillKick: make(chan struct{}, 1),
+		logger:       logger,
+		pinned:       make(map[string]struct{}),
+		envPins:      make(map[string]struct{}),
+		configured:   make(map[string]Configured),
+		demand:       make(map[string]*demandState),
+		currentImage: make(map[string]string),
+		targets:      make(map[string]Key),
+		lastUsed:     make(map[string]time.Time),
+		ready:        make(map[string][]*ParkedSlot),
+		spawning:     make(map[string]int),
+		spawnFails:   make(map[string]int),
+		metrics:      &Metrics{},
+		refillKick:   make(chan struct{}, 1),
+		pending:      make(map[string]*pendingDestroy),
 	}
 }
 
@@ -95,17 +120,13 @@ func (p *Pool) releasePark(slotID string) {
 func (p *Pool) ReleasePark(slotID string) { p.releasePark(slotID) }
 
 // destroySlots tears down discarded slots outside the pool lock: the spawner
-// call talks to the Docker engine and must never run under p.mu.
+// call talks to the Docker engine and must never run under p.mu. A slot's
+// park reservation is released only once its container is confirmed gone;
+// a failed teardown is kept and retried (pending_destroy.go).
 func (p *Pool) destroySlots(ctx context.Context, slots []*ParkedSlot) {
 	spawner := p.currentSpawner()
 	for _, slot := range slots {
-		if slot == nil {
-			continue
-		}
-		if spawner != nil {
-			_ = spawner.DestroyParked(ctx, slot)
-		}
-		p.releasePark(slot.ID)
+		p.destroySlot(ctx, spawner, slot, p.releasePark)
 	}
 }
 func (p *Pool) SetDefaultDepth(n int) {
@@ -130,6 +151,7 @@ func (p *Pool) PinTarget(key Key) {
 	ks := key.KeyString()
 	p.mu.Lock()
 	p.pinned[ks] = struct{}{}
+	p.envPins[ks] = struct{}{}
 	p.targets[ks] = key
 	p.mu.Unlock()
 }
@@ -244,6 +266,7 @@ func (p *Pool) HasReady(key Key) bool {
 func (p *Pool) NoteMiss(key Key) {
 	p.NoteTarget(key)
 	p.mu.Lock()
+	p.countDemandLocked(key.KeyString())
 	if p.metrics != nil {
 		p.metrics.recordMiss()
 	}
@@ -266,6 +289,15 @@ func (p *Pool) Acquire(ctx context.Context, key Key, currentImageID string) (*Pa
 
 	p.mu.Lock()
 	p.lastUsed[ks] = time.Now().UTC()
+	p.countDemandLocked(ks)
+	// A caller that cannot afford an image lookup on the create path (the
+	// containerd driver passes "") still gets an entry's stale slots left
+	// out, from what the refill tick last resolved. A replace_as_used entry
+	// hands its old slots out on purpose, oldest first.
+	if currentImageID == "" {
+		currentImageID = p.currentImage[ks]
+	}
+	keepStale := p.configured[ks].ReplaceAsUsed
 	q := p.ready[ks]
 	keep := q[:0]
 	for _, slot := range q {
@@ -274,7 +306,7 @@ func (p *Pool) Acquire(ctx context.Context, key Key, currentImageID string) (*Pa
 			if slot != nil {
 				discardDead = append(discardDead, slot)
 			}
-		case currentImageID != "" && slot.ImageID != "" && slot.ImageID != currentImageID:
+		case !keepStale && currentImageID != "" && slot.ImageID != "" && slot.ImageID != currentImageID:
 			discardStale = append(discardStale, slot)
 		case picked == nil:
 			picked = slot
@@ -312,10 +344,6 @@ func (p *Pool) Acquire(ctx context.Context, key Key, currentImageID string) (*Pa
 	return picked, nil
 }
 
-// reclaimDestroyTimeout bounds the background teardown of each reclaimed
-// slot, so one slow destroy cannot leave the rest running.
-const reclaimDestroyTimeout = 30 * time.Second
-
 // Reclaim gives up to n parked slots back so a real sandbox can be admitted
 // on a host the pool has filled (capacity.Admitter calls it through
 // SetParkReclaimer). It takes from the least-recently-used miss-driven target
@@ -323,6 +351,9 @@ const reclaimDestroyTimeout = 30 * time.Second
 // before returning because the admitter retries straight after, and tears the
 // containers down in the background so the create that asked never waits on
 // the engine. Refill re-parks only once the capacity gate has room again.
+// A teardown that fails is kept and retried like any other
+// (pending_destroy.go); its reservation is already gone, so until the retry
+// succeeds the host runs one container more than the admitter counts.
 func (p *Pool) Reclaim(n int) int {
 	if p == nil || n <= 0 {
 		return 0
@@ -352,10 +383,10 @@ func (p *Pool) Reclaim(n int) int {
 	}
 	if len(taken) > 0 && spawner != nil {
 		go func() {
+			// Each teardown is bounded on its own (parkDestroyTimeout), so
+			// one slow destroy cannot leave the rest running.
 			for _, slot := range taken {
-				ctx, cancel := context.WithTimeout(context.Background(), reclaimDestroyTimeout)
-				_ = spawner.DestroyParked(ctx, slot)
-				cancel()
+				p.destroySlot(context.Background(), spawner, slot, nil)
 			}
 		}()
 	}
@@ -455,7 +486,7 @@ func (p *Pool) UnmarkSpawning(ks string) {
 func (p *Pool) SpawnBudget(ks string) int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	depth := p.defaultDepth
+	depth := p.depthLocked(ks)
 	if depth <= 0 {
 		return 0
 	}
@@ -514,7 +545,7 @@ func (p *Pool) ReapIdle(now time.Time) int {
 	return len(reaped)
 }
 
-// Close drains all warm slots.
+// Close drains all warm slots, and tries each kept teardown once more.
 func (p *Pool) Close() int {
 	p.mu.Lock()
 	var slots []*ParkedSlot
@@ -528,6 +559,7 @@ func (p *Pool) Close() int {
 	p.ready = make(map[string][]*ParkedSlot)
 	p.mu.Unlock()
 	p.destroySlots(context.Background(), slots)
+	p.retryPendingDestroys(context.Background(), true)
 	if p.metrics != nil {
 		p.metrics.setParked(0)
 	}

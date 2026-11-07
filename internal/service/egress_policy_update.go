@@ -533,6 +533,11 @@ func (s *Service) commitPolicySpec(ctx context.Context, id string, create *model
 	if c == nil {
 		return nil
 	}
+	unlock, err := s.lockSpec(ctx, id)
+	if err != nil {
+		return fmt.Errorf("%w: %v", ErrEgressSpecCommitFailed, err)
+	}
+	defer unlock()
 	spec := c.SpecOf(id)
 	if spec == nil {
 		return nil

@@ -1,0 +1,5 @@
+# Installed with --no-deps --no-build-isolation. NeMo Gym's provider API is
+# only in its source (0.7.0rc0; PyPI's latest is 0.4.0), so CI pins the
+# commit the tests were written against, by the hash of its archive.
+nemo-gym @ https://github.com/NVIDIA-NeMo/Gym/archive/bd6f5f0d8f3a56cbf3f7e1d2d4a1d2220b7ff6fe.tar.gz \
+    --hash=sha256:3016de4ff78662b701bb261a92895cfccde36e74d55449f4f94435adff011617

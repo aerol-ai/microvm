@@ -2,9 +2,25 @@ package ai.aerol.microvm;
 
 import java.util.List;
 
+import com.fasterxml.jackson.annotation.JsonIgnore;
+
 import ai.aerol.microvm.model.AuditOptions;
 import ai.aerol.microvm.model.AuditPage;
 import ai.aerol.microvm.model.CloneGeneration;
+import ai.aerol.microvm.model.CopyFileOptions;
+import ai.aerol.microvm.model.DeleteFileOptions;
+import ai.aerol.microvm.model.FileInfo;
+import ai.aerol.microvm.model.FileList;
+import ai.aerol.microvm.model.FileMatch;
+import ai.aerol.microvm.model.ListFilesOptions;
+import ai.aerol.microvm.model.MakeDirOptions;
+import ai.aerol.microvm.model.MoveFileOptions;
+import ai.aerol.microvm.model.UploadFileOptions;
+import ai.aerol.microvm.model.DownloadFileOptions;
+import ai.aerol.microvm.model.CreateOptions;
+import ai.aerol.microvm.model.CreateSandboxTokenOptions;
+import ai.aerol.microvm.model.RevokeSandboxTokensResult;
+import ai.aerol.microvm.model.SandboxToken;
 import ai.aerol.microvm.model.CreateSnapshotOptions;
 import ai.aerol.microvm.model.CreateSessionOptions;
 import ai.aerol.microvm.model.CustomDomain;
@@ -17,6 +33,7 @@ import ai.aerol.microvm.model.NetworkLearned;
 import ai.aerol.microvm.model.NetworkPolicy;
 import ai.aerol.microvm.model.NetworkPolicyOptions;
 import ai.aerol.microvm.model.ExposeResult;
+import ai.aerol.microvm.model.FileEvent;
 import ai.aerol.microvm.model.Lifecycle;
 import ai.aerol.microvm.model.NetworkUsage;
 import ai.aerol.microvm.model.ResizeOptions;
@@ -25,13 +42,59 @@ import ai.aerol.microvm.model.SandboxSnapshot;
 import ai.aerol.microvm.model.Session;
 import ai.aerol.microvm.model.SessionAttachOptions;
 import ai.aerol.microvm.model.SetNetworkLimitsOptions;
+import ai.aerol.microvm.model.WatchOptions;
 
-public class Sandbox extends SandboxData {
+/**
+ * A sandbox, as returned by {@link MicroVMClient#create} and the other calls
+ * that return one.
+ *
+ * <p>It is {@link AutoCloseable}: a try-with-resources block calls
+ * {@link #close()} when it ends, which deletes the sandbox only when
+ * {@link #isDestroyOnClose()} is true. That is off by default, so the
+ * sandbox keeps running after the block, as it would without one. Turn it on
+ * with {@link CreateOptions#setDestroyOnClose(boolean)} or
+ * {@link #setDestroyOnClose(boolean)}.
+ */
+public class Sandbox extends SandboxData implements AutoCloseable {
     private final MicroVMClient client;
+    // Opt-in (plan S2): ending a try block must not delete a sandbox nobody
+    // asked to delete.
+    private boolean destroyOnClose;
+    private boolean closed;
 
     Sandbox(MicroVMClient client, SandboxData data) {
         this.client = client;
         apply(data);
+    }
+
+    /** Whether {@link #close()} deletes this sandbox. False by default. */
+    @JsonIgnore // a client-side flag, not sandbox data
+    public boolean isDestroyOnClose() {
+        return destroyOnClose;
+    }
+
+    /** Sets whether {@link #close()} deletes this sandbox; returns this sandbox. */
+    public Sandbox setDestroyOnClose(boolean destroyOnClose) {
+        this.destroyOnClose = destroyOnClose;
+        return this;
+    }
+
+    /**
+     * Deletes the sandbox when {@link #isDestroyOnClose()} is true; otherwise
+     * does nothing. A sandbox that is already gone counts as deleted, and a
+     * second close does nothing.
+     */
+    @Override
+    public void close() {
+        if (!destroyOnClose || closed) {
+            return;
+        }
+        try {
+            client.destroy(id);
+        } catch (MicroVMNotFoundException e) {
+            // Already gone, which is what close wanted.
+        }
+        closed = true;
     }
 
     public SandboxData toData() {
@@ -95,6 +158,14 @@ public class Sandbox extends SandboxData {
         return client.sessionRecording(id, sessionId);
     }
 
+    /**
+     * Watches a folder in this sandbox for changes; see
+     * {@link MicroVMClient#watchFiles(String, String, WatchOptions, java.util.function.Consumer)}.
+     */
+    public FileWatchHandle watchFiles(String path, WatchOptions options, java.util.function.Consumer<FileEvent> onEvent) {
+        return client.watchFiles(id, path, options, onEvent);
+    }
+
     public SessionAttachHandle attachSession(String sessionId, SessionAttachOptions options) {
         return client.attachSession(id, sessionId, options);
     }
@@ -103,8 +174,98 @@ public class Sandbox extends SandboxData {
         client.uploadFile(id, targetPath, data);
     }
 
+    /** Uploads with write options: append, create-only, atomic replace and a mode. */
+    public void uploadFile(String targetPath, byte[] data, UploadFileOptions options) {
+        client.uploadFile(id, targetPath, data, options);
+    }
+
+    /** Copies a local folder into the sandbox. See {@link MicroVMClient#uploadDir}. */
+    public void uploadDir(java.nio.file.Path localDir, String remoteDir) {
+        client.uploadDir(id, localDir, remoteDir);
+    }
+
     public byte[] downloadFile(String targetPath) {
         return client.downloadFile(id, targetPath);
+    }
+
+    /** Reads a whole file with a size limit. See {@link DownloadFileOptions}. */
+    public byte[] downloadFile(String targetPath, DownloadFileOptions options) {
+        return client.downloadFile(id, targetPath, options);
+    }
+
+    /** Opens a file as a stream. See {@link MicroVMClient#downloadFileStream}. */
+    public java.io.InputStream downloadFileStream(String targetPath, DownloadFileOptions options) {
+        return client.downloadFileStream(id, targetPath, options);
+    }
+
+    /** Uploads from a stream, sent once. See {@link MicroVMClient#uploadFileStream}. */
+    public void uploadFileStream(String targetPath, java.io.InputStream data, UploadFileOptions options) {
+        client.uploadFileStream(id, targetPath, data, options);
+    }
+
+    /** Lists a folder. See {@link ListFilesOptions}; {@code truncated} means more entries exist. */
+    public FileList listFiles(String path, ListFilesOptions options) {
+        return client.listFiles(id, path, options);
+    }
+
+    public FileList listFiles(String path) {
+        return client.listFiles(id, path);
+    }
+
+    /** Describes one path. A symlink is followed. */
+    public FileInfo getFileInfo(String path) {
+        return client.getFileInfo(id, path);
+    }
+
+    /** Whether a path exists. */
+    public boolean fileExists(String path) {
+        return client.fileExists(id, path);
+    }
+
+    /** Deletes a file, or a folder with {@code recursive}. */
+    public void deleteFile(String path, DeleteFileOptions options) {
+        client.deleteFile(id, path, options);
+    }
+
+    public void deleteFile(String path) {
+        client.deleteFile(id, path);
+    }
+
+    /** Makes a folder; with {@code parents}, like {@code mkdir -p}. */
+    public void makeDir(String path, MakeDirOptions options) {
+        client.makeDir(id, path, options);
+    }
+
+    public void makeDir(String path) {
+        client.makeDir(id, path);
+    }
+
+    /** Moves or renames a file or folder. */
+    public void moveFile(String source, String destination, MoveFileOptions options) {
+        client.moveFile(id, source, destination, options);
+    }
+
+    public void moveFile(String source, String destination) {
+        client.moveFile(id, source, destination);
+    }
+
+    /** Copies a file, or a folder with {@code recursive}. */
+    public void copyFile(String source, String destination, CopyFileOptions options) {
+        client.copyFile(id, source, destination, options);
+    }
+
+    public void copyFile(String source, String destination) {
+        client.copyFile(id, source, destination);
+    }
+
+    /** Paths under {@code path} whose name matches a glob. */
+    public List<String> searchFiles(String path, String pattern) {
+        return client.searchFiles(id, path, pattern);
+    }
+
+    /** Each line under {@code path} that contains {@code text}. */
+    public List<FileMatch> findInFiles(String path, String text) {
+        return client.findInFiles(id, path, text);
     }
 
     public ExposeResult exposePort(int port) {
@@ -124,6 +285,24 @@ public class Sandbox extends SandboxData {
 
     public void unexposePort(int port) {
         client.unexposePort(id, port);
+    }
+
+    /**
+     * Issue a signed token for this sandbox only, to hand to a browser or an
+     * end user. Each call makes a new token; the server keeps no copy, so
+     * {@link SandboxToken#token} is shown only in the result.
+     */
+    public SandboxToken createToken(CreateSandboxTokenOptions options) {
+        return client.createSandboxToken(id, options);
+    }
+
+    /**
+     * Make every token issued for this sandbox so far stop working, toolbox
+     * and port tokens alike. A token made after the call works. Safe to call
+     * again.
+     */
+    public RevokeSandboxTokensResult revokeTokens() {
+        return client.revokeSandboxTokens(id);
     }
 
     public List<CustomDomain> addCustomDomain(String hostname) {

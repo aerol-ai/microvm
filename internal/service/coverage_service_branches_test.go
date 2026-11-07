@@ -6,6 +6,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -483,7 +484,7 @@ func TestStartBuiltImageGCAndLifecycleSweepEnabledPaths(t *testing.T) {
 }
 
 func TestServicePureHelperBranches(t *testing.T) {
-	if got := capacityRequestFromSandbox(nil); got != (capacity.Request{}) {
+	if got := capacityRequestFromSandbox(nil); !reflect.DeepEqual(got, capacity.Request{}) {
 		t.Fatalf("capacityRequestFromSandbox(nil) = %+v, want zero value", got)
 	}
 
@@ -815,6 +816,7 @@ func TestServiceHelperBranchCoverageRoundTwo(t *testing.T) {
 		svc.ReplayReservations(ctx)
 		svc.refreshPendingImageGCOnUse(ctx, "alpine:latest")
 		svc.schedulePendingImageGC(ctx, "", "alpine:latest")
+		withGCCaddyFake(t, svc)
 		if err := svc.gcClusterIngressRoutes(ctx); err == nil {
 			t.Fatal("closed store should fail gcClusterIngressRoutes")
 		}

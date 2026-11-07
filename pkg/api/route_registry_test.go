@@ -34,6 +34,11 @@ var publicRoutes = map[string]string{
 	"GET /ui/":      "the static dashboard page; sign-in happens in the page",
 	"/e2b/runtime":  "envd runtime proxy: the sandbox's own envd token guards it",
 	"/e2b/runtime/": "envd runtime proxy: the sandbox's own envd token guards it",
+	// Sandbox cloud identity (plans/sandbox-cloud-identity.md D1.1, security
+	// point 4): clouds fetch both anonymously; public keys only, 404 when
+	// the deployment is not an issuer.
+	"GET /.well-known/openid-configuration": "OIDC discovery for sandbox cloud identity; names the issuer and the JWKS URL",
+	"GET /.well-known/jwks.json":            "the issuer's public signing keys; never private material",
 }
 
 // publicRoutePrefixes are public routes later tasks add: identity discovery
@@ -75,9 +80,11 @@ var routePermissions = map[string]string{
 	"DELETE /v1/cluster/nodes/{id}/storage-retired":            "fleet.admin",
 	"DELETE /v1/cluster/orphans/{id}":                          "fleet.admin",
 	"DELETE /v1/egress-profiles/{name}":                        "sandbox.write",
+	"DELETE /v1/warm-pools/{image...}":                         "fleet.admin",
 	"DELETE /v1/js-bundles/{id}":                               "sandbox.write",
 	"DELETE /v1/sandboxes/{id}":                                "sandbox.write",
 	"DELETE /v1/sandboxes/{id}/custom-domains/{hostname}":      "sandbox.write",
+	"DELETE /v1/teams/{team}/quota":                            "fleet.admin",
 	"DELETE /v1/sandboxes/{id}/ports/{port}":                   "sandbox.write",
 	"DELETE /v1/tokens/{id}":                                   "token.write",
 	"DELETE /v1/snapshots/{id}":                                "sandbox.write",
@@ -123,7 +130,10 @@ var routePermissions = map[string]string{
 	"GET /v1/cluster/sandboxes/{id}/secret-holders":            "fleet.admin",
 	"GET /v1/cluster/storage-retirements":                      "fleet.admin",
 	"GET /v1/egress-profiles":                                  "sandbox.read",
+	"GET /v1/warm-pools":                                       "fleet.admin",
+	"GET /v1/warm-pools/{image...}":                            "fleet.admin",
 	"GET /v1/egress-profiles/{name}":                           "sandbox.read",
+	"GET /v1/teams/{team}/quota":                               "fleet.admin",
 	"GET /v1/ingress/dns":                                      "fleet.admin",
 	"GET /v1/js-bundles":                                       "sandbox.read",
 	"GET /v1/js-bundles/{id}":                                  "sandbox.read",
@@ -167,8 +177,18 @@ var routePermissions = map[string]string{
 	"POST /v1/cluster/internal/artifact-catalog":               "cluster.internal",
 	"POST /v1/cluster/internal/artifact-catalog/epoch":         "cluster.internal",
 	"POST /v1/cluster/internal/egress-profiles/read":           "cluster.internal",
+	"POST /v1/cluster/internal/identity/read":                  "cluster.internal",
+	"POST /v1/cluster/internal/identity/write":                 "cluster.internal",
+	"POST /v1/identity/keys/rotate":                            "fleet.admin",
+	"PUT /v1/identity/roles/{tag}":                             "fleet.admin",
+	"DELETE /v1/identity/roles/{tag}":                          "fleet.admin",
+	"GET /v1/identity/roles":                                   "fleet.admin",
 	"POST /v1/cluster/internal/egress-profiles/write":          "cluster.internal",
+	"POST /v1/cluster/internal/team-quotas/read":               "cluster.internal",
+	"POST /v1/cluster/internal/team-quotas/write":              "cluster.internal",
 	"POST /v1/cluster/internal/tokens/write":                   "cluster.internal",
+	"POST /v1/cluster/internal/warm-pools/read":                "cluster.internal",
+	"POST /v1/cluster/internal/warm-pools/write":               "cluster.internal",
 	"POST /v1/cluster/internal/placements-by-ids":              "cluster.internal",
 	"POST /v1/cluster/internal/placements/owned-recovery":      "cluster.internal",
 	"POST /v1/cluster/internal/placements/page":                "cluster.internal",
@@ -187,6 +207,8 @@ var routePermissions = map[string]string{
 	"POST /v1/sandboxes":                                       "sandbox.write",
 	"POST /v1/sandboxes/{id}/custom-domains":                   "sandbox.write",
 	"POST /v1/sandboxes/{id}/ports/{port}":                     "sandbox.write",
+	"POST /v1/sandboxes/{id}/tokens":                           "sandbox.exec",
+	"POST /v1/sandboxes/{id}/tokens/revoke":                    "sandbox.exec",
 	"POST /v1/sandboxes/{id}/resize":                           "sandbox.write",
 	"POST /v1/sandboxes/{id}/snapshot":                         "sandbox.write",
 	"POST /v1/sandboxes/{id}/start":                            "sandbox.write",
@@ -201,8 +223,10 @@ var routePermissions = map[string]string{
 	"PUT /e2b/sandboxes/{id}/network":                          "sandbox.write",
 	"PUT /v1/cluster/internal/wasm-migrate/{id}/import":        "cluster.internal",
 	"PUT /v1/egress-profiles/{name}":                           "sandbox.write",
+	"PUT /v1/warm-pools/{image...}":                            "fleet.admin",
 	"PUT /v1/sandboxes/{id}/lifecycle":                         "sandbox.write",
 	"PUT /v1/sandboxes/{id}/network/policy":                    "sandbox.write",
+	"PUT /v1/teams/{team}/quota":                               "fleet.admin",
 }
 
 // registeredRoutes is every route a fully configured server mounts (remote

@@ -2,6 +2,8 @@
 # secretstorage, jeepney, and cryptography are keyring's Linux dependencies.
 # They are listed directly so the hash file includes them when compiled off Linux.
 websocket-client>=1.8.0,<2
+# The [async] extra, so CI runs the AsyncMicroVM tests (tests/test_async.py).
+httpx>=0.27,<1
 build>=1.2
 twine>=6
 setuptools>=61

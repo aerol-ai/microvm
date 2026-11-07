@@ -97,6 +97,9 @@ func TestAgentControlPlaneCarriesReservationAndNameConflicts(t *testing.T) {
 		// UC-367 on cluster-hetero-lite: concurrent same-key creates through
 		// two ingresses re-reserved one id, and the fence came back as a 500.
 		{"incarnation", "cluster: fsm apply: " + ErrIncarnationConflict.Error() + ": reservation retry changed its incarnation", ErrIncarnationConflict},
+		// Placement rules: the leader refused a reservation outside the
+		// rule; an agent-routed create must still answer 409, not 503.
+		{"placement rule", "worker w1: " + ErrPlacementUnsatisfiable.Error() + ": no node has the labels zone=z", ErrPlacementUnsatisfiable},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

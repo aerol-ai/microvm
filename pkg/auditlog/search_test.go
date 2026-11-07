@@ -36,6 +36,12 @@ func TestSearchFilterMatch(t *testing.T) {
 		{"checkpoints are structure, not evidence", SearchFilter{}, Event{Kind: KindRetentionCheckpoint}, false},
 		{"stubs are structure, not evidence", SearchFilter{}, Event{Kind: KindRetentionRedacted}, false},
 		{"unless asked for by kind", SearchFilter{Kind: KindRetentionRedacted}, Event{Kind: KindRetentionRedacted}, true},
+		{"system:* matches a system caller", SearchFilter{Caller: SystemCallerWildcard}, Event{Kind: KindAPI, Caller: &Caller{Kind: "system", ID: "system:lifecycle"}}, true},
+		{"system:* matches another subsystem", SearchFilter{Caller: SystemCallerWildcard}, Event{Kind: KindAPI, Caller: &Caller{Kind: "system", ID: "system:runtime"}}, true},
+		{"system:* does not match a person", SearchFilter{Caller: SystemCallerWildcard}, api, false},
+		{"system:* needs the system kind", SearchFilter{Caller: SystemCallerWildcard}, Event{Kind: KindAPI, Caller: &Caller{Kind: "token", ID: "system:forged"}}, false},
+		{"system:* needs a caller", SearchFilter{Caller: SystemCallerWildcard}, Event{Kind: KindAPI}, false},
+		{"system:* is not a name", SearchFilter{Caller: SystemCallerWildcard}, Event{Kind: KindAPI, Caller: &Caller{Kind: "oidc", ID: "x", Name: "system:*"}}, false},
 	}
 	for _, c := range cases {
 		if got := c.f.Match(c.ev); got != c.want {

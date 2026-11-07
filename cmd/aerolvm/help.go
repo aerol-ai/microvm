@@ -163,18 +163,25 @@ Example:
   aerolvm logs build-box ses-1 --follow
 `
 
-const cpHelp = `Copy a file between this machine and a sandbox.
+const cpHelp = `Copy a file or a folder between this machine and a sandbox.
 
-Usage: aerolvm cp <src> <dst>
+Usage: aerolvm cp [-r] <src> <dst>
+
+  -r, --recursive   copy a folder (as a tar; the sandbox needs tar to copy
+                    one out, and WASM and V8 isolate sandboxes cannot)
 
 A sandbox path is <sandbox>:<path>. "-" is stdin (as src) or stdout (as dst).
-Files stream; size doesn't matter. Directories are not supported yet (use
-tar through exec).
+Files stream; size doesn't matter. With -r, a destination that is an
+existing folder (or, in the sandbox, ends with "/") gets the folder inside
+it; any other destination becomes the copy. A folder copied out is checked
+entry by entry: nothing can be written outside the destination.
 
 Examples:
   aerolvm cp ./data.csv build-box:/work/data.csv
   aerolvm cp build-box:/work/report.html ./report.html
   aerolvm cp build-box:/var/log/app.log - | tail
+  aerolvm cp -r ./src build-box:/work/
+  aerolvm cp -r build-box:/work/out ./results
 `
 
 const lsHelp = `List a directory in a sandbox.

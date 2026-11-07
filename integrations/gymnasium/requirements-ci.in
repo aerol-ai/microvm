@@ -1,0 +1,11 @@
+# CI install set for this package's tests. The hash-pinned output is
+# requirements-ci.txt; regenerate it with:
+#   pip-compile --allow-unsafe --generate-hashes --strip-extras \
+#     --output-file=requirements-ci.txt requirements-ci.in
+# The framework is pinned to the one release the tests cover.
+gymnasium==1.4.0
+# The AerolVM SDK's only dependency. The SDK itself is installed from
+# sdk/python with --no-deps.
+websocket-client>=1.8.0,<2
+setuptools>=77
+wheel

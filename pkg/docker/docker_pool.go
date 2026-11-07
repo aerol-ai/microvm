@@ -59,6 +59,22 @@ func isParkedContainer(summary containerSummary) bool {
 // sandbox name already taken — signals the §6 duplicate-create protocol.
 var ErrSandboxContainerExists = errors.New("docker: sandbox container name already exists")
 
+// nameConflictAsExists marks Docker's 409 "name is already in use" on a
+// container create as ErrSandboxContainerExists, the error the containerd
+// driver gives for the same case, so the service can tell a duplicate or a
+// failed create's leftover from any other failed create. Before, the raw
+// 409 reached the caller as a 400.
+func nameConflictAsExists(err error) error {
+	if err == nil {
+		return nil
+	}
+	msg := err.Error()
+	if strings.Contains(msg, "failed with status 409") && strings.Contains(msg, "is already in use") {
+		return fmt.Errorf("%w: %w", ErrSandboxContainerExists, err)
+	}
+	return err
+}
+
 // SetWarmPool wires the docker warm pool. Nil disables the fast path.
 func (c *Client) SetWarmPool(p *dockerpool.Pool) {
 	c.warmPool = p
@@ -97,6 +113,12 @@ func poolEligible(req models.CreateSandboxRequest, hostMounts []mounts.Container
 	// non-default OSUser forces a miss (we cannot change the container user
 	// post-create).
 	if user := strings.TrimSpace(req.OSUser); user != "" && !strings.EqualFold(user, "root") {
+		return false
+	}
+	// A parked container's image user was never checked against the create
+	// policy's require_non_root rule; the cold path checks it from the image
+	// config before anything is made.
+	if req.RequireNonRootUser {
 		return false
 	}
 	if len(req.ContainerCommand) > 0 {
@@ -404,6 +426,19 @@ func (c *Client) resolveImageIDForWarm(ctx context.Context, imageRef string) (st
 	return id, ok, nil
 }
 
+// PoolImageID is the image ID a tag names on this host now, for the warm
+// pool's image-change check (plans/agent-sandbox-feature-parity.md W3). It
+// never pulls and records no create timing: a cache hit (the image-ID
+// warmer refreshes every pool target each refill interval), else one
+// inspect through the same generation fence the warmer uses.
+func (c *Client) PoolImageID(ctx context.Context, image string) (string, error) {
+	if id, ok := c.imageIDs.Get(image); ok {
+		return id, nil
+	}
+	id, _, err := c.resolveImageIDForWarm(ctx, image)
+	return id, err
+}
+
 func (c *Client) adoptParked(ctx context.Context, req models.CreateSandboxRequest, sandboxID, toolboxToken string, slot *dockerpool.ParkedSlot) (*SandboxRuntime, error) {
 	if slot == nil || slot.Handle == nil {
 		return nil, errors.New("parked slot is incomplete")
@@ -495,8 +530,13 @@ func (c *Client) destroyParked(ctx context.Context, slot *dockerpool.ParkedSlot)
 	}
 	// The slot holds its address until it is removed: everything keyed by
 	// the address goes first (the park block, and anything an adopt
-	// that failed half way put there).
-	if slot.ContainerIP != "" {
+	// that failed half way put there). Docker frees the address with the
+	// container, so this is the only safe moment: a clear after the removal
+	// could hit the next container given the address. If the removal then
+	// fails the container keeps its address (no other can share it) and the
+	// pool retries; a retry (TeardownRetry) skips the address, since by then
+	// the container may be gone and the address someone else's.
+	if slot.ContainerIP != "" && !slot.TeardownRetry {
 		_ = c.networkRules.ClearAddress(slot.ContainerIP)
 	}
 	if slot.Handle != nil {

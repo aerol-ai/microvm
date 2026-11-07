@@ -162,6 +162,15 @@ func (h *handlers) clusterCreateWrap(w http.ResponseWriter, r *http.Request) {
 		h.createSandbox(w, r)
 		return
 	}
+	// destroy_at becomes an age here, after the digests (a retry must match
+	// the client's request, not an age that moves with the clock) and before
+	// Prepare: a refused time must not hold the name in a reservation, and
+	// SyncBody then forwards destroy_at_age, which an owner on an older
+	// build reads too, where it would drop destroy_at (L6).
+	if err := service.NormalizeCreateLifecycle(&req, time.Now().UTC()); err != nil {
+		apihttp.WriteError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 
 	// Placement, reservation and forwarding are the same decision for native
 	// v1 as for the daytona/e2b facades, so they run through one
@@ -209,6 +218,12 @@ func (h *handlers) createSandboxOnSelectedNode(w http.ResponseWriter, r *http.Re
 		return
 	}
 	if err := service.NormalizeCreateFailover(&req); err != nil {
+		apihttp.WriteError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	// destroy_at becomes an age before the spec is promoted, so a failover
+	// replays the age (L6).
+	if err := service.NormalizeCreateLifecycle(&req, time.Now().UTC()); err != nil {
 		apihttp.WriteError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -303,7 +318,9 @@ func (h *handlers) createSandboxOnSelectedNode(w http.ResponseWriter, r *http.Re
 	}
 	secrets.OwnerRef = resp.Sandbox.OwnerRef
 	redacted := h.deps.Service.RedactClusterSecretsConfigured(req)
-	promoteErr := c.RecordPlacement(commitCtx, resp.Sandbox.ID, &redacted, secrets)
+	// No reservation came first, so the promote is this create's team-quota
+	// admission (plan item P2).
+	promoteErr := c.RecordPlacement(cluster.WithTeamQuotaAdmission(commitCtx), resp.Sandbox.ID, &redacted, secrets)
 
 	if promoteErr != nil {
 		h.deps.Logger.Error("cluster: RecordPlacement failed; rolling back create",
@@ -312,6 +329,11 @@ func (h *handlers) createSandboxOnSelectedNode(w http.ResponseWriter, r *http.Re
 		if errors.Is(promoteErr, cluster.ErrNameConflict) {
 			setCreateServerTiming(w, createStart, createTiming, h.deps.ContainerEngine)
 			apihttp.WriteError(w, http.StatusConflict, "sandbox name already in use cluster-wide")
+			return
+		}
+		if errors.Is(promoteErr, cluster.ErrTeamQuotaExceeded) {
+			setCreateServerTiming(w, createStart, createTiming, h.deps.ContainerEngine)
+			apihttp.WriteStoreAwareError(h.deps.Logger, w, promoteErr)
 			return
 		}
 		setCreateServerTiming(w, createStart, createTiming, h.deps.ContainerEngine)
@@ -681,6 +703,12 @@ func (h *handlers) clusterDestroyWrap(w http.ResponseWriter, r *http.Request) {
 type memberView struct {
 	cluster.Member
 	Drained bool `json:"drained,omitempty"`
+	// Zone and Labels lift the node's placement labels out of its capacity
+	// heartbeat so an operator can see what a placement rule can target
+	// (plans/placement-rules.md P1.7). Empty for a node with no labels, an
+	// older build, or no heartbeat yet.
+	Zone   string            `json:"zone,omitempty"`
+	Labels map[string]string `json:"labels,omitempty"`
 }
 
 // clusterMembers returns the gossiped member list (observability only).
@@ -693,7 +721,8 @@ func (h *handlers) clusterMembers(w http.ResponseWriter, r *http.Request) {
 	members := c.Members()
 	view := make([]memberView, 0, len(members))
 	for _, m := range members {
-		view = append(view, memberView{Member: m, Drained: c.IsNodeDrained(m.NodeID)})
+		view = append(view, memberView{Member: m, Drained: c.IsNodeDrained(m.NodeID),
+			Zone: m.Capacity.Labels[models.PlacementZoneLabel], Labels: m.Capacity.Labels})
 	}
 	resp := map[string]any{"members": view}
 	// `sandboxd key rotate --stage` reads this (plans/customer-key-custody.md
@@ -1366,7 +1395,8 @@ func (h *handlers) writeInternalPlacement(w http.ResponseWriter, id string) {
 }
 
 // clusterInternalVolume answers an agent-role node's volume metadata read from
-// this server node's replicated FSM. Kinds: id, name, list, source. Writes never
+// this server node's replicated FSM. Kinds: id, name, list, source,
+// attachment_count, sandbox, reclaims. Writes never
 // hit this path — they flow through the generic apply endpoint.
 func (h *handlers) clusterInternalVolume(w http.ResponseWriter, r *http.Request) {
 	c := h.deps.Service.Cluster()
@@ -1412,6 +1442,28 @@ func (h *handlers) clusterInternalVolume(w http.ResponseWriter, r *http.Request)
 			return
 		}
 		apihttp.WriteJSON(w, http.StatusOK, cluster.VolumeQueryResponse{Count: count})
+	case "sandbox":
+		attachments, err := c.VolumeAttachmentsForSandbox(r.Context(), q.Get("sandbox_id"))
+		if err != nil {
+			apihttp.WriteError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		apihttp.WriteJSON(w, http.StatusOK, cluster.VolumeQueryResponse{Attachments: attachments})
+	case "reclaims":
+		// The delete_with_sandbox volumes the asking worker should drain
+		// (cluster/fsm_volume_reclaims.go).
+		rc, ok := c.(cluster.VolumeReclaimClient)
+		if !ok {
+			apihttp.WriteError(w, http.StatusBadRequest, "unknown volume query kind")
+			return
+		}
+		limit, _ := strconv.Atoi(q.Get("limit"))
+		reclaims, err := rc.VolumeReclaimsFor(r.Context(), q.Get("node_id"), limit)
+		if err != nil {
+			apihttp.WriteError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		apihttp.WriteJSON(w, http.StatusOK, cluster.VolumeQueryResponse{Reclaims: reclaims})
 	default:
 		apihttp.WriteError(w, http.StatusBadRequest, "unknown volume query kind")
 	}
@@ -1752,13 +1804,17 @@ func (h *handlers) clusterInternalSelectPlacement(w http.ResponseWriter, r *http
 	// worker back to the caller so IT can pick two of them made each create's
 	// response scale with the fleet; only an agent on the previous build
 	// still needs that shape.
+	// Every answer below went through the label filter, so it says so: an
+	// agent that sent a rule and hears nothing back is talking to an older
+	// server and must not trust its target.
+	labelsChecked := len(req.Request.Labels) > 0
 	if sandboxID := strings.TrimSpace(req.SandboxID); sandboxID != "" {
 		target, recipients, err := c.SelectPlacementForCreate(req.Request, sandboxID, req.RecipientBackups)
 		if err != nil {
 			apihttp.WriteJSON(w, http.StatusOK, cluster.SelectPlacementErrorResponse(err))
 			return
 		}
-		apihttp.WriteJSON(w, http.StatusOK, cluster.SelectPlacementResponse{Target: target, Recipients: recipients})
+		apihttp.WriteJSON(w, http.StatusOK, cluster.SelectPlacementResponse{Target: target, Recipients: recipients, LabelsChecked: labelsChecked})
 		return
 	}
 	// Target-only callers (build, template, JS bundle, local-image routing)
@@ -1771,7 +1827,7 @@ func (h *handlers) clusterInternalSelectPlacement(w http.ResponseWriter, r *http
 			apihttp.WriteJSON(w, http.StatusOK, cluster.SelectPlacementErrorResponse(err))
 			return
 		}
-		apihttp.WriteJSON(w, http.StatusOK, cluster.SelectPlacementResponse{Target: target})
+		apihttp.WriteJSON(w, http.StatusOK, cluster.SelectPlacementResponse{Target: target, LabelsChecked: labelsChecked})
 		return
 	}
 	target, candidates, err := c.SelectPlacementWithCandidates(req.Request)
@@ -1779,7 +1835,7 @@ func (h *handlers) clusterInternalSelectPlacement(w http.ResponseWriter, r *http
 		apihttp.WriteJSON(w, http.StatusOK, cluster.SelectPlacementErrorResponse(err))
 		return
 	}
-	apihttp.WriteJSON(w, http.StatusOK, cluster.SelectPlacementResponse{Target: target, Candidates: candidates})
+	apihttp.WriteJSON(w, http.StatusOK, cluster.SelectPlacementResponse{Target: target, Candidates: candidates, LabelsChecked: labelsChecked})
 }
 
 // A public JSON create is capped at 1 MiB. Encrypting its credentials and then
@@ -2215,4 +2271,53 @@ func normalizeCreateRuntimeForPlacement(req *models.CreateSandboxRequest) error 
 	}
 	req.Runtime = chosenRuntime
 	return nil
+}
+
+// destroyAtUpgradeGate refuses a lifecycle update that sets destroy_at while
+// some live cluster member runs a build before L6 (cluster.DestroyAtGate):
+// forwarded to such an owner, the update would arrive without the field and
+// clear every timer the sandbox had. It runs before the forward, on the node
+// the caller reached. A single node, and a body without destroy_at, pass
+// through untouched.
+func (h *handlers) destroyAtUpgradeGate(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var gate cluster.DestroyAtGate
+		if h.deps.Service != nil {
+			gate, _ = h.deps.Service.Cluster().(cluster.DestroyAtGate)
+		}
+		if gate == nil {
+			next.ServeHTTP(w, r)
+			return
+		}
+		raw, err := apihttp.ReadJSONBody(w, r)
+		_ = r.Body.Close()
+		if err != nil {
+			apihttp.WriteError(w, http.StatusBadRequest, "read body: "+err.Error())
+			return
+		}
+		r.Body = io.NopCloser(bytes.NewReader(raw))
+		r.ContentLength = int64(len(raw))
+		if setsDestroyAt(raw) && !gate.DestroyAtAllowed() {
+			apihttp.WriteError(w, http.StatusBadRequest, "destroy_at in a lifecycle update needs every cluster node on this release; finish upgrading the cluster first (a create with destroy_at works now)")
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// setsDestroyAt reports whether a lifecycle body sets destroy_at to a value.
+// The key is matched without case, as encoding/json matches it when the
+// handler decodes the body: "Destroy_At" sets the field too, so an exact
+// match let it past the gate.
+func setsDestroyAt(raw []byte) bool {
+	var fields map[string]json.RawMessage
+	if json.Unmarshal(raw, &fields) != nil {
+		return false
+	}
+	for k, v := range fields {
+		if strings.EqualFold(k, "destroy_at") && string(v) != "null" {
+			return true
+		}
+	}
+	return false
 }

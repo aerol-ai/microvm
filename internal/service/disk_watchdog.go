@@ -67,10 +67,10 @@ func (s *Service) runDiskLimitWatch(ctx context.Context) {
 
 func (s *Service) stopForDiskLimit(ctx context.Context, sb *models.Sandbox, used int64) {
 	msg := fmt.Sprintf("stopped: wrote %.1f GiB to its disk, over its %d GiB", float64(used)/float64(1<<30), sb.DiskGB)
-	done := s.beginSystemAction(ctx, sb.ID, systemActionDiskStop)
+	done := s.beginSystemActionReason(ctx, sb.ID, systemActionDiskStop, models.StatusReasonDiskLimit)
 	// Manual: never armed for wake, so traffic does not restart a sandbox
 	// that is over its disk.
-	_, err := s.stopSandboxInternal(ctx, sb.ID, stopModeManual)
+	_, err := s.stopSandboxForReason(ctx, sb.ID, stopModeManual, models.StatusReasonDiskLimit)
 	done(err)
 	if err != nil {
 		s.logger.Warn("disk watchdog: stop failed", "sandbox_id", sb.ID, "used_bytes", used, "disk_gb", sb.DiskGB, "error", err)

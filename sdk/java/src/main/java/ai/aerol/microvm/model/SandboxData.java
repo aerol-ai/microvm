@@ -50,6 +50,16 @@ public class SandboxData {
     public Instant updatedAt;
     public Instant lastActiveAt;
     public String lastError;
+    /**
+     * Why the sandbox is in its status, one of the {@link StatusReason}
+     * values. Null when a call simply created or started it.
+     */
+    public String statusReason;
+    /**
+     * Exit code behind out_of_memory, crashed, program_exited and restarted.
+     * Null when there is no exit; 0 is a real exit code.
+     */
+    public Integer exitCode;
     public List<String> containerCommand;
     public Lifecycle lifecycle = new Lifecycle();
     public Failover failover;
@@ -64,6 +74,8 @@ public class SandboxData {
     public String tenantId;
     /** GPU configuration this sandbox was created with. Null means no GPU. */
     public GpuOptions gpus;
+    /** The sandbox's cloud identity, when it was created with one. */
+    public SandboxIdentity identity;
 
     public SandboxData copy() {
         SandboxData copy = new SandboxData();
@@ -102,6 +114,8 @@ public class SandboxData {
         updatedAt = other.updatedAt;
         lastActiveAt = other.lastActiveAt;
         lastError = other.lastError;
+        statusReason = other.statusReason;
+        exitCode = other.exitCode;
         containerCommand = other.containerCommand == null ? null : new ArrayList<>(other.containerCommand);
         lifecycle = other.lifecycle == null ? new Lifecycle() : other.lifecycle.copy();
         failover = other.failover == null ? null : other.failover.copy();
@@ -111,5 +125,6 @@ public class SandboxData {
         moduleDigest = other.moduleDigest;
         tenantId = other.tenantId;
         gpus = other.gpus == null ? null : other.gpus.copy();
+        identity = other.identity == null ? null : other.identity.copy();
     }
 }

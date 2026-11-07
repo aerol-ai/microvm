@@ -130,8 +130,8 @@ func TestCreateSnapshotFromImageName(t *testing.T) {
 	rr := httptest.NewRecorder()
 	handler.ServeHTTP(rr, req)
 
-	if rr.Code != http.StatusCreated {
-		t.Fatalf("status = %d, want %d; body=%s", rr.Code, http.StatusCreated, rr.Body.String())
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", rr.Code, http.StatusOK, rr.Body.String())
 	}
 
 	var resp snapshotResponse
@@ -197,8 +197,8 @@ func TestCreateSnapshotFromBuildInfo(t *testing.T) {
 	rr := httptest.NewRecorder()
 	handler.ServeHTTP(rr, req)
 
-	if rr.Code != http.StatusCreated {
-		t.Fatalf("status = %d, want 201; body=%s", rr.Code, rr.Body.String())
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rr.Code, rr.Body.String())
 	}
 
 	var resp snapshotResponse
@@ -229,7 +229,7 @@ func TestCreateSnapshotFromSingleLineFROM(t *testing.T) {
 	rr := httptest.NewRecorder()
 	handler.ServeHTTP(rr, req)
 
-	if rr.Code != http.StatusCreated {
+	if rr.Code != http.StatusOK {
 		t.Fatalf("status = %d; body=%s", rr.Code, rr.Body.String())
 	}
 	var resp snapshotResponse
@@ -315,7 +315,7 @@ func TestCreateSnapshotIdempotentOnSameImage(t *testing.T) {
 	first := httptest.NewRecorder()
 	handler.ServeHTTP(first, httptest.NewRequest(http.MethodPost, "/daytona/snapshots",
 		strings.NewReader(body)))
-	if first.Code != http.StatusCreated {
+	if first.Code != http.StatusOK {
 		t.Fatalf("first call status = %d; body=%s", first.Code, first.Body.String())
 	}
 
@@ -323,15 +323,15 @@ func TestCreateSnapshotIdempotentOnSameImage(t *testing.T) {
 	second := httptest.NewRecorder()
 	handler.ServeHTTP(second, httptest.NewRequest(http.MethodPost, "/daytona/snapshots",
 		strings.NewReader(body)))
-	if second.Code != http.StatusCreated {
-		t.Fatalf("retry status = %d, want 201 (idempotent); body=%s", second.Code, second.Body.String())
+	if second.Code != http.StatusOK {
+		t.Fatalf("retry status = %d, want 200 (idempotent); body=%s", second.Code, second.Body.String())
 	}
 
 	// Same name with a *different* image must conflict.
 	conflict := httptest.NewRecorder()
 	handler.ServeHTTP(conflict, httptest.NewRequest(http.MethodPost, "/daytona/snapshots",
 		strings.NewReader(`{"name":"py","imageName":"python:3.13"}`)))
-	if conflict.Code == http.StatusCreated {
+	if conflict.Code == http.StatusOK {
 		t.Fatalf("conflicting image under same name accepted: body=%s", conflict.Body.String())
 	}
 }
@@ -348,7 +348,7 @@ func TestCreateSnapshotThenCreateSandboxResolvesImage(t *testing.T) {
 	mkSnap := httptest.NewRecorder()
 	env.handler.ServeHTTP(mkSnap, httptest.NewRequest(http.MethodPost, "/daytona/snapshots",
 		strings.NewReader(`{"name":"py-base","imageName":"python:3.12-slim"}`)))
-	if mkSnap.Code != http.StatusCreated {
+	if mkSnap.Code != http.StatusOK {
 		t.Fatalf("create snapshot status = %d; body=%s", mkSnap.Code, mkSnap.Body.String())
 	}
 

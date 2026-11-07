@@ -428,6 +428,9 @@ func open(path string, secretCipher *secrets.Cipher) (*Store, error) {
 			updated_at DATETIME NOT NULL
 		);`,
 		`CREATE INDEX IF NOT EXISTS idx_sandbox_egress_hold ON sandbox_egress(hold_reason) WHERE hold_reason != '';`,
+		// team_quotas caps what each team may hold (plan item P2); the
+		// single-node store, a cluster keeps quotas in the Raft FSM.
+		teamQuotasDDL,
 		// egress_profiles are named allowlists sandboxes reference
 		// (plans/egress-domain-filtering.md D21). Owner-scoped like sandbox
 		// names; this table is the single-node store, a cluster keeps them in
@@ -456,6 +459,20 @@ func open(path string, secretCipher *secrets.Cipher) (*Store, error) {
 			PRIMARY KEY (sandbox_id, profile)
 		);`,
 		`CREATE INDEX IF NOT EXISTS idx_sandbox_egress_profiles_ref ON sandbox_egress_profiles(owner_ref, profile);`,
+		// warm_pools are the API warm-pool entries (plans/agent-sandbox-
+		// feature-parity.md W1): one row per image, fleet-wide operator
+		// config with no owner. This table is the single-node store; a
+		// cluster keeps them in the Raft FSM (fsm_warm_pools.go).
+		`CREATE TABLE IF NOT EXISTS warm_pools (
+			image TEXT PRIMARY KEY,
+			depth INTEGER NOT NULL DEFAULT 0,
+			min_depth INTEGER NOT NULL DEFAULT 0,
+			max_depth INTEGER NOT NULL DEFAULT 0,
+			on_image_change TEXT NOT NULL DEFAULT '',
+			generation INTEGER NOT NULL DEFAULT 1,
+			created_at DATETIME NOT NULL,
+			updated_at DATETIME NOT NULL
+		);`,
 		// api_tokens are scoped API tokens (plans/identity-and-access.md
 		// §5.4): this table is the single-node store, a cluster keeps them
 		// in the Raft FSM. Only SHA-256 of the secret is stored, never the
@@ -847,6 +864,7 @@ func open(path string, secretCipher *secrets.Cipher) (*Store, error) {
 				PRIMARY KEY (scope, ip)
 			);`,
 	}
+	stmts = append(stmts, identitySchema...)
 
 	for _, stmt := range stmts {
 		if _, err := db.Exec(stmt); err != nil {
@@ -903,11 +921,20 @@ func open(path string, secretCipher *secrets.Cipher) (*Store, error) {
 		// rejects two reservations on the same host_port without preventing
 		// many rows at the default 0.
 		`ALTER TABLE exposed_ports ADD COLUMN host_port INTEGER NOT NULL DEFAULT 0;`,
+		// Visibility of an exposed port (A2): "public" (anyone with the URL,
+		// every row from before this column) or "token" (the URL needs a
+		// sandbox token). Read on the ingress path from the sandbox row the
+		// warm cache already loads, so it adds no query.
+		`ALTER TABLE exposed_ports ADD COLUMN visibility TEXT NOT NULL DEFAULT 'public';`,
 		// Backend coordinate frozen at volume-creation time. Pre-migration rows
 		// get '' and fall back to recomputing the source from current operator
 		// config; new volumes store the resolved location so delete/reclaim
 		// targets exactly what was created even if config later changes.
 		`ALTER TABLE volumes ADD COLUMN source TEXT NOT NULL DEFAULT '';`,
+		// delete_with_sandbox (plans/agent-sandbox-feature-parity.md V1): the
+		// volume goes, row and bytes, once its last attachment does. 0 on every
+		// pre-migration row, which keeps those volumes as they always were.
+		`ALTER TABLE volumes ADD COLUMN delete_with_sandbox INTEGER NOT NULL DEFAULT 0;`,
 		`ALTER TABLE sandboxes ADD COLUMN net_bytes_in INTEGER NOT NULL DEFAULT 0;`,
 		`ALTER TABLE sandboxes ADD COLUMN net_bytes_out INTEGER NOT NULL DEFAULT 0;`,
 		`ALTER TABLE sandboxes ADD COLUMN net_bytes_in_limit INTEGER NOT NULL DEFAULT 0;`,
@@ -940,6 +967,13 @@ func open(path string, secretCipher *secrets.Cipher) (*Store, error) {
 		// itself. Pre-migration rows are backfilled from a still-existing
 		// source sandbox after this loop (backfillSnapshotOwners).
 		`ALTER TABLE sandbox_snapshots ADD COLUMN owner_ref TEXT NOT NULL DEFAULT '';`,
+		// Demand-following warm-pool depth (W2): max_depth 0 is a fixed
+		// depth, so an entry stored before the columns keeps its meaning.
+		`ALTER TABLE warm_pools ADD COLUMN min_depth INTEGER NOT NULL DEFAULT 0;`,
+		`ALTER TABLE warm_pools ADD COLUMN max_depth INTEGER NOT NULL DEFAULT 0;`,
+		// What a pool does when its image changes (W3); '' reads as
+		// replace_now, the behaviour before the column.
+		`ALTER TABLE warm_pools ADD COLUMN on_image_change TEXT NOT NULL DEFAULT '';`,
 		// auto_import_pending is set when the post-pull AOCR auto-import
 		// (F21) failed and a background reconciler should retry. It is
 		// local-node bookkeeping only — never replicated, never user-visible.
@@ -1063,6 +1097,41 @@ func open(path string, secretCipher *secrets.Cipher) (*Store, error) {
 		// empty-string sentinels keep scanSandbox free of NullString
 		// plumbing). Unused by other runtimes today.
 		`ALTER TABLE sandboxes ADD COLUMN tenant_id TEXT NOT NULL DEFAULT '';`,
+		// Why the sandbox is in its current status (models.StatusReason*) and
+		// the exit code behind it (plans/agent-sandbox-feature-parity.md L2).
+		// '' and NULL for every pre-migration row: "nothing recorded", which
+		// is the truth for a stop that happened before the column existed.
+		// exit_code is nullable because 0 is a real exit code.
+		`ALTER TABLE sandboxes ADD COLUMN status_reason TEXT NOT NULL DEFAULT '';`,
+		`ALTER TABLE sandboxes ADD COLUMN exit_code INTEGER;`,
+		// Restart on failure (L1): the lifecycle flag, then the backoff
+		// state. The state is stored rather than held in memory so a daemon
+		// restart keeps a crash-looping sandbox's backoff instead of
+		// restarting it at full speed after every daemon restart. restart_at
+		// is NULL when no restart is pending.
+		`ALTER TABLE sandboxes ADD COLUMN restart_on_failure INTEGER NOT NULL DEFAULT 0;`,
+		`ALTER TABLE sandboxes ADD COLUMN restart_failures INTEGER NOT NULL DEFAULT 0;`,
+		`ALTER TABLE sandboxes ADD COLUMN restart_at DATETIME;`,
+		`ALTER TABLE sandboxes ADD COLUMN last_restarted_at DATETIME;`,
+		// Destroy after the main program exits (L5): the lifecycle timer, and
+		// when the sweep saw the program end. The exit is stored, not kept in
+		// memory, so the timer survives a daemon restart; NULL while the
+		// program runs.
+		`ALTER TABLE sandboxes ADD COLUMN destroy_after_exit_for_ns INTEGER NOT NULL DEFAULT 0;`,
+		`ALTER TABLE sandboxes ADD COLUMN program_exited_at DATETIME;`,
+		// Sandbox token revoke (pkg/sandboxtoken): the unix second before
+		// which every token issued for this sandbox is refused. 0 for every
+		// pre-migration row: nothing was ever revoked. It only moves forward
+		// (Upsert and RevokeSandboxTokens keep the larger value), so a
+		// whole-row write from a read taken before a revoke cannot undo it.
+		`ALTER TABLE sandboxes ADD COLUMN tokens_not_before INTEGER NOT NULL DEFAULT 0;`,
+		// Which run of the sandbox the row describes: one more each time a
+		// write moves it to started (Upsert). An exit read from toolboxd is
+		// stored only for the run it was asked of (RecordProgramExit), so a
+		// reply that comes back after a stop and a start cannot mark the new
+		// run exited (review 2 finding 10). 0 on every pre-migration row; the
+		// next start makes it 1.
+		`ALTER TABLE sandboxes ADD COLUMN run_generation INTEGER NOT NULL DEFAULT 0;`,
 		// Checkpoint pushes are async and outlive their sandbox: without the
 		// lifecycle they were started for, a push that lands after the id is
 		// reused writes the old incarnation's artifact into the new one.
@@ -2167,8 +2236,12 @@ func (s *Store) insertSandbox(ctx context.Context, exec dbExecer, sandbox *model
 			checkpoint_path, clone_generation,
 			wasm_registry_ref, wasm_registry_digest,
 			owner_ref, fleet_suspended,
-			tenant_id, audit_incarnation_id
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			tenant_id, audit_incarnation_id,
+			status_reason, exit_code,
+			restart_on_failure, restart_failures, restart_at, last_restarted_at,
+			destroy_after_exit_for_ns, program_exited_at,
+			tokens_not_before
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`,
 		sandbox.ID,
 		sandbox.Image,
@@ -2226,6 +2299,15 @@ func (s *Store) insertSandbox(ctx context.Context, exec dbExecer, sandbox *model
 		boolToInt(sandbox.FleetSuspended),
 		strings.TrimSpace(sandbox.TenantID),
 		strings.TrimSpace(sandbox.AuditIncarnationID),
+		strings.TrimSpace(sandbox.StatusReason),
+		nullableInt(sandbox.ExitCode),
+		boolToInt(sandbox.Lifecycle.RestartOnFailure),
+		sandbox.RestartFailures,
+		nullableTime(sandbox.RestartAt),
+		nullableTime(sandbox.LastRestartedAt),
+		int64(sandbox.Lifecycle.DestroyAfterExitFor),
+		nullableTime(sandbox.ProgramExitedAt),
+		sandbox.TokensNotBefore,
 	)
 	if err != nil {
 		if isSandboxNameConflict(err, sandbox.Name) {
@@ -2387,6 +2469,32 @@ func (s *Store) Upsert(ctx context.Context, sandbox *models.Sandbox) error {
 	// pass and written after the old key was retired would otherwise put
 	// back bytes nothing opens. Only Create, the reseal pass and a write
 	// with a new plaintext toolbox token (the last argument) change one.
+	//
+	// The same staleness rule covers status_reason and exit_code: the writer
+	// that changes the status says why, and a write that keeps the status
+	// keeps the reason. Every path that changes status (the API stop, the
+	// die event, reconcile, start) writes the whole row from its own earlier
+	// read, so without it a duplicate event, or a reconcile pass that read
+	// the row a moment before a stop, would replace "user_stop" with its own
+	// guess. A reason that changes with no status change goes through
+	// SetStatusReason.
+	//
+	// The restart-on-failure backoff state (restart_failures, restart_at,
+	// last_restarted_at) is not updated here at all: only ScheduleRestart,
+	// MarkRestarted and CancelRestart write it, so a whole-row write from a
+	// read taken before a crash cannot drop the restart that crash scheduled.
+	//
+	// program_exited_at is written only by RecordProgramExit, and cleared
+	// here only on a write that starts the sandbox: a start runs the main
+	// program again, while a stop keeps the exit and its destroy timer.
+	//
+	// tokens_not_before keeps the larger of the two values: a whole-row
+	// write from a read taken before a token revoke would otherwise lower
+	// it and bring every revoked token back.
+	// run_generation is never taken from the caller's (older) read: the same
+	// start transition adds one to the stored value, so every start path
+	// (the API start, a restart on failure, a wake, the start event) counts
+	// each run once, whichever of them writes it first.
 	_, err = exec.ExecContext(ctx, `
 		INSERT INTO sandboxes (
 			id, image, status, public_url, container_id, container_ip, cpu, memory_mb, disk_gb,
@@ -2407,8 +2515,12 @@ func (s *Store) Upsert(ctx context.Context, sandbox *models.Sandbox) error {
 			checkpoint_path, clone_generation,
 			wasm_registry_ref, wasm_registry_digest,
 			owner_ref, fleet_suspended,
-			tenant_id, audit_incarnation_id
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			tenant_id, audit_incarnation_id,
+			status_reason, exit_code,
+			restart_on_failure, restart_failures, restart_at, last_restarted_at,
+			destroy_after_exit_for_ns, program_exited_at,
+			tokens_not_before
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			image = excluded.image,
 			status = excluded.status,
@@ -2468,6 +2580,25 @@ func (s *Store) Upsert(ctx context.Context, sandbox *models.Sandbox) error {
 			audit_incarnation_id = CASE
 				WHEN excluded.audit_incarnation_id <> '' THEN excluded.audit_incarnation_id
 				ELSE sandboxes.audit_incarnation_id
+			END,
+			status_reason = CASE
+				WHEN excluded.status <> sandboxes.status THEN excluded.status_reason
+				ELSE sandboxes.status_reason
+			END,
+			exit_code = CASE
+				WHEN excluded.status <> sandboxes.status THEN excluded.exit_code
+				ELSE sandboxes.exit_code
+			END,
+			restart_on_failure = excluded.restart_on_failure,
+			destroy_after_exit_for_ns = excluded.destroy_after_exit_for_ns,
+			program_exited_at = CASE
+				WHEN excluded.status = 'started' AND sandboxes.status <> 'started' THEN NULL
+				ELSE sandboxes.program_exited_at
+			END,
+			tokens_not_before = MAX(sandboxes.tokens_not_before, excluded.tokens_not_before),
+			run_generation = CASE
+				WHEN excluded.status = 'started' AND sandboxes.status <> 'started' THEN sandboxes.run_generation + 1
+				ELSE sandboxes.run_generation
 			END
 	`,
 		sandbox.ID,
@@ -2526,6 +2657,15 @@ func (s *Store) Upsert(ctx context.Context, sandbox *models.Sandbox) error {
 		boolToInt(sandbox.FleetSuspended),
 		strings.TrimSpace(sandbox.TenantID),
 		incarnationID,
+		strings.TrimSpace(sandbox.StatusReason),
+		nullableInt(sandbox.ExitCode),
+		boolToInt(sandbox.Lifecycle.RestartOnFailure),
+		sandbox.RestartFailures,
+		nullableTime(sandbox.RestartAt),
+		nullableTime(sandbox.LastRestartedAt),
+		int64(sandbox.Lifecycle.DestroyAfterExitFor),
+		nullableTime(sandbox.ProgramExitedAt),
+		sandbox.TokensNotBefore,
 		boolToInt(sandbox.ToolboxToken != ""),
 	)
 	if err != nil {
@@ -2578,7 +2718,12 @@ func (s *Store) Get(ctx context.Context, id string) (*models.Sandbox, error) {
 			checkpoint_path, clone_generation,
 			wasm_registry_ref, wasm_registry_digest,
 			owner_ref, fleet_suspended,
-			tenant_id, audit_incarnation_id
+			tenant_id, audit_incarnation_id,
+			status_reason, exit_code,
+			restart_on_failure, restart_failures, restart_at, last_restarted_at,
+			destroy_after_exit_for_ns, program_exited_at,
+			tokens_not_before,
+			run_generation
 		FROM sandboxes
 		WHERE id = ?
 	`, id)
@@ -2606,7 +2751,7 @@ func (s *Store) Get(ctx context.Context, id string) (*models.Sandbox, error) {
 	}
 	sandbox.CustomDomains = customDomains
 
-	if err := s.attachEgressModes(ctx, map[string]*models.Sandbox{id: sandbox}); err != nil {
+	if err := s.attachSandboxSideState(ctx, map[string]*models.Sandbox{id: sandbox}); err != nil {
 		return nil, err
 	}
 	return sandbox, nil
@@ -2647,7 +2792,12 @@ func (s *Store) List(ctx context.Context) ([]*models.Sandbox, error) {
 			checkpoint_path, clone_generation,
 			wasm_registry_ref, wasm_registry_digest,
 			owner_ref, fleet_suspended,
-			tenant_id, audit_incarnation_id
+			tenant_id, audit_incarnation_id,
+			status_reason, exit_code,
+			restart_on_failure, restart_failures, restart_at, last_restarted_at,
+			destroy_after_exit_for_ns, program_exited_at,
+			tokens_not_before,
+			run_generation
 		FROM sandboxes
 		ORDER BY created_at DESC
 	`)
@@ -2682,7 +2832,7 @@ func (s *Store) List(ctx context.Context) ([]*models.Sandbox, error) {
 		if err := s.attachCustomDomainsBulk(ctx, byID); err != nil {
 			return nil, err
 		}
-		if err := s.attachEgressModes(ctx, byID); err != nil {
+		if err := s.attachSandboxSideState(ctx, byID); err != nil {
 			return nil, err
 		}
 	}
@@ -2718,7 +2868,12 @@ func (s *Store) ListByOwner(ctx context.Context, ownerRef string) ([]*models.San
 			checkpoint_path, clone_generation,
 			wasm_registry_ref, wasm_registry_digest,
 			owner_ref, fleet_suspended,
-			tenant_id, audit_incarnation_id
+			tenant_id, audit_incarnation_id,
+			status_reason, exit_code,
+			restart_on_failure, restart_failures, restart_at, last_restarted_at,
+			destroy_after_exit_for_ns, program_exited_at,
+			tokens_not_before,
+			run_generation
 		FROM sandboxes
 		WHERE owner_ref = ?
 		ORDER BY created_at DESC
@@ -2741,7 +2896,7 @@ func (s *Store) ListByOwner(ctx context.Context, ownerRef string) ([]*models.San
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("iterate sandboxes by owner: %w", err)
 	}
-	if err := s.attachEgressModes(ctx, byID); err != nil {
+	if err := s.attachSandboxSideState(ctx, byID); err != nil {
 		return nil, err
 	}
 	return sandboxes, nil
@@ -2776,7 +2931,12 @@ func (s *Store) ListByRuntime(ctx context.Context, runtime string) ([]*models.Sa
 			checkpoint_path, clone_generation,
 			wasm_registry_ref, wasm_registry_digest,
 			owner_ref, fleet_suspended,
-			tenant_id, audit_incarnation_id
+			tenant_id, audit_incarnation_id,
+			status_reason, exit_code,
+			restart_on_failure, restart_failures, restart_at, last_restarted_at,
+			destroy_after_exit_for_ns, program_exited_at,
+			tokens_not_before,
+			run_generation
 		FROM sandboxes
 		WHERE runtime = ?
 		ORDER BY created_at DESC
@@ -2799,7 +2959,7 @@ func (s *Store) ListByRuntime(ctx context.Context, runtime string) ([]*models.Sa
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("iterate sandboxes by runtime: %w", err)
 	}
-	if err := s.attachEgressModes(ctx, byID); err != nil {
+	if err := s.attachSandboxSideState(ctx, byID); err != nil {
 		return nil, err
 	}
 	return sandboxes, nil
@@ -2863,7 +3023,7 @@ func (s *Store) UpsertAccountMapping(ctx context.Context, ownerRef, externalID s
 // batches; the in-memory join below stays the same shape.
 func (s *Store) attachPortsBulk(ctx context.Context, byID map[string]*models.Sandbox) error {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT sandbox_id, port, protocol, host_port, public_url, created_at
+		SELECT sandbox_id, port, protocol, host_port, public_url, created_at, visibility
 		FROM exposed_ports
 		ORDER BY sandbox_id, port ASC
 	`)
@@ -2874,7 +3034,7 @@ func (s *Store) attachPortsBulk(ctx context.Context, byID map[string]*models.San
 
 	for rows.Next() {
 		var exposure models.ExposedPort
-		if err := rows.Scan(&exposure.SandboxID, &exposure.Port, &exposure.Protocol, &exposure.HostPort, &exposure.PublicURL, &exposure.CreatedAt); err != nil {
+		if err := scanExposedPort(rows.Scan, &exposure); err != nil {
 			return fmt.Errorf("scan exposed port: %w", err)
 		}
 		if sb, ok := byID[exposure.SandboxID]; ok {
@@ -3113,6 +3273,8 @@ func (s *Store) UpdateLifecycle(ctx context.Context, id string, l models.Lifecyc
 		    stop_at_age_ns = ?,
 		    destroy_at_age_ns = ?,
 		    serverless = ?,
+		    restart_on_failure = ?,
+		    destroy_after_exit_for_ns = ?,
 		    updated_at = ?
 		WHERE id = ?
 	`,
@@ -3121,6 +3283,8 @@ func (s *Store) UpdateLifecycle(ctx context.Context, id string, l models.Lifecyc
 		int64(l.StopAtAge),
 		int64(l.DestroyAtAge),
 		boolToInt(l.Serverless),
+		boolToInt(l.RestartOnFailure),
+		int64(l.DestroyAfterExitFor),
 		time.Now().UTC(),
 		id,
 	)
@@ -3255,6 +3419,29 @@ func (s *Store) SetWakeArmed(ctx context.Context, id string, armed bool) error {
 	return nil
 }
 
+// RevokeSandboxTokens moves the sandbox's tokens_not_before forward to
+// notBefore and returns the value the row now holds. It never moves it
+// back: a second revoke with an older clock reading, or a retry, keeps the
+// later value, so a repeated call can only refuse more tokens, never bring
+// one back. updated_at is left alone, as nothing a caller reads about the
+// sandbox changed. Returns ErrNotFound if no row matches id.
+func (s *Store) RevokeSandboxTokens(ctx context.Context, id string, notBefore int64) (int64, error) {
+	var stored int64
+	err := s.db.QueryRowContext(ctx, `
+		UPDATE sandboxes
+		SET tokens_not_before = MAX(tokens_not_before, ?)
+		WHERE id = ?
+		RETURNING tokens_not_before
+	`, notBefore, id).Scan(&stored)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, ErrNotFound
+	}
+	if err != nil {
+		return 0, fmt.Errorf("revoke sandbox tokens: %w", err)
+	}
+	return stored, nil
+}
+
 // SetAllowPublicTraffic flips the public-exposure flag together with the
 // derived public_url in one statement. The expose_port opt-in path (the only
 // way a private sandbox becomes public after create) is the caller; the two
@@ -3327,14 +3514,50 @@ func (s *Store) ListAutoImportPendingIDs(ctx context.Context) ([]string, error) 
 	return ids, rows.Err()
 }
 
+// Delete removes a sandbox row. The FK cascade takes its volume attachments
+// with it, which can be the last link from any sandbox to a
+// delete_with_sandbox volume; so the same transaction writes the reclaim
+// ledger row (pending_volume_deletions) of every such volume this sandbox
+// was the only holder of. Whatever the caller did or failed to do before,
+// the volume can no longer lose its cleanup record: the reclaim sweep
+// deletes its row and then its bytes. A volume another sandbox still holds
+// is left to that sandbox's delete.
 func (s *Store) Delete(ctx context.Context, id string) error {
-	result, err := s.db.ExecContext(ctx, `DELETE FROM sandboxes WHERE id = ?`, id)
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin delete sandbox: %w", err)
+	}
+	defer tx.Rollback()
+	// WHERE is required before the upsert clause of an INSERT ... SELECT.
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO pending_volume_deletions (volume_id, tenant, name, backend, source, created_at)
+		SELECT DISTINCT v.id, v.tenant, v.name, v.backend, v.source, ?
+		FROM volume_attachments a
+		JOIN volumes v ON v.id = a.volume_id AND v.tenant = a.tenant
+		WHERE a.sandbox_id = ? AND v.delete_with_sandbox = 1 AND v.source <> ''
+			AND NOT EXISTS (
+				SELECT 1 FROM volume_attachments o
+				WHERE o.tenant = v.tenant AND o.volume_id = v.id AND o.sandbox_id <> ?
+			)
+		ON CONFLICT(volume_id) DO UPDATE SET
+			tenant = excluded.tenant,
+			name = excluded.name,
+			backend = excluded.backend,
+			source = excluded.source,
+			created_at = excluded.created_at
+	`, time.Now().UTC(), id, id); err != nil {
+		return fmt.Errorf("record delete_with_sandbox volumes: %w", err)
+	}
+	result, err := tx.ExecContext(ctx, `DELETE FROM sandboxes WHERE id = ?`, id)
 	if err != nil {
 		return fmt.Errorf("delete sandbox: %w", err)
 	}
 	affected, err := result.RowsAffected()
 	if err == nil && affected == 0 {
 		return ErrNotFound
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit delete sandbox: %w", err)
 	}
 	return nil
 }
@@ -4849,6 +5072,137 @@ func (s *Store) UpdateStatus(ctx context.Context, id string, status models.Sandb
 	return nil
 }
 
+// UpdateStatusWithReason is UpdateStatus for a path that also knows why the
+// status changed (models.StatusReason*): one statement, so the row is never
+// seen in its new status with the old reason.
+func (s *Store) UpdateStatusWithReason(ctx context.Context, id string, status models.SandboxStatus, lastError, reason string, exitCode *int) error {
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE sandboxes
+		SET status = ?, last_error = ?, status_reason = ?, exit_code = ?, updated_at = ?
+		WHERE id = ?
+	`, string(status), lastError, reason, nullableInt(exitCode), time.Now().UTC(), id)
+	if err != nil {
+		return fmt.Errorf("update sandbox status: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err == nil && affected == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// SetStatusReason records why a sandbox is in its status when the status
+// itself does not change: a failover recreate, a restart on failure, or a
+// main program that ended while the sandbox stays up. Upsert keeps the
+// reason on a write that keeps the status, so these need their own write.
+func (s *Store) SetStatusReason(ctx context.Context, id, reason string, exitCode *int) error {
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE sandboxes
+		SET status_reason = ?, exit_code = ?, updated_at = ?
+		WHERE id = ?
+	`, reason, nullableInt(exitCode), time.Now().UTC(), id)
+	if err != nil {
+		return fmt.Errorf("set sandbox status reason: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err == nil && affected == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// SetStatusReasonIfStatus is SetStatusReason for a row that is still in
+// status. A reason that explains a status must not land on a row another
+// writer has moved since: a restart's "restarted" on a sandbox whose die
+// event already wrote "crashed" would hide the crash its restart on failure
+// answers. set reports whether the row was written (false for a row that
+// moved, or is gone).
+func (s *Store) SetStatusReasonIfStatus(ctx context.Context, id string, status models.SandboxStatus, reason string, exitCode *int) (bool, error) {
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE sandboxes
+		SET status_reason = ?, exit_code = ?, updated_at = ?
+		WHERE id = ? AND status = ?
+	`, reason, nullableInt(exitCode), time.Now().UTC(), id, string(status))
+	if err != nil {
+		return false, fmt.Errorf("set sandbox status reason: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("set sandbox status reason: %w", err)
+	}
+	return affected == 1, nil
+}
+
+// ScheduleRestart records a pending restart on failure: the consecutive
+// failure count the backoff was computed from and when the restart is due.
+func (s *Store) ScheduleRestart(ctx context.Context, id string, failures int, at time.Time) error {
+	return s.execOneSandbox(ctx, "schedule sandbox restart", `
+		UPDATE sandboxes SET restart_failures = ?, restart_at = ? WHERE id = ?
+	`, failures, at.UTC(), id)
+}
+
+// MarkRestarted records that a pending restart ran at at: nothing is pending
+// any more, and at is what the next failure measures "ran fine for 10
+// minutes" from.
+func (s *Store) MarkRestarted(ctx context.Context, id string, at time.Time) error {
+	return s.execOneSandbox(ctx, "mark sandbox restarted", `
+		UPDATE sandboxes SET restart_at = NULL, last_restarted_at = ? WHERE id = ?
+	`, at.UTC(), id)
+}
+
+// CancelRestart drops a pending restart (a stop, a start, or a timer that
+// wins over it). The failure count stays, so a sandbox that crashes again
+// soon keeps backing off. A non-empty reason replaces the crash's reason on
+// a row that was stopped waiting for the restart: a stop of a sandbox that
+// is already down changes no status, so Upsert would keep "crashed".
+func (s *Store) CancelRestart(ctx context.Context, id, reason string) error {
+	return s.execOneSandbox(ctx, "cancel sandbox restart", `
+		UPDATE sandboxes SET
+			status_reason = CASE WHEN ? <> '' AND restart_at IS NOT NULL AND status = 'stopped' THEN ? ELSE status_reason END,
+			exit_code = CASE WHEN ? <> '' AND restart_at IS NOT NULL AND status = 'stopped' THEN NULL ELSE exit_code END,
+			restart_at = NULL
+		WHERE id = ?
+	`, reason, reason, reason, id)
+}
+
+// RecordProgramExit stores the end of a started sandbox's main program: when
+// it ended, status_reason program_exited and its exit code. Only the first
+// report counts (program_exited_at must still be NULL), only while the row is
+// started, and only for the run the report was read from (runGeneration, the
+// row's run_generation when the caller asked toolboxd). A sandbox that
+// stopped meanwhile is left alone, and so is one that stopped and started
+// again: its new run has a new generation, so the old run's exit cannot land
+// on it. recorded reports whether this call stored it.
+func (s *Store) RecordProgramExit(ctx context.Context, id string, runGeneration int64, at time.Time, exitCode int) (bool, error) {
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE sandboxes
+		SET program_exited_at = ?, status_reason = ?, exit_code = ?, updated_at = ?
+		WHERE id = ? AND status = ? AND program_exited_at IS NULL AND run_generation = ?
+	`, at.UTC(), models.StatusReasonProgramExited, exitCode, time.Now().UTC(), id, string(models.SandboxStatusStarted), runGeneration)
+	if err != nil {
+		return false, fmt.Errorf("record program exit: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("record program exit: %w", err)
+	}
+	return affected == 1, nil
+}
+
+// execOneSandbox runs a single-row sandboxes UPDATE and maps "no row" to
+// ErrNotFound.
+func (s *Store) execOneSandbox(ctx context.Context, what, query string, args ...any) error {
+	result, err := s.db.ExecContext(ctx, query, args...)
+	if err != nil {
+		return fmt.Errorf("%s: %w", what, err)
+	}
+	affected, err := result.RowsAffected()
+	if err == nil && affected == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
 func (s *Store) UpdateRuntime(ctx context.Context, id, containerID, containerIP, publicURL string) error {
 	result, err := s.db.ExecContext(ctx, `
 		UPDATE sandboxes
@@ -4877,19 +5231,39 @@ func (s *Store) Touch(ctx context.Context, id string, at time.Time) error {
 	return nil
 }
 
+// scanExposedPort reads one exposed_ports row in the column order every
+// SELECT above uses. Visibility is "" for a public port (the stored
+// default), so a public exposure's JSON is what it was before A2.
+func scanExposedPort(scan func(dest ...any) error, exposure *models.ExposedPort) error {
+	var visibility string
+	if err := scan(&exposure.SandboxID, &exposure.Port, &exposure.Protocol, &exposure.HostPort, &exposure.PublicURL, &exposure.CreatedAt, &visibility); err != nil {
+		return err
+	}
+	exposure.Visibility = ""
+	if visibility == models.ExposedPortVisibilityToken {
+		exposure.Visibility = models.ExposedPortVisibilityToken
+	}
+	return nil
+}
+
 func (s *Store) UpsertPort(ctx context.Context, exposure models.ExposedPort) error {
 	if exposure.Protocol == "" {
 		exposure.Protocol = models.ExposedPortProtocolHTTP
 	}
+	visibility := models.ExposedPortVisibilityPublic
+	if exposure.TokenGated() {
+		visibility = models.ExposedPortVisibilityToken
+	}
 	_, err := s.db.ExecContext(ctx, `
-		INSERT INTO exposed_ports (sandbox_id, port, protocol, host_port, public_url, created_at)
-		VALUES (?, ?, ?, ?, ?, ?)
+		INSERT INTO exposed_ports (sandbox_id, port, protocol, host_port, public_url, created_at, visibility)
+		VALUES (?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(sandbox_id, port) DO UPDATE SET
 			protocol = excluded.protocol,
 			host_port = excluded.host_port,
 			public_url = excluded.public_url,
-			created_at = excluded.created_at
-	`, exposure.SandboxID, exposure.Port, exposure.Protocol, exposure.HostPort, exposure.PublicURL, exposure.CreatedAt.UTC())
+			created_at = excluded.created_at,
+			visibility = excluded.visibility
+	`, exposure.SandboxID, exposure.Port, exposure.Protocol, exposure.HostPort, exposure.PublicURL, exposure.CreatedAt.UTC(), visibility)
 	if err != nil {
 		return fmt.Errorf("upsert exposed port: %w", err)
 	}
@@ -4950,11 +5324,11 @@ func (s *Store) TryReserveHostPort(ctx context.Context, sandboxID string, contai
 // protocol destination port back to a sandbox/container port.
 func (s *Store) GetPortByHostPort(ctx context.Context, hostPort int) (*models.ExposedPort, error) {
 	var exposure models.ExposedPort
-	err := s.db.QueryRowContext(ctx, `
-		SELECT sandbox_id, port, protocol, host_port, public_url, created_at
+	err := scanExposedPort(s.db.QueryRowContext(ctx, `
+		SELECT sandbox_id, port, protocol, host_port, public_url, created_at, visibility
 		FROM exposed_ports
 		WHERE host_port = ?
-	`, hostPort).Scan(&exposure.SandboxID, &exposure.Port, &exposure.Protocol, &exposure.HostPort, &exposure.PublicURL, &exposure.CreatedAt)
+	`, hostPort).Scan, &exposure)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, nil
@@ -4964,14 +5338,29 @@ func (s *Store) GetPortByHostPort(ctx context.Context, hostPort int) (*models.Ex
 	return &exposure, nil
 }
 
+// GetPort returns the exposure row for (sandboxID, port), or nil if absent.
+// One primary-key lookup: the service's route writers read a port's gate
+// here right before they write its route, rather than trusting the copy in
+// a sandbox row they read earlier.
+func (s *Store) GetPort(ctx context.Context, sandboxID string, port int) (*models.ExposedPort, error) {
+	return s.getPort(ctx, sandboxID, port)
+}
+
+// ListPorts returns every exposure row of one sandbox, ordered by port.
+// The narrow read (no sandbox row, no token decrypt) the toolboxd
+// allowlist push makes under its lock.
+func (s *Store) ListPorts(ctx context.Context, sandboxID string) ([]models.ExposedPort, error) {
+	return s.loadPorts(ctx, sandboxID)
+}
+
 // getPort returns the exposure row for (sandboxID, port), or nil if absent.
 func (s *Store) getPort(ctx context.Context, sandboxID string, port int) (*models.ExposedPort, error) {
 	var exposure models.ExposedPort
-	err := s.db.QueryRowContext(ctx, `
-		SELECT sandbox_id, port, protocol, host_port, public_url, created_at
+	err := scanExposedPort(s.db.QueryRowContext(ctx, `
+		SELECT sandbox_id, port, protocol, host_port, public_url, created_at, visibility
 		FROM exposed_ports
 		WHERE sandbox_id = ? AND port = ?
-	`, sandboxID, port).Scan(&exposure.SandboxID, &exposure.Port, &exposure.Protocol, &exposure.HostPort, &exposure.PublicURL, &exposure.CreatedAt)
+	`, sandboxID, port).Scan, &exposure)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, nil
@@ -4986,7 +5375,7 @@ func (s *Store) getPort(ctx context.Context, sandboxID string, port int) (*model
 // without N+1 per-sandbox lookups.
 func (s *Store) ListAllExposedPorts(ctx context.Context) ([]models.ExposedPort, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT sandbox_id, port, protocol, host_port, public_url, created_at
+		SELECT sandbox_id, port, protocol, host_port, public_url, created_at, visibility
 		FROM exposed_ports
 		ORDER BY sandbox_id, port ASC
 	`)
@@ -4998,7 +5387,7 @@ func (s *Store) ListAllExposedPorts(ctx context.Context) ([]models.ExposedPort, 
 	var ports []models.ExposedPort
 	for rows.Next() {
 		var exposure models.ExposedPort
-		if err := rows.Scan(&exposure.SandboxID, &exposure.Port, &exposure.Protocol, &exposure.HostPort, &exposure.PublicURL, &exposure.CreatedAt); err != nil {
+		if err := scanExposedPort(rows.Scan, &exposure); err != nil {
 			return nil, fmt.Errorf("scan exposed port: %w", err)
 		}
 		ports = append(ports, exposure)
@@ -5268,7 +5657,7 @@ func (s *Store) attachCustomDomainsBulk(ctx context.Context, byID map[string]*mo
 
 func (s *Store) loadPorts(ctx context.Context, sandboxID string) ([]models.ExposedPort, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT sandbox_id, port, protocol, host_port, public_url, created_at
+		SELECT sandbox_id, port, protocol, host_port, public_url, created_at, visibility
 		FROM exposed_ports
 		WHERE sandbox_id = ?
 		ORDER BY port ASC
@@ -5281,7 +5670,7 @@ func (s *Store) loadPorts(ctx context.Context, sandboxID string) ([]models.Expos
 	var ports []models.ExposedPort
 	for rows.Next() {
 		var exposure models.ExposedPort
-		if err := rows.Scan(&exposure.SandboxID, &exposure.Port, &exposure.Protocol, &exposure.HostPort, &exposure.PublicURL, &exposure.CreatedAt); err != nil {
+		if err := scanExposedPort(rows.Scan, &exposure); err != nil {
 			return nil, fmt.Errorf("scan exposed port: %w", err)
 		}
 		ports = append(ports, exposure)
@@ -5315,6 +5704,11 @@ func (s *Store) scanSandbox(scanner interface {
 	var fleetSuspended int
 	var allowOutJSON, denyOutJSON string
 	var allowPublicTraffic int
+	var exitCode sql.NullInt64
+	var restartOnFailure int
+	var restartAt, lastRestartedAt sql.NullTime
+	var destroyAfterExitNs int64
+	var programExitedAt sql.NullTime
 
 	err := scanner.Scan(
 		&sandbox.ID,
@@ -5373,10 +5767,24 @@ func (s *Store) scanSandbox(scanner interface {
 		&fleetSuspended,
 		&sandbox.TenantID,
 		&sandbox.AuditIncarnationID,
+		&sandbox.StatusReason,
+		&exitCode,
+		&restartOnFailure,
+		&sandbox.RestartFailures,
+		&restartAt,
+		&lastRestartedAt,
+		&destroyAfterExitNs,
+		&programExitedAt,
+		&sandbox.TokensNotBefore,
+		&sandbox.RunGeneration,
 	)
 	if err != nil {
 		return nil, err
 	}
+	sandbox.ExitCode = intFromNull(exitCode)
+	sandbox.RestartAt = timeFromNull(restartAt)
+	sandbox.LastRestartedAt = timeFromNull(lastRestartedAt)
+	sandbox.ProgramExitedAt = timeFromNull(programExitedAt)
 	sandbox.FleetSuspended = fleetSuspended == 1
 	sandbox.NetworkQuotaExceeded = netQuotaExceeded == 1
 	if netQuotaExceededAt.Valid {
@@ -5423,11 +5831,13 @@ func (s *Store) scanSandbox(scanner interface {
 	sandbox.AllowPublicTraffic = &allowPublic
 	sandbox.ToolboxEnabled = toolboxEnabled == 1
 	sandbox.Lifecycle = models.Lifecycle{
-		StopIfIdleFor:    time.Duration(stopIfIdleNs),
-		DestroyIfIdleFor: time.Duration(destroyIfIdleNs),
-		StopAtAge:        time.Duration(stopAtAgeNs),
-		DestroyAtAge:     time.Duration(destroyAtAgeNs),
-		Serverless:       serverless == 1,
+		StopIfIdleFor:       time.Duration(stopIfIdleNs),
+		DestroyIfIdleFor:    time.Duration(destroyIfIdleNs),
+		StopAtAge:           time.Duration(stopAtAgeNs),
+		DestroyAtAge:        time.Duration(destroyAtAgeNs),
+		Serverless:          serverless == 1,
+		RestartOnFailure:    restartOnFailure == 1,
+		DestroyAfterExitFor: time.Duration(destroyAfterExitNs),
 	}
 	if policy, err := models.NormalizeFailoverPolicy(failoverPolicy); err == nil && policy == models.FailoverPolicyRecreate {
 		sandbox.Failover = &models.Failover{Policy: policy}
@@ -5632,6 +6042,33 @@ func nullableTime(t *time.Time) sql.NullTime {
 		return sql.NullTime{}
 	}
 	return sql.NullTime{Time: t.UTC(), Valid: true}
+}
+
+// nullableInt maps a *int to a sql.NullInt64: exit_code is NULL when there
+// is no exit, since 0 is a real exit code.
+func nullableInt(v *int) sql.NullInt64 {
+	if v == nil {
+		return sql.NullInt64{}
+	}
+	return sql.NullInt64{Int64: int64(*v), Valid: true}
+}
+
+// timeFromNull is nullableTime's inverse for the read path.
+func timeFromNull(v sql.NullTime) *time.Time {
+	if !v.Valid {
+		return nil
+	}
+	t := v.Time.UTC()
+	return &t
+}
+
+// intFromNull is nullableInt's inverse for the read path.
+func intFromNull(v sql.NullInt64) *int {
+	if !v.Valid {
+		return nil
+	}
+	n := int(v.Int64)
+	return &n
 }
 
 func boolToInt(value bool) int {
