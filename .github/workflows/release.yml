@@ -430,6 +430,16 @@ jobs:
       - name: Generate release.json
         run: go run ./cmd/releasemeta -version "$VERSION" -install-script dist/install.sh -o dist/release.json
 
+      # The operator files from setup/ (alert rules, Alertmanager config,
+      # Grafana dashboards, runbooks), so nobody needs a checkout for them
+      # (plans/kubectl-style-cluster-ops.md §7). The file list is the tree
+      # itself; cmd/opsbundle's tests check the bundle holds what setup/
+      # has. Before checksums.txt, so it covers the bundle;
+      # integration-tests/safety TestReleaseWorkflowShipsTheOpsBundle keeps
+      # it there.
+      - name: Bundle the ops files
+        run: go run ./cmd/opsbundle -version "$VERSION" -setup setup -mtime "$(git log -1 --format=%ct)" -o "dist/aerolvm-ops-${VERSION}.tar.gz"
+
       - name: Generate CycloneDX SBOM
         run: go run github.com/CycloneDX/cyclonedx-gomod/cmd/cyclonedx-gomod@v1.10.0 mod -json -output dist/sbom.cdx.json
 
@@ -441,7 +451,8 @@ jobs:
           cd dist
           for asset in *; do
             case "$asset" in
-              checksums.txt|sbom.cdx.json|*.intoto.jsonl) continue ;;
+              # The ops bundle's name already carries the tag.
+              checksums.txt|sbom.cdx.json|*.intoto.jsonl|aerolvm-ops-*) continue ;;
             esac
             cp "$asset" "${VERSION}_${asset}"
           done
