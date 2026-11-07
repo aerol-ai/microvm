@@ -47,7 +47,7 @@ The create answer carries a `Server-Timing` header that splits the server's time
 | Step | Docker, pool off | Docker, pool on | gVisor |
 |---|---|---|---|
 | Find the image | 21 ms | (pool) | 1 ms |
-| Network setup | 11 ms | (pool) | 0 ms |
+| Network setup | 11 ms | (pool) | not measured yet |
 | Create the container | 55 ms | (pool) | 36 ms |
 | Start the container | 71 ms | (pool) | 21 ms |
 | Take a warm sandbox from the pool | | 11 ms | |
@@ -55,6 +55,8 @@ The create answer carries a `Server-Timing` header that splits the server's time
 | Server total | 171 ms | 22 ms | 81 ms |
 
 The rest of the time a client sees is the network trip and TLS to the API.
+
+gVisor's network setup was not measured in this run. The server sent a fixed 0 for that step instead of timing it. Newer servers time it, and we will add the number after the next run.
 
 The commands, run on a server with `SB_API_URL` and `SB_PAT_TOKEN` set:
 
