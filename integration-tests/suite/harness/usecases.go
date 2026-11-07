@@ -265,6 +265,16 @@ const (
 	// under the suite's client; gates UC-362, which asserts the noisy tenant
 	// is told 429.
 	CapAPIListFairness Capability = "api-list-fairness"
+	// CapClusterChaos gates the cluster-correctness fault cases UC-470..479
+	// (plans/cluster-correctness-and-create-latency.md §3.2). The scenario is
+	// role-separated (three dedicated servers, at least two workers, one
+	// ingress) and on-demand, the suite can SSH to every node, and the
+	// operator accepts partitions, packet loss, runtime kills and Raft leader
+	// kills on it. Separate from CapCluster because a 3x mixed node is a
+	// voter, worker and ingress at once, so "partition the owner from the
+	// servers" cannot be expressed there; separate from the hetero scenarios
+	// because these cases cost an hour and are a release gate of their own.
+	CapClusterChaos Capability = "cluster-chaos"
 )
 
 // UseCase is one row of the coverage matrix.
@@ -316,7 +326,7 @@ var KnownCapabilities = map[Capability]bool{
 	CapL4ProxyProtocol: true, CapPATRotation: true,
 	CapKeyCustodyVault: true, CapKeyCustodyPKCS11: true, CapKeyCustodyKMSWrapped: true,
 	CapKeyCustodyKMSSwitch: true, CapKeyCustodySingleWrapped: true,
-	CapAPILoadBalancer: true, CapAPIListFairness: true,
+	CapAPILoadBalancer: true, CapAPIListFairness: true, CapClusterChaos: true,
 }
 
 // Registry is the full use-case catalogue. Order is the matrix row order.
@@ -1056,6 +1066,21 @@ var Registry = []UseCase{
 	{ID: "UC-458", Title: "DeepAgents backend (G2): a shell command runs in the root with its exit code, stderr apart, a capped and flagged stdout and a timeout; upload makes missing folders; the server answers a missing file 404, a folder download \"is a directory\" and an upload onto a folder 409 \"is a directory\" (the per-file error codes the backend maps); list and recursive delete work and a second delete is 404", Requires: []Capability{CapDocker}, Implemented: true},
 	{ID: "UC-459", Title: "Gymnasium environment (G4): a start snapshot built from a task folder (upload_dir) and a setup command boots two episodes that each see the task and setup files, where a check command's exit code tracks the agent's work, and the second episode does not see what the first one wrote", Requires: []Capability{CapDocker}, Implemented: true},
 	{ID: "UC-460", Title: "NeMo Gym through the Daytona facade (G5): a create with NeMo Gym's name, labels, env and auto-stop and auto-delete intervals reaches started; process/execute runs with the create env, the call's envs and cwd and returns the exit code; create answers 200 with kvm; bulk-download names file and error parts by the full requested path; delete makes the sandbox answer 404", Requires: []Capability{CapDocker}, Implemented: true},
+
+	// Cluster correctness under faults (plans/cluster-correctness-and-create-latency.md
+	// §3.2, z_cluster_chaos_test.go). Each case asserts invariants I1..I8 from
+	// §1 and records a verdict per invariant in the report; the plan item it
+	// guards is in the test's doc comment, so a red row maps to a fix.
+	{ID: "UC-470", Title: "Chaos (I1, I7; C4): an owner worker and the ingress are partitioned from the servers for 120 s; at no sample do two workers run the recreate-policy sandbox, and after the reassign the cut-off ingress answers 421 or 503, never the old copy; after the heal exactly one copy runs, on the owner", Requires: []Capability{CapCluster, CapClusterChaos}, Implemented: true},
+	{ID: "UC-471", Title: "Chaos (I3, I6; C2): a worker is partitioned, its sandbox is reassigned and then deleted, the worker heals and restarts; the sandbox stays absent from placements, the API and every node's runtime for two reconcile intervals", Requires: []Capability{CapCluster, CapClusterChaos}, Implemented: true},
+	{ID: "UC-472", Title: "Chaos (I3; C3): the owner is killed (sandboxd and the container runtime), the sandbox is deleted right after the reassign; it is never recreated, before or after the old owner returns", Requires: []Capability{CapCluster, CapClusterChaos}, Implemented: true},
+	{ID: "UC-473", Title: "Chaos (I4, I6, I8; C1, C5): the Raft leader is killed during N concurrent creates (default 200); every create ends fully created (placed and running on its owner) or fully absent, no name has two sandboxes, no reservation outlives its TTL, and no worker runs more than its budget", Requires: []Capability{CapCluster, CapClusterChaos}, Implemented: true},
+	{ID: "UC-474", Title: "Chaos (I8; C5): the Raft leader and a second server are stopped while creates are between reserve and promote; every create that failed leaves no sandbox, no placement and no container once the servers are back", Requires: []Capability{CapCluster, CapClusterChaos}, Implemented: true},
+	{ID: "UC-475", Title: "Chaos (I3; C2, C3): concurrent create, destroy, stop and start on the same names; no stop, start or get of a destroyed sandbox succeeds, a destroyed id is never handed back by a create or a name lookup and never runs again, and no name holds two live placements", Requires: []Capability{CapCluster, CapClusterChaos}, Implemented: true},
+	{ID: "UC-476", Title: "Chaos (I1, I4; C4, C6, C7): 5% packet loss and 200 ms delay between every pair of nodes during a create workload; no sandbox runs on two workers at any sample, no worker runs more than its budget, failed creates leave nothing", Requires: []Capability{CapCluster, CapClusterChaos}, Implemented: true},
+	{ID: "UC-477", Title: "Chaos (I6; C1): every server is restarted one at a time; after each restart a leader is back, every committed placement keeps its owner and incarnation, every sandbox still runs once on its owner, and the cluster takes a new create", Requires: []Capability{CapCluster, CapClusterChaos}, Implemented: true},
+	{ID: "UC-478", Title: "Chaos (I4, I6; C7): a worker holding many recreate-policy sandboxes is killed while the survivors have less room than it held; no worker ever runs more than its budget, and every sandbox placed on a survivor runs there within the failover bound", Requires: []Capability{CapCluster, CapClusterChaos}, Implemented: true},
+	{ID: "UC-479", Title: "Chaos (I1, I6; C2, C4): after a real owner kill (sandboxd and the container runtime) and failover, the old node returns and never runs a copy of the sandbox; exactly one copy runs, on the new owner", Requires: []Capability{CapCluster, CapClusterChaos}, Implemented: true},
 }
 
 // byID is a lookup built once for the report generator.

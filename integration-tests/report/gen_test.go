@@ -163,3 +163,91 @@ func TestSummarize(t *testing.T) {
 		t.Fatalf("summary = %+v", s)
 	}
 }
+
+func TestClassifyAttachesInvariantVerdicts(t *testing.T) {
+	// The chaos cases log one invariant marker per invariant from a cleanup,
+	// before their terminal event. The verdicts must land on the row (pass
+	// rows included: "held over 61 samples" is the evidence the fault was
+	// injected) and must not be mistaken for a fail reason.
+	events := []testEvent{
+		{Action: "output", Test: "TestClusterChaosPartition", Output: "    client.go:54: ucid=UC-11\n"},
+		{Action: "output", Test: "TestClusterChaosPartition", Output: "    z_cluster_chaos_test.go:99: I7 violated: cut-off ingress served the old copy\n"},
+		{Action: "output", Test: "TestClusterChaosPartition", Output: "    invariants.go:171: invariant=I1 held: max 1 running copy over 61 samples\n"},
+		{Action: "output", Test: "TestClusterChaosPartition", Output: "    invariants.go:171: invariant=I7 violated: cut-off ingress served the old copy\n"},
+		{Action: "fail", Test: "TestClusterChaosPartition"},
+		{Action: "output", Test: "TestClusterChaosRestart", Output: "    client.go:54: ucid=UC-10\n"},
+		{Action: "output", Test: "TestClusterChaosRestart", Output: "    invariants.go:171: invariant=I6 held: converged in 41s\n"},
+		{Action: "pass", Test: "TestClusterChaosRestart"},
+	}
+	got := classify(events, reg(), false)
+	by := map[string]Result{}
+	for _, r := range got {
+		by[r.ID] = r
+	}
+	fail := by["UC-11"]
+	if fail.Status != StatusFail || len(fail.Invariants) != 2 {
+		t.Fatalf("UC-11 = %+v, want fail with two invariant verdicts", fail)
+	}
+	if fail.Invariants[0] != (harness.InvariantResult{ID: "I1", Result: "held", Detail: "max 1 running copy over 61 samples"}) {
+		t.Errorf("UC-11 I1 = %+v", fail.Invariants[0])
+	}
+	if strings.Contains(fail.Reason, "invariant=") {
+		t.Errorf("an invariant marker leaked into the fail reason: %q", fail.Reason)
+	}
+	if !strings.Contains(fail.Reason, "served the old copy") {
+		t.Errorf("the t.Errorf line must still be the reason: %q", fail.Reason)
+	}
+	pass := by["UC-10"]
+	if pass.Status != StatusPass || len(pass.Invariants) != 1 || pass.Invariants[0].ID != "I6" {
+		t.Fatalf("UC-10 = %+v, want pass carrying I6", pass)
+	}
+	if cell := detailCell(pass); cell != "I6 held" {
+		t.Errorf("pass detail = %q, want the verdict summary", cell)
+	}
+	if cell := detailCell(fail); !strings.HasPrefix(cell, "I1 held · I7 violated — ") {
+		t.Errorf("fail detail = %q, want the verdicts before the reason", cell)
+	}
+	if md := renderMarkdown(Report{Scenario: "cluster-chaos", Results: got}); !strings.Contains(md, "| ✅ pass | I6 held |") {
+		t.Errorf("markdown does not show the pass row's verdict:\n%s", md)
+	}
+}
+
+func TestApplyFocusDowngradesOnlyUnfocusedMissingRows(t *testing.T) {
+	focusReg := []harness.UseCase{
+		{ID: "UC-10", Implemented: true},
+		{ID: "UC-470", Requires: []harness.Capability{harness.CapCluster, harness.CapClusterChaos}, Implemented: true},
+		{ID: "UC-471", Requires: []harness.Capability{harness.CapCluster, harness.CapClusterChaos}, Implemented: true},
+		{ID: "UC-24", Implemented: false},
+	}
+	events := []testEvent{
+		{Action: "output", Test: "TestClusterChaosA", Output: "    client.go:54: ucid=UC-470\n"},
+		{Action: "pass", Test: "TestClusterChaosA"},
+		// UC-471's test crashed before reporting: it must stay missing.
+	}
+	got := applyFocus(classify(events, focusReg, false), focusReg, harness.CapClusterChaos)
+	want := map[string]Status{"UC-10": StatusSkip, "UC-470": StatusPass, "UC-471": StatusMissing, "UC-24": StatusPending}
+	for _, r := range got {
+		if r.Status != want[r.ID] {
+			t.Errorf("%s = %s, want %s", r.ID, r.Status, want[r.ID])
+		}
+		if r.ID == "UC-10" && !strings.Contains(r.Reason, "focused scenario") {
+			t.Errorf("UC-10 reason = %q, want the focus explanation", r.Reason)
+		}
+	}
+	if s := summarize(got); s.Missing != 1 || s.Fail != 0 {
+		t.Errorf("summary = %+v: the gate must stay red for the focused case that never reported", s)
+	}
+}
+
+func TestValidateFocusRefusesACapabilityThatWouldSkipEverything(t *testing.T) {
+	if err := validateFocus(harness.CapClusterChaos, harness.Registry); err != nil {
+		t.Fatalf("cluster-chaos is a real focus: %v", err)
+	}
+	if err := validateFocus("clutser-chaos", harness.Registry); err == nil {
+		t.Error("a typo'd focus capability must be refused: it would turn every missing row, the focused ones included, into a skip")
+	}
+	unused := []harness.UseCase{{ID: "UC-10", Requires: []harness.Capability{harness.CapDocker}, Implemented: true}}
+	if err := validateFocus(harness.CapClusterChaos, unused); err == nil {
+		t.Error("a focus no use case requires must be refused")
+	}
+}

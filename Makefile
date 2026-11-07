@@ -24,7 +24,8 @@ BIN_DIR ?= bin
 	integration-key-custody-vault integration-key-custody-pkcs11 integration-key-custody-kms \
 	integration-key-custody-kms-switch integration-key-custody-single \
 	integration-routing integration-routing-hetero-lite \
-	integration-bench-cluster integration-identity-gate integration-identity-only
+	integration-bench-cluster integration-identity-gate integration-identity-only \
+	integration-cluster-chaos
 
 fmt:
 	$(GO) fmt ./...
@@ -406,6 +407,19 @@ integration-cluster-hetero:
 # runtime but Firecracker, ~8 x t3.medium on-demand.
 integration-cluster-hetero-lite:
 	integration-tests/run.sh cluster-hetero-lite $(RUN_FLAGS)
+
+# Cluster correctness under faults (UC-470..UC-479,
+# plans/cluster-correctness-and-create-latency.md §3.2): partitions, packet
+# loss, owner and runtime kills, Raft leader kills. 3 server / 3 worker /
+# 1 ingress, 7 x t3.medium on-demand (~$0.29/h; a run is ~1.5-2 h, ~$0.45-0.65).
+# A FOCUSED scenario: only the chaos cases run (the focus block in
+# scenarios/cluster-chaos.caps.yml) and the report marks every other use case
+# skip. Several cases fail on main until the plan's C2-C7 fixes land; each
+# test's doc comment names the fix it guards. Re-run one case on a kept stack:
+#   make integration-cluster-chaos keep
+#   AEROL_TEST_RUN='^TestClusterChaosOldCopyDiesAfterReturn$$' make integration-cluster-chaos keep no-build
+integration-cluster-chaos:
+	integration-tests/run.sh cluster-chaos $(RUN_FLAGS)
 
 # Same as integration-cluster-hetero but skips node-kill / failover fault injection.
 integration-cluster-hetero-safe:
