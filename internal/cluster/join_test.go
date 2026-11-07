@@ -690,15 +690,47 @@ func TestJoinRateLimiter(t *testing.T) {
 	if !l.allow(a) {
 		t.Fatal("bucket did not refill")
 	}
-	// The map is bounded: past the cap new addresses fail closed until idle
-	// entries are swept.
+	// The map is bounded, and past the cap the source seen longest ago is
+	// forgotten instead of the new one being refused (J13): an attacker
+	// with many addresses cannot lock real joiners out.
 	l.max = 2
-	if l.allow(netip.MustParseAddr("10.0.0.3")) {
-		t.Fatal("a new address past the cap allowed")
-	}
-	now = now.Add(joinRateIdle)
 	if !l.allow(netip.MustParseAddr("10.0.0.3")) {
-		t.Fatal("idle entries never swept")
+		t.Fatal("a new address past the cap refused")
+	}
+	if len(l.sources) != 2 || l.sources[b] != nil {
+		t.Fatalf("the oldest source (b) was not the one forgotten: %d sources", len(l.sources))
+	}
+	for i := 0; i < 50; i++ {
+		l.allow(netip.MustParseAddr(fmt.Sprintf("192.0.2.%d", i)))
+	}
+	if len(l.sources) != 2 || l.byAge.Len() != 2 {
+		t.Fatalf("limiter grew past its cap: %d", len(l.sources))
+	}
+	// Idle sources go on the next call.
+	now = now.Add(joinRateIdle)
+	if !l.allow(netip.MustParseAddr("10.0.0.9")) || len(l.sources) != 1 {
+		t.Fatalf("idle entries never dropped: %d sources", len(l.sources))
+	}
+	l.max = joinRateMaxSources
+
+	// IPv6 shares one bucket per /64: a host cycling through its /64 is
+	// still one source. Another /64 is another source; an IPv4-mapped
+	// address is its IPv4 address.
+	v6a, v6b := netip.MustParseAddr("2001:db8:1:2::1"), netip.MustParseAddr("2001:db8:1:2:ffff::9")
+	for i := 0; i < joinRateBurst; i++ {
+		l.allow(v6a)
+	}
+	if l.allow(v6b) {
+		t.Fatal("another address in the same /64 got its own bucket")
+	}
+	if !l.allow(netip.MustParseAddr("2001:db8:1:3::1")) {
+		t.Fatal("another /64 shares the bucket")
+	}
+	if got := joinRateKey(netip.MustParseAddr("::ffff:10.0.0.7")); got != netip.MustParseAddr("10.0.0.7") {
+		t.Fatalf("mapped address key = %v", got)
+	}
+	if got := joinRateKey(v6b); got != netip.MustParseAddr("2001:db8:1:2::") {
+		t.Fatalf("v6 key = %v", got)
 	}
 	// The server answers 429 past the limit and counts it.
 	s := &joinServer{svc: &Cluster{fsm: newPlacementFSM()}, limiter: newJoinRateLimiter()}

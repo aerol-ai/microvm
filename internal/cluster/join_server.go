@@ -1,6 +1,7 @@
 package cluster
 
 import (
+	"container/list"
 	"context"
 	"crypto/tls"
 	"encoding/json"
@@ -43,10 +44,15 @@ const (
 	// fits a scale-out step; a token sprayer still gets ~1 guess a second.
 	joinRatePerSecond = 1
 	joinRateBurst     = 20
-	// joinRateMaxSources bounds the limiter map; past it (after a sweep of
-	// idle entries) a new address is refused, which fails closed.
+	// joinRateMaxSources bounds the limiter's memory. Past it the source
+	// seen longest ago is forgotten (it gets a fresh bucket if it comes
+	// back) instead of refusing the new one: refusing let anyone holding
+	// many addresses lock every real joiner out (J13).
 	joinRateMaxSources = 10_000
 	joinRateIdle       = 10 * time.Minute
+	// joinRateIPv6Prefix groups IPv6 sources: one host or site is handed
+	// at least a /64, so a bucket per address would give it 2^64 buckets.
+	joinRateIPv6Prefix = 64
 	// joinMaxBody caps a join body: a CSR and a token are a few KiB.
 	joinMaxBody = 64 << 10
 	// joinRequestTimeout bounds one join, dial-back and Raft write included.
@@ -317,53 +323,72 @@ func writeJoinJSON(w http.ResponseWriter, status int, body any) {
 	_ = json.NewEncoder(w).Encode(body)
 }
 
-// joinRateLimiter is a token bucket per source address.
+// joinRateLimiter is a token bucket per source: an IPv4 address, or an
+// IPv6 /64. Sources sit in a list from most to least recently seen, so
+// both forgetting the oldest at the cap and dropping idle ones cost no
+// scan of the whole map.
 type joinRateLimiter struct {
-	mu        sync.Mutex
-	sources   map[netip.Addr]*joinRateEntry
-	lastSweep time.Time
-	now       func() time.Time
-	limit     rate.Limit
-	burst     int
-	max       int
+	mu      sync.Mutex
+	sources map[netip.Addr]*list.Element // of *joinRateEntry
+	byAge   *list.List                   // front: seen most recently
+	now     func() time.Time
+	limit   rate.Limit
+	burst   int
+	max     int
 }
 
 type joinRateEntry struct {
+	key  netip.Addr
 	lim  *rate.Limiter
 	seen time.Time
 }
 
 func newJoinRateLimiter() *joinRateLimiter {
 	return &joinRateLimiter{
-		sources: map[netip.Addr]*joinRateEntry{}, now: time.Now,
+		sources: map[netip.Addr]*list.Element{}, byAge: list.New(), now: time.Now,
 		limit: rate.Limit(joinRatePerSecond), burst: joinRateBurst, max: joinRateMaxSources,
 	}
+}
+
+// joinRateKey is the bucket a source address shares.
+func joinRateKey(src netip.Addr) netip.Addr {
+	src = src.Unmap()
+	if src.Is4() {
+		return src
+	}
+	return netip.PrefixFrom(src, joinRateIPv6Prefix).Masked().Addr()
 }
 
 func (l *joinRateLimiter) allow(src netip.Addr) bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	now := l.now()
-	e, ok := l.sources[src]
-	if !ok {
-		if len(l.sources) >= l.max || now.Sub(l.lastSweep) >= joinRateIdle {
-			l.sweep(now)
+	key := joinRateKey(src)
+	l.dropIdle(now)
+	var e *joinRateEntry
+	if el, ok := l.sources[key]; ok {
+		e = el.Value.(*joinRateEntry)
+		l.byAge.MoveToFront(el)
+	} else {
+		for l.byAge.Len() >= max(l.max, 1) {
+			l.forget(l.byAge.Back())
 		}
-		if len(l.sources) >= l.max {
-			return false
-		}
-		e = &joinRateEntry{lim: rate.NewLimiter(l.limit, l.burst)}
-		l.sources[src] = e
+		e = &joinRateEntry{key: key, lim: rate.NewLimiter(l.limit, l.burst)}
+		l.sources[key] = l.byAge.PushFront(e)
 	}
 	e.seen = now
 	return e.lim.AllowN(now, 1)
 }
 
-func (l *joinRateLimiter) sweep(now time.Time) {
-	l.lastSweep = now
-	for k, e := range l.sources {
-		if now.Sub(e.seen) >= joinRateIdle {
-			delete(l.sources, k)
-		}
+// dropIdle forgets sources not seen for joinRateIdle: by then their
+// bucket has refilled anyway.
+func (l *joinRateLimiter) dropIdle(now time.Time) {
+	for el := l.byAge.Back(); el != nil && now.Sub(el.Value.(*joinRateEntry).seen) >= joinRateIdle; el = l.byAge.Back() {
+		l.forget(el)
 	}
+}
+
+func (l *joinRateLimiter) forget(el *list.Element) {
+	delete(l.sources, el.Value.(*joinRateEntry).key)
+	l.byAge.Remove(el)
 }
