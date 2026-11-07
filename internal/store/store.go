@@ -1306,6 +1306,10 @@ func open(path string, secretCipher *secrets.Cipher) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("create sandboxes module_digest index: %w", err)
 	}
+	if _, err := db.Exec(sandboxNameLookupIndexDDL); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("create sandboxes name lookup index: %w", err)
+	}
 	if err := migrateLegacyPlaintextSecrets(db, secretCipher); err != nil {
 		db.Close()
 		return nil, err
@@ -1604,6 +1608,26 @@ func migratePendingImageGCKey(db *sql.DB) error {
 // themselves.
 // Daytona, the v1 ?name= lookup and the aerolvm CLI resolve names through it.
 const sandboxNameIndexDDL = `CREATE UNIQUE INDEX IF NOT EXISTS idx_sandboxes_name ON sandboxes(owner_ref, name) WHERE name <> '';`
+
+// sandboxNameLookupIndexDDL serves the create-time check that a new id is not
+// another sandbox's name (sandboxIDTakenAsNameSQL). idx_sandboxes_name leads
+// with owner_ref and cannot answer a name-only lookup, so without this index
+// every create scanned the whole table: create p50 grew by about 0.1 ms per
+// 1,000 rows (3.4 ms at 30,000; BenchmarkStoreCreate). Not unique: owners
+// may share a name. Building it on an existing database is a one-time cost
+// at the first start after upgrade.
+const sandboxNameLookupIndexDDL = `CREATE INDEX IF NOT EXISTS idx_sandboxes_name_lookup ON sandboxes(name) WHERE name <> '';`
+
+// sandboxIDTakenAsNameSQL finds another sandbox whose name equals a new id.
+// It repeats the partial index's condition (the name is not empty) so SQLite
+// may use the index: a bound parameter alone does not prove it. The caller
+// only runs it for a non-empty id, so the extra condition never changes the
+// answer.
+const sandboxIDTakenAsNameSQL = `
+	SELECT id FROM sandboxes
+	WHERE name = ? AND name <> '' AND id <> ?
+	LIMIT 1
+`
 
 // backfillSnapshotOwners stamps pre-migration snapshot rows with the owner of
 // their source sandbox while that sandbox still exists. A row whose source is
@@ -3796,11 +3820,7 @@ func ensureSandboxLookupNameAvailable(ctx context.Context, q queryRower, id, nam
 	}
 	if id != "" {
 		var existingID string
-		err := q.QueryRowContext(ctx, `
-			SELECT id FROM sandboxes
-			WHERE name = ? AND id <> ?
-			LIMIT 1
-		`, id, id).Scan(&existingID)
+		err := q.QueryRowContext(ctx, sandboxIDTakenAsNameSQL, id, id).Scan(&existingID)
 		if err == nil {
 			return ErrSandboxNameConflict
 		}

@@ -3066,3 +3066,31 @@ func TestClaimPathsReadOnWriter(t *testing.T) {
 		}
 	}
 }
+
+// The create-time check that a new id is not another sandbox's name must seek
+// an index, not scan every sandbox: the scan made each create cost about
+// 0.1 ms more per 1,000 rows on the node.
+func TestSandboxIDAsNameCheckSeeksAnIndex(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	for i := 0; i < 50; i++ {
+		sb := sampleSandbox(fmt.Sprintf("sb-plan-%02d", i))
+		sb.Name = fmt.Sprintf("name-%02d", i)
+		if err := st.Create(ctx, sb); err != nil {
+			t.Fatalf("Create: %v", err)
+		}
+	}
+	plan := queryPlan(t, st, sandboxIDTakenAsNameSQL, []any{"sb-new", "sb-new"})
+	if !strings.Contains(plan, "idx_sandboxes_name_lookup") || strings.Contains(plan, "SCAN sandboxes") {
+		t.Fatalf("plan = %q, want a search on idx_sandboxes_name_lookup", plan)
+	}
+
+	// The answers are unchanged: an id that is another sandbox's name is
+	// refused, and a fresh id is not.
+	if err := st.Create(ctx, sampleSandbox("name-07")); !errors.Is(err, ErrSandboxNameConflict) {
+		t.Fatalf("Create(id = existing name) = %v, want ErrSandboxNameConflict", err)
+	}
+	if err := st.Create(ctx, sampleSandbox("sb-plan-fresh")); err != nil {
+		t.Fatalf("Create(fresh id) = %v", err)
+	}
+}
