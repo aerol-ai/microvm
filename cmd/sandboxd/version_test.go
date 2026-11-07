@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"reflect"
 	"runtime"
 	"runtime/debug"
 	"strconv"
@@ -14,6 +15,7 @@ import (
 	"testing"
 
 	"github.com/aerol-ai/microvm/internal/cluster"
+	"github.com/aerol-ai/microvm/internal/egress"
 	"github.com/aerol-ai/microvm/internal/version"
 	"github.com/aerol-ai/microvm/pkg/daemon"
 )
@@ -114,8 +116,9 @@ func TestRunVersionCLIJSON(t *testing.T) {
 			t.Fatalf("%v: not JSON: %v\n%s", args, err, out.String())
 		}
 		want := buildInfo{Version: version.Version, Commit: "deadbeef", FSMOpsVersion: cluster.FSMOpsVersion(),
+			EgressGatewayProtocol: egress.ProtocolVersion, Commands: []string{"upgrade-node", "host-apply"},
 			GoVersion: runtime.Version(), Platform: runtime.GOOS + "/" + runtime.GOARCH}
-		if got != want {
+		if !reflect.DeepEqual(got, want) {
 			t.Fatalf("%v: got %+v, want %+v", args, got, want)
 		}
 	}

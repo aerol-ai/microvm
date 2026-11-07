@@ -637,12 +637,15 @@ func (u *Upgrader) planServices(ctx context.Context, st *State, meta *release.Me
 type progress struct {
 	stopped bool // sandboxd was stopped
 	started bool // the new sandboxd was started
+	// healthTimeout bounds the wait for the old sandboxd after a revert,
+	// as it bounds the wait for the new one.
+	healthTimeout time.Duration
 }
 
 // apply is everything from stopping sandboxd on (§6.3 steps 4-8). Any
 // failure goes to revert.
 func (u *Upgrader) apply(ctx context.Context, st *State, stageDir string, req Request) (*State, error) {
-	var p progress
+	p := progress{healthTimeout: req.HealthTimeout}
 	marker := StoreOpenedMarkerPath(u.Paths.DBPath)
 	if st.WasActive {
 		st.Phase = PhaseStopping
@@ -863,7 +866,7 @@ func (u *Upgrader) revert(st *State, cause error, p progress) (*State, error) {
 	if p.stopped {
 		if err := u.Host.RestartUnit(ctx, sandboxdUnit); err != nil {
 			problems = append(problems, err)
-		} else if err := u.waitHealthy(ctx, st.FromVersion, DefaultHealthTimeout); err != nil {
+		} else if err := u.waitHealthy(ctx, st.FromVersion, p.healthTimeout); err != nil {
 			problems = append(problems, fmt.Errorf("after putting the previous files back: %w", err))
 		}
 	}

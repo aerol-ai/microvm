@@ -10,6 +10,7 @@ import (
 	"runtime/debug"
 
 	"github.com/aerol-ai/microvm/internal/cluster"
+	"github.com/aerol-ai/microvm/internal/egress"
 	"github.com/aerol-ai/microvm/internal/version"
 )
 
@@ -34,25 +35,34 @@ func isVersionArg(arg string) bool {
 // buildInfo is what `sandboxd version -o json` prints. fsm_ops_version is
 // the cluster op set this build applies: two builds with the same release
 // tag but different values cannot both lead a rolling upgrade safely, so it
-// is printed beside the tag.
+// is printed beside the tag. egress_gateway_protocol is the protocol an
+// egress gateway started from this binary speaks, and commands lists the
+// node commands a caller may run on it ("upgrade-node", eng D7).
 type buildInfo struct {
-	Version       string `json:"version"`
-	Commit        string `json:"commit,omitempty"`
-	FSMOpsVersion int    `json:"fsm_ops_version"`
-	GoVersion     string `json:"go_version"`
-	Platform      string `json:"platform"`
+	Version               string   `json:"version"`
+	Commit                string   `json:"commit,omitempty"`
+	FSMOpsVersion         int      `json:"fsm_ops_version"`
+	EgressGatewayProtocol int      `json:"egress_gateway_protocol"`
+	Commands              []string `json:"commands"`
+	GoVersion             string   `json:"go_version"`
+	Platform              string   `json:"platform"`
 }
+
+// nodeCommands are the commands buildInfo.Commands lists.
+var nodeCommands = []string{"upgrade-node", "host-apply"}
 
 // readBuildInfo is debug.ReadBuildInfo; tests replace it.
 var readBuildInfo = debug.ReadBuildInfo
 
 func currentBuildInfo() buildInfo {
 	return buildInfo{
-		Version:       version.Version,
-		Commit:        buildCommit(),
-		FSMOpsVersion: cluster.FSMOpsVersion(),
-		GoVersion:     runtime.Version(),
-		Platform:      runtime.GOOS + "/" + runtime.GOARCH,
+		Version:               version.Version,
+		Commit:                buildCommit(),
+		FSMOpsVersion:         cluster.FSMOpsVersion(),
+		EgressGatewayProtocol: egress.ProtocolVersion,
+		Commands:              nodeCommands,
+		GoVersion:             runtime.Version(),
+		Platform:              runtime.GOOS + "/" + runtime.GOARCH,
 	}
 }
 
@@ -117,6 +127,7 @@ func runVersionCLI(args []string, out io.Writer) error {
 			fmt.Fprintf(out, "commit:          %s\n", info.Commit)
 		}
 		fmt.Fprintf(out, "fsm ops version: %d\n", info.FSMOpsVersion)
+		fmt.Fprintf(out, "egress protocol: %d\n", info.EgressGatewayProtocol)
 		fmt.Fprintf(out, "go:              %s\n", info.GoVersion)
 		fmt.Fprintf(out, "platform:        %s\n", info.Platform)
 		return nil

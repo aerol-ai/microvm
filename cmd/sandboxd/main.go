@@ -48,6 +48,22 @@ func main() {
 		return
 	}
 
+	// Node upgrader and host setup (plans/kubectl-style-cluster-ops.md
+	// §6.3, §7). Like version, they never fall through to run(): each
+	// stops, swaps or reconfigures the daemon from outside it.
+	if len(os.Args) >= 2 && os.Args[1] == upgradeSubcommand {
+		if code := runUpgradeCLI(os.Args[2:], os.Stdout, os.Stderr); code != 0 {
+			osExit(code)
+		}
+		return
+	}
+	if len(os.Args) >= 2 && os.Args[1] == hostSubcommand {
+		if code := runHostCLI(os.Args[2:], os.Stdout, os.Stderr); code != 0 {
+			osExit(code)
+		}
+		return
+	}
+
 	if len(os.Args) >= 2 && os.Args[1] == "--wasm-worker" {
 		if err := runWasmWorkerCLI(os.Args[2:]); err != nil {
 			os.Stderr.WriteString(err.Error() + "\n")
