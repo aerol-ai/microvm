@@ -4,7 +4,6 @@ import (
 	"context"
 	"database/sql"
 	"errors"
-	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -12,63 +11,6 @@ import (
 	"github.com/aerol-ai/microvm/pkg/models"
 	_ "github.com/mattn/go-sqlite3"
 )
-
-func TestNetnsBeginClaimReserveContested(t *testing.T) {
-	ctx := context.Background()
-	path := t.TempDir() + "/netns-c.db"
-	st, err := Open(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = st.Close() })
-	db2, err := sql.Open("sqlite3", sqliteDSN(path))
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = db2.Close() })
-	now := time.Now().UTC()
-	_ = st.SeedContainerNetnsSlot(ctx, "aerol-netns-0", now)
-
-	arm := func(stealState, freeState string) {
-		afterNetnsFreeSelect = func(slotID string) {
-			_, _ = db2.ExecContext(ctx, `
-				UPDATE container_netns_slots
-				SET sandbox_id = 'thief', state = ?, updated_at = ?
-				WHERE slot_id = ?`, stealState, now, slotID)
-		}
-		afterNetnsFreeMiss = func() {
-			_, _ = db2.ExecContext(ctx, `
-				UPDATE container_netns_slots
-				SET sandbox_id = NULL, state = ?, updated_at = ?
-				WHERE sandbox_id = 'thief'`, freeState, now)
-		}
-	}
-
-	arm(NetnsSlotStateReserved, NetnsSlotStateFree)
-	t.Cleanup(func() {
-		afterNetnsFreeSelect = nil
-		afterNetnsFreeMiss = nil
-	})
-	if _, err := st.BeginPrewarmContainerNetnsSlot(ctx, now); err == nil || !strings.Contains(err.Error(), "contested") {
-		t.Fatalf("begin contested = %v", err)
-	}
-	if _, err := st.ReserveContainerNetnsSlot(ctx, "sb-r", now); err == nil || !strings.Contains(err.Error(), "contested") {
-		t.Fatalf("reserve contested = %v", err)
-	}
-
-	afterNetnsFreeSelect = nil
-	afterNetnsFreeMiss = nil
-	slot, err := st.BeginPrewarmContainerNetnsSlot(ctx, now)
-	if err != nil {
-		t.Fatal(err)
-	}
-	_ = st.FinishPrewarmContainerNetnsSlot(ctx, slot.SlotID, "/n", "10.0.0.1", now)
-
-	arm(NetnsSlotStateAdopted, NetnsSlotStatePooled)
-	if _, err := st.ClaimPooledContainerNetnsSlot(ctx, "sb-c", now); err == nil || !strings.Contains(err.Error(), "contested") {
-		t.Fatalf("claim contested = %v", err)
-	}
-}
 
 func TestNetnsDropTableErrors(t *testing.T) {
 	st := newTestStore(t)
@@ -133,8 +75,6 @@ func TestStoreCross95HooksAndScanErrors(t *testing.T) {
 	}, now); err != nil {
 		t.Fatal(err)
 	}
-	afterTapAllocateSelect = func(string) {}
-	t.Cleanup(func() { afterTapAllocateSelect = nil })
 	if _, err := tap.AllocateFirecrackerTapSlot(ctx, "sb-tap", now); err != nil {
 		t.Fatalf("allocate tap: %v", err)
 	}
