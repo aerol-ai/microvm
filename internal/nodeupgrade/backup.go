@@ -22,6 +22,13 @@ const backupSuffix = ".state.db"
 // large, so older ones go.
 const keepBackups = 2
 
+// VacuumInto is sqliteBackup for the node's other database tools (`sandboxd
+// backup`, internal/nodeops), so every copy of state.db is taken the same
+// way. dest is replaced if it exists and ends up 0600.
+func VacuumInto(ctx context.Context, dbPath, dest string) error {
+	return sqliteBackup(ctx, dbPath, dest)
+}
+
 // sqliteBackup copies the database to dest with VACUUM INTO: a consistent
 // snapshot that folds in the WAL. sandboxd is stopped when it runs, so the
 // one-writer rule of the store holds (internal/store: MaxOpenConns=1).

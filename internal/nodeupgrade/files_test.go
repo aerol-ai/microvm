@@ -14,6 +14,37 @@ import (
 
 func removeFile(path string) error { return os.Remove(path) }
 
+// The node's other tools (internal/nodeops) take state.db copies and read
+// env files through these, so they must be the upgrader's own.
+func TestExportedHelpersAreTheUpgradersOwn(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "state.db")
+	db, err := sql.Open("sqlite3", dbPath+"?_journal_mode=WAL")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec("CREATE TABLE t (v TEXT); INSERT INTO t VALUES ('a')"); err != nil {
+		t.Fatal(err)
+	}
+	_ = db.Close()
+	dest := filepath.Join(dir, "copy.db")
+	if err := VacuumInto(context.Background(), dbPath, dest); err != nil {
+		t.Fatal(err)
+	}
+	if st, err := os.Stat(dest); err != nil || st.Mode().Perm() != 0o600 {
+		t.Fatalf("copy: %v %v", st, err)
+	}
+	env := filepath.Join(dir, "sandboxd.env")
+	writeFile(t, env, []byte("# c\nSB_A = 'x'\nSB_A=y\n"))
+	got, err := ReadEnvFile(env)
+	if err != nil || got["SB_A"] != "y" {
+		t.Fatalf("ReadEnvFile = %v %v", got, err)
+	}
+	if _, err := ReadEnvFile(filepath.Join(dir, "none")); !os.IsNotExist(err) {
+		t.Fatalf("missing env file: %v", err)
+	}
+}
+
 func TestSwapInKeepsThePreviousFileAndPutBackChecksIt(t *testing.T) {
 	dir := t.TempDir()
 	dst := filepath.Join(dir, "sandboxd")

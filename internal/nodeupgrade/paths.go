@@ -159,6 +159,10 @@ func ResolvePaths(envFile string, getenv func(string) string, lookCaddy func() (
 	return p, nil
 }
 
+// ReadEnvFile is readEnvFile for the node's other tools, so they read the
+// env files exactly as the upgrader (and systemd) does.
+func ReadEnvFile(path string) (map[string]string, error) { return readEnvFile(path) }
+
 // readEnvFile parses a systemd EnvironmentFile: KEY=VALUE lines, # and ;
 // comments, optional quotes; a later line overrides an earlier one.
 func readEnvFile(path string) (map[string]string, error) {
