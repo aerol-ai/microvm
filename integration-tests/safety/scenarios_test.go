@@ -297,7 +297,14 @@ func TestClusterScenariosDeclareExpectedMembers(t *testing.T) {
 			t.Errorf("%s has no nodes map", filepath.Base(tfvars))
 			continue
 		}
-		nodes := len(nodeRe.FindAllString(body[start:], -1))
+		// A blank node (nodes[].blank) is plain Ubuntu, never a member until
+		// a case joins it, so it is not counted.
+		nodes := 0
+		for _, line := range strings.Split(body[start:], "\n") {
+			if nodeRe.MatchString(line) && !regexp.MustCompile(`\bblank\s*=\s*true\b`).MatchString(line) {
+				nodes++
+			}
+		}
 		if got := m[1]; got != itoa(nodes) {
 			t.Errorf("%s: expected_members = %s but the node map has %d entries", base, got, nodes)
 		}

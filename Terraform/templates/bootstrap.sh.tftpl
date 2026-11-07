@@ -55,6 +55,12 @@ set -euxo pipefail
 exec > >(tee -a /var/log/aerolvm-bootstrap.log) 2>&1
 
 echo "[bootstrap] node=${node_name} role=${role} seed=${is_seed}"
+%{ if blank ~}
+# A blank node (Terraform nodes[].blank): plain Ubuntu with nothing
+# installed, so a test can join it later with the one-line installer.
+echo "[bootstrap] blank node: nothing installed"
+exit 0
+%{ endif ~}
 
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -y

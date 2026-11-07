@@ -170,6 +170,7 @@ locals {
     containerd_cfg = { socket = "x", namespace = "x", cni_plugin_dir = "x", native_netns_pool_enabled = "x" }
     containerd_pool_cfg = { enabled = "false", depth = "x", images = "x", max_images = "x", idle_ttl = "x", refill_interval = "x" }
     one_line_join = false
+    blank = false
     join_token = ""
     join_token_worker = ""
     join_token_ingress = ""
@@ -345,6 +346,10 @@ output "seed_join" {
     join_token_server  = "cccccc.00000000000000000000000000000000"
     sandboxd_env       = { SB_CLUSTER_NODE_CERT_TTL = "10m" }
   }))
+}
+
+output "joiner_blank" {
+  value = templatefile("__TEMPLATE__", merge(local.base, { is_seed = false, blank = true }))
 }
 
 output "joiner_join" {

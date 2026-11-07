@@ -81,7 +81,7 @@ func TestBootstrapTemplateRenders(t *testing.T) {
 	for _, branch := range []string{
 		"seed", "joiner", "joiner_kms", "joiner_audit_s3", "joiner_audit_file",
 		"seed_receiver", "joiner_receiver", "seed_public_ca", "seed_wrapped",
-		"joiner_api_lb", "joiner_api_lb_worker", "joiner_routing_on", "joiner_routing_off", "joiner_containerd_pool", "seed_join", "joiner_join",
+		"joiner_api_lb", "joiner_api_lb_worker", "joiner_routing_on", "joiner_routing_off", "joiner_containerd_pool", "seed_join", "joiner_join", "joiner_blank",
 		"joiner_download_mirror",
 	} {
 		t.Run(branch, func(t *testing.T) {
@@ -187,6 +187,13 @@ func TestBootstrapTemplateRenders(t *testing.T) {
 			for _, want := range joinMode[branch] {
 				if !strings.Contains(out, want) {
 					t.Errorf("rendered %s bootstrap is missing %q", branch, want)
+				}
+			}
+			// A blank node stops before installing anything.
+			if branch == "joiner_blank" {
+				blank, _, _ := strings.Cut(out, "exit 0")
+				if !strings.Contains(blank, "blank node: nothing installed") || strings.Contains(blank, "/tmp/install.sh") || strings.Contains(blank, "apt-get") {
+					t.Errorf("blank bootstrap does not stop before the install:\n%s", blank)
 				}
 			}
 			if _, ok := joinMode[branch]; ok {

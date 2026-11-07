@@ -107,6 +107,7 @@ locals {
       sandboxd_env          = n.sandboxd_env
       tags                  = n.tags
       spot                  = n.spot
+      blank                 = n.blank
     }
   }
 

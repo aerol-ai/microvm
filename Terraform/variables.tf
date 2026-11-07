@@ -292,6 +292,9 @@ variable "nodes" {
       extra_user_data  (string,  default ""; appended to bootstrap.sh)
       sandboxd_env     (map(string), default {}; merged over var.extra_sandboxd_env)
       tags             (map(string), default {})
+      blank            (bool,    default false; plain Ubuntu, nothing installed,
+                        for a test to join by hand. Not a member, so it
+                        gets no DNS record and is not counted.)
   EOT
   type = map(object({
     role                  = optional(string, "mixed")
@@ -316,6 +319,7 @@ variable "nodes" {
     # SB_* profiles (audit rate limits, jail settings) from one node map.
     sandboxd_env = optional(map(string), {})
     tags         = optional(map(string), {})
+    blank        = optional(bool, false)
     # spot requests this node as an EC2 spot instance (one-time, terminate on
     # reclaim). Default false → on-demand, identical to prior behaviour. Only
     # the integration test harness sets this true; prod node maps omit it.

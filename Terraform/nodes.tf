@@ -68,6 +68,7 @@ resource "aws_instance" "seed" {
   # then applies to the (far smaller) compressed payload.
   user_data_base64 = base64gzip(templatefile("${path.module}/templates/bootstrap.sh.tftpl", {
     node_name                                = "${var.cluster_name}-${local.seed_node.name}"
+    blank                                    = false
     role                                     = local.seed_node.role
     is_seed                                  = true
     domain                                   = local.domain_name
@@ -254,6 +255,11 @@ resource "aws_instance" "seed" {
     # Terraform/validate/ingress.go.
     # Wrapped custody needs a key store to wrap with; the only one this
     # module provisions is the AWS KMS key behind secret_kms_enabled.
+    precondition {
+      condition     = !local.seed_node.blank
+      error_message = "The seed can't be blank: it starts the cluster."
+    }
+
     # One-line joins need a domain install: the installer's --local mode
     # never joins a cluster.
     precondition {
@@ -324,6 +330,7 @@ resource "aws_instance" "joiner" {
   # user_data limit; cloud-init decompresses gzipped user-data transparently.
   user_data_base64 = base64gzip(templatefile("${path.module}/templates/bootstrap.sh.tftpl", {
     node_name                                = "${var.cluster_name}-${each.value.name}"
+    blank                                    = each.value.blank
     role                                     = each.value.role
     is_seed                                  = false
     domain                                   = local.domain_name
