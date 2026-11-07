@@ -639,6 +639,37 @@ Every entry was re-verified against `main` at `704c9e74` on 2026-10-06.
 
 ---
 
+## `aerolvm apply -f` and a manifest shared with the Kubernetes operator (CLI)
+
+- **What:** `aerolvm apply -f sandbox.yaml`, and an `-o yaml` object shape
+  (`apiVersion`, `kind`, `metadata`, `spec`, `status`) that is the same as the
+  Kubernetes operator's CRDs, so one YAML file works with `aerolvm apply` and
+  `kubectl apply`.
+- **Why deferred:** CEO review of `plans/kubectl-style-cluster-ops.md`
+  (D3, 2026-11-07). The format must match the CRD shape the Kubernetes v2
+  plan picks (its Q1: implement `kubernetes-sigs/agent-sandbox` or own CRDs),
+  and that is still open on PR #522. Picking a format first risks a rename
+  that breaks saved files.
+- **Start when:** the Kubernetes v2 plan answers its Q1.
+- **Where to start:** `plans/kubectl-style-cluster-ops.md` D12 and §3.3;
+  `cmd/aerolvm/verbs.go` (today's `get` and `create`).
+
+## External-CA mode for cluster joins (security, cluster PKI)
+
+- **What:** `sandboxd init --external-ca` keeps the cluster CA key out of
+  the cluster. A join then waits as a pending CSR until
+  `aerolvm certificate approve <id>` or an outside signer signs it.
+  `aerolvm get csr` lists pending CSRs.
+- **Why deferred:** CEO review of `plans/kubectl-style-cluster-ops.md`
+  (D4, 2026-11-07). The default path (CA key on server nodes, like kubeadm)
+  already makes joining one line, and this mode can be added later without
+  changing it. It would add a pending-CSR record in Raft and a second
+  signing path to the riskiest phase.
+- **Start when:** a customer needs the CA key outside the cluster (the
+  Kubernetes v2 plan's D11 asks the same for Kubernetes installs).
+- **Where to start:** `plans/kubectl-style-cluster-ops.md` D5, §4 and §8;
+  `internal/cluster/tls.go` (cert checks and reload).
+
 ## Done
 
 Kept for the record. Each entry names the fix and where it lives.
