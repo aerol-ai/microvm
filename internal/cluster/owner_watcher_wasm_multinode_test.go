@@ -58,6 +58,9 @@ func TestWasmDurableFailoverMultiNodeClusterSoak(t *testing.T) {
 		}
 	}
 
+	// The follower is still running; eviction runs only for a node gossip
+	// reports dead, so the leader's view is made to say so.
+	markGossipDead(t, leader, "fol-wasm-soak")
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	leader.evictDeadOwner(ctx, "fol-wasm-soak")
