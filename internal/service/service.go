@@ -1948,6 +1948,12 @@ func gpuVendorForCapacity(req *models.GPURequest) string {
 }
 
 func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxRequest, idOverride string) (resp *models.CreateSandboxResponse, err error) {
+	// The work before the runtime driver, as back-to-back Server-Timing
+	// stages (svc_validate, svc_quota, svc_policy, then on the container
+	// path svc_keygen, svc_admit, svc_pre_driver), so none of it is time no
+	// stage covers. Boot-path (pr-review §2): a timer read and a RecordStage
+	// per mark on a timed create; nil, and free, when nothing times it.
+	clock := createtiming.StartClock(ctx)
 	// The runtime that serves this create from something already running
 	// (a warm pool slot, a parked container) marks it warm (O1).
 	ctx, warm := scaleobs.WithWarmStart(ctx)
@@ -2040,6 +2046,7 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 	if err := s.checkPlacementRule(&req); err != nil {
 		return nil, err
 	}
+	clock.Mark("svc_validate")
 
 	// Owner attribution: a validated user token stamps its account onto the
 	// new sandbox; operator/PAT and internal creates are owner-less (""). The
@@ -2078,6 +2085,7 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 		return nil, err
 	}
 	defer func() { quotaTicket.settle(resp, err) }()
+	clock.Mark("svc_quota")
 	// Custom-domain validation runs early so an invalid or unsupported
 	// payload fails before admission/mounts/docker.Create burn resources.
 	// On success req.CustomDomains is rewritten with the canonical slice.
@@ -2262,6 +2270,7 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 				chosenRuntime, models.ErrRuntimeNotImplemented)
 		}
 		req.Runtime = chosenRuntime
+		clock.Mark("svc_policy")
 		return s.createFirecrackerSandbox(ctx, req, idOverride)
 	}
 	if chosenRuntime == models.RuntimeWasm {
@@ -2277,6 +2286,7 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 			req.MemoryMB = 0
 		}
 		req.Runtime = chosenRuntime
+		clock.Mark("svc_policy")
 		return s.createWasmSandbox(ctx, req, idOverride)
 	}
 	// "isolate" is the fifth runtime (V8 isolates, Workers model), dispatched
@@ -2293,6 +2303,7 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 				chosenRuntime, models.ErrRuntimeNotImplemented)
 		}
 		req.Runtime = chosenRuntime
+		clock.Mark("svc_policy")
 		return s.createIsolateSandbox(ctx, req, idOverride)
 	}
 	req.Runtime = chosenRuntime
@@ -2348,6 +2359,7 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 	if s.testSealedMountsOverride != nil {
 		sealedMounts = s.testSealedMountsOverride
 	}
+	clock.Mark("svc_policy")
 
 	toolboxToken, err := generateToolboxToken()
 	if err != nil {
@@ -2372,6 +2384,7 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 			return nil, fmt.Errorf("generate sandbox id: %w", err)
 		}
 	}
+	clock.Mark("svc_keygen")
 
 	// Cluster mode carries the redacted spec inside the placement's raft log
 	// entry, which is size-capped (cluster.ValidateRecoveryPayloadSize) — there
@@ -2417,6 +2430,7 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 	if err != nil {
 		return nil, err
 	}
+	clock.Mark("svc_admit")
 
 	prepareStart := time.Now()
 	egressPol, err := compileCreateEgressEffective(&req)
@@ -2563,6 +2577,9 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 	egressCommitted := false
 	defer func() { early.end(egressCommitted) }()
 	clearGen := s.egressClears.now()
+	// svc_pre_driver: egress compile, mounts and the runtime pick. A
+	// gateway create's svc_egress_prepare is a part of it.
+	clock.Mark("svc_pre_driver")
 	state, err := ociRt.Create(createCtx, driverReq, sandboxID, toolboxToken, append(binds, inspectBinds...))
 	if err != nil {
 		// A driver that reported the address and failed let it go through
