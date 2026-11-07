@@ -265,6 +265,26 @@ func (s *Service) HoldsCommittedSnapshotImage(ctx context.Context, image string)
 	return snapshot != nil, err
 }
 
+// HoldsSnapshotNamed reports whether this node's catalogue has a snapshot of
+// this name in the caller's namespace (any spelling). The cluster create
+// router asks it before it sends a create by snapshot name to the snapshot's
+// home, since a node holding the row resolves the name itself; the home asks
+// it when that create arrives.
+func (s *Service) HoldsSnapshotNamed(ctx context.Context, name string) (bool, error) {
+	if s == nil || s.store == nil || strings.TrimSpace(name) == "" {
+		return false, nil
+	}
+	_, err := s.getSnapshotAnySpelling(ctx, strings.TrimSpace(name))
+	switch {
+	case err == nil:
+		return true, nil
+	case errors.Is(err, store.ErrNotFound):
+		return false, nil
+	default:
+		return false, err
+	}
+}
+
 // NormalizeCreateImageDistribution resolves snapshot aliases and fills the
 // create request's image-distribution metadata before placement decisions are
 // made. The method is intentionally side-effect free: it does not pull, push,
@@ -374,7 +394,7 @@ func (s *Service) NormalizeCreateImageDistribution(ctx context.Context, req *mod
 			// records the obligation with the row delete; the worker
 			// removes the manifest by digest, retrying every tick until it
 			// lands). The window is bounded by that retry loop, not closed.
-			if imageRegistryHost(req.Image) == "" && !docker.IsLocalOnlyImageRef(req.Image) && !imageRefHasTagOrDigest(req.Image) {
+			if IsBareSnapshotName(req.Image) {
 				dest := s.snapshotPusher.DestRefFor(owner, req.Image)
 				if meta := req.ImageDistribution(); !scoped && meta.Mode == models.ImageDistributionAOCR && meta.RegistryRef != "" {
 					dest = meta.RegistryRef
@@ -481,6 +501,15 @@ func ImageRequiresLocalPlacement(req models.CreateSandboxRequest) bool {
 	}
 	pushed := req.ImageDistributionMode == models.ImageDistributionAOCR && strings.TrimSpace(req.ImageRegistryRef) != ""
 	return !(pushed && docker.IsSnapshotImageRef(req.Image))
+}
+
+// IsBareSnapshotName reports an image that can only be a snapshot name a node
+// without the snapshot's row resolves across the cluster: no registry host,
+// no tag or digest, and not a local-only ref (a build or a committed snapshot
+// tag, which the cluster create router routes by their own keys).
+func IsBareSnapshotName(image string) bool {
+	image = strings.TrimSpace(image)
+	return image != "" && imageRegistryHost(image) == "" && !docker.IsLocalOnlyImageRef(image) && !imageRefHasTagOrDigest(image)
 }
 
 // imageRefHasTagOrDigest reports whether image carries an explicit `:tag` or

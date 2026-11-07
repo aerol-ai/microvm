@@ -1231,6 +1231,10 @@ func (s *Service) AttachSnapshotPusher(pusher *SnapshotPusher, reconciler *Snaps
 	}
 	s.snapshotPusher = pusher
 	s.snapshotPushReconciler = reconciler
+	if reconciler != nil {
+		// Before the daemon starts the worker (go r.Run), so no race.
+		reconciler.onPushed = s.forgetSnapshotLocalOnly
+	}
 }
 
 // AttachWasmCheckpointPusher wires AOCR push for durable WASM checkpoints.
@@ -4714,6 +4718,12 @@ func (s *Service) CountSnapshots(ctx context.Context, sourceSandboxID string) (i
 // never fails the create. It is a no-op single-node (the Noop client). The
 // write detaches from the request context so a client that disconnected right
 // after the commit still gets the snapshot registered.
+//
+// A snapshot whose image is only here (not, or not yet, pushed to the
+// registry) also gets the local-only key, so a create by its name that lands
+// on another node runs here instead of pulling a copy that does not exist
+// (UC-459). The push worker drops that key when the push lands
+// (forgetSnapshotLocalOnly).
 func (s *Service) registerSnapshotHome(ctx context.Context, snapshot *models.SandboxSnapshot) {
 	c := s.Cluster()
 	if c == nil {
@@ -4723,7 +4733,11 @@ func (s *Service) registerSnapshotHome(ctx context.Context, snapshot *models.San
 	if self == "" {
 		return
 	}
-	for _, key := range snapshotHomeKeys(snapshot) {
+	keys := snapshotHomeKeys(snapshot)
+	if SnapshotNeedsPush(snapshot) {
+		keys = append(keys, cluster.SnapshotLocalOnlyKey(snapshot.OwnerRef, snapshot.Name))
+	}
+	for _, key := range keys {
 		if err := c.RegisterSnapshotNode(context.WithoutCancel(ctx), key, self); err != nil && s.logger != nil {
 			s.logger.Warn("snapshot home-node register failed", "snapshot", snapshot.Name, "error", err)
 		}
@@ -4732,15 +4746,34 @@ func (s *Service) registerSnapshotHome(ctx context.Context, snapshot *models.San
 
 // forgetSnapshotHome drops the snapshot's home entries after it is deleted.
 // Best-effort: a stale entry is also swept when its node leaves the cluster.
+// The local-only key goes too, whatever the row's push state: a push whose
+// own forget failed left it behind, and it would keep sending creates by this
+// name to a node that no longer has the snapshot.
 func (s *Service) forgetSnapshotHome(ctx context.Context, snapshot *models.SandboxSnapshot) {
 	c := s.Cluster()
 	if c == nil {
 		return
 	}
-	for _, key := range snapshotHomeKeys(snapshot) {
+	keys := append(snapshotHomeKeys(snapshot), cluster.SnapshotLocalOnlyKey(snapshot.OwnerRef, snapshot.Name))
+	for _, key := range keys {
 		if err := c.ForgetSnapshotNode(context.WithoutCancel(ctx), key); err != nil && s.logger != nil {
 			s.logger.Warn("snapshot home-node forget failed", "snapshot", snapshot.Name, "error", err)
 		}
+	}
+}
+
+// forgetSnapshotLocalOnly drops a snapshot's local-only key once its push has
+// landed: the registry copy exists now, so a create by its name may run on any
+// node again. The push worker calls it (SnapshotPushReconciler.onPushed).
+// Best-effort: a failed forget only keeps those creates on this node, where
+// the snapshot still runs, until the snapshot is deleted.
+func (s *Service) forgetSnapshotLocalOnly(ctx context.Context, snapshot *models.SandboxSnapshot) {
+	c := s.Cluster()
+	if c == nil || snapshot == nil {
+		return
+	}
+	if err := c.ForgetSnapshotNode(context.WithoutCancel(ctx), cluster.SnapshotLocalOnlyKey(snapshot.OwnerRef, snapshot.Name)); err != nil && s.logger != nil {
+		s.logger.Warn("snapshot local-only key forget failed; creates by its name stay on this node", "snapshot", snapshot.Name, "error", err)
 	}
 }
 
