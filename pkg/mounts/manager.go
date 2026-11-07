@@ -46,6 +46,9 @@ type Manager struct {
 	sweeping map[string]chan struct{} // sandboxID -> closed when Sweep is done with it
 
 	closeCh chan struct{}
+
+	// cgroup is where helpers start so they outlive sandboxd (cgroup.go).
+	cgroup *helperCgroup
 }
 
 type mountState struct {
@@ -55,13 +58,17 @@ type mountState struct {
 	hostPath   string
 	plan       adapters.Plan
 	cmd        *exec.Cmd
-	output     *capturedOutput // captured stdout+stderr of the FUSE mount tool
-	exit       *procExit       // cmd's exit; superviseExit waits on it
+	output     *helperOutput // stdout+stderr of the FUSE mount tool
+	exit       *procExit     // the tool's exit; superviseExit waits on it
 	startedAt  time.Time
 	restarts   int
 	lastCrash  time.Time
 	supervised bool
 	disabled   bool // true after we've given up restarting
+
+	// proc is a tool a previous sandboxd started and this one adopted
+	// (adoptOne); cmd is nil while it runs. A restart starts cmd instead.
+	proc liveProcess
 }
 
 // New constructs a Manager. The root and cred directories are created with
@@ -97,6 +104,7 @@ func New(logger *slog.Logger, cfg Config) (*Manager, error) {
 		mounting:    make(map[string]int),
 		sweeping:    make(map[string]chan struct{}),
 		closeCh:     make(chan struct{}),
+		cgroup:      newHelperCgroup(logger, helperCgroupRoot),
 	}, nil
 }
 
@@ -121,6 +129,14 @@ var ErrMountsEstablished = fmt.Errorf("%w: its mounts are already established", 
 // entries are torn down before returning. It refuses, untouched, an ID that
 // already has mounts (ErrMountsEstablished).
 func (m *Manager) MountAll(ctx context.Context, sandboxID string, mounts []models.MountSpec) ([]ContainerBind, error) {
+	return m.mountSet(ctx, sandboxID, mounts, false)
+}
+
+// mountSet is MountAll. With adopt, a mount a previous sandboxd left serving
+// is taken over instead of mounted again (adoptOne); the rest are cleared
+// and mounted afresh. A failure tears down the adopted mounts too, as
+// MountAll tears down everything it established.
+func (m *Manager) mountSet(ctx context.Context, sandboxID string, mounts []models.MountSpec, adopt bool) ([]ContainerBind, error) {
 	if len(mounts) == 0 {
 		return nil, nil
 	}
@@ -147,15 +163,39 @@ func (m *Manager) MountAll(ctx context.Context, sandboxID string, mounts []model
 	if taken {
 		return nil, fmt.Errorf("mount %s: %w", sandboxID, ErrMountsEstablished)
 	}
-	if err := os.MkdirAll(filepath.Join(m.rootDir, sandboxID), 0o700); err != nil {
+	dir := filepath.Join(m.rootDir, sandboxID)
+	if adopt {
+		// No directory, nothing a previous sandboxd could have left.
+		if _, err := os.Stat(dir); err != nil {
+			adopt = false
+		}
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, fmt.Errorf("create sandbox mount dir: %w", err)
 	}
 
 	binds := make([]ContainerBind, 0, len(mounts))
 	established := make([]*mountState, 0, len(mounts))
+	var helpers []helperProcess
+	if adopt {
+		helpers = m.listHelperProcesses()
+	}
 
 	for i, spec := range mounts {
-		state, bind, err := m.mountOne(ctx, sandboxID, i, spec)
+		var (
+			state *mountState
+			bind  ContainerBind
+			err   error
+		)
+		if adopt {
+			state, bind = m.adoptOne(sandboxID, i, spec, helpers)
+			if state == nil {
+				m.clearStaleMount(sandboxID, i, helpers)
+			}
+		}
+		if state == nil {
+			state, bind, err = m.mountOne(ctx, sandboxID, i, spec)
+		}
 		if err != nil {
 			// Roll back everything we just established for this sandbox.
 			for _, s := range established {
@@ -341,7 +381,9 @@ func (m *Manager) cleanupOrphanDir(dir string) {
 
 // Reestablish ensures a sandbox's mounts are running, mounting any that are
 // missing. Called by the reconciler at startup and periodically. It mounts
-// only through MountAll, so its mounts are owned against Sweep the same way.
+// only through mountSet, so its mounts are owned against Sweep the same way.
+// For a sandbox this process does not track yet (the first pass after a
+// sandboxd restart) it adopts the helpers still serving its mounts.
 func (m *Manager) Reestablish(ctx context.Context, sandboxID string, mounts []models.MountSpec) error {
 	m.mu.Lock()
 	already, present := m.state[sandboxID]
@@ -354,7 +396,7 @@ func (m *Manager) Reestablish(ctx context.Context, sandboxID string, mounts []mo
 	if present {
 		_ = m.UnmountAll(sandboxID)
 	}
-	_, err := m.MountAll(ctx, sandboxID, mounts)
+	_, err := m.mountSet(ctx, sandboxID, mounts, !present)
 	return err
 }
 
@@ -366,7 +408,7 @@ func (m *Manager) mountOne(ctx context.Context, sandboxID string, index int, spe
 		return nil, ContainerBind{}, fmt.Errorf("no adapter for type %q", spec.Type)
 	}
 
-	hostPath := filepath.Join(m.rootDir, sandboxID, fmt.Sprintf("%d", index))
+	hostPath := m.hostPath(sandboxID, index)
 	if err := os.MkdirAll(hostPath, 0o700); err != nil {
 		return nil, ContainerBind{}, fmt.Errorf("create host path: %w", err)
 	}
@@ -411,7 +453,7 @@ func (m *Manager) mountOne(ctx context.Context, sandboxID string, index int, spe
 	// User-space FUSE: spawn and supervise. stdout+stderr are captured so a
 	// mount that never becomes ready surfaces the tool's own error instead of a
 	// bare "timed out waiting for mount" (cluster-hetero UC-81..84).
-	cmd, out, exit, err := spawnMountProcess(plan)
+	cmd, out, exit, err := m.spawnHelper(plan, m.helperLogPath(sandboxID, index))
 	if err != nil {
 		m.cleanupCred(plan)
 		return nil, ContainerBind{}, fmt.Errorf("spawn mount tool: %w", toolStartError(plan.Argv[0], err))
@@ -440,12 +482,26 @@ func (m *Manager) mountOne(ctx context.Context, sandboxID string, index int, spe
 
 // superviseExit waits for the mount process to exit and either restarts it
 // once or marks the mount disabled if it crashes a second time within 30s.
+// While it waits it keeps the tool's log under maxHelperLogBytes.
 func (m *Manager) superviseExit(state *mountState) {
 	if state.exit == nil {
 		return // no process to supervise
 	}
-	<-state.exit.done
+	trim := time.NewTicker(helperLogTrimInterval)
+	for running := true; running; {
+		select {
+		case <-state.exit.done:
+			running = false
+		case <-trim.C:
+			state.output.trim()
+		}
+	}
+	trim.Stop()
 	err := state.exit.err
+	if state.proc != nil {
+		// An adopted tool's pidfd; a restart below starts a child instead.
+		_ = state.proc.Close()
+	}
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -492,7 +548,7 @@ func (m *Manager) superviseExit(state *mountState) {
 	if state.plan.CredFile != "" {
 		_ = writeCredFile(state.plan.CredFile, state.plan.CredBody)
 	}
-	cmd, out, exit, err := spawnMountProcess(state.plan)
+	cmd, out, exit, err := m.spawnHelper(state.plan, m.helperLogPath(state.sandboxID, state.index))
 	if err != nil {
 		state.disabled = true
 		m.logger.Warn("mount restart spawn failed", "sandbox_id", state.sandboxID, "index", state.index, "error", err)
@@ -510,8 +566,11 @@ func (m *Manager) tearDownState(s *mountState) error {
 	if s.plan.IsKernelMount {
 		_ = unmountPath(s.hostPath)
 	} else {
-		if s.cmd != nil {
+		switch {
+		case s.cmd != nil:
 			_ = killMount(s.cmd)
+		case s.proc != nil:
+			killLiveProcess(s.proc)
 		}
 		_ = unmountPath(s.hostPath)
 	}
