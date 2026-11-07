@@ -173,26 +173,28 @@ jobs:
             apt_pkgs: ""
             goarm: ""
 
-          # macOS — sandboxd (native CGO, for install.sh --local) + toolboxd.
-          # The in-sandbox agent install.sh mounts on macOS is the Linux
-          # toolboxd (containers run in Docker's Linux VM); toolboxd_darwin_*
-          # is still published for direct use.
+          # macOS — sandboxd (CGO, for install.sh --local) + toolboxd.
+          # The org has no macOS runners, so sandboxd cross-compiles on Linux
+          # with zig as the C toolchain (.github/darwin-cross/setup.sh). The
+          # in-sandbox agent install.sh mounts on macOS is the Linux toolboxd
+          # (containers run in Docker's Linux VM); toolboxd_darwin_* is still
+          # published for direct use.
           # - name: MacOS x86_64
-          #   runner: macos-13
+          #   runner: ubuntu-latest
           #   goos: darwin
           #   goarch: amd64
           #   suffix: darwin_amd64
-          #   cc: ""
-          #   apt_pkgs: ""
+          #   cc: "zig cc -target x86_64-macos.14.0"
+          #   apt_pkgs: llvm
           #   goarm: ""
 
           - name: MacOS aarch64
-            runner: macos-14
+            runner: ubuntu-latest
             goos: darwin
             goarch: arm64
             suffix: darwin_arm64
-            cc: ""
-            apt_pkgs: ""
+            cc: "zig cc -target aarch64-macos.14.0"
+            apt_pkgs: llvm
             goarm: ""
 
     steps:
@@ -222,6 +224,11 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y ${{ matrix.apt_pkgs }}
 
+      - name: Set up darwin cross toolchain
+        if: matrix.goos == 'darwin'
+        shell: bash
+        run: bash .github/darwin-cross/setup.sh
+
       - name: Build sandboxd (Linux + macOS, CGO enabled)
         if: matrix.goos == 'linux' || matrix.goos == 'darwin'
         shell: bash
@@ -235,6 +242,14 @@ jobs:
           mkdir -p dist
           go build -trimpath -ldflags "$LDFLAGS" -o dist/sandboxd_${{ matrix.suffix }} ./cmd/sandboxd
           chmod 0755 dist/sandboxd_${{ matrix.suffix }}
+
+      # Same check as test.yml: macOS kills an unsigned arm64 binary at launch.
+      - name: Check the darwin binary is signed
+        if: matrix.suffix == 'darwin_arm64'
+        shell: bash
+        run: |
+          llvm-objdump --macho --private-headers dist/sandboxd_${{ matrix.suffix }} | grep LC_CODE_SIGNATURE >/dev/null ||
+            { echo "::error::sandboxd_${{ matrix.suffix }} has no code signature; macOS will not run it"; exit 1; }
 
       - name: Build toolboxd
         shell: bash
