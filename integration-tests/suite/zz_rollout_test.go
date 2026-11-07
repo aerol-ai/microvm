@@ -780,14 +780,16 @@ func TestRolloutLive08ReleaseSourceAndFinalize(t *testing.T) {
 	requirePrevious(t)
 	t.Cleanup(func() { destroyKeptSandboxes(t, c) })
 	servers := rolloutNodesOfRole(t, targets, "server")
+	// The pkill runs in a call of its own: a shell whose command line names
+	// the server would match its own pattern and kill itself.
 	for _, s := range servers {
-		sshRoot(t, s, "pkill -f 'http.server 18099' || true; "+
-			"nohup setsid python3 -m http.server 18099 --bind 127.0.0.1 --directory /var/tmp/aerolvm-rel > /var/tmp/aerolvm-rel.log 2>&1 < /dev/null & "+
+		sshRoot(t, s, "pkill -f 'http[.]server 18099' || true")
+		sshRoot(t, s, "nohup setsid python3 -m http.server 18099 --bind 127.0.0.1 --directory /var/tmp/aerolvm-rel > /var/tmp/aerolvm-rel.log 2>&1 < /dev/null & "+
 			"sed -i '/^SB_RELEASE_URL=/d' /etc/sandboxd/sandboxd.env; echo SB_RELEASE_URL=http://127.0.0.1:18099 >> /etc/sandboxd/sandboxd.env")
 	}
 	defer func() {
 		for _, s := range servers {
-			sshRoot(t, s, "pkill -f 'http.server 18099' || true; sed -i '/^SB_RELEASE_URL=/d' /etc/sandboxd/sandboxd.env")
+			sshRoot(t, s, "pkill -f 'http[.]server 18099' || true; sed -i '/^SB_RELEASE_URL=/d' /etc/sandboxd/sandboxd.env")
 		}
 	}()
 	// No node holds build B now, so staging must fetch it again.
