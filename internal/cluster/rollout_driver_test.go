@@ -983,6 +983,21 @@ func TestRolloutDriverResendKeepsQuorum(t *testing.T) {
 	}
 }
 
+// R12: the leader read "running", then a stop landed before it marked the
+// next node. The FSM refuses the mark, so no restart starts, and the cordon
+// set for that restart goes back.
+func TestRolloutDriverStopBetweenReadAndMarkLeavesNoCordon(t *testing.T) {
+	g := newRolloutRig(t, 1, 0, 2)
+	g.start(func(r *RolloutRecord) { r.AllowDowntime = true; r.Batch = "1" })
+	read := g.run(upgradewire.StateRunning)
+	g.host.event(context.Background(), RolloutCommand{Event: evStop, RolloutID: "r1"})
+	g.driver.startUpgrade(context.Background(), read, read.Nodes["w1"], g.host.members()["w1"])
+	r := g.host.rollout()
+	if r.Nodes["w1"].State != upgradewire.NodeStaged || g.host.drain["w1"] || g.nodes.nodes["w1"].applies != 0 || g.driver.busy("w1") {
+		t.Fatalf("after a refused mark: %s, cordoned %v, applies %d", describeNodes(r), g.host.drain["w1"], g.nodes.nodes["w1"].applies)
+	}
+}
+
 // hookedNodes runs onApply inside a node's apply call, before it answers.
 type hookedNodes struct {
 	*fakeNodes

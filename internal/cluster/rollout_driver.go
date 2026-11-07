@@ -704,11 +704,13 @@ func (d *rolloutDriver) startUpgrade(ctx context.Context, r *RolloutRecord, n *R
 			d.release(n.NodeID)
 		}
 	}()
+	cordoned := false
 	if !d.host.drained()[n.NodeID] {
 		if err := d.host.setDrain(ctx, n.NodeID, true); err != nil {
 			d.warnf("cluster: rollout could not cordon a node before its restart; will retry", "node_id", n.NodeID, "err", err)
 			return
 		}
+		cordoned = true
 	}
 	timeout := time.Duration(r.NodeTimeoutNanos)
 	if timeout <= 0 {
@@ -717,6 +719,14 @@ func (d *rolloutDriver) startUpgrade(ctx context.Context, r *RolloutRecord, n *R
 	op := rolloutOpID(r)
 	if !d.update(ctx, RolloutNodeUpdate{RolloutID: r.ID, NodeID: n.NodeID, State: upgradewire.NodeUpgrading, ExpectState: n.State,
 		Op: op, Term: d.host.term(), DeadlineUnixNano: d.host.now().Add(timeout).UnixNano(), ClearError: true}) {
+		// Refused: a stop or a rollback landed after this tick read the
+		// rollout (rolloutStartsRestarts). No restart follows, so the cordon
+		// set just now goes back.
+		if cordoned {
+			if err := d.host.setDrain(ctx, n.NodeID, false); err != nil {
+				d.warnf("cluster: rollout could not uncordon a node whose restart did not start", "node_id", n.NodeID, "err", err)
+			}
+		}
 		return
 	}
 	d.logf("cluster: rollout upgrading node", "rollout_id", r.ID, "node_id", n.NodeID, "op", op, "to", targetOf(r), "caller", r.Caller)
