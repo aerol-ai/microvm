@@ -7,6 +7,10 @@ dist-test/
 *.db-wal
 Terraform/.terraform.lock.hcl
 Terraform/root/.terraform.lock.hcl
+Terraform/examples/*/.terraform.lock.hcl
+# The from-url example's secrets; the committed sibling is
+# config/secrets.example.yml next to it.
+Terraform/examples/*/config/secrets.yml
 *.log
 # Shared cluster secrets (read by both Terraform and Ansible). The committed
 # sibling is config/secrets.example.yml.

@@ -212,3 +212,18 @@ func TestRootMovesOnlyModuleResources(t *testing.T) {
 		}
 	}
 }
+
+func TestFromURLExampleUsesTheModuleByURL(t *testing.T) {
+	main := readTF(t, "examples", "from-url", "main.tf")
+	if !regexp.MustCompile(`source = "git::https://github\.com/aerol-ai/microvm//Terraform\?ref=v\d+\.\d+\.\d+"`).MatchString(main) {
+		t.Error("examples/from-url/main.tf must use the module by URL with a release tag")
+	}
+	for _, line := range strings.Split(main, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "backend ") {
+			t.Error("the example must leave its backend commented out: it is the reader's choice")
+		}
+	}
+	if strings.Contains(main, "one_line_join") {
+		t.Error("the example must use the module's default join (one line), not set one_line_join")
+	}
+}
