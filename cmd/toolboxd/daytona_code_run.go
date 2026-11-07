@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"io"
 	"net/http"
 	"os"
@@ -144,11 +143,8 @@ func (s *server) handleDaytonaCodeRun(w http.ResponseWriter, r *http.Request) {
 	// preserves the spawn-failure message we appended below.
 	stdoutStr := string(stdoutBytes)
 	stderrStr := string(stderrBytes)
-	if waitErr != nil {
-		var exitErr *exec.ExitError
-		if !errors.As(waitErr, &exitErr) && !reapedElsewhere(waitErr) {
-			stderrStr = strings.TrimSpace(stderrStr + "\n" + waitErr.Error())
-		}
+	if waitErr != nil && !isExitStatus(waitErr) {
+		stderrStr = strings.TrimSpace(stderrStr + "\n" + waitErr.Error())
 	}
 	result := stdoutStr
 	if result == "" {
