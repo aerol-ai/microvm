@@ -623,6 +623,9 @@ type placementFSM struct {
 	// cursor workers poll with.
 	deniedNodes        map[string]NodeDenyRecord
 	deniedNodesVersion uint64
+	// deniedSet is deniedNodes' keys, published copy-on-write on every
+	// change so the hot readers (gossip, the peer authorizer) never take mu.
+	deniedSet atomic.Pointer[map[string]bool]
 
 	// subMu guards subscribers. Separate from mu so a slow subscriber accept
 	// can't block FSM reads — Apply takes mu briefly to write, releases it,

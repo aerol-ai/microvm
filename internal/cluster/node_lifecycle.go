@@ -302,19 +302,13 @@ func (f *placementFSM) ownedCount(nodeID string) int {
 	return 0
 }
 
-// deniedNodeSet copies the deny set for one placement sweep: one lock for
-// the sweep rather than one per candidate.
+// deniedNodeSet is the published deny set for one placement sweep. It is
+// shared, copy-on-write: callers read it and never write to it.
 func (f *placementFSM) deniedNodeSet() map[string]bool {
-	f.mu.RLock()
-	defer f.mu.RUnlock()
-	if len(f.deniedNodes) == 0 {
-		return nil
+	if set := f.deniedSet.Load(); set != nil {
+		return *set
 	}
-	out := make(map[string]bool, len(f.deniedNodes))
-	for id := range f.deniedNodes {
-		out[id] = true
-	}
-	return out
+	return nil
 }
 
 // DeleteNode sends the delete to the server tier; any server takes it and

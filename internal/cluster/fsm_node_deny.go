@@ -66,19 +66,31 @@ func (f *placementFSM) applyDenyNodeLocked(cmd command, index uint64) (any, erro
 	rec := NodeDenyRecord{NodeID: id, Role: strings.TrimSpace(in.Role), DeniedUnixNano: cmd.StampUnixNano}
 	f.deniedNodes[id] = rec
 	f.deniedNodesVersion = index
+	f.publishDeniedLocked()
 	return nodeDenyApplyResult{Record: rec, Changed: true}, nil
 }
 
-// isNodeDenied is the hot check: the peer authorizer and gossip ask it on
-// every request and every alive message, so it is one map read.
+// publishDeniedLocked swaps in a fresh copy of the deny set for the
+// lock-free readers. Caller holds f.mu. Copy-on-write is cheap: the set
+// changes only when an operator deletes a node.
+func (f *placementFSM) publishDeniedLocked() {
+	set := make(map[string]bool, len(f.deniedNodes))
+	for id := range f.deniedNodes {
+		set[id] = true
+	}
+	f.deniedSet.Store(&set)
+}
+
+// isNodeDenied is the hot check, asked by the peer authorizer on every
+// internal request and by gossip on every alive message, which memberlist
+// delivers with its own node lock held. So it never takes f.mu: a reader
+// there would wait behind a long Snapshot and stall gossip with it.
 func (f *placementFSM) isNodeDenied(nodeID string) bool {
 	if f == nil || nodeID == "" {
 		return false
 	}
-	f.mu.RLock()
-	defer f.mu.RUnlock()
-	_, ok := f.deniedNodes[nodeID]
-	return ok
+	set := f.deniedSet.Load()
+	return set != nil && (*set)[nodeID]
 }
 
 // deniedNodesView returns every record, sorted by node ID, and the Raft index
@@ -113,6 +125,7 @@ func (f *placementFSM) restoreDeniedNodesLocked(records []NodeDenyRecord, versio
 	if len(f.deniedNodes) > 0 {
 		f.deniedNodesVersion = version
 	}
+	f.publishDeniedLocked()
 }
 
 // DeniedNodesResponse answers PublicInternalDeniedNodesPath: the whole set
