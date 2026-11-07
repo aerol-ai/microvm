@@ -86,7 +86,11 @@ mapfile -t MEMBER_IPS < <(jq -r '.nodes[] | select(.name | endswith("spare-1") |
   { echo "missing base_url, token, seed, spare-1 or servers in the targets" >&2; exit 2; }
 echo "base=$BASE seed=$SEED_IP servers=${SERVER_IPS[*]} blank=$BLANK_IP members=${MEMBER_IPS[*]}"
 AUTH=(-sS -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json")
-api() { curl "${AUTH[@]}" "$@"; }
+# The leased name was just re-created, and macOS's resolver may still serve
+# a cached NXDOMAIN for it (lib/common.sh direct_resolve_args says why), so
+# curl gets the address from a direct query.
+# shellcheck disable=SC2046 # word-split on purpose: zero or two args
+api() { curl "${AUTH[@]}" $(direct_resolve_args "$BASE") "$@"; }
 members_alive() { api "$BASE/v1/cluster/members" | jq '[.members[] | select(.alive)] | length'; }
 BEFORE_MEMBERS="$(members_alive)"
 echo "alive members on $FROM_TAG: $BEFORE_MEMBERS"
@@ -158,7 +162,9 @@ fi
 step "5/6 a blank machine joins with the join-command line"
 AEROLVM="$(mktemp -d)/aerolvm"
 (cd "$REPO_ROOT" && go build -o "$AEROLVM" ./cmd/aerolvm)
-line="$(SB_API_URL="$BASE" SB_PAT_TOKEN="$TOKEN" XDG_CONFIG_HOME="$(mktemp -d)" "$AEROLVM" join-command --role worker)"
+# GODEBUG=netdns=go: Go's own resolver asks the DNS server directly, past
+# the macOS cache that may still hold NXDOMAIN for the leased name.
+line="$(GODEBUG=netdns=go SB_API_URL="$BASE" SB_PAT_TOKEN="$TOKEN" XDG_CONFIG_HOME="$(mktemp -d)" "$AEROLVM" join-command --role worker)"
 echo "  join-command printed: ${line%%--token*}--token <hidden> ..."
 args="${line#*bash -s -- }"
 [[ "$args" == join\ https://* ]] || die UC-633 "join-command printed an unexpected line"
