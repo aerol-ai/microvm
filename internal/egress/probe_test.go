@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // shortSocket returns a socket path short enough for macOS's 104-byte cap.
@@ -64,6 +65,12 @@ func TestProbeGatewayProtocolAsksTheRunningGateway(t *testing.T) {
 	}
 	if got != ProtocolVersion {
 		t.Fatalf("probe = %d, want the gateway's ProtocolVersion %d", got, ProtocolVersion)
+	}
+	// A caller's shorter deadline bounds the exchange.
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if got, err := ProbeGatewayProtocol(ctx, path); err != nil || got != ProtocolVersion {
+		t.Fatalf("probe with a deadline = %d, %v", got, err)
 	}
 }
 
