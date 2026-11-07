@@ -466,7 +466,12 @@ func (d *Driver) startTask(ctx context.Context, containerRef, sandboxID, toolbox
 	// the exact socket (nonce from the spec mount path, token from the spec env)
 	// so the mount succeeds and the restarted toolbox can re-signal readiness.
 	// A pool container's park socket is the parked listener above.
-	if d.cfg.ReadyEnabled && parked == nil {
+	// The stored spec decides, not today's ReadyEnabled: a sandbox created
+	// while the socket was on still bind-mounts it after an operator turns
+	// the socket (or the warm pool that widens it) off, and without the file
+	// runc refuses the task. recreateResumeReadySocket is a no-op for a spec
+	// with no ready mount.
+	if parked == nil {
 		if rl := d.recreateResumeReadySocket(spec); rl != nil {
 			defer func() { _ = rl.Close() }()
 		}

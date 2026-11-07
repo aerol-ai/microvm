@@ -3465,6 +3465,16 @@ func (c Config) ContainerdPoolEffective() bool {
 		c.ContainerdPoolEnabled && c.DockerReadySocketEnabled
 }
 
+// ContainerdReadySocketEffective is the containerd driver's ready-socket gate:
+// the docker gate, widened by the containerd warm pool. Park and adopt both
+// run over the held socket, so without the widening a single-node host that
+// turns on only SB_CONTAINERD_POOL_ENABLED wires the pool but never parks a
+// slot. It is a separate gate, not a change to DockerReadySocketEffective,
+// so the docker client and its boot-time ready-dir sweep stay as they were.
+func (c Config) ContainerdReadySocketEffective() bool {
+	return c.DockerReadySocketEffective() || c.ContainerdPoolEffective()
+}
+
 // DockerReadySocketDir is the host directory for per-create readiness sockets.
 func (c Config) DockerReadySocketDir() string {
 	base := strings.TrimSpace(c.MountsCredentialsRuntimeDir)
