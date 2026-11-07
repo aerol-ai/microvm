@@ -349,6 +349,31 @@ func applyB(source string) upgradewire.ApplyRequest {
 	}
 }
 
+// keptSandbox creates a sandbox that outlives the case that made it: the
+// later cases check it kept its PID 1 through every restart. The last case
+// destroys it (destroyKeptSandboxes).
+func keptSandbox(t *testing.T, c *harness.Client, name string) *microvm.Sandbox {
+	t.Helper()
+	public := true
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+	sb, err := c.SDK().Create(ctx, sdktypes.CreateSandboxOptions{Name: name, Image: harness.DefaultImage, AllowPublicTraffic: &public})
+	if err != nil {
+		t.Fatalf("create sandbox: %v", err)
+	}
+	return sb
+}
+
+func destroyKeptSandboxes(t *testing.T, c *harness.Client) {
+	for id := range rl.sandboxes {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+		if err := c.SDK().Destroy(ctx, id); err != nil {
+			t.Logf("cleanup: destroy sandbox %s: %v", id, err)
+		}
+		cancel()
+	}
+}
+
 // pid1Start is the start time of the sandbox's PID 1, in clock ticks since
 // boot: it changes only if the container restarts.
 func pid1Start(t *testing.T, sb *microvm.Sandbox) string {
@@ -459,7 +484,7 @@ func TestRolloutLive03StageFailureStopsEarly(t *testing.T) {
 	// Sandboxes made now must outlive every restart (UC-653).
 	rl.sandboxes = map[string]liveSandbox{}
 	for i := 0; i < 2; i++ {
-		sb := c.NewSandbox(t, sdktypes.CreateSandboxOptions{Name: fmt.Sprintf("%s-%d", harness.UniqueName(sc, t), i)})
+		sb := keptSandbox(t, c, fmt.Sprintf("%s-%d", harness.UniqueName(sc, t), i))
 		ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 		owner, err := c.OwnerNodeID(ctx, sb.ID)
 		cancel()
@@ -753,6 +778,7 @@ func TestRolloutLive08ReleaseSourceAndFinalize(t *testing.T) {
 	harness.Require(t, sc, "UC-655", "UC-642")
 	c, targets := requireRolloutLive(t)
 	requirePrevious(t)
+	t.Cleanup(func() { destroyKeptSandboxes(t, c) })
 	servers := rolloutNodesOfRole(t, targets, "server")
 	for _, s := range servers {
 		sshRoot(t, s, "pkill -f 'http.server 18099' || true; "+
