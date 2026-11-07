@@ -66,30 +66,26 @@ the incident log.
    sudo systemctl stop sandboxd
    ```
 
-2. Back up the chosen survivor before mutation:
+2. On the chosen node, back it up, write `peers.json` and start sandboxd on
+   this node only:
 
    ```bash
-   sudo /usr/local/sbin/sandboxd-backup.sh \
-     --output /root/pre-quorum-recovery-$(hostname)-$(date +%F-%H%M%S).tar.gz
+   sudo sandboxd recover-quorum --start
    ```
 
-3. On the chosen node, write `peers.json`:
+   It takes the node ID (`SB_NODE_ID`), the Raft address
+   (`SB_RAFT_ADVERTISE_ADDR`) and the Raft directory from the node's env
+   files; pass `--node-id`, `--raft-address` or `--raft-dir` to override
+   them. Before it changes anything it backs the node up to
+   `/var/lib/sandboxd/backups/pre-recover-quorum-<host>-<time>.tar.gz`
+   (`--backup-output` picks another path). It refuses while sandboxd runs on
+   this node, on a worker or ingress node, with another node's ID, with a
+   bind address such as `0.0.0.0:7000`, and on a directory with no Raft
+   data. With `--start` it waits until sandboxd has applied the file.
+   Without it, start sandboxd yourself and watch `journalctl -u sandboxd -f`.
+   The older `raft-lost-quorum-recover.sh` now only calls this command.
 
-   ```bash
-   sudo /usr/local/sbin/raft-lost-quorum-recover.sh \
-     --raft-dir /var/lib/sandboxd/raft \
-     --node-id <chosen-node-id> \
-     --raft-address <chosen-private-ip>:7000
-   ```
-
-4. Start sandboxd on the chosen node only:
-
-   ```bash
-   sudo systemctl start sandboxd
-   sudo journalctl -u sandboxd -f
-   ```
-
-5. Wait for recovery to apply. The recovery file should be renamed:
+3. Check the recovery applied. The recovery file is renamed:
 
    ```bash
    sudo ls -l /var/lib/sandboxd/raft/peers.json*
@@ -119,7 +115,24 @@ Expected:
 
 ## Rejoin Other Nodes
 
-For every other surviving server node, do not reuse stale Raft state:
+For every other surviving server node, do not reuse stale Raft state. Started
+with its old Raft log, a server still counts the lost servers as voters and
+can elect a second leader with another old server.
+
+```bash
+sudo systemctl stop sandboxd
+sudo sandboxd recover-quorum --rejoin --start
+```
+
+`--rejoin` moves `/var/lib/sandboxd/raft` aside as
+`raft.pre-rejoin.<unix>` (keep it until the cluster is healthy and backed up)
+and starts sandboxd; the node finds the cluster through gossip and the leader
+adds it as a voter. It refuses on a node with `SB_CLUSTER_BOOTSTRAP=true` (the
+seed): with an empty Raft log that node would start a new cluster of its own.
+Set `SB_CLUSTER_BOOTSTRAP=false` in its `cluster.env` first.
+
+If the node also lost its cluster settings or certificates, join it again
+instead:
 
 ```bash
 sudo systemctl stop sandboxd
