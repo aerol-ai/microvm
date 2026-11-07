@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/x509"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"strings"
@@ -24,6 +25,9 @@ import (
 //	GET    /v1/cluster/join-tokens            fleet.admin  list (never a secret or hash)
 //	DELETE /v1/cluster/join-tokens/{id}       fleet.admin  revoke (idempotent)
 //	POST   /v1/cluster/adopt                  fleet.admin  sandboxd adopt's call, on a server
+//
+// A server token and adopt also refuse a caller whose mTLS cert names a
+// node that is not a server (refuseNonServerNode).
 //	POST   /v1/cluster/internal/join/write    peer, Raft servers only: a follower's write to the leader
 //	POST   /v1/cluster/internal/renew-cert    peer: renew this caller's cert (admitted key)
 //	POST   /v1/cluster/internal/ca-key        peer, servers only: the CA key for adopt
@@ -69,6 +73,38 @@ func joinTokenCreator(r *http.Request, claimed string) string {
 	return access.Principal.ID
 }
 
+// serverPeerChecker is the server-role binding (Cluster.IsJoinWritePeer):
+// the node's admitted role, and Raft membership.
+type serverPeerChecker interface {
+	IsJoinWritePeer(peerID string) bool
+}
+
+// refuseNonServerNode stops a server-tier power (a server join token, or
+// adopt) asked over a connection that proves a node identity, unless that
+// node is a server. Such a call is a node acting for itself, or relaying
+// an operator: a worker's own API sends token calls on with its own cert
+// (agent_join.go), and a forward carries the edge's cert. Every joined
+// node holds the PAT (the join answer carries it), so without this a
+// leaked worker token becomes a worker cert plus the PAT, then a server
+// token, then the CA key and a Raft seat, which the plan promises a
+// worker token never gives (§8). An operator calling with the PAT and no
+// node cert is not affected. It reports whether it answered.
+func (h *handlers) refuseNonServerNode(w http.ResponseWriter, r *http.Request, what string) bool {
+	if r.TLS == nil || len(r.TLS.VerifiedChains) == 0 {
+		return false
+	}
+	peer, err := cluster.AuthenticatedPeerNodeID(r)
+	checker, ok := h.deps.Service.Cluster().(serverPeerChecker)
+	if err == nil && ok && checker.IsJoinWritePeer(peer) {
+		return false
+	}
+	if h.deps.Logger != nil {
+		h.deps.Logger.Warn("cluster: refused a server-only join call from a node that is not a server", "what", what, "peer", peer)
+	}
+	writeJoinError(w, fmt.Errorf("%w: %s asked by node %q, which is not an admitted server; run it on a server node with the operator token", cluster.ErrPeerNotServer, what, peer))
+	return true
+}
+
 func (h *handlers) clusterCreateJoinToken(w http.ResponseWriter, r *http.Request) {
 	mgr, ok := joinTarget[cluster.JoinTokenManager](h, w, "join tokens")
 	if !ok {
@@ -77,6 +113,9 @@ func (h *handlers) clusterCreateJoinToken(w http.ResponseWriter, r *http.Request
 	var req cluster.JoinTokenCreateRequest
 	if err := apihttp.DecodeJSON(w, r, &req); err != nil {
 		apihttp.WriteError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	if strings.EqualFold(strings.TrimSpace(req.Role), cluster.JoinRoleServer) && h.refuseNonServerNode(w, r, "a server join token") {
 		return
 	}
 	req.CreatedBy = joinTokenCreator(r, req.CreatedBy)
@@ -132,6 +171,9 @@ type joinAdopter interface {
 func (h *handlers) clusterAdopt(w http.ResponseWriter, r *http.Request) {
 	adopter, ok := joinTarget[joinAdopter](h, w, "adopt (run it on a server node)")
 	if !ok {
+		return
+	}
+	if h.refuseNonServerNode(w, r, "adopt") {
 		return
 	}
 	var req cluster.AdoptRequest
