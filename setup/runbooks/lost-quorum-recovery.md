@@ -132,16 +132,18 @@ seed): with an empty Raft log that node would start a new cluster of its own.
 Set `SB_CLUSTER_BOOTSTRAP=false` in its `cluster.env` first.
 
 If the node also lost its cluster settings or certificates, join it again
-instead:
+instead. From your laptop, delete the old member and make a server token:
 
 ```bash
-sudo systemctl stop sandboxd
-sudo mv /var/lib/sandboxd/raft /var/lib/sandboxd/raft.pre-rejoin.$(date +%s)
-sudo /usr/local/sbin/cluster-join.sh \
-  --gossip-key '<key>' \
-  --peers <recovered-node-private-ip>:7001 \
-  --tls-bundle /path/to/aerolvm-tls-bundle.tar.gz \
-  --force
+aerolvm delete node <node-id> --force
+aerolvm join-command --role server
+```
+
+Then on the node:
+
+```bash
+sudo sandboxd reset --yes      # removes the old cluster files and Raft data
+# run the printed join line here, with --node-id <node-id> at the end
 ```
 
 Rejoin one server at a time. Wait for membership and health before the next.
@@ -156,15 +158,15 @@ Bolt until they are drained and rejoined with a fresh DataDir.
 **This is NOT in-place revertable.** Once a node has written WAL state, a
 boltdb-only build cannot read it. To revert a WAL node to Bolt:
 
-1. `sandboxd-node-lifecycle.sh drain` (or equivalent) — never drop below quorum.
-2. `remove-member` the node from the cluster.
+1. `aerolvm drain <node-id>` — never drop below quorum.
+2. `aerolvm delete node <node-id>`.
 3. Stop sandboxd, move aside the DataDir Raft tree (`mv …/raft …/raft.pre-revert.$(date +%s)`).
 4. Deploy the desired build against a **fresh** DataDir (current builds recreate
    WAL when `raft-log.bolt` is absent; pin an older build only if you must stay
    on Bolt).
-5. Rejoin with `cluster-join.sh --force`.
+5. `sudo sandboxd reset --yes`, then rejoin with a fresh `aerolvm join-command --role server` line.
 
-Rollout is one node at a time via the standard **drain → remove-member →
+Rollout is one node at a time via the standard **drain → delete node →
 rejoin** cycle. Mixed-format clusters (some Bolt, some WAL) are safe: the log
 store is node-local; Raft replicates log entries over the transport, not store
 files. Re-verify this lost-quorum recovery runbook on a WAL node after the
