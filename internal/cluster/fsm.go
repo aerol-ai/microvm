@@ -946,6 +946,11 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 	// expected a monotonic revision across restores (B9).
 	f.version = log.Index
 	now := applyNow(log)
+	// The pending-load index is replicated state, so only apply prunes it,
+	// and by the entry's time: every server then drops the same claims at the
+	// same log position. Reads used to prune with the reading server's clock,
+	// which made servers disagree once apply stopped reading the clock (C1).
+	f.pruneExpiredPendingReservationsLocked(now)
 
 	switch cmd.Op {
 	case opPlace:
@@ -2675,12 +2680,13 @@ func (f *placementFSM) livePendingReservationCount(owner string, now int64) int 
 	if owner == "" {
 		return 0
 	}
-	f.mu.Lock()
-	defer f.mu.Unlock()
+	f.mu.RLock()
+	defer f.mu.RUnlock()
 	if f.pendingReservationIDsByOwner == nil {
 		return 0
 	}
-	f.pruneExpiredPendingReservationsLocked(now)
+	// No prune here: see pendingReservationLoadByNode. Expired claims are
+	// skipped below instead.
 	ids := f.pendingReservationIDsByOwner[owner]
 	if len(ids) == 0 {
 		return 0
@@ -2699,11 +2705,16 @@ func (f *placementFSM) livePendingReservationCount(owner string, now int64) int 
 }
 
 func (f *placementFSM) refreshPendingReservationExpiryLocked(sandboxID string, expiresUnix int64) {
-	if f.pendingReservationClaims == nil {
-		return
-	}
 	claim, ok := f.pendingReservationClaims[sandboxID]
 	if !ok {
+		// Apply prunes claims by entry time. Entry times normally rise, but a
+		// new leader's clock can run behind the old one's, so a retry stamped
+		// before the old expiry can follow an entry that already pruned this
+		// claim. The caller has just stored the row, still reserved, with its
+		// new expiry: count its load again rather than lose it (I4).
+		if p, exists := f.fullPlacementLocked(sandboxID); exists && p.IsReserved() {
+			f.claimPendingReservationLocked(sandboxID, p)
+		}
 		return
 	}
 	claim.ExpiresUnix = expiresUnix
@@ -3090,10 +3101,13 @@ func (f *placementFSM) pendingReservationsByNode(now int64) map[string]capacity.
 // reservations counted by owner and runtime, read under one lock so the two
 // agree. Placement needs both: the aggregate for CPU, memory and disk, the
 // counts for network slots (a pool serves some runtimes, not others).
+//
+// It never prunes: the index is replicated state that only apply may change
+// (see apply). Claims that expired after the last applied entry are left out
+// of the answer instead, so a read at a later time still sees the right load.
 func (f *placementFSM) pendingReservationLoadByNode(now int64) (map[string]capacity.Request, map[string]map[string]int) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.pruneExpiredPendingReservationsLocked(now)
+	f.mu.RLock()
+	defer f.mu.RUnlock()
 	out := make(map[string]capacity.Request, len(f.pendingReservationCapacity))
 	for owner, req := range f.pendingReservationCapacity {
 		out[owner] = req
@@ -3106,7 +3120,81 @@ func (f *placementFSM) pendingReservationLoadByNode(now int64) (map[string]capac
 		}
 		runtimes[owner] = cp
 	}
+	f.forEachExpiredClaimLocked(now, func(claim pendingReservationClaim) {
+		subtractPendingLoad(out, runtimes, claim.OwnerNodeID, claim.Request)
+	})
 	return out, runtimes
+}
+
+// forEachExpiredClaimLocked calls fn once for every claim that has expired
+// by now but is still in the index (apply has not yet reached an entry past
+// its expiry). It walks only the expired part of the expiry min-heap: a node
+// that has not expired has no expired descendants, so the cost is the number
+// of expired entries, not the number of reservations. Heap entries left by a
+// refresh (an older expiry for the same claim) are skipped. Caller holds f.mu
+// for reading.
+func (f *placementFSM) forEachExpiredClaimLocked(now int64, fn func(pendingReservationClaim)) {
+	h := f.pendingReservationExpiries
+	if now <= 0 || len(h) == 0 {
+		return
+	}
+	var seen map[string]struct{}
+	stack := []int{0}
+	for len(stack) > 0 {
+		i := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		if i >= len(h) {
+			continue
+		}
+		e := h[i]
+		if e.ExpiresUnix <= 0 || now <= e.ExpiresUnix {
+			continue
+		}
+		stack = append(stack, 2*i+1, 2*i+2)
+		claim, ok := f.pendingReservationClaims[e.SandboxID]
+		if !ok || claim.ExpiresUnix != e.ExpiresUnix {
+			continue
+		}
+		if _, dup := seen[e.SandboxID]; dup {
+			continue
+		}
+		if seen == nil {
+			seen = make(map[string]struct{})
+		}
+		seen[e.SandboxID] = struct{}{}
+		fn(claim)
+	}
+}
+
+// subtractPendingLoad removes one claim from a copy of the pending
+// aggregates, the same way subtractPendingCapacityLocked does on the index.
+func subtractPendingLoad(load map[string]capacity.Request, runtimes map[string]map[string]int, owner string, req capacity.Request) {
+	if owner == "" {
+		return
+	}
+	if byRuntime := runtimes[owner]; byRuntime != nil {
+		if byRuntime[req.Runtime] <= 1 {
+			delete(byRuntime, req.Runtime)
+		} else {
+			byRuntime[req.Runtime]--
+		}
+		if len(byRuntime) == 0 {
+			delete(runtimes, owner)
+		}
+	}
+	cur, ok := load[owner]
+	if !ok {
+		return
+	}
+	cur.CPU -= req.CPU
+	cur.MemoryMB -= req.MemoryMB
+	cur.DiskGB -= req.DiskGB
+	cur.GPUs -= req.GPUs
+	if cur.CPU == 0 && cur.MemoryMB == 0 && cur.DiskGB == 0 && cur.GPUs == 0 {
+		delete(load, owner)
+		return
+	}
+	load[owner] = cur
 }
 
 func (f *placementFSM) expiredReservationIDs(now int64) []string {
