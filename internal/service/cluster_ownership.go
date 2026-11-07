@@ -58,8 +58,26 @@ func (s *Service) assertClusterOwnership(ctx context.Context, sandboxes []*model
 				}
 			}
 		}
-		if !s.clusterOwnershipNeedsReplay(c, sb) {
+		placement, placed := c.PlacementOf(sb.ID)
+		if !placementNeedsReplay(c.SelfNodeID(), placement, placed, sb) {
 			continue
+		}
+		if !placed {
+			// Checked before the row is sealed: a deleted lifecycle must not
+			// get its secrets fanned out to peers again on the way out.
+			incarnationID, deleted, err := s.clusterLifecycleDeleted(ctx, c, sb)
+			if err != nil {
+				if firstErr == nil {
+					firstErr = err
+				}
+				continue
+			}
+			if deleted {
+				if err := s.destroyDeletedClusterLifecycle(ctx, sb.ID, incarnationID); err != nil && firstErr == nil {
+					firstErr = err
+				}
+				continue
+			}
 		}
 		state, stateErr := s.localSandboxStateForCluster(ctx, c, sb)
 		if stateErr != nil {
@@ -79,12 +97,76 @@ func (s *Service) assertClusterOwnership(ctx context.Context, sandboxes []*model
 	return len(states), errors.Join(firstErr, c.AssertOwnership(ctx, states))
 }
 
-func (s *Service) clusterOwnershipNeedsReplay(c cluster.Client, sb *models.Sandbox) bool {
-	p, ok := c.PlacementOf(sb.ID)
+// clusterLifecycleDeleted reports whether the cluster deleted the lifecycle of
+// a local row that has no placement: a post-delete record exists for its exact
+// incarnation. That happens when this node was cut off while the sandbox was
+// moved and deleted, or deleted as an orphan. It also returns the incarnation
+// it asked about. Never asks without an incarnation: the newest record for the
+// id could belong to another lifetime.
+//
+// A server answers from its own replica, so it must have caught up first: a
+// restarted node that has not applied the delete yet would answer "no record"
+// and the row would be placed again.
+func (s *Service) clusterLifecycleDeleted(ctx context.Context, c cluster.Client, sb *models.Sandbox) (string, bool, error) {
+	if !cluster.CaughtUp(c) {
+		return "", false, fmt.Errorf("ownership replay of %s: %w", sb.ID, cluster.ErrNotCaughtUp)
+	}
+	incarnationID, err := s.localSandboxAuditIncarnation(ctx, sb)
+	if err != nil || incarnationID == "" {
+		return "", false, err
+	}
+	_, deleted, err := c.AuditACLForSandbox(ctx, sb.ID, incarnationID)
+	if err != nil {
+		return "", false, fmt.Errorf("ownership replay of %s: post-delete record lookup: %w", sb.ID, err)
+	}
+	return incarnationID, deleted, nil
+}
+
+// destroyDeletedClusterLifecycle destroys this node's copy of a sandbox whose
+// lifecycle the cluster already deleted. It is the ordinary destroy: the
+// placement is gone, so its delete fence and placement delete are no-ops, and
+// the lifetime-wide cleanup (exact-incarnation secrets, routes, runtime) is
+// right because no node owns that lifetime any more. The row is read again
+// under the lifecycle lock, and left alone if it is another lifetime by now.
+func (s *Service) destroyDeletedClusterLifecycle(ctx context.Context, sandboxID, incarnationID string) error {
+	unlock, err := s.lifecycleLocks.lockCtx(ctx, sandboxID)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	current, err := s.store.Get(ctx, sandboxID)
+	if errors.Is(err, store.ErrNotFound) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	currentIncarnation, err := s.localSandboxAuditIncarnation(ctx, current)
+	if err != nil {
+		return err
+	}
+	if currentIncarnation != incarnationID {
+		return nil
+	}
+	if s.logger != nil {
+		s.logger.Warn("cluster: destroying local sandbox; the cluster deleted it while this node was away",
+			"sandbox_id", sandboxID, "incarnation_id", incarnationID)
+	}
+	done := s.beginSystemAction(ctx, sandboxID, systemActionClusterDeleted)
+	err = s.destroySandboxLocked(ctx, sandboxID)
+	if errors.Is(err, store.ErrNotFound) {
+		err = nil
+	}
+	done(err)
+	return err
+}
+
+// placementNeedsReplay reports whether the ownership replay must hand sb to
+// AssertOwnership, given the placement (p, ok) this node sees for it.
+func placementNeedsReplay(self string, p cluster.Placement, ok bool, sb *models.Sandbox) bool {
 	if !ok {
 		return true
 	}
-	self := c.SelfNodeID()
 	if placementCanBeClaimedBySelf(p, self) {
 		return true
 	}
@@ -198,6 +280,7 @@ func (s *Service) localSandboxStateForCluster(ctx context.Context, c cluster.Cli
 		Secrets:         secrets,
 		ExposedPorts:    clusterPortsFromSandbox(sb),
 		CustomHostnames: sandboxCustomHostnamesList(sb),
+		CreatedAt:       sb.CreatedAt,
 	}, nil
 }
 

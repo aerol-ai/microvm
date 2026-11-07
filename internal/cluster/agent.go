@@ -528,19 +528,20 @@ func (a *Agent) RecordPlacement(ctx context.Context, sandboxID string, spec *mod
 		}
 	}
 	cmd := command{
-		Op:                    opPlace,
-		SandboxID:             sandboxID,
-		OwnerNodeID:           a.nodeID,
-		OwnerAPIURL:           a.apiURL,
-		OwnerDataPlaneHost:    a.dataPlaneHost,
-		Spec:                  QualifySpecName(spec, nameOwnerRef),
-		SecretRef:             secrets.Ref,
-		SecretVersion:         secrets.Version,
-		SecretRecipients:      normalizeSecretRecipientIDs(secrets.Recipients),
-		SecretSealGeneration:  secrets.SealGeneration,
-		IncarnationID:         incarnationID,
-		ExpectedIncarnationID: expectedIncarnationID,
-		OwnerRef:              secrets.OwnerRef,
+		Op:                     opPlace,
+		SandboxID:              sandboxID,
+		OwnerNodeID:            a.nodeID,
+		OwnerAPIURL:            a.apiURL,
+		OwnerDataPlaneHost:     a.dataPlaneHost,
+		Spec:                   QualifySpecName(spec, nameOwnerRef),
+		SecretRef:              secrets.Ref,
+		SecretVersion:          secrets.Version,
+		SecretRecipients:       normalizeSecretRecipientIDs(secrets.Recipients),
+		SecretSealGeneration:   secrets.SealGeneration,
+		IncarnationID:          incarnationID,
+		ExpectedIncarnationID:  expectedIncarnationID,
+		OwnerRef:               secrets.OwnerRef,
+		RefuseDeletedLifecycle: a.deletedLifecycleFenceReplicated(),
 	}
 	return a.applyCommand(ctx, cmd)
 }
@@ -982,6 +983,7 @@ func (a *Agent) ApplyEncoded(ctx context.Context, payload []byte) error {
 
 func (a *Agent) AssertOwnership(ctx context.Context, local []LocalSandboxState) error {
 	var firstErr error
+	now := time.Now()
 	for _, st := range local {
 		if st.ID == "" {
 			continue
@@ -1001,8 +1003,11 @@ func (a *Agent) AssertOwnership(ctx context.Context, local []LocalSandboxState) 
 		}
 		switch {
 		case !ok:
-			if err := a.RecordPlacement(ctx, st.ID, st.Spec, st.Secrets); err != nil && firstErr == nil {
-				firstErr = err
+			// A worker is never the sole Raft server: only a young row is
+			// provably not a deleted one (adoptUnplacedRow).
+			record := func() error { return a.RecordPlacement(ctx, st.ID, st.Spec, st.Secrets) }
+			if !placeUnplacedRow(a.logger, a.nodeID, st, now, a.cfg.AuditDeletedGrace, false, record, &firstErr) {
+				continue
 			}
 			for port, route := range st.ExposedPorts {
 				if err := a.addExposedPortForIncarnation(ctx, st.ID, incarnationID, port, route); err != nil && firstErr == nil {
@@ -1700,6 +1705,11 @@ func (a *Agent) doHTTPRequest(ctx context.Context, client *http.Client, endpoint
 			// Idempotency-Key retry's re-reserve that hits it is routed to
 			// the reservation's owner, which keys off errors.Is.
 			return fmt.Errorf("%w: %s", ErrIncarnationConflict, message)
+		}
+		if resp.StatusCode == http.StatusConflict && strings.Contains(message, ErrPlacementDeleted.Error()) {
+			// The deleted-lifecycle fence across the same hop: a worker's
+			// ownership replay keys off errors.Is to stop replaying the row.
+			return fmt.Errorf("%w: %s", ErrPlacementDeleted, message)
 		}
 		if resp.StatusCode == http.StatusTooManyRequests && strings.Contains(message, ErrTeamQuotaExceeded.Error()) {
 			// A team at its quota is a verdict, not backpressure: the create

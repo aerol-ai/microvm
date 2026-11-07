@@ -22,6 +22,13 @@ type fakeOwnershipCluster struct {
 	assertErr  error
 }
 
+// clusterOwnershipNeedsReplay is placementNeedsReplay over c's placement view,
+// the way assertClusterOwnership calls it.
+func (s *Service) clusterOwnershipNeedsReplay(c cluster.Client, sb *models.Sandbox) bool {
+	p, ok := c.PlacementOf(sb.ID)
+	return placementNeedsReplay(c.SelfNodeID(), p, ok, sb)
+}
+
 func (c *fakeOwnershipCluster) PlacementOf(sandboxID string) (cluster.Placement, bool) {
 	p, ok := c.placements[sandboxID]
 	return p, ok
