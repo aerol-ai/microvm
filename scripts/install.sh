@@ -137,9 +137,10 @@ L4_PROXY_PROTOCOL="false"
 # a default install opens no new port.
 LB_HEALTH_PORT=""
 
-# A re-run restarts a running sandboxd when it changed the daemon's settings
-# file or unit (see restart_sandboxd_if_reconfigured). record_sandboxd_state
-# fills the two state variables before anything is written.
+# A re-run restarts a running sandboxd when it changed the daemon's binary,
+# settings file or unit (see restart_sandboxd_if_reconfigured).
+# record_sandboxd_state fills the two state variables before anything is
+# written.
 SANDBOXD_ENV_FILE="/etc/sandboxd/sandboxd.env"
 SANDBOXD_UNIT_FILE="/etc/systemd/system/sandboxd.service"
 # The cgroup v2 and proc mounts keep_firecracker_vms_running reads (tests
@@ -2208,17 +2209,19 @@ WantedBy=multi-user.target
 EOF
 }
 
-# sandboxd_config_fingerprint identifies the two files a running sandboxd
-# read when it started and install.sh rewrites: its settings file and its
-# unit. cksum, not sha256sum, because it is POSIX; it only has to notice a
-# change. On a fresh install neither file exists yet, and under pipefail a
-# failing cat would abort the install, hence the `|| true`.
+# sandboxd_config_fingerprint identifies the three files a running sandboxd
+# was started from and install.sh rewrites: its binary, its settings file
+# and its unit. The binary is in it because re-running the installer is how
+# a node is upgraded: without it, a run that only installed a new release
+# left the old one running. cksum, not sha256sum, because it is POSIX; it
+# only has to notice a change. On a fresh install no file exists yet, and
+# under pipefail a failing cat would abort the install, hence the `|| true`.
 sandboxd_config_fingerprint() {
-	{ cat "$SANDBOXD_ENV_FILE" "$SANDBOXD_UNIT_FILE" 2>/dev/null || true; } | cksum | cut -d' ' -f1-2
+	{ cat "$INSTALL_PREFIX/sandboxd" "$SANDBOXD_ENV_FILE" "$SANDBOXD_UNIT_FILE" 2>/dev/null || true; } | cksum | cut -d' ' -f1-2
 }
 
 # record_sandboxd_state notes, before any file is written, whether sandboxd
-# is running and what its settings were.
+# is running and what it was started from.
 record_sandboxd_state() {
 	SANDBOXD_WAS_ACTIVE="false"
 	if systemctl is-active --quiet sandboxd 2>/dev/null; then
@@ -2273,7 +2276,7 @@ keep_firecracker_vms_running() {
 }
 
 # restart_sandboxd_if_reconfigured restarts sandboxd when it was running
-# before this run and the run changed its settings file or unit.
+# before this run and the run changed its binary, settings file or unit.
 # `systemctl enable --now` only starts a stopped unit, so before this a
 # re-run left the old process on its old settings. Under --pat-scope host
 # that was an outage: Caddy, restarted onto the public socket, proxied to a
@@ -2288,7 +2291,7 @@ restart_sandboxd_if_reconfigured() {
 	if [[ "$(sandboxd_config_fingerprint)" == "$SANDBOXD_CONFIG_BEFORE" ]]; then
 		return 0
 	fi
-	echo "sandboxd settings changed; restarting sandboxd before Caddy"
+	echo "sandboxd binary or settings changed; restarting sandboxd before Caddy"
 	keep_firecracker_vms_running
 	systemctl restart sandboxd
 	if ! wait_for_sandboxd_ready; then
@@ -3400,8 +3403,9 @@ if [[ "$LOCAL_MODE" == "true" ]]; then
 		echo "install.sh must run as root (use sudo)" >&2
 		exit 1
 	fi
-	install_binaries
+	# Before install_binaries, so the restart check sees a new binary too.
 	record_sandboxd_state
+	install_binaries
 	write_local_environment
 	# This branch skips install_packages, so it installs the two parts of it
 	# a local server still needs, in the same order: the mount tools (platform
@@ -3463,8 +3467,9 @@ fi
 # into the same build when --dns-provider is set so we make exactly one
 # trip to the Caddy build server.
 install_custom_caddy "$DNS_PROVIDER"
-install_binaries
+# Before install_binaries, so the restart check sees a new binary too.
 record_sandboxd_state
+install_binaries
 write_environment
 prepare_key_custody
 write_caddy_env

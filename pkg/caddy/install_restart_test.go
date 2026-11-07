@@ -54,6 +54,8 @@ func TestInstallRestartsSandboxdOnlyWhenARerunChangedIt(t *testing.T) {
 	cases := []struct {
 		name         string
 		active       bool
+		binBefore    string // "" = no file yet
+		binAfter     string
 		envBefore    string // "" = no file yet
 		envAfter     string
 		unitBefore   string
@@ -64,22 +66,26 @@ func TestInstallRestartsSandboxdOnlyWhenARerunChangedIt(t *testing.T) {
 		wantWarning  bool
 		wantHealthUp bool
 	}{
-		{name: "fresh install", active: false, envAfter: "SB_PAT_TOKEN=a\n", unitAfter: "unit-1", patScope: "any"},
-		{name: "stopped unit", active: false, envBefore: "SB_PAT_TOKEN=a\n", envAfter: "SB_PAT_TOKEN=b\n", unitBefore: "unit-1", unitAfter: "unit-1", patScope: "any"},
-		{name: "re-run that changes nothing", active: true, envBefore: "SB_PAT_TOKEN=a\n", envAfter: "SB_PAT_TOKEN=a\n", unitBefore: "unit-1", unitAfter: "unit-1", patScope: "any"},
-		{name: "re-run that changes the settings", active: true, envBefore: "SB_PAT_TOKEN=a\n", envAfter: "SB_PAT_TOKEN=a\nSB_PAT_SCOPE=any\n", unitBefore: "unit-1", unitAfter: "unit-1", patScope: "any",
+		{name: "fresh install", active: false, binAfter: "bin-1", envAfter: "SB_PAT_TOKEN=a\n", unitAfter: "unit-1", patScope: "any"},
+		{name: "stopped unit", binBefore: "bin-1", binAfter: "bin-1", active: false, envBefore: "SB_PAT_TOKEN=a\n", envAfter: "SB_PAT_TOKEN=b\n", unitBefore: "unit-1", unitAfter: "unit-1", patScope: "any"},
+		{name: "re-run that changes nothing", binBefore: "bin-1", binAfter: "bin-1", active: true, envBefore: "SB_PAT_TOKEN=a\n", envAfter: "SB_PAT_TOKEN=a\n", unitBefore: "unit-1", unitAfter: "unit-1", patScope: "any"},
+		{name: "re-run that changes the settings", binBefore: "bin-1", binAfter: "bin-1", active: true, envBefore: "SB_PAT_TOKEN=a\n", envAfter: "SB_PAT_TOKEN=a\nSB_PAT_SCOPE=any\n", unitBefore: "unit-1", unitAfter: "unit-1", patScope: "any",
 			wantRestart: true, wantHealthUp: true},
-		{name: "re-run that changes the unit", active: true, envBefore: "SB_PAT_TOKEN=a\n", envAfter: "SB_PAT_TOKEN=a\n", unitBefore: "unit-1", unitAfter: "unit-2", patScope: "any",
+		{name: "re-run that changes the unit", binBefore: "bin-1", binAfter: "bin-1", active: true, envBefore: "SB_PAT_TOKEN=a\n", envAfter: "SB_PAT_TOKEN=a\n", unitBefore: "unit-1", unitAfter: "unit-2", patScope: "any",
 			wantRestart: true, wantHealthUp: true},
-		{name: "--pat-scope host, socket made", active: true, envBefore: "SB_PAT_TOKEN=a\n", envAfter: "SB_PAT_TOKEN=a\nSB_PAT_SCOPE=host\n", unitBefore: "unit-1", unitAfter: "unit-1", patScope: "host", socket: true,
+		{name: "--pat-scope host, socket made", binBefore: "bin-1", binAfter: "bin-1", active: true, envBefore: "SB_PAT_TOKEN=a\n", envAfter: "SB_PAT_TOKEN=a\nSB_PAT_SCOPE=host\n", unitBefore: "unit-1", unitAfter: "unit-1", patScope: "host", socket: true,
 			wantRestart: true, wantHealthUp: true},
-		{name: "--pat-scope host, no socket", active: true, envBefore: "SB_PAT_TOKEN=a\n", envAfter: "SB_PAT_TOKEN=a\nSB_PAT_SCOPE=host\n", unitBefore: "unit-1", unitAfter: "unit-1", patScope: "host",
+		{name: "--pat-scope host, no socket", binBefore: "bin-1", binAfter: "bin-1", active: true, envBefore: "SB_PAT_TOKEN=a\n", envAfter: "SB_PAT_TOKEN=a\nSB_PAT_SCOPE=host\n", unitBefore: "unit-1", unitAfter: "unit-1", patScope: "host",
 			wantRestart: true, wantWarning: true},
+		{name: "re-run that installs a new binary only", binBefore: "bin-1", binAfter: "bin-2", active: true, envBefore: "SB_PAT_TOKEN=a\n", envAfter: "SB_PAT_TOKEN=a\n", unitBefore: "unit-1", unitAfter: "unit-1", patScope: "any",
+			wantRestart: true, wantHealthUp: true},
+		{name: "new binary, stopped unit", binBefore: "bin-1", binAfter: "bin-2", active: false, envBefore: "SB_PAT_TOKEN=a\n", envAfter: "SB_PAT_TOKEN=a\n", unitBefore: "unit-1", unitAfter: "unit-1", patScope: "any"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			dir := t.TempDir()
 			env, unit := filepath.Join(dir, "sandboxd.env"), filepath.Join(dir, "sandboxd.service")
+			bin := filepath.Join(dir, "sandboxd")
 			// A unix socket path must stay under ~104 bytes; t.TempDir can be
 			// longer on macOS.
 			sockDir, err := os.MkdirTemp("", "isr")
@@ -95,7 +101,7 @@ func TestInstallRestartsSandboxdOnlyWhenARerunChangedIt(t *testing.T) {
 				}
 				t.Cleanup(func() { _ = l.Close() })
 			}
-			for path, content := range map[string]string{env: tc.envBefore, unit: tc.unitBefore} {
+			for path, content := range map[string]string{bin: tc.binBefore, env: tc.envBefore, unit: tc.unitBefore} {
 				if content != "" {
 					if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
 						t.Fatal(err)
@@ -118,6 +124,7 @@ func TestInstallRestartsSandboxdOnlyWhenARerunChangedIt(t *testing.T) {
 				t.Fatal(err)
 			}
 			script := "set -euo pipefail\n" +
+				"INSTALL_PREFIX='" + dir + "'\n" +
 				"SANDBOXD_ENV_FILE='" + env + "'\nSANDBOXD_UNIT_FILE='" + unit + "'\n" +
 				"SANDBOXD_HEALTH_URL='http://127.0.0.1:21212/health'\nSANDBOXD_READY_TRIES=3\n" +
 				"SANDBOXD_WAS_ACTIVE=false\nSANDBOXD_CONFIG_BEFORE=''\n" +
@@ -133,6 +140,7 @@ func TestInstallRestartsSandboxdOnlyWhenARerunChangedIt(t *testing.T) {
 				"curl() { echo \"curl $*\" >> \"$LOG\"; [[ -f \"$UP\" ]]; }\n" +
 				"sleep() { echo \"sleep $*\" >> \"$LOG\"; }\n" +
 				"record_sandboxd_state\n" +
+				"printf '%s' '" + tc.binAfter + "' > \"$INSTALL_PREFIX/sandboxd\"\n" +
 				"printf '%s' '" + tc.envAfter + "' > \"$SANDBOXD_ENV_FILE\"\n" +
 				"printf '%s' '" + tc.unitAfter + "' > \"$SANDBOXD_UNIT_FILE\"\n" +
 				"restart_sandboxd_if_reconfigured\n" +
@@ -174,8 +182,8 @@ func TestInstallRestartsSandboxdOnlyWhenARerunChangedIt(t *testing.T) {
 }
 
 // The order is what fixes the outage: the state is recorded before the
-// settings are written, and the restart runs after daemon-reload and before
-// Caddy starts, on both Linux install paths.
+// binary and the settings are written, and the restart runs after
+// daemon-reload and before Caddy starts, on both Linux install paths.
 func TestInstallRestartsSandboxdBeforeCaddyStarts(t *testing.T) {
 	raw, err := os.ReadFile("../../scripts/install.sh")
 	if err != nil {
@@ -193,16 +201,16 @@ func TestInstallRestartsSandboxdBeforeCaddyStarts(t *testing.T) {
 			at += i + len(step)
 		}
 	}
-	local := strings.Index(src, "\tinstall_binaries\n\trecord_sandboxd_state\n\twrite_local_environment\n")
+	local := strings.Index(src, "\trecord_sandboxd_state\n\tinstall_binaries\n\twrite_local_environment\n")
 	if local < 0 {
-		t.Fatal("the local install path does not record sandboxd's state right before writing its settings")
+		t.Fatal("the local install path does not record sandboxd's state right before installing the binary and writing its settings")
 	}
 	inOrder(t, local, "write_local_environment", "write_local_systemd_unit", "systemctl daemon-reload",
 		"restart_sandboxd_if_reconfigured", "systemctl enable --now sandboxd sandboxd-healthcheck.timer")
 
-	main := strings.Index(src, "\ninstall_binaries\nrecord_sandboxd_state\nwrite_environment\n")
+	main := strings.Index(src, "\nrecord_sandboxd_state\ninstall_binaries\nwrite_environment\n")
 	if main < 0 {
-		t.Fatal("the main install path does not record sandboxd's state right before writing its settings")
+		t.Fatal("the main install path does not record sandboxd's state right before installing the binary and writing its settings")
 	}
 	inOrder(t, main, "write_environment", "write_caddyfile", "write_systemd_unit", "systemctl daemon-reload",
 		"restart_sandboxd_if_reconfigured", "systemctl enable --now caddy sandboxd sandboxd-healthcheck.timer")
