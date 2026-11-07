@@ -542,6 +542,11 @@ type gossipSetupConfig struct {
 	PATScope string
 }
 
+// testTuneMemberlist is set only by this package's TestMain, to shorten
+// gossip probe and failure-detection timers for in-process test clusters; it
+// is nil in every binary, which keeps memberlist's LAN defaults.
+var testTuneMemberlist func(*memberlist.Config)
+
 func setupGossip(cfg gossipSetupConfig, admitter *capacity.Admitter, logger *slog.Logger) (*gossipNode, error) {
 	mlCfg := memberlist.DefaultLANConfig()
 	mlCfg.Name = cfg.NodeID
@@ -602,6 +607,9 @@ func setupGossip(cfg gossipSetupConfig, admitter *capacity.Admitter, logger *slo
 		)
 	}
 
+	if testTuneMemberlist != nil {
+		testTuneMemberlist(mlCfg)
+	}
 	ml, err := memberlist.Create(mlCfg)
 	if err != nil {
 		return nil, fmt.Errorf("gossip setup: memberlist.Create: %w", err)
