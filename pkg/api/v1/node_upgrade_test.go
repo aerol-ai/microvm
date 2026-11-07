@@ -81,7 +81,7 @@ func upgradeErr(t *testing.T, rr *httptest.ResponseRecorder) upgradewire.ErrorRe
 	return e
 }
 
-func hexSum(b string) string {
+func nodeHexSum(b string) string {
 	s := sha256.Sum256([]byte(b))
 	return hex.EncodeToString(s[:])
 }
@@ -92,7 +92,7 @@ func platformAsset(name string) string { return name + "_" + runtime.GOOS + "_" 
 // rollout command.
 func TestNodeUpgradeRoutesRefuseInClusterMode(t *testing.T) {
 	mux, _, host := nodeUpgradeMux(t, true, true)
-	file := upgradewire.NodeUpgradeFilesPath + "/" + hexSum("x")
+	file := upgradewire.NodeUpgradeFilesPath + "/" + nodeHexSum("x")
 	for _, tc := range []struct{ method, path string }{
 		{http.MethodPost, upgradewire.NodeUpgradePath},
 		{http.MethodGet, upgradewire.NodeUpgradePath},
@@ -116,7 +116,7 @@ func TestNodeUpgradeRoutesRefuseInClusterMode(t *testing.T) {
 // status read still works.
 func TestNodeUpgradeRoutesRespectRemoteUpgradeOff(t *testing.T) {
 	mux, _, _ := nodeUpgradeMux(t, false, false)
-	file := upgradewire.NodeUpgradeFilesPath + "/" + hexSum("x")
+	file := upgradewire.NodeUpgradeFilesPath + "/" + nodeHexSum("x")
 	for _, tc := range []struct{ method, path string }{
 		{http.MethodPost, upgradewire.NodeUpgradePath},
 		{http.MethodPut, file},
@@ -144,11 +144,11 @@ func TestNodeUpgradeUploadThenStart(t *testing.T) {
 	}{
 		{"bad name", http.MethodPut, filePath("ABC"), "x", http.StatusBadRequest, "invalid_request"},
 		{"head bad name", http.MethodHead, filePath("abc"), "", http.StatusBadRequest, ""},
-		{"wrong body", http.MethodPut, filePath(hexSum(sandboxd)), "something else", http.StatusBadRequest, upgradewire.ErrCodeHashMismatch},
-		{"head missing", http.MethodHead, filePath(hexSum(sandboxd)), "", http.StatusNotFound, ""},
-		{"put", http.MethodPut, filePath(hexSum(sandboxd)), sandboxd, http.StatusCreated, ""},
-		{"put again", http.MethodPut, filePath(hexSum(sandboxd)), sandboxd, http.StatusOK, ""},
-		{"head present", http.MethodHead, filePath(hexSum(sandboxd)), "", http.StatusOK, ""},
+		{"wrong body", http.MethodPut, filePath(nodeHexSum(sandboxd)), "something else", http.StatusBadRequest, upgradewire.ErrCodeHashMismatch},
+		{"head missing", http.MethodHead, filePath(nodeHexSum(sandboxd)), "", http.StatusNotFound, ""},
+		{"put", http.MethodPut, filePath(nodeHexSum(sandboxd)), sandboxd, http.StatusCreated, ""},
+		{"put again", http.MethodPut, filePath(nodeHexSum(sandboxd)), sandboxd, http.StatusOK, ""},
+		{"head present", http.MethodHead, filePath(nodeHexSum(sandboxd)), "", http.StatusOK, ""},
 		{"get before any op", http.MethodGet, upgradewire.NodeUpgradePath, "", http.StatusNotFound, "not_found"},
 		{"bad json", http.MethodPost, upgradewire.NodeUpgradePath, "{", http.StatusBadRequest, "invalid_request"},
 		{"bad version", http.MethodPost, upgradewire.NodeUpgradePath, `{"version":"../x","files":{}}`, http.StatusBadRequest, "invalid_request"},
@@ -164,7 +164,7 @@ func TestNodeUpgradeUploadThenStart(t *testing.T) {
 		}
 	}
 
-	files := map[string]string{platformAsset("sandboxd"): hexSum(sandboxd), platformAsset("toolboxd"): hexSum(toolboxd)}
+	files := map[string]string{platformAsset("sandboxd"): nodeHexSum(sandboxd), platformAsset("toolboxd"): nodeHexSum(toolboxd)}
 	post := func(version string) *httptest.ResponseRecorder {
 		b, _ := json.Marshal(upgradewire.NodeUpgradeRequest{Version: version, Files: files, Source: upgradewire.SourceUpload})
 		return sendBody(mux, http.MethodPost, upgradewire.NodeUpgradePath, string(b))
@@ -178,7 +178,7 @@ func TestNodeUpgradeUploadThenStart(t *testing.T) {
 		!strings.Contains(upgradeErr(t, rr).Reason, platformAsset("toolboxd")) {
 		t.Fatalf("missing toolboxd = %d %s", rr.Code, rr.Body.String())
 	}
-	if rr := sendBody(mux, http.MethodPut, filePath(hexSum(toolboxd)), toolboxd); rr.Code != http.StatusCreated {
+	if rr := sendBody(mux, http.MethodPut, filePath(nodeHexSum(toolboxd)), toolboxd); rr.Code != http.StatusCreated {
 		t.Fatal(rr.Body.String())
 	}
 	rr := post("v0.6.13")
@@ -213,7 +213,7 @@ func TestNodeUpgradeRouteFailures(t *testing.T) {
 		old := maxNodeUpgradeFile
 		maxNodeUpgradeFile = 4
 		t.Cleanup(func() { maxNodeUpgradeFile = old })
-		path := upgradewire.NodeUpgradeFilesPath + "/" + hexSum("too big")
+		path := upgradewire.NodeUpgradeFilesPath + "/" + nodeHexSum("too big")
 		if rr := sendBody(mux, http.MethodPut, path, "too big"); rr.Code != http.StatusRequestEntityTooLarge {
 			t.Fatalf("declared length = %d", rr.Code)
 		}
@@ -231,7 +231,7 @@ func TestNodeUpgradeRouteFailures(t *testing.T) {
 		if err := os.WriteFile(filepath.Dir(l.StateDir)+"/upgrade", []byte("a file, not a directory"), 0o600); err != nil {
 			t.Fatal(err)
 		}
-		if rr := sendBody(mux, http.MethodPut, upgradewire.NodeUpgradeFilesPath+"/"+hexSum("x"), "x"); rr.Code != http.StatusInternalServerError {
+		if rr := sendBody(mux, http.MethodPut, upgradewire.NodeUpgradeFilesPath+"/"+nodeHexSum("x"), "x"); rr.Code != http.StatusInternalServerError {
 			t.Fatalf("put = %d %s", rr.Code, rr.Body.String())
 		}
 	})

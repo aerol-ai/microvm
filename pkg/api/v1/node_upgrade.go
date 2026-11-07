@@ -25,7 +25,7 @@ const maxNodeUpgradeBody = 1 << 20
 // maxNodeUpgradeFile caps one upload (§6.6: 256 MiB); tests lower it.
 var maxNodeUpgradeFile = upgradewire.MaxUploadBytes
 
-func writeUpgradeError(w http.ResponseWriter, status int, e upgradewire.ErrorResponse) {
+func writeNodeUpgradeError(w http.ResponseWriter, status int, e upgradewire.ErrorResponse) {
 	apihttp.WriteJSON(w, status, e)
 }
 
@@ -34,7 +34,7 @@ func writeUpgradeError(w http.ResponseWriter, status int, e upgradewire.ErrorRes
 func (h *handlers) nodeUpgradeAllowed(w http.ResponseWriter, r *http.Request, changes bool) bool {
 	svc := h.deps.Service
 	if svc.ClusterEnabled() {
-		writeUpgradeError(w, http.StatusConflict, upgradewire.ErrorResponse{
+		writeNodeUpgradeError(w, http.StatusConflict, upgradewire.ErrorResponse{
 			Error:  upgradewire.ErrCodeClusterMode,
 			Reason: "this node runs in a cluster; the cluster's rollout upgrades its nodes",
 			Hint:   "aerolvm upgrade apply <version>",
@@ -42,7 +42,7 @@ func (h *handlers) nodeUpgradeAllowed(w http.ResponseWriter, r *http.Request, ch
 		return false
 	}
 	if changes && !svc.RemoteUpgradeEnabled() {
-		writeUpgradeError(w, http.StatusForbidden, upgradewire.ErrorResponse{
+		writeNodeUpgradeError(w, http.StatusForbidden, upgradewire.ErrorResponse{
 			Error:  upgradewire.ErrCodeRemoteUpgradeDisabled,
 			Reason: "SB_REMOTE_UPGRADE is off on this node, so it takes no upgrade over the API",
 			Hint:   "on the node: sudo sandboxd upgrade node <version> --sha256 <file>=<hash>...",
@@ -61,7 +61,7 @@ func (h *handlers) nodeUpgradeStart(w http.ResponseWriter, r *http.Request) {
 	}
 	var req upgradewire.NodeUpgradeRequest
 	if err := json.NewDecoder(io.LimitReader(r.Body, maxNodeUpgradeBody)).Decode(&req); err != nil {
-		writeUpgradeError(w, http.StatusBadRequest, upgradewire.ErrorResponse{Error: "invalid_request", Reason: "decode body: " + err.Error()})
+		writeNodeUpgradeError(w, http.StatusBadRequest, upgradewire.ErrorResponse{Error: "invalid_request", Reason: "decode body: " + err.Error()})
 		return
 	}
 	resp, started, err := h.deps.Service.NodeUpgrades().Start(r.Context(), req)
@@ -69,18 +69,18 @@ func (h *handlers) nodeUpgradeStart(w http.ResponseWriter, r *http.Request) {
 	var missing *nodeupgrade.ErrFilesMissing
 	switch {
 	case errors.Is(err, nodeupgrade.ErrUsage):
-		writeUpgradeError(w, http.StatusBadRequest, upgradewire.ErrorResponse{Error: "invalid_request", Reason: err.Error()})
+		writeNodeUpgradeError(w, http.StatusBadRequest, upgradewire.ErrorResponse{Error: "invalid_request", Reason: err.Error()})
 		return
 	case errors.As(err, &running):
-		writeUpgradeError(w, http.StatusConflict, upgradewire.ErrorResponse{Error: upgradewire.ErrCodeUpgradeRunning,
+		writeNodeUpgradeError(w, http.StatusConflict, upgradewire.ErrorResponse{Error: upgradewire.ErrCodeUpgradeRunning,
 			Reason: err.Error(), Hint: "aerolvm upgrade status"})
 		return
 	case errors.As(err, &missing):
-		writeUpgradeError(w, http.StatusConflict, upgradewire.ErrorResponse{Error: upgradewire.ErrCodeFilesMissing, Reason: err.Error()})
+		writeNodeUpgradeError(w, http.StatusConflict, upgradewire.ErrorResponse{Error: upgradewire.ErrCodeFilesMissing, Reason: err.Error()})
 		return
 	case err != nil:
 		h.deps.Logger.Error("node upgrade did not start", "version", req.Version, "error", err)
-		writeUpgradeError(w, http.StatusInternalServerError, upgradewire.ErrorResponse{Error: "internal", Reason: err.Error()})
+		writeNodeUpgradeError(w, http.StatusInternalServerError, upgradewire.ErrorResponse{Error: "internal", Reason: err.Error()})
 		return
 	}
 	auditlog.NoteTarget(r.Context(), resp.Op)
@@ -98,7 +98,7 @@ func (h *handlers) nodeUpgradeStatus(w http.ResponseWriter, r *http.Request) {
 	}
 	resp, ok := h.deps.Service.NodeUpgrades().Latest(r.Context())
 	if !ok {
-		writeUpgradeError(w, http.StatusNotFound, upgradewire.ErrorResponse{Error: "not_found", Reason: "no upgrade has run on this node"})
+		writeNodeUpgradeError(w, http.StatusNotFound, upgradewire.ErrorResponse{Error: "not_found", Reason: "no upgrade has run on this node"})
 		return
 	}
 	apihttp.WriteJSON(w, http.StatusOK, resp)
@@ -108,7 +108,7 @@ func (h *handlers) nodeUpgradeStatus(w http.ResponseWriter, r *http.Request) {
 func nodeUpgradeFileSum(w http.ResponseWriter, r *http.Request) string {
 	sum := r.PathValue("sha256")
 	if !upgradewire.SHA256Re.MatchString(sum) {
-		writeUpgradeError(w, http.StatusBadRequest, upgradewire.ErrorResponse{Error: "invalid_request",
+		writeNodeUpgradeError(w, http.StatusBadRequest, upgradewire.ErrorResponse{Error: "invalid_request",
 			Reason: "the file name must be its SHA-256 in lower-case hex"})
 		return ""
 	}
@@ -127,7 +127,7 @@ func (h *handlers) nodeUpgradePutFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if r.ContentLength > maxNodeUpgradeFile {
-		writeUpgradeError(w, http.StatusRequestEntityTooLarge, upgradewire.ErrorResponse{Error: "too_large",
+		writeNodeUpgradeError(w, http.StatusRequestEntityTooLarge, upgradewire.ErrorResponse{Error: "too_large",
 			Reason: "a release file may be at most 256 MiB"})
 		return
 	}
@@ -136,15 +136,15 @@ func (h *handlers) nodeUpgradePutFile(w http.ResponseWriter, r *http.Request) {
 	var tooBig *http.MaxBytesError
 	switch {
 	case errors.Is(err, nodeupgrade.ErrHashMismatch):
-		writeUpgradeError(w, http.StatusBadRequest, upgradewire.ErrorResponse{Error: upgradewire.ErrCodeHashMismatch, Reason: err.Error()})
+		writeNodeUpgradeError(w, http.StatusBadRequest, upgradewire.ErrorResponse{Error: upgradewire.ErrCodeHashMismatch, Reason: err.Error()})
 		return
 	case errors.As(err, &tooBig):
-		writeUpgradeError(w, http.StatusRequestEntityTooLarge, upgradewire.ErrorResponse{Error: "too_large",
+		writeNodeUpgradeError(w, http.StatusRequestEntityTooLarge, upgradewire.ErrorResponse{Error: "too_large",
 			Reason: "a release file may be at most 256 MiB"})
 		return
 	case err != nil:
 		h.deps.Logger.Error("store an uploaded release file", "sha256", sum, "error", err)
-		writeUpgradeError(w, http.StatusInternalServerError, upgradewire.ErrorResponse{Error: "internal", Reason: err.Error()})
+		writeNodeUpgradeError(w, http.StatusInternalServerError, upgradewire.ErrorResponse{Error: "internal", Reason: err.Error()})
 		return
 	}
 	status := http.StatusOK
