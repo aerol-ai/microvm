@@ -48,6 +48,16 @@ import (
 // speed; two seconds keeps it responsive without load at 2,000 nodes.
 const rolloutTickEvery = 2 * time.Second
 
+// defaultMaxNodeCalls bounds the node calls the leader has in flight
+// (stage, apply, finalize) and the status reads of one tick. Staging 2,000
+// nodes then never opens 2,000 connections at once (the rest go out on
+// later ticks as calls end), and a few dead hosts cannot stall a tick for
+// minutes: the reads run side by side, each bounded by statusTimeout.
+const defaultMaxNodeCalls = 64
+
+// statusTimeout bounds one read of a node's upgrade state.
+const statusTimeout = 10 * time.Second
+
 // rolloutNodeClient is the small interface §6.6 names.
 type rolloutNodeClient interface {
 	Step(ctx context.Context, node Member, req UpgradeStepRequest) (UpgradeStepResponse, error)
@@ -105,6 +115,9 @@ type rolloutDriver struct {
 	// finalizeRetry backs off nodes whose one-way migrations failed, by
 	// node ID (under mu). A new leader starts with none: one more try each.
 	finalizeRetry map[string]retryWait
+	// maxCalls bounds the node calls in flight (stage, apply, finalize)
+	// and the status reads of one tick (defaultMaxNodeCalls).
+	maxCalls int
 }
 
 func newRolloutDriver(host rolloutHost, nodes rolloutNodeClient, logger *slog.Logger) *rolloutDriver {
@@ -127,15 +140,23 @@ func (d *rolloutDriver) warnf(msg string, args ...any) {
 	}
 }
 
-// claim marks nodeID busy with a call; false when one is in flight.
+// claim marks nodeID busy with a call; false when one is in flight, or
+// when callLimit calls are (a later tick tries again).
 func (d *rolloutDriver) claim(nodeID string) bool {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	if d.inflight[nodeID] {
+	if d.inflight[nodeID] || len(d.inflight) >= d.callLimit() {
 		return false
 	}
 	d.inflight[nodeID] = true
 	return true
+}
+
+func (d *rolloutDriver) callLimit() int {
+	if d.maxCalls > 0 {
+		return d.maxCalls
+	}
+	return defaultMaxNodeCalls
 }
 
 func (d *rolloutDriver) release(nodeID string) {
@@ -150,11 +171,17 @@ func (d *rolloutDriver) busy(nodeID string) bool {
 	return d.inflight[nodeID]
 }
 
-// run starts one node call for nodeID unless one is in flight.
+// run starts one node call for nodeID unless one is in flight or every
+// call slot is taken.
 func (d *rolloutDriver) run(nodeID string, fn func()) {
 	if !d.claim(nodeID) {
 		return
 	}
+	d.spawn(nodeID, fn)
+}
+
+// spawn runs fn for a node already claimed, then releases the claim.
+func (d *rolloutDriver) spawn(nodeID string, fn func()) {
 	if d.inline {
 		defer d.release(nodeID)
 		fn()
@@ -658,8 +685,19 @@ func rolloutOpID(r *RolloutRecord) string {
 }
 
 // startUpgrade cordons the node, records it upgrading with a deadline, and
-// sends the apply step.
+// sends the apply step. It takes a call slot first, so a node is marked
+// upgrading only when its call can go out now; with every slot taken it
+// waits for a later tick instead of waiting for the resend.
 func (d *rolloutDriver) startUpgrade(ctx context.Context, r *RolloutRecord, n *RolloutNodeRecord, m Member) {
+	if !d.claim(n.NodeID) {
+		return
+	}
+	sent := false
+	defer func() {
+		if !sent {
+			d.release(n.NodeID)
+		}
+	}()
 	if !d.host.drained()[n.NodeID] {
 		if err := d.host.setDrain(ctx, n.NodeID, true); err != nil {
 			d.warnf("cluster: rollout could not cordon a node before its restart; will retry", "node_id", n.NodeID, "err", err)
@@ -676,10 +714,18 @@ func (d *rolloutDriver) startUpgrade(ctx context.Context, r *RolloutRecord, n *R
 		return
 	}
 	d.logf("cluster: rollout upgrading node", "rollout_id", r.ID, "node_id", n.NodeID, "op", op, "to", targetOf(r), "caller", r.Caller)
-	d.sendApply(ctx, r, *n, m, op)
+	sent = true
+	d.spawn(n.NodeID, d.applyCall(ctx, r, *n, m, op))
 }
 
+// sendApply sends the apply step again (a resend), in a call slot of its
+// own.
 func (d *rolloutDriver) sendApply(ctx context.Context, r *RolloutRecord, n RolloutNodeRecord, m Member, op string) {
+	d.run(n.NodeID, d.applyCall(ctx, r, n, m, op))
+}
+
+// applyCall is one apply step's call, to run in a claimed slot.
+func (d *rolloutDriver) applyCall(ctx context.Context, r *RolloutRecord, n RolloutNodeRecord, m Member, op string) func() {
 	timeout := time.Duration(r.NodeTimeoutNanos)
 	health := nodeupgrade.DefaultHealthTimeout
 	if timeout > 0 && timeout/2 < health {
@@ -694,7 +740,7 @@ func (d *rolloutDriver) sendApply(ctx context.Context, r *RolloutRecord, n Rollo
 		req.Files = nil
 	}
 	rolloutID := r.ID
-	d.run(n.NodeID, func() {
+	return func() {
 		cctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), d.applyTimeout)
 		defer cancel()
 		resp, err := d.nodes.Step(cctx, m, req)
@@ -716,7 +762,7 @@ func (d *rolloutDriver) sendApply(ctx context.Context, r *RolloutRecord, n Rollo
 		default:
 			fail(err.Error())
 		}
-	})
+	}
 }
 
 func (d *rolloutDriver) failNode(ctx context.Context, rolloutID string, n RolloutNodeRecord, why string) {
@@ -732,15 +778,15 @@ func (d *rolloutDriver) failNode(ctx context.Context, rolloutID string, n Rollou
 func (d *rolloutDriver) watchUpgrading(ctx context.Context, r *RolloutRecord, members map[string]Member) bool {
 	now := d.host.now()
 	target := targetOf(r)
+	var list []*RolloutNodeRecord
 	for _, n := range r.sortedNodes() {
-		if n.State != upgradewire.NodeUpgrading || d.busy(n.NodeID) {
-			continue
+		if n.State == upgradewire.NodeUpgrading && !d.busy(n.NodeID) {
+			list = append(list, n)
 		}
-		m := members[n.NodeID]
-		sctx, cancel := context.WithTimeout(ctx, 10*time.Second)
-		st, err := d.nodes.Status(sctx, m, n.Op)
-		cancel()
-		if err == nil && d.followUpgrading(ctx, r, n, m, st, now) {
+	}
+	reads := d.readStatuses(ctx, list, members)
+	for i, n := range list {
+		if reads[i].err == nil && d.followUpgrading(ctx, r, n, members[n.NodeID], reads[i].st, now) {
 			continue
 		}
 		if n.DeadlineUnixNano > 0 && now.After(time.Unix(0, n.DeadlineUnixNano)) {
@@ -756,6 +802,34 @@ func (d *rolloutDriver) watchUpgrading(ctx context.Context, r *RolloutRecord, me
 		return true
 	}
 	return false
+}
+
+// nodeRead is one node's answer to a status read.
+type nodeRead struct {
+	st  UpgradeNodeStatus
+	err error
+}
+
+// readStatuses reads the nodes' upgrade state side by side, at most
+// callLimit at a time, each bounded by statusTimeout: a tick waits for its
+// slowest round, not for every dead host in turn.
+func (d *rolloutDriver) readStatuses(ctx context.Context, nodes []*RolloutNodeRecord, members map[string]Member) []nodeRead {
+	out := make([]nodeRead, len(nodes))
+	slots := make(chan struct{}, d.callLimit())
+	var wg sync.WaitGroup
+	for i, n := range nodes {
+		slots <- struct{}{}
+		wg.Add(1)
+		go func(i int, m Member, op string) {
+			defer wg.Done()
+			defer func() { <-slots }()
+			sctx, cancel := context.WithTimeout(ctx, statusTimeout)
+			defer cancel()
+			out[i].st, out[i].err = d.nodes.Status(sctx, m, op)
+		}(i, members[n.NodeID], n.Op)
+	}
+	wg.Wait()
+	return out
 }
 
 // followUpgrading acts on one upgrading node's own report and says whether

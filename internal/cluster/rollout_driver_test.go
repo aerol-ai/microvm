@@ -983,6 +983,119 @@ func TestRolloutDriverResendKeepsQuorum(t *testing.T) {
 	}
 }
 
+// gatedNodes holds every worker's stage call until gate closes, and counts
+// the calls in flight.
+type gatedNodes struct {
+	*fakeNodes
+	gate      chan struct{}
+	mu        sync.Mutex
+	now, peak int
+}
+
+func (g *gatedNodes) Step(ctx context.Context, m Member, req UpgradeStepRequest) (UpgradeStepResponse, error) {
+	if req.Step == UpgradeStepStage && strings.HasPrefix(m.NodeID, "w") {
+		g.mu.Lock()
+		g.now++
+		g.peak = max(g.peak, g.now)
+		g.mu.Unlock()
+		<-g.gate
+		g.mu.Lock()
+		g.now--
+		g.mu.Unlock()
+	}
+	return g.fakeNodes.Step(ctx, m, req)
+}
+
+func (g *gatedNodes) counts() (now, peak int) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.now, g.peak
+}
+
+// R11: staging 40 workers opens at most maxCalls calls at once (64 by
+// default), not one per node; the rest go out on later ticks as slots free.
+func TestRolloutDriverBoundsNodeCalls(t *testing.T) {
+	g := newRolloutRig(t, 1, 0, 40)
+	gated := &gatedNodes{fakeNodes: g.nodes, gate: make(chan struct{})}
+	d := newRolloutDriver(g.host, gated, nil)
+	d.maxCalls, d.applyResendAfter = 8, time.Hour
+	g.start(func(r *RolloutRecord) { r.AllowDowntime = true; r.Hold = true })
+	ctx := context.Background()
+	d.tick(ctx) // the server stages first
+	d.wg.Wait()
+	d.tick(ctx) // the workers' turn
+	d.tick(ctx) // a second tick while every slot is taken
+	deadline := time.Now().Add(5 * time.Second)
+	for now, _ := gated.counts(); now < 8 && time.Now().Before(deadline); now, _ = gated.counts() {
+		time.Sleep(5 * time.Millisecond)
+	}
+	time.Sleep(50 * time.Millisecond) // room for any call over the bound to show
+	if now, peak := gated.counts(); now != 8 || peak != 8 {
+		t.Fatalf("calls in flight = %d (peak %d), want 8", now, peak)
+	}
+	close(gated.gate)
+	for i := 0; i < 50 && g.host.rollout().State == upgradewire.StateStaging; i++ {
+		d.wg.Wait()
+		d.tick(ctx)
+	}
+	d.wg.Wait()
+	r := g.host.rollout()
+	if _, peak := gated.counts(); peak != 8 || r.State == upgradewire.StateStaging {
+		t.Fatalf("peak %d, rollout %s %s", peak, r.State, describeNodes(r))
+	}
+}
+
+// slowStatus answers each status read after a pause and counts the reads in
+// flight.
+type slowStatus struct {
+	*fakeNodes
+	delay     time.Duration
+	mu        sync.Mutex
+	now, peak int
+}
+
+func (s *slowStatus) Status(ctx context.Context, m Member, op string) (UpgradeNodeStatus, error) {
+	s.mu.Lock()
+	s.now++
+	s.peak = max(s.peak, s.now)
+	s.mu.Unlock()
+	time.Sleep(s.delay)
+	s.mu.Lock()
+	s.now--
+	s.mu.Unlock()
+	return s.fakeNodes.Status(ctx, m, op)
+}
+
+// R11: the leader reads its upgrading nodes side by side, at most maxCalls
+// at a time, so a few dead hosts (each read waits up to 10 s) no longer
+// stall a tick for minutes.
+func TestRolloutDriverReadsUpgradingNodesSideBySide(t *testing.T) {
+	const workers = 12
+	g := newRolloutRig(t, 1, 0, workers)
+	for id, n := range g.nodes.nodes {
+		if strings.HasPrefix(id, "w") {
+			n.neverHealth = true
+		}
+	}
+	g.start(func(r *RolloutRecord) { r.AllowDowntime = true; r.Batch = "100%" })
+	g.run(upgradewire.StateRunning)
+	for i := 0; i < 10 && len(g.host.rollout().nodesIn(upgradewire.NodeUpgrading)) < workers; i++ {
+		g.driver.tick(context.Background())
+	}
+	if n := len(g.host.rollout().nodesIn(upgradewire.NodeUpgrading)); n != workers {
+		t.Fatalf("setup: %d upgrading", n)
+	}
+	slow := &slowStatus{fakeNodes: g.nodes, delay: 50 * time.Millisecond}
+	d := newRolloutDriver(g.host, slow, nil)
+	d.inline, d.maxCalls, d.applyResendAfter = true, 4, time.Hour
+	start := time.Now()
+	d.tick(context.Background())
+	took := time.Since(start)
+	if slow.peak != 4 || took >= workers*slow.delay {
+		t.Fatalf("%d reads at most at once, tick took %s; want 4 at once, well under %s", slow.peak, took, workers*slow.delay)
+	}
+}
+
 // deleteNode writes the deny record `aerolvm delete node` writes, and the
 // node leaves gossip.
 func (g *rolloutRig) deleteNode(id string) {
