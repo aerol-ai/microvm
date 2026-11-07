@@ -2,11 +2,27 @@
 
 # cluster-join.sh — join an existing AerolVM cluster.
 #
-# Run this on every node EXCEPT the one that ran cluster-init.sh. The seed
-# node's printed gossip key + gossip-advertise address are required. install.sh
-# must already have run on this host.
+# The new form is a thin wrapper over `sudo sandboxd join`
+# (plans/kubectl-style-cluster-ops.md D2, §4):
+#
+#   cluster-join.sh https://<server>:7003 --token <id.secret> [--ca-cert-hash ...]
+#
+# The old form below (gossip key, bundles, a CSR signed on the seed by
+# cluster-sign-node.sh, two passes) is deprecated and stays for one release,
+# because Terraform's default mode still runs it. Run this on every node
+# EXCEPT the seed. install.sh must already have run on this host.
 
 set -euo pipefail
+
+# The new form: a join URL or a token means `sandboxd join`.
+if [[ $# -gt 0 && ( "$1" == https://* || " $* " == *" --token "* || " $* " == *" --token="* ) ]]; then
+	echo "[cluster-join] cluster-join.sh now runs: sandboxd join (use it directly next time)" >&2
+	exec "${SANDBOXD_BIN:-/usr/local/bin/sandboxd}" join "$@"
+fi
+case " $* " in
+	*" --help "*) ;;
+	*) echo "cluster-join.sh: the two-pass join (bundles, a signed CSR, scp) is deprecated and goes away next release; use the one line \`aerolvm join-command\` prints, which runs sandboxd join" >&2 ;;
+esac
 
 NODE_ID=""
 API_ADVERTISE_URL=""
