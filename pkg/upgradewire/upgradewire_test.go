@@ -50,4 +50,12 @@ func TestWireNames(t *testing.T) {
 	if r.ActiveVersion != "v0.6.12" || r.ActiveFSMOpsVersion != 13 || !r.Nodes[0].Migrated {
 		t.Fatalf("Rollout active version decode: %+v", r)
 	}
+	b, err = json.Marshal(NodeUpgradeResponse{Op: "o1", State: "done", Version: "v1", From: "v2", Rollback: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want = `{"op":"o1","state":"done","version":"v1","from":"v2","rollback":true,"started_at":"0001-01-01T00:00:00Z","updated_at":"0001-01-01T00:00:00Z"}`
+	if string(b) != want {
+		t.Fatalf("NodeUpgradeResponse JSON\n got %s\nwant %s", b, want)
+	}
 }

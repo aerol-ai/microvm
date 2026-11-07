@@ -218,6 +218,14 @@ type LeaderTransferResponse struct {
 	Term   uint64 `json:"term"`
 }
 
+// The states of a local operation that callers branch on (the others are
+// progress).
+const (
+	NodeOpPending = "pending"
+	NodeOpDone    = "done"
+	NodeOpFailed  = "failed"
+)
+
 // NodeUpgradeRequest is the body of POST NodeUpgradePath.
 type NodeUpgradeRequest struct {
 	Version string `json:"version"`
@@ -236,11 +244,18 @@ type NodeUpgradeRequest struct {
 
 // NodeUpgradeResponse is one local upgrade operation.
 type NodeUpgradeResponse struct {
-	Op      string `json:"op"`
+	Op string `json:"op"`
+	// State is the operation's phase: NodeOpPending while the upgrader is
+	// launched but has written no record yet, then the upgrader's own
+	// phases (staging, stopping, backup, swapping, host-apply, starting,
+	// reverting), ending in NodeOpDone or NodeOpFailed.
 	State   string `json:"state"`
 	Version string `json:"version"`
 	// From is the version the node ran before the operation.
-	From      string    `json:"from,omitempty"`
+	From string `json:"from,omitempty"`
+	// Rollback is true when the operation was a rollback, so
+	// `aerolvm upgrade rollback` run twice does not undo its own rollback.
+	Rollback  bool      `json:"rollback,omitempty"`
 	Error     string    `json:"error,omitempty"`
 	StartedAt time.Time `json:"started_at"`
 	UpdatedAt time.Time `json:"updated_at"`
