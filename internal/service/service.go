@@ -6741,6 +6741,19 @@ func (s *Service) Reconcile(ctx context.Context) error {
 		if strings.HasPrefix(sandbox.LastError, reconcileUnknownErrorPrefix) {
 			sandbox.LastError = ""
 		}
+		// A lifecycle step (a start, stop, restart, idle stop or destroy)
+		// that holds this sandbox is changing it: the runtime is mid-change
+		// and the step writes its own status and reason. Reconcile used to
+		// see a VM an idle stop had just stopped, record "reconcile" before
+		// the stop wrote "idle", and the store kept the first reason (UC-395
+		// on single-node-fc, where a VM stop takes seconds). So a change only
+		// this pass saw, on a sandbox a step holds, is left to the step; the
+		// next pass sees the result. It does not wait: a step can hold the
+		// lock for seconds. With no step holding it, a change this pass saw
+		// happened outside any step, and "reconcile" is the right reason.
+		if state.Status != sandbox.Status && s.lifecycleLocks.held(sandbox.ID) {
+			continue
+		}
 		// A started instance listed without an address or id has not moved;
 		// the runtime just did not say this pass (containerd's netns probe
 		// failed, firecracker's list never carries them). Keep the row's, so

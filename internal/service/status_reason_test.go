@@ -195,6 +195,35 @@ func TestReconcileNamesAStopItOnlyFound(t *testing.T) {
 	wantReason(t, h.row(t, "sb-seen"), models.SandboxStatusStarted, "", nil)
 }
 
+// TestReconcileLeavesASandboxALifecycleStepHolds: an idle stop holds the
+// sandbox's lifecycle lock while it stops the runtime and then writes
+// stopped/idle. A reconcile pass in between saw the runtime stopped and wrote
+// stopped/reconcile first, and the store kept that reason (UC-395 on
+// single-node-fc). Reconcile now leaves a sandbox a step holds to the step.
+func TestReconcileLeavesASandboxALifecycleStepHolds(t *testing.T) {
+	ctx := context.Background()
+	h := newStatusReasonHarness(t)
+	h.seedStarted(t, "sb-idle", models.Lifecycle{}, 0, 0)
+	h.rt.managed = map[string]*models.SandboxRuntimeState{
+		"sb-idle": {ContainerID: "sb-idle", ContainerIP: "10.0.0.9", Status: models.SandboxStatusStopped},
+	}
+	unlock, err := h.svc.lifecycleLocks.lockCtx(ctx, "sb-idle") // the idle stop, mid-way
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := h.svc.Reconcile(ctx); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	wantReason(t, h.row(t, "sb-idle"), models.SandboxStatusStarted, "", nil)
+	unlock()
+
+	// With no step holding it, a stop only reconcile saw is still named so.
+	if err := h.svc.Reconcile(ctx); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	wantReason(t, h.row(t, "sb-idle"), models.SandboxStatusStopped, models.StatusReasonReconcile, nil)
+}
+
 // TestReconcileWithAStaleReadKeepsTheEventsReason is the race the store's
 // transition rule exists for: reconcile read the row as started, the die
 // event then stopped it with its own reason, and reconcile's whole-row write

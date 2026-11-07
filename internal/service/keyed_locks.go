@@ -83,6 +83,10 @@ func (l *keyedLocks[K]) lockCtx(ctx context.Context, k K) (func(), error) {
 	return l.unlockFunc(k, e), nil
 }
 
+// held reports whether a call holds or waits for k's lock: reconcile leaves
+// a sandbox a lifecycle step holds to that step.
+func (l *keyedLocks[K]) held(k K) bool { return l.refs(k) > 0 }
+
 // refs is the number of calls holding or waiting for k's lock, and keys the
 // number of keys with any. Tests only.
 func (l *keyedLocks[K]) refs(k K) int {
