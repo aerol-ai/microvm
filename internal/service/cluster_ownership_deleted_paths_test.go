@@ -52,6 +52,9 @@ func TestReplayClusterOwnershipUnplacedRowWithoutProof(t *testing.T) {
 			rt := &recordingRuntime{}
 			svc, st, _ := newServiceRuntimeHarness(t, rt)
 			svc.cfg.EnableCluster = true
+			// An old row and a live grace: without the lookup, this row
+			// would be destroyed as unproven.
+			svc.cfg.AuditDeletedGrace = time.Hour
 			c := &lookupCountingCluster{
 				deletedLifecycleCluster: newDeletedLifecycleCluster(map[string]string{"sb-unplaced": "inc-unplaced"}),
 				lookupErr:               tc.lookupErr,
@@ -62,7 +65,7 @@ func TestReplayClusterOwnershipUnplacedRowWithoutProof(t *testing.T) {
 			}
 			svc.AttachCluster(c)
 			now := time.Now().UTC()
-			seedReplayRow(t, st, "sb-unplaced", "inc-unplaced", now)
+			seedReplayRow(t, st, "sb-unplaced", "inc-unplaced", now.Add(-2*time.Hour))
 			seedReplayRow(t, st, "sb-reserved", "inc-reserved", now)
 
 			_, err := svc.ReplayClusterOwnership(ctx)
@@ -100,6 +103,7 @@ func TestReplayClusterOwnershipNeverLooksUpWithoutIncarnation(t *testing.T) {
 	rt := &recordingRuntime{}
 	svc, st, _ := newServiceRuntimeHarness(t, rt)
 	svc.cfg.EnableCluster = true
+	svc.cfg.AuditDeletedGrace = time.Hour
 	c := &lookupCountingCluster{deletedLifecycleCluster: newDeletedLifecycleCluster(nil)}
 	svc.AttachCluster(c)
 	seedReplayRow(t, st, "sb-no-incarnation", "", time.Now().UTC())
@@ -115,10 +119,10 @@ func TestReplayClusterOwnershipNeverLooksUpWithoutIncarnation(t *testing.T) {
 	}
 }
 
-// TestDestroyDeletedClusterLifecycleRechecksRow: the destroy reads the row
+// TestDestroyUnplacedLocalSandboxRechecksRow: the destroy reads the row
 // again under the lifecycle lock and leaves it alone when it is gone or is
 // another lifetime by then; a runtime failure keeps the row for the retry.
-func TestDestroyDeletedClusterLifecycleRechecksRow(t *testing.T) {
+func TestDestroyUnplacedLocalSandboxRechecksRow(t *testing.T) {
 	ctx := context.Background()
 	rt := &recordingRuntime{}
 	svc, st, _ := newServiceRuntimeHarness(t, rt)
@@ -126,10 +130,10 @@ func TestDestroyDeletedClusterLifecycleRechecksRow(t *testing.T) {
 	svc.AttachCluster(newDeletedLifecycleCluster(nil))
 	seedReplayRow(t, st, "sb-reused", "inc-new", time.Now().UTC())
 
-	if err := svc.destroyDeletedClusterLifecycle(ctx, "sb-missing", "inc-missing"); err != nil {
+	if err := svc.destroyUnplacedLocalSandbox(ctx, "sb-missing", "inc-missing", unplacedDestroyedDeleted); err != nil {
 		t.Fatalf("missing row: %v", err)
 	}
-	if err := svc.destroyDeletedClusterLifecycle(ctx, "sb-reused", "inc-old"); err != nil {
+	if err := svc.destroyUnplacedLocalSandbox(ctx, "sb-reused", "inc-old", unplacedDestroyedDeleted); err != nil {
 		t.Fatalf("reused row: %v", err)
 	}
 	if _, err := st.Get(ctx, "sb-reused"); err != nil {
@@ -140,14 +144,14 @@ func TestDestroyDeletedClusterLifecycleRechecksRow(t *testing.T) {
 	}
 
 	rt.destroyErr = errors.New("runtime busy")
-	if err := svc.destroyDeletedClusterLifecycle(ctx, "sb-reused", "inc-new"); !errors.Is(err, rt.destroyErr) {
+	if err := svc.destroyUnplacedLocalSandbox(ctx, "sb-reused", "inc-new", unplacedDestroyedUnproven); !errors.Is(err, rt.destroyErr) {
 		t.Fatalf("destroy = %v, want the runtime error", err)
 	}
 	if _, err := st.Get(ctx, "sb-reused"); err != nil {
 		t.Fatalf("a failed destroy must keep the row as the retry anchor: %v", err)
 	}
 	rt.destroyErr = nil
-	if err := svc.destroyDeletedClusterLifecycle(ctx, "sb-reused", "inc-new"); err != nil {
+	if err := svc.destroyUnplacedLocalSandbox(ctx, "sb-reused", "inc-new", unplacedDestroyedUnproven); err != nil {
 		t.Fatalf("retried destroy: %v", err)
 	}
 	if _, err := st.Get(ctx, "sb-reused"); !errors.Is(err, store.ErrNotFound) {
@@ -172,5 +176,46 @@ func TestReplayClusterOwnershipDestroyFailureIsReported(t *testing.T) {
 	}
 	if slices.Contains(c.assertedIDs(), "sb-deleted") {
 		t.Fatalf("a deleted lifecycle was handed to the cluster after a failed destroy: %v", c.assertedIDs())
+	}
+}
+
+// TestUnplacedRowPlaceable is the proof that lets a row with no placement and
+// no post-delete record be placed instead of destroyed.
+func TestUnplacedRowPlaceable(t *testing.T) {
+	now := time.Date(2026, 11, 7, 12, 0, 0, 0, time.UTC)
+	cases := []struct {
+		name       string
+		createdAt  time.Time
+		grace      time.Duration
+		soleServer bool
+		want       bool
+	}{
+		{"sole server places an old row (a single node turned into a cluster)", now.Add(-48 * time.Hour), time.Hour, true, true},
+		{"sole server places even with grace 0", now.Add(-48 * time.Hour), 0, true, true},
+		{"young row: a delete would still have its record", now.Add(-10 * time.Minute), time.Hour, false, true},
+		{"row just inside grace less clock skew", now.Add(-58*time.Minute + time.Second), time.Hour, false, true},
+		{"row at grace less clock skew: no longer provable", now.Add(-59 * time.Minute), time.Hour, false, false},
+		{"old row: its record may have expired", now.Add(-2 * time.Hour), time.Hour, false, false},
+		{"grace 0 keeps no record, so nothing is provable", now.Add(-time.Second), 0, false, false},
+		{"grace shorter than the clock skew allowance", now.Add(-time.Second), 30 * time.Second, false, false},
+		{"unknown creation time counts as old", time.Time{}, time.Hour, false, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := unplacedRowPlaceable(tc.createdAt, now, tc.grace, tc.soleServer); got != tc.want {
+				t.Fatalf("unplacedRowPlaceable(age=%s, grace=%s, sole=%v) = %v, want %v",
+					now.Sub(tc.createdAt), tc.grace, tc.soleServer, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestDestroyUnplacedLocalSandboxNeedsCluster: without a placement client the
+// destroy cannot confirm there is no placement, so it refuses.
+func TestDestroyUnplacedLocalSandboxNeedsCluster(t *testing.T) {
+	svc, _, _ := newServiceRuntimeHarness(t, &recordingRuntime{})
+	svc.cfg.EnableCluster = true
+	if err := svc.destroyUnplacedLocalSandbox(context.Background(), "sb-x", "inc-x", unplacedDestroyedUnproven); !errors.Is(err, ErrClusterFinalizationUnavailable) {
+		t.Fatalf("destroy without a cluster = %v, want ErrClusterFinalizationUnavailable", err)
 	}
 }

@@ -53,11 +53,10 @@ var (
 
 	clusterReservationsExpired = expvar.NewInt("aerolvm_cluster_reservations_expired_total")
 
-	// Local rows the ownership replay did not place (deleted_lifecycle.go):
-	// "deleted" when opPlace refused a deleted lifecycle, "unproven" when the
-	// row has no placement and nothing proves it was never deleted. An
-	// unproven row stays on its node until an operator destroys it.
-	clusterOwnershipReplaySkipped = expvar.NewMap("aerolvm_cluster_ownership_replay_skipped_total")
+	// Ownership replays of a local row that opPlace refused because the
+	// cluster deleted that lifecycle (deleted_lifecycle.go). The service
+	// checks first, so this moves only on a race with a delete.
+	clusterOwnershipReplayRefused = expvar.NewInt("aerolvm_cluster_ownership_replay_refused_total")
 
 	// Restart catch-up (catch_up.go). catching_up is 1 from New until the
 	// FSM applies the leader's read index; a node stuck at 1 cannot reach a
@@ -188,8 +187,8 @@ func recordExpiredReservation() {
 	clusterReservationsExpired.Add(1)
 }
 
-func recordOwnershipReplaySkipped(reason string) {
-	clusterOwnershipReplaySkipped.Add(reason, 1)
+func recordOwnershipReplayRefused() {
+	clusterOwnershipReplayRefused.Add(1)
 }
 
 // recordFailoverRecreate counts one attempt to re-materialize an opted-in

@@ -237,9 +237,6 @@ func TestAgentAssertOwnershipFreshPlacementReplaysPortsAndDomains(t *testing.T) 
 		return false
 	}), Member{NodeID: "worker-self", Alive: true, Role: config.NodeRoleWorker})
 
-	// A fresh row is younger than the post-delete grace, so a worker may
-	// place it (adoptUnplacedRow).
-	agent.cfg.AuditDeletedGrace = time.Hour
 	spec := &models.CreateSandboxRequest{Image: "alpine:3.20"}
 	if err := agent.AssertOwnership(context.Background(), []LocalSandboxState{{
 		ID:              "sb-fresh",
@@ -247,7 +244,6 @@ func TestAgentAssertOwnershipFreshPlacementReplaysPortsAndDomains(t *testing.T) 
 		Secrets:         PlacementSecrets{IncarnationID: "inc-fresh"},
 		ExposedPorts:    map[int]ExposedPortRoute{8080: {Protocol: "http"}},
 		CustomHostnames: []string{"fresh.example.com"},
-		CreatedAt:       time.Now(),
 	}}); err != nil {
 		t.Fatalf("AssertOwnership(fresh): %v", err)
 	}

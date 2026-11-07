@@ -263,9 +263,11 @@ const (
 	systemActionFleetDelete       = "fleet.delete"
 	systemActionMethod            = "SYSTEM"
 	auditSubsystemAuditMode       = "audit"
-	// The cluster deleted the sandbox while this node was cut off; the
-	// node destroys its leftover copy when it returns (C2).
-	systemActionClusterDeleted = "cluster.deleted_while_away"
+	// A node returning from a cut-off destroys its copy of a sandbox the
+	// cluster has no placement for (C2): one the cluster deleted while it
+	// was away, or one nothing proves is still live.
+	systemActionClusterDeleted  = "cluster.deleted_while_away"
+	systemActionClusterUnproven = "cluster.unproven_while_away"
 )
 
 // beginSystemAction resolves the sandbox's lifecycle and owner now, before

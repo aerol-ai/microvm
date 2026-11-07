@@ -17,11 +17,19 @@ import (
 // post-delete records (sandbox id -> incarnation). Its AssertOwnership writes
 // a placement for every row it is handed, as Cluster.AssertOwnership did for a
 // missing row before C2, so a row that reaches it counts as re-placed.
+//
+// authoritative, when set, is what an authoritative read returns instead of
+// placements: a worker's PlacementOf reports "no placement" when its lookup
+// fails, so the authoritative answer can differ. authErr fails that read.
+// sole says whether this node is the only Raft server.
 type deletedLifecycleCluster struct {
 	*cluster.Noop
-	placements map[string]cluster.Placement
-	deleted    map[string]string
-	asserted   []cluster.LocalSandboxState
+	placements    map[string]cluster.Placement
+	deleted       map[string]string
+	asserted      []cluster.LocalSandboxState
+	authoritative map[string]cluster.Placement
+	authErr       error
+	sole          bool
 }
 
 func newDeletedLifecycleCluster(deleted map[string]string) *deletedLifecycleCluster {
@@ -38,14 +46,23 @@ func (c *deletedLifecycleCluster) PlacementOf(id string) (cluster.Placement, boo
 }
 
 func (c *deletedLifecycleCluster) AuthoritativePlacementsByIDs(_ context.Context, ids []string) (map[string]cluster.Placement, error) {
+	if c.authErr != nil {
+		return nil, c.authErr
+	}
+	source := c.placements
+	if c.authoritative != nil {
+		source = c.authoritative
+	}
 	out := make(map[string]cluster.Placement, len(ids))
 	for _, id := range ids {
-		if p, ok := c.placements[id]; ok {
+		if p, ok := source[id]; ok {
 			out[id] = p
 		}
 	}
 	return out, nil
 }
+
+func (c *deletedLifecycleCluster) SoleRaftServer() bool { return c.sole }
 
 func (c *deletedLifecycleCluster) AuditACLForSandbox(_ context.Context, id, incarnationID string) (cluster.AuditACL, bool, error) {
 	if inc, ok := c.deleted[id]; ok && incarnationID != "" && inc == incarnationID {
@@ -97,6 +114,7 @@ func TestReplayClusterOwnershipDestroysDeletedLifecycle(t *testing.T) {
 	rt := &recordingRuntime{}
 	svc, st, _ := newServiceRuntimeHarness(t, rt)
 	svc.cfg.EnableCluster = true
+	svc.cfg.AuditDeletedGrace = time.Hour
 	c := newDeletedLifecycleCluster(map[string]string{"sb-deleted": "inc-deleted"})
 	svc.AttachCluster(c)
 
@@ -143,5 +161,109 @@ func TestReplayClusterOwnershipDestroysDeletedLifecycle(t *testing.T) {
 	}
 	if !recorded {
 		t.Fatalf("the destroy wrote no system:boot-restore audit record: %+v", sink.Events())
+	}
+}
+
+// TestReplayClusterOwnershipUnplacedRowOutcomes is the rule for a local row
+// the cluster has no placement for, after the user's decision on C2:
+// destroy it unless it is provably not a deleted sandbox. Provably live means
+// this node is the only Raft server, or the row is younger than
+// SB_AUDIT_DELETED_GRACE (a delete would still have its record). Every
+// destroy re-checks that the cluster really has no placement, and nothing is
+// destroyed when post-delete records are switched off (grace 0) or the row
+// has no incarnation to match.
+func TestReplayClusterOwnershipUnplacedRowOutcomes(t *testing.T) {
+	const (
+		placed    = "placed"
+		destroyed = "destroyed"
+		kept      = "kept"
+	)
+	old := time.Now().UTC().Add(-2 * time.Hour)
+	young := time.Now().UTC()
+	cases := []struct {
+		name          string
+		grace         time.Duration
+		createdAt     time.Time
+		incarnation   string
+		deleted       bool
+		sole          bool
+		authoritative map[string]cluster.Placement
+		authErr       error
+		want          string
+		wantRecord    string
+		wantErr       bool
+	}{
+		{name: "post-delete record: destroyed", grace: time.Hour, createdAt: young, incarnation: "inc-row", deleted: true,
+			want: destroyed, wantRecord: "SYSTEM cluster.deleted_while_away"},
+		{name: "older than the grace, no record, not the sole server: destroyed as unproven", grace: time.Hour, createdAt: old, incarnation: "inc-row",
+			want: destroyed, wantRecord: "SYSTEM cluster.unproven_while_away"},
+		{name: "older than the grace on the sole Raft server: placed", grace: time.Hour, createdAt: old, incarnation: "inc-row", sole: true,
+			want: placed},
+		{name: "younger than the grace: placed", grace: time.Hour, createdAt: young, incarnation: "inc-row",
+			want: placed},
+		{name: "grace 0 keeps no record, so nothing is destroyed", grace: 0, createdAt: old, incarnation: "inc-row",
+			want: kept},
+		{name: "grace 0 on the sole Raft server: placed", grace: 0, createdAt: old, incarnation: "inc-row", sole: true,
+			want: placed},
+		{name: "the cluster still has a placement the local view missed: kept", grace: time.Hour, createdAt: old, incarnation: "inc-row",
+			authoritative: map[string]cluster.Placement{"sb-row": {SandboxID: "sb-row", OwnerNodeID: "self", IncarnationID: "inc-row", State: cluster.PlacementStatePlaced}},
+			want:          kept},
+		{name: "the authoritative read fails: kept and reported", grace: time.Hour, createdAt: old, incarnation: "inc-row",
+			authErr: errors.New("leader unreachable"), want: kept, wantErr: true},
+		{name: "no incarnation to match: kept", grace: time.Hour, createdAt: old, incarnation: "",
+			want: kept},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			rt := &recordingRuntime{}
+			svc, st, _ := newServiceRuntimeHarness(t, rt)
+			svc.cfg.EnableCluster = true
+			svc.cfg.AuditDeletedGrace = tc.grace
+			deleted := map[string]string{}
+			if tc.deleted {
+				deleted["sb-row"] = tc.incarnation
+			}
+			c := newDeletedLifecycleCluster(deleted)
+			c.sole, c.authoritative, c.authErr = tc.sole, tc.authoritative, tc.authErr
+			svc.AttachCluster(c)
+			sink := &memSecretAuditSink{}
+			svc.secretAudit = sink
+			svc.secretAuditOnce.Do(func() {})
+			seedReplayRow(t, st, "sb-row", tc.incarnation, tc.createdAt)
+
+			_, err := svc.ReplayClusterOwnership(ctx)
+			if tc.wantErr != (err != nil) {
+				t.Fatalf("ReplayClusterOwnership error = %v, want error %v", err, tc.wantErr)
+			}
+			asserted := slices.Contains(c.assertedIDs(), "sb-row")
+			_, getErr := st.Get(ctx, "sb-row")
+			rowGone := errors.Is(getErr, store.ErrNotFound)
+			runtimeGone := slices.Contains(rt.destroyIDs, "sb-row")
+			got := kept
+			switch {
+			case asserted && !rowGone && !runtimeGone:
+				got = placed
+			case rowGone && runtimeGone && !asserted:
+				got = destroyed
+			case asserted || rowGone || runtimeGone:
+				t.Fatalf("mixed outcome: asserted=%v rowGone=%v runtimeDestroyed=%v", asserted, rowGone, runtimeGone)
+			}
+			if got != tc.want {
+				t.Fatalf("outcome = %s, want %s (asserted=%v rowGone=%v runtimeDestroyed=%v)", got, tc.want, asserted, rowGone, runtimeGone)
+			}
+			if tc.wantRecord == "" {
+				return
+			}
+			found := false
+			for _, ev := range sink.Events() {
+				if ev.Ref == tc.wantRecord && ev.SandboxID == "sb-row" && ev.Caller.ID == "system:boot-restore" {
+					found = true
+				}
+			}
+			if !found {
+				t.Fatalf("no %q audit record by system:boot-restore: %+v", tc.wantRecord, sink.Events())
+			}
+		})
 	}
 }
