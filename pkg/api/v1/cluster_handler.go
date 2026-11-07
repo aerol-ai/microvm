@@ -725,7 +725,14 @@ func (h *handlers) clusterMembers(w http.ResponseWriter, r *http.Request) {
 	}
 	// Voter and leader come from this server's Raft view; on a worker the
 	// control plane's answer already carries them.
-	members := cluster.AnnotateRaftRoles(c, c.Members())
+	members := c.Members()
+	var voters []string
+	if reader, ok := c.(cluster.RaftRoleReader); ok {
+		if roles, ok := reader.RaftRoles(); ok {
+			members = roles.Annotate(members)
+			voters = roles.Voters()
+		}
+	}
 	view := make([]memberView, 0, len(members))
 	denied, _ := c.(cluster.DeniedNodeChecker)
 	for _, m := range members {
@@ -742,6 +749,13 @@ func (h *handlers) clusterMembers(w http.ResponseWriter, r *http.Request) {
 	// §13): the gossip gate with its boot-window rule, not just the list.
 	if gate, ok := c.(cluster.ServerKeyRingGate); ok {
 		resp["server_key_ring_ready"] = gate.ServerKeyRingAllowed()
+	}
+	// raft_voters (a new field, only on a node with a Raft view) is the
+	// Raft configuration's voters. The member list is gossip, which drops
+	// a server that has been down a while, so `sandboxd upgrade node`
+	// counts voters from here when it checks quorum before a stop.
+	if voters != nil {
+		resp["raft_voters"] = voters
 	}
 	apihttp.WriteJSON(w, http.StatusOK, resp)
 }

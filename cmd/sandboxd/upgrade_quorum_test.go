@@ -18,15 +18,32 @@ import (
 )
 
 type fakeGuardAPI struct {
-	members     []cluster.Member
+	members []cluster.Member
+	// voters is raft_voters; nil sends the voters the members' flags name,
+	// as a daemon with the field does.
+	voters []string
+	// legacy leaves raft_voters out, as a daemon from before the field.
+	legacy      bool
 	membersErr  error
 	transfer    upgradewire.LeaderTransferResponse
 	transferErr error
 	transfers   int
 }
 
-func (f *fakeGuardAPI) Members(context.Context) ([]cluster.Member, error) {
-	return f.members, f.membersErr
+func (f *fakeGuardAPI) Members(context.Context) (memberList, error) {
+	if f.membersErr != nil || f.legacy {
+		return memberList{Members: f.members}, f.membersErr
+	}
+	voters := f.voters
+	if voters == nil {
+		voters = []string{}
+		for _, m := range f.members {
+			if m.Voter {
+				voters = append(voters, m.NodeID)
+			}
+		}
+	}
+	return memberList{Members: f.members, RaftVoters: voters}, nil
 }
 
 func (f *fakeGuardAPI) TransferLeadership(context.Context) (upgradewire.LeaderTransferResponse, error) {
@@ -93,6 +110,36 @@ func TestGuardServerStop(t *testing.T) {
 			wantErr: `node "s9" is not in the local member list`},
 		{name: "this node not listed with --allow-downtime goes on", self: "s9", allow: true,
 			api: fakeGuardAPI{members: []cluster.Member{srv("s1", true, true)}}},
+		// J2: gossip forgot two dead voters of five. The member list shows
+		// 3 of 3 up; the Raft configuration still has 5, so stopping one
+		// leaves 2 of 5 and is refused.
+		{name: "voters gossip forgot still count", self: "s2",
+			api: fakeGuardAPI{members: []cluster.Member{srv("s1", true, true), srv("s2", true, false), srv("s3", true, false), worker},
+				voters: []string{"s1", "s2", "s3", "s4", "s5"}},
+			wantErr: "leaves 2 of 5 voting servers up, and Raft needs 3; these servers are down: s4, s5"},
+		{name: "voters gossip forgot, with --allow-downtime: warns", self: "s2", allow: true,
+			api: fakeGuardAPI{members: []cluster.Member{srv("s1", true, true), srv("s2", true, false), srv("s3", true, false)},
+				voters: []string{"s1", "s2", "s3", "s4", "s5"}},
+			wantOut: "leaves 2 of 5 voting servers up"},
+		{name: "five voters, one forgotten: a stop keeps quorum", self: "s3",
+			api: fakeGuardAPI{members: []cluster.Member{srv("s1", true, true), srv("s2", true, false), srv("s3", true, false), srv("s4", true, false)},
+				voters: []string{"s1", "s2", "s3", "s4", "s5"}}},
+		{name: "the Raft configuration decides who votes, not a stale flag", self: "s2",
+			api: fakeGuardAPI{members: []cluster.Member{srv("s1", true, true), {NodeID: "s2", Alive: true}, srv("s3", false, false)},
+				voters: []string{"s1", "s2", "s3"}},
+			wantErr: "leaves 1 of 3 voting servers up"},
+		{name: "a node the Raft configuration does not list as a voter goes on", self: "s3",
+			api: fakeGuardAPI{members: []cluster.Member{srv("s1", true, true), srv("s2", false, false), srv("s3", true, false)},
+				voters: []string{"s1", "s2"}}},
+		{name: "this node missing from gossip but voting still counts", self: "s2",
+			api:     fakeGuardAPI{members: []cluster.Member{srv("s1", true, true)}, voters: []string{"s1", "s2", "s3"}},
+			wantErr: "leaves 1 of 3 voting servers up, and Raft needs 2; these servers are down: s3"},
+		{name: "an older daemon without raft_voters: gossip count with a warning", self: "s2",
+			api:     fakeGuardAPI{legacy: true, members: []cluster.Member{srv("s1", true, true), srv("s2", true, false), srv("s3", true, false)}},
+			wantOut: "does not list the Raft voters"},
+		{name: "an older daemon without raft_voters still refuses what it can see", self: "s2",
+			api:     fakeGuardAPI{legacy: true, members: []cluster.Member{srv("s1", true, true), srv("s2", true, false), srv("s3", false, false)}},
+			wantErr: "leaves 1 of 3 voting servers up"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -142,11 +189,13 @@ func TestReadStopGuardEnv(t *testing.T) {
 // node's PAT and reads the members and hand-off routes.
 func TestServerStopGuardAgainstTheLocalAPI(t *testing.T) {
 	var gotAuth []string
+	voters := []string{"s1", "s2", "s3"}
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotAuth = append(gotAuth, r.Header.Get("Authorization"))
 		switch {
 		case r.Method == http.MethodGet && r.URL.Path == "/v1/cluster/members":
-			json.NewEncoder(w).Encode(map[string]any{"members": []cluster.Member{srv("s1", true, true), srv("s2", true, false), srv("s3", true, false)}})
+			json.NewEncoder(w).Encode(map[string]any{"members": []cluster.Member{srv("s1", true, true), srv("s2", true, false), srv("s3", true, false)},
+				"raft_voters": voters})
 		case r.Method == http.MethodPost && r.URL.Path == upgradewire.ClusterLeaderTransferPath:
 			var req upgradewire.LeaderTransferRequest
 			if err := json.NewDecoder(r.Body).Decode(&req); err != nil || r.Header.Get("Content-Type") != "application/json" {
@@ -173,6 +222,14 @@ func TestServerStopGuardAgainstTheLocalAPI(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), "handed leadership to s2") || len(gotAuth) != 2 || gotAuth[0] != "Bearer pat-9" {
 		t.Fatalf("out=%q auth=%v", out.String(), gotAuth)
+	}
+	// Two voters gossip no longer lists: the daemon's raft_voters still
+	// names them, and the guard refuses (J2).
+	voters = []string{"s1", "s2", "s3", "s4", "s5"}
+	out.Reset()
+	err := serverStopGuard(nodeupgrade.Paths{EnvFile: envFile}, &out)(context.Background(), false)
+	if err == nil || !strings.Contains(err.Error(), "leaves 2 of 5 voting servers up") {
+		t.Fatalf("guard with forgotten voters = %v", err)
 	}
 
 	// Error answers surface with their status; an empty member list is

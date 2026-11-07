@@ -42,3 +42,15 @@ func TestAnnotateRaftRolesWithoutRaftView(t *testing.T) {
 		t.Fatal("nil cluster reported a Raft view")
 	}
 }
+
+// Voters is the configuration's voters, sorted, non-voters left out; an
+// empty configuration lists none (an empty list, never nil).
+func TestRaftRolesVoters(t *testing.T) {
+	r := RaftRoles{Servers: map[string]bool{"c": true, "a": true, "learner": false, "b": true}}
+	if got := r.Voters(); len(got) != 3 || got[0] != "a" || got[1] != "b" || got[2] != "c" {
+		t.Fatalf("Voters = %v", got)
+	}
+	if got := (RaftRoles{}).Voters(); got == nil || len(got) != 0 {
+		t.Fatalf("empty Voters = %#v", got)
+	}
+}

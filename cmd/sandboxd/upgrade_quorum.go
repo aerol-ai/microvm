@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -34,7 +35,11 @@ import (
 //     the cluster is not leaderless while sandboxd restarts.
 //
 // It asks the local sandboxd over its API, as `sandboxd key rotate` does,
-// because only a server's Raft view knows who votes and who leads.
+// because only a server's Raft view knows who votes and who leads. The
+// voters come from the Raft configuration (raft_voters), not the member
+// list: gossip drops a node that has been down a while, so with 5 voters
+// and 2 long dead it would see 3 of 3 up and allow a stop that leaves 2
+// of 5.
 
 // stopGuardTimeout bounds each call to the local daemon.
 const stopGuardTimeout = 15 * time.Second
@@ -42,8 +47,16 @@ const stopGuardTimeout = 15 * time.Second
 // stopGuardAPI is the local daemon's API: the members list and the leader
 // hand-off. Tests replace newStopGuardAPI.
 type stopGuardAPI interface {
-	Members(ctx context.Context) ([]cluster.Member, error)
+	Members(ctx context.Context) (memberList, error)
 	TransferLeadership(ctx context.Context) (upgradewire.LeaderTransferResponse, error)
+}
+
+// memberList is the local daemon's GET /v1/cluster/members answer.
+type memberList struct {
+	Members []cluster.Member `json:"members"`
+	// RaftVoters is the Raft configuration's voters. nil means the daemon
+	// did not send it (a build from before the field).
+	RaftVoters []string `json:"raft_voters"`
 }
 
 // stopGuardEnv is what the guard reads from the node's env files.
@@ -100,7 +113,7 @@ func serverStopGuard(paths nodeupgrade.Paths, out io.Writer) func(context.Contex
 }
 
 func guardServerStop(ctx context.Context, e stopGuardEnv, api stopGuardAPI, allowDowntime bool, out io.Writer) error {
-	members, err := api.Members(ctx)
+	list, err := api.Members(ctx)
 	if err != nil {
 		if allowDowntime {
 			fmt.Fprintf(out, "warning: could not check quorum before stopping sandboxd (--allow-downtime given): %v\n", err)
@@ -109,22 +122,32 @@ func guardServerStop(ctx context.Context, e stopGuardEnv, api stopGuardAPI, allo
 		return fmt.Errorf("refusing to stop sandboxd: cannot ask the local sandboxd who votes and who leads, so quorum cannot be checked (pass --allow-downtime to stop it anyway): %w", err)
 	}
 	var self *cluster.Member
-	var voters, down []string
-	up := 0
-	for i := range members {
-		m := &members[i]
+	alive := map[string]bool{}
+	for i := range list.Members {
+		m := &list.Members[i]
+		alive[m.NodeID] = m.Alive
 		if m.NodeID == e.nodeID {
 			self = m
 		}
-		if !m.Voter {
-			continue
+	}
+	voters := list.RaftVoters
+	if voters == nil {
+		// An older daemon: the gossip view is all there is, and it misses
+		// a voter gossip has forgotten. Say so rather than refuse, so the
+		// documented install.sh re-run keeps working on it.
+		fmt.Fprintf(out, "warning: the local sandboxd does not list the Raft voters; counting voters from gossip, which leaves out servers that have been down a while\n")
+		for _, m := range list.Members {
+			if m.Voter {
+				voters = append(voters, m.NodeID)
+			}
 		}
-		voters = append(voters, m.NodeID)
-		if m.Alive {
-			up++
-		} else {
-			down = append(down, m.NodeID)
-		}
+	}
+	selfVotes := slices.Contains(voters, e.nodeID)
+	if self == nil && selfVotes {
+		// Gossip always lists the node it runs on; if it does not, this
+		// node is still the one about to stop.
+		self = &cluster.Member{NodeID: e.nodeID, Alive: true, Voter: true}
+		alive[e.nodeID] = true
 	}
 	if self == nil {
 		if allowDowntime {
@@ -132,8 +155,17 @@ func guardServerStop(ctx context.Context, e stopGuardEnv, api stopGuardAPI, allo
 		}
 		return fmt.Errorf("refusing to stop sandboxd: node %q is not in the local member list, so quorum cannot be checked (pass --allow-downtime to stop it anyway)", e.nodeID)
 	}
-	if !self.Voter {
+	if !selfVotes {
 		return nil
+	}
+	up := 0
+	var down []string
+	for _, id := range voters {
+		if alive[id] {
+			up++
+		} else {
+			down = append(down, id)
+		}
 	}
 	sort.Strings(down)
 	majority := len(voters)/2 + 1
@@ -214,17 +246,15 @@ func (a *localAPI) do(ctx context.Context, method, path string, body any, out an
 	return nil
 }
 
-func (a *localAPI) Members(ctx context.Context) ([]cluster.Member, error) {
-	var body struct {
-		Members []cluster.Member `json:"members"`
-	}
+func (a *localAPI) Members(ctx context.Context) (memberList, error) {
+	var body memberList
 	if err := a.do(ctx, http.MethodGet, "/v1/cluster/members", nil, &body); err != nil {
-		return nil, err
+		return memberList{}, err
 	}
 	if body.Members == nil {
-		return nil, errors.New("the local sandboxd listed no members")
+		return memberList{}, errors.New("the local sandboxd listed no members")
 	}
-	return body.Members, nil
+	return body, nil
 }
 
 func (a *localAPI) TransferLeadership(ctx context.Context) (upgradewire.LeaderTransferResponse, error) {

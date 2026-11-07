@@ -1,6 +1,10 @@
 package cluster
 
-import "github.com/hashicorp/raft"
+import (
+	"sort"
+
+	"github.com/hashicorp/raft"
+)
 
 // RaftRoles is one Raft server's view of the configuration: every configured
 // server (true when it votes) and the current leader.
@@ -34,6 +38,29 @@ func (c *Cluster) RaftRoles() (RaftRoles, bool) {
 	return out, true
 }
 
+// Voters lists the voting servers, sorted. It is the configuration, not
+// gossip: a voter down long enough for gossip to forget it is still
+// listed, and still counts toward the majority Raft needs.
+func (r RaftRoles) Voters() []string {
+	out := make([]string, 0, len(r.Servers))
+	for id, voter := range r.Servers {
+		if voter {
+			out = append(out, id)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// Annotate fills Voter and Leader on members from r, in place.
+func (r RaftRoles) Annotate(members []Member) []Member {
+	for i := range members {
+		members[i].Voter = r.Servers[members[i].NodeID]
+		members[i].Leader = r.Leader != "" && members[i].NodeID == r.Leader
+	}
+	return members
+}
+
 // AnnotateRaftRoles fills Voter and Leader on members from c's Raft view, in
 // place. It costs one configuration read, so only the operator endpoints call
 // it, never Members() itself: create routing and list fan-out read Members()
@@ -49,9 +76,5 @@ func AnnotateRaftRoles(c Client, members []Member) []Member {
 	if !ok {
 		return members
 	}
-	for i := range members {
-		members[i].Voter = roles.Servers[members[i].NodeID]
-		members[i].Leader = roles.Leader != "" && members[i].NodeID == roles.Leader
-	}
-	return members
+	return roles.Annotate(members)
 }

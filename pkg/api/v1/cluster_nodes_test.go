@@ -283,6 +283,31 @@ func TestClusterMembersCarriesRaftRoles(t *testing.T) {
 	}
 }
 
+// raft_voters lists the Raft configuration's voters, including the ones
+// gossip forgot (J2: the hand-run quorum guard counts from it); a node
+// with no Raft view leaves the field out.
+func TestClusterMembersListsRaftVoters(t *testing.T) {
+	stub := newNodeStub()
+	stub.members = []cluster.Member{{NodeID: "srv-1", Alive: true}, {NodeID: "srv-2", Alive: true}, {NodeID: "srv-3", Alive: true}}
+	stub.roles = cluster.RaftRoles{Servers: map[string]bool{"srv-1": true, "srv-2": true, "srv-3": true, "srv-4": true, "srv-5": true, "learner": false}, Leader: "srv-1"}
+	rr := serve(nodeRoutesMux(t, stub), http.MethodGet, "/v1/cluster/members")
+	var body struct {
+		Members    []cluster.Member `json:"members"`
+		RaftVoters []string         `json:"raft_voters"`
+	}
+	if rr.Code != http.StatusOK || json.Unmarshal(rr.Body.Bytes(), &body) != nil {
+		t.Fatalf("members = %d %s", rr.Code, rr.Body.String())
+	}
+	if got := strings.Join(body.RaftVoters, ","); got != "srv-1,srv-2,srv-3,srv-4,srv-5" || len(body.Members) != 3 {
+		t.Fatalf("raft_voters = %q, members = %+v", got, body.Members)
+	}
+	stub.roles = cluster.RaftRoles{}
+	rr = serve(nodeRoutesMux(t, stub), http.MethodGet, "/v1/cluster/members")
+	if rr.Code != http.StatusOK || strings.Contains(rr.Body.String(), "raft_voters") {
+		t.Fatalf("no Raft view = %d %s", rr.Code, rr.Body.String())
+	}
+}
+
 // A deleted node may still be running and gossiping until someone stops the
 // machine. It is not a member any more: the members list leaves it out, so
 // `aerolvm get nodes` stops showing it the moment the delete returns.
