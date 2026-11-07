@@ -440,6 +440,15 @@ jobs:
       - name: Bundle the ops files
         run: go run ./cmd/opsbundle -version "$VERSION" -setup setup -mtime "$(git log -1 --format=%ct)" -o "dist/aerolvm-ops-${VERSION}.tar.gz"
 
+      # Krew installs only from archives, so aerolvm ships as
+      # aerolvm_<os>_<arch>.tar.gz too, with a Krew manifest and a Homebrew
+      # formula built from those archives' names and hashes
+      # (plans/kubectl-style-cluster-ops.md §7, D13). Like release.json it is
+      # generated, never hand-synced, and runs before the tagged copies and
+      # checksums.txt so both cover it; cmd/aerolvmdist's tests keep it here.
+      - name: Package aerolvm for Krew and Homebrew
+        run: go run ./cmd/aerolvmdist -version "$VERSION" -dist dist -repo "$GITHUB_REPOSITORY"
+
       - name: Generate CycloneDX SBOM
         run: go run github.com/CycloneDX/cyclonedx-gomod/cmd/cyclonedx-gomod@v1.10.0 mod -json -output dist/sbom.cdx.json
 
@@ -681,6 +690,76 @@ jobs:
             fi
             (cd "npm-dist/$dir" && "$npm_bin" publish --access public --tag "$tag")
           done < npm-dist/order.txt
+
+  # The Homebrew tap is opt-in like npm, until its one-time setup is done:
+  # the repository variable AEROLVM_HOMEBREW_TAP names the tap (owner/repo,
+  # for example aerol-ai/homebrew-tap, so `brew install aerol-ai/tap/aerolvm`
+  # works) and the secret HOMEBREW_TAP_TOKEN may push to it. It runs after the
+  # GitHub release, for stable releases only, and copies the aerolvm.rb that
+  # release published, so the tap always names that release's own archives
+  # and hashes. Safe to re-run: an unchanged formula makes no commit.
+  homebrew:
+    name: Publish the Homebrew formula
+    needs: release
+    if: vars.AEROLVM_HOMEBREW_TAP != '' && !github.event.release.prerelease
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      VERSION: ${{ github.event.release.tag_name }}
+      TAP: ${{ vars.AEROLVM_HOMEBREW_TAP }}
+    steps:
+      - name: Reject a release tag or tap that is not well formed
+        run: |
+          # Same check as the test job, stable versions only. The tag and the
+          # tap reach gh and git below.
+          if [[ ! "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::release tag must look like v1.2.3"
+            exit 1
+          fi
+          if [[ ! "$TAP" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+            echo "::error::AEROLVM_HOMEBREW_TAP must look like owner/homebrew-tap"
+            exit 1
+          fi
+
+      - name: Download the formula this release published
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: gh release download "$VERSION" --pattern aerolvm.rb --dir formula
+
+      - name: Check out the tap
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: ${{ vars.AEROLVM_HOMEBREW_TAP }}
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: tap
+
+      # Re-running this workflow for an older tag must not move the tap back,
+      # the same rule as "Mark the release as latest".
+      - name: Commit the formula if this is the newest release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          newest="$(gh release list --exclude-drafts --exclude-pre-releases --limit 1000 --json tagName --jq '.[].tagName' \
+            | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n 1)"
+          if [[ "$newest" != "$VERSION" ]]; then
+            echo "$newest is newer than $VERSION, so the tap stays on $newest."
+            exit 0
+          fi
+          mkdir -p tap/Formula
+          cp formula/aerolvm.rb tap/Formula/aerolvm.rb
+          cd tap
+          git add Formula/aerolvm.rb
+          if git diff --cached --quiet; then
+            echo "The tap already has the $VERSION formula."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "aerolvm ${VERSION}"
+          git push
 
   mcp-registry:
     name: Publish to the MCP Registry
