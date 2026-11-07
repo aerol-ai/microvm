@@ -86,6 +86,7 @@ BENCH_ONLY=0
 DESTROY_ONLY=0
 OBS_SNAPSHOT_ONLY=0
 UPGRADE_FROM=""
+UPGRADE_NODE=0
 SCENARIO=""
 # PID of the local-mode SSH port-forward, so teardown can reap it. Without this
 # the `ssh -fN` forks leak: each leftover keeps local :21212 bound, so the next
@@ -139,20 +140,29 @@ while [[ $# -gt 0 ]]; do
       UPGRADE_FROM="$1"
       ;;
     --upgrade-from=*) UPGRADE_FROM="${arg#--upgrade-from=}" ;;
+    # With --upgrade-from: upgrade through `sandboxd upgrade node` instead of
+    # the install.sh re-run (upgrade-gate.sh --upgrade-node).
+    --upgrade-node) UPGRADE_NODE=1 ;;
     -*) echo "unknown flag: $arg" >&2; exit 2 ;;
     *) SCENARIO="$arg" ;;
   esac
   shift
 done
-[[ -n "$SCENARIO" ]] || { echo "usage: run.sh <scenario|all> [--keep] [--prod-tls] [--metal-on-demand] [--no-disruptive] [--collect-logs-only] [--bench-only] [--destroy-only] [--obs-snapshot-only] [--released|--version <tag>] [--upgrade-from <tag>] [--no-build]" >&2; exit 2; }
+[[ -n "$SCENARIO" ]] || { echo "usage: run.sh <scenario|all> [--keep] [--prod-tls] [--metal-on-demand] [--no-disruptive] [--collect-logs-only] [--bench-only] [--destroy-only] [--obs-snapshot-only] [--released|--version <tag>] [--upgrade-from <tag> [--upgrade-node]] [--no-build]" >&2; exit 2; }
+if [[ "$UPGRADE_NODE" == 1 && -z "${UPGRADE_FROM:-}" ]]; then
+  echo "--upgrade-node is a way to run the --upgrade-from gate; give --upgrade-from <tag> too" >&2
+  exit 2
+fi
+GATE_ARGS=()
+[[ "$UPGRADE_NODE" == 1 ]] && GATE_ARGS+=(--upgrade-node)
 # --upgrade-from hands off to the warm-upgrade gate before any normal
 # provisioning. It runs its own old-tag provision and teardown, so returning
 # here afterwards would double-provision; exec replaces this process.
 if [[ -n "${UPGRADE_FROM:-}" ]]; then
   if [[ "$KEEP" == 1 ]]; then
-    exec "${HERE}/upgrade-gate.sh" "$SCENARIO" --from "$UPGRADE_FROM" --keep
+    exec "${HERE}/upgrade-gate.sh" "$SCENARIO" --from "$UPGRADE_FROM" --keep ${GATE_ARGS[@]+"${GATE_ARGS[@]}"}
   else
-    exec "${HERE}/upgrade-gate.sh" "$SCENARIO" --from "$UPGRADE_FROM"
+    exec "${HERE}/upgrade-gate.sh" "$SCENARIO" --from "$UPGRADE_FROM" ${GATE_ARGS[@]+"${GATE_ARGS[@]}"}
   fi
 fi
 # A pinned tag and "reuse the last local build" describe different artifact

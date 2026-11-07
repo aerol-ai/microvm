@@ -20,13 +20,23 @@
 # version), and `sandboxd --version` prints the new version, exits by itself
 # and leaves the running daemon alone.
 #
-# Usage: upgrade-gate.sh <scenario> --from <tag> [--keep] [--swap-binary]
+# Usage: upgrade-gate.sh <scenario> --from <tag> [--keep] [--swap-binary|--upgrade-node]
 #   <scenario>     e.g. single-node, cluster-hetero
 #   --from <tag>   the released tag to provision first (the old schema), e.g. v0.6.7
 #   --keep         leave the deployment up after the gate (default: destroy)
 #   --swap-binary  upgrade by copying the binary in and restarting, the
 #                  pre-Phase-0 way, to check a schema migration alone when the
 #                  installer path is what is broken
+#   --upgrade-node upgrade through `sandboxd upgrade node` (plans/kubectl-style-
+#                  cluster-ops.md §6.3) instead of the install.sh re-run: this
+#                  build's sandboxd runs from a temp path with --from a dir of
+#                  this build's files. Per node it checks the *.prev files and
+#                  a state.db backup exist, sandboxd runs the new version, and
+#                  a second identical upgrade is a noop; across the
+#                  deployment, that a container sandbox created before the
+#                  upgrade still runs with the same ID and answers exec. After
+#                  the schema checks, `sandboxd upgrade node <from> --rollback`
+#                  must put the old binaries back and sandboxd run <from>.
 #
 # Exit 0 only if every node migrated with no data loss AND the API still serves
 # the seeded snapshots. Any failure is loud and non-zero.
@@ -50,18 +60,22 @@ SCENARIO=""
 FROM_TAG=""
 KEEP=0
 SWAP_BINARY=0
+UPGRADE_NODE=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --from) FROM_TAG="${2:-}"; shift 2 ;;
     --keep) KEEP=1; shift ;;
     --swap-binary) SWAP_BINARY=1; shift ;;
+    --upgrade-node) UPGRADE_NODE=1; shift ;;
     -h|--help) grep '^#' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
     -*) echo "unknown flag: $1" >&2; exit 2 ;;
     *) SCENARIO="$1"; shift ;;
   esac
 done
 [[ -n "$SCENARIO" && -n "$FROM_TAG" ]] || {
-  echo "usage: upgrade-gate.sh <scenario> --from <tag> [--keep] [--swap-binary]" >&2; exit 2; }
+  echo "usage: upgrade-gate.sh <scenario> --from <tag> [--keep] [--swap-binary|--upgrade-node]" >&2; exit 2; }
+[[ "$SWAP_BINARY" == 1 && "$UPGRADE_NODE" == 1 ]] && {
+  echo "--swap-binary and --upgrade-node are two ways to upgrade; pick one" >&2; exit 2; }
 
 SDIR="$HERE/.tf/$SCENARIO"
 fail=0
@@ -156,6 +170,115 @@ if [[ "$SWAP_BINARY" == 1 ]]; then
     on_node "$ip" "sudo systemctl stop sandboxd && sudo install -m0755 /tmp/aerol-upgrade/sandboxd_linux_amd64 /usr/local/bin/sandboxd && sudo systemctl start sandboxd" \
       || { die "restart on $ip failed"; continue; }
   done
+elif [[ "$UPGRADE_NODE" == 1 ]]; then
+  for f in sandboxd_linux_amd64 toolboxd_linux_amd64 checksums.txt; do
+    [[ -f "$BUILD_DIR/$f" ]] || { echo "build $BUILD_DIR has no $f" >&2; exit 2; }
+  done
+  # A container sandbox from before the upgrade: it must keep running, with
+  # the same ID, through every node's sandboxd restart (§6.4).
+  KEEP_SB="$(api -X POST "$BASE/v1/sandboxes" -d '{"name":"upg-node-keep","image":"alpine:3.20"}')"
+  KEEP_ID="$(jq -r '.id // empty' <<<"$KEEP_SB")"
+  [[ -n "$KEEP_ID" ]] || die "keep sandbox create returned no id: $KEEP_SB"
+  for _ in $(seq 1 40); do
+    st="$(api "$BASE/v1/sandboxes/$KEEP_ID" | jq -r '.status // empty')"
+    [[ "$st" == running || "$st" == started ]] && break; sleep 3
+  done
+  echo "  keep sandbox: $KEEP_ID ($st)"
+
+  # upgrade-node.sh runs on the node as root: one phase of the upgrade per
+  # call, printing key=value lines, so no value crosses a shell quote.
+  NODE_SCRIPT="$(mktemp -t aerol-upgrade-node.XXXXXX)"
+  cat >"$NODE_SCRIPT" <<'UPGNODE'
+#!/usr/bin/env bash
+set -u
+phase="$1" stage="$2" want="$3" old="$4"
+bin=/usr/local/bin
+sum() { awk -v n="$1" '$2 == n { print $1 }' "$stage/checksums.txt"; }
+field() { sed -n "s/^  \"$1\": \"\{0,1\}\([^\",]*\)\"\{0,1\},\{0,1\}$/\1/p" <<<"$2" | head -n1; }
+health() { curl -fsS --max-time 5 http://127.0.0.1:21212/health 2>/dev/null | sed -n 's/.*"version":"\([^"]*\)".*/\1/p'; }
+upgrade() {
+  "$stage/sandboxd_linux_amd64" upgrade node "$want" --from "$stage" \
+    --sha256 "sandboxd_linux_amd64=$(sum sandboxd_linux_amd64)" \
+    --sha256 "toolboxd_linux_amd64=$(sum toolboxd_linux_amd64)" \
+    --allow-unversioned -o json 2>>"$stage/upgrade.err"
+}
+case "$phase" in
+before)
+  echo "sha_sandboxd=$(sha256sum "$bin/sandboxd" | cut -d' ' -f1)"
+  echo "sha_toolboxd=$(sha256sum "$bin/toolboxd" | cut -d' ' -f1)"
+  echo "running=$(health)"
+  ;;
+upgrade)
+  pid="$(systemctl show -p MainPID --value sandboxd)"
+  start="$(date +%s)"
+  out="$(upgrade)"
+  echo "exit=$?"
+  echo "seconds=$(($(date +%s) - start))"
+  echo "result=$(field result "$out")"
+  backup="$(field backup_path "$out")"
+  echo "backup=$backup"
+  echo "backup_exists=$([[ -s "$backup" ]] && echo yes || echo no)"
+  echo "backup_took=$(sed -n 's/^backed up .* in \(.*\)$/\1/p' "$stage/upgrade.err" | tail -n1)"
+  for f in sandboxd toolboxd; do
+    echo "prev_$f=$([[ -f "$bin/$f.prev" ]] && echo yes || echo no)"
+  done
+  echo "new_sandboxd=$(cmp -s "$bin/sandboxd" "$stage/sandboxd_linux_amd64" && echo yes || echo no)"
+  echo "pid_changed=$([[ "$(systemctl show -p MainPID --value sandboxd)" != "$pid" ]] && echo yes || echo no)"
+  echo "running=$(health)"
+  ;;
+again)
+  pid="$(systemctl show -p MainPID --value sandboxd)"
+  out="$(upgrade)"
+  echo "exit=$?"
+  echo "result=$(field result "$out")"
+  echo "pid_same=$([[ "$(systemctl show -p MainPID --value sandboxd)" == "$pid" ]] && echo yes || echo no)"
+  ;;
+rollback)
+  out="$("$bin/sandboxd" upgrade node "$old" --rollback -o json 2>>"$stage/upgrade.err")"
+  echo "exit=$?"
+  echo "result=$(field result "$out")"
+  echo "sha_sandboxd=$(sha256sum "$bin/sandboxd" | cut -d' ' -f1)"
+  echo "sha_toolboxd=$(sha256sum "$bin/toolboxd" | cut -d' ' -f1)"
+  echo "running=$(health)"
+  ;;
+esac
+UPGNODE
+  kv() { sed -n "s/^$1=//p" <<<"$2" | head -n1; }
+  declare -A NODE_BEFORE
+  STAGE=/tmp/aerolvm-upgrade-node
+  node_name="$(basename "$NODE_SCRIPT")"
+  for ip in "${IPS[@]}"; do
+    echo "  upgrading $ip (sandboxd upgrade node from $STAGE) ..."
+    on_node "$ip" "rm -rf $STAGE && mkdir -p $STAGE" || { die "$ip: cannot make $STAGE"; continue; }
+    # Through S3, not scp: one upload from here, then a download inside AWS.
+    stage_to_node "ubuntu@$ip" "$STAGE" "$BUILD_DIR/sandboxd_linux_amd64" "$BUILD_DIR/toolboxd_linux_amd64" "$BUILD_DIR/checksums.txt" \
+      "$NODE_SCRIPT" >/dev/null || { die "staging the build on $ip failed"; continue; }
+    on_node "$ip" "chmod 0755 $STAGE/sandboxd_linux_amd64" || true
+    NODE_BEFORE[$ip]="$(on_node "$ip" "sudo bash $STAGE/$node_name before $STAGE $WANT_VERSION $FROM_TAG")" || true
+    up="$(on_node "$ip" "sudo bash $STAGE/$node_name upgrade $STAGE $WANT_VERSION $FROM_TAG")" || true
+    echo "    upgrade: exit=$(kv exit "$up") result=$(kv result "$up") in $(kv seconds "$up")s, backup $(kv backup "$up") took $(kv backup_took "$up"), running=$(kv running "$up")"
+    [[ "$(kv exit "$up")" == 0 && "$(kv result "$up")" == upgraded ]] ||
+      die "$ip: sandboxd upgrade node exited $(kv exit "$up") with result '$(kv result "$up")'; see $STAGE/upgrade.err on the node"
+    [[ "$(kv prev_sandboxd "$up")" == yes && "$(kv prev_toolboxd "$up")" == yes ]] ||
+      die "$ip: the old binaries were not kept as *.prev (sandboxd=$(kv prev_sandboxd "$up") toolboxd=$(kv prev_toolboxd "$up"))"
+    [[ "$(kv backup_exists "$up")" == yes ]] || die "$ip: no state.db backup at '$(kv backup "$up")'"
+    [[ "$(kv new_sandboxd "$up")" == yes && "$(kv pid_changed "$up")" == yes ]] ||
+      die "$ip: sandboxd was not replaced and restarted (new file=$(kv new_sandboxd "$up"), new PID=$(kv pid_changed "$up"))"
+    [[ "$(kv running "$up")" == "$WANT_VERSION" ]] ||
+      die "$ip: the running sandboxd reports '$(kv running "$up")', want $WANT_VERSION"
+    again="$(on_node "$ip" "sudo bash $STAGE/$node_name again $STAGE $WANT_VERSION $FROM_TAG")" || true
+    echo "    again:   exit=$(kv exit "$again") result=$(kv result "$again") same PID=$(kv pid_same "$again")"
+    [[ "$(kv exit "$again")" == 0 && "$(kv result "$again")" == noop && "$(kv pid_same "$again")" == yes ]] ||
+      die "$ip: a second identical upgrade was not a noop (exit $(kv exit "$again"), result '$(kv result "$again")', same PID $(kv pid_same "$again"))"
+  done
+  wait_for_health "$BASE" "$TOKEN" || die "deployment not healthy after sandboxd upgrade node"
+  keep="$(api "$BASE/v1/sandboxes/$KEEP_ID")"
+  [[ "$(jq -r '.id // empty' <<<"$keep")" == "$KEEP_ID" && "$(jq -r '.status // empty' <<<"$keep")" =~ ^(running|started)$ ]] ||
+    die "the sandbox from before the upgrade is not running under the same ID: $keep"
+  ex="$(api -X POST "$BASE/v1/sandboxes/$KEEP_ID/toolbox/process/execute" -d '{"command":"echo still-here"}')"
+  [[ "$(jq -r '.exit_code // empty' <<<"$ex")" == 0 && "$(jq -r '.stdout // empty' <<<"$ex")" == *still-here* ]] ||
+    die "the sandbox from before the upgrade does not answer exec: $ex"
+  echo "  keep sandbox $KEEP_ID still runs and answers exec"
 else
   for f in install.sh sandboxd_linux_amd64 toolboxd_linux_amd64 checksums.txt; do
     [[ -f "$BUILD_DIR/$f" ]] || { echo "build $BUILD_DIR has no $f" >&2; exit 2; }
@@ -282,6 +405,29 @@ if [[ -n "$DID" ]]; then
   echo "  create-from-snapshot upg-committed -> ok"
 else
   die "create-from-snapshot returned no id"
+fi
+
+if [[ "$UPGRADE_NODE" == 1 ]]; then
+  step "7/7 sandboxd upgrade node $FROM_TAG --rollback puts the old binaries back"
+  # After the schema checks, which judge the new build. The rollback never
+  # restores the database backup (§6.8): the old binary must read the
+  # database the new one left.
+  for ip in "${IPS[@]}"; do
+    rb="$(on_node "$ip" "sudo bash $STAGE/$node_name rollback $STAGE $WANT_VERSION $FROM_TAG")" || true
+    echo "  $ip: exit=$(kv exit "$rb") result=$(kv result "$rb") running=$(kv running "$rb")"
+    [[ "$(kv exit "$rb")" == 0 && "$(kv result "$rb")" == upgraded ]] ||
+      die "$ip: the rollback exited $(kv exit "$rb") with result '$(kv result "$rb")'; see $STAGE/upgrade.err on the node"
+    [[ "$(kv sha_sandboxd "$rb")" == "$(kv sha_sandboxd "${NODE_BEFORE[$ip]}")" && "$(kv sha_toolboxd "$rb")" == "$(kv sha_toolboxd "${NODE_BEFORE[$ip]}")" ]] ||
+      die "$ip: the rollback did not put the old sandboxd and toolboxd back"
+    [[ "$(kv running "$rb")" == "$FROM_TAG" ]] ||
+      die "$ip: after the rollback sandboxd reports '$(kv running "$rb")', want $FROM_TAG"
+  done
+  wait_for_health "$BASE" "$TOKEN" || die "deployment not healthy after the rollback"
+  keep="$(api "$BASE/v1/sandboxes/$KEEP_ID")"
+  [[ "$(jq -r '.status // empty' <<<"$keep")" =~ ^(running|started)$ ]] ||
+    die "the sandbox from before the upgrade did not survive the rollback: $keep"
+  api -X DELETE "$BASE/v1/sandboxes/$KEEP_ID" >/dev/null 2>&1 || true
+  rm -f "$NODE_SCRIPT"
 fi
 
 echo

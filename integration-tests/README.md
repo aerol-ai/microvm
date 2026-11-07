@@ -226,6 +226,24 @@ installer output goes to `reports/upgrade-gate-<scenario>-install-<ip>.log`.
 `upgrade-gate.sh <scenario> --from <tag> --swap-binary` upgrades by copying
 the binary in instead, to check a schema migration alone.
 
+`--upgrade-node` (on `run.sh` with `--upgrade-from`, or on `upgrade-gate.sh`)
+upgrades through `sandboxd upgrade node` instead
+(`plans/kubectl-style-cluster-ops.md` §6.3): this build's `sandboxd` runs
+from a temp path with `--from` a directory of this build's files and
+`--allow-unversioned` (the build's version is `itest-<build id>`). Per node it
+fails unless the old binaries are kept as `*.prev`, a `state.db` backup
+exists, sandboxd restarted onto the new build, and a second identical
+upgrade is a noop with the same PID; a container sandbox created before the
+upgrade must still run under the same ID and answer exec. After the schema
+checks, `sandboxd upgrade node <tag> --rollback` must put the old binaries
+back and sandboxd report `<tag>`. The node's upgrader log is
+`/tmp/aerolvm-upgrade-node/upgrade.err`, and the gate prints how long the
+database backup took.
+
+```bash
+integration-tests/run.sh single-node --upgrade-from v0.6.11 --upgrade-node
+```
+
 ## Key custody scenarios
 
 Customer key custody (`plans/customer-key-custody.md` Phase 6) has five
