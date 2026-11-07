@@ -332,7 +332,8 @@ type nodeStateRow struct {
 //
 //	pending   -> staged | manual | skipped | failed | done (already on the target)
 //	staged    -> upgrading | manual | skipped | failed | done
-//	upgrading -> done | failed | skipped
+//	upgrading -> done | failed | skipped | pending (its op ended, or never
+//	             started, after a stop, a restage or a rollback)
 //	manual    -> done | skipped | pending
 //	skipped   -> pending (it came back) | done (upgraded by hand)
 //	failed    -> pending (retried)
@@ -341,7 +342,7 @@ type nodeStateRow struct {
 var nodeStateTable = []nodeStateRow{
 	{From: upgradewire.NodePending, To: []string{upgradewire.NodeStaged, upgradewire.NodeManual, upgradewire.NodeSkipped, upgradewire.NodeFailed, upgradewire.NodeDone, upgradewire.NodeUpgrading}},
 	{From: upgradewire.NodeStaged, To: []string{upgradewire.NodeUpgrading, upgradewire.NodeManual, upgradewire.NodeSkipped, upgradewire.NodeFailed, upgradewire.NodeDone}},
-	{From: upgradewire.NodeUpgrading, To: []string{upgradewire.NodeDone, upgradewire.NodeFailed, upgradewire.NodeSkipped}},
+	{From: upgradewire.NodeUpgrading, To: []string{upgradewire.NodeDone, upgradewire.NodeFailed, upgradewire.NodeSkipped, upgradewire.NodePending}},
 	{From: upgradewire.NodeManual, To: []string{upgradewire.NodeDone, upgradewire.NodeSkipped, upgradewire.NodePending}},
 	{From: upgradewire.NodeSkipped, To: []string{upgradewire.NodePending, upgradewire.NodeDone}},
 	{From: upgradewire.NodeFailed, To: []string{upgradewire.NodePending}},

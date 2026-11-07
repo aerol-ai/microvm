@@ -786,6 +786,117 @@ func TestRolloutDriverHelpers(t *testing.T) {
 	d.release("n")
 }
 
+// upgradingNode runs the rig until id is upgrading and its upgrader runs
+// without an end (neverHealth).
+func (g *rolloutRig) upgradingNode(id string) {
+	g.t.Helper()
+	g.nodes.nodes[id].neverHealth = true
+	g.run(upgradewire.StateRunning)
+	for i := 0; i < 20 && g.nodes.nodes[id].applies == 0; i++ {
+		g.driver.tick(context.Background())
+	}
+	if r := g.host.rollout(); r.Nodes[id].State != upgradewire.NodeUpgrading {
+		g.t.Fatalf("%s never upgraded: %s", id, describeNodes(r))
+	}
+}
+
+// finishUpgrade makes id's upgrader end: on v2, or reverted to v1.
+func (g *rolloutRig) finishUpgrade(id string, ok bool) {
+	g.nodes.mu.Lock()
+	n := g.nodes.nodes[id]
+	n.neverHealth = false
+	n.opFails = !ok
+	if ok {
+		n.version = "v2"
+	}
+	g.nodes.mu.Unlock()
+	if ok {
+		g.host.setVersion(id, "v2")
+	}
+}
+
+// R4: apply again after a stop keeps a node that is mid-restart upgrading,
+// with its deadline, so the dead-owner loop never fails it over; the new
+// pass follows its old op to the end and never restarts it a second time.
+func TestRolloutDriverRestageFollowsNodeStillUpgrading(t *testing.T) {
+	g := newRolloutRig(t, 1, 0, 2)
+	g.start(func(r *RolloutRecord) { r.AllowDowntime = true; r.Batch = "1" })
+	g.upgradingNode("w1")
+	g.host.event(context.Background(), RolloutCommand{Event: evStop, RolloutID: "r1"})
+	if res, _ := g.host.event(context.Background(), RolloutCommand{Event: evApply, Target: "v2"}); res.Verdict.Outcome != outcomeRestage {
+		t.Fatalf("apply again = %+v", res.Verdict)
+	}
+	for i := 0; i < 5; i++ {
+		g.driver.tick(context.Background())
+	}
+	r := g.host.rollout()
+	if _, ok := g.fsm.upgradingDeadline("w1"); !ok || r.State != upgradewire.StateStaging {
+		t.Fatalf("restage lost w1's restart: %s %s", r.State, describeNodes(r))
+	}
+	g.finishUpgrade("w1", true)
+	r = g.run(upgradewire.StateFinalized)
+	if g.nodes.nodes["w1"].applies != 1 || r.Nodes["w1"].State != upgradewire.NodeDone || g.host.drain["w1"] {
+		t.Fatalf("w1 restarted %d times, %s, cordoned %v", g.nodes.nodes["w1"].applies, describeNodes(r), g.host.drain["w1"])
+	}
+}
+
+// R4: a rollback keeps a node that is mid-upgrade upgrading. While its
+// upgrader runs, the node still answers on the old version, which is the
+// rollback's target; it must not count as rolled back then. Once the
+// upgrade ends on the new version, the node is rolled back like the rest.
+func TestRolloutDriverRollbackFollowsNodeStillUpgrading(t *testing.T) {
+	g := newRolloutRig(t, 1, 0, 2)
+	g.start(func(r *RolloutRecord) { r.AllowDowntime = true; r.Batch = "1" })
+	g.upgradingNode("w1")
+	g.host.event(context.Background(), RolloutCommand{Event: evStop, RolloutID: "r1"})
+	if res, _ := g.host.event(context.Background(), RolloutCommand{Event: evRollback, RolloutID: "r1"}); res.Rollout.State != upgradewire.StateRollingBack {
+		t.Fatalf("rollback = %+v", res.Verdict)
+	}
+	for i := 0; i < 5; i++ {
+		g.driver.tick(context.Background())
+	}
+	r := g.host.rollout()
+	if _, ok := g.fsm.upgradingDeadline("w1"); !ok || r.State != upgradewire.StateRollingBack {
+		t.Fatalf("rollback lost w1's restart: %s %s", r.State, describeNodes(r))
+	}
+	g.finishUpgrade("w1", true)
+	r = g.run(upgradewire.StateRolledBack)
+	if g.nodes.nodes["w1"].applies != 2 || g.host.memberM["w1"].Version != "v1" {
+		t.Fatalf("w1: %d restarts, runs %s; want the upgrade then the rollback (%s)", g.nodes.nodes["w1"].applies, g.host.memberM["w1"].Version, describeNodes(r))
+	}
+}
+
+// R4 with R12: a restart the leader marked but that never started (the
+// stop landed first, so the node refused it) goes back to pending once the
+// leader is sure nothing runs, with its own cordon mark back.
+func TestRolloutDriverStopReturnsUnstartedRestart(t *testing.T) {
+	g := newRolloutRig(t, 1, 0, 2)
+	g.nodes.nodes["w1"].applyErr = &UpgradeStepError{Status: http.StatusConflict, Code: upgradewire.ErrCodeRolloutConflict, Reason: "stopped"}
+	g.start(func(r *RolloutRecord) { r.AllowDowntime = true; r.Batch = "1" })
+	g.run(upgradewire.StateRunning)
+	for i := 0; i < 20 && g.host.rollout().Nodes["w1"].State != upgradewire.NodeUpgrading; i++ {
+		g.driver.tick(context.Background())
+	}
+	g.host.event(context.Background(), RolloutCommand{Event: evStop, RolloutID: "r1"})
+	g.driver.tick(context.Background())
+	if n := g.host.rollout().Nodes["w1"]; n.State != upgradewire.NodeUpgrading {
+		t.Fatalf("w1 left upgrading before the leader could be sure: %+v", n)
+	}
+	g.host.advance(3 * time.Minute)
+	g.driver.tick(context.Background())
+	r := g.host.rollout()
+	if n := r.Nodes["w1"]; n.State != upgradewire.NodePending || n.Op != "" || g.host.drain["w1"] || g.nodes.nodes["w1"].applies != 0 {
+		t.Fatalf("unstarted restart after stop: %+v, cordoned %v", n, g.host.drain["w1"])
+	}
+	// apply again: it is staged and upgraded in the new pass.
+	g.nodes.nodes["w1"].applyErr = nil
+	g.host.event(context.Background(), RolloutCommand{Event: evApply, Target: "v2"})
+	g.run(upgradewire.StateFinalized)
+	if g.nodes.nodes["w1"].applies != 1 {
+		t.Fatalf("w1 applies = %d", g.nodes.nodes["w1"].applies)
+	}
+}
+
 // deleteNode writes the deny record `aerolvm delete node` writes, and the
 // node leaves gossip.
 func (g *rolloutRig) deleteNode(id string) {

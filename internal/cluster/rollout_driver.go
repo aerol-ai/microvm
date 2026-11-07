@@ -93,6 +93,12 @@ type rolloutDriver struct {
 	// the leader sends its apply again (the old leader died between writing
 	// the record and calling).
 	applyResendAfter time.Duration
+	// abandonAfter is how long an upgrading node whose op is no longer
+	// wanted (a stop, a restage or a rollback came in) may show no trace of
+	// it before the leader takes it as never started. It outlasts a node's
+	// own apply work (materializeTimeout plus launchTimeout), so the node
+	// cannot still be about to launch it.
+	abandonAfter time.Duration
 	// indexSlack is how far a server's applied index may trail the
 	// leader's and still count as caught up.
 	indexSlack uint64
@@ -101,7 +107,8 @@ type rolloutDriver struct {
 func newRolloutDriver(host rolloutHost, nodes rolloutNodeClient, logger *slog.Logger) *rolloutDriver {
 	return &rolloutDriver{
 		host: host, nodes: nodes, logger: logger, inflight: map[string]bool{},
-		stepTimeout: 15 * time.Minute, applyTimeout: time.Minute, applyResendAfter: 30 * time.Second, indexSlack: 1000,
+		stepTimeout: 15 * time.Minute, applyTimeout: time.Minute, applyResendAfter: 30 * time.Second, abandonAfter: 2 * time.Minute,
+		indexSlack: 1000,
 	}
 }
 
@@ -256,6 +263,12 @@ func (d *rolloutDriver) adoptMembers(ctx context.Context, r *RolloutRecord, memb
 // tickStaging stages every node, servers first (§6.7).
 func (d *rolloutDriver) tickStaging(ctx context.Context, r *RolloutRecord, members map[string]Member) {
 	now := d.host.now()
+	// A restage keeps a node that was mid-restart upgrading (resetNode):
+	// follow it to its end first. Staging waits for it (evAllStaged).
+	d.watchUpgrading(ctx, r, members)
+	if r = d.host.rollout(); r == nil || r.State != upgradewire.StateStaging {
+		return
+	}
 	serversPending := false
 	for _, n := range r.sortedNodes() {
 		if n.State != upgradewire.NodePending {
@@ -637,13 +650,23 @@ func (d *rolloutDriver) sendApply(ctx context.Context, r *RolloutRecord, n Rollo
 		cctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), d.applyTimeout)
 		defer cancel()
 		resp, err := d.nodes.Step(cctx, m, req)
+		fail := func(why string) {
+			// A stop, a restage or a rollback may have landed during the
+			// call: then the node keeps upgrading under the record's rules
+			// (followUpgrading), and this answer fails nothing.
+			if cur := d.host.rollout(); cur == nil || cur.ID != rolloutID || rolloutOpID(cur) != op {
+				return
+			}
+			d.failNode(cctx, rolloutID, n, why)
+		}
 		switch {
 		case err == nil && resp.State == UpgradeNodeFailed:
-			d.failNode(cctx, rolloutID, n, resp.Error)
-		case err == nil, stepRetryable(err), stepCode(err) == upgradewire.ErrCodeUpgradeRunning:
-			// Started, or worth another try: watchUpgrading follows it.
+			fail(resp.Error)
+		case err == nil, stepRetryable(err), stepCode(err) == upgradewire.ErrCodeUpgradeRunning, stepCode(err) == upgradeCodeNotInRecord:
+			// Started, worth another try, or refused because the record
+			// moved on: watchUpgrading follows the node from the record.
 		default:
-			d.failNode(cctx, rolloutID, n, err.Error())
+			fail(err.Error())
 		}
 	})
 }
@@ -669,25 +692,8 @@ func (d *rolloutDriver) watchUpgrading(ctx context.Context, r *RolloutRecord, me
 		sctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 		st, err := d.nodes.Status(sctx, m, n.Op)
 		cancel()
-		if err == nil {
-			switch {
-			case st.OpFound && st.OpPhase == string(nodeupgrade.PhaseFailed):
-				d.failNode(ctx, r.ID, *n, "the node's upgrader failed and put the previous files back: "+st.OpError)
-				continue
-			case st.Version == target && d.healthy(n, m, st, target):
-				if d.update(ctx, RolloutNodeUpdate{RolloutID: r.ID, NodeID: n.NodeID, State: upgradewire.NodeDone, ExpectState: upgradewire.NodeUpgrading, Version: st.Version, ClearError: true}) {
-					d.restoreCordon(ctx, n)
-					recordNodeUpgrade(now.Sub(time.Unix(0, n.UpdatedUnixNano)).Seconds())
-					d.logf("cluster: rollout node done", "rollout_id", r.ID, "node_id", n.NodeID, "version", st.Version)
-				}
-				continue
-			case !st.OpFound && !st.OpRunning && st.Version != target && now.Sub(time.Unix(0, n.UpdatedUnixNano)) > d.applyResendAfter:
-				// The op never started: the leader that marked the node died
-				// before its call, or the call was lost. The node's own
-				// state shows no op, so sending it again cannot start a
-				// second upgrade.
-				d.sendApply(ctx, r, *n, m, n.Op)
-			}
+		if err == nil && d.followUpgrading(ctx, r, n, m, st, now) {
+			continue
 		}
 		if n.DeadlineUnixNano > 0 && now.After(time.Unix(0, n.DeadlineUnixNano)) {
 			d.failNode(ctx, r.ID, *n, fmt.Sprintf("did not come back healthy on %s within %s (--node-timeout)", target, time.Duration(r.NodeTimeoutNanos)))
@@ -702,6 +708,65 @@ func (d *rolloutDriver) watchUpgrading(ctx context.Context, r *RolloutRecord, me
 		return true
 	}
 	return false
+}
+
+// followUpgrading acts on one upgrading node's own report and says whether
+// the node left upgrading.
+//
+// A node keeps state upgrading, its op and its deadline from the moment the
+// leader marks it until it reports a result or the deadline passes, even
+// across a stop, a restage or a rollback: until then it may be restarting,
+// and only that state keeps the dead-owner loop from failing it over. Its op
+// may then be an earlier pass's, or the rollout may start no restart now.
+// Such an op is never sent again (the node's fence refuses it too), and once
+// it has ended, or plainly never started, the node goes back to pending so
+// this pass's walk decides what it still needs.
+func (d *rolloutDriver) followUpgrading(ctx context.Context, r *RolloutRecord, n *RolloutNodeRecord, m Member, st UpgradeNodeStatus, now time.Time) bool {
+	target := targetOf(r)
+	current := n.Op == rolloutOpID(r)
+	ended := st.OpFound && !st.OpRunning && (st.OpPhase == string(nodeupgrade.PhaseDone) || st.OpPhase == string(nodeupgrade.PhaseFailed))
+	idle := !st.OpFound && !st.OpRunning
+	since := now.Sub(time.Unix(0, n.UpdatedUnixNano))
+	abandoned := idle && since > d.abandonAfter
+	switch {
+	case current && st.OpFound && st.OpPhase == string(nodeupgrade.PhaseFailed):
+		d.failNode(ctx, r.ID, *n, "the node's upgrader failed and put the previous files back: "+st.OpError)
+		return true
+	case st.Version == target && d.healthy(n, m, st, target) && (current || ended || abandoned):
+		// An earlier pass's op counts only once it has ended: until then the
+		// node still answers on the version it is leaving, which is what a
+		// rollback goes back to.
+		if d.update(ctx, RolloutNodeUpdate{RolloutID: r.ID, NodeID: n.NodeID, State: upgradewire.NodeDone, ExpectState: upgradewire.NodeUpgrading, Version: st.Version, ClearError: true}) {
+			d.restoreCordon(ctx, n)
+			recordNodeUpgrade(since.Seconds())
+			d.logf("cluster: rollout node done", "rollout_id", r.ID, "node_id", n.NodeID, "version", st.Version)
+		}
+		return true
+	case !current || !rolloutStartsRestarts(r.State):
+		if st.Version != target && (ended || abandoned) {
+			d.requeue(ctx, r, n)
+			return true
+		}
+	case idle && st.Version != target && since > d.applyResendAfter:
+		// The op never started: the leader that marked the node died before
+		// its call, or the call was lost. The node's own state shows no op,
+		// so sending it again cannot start a second upgrade.
+		d.sendApply(ctx, r, *n, m, n.Op)
+	}
+	return false
+}
+
+// requeue sends an upgrading node whose step is over back to pending for
+// this pass. While the rollout starts no restart, no restart follows soon,
+// so the node also gets its own cordon mark back.
+func (d *rolloutDriver) requeue(ctx context.Context, r *RolloutRecord, n *RolloutNodeRecord) {
+	if !d.update(ctx, RolloutNodeUpdate{RolloutID: r.ID, NodeID: n.NodeID, State: upgradewire.NodePending, ExpectState: upgradewire.NodeUpgrading, ClearError: true}) {
+		return
+	}
+	if !rolloutStartsRestarts(r.State) {
+		d.restoreCordon(ctx, n)
+	}
+	d.logf("cluster: rollout node back to pending; its earlier step is over", "rollout_id", r.ID, "node_id", n.NodeID, "op", n.Op, "state", r.State)
 }
 
 // healthy is §6.2's check: alive in gossip on the target, a server's

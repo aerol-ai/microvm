@@ -315,7 +315,7 @@ func (f *placementFSM) applyRolloutCommandLocked(cmd command) (any, error) {
 		next.Attempt++
 		next.UpdatedUnixNano, next.StateUnixNano = stamp, stamp
 		for _, n := range next.Nodes {
-			if n.State == upgradewire.NodeDone {
+			if n.State == upgradewire.NodeDone || n.State == upgradewire.NodeUpgrading {
 				continue
 			}
 			resetNode(n, stamp)
@@ -337,7 +337,7 @@ func (f *placementFSM) applyRolloutCommandLocked(cmd command) (any, error) {
 			next.Error = ""
 			next.Attempt++
 			for _, n := range next.Nodes {
-				if n.State == upgradewire.NodeSkipped {
+				if n.State == upgradewire.NodeSkipped || n.State == upgradewire.NodeUpgrading {
 					continue
 				}
 				resetNode(n, stamp)
@@ -365,7 +365,11 @@ func (f *placementFSM) applyRolloutCommandLocked(cmd command) (any, error) {
 }
 
 // resetNode puts a node back to pending for another pass (a restage or a
-// rollback). Its cordon mark at the start and its order stay.
+// rollback). Its cordon mark at the start and its order stay. A node that
+// is upgrading is never reset: it may be restarting right now, and its
+// state and deadline are what keep the dead-owner loop from failing it
+// over (dead_owner.go). The leader follows its op to the end and only then
+// sends it back to pending (rolloutDriver.followUpgrading).
 func resetNode(n *RolloutNodeRecord, stamp int64) {
 	n.State = upgradewire.NodePending
 	n.Error = ""
@@ -445,6 +449,10 @@ func (f *placementFSM) applyRolloutNodeLocked(cmd command) (any, error) {
 		}
 		if in.State != "" && in.State != upgradewire.NodeUpgrading {
 			n.DeadlineUnixNano = 0
+		}
+		if in.State == upgradewire.NodePending {
+			// Back for another pass: the old step is over.
+			n.Op, n.Term = "", 0
 		}
 		if in.Migrated {
 			n.Migrated = true

@@ -416,6 +416,63 @@ func TestRolloutAPIViewAndFiles(t *testing.T) {
 	}
 }
 
+// R4: a node mid-restart keeps state upgrading, its op and its deadline
+// through a restage (apply again) and a rollback, so the dead-owner loop
+// still skips it until the deadline. Nodes not mid-restart reset as before.
+func TestFSMRolloutRestageAndRollbackKeepUpgradingNodes(t *testing.T) {
+	for _, second := range []string{evApply, evRollback} {
+		t.Run(second, func(t *testing.T) {
+			f := newPlacementFSM()
+			nodes := append(twoNodes(), &RolloutNodeRecord{NodeID: "w2", Tier: rolloutTierWorker, Arch: "amd64", State: upgradewire.NodePending, Order: 3, Batch: 1})
+			log := []command{applyCmd("r1", "v2", nodes...)}
+			for _, id := range []string{"s1", "w1", "w2"} {
+				log = append(log, nodeCmd(RolloutNodeUpdate{RolloutID: "r1", NodeID: id, State: upgradewire.NodeStaged}, 11))
+			}
+			log = append(log,
+				eventCmd("r1", evAllStaged, 12),
+				nodeCmd(RolloutNodeUpdate{RolloutID: "r1", NodeID: "s1", State: upgradewire.NodeUpgrading, Op: "r1-u0", DeadlineUnixNano: 900}, 13),
+				nodeCmd(RolloutNodeUpdate{RolloutID: "r1", NodeID: "s1", State: upgradewire.NodeDone, Version: "v2"}, 14),
+				nodeCmd(RolloutNodeUpdate{RolloutID: "r1", NodeID: "w1", State: upgradewire.NodeUpgrading, Op: "r1-u0", Term: 4, DeadlineUnixNano: 1000}, 15),
+				nodeCmd(RolloutNodeUpdate{RolloutID: "r1", NodeID: "w2", State: upgradewire.NodeUpgrading, Op: "r1-u0", DeadlineUnixNano: 1000}, 15),
+				nodeCmd(RolloutNodeUpdate{RolloutID: "r1", NodeID: "w2", State: upgradewire.NodeFailed, Error: "boom"}, 16),
+				eventCmd("r1", evNodeFailed, 17),
+			)
+			if second == evApply {
+				log = append(log, applyCmd("again", "v2"))
+			} else {
+				log = append(log, eventCmd("r1", evRollback, 18))
+			}
+			for i, cmd := range log {
+				applyDenyLogAt(t, f, uint64(i+1), cmd)
+			}
+			r := f.rollout
+			w1 := r.Nodes["w1"]
+			if r.Attempt != 1 || w1.State != upgradewire.NodeUpgrading || w1.Op != "r1-u0" || w1.Term != 4 || w1.DeadlineUnixNano != 1000 || w1.UpdatedUnixNano != 15 {
+				t.Fatalf("after %s the node mid-restart is %+v", second, w1)
+			}
+			if dl, ok := f.upgradingDeadline("w1"); !ok || dl.UnixNano() != 1000 {
+				t.Fatalf("after %s the dead-owner loop sees no deadline: %v %v", second, dl, ok)
+			}
+			if r.Nodes["w2"].State != upgradewire.NodePending || r.Nodes["w2"].Error != "" {
+				t.Fatalf("after %s the failed node is %+v", second, r.Nodes["w2"])
+			}
+			wantS1 := upgradewire.NodeDone // a restage keeps done nodes
+			if second == evRollback {
+				wantS1 = upgradewire.NodePending // a rollback takes them back
+			}
+			if r.Nodes["s1"].State != wantS1 {
+				t.Fatalf("after %s s1 is %s, want %s", second, r.Nodes["s1"].State, wantS1)
+			}
+			// Once its old op ends, the node goes back to pending for this
+			// pass: its op and deadline go with it.
+			res := rolloutRes(t, applyDenyLogAt(t, f, 30, nodeCmd(RolloutNodeUpdate{RolloutID: "r1", NodeID: "w1", State: upgradewire.NodePending, ExpectState: upgradewire.NodeUpgrading}, 40)))
+			if n := res.Rollout.Nodes["w1"]; !res.Changed || n.Op != "" || n.Term != 0 || n.DeadlineUnixNano != 0 {
+				t.Fatalf("upgrading -> pending = %+v", n)
+			}
+		})
+	}
+}
+
 // R12: staging, stop, a pause and a failure start no new restart (§6.6).
 // The FSM refuses a node's move to upgrading then, so a leader that read
 // "running" just before a stop landed cannot mark one. A node already
