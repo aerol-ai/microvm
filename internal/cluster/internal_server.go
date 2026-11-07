@@ -50,6 +50,11 @@ type internalServer struct {
 	// so a forwarding peer retries instead of surfacing a permanent failure —
 	// that is the boot-safe half of the revocation path.
 	peerAuth atomic.Pointer[internalPeerAuthorizer]
+	// peerDenied refuses deleted nodes (gossip_deny.go) before the
+	// membership check, with their own 403 wording. Kept apart from
+	// peerAuth so a deleted node is told it was deleted rather than "not
+	// in membership", which a restarting node reads as "retry".
+	peerDenied atomic.Pointer[internalPeerAuthorizer]
 	// extra is loaded atomically so AttachInternalHandler is lock-free for
 	// the hot path (every incoming forward reads it once per request).
 	extra atomic.Pointer[http.Handler]
@@ -165,6 +170,10 @@ func (s *internalServer) authorizePeerRequest(w http.ResponseWriter, r *http.Req
 		http.Error(w, err.Error(), http.StatusForbidden)
 		return false
 	}
+	if denied := s.peerDenied.Load(); denied != nil && (*denied)(peerID) {
+		http.Error(w, ErrPeerDeleted.Error(), http.StatusForbidden)
+		return false
+	}
 	authorizer := s.peerAuth.Load()
 	if authorizer == nil {
 		// Boot window: the listener is bound but gossip has not been
@@ -192,6 +201,19 @@ func (s *internalServer) SetPeerAuthorizer(fn internalPeerAuthorizer) {
 		return
 	}
 	s.peerAuth.Store(&fn)
+}
+
+// SetPeerDenyCheck installs the deleted-node check. fn reports (and records)
+// a refusal; nil removes the check.
+func (s *internalServer) SetPeerDenyCheck(fn internalPeerAuthorizer) {
+	if s == nil {
+		return
+	}
+	if fn == nil {
+		s.peerDenied.Store(nil)
+		return
+	}
+	s.peerDenied.Store(&fn)
 }
 
 // SetExtraHandler installs the http.Handler used for every non-/internal/apply

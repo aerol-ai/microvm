@@ -159,6 +159,11 @@ type Agent struct {
 	// identityRoles caches the role tags this worker's creates and token
 	// refreshes ask about (identity.go).
 	identityRoles identityRoleCache
+	// deny is this node's copy of the deleted-node set
+	// (agent_deny_mirror.go); denyMirrorStop ends its poll.
+	deny           agentDenyMirror
+	denyMirrorStop context.CancelFunc
+	denyHits       *denyHitRecorder
 
 	// feed is the placement delta feed (agent_placement_feed.go), started
 	// only with SB_INGRESS_PROXY_ROUTING. nil means the page walk.
@@ -254,6 +259,7 @@ func NewAgent(cfg config.Config, logger *slog.Logger, admitter *capacity.Admitte
 		dataPlaneHost: cfg.DataPlaneAdvertiseHost,
 		patToken:      cfg.PATToken,
 		tls:           clusterTLS,
+		denyHits:      &denyHitRecorder{logger: logger},
 	}
 
 	if clusterTLS != nil {
@@ -269,6 +275,7 @@ func NewAgent(cfg config.Config, logger *slog.Logger, admitter *capacity.Admitte
 		if err != nil {
 			return nil, fmt.Errorf("cluster.NewAgent: internal server: %w", err)
 		}
+		is.SetPeerDenyCheck(a.refuseDeniedPeer)
 		a.internalServer = is
 		a.internalURL = deriveInternalAdvertiseURL(cfg.ClusterInternalAdvertiseURL, cfg.ClusterInternalListenAddr, is.Addr())
 	}
@@ -302,6 +309,8 @@ func NewAgent(cfg config.Config, logger *slog.Logger, admitter *capacity.Admitte
 		OnLeave:        a.invalidatePeerClient,
 		PeerCacheDir:   cfg.RaftDataDir,
 		PATScope:       cfg.PATScope,
+		Denied:         a.deny.has,
+		DenyHits:       a.denyHits,
 	}, admitter, logger)
 	if err != nil {
 		if a.internalServer != nil {
@@ -323,6 +332,7 @@ func NewAgent(cfg config.Config, logger *slog.Logger, admitter *capacity.Admitte
 	// AttachRecreator probe silently skipped an Agent.
 	a.startOwnerWatcher()
 	a.startPlacementFeed()
+	a.startDenyMirror(denyMirrorInterval)
 	return a, nil
 }
 
@@ -1469,6 +1479,9 @@ func (a *Agent) Leader() string {
 
 func (a *Agent) Close() error {
 	var firstErr error
+	if a.denyMirrorStop != nil {
+		a.denyMirrorStop()
+	}
 	a.stopOwnerWatcher()
 	a.stopPlacementFeed()
 	if a.gossip != nil {

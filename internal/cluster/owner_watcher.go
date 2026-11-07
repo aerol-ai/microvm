@@ -353,6 +353,7 @@ func (c *Cluster) selectRecreationTargetFor(p Placement, exclude ...string) (Pla
 		return c.SelectPlacement(req)
 	}
 	drained := c.fsm.drainedNodesSnapshot()
+	denied := c.fsm.deniedNodeSet()
 	// Score every eligible candidate that isn't excluded and pick the one with
 	// the highest headroom. Secret-bearing placements normally have only the
 	// owner plus two backups, so the recipient lookup remains O(recipients)
@@ -385,7 +386,7 @@ func (c *Cluster) selectRecreationTargetFor(p Placement, exclude ...string) (Pla
 		if req.RequiredNodeID != "" && m.NodeID != req.RequiredNodeID {
 			continue
 		}
-		if drained[m.NodeID] {
+		if drained[m.NodeID] || denied[m.NodeID] {
 			continue
 		}
 		if m.APIURL == "" && m.NodeID != c.nodeID {

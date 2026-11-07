@@ -245,6 +245,12 @@ type gossipMemberIndex struct {
 	// once before memberlist starts delivering events; the drift gauge
 	// counts alive members that gossip a different one.
 	selfPATScope string
+	// selfID and denied keep deleted nodes out of the index (gossip_deny.go):
+	// a denied member is dropped on its next upsert and on every refresh.
+	// Self is never dropped. A nil denied (tests, and any index built
+	// without a deny source) keeps every member.
+	selfID string
+	denied func(string) bool
 }
 
 func newGossipMemberIndex() *gossipMemberIndex {
@@ -288,10 +294,15 @@ func (i *gossipMemberIndex) upsert(m Member) {
 	if i.seen == nil {
 		i.seen = make(map[string]int64)
 	}
-	if m.Alive {
-		i.seen[m.NodeID] = now
+	if !i.keep(m.NodeID) {
+		delete(i.members, m.NodeID)
+		delete(i.seen, m.NodeID)
+	} else {
+		if m.Alive {
+			i.seen[m.NodeID] = now
+		}
+		i.members[m.NodeID] = m
 	}
-	i.members[m.NodeID] = m
 	i.rebuildControlPlaneLocked()
 	i.recordFeatureFloorLocked()
 	i.recordMetricsLocked(now)
@@ -336,7 +347,7 @@ func (i *gossipMemberIndex) replace(members []Member) {
 	now := time.Now().UnixNano()
 	next := make(map[string]Member, len(members))
 	for _, m := range members {
-		if m.NodeID == "" {
+		if m.NodeID == "" || !i.keep(m.NodeID) {
 			continue
 		}
 		next[m.NodeID] = m
@@ -563,6 +574,11 @@ type gossipSetupConfig struct {
 	PeerCacheDir string
 	// PATScope is this node's SB_PAT_SCOPE, gossiped for the drift gauge.
 	PATScope string
+	// Denied reports deleted node IDs (gossip_deny.go): gossip refuses their
+	// alive messages and the member index drops them. nil denies nothing.
+	Denied func(string) bool
+	// DenyHits counts and logs those refusals.
+	DenyHits *denyHitRecorder
 }
 
 // testTuneMemberlist is set only by this package's TestMain, to shorten
@@ -593,6 +609,11 @@ func setupGossip(cfg gossipSetupConfig, admitter *capacity.Admitter, logger *slo
 	memberIndex := newGossipMemberIndex()
 	memberIndex.selfPATScope = GossipPATScope(cfg.PATScope)
 	nodeTable := newGossipNodeTable()
+	memberIndex.selfID = cfg.NodeID
+	memberIndex.denied = cfg.Denied
+	if cfg.Denied != nil {
+		mlCfg.Alive = &gossipAliveDelegate{selfID: cfg.NodeID, denied: cfg.Denied, hits: cfg.DenyHits}
+	}
 	mlCfg.Delegate = delegate
 	mlCfg.Events = &indexedEventDelegate{index: memberIndex, nodes: nodeTable, logger: logger, next: cfg.Events, onLeave: cfg.OnLeave}
 	if len(cfg.SecretKey) > 0 {
@@ -851,6 +872,21 @@ func (g *gossipNode) scanMembers() []Member {
 		out = append(out, memberFromMemberlistNode(n))
 	}
 	return out
+}
+
+// memberlistMember is lookupMember without the deny filter: memberlist's own
+// view, which still holds a deleted node until it stops answering probes. It
+// scans every node, so only the operator's node-delete path uses it.
+func (g *gossipNode) memberlistMember(id string) (Member, bool) {
+	if m, ok := g.lookupMember(id); ok {
+		return m, true
+	}
+	for _, n := range g.memberlistNodes() {
+		if n != nil && n.Name == id {
+			return memberFromMemberlistNode(n), true
+		}
+	}
+	return Member{}, false
 }
 
 func memberFromMemberlistNode(n *memberlist.Node) Member {

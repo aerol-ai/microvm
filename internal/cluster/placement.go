@@ -137,6 +137,9 @@ func (c *Cluster) SelectPlacementWithCandidates(req capacity.Request) (Placement
 	// soft-scoring penalty. Self can be drained too; that's the intended way
 	// to roll a node out of rotation without restarting it.
 	drained := c.fsm.drainedNodesSnapshot()
+	// A deleted node is out of the gossip view within one refresh; until
+	// then the deny record keeps it out of the candidates.
+	denied := c.fsm.deniedNodeSet()
 	candidates := make([]Member, 0, len(all))
 	// requiredReachable records whether the artifact-bound node, if any, was
 	// seen as a live capacity-reporting member. If it was and still produced
@@ -193,6 +196,11 @@ func (c *Cluster) SelectPlacementWithCandidates(req capacity.Request) (Placement
 				continue
 			}
 			labelMatched = true
+		}
+		if denied[m.NodeID] {
+			rejects["denied"]++
+			c.denyHits.hit(denyHitPlacement, m.NodeID)
+			continue
 		}
 		if drained[m.NodeID] {
 			rejects["drained"]++
@@ -654,6 +662,16 @@ func (c *Cluster) admitReservationCommand(cmd command) error {
 	reservations = c.admission.withoutHeldResends(reservations)
 	if len(reservations) == 0 {
 		return nil
+	}
+	// A router with a stale view may still pick a node deleted since; the
+	// leader refuses it here, so the create retries elsewhere.
+	if denied := c.fsm.deniedNodeSet(); len(denied) > 0 {
+		for _, r := range reservations {
+			if denied[r.OwnerNodeID] {
+				c.denyHits.hit(denyHitPlacement, r.OwnerNodeID)
+				return fmt.Errorf("%w: worker %s was deleted from the cluster", ErrNoPlacementTarget, r.OwnerNodeID)
+			}
+		}
 	}
 	templateIDs := make([]string, 0, len(reservations))
 	for _, r := range reservations {

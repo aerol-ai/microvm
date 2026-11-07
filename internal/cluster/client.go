@@ -163,6 +163,8 @@ type Cluster struct {
 	// makes, so tests can move a placement or revive the node between the
 	// read and the write. Always nil in production.
 	evictDeadOwnerStepHook func(step evictDeadOwnerStep, sandboxID string)
+	// denyHits counts and logs refusals of deleted nodes (gossip_deny.go).
+	denyHits *denyHitRecorder
 }
 
 // New constructs the server-role Cluster for cfg.EnableCluster=true. Caller
@@ -238,6 +240,7 @@ func New(cfg config.Config, logger *slog.Logger, admitter *capacity.Admitter) (*
 		commitTimeout: commitTimeout,
 		deadOwners:    newDeadOwnerTracker(),
 		tls:           clusterTLS,
+		denyHits:      &denyHitRecorder{logger: logger},
 	}
 	// Not caught up from the first instant anything can read the FSM; the
 	// loop that clears it starts at the end of New (startCatchUpWatch).
@@ -260,6 +263,9 @@ func New(cfg config.Config, logger *slog.Logger, admitter *capacity.Admitter) (*
 			return nil, fmt.Errorf("cluster.New: internal server: %w", err)
 		}
 		is.SetReadIndexHandler(c.LeaderReadIndex)
+		// The FSM exists before the listener, so a deleted node is refused
+		// from the first request, boot window included.
+		is.SetPeerDenyCheck(c.refuseDeniedPeer)
 		c.internalServer = is
 		c.internalURL = deriveInternalAdvertiseURL(cfg.ClusterInternalAdvertiseURL, cfg.ClusterInternalListenAddr, is.Addr())
 	}
@@ -305,6 +311,8 @@ func New(cfg config.Config, logger *slog.Logger, admitter *capacity.Admitter) (*
 		OnLeave:        c.invalidatePeerClient,
 		PeerCacheDir:   cfg.RaftDataDir,
 		PATScope:       cfg.PATScope,
+		Denied:         fsm.isNodeDenied,
+		DenyHits:       c.denyHits,
 	}, admitter, logger)
 	if err != nil {
 		if c.internalServer != nil {

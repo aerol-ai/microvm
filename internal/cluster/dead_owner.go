@@ -161,6 +161,15 @@ func (c *Cluster) reconcileDeadOwners(ctx context.Context) {
 		}
 	}
 
+	// A deleted node is out of the gossip view, so nothing above marks it.
+	// One that still owns placements (its delete failed after the deny
+	// record landed and was never retried) is evicted like a dead owner.
+	for nodeID := range c.fsm.deniedNodeSet() {
+		if c.fsm.ownedCount(nodeID) > 0 {
+			c.deadOwners.markDead(nodeID, time.Now())
+		}
+	}
+
 	now := time.Now()
 	for nodeID, since := range c.deadOwners.snapshot() {
 		if now.Sub(since) < grace {
@@ -174,32 +183,60 @@ func (c *Cluster) reconcileDeadOwners(ctx context.Context) {
 	}
 }
 
-// evictDeadOwner handles every placement owned by nodeID and removes the dead
-// node from the raft configuration. Sandboxes that opted into
-// failover.policy=recreate are reassigned to a live peer scored against their
-// replicated spec; the owner watcher on that peer re-materializes the
-// container. All remaining placements are orphaned (OwnerNodeID="") so the API
-// surfaces ErrOrphaned (410 Gone).
-//
-// All steps are idempotent so a partial failure is safe to retry on the next
-// tick: a placement already orphaned stays orphaned, and RemoveServer is a
-// no-op once the dead node is gone.
-//
-// Every write is fenced on the dead node, because each step is a Raft round
-// trip and the world moves while the loop runs. A reassign carries the dead
-// node as its expected owner: opReassign keeps the incarnation, so without
-// that the FSM cannot tell a placement still on the dead node from one that
-// another path moved after this loop read it, and would move it again.
-// opOrphanOwner needs no extra field: it only touches rows whose owner is
-// still nodeID when it applies. And before each step the node's liveness is
-// re-checked, so a node that rejoins mid-loop keeps what it still owns
-// instead of having it moved or orphaned under it.
+// evictDeadOwner handles every placement owned by nodeID (evictOwnerPlacements)
+// and removes the dead node from the raft configuration. All steps are
+// idempotent so a partial failure is safe to retry on the next tick: a
+// placement already orphaned stays orphaned, and RemoveServer is a no-op once
+// the dead node is gone. A node that rejoins mid-loop keeps what it still
+// owns and stays a voter: evictOwnerPlacements stops with errOwnerRejoined,
+// and the liveness check runs once more before the removal.
 func (c *Cluster) evictDeadOwner(ctx context.Context, nodeID string) {
+	reassigned, orphaned, err := c.evictOwnerPlacements(ctx, nodeID)
+	if err != nil {
+		return
+	}
+	if reassigned > 0 || orphaned > 0 {
+		c.logger.Warn("cluster: handled placements after owner death",
+			"dead_node", nodeID, "reassigned", reassigned, "orphaned", orphaned)
+	}
+	// A voter that came back after its sandboxes were orphaned still must
+	// not be dropped from Raft: it reclaims them through ClaimOrphan.
+	if c.deadOwnerRejoined(nodeID, reassigned) {
+		return
+	}
+	c.runEvictDeadOwnerStepHook(evictStepRemoveServer, "")
+	c.removeDeadOwnerServer(nodeID)
+}
+
+// errOwnerRejoined is evictOwnerPlacements' answer when the owner shows alive
+// again partway through: the sandboxes it still owns stay with it, and the
+// dead-owner loop leaves it in Raft.
+var errOwnerRejoined = errors.New("cluster: owner rejoined during eviction")
+
+// evictOwnerPlacements moves every placement nodeID owns off it. Sandboxes
+// that opted into failover.policy=recreate are reassigned to a live peer
+// scored against their replicated spec; the owner watcher on that peer
+// re-materializes the container. All remaining placements are orphaned
+// (OwnerNodeID="") so the API surfaces ErrOrphaned (410 Gone). The dead-owner
+// loop and an operator's node delete (node_lifecycle.go) share it. A failure
+// is logged and returned after the steps that succeeded; every step is
+// idempotent, so the caller's retry finishes the job.
+//
+// Every write is fenced on the owner, because each step is a Raft round trip
+// and the world moves while the loop runs. A reassign carries nodeID as its
+// expected owner: opReassign keeps the incarnation, so without that the FSM
+// cannot tell a placement still on nodeID from one that another path moved
+// after this loop read it, and would move it again. opOrphanOwner needs no
+// extra field: it only touches rows whose owner is still nodeID when it
+// applies. And before each step the owner's liveness is re-checked
+// (deadOwnerRejoined), so a node that rejoins mid-loop keeps what it still
+// owns instead of having it moved or orphaned under it (errOwnerRejoined). A
+// deleted node never counts as rejoined, so a delete always finishes.
+func (c *Cluster) evictOwnerPlacements(ctx context.Context, nodeID string) (reassigned, orphaned int, err error) {
 	ids := c.fsm.idsOwnedBy(nodeID)
-	var reassigned int
 	for _, id := range ids {
 		if c.deadOwnerRejoined(nodeID, reassigned) {
-			return
+			return reassigned, 0, errOwnerRejoined
 		}
 		p, ok := c.fsm.get(id)
 		if !ok || strings.TrimSpace(p.OwnerNodeID) != strings.TrimSpace(nodeID) {
@@ -245,7 +282,7 @@ func (c *Cluster) evictDeadOwner(ctx context.Context, nodeID string) {
 			}
 			c.logger.Warn("cluster: reassign placement failed; will retry next tick",
 				"sandbox_id", id, "dead_node", nodeID, "new_owner", target.NodeID, "err", err)
-			return
+			return reassigned, 0, err
 		}
 		// The leader apply wrapper increments the metric only when the FSM
 		// reports a real transition. reassigned is a local log counter and
@@ -253,33 +290,34 @@ func (c *Cluster) evictDeadOwner(ctx context.Context, nodeID string) {
 		reassigned++
 	}
 	if c.deadOwnerRejoined(nodeID, reassigned) {
-		return
+		return reassigned, 0, errOwnerRejoined
 	}
-	orphaned := len(c.fsm.idsOwnedBy(nodeID))
+	orphaned = len(c.fsm.idsOwnedBy(nodeID))
 	c.runEvictDeadOwnerStepHook(evictStepOrphan, "")
 	if err := c.orphanOwner(ctx, nodeID); err != nil {
 		c.logger.Warn("cluster: orphan dead-owner placements failed; will retry next tick",
 			"dead_node", nodeID, "err", err)
-		return
+		return reassigned, 0, err
 	}
-	if reassigned > 0 || orphaned > 0 {
-		c.logger.Warn("cluster: handled placements after owner death",
-			"dead_node", nodeID, "reassigned", reassigned, "orphaned", orphaned)
-	}
-	// A voter that came back after its sandboxes were orphaned still must
-	// not be dropped from Raft: it reclaims them through ClaimOrphan.
-	if c.deadOwnerRejoined(nodeID, reassigned) {
-		return
-	}
-	c.runEvictDeadOwnerStepHook(evictStepRemoveServer, "")
-	c.removeDeadOwnerServer(nodeID)
+	return reassigned, orphaned, nil
 }
 
 // deadOwnerRejoined reports whether gossip sees nodeID alive again, and logs
 // that the eviction stops. It reads the same gossip view reconcileDeadOwners
 // used to decide the node was dead. The dead-owner mark is left for that
 // reconciler (or the join callback) to clear.
+//
+// A deleted node (one with a deny record) never counts as back, even while
+// its machine still runs and gossips: it is refused at peer auth, gossip and
+// placement, so its sandboxes must move as the delete intends. The member
+// index drops it only on its next refresh (the node delete calls
+// applyDenySet after this eviction), so until then gossip can still read it
+// as alive. The check lives here, the one place that decides "alive again",
+// so every caller of the fence gets it.
 func (c *Cluster) deadOwnerRejoined(nodeID string, reassigned int) bool {
+	if c.fsm.isNodeDenied(nodeID) {
+		return false
+	}
 	m, ok := c.gossip.lookupMember(nodeID)
 	if !ok || !m.Alive {
 		return false
