@@ -243,6 +243,23 @@ jobs:
           go build -trimpath -ldflags "$LDFLAGS" -o dist/sandboxd_${{ matrix.suffix }} ./cmd/sandboxd
           chmod 0755 dist/sandboxd_${{ matrix.suffix }}
 
+      # Upgrade checks (Ansible's update-sandboxd.yml, the docs' "Upgrading"
+      # steps, integration-tests/upgrade-gate.sh) read the version from
+      # `sandboxd --version`, so a release whose binary misreports it would
+      # pass them all while running the wrong build.
+      - name: Check the linux_amd64 sandboxd reports the release version
+        if: matrix.suffix == 'linux_amd64'
+        shell: bash
+        run: |
+          # The whole output first, then its first line: `| head -n1` under
+          # pipefail can fail on SIGPIPE when head exits before the rest.
+          out="$(dist/sandboxd_linux_amd64 --version)"
+          got="${out%%$'\n'*}"
+          if [[ "$got" != "sandboxd $VERSION" ]]; then
+            echo "::error::sandboxd --version printed '$got', want 'sandboxd $VERSION'"
+            exit 1
+          fi
+
       # Same check as test.yml: macOS kills an unsigned arm64 binary at launch.
       - name: Check the darwin binary is signed
         if: matrix.suffix == 'darwin_arm64'
@@ -389,16 +406,19 @@ jobs:
           merge-multiple: true
 
       # Terraform's seed bootstrap downloads cluster-sign-node.sh from
-      # /releases/latest/download/ (Terraform/variables.tf), so every script a
-      # Terraform default names must ship here; integration-tests/safety
-      # TestTerraformReleaseURLsNameShippedAssets keeps the two in step.
+      # /releases/latest/download/ (Terraform/variables.tf), and the operator
+      # docs download uninstall.sh from there, so every script a Terraform
+      # default or a doc names must ship here; integration-tests/safety
+      # TestTerraformReleaseURLsNameShippedAssets and
+      # TestDocsReleaseURLsNameShippedAssets keep them in step.
       - name: Copy install scripts
         run: |
           cp scripts/install.sh dist/install.sh
+          cp scripts/uninstall.sh dist/uninstall.sh
           cp scripts/cluster-init.sh dist/cluster-init.sh
           cp scripts/cluster-join.sh dist/cluster-join.sh
           cp scripts/cluster-sign-node.sh dist/cluster-sign-node.sh
-          chmod 0755 dist/install.sh dist/cluster-init.sh dist/cluster-join.sh dist/cluster-sign-node.sh
+          chmod 0755 dist/install.sh dist/uninstall.sh dist/cluster-init.sh dist/cluster-join.sh dist/cluster-sign-node.sh
 
       - name: Generate CycloneDX SBOM
         run: go run github.com/CycloneDX/cyclonedx-gomod/cmd/cyclonedx-gomod@v1.10.0 mod -json -output dist/sbom.cdx.json

@@ -111,7 +111,7 @@ func runVersionCLI(args []string, out io.Writer) error {
 		return enc.Encode(info)
 	case "text":
 		// The first line is "sandboxd <version>" alone, so a script can
-		// take the version with `head -n1` without parsing the rest.
+		// take the version from it without parsing the rest.
 		fmt.Fprintf(out, "sandboxd %s\n", info.Version)
 		if info.Commit != "" {
 			fmt.Fprintf(out, "commit:          %s\n", info.Commit)

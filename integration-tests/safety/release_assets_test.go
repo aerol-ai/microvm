@@ -1,6 +1,7 @@
 package safety
 
 import (
+	"io/fs"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -20,6 +21,9 @@ var (
 	// release. Only latest/ is checked: a pinned tag names a release that
 	// already exists, and changing release.yml cannot fix it.
 	releaseURLDefault = regexp.MustCompile(`releases/latest/download/([A-Za-z0-9._-]+)`)
+	// docsReleaseURL is the same for docs, which also link other projects'
+	// releases; only this repository's are ours to ship.
+	docsReleaseURL = regexp.MustCompile(`github\.com/aerol-ai/microvm/releases/latest/download/([A-Za-z0-9._-]+)`)
 	// shippedCopy matches release.yml's `cp <src> dist/<name>`.
 	shippedCopy = regexp.MustCompile(`\bcp\s+\S+\s+dist/([A-Za-z0-9._-]+)`)
 	// shippedBuild matches `-o dist/<name>_${{ matrix.suffix }}` and
@@ -27,9 +31,16 @@ var (
 	shippedBuild = regexp.MustCompile(`(?:-o|--output)\s+"?dist/([A-Za-z0-9._-]+)_\$\{\{\s*matrix\.suffix\s*\}\}`)
 )
 
-func TestTerraformReleaseURLsNameShippedAssets(t *testing.T) {
-	repoRoot := filepath.Join(filepath.Dir(buildScript(t)), "..", "..")
-	release, err := os.ReadFile(filepath.Join(repoRoot, ".github", "workflows", "release.yml"))
+func repoRoot(t *testing.T) string {
+	t.Helper()
+	return filepath.Join(filepath.Dir(buildScript(t)), "..", "..")
+}
+
+// releaseShipped reports, from release.yml, whether a release carries an
+// asset with this name.
+func releaseShipped(t *testing.T) func(name string) bool {
+	t.Helper()
+	release, err := os.ReadFile(filepath.Join(repoRoot(t), ".github", "workflows", "release.yml"))
 	if err != nil {
 		t.Fatalf("read release.yml: %v", err)
 	}
@@ -50,7 +61,7 @@ func TestTerraformReleaseURLsNameShippedAssets(t *testing.T) {
 	if len(builtPrefixes) == 0 {
 		t.Fatalf("release.yml: no `-o dist/<name>_${{ matrix.suffix }}` found; shippedBuild no longer matches the workflow")
 	}
-	shipped := func(name string) bool {
+	return func(name string) bool {
 		if copied[name] {
 			return true
 		}
@@ -61,8 +72,11 @@ func TestTerraformReleaseURLsNameShippedAssets(t *testing.T) {
 		}
 		return false
 	}
+}
 
-	tfFiles, err := filepath.Glob(filepath.Join(repoRoot, "Terraform", "*.tf"))
+func TestTerraformReleaseURLsNameShippedAssets(t *testing.T) {
+	shipped := releaseShipped(t)
+	tfFiles, err := filepath.Glob(filepath.Join(repoRoot(t), "Terraform", "*.tf"))
 	if err != nil || len(tfFiles) == 0 {
 		t.Fatalf("no Terraform/*.tf files found (err=%v)", err)
 	}
@@ -84,4 +98,44 @@ func TestTerraformReleaseURLsNameShippedAssets(t *testing.T) {
 		t.Fatal("found no releases/latest/download/ defaults in Terraform/*.tf; the check would pass vacuously")
 	}
 	t.Logf("checked %d Terraform release-asset defaults", checked)
+}
+
+// The single-node and local setup guides told operators to download
+// uninstall.sh from releases/latest/ for releases that never uploaded it, so
+// the documented uninstall was a 404. Every release URL an operator doc
+// gives must name a file the release ships.
+func TestDocsReleaseURLsNameShippedAssets(t *testing.T) {
+	shipped := releaseShipped(t)
+	root := repoRoot(t)
+	checked := 0
+	for _, dir := range []string{"setup", filepath.Join("docs", "src", "content", "docs"), "Ansible", "README.md"} {
+		err := filepath.WalkDir(filepath.Join(root, dir), func(path string, d fs.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+			if d.IsDir() || (!strings.HasSuffix(path, ".md") && !strings.HasSuffix(path, ".mdx")) {
+				return nil
+			}
+			body, err := os.ReadFile(path)
+			if err != nil {
+				return err
+			}
+			for _, m := range docsReleaseURL.FindAllStringSubmatch(string(body), -1) {
+				checked++
+				if !shipped(m[1]) {
+					rel, _ := filepath.Rel(root, path)
+					t.Errorf("%s links releases/latest/download/%s, but .github/workflows/release.yml never ships %s: the link is a 404",
+						rel, m[1], m[1])
+				}
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("walk %s: %v", dir, err)
+		}
+	}
+	if checked == 0 {
+		t.Fatal("found no releases/latest/download/ links in the docs; the check would pass vacuously")
+	}
+	t.Logf("checked %d release-asset links in the docs", checked)
 }
