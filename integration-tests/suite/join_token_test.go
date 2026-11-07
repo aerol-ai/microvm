@@ -154,14 +154,14 @@ func TestJoinTokenEveryNodeJoinedWithAToken(t *testing.T) {
 			marker = "seed started the cluster with sandboxd init"
 		}
 		out, err := joinNodeSSH(t, n, `sudo bash -c 'grep -c "`+marker+`" /var/log/aerolvm-bootstrap.log; `+
-			`grep -c "Managed by sandboxd init / sandboxd join" /etc/sandboxd/cluster.env; `+
+			`grep -c "^SB_CLUSTER_BOOTSTRAP=" /etc/sandboxd/cluster.env; `+
 			`ls /tmp/cluster-join.sh /tmp/cluster-init.sh /tmp/aerolvm-tls-bundle.tar.gz 2>/dev/null | wc -l'`)
 		if err != nil {
 			t.Fatalf("%s: %v: %s", n.Name, err, out)
 		}
 		fields := strings.Fields(out)
 		if len(fields) < 3 || fields[len(fields)-3] == "0" || fields[len(fields)-2] == "0" || fields[len(fields)-1] != "0" {
-			t.Fatalf("%s did not join with the one-line installer (bootstrap marker, cluster.env header, old files): %q", n.Name, out)
+			t.Fatalf("%s did not join with the one-line installer (bootstrap marker, cluster.env from init or join, old files): %q", n.Name, out)
 		}
 		cert, err := readNodeCert(t, n)
 		if err != nil {

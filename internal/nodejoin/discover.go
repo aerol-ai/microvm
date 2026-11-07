@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -63,19 +64,32 @@ func normalizeJoinURL(raw string) (string, error) {
 	return "https://" + u.Host, nil
 }
 
+// portProbeTimeout bounds the connect to the join port (eng T14: about
+// 3 s), so a firewall that drops 7003 fails the check quickly instead of
+// after the whole call's budget.
+const portProbeTimeout = 3 * time.Second
+
+func joinTransport(cfg *tls.Config) *http.Transport {
+	return &http.Transport{
+		DialContext:         (&net.Dialer{Timeout: portProbeTimeout}).DialContext,
+		TLSHandshakeTimeout: 2 * portProbeTimeout,
+		TLSClientConfig:     cfg,
+	}
+}
+
 // insecureClient talks to the join port before the CA is known. Safe only
 // because nothing it reads is trusted until its MACs check out.
 func insecureClient() *http.Client {
-	return &http.Client{Timeout: joinTimeout, Transport: &http.Transport{
-		TLSClientConfig: &tls.Config{InsecureSkipVerify: true, MinVersion: tls.VersionTLS12}, //nolint:gosec // trust comes from the discovery MAC, not the chain
-	}}
+	return &http.Client{Timeout: joinTimeout, Transport: joinTransport(
+		&tls.Config{InsecureSkipVerify: true, MinVersion: tls.VersionTLS12}, //nolint:gosec // trust comes from the discovery MAC, not the chain
+	)}
 }
 
 // pinnedClient checks the join port's cert against the discovered CA.
 func pinnedClient(pool *x509.CertPool) *http.Client {
-	return &http.Client{Timeout: joinTimeout, Transport: &http.Transport{
-		TLSClientConfig: &tls.Config{RootCAs: pool, ServerName: clusterServerName, MinVersion: tls.VersionTLS12},
-	}}
+	return &http.Client{Timeout: joinTimeout, Transport: joinTransport(
+		&tls.Config{RootCAs: pool, ServerName: clusterServerName, MinVersion: tls.VersionTLS12},
+	)}
 }
 
 // discover reads and checks cluster-info for token. pin is --ca-cert-hash.
