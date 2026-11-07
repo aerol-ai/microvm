@@ -33,6 +33,7 @@
 #            cluster-3-mixed-kms-switch | single-node-wrapped-kms
 # Ingress proxy routing gate: cluster-3-mixed-routing | cluster-hetero-lite-routing
 # Ingress load balancer (UC-356): cluster-3-mixed-lb
+# Cluster correctness faults (UC-470..479, focused): cluster-chaos
 #
 # Safety: every dangerous input is gated by provision.sh check-safety BEFORE any
 # apply. Teardown runs on EXIT/INT/TERM (trap) so a crash can't leak EC2; the
@@ -1516,9 +1517,24 @@ run_one() {
   # EMPTY array is an unbound-variable error — so the common case (no filter)
   # would abort the run.
   local -a runflag=()
+  # A FOCUSED scenario (a `focus:` block in its caps file, e.g. cluster-chaos)
+  # runs only the tests that claim its focus capability's use cases, on
+  # purpose and every time. Unlike AEROL_TEST_RUN that run IS the scenario's
+  # canonical report, so it keeps the scenario's name; gen is told the focus
+  # capability and marks every other use case "skip (not in this focused
+  # scenario)" instead of "missing". An operator's AEROL_TEST_RUN still wins
+  # and still reports as -partial.
+  local focus_run focus_cap
+  focus_run=$(yq -r '.focus.run // ""' "$caps_file")
+  focus_cap=$(yq -r '.focus.capability // ""' "$caps_file")
+  local -a focusflag=()
   if [[ -n "${AEROL_TEST_RUN:-}" ]]; then
     runflag=(-run "${AEROL_TEST_RUN}")
     echo "test filter: -run ${AEROL_TEST_RUN} (PARTIAL pass; the report covers only these tests)" >&2
+  elif [[ -n "$focus_run" && -n "$focus_cap" ]]; then
+    runflag=(-run "${focus_run}")
+    focusflag=(-focus-cap "${focus_cap}")
+    echo "focused scenario: -run ${focus_run} (only ${focus_cap} use cases run here; the rest report as skip)" >&2
   fi
 
   # The S3 Object Lock audit witness, when the scenario has one (empty values
@@ -1655,7 +1671,7 @@ run_one() {
     echo "partial run: reporting as ${report_scenario} so ${scenario}'s full report is preserved" >&2
   fi
   AEROL_SCENARIO="$scenario" go run "${HERE}/report" -scenario "$report_scenario" \
-    -json "$json_out" -out "${HERE}/reports"
+    -json "$json_out" -out "${HERE}/reports" ${focusflag[@]+"${focusflag[@]}"}
   if [[ "${AEROL_BENCH:-}" == "1" && -n "$bench_out" ]]; then
     publish_bench_artifacts "$bench_out"
   fi

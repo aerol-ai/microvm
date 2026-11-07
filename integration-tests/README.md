@@ -260,6 +260,68 @@ over 30 s, and no sandboxd restarted (UC-361's checks). The numbers land in
 each node's `429`/`503` counts. A run whose noisy team never got a `429`
 fails and says to raise `AEROL_FAIRNESS_NOISY`.
 
+## Cluster correctness under faults (UC-470..UC-479)
+
+`cluster-chaos` (`make integration-cluster-chaos`) is the live layer of
+`plans/cluster-correctness-and-create-latency.md` §3.2. Each case injects one
+fault and asserts the plan's §1 invariants (I1 one executor, I3 no
+resurrection, I4 capacity, I6 convergence, I7 routing safety, I8 a failed
+create leaves nothing), not just "no error". Several fail on `main` until the
+plan's fixes C2..C7 land; each test's doc comment in
+`suite/z_cluster_chaos_test.go` names the fix it guards.
+
+| UC | Fault | Invariants | Guards |
+|----|-------|------------|--------|
+| UC-470 | Owner worker + ingress cut off from the servers for 120 s | I1, I7, I6 | C4 |
+| UC-471 | Worker cut off, its sandbox reassigned and deleted, worker heals and restarts | I3, I6 | C2 |
+| UC-472 | Owner killed (sandboxd, containers, engine); DELETE right after the reassign | I3 | C3 |
+| UC-473 | Raft leader killed during 200 concurrent creates | I8, I6, I4 | C5, C1 |
+| UC-474 | Leader and a second voter stopped while creates are between reserve and promote | I8 | C5 |
+| UC-475 | Concurrent create, destroy, stop, start on the same names | I3 | C2, C3 |
+| UC-476 | 5% loss and 200 ms delay between every pair of nodes, under creates | I1, I4, I8 | C4, C6, C7 |
+| UC-477 | Every server restarted in turn, leader last | I6 | C1 |
+| UC-478 | Loaded worker killed when the survivors have less room | I4, I6 | C7 |
+| UC-479 | Owner killed for real; the old node returns | I1, I6 | C4, C2 |
+
+- **Topology.** 3 servers, 3 workers, 1 ingress, all t3.medium on-demand
+  (`scenarios/cluster-chaos.tfvars` says why each). About $0.29/h; bring-up
+  ~20 min, the ten cases ~80 min, teardown ~5 min, so ~$0.45-0.65 a run.
+  The scenario sets `SB_RECONCILE_INTERVAL=60s`; the cases read it off a node
+  and wait two intervals plus a minute before calling a state converged.
+- **Focused.** The caps file's `focus` block makes run.sh pass
+  `-run '^TestClusterChaos'` and tells the report generator to mark every
+  other use case skip (not in this focused scenario) instead of missing, so
+  the gate is red only for a chaos case that failed or never reported.
+  `safety/focus_filter_test.go` keeps the regex matching exactly the tests
+  that claim a `cluster-chaos` use case.
+- **Invariant verdicts in the report.** Each case calls
+  `harness.TrackInvariants` and logs one `invariant=I<n> <held|violated|not-exercised>`
+  line per invariant; `report/gen.go` puts them on the row
+  (`reports/cluster-chaos.json` `invariants`, and the Detail column), pass
+  rows included, so a green row also says what it held over.
+- **How faults are injected.** Partitions are iptables DROP rules both ways
+  on the cut-off nodes, as UC-291, with a dead-man heal armed by
+  `systemd-run` first. Packet loss and delay are a netem qdisc on a filtered
+  prio band, so only traffic to the other nodes is impaired; SSH and the
+  internet are not. A "real" owner kill stops sandboxd, SIGKILLs every
+  sandbox container and stops the engine; the restore starts them and waits
+  for the rejoin. "Two copies" is read from every worker's engine over SSH
+  (`harness.RuntimeCensusScript`), and a census that failed is never read
+  as "no copy".
+
+| Env var | Default | Purpose |
+|---------|---------|---------|
+| `AEROL_CHAOS_PARTITION_SECONDS` | `120` | UC-470's partition |
+| `AEROL_CHAOS_CREATES` / `AEROL_CHAOS_KILL_AFTER_MS` | `200` / `1500` | UC-473's burst and when the leader dies |
+| `AEROL_CHAOS_SANDBOX_CPU` / `AEROL_CHAOS_SANDBOX_MEMORY_MB` | `0.25` / `128` | size of the bulk cases' sandboxes |
+| `AEROL_CHAOS_PROMOTE_CREATES` / `_WINDOW_SECONDS` / `_STOP_AFTER_MS` / `_IMAGE` | `12` / `30` / `2500` / `python:3.12-slim` | UC-474 |
+| `AEROL_CHAOS_LIFECYCLE_NAMES` / `_ROUNDS` | `6` / `8` | UC-475 |
+| `AEROL_CHAOS_NETEM_DELAY` / `_LOSS` / `_SECONDS` / `_CREATES` | `200ms` / `5%` / `180` / `30` | UC-476 |
+| `AEROL_CHAOS_RESTART_SANDBOXES` | `6` | UC-477 |
+| `AEROL_CHAOS_MASS_SANDBOXES` / `_CPU` / `_MEMORY_MB` / `_SURVIVOR_FREE_CPU` | `12` / `1.0` / `256` / `4` | UC-478 |
+| `AEROL_CHAOS_FAILOVER_BOUND_SECONDS` | `300` | how long a reassign, and a reassigned sandbox's start, may take |
+| `AEROL_CHAOS_CONVERGE_SECONDS` | 2 x reconcile + 60 | override the convergence bound T |
+
 ## Enterprise scenarios and the audit witness
 
 Enterprise mode (`SB_ENTERPRISE_MODE=true`) refuses to boot without an

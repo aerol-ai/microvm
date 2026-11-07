@@ -1,0 +1,28 @@
+# cluster-chaos: the cluster-correctness fault scenario (UC-470..UC-479,
+# plans/cluster-correctness-and-create-latency.md §3.2). 3 server / 3 worker /
+# 1 ingress, all t3.medium on-demand; see cluster-chaos.tfvars for why.
+name: cluster-chaos
+capabilities:
+  - docker
+  - domain
+  - cluster
+  # Partitions, packet loss, runtime kills and Raft leader kills on a
+  # role-separated, on-demand fleet the suite can SSH into.
+  - cluster-chaos
+
+# 3 server + 3 worker + 1 ingress.
+expected_members: 7
+
+# Every case here injects a fault.
+disruptive: true
+
+# Only the chaos cases run on this scenario. run.sh passes `run` to go test as
+# -run, and the report marks every use case that does not need `capability`
+# "skip (not in this focused scenario)" instead of "missing", so the gate is
+# red only when a chaos case fails or never reported. The rest of the suite
+# already runs on cluster-hetero-lite, the same role-separated shape.
+# integration-tests/safety/focus_filter_test.go keeps `run` matching exactly
+# the tests that claim a cluster-chaos use case.
+focus:
+  capability: cluster-chaos
+  run: '^TestClusterChaos'
