@@ -468,8 +468,12 @@ func (u *upgradeNode) apply(ctx context.Context, p nodeupgrade.Paths, req Upgrad
 		return resp, stepErr(http.StatusConflict, upgradewire.ErrCodeUpgradeRunning, "another upgrade (op %q) is running on %s", holder, u.nodeID)
 	}
 	rollback := req.Direction == upgradewire.DirectionRollback
+	// AllowDowntime: the leader kept quorum and moved leadership off this
+	// node before this call (§6.2); the node must not second-guess a
+	// one-voter rollout run with --allow-downtime.
 	nreq := nodeupgrade.Request{
 		Version: req.Version, Op: req.Op, Rollback: rollback, AllowUnversioned: req.AllowUnversioned,
+		AllowDowntime: true,
 	}
 	if d, err := time.ParseDuration(req.HealthTimeout); err == nil && d > 0 {
 		nreq.HealthTimeout = d

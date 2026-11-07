@@ -202,6 +202,15 @@ func TestUpgradeRefusesBeforeAnythingStops(t *testing.T) {
 			r.t.Cleanup(func() { maxFileBytes = old })
 			return r.from(newRelease("v0.6.12"))
 		}, want: "larger than 8 bytes"},
+		{name: "the stop guard refuses", setup: func(r *rig) Request {
+			r.u.BeforeStop = func(_ context.Context, allow bool) error {
+				if allow {
+					return errors.New("allowDowntime should be false")
+				}
+				return errors.New("refusing to stop sandboxd: quorum")
+			}
+			return r.from(newRelease("v0.6.12"))
+		}, want: "refusing to stop sandboxd: quorum"},
 		{name: "a release.json that does not parse", setup: func(r *rig) Request {
 			req := r.from(newRelease("v0.6.12"))
 			writeFile(r.t, filepath.Join(req.From, "release.json"), []byte("{"))
@@ -612,4 +621,44 @@ func TestUpgradeRejectsABadRequest(t *testing.T) {
 	if _, err := os.Stat(r.paths.StateDir); !os.IsNotExist(err) {
 		t.Fatal("a rejected request made the state directory")
 	}
+}
+
+// The stop guard runs once, after every check, with the request's
+// AllowDowntime; it never runs for a no-op or when sandboxd is not running.
+func TestUpgradeStopGuardRunsOnceBeforeTheStop(t *testing.T) {
+	t.Run("runs with allow-downtime, then the upgrade goes on", func(t *testing.T) {
+		r := newRig(t, newRelease("v0.6.11"))
+		calls := 0
+		r.u.BeforeStop = func(_ context.Context, allow bool) error {
+			calls++
+			if !allow {
+				t.Errorf("allowDowntime = false, want true")
+			}
+			if strings.Contains(r.out.String(), "stopped sandboxd") {
+				t.Errorf("guard ran after the stop")
+			}
+			return nil
+		}
+		req := r.from(newRelease("v0.6.12"))
+		req.AllowDowntime = true
+		if _, err := r.u.Run(context.Background(), req); err != nil {
+			t.Fatalf("Run: %v\n%s", err, r.out)
+		}
+		if calls != 1 {
+			t.Fatalf("guard calls = %d", calls)
+		}
+	})
+	t.Run("not for a no-op", func(t *testing.T) {
+		r := newRig(t, newRelease("v0.6.12"))
+		r.u.BeforeStop = func(context.Context, bool) error { t.Error("guard ran for a no-op"); return nil }
+		if _, err := r.u.Run(context.Background(), r.from(newRelease("v0.6.12"))); err != nil {
+			t.Fatal(err)
+		}
+	})
+	t.Run("not when sandboxd is stopped", func(t *testing.T) {
+		r := newRig(t, newRelease("v0.6.11"))
+		r.host.active[sandboxdUnit] = false
+		r.u.BeforeStop = func(context.Context, bool) error { t.Error("guard ran with sandboxd stopped"); return nil }
+		_, _ = r.u.Run(context.Background(), r.from(newRelease("v0.6.12")))
+	})
 }

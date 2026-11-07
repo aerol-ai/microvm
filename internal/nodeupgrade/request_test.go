@@ -78,10 +78,10 @@ func TestRequestValidation(t *testing.T) {
 func TestRequestArgs(t *testing.T) {
 	req := Request{
 		Version: "v0.6.12", From: "/tmp/rel", Rollback: true, AllowUnversioned: true, SkipHostApply: true,
-		Op: "op-1", HealthTimeout: 90 * time.Second,
+		Op: "op-1", HealthTimeout: 90 * time.Second, AllowDowntime: true,
 		SHA256: map[string]string{"toolboxd": "b", "sandboxd": "a"},
 	}
-	want := "upgrade node v0.6.12 --sha256 sandboxd=a --sha256 toolboxd=b --from /tmp/rel --rollback --allow-unversioned --skip-host-apply --op op-1 --health-timeout 1m30s"
+	want := "upgrade node v0.6.12 --sha256 sandboxd=a --sha256 toolboxd=b --from /tmp/rel --rollback --allow-unversioned --skip-host-apply --op op-1 --health-timeout 1m30s --allow-downtime"
 	if got := strings.Join(req.Args(), " "); got != want {
 		t.Fatalf("args = %s", got)
 	}

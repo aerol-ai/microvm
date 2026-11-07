@@ -51,6 +51,11 @@ type Request struct {
 	// HealthTimeout bounds the wait for the new sandboxd; zero is the
 	// default.
 	HealthTimeout time.Duration
+	// AllowDowntime lets the upgrade stop a Raft server even when the
+	// voters left up would not be a majority (Upgrader.BeforeStop). The
+	// rollout leader sets it on the calls it makes: it checked quorum and
+	// moved leadership itself before calling the node.
+	AllowDowntime bool
 }
 
 // DefaultHealthTimeout is how long the upgrader waits for the new sandboxd
@@ -196,6 +201,9 @@ func (r Request) Args() []string {
 	}
 	if r.HealthTimeout > 0 {
 		args = append(args, "--health-timeout", r.HealthTimeout.String())
+	}
+	if r.AllowDowntime {
+		args = append(args, "--allow-downtime")
 	}
 	return args
 }

@@ -53,6 +53,10 @@ old files are put back. Run as root.
   --op <id>                the operation ID; a repeated ID answers with what
                            it did
   --health-timeout <dur>   how long to wait for the new sandboxd (default 2m)
+  --allow-downtime         on a Raft server, stop it even if the servers left
+                           up would not be a majority; without it the upgrade
+                           refuses, and hands off leadership first if this
+                           node leads
   --env-file <path>        the node's env file (default /etc/sandboxd/sandboxd.env)
   -o text|json             output; json prints the operation record
 
@@ -106,6 +110,7 @@ func parseUpgradeArgs(args []string) (req nodeupgrade.Request, envFile, output s
 	fs.BoolVar(&req.SkipHostApply, "skip-host-apply", false, "")
 	fs.StringVar(&req.Op, "op", "", "")
 	fs.DurationVar(&req.HealthTimeout, "health-timeout", 0, "")
+	fs.BoolVar(&req.AllowDowntime, "allow-downtime", false, "")
 	fs.StringVar(&envFile, "env-file", nodeupgrade.DefaultEnvFile, "")
 	fs.StringVar(&output, "o", "text", "")
 	fs.StringVar(&output, "output", "text", "")
@@ -166,6 +171,7 @@ func runUpgradeCLI(args []string, stdout, stderr io.Writer) int {
 		Host:                newUpgradeHost(),
 		Out:                 progress,
 		SelfHostSetupSHA256: scripts.InstallShSHA256(),
+		BeforeStop:          serverStopGuard(paths, progress),
 	}
 	ctx, cancel := upgradeSignalContext()
 	defer cancel()

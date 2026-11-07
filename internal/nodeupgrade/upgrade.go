@@ -53,6 +53,12 @@ type Upgrader struct {
 	Backup func(ctx context.Context, dbPath, dest string) error
 	// PollInterval is the health poll period; zero is one second.
 	PollInterval time.Duration
+	// BeforeStop runs once everything is staged and checked, just before
+	// a running sandboxd is stopped. An error ends the op as failed with
+	// nothing on the node changed. `sandboxd upgrade node` uses it on a
+	// Raft server to keep quorum and hand off leadership (§6.3); nil skips
+	// it.
+	BeforeStop func(ctx context.Context, allowDowntime bool) error
 	// hook is called at named points of apply; the crash-safety tests stop
 	// the upgrader there. Nil in production.
 	hook func(point string)
@@ -206,6 +212,13 @@ func (u *Upgrader) Run(ctx context.Context, req Request) (*State, error) {
 	u.planServices(ctx, st, meta, rolledBack)
 	if err := u.save(st); err != nil {
 		return nil, err
+	}
+	// Last, so a refusal costs nothing and a staging failure never moves
+	// leadership for nothing.
+	if st.WasActive && u.BeforeStop != nil {
+		if err := u.BeforeStop(ctx, req.AllowDowntime); err != nil {
+			return u.failEarly(st, err)
+		}
 	}
 	return u.apply(ctx, st, stageDir, req)
 }
