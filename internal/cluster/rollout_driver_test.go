@@ -785,3 +785,38 @@ func TestRolloutDriverHelpers(t *testing.T) {
 	}
 	d.release("n")
 }
+
+// deleteNode writes the deny record `aerolvm delete node` writes, and the
+// node leaves gossip.
+func (g *rolloutRig) deleteNode(id string) {
+	g.t.Helper()
+	g.host.mu.Lock()
+	g.host.index++
+	idx := g.host.index
+	delete(g.host.memberM, id)
+	g.host.mu.Unlock()
+	data, err := encodeCommand(command{Op: opDenyNode, StampUnixNano: g.host.now().UnixNano(), NodeDeny: &NodeDenyRecord{NodeID: id}})
+	if err != nil {
+		g.t.Fatal(err)
+	}
+	if e, ok := g.fsm.Apply(&raft.Log{Index: idx, Data: data}).(error); ok {
+		g.t.Fatal(e)
+	}
+}
+
+// R3: the finalize refusal tells the operator to delete a skipped node;
+// once it is deleted, the rollout finalizes by itself.
+func TestRolloutDriverDeletedSkippedNodeLetsFinalizeRun(t *testing.T) {
+	g := newRolloutRig(t, 1, 0, 3)
+	g.host.setAlive("w2", false)
+	g.start(func(r *RolloutRecord) { r.AllowDowntime = true })
+	r := g.run(upgradewire.StateDone)
+	if r.Nodes["w2"].State != upgradewire.NodeSkipped {
+		t.Fatalf("w2 = %s", describeNodes(r))
+	}
+	g.deleteNode("w2")
+	r = g.run(upgradewire.StateFinalized)
+	if r.Nodes["w2"] != nil {
+		t.Fatalf("finalized with a deleted node: %s", describeNodes(r))
+	}
+}

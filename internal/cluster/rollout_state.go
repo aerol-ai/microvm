@@ -337,6 +337,7 @@ type nodeStateRow struct {
 //	skipped   -> pending (it came back) | done (upgraded by hand)
 //	failed    -> pending (retried)
 //	done      -> (none; a rollback resets it)
+//	any       -> out of the rollout, when the node is deleted (dropDeleted)
 var nodeStateTable = []nodeStateRow{
 	{From: upgradewire.NodePending, To: []string{upgradewire.NodeStaged, upgradewire.NodeManual, upgradewire.NodeSkipped, upgradewire.NodeFailed, upgradewire.NodeDone, upgradewire.NodeUpgrading}},
 	{From: upgradewire.NodeStaged, To: []string{upgradewire.NodeUpgrading, upgradewire.NodeManual, upgradewire.NodeSkipped, upgradewire.NodeFailed, upgradewire.NodeDone}},
@@ -363,6 +364,26 @@ func nodeMoveAllowed(from, to string) bool {
 		}
 	}
 	return false
+}
+
+// dropDeleted takes deleted nodes out of the rollout, from any state (§5,
+// §6.2). A deleted node never reports again, so kept in the record it would
+// hold finalize forever as skipped, a node timeout as upgrading, or the
+// one-way migrations while finalizing. A machine that joins again under the
+// same ID comes back as a new member (adoptMembers). It reports whether a
+// node left.
+func (r *RolloutRecord) dropDeleted(deleted func(nodeID string) bool) bool {
+	if r == nil {
+		return false
+	}
+	dropped := false
+	for id := range r.Nodes {
+		if deleted(id) {
+			delete(r.Nodes, id)
+			dropped = true
+		}
+	}
+	return dropped
 }
 
 // nodesIn lists the IDs of the nodes in state, sorted.

@@ -415,3 +415,83 @@ func TestRolloutAPIViewAndFiles(t *testing.T) {
 		t.Fatal("op helpers")
 	}
 }
+
+// R3: a deleted node leaves the rollout (§5, §6.2). A skipped node then no
+// longer holds finalize, a node deleted while finalizing no longer holds
+// the migrations, and a node deleted before a rollout's apply or a join's
+// add lands never enters it. The drop rides on opDenyNode, so a replay or a
+// snapshot reaches the same record.
+func TestFSMRolloutDeletedNodeLeavesTheRollout(t *testing.T) {
+	f := newPlacementFSM()
+	log := []command{
+		applyCmd("r1", "v2", twoNodes()...),
+		nodeCmd(RolloutNodeUpdate{RolloutID: "r1", NodeID: "s1", State: upgradewire.NodeStaged}, 11),
+		nodeCmd(RolloutNodeUpdate{RolloutID: "r1", NodeID: "w1", State: upgradewire.NodeSkipped, Error: "down"}, 12),
+		eventCmd("r1", evAllStaged, 13),
+		nodeCmd(RolloutNodeUpdate{RolloutID: "r1", NodeID: "s1", State: upgradewire.NodeUpgrading, Op: "r1-u0", DeadlineUnixNano: 99}, 14),
+		nodeCmd(RolloutNodeUpdate{RolloutID: "r1", NodeID: "s1", State: upgradewire.NodeDone, Version: "v2"}, 15),
+		eventCmd("r1", evAllDone, 16),
+	}
+	for i, cmd := range log {
+		applyDenyLogAt(t, f, uint64(i+1), cmd)
+	}
+	if v := decideRollout(f.rollout, rolloutEvent{Kind: evFinalize}); v.Code != upgradewire.ErrCodeSkippedNodes {
+		t.Fatalf("finalize with w1 skipped = %+v", v)
+	}
+	// aerolvm delete node w1: what the refusal's own hint says to do.
+	applyDenyLogAt(t, f, 20, denyCmd("w1", 30))
+	if _, still := f.rollout.Nodes["w1"]; still {
+		t.Fatalf("a deleted node stayed in the rollout: %s", describeNodes(f.rollout))
+	}
+	if v := decideRollout(f.rollout, rolloutEvent{Kind: evFinalize}); v.Outcome != outcomeMove {
+		t.Fatalf("finalize after deleting the skipped node = %+v", v)
+	}
+	// A replica that restores a snapshot taken after the delete holds the
+	// same record.
+	snap, err := f.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	sink := &memSnapshotSink{}
+	if err := snap.Persist(sink); err != nil {
+		t.Fatal(err)
+	}
+	snap.Release()
+	back := newPlacementFSM()
+	if err := back.Restore(io.NopCloser(bytes.NewReader(sink.Bytes()))); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(rolloutViewOf(back), rolloutViewOf(f)) {
+		t.Fatalf("restored %s, want %s", describeNodes(back.rollout), describeNodes(f.rollout))
+	}
+	// A join cannot add it back while it is denied.
+	if res := rolloutRes(t, applyDenyLogAt(t, f, 21, nodeCmd(RolloutNodeUpdate{RolloutID: "r1", NodeID: "w1", Add: &RolloutNodeRecord{}}, 31))); res.Changed || res.Rollout.Nodes["w1"] != nil {
+		t.Fatalf("a denied node was added: %+v", res)
+	}
+	// Deleted while finalizing: the migrations no longer wait for it.
+	g := newPlacementFSM()
+	nodes := twoNodes()
+	nodes[0].State, nodes[1].State = upgradewire.NodeDone, upgradewire.NodeDone
+	fin := eventCmd("r2", evFinalize, 41)
+	fin.RolloutCmd.Active = &ActiveVersion{FV: 13, Release: "v2"}
+	for i, cmd := range []command{applyCmd("r2", "v2", nodes...), eventCmd("r2", evAllStaged, 40), eventCmd("r2", evAllDone, 40), fin,
+		nodeCmd(RolloutNodeUpdate{RolloutID: "r2", NodeID: "s1", Migrated: true}, 42)} {
+		applyDenyLogAt(t, g, uint64(i+1), cmd)
+	}
+	if g.rollout.State != upgradewire.StateFinalizing {
+		t.Fatalf("setup: %s", g.rollout.State)
+	}
+	if v := decideRollout(g.rollout, rolloutEvent{Kind: evMigrated}); v.Outcome != outcomeRefused {
+		t.Fatalf("migrated before the delete = %+v", v)
+	}
+	applyDenyLogAt(t, g, 10, denyCmd("w1", 50))
+	if res := rolloutRes(t, applyDenyLogAt(t, g, 11, eventCmd("r2", evMigrated, 51))); res.Rollout.State != upgradewire.StateFinalized {
+		t.Fatalf("a node deleted while finalizing still holds the rollout: %s %s", res.Rollout.State, describeNodes(res.Rollout))
+	}
+	// A rollout whose apply lands after the delete never holds the node.
+	h := newPlacementFSM()
+	applyDenyLogAt(t, h, 1, denyCmd("w1", 5))
+	if res := rolloutRes(t, applyDenyLogAt(t, h, 2, applyCmd("r3", "v2", twoNodes()...))); res.Rollout.Nodes["w1"] != nil || res.Rollout.Nodes["s1"] == nil {
+		t.Fatalf("new rollout over a deleted node: %s", describeNodes(res.Rollout))
+	}
+}

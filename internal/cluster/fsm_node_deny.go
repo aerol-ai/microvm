@@ -73,6 +73,11 @@ func (f *placementFSM) applyDenyNodeLocked(cmd command, index uint64) (any, erro
 	f.tombstoneAdmittedLocked(id, cmd.StampUnixNano)
 	f.deniedNodesVersion = index
 	f.publishDeniedLocked()
+	// The node also leaves any rollout (rollout_state.go dropDeleted), or a
+	// skipped one would hold finalize forever. A rollout record exists only
+	// once every server runs rolloutFSMOpsVersion, so an older build never
+	// sees a record this changes.
+	f.dropDeletedFromRolloutLocked(id, cmd.StampUnixNano)
 	return nodeDenyApplyResult{Record: rec, Changed: true}, nil
 }
 

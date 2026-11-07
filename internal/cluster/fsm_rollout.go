@@ -304,6 +304,9 @@ func (f *placementFSM) applyRolloutCommandLocked(cmd command) (any, error) {
 		for _, n := range next.Nodes {
 			n.UpdatedUnixNano = stamp
 		}
+		// The leader built the node list before this entry; a delete that
+		// landed in between must not put the node back.
+		next.dropDeleted(f.isDeniedLocked)
 		f.rollout = next
 	case outcomeRestage:
 		next := cloneRollout(cur)
@@ -397,6 +400,9 @@ func (f *placementFSM) applyRolloutNodeLocked(cmd command) (any, error) {
 		if ok {
 			return rolloutApplyResult{Verdict: rolloutVerdict{Outcome: outcomeNoop}, Rollout: cloneRollout(cur)}, nil
 		}
+		if f.isDeniedLocked(in.NodeID) {
+			return rolloutApplyResult{Verdict: refusedIn(next.State, fmt.Sprintf("node %s was deleted", in.NodeID), ""), Rollout: cloneRollout(cur)}, nil
+		}
 		add := *in.Add
 		add.NodeID = in.NodeID
 		add.UpdatedUnixNano = stamp
@@ -468,6 +474,26 @@ func (f *placementFSM) applyRolloutNodeLocked(cmd command) (any, error) {
 	f.rollout = next
 	f.rolloutVersion++
 	return rolloutApplyResult{Verdict: rolloutVerdict{Outcome: outcomeMove}, Rollout: cloneRollout(next), Changed: true}, nil
+}
+
+// isDeniedLocked reports whether nodeID has a deny record. Caller holds f.mu.
+func (f *placementFSM) isDeniedLocked(nodeID string) bool {
+	_, ok := f.deniedNodes[nodeID]
+	return ok
+}
+
+// dropDeletedFromRolloutLocked is opDenyNode's part in the rollout: the
+// deleted node leaves the record in the same entry, so every replica drops
+// it at the same log index. Caller holds f.mu.
+func (f *placementFSM) dropDeletedFromRolloutLocked(nodeID string, stamp int64) {
+	if f.rollout == nil || f.rollout.Nodes[nodeID] == nil {
+		return
+	}
+	next := cloneRollout(f.rollout)
+	next.dropDeleted(func(id string) bool { return id == nodeID })
+	next.UpdatedUnixNano = stamp
+	f.rollout = next
+	f.rolloutVersion++
 }
 
 // rolloutView returns a copy of the rollout and the active version.
