@@ -1103,6 +1103,16 @@ var Registry = []UseCase{
 
 	// A paused sandbox on every public address (#1050).
 	{ID: "UC-484", Title: "Chaos (I7; C4): a worker cut off from the servers pauses its recreate-policy sandbox, and every public address of it answers within seconds: the toolbox URL and the HTTP port with 503, the raw TCP port by closing the connection; after the heal they answer as before (#1050)", Requires: []Capability{CapCluster, CapClusterChaos}, Implemented: true},
+	// kubectl-style node verbs, Phase 1 (plans/kubectl-style-cluster-ops.md
+	// §9; node_verbs_test.go, zz_node_delete_test.go). The delete pair is
+	// disruptive and permanent for the run, so it lives in the file that
+	// sorts last.
+	{ID: "UC-610", Title: "aerolvm get nodes: every member is listed with its role and gossiped build version, exactly one is Ready,Leader and a voter, no worker is a voter, -o json matches /v1/cluster/members, and version and cluster-info reach the server", Requires: []Capability{CapCluster}, Implemented: true},
+	{ID: "UC-611", Title: "aerolvm cordon: a cordoned worker reads SchedulingDisabled and gets none of 2x-workers new sandboxes; uncordon clears the mark", Requires: []Capability{CapCluster}, Implemented: true},
+	{ID: "UC-612", Title: "GET /v1/cluster/nodes/{id} and describe node: a worker's owned count grows by the sandboxes placed on it and ?sandboxes= lists their IDs, without paging the sandbox index", Requires: []Capability{CapCluster}, Implemented: true},
+	{ID: "UC-613", Title: "aerolvm drain --delete-sandboxes: a worker with live sandboxes ends cordoned and owning none, and its sandboxes answer 404", Requires: []Capability{CapCluster}, Implemented: true},
+	{ID: "UC-614", Title: "aerolvm delete node (DELETE /v1/cluster/nodes/{id}) removes a worker: it leaves the member list, GET node answers 404, a repeated delete exits 0, and DELETE /v1/cluster/members/{worker} still answers 404 before and after", Requires: []Capability{CapCluster}, Implemented: true},
+	{ID: "UC-615", Title: "A deleted worker cannot rejoin: its own certificate is refused on a server's internal listener with 403 \"was deleted\" (accepted before the delete), and after a sandboxd restart it stays out of the member list", Requires: []Capability{CapCluster}, Implemented: true},
 }
 
 // byID is a lookup built once for the report generator.
