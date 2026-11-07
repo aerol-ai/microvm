@@ -16,6 +16,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"io"
 	"math/big"
 	"os"
 	"path/filepath"
@@ -107,7 +108,7 @@ func randomJoinString(n int) (string, error) {
 	out := make([]byte, 0, n)
 	buf := make([]byte, n*2)
 	for len(out) < n {
-		if _, err := rand.Read(buf); err != nil {
+		if _, err := io.ReadFull(pkiRandom, buf); err != nil {
 			return "", fmt.Errorf("cluster: read random: %w", err)
 		}
 		for _, b := range buf {
@@ -503,11 +504,18 @@ var joinNodeIDPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$`)
 // ValidJoinNodeID reports whether id may name a joining node.
 func ValidJoinNodeID(id string) bool { return joinNodeIDPattern.MatchString(id) }
 
+// pkiRandom is where token secrets and cert serials come from. A var so a
+// test can make it fail; always crypto/rand in production.
+var pkiRandom io.Reader = rand.Reader
+
+// randomSerial is a positive 127-bit serial (RFC 5280 allows 20 octets).
 func randomSerial() (*big.Int, error) {
-	serial, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 127))
-	if err != nil {
+	var buf [16]byte
+	if _, err := io.ReadFull(pkiRandom, buf[:]); err != nil {
 		return nil, fmt.Errorf("cluster: serial: %w", err)
 	}
+	buf[0] &= 0x7f
+	serial := new(big.Int).SetBytes(buf[:])
 	return serial.Add(serial, big.NewInt(1)), nil
 }
 

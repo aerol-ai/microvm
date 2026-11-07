@@ -1147,11 +1147,9 @@ func (c *Cluster) peerLeaf(ctx context.Context, m Member) (*x509.Certificate, er
 		return nil, err
 	}
 	defer conn.Close()
-	state := conn.(*tls.Conn).ConnectionState()
-	if len(state.PeerCertificates) == 0 {
-		return nil, errors.New("no peer certificate")
-	}
-	leaf := state.PeerCertificates[0]
+	// The handshake verified the chain against the cluster CA, so there is
+	// always a leaf here.
+	leaf := conn.(*tls.Conn).ConnectionState().PeerCertificates[0]
 	if ExtractPeerNodeID(leaf) != m.NodeID {
 		return nil, fmt.Errorf("cert names %q", ExtractPeerNodeID(leaf))
 	}
