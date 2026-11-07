@@ -723,7 +723,9 @@ func (h *handlers) clusterMembers(w http.ResponseWriter, r *http.Request) {
 		apihttp.WriteJSON(w, http.StatusOK, map[string]any{"members": []any{}})
 		return
 	}
-	members := c.Members()
+	// Voter and leader come from this server's Raft view; on a worker the
+	// control plane's answer already carries them.
+	members := cluster.AnnotateRaftRoles(c, c.Members())
 	view := make([]memberView, 0, len(members))
 	for _, m := range members {
 		view = append(view, memberView{Member: m, Drained: c.IsNodeDrained(m.NodeID),
