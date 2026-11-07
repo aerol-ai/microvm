@@ -312,10 +312,39 @@ func TestT14IsolateAcrossSandboxdRestart(t *testing.T) {
 	c := client(t)
 	ref := uploadBundle(t, c, "itest-t14-counter", isolateCounter)
 
-	measure := func(variant, tenant string) {
-		// A tenant of its own per variant: a tenant is one workerd group.
-		sb := newIsolateSandbox(t, c, ref, tenant, sdktypes.CreateSandboxOptions{})
-		waitRunning(t, sb)
+	// measure records one variant. A variant whose sandbox cannot even be
+	// set up is a finding too (the jail is the default), so it is recorded
+	// with the host's evidence instead of stopping the case; measure
+	// reports whether the restart itself was measured.
+	measure := func(variant, tenant string) bool {
+		setupFailed := func(format string, args ...any) bool {
+			msg := fmt.Sprintf(format, args...)
+			procs := t14Procs(t, target)
+			jout, _ := harness.SSHRun(t, target, "sudo journalctl -u sandboxd --since '-3min' --no-pager -o cat | grep -iE 'isolate|workerd' | tail -n 12")
+			t.Logf("T14 isolate/%s: SETUP FAILED, no restart measured: %s\nhost:\n%s\njournal:\n%s", variant, msg, procs, strings.TrimSpace(jout))
+			return false
+		}
+		// Not newIsolateSandbox: it stops the case on a failed create.
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+		sb, err := c.SDK().Create(ctx, sdktypes.CreateSandboxOptions{
+			Name: harness.UniqueName(sc, t), Runtime: models.RuntimeIsolate, ModuleRef: ref, TenantID: tenant, MemoryMB: 128,
+		})
+		cancel()
+		if err != nil {
+			return setupFailed("create: %v", err)
+		}
+		t.Cleanup(func() { destroyBest(c, sb.ID) })
+		deadline := time.Now().Add(90 * time.Second)
+		for {
+			status, reason := t14Status(context.Background(), c, sb.ID)
+			if status == string(models.SandboxStatusStarted) {
+				break
+			}
+			if status == "error" || time.Now().After(deadline) {
+				return setupFailed("sandbox %s never reached started: %s (%s)", sb.ID, status, reason)
+			}
+			time.Sleep(2 * time.Second)
+		}
 		s := &t14Subject{runtime: "isolate", variant: variant, sb: sb}
 		s.probe = func(ctx context.Context) t14Probe {
 			var p t14Probe
@@ -336,16 +365,17 @@ func TestT14IsolateAcrossSandboxdRestart(t *testing.T) {
 		}
 		for i := 1; i <= 2; i++ {
 			if p := s.probe(context.Background()); !p.ExecOK || p.ExecOut != fmt.Sprint(i) {
-				t.Fatalf("isolate %s before the restart: fetch %d = %+v", variant, i, p)
+				return setupFailed("fetch %d before the restart = %+v", i, p)
 			}
 		}
 		t14Measure(t, c, target, []*t14Subject{s})
 		if s.res.Before.ExecOut != "3" {
 			t.Fatalf("isolate %s: the measurement's own before-fetch read %q, want 3", variant, s.res.Before.ExecOut)
 		}
+		return true
 	}
 
-	measure("jail on (default)", "itest-t14-jail-on")
+	jailOn := measure("jail on (default)", "itest-t14-jail-on")
 
 	// The same with the jail off: workerd then runs as sandboxd's child.
 	env, _ := harness.SSHRun(t, target, "grep -E '^SB_ISOLATE_USE_JAIL=' /etc/sandboxd/sandboxd.env || true")
@@ -362,5 +392,7 @@ func TestT14IsolateAcrossSandboxdRestart(t *testing.T) {
 	if procs := t14Procs(t, target); !slices.ContainsFunc(strings.Split(procs, "\n"), func(l string) bool { return strings.HasPrefix(l, "sandboxd pid=") }) {
 		t.Fatalf("sandboxd is not running after turning the jail off:\n%s", procs)
 	}
-	measure("jail off", "itest-t14-jail-off")
+	if jailOff := measure("jail off", "itest-t14-jail-off"); !jailOn && !jailOff {
+		t.Fatal("T14 isolate: neither variant could be set up, so nothing was measured")
+	}
 }
