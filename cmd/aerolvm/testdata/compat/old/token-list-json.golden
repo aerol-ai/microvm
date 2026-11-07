@@ -1,0 +1,17 @@
+exit 0
+--- stdout
+{
+  "tokens": [
+    {
+      "id": "tok_aaaaaaaaaaaa",
+      "name": "ci",
+      "role": "runner",
+      "team": "ml",
+      "created_by": "operator",
+      "created_at": "2026-10-17T00:00:00Z",
+      "expires_at": "2027-01-15T00:00:00Z",
+      "expired": false
+    }
+  ]
+}
+--- stderr
