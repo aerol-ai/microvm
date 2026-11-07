@@ -65,117 +65,32 @@ func (s *Store) SeedContainerNetnsSlot(ctx context.Context, slotID string, now t
 }
 
 // ReserveContainerNetnsSlot claims a free slot for sandboxID. Idempotent when
-// sandboxID already owns a slot.
+// sandboxID already owns a slot. Returns ErrNoFreeContainerNetnsSlot only
+// when no free slot is left: never because another create was claiming at
+// the same moment (see claimContainerNetnsSlot).
 func (s *Store) ReserveContainerNetnsSlot(ctx context.Context, sandboxID string, now time.Time) (*ContainerNetnsSlot, error) {
 	sandboxID = strings.TrimSpace(sandboxID)
 	if sandboxID == "" {
 		return nil, errors.New("reserve container netns slot: sandbox_id is required")
 	}
-	if existing, err := s.GetContainerNetnsSlotBySandbox(ctx, sandboxID); err != nil {
-		return nil, err
-	} else if existing != nil {
-		return existing, nil
-	}
-	now = now.UTC()
-	for attempt := 0; attempt < 8; attempt++ {
-		var candidate ContainerNetnsSlot
-		row := s.db.QueryRowContext(ctx, `
-			SELECT slot_id, netns_path, container_ip, sandbox_id, state, created_at, updated_at
-			FROM container_netns_slots
-			WHERE state = ? AND sandbox_id IS NULL
-			ORDER BY slot_id ASC
-			LIMIT 1
-		`, NetnsSlotStateFree)
-		if err := scanContainerNetnsSlot(row, &candidate); err != nil {
-			if errors.Is(err, sql.ErrNoRows) {
-				return nil, ErrNoFreeContainerNetnsSlot
-			}
-			return nil, fmt.Errorf("reserve container netns slot (select): %w", err)
-		}
-		if afterNetnsFreeSelect != nil {
-			afterNetnsFreeSelect(candidate.SlotID)
-		}
-		res, err := s.db.ExecContext(ctx, `
-			UPDATE container_netns_slots
-			SET sandbox_id = ?, state = ?, updated_at = ?
-			WHERE slot_id = ? AND state = ? AND sandbox_id IS NULL
-		`, sandboxID, NetnsSlotStateReserved, now, candidate.SlotID, NetnsSlotStateFree)
-		if err != nil {
-			return nil, fmt.Errorf("reserve container netns slot (update): %w", err)
-		}
-		n, err := res.RowsAffected()
-		if err != nil {
-			return nil, fmt.Errorf("reserve container netns slot (affected): %w", err)
-		}
-		if n == 1 {
-			candidate.SandboxID = sandboxID
-			candidate.State = NetnsSlotStateReserved
-			candidate.UpdatedAt = now
-			return &candidate, nil
-		}
-		if afterNetnsFreeMiss != nil {
-			afterNetnsFreeMiss()
-		}
-	}
-	return nil, errors.New("reserve container netns slot: pool contested after 8 attempts")
+	return s.claimContainerNetnsSlotForSandbox(ctx, sandboxID, NetnsSlotStateFree, NetnsSlotStateReserved,
+		ErrNoFreeContainerNetnsSlot, now, "reserve container netns slot")
 }
 
 // ErrNoPooledContainerNetnsSlot means no prewarmed slot is available for claim.
 var ErrNoPooledContainerNetnsSlot = errors.New("container netns pool: no pooled slot")
 
-// afterNetnsFreeSelect is set only by tests to steal a free/pooled candidate
-// before the claiming UPDATE (BeginPrewarm / ClaimPooled / Reserve).
-var afterNetnsFreeSelect func(slotID string)
-
-// afterNetnsFreeMiss restores a free/pooled row after a lost UPDATE so the
-// next SELECT can still observe a candidate (contested-path coverage).
-var afterNetnsFreeMiss func()
-
 // BeginPrewarmContainerNetnsSlot reserves a free slot under its own slot_id so
 // the refill ticker can CNI-realize it without a sandbox owner yet.
 func (s *Store) BeginPrewarmContainerNetnsSlot(ctx context.Context, now time.Time) (*ContainerNetnsSlot, error) {
-	now = now.UTC()
-	for attempt := 0; attempt < 8; attempt++ {
-		var candidate ContainerNetnsSlot
-		row := s.db.QueryRowContext(ctx, `
-			SELECT slot_id, netns_path, container_ip, sandbox_id, state, created_at, updated_at
-			FROM container_netns_slots
-			WHERE state = ? AND sandbox_id IS NULL
-			ORDER BY slot_id ASC
-			LIMIT 1
-		`, NetnsSlotStateFree)
-		if err := scanContainerNetnsSlot(row, &candidate); err != nil {
-			if errors.Is(err, sql.ErrNoRows) {
-				return nil, ErrNoFreeContainerNetnsSlot
-			}
-			return nil, fmt.Errorf("begin prewarm (select): %w", err)
-		}
-		if afterNetnsFreeSelect != nil {
-			afterNetnsFreeSelect(candidate.SlotID)
-		}
-		res, err := s.db.ExecContext(ctx, `
-			UPDATE container_netns_slots
-			SET sandbox_id = ?, state = ?, updated_at = ?
-			WHERE slot_id = ? AND state = ? AND sandbox_id IS NULL
-		`, candidate.SlotID, NetnsSlotStateReserved, now, candidate.SlotID, NetnsSlotStateFree)
-		if err != nil {
-			return nil, fmt.Errorf("begin prewarm (update): %w", err)
-		}
-		n, err := res.RowsAffected()
-		if err != nil {
-			return nil, fmt.Errorf("begin prewarm (affected): %w", err)
-		}
-		if n == 1 {
-			candidate.SandboxID = candidate.SlotID
-			candidate.State = NetnsSlotStateReserved
-			candidate.UpdatedAt = now
-			return &candidate, nil
-		}
-		if afterNetnsFreeMiss != nil {
-			afterNetnsFreeMiss()
-		}
+	slot, err := s.claimContainerNetnsSlot(ctx, "", NetnsSlotStateFree, NetnsSlotStateReserved, now.UTC())
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNoFreeContainerNetnsSlot
 	}
-	return nil, errors.New("begin prewarm: pool contested after 8 attempts")
+	if err != nil {
+		return nil, fmt.Errorf("begin prewarm: %w", err)
+	}
+	return slot, nil
 }
 
 // FinishPrewarmContainerNetnsSlot moves a refill-reserved slot into the pooled
@@ -213,53 +128,68 @@ func (s *Store) ClaimPooledContainerNetnsSlot(ctx context.Context, sandboxID str
 	if sandboxID == "" {
 		return nil, errors.New("claim pooled netns slot: sandbox_id is required")
 	}
-	if existing, err := s.GetContainerNetnsSlotBySandbox(ctx, sandboxID); err != nil {
-		return nil, err
-	} else if existing != nil {
-		return existing, nil
+	return s.claimContainerNetnsSlotForSandbox(ctx, sandboxID, NetnsSlotStatePooled, NetnsSlotStateAdopted,
+		ErrNoPooledContainerNetnsSlot, now, "claim pooled netns slot")
+}
+
+// claimContainerNetnsSlotForSandbox claims the first unowned slot in
+// fromState for sandboxID, or returns the slot sandboxID already owns.
+// empty is returned when the sandbox owns none and no slot is in fromState.
+func (s *Store) claimContainerNetnsSlotForSandbox(ctx context.Context, sandboxID, fromState, toState string, empty error, now time.Time, op string) (*ContainerNetnsSlot, error) {
+	slot, err := s.claimContainerNetnsSlot(ctx, sandboxID, fromState, toState, now.UTC())
+	if err == nil {
+		return slot, nil
 	}
-	now = now.UTC()
-	for attempt := 0; attempt < 8; attempt++ {
-		var candidate ContainerNetnsSlot
-		row := s.db.QueryRowContext(ctx, `
-			SELECT slot_id, netns_path, container_ip, sandbox_id, state, created_at, updated_at
-			FROM container_netns_slots
+	if !errors.Is(err, sql.ErrNoRows) {
+		return nil, fmt.Errorf("%s: %w", op, err)
+	}
+	// Nothing was claimed: either this sandbox already owns a slot (a retried
+	// or duplicate create) or the pool is empty.
+	existing, err := s.GetContainerNetnsSlotBySandbox(ctx, sandboxID)
+	if err != nil || existing != nil {
+		return existing, err
+	}
+	return nil, empty
+}
+
+// claimContainerNetnsSlot moves the first unowned slot in fromState to
+// toState under owner (the slot's own id when owner is empty, for a prewarm),
+// in ONE statement, and returns the row as written. It claims nothing, and
+// returns sql.ErrNoRows, when no slot is in fromState or owner already owns
+// a slot.
+//
+// It used to SELECT a candidate, then UPDATE it only if still free, and
+// retry up to 8 times. The writer runs one statement at a time but hands
+// the connection back between two statements, so concurrent callers read
+// the same lowest free slot, one won, the rest retried, and with more than
+// 8 callers some ran out of tries while free slots were left (32 concurrent
+// reservations: 41 of 640 failed). Two calls for one sandbox could also both
+// pass a separate "already own one?" check, and the second then failed on
+// the unique index. A single UPDATE that picks its own target and checks
+// ownership cannot lose either race: SQLite holds the write lock for the
+// whole statement.
+func (s *Store) claimContainerNetnsSlot(ctx context.Context, owner, fromState, toState string, now time.Time) (*ContainerNetnsSlot, error) {
+	var ownerArg any // NULL for a prewarm: owned by its own slot_id
+	if owner != "" {
+		ownerArg = owner
+	}
+	row := s.db.QueryRowContext(ctx, `
+		UPDATE container_netns_slots
+		SET sandbox_id = COALESCE(?, slot_id), state = ?, updated_at = ?
+		WHERE slot_id = (
+			SELECT slot_id FROM container_netns_slots
 			WHERE state = ? AND sandbox_id IS NULL
 			ORDER BY slot_id ASC
 			LIMIT 1
-		`, NetnsSlotStatePooled)
-		if err := scanContainerNetnsSlot(row, &candidate); err != nil {
-			if errors.Is(err, sql.ErrNoRows) {
-				return nil, ErrNoPooledContainerNetnsSlot
-			}
-			return nil, fmt.Errorf("claim pooled (select): %w", err)
-		}
-		if afterNetnsFreeSelect != nil {
-			afterNetnsFreeSelect(candidate.SlotID)
-		}
-		res, err := s.db.ExecContext(ctx, `
-			UPDATE container_netns_slots
-			SET sandbox_id = ?, state = ?, updated_at = ?
-			WHERE slot_id = ? AND state = ? AND sandbox_id IS NULL
-		`, sandboxID, NetnsSlotStateAdopted, now, candidate.SlotID, NetnsSlotStatePooled)
-		if err != nil {
-			return nil, fmt.Errorf("claim pooled (update): %w", err)
-		}
-		n, err := res.RowsAffected()
-		if err != nil {
-			return nil, fmt.Errorf("claim pooled (affected): %w", err)
-		}
-		if n == 1 {
-			candidate.SandboxID = sandboxID
-			candidate.State = NetnsSlotStateAdopted
-			candidate.UpdatedAt = now
-			return &candidate, nil
-		}
-		if afterNetnsFreeMiss != nil {
-			afterNetnsFreeMiss()
-		}
+		)
+		AND NOT EXISTS (SELECT 1 FROM container_netns_slots WHERE sandbox_id = ?)
+		RETURNING slot_id, netns_path, container_ip, sandbox_id, state, created_at, updated_at
+	`, ownerArg, toState, now, fromState, ownerArg)
+	var slot ContainerNetnsSlot
+	if err := scanContainerNetnsSlot(row, &slot); err != nil {
+		return nil, err
 	}
-	return nil, errors.New("claim pooled: pool contested after 8 attempts")
+	return &slot, nil
 }
 
 // ListNonFreeContainerNetnsSlots returns rows not in the free state for reconcile.
