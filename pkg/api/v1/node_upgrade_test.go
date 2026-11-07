@@ -226,6 +226,26 @@ func TestNodeUpgradeRouteFailures(t *testing.T) {
 			t.Fatalf("streamed = %d %s", rr.Code, rr.Body.String())
 		}
 	})
+	t.Run("uploads past the 2 GiB total", func(t *testing.T) {
+		// J14: the single node caps its uploads like the cluster leader.
+		// A sparse file stands for 2 GiB already stored.
+		mux, l, _ := nodeUpgradeMux(t, false, true)
+		dir := nodeupgrade.FileStoreDir(l.StateDir)
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		held := filepath.Join(dir, nodeHexSum("held"))
+		if err := os.WriteFile(held, nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Truncate(held, upgradewire.MaxUploadTotalBytes); err != nil {
+			t.Fatal(err)
+		}
+		rr := sendBody(mux, http.MethodPut, upgradewire.NodeUpgradeFilesPath+"/"+nodeHexSum("x"), "x")
+		if rr.Code != http.StatusInsufficientStorage || upgradeErr(t, rr).Error != upgradewire.ErrCodeUploadQuota {
+			t.Fatalf("put past the total = %d %s", rr.Code, rr.Body.String())
+		}
+	})
 	t.Run("store unwritable", func(t *testing.T) {
 		mux, l, _ := nodeUpgradeMux(t, false, true)
 		if err := os.WriteFile(filepath.Dir(l.StateDir)+"/upgrade", []byte("a file, not a directory"), 0o600); err != nil {

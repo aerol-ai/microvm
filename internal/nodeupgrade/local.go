@@ -111,7 +111,7 @@ func (l *Local) goarch() string {
 func (l *Local) Platform() string { return l.goos() + "/" + l.goarch() }
 
 func (l *Local) store() FileStore {
-	return FileStore{Dir: FileStoreDir(l.StateDir), MaxBytes: upgradewire.MaxUploadBytes}
+	return FileStore{Dir: FileStoreDir(l.StateDir), MaxBytes: upgradewire.MaxUploadBytes, MaxTotalBytes: upgradewire.MaxUploadTotalBytes}
 }
 
 // PutFile stores one uploaded file under its SHA-256. created is false when

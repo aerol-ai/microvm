@@ -142,6 +142,11 @@ func (h *handlers) nodeUpgradePutFile(w http.ResponseWriter, r *http.Request) {
 		writeNodeUpgradeError(w, http.StatusRequestEntityTooLarge, upgradewire.ErrorResponse{Error: "too_large",
 			Reason: "a release file may be at most 256 MiB"})
 		return
+	case errors.Is(err, nodeupgrade.ErrStoreFull):
+		// The same answer the cluster leader gives past the same cap (§8).
+		writeNodeUpgradeError(w, http.StatusInsufficientStorage, upgradewire.ErrorResponse{Error: upgradewire.ErrCodeUploadQuota, Reason: err.Error(),
+			Hint: "aerolvm upgrade apply <version> --from <dir>, which uploads only the files it needs"})
+		return
 	case err != nil:
 		h.deps.Logger.Error("store an uploaded release file", "sha256", sum, "error", err)
 		writeNodeUpgradeError(w, http.StatusInternalServerError, upgradewire.ErrorResponse{Error: "internal", Reason: err.Error()})

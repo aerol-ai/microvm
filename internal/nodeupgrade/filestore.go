@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strings"
 	"time"
 )
 
@@ -21,7 +22,15 @@ type FileStore struct {
 	Dir string
 	// MaxBytes caps one file; zero means MaxFileBytes.
 	MaxBytes int64
+	// MaxTotalBytes caps everything stored, for a store that takes
+	// uploads (upgradewire.MaxUploadTotalBytes); zero means no cap. Put
+	// refuses past it with ErrStoreFull.
+	MaxTotalBytes int64
 }
+
+// ErrStoreFull is returned by Put when the store already holds, or the
+// body would take it past, MaxTotalBytes. Nothing is kept.
+var ErrStoreFull = errors.New("the node holds 2 GiB of uploaded release files already; start the upgrade, or wait an hour for unused ones to be pruned")
 
 var storeHashRe = regexp.MustCompile(`^[0-9a-f]{64}$`)
 
@@ -75,6 +84,18 @@ func (s FileStore) Put(sum string, r io.Reader) (created bool, size int64, err e
 	if fi, statErr := os.Stat(dst); statErr == nil && fi.Mode().IsRegular() {
 		return false, fi.Size(), nil
 	}
+	limit, full := s.max(), false
+	if s.MaxTotalBytes > 0 {
+		// Uploads in flight count too (their .put-* files), so two at once
+		// cannot each take the whole room.
+		left := s.MaxTotalBytes - s.storedBytes()
+		if left <= 0 {
+			return false, 0, ErrStoreFull
+		}
+		if left < limit {
+			limit, full = left, true
+		}
+	}
 	if err := os.MkdirAll(s.Dir, 0o700); err != nil {
 		return false, 0, err
 	}
@@ -84,9 +105,12 @@ func (s FileStore) Put(sum string, r io.Reader) (created bool, size int64, err e
 	}
 	tmpName := tmp.Name()
 	_ = tmp.Close()
-	n, got, err := streamToFileMax(r, tmpName, 0o600, s.max())
+	n, got, err := streamToFileMax(r, tmpName, 0o600, limit)
 	if err != nil {
 		_ = os.Remove(tmpName)
+		if full && strings.HasPrefix(err.Error(), "larger than") {
+			return false, 0, ErrStoreFull
+		}
 		return false, 0, err
 	}
 	if got != sum {
@@ -98,6 +122,21 @@ func (s FileStore) Put(sum string, r io.Reader) (created bool, size int64, err e
 		return false, 0, err
 	}
 	return true, n, nil
+}
+
+// storedBytes adds up the regular files in the store, temp files included.
+func (s FileStore) storedBytes() int64 {
+	entries, err := os.ReadDir(s.Dir)
+	if err != nil {
+		return 0
+	}
+	var total int64
+	for _, e := range entries {
+		if info, err := e.Info(); err == nil && info.Mode().IsRegular() {
+			total += info.Size()
+		}
+	}
+	return total
 }
 
 // Open opens a stored file for reading. The caller should check the hash of

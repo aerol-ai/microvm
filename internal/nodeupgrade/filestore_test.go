@@ -99,6 +99,42 @@ func TestFileStoreRefusals(t *testing.T) {
 	}
 }
 
+// J14: a store that takes uploads caps their total, like the cluster
+// leader does: a body that would go past it, or any body once it is full,
+// is refused with ErrStoreFull and nothing is kept. A file already there
+// still answers without reading the body.
+func TestFileStoreTotalCap(t *testing.T) {
+	s := FileStore{Dir: t.TempDir(), MaxBytes: 8, MaxTotalBytes: 10}
+	if created, _, err := s.Put(sumOf("123456"), strings.NewReader("123456")); err != nil || !created {
+		t.Fatalf("first put = %v %v", created, err)
+	}
+	// 6 + 6 > 10: cut while it streams, though under the per-file cap.
+	if _, _, err := s.Put(sumOf("abcdef"), strings.NewReader("abcdef")); !errors.Is(err, ErrStoreFull) {
+		t.Fatalf("put past the total = %v", err)
+	}
+	if created, _, err := s.Put(sumOf("abcd"), strings.NewReader("abcd")); err != nil || !created {
+		t.Fatalf("put that fits exactly = %v %v", created, err)
+	}
+	if _, _, err := s.Put(sumOf("z"), strings.NewReader("z")); !errors.Is(err, ErrStoreFull) {
+		t.Fatalf("put into a full store = %v", err)
+	}
+	if created, n, err := s.Put(sumOf("abcd"), iotestErrReader{}); err != nil || created || n != 4 {
+		t.Fatalf("repeat put into a full store = %v %d %v", created, n, err)
+	}
+	// The per-file cap still wins when it is the smaller one.
+	roomy := FileStore{Dir: t.TempDir(), MaxBytes: 4, MaxTotalBytes: 100}
+	if _, _, err := roomy.Put(sumOf("123456"), strings.NewReader("123456")); errors.Is(err, ErrStoreFull) || err == nil {
+		t.Fatalf("per-file cap = %v", err)
+	}
+	entries, _ := os.ReadDir(s.Dir)
+	if len(entries) != 2 {
+		t.Fatalf("refused puts left files: %v", entries)
+	}
+	if (FileStore{Dir: filepath.Join(t.TempDir(), "missing")}).storedBytes() != 0 {
+		t.Fatal("a missing store holds bytes")
+	}
+}
+
 func TestFileStoreMaterialize(t *testing.T) {
 	s := FileStore{Dir: t.TempDir()}
 	a, b := "sandboxd", "toolboxd"

@@ -47,7 +47,7 @@ const (
 	uploadPruneAge = time.Hour
 	// maxUploadTotalBytes caps what operators may push to the leader at
 	// once (§8: 2 GiB in total, plus the hourly prune).
-	maxUploadTotalBytes = int64(2) << 30
+	maxUploadTotalBytes = upgradewire.MaxUploadTotalBytes
 )
 
 // ErrUploadQuota refuses an upload past maxUploadTotalBytes.
