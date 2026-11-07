@@ -151,7 +151,7 @@ func TestHangupClosesTheTerminal(t *testing.T) {
 	}
 	if runtime.GOOS == "linux" {
 		// The kernel hangs up the terminal only when the master really
-		// closes; that needs the poller, which creack/pty's master is in on
+		// closes; that needs the poller, which StartPTY's master is in on
 		// Linux (where toolboxd runs) but not on macOS.
 		waitSessionDone(t, sess)
 		if _, signal := sess.ExitInfo(); signal == "" {

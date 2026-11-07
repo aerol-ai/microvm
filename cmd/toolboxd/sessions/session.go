@@ -18,7 +18,6 @@ import (
 	"time"
 
 	"github.com/aerol-ai/microvm/pkg/models"
-	"github.com/creack/pty"
 )
 
 // Stream identifies which output stream a chunk of bytes belongs to. Pipe
@@ -334,7 +333,7 @@ func (s *Session) Resize(cols, rows int) error {
 	}
 	s.cols = cols
 	s.rows = rows
-	return pty.Setsize(s.ptmx, &pty.Winsize{Cols: uint16(cols), Rows: uint16(rows)})
+	return SetWinsize(s.ptmx, uint16(cols), uint16(rows))
 }
 
 // Signal sends a signal to the session's process group. Accepts INT, TERM,

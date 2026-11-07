@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/aerol-ai/microvm/pkg/models"
+	"golang.org/x/sys/unix"
 )
 
 func TestHoldsFileAndNoPath(t *testing.T) {
@@ -95,5 +96,111 @@ func TestKillTerminalEndsJobControlJobs(t *testing.T) {
 	// KillTerminal must not scan.
 	if sess.KillTerminal() != 0 {
 		t.Fatal("KillTerminal scanned after the session hung up")
+	}
+}
+
+// masterFlags reads a session master's file status and descriptor flags
+// through the raw descriptor (calling Fd would change what it measures).
+func masterFlags(t *testing.T, s *Session) (nonblock, cloexec bool) {
+	t.Helper()
+	s.mu.Lock()
+	master := s.ptmx
+	s.mu.Unlock()
+	if master == nil {
+		t.Fatal("session has no terminal")
+	}
+	raw, err := master.SyscallConn()
+	if err != nil {
+		t.Fatalf("SyscallConn: %v", err)
+	}
+	var status, fdFlags int
+	if err := raw.Control(func(fd uintptr) {
+		status, _ = unix.FcntlInt(fd, unix.F_GETFL, 0)
+		fdFlags, _ = unix.FcntlInt(fd, unix.F_GETFD, 0)
+	}); err != nil {
+		t.Fatalf("Control: %v", err)
+	}
+	return status&unix.O_NONBLOCK != 0, fdFlags&unix.FD_CLOEXEC != 0
+}
+
+// creack/pty puts the master in blocking mode (it calls Fd), where Close
+// cannot interrupt the output pump's Read. StartPTY must hand back a
+// non-blocking, close-on-exec master, and a resize must not undo it.
+func TestPTYMasterStaysPollable(t *testing.T) {
+	mgr := newTestManager(t)
+	sess, err := mgr.Create(context.Background(), models.CreateSessionRequest{Name: "pollable", Command: "sleep 30", PTY: true})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	t.Cleanup(func() { _ = sess.Signal("KILL") })
+	if nonblock, cloexec := masterFlags(t, sess); !nonblock || !cloexec {
+		t.Fatalf("master nonblock=%v cloexec=%v, want both", nonblock, cloexec)
+	}
+	if err := sess.Resize(132, 43); err != nil {
+		t.Fatalf("Resize: %v", err)
+	}
+	if nonblock, _ := masterFlags(t, sess); !nonblock {
+		t.Fatal("Resize put the master back in blocking mode")
+	}
+}
+
+// The way a terminal is really closed: the shell has printed something, so
+// the output pump is back inside Read when Hangup runs. With a blocking
+// master the Close never reached the kernel and the session never ended
+// (10 of 10 before the fix); TestHangupClosesTheTerminal only passed when
+// Hangup won the race against the pump's first Read.
+func TestHangupAfterOutputEndsTheSession(t *testing.T) {
+	mgr := newTestManager(t)
+	sess, err := mgr.Create(context.Background(), models.CreateSessionRequest{Name: "used", Command: "echo ready; sleep 30", PTY: true})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	t.Cleanup(func() { _ = sess.Signal("KILL") })
+	frames, cancel := sess.Subscribe()
+	var out []byte
+	deadline := time.After(10 * time.Second)
+	for !regexp.MustCompile("ready").Match(out) {
+		select {
+		case f, ok := <-frames:
+			if !ok {
+				t.Fatalf("session ended before printing; output %q", out)
+			}
+			out = append(out, f.Data...)
+		case <-deadline:
+			t.Fatalf("no output within 10s; got %q", out)
+		}
+	}
+	cancel()
+	if err := sess.Resize(100, 30); err != nil {
+		t.Fatalf("Resize: %v", err)
+	}
+	sess.Hangup()
+	waitSessionDone(t, sess)
+	if _, signal := sess.ExitInfo(); signal == "" {
+		t.Fatal("after Hangup the shell exited normally; want it ended by SIGHUP")
+	}
+}
+
+// When the master cannot be duplicated the terminal still works, only
+// without an interruptible Close, and a resize on a closed master fails.
+func TestPollableMasterFallbacks(t *testing.T) {
+	f, err := os.CreateTemp(t.TempDir(), "master")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = f.Close()
+	if got := pollableMaster(f); got != f {
+		t.Fatal("a closed master must come back unchanged")
+	}
+	if err := SetWinsize(f, 80, 24); err == nil {
+		t.Fatal("SetWinsize on a closed master succeeded")
+	}
+	open, err := os.CreateTemp(t.TempDir(), "notatty")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = open.Close() })
+	if err := SetWinsize(open, 80, 24); err == nil {
+		t.Fatal("SetWinsize on a regular file succeeded")
 	}
 }

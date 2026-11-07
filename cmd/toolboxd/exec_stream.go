@@ -14,7 +14,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/creack/pty"
+	"github.com/aerol-ai/microvm/cmd/toolboxd/sessions"
 	"github.com/gorilla/websocket"
 )
 
@@ -243,7 +243,7 @@ func (s *server) runWithPTY(conn *websocket.Conn, cmd *exec.Cmd, start *execStre
 	var ptmx *os.File
 	child, err := execChildren.start(cmd, func() error {
 		var startErr error
-		ptmx, startErr = pty.StartWithSize(cmd, &pty.Winsize{Cols: cols, Rows: rows})
+		ptmx, startErr = sessions.StartPTY(cmd, cols, rows)
 		return startErr
 	})
 	if err != nil {
@@ -383,7 +383,7 @@ func handlePTYControl(logger *slog.Logger, ctrl execStreamControlIn, ptmx *os.Fi
 		if ctrl.Cols <= 0 || ctrl.Rows <= 0 {
 			return
 		}
-		if err := pty.Setsize(ptmx, &pty.Winsize{Cols: uint16(ctrl.Cols), Rows: uint16(ctrl.Rows)}); err != nil {
+		if err := sessions.SetWinsize(ptmx, uint16(ctrl.Cols), uint16(ctrl.Rows)); err != nil {
 			logger.Debug("pty resize failed", "error", err)
 		}
 	case "signal":
