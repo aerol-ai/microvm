@@ -219,7 +219,7 @@ Reading for this plan also turned up doc drift. Appendix A lists it.
 | D12 | **Deferred by CEO review D3 (until the K8s v2 plan's Q1 picks the CRD shape).** **One manifest format for `aerolvm apply` and the Kubernetes operator.** `-o yaml` prints `apiVersion`, `kind`, `metadata`, `spec` and `status`, with the same group and fields as the operator's future CRDs. | The same YAML file works with `aerolvm apply` and with `kubectl apply`. |
 | D13 | **`kubectl aerolvm` works as a plugin. We don't fake the Kubernetes API.** The `aerolvm` binary behaves the same when it is called as `kubectl-aerolvm`, and we publish a Krew manifest. | The plugin is cheap. A fake API server would need discovery, OpenAPI, watch, server-side apply and RBAC mapping, which is a lot to build and maintain. Real `kubectl get sandboxes` comes from the operator on Kubernetes (v2 plan K11). |
 | D14 | **Everything an operator needs ships in the release or inside a binary.** `uninstall.sh` and `aerolvm-ops-<version>.tar.gz` (alerts, dashboards, runbooks) become release assets. Backup, restore and lost-quorum recovery become `sandboxd` commands. Terraform is used by URL with `?ref=<tag>`, without a clone. | Closes C4. |
-| D15 | **Remote upgrade is on by default (enterprise mode's default is Q6), and each node can turn it off** with `SB_REMOTE_UPGRADE=false`. When it is off on a node, the rollout marks that node `manual` and waits; `aerolvm upgrade status` and `apply --wait` print the command to run on it (§6.3). | Easy by default. Teams with their own change tooling keep control. |
+| D15 | **Remote upgrade is on by default, except in enterprise mode (`SB_ENTERPRISE_MODE=true`), where it is off unless `SB_REMOTE_UPGRADE=true` is set (eng D4); each node can turn it off** with `SB_REMOTE_UPGRADE=false`. When it is off on a node, the rollout marks that node `manual` and waits; `aerolvm upgrade status` and `apply --wait` print the command to run on it (§6.3). | Easy by default. Teams with their own change tooling keep control. |
 
 ---
 
@@ -246,7 +246,7 @@ host, then runs `sandboxd join`:
 
 ```bash
 curl -fsSL https://aerolvm.aerol.ai | sudo bash -s -- \
-  join https://10.0.0.5:7002 --token abc123.0f1e2d3c4b5a6978 --ca-cert-hash sha256:9a1c…
+  join https://10.0.0.5:7003 --token abc123.0f1e2d3c4b5a6978 --ca-cert-hash sha256:9a1c…
 ```
 
 ### 3.2 From anywhere: `aerolvm …`
@@ -259,7 +259,7 @@ curl -fsSL https://aerolvm.aerol.ai | sudo bash -s -- \
 | `aerolvm describe node <name>` | The member record, plus sandbox count, capacity and cert expiry |
 | `aerolvm cordon <name>`, `uncordon <name>` | Today's drain and uncordon routes. Add `POST …/cordon` as the clear name, and keep `/drain` for old clients. |
 | `aerolvm drain <name> [--timeout 10m] [--delete-sandboxes] [--migrate]` | Cordon, then wait (§5) |
-| `aerolvm delete node <name>` | Today's remove route, extended to workers and ingress nodes (§5) |
+| `aerolvm delete node <name>` | New route `DELETE /v1/cluster/nodes/{id}` for any role (§5). `DELETE /v1/cluster/members/{id}` stays as it is, because `/v1` is soft-frozen (`.claude/skills/add-v1-endpoint/SKILL.md:8`) |
 | `aerolvm join-command [--role worker] [--ttl 2h] [--reusable]` | New. Makes a join token and prints the one-line join command. The installer asks the cluster which version to install (§6.5). `--ttl 0` only for worker and ingress roles (CEO D13). |
 | `aerolvm get jointokens`, `aerolvm delete jointoken <id>` | List and revoke join tokens |
 | `aerolvm get csr`, `aerolvm certificate approve <id>` | External-CA mode only (D5). Deferred by CEO review D4. |
@@ -363,30 +363,34 @@ sequenceDiagram
     N->>S: gossip join. The leader adds servers to Raft (existing code).
 ```
 
-- **Where the join call lands.** The internal mTLS port (7002) already
-  presents a cert signed by the cluster CA, which is exactly what the CA hash
-  pins. Today that listener demands a client cert
-  (`internal/cluster/tls.go:299`). We change it to "check a client cert if one
-  is given". Every route except the three join paths (`cluster-info`,
-  `join`, `join/preflight`) then sits behind a "must
-  have a verified peer cert" check. A test walks every registered internal
-  route and proves it. A separate join port is the alternative (Q1).
+- **Where the join call lands (eng D3).** A separate join port, 7003, on
+  server nodes only. It presents the server's node cert, which is signed by
+  the cluster CA (exactly what the CA hash pins), and asks for no client
+  cert. It serves only the three join paths: `cluster-info`, `join` and
+  `join/preflight`. The internal port 7002 is unchanged and still demands a
+  client cert on every connection (`internal/cluster/tls.go:299`), so no
+  handler there can be reached without one. Workers and ingress nodes don't
+  open 7003.
 - **Discovery check.** For each token, Raft keeps the hash of the secret and
   a discovery key derived from the secret (HKDF). The discovery key can sign
   the `cluster-info` answer but can't be used to join. The new machine
   derives the same key from its token and checks the HMAC.
-- **Who signs.** Any server that holds the CA key. A worker that gets a
-  worker or ingress join call runs the dial-back itself (it sees the
-  caller's real IP, §4.3), then forwards the call to a server over the
-  existing internal channel. A worker never relays a server-role join,
-  because that answer carries the CA key (D5): it answers `421` with the
-  servers' join URLs, and the installer retries there.
+- **Who signs.** The server that receives the call on 7003; every server
+  holds the CA key (D5). Workers never see join traffic, so there is no
+  relay and the CA key never passes through a worker.
 - **What gets signed.** The signer builds the cert from the token's role and
   the requested node ID. It ignores the names written in the CSR. This is the
   rule `cluster-sign-node.sh:88-98` follows today, with the names
   `DNS:aerolvm-cluster-node` and `DNS:node:<id>`. The node ID must not match a
   live member. A join for a deleted node ID, with a new token and a new key,
   replaces that ID's deny record (§5).
+- **The token's role is enforced, not just gossiped.** The cert also names
+  the role (`DNS:role:<role>`), and the admission record in Raft stores it.
+  Today the voter auto-join trusts the role a node gossips
+  (`peerForcedNonVoter`, `internal/cluster/voter_autojoin.go:320-323`); it
+  changes to use the admitted role. A node admitted as a worker or ingress
+  node is never added to Raft and never gets the CA key, whatever it gossips.
+  (Repair from the Codex eng review, finding 1.)
 - **One winner per node ID.** Before it signs, the signer writes one Raft op
   that uses up the token and reserves the node ID for this node's key. Raft
   applies these one at a time, so when two machines ask for the same node
@@ -436,7 +440,7 @@ also run alone. Each failed check prints one line that says how to fix it.
 
 | Check | Fails when | Printed fix (example) |
 |---|---|---|
-| Ports | This node can't reach the join server on the TCP ports its role needs, or the join server can't reach this node back. Servers: TCP 7000 (Raft), TCP 7001 (gossip), TCP 7002 (internal). UDP 7001 can't be checked before the node has the gossip key, so preflight only warns that it must be open. Workers and ingress nodes: 7001 and 7002 only, because they run no Raft listener (`internal/cluster/agent.go:270`). | "open TCP 7001-7002 and UDP 7001 between nodes (and TCP 7000 between servers)" |
+| Ports | This node can't reach the join server on TCP 7003 (join, eng D3) and on the TCP ports its role needs, or the join server can't reach this node back. Servers: TCP 7000 (Raft), TCP 7001 (gossip), TCP 7002 (internal). UDP 7001 can't be checked before the node has the gossip key, so preflight only warns that it must be open. Workers and ingress nodes: 7001 and 7002 only, because they run no Raft listener (`internal/cluster/agent.go:270`). | "open TCP 7001-7002 and UDP 7001 between nodes, TCP 7000 between servers, and TCP 7003 to servers" |
 | Clock | This node's clock is more than 30 seconds off the join server's (read from the HTTP `Date` header) | "start time sync (chrony or systemd-timesyncd)" |
 | cgroup v2 | Never fails; warns when the unified cgroup hierarchy is not mounted. Today cgroup v1 only logs a warning too (`internal/runtime/firecracker/vmm.go`). On a Firecracker node the warning adds that VMs won't survive a sandboxd restart, because the VM cgroup move needs v2. | "boot with systemd.unified_cgroup_hierarchy=1" |
 | KVM | Firecracker is enabled for this node and `/dev/kvm` is missing | "use a metal or nested-virt machine, or turn Firecracker off" |
@@ -447,8 +451,8 @@ The return path in the ports check needs the other side. Preflight opens
 short-lived listeners on this node's TCP ports and asks the join server to
 dial them back: inside `POST /v1/join` during a join, or through
 `POST /v1/join/preflight` (token required, rate-limited, audited, signs
-nothing) when preflight runs alone. The node that receives the call dials
-back, only at that call's source IP, never at an address taken from the
+nothing) when preflight runs alone. The server that receives the call on
+7003 dials back, only at that call's source IP, never at an address taken from the
 request body. The listeners then close.
 
 `init` has no join server, so it runs only the local checks: cgroup, KVM,
@@ -487,9 +491,11 @@ on the last release, adopted, then grown with one-line joins.
   (`sandboxd-node-lifecycle.sh:132-179`) and into the CLI. A new
   `GET /v1/cluster/nodes/{id}` returns counts, so the CLI does not page
   through the whole sandbox index at fleet scale.
-- **`delete node`** works for servers today (`RemoveMember`,
-  `internal/cluster/client.go:1107-1161`). For workers and ingress nodes it is
-  new. It marks the node drained and orphans its placements, the same way
+- **`delete node`** uses a new route, `DELETE /v1/cluster/nodes/{id}`, for
+  every role. For servers it calls today's `RemoveMember`
+  (`internal/cluster/client.go:1107-1161`); for workers and ingress nodes it
+  is new. The old `DELETE /v1/cluster/members/{id}` keeps its current
+  answers, including 404 for a worker, because `/v1` is soft-frozen. It marks the node drained and orphans its placements, the same way
   the dead-owner path does (`internal/cluster/dead_owner.go:165-237`). It also
   writes a deny record to Raft: the node ID and its cert key. Until a fresh
   join for that ID (new token, new key) replaces the record, the ID gets no
@@ -518,7 +524,7 @@ on the last release, adopted, then grown with one-line joins.
 ```bash
 aerolvm upgrade plan v0.6.12
 aerolvm release pull v0.6.12 -o aerolvm-v0.6.12.tgz   # offline sites (§7.1)
-aerolvm upgrade apply v0.6.12 [--hold] [--batch <n|n%>] [--pause-after N] [--from ./dist | --from aerolvm-v0.6.12.tgz] [--wait]
+aerolvm upgrade apply v0.6.12 [--hold] [--batch <n|n%>] [--pause-after N] [--node-timeout 10m] [--from ./dist | --from aerolvm-v0.6.12.tgz] [--wait]
 aerolvm upgrade status
 aerolvm upgrade stop
 aerolvm upgrade resume
@@ -595,6 +601,17 @@ goes on without it.
   restarts another server only if the voters that stay up still form a
   majority. If they wouldn't, the rollout ends `failed` and names the down
   server. With three servers and one down, nothing restarts.
+- **A cluster with one server (eng D8).** With one voter, no majority can
+  stay up and leadership can't move. `upgrade plan` warns that the API is
+  down during the server's restart, and `apply` needs `--allow-downtime`.
+  The server goes last; after it starts, it resumes the rollout from Raft.
+  Sandboxes keep running throughout (§6.4).
+- **Upgrading is not dying.** Before each node step, the leader writes the
+  node's state as `upgrading`, with a deadline equal to `--node-timeout`
+  (eng D6). The dead-owner loop (`internal/cluster/dead_owner.go`, 30-second
+  default grace at `:110-112`) skips a node in that state until its
+  deadline, so a normal restart never sets off failover of its sandboxes.
+  (Repair from the Codex eng review, finding 2.)
 
 Leadership hand-off uses Raft's `LeadershipTransfer`. Nothing calls it today.
 We add it behind a new route, `POST /v1/cluster/leader/transfer`.
@@ -632,7 +649,11 @@ The upgrader:
    (CEO D12). After staging (§6.7), the files are already on disk.
    - **Servers** download them from `SB_RELEASE_URL` (default GitHub
      releases; air-gapped sites point it at a mirror). With `--from`, a
-     server copies them from the leader instead (§6.6).
+     server copies them from the leader instead (§6.6). Servers cache the
+     files for every CPU type in the rollout (taken from the member list,
+     including skipped nodes), not only their own, so arm64 workers can
+     stage from amd64 servers. (Repair from the Codex eng review, finding
+     6.)
    - **Workers and ingress nodes** copy them from any server over the
      internal mTLS channel: `GET /v1/cluster/internal/upgrade/files/{sha256}`.
      The route sits behind `authorizePeerRequest`, so only live members can
@@ -654,7 +675,13 @@ The upgrader:
    stops.
 3. Refuses to downgrade, unless this is a rollback (§6.8).
 4. Moves Firecracker VMs out of sandboxd's cgroup. This is a Go port of
-   `install.sh:1910-1934`.
+   `install.sh:1910-1934`. External-storage mount helpers (mount-s3, rclone,
+   sshfs) are killed today with sandboxd: `pkg/mounts/process.go:110-114`
+   only sets `Setpgid`, and the unit uses `KillMode=control-group`. So the
+   mount manager starts each helper in its own `aerolvm-mounts` cgroup from
+   the start, and sandboxd adopts running helpers at boot. Phase 3a must
+   prove mounts keep serving reads and writes across a restart. (Repair from
+   the Codex eng review, finding 3.)
 5. Stops sandboxd and backs up the database with `VACUUM INTO`. sandboxd is
    stopped, so the single-writer rule still holds.
 6. Keeps the old files as `*.prev` and renames the new files into place.
@@ -710,6 +737,7 @@ it is the leader, it hands off leadership first.
 |---|---|---|
 | containerd, docker, gVisor | Keeps running. sandboxd adopts it again at boot. | Needs live proof in the upgrade test |
 | Firecracker | Keeps running. It was moved to the `aerolvm-vmm` cgroup. | `install.sh:1863-1866`, `:1910-1934` |
+| External-storage mounts | Keep serving: helpers run in the `aerolvm-mounts` cgroup and are adopted at boot (§6.3 step 4) | `pkg/mounts/process.go:110-114` (today they die with sandboxd) |
 | WASM, V8 isolate (workerd) | Their worker processes sit in sandboxd's cgroup, so they likely die with it, unless they are moved too. **Not confirmed. Measure this before Phase 3 ships.** | `KillMode=control-group`, `install.sh:1866` |
 | toolboxd inside a sandbox | The old one keeps running. New sandboxes get the new one. | `setup/deployment/toolboxd-updates.md:108-114` |
 
@@ -753,8 +781,13 @@ sandbox restarts for containers and VMs.
     rebuilds or changes data (like `migrateSnapshotOwnerPK`).
   - A `schema_migrations` table records every number applied.
   - At start, a binary runs only its `n1_safe` migrations. Its non-`n1_safe`
-    (one-way) migrations wait until the leader writes the new active cluster
-    version; then each node runs them once (CEO D16). Code that ships a
+    (one-way) migrations wait until the leader commits the new active cluster
+    version; then each node runs them once and reports done (CEO D16).
+    Finalize has two steps: `finalizing` (committed; nodes migrate) and
+    `finalized` (every member reported). Features that need the new schema
+    turn on per node only after that node's migrations finish, and a new
+    rollout waits for `finalized`. (Repair from the Codex eng review,
+    finding 4.) Code that ships a
     one-way migration must work on the old schema until finalize.
   - A binary that finds a migration number it doesn't know refuses to start
     with a clear error, unless every unknown number is `n1_safe`.
@@ -822,7 +855,9 @@ aerolvm upgrade apply ──► leader: opPutRollout (fleet.admin, audited, call
 | running | a node fails its health check | failed |
 | staging, running, paused | `stop` | stopped |
 | failed, stopped | `apply` with the same target | staging (nodes on the target are skipped) |
-| done | finalize (auto, or `finalize` with `--hold`) | finalized |
+| done | finalize (auto, or `finalize` with `--hold`) | finalizing |
+| finalizing | every member reports its one-way migrations done | finalized |
+| finalizing | a node's one-way migration fails | finalizing (that node stays cordoned and `failed` in status) |
 | done, failed, stopped, paused | `rollback` | rolling-back |
 | rolling-back | every node back on the previous version | rolled-back |
 | rolling-back | a node fails | failed (direction: rollback) |
@@ -843,7 +878,7 @@ aerolvm upgrade apply ──► leader: opPutRollout (fleet.admin, audited, call
 |---|---|---|
 | `apply` same target | staging, running, paused, done | Returns the existing rollout |
 | `apply` same target | failed, stopped | Back to staging, so stopped nodes re-stage; nodes on the target are skipped |
-| `apply` same target | finalized | Success; nothing changes |
+| `apply` same target | finalizing, finalized | Success; nothing changes |
 | `apply` same target | rolling-back | Refused: wait for the rollback to end |
 | `apply` same target | rolled-back | New rollout |
 | `apply` other target | finalized, rolled-back, or no rollout | New rollout |
@@ -856,7 +891,8 @@ aerolvm upgrade apply ──► leader: opPutRollout (fleet.admin, audited, call
 | `rollback` | done (held), failed, stopped, paused | See §6.8 |
 | `rollback` | rolling-back, rolled-back | Success; nothing changes |
 | `rollback` | failed (direction: rollback) | Resumes the same rollback |
-| `finalize` | done, with no node still `skipped` | Writes the new active cluster version (§6.5) |
+| `finalize` | done, with no node still `skipped` | Commits the new active cluster version; state becomes `finalizing` (§6.5) |
+| `finalize` | finalizing | Success; nothing changes |
 | `finalize` | done, with skipped nodes | Refused: lists them; upgrade or delete each first (§6.2) |
 | `finalize` | finalized | Success; nothing changes |
 
@@ -898,9 +934,9 @@ aerolvm upgrade apply ──► leader: opPutRollout (fleet.admin, audited, call
   step, read a node's state, hand off leadership) so tests can use a fake.
   The rollout and node states are one pure transition function built from
   the tables above, not branches spread across handlers.
-- **Per-node health timeout.** Not chosen yet. Suggested default: 10
-  minutes, with a flag. Owner: the Phase 3b implementer, settled in eng
-  review.
+- **Per-node health timeout (eng D6).** 10 minutes by default, set with
+  `--node-timeout`. When it runs out, the node is `failed` and the rollout
+  stops.
 
 ### 6.7 Staging and the canary pause (CEO review D8)
 
@@ -952,6 +988,11 @@ finalize (the table in §6.6).
 - **`install.sh`** writes `/etc/sandboxd/node.json`. It reads secrets back
   from the existing env files, and never makes a new PAT when one exists. It
   accepts `init` and `join` as its first word and passes them to `sandboxd`.
+- **One way to swap binaries (eng D7).** When the installed `sandboxd` has
+  `upgrade node`, a re-run of `install.sh` downloads and checks the files,
+  then runs `sandboxd upgrade node` with them, so every swap keeps the
+  backup, the `*.prev` copies and running VMs. First installs and nodes
+  older than Phase 3a keep today's path.
 - **Built into `sandboxd`.** A small Go package in `scripts/` embeds
   `install.sh` (`//go:embed install.sh`). `sandboxd host apply` runs that
   copy.
@@ -1043,8 +1084,9 @@ aerolvm-v0.6.12.tgz
   worker until it is revoked, and a worker's join answer carries the gossip
   key and the credential bundle (§4). With plain credential custody, that
   bundle decrypts sealed credentials; with wrapped custody (KMS, Vault or
-  PKCS#11) it does not. Q8 asks whether `--ttl 0` should require wrapped
-  custody.
+  PKCS#11) it does not. So in enterprise mode, `--ttl 0` is refused unless
+  custody is wrapped; elsewhere `join-command` allows it with a warning
+  (eng D5).
 
 # Part 4: Phases, tests, risks and open questions
 
@@ -1074,8 +1116,9 @@ Phase 0 is useful on its own and carries no design risk. Start there.
     version) get `fsm_*_test.go` tests. These cover replay and mixed
     versions: an old FSM and a new FSM apply the same log and must end in the
     same state, as in `plans/mcp-server-and-agent-cli.md` R5.
-  - The listener change gets a test that every internal route rejects a call
-    with no client cert, except the three join paths.
+  - The join port (eng D3): 7002 still refuses every connection without a
+    client cert; 7003 serves only the three join paths and exists only on
+    servers; a worker has no 7003 listener.
   - The rollout record (§6.6): replay and mixed-version tests for its ops; a
     leader-change test where a new leader resumes a half-done rollout without
     a second upgrade on any node; `stop` and "same target twice" tests.
@@ -1100,6 +1143,23 @@ Phase 0 is useful on its own and carries no design risk. Start there.
     node ID is refused after the new node joins; an obsolete server is kept
     out of Raft; the gateway restarts only when its protocol would fall
     outside the target's range.
+  - Codex eng repairs: a worker that gossips `server` is never added to
+    Raft and never gets the CA key; a restart longer than the dead-owner
+    grace sets off no failover while the node is `upgrading`; mounts keep
+    serving reads and writes across a sandboxd restart; schema-dependent
+    requests on a node wait for its one-way migrations, and a new rollout
+    waits for `finalized`; amd64 servers serve arm64 files; a one-server
+    cluster upgrades only with `--allow-downtime` and resumes after its
+    restart.
+  - Eng review additions: enterprise mode refuses `--ttl 0` with plain
+    custody and turns remote upgrade off unless `SB_REMOTE_UPGRADE=true`;
+    `--node-timeout` fires and fails the node and the rollout; `--batch`
+    accepts 10% and 3, rejects 0, 0% and 150%; `install.sh` hands off to
+    `sandboxd upgrade node` when it exists and keeps the first-install path;
+    an older CLI's `login` leaves `contexts.json` intact; `DELETE
+    /v1/cluster/nodes/{id}` removes a worker while `DELETE
+    /v1/cluster/members/{worker}` still answers 404; a join from a build that
+    may not join is refused; `pkg/release` round-trips `release.json`.
   - Crash safety: kill the upgrader after each file swap; the next boot
     completes or restores the set. Two joins with the same node ID at once:
     exactly one wins. Kill the leader during staging: the new leader
@@ -1189,7 +1249,7 @@ Phase 0 is useful on its own and carries no design risk. Start there.
 
 | Risk | What we do about it |
 |---|---|
-| The join route, which takes calls without a client cert, sits on the internal port | Only three join paths are open. A test walks every route. Rate limit. Q1 keeps a separate port as the fallback. |
+| The join routes take calls without a client cert | They live on their own port, 7003, on servers only (eng D3); 7002 stays strict. Rate limit, audit. |
 | Remote upgrade means a `fleet.admin` caller can run code on every node | The guards in §8, and the off switch |
 | WASM and isolate sandboxes may die during an upgrade | Measure first. Then either move their workers out of the cgroup, or drain those nodes before the upgrade and say so in `upgrade plan`. |
 | The new `get <kind>` grammar breaks a script whose sandbox is named like a kind | Warning at create time. The `get sb <name>` form always works. |
@@ -1202,14 +1262,14 @@ Phase 0 is useful on its own and carries no design risk. Start there.
 
 | # | Question | Recommendation |
 |---|---|---|
-| Q1 | Should join land on port 7002 behind an allowlist, or on its own port? | 7002. It needs no new firewall rule, and the allowlist test guards it. |
+| Q1 | Should join land on port 7002 behind an allowlist, or on its own port? | Settled by eng D3: its own port, 7003, on servers only. |
 | Q2 | Should the CA key live on all servers, or only on the seed? | Settled by D5: all servers. |
 | Q3 | Default join token lifetime: 2 hours, or kubeadm's 24 hours? | 2 hours. `--ttl` can raise it. |
 | Q4 | Manifest `apiVersion` group: wait for the v2 plan's Q1 (the `agent-sandbox` CRD shape), or pick `aerolvm.dev/v1alpha1` now? | Decide together with the v2 plan when the deferred `apply -f` work starts (`TODOS.md`). |
 | Q5 | JSON files, or a YAML file shaped like kubeconfig? | JSON: `config.json` unchanged plus `contexts.json` (§3.4), so older CLIs keep working. |
-| Q6 | Should enterprise mode turn remote upgrade off by default? D15 keeps it on everywhere else. | Yes: off by default in enterprise mode, so banks opt in. |
+| Q6 | Should enterprise mode turn remote upgrade off by default? | Settled by eng D4: off in enterprise mode unless `SB_REMOTE_UPGRADE=true`. |
 | Q7 | Should `drain` wait by default, or stop sandboxes? | Settled by §5: wait, with a 10-minute default `--timeout`. |
-| Q8 | Should `--ttl 0` join tokens be allowed only when credential custody is wrapped (§8)? | Decide in eng review with the key-custody owners. Leaning yes for enterprise mode. |
+| Q8 | Should `--ttl 0` join tokens be allowed only when credential custody is wrapped (§8)? | Settled by eng D5: required in enterprise mode; elsewhere allowed with a warning. |
 
 ---
 
@@ -1730,8 +1790,8 @@ one saved login                 staged, canaried, offline-capable,     + CA and 
 | `GET /v1/join/cluster-info` | Unknown token ID, HMAC mismatch | Y | 403; the joiner says "token or CA hash wrong" |
 | `POST /v1/join` | Token used, expired or wrong role | Y | 403 with the reason; audited |
 | `POST /v1/join` | Two joins with one node ID | Y (fixed) | One Raft op reserves the ID; the loser gets 409 |
-| `POST /v1/join` via a worker | No server reachable | Y | 503 with `Retry-After`; the installer retries |
-| `POST /v1/join` via a worker, server role | Would relay the CA key | Y | 421 with server join URLs |
+| `POST /v1/join` | The named server is down | Y | Connection error; the join command lists every server and the installer tries the next |
+| `POST /v1/join` | Sent to a worker | Y | Workers have no 7003 listener (eng D3); the join command names servers only |
 | `sandboxd join` | Crash before restart | Y | Re-run; the node key is kept |
 | Cert renewal | Signer down, or key denied | Y | Retries; alert after 1 day of failures |
 | Stage step | Disk full, hash mismatch, no `systemd-run`, unreachable mirror | Y | Rollout `failed` before any restart, with the node's error |
@@ -1790,7 +1850,7 @@ From the CEO summary's 0G record:
                      │                                      │ fenced by term + record
                      │   POST nodes/{id}/upgrade ◄──────────┘ over :7002 mTLS
                      │   GET upgrade/files/{sha} ◄── workers copy from non-leader servers
- new machine ─ install.sh ─► sandboxd preflight/join ─► :7002 cluster-info · join · join/preflight
+ new machine ─ install.sh ─► sandboxd preflight/join ─► :7003 (servers only) cluster-info · join · join/preflight
  deny records + tokens ─► Raft FSM ─► token mirror ─► workers and ingress (+ AliveDelegate)
 ```
 
@@ -1799,14 +1859,15 @@ From the CEO summary's 0G record:
 ```
  token+CSR ─► validate (64-hex, role, TTL) ─► Raft op: use token + reserve ID ─► sign ─► answer
     │ nil/empty token ─► 400        │ wrong/expired ─► 403      │ ID taken ─► 409
-    │ server-role via worker ─► 421 │ Raft unavailable ─► 503 Retry-After
+    │ (7003 exists on servers only) │ Raft unavailable ─► 503 Retry-After
     └ retry with same key ─► same answer (idempotent)
 ```
 
 3. **State machine: a rollout**
 
 ```
- (none) ─apply─► staging ─all staged─► running ─all done/skipped─► done ─finalize─► finalized
+ (none) ─apply─► staging ─all staged─► running ─all done/skipped─► done ─finalize─► finalizing
+   finalizing ─every member migrated─► finalized   (a failed node stays cordoned, finalizing)
                   │  │                  │  ▲                         │
                   │  └─stage fails─► failed ◄─node fails─┘  └─pause─► paused ─resume─┘
                   └────stop────────► stopped ◄──stop── running/paused
@@ -1977,22 +2038,514 @@ here; they belong to eng review:
 - Q8: should `--ttl 0` worker tokens require wrapped credential custody.
 - The per-node health timeout for rollouts (suggested 10 minutes).
 
+# Part 6: Eng review (2026-11-07)
+
+Target: `plans/kubectl-style-cluster-ops.md` (this file), reviewed by
+`/plan-eng-review` after the CEO review. The CEO summary
+(`docs/designs/kubectl-style-cluster-ops.md`) and CEO D3-D16 bind this
+review.
+
+## Scope record (eng)
+
+feature answers: no cuts proposed (CEO D3-D16 settled scope); structure: A
+(D1 answer 2026-11-07: "Original arrangement"); CEO plan: used (D2 answer
+2026-11-07: "Use it"); accepted scope: the plan as amended by the CEO
+review, unchanged; pending remedies: Q1, Q6, Q8, per-node rollout timeout.
+
+Scope Challenge result: scope accepted as-is.
+
+Scope Challenge findings (no remedy needed; recorded):
+
+- [INFORMATIONAL] (confidence: 8/10) `scripts/install.sh`: 52 commits in 90
+  days touch the files this plan changes. Phase 0 and Phase 3a `install.sh`
+  edits should land as small PRs.
+- [INFORMATIONAL] (confidence: 7/10) `.github/workflows/release.yml:453-581`:
+  publishing is gated per channel; the plan names no Homebrew tap repo,
+  Krew route or credentials (§7). Owner: Phase 4.
+- [INFORMATIONAL] (confidence: 7/10) §9: seven phases as stacks of one PR per
+  task is roughly 40 or more PRs [estimated]. Sequencing cost only.
+
+## Section 1 (eng): Architecture
+
+Two shapes: A (plan, CEO D6) — the leader pushes node steps from a rollout
+record; B — nodes pull a desired version and take upgrade-slot leases. Pick
+A: approved in CEO D6, one owner for order, quorum and resumption behind a
+three-call interface; B makes every node poll and reopens D6 without new
+evidence.
+
+Findings and build details applied inside approved scope:
+- (confidence 8/10) `release.json` read in three places: one Go type in a new
+  `pkg/release` package, used by `aerolvm` and the server; `release.yml`
+  generates `release.json` from it.
+- (confidence 7/10) Node upgrade state has two owners: the node's op file
+  wins while an op is in flight; the Raft record reflects what the node
+  reports.
+
+## Decision ledger (eng)
+
+### E1: Join listener (plan Q1)
+Finding: Section 1, INFORMATIONAL, confidence 8/10, `internal/cluster/tls.go:299` (`ClientAuth: tls.RequireAndVerifyClientCert`), `internal/cluster/internal_server.go:68-131`; reviewer: Claude (plan-eng-review).
+Plan baseline: §4 puts the three join paths on 7002 with `VerifyClientCertIfGiven` and a route-walk test; Q1 open, plan recommendation 7002.
+Runtime evidence: 7002 today requires a verified client cert on every connection; workers serve 7002 too.
+Comparison grid:
+
+| Choice | Current | A | B |
+|---|---|---|---|
+| E1 where join paths listen | 7002, pending | 7002 with `VerifyClientCertIfGiven` + route-walk test | New port 7003 on server nodes only, server cert, no client auth |
+| 7002 client-cert mode | Required | "If given"; every handler keeps `authorizePeerRequest` | Required (unchanged) |
+| Workers relay joins | Yes (non-server roles), 421 for server role | Yes | No: join is served only by servers |
+| Firewall ports | 7000-7002 | 7000-7002 | 7000-7003 (7003 to servers only) |
+| E2 enterprise default, E3 ttl-0 custody, E4 timeout, E5 install.sh path | pending | pending | pending |
+
+Question D3:
+D3 — E1: Should joins listen on the existing port 7002, or on their own port on servers only?
+Project/branch/task: eng review of plans/kubectl-style-cluster-ops.md on plans/kubectl-style-ops-ceo-review (PR #988).
+ELI10: Port 7002 is the nodes' private channel; today every connection must show a node certificate (`internal/cluster/tls.go:299`). A machine that is joining has no certificate yet. Either 7002 relaxes to "show one if you have one" and every route checks again, or joins get their own port that only servers open, and 7002 stays strict.
+Stakes if we pick wrong: one missed check on a relaxed 7002 opens a node-to-node route to the internet; an extra port is one more firewall rule to get right.
+Recommendation: B) A separate join port because 7002 stays strict by construction, and workers no longer relay joins, which removes the relay and its 421 rule.
+Note: options differ in kind, not coverage — no completeness score.
+Pros / cons: see each option.
+Net: no new firewall rule versus a private channel that can't be weakened by a missed check.
+Header: E1 port
+Options:
+A) Keep 7002, relax it
+7002 accepts connections without a cert; every handler keeps `authorizePeerRequest`; a test walks every route (human: ~2 days / CC: ~30 min; risk medium). ✅ No new port, so no firewall, Terraform or docs change. ✅ Workers can take join calls and relay them. ❌ The private channel's safety now rests on every future handler remembering its check.
+B) Separate join port (recommended)
+Port 7003 on server nodes only, server cert, no client auth, three join paths; 7002 unchanged (human: ~2 days / CC: ~30 min; risk low). ✅ 7002 stays strict by construction; no handler can forget a check. ✅ Workers never see join traffic, so the relay, its dial-back and the 421 rule go away. ❌ One more port to open to servers (Terraform, docs, preflight).
+
+State: approved
+Actual answer: B) Separate join port (D3 answer 2026-11-07: "Separate join port")
+Accepted scope: port 7003 on server nodes only, server cert, no client auth, the three join paths; 7002 unchanged; no worker relay, dial-back or 421 rule; preflight, docs and Terraform open 7003 to servers.
+History: Q1 in §14 recommended 7002 before this review.
+
+### E2: Remote upgrade default in enterprise mode (plan Q6)
+Finding: Section 1, INFORMATIONAL, confidence 8/10, `internal/config/config.go:129-132` (`EnterpriseMode` … `SB_ENTERPRISE_MODE`); reviewer: Claude (plan-eng-review).
+Plan baseline: D15 remote upgrade on by default; Q6 open, plan recommendation "off by default in enterprise mode".
+Runtime evidence: `SB_ENTERPRISE_MODE` already turns on a fail-fast production profile (`config.go:129-131`).
+Comparison grid:
+
+| Choice | Current | A | B |
+|---|---|---|---|
+| E2 remote upgrade default, enterprise mode | On (D15), pending | Off; turn on with `SB_REMOTE_UPGRADE=true` | On, like everywhere else |
+| Remote upgrade default, other installs | On (D15) | On (unchanged) | On (unchanged) |
+| Off behavior | `manual` nodes (§6.3) | Same | Same |
+| E1, E3, E4, E5 | pending | pending | pending |
+
+Question D4:
+D4 — E2: Should enterprise mode turn remote upgrade off by default?
+Project/branch/task: eng review of plans/kubectl-style-cluster-ops.md on plans/kubectl-style-ops-ceo-review (PR #988).
+ELI10: Remote upgrade lets an admin token install a new binary on every node. The plan has it on by default (D15). Enterprise mode (`SB_ENTERPRISE_MODE`, `internal/config/config.go:129-132`) is the strict production profile banks use. Off by default there means a bank must opt in; nodes that stay off are upgraded by hand, one command each, and the rollout waits for them.
+Stakes if we pick wrong: on by default gives a stolen admin token a path to every bank node; off by default makes bank upgrades slower.
+Recommendation: A) Off in enterprise mode because enterprise mode already means "fail safe by default", and opting in is one setting.
+Note: options differ in kind, not coverage — no completeness score.
+Pros / cons: see each option.
+Net: a safer bank default versus one-command upgrades everywhere.
+Header: E2 enterprise
+Options:
+A) Off in enterprise mode (recommended)
+`SB_ENTERPRISE_MODE=true` sets `SB_REMOTE_UPGRADE=false` unless it is set explicitly (human: ~2h / CC: ~10 min; risk low). ✅ A stolen admin token can't push binaries to bank nodes unless the bank opted in. ✅ Matches enterprise mode's existing fail-safe profile. ❌ Bank operators run `sandboxd upgrade node` on each node unless they opt in.
+B) On everywhere
+Keep D15 as written (human: 0 / CC: 0; risk medium). ✅ One-command upgrades for every install, banks included. ✅ No special case to document or test. ❌ An admin token can replace binaries on every bank node by default.
+
+State: approved
+Actual answer: A) Off in enterprise mode (D4 answer 2026-11-07: "Off in enterprise mode")
+Accepted scope: `SB_ENTERPRISE_MODE=true` sets `SB_REMOTE_UPGRADE=false` unless it is set explicitly; other installs keep D15's default.
+History: Q6 in §14 recommended off in enterprise mode before this review.
+
+### E3: Never-expiring worker tokens and key custody (plan Q8)
+Finding: Section 1, INFORMATIONAL, confidence 7/10, plan §8 ("a worker's join answer carries the gossip key and the credential bundle"); reviewer: Claude (plan-eng-review).
+Plan baseline: CEO D13 allows `--ttl 0` for worker and ingress tokens; Q8 open.
+Runtime evidence: today every joiner gets the credential bundle (`scripts/cluster-join.sh` with `--cred-bundle`); wrapped custody exists (`sandboxd key wrap`).
+Comparison grid:
+
+| Choice | Current | A | B | C |
+|---|---|---|---|---|
+| E3 `--ttl 0` allowed with plain custody | Yes (D13), pending | Yes, except in enterprise mode | No, anywhere | Yes (document only) |
+| `--ttl 0` with wrapped custody | Yes | Yes | Yes | Yes |
+| CEO D13 rule (servers ≤ 24 h) | Kept | Kept | Kept | Kept |
+| E1, E2, E4, E5 | pending | pending | pending | pending |
+
+Question D5:
+D5 — E3: Should never-expiring worker tokens need wrapped key custody?
+Project/branch/task: eng review of plans/kubectl-style-cluster-ops.md on plans/kubectl-style-ops-ceo-review (PR #988).
+ELI10: You allowed worker and ingress tokens that never expire (CEO D13). A worker's join answer includes the cluster's credential bundle. With plain custody, that bundle can decrypt stored secrets; with wrapped custody (KMS, Vault or an HSM), it can't by itself. So a leaked never-expiring token is much worse with plain custody.
+Stakes if we pick wrong: allow it with plain custody and a leaked Terraform variable can expose stored secrets; forbid it everywhere and small installs without a KMS lose autoscaling.
+Recommendation: A) Require wrapped custody in enterprise mode only because banks already run wrapped custody, and small installs keep autoscaling.
+Note: options differ in kind, not coverage — no completeness score.
+Pros / cons: see each option.
+Net: secret safety for banks versus autoscaling for everyone.
+Header: E3 ttl-0
+Options:
+A) Wrapped custody in enterprise mode (recommended)
+In enterprise mode, `--ttl 0` is refused unless credential custody is wrapped; elsewhere it is allowed with a warning (human: ~1 day / CC: ~20 min; risk low). ✅ A leaked bank token can't decrypt stored secrets. ✅ Small installs without a KMS keep autoscaling. ❌ Non-enterprise installs keep the leak risk, shown only as a warning.
+B) Wrapped custody everywhere
+`--ttl 0` is refused unless custody is wrapped (human: ~1 day / CC: ~20 min; risk low). ✅ No install hands out a never-expiring token that can decrypt secrets. ✅ One rule, nothing mode-specific. ❌ Installs without KMS, Vault or an HSM can't use autoscaling tokens.
+C) Allow it, document the risk
+Keep CEO D13 as is, with §8's note (human: 0 / CC: 0; risk medium). ✅ Autoscaling works everywhere with no setup. ✅ No new rule. ❌ A leaked never-expiring token with plain custody can decrypt stored secrets anywhere, banks included.
+
+State: approved
+Actual answer: A) Wrapped custody in enterprise mode (D5 answer 2026-11-07: "Wrapped custody in enterprise mode")
+Accepted scope: in enterprise mode, `--ttl 0` join tokens are refused unless credential custody is wrapped; elsewhere they are allowed and `join-command` prints a warning; CEO D13's server rule (at most 24 hours) unchanged.
+History: Q8 in §14, raised in CEO review spec round 3.
+
+### E4: Per-node rollout health timeout
+Finding: Section 1, INFORMATIONAL, confidence 7/10, plan §6.6 ("Per-node health timeout. Not chosen yet."); reviewer: Claude (plan-eng-review).
+Plan baseline: open, suggested 10 minutes with a flag.
+Runtime evidence: sandboxd's unit allows `TimeoutStartSec=60` (`scripts/install.sh:1860`); `/health` wait in the Ansible playbook is 30 tries (`Ansible/playbooks/update-sandboxd.yml:138-146`).
+Comparison grid:
+
+| Choice | Current | A | B | C |
+|---|---|---|---|---|
+| E4 per-node health timeout | None, pending | 10 min, `--node-timeout` | 5 min, `--node-timeout` | None: wait, `status` shows the node |
+| On timeout | — | Node `failed`, rollout `failed` | Same | — |
+| E1, E2, E3, E5 | pending | pending | pending | pending |
+
+Question D6:
+D6 — E4: How long should the rollout wait for one node to come back healthy?
+Project/branch/task: eng review of plans/kubectl-style-cluster-ops.md on plans/kubectl-style-ops-ceo-review (PR #988).
+ELI10: After a node restarts on the new version, the leader waits for it to pass the health check before moving on. The plan never says how long. Without a limit, one stuck node holds the rollout forever. sandboxd's own service unit gives it 60 seconds to start (`scripts/install.sh:1860`), but a node with many sandboxes can take longer to adopt them all.
+Stakes if we pick wrong: too short fails healthy but slow nodes; no limit lets one stuck node stall the whole fleet.
+Recommendation: A) 10 minutes because it is ten times the unit's start limit, leaves room for slow adoption, and still fails a stuck node in minutes.
+Note: options differ in kind, not coverage — no completeness score.
+Pros / cons: see each option.
+Net: patience for slow nodes versus a fast failure signal.
+Header: E4 timeout
+Options:
+A) 10 minutes (recommended)
+Default 10 min, set with `--node-timeout`; on timeout the node is `failed` and the rollout stops (human: ~2h / CC: ~10 min; risk low). ✅ Slow nodes that adopt many sandboxes still pass. ✅ A stuck node fails the rollout within minutes, not never. ❌ A truly stuck node holds its batch for up to 10 minutes.
+B) 5 minutes
+Default 5 min, set with `--node-timeout` (human: ~2h / CC: ~10 min; risk medium). ✅ Faster failure signal on stuck nodes. ✅ Still five times the unit's start limit. ❌ Busy nodes adopting many sandboxes may fail and stop the rollout.
+C) No timeout
+Wait as long as it takes; `status` shows the node `upgrading` (human: 0 / CC: 0; risk high). ✅ Never fails a slow but healthy node. ✅ Nothing to tune. ❌ One stuck node stalls the rollout until a person notices.
+
+State: approved
+Actual answer: A) 10 minutes (D6 answer 2026-11-07: "10 minutes")
+Accepted scope: per-node health timeout default 10 minutes, set with `--node-timeout`; on timeout the node is `failed` and the rollout stops.
+History: suggested in CEO review Section 2.
+
+### E5: One way to replace binaries
+Finding: Section 1, INFORMATIONAL, confidence 7/10, `scripts/install.sh:1344` (`install -m 0755 "$tmp_dir/$sandboxd_asset" "$INSTALL_PREFIX/sandboxd"`); reviewer: Claude (plan-eng-review).
+Plan baseline: after Phase 3a, `install.sh` still replaces binaries itself; `sandboxd upgrade node` keeps backups, `*.prev` and the VM move (§6.3).
+Runtime evidence: `install.sh` overwrites the binary and keeps no copy (`install.sh:1344`).
+Comparison grid:
+
+| Choice | Current | A | B |
+|---|---|---|---|
+| E5 `install.sh` re-run on a node that already has `sandboxd upgrade node` | Overwrites binaries itself | Hands the new binaries to `sandboxd upgrade node` | Unchanged |
+| First install, and nodes older than Phase 3a | `install.sh` installs | Unchanged | Unchanged |
+| E1, E2, E3, E4 | pending | pending | pending |
+
+Question D7:
+D7 — E5: Should a re-run of install.sh hand binary replacement to the safe upgrader?
+Project/branch/task: eng review of plans/kubectl-style-cluster-ops.md on plans/kubectl-style-ops-ceo-review (PR #988).
+ELI10: After Phase 3a, there are two ways to swap binaries on a node: `sandboxd upgrade node` (keeps a backup, the old files and running VMs) and re-running `install.sh`, which just overwrites the file (`scripts/install.sh:1344`). Operators will keep re-running `install.sh`, because today's docs say to.
+Stakes if we pick wrong: keep two paths and an operator who follows old docs skips the backup and rollback with no warning.
+Recommendation: A) Hand off because it leaves one safe path for replacing binaries, and the old habit still works.
+Note: options differ in kind, not coverage — no completeness score.
+Pros / cons: see each option.
+Net: one safe swap path versus a simpler installer.
+Header: E5 one path
+Options:
+A) Hand off to the upgrader (recommended)
+When the installed `sandboxd` has `upgrade node`, `install.sh` downloads and checks the files, then runs `sandboxd upgrade node` with them (human: ~1 day / CC: ~20 min; risk low). ✅ Every binary swap keeps the backup, `*.prev` and running VMs. ✅ Operators who follow old docs get the safe path for free. ❌ `install.sh` gains a branch that depends on the installed version.
+B) Keep two paths
+`install.sh` keeps overwriting binaries itself (human: 0 / CC: 0; risk medium). ✅ No change to the installer. ✅ The installer stays independent of the daemon. ❌ A re-run skips the backup and rollback, and old docs keep sending people there.
+
+State: approved
+Actual answer: A) Hand off to the upgrader (D7 answer 2026-11-07: "Hand off to the upgrader")
+Accepted scope: when the installed `sandboxd` has `upgrade node`, `install.sh` downloads and checks the files, then runs `sandboxd upgrade node` with them; first installs and nodes older than Phase 3a keep today's path.
+History: none.
+
+## Section 2 (eng): Code quality
+
+- [INFORMATIONAL] (confidence: 9/10) `go.mod:49` (`golang.org/x/time v0.16.0`),
+  `internal/egress/dnsfilter/filter.go` (`rate.NewLimiter`): the copy rate
+  cap (CEO D15) reuses `golang.org/x/time/rate`; no new limiter.
+- [INFORMATIONAL] (confidence: 8/10) §6.3: four entry points start a node
+  upgrade (the leader's node route, the single-node route, `sandboxd upgrade
+  node` by hand, and the `install.sh` hand-off from eng D7). All four only
+  launch `sandboxd upgrade node`; the steps live in that one command. Proposed
+  callers, from §6.1, §6.3 and §7.
+- [INFORMATIONAL] (confidence: 7/10) §6.1: `--batch` accepts 1-100% or a
+  positive count; `0`, `0%` and over `100%` are usage errors (exit 2).
+- [CRITICAL] (confidence: 9/10) §3.2, §5: `aerolvm delete node` extended
+  `DELETE /v1/cluster/members/{id}` to workers, changing a soft-frozen `/v1`
+  status code (`.claude/skills/add-v1-endpoint/SKILL.md:8`: "Changing an
+  existing v1 response body, status code, header, or path → not fine").
+  Repaired: a new route, `DELETE /v1/cluster/nodes/{id}`; the old route
+  keeps its answers. Repo-rule compliance, so no question.
+
+## Section 3 (eng): Tests
+
+Framework: Go (`make test`, offline) plus the per-SDK suites in CLAUDE.md;
+live checks behind the `integration` build tag. Every path below is
+proposed code, so "PLANNED" means a test named in §10, and GAP means a
+test this review added to §10 (required proof of an approved behavior).
+
+```
+CODE PATHS                                         USER FLOWS
+[+] join (internal/cluster, :7003 on servers)      [+] Add a machine with one line
+  ├── cluster-info HMAC ok / wrong token  [PLANNED]   ├── [PLANNED →E2E] cluster-join-token scenario
+  ├── one Raft op: token + node-ID reserve [PLANNED]  ├── [PLANNED →E2E] adopt a scripted cluster (§4.4)
+  ├── 7003 absent on workers, 7002 strict  [PLANNED]  └── [GAP→added] join refused for a stale build
+  └── enterprise: ttl-0 needs wrapped      [GAP→added]
+[+] renew-cert ticker                [PLANNED]     [+] Upgrade a fleet
+[+] deny records + AliveDelegate     [PLANNED]        ├── [PLANNED →E2E] 3b gate: two local builds
+[+] rollout controller (leader)                       ├── [PLANNED] pause / resume / stop / rollback
+  ├── transitions table (pure func)  [PLANNED]        ├── [GAP→added] --node-timeout fires → failed
+  ├── fencing: leader, term, record  [PLANNED]        └── [PLANNED] down node skipped, caught up
+  ├── quorum check for servers       [PLANNED]
+  └── batch parsing 10%, 0%, 150%    [GAP→added]   [+] Operator CLI
+[+] sandboxd upgrade node                             ├── [PLANNED] old verbs print the same output
+  ├── stage: disk, hash, systemd-run [PLANNED]        ├── [GAP→added] older CLI login keeps contexts.json
+  ├── swap order + boot recovery     [PLANNED]        └── [GAP→added] delete node: new route; old
+  ├── migrate fail → restore only    [PLANNED]             DELETE /v1/cluster/members/{worker} still 404
+  └── install.sh hand-off (eng D7)   [GAP→added]
+[+] enterprise defaults (eng D4)     [GAP→added]
+[+] pkg/release round trip           [GAP→added]
+
+COVERAGE (planned): 27/27 paths have a planned or added test | GAPS added: 9
+```
+
+Regression contracts carried forward (no new question needed; each keeps
+behavior the plan already promises): old `aerolvm` verbs, flags, output and
+exit codes; first-install path of `install.sh`; 7002 mTLS; single node
+with cluster mode off; `DELETE /v1/cluster/members/{id}` answers.
+
+Tests made obsolete by this plan: none yet. The bash cluster scripts'
+behavior moves into Go in Phase 2; their tests (if any) retire with them.
+
+## Section 4 (eng): Performance
+
+- [INFORMATIONAL] (confidence: 8/10) §4.3: the preflight dial-back and port
+  checks need timeouts; 3 seconds per port, so a blocked port fails fast
+  instead of hanging the join.
+- [INFORMATIONAL] (confidence: 8/10) §6.3 step 1, §7.1: downloads and copies
+  stream to disk with the SHA-256 computed as bytes arrive; no file is held
+  in memory (sandboxd is 77 MiB per release [measured: v0.6.11 assets]).
+- [INFORMATIONAL] (confidence: 5/10, medium confidence, verify) §6.3 step 5:
+  `VACUUM INTO` runs while sandboxd is stopped, so its time adds to each
+  node's downtime. `state.db` size on large nodes is unknown; measure it in
+  the Phase 3a live gate.
+- Sizes: deny records live until cert expiry (90 days); the rollout record
+  holds about 2,000 per-node entries of a few hundred bytes [estimated];
+  `GET /v1/cluster/members` is about 1.67 MB at 2,000 members [from the
+  fleet-scale measurement of 852 B per member]. No issue.
+
+### E6: Upgrading a cluster with one server (Codex eng finding 5)
+Finding: Outside voice (Codex, eng), High, confidence 9/10, `internal/cluster/raft.go:149` (`if cfg.BootstrapCluster {` … a one-server configuration); reviewer: Codex (gpt-6-astra), verified by Claude.
+Plan baseline: §6.2 restarts a server only while a majority stays up and hands off leadership first; §6.3 applies the same checks to `sandboxd upgrade node` on a server; no single-voter path.
+Runtime evidence: the repo bootstraps one-server clusters (`raft.go:149`); with one voter, no majority stays up during its restart and leadership can't move.
+Comparison grid:
+
+| Choice | Current | A | B |
+|---|---|---|---|
+| E6 one-voter cluster upgrade | Refused by the quorum check (no path) | Allowed with `--allow-downtime`; `upgrade plan` warns the API is down during the server's restart; the server goes last and resumes the rollout from Raft after it starts | Refused; `aerolvm upgrade` says to add servers first or run `sandboxd upgrade node` by hand |
+| Quorum check for clusters with 2+ voters | §6.2 (unchanged) | Unchanged | Unchanged |
+| Running sandboxes during the restart | Keep running (§6.4) | Same | Same |
+
+Question D8:
+D8 — E6: How should a cluster with only one server upgrade?
+Project/branch/task: eng review of plans/kubectl-style-cluster-ops.md on plans/kubectl-style-ops-ceo-review (PR #988).
+ELI10: The plan never restarts a server unless most servers stay up, and the leader hands off first. A cluster with a single server (the repo supports this, `internal/cluster/raft.go:149`) can never meet that rule, so it has no upgrade path at all. Codex found this. Either allow it with a short API outage the operator agrees to, or refuse and ask for more servers.
+Stakes if we pick wrong: refuse and small or test clusters can't use `aerolvm upgrade`; allow it silently and operators get a surprise outage.
+Recommendation: A) Allow with `--allow-downtime` because small clusters get one-command upgrades, and the outage is shown and agreed to up front.
+Note: options differ in kind, not coverage — no completeness score.
+Pros / cons: see each option.
+Net: one-command upgrades for small clusters versus no downtime path to build.
+Header: E6 one server
+Options:
+A) Allow with --allow-downtime (recommended)
+With one voter, `upgrade plan` warns the API is down for the server's restart; `apply` needs `--allow-downtime`; the server goes last and resumes the rollout from Raft after it starts (human: ~1 day / CC: ~30 min; risk low). ✅ Small and test clusters upgrade with one command like big ones. ✅ The outage is shown up front and needs an explicit flag. ❌ The API is down for about the restart time; sandboxes keep running.
+B) Refuse, ask for more servers
+`aerolvm upgrade` refuses on one voter and says to add servers or run `sandboxd upgrade node` by hand (human: ~2h / CC: ~10 min; risk low). ✅ No downtime path to build or test. ✅ The quorum rule stays absolute. ❌ Small and test clusters can't use `aerolvm upgrade` at all.
+
+State: approved
+Actual answer: A) Allow with --allow-downtime (D8 answer 2026-11-07: "Allow with --allow-downtime")
+Accepted scope: with one voter, `upgrade plan` warns the API is down for the server's restart; `apply` needs `--allow-downtime`; the server goes last and resumes the rollout from Raft after it starts.
+History: none.
+
+## Outside voice (eng): Codex findings and dispositions
+
+| # | Finding | Severity | Disposition |
+|---|---|---|---|
+| 1 | Worker tokens don't bind the role; a worker can gossip `server` (`voter_autojoin.go:320-323`) | High | Repaired: role in the cert and admission record; voter auto-join uses the admitted role (§4) |
+| 2 | Upgrades can set off dead-owner failover after 30 s (`dead_owner.go:110-112`) | High | Repaired: `upgrading` state with a `--node-timeout` deadline; the dead-owner loop skips it (§6.2) |
+| 3 | Mount helpers die with sandboxd (`pkg/mounts/process.go:110-114`) | High | Repaired: helpers in an `aerolvm-mounts` cgroup, adopted at boot; Phase 3a proves it (§6.3, §6.4) |
+| 4 | Finalize turns features on before one-way migrations finish | High | Repaired: `finalizing` then `finalized`; per-node feature gating; new rollouts wait (§6.5, §6.6) |
+| 5 | One-server clusters have no upgrade path (`raft.go:149`) | High | Decided: eng D8, allow with `--allow-downtime` |
+| 6 | Servers don't cache CPU types they don't run | Medium | Repaired: servers cache every CPU type in the rollout (§6.3) |
+
+Approval readiness: PASS. Checked rows and answers: E1 (D3), E2 (D4), E3 (D5), E4 (D6), E5 (D7), E6 (D8). D1 (structure) and D2 (CEO plan) are setup answers, not remedies. Repairs without a question: the `/v1` route fix (repo rule, Section 2), build details in Sections 1, 2 and 4, and Codex eng findings 1, 2, 3, 4 and 6, each of which makes a promise the plan already makes true.
+
+## Eng review outputs
+
+### NOT in scope (eng)
+
+Nothing new was deferred in this review. The CEO review's list stands (Part
+5, "NOT in scope"): `apply -f` and the shared manifest (CEO D3), external-CA
+mode (CEO D4), and the out-of-scope items in §12.
+
+### What already exists (eng additions)
+
+| Need | Existing code | Reused? |
+|---|---|---|
+| Copy rate cap | `golang.org/x/time/rate` (`go.mod:49`), used in `internal/egress/dnsfilter/filter.go` | Yes |
+| Leader check for workers | read-index route, `internal/cluster/catch_up.go:64` | Yes |
+| Voter eligibility by role | `peerForcedNonVoter`, `internal/cluster/voter_autojoin.go:320-323` | Changed to use the admitted role |
+| Dead-owner grace | `internal/cluster/dead_owner.go:110-112` | Extended: skips `upgrading` nodes |
+| Mount helper processes | `pkg/mounts/process.go:110-114` | Changed: own cgroup, adopted at boot |
+| Enterprise profile | `SB_ENTERPRISE_MODE`, `internal/config/config.go:129-132` | Yes, for eng D4 and D5 |
+
+### Diagrams (eng)
+
+```
+ Join (eng D3):  new machine ─► server:7003 (no client cert; 3 paths) ─► Raft op ─► sign
+                 workers: no 7003 · 7002: client cert always required
+
+ Finalize (Codex eng 4):  done ─finalize─► finalizing (version committed; each node runs
+                          one-way migrations, then reports) ─all reported─► finalized
+                          schema features turn on per node after its migrations
+
+ Upgrade vs failover (Codex eng 2):  leader writes node=upgrading(deadline=--node-timeout)
+                          ─► node restarts ─► dead-owner loop skips it until the deadline
+```
+
+### Failure modes (eng)
+
+| New path | Realistic failure | Handled? | Test? | User sees |
+|---|---|---|---|---|
+| Join on 7003 | Firewall blocks 7003 | Yes: preflight names it | Yes | "open TCP 7003 to servers" |
+| Role binding | Worker gossips `server` | Yes: admitted role wins | Yes | Node stays a worker |
+| Upgrading state | Restart longer than 30 s | Yes: dead-owner skips until deadline | Yes | No failover; status shows `upgrading` |
+| Mount helpers | sandboxd restart | Yes: own cgroup, adopted | Yes (live, Phase 3a) | Mounts keep working |
+| Finalizing | One node's migration fails | Yes: node cordoned, `failed` in status | Yes | Status names the node |
+| One-server upgrade | API down during restart | Yes: `--allow-downtime` required, warned | Yes | Planned outage message |
+| Mixed CPU types | No arm64 files on amd64 servers | Yes: servers cache all types | Yes | Staging succeeds |
+
+No critical gaps: every row has handling, a test and a visible result.
+
+### Worktree parallelization strategy
+
+| Step | Modules touched | Depends on |
+|------|----------------|------------|
+| Phase 0 quick fixes | `scripts/`, `cmd/sandboxd/`, `.github/workflows/`, `Ansible/`, `docs/` | — |
+| Phase 1 node verbs | `cmd/aerolvm/`, `pkg/api/v1/`, `internal/cluster/` (gossip, members) | — |
+| Phase 2 join | `internal/cluster/` (join, tokens, deny, renew), `cmd/sandboxd/` | Phase 1 (`internal/cluster/`) |
+| Phase 3a node upgrader | `cmd/sandboxd/`, `internal/store/`, `pkg/release/`, `pkg/mounts/`, `scripts/` | Phase 0 |
+| Phase 3b rollouts | `internal/cluster/` (rollout), `pkg/api/v1/`, `cmd/aerolvm/` | Phase 2, Phase 3a |
+| Phase 4 kubectl polish | `cmd/aerolvm/` | Phase 1 |
+| Phase 5 retire repo-only paths | `Terraform/`, `Ansible/`, `cmd/sandboxd/` | Phase 2, Phase 3b |
+
+Parallel lanes: Lane A: Phase 0 → Phase 3a. Lane B: Phase 1 → Phase 2 (shared
+`internal/cluster/`). Lane C: Phase 4 (after Phase 1 merges; `cmd/aerolvm/`).
+Execution order: launch A and B. Start C when Phase 1 merges. Phase 3b
+waits for A and B. Phase 5 last.
+Conflict flags: `internal/cluster/` (Phases 1, 2, 3b) runs in sequence;
+`cmd/sandboxd/` (Phases 0, 2, 3a) and `cmd/aerolvm/` (Phases 1, 3b, 4) need
+rebases between lanes.
+
+## Implementation Tasks
+Synthesized from this review's findings. Each task derives from a specific
+finding above. Run with Claude Code or Codex; checkbox as you ship.
+Effort ratios assumed: features ~30x, bug fix with regression ~20x,
+architecture ~5x.
+
+- [ ] **T1 (P1, human: ~2d / CC: ~30min)** — cluster — Join listener on port 7003, servers only; 7002 unchanged
+  - Surfaced by: Section 1 — E1, D3
+  - Files: `internal/cluster/internal_server.go`, `internal/cluster/tls.go`, `Terraform/network.tf`
+  - Verify: test: 7002 refuses no-cert connections; workers have no 7003 listener
+- [ ] **T2 (P1, human: ~2h / CC: ~10min)** — config — Enterprise mode turns remote upgrade off unless `SB_REMOTE_UPGRADE=true`
+  - Surfaced by: Section 1 — E2, D4
+  - Files: `internal/config/config.go`
+  - Verify: config table test for both settings
+- [ ] **T3 (P1, human: ~1d / CC: ~20min)** — cluster PKI — `--ttl 0` refused in enterprise mode without wrapped custody; warning elsewhere
+  - Surfaced by: Section 1 — E3, D5
+  - Files: `internal/cluster/` (join tokens), `cmd/aerolvm/`
+  - Verify: table test across mode and custody
+- [ ] **T4 (P1, human: ~2h / CC: ~10min)** — rollout — `--node-timeout`, default 10 minutes
+  - Surfaced by: Section 1 — E4, D6
+  - Files: `internal/cluster/` (rollout), `cmd/aerolvm/`
+  - Verify: fake-clock test: timeout fails the node and the rollout
+- [ ] **T5 (P1, human: ~1d / CC: ~20min)** — installer — `install.sh` hands binary swaps to `sandboxd upgrade node` when present
+  - Surfaced by: Section 1 — E5, D7
+  - Files: `scripts/install.sh`
+  - Verify: install test: re-run calls the upgrader; first install unchanged
+- [ ] **T6 (P1, human: ~1d / CC: ~30min)** — rollout — One-server upgrade with `--allow-downtime`
+  - Surfaced by: Outside voice (eng) — Codex 5, D8
+  - Files: `internal/cluster/` (rollout), `cmd/aerolvm/`
+  - Verify: test: refused without the flag; resumes after the server's own restart
+- [ ] **T7 (P1, human: ~1d / CC: ~20min)** — API — `DELETE /v1/cluster/nodes/{id}`; members route unchanged
+  - Surfaced by: Section 2 — soft-frozen `/v1` (CRITICAL, repaired)
+  - Files: `pkg/api/v1/routes.go`, `pkg/api/v1/cluster_handler.go`
+  - Verify: test: worker removed by the new route; old route still 404 for a worker
+- [ ] **T8 (P1, human: ~2d / CC: ~30min)** — cluster — Role in the cert and admission record; voter auto-join uses it
+  - Surfaced by: Outside voice (eng) — Codex 1
+  - Files: `internal/cluster/voter_autojoin.go`, `internal/cluster/tls.go`
+  - Verify: regression test: a worker gossiping `server` never becomes a voter
+- [ ] **T9 (P1, human: ~1d / CC: ~20min)** — cluster — `upgrading` state skips the dead-owner loop until its deadline
+  - Surfaced by: Outside voice (eng) — Codex 2
+  - Files: `internal/cluster/dead_owner.go`
+  - Verify: test: restart longer than the grace sets off no failover
+- [ ] **T10 (P1, human: ~2d / CC: ~45min)** — mounts — Helpers in an `aerolvm-mounts` cgroup, adopted at boot
+  - Surfaced by: Outside voice (eng) — Codex 3
+  - Files: `pkg/mounts/process.go`, `pkg/mounts/`
+  - Verify: Phase 3a live gate: reads and writes keep working across a restart
+- [ ] **T11 (P1, human: ~3d / CC: ~1h)** — store/cluster — `finalizing` then `finalized`; per-node schema feature gating
+  - Surfaced by: Outside voice (eng) — Codex 4
+  - Files: `internal/store/store.go`, `internal/cluster/` (rollout)
+  - Verify: tests: delayed and failed migrations under concurrent requests
+- [ ] **T12 (P2, human: ~1d / CC: ~20min)** — upgrade files — Servers cache every CPU type in the rollout
+  - Surfaced by: Outside voice (eng) — Codex 6
+  - Files: `internal/cluster/` (file route)
+  - Verify: test: amd64 servers serve arm64 files
+- [ ] **T13 (P2, human: ~1d / CC: ~20min)** — release — `pkg/release` type; `release.json` generated in `release.yml`
+  - Surfaced by: Section 1 — information leakage / hand-synced list
+  - Files: `pkg/release/` (new), `.github/workflows/release.yml`
+  - Verify: round-trip test; workflow output equals the Go type
+- [ ] **T14 (P2, human: ~4h / CC: ~15min)** — preflight/upgrader — 3-second port timeouts; streamed, hashed downloads
+  - Surfaced by: Section 4
+  - Files: `cmd/sandboxd/`
+  - Verify: tests: blocked port fails in about 3 s; memory stays flat on a 77 MiB download
+- [ ] **T15 (P3, human: ~2h / CC: ~10min)** — measurement — Measure `VACUUM INTO` time on a large `state.db` in the Phase 3a gate
+  - Surfaced by: Section 4 (medium confidence)
+  - Files: `integration-tests/upgrade-gate.sh`
+  - Verify: the gate report prints the backup time
+
+### Unresolved decisions (eng)
+
+None. Every question in this review was answered (D1-D8).
+
+### Completion summary (eng)
+
+- Step 0: Scope Challenge — scope accepted as-is
+- Reality rows: 7/7 applicable rows emitted (`PLAN_REALITY: phase=eng rows=7/7 verdict=complete`), 3 unverified premises
+- Architecture Review: 3 issues found, plus 4 open items decided (D3-D6) and E5 (D7)
+- Code Quality Review: 4 issues found (1 critical, repaired)
+- Test Review: diagram produced, 9 gaps identified (tests added to §10)
+- Performance Review: 3 issues found
+- NOT in scope: written
+- What already exists: written
+- TODOS.md updates: 0 items proposed to user
+- Failure modes: 0 critical gaps flagged
+- Unresolved decisions: 0 in this review
+- Outside voice: codex (gpt-6-astra), completed, 6 findings: 5 repaired, 1 decided (D8)
+- Parallelization: 3 lanes, 2 parallel at start / Phase 3b and Phase 5 sequential
+- Lake Score: N/A (no answers scored for completeness)
+
 ## GSTACK REVIEW REPORT
 
 | Review | Trigger | Why | Runs | Status | Findings |
 |--------|---------|-----|------|--------|----------|
 | CEO Review | `/plan-ceo-review` | Scope & strategy | 1 | ISSUES OPEN | 4 proposals, 4 accepted, 2 deferred |
-| Outside Review | codex (`/plan-ceo-review` outside voice) | Independent 2nd opinion | 1 | completed | 8 findings; 8 resolved (7 repaired, 1 decided in CEO D16); 0 unresolved |
-| Eng Review | `/plan-eng-review` | Architecture & tests (required) | 0 | — | — |
+| Outside Review | codex (outside voice in `/plan-ceo-review` and `/plan-eng-review`) | Independent 2nd opinion | 2 | completed | 14 findings; 14 resolved (12 repaired, 2 decided: CEO D16, eng D8); 0 unresolved |
+| Eng Review | `/plan-eng-review` | Architecture & tests (required) | 1 | CLEAR | 14 issues, 0 critical gaps |
 | Design Review | `/plan-design-review` | UI/UX gaps | 0 | — | — |
 | DX Review | `/plan-devex-review` | Developer experience gaps | 0 | — | — |
 
-- **OUTSIDE COVERAGE:** codex (gpt-6-astra, plan-review tier), plan-review phase, completed, 8 findings (7 High, 1 Medium), all resolved.
-- **CROSS-MODEL:** the native review (Claude, this skill) and Codex both put the upgrade path at the center of the risk. Codex showed one native repair was wrong (the database restore boundary) and found five gaps the native review missed: unfenced upgrade commands, `host apply` breaking the upgrade, no adoption path for existing clusters, node-ID reuse undoing revocation, and obsolete servers rejoining Raft. The native review found the batch size, dead-node, file-serving and Raft-heartbeat issues that Codex did not raise.
-- **VERDICT:** no review is CLEAR yet; eng review required.
+- **OUTSIDE COVERAGE:** codex (gpt-6-astra), plan-review phase, two completed runs: CEO pass 8 findings (7 repaired, 1 decided), eng pass 6 findings (5 repaired, 1 decided).
+- **CROSS-MODEL:** Claude's eng review and Codex agree the upgrade path and node admission carry the risk. Codex's eng pass found five problems the native review missed (role not bound to the token, failover during upgrades, mount helpers killed on restart, finalize turning features on before migrations, one-server clusters with no path). The native review found the soft-frozen `/v1` route change and the four open items that Codex did not raise.
+- **VERDICT:** ENG CLEARED — ready to implement. The CEO review's open items were all decided in this eng review (D3-D6).
 
 **UNRESOLVED DECISIONS:**
-- Q1: join on port 7002 behind the allowlist, or on its own port (eng review)
-- Q6: enterprise-mode default for remote upgrade (eng review)
-- Q8: whether `--ttl 0` worker tokens require wrapped credential custody (eng review)
-- Per-node health timeout for rollouts, suggested 10 minutes (eng review)
+- + 4 unresolved from prior reviews (the CEO review logged Q1, Q6, Q8 and the rollout timeout as open; this eng review decided all four as D3-D6)
