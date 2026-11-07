@@ -129,7 +129,9 @@ done
 step "4/6 record pre-upgrade state + confirm OLD schema on every node"
 declare -A PRE_SNAPS PRE_ALIASES
 for ip in "${IPS[@]}"; do
-  pk="$(on_node "$ip" "sudo sqlite3 $DB 'SELECT group_concat(name) FROM pragma_table_info(\"sandbox_snapshots\") WHERE pk>0;'")" || true
+  # group_concat follows column-definition order, and an outer ORDER BY sorts
+  # only the single result row, so key columns are ordered in a subquery.
+  pk="$(on_node "$ip" "sudo sqlite3 $DB 'SELECT group_concat(name) FROM (SELECT name FROM pragma_table_info(\"sandbox_snapshots\") WHERE pk>0 ORDER BY pk);'")" || true
   PRE_SNAPS[$ip]="$(on_node "$ip" "sudo sqlite3 $DB 'SELECT count(*) FROM sandbox_snapshots;'")"
   PRE_ALIASES[$ip]="$(on_node "$ip" "sudo sqlite3 $DB 'SELECT count(*) FROM snapshot_aliases;'")"
   echo "  $ip: pk=[$pk] snaps=${PRE_SNAPS[$ip]} aliases=${PRE_ALIASES[$ip]}"
@@ -249,7 +251,7 @@ wait_for_health "$BASE" "$TOKEN" || die "cluster not healthy after upgrade"
 
 step "6/6 verify migration preserved everything + schema rebuilt"
 for ip in "${IPS[@]}"; do
-  pk="$(on_node "$ip" "sudo sqlite3 $DB 'SELECT group_concat(name) FROM pragma_table_info(\"sandbox_snapshots\") WHERE pk>0 ORDER BY pk;'")"
+  pk="$(on_node "$ip" "sudo sqlite3 $DB 'SELECT group_concat(name) FROM (SELECT name FROM pragma_table_info(\"sandbox_snapshots\") WHERE pk>0 ORDER BY pk);'")"
   alias_owner="$(on_node "$ip" "sudo sqlite3 $DB 'SELECT count(*) FROM pragma_table_info(\"snapshot_aliases\") WHERE name=\"owner_ref\";'")"
   snaps="$(on_node "$ip" "sudo sqlite3 $DB 'SELECT count(*) FROM sandbox_snapshots;'")"
   aliases="$(on_node "$ip" "sudo sqlite3 $DB 'SELECT count(*) FROM snapshot_aliases;'")"
