@@ -19,7 +19,6 @@ import (
 
 	"github.com/aerol-ai/microvm/cmd/toolboxd/loginshell"
 	"github.com/aerol-ai/microvm/pkg/models"
-	"github.com/creack/pty"
 )
 
 // writeLoginRestore writes the PATH restore as the first line of a
@@ -298,7 +297,7 @@ func (m *Manager) Create(ctx context.Context, req models.CreateSessionRequest) (
 		var ptmx *os.File
 		wait, err := m.startProcess(cmd, func() error {
 			var err error
-			ptmx, err = pty.StartWithSize(cmd, &pty.Winsize{Cols: uint16(s.cols), Rows: uint16(s.rows)})
+			ptmx, err = StartPTY(cmd, uint16(s.cols), uint16(s.rows))
 			return err
 		})
 		if err != nil {
