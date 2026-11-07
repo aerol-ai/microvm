@@ -377,9 +377,7 @@ func TestExposeCallsOnOnePortDoNotInterleave(t *testing.T) {
 	if e := findExposure(sb, 3000); e == nil || e.TokenGated() || w.shape(3000) != "direct" {
 		t.Fatalf("after token then public: %+v, route %q", e, w.shape(3000))
 	}
-	svc.portLocksMu.Lock()
-	left := len(svc.portLocks)
-	svc.portLocksMu.Unlock()
+	left := svc.portLocks.keys()
 	if left != 0 {
 		t.Fatalf("%d port locks left after every call returned", left)
 	}

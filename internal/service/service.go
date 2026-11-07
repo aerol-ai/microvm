@@ -427,7 +427,7 @@ type Service struct {
 	// facade calls that each read the Lifecycle, patch one field and write the
 	// whole struct back race, and an automatic restart already inside the
 	// runtime start undoes a stop that succeeded (review 2 finding 9).
-	lifecycleLocks sandboxLocks
+	lifecycleLocks keyedLocks[string]
 	// programExitRotation and lifecycleRotation keep the lifecycle sweep's
 	// exit probes and its stops and deletes fair across passes
 	// (sweep_rotation.go; review 2 finding 11).
@@ -536,13 +536,13 @@ type Service struct {
 	// resizeLocks runs one resize of a sandbox at a time, from its read
 	// through the runtime change and the store write to the quota settle
 	// (ResizeSandbox). Resizes of different sandboxes still run together.
-	resizeLocks ctxKeyedLocks
+	resizeLocks keyedLocks[string]
 	// specLocks serializes this node's read-modify-writes of one sandbox's
 	// replicated spec (replicateSpecPatch, commitPolicySpec, a resize's quota
 	// write and its undo), so one writer cannot put back a field, such as the
 	// size a team is charged for, that another has just changed. A sandbox's
 	// mutations run on its owner, so one node's lock covers them.
-	specLocks ctxKeyedLocks
+	specLocks keyedLocks[string]
 	// identity is the cloud-identity issuer state: signing keys, the lazy
 	// bootstrap latch and in-flight token pushes (identity.go).
 	identity identityState
@@ -694,8 +694,7 @@ type Service struct {
 
 	// portLocks serializes expose and unexpose on one sandbox port
 	// (lockExposedPort). Entries live only while a call holds or waits.
-	portLocksMu sync.Mutex
-	portLocks   map[portLockKey]*portLock
+	portLocks keyedLocks[portLockKey]
 
 	// The locks every writer of one way into a port shares while it reads
 	// the port's gate from the store and writes from it, so no writer acts
@@ -3628,7 +3627,7 @@ func sandboxMatchesTags(sb *models.Sandbox, want map[string]string) bool {
 // same sandbox already in flight, and a stop that comes during it waits for
 // it in turn.
 func (s *Service) StartSandbox(ctx context.Context, id string) (*models.Sandbox, error) {
-	unlock, err := s.lifecycleLocks.lock(ctx, id)
+	unlock, err := s.lifecycleLocks.lockCtx(ctx, id)
 	if err != nil {
 		return nil, err
 	}
@@ -3885,7 +3884,7 @@ func (s *Service) StopSandbox(ctx context.Context, id string) (*models.Sandbox, 
 // or a restart on failure in flight cannot write the row back after the
 // delete (Upsert inserts a missing row).
 func (s *Service) DestroySandbox(ctx context.Context, id string) error {
-	unlock, err := s.lifecycleLocks.lock(ctx, id)
+	unlock, err := s.lifecycleLocks.lockCtx(ctx, id)
 	if err != nil {
 		return err
 	}
@@ -4839,7 +4838,11 @@ func snapshotImageIsOwnedTag(snapshot *models.SandboxSnapshot) bool {
 // too the hold stays at the larger size, so the team is never charged less
 // than the sandbox may hold.
 func (s *Service) ResizeSandbox(ctx context.Context, id string, req models.ResizeSandboxRequest) (*models.Sandbox, error) {
-	unlock, err := s.resizeLocks.lock(ctx, id)
+	// A caller that already left starts no resize, even on a free lock.
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	unlock, err := s.resizeLocks.lockCtx(ctx, id)
 	if err != nil {
 		return nil, err
 	}
@@ -5004,7 +5007,7 @@ func (s *Service) UpdateLifecycle(ctx context.Context, id string, l models.Lifec
 			return nil, fmt.Errorf("invalid lifecycle: %w", err)
 		}
 	}
-	unlock, err := s.lifecycleLocks.lock(ctx, id)
+	unlock, err := s.lifecycleLocks.lockCtx(ctx, id)
 	if err != nil {
 		return nil, err
 	}
@@ -7252,7 +7255,7 @@ func (s *Service) runLifecycleSweep(ctx context.Context) {
 // carries that exit, so it is not deleted for it (review 2 finding 10). A
 // row that is gone, or no longer due, is nothing to do.
 func (s *Service) runLifecycleAction(ctx context.Context, id string, now time.Time, globalIdle time.Duration, netstatsFallback bool) error {
-	unlock, err := s.lifecycleLocks.lock(ctx, id)
+	unlock, err := s.lifecycleLocks.lockCtx(ctx, id)
 	if err != nil {
 		return err
 	}

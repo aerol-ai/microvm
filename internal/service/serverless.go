@@ -191,7 +191,7 @@ func (s *Service) stopSandboxInternal(ctx context.Context, id string, mode stopM
 // the manual mode's no-wake rule. Both take the lifecycle boundary
 // (lifecycle_boundary.go).
 func (s *Service) stopSandboxForReason(ctx context.Context, id string, mode stopMode, reason string) (*models.Sandbox, error) {
-	unlock, err := s.lifecycleLocks.lock(ctx, id)
+	unlock, err := s.lifecycleLocks.lockCtx(ctx, id)
 	if err != nil {
 		return nil, err
 	}
@@ -716,7 +716,7 @@ func (s *Service) EnsureSandboxAwakeForHTTP(ctx context.Context, id string) (*mo
 // is no longer a stopped serverless sandbox, is returned as it is, as the
 // wake's first checks do.
 func (s *Service) wakeSandbox(ctx context.Context, id string) (*models.Sandbox, error) {
-	unlock, err := s.lifecycleLocks.lock(ctx, id)
+	unlock, err := s.lifecycleLocks.lockCtx(ctx, id)
 	if err != nil {
 		return nil, err
 	}

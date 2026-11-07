@@ -105,12 +105,7 @@ func waitForT(t *testing.T, what string, cond func() bool) {
 }
 
 func exposedPortRefs(svc *Service, id string, port int) int {
-	svc.portLocksMu.Lock()
-	defer svc.portLocksMu.Unlock()
-	if l := svc.portLocks[portLockKey{id: id, port: port}]; l != nil {
-		return l.refs
-	}
-	return 0
+	return svc.portLocks.refs(portLockKey{id: id, port: port})
 }
 
 // Every entry point that writes a port route from a row read earlier (start,

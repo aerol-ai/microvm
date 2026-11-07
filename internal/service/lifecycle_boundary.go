@@ -1,10 +1,5 @@
 package service
 
-import (
-	"context"
-	"sync"
-)
-
 // The lifecycle boundary (review 2 finding 9). Every change to whether one
 // sandbox runs happens under one per-sandbox lock, Service.lifecycleLocks:
 //
@@ -39,63 +34,4 @@ import (
 // their sandbox's own event queue (event_queues.go), so a sandbox held by a
 // long step never holds up another sandbox's events. Waiting honours ctx, so
 // a caller that gives up stops waiting.
-type sandboxLocks struct {
-	mu    sync.Mutex
-	locks map[string]*sandboxLock
-}
-
-// sandboxLock is one sandbox's lock: holding it is having the one token in
-// held. refs counts the callers holding or waiting for it; the last one out
-// removes the map entry, so the map only holds sandboxes with a step in
-// flight.
-type sandboxLock struct {
-	held chan struct{}
-	refs int
-}
-
-// lock takes id's lock and returns its unlock. A lock that is free is taken
-// even when ctx is already done, as before; waiting for a held one ends with
-// ctx's error.
-func (l *sandboxLocks) lock(ctx context.Context, id string) (func(), error) {
-	l.mu.Lock()
-	if l.locks == nil {
-		l.locks = make(map[string]*sandboxLock)
-	}
-	e := l.locks[id]
-	if e == nil {
-		e = &sandboxLock{held: make(chan struct{}, 1)}
-		l.locks[id] = e
-	}
-	e.refs++
-	l.mu.Unlock()
-
-	select {
-	case e.held <- struct{}{}:
-	default:
-		select {
-		case e.held <- struct{}{}:
-		case <-ctx.Done():
-			l.release(id, e)
-			return nil, ctx.Err()
-		}
-	}
-	return func() {
-		<-e.held
-		l.release(id, e)
-	}, nil
-}
-
-func (l *sandboxLocks) release(id string, e *sandboxLock) {
-	l.mu.Lock()
-	if e.refs--; e.refs == 0 {
-		delete(l.locks, id)
-	}
-	l.mu.Unlock()
-}
-
-// size is the number of sandboxes with a step in flight (tests).
-func (l *sandboxLocks) size() int {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	return len(l.locks)
-}
+// lifecycleLocks is a keyedLocks[string] (keyed_locks.go), taken with lockCtx.

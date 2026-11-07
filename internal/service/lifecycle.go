@@ -30,7 +30,7 @@ var (
 // ErrSandboxNotRunning. This is the single definition of "can this be paused"
 // the E2B pause and Runloop suspend handlers used to each carry (D7).
 func (s *Service) PauseSandbox(ctx context.Context, id string) (*models.Sandbox, error) {
-	unlock, err := s.lifecycleLocks.lock(ctx, id)
+	unlock, err := s.lifecycleLocks.lockCtx(ctx, id)
 	if err != nil {
 		return nil, err
 	}
@@ -63,7 +63,7 @@ func (s *Service) PauseSandbox(ctx context.Context, id string) (*models.Sandbox,
 // this be resumed" the E2B connect and Runloop resume handlers used to each
 // carry (D7).
 func (s *Service) ResumeSandbox(ctx context.Context, id string) (*models.Sandbox, error) {
-	unlock, err := s.lifecycleLocks.lock(ctx, id)
+	unlock, err := s.lifecycleLocks.lockCtx(ctx, id)
 	if err != nil {
 		return nil, err
 	}
@@ -91,7 +91,7 @@ func (s *Service) ResumeSandbox(ctx context.Context, id string) (*models.Sandbox
 // patches on the same sandbox could each read the same base and the later
 // write would drop the earlier field (D7).
 func (s *Service) ApplyLifecyclePatch(ctx context.Context, id string, patch func(*models.Sandbox) (models.Lifecycle, bool, error)) (*models.Sandbox, bool, error) {
-	unlock, err := s.lifecycleLocks.lock(ctx, id)
+	unlock, err := s.lifecycleLocks.lockCtx(ctx, id)
 	if err != nil {
 		return nil, false, err
 	}

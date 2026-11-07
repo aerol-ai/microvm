@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/cluster"
@@ -235,14 +234,6 @@ type portLockKey struct {
 	port int
 }
 
-// portLock is one port's lock and the number of calls holding or waiting
-// for it; the last one out removes the map entry, so the map holds only
-// ports with a call in flight.
-type portLock struct {
-	mu   sync.Mutex
-	refs int
-}
-
 // lockExposedPort serializes expose and unexpose calls on one sandbox port
 // and returns the unlock. Without it, opposite calls race. Say a "public"
 // and a "token" call arrive together: the rows can land public then token
@@ -252,25 +243,5 @@ type portLock struct {
 // enough: the v1 routes forward every expose and unexpose to the owner.
 // Callers on other ports and sandboxes never wait on each other.
 func (s *Service) lockExposedPort(id string, port int) func() {
-	k := portLockKey{id: id, port: port}
-	s.portLocksMu.Lock()
-	if s.portLocks == nil {
-		s.portLocks = make(map[portLockKey]*portLock)
-	}
-	l := s.portLocks[k]
-	if l == nil {
-		l = &portLock{}
-		s.portLocks[k] = l
-	}
-	l.refs++
-	s.portLocksMu.Unlock()
-	l.mu.Lock()
-	return func() {
-		l.mu.Unlock()
-		s.portLocksMu.Lock()
-		if l.refs--; l.refs == 0 {
-			delete(s.portLocks, k)
-		}
-		s.portLocksMu.Unlock()
-	}
+	return s.portLocks.lock(portLockKey{id: id, port: port})
 }

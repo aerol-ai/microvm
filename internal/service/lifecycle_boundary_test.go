@@ -11,17 +11,18 @@ import (
 )
 
 // TestSandboxLocks: one sandbox's steps wait for each other, other
-// sandboxes' never do, a wait ends with ctx, and nothing is left behind.
+// sandboxes' never do, a wait ends with ctx, and nothing is left behind
+// (lifecycleLocks, a keyedLocks[string] taken with lockCtx).
 func TestSandboxLocks(t *testing.T) {
 	ctx := context.Background()
-	var l sandboxLocks
-	unlockA, err := l.lock(ctx, "a")
+	var l keyedLocks[string]
+	unlockA, err := l.lockCtx(ctx, "a")
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	// Another sandbox is not held up.
-	unlockB, err := l.lock(ctx, "b")
+	unlockB, err := l.lockCtx(ctx, "b")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -30,7 +31,7 @@ func TestSandboxLocks(t *testing.T) {
 	// The same sandbox waits.
 	got := make(chan func(), 1)
 	go func() {
-		unlock, err := l.lock(ctx, "a")
+		unlock, err := l.lockCtx(ctx, "a")
 		if err != nil {
 			t.Error(err)
 		}
@@ -45,7 +46,7 @@ func TestSandboxLocks(t *testing.T) {
 	// A wait that outlasts its ctx gives up, and holds nothing.
 	short, cancel := context.WithTimeout(ctx, 20*time.Millisecond)
 	defer cancel()
-	if _, err := l.lock(short, "a"); !errors.Is(err, context.DeadlineExceeded) {
+	if _, err := l.lockCtx(short, "a"); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("a wait past its deadline = %v", err)
 	}
 
@@ -56,14 +57,14 @@ func TestSandboxLocks(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("the waiting step never got the lock")
 	}
-	if n := l.size(); n != 0 {
+	if n := l.keys(); n != 0 {
 		t.Fatalf("%d locks left after every step finished", n)
 	}
 
 	// A free lock is taken even with a done ctx, as before.
 	done, cancelDone := context.WithCancel(ctx)
 	cancelDone()
-	unlock, err := l.lock(done, "a")
+	unlock, err := l.lockCtx(done, "a")
 	if err != nil {
 		t.Fatalf("free lock with a done ctx: %v", err)
 	}
@@ -160,7 +161,7 @@ func TestEveryLifecycleEntryPointTakesTheBoundary(t *testing.T) {
 			} else {
 				h.seedStarted(t, id, models.Lifecycle{}, 0, 0)
 			}
-			unlock, err := h.svc.lifecycleLocks.lock(ctx, id)
+			unlock, err := h.svc.lifecycleLocks.lockCtx(ctx, id)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -192,7 +193,7 @@ func TestLifecycleEntryPointsGiveUpWithTheirContext(t *testing.T) {
 	h := newRestartHarness(t)
 	id := "sb-busy"
 	h.seedStarted(t, id, models.Lifecycle{}, 0, 0)
-	unlock, err := h.svc.lifecycleLocks.lock(context.Background(), id)
+	unlock, err := h.svc.lifecycleLocks.lockCtx(context.Background(), id)
 	if err != nil {
 		t.Fatal(err)
 	}

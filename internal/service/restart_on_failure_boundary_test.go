@@ -115,7 +115,7 @@ func TestRestartGivesUpWhileTheBoundaryStaysBusy(t *testing.T) {
 	h.seedRestarting(t, id, models.Lifecycle{})
 	h.event(t, id, "die", 1)
 	h.clock.advance(time.Minute)
-	unlock, err := h.svc.lifecycleLocks.lock(context.Background(), id)
+	unlock, err := h.svc.lifecycleLocks.lockCtx(context.Background(), id)
 	if err != nil {
 		t.Fatal(err)
 	}

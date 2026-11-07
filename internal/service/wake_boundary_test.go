@@ -37,7 +37,7 @@ func TestWakeDoesNotUndoAStopThatWonTheBoundary(t *testing.T) {
 	id := "sb-sleepy"
 	seedSleepingServerless(t, h, id)
 
-	unlock, err := h.svc.lifecycleLocks.lock(ctx, id)
+	unlock, err := h.svc.lifecycleLocks.lockCtx(ctx, id)
 	if err != nil {
 		t.Fatal(err)
 	}

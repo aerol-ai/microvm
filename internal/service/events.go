@@ -127,7 +127,7 @@ func (s *Service) handleDockerEvent(ctx context.Context, event docker.DockerEven
 	// A start or an OOM record changes nothing the boundary guards.
 	switch event.Action {
 	case "die", "stop", "destroy":
-		unlock, err := s.lifecycleLocks.lock(ctx, event.SandboxID)
+		unlock, err := s.lifecycleLocks.lockCtx(ctx, event.SandboxID)
 		if err != nil {
 			return fmt.Errorf("wait for the sandbox's lifecycle: %w", err)
 		}

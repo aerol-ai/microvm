@@ -64,7 +64,11 @@ func (s *Service) lockSpec(ctx context.Context, id string) (func(), error) {
 	if !s.ClusterEnabled() {
 		return func() {}, nil
 	}
-	return s.specLocks.lock(ctx, id)
+	// A caller that already left starts nothing, even on a free lock.
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return s.specLocks.lockCtx(ctx, id)
 }
 
 // provider returns the provider installed by New or ConfigureSecretProvider.

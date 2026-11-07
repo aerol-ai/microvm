@@ -266,7 +266,7 @@ func (s *Service) runScheduledRestart(id string, gen uint64) {
 // the restarted sandbox: the stop always has the last word. A wait that
 // outlasts ctx gives up; the sweep arms the restart again.
 func (s *Service) restartIfDue(ctx context.Context, id string) {
-	unlock, err := s.lifecycleLocks.lock(ctx, id)
+	unlock, err := s.lifecycleLocks.lockCtx(ctx, id)
 	if err != nil {
 		s.logger.Warn("restart on failure: lifecycle busy; the sweep retries", "sandbox_id", id, "error", err)
 		return

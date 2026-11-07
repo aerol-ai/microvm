@@ -61,7 +61,7 @@ func TestReview923ConcurrentResizeMustNotBypassQuota(t *testing.T) {
 	// run straight through, which is the race.
 	second := make(chan error, 1)
 	go func() { _, err := svc.ResizeSandbox(ctx, "sb-a", models.ResizeSandboxRequest{CPU: 2}); second <- err }()
-	if !waitFor(5*time.Second, func() bool { return svc.resizeLocks.waiters("sb-a") == 2 }) {
+	if !waitFor(5*time.Second, func() bool { return svc.resizeLocks.refs("sb-a") == 2 }) {
 		t.Fatal("the second resize never queued behind the first")
 	}
 	ticket, createErr := svc.admitTeamQuotaCreate(ctx, "team:risk", models.CreateSandboxRequest{CPU: 1})
@@ -86,7 +86,7 @@ func TestReview923ConcurrentResizeMustNotBypassQuota(t *testing.T) {
 	if err != nil || sb.CPU != 2 || q.Usage.CPU != 3 {
 		t.Fatalf("after both resizes: A=%g usage=%+v err=%v, want A=2 and usage 3 (the later resize wins, in order)", sb.CPU, q.Usage, err)
 	}
-	if n := svc.resizeLocks.waiters("sb-a"); n != 0 {
+	if n := svc.resizeLocks.refs("sb-a"); n != 0 {
 		t.Fatalf("resize lock left %d holders", n)
 	}
 }
@@ -412,7 +412,7 @@ func TestTeamQuotaClusterGrowthWithoutSpecFailsClosed(t *testing.T) {
 func TestSpecWriteThroughsShareOneLockPerSandbox(t *testing.T) {
 	stub := &quotaStubCluster{spec: &models.CreateSandboxRequest{Image: "a", CPU: 1}}
 	svc := clusterQuotaService(t, stub)
-	unlock, err := svc.specLocks.lock(context.Background(), "sb-1")
+	unlock, err := svc.specLocks.lockCtx(context.Background(), "sb-1")
 	if err != nil {
 		t.Fatal(err)
 	}

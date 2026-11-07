@@ -3,7 +3,6 @@ package service
 import (
 	"context"
 	"fmt"
-	"sync"
 
 	"github.com/aerol-ai/microvm/pkg/models"
 )
@@ -43,55 +42,6 @@ import (
 // forward expose, unexpose and custom-domain calls to the owner, and start,
 // reconcile, runtime events and failover replay run on the owner, whose
 // store holds the rows. Ingress nodes route to the owner, never to the app.
-
-// keyedLocks is a set of mutexes keyed by K. A key has an entry only while a
-// call holds or waits for it, so the map stays as small as the work in
-// flight. The zero value is ready to use.
-type keyedLocks[K comparable] struct {
-	mu sync.Mutex
-	m  map[K]*portLock
-}
-
-// lock takes k's mutex and returns its unlock.
-func (l *keyedLocks[K]) lock(k K) func() {
-	l.mu.Lock()
-	if l.m == nil {
-		l.m = make(map[K]*portLock)
-	}
-	e := l.m[k]
-	if e == nil {
-		e = &portLock{}
-		l.m[k] = e
-	}
-	e.refs++
-	l.mu.Unlock()
-	e.mu.Lock()
-	return func() {
-		e.mu.Unlock()
-		l.mu.Lock()
-		if e.refs--; e.refs == 0 {
-			delete(l.m, k)
-		}
-		l.mu.Unlock()
-	}
-}
-
-// refs is the number of calls holding or waiting for k's mutex, and keys
-// the number of keys with any. Tests only.
-func (l *keyedLocks[K]) refs(k K) int {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	if e := l.m[k]; e != nil {
-		return e.refs
-	}
-	return 0
-}
-
-func (l *keyedLocks[K]) keys() int {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	return len(l.m)
-}
 
 // Stages testAfterRouteGateRead reports.
 const (

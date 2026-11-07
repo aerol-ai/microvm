@@ -50,7 +50,7 @@ func TestALongLifecycleStepDoesNotDelayOtherSandboxesEvents(t *testing.T) {
 	h.seedStarted(t, "sb-slow", models.Lifecycle{}, 0, 0)
 	h.seedStarted(t, "sb-other", models.Lifecycle{}, 0, 0)
 
-	unlock, err := h.svc.lifecycleLocks.lock(ctx, "sb-slow")
+	unlock, err := h.svc.lifecycleLocks.lockCtx(ctx, "sb-slow")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -93,7 +93,7 @@ func TestASandboxsEventsKeepTheirOrderBehindItsLifecycleBoundary(t *testing.T) {
 		id: {ContainerID: id, ContainerIP: "10.0.0.7", Status: models.SandboxStatusStarted},
 	}
 
-	unlock, err := h.svc.lifecycleLocks.lock(ctx, id)
+	unlock, err := h.svc.lifecycleLocks.lockCtx(ctx, id)
 	if err != nil {
 		t.Fatal(err)
 	}
