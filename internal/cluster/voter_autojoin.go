@@ -68,6 +68,11 @@ func (c *Cluster) handleMemberJoin(nodeID string) {
 	if c.raft == nil || c.raft.raft.State() != raft.Leader {
 		return
 	}
+	if c.admittedNonServer(nodeID) {
+		// Admitted as a worker or ingress node: never a Raft replica,
+		// whatever role it gossips (Codex eng finding 1).
+		return
+	}
 	raftAddr := c.peerRaftAddr(nodeID)
 	if raftAddr == "" {
 		// Metadata hasn't propagated yet. The reconcile loop will catch this.
@@ -316,11 +321,24 @@ func (c *Cluster) logReplicaBudgetRefusal(nodeID, raftAddr string) {
 	)
 }
 
-// peerForcedNonVoter returns true when the joining peer gossiped a role that
-// must never become a raft voter (worker or ingress). Empty / unknown roles
-// are treated as voter-eligible so older builds (and the default "mixed"
-// role) keep their pre-role-split behavior.
+// admittedNonServer reports whether nodeID has an admitted record (join.go)
+// whose role is not server. Such a node never enters Raft. A node with no
+// record (a scripted cluster before adopt) is judged by its gossiped role,
+// as before.
+func (c *Cluster) admittedNonServer(nodeID string) bool {
+	rec, ok := c.fsm.admittedNode(nodeID)
+	return ok && !rec.IsServer()
+}
+
+// peerForcedNonVoter returns true when the joining peer must never become a
+// raft voter. The admitted role decides when the node has one (Codex eng
+// finding 1: a worker that gossips "server" stays a worker); otherwise the
+// gossiped role does, with empty / unknown roles voter-eligible so older
+// builds (and the default "mixed" role) keep their pre-role-split behavior.
 func (c *Cluster) peerForcedNonVoter(nodeID string) bool {
+	if rec, ok := c.fsm.admittedNode(nodeID); ok {
+		return !rec.IsServer()
+	}
 	if c.gossip == nil {
 		return false
 	}
