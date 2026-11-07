@@ -40,11 +40,15 @@ func newLeaderLossCluster(self string) *leaderLossCluster {
 	return &leaderLossCluster{Noop: cluster.NewNoop(self, "http://"+self, ""), placements: map[string]cluster.Placement{}}
 }
 
-func (c *leaderLossCluster) reserve(id string) {
+func (c *leaderLossCluster) reserve(id string) { c.reserveLifetime(id, "inc-"+id) }
+
+// reserveLifetime is a reservation for one lifetime of id: what the edge's
+// Prepare writes for a create, with a fresh incarnation each time.
+func (c *leaderLossCluster) reserveLifetime(id, incarnation string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.placements[id] = cluster.Placement{
-		SandboxID: id, OwnerNodeID: c.SelfNodeID(), IncarnationID: "inc-" + id,
+		SandboxID: id, OwnerNodeID: c.SelfNodeID(), IncarnationID: incarnation,
 		State: cluster.PlacementStateReserved, ExpiresUnix: time.Now().Add(2 * time.Minute).Unix(),
 	}
 }
@@ -309,5 +313,90 @@ func TestFailedLocalCreatePromoteDuringElectionLeavesNothing(t *testing.T) {
 	}
 	if states, _ := rt.ListManaged(ctx); states[id] != nil {
 		t.Errorf("runtime instance still running after replay and reconcile: %+v", states[id])
+	}
+}
+
+// failPromoteAndRollback runs the first attempt of a keyed create of id: the
+// leader is lost as the promote starts, so the promote and its rollback both
+// fail and the local row is left marked. The leader then comes back.
+func failPromoteAndRollback(t *testing.T, ctx context.Context, svc *service.Service, fc *leaderLossCluster, logger *slog.Logger, id string) {
+	t.Helper()
+	fc.reserve(id)
+	fc.dropLeaderOnPromote = true
+	if _, err := OverlapCreateAndPromote(ctx, svc, logger, models.CreateSandboxRequest{Image: "alpine:3.20"}, id, OverlapOptions{PromoteWithSpec: true}); err == nil {
+		t.Fatal("first create succeeded; this test needs the promote and its rollback to fail")
+	}
+	fc.setLeaderDown(false)
+}
+
+// TestOverlapRetryFinishesPendingRollbackInline: a keyed retry routed back
+// with the failed create's own reservation finishes the rollback itself once
+// the leader is back. That destroy takes the reservation with it (its
+// lifetime's secrets are tombed), so the retry answers the existing "the
+// create's reservation is gone, retry to create afresh" (503), exactly what a
+// retry gets after a rollback that finished on time. The next retry, with a
+// fresh reservation from the edge, creates a new sandbox.
+func TestOverlapRetryFinishesPendingRollbackInline(t *testing.T) {
+	ctx := context.Background()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	const id = "sb-c5-inline-own"
+	fc := newLeaderLossCluster("node-a")
+	rt := newFakeRuntime()
+	svc, st := newCreateServiceWithRuntime(t, fc, rt, true)
+	failPromoteAndRollback(t, ctx, svc, fc, logger, id)
+
+	_, err := OverlapCreateAndPromote(ctx, svc, logger, models.CreateSandboxRequest{Image: "alpine:3.20"}, id, OverlapOptions{PromoteWithSpec: true})
+	if !errors.Is(err, service.ErrReservedPlacementGone) {
+		t.Fatalf("retry = %v, want ErrReservedPlacementGone after finishing the rollback (not ErrCreateRollbackPending)", err)
+	}
+	if _, err := st.Get(ctx, id); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("failed create's row after the retry = %v, want it destroyed", err)
+	}
+	if states, _ := rt.ListManaged(ctx); states[id] != nil {
+		t.Fatalf("failed create's runtime still running after the retry: %+v", states[id])
+	}
+	if p, ok := fc.placement(id); ok {
+		t.Fatalf("failed create's reservation after the retry = state %q, want none", p.State)
+	}
+
+	fc.reserveLifetime(id, "inc-"+id+"-2")
+	resp, err := OverlapCreateAndPromote(ctx, svc, logger, models.CreateSandboxRequest{Image: "alpine:3.20"}, id, OverlapOptions{PromoteWithSpec: true})
+	if err != nil || resp.Replayed {
+		t.Fatalf("next retry = %+v, %v; want a fresh create", resp, err)
+	}
+	if p, ok := fc.placement(id); !ok || p.IsReserved() || p.IncarnationID != "inc-"+id+"-2" {
+		t.Fatalf("placement after the fresh create = %+v (present %v), want the new lifetime placed", p, ok)
+	}
+}
+
+// TestOverlapRetryWithNewerReservationCreatesFresh: when the failed create's
+// reservation already expired and the edge reserved the id again (a new
+// lifetime), the retry finishes the old lifetime's rollback (local only: the
+// new reservation is not its to delete) and creates afresh in the same
+// request.
+func TestOverlapRetryWithNewerReservationCreatesFresh(t *testing.T) {
+	ctx := context.Background()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	const id = "sb-c5-inline-newer"
+	fc := newLeaderLossCluster("node-a")
+	rt := newFakeRuntime()
+	svc, st := newCreateServiceWithRuntime(t, fc, rt, true)
+	failPromoteAndRollback(t, ctx, svc, fc, logger, id)
+	creates := rt.creates.Load()
+
+	fc.reserveLifetime(id, "inc-"+id+"-2")
+	resp, err := OverlapCreateAndPromote(ctx, svc, logger, models.CreateSandboxRequest{Image: "alpine:3.20"}, id, OverlapOptions{PromoteWithSpec: true})
+	if err != nil || resp.Replayed {
+		t.Fatalf("retry with a newer reservation = %+v, %v; want a fresh create in the same request", resp, err)
+	}
+	if got := rt.creates.Load(); got != creates+1 {
+		t.Fatalf("runtime creates = %d, want %d (one fresh)", got, creates+1)
+	}
+	row, err := st.Get(ctx, id)
+	if err != nil || row.RollbackPending || row.AuditIncarnationID != "inc-"+id+"-2" {
+		t.Fatalf("row after the retry = %+v, %v; want the new, unmarked lifetime", row, err)
+	}
+	if p, ok := fc.placement(id); !ok || p.IsReserved() || p.IncarnationID != "inc-"+id+"-2" {
+		t.Fatalf("placement after the retry = %+v (present %v), want the new lifetime placed", p, ok)
 	}
 }

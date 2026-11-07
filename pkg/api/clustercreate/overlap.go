@@ -140,13 +140,22 @@ func OverlapCreateAndPromote(
 	// reservation, so the binding below answers ErrReservedPlacementGone
 	// (503): the client's next retry reserves afresh.
 	if existing, err := svc.GetSandbox(ctx, reservationID); err == nil && existing != nil {
-		if existing.RollbackPending {
-			// The create it would replay failed and is still being rolled
-			// back (service rollback_pending.go): 503, and the retry after
-			// reconcile has destroyed it creates afresh.
-			return nil, service.ErrCreateRollbackPending
+		if !existing.RollbackPending {
+			return &models.CreateSandboxResponse{Sandbox: *existing, Replayed: true}, nil
 		}
-		return &models.CreateSandboxResponse{Sandbox: *existing, Replayed: true}, nil
+		// The create it would replay failed and its rollback has not
+		// finished (service rollback_pending.go). Finish it now, once, under
+		// this create's lease; on failure answer ErrCreateRollbackPending
+		// (503) and leave it to reconcile. On success the binding below
+		// decides: the failed create's own reservation went with its destroy
+		// (its lifetime's secrets are tombed and cannot be reused), so this
+		// retry answers ErrReservedPlacementGone (503, "retry to create
+		// afresh") as after any finished rollback; a newer reservation of
+		// the id, made by the edge after the old one expired, binds and the
+		// create runs now.
+		if err := svc.FinishRollbackPending(ctx, reservationID); err != nil {
+			return nil, err
+		}
 	}
 
 	// Platform volumes: the seal and the promoted spec need concrete

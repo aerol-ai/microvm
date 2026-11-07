@@ -831,6 +831,10 @@ type Service struct {
 	// reach a waiter's ErrCreateInProgress without waiting out the create
 	// timeout. Zero in production.
 	testCreateLeaseWait time.Duration
+	// testBeforeRollbackSweepDestroy runs in reconcileRollbackPending after
+	// the pending ids were listed and before each one is acted on, so a test
+	// can land a create retry inside that window. Nil in production.
+	testBeforeRollbackSweepDestroy func(id string)
 	// testSecretPeerPusher overrides cluster secret fan-out in tests. Nil in
 	// production (SealAndDistribute type-asserts the live Cluster/Agent).
 	testSecretPeerPusher cluster.SecretPeerPusher
@@ -1428,15 +1432,20 @@ func (s *Service) CreateSandboxWithID(ctx context.Context, req models.CreateSand
 		if err := s.checkStoredCreateDigest(ctx, id); err != nil {
 			return nil, err
 		}
-		// A create of this id was reported failed and is still being rolled
-		// back (rollback_pending.go): not a sandbox to hand back.
-		if existing.RollbackPending {
-			return nil, ErrCreateRollbackPending
+		if !existing.RollbackPending {
+			// Already present locally — recreate is a no-op. The watcher tick
+			// that noticed the FSM-only entry must have raced with a local
+			// create.
+			auditlog.NoteSandboxIdentity(ctx, id, existing.AuditIncarnationID, existing.OwnerRef)
+			return &models.CreateSandboxResponse{Sandbox: *existing, Replayed: true}, nil
 		}
-		// Already present locally — recreate is a no-op. The watcher tick that
-		// noticed the FSM-only entry must have raced with a local create.
-		auditlog.NoteSandboxIdentity(ctx, id, existing.AuditIncarnationID, existing.OwnerRef)
-		return &models.CreateSandboxResponse{Sandbox: *existing, Replayed: true}, nil
+		// A create of this id was reported failed and its rollback has not
+		// finished (rollback_pending.go): not a sandbox to hand back. Finish
+		// the rollback now, once; then this retry creates afresh below, or
+		// answers ErrCreateRollbackPending (503) and reconcile keeps trying.
+		if err := s.FinishRollbackPending(ctx, id); err != nil {
+			return nil, err
+		}
 	}
 	resp, err := s.createSandbox(ctx, req, id)
 	// A failed earlier create of this ID can leave its runtime instance

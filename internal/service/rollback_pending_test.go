@@ -3,8 +3,10 @@ package service
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/aerol-ai/microvm/internal/cluster"
 	"github.com/aerol-ai/microvm/internal/store"
@@ -166,20 +168,176 @@ func TestReconcileRollbackPendingRetriesUntilDestroyed(t *testing.T) {
 }
 
 // TestCreateReplayRefusesRollbackPendingRow: an Idempotency-Key retry of a
-// create that failed must not be handed the leftover sandbox reconcile is
-// about to destroy. It gets a retryable 503 and nothing is created.
+// create that failed must not be handed the leftover sandbox. While the
+// leader is still away its inline attempt to finish the rollback fails too,
+// so it gets a retryable 503, nothing is created, and the row stays marked
+// for the reconcile sweep.
 func TestCreateReplayRefusesRollbackPendingRow(t *testing.T) {
 	ctx := context.Background()
-	svc, _, rt, _ := newRollbackHarness(t, "sb-keyed")
+	svc, st, rt, fc := newRollbackHarness(t, "sb-keyed")
 	if err := svc.MarkRollbackPending(ctx, "sb-keyed"); err != nil {
 		t.Fatalf("mark: %v", err)
 	}
+	fc.setReadErr(cluster.ErrNotLeader)
 	_, err := svc.CreateSandboxWithID(ctx, models.CreateSandboxRequest{Image: "alpine:3.20"}, "sb-keyed")
 	if !errors.Is(err, ErrCreateRollbackPending) || !errors.Is(err, ErrCreateInProgress) {
 		t.Fatalf("replay of a rollback-pending create = %v, want ErrCreateRollbackPending (an ErrCreateInProgress)", err)
 	}
 	if rt.createCalls != 1 {
 		t.Fatalf("runtime creates = %d, want only the original 1", rt.createCalls)
+	}
+	if len(rt.destroyIDs) != 0 {
+		t.Fatalf("runtime destroyed %v with no leader for the fence, want nothing", rt.destroyIDs)
+	}
+	if row, err := st.Get(ctx, "sb-keyed"); err != nil || !row.RollbackPending {
+		t.Fatalf("row after the refused retry = %+v, %v; want it kept and still marked", row, err)
+	}
+}
+
+// TestCreateRetryFinishesPendingRollbackInline: a retry that finds its failed
+// create still marked runs the pending destroy itself once the leader is
+// back, and then creates afresh in the same request instead of answering 503
+// until the next reconcile pass.
+func TestCreateRetryFinishesPendingRollbackInline(t *testing.T) {
+	ctx := context.Background()
+	svc, st, rt, fc := newRollbackHarness(t, "sb-retry")
+	old, err := st.Get(ctx, "sb-retry")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.MarkRollbackPending(ctx, "sb-retry"); err != nil {
+		t.Fatalf("mark: %v", err)
+	}
+	resp, err := svc.CreateSandboxWithID(ctx, models.CreateSandboxRequest{Image: "alpine:3.20"}, "sb-retry")
+	if err != nil {
+		t.Fatalf("retry of a failed create with a leader back = %v, want a fresh create", err)
+	}
+	if resp.Replayed {
+		t.Fatal("retry replayed the failed create's sandbox")
+	}
+	if len(rt.destroyIDs) != 1 || rt.destroyIDs[0] != "sb-retry" {
+		t.Fatalf("runtime destroys = %v, want the failed create's one", rt.destroyIDs)
+	}
+	if rt.createCalls != 2 {
+		t.Fatalf("runtime creates = %d, want the original and the fresh one", rt.createCalls)
+	}
+	row, err := st.Get(ctx, "sb-retry")
+	if err != nil || row.RollbackPending || row.AuditIncarnationID == old.AuditIncarnationID {
+		t.Fatalf("row after the retry = %+v, %v; want a fresh, unmarked lifetime", row, err)
+	}
+	if _, ok := fc.PlacementOf("sb-retry"); ok {
+		t.Fatal("the failed create's reservation survived the inline rollback")
+	}
+}
+
+// TestCreateRetryAndRollbackSweepDestroyOnce runs a create retry and the
+// reconcile sweep at the same time on one marked row, many times. Whichever
+// gets there first destroys the failed create; the other must neither
+// destroy it again nor destroy the fresh sandbox the retry made, and the
+// retry creates exactly one fresh sandbox.
+func TestCreateRetryAndRollbackSweepDestroyOnce(t *testing.T) {
+	for round := 0; round < 8; round++ {
+		ctx := context.Background()
+		id := fmt.Sprintf("sb-race-%d", round)
+		svc, st, rt, _ := newRollbackHarness(t, id)
+		if err := svc.MarkRollbackPending(ctx, id); err != nil {
+			t.Fatalf("mark: %v", err)
+		}
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		var retryErr error
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			<-start
+			_, retryErr = svc.CreateSandboxWithID(ctx, models.CreateSandboxRequest{Image: "alpine:3.20"}, id)
+		}()
+		go func() {
+			defer wg.Done()
+			<-start
+			svc.reconcileRollbackPending(ctx)
+		}()
+		close(start)
+		wg.Wait()
+		if retryErr != nil {
+			t.Fatalf("round %d: retry = %v, want a fresh create", round, retryErr)
+		}
+		if len(rt.destroyIDs) != 1 {
+			t.Fatalf("round %d: runtime destroys = %v, want exactly one", round, rt.destroyIDs)
+		}
+		if rt.createCalls != 2 {
+			t.Fatalf("round %d: runtime creates = %d, want the original and one fresh", round, rt.createCalls)
+		}
+		if row, err := st.Get(ctx, id); err != nil || row.RollbackPending {
+			t.Fatalf("round %d: row = %+v, %v; want the fresh, unmarked sandbox", round, row, err)
+		}
+	}
+}
+
+// TestRollbackSweepSparesTheFreshSandbox is the one interleaving the race
+// test above can miss: the sweep lists the marked id, a create retry then
+// finishes the rollback and creates afresh under the same id, and only then
+// does the sweep act on its list. It must find the new row unmarked and leave
+// the fresh sandbox alone.
+func TestRollbackSweepSparesTheFreshSandbox(t *testing.T) {
+	ctx := context.Background()
+	const id = "sb-stale-list"
+	svc, st, rt, _ := newRollbackHarness(t, id)
+	if err := svc.MarkRollbackPending(ctx, id); err != nil {
+		t.Fatalf("mark: %v", err)
+	}
+	var once sync.Once
+	svc.testBeforeRollbackSweepDestroy = func(string) {
+		once.Do(func() {
+			if _, err := svc.CreateSandboxWithID(ctx, models.CreateSandboxRequest{Image: "alpine:3.20"}, id); err != nil {
+				t.Errorf("retry inside the sweep window: %v", err)
+			}
+		})
+	}
+	svc.reconcileRollbackPending(ctx)
+	if len(rt.destroyIDs) != 1 {
+		t.Fatalf("runtime destroys = %v, want only the failed create's (the sweep destroyed the fresh sandbox)", rt.destroyIDs)
+	}
+	if row, err := st.Get(ctx, id); err != nil || row.RollbackPending {
+		t.Fatalf("row after the sweep = %+v, %v; want the fresh sandbox, unmarked", row, err)
+	}
+}
+
+// TestFinishRollbackPendingFailures: an attempt that cannot get the row's
+// lifecycle lock within the rollback budget, or cannot read the row, answers
+// ErrCreateRollbackPending and leaves the row marked.
+func TestFinishRollbackPendingFailures(t *testing.T) {
+	ctx := context.Background()
+	restore := createRollbackTimeout
+	createRollbackTimeout = 50 * time.Millisecond
+	t.Cleanup(func() { createRollbackTimeout = restore })
+
+	svc, st, rt, _ := newRollbackHarness(t, "sb-locked")
+	if err := svc.MarkRollbackPending(ctx, "sb-locked"); err != nil {
+		t.Fatal(err)
+	}
+	unlock, err := svc.lifecycleLocks.lockCtx(ctx, "sb-locked")
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = svc.FinishRollbackPending(ctx, "sb-locked")
+	unlock()
+	if !errors.Is(err, ErrCreateRollbackPending) {
+		t.Fatalf("attempt while a start or stop holds the lock = %v, want ErrCreateRollbackPending", err)
+	}
+	if row, err := st.Get(ctx, "sb-locked"); err != nil || !row.RollbackPending || len(rt.destroyIDs) != 0 {
+		t.Fatalf("row = %+v, %v, destroys %v; want it kept, marked, not destroyed", row, err, rt.destroyIDs)
+	}
+
+	// Nothing there: nothing pending.
+	if err := svc.FinishRollbackPending(ctx, "sb-none"); err != nil {
+		t.Fatalf("attempt on a missing row = %v, want nil", err)
+	}
+
+	broken, brokenStore, _ := newServiceRuntimeHarnessAllowStoreClose(t, &recordingRuntime{})
+	_ = brokenStore.Close()
+	if err := broken.FinishRollbackPending(ctx, "sb-x"); !errors.Is(err, ErrCreateRollbackPending) {
+		t.Fatalf("attempt on an unreadable store = %v, want ErrCreateRollbackPending", err)
 	}
 }
 
