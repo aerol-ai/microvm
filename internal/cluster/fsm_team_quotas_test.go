@@ -286,7 +286,10 @@ func TestTeamQuotaConcurrentReservationsOnOneLeader(t *testing.T) {
 	if u := usageOf(leader.fsm, "risk"); u.Sandboxes != 3 {
 		t.Fatalf("usage = %+v, want 3 sandboxes", u)
 	}
-	if leader.quotaBarrierTerm.Load() == 0 {
+	leader.reservationAdmissionMu.Lock()
+	barrierTerm := leader.admission.term
+	leader.reservationAdmissionMu.Unlock()
+	if barrierTerm == 0 {
 		t.Fatal("the leader admitted without its per-term barrier")
 	}
 	// The read path agrees.
@@ -438,7 +441,7 @@ func TestTeamQuotaClusterWithoutRaft(t *testing.T) {
 	if err := c.admitTeamQuotaCommand(command{}); err != nil {
 		t.Fatalf("nil cluster admit = %v", err)
 	}
-	if err := (&Cluster{}).teamQuotaBarrier(); err != nil {
+	if err := (&Cluster{}).admissionBarrier(); err != nil {
 		t.Fatalf("barrier without raft = %v", err)
 	}
 }

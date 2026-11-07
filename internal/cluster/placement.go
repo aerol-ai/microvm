@@ -586,19 +586,22 @@ func pickTwo(c []Member) (Member, Member) {
 
 func sameNode(a, b Member) bool { return a.NodeID == b.NodeID }
 
+// admitReservationCommand is the leader's capacity answer for a reservation
+// command. It runs under reservationAdmissionMu and counts, besides the
+// owner's heartbeat, the committed pending load plus every reservation the
+// leader has admitted but not yet seen applied (admission_ledger.go). A
+// resend of a create still in flight is not counted again.
 func (c *Cluster) admitReservationCommand(cmd command) error {
-	reservations := reservationCommands(cmd)
+	reservations := c.admission.withoutHeldResends(reservationCommands(cmd))
 	if len(reservations) == 0 {
 		return nil
 	}
 	now := time.Now().Unix()
-	pending, pendingRuntimes := c.fsm.pendingReservationLoadByNode(now)
-	pendingCounts := make(map[string]int, len(reservations))
+	owners := make([]string, 0, len(reservations))
 	for _, r := range reservations {
-		if _, ok := pendingCounts[r.OwnerNodeID]; !ok {
-			pendingCounts[r.OwnerNodeID] = c.fsm.livePendingReservationCount(r.OwnerNodeID, now)
-		}
+		owners = append(owners, r.OwnerNodeID)
 	}
+	pending, pendingRuntimes, pendingCounts := c.fsm.admissionPendingLoad(now, owners, c.admission.heldReservations())
 	templateIDs := make([]string, 0, len(reservations))
 	for _, r := range reservations {
 		if r.Spec != nil {

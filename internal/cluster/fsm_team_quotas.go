@@ -19,8 +19,10 @@ import (
 //
 // Admission is a leader-side check, like capacity admission (placement.go):
 // it runs under reservationAdmissionMu before the entry is appended, never in
-// Apply. A replica on an older build therefore applies exactly the entries
-// the leader admitted and cannot diverge from one that refuses.
+// Apply, against usage plus the leader's in-flight holds
+// (admission_ledger.go). A replica on an older build therefore applies
+// exactly the entries the leader admitted and cannot diverge from one that
+// refuses.
 const (
 	opPutTeamQuota    opCode = 38 // create or replace one team's quota
 	opDeleteTeamQuota opCode = 39 // remove one team's quota
@@ -232,12 +234,17 @@ func teamQuotaAsks(cmd command) []teamQuotaAsk {
 	return out
 }
 
+// heldUsageKey names one held sandbox in one team.
+type heldUsageKey struct{ sandbox, team string }
+
 // checkTeamQuotasLocked is the admission answer for asks, counted against
-// the committed usage plus every earlier ask in the same command. A sandbox
-// already in the index counts as a change of size, not a new sandbox, so a
-// retried reservation or a promote never counts twice. f.mu must be held.
-func (f *placementFSM) checkTeamQuotasLocked(asks []teamQuotaAsk) error {
+// the committed usage, plus what the held asks add (heldTeamUsageLocked),
+// plus every earlier ask in the same command. A sandbox already in the index
+// or held counts as a change of size, not a new sandbox, so a retried
+// reservation or a promote never counts twice. f.mu must be held.
+func (f *placementFSM) checkTeamQuotasLocked(held, asks []teamQuotaAsk) error {
 	added := make(map[string]models.TeamQuotaUsage)
+	counted := f.heldTeamUsageLocked(held, added)
 	for _, a := range asks {
 		team := a.team
 		prev, had := f.teamUsageEntries[a.sandboxID]
@@ -247,6 +254,9 @@ func (f *placementFSM) checkTeamQuotasLocked(asks []teamQuotaAsk) error {
 		}
 		if team == "" {
 			continue
+		}
+		if h, ok := counted[heldUsageKey{a.sandboxID, team}]; ok {
+			prev, had = h, true
 		}
 		delta := models.TeamQuotaUsage{Sandboxes: 1, CPU: a.cpu, MemoryMB: a.memoryMB}
 		if had && prev.team == team {
@@ -281,14 +291,68 @@ func (f *placementFSM) checkTeamQuotasLocked(asks []teamQuotaAsk) error {
 	return nil
 }
 
+// heldTeamUsageLocked adds to added what the held asks (admitted by the
+// leader, not yet seen applied: admission_ledger.go) put on their teams, and
+// returns the size each held sandbox is counted at.
+//
+// It reads the index under the same lock as the usage it adds to, so a held
+// ask that has already been applied adds only growth over its row, and one
+// that has not adds a sandbox: counted once either way. Shrinking is never
+// counted before it commits: a resize that then fails would leave the team
+// bigger than the check assumed. Holds for one sandbox count at the largest
+// size. They are not checked against the quota; they were admitted already.
+// f.mu must be held.
+func (f *placementFSM) heldTeamUsageLocked(held []teamQuotaAsk, added map[string]models.TeamQuotaUsage) map[heldUsageKey]teamUsageEntry {
+	if len(held) == 0 {
+		return nil
+	}
+	largest := make(map[heldUsageKey]teamUsageEntry, len(held))
+	for _, a := range held {
+		team := a.team
+		if row, ok := f.teamUsageEntries[a.sandboxID]; team == "" && ok {
+			team = row.team
+		}
+		if team == "" {
+			continue
+		}
+		key := heldUsageKey{a.sandboxID, team}
+		cur, seen := largest[key]
+		if !seen {
+			cur = teamUsageEntry{team: team}
+		}
+		cur.cpu, cur.memoryMB = max(cur.cpu, a.cpu), max(cur.memoryMB, a.memoryMB)
+		largest[key] = cur
+	}
+	for key, e := range largest {
+		delta := models.TeamQuotaUsage{Sandboxes: 1, CPU: e.cpu, MemoryMB: e.memoryMB}
+		if row, ok := f.teamUsageEntries[key.sandbox]; ok && row.team == key.team {
+			delta = models.TeamQuotaUsage{CPU: max(e.cpu-row.cpu, 0), MemoryMB: max(e.memoryMB-row.memoryMB, 0)}
+			e.cpu, e.memoryMB = max(e.cpu, row.cpu), max(e.memoryMB, row.memoryMB)
+			largest[key] = e
+		}
+		sum := added[key.team]
+		sum.Sandboxes += delta.Sandboxes
+		sum.CPU += delta.CPU
+		sum.MemoryMB += delta.MemoryMB
+		added[key.team] = sum
+	}
+	return largest
+}
+
 // admitTeamQuotas reports whether asks fit their teams' quotas.
 func (f *placementFSM) admitTeamQuotas(asks []teamQuotaAsk) error {
+	return f.admitTeamQuotasOver(nil, asks)
+}
+
+// admitTeamQuotasOver is admitTeamQuotas with the leader's held asks counted
+// too, read under the same lock as the usage.
+func (f *placementFSM) admitTeamQuotasOver(held, asks []teamQuotaAsk) error {
 	if len(asks) == 0 {
 		return nil
 	}
 	f.mu.RLock()
 	defer f.mu.RUnlock()
-	return f.checkTeamQuotasLocked(asks)
+	return f.checkTeamQuotasLocked(held, asks)
 }
 
 // anyTeamQuotaFor reports whether any ask's team (or the team of the row it

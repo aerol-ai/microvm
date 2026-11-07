@@ -2,7 +2,6 @@ package cluster
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -92,14 +91,15 @@ func (c *Cluster) takesTeamQuotaAdmission(cmd command) bool {
 
 // admitTeamQuotaCommand is the leader's quota answer for cmd. It runs under
 // reservationAdmissionMu with the reservation admission, so two creates for a
-// team's last slot are decided one after the other against usage that
-// includes the first: the second sees the first's row, and is refused.
+// team's last slot are decided one after the other, and against usage plus
+// the leader's in-flight holds: the second counts the first whether or not it
+// has committed yet, and is refused.
 //
 // Exactness across a leader change: a new leader's FSM may not yet have
-// applied entries an old leader committed. Before its first quota decision in
-// a term the leader runs a Raft barrier, which returns once every entry
-// before it is applied, so no admitted reservation is missing from the usage
-// it reads. The barrier runs once per term, and only for a team with a quota.
+// applied entries an old leader committed. Before its first admission in a
+// term the leader runs a Raft barrier (admitHold), which returns once every
+// entry before it is applied, so no admitted reservation is missing from the
+// usage it reads.
 func (c *Cluster) admitTeamQuotaCommand(cmd command) error {
 	if c == nil || c.fsm == nil {
 		return nil
@@ -108,44 +108,16 @@ func (c *Cluster) admitTeamQuotaCommand(cmd command) error {
 	if len(asks) == 0 || !c.fsm.anyTeamQuotaFor(asks) {
 		return nil
 	}
-	if err := c.teamQuotaBarrier(); err != nil {
-		return err
-	}
-	return c.fsm.admitTeamQuotas(asks)
-}
-
-// teamQuotaBarrier applies a Raft barrier once per leadership term.
-func (c *Cluster) teamQuotaBarrier() error {
-	if c.raft == nil || c.raft.raft == nil {
-		return nil
-	}
-	term := c.raft.raft.CurrentTerm()
-	if c.quotaBarrierTerm.Load() == term {
-		return nil
-	}
-	if err := c.raft.raft.Barrier(c.commitTimeout).Error(); err != nil {
-		if errors.Is(err, raft.ErrNotLeader) || errors.Is(err, raft.ErrLeadershipLost) {
-			return ErrNotLeader
-		}
-		return fmt.Errorf("cluster: team quota barrier: %w", err)
-	}
-	c.quotaBarrierTerm.Store(term)
-	return nil
+	return c.fsm.admitTeamQuotasOver(c.admission.heldAsks(), asks)
 }
 
 // applyQuotaAdmittedEncodedLocal is applyReservationEncodedLocal for a
-// promote or spec write that can grow a team: the same queue, the same
-// leader check, then the quota check, then the append.
+// promote or spec write that can grow a team: the same admission lock and
+// ledger, the quota check, then the append.
 func (c *Cluster) applyQuotaAdmittedEncodedLocal(ctx context.Context, payload []byte, cmd command) error {
-	c.reservationAdmissionMu.Lock()
-	defer c.reservationAdmissionMu.Unlock()
-	if c.raft.raft.State() != raft.Leader {
-		return ErrNotLeader
-	}
-	if err := c.admitTeamQuotaCommand(cmd); err != nil {
-		return err
-	}
-	return c.applyEncodedLocal(ctx, payload)
+	return c.applyAdmittedEncodedLocal(ctx, payload, cmd, func() error {
+		return c.admitTeamQuotaCommand(cmd)
+	})
 }
 
 // teamQuotaWritesAllowed is the rolling-upgrade gate for quota ops. Every
