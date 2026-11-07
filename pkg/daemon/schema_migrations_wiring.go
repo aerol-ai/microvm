@@ -4,8 +4,33 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/aerol-ai/microvm/internal/cluster"
 	"github.com/aerol-ai/microvm/internal/config"
 )
+
+// oneWayFinalizer is the store's half of finalize in a cluster: run the
+// one-way migrations, and list what is still pending.
+type oneWayFinalizer interface {
+	oneWayMigrator
+	PendingOneWayMigrations(ctx context.Context) ([]int, error)
+}
+
+// attachOneWayMigrator hands the cluster client this node's finalize step
+// (plans/kubectl-style-cluster-ops.md §6.5): once the leader commits a new
+// active version, the rollout's finalize step calls it on every node, and
+// features that need the new schema turn on per node only after it ran. A
+// database with nothing pending is finished from the start. A client
+// without the hook (Noop) is left alone.
+func attachOneWayMigrator(ctx context.Context, c cluster.Client, db oneWayFinalizer) {
+	target, ok := c.(interface {
+		AttachOneWayMigrator(cluster.OneWayMigrator, bool)
+	})
+	if !ok {
+		return
+	}
+	pending, err := db.PendingOneWayMigrations(ctx)
+	target.AttachOneWayMigrator(db.RunOneWayMigrations, err == nil && len(pending) == 0)
+}
 
 // oneWayMigrator is the store's finalize-gated migration step
 // (store.Store.RunOneWayMigrations).

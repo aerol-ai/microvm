@@ -664,6 +664,7 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 		// sandboxes too, and when only *Cluster did, this probe silently
 		// skipped every worker-role node and its reassigned placements were
 		// never materialized. A miss is now loud rather than invisible.
+		attachOneWayMigrator(ctx, clusterClient, db)
 		if withRecreator, ok := clusterClient.(interface {
 			AttachRecreator(cluster.SandboxRecreator)
 		}); ok {

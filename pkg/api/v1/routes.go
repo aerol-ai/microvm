@@ -9,6 +9,7 @@ import (
 	"github.com/aerol-ai/microvm/internal/service"
 	"github.com/aerol-ai/microvm/pkg/api/apihttp"
 	"github.com/aerol-ai/microvm/pkg/controlplane"
+	"github.com/aerol-ai/microvm/pkg/upgradewire"
 )
 
 // Deps holds the shared dependencies a version package needs from the
@@ -287,6 +288,22 @@ func RegisterRoutes(mux apihttp.Mux, d Deps) {
 	mux.Handle("GET "+cluster.PublicJoinTokensPath, op(http.HandlerFunc(h.clusterListJoinTokens)))
 	mux.Handle("DELETE "+cluster.PublicJoinTokensPath+"/{id}", op(http.HandlerFunc(h.clusterRevokeJoinToken)))
 	mux.Handle("POST "+cluster.PublicAdoptPath, op(http.HandlerFunc(h.clusterAdopt)))
+	// Cluster upgrades (plans/kubectl-style-cluster-ops.md §6,
+	// cluster_upgrade.go): the rollout for operators; the node step, the
+	// fence and release-file copies for peers.
+	mux.Handle("GET "+upgradewire.ClusterUpgradePath, op(http.HandlerFunc(h.clusterGetUpgrade)))
+	mux.Handle("POST "+upgradewire.ClusterUpgradePath, op(http.HandlerFunc(h.clusterApplyUpgrade)))
+	mux.Handle("POST "+upgradewire.ClusterUpgradeStopPath, op(h.clusterUpgradeCommand(cluster.RolloutStop)))
+	mux.Handle("POST "+upgradewire.ClusterUpgradeResumePath, op(h.clusterUpgradeCommand(cluster.RolloutResume)))
+	mux.Handle("POST "+upgradewire.ClusterUpgradeFinalizePath, op(h.clusterUpgradeCommand(cluster.RolloutFinalize)))
+	mux.Handle("POST "+upgradewire.ClusterUpgradeRollbackPath, op(h.clusterUpgradeCommand(cluster.RolloutRollback)))
+	mux.Handle("PUT "+upgradewire.ClusterUpgradeFilesPath+"/{sha256}", op(http.HandlerFunc(h.clusterUpgradeFile)))
+	mux.Handle("HEAD "+upgradewire.ClusterUpgradeFilesPath+"/{sha256}", op(http.HandlerFunc(h.clusterUpgradeFile)))
+	mux.Handle("POST "+upgradewire.ClusterLeaderTransferPath, op(http.HandlerFunc(h.clusterLeaderTransfer)))
+	mux.Handle("POST "+PathPrefix+"/cluster/nodes/{id}"+cluster.NodeUpgradeStepSuffix, internalOp(http.HandlerFunc(h.clusterNodeUpgradeStep)))
+	mux.Handle("GET "+PathPrefix+"/cluster/nodes/{id}"+cluster.NodeUpgradeStepSuffix, internalOp(http.HandlerFunc(h.clusterNodeUpgradeStatus)))
+	mux.Handle("GET "+cluster.PublicInternalUpgradeFencePath, internalOp(http.HandlerFunc(h.clusterInternalUpgradeFence)))
+	mux.Handle("GET "+cluster.PublicInternalUpgradeFilesPath+"{sha256}", internalOp(http.HandlerFunc(h.clusterInternalUpgradeFile)))
 	mux.Handle("POST "+cluster.PublicInternalJoinWritePath, internalOp(http.HandlerFunc(h.clusterInternalJoinWrite)))
 	mux.Handle("POST "+cluster.PublicInternalRenewCertPath, internalOp(http.HandlerFunc(h.clusterInternalRenewCert)))
 	mux.Handle("POST "+cluster.PublicInternalCAKeyPath, internalOp(http.HandlerFunc(h.clusterInternalCAKey)))
