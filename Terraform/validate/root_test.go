@@ -121,6 +121,28 @@ func TestRootPassesEveryVariable(t *testing.T) {
 	if !regexp.MustCompile(`(?s)variable "one_line_join" \{.*default\s+= false`).MatchString(join) {
 		t.Error("Terraform/root/join.tf must declare one_line_join with default = false, so a cluster built from a checkout keeps its machines")
 	}
+	module := hclVariable(readTF(t, "join.tf"), "one_line_join")
+	if !regexp.MustCompile(`default\s+= true`).MatchString(module) {
+		t.Error("the module's one_line_join must default to true: one-line joins are how it joins nodes")
+	}
+	// A root that passes null (the harness's module-url root does) must get
+	// the default, not a null the bootstrap template can't branch on.
+	if !regexp.MustCompile(`nullable\s+= false`).MatchString(module) {
+		t.Error("the module's one_line_join must be nullable = false")
+	}
+}
+
+// hclVariable returns the variable block named name, or "".
+func hclVariable(src, name string) string {
+	start := strings.Index(src, `variable "`+name+`" {`)
+	if start < 0 {
+		return ""
+	}
+	end := strings.Index(src[start:], "\n}\n")
+	if end < 0 {
+		return src[start:]
+	}
+	return src[start : start+end+2]
 }
 
 func TestRootForwardsEveryOutput(t *testing.T) {

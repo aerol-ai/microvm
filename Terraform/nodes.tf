@@ -264,7 +264,7 @@ resource "aws_instance" "seed" {
     # never joins a cluster.
     precondition {
       condition     = !var.one_line_join || local.has_domain
-      error_message = "one_line_join needs a domain: install.sh --local (no domain) never joins a cluster."
+      error_message = "one_line_join needs a domain: install.sh --local (no domain) never joins a cluster. Set one_line_join = false for a cluster with no domain."
     }
 
     precondition {
