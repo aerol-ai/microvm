@@ -55,6 +55,12 @@ const (
 // sandboxd is about 77 MiB).
 const MaxUploadBytes int64 = 256 << 20
 
+// MaxUploadTotalBytes caps what a node holds of uploads at once, on the
+// cluster leader and on a single node alike (§8: 2 GiB in total, plus the
+// hourly prune of uploads nothing used). A PUT past it answers 507 with
+// ErrCodeUploadQuota.
+const MaxUploadTotalBytes int64 = 2 << 30
+
 // SHA256Re is the only accepted shape of a {sha256} path segment: 64
 // lower-case hex digits. Anything else is a 400 before any file is touched.
 var SHA256Re = regexp.MustCompile(`^[0-9a-f]{64}$`)
@@ -71,6 +77,7 @@ const (
 	ErrCodeHashMismatch          = "hash_mismatch"           // upload body does not hash to its path
 	ErrCodeFilesMissing          = "files_missing"           // source=upload but the leader lacks a file
 	ErrCodeUpgradeRunning        = "upgrade_running"         // a local upgrade already holds the node's lock
+	ErrCodeUploadQuota           = "upload_quota"            // the node holds MaxUploadTotalBytes of uploads already
 )
 
 // ErrorResponse is the body of every refusal on these routes.
