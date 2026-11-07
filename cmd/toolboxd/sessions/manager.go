@@ -46,8 +46,10 @@ type Config struct {
 	// PID 1 and reaps orphans with wait4(-1), which can take a session's own
 	// exit status before cmd.Wait does; it passes its child table here so
 	// the status reaches the session instead of reading as exit 0. Nil means
-	// start, then cmd.Wait: right for a host that reaps nothing (the WASM
-	// tool host).
+	// start, then cmd.Wait: right for a parent that reaps nothing. The
+	// Manager starts real processes wherever it runs, so it belongs inside a
+	// sandbox (toolboxd), never in sandboxd: the WASM tool host stopped using
+	// it for that reason (internal/runtime/wasm/toolhost/sessions.go).
 	StartProcess func(cmd *exec.Cmd, start func() error) (wait func() (code int, signal string), err error)
 	// BaseEnv returns the environment a session starts from, before the
 	// request's own env is laid on top. Nil means os.Environ(). toolboxd

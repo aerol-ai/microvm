@@ -108,6 +108,7 @@ These calls fail. Most return HTTP 404 or 501, so your code gets an error rather
 | GPUs on create | Refused (HTTP 400). |
 | Regions and `target` | `target` is saved and returned, but it does not choose where the sandbox runs. There is no regions list. |
 | Volumes on WebAssembly sandboxes | Refused, because they have no container file system. |
+| Sessions and `process.codeRun` on WebAssembly sandboxes | Refused (HTTP 501), because they have no shell. Use `process.executeCommand`. |
 
 ## Public or private
 

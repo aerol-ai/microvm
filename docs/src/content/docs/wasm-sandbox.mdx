@@ -140,6 +140,14 @@ To build and push your own module, see [WASM modules](/wasm-modules/).
 
 `exec` works on WASM sandboxes, but there is no shell. Each `exec` runs the module from the start, with your command split on spaces as its arguments. Quotes do not group words. Files the module writes under `/work` stay there between runs.
 
+Because there is no shell, these do not work on WASM sandboxes:
+
+- [Terminal sessions](/sessions/), including Daytona SDK sessions. The server answers HTTP 501.
+- Streamed commands (`execStream`) and the Daytona SDK's `process.codeRun`. The server answers HTTP 501.
+- [SSH logins](/ssh-access/). A login opens a terminal session, so it fails too.
+
+Use `exec` instead.
+
 ## Keep the sandbox across server restarts
 
 By default, a WASM sandbox is lost when the server restarts. Set `durability` to keep it. This is the same create field described in [Durability and failover](/durability/), but WASM uses a different default.

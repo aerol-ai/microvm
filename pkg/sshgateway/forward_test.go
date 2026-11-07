@@ -105,6 +105,18 @@ func TestPublicKeyCallback_RemoteOwned(t *testing.T) {
 		}
 	})
 
+	t.Run("remote wasm or isolate sandbox denied", func(t *testing.T) {
+		for _, rt := range []string{models.RuntimeWasm, models.RuntimeIsolate} {
+			noShell := *owner
+			noShell.Runtime = rt
+			srv := ownerAPIStub(t, &noShell, "pat-1")
+			g := newRemoteGateway(t, srv.URL, "pat-1", &fakeLookup{err: errNotFoundStub})
+			if _, err := g.publicKeyCallback(context.Background())(fakeConnMetadata{user: "sb-remote"}, signer.PublicKey()); err == nil {
+				t.Fatalf("runtime %s: expected permission denied, the sandbox has no shell", rt)
+			}
+		}
+	})
+
 	t.Run("stopped remote sandbox denied", func(t *testing.T) {
 		stopped := *owner
 		stopped.Status = models.SandboxStatusStopped

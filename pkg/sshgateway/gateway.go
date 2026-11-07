@@ -352,10 +352,24 @@ func authorizeLocalSSH(sandbox *models.Sandbox, key ssh.PublicKey) error {
 	if sandbox.Status != models.SandboxStatusStarted {
 		return fmt.Errorf("sandbox not running: status=%s", sandbox.Status)
 	}
+	if err := sshRuntimeSupported(sandbox.Runtime); err != nil {
+		return err
+	}
 	if sandbox.ContainerID == "" {
 		return errors.New("sandbox has no container")
 	}
 	return authorizeKey(sandbox.SSHPublicKey, key)
+}
+
+// sshRuntimeSupported refuses the runtimes with no shell to log in to. A WASM
+// sandbox runs one module in the engine and a V8 isolate one script; neither
+// has a process a login could attach to. Without this a login reached the
+// docker exec or toolbox paths with a container that does not exist.
+func sshRuntimeSupported(runtime string) error {
+	if runtime == models.RuntimeWasm || runtime == models.RuntimeIsolate {
+		return fmt.Errorf("runtime %s has no shell to log in to", runtime)
+	}
+	return nil
 }
 
 // authorizeKey parses the sandbox's stored authorized key and compares it to the
