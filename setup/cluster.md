@@ -367,12 +367,12 @@ Look for `cluster: leader elected` and absence of any
 `SB_CREDENTIAL_ENCRYPTION_KEY is required` or `SB_GOSSIP_SECRET_KEY is
 required` errors.
 
-### Step 4 - Securely transfer the TLS bundle
+### Step 4 - Securely transfer both bundles
 
-The TLS bundle contains only the public CA certificate. Transfer the separate
-0600 credential bundle through the same protected channel because it can
-decrypt sealed cluster credentials. The CA private key is never in either
-joiner bundle.
+The TLS bundle contains only the public CA certificate. The separate 0600
+credential bundle can decrypt sealed cluster credentials, so move it only
+through a protected channel. The CA private key is in neither bundle: it
+stays on the seed, which signs each joiner's certificate in Step 5.
 
 ```bash
 # from your laptop or a jump host:
@@ -389,12 +389,17 @@ scp /tmp/aerolvm-cred-bundle.tar.gz node-c:/tmp/
 Wipe local copies after distribution:
 
 ```bash
-shred -u /tmp/aerolvm-tls-bundle.tar.gz
+shred -u /tmp/aerolvm-tls-bundle.tar.gz /tmp/aerolvm-cred-bundle.tar.gz
 ```
 
 ### Step 5 - Join the rest (node B, node C)
 
-On each joining node:
+`cluster-join.sh` runs twice on each joiner. The first pass makes the node's
+key and a certificate request (CSR) and stops. The seed signs the request.
+The second pass installs the signed certificate and starts the node in the
+cluster.
+
+**Pass 1, on the joiner (`node-b`):**
 
 ```bash
 sudo curl -fsSL https://github.com/aerol-ai/microvm/releases/latest/download/cluster-join.sh \
@@ -404,18 +409,50 @@ sudo /usr/local/bin/cluster-join.sh \
     --node-id node-b \
     --gossip-key '<key-from-cluster-init-output>' \
     --peers 10.0.0.5:7001 \
-    --tls-bundle /tmp/aerolvm-tls-bundle.tar.gz
+    --tls-bundle /tmp/aerolvm-tls-bundle.tar.gz \
+    --cred-bundle /tmp/aerolvm-cred-bundle.tar.gz
 ```
 
-The script:
+It checks the gossip key, unpacks `ca.crt` (and refuses a bundle that holds
+anything else), writes `node.key` and `node.csr` under `/etc/sandboxd/tls/`,
+prints the signing commands, and exits with code 2 before it changes
+`sandboxd`.
 
-1. Validates the gossip key length.
-2. Extracts CA + cred-key from the bundle.
-3. Mints a fresh per-node cert signed by the bundled CA.
-4. Installs the credential key at `/var/lib/sandboxd/credential_encryption.key`.
-5. Writes `/etc/sandboxd/cluster.env` with `SB_BOOTSTRAP_PEERS`,
-   `SB_GOSSIP_SECRET_KEY`, `SB_CREDENTIAL_ENCRYPTION_KEY`, and the TLS dir.
-6. Restarts `sandboxd`.
+**Sign, on the seed (`node-a`):** copy the joiner's
+`/etc/sandboxd/tls/node.csr` to the seed, then:
+
+```bash
+sudo curl -fsSL https://github.com/aerol-ai/microvm/releases/latest/download/cluster-sign-node.sh \
+  -o /usr/local/bin/cluster-sign-node.sh
+sudo chmod +x /usr/local/bin/cluster-sign-node.sh
+sudo /usr/local/bin/cluster-sign-node.sh \
+    --csr /tmp/node-b.csr --node-id node-b --out /tmp/node-b.crt
+```
+
+Copy `/tmp/node-b.crt` back to the joiner as `/tmp/node.crt`.
+
+**Pass 2, on the joiner:** the same command plus `--signed-cert`:
+
+```bash
+sudo /usr/local/bin/cluster-join.sh \
+    --node-id node-b \
+    --gossip-key '<key-from-cluster-init-output>' \
+    --peers 10.0.0.5:7001 \
+    --tls-bundle /tmp/aerolvm-tls-bundle.tar.gz \
+    --cred-bundle /tmp/aerolvm-cred-bundle.tar.gz \
+    --signed-cert /tmp/node.crt
+```
+
+This pass:
+
+1. Installs the signed `node.crt`.
+2. Installs the cluster's credential key from the credential bundle at
+   `/var/lib/sandboxd/credential_encryption.key` (or, when the seed used
+   `--key-custody wrapped`, only the wrapped key).
+3. Writes `/etc/sandboxd/cluster.env` with `SB_BOOTSTRAP_PEERS`,
+   `SB_GOSSIP_SECRET_KEY`, the credential key settings, `SB_NODE_ROLE` when
+   `--role` is given, and the TLS dir, plus the systemd drop-in that loads it.
+4. Restarts `sandboxd` and prints its cluster status.
 
 `--peers` accepts a comma-separated list - one reachable peer is enough; the
 new node discovers the rest through gossip.
@@ -887,26 +924,30 @@ sudo /usr/local/bin/cluster-init.sh \
     --api-advertise-url http://$NODE_A_PRIVATE_IP:21212
 ```
 
-Save the printed gossip key and bundle path. The bundle is at
-`./aerolvm-tls-bundle.tar.gz` by default (the script prints the exact path).
+Save the printed gossip key and both bundle paths. The bundles are at
+`./aerolvm-tls-bundle.tar.gz` and `./aerolvm-cred-bundle.tar.gz` by default
+(the script prints the exact paths).
 
-### Step 8 - Distribute the TLS bundle to `node-b` and `node-c`
+### Step 8 - Distribute both bundles to `node-b` and `node-c`
 
 From your laptop:
 
 ```bash
 scp ubuntu@<node-a-EIP>:aerolvm-tls-bundle.tar.gz /tmp/
-scp /tmp/aerolvm-tls-bundle.tar.gz ubuntu@<node-b-EIP>:/tmp/
-scp /tmp/aerolvm-tls-bundle.tar.gz ubuntu@<node-c-EIP>:/tmp/
-shred -u /tmp/aerolvm-tls-bundle.tar.gz
+scp ubuntu@<node-a-EIP>:aerolvm-cred-bundle.tar.gz /tmp/
+for n in <node-b-EIP> <node-c-EIP>; do
+  scp /tmp/aerolvm-tls-bundle.tar.gz /tmp/aerolvm-cred-bundle.tar.gz ubuntu@$n:/tmp/
+done
+shred -u /tmp/aerolvm-tls-bundle.tar.gz /tmp/aerolvm-cred-bundle.tar.gz
 ```
 
 ### Step 9 - Join `node-b` and `node-c`
 
-On each joiner:
+Each join takes two passes with a signing step on `node-a` in between, as in
+[Step 5 of the 3-node walkthrough](#step-5---join-the-rest-node-b-node-c).
 
 ```bash
-# On node-b (and node-c, with --node-id node-c):
+# Pass 1, on node-b (and node-c, with --node-id node-c):
 NODE_A_PRIVATE_IP=10.0.1.X
 GOSSIP_KEY='<key-from-step-7>'
 
@@ -918,8 +959,24 @@ sudo /usr/local/bin/cluster-join.sh \
     --node-id node-b \
     --gossip-key "$GOSSIP_KEY" \
     --peers $NODE_A_PRIVATE_IP:7001 \
-    --tls-bundle /tmp/aerolvm-tls-bundle.tar.gz
+    --tls-bundle /tmp/aerolvm-tls-bundle.tar.gz \
+    --cred-bundle /tmp/aerolvm-cred-bundle.tar.gz
+
+# Copy node-b's /etc/sandboxd/tls/node.csr to node-a as /tmp/node-b.csr, then on node-a:
+sudo /usr/local/bin/cluster-sign-node.sh --csr /tmp/node-b.csr --node-id node-b --out /tmp/node-b.crt
+
+# Copy /tmp/node-b.crt back to node-b as /tmp/node.crt, then pass 2 on node-b:
+sudo /usr/local/bin/cluster-join.sh \
+    --node-id node-b \
+    --gossip-key "$GOSSIP_KEY" \
+    --peers $NODE_A_PRIVATE_IP:7001 \
+    --tls-bundle /tmp/aerolvm-tls-bundle.tar.gz \
+    --cred-bundle /tmp/aerolvm-cred-bundle.tar.gz \
+    --signed-cert /tmp/node.crt
 ```
+
+`cluster-sign-node.sh` is installed on `node-a` in Step 5 of the 3-node
+walkthrough (download it from the release the same way).
 
 ### Step 10 - Verify
 
@@ -1054,7 +1111,9 @@ Re-running `install.sh` later does not overwrite the cluster overlay.
 ### Adding a 4th (or 5th, …) node
 
 Run `cluster-join.sh` on the new host with any reachable peer. The script
-takes the same gossip key + TLS bundle as the original joiners. The leader
+takes the same gossip key, TLS bundle and credential bundle as the original
+joiners, and the same two passes with a signing step on the seed
+([Step 5](#step-5---join-the-rest-node-b-node-c)). The leader
 adds it as a voter until `SB_CLUSTER_MAX_AUTO_VOTERS` is reached; after that,
 it is added as a non-voter.
 

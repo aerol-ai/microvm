@@ -10,16 +10,21 @@ states the rule, explains why, and gives you the implementation.
 **Terraform is the sole writer of node role. Role changes happen by
 recreating the instance, never by editing it in place.**
 
-Ansible never touches `SB_NODE_ROLE` or `/etc/sandboxd/sandboxd.env`. There
-is no `change-role.yml` playbook - and there shouldn't be.
+Ansible never writes `SB_NODE_ROLE` (it lives in `/etc/sandboxd/cluster.env`;
+`configure-ops.yml` adds only ops settings there). There is no
+`change-role.yml` playbook - and there shouldn't be.
 
 ## Why
 
 Three pieces of state describe a node's role:
 
 1. **EC2 `Role` tag** - owned by Terraform's `nodes.tf`.
-2. **`SB_NODE_ROLE` in `/etc/sandboxd/sandboxd.env`** - written by
-   `cluster-init.sh` / `cluster-join.sh` during the user_data bootstrap.
+2. **`SB_NODE_ROLE` in `/etc/sandboxd/cluster.env`** - written by
+   `cluster-init.sh` / `cluster-join.sh` (`--role`) during the user_data
+   bootstrap. It is not in `/etc/sandboxd/sandboxd.env`: that file belongs
+   to `install.sh`, and the systemd drop-in
+   `/etc/systemd/system/sandboxd.service.d/cluster.conf` layers
+   `cluster.env` on top of it.
 3. **Cloudflare A records** - created by Terraform's `dns.tf` for any node
    whose role contains `ingress`.
 
@@ -129,7 +134,7 @@ answer is to move role out of Terraform entirely:
 - Terraform launches every node as `mixed` (or some neutral default).
 - The cluster exposes `POST /v1/cluster/nodes/<id>/role`.
 - Role state lives in the Raft-backed store, reconciled into
-  `/etc/sandboxd/sandboxd.env` by a per-node reconciler that restarts
+  `/etc/sandboxd/cluster.env` by a per-node reconciler that restarts
   sandboxd when role changes.
 - DNS becomes a function of cluster state, not of `var.nodes` - either via a
   cluster-managed DNS controller, or by Terraform reading cluster state at

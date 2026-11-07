@@ -44,20 +44,25 @@ It also names four incident roles. The **incident lead** makes decisions and kee
 
 ## Scripts the runbooks use
 
-These live in [`scripts/`](https://github.com/aerol-ai/microvm/tree/main/scripts). Most run on a node, with `sudo`. `terraform.sh` runs on your own computer.
+Most run on a node, with `sudo`. `terraform.sh` runs on your own computer.
 
-| Script | What it does |
-|---|---|
-| [`install.sh`](https://github.com/aerol-ai/microvm/blob/main/scripts/install.sh) | Installs or upgrades AerolVM on one machine. See [Install on a server](/getting-started/single-node-setup/). |
-| [`uninstall.sh`](https://github.com/aerol-ai/microvm/blob/main/scripts/uninstall.sh) | Removes the AerolVM server from a machine. |
-| [`terraform.sh`](https://github.com/aerol-ai/microvm/blob/main/scripts/terraform.sh) | Runs Terraform with your `config/` files. See [Cluster setup](/cluster-setup/). |
-| [`cluster-init.sh`](https://github.com/aerol-ai/microvm/blob/main/scripts/cluster-init.sh) | Starts a new cluster on its first server node. |
-| [`cluster-join.sh`](https://github.com/aerol-ai/microvm/blob/main/scripts/cluster-join.sh) | Joins a node to an existing cluster. |
-| [`cluster-sign-node.sh`](https://github.com/aerol-ai/microvm/blob/main/scripts/cluster-sign-node.sh) | On the seed, signs a joining node's certificate request. The signing key never leaves the seed. |
-| [`sandboxd-node-lifecycle.sh`](https://github.com/aerol-ai/microvm/blob/main/scripts/sandboxd-node-lifecycle.sh) | Drains or uncordons a node, removes a member, or empties a node before a role change. |
-| [`sandboxd-backup.sh`](https://github.com/aerol-ai/microvm/blob/main/scripts/sandboxd-backup.sh) | Saves a node's database, Raft data and settings into one archive. |
-| [`sandboxd-restore.sh`](https://github.com/aerol-ai/microvm/blob/main/scripts/sandboxd-restore.sh) | Puts that archive back on a node. It writes nothing unless you pass `--force`. |
-| [`raft-lost-quorum-recover.sh`](https://github.com/aerol-ai/microvm/blob/main/scripts/raft-lost-quorum-recover.sh) | Writes the recovery file (`peers.json`) that makes one surviving server the only voter. |
+Use the copy that matches the release your servers run, not the one on `main`: `main` can hold changes your release does not have. `sudo sandboxd version` prints the release, such as `v0.6.12`.
+
+- **Shipped with every release.** The links below are the latest release's copies. For another release, use `https://github.com/aerol-ai/microvm/releases/download/<release>/<script>`.
+- **In the source only.** Open `https://github.com/aerol-ai/microvm/tree/<release>/scripts` and take the script from there.
+
+| Script | Where to get it | What it does |
+|---|---|---|
+| [`install.sh`](https://github.com/aerol-ai/microvm/releases/latest/download/install.sh) | Every release | Installs or upgrades AerolVM on one machine. See [Install on a server](/getting-started/single-node-setup/). |
+| [`uninstall.sh`](https://github.com/aerol-ai/microvm/releases/latest/download/uninstall.sh) | Every release | Removes the AerolVM server from a machine. |
+| [`cluster-init.sh`](https://github.com/aerol-ai/microvm/releases/latest/download/cluster-init.sh) | Every release | Starts a new cluster on its first server node. |
+| [`cluster-join.sh`](https://github.com/aerol-ai/microvm/releases/latest/download/cluster-join.sh) | Every release | Joins a node to an existing cluster. |
+| [`cluster-sign-node.sh`](https://github.com/aerol-ai/microvm/releases/latest/download/cluster-sign-node.sh) | Every release | On the seed, signs a joining node's certificate request. The signing key never leaves the seed. |
+| `terraform.sh` | Source, at your release | Runs Terraform with your `config/` files. See [Cluster setup](/cluster-setup/). |
+| `sandboxd-node-lifecycle.sh` | Source, at your release | Drains or uncordons a node, removes a member, or empties a node before a role change. |
+| `sandboxd-backup.sh` | Source, at your release | Saves a node's database, Raft data and settings into one archive. |
+| `sandboxd-restore.sh` | Source, at your release | Puts that archive back on a node. It writes nothing unless you pass `--force`. |
+| `raft-lost-quorum-recover.sh` | Source, at your release | Writes the recovery file (`peers.json`) that makes one surviving server the only voter. |
 
 <Aside type="caution">
 Use `raft-lost-quorum-recover.sh` only while you follow the lost-quorum runbook. It can make the cluster keep changes that a majority never agreed on. Try to bring the original voting servers back first.
