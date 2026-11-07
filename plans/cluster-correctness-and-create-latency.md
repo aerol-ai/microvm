@@ -313,7 +313,44 @@ lookups per routed request.
 
 The already-open PR #999 (store name index) is independent of all of these.
 
-## 7. Open questions
+## 7. Live run plan (AWS)
+
+**Order.** Offline first: every fix PR green on its own, then one local branch
+that merges all of them (plus the chaos scenarios of PR #1008) passes the full
+Go suite and the offline fault harness. The live runs then build from that one
+branch (`run.sh` builds from the working tree), so every fix is tested
+together. No fix PR merges until these runs pass.
+
+**Wave 1** (in parallel, one VPC each):
+
+| Run | Target | Machines | What it checks | Time (est.) | Cost (est.) |
+|---|---|---|---|---|---|
+| Chaos | `make integration-cluster-chaos` | 3 servers, 3 workers, 1 ingress; t3.medium on-demand | UC-470–479: partition, real kills, leader kill during creates, packet loss, rolling restart; C1–C7, I1–I8 | 1.5–2 h | $0.50–0.65 |
+| Split roles | `make integration-cluster-hetero-lite` | same 7-node split, on-demand | Full suite with separate server, worker and ingress nodes: C4 lease, stale reads and feed age; C6; C2; routing | ~1.5 h | ~$0.45 |
+| Mixed cluster | `make integration-cluster-mixed` | 3 × t3.medium spot | Full suite including UC-58b failover: C1, C3, C5 | ~1.5 h | ~$0.10 |
+
+**Wave 2:**
+
+| Run | Target | Machines | What it checks | Time (est.) | Cost (est.) |
+|---|---|---|---|---|---|
+| Create benchmark | `make integration-benchmark-containerd` | 3 × spot | L1: every create stage named; fills the 74–92 ms gap in 4.1 | ~1 h | ~$0.10 |
+| Single-node pool | `single-node-containerd` plus `SB_CONTAINERD_POOL_ENABLED=true` (new variant) | 1 × spot | L2: pool hits on one node | ~1 h | ~$0.03 |
+| Single node | `make integration-single` | 1 × spot | Nothing in the cluster fixes changes single-node mode | ~1 h | ~$0.03 |
+
+Total about $1.20–1.40 of EC2 (about $2 if spot is unavailable and everything
+runs on-demand), plus small S3 and disk charges. Each rerun of a failed
+scenario costs about the same as its first run.
+
+**Rows of 3.2 not covered yet:**
+
+- Kill a worker between runtime start and store write: needs a failpoint in
+  the create path to hit that exact moment; not built.
+- 1,000 concurrent creates during a leader kill: UC-473 uses 200, the most
+  three t3.medium workers hold. 1,000 needs bigger workers.
+- 72-hour churn soak: no long-running churn driver exists yet. On three spot
+  t3.medium nodes it would cost about $3–4 of EC2 once built.
+
+## 8. Open questions
 
 1. After a returning node's post-delete record has expired (C2), what is the
    rule: quarantine the local row until the leader confirms, or destroy it?
