@@ -607,39 +607,54 @@ func TestClusterInfo(t *testing.T) {
 	}
 }
 
-func TestVersionShowsClientAndServer(t *testing.T) {
+func TestVersionServerIsOptIn(t *testing.T) {
 	h, f := standardFleet(t)
-	if code := h.run("version"); code != exitOK || h.stdout.String() != "Client Version: "+versionString()+"\nServer Version: v9.9.9\n" {
-		t.Fatalf("version = %d %q", code, h.stdout.String())
+	// Plain version never asks the server (TestVersionOutputUnchanged pins
+	// its exact output).
+	if code := h.run("version"); code != exitOK || h.stdout.String() != versionString()+"\n" || len(f.queries) != 0 {
+		t.Fatalf("plain version = %d %q (queries %v)", code, h.stdout.String(), f.queries)
 	}
-	if code := h.run("version", "--json"); code != exitOK {
-		t.Fatal(h.stderr.String())
+	if code := h.run("version", "--server"); code != exitOK || h.stdout.String() != "Client Version: "+versionString()+"\nServer Version: v9.9.9\n" {
+		t.Fatalf("--server = %d %q %q", code, h.stdout.String(), h.stderr.String())
 	}
-	var v map[string]string
-	h.jsonOut(&v)
-	if v["version"] != versionString() || v["client_version"] != versionString() || v["server_version"] != "v9.9.9" || v["api_url"] != f.srv.URL {
-		t.Fatalf("version json = %+v", v)
+	for _, args := range [][]string{{"version", "-o", "json"}, {"version", "--server", "--json"}, {"version", "--output", "json"}} {
+		if code := h.run(args...); code != exitOK {
+			t.Fatalf("%v = %d %q", args, code, h.stderr.String())
+		}
+		var v map[string]string
+		h.jsonOut(&v)
+		if len(v) != 2 || v["client"] != versionString() || v["server"] != "v9.9.9" {
+			t.Fatalf("%v = %+v", args, v)
+		}
 	}
-	if code := h.run("version", "--client"); code != exitOK || h.stdout.String() != "Client Version: "+versionString()+"\n" || len(f.queries) != 2 {
-		t.Fatalf("--client = %q (queries %v)", h.stdout.String(), f.queries)
-	}
-	if code := h.run("--version"); code != exitOK || h.stdout.String() != versionString()+"\n" {
-		t.Fatalf("--version = %q", h.stdout.String())
-	}
-	// An unreachable server is a warning; the client's version still prints.
-	h.env["SB_API_URL"] = "http://127.0.0.1:1"
-	if code := h.run("version"); code != exitOK || h.stdout.String() != "Client Version: "+versionString()+"\n" || !strings.Contains(h.stderr.String(), "couldn't read the server version") {
-		t.Fatalf("unreachable = %d %q %q", code, h.stdout.String(), h.stderr.String())
-	}
-	// No login at all: nothing to ask, nothing to warn about.
-	delete(h.env, "SB_PAT_TOKEN")
-	delete(h.env, "SB_API_URL")
-	h.env["XDG_CONFIG_HOME"] = t.TempDir()
-	if code := h.run("version"); code != exitOK || h.stderr.String() != "" {
-		t.Fatalf("no login = %d %q", code, h.stderr.String())
+	if code := h.run("version", "-o", "yaml"); code != exitUsage || !strings.Contains(h.stderr.String(), "-o must be json") {
+		t.Fatalf("-o yaml = %d %q", code, h.stderr.String())
 	}
 	if code := h.run("version", "--nope"); code != exitUsage {
 		t.Fatal("bad flag")
+	}
+	// Asked for and unreachable: the client's half, the error, exit 1.
+	h.env["SB_API_URL"] = "http://127.0.0.1:1"
+	if code := h.run("version", "--server"); code != exitError || h.stdout.String() != "Client Version: "+versionString()+"\n" || h.stderr.String() == "" {
+		t.Fatalf("unreachable --server = %d %q %q", code, h.stdout.String(), h.stderr.String())
+	}
+	if code := h.run("version", "-o", "json"); code != exitError {
+		t.Fatalf("unreachable -o json = %d", code)
+	}
+	var v map[string]string
+	h.jsonOut(&v)
+	if len(v) != 1 || v["client"] != versionString() {
+		t.Fatalf("unreachable -o json = %+v", v)
+	}
+	// No login: the same, and plain version still works.
+	delete(h.env, "SB_PAT_TOKEN")
+	delete(h.env, "SB_API_URL")
+	h.env["XDG_CONFIG_HOME"] = t.TempDir()
+	if code := h.run("version", "--server"); code != exitError || !strings.Contains(h.stderr.String(), "not logged in") {
+		t.Fatalf("no login --server = %d %q", code, h.stderr.String())
+	}
+	if code := h.run("version"); code != exitOK || h.stderr.String() != "" {
+		t.Fatalf("no login plain = %d %q", code, h.stderr.String())
 	}
 }
 

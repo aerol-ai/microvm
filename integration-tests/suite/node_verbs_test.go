@@ -190,8 +190,8 @@ func TestNodeVerbsGetNodes(t *testing.T) {
 	if len(listed.Nodes) != len(members) {
 		t.Fatalf("get nodes -o json = %d nodes, the API %d", len(listed.Nodes), len(members))
 	}
-	if r := mustCLI(t, env, "version"); !strings.Contains(r.stdout, "Server Version: ") {
-		t.Fatalf("aerolvm version printed no server version: %q", r.stdout)
+	if r := mustCLI(t, env, "version", "--server"); !strings.Contains(r.stdout, "Server Version: ") {
+		t.Fatalf("aerolvm version --server printed no server version: %q", r.stdout)
 	}
 	if r := mustCLI(t, env, "cluster-info"); !strings.Contains(r.stdout, "Leader: ") {
 		t.Fatalf("cluster-info = %q", r.stdout)

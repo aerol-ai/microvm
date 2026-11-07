@@ -1107,7 +1107,7 @@ var Registry = []UseCase{
 	// §9; node_verbs_test.go, zz_node_delete_test.go). The delete pair is
 	// disruptive and permanent for the run, so it lives in the file that
 	// sorts last.
-	{ID: "UC-610", Title: "aerolvm get nodes: every member is listed with its role and gossiped build version, exactly one is Ready,Leader and a voter, no worker is a voter, -o json matches /v1/cluster/members, and version and cluster-info reach the server", Requires: []Capability{CapCluster}, Implemented: true},
+	{ID: "UC-610", Title: "aerolvm get nodes: every member is listed with its role and gossiped build version, exactly one is Ready,Leader and a voter, no worker is a voter, -o json matches /v1/cluster/members, and version --server and cluster-info reach the server", Requires: []Capability{CapCluster}, Implemented: true},
 	{ID: "UC-611", Title: "aerolvm cordon: a cordoned worker reads SchedulingDisabled and gets none of 2x-workers new sandboxes; uncordon clears the mark", Requires: []Capability{CapCluster}, Implemented: true},
 	{ID: "UC-612", Title: "GET /v1/cluster/nodes/{id} and describe node: a worker's owned count grows by the sandboxes placed on it and ?sandboxes= lists their IDs, without paging the sandbox index", Requires: []Capability{CapCluster}, Implemented: true},
 	{ID: "UC-613", Title: "aerolvm drain --delete-sandboxes: a worker with live sandboxes ends cordoned and owning none, and its sandboxes answer 404", Requires: []Capability{CapCluster}, Implemented: true},

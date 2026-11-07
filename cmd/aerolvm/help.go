@@ -438,17 +438,22 @@ working on sandboxd until an operator revokes it.
 Usage: aerolvm logout [--json]
 `
 
-const versionHelp = `Print the aerolvm version and the version of the sandboxd it talks to.
+const versionHelp = `Print the aerolvm version.
 
-Usage: aerolvm version [--client] [--json]
+Usage: aerolvm version [--json]
+       aerolvm version --server
+       aerolvm version -o json
 
-The server's version comes from the login or SB_API_URL, like any command;
-if it can't be reached, only the client's version is printed (with a
-warning) and the exit code is still 0. "aerolvm --version" prints only the
-client's version, bare.
+Plain "aerolvm version" (and "aerolvm --version") prints the client's
+version and nothing else, without calling sandboxd.
 
-  --client   skip the server
-  --json     {"version":"<client>","client_version":"...","server_version":"...","api_url":"..."}
+  --json      {"version":"<client>"}
+  --server    also ask sandboxd (the login or SB_API_URL, like any command)
+              and print "Client Version: ..." and "Server Version: ..."
+  -o json     {"client":"...","server":"..."}
+
+With --server or -o json, a sandboxd that can't be reached still prints the
+client's half, then the error, and exits 1.
 `
 
 const describeHelp = `Show one node in detail: role, status, version, Raft voter and leader,

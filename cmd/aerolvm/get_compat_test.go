@@ -4,8 +4,10 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
+	"github.com/aerol-ai/microvm/internal/agenttools/agenttoolstest"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
 
@@ -41,6 +43,36 @@ func TestGetSandboxOutputUnchanged(t *testing.T) {
 		got := fmt.Sprintf("exit %d\n--- stdout\n%s--- stderr\n%s", code, h.stdout.String(), h.stderr.String())
 		checkGoldenIn(t, "compat", tc.golden+".golden", got)
 	}
+}
+
+// TestVersionOutputUnchanged is D11 for `version`: plain `aerolvm version`,
+// --json, AEROLVM_OUTPUT=json and --version print exactly what they printed
+// before the server version existed, and none of them calls sandboxd. The
+// golden files were recorded from the CLI before the change; the server
+// version is opt-in (--server, -o json).
+func TestVersionOutputUnchanged(t *testing.T) {
+	h := newHarness(t)
+	for _, tc := range []struct {
+		args   []string
+		env    string
+		golden string
+	}{
+		{[]string{"version"}, "", "version"},
+		{[]string{"version", "--json"}, "", "version-json"},
+		{[]string{"version"}, "json", "version-json"},
+		{[]string{"--version"}, "", "version"},
+	} {
+		h.env["AEROLVM_OUTPUT"] = tc.env
+		code := h.run(tc.args...)
+		got := fmt.Sprintf("exit %d\n--- stdout\n%s--- stderr\n%s", code, h.stdout.String(), h.stderr.String())
+		checkGoldenIn(t, "compat", tc.golden+".golden", strings.ReplaceAll(got, versionString(), "VERSION"))
+	}
+	delete(h.env, "AEROLVM_OUTPUT")
+	h.fake.Observe(func(s *agenttoolstest.Server) {
+		if len(s.Requests) != 0 {
+			t.Fatalf("plain version reached sandboxd: %v", s.Requests)
+		}
+	})
 }
 
 // checkGoldenIn is checkGolden for a testdata directory of its own.

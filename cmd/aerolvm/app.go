@@ -131,7 +131,7 @@ func (a *app) verbGroups() []verbGroup {
 			{"login", "Save the sandboxd URL and token for every command", loginHelp, runLogin},
 			{"logout", "Forget the saved login", logoutHelp, runLogout},
 			{"health", "Check that sandboxd is reachable and the token works", healthHelp, runHealth},
-			{"version", "Print the aerolvm and sandboxd versions", versionHelp, runVersion},
+			{"version", "Print the aerolvm version (--server: sandboxd's too)", versionHelp, runVersion},
 			{"config", "List and switch saved contexts (clusters)", configHelp, runConfig},
 			{"mcp", "Run the MCP server over stdio, or print client setup", mcpHelp, runMCP},
 		}},
@@ -164,8 +164,7 @@ func (a *app) run(ctx context.Context, args []string) int {
 		fmt.Fprint(a.stdout, a.overview())
 		return exitOK
 	case "--version":
-		fmt.Fprintln(a.stdout, versionString())
-		return exitOK
+		return runVersion(ctx, a, nil)
 	}
 	for _, v := range a.verbs() {
 		if v.name == args[0] {

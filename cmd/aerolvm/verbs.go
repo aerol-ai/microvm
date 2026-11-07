@@ -380,34 +380,48 @@ func runHealth(ctx context.Context, a *app, args []string) int {
 	return exitOK
 }
 
-// runVersion prints the client's version and, like kubectl version, the
-// server's. "version" in --json stays the client's, as it always was. A
-// server that cannot be reached is a warning, never a failure: the client's
-// version is still known, and `aerolvm health` is the reachability check.
+// runVersion prints the client's version, bare, and with --json
+// {"version": ...}, exactly as it always has: scripts and the release check
+// read it (plan D11 keeps every verb's output). The server's version is
+// opt-in: --server prints kubectl's "Client Version / Server Version" lines
+// and -o json prints {"client","server"}. Asked for and not reachable, the
+// client's half still prints and the exit code is 1, as kubectl does.
 func runVersion(ctx context.Context, a *app, args []string) int {
 	fs, c := a.newFlagSet("version")
-	var clientOnly bool
-	fs.BoolVar(&clientOnly, "client", false, "")
+	var server bool
+	var output string
+	fs.BoolVar(&server, "server", false, "")
+	fs.StringVar(&output, "o", "", "")
+	fs.StringVar(&output, "output", "", "")
 	if _, _, err := parseArgs(fs, args); err != nil {
 		return a.flagError(c, "version", err)
 	}
-	out := map[string]string{"version": versionString(), "client_version": versionString()}
-	if !clientOnly {
-		server, apiURL, err := a.serverVersion(ctx, c)
-		switch {
-		case err == nil:
-			out["server_version"], out["api_url"] = server, apiURL
-		case apiURL != "":
-			a.note("aerolvm: couldn't read the server version from %s: %s", apiURL, agenttools.Classify(err).Message)
-		}
+	if output != "" && output != "json" {
+		return a.usageError(c, "version", "-o must be json, got %q", output)
 	}
-	if c.json {
-		a.printJSON(out)
+	if !server && output == "" {
+		if c.json {
+			a.printJSON(map[string]string{"version": versionString()})
+			return exitOK
+		}
+		fmt.Fprintln(a.stdout, versionString())
 		return exitOK
 	}
-	fmt.Fprintf(a.stdout, "Client Version: %s\n", versionString())
-	if v, ok := out["server_version"]; ok {
-		fmt.Fprintf(a.stdout, "Server Version: %s\n", dash(v))
+	srv, _, err := a.serverVersion(ctx, c)
+	if output == "json" || c.json {
+		out := map[string]string{"client": versionString()}
+		if err == nil {
+			out["server"] = srv
+		}
+		a.printJSON(out)
+	} else {
+		fmt.Fprintf(a.stdout, "Client Version: %s\n", versionString())
+		if err == nil {
+			fmt.Fprintf(a.stdout, "Server Version: %s\n", dash(srv))
+		}
+	}
+	if err != nil {
+		return a.fail(c, err, exitError)
 	}
 	return exitOK
 }
