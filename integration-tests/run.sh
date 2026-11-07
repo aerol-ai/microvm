@@ -87,6 +87,7 @@ DESTROY_ONLY=0
 OBS_SNAPSHOT_ONLY=0
 UPGRADE_FROM=""
 UPGRADE_NODE=0
+ADOPT_FROM=""
 SCENARIO=""
 # PID of the local-mode SSH port-forward, so teardown can reap it. Without this
 # the `ssh -fN` forks leak: each leftover keeps local :21212 bound, so the next
@@ -143,12 +144,22 @@ while [[ $# -gt 0 ]]; do
     # With --upgrade-from: upgrade through `sandboxd upgrade node` instead of
     # the install.sh re-run (upgrade-gate.sh --upgrade-node).
     --upgrade-node) UPGRADE_NODE=1 ;;
+    # The adopt half of the one-line join gate (plans/kubectl-style-cluster-
+    # ops.md §4.4): provision on an OLD tag with the old scripts, move every
+    # node to the local build, `sandboxd adopt`, then join a blank node with
+    # one line. Delegates to adopt-gate.sh, like --upgrade-from.
+    --adopt-from)
+      shift
+      [[ $# -gt 0 ]] || { echo "--adopt-from needs a release tag (e.g. --adopt-from v0.6.11)" >&2; exit 2; }
+      ADOPT_FROM="$1"
+      ;;
+    --adopt-from=*) ADOPT_FROM="${arg#--adopt-from=}" ;;
     -*) echo "unknown flag: $arg" >&2; exit 2 ;;
     *) SCENARIO="$arg" ;;
   esac
   shift
 done
-[[ -n "$SCENARIO" ]] || { echo "usage: run.sh <scenario|all> [--keep] [--prod-tls] [--metal-on-demand] [--no-disruptive] [--collect-logs-only] [--bench-only] [--destroy-only] [--obs-snapshot-only] [--released|--version <tag>] [--upgrade-from <tag> [--upgrade-node]] [--no-build]" >&2; exit 2; }
+[[ -n "$SCENARIO" ]] || { echo "usage: run.sh <scenario|all> [--keep] [--prod-tls] [--metal-on-demand] [--no-disruptive] [--collect-logs-only] [--bench-only] [--destroy-only] [--obs-snapshot-only] [--released|--version <tag>] [--upgrade-from <tag> [--upgrade-node]] [--adopt-from <tag>] [--no-build]" >&2; exit 2; }
 if [[ "$UPGRADE_NODE" == 1 && -z "${UPGRADE_FROM:-}" ]]; then
   echo "--upgrade-node is a way to run the --upgrade-from gate; give --upgrade-from <tag> too" >&2
   exit 2
@@ -163,6 +174,13 @@ if [[ -n "${UPGRADE_FROM:-}" ]]; then
     exec "${HERE}/upgrade-gate.sh" "$SCENARIO" --from "$UPGRADE_FROM" --keep ${GATE_ARGS[@]+"${GATE_ARGS[@]}"}
   else
     exec "${HERE}/upgrade-gate.sh" "$SCENARIO" --from "$UPGRADE_FROM" ${GATE_ARGS[@]+"${GATE_ARGS[@]}"}
+  fi
+fi
+if [[ -n "${ADOPT_FROM:-}" ]]; then
+  if [[ "$KEEP" == 1 ]]; then
+    exec "${HERE}/adopt-gate.sh" "$SCENARIO" --from "$ADOPT_FROM" --keep
+  else
+    exec "${HERE}/adopt-gate.sh" "$SCENARIO" --from "$ADOPT_FROM"
   fi
 fi
 # A pinned tag and "reuse the last local build" describe different artifact

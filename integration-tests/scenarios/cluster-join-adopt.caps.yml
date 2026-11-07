@@ -1,0 +1,13 @@
+# The adopt half of the Phase 2 gate: run only through adopt-gate.sh
+# (run.sh cluster-join-adopt --adopt-from <tag>), whose checks are
+# UC-630..634. spare-1 is a blank machine and not a member until the gate
+# joins it.
+name: cluster-join-adopt
+capabilities:
+  - docker
+  - domain
+  - cluster
+
+expected_members: 4
+
+disruptive: true

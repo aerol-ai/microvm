@@ -244,6 +244,33 @@ database backup took.
 integration-tests/run.sh single-node --upgrade-from v0.6.11 --upgrade-node
 ```
 
+## Release gate: one-line joins
+
+`plans/kubectl-style-cluster-ops.md` Phase 2 has two halves.
+
+`cluster-join-token` (3 servers, 1 ingress, 2 workers, t3.medium) builds
+every node from blank Ubuntu with Terraform `one_line_join`: the seed runs
+`install.sh ... init` with Terraform's token per role, every other node
+`install.sh ... join https://<seed>:7003 --token <t>`; no S3 hand-off, no
+CSR loop, no scp. Node certs last 10 minutes so renewal happens during the
+run. Its cases are UC-620..625 (`TestJoinToken*`; the disruptive ones delete
+and re-join a worker):
+
+```bash
+AEROL_TEST_RUN='TestJoinToken' integration-tests/run.sh cluster-join-token
+```
+
+`cluster-join-adopt` is the adopt path: provisioned on an old release with
+the old scripts, moved to this build with the `install.sh` first hop,
+adopted with `sandboxd adopt` (the seed, then every other server), and grown
+by one blank machine (`spare-1`, Terraform `nodes[].blank`) with the line
+`aerolvm join-command` prints. `adopt-gate.sh` runs it and prints
+UC-630..634 as PASS or FAIL:
+
+```bash
+integration-tests/run.sh cluster-join-adopt --adopt-from v0.6.11
+```
+
 ## Key custody scenarios
 
 Customer key custody (`plans/customer-key-custody.md` Phase 6) has five
