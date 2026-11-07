@@ -16,7 +16,7 @@ resource "aws_instance" "seed" {
   ami                         = local.seed_node.ami_id
   instance_type               = local.seed_node.instance_type
   subnet_id                   = aws_subnet.public.id
-  vpc_security_group_ids      = [aws_security_group.node.id]
+  vpc_security_group_ids      = local.node_join_role[local.seed_name] == "server" ? [aws_security_group.node.id, aws_security_group.join.id] : [aws_security_group.node.id]
   key_name                    = local.effective_key_name
   iam_instance_profile        = aws_iam_instance_profile.seed.name
   associate_public_ip_address = true
@@ -224,6 +224,12 @@ resource "aws_instance" "seed" {
     containerd_cfg         = local.containerd_cfg
     containerd_pool_cfg    = local.containerd_pool_cfg
     platform_volumes_cfg   = local.platform_volumes_cfg
+    # One-line join (join.tf): the seed registers a token per role.
+    one_line_join      = var.one_line_join
+    join_token         = ""
+    join_token_worker  = local.join_tokens["worker"]
+    join_token_ingress = local.join_tokens["ingress"]
+    join_token_server  = local.join_tokens["server"]
   }))
 
   tags = merge(
@@ -248,6 +254,13 @@ resource "aws_instance" "seed" {
     # Terraform/validate/ingress.go.
     # Wrapped custody needs a key store to wrap with; the only one this
     # module provisions is the AWS KMS key behind secret_kms_enabled.
+    # One-line joins need a domain install: the installer's --local mode
+    # never joins a cluster.
+    precondition {
+      condition     = !var.one_line_join || local.has_domain
+      error_message = "one_line_join needs a domain: install.sh --local (no domain) never joins a cluster."
+    }
+
     precondition {
       condition     = var.key_custody == "file" || var.secret_kms_enabled
       error_message = "key_custody = \"wrapped\" needs secret_kms_enabled = true: the server key is wrapped by that KMS key."
@@ -266,7 +279,7 @@ resource "aws_instance" "joiner" {
   ami                         = each.value.ami_id
   instance_type               = each.value.instance_type
   subnet_id                   = aws_subnet.public.id
-  vpc_security_group_ids      = [aws_security_group.node.id]
+  vpc_security_group_ids      = local.node_join_role[each.key] == "server" ? [aws_security_group.node.id, aws_security_group.join.id] : [aws_security_group.node.id]
   key_name                    = local.effective_key_name
   iam_instance_profile        = aws_iam_instance_profile.joiner.name
   associate_public_ip_address = true
@@ -468,6 +481,12 @@ resource "aws_instance" "joiner" {
     containerd_cfg         = local.containerd_cfg
     containerd_pool_cfg    = local.containerd_pool_cfg
     platform_volumes_cfg   = local.platform_volumes_cfg
+    # One-line join (join.tf): a joiner holds only its own role's token.
+    one_line_join      = var.one_line_join
+    join_token         = local.join_tokens[local.node_join_role[each.key]]
+    join_token_worker  = ""
+    join_token_ingress = ""
+    join_token_server  = ""
   }))
 
   depends_on = [aws_instance.seed]

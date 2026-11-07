@@ -329,9 +329,50 @@ INSTALL_ARGS+=(--key-custody wrapped --secret-provider-env /tmp/aerolvm-secret-p
 # server key of its own (with wrapped custody, a wrap through the key store).
 INSTALL_ARGS+=(--no-start)
 %{ endif ~}
+%{ if one_line_join ~}
+# One-line join (Terraform/join.tf): the install runs below as the one line
+# `install.sh ... init|join`. What this node's sandboxd needs from its first
+# cluster-mode boot (sandboxd_env, such as the node-cert TTL the join service
+# signs with) goes into cluster.env first; sandboxd init and join keep the
+# lines they do not own.
+sudo install -d -m 0755 /etc/sandboxd
+sudo tee /etc/sandboxd/cluster.env >/dev/null <<'EOF'
+# Managed by Terraform bootstrap: sandboxd_env, written before sandboxd init / join.
+%{ for k, v in sandboxd_env ~}
+${k}=${v}
+%{ endfor ~}
+EOF
+sudo chmod 0600 /etc/sandboxd/cluster.env
+%{ else ~}
 sudo /tmp/install.sh "$${INSTALL_ARGS[@]}"
+%{ endif ~}
 
 %{ if is_seed ~}
+%{ if one_line_join ~}
+###############################################################################
+# 2a. Seed, one-line join: install.sh ... init. sandboxd init makes the CA,
+# the gossip key and the server key, starts Raft, and registers Terraform's
+# token per role: worker and ingress never expire (scale-out weeks later
+# still joins), the server token lasts 24h. No S3 hand-off and no CSR loop:
+# the servers sign every joiner's cert. set +x keeps the tokens out of the
+# bootstrap log.
+###############################################################################
+set +x
+INIT_ARGS=(
+  --role '${role}'
+  --node-id '${node_name}'
+  --ingress-advertise-host '${domain}'
+  --token 'worker=${join_token_worker}:0'
+  --token 'ingress=${join_token_ingress}:0'
+  --token 'server=${join_token_server}:24h'
+)
+%{ if key_custody == "wrapped" ~}
+INIT_ARGS+=(--key-custody wrapped)
+%{ endif ~}
+curl -fsSL '${install_script_url}' | sudo bash -s -- "$${INSTALL_ARGS[@]}" init "$${INIT_ARGS[@]}"
+set -x
+echo "[bootstrap] seed started the cluster with sandboxd init"
+%{ else ~}
 ###############################################################################
 # 2a. Seed: cluster-init.sh
 #
@@ -451,6 +492,7 @@ sudo systemd-run --unit=aerolvm-csr-signer --description='AerolVM CSR signing re
   "$(( $(date +%s) + ${seed_wait_max_seconds} ))" \
   || echo "[bootstrap] WARNING: could not start the CSR signer; joiners will not get certs" >&2
 echo "[bootstrap] seed CSR signer started (deadline ${seed_wait_max_seconds}s)"
+%{ endif ~}
 
 %{ if audit_receiver_endpoint != "" && audit_receiver_url != "" ~}
 ###############################################################################
@@ -507,6 +549,42 @@ sudo systemctl enable --now aerol-audit-receiver.service \
   || echo "[bootstrap] WARNING: audit receiver failed to start" >&2
 echo "[bootstrap] audit receiver started on :${audit_receiver_port}"
 %{ endif ~}
+%{ else ~}
+%{ if one_line_join ~}
+###############################################################################
+# 2b. Joiner, one-line join: wait until the seed's join port answers for this
+# node's token (the seed registers it at the end of sandboxd init), then run
+# install.sh ... join. A join is safe to run again (the same key gets the
+# same answer), so a failed attempt is retried. set +x keeps the token out
+# of the bootstrap log.
+###############################################################################
+set +x
+JOIN_TOKEN='${join_token}'
+deadline=$(( $(date +%s) + ${seed_wait_max_seconds} ))
+until curl -fsSk --max-time 5 "https://${seed_private_ip}:7003/v1/join/cluster-info?token_id=$${JOIN_TOKEN%%.*}" >/dev/null 2>&1; do
+  if [ "$(date +%s)" -ge "$deadline" ]; then
+    echo "[bootstrap] timed out waiting for the seed's join port" >&2
+    exit 1
+  fi
+  echo "[bootstrap] waiting for the seed's join port..."
+  sleep 10
+done
+joined=0
+for attempt in 1 2 3; do
+  if curl -fsSL '${install_script_url}' | sudo bash -s -- "$${INSTALL_ARGS[@]}" join 'https://${seed_private_ip}:7003' \
+       --token "$JOIN_TOKEN" --node-id '${node_name}' --role '${role}' --ingress-advertise-host '${domain}'; then
+    joined=1
+    break
+  fi
+  echo "[bootstrap] join attempt $attempt failed; retrying" >&2
+  sleep 20
+done
+set -x
+if [ "$joined" != 1 ]; then
+  echo "[bootstrap] could not join the cluster" >&2
+  exit 1
+fi
+echo "[bootstrap] joined the cluster with sandboxd join"
 %{ else ~}
 ###############################################################################
 # 2b. Joiner: cluster-join.sh
@@ -645,6 +723,7 @@ else
   sudo /tmp/cluster-join.sh "$${JOIN_ARGS[@]}" --signed-cert /tmp/node.crt
   echo "[bootstrap] joiner installed a seed-signed cert and joined"
 fi
+%{ endif ~}
 %{ endif ~}
 
 ###############################################################################
