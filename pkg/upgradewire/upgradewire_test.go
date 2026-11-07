@@ -44,10 +44,10 @@ func TestWireNames(t *testing.T) {
 	if r.State != StatePaused || r.Direction != DirectionUpgrade || len(r.Nodes) != 1 || r.Nodes[0].State != NodeManual || r.Nodes[0].ManualCommand == "" {
 		t.Fatalf("Rollout decode: %+v", r)
 	}
-	if err := json.Unmarshal([]byte(`{"id":"r2","active_version":"v0.6.12","active_fsm_ops_version":13,"nodes":[]}`), &r); err != nil {
+	if err := json.Unmarshal([]byte(`{"id":"r2","active_version":"v0.6.12","active_fsm_ops_version":13,"nodes":[{"node_id":"s1","migrated":true}]}`), &r); err != nil {
 		t.Fatal(err)
 	}
-	if r.ActiveVersion != "v0.6.12" || r.ActiveFSMOpsVersion != 13 {
+	if r.ActiveVersion != "v0.6.12" || r.ActiveFSMOpsVersion != 13 || !r.Nodes[0].Migrated {
 		t.Fatalf("Rollout active version decode: %+v", r)
 	}
 }

@@ -199,8 +199,11 @@ type RolloutNode struct {
 	// Error is why the node failed, or why it is manual or skipped.
 	Error string `json:"error,omitempty"`
 	// ManualCommand is the command to run on a manual node.
-	ManualCommand string    `json:"manual_command,omitempty"`
-	UpdatedAt     time.Time `json:"updated_at"`
+	ManualCommand string `json:"manual_command,omitempty"`
+	// Migrated is true once the node ran its one-way schema migrations
+	// at finalize (§6.5); finalized waits for every node.
+	Migrated  bool      `json:"migrated,omitempty"`
+	UpdatedAt time.Time `json:"updated_at"`
 }
 
 // LeaderTransferRequest is the body of POST ClusterLeaderTransferPath.
