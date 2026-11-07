@@ -130,7 +130,11 @@ type Config struct {
 	// EnterpriseMode enables a fail-fast production profile. It validates that
 	// secret sealing, audit durability, resource isolation, and cluster mTLS
 	// cannot be accidentally disabled. SB_ENTERPRISE_MODE.
-	EnterpriseMode     bool
+	EnterpriseMode bool
+	// RemoteUpgrade is SB_REMOTE_UPGRADE: whether this node accepts upgrade
+	// commands over the API. Default true, false in enterprise mode unless
+	// set (remote_upgrade.go).
+	RemoteUpgrade      bool
 	PATToken           string
 	APIHost            string
 	APIPort            int
@@ -3091,6 +3095,9 @@ func load(keyTool bool) (Config, error) {
 		return Config{}, err
 	}
 	if err := cfg.loadPATScopeConfig(); err != nil {
+		return Config{}, err
+	}
+	if err := cfg.loadRemoteUpgradeConfig(); err != nil {
 		return Config{}, err
 	}
 	if err := cfg.loadNodeLabelsConfig(); err != nil {
