@@ -1113,6 +1113,10 @@ var Registry = []UseCase{
 	{ID: "UC-613", Title: "aerolvm drain --delete-sandboxes: a worker with live sandboxes ends cordoned and owning none, and its sandboxes answer 404", Requires: []Capability{CapCluster}, Implemented: true},
 	{ID: "UC-614", Title: "aerolvm delete node (DELETE /v1/cluster/nodes/{id}) removes a worker: it leaves the member list, GET node answers 404, a repeated delete exits 0, and DELETE /v1/cluster/members/{worker} still answers 404 before and after", Requires: []Capability{CapCluster}, Implemented: true},
 	{ID: "UC-615", Title: "A deleted worker cannot rejoin: its own certificate is refused on a server's internal listener with 403 \"was deleted\" (accepted before the delete), and after a sandboxd restart it stays out of the member list", Requires: []Capability{CapCluster}, Implemented: true},
+	// Upgrades without restarting sandboxes, Phase 3a live gate for mounts
+	// (plans/kubectl-style-cluster-ops.md §6.3 step 4, §6.4;
+	// z_mount_restart_test.go).
+	{ID: "UC-469", Title: "External-storage mounts survive a sandboxd restart: on the node running a sandbox with a platform volume, a file written through the mount reads back after `systemctl restart sandboxd` and a new write lands through the same mount of the same sandbox (never re-created); the mount helper is the same process before and after (adopted, not mounted again) and, on cgroup v2, runs in the aerolvm-mounts cgroup; a second sandbox on the volume reads the new file", Requires: []Capability{CapPlatformVolumes}, Implemented: true},
 }
 
 // byID is a lookup built once for the report generator.
