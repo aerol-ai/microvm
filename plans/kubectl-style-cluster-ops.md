@@ -357,7 +357,7 @@ sequenceDiagram
     S-->>N: ca.crt and HMAC(discovery key of that token, ca.crt)
     Note over N: check the CA hash or the HMAC. Trust only that CA from now on.
     N->>S: POST /v1/join with token, node ID, role, CSR
-    S->>S: one Raft op: use up token, reserve node ID for this key; then sign CSR
+    S->>S: one Raft op: use up token, reserve node ID for this key, then sign CSR
     S-->>N: node cert, gossip key, peers, credential bundle, CA key for servers only
     N->>N: write files, restart sandboxd
     N->>S: gossip join. The leader adds servers to Raft (existing code).
