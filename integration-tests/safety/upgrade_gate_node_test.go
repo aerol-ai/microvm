@@ -102,7 +102,7 @@ func TestUpgradeGateUpgradeNodeScript(t *testing.T) {
 	}
 	up := run("upgrade")
 	for k, want := range map[string]string{
-		"exit": "0", "result": "upgraded", "backup": backup, "backup_exists": "yes", "backup_took": "12ms",
+		"exit": "0", "result": "upgraded", "backup": backup, "backup_exists": "yes", "backup_took": "12ms", "backup_bytes": "3",
 		"prev_sandboxd": "yes", "prev_toolboxd": "yes", "new_sandboxd": "yes", "pid_changed": "yes", "running": "itest-abc",
 	} {
 		if up[k] != want {

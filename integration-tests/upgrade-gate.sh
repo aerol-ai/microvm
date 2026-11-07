@@ -219,6 +219,7 @@ upgrade)
   echo "backup=$backup"
   echo "backup_exists=$([[ -s "$backup" ]] && echo yes || echo no)"
   echo "backup_took=$(sed -n 's/^backed up .* in \(.*\)$/\1/p' "$stage/upgrade.err" | tail -n1)"
+  echo "backup_bytes=$([[ -f "$backup" ]] && wc -c <"$backup" | tr -d ' ')"
   for f in sandboxd toolboxd; do
     echo "prev_$f=$([[ -f "$bin/$f.prev" ]] && echo yes || echo no)"
   done
@@ -245,6 +246,9 @@ esac
 UPGNODE
   kv() { sed -n "s/^$1=//p" <<<"$2" | head -n1; }
   declare -A NODE_BEFORE
+  # How long each node's VACUUM INTO took, with sandboxd stopped: it adds
+  # to that node's downtime (eng review T15). Printed again at the end.
+  BACKUP_TIMES=()
   STAGE=/tmp/aerolvm-upgrade-node
   node_name="$(basename "$NODE_SCRIPT")"
   for ip in "${IPS[@]}"; do
@@ -256,7 +260,8 @@ UPGNODE
     on_node "$ip" "chmod 0755 $STAGE/sandboxd_linux_amd64" || true
     NODE_BEFORE[$ip]="$(on_node "$ip" "sudo bash $STAGE/$node_name before $STAGE $WANT_VERSION $FROM_TAG")" || true
     up="$(on_node "$ip" "sudo bash $STAGE/$node_name upgrade $STAGE $WANT_VERSION $FROM_TAG")" || true
-    echo "    upgrade: exit=$(kv exit "$up") result=$(kv result "$up") in $(kv seconds "$up")s, backup $(kv backup "$up") took $(kv backup_took "$up"), running=$(kv running "$up")"
+    echo "    upgrade: exit=$(kv exit "$up") result=$(kv result "$up") in $(kv seconds "$up")s, backup $(kv backup "$up") ($(kv backup_bytes "$up") bytes) took $(kv backup_took "$up"), running=$(kv running "$up")"
+    BACKUP_TIMES+=("$ip: state.db backup took $(kv backup_took "$up") for $(kv backup_bytes "$up") bytes")
     [[ "$(kv exit "$up")" == 0 && "$(kv result "$up")" == upgraded ]] ||
       die "$ip: sandboxd upgrade node exited $(kv exit "$up") with result '$(kv result "$up")'; see $STAGE/upgrade.err on the node"
     [[ "$(kv prev_sandboxd "$up")" == yes && "$(kv prev_toolboxd "$up")" == yes ]] ||
@@ -430,6 +435,11 @@ if [[ "$UPGRADE_NODE" == 1 ]]; then
   rm -f "$NODE_SCRIPT"
 fi
 
+if [[ "$UPGRADE_NODE" == 1 && ${#BACKUP_TIMES[@]} -gt 0 ]]; then
+  echo
+  echo "Database backup (VACUUM INTO, sandboxd stopped) per node:"
+  printf '  %s\n' "${BACKUP_TIMES[@]}"
+fi
 echo
 if [[ "$fail" == 0 ]]; then echo "UPGRADE-GATE PASS ($SCENARIO: $FROM_TAG -> local build)"; else echo "UPGRADE-GATE FAIL ($SCENARIO)"; fi
 exit "$fail"
