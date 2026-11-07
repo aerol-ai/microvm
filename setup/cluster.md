@@ -1170,10 +1170,39 @@ sudo journalctl -u sandboxd -f   # wait for "cluster: leader elected" or peer lo
 Quorum is preserved as long as you don't exceed `(N-1)/2` simultaneous
 restarts. For a 3-node cluster: never restart two at once.
 
-### Updating binaries
+### Upgrading
 
-Re-run `install.sh` on each node in turn (rolling). The cluster overlay is
-preserved.
+Upgrade one node at a time, like a [rolling restart](#rolling-restart). On
+each node, re-run the installer with no flags:
+
+```bash
+curl -fsSL https://aerolvm.aerol.ai | sudo bash
+```
+
+- **It remembers the node's settings.** Each run saves every option except
+  secrets to `/etc/sandboxd/node.json`, and reads the PAT, DNS token and
+  other secrets back from the env files it wrote. So a re-run keeps the
+  PAT every peer shares. A node installed before `node.json` existed has
+  its settings read back from `/etc/sandboxd/sandboxd.env` (and Caddy's
+  files) once, and the run writes `node.json`. Options you do pass win over
+  the saved ones. Add `--version vX.Y.Z` to install a given release instead
+  of the latest.
+- **It restarts `sandboxd` onto the new binary**, then waits until it
+  answers before it starts Caddy. The cluster overlay (`cluster.env` and its
+  drop-in) is never touched.
+- **Check the result** on the node, then wait until the node shows
+  `alive: true` in `/v1/cluster/members` before you move on:
+
+  ```bash
+  sudo sandboxd version
+  ```
+
+  It prints the release, the commit, and the cluster FSM op version this
+  build applies; it never starts a second daemon. `sandboxd version -o json`
+  prints the same as JSON.
+
+Upgrade the current leader (`/v1/cluster/leader`) last, so leadership moves
+only once.
 
 Go one node at a time, as in a rolling restart, but finish every server node
 in the same session. Do not leave old and new servers running side by side
