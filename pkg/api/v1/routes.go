@@ -279,6 +279,17 @@ func RegisterRoutes(mux apihttp.Mux, d Deps) {
 	mux.Handle("POST "+PathPrefix+"/cluster/nodes/{id}/storage-retired", op(http.HandlerFunc(h.clusterRetireNodeStorage)))
 	mux.Handle("DELETE "+PathPrefix+"/cluster/nodes/{id}/storage-retired", op(http.HandlerFunc(h.clusterRevokeNodeStorageRetirement)))
 	mux.Handle("GET "+PathPrefix+"/cluster/storage-retirements", op(http.HandlerFunc(h.clusterListNodeStorageRetirements)))
+	// Join service (plans/kubectl-style-cluster-ops.md §4): tokens and
+	// adopt for operators; renewal, the CA key and join writes for peers.
+	// The new machine's own calls never reach this mux: they go to the join
+	// listener (:7003) on servers.
+	mux.Handle("POST "+cluster.PublicJoinTokensPath, op(http.HandlerFunc(h.clusterCreateJoinToken)))
+	mux.Handle("GET "+cluster.PublicJoinTokensPath, op(http.HandlerFunc(h.clusterListJoinTokens)))
+	mux.Handle("DELETE "+cluster.PublicJoinTokensPath+"/{id}", op(http.HandlerFunc(h.clusterRevokeJoinToken)))
+	mux.Handle("POST "+cluster.PublicAdoptPath, op(http.HandlerFunc(h.clusterAdopt)))
+	mux.Handle("POST "+cluster.PublicInternalJoinWritePath, internalOp(http.HandlerFunc(h.clusterInternalJoinWrite)))
+	mux.Handle("POST "+cluster.PublicInternalRenewCertPath, internalOp(http.HandlerFunc(h.clusterInternalRenewCert)))
+	mux.Handle("POST "+cluster.PublicInternalCAKeyPath, internalOp(http.HandlerFunc(h.clusterInternalCAKey)))
 	mux.Handle("POST "+cluster.PublicWasmMigratePath, op(http.HandlerFunc(h.clusterWasmMigrate)))
 	mux.Handle("GET "+cluster.PublicInternalWasmMigratePath+"{id}/export", internalOp(http.HandlerFunc(h.clusterInternalWasmMigrateExport)))
 	mux.Handle("PUT "+cluster.PublicInternalWasmMigratePath+"{id}/import", internalOp(http.HandlerFunc(h.clusterInternalWasmMigrateImport)))
@@ -334,6 +345,10 @@ func withInternalMTLS(d Deps, next http.Handler) http.Handler {
 		}
 		if peerDenied(d, peerID) {
 			http.Error(w, cluster.ErrPeerDeleted.Error(), http.StatusForbidden)
+			return
+		}
+		if err := peerKeyRefused(d, r, peerID); err != nil {
+			http.Error(w, err.Error(), http.StatusForbidden)
 			return
 		}
 		if !peerMemberAlive(d, peerID) {
