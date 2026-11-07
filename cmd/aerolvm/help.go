@@ -112,6 +112,7 @@ const getHelp = `Show one sandbox, or list the nodes of a cluster.
 
 Usage: aerolvm get <sandbox>
        aerolvm get nodes [<name>...] [-o wide|json|yaml|name]
+       aerolvm get jointokens [<id>...] [-o wide|json|yaml|name]
 
 After get, a kind (nodes, node or no) lists that kind; any other word is a
 sandbox, as always. A sandbox named like a kind is not reachable this way
@@ -508,6 +509,7 @@ Examples:
 const deleteHelp = `Delete nodes from the cluster.
 
 Usage: aerolvm delete node <name>... [--force]
+       aerolvm delete jointoken <id>...   (revoke join tokens)
 
 Works for every role. A Raft server leaves the Raft configuration. A worker
 or ingress node is cordoned, its sandboxes are handed to other workers when

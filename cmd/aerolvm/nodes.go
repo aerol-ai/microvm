@@ -312,7 +312,7 @@ func (a *app) getKind(ctx context.Context, c *commonFlags, names []string, outpu
 
 // kindArgs parses describe/delete: the kind word, then its names. flags
 // adds a verb's own flags.
-func (a *app) kindArgs(verbName string, args []string, flags func(*flag.FlagSet)) (*commonFlags, string, []string, int) {
+func (a *app) kindArgs(verbName string, args []string, flags func(*flag.FlagSet)) (*commonFlags, string, string, []string, int) {
 	fs, c := a.newFlagSet(verbName)
 	var output string
 	fs.StringVar(&output, "o", "", "")
@@ -322,25 +322,29 @@ func (a *app) kindArgs(verbName string, args []string, flags func(*flag.FlagSet)
 	}
 	pos, _, err := parseArgs(fs, args)
 	if err != nil {
-		return c, "", nil, a.flagError(c, verbName, err)
+		return c, "", "", nil, a.flagError(c, verbName, err)
 	}
 	if len(pos) == 0 {
-		return c, "", nil, a.usageError(c, verbName, "expected a kind and a name, such as `aerolvm %s node <name>`", verbName)
+		return c, "", "", nil, a.usageError(c, verbName, "expected a kind and a name, such as `aerolvm %s node <name>`", verbName)
 	}
-	if _, ok := lookupKind(pos[0]); !ok {
+	kind, ok := lookupKind(pos[0])
+	if !ok {
 		hint := ""
 		if verbName == "delete" {
 			hint = "; to destroy a sandbox use `aerolvm destroy`"
 		}
-		return c, "", nil, a.usageError(c, verbName, "unknown kind %q: %s takes node (or nodes, no)%s", pos[0], verbName, hint)
+		return c, "", "", nil, a.usageError(c, verbName, "unknown kind %q: %s takes node (or nodes, no) or jointoken%s", pos[0], verbName, hint)
 	}
-	return c, output, pos[1:], -1
+	return c, kind, output, pos[1:], -1
 }
 
 func runDescribe(ctx context.Context, a *app, args []string) int {
-	c, output, names, code := a.kindArgs("describe", args, nil)
+	c, kind, output, names, code := a.kindArgs("describe", args, nil)
 	if code >= 0 {
 		return code
+	}
+	if kind != kindNode {
+		return a.usageError(c, "describe", "describe takes node; to see a join token use `aerolvm get jointokens <id> -o yaml`")
 	}
 	if len(names) != 1 {
 		return a.usageError(c, "describe", "expected one node name")
@@ -404,9 +408,12 @@ func runDescribe(ctx context.Context, a *app, args []string) int {
 
 func runDelete(ctx context.Context, a *app, args []string) int {
 	var force bool
-	c, _, names, code := a.kindArgs("delete", args, func(fs *flag.FlagSet) { fs.BoolVar(&force, "force", false, "") })
+	c, kind, _, names, code := a.kindArgs("delete", args, func(fs *flag.FlagSet) { fs.BoolVar(&force, "force", false, "") })
 	if code >= 0 {
 		return code
+	}
+	if h := extraKinds[kind]; h.delete != nil {
+		return h.delete(ctx, a, c, names)
 	}
 	if len(names) == 0 {
 		return a.usageError(c, "delete", "name at least one node")

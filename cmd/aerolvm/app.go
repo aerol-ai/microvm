@@ -119,6 +119,7 @@ func (a *app) verbGroups() []verbGroup {
 			{"cluster-info", "Show the leader, members and cluster version", clusterInfoHelp, runClusterInfo},
 			{"upgrade", "Plan, run and follow an upgrade of every node", upgradeHelp, runUpgrade},
 			{"release", "Download a release into one file for offline sites", releaseHelp, runRelease},
+			{"join-command", "Make a join token and print the command that adds a node", joinCommandHelp, runJoinCommand},
 		}},
 		{"Audit", []verb{
 			{"audit", "Verify or search nodes' audit logs", auditHelp, runAudit},

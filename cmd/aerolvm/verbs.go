@@ -161,7 +161,10 @@ func runGet(ctx context.Context, a *app, args []string) int {
 	// A kind first ("get nodes") lists that kind; any other word is a
 	// sandbox, exactly as before kinds existed (get_compat_test.go).
 	if len(pos) > 0 {
-		if _, ok := lookupKind(pos[0]); ok {
+		if kind, ok := lookupKind(pos[0]); ok {
+			if h := extraKinds[kind]; h.get != nil {
+				return h.get(ctx, a, c, pos[1:], output)
+			}
 			return a.getKind(ctx, c, pos[1:], output)
 		}
 	}

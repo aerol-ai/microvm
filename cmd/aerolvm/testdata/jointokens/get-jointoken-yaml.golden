@@ -1,0 +1,14 @@
+exit 0
+--- stdout
+created_at: "2026-11-07T10:00:00Z"
+created_by: node:srv-a
+expired: false
+expires_at: "2026-11-08T10:00:00Z"
+id: srv001
+reusable: false
+role: server
+used_by:
+    - key_hash: cc
+      node_id: srv-b
+      unix_nano: 3
+--- stderr
