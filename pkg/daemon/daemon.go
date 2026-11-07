@@ -185,6 +185,9 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 		return fmt.Errorf("open store: %w", err)
 	}
 	defer db.Close()
+	if err := runStandaloneOneWayMigrations(ctx, cfg, db); err != nil {
+		return err
+	}
 
 	// The dockerd driver ALWAYS drives DOCKER-USER, independent of the host
 	// engine choice. On a node flipped to containerd, pre-flip engine=docker
