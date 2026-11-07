@@ -53,11 +53,14 @@ func (p *Pool) ClaimPooled(ctx context.Context, sandboxID string, now time.Time)
 	}
 	raw, err := p.st.ClaimPooledContainerNetnsSlot(ctx, sandboxID, now)
 	if errors.Is(err, store.ErrNoPooledContainerNetnsSlot) {
+		// No wake on a miss: the create reserves a free slot next, and
+		// Reserve wakes the refiller once that slot is the create's.
 		return nil, false, nil
 	}
 	if err != nil {
 		return nil, false, err
 	}
+	p.wakeRefiller()
 	return slotFromStore(raw), true, nil
 }
 
@@ -243,7 +246,14 @@ func (p *Pool) RetryReleasing(ctx context.Context, host HostManager, now time.Ti
 // keeps failing is retried and logged at this pace, not every tick.
 const releasingRetryEvery = 15
 
-// Refiller maintains the pooled warm depth on a ticker.
+// Refiller maintains the pooled warm depth. A create taking a slot wakes
+// it (Pool.claimed); the ticker stays as the backstop for what no claim
+// signals: a slot a release frees while the queue is short, a failed
+// prewarm with no create behind it, and the retry of slots parked as
+// releasing. Every pass runs on Run's one goroutine, so passes never
+// overlap. That single flight is what keeps the queue at or under depth:
+// TargetDepth counts only finished warm slots, so two passes at once would
+// both fill the same gap.
 type Refiller struct {
 	pool     *Pool
 	host     HostManager
@@ -279,6 +289,10 @@ func (r *Refiller) Run(ctx context.Context) {
 	r.refillOnce(ctx)
 	ticker := time.NewTicker(r.interval)
 	defer ticker.Stop()
+	var claimed <-chan struct{} // nil without a pool: that case never fires
+	if r.pool != nil {
+		claimed = r.pool.claimed
+	}
 	for {
 		select {
 		case <-ctx.Done():
@@ -287,6 +301,10 @@ func (r *Refiller) Run(ctx context.Context) {
 			return
 		case <-ticker.C:
 			r.refillOnce(ctx)
+		case <-claimed:
+			// Only the top-up: a claim is not a tick, so a burst does not
+			// speed up the releasing retry past its every-15-ticks pace.
+			r.topUp(ctx)
 		}
 	}
 }
@@ -299,14 +317,37 @@ func (r *Refiller) refillOnce(ctx context.Context) {
 		_, _ = r.pool.RetryReleasing(ctx, r.host, r.now())
 	}
 	r.ticks++
+	r.topUp(ctx)
+}
+
+// topUp prewarms slots until the queue is back at depth. It stops at the
+// first failed prewarm (the next claim or tick tries again, so a broken CNI
+// costs one attempt per wake, not a tight loop) and once Stop is called, so
+// Stop waits for at most the one prewarm already running.
+func (r *Refiller) topUp(ctx context.Context) {
+	if r == nil || r.pool == nil || r.host == nil {
+		return
+	}
 	need, err := r.pool.TargetDepth(ctx, r.depth)
 	if err != nil || need == 0 {
 		return
 	}
 	for i := 0; i < need; i++ {
+		if r.stopping() {
+			return
+		}
 		if err := r.pool.Prewarm(ctx, r.host, r.now()); err != nil {
 			return
 		}
+	}
+}
+
+func (r *Refiller) stopping() bool {
+	select {
+	case <-r.stopCh:
+		return true
+	default:
+		return false
 	}
 }
 
