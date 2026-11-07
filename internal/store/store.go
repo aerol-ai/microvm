@@ -6136,14 +6136,6 @@ var afterTransferTapReads func()
 // both initial reads miss, covering the idempotent re-read branch.
 var afterTransferSourceNil func()
 
-// afterTapAllocateSelect is set only by tests to steal a free TAP candidate
-// before the claiming UPDATE, covering the contested-pool path.
-var afterTapAllocateSelect func(tapName string)
-
-// afterTapAllocateMiss is set only by tests to restore a free row after a
-// lost UPDATE so the next SELECT still observes pool occupancy.
-var afterTapAllocateMiss func()
-
 // ErrSandboxNameConflict is returned by Create/Upsert when the sandbox's
 // name collides with another row of the same owner, or with an existing id.
 // Names are unique per owner_ref (idx_sandboxes_name); empty names skip the
@@ -8269,77 +8261,43 @@ func (s *Store) SeedFirecrackerTapSlot(ctx context.Context, slot FirecrackerTapS
 // is returned without changes (the partial unique index guarantees at
 // most one). If no slot is free, returns ErrNoFreeFirecrackerTapSlot.
 //
-// The implementation is a two-step inside the SQLite single-writer
-// window:
-//
-//  1. SELECT a row WHERE sandbox_id IS NULL LIMIT 1.
-//  2. UPDATE that row SET sandbox_id = ?, allocated_at = ? WHERE
-//     tap_name = ? AND sandbox_id IS NULL.
-//
-// The WHERE clause on UPDATE re-checks sandbox_id IS NULL so a race
-// with a concurrent allocate of the same row updates RowsAffected=0
-// and we loop. SQLite's single-writer model makes this contest rare
-// in practice but the code stays correct under any future change.
+// The claim is one UPDATE that picks its own target and refuses when the
+// sandbox already owns a slot, so concurrent creates never collide and a
+// duplicate call gets the same slot. It used to SELECT a candidate and then
+// UPDATE it if still free, retrying up to 8 times; with more than 8
+// concurrent callers some ran out of tries while slots were free (see
+// claimContainerNetnsSlot).
 func (s *Store) AllocateFirecrackerTapSlot(ctx context.Context, sandboxID string, now time.Time) (*FirecrackerTapSlot, error) {
 	if sandboxID == "" {
 		return nil, errors.New("allocate firecracker tap slot: sandbox_id is required")
 	}
-	// Idempotency check first — if the sandbox already owns a slot,
-	// return it. Doing this before the allocate loop avoids a
-	// pessimistic UPDATE attempt that the partial unique index would
-	// reject (which would also work, but produces a noisier error).
-	if existing, err := s.GetFirecrackerTapSlotBySandbox(ctx, sandboxID); err != nil {
-		return nil, err
-	} else if existing != nil {
-		return existing, nil
-	}
-
-	// Bounded retry — under the SQLite single-writer model the contest
-	// resolves in one or two passes. The cap exists to prevent a buggy
-	// caller from spinning forever if every UPDATE fights for the same
-	// row; in practice the loop fires at most twice.
-	for attempt := 0; attempt < 8; attempt++ {
-		var candidate FirecrackerTapSlot
-		row := s.db.QueryRowContext(ctx, `
-			SELECT tap_name, cidr, host_ip, guest_ip, vsock_cid, created_at
-			FROM firecracker_tap_pool
+	var slot FirecrackerTapSlot
+	err := s.db.QueryRowContext(ctx, `
+		UPDATE firecracker_tap_pool
+		SET sandbox_id = ?, allocated_at = ?
+		WHERE tap_name = (
+			SELECT tap_name FROM firecracker_tap_pool
 			WHERE sandbox_id IS NULL
 			ORDER BY tap_name ASC
 			LIMIT 1
-		`)
-		if err := row.Scan(&candidate.TapName, &candidate.CIDR, &candidate.HostIP, &candidate.GuestIP, &candidate.VsockCID, &candidate.CreatedAt); err != nil {
-			if errors.Is(err, sql.ErrNoRows) {
-				return nil, ErrNoFreeFirecrackerTapSlot
-			}
-			return nil, fmt.Errorf("allocate firecracker tap slot (select): %w", err)
-		}
-		if afterTapAllocateSelect != nil {
-			afterTapAllocateSelect(candidate.TapName)
-		}
-
-		res, err := s.db.ExecContext(ctx, `
-			UPDATE firecracker_tap_pool
-			SET sandbox_id = ?, allocated_at = ?
-			WHERE tap_name = ? AND sandbox_id IS NULL
-		`, sandboxID, now.UTC(), candidate.TapName)
-		if err != nil {
-			return nil, fmt.Errorf("allocate firecracker tap slot (update): %w", err)
-		}
-		n, err := res.RowsAffected()
-		if err != nil {
-			return nil, fmt.Errorf("allocate firecracker tap slot (affected): %w", err)
-		}
-		if n == 1 {
-			candidate.SandboxID = sandboxID
-			candidate.AllocatedAt = now.UTC()
-			return &candidate, nil
-		}
-		if afterTapAllocateMiss != nil {
-			afterTapAllocateMiss()
-		}
-		// Lost the race; loop and pick another free slot.
+		)
+		AND NOT EXISTS (SELECT 1 FROM firecracker_tap_pool WHERE sandbox_id = ?)
+		RETURNING tap_name, cidr, host_ip, guest_ip, vsock_cid, created_at
+	`, sandboxID, now.UTC(), sandboxID).Scan(&slot.TapName, &slot.CIDR, &slot.HostIP, &slot.GuestIP, &slot.VsockCID, &slot.CreatedAt)
+	if err == nil {
+		slot.SandboxID = sandboxID
+		slot.AllocatedAt = now.UTC()
+		return &slot, nil
 	}
-	return nil, errors.New("allocate firecracker tap slot: pool contested after 8 attempts (likely allocator livelock)")
+	if !errors.Is(err, sql.ErrNoRows) {
+		return nil, fmt.Errorf("allocate firecracker tap slot: %w", err)
+	}
+	// Nothing was claimed: the sandbox already owns a slot, or none is free.
+	existing, err := s.GetFirecrackerTapSlotBySandbox(ctx, sandboxID)
+	if err != nil || existing != nil {
+		return existing, err
+	}
+	return nil, ErrNoFreeFirecrackerTapSlot
 }
 
 // ReleaseFirecrackerTapSlot returns a sandbox's slot to the pool by
@@ -8658,18 +8616,13 @@ func (s *Store) MarkFirecrackerVMMSlotFailed(ctx context.Context, slotID, errMsg
 
 // AllocateFirecrackerVMMSlot claims one 'loaded' slot for templateID +
 // sandboxID. Idempotent: if sandboxID already owns a slot, that slot
-// is returned without re-allocation (the partial unique index makes a
-// duplicate claim a hard error, but the pre-check yields a cleaner
-// happy path). If no 'loaded' slot for templateID exists, returns
-// ErrNoFreeFirecrackerVMMSlot — PR 4-B's caller falls back to cold
-// spawn rather than failing the create.
+// is returned without re-allocation. If no 'loaded' slot for templateID
+// exists, returns ErrNoFreeFirecrackerVMMSlot — PR 4-B's caller falls back
+// to cold spawn rather than failing the create.
 //
-// The allocator shape is lifted from AllocateFirecrackerTapSlot:
-// SELECT one free row, UPDATE WHERE row is still free. The UPDATE's
-// WHERE re-checks status='loaded' AND sandbox_id IS NULL so a race
-// against a concurrent allocator updates RowsAffected=0 and we loop.
-// SQLite's single writer makes the contest rare, but the loop keeps
-// correctness if the locking model ever changes.
+// Same shape as AllocateFirecrackerTapSlot: one UPDATE picks the oldest
+// loaded slot and refuses when the sandbox already owns one, so concurrent
+// creates cannot collide on a slot.
 func (s *Store) AllocateFirecrackerVMMSlot(ctx context.Context, templateID, sandboxID string, now time.Time) (*FirecrackerVMMSlot, error) {
 	if strings.TrimSpace(templateID) == "" {
 		return nil, errors.New("allocate firecracker vmm slot: template_id is required")
@@ -8677,56 +8630,39 @@ func (s *Store) AllocateFirecrackerVMMSlot(ctx context.Context, templateID, sand
 	if strings.TrimSpace(sandboxID) == "" {
 		return nil, errors.New("allocate firecracker vmm slot: sandbox_id is required")
 	}
-	if existing, err := s.GetFirecrackerVMMSlotBySandbox(ctx, sandboxID); err != nil {
-		return nil, err
-	} else if existing != nil {
-		return existing, nil
-	}
-
-	for attempt := 0; attempt < 8; attempt++ {
-		var candidate FirecrackerVMMSlot
-		var loadedAt sql.NullTime
-		row := s.db.QueryRowContext(ctx, `
-			SELECT id, template_id, status, api_socket, run_dir, vsock_cid, created_at, loaded_at
-			FROM firecracker_vmm_pool
+	var slot FirecrackerVMMSlot
+	var loadedAt sql.NullTime
+	err := s.db.QueryRowContext(ctx, `
+		UPDATE firecracker_vmm_pool
+		SET status = ?, sandbox_id = ?, allocated_at = ?
+		WHERE id = (
+			SELECT id FROM firecracker_vmm_pool
 			WHERE template_id = ? AND status = ? AND sandbox_id IS NULL
 			ORDER BY loaded_at ASC
 			LIMIT 1
-		`, templateID, FirecrackerVMMSlotStatusLoaded)
-		if err := row.Scan(&candidate.ID, &candidate.TemplateID, &candidate.Status,
-			&candidate.APISocket, &candidate.RunDir, &candidate.VsockCID,
-			&candidate.CreatedAt, &loadedAt); err != nil {
-			if errors.Is(err, sql.ErrNoRows) {
-				return nil, ErrNoFreeFirecrackerVMMSlot
-			}
-			return nil, fmt.Errorf("allocate firecracker vmm slot (select): %w", err)
-		}
+		)
+		AND NOT EXISTS (SELECT 1 FROM firecracker_vmm_pool WHERE sandbox_id = ?)
+		RETURNING id, template_id, status, api_socket, run_dir, vsock_cid, created_at, loaded_at
+	`, FirecrackerVMMSlotStatusAllocated, sandboxID, now.UTC(), templateID, FirecrackerVMMSlotStatusLoaded, sandboxID).Scan(
+		&slot.ID, &slot.TemplateID, &slot.Status, &slot.APISocket, &slot.RunDir, &slot.VsockCID,
+		&slot.CreatedAt, &loadedAt)
+	if err == nil {
 		if loadedAt.Valid {
-			candidate.LoadedAt = loadedAt.Time
+			slot.LoadedAt = loadedAt.Time
 		}
-
-		res, err := s.db.ExecContext(ctx, `
-			UPDATE firecracker_vmm_pool
-			SET status = ?, sandbox_id = ?, allocated_at = ?
-			WHERE id = ? AND status = ? AND sandbox_id IS NULL
-		`, FirecrackerVMMSlotStatusAllocated, sandboxID, now.UTC(),
-			candidate.ID, FirecrackerVMMSlotStatusLoaded)
-		if err != nil {
-			return nil, fmt.Errorf("allocate firecracker vmm slot (update): %w", err)
-		}
-		n, err := res.RowsAffected()
-		if err != nil {
-			return nil, fmt.Errorf("allocate firecracker vmm slot (affected): %w", err)
-		}
-		if n == 1 {
-			candidate.Status = FirecrackerVMMSlotStatusAllocated
-			candidate.SandboxID = sandboxID
-			candidate.AllocatedAt = now.UTC()
-			return &candidate, nil
-		}
-		// Lost the race; loop and pick another 'loaded' row.
+		slot.SandboxID = sandboxID
+		slot.AllocatedAt = now.UTC()
+		return &slot, nil
 	}
-	return nil, errors.New("allocate firecracker vmm slot: pool contested after 8 attempts (likely allocator livelock)")
+	if !errors.Is(err, sql.ErrNoRows) {
+		return nil, fmt.Errorf("allocate firecracker vmm slot: %w", err)
+	}
+	// Nothing was claimed: the sandbox already owns a slot, or none is loaded.
+	existing, err := s.GetFirecrackerVMMSlotBySandbox(ctx, sandboxID)
+	if err != nil || existing != nil {
+		return existing, err
+	}
+	return nil, ErrNoFreeFirecrackerVMMSlot
 }
 
 // ReleaseFirecrackerVMMSlot moves a sandbox's slot from 'allocated' to
