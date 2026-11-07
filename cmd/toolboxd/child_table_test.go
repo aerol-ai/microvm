@@ -2,6 +2,7 @@ package main
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"strings"
@@ -286,5 +287,36 @@ func TestSessionProcessKeepsExitStatusWhenReaperWinsTheRace(t *testing.T) {
 	}
 	if _, err := startSessionProcess(exec.Command("sh"), func() error { return errors.New("boom") }); err == nil {
 		t.Fatal("a failed start returned no error")
+	}
+}
+
+// TestIsExitStatus: a wait error that only carries the command's exit status
+// is its result, not a failure to append to stderr. The reaper's status
+// (reapedExit) is one of those: missing it made a plain "exit 3" end stderr
+// with "exit status 3" whenever the reaper won the race (UC-458 on
+// cluster-3-mixed-docker, 2026-11-07).
+func TestIsExitStatus(t *testing.T) {
+	ranExit3 := exec.Command("sh", "-c", "exit 3").Run()
+	var exitErr *exec.ExitError
+	if !errors.As(ranExit3, &exitErr) {
+		t.Fatalf("sh -c 'exit 3' gave %T %v, want an *exec.ExitError", ranExit3, ranExit3)
+	}
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"Go's exit error", ranExit3, true},
+		{"the reaper's exit status", &reapedExit{status: syscall.WaitStatus(3 << 8)}, true},
+		{"the reaper's kill", &reapedExit{status: syscall.WaitStatus(syscall.SIGKILL)}, true},
+		{"a wrapped reaper status", fmt.Errorf("wait: %w", &reapedExit{status: syscall.WaitStatus(1 << 8)}), true},
+		{"reaped elsewhere", syscall.ECHILD, true},
+		{"a spawn failure", errors.New("exec: \"nope\": executable file not found in $PATH"), false},
+		{"a pipe error", fmt.Errorf("read |0: %w", os.ErrClosed), false},
+	}
+	for _, tc := range cases {
+		if got := isExitStatus(tc.err); got != tc.want {
+			t.Errorf("%s: isExitStatus(%v) = %v, want %v", tc.name, tc.err, got, tc.want)
+		}
 	}
 }

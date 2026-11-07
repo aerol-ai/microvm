@@ -88,6 +88,19 @@ func reapedElsewhere(err error) bool {
 	return errors.Is(err, syscall.ECHILD) || errors.Is(err, syscall.ESRCH)
 }
 
+// isExitStatus reports whether a wait error only carries the command's own
+// exit status: Go's ExitError, the status the reaper collected when it won
+// the race (reapedExit, from settle), or a status already reaped elsewhere.
+// That is the command's result, not a failure, so callers must not append
+// its text to the command's stderr. Missing reapedExit here made a plain
+// "exit 3" show up as "exit status 3" at the end of stderr whenever the
+// reaper won (UC-458 on cluster-3-mixed-docker, 2026-11-07).
+func isExitStatus(err error) bool {
+	var exitErr *exec.ExitError
+	var reaped *reapedExit
+	return errors.As(err, &exitErr) || errors.As(err, &reaped) || reapedElsewhere(err)
+}
+
 // settle is wait after cmd.Wait returned err.
 func (c *trackedChild) settle(err error) error {
 	c.table.mu.Lock()
