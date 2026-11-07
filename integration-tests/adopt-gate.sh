@@ -97,9 +97,11 @@ echo "alive members on $FROM_TAG: $BEFORE_MEMBERS"
 
 step "3/6 build this tree; move every scripted node to it (the install.sh first hop)"
 make -C "$REPO_ROOT" itest-build >/dev/null
-BIN="$(ls -t "$HERE"/.build/*/sandboxd_linux_amd64 2>/dev/null | head -1)"
-[[ -n "$BIN" ]] || { echo "no cross-compiled sandboxd_linux_amd64 under .build/" >&2; exit 2; }
-BUILD_DIR="$(dirname "$BIN")"
+# This tree's own build: the newest folder under .build/ can be another
+# build (the rollout gate leaves a rollout-<version> folder there).
+BUILD_ID="$(bash "$HERE/lib/build.sh" build-id)"
+BUILD_DIR="$HERE/.build/$BUILD_ID"
+[[ -f "$BUILD_DIR/sandboxd_linux_amd64" ]] || { echo "no cross-compiled sandboxd_linux_amd64 in $BUILD_DIR" >&2; exit 2; }
 WANT_VERSION="itest-$(basename "$BUILD_DIR")"
 for f in install.sh sandboxd_linux_amd64 toolboxd_linux_amd64 checksums.txt; do
   [[ -f "$BUILD_DIR/$f" ]] || { echo "build $BUILD_DIR has no $f" >&2; exit 2; }

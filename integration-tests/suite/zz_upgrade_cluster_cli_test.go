@@ -53,6 +53,17 @@ func TestUpgradeCLICluster01Apply(t *testing.T) {
 	if !healthMode(t, c) {
 		t.Skip("needs a cluster")
 	}
+	// The harness's single-node scenarios are one-server clusters, where
+	// apply needs --allow-downtime and UC-646 has no follower to stop.
+	voters := 0
+	for _, m := range listNodeViews(t, c) {
+		if m.Voter {
+			voters++
+		}
+	}
+	if voters < 3 {
+		t.Skipf("needs three voting servers, found %d", voters)
+	}
 	before := memberVersions(t, c)
 	for _, v := range before {
 		clusterCLI.versionPrev = v

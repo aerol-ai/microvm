@@ -30,6 +30,8 @@ type fakeGuardAPI struct {
 	transfers   int
 }
 
+func (f *fakeGuardAPI) ClusterMode(context.Context) (bool, error) { return true, nil }
+
 func (f *fakeGuardAPI) Members(context.Context) (memberList, error) {
 	if f.membersErr != nil || f.legacy {
 		return memberList{Members: f.members}, f.membersErr
@@ -193,6 +195,8 @@ func TestServerStopGuardAgainstTheLocalAPI(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotAuth = append(gotAuth, r.Header.Get("Authorization"))
 		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/health":
+			json.NewEncoder(w).Encode(map[string]any{"version": "v1", "cluster_topology": "mixed"})
 		case r.Method == http.MethodGet && r.URL.Path == "/v1/cluster/members":
 			json.NewEncoder(w).Encode(map[string]any{"members": []cluster.Member{srv("s1", true, true), srv("s2", true, false), srv("s3", true, false)},
 				"raft_voters": voters})
@@ -220,7 +224,7 @@ func TestServerStopGuardAgainstTheLocalAPI(t *testing.T) {
 	if err := serverStopGuard(nodeupgrade.Paths{EnvFile: envFile}, &out)(context.Background(), false); err != nil {
 		t.Fatalf("guard: %v", err)
 	}
-	if !strings.Contains(out.String(), "handed leadership to s2") || len(gotAuth) != 2 || gotAuth[0] != "Bearer pat-9" {
+	if !strings.Contains(out.String(), "handed leadership to s2") || len(gotAuth) != 3 || gotAuth[0] != "Bearer pat-9" {
 		t.Fatalf("out=%q auth=%v", out.String(), gotAuth)
 	}
 	// Two voters gossip no longer lists: the daemon's raft_voters still
@@ -262,5 +266,56 @@ func TestServerStopGuardAgainstTheLocalAPI(t *testing.T) {
 	}
 	if err := (&localAPI{base: ts.URL, http: ts.Client()}).do(context.Background(), http.MethodPost, "/x", make(chan int), nil); err == nil {
 		t.Fatal("unmarshalable body accepted")
+	}
+}
+
+// The env files say cluster mode, but the running daemon says it is a single
+// node (a systemd drop-in turned cluster mode off after cluster.env, as the
+// single-node upgrade test does): the guard asks /health and steps aside. If
+// /health can't be read, it keeps the safe answer and checks quorum.
+func TestServerStopGuardTrustsTheRunningDaemonsMode(t *testing.T) {
+	var paths []string
+	health := map[string]any{"version": "v1"}
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.URL.Path)
+		switch r.URL.Path {
+		case "/health":
+			if health == nil {
+				http.Error(w, "down", http.StatusServiceUnavailable)
+				return
+			}
+			json.NewEncoder(w).Encode(health)
+		default:
+			http.Error(w, "no members", http.StatusServiceUnavailable)
+		}
+	}))
+	defer ts.Close()
+	old := newStopGuardAPI
+	newStopGuardAPI = func(e stopGuardEnv) stopGuardAPI { return &localAPI{base: ts.URL, pat: e.pat, http: ts.Client()} }
+	defer func() { newStopGuardAPI = old }()
+	dir := t.TempDir()
+	envFile := filepath.Join(dir, "sandboxd.env")
+	os.WriteFile(envFile, []byte("SB_PAT_TOKEN=p\n"), 0o600)
+	os.WriteFile(filepath.Join(dir, "cluster.env"), []byte("SB_ENABLE_CLUSTER=true\nSB_NODE_ID=node1\n"), 0o600)
+	guard := serverStopGuard(nodeupgrade.Paths{EnvFile: envFile}, &bytes.Buffer{})
+
+	if err := guard(context.Background(), false); err != nil {
+		t.Fatalf("single node by /health: %v", err)
+	}
+	if len(paths) != 1 || paths[0] != "/health" {
+		t.Fatalf("calls = %v, want only /health", paths)
+	}
+	// /health down, or with no version: the guard checks quorum and,
+	// unable to read members, refuses.
+	for _, h := range []map[string]any{nil, {}} {
+		health, paths = h, nil
+		if err := guard(context.Background(), false); err == nil || !strings.Contains(err.Error(), "quorum cannot be checked") {
+			t.Fatalf("health %v: err = %v", h, err)
+		}
+	}
+	// A daemon that reports a cluster by node count is a cluster too.
+	health, paths = map[string]any{"version": "v1", "cluster_nodes": 3}, nil
+	if err := guard(context.Background(), false); err == nil {
+		t.Fatal("cluster_nodes > 0 was treated as a single node")
 	}
 }

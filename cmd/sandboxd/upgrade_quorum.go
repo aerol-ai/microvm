@@ -47,6 +47,9 @@ const stopGuardTimeout = 15 * time.Second
 // stopGuardAPI is the local daemon's API: the members list and the leader
 // hand-off. Tests replace newStopGuardAPI.
 type stopGuardAPI interface {
+	// ClusterMode asks /health whether the running daemon is in cluster
+	// mode: the env files alone can be overridden by a systemd drop-in.
+	ClusterMode(ctx context.Context) (bool, error)
 	Members(ctx context.Context) (memberList, error)
 	TransferLeadership(ctx context.Context) (upgradewire.LeaderTransferResponse, error)
 }
@@ -108,7 +111,14 @@ func serverStopGuard(paths nodeupgrade.Paths, out io.Writer) func(context.Contex
 		if !e.cluster {
 			return nil
 		}
-		return guardServerStop(ctx, e, newStopGuardAPI(e), allowDowntime, out)
+		api := newStopGuardAPI(e)
+		// The env files say cluster mode, but a later drop-in may turn it
+		// off (a node taken out of its cluster). The running daemon is the
+		// truth; when it can't be asked, keep the safe answer and check.
+		if inCluster, err := api.ClusterMode(ctx); err == nil && !inCluster {
+			return nil
+		}
+		return guardServerStop(ctx, e, api, allowDowntime, out)
 	}
 }
 
@@ -244,6 +254,21 @@ func (a *localAPI) do(ctx context.Context, method, path string, body any, out an
 		return fmt.Errorf("%s %s: %w", method, path, err)
 	}
 	return nil
+}
+
+func (a *localAPI) ClusterMode(ctx context.Context) (bool, error) {
+	var h struct {
+		Version         string `json:"version"`
+		ClusterTopology string `json:"cluster_topology"`
+		ClusterNodes    int    `json:"cluster_nodes"`
+	}
+	if err := a.do(ctx, http.MethodGet, "/health", nil, &h); err != nil {
+		return false, err
+	}
+	if h.Version == "" {
+		return false, errors.New("the local sandboxd's /health has no version")
+	}
+	return h.ClusterTopology != "" || h.ClusterNodes > 0, nil
 }
 
 func (a *localAPI) Members(ctx context.Context) (memberList, error) {
