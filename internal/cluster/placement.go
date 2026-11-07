@@ -586,8 +586,55 @@ func pickTwo(c []Member) (Member, Member) {
 
 func sameNode(a, b Member) bool { return a.NodeID == b.NodeID }
 
+// reservationRetryAdmitMargin is how long a reservation must still have to
+// live for admission to treat a resend of it as a refresh. Admission reads
+// the leader's clock; the FSM decides by the time the same leader stamps on
+// the entry a moment later. Inside this margin the FSM may find the row
+// expired and reserve afresh, which needs a normal admission.
+const reservationRetryAdmitMargin = 5 // seconds
+
+// withoutLiveReservationRetries drops the reservations the FSM will apply as
+// a TTL refresh of a live reservation: same sandbox, same owner, same
+// incarnation (reservePlacementLocked's retry branch). Their load is already
+// in the pending index, so admitting them again counted one sandbox twice: a
+// create whose first answer was lost in a leader change, resent to the next
+// server, was refused on a full worker while its reservation kept the slot
+// until the TTL sweep. Found by the offline fault harness (PR #1017, Bug A).
+// A resend that changed its incarnation is admitted as usual; the FSM
+// refuses it anyway.
+func withoutLiveReservationRetries(fsm *placementFSM, reservations []reservationCommand, now int64) []reservationCommand {
+	var kept []reservationCommand
+	for i, r := range reservations {
+		if !isLiveReservationRetry(fsm, r, now) {
+			if kept != nil {
+				kept = append(kept, r)
+			}
+			continue
+		}
+		if kept == nil {
+			kept = append(make([]reservationCommand, 0, len(reservations)), reservations[:i]...)
+		}
+	}
+	if kept == nil {
+		return reservations
+	}
+	return kept
+}
+
+func isLiveReservationRetry(fsm *placementFSM, r reservationCommand, now int64) bool {
+	incarnation := strings.TrimSpace(r.IncarnationID)
+	if fsm == nil || r.SandboxID == "" || incarnation == "" {
+		return false
+	}
+	p, ok := fsm.get(r.SandboxID)
+	return ok && p.IsReserved() &&
+		strings.TrimSpace(p.OwnerNodeID) == strings.TrimSpace(r.OwnerNodeID) &&
+		strings.TrimSpace(p.IncarnationID) == incarnation &&
+		now+reservationRetryAdmitMargin <= p.ExpiresUnix
+}
+
 func (c *Cluster) admitReservationCommand(cmd command) error {
-	reservations := reservationCommands(cmd)
+	reservations := withoutLiveReservationRetries(c.fsm, reservationCommands(cmd), time.Now().Unix())
 	if len(reservations) == 0 {
 		return nil
 	}
