@@ -94,6 +94,11 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 	// here on instead of "connection refused" (liveness.go).
 	live := startLiveness(cfg.LivenessSocket, logger)
 	defer live.stop()
+	// Before anything reads a binary or the database: a node never boots
+	// on a half-swapped set of binaries (upgrade_recovery.go).
+	if err := recoverInterruptedUpgrade(ctx, cfg, logger); err != nil {
+		return err
+	}
 
 	cp := controlplane.Noop()
 	if makeProvider != nil {
@@ -188,6 +193,10 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 	if err := runStandaloneOneWayMigrations(ctx, cfg, db); err != nil {
 		return err
 	}
+	// Open and migrate are done, and nothing past them (reconcile, the
+	// secret outbox, any loop) has run: the upgrader restores its database
+	// backup only when a new binary never got here.
+	markStoreOpened(cfg, logger)
 
 	// The dockerd driver ALWAYS drives DOCKER-USER, independent of the host
 	// engine choice. On a node flipped to containerd, pre-flip engine=docker
