@@ -1,0 +1,89 @@
+exit 0
+--- stdout
+{
+  "id": "r-1",
+  "state": "staging",
+  "direction": "upgrade",
+  "target_version": "v0.6.13",
+  "previous_version": "v0.6.12",
+  "source": "upload",
+  "caller": "operator",
+  "hold": true,
+  "batch": "10%",
+  "node_timeout": "10m0s",
+  "created_at": "2026-11-07T10:00:01Z",
+  "updated_at": "2026-11-07T10:00:01Z",
+  "active_version": "v0.6.12",
+  "nodes": [
+    {
+      "node_id": "srv-a",
+      "role": "server",
+      "arch": "amd64",
+      "state": "pending",
+      "version": "v0.6.12",
+      "order": 1,
+      "updated_at": "2026-11-07T10:00:01Z"
+    },
+    {
+      "node_id": "srv-b",
+      "role": "server",
+      "arch": "amd64",
+      "state": "pending",
+      "version": "v0.6.12",
+      "order": 2,
+      "updated_at": "2026-11-07T10:00:01Z"
+    },
+    {
+      "node_id": "srv-c",
+      "role": "server",
+      "arch": "amd64",
+      "state": "pending",
+      "version": "v0.6.12",
+      "order": 3,
+      "updated_at": "2026-11-07T10:00:01Z"
+    },
+    {
+      "node_id": "ing-1",
+      "role": "ingress",
+      "arch": "amd64",
+      "state": "pending",
+      "version": "v0.6.12",
+      "order": 4,
+      "updated_at": "2026-11-07T10:00:01Z"
+    },
+    {
+      "node_id": "wkr-1",
+      "role": "worker",
+      "arch": "amd64",
+      "state": "pending",
+      "version": "v0.6.12",
+      "order": 5,
+      "batch": 1,
+      "updated_at": "2026-11-07T10:00:01Z"
+    },
+    {
+      "node_id": "wkr-2",
+      "role": "worker",
+      "arch": "amd64",
+      "state": "skipped",
+      "version": "v0.6.12",
+      "order": 6,
+      "batch": 1,
+      "error": "down when its turn came",
+      "updated_at": "2026-11-07T10:00:01Z"
+    },
+    {
+      "node_id": "wkr-3",
+      "role": "worker",
+      "arch": "amd64",
+      "state": "manual",
+      "version": "v0.6.12",
+      "order": 7,
+      "batch": 1,
+      "error": "remote upgrade is off",
+      "manual_command": "sudo sandboxd upgrade node v0.6.13 --sha256 sandboxd_linux_amd64=169ef2fd27b0f984408ea500a8ef8446cf7cf301b86d178fbd66d372574d3c94",
+      "updated_at": "2026-11-07T10:00:01Z"
+    }
+  ]
+}
+--- stderr

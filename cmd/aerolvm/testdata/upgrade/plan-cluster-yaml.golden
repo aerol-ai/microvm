@@ -1,0 +1,116 @@
+exit 0
+--- stdout
+allowed: true
+batch: 10%
+batch_size: 1
+egress_gateway: stays up
+files:
+    - caddy_linux_amd64
+    - release.json
+    - sandboxd_linux_amd64
+    - toolboxd_linux_amd64
+host_setup: changes
+mode: cluster
+nodes:
+    - action: upgrade
+      alive: true
+      node_id: srv-b
+      order: 1
+      role: server
+      tier: servers
+      version: v0.6.12
+      voter: true
+    - action: upgrade
+      alive: true
+      node_id: srv-c
+      order: 2
+      role: server
+      tier: servers
+      version: v0.6.12
+      voter: true
+    - action: upgrade
+      alive: true
+      leader: true
+      node_id: srv-a
+      order: 3
+      role: server
+      tier: servers
+      version: v0.6.12
+      voter: true
+    - action: upgrade
+      alive: true
+      node_id: ing-1
+      order: 4
+      role: ingress
+      tier: ingress
+      version: v0.6.12
+    - action: upgrade
+      alive: true
+      batch: 1
+      node_id: wkr-1
+      order: 5
+      role: worker
+      tier: workers
+      version: v0.6.12
+    - action: 'skip: down (upgraded when it is back)'
+      alive: false
+      node_id: wkr-2
+      role: worker
+      tier: workers
+      version: v0.6.12
+    - action: 'skip: already on the target'
+      alive: true
+      node_id: wkr-3
+      role: worker
+      tier: workers
+      version: v0.6.13
+    - action: upgrade
+      alive: true
+      batch: 2
+      node_id: wkr-4
+      order: 6
+      role: worker
+      tier: workers
+      version: v0.6.12
+    - action: upgrade
+      alive: true
+      batch: 3
+      node_id: wkr-5
+      order: 7
+      role: worker
+      tier: workers
+      version: v0.6.12
+one_way_migrations:
+    - 7
+release:
+    egress_gateway_protocol:
+        - 1
+        - 2
+    fsm_ops_version: 13
+    host_setup_needs_network: false
+    host_setup_sha256: 5fd06fb01e71912ce6fc80cae061c48045f2f0132a1eb28d58e7c4dc85820ec6
+    one_way_migrations:
+        - 7
+    upgrade_from_min: v0.6.12
+    version: v0.6.13
+rollback_after_finalize: false
+skew:
+    upgrade_from_min: v0.6.12
+source: release <releases>/v0.6.13 (each node downloads it)
+target_version: v0.6.13
+tiers:
+    - estimate: about 3 min
+      name: servers
+      nodes: 3
+      steps: 3
+    - estimate: about 1 min
+      name: ingress
+      nodes: 1
+      steps: 1
+    - estimate: about 3 min
+      name: workers
+      nodes: 5
+      steps: 3
+warnings:
+    - 'down nodes are skipped and upgraded when they come back; finalize waits for them: wkr-2'
+--- stderr

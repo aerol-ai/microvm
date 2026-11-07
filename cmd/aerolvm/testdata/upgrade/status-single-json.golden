@@ -1,0 +1,11 @@
+exit 0
+--- stdout
+{
+  "op": "op-1",
+  "state": "done",
+  "version": "v0.6.13",
+  "from": "v0.6.12",
+  "started_at": "2026-11-07T10:00:01Z",
+  "updated_at": "2026-11-07T10:00:05Z"
+}
+--- stderr

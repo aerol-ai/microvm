@@ -117,6 +117,8 @@ func (a *app) verbGroups() []verbGroup {
 			{"drain", "Cordon a node and wait until it runs no sandboxes", drainHelp, runDrain},
 			{"delete", "Delete a node from the cluster", deleteHelp, runDelete},
 			{"cluster-info", "Show the leader, members and cluster version", clusterInfoHelp, runClusterInfo},
+			{"upgrade", "Plan, run and follow an upgrade of every node", upgradeHelp, runUpgrade},
+			{"release", "Download a release into one file for offline sites", releaseHelp, runRelease},
 		}},
 		{"Audit", []verb{
 			{"audit", "Verify or search nodes' audit logs", auditHelp, runAudit},
