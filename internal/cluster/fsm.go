@@ -911,6 +911,24 @@ func (f *placementFSM) Apply(log *raft.Log) interface{} {
 	return res
 }
 
+// applyNow is the time an entry is applied "at": the leader's timestamp from
+// when it first appended the entry. Every decision apply makes from time
+// (whether a reservation or a delete fence has expired) must come out the
+// same on every server and on every replay, and the applying server's own
+// clock does not: a lagging follower, or a server replaying its log after a
+// restart, read a later time than the leader and could overwrite a
+// reservation the leader had refused, leaving servers that disagree on a
+// sandbox's owner and incarnation. raft sets AppendedAt once on the leader,
+// the transport sends it with the entry, and both log stores (raft-boltdb
+// and raft-wal) persist it. An entry without one (built by hand in tests)
+// falls back to the local clock.
+func applyNow(log *raft.Log) int64 {
+	if log != nil && !log.AppendedAt.IsZero() {
+		return log.AppendedAt.Unix()
+	}
+	return time.Now().Unix()
+}
+
 func (f *placementFSM) apply(log *raft.Log) interface{} {
 	cmd, err := decodeCommand(log.Data)
 	if err != nil {
@@ -927,7 +945,7 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 	// and reset to 0 on every cold restart, which broke watchers that
 	// expected a monotonic revision across restores (B9).
 	f.version = log.Index
-	now := time.Now().Unix()
+	now := applyNow(log)
 
 	switch cmd.Op {
 	case opPlace:
