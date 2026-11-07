@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"runtime"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -68,6 +69,11 @@ type nodeMeta struct {
 	// sends none and reads as "". It rides only the first two fallback tiers,
 	// so a meta near the cap loses the version before it loses RaftAddr.
 	BuildVersion string `json:"bv,omitempty"`
+	// Arch is this node's CPU type (GOARCH: "amd64", "arm64"), so a rollout
+	// knows which release files each node needs, a down node's included,
+	// and servers cache every type the fleet runs (§6.3, Codex eng finding
+	// 6). It rides the same two tiers as bv; an older peer sends none.
+	Arch string `json:"ar,omitempty"`
 }
 
 // GossipPATScope is the value a node gossips for its SB_PAT_SCOPE: "host",
@@ -95,9 +101,11 @@ type gossipDelegate struct {
 	role          string
 	publicHost    string
 	patScope      string
-	// buildVersion is gossiped as "bv". Empty in a delegate built by hand
-	// (tests), which keeps that meta byte for byte what it was.
+	// buildVersion is gossiped as "bv" and arch as "ar". Empty in a
+	// delegate built by hand (tests), which keeps that meta byte for byte
+	// what it was.
 	buildVersion string
+	arch         string
 }
 
 func newGossipDelegate(nodeID, nodeName, apiURL, dataPlaneHost, raftAddr, internalURL, role, publicHost string, admitter *capacity.Admitter) *gossipDelegate {
@@ -112,6 +120,7 @@ func newGossipDelegate(nodeID, nodeName, apiURL, dataPlaneHost, raftAddr, intern
 		role:          role,
 		publicHost:    publicHost,
 		buildVersion:  version.Version,
+		arch:          runtime.GOARCH,
 	}
 	d.refreshMeta()
 	return d
@@ -135,7 +144,7 @@ func (d *gossipDelegate) refreshMeta() {
 	meta := nodeMeta{
 		NodeID: d.nodeID, NodeName: d.nodeName, APIURL: d.apiURL, DataPlaneHost: d.dataPlaneHost,
 		RaftAddr: d.raftAddr, InternalURL: d.internalURL, Role: d.role, PublicHost: d.publicHost,
-		FSMOpsVersion: fsmOpsVersion, PATScope: patScope, BuildVersion: d.buildVersion,
+		FSMOpsVersion: fsmOpsVersion, PATScope: patScope, BuildVersion: d.buildVersion, Arch: d.arch,
 	}
 	enc, err := json.Marshal(meta)
 	if err != nil {
@@ -166,8 +175,8 @@ func (d *gossipDelegate) NodeMeta(limit int) []byte {
 			// raft/identity loss breaks voter join and cross-node routing.
 			// PATScope rides the first two tiers: dropping it only raises a
 			// false drift alert, never widens access.
-			{NodeID: d.nodeID, APIURL: d.apiURL, DataPlaneHost: d.dataPlaneHost, RaftAddr: d.raftAddr, InternalURL: d.internalURL, Role: d.role, FSMOpsVersion: fsmOpsVersion, PATScope: d.selfMeta.PATScope, BuildVersion: d.buildVersion},
-			{NodeID: d.nodeID, APIURL: d.apiURL, DataPlaneHost: d.dataPlaneHost, RaftAddr: d.raftAddr, Role: d.role, FSMOpsVersion: fsmOpsVersion, PATScope: d.selfMeta.PATScope, BuildVersion: d.buildVersion},
+			{NodeID: d.nodeID, APIURL: d.apiURL, DataPlaneHost: d.dataPlaneHost, RaftAddr: d.raftAddr, InternalURL: d.internalURL, Role: d.role, FSMOpsVersion: fsmOpsVersion, PATScope: d.selfMeta.PATScope, BuildVersion: d.buildVersion, Arch: d.arch},
+			{NodeID: d.nodeID, APIURL: d.apiURL, DataPlaneHost: d.dataPlaneHost, RaftAddr: d.raftAddr, Role: d.role, FSMOpsVersion: fsmOpsVersion, PATScope: d.selfMeta.PATScope, BuildVersion: d.buildVersion, Arch: d.arch},
 			{NodeID: d.nodeID, APIURL: d.apiURL, RaftAddr: d.raftAddr, Role: d.role, FSMOpsVersion: fsmOpsVersion},
 			{NodeID: d.nodeID, RaftAddr: d.raftAddr, Role: d.role, FSMOpsVersion: fsmOpsVersion},
 			{NodeID: d.nodeID, RaftAddr: d.raftAddr, FSMOpsVersion: fsmOpsVersion},
@@ -910,6 +919,7 @@ func memberFromMemberlistNode(n *memberlist.Node) Member {
 			m.FSMOpsVersion = meta.FSMOpsVersion
 			m.PATScope = meta.PATScope
 			m.Version = meta.BuildVersion
+			m.Arch = meta.Arch
 			// m.Capacity stays zero here — capacity no longer travels in
 			// nodeMeta (see the type comment). Cluster.Members and
 			// SelectPlacement overlay fresh capacity leases later.
@@ -945,6 +955,7 @@ func (g *gossipNode) selfMember() Member {
 		FSMOpsVersion: meta.FSMOpsVersion,
 		PATScope:      meta.PATScope,
 		Version:       meta.BuildVersion,
+		Arch:          meta.Arch,
 		Alive:         true,
 		Capacity:      snap,
 	}

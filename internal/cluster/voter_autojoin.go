@@ -73,6 +73,12 @@ func (c *Cluster) handleMemberJoin(nodeID string) {
 		// whatever role it gossips (Codex eng finding 1).
 		return
 	}
+	if c.peerObsolete(nodeID) {
+		// Below the active cluster version: it would fail ops it does not
+		// know when it replays the log. It joins Raft once upgraded
+		// (§6.5, Codex outside review finding 7).
+		return
+	}
 	raftAddr := c.peerRaftAddr(nodeID)
 	if raftAddr == "" {
 		// Metadata hasn't propagated yet. The reconcile loop will catch this.
@@ -488,6 +494,7 @@ func (c *Cluster) reconcileVoters() {
 	if c.raft == nil || c.raft.raft.State() != raft.Leader {
 		return
 	}
+	c.removeObsoleteServers()
 	for _, m := range c.gossip.members() {
 		if m.NodeID == "" || m.NodeID == c.nodeID || !m.Alive || m.RaftAddr == "" {
 			continue

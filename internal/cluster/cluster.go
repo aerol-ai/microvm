@@ -582,6 +582,9 @@ type Member struct {
 	// Version is the peer's gossiped sandboxd build ("bv"). Empty for a peer
 	// on a build that predates the field.
 	Version string `json:"version,omitempty"`
+	// Arch is the peer's gossiped CPU type ("ar"). Empty for a peer on a
+	// build that predates the field.
+	Arch string `json:"arch,omitempty"`
 	// Voter and Leader come from the Raft configuration and leadership, not
 	// gossip, so only a Raft server can fill them in (AnnotateRaftRoles).
 	// Both stay false for workers, ingress nodes and any member listed

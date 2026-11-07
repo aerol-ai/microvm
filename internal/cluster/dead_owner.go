@@ -175,6 +175,13 @@ func (c *Cluster) reconcileDeadOwners(ctx context.Context) {
 		if now.Sub(since) < grace {
 			continue
 		}
+		// A node the rollout is upgrading is restarting, not dead: no
+		// failover until its step deadline (--node-timeout) passes, so a
+		// restart longer than the grace moves none of its sandboxes (§6.2,
+		// Codex eng finding 2). Past the deadline it is judged as before.
+		if deadline, upgrading := c.fsm.upgradingDeadline(nodeID); upgrading && now.Before(deadline) {
+			continue
+		}
 		if live[nodeID] {
 			c.deadOwners.clear(nodeID)
 			continue

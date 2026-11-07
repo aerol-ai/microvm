@@ -140,6 +140,10 @@ func (c *Cluster) SelectPlacementWithCandidates(req capacity.Request) (Placement
 	// A deleted node is out of the gossip view within one refresh; until
 	// then the deny record keeps it out of the candidates.
 	denied := c.fsm.deniedNodeSet()
+	// A member below the active cluster version missed a finalize while it
+	// was down: it stays out of placement until it is upgraded (§6.5).
+	// Zero (never written) excludes nobody.
+	activeFV := c.fsm.activeFVValue()
 	candidates := make([]Member, 0, len(all))
 	// requiredReachable records whether the artifact-bound node, if any, was
 	// seen as a live capacity-reporting member. If it was and still produced
@@ -204,6 +208,10 @@ func (c *Cluster) SelectPlacementWithCandidates(req capacity.Request) (Placement
 		}
 		if drained[m.NodeID] {
 			rejects["drained"]++
+			continue
+		}
+		if activeFV > 0 && m.FSMOpsVersion > 0 && m.FSMOpsVersion < activeFV {
+			rejects["below_active_version"]++
 			continue
 		}
 		// A hard capability rule like drain, kept out of nodeFits so the

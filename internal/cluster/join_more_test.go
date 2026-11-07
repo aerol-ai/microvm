@@ -102,7 +102,7 @@ func TestJoinGossipBackedHelpers(t *testing.T) {
 		t.Fatalf("join URLs = %v (workers and dead servers are not join URLs)", got)
 	}
 	for v, want := range map[string]bool{"v1.2.3": true, "v1.2.2": true, "v0.1.0": false, version.Version: true, "v9": false} {
-		if c.joinVersionAllowed(v) != want {
+		if c.joinVersionAllowed(v, 0) != want {
 			t.Fatalf("joinVersionAllowed(%s) != %v", v, want)
 		}
 	}

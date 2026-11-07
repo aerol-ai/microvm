@@ -113,7 +113,7 @@ func TestJoinServiceEdges(t *testing.T) {
 	}
 
 	// Small helpers.
-	if c.joinVersionAllowed("") || c.joinVersionAllowed("v9.9.9") || !c.joinVersionAllowed(version.Version) {
+	if c.joinVersionAllowed("", 0) || c.joinVersionAllowed("v9.9.9", 0) || !c.joinVersionAllowed(version.Version, 0) {
 		t.Fatal("joinVersionAllowed without gossip")
 	}
 	if got := c.bootstrapPeers(); got == nil || len(got) != 0 {

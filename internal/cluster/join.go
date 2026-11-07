@@ -21,6 +21,7 @@ import (
 
 	"github.com/aerol-ai/microvm/internal/version"
 	"github.com/aerol-ai/microvm/pkg/secrets"
+	"github.com/aerol-ai/microvm/pkg/upgradewire"
 )
 
 // The cluster side of one-line joins (plans/kubectl-style-cluster-ops.md
@@ -183,6 +184,11 @@ type JoinRequest struct {
 	// Version is the joiner's sandboxd build.
 	Version string     `json:"version"`
 	Ports   *JoinPorts `json:"ports,omitempty"`
+	// FSMOpsVersion is the joiner's FSM op set (FSMOpsVersion()), so the
+	// server can tell whether its build supports the active cluster
+	// version. Optional: an older joiner sends none and is judged by its
+	// build version.
+	FSMOpsVersion int `json:"fv,omitempty"`
 }
 
 // JoinCredentials is the credential bundle: what cluster-init.sh's
@@ -609,18 +615,52 @@ func (c *Cluster) clusterID() string {
 	return CACertHash(cert)
 }
 
-// joinVersion is the build a new node should install: for now this
-// server's build. The rollout record (Phase 3b) replaces it with the
-// active version or a running rollout's target.
-func (c *Cluster) joinVersion() string { return version.Version }
+// joinVersion is the build a new node should install (§6.5): a running
+// rollout's target (the version it moves nodes to, so a rollback's is the
+// previous one), else this server's build. So a long-lived token (CEO
+// D13) never installs a build the cluster is moving away from.
+func (c *Cluster) joinVersion() string {
+	if c != nil && c.fsm != nil {
+		if r, _ := c.fsm.rolloutView(); r != nil && !rolloutTerminal(r) {
+			return targetOf(r)
+		}
+	}
+	return version.Version
+}
 
-// joinVersionAllowed reports whether a joiner on build v may join: this
-// server's build, or one some live member runs (a cluster mid-upgrade runs
-// two). Phase 3b narrows this to a rollout's previous and target versions.
-func (c *Cluster) joinVersionAllowed(v string) bool {
+// joinVersionAllowed reports whether a joiner on build v, applying FSM ops
+// of version fv (0 when an older joiner did not say), may join (§6.5):
+//
+//   - while a rollout is not finalized or rolled back, only on its target
+//     or its previous version (the rollout adds the node: done on the
+//     version it moves to, else pending and caught up); a finalizing
+//     rollout takes only its target;
+//   - otherwise only a build that supports the active cluster version:
+//     fv >= the active fv when the joiner says its fv, else the active
+//     release itself;
+//   - before the active version was ever written, this server's build or
+//     one some live member runs (a cluster mid-upgrade runs two).
+func (c *Cluster) joinVersionAllowed(v string, fv int) bool {
 	v = strings.TrimSpace(v)
 	if v == "" {
 		return false
+	}
+	if c.fsm != nil {
+		r, active := c.fsm.rolloutView()
+		if r != nil && !rolloutTerminal(r) {
+			if v == r.TargetVersion {
+				return true
+			}
+			return v == r.PreviousVersion && r.State != upgradewire.StateFinalizing
+		}
+		if active.FV > 0 {
+			if fv > 0 {
+				return fv >= active.FV
+			}
+			if active.Release != "" && v == active.Release {
+				return true
+			}
+		}
 	}
 	if v == c.joinVersion() {
 		return true
@@ -815,7 +855,7 @@ func (c *Cluster) Join(ctx context.Context, req JoinRequest, source netip.Addr) 
 	if !ValidJoinNodeID(nodeID) {
 		return JoinResponse{}, fmt.Errorf("%w: %q", ErrJoinNodeIDInvalid, req.NodeID)
 	}
-	if !c.joinVersionAllowed(req.Version) {
+	if !c.joinVersionAllowed(req.Version, req.FSMOpsVersion) {
 		return JoinResponse{}, fmt.Errorf("%w: %q (cluster runs %s)", ErrJoinVersion, req.Version, c.joinVersion())
 	}
 	csr, err := ParseCertificateRequestPEM([]byte(req.CSR))
