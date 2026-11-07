@@ -471,6 +471,8 @@ A placed sandbox stays on its owner node, and every other node forwards requests
 
 **Loop detection.** A stale placement view could bounce a request between two nodes that each think the other owns sandbox X. `forward.go` sets `X-Cluster-Forwarded: 1` on the way out. A node that receives a request with that header, and is about to forward it again, returns 421 Misdirected Request instead. The caller then retries against fresh placement.
 
+**A server cut off from the leader stops answering placement questions.** Worker and ingress nodes keep no placement state; they ask a server-role node. A follower's copy only moves when the leader sends it changes, so a follower on the wrong side of a network split would keep naming an owner the leader may already have replaced. Once a follower has heard nothing from the leader for twice the Raft heartbeat timeout (2 seconds by default), it answers those questions with 503, and the asking node tries the next server. The leader always answers. `stale_read.go` holds the rule.
+
 Every node runs the same check on a request for a sandbox, whether the request came from a caller or from another node:
 
 ```mermaid

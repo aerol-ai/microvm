@@ -1326,6 +1326,9 @@ func (h *handlers) clusterInternalPlacementByName(w http.ResponseWriter, r *http
 		apihttp.WriteError(w, http.StatusServiceUnavailable, "cluster: not enabled on this node")
 		return
 	}
+	if refuseStalePlacementRead(w, c) {
+		return
+	}
 	// Raw-key contract: the path carries one nameIndex key, and the worker
 	// agent applies the per-owner rules itself (cluster.Agent.OwnerOfName).
 	id, owner, err := c.OwnerOfNameKey(string(decoded))
@@ -1366,6 +1369,22 @@ func writeInternalNoPlacement(w http.ResponseWriter, c cluster.Client) {
 	apihttp.WriteError(w, http.StatusNotFound, "no placement record")
 }
 
+// refuseStalePlacementRead answers 503 + Retry-After, and reports true, when
+// this server is a follower that has lost contact with the raft leader
+// (cluster.ErrStalePlacementView). Its FSM stopped moving when the contact
+// did, so any answer, a row or an absence, may describe an owner the leader
+// has since replaced. The agent asks the next server after a 503. The leader
+// is never refused.
+func refuseStalePlacementRead(w http.ResponseWriter, c cluster.Client) bool {
+	if cluster.PlacementViewFresh(c) {
+		return false
+	}
+	cluster.RecordStalePlacementReadReject()
+	w.Header().Set("Retry-After", strconv.Itoa(cluster.LeaderChangeRetryAfterSeconds))
+	apihttp.WriteError(w, http.StatusServiceUnavailable, cluster.ErrStalePlacementView.Error())
+	return true
+}
+
 func (h *handlers) writeInternalPlacement(w http.ResponseWriter, id string) {
 	if id == "" {
 		apihttp.WriteError(w, http.StatusBadRequest, "sandbox id required")
@@ -1374,6 +1393,9 @@ func (h *handlers) writeInternalPlacement(w http.ResponseWriter, id string) {
 	c := h.deps.Service.Cluster()
 	if c == nil {
 		apihttp.WriteError(w, http.StatusServiceUnavailable, "cluster: not enabled on this node")
+		return
+	}
+	if refuseStalePlacementRead(w, c) {
 		return
 	}
 	p, ok := c.PlacementOf(id)
@@ -1498,6 +1520,9 @@ func (h *handlers) clusterInternalPlacements(w http.ResponseWriter, r *http.Requ
 		apihttp.WriteError(w, http.StatusServiceUnavailable, "cluster: not enabled on this node")
 		return
 	}
+	if refuseStalePlacementRead(w, c) {
+		return
+	}
 	if !cluster.CaughtUp(c) {
 		// The whole view, still short of rows: the agent would read every
 		// missing row as absent.
@@ -1522,6 +1547,9 @@ func (h *handlers) clusterInternalPlacementsQuery(w http.ResponseWriter, r *http
 		apihttp.WriteError(w, http.StatusBadRequest, "invalid JSON body")
 		return
 	}
+	if refuseStalePlacementRead(w, c) {
+		return
+	}
 	placements := c.PlacementsForShards(filter)
 	for i := range placements {
 		redactPlacementSecretFields(&placements[i])
@@ -1538,6 +1566,9 @@ func (h *handlers) clusterInternalPlacementsPage(w http.ResponseWriter, r *http.
 	var req cluster.PlacementPageRequest
 	if err := apihttp.DecodeJSON(w, r, &req); err != nil {
 		apihttp.WriteError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	if refuseStalePlacementRead(w, c) {
 		return
 	}
 	if !cluster.CaughtUp(c) {
@@ -1589,7 +1620,16 @@ func (h *handlers) clusterInternalPlacementChanges(w http.ResponseWriter, r *htt
 		}
 		wait = d
 	}
+	if refuseStalePlacementRead(w, c) {
+		return
+	}
 	resp := srv.PlacementChanges(r.Context(), since, wait)
+	// Checked again after the park: a poll can wait up to MaxPlacementChangesWait,
+	// and a server that lost its leader meanwhile would answer "nothing
+	// changed" from a view that stopped moving when the contact did.
+	if refuseStalePlacementRead(w, c) {
+		return
+	}
 	for i := range resp.Changes {
 		if resp.Changes[i].Placement != nil {
 			redactPlacementSecretFields(resp.Changes[i].Placement)
@@ -1630,6 +1670,9 @@ func (h *handlers) clusterInternalOwnedRecovery(w http.ResponseWriter, r *http.R
 	if !ok {
 		// Only a server-role node holds the FSM this answer comes from.
 		apihttp.WriteError(w, http.StatusServiceUnavailable, "cluster: node holds no placement state")
+		return
+	}
+	if refuseStalePlacementRead(w, c) {
 		return
 	}
 	apihttp.WriteJSON(w, http.StatusOK, owned.OwnedRecoveryPlacements(ownerID, req.Limit, req.PageToken))
@@ -1700,6 +1743,9 @@ func (h *handlers) clusterInternalPlacementsByIDs(w http.ResponseWriter, r *http
 	}
 	if len(req.IDs) > cluster.MaxPlacementPageLimit {
 		apihttp.WriteError(w, http.StatusBadRequest, "too many placement ids")
+		return
+	}
+	if refuseStalePlacementRead(w, c) {
 		return
 	}
 	if !cluster.CaughtUp(c) {
