@@ -194,7 +194,9 @@ func TestRestoreBringsTheArchivesKeySet(t *testing.T) {
 func TestRestoreReadsTheScriptsArchive(t *testing.T) {
 	archive := filepath.Join(t.TempDir(), "old.tgz")
 	writeTar(t, archive,
+		tarEntry{name: "./._."}, // macOS tar's extended attributes
 		tarEntry{name: "./"}, tarEntry{name: "./MANIFEST.txt", body: "created_utc=x\n"},
+		tarEntry{name: "./etc/sandboxd/._sandboxd.env", body: "xattrs"},
 		tarEntry{name: "./var/"}, tarEntry{name: "./var/lib/"}, tarEntry{name: "./var/lib/sandboxd/"},
 		tarEntry{name: "./var/lib/sandboxd/state.db", body: "db", mode: 0o640},
 		tarEntry{name: "./var/lib/sandboxd/raft/", mode: 0o700},

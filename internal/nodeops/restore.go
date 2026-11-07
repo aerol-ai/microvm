@@ -261,7 +261,7 @@ func scanArchive(file string) (*archiveIndex, error) {
 		if err != nil {
 			return nil, fmt.Errorf("read archive: %w", err)
 		}
-		if h.Typeflag == tar.TypeXGlobalHeader {
+		if h.Typeflag == tar.TypeXGlobalHeader || appleDouble(h.Name) {
 			continue
 		}
 		name, err := entryName(h.Name)
@@ -295,6 +295,12 @@ func scanArchive(file string) (*archiveIndex, error) {
 		return nil, err
 	}
 	return idx, nil
+}
+
+// appleDouble is a "._name" entry macOS tar adds for extended attributes,
+// when an archive was repacked on a Mac. It is never node data.
+func appleDouble(raw string) bool {
+	return strings.HasPrefix(path.Base(strings.TrimSuffix(raw, "/")), "._")
 }
 
 // entryName is an archive name without "./" and a trailing slash. A name
@@ -412,7 +418,7 @@ func (r *restorer) extract(file string) error {
 		if err != nil {
 			return err
 		}
-		if h.Typeflag == tar.TypeXGlobalHeader {
+		if h.Typeflag == tar.TypeXGlobalHeader || appleDouble(h.Name) {
 			continue
 		}
 		name, err := entryName(h.Name)
