@@ -23,21 +23,14 @@ import (
 
 const kindJoinToken = "jointoken"
 
-// kindHandler serves a kind that lives outside nodes.go, so each kind's
-// file registers itself and the get/delete dispatch stays one line.
-type kindHandler struct {
-	get    func(ctx context.Context, a *app, c *commonFlags, names []string, output string) int
-	delete func(ctx context.Context, a *app, c *commonFlags, names []string) int
+// getJoinTokensKind and deleteJoinTokensKind plug join tokens into the
+// kind table (resourceKinds).
+func getJoinTokensKind(ctx context.Context, a *app, c *commonFlags, call kindCall) int {
+	return getJoinTokens(ctx, a, c, call.names, call.output)
 }
 
-// extraKinds maps a kind to its handler.
-var extraKinds = map[string]kindHandler{}
-
-func init() {
-	for _, alias := range []string{"jointoken", "jointokens", "join-token", "join-tokens", "jt"} {
-		kindAliases[alias] = kindJoinToken
-	}
-	extraKinds[kindJoinToken] = kindHandler{get: getJoinTokens, delete: deleteJoinTokens}
+func deleteJoinTokensKind(ctx context.Context, a *app, c *commonFlags, call kindCall) int {
+	return deleteJoinTokens(ctx, a, c, call.names)
 }
 
 // joinInstallerURL is the installer the printed command fetches.
@@ -241,7 +234,7 @@ func getJoinTokens(ctx context.Context, a *app, c *commonFlags, names []string, 
 		for i, t := range tokens {
 			raws[i] = t.raw
 		}
-		a.printObjects(format, "tokens", raws, len(names) == 1)
+		a.printObjects(format, "tokens", rawItems(raws), len(names) == 1)
 		return exitOK
 	case "name":
 		for _, t := range tokens {

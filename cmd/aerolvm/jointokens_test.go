@@ -197,7 +197,7 @@ func TestGetAndDeleteJoinTokens(t *testing.T) {
 		{[]string{"get", "jointokens", "-o", "bogus"}, exitUsage, "-o must be wide, json, yaml or name"},
 		{[]string{"delete", "jointoken"}, exitUsage, "name at least one join token"},
 		{[]string{"delete", "jointoken", "bad"}, exitError, "bad join request"},
-		{[]string{"describe", "jointoken", "wrk001"}, exitUsage, "describe takes node"},
+		{[]string{"describe", "jointoken", "wrk001"}, exitUsage, "describe does not take jointokens"},
 		{[]string{"delete", "widget", "x"}, exitUsage, "or jointoken"},
 	} {
 		if code := h.run(tc.args...); code != tc.code || !strings.Contains(h.stderr.String(), tc.want) {

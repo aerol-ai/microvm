@@ -1,0 +1,7 @@
+exit 0
+--- stdout
+NAME   ID                    STATUS    RUNTIME   AGE
+box    sb-0000000000000001   started   docker    34d
+db     sb-0000000000000002   started   docker    5h
+-      sb-0000000000000003   stopped   wasm      45s
+--- stderr

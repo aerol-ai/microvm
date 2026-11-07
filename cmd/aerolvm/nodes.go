@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"flag"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -15,7 +14,6 @@ import (
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/agenttools"
-	"gopkg.in/yaml.v3"
 )
 
 // Node verbs in kubectl grammar (plans/kubectl-style-cluster-ops.md §3.2,
@@ -23,19 +21,8 @@ import (
 // cluster-info are their own verbs. They call the fleet.admin /v1/cluster
 // routes through callAPI, like token and whoami: no SDK exposes /v1/cluster.
 //
-// After get, describe or delete, the first word is a kind when it names one
-// (kindAliases); otherwise get keeps meaning "show one sandbox", with exactly
-// the output it always had.
-
-const kindNode = "node"
-
-// kindAliases maps every accepted spelling to its kind.
-var kindAliases = map[string]string{"node": kindNode, "nodes": kindNode, "no": kindNode}
-
-func lookupKind(word string) (string, bool) {
-	kind, ok := kindAliases[strings.ToLower(word)]
-	return kind, ok
-}
+// The kind dispatch (get, describe, delete) is kinds.go; nodes are one entry
+// in its table.
 
 // nodeSandboxIDPage is how many owned sandbox IDs one node read asks for.
 const nodeSandboxIDPage = 500
@@ -228,30 +215,13 @@ func outputFormat(c *commonFlags, output string, allowed ...string) (string, boo
 	return output, false
 }
 
-// printObjects prints server objects as JSON or YAML; one object prints
-// bare, several under key.
-func (a *app) printObjects(format, key string, raws []json.RawMessage, single bool) {
-	var v any = map[string]any{key: raws}
-	if single && len(raws) == 1 {
-		v = raws[0]
+// getNodes is `aerolvm get nodes […]`.
+func getNodes(ctx context.Context, a *app, c *commonFlags, call kindCall) int {
+	format, code := a.getFormat(c, call.output)
+	if code >= 0 {
+		return code
 	}
-	if format == "json" {
-		a.printJSON(v)
-		return
-	}
-	b, _ := json.Marshal(v)
-	var generic any
-	_ = json.Unmarshal(b, &generic)
-	out, _ := yaml.Marshal(generic)
-	_, _ = a.stdout.Write(out)
-}
-
-// getKind is `aerolvm get <kind> …`.
-func (a *app) getKind(ctx context.Context, c *commonFlags, names []string, output string) int {
-	format, ok := outputFormat(c, output, "wide", "json", "yaml", "name")
-	if !ok {
-		return a.usageError(c, "get", "-o must be wide, json, yaml or name, got %q", format)
-	}
+	names := call.names
 	nodes, err := a.listNodes(ctx, c)
 	if err != nil {
 		return a.fail(c, err, exitError)
@@ -273,7 +243,7 @@ func (a *app) getKind(ctx context.Context, c *commonFlags, names []string, outpu
 	}
 	switch format {
 	case "json", "yaml":
-		raws := make([]json.RawMessage, len(nodes))
+		raws := make([]any, len(nodes))
 		for i, n := range nodes {
 			raws[i] = n.raw
 		}
@@ -310,55 +280,22 @@ func (a *app) getKind(ctx context.Context, c *commonFlags, names []string, outpu
 	return exitOK
 }
 
-// kindArgs parses describe/delete: the kind word, then its names. flags
-// adds a verb's own flags.
-func (a *app) kindArgs(verbName string, args []string, flags func(*flag.FlagSet)) (*commonFlags, string, string, []string, int) {
-	fs, c := a.newFlagSet(verbName)
-	var output string
-	fs.StringVar(&output, "o", "", "")
-	fs.StringVar(&output, "output", "", "")
-	if flags != nil {
-		flags(fs)
+// describeNode is `aerolvm describe node <name>`.
+func describeNode(ctx context.Context, a *app, c *commonFlags, call kindCall) int {
+	if !a.oneName(c, call) {
+		return exitUsage
 	}
-	pos, _, err := parseArgs(fs, args)
-	if err != nil {
-		return c, "", "", nil, a.flagError(c, verbName, err)
-	}
-	if len(pos) == 0 {
-		return c, "", "", nil, a.usageError(c, verbName, "expected a kind and a name, such as `aerolvm %s node <name>`", verbName)
-	}
-	kind, ok := lookupKind(pos[0])
-	if !ok {
-		hint := ""
-		if verbName == "delete" {
-			hint = "; to destroy a sandbox use `aerolvm destroy`"
-		}
-		return c, "", "", nil, a.usageError(c, verbName, "unknown kind %q: %s takes node (or nodes, no) or jointoken%s", pos[0], verbName, hint)
-	}
-	return c, kind, output, pos[1:], -1
-}
-
-func runDescribe(ctx context.Context, a *app, args []string) int {
-	c, kind, output, names, code := a.kindArgs("describe", args, nil)
+	format, code := a.describeFormat(c, call.output)
 	if code >= 0 {
 		return code
 	}
-	if kind != kindNode {
-		return a.usageError(c, "describe", "describe takes node; to see a join token use `aerolvm get jointokens <id> -o yaml`")
-	}
-	if len(names) != 1 {
-		return a.usageError(c, "describe", "expected one node name")
-	}
-	format, ok := outputFormat(c, output, "json", "yaml")
-	if !ok {
-		return a.usageError(c, "describe", "-o must be json or yaml, got %q", format)
-	}
+	names := call.names
 	n, err := a.getNode(ctx, c, names[0], 0)
 	if err != nil {
 		return a.fail(c, err, exitError)
 	}
 	if format != "" {
-		a.printObjects(format, "nodes", []json.RawMessage{n.raw}, true)
+		a.printObjects(format, "nodes", []any{n.raw}, true)
 		return exitOK
 	}
 	r := n.rec
@@ -406,19 +343,13 @@ func runDescribe(ctx context.Context, a *app, args []string) int {
 	return exitOK
 }
 
-func runDelete(ctx context.Context, a *app, args []string) int {
-	var force bool
-	c, kind, _, names, code := a.kindArgs("delete", args, func(fs *flag.FlagSet) { fs.BoolVar(&force, "force", false, "") })
-	if code >= 0 {
-		return code
-	}
-	if h := extraKinds[kind]; h.delete != nil {
-		return h.delete(ctx, a, c, names)
-	}
+// deleteNodes is `aerolvm delete node <name>... [--force]`.
+func deleteNodes(ctx context.Context, a *app, c *commonFlags, call kindCall) int {
+	names, force := call.names, call.force
 	if len(names) == 0 {
 		return a.usageError(c, "delete", "name at least one node")
 	}
-	code = exitOK
+	code := exitOK
 	var results []any
 	for _, name := range names {
 		path := "/v1/cluster/nodes/" + url.PathEscape(name)

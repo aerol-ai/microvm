@@ -1,0 +1,10 @@
+exit 0
+--- stdout
+ID:          tok_aaaaaaaaaaaa
+Name:        ci
+Role:        runner
+Team:        team ml
+Created:     2026-10-17T00:00:00Z (21d ago)
+Created by:  operator
+Expires:     2027-01-15T00:00:00Z (in 68 days)
+--- stderr

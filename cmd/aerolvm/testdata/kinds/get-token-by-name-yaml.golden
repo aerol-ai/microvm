@@ -1,0 +1,20 @@
+exit 0
+--- stdout
+tokens:
+    - created_at: "2026-10-17T00:00:00Z"
+      created_by: operator
+      expired: false
+      expires_at: "2027-01-15T00:00:00Z"
+      id: tok_aaaaaaaaaaaa
+      name: ci
+      role: runner
+      team: ml
+    - created_at: "2026-10-17T00:00:00Z"
+      created_by: ""
+      expired: true
+      expires_at: "2026-10-27T00:00:00Z"
+      id: tok_bbbbbbbbbbbb
+      name: ci
+      role: viewer
+      team: web
+--- stderr

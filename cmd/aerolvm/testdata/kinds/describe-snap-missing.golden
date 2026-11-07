@@ -1,0 +1,4 @@
+exit 1
+--- stdout
+--- stderr
+{"error":{"code":"not_found","message":"snapshot \"ghost\" not found","http_status":404,"retryable":false,"hint":"run `aerolvm get snapshots` to list them"}}

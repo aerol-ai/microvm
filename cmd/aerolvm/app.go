@@ -103,7 +103,7 @@ func (a *app) verbGroups() []verbGroup {
 		}},
 		{"Manage sandboxes", []verb{
 			{"list", "List sandboxes", listHelp, runList},
-			{"get", "Show one sandbox, or list nodes: get nodes", getHelp, runGet},
+			{"get", "List or show sandboxes, snapshots, tokens or nodes", getHelp, runGet},
 			{"create", "Create a sandbox, or return the existing one with that name", createHelp, runCreate},
 			{"start", "Start stopped sandboxes", startHelp, runStart},
 			{"stop", "Stop sandboxes (files are kept)", stopHelp, runStop},
@@ -111,15 +111,20 @@ func (a *app) verbGroups() []verbGroup {
 			{"snapshot", "Snapshot a sandbox as a reusable image", snapshotHelp, runSnapshot},
 		}},
 		{"Cluster", []verb{
-			{"describe", "Show one node in detail", describeHelp, runDescribe},
+			{"describe", "Show one sandbox, snapshot, token or node in detail", describeHelp, runDescribe},
 			{"cordon", "Stop new sandboxes landing on a node", cordonHelp, runCordon},
 			{"uncordon", "Let new sandboxes land on a node again", uncordonHelp, runUncordon},
 			{"drain", "Cordon a node and wait until it runs no sandboxes", drainHelp, runDrain},
-			{"delete", "Delete a node from the cluster", deleteHelp, runDelete},
+			{"delete", "Delete sandboxes, snapshots, tokens or nodes", deleteHelp, runDelete},
 			{"cluster-info", "Show the leader, members and cluster version", clusterInfoHelp, runClusterInfo},
 			{"upgrade", "Plan, run and follow an upgrade of every node", upgradeHelp, runUpgrade},
 			{"release", "Download a release into one file for offline sites", releaseHelp, runRelease},
 			{"join-command", "Make a join token and print the command that adds a node", joinCommandHelp, runJoinCommand},
+		}},
+		// kubectl polish (plans/kubectl-style-cluster-ops.md Phase 4).
+		{"Resources", []verb{
+			{"api-resources", "List the kinds get, describe and delete take", apiResourcesHelp, runAPIResources},
+			{"top", "Show the CPU and memory each node has reserved", topHelp, runTop},
 		}},
 		{"Audit", []verb{
 			{"audit", "Verify or search nodes' audit logs", auditHelp, runAudit},

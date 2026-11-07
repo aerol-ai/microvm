@@ -1,0 +1,17 @@
+exit 0
+--- stdout
+Name:         -
+ID:           sb-0000000000000003
+Status:       stopped
+Runtime:      wasm
+Image:        -
+CPU:          -
+Memory:       -
+Created:      2026-11-07T11:59:15Z (45s ago)
+Last active:  -
+URL:          -
+Tags:         app=web
+Ports:        -
+Network:      outbound except 10.0.0.0/8
+Lifecycle:    -
+--- stderr

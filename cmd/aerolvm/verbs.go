@@ -47,6 +47,11 @@ func runCreate(ctx context.Context, a *app, args []string) int {
 	if blockNetwork && len(allowHosts) > 0 {
 		return a.usageError(c, "create", "--block-network and --allow-host can't be combined")
 	}
+	if k, ok := findKind(name); ok {
+		// Still created: the name is valid. But `get <name>` now lists a kind.
+		a.note("aerolvm: warning: %q is also a kind, so `aerolvm get %s` lists %s; reach this sandbox with `aerolvm get sb %s`",
+			name, name, k.plural, name)
+	}
 	spec := agenttools.CreateSpec{
 		Name: name, Image: image, Runtime: runtime, CPU: cpu, MemoryMB: memoryMB,
 		Env: env.orNil(), Tags: tags.orNil(), BlockNetwork: blockNetwork, AllowOut: allowHosts,
@@ -150,26 +155,20 @@ func dash(s string) string {
 }
 
 func runGet(ctx context.Context, a *app, args []string) int {
-	fs, c := a.newFlagSet("get")
-	var output string
-	fs.StringVar(&output, "o", "", "")
-	fs.StringVar(&output, "output", "", "")
-	pos, _, err := parseArgs(fs, args)
-	if err != nil {
-		return a.flagError(c, "get", err)
+	c, call, pos, code := a.parseKindArgs("get", args)
+	if code >= 0 {
+		return code
 	}
 	// A kind first ("get nodes") lists that kind; any other word is a
 	// sandbox, exactly as before kinds existed (get_compat_test.go).
-	if len(pos) > 0 {
-		if kind, ok := lookupKind(pos[0]); ok {
-			if h := extraKinds[kind]; h.get != nil {
-				return h.get(ctx, a, c, pos[1:], output)
-			}
-			return a.getKind(ctx, c, pos[1:], output)
-		}
+	if code, ok := a.runKind(ctx, c, "get", call, pos); ok {
+		return code
 	}
-	if output != "" {
+	if call.output != "" {
 		return a.usageError(c, "get", "-o is for kinds, as in `aerolvm get nodes -o wide`; for a sandbox use --json")
+	}
+	if call.selector != "" {
+		return a.usageError(c, "get", "-l is for kinds: aerolvm get sandboxes -l app=web")
 	}
 	if len(pos) != 1 {
 		return a.usageError(c, "get", "expected one sandbox")
@@ -211,12 +210,15 @@ func runStop(ctx context.Context, a *app, args []string) int {
 // runDestroy treats a sandbox that is already gone as destroyed, so retries
 // and cleanup scripts never fail on their own success (§5.2 rule 7).
 func runDestroy(ctx context.Context, a *app, args []string) int {
-	return a.eachSandbox(ctx, "destroy", args, func(ctx context.Context, tools *agenttools.Tools, sb *microvm.Sandbox) (any, error) {
-		if err := tools.Client().Destroy(ctx, sb.ID); err != nil && !agenttools.IsCode(err, agenttools.CodeNotFound) {
-			return nil, err
-		}
-		return map[string]any{"id": sb.ID, "name": sb.Name, "destroyed": true}, nil
-	})
+	return a.eachSandbox(ctx, "destroy", args, destroySandbox)
+}
+
+// destroySandbox is destroy's step, shared with `delete sandbox`.
+func destroySandbox(ctx context.Context, tools *agenttools.Tools, sb *microvm.Sandbox) (any, error) {
+	if err := tools.Client().Destroy(ctx, sb.ID); err != nil && !agenttools.IsCode(err, agenttools.CodeNotFound) {
+		return nil, err
+	}
+	return map[string]any{"id": sb.ID, "name": sb.Name, "destroyed": true}, nil
 }
 
 // eachSandbox runs op on every named sandbox, reporting each failure and
@@ -230,18 +232,34 @@ func (a *app) eachSandbox(ctx context.Context, verbName string, args []string, o
 	if len(pos) == 0 {
 		return a.usageError(c, verbName, "name at least one sandbox")
 	}
+	return a.sandboxEach(ctx, c, verbName == "destroy", pos, op, func(_ string, sb *microvm.Sandbox) {
+		if sb != nil {
+			fmt.Fprintln(a.stdout, sb.ID)
+		}
+	})
+}
+
+// sandboxEach runs op on every ref, reporting each failure and carrying on,
+// and exits 1 if any failed. With gone, a ref that is already gone counts as
+// done (destroy and delete). done prints a success line without --json; sb
+// is nil for a ref that was already gone.
+func (a *app) sandboxEach(ctx context.Context, c *commonFlags, gone bool, refs []string,
+	op func(context.Context, *agenttools.Tools, *microvm.Sandbox) (any, error), done func(ref string, sb *microvm.Sandbox)) int {
 	tools, err := a.tools(ctx, c)
 	if err != nil {
 		return a.fail(c, err, exitError)
 	}
 	code := exitOK
-	results := make([]any, 0, len(pos))
-	for _, ref := range pos {
+	results := make([]any, 0, len(refs))
+	for _, ref := range refs {
 		sb, err := tools.Resolve(ctx, ref)
 		if err != nil {
-			if verbName == "destroy" && agenttools.IsCode(err, agenttools.CodeNotFound) {
+			if gone && agenttools.IsCode(err, agenttools.CodeNotFound) {
 				a.note("%s: already gone", ref)
 				results = append(results, map[string]any{"ref": ref, "destroyed": true, "already_gone": true})
+				if !c.json && done != nil {
+					done(ref, nil)
+				}
 				continue
 			}
 			code = a.fail(c, err, exitError)
@@ -254,7 +272,7 @@ func (a *app) eachSandbox(ctx context.Context, verbName string, args []string, o
 		}
 		results = append(results, out)
 		if !c.json {
-			fmt.Fprintln(a.stdout, sb.ID)
+			done(ref, sb)
 		}
 	}
 	if c.json {

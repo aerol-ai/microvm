@@ -1,0 +1,4 @@
+exit 0
+--- stdout
+snapshot "snap-c" deleted
+--- stderr

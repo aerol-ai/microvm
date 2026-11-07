@@ -117,17 +117,31 @@ func runTokenList(ctx context.Context, a *app, args []string) int {
 		a.note("aerolvm: no API tokens")
 		return exitOK
 	}
+	a.printTokenTable(list.Tokens, false)
+	return exitOK
+}
+
+// printTokenTable is `token list`'s table, which `get tokens` prints too;
+// wide adds when each token was made.
+func (a *app) printTokenTable(tokens []models.APIToken, wide bool) {
 	tw := tabwriter.NewWriter(a.stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(tw, "ID\tNAME\tROLE\tTEAM\tEXPIRES\tCREATED BY")
-	for _, t := range list.Tokens {
+	header := "ID\tNAME\tROLE\tTEAM\tEXPIRES\tCREATED BY"
+	if wide {
+		header += "\tCREATED"
+	}
+	fmt.Fprintln(tw, header)
+	for _, t := range tokens {
 		expires := t.ExpiresAt.UTC().Format("2006-01-02")
 		if t.Expired {
 			expires += " (expired)"
 		}
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\n", t.ID, t.Name, t.Role, t.Team, expires, dash(t.CreatedBy))
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s", t.ID, t.Name, t.Role, t.Team, expires, dash(t.CreatedBy))
+		if wide {
+			fmt.Fprintf(tw, "\t%s", t.CreatedAt.UTC().Format("2006-01-02"))
+		}
+		fmt.Fprintln(tw)
 	}
 	_ = tw.Flush()
-	return exitOK
 }
 
 func runTokenRevoke(ctx context.Context, a *app, args []string) int {

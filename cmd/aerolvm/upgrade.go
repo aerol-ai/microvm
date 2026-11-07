@@ -783,7 +783,7 @@ func (a *app) waitRollout(ctx context.Context, c *commonFlags, conn connection, 
 // printValue prints v as JSON or YAML.
 func (a *app) printValue(format string, v any) {
 	raw, _ := json.Marshal(v)
-	a.printObjects(format, "", []json.RawMessage{raw}, true)
+	a.printObjects(format, "", rawItems([]json.RawMessage{raw}), true)
 }
 
 func runUpgradeStatus(ctx context.Context, a *app, args []string) int {
@@ -827,7 +827,7 @@ func runUpgradeStatus(ctx context.Context, a *app, args []string) int {
 		return exitOK
 	}
 	if format != "" {
-		a.printObjects(format, "", []json.RawMessage{raw}, true)
+		a.printObjects(format, "", rawItems([]json.RawMessage{raw}), true)
 		return exitOK
 	}
 	if t.cluster {

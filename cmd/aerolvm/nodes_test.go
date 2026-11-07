@@ -377,7 +377,8 @@ func TestDescribeNode(t *testing.T) {
 	}{
 		{[]string{"describe", "node", "ghost"}, exitError, `node "ghost" not found`},
 		{[]string{"describe"}, exitUsage, "expected a kind and a name"},
-		{[]string{"describe", "sandbox", "x"}, exitUsage, `unknown kind "sandbox"`},
+		// Not a kind: a sandbox (Phase 4), which takes one name.
+		{[]string{"describe", "pod", "x"}, exitUsage, "expected one sandbox name"},
 		{[]string{"describe", "node"}, exitUsage, "expected one node name"},
 		{[]string{"describe", "node", "a", "-o", "wide"}, exitUsage, "-o must be json or yaml"},
 		{[]string{"describe", "--nope"}, exitUsage, "nope"},
@@ -574,7 +575,7 @@ func TestDeleteNodeVerb(t *testing.T) {
 		want string
 	}{
 		{[]string{"delete"}, "expected a kind and a name"},
-		{[]string{"delete", "sb", "box"}, "to destroy a sandbox use `aerolvm destroy`"},
+		{[]string{"delete", "pod", "box"}, `unknown kind "pod"`},
 		{[]string{"delete", "node"}, "name at least one node"},
 	} {
 		if code := h.run(tc.args...); code != exitUsage || !strings.Contains(h.stderr.String(), tc.want) {

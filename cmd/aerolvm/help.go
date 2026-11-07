@@ -87,6 +87,9 @@ Flags:
                        or comma list): a host, *.domain, host:port or CIDR
   --json               print the sandbox as JSON, plus "created": true|false
 
+A name that is also a kind (nodes, sb, ...) works, with a warning: "aerolvm
+get <name>" lists that kind, so reach the sandbox with "aerolvm get sb <name>".
+
 Examples:
   aerolvm create --name build-box --image python:3.12 --destroy-if-idle 2h
   id=$(aerolvm create --image node:22 --json | jq -r .id)
@@ -108,25 +111,34 @@ Examples:
   aerolvm list --limit 20 --json
 `
 
-const getHelp = `Show one sandbox, or list the nodes of a cluster.
+const getHelp = `List or show sandboxes, snapshots, tokens, join tokens or nodes, like kubectl get.
 
 Usage: aerolvm get <sandbox>
-       aerolvm get nodes [<name>...] [-o wide|json|yaml|name]
-       aerolvm get jointokens [<id>...] [-o wide|json|yaml|name]
+       aerolvm get <kind> [<name>...] [-o wide|json|yaml|name] [-l SELECTOR]
 
-After get, a kind (nodes, node or no) lists that kind; any other word is a
-sandbox, as always. A sandbox named like a kind is not reachable this way
-yet: use its ID.
+Kinds and their short names: sandboxes (sb), snapshots (snap), tokens
+(tok), nodes (no), jointokens (jt). "aerolvm api-resources" lists them. After get, a kind
+lists that kind; any other word is a sandbox, as always, so
+"aerolvm get build-box" prints what it always did. A sandbox named like a
+kind is reached with "aerolvm get sb <name>".
 
 Nodes show STATUS like kubectl: Ready or NotReady, plus SchedulingDisabled
 when cordoned and Leader for the Raft leader. Listing nodes needs an admin.
 
-  --json      print the sandbox object (for nodes: {"nodes":[...]})
-  -o FORMAT   nodes only: wide adds CPU, memory, zone and URL columns; json
-              and yaml print the server's objects; name prints node/<name>
+  --json        print JSON: for "get <sandbox>" the sandbox object, as
+                always; for a kind the same as -o json
+  -o FORMAT     kinds only. wide adds columns; json and yaml print the
+                server's objects (one named object bare, else
+                {"<kind>":[...]}); name prints <kind>/<name>
+  -l SELECTOR   sandboxes only: select by tag. k=v and k==v are filtered
+                by sandboxd; k!=v, k (has the tag) and !k (lacks it) here.
+                Comma-separate terms; every one must hold.
 
 Examples:
   aerolvm get build-box --json
+  aerolvm get sb -l app=web,env!=prod -o wide
+  aerolvm get sb build-box -o yaml
+  aerolvm get snapshots
   aerolvm get nodes -o wide
 `
 
@@ -457,16 +469,24 @@ With --server or -o json, a sandboxd that can't be reached still prints the
 client's half, then the error, and exits 1.
 `
 
-const describeHelp = `Show one node in detail: role, status, version, Raft voter and leader,
-addresses, labels, and how many sandboxes it owns and runs.
+const describeHelp = `Show one sandbox, snapshot, token or node in detail, like kubectl describe.
 
-Usage: aerolvm describe node <name> [-o json|yaml]
+Usage: aerolvm describe <kind> <name> [-o json|yaml]
+       aerolvm describe <sandbox>
 
-"Sandboxes running" comes from the node's last capacity heartbeat; with
-none fresh it says unknown and gives the owned count as the most there
-could be. Needs an admin.
+Kinds: sandboxes (sb), snapshots (snap), tokens (tok), nodes (no). A word
+that is not a kind is a sandbox.
 
-Example:
+A node shows role, status, version, Raft voter and leader, addresses,
+labels, and how many sandboxes it owns and runs. "Sandboxes running" comes
+from the node's last capacity heartbeat; with none fresh it says unknown
+and gives the owned count as the most there could be. Nodes need an admin.
+
+A token is named by its ID (tok_...) or its name; a name used in several
+teams describes each.
+
+Examples:
+  aerolvm describe sb build-box
   aerolvm describe node wrk-1
 `
 
@@ -506,22 +526,55 @@ Examples:
   aerolvm drain wrk-2 --migrate --delete-sandboxes
 `
 
-const deleteHelp = `Delete nodes from the cluster.
+const deleteHelp = `Delete sandboxes, snapshots, tokens, join tokens or nodes, like kubectl delete.
 
-Usage: aerolvm delete node <name>... [--force]
-       aerolvm delete jointoken <id>...   (revoke join tokens)
+Usage: aerolvm delete <kind> <name>... [--force]
 
-Works for every role. A Raft server leaves the Raft configuration. A worker
-or ingress node is cordoned, its sandboxes are handed to other workers when
-they asked for failover, or else marked lost, and its ID is denied: other
-nodes refuse its calls and its gossip until it joins again as a new node.
-Drain it first; deleting a live node that still owns sandboxes needs
---force. A node that is already gone counts as deleted (exit 0).
+Kinds: sandboxes (sb), snapshots (snap), tokens (tok), nodes (no),
+jointokens (jt; delete revokes them). Unlike
+get, delete always needs the kind, so a typo never deletes a sandbox. Each
+prints <kind> "<name>" deleted. One that is already gone counts as deleted
+(exit 0), so a retry never fails.
 
-Prints node "<name>" deleted. Needs an admin.
+  sandbox    the same as aerolvm destroy, with the same --json results
+  snapshot   deletes the snapshot image
+  token      revokes the token; name it by ID (tok_...), never by name
+  node       works for every role. A Raft server leaves the Raft
+             configuration. A worker or ingress node is cordoned, its
+             sandboxes are handed to other workers when they asked for
+             failover, or else marked lost, and its ID is denied: other
+             nodes refuse its calls and its gossip until it joins again as
+             a new node. Drain it first; deleting a live node that still
+             owns sandboxes needs --force. Needs an admin.
+
+Examples:
+  aerolvm delete sb build-box
+  aerolvm drain wrk-2 --delete-sandboxes && aerolvm delete node wrk-2
+`
+
+const apiResourcesHelp = `List the kinds get, describe and delete take, with their short names.
+
+Usage: aerolvm api-resources [-o wide|json|yaml|name]
+
+  -o wide   add the verbs each kind takes
+  -o name   print only the kind names
+
+It asks no server: the kinds are this aerolvm's.
+`
+
+const topHelp = `Show the CPU and memory each node has reserved for sandboxes, like kubectl top.
+
+Usage: aerolvm top nodes [<name>...] [-o json|yaml]
+
+CPU% and MEMORY% are of the node's budget: what sandboxd may hand out
+after overcommit. Placement decides on these reservations, so they say
+whether the next sandbox fits. The numbers come from each node's last
+capacity heartbeat; a node with none fresh shows -. On a single node (no
+cluster), the one row is named after the API host. Needs an admin in a
+cluster.
 
 Example:
-  aerolvm drain wrk-2 --delete-sandboxes && aerolvm delete node wrk-2
+  aerolvm top nodes
 `
 
 const clusterInfoHelp = `Show where sandboxd runs, its version, the Raft leader, the members by role,

@@ -1,0 +1,5 @@
+exit 2
+--- stdout
+--- stderr
+aerolvm get: name sandboxes or select them with -l, not both
+run `aerolvm get --help` for usage
