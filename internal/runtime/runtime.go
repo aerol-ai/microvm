@@ -226,6 +226,20 @@ type ContainerRuntime interface {
 	ClearEgressPolicy(containerIP string, allowCIDRs, denyCIDRs []string) error
 }
 
+// Freezer is implemented by runtimes that can stop every process of a sandbox
+// where it stands and let it continue later with its memory intact (the
+// cgroup freezer behind docker pause and containerd task.Pause). The cluster
+// ownership fence uses it: a worker that cannot confirm it still owns a
+// failover.policy=recreate sandbox freezes it, so it neither runs nor serves
+// while another node may be starting a replacement, and thaws it when
+// ownership is confirmed. Both calls are idempotent: freezing a frozen or
+// stopped instance, or thawing one that is not frozen, is a no-op. Neither
+// changes the sandbox's recorded status.
+type Freezer interface {
+	Freeze(ctx context.Context, containerRef string) error
+	Thaw(ctx context.Context, containerRef string) error
+}
+
 // AsContainerRuntime returns the network-rule surface when rt implements it.
 // WASM and other host-mediated runtimes return false.
 func AsContainerRuntime(rt Runtime) (ContainerRuntime, bool) {

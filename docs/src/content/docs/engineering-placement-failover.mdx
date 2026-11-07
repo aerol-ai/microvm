@@ -529,6 +529,8 @@ flowchart TB
 - The rebuild is safe to repeat. A sandbox that already runs here is left as it is.
 - If no other node can take it, the sandbox stays here and the watcher keeps trying.
 
+**The old owner pauses its copy first.** "Dead" only means the leader cannot hear the node. A node cut off by a network split may still be running its sandboxes. So every worker keeps a lease on what it owns: each time the leader answers one of its placement reads (every 5 seconds by default), the lease is renewed. If half of `ClusterDeadOwnerGrace` (15 seconds by default) passes with no answer, the worker pauses each of its recreate-policy sandboxes in place (docker and containerd freeze them with the cgroup freezer) and refuses to start or serve them; API calls for them get 503 with `Retry-After`. That happens well before the leader may hand them to another node. When the leader answers again, a sandbox whose placement still names this node resumes where it stopped; one that moved stays paused until the stale-ownership check removes it. Firecracker, WASM and isolate sandboxes cannot be paused in place yet: they are refused, but keep running. `ownership_lease.go` in `internal/service` holds the rule.
+
 Orphaned sandboxes have two ways out:
 
 - **`opClaimOrphan`.** When the original owner comes back online, `AssertOwnership` runs at boot and reclaims its orphaned placements. The `opPlace` path refuses to overwrite an orphan. An orphan must be claimed on purpose, never silently re-placed, because the original node may still be running the container.

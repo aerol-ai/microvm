@@ -82,6 +82,13 @@ func Wrap(svc *service.Service, opts Options, local http.Handler) http.Handler {
 		// been applied here yet. Serve a row this node holds; for one it
 		// does not, answer 503 + Retry-After instead of a false "gone".
 		serveLocal := func(localID string) {
+			// A sandbox held by the ownership fence may be running on
+			// another node by now: this node could not confirm it still
+			// owns it, so it must not answer for it (I1).
+			if svc.OwnershipFenced(localID) {
+				WriteOwnershipFenced(w, write)
+				return
+			}
 			if !cluster.CaughtUp(c) && !svc.HasLocalSandbox(r.Context(), localID) {
 				WriteNotCaughtUp(w, write)
 				return
@@ -135,6 +142,15 @@ func Wrap(svc *service.Service, opts Options, local http.Handler) http.Handler {
 		}
 		c.ForwardHTTP(cluster.Endpoint{NodeID: owner.NodeID, InternalURL: owner.InternalURL, APIURL: owner.APIURL}, w, r)
 	})
+}
+
+// WriteOwnershipFenced answers a request for a sandbox this node has paused
+// because it could not confirm with the control plane that it still owns it
+// (service.ErrOwnershipFenced). 503 + Retry-After, in the caller's envelope.
+func WriteOwnershipFenced(w http.ResponseWriter, write ErrorWriter) {
+	cls := apihttp.Classify(service.ErrOwnershipFenced)
+	cls.SetRetryAfter(w)
+	write(w, cls.Status, cls.Message)
 }
 
 // WriteNotCaughtUp answers a request whose truthful answer this node cannot
