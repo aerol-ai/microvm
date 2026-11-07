@@ -334,8 +334,13 @@ together. No fix PR merges until these runs pass.
 | Run | Target | Machines | What it checks | Time (est.) | Cost (est.) |
 |---|---|---|---|---|---|
 | Create benchmark | `make integration-benchmark-containerd` | 3 × spot | L1: every create stage named; fills the 74–92 ms gap in 4.1 | ~1 h | ~$0.10 |
-| Single-node pool | `single-node-containerd` plus `SB_CONTAINERD_POOL_ENABLED=true` (new variant) | 1 × spot | L2: pool hits on one node | ~1 h | ~$0.03 |
+| Single-node pool | one hand-launched node: `install.sh` with no cluster, containerd, `SB_CONTAINERD_POOL_ENABLED=true`; a few creates | 1 × spot | L2: pool hits on a node that is not in cluster mode | ~20 min | ~$0.01 |
 | Single node | `make integration-single` | 1 × spot | Nothing in the cluster fixes changes single-node mode | ~1 h | ~$0.03 |
+
+Why L2 needs a hand-launched node: every Terraform-built node runs
+`cluster-init`, even in the "single-node" scenarios, and cluster mode already
+turns on the ready socket the pool needs. The bug only shows with cluster mode
+off, so a harness scenario would pass on `main` too and prove nothing.
 
 Total about $1.20–1.40 of EC2 (about $2 if spot is unavailable and everything
 runs on-demand), plus small S3 and disk charges. Each rerun of a failed
