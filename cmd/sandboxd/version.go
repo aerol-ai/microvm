@@ -16,9 +16,9 @@ import (
 
 // `sandboxd version` says which build is installed
 // (plans/kubectl-style-cluster-ops.md §3.1, Phase 0). Before it existed,
-// `sandboxd --version` fell through to the daemon boot, so Ansible's
-// update-sandboxd.yml started a second daemon on a live node's state
-// directory every time it asked. It reads nothing but the binary itself:
+// `sandboxd --version` fell through to the daemon boot, so the old Ansible
+// update playbook started a second daemon on a live node's state directory
+// every time it asked. It reads nothing but the binary itself:
 // no env file, no database, no network.
 const versionSubcommand = "version"
 

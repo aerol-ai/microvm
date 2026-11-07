@@ -190,7 +190,7 @@ func (s *server) portAllowed(port int) bool {
 
 func main() {
 	// --version / -v must be handled before any server setup so deploy
-	// tooling (Ansible's update-toolboxd.yml) can probe an installed binary
+	// tooling (or an operator) can probe an installed binary
 	// without accidentally launching it as a daemon. Note: when toolboxd
 	// runs inside a sandbox container, os.Args[1:] is the user's entry-point
 	// command — there's no ambiguity here because a user command starting

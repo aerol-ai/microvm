@@ -243,10 +243,11 @@ jobs:
           go build -trimpath -ldflags "$LDFLAGS" -o dist/sandboxd_${{ matrix.suffix }} ./cmd/sandboxd
           chmod 0755 dist/sandboxd_${{ matrix.suffix }}
 
-      # Upgrade checks (Ansible's update-sandboxd.yml, the docs' "Upgrading"
-      # steps, integration-tests/upgrade-gate.sh) read the version from
-      # `sandboxd --version`, so a release whose binary misreports it would
-      # pass them all while running the wrong build.
+      # Upgrade checks (`sandboxd upgrade node`, the docs' "Upgrading"
+      # steps, integration-tests/upgrade-gate.sh) read the version from the
+      # binary (`sandboxd version`, `sandboxd --version`), so a release whose
+      # binary misreports it would pass them all while running the wrong
+      # build.
       - name: Check the linux_amd64 sandboxd reports the release version
         if: matrix.suffix == 'linux_amd64'
         shell: bash
