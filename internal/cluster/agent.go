@@ -163,6 +163,9 @@ type Agent struct {
 	// feed is the placement delta feed (agent_placement_feed.go), started
 	// only with SB_INGRESS_PROXY_ROUTING. nil means the page walk.
 	feed *agentPlacementFeed
+	// ownerCache remembers which node owns a sandbox so routing skips the
+	// control-plane lookup (owner_cache.go). nil unless SB_CLUSTER_OWNER_CACHE.
+	ownerCache *OwnerCache
 
 	cfg           config.Config
 	logger        *slog.Logger
@@ -303,6 +306,7 @@ func NewAgent(cfg config.Config, logger *slog.Logger, admitter *capacity.Admitte
 		return nil, fmt.Errorf("cluster.NewAgent: gossip: %w", err)
 	}
 	a.gossip = gn
+	a.ownerCache = newAgentOwnerCache(a)
 	if a.internalServer != nil {
 		a.internalServer.SetPeerAuthorizer(func(nodeID string) bool {
 			m, ok := gn.lookupMember(nodeID)

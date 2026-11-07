@@ -49,7 +49,38 @@ const (
 	// it only with the operator token, on the sandbox's sessions routes,
 	// for the sandbox the path names.
 	HeaderSSHGateway = "X-Cluster-Ssh-Gateway"
+	// HeaderRouteHint marks a forward whose target came from the edge's
+	// owner cache (owner_cache.go), not from a lookup the edge just made. Its
+	// value is a random token the edge made for this one request. The
+	// receiver serves the request only when its own lookup says it owns the
+	// sandbox; otherwise it answers 421 with HeaderNotOwner set to the same
+	// token. Like every X-Cluster-* header it is honoured only from a live
+	// mTLS peer, and StampForward sets it only from the request context
+	// (ContextWithRouteHint), never from a header that came in.
+	HeaderRouteHint = "X-Cluster-Route-Hint"
+	// HeaderNotOwner is the response header of that 421 ("not here"). It
+	// echoes the request's HeaderRouteHint token. The edge routes the call
+	// again only on a 421 carrying its own token, so a 421 from anything
+	// else (the sandbox's own server behind a toolbox route, a node on an
+	// older build) reaches the caller as it is and never causes a second
+	// send. The receiver drops the hint header before any handler runs, so
+	// nothing behind it can learn the token.
+	HeaderNotOwner = "X-Cluster-Not-Owner"
 )
+
+type routeHintCtxKey struct{}
+
+// ContextWithRouteHint marks the forwards made under ctx as routed from the
+// owner cache, with token as the request's HeaderRouteHint.
+func ContextWithRouteHint(ctx context.Context, token string) context.Context {
+	return context.WithValue(ctx, routeHintCtxKey{}, token)
+}
+
+// RouteHintFromContext is the token ContextWithRouteHint recorded, or "".
+func RouteHintFromContext(ctx context.Context) string {
+	token, _ := ctx.Value(routeHintCtxKey{}).(string)
+	return token
+}
 
 // PAT origins carried in HeaderPATOrigin.
 const (
@@ -109,6 +140,9 @@ func PATOriginFromContext(ctx context.Context) string {
 //     the SSH gateway bridged for a sandbox key holder (the context carries
 //     auditlog.SSHGatewayCall). Removed from every other request, the same
 //     way as HeaderSurface.
+//   - HeaderRouteHint, when the edge routed the request from its owner
+//     cache (ContextWithRouteHint). Removed from every other request, the
+//     same way as HeaderSurface.
 //
 // It also marks the edge's api record as forwarded (auditlog.MarkForwarded):
 // only the node that runs the handler records the call, so the peer writes
@@ -150,6 +184,11 @@ func StampForward(out *http.Request, access controlplane.Access) {
 		out.Header.Set(HeaderSSHGateway, call.Encode())
 	} else {
 		out.Header.Del(HeaderSSHGateway)
+	}
+	if token := RouteHintFromContext(out.Context()); token != "" {
+		out.Header.Set(HeaderRouteHint, token)
+	} else {
+		out.Header.Del(HeaderRouteHint)
 	}
 	auditlog.MarkForwarded(out.Context())
 }

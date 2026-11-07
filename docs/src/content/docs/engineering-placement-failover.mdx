@@ -488,6 +488,13 @@ flowchart TB
 - A request is forwarded at most once. A second hop would mean two nodes disagree about the owner, so the request stops with 421.
 - Finding the owner is only a read. No Raft write happens on this path.
 
+**Owner cache (off by default).** A worker or ingress node holds no placement table, so each "who owns X?" is a call to the server tier, and the owner makes the same call again. With `SB_CLUSTER_OWNER_CACHE=true`, a worker or ingress node remembers the owner its last lookup found and forwards straight there. The cache only picks where a request goes, never the answer:
+
+- The owner still looks itself up on every request. If the answer is not "this node", it does not serve, 404 or 410. It answers `421` with a private header that repeats a one-time token the edge sent, so nothing else can fake that answer.
+- The edge then drops the entry and routes the request once more from a fresh lookup, as it would with the cache off. That second try never uses the cache, so the edge sends a request at most twice.
+- An entry lasts 30 seconds. The cache holds at most 16,384 sandboxes, about 4 MiB. A node that gossip reports dead gets no cached traffic.
+- Turn it on only after every node runs a build that has it: an owner on an older build would serve or 404 a stale forward.
+
 **The trade.** Owner-sharded execution buys local consistency. The toolbox sessions, the SQLite row and the container for one sandbox all live on one host. So that sandbox's state needs no agreement across nodes.
 
 The cost is an extra forwarding hop on every cross-node API call. It also ties the sandbox to its owner: a long-lived sandbox cannot move except through the failover path.

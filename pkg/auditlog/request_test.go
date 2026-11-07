@@ -201,6 +201,14 @@ func TestCallState(t *testing.T) {
 	if !innerSt.Forwarded() || st.Forwarded() {
 		t.Fatal("marking the inner state touched the outer one")
 	}
+	// A forward the peer turned down without running it ("not here") is
+	// taken back, so the node that answers in the end records the call.
+	MarkForwarded(ctx)
+	ClearForwarded(ctx)
+	ClearForwarded(bare)
+	if st.Forwarded() {
+		t.Fatal("ClearForwarded left the forward mark")
+	}
 	MarkForwarded(ctx)
 	MarkForwardFailed(ctx)
 	if !st.Forwarded() || !st.ForwardFailed() {

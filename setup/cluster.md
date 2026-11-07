@@ -1154,6 +1154,7 @@ file themselves can set them directly in `/etc/sandboxd/cluster.env`.
 | `SB_CLUSTER_TLS_DIR` | yes | Cluster CA trust certificate + this node's keypair. |
 | `SB_CLUSTER_INTERNAL_LISTEN` | no | mTLS listen. Default `0.0.0.0:7002`. |
 | `SB_CLUSTER_INTERNAL_ADVERTISE` | no | HTTPS URL peers dial. Auto-derived. |
+| `SB_CLUSTER_OWNER_CACHE` | no | Worker and ingress nodes remember which node owns a sandbox, so they forward without asking the server tier first. Default `false`. Turn it on only after every node runs a build that has it. See `setup/config-defaults.md`. |
 | `SB_BOOTSTRAP_PEERS` | join only | Comma-separated gossip-advertise addresses. Empty on the seed. |
 | `SB_CLUSTER_BOOTSTRAP` | yes | `true` only on the seed; `false` on joiners. |
 | `SB_CLUSTER_MAX_AUTO_VOTERS` | no | Max gossip-discovered **server-role** nodes auto-promoted as raft voters. Default `5`; additional server nodes become non-voters that still replicate the full FSM. Set `0` for unlimited. Does not bound replica count — the live server tier is separately capped at 7 nodes. |

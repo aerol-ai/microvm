@@ -48,7 +48,9 @@ func TestUserTokenWithoutAnAccountIsRefused(t *testing.T) {
 
 // A single node has no peers, so cluster control headers can only come from
 // a caller; they are dropped, and the request goes on without them. In a
-// cluster they still need an authenticated peer.
+// cluster they still need an authenticated peer. That includes the owner
+// cache's route hint: a caller who could send it would make a node answer
+// "not here" instead of 404 or 410.
 func TestSingleNodeDropsClusterControlHeaders(t *testing.T) {
 	var seen http.Header
 	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -59,13 +61,14 @@ func TestSingleNodeDropsClusterControlHeaders(t *testing.T) {
 		r := httptest.NewRequest(http.MethodPost, "/v1/sandboxes", nil)
 		r.Header.Set("X-Cluster-Create-Target", "node-1")
 		r.Header.Set("x-cluster-create-id", "chosen-id")
+		r.Header.Set("X-Cluster-Route-Hint", "forged")
 		r.Header.Set("X-Request-Id", "kept")
 		return r
 	}
 	single := &Server{}
 	rec := httptest.NewRecorder()
 	single.clusterControlHeaderGuard(next).ServeHTTP(rec, req())
-	if rec.Code != http.StatusOK || seen.Get("X-Cluster-Create-Target") != "" || seen.Get("X-Cluster-Create-Id") != "" || seen.Get("X-Request-Id") != "kept" {
+	if rec.Code != http.StatusOK || seen.Get("X-Cluster-Create-Target") != "" || seen.Get("X-Cluster-Create-Id") != "" || seen.Get("X-Cluster-Route-Hint") != "" || seen.Get("X-Request-Id") != "kept" {
 		t.Fatalf("single node passed %d with headers %v", rec.Code, seen)
 	}
 	seen = nil

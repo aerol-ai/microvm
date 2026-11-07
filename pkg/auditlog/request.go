@@ -165,6 +165,17 @@ func MarkForwarded(ctx context.Context) {
 	}
 }
 
+// ClearForwarded undoes MarkForwarded for a forward the peer turned down
+// without running it: a forward routed from the owner cache that the target
+// answered "not here" (cluster.HeaderNotOwner). The edge routes the call
+// again, and whichever node answers it then writes the record, the edge
+// included.
+func ClearForwarded(ctx context.Context) {
+	if st := CallStateFromContext(ctx); st != nil {
+		st.forwarded.Store(false)
+	}
+}
+
 // MarkForwardFailed records that the forward itself failed (the edge
 // answered 502 without reaching the peer), so the edge records the call
 // after all: no peer ever saw it.
