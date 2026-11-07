@@ -20,7 +20,8 @@ package suite
 //	08 source release + finalize    UC-655, UC-642
 //
 // Every node restarts several times: run it alone,
-// AEROL_TEST_RUN='TestRolloutLive' on cluster-hetero-lite. The file sorts
+// AEROL_TEST_RUN='TestRolloutLive' on cluster-rollout (a copy of cluster-hetero-lite
+// under its own name: the harness keys Terraform state by scenario name). The file sorts
 // last so a full pass runs it after everything else.
 
 import (
