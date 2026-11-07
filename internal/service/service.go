@@ -1688,6 +1688,28 @@ func (s *Service) RecreateSandboxReport(ctx context.Context, id string, spec mod
 	// gets the user's name back (names are unique per owner in the store).
 	// A malformed legacy "owner:" name decodes to itself and never fails.
 	spec = cluster.DecodeSpecName(spec)
+	// Nothing local yet: this call would create the sandbox. Take the id's
+	// create lease first, the one a placement-only DELETE also takes
+	// (destroy_unmaterialized.go), and confirm under it that the placement
+	// the watcher read is still this node's to create: a DELETE may have
+	// committed since the watcher's tick began. A materialized sandbox skips
+	// this, so a steady-state tick adds no control-plane read.
+	if _, err := s.store.Get(ctx, id); errors.Is(err, store.ErrNotFound) {
+		var release func()
+		var leaseErr error
+		ctx, release, leaseErr = s.beginCreateLease(ctx, id, spec.CreateRequestDigests)
+		if leaseErr != nil {
+			return true, leaseErr
+		}
+		defer release()
+		owned, err := s.failoverRecreateStillOwned(ctx, id, secrets)
+		if err != nil {
+			return true, err
+		}
+		if !owned {
+			return false, nil
+		}
+	}
 	if strings.TrimSpace(spec.Runtime) == models.RuntimeWasm && spec.Durability == models.DurabilityDurable {
 		nodeID := ""
 		if c := s.Cluster(); c != nil {
@@ -3883,7 +3905,24 @@ func (s *Service) StopSandbox(ctx context.Context, id string) (*models.Sandbox, 
 // DestroySandbox deletes a sandbox inside the lifecycle boundary, so a start
 // or a restart on failure in flight cannot write the row back after the
 // delete (Upsert inserts a missing row).
+//
+// With no local row, a cluster node may still own the sandbox's placement:
+// one reassigned to it by a failover that its owner watcher has not recreated
+// yet. destroyUnmaterializedPlacement deletes that placement instead of
+// answering 404. It runs after the lifecycle lock is released, because it
+// takes the create lease, and the lock order is create lease, then lifecycle
+// lock (a create's rollback destroys under its lease).
 func (s *Service) DestroySandbox(ctx context.Context, id string) error {
+	err := s.destroySandboxUnderLifecycleLock(ctx, id)
+	if errors.Is(err, store.ErrNotFound) {
+		return s.destroyUnmaterializedPlacement(ctx, id, err)
+	}
+	return err
+}
+
+// destroySandboxUnderLifecycleLock runs the local destroy inside the
+// lifecycle boundary for id.
+func (s *Service) destroySandboxUnderLifecycleLock(ctx context.Context, id string) error {
 	unlock, err := s.lifecycleLocks.lockCtx(ctx, id)
 	if err != nil {
 		return err

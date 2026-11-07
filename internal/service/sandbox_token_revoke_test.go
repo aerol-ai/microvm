@@ -285,6 +285,7 @@ func TestWasmFailoverRecreateSetsTokensNotBefore(t *testing.T) {
 	t.Cleanup(func() { _ = st.Close() })
 	rt := &fakeWasmRecreateRuntime{}
 	svc := New(config.Config{EnableWasm: true, WasmModulesDir: modulesDir, EnableCluster: true}, slog.Default(), st, rt, nil, nil, nil, nil, nil)
+	svc.AttachCluster(newRecreateOwnerCluster("self"))
 	svc.SetWasmRuntime(rt)
 	svc.AttachWasmCheckpointPusher(&fakeWasmCheckpointStore{pullSrc: remoteSnap})
 	spec := models.CreateSandboxRequest{Runtime: models.RuntimeWasm, Durability: models.DurabilityDurable, ModuleRef: "file:///tmp/demo.wasm"}
