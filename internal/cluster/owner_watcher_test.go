@@ -23,9 +23,10 @@ type recordingRecreator struct {
 }
 
 type recordedRecreate struct {
-	spec    models.CreateSandboxRequest
-	secrets PlacementSecrets
-	ports   map[int]ExposedPortRoute
+	spec       models.CreateSandboxRequest
+	secrets    PlacementSecrets
+	ports      map[int]ExposedPortRoute
+	ownerSince int64
 }
 
 // legacyRecreator exercises compatibility with implementations that predate
@@ -45,14 +46,14 @@ func newRecordingRecreator() *recordingRecreator {
 }
 
 func (r *recordingRecreator) RecreateSandbox(ctx context.Context, id string, spec models.CreateSandboxRequest, secrets PlacementSecrets, ports map[int]ExposedPortRoute) error {
-	_, err := r.RecreateSandboxReport(ctx, id, spec, secrets, ports)
+	_, err := r.RecreateSandboxReport(ctx, id, spec, secrets, ports, 0)
 	return err
 }
 
-func (r *recordingRecreator) RecreateSandboxReport(_ context.Context, id string, spec models.CreateSandboxRequest, secrets PlacementSecrets, ports map[int]ExposedPortRoute) (bool, error) {
+func (r *recordingRecreator) RecreateSandboxReport(_ context.Context, id string, spec models.CreateSandboxRequest, secrets PlacementSecrets, ports map[int]ExposedPortRoute, ownerSince int64) (bool, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.calls[id] = recordedRecreate{spec: spec, secrets: secrets, ports: ports}
+	r.calls[id] = recordedRecreate{spec: spec, secrets: secrets, ports: ports, ownerSince: ownerSince}
 	return r.attempted, r.err
 }
 

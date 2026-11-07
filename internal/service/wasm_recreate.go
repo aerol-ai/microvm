@@ -22,7 +22,7 @@ import (
 // pull had nothing to bind to and read the id-wide :latest — whichever
 // lifetime pushed last, a destroyed one included — and then adopted that
 // snapshot's clone generation as if it were current.
-func (s *Service) recreateWasmDurableSandbox(ctx context.Context, id, incarnationID string, spec models.CreateSandboxRequest, exposedPorts map[int]cluster.ExposedPortRoute) (bool, error) {
+func (s *Service) recreateWasmDurableSandbox(ctx context.Context, id, incarnationID string, spec models.CreateSandboxRequest, exposedPorts map[int]cluster.ExposedPortRoute, ownerSinceUnixNano int64) (bool, error) {
 	incarnationID = strings.TrimSpace(incarnationID)
 	if incarnationID == "" {
 		return true, fmt.Errorf("recreate %s: placement carries no lifetime (incarnation); refusing to restore an unidentified checkpoint", id)
@@ -37,6 +37,11 @@ func (s *Service) recreateWasmDurableSandbox(ctx context.Context, id, incarnatio
 		// the current one's placement. Reconciliation retires the stale row.
 		if local := strings.TrimSpace(existing.AuditIncarnationID); local != "" && local != incarnationID {
 			return true, fmt.Errorf("recreate %s: local row belongs to lifetime %s, placement is %s", id, local, incarnationID)
+		}
+		// The row is reused, so it is raised to the takeover like any other
+		// (RecreateSandboxReport), before anything below can fail.
+		if err := s.raiseTokensNotBeforeToTakeover(ctx, existing, ownerSinceUnixNano); err != nil {
+			return true, fmt.Errorf("recreate %s: %w", id, err)
 		}
 		attempted := existing.Status == models.SandboxStatusPassivated
 		if _, err := s.ensureWasmCheckpointLocal(ctx, existing); err != nil {
