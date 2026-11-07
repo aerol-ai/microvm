@@ -3,6 +3,7 @@ package cluster
 import (
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"sort"
 	"strings"
 	"time"
@@ -220,15 +221,55 @@ func (f *placementFSM) applyClaimVolumeReclaimLocked(cmd command) error {
 // sandboxes).
 type reclaimNodeState func(nodeID string) (alive, drains bool)
 
+// reclaimAdoptersPerEntry is how many live sweepers may claim one entry
+// another node left. Every sweeper polls, and a claim is a raft entry, so
+// when every sweeper was offered the same oldest entries a dead node's
+// backlog cost up to sweepers x limit raft entries per sweep (2000 nodes x
+// 128). Now each entry has its own few adopters (mayAdoptVolumeReclaim), so
+// the claims per entry per sweep stay at this, whatever the fleet size, and
+// the backlog is spread over every sweeper.
+const reclaimAdoptersPerEntry = 3
+
+// volumeReclaimsMaxLimit caps one answer; a request with no limit gets it.
+const volumeReclaimsMaxLimit = 1024
+
+// mayAdoptVolumeReclaim reports whether nodeID is one of the
+// reclaimAdoptersPerEntry sweepers that may take over the entry under key:
+// the ones that follow the entry's hash in adopters (the live sweepers,
+// sorted). Servers with slightly different membership views may pick
+// slightly different adopters; a claim is a compare-and-set on the entry,
+// so that only adds a losing claim or two. No adopters list (no membership
+// view) offers the entry to every caller, as before.
+func mayAdoptVolumeReclaim(key, nodeID string, adopters []string) bool {
+	n := len(adopters)
+	if n == 0 {
+		return true
+	}
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(key))
+	start := int(h.Sum64() % uint64(n))
+	for i := 0; i < reclaimAdoptersPerEntry && i < n; i++ {
+		if adopters[(start+i)%n] == nodeID {
+			return true
+		}
+	}
+	return false
+}
+
 // volumeReclaimsFor returns up to limit entries nodeID should drain: its
 // own first, then the ones it may take over, each group oldest first. An
 // entry may be taken over from a live node that never drains (the leader
 // that expired an abandoned delete) at once, and from a node that is dead or
-// unknown once it is volumeReclaimAdoptAfter old. A live draining node's
-// entries are skipped by node, so a poll costs O(own entries + nodes that
-// hold entries), not O(every entry), however large a backlog grows.
-func (f *placementFSM) volumeReclaimsFor(nodeID string, state reclaimNodeState, now time.Time, limit int) []VolumeReclaim {
+// unknown once it is volumeReclaimAdoptAfter old, and only by its adopters
+// (mayAdoptVolumeReclaim). A live draining node's entries are skipped by
+// node, so a poll costs O(own entries + nodes that hold entries + entries
+// held by nodes that do not drain), and it copies only what it returns
+// from that last group.
+func (f *placementFSM) volumeReclaimsFor(nodeID string, state reclaimNodeState, adopters []string, now time.Time, limit int) []VolumeReclaim {
 	nodeID = strings.TrimSpace(nodeID)
+	if limit <= 0 || limit > volumeReclaimsMaxLimit {
+		limit = volumeReclaimsMaxLimit
+	}
 	var own, adopt []VolumeReclaim
 	f.mu.RLock()
 	for node, keys := range f.volumeReclaimsByNode {
@@ -247,7 +288,10 @@ func (f *placementFSM) volumeReclaimsFor(nodeID string, state reclaimNodeState, 
 		}
 		for key := range keys {
 			r := f.volumeReclaims[key]
-			if alive || now.Sub(time.Unix(0, r.RecordedUnixNano)) >= volumeReclaimAdoptAfter {
+			if !alive && now.Sub(time.Unix(0, r.RecordedUnixNano)) < volumeReclaimAdoptAfter {
+				continue
+			}
+			if mayAdoptVolumeReclaim(key, nodeID, adopters) {
 				adopt = append(adopt, r)
 			}
 		}
@@ -256,7 +300,7 @@ func (f *placementFSM) volumeReclaimsFor(nodeID string, state reclaimNodeState, 
 	sortVolumeReclaims(own)
 	sortVolumeReclaims(adopt)
 	out := append(own, adopt...)
-	if limit > 0 && len(out) > limit {
+	if len(out) > limit {
 		out = out[:limit]
 	}
 	return out

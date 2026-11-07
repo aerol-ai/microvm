@@ -4,7 +4,10 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
+	"sort"
+	"strings"
 	"testing"
 	"time"
 
@@ -204,13 +207,13 @@ func TestFSMVolumeReclaimsForOwnThenAdoptable(t *testing.T) {
 		}
 		return false, false // dead or unknown
 	}
-	if ids := reclaimIDs(f.volumeReclaimsFor(" me ", state, now, 0)); len(ids) != 4 || ids[0] != "own-old" || ids[1] != "own-new" || ids[2] != "dead-old" || ids[3] != "server-young" {
+	if ids := reclaimIDs(f.volumeReclaimsFor(" me ", state, nil, now, 0)); len(ids) != 4 || ids[0] != "own-old" || ids[1] != "own-new" || ids[2] != "dead-old" || ids[3] != "server-young" {
 		t.Fatalf("for me = %v, want own oldest first, then the dead node's old entry and the server's", ids)
 	}
-	if ids := reclaimIDs(f.volumeReclaimsFor("me", state, now, 1)); len(ids) != 1 || ids[0] != "own-old" {
+	if ids := reclaimIDs(f.volumeReclaimsFor("me", state, nil, now, 1)); len(ids) != 1 || ids[0] != "own-old" {
 		t.Fatalf("limited = %v", ids)
 	}
-	if ids := reclaimIDs(f.volumeReclaimsFor("me", nil, now, 0)); len(ids) != 2 {
+	if ids := reclaimIDs(f.volumeReclaimsFor("me", nil, nil, now, 0)); len(ids) != 2 {
 		t.Fatalf("no membership view = %v, want own only", ids)
 	}
 	// The index follows a claim and an ack.
@@ -223,7 +226,7 @@ func TestFSMVolumeReclaimsForOwnThenAdoptable(t *testing.T) {
 			}
 			f.mu.Unlock()
 			r.NodeID = "me"
-			if ids := reclaimIDs(f.volumeReclaimsFor("me", state, now, 0)); len(ids) != 5 {
+			if ids := reclaimIDs(f.volumeReclaimsFor("me", state, nil, now, 0)); len(ids) != 5 {
 				t.Fatalf("after claim = %v", ids)
 			}
 			f.mu.Lock()
@@ -271,6 +274,13 @@ func TestGossipReclaimNodeState(t *testing.T) {
 	}
 	if alive, _ := gossipReclaimNodeState(nil)("x"); alive {
 		t.Fatal("no gossip view: nothing is alive")
+	}
+	// The adopters are the live members that drain, sorted.
+	if got := gossipReclaimAdopters(&gossipNode{memberIndex: index}); strings.Join(got, ",") != "mixed-live,wkr-live" {
+		t.Fatalf("adopters = %v, want the live sweepers sorted", got)
+	}
+	if got := gossipReclaimAdopters(nil); got != nil {
+		t.Fatalf("no gossip view: adopters = %v, want none", got)
 	}
 }
 
@@ -503,5 +513,81 @@ func TestClusterVolumeDeleteOwingBytesRoundTrip(t *testing.T) {
 	mine, err := c.VolumeReclaimsFor(ctx, c.SelfNodeID(), 10)
 	if err != nil || len(mine) != 1 || mine[0].VolumeID != "vol-api" || mine[0].Source != v.Source {
 		t.Fatalf("reclaims = %+v, %v", mine, err)
+	}
+}
+
+// TestFSMVolumeReclaimTakeoverIsSpreadOverAFewAdopters: every sweeper polls,
+// and each claim is a raft entry. When every sweeper was offered the same
+// oldest entries of a dead node, a backlog cost up to sweepers x limit raft
+// entries per sweep. Now each entry goes to reclaimAdoptersPerEntry
+// sweepers, so a fleet of 2000 offers each of 600 entries 3 times, not 2000.
+func TestFSMVolumeReclaimTakeoverIsSpreadOverAFewAdopters(t *testing.T) {
+	f := newPlacementFSM()
+	now := time.Unix(10_000, 0)
+	old := now.Add(-2 * volumeReclaimAdoptAfter).UnixNano()
+	const entries, sweepers = 600, 2000
+	var in []VolumeReclaim
+	for i := 0; i < entries; i++ {
+		in = append(in, VolumeReclaim{Tenant: "t", VolumeID: fmt.Sprintf("v-%04d", i), NodeID: "dead", RecordedUnixNano: old})
+	}
+	in = append(in, VolumeReclaim{Tenant: "t", VolumeID: "mine", NodeID: "n-0007", RecordedUnixNano: old})
+	f.restoreVolumeReclaimsLocked(in)
+	var adopters []string
+	for i := 0; i < sweepers; i++ {
+		adopters = append(adopters, fmt.Sprintf("n-%04d", i))
+	}
+	sort.Strings(adopters)
+	state := func(node string) (bool, bool) { return node != "dead", node != "dead" }
+
+	offers := map[string]int{}
+	total := 0
+	for _, node := range adopters {
+		for _, r := range f.volumeReclaimsFor(node, state, adopters, now, 128) {
+			if r.NodeID == "dead" {
+				offers[r.VolumeID]++
+				total++
+			}
+		}
+	}
+	if len(offers) != entries {
+		t.Fatalf("%d of %d entries were offered to anyone; every entry needs an adopter", len(offers), entries)
+	}
+	for id, n := range offers {
+		if n != reclaimAdoptersPerEntry {
+			t.Fatalf("entry %s offered to %d sweepers, want %d", id, n, reclaimAdoptersPerEntry)
+		}
+	}
+	if total != entries*reclaimAdoptersPerEntry {
+		t.Fatalf("total offers = %d, want %d", total, entries*reclaimAdoptersPerEntry)
+	}
+
+	// A sweeper this server does not know yet gets its own entries only.
+	if ids := reclaimIDs(f.volumeReclaimsFor("n-new", state, adopters, now, 0)); len(ids) != 0 {
+		t.Fatalf("unknown sweeper = %v, want none", ids)
+	}
+	if ids := reclaimIDs(f.volumeReclaimsFor("n-0007", state, adopters, now, 0)); len(ids) == 0 || ids[0] != "mine" {
+		t.Fatalf("own entries come first = %v", ids)
+	}
+	// A small fleet: every live sweeper is an adopter of every entry.
+	small := []string{"a", "b"}
+	if ids := f.volumeReclaimsFor("a", state, small, now, 0); len(ids) != entries {
+		t.Fatalf("2 sweepers: a got %d, want all %d", len(ids), entries)
+	}
+}
+
+// TestFSMVolumeReclaimsForCapsAnAnswer: a request with no limit (or a huge
+// one) gets volumeReclaimsMaxLimit entries, not the whole ledger.
+func TestFSMVolumeReclaimsForCapsAnAnswer(t *testing.T) {
+	f := newPlacementFSM()
+	now := time.Unix(10_000, 0)
+	var in []VolumeReclaim
+	for i := 0; i < volumeReclaimsMaxLimit+10; i++ {
+		in = append(in, VolumeReclaim{Tenant: "t", VolumeID: fmt.Sprintf("v-%05d", i), NodeID: "me", RecordedUnixNano: now.UnixNano()})
+	}
+	f.restoreVolumeReclaimsLocked(in)
+	for _, limit := range []int{0, -1, volumeReclaimsMaxLimit * 10} {
+		if got := len(f.volumeReclaimsFor("me", nil, nil, now, limit)); got != volumeReclaimsMaxLimit {
+			t.Fatalf("limit %d: got %d entries, want the cap %d", limit, got, volumeReclaimsMaxLimit)
+		}
 	}
 }

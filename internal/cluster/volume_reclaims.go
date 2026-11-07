@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -59,7 +60,7 @@ func (c *Cluster) VolumeReclaimsFor(_ context.Context, nodeID string, limit int)
 	if c == nil || c.fsm == nil {
 		return []VolumeReclaim{}, nil
 	}
-	out := c.fsm.volumeReclaimsFor(nodeID, gossipReclaimNodeState(c.gossip), time.Now(), limit)
+	out := c.fsm.volumeReclaimsFor(nodeID, gossipReclaimNodeState(c.gossip), gossipReclaimAdopters(c.gossip), time.Now(), limit)
 	if out == nil {
 		out = []VolumeReclaim{}
 	}
@@ -76,6 +77,22 @@ func gossipReclaimNodeState(g *gossipNode) reclaimNodeState {
 		}
 		return true, CanOwnSandboxRole(m.Role)
 	}
+}
+
+// gossipReclaimAdopters lists the live members that run the reclaim sweep,
+// sorted, from this server's membership view (mayAdoptVolumeReclaim).
+func gossipReclaimAdopters(g *gossipNode) []string {
+	if g == nil {
+		return nil
+	}
+	var out []string
+	for _, m := range g.members() {
+		if m.Alive && CanOwnSandboxRole(m.Role) {
+			out = append(out, m.NodeID)
+		}
+	}
+	sort.Strings(out)
+	return out
 }
 
 func (c *Cluster) ClaimVolumeReclaim(ctx context.Context, r VolumeReclaim, nodeID string) error {
