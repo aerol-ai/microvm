@@ -214,6 +214,18 @@ integration-tests/run.sh cluster-hetero --upgrade-from v0.6.7  # full gate
 [`SNAPSHOT-MIGRATION-UPGRADE.md`](./SNAPSHOT-MIGRATION-UPGRADE.md) is the manual
 runbook the automation mirrors (use it to debug a failed gate).
 
+The gate upgrades the way the docs tell an operator to: it copies this
+build's `install.sh`, `sandboxd`, `toolboxd` and `checksums.txt` to each node
+and re-runs `install.sh` with no node flags (only the `--*-url` flags that say
+where those files are). Per node it fails unless the PAT is kept,
+`/etc/sandboxd/node.json` is written (0600, root, no PAT) after the settings
+were read back from the old release's files, sandboxd restarted onto the new
+build (new PID, `/health` version), and `sandboxd --version` prints
+`sandboxd itest-<build id>` without disturbing the daemon. Each node's
+installer output goes to `reports/upgrade-gate-<scenario>-install-<ip>.log`.
+`upgrade-gate.sh <scenario> --from <tag> --swap-binary` upgrades by copying
+the binary in instead, to check a schema migration alone.
+
 ## Key custody scenarios
 
 Customer key custody (`plans/customer-key-custody.md` Phase 6) has five
