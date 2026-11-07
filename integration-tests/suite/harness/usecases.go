@@ -1116,6 +1116,12 @@ var Registry = []UseCase{
 	// Upgrades without restarting sandboxes, Phase 3a live gate for mounts
 	// (plans/kubectl-style-cluster-ops.md §6.3 step 4, §6.4;
 	// z_mount_restart_test.go).
+	// The node's day-2 tools in Go, Phase 5 (plans/kubectl-style-cluster-ops.md
+	// §3.1; z_ops_tools_test.go). UC-680 and UC-681 restore and copy a
+	// single node's database, so they never run on a cluster.
+	{ID: "UC-680", Title: "sandboxd backup then sandboxd restore on a single node: the archive is 0600 and its manifest says VACUUM INTO; restore refuses while sandboxd runs; after stop, restore --start, sandboxd is healthy, a sandbox and a snapshot from before the backup are back and work (exec, create from the snapshot), and a sandbox and a snapshot made after the backup are gone", Excludes: []Capability{CapCluster}, Implemented: true},
+	{ID: "UC-681", Title: "sandboxd backup of a state.db near 1 GiB built from the node's own schema on the node's disk: the VACUUM INTO time (what an upgrade adds to a node's downtime, eng review T15) is measured and under 5 minutes", Excludes: []Capability{CapCluster}, Implemented: true},
+	{ID: "UC-682", Title: "Lost quorum: with two of three servers stopped there is no leader and a create fails; sandboxd recover-quorum --start on the surviving seed (refused while sandboxd runs; --rejoin refused on the seed) backs up, makes it the only voter and it leads and serves creates, a sandbox from before still answers exec; recover-quorum --rejoin --start on each lost server brings it back as a voter, ending with 3 voters and 1 leader", Requires: []Capability{CapCluster}, Implemented: true},
 	{ID: "UC-640", Title: "External-storage mounts survive a sandboxd restart: on the node running a sandbox with a platform volume, a file written through the mount reads back after `systemctl restart sandboxd` and a new write lands through the same mount of the same sandbox (never re-created); the mount helper is the same process before and after (adopted, not mounted again) and, on cgroup v2, runs in the aerolvm-mounts cgroup; a second sandbox on the volume reads the new file", Requires: []Capability{CapPlatformVolumes}, Implemented: true},
 }
 
