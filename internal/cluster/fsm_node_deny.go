@@ -18,7 +18,10 @@ import (
 // deleted node would keep raft-apply and owner-API authority for the rest of
 // its cert's life. A later fresh join (with a join token and a new key) is
 // what will replace a record; until that lands, a deleted node ID stays
-// denied and a machine that comes back needs a new SB_NODE_ID.
+// denied and a machine that comes back needs a new SB_NODE_ID. Once every
+// cert the node could hold has expired the record guards nothing, and the
+// next join drops it (pruneDeniedNodesLocked), so autoscaling
+// does not grow the set forever.
 //
 // Servers hold the records in this FSM. Workers and ingress nodes hold no
 // Raft state, so they poll the server tier for the set the way they keep
@@ -41,6 +44,19 @@ type NodeDenyRecord struct {
 	// Role is the node's gossiped role when it was deleted, for operators.
 	Role           string `json:"role,omitempty"`
 	DeniedUnixNano int64  `json:"denied_unix_nano"`
+	// ExpiresUnixNano is when every cert the node could hold has expired
+	// (certsGoneAt). From then on the record, like the node's tombstones,
+	// guards nothing, and a later join drops it (J10).
+	ExpiresUnixNano int64 `json:"expires_unix_nano,omitempty"`
+}
+
+// expiresAt is ExpiresUnixNano, or for a record written before the field
+// the bound a node with no admitted record gets.
+func (r NodeDenyRecord) expiresAt() int64 {
+	if r.ExpiresUnixNano != 0 {
+		return r.ExpiresUnixNano
+	}
+	return certsGoneAt(0, r.DeniedUnixNano)
 }
 
 // nodeDenyApplyResult is the leader FSM's answer to opDenyNode. Changed is
@@ -63,14 +79,21 @@ func (f *placementFSM) applyDenyNodeLocked(cmd command, index uint64) (any, erro
 	if f.deniedNodes == nil {
 		f.deniedNodes = make(map[string]NodeDenyRecord)
 	}
-	rec := NodeDenyRecord{NodeID: id, Role: strings.TrimSpace(in.Role), DeniedUnixNano: cmd.StampUnixNano}
+	// The expiry reads only the admitted record, which exists only once
+	// every server runs joinFSMOpsVersion; before that it is the plain
+	// bound every build computes the same way (expiresAt), so replicas of
+	// either build agree on when the record stops mattering.
+	stamp := cmd.StampUnixNano
+	rec := NodeDenyRecord{NodeID: id, Role: strings.TrimSpace(in.Role), DeniedUnixNano: stamp,
+		ExpiresUnixNano: certsGoneAt(f.admitted[id].NotAfterUnixNano, stamp)}
 	f.deniedNodes[id] = rec
 	// The node's admitted key (fsm_join.go) becomes a tombstone, so its old
 	// cert stays refused even after a fresh join reuses the ID. An older
 	// build skips this, but no admitted record can exist until every server
 	// runs a build with joinFSMOpsVersion, so on any log an older build can
-	// apply the two agree.
-	f.tombstoneAdmittedLocked(id, cmd.StampUnixNano)
+	// apply the two agree. The join that later reuses the ID tombstones
+	// the rest of the old certs, by identity (applyAdmitNodeLocked).
+	f.tombstoneAdmittedLocked(id, stamp)
 	f.deniedNodesVersion = index
 	f.publishDeniedLocked()
 	// The node also leaves any rollout (rollout_state.go dropDeleted), or a
@@ -79,6 +102,23 @@ func (f *placementFSM) applyDenyNodeLocked(cmd command, index uint64) (any, erro
 	// sees a record this changes.
 	f.dropDeletedFromRolloutLocked(id, cmd.StampUnixNano)
 	return nodeDenyApplyResult{Record: rec, Changed: true}, nil
+}
+
+// pruneDeniedNodesLocked drops the deny records whose node's certs have all
+// expired at stamp (J10). Without it the set grew forever under
+// autoscaling, and every worker downloads the whole set on each change.
+// Only opAdmitNode calls it: every replica that can apply that op prunes
+// the same way, and joins are what autoscaling repeats. Reports whether
+// any went.
+func (f *placementFSM) pruneDeniedNodesLocked(stamp int64) bool {
+	changed := false
+	for id, rec := range f.deniedNodes {
+		if rec.expiresAt() <= stamp {
+			delete(f.deniedNodes, id)
+			changed = true
+		}
+	}
+	return changed
 }
 
 // publishDeniedLocked swaps in a fresh copy of the deny set for the
@@ -168,7 +208,17 @@ func (c *Cluster) DeniedNodes(since uint64) (DeniedNodesResponse, bool) {
 	if since >= version {
 		return DeniedNodesResponse{}, false
 	}
-	return DeniedNodesResponse{Nodes: nodes, RevokedKeys: c.fsm.revokedKeysView(), Version: version}, true
+	// Tombstones past their life refuse nothing; they wait only for the
+	// next join to drop them, so they are not sent (J10).
+	now := time.Now().UnixNano()
+	revoked := c.fsm.revokedKeysView()
+	live := revoked[:0]
+	for _, k := range revoked {
+		if now < k.ExpiresUnixNano {
+			live = append(live, k)
+		}
+	}
+	return DeniedNodesResponse{Nodes: nodes, RevokedKeys: live, Version: version}, true
 }
 
 // revokedKeysView returns the tombstones, sorted by key hash.

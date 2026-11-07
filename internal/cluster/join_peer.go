@@ -24,7 +24,10 @@ import (
 // 2,000-node fleet would otherwise push the whole admitted table to every
 // worker. Tombstones are enough for the case that matters, an old cert of a
 // reused node ID: a join can take an ID only after `aerolvm delete node`
-// tombstoned the old key (opAdmitNode refuses an ID held by another key).
+// (opAdmitNode refuses an ID held by another key), and the delete
+// tombstones the admitted key and, by identity, every cert for the ID
+// issued before it. The second covers a node deleted before it was ever
+// admitted, whose key nobody knows (J7).
 
 // denyHitKey counts internal calls refused for their cert key.
 const denyHitKey = "key"
@@ -50,19 +53,21 @@ func (c *Cluster) CheckPeerKey(nodeID string, leaf *x509.Certificate) error {
 	if c == nil || c.fsm == nil {
 		return nil
 	}
-	if err := c.fsm.peerTrustSnapshot().checkPeerKey(nodeID, CertKeyHash(leaf), time.Now().UnixNano()); err != nil {
+	if err := c.fsm.peerTrustSnapshot().checkPeerCert(nodeID, leaf, time.Now().UnixNano()); err != nil {
 		c.denyHits.hit(denyHitKey, nodeID)
 		return err
 	}
 	return nil
 }
 
-// CheckPeerKey is the worker's rule: the mirrored tombstones.
+// CheckPeerKey is the worker's rule: the mirrored tombstones, by key and
+// by identity (a cert for the ID issued before its node was deleted).
 func (a *Agent) CheckPeerKey(nodeID string, leaf *x509.Certificate) error {
-	if a == nil {
+	if a == nil || leaf == nil {
 		return nil
 	}
-	if a.deny.revokedKey(CertKeyHash(leaf), time.Now().UnixNano()) {
+	now := time.Now().UnixNano()
+	if a.deny.revokedKey(CertKeyHash(leaf), now) || a.deny.oldCert(nodeID, leaf.NotBefore, now) {
 		a.denyHits.hit(denyHitKey, nodeID)
 		return ErrPeerKeyRevoked
 	}

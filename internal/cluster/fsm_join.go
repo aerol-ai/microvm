@@ -1,6 +1,7 @@
 package cluster
 
 import (
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"sort"
@@ -18,10 +19,19 @@ import (
 //	opDeleteJoinToken ─► revoke                    (idempotent)
 //	opAdmitNode       ─► one join, atomically:     use the token for this key,
 //	                                               reserve the node ID for this key,
-//	                                               replace a deny record, write admitted[id]
+//	                                               replace a deny record (tombstoning by identity
+//	                                               every cert for the ID issued before the delete),
+//	                                               write admitted[id]
 //	opAdoptNodes      ─► admitted[id] for every live member of a scripted cluster (§4.4)
 //	opRekeyNode       ─► a renewal that moved the node to a new key (§4.2)
 //	opDenyNode (42)   ─► also moves the admitted key to the tombstones (§5)
+//
+// Deny records and tombstones live until every cert they guard against
+// has expired (certsGoneAt); a later join drops them, at its own stamp
+// (J10). Both extras sit in opAdmitNode, which only a build with
+// joinFSMOpsVersion applies, so every replica that applies them agrees.
+// (No released build has fv 12 yet; these extras ship with it, so no
+// build applies opAdmitNode without them.)
 //
 // Why not the API token table (D3 asked us to check first): its records
 // carry a controlplane role, a required expiry and a team, and every worker
@@ -193,11 +203,49 @@ func (a AdmittedNode) IsServer() bool { return a.Role == JoinRoleServer }
 // RevokedKey is a tombstone: a deleted node's cert key, refused on every
 // internal call until any cert for it would have expired, even after its
 // node ID is reused (Codex CEO finding 6).
+//
+// A by-identity tombstone (byNodeID: KeyHash is nodeCertsTombstoneKey(NodeID))
+// refuses every cert for NodeID issued before IssuedBeforeUnixNano,
+// whatever its key. The join that reuses a deleted node's ID writes one,
+// because a node deleted before it was ever admitted has no known key,
+// and an admitted one may still hold certs for a key it rekeyed away
+// from. Workers mirror only tombstones, so without it such an old cert
+// would work on their port 7002 once the ID was reused (J7).
 type RevokedKey struct {
-	KeyHash         string `json:"key_hash"`
-	NodeID          string `json:"node_id"`
-	RevokedUnixNano int64  `json:"revoked_unix_nano"`
-	ExpiresUnixNano int64  `json:"expires_unix_nano"`
+	KeyHash              string `json:"key_hash"`
+	NodeID               string `json:"node_id"`
+	RevokedUnixNano      int64  `json:"revoked_unix_nano"`
+	ExpiresUnixNano      int64  `json:"expires_unix_nano"`
+	IssuedBeforeUnixNano int64  `json:"issued_before_unix_nano,omitempty"`
+}
+
+// nodeCertsTombstoneKey is the table key of a by-identity tombstone. A key
+// hash is hex, so it never collides with one.
+func nodeCertsTombstoneKey(nodeID string) string { return "node:" + nodeID }
+
+// byNodeID reports whether r is a by-identity tombstone.
+func (r RevokedKey) byNodeID() bool {
+	return r.NodeID != "" && r.KeyHash == nodeCertsTombstoneKey(r.NodeID)
+}
+
+// nodeCertCutoffSkew pads a by-identity tombstone's cutoff back from the
+// delete, for clock skew between the leader that stamps the delete and the
+// server that signs a fresh join's cert, so a delete followed at once by a
+// re-join never refuses the new cert. A cert issued in that last minute
+// carries the admitted key (or the previous one in its grace), and both
+// are tombstoned by key; a node never admitted gets no cert from the join
+// service at all.
+const nodeCertCutoffSkew = time.Minute
+
+// certCutoff is a by-identity tombstone in the lock-free views.
+type certCutoff struct {
+	before  int64 // refuse certs whose NotBefore is earlier
+	expires int64
+}
+
+// refuses reports whether the cutoff refuses a cert with notBefore at now.
+func (c certCutoff) refuses(notBefore time.Time, now int64) bool {
+	return now < c.expires && notBefore.UnixNano() < c.before
 }
 
 // JoinAdmitCommand is opAdmitNode's payload.
@@ -245,6 +293,8 @@ type JoinRekeyCommand struct {
 type peerTrustView struct {
 	admitted map[string]AdmittedNode
 	revoked  map[string]int64 // key hash -> expires (unix nano)
+	// cutoffs are the by-identity tombstones, by node ID.
+	cutoffs map[string]certCutoff
 }
 
 func (f *placementFSM) joinStateInitLocked() {
@@ -349,7 +399,12 @@ func (f *placementFSM) applyAdmitNodeLocked(cmd command, index uint64) (any, err
 		return nil, errors.New("placementFSM: opAdmitNode requires a key hash")
 	}
 	f.joinStateInitLocked()
+	// Joins are what autoscaling repeats, so they also drop the deny
+	// records whose node's certs have all expired (J10).
 	trustChanged := f.pruneRevokedKeysLocked(stamp)
+	if f.pruneDeniedNodesLocked(stamp) {
+		trustChanged = true
+	}
 	defer func() {
 		if trustChanged {
 			f.deniedNodesVersion = index
@@ -399,10 +454,14 @@ func (f *placementFSM) applyAdmitNodeLocked(cmd command, index uint64) (any, err
 	}
 	f.pruneJoinTokensLocked(stamp)
 	res := JoinAdmitResult{Node: rec}
-	if _, denied := f.deniedNodes[nodeID]; denied {
+	if deny, denied := f.deniedNodes[nodeID]; denied {
 		// A fresh join (new token, new key: the revoked check above refused
-		// the old one) replaces the deny record (§5).
+		// the old one) replaces the deny record (§5). Every cert for the ID
+		// issued before the delete stays refused, whatever its key (J7): a
+		// node deleted before it was ever admitted had no key to
+		// tombstone, and workers check only tombstones.
 		delete(f.deniedNodes, nodeID)
+		f.tombstoneNodeCertsLocked(nodeID, deny.DeniedUnixNano, deny.expiresAt())
 		res.ReplacedDeny = true
 	}
 	trustChanged = trustChanged || res.ReplacedDeny
@@ -512,7 +571,7 @@ func (f *placementFSM) tombstoneAdmittedLocked(nodeID string, stamp int64) bool 
 		return false
 	}
 	f.joinStateInitLocked()
-	expires := max(cur.NotAfterUnixNano, stamp+int64(NodeCertLifetime)) + int64(revokedKeySkew)
+	expires := certsGoneAt(cur.NotAfterUnixNano, stamp)
 	f.revokedKeys[cur.KeyHash] = RevokedKey{KeyHash: cur.KeyHash, NodeID: nodeID, RevokedUnixNano: stamp, ExpiresUnixNano: expires}
 	if cur.PrevKeyHash != "" && cur.PrevUntilUnixNano > stamp {
 		f.revokedKeys[cur.PrevKeyHash] = RevokedKey{KeyHash: cur.PrevKeyHash, NodeID: nodeID, RevokedUnixNano: stamp, ExpiresUnixNano: expires}
@@ -525,6 +584,29 @@ func (f *placementFSM) tombstoneAdmittedLocked(nodeID string, stamp int64) bool 
 	return true
 }
 
+// certsGoneAt is when every cert a node deleted at stamp could hold has
+// expired: the later of the newest cert its admitted record saw (notAfter,
+// 0 when none) and a full cert life after the delete, because a same-key
+// renewal does not write Raft. Plus revokedKeySkew. Tombstones and deny
+// records live until then.
+func certsGoneAt(notAfter, stamp int64) int64 {
+	return max(notAfter, stamp+int64(NodeCertLifetime)) + int64(revokedKeySkew)
+}
+
+// tombstoneNodeCertsLocked writes the by-identity tombstone (J7): every
+// cert for nodeID issued before the delete at stamp stays refused until
+// expires. A later delete and re-join of the same ID replaces it with a
+// later cutoff, which covers more.
+func (f *placementFSM) tombstoneNodeCertsLocked(nodeID string, stamp, expires int64) {
+	f.joinStateInitLocked()
+	key := nodeCertsTombstoneKey(nodeID)
+	f.revokedKeys[key] = RevokedKey{
+		KeyHash: key, NodeID: nodeID, RevokedUnixNano: stamp, ExpiresUnixNano: expires,
+		IssuedBeforeUnixNano: stamp - int64(nodeCertBackdate) - int64(nodeCertCutoffSkew),
+	}
+	f.publishPeerTrustLocked()
+}
+
 // publishPeerTrustLocked swaps in a fresh copy of the admitted keys and
 // tombstones for lock-free readers. Caller holds f.mu. Copy-on-write is
 // cheap: these change on a join, an adopt, a rekey or a delete.
@@ -532,11 +614,16 @@ func (f *placementFSM) publishPeerTrustLocked() {
 	view := &peerTrustView{
 		admitted: make(map[string]AdmittedNode, len(f.admitted)),
 		revoked:  make(map[string]int64, len(f.revokedKeys)),
+		cutoffs:  map[string]certCutoff{},
 	}
 	for id, rec := range f.admitted {
 		view.admitted[id] = rec
 	}
 	for k, rec := range f.revokedKeys {
+		if rec.byNodeID() {
+			view.cutoffs[rec.NodeID] = certCutoff{before: rec.IssuedBeforeUnixNano, expires: rec.ExpiresUnixNano}
+			continue
+		}
 		view.revoked[k] = rec.ExpiresUnixNano
 	}
 	f.peerTrust.Store(view)
@@ -587,6 +674,18 @@ func (v *peerTrustView) revokedKey(keyHash string, now int64) bool {
 	}
 	exp, ok := v.revoked[keyHash]
 	return ok && now < exp
+}
+
+// checkPeerCert is checkPeerKey for a whole cert: also refused is a cert
+// for nodeID issued before its node was deleted (a by-identity tombstone).
+func (v *peerTrustView) checkPeerCert(nodeID string, leaf *x509.Certificate, now int64) error {
+	if v == nil || leaf == nil {
+		return nil
+	}
+	if c, ok := v.cutoffs[nodeID]; ok && c.refuses(leaf.NotBefore, now) {
+		return ErrPeerKeyRevoked
+	}
+	return v.checkPeerKey(nodeID, CertKeyHash(leaf), now)
 }
 
 // joinTokenView returns one token, copied.

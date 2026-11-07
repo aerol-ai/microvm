@@ -286,9 +286,16 @@ func TestFSMDenyTombstonesAdmittedKey(t *testing.T) {
 	if err := trust.checkPeerKey("wkr-1", testKey("new"), stamp+31); err != nil {
 		t.Fatalf("new key refused: %v", err)
 	}
+	// The fresh join also tombstoned, by identity, every cert for the ID
+	// issued before the delete (J7), and it expires with the key one.
+	byID := l.f.revokedKeysView()
+	if len(byID) != 2 || !byID[1].byNodeID() || byID[1].IssuedBeforeUnixNano != stamp+10-int64(nodeCertBackdate)-int64(nodeCertCutoffSkew) ||
+		byID[1].ExpiresUnixNano != byID[0].ExpiresUnixNano {
+		t.Fatalf("tombstones after the fresh join = %+v", byID)
+	}
 	// A retried delete of the new node tombstones the new key too.
 	l.apply(denyCmd("wkr-1", stamp+40))
-	if len(l.f.revokedKeysView()) != 2 {
+	if len(l.f.revokedKeysView()) != 3 {
 		t.Fatalf("second deny tombstones = %+v", l.f.revokedKeysView())
 	}
 	// Tombstones expire at an entry stamped past their life, on every replica.
@@ -502,7 +509,7 @@ func TestFSMJoinReplay(t *testing.T) {
 		applyDenyLogAt(t, full, uint64(i+1), cmd)
 	}
 	want := joinViewOf(full)
-	if len(want.admitted) != 4 || len(want.revoked) != 1 || len(want.tokens) != 2 {
+	if len(want.admitted) != 4 || len(want.revoked) != 2 || len(want.tokens) != 2 {
 		t.Fatalf("full replay = %+v", want)
 	}
 	for cut := 1; cut < len(log); cut++ {

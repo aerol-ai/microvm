@@ -1032,7 +1032,7 @@ func (c *Cluster) RenewNodeCert(ctx context.Context, peerID string, leaf *x509.C
 	if !ok {
 		return RenewCertResponse{}, ErrNotAdmitted
 	}
-	if err := c.fsm.peerTrustSnapshot().checkPeerKey(peerID, CertKeyHash(leaf), time.Now().UnixNano()); err != nil {
+	if err := c.fsm.peerTrustSnapshot().checkPeerCert(peerID, leaf, time.Now().UnixNano()); err != nil {
 		return RenewCertResponse{}, err
 	}
 	csr, err := ParseCertificateRequestPEM(csrPEM)

@@ -33,7 +33,22 @@ type agentDenyMirror struct {
 	mu      sync.RWMutex
 	set     map[string]bool
 	revoked map[string]int64 // cert key hash -> expires (unix nano)
+	// cutoffs are the by-identity tombstones (RevokedKey.byNodeID), by
+	// node ID: every cert for the ID issued before the delete is refused.
+	cutoffs map[string]certCutoff
 	version uint64
+}
+
+// oldCert reports whether a cert for nodeID issued at notBefore predates
+// the node's delete (a live by-identity tombstone).
+func (m *agentDenyMirror) oldCert(nodeID string, notBefore time.Time, now int64) bool {
+	if m == nil || nodeID == "" {
+		return false
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	c, ok := m.cutoffs[nodeID]
+	return ok && c.refuses(notBefore, now)
 }
 
 // revokedKey reports whether keyHash is a live tombstone.
@@ -64,6 +79,12 @@ func (m *agentDenyMirror) cursor() uint64 {
 
 // merge takes resp when it is newer and returns the IDs it added.
 func (m *agentDenyMirror) merge(resp DeniedNodesResponse) []string {
+	return m.mergeAt(resp, time.Now().UnixNano())
+}
+
+// mergeAt is merge at now: tombstones already past their life are not
+// kept, so the copy holds only what can still refuse a cert (J10).
+func (m *agentDenyMirror) mergeAt(resp DeniedNodesResponse, now int64) []string {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if resp.Version <= m.version {
@@ -81,12 +102,17 @@ func (m *agentDenyMirror) merge(resp DeniedNodesResponse) []string {
 		}
 	}
 	revoked := make(map[string]int64, len(resp.RevokedKeys))
+	cutoffs := map[string]certCutoff{}
 	for _, k := range resp.RevokedKeys {
-		if k.KeyHash != "" {
+		switch {
+		case k.KeyHash == "" || now >= k.ExpiresUnixNano:
+		case k.byNodeID():
+			cutoffs[k.NodeID] = certCutoff{before: k.IssuedBeforeUnixNano, expires: k.ExpiresUnixNano}
+		default:
 			revoked[k.KeyHash] = k.ExpiresUnixNano
 		}
 	}
-	m.set, m.revoked, m.version = set, revoked, resp.Version
+	m.set, m.revoked, m.cutoffs, m.version = set, revoked, cutoffs, resp.Version
 	return added
 }
 

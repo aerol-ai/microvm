@@ -965,9 +965,10 @@ func TestInternalCallsRefuseOldCertOfReusedID(t *testing.T) {
 	if RefusePeerKey(NewNoop("a", "http://a", ""), "wkr-r", oldLeaf) != nil || RefusePeerKey(leader, "wkr-r", nil) != nil {
 		t.Fatal("Noop or nil leaf refused")
 	}
-	// Workers refuse the tombstone too, from the mirror.
+	// Workers refuse the tombstone too, from the mirror: the key one and
+	// the by-identity one the fresh join wrote.
 	resp, changed := leader.DeniedNodes(0)
-	if !changed || len(resp.RevokedKeys) != 1 || len(resp.Nodes) != 0 {
+	if !changed || len(resp.RevokedKeys) != 2 || len(resp.Nodes) != 0 {
 		t.Fatalf("deny feed = %+v %v", resp, changed)
 	}
 	agent := &Agent{denyHits: &denyHitRecorder{}}
@@ -980,6 +981,49 @@ func TestInternalCallsRefuseOldCertOfReusedID(t *testing.T) {
 	}
 	if agent.IsNodeDenied("wkr-r") {
 		t.Fatal("worker kept the replaced deny record")
+	}
+
+	// J7: a node deleted before it was ever admitted (adopt skipped it,
+	// it was down) has no key to tombstone. Once a fresh join reuses its
+	// ID, its old cert, issued before the delete, is still refused: on
+	// servers, and on workers, which check only tombstones.
+	legacyKey, _, _ := NewNodeKey()
+	_, legacyLeaf, _ := ca.SignNodeCert(NodeCertRequest{PublicKey: &legacyKey.PublicKey, NodeID: "wkr-legacy", Role: JoinRoleWorker, Now: time.Now().Add(-time.Hour)})
+	if _, err := leader.writeNodeDeny(ctx, "wkr-legacy", config.NodeRoleWorker); err != nil {
+		t.Fatal(err)
+	}
+	tok2, err := leader.CreateJoinToken(ctx, JoinTokenCreateRequest{Role: JoinRoleWorker})
+	if err != nil {
+		t.Fatal(err)
+	}
+	freshKey, _, _ := NewNodeKey()
+	_, freshLeaf, _ := ca.SignNodeCert(NodeCertRequest{PublicKey: &freshKey.PublicKey, NodeID: "wkr-legacy", Role: JoinRoleWorker})
+	written, err = leader.WriteJoin(ctx, JoinWriteRequest{Kind: joinWriteAdmit, Admit: &JoinAdmitCommand{
+		TokenID: tok2.ID, NodeID: "wkr-legacy", Role: JoinRoleWorker, KeyHash: CertKeyHash(freshLeaf),
+	}})
+	if err != nil || written.Admit == nil || !written.Admit.ReplacedDeny {
+		t.Fatalf("fresh join over a never-admitted node = %+v %v", written, err)
+	}
+	if err := leader.CheckPeerKey("wkr-legacy", legacyLeaf); !errors.Is(err, ErrPeerKeyRevoked) {
+		t.Fatalf("server check of the never-admitted node's old cert = %v", err)
+	}
+	if err := leader.CheckPeerKey("wkr-legacy", freshLeaf); err != nil {
+		t.Fatalf("server refused the fresh cert: %v", err)
+	}
+	resp, changed = leader.DeniedNodes(resp.Version)
+	if !changed {
+		t.Fatal("the deny feed did not move")
+	}
+	legacyAgent := &Agent{denyHits: &denyHitRecorder{}}
+	legacyAgent.deny.merge(resp)
+	if err := legacyAgent.CheckPeerKey("wkr-legacy", legacyLeaf); !errors.Is(err, ErrPeerKeyRevoked) {
+		t.Fatalf("worker check of the never-admitted node's old cert = %v", err)
+	}
+	if err := legacyAgent.CheckPeerKey("wkr-legacy", freshLeaf); err != nil {
+		t.Fatalf("worker refused the fresh cert: %v", err)
+	}
+	if legacyAgent.IsNodeDenied("wkr-legacy") || legacyAgent.CheckPeerKey("wkr-r", newLeaf) != nil {
+		t.Fatal("worker refused a node it should accept")
 	}
 	var nilAgent *Agent
 	var nilCluster *Cluster
