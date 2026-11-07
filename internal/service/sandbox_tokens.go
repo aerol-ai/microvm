@@ -154,6 +154,50 @@ func (s *Service) RevokeSandboxTokens(ctx context.Context, sandboxID string) (mo
 	return models.RevokeSandboxTokensResponse{SandboxID: sandbox.ID, TokensNotBefore: at}, nil
 }
 
+// raiseTokensNotBeforeToTakeover refuses, on a sandbox row this node kept
+// from an earlier ownership, every token issued before the node took the
+// placement back. Without it a failback reopens a revoke: the sandbox moves
+// to another node, which recreates it (a new row, so a new not-before), the
+// user revokes its tokens there, and the placement then returns here, where
+// the owner watcher reuses the old row with its old not-before, and the
+// revoked tokens work again. ownerSinceUnixNano is the placement's
+// OwnerSinceUnixNano (the leader's time for the takeover's raft entry); 0
+// means no takeover is known and changes nothing.
+//
+// The watcher calls this on every tick for every owned sandbox; it writes
+// once per takeover, because afterwards the row is no longer older. A
+// sandbox that never changed owner is never touched: the FSM leaves the
+// first owner at 0, so a create whose row is written before its placement
+// is not mistaken for one. The write is the revoke's own MAX, so a retry,
+// or a revoke racing it, never moves the not-before back. It refuses the
+// tokens issued in the takeover's second too, as a revoke would; one issued
+// here after the takeover but before this tick in that second is refused
+// with them. Cluster mode off: no placement, so the value is always 0.
+func (s *Service) raiseTokensNotBeforeToTakeover(ctx context.Context, row *models.Sandbox, ownerSinceUnixNano int64) error {
+	if ownerSinceUnixNano <= 0 {
+		return nil
+	}
+	notBefore := sandboxtoken.NotBeforeAt(time.Unix(0, ownerSinceUnixNano))
+	if row.TokensNotBefore >= notBefore {
+		return nil
+	}
+	stored, err := s.store.RevokeSandboxTokens(ctx, row.ID, notBefore)
+	if err != nil {
+		return fmt.Errorf("refuse sandbox tokens from before the takeover: %w", err)
+	}
+	previous := row.TokensNotBefore
+	row.TokensNotBefore = stored
+	// After the write, as RevokeSandboxTokens does: a gated port's warm
+	// entry read before it must not keep the old not-before.
+	s.invalidateWarm(row.ID)
+	if s.logger != nil {
+		s.logger.Info("sandbox tokens from before the owner takeover refused",
+			"sandbox_id", row.ID, "owner_since", time.Unix(0, ownerSinceUnixNano).UTC(),
+			"previous_tokens_not_before", time.Unix(previous, 0).UTC(), "tokens_not_before", time.Unix(stored, 0).UTC())
+	}
+	return nil
+}
+
 // sandboxTokenTTL parses expires_in and applies the cap.
 func (s *Service) sandboxTokenTTL(raw string) (time.Duration, error) {
 	if strings.TrimSpace(raw) == "" {

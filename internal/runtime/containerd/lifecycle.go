@@ -471,6 +471,11 @@ func (d *Driver) startTask(ctx context.Context, containerRef, sandboxID, toolbox
 			defer func() { _ = rl.Close() }()
 		}
 	}
+	// The new run's start time (SandboxRuntimeState.StartedAt): taken after
+	// the old task was deleted, so after its exit, and before the new task
+	// exists, so before anything it can report. The shims stamp exits on
+	// this same host clock.
+	startedAt := time.Now().UTC()
 	task, err = container.NewTask(ctx, logIO)
 	if err != nil {
 		return nil, fmt.Errorf("create task: %w", err)
@@ -490,7 +495,12 @@ func (d *Driver) startTask(ctx context.Context, containerRef, sandboxID, toolbox
 			return nil, fmt.Errorf("re-adopt warm-pool container: %w", err)
 		}
 	}
-	return d.runtimeStateAfterStart(ctx, container, task, containerRef, "")
+	state, err := d.runtimeStateAfterStart(ctx, container, task, containerRef, "")
+	if err != nil {
+		return nil, err
+	}
+	state.StartedAt = startedAt
+	return state, nil
 }
 
 // parkedRestartListener returns the listener a start of a warm-pool

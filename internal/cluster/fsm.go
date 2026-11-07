@@ -911,6 +911,46 @@ func (f *placementFSM) Apply(log *raft.Log) interface{} {
 	return res
 }
 
+// ownerSinceAfter is the OwnerSinceUnixNano a placement carries once the
+// entry log makes newOwner its owner; prev is the row before the entry and
+// existed is false for a new row. A new row has had no other owner, so it
+// starts at 0 even though it has an owner: a create that runs locally first
+// writes its sandbox row before the opPlace that records the owner, and
+// stamping that first owner would refuse the tokens the create's caller
+// issues straight after it. The time is the leader's append time from the
+// entry itself, so replicas and replays agree; an entry without one (an old
+// log, a test) records 0, which reads as "no takeover known".
+func ownerSinceAfter(prev Placement, existed bool, newOwner string, log *raft.Log) int64 {
+	if !existed {
+		return 0
+	}
+	newOwner = strings.TrimSpace(newOwner)
+	previous := strings.TrimSpace(prev.OwnerNodeID)
+	if prev.IsOrphaned() {
+		previous = strings.TrimSpace(prev.OrphanedOwnerNodeID)
+	}
+	// Orphaning hands the sandbox to nobody, and a claim back by the node it
+	// was orphaned from is the same owner returning: neither is a takeover.
+	if newOwner == "" || newOwner == previous {
+		return prev.OwnerSinceUnixNano
+	}
+	if log == nil || log.AppendedAt.IsZero() {
+		return 0
+	}
+	return log.AppendedAt.UnixNano()
+}
+
+// setPlacementOwner moves an existing placement to owner ("" orphans it; the
+// caller keeps the orphan bookkeeping) and keeps OwnerSinceUnixNano in step.
+// Every apply that changes the owner of an existing row goes through it, so
+// the takeover time cannot drift from the owner it describes.
+func setPlacementOwner(p *Placement, owner, apiURL, dataPlaneHost string, log *raft.Log) {
+	p.OwnerSinceUnixNano = ownerSinceAfter(*p, true, owner, log)
+	p.OwnerNodeID = owner
+	p.OwnerAPIURL = apiURL
+	p.OwnerDataPlaneHost = dataPlaneHost
+}
+
 func (f *placementFSM) apply(log *raft.Log) interface{} {
 	cmd, err := decodeCommand(log.Data)
 	if err != nil {
@@ -1053,6 +1093,7 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 			OwnerNodeID:          cmd.OwnerNodeID,
 			OwnerAPIURL:          cmd.OwnerAPIURL,
 			OwnerDataPlaneHost:   dataPlaneHost,
+			OwnerSinceUnixNano:   ownerSinceAfter(existing, exists, cmd.OwnerNodeID, log),
 			Version:              f.version,
 			CreatedUnix:          created,
 			UpdatedUnix:          now,
@@ -1279,9 +1320,7 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 		previousOwner := existing.OwnerNodeID
 		ownerChanged := previousOwner != cmd.OwnerNodeID
 		recordPlacementAuditNode(&existing, previousOwner)
-		existing.OwnerNodeID = cmd.OwnerNodeID
-		existing.OwnerAPIURL = cmd.OwnerAPIURL
-		existing.OwnerDataPlaneHost = cmd.OwnerDataPlaneHost
+		setPlacementOwner(&existing, cmd.OwnerNodeID, cmd.OwnerAPIURL, cmd.OwnerDataPlaneHost, log)
 		if cmd.OwnerNodeID == "" {
 			existing.OwnerState = PlacementOwnerStateOrphaned
 			if existing.OrphanedOwnerNodeID == "" {
@@ -1320,9 +1359,7 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 			}
 			f.releaseOwnerLocked(id, existing)
 			recordPlacementAuditNode(&existing, cmd.NodeID)
-			existing.OwnerNodeID = ""
-			existing.OwnerAPIURL = ""
-			existing.OwnerDataPlaneHost = ""
+			setPlacementOwner(&existing, "", "", "", log)
 			existing.OwnerState = PlacementOwnerStateOrphaned
 			existing.OrphanedOwnerNodeID = cmd.NodeID
 			existing.OrphanedUnix = now
@@ -1419,9 +1456,7 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 			}
 		}
 		recordPlacementAuditNode(&existing, existing.OrphanedOwnerNodeID)
-		existing.OwnerNodeID = cmd.OwnerNodeID
-		existing.OwnerAPIURL = cmd.OwnerAPIURL
-		existing.OwnerDataPlaneHost = cmd.OwnerDataPlaneHost
+		setPlacementOwner(&existing, cmd.OwnerNodeID, cmd.OwnerAPIURL, cmd.OwnerDataPlaneHost, log)
 		existing.OwnerState = PlacementOwnerStateActive
 		existing.OrphanedOwnerNodeID = ""
 		existing.OrphanedUnix = 0

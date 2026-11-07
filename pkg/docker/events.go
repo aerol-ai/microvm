@@ -19,7 +19,12 @@ type DockerEvent struct {
 	SandboxID   string
 	Action      string // "die", "destroy", "oom", "start", "stop"
 	ExitCode    int    // populated on "die" when reported by Docker
-	Time        time.Time
+	// Time is when the engine recorded the event, on the engine's clock, to
+	// the nanosecond when it says (Docker's timeNano, containerd's exit
+	// time). The service tells an exit of an earlier run by it
+	// (internal/service/run_starts.go), so seconds are not enough: a start
+	// often follows the exit within the same second. Zero when unknown.
+	Time time.Time
 }
 
 // StreamEvents subscribes to Docker's /events feed for managed containers and
@@ -95,8 +100,10 @@ type rawDockerEvent struct {
 	Status string `json:"status"`
 	Action string `json:"Action"`
 	ID     string `json:"id"`
-	Time   int64  `json:"time"`
-	Actor  struct {
+	// TimeNano is the event's time to the nanosecond (API v1.22 and
+	// later); the legacy "time" field has whole seconds only.
+	TimeNano int64 `json:"timeNano"`
+	Actor    struct {
 		ID         string            `json:"ID"`
 		Attributes map[string]string `json:"Attributes"`
 	} `json:"Actor"`
@@ -133,9 +140,12 @@ func (r rawDockerEvent) normalize() (DockerEvent, bool) {
 		}
 	}
 
+	// Only timeNano: whole seconds (an engine older than API v1.22) are
+	// truncated, so a crash just after a start would read as before it.
+	// Unknown is handled as it always was.
 	eventTime := time.Time{}
-	if r.Time > 0 {
-		eventTime = time.Unix(r.Time, 0).UTC()
+	if r.TimeNano > 0 {
+		eventTime = time.Unix(0, r.TimeNano).UTC()
 	}
 
 	return DockerEvent{
