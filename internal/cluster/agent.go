@@ -166,6 +166,10 @@ type Agent struct {
 	// certRenewStop ends the node cert renewal loop (cert_renew.go).
 	certRenewStop context.CancelFunc
 	denyHits      *denyHitRecorder
+	// upgrade is the node side of a rollout step (upgrade_node.go);
+	// upgradePruneStop ends its file-store prune.
+	upgrade          *upgradeNode
+	upgradePruneStop context.CancelFunc
 
 	// feed is the placement delta feed (agent_placement_feed.go), started
 	// only with SB_INGRESS_PROXY_ROUTING. nil means the page walk.
@@ -339,7 +343,35 @@ func NewAgent(cfg config.Config, logger *slog.Logger, admitter *capacity.Admitte
 	if clusterTLS != nil {
 		a.certRenewStop = startCertRenewer(&certRenewer{tls: clusterTLS, nodeID: nodeID, logger: logger, renew: a.renewViaServers})
 	}
+	a.startUpgradeNode()
 	return a, nil
+}
+
+// startUpgradeNode wires this worker's or ingress node's half of a
+// rollout step and the prune of its upgrade file store.
+func (a *Agent) startUpgradeNode() {
+	a.upgrade = newUpgradeNode(a.cfg, a.nodeID, false, a.logger)
+	a.upgrade.fence = a.agentFence
+	a.upgrade.servers = func() []Member { return serversForCopy(a.controlPlaneMembers(), a.nodeID, "") }
+	a.upgrade.clientFor = a.ClientForPeer
+	a.upgrade.audit = a.recordUpgradeAudit
+	ctx, cancel := context.WithCancel(context.Background())
+	a.upgradePruneStop = cancel
+	go func() {
+		t := time.NewTicker(upgradePruneEvery)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case now := <-t.C:
+				// A worker holds no rollout record: files it staged and has
+				// not installed within the hour are pruned, and apply copies
+				// a missing one again.
+				pruneUpgradeFiles(a.upgrade.paths, nil, now)
+			}
+		}
+	}()
 }
 
 func (a *Agent) SelfNodeID() string { return a.nodeID }
@@ -1490,6 +1522,9 @@ func (a *Agent) Close() error {
 	}
 	if a.denyMirrorStop != nil {
 		a.denyMirrorStop()
+	}
+	if a.upgradePruneStop != nil {
+		a.upgradePruneStop()
 	}
 	a.stopOwnerWatcher()
 	a.stopPlacementFeed()

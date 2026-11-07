@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/config"
+	"github.com/aerol-ai/microvm/internal/nodeupgrade"
 	"github.com/aerol-ai/microvm/pkg/capacity"
 	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/google/uuid"
@@ -175,6 +176,14 @@ type Cluster struct {
 	joinAdvertisePort int
 	joinDial          dialFunc
 	certRenewStop     context.CancelFunc
+
+	// Rollouts (rollout*.go, upgrade_*.go): the node side of an upgrade
+	// step, the release-file server, the leader's driver and its loop.
+	upgrade     *upgradeNode
+	files       *upgradeFileServer
+	driver      *rolloutDriver
+	rolloutStop context.CancelFunc
+	rolloutWake chan struct{}
 }
 
 // New constructs the server-role Cluster for cfg.EnableCluster=true. Caller
@@ -377,8 +386,37 @@ func New(cfg config.Config, logger *slog.Logger, admitter *capacity.Admitter) (*
 	c.startCatchUpWatch()
 
 	c.startJoinService()
+	c.startRollouts()
 
 	return c, nil
+}
+
+// startRollouts wires the upgrade node, the release-file server and the
+// rollout driver, and starts their loop. Nothing here is on the sandbox
+// boot path: the loop's first tick is rolloutTickEvery after start.
+func (c *Cluster) startRollouts() {
+	c.upgrade = newUpgradeNode(c.cfg, c.nodeID, true, c.logger)
+	c.upgrade.fence = func(ctx context.Context, rolloutID string) (UpgradeFence, error) {
+		return c.serverFence(ctx, rolloutID, c.nodeID)
+	}
+	c.upgrade.servers = func() []Member { return serversForCopy(c.LocalMembers(), c.nodeID, c.Leader()) }
+	c.upgrade.clientFor = c.ClientForPeer
+	c.upgrade.appliedIndex = c.fsm.currentVersion
+	c.upgrade.audit = c.recordUpgradeAudit
+	c.files = newUpgradeFileServer(c.cfg.UpgradeServeMBPS, func() (nodeupgrade.Paths, error) { return c.upgrade.paths() }, c.leaderRefusesCopy)
+	c.driver = newRolloutDriver(clusterRolloutHost{c: c}, clusterNodeClient{c: c}, c.logger)
+	c.rolloutWake = make(chan struct{}, 1)
+	rolloutMetricsSource.Store(c.fsm)
+	activeVersionSource.Store(c)
+	c.startRolloutLoop()
+}
+
+// recordUpgradeAudit hands an upgrade record to the service's audit
+// writer, when one is attached (AttachRecreator).
+func (c *Cluster) recordUpgradeAudit(ev UpgradeAuditEvent) {
+	if rec, ok := c.currentRecreator().(UpgradeAuditRecorder); ok {
+		rec.RecordClusterUpgrade(ev)
+	}
 }
 
 // startJoinService loads the CA store, opens the join listener (servers
@@ -1585,6 +1623,12 @@ func (c *Cluster) ApplyEncoded(ctx context.Context, payload []byte) error {
 		// peer could admit a key as a server, or skip the gate.
 		return errJoinOpNotForwardable
 	}
+	if isRolloutOp(cmd.Op) {
+		// The active version and the rollout are proposed only by this
+		// leader's rollout code, after its upgrade gate and the transition
+		// tables; a raw forward could move a rollout past both.
+		return errRolloutOpNotForwardable
+	}
 	if isRawObligationReport(cmd) {
 		c.obligations.add(cmd.ObligationReports)
 		return nil
@@ -2122,6 +2166,9 @@ func (c *Cluster) Close() error {
 	var firstErr error
 	if c.certRenewStop != nil {
 		c.certRenewStop()
+	}
+	if c.rolloutStop != nil {
+		c.rolloutStop()
 	}
 	if c.joinServer != nil {
 		if err := c.joinServer.Close(); err != nil {
