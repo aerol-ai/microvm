@@ -35,6 +35,8 @@ type fakeCluster struct {
 	noCordonRoute bool
 	fail          map[string]int // "METHOD path" -> fail this many times with 500
 	failOnCall    map[string]int // "METHOD path" -> fail only the Nth call
+	dropOnCall    map[string]int // "METHOD path" -> drop the connection on the Nth call
+	status503     map[string]int // "METHOD path" -> answer 503 this many times
 	calls         map[string]int
 	slowNodeGet   time.Duration
 	drainRunning  bool // each node GET lowers running by one
@@ -47,7 +49,7 @@ type fakeCluster struct {
 func newFakeCluster(t *testing.T) *fakeCluster {
 	f := &fakeCluster{t: t, owned: map[string][]string{}, runtimes: map[string]string{}, running: map[string]int{},
 		unknown: map[string]bool{}, cordoned: map[string]bool{}, deleted: map[string]bool{}, fail: map[string]int{}, busy: map[string]bool{},
-		failOnCall: map[string]int{}, calls: map[string]int{}}
+		failOnCall: map[string]int{}, calls: map[string]int{}, dropOnCall: map[string]int{}, status503: map[string]int{}}
 	f.srv = httptest.NewServer(http.HandlerFunc(f.serve))
 	t.Cleanup(f.srv.Close)
 	return f
@@ -84,6 +86,20 @@ func (f *fakeCluster) serve(w http.ResponseWriter, r *http.Request) {
 	}
 	key := r.Method + " " + r.URL.Path
 	f.calls[key]++
+	if n := f.dropOnCall[key]; n > 0 && f.calls[key] == n {
+		// A load balancer reset: no HTTP answer at all.
+		if hj, ok := w.(http.Hijacker); ok {
+			if conn, _, err := hj.Hijack(); err == nil {
+				_ = conn.Close()
+				return
+			}
+		}
+	}
+	if f.status503[key] > 0 {
+		f.status503[key]--
+		writeFakeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "catching up"})
+		return
+	}
 	if n := f.failOnCall[key]; n > 0 && f.calls[key] == n {
 		writeFakeJSON(w, http.StatusInternalServerError, map[string]string{"error": "boom"})
 		return
@@ -705,5 +721,38 @@ func TestDrainEdges(t *testing.T) {
 	h.env["XDG_CONFIG_HOME"] = t.TempDir()
 	if code := h.run("get", "nodes"); code != exitError || !strings.Contains(h.stderr.String(), "not logged in") {
 		t.Fatalf("no login = %d %q", code, h.stderr.String())
+	}
+}
+
+// A read survives one dropped connection or a 503: GETs are safe to repeat,
+// and one reset from a load balancer failed a live describe (UC-612). A
+// write is never retried by the CLI, and a 500 is final.
+func TestClusterReadsRetryTransientFailures(t *testing.T) {
+	old := clusterReadRetryDelays
+	clusterReadRetryDelays = []time.Duration{time.Millisecond, time.Millisecond, time.Millisecond}
+	t.Cleanup(func() { clusterReadRetryDelays = old })
+
+	h, f := standardFleet(t)
+	f.dropOnCall["GET /v1/cluster/nodes/wkr-1"] = 1
+	if code := h.run("describe", "node", "wkr-1"); code != exitOK {
+		t.Fatalf("describe after one reset = %d: %s", code, h.stderr.String())
+	}
+	f.status503["GET /v1/cluster/members"] = 2
+	if code := h.run("get", "nodes"); code != exitOK {
+		t.Fatalf("get nodes after two 503s = %d: %s", code, h.stderr.String())
+	}
+	f.status503["GET /v1/cluster/members"] = 4
+	if code := h.run("get", "nodes"); code == exitOK {
+		t.Fatal("get nodes after four 503s succeeded, want the retries to give up")
+	}
+	f.fail["GET /v1/cluster/members"] = 1
+	before := f.calls["GET /v1/cluster/members"]
+	if code := h.run("get", "nodes"); code == exitOK || f.calls["GET /v1/cluster/members"] != before+1 {
+		t.Fatalf("a 500 was retried: code %d, calls %d -> %d", code, before, f.calls["GET /v1/cluster/members"])
+	}
+	f.status503["POST /v1/cluster/nodes/wkr-1/cordon"] = 1
+	before = f.calls["POST /v1/cluster/nodes/wkr-1/cordon"]
+	if code := h.run("cordon", "wkr-1"); code == exitOK || f.calls["POST /v1/cluster/nodes/wkr-1/cordon"] != before+1 {
+		t.Fatalf("a write was retried: code %d, calls %d -> %d", code, before, f.calls["POST /v1/cluster/nodes/wkr-1/cordon"])
 	}
 }

@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"net/http"
@@ -123,13 +124,48 @@ type nodeRaw struct {
 	rec nodeRecord
 }
 
-// clusterCall is one /v1/cluster call with the verb's connection.
+// clusterCall is one /v1/cluster call with the verb's connection. A GET is
+// retried on a dropped connection or a 502/503/504: reads are safe to repeat
+// (the CLI contract), and a drain or describe from a laptop otherwise fails
+// on one reset from a load balancer (live UC-612, 2026-11-07). Writes are
+// never retried here; their own idempotency is the server's job.
 func (a *app) clusterCall(ctx context.Context, c *commonFlags, method, path string, in, out any) error {
 	conn, err := a.resolve(ctx, c)
 	if err != nil {
 		return err
 	}
-	return a.callAPI(ctx, c, conn, method, path, in, out)
+	for attempt := 0; ; attempt++ {
+		err = a.callAPI(ctx, c, conn, method, path, in, out)
+		if err == nil || method != http.MethodGet || attempt >= len(clusterReadRetryDelays) || !retryableRead(err) {
+			return err
+		}
+		if c != nil && c.debug {
+			a.note("aerolvm debug: GET %s failed (%v), retrying", path, err)
+		}
+		select {
+		case <-ctx.Done():
+			return err
+		case <-time.After(clusterReadRetryDelays[attempt]):
+		}
+	}
+}
+
+// clusterReadRetryDelays bounds a read's retries: three more tries over about
+// two seconds, short enough that a real outage still fails fast.
+var clusterReadRetryDelays = []time.Duration{200 * time.Millisecond, 600 * time.Millisecond, 1200 * time.Millisecond}
+
+// retryableRead is a transport failure (no HTTP answer at all) or a gateway
+// or overload status; any other HTTP answer is final.
+func retryableRead(err error) bool {
+	var refusal *apiRefusal
+	if errors.As(err, &refusal) {
+		switch refusal.StatusCode {
+		case http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+			return true
+		}
+		return false
+	}
+	return !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded)
 }
 
 func (a *app) listNodes(ctx context.Context, c *commonFlags) ([]nodeRaw, error) {
