@@ -727,7 +727,13 @@ func (h *handlers) clusterMembers(w http.ResponseWriter, r *http.Request) {
 	// control plane's answer already carries them.
 	members := cluster.AnnotateRaftRoles(c, c.Members())
 	view := make([]memberView, 0, len(members))
+	denied, _ := c.(cluster.DeniedNodeChecker)
 	for _, m := range members {
+		// A deleted node may still be running and gossiping until someone
+		// stops the machine; it is not a member any more, so it is not listed.
+		if denied != nil && denied.IsNodeDenied(m.NodeID) {
+			continue
+		}
 		view = append(view, memberView{Member: m, Drained: c.IsNodeDrained(m.NodeID),
 			Zone: m.Capacity.Labels[models.PlacementZoneLabel], Labels: m.Capacity.Labels})
 	}

@@ -45,6 +45,11 @@ var (
 	// ErrNodeStillServing refuses to delete a live node that still owns
 	// sandboxes unless the caller forces it: drain it first.
 	ErrNodeStillServing = errors.New("cluster: node is alive and still owns sandboxes; drain it first or force the delete")
+	// ErrNodeDeleted is a read of a node an operator deleted. The machine
+	// may still be running and gossiping (the deny record refuses it at
+	// join, not on every alive message), so a read must not report it as
+	// a member: to an operator, `delete node` means gone.
+	ErrNodeDeleted = fmt.Errorf("%w: it was deleted", ErrUnknownNode)
 )
 
 // NodeDeleteResult is the answer to a node delete.
@@ -245,6 +250,9 @@ func nodeLifecycleError(status int, message string) error {
 // NodeDetail reads one node from this server's gossip view and FSM.
 func (c *Cluster) NodeDetail(_ context.Context, nodeID string, sandboxIDLimit int) (NodeDetail, error) {
 	nodeID = strings.TrimSpace(nodeID)
+	if c.fsm.isNodeDenied(nodeID) {
+		return NodeDetail{}, ErrNodeDeleted
+	}
 	if !c.PlacementViewCaughtUp() {
 		// A count from a view still catching up is short of rows the
 		// cluster holds, and drain would read it as "empty".

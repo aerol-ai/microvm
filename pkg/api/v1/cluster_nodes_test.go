@@ -282,3 +282,36 @@ func TestClusterMembersCarriesRaftRoles(t *testing.T) {
 		t.Fatalf("members = %+v", body.Members)
 	}
 }
+
+// A deleted node may still be running and gossiping until someone stops the
+// machine. It is not a member any more: the members list leaves it out, so
+// `aerolvm get nodes` stops showing it the moment the delete returns.
+func TestMembersListLeavesOutDeletedNodes(t *testing.T) {
+	stub := newNodeStub()
+	stub.members = []cluster.Member{{NodeID: "srv-1", Alive: true}, {NodeID: "wkr-gone", Alive: true}, {NodeID: "wkr-2", Alive: true}}
+	stub.deniedIDs = map[string]bool{"wkr-gone": true}
+	rr := serve(nodeRoutesMux(t, stub), http.MethodGet, "/v1/cluster/members")
+	var got struct {
+		Members []cluster.Member `json:"members"`
+	}
+	if rr.Code != http.StatusOK || json.Unmarshal(rr.Body.Bytes(), &got) != nil {
+		t.Fatalf("GET members = %d %s", rr.Code, rr.Body.String())
+	}
+	var ids []string
+	for _, m := range got.Members {
+		ids = append(ids, m.NodeID)
+	}
+	if strings.Join(ids, ",") != "srv-1,wkr-2" {
+		t.Fatalf("members = %v, want the deleted wkr-gone left out", ids)
+	}
+}
+
+// A read of a deleted node is a 404 that says why.
+func TestGetNodeRouteDeletedNode(t *testing.T) {
+	stub := newNodeStub()
+	stub.detailErr = cluster.ErrNodeDeleted
+	rr := serve(nodeRoutesMux(t, stub), http.MethodGet, "/v1/cluster/nodes/wkr-gone")
+	if rr.Code != http.StatusNotFound || !strings.Contains(rr.Body.String(), "deleted") {
+		t.Fatalf("GET deleted node = %d %s, want 404 naming the delete", rr.Code, rr.Body.String())
+	}
+}

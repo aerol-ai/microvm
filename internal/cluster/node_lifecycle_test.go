@@ -265,6 +265,11 @@ func TestNodeDetailCounts(t *testing.T) {
 	if _, err := c.NodeDetail(ctx, "", 0); !errors.Is(err, ErrUnknownNode) {
 		t.Fatalf("empty = %v", err)
 	}
+	// A deleted node still in gossip reads as gone, and says why.
+	applyOp(t, c.fsm, command{Op: opDenyNode, StampUnixNano: 1, NodeDeny: &NodeDenyRecord{NodeID: "wkr-2", Role: config.NodeRoleWorker}})
+	if _, err := c.NodeDetail(ctx, "wkr-2", 0); !errors.Is(err, ErrNodeDeleted) || !errors.Is(err, ErrUnknownNode) {
+		t.Fatalf("deleted = %v, want ErrNodeDeleted (an ErrUnknownNode)", err)
+	}
 	// Parked slots never push running below zero, and owning nothing is 0.
 	parked := recreateCandidate("wkr-3", config.NodeRoleWorker, 8)
 	parked.Capacity.ParkedSlots = 4
