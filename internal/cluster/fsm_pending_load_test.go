@@ -44,13 +44,14 @@ func pendingIndexState(f *placementFSM) (map[string]pendingReservationClaim, int
 	return claims, int(f.pendingReservationCapacity["w1"].CPU)
 }
 
-// Found by the offline fault harness (PR #1017, Bug B). A read pruned the
+// Found by the offline fault harness (PR #1017, Bug B; the same repro is
+// skipped there until this fix lands, under its own name). A read pruned the
 // pending-load index with the reading server's clock. Once apply decides by
 // the entry's time (C1), a server could prune a claim at its own time T+2,
 // then apply a same-owner retry the leader stamped at T+1, before the old
 // expiry: the refresh found no claim, and the reservation lived on while this
 // server counted no load for it.
-func TestPendingLoadSurvivesReadAfterExpiryThenRefresh(t *testing.T) {
+func TestPendingLoadKeepsARetryRefreshedAfterALaterRead(t *testing.T) {
 	f := newPlacementFSM()
 	base := time.Now().Truncate(time.Second).Add(-time.Hour)
 	applyPendingReserve(t, f, 1, "sb-prune", base, base.Unix()+1)
