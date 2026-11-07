@@ -416,7 +416,11 @@ func (in *Initer) printSummary(res InitResult, installer string) {
 		if t.ExpiresAt != nil {
 			life = "valid until " + t.ExpiresAt.Format(time.RFC3339)
 		}
-		in.printf("\nTo add a %s node, run this on it (the token %s):\n\n  %s\n", t.Role, life, JoinCommand(installer, res.JoinURL, t.Token, res.ClusterID))
+		article := "a"
+		if t.Role == cluster.JoinRoleIngress {
+			article = "an"
+		}
+		in.printf("\nTo add %s %s node, run this on it (the token %s):\n\n  %s\n", article, t.Role, life, JoinCommand(installer, res.JoinURL, t.Token, res.ClusterID))
 		if t.Warning != "" {
 			in.printf("  warning: %s\n", t.Warning)
 		}
