@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -165,6 +166,15 @@ type Cluster struct {
 	evictDeadOwnerStepHook func(step evictDeadOwnerStep, sandboxID string)
 	// denyHits counts and logs refusals of deleted nodes (gossip_deny.go).
 	denyHits *denyHitRecorder
+
+	// Join service (join.go): the CA signer from the CA store, the join
+	// listener and the port it advertises, the dial-back dialer (tests swap
+	// it; nil is net.Dialer) and the cert renewal loop.
+	ca                caSigner
+	joinServer        *joinServer
+	joinAdvertisePort int
+	joinDial          dialFunc
+	certRenewStop     context.CancelFunc
 }
 
 // New constructs the server-role Cluster for cfg.EnableCluster=true. Caller
@@ -266,6 +276,7 @@ func New(cfg config.Config, logger *slog.Logger, admitter *capacity.Admitter) (*
 		// The FSM exists before the listener, so a deleted node is refused
 		// from the first request, boot window included.
 		is.SetPeerDenyCheck(c.refuseDeniedPeer)
+		is.SetPeerKeyCheck(c.CheckPeerKey)
 		c.internalServer = is
 		c.internalURL = deriveInternalAdvertiseURL(cfg.ClusterInternalAdvertiseURL, cfg.ClusterInternalListenAddr, is.Addr())
 	}
@@ -365,7 +376,42 @@ func New(cfg config.Config, logger *slog.Logger, admitter *capacity.Admitter) (*
 	// so the loop's first read index finds gossip and the internal client.
 	c.startCatchUpWatch()
 
+	c.startJoinService()
+
 	return c, nil
+}
+
+// startJoinService loads the CA store, opens the join listener (servers
+// only, when SB_CLUSTER_JOIN_LISTEN_ADDR resolved to an address) and starts
+// cert renewal. None of it is on the sandbox boot path, and none of it can
+// fail the daemon's start: a cluster that can't join new nodes still serves
+// the ones it has, so problems are logged loudly instead.
+func (c *Cluster) startJoinService() {
+	joinTokenSource.Store(c.fsm)
+	if ca, err := LoadClusterCA(c.cfg.ClusterCADir); err != nil {
+		c.logger.Error("cluster: CA store unreadable; joins and renewals signed here are off until it is fixed", "dir", c.cfg.ClusterCADir, "err", err)
+	} else if ca != nil {
+		if id := c.clusterID(); id != "" && CACertHash(ca.Certificate()) != id {
+			c.logger.Error("cluster: the CA store holds another cluster's CA; not signing with it", "dir", c.cfg.ClusterCADir)
+		} else {
+			c.ca.set(ca)
+		}
+	}
+	if c.tls == nil {
+		return
+	}
+	if addr := c.cfg.ClusterJoinListenAddr; addr != "" {
+		js, err := startJoinServer(addr, c.tls, c, c.recordJoinAudit, c.logger)
+		if err != nil {
+			c.logger.Error("cluster: join listener did not start; one-line joins land on other servers only", "addr", addr, "err", err)
+		} else {
+			c.joinServer = js
+			if tcp, ok := js.listener.Addr().(*net.TCPAddr); ok {
+				c.joinAdvertisePort = tcp.Port
+			}
+		}
+	}
+	c.certRenewStop = startCertRenewer(&certRenewer{tls: c.tls, nodeID: c.nodeID, logger: c.logger, renew: c.renewViaServers})
 }
 
 func (c *Cluster) SelfNodeID() string { return c.nodeID }
@@ -2074,6 +2120,14 @@ func (c *Cluster) LeaderAPIURL() string {
 // Close shuts down gossip + raft. Idempotent.
 func (c *Cluster) Close() error {
 	var firstErr error
+	if c.certRenewStop != nil {
+		c.certRenewStop()
+	}
+	if c.joinServer != nil {
+		if err := c.joinServer.Close(); err != nil {
+			firstErr = fmt.Errorf("cluster: join server close: %w", err)
+		}
+	}
 	if c.voterReconcileStop != nil {
 		c.voterReconcileStop()
 	}
@@ -2096,7 +2150,7 @@ func (c *Cluster) Close() error {
 		c.catchUpStop()
 	}
 	if c.gossip != nil {
-		if err := c.gossip.Close(); err != nil {
+		if err := c.gossip.Close(); err != nil && firstErr == nil {
 			firstErr = fmt.Errorf("cluster: gossip close: %w", err)
 		}
 	}

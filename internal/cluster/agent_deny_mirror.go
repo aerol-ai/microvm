@@ -10,13 +10,15 @@ import (
 	"time"
 )
 
-// A worker or ingress node's copy of the deny set (fsm_node_deny.go). It
-// holds no Raft state, so it polls the server tier the way it keeps its API
-// token copy: GET denied-nodes?since=V every denyMirrorInterval, 304 while
-// nothing changed. The set only grows, so the mirror takes a reply only when
-// its version is newer than the one it holds: a server that lags another can
-// never shrink it. Lookups are map reads; nothing on the request path waits
-// on a poll.
+// A worker or ingress node's copy of the deny set (fsm_node_deny.go) and of
+// the revoked cert keys (fsm_join.go). It holds no Raft state, so it polls
+// the server tier the way it keeps its API token copy: GET
+// denied-nodes?since=V every denyMirrorInterval, 304 while nothing changed.
+// A reply replaces the copy only when its version is newer than the one
+// held, so a server that lags another never hands back an older set; a
+// newer one may drop an ID, which is a fresh join replacing its deny
+// record. Lookups are map reads; nothing on the request path waits on a
+// poll.
 //
 // Until the first poll lands the set is empty, so a worker that boots while
 // a deleted node is still running may accept that node's calls for one poll
@@ -30,7 +32,19 @@ const denyMirrorInterval = 5 * time.Second
 type agentDenyMirror struct {
 	mu      sync.RWMutex
 	set     map[string]bool
+	revoked map[string]int64 // cert key hash -> expires (unix nano)
 	version uint64
+}
+
+// revokedKey reports whether keyHash is a live tombstone.
+func (m *agentDenyMirror) revokedKey(keyHash string, now int64) bool {
+	if m == nil || keyHash == "" {
+		return false
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	exp, ok := m.revoked[keyHash]
+	return ok && now < exp
 }
 
 func (m *agentDenyMirror) has(nodeID string) bool {
@@ -55,17 +69,24 @@ func (m *agentDenyMirror) merge(resp DeniedNodesResponse) []string {
 	if resp.Version <= m.version {
 		return nil
 	}
-	if m.set == nil {
-		m.set = make(map[string]bool, len(resp.Nodes))
-	}
+	set := make(map[string]bool, len(resp.Nodes))
 	var added []string
 	for _, rec := range resp.Nodes {
-		if rec.NodeID != "" && !m.set[rec.NodeID] {
-			m.set[rec.NodeID] = true
+		if rec.NodeID == "" || set[rec.NodeID] {
+			continue
+		}
+		set[rec.NodeID] = true
+		if !m.set[rec.NodeID] {
 			added = append(added, rec.NodeID)
 		}
 	}
-	m.version = resp.Version
+	revoked := make(map[string]int64, len(resp.RevokedKeys))
+	for _, k := range resp.RevokedKeys {
+		if k.KeyHash != "" {
+			revoked[k.KeyHash] = k.ExpiresUnixNano
+		}
+	}
+	m.set, m.revoked, m.version = set, revoked, resp.Version
 	return added
 }
 

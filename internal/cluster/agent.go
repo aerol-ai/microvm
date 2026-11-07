@@ -163,7 +163,9 @@ type Agent struct {
 	// (agent_deny_mirror.go); denyMirrorStop ends its poll.
 	deny           agentDenyMirror
 	denyMirrorStop context.CancelFunc
-	denyHits       *denyHitRecorder
+	// certRenewStop ends the node cert renewal loop (cert_renew.go).
+	certRenewStop context.CancelFunc
+	denyHits      *denyHitRecorder
 
 	// feed is the placement delta feed (agent_placement_feed.go), started
 	// only with SB_INGRESS_PROXY_ROUTING. nil means the page walk.
@@ -276,6 +278,7 @@ func NewAgent(cfg config.Config, logger *slog.Logger, admitter *capacity.Admitte
 			return nil, fmt.Errorf("cluster.NewAgent: internal server: %w", err)
 		}
 		is.SetPeerDenyCheck(a.refuseDeniedPeer)
+		is.SetPeerKeyCheck(a.CheckPeerKey)
 		a.internalServer = is
 		a.internalURL = deriveInternalAdvertiseURL(cfg.ClusterInternalAdvertiseURL, cfg.ClusterInternalListenAddr, is.Addr())
 	}
@@ -333,6 +336,9 @@ func NewAgent(cfg config.Config, logger *slog.Logger, admitter *capacity.Admitte
 	a.startOwnerWatcher()
 	a.startPlacementFeed()
 	a.startDenyMirror(denyMirrorInterval)
+	if clusterTLS != nil {
+		a.certRenewStop = startCertRenewer(&certRenewer{tls: clusterTLS, nodeID: nodeID, logger: logger, renew: a.renewViaServers})
+	}
 	return a, nil
 }
 
@@ -1479,6 +1485,9 @@ func (a *Agent) Leader() string {
 
 func (a *Agent) Close() error {
 	var firstErr error
+	if a.certRenewStop != nil {
+		a.certRenewStop()
+	}
 	if a.denyMirrorStop != nil {
 		a.denyMirrorStop()
 	}

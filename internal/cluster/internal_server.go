@@ -55,6 +55,9 @@ type internalServer struct {
 	// peerAuth so a deleted node is told it was deleted rather than "not
 	// in membership", which a restarting node reads as "retry".
 	peerDenied atomic.Pointer[internalPeerAuthorizer]
+	// peerKey refuses a cert key that is tombstoned, or that is not the one
+	// admitted for its node ID (join_peer.go), after the deny check.
+	peerKey atomic.Pointer[peerKeyCheck]
 	// extra is loaded atomically so AttachInternalHandler is lock-free for
 	// the hot path (every incoming forward reads it once per request).
 	extra atomic.Pointer[http.Handler]
@@ -173,6 +176,12 @@ func (s *internalServer) authorizePeerRequest(w http.ResponseWriter, r *http.Req
 	if denied := s.peerDenied.Load(); denied != nil && (*denied)(peerID) {
 		http.Error(w, ErrPeerDeleted.Error(), http.StatusForbidden)
 		return false
+	}
+	if check := s.peerKey.Load(); check != nil {
+		if err := (*check)(peerID, r.TLS.PeerCertificates[0]); err != nil {
+			http.Error(w, err.Error(), http.StatusForbidden)
+			return false
+		}
 	}
 	authorizer := s.peerAuth.Load()
 	if authorizer == nil {
