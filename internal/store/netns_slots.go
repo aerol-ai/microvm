@@ -194,7 +194,7 @@ func (s *Store) claimContainerNetnsSlot(ctx context.Context, owner, fromState, t
 
 // ListNonFreeContainerNetnsSlots returns rows not in the free state for reconcile.
 func (s *Store) ListNonFreeContainerNetnsSlots(ctx context.Context) ([]ContainerNetnsSlot, error) {
-	rows, err := s.db.QueryContext(ctx, `
+	rows, err := s.rdb.QueryContext(ctx, `
 		SELECT slot_id, netns_path, container_ip, sandbox_id, state, created_at, updated_at
 		FROM container_netns_slots
 		WHERE state != ?
@@ -410,7 +410,7 @@ func (s *Store) GetContainerNetnsSlotBySandbox(ctx context.Context, sandboxID st
 		return nil, errors.New("get container netns slot: sandbox_id is required")
 	}
 	var slot ContainerNetnsSlot
-	row := s.db.QueryRowContext(ctx, `
+	row := s.rdb.QueryRowContext(ctx, `
 		SELECT slot_id, netns_path, container_ip, sandbox_id, state, created_at, updated_at
 		FROM container_netns_slots
 		WHERE sandbox_id = ?
@@ -430,7 +430,7 @@ func (s *Store) ListContainerNetnsSlotsByState(ctx context.Context, state string
 	if state == "" {
 		return nil, errors.New("list container netns slots: state is required")
 	}
-	rows, err := s.db.QueryContext(ctx, `
+	rows, err := s.rdb.QueryContext(ctx, `
 		SELECT slot_id, netns_path, container_ip, sandbox_id, state, created_at, updated_at
 		FROM container_netns_slots
 		WHERE state = ?
@@ -466,7 +466,7 @@ type ContainerNetnsPoolStats struct {
 
 func (s *Store) GetContainerNetnsPoolStats(ctx context.Context) (ContainerNetnsPoolStats, error) {
 	var stats ContainerNetnsPoolStats
-	row := s.db.QueryRowContext(ctx, `
+	row := s.rdb.QueryRowContext(ctx, `
 		SELECT
 			COUNT(*),
 			COALESCE(SUM(CASE WHEN state = 'free' THEN 1 ELSE 0 END), 0),

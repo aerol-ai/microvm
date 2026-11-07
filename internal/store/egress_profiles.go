@@ -69,7 +69,7 @@ func (s *Store) PutEgressProfile(ctx context.Context, owner, name string, allowO
 
 // GetEgressProfile returns an owner's profile.
 func (s *Store) GetEgressProfile(ctx context.Context, owner, name string) (models.EgressProfile, error) {
-	return getEgressProfile(ctx, s.db, owner, name)
+	return getEgressProfile(ctx, s.rdb, owner, name)
 }
 
 type queryRower interface {
@@ -98,7 +98,7 @@ func getEgressProfile(ctx context.Context, q queryRower, owner, name string) (mo
 // ListEgressProfiles returns up to limit of an owner's profiles by name,
 // starting after the name in after.
 func (s *Store) ListEgressProfiles(ctx context.Context, owner, after string, limit int) ([]models.EgressProfile, error) {
-	rows, err := s.db.QueryContext(ctx, `
+	rows, err := s.rdb.QueryContext(ctx, `
 		SELECT name, allow_out_json, description, generation, created_at, updated_at
 		FROM egress_profiles WHERE owner_ref = ? AND name > ?
 		ORDER BY name LIMIT ?
@@ -169,7 +169,7 @@ func (s *Store) SandboxesReferencingProfile(ctx context.Context, owner, name str
 }
 
 func (s *Store) profileRefs(ctx context.Context, query string, args ...any) ([]ProfileRef, error) {
-	rows, err := s.db.QueryContext(ctx, query, args...)
+	rows, err := s.rdb.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("list profile references: %w", err)
 	}
@@ -207,7 +207,7 @@ func (s *Store) GetSandboxesEgressProfiles(ctx context.Context, ids []string) (m
 		return out, nil
 	}
 	placeholders, args := inClause(ids)
-	rows, err := s.db.QueryContext(ctx, `
+	rows, err := s.rdb.QueryContext(ctx, `
 		SELECT sandbox_id, profile, applied_generation FROM sandbox_egress_profiles
 		WHERE sandbox_id IN (`+placeholders+`) ORDER BY sandbox_id, position
 	`, args...)
@@ -229,7 +229,7 @@ func (s *Store) GetSandboxesEgressProfiles(ctx context.Context, ids []string) (m
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
-	rows, err = s.db.QueryContext(ctx, `
+	rows, err = s.rdb.QueryContext(ctx, `
 		SELECT sandbox_id, inline_allow_json FROM sandbox_egress
 		WHERE inline_allow_json != '' AND sandbox_id IN (`+placeholders+`)
 	`, args...)
@@ -426,7 +426,7 @@ func (s *Store) attachEgressModes(ctx context.Context, byID map[string]*models.S
 			args = append(args, id)
 		}
 	}
-	rows, err := s.db.QueryContext(ctx, query, args...)
+	rows, err := s.rdb.QueryContext(ctx, query, args...)
 	if err != nil {
 		return fmt.Errorf("load egress modes: %w", err)
 	}

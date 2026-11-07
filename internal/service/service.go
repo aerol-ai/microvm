@@ -849,9 +849,9 @@ type Service struct {
 	// result in StopByOwner so the non-NotFound error arm is reachable.
 	// Nil in production.
 	testForceFleetSuspendErr error
-	// testAfterNetstatsUpdate runs after a successful UpdateSandboxNetCounters
-	// in handleNetworkSamples so the subsequent Get failure arm can be forced.
-	// Nil in production.
+	// testAfterNetstatsUpdate runs in handleNetworkSamples once per sandbox
+	// whose counters were applied, before the quota re-read, so the re-read's
+	// failure arms can be forced. Nil in production.
 	testAfterNetstatsUpdate func()
 
 	// idempotencySweepAt is the unix-nano time the next request_idempotency

@@ -19,7 +19,7 @@ func (s *Store) SandboxIDsClaimingContainerIP(ctx context.Context, ip string) ([
 	if ip == "" {
 		return nil, nil
 	}
-	rows, err := s.db.QueryContext(ctx, `
+	rows, err := s.rdb.QueryContext(ctx, `
 		SELECT id FROM sandboxes
 		WHERE container_ip = ? AND status IN (?, ?)
 		UNION
@@ -48,7 +48,7 @@ func (s *Store) SandboxIDsClaimingContainerIP(ctx context.Context, ip string) ([
 // sealed column, so it answers on a node whose server key is revoked.
 func (s *Store) HasSandbox(ctx context.Context, id string) (bool, error) {
 	var one int
-	err := s.db.QueryRowContext(ctx, `SELECT 1 FROM sandboxes WHERE id = ?`, id).Scan(&one)
+	err := s.rdb.QueryRowContext(ctx, `SELECT 1 FROM sandboxes WHERE id = ?`, id).Scan(&one)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, nil
 	}

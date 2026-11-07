@@ -233,8 +233,8 @@ func TestWave35IsolateAndUsageGuards(t *testing.T) {
 	usage.emitReservedUsageAt(ctx, []*models.Sandbox{nil, {ID: "gone", Status: models.SandboxStatusDestroyed}}, start)
 	future := &models.Sandbox{ID: "future", Status: models.SandboxStatusStarted, CreatedAt: start.Add(time.Hour)}
 	usage.emitReservedUsageAt(ctx, []*models.Sandbox{future}, start)
-	usage.emitNetworkUsage(ctx, &models.Sandbox{ID: "net"}, 0, 0, start)
-	usage.emitNetworkUsage(ctx, &models.Sandbox{ID: "net"}, 8, 0, start)
+	usage.emitNetworkUsage(ctx, "net", "", 0, 0, start)
+	usage.emitNetworkUsage(ctx, "net", "", 8, 0, start)
 }
 
 func boolPtr(v bool) *bool { return &v }

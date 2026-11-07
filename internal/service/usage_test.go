@@ -158,7 +158,7 @@ func TestEmitNetworkUsage(t *testing.T) {
 	sb := &models.Sandbox{ID: "sb1", OwnerRef: "acme"}
 	now := time.Unix(1_700_000_000, 0).UTC()
 
-	s.emitNetworkUsage(context.Background(), sb, 1000, 2000, now)
+	s.emitNetworkUsage(context.Background(), sb.ID, sb.OwnerRef, 1000, 2000, now)
 	got := byKind(r.all())
 	if got[usageKindIngress].Value != 1000 || got[usageKindIngress].Unit != usageUnitBytes {
 		t.Fatalf("ingress = %v %s, want 1000 bytes", got[usageKindIngress].Value, got[usageKindIngress].Unit)
@@ -172,7 +172,7 @@ func TestEmitNetworkUsage(t *testing.T) {
 
 	// Zero deltas emit nothing.
 	r.batches = nil
-	s.emitNetworkUsage(context.Background(), sb, 0, 0, now)
+	s.emitNetworkUsage(context.Background(), sb.ID, sb.OwnerRef, 0, 0, now)
 	if len(r.all()) != 0 {
 		t.Fatalf("zero-delta should emit nothing")
 	}

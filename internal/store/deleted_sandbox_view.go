@@ -42,7 +42,7 @@ func (s *Store) PutDeletedSandboxView(ctx context.Context, sandboxID, facade, ow
 // ErrNotFound. Owner scoping and the replay-window check are the service's
 // job — the store returns the row as stored.
 func (s *Store) GetDeletedSandboxView(ctx context.Context, sandboxID, facade string) (*DeletedSandboxView, error) {
-	row := s.db.QueryRowContext(ctx, `
+	row := s.rdb.QueryRowContext(ctx, `
 		SELECT sandbox_id, facade, owner_ref, view_json, created_at
 		FROM deleted_sandbox_view
 		WHERE sandbox_id = ? AND facade = ?

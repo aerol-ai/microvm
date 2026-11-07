@@ -105,7 +105,7 @@ func (s *Store) ListDueSnapshotRegistryRetirements(ctx context.Context, now time
 	if limit <= 0 {
 		return nil, errors.New("list snapshot registry retirements: limit must be positive")
 	}
-	rows, err := s.db.QueryContext(ctx, `
+	rows, err := s.rdb.QueryContext(ctx, `
 		SELECT registry_ref, digest, owner_ref, name, scheduled_at, attempts, last_error
 		FROM snapshot_registry_retirements
 		WHERE scheduled_at <= ?
@@ -136,7 +136,7 @@ func (s *Store) ListDueSnapshotRegistryRetirements(ctx context.Context, now time
 // the same owner and name has a push still to land (pending, pushing or
 // error), which can put this very digest back under the tag — wait for it.
 func (s *Store) SnapshotRegistryCopyInUse(ctx context.Context, registryRef, digest, ownerRef, name string) (inUse, pushPending bool, err error) {
-	err = s.db.QueryRowContext(ctx, `
+	err = s.rdb.QueryRowContext(ctx, `
 		SELECT
 			EXISTS (SELECT 1 FROM sandbox_snapshots WHERE image_registry_ref = ? AND image_digest = ?),
 			EXISTS (SELECT 1 FROM sandbox_snapshots WHERE owner_ref = ? AND name = ?

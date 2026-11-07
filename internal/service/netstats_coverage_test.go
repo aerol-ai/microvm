@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/docker/netstats"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
@@ -72,7 +73,7 @@ func TestNetstatsRefetchWarnWave23(t *testing.T) {
 		CreatedAt: now, UpdatedAt: now, LastActiveAt: now,
 	})
 	sink := netstatsServiceSink{svc: svc}
-	_ = st.UpdateSandboxNetCounters(context.Background(), "sb-ns", 10, 20)
+	_, _ = st.ApplyNetCounterDeltas(context.Background(), []store.NetCounterDelta{{SandboxID: "sb-ns", BytesIn: 10, BytesOut: 20}})
 	_ = st.Close()
 	sink.handleNetworkSamples(context.Background(), []netstats.Sample{{
 		SandboxID: "sb-ns", BytesIn: 1, BytesOut: 2, SampledAt: now,
@@ -91,6 +92,8 @@ func TestNetstatsGetAfterUpdateFailWave24(t *testing.T) {
 		ID: "sb-ns24", Image: "a", Status: models.SandboxStatusStarted,
 		CreatedAt: now, UpdatedAt: now, LastActiveAt: now,
 	})
+	// A cap the sample crosses sends it down the quota re-read path.
+	_ = st.SetNetworkLimits(context.Background(), "sb-ns24", 1, 0)
 	svc.testAfterNetstatsUpdate = func() { _ = st.Close() }
 	netstatsServiceSink{svc: svc}.handleNetworkSamples(context.Background(), []netstats.Sample{{
 		SandboxID: "sb-ns24", BytesIn: 5, BytesOut: 6, SampledAt: now,
@@ -105,6 +108,7 @@ func TestNetstatsRefetchNotFoundAndWarnWave25(t *testing.T) {
 		ID: "sb-ns25", Image: "a", Status: models.SandboxStatusStarted,
 		CreatedAt: now, UpdatedAt: now, LastActiveAt: now,
 	})
+	_ = st.SetNetworkLimits(context.Background(), "sb-ns25", 1, 0)
 	// Delete sandbox after update so Get returns NotFound (continue arm).
 	svc.testAfterNetstatsUpdate = func() { _ = st.Delete(context.Background(), "sb-ns25") }
 	netstatsServiceSink{svc: svc}.handleNetworkSamples(context.Background(), []netstats.Sample{{
@@ -117,6 +121,7 @@ func TestNetstatsRefetchNotFoundAndWarnWave25(t *testing.T) {
 		ID: "sb-ns25b", Image: "a", Status: models.SandboxStatusStarted,
 		CreatedAt: now, UpdatedAt: now, LastActiveAt: now,
 	})
+	_ = st2.SetNetworkLimits(context.Background(), "sb-ns25b", 0, 1)
 	svc2.testAfterNetstatsUpdate = func() { _ = st2.Close() }
 	netstatsServiceSink{svc: svc2}.handleNetworkSamples(context.Background(), []netstats.Sample{{
 		SandboxID: "sb-ns25b", BytesIn: 2, BytesOut: 2, SampledAt: now,

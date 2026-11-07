@@ -131,7 +131,8 @@ internal/
                  secrets, image distribution. Daytona/E2B helpers live here
                  as named files (daytona.go, e2b.go), NOT version-aware
                  branching.
-  store/         SQLite store. Single-writer (MaxOpenConns=1, WAL).
+  store/         SQLite store. One writer (MaxOpenConns=1) + a read-only
+                 pool for plain reads, WAL, synchronous=NORMAL.
                  store.go has all schema + CRUD; store_test.go is the
                  regression-test target for host-port pool changes.
   version/       Build version string.
@@ -313,8 +314,15 @@ For changes that don't match a skill, the file-level "where to look" map is:
   `internal/`.
 - **Errors that the API surfaces use `apihttp.WriteStoreAwareError`** so
   `models.ErrNotFound`, capacity errors, etc. get the right HTTP status.
-- **SQLite is single-writer in this process** (`MaxOpenConns=1`). Don't add a
-  second `*sql.DB` — queue through the existing one.
+- **SQLite has one writer in this process** (`Store.db`, `MaxOpenConns=1`).
+  Every write and every transaction goes through it; don't open another
+  writable `*sql.DB`. Plain reads outside a transaction use the read-only
+  pool (`Store.rdb`, `query_only`), so they never wait behind a write. A
+  statement that writes — including `UPDATE … RETURNING` through
+  `QueryRowContext` — must use `s.db`; the pool rejects it. Claim paths
+  also stay on `s.db`: a claim is one `UPDATE` that picks its own target
+  (see `claimContainerNetnsSlot`), never a read followed by a claim
+  (see the `Store` comment and `TestClaimPathsReadOnWriter`).
 - **`pkg/models` is shared between server, facades, and SDK-internal Go
   transport.** Adding a field there ripples; keep DTOs lean and stable.
 

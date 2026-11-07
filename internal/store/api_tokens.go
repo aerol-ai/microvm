@@ -50,7 +50,7 @@ func (s *Store) InsertAPIToken(ctx context.Context, rec identity.TokenRecord) er
 
 // ListAPITokens returns every stored token, sorted by team and name.
 func (s *Store) ListAPITokens(ctx context.Context) ([]identity.TokenRecord, error) {
-	rows, err := s.db.QueryContext(ctx, `
+	rows, err := s.rdb.QueryContext(ctx, `
 		SELECT id, name, role, owner_ref, created_by, created_at, expires_at, secret_hash
 		FROM api_tokens ORDER BY owner_ref, name, id
 	`)

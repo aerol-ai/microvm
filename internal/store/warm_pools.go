@@ -75,7 +75,7 @@ func warmPoolSettingsEqual(a, b models.WarmPool) bool {
 
 // GetWarmPool returns the entry for an image.
 func (s *Store) GetWarmPool(ctx context.Context, image string) (models.WarmPool, error) {
-	return getWarmPool(ctx, s.db, image)
+	return getWarmPool(ctx, s.rdb, image)
 }
 
 func getWarmPool(ctx context.Context, q queryRower, image string) (models.WarmPool, error) {
@@ -96,7 +96,7 @@ func getWarmPool(ctx context.Context, q queryRower, image string) (models.WarmPo
 // ListWarmPools returns every entry by image. There are at most
 // models.MaxWarmPools, so there is no paging.
 func (s *Store) ListWarmPools(ctx context.Context) ([]models.WarmPool, error) {
-	rows, err := s.db.QueryContext(ctx, `
+	rows, err := s.rdb.QueryContext(ctx, `
 		SELECT image, depth, min_depth, max_depth, on_image_change, generation, created_at, updated_at FROM warm_pools ORDER BY image
 	`)
 	if err != nil {
