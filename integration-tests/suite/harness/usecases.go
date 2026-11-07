@@ -1163,6 +1163,22 @@ var Registry = []UseCase{
 	{ID: "UC-664", Title: "aerolvm upgrade rollback --wait puts A back on the single node (the *.prev files), the sandbox from before still runs and answers exec, and a second rollback is a no-op", Requires: []Capability{CapDocker}, Excludes: []Capability{CapCluster}, Implemented: true},
 	{ID: "UC-665", Title: "aerolvm release pull v0.6.11 --arch amd64 builds a checked bundle from the real GitHub release (manifest.json first, checksums.txt, binaries, SLSA provenance); a copy with one changed byte and a bundle of an unknown format are both refused by apply --from before any call reaches sandboxd", Requires: []Capability{CapDocker}, Excludes: []Capability{CapCluster}, Implemented: true},
 	{ID: "UC-666", Title: "The single-node upload route checks each file against its name: a PUT whose body does not hash to the path answers 400 hash_mismatch, a bad name 400, a HEAD of an unknown file 404, and a POST with a bad version 400", Requires: []Capability{CapDocker}, Excludes: []Capability{CapCluster}, Implemented: true},
+	// kubectl grammar for sandboxes, snapshots and tokens, Phase 4
+	// (plans/kubectl-style-cluster-ops.md §3.3, §9; kubectl_polish_test.go).
+	// Stable forms also run through a kubectl-aerolvm copy of the binary,
+	// which must answer the same.
+	{ID: "UC-670", Title: "aerolvm get sandboxes: the table, -o wide, -o name (every page), -o json and -o yaml show the sandboxes the API has, and get sb <name> --json is the same sandbox as the old get <name> --json; kubectl-aerolvm answers the same", Requires: []Capability{CapDocker}, Implemented: true},
+	{ID: "UC-671", Title: "aerolvm get sb -l: k=v and k==v (filtered by sandboxd), k!=v, k and !k (filtered by the CLI) select exactly the right tagged sandboxes, and a set-based selector is refused with exit 2", Requires: []Capability{CapDocker}, Implemented: true},
+	{ID: "UC-672", Title: "aerolvm describe sb shows the sandbox's ID, status, tags and network; describe <name> with no kind and the old get <name> still reach the sandbox; a missing sandbox exits 1", Requires: []Capability{CapDocker}, Implemented: true},
+	{ID: "UC-673", Title: "aerolvm delete sb destroys the sandbox (the API answers not found after), a repeat delete exits 0 as already gone, --json matches destroy's results, and delete with a word that is not a kind exits 2 and destroys nothing", Requires: []Capability{CapDocker}, Implemented: true},
+	{ID: "UC-674", Title: "aerolvm get/describe/delete snapshots on a snapshot the old snapshot verb made: listed by name, -o json names its source sandbox, describe shows it, delete removes it (get then exits 1) and a repeat delete exits 0", Requires: []Capability{CapDocker}, Implemented: true},
+	{ID: "UC-675", Title: "aerolvm get/describe/delete tokens on a token aerolvm token create made: listed by ID, described by name, -o json shows role and team, delete by name is refused, delete by ID revokes it so it leaves the list, and a repeat delete exits 0", Requires: []Capability{CapIdentity}, Implemented: true},
+	{ID: "UC-676", Title: "aerolvm api-resources lists nodes, sandboxes, snapshots and tokens with their short names and verbs, with no login; top nodes on a single node shows the node's reserved CPU and memory against its budget from /v1/capacity", Requires: []Capability{CapDocker}, Implemented: true},
+	// T14 (plans/kubectl-style-cluster-ops.md §6.4): measurements, not pass
+	// or fail on survival. They restart sandboxd, so they live in a file that
+	// sorts late (z_runtime_restart_test.go).
+	{ID: "UC-677", Title: "T14 WASM across systemctl restart sandboxd: an ephemeral and a passivatable WASM sandbox with a counter file are probed before and after (status, exec, state, host processes, times, what sandboxd logged), and the result is recorded", Requires: []Capability{CapWasm}, Implemented: true},
+	{ID: "UC-678", Title: "T14 V8 isolate across systemctl restart sandboxd: an isolate sandbox with an in-memory fetch counter is probed before and after, with the jail on (default) and with SB_ISOLATE_USE_JAIL=false, and the result is recorded", Requires: []Capability{CapIsolate}, Implemented: true},
 }
 
 // byID is a lookup built once for the report generator.
