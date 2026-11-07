@@ -263,6 +263,9 @@ const (
 	systemActionFleetDelete       = "fleet.delete"
 	systemActionMethod            = "SYSTEM"
 	auditSubsystemAuditMode       = "audit"
+	// The cluster deleted the sandbox while this node was cut off; the
+	// node destroys its leftover copy when it returns (C2).
+	systemActionClusterDeleted = "cluster.deleted_while_away"
 )
 
 // beginSystemAction resolves the sandbox's lifecycle and owner now, before

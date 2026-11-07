@@ -31,7 +31,7 @@ const (
 // it once per release that adds such a feature, and give the feature its
 // own constant naming the version that introduced it.
 const (
-	fsmOpsVersion              = 10
+	fsmOpsVersion              = 11
 	egressProfileFSMOpsVersion = 1 // opPutEgressProfile, opDeleteEgressProfile
 	// auditCallerFSMOpsVersion: audit records carry a hash-covered caller
 	// field (AuditCallerWritesAllowed).
@@ -67,8 +67,9 @@ const (
 
 // fsmOpsVersion 9 is P2's team quotas (teamQuotaFSMOpsVersion in
 // fsm_team_quotas.go); 10 is the delete_with_sandbox volume reclaim ledger
-// (volumeReclaimFSMOpsVersion in fsm_volume_reclaims.go). Versions 6 to 8
-// are the gates in the block above.
+// (volumeReclaimFSMOpsVersion in fsm_volume_reclaims.go); 11 is the
+// deleted-lifecycle fence on opPlace (deletedLifecycleFenceFSMOpsVersion in
+// deleted_lifecycle.go). Versions 6 to 8 are the gates in the block above.
 
 var (
 	// ErrEgressProfileInUse is a delete of a profile placements reference.
