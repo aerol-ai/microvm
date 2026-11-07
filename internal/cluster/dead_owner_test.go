@@ -285,6 +285,205 @@ func TestEvictDeadOwnerOrphansSpecWithoutFailoverOptIn(t *testing.T) {
 	}
 }
 
+// newEvictFenceCluster is a single-node leader that can own sandboxes and
+// has capacity, so every failover reassign targets the leader itself. The
+// dead owner is not in gossip, which reads as not alive. The gossip refresh
+// loop is stopped so a test can revive the dead owner by writing it into the
+// member index; the loop would otherwise rewrite the index from memberlist.
+func newEvictFenceCluster(t *testing.T, nodeID string) (*Cluster, func()) {
+	t.Helper()
+	c, cleanup := newTestCluster(t, nodeID, true, nil)
+	waitForLeader(t, c, 10*time.Second)
+	stopGossipRefresh(t, c)
+	seedSelfFailoverCapacity(c)
+	return c, cleanup
+}
+
+// markGossipDead makes c's gossip view report nodeID as not alive, the
+// precondition reconcileDeadOwners checks before it evicts a node.
+// evictDeadOwner re-reads that view before every step, so the refresh loop is
+// stopped first: its next tick would rewrite the view from memberlist, where
+// a live test peer is still alive, and stop the eviction halfway.
+func markGossipDead(t *testing.T, c *Cluster, nodeID string) {
+	t.Helper()
+	stopGossipRefresh(t, c)
+	m, _ := c.gossip.lookupMember(nodeID)
+	m.NodeID = nodeID
+	m.Alive = false
+	c.gossip.currentMemberIndex().upsert(m)
+}
+
+func applyRaftCommand(t *testing.T, c *Cluster, cmd command) {
+	t.Helper()
+	raw, err := encodeCommand(cmd)
+	if err != nil {
+		t.Fatalf("encodeCommand: %v", err)
+	}
+	f := c.raft.raft.Apply(raw, 2*time.Second)
+	if err := f.Error(); err != nil {
+		t.Fatalf("raft apply: %v", err)
+	}
+	if err, ok := f.Response().(error); ok && err != nil {
+		t.Fatalf("fsm apply: %v", err)
+	}
+}
+
+// TestEvictDeadOwnerReassignIsFencedOnTheDeadOwner pins the owner fence on
+// failover reassigns. opReassign keeps the incarnation, so the incarnation
+// check alone cannot tell "still on the dead node" from "moved since the
+// eviction read it". A placement that moves between the read and the write
+// must stay where it moved to, and the refusal must not stop the eviction of
+// the dead node's other sandboxes.
+func TestEvictDeadOwnerReassignIsFencedOnTheDeadOwner(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test: requires real raft socket")
+	}
+	c, cleanup := newEvictFenceCluster(t, "srv-evict-fence")
+	defer cleanup()
+
+	// moved leaves the dead node after the eviction read it (the FSM fence
+	// must refuse the write); movedEarly leaves before the eviction reads it
+	// (the read re-check must skip it). next never moves.
+	moved := placeFailoverPlacement(t, c, "sb-a-moves-first", "dead-worker")
+	next := placeFailoverPlacement(t, c, "sb-b-still-dead", "dead-worker")
+	movedEarly := placeFailoverPlacement(t, c, "sb-c-moves-early", "dead-worker")
+	moveToOther := func(p Placement) {
+		applyRaftCommand(t, c, command{
+			Op: opReassign, SandboxID: p.SandboxID,
+			OwnerNodeID: "other-worker", OwnerAPIURL: "http://other-worker",
+			ExpectedIncarnationID: p.IncarnationID,
+			ExpectedOwnerNodeID:   "dead-worker", ExpectedOwnerNodeIDSet: true,
+		})
+	}
+	c.evictDeadOwnerStepHook = func(step evictDeadOwnerStep, sandboxID string) {
+		if step != evictStepReassign || sandboxID != moved.SandboxID {
+			return
+		}
+		// Another path (the stuck-owner watcher, an earlier eviction tick
+		// on a former leader) moves placements while this eviction runs.
+		moveToOther(moved)
+		moveToOther(movedEarly)
+	}
+
+	c.evictDeadOwner(context.Background(), "dead-worker")
+
+	for _, p := range []Placement{moved, movedEarly} {
+		if got, _ := c.fsm.get(p.SandboxID); got.OwnerNodeID != "other-worker" {
+			t.Fatalf("%s owner = %q, want other-worker: the eviction moved a sandbox that had already left the dead node", p.SandboxID, got.OwnerNodeID)
+		}
+	}
+	if p, _ := c.fsm.get(next.SandboxID); p.OwnerNodeID != c.nodeID {
+		t.Fatalf("%s owner = %q, want %s: one refused reassign stopped the rest of the eviction", next.SandboxID, p.OwnerNodeID, c.nodeID)
+	}
+}
+
+// TestEvictDeadOwnerStopsWhenTheNodeRejoins pins the liveness re-check. Each
+// eviction step is a Raft round trip, so a node with many sandboxes can come
+// back while the loop runs. The sandboxes it still owns at that point must
+// stay with it: not moved, not orphaned, and the node must stay a voter.
+// The step that was already in flight when it came back is allowed to land.
+func TestEvictDeadOwnerStopsWhenTheNodeRejoins(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test: requires real raft socket")
+	}
+	const (
+		dead = "dead-worker"
+		// self stands for the leader, the only failover target.
+		self = "<leader>"
+	)
+	type want struct {
+		owner    string
+		orphaned bool
+	}
+	cases := []struct {
+		name string
+		// failover lists the sandboxes that opt into failover recreate;
+		// plain ones carry no failover policy and can only be orphaned.
+		failover []string
+		plain    []string
+		// reviveAt is the step (and sandbox, for a reassign) whose hook
+		// brings the node back, just before that step's write.
+		reviveStep    evictDeadOwnerStep
+		reviveSandbox string
+		want          map[string]want
+	}{
+		{
+			name:          "rejoins before the next reassign",
+			failover:      []string{"sb-a-first", "sb-b-second"},
+			plain:         []string{"sb-c-plain"},
+			reviveStep:    evictStepReassign,
+			reviveSandbox: "sb-a-first",
+			want: map[string]want{
+				"sb-a-first":  {owner: self},
+				"sb-b-second": {owner: dead},
+				"sb-c-plain":  {owner: dead},
+			},
+		},
+		{
+			name:          "rejoins before the orphan step",
+			failover:      []string{"sb-z-last"},
+			plain:         []string{"sb-a-plain"},
+			reviveStep:    evictStepReassign,
+			reviveSandbox: "sb-z-last",
+			want: map[string]want{
+				"sb-z-last":  {owner: self},
+				"sb-a-plain": {owner: dead},
+			},
+		},
+		{
+			name:       "rejoins before the voter removal",
+			plain:      []string{"sb-a-plain"},
+			reviveStep: evictStepOrphan,
+			want: map[string]want{
+				"sb-a-plain": {orphaned: true},
+			},
+		},
+	}
+	for i, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c, cleanup := newEvictFenceCluster(t, fmt.Sprintf("srv-evict-rejoin-%d", i))
+			defer cleanup()
+			for _, id := range tc.failover {
+				placeFailoverPlacement(t, c, id, dead)
+			}
+			for _, id := range tc.plain {
+				applyRaftCommand(t, c, command{
+					Op: opPlace, SandboxID: id, OwnerNodeID: dead, OwnerAPIURL: "http://" + dead,
+					IncarnationID: "inc-" + id, Spec: &models.CreateSandboxRequest{Image: "alpine"},
+				})
+			}
+			// Marked now, inside the default 30s grace, so the cluster's own
+			// background dead-owner tick never evicts this node in parallel.
+			c.deadOwners.markDead(dead, time.Now())
+			c.evictDeadOwnerStepHook = func(step evictDeadOwnerStep, sandboxID string) {
+				if step == tc.reviveStep && sandboxID == tc.reviveSandbox {
+					c.gossip.currentMemberIndex().upsert(recreateCandidate(dead, config.NodeRoleWorker, 0))
+				}
+			}
+
+			c.evictDeadOwner(context.Background(), dead)
+
+			for id, w := range tc.want {
+				if w.owner == self {
+					w.owner = c.nodeID
+				}
+				p, ok := c.fsm.get(id)
+				if !ok {
+					t.Fatalf("%s: placement missing", id)
+				}
+				if p.IsOrphaned() != w.orphaned || (!w.orphaned && p.OwnerNodeID != w.owner) {
+					t.Fatalf("%s: owner=%q orphaned=%v, want owner=%q orphaned=%v", id, p.OwnerNodeID, p.IsOrphaned(), w.owner, w.orphaned)
+				}
+			}
+			// removeDeadOwnerServer clears the mark, so a mark still present
+			// shows the voter-removal step never ran for the revived node.
+			if _, marked := c.deadOwners.snapshot()[dead]; !marked {
+				t.Fatal("dead-owner mark cleared: the voter-removal step ran for a node that had come back")
+			}
+		})
+	}
+}
+
 // newTestClusterWithCfg is newTestCluster but with a hook to mutate the
 // generated config before it's handed to New. Used by tests that need to
 // shorten time-based knobs.
