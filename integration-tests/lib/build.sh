@@ -6,6 +6,7 @@
 #   build.sh publish [--ref <commit>] [--ttl 12h] [--arch ...]
 #   build.sh urls    [--ref <commit>] [--ttl 12h] [--arch ...]
 #   build.sh artifacts-init
+#   build.sh variant <suffix> [--arch ...]
 #
 # AEROL_GO_TAGS (e.g. itest_failpoints) compiles sandboxd with test-only Go
 # build tags and becomes part of the build id; unset, the build is the
@@ -384,6 +385,46 @@ cmd_build() {
 
   log "build: done — ${out}"
   printf '%s\n' "$build_id"
+}
+
+# cmd_variant builds this tree again under another version stamp,
+# itest-<build id>-<suffix>, into <build dir>/variant-<suffix>/ with its own
+# checksums.txt, and prints that directory. The upgrade gates
+# (plans/kubectl-style-cluster-ops.md §9 Phase 3b: "two local builds of this
+# stack with different versions") install the normal build, then upgrade to
+# this one: the same code, so the only change an upgrade makes is the
+# version. Cached like build: a second call with the same tree is free.
+cmd_variant() {
+  local suffix="${1:-}"
+  [[ "$suffix" =~ ^[a-z0-9]{1,8}$ ]] || die "variant needs a suffix of 1-8 lower-case letters or digits, e.g. 'variant b'"
+  shift
+  parse_common_flags "$@"
+  preflight
+
+  local build_id out src arch
+  build_id=$(resolve_build_id)
+  out="${BUILD_ROOT}/${build_id}/variant-${suffix}"
+  # checksums.txt is written last, so its presence marks a whole build.
+  if [[ -f "${out}/checksums.txt" ]]; then
+    local complete=1
+    for arch in "${ARCHES[@]}"; do
+      [[ -f "${out}/sandboxd_linux_${arch}" && -f "${out}/toolboxd_linux_${arch}" ]] || complete=0
+    done
+    if (( complete )); then
+      log "build: variant ${suffix} of ${build_id} already built (cache hit) — ${out}"
+      printf '%s\n' "$out"
+      return 0
+    fi
+  fi
+  src=$(source_tree_for "$build_id")
+  rm -rf "$out"
+  mkdir -p "$out"
+  log "build: variant ${suffix} of ${build_id} (version itest-${build_id}-${suffix})"
+  for arch in "${ARCHES[@]}"; do
+    build_one_arch "$src" "$out" "$arch" "${build_id}-${suffix}"
+  done
+  write_checksums "$out"
+  printf '%s\n' "$out"
 }
 
 # prune_build_cache caps local disk.
@@ -963,6 +1004,7 @@ main() {
     urls)           cmd_urls "$@" ;;
     build-id)       cmd_build_id "$@" ;;
     stage)          cmd_stage "$@" ;;
+    variant)        cmd_variant "$@" ;;
     artifacts-init) cmd_artifacts_init ;;
     *)
       cat >&2 <<'USAGE'
@@ -980,6 +1022,9 @@ usage: build.sh <command> [flags]
           Put local files in S3 for a test node (reusing a published build's
           copy) and print "<sha256> <mode> <name> <url>" per file. Use
           lib/stage.sh's stage_to_node, not this, to move files to a node.
+  variant <suffix> [--arch ...]
+          Build this tree again as version itest-<id>-<suffix> into
+          .build/<id>/variant-<suffix>/ and print that directory.
   artifacts-init
           One-time per-account artifacts bucket bootstrap.
 USAGE
