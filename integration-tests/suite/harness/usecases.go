@@ -1116,7 +1116,7 @@ var Registry = []UseCase{
 	// Upgrades without restarting sandboxes, Phase 3a live gate for mounts
 	// (plans/kubectl-style-cluster-ops.md §6.3 step 4, §6.4;
 	// z_mount_restart_test.go).
-	{ID: "UC-469", Title: "External-storage mounts survive a sandboxd restart: on the node running a sandbox with a platform volume, a file written through the mount reads back after `systemctl restart sandboxd` and a new write lands through the same mount of the same sandbox (never re-created); the mount helper is the same process before and after (adopted, not mounted again) and, on cgroup v2, runs in the aerolvm-mounts cgroup; a second sandbox on the volume reads the new file", Requires: []Capability{CapPlatformVolumes}, Implemented: true},
+	{ID: "UC-640", Title: "External-storage mounts survive a sandboxd restart: on the node running a sandbox with a platform volume, a file written through the mount reads back after `systemctl restart sandboxd` and a new write lands through the same mount of the same sandbox (never re-created); the mount helper is the same process before and after (adopted, not mounted again) and, on cgroup v2, runs in the aerolvm-mounts cgroup; a second sandbox on the volume reads the new file", Requires: []Capability{CapPlatformVolumes}, Implemented: true},
 }
 
 // byID is a lookup built once for the report generator.

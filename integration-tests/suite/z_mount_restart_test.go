@@ -2,7 +2,7 @@
 
 package suite
 
-// UC-469. Restarts sandboxd on one node, so it sorts after the rest of the
+// UC-640. Restarts sandboxd on one node, so it sorts after the rest of the
 // suite.
 
 import (
@@ -14,7 +14,7 @@ import (
 	sdktypes "github.com/aerol-ai/microvm/sdk/go/pkg/types"
 )
 
-// UC-469 — an external-storage mount keeps serving across a sandboxd restart
+// UC-640 — an external-storage mount keeps serving across a sandboxd restart
 // (plans/kubectl-style-cluster-ops.md §6.3 step 4 and §6.4, Codex eng
 // finding 3; the Phase 3a live gate for mounts).
 //
@@ -33,7 +33,7 @@ import (
 // With an NFS-backed volume there is no helper (a kernel mount survives a
 // restart on its own); the read and write halves still run.
 func TestMountHelpersServeAcrossSandboxdRestart(t *testing.T) {
-	harness.Require(t, sc, "UC-469")
+	harness.Require(t, sc, "UC-640")
 	if !harness.DisruptiveAllowed() {
 		t.Skip("disruptive tests disabled: this restarts sandboxd on the sandbox's node")
 	}
