@@ -378,6 +378,9 @@ func TestClusterModeOn(t *testing.T) {
 		{name: "1", main: "SB_ENABLE_CLUSTER=1\n", on: true, known: true},
 		{name: "cluster.env wins", main: "SB_ENABLE_CLUSTER=false\n", extra: "SB_ENABLE_CLUSTER=true\n", on: true, known: true},
 		{name: "unparsable falls back to off", main: "SB_ENABLE_CLUSTER=maybe\n", known: true},
+		{name: "a cluster.env without the switch cannot tell", main: "SB_API_PORT=1\n", extra: "SB_NODE_ID=n1\n"},
+		{name: "cluster settings without the switch cannot tell", main: "SB_CLUSTER_GOSSIP_SECRET_KEY=x\n"},
+		{name: "an explicit off beside cluster.env is off", main: "SB_API_PORT=1\n", extra: "SB_ENABLE_CLUSTER=false\n", known: true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

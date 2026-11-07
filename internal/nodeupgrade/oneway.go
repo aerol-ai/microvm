@@ -34,8 +34,10 @@ import (
 // clusterModeOn reports whether the node's env files turn cluster mode on:
 // sandboxd.env, then cluster.env beside it (a later file wins, as systemd
 // loads them), read the way sandboxd reads SB_ENABLE_CLUSTER. known is
-// false when the main env file cannot be read: the caller then keeps the
-// cluster rule, which never restores after boot work.
+// false when it cannot tell: an env file it cannot read, or cluster
+// settings (a cluster.env, an SB_CLUSTER_* key) without the switch, which
+// may then be set some other way. The caller keeps the cluster rule then,
+// which never restores after boot work.
 func clusterModeOn(envFile string) (on, known bool) {
 	if envFile == "" {
 		return false, false
@@ -44,14 +46,23 @@ func clusterModeOn(envFile string) (on, known bool) {
 	if err != nil {
 		return false, false
 	}
-	if extra, err := readEnvFile(filepath.Join(filepath.Dir(envFile), "cluster.env")); err == nil {
+	clusterSettings := false
+	extra, err := readEnvFile(filepath.Join(filepath.Dir(envFile), "cluster.env"))
+	switch {
+	case err == nil:
+		clusterSettings = true
 		for k, v := range extra {
 			env[k] = v
 		}
+	case !os.IsNotExist(err):
+		return false, false
 	}
 	raw := strings.TrimSpace(env["SB_ENABLE_CLUSTER"])
 	if raw == "" {
-		return false, true
+		for k := range env {
+			clusterSettings = clusterSettings || strings.HasPrefix(k, "SB_CLUSTER_")
+		}
+		return false, !clusterSettings
 	}
 	v, err := strconv.ParseBool(raw)
 	if err != nil {
