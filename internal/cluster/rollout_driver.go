@@ -102,11 +102,14 @@ type rolloutDriver struct {
 	// indexSlack is how far a server's applied index may trail the
 	// leader's and still count as caught up.
 	indexSlack uint64
+	// finalizeRetry backs off nodes whose one-way migrations failed, by
+	// node ID (under mu). A new leader starts with none: one more try each.
+	finalizeRetry map[string]retryWait
 }
 
 func newRolloutDriver(host rolloutHost, nodes rolloutNodeClient, logger *slog.Logger) *rolloutDriver {
 	return &rolloutDriver{
-		host: host, nodes: nodes, logger: logger, inflight: map[string]bool{},
+		host: host, nodes: nodes, logger: logger, inflight: map[string]bool{}, finalizeRetry: map[string]retryWait{},
 		stepTimeout: 15 * time.Minute, applyTimeout: time.Minute, applyResendAfter: 30 * time.Second, abandonAfter: 2 * time.Minute,
 		indexSlack: 1000,
 	}
@@ -838,7 +841,7 @@ func (d *rolloutDriver) healthy(n *RolloutNodeRecord, m Member, st UpgradeNodeSt
 // restoreCordon gives a node back its own cordon mark from the start of
 // the rollout (§6.2).
 func (d *rolloutDriver) restoreCordon(ctx context.Context, n *RolloutNodeRecord) {
-	if n.WasCordoned {
+	if n.WasCordoned || !d.host.drained()[n.NodeID] {
 		return
 	}
 	if err := d.host.setDrain(ctx, n.NodeID, false); err != nil {
@@ -846,14 +849,57 @@ func (d *rolloutDriver) restoreCordon(ctx context.Context, n *RolloutNodeRecord)
 	}
 }
 
+// migrationFailedPrefix starts the error of a node whose one-way
+// migrations failed: the leader cordoned it for that.
+const migrationFailedPrefix = "one-way migrations failed: "
+
+// Waits between retries of a node whose one-way migrations failed: they
+// double from the first to the last.
+const (
+	finalizeRetryFirst = 10 * time.Second
+	finalizeRetryMax   = 5 * time.Minute
+)
+
+// retryWait is one node's backoff: its next try and the wait that set it.
+type retryWait struct {
+	next time.Time
+	wait time.Duration
+}
+
+// finalizeDue reports whether nodeID's migrations may run again now.
+func (d *rolloutDriver) finalizeDue(nodeID string, now time.Time) bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	b, ok := d.finalizeRetry[nodeID]
+	return !ok || !now.Before(b.next)
+}
+
+// finalizeFailed backs nodeID off and returns the wait.
+func (d *rolloutDriver) finalizeFailed(nodeID string, now time.Time) time.Duration {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	b := d.finalizeRetry[nodeID]
+	b.wait = min(max(2*b.wait, finalizeRetryFirst), finalizeRetryMax)
+	b.next = now.Add(b.wait)
+	d.finalizeRetry[nodeID] = b
+	return b.wait
+}
+
+func (d *rolloutDriver) finalizeOK(nodeID string) {
+	d.mu.Lock()
+	delete(d.finalizeRetry, nodeID)
+	d.mu.Unlock()
+}
+
 // tickFinalizing runs every node's one-way migrations (§6.5, CEO D16).
 func (d *rolloutDriver) tickFinalizing(ctx context.Context, r *RolloutRecord, members map[string]Member) {
+	now := d.host.now()
 	for _, n := range r.sortedNodes() {
 		if n.Migrated {
 			continue
 		}
 		m, ok := members[n.NodeID]
-		if !ok || !m.Alive {
+		if !ok || !m.Alive || !d.finalizeDue(n.NodeID, now) {
 			continue
 		}
 		req := UpgradeStepRequest{RolloutID: r.ID, Step: UpgradeStepFinalize, Direction: r.Direction, Version: r.TargetVersion, Term: d.host.term()}
@@ -864,14 +910,28 @@ func (d *rolloutDriver) tickFinalizing(ctx context.Context, r *RolloutRecord, me
 			_, err := d.nodes.Step(cctx, m, req)
 			switch {
 			case err == nil:
-				d.update(cctx, RolloutNodeUpdate{RolloutID: rolloutID, NodeID: node.NodeID, Migrated: true, ClearError: true})
+				d.finalizeOK(node.NodeID)
+				if d.update(cctx, RolloutNodeUpdate{RolloutID: rolloutID, NodeID: node.NodeID, Migrated: true, ClearError: true}) &&
+					strings.HasPrefix(node.Error, migrationFailedPrefix) {
+					// It failed before and was cordoned for that (below).
+					d.restoreCordon(cctx, &node)
+				}
 			case stepRetryable(err):
 			default:
 				// The node stays cordoned and shows the error; the rollout
-				// stays finalizing until it reports (§6.6).
-				d.update(cctx, RolloutNodeUpdate{RolloutID: rolloutID, NodeID: node.NodeID, Error: "one-way migrations failed: " + err.Error()})
-				_ = d.host.setDrain(cctx, node.NodeID, true)
-				d.event(cctx, RolloutCommand{Event: evMigrationFailed, RolloutID: rolloutID, Error: err.Error()})
+				// stays finalizing until it reports (§6.6). The same failure
+				// again writes nothing, and the retries wait longer each
+				// time: a broken node must not fill the Raft log.
+				wait := d.finalizeFailed(node.NodeID, d.host.now())
+				if msg := migrationFailedPrefix + err.Error(); node.Error != msg {
+					d.update(cctx, RolloutNodeUpdate{RolloutID: rolloutID, NodeID: node.NodeID, Error: msg})
+				}
+				if !d.host.drained()[node.NodeID] {
+					if err := d.host.setDrain(cctx, node.NodeID, true); err != nil {
+						d.warnf("cluster: rollout could not cordon a node whose migrations failed", "node_id", node.NodeID, "err", err)
+					}
+				}
+				d.warnf("cluster: rollout node's one-way migrations failed; will retry", "rollout_id", rolloutID, "node_id", node.NodeID, "in", wait, "err", err)
 			}
 		})
 	}
@@ -891,8 +951,19 @@ func (d *rolloutDriver) update(ctx context.Context, u RolloutNodeUpdate) bool {
 	return res.Changed
 }
 
-// event writes one rollout event.
+// event writes one rollout event, when it would change the rollout. The
+// transition function answers first, from this leader's record, as it
+// answers the FSM: an event it refuses or that changes nothing (all_done
+// while a node is manual, migration_failed while finalizing) would be a
+// Raft entry every tick that does nothing.
 func (d *rolloutDriver) event(ctx context.Context, rc RolloutCommand) {
+	cur := d.host.rollout()
+	if cur == nil || cur.ID != rc.RolloutID {
+		return
+	}
+	if v := decideRollout(cur, rolloutEvent{Kind: rc.Event}); v.Outcome == outcomeNoop || v.Outcome == outcomeRefused {
+		return
+	}
 	res, err := d.host.event(ctx, rc)
 	if err != nil {
 		d.warnf("cluster: rollout event failed", "rollout_id", rc.RolloutID, "event", rc.Event, "err", err)

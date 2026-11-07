@@ -645,6 +645,19 @@ func TestRolloutDriverRemoteUpgradeOffIsManual(t *testing.T) {
 	if r.State == upgradewire.StateDone {
 		t.Fatal("done while a node is manual")
 	}
+	// Waiting on the operator writes nothing: all_done is refused by the
+	// transition function before it becomes a Raft entry.
+	writes := g.host.index
+	for i := 0; i < 5; i++ {
+		g.driver.tick(context.Background())
+	}
+	if g.host.index != writes {
+		t.Fatalf("a rollout waiting on a manual node wrote %d entries in 5 ticks", g.host.index-writes)
+	}
+	g.driver.event(context.Background(), RolloutCommand{Event: evStop, RolloutID: "an-old-rollout"})
+	if g.host.index != writes {
+		t.Fatal("an event for a replaced rollout was written")
+	}
 	// The operator runs the command: the node reports v2 and is done.
 	g.host.setVersion("w1", "v2")
 	g.run(upgradewire.StateDone)
@@ -701,20 +714,43 @@ func TestRolloutDriverAdoptsJoinedNode(t *testing.T) {
 	}
 }
 
+// R9: a node whose one-way migrations fail stays cordoned and shows the
+// error, and the rollout stays finalizing. The leader retries it with a
+// growing wait and writes only what changed, not about three Raft entries
+// per failing node every two-second tick; once the node succeeds it gets
+// its own cordon mark back.
 func TestRolloutDriverFinalizeMigrationFailure(t *testing.T) {
 	g := newRolloutRig(t, 1, 0, 1)
 	g.nodes.nodes["w1"].finalizeErr = &UpgradeStepError{Status: http.StatusInternalServerError, Reason: "disk I/O"}
 	g.start(func(r *RolloutRecord) { r.AllowDowntime = true })
 	g.run(upgradewire.StateFinalizing)
-	for i := 0; i < 5; i++ {
+	g.driver.tick(context.Background())
+	writes, cordons := g.host.index, len(g.host.drains)
+	for i := 0; i < 10; i++ {
 		g.driver.tick(context.Background())
 	}
 	r := g.host.rollout()
 	if r.State != upgradewire.StateFinalizing || !strings.Contains(r.Nodes["w1"].Error, "disk I/O") || !g.host.drain["w1"] {
 		t.Fatalf("finalize failure: %s cordon %v", describeNodes(r), g.host.drain["w1"])
 	}
+	if g.host.index != writes || len(g.host.drains) != cordons || g.nodes.nodes["w1"].finalizes != 1 {
+		t.Fatalf("10 more ticks wrote %d entries and %d cordons, and ran the migrations %d times; want none, none and once",
+			g.host.index-writes, len(g.host.drains)-cordons, g.nodes.nodes["w1"].finalizes)
+	}
+	// The retry waits grow: 10 s, then 20 s.
+	g.host.advance(11 * time.Second)
+	g.driver.tick(context.Background())
+	g.host.advance(11 * time.Second)
+	g.driver.tick(context.Background())
+	if n := g.nodes.nodes["w1"].finalizes; n != 2 || g.host.index != writes {
+		t.Fatalf("after the first wait: %d runs, %d new writes; want 2 runs and no write (same error)", n, g.host.index-writes)
+	}
 	g.nodes.nodes["w1"].finalizeErr = nil
-	g.run(upgradewire.StateFinalized)
+	g.host.advance(10 * time.Second)
+	r = g.run(upgradewire.StateFinalized)
+	if g.host.drain["w1"] || r.Nodes["w1"].Error != "" {
+		t.Fatalf("a node that later succeeded: cordoned %v, %s", g.host.drain["w1"], describeNodes(r))
+	}
 }
 
 func TestRolloutDriverStagingTimeout(t *testing.T) {
