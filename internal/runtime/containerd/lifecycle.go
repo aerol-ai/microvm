@@ -106,6 +106,10 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 	// createdContainer, which wrongly leaked host files / ready socket / netns
 	// slot / lease on any failure BEFORE NewContainer.)
 	lostRace := false
+	// snapshotLeft is set when NewContainer failed for any reason but
+	// AlreadyExists: it may have prepared the sandbox's snapshot and not
+	// written the container (see removeOrphanSnapshot).
+	snapshotLeft := false
 	var (
 		container cntr.Container
 		task      cntr.Task
@@ -130,6 +134,12 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		// rule cleared after the slot is free could be the next owner's);
 		// and the slot goes back to the pool last.
 		d.lifoTeardown(ctx, client, container, task, logPath, hostFiles)
+		if snapshotLeft {
+			if err := d.removeOrphanSnapshot(ctx, client, sandboxID); err != nil {
+				d.logger.Warn("containerd: failed create's snapshot not removed; the next create of the id removes it as a leftover",
+					"sandbox_id", sandboxID, "error", err)
+			}
+		}
 		if !netnsProvisioned || d.netns == nil {
 			return
 		}
@@ -282,6 +292,7 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 			lostRace = true
 			return nil, fmt.Errorf("%w: sandbox container already exists", dockerpkg.ErrSandboxContainerExists)
 		}
+		snapshotLeft = true
 		return nil, fmt.Errorf("create container: %w", err)
 	}
 	// The prepaid address is this sandbox's from here (a duplicate create
@@ -607,8 +618,9 @@ func (d *Driver) Destroy(ctx context.Context, sandbox *models.Sandbox) error {
 	return destroyErr
 }
 
-// destroyContainer kills the sandbox's task and deletes its container; a
-// container containerd doesn't have is already gone.
+// destroyContainer kills the sandbox's task and deletes its container with
+// its snapshot. A container containerd doesn't have is gone, but the snapshot
+// named after it can still be there (removeOrphanSnapshot), so that goes too.
 func (d *Driver) destroyContainer(ctx context.Context, sandbox *models.Sandbox) error {
 	client, err := d.ensureClient()
 	if err != nil {
@@ -621,7 +633,7 @@ func (d *Driver) destroyContainer(ctx context.Context, sandbox *models.Sandbox) 
 	container, err := client.LoadContainer(ctx, ref)
 	if err != nil {
 		if errdefs.IsNotFound(err) {
-			return nil
+			return removeSnapshot(ctx, client, ref)
 		}
 		return err
 	}
@@ -633,6 +645,64 @@ func (d *Driver) destroyContainer(ctx context.Context, sandbox *models.Sandbox) 
 		_, _ = task.Delete(ctx, cntr.WithProcessKill)
 	}
 	return container.Delete(ctx, cntr.WithSnapshotCleanup)
+}
+
+// removeOrphanSnapshot removes the snapshot named id when containerd says no
+// container holds id.
+//
+// NewContainer prepares a container's snapshot (cntr.WithNewSnapshot, keyed by
+// the container's own id, here the sandbox ID) before it writes the
+// container. A NewContainer that fails in between leaves the snapshot with no
+// container, most often a create whose client hung up (an SDK timeout): its
+// context is cancelled, the container write fails, and so does the delete of
+// NewContainer's own lease, which keeps the snapshot pinned for a day. The
+// next create of the ID, an Idempotency-Key retry, fails its prepare with
+// AlreadyExists, and the service answered 409 "sandbox already exists"
+// (UC-450 live, 2026-11-08).
+//
+// A snapshot whose container exists is that container's rootfs, and
+// containerd's Remove does not check for one, so the container is looked up
+// first and a lookup that fails leaves the snapshot. Nothing else can hold a
+// snapshot under a sandbox ID with no container: the service runs one create
+// of an ID at a time (its create lease), and every other snapshot this driver
+// makes is named after a warm-pool slot.
+func (d *Driver) removeOrphanSnapshot(ctx context.Context, client *Client, id string) error {
+	if _, err := client.LoadContainer(ctx, id); !errdefs.IsNotFound(err) {
+		return err
+	}
+	return removeSnapshot(ctx, client, id)
+}
+
+// removeSnapshot removes the snapshot named key from the default snapshotter;
+// one that is not there is already gone.
+func removeSnapshot(ctx context.Context, client *Client, key string) error {
+	s := snapshotsFn(client)
+	if s == nil {
+		return nil
+	}
+	if err := s.Remove(client.withNS(ctx), key); err != nil && !errdefs.IsNotFound(err) {
+		return fmt.Errorf("remove snapshot %q: %w", key, err)
+	}
+	return nil
+}
+
+// snapshotRemover is the containerd snapshotter surface the orphan-snapshot
+// cleanup needs. Tests inject a fake so the path is covered offline.
+type snapshotRemover interface {
+	Remove(ctx context.Context, key string) error
+}
+
+// snapshotsFn resolves the default snapshotter, the one cntr.WithNewSnapshot
+// prepares every sandbox's snapshot on (Create names none). Production uses
+// client.Raw(); tests override.
+var snapshotsFn = func(client *Client) snapshotRemover {
+	if client == nil || client.Raw() == nil {
+		return nil
+	}
+	if s := client.Raw().SnapshotService(""); s != nil {
+		return s
+	}
+	return nil
 }
 
 // Inspect reports what containerd knows about one container. An error
