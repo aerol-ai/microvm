@@ -416,6 +416,36 @@ func TestRolloutAPIViewAndFiles(t *testing.T) {
 	}
 }
 
+// R12: staging, stop, a pause and a failure start no new restart (§6.6).
+// The FSM refuses a node's move to upgrading then, so a leader that read
+// "running" just before a stop landed cannot mark one. A node already
+// upgrading is still followed to its result.
+func TestFSMRolloutNoNewRestartOutsideRunning(t *testing.T) {
+	f := newPlacementFSM()
+	up := func(index uint64, id string) rolloutApplyResult {
+		return rolloutRes(t, applyDenyLogAt(t, f, index, nodeCmd(RolloutNodeUpdate{RolloutID: "r1", NodeID: id, State: upgradewire.NodeUpgrading, Op: "r1-u0", DeadlineUnixNano: 500}, int64(index))))
+	}
+	applyDenyLogAt(t, f, 1, applyCmd("r1", "v2", twoNodes()...))
+	if res := up(2, "s1"); res.Changed || res.Rollout.Nodes["s1"].State != upgradewire.NodePending {
+		t.Fatalf("a restart started while staging: %+v", res.Rollout.Nodes["s1"])
+	}
+	for i, id := range []string{"s1", "w1"} {
+		applyDenyLogAt(t, f, uint64(3+i), nodeCmd(RolloutNodeUpdate{RolloutID: "r1", NodeID: id, State: upgradewire.NodeStaged}, 12))
+	}
+	applyDenyLogAt(t, f, 5, eventCmd("r1", evAllStaged, 13))
+	if res := up(6, "s1"); !res.Changed || res.Rollout.Nodes["s1"].State != upgradewire.NodeUpgrading {
+		t.Fatalf("running refused a restart: %+v", res.Rollout.Nodes["s1"])
+	}
+	applyDenyLogAt(t, f, 7, eventCmd("r1", evStop, 14))
+	if res := up(8, "w1"); res.Changed || res.Rollout.Nodes["w1"].State != upgradewire.NodeStaged {
+		t.Fatalf("a stopped rollout started a restart: %+v", res.Rollout.Nodes["w1"])
+	}
+	// The restart in flight is finished, not dropped.
+	if res := rolloutRes(t, applyDenyLogAt(t, f, 9, nodeCmd(RolloutNodeUpdate{RolloutID: "r1", NodeID: "s1", State: upgradewire.NodeDone, ExpectState: upgradewire.NodeUpgrading, Version: "v2"}, 15))); !res.Changed {
+		t.Fatalf("the restart in flight could not finish: %+v", res.Verdict)
+	}
+}
+
 // R3: a deleted node leaves the rollout (§5, §6.2). A skipped node then no
 // longer holds finalize, a node deleted while finalizing no longer holds
 // the migrations, and a node deleted before a rollout's apply or a join's

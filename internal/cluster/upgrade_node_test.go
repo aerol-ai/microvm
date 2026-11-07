@@ -114,12 +114,16 @@ func newUpgradeNodeRig(t *testing.T, isServer bool) *upgradeNodeRig {
 	return g
 }
 
+// stepOp is n1's op in stepRollout: the first upgrade pass of r1
+// (rolloutOpID).
+const stepOp = "r1-u0"
+
 // stepRollout is a committed rollout in which n1 is in state.
 func stepRollout(state, nodeState string, files map[string]string) *RolloutRecord {
 	return &RolloutRecord{
 		ID: "r1", State: state, Direction: upgradewire.DirectionUpgrade, TargetVersion: "v2", PreviousVersion: "v1",
 		Caller: "pat:op", Files: files, PrevFiles: map[string]string{"sandboxd_linux_amd64": strings.Repeat("c", 64)},
-		Nodes: map[string]*RolloutNodeRecord{"n1": {NodeID: "n1", State: nodeState, Op: "op1"}},
+		Nodes: map[string]*RolloutNodeRecord{"n1": {NodeID: "n1", State: nodeState, Op: stepOp}},
 	}
 }
 
@@ -154,14 +158,43 @@ func TestCheckUpgradeFence(t *testing.T) {
 		{"stage while finalizing", "lead", func(_ *UpgradeStepRequest, f *UpgradeFence) { f.Rollout.State = upgradewire.StateFinalizing }, upgradewire.ErrCodeRolloutConflict},
 		{"stage a done node", "lead", func(_ *UpgradeStepRequest, f *UpgradeFence) { f.Rollout.Nodes["n1"].State = upgradewire.NodeDone }, upgradewire.ErrCodeRolloutConflict},
 		{"apply ok", "lead", func(r *UpgradeStepRequest, f *UpgradeFence) {
-			r.Step, r.Op = UpgradeStepApply, "op1"
+			r.Step, r.Op = UpgradeStepApply, stepOp
 			f.Rollout.State, f.Rollout.Nodes["n1"].State = upgradewire.StateRunning, upgradewire.NodeUpgrading
+		}, ""},
+		{"apply catching up a node once done", "lead", func(r *UpgradeStepRequest, f *UpgradeFence) {
+			r.Step, r.Op = UpgradeStepApply, stepOp
+			f.Rollout.State, f.Rollout.Nodes["n1"].State = upgradewire.StateDone, upgradewire.NodeUpgrading
 		}, ""},
 		{"apply another op", "lead", func(r *UpgradeStepRequest, f *UpgradeFence) {
 			r.Step, r.Op = UpgradeStepApply, "op9"
-			f.Rollout.Nodes["n1"].State = upgradewire.NodeUpgrading
+			f.Rollout.State, f.Rollout.Nodes["n1"].State = upgradewire.StateRunning, upgradewire.NodeUpgrading
 		}, upgradeCodeNotInRecord},
-		{"apply a staged node", "lead", func(r *UpgradeStepRequest, _ *UpgradeFence) { r.Step, r.Op = UpgradeStepApply, "op1" }, upgradeCodeNotInRecord},
+		{"apply a staged node", "lead", func(r *UpgradeStepRequest, f *UpgradeFence) {
+			r.Step, r.Op = UpgradeStepApply, stepOp
+			f.Rollout.State = upgradewire.StateRunning
+		}, upgradeCodeNotInRecord},
+		// R12: stop, a pause, a failure or a restage starts no new restart,
+		// even one the leader marked and called before the command landed.
+		{"apply after stop", "lead", func(r *UpgradeStepRequest, f *UpgradeFence) {
+			r.Step, r.Op = UpgradeStepApply, stepOp
+			f.Rollout.State, f.Rollout.Nodes["n1"].State = upgradewire.StateStopped, upgradewire.NodeUpgrading
+		}, upgradewire.ErrCodeRolloutConflict},
+		{"apply while paused", "lead", func(r *UpgradeStepRequest, f *UpgradeFence) {
+			r.Step, r.Op = UpgradeStepApply, stepOp
+			f.Rollout.State, f.Rollout.Nodes["n1"].State = upgradewire.StatePaused, upgradewire.NodeUpgrading
+		}, upgradewire.ErrCodeRolloutConflict},
+		{"apply after a failure", "lead", func(r *UpgradeStepRequest, f *UpgradeFence) {
+			r.Step, r.Op = UpgradeStepApply, stepOp
+			f.Rollout.State, f.Rollout.Nodes["n1"].State = upgradewire.StateFailed, upgradewire.NodeUpgrading
+		}, upgradewire.ErrCodeRolloutConflict},
+		{"apply while restaging", "lead", func(r *UpgradeStepRequest, f *UpgradeFence) {
+			r.Step, r.Op = UpgradeStepApply, stepOp
+			f.Rollout.Nodes["n1"].State = upgradewire.NodeUpgrading
+		}, upgradewire.ErrCodeRolloutConflict},
+		{"apply an op of an earlier pass", "lead", func(r *UpgradeStepRequest, f *UpgradeFence) {
+			r.Step, r.Op = UpgradeStepApply, stepOp
+			f.Rollout.State, f.Rollout.Attempt, f.Rollout.Nodes["n1"].State = upgradewire.StateRunning, 1, upgradewire.NodeUpgrading
+		}, upgradeCodeNotInRecord},
 		{"finalize ok", "lead", func(r *UpgradeStepRequest, f *UpgradeFence) {
 			r.Step = UpgradeStepFinalize
 			f.Rollout.State = upgradewire.StateFinalizing
@@ -169,9 +202,10 @@ func TestCheckUpgradeFence(t *testing.T) {
 		{"finalize too early", "lead", func(r *UpgradeStepRequest, _ *UpgradeFence) { r.Step = UpgradeStepFinalize }, upgradewire.ErrCodeRolloutConflict},
 		{"unknown step", "lead", func(r *UpgradeStepRequest, _ *UpgradeFence) { r.Step = "dance" }, ""},
 		{"rollback files", "lead", func(r *UpgradeStepRequest, f *UpgradeFence) {
-			r.Step, r.Op, r.Direction, r.Version = UpgradeStepApply, "op1", upgradewire.DirectionRollback, "v1"
+			r.Step, r.Op, r.Direction, r.Version = UpgradeStepApply, "r1-b0", upgradewire.DirectionRollback, "v1"
 			r.Files = map[string]string{"sandboxd_linux_amd64": strings.Repeat("c", 64)}
 			f.Rollout.Direction, f.Rollout.State, f.Rollout.Nodes["n1"].State = upgradewire.DirectionRollback, upgradewire.StateRollingBack, upgradewire.NodeUpgrading
+			f.Rollout.Nodes["n1"].Op = "r1-b0"
 		}, ""},
 	}
 	for _, tc := range cases {
@@ -325,9 +359,9 @@ func TestUpgradeNodeApply(t *testing.T) {
 		}
 	}
 	g.fence = UpgradeFence{Leader: "lead", Term: 2, Rollout: stepRollout(upgradewire.StateRunning, upgradewire.NodeUpgrading, files)}
-	req := UpgradeStepRequest{RolloutID: "r1", Step: UpgradeStepApply, Direction: upgradewire.DirectionUpgrade, Version: "v2", Files: files, Op: "op1", Term: 2, HealthTimeout: "1m", AllowUnversioned: true}
+	req := UpgradeStepRequest{RolloutID: "r1", Step: UpgradeStepApply, Direction: upgradewire.DirectionUpgrade, Version: "v2", Files: files, Op: stepOp, Term: 2, HealthTimeout: "1m", AllowUnversioned: true}
 	resp, err := g.u.Step(context.Background(), "lead", req)
-	if err != nil || resp.State != UpgradeNodeStarted || resp.Op != "op1" || len(g.launched) != 1 {
+	if err != nil || resp.State != UpgradeNodeStarted || resp.Op != stepOp || len(g.launched) != 1 {
 		t.Fatalf("apply = %+v %v", resp, err)
 	}
 	l := g.launched[0]
@@ -339,13 +373,13 @@ func TestUpgradeNodeApply(t *testing.T) {
 	}
 	// The node's own record answers a repeat: never a second upgrade.
 	for phase, want := range map[string]string{"swapping": UpgradeNodeStarted, "done": UpgradeNodeDone, "failed": UpgradeNodeFailed} {
-		writeOpState(t, g.paths.StateDir, "op1", phase, "boom")
+		writeOpState(t, g.paths.StateDir, stepOp, phase, "boom")
 		resp, err := g.u.Step(context.Background(), "lead", req)
 		if err != nil || resp.State != want || len(g.launched) != 1 {
 			t.Fatalf("repeat with op %s = %+v %v", phase, resp, err)
 		}
 	}
-	_ = os.Remove(filepath.Join(g.paths.StateDir, "op1.json"))
+	_ = os.Remove(filepath.Join(g.paths.StateDir, stepOp+".json"))
 	// Another upgrade holds the lock: upgrade_running.
 	lk, err := os.OpenFile(filepath.Join(g.paths.StateDir, "lock"), os.O_RDWR|os.O_CREATE, 0o600)
 	if err != nil {
@@ -357,7 +391,7 @@ func TestUpgradeNodeApply(t *testing.T) {
 	if stepCode(err) != upgradewire.ErrCodeUpgradeRunning {
 		t.Fatalf("apply while locked = %v", err)
 	}
-	if st := g.u.Status("op1"); !st.OpRunning || st.OpFound {
+	if st := g.u.Status(stepOp); !st.OpRunning || st.OpFound {
 		t.Fatalf("status while locked = %+v", st)
 	}
 	_ = syscall.Flock(int(lk.Fd()), syscall.LOCK_UN)
@@ -381,7 +415,8 @@ func TestUpgradeNodeRollbackApply(t *testing.T) {
 	r := stepRollout(upgradewire.StateRollingBack, upgradewire.NodeUpgrading, nil)
 	r.Direction, r.PrevFiles = upgradewire.DirectionRollback, files
 	g.fence = UpgradeFence{Leader: "lead", Term: 1, Rollout: r}
-	req := UpgradeStepRequest{RolloutID: "r1", Step: UpgradeStepApply, Direction: upgradewire.DirectionRollback, Version: "v1", Files: files, Op: "op1", Term: 1}
+	r.Nodes["n1"].Op = "r1-b0"
+	req := UpgradeStepRequest{RolloutID: "r1", Step: UpgradeStepApply, Direction: upgradewire.DirectionRollback, Version: "v1", Files: files, Op: "r1-b0", Term: 1}
 	if _, err := g.u.Step(context.Background(), "lead", req); err != nil || len(g.launched) != 1 || !g.launched[0].Rollback || g.launched[0].From == "" {
 		t.Fatalf("rollback apply = %v %+v", err, g.launched)
 	}
@@ -389,8 +424,9 @@ func TestUpgradeNodeRollbackApply(t *testing.T) {
 	missing := map[string]string{"sandboxd_linux_amd64": strings.Repeat("7", 64)}
 	r.PrevFiles = missing
 	g.u.servers = func() []Member { return nil }
-	req.Files, req.Op = missing, "op2"
-	r.Nodes["n1"].Op = "op2"
+	r.Attempt = 1
+	req.Files, req.Op = missing, "r1-b1"
+	r.Nodes["n1"].Op = "r1-b1"
 	saved := materializeTimeout
 	materializeTimeout = 20 * time.Millisecond
 	defer func() { materializeTimeout = saved }()
@@ -399,11 +435,60 @@ func TestUpgradeNodeRollbackApply(t *testing.T) {
 	}
 	// The leader's earlier call launched the unit but its answer was lost:
 	// the running unit answers started, and nothing launches twice.
-	req.Op = "op3"
-	r.Nodes["n1"].Op = "op3"
-	g.host.active[nodeupgrade.LaunchUnit("op3")] = true
+	r.Attempt = 2
+	req.Op = "r1-b2"
+	r.Nodes["n1"].Op = "r1-b2"
+	g.host.active[nodeupgrade.LaunchUnit("r1-b2")] = true
 	if resp, err := g.u.Step(context.Background(), "lead", req); err != nil || resp.State != UpgradeNodeStarted || len(g.launched) != 2 {
 		t.Fatalf("apply while its unit runs = %+v %v (%d launches)", resp, err, len(g.launched))
+	}
+}
+
+// R12: the files of an apply may take up to materializeTimeout to arrive.
+// A stop, a rollback or a new leader that lands meanwhile must stop the
+// restart, so the node reads the fence again right before the launch.
+func TestUpgradeNodeApplyChecksTheFenceAgainBeforeLaunch(t *testing.T) {
+	sd, tb := []byte("new sandboxd"), []byte("new toolboxd")
+	files := map[string]string{"sandboxd_linux_amd64": sumOf(sd), "toolboxd_linux_amd64": sumOf(tb)}
+	req := UpgradeStepRequest{RolloutID: "r1", Step: UpgradeStepApply, Direction: upgradewire.DirectionUpgrade, Version: "v2", Files: files, Op: stepOp, Term: 2}
+	cases := []struct {
+		name  string
+		later func(f *UpgradeFence)
+		code  string
+	}{
+		{"stopped", func(f *UpgradeFence) { f.Rollout.State = upgradewire.StateStopped }, upgradewire.ErrCodeRolloutConflict},
+		{"rolled back", func(f *UpgradeFence) {
+			f.Rollout.State, f.Rollout.Direction, f.Rollout.Attempt = upgradewire.StateRollingBack, upgradewire.DirectionRollback, 1
+		}, upgradeCodeNotInRecord},
+		{"new leader", func(f *UpgradeFence) { f.Leader, f.Term = "lead2", 3 }, upgradeCodeNotLeader},
+		{"fence unreadable", nil, upgradeCodeRetry},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			g := newUpgradeNodeRig(t, false)
+			store := nodeupgrade.FileStore{Dir: nodeupgrade.FileStoreDir(g.paths.StateDir)}
+			for _, b := range [][]byte{sd, tb} {
+				if _, _, err := store.Put(sumOf(b), bytes.NewReader(b)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			reads := 0
+			g.u.fence = func(context.Context, string) (UpgradeFence, error) {
+				reads++
+				f := UpgradeFence{Leader: "lead", Term: 2, Rollout: stepRollout(upgradewire.StateRunning, upgradewire.NodeUpgrading, files)}
+				if reads > 1 {
+					if tc.later == nil {
+						return UpgradeFence{}, errors.New("no server answered")
+					}
+					tc.later(&f)
+				}
+				return f, nil
+			}
+			_, err := g.u.Step(context.Background(), "lead", req)
+			if stepCode(err) != tc.code || len(g.launched) != 0 || reads != 2 {
+				t.Fatalf("apply = %v (code %q), %d launches, %d fence reads; want %s, none, 2", err, stepCode(err), len(g.launched), reads, tc.code)
+			}
+		})
 	}
 }
 

@@ -343,7 +343,14 @@ func checkUpgradeFence(caller, selfID string, req UpgradeStepRequest, f UpgradeF
 			return stepErr(http.StatusConflict, upgradewire.ErrCodeRolloutConflict, "this node is %s in rollout %s, not pending", n.State, r.ID)
 		}
 	case UpgradeStepApply:
-		if n.State != upgradewire.NodeUpgrading || n.Op == "" || n.Op != req.Op {
+		// A stop, a pause or a failure starts no new restart, even one the
+		// leader marked and called just before (§6.6).
+		if !rolloutStartsRestarts(r.State) {
+			return stepErr(http.StatusConflict, upgradewire.ErrCodeRolloutConflict, "rollout %s is %s: it starts no restart", r.ID, r.State)
+		}
+		// Only this pass's op restarts the node: an op from before a restage
+		// or a rollback belongs to a pass that is over.
+		if n.State != upgradewire.NodeUpgrading || n.Op == "" || n.Op != req.Op || req.Op != rolloutOpID(r) {
 			return stepErr(http.StatusForbidden, upgradeCodeNotInRecord, "op %s is not this node's step in rollout %s (node is %s, op %q)", req.Op, r.ID, n.State, n.Op)
 		}
 	case UpgradeStepFinalize:
@@ -383,18 +390,8 @@ func (u *upgradeNode) Step(ctx context.Context, caller string, req UpgradeStepRe
 	if req.Step != UpgradeStepFinalize && !u.cfg.RemoteUpgradeEnabled() {
 		return resp, stepErr(http.StatusConflict, upgradewire.ErrCodeRemoteUpgradeDisabled, "SB_REMOTE_UPGRADE=false on %s: run the upgrade on the node", u.nodeID)
 	}
-	if u.fence == nil {
-		return resp, stepErr(http.StatusServiceUnavailable, upgradeCodeRetry, "the node cannot read the rollout yet")
-	}
-	fence, err = u.fence(ctx, req.RolloutID)
+	fence, err = u.checkFence(ctx, caller, req)
 	if err != nil {
-		var se *UpgradeStepError
-		if errors.As(err, &se) {
-			return resp, err
-		}
-		return resp, stepErr(http.StatusServiceUnavailable, upgradeCodeRetry, "read the committed rollout: %v", err)
-	}
-	if err := checkUpgradeFence(caller, u.nodeID, req, fence); err != nil {
 		return resp, err
 	}
 	p, err := u.paths()
@@ -408,10 +405,26 @@ func (u *upgradeNode) Step(ctx context.Context, caller string, req UpgradeStepRe
 	case UpgradeStepStage:
 		return u.stage(ctx, p, req, resp)
 	case UpgradeStepApply:
-		return u.apply(ctx, p, req, resp)
+		return u.apply(ctx, p, caller, req, resp)
 	default:
 		return u.finalize(ctx, resp)
 	}
+}
+
+// checkFence reads the committed fence and checks req against it.
+func (u *upgradeNode) checkFence(ctx context.Context, caller string, req UpgradeStepRequest) (UpgradeFence, error) {
+	if u.fence == nil {
+		return UpgradeFence{}, stepErr(http.StatusServiceUnavailable, upgradeCodeRetry, "the node cannot read the rollout yet")
+	}
+	fence, err := u.fence(ctx, req.RolloutID)
+	if err != nil {
+		var se *UpgradeStepError
+		if errors.As(err, &se) {
+			return fence, err
+		}
+		return fence, stepErr(http.StatusServiceUnavailable, upgradeCodeRetry, "read the committed rollout: %v", err)
+	}
+	return fence, checkUpgradeFence(caller, u.nodeID, req, fence)
 }
 
 func (u *upgradeNode) stage(ctx context.Context, p nodeupgrade.Paths, req UpgradeStepRequest, resp UpgradeStepResponse) (UpgradeStepResponse, error) {
@@ -441,7 +454,7 @@ func (u *upgradeNode) stage(ctx context.Context, p nodeupgrade.Paths, req Upgrad
 	return resp, nil
 }
 
-func (u *upgradeNode) apply(ctx context.Context, p nodeupgrade.Paths, req UpgradeStepRequest, resp UpgradeStepResponse) (UpgradeStepResponse, error) {
+func (u *upgradeNode) apply(ctx context.Context, p nodeupgrade.Paths, caller string, req UpgradeStepRequest, resp UpgradeStepResponse) (UpgradeStepResponse, error) {
 	resp.Op = req.Op
 	if version.Version == req.Version {
 		resp.State = UpgradeNodeDone
@@ -503,6 +516,13 @@ func (u *upgradeNode) apply(ctx context.Context, p nodeupgrade.Paths, req Upgrad
 		// Launched by an earlier call whose answer was lost.
 		resp.State = UpgradeNodeStarted
 		return resp, nil
+	}
+	// The fence again, right before the launch: the files may have taken up
+	// to materializeTimeout to arrive, and a stop, a rollback or a new
+	// leader that landed meanwhile must stop this restart. After the launch
+	// only the upgrader's own result ends it.
+	if _, err := u.checkFence(lctx, caller, req); err != nil {
+		return resp, err
 	}
 	op, err := u.launch(lctx, u.host, p.Sandboxd, nreq)
 	if err != nil {

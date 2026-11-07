@@ -347,11 +347,26 @@ var nodeStateTable = []nodeStateRow{
 	{From: upgradewire.NodeFailed, To: []string{upgradewire.NodePending}},
 }
 
-// nodeMoveAllowed reports whether one node may move from -> to. Staying in
-// a state is always allowed (a retried write).
-func nodeMoveAllowed(from, to string) bool {
+// restartStates are the rollout states that start node restarts: the walk
+// runs in them (running, rolling-back, and done while it catches up a node
+// that came back). Staging restarts nothing yet, and stop, a pause and a
+// failure start no new restart (§6.6). The FSM refuses a move to upgrading
+// outside them, and a node refuses an apply step outside them
+// (checkUpgradeFence), so a stop that lands while a restart is being
+// started stops it; one already launched is followed to its result.
+var restartStates = []string{upgradewire.StateRunning, upgradewire.StateRollingBack, upgradewire.StateDone}
+
+func rolloutStartsRestarts(state string) bool { return containsState(restartStates, state) }
+
+// nodeMoveAllowed reports whether one node may move from -> to while the
+// rollout is in state. Staying in a state is always allowed (a retried
+// write).
+func nodeMoveAllowed(state, from, to string) bool {
 	if from == to {
 		return true
+	}
+	if to == upgradewire.NodeUpgrading && !rolloutStartsRestarts(state) {
+		return false
 	}
 	for _, row := range nodeStateTable {
 		if row.From != from {

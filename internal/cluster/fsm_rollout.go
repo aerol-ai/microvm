@@ -417,8 +417,8 @@ func (f *placementFSM) applyRolloutNodeLocked(cmd command) (any, error) {
 			return rolloutApplyResult{Verdict: refusedIn(next.State, fmt.Sprintf("node %s is %s, not %s", in.NodeID, n.State, in.ExpectState), ""), Rollout: cloneRollout(cur)}, nil
 		}
 		if in.State != "" {
-			if !nodeMoveAllowed(n.State, in.State) {
-				return rolloutApplyResult{Verdict: refusedIn(next.State, fmt.Sprintf("node %s cannot move from %s to %s", in.NodeID, n.State, in.State), ""), Rollout: cloneRollout(cur)}, nil
+			if !nodeMoveAllowed(next.State, n.State, in.State) {
+				return rolloutApplyResult{Verdict: refusedIn(next.State, fmt.Sprintf("node %s cannot move from %s to %s while the rollout is %s", in.NodeID, n.State, in.State, next.State), ""), Rollout: cloneRollout(cur)}, nil
 			}
 			n.State = in.State
 		}

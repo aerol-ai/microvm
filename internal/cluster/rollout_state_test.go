@@ -224,22 +224,33 @@ func TestNodeStateTableEveryRow(t *testing.T) {
 	for _, row := range nodeStateTable {
 		for _, to := range row.To {
 			allowed[row.From+">"+to] = true
-			if !nodeMoveAllowed(row.From, to) {
+			if !nodeMoveAllowed(upgradewire.StateRunning, row.From, to) {
 				t.Fatalf("%s -> %s is in the table but refused", row.From, to)
 			}
 		}
 	}
-	for _, from := range all {
-		for _, to := range all {
-			got := nodeMoveAllowed(from, to)
-			want := from == to || allowed[from+">"+to]
-			if got != want {
-				t.Fatalf("nodeMoveAllowed(%s, %s) = %v, want %v", from, to, got, want)
+	for _, state := range allRolloutStates {
+		for _, from := range all {
+			for _, to := range all {
+				got := nodeMoveAllowed(state, from, to)
+				want := from == to || allowed[from+">"+to]
+				// R12: a restart starts only while the rollout starts them.
+				if from != to && to == upgradewire.NodeUpgrading && !containsState(restartStates, state) {
+					want = false
+				}
+				if got != want {
+					t.Fatalf("nodeMoveAllowed(%q, %s, %s) = %v, want %v", state, from, to, got, want)
+				}
 			}
 		}
 	}
+	for _, state := range []string{upgradewire.StateStaging, upgradewire.StateStopped, upgradewire.StatePaused, upgradewire.StateFailed, upgradewire.StateFinalizing} {
+		if nodeMoveAllowed(state, upgradewire.NodeStaged, upgradewire.NodeUpgrading) || rolloutStartsRestarts(state) {
+			t.Fatalf("a %s rollout starts a restart", state)
+		}
+	}
 	// done is final for the per-node writes; only a rollout event resets it.
-	if nodeMoveAllowed(upgradewire.NodeDone, upgradewire.NodePending) || nodeMoveAllowed(upgradewire.NodeDone, upgradewire.NodeFailed) {
+	if nodeMoveAllowed(upgradewire.StateRunning, upgradewire.NodeDone, upgradewire.NodePending) || nodeMoveAllowed(upgradewire.StateRunning, upgradewire.NodeDone, upgradewire.NodeFailed) {
 		t.Fatal("a node write moved a done node")
 	}
 }

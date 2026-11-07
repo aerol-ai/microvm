@@ -30,12 +30,16 @@ func TestReconcileDeadOwnersSkipsUpgradingNodeUntilDeadline(t *testing.T) {
 	if err := c.raft.raft.Apply(payload, 2*time.Second).Error(); err != nil {
 		t.Fatal(err)
 	}
-	deadline := time.Now().Add(400 * time.Millisecond)
-	rec := newTestRollout("r1", "v2", &RolloutNodeRecord{NodeID: "wkr", Tier: rolloutTierWorker, State: upgradewire.NodePending})
+	rec := newTestRollout("r1", "v2", &RolloutNodeRecord{NodeID: "wkr", Tier: rolloutTierWorker, State: upgradewire.NodeStaged})
 	if _, err := c.proposeRolloutCommand(ctx, RolloutCommand{Event: evApply, New: rec, Target: "v2"}); err != nil {
 		t.Fatal(err)
 	}
-	if res, err := c.proposeRolloutNode(ctx, RolloutNodeUpdate{RolloutID: "r1", NodeID: "wkr", State: upgradewire.NodeUpgrading, Op: "op", DeadlineUnixNano: deadline.UnixNano()}); err != nil || !res.Changed {
+	// Restarts start only once the rollout runs.
+	if res, err := c.proposeRolloutCommand(ctx, RolloutCommand{Event: evAllStaged, RolloutID: "r1"}); err != nil || res.Rollout.State != upgradewire.StateRunning {
+		t.Fatalf("all staged = %+v %v", res, err)
+	}
+	deadline := time.Now().Add(400 * time.Millisecond)
+	if res, err := c.proposeRolloutNode(ctx, RolloutNodeUpdate{RolloutID: "r1", NodeID: "wkr", State: upgradewire.NodeUpgrading, Op: "r1-u0", DeadlineUnixNano: deadline.UnixNano()}); err != nil || !res.Changed {
 		t.Fatalf("mark upgrading = %+v %v", res, err)
 	}
 	c.deadOwners.markDead("wkr", time.Now())
