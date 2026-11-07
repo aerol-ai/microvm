@@ -50,7 +50,10 @@
 //     (a create, a failover recreate on another node, a WASM migration)
 //     starts with a not-before of its creation, so a token from before it
 //     never reaches it: not a token for a deleted sandbox whose id was
-//     reused, nor one revoked on an owner that then died.
+//     reused, nor one revoked on an owner that then died. A node that
+//     takes a placement back and reuses the row it kept from before raises
+//     that row to the takeover's time, so a token revoked on the owner in
+//     between stays refused there too.
 //   - Replay inside the lifetime is by design: it is a bearer token, like a
 //     signed URL. It travels only over HTTPS (A2 refuses token visibility
 //     without a domain) and is never forwarded into the sandbox: the toolbox

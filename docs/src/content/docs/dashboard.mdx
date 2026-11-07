@@ -179,6 +179,8 @@ These counters show what happens to sandboxes over time. Each one has a `key` la
 
 A rise in `crashed` or `out_of_memory` stops together with `restarted` starts means sandboxes are crashing over and over. The D2 Capability Matrix dashboard in [`setup/grafana`](https://github.com/aerol-ai/microvm/tree/main/setup/grafana) has a panel with all four counters.
 
+`aerolvm_sandbox_events_dropped_total` has no labels. It counts runtime events the server dropped because one sandbox already had 64 events waiting. That only happens while a long step, such as a restart, holds the sandbox. The server then drops that sandbox's oldest waiting event, so other sandboxes' events keep moving. The next reconcile pass reads the runtime and fixes the sandbox's status. A value above `0` means one sandbox sent a flood of events; the server log names it.
+
 ## Profile the server with pprof
 
 pprof is Go's built-in profiler. It shows where the server spends its CPU time, what holds its memory, and what each goroutine (a lightweight Go thread) is doing. It is off by default.

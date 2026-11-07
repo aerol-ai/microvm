@@ -398,9 +398,21 @@ type Placement struct {
 	OwnerState          PlacementOwnerState `json:"owner_state,omitempty"`
 	OrphanedOwnerNodeID string              `json:"orphaned_owner_node_id,omitempty"`
 	OrphanedUnix        int64               `json:"orphaned_unix,omitempty"`
-	Version             uint64              `json:"version"`
-	CreatedUnix         int64               `json:"created_unix"`
-	UpdatedUnix         int64               `json:"updated_unix"`
+	// OwnerSinceUnixNano is when OwnerNodeID took the placement over from
+	// another node: the leader's append time (raft.Log.AppendedAt) of the
+	// entry that moved it, never a clock read in apply, so every replica and
+	// every replay computes the same value. 0 means no takeover is known: the
+	// placement still has the owner it was created (reserved or placed)
+	// with, the entry carried no append time, or an older build applied it.
+	// Orphaning, and a claim back by the node it was orphaned from, keep the
+	// value, as no other node owned the sandbox in between. The owner reads
+	// it when it reuses a local row from an earlier ownership, to refuse the
+	// sandbox tokens issued before the takeover (another node may have
+	// revoked them): Service.RecreateSandboxReport.
+	OwnerSinceUnixNano int64  `json:"owner_since_unix_nano,omitempty"`
+	Version            uint64 `json:"version"`
+	CreatedUnix        int64  `json:"created_unix"`
+	UpdatedUnix        int64  `json:"updated_unix"`
 	// Name is the small, hot copy of Spec.Name used to rebuild the cluster-wide
 	// uniqueness index without loading the larger recovery spec payload.
 	Name string `json:"name,omitempty"`
@@ -635,8 +647,14 @@ type SandboxRecreator interface {
 // no-op where the sandbox and its replicated routes were already present.
 // Failures always report attempted=true so retry/error metrics retain the
 // signal that drives stuck-placement reassignment.
+//
+// ownerSinceUnixNano is the placement's OwnerSinceUnixNano, handed over from
+// the row the watcher already read: an owner that finds a local row from an
+// earlier ownership refuses the sandbox tokens issued before it took the
+// placement back. Reading the placement again in the service instead would
+// cost a worker one control-plane round trip per owned sandbox per tick.
 type SandboxRecreateReporter interface {
-	RecreateSandboxReport(ctx context.Context, id string, spec models.CreateSandboxRequest, secrets PlacementSecrets, exposedPorts map[int]ExposedPortRoute) (attempted bool, err error)
+	RecreateSandboxReport(ctx context.Context, id string, spec models.CreateSandboxRequest, secrets PlacementSecrets, exposedPorts map[int]ExposedPortRoute, ownerSinceUnixNano int64) (attempted bool, err error)
 }
 
 // Client is the surface the rest of the daemon (Service, API handlers)

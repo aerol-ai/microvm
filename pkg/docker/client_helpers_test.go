@@ -94,18 +94,20 @@ func TestClientHelperFunctions(t *testing.T) {
 		}
 		running := containerInspect{}
 		running.State = &struct {
-			Running bool   "json:\"Running\""
-			Status  string "json:\"Status\""
-			Pid     int    "json:\"Pid\""
+			Running   bool   "json:\"Running\""
+			Status    string "json:\"Status\""
+			Pid       int    "json:\"Pid\""
+			StartedAt string "json:\"StartedAt\""
 		}{Running: true, Status: "running"}
 		if got := containerStatus(running); got != models.SandboxStatusStarted {
 			t.Fatalf("running status = %q", got)
 		}
 		exited := containerInspect{}
 		exited.State = &struct {
-			Running bool   "json:\"Running\""
-			Status  string "json:\"Status\""
-			Pid     int    "json:\"Pid\""
+			Running   bool   "json:\"Running\""
+			Status    string "json:\"Status\""
+			Pid       int    "json:\"Pid\""
+			StartedAt string "json:\"StartedAt\""
 		}{Running: false, Status: "exited"}
 		if got := containerStatus(exited); got != models.SandboxStatusStopped {
 			t.Fatalf("exited status = %q", got)

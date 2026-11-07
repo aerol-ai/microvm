@@ -1650,7 +1650,24 @@ func (c *Client) waitForRuntime(ctx context.Context, containerRef string) (*Sand
 		ContainerID: inspect.ID,
 		ContainerIP: containerIP,
 		Status:      models.SandboxStatusStarted,
+		// The inspect that saw it running: the run this start began, or
+		// the one already running when there was nothing to start.
+		StartedAt: runStartedAt(inspect),
 	}, nil
+}
+
+// runStartedAt is the inspected container's run start
+// (SandboxRuntimeState.StartedAt), or zero when Docker gives none it can
+// read; "0001-01-01T00:00:00Z" (never started) is zero too.
+func runStartedAt(inspect containerInspect) time.Time {
+	if inspect.State == nil {
+		return time.Time{}
+	}
+	at, err := time.Parse(time.RFC3339Nano, inspect.State.StartedAt)
+	if err != nil {
+		return time.Time{}
+	}
+	return at.UTC()
 }
 
 func (c *Client) waitForContainerRunning(ctx context.Context, containerRef string) (string, containerInspect, error) {
@@ -1961,6 +1978,11 @@ type containerInspect struct {
 		Running bool   `json:"Running"`
 		Status  string `json:"Status"`
 		Pid     int    `json:"Pid"`
+		// StartedAt is when the daemon began the current (or last) run,
+		// on the clock its events carry (RFC 3339, nanoseconds). A string,
+		// so a value nobody expected costs only this field (runStartedAt),
+		// never the whole inspect.
+		StartedAt string `json:"StartedAt"`
 	} `json:"State"`
 	NetworkSettings struct {
 		Networks map[string]struct {

@@ -1,8 +1,10 @@
 package service
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"path/filepath"
 	"strings"
@@ -258,7 +260,7 @@ func TestFailoverRecreateRefusesTokensFromBefore(t *testing.T) {
 	}
 
 	setSandboxTokenClock(t, base.Add(30*time.Second))
-	if _, err := svc.RecreateSandboxReport(ctx, id, spec, cluster.PlacementSecrets{}, nil); err != nil {
+	if _, err := svc.RecreateSandboxReport(ctx, id, spec, cluster.PlacementSecrets{}, nil, 0); err != nil {
 		t.Fatalf("a later watcher tick: %v", err)
 	}
 	if row, _ := st.Get(ctx, id); row.TokensNotBefore != base.Unix()+1 {
@@ -293,5 +295,246 @@ func TestWasmFailoverRecreateSetsTokensNotBefore(t *testing.T) {
 	}
 	if row, err := st.Get(ctx, "sb-wasm-tok"); err != nil || row.TokensNotBefore != base.Unix()+1 {
 		t.Fatalf("recreated WASM row not-before = %v, %v; want %d", row, err, base.Unix()+1)
+	}
+}
+
+// signedClaimsAt signs a token for id issued at iat with the shared server
+// key, as any owner would have, and verifies it as the API edge does.
+func signedClaimsAt(t *testing.T, svc *Service, id string, iat int64, n int) sandboxtoken.Claims {
+	t.Helper()
+	raw, _, err := sandboxtoken.Sign(svc.cipher, sandboxtoken.Claims{
+		TokenID: fmt.Sprintf("stk_%032d", n), SandboxID: id,
+		IssuedAt: iat, ExpiresAt: iat + 3600,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := svc.VerifySandboxToken(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return c
+}
+
+// Failback: A owns the sandbox, it fails over to B (B recreates it in a new
+// row), the user revokes its tokens on B, and the placement comes back to A,
+// which still holds its old row. The owner watcher reuses that row rather
+// than recreating it, so on its own the row's old not-before would let the
+// tokens revoked on B in again. The placement's takeover time raises it on
+// the first tick, once: a token from before the takeover is refused, one
+// issued after works, and later ticks write nothing.
+func TestFailbackRefusesTokensFromBeforeTheTakeover(t *testing.T) {
+	base := time.Unix(1_800_000_000, 0)
+	setSandboxTokenClock(t, base)
+	svc, st, _ := newServiceRuntimeHarness(t, &recordingRuntime{})
+	var logs bytes.Buffer
+	svc.logger = slog.New(slog.NewTextHandler(&logs, nil))
+	ctx := context.Background()
+	const id = "sb-failback-tok"
+	spec := models.CreateSandboxRequest{Image: "alpine:3.20"}
+
+	// A's row, from A's first ownership.
+	if err := svc.RecreateSandbox(ctx, id, spec, cluster.PlacementSecrets{}, nil); err != nil {
+		t.Fatalf("RecreateSandbox: %v", err)
+	}
+	onA := signedClaimsAt(t, svc, id, base.Unix()+10, 1)
+	// Issued on B after its failover recreate; the user's revoke on B
+	// (base+30) refuses it there.
+	revokedOnB := signedClaimsAt(t, svc, id, base.Unix()+25, 2)
+	toolbox := func(c sandboxtoken.Claims) error {
+		_, err := svc.EnsureSandboxAwakeForHTTP(sandboxTokenCtx(c), id)
+		return err
+	}
+	// The gap: A's old row still admits the token B revoked.
+	if err := toolbox(revokedOnB); err != nil {
+		t.Fatalf("before the tick A's row should still hold its old not-before: %v", err)
+	}
+
+	// The placement returns to A at base+40.5 (the reassign entry's append
+	// time); the watcher's next tick runs at base+45.
+	ownerSince := base.Add(40*time.Second + 500*time.Millisecond).UnixNano()
+	setSandboxTokenClock(t, base.Add(45*time.Second))
+	genBefore := svc.warmGen.Load()
+	if attempted, err := svc.RecreateSandboxReport(ctx, id, spec, cluster.PlacementSecrets{}, nil, ownerSince); err != nil || attempted {
+		t.Fatalf("first tick after the takeover = %v, %v; want a quiet success", attempted, err)
+	}
+	want := base.Unix() + 41
+	if row, err := st.Get(ctx, id); err != nil || row.TokensNotBefore != want {
+		t.Fatalf("not-before after the takeover = %d, %v; want %d", row.TokensNotBefore, err, want)
+	}
+	if svc.warmGen.Load() == genBefore {
+		t.Fatal("the raise left a gated port's warm entry in place")
+	}
+	for name, c := range map[string]sandboxtoken.Claims{"revoked on B": revokedOnB, "issued on A before the failover": onA} {
+		if err := toolbox(c); !errors.Is(err, ErrSandboxTokenRevoked) {
+			t.Fatalf("a token %s: %v, want ErrSandboxTokenRevoked", name, err)
+		}
+	}
+	setSandboxTokenClock(t, base.Add(46*time.Second))
+	fresh := issueClaims(t, svc, ctx, id, models.CreateSandboxTokenRequest{ExpiresIn: "10m"})
+	if err := toolbox(fresh); err != nil {
+		t.Fatalf("a token issued after the takeover: %v", err)
+	}
+
+	// Later ticks: the row is no longer older, so nothing is written.
+	for _, at := range []time.Duration{50 * time.Second, 55 * time.Second} {
+		setSandboxTokenClock(t, base.Add(at))
+		if _, err := svc.RecreateSandboxReport(ctx, id, spec, cluster.PlacementSecrets{}, nil, ownerSince); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if row, _ := st.Get(ctx, id); row.TokensNotBefore != want {
+		t.Fatalf("a later tick moved the not-before to %d", row.TokensNotBefore)
+	}
+	if n := strings.Count(logs.String(), "sandbox tokens from before the owner takeover refused"); n != 1 {
+		t.Fatalf("raised %d times over three ticks, want once:\n%s", n, logs.String())
+	}
+	if err := toolbox(fresh); err != nil {
+		t.Fatalf("a later tick refused a token issued after the takeover: %v", err)
+	}
+}
+
+// The rows the raise must leave alone: a sandbox that never changed owner
+// (the FSM leaves its first owner at 0), a row created after the takeover
+// (the new owner recreated it, so its own not-before is later), and cluster
+// mode off, where no placement exists and the only callers pass 0.
+func TestTakeoverLeavesOtherRowsAlone(t *testing.T) {
+	base := time.Unix(1_800_000_000, 0)
+	for _, tc := range []struct {
+		name     string
+		recreate func(*Service, context.Context, string, models.CreateSandboxRequest) error
+	}{
+		{"never changed owner", func(svc *Service, ctx context.Context, id string, spec models.CreateSandboxRequest) error {
+			_, err := svc.RecreateSandboxReport(ctx, id, spec, cluster.PlacementSecrets{}, nil, 0)
+			return err
+		}},
+		{"row created after the takeover", func(svc *Service, ctx context.Context, id string, spec models.CreateSandboxRequest) error {
+			_, err := svc.RecreateSandboxReport(ctx, id, spec, cluster.PlacementSecrets{}, nil, base.Add(-time.Minute).UnixNano())
+			return err
+		}},
+		{"cluster mode off", func(svc *Service, ctx context.Context, id string, spec models.CreateSandboxRequest) error {
+			return svc.RecreateSandbox(ctx, id, spec, cluster.PlacementSecrets{}, nil)
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			setSandboxTokenClock(t, base)
+			svc, st, _ := newServiceRuntimeHarness(t, &recordingRuntime{})
+			ctx := context.Background()
+			const id = "sb-takeover-alone"
+			spec := models.CreateSandboxRequest{Image: "alpine:3.20"}
+			if err := svc.RecreateSandbox(ctx, id, spec, cluster.PlacementSecrets{}, nil); err != nil {
+				t.Fatal(err)
+			}
+			setSandboxTokenClock(t, base.Add(10*time.Second))
+			tok := issueClaims(t, svc, ctx, id, models.CreateSandboxTokenRequest{ExpiresIn: "10m"})
+			setSandboxTokenClock(t, base.Add(30*time.Second))
+			if err := tc.recreate(svc, ctx, id, spec); err != nil {
+				t.Fatal(err)
+			}
+			if row, _ := st.Get(ctx, id); row.TokensNotBefore != base.Unix()+1 {
+				t.Fatalf("not-before moved to %d, want %d", row.TokensNotBefore, base.Unix()+1)
+			}
+			if _, err := svc.EnsureSandboxAwakeForHTTP(sandboxTokenCtx(tok), id); err != nil {
+				t.Fatalf("a token the raise had no reason to refuse: %v", err)
+			}
+		})
+	}
+}
+
+// wasmFailbackService is a cluster-mode service holding a durable WASM
+// sandbox's row from a recreate at the current token clock, with its store
+// at path so a test can break it.
+func wasmFailbackService(t *testing.T, path string) (*Service, *store.Store, models.CreateSandboxRequest, cluster.PlacementSecrets) {
+	t.Helper()
+	remoteSnap := filepath.Join(t.TempDir(), "remote-mem.snap")
+	seedWasmSnapshot(t, remoteSnap, "gen-failback-1")
+	st, err := store.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	rt := &fakeWasmRecreateRuntime{}
+	svc := New(config.Config{EnableWasm: true, WasmModulesDir: t.TempDir(), EnableCluster: true}, slog.Default(), st, rt, nil, nil, nil, nil, nil)
+	svc.SetWasmRuntime(rt)
+	svc.AttachWasmCheckpointPusher(&fakeWasmCheckpointStore{pullSrc: remoteSnap})
+	spec := models.CreateSandboxRequest{Runtime: models.RuntimeWasm, Durability: models.DurabilityDurable, ModuleRef: "file:///tmp/demo.wasm"}
+	secrets := cluster.PlacementSecrets{IncarnationID: "inc-sb-wasm-failback"}
+	if err := svc.RecreateSandbox(context.Background(), "sb-wasm-failback", spec, secrets, nil); err != nil {
+		t.Fatalf("RecreateSandbox: %v", err)
+	}
+	return svc, st, spec, secrets
+}
+
+// A durable WASM sandbox has its own recreate path with the same reuse of a
+// local row from the same lifetime, and gets the same raise.
+func TestWasmFailbackRefusesTokensFromBeforeTheTakeover(t *testing.T) {
+	base := time.Unix(1_800_000_000, 0)
+	setSandboxTokenClock(t, base)
+	ctx := context.Background()
+	svc, st, spec, secrets := wasmFailbackService(t, filepath.Join(t.TempDir(), "test.db"))
+
+	setSandboxTokenClock(t, base.Add(100*time.Second))
+	ownerSince := base.Add(90 * time.Second).UnixNano()
+	if _, err := svc.RecreateSandboxReport(ctx, "sb-wasm-failback", spec, secrets, nil, ownerSince); err != nil {
+		t.Fatalf("tick after the takeover: %v", err)
+	}
+	row, err := st.Get(ctx, "sb-wasm-failback")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row.TokensNotBefore != base.Unix()+91 {
+		t.Fatalf("WASM row not-before = %d, want %d", row.TokensNotBefore, base.Unix()+91)
+	}
+}
+
+// A raise that cannot be written fails the tick (attempted, with the
+// error), so the watcher retries it rather than counting a reused row that
+// still admits the revoked tokens as healthy. Both reuse paths.
+func TestTakeoverRaiseFailureFailsTheTick(t *testing.T) {
+	base := time.Unix(1_800_000_000, 0)
+	ownerSince := base.Add(40 * time.Second).UnixNano()
+	for _, tc := range []struct {
+		name string
+		tick func(t *testing.T, path string) (*store.Store, string, func() (bool, error))
+	}{
+		{"container row", func(t *testing.T, path string) (*store.Store, string, func() (bool, error)) {
+			svc, st, _ := newServiceRuntimeHarnessAtPath(t, path, &recordingRuntime{})
+			spec := models.CreateSandboxRequest{Image: "alpine:3.20"}
+			if err := svc.RecreateSandbox(context.Background(), "sb-raise-fail", spec, cluster.PlacementSecrets{}, nil); err != nil {
+				t.Fatal(err)
+			}
+			return st, "sb-raise-fail", func() (bool, error) {
+				return svc.RecreateSandboxReport(context.Background(), "sb-raise-fail", spec, cluster.PlacementSecrets{}, nil, ownerSince)
+			}
+		}},
+		{"durable WASM row", func(t *testing.T, path string) (*store.Store, string, func() (bool, error)) {
+			svc, st, spec, secrets := wasmFailbackService(t, path)
+			return st, "sb-wasm-failback", func() (bool, error) {
+				return svc.RecreateSandboxReport(context.Background(), "sb-wasm-failback", spec, secrets, nil, ownerSince)
+			}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			setSandboxTokenClock(t, base)
+			path := filepath.Join(t.TempDir(), "state.db")
+			st, id, tick := tc.tick(t, path)
+			cb96SQL(t, path, `CREATE TRIGGER failback_raise BEFORE UPDATE OF tokens_not_before ON sandboxes BEGIN SELECT RAISE(ABORT, 'failback raise'); END`)
+			setSandboxTokenClock(t, base.Add(45*time.Second))
+			attempted, err := tick()
+			if err == nil || !attempted || !strings.Contains(err.Error(), "refuse sandbox tokens from before the takeover") {
+				t.Fatalf("tick with a failing raise = %v, %v; want an attempted failure", attempted, err)
+			}
+			cb96SQL(t, path, `DROP TRIGGER failback_raise`)
+			if _, err := tick(); err != nil {
+				t.Fatalf("the retry: %v", err)
+			}
+			row, err := st.Get(context.Background(), id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if row.TokensNotBefore != base.Unix()+41 {
+				t.Fatalf("not-before after the retry = %d, want %d", row.TokensNotBefore, base.Unix()+41)
+			}
+		})
 	}
 }
