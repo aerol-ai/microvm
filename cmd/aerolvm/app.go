@@ -47,6 +47,10 @@ type app struct {
 	// conn is the connection the command's tools use, so a refused token
 	// can be named in the error.
 	conn *connection
+	// contextName is the --context the running verb was given (contexts.go).
+	contextName string
+	// pollEvery is how often drain re-reads the node; zero means 2s.
+	pollEvery time.Duration
 }
 
 func newApp() *app {
@@ -99,12 +103,20 @@ func (a *app) verbGroups() []verbGroup {
 		}},
 		{"Manage sandboxes", []verb{
 			{"list", "List sandboxes", listHelp, runList},
-			{"get", "Show one sandbox", getHelp, runGet},
+			{"get", "Show one sandbox, or list nodes: get nodes", getHelp, runGet},
 			{"create", "Create a sandbox, or return the existing one with that name", createHelp, runCreate},
 			{"start", "Start stopped sandboxes", startHelp, runStart},
 			{"stop", "Stop sandboxes (files are kept)", stopHelp, runStop},
 			{"destroy", "Destroy sandboxes", destroyHelp, runDestroy},
 			{"snapshot", "Snapshot a sandbox as a reusable image", snapshotHelp, runSnapshot},
+		}},
+		{"Cluster", []verb{
+			{"describe", "Show one node in detail", describeHelp, runDescribe},
+			{"cordon", "Stop new sandboxes landing on a node", cordonHelp, runCordon},
+			{"uncordon", "Let new sandboxes land on a node again", uncordonHelp, runUncordon},
+			{"drain", "Cordon a node and wait until it runs no sandboxes", drainHelp, runDrain},
+			{"delete", "Delete a node from the cluster", deleteHelp, runDelete},
+			{"cluster-info", "Show the leader, members and cluster version", clusterInfoHelp, runClusterInfo},
 		}},
 		{"Audit", []verb{
 			{"audit", "Verify or search nodes' audit logs", auditHelp, runAudit},
@@ -119,7 +131,8 @@ func (a *app) verbGroups() []verbGroup {
 			{"login", "Save the sandboxd URL and token for every command", loginHelp, runLogin},
 			{"logout", "Forget the saved login", logoutHelp, runLogout},
 			{"health", "Check that sandboxd is reachable and the token works", healthHelp, runHealth},
-			{"version", "Print the aerolvm version", versionHelp, runVersion},
+			{"version", "Print the aerolvm and sandboxd versions", versionHelp, runVersion},
+			{"config", "List and switch saved contexts (clusters)", configHelp, runConfig},
 			{"mcp", "Run the MCP server over stdio, or print client setup", mcpHelp, runMCP},
 		}},
 	}
@@ -151,7 +164,8 @@ func (a *app) run(ctx context.Context, args []string) int {
 		fmt.Fprint(a.stdout, a.overview())
 		return exitOK
 	case "--version":
-		return runVersion(ctx, a, nil)
+		fmt.Fprintln(a.stdout, versionString())
+		return exitOK
 	}
 	for _, v := range a.verbs() {
 		if v.name == args[0] {
@@ -177,7 +191,7 @@ func (a *app) overview() string {
 	for _, g := range a.verbGroups() {
 		fmt.Fprintf(&b, "\n%s:\n", g.title)
 		for _, v := range g.verbs {
-			fmt.Fprintf(&b, "  %-9s %s\n", v.name, v.summary)
+			fmt.Fprintf(&b, "  %-12s %s\n", v.name, v.summary)
 		}
 	}
 	b.WriteString(overviewTail)
@@ -186,8 +200,9 @@ func (a *app) overview() string {
 
 // commonFlags are on every verb.
 type commonFlags struct {
-	json  bool
-	debug bool
+	json    bool
+	debug   bool
+	context string
 }
 
 func (a *app) newFlagSet(name string) (*flag.FlagSet, *commonFlags) {
@@ -197,6 +212,7 @@ func (a *app) newFlagSet(name string) (*flag.FlagSet, *commonFlags) {
 	jsonDefault := strings.EqualFold(strings.TrimSpace(a.getenv("AEROLVM_OUTPUT")), "json")
 	fs.BoolVar(&c.json, "json", jsonDefault, "print JSON on stdout (default when AEROLVM_OUTPUT=json)")
 	fs.BoolVar(&c.debug, "debug", false, "log API requests to stderr (the token is redacted)")
+	fs.StringVar(&c.context, "context", "", "the saved context to use (aerolvm config get-contexts)")
 	return fs, c
 }
 
@@ -287,6 +303,9 @@ func (a *app) note(format string, args ...any) {
 // counting on it would send tokens some nodes already refuse. DR15's
 // refresh-failure line is for a token that has expired.
 func (a *app) prepare(ctx context.Context, c *commonFlags) (connection, error) {
+	if c != nil {
+		a.contextName = c.context
+	}
 	conn, err := a.connection()
 	if err != nil {
 		return connection{}, err

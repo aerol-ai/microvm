@@ -356,7 +356,7 @@ jobs:
 
       - name: Check the linux_amd64 build reports the release version
         run: |
-          got="$(dist/aerolvm_linux_amd64 version)"
+          got="$(dist/aerolvm_linux_amd64 --version)"
           if [[ "$got" != "$VERSION" ]]; then
             echo "::error::aerolvm version printed '$got', want '$VERSION'"
             exit 1

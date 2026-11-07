@@ -459,8 +459,10 @@ func TestNPMLauncher(t *testing.T) {
 		}
 		return out.String(), errb.String(), 0
 	}
-	if out, _, code := run("version"); code != 0 || strings.TrimSpace(out) != "v1.2.3" {
-		t.Fatalf("version through the launcher = %q, exit %d", out, code)
+	// --version is the bare client version; `version` also asks the
+	// server, which this test has none of.
+	if out, _, code := run("--version"); code != 0 || strings.TrimSpace(out) != "v1.2.3" {
+		t.Fatalf("--version through the launcher = %q, exit %d", out, code)
 	}
 	if out, _, code := run("no-such-verb"); code != exitUsage || out != "" {
 		t.Fatalf("usage error through the launcher: stdout %q, exit %d; want nothing and %d", out, code, exitUsage)

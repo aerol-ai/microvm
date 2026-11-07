@@ -1,0 +1,8 @@
+exit 0
+--- stdout
+NAME    ROLE     STATUS                     VERSION   SANDBOXES
+old-1   mixed    Ready                      -         -
+srv-a   server   Ready,Leader               v0.6.12   -
+wkr-1   worker   Ready,SchedulingDisabled   v0.6.12   2
+wkr-2   worker   NotReady                   v0.6.11   -
+--- stderr

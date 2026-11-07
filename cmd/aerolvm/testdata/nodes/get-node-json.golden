@@ -1,0 +1,30 @@
+exit 0
+--- stdout
+{
+  "alive": true,
+  "api_url": "https://wkr-1:21212",
+  "capacity": {
+    "cpu_budget": 8,
+    "host_cpu_cores": 8,
+    "host_memory_total_mb": 8192,
+    "memory_budget_mb": 4096,
+    "parked_slots": 1,
+    "reserved_cpu": 2,
+    "reserved_memory_mb": 1024,
+    "sandboxes_active": 3
+  },
+  "data_plane_host": "10.0.0.11",
+  "drained": true,
+  "fsm_ops_version": 11,
+  "internal_url": "https://wkr-1:7002",
+  "labels": {
+    "gpu": "a10",
+    "zone": "az-1"
+  },
+  "node_id": "wkr-1",
+  "node_name": "worker one",
+  "role": "worker",
+  "version": "v0.6.12",
+  "zone": "az-1"
+}
+--- stderr

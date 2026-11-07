@@ -21,6 +21,7 @@ Environment (these override "aerolvm login"):
   SB_PAT_TOKEN     API token (required unless you ran "aerolvm login")
   SB_API_TOKEN     the same as SB_PAT_TOKEN; SB_PAT_TOKEN wins if both are set
   SB_TEAM          the team to act for, when your sign-in has several
+  AEROLVM_CONTEXT  the saved context to use (see "aerolvm config")
   AEROLVM_OUTPUT   set to "json" to make --json the default
 
 Output: stdout is data, stderr is everything else. With --json, errors are
@@ -107,14 +108,25 @@ Examples:
   aerolvm list --limit 20 --json
 `
 
-const getHelp = `Show one sandbox.
+const getHelp = `Show one sandbox, or list the nodes of a cluster.
 
 Usage: aerolvm get <sandbox>
+       aerolvm get nodes [<name>...] [-o wide|json|yaml|name]
 
-  --json   print the sandbox object
+After get, a kind (nodes, node or no) lists that kind; any other word is a
+sandbox, as always. A sandbox named like a kind is not reachable this way
+yet: use its ID.
 
-Example:
+Nodes show STATUS like kubectl: Ready or NotReady, plus SchedulingDisabled
+when cordoned and Leader for the Raft leader. Listing nodes needs an admin.
+
+  --json      print the sandbox object (for nodes: {"nodes":[...]})
+  -o FORMAT   nodes only: wide adds CPU, memory, zone and URL columns; json
+              and yaml print the server's objects; name prints node/<name>
+
+Examples:
   aerolvm get build-box --json
+  aerolvm get nodes -o wide
 `
 
 const execHelp = `Run a command in a sandbox and stream its output.
@@ -426,9 +438,118 @@ working on sandboxd until an operator revokes it.
 Usage: aerolvm logout [--json]
 `
 
-const versionHelp = `Print the aerolvm version.
+const versionHelp = `Print the aerolvm version and the version of the sandboxd it talks to.
 
-Usage: aerolvm version [--json]
+Usage: aerolvm version [--client] [--json]
+
+The server's version comes from the login or SB_API_URL, like any command;
+if it can't be reached, only the client's version is printed (with a
+warning) and the exit code is still 0. "aerolvm --version" prints only the
+client's version, bare.
+
+  --client   skip the server
+  --json     {"version":"<client>","client_version":"...","server_version":"...","api_url":"..."}
+`
+
+const describeHelp = `Show one node in detail: role, status, version, Raft voter and leader,
+addresses, labels, and how many sandboxes it owns and runs.
+
+Usage: aerolvm describe node <name> [-o json|yaml]
+
+"Sandboxes running" comes from the node's last capacity heartbeat; with
+none fresh it says unknown and gives the owned count as the most there
+could be. Needs an admin.
+
+Example:
+  aerolvm describe node wrk-1
+`
+
+const cordonHelp = `Stop new sandboxes landing on nodes. Sandboxes already there keep running.
+
+Usage: aerolvm cordon <name>...
+
+Prints node/<name> cordoned. Safe to repeat. Needs an admin.
+`
+
+const uncordonHelp = `Let new sandboxes land on nodes again.
+
+Usage: aerolvm uncordon <name>...
+
+Prints node/<name> uncordoned. Safe to repeat. Needs an admin.
+`
+
+const drainHelp = `Cordon a node, then wait until it runs no sandboxes.
+
+Usage: aerolvm drain <name> [--timeout 10m] [--delete-sandboxes] [--migrate]
+
+Without flags, drain waits for the node's own users to stop or destroy
+their sandboxes. It reads the node's counts each poll (GET
+/v1/cluster/nodes/{id}), so it never pages the fleet's sandbox list.
+
+Flags:
+  --timeout D          give up after D (default 10m; 0 waits forever).
+                       The node stays cordoned either way. Exit 1 on timeout.
+  --delete-sandboxes   destroy every sandbox the node owns, running or
+                       stopped, and wait until it owns none
+  --migrate            first move the node's WASM sandboxes to another ready
+                       worker with live migration
+  --json               print {"node_id","cordoned","drained","migrated","deleted"}
+
+Examples:
+  aerolvm drain wrk-2 --timeout 30m
+  aerolvm drain wrk-2 --migrate --delete-sandboxes
+`
+
+const deleteHelp = `Delete nodes from the cluster.
+
+Usage: aerolvm delete node <name>... [--force]
+
+Works for every role. A Raft server leaves the Raft configuration. A worker
+or ingress node is cordoned, its sandboxes are handed to other workers when
+they asked for failover, or else marked lost, and its ID is denied: other
+nodes refuse its calls and its gossip until it joins again as a new node.
+Drain it first; deleting a live node that still owns sandboxes needs
+--force. A node that is already gone counts as deleted (exit 0).
+
+Prints node "<name>" deleted. Needs an admin.
+
+Example:
+  aerolvm drain wrk-2 --delete-sandboxes && aerolvm delete node wrk-2
+`
+
+const clusterInfoHelp = `Show where sandboxd runs, its version, the Raft leader, the members by role,
+and the cluster version (the lowest FSM ops version a live member runs).
+
+Usage: aerolvm cluster-info [--json]
+
+Needs an admin.
+`
+
+const configHelp = `List and switch saved contexts: one login per cluster.
+
+Usage: aerolvm config get-contexts
+       aerolvm config current-context
+       aerolvm config use-context <name>
+       aerolvm config rename-context <old> <new>
+       aerolvm config delete-context <name>
+       aerolvm config view
+       aerolvm config import <file> [--name N] [--use]
+
+"aerolvm login <url> [--name N]" saves a context, named after the host
+unless --name says otherwise, and makes it current. Contexts live in
+contexts.json beside config.json; config.json always holds the current one,
+so older aerolvm versions keep working. view never prints a token. import
+reads a login file (api_url, token, optional name and team) or another
+contexts.json; it becomes current when there is none, or with --use.
+
+Every command takes --context <name>. Which login a command uses, first
+match wins: --context, then SB_PAT_TOKEN / SB_API_URL, then AEROLVM_CONTEXT,
+then the current context.
+
+Examples:
+  aerolvm login https://api.staging.example.com --name staging
+  aerolvm config use-context prod
+  aerolvm get nodes --context staging
 `
 
 const auditHelp = `Verify nodes' audit logs against the heads their S3 witness locked, or

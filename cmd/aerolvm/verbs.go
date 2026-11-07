@@ -151,9 +151,22 @@ func dash(s string) string {
 
 func runGet(ctx context.Context, a *app, args []string) int {
 	fs, c := a.newFlagSet("get")
+	var output string
+	fs.StringVar(&output, "o", "", "")
+	fs.StringVar(&output, "output", "", "")
 	pos, _, err := parseArgs(fs, args)
 	if err != nil {
 		return a.flagError(c, "get", err)
+	}
+	// A kind first ("get nodes") lists that kind; any other word is a
+	// sandbox, exactly as before kinds existed (get_compat_test.go).
+	if len(pos) > 0 {
+		if _, ok := lookupKind(pos[0]); ok {
+			return a.getKind(ctx, c, pos[1:], output)
+		}
+	}
+	if output != "" {
+		return a.usageError(c, "get", "-o is for kinds, as in `aerolvm get nodes -o wide`; for a sandbox use --json")
 	}
 	if len(pos) != 1 {
 		return a.usageError(c, "get", "expected one sandbox")
@@ -367,15 +380,34 @@ func runHealth(ctx context.Context, a *app, args []string) int {
 	return exitOK
 }
 
-func runVersion(_ context.Context, a *app, args []string) int {
+// runVersion prints the client's version and, like kubectl version, the
+// server's. "version" in --json stays the client's, as it always was. A
+// server that cannot be reached is a warning, never a failure: the client's
+// version is still known, and `aerolvm health` is the reachability check.
+func runVersion(ctx context.Context, a *app, args []string) int {
 	fs, c := a.newFlagSet("version")
+	var clientOnly bool
+	fs.BoolVar(&clientOnly, "client", false, "")
 	if _, _, err := parseArgs(fs, args); err != nil {
 		return a.flagError(c, "version", err)
 	}
+	out := map[string]string{"version": versionString(), "client_version": versionString()}
+	if !clientOnly {
+		server, apiURL, err := a.serverVersion(ctx, c)
+		switch {
+		case err == nil:
+			out["server_version"], out["api_url"] = server, apiURL
+		case apiURL != "":
+			a.note("aerolvm: couldn't read the server version from %s: %s", apiURL, agenttools.Classify(err).Message)
+		}
+	}
 	if c.json {
-		a.printJSON(map[string]string{"version": versionString()})
+		a.printJSON(out)
 		return exitOK
 	}
-	fmt.Fprintln(a.stdout, versionString())
+	fmt.Fprintf(a.stdout, "Client Version: %s\n", versionString())
+	if v, ok := out["server_version"]; ok {
+		fmt.Fprintf(a.stdout, "Server Version: %s\n", dash(v))
+	}
 	return exitOK
 }
