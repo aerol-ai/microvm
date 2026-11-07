@@ -284,6 +284,12 @@ const (
 	// servers" cannot be expressed there; separate from the hetero scenarios
 	// because these cases cost an hour and are a release gate of their own.
 	CapClusterChaos Capability = "cluster-chaos"
+	// CapOneLineJoin: every node joined with the one-line installer and a
+	// join token per role (Terraform one_line_join; plans/kubectl-style-
+	// cluster-ops.md §7), not the S3 bundle hand-off and CSR loop, and the
+	// servers sign certs with SB_CLUSTER_NODE_CERT_TTL=10m so renewal is
+	// seen in a run. Gates UC-620..625.
+	CapOneLineJoin Capability = "one-line-join"
 )
 
 // UseCase is one row of the coverage matrix.
@@ -335,7 +341,7 @@ var KnownCapabilities = map[Capability]bool{
 	CapL4ProxyProtocol: true, CapPATRotation: true,
 	CapKeyCustodyVault: true, CapKeyCustodyPKCS11: true, CapKeyCustodyKMSWrapped: true,
 	CapKeyCustodyKMSSwitch: true, CapKeyCustodySingleWrapped: true,
-	CapAPILoadBalancer: true, CapAPIListFairness: true, CapClusterChaos: true,
+	CapAPILoadBalancer: true, CapAPIListFairness: true, CapClusterChaos: true, CapOneLineJoin: true,
 }
 
 // Registry is the full use-case catalogue. Order is the matrix row order.
@@ -1113,6 +1119,13 @@ var Registry = []UseCase{
 	{ID: "UC-613", Title: "aerolvm drain --delete-sandboxes: a worker with live sandboxes ends cordoned and owning none, and its sandboxes answer 404", Requires: []Capability{CapCluster}, Implemented: true},
 	{ID: "UC-614", Title: "aerolvm delete node (DELETE /v1/cluster/nodes/{id}) removes a worker: it leaves the member list, GET node answers 404, a repeated delete exits 0, and DELETE /v1/cluster/members/{worker} still answers 404 before and after", Requires: []Capability{CapCluster}, Implemented: true},
 	{ID: "UC-615", Title: "A deleted worker cannot rejoin: its own certificate is refused on a server's internal listener with 403 \"was deleted\" (accepted before the delete), and after a sandboxd restart it stays out of the member list", Requires: []Capability{CapCluster}, Implemented: true},
+	// One-line joins, Phase 2b (plans/kubectl-style-cluster-ops.md §4, §7).
+	{ID: "UC-620", Title: "Every node joined with a token through the one-line installer: its bootstrap ran install.sh init or join, cluster.env is sandboxd's, the cert names the token's role, nothing of the two-pass join ran, servers are the only voters, and each of Terraform's per-role tokens lists the nodes of its role", Requires: []Capability{CapOneLineJoin, CapCluster}, Implemented: true},
+	{ID: "UC-621", Title: "Wrong, reused and revoked join tokens are refused: an unknown token id's cluster-info is 403, a made-up token's join is 403 token_invalid, a used single-use token is 403 token_used for another key, a revoked token's cluster-info is 403; join-command refuses --ttl 0 for servers and warns for a never-expiring worker token", Requires: []Capability{CapOneLineJoin, CapCluster}, Implemented: true},
+	{ID: "UC-622", Title: "A deleted worker can't come back with its old key (403 key_revoked, sandboxd reset named as the fix); after sandboxd reset --yes a fresh join (new key and token) brings the same node ID back as a member", Requires: []Capability{CapOneLineJoin, CapCluster}, Implemented: true},
+	{ID: "UC-623", Title: "Node certs renew themselves: with 10-minute certs a server's and a worker's cert are replaced for the same node and role within 15 minutes, with no sandboxd restart, and sandboxes still place afterwards", Requires: []Capability{CapOneLineJoin, CapCluster}, Implemented: true},
+	{ID: "UC-624", Title: "aerolvm join-command prints `curl -fsSL <installer> | sudo bash -s -- join <url> --token <t> --ca-cert-hash sha256:<h>`, and those words run as typed on a reset machine make it a worker member under its host name", Requires: []Capability{CapOneLineJoin, CapCluster}, Implemented: true},
+	{ID: "UC-625", Title: "Running a successful join again is a replay: it exits 0, says nothing changed and sandboxd keeps its PID", Requires: []Capability{CapOneLineJoin, CapCluster}, Implemented: true},
 	// Upgrades without restarting sandboxes, Phase 3a live gate for mounts
 	// (plans/kubectl-style-cluster-ops.md §6.3 step 4, §6.4;
 	// z_mount_restart_test.go).
