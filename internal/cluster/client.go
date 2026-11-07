@@ -1533,6 +1533,12 @@ func (c *Cluster) ApplyEncoded(ctx context.Context, payload []byte) error {
 		// the op past that gate, or deny another node outright.
 		return errDenyNodeNotForwardable
 	}
+	if isJoinOp(cmd.Op) {
+		// Join state is proposed only by a server's join path (join.go),
+		// after its token, role and upgrade checks; a raw forward from any
+		// peer could admit a key as a server, or skip the gate.
+		return errJoinOpNotForwardable
+	}
 	if isRawObligationReport(cmd) {
 		c.obligations.add(cmd.ObligationReports)
 		return nil

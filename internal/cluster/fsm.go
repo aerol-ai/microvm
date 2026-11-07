@@ -60,8 +60,8 @@ const (
 	// ops (fsm_tokens.go); 33/34 are the warm-pool ops (fsm_warm_pools.go);
 	// 35-37 are the identity ops (fsm_identity.go); 38/39 are the team-quota
 	// ops (fsm_team_quotas.go); 40/41 are the volume-reclaim ops
-	// (fsm_volume_reclaims.go); 42 is opDenyNode (fsm_node_deny.go). The
-	// next free code is 43.
+	// (fsm_volume_reclaims.go); 42 is opDenyNode (fsm_node_deny.go); 43-47
+	// are the join ops (fsm_join.go). The next free code is 48.
 	opRegisterSnapshotNode opCode = 29 // record which node holds a snapshot's image (name → node, cluster-wide)
 	opForgetSnapshotNode   opCode = 30 // drop a snapshot's name → node entry (on delete / node death)
 )
@@ -260,6 +260,14 @@ type command struct {
 	RefuseDeletedLifecycle bool `json:"refuse_deleted_lifecycle,omitempty"`
 	// NodeDeny carries the deleted node for opDenyNode (fsm_node_deny.go).
 	NodeDeny *NodeDenyRecord `json:"node_deny,omitempty"`
+	// JoinToken carries opPutJoinToken, JoinTokenID opDeleteJoinToken,
+	// JoinAdmit opAdmitNode, JoinAdopt opAdoptNodes and JoinRekey
+	// opRekeyNode (fsm_join.go).
+	JoinToken   *JoinTokenRecord  `json:"join_token,omitempty"`
+	JoinTokenID string            `json:"join_token_id,omitempty"`
+	JoinAdmit   *JoinAdmitCommand `json:"join_admit,omitempty"`
+	JoinAdopt   *JoinAdoptCommand `json:"join_adopt,omitempty"`
+	JoinRekey   *JoinRekeyCommand `json:"join_rekey,omitempty"`
 }
 
 type reservationCommand struct {
@@ -626,6 +634,16 @@ type placementFSM struct {
 	// deniedSet is deniedNodes' keys, published copy-on-write on every
 	// change so the hot readers (gossip, the peer authorizer) never take mu.
 	deniedSet atomic.Pointer[map[string]bool]
+	// Join state (fsm_join.go, snapshotted): join tokens by id, the one
+	// admitted key per node ID (and its reverse index) and the revoked-key
+	// tombstones. A change to the tombstones moves deniedNodesVersion too,
+	// because workers mirror them with the deny set. peerTrust is the
+	// published copy the per-request peer check reads without mu.
+	joinTokens    map[string]*JoinTokenRecord
+	admitted      map[string]AdmittedNode
+	admittedByKey map[string]string
+	revokedKeys   map[string]RevokedKey
+	peerTrust     atomic.Pointer[peerTrustView]
 
 	// subMu guards subscribers. Separate from mu so a slow subscriber accept
 	// can't block FSM reads — Apply takes mu briefly to write, releases it,
@@ -730,6 +748,10 @@ func newPlacementFSMWithRecoveryStore(store placementRecoveryStore) *placementFS
 		tokens:                       newAPITokenState(),
 		warmPools:                    make(map[string]*WarmPoolRecord),
 		deniedNodes:                  make(map[string]NodeDenyRecord),
+		joinTokens:                   make(map[string]*JoinTokenRecord),
+		admitted:                     make(map[string]AdmittedNode),
+		admittedByKey:                make(map[string]string),
+		revokedKeys:                  make(map[string]RevokedKey),
 	}
 }
 
@@ -2017,6 +2039,35 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 		return nil
 	case opDenyNode:
 		result, err := f.applyDenyNodeLocked(cmd, log.Index)
+		if err != nil {
+			return err
+		}
+		return result
+	case opPutJoinToken:
+		result, err := f.applyPutJoinTokenLocked(cmd)
+		if err != nil {
+			return err
+		}
+		return result
+	case opDeleteJoinToken:
+		if err := f.applyDeleteJoinTokenLocked(cmd); err != nil {
+			return err
+		}
+		return nil
+	case opAdmitNode:
+		result, err := f.applyAdmitNodeLocked(cmd, log.Index)
+		if err != nil {
+			return err
+		}
+		return result
+	case opAdoptNodes:
+		result, err := f.applyAdoptNodesLocked(cmd)
+		if err != nil {
+			return err
+		}
+		return result
+	case opRekeyNode:
+		result, err := f.applyRekeyNodeLocked(cmd)
 		if err != nil {
 			return err
 		}
@@ -3965,6 +4016,14 @@ type fsmSnapshotPayload struct {
 	// the field, which is safe because no record is written until every
 	// server runs a build with it (nodeDenyFSMOpsVersion).
 	DeniedNodes []NodeDenyRecord
+	// JoinTokens, AdmittedNodes and RevokedKeys are the join state
+	// (fsm_join.go). Optional; an older snapshot decodes them as nil, which
+	// reads as nothing issued, admitted or revoked. An older build ignores
+	// them, which is safe because nothing is written until every server runs
+	// a build with them (joinFSMOpsVersion).
+	JoinTokens    []JoinTokenRecord
+	AdmittedNodes []AdmittedNode
+	RevokedKeys   []RevokedKey
 }
 
 type placementSnapshotRow struct {
@@ -4051,6 +4110,9 @@ func (f *placementFSM) Snapshot() (raft.FSMSnapshot, error) {
 		identityKeys:       identityKeys,
 		identityRoles:      identityRoles,
 		deniedNodes:        f.deniedNodesSnapshotLocked(),
+		joinTokens:         f.joinTokensSnapshotLocked(),
+		admittedNodes:      f.admittedSnapshotLocked(),
+		revokedKeys:        f.revokedSnapshotLocked(),
 		recoveryStore:      f.recoveryStore,
 		recoveryRefs:       recoveryRefs,
 		guard:              beginRecoverySnapshot(f.recoveryStore),
@@ -4152,7 +4214,8 @@ func (f *placementFSM) Restore(rc io.ReadCloser) (err error) {
 	f.apiTokens().restore(payload.APITokens, payload.Version)
 	f.restoreWarmPoolsLocked(payload.WarmPools, payload.Version)
 	f.restoreIdentityLocked(payload.IdentityKeys, payload.IdentityRoles)
-	f.restoreDeniedNodesLocked(payload.DeniedNodes, payload.Version)
+	f.restoreJoinStateLocked(payload.JoinTokens, payload.AdmittedNodes, payload.RevokedKeys)
+	f.restoreDeniedNodesLocked(payload.DeniedNodes, payload.Version, len(payload.RevokedKeys) > 0)
 	f.auditACLs = make(map[string]AuditACL, len(payload.AuditACLs))
 	f.auditACLLatest = make(map[string]string)
 	f.auditACLBySandbox = make(map[string]map[string]struct{})
@@ -4312,6 +4375,9 @@ type fsmSnapshot struct {
 	identityRoles      []IdentityRoleRecord
 	teamQuotas         []TeamQuotaRecord
 	deniedNodes        []NodeDenyRecord
+	joinTokens         []JoinTokenRecord
+	admittedNodes      []AdmittedNode
+	revokedKeys        []RevokedKey
 	recoveryStore      placementRecoveryStore
 	recoveryRefs       []string
 	// guard is the store's Put tracking this snapshot began; Release ends
@@ -4356,6 +4422,9 @@ func (s *fsmSnapshot) Persist(sink raft.SnapshotSink) (err error) {
 		IdentityRoles:      s.identityRoles,
 		TeamQuotas:         s.teamQuotas,
 		DeniedNodes:        s.deniedNodes,
+		JoinTokens:         s.joinTokens,
+		AdmittedNodes:      s.admittedNodes,
+		RevokedKeys:        s.revokedKeys,
 	}); err != nil {
 		_ = sink.Cancel()
 		return fmt.Errorf("fsmSnapshot: encode: %w", err)

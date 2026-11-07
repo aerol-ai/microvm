@@ -65,6 +65,12 @@ func (f *placementFSM) applyDenyNodeLocked(cmd command, index uint64) (any, erro
 	}
 	rec := NodeDenyRecord{NodeID: id, Role: strings.TrimSpace(in.Role), DeniedUnixNano: cmd.StampUnixNano}
 	f.deniedNodes[id] = rec
+	// The node's admitted key (fsm_join.go) becomes a tombstone, so its old
+	// cert stays refused even after a fresh join reuses the ID. An older
+	// build skips this, but no admitted record can exist until every server
+	// runs a build with joinFSMOpsVersion, so on any log an older build can
+	// apply the two agree.
+	f.tombstoneAdmittedLocked(id, cmd.StampUnixNano)
 	f.deniedNodesVersion = index
 	f.publishDeniedLocked()
 	return nodeDenyApplyResult{Record: rec, Changed: true}, nil
@@ -112,8 +118,9 @@ func (f *placementFSM) deniedNodesSnapshotLocked() []NodeDenyRecord {
 
 // restoreDeniedNodesLocked loads the snapshot's records. The version becomes
 // the snapshot's index: no change to the set is newer than that, and an agent
-// that sees it move only refetches a set it may already hold.
-func (f *placementFSM) restoreDeniedNodesLocked(records []NodeDenyRecord, version uint64) {
+// that sees it move only refetches a set it may already hold. haveRevoked
+// says the snapshot carries key tombstones, which agents mirror with the set.
+func (f *placementFSM) restoreDeniedNodesLocked(records []NodeDenyRecord, version uint64, haveRevoked bool) {
 	f.deniedNodes = make(map[string]NodeDenyRecord, len(records))
 	for _, r := range records {
 		if id := strings.TrimSpace(r.NodeID); id != "" {
@@ -122,7 +129,7 @@ func (f *placementFSM) restoreDeniedNodesLocked(records []NodeDenyRecord, versio
 		}
 	}
 	f.deniedNodesVersion = 0
-	if len(f.deniedNodes) > 0 {
+	if len(f.deniedNodes) > 0 || haveRevoked {
 		f.deniedNodesVersion = version
 	}
 	f.publishDeniedLocked()
@@ -130,10 +137,14 @@ func (f *placementFSM) restoreDeniedNodesLocked(records []NodeDenyRecord, versio
 
 // DeniedNodesResponse answers PublicInternalDeniedNodesPath: the whole set
 // and its version. The set is the deleted nodes of the cluster's life, so a
-// full copy per change stays small.
+// full copy per change stays small. RevokedKeys are the cert-key tombstones
+// (fsm_join.go): a worker refuses them on its internal listener, so a
+// deleted node's old cert is refused there too after its ID is reused. An
+// older server omits the field, which reads as "none".
 type DeniedNodesResponse struct {
-	Nodes   []NodeDenyRecord `json:"nodes"`
-	Version uint64           `json:"version"`
+	Nodes       []NodeDenyRecord `json:"nodes"`
+	RevokedKeys []RevokedKey     `json:"revoked_keys,omitempty"`
+	Version     uint64           `json:"version"`
 }
 
 // PublicInternalDeniedNodesPath serves the deny set to nodes that hold no
@@ -152,7 +163,14 @@ func (c *Cluster) DeniedNodes(since uint64) (DeniedNodesResponse, bool) {
 	if since >= version {
 		return DeniedNodesResponse{}, false
 	}
-	return DeniedNodesResponse{Nodes: nodes, Version: version}, true
+	return DeniedNodesResponse{Nodes: nodes, RevokedKeys: c.fsm.revokedKeysView(), Version: version}, true
+}
+
+// revokedKeysView returns the tombstones, sorted by key hash.
+func (f *placementFSM) revokedKeysView() []RevokedKey {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	return f.revokedSnapshotLocked()
 }
 
 // IsNodeDenied reports whether nodeID was deleted, from the local FSM.
