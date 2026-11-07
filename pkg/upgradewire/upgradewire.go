@@ -66,7 +66,7 @@ const (
 	ErrCodeRolloutConflict       = "rollout_conflict"        // the current rollout's state refuses the command
 	ErrCodeSkew                  = "version_skew"            // target below upgrade_from_min, or a downgrade
 	ErrCodeRemoteUpgradeDisabled = "remote_upgrade_disabled" // SB_REMOTE_UPGRADE=false on the node
-	ErrCodeNeedsDowntime         = "needs_allow_downtime"    // one voter and no AllowDowntime
+	ErrCodeNeedsDowntime         = "needs_allow_downtime"    // one or two voters and no AllowDowntime
 	ErrCodeSkippedNodes          = "skipped_nodes"           // finalize while nodes are still skipped
 	ErrCodeHashMismatch          = "hash_mismatch"           // upload body does not hash to its path
 	ErrCodeFilesMissing          = "files_missing"           // source=upload but the leader lacks a file
