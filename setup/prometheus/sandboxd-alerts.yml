@@ -656,6 +656,36 @@ groups:
           description: "A node leaf has less than 14 days or the cluster CA less than 30 days remaining. Rotate node.crt/node.key atomically; new handshakes hot-reload the pair."
           runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/secrets-and-audit.md"
 
+      # Automatic node cert renewal (plans/kubectl-style-cluster-ops.md
+      # §4.2). Every node renews at 2/3 of its cert's life; failing_since is
+      # when the current run of failures began (0 while renewals work). A
+      # cluster built with the scripts renews only after `sandboxd adopt`;
+      # until then renewals are skipped, not failed, and the expiry alert
+      # above is the backstop.
+      - alert: SandboxdClusterCertRenewalFailing
+        expr: aerolvm_cert_renew_failing_since_unix > 0 and (time() - aerolvm_cert_renew_failing_since_unix) > 86400
+        for: 10m
+        labels:
+          severity: warning
+          component: cluster-mtls
+        annotations:
+          summary: "sandboxd node cert renewal has been failing for more than a day"
+          description: "{{ $labels.instance }} could not renew its cluster node cert for over 24 hours (aerolvm_cert_renew_failures_total keeps rising). Check that a server holds the CA key (`sandboxd adopt` on the seed, then on each server), that the node can reach a server on TCP 7002, and that the node was not deleted. A cert that expires can't renew: the node then needs a new join token."
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/secrets-and-audit.md"
+
+      # One-line joins failing in bulk: a bad token in an autoscaling
+      # template, a firewall blocking the dial-back, or a token spray.
+      - alert: SandboxdClusterJoinsFailing
+        expr: sum by (instance) (rate(aerolvm_join_attempts_total{key="failure"}[15m])) > 0.1 and sum by (instance) (rate(aerolvm_join_attempts_total{key="success"}[15m])) == 0
+        for: 15m
+        labels:
+          severity: warning
+          component: cluster-mtls
+        annotations:
+          summary: "sandboxd join calls are failing"
+          description: "{{ $labels.instance }} refused every join for 15 minutes. aerolvm_join_attempts_total{key=\"failure\"} carries the reason in key2 (token_invalid, token_expired, dial_back, version, rate_limited, ...); the audit log names each caller's address and token id."
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/secrets-and-audit.md"
+
       # Provider boot/runtime canary (local always ok; awskms wrap/unwrap).
       - alert: SandboxdSecretProviderCanaryFailing
         expr: aerolvm_secret_provider_canary_ok == 0
