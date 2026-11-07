@@ -175,9 +175,13 @@ type Rollout struct {
 	// Error is why the rollout is failed or stopped, if it is.
 	Error string `json:"error,omitempty"`
 	// ActiveVersion is the cluster's active version (§6.5) when this was
-	// read.
-	ActiveVersion string        `json:"active_version,omitempty"`
-	Nodes         []RolloutNode `json:"nodes"`
+	// read: the release it was committed for.
+	ActiveVersion string `json:"active_version,omitempty"`
+	// ActiveFSMOpsVersion is the active version's FSM op number, the one
+	// cross-node writes gate on. It moves only when a new build's op set
+	// is finalized, so two builds of one tree share it.
+	ActiveFSMOpsVersion int           `json:"active_fsm_ops_version,omitempty"`
+	Nodes               []RolloutNode `json:"nodes"`
 }
 
 // RolloutNode is one node's progress.
