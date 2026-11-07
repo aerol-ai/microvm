@@ -30,17 +30,21 @@ func (t *serverTimingTransport) RoundTrip(req *http.Request) (*http.Response, er
 	// have a longer suffix; list is a GET), so this uniquely tags create calls.
 	if err == nil && resp != nil && req.Method == http.MethodPost &&
 		strings.HasSuffix(req.URL.Path, "/sandboxes") && resp.StatusCode/100 == 2 {
-		if ms, ok := parseServerTimingCreate(resp.Header.Get("Server-Timing")); ok {
+		// Every Server-Timing line, not just the first: Server-Timing may be
+		// split across lines, and a forwarded create's router adds its own
+		// stages (cluster_place, cluster_reserve, cluster_forward).
+		header := strings.Join(resp.Header.Values("Server-Timing"), ", ")
+		if ms, ok := parseServerTimingCreate(header); ok {
 			t.mu.Lock()
 			t.lastMS, t.have = ms, true
 			t.mu.Unlock()
 		}
-		if src, ok := parseServerTimingReadinessSource(resp.Header.Get("Server-Timing")); ok {
+		if src, ok := parseServerTimingReadinessSource(header); ok {
 			t.mu.Lock()
 			t.lastReadiness, t.haveReadiness = src, true
 			t.mu.Unlock()
 		}
-		if stages := parseServerTimingStages(resp.Header.Get("Server-Timing")); len(stages) > 0 {
+		if stages := parseServerTimingStages(header); len(stages) > 0 {
 			t.mu.Lock()
 			t.lastStages, t.haveStages = stages, true
 			t.mu.Unlock()
@@ -83,11 +87,18 @@ func (t *serverTimingTransport) takeCreateStages() (map[string]float64, bool) {
 	return stages, ok
 }
 
+// outcomeStages are the stages whose desc says how the step went ("hit" or
+// "miss"). The bench groups stages by name, so these are also filed under
+// <name>_<desc>, and a run reports the hit and miss medians apart: a
+// containerd_netns hit is a claimed slot, a miss is an inline CNI build, and
+// one median of the two mixed would describe neither (plan PR #1000, L1).
+var outcomeStages = map[string]bool{"containerd_netns": true}
+
 // parseServerTimingStages extracts every metric with a dur= attribute into
 // a name→milliseconds map. Metrics without dur (e.g. readiness;desc=…)
-// are skipped. Extra attributes on a dur-carrying metric are ignored —
-// the presence of the fc_warm key alone marks a warm-pool hit, so the
-// bench needs no desc parsing.
+// are skipped. Other attributes are ignored, except the desc of an
+// outcomeStages entry; the presence of the fc_warm key alone marks a
+// warm-pool hit, so fc_warm needs no desc parsing.
 func parseServerTimingStages(header string) map[string]float64 {
 	var stages map[string]float64
 	for _, metric := range strings.Split(header, ",") {
@@ -96,15 +107,26 @@ func parseServerTimingStages(header string) map[string]float64 {
 		if name == "" {
 			continue
 		}
+		dur, haveDur, desc := 0.0, false, ""
 		for _, attr := range fields[1:] {
-			if v, ok := strings.CutPrefix(strings.TrimSpace(attr), "dur="); ok {
+			attr = strings.TrimSpace(attr)
+			if v, ok := strings.CutPrefix(attr, "dur="); ok {
 				if ms, err := strconv.ParseFloat(strings.TrimSpace(v), 64); err == nil {
-					if stages == nil {
-						stages = make(map[string]float64)
-					}
-					stages[name] = ms
+					dur, haveDur = ms, true
 				}
+			} else if v, ok := strings.CutPrefix(attr, "desc="); ok {
+				desc = strings.TrimSpace(v)
 			}
+		}
+		if !haveDur {
+			continue
+		}
+		if stages == nil {
+			stages = make(map[string]float64)
+		}
+		stages[name] = dur
+		if outcomeStages[name] && (desc == "hit" || desc == "miss") {
+			stages[name+"_"+desc] = dur
 		}
 	}
 	return stages

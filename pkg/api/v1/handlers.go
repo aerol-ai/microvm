@@ -12,6 +12,7 @@ import (
 	"github.com/aerol-ai/microvm/internal/service"
 	"github.com/aerol-ai/microvm/pkg/api/apihttp"
 	"github.com/aerol-ai/microvm/pkg/controlplane"
+	"github.com/aerol-ai/microvm/pkg/createtiming"
 	"github.com/aerol-ai/microvm/pkg/docker"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
@@ -81,11 +82,7 @@ func setCreateServerTiming(w http.ResponseWriter, start time.Time, timing *docke
 		// plans/firecracker-create-latency.md). Absent stages are simply
 		// not rendered — a docker create carries no fc_* entries.
 		for _, st := range timing.Stages() {
-			entry := st.Name + ";dur=" + strconv.FormatFloat(st.DurMS, 'f', 1, 64)
-			if st.Desc != "" {
-				entry += ";desc=" + st.Desc
-			}
-			parts = append(parts, entry)
+			parts = append(parts, createtiming.FormatStage(st))
 		}
 	}
 	w.Header().Set("Server-Timing", strings.Join(parts, ", "))
