@@ -269,6 +269,12 @@ func RegisterRoutes(mux apihttp.Mux, d Deps) {
 	mux.Handle("GET "+PathPrefix+"/cluster/sandbox-index", op(http.HandlerFunc(h.clusterSandboxIndex)))
 	mux.Handle("GET "+PathPrefix+"/cluster/ingress-route/{id}", op(http.HandlerFunc(h.clusterIngressRoute)))
 	mux.Handle("POST "+PathPrefix+"/cluster/nodes/{id}/drain", op(http.HandlerFunc(h.clusterDrainNode)))
+	// cordon is drain's clear name (`aerolvm cordon`): the same admission-
+	// only mark. /drain stays for older clients and the lifecycle script.
+	mux.Handle("POST "+PathPrefix+"/cluster/nodes/{id}/cordon", op(http.HandlerFunc(h.clusterDrainNode)))
+	mux.Handle("GET "+PathPrefix+"/cluster/nodes/{id}", op(http.HandlerFunc(h.clusterGetNode)))
+	// Any role. DELETE /cluster/members/{id} keeps its servers-only answers.
+	mux.Handle("DELETE "+PathPrefix+"/cluster/nodes/{id}", op(http.HandlerFunc(h.clusterDeleteNode)))
 	mux.Handle("POST "+PathPrefix+"/cluster/nodes/{id}/uncordon", op(http.HandlerFunc(h.clusterUncordonNode)))
 	mux.Handle("POST "+PathPrefix+"/cluster/nodes/{id}/storage-retired", op(http.HandlerFunc(h.clusterRetireNodeStorage)))
 	mux.Handle("DELETE "+PathPrefix+"/cluster/nodes/{id}/storage-retired", op(http.HandlerFunc(h.clusterRevokeNodeStorageRetirement)))
@@ -309,6 +315,7 @@ func RegisterRoutes(mux apihttp.Mux, d Deps) {
 	mux.Handle("GET "+cluster.PublicInternalSnapshotNodePath, internalOp(http.HandlerFunc(h.clusterInternalSnapshotNode)))
 	mux.Handle("GET "+cluster.PublicInternalDrainStatePath+"{id}", internalOp(http.HandlerFunc(h.clusterInternalDrainState)))
 	mux.Handle("GET "+cluster.PublicInternalDrainedNodesPath, internalOp(http.HandlerFunc(h.clusterInternalDrainedNodes)))
+	mux.Handle("GET "+cluster.PublicInternalDeniedNodesPath, internalOp(http.HandlerFunc(h.clusterInternalDeniedNodes)))
 	mux.Handle("GET "+cluster.PublicInternalStorageObligationsPath, internalOp(http.HandlerFunc(h.clusterInternalStorageObligations)))
 	mux.Handle("POST "+cluster.PublicInternalSecretPath, internalOp(http.HandlerFunc(h.clusterInternalSecretPut)))
 	mux.Handle("HEAD "+cluster.PublicInternalSecretPath+"/{sandboxID}", internalOp(http.HandlerFunc(h.clusterInternalSecretHead)))
@@ -323,6 +330,10 @@ func withInternalMTLS(d Deps, next http.Handler) http.Handler {
 		peerID, err := cluster.AuthenticatedPeerNodeID(r)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusForbidden)
+			return
+		}
+		if peerDenied(d, peerID) {
+			http.Error(w, cluster.ErrPeerDeleted.Error(), http.StatusForbidden)
 			return
 		}
 		if !peerMemberAlive(d, peerID) {
