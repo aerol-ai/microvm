@@ -372,8 +372,9 @@ func (d *rolloutDriver) tickMoving(ctx context.Context, r *RolloutRecord, member
 	if d.watchUpgrading(ctx, r, members) {
 		return
 	}
-	r = d.host.rollout()
-	if r == nil {
+	// A failure written just now (a resend refused for quorum) ends the
+	// walk for this tick, before anything is cordoned for nothing.
+	if r = d.host.rollout(); r == nil || !rolloutStartsRestarts(r.State) {
 		return
 	}
 	target := targetOf(r)
@@ -517,20 +518,59 @@ func (d *rolloutDriver) stepTier(ctx context.Context, r *RolloutRecord, tier str
 			d.skip(ctx, r, n, "down when its turn came")
 			continue
 		}
-		if tier == rolloutTierServer && len(voters) > 1 {
-			if n.NodeID == d.host.selfID() {
-				d.handOff(ctx, r, members, voters)
-				return
-			}
-			if down := quorumBlockers(voters, n.NodeID, d.host.selfID(), members); len(down) > 0 && !majorityUp(voters, n.NodeID, d.host.selfID(), members) {
-				d.update(ctx, RolloutNodeUpdate{RolloutID: r.ID, NodeID: n.NodeID, State: upgradewire.NodeFailed, ExpectState: n.State,
-					Error: fmt.Sprintf("restarting it would leave no Raft majority: servers %s are down", strings.Join(down, ", "))})
-				d.event(ctx, RolloutCommand{Event: evNodeFailed, RolloutID: r.ID, Error: fmt.Sprintf("servers %s are down; no server restarts without a majority", strings.Join(down, ", "))})
-				return
-			}
+		if !d.mayRestart(ctx, r, n, members, voters) {
+			return
 		}
 		d.startUpgrade(ctx, r, n, m)
 	}
+}
+
+// mayRestart is the gate every node restart passes, the first apply and a
+// resend alike (§6.2). This leader never restarts itself while another
+// voter can lead: it hands off leadership instead, and the next leader
+// restarts it. A Raft voter restarts only if the voters left up still form
+// a majority (quorumRefusal); a refused restart fails the node and the
+// rollout, naming why.
+func (d *rolloutDriver) mayRestart(ctx context.Context, r *RolloutRecord, n *RolloutNodeRecord, members map[string]Member, voters []string) bool {
+	self := d.host.selfID()
+	if n.NodeID == self && len(voters) > 1 {
+		d.handOff(ctx, r, members, voters)
+		return false
+	}
+	if !containsState(voters, n.NodeID) {
+		return true
+	}
+	nodeWhy, rolloutWhy := quorumRefusal(r, n.NodeID, self, members, voters)
+	if nodeWhy == "" {
+		return true
+	}
+	d.update(ctx, RolloutNodeUpdate{RolloutID: r.ID, NodeID: n.NodeID, State: upgradewire.NodeFailed, ExpectState: n.State, Error: nodeWhy})
+	d.event(ctx, RolloutCommand{Event: evNodeFailed, RolloutID: r.ID, Error: rolloutWhy})
+	return false
+}
+
+// quorumRefusal says why restarting voter target now would leave no Raft
+// majority, for the node and for the rollout, or "" when it may restart.
+// The rule is "voters up after this restart >= majority", checked every
+// time. A voter that is down always blocks (§6.2: with three servers and
+// one down, nothing restarts). A cluster that cannot keep a majority
+// through any restart, one or two voters, restarts only when the rollout
+// was applied with allow_downtime (eng D8).
+func quorumRefusal(r *RolloutRecord, target, self string, members map[string]Member, voters []string) (node, rollout string) {
+	if majorityUp(voters, target, self, members) {
+		return "", ""
+	}
+	if down := quorumBlockers(voters, target, self, members); len(down) > 0 {
+		list := strings.Join(down, ", ")
+		return fmt.Sprintf("restarting it would leave no Raft majority: servers %s are down", list),
+			fmt.Sprintf("servers %s are down; no server restarts without a majority", list)
+	}
+	if r.AllowDowntime {
+		return "", ""
+	}
+	return fmt.Sprintf("restarting it leaves %d of %d voting servers up, and Raft needs %d; the rollout was applied without allow_downtime",
+			votersUpAfter(voters, target, self, members), len(voters), len(voters)/2+1),
+		fmt.Sprintf("%d voting servers cannot keep a majority through a restart; roll back, then apply with allow_downtime", len(voters))
 }
 
 // quorumBlockers lists the voters other than target that are down.
@@ -550,6 +590,11 @@ func quorumBlockers(voters []string, target, self string, members map[string]Mem
 // majorityUp reports whether the voters still up while target restarts
 // form a majority of all voters.
 func majorityUp(voters []string, target, self string, members map[string]Member) bool {
+	return votersUpAfter(voters, target, self, members) > len(voters)/2
+}
+
+// votersUpAfter counts the voters still up while target restarts.
+func votersUpAfter(voters []string, target, self string, members map[string]Member) int {
 	up := 0
 	for _, v := range voters {
 		if v == target {
@@ -563,7 +608,7 @@ func majorityUp(voters []string, target, self string, members map[string]Member)
 			up++
 		}
 	}
-	return up > len(voters)/2
+	return up
 }
 
 // handOff moves leadership to a voter that already runs the target, so
@@ -750,8 +795,12 @@ func (d *rolloutDriver) followUpgrading(ctx context.Context, r *RolloutRecord, n
 	case idle && st.Version != target && since > d.applyResendAfter:
 		// The op never started: the leader that marked the node died before
 		// its call, or the call was lost. The node's own state shows no op,
-		// so sending it again cannot start a second upgrade.
-		d.sendApply(ctx, r, *n, m, n.Op)
+		// so sending it again cannot start a second upgrade. It is a restart
+		// all the same, so it passes the same gate as the first call: the
+		// voter that is down now may be the leader that marked it.
+		if d.mayRestart(ctx, r, n, d.host.members(), d.host.voters()) {
+			d.sendApply(ctx, r, *n, m, n.Op)
+		}
 	}
 	return false
 }

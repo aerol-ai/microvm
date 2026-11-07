@@ -444,6 +444,47 @@ func TestUpgradeNodeRollbackApply(t *testing.T) {
 	}
 }
 
+// R5b: a server's upgrader runs its own quorum guard before it stops
+// sandboxd (cmd/sandboxd serverStopGuard). The node used to switch that
+// guard off on every call; now a server keeps it unless the rollout itself
+// was applied with allow_downtime. A worker holds no vote, so its guard has
+// nothing to check.
+func TestUpgradeNodeApplyAllowDowntimeFromTheRollout(t *testing.T) {
+	sd, tb := []byte("new sandboxd"), []byte("new toolboxd")
+	files := map[string]string{"sandboxd_linux_amd64": sumOf(sd), "toolboxd_linux_amd64": sumOf(tb)}
+	cases := []struct {
+		name          string
+		server        bool
+		allowDowntime bool
+		want          bool
+	}{
+		{"server keeps its guard", true, false, false},
+		{"server in an allow_downtime rollout", true, true, true},
+		{"worker has no vote", false, false, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			g := newUpgradeNodeRig(t, tc.server)
+			store := nodeupgrade.FileStore{Dir: nodeupgrade.FileStoreDir(g.paths.StateDir)}
+			for _, b := range [][]byte{sd, tb} {
+				if _, _, err := store.Put(sumOf(b), bytes.NewReader(b)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			r := stepRollout(upgradewire.StateRunning, upgradewire.NodeUpgrading, files)
+			r.AllowDowntime = tc.allowDowntime
+			g.fence = UpgradeFence{Leader: "lead", Term: 2, Rollout: r}
+			req := UpgradeStepRequest{RolloutID: "r1", Step: UpgradeStepApply, Direction: upgradewire.DirectionUpgrade, Version: "v2", Files: files, Op: stepOp, Term: 2}
+			if _, err := g.u.Step(context.Background(), "lead", req); err != nil || len(g.launched) != 1 {
+				t.Fatalf("apply = %v, %d launches", err, len(g.launched))
+			}
+			if g.launched[0].AllowDowntime != tc.want {
+				t.Fatalf("AllowDowntime = %v, want %v", g.launched[0].AllowDowntime, tc.want)
+			}
+		})
+	}
+}
+
 // R12: the files of an apply may take up to materializeTimeout to arrive.
 // A stop, a rollback or a new leader that lands meanwhile must stop the
 // restart, so the node reads the fence again right before the launch.

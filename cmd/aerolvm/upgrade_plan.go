@@ -299,8 +299,11 @@ func (p *upgradePlan) planCluster(nodes []nodeRaw, batch string, pauseAfter int)
 	if pauseAfter > 0 && batchNo > 0 {
 		p.Warnings = append(p.Warnings, fmt.Sprintf("the rollout pauses after the first %d worker(s); go on with: aerolvm upgrade resume", min(pauseAfter, p.BatchSize)))
 	}
-	if voters == 1 {
+	switch {
+	case voters == 1:
 		p.Warnings = append(p.Warnings, "this cluster has one Raft server: the API is down while it restarts (sandboxes keep running); apply needs --allow-downtime")
+	case voters == 2 && votersDown == 0:
+		p.Warnings = append(p.Warnings, "this cluster has two Raft servers: while either one restarts, one of two is up, which is no majority, so the API is down during each server restart (sandboxes keep running); apply needs --allow-downtime")
 	}
 	if votersDown > 0 && voters-votersDown-1 <= voters/2 {
 		p.Warnings = append(p.Warnings, fmt.Sprintf("%d of %d Raft servers are down: restarting another would lose the majority, so the rollout will fail at the servers; bring them back or delete them first", votersDown, voters))

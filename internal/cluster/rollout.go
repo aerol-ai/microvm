@@ -418,9 +418,15 @@ func (c *Cluster) buildRollout(caller string, spec *RolloutRecord, req upgradewi
 	if err != nil {
 		return nil, rolloutErr(http.StatusServiceUnavailable, "retry", err.Error(), "")
 	}
-	if len(voters) == 1 && !req.AllowDowntime {
-		return nil, rolloutErr(http.StatusConflict, upgradewire.ErrCodeNeedsDowntime,
-			"this cluster has one Raft voter: no majority stays up and leadership cannot move while it restarts, so the API is down for that restart (sandboxes keep running)",
+	// With one or two voters, restarting any one leaves no majority up, so
+	// the driver restarts no server without allow_downtime (quorumRefusal).
+	// Say so now, before anything is staged.
+	if len(voters) < 3 && !req.AllowDowntime {
+		reason := "this cluster has one Raft voter: no majority stays up and leadership cannot move while it restarts, so the API is down for that restart (sandboxes keep running)"
+		if len(voters) == 2 {
+			reason = "this cluster has two Raft voters: while either one restarts, one of two is up, which is no majority, so the API is down for each server restart (sandboxes keep running)"
+		}
+		return nil, rolloutErr(http.StatusConflict, upgradewire.ErrCodeNeedsDowntime, reason,
 			"apply again with allow_downtime (aerolvm upgrade apply --allow-downtime)")
 	}
 	denied := c.fsm.deniedNodeSet()

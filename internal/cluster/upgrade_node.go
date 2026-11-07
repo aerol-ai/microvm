@@ -481,13 +481,7 @@ func (u *upgradeNode) apply(ctx context.Context, p nodeupgrade.Paths, caller str
 		return resp, stepErr(http.StatusConflict, upgradewire.ErrCodeUpgradeRunning, "another upgrade (op %q) is running on %s", holder, u.nodeID)
 	}
 	rollback := req.Direction == upgradewire.DirectionRollback
-	// AllowDowntime: the leader kept quorum and moved leadership off this
-	// node before this call (§6.2); the node must not second-guess a
-	// one-voter rollout run with --allow-downtime.
-	nreq := nodeupgrade.Request{
-		Version: req.Version, Op: req.Op, Rollback: rollback, AllowUnversioned: req.AllowUnversioned,
-		AllowDowntime: true,
-	}
+	nreq := nodeupgrade.Request{Version: req.Version, Op: req.Op, Rollback: rollback, AllowUnversioned: req.AllowUnversioned}
 	if d, err := time.ParseDuration(req.HealthTimeout); err == nil && d > 0 {
 		nreq.HealthTimeout = d
 	}
@@ -521,9 +515,17 @@ func (u *upgradeNode) apply(ctx context.Context, p nodeupgrade.Paths, caller str
 	// to materializeTimeout to arrive, and a stop, a rollback or a new
 	// leader that landed meanwhile must stop this restart. After the launch
 	// only the upgrader's own result ends it.
-	if _, err := u.checkFence(lctx, caller, req); err != nil {
+	fence, err := u.checkFence(lctx, caller, req)
+	if err != nil {
 		return resp, err
 	}
+	// The upgrader's own quorum guard (cmd/sandboxd serverStopGuard) runs
+	// right before it stops sandboxd. The leader checked quorum before its
+	// call, but every server restart must pass the check, and the node's
+	// view is the newest: a server keeps its guard unless the rollout was
+	// applied with allow_downtime (one or two voters, eng D8). A worker or
+	// ingress node holds no vote.
+	nreq.AllowDowntime = !u.isServer || fence.Rollout.AllowDowntime
 	op, err := u.launch(lctx, u.host, p.Sandboxd, nreq)
 	if err != nil {
 		if errors.Is(err, nodeupgrade.ErrUsage) {

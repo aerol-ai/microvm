@@ -897,6 +897,56 @@ func TestRolloutDriverStopReturnsUnstartedRestart(t *testing.T) {
 	}
 }
 
+// R5a: with two voters, restarting one leaves one of two up, which is no
+// majority, even though no voter is down. Without allow_downtime no server
+// restarts; with it, the restart goes ahead.
+func TestRolloutDriverTwoVotersNeedAllowDowntime(t *testing.T) {
+	g := newRolloutRig(t, 2, 0, 1)
+	g.start(nil)
+	r := g.run(upgradewire.StateFailed)
+	if r.Nodes["s2"].State != upgradewire.NodeFailed || !strings.Contains(r.Nodes["s2"].Error, "1 of 2") || !strings.Contains(r.Error, "allow_downtime") {
+		t.Fatalf("two voters without allow_downtime: %q %s", r.Error, describeNodes(r))
+	}
+	if got := g.nodes.applyOrder(); len(got) != 0 {
+		t.Fatalf("a server restarted without a majority: %v", got)
+	}
+
+	g = newRolloutRig(t, 2, 0, 1)
+	g.nodes.onTransfer = func(to string) { g.host.self = to }
+	g.start(func(r *RolloutRecord) { r.AllowDowntime = true })
+	g.run(upgradewire.StateFinalized)
+	if got := strings.Join(g.nodes.applyOrder(), ","); !strings.HasPrefix(got, "upgrade:s2,upgrade:s1") {
+		t.Fatalf("apply order with allow_downtime = %s", got)
+	}
+}
+
+// R5b: a new leader that finds a server marked upgrading whose call never
+// reached it sends the call again. That resend is a server restart too: it
+// passes the same quorum check, so it never restarts a voter while another
+// voter is down.
+func TestRolloutDriverResendKeepsQuorum(t *testing.T) {
+	g := newRolloutRig(t, 3, 0, 1)
+	g.nodes.nodes["s2"].applyErr = errors.New("connection reset")
+	g.start(nil)
+	g.run(upgradewire.StateRunning)
+	for i := 0; i < 10 && g.host.rollout().Nodes["s2"].State != upgradewire.NodeUpgrading; i++ {
+		g.driver.tick(context.Background())
+	}
+	if n := g.host.rollout().Nodes["s2"]; n.State != upgradewire.NodeUpgrading || g.nodes.nodes["s2"].applies != 0 {
+		t.Fatalf("setup: s2 = %+v", n)
+	}
+	// The call is lost; then s3 goes down. Restarting s2 now would leave one
+	// voter of three.
+	g.nodes.nodes["s2"].applyErr = nil
+	g.host.setAlive("s3", false)
+	g.driver.applyResendAfter = 0
+	g.host.advance(time.Second)
+	r := g.run(upgradewire.StateFailed)
+	if g.nodes.nodes["s2"].applies != 0 || r.Nodes["s2"].State != upgradewire.NodeFailed || !strings.Contains(r.Nodes["s2"].Error, "s3") {
+		t.Fatalf("resend without a majority: s2 applies %d, %s", g.nodes.nodes["s2"].applies, describeNodes(r))
+	}
+}
+
 // deleteNode writes the deny record `aerolvm delete node` writes, and the
 // node leaves gossip.
 func (g *rolloutRig) deleteNode(id string) {

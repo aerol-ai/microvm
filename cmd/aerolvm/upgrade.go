@@ -79,8 +79,9 @@ Flags (plan, apply):
 Flags (apply):
   --hold               stop at "done" and wait for "aerolvm upgrade finalize"
   --node-timeout D     how long each node may take (default 10m)
-  --allow-downtime     needed when the cluster has one Raft server: the API
-                       is down while it restarts (sandboxes keep running)
+  --allow-downtime     needed when the cluster has one or two Raft servers:
+                       the API is down while each restarts (sandboxes keep
+                       running)
   --allow-unversioned  allow a dev or test build whose version is not vX.Y.Z
   --wait               follow the rollout until it ends (rollback: too)
   -o json|yaml         print the rollout or operation (also --json)

@@ -98,9 +98,14 @@ func TestRolloutOverInternalMTLS(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	out, created, err := leader.ApplyRollout(ctx, "pat:op", upgradewire.ApplyRequest{
-		Version: "itest-b", Files: files, Source: upgradewire.SourceUpload, AllowUnversioned: true, Hold: true,
-	})
+	apply := upgradewire.ApplyRequest{Version: "itest-b", Files: files, Source: upgradewire.SourceUpload, AllowUnversioned: true, Hold: true}
+	// R5a: two voters keep no majority while one restarts, so apply asks
+	// for allow_downtime before anything is staged.
+	if _, _, err := leader.ApplyRollout(ctx, "pat:op", apply); func() bool { _, code := rolloutErrCode(err); return code != upgradewire.ErrCodeNeedsDowntime }() {
+		t.Fatalf("apply on two voters without allow_downtime = %v", err)
+	}
+	apply.AllowDowntime = true
+	out, created, err := leader.ApplyRollout(ctx, "pat:op", apply)
 	if err != nil || !created || len(out.Nodes) != 2 {
 		t.Fatalf("apply = %+v %v %v", out, created, err)
 	}

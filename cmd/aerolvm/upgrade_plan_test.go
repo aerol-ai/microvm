@@ -139,6 +139,16 @@ func TestUpgradePlanNeedsNetworkAndUnversioned(t *testing.T) {
 		!strings.Contains(h.stdout.String(), " mixed ") {
 		t.Fatalf("quorum = %d %q", code, h.stdout.String())
 	}
+	// Two servers, both up: either restart leaves one of two, so apply
+	// needs --allow-downtime as with one.
+	f.members = []map[string]any{
+		{"node_id": "s1", "role": "server", "alive": true, "version": "v0.6.12", "voter": true, "leader": true},
+		{"node_id": "s2", "role": "server", "alive": true, "version": "v0.6.12", "voter": true},
+	}
+	if code := h.run("upgrade", "plan", "v0.6.13"); code != exitOK || !strings.Contains(h.stdout.String(), "two Raft servers") ||
+		!strings.Contains(h.stdout.String(), "--allow-downtime") {
+		t.Fatalf("two voters = %d %q", code, h.stdout.String())
+	}
 	for _, tc := range []struct {
 		args []string
 		code int
