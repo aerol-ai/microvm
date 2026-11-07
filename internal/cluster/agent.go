@@ -1196,8 +1196,9 @@ func (a *Agent) PlacementsForShards(filter PlacementShardFilter) []Placement {
 		// a cut-off ingress kept routing by its last rows for the whole cut:
 		// to an owner the leader may have replaced, or one that has paused
 		// the sandbox (C4 part 1), whose paused process takes the connection
-		// and never answers. Past the lease the rows go out in flux, which
-		// the ingress answers with 503 + Retry-After.
+		// and never answers. Past the lease the recreate-policy rows go out
+		// in flux, which the ingress answers with 503 + Retry-After; the rest
+		// keep routing (staleViewPlacement).
 		cached := a.cachedPlacementsForShards(filter)
 		a.cacheMu.RLock()
 		answered := a.placementWalkAnswered
@@ -1206,7 +1207,7 @@ func (a *Agent) PlacementsForShards(filter PlacementShardFilter) []Placement {
 		inFlux := !answered.IsZero() && age > OwnershipLease(a.cfg)
 		if inFlux {
 			for i := range cached {
-				cached[i] = inFluxPlacement(cached[i])
+				cached[i] = staleViewPlacement(cached[i])
 			}
 		}
 		a.logger.Warn("cluster agent: paged placement lookup failed; using cached placement view",

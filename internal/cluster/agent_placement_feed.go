@@ -32,13 +32,17 @@ import (
 // used to keep routing by them for as long as the cut lasted, and so kept
 // sending traffic to an owner the leader may have replaced. Once maxStale
 // (OwnershipLease: half the dead-owner grace) passes without an answered poll
-// or resync, the feed hands every row out in flux: the same row, with the
-// owner's addresses blanked. Both ingress routers already read a row with no
-// owner address as in flux and answer 503 + Retry-After
-// (routedns.addPlacementHosts, service.buildClusterIngressIntents). The next
-// answered poll hands the real rows back.
+// or resync, the feed hands every failover.policy=recreate row out in flux:
+// the same row, with the owner's addresses blanked (staleViewPlacement). Both
+// ingress routers already read a row with no owner address as in flux and
+// answer 503 + Retry-After (routedns.addPlacementHosts,
+// service.buildClusterIngressIntents). Every other row keeps its route: the
+// leader orphans such a sandbox when its owner dies and never starts a second
+// copy, so its owner is the only place it can run, and an outage of the whole
+// server tier does not take it offline. The next answered poll hands the real
+// rows back.
 //
-//	fresh ──(no answered poll for maxStale)──▶ in flux: watchers get an all-in-flux full view
+//	fresh ──(no answered poll for maxStale)──▶ in flux: watchers get a full view with recreate rows in flux
 //	in flux ──(an answered poll or resync)──▶ fresh: watchers get the real full view
 
 type agentPlacementFeed struct {
@@ -72,9 +76,9 @@ type agentPlacementFeed struct {
 	done chan struct{}
 }
 
-// clusterPlacementFeedInFlux is 1 while this ingress hands out every route in
-// flux because the control plane has not answered its feed within the age
-// limit.
+// clusterPlacementFeedInFlux is 1 while this ingress hands out every
+// recreate-policy route in flux because the control plane has not answered
+// its feed within the age limit.
 var clusterPlacementFeedInFlux = expvar.NewInt("aerolvm_cluster_placement_feed_in_flux")
 
 // feedBackoff bounds retries after a failed poll or walk.
@@ -296,8 +300,9 @@ func (a *Agent) applyPlacementChanges(f *agentPlacementFeed, resp PlacementChang
 
 // feedPlacements answers PlacementsForShards from the synced view: no
 // control-plane read at all. ok=false means "not synced, use the page walk".
-// Past the age limit every row comes back in flux (inFluxPlacement); the
-// page walk is not a way out, since its own cache is older still.
+// Past the age limit every recreate-policy row comes back in flux
+// (staleViewPlacement); the page walk is not a way out, since its own cache
+// is older still.
 func (a *Agent) feedPlacements(filter PlacementShardFilter) ([]Placement, bool) {
 	if a == nil || a.feed == nil {
 		return nil, false
@@ -323,7 +328,7 @@ func (a *Agent) feedPlacements(filter PlacementShardFilter) ([]Placement, bool) 
 			}
 		}
 		if stale {
-			p = inFluxPlacement(p)
+			p = staleViewPlacement(p)
 		}
 		out = append(out, p)
 	}
@@ -337,6 +342,16 @@ func (a *Agent) feedPlacements(filter PlacementShardFilter) ([]Placement, bool) 
 func inFluxPlacement(p Placement) Placement {
 	p.OwnerAPIURL = ""
 	p.OwnerDataPlaneHost = ""
+	return p
+}
+
+// staleViewPlacement is how a row goes out once the view is past the age
+// limit: in flux if the leader may have moved it (placementMovableOnFailover),
+// unchanged otherwise.
+func staleViewPlacement(p Placement) Placement {
+	if placementMovableOnFailover(p) {
+		return inFluxPlacement(p)
+	}
 	return p
 }
 
@@ -382,9 +397,9 @@ func (f *agentPlacementFeed) markAnswered() (full []Placement, wasInFlux bool) {
 	return clonePlacements(full), true
 }
 
-// checkPlacementFeedAge hands watchers the all-in-flux view once the rows pass the age
-// limit, and wakes the ingress reconciler so it re-reads them (in flux) too.
-// It reports whether it made that transition.
+// checkPlacementFeedAge hands watchers the stale view (recreate-policy rows in
+// flux) once the rows pass the age limit, and wakes the ingress reconciler so
+// it re-reads them too. It reports whether it made that transition.
 func (a *Agent) checkPlacementFeedAge(f *agentPlacementFeed) bool {
 	f.transitionMu.Lock()
 	defer f.transitionMu.Unlock()
@@ -397,14 +412,18 @@ func (a *Agent) checkPlacementFeedAge(f *agentPlacementFeed) bool {
 	f.inFluxSent = true
 	age := now.Sub(f.lastAnswered)
 	full := make([]Placement, 0, len(f.rows))
+	inFlux := 0
 	for _, p := range f.rows {
-		full = append(full, inFluxPlacement(p))
+		if placementMovableOnFailover(p) {
+			inFlux++
+		}
+		full = append(full, staleViewPlacement(p))
 	}
 	f.mu.Unlock()
 	clusterPlacementFeedInFlux.Set(1)
 	if a.logger != nil {
-		a.logger.Warn("cluster agent: placement feed has had no answer from the control plane past its age limit; every sandbox route is in flux (503) until it answers",
-			"since_last_answer", age.Round(time.Millisecond), "age_limit", f.maxStale, "placements", len(full))
+		a.logger.Warn("cluster agent: placement feed has had no answer from the control plane past its age limit; failover.policy=recreate sandbox routes are in flux (503) until it answers",
+			"since_last_answer", age.Round(time.Millisecond), "age_limit", f.maxStale, "placements", len(full), "in_flux", inFlux)
 	}
 	f.notifyWatchers(clonePlacements(full), nil)
 	f.signal()
