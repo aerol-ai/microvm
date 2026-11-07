@@ -878,6 +878,9 @@ type Service struct {
 	// expiry sweep may run (idempotency_ledger.go). Claims trigger it, so
 	// the table is pruned without a dedicated background loop.
 	idempotencySweepAt atomic.Int64
+
+	// nodeUpgrades is the single-node upgrade API's state (node_upgrade.go).
+	nodeUpgrades nodeUpgradeState
 }
 
 func New(cfg config.Config, logger *slog.Logger, db *store.Store, runtimeDriver runtime.Runtime, eventsClient docker.EventsSource, caddyClient *caddy.Client, cipher *secrets.Cipher, mountManager *mounts.Manager, admitter *capacity.Admitter) *Service {

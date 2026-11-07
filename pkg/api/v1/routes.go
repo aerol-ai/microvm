@@ -280,6 +280,13 @@ func RegisterRoutes(mux apihttp.Mux, d Deps) {
 	mux.Handle("POST "+PathPrefix+"/cluster/nodes/{id}/storage-retired", op(http.HandlerFunc(h.clusterRetireNodeStorage)))
 	mux.Handle("DELETE "+PathPrefix+"/cluster/nodes/{id}/storage-retired", op(http.HandlerFunc(h.clusterRevokeNodeStorageRetirement)))
 	mux.Handle("GET "+PathPrefix+"/cluster/storage-retirements", op(http.HandlerFunc(h.clusterListNodeStorageRetirements)))
+	// Single-node upgrade (plans/kubectl-style-cluster-ops.md §6.1): upload
+	// release files, start `sandboxd upgrade node`, read its progress. 409
+	// cluster_mode on a cluster; the rollout routes own upgrades there.
+	mux.Handle("POST "+upgradewire.NodeUpgradePath, op(http.HandlerFunc(h.nodeUpgradeStart)))
+	mux.Handle("GET "+upgradewire.NodeUpgradePath, op(http.HandlerFunc(h.nodeUpgradeStatus)))
+	mux.Handle("PUT "+upgradewire.NodeUpgradeFilesPath+"/{sha256}", op(http.HandlerFunc(h.nodeUpgradePutFile)))
+	mux.Handle("HEAD "+upgradewire.NodeUpgradeFilesPath+"/{sha256}", op(http.HandlerFunc(h.nodeUpgradeHeadFile)))
 	// Join service (plans/kubectl-style-cluster-ops.md §4): tokens and
 	// adopt for operators; renewal, the CA key and join writes for peers.
 	// The new machine's own calls never reach this mux: they go to the join
