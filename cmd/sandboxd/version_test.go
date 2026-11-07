@@ -116,7 +116,7 @@ func TestRunVersionCLIJSON(t *testing.T) {
 			t.Fatalf("%v: not JSON: %v\n%s", args, err, out.String())
 		}
 		want := buildInfo{Version: version.Version, Commit: "deadbeef", FSMOpsVersion: cluster.FSMOpsVersion(),
-			EgressGatewayProtocol: egress.ProtocolVersion, Commands: []string{"upgrade-node", "host-apply", "backup", "restore", "recover-quorum"},
+			EgressGatewayProtocol: egress.ProtocolVersion, Commands: []string{"upgrade-node", "host-apply", "backup", "restore", "recover-quorum", "init", "join", "preflight", "adopt", "reset"},
 			GoVersion: runtime.Version(), Platform: runtime.GOOS + "/" + runtime.GOARCH}
 		if !reflect.DeepEqual(got, want) {
 			t.Fatalf("%v: got %+v, want %+v", args, got, want)

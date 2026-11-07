@@ -49,7 +49,7 @@ type buildInfo struct {
 }
 
 // nodeCommands are the commands buildInfo.Commands lists.
-var nodeCommands = []string{"upgrade-node", "host-apply", "backup", "restore", "recover-quorum"}
+var nodeCommands = []string{"upgrade-node", "host-apply", "backup", "restore", "recover-quorum", "init", "join", "preflight", "adopt", "reset"}
 
 // readBuildInfo is debug.ReadBuildInfo; tests replace it.
 var readBuildInfo = debug.ReadBuildInfo
