@@ -194,7 +194,12 @@ func (h *handlers) clusterCreateWrap(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	h.createSandboxOnSelectedNode(w, r, req, decision.ReservationID)
+	// The router's steps before create;dur (cluster_place, cluster_reserve)
+	// go on the recorder createSandboxOnSelectedNode picks up, so the
+	// response's Server-Timing covers them (plan PR #1000 item L1).
+	ctx, timing := docker.WithCreateTiming(r.Context())
+	decision.RecordReserveStages(timing)
+	h.createSandboxOnSelectedNode(w, r.WithContext(ctx), req, decision.ReservationID)
 }
 
 // createSandboxOnSelectedNode performs the local side effect once placement has
