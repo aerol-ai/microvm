@@ -27,7 +27,7 @@ func (s *Store) ListIdempotentRequests(ctx context.Context, scope, state, afterF
 	if limit <= 0 || limit > maxIdempotentListRows {
 		limit = maxIdempotentListRows
 	}
-	rows, err := s.db.QueryContext(ctx, `
+	rows, err := s.rdb.QueryContext(ctx, `
 		SELECT scope, fingerprint, target_id, state, locked_until, replay_until, created_at, updated_at
 		FROM request_idempotency
 		WHERE scope = ? AND state = ? AND fingerprint > ?

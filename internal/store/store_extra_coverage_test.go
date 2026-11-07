@@ -44,19 +44,8 @@ func TestNetworkCountersAndLimits(t *testing.T) {
 		t.Fatalf("Create: %v", err)
 	}
 
-	// Negative deltas rejected.
-	if err := st.UpdateSandboxNetCounters(ctx, "sb-net", -1, 0); err == nil {
-		t.Fatalf("expected error for negative delta")
-	}
-	// No-op when both zero.
-	if err := st.UpdateSandboxNetCounters(ctx, "sb-net", 0, 0); err != nil {
-		t.Fatalf("zero delta: %v", err)
-	}
-	if err := st.UpdateSandboxNetCounters(ctx, "sb-net", 100, 200); err != nil {
-		t.Fatalf("UpdateSandboxNetCounters: %v", err)
-	}
-	if err := st.UpdateSandboxNetCounters(ctx, "missing", 1, 1); !errors.Is(err, ErrNotFound) {
-		t.Fatalf("UpdateSandboxNetCounters(missing) = %v", err)
+	if _, err := st.ApplyNetCounterDeltas(ctx, []NetCounterDelta{{SandboxID: "sb-net", BytesIn: 100, BytesOut: 200}}); err != nil {
+		t.Fatalf("ApplyNetCounterDeltas: %v", err)
 	}
 
 	if err := st.SetNetworkLimits(ctx, "sb-net", 1000, 2000); err != nil {

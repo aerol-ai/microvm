@@ -3179,7 +3179,7 @@ func TestUpdateTagsLifecycleQueryErrors(t *testing.T) {
 	_ = st.UpdateLifecycle(ctx, "sb", models.Lifecycle{StopIfIdleFor: time.Second})
 	_ = st.MarkNetworkQuotaExceeded(ctx, "sb", time.Now())
 	_ = st.SetAllowPublicTraffic(ctx, "sb", true, "https://x")
-	_ = st.UpdateSandboxNetCounters(ctx, "sb", 1, 2)
+	_, _ = st.ApplyNetCounterDeltas(ctx, []NetCounterDelta{{SandboxID: "sb", BytesIn: 1, BytesOut: 2}})
 	_, _ = st.ListAutoImportPendingIDs(ctx)
 }
 

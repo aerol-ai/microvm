@@ -41,11 +41,14 @@ db.SetMaxOpenConns(1)
 db.SetMaxIdleConns(1)
 ```
 
-The store also turns on three SQLite settings:
+The store also turns on four SQLite settings:
 
 - `PRAGMA journal_mode = WAL` (write-ahead logging), so readers can keep working during a write.
 - `PRAGMA foreign_keys = ON`, so deleting a sandbox also deletes the rows that belong to it.
 - `busy_timeout=5000`, so a blocked operation waits up to five seconds instead of failing at once.
+- `PRAGMA synchronous = NORMAL`, so a commit does not wait for the disk. The log is synced at each checkpoint. A crash of `sandboxd` loses nothing, and the file is never corrupted. A power cut can undo the commits since the last checkpoint.
+
+Plain reads that are not inside a transaction use a second, read-only pool of four connections. WAL lets them run while the writer works, so a long read, such as listing every sandbox, never makes a create wait. That pool cannot write: it is opened with `query_only`. A transaction reads through the writer, so the read and the write that depends on it stay one step.
 
 The key property is in the first two lines of code: **every write in this process goes through one SQL connection.** Two API handlers making conflicting changes do not race in the database. One waits its turn in Go's `database/sql` pool.
 

@@ -63,7 +63,7 @@ func (s *Store) ListSealedRows(ctx context.Context, col SealedColumn, afterID st
 	if limit <= 0 {
 		return nil, errors.New("sealed row page limit must be positive")
 	}
-	rows, err := s.db.QueryContext(ctx, q.list, afterID, limit)
+	rows, err := s.rdb.QueryContext(ctx, q.list, afterID, limit)
 	if err != nil {
 		return nil, fmt.Errorf("list sealed %s: %w", q.name, err)
 	}

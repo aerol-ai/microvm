@@ -21,7 +21,26 @@ import (
 )
 
 type Store struct {
+	// db is the one writer: every write and every transaction goes through
+	// its single connection (see open). rdb serves plain reads outside a
+	// transaction from a small read-only pool, so a read never waits behind
+	// a write, and a long read (List over every sandbox) never makes a
+	// create wait. WAL gives each read the latest committed state, so a read
+	// that starts after a write has returned always sees that write. For an
+	// in-memory database rdb is db: a second connection would open a
+	// different, empty database.
+	//
+	// Claim paths stay on db. The slot claims (netns, TAP, VMM) are single
+	// UPDATE statements that pick their own target (claimContainerNetnsSlot).
+	// AddCustomDomain, EnsureWasmCheckpointCleanupRef and getPort (under
+	// TryReserveHostPort) write and then read the row that decided the
+	// outcome; they read on db so they behave exactly as with one
+	// connection. TestClaimPathsReadOnWriter keeps all of them off rdb: a
+	// read-then-claim loop on the pool let racing callers pick the same
+	// candidate and run out of retries (32 concurrent reservations: 19%
+	// failed, before claims became one statement).
 	db           *sql.DB
+	rdb          *sql.DB
 	secretCipher *secrets.Cipher
 }
 
@@ -36,6 +55,13 @@ func (s *Store) SetSecretCipher(cipher *secrets.Cipher) {
 }
 
 const sqliteBusyTimeoutMS = 5000
+
+// sqliteReadConns caps the read-only pool beside the writer. SQLite in WAL
+// mode runs any number of readers alongside the one writer; four covers the
+// concurrent API reads and background sweeps of one node without holding
+// many idle file handles. BenchmarkStoreGetUnderWrites and
+// BenchmarkStoreCreateDuringListSweep measure what it buys.
+const sqliteReadConns = 4
 
 func Open(path string) (*Store, error) {
 	return open(path, nil)
@@ -1305,7 +1331,20 @@ func open(path string, secretCipher *secrets.Cipher) (*Store, error) {
 		}
 	}
 
-	return &Store{db: db, secretCipher: secretCipher}, nil
+	rdb := db
+	if !isMemorySQLitePath(path) {
+		// Opened only after every migration above, so no reader can see a
+		// half-migrated schema.
+		rdb, err = sql.Open("sqlite3", sqliteReadDSN(path))
+		if err != nil {
+			db.Close()
+			return nil, fmt.Errorf("open sqlite read pool: %w", err)
+		}
+		rdb.SetMaxOpenConns(sqliteReadConns)
+		rdb.SetMaxIdleConns(sqliteReadConns)
+	}
+
+	return &Store{db: db, rdb: rdb, secretCipher: secretCipher}, nil
 }
 
 const legacySecretMigrationBatchSize = 256
@@ -2075,7 +2114,31 @@ func sqliteDSN(path string) string {
 	options.Set("_busy_timeout", fmt.Sprintf("%d", sqliteBusyTimeoutMS))
 	options.Set("_foreign_keys", "on")
 	options.Set("_journal_mode", "WAL")
+	// NORMAL is also go-sqlite3's own default; it is set here so the choice
+	// is visible and a driver upgrade cannot change it. In WAL mode a commit
+	// does not wait for a disk sync: the WAL is synced at each checkpoint.
+	// The database can never be corrupted by a crash. A sandboxd crash loses
+	// nothing (the OS still holds the writes); a power cut or kernel crash
+	// can roll back the commits since the last checkpoint. FULL would sync
+	// on every commit, which costs one disk round trip per write (about 1 ms
+	// on EBS gp3) on the single writer. Cluster placement does not depend on
+	// this file: Raft syncs its own log on every append.
+	options.Set("_synchronous", "NORMAL")
+	return withSQLiteOptions(path, options)
+}
 
+// sqliteReadDSN is the DSN of the read-only pool. query_only makes a write
+// that is routed to the pool by mistake fail loudly instead of becoming a
+// second writer. Journal mode is not set: WAL is a property of the database
+// file, and the writer has already set it.
+func sqliteReadDSN(path string) string {
+	options := url.Values{}
+	options.Set("_busy_timeout", fmt.Sprintf("%d", sqliteBusyTimeoutMS))
+	options.Set("_query_only", "true")
+	return withSQLiteOptions(path, options)
+}
+
+func withSQLiteOptions(path string, options url.Values) string {
 	separator := "?"
 	if strings.Contains(path, "?") {
 		separator = "&"
@@ -2083,11 +2146,51 @@ func sqliteDSN(path string) string {
 	return path + separator + options.Encode()
 }
 
+// isMemorySQLitePath reports whether path names an in-memory database, where
+// every new connection would open its own empty database.
+func isMemorySQLitePath(path string) bool {
+	return strings.Contains(path, ":memory:") || strings.Contains(path, "mode=memory")
+}
+
+// storeCloseDrain bounds how long Close waits for queries that other
+// goroutines were already running when it was called.
+const storeCloseDrain = 5 * time.Second
+
+// Close closes both pools and then waits, up to storeCloseDrain, for every
+// connection to be closed. database/sql's own Close does not wait for a
+// connection that is checked out: it closes it whenever that query ends.
+// Background work (the secret-delete fanout, the netstats poller) can be
+// mid-read at shutdown, and its late close checkpoints and removes the WAL
+// files after Close has returned, under whoever owns the directory next.
 func (s *Store) Close() error {
 	if s == nil || s.db == nil {
 		return nil
 	}
-	return s.db.Close()
+	err := s.db.Close()
+	if s.rdb != nil && s.rdb != s.db {
+		err = errors.Join(err, s.rdb.Close())
+	}
+	waitConnsClosed(storeCloseDrain, s.db, s.rdb)
+	return err
+}
+
+// waitConnsClosed polls until every pool reports no open connection or the
+// timeout passes. A closed pool's OpenConnections drops only after the
+// driver connection itself has been closed.
+func waitConnsClosed(timeout time.Duration, pools ...*sql.DB) bool {
+	deadline := time.Now().Add(timeout)
+	for _, pool := range pools {
+		if pool == nil {
+			continue
+		}
+		for pool.Stats().OpenConnections > 0 {
+			if !time.Now().Before(deadline) {
+				return false
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}
+	return true
 }
 
 type dbExecer interface {
@@ -2095,14 +2198,14 @@ type dbExecer interface {
 }
 
 func (s *Store) Create(ctx context.Context, sandbox *models.Sandbox) error {
-	if err := s.ensureSandboxLookupNameAvailable(ctx, sandbox.ID, sandbox.Name); err != nil {
-		return err
-	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin sandbox create: %w", err)
 	}
 	defer tx.Rollback()
+	if err := ensureSandboxLookupNameAvailable(ctx, tx, sandbox.ID, sandbox.Name); err != nil {
+		return err
+	}
 	if err := s.insertSandbox(ctx, tx, sandbox); err != nil {
 		return err
 	}
@@ -2139,14 +2242,14 @@ func (s *Store) CreateWithSealedEnv(ctx context.Context, sandbox *models.Sandbox
 	if len(sealedEnv) == 0 {
 		return s.Create(ctx, sandbox)
 	}
-	if err := s.ensureSandboxLookupNameAvailable(ctx, sandbox.ID, sandbox.Name); err != nil {
-		return err
-	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin create+env tx: %w", err)
 	}
 	defer tx.Rollback()
+	if err := ensureSandboxLookupNameAvailable(ctx, tx, sandbox.ID, sandbox.Name); err != nil {
+		return err
+	}
 	// Persist without plaintext env_json; sealed row is the source of truth.
 	cleared := *sandbox
 	cleared.Env = nil
@@ -2188,7 +2291,7 @@ func putCreateDigestExec(ctx context.Context, exec dbExecer, sandbox *models.San
 // key, or a row made before digests were kept).
 func (s *Store) GetCreateRequestDigest(ctx context.Context, sandboxID string) (string, error) {
 	var digest string
-	err := s.db.QueryRowContext(ctx, `SELECT digest FROM sandbox_create_digests WHERE sandbox_id = ?`, strings.TrimSpace(sandboxID)).Scan(&digest)
+	err := s.rdb.QueryRowContext(ctx, `SELECT digest FROM sandbox_create_digests WHERE sandbox_id = ?`, strings.TrimSpace(sandboxID)).Scan(&digest)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", nil
 	}
@@ -2433,12 +2536,9 @@ func (s *Store) Upsert(ctx context.Context, sandbox *models.Sandbox) error {
 	if err != nil {
 		return err
 	}
-	if err := s.ensureSandboxLookupNameAvailable(ctx, sandbox.ID, sandbox.Name); err != nil {
-		return err
-	}
-
 	incarnationID := strings.TrimSpace(sandbox.AuditIncarnationID)
 	var exec dbExecer = s.db
+	var lookup queryRower = s.db
 	var tx *sql.Tx
 	if incarnationID != "" {
 		tx, err = s.db.BeginTx(ctx, nil)
@@ -2447,7 +2547,12 @@ func (s *Store) Upsert(ctx context.Context, sandbox *models.Sandbox) error {
 		}
 		defer tx.Rollback()
 		exec = tx
-
+		lookup = tx
+	}
+	if err := ensureSandboxLookupNameAvailable(ctx, lookup, sandbox.ID, sandbox.Name); err != nil {
+		return err
+	}
+	if tx != nil {
 		// Upsert may insert a row, but it must not silently replace the durable
 		// lifecycle identity of an existing sandbox.
 		var currentIncarnationID string
@@ -2699,7 +2804,7 @@ func (s *Store) Upsert(ctx context.Context, sandbox *models.Sandbox) error {
 }
 
 func (s *Store) Get(ctx context.Context, id string) (*models.Sandbox, error) {
-	row := s.db.QueryRowContext(ctx, `
+	row := s.rdb.QueryRowContext(ctx, `
 		SELECT id, image, status, public_url, container_id, container_ip, cpu, memory_mb, disk_gb,
 			os_user, network_block_all, network_allow_out_json, network_deny_out_json, allow_public_traffic, mask_request_host, toolbox_enabled, toolbox_token_sealed, ssh_public_key,
 			last_error, container_command_json, name, tags_json, created_at, updated_at, last_active_at,
@@ -2767,13 +2872,13 @@ func (s *Store) CountDistinctSandboxOwners(ctx context.Context, max int) (int, e
 		max = 1
 	}
 	var n int
-	err := s.db.QueryRowContext(ctx,
+	err := s.rdb.QueryRowContext(ctx,
 		`SELECT COUNT(*) FROM (SELECT DISTINCT owner_ref FROM sandboxes LIMIT ?)`, max).Scan(&n)
 	return n, err
 }
 
 func (s *Store) List(ctx context.Context) ([]*models.Sandbox, error) {
-	rows, err := s.db.QueryContext(ctx, `
+	rows, err := s.rdb.QueryContext(ctx, `
 		SELECT id, image, status, public_url, container_id, container_ip, cpu, memory_mb, disk_gb,
 			os_user, network_block_all, network_allow_out_json, network_deny_out_json, allow_public_traffic, mask_request_host, toolbox_enabled, toolbox_token_sealed, ssh_public_key,
 			last_error, container_command_json, name, tags_json, created_at, updated_at, last_active_at,
@@ -2849,7 +2954,7 @@ func (s *Store) List(ctx context.Context) ([]*models.Sandbox, error) {
 // here — the current callers (scoping filter, enforcement) only need identity
 // and lifecycle fields, so we skip the bulk joins.
 func (s *Store) ListByOwner(ctx context.Context, ownerRef string) ([]*models.Sandbox, error) {
-	rows, err := s.db.QueryContext(ctx, `
+	rows, err := s.rdb.QueryContext(ctx, `
 		SELECT id, image, status, public_url, container_id, container_ip, cpu, memory_mb, disk_gb,
 			os_user, network_block_all, network_allow_out_json, network_deny_out_json, allow_public_traffic, mask_request_host, toolbox_enabled, toolbox_token_sealed, ssh_public_key,
 			last_error, container_command_json, name, tags_json, created_at, updated_at, last_active_at,
@@ -2912,7 +3017,7 @@ func (s *Store) ListByOwner(ctx context.Context, ownerRef string) ([]*models.San
 // sweep callers only need identity + lifecycle fields. Toolbox tokens stay
 // sealed; those sweeps never need the bearer.
 func (s *Store) ListByRuntime(ctx context.Context, runtime string) ([]*models.Sandbox, error) {
-	rows, err := s.db.QueryContext(ctx, `
+	rows, err := s.rdb.QueryContext(ctx, `
 		SELECT id, image, status, public_url, container_id, container_ip, cpu, memory_mb, disk_gb,
 			os_user, network_block_all, network_allow_out_json, network_deny_out_json, allow_public_traffic, mask_request_host, toolbox_enabled, toolbox_token_sealed, ssh_public_key,
 			last_error, container_command_json, name, tags_json, created_at, updated_at, last_active_at,
@@ -3022,7 +3127,7 @@ func (s *Store) UpsertAccountMapping(ctx context.Context, ownerRef, externalID s
 // dominates, switch to a chunked WHERE sandbox_id IN (...) with parameter
 // batches; the in-memory join below stays the same shape.
 func (s *Store) attachPortsBulk(ctx context.Context, byID map[string]*models.Sandbox) error {
-	rows, err := s.db.QueryContext(ctx, `
+	rows, err := s.rdb.QueryContext(ctx, `
 		SELECT sandbox_id, port, protocol, host_port, public_url, created_at, visibility
 		FROM exposed_ports
 		ORDER BY sandbox_id, port ASC
@@ -3071,7 +3176,7 @@ func (s *Store) HasActiveImageRef(ctx context.Context, image string) (bool, erro
 		return true, nil
 	}
 	var present int
-	err := s.db.QueryRowContext(ctx, hasActiveImageRefSQL, image, string(models.SandboxStatusDestroyed), image).Scan(&present)
+	err := s.rdb.QueryRowContext(ctx, hasActiveImageRefSQL, image, string(models.SandboxStatusDestroyed), image).Scan(&present)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, nil
 	}
@@ -3134,7 +3239,7 @@ func (s *Store) ListPendingImageGCDue(ctx context.Context, cutoff time.Time, lim
 		query += " LIMIT ?"
 		args = append(args, limit)
 	}
-	rows, err := s.db.QueryContext(ctx, query, args...)
+	rows, err := s.rdb.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("list pending image gc due: %w", err)
 	}
@@ -3298,35 +3403,107 @@ func (s *Store) UpdateLifecycle(ctx context.Context, id string, l models.Lifecyc
 	return nil
 }
 
-// UpdateSandboxNetCounters bumps the cumulative ingress/egress counters by
-// the given deltas. Both values are non-negative byte counts measured since
-// the last sample. Concurrent calls are serialized by SQLite's single
-// writer, and the UPDATE is atomic so a failed sample never partially
-// applies. Returns ErrNotFound if the sandbox row was deleted between the
-// poller's snapshot and this write — the netstats poller treats that as a
-// cleanup signal and drops the in-memory baseline.
-func (s *Store) UpdateSandboxNetCounters(ctx context.Context, id string, deltaIn, deltaOut int64) error {
-	if deltaIn < 0 || deltaOut < 0 {
-		return fmt.Errorf("net counter deltas must be non-negative (in=%d out=%d)", deltaIn, deltaOut)
+// NetCounterDelta is one sandbox's byte counts since the previous netstats
+// poll. Both are non-negative.
+type NetCounterDelta struct {
+	SandboxID string
+	BytesIn   int64
+	BytesOut  int64
+}
+
+// NetCounterTotals is a sandbox's cumulative counters, caps and quota flag
+// as they stand right after a delta, read by the same statement that
+// applied it. Index is that delta's position in the ApplyNetCounterDeltas
+// input, so a caller can pair totals with its own per-delta data even when
+// one sandbox appears twice.
+type NetCounterTotals struct {
+	Index         int
+	SandboxID     string
+	OwnerRef      string
+	BytesIn       int64
+	BytesOut      int64
+	BytesInLimit  int64
+	BytesOutLimit int64
+	QuotaExceeded bool
+}
+
+// netCounterBatchRows bounds one ApplyNetCounterDeltas transaction. The
+// writer is held for a whole transaction, so a poll over thousands of
+// sandboxes is cut into short ones and a create waits behind at most one
+// of them, not behind the whole poll. Measured with BenchmarkStoreNetstatsTick
+// over 2,000 sandboxes: 64 rows keeps a create that lands mid-poll near 1 ms
+// (256 rows: 1-3 ms) for a poll of ~32 ms instead of ~28 ms.
+const netCounterBatchRows = 64
+
+// ApplyNetCounterDeltas adds each delta to its sandbox's cumulative counters
+// and returns the totals right after, for every sandbox that still exists.
+// A sandbox deleted since the poll, or a zero delta, is skipped without an
+// error. Any negative delta rejects the whole call before anything is
+// written.
+//
+// Deltas are applied netCounterBatchRows at a time, one transaction each.
+// The netstats poller used to pay one commit plus a four-query re-read per
+// sandbox per poll, all on the single writer (BenchmarkStoreNetstatsTick);
+// the totals now come back from the UPDATE itself. Each UPDATE is atomic,
+// so a sample is applied whole or not at all. On an error the returned
+// totals cover exactly the batches that committed before it.
+func (s *Store) ApplyNetCounterDeltas(ctx context.Context, deltas []NetCounterDelta) ([]NetCounterTotals, error) {
+	for _, d := range deltas {
+		if d.BytesIn < 0 || d.BytesOut < 0 {
+			return nil, fmt.Errorf("net counter deltas must be non-negative (sandbox=%s in=%d out=%d)", d.SandboxID, d.BytesIn, d.BytesOut)
+		}
 	}
-	if deltaIn == 0 && deltaOut == 0 {
-		return nil
+	totals := make([]NetCounterTotals, 0, len(deltas))
+	for start := 0; start < len(deltas); start += netCounterBatchRows {
+		end := min(start+netCounterBatchRows, len(deltas))
+		committed := len(totals)
+		var err error
+		if totals, err = s.applyNetCounterBatch(ctx, deltas[start:end], start, totals); err != nil {
+			return totals[:committed], err
+		}
 	}
-	result, err := s.db.ExecContext(ctx, `
+	return totals, nil
+}
+
+func (s *Store) applyNetCounterBatch(ctx context.Context, deltas []NetCounterDelta, offset int, totals []NetCounterTotals) ([]NetCounterTotals, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return totals, fmt.Errorf("begin net counter batch: %w", err)
+	}
+	defer tx.Rollback()
+	stmt, err := tx.PrepareContext(ctx, `
 		UPDATE sandboxes
 		SET net_bytes_in = net_bytes_in + ?,
 		    net_bytes_out = net_bytes_out + ?,
 		    updated_at = ?
 		WHERE id = ?
-	`, deltaIn, deltaOut, time.Now().UTC(), id)
+		RETURNING owner_ref, net_bytes_in, net_bytes_out,
+			net_bytes_in_limit, net_bytes_out_limit, net_quota_exceeded
+	`)
 	if err != nil {
-		return fmt.Errorf("update sandbox net counters: %w", err)
+		return totals, fmt.Errorf("prepare net counter batch: %w", err)
 	}
-	affected, err := result.RowsAffected()
-	if err == nil && affected == 0 {
-		return ErrNotFound
+	defer stmt.Close()
+	now := time.Now().UTC()
+	for i, d := range deltas {
+		if d.BytesIn == 0 && d.BytesOut == 0 {
+			continue
+		}
+		t := NetCounterTotals{Index: offset + i, SandboxID: d.SandboxID}
+		err := stmt.QueryRowContext(ctx, d.BytesIn, d.BytesOut, now, d.SandboxID).Scan(
+			&t.OwnerRef, &t.BytesIn, &t.BytesOut, &t.BytesInLimit, &t.BytesOutLimit, &t.QuotaExceeded)
+		if errors.Is(err, sql.ErrNoRows) {
+			continue
+		}
+		if err != nil {
+			return totals, fmt.Errorf("update sandbox net counters: %w", err)
+		}
+		totals = append(totals, t)
 	}
-	return nil
+	if err := tx.Commit(); err != nil {
+		return totals, fmt.Errorf("commit net counter batch: %w", err)
+	}
+	return totals, nil
 }
 
 // SetNetworkLimits replaces the per-sandbox network byte caps. Zero means
@@ -3494,7 +3671,7 @@ func (s *Store) SetAutoImportPending(ctx context.Context, id string, pending boo
 // have meanwhile been deleted without holding a large in-memory snapshot.
 // Hits the partial index on (auto_import_pending = 1).
 func (s *Store) ListAutoImportPendingIDs(ctx context.Context) ([]string, error) {
-	rows, err := s.db.QueryContext(ctx, `
+	rows, err := s.rdb.QueryContext(ctx, `
 		SELECT id FROM sandboxes
 		WHERE auto_import_pending = 1
 		ORDER BY updated_at ASC
@@ -3595,12 +3772,17 @@ func (s *Store) RollbackSandboxCreate(ctx context.Context, id, incarnationID str
 // namespace unambiguous. Handlers resolve by id first and name second, so a
 // name that equals another sandbox's id would otherwise be permanently
 // shadowed. The inverse is also rejected for caller-supplied ids.
-func (s *Store) ensureSandboxLookupNameAvailable(ctx context.Context, id, name string) error {
+//
+// Callers pass the write transaction that inserts the row, so the check and
+// the insert are one atomic step under the single writer. The id-against-
+// names query cannot use idx_sandboxes_name (owner_ref leads it) and scans
+// the table; on the writer's connection those pages are already cached.
+func ensureSandboxLookupNameAvailable(ctx context.Context, q queryRower, id, name string) error {
 	id = strings.TrimSpace(id)
 	name = strings.TrimSpace(name)
 	if name != "" {
 		var existingID string
-		err := s.db.QueryRowContext(ctx, `
+		err := q.QueryRowContext(ctx, `
 			SELECT id FROM sandboxes
 			WHERE id = ? AND id <> ?
 			LIMIT 1
@@ -3614,7 +3796,7 @@ func (s *Store) ensureSandboxLookupNameAvailable(ctx context.Context, id, name s
 	}
 	if id != "" {
 		var existingID string
-		err := s.db.QueryRowContext(ctx, `
+		err := q.QueryRowContext(ctx, `
 			SELECT id FROM sandboxes
 			WHERE name = ? AND id <> ?
 			LIMIT 1
@@ -3661,7 +3843,7 @@ func (s *Store) UpsertCompatState(ctx context.Context, sandboxID, facade, stateJ
 // GetCompatState returns the state blob for (sandboxID, facade), or
 // ErrNotFound when no row exists. Callers unmarshal state_json themselves.
 func (s *Store) GetCompatState(ctx context.Context, sandboxID, facade string) (*models.SandboxCompatState, error) {
-	row := s.db.QueryRowContext(ctx, `
+	row := s.rdb.QueryRowContext(ctx, `
 		SELECT sandbox_id, facade, state_json, created_at, updated_at
 		FROM sandbox_compat_state
 		WHERE sandbox_id = ? AND facade = ?
@@ -3680,7 +3862,7 @@ func (s *Store) GetCompatState(ctx context.Context, sandboxID, facade string) (*
 // sandbox_id. Empty result is map of length zero, not nil — callers can
 // always index into it.
 func (s *Store) ListCompatState(ctx context.Context, facade string) (map[string]models.SandboxCompatState, error) {
-	rows, err := s.db.QueryContext(ctx, `
+	rows, err := s.rdb.QueryContext(ctx, `
 		SELECT sandbox_id, facade, state_json, created_at, updated_at
 		FROM sandbox_compat_state
 		WHERE facade = ?
@@ -3712,7 +3894,7 @@ func (s *Store) ListCompatState(ctx context.Context, facade string) (map[string]
 // real cost at 100k sandboxes, and returning only the owner's rows keeps the
 // owner check inside the shared helper rather than relying on the caller.
 func (s *Store) ListCompatStateByOwner(ctx context.Context, facade, ownerRef string) (map[string]models.SandboxCompatState, error) {
-	rows, err := s.db.QueryContext(ctx, `
+	rows, err := s.rdb.QueryContext(ctx, `
 		SELECT cs.sandbox_id, cs.facade, cs.state_json, cs.created_at, cs.updated_at
 		FROM sandbox_compat_state cs
 		JOIN sandboxes s ON s.id = cs.sandbox_id
@@ -3748,7 +3930,7 @@ func (s *Store) ResolveSandboxIDByName(ctx context.Context, ownerRef, name strin
 	if trimmed == "" {
 		return "", ErrNotFound
 	}
-	row := s.db.QueryRowContext(ctx, `SELECT id FROM sandboxes WHERE owner_ref = ? AND name = ?`, strings.TrimSpace(ownerRef), trimmed)
+	row := s.rdb.QueryRowContext(ctx, `SELECT id FROM sandboxes WHERE owner_ref = ? AND name = ?`, strings.TrimSpace(ownerRef), trimmed)
 	var sandboxID string
 	if err := row.Scan(&sandboxID); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -3806,7 +3988,7 @@ func (s *Store) UpsertSnapshotAlias(ctx context.Context, alias models.SnapshotAl
 // GetSnapshotAlias returns the alias row, or ErrNotFound if the alias
 // does not exist.
 func (s *Store) GetSnapshotAlias(ctx context.Context, alias string) (*models.SnapshotAlias, error) {
-	row := s.db.QueryRowContext(ctx, `
+	row := s.rdb.QueryRowContext(ctx, `
 		SELECT alias, snapshot_name, facade, extra_names_json, state_json, created_at, updated_at, owner_ref
 		FROM snapshot_aliases
 		WHERE alias = ?
@@ -3828,13 +4010,13 @@ func (s *Store) ListSnapshotAliases(ctx context.Context, facade string) (map[str
 	var err error
 	trimmed := strings.TrimSpace(facade)
 	if trimmed == "" {
-		rows, err = s.db.QueryContext(ctx, `
+		rows, err = s.rdb.QueryContext(ctx, `
 			SELECT alias, snapshot_name, facade, extra_names_json, state_json, created_at, updated_at, owner_ref
 			FROM snapshot_aliases
 			ORDER BY created_at DESC, alias ASC
 		`)
 	} else {
-		rows, err = s.db.QueryContext(ctx, `
+		rows, err = s.rdb.QueryContext(ctx, `
 			SELECT alias, snapshot_name, facade, extra_names_json, state_json, created_at, updated_at, owner_ref
 			FROM snapshot_aliases
 			WHERE facade = ?
@@ -3865,7 +4047,7 @@ func (s *Store) ListSnapshotAliases(ctx context.Context, facade string) (map[str
 // tenant's alias rows (and the facade state on them) never leave the store.
 func (s *Store) ListSnapshotAliasesForOwner(ctx context.Context, facade, ownerRef string) (map[string]models.SnapshotAlias, error) {
 	trimmed := strings.TrimSpace(facade)
-	rows, err := s.db.QueryContext(ctx, `
+	rows, err := s.rdb.QueryContext(ctx, `
 		SELECT a.alias, a.snapshot_name, a.facade, a.extra_names_json, a.state_json, a.created_at, a.updated_at, a.owner_ref
 		FROM snapshot_aliases a
 		WHERE a.owner_ref = ? AND (? = '' OR a.facade = ?)
@@ -4010,7 +4192,7 @@ func (s *Store) ClaimIdempotentRequest(ctx context.Context, scope, fingerprint s
 // GetIdempotentRequest returns the row for (scope, fingerprint), or
 // ErrNotFound when no row exists.
 func (s *Store) GetIdempotentRequest(ctx context.Context, scope, fingerprint string) (*models.IdempotentRequestRecord, error) {
-	row := s.db.QueryRowContext(ctx, `
+	row := s.rdb.QueryRowContext(ctx, `
 		SELECT scope, fingerprint, target_id, state, locked_until, replay_until, created_at, updated_at
 		FROM request_idempotency
 		WHERE scope = ? AND fingerprint = ?
@@ -4111,7 +4293,7 @@ func (s *Store) CreateSnapshot(ctx context.Context, snapshot *models.SandboxSnap
 }
 
 func (s *Store) GetSnapshot(ctx context.Context, ownerRef, name string) (*models.SandboxSnapshot, error) {
-	row := s.db.QueryRowContext(ctx, `
+	row := s.rdb.QueryRowContext(ctx, `
 		SELECT name, image, image_id, source_sandbox_id, created_at,
 			entrypoint_json, region_id, cpu, memory_mb, disk_gb, gpu,
 			image_distribution_mode, image_digest, image_registry_ref, image_verified_at,
@@ -4143,7 +4325,7 @@ func (s *Store) GetSnapshotByNames(ctx context.Context, ownerRef string, names [
 	for _, name := range names {
 		args = append(args, strings.TrimSpace(name))
 	}
-	rows, err := s.db.QueryContext(ctx, `
+	rows, err := s.rdb.QueryContext(ctx, `
 		SELECT name, image, image_id, source_sandbox_id, created_at,
 			entrypoint_json, region_id, cpu, memory_mb, disk_gb, gpu,
 			image_distribution_mode, image_digest, image_registry_ref, image_verified_at,
@@ -4203,7 +4385,7 @@ func (s *Store) GetSnapshotsByImage(ctx context.Context, images []string) ([]*mo
 		args = append(args, strings.TrimSpace(image))
 	}
 	args = append(args, maxSnapshotsByImage)
-	rows, err := s.db.QueryContext(ctx, snapshotsByImageSQL(len(images)), args...)
+	rows, err := s.rdb.QueryContext(ctx, snapshotsByImageSQL(len(images)), args...)
 	if err != nil {
 		return nil, fmt.Errorf("get snapshots by image: %w", err)
 	}
@@ -4223,7 +4405,7 @@ func (s *Store) GetSnapshotsByImage(ctx context.Context, images []string) ([]*mo
 }
 
 func (s *Store) ListSnapshots(ctx context.Context) ([]*models.SandboxSnapshot, error) {
-	rows, err := s.db.QueryContext(ctx, `
+	rows, err := s.rdb.QueryContext(ctx, `
 		SELECT name, image, image_id, source_sandbox_id, created_at,
 			entrypoint_json, region_id, cpu, memory_mb, disk_gb, gpu,
 			image_distribution_mode, image_digest, image_registry_ref, image_verified_at,
@@ -4296,7 +4478,7 @@ func (s *Store) ListSnapshotPage(ctx context.Context, q SnapshotPageQuery) ([]Sn
 		return nil, fmt.Errorf("list snapshot page: limit must be positive")
 	}
 	query, args := snapshotPageSQL(q, min(q.Limit, maxSnapshotPageRows))
-	rows, err := s.db.QueryContext(ctx, query, args...)
+	rows, err := s.rdb.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("list snapshot page: %w", err)
 	}
@@ -4381,7 +4563,7 @@ func countSnapshotsSQL(ownerRef string, scoped bool, sourceSandboxID string) (st
 func (s *Store) CountSnapshots(ctx context.Context, ownerRef string, scoped bool, sourceSandboxID string) (int, error) {
 	query, args := countSnapshotsSQL(ownerRef, scoped, sourceSandboxID)
 	var count int
-	err := s.db.QueryRowContext(ctx, query, args...).Scan(&count)
+	err := s.rdb.QueryRowContext(ctx, query, args...).Scan(&count)
 	if err != nil {
 		return 0, fmt.Errorf("count snapshots: %w", err)
 	}
@@ -4539,7 +4721,7 @@ func (s *Store) CreateTemplate(ctx context.Context, template *models.Template) e
 }
 
 func (s *Store) GetTemplate(ctx context.Context, id string) (*models.Template, error) {
-	row := s.db.QueryRowContext(ctx, `
+	row := s.rdb.QueryRowContext(ctx, `
 		SELECT id, image, status, rootfs_path, rootfs_size_bytes, min_size_mib,
 			last_error, created_at, updated_at, ready_at,
 			snapshot_memory_path, snapshot_state_path, snapshot_size_bytes,
@@ -4559,7 +4741,7 @@ func (s *Store) GetTemplate(ctx context.Context, id string) (*models.Template, e
 }
 
 func (s *Store) ListTemplates(ctx context.Context) ([]*models.Template, error) {
-	rows, err := s.db.QueryContext(ctx, `
+	rows, err := s.rdb.QueryContext(ctx, `
 		SELECT id, image, status, rootfs_path, rootfs_size_bytes, min_size_mib,
 			last_error, created_at, updated_at, ready_at,
 			snapshot_memory_path, snapshot_state_path, snapshot_size_bytes,
@@ -4788,7 +4970,7 @@ func (s *Store) MarkTemplatePushPending(ctx context.Context, id string) (bool, e
 // push_state. The reconciler enforces the same guard defensively, but
 // filtering at the source means we never even materialize the row.
 func (s *Store) ListTemplatesPendingPush(ctx context.Context) ([]*models.Template, error) {
-	rows, err := s.db.QueryContext(ctx, `
+	rows, err := s.rdb.QueryContext(ctx, `
 		SELECT id, image, status, rootfs_path, rootfs_size_bytes, min_size_mib,
 			last_error, created_at, updated_at, ready_at,
 			snapshot_memory_path, snapshot_state_path, snapshot_size_bytes,
@@ -4836,7 +5018,7 @@ func (s *Store) ListTemplatesPendingPush(ctx context.Context) ([]*models.Templat
 // under its own read, so a row that another caller already recovered
 // between this list and the rebuild kick is handled cleanly.
 func (s *Store) ListUnhealthyTemplates(ctx context.Context) ([]*models.Template, error) {
-	rows, err := s.db.QueryContext(ctx, `
+	rows, err := s.rdb.QueryContext(ctx, `
 		SELECT id, image, status, rootfs_path, rootfs_size_bytes, min_size_mib,
 			last_error, created_at, updated_at, ready_at,
 			snapshot_memory_path, snapshot_state_path, snapshot_size_bytes,
@@ -4875,7 +5057,7 @@ func (s *Store) ListUnhealthyTemplates(ctx context.Context) ([]*models.Template,
 // Returns rows sorted oldest-first so a reconcile sweep that hits its
 // per-tick fanout cap rotates the most-overdue templates first.
 func (s *Store) ListTemplatesReadyBefore(ctx context.Context, cutoff time.Time) ([]*models.Template, error) {
-	rows, err := s.db.QueryContext(ctx, `
+	rows, err := s.rdb.QueryContext(ctx, `
 		SELECT id, image, status, rootfs_path, rootfs_size_bytes, min_size_mib,
 			last_error, created_at, updated_at, ready_at,
 			snapshot_memory_path, snapshot_state_path, snapshot_size_bytes,
@@ -4911,7 +5093,7 @@ func (s *Store) ListTemplatesReadyBefore(ctx context.Context, cutoff time.Time) 
 // these sets distinct prevents a pending or failed template from looking
 // absent to item routing without making it eligible for sandbox placement.
 func (s *Store) ListTemplateInventoryIDs(ctx context.Context) (readyIDs, catalogIDs []string, err error) {
-	rows, err := s.db.QueryContext(ctx, `
+	rows, err := s.rdb.QueryContext(ctx, `
 		SELECT id, status
 		FROM firecracker_templates
 		ORDER BY id ASC
@@ -4968,7 +5150,7 @@ func (s *Store) IsTemplateReferenced(ctx context.Context, id string) (bool, erro
 		return false, nil
 	}
 	var present int
-	err := s.db.QueryRowContext(ctx, `
+	err := s.rdb.QueryRowContext(ctx, `
 		SELECT 1 FROM sandboxes
 		WHERE template_id = ?
 		LIMIT 1
@@ -4993,7 +5175,7 @@ func (s *Store) IsTemplateReferencedByVMM(ctx context.Context, id string) (bool,
 		return false, nil
 	}
 	var present int
-	err := s.db.QueryRowContext(ctx, `
+	err := s.rdb.QueryRowContext(ctx, `
 		SELECT 1 FROM firecracker_vmm_pool
 		WHERE template_id = ?
 		LIMIT 1
@@ -5018,7 +5200,7 @@ func (s *Store) ListGCEligibleTemplates(ctx context.Context, olderThan time.Time
 	// "build goroutine still owns this row, do not GC" — same reason
 	// as pending. We explicitly enumerate so a stray status string
 	// (older build, manual SQL) doesn't get silently swept.
-	rows, err := s.db.QueryContext(ctx, `
+	rows, err := s.rdb.QueryContext(ctx, `
 		SELECT id, image, status, rootfs_path, rootfs_size_bytes, min_size_mib,
 			last_error, created_at, updated_at, ready_at,
 			snapshot_memory_path, snapshot_state_path, snapshot_size_bytes,
@@ -5324,7 +5506,7 @@ func (s *Store) TryReserveHostPort(ctx context.Context, sandboxID string, contai
 // protocol destination port back to a sandbox/container port.
 func (s *Store) GetPortByHostPort(ctx context.Context, hostPort int) (*models.ExposedPort, error) {
 	var exposure models.ExposedPort
-	err := scanExposedPort(s.db.QueryRowContext(ctx, `
+	err := scanExposedPort(s.rdb.QueryRowContext(ctx, `
 		SELECT sandbox_id, port, protocol, host_port, public_url, created_at, visibility
 		FROM exposed_ports
 		WHERE host_port = ?
@@ -5354,6 +5536,9 @@ func (s *Store) ListPorts(ctx context.Context, sandboxID string) ([]models.Expos
 }
 
 // getPort returns the exposure row for (sandboxID, port), or nil if absent.
+// getPort is TryReserveHostPort's conflict lookup, so it reads on the writer
+// like the other claim paths: the host-port pool behaves exactly as it did
+// with a single connection.
 func (s *Store) getPort(ctx context.Context, sandboxID string, port int) (*models.ExposedPort, error) {
 	var exposure models.ExposedPort
 	err := scanExposedPort(s.db.QueryRowContext(ctx, `
@@ -5374,7 +5559,7 @@ func (s *Store) getPort(ctx context.Context, sandboxID string, port int) (*model
 // sandbox. Used by reconcile to GC zombie caddy routes / layer4 servers
 // without N+1 per-sandbox lookups.
 func (s *Store) ListAllExposedPorts(ctx context.Context) ([]models.ExposedPort, error) {
-	rows, err := s.db.QueryContext(ctx, `
+	rows, err := s.rdb.QueryContext(ctx, `
 		SELECT sandbox_id, port, protocol, host_port, public_url, created_at, visibility
 		FROM exposed_ports
 		ORDER BY sandbox_id, port ASC
@@ -5509,7 +5694,7 @@ func (s *Store) RemoveCustomDomain(ctx context.Context, sandboxID, hostname stri
 // ListCustomDomains returns the canonical-ordered rows for one sandbox.
 // Empty slice (nil) when the sandbox has no custom domains.
 func (s *Store) ListCustomDomains(ctx context.Context, sandboxID string) ([]models.CustomDomain, error) {
-	rows, err := s.db.QueryContext(ctx, `
+	rows, err := s.rdb.QueryContext(ctx, `
 		SELECT hostname, status, last_error, target_port, created_at, updated_at
 		FROM sandbox_custom_domains
 		WHERE sandbox_id = ?
@@ -5540,7 +5725,7 @@ func (s *Store) ListCustomDomains(ctx context.Context, sandboxID string) ([]mode
 // loop's matcher-GC pass and by the cluster FSM hydration on cold start.
 // Ordered by hostname so reconcile diffs are stable across calls.
 func (s *Store) ListAllCustomDomains(ctx context.Context) ([]CustomDomainRow, error) {
-	rows, err := s.db.QueryContext(ctx, `
+	rows, err := s.rdb.QueryContext(ctx, `
 		SELECT hostname, sandbox_id, status, last_error, target_port, created_at, updated_at
 		FROM sandbox_custom_domains
 		ORDER BY hostname ASC
@@ -5577,7 +5762,7 @@ func (s *Store) ResolveCustomDomain(ctx context.Context, hostname string) (strin
 		return "", ErrNotFound
 	}
 	var sandboxID string
-	err := s.db.QueryRowContext(ctx, `
+	err := s.rdb.QueryRowContext(ctx, `
 		SELECT sandbox_id FROM sandbox_custom_domains WHERE hostname = ?
 	`, hostname).Scan(&sandboxID)
 	if err != nil {
@@ -5627,7 +5812,7 @@ func (s *Store) loadCustomDomains(ctx context.Context, sandboxID string) ([]mode
 // in practice. Switch to a chunked WHERE sandbox_id IN (...) if the table
 // ever crosses ~100k rows.
 func (s *Store) attachCustomDomainsBulk(ctx context.Context, byID map[string]*models.Sandbox) error {
-	rows, err := s.db.QueryContext(ctx, `
+	rows, err := s.rdb.QueryContext(ctx, `
 		SELECT sandbox_id, hostname, status, last_error, target_port, created_at, updated_at
 		FROM sandbox_custom_domains
 		ORDER BY sandbox_id, hostname ASC
@@ -5656,7 +5841,7 @@ func (s *Store) attachCustomDomainsBulk(ctx context.Context, byID map[string]*mo
 }
 
 func (s *Store) loadPorts(ctx context.Context, sandboxID string) ([]models.ExposedPort, error) {
-	rows, err := s.db.QueryContext(ctx, `
+	rows, err := s.rdb.QueryContext(ctx, `
 		SELECT sandbox_id, port, protocol, host_port, public_url, created_at, visibility
 		FROM exposed_ports
 		WHERE sandbox_id = ?
@@ -6429,7 +6614,7 @@ func (s *Store) GetClusterSecret(ctx context.Context, ref string) (*ClusterSecre
 	if ref == "" {
 		return nil, ErrNotFound
 	}
-	row := s.db.QueryRowContext(ctx, `
+	row := s.rdb.QueryRowContext(ctx, `
 		SELECT ref, sandbox_id, version, recipients_json, sealed_payload, seal_generation, created_at, updated_at
 		FROM cluster_secrets
 		WHERE ref = ?
@@ -6607,7 +6792,7 @@ func (s *Store) GetSandboxAuditACLOwnerRef(ctx context.Context, sandboxID, incar
 		return "", nil
 	}
 	var ref string
-	err := s.db.QueryRowContext(ctx, `
+	err := s.rdb.QueryRowContext(ctx, `
 		SELECT owner_ref FROM sandbox_audit_acl
 		WHERE sandbox_id = ? AND incarnation_id = ?
 	`, sandboxID, incarnationID).Scan(&ref)
@@ -6629,7 +6814,7 @@ func (s *Store) HasSandboxAuditACL(ctx context.Context, sandboxID, incarnationID
 		return false, nil
 	}
 	var one int
-	err := s.db.QueryRowContext(ctx, `
+	err := s.rdb.QueryRowContext(ctx, `
 		SELECT 1 FROM sandbox_audit_acl
 		WHERE sandbox_id = ? AND incarnation_id = ?
 		LIMIT 1
@@ -6674,7 +6859,7 @@ func (s *Store) SandboxAuditIncarnations(ctx context.Context, ids []string) (map
 			args[i] = id
 			marks[i] = "?"
 		}
-		rows, err := s.db.QueryContext(ctx, `
+		rows, err := s.rdb.QueryContext(ctx, `
 			SELECT id, audit_incarnation_id FROM sandboxes WHERE id IN (`+strings.Join(marks, ",")+`)
 		`, args...)
 		if err != nil {
@@ -6706,7 +6891,7 @@ func (s *Store) CurrentSandboxAuditIncarnation(ctx context.Context, sandboxID st
 		return "", nil
 	}
 	var incarnationID string
-	err := s.db.QueryRowContext(ctx, `
+	err := s.rdb.QueryRowContext(ctx, `
 		SELECT audit_incarnation_id FROM sandboxes WHERE id = ?
 	`, sandboxID).Scan(&incarnationID)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -6728,7 +6913,7 @@ func (s *Store) LatestRetainedSandboxAuditIncarnation(ctx context.Context, sandb
 		return "", nil
 	}
 	var incarnationID string
-	err := s.db.QueryRowContext(ctx, `
+	err := s.rdb.QueryRowContext(ctx, `
 		SELECT incarnation_id FROM sandbox_audit_acl
 		WHERE sandbox_id = ? AND incarnation_id <> ''
 		ORDER BY established_seq DESC
@@ -7080,7 +7265,7 @@ func (s *Store) GetSecretDeleteOutboxForIncarnation(ctx context.Context, sandbox
 	if sandboxID == "" || incarnationID == "" {
 		return nil, nil
 	}
-	row := s.db.QueryRowContext(ctx, `
+	row := s.rdb.QueryRowContext(ctx, `
 		SELECT sandbox_id, incarnation_id, recipients_json, recipient_provenance_json, generation, awaiting_promotion, attempts, created_at, updated_at
 		FROM cluster_secret_delete_outbox
 		WHERE sandbox_id = ? AND incarnation_id = ?
@@ -7298,7 +7483,7 @@ func (s *Store) NextClusterSecretSealGenerationForIncarnation(ctx context.Contex
 		return 0, errors.New("next cluster secret generation: sandbox id and incarnation id are required")
 	}
 	var tombGeneration sql.NullInt64
-	err := s.db.QueryRowContext(ctx, `
+	err := s.rdb.QueryRowContext(ctx, `
 		SELECT generation FROM cluster_secret_tombs
 		WHERE sandbox_id = ? AND incarnation_id = ?
 	`, sandboxID, incarnationID).Scan(&tombGeneration)
@@ -7306,7 +7491,7 @@ func (s *Store) NextClusterSecretSealGenerationForIncarnation(ctx context.Contex
 		return 0, fmt.Errorf("read cluster secret lifecycle tomb generation: %w", err)
 	}
 	var sealGeneration sql.NullInt64
-	err = s.db.QueryRowContext(ctx, `
+	err = s.rdb.QueryRowContext(ctx, `
 		SELECT seal_generation FROM cluster_secrets
 		WHERE sandbox_id = ? AND ref = ?
 	`, sandboxID, secrets.FormatRef(sandboxID, incarnationID, secrets.RefVersion)).Scan(&sealGeneration)
@@ -7335,7 +7520,7 @@ func (s *Store) ClusterSecretSealGeneration(ctx context.Context, sandboxID, inca
 		return 0, false, nil
 	}
 	var generation int64
-	err := s.db.QueryRowContext(ctx, `
+	err := s.rdb.QueryRowContext(ctx, `
 		SELECT seal_generation FROM cluster_secrets WHERE sandbox_id = ? AND ref = ?
 	`, sandboxID, secrets.FormatRef(sandboxID, incarnationID, secrets.RefVersion)).Scan(&generation)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -7391,7 +7576,7 @@ func (s *Store) ClusterSecretSealSummaries(ctx context.Context, refs []string) (
 			args[i] = ref
 			marks[i] = "?"
 		}
-		rows, err := s.db.QueryContext(ctx, `
+		rows, err := s.rdb.QueryContext(ctx, `
 			SELECT ref, seal_generation, recipients_json
 			FROM cluster_secrets
 			WHERE ref IN (`+strings.Join(marks, ",")+`)
@@ -7449,7 +7634,7 @@ func (s *Store) ListSecretDeleteOutboxDue(ctx context.Context, now time.Time, li
 // store takes no dependency on the JSON1 build of the driver. The outbox only
 // holds pending deletes, so it stays small.
 func (s *Store) SecretDeleteOwedByRecipient(ctx context.Context) (map[string]int, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT recipients_json FROM cluster_secret_delete_outbox`)
+	rows, err := s.rdb.QueryContext(ctx, `SELECT recipients_json FROM cluster_secret_delete_outbox`)
 	if err != nil {
 		return nil, fmt.Errorf("count secret delete obligations: %w", err)
 	}
@@ -7487,7 +7672,7 @@ func (s *Store) listSecretDeleteOutbox(ctx context.Context, where string, args [
 	if limit <= 0 {
 		return nil, errors.New("secret delete outbox batch limit must be positive")
 	}
-	rows, err := s.db.QueryContext(ctx, `
+	rows, err := s.rdb.QueryContext(ctx, `
 		SELECT sandbox_id, incarnation_id, recipients_json, recipient_provenance_json, generation, awaiting_promotion, attempts, created_at, updated_at
 		FROM cluster_secret_delete_outbox
 		`+where+`
@@ -7730,7 +7915,7 @@ func (s *Store) GetSecretPutOutboxForIncarnation(ctx context.Context, sandboxID,
 	if sandboxID == "" || incarnationID == "" {
 		return nil, nil
 	}
-	row := s.db.QueryRowContext(ctx, `
+	row := s.rdb.QueryRowContext(ctx, `
 		SELECT sandbox_id, incarnation_id, seal_generation, recipients_json, attempts, created_at, updated_at
 		FROM cluster_secret_put_outbox
 		WHERE sandbox_id = ? AND incarnation_id = ?
@@ -7769,7 +7954,7 @@ func (s *Store) listSecretPutOutbox(ctx context.Context, where string, args []an
 	if limit <= 0 {
 		return nil, errors.New("secret put outbox batch limit must be positive")
 	}
-	rows, err := s.db.QueryContext(ctx, `
+	rows, err := s.rdb.QueryContext(ctx, `
 		SELECT sandbox_id, incarnation_id, seal_generation, recipients_json, attempts, created_at, updated_at
 		FROM cluster_secret_put_outbox
 		`+where+`
@@ -7911,7 +8096,7 @@ func (s *Store) SecretLifecycleStats(ctx context.Context) (SecretLifecycleStats,
 	// SQLite aggregate expressions lose the DATETIME column affinity, so MIN
 	// is returned as text rather than time.Time by go-sqlite3.
 	var oldest sql.NullString
-	if err := s.db.QueryRowContext(ctx, `
+	if err := s.rdb.QueryRowContext(ctx, `
 		SELECT COUNT(*), MIN(created_at) FROM cluster_secret_delete_outbox
 	`).Scan(&stats.OutboxPending, &oldest); err != nil {
 		return stats, fmt.Errorf("secret delete outbox stats: %w", err)
@@ -7929,7 +8114,7 @@ func (s *Store) SecretLifecycleStats(ctx context.Context) (SecretLifecycleStats,
 		}
 	}
 	oldest = sql.NullString{}
-	if err := s.db.QueryRowContext(ctx, `
+	if err := s.rdb.QueryRowContext(ctx, `
 		SELECT COUNT(*), MIN(created_at) FROM cluster_secret_put_outbox
 	`).Scan(&stats.PutOutboxPending, &oldest); err != nil {
 		return stats, fmt.Errorf("secret put outbox stats: %w", err)
@@ -7946,7 +8131,7 @@ func (s *Store) SecretLifecycleStats(ctx context.Context) (SecretLifecycleStats,
 			return stats, fmt.Errorf("secret put outbox stats: invalid oldest timestamp %q", oldest.String)
 		}
 	}
-	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM cluster_secret_tombs`).Scan(&stats.Tombstones); err != nil {
+	if err := s.rdb.QueryRowContext(ctx, `SELECT COUNT(*) FROM cluster_secret_tombs`).Scan(&stats.Tombstones); err != nil {
 		return stats, fmt.Errorf("secret tomb stats: %w", err)
 	}
 	return stats, nil
@@ -8010,7 +8195,7 @@ func (s *Store) ClusterSecretTombGenerationForIncarnation(ctx context.Context, s
 		return 0, nil
 	}
 	var gen int64
-	err := s.db.QueryRowContext(ctx, `
+	err := s.rdb.QueryRowContext(ctx, `
 		SELECT generation FROM cluster_secret_tombs
 		WHERE sandbox_id = ? AND incarnation_id = ?
 	`, sandboxID, incarnationID).Scan(&gen)
@@ -8079,7 +8264,7 @@ func (s *Store) ListClusterSecretsBatch(ctx context.Context, afterRef string, li
 		`
 		args = []any{afterRef, limit}
 	}
-	rows, err := s.db.QueryContext(ctx, query, args...)
+	rows, err := s.rdb.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("list cluster secret batch: %w", err)
 	}
@@ -8142,7 +8327,7 @@ func putEnvExec(ctx context.Context, exec dbExecer, sandboxID string, sealed []b
 
 // GetEnv returns the encrypted env blob, or ErrNotFound if no row exists.
 func (s *Store) GetEnv(ctx context.Context, sandboxID string) ([]byte, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT sealed_blob FROM sandbox_env WHERE sandbox_id = ?`, sandboxID)
+	row := s.rdb.QueryRowContext(ctx, `SELECT sealed_blob FROM sandbox_env WHERE sandbox_id = ?`, sandboxID)
 	var blob []byte
 	if err := row.Scan(&blob); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -8163,7 +8348,7 @@ func (s *Store) GetEnv(ctx context.Context, sandboxID string) ([]byte, error) {
 // fail loud on loss cannot use the blob length alone. ErrNotFound still means
 // the SANDBOX row is missing, not the env row.
 func (s *Store) GetEnvWithIdentity(ctx context.Context, sandboxID string) (blob []byte, present bool, incarnationID, ownerRef string, err error) {
-	err = s.db.QueryRowContext(ctx, `SELECT env.sealed_blob, env.sandbox_id IS NOT NULL, sandbox.audit_incarnation_id, sandbox.owner_ref
+	err = s.rdb.QueryRowContext(ctx, `SELECT env.sealed_blob, env.sandbox_id IS NOT NULL, sandbox.audit_incarnation_id, sandbox.owner_ref
 		FROM sandboxes AS sandbox LEFT JOIN sandbox_env AS env ON env.sandbox_id = sandbox.id
 		WHERE sandbox.id = ?`, sandboxID).Scan(&blob, &present, &incarnationID, &ownerRef)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -8184,7 +8369,7 @@ func (s *Store) DeleteEnv(ctx context.Context, sandboxID string) error {
 
 // GetMounts returns the encrypted mount blob, or ErrNotFound if no row exists.
 func (s *Store) GetMounts(ctx context.Context, sandboxID string) ([]byte, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT sealed_blob FROM sandbox_mounts WHERE sandbox_id = ?`, sandboxID)
+	row := s.rdb.QueryRowContext(ctx, `SELECT sealed_blob FROM sandbox_mounts WHERE sandbox_id = ?`, sandboxID)
 	var blob []byte
 	if err := row.Scan(&blob); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -8399,7 +8584,7 @@ func (s *Store) GetFirecrackerTapSlotBySandbox(ctx context.Context, sandboxID st
 	if sandboxID == "" {
 		return nil, errors.New("get firecracker tap slot: sandbox_id is required")
 	}
-	row := s.db.QueryRowContext(ctx, `
+	row := s.rdb.QueryRowContext(ctx, `
 		SELECT tap_name, cidr, host_ip, guest_ip, vsock_cid, created_at, allocated_at
 		FROM firecracker_tap_pool
 		WHERE sandbox_id = ?
@@ -8432,7 +8617,7 @@ type FirecrackerTapPoolStats struct {
 
 func (s *Store) GetFirecrackerTapPoolStats(ctx context.Context) (FirecrackerTapPoolStats, error) {
 	var stats FirecrackerTapPoolStats
-	row := s.db.QueryRowContext(ctx, `
+	row := s.rdb.QueryRowContext(ctx, `
 		SELECT
 			COUNT(*),
 			COUNT(CASE WHEN sandbox_id IS NOT NULL THEN 1 END)
@@ -8715,7 +8900,7 @@ func (s *Store) GetFirecrackerVMMSlotBySandbox(ctx context.Context, sandboxID st
 	if strings.TrimSpace(sandboxID) == "" {
 		return nil, errors.New("get firecracker vmm slot: sandbox_id is required")
 	}
-	row := s.db.QueryRowContext(ctx, `
+	row := s.rdb.QueryRowContext(ctx, `
 		SELECT id, template_id, status, api_socket, run_dir, vsock_cid,
 			created_at, loaded_at, allocated_at, released_at, last_error
 		FROM firecracker_vmm_pool
@@ -8743,7 +8928,7 @@ func (s *Store) GetFirecrackerVMMSlotByID(ctx context.Context, slotID string) (*
 	if strings.TrimSpace(slotID) == "" {
 		return nil, errors.New("get firecracker vmm slot by id: slot id is required")
 	}
-	row := s.db.QueryRowContext(ctx, `
+	row := s.rdb.QueryRowContext(ctx, `
 		SELECT id, template_id, status, sandbox_id, api_socket, run_dir, vsock_cid,
 			created_at, loaded_at, allocated_at, released_at, last_error
 		FROM firecracker_vmm_pool
@@ -8786,7 +8971,7 @@ func (s *Store) ListFirecrackerVMMSlotsForRefill(ctx context.Context, templateID
 	if strings.TrimSpace(templateID) == "" {
 		return nil, errors.New("list firecracker vmm slots: template_id is required")
 	}
-	rows, err := s.db.QueryContext(ctx, `
+	rows, err := s.rdb.QueryContext(ctx, `
 		SELECT id, template_id, status, sandbox_id, api_socket, run_dir, vsock_cid,
 			created_at, loaded_at, allocated_at, released_at, last_error
 		FROM firecracker_vmm_pool
@@ -8806,7 +8991,7 @@ func (s *Store) ListFirecrackerVMMSlotsForRefill(ctx context.Context, templateID
 // query exactly so the sweep is cheap even when the steady-state
 // count is zero.
 func (s *Store) ListReleasedFirecrackerVMMSlots(ctx context.Context, olderThan time.Time) ([]FirecrackerVMMSlot, error) {
-	rows, err := s.db.QueryContext(ctx, `
+	rows, err := s.rdb.QueryContext(ctx, `
 		SELECT id, template_id, status, sandbox_id, api_socket, run_dir, vsock_cid,
 			created_at, loaded_at, allocated_at, released_at, last_error
 		FROM firecracker_vmm_pool
@@ -8853,7 +9038,7 @@ func (s *Store) GetFirecrackerVMMPoolStats(ctx context.Context, templateID strin
 	if strings.TrimSpace(templateID) == "" {
 		return stats, errors.New("firecracker vmm pool stats: template_id is required")
 	}
-	rows, err := s.db.QueryContext(ctx, `
+	rows, err := s.rdb.QueryContext(ctx, `
 		SELECT status, COUNT(*)
 		FROM firecracker_vmm_pool
 		WHERE template_id = ?
@@ -9070,7 +9255,7 @@ func (s *Store) PutWasmStateKV(ctx context.Context, sandboxID, key string, value
 func (s *Store) GetWasmStateKV(ctx context.Context, sandboxID, key string) ([]byte, bool, error) {
 	sandboxID = strings.TrimSpace(sandboxID)
 	key = strings.TrimSpace(key)
-	row := s.db.QueryRowContext(ctx, `
+	row := s.rdb.QueryRowContext(ctx, `
 		SELECT value FROM wasm_state_kv WHERE sandbox_id = ? AND key = ?`,
 		sandboxID, key)
 	var value []byte
@@ -9141,7 +9326,7 @@ func (s *Store) DeleteOrphanedWasmStateKV(ctx context.Context, limit int) (int64
 // ListWasmStateKVKeys lists keys for a sandbox.
 func (s *Store) ListWasmStateKVKeys(ctx context.Context, sandboxID string) ([]string, error) {
 	sandboxID = strings.TrimSpace(sandboxID)
-	rows, err := s.db.QueryContext(ctx, `
+	rows, err := s.rdb.QueryContext(ctx, `
 		SELECT key FROM wasm_state_kv WHERE sandbox_id = ? ORDER BY key`,
 		sandboxID)
 	if err != nil {
@@ -9263,7 +9448,7 @@ func (s *Store) ListWasmCheckpointPushesForIncarnation(ctx context.Context, sand
 }
 
 func (s *Store) queryWasmCheckpointPushes(ctx context.Context, query string, args ...any) ([]WasmCheckpointPushRecord, error) {
-	rows, err := s.db.QueryContext(ctx, query, args...)
+	rows, err := s.rdb.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("list wasm checkpoint pushes: %w", err)
 	}
@@ -9356,7 +9541,7 @@ func (s *Store) WasmCheckpointRefInUse(ctx context.Context, sandboxID string, ex
 		digest = ""
 	}
 	var liveRef, liveDigest, liveIncarnation string
-	err := s.db.QueryRowContext(ctx, `
+	err := s.rdb.QueryRowContext(ctx, `
 		SELECT COALESCE(wasm_registry_ref, ''), COALESCE(wasm_registry_digest, ''), COALESCE(audit_incarnation_id, '')
 		FROM sandboxes WHERE id = ?`, sandboxID).Scan(&liveRef, &liveDigest, &liveIncarnation)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -9381,7 +9566,7 @@ func (s *Store) WasmCheckpointRefInUse(ctx context.Context, sandboxID string, ex
 		return true, nil
 	}
 	var held int
-	err = s.db.QueryRowContext(ctx, `
+	err = s.rdb.QueryRowContext(ctx, `
 		SELECT COUNT(1) FROM wasm_checkpoint_pushes
 		WHERE sandbox_id = ? AND incarnation_id = ? AND id != ?
 		  AND ((? != '' AND registry_ref = ?) OR (? != '' AND digest = ?))`,
@@ -9445,7 +9630,7 @@ func (s *Store) UpdateWasmRegistryPush(ctx context.Context, sandboxID, incarnati
 // can this node boot"), so it spans every owner's namespace; DISTINCT keeps two
 // owners' rows for the same ref from doubling the gossiped list.
 func (s *Store) ListReadyWasmModuleRefs(ctx context.Context) ([]string, error) {
-	rows, err := s.db.QueryContext(ctx, `
+	rows, err := s.rdb.QueryContext(ctx, `
 		SELECT DISTINCT module_ref FROM wasm_modules
 		WHERE status = 'ready' AND module_ref != ''
 		ORDER BY module_ref`)
@@ -9466,7 +9651,7 @@ func (s *Store) ListReadyWasmModuleRefs(ctx context.Context) ([]string, error) {
 
 // ListWasmModulesOlderThan returns catalogue rows not updated since cutoff.
 func (s *Store) ListWasmModulesOlderThan(ctx context.Context, cutoff time.Time) ([]WasmModuleRecord, error) {
-	rows, err := s.db.QueryContext(ctx, `
+	rows, err := s.rdb.QueryContext(ctx, `
 		SELECT id, module_ref, status, module_path, module_size_bytes, digest,
 			entrypoint, has_warm, last_error, owner_ref, created_at, updated_at, ready_at
 		FROM wasm_modules
@@ -9510,7 +9695,7 @@ func (s *Store) wasmModuleReferenced(ctx context.Context, byOwner bool, ownerRef
 	moduleID = strings.TrimSpace(moduleID)
 	moduleRef = strings.TrimSpace(moduleRef)
 	moduleDigest = strings.TrimSpace(moduleDigest)
-	row := s.db.QueryRowContext(ctx, `
+	row := s.rdb.QueryRowContext(ctx, `
 		SELECT 1 FROM sandboxes
 		WHERE (? = 0 OR owner_ref = ?) AND
 		      (module_ref = ? OR module_ref = ? OR module_digest = ? OR
@@ -9537,7 +9722,7 @@ func (s *Store) IsWasmDigestCatalogued(ctx context.Context, digest string) (bool
 	if digest == "" {
 		return false, nil
 	}
-	row := s.db.QueryRowContext(ctx, `SELECT 1 FROM wasm_modules WHERE digest = ? LIMIT 1`, digest)
+	row := s.rdb.QueryRowContext(ctx, `SELECT 1 FROM wasm_modules WHERE digest = ? LIMIT 1`, digest)
 	var one int
 	err := row.Scan(&one)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -9567,7 +9752,7 @@ func (s *Store) IsWasmDigestCataloguedElsewhere(ctx context.Context, ownerRef, i
 	if digest == "" {
 		return false, nil
 	}
-	row := s.db.QueryRowContext(ctx, wasmDigestCataloguedElsewhereSQL, digest, strings.TrimSpace(ownerRef), strings.TrimSpace(id))
+	row := s.rdb.QueryRowContext(ctx, wasmDigestCataloguedElsewhereSQL, digest, strings.TrimSpace(ownerRef), strings.TrimSpace(id))
 	var one int
 	err := row.Scan(&one)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -9608,7 +9793,7 @@ func (s *Store) WasmDigestsInUse(ctx context.Context, digests []string) (map[str
 		q := `SELECT module_digest FROM sandboxes WHERE module_digest IN (` + in + `)
 		      UNION
 		      SELECT digest FROM wasm_modules WHERE digest IN (` + in + `)`
-		rows, err := s.db.QueryContext(ctx, q, args...)
+		rows, err := s.rdb.QueryContext(ctx, q, args...)
 		if err != nil {
 			return nil, fmt.Errorf("wasm digests in use: %w", err)
 		}
@@ -9669,7 +9854,7 @@ func (s *Store) GetWasmModule(ctx context.Context, ownerRef, id string) (WasmMod
 	if id == "" {
 		return WasmModuleRecord{}, errors.New("get wasm module: id required")
 	}
-	row := s.db.QueryRowContext(ctx, `
+	row := s.rdb.QueryRowContext(ctx, `
 		SELECT id, module_ref, status, module_path, module_size_bytes, digest,
 			entrypoint, has_warm, last_error, owner_ref, created_at, updated_at, ready_at
 		FROM wasm_modules WHERE owner_ref = ? AND id = ?`, strings.TrimSpace(ownerRef), id)
@@ -9705,7 +9890,7 @@ func (s *Store) ResolveWasmModule(ctx context.Context, ownerRef, id string) (Was
 	if id == "" {
 		return WasmModuleRecord{}, errors.New("resolve wasm module: id required")
 	}
-	row := s.db.QueryRowContext(ctx, wasmModuleResolveSQL, strings.TrimSpace(ownerRef), id)
+	row := s.rdb.QueryRowContext(ctx, wasmModuleResolveSQL, strings.TrimSpace(ownerRef), id)
 	rec, err := scanWasmModule(row)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -9719,7 +9904,7 @@ func (s *Store) ResolveWasmModule(ctx context.Context, ownerRef, id string) (Was
 // ListWasmModules returns all catalogue rows, every namespace, newest-first.
 // Callers filter by owner; the same id may appear once per namespace.
 func (s *Store) ListWasmModules(ctx context.Context) ([]WasmModuleRecord, error) {
-	rows, err := s.db.QueryContext(ctx, `
+	rows, err := s.rdb.QueryContext(ctx, `
 		SELECT id, module_ref, status, module_path, module_size_bytes, digest,
 			entrypoint, has_warm, last_error, owner_ref, created_at, updated_at, ready_at
 		FROM wasm_modules
@@ -9760,7 +9945,7 @@ func (s *Store) DeleteWasmModule(ctx context.Context, ownerRef, id string) error
 // CompareCloneGeneration rejects stale snapshot writes when wantGen is older
 // than the row's current clone_generation (§4.8 fencing).
 func (s *Store) CompareCloneGeneration(ctx context.Context, sandboxID, snapshotGen string) error {
-	row := s.db.QueryRowContext(ctx, `SELECT clone_generation FROM sandboxes WHERE id = ?`, sandboxID)
+	row := s.rdb.QueryRowContext(ctx, `SELECT clone_generation FROM sandboxes WHERE id = ?`, sandboxID)
 	var current string
 	if err := row.Scan(&current); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -9784,7 +9969,7 @@ func (s *Store) CurrentSandboxAuditIdentity(ctx context.Context, sandboxID strin
 	if sandboxID == "" {
 		return "", "", nil
 	}
-	err = s.db.QueryRowContext(ctx, `
+	err = s.rdb.QueryRowContext(ctx, `
 		SELECT audit_incarnation_id, owner_ref FROM sandboxes WHERE id = ?
 	`, sandboxID).Scan(&incarnationID, &ownerRef)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -9857,7 +10042,7 @@ func (s *Store) DeleteNodeStorageRetirement(ctx context.Context, nodeID string) 
 // bounded by the number of nodes an operator has ever decommissioned, so it is
 // read whole and cached by the caller for a maintenance tick.
 func (s *Store) ListNodeStorageRetirements(ctx context.Context) ([]NodeStorageRetirement, error) {
-	rows, err := s.db.QueryContext(ctx, `
+	rows, err := s.rdb.QueryContext(ctx, `
 		SELECT node_id, attested_at, actor, reason, created_at
 		FROM node_storage_retirements ORDER BY node_id
 	`)

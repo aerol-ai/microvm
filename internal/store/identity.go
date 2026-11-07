@@ -71,7 +71,7 @@ var (
 // ReadIdentityKeys returns the signing key set; generation 0 with no keys
 // before the first key is made.
 func (s *Store) ReadIdentityKeys(ctx context.Context) (cloudidentity.KeySet, error) {
-	return readIdentityKeys(ctx, s.db)
+	return readIdentityKeys(ctx, s.rdb)
 }
 
 func readIdentityKeys(ctx context.Context, q queryRower) (cloudidentity.KeySet, error) {
@@ -159,7 +159,7 @@ func (s *Store) PutIdentityRole(ctx context.Context, owner, tag, minRole string,
 
 // GetIdentityRole returns one tag of an owner's allow list.
 func (s *Store) GetIdentityRole(ctx context.Context, owner, tag string) (models.IdentityRole, error) {
-	return getIdentityRole(ctx, s.db, owner, tag)
+	return getIdentityRole(ctx, s.rdb, owner, tag)
 }
 
 func getIdentityRole(ctx context.Context, q queryRower, owner, tag string) (models.IdentityRole, error) {
@@ -179,7 +179,7 @@ func getIdentityRole(ctx context.Context, q queryRower, owner, tag string) (mode
 // ListIdentityRoles returns up to limit of an owner's tags, by tag, after
 // the tag in after.
 func (s *Store) ListIdentityRoles(ctx context.Context, owner, after string, limit int) ([]models.IdentityRole, error) {
-	rows, err := s.db.QueryContext(ctx, `
+	rows, err := s.rdb.QueryContext(ctx, `
 		SELECT tag, min_role, created_at, updated_at FROM identity_roles
 		WHERE owner_ref = ? AND tag > ? ORDER BY tag LIMIT ?
 	`, owner, after, limit)
@@ -290,7 +290,7 @@ func (s *Store) SandboxIdentitiesDue(ctx context.Context, cutoff time.Time, afte
 }
 
 func (s *Store) sandboxIdentities(ctx context.Context, where string, args ...any) ([]SandboxIdentity, error) {
-	rows, err := s.db.QueryContext(ctx, `
+	rows, err := s.rdb.QueryContext(ctx, `
 		SELECT i.sandbox_id, i.owner_ref, i.role_tag, i.audience, i.aws_role_arn, i.azure_client_id, i.azure_tenant_id,
 			i.token_expires_unix, i.token_kid, i.last_error
 		FROM sandbox_identity i `+where, args...)

@@ -248,8 +248,10 @@ func (s *Service) noteLifecycleStart(id string, edgeTime time.Time) {
 // bytesIn/bytesOut are the delta bytes since the previous tick; the window is
 // [sampledAt-pollInterval, sampledAt]. Called from the netstats poller sink
 // (background), never the request path. No-op when no reporter is wired.
-func (s *Service) emitNetworkUsage(ctx context.Context, sb *models.Sandbox, bytesIn, bytesOut int64, sampledAt time.Time) {
-	if !s.usageEnabled() || sb == nil || (bytesIn <= 0 && bytesOut <= 0) {
+// It takes the two identity fields it uses, not a whole row: the poller gets
+// them back from the counter UPDATE and no longer reads the full sandbox.
+func (s *Service) emitNetworkUsage(ctx context.Context, sandboxID, ownerRef string, bytesIn, bytesOut int64, sampledAt time.Time) {
+	if !s.usageEnabled() || (bytesIn <= 0 && bytesOut <= 0) {
 		return
 	}
 	windowEnd := sampledAt.UTC()
@@ -263,9 +265,9 @@ func (s *Service) emitNetworkUsage(ctx context.Context, sb *models.Sandbox, byte
 			return
 		}
 		samples = append(samples, controlplane.Sample{
-			EventID:     usageEventID(sb.ID, kind, windowEnd),
-			OwnerRef:    sb.OwnerRef,
-			SandboxID:   sb.ID,
+			EventID:     usageEventID(sandboxID, kind, windowEnd),
+			OwnerRef:    ownerRef,
+			SandboxID:   sandboxID,
 			Kind:        kind,
 			Value:       float64(value),
 			Unit:        usageUnitBytes,

@@ -119,7 +119,7 @@ func (s *Store) SetPendingEgressRuleClear(ctx context.Context, p PendingEgressRu
 
 // ListPendingEgressRuleClears returns every pending rule clear.
 func (s *Store) ListPendingEgressRuleClears(ctx context.Context) ([]PendingEgressRuleClear, error) {
-	rows, err := s.db.QueryContext(ctx, `
+	rows, err := s.rdb.QueryContext(ctx, `
 		SELECT scope, ip, sandbox_id, rules_json, hold, created_at, updated_at FROM pending_egress_rule_clears ORDER BY scope, ip
 	`)
 	if err != nil {
@@ -214,7 +214,7 @@ func (s *Store) ClearInstalledEgress(ctx context.Context, sandboxID string, now 
 // ListInstalledEgress returns the sandboxes with an installed record: those
 // whose last policy transition hasn't finished.
 func (s *Store) ListInstalledEgress(ctx context.Context) ([]string, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT sandbox_id FROM sandbox_egress WHERE installed_egress_json != ''`)
+	rows, err := s.rdb.QueryContext(ctx, `SELECT sandbox_id FROM sandbox_egress WHERE installed_egress_json != ''`)
 	if err != nil {
 		return nil, fmt.Errorf("list installed egress: %w", err)
 	}
@@ -337,7 +337,7 @@ func (s *Store) GetEgressState(ctx context.Context, sandboxID string) (EgressSta
 	st := EgressState{SandboxID: sandboxID}
 	var since sql.NullTime
 	var withheld, installed string
-	err := s.db.QueryRowContext(ctx, `
+	err := s.rdb.QueryRowContext(ctx, `
 		SELECT hold_reason, hold_since, inspect_ca, withheld_env_json, installed_egress_json FROM sandbox_egress WHERE sandbox_id = ?
 	`, sandboxID).Scan(&st.HoldReason, &since, &st.InspectCA, &withheld, &installed)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -366,7 +366,7 @@ func (s *Store) GetEgressState(ctx context.Context, sandboxID string) (EgressSta
 // ListEgressHolds returns every held sandbox and its reason (reconcile
 // retries, the held-sandboxes gauge). The partial index keeps it to held rows.
 func (s *Store) ListEgressHolds(ctx context.Context) (map[string]string, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT sandbox_id, hold_reason FROM sandbox_egress WHERE hold_reason != ''`)
+	rows, err := s.rdb.QueryContext(ctx, `SELECT sandbox_id, hold_reason FROM sandbox_egress WHERE hold_reason != ''`)
 	if err != nil {
 		return nil, fmt.Errorf("list egress holds: %w", err)
 	}

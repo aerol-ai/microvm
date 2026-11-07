@@ -91,7 +91,7 @@ func (s *Store) ListSnapshotsPendingPushPage(ctx context.Context, after Snapshot
 		return nil, errors.New("list snapshots pending push: limit must be positive")
 	}
 	query, args := snapshotPushPageSQL(after, min(limit, maxSnapshotPushPage), time.Now().UTC())
-	rows, err := s.db.QueryContext(ctx, query, args...)
+	rows, err := s.rdb.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("list snapshots pending push: %w", err)
 	}

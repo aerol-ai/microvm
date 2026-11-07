@@ -134,7 +134,7 @@ func (c SecretAuditIndexChunk) Decode() ([]auditlog.IndexEntry, error) {
 // GetSecretAuditIndexMeta returns the stored coverage, or ok=false when the
 // index has never been built.
 func (s *Store) GetSecretAuditIndexMeta(ctx context.Context) (SecretAuditIndexMeta, bool, error) {
-	return readSecretAuditIndexMeta(ctx, s.db)
+	return readSecretAuditIndexMeta(ctx, s.rdb)
 }
 
 type dbQueryRower interface {
@@ -425,7 +425,7 @@ func (s *Store) ShiftSecretAuditIndex(ctx context.Context, floor, delta int64, m
 // SecretAuditIndexStats reports chunk and entry totals for observability
 // and tests.
 func (s *Store) SecretAuditIndexStats(ctx context.Context) (chunks, entries int64, err error) {
-	err = s.db.QueryRowContext(ctx, `SELECT COUNT(*), COALESCE(SUM(n), 0) FROM secret_audit_index`).Scan(&chunks, &entries)
+	err = s.rdb.QueryRowContext(ctx, `SELECT COUNT(*), COALESCE(SUM(n), 0) FROM secret_audit_index`).Scan(&chunks, &entries)
 	if err != nil {
 		return 0, 0, fmt.Errorf("secret audit index stats: %w", err)
 	}

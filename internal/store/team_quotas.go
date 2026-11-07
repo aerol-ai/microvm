@@ -68,7 +68,7 @@ func (s *Store) PutTeamQuota(ctx context.Context, team string, limits models.Tea
 
 // GetTeamQuota returns a team's quota, or models.ErrTeamQuotaNotFound.
 func (s *Store) GetTeamQuota(ctx context.Context, team string) (models.TeamQuota, error) {
-	return getTeamQuota(ctx, s.db, team)
+	return getTeamQuota(ctx, s.rdb, team)
 }
 
 func getTeamQuota(ctx context.Context, q queryRower, team string) (models.TeamQuota, error) {
@@ -89,7 +89,7 @@ func getTeamQuota(ctx context.Context, q queryRower, team string) (models.TeamQu
 // ListTeamQuotas returns every team's quota, by team. The table holds one
 // row per team an admin limited, so it is small.
 func (s *Store) ListTeamQuotas(ctx context.Context) ([]models.TeamQuota, error) {
-	rows, err := s.db.QueryContext(ctx, `
+	rows, err := s.rdb.QueryContext(ctx, `
 		SELECT team, max_sandboxes, max_cpu, max_memory_mb, generation, created_at, updated_at
 		FROM team_quotas ORDER BY team
 	`)
@@ -128,7 +128,7 @@ type QuotaSandbox struct {
 // the size each asked for. It is the single-node ledger's source of truth,
 // read only when the ledger (re)loads an owner, never per create.
 func (s *Store) TeamQuotaSandboxes(ctx context.Context, ownerRef string) ([]QuotaSandbox, error) {
-	rows, err := s.db.QueryContext(ctx, `
+	rows, err := s.rdb.QueryContext(ctx, `
 		SELECT id, cpu, memory_mb FROM sandboxes WHERE owner_ref = ? AND status != ?
 	`, ownerRef, string(models.SandboxStatusDestroyed))
 	if err != nil {
