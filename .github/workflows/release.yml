@@ -420,6 +420,16 @@ jobs:
           cp scripts/cluster-sign-node.sh dist/cluster-sign-node.sh
           chmod 0755 dist/install.sh dist/uninstall.sh dist/cluster-init.sh dist/cluster-join.sh dist/cluster-sign-node.sh
 
+      # release.json says which versions may upgrade straight to this one and
+      # what the upgrade changes (plans/kubectl-style-cluster-ops.md §6.5). It
+      # is generated from the tagged tree through the pkg/release type, never
+      # written by hand, and hashes the install.sh shipped above. It runs
+      # before the tagged copies and checksums.txt so both cover it.
+      # integration-tests/safety TestReleaseWorkflowGeneratesReleaseJSON keeps
+      # it in that place.
+      - name: Generate release.json
+        run: go run ./cmd/releasemeta -version "$VERSION" -install-script dist/install.sh -o dist/release.json
+
       - name: Generate CycloneDX SBOM
         run: go run github.com/CycloneDX/cyclonedx-gomod/cmd/cyclonedx-gomod@v1.10.0 mod -json -output dist/sbom.cdx.json
 
