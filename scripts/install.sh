@@ -143,6 +143,24 @@ LB_HEALTH_PORT=""
 # written.
 SANDBOXD_ENV_FILE="/etc/sandboxd/sandboxd.env"
 SANDBOXD_UNIT_FILE="/etc/systemd/system/sandboxd.service"
+# Saved answers (plans/kubectl-style-cluster-ops.md D7). node.json holds
+# every non-secret setting a run used, so a re-run with no flags rebuilds
+# the same node; flags given on a re-run win over it. Secrets stay only in
+# the env files they are written to and are read back from there. On a node
+# installed before node.json existed, the first re-run reads its settings
+# back from the files below once (see migrate_node_settings).
+NODE_SETTINGS_FILE="/etc/sandboxd/node.json"
+CADDY_ENV_FILE="/etc/default/caddy"
+CADDYFILE_PATH="/etc/caddy/Caddyfile"
+# The flags this run was given, each followed by a space (flag_given).
+GIVEN_FLAGS=" "
+# true when PUBLIC_HOST came from this machine's address, not from
+# --public-host or node.json: node.json then keeps it empty, so a machine
+# whose address changed gets its new one on the next run.
+PUBLIC_HOST_DETECTED="false"
+# The key-store lines read back from sandboxd.env when a wrapped-custody
+# node is re-run without --secret-provider-env (secret_provider_lines).
+SAVED_SECRET_PROVIDER_LINES=""
 # The cgroup v2 and proc mounts keep_firecracker_vms_running reads (tests
 # point them at fixtures).
 CGROUP_ROOT="/sys/fs/cgroup"
@@ -510,6 +528,15 @@ Options:
                                (--cli-only).
   --help                       Show this help
 
+Re-running (Linux):
+  Each run saves every option except secrets and download choices to
+  /etc/sandboxd/node.json (root only). Secrets stay in the env files, and
+  a re-run reads them back, so it keeps the PAT. A re-run with no options
+  installs the latest release onto the same settings and restarts sandboxd
+  when its binary or settings changed. Options you pass win over saved
+  ones. To turn a saved switch such as --with-gvisor off, set it to false
+  in node.json.
+
 Examples:
 	curl -fsSL https://aerolvm.aerol.ai | sudo bash -s -- --domain sandbox.example.com --pat-token my-pat-token
   ./scripts/install.sh --version v0.1.0 --public-host 203.0.113.42
@@ -834,6 +861,301 @@ resolve_ingress_proxy_routing() {
 	fi
 }
 
+# NODE_SETTINGS lists every setting node.json keeps, as VARIABLE:--flag:type.
+# A setting's key in node.json is its flag without the dashes, with "_" for
+# "-", so a saved file maps back to flags one to one. Left out on purpose:
+#   - secrets (--pat-token, --dns-api-token, the --caddy-storage-s3-*-key
+#     flags, --secret-provider-env): node.json is not where secrets live;
+#     load_saved_node_settings reads them back from the env files;
+#   - what one run fetches or does (--version, the --*-url flags,
+#     --build-from-source, --no-start, --cli-only): a re-run with no flags
+#     installs the latest release, which is how a node is upgraded, and
+#     --no-start is only for a joiner's first install.
+NODE_SETTINGS=(
+	DOMAIN:--domain:string
+	PUBLIC_HOST:--public-host:string
+	NODE_NAME:--node-name:string
+	GITHUB_REPO:--github-repo:string
+	INSTALL_PREFIX:--install-prefix:string
+	IDLE_TIMEOUT_MIN:--idle-timeout-min:string
+	DNS_PROVIDER:--dns-provider:string
+	ACME_EMAIL:--acme-email:string
+	ACME_CA:--acme-ca:string
+	ACME_CA_ROOT:--acme-ca-root:string
+	TLS_ISSUER:--tls-issuer:string
+	LOCAL_MODE:--local:bool
+	INGRESS_PROXY_ROUTING:--ingress-proxy-routing:bool
+	WITH_GVISOR:--with-gvisor:bool
+	RUNSC_PATH:--runsc-path:string
+	WITH_CONTAINERD_ENGINE:--with-containerd-engine:bool
+	WITH_ISOLATE:--with-isolate:bool
+	WORKERD_PATH:--workerd-path:string
+	WITH_FIRECRACKER:--with-firecracker:bool
+	WITH_NVIDIA_GPU:--with-nvidia-gpu:bool
+	WITH_AMD_GPU:--with-amd-gpu:bool
+	CADDY_STORAGE_S3:--caddy-storage-s3:bool
+	CADDY_STORAGE_S3_BUCKET:--caddy-storage-s3-bucket:string
+	CADDY_STORAGE_S3_REGION:--caddy-storage-s3-region:string
+	CADDY_STORAGE_S3_ENDPOINT:--caddy-storage-s3-endpoint:string
+	CADDY_STORAGE_S3_PREFIX:--caddy-storage-s3-prefix:string
+	PAT_SCOPE:--pat-scope:string
+	L4_PROXY_PROTOCOL:--l4-proxy-protocol:bool
+	LB_HEALTH_PORT:--lb-health-port:string
+	KEY_CUSTODY:--key-custody:string
+)
+
+# flag_given reports whether this run was given flag $1 on its command line.
+flag_given() {
+	[[ "$GIVEN_FLAGS" == *" $1 "* ]]
+}
+
+# env_file_value prints KEY's value from an env file install.sh wrote
+# (KEY=value lines; the value may hold "="), or nothing.
+env_file_value() {
+	[[ -r "$1" ]] || return 0
+	awk -F= -v key="$2" '$1 == key { value = substr($0, length($1) + 2); found = 1 } END { if (found) print value }' "$1"
+}
+
+# detect_public_host prints this machine's first address, the default
+# public host. macOS hostname has no -I; under pipefail the failed pipeline
+# would exit the script silently, so it falls through to 127.0.0.1.
+detect_public_host() {
+	local host
+	host="$(hostname -I 2>/dev/null | awk '{print $1}' || true)"
+	echo "${host:-127.0.0.1}"
+}
+
+# json_string prints $1 as a JSON string. sed, not ${v//...}: how bash
+# treats a backslash in a replacement changed in 5.2. A control character
+# would need an escape the reader does not take, and it would break the env
+# files anyway, so it fails the run.
+json_string() {
+	if [[ "$1" == *[[:cntrl:]]* ]]; then
+		echo "Cannot save $2: its value holds a control character" >&2
+		exit 1
+	fi
+	printf '"%s"' "$(printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')"
+}
+
+# json_unescape undoes json_string, one character at a time so an escaped
+# backslash is never read as the start of the next escape.
+json_unescape() {
+	local in="$1" out="" c i
+	for ((i = 0; i < ${#in}; i++)); do
+		c="${in:i:1}"
+		if [[ "$c" == '\' ]]; then
+			i=$((i + 1))
+			c="${in:i:1}"
+			case "$c" in
+			'"' | '\' | '/') ;;
+			*)
+				echo "$NODE_SETTINGS_FILE: unsupported escape \\$c; keep values free of control characters" >&2
+				return 1
+				;;
+			esac
+		fi
+		out+="$c"
+	done
+	printf '%s' "$out"
+}
+
+# saved_setting stores one saved value as NODE_JSON_<key>.
+saved_setting() {
+	printf -v "NODE_JSON_$1" '%s' "$2"
+}
+
+# read_node_settings loads node.json into NODE_JSON_<key>. It takes the
+# shape write_node_settings writes (and jq prints): one "key": value per
+# line. Anything else fails the run, so a broken hand edit never silently
+# drops a setting.
+read_node_settings() {
+	local line n=0 value
+	local brace='^[[:space:]]*[{}]?[[:space:]]*$'
+	local re='^[[:space:]]*"([a-z0-9_]+)"[[:space:]]*:[[:space:]]*("(([^"\\]|\\.)*)"|true|false|[0-9]+)[[:space:]]*,?[[:space:]]*$'
+	while IFS= read -r line || [[ -n "$line" ]]; do
+		n=$((n + 1))
+		[[ "$line" =~ $brace ]] && continue
+		if [[ ! "$line" =~ $re ]]; then
+			echo "$NODE_SETTINGS_FILE line $n is not one \"key\": value setting. Fix it, or delete the file to read the settings back from $SANDBOXD_ENV_FILE." >&2
+			exit 1
+		fi
+		value="${BASH_REMATCH[2]}"
+		if [[ "$value" == \"* ]]; then
+			value="$(json_unescape "${BASH_REMATCH[3]}")" || exit 1
+		fi
+		saved_setting "${BASH_REMATCH[1]}" "$value"
+	done <"$NODE_SETTINGS_FILE"
+	if [[ "${NODE_JSON_format:-}" != "1" ]]; then
+		echo "$NODE_SETTINGS_FILE has format '${NODE_JSON_format:-}'; this install.sh reads format 1. Use the install.sh of the release that wrote it." >&2
+		exit 1
+	fi
+}
+
+# migrate_node_settings recovers the non-secret settings of a node installed
+# before node.json existed, from the files those installs wrote: sandboxd.env
+# and, in domain mode, /etc/default/caddy and the Caddyfile. A setting none
+# of them records (--runsc-path, the GPU flags) stays at its default; those
+# only install extra software, which a re-run leaves in place.
+migrate_node_settings() {
+	local env="$SANDBOXD_ENV_FILE" v
+	echo "No $NODE_SETTINGS_FILE yet: reading this node's settings back from $env"
+	saved_setting format 1
+	saved_setting node_name "$(env_file_value "$env" SB_NODE_NAME)"
+	saved_setting idle_timeout_min "$(env_file_value "$env" SB_IDLE_TIMEOUT_MIN)"
+	v="$(env_file_value "$env" SB_TOOLBOX_BINARY_PATH)"
+	[[ -n "$v" ]] && saved_setting install_prefix "$(dirname "$v")"
+	# Only a --local install binds the API to loopback, and it writes none
+	# of the settings below.
+	if [[ "$(env_file_value "$env" SB_API_HOST)" == "127.0.0.1" ]]; then
+		saved_setting local true
+		return 0
+	fi
+	saved_setting domain "$(env_file_value "$env" SB_DOMAIN)"
+	v="$(env_file_value "$env" SB_PUBLIC_HOST)"
+	[[ "$v" == "$(detect_public_host)" ]] || saved_setting public_host "$v"
+	saved_setting acme_ca "$(env_file_value "$env" SB_TLS_ACME_CA)"
+	saved_setting acme_ca_root "$(env_file_value "$env" SB_TLS_ACME_CA_ROOT)"
+	saved_setting tls_issuer "$(env_file_value "$env" SB_TLS_ISSUER)"
+	saved_setting pat_scope "$(env_file_value "$env" SB_PAT_SCOPE)"
+	[[ "$(env_file_value "$env" SB_INGRESS_PROXY_ROUTING)" == "true" ]] && saved_setting ingress_proxy_routing true
+	[[ "$(env_file_value "$env" SB_L4_FALLBACK_PROXY_PROTOCOL)" == "true" ]] && saved_setting l4_proxy_protocol true
+	[[ ",$(env_file_value "$env" SB_HOST_RUNTIMES)," == *,gvisor,* ]] && saved_setting with_gvisor true
+	[[ "$(env_file_value "$env" SB_ENABLE_FIRECRACKER)" == "true" ]] && saved_setting with_firecracker true
+	[[ "$(env_file_value "$env" SB_ENABLE_ISOLATE)" == "true" ]] && saved_setting with_isolate true
+	saved_setting workerd_path "$(env_file_value "$env" SB_ISOLATE_WORKERD_PATH)"
+	[[ "$(env_file_value "$env" SB_CONTAINER_ENGINE)" == "containerd" ]] && saved_setting with_containerd_engine true
+	[[ "$(env_file_value "$env" SB_CREDENTIAL_KEY_CUSTODY)" == "wrapped" ]] && saved_setting key_custody wrapped
+	# Cloudflare is the only DNS provider install.sh supports, and it writes
+	# the provider's token to /etc/default/caddy only when one is set.
+	[[ -n "$(env_file_value "$CADDY_ENV_FILE" SB_DNS_API_TOKEN)" ]] && saved_setting dns_provider cloudflare
+	v="$(env_file_value "$CADDY_ENV_FILE" SB_CADDY_S3_BUCKET)"
+	if [[ -n "$v" ]]; then
+		saved_setting caddy_storage_s3 true
+		saved_setting caddy_storage_s3_bucket "$v"
+		saved_setting caddy_storage_s3_region "$(env_file_value "$CADDY_ENV_FILE" SB_CADDY_S3_REGION)"
+		saved_setting caddy_storage_s3_endpoint "$(env_file_value "$CADDY_ENV_FILE" SB_CADDY_S3_ENDPOINT)"
+		saved_setting caddy_storage_s3_prefix "$(env_file_value "$CADDY_ENV_FILE" SB_CADDY_S3_PREFIX)"
+	fi
+	if [[ -r "$CADDYFILE_PATH" ]]; then
+		saved_setting acme_email "$(awk '/^\temail / { sub(/^\temail /, ""); print; exit }' "$CADDYFILE_PATH")"
+		# Dropping this listener would take the node out of its load
+		# balancer, so it is recovered too.
+		saved_setting lb_health_port "$(sed -n 's/^http:\/\/:\([0-9][0-9]*\) {$/\1/p' "$CADDYFILE_PATH" | head -n1)"
+	fi
+	return 0
+}
+
+# load_saved_node_settings applies the saved settings this run was not
+# given a flag for, then reads back the secrets it was not given. macOS
+# --local keeps its token in the LaunchAgent (reuse_darwin_pat_token) and has
+# no /etc/sandboxd, so this is Linux only.
+load_saved_node_settings() {
+	[[ "$(uname -s)" == "Darwin" ]] && return 0
+	if [[ -f "$NODE_SETTINGS_FILE" ]]; then
+		if [[ ! -r "$NODE_SETTINGS_FILE" ]]; then
+			echo "Cannot read $NODE_SETTINGS_FILE: run install.sh as root" >&2
+			exit 1
+		fi
+		echo "Using the settings saved in $NODE_SETTINGS_FILE; flags given now win over them"
+		read_node_settings
+	elif [[ -f "$SANDBOXD_ENV_FILE" ]]; then
+		migrate_node_settings
+	fi
+	local entry var flag kind key name value
+	for entry in "${NODE_SETTINGS[@]}"; do
+		IFS=: read -r var flag kind <<<"$entry"
+		key="${flag#--}"
+		key="${key//-/_}"
+		name="NODE_JSON_$key"
+		value="${!name-}"
+		# Empty means "the default": every setting with a non-empty default
+		# is always saved with its value.
+		[[ -n "$value" ]] || continue
+		flag_given "$flag" && continue
+		if [[ "$kind" == bool && "$value" != true && "$value" != false ]]; then
+			echo "$NODE_SETTINGS_FILE: $key must be true or false, got '$value'" >&2
+			exit 1
+		fi
+		printf -v "$var" '%s' "$value"
+	done
+
+	# Secrets. A re-run must never make a new PAT while one exists: every
+	# client, and every peer in a cluster, holds the old one.
+	if ! flag_given --pat-token; then
+		value="$(env_file_value "$SANDBOXD_ENV_FILE" SB_PAT_TOKEN)"
+		[[ -n "$value" ]] && PAT_TOKEN="$value"
+	fi
+	if [[ -n "$DNS_PROVIDER" ]] && ! flag_given --dns-api-token; then
+		DNS_API_TOKEN="$(env_file_value "$CADDY_ENV_FILE" SB_DNS_API_TOKEN)"
+	fi
+	if [[ "$CADDY_STORAGE_S3" == "true" ]]; then
+		flag_given --caddy-storage-s3-access-key || CADDY_STORAGE_S3_ACCESS_KEY="$(env_file_value "$CADDY_ENV_FILE" SB_CADDY_S3_ACCESS_KEY)"
+		flag_given --caddy-storage-s3-secret-key || CADDY_STORAGE_S3_SECRET_KEY="$(env_file_value "$CADDY_ENV_FILE" SB_CADDY_S3_SECRET_KEY)"
+		flag_given --caddy-storage-s3-encryption-key || CADDY_STORAGE_S3_ENCRYPTION_KEY="$(env_file_value "$CADDY_ENV_FILE" SB_CADDY_S3_ENCRYPTION_KEY)"
+	fi
+	if [[ "$KEY_CUSTODY" == "wrapped" ]] && ! flag_given --secret-provider-env && [[ -r "$SANDBOXD_ENV_FILE" ]]; then
+		SAVED_SECRET_PROVIDER_LINES="$(grep -E '^(SB_SECRET_[A-Z0-9_]+|AWS_REGION)=' "$SANDBOXD_ENV_FILE" || true)"
+	fi
+	return 0
+}
+
+# secret_provider_lines prints the key-store settings write_environment
+# appends for --key-custody wrapped: from --secret-provider-env when given,
+# else the lines read back from the existing sandboxd.env.
+secret_provider_lines() {
+	if [[ -n "$SECRET_PROVIDER_ENV" ]]; then
+		grep -E '^(SB_SECRET_[A-Z0-9_]+|AWS_REGION)=' "$SECRET_PROVIDER_ENV" || true
+	elif [[ -n "$SAVED_SECRET_PROVIDER_LINES" ]]; then
+		printf '%s\n' "$SAVED_SECRET_PROVIDER_LINES"
+	fi
+}
+
+# node_setting_answer prints what node.json keeps for a setting: the answer,
+# not what install.sh derived from it. A detected address or the default S3
+# endpoint is left empty, so the next run derives it afresh.
+node_setting_answer() {
+	case "$1" in
+	PUBLIC_HOST)
+		[[ "$PUBLIC_HOST_DETECTED" == "true" ]] && return 0
+		;;
+	CADDY_STORAGE_S3_ENDPOINT)
+		[[ "$CADDY_STORAGE_S3_ENDPOINT" == "s3.${CADDY_STORAGE_S3_REGION}.amazonaws.com" ]] && return 0
+		;;
+	esac
+	printf '%s' "${!1}"
+}
+
+# write_node_settings saves this run's settings to node.json, mode 0600 (it
+# names the key store and buckets the node uses). It is replaced in one
+# rename, so a run that dies mid-write leaves the old file.
+write_node_settings() {
+	local dir entry var flag kind key value tmp
+	dir="$(dirname "$NODE_SETTINGS_FILE")"
+	mkdir -p "$dir"
+	tmp="$(mktemp "$dir/.node.json.XXXXXX")"
+	{
+		printf '{\n  "format": 1'
+		for entry in "${NODE_SETTINGS[@]}"; do
+			IFS=: read -r var flag kind <<<"$entry"
+			key="${flag#--}"
+			key="${key//-/_}"
+			value="$(node_setting_answer "$var")"
+			if [[ "$kind" == bool ]]; then
+				[[ "$value" == "true" ]] || value="false"
+			else
+				value="$(json_string "$value" "$flag")" || {
+					rm -f "$tmp"
+					exit 1
+				}
+			fi
+			printf ',\n  "%s": %s' "$key" "$value"
+		done
+		printf '\n}\n'
+	} >"$tmp"
+	chmod 0600 "$tmp"
+	mv -f "$tmp" "$NODE_SETTINGS_FILE"
+}
+
 # install_cli installs the aerolvm agent CLI alone
 # (plans/mcp-server-and-agent-cli.md §5.8): the path for laptops and CI
 # runners that drive a sandboxd running somewhere else.
@@ -900,6 +1222,8 @@ install_cli() {
 }
 
 while [[ $# -gt 0 ]]; do
+	# Every arm shifts its value away, so $1 here is always a flag.
+	GIVEN_FLAGS+="$1 "
 	case "$1" in
 		--domain)
 			DOMAIN="$2"
@@ -1107,6 +1431,12 @@ while [[ $# -gt 0 ]]; do
 	esac
 done
 
+# Before any check, so saved settings are checked exactly like flags. A
+# --cli-only run installs no node and must not pick up a node's settings.
+if [[ "$CLI_ONLY" != "true" ]]; then
+	load_saved_node_settings
+fi
+
 # Firecracker is a runtime for a server node: --cli-only installs no daemon,
 # and --local is the Docker-only developer install (macOS has no KVM at all).
 # Refused before either branch runs, so neither half-installs it.
@@ -1151,12 +1481,15 @@ case "$KEY_CUSTODY" in
 			echo "--key-custody wrapped is not supported with --local" >&2
 			exit 1
 		fi
-		if [[ -z "$SECRET_PROVIDER_ENV" || ! -f "$SECRET_PROVIDER_ENV" ]]; then
+		# A re-run may leave --secret-provider-env out: the settings are then
+		# the ones the last run wrote to sandboxd.env.
+		if [[ -n "$SECRET_PROVIDER_ENV" && ! -f "$SECRET_PROVIDER_ENV" ]] ||
+			[[ -z "$SECRET_PROVIDER_ENV" && -z "$SAVED_SECRET_PROVIDER_LINES" ]]; then
 			echo "--key-custody wrapped needs --secret-provider-env <file> with SB_SECRET_PROVIDER and its settings" >&2
 			exit 1
 		fi
-		if ! grep -Eq '^SB_SECRET_PROVIDER=(awskms|vault|pkcs11)$' "$SECRET_PROVIDER_ENV"; then
-			echo "$SECRET_PROVIDER_ENV must set SB_SECRET_PROVIDER to awskms, vault or pkcs11" >&2
+		if ! grep -Eq '^SB_SECRET_PROVIDER=(awskms|vault|pkcs11)$' <<<"$(secret_provider_lines)"; then
+			echo "${SECRET_PROVIDER_ENV:-$SANDBOXD_ENV_FILE} must set SB_SECRET_PROVIDER to awskms, vault or pkcs11" >&2
 			exit 1
 		fi
 		;;
@@ -1176,10 +1509,8 @@ if [[ -z "$PAT_TOKEN" ]]; then
 fi
 
 if [[ -z "$PUBLIC_HOST" ]]; then
-	# macOS hostname has no -I; under pipefail the failed pipeline would
-	# exit the script silently, so fall through to the default instead.
-	PUBLIC_HOST="$(hostname -I 2>/dev/null | awk '{print $1}' || true)"
-	PUBLIC_HOST="${PUBLIC_HOST:-127.0.0.1}"
+	PUBLIC_HOST="$(detect_public_host)"
+	PUBLIC_HOST_DETECTED="true"
 fi
 
 # Host path of the toolboxd binary bind-mounted into every sandbox.
@@ -1834,7 +2165,7 @@ EOF
 			echo "# only wrapped by the key store below; see sandboxd key status."
 			# AWS_REGION too: the AWS KMS client needs it, and the SDK's
 			# IMDS fallback turns a missing region into an opaque timeout.
-			grep -E '^(SB_SECRET_[A-Z0-9_]+|AWS_REGION)=' "$SECRET_PROVIDER_ENV"
+			secret_provider_lines
 			echo "SB_CREDENTIAL_KEY_CUSTODY=wrapped"
 		} >> /etc/sandboxd/sandboxd.env
 	fi
@@ -3407,6 +3738,7 @@ if [[ "$LOCAL_MODE" == "true" ]]; then
 	record_sandboxd_state
 	install_binaries
 	write_local_environment
+	write_node_settings
 	# This branch skips install_packages, so it installs the two parts of it
 	# a local server still needs, in the same order: the mount tools (platform
 	# volumes and external storage are mounted on the host), then Docker.
@@ -3471,6 +3803,7 @@ install_custom_caddy "$DNS_PROVIDER"
 record_sandboxd_state
 install_binaries
 write_environment
+write_node_settings
 prepare_key_custody
 write_caddy_env
 write_caddy_systemd_dropin

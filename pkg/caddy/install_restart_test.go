@@ -201,14 +201,14 @@ func TestInstallRestartsSandboxdBeforeCaddyStarts(t *testing.T) {
 			at += i + len(step)
 		}
 	}
-	local := strings.Index(src, "\trecord_sandboxd_state\n\tinstall_binaries\n\twrite_local_environment\n")
+	local := strings.Index(src, "\trecord_sandboxd_state\n\tinstall_binaries\n\twrite_local_environment\n\twrite_node_settings\n")
 	if local < 0 {
 		t.Fatal("the local install path does not record sandboxd's state right before installing the binary and writing its settings")
 	}
 	inOrder(t, local, "write_local_environment", "write_local_systemd_unit", "systemctl daemon-reload",
 		"restart_sandboxd_if_reconfigured", "systemctl enable --now sandboxd sandboxd-healthcheck.timer")
 
-	main := strings.Index(src, "\nrecord_sandboxd_state\ninstall_binaries\nwrite_environment\n")
+	main := strings.Index(src, "\nrecord_sandboxd_state\ninstall_binaries\nwrite_environment\nwrite_node_settings\n")
 	if main < 0 {
 		t.Fatal("the main install path does not record sandboxd's state right before installing the binary and writing its settings")
 	}
