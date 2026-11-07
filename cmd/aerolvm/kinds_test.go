@@ -278,6 +278,35 @@ func TestGetSandboxesPagingAndEmpty(t *testing.T) {
 	}
 }
 
+// A list prints in name order (then ID), whatever order the server sends:
+// the live list route's order changes from call to call (lane 4 live run
+// 1), and kubectl sorts by name.
+func TestGetListsSortByName(t *testing.T) {
+	h, f := newKindsHarness(t)
+	// The fake answers in ID order, which is the reverse of name order here.
+	for _, name := range []string{"zeta", "mid", "alpha"} {
+		h.fake.AddSandbox(models.Sandbox{Name: name})
+	}
+	h.fake.AddSandbox(models.Sandbox{ID: "sb-00000000000000aa"})
+	if code := h.run("get", "sb", "-o", "name"); code != exitOK ||
+		h.stdout.String() != "sandbox/alpha\nsandbox/mid\nsandbox/sb-00000000000000aa\nsandbox/zeta\n" {
+		t.Fatalf("get sb -o name = %d %q", code, h.stdout.String())
+	}
+	// Named sandboxes keep the order they were asked for.
+	if code := h.run("get", "sb", "zeta", "alpha", "-o", "name"); code != exitOK || h.stdout.String() != "sandbox/zeta\nsandbox/alpha\n" {
+		t.Fatalf("get sb zeta alpha = %d %q", code, h.stdout.String())
+	}
+	f.mu.Lock()
+	f.tokens = []map[string]any{
+		{"id": "tok_zzzzzzzzzzzz", "name": "b"}, {"id": "tok_yyyyyyyyyyyy", "name": "a"}, {"id": "tok_xxxxxxxxxxxx", "name": "b"},
+	}
+	f.mu.Unlock()
+	if code := h.run("get", "tokens", "-o", "name"); code != exitOK ||
+		h.stdout.String() != "token/tok_yyyyyyyyyyyy\ntoken/tok_xxxxxxxxxxxx\ntoken/tok_zzzzzzzzzzzz\n" {
+		t.Fatalf("get tokens -o name = %d %q", code, h.stdout.String())
+	}
+}
+
 func TestDescribeAndDeleteSandboxes(t *testing.T) {
 	h, f := newKindsHarness(t)
 	kindsFixture(h, f)

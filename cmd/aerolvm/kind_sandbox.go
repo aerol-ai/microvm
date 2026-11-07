@@ -48,6 +48,16 @@ func getSandboxes(ctx context.Context, a *app, c *commonFlags, call kindCall) in
 		}
 	} else if rows, err = listAllSandboxes(ctx, tools, sel); err != nil {
 		return a.fail(c, err, exitError)
+	} else {
+		// The list route's order can differ from one call to the next.
+		// kubectl sorts by name, and a stable order is what lets a script
+		// or a person compare two runs.
+		sort.SliceStable(rows, func(i, j int) bool {
+			if a, b := sandboxName(rows[i]), sandboxName(rows[j]); a != b {
+				return a < b
+			}
+			return rows[i].ID < rows[j].ID
+		})
 	}
 
 	switch format {

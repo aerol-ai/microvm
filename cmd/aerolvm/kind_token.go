@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"sort"
 
 	"github.com/aerol-ai/microvm/internal/agenttools"
 	"github.com/aerol-ai/microvm/pkg/identitywire"
@@ -69,6 +70,15 @@ func getTokens(ctx context.Context, a *app, c *commonFlags, call kindCall) int {
 	tokens, err := a.listTokens(ctx, c)
 	if err == nil && len(call.names) > 0 {
 		tokens, err = pickTokens(tokens, call.names)
+	} else if err == nil {
+		// By name, then ID, as with sandboxes: the server's order is not
+		// promised to hold between calls.
+		sort.SliceStable(tokens, func(i, j int) bool {
+			if a, b := tokens[i].rec.Name, tokens[j].rec.Name; a != b {
+				return a < b
+			}
+			return tokens[i].rec.ID < tokens[j].rec.ID
+		})
 	}
 	if err != nil {
 		return a.fail(c, err, exitError)
