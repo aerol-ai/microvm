@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -122,6 +123,66 @@ func TestDeleteNodeLeaderPaths(t *testing.T) {
 	index.upsert(Member{NodeID: "wkr-2", Alive: true, Role: config.NodeRoleWorker, APIURL: "http://wkr-2"})
 	if res, err := leader.DeleteNode(ctx, "wkr-2", false); err != nil || !res.Denied {
 		t.Fatalf("delete an empty live worker = %+v %v", res, err)
+	}
+}
+
+// A deleted server gets a deny record too (Phase 2b closes the 2a gap): its
+// key is a tombstone and gossip refuses its ID, so voter auto-join can't
+// add it back. A refused delete writes nothing, a retry reports the record
+// it finds, and the old members route still writes none.
+func TestDeleteServerWritesADenyRecord(t *testing.T) {
+	if testing.Short() {
+		t.Skip("starts a raft node")
+	}
+	leader, cleanup := newTestCluster(t, "dsrv-ldr", true, nil)
+	defer cleanup()
+	waitForLeader(t, leader, 10*time.Second)
+	stopGossipRefresh(t, leader)
+	ctx := context.Background()
+	index := leader.gossip.currentMemberIndex()
+	for i, id := range []string{"dsrv-2", "dsrv-3"} {
+		addr := raft.ServerAddress(fmt.Sprintf("127.0.0.1:%d", i+1))
+		if err := leader.raft.raft.AddNonvoter(raft.ServerID(id), addr, 0, time.Second).Error(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	index.upsert(Member{NodeID: "dsrv-2", Alive: true, Role: config.NodeRoleServer, FSMOpsVersion: fsmOpsVersion})
+	index.upsert(Member{NodeID: "dsrv-3", Alive: false, Role: config.NodeRoleServer, FSMOpsVersion: fsmOpsVersion})
+
+	// Refusals come before any write.
+	if _, err := leader.DeleteNode(ctx, "dsrv-ldr", true); !errors.Is(err, ErrLastVoter) || leader.IsNodeDenied("dsrv-ldr") {
+		t.Fatalf("delete the last voter = %v, denied %t", err, leader.IsNodeDenied("dsrv-ldr"))
+	}
+	if _, err := leader.DeleteNode(ctx, "dsrv-2", false); !errors.Is(err, ErrMemberStillAlive) || leader.IsNodeDenied("dsrv-2") {
+		t.Fatalf("delete a live server without force = %v, denied %t", err, leader.IsNodeDenied("dsrv-2"))
+	}
+
+	res, err := leader.DeleteNode(ctx, "dsrv-2", true)
+	if err != nil || !res.RaftRemoved || !res.Denied || res.AlreadyDeleted {
+		t.Fatalf("delete a server = %+v %v", res, err)
+	}
+	if !leader.IsNodeDenied("dsrv-2") {
+		t.Fatal("the deleted server is not denied")
+	}
+	if _, ok := leader.configuredServer("dsrv-2"); ok {
+		t.Fatal("the deleted server is still in the Raft configuration")
+	}
+	// Gossip refuses it, so it can't come back as a member (and voter
+	// auto-join never sees it).
+	index.upsert(Member{NodeID: "dsrv-2", Alive: true, Role: config.NodeRoleServer})
+	for _, m := range leader.Members() {
+		if m.NodeID == "dsrv-2" {
+			t.Fatal("a deleted server is still listed")
+		}
+	}
+	// A retry: no longer a Raft server, it finds the record and says so.
+	if res, err := leader.DeleteNode(ctx, "dsrv-2", false); err != nil || !res.Denied || !res.AlreadyDeleted || res.RaftRemoved {
+		t.Fatalf("repeat delete = %+v %v", res, err)
+	}
+
+	// The old route is unchanged: out of Raft, no record.
+	if err := leader.RemoveMember(ctx, "dsrv-3", true); err != nil || leader.IsNodeDenied("dsrv-3") {
+		t.Fatalf("RemoveMember = %v, denied %t", err, leader.IsNodeDenied("dsrv-3"))
 	}
 }
 

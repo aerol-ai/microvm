@@ -130,16 +130,8 @@ func (c *Cluster) DeleteNode(ctx context.Context, nodeID string, force bool) (No
 }
 
 func (c *Cluster) deleteNodeLocal(ctx context.Context, nodeID string, force bool) (NodeDeleteResult, error) {
-	if _, ok := c.configuredServer(nodeID); ok {
-		owned := c.fsm.ownedCount(nodeID)
-		if err := c.removeMemberLocal(ctx, nodeID, force); err != nil {
-			return NodeDeleteResult{}, err
-		}
-		role := ""
-		if m, ok := c.gossip.memberlistMember(nodeID); ok {
-			role = m.Role
-		}
-		return NodeDeleteResult{NodeID: nodeID, Role: role, RaftRemoved: true, Orphaned: owned}, nil
+	if srv, ok := c.configuredServer(nodeID); ok {
+		return c.deleteServerLocal(ctx, nodeID, srv, force)
 	}
 	member, known := c.gossip.memberlistMember(nodeID)
 	denied := c.fsm.isNodeDenied(nodeID)
@@ -173,6 +165,66 @@ func (c *Cluster) deleteNodeLocal(ctx context.Context, nodeID string, force bool
 	return NodeDeleteResult{
 		NodeID: nodeID, Role: deny.Record.Role, Denied: true, AlreadyDeleted: !deny.Changed,
 		Reassigned: reassigned, Orphaned: orphaned,
+	}, nil
+}
+
+// deleteServerLocal deletes a Raft server: a deny record, then today's
+// RemoveMember. The refusals RemoveMember can give (the last voter; alive
+// without force) are checked first, so a delete that would be refused
+// writes nothing. The deny goes first for the same reason as a worker's:
+// from its commit the server's cert key is a tombstone and gossip refuses
+// its ID, so voter auto-join can't add it back between the remove and a
+// deny written after it. If the remove then fails, the server is denied
+// but still in the Raft configuration; Raft (7000) does not read the deny,
+// so quorum is untouched, and the retry finds the record and removes it.
+// The old DELETE /v1/cluster/members/{id} keeps writing no record (/v1 is
+// soft-frozen).
+func (c *Cluster) deleteServerLocal(ctx context.Context, nodeID string, srv raft.Server, force bool) (NodeDeleteResult, error) {
+	alreadyDenied := c.fsm.isNodeDenied(nodeID)
+	if srv.Suffrage == raft.Voter {
+		voters, ok := c.currentVoterCount()
+		if !ok {
+			return NodeDeleteResult{}, fmt.Errorf("cluster: read raft configuration")
+		}
+		if voters <= 1 {
+			return NodeDeleteResult{}, ErrLastVoter
+		}
+	}
+	// A denied server is refused at gossip, so it reads as dead here; the
+	// liveness rule applies only before the first record.
+	if !alreadyDenied && !force && c.memberAlive(nodeID) {
+		return NodeDeleteResult{}, ErrMemberStillAlive
+	}
+	role := ""
+	if m, ok := c.gossip.memberlistMember(nodeID); ok {
+		role = m.Role
+	}
+	owned := c.fsm.ownedCount(nodeID)
+	deny, err := c.writeNodeDeny(ctx, nodeID, role)
+	denied := err == nil
+	switch {
+	case errors.Is(err, ErrClusterVersion):
+		// Mid-upgrade an older server can't apply the record (often the
+		// very server being deleted, dead on its old build). Removing it
+		// must still work, so it goes as before: out of Raft, no record.
+		c.logger.Warn("cluster: deleting a server without a deny record; a server runs an older build", "node_id", nodeID, "err", err)
+	case err != nil:
+		return NodeDeleteResult{}, err
+	case deny.Record.Role != "":
+		role = deny.Record.Role
+	}
+	// force: the liveness check above already ran, and a deny makes the
+	// node look dead to gossip.
+	if err := c.removeMemberLocal(ctx, nodeID, true); err != nil {
+		return NodeDeleteResult{}, err
+	}
+	if denied {
+		c.invalidatePeerClient(nodeID)
+		c.gossip.applyDenySet()
+	}
+	c.logger.Info("cluster: deleted server", "node_id", nodeID, "role", role, "denied", denied, "already_deleted", denied && !deny.Changed, "orphaned", owned, "force", force)
+	return NodeDeleteResult{
+		NodeID: nodeID, Role: role, RaftRemoved: true, Denied: denied, AlreadyDeleted: denied && !deny.Changed, Orphaned: owned,
 	}, nil
 }
 
