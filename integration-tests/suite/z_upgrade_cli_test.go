@@ -122,8 +122,9 @@ type nodeOpView struct {
 // node's restart.
 func aerolvmLong(t *testing.T, args ...string) cliResult {
 	t.Helper()
-	// A slow uplink moves the 110 MiB sandboxd at about 1 Mbit/s.
-	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Minute)
+	// A slow uplink moves the 113 MiB sandboxd at well under 1 Mbit/s (the
+	// first live run took 39 minutes to upload it).
+	ctx, cancel := context.WithTimeout(context.Background(), 75*time.Minute)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, aerolvmBinary(t), args...)
 	cmd.Env = tokenEnv(t)
