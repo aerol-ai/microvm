@@ -233,11 +233,20 @@ func TestT14WasmAcrossSandboxdRestart(t *testing.T) {
 		if variant == "" {
 			variant = "ephemeral (default)"
 		}
-		sb := c.NewSandbox(t, sdktypes.CreateSandboxOptions{
+		// Not c.NewSandbox: it turns on public traffic, which takes WASM off
+		// the default in-process resident host onto a per-sandbox worker.
+		// T14 measures what a default create gets.
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+		sb, err := c.SDK().Create(ctx, sdktypes.CreateSandboxOptions{
 			Name: harness.UniqueName(sc, t), Runtime: "wasm", Image: ref, ModuleRef: ref, Durability: durability,
 		})
+		cancel()
+		if err != nil {
+			t.Fatalf("create a %s WASM sandbox: %v", variant, err)
+		}
+		t.Cleanup(func() { destroyBest(c, sb.ID) })
 		waitRunning(t, sb)
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		ctx, cancel = context.WithTimeout(context.Background(), 2*time.Minute)
 		if err := sb.UploadFile(ctx, "/t14-count.py", []byte(wasmCounter)); err != nil {
 			cancel()
 			t.Fatalf("upload the counter to %s: %v", sb.ID, err)
@@ -378,7 +387,7 @@ func TestT14IsolateAcrossSandboxdRestart(t *testing.T) {
 	jailOn := measure("jail on (default)", "itest-t14-jail-on")
 
 	// The same with the jail off: workerd then runs as sandboxd's child.
-	env, _ := harness.SSHRun(t, target, "grep -E '^SB_ISOLATE_USE_JAIL=' /etc/sandboxd/sandboxd.env || true")
+	env, _ := harness.SSHRun(t, target, "sudo grep -E '^SB_ISOLATE_USE_JAIL=' /etc/sandboxd/sandboxd.env || true")
 	t.Logf("T14 isolate: SB_ISOLATE_USE_JAIL lines before the switch: %q", strings.TrimSpace(env))
 	if out, err := harness.SSHRun(t, target, "echo 'SB_ISOLATE_USE_JAIL=false' | sudo tee -a /etc/sandboxd/sandboxd.env >/dev/null && echo ok"); err != nil {
 		t.Fatalf("turn the jail off: %v\n%s", err, out)
