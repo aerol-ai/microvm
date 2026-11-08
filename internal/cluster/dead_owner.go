@@ -7,8 +7,32 @@ import (
 	"sync"
 	"time"
 
+	"github.com/aerol-ai/microvm/internal/config"
 	"github.com/hashicorp/raft"
 )
+
+// defaultDeadOwnerGrace is SB_DEAD_OWNER_GRACE's default. config.Load sets it;
+// this covers a Config built without Load (tests, embedders).
+const defaultDeadOwnerGrace = 30 * time.Second
+
+// DeadOwnerGrace is how long the leader waits, after it first sees a node
+// dead, before it moves or orphans that node's sandboxes (SB_DEAD_OWNER_GRACE).
+func DeadOwnerGrace(cfg config.Config) time.Duration {
+	if cfg.ClusterDeadOwnerGrace > 0 {
+		return cfg.ClusterDeadOwnerGrace
+	}
+	return defaultDeadOwnerGrace
+}
+
+// OwnershipLease is how long a node may keep acting on placement or ownership
+// information it has not confirmed with the control plane: half the dead-owner
+// grace. The leader cannot move a sandbox until a node has looked dead for the
+// whole grace, so a node that stops trusting what it last heard at half the
+// grace stops before any move it has not heard about. The other half is the
+// margin for clocks, loop ticks and the time gossip takes to call a node dead.
+func OwnershipLease(cfg config.Config) time.Duration {
+	return DeadOwnerGrace(cfg) / 2
+}
 
 // deadOwnerTracker holds per-node "first observed dead at" timestamps so the
 // reconciler can decide which nodes have outlasted the grace period.
@@ -108,10 +132,7 @@ func (c *Cluster) reconcileDeadOwners(ctx context.Context) {
 	if c.raft == nil || c.raft.raft.State() != raft.Leader {
 		return
 	}
-	grace := c.cfg.ClusterDeadOwnerGrace
-	if grace <= 0 {
-		grace = 30 * time.Second
-	}
+	grace := DeadOwnerGrace(c.cfg)
 
 	// Refresh the dead set from gossip: any tracked node that's actually
 	// alive should be cleared (covers events we missed during a leadership
