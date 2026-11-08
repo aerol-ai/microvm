@@ -181,8 +181,12 @@ func (d *gossipDelegate) MergeRemoteState([]byte, bool)   {}
 // gossipNode wraps memberlist + the delegate so Close can stop the refresh
 // loop alongside leaving the cluster.
 type gossipNode struct {
-	ml                 *memberlist.Memberlist
-	delegate           *gossipDelegate
+	ml       *memberlist.Memberlist
+	delegate *gossipDelegate
+	// nodes holds copies of memberlist's nodes taken inside its event
+	// callbacks. Read node fields from here, never through ml.Members() or
+	// ml.LocalNode() pointers (see gossip_node_table.go).
+	nodes              *gossipNodeTable
 	memberIndex        *gossipMemberIndex
 	memberIndexMu      sync.RWMutex
 	stopRefresh        context.CancelFunc
@@ -427,12 +431,14 @@ func (i *gossipMemberIndex) recordMetricsLocked(now int64) {
 
 type indexedEventDelegate struct {
 	index   *gossipMemberIndex
+	nodes   *gossipNodeTable
 	logger  *slog.Logger
 	next    memberlist.EventDelegate
 	onLeave func(nodeID string)
 }
 
 func (d *indexedEventDelegate) NotifyJoin(n *memberlist.Node) {
+	d.nodes.put(n)
 	m := memberFromMemberlistNode(n)
 	if d.index != nil && n != nil {
 		d.index.upsert(m)
@@ -455,6 +461,9 @@ func (d *indexedEventDelegate) NotifyJoin(n *memberlist.Node) {
 }
 
 func (d *indexedEventDelegate) NotifyLeave(n *memberlist.Node) {
+	if n != nil {
+		d.nodes.remove(n.Name)
+	}
 	m := memberFromMemberlistNode(n)
 	if d.index != nil && n != nil {
 		m.Alive = false
@@ -480,6 +489,7 @@ func (d *indexedEventDelegate) NotifyLeave(n *memberlist.Node) {
 }
 
 func (d *indexedEventDelegate) NotifyUpdate(n *memberlist.Node) {
+	d.nodes.put(n)
 	m := memberFromMemberlistNode(n)
 	if d.index != nil && n != nil {
 		d.index.upsert(m)
@@ -569,8 +579,9 @@ func setupGossip(cfg gossipSetupConfig, admitter *capacity.Admitter, logger *slo
 	delegate.setPATScope(cfg.PATScope)
 	memberIndex := newGossipMemberIndex()
 	memberIndex.selfPATScope = GossipPATScope(cfg.PATScope)
+	nodeTable := newGossipNodeTable()
 	mlCfg.Delegate = delegate
-	mlCfg.Events = &indexedEventDelegate{index: memberIndex, logger: logger, next: cfg.Events, onLeave: cfg.OnLeave}
+	mlCfg.Events = &indexedEventDelegate{index: memberIndex, nodes: nodeTable, logger: logger, next: cfg.Events, onLeave: cfg.OnLeave}
 	if len(cfg.SecretKey) > 0 {
 		// memberlist accepts 16/24/32-byte keys for AES-128/192/256-GCM. Anything
 		// else is rejected at construction so we surface a clear error rather
@@ -614,10 +625,13 @@ func setupGossip(cfg gossipSetupConfig, admitter *capacity.Admitter, logger *slo
 	if err != nil {
 		return nil, fmt.Errorf("gossip setup: memberlist.Create: %w", err)
 	}
+	// Create marks this node alive before it returns, and that fires
+	// NotifyJoin for self, so the table already holds our own address.
+	selfGossipAddr := nodeTable.address(cfg.NodeID)
 	if logger != nil {
 		logger.Info("cluster gossip listening",
 			"node_id", cfg.NodeID,
-			"memberlist_addr", ml.LocalNode().Address(),
+			"memberlist_addr", selfGossipAddr,
 			"bootstrap_peers", cfg.BootstrapPeers,
 		)
 	}
@@ -646,6 +660,7 @@ func setupGossip(cfg gossipSetupConfig, admitter *capacity.Admitter, logger *slo
 	gn := &gossipNode{
 		ml:                 ml,
 		delegate:           delegate,
+		nodes:              nodeTable,
 		memberIndex:        memberIndex,
 		stopRefresh:        cancel,
 		refreshDone:        make(chan struct{}),
@@ -653,7 +668,7 @@ func setupGossip(cfg gossipSetupConfig, admitter *capacity.Admitter, logger *slo
 		bootstrapPeers:     append([]string(nil), cfg.BootstrapPeers...),
 		joinBootstrapPeers: ml.Join,
 		peerCache:          newGossipPeerCache(cfg.PeerCacheDir),
-		selfGossipAddr:     ml.LocalNode().Address(),
+		selfGossipAddr:     selfGossipAddr,
 	}
 	// Loaded but deliberately not dialled here: setupGossip is on the boot
 	// path, and a stale entry whose host is gone costs a full TCP timeout.
@@ -723,10 +738,10 @@ func (g *gossipNode) rejoinPeers() []string {
 }
 
 func (g *gossipNode) memberlistNodes() []*memberlist.Node {
-	if g == nil || g.ml == nil {
+	if g == nil {
 		return nil
 	}
-	return g.ml.Members()
+	return g.nodes.snapshot()
 }
 
 func (g *gossipNode) maybeRejoinBootstrapPeers(nodes []*memberlist.Node) {
@@ -775,12 +790,10 @@ func hasLiveControlPlaneMember(nodes []*memberlist.Node, selfNodeID string) bool
 	return false
 }
 
-// members returns peer state, including self. Self's metadata is sourced from
-// the local delegate (under its own mutex) rather than from the *memberlist.Node
-// pointer returned by ml.Members(): that pointer aliases internal state whose
-// Meta field is rewritten by memberlist.aliveNode every time our refresh loop
-// calls UpdateNode, which races with members() reads. memberlist exposes no
-// safe accessor for self's Meta, so we substitute self ourselves.
+// members returns peer state, including self. Peers come from the node table
+// (copies taken inside memberlist's callbacks; see gossip_node_table.go). Self
+// is sourced from the local delegate (under its own mutex), which holds the
+// newest metadata even before memberlist has re-announced it.
 func (g *gossipNode) members() []Member {
 	if index := g.currentMemberIndex(); index != nil {
 		return index.snapshot()
@@ -815,7 +828,7 @@ func (g *gossipNode) setMemberIndex(index *gossipMemberIndex) {
 }
 
 func (g *gossipNode) scanMembers() []Member {
-	all := g.ml.Members()
+	all := g.nodes.snapshot()
 	out := make([]Member, 0, len(all))
 	for _, n := range all {
 		if n.Name == g.delegate.nodeID {
