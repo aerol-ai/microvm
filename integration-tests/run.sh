@@ -793,6 +793,22 @@ allow_disruptive_for() {
   echo "0"
 }
 
+# go_tags_for echoes the test-only Go build tags a scenario's local build
+# compiles sandboxd with: the caps file's `go_tags`, from the caps file and
+# not the scenario name for the reason allow_disruptive_for gives. An
+# operator's AEROL_GO_TAGS wins, so one case can be tried on another fleet.
+# Empty for every scenario that declares none, which is the release build.
+go_tags_for() {
+  local caps_file="$1"
+  if [[ -n "${AEROL_GO_TAGS:-}" ]]; then
+    echo "$AEROL_GO_TAGS"
+    return
+  fi
+  if [[ -f "$caps_file" ]]; then
+    yq -r '.go_tags // ""' "$caps_file"
+  fi
+}
+
 is_stale_wasm_snapshot_ref() {
   local ref="${1:-}"
   # WASM runtime tests use a staged module alias such as "python". A snapshot
@@ -1016,7 +1032,12 @@ prepare_artifacts() {
   # Every scenario, enterprise ones included, provisions sandboxd built the way
   # a release builds it, with no build tags. Enterprise gets its witness from
   # SB_AUDIT_WITNESS_BACKEND=s3 and the scenario's Object Lock bucket
-  # (audit_witness_enabled), not from a test-only build.
+  # (audit_witness_enabled), not from a test-only build. The one exception is
+  # a caps file's go_tags (cluster-chaos: itest_failpoints, for UC-480), and
+  # only on the local build below: --released and --version install release
+  # binaries, which never carry a tag, and a case that needs one skips there.
+  local go_tags
+  go_tags=$(go_tags_for "${HERE}/scenarios/${scenario}.caps.yml")
 
   case "$BUILD_MODE" in
     released)
@@ -1079,10 +1100,16 @@ EOF
       ;;
   esac
 
-  # Default: local build.
+  # Default: local build. AEROL_GO_TAGS is passed per call, never exported:
+  # `run.sh all` runs scenarios one after another in this shell, and a tag
+  # exported for cluster-chaos would build every later scenario's sandboxd
+  # with a failpoint in it.
+  if [[ -n "$go_tags" ]]; then
+    echo "=== artifacts: sandboxd built with -tags ${go_tags} (test-only; the build id says so) ==="
+  fi
   local build_id
   if [[ "$NO_BUILD" == "1" ]]; then
-    build_id=$("$BUILD_SH" build-id)
+    build_id=$(AEROL_GO_TAGS="$go_tags" "$BUILD_SH" build-id)
     echo "=== artifacts: reusing published build ${build_id} (--no-build) ==="
     # Fall back to building rather than aborting when the build is not
     # published.
@@ -1101,10 +1128,10 @@ EOF
     # stderr is NOT suppressed: if the failure is something other than a
     # missing build (bad credentials, an unreachable bucket) that message is
     # the only clue, and the fallback build would fail for the same reason.
-    if ! "$BUILD_SH" urls --with-receiver >"$out"; then
+    if ! AEROL_GO_TAGS="$go_tags" "$BUILD_SH" urls --with-receiver >"$out"; then
       echo "=== --no-build: ${build_id} is not published; building and publishing it now ===" >&2
-      build_id=$("$BUILD_SH" build --with-receiver)
-      "$BUILD_SH" publish --with-receiver >"$out"
+      build_id=$(AEROL_GO_TAGS="$go_tags" "$BUILD_SH" build --with-receiver)
+      AEROL_GO_TAGS="$go_tags" "$BUILD_SH" publish --with-receiver >"$out"
     fi
   else
     echo "=== artifacts: building locally ==="
@@ -1112,8 +1139,8 @@ EOF
     # the alternative is a scenario that enables the receiver discovering at
     # apply time that this build did not produce one. Skipped automatically on
     # refs that predate it.
-    build_id=$("$BUILD_SH" build --with-receiver)
-    "$BUILD_SH" publish --with-receiver >"$out"
+    build_id=$(AEROL_GO_TAGS="$go_tags" "$BUILD_SH" build --with-receiver)
+    AEROL_GO_TAGS="$go_tags" "$BUILD_SH" publish --with-receiver >"$out"
   fi
 
   export AEROL_BUILD_MODE="local"

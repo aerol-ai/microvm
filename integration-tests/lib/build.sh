@@ -7,6 +7,10 @@
 #   build.sh urls    [--ref <commit>] [--ttl 12h] [--arch ...]
 #   build.sh artifacts-init
 #
+# AEROL_GO_TAGS (e.g. itest_failpoints) compiles sandboxd with test-only Go
+# build tags and becomes part of the build id; unset, the build is the
+# release build. run.sh sets it from a scenario's caps go_tags.
+#
 # WHY this exists: every scenario until now provisioned from
 # `releases/latest`, so a branch under test could only be exercised after it
 # merged and released. The security-hardening matrix has to run against an
@@ -164,13 +168,44 @@ tree_delta() {
   done < <(git -C "$REPO_ROOT" ls-files --others --exclude-standard)
 }
 
+# go_tags echoes AEROL_GO_TAGS (comma- or space-separated) as one sorted,
+# de-duplicated, comma-separated list, or nothing when it is unset. Sorted so
+# "a,b" and "b a" name the same build. Only sandboxd is built with them, and
+# only run.sh's local itest build sets them (a scenario's caps go_tags): a
+# release build never goes through this script.
+go_tags() {
+  local raw="${AEROL_GO_TAGS:-}" t
+  local -a parts=() tags=()
+  IFS=$', \t' read -r -a parts <<<"$raw"
+  for t in ${parts[@]+"${parts[@]}"}; do
+    [[ -n "$t" ]] || continue
+    # The tags land in the build id, so in a directory name, an S3 key and
+    # the version string; Go itself allows nothing else in a tag.
+    [[ "$t" =~ ^[A-Za-z0-9_.]+$ ]] \
+      || die "AEROL_GO_TAGS: '${t}' is not a Go build tag (letters, digits, '_' and '.')"
+    tags+=("$t")
+  done
+  (( ${#tags[@]} > 0 )) || return 0
+  printf '%s\n' "${tags[@]}" | LC_ALL=C sort -u | paste -sd, -
+}
+
 # resolve_build_id echoes AEROL_BUILD_ID for the current invocation.
 #   --ref <commit>  ->  <short-sha>            (a commit is immutable; never dirty)
 #   default (HEAD)  ->  <short-sha>[-dirty-<tree-hash>]
+# either way followed by -tags-<tag>[-<tag>…] when AEROL_GO_TAGS is set: the
+# id is the cache key and the S3 prefix, so a tagged binary must never be
+# served for an untagged request, or the reverse. '-' cannot occur in a tag,
+# so the suffix reads back unambiguously.
 resolve_build_id() {
+  local tags suffix=""
+  # $(…) clears errexit here too, so a refused tag must fail this by hand.
+  tags=$(go_tags) || exit 1
+  [[ -n "$tags" ]] && suffix="-tags-${tags//,/-}"
   if [[ -n "$REF" ]]; then
-    git -C "$REPO_ROOT" rev-parse --short=12 "${REF}^{commit}" 2>/dev/null \
+    local id
+    id=$(git -C "$REPO_ROOT" rev-parse --short=12 "${REF}^{commit}" 2>/dev/null) \
       || die "--ref '${REF}' is not a commit in this repository"
+    printf '%s%s\n' "$id" "$suffix"
     return
   fi
   local sha delta
@@ -182,9 +217,9 @@ resolve_build_id() {
     || die "cannot resolve HEAD in ${REPO_ROOT}; refusing to build under an empty id"
   delta=$(tree_delta)
   if [[ -n "$delta" ]]; then
-    printf '%s-dirty-%s\n' "$sha" "$(printf '%s' "$delta" | sha256_stdin | cut -c1-12)"
+    printf '%s-dirty-%s%s\n' "$sha" "$(printf '%s' "$delta" | sha256_stdin | cut -c1-12)" "$suffix"
   else
-    printf '%s\n' "$sha"
+    printf '%s%s\n' "$sha" "$suffix"
   fi
 }
 
@@ -242,12 +277,21 @@ build_one_arch() {
   # exact tree that produced the numbers.
   ldflags="-X ${VERSION_PKG}.Version=itest-${build_id}"
 
+  # Test-only build tags (AEROL_GO_TAGS, e.g. itest_failpoints) go on sandboxd
+  # alone: it is the only binary with a failpoint, and toolboxd runs inside
+  # every sandbox, where a test hook has no business. No tags, no -tags flag:
+  # the default build is the release build.
+  local tags
+  tags=$(go_tags) || exit 1
+  local -a tagflag=()
+  [[ -n "$tags" ]] && tagflag=(-tags "$tags")
+
   # sandboxd needs CGO: mattn/go-sqlite3 is a C library, and the store is not
   # optional. zig cc supplies the cross-linking C toolchain Apple's clang can't.
-  log "build: sandboxd_linux_${arch} (CGO=1, zig cc -target ${zig_target})"
+  log "build: sandboxd_linux_${arch} (CGO=1, zig cc -target ${zig_target}${tags:+, -tags ${tags}})"
   ( cd "$src" && CGO_ENABLED=1 GOOS=linux GOARCH="$goarch" \
       CC="zig cc -target ${zig_target}" CXX="zig c++ -target ${zig_target}" \
-      go build -trimpath -ldflags "$ldflags" \
+      go build -trimpath ${tagflag[@]+"${tagflag[@]}"} -ldflags "$ldflags" \
       -o "${out}/sandboxd_linux_${arch}" ./cmd/sandboxd )
   assert_linux_elf "${out}/sandboxd_linux_${arch}" "$arch"
 
@@ -466,6 +510,7 @@ write_buildinfo() {
   "arches": [$(printf '"%s",' "${ARCHES[@]}" | sed 's/,$//')],
   "with_caddy": $( ((WITH_CADDY)) && echo true || echo false ),
   "with_receiver": $( ((WITH_RECEIVER)) && echo true || echo false ),
+  "go_tags": "$(go_tags)",
   "receiver_built": $( compgen -G "${out}/audit-receiver_linux_*" >/dev/null && echo true || echo false ),
   "zig_version": "$(zig version)",
   "zig_target_amd64": "${ZIG_TARGET_amd64}",
