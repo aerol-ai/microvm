@@ -1334,6 +1334,23 @@ func TestNodeRoleCases(t *testing.T) {
 		}
 	})
 
+	// SB_CLUSTER_OWNER_CACHE is off unless asked for: an older owner would
+	// serve or 404 a stale cache-routed forward instead of saying "not here".
+	t.Run("cluster_owner_cache_defaults_off_and_opts_in", func(t *testing.T) {
+		setClusterDefaults(t)
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load() error = %v", err)
+		}
+		if cfg.ClusterOwnerCache {
+			t.Fatal("ClusterOwnerCache = true by default")
+		}
+		t.Setenv("SB_CLUSTER_OWNER_CACHE", "true")
+		if cfg, err = Load(); err != nil || !cfg.ClusterOwnerCache {
+			t.Fatalf("SB_CLUSTER_OWNER_CACHE=true: ClusterOwnerCache=%v err=%v", cfg.ClusterOwnerCache, err)
+		}
+	})
+
 	t.Run("helpers_match_role", func(t *testing.T) {
 		cases := []struct {
 			role                            string

@@ -58,6 +58,25 @@ var (
 	// checks first, so this moves only on a race with a delete.
 	clusterOwnershipReplayRefused = expvar.NewInt("aerolvm_cluster_ownership_replay_refused_total")
 
+	// Request routing (pkg/api/clusterroute.Wrap, plan PR #1000 item E3a).
+	// route_requests counts per-sandbox calls a client sent to this node;
+	// route_lookups counts the control-plane reads the router made, by hop
+	// ("edge" = the node the client called, "owner" = the node a forward
+	// reached). Summed over the fleet, lookups / requests is the number of
+	// control-plane reads one routed call costs. On a worker or ingress node
+	// each read is a round trip to the server tier.
+	clusterRouteRequests = expvar.NewInt("aerolvm_cluster_route_requests_total")
+	clusterRouteLookups  = expvar.NewMap("aerolvm_cluster_route_lookups_total")
+	// Owner cache (owner_cache.go). hits: forwards routed from an entry;
+	// misses: routed calls that found no usable entry; retries: hits the
+	// target turned down ("not here") that the edge routed again; not_owner:
+	// cache-routed forwards this node turned down; entries: entries held.
+	ownerCacheHits     = expvar.NewInt("aerolvm_cluster_owner_cache_hits_total")
+	ownerCacheMisses   = expvar.NewInt("aerolvm_cluster_owner_cache_misses_total")
+	ownerCacheRetries  = expvar.NewInt("aerolvm_cluster_owner_cache_retries_total")
+	ownerCacheNotOwner = expvar.NewInt("aerolvm_cluster_owner_cache_not_owner_total")
+	ownerCacheEntries  = expvar.NewInt("aerolvm_cluster_owner_cache_entries")
+
 	// Restart catch-up (catch_up.go). catching_up is 1 from New until the
 	// FSM applies the leader's read index; a node stuck at 1 cannot reach a
 	// leader. rejects counts requests answered 503 instead of a false 404.
@@ -182,6 +201,32 @@ func RecordOwnerForwardStale() {
 func recordOwnerForwardTargetMiss(reason string) {
 	scaleobs.Add(ownerForwardTargetMisses, reason, 1)
 }
+
+// Route hops for RecordRouteLookup.
+const (
+	RouteHopEdge  = "edge"
+	RouteHopOwner = "owner"
+)
+
+// RecordRouteRequest counts one per-sandbox call a client sent to this node.
+func RecordRouteRequest() { clusterRouteRequests.Add(1) }
+
+// RecordRouteLookup counts one control-plane read the router made on hop.
+func RecordRouteLookup(hop string) { scaleobs.Add(clusterRouteLookups, hop, 1) }
+
+// RecordOwnerCacheHit counts one forward routed from an owner-cache entry.
+func RecordOwnerCacheHit() { ownerCacheHits.Add(1) }
+
+// RecordOwnerCacheMiss counts one routed call that found no usable entry.
+func RecordOwnerCacheMiss() { ownerCacheMisses.Add(1) }
+
+// RecordOwnerCacheRetry counts one cache-routed call the target turned down
+// and the edge routed again from a fresh lookup.
+func RecordOwnerCacheRetry() { ownerCacheRetries.Add(1) }
+
+// RecordOwnerCacheNotOwner counts one cache-routed forward this node turned
+// down because its own lookup does not say it owns the sandbox.
+func RecordOwnerCacheNotOwner() { ownerCacheNotOwner.Add(1) }
 
 func recordExpiredReservation() {
 	clusterReservationsExpired.Add(1)
