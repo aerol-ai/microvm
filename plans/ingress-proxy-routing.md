@@ -269,9 +269,11 @@ extra, because the responder starts with the daemon.
   config clears it elsewhere, so local and IP-mode nodes stay silent).
   `install.sh` turns it on for a `--domain` install
   (`--no-ingress-proxy-routing` for off). Terraform's
-  `default_ingress_proxy_routing` stays false, because changing it would
-  replace every running node (`plans/cluster-phase-2.md` §4.3). The
-  rationale is in `setup/config-defaults.md`.
+  `default_ingress_proxy_routing` is nullable: null (the default) passes no
+  flag, so install.sh's default applies, and renders the same user data as
+  the old default false, so no running node is replaced; `true` or `false`
+  passes an explicit flag (`plans/cluster-phase-2.md` §4.3). The rationale
+  is in `setup/config-defaults.md`.
 - **Per-node, no flag-day.** Owner and ingress flags are independent; the
   matrix is tested (6A).
 - **Flag on:** verify the resolver routing domain, install the static routes,

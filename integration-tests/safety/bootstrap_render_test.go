@@ -4,6 +4,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 )
@@ -80,7 +81,7 @@ func TestBootstrapTemplateRenders(t *testing.T) {
 	for _, branch := range []string{
 		"seed", "joiner", "joiner_kms", "joiner_audit_s3", "joiner_audit_file",
 		"seed_receiver", "joiner_receiver", "seed_public_ca", "seed_wrapped",
-		"joiner_api_lb", "joiner_api_lb_worker",
+		"joiner_api_lb", "joiner_api_lb_worker", "joiner_routing_on", "joiner_routing_off",
 	} {
 		t.Run(branch, func(t *testing.T) {
 			out, err := run("output", "-raw", branch)
@@ -591,4 +592,66 @@ func TestBootstrapJoinerInstallsWithoutStarting(t *testing.T) {
 	if i, j := strings.Index(joiner, flag), strings.Index(joiner, `sudo /tmp/install.sh "${INSTALL_ARGS[@]}"`); i < 0 || j < 0 || i > j {
 		t.Errorf("--no-start is not added before install.sh runs (flag at %d, install at %d)", i, j)
 	}
+}
+
+// default_ingress_proxy_routing is three-valued. null, its default, must
+// render exactly what the old default false rendered, which was no routing
+// text at all: nodes have user_data_replace_on_change, so one extra byte
+// would replace every node of every cluster that never set the variable.
+// true must render today's single line and nothing else (clusters that set
+// it keep their nodes too); false renders the off switch, because without a
+// flag install.sh turns routing on for a domain install.
+func TestBootstrapIngressProxyRoutingIsThreeValued(t *testing.T) {
+	null := renderBootstrap(t, "joiner")
+	on := renderBootstrap(t, "joiner_routing_on")
+	off := renderBootstrap(t, "joiner_routing_off")
+
+	if strings.Contains(null, "ingress-proxy-routing") {
+		t.Fatal("the null (default) render mentions ingress-proxy-routing; it must render no routing text at all")
+	}
+	added, ok := insertedLines(null, on)
+	if !ok || len(added) != 1 || added[0] != "INSTALL_ARGS+=(--ingress-proxy-routing)" {
+		t.Fatalf("true must add exactly the one flag line to the null render; added %q (contiguous=%v)", added, ok)
+	}
+	added, ok = insertedLines(null, off)
+	if !ok || len(added) == 0 || added[len(added)-1] != "INSTALL_ARGS+=(--no-ingress-proxy-routing)" {
+		t.Fatalf("false must add the off flag to the null render; added %q (contiguous=%v)", added, ok)
+	}
+	for _, l := range added[:len(added)-1] {
+		if !strings.HasPrefix(l, "#") {
+			t.Errorf("false adds a non-comment line besides the flag: %q", l)
+		}
+	}
+
+	// And the default really is null: a default of false would now render
+	// the off switch on every node and replace them all.
+	raw, err := os.ReadFile(filepath.Join(filepath.Dir(buildScript(t)), "..", "..", "Terraform", "variables.tf"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	block := regexp.MustCompile(`(?s)variable "default_ingress_proxy_routing" \{.*?\n\}`).FindString(string(raw))
+	if block == "" || !regexp.MustCompile(`\n\s*default\s*=\s*null\s*\n`).MatchString(block) {
+		t.Fatalf("default_ingress_proxy_routing must default to null:\n%s", block)
+	}
+}
+
+// insertedLines returns the lines with adds to base, when with is base plus
+// one contiguous run of lines (ok false otherwise).
+func insertedLines(base, with string) ([]string, bool) {
+	b, w := strings.Split(base, "\n"), strings.Split(with, "\n")
+	if len(w) < len(b) {
+		return nil, false
+	}
+	pre := 0
+	for pre < len(b) && b[pre] == w[pre] {
+		pre++
+	}
+	suf := 0
+	for suf < len(b)-pre && b[len(b)-1-suf] == w[len(w)-1-suf] {
+		suf++
+	}
+	if pre+suf != len(b) {
+		return nil, false
+	}
+	return w[pre : len(w)-suf], true
 }

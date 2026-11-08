@@ -180,8 +180,13 @@ INSTALL_ARGS+=(--with-gvisor)
 %{ if with_isolate ~}
 INSTALL_ARGS+=(--with-isolate)
 %{ endif ~}
-%{ if ingress_proxy_routing ~}
+%{ if ingress_proxy_routing == true ~}
 INSTALL_ARGS+=(--ingress-proxy-routing)
+%{ endif ~}
+%{ if ingress_proxy_routing == false ~}
+# Explicitly off in Terraform. Without the flag, install.sh would turn
+# routing on for this --domain install.
+INSTALL_ARGS+=(--no-ingress-proxy-routing)
 %{ endif ~}
 %{ if with_nvidia_gpu ~}
 INSTALL_ARGS+=(--with-nvidia-gpu)

@@ -307,8 +307,9 @@ func TestPlacementFeedPollingFitsTheAgeLimit(t *testing.T) {
 }
 
 // TestAgentPageWalkMarksRecreateEntriesInFluxWhenTheControlPlaneStops is the I7
-// regression for an ingress WITHOUT SB_INGRESS_PROXY_ROUTING, which is the
-// default and what the live cluster-chaos scenario runs (UC-470, 2026-11-08).
+// regression for an ingress WITHOUT SB_INGRESS_PROXY_ROUTING, which was the
+// default then and is what the live cluster-chaos scenario pins (UC-470,
+// 2026-11-08; default_ingress_proxy_routing = false in its tfvars).
 // That ingress has no feed: PlacementsForShards walks the pages, and when
 // the walk fails it falls back to the rows of the last walk that worked,
 // with no age limit. A cut-off ingress therefore kept its SNI route to the

@@ -153,7 +153,7 @@ Every entry was re-verified against `main` at `704c9e74` on 2026-10-06.
   `secret_audit_index.go`. An E2b witness sink may double as the central
   store.
 
-## Ingress route changes reset in-flight TLS connections on :443 — IMPLEMENTED behind `SB_INGRESS_PROXY_ROUTING`; default on (Go + install.sh), Terraform still off
+## Ingress route changes reset in-flight TLS connections on :443 — IMPLEMENTED behind `SB_INGRESS_PROXY_ROUTING`; default on (Go, install.sh, Terraform null)
 
 - **Shipped 2026-09-28 (#503–#512, released in v0.6.0; design in
   `plans/ingress-proxy-routing.md`):** a static Caddy config, with sandboxd
@@ -185,13 +185,14 @@ Every entry was re-verified against `main` at `704c9e74` on 2026-10-06.
 - **Default on where it applies:** `internal/config/config.go` defaults the
   flag on and clears it on a node without a Caddy domain (no ERROR, no
   probe). `scripts/install.sh` turns it on for a `--domain` install
-  (`--no-ingress-proxy-routing` for off). **Terraform still defaults it
-  off** (`default_ingress_proxy_routing`): changing the default would
-  replace every node of a running cluster (`user_data_replace_on_change`).
-  New clusters set it true. Because `false` adds no installer flag, nodes
-  Terraform creates after the install.sh change come up on anyway; whether
-  to keep that, render an explicit off for `false`, or make the variable
-  nullable is open (`plans/cluster-phase-2.md` §8, question 1).
+  (`--no-ingress-proxy-routing` for off). Terraform's
+  `default_ingress_proxy_routing` is nullable (the owner's answer to
+  `plans/cluster-phase-2.md` §8, question 1): null, the default, passes no
+  flag and renders the same user data as the old default false, so no
+  running node is replaced and new nodes come up on; `true` or `false`
+  passes an explicit flag. `cluster-chaos` pins false (its cases were proven
+  against the page walk); the three routing scenarios set true; every other
+  domain scenario now runs with routing on.
 - **Why it matters (cluster-bank-flagship, 2026-11-01, flag off):** UC-230
   and UC-266 exec-stream dials failed with `unexpected EOF`, 1 run in 20.
   Every create or destroy anywhere in the cluster made both dedicated

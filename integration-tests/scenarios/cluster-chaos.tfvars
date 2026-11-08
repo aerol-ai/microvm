@@ -40,6 +40,14 @@ caddy_shared_cert_storage = {
   enabled = true
 }
 
+# Pinned off. The chaos cases were written and proven against an ingress
+# with the flag off, which reads placements through the page walk, not the
+# delta feed (UC-470's cut-off owner is the walk's age limit; see
+# internal/cluster/agent_placement_feed_stale_test.go). Left unset, install.sh
+# would now turn routing on for this domain install and change what every
+# case measures. A flag-on chaos run is its own scenario when wanted.
+default_ingress_proxy_routing = false
+
 extra_sandboxd_env = {
   # Several cases wait out two reconcile intervals before they call a state
   # converged (I6). The 5-minute default would make that 10 minutes per case;
