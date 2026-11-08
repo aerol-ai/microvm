@@ -149,7 +149,21 @@ sync_release() {
 	gh release download "$tag" --repo "$REPO" --dir "$dir"
 	check_release "$dir" "$tag"
 	echo "Every file of ${tag} matches its checksums.txt; uploading to ${dest}"
-	aws s3 sync "$dir" "$dest" "${SYNC_OPTS[@]}"
+	local opts=("${SYNC_OPTS[@]}")
+	# A release re-cut under the same tag can change a file without changing
+	# its size, and checksums.txt never changes size (fixed-length lines), so
+	# a size-only sync would leave the mirror's checksums.txt stale against
+	# its new files and every install from the mirror would fail its check.
+	# When the mirror's checksums.txt differs from the release's, send every
+	# file, as --force does.
+	if [[ "$FORCE" != "true" ]] && aws s3 cp "${dest}checksums.txt" "$WORK/mirror-checksums.txt" \
+		--region "$REGION" --only-show-errors --no-progress 2>/dev/null; then
+		if ! cmp -s "$WORK/mirror-checksums.txt" "$dir/checksums.txt"; then
+			echo "The mirror's checksums.txt for ${tag} differs from the release's (re-cut?); sending every file"
+			opts=(--region "$REGION" --only-show-errors --no-progress)
+		fi
+	fi
+	aws s3 sync "$dir" "$dest" "${opts[@]}"
 	if [[ "$mark" == "yes" ]]; then
 		printf '%s\n' "$tag" >"$WORK/latest.txt"
 		# latest.txt moves only after every file of the release is up, so

@@ -65,6 +65,13 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 dst="$FAKE_S3/${args[3]#s3://}"
+if [[ "${args[0]} ${args[1]}" == "s3 cp" && "${args[2]}" == s3://* ]]; then
+  # A download from the bucket: missing is an error, as with aws.
+  from="$FAKE_S3/${args[2]#s3://}"
+  [[ -f "$from" ]] || exit 1
+  cp "$from" "${args[3]}"
+  exit 0
+fi
 case "${args[0]} ${args[1]}" in
   "s3 sync")
     # Like aws s3 sync: with --size-only a file already there at the same
@@ -242,7 +249,7 @@ func TestMirrorSyncReleaseUploadsOnlyAVerifiedRelease(t *testing.T) {
 			if has != tc.wantLatest || (has && latest != tag+"\n") {
 				t.Errorf("latest.txt = %q (present %v), want present %v naming %s", latest, has, tc.wantLatest, tag)
 			}
-			if tc.wantLatest && strings.Index(r.logs, "aws s3 cp") < strings.Index(r.logs, "aws s3 sync") {
+			if tc.wantLatest && strings.Index(r.logs, "latest.txt s3://") < strings.Index(r.logs, "aws s3 sync") {
 				t.Error("latest.txt moved before the release's files were up")
 			}
 			if strings.Contains(r.logs, "curl ") {
@@ -455,5 +462,26 @@ func TestMirrorSyncSkipsFilesAlreadyOnTheMirror(t *testing.T) {
 	}
 	if got := r.uploaded()["aerolvm-downloads/aerolvm/"+tag+"/sandboxd_linux_amd64"]; got != "sandboxd" {
 		t.Fatalf("--force left %q, want the released bytes", got)
+	}
+
+	// A re-cut under the same tag: a same-size change and a new
+	// checksums.txt (same size too). The mirror's checksums.txt differs, so
+	// every file goes again without --force.
+	recut := map[string]string{"sandboxd_linux_amd64": "SANDBOXD", "install.sh": "#!/bin/sh\n"}
+	recut["checksums.txt"] = checksumsFor(recut)
+	if len(recut["checksums.txt"]) != len(files["checksums.txt"]) {
+		t.Fatal("test setup: the re-cut checksums.txt should keep its size")
+	}
+	r.release(repo, tag, recut)
+	r.run("--release", tag)
+	if r.code != 0 {
+		t.Fatalf("re-cut sync exit %d", r.code)
+	}
+	got := r.uploaded()
+	if got["aerolvm-downloads/aerolvm/"+tag+"/sandboxd_linux_amd64"] != "SANDBOXD" || got["aerolvm-downloads/aerolvm/"+tag+"/checksums.txt"] != recut["checksums.txt"] {
+		t.Fatal("a re-cut release left stale files on the mirror")
+	}
+	if !strings.Contains(r.stdout, "differs from the release's") {
+		t.Fatal("the re-cut was not detected")
 	}
 }
