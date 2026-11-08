@@ -64,7 +64,7 @@ func TestVersionPinFillsWhatTheReleaseLacks(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read run.sh: %v", err)
 	}
-	fn := extractShellFunc(t, string(runSh), "prepare_artifacts")
+	fn := extractShellFunc(t, string(runSh), "release_download_base") + extractShellFunc(t, string(runSh), "prepare_artifacts")
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

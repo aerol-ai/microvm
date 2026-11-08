@@ -208,6 +208,7 @@ Good to know:
 - If `kernel_config_url` is empty, setup tries `kernel_url` with `.config` added to the end.
 - The kernel config must turn on `CONFIG_VMGENID=y`. If it does not, setup stops.
 - If your server image already has the files, set `auto_install_artifacts = false` and leave the URLs empty. The kernel must be at `kernel_path`, with its config next to it (by default `/var/lib/sandboxd/firecracker/vmlinux.config`).
+- The default download comes from GitHub only. So that a GitHub outage cannot stop a new server, point `binary_url` and `jailer_url` at the copies on the [download mirror](/getting-started/installer-options/#where-downloads-come-from): `https://aerolvm-downloads.s3.us-east-1.amazonaws.com/deps/firecracker/v1.15.1/firecracker-v1.15.1-x86_64` and `.../jailer-v1.15.1-x86_64` (`aarch64` on Arm servers). Set them when you create the cluster: changing them later replaces every Firecracker server on the next `terraform apply`.
 
 After you deploy, turn a container image into a Firecracker template, then create sandboxes with the `firecracker` runtime. See [Firecracker templates](/firecracker-templates/).
 
