@@ -48,7 +48,7 @@ func (s *Server) clusterControlHeaderGuard(next http.Handler) http.Handler {
 		}
 		if s.service == nil || !cluster.IsLivePeer(s.service.Cluster(), peerID) {
 			cluster.RecordMTLSUnknownPeer()
-			apihttp.WriteError(w, http.StatusForbidden, "cluster peer not in membership")
+			apihttp.WriteError(w, http.StatusForbidden, cluster.PeerNotInMembershipMessage)
 			return
 		}
 		next.ServeHTTP(w, r)

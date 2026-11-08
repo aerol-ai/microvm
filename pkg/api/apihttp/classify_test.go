@@ -96,6 +96,9 @@ func TestClassify(t *testing.T) {
 		{"not leader", cluster.ErrNotLeader, http.StatusServiceUnavailable, cluster.LeaderChangeRetryAfterSeconds, "", ErrKindOther},
 		{"no leader", fmt.Errorf("storage retirement: %w", cluster.ErrNoLeader), http.StatusServiceUnavailable, cluster.LeaderChangeRetryAfterSeconds, "", ErrKindOther},
 		{"leader gone mid-forward", fmt.Errorf("%w: leader-forward apply: dial tcp 10.42.1.198:7002: connect: connection refused", cluster.ErrNotLeader), http.StatusServiceUnavailable, cluster.LeaderChangeRetryAfterSeconds, "", ErrKindOther},
+		// A new leader whose gossip view does not list the forwarder yet:
+		// retryable like an election, never the unclassified 400.
+		{"leader does not see this node yet", fmt.Errorf("%w: leader-forward apply: %s", cluster.ErrMembershipPending, cluster.PeerNotInMembershipMessage), http.StatusServiceUnavailable, cluster.LeaderChangeRetryAfterSeconds, "", ErrKindOther},
 		{"placement view catching up", fmt.Errorf("destroy: %w", cluster.ErrNotCaughtUp), http.StatusServiceUnavailable, cluster.CatchUpRetryAfterSeconds, "", ErrKindOther},
 		{"ownership fenced", fmt.Errorf("start: %w", service.ErrOwnershipFenced), http.StatusServiceUnavailable, cluster.LeaderChangeRetryAfterSeconds, "", ErrKindOther},
 		{"snapshot name conflict", store.ErrSnapshotNameConflict, http.StatusConflict, 0, "", ErrKindSnapshotNameConflict},

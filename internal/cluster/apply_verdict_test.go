@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 )
@@ -146,5 +148,59 @@ func TestApplyVerdictDoesNotCrossConflictSentinels(t *testing.T) {
 		fmt.Errorf("%w: reservation retry changed its incarnation", ErrIncarnationConflict).Error())
 	if !errors.Is(inc, ErrIncarnationConflict) || errors.Is(inc, ErrReservationConflict) || errors.Is(inc, ErrNameConflict) {
 		t.Fatalf("incarnation-conflict message resolved to the wrong sentinel: %v", inc)
+	}
+}
+
+// A leader whose gossip view does not list the forwarder yet answers 403
+// PeerNotInMembershipMessage. During a leader change that is a moment's lag
+// (TestClusterFaultLeaderChangeDuringConcurrentReserves/kill hit it under
+// -race on main), so the forward must come back as ErrMembershipPending,
+// which callers retry like an election; it used to be unclassified, and the
+// public API answered 400. Every other 403 stays final.
+func TestLeaderForwardMembershipRefusalIsRetryable(t *testing.T) {
+	cases := []struct {
+		name      string
+		write     func(w http.ResponseWriter)
+		retryable bool
+	}{
+		{
+			name:      "internal listener (plain text)",
+			write:     func(w http.ResponseWriter) { http.Error(w, PeerNotInMembershipMessage, http.StatusForbidden) },
+			retryable: true,
+		},
+		{
+			name: "v1 apply route (JSON error body)",
+			write: func(w http.ResponseWriter) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusForbidden)
+				_, _ = w.Write([]byte(`{"error":"` + PeerNotInMembershipMessage + `"}`))
+			},
+			retryable: true,
+		},
+		{
+			name:      "unauthenticated peer stays final",
+			write:     func(w http.ResponseWriter) { http.Error(w, "cluster peer identity required", http.StatusForbidden) },
+			retryable: false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { tc.write(w) }))
+			defer srv.Close()
+			c := &Cluster{nodeID: "forwarder-1"}
+			err := c.doLeaderApply(context.Background(), srv.Client(), srv.URL+"/internal/apply", []byte("cmd"))
+			if err == nil {
+				t.Fatal("a 403 from the leader returned no error")
+			}
+			if got := errors.Is(err, ErrMembershipPending); got != tc.retryable {
+				t.Fatalf("errors.Is(%v, ErrMembershipPending) = %v, want %v", err, got, tc.retryable)
+			}
+			if got := IsControlPlaneUnavailable(err); got != tc.retryable {
+				t.Fatalf("IsControlPlaneUnavailable(%v) = %v, want %v", err, got, tc.retryable)
+			}
+			if !strings.Contains(err.Error(), "leader-forward apply") {
+				t.Fatalf("error %q does not say it came from the leader forward", err)
+			}
+		})
 	}
 }

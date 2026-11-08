@@ -117,6 +117,17 @@ func forwardApplyStatus(status int, message string) error {
 		case strings.Contains(message, ErrPlacementDeleted.Error()):
 			return fmt.Errorf("%w: %s", ErrPlacementDeleted, message)
 		}
+	case http.StatusForbidden:
+		// The leader's peer check does not see this node alive in gossip
+		// yet. During a leader change the new leader's view can lag the
+		// forwarder's for a moment; as an unclassified error the create
+		// answered 400 and an SDK gave up on a write a retry seconds later
+		// commits (the reserve never reached the FSM). The agent's
+		// control-plane calls already treat the same 403 this way. Every
+		// other 403 stays final.
+		if strings.Contains(message, PeerNotInMembershipMessage) {
+			return fmt.Errorf("%w: leader-forward apply: %s", ErrMembershipPending, message)
+		}
 	case http.StatusServiceUnavailable:
 		switch {
 		case strings.Contains(message, ErrCapacityExceeded.Error()):
