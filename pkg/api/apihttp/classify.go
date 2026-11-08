@@ -376,6 +376,10 @@ func Classify(err error) Classification {
 	// leader's internal address.
 	case cluster.IsLeaderUnavailable(err):
 		return Classification{Status: http.StatusServiceUnavailable, RetryAfter: cluster.LeaderChangeRetryAfterSeconds, Message: "cluster leader unavailable (an election is in progress); retry shortly", LogLevel: slog.LevelInfo, Log: true}
+	// The leader does not see this node in gossip yet (a leader change or a
+	// restart in progress). The write never reached the FSM: retryable.
+	case errors.Is(err, cluster.ErrMembershipPending):
+		return Classification{Status: http.StatusServiceUnavailable, RetryAfter: cluster.LeaderChangeRetryAfterSeconds, Message: "the cluster leader does not see this node yet (a leader change or restart is in progress); retry shortly", LogLevel: slog.LevelInfo, Log: true}
 	// A restarted node whose placement view has not caught up cannot prove a
 	// sandbox is gone: retry, never 404 (a client that trusts a 404 leaks
 	// the sandbox, its secrets and its capacity).

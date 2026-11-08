@@ -80,6 +80,12 @@ func IsLeaderUnavailable(err error) bool {
 // systemd's restart limit made it final.
 var ErrMembershipPending = errors.New("cluster: peer membership not yet recognised by the control plane")
 
+// PeerNotInMembershipMessage is the 403 body every peer check (the internal
+// listener, the v1 apply route, the peer middleware) answers a node it does
+// not see alive in gossip. The callers match it to restore
+// ErrMembershipPending, so it is one constant, never retyped.
+const PeerNotInMembershipMessage = "cluster peer not in membership"
+
 // IsControlPlaneUnavailable reports whether err means only that the control
 // plane could not serve this node at this instant — no leader seated, or the
 // server not yet seeing this node in gossip. Neither says anything about the

@@ -176,7 +176,7 @@ func (s *internalServer) authorizePeerRequest(w http.ResponseWriter, r *http.Req
 	}
 	if !(*authorizer)(peerID) {
 		RecordMTLSUnknownPeer()
-		http.Error(w, "cluster peer not in membership", http.StatusForbidden)
+		http.Error(w, PeerNotInMembershipMessage, http.StatusForbidden)
 		return false
 	}
 	return true

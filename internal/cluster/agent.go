@@ -1872,7 +1872,7 @@ func (e statusError) Is(target error) bool {
 	}
 	switch e.status {
 	case http.StatusForbidden:
-		return strings.Contains(e.message, "cluster peer not in membership")
+		return strings.Contains(e.message, PeerNotInMembershipMessage)
 	case http.StatusServiceUnavailable:
 		return strings.Contains(e.message, "peer membership not yet available")
 	}

@@ -327,7 +327,7 @@ func withInternalMTLS(d Deps, next http.Handler) http.Handler {
 		}
 		if !peerMemberAlive(d, peerID) {
 			cluster.RecordMTLSUnknownPeer()
-			http.Error(w, "cluster peer not in membership", http.StatusForbidden)
+			http.Error(w, cluster.PeerNotInMembershipMessage, http.StatusForbidden)
 			return
 		}
 		r = r.WithContext(context.WithValue(r.Context(), clusterPeerNodeIDContextKey{}, peerID))
