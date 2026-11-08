@@ -81,7 +81,7 @@ func joinTransport(cfg *tls.Config) *http.Transport {
 // because nothing it reads is trusted until its MACs check out.
 func insecureClient() *http.Client {
 	return &http.Client{Timeout: joinTimeout, Transport: joinTransport(
-		&tls.Config{InsecureSkipVerify: true, MinVersion: tls.VersionTLS12}, //nolint:gosec // trust comes from the discovery MAC, not the chain
+		&tls.Config{InsecureSkipVerify: true, MinVersion: tls.VersionTLS12}, // #nosec G402 -- trust comes from the discovery MAC, not the chain
 	)}
 }
 
