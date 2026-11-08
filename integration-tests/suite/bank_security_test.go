@@ -1801,28 +1801,14 @@ func bankStillAnswers(t *testing.T, sb *microvm.Sandbox, wait time.Duration) {
 	}
 }
 
-// bankAddressRules is the node's host firewall lines that name ip (iptables,
-// legacy iptables and nftables, whichever the node uses), normalized so two
-// snapshots compare: nft counters are dropped, and a set's element list is
-// reduced to "holds ip".
+// bankAddressRules is what the node's host firewall (iptables, legacy
+// iptables and nftables, whichever the node uses) holds for ip, normalized so
+// two snapshots compare (harness.AddressRuleLines: counters dropped, nft sets
+// read element by element, so a set re-wrapped by another address is no
+// change).
 func bankAddressRules(t *testing.T, node harness.IntegrationNode, ip string) []string {
 	t.Helper()
-	out := bankRuleDump(t, node)
-	re := ipOnLine(ip)
-	counters := regexp.MustCompile(`counter packets \d+ bytes \d+ ?`)
-	var rules []string
-	for _, line := range strings.Split(out, "\n") {
-		line = strings.TrimSpace(line)
-		if !re.MatchString(line) {
-			continue
-		}
-		if strings.Contains(line, "elements = {") {
-			line = "a set holds " + ip
-		}
-		rules = append(rules, counters.ReplaceAllString(line, ""))
-	}
-	sort.Strings(rules)
-	return rules
+	return harness.AddressRuleLines(bankRuleDump(t, node), ip)
 }
 
 // UC-345 — a process OOM-killed inside a sandbox neither stops the sandbox
