@@ -13,9 +13,11 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/aerol-ai/microvm/pkg/egresspolicy"
+	"github.com/aerol-ai/microvm/pkg/hostproc"
 	"github.com/aerol-ai/microvm/pkg/jsbundle"
 )
 
@@ -46,6 +48,14 @@ type HostConfig struct {
 	// Logger records egress pool-exhaustion spill (no silent caps). Nil →
 	// slog.Default().
 	Logger *slog.Logger
+	// RecordDir holds the record a running host leaves for the next
+	// sandboxd (adopt.go). Empty: no record, and a sandboxd restart stops
+	// the host instead of taking it over.
+	RecordDir string
+	// Cgroup is where an unjailed workerd starts, outside sandboxd's unit,
+	// so a sandboxd restart does not stop it. A jailed workerd has its
+	// group's own cgroup instead. Nil: start in place.
+	Cgroup *hostproc.Cgroup
 }
 
 // Host owns one workerd process for an isolate group and the Go-side
@@ -86,11 +96,20 @@ type Host struct {
 	// cmd/ctrlClient/servers are set once in Start and cleared in Stop; guarded
 	// by mu because Invoke reads ctrlClient while Stop nils cmd concurrently.
 	cmd *exec.Cmd
+	// proc is a workerd a previous sandboxd started and this one adopted
+	// (adopt.go). It has no cmd: it is signalled through its pidfd.
+	proc hostproc.Process
 	// exited is closed once workerd has exited; one goroutine reaps it
 	// (cmd.Wait may be called only once), so both the readiness wait and
 	// Stop learn of the exit from here.
-	exited        chan struct{}
-	exitErr       error
+	exited  chan struct{}
+	exitErr error
+	// pid, startTicks and bootID name workerd for the record; recordMu
+	// orders record writes.
+	pid           int
+	startTicks    uint64
+	bootID        string
+	recordMu      sync.Mutex
 	bundleSrv     *http.Server
 	egressDenySrv *http.Server
 	ctrlClient    *http.Client
@@ -217,8 +236,12 @@ func (h *Host) Load(id string, b *jsbundle.Bundle) error {
 		return err
 	}
 	h.mu.Lock()
+	_, had := h.bundles[id]
 	h.bundles[id] = b
 	h.mu.Unlock()
+	if !had {
+		h.writeRecord()
+	}
 	return nil
 }
 
@@ -237,6 +260,7 @@ func (h *Host) Unload(id string) int {
 	}
 	n := len(h.bundles)
 	h.mu.Unlock()
+	h.writeRecord()
 	return n
 }
 
@@ -304,10 +328,17 @@ func (h *Host) Start(ctx context.Context) error {
 
 	configPath := filepath.Join(h.cfg.RunDir, "config.capnp")
 	workerdArgs := []string{"serve", "--experimental", h.inJail(configPath)}
-	cmd := exec.Command(h.cfg.WorkerdPath, workerdArgs...)
-	cmd.Dir = h.cfg.RunDir
-	cmd.Stdout = os.Stderr
-	cmd.Stderr = os.Stderr
+	newCmd := func() *exec.Cmd {
+		c := exec.Command(h.cfg.WorkerdPath, workerdArgs...)
+		c.Dir = h.cfg.RunDir
+		// Straight to sandboxd's stderr (the journal), never a pipe
+		// sandboxd reads: workerd outlives sandboxd and must not get
+		// SIGPIPE when it is gone.
+		c.Stdout = os.Stderr
+		c.Stderr = os.Stderr
+		return c
+	}
+	cmd := newCmd()
 	if h.cfg.Jail.Require {
 		if err := applyJail(cmd, h.cfg.Jail, workerdArgs, realized); err != nil {
 			_ = h.stopServers()
@@ -325,13 +356,22 @@ func (h *Host) Start(ctx context.Context) error {
 			return err
 		}
 	}
-	if err := cmd.Start(); err != nil {
+	var startErr error
+	if !h.cfg.Jail.Require && h.cfg.Cgroup != nil {
+		// Unjailed, workerd would be sandboxd's child in sandboxd's cgroup
+		// and die with every restart; it starts in the hosts' cgroup.
+		cmd, startErr = h.cfg.Cgroup.Start(func() (*exec.Cmd, error) { return newCmd(), nil })
+	} else {
+		startErr = cmd.Start()
+	}
+	if startErr != nil {
 		realized.closeFD()
 		_ = realized.teardown()
 		_ = h.stopServers()
-		return fmt.Errorf("isolate: start workerd: %w", err)
+		return fmt.Errorf("isolate: start workerd: %w", startErr)
 	}
 	realized.closeFD()
+	h.noteProcess(cmd.Process.Pid)
 	exited := make(chan struct{})
 	client := unixHTTPClient(h.controlSock)
 	h.mu.Lock()
@@ -353,6 +393,7 @@ func (h *Host) Start(ctx context.Context) error {
 		return err
 	}
 	h.started.Store(true)
+	h.writeRecord()
 	return nil
 }
 
@@ -504,12 +545,18 @@ func (h *Host) stopServers() error {
 
 // Stop kills the workerd process and tears down the host servers. Idempotent.
 func (h *Host) Stop() error {
+	// The record goes before workerd does, so a sandboxd that dies in
+	// between finds an unrecorded workerd at boot and kills it rather than
+	// adopting a host that is being stopped.
+	h.removeRecord()
 	h.started.Store(false)
 	h.mu.Lock()
 	cmd := h.cmd
+	proc := h.proc
 	exited := h.exited
 	jail := h.jail
 	h.cmd = nil
+	h.proc = nil
 	h.jail = nil
 	h.mu.Unlock()
 	if cmd != nil && cmd.Process != nil {
@@ -517,6 +564,11 @@ func (h *Host) Stop() error {
 		if exited != nil {
 			<-exited
 		}
+	}
+	if proc != nil {
+		_ = proc.Signal(syscall.SIGKILL)
+		<-proc.Done()
+		_ = proc.Close()
 	}
 	err := h.stopServers()
 	if jail != nil {

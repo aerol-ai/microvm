@@ -180,10 +180,14 @@ func (h *Host) setEgressPolicy(id string, raw EgressPolicy, claim bool) error {
 
 	if p.BlockAll() {
 		// No slot for block-all: it binds EGRESS_DENY. Drop any prior slot.
-		if slot, ok := h.slotByID[id]; ok {
+		slot, had := h.slotByID[id]
+		if had {
 			h.freeSlotLocked(id, slot)
 		}
 		h.mu.Unlock()
+		if had {
+			h.writeRecord()
+		}
 		return nil
 	}
 	if _, ok := h.slotByID[id]; ok {
@@ -207,6 +211,9 @@ func (h *Host) setEgressPolicy(id string, raw EgressPolicy, claim bool) error {
 	h.slotByID[id] = slot
 	h.idBySlot[slot] = id
 	h.mu.Unlock()
+	// The slot is part of the isolate's identity in workerd's cache: a
+	// restarted sandboxd must give it back exactly (adopt.go).
+	h.writeRecord()
 	return nil
 }
 
