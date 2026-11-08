@@ -1205,11 +1205,16 @@ var Registry = []UseCase{
 	{ID: "UC-674", Title: "aerolvm get/describe/delete snapshots on a snapshot the old snapshot verb made: listed by name, -o json names its source sandbox, describe shows it, delete removes it (get then exits 1) and a repeat delete exits 0 (on a cluster the list checks are skipped: GET /v1/snapshots is node-local there)", Requires: []Capability{CapDocker}, Implemented: true},
 	{ID: "UC-675", Title: "aerolvm get/describe/delete tokens on a token aerolvm token create made: listed by ID, described by name, -o json shows role and team, delete by name is refused, delete by ID revokes it so it leaves the list, and a repeat delete exits 0", Requires: []Capability{CapIdentity}, Implemented: true},
 	{ID: "UC-676", Title: "aerolvm api-resources lists nodes, sandboxes, snapshots and tokens with their short names and verbs, with no login; top nodes shows each node's reserved CPU and memory against its budget from /v1/capacity, and - for a node with no budget (a cluster's ingress or server)", Requires: []Capability{CapDocker}, Implemented: true},
-	// T14 (plans/kubectl-style-cluster-ops.md §6.4): measurements, not pass
-	// or fail on survival. They restart sandboxd, so they live in a file that
-	// sorts late (z_runtime_restart_test.go).
-	{ID: "UC-677", Title: "T14 WASM across systemctl restart sandboxd: an ephemeral and a passivatable WASM sandbox with a counter file are probed before and after (status, exec, state, host processes, times, what sandboxd logged), and the result is recorded", Requires: []Capability{CapWasm}, Implemented: true},
-	{ID: "UC-678", Title: "T14 V8 isolate across systemctl restart sandboxd: an isolate sandbox with an in-memory fetch counter is probed before and after, with the jail on (default) and with SB_ISOLATE_USE_JAIL=false, and the result is recorded", Requires: []Capability{CapIsolate}, Implemented: true},
+	// T14 (plans/kubectl-style-cluster-ops.md §6.4) found that WASM and
+	// isolate sandboxes did not survive a sandboxd restart; these now assert
+	// that they do. They restart sandboxd, so they live in files that sort
+	// late (z_runtime_restart_test.go, z_upgrade_runtimes_test.go).
+	{ID: "UC-677", Title: "WASM across systemctl restart sandboxd: an ephemeral (default) and a passivatable WASM sandbox on the resident host keep running, answer exec within seconds of /health with their /work counter moved on by exactly one and their marker file intact, sandboxd logs taking each over, and every WASM worker process from before is still running", Requires: []Capability{CapWasm}, Implemented: true},
+	{ID: "UC-678", Title: "V8 isolate across systemctl restart sandboxd: an isolate whose fetch handler counts calls in memory keeps running and answers 4 after 3 (the same isolate, so the same memory), with the jail on (the default; it can be created at all) and with SB_ISOLATE_USE_JAIL=false", Requires: []Capability{CapIsolate}, Implemented: true},
+	{ID: "UC-700", Title: "A WASM sandbox with public traffic on runs on its own per-sandbox worker, and Python there runs a script file from /work and -c (an exec no longer opens a guest listener whose fd broke Python's embedded files)", Requires: []Capability{CapWasm}, Implemented: true},
+	{ID: "UC-701", Title: "A WASM sandbox with public traffic on (its own per-sandbox worker) keeps running across systemctl restart sandboxd with its /work counter moved on by one (asserted in the UC-677 test)", Requires: []Capability{CapWasm}, Implemented: true},
+	{ID: "UC-702", Title: "A WASM sandbox whose worker was killed while sandboxd was stopped is restored at boot over its kept /work: started, exec answers at once, its counter file carries on, and sandboxd logs the restore", Requires: []Capability{CapWasm}, Implemented: true},
+	{ID: "UC-703", Title: "aerolvm upgrade plan <B> --from says WASM and isolate sandboxes keep running, and aerolvm upgrade apply <B> --from --wait on a single node keeps an ephemeral and a passivatable WASM sandbox and a jailed isolate running with their state (counter 3 then 4); then rollback puts A back", Requires: []Capability{CapWasm, CapIsolate, CapDocker}, Excludes: []Capability{CapCluster}, Implemented: true},
 }
 
 // byID is a lookup built once for the report generator.

@@ -1,0 +1,15 @@
+# single-node-wasm-isolate under its own name (Terraform state is keyed by
+# scenario name), for the WASM and isolate restart-survival gate: UC-677,
+# UC-678 and UC-700..703. One mixed node running docker (containerd engine),
+# WASM and the V8 isolate (jail on), with named credentials.
+#
+# `wasm` makes run.sh turn on wasm.enabled and stage the standard modules;
+# `isolate` and `isolate-jail` only advertise what provisioning installed.
+name: single-node-wasm-restart
+capabilities:
+  - docker
+  - wasm
+  - isolate
+  - isolate-jail
+  - identity
+  - domain
