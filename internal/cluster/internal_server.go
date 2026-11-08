@@ -80,7 +80,7 @@ func startInternalServer(bindAddr string, ct *ClusterTLS, applyHandler func(cont
 	is := &internalServer{logger: logger}
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST "+InternalAPIPath, func(w http.ResponseWriter, r *http.Request) {
-		if !is.authorizePeerRequest(w, r) {
+		if _, ok := is.authorizePeerRequest(w, r); !ok {
 			return
 		}
 		// The TLS handshake verifies the chain and authorizePeerRequest binds
@@ -105,7 +105,7 @@ func startInternalServer(bindAddr string, ct *ClusterTLS, applyHandler func(cont
 		w.WriteHeader(http.StatusNoContent)
 	})
 	mux.HandleFunc("GET "+InternalReadIndexPath, func(w http.ResponseWriter, r *http.Request) {
-		if !is.authorizePeerRequest(w, r) {
+		if _, ok := is.authorizePeerRequest(w, r); !ok {
 			return
 		}
 		var fn readIndexFunc
@@ -123,7 +123,8 @@ func startInternalServer(bindAddr string, ct *ClusterTLS, applyHandler func(cont
 		// which public-API-shaped route is delegated below. Authorize the mTLS
 		// identity before examining headers; otherwise a removed node can omit
 		// X-Cluster-* markers and exercise operator routes with the shared PAT.
-		if !is.authorizePeerRequest(w, r) {
+		peerID, ok := is.authorizePeerRequest(w, r)
+		if !ok {
 			return
 		}
 		hp := is.extra.Load()
@@ -133,7 +134,9 @@ func startInternalServer(bindAddr string, ct *ClusterTLS, applyHandler func(cont
 			http.Error(w, "cluster: internal API not yet attached", http.StatusServiceUnavailable)
 			return
 		}
-		(*hp).ServeHTTP(w, r)
+		// The mark lets a peer with no PAT call as itself (peer_cert_auth.go):
+		// it is set only here, after every peer check passed.
+		(*hp).ServeHTTP(w, r.WithContext(ContextWithInternalPeer(r.Context(), peerID)))
 	})
 
 	tlsListener, err := tls.Listen("tcp", bindAddr, ct.serverConfig())
@@ -167,20 +170,23 @@ func startInternalServer(bindAddr string, ct *ClusterTLS, applyHandler func(cont
 	return is, nil
 }
 
-func (s *internalServer) authorizePeerRequest(w http.ResponseWriter, r *http.Request) bool {
+// authorizePeerRequest answers a refusal and reports false unless the
+// request comes from a live, admitted, undeleted peer; it returns that
+// peer's ID.
+func (s *internalServer) authorizePeerRequest(w http.ResponseWriter, r *http.Request) (string, bool) {
 	peerID, err := AuthenticatedPeerNodeID(r)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusForbidden)
-		return false
+		return "", false
 	}
 	if denied := s.peerDenied.Load(); denied != nil && (*denied)(peerID) {
 		http.Error(w, ErrPeerDeleted.Error(), http.StatusForbidden)
-		return false
+		return "", false
 	}
 	if check := s.peerKey.Load(); check != nil {
 		if err := (*check)(peerID, r.TLS.PeerCertificates[0]); err != nil {
 			http.Error(w, err.Error(), http.StatusForbidden)
-			return false
+			return "", false
 		}
 	}
 	authorizer := s.peerAuth.Load()
@@ -190,14 +196,14 @@ func (s *internalServer) authorizePeerRequest(w http.ResponseWriter, r *http.Req
 		// closed, but as a retryable "not ready" — the same shape the
 		// delegated path already returns before AttachInternalHandler fires.
 		http.Error(w, "cluster: peer membership not yet available", http.StatusServiceUnavailable)
-		return false
+		return "", false
 	}
 	if !(*authorizer)(peerID) {
 		RecordMTLSUnknownPeer()
 		http.Error(w, PeerNotInMembershipMessage, http.StatusForbidden)
-		return false
+		return "", false
 	}
-	return true
+	return peerID, true
 }
 
 // SetPeerAuthorizer installs the live-membership check after gossip starts.

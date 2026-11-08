@@ -242,7 +242,7 @@ type upgradeNode struct {
 
 func newUpgradeNode(cfg config.Config, nodeID string, isServer bool, logger *slog.Logger) *upgradeNode {
 	return &upgradeNode{
-		nodeID: nodeID, isServer: isServer, cfg: cfg, logger: logger, patToken: cfg.PATToken,
+		nodeID: nodeID, isServer: isServer, cfg: cfg, logger: logger, patToken: cfg.ClusterPeerPAT(),
 		host:       &nodeupgrade.SystemHost{},
 		launch:     nodeupgrade.Launch,
 		fetchRetry: 2 * time.Second,

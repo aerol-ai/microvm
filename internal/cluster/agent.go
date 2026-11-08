@@ -186,6 +186,8 @@ type Agent struct {
 
 	gossip *gossipNode
 
+	// patToken is cfg.ClusterPeerPAT(): empty on a node joined without the
+	// operator PAT, which then calls peers with its cert alone.
 	patToken string
 
 	internalURL    string
@@ -263,7 +265,7 @@ func NewAgent(cfg config.Config, logger *slog.Logger, admitter *capacity.Admitte
 		nodeID:        nodeID,
 		apiURL:        cfg.SelfAPIAdvertiseURL,
 		dataPlaneHost: cfg.DataPlaneAdvertiseHost,
-		patToken:      cfg.PATToken,
+		patToken:      cfg.ClusterPeerPAT(),
 		tls:           clusterTLS,
 		denyHits:      &denyHitRecorder{logger: logger},
 	}

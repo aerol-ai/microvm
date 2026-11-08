@@ -45,13 +45,13 @@ type Cluster struct {
 	// time in tests (stale_read.go). Always nil in production.
 	leaderContactHook func() (raft.RaftState, time.Time)
 
-	// patToken authenticates leader-forwarded raft applies. Sourced from
-	// cfg.PATToken at construction; same value every node already shares for
-	// regular API auth, so no new secret-distribution surface. With mTLS
-	// enabled the PAT is belt-and-braces — the TLS handshake already proved
-	// cluster membership — but we keep sending it so the receiving handler can
-	// stay symmetric with the public endpoint. A selected mTLS request never
-	// downgrades to the public endpoint after a TLS error.
+	// patToken is the bearer this node's own peer calls carry:
+	// cfg.ClusterPeerPAT(), the operator PAT when the node holds it. A node
+	// joined without it sends none and peers know it by its cert alone
+	// (peer_cert_auth.go). The TLS handshake proves membership either way;
+	// a node with the PAT keeps sending it so older peers still accept it.
+	// A selected mTLS request never downgrades to the public endpoint after
+	// a TLS error. The join service also hands it to the servers it joins.
 	patToken string
 	// internalURL is this node's cluster-internal mTLS advertise URL.
 	internalURL string
@@ -255,7 +255,7 @@ func New(cfg config.Config, logger *slog.Logger, admitter *capacity.Admitter) (*
 		dataPlaneHost: cfg.DataPlaneAdvertiseHost,
 		fsm:           fsm,
 		raft:          rn,
-		patToken:      cfg.PATToken,
+		patToken:      cfg.ClusterPeerPAT(),
 		commitTimeout: commitTimeout,
 		deadOwners:    newDeadOwnerTracker(),
 		tls:           clusterTLS,
