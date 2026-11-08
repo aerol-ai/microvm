@@ -21,9 +21,10 @@ func TestPoolEligible(t *testing.T) {
 	if !poolEligible(req, nil) {
 		t.Fatal("default create should be eligible")
 	}
+	// Env rides the adopt frame on this engine (plans/cluster-phase-2.md §2).
 	req.Env = map[string]string{"X": "1"}
-	if poolEligible(req, nil) {
-		t.Fatal("env should disqualify")
+	if !poolEligible(req, nil) {
+		t.Fatal("plain env should not disqualify")
 	}
 }
 

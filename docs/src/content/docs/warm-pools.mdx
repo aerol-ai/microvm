@@ -220,11 +220,15 @@ There is nothing new to call. Create a sandbox from the image as usual, and a se
 
 A create can only take a waiting sandbox when it asks for nothing that a waiting sandbox does not already have. These settings make the create start a new sandbox instead:
 
-- environment variables, mounts or volumes
+- mounts or volumes
+- environment variables on a Docker server
+- on a containerd server, environment variables that the server can't hand over: a name that starts with `SB_` or `AEROLVM_EGRESS_CA`, the names `USER` or `LOGNAME`, or more than about 252 KiB of variables in all
 - a user other than `root`, or a custom start command
 - a private-registry login
 - a GPU
 - on Docker servers that limit disk size, a disk size other than the default
+
+On a containerd server, the waiting sandbox gets your environment variables when it is handed to you, before its start command runs. So the start command, your commands and terminals all see them, just as on a new sandbox. The server sends them to the sandbox's agent over a private channel and never writes them into the container's settings. If the agent can't prove it got them, the server throws that sandbox away and starts a new one for you.
 
 The image name must match the entry exactly. An entry for `python:3.12` does not serve a create of `docker.io/library/python:3.12`.
 

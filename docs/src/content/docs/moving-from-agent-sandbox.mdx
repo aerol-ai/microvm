@@ -229,7 +229,7 @@ In agent-sandbox, a create names a warm pool, and the template behind it sets th
 
 - **The sandbox is running when the call returns.** There is no ready timeout to set.
 - **Warm pools work by image.** Your server operator sets up [warm pools](/warm-pools/), one per image. A create for that image gets a waiting sandbox by itself. You do not name the pool.
-- **`env` skips the warm pool,** as it does in agent-sandbox. So do mounts, volumes and a few other settings ([the full list](/warm-pools/#create-from-a-warm-pool)). To keep the fast start, leave `env` out and pass variables to each command instead, as in the next section.
+- **On a Docker server, `env` skips the warm pool,** as it does in agent-sandbox. So do mounts, volumes and a few other settings ([the full list](/warm-pools/#create-from-a-warm-pool)). To keep the fast start there, leave `env` out and pass variables to each command instead, as in the next section. On a containerd server, a create with `env` can still take a waiting sandbox.
 - **Times are in nanoseconds** in TypeScript, Python, Rust and Java. Go takes a `time.Duration`. [Lifecycle](/lifecycle/) has other timers too, such as delete after an idle hour.
 - **Pick the isolation per sandbox** with `runtime`: `"gvisor"` for a [gVisor sandbox](/gvisor-sandbox/), or `"firecracker"` for a [microVM](/firecracker-sandbox/). Leave it out for a [container](/container-sandbox/).
 

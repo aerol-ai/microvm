@@ -34,10 +34,12 @@ import (
 var userCommandPID atomic.Int64
 
 // sandboxEnv is the sandbox env a Firecracker host pushes over vsock
-// (set_env). Empty on a container runtime, whose sandbox env is already in
-// os.Environ(). Every child toolboxd starts for the user takes its
-// environment from childEnviron, so the pushed env reaches exec, sessions,
-// terminals, SSH, envd and Daytona processes alike.
+// (set_env), or a containerd host sends in a warm-pool adopt frame
+// (applyAdoptFrame). Empty on a container created cold, whose sandbox env is
+// already in os.Environ(). Every child toolboxd starts for the user takes
+// its environment from childEnviron, so the pushed env reaches the held-back
+// image command, exec, sessions, terminals, SSH, envd and Daytona processes
+// alike.
 var sandboxEnv = &sandboxenv.Store{}
 
 // childEnviron is the environment a user-facing child starts from: toolboxd's
@@ -356,10 +358,25 @@ func (a *sessionFlusherAdapter) FlushRecording(id string) error {
 }
 
 func startUserCommand(logger *slog.Logger, args []string) {
+	env := childEnviron()
 	cmd := exec.Command(args[0], args[1:]...)
+	if sandboxEnv.Len() > 0 && !strings.Contains(args[0], "/") {
+		// exec.Command looked a bare name up on toolboxd's own PATH. On a
+		// container created cold that is the sandbox env's PATH, which is
+		// where the engine resolves an entrypoint too. A warm-pool
+		// container got its env in the adopt frame, after toolboxd
+		// started, so look the name up on the PATH the child gets, or a
+		// create that sets PATH could run another binary (or none) warm
+		// than it runs cold.
+		if path, code, _ := resolveArgvProgram(args[0], argvSearchPath(env, nil), ""); code == 0 {
+			cmd.Path, cmd.Err = path, nil
+		} else {
+			cmd.Err = &exec.Error{Name: args[0], Err: exec.ErrNotFound}
+		}
+	}
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	cmd.Env = childEnviron()
+	cmd.Env = env
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	// Held from fork until the pid is recorded: the reaper waits on it, so a
 	// command that exits at once is still known as the main program.

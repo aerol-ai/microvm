@@ -73,16 +73,15 @@ func parkedReadyOnConn(logger *slog.Logger, srv *server, conn net.Conn, bootstra
 		return fmt.Errorf("adopt read: %w", err)
 	}
 
-	srv.adoptIdentity(frame.SandboxID, frame.Token)
+	// Env, then identity, then ack, then command (applyAdoptFrame). A frame
+	// whose env can't be applied returns here: no ack and no command.
+	ack, err := srv.applyAdoptFrame(frame)
+	if err != nil {
+		return err
+	}
 
 	_ = conn.SetWriteDeadline(time.Now().Add(parkWriteTimeout))
-	if err := readyproto.Encode(conn, readyproto.ReadySignal{
-		Event:        readyproto.EventReady,
-		SandboxID:    frame.SandboxID,
-		Token:        frame.Token,
-		Nonce:        frame.Nonce,
-		AgentVersion: version.Version,
-	}); err != nil {
+	if err := readyproto.Encode(conn, ack); err != nil {
 		return fmt.Errorf("ready ack: %w", err)
 	}
 

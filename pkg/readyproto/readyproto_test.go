@@ -2,6 +2,7 @@ package readyproto
 
 import (
 	"bytes"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -212,7 +213,7 @@ func TestParkedAdoptRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("decode adopt: %v", err)
 	}
-	if gotAdopt != adopt {
+	if !reflect.DeepEqual(gotAdopt, adopt) {
 		t.Fatalf("adopt round-trip = %+v, want %+v", gotAdopt, adopt)
 	}
 }

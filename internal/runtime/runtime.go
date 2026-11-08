@@ -302,3 +302,29 @@ func AsIdentityStarter(rt Runtime) (IdentityStarter, bool) {
 	s, ok := rt.(IdentityStarter)
 	return s, ok
 }
+
+// AdoptEnvLoader returns the env a start must hand a warm-pool container
+// again, exactly as the create handed it: the sandbox's env from its sealed
+// row, with the withheld-key placeholders in place of the values the egress
+// gateway injects. It holds plaintext secrets, so it is called only when
+// the start really re-adopts a container that was adopted with env, and
+// what it returns is never logged.
+type AdoptEnvLoader func(ctx context.Context) (map[string]string, error)
+
+// EnvIdentityStarter is an IdentityStarter whose re-adopt also carries the
+// sandbox's env. A containerd warm-pool create hands the env to the toolbox
+// in the adopt frame instead of the container spec (plans/cluster-phase-2.md
+// §2), so the spec a start re-creates the task from has none: each start
+// must send it again, as a cold container's start re-reads it from its
+// spec. loadEnv is lazy so a start that needs no env (a cold container, a
+// pool container adopted without env) reads and decrypts nothing more.
+type EnvIdentityStarter interface {
+	StartWithIdentityEnv(ctx context.Context, containerRef, sandboxID, toolboxToken string, loadEnv AdoptEnvLoader) (*models.SandboxRuntimeState, error)
+}
+
+// AsEnvIdentityStarter returns the env-carrying start when rt implements it.
+// Callers fall back to AsIdentityStarter when this returns false.
+func AsEnvIdentityStarter(rt Runtime) (EnvIdentityStarter, bool) {
+	s, ok := rt.(EnvIdentityStarter)
+	return s, ok
+}
