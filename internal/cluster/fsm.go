@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/cloudidentity"
@@ -620,6 +621,14 @@ type placementFSM struct {
 	// then takes subMu to fan out.
 	subMu       sync.Mutex
 	subscribers []chan<- struct{}
+
+	// unreported receives load an apply stops counting as pending before
+	// the owner's capacity heartbeat can show it (capacity_unreported.go).
+	// It is this server's, written by apply and never read by it, and not
+	// in snapshots, so replicated state stays a function of the log alone.
+	// Atomic so a test can install one beside a running raft; nil records
+	// nothing.
+	unreported atomic.Pointer[unreportedLoad]
 }
 
 type placementRecovery struct {
@@ -1140,6 +1149,11 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 		f.claimShardLocked(cmd.SandboxID)
 		f.claimOwnerRefLocked(cmd.SandboxID, ownerRef)
 		f.claimOwnerLocked(cmd.SandboxID, p)
+		if exists && existing.IsReserved() {
+			// The reservation's pending load was released above, and the
+			// owner's next heartbeat has not been taken yet.
+			f.recordUnreportedLocked(cmd.OwnerNodeID, spec)
+		}
 		return nil
 	case opReserve:
 		// Reservations are the first-half of the two-step create: the router
@@ -1358,6 +1372,18 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 			f.claimOwnerLocked(cmd.SandboxID, existing)
 		}
 		if cmd.ReassignCause == reassignCauseFailover {
+			// A reserved row keeps its load pending under the new owner
+			// (claimed just above). A placed one was never pending, so
+			// without this the new owner looked as empty as its last
+			// heartbeat to every reassign after this one in the same
+			// eviction. It counts until the new owner's next heartbeat; one
+			// taken before the owner watcher there recreates the sandbox
+			// still misses it, and then the worker's admitter refuses the
+			// overflow, as before. Only failover moves count: a WASM
+			// migrate reassigns to the node that already holds the sandbox.
+			if !wasReserved && ownerChanged {
+				f.recordUnreportedLocked(cmd.OwnerNodeID, existing.Spec)
+			}
 			return reassignApplyResult{Changed: ownerChanged}
 		}
 		return nil
@@ -2635,6 +2661,18 @@ func (f *placementFSM) validateHostPortAvailableLocked(sandboxID string, port in
 		return fmt.Errorf("%w: %d reserved by %s:%d", ErrHostPortReserved, route.HostPort, claim.SandboxID, claim.Port)
 	}
 	return nil
+}
+
+// recordUnreportedLocked hands owner's new load to this server's unreported
+// ledger. It runs on every server and on log replay; a replayed entry is
+// counted until the owner's next heartbeat, which is over-counting, the safe
+// direction.
+func (f *placementFSM) recordUnreportedLocked(owner string, spec *models.CreateSandboxRequest) {
+	u := f.unreported.Load()
+	if u == nil || owner == "" {
+		return
+	}
+	u.record(owner, capacityRequestFromSpec(spec))
 }
 
 func (f *placementFSM) claimPendingReservationLocked(sandboxID string, p Placement) {

@@ -306,7 +306,7 @@ func (c *Cluster) selectRecreationTargetFor(p Placement, exclude ...string) (Pla
 	// owner plus two backups, so the recipient lookup remains O(recipients)
 	// rather than scanning a 2,000-node fleet for every failed sandbox.
 	all := c.withCatalogueTemplateHolders(c.recreationCandidates(p), req.TemplateID)
-	pending, pendingRuntimes := c.fsm.pendingReservationLoadByNode(time.Now().Unix())
+	pending := c.pendingLoadByNode(time.Now().Unix())
 	var best Member
 	bestScore := -1.0
 	found := false
@@ -339,14 +339,15 @@ func (c *Cluster) selectRecreationTargetFor(p Placement, exclude ...string) (Pla
 		if m.APIURL == "" && m.NodeID != c.nodeID {
 			continue
 		}
-		if !nodeFits(m, req, pending[m.NodeID]) {
+		extra, extraByRuntime := pending.of(m.NodeID)
+		if !nodeFits(m, req, extra) {
 			continue
 		}
 		// A recreate needs a network slot as much as a first create did.
-		if !slotsFit(m, req, pendingRuntimes[m.NodeID]) {
+		if !slotsFit(m, req, extraByRuntime) {
 			continue
 		}
-		s := placementScore(m, req, pending[m.NodeID], pendingRuntimes[m.NodeID])
+		s := placementScore(m, req, extra, extraByRuntime)
 		if !found || s > bestScore {
 			best = m
 			bestScore = s
