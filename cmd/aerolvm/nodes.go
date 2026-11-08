@@ -114,8 +114,12 @@ type nodeRaw struct {
 // clusterCall is one /v1/cluster call with the verb's connection. A GET is
 // retried on a dropped connection or a 502/503/504: reads are safe to repeat
 // (the CLI contract), and a drain or describe from a laptop otherwise fails
-// on one reset from a load balancer (live UC-612, 2026-11-07). Writes are
-// never retried here; their own idempotency is the server's job.
+// on one reset from a load balancer (live UC-612, 2026-11-07). DELETEs are
+// retried the same way: every delete here is idempotent (a node, join token,
+// snapshot, token or sandbox that is already gone counts as deleted), and a
+// Caddy reload on the ingress node can drop a delete in flight (live UC-614,
+// 2026-11-08). Other writes are never retried here; their own idempotency
+// is the server's job.
 func (a *app) clusterCall(ctx context.Context, c *commonFlags, method, path string, in, out any) error {
 	conn, err := a.resolve(ctx, c)
 	if err != nil {
@@ -123,11 +127,12 @@ func (a *app) clusterCall(ctx context.Context, c *commonFlags, method, path stri
 	}
 	for attempt := 0; ; attempt++ {
 		err = a.callAPI(ctx, c, conn, method, path, in, out)
-		if err == nil || method != http.MethodGet || attempt >= len(clusterReadRetryDelays) || !retryableRead(err) {
+		retryable := method == http.MethodGet || method == http.MethodDelete
+		if err == nil || !retryable || attempt >= len(clusterReadRetryDelays) || !retryableRead(err) {
 			return err
 		}
 		if c != nil && c.debug {
-			a.note("aerolvm debug: GET %s failed (%v), retrying", path, err)
+			a.note("aerolvm debug: %s %s failed (%v), retrying", method, path, err)
 		}
 		select {
 		case <-ctx.Done():

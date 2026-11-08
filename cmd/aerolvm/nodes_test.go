@@ -753,6 +753,12 @@ func TestClusterReadsRetryTransientFailures(t *testing.T) {
 	if code := h.run("get", "nodes"); code == exitOK || f.calls["GET /v1/cluster/members"] != before+1 {
 		t.Fatalf("a 500 was retried: code %d, calls %d -> %d", code, before, f.calls["GET /v1/cluster/members"])
 	}
+	// A delete is idempotent, so a dropped connection is retried (live
+	// UC-614: a Caddy reload dropped one in flight).
+	f.dropOnCall["DELETE /v1/cluster/nodes/wkr-2"] = 1
+	if code := h.run("delete", "node", "wkr-2"); code != exitOK || f.calls["DELETE /v1/cluster/nodes/wkr-2"] != 2 {
+		t.Fatalf("delete after one reset = %d (calls %d): %s", code, f.calls["DELETE /v1/cluster/nodes/wkr-2"], h.stderr.String())
+	}
 	f.status503["POST /v1/cluster/nodes/wkr-1/cordon"] = 1
 	before = f.calls["POST /v1/cluster/nodes/wkr-1/cordon"]
 	if code := h.run("cordon", "wkr-1"); code == exitOK || f.calls["POST /v1/cluster/nodes/wkr-1/cordon"] != before+1 {
