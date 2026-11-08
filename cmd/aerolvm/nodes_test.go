@@ -105,8 +105,10 @@ func (f *fakeCluster) serve(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if f.slowNodeGet > 0 && r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/v1/cluster/nodes/") && f.calls[key] > 1 {
+		// Read it before unlocking: the test turns it off while this sleeps.
+		d := f.slowNodeGet
 		f.mu.Unlock()
-		time.Sleep(f.slowNodeGet)
+		time.Sleep(d)
 		f.mu.Lock()
 	}
 	if f.fail[key] > 0 {
