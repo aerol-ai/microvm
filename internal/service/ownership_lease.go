@@ -10,6 +10,7 @@ import (
 
 	"github.com/aerol-ai/microvm/internal/cluster"
 	"github.com/aerol-ai/microvm/internal/runtime"
+	"github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
 
@@ -28,7 +29,10 @@ import (
 // sees as dead). It runs out after cluster.OwnershipLease, half the grace,
 // without one. Then the worker fences every local recreate-policy sandbox: it
 // freezes the running ones in place (runtime.Freezer), refuses to start them,
-// skips their lifecycle timers, and clusterroute.Wrap answers 503 for them.
+// skips their lifecycle timers, clusterroute.Wrap answers 503 for them, and
+// their public HTTP port routes answer 503 + Retry-After instead of proxying
+// (a frozen process keeps its listening socket, so the proxy would take each
+// connection and never answer it).
 // When a read succeeds again, a sandbox whose placement still names this node
 // and the same lifetime is thawed; one that moved stays frozen until
 // reconcileStaleOwnership removes it, as it always has.
@@ -74,6 +78,10 @@ type ownershipLease struct {
 	// started guards StartOwnershipLease against a second set of loops.
 	started bool
 	fenced  map[string]*fencedSandbox
+	// routeRestore holds sandboxes whose fence has been lifted but whose
+	// public HTTP routes still answer 503: the swap back failed, and every
+	// check retries it until it lands.
+	routeRestore map[string]struct{}
 
 	// actionMu serializes the expiry check and the confirm, which both
 	// freeze or thaw runtime instances.
@@ -86,6 +94,9 @@ type fencedSandbox struct {
 	frozen bool
 	// cannotFreeze: its runtime has no Freezer; logged once.
 	cannotFreeze bool
+	// routesFenced: every public HTTP port answers 503. Until it is set,
+	// every check retries the swap.
+	routesFenced bool
 }
 
 // ownershipLeaseApplies reports whether this node runs a lease at all: only
@@ -172,6 +183,14 @@ func (s *Service) fenceLocked(id string) *fencedSandbox {
 }
 
 func (s *Service) unfenceLocked(id string) {
+	if _, ok := s.ownership.fenced[id]; ok {
+		// Its routes may answer 503 (all of them, or the ones a partly
+		// failed swap reached) until restoreFencedRoutes swaps them back.
+		if s.ownership.routeRestore == nil {
+			s.ownership.routeRestore = make(map[string]struct{})
+		}
+		s.ownership.routeRestore[id] = struct{}{}
+	}
 	delete(s.ownership.fenced, id)
 	ownershipFencedSandboxes.Set(int64(len(s.ownership.fenced)))
 }
@@ -259,6 +278,7 @@ func (s *Service) confirmOwnership(ctx context.Context, sent time.Time) error {
 			}
 		}
 	}
+	s.restoreFencedRoutes(ctx)
 	return nil
 }
 
@@ -285,6 +305,7 @@ func (s *Service) enforceOwnershipLease(ctx context.Context, now time.Time) {
 	}
 	s.ownership.actionMu.Lock()
 	defer s.ownership.actionMu.Unlock()
+	s.restoreFencedRoutes(ctx)
 	lease := cluster.OwnershipLease(s.cfg)
 	s.ownership.mu.Lock()
 	confirmed := s.ownership.confirmed
@@ -319,7 +340,7 @@ func (s *Service) fenceSettled(sb *models.Sandbox) bool {
 	s.ownership.mu.Lock()
 	defer s.ownership.mu.Unlock()
 	f, ok := s.ownership.fenced[sb.ID]
-	return ok && (f.frozen || f.cannotFreeze || sb.Status != models.SandboxStatusStarted)
+	return ok && f.routesFenced && (f.frozen || f.cannotFreeze || sb.Status != models.SandboxStatusStarted)
 }
 
 // fenceSandbox fences id and freezes its instance if it is running. It holds
@@ -337,10 +358,15 @@ func (s *Service) fenceSandbox(ctx context.Context, id string) {
 	}
 	s.ownership.mu.Lock()
 	f := s.fenceLocked(id)
-	frozen, cannot := f.frozen, f.cannotFreeze
+	frozen, cannot, routed := f.frozen, f.cannotFreeze, f.routesFenced
 	s.ownership.mu.Unlock()
 	// The ingress proxy's warm fast path must not reach it either.
 	s.invalidateWarm(id)
+	// Its public ports answer 503 before it freezes, so no request is
+	// proxied to a process that will never answer.
+	if !routed {
+		s.fenceSandboxRoutes(ctx, sb)
+	}
 	if frozen || cannot || sb.Status != models.SandboxStatusStarted {
 		return
 	}
@@ -368,6 +394,89 @@ func (s *Service) fenceSandbox(ctx context.Context, id string) {
 	s.ownership.mu.Lock()
 	f.frozen = true
 	s.ownership.mu.Unlock()
+}
+
+// fenceSandboxRoutes swaps every public HTTP port route of a fenced sandbox
+// for the 503 (applyHTTPPortRoute reads the fence). A failure leaves
+// routesFenced unset, so the next check retries; ports already swapped are
+// rewritten in place, which is idempotent.
+func (s *Service) fenceSandboxRoutes(ctx context.Context, sb *models.Sandbox) {
+	err := s.syncHTTPPortRoutes(ctx, sb)
+	s.ownership.mu.Lock()
+	if f, ok := s.ownership.fenced[sb.ID]; ok {
+		f.routesFenced = err == nil
+	}
+	// A fence that comes back before the last swap back landed owns the
+	// routes again.
+	delete(s.ownership.routeRestore, sb.ID)
+	s.ownership.mu.Unlock()
+	if err != nil && s.logger != nil {
+		s.logger.Warn("cluster: could not point a fenced sandbox's public ports at 503; will retry", "sandbox_id", sb.ID, "error", err)
+	}
+}
+
+// restoreFencedRoutes swaps the public HTTP routes of every sandbox whose
+// fence has been lifted back to their normal shape. Rollback rule: until a
+// sandbox's swap back has fully landed it stays in routeRestore, its routes
+// keep answering 503 (a quick, retryable answer, never a hang), and every
+// check tries again. A sandbox fenced again is left to the fence; one whose
+// row is gone was destroyed, and the destroy removed its routes. The caller
+// holds actionMu, so no fence runs meanwhile.
+func (s *Service) restoreFencedRoutes(ctx context.Context) {
+	s.ownership.mu.Lock()
+	ids := make([]string, 0, len(s.ownership.routeRestore))
+	for id := range s.ownership.routeRestore {
+		ids = append(ids, id)
+	}
+	s.ownership.mu.Unlock()
+	for _, id := range ids {
+		if s.OwnershipFenced(id) {
+			continue
+		}
+		sb, err := s.store.Get(ctx, id)
+		if err != nil && !errors.Is(err, store.ErrNotFound) {
+			continue
+		}
+		if err == nil {
+			if err := s.syncHTTPPortRoutes(ctx, sb); err != nil {
+				if s.logger != nil {
+					s.logger.Warn("cluster: could not restore a resumed sandbox's public ports; they answer 503 until a retry lands", "sandbox_id", id, "error", err)
+				}
+				continue
+			}
+		}
+		s.ownership.mu.Lock()
+		delete(s.ownership.routeRestore, id)
+		s.ownership.mu.Unlock()
+	}
+}
+
+// syncHTTPPortRoutes rewrites the route of every HTTP exposure of sb, in the
+// shape its state asks for (syncExposedPortRoute: public or not, then
+// applyHTTPPortRoute: fenced or not, serverless or not).
+func (s *Service) syncHTTPPortRoutes(ctx context.Context, sb *models.Sandbox) error {
+	var firstErr error
+	for _, port := range sb.ExposedPorts {
+		if port.Protocol != "" && port.Protocol != models.ExposedPortProtocolHTTP {
+			continue
+		}
+		if err := s.syncExposedPortRoute(ctx, sb, port); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
+}
+
+// applyFencedHTTPPortRoute is applyHTTPPortRoute for a fenced sandbox: the
+// port answers 503 + Retry-After under the port route's own id, and a wake
+// route (serverless, token-gated) goes the way the direct shape removes it.
+// The caller holds the port's httpRouteLocks.
+func (s *Service) applyFencedHTTPPortRoute(ctx context.Context, id string, port int) error {
+	if err := s.publicRoutes().UpsertFencedPortRoute(ctx, id, port); err != nil {
+		return err
+	}
+	_ = s.publicRoutes().DeleteWakeHTTPPortRoute(ctx, id, port)
+	return nil
 }
 
 // thawSandbox thaws sb's instance under its lifecycle boundary. A runtime

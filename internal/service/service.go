@@ -5768,17 +5768,23 @@ func (s *Service) installHTTPPortRoute(ctx context.Context, sandbox *models.Sand
 // intent from a new one, so only the lock plus a fresh read keep an old
 // public intent from replacing a newer gated route.
 func (s *Service) applyHTTPPortRoute(ctx context.Context, sandbox *models.Sandbox, port int) error {
+	// Every shape takes the lock, not just the direct one: a writer that
+	// read the gate before an expose stored "token" must finish before
+	// that expose's wake write starts, or its direct write lands last. The
+	// ownership fence is read under it for the same reason: the fence and
+	// the confirm that lifts it each rewrite the route after changing the
+	// fence, so the last write for a port always matches the fence.
+	unlock := s.httpRouteLocks.lock(portLockKey{id: sandbox.ID, port: port})
+	defer unlock()
+	if s.OwnershipFenced(sandbox.ID) {
+		return s.applyFencedHTTPPortRoute(ctx, sandbox.ID, port)
+	}
 	if s.isWasmSandbox(sandbox) {
 		return s.installWasmHTTPPortRoute(ctx, sandbox, port)
 	}
 	if s.isIsolateSandbox(sandbox) {
 		return s.installIsolateHTTPPortRoute(ctx, sandbox, port)
 	}
-	// Every shape takes the lock, not just the direct one: a writer that
-	// read the gate before an expose stored "token" must finish before
-	// that expose's wake write starts, or its direct write lands last.
-	unlock := s.httpRouteLocks.lock(portLockKey{id: sandbox.ID, port: port})
-	defer unlock()
 	// The direct route is where DIRECT-path Host masking is enforced; the
 	// serverless wake route can't carry it (the loopback ingress proxy
 	// overwrites Host on re-dial), so that path masks in the proxy instead.

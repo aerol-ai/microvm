@@ -34,6 +34,7 @@ type publicRouteWriter interface {
 	UpsertPortRouteWithDial(ctx context.Context, id string, guestPort int, dial string, opts ...caddy.HTTPRouteOptions) error
 	UpsertPortRouteWithRetry(ctx context.Context, id, containerIP string, port int, tryDuration time.Duration, opts ...caddy.HTTPRouteOptions) error
 	UpsertPortRouteToPeer(ctx context.Context, id string, port int, peerHost string) error
+	UpsertFencedPortRoute(ctx context.Context, id string, port int) error
 	DeletePortRoute(ctx context.Context, id string, port int) error
 	UpsertWakeHTTPPortRoute(ctx context.Context, id, ingressAddr string, port int) error
 	DeleteWakeHTTPPortRoute(ctx context.Context, id string, port int) error
@@ -113,6 +114,7 @@ func (noopRouteWriter) UpsertPortRouteWithRetry(context.Context, string, string,
 	return nil
 }
 func (noopRouteWriter) UpsertPortRouteToPeer(context.Context, string, int, string) error { return nil }
+func (noopRouteWriter) UpsertFencedPortRoute(context.Context, string, int) error         { return nil }
 func (noopRouteWriter) DeletePortRoute(context.Context, string, int) error               { return nil }
 func (noopRouteWriter) UpsertWakeHTTPPortRoute(context.Context, string, string, int) error {
 	return nil

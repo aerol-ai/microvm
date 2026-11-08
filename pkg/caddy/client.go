@@ -455,6 +455,24 @@ func (c *Client) UpsertPortRouteWithRetry(ctx context.Context, id, containerIP s
 	return c.upsertRoute(ctx, routeID, route)
 }
 
+// UpsertFencedPortRoute turns a local sandbox's per-port HTTP route into a
+// 503 + Retry-After answer while the worker's ownership lease holds the
+// sandbox paused (internal/service/ownership_lease.go). A paused process
+// keeps its listening socket, so the proxy route would take each connection
+// and never answer it. The 503 is written under the port route's own @id and
+// matcher, so each swap is one PATCH in place: there is never a moment with
+// no route, and never a second route that could end up behind the proxy one.
+// The proxy route comes back through UpsertPortRoute*. Domain mode only, like
+// UpsertPortRoute.
+func (c *Client) UpsertFencedPortRoute(ctx context.Context, id string, port int) error {
+	if !c.enabled || c.domain == "" {
+		return nil
+	}
+	routeID := portRouteID(id, port)
+	match := []map[string]any{{"host": []string{fmt.Sprintf("%s-%d.%s", id, port, c.domain)}}}
+	return c.upsertRoute(ctx, routeID, inFluxRoute(routeID, match))
+}
+
 // UpsertPortRouteToPeer installs the IP/path-mode per-port route for a
 // sandbox owned by another node. In domain mode this is handled by SNI
 // pass-through routes in the layer4 mux.
