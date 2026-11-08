@@ -231,6 +231,19 @@ func TestUpgradePlanCountsRestartLosers(t *testing.T) {
 	if len(p.Warnings) != 1 || !strings.HasPrefix(p.Warnings[0], "at least 3 WASM and 1 V8-isolate") {
 		t.Fatalf("capped: %v", p.Warnings)
 	}
+	// They now keep running; only the first hand-over restarts them, and
+	// nothing says a restart stops or deletes them.
+	if w := p.Warnings[0]; !strings.Contains(w, "keep running") || !strings.Contains(w, "restarts once") ||
+		strings.Contains(w, "deletes") || strings.Contains(w, "stops its") {
+		t.Fatalf("warning = %q", w)
+	}
+	for _, r := range planRuntimes {
+		if strings.Contains(r[0], "WASM") || strings.Contains(r[0], "isolate") {
+			if !strings.HasPrefix(r[1], "keep running") {
+				t.Fatalf("plan row %q = %q", r[0], r[1])
+			}
+		}
+	}
 
 	// Against the fake: the cap stops a list that never ends.
 	h, f, _ := planHarness(t, true, "v0.6.12")

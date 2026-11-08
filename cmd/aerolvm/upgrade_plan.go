@@ -31,9 +31,10 @@ var planRuntimes = [][2]string{
 	{"containerd, docker, gVisor sandboxes", "keep running; sandboxd adopts them again"},
 	{"Firecracker VMs", "keep running (moved out of sandboxd's cgroup first)"},
 	{"external-storage mounts", "keep serving (their helpers run in their own cgroup)"},
-	// Measured live (T14, single-node-wasm-isolate): neither survives.
-	{"WASM sandboxes", "STOP: marked stopped; `aerolvm start` keeps their files but may not run them again; passivatable ones fail their checkpoint"},
-	{"V8-isolate sandboxes", "are LOST: sandboxd deletes them when it starts again"},
+	// Measured live on single-node-wasm-isolate (T14 found neither survived;
+	// they now leave sandboxd's cgroup and are taken over at boot).
+	{"WASM sandboxes", "keep running with their /work files (their workers run outside sandboxd's cgroup; sandboxd takes them over again)"},
+	{"V8-isolate sandboxes", "keep running with their in-memory state (workerd runs outside sandboxd's cgroup; sandboxd takes it over again)"},
 	{"toolboxd in running sandboxes", "the old one keeps running; new sandboxes get the new one"},
 	{"the node's sandboxd API", "down for a few seconds while sandboxd restarts"},
 	{"Caddy", "restarts only when its file changes"},
@@ -60,8 +61,11 @@ type upgradePlan struct {
 	RestartLosers         planLosers        `json:"restart_losers"`
 }
 
-// planLosers counts the sandboxes a node restart stops or loses (WASM and
-// V8 isolate, planRuntimes), so plan can say how many before anything runs.
+// planLosers counts the WASM and V8-isolate sandboxes that run now. They
+// keep running through a node restart (planRuntimes), except once on a node
+// whose sandboxd started them before it could hand them over, so plan says
+// how many before anything runs. The JSON name is from when every one of
+// them was lost.
 type planLosers struct {
 	WASM    int  `json:"wasm"`
 	Isolate int  `json:"isolate"`
@@ -604,11 +608,17 @@ var countRestartLosers = func(ctx context.Context, a *app, c *commonFlags) (plan
 	return out, nil
 }
 
-// countLosers records the count and warns when a restart would stop or lose
-// any sandbox. A failed count is a warning too: plan never hides it.
+// firstHandoverNote is what a restart does to WASM and isolate sandboxes a
+// sandboxd started before it could hand them over to the next one: their
+// workers sat in its cgroup and stop with it, so the new sandboxd restores
+// them instead of taking them over.
+const firstHandoverNote = "on a node whose running sandboxd predates the hand-over, each restarts once: a WASM sandbox keeps its /work files, an isolate starts fresh on its next request"
+
+// countLosers records the count and says what a restart does to those
+// sandboxes. A failed count is a warning too: plan never hides it.
 func (p *upgradePlan) countLosers(l planLosers, err error) {
 	if err != nil {
-		p.Warnings = append(p.Warnings, "could not count WASM and V8-isolate sandboxes ("+err.Error()+"); a node restart stops or loses them")
+		p.Warnings = append(p.Warnings, "could not count WASM and V8-isolate sandboxes ("+err.Error()+"); they keep running through a node restart, but "+firstHandoverNote)
 		return
 	}
 	p.RestartLosers = l
@@ -619,5 +629,5 @@ func (p *upgradePlan) countLosers(l planLosers, err error) {
 	if l.Capped {
 		atLeast = "at least "
 	}
-	p.Warnings = append(p.Warnings, fmt.Sprintf("%s%d WASM and %d V8-isolate sandbox(es) run now: each node's restart stops its WASM sandboxes and deletes its isolate sandboxes", atLeast, l.WASM, l.Isolate))
+	p.Warnings = append(p.Warnings, fmt.Sprintf("%s%d WASM and %d V8-isolate sandbox(es) run now: they keep running through each node's restart, but %s", atLeast, l.WASM, l.Isolate, firstHandoverNote))
 }

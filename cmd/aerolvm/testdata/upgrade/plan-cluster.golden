@@ -29,8 +29,8 @@ What a running sandbox sees while sandboxd restarts, on every node:
   containerd, docker, gVisor sandboxes   keep running; sandboxd adopts them again
   Firecracker VMs                        keep running (moved out of sandboxd's cgroup first)
   external-storage mounts                keep serving (their helpers run in their own cgroup)
-  WASM sandboxes                         STOP: marked stopped; `aerolvm start` keeps their files but may not run them again; passivatable ones fail their checkpoint
-  V8-isolate sandboxes                   are LOST: sandboxd deletes them when it starts again
+  WASM sandboxes                         keep running with their /work files (their workers run outside sandboxd's cgroup; sandboxd takes them over again)
+  V8-isolate sandboxes                   keep running with their in-memory state (workerd runs outside sandboxd's cgroup; sandboxd takes it over again)
   toolboxd in running sandboxes          the old one keeps running; new sandboxes get the new one
   the node's sandboxd API                down for a few seconds while sandboxd restarts
   Caddy                                  restarts only when its file changes
@@ -38,7 +38,7 @@ What a running sandbox sees while sandboxd restarts, on every node:
 Warnings:
   - the rollout pauses after the first 1 worker(s); go on with: aerolvm upgrade resume
   - down nodes are skipped and upgraded when they come back; finalize waits for them: wkr-2
-  - 2 WASM and 1 V8-isolate sandbox(es) run now: each node's restart stops its WASM sandboxes and deletes its isolate sandboxes
+  - 2 WASM and 1 V8-isolate sandbox(es) run now: they keep running through each node's restart, but on a node whose running sandboxd predates the hand-over, each restarts once: a WASM sandbox keeps its /work files, an isolate starts fresh on its next request
 
 To go ahead: aerolvm upgrade apply v0.6.13
 --- stderr

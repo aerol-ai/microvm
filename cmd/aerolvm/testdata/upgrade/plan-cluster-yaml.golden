@@ -117,5 +117,5 @@ tiers:
       steps: 3
 warnings:
     - 'down nodes are skipped and upgraded when they come back; finalize waits for them: wkr-2'
-    - '2 WASM and 1 V8-isolate sandbox(es) run now: each node''s restart stops its WASM sandboxes and deletes its isolate sandboxes'
+    - '2 WASM and 1 V8-isolate sandbox(es) run now: they keep running through each node''s restart, but on a node whose running sandboxd predates the hand-over, each restarts once: a WASM sandbox keeps its /work files, an isolate starts fresh on its next request'
 --- stderr

@@ -532,10 +532,10 @@ The AerolVM server on each node stops for a few seconds while it swaps its files
 | Containers: Docker, containerd and gVisor | Keep running. The new server picks them up again. |
 | Firecracker | Keep running. Their VMs run outside the server's own service. |
 | Attached cloud storage | Keeps working. Its helpers run outside the server's own service. |
-| WebAssembly (WASM) | **Do not survive.** They stop when the server restarts and lose what they held in memory. Start or recreate them after. |
-| V8 isolate | **Do not survive.** They are gone after the server restarts. Create them again after. |
+| WebAssembly (WASM) | Keep running, with their `/work` files. Their workers run outside the server's own service, and the new server picks them up again. |
+| V8 isolate | Keep running, with what they hold in memory. Their `workerd` runs outside the server's own service, and the new server picks it up again. |
 
-A node with WASM or V8 isolate sandboxes that must not stop: drain it first with `aerolvm drain`, or plan for those sandboxes to be recreated.
+The first upgrade from a release that could not hand them over restarts WASM and V8 isolate sandboxes once: a WASM sandbox keeps its `/work` files, and an isolate starts fresh on its next request. If that matters, drain the node first with `aerolvm drain`.
 
 The toolbox inside a running sandbox stays the old one. New sandboxes get the new one.
 

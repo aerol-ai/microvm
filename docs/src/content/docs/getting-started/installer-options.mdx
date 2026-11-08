@@ -66,7 +66,7 @@ curl -fsSL https://aerolvm.aerol.ai | sudo bash
 - **Older servers work too.** On a server set up before `node.json` existed, the first new run reads the settings back from those files once, then writes `node.json`.
 - **It starts the new version.** If the run installed a new release, or changed a setting, and the server is running, the installer restarts the server. It waits until the server answers, and only then starts Caddy.
 - **It swaps the programs safely.** When the installed server has `sandboxd upgrade node`, the installer hands the swap to it, the same way `aerolvm upgrade` does: a database backup, the old files kept, and the old files back if the new server does not start.
-- **Most sandboxes keep running.** Containers and Firecracker VMs keep running while the server restarts. WebAssembly and V8 isolate sandboxes do not survive a restart today: create them again after.
+- **Sandboxes keep running.** Containers, Firecracker VMs, WebAssembly and V8 isolate sandboxes keep running while the server restarts. The new server picks them up again.
 - **Check the version** with `sudo sandboxd version`. It shows the release and never starts a second server.
 
 ## Change an install

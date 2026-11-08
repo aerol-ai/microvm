@@ -5,7 +5,7 @@ description: Keep a sandbox's data safe through restarts and failures, and choos
 
 import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
 
-Files a sandbox writes to its own disk last only as long as the sandbox. That covers `/tmp`, the working folder, and anywhere else that is not attached storage. If you delete the sandbox, or the cluster node running it dies, those files are gone. A server restart keeps them for container and Firecracker sandboxes, but not for WebAssembly and V8 isolate sandboxes by default.
+Files a sandbox writes to its own disk last only as long as the sandbox. That covers `/tmp`, the working folder, and anywhere else that is not attached storage. If you delete the sandbox, or the cluster node running it dies, those files are gone. A server restart keeps them, and keeps every sandbox running. A machine reboot keeps them for container and Firecracker sandboxes, but not for WebAssembly sandboxes, whose working folder lives in memory.
 
 To keep data, write it to [attached cloud storage](/external-storage/). Treat the sandbox itself as replaceable: if you lose one, create a new one and attach the same storage.
 
@@ -15,7 +15,7 @@ A cluster is a group of AerolVM servers. In a cluster, you can also ask for a sa
 
 | What | You delete the sandbox | The server restarts or crashes (one server) | A cluster node dies |
 |---|---|---|---|
-| Files on the sandbox's own disk | Lost | Kept for container and Firecracker sandboxes. Lost for WebAssembly and V8 isolate sandboxes by default. | Lost |
+| Files on the sandbox's own disk | Lost | Kept. A WebAssembly sandbox loses them only if the machine reboots. | Lost |
 | Files on attached storage (S3, NFS, SSHFS, rclone) | Kept (they live outside the sandbox) | Kept | Kept. A new sandbox can attach them again. |
 | Sandbox ID | Gone. A new sandbox gets a new ID. | Kept if the server saved its record | Lost by default (`410 Gone`). With recreate: kept, if the rebuild works. |
 | Environment variables, image, CPU and memory | Gone | Restored on `start` | Lost by default. With recreate: restored from the cluster's copy. |
@@ -302,11 +302,11 @@ Exposing a port is safe to repeat. If the port is already exposed, `exposePort` 
 
 | Value | What it means |
 |---|---|
-| `ephemeral` | The sandbox is lost when the server restarts. |
-| `passivatable` | The sandbox is kept across a server restart. A WebAssembly sandbox is saved to local disk when the server shuts down and brought back when it starts. |
+| `ephemeral` | The sandbox is lost if it cannot keep running through a server restart, for example after a machine reboot. |
+| `passivatable` | The sandbox is kept across a server restart. A WebAssembly sandbox whose worker cannot keep running is saved to local disk when the server shuts down and brought back when it starts. |
 | `durable` | Planned: also send the saved state to another node for failover. It is not available yet. The server rejects it on every runtime today. |
 
-If you leave it out, you get the default for the runtime. Containers and virtual machines survive a server restart on their own, but WebAssembly and V8 isolate sandboxes do not:
+If you leave it out, you get the default for the runtime. Every runtime keeps running through a plain server restart on its own; the default decides what happens when it cannot:
 
 | Runtime | Default |
 |---|---|
