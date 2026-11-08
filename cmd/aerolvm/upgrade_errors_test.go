@@ -201,3 +201,35 @@ func TestReleasePullIOFailures(t *testing.T) {
 		t.Fatalf("a failed pull left %s: %v", out, err)
 	}
 }
+
+// A --from file over the 256 MiB upload limit is refused before anything
+// is sent, even when checksums.txt vouches for it. The file is sparse, so
+// the test writes almost nothing.
+func TestFromDirRefusesAFileOverTheUploadLimit(t *testing.T) {
+	dir, all := distDir(t, "v0.6.13", true)
+	big := filepath.Join(dir, "sandboxd_linux_amd64")
+	if err := os.Truncate(big, upgradewire.MaxUploadBytes+1); err != nil {
+		t.Fatal(err)
+	}
+	sum, _, err := hashFile(big)
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := sha(all["sandboxd_linux_amd64"])
+	sums, err := os.ReadFile(filepath.Join(dir, checksumsName))
+	if err != nil || !strings.Contains(string(sums), old) {
+		t.Fatalf("checksums.txt lacks sandboxd's hash: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, checksumsName), []byte(strings.Replace(string(sums), old, sum, 1)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loadDirSource(dir, "v0.6.13", []string{"amd64"}); err == nil || !strings.Contains(err.Error(), "larger than the 256 MiB upload limit") {
+		t.Fatalf("loadDirSource = %v", err)
+	}
+}
+
+func TestHumanBytesMiB(t *testing.T) {
+	if got := humanBytes(3 << 20); got != "3.0 MiB" {
+		t.Fatal(got)
+	}
+}
