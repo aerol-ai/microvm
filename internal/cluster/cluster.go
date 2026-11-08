@@ -153,6 +153,12 @@ var ErrInvalidSecretHandle = errors.New("cluster: invalid secret handle")
 // a different lifetime of the same sandbox ID.
 var ErrIncarnationConflict = errors.New("cluster: sandbox incarnation conflict")
 
+// ErrPlacementDeleted refuses an opPlace that would write back the placement
+// of a lifetime (sandbox ID + incarnation) the cluster already deleted. It is
+// what a node that was cut off gets when its ownership replay tries to place
+// a sandbox someone deleted meanwhile; that node must destroy its copy.
+var ErrPlacementDeleted = errors.New("cluster: sandbox lifecycle was deleted")
+
 // ErrNoPlacementTarget is returned when no alive worker-capable node can
 // accept a new sandbox. This is distinct from "self wins": a pure server or
 // ingress node must not silently fall back to local Docker ownership.
@@ -435,6 +441,14 @@ type Placement struct {
 	// field"; placementAllowsPublicTraffic still consults Spec when present,
 	// so a legacy row behaves exactly as before until its next write.
 	PublicTraffic bool `json:"public_traffic,omitempty"`
+	// FailoverRecreate mirrors Spec.Failover.ShouldRecreate() on the HOT row,
+	// for the same reason as PublicTraffic: an ingress reads only redacted
+	// pages and feed rows. When it loses the servers past the ownership
+	// lease it puts only these sandboxes in flux, since only they can be
+	// handed to another worker behind its back (placementMovableOnFailover).
+	// false means "no recreate policy, or recorded by a build that predates
+	// this field"; a row read with its Spec still consults the Spec.
+	FailoverRecreate bool `json:"failover_recreate,omitempty"`
 	// EgressProfiles / EgressInlineHostnames mirror Spec.EgressProfiles and
 	// the hostname count of Spec.NetworkAllowOut on the HOT row, for the
 	// FSM's profile reference index and union-cap check (D21). Empty for a

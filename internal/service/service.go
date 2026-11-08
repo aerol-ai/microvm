@@ -633,6 +633,9 @@ type Service struct {
 	cluster      cluster.Client
 	clusterMu    sync.Mutex
 	clusterReady atomic.Bool
+	// ownership is the worker's ownership lease and fence
+	// (ownership_lease.go). Zero value: not begun, fences nothing.
+	ownership ownershipLease
 
 	// expectedStops tracks sandboxes whose stop was issued by sandboxd
 	// itself (manual API call or lifecycle sweep). The Docker /events
@@ -836,6 +839,10 @@ type Service struct {
 	// reach a waiter's ErrCreateInProgress without waiting out the create
 	// timeout. Zero in production.
 	testCreateLeaseWait time.Duration
+	// testBeforeRollbackSweepDestroy runs in reconcileRollbackPending after
+	// the pending ids were listed and before each one is acted on, so a test
+	// can land a create retry inside that window. Nil in production.
+	testBeforeRollbackSweepDestroy func(id string)
 	// testSecretPeerPusher overrides cluster secret fan-out in tests. Nil in
 	// production (SealAndDistribute type-asserts the live Cluster/Agent).
 	testSecretPeerPusher cluster.SecretPeerPusher
@@ -1231,6 +1238,10 @@ func (s *Service) AttachSnapshotPusher(pusher *SnapshotPusher, reconciler *Snaps
 	}
 	s.snapshotPusher = pusher
 	s.snapshotPushReconciler = reconciler
+	if reconciler != nil {
+		// Before the daemon starts the worker (go r.Run), so no race.
+		reconciler.onPushed = s.forgetSnapshotLocalOnly
+	}
 }
 
 // AttachWasmCheckpointPusher wires AOCR push for durable WASM checkpoints.
@@ -1433,10 +1444,20 @@ func (s *Service) CreateSandboxWithID(ctx context.Context, req models.CreateSand
 		if err := s.checkStoredCreateDigest(ctx, id); err != nil {
 			return nil, err
 		}
-		// Already present locally — recreate is a no-op. The watcher tick that
-		// noticed the FSM-only entry must have raced with a local create.
-		auditlog.NoteSandboxIdentity(ctx, id, existing.AuditIncarnationID, existing.OwnerRef)
-		return &models.CreateSandboxResponse{Sandbox: *existing, Replayed: true}, nil
+		if !existing.RollbackPending {
+			// Already present locally — recreate is a no-op. The watcher tick
+			// that noticed the FSM-only entry must have raced with a local
+			// create.
+			auditlog.NoteSandboxIdentity(ctx, id, existing.AuditIncarnationID, existing.OwnerRef)
+			return &models.CreateSandboxResponse{Sandbox: *existing, Replayed: true}, nil
+		}
+		// A create of this id was reported failed and its rollback has not
+		// finished (rollback_pending.go): not a sandbox to hand back. Finish
+		// the rollback now, once; then this retry creates afresh below, or
+		// answers ErrCreateRollbackPending (503) and reconcile keeps trying.
+		if err := s.FinishRollbackPending(ctx, id); err != nil {
+			return nil, err
+		}
 	}
 	resp, err := s.createSandbox(ctx, req, id)
 	// A failed earlier create of this ID can leave its runtime instance
@@ -1500,7 +1521,9 @@ func (s *Service) reconcileStaleOwnership(ctx context.Context) {
 		placement, ok := placements[sb.ID]
 		// No placement can be a fresh local create awaiting ownership replay;
 		// an orphan has no replacement owner yet. Neither is proof that this
-		// node's runtime is stale.
+		// node's runtime is stale. A row with no placement is the ownership
+		// replay's to settle (settleUnplacedRow): it destroys a deleted or
+		// unproven one after an authoritative read.
 		if !ok || placement.IsOrphaned() || strings.TrimSpace(placement.OwnerNodeID) == self {
 			continue
 		}
@@ -1703,6 +1726,28 @@ func (s *Service) RecreateSandboxReport(ctx context.Context, id string, spec mod
 	// gets the user's name back (names are unique per owner in the store).
 	// A malformed legacy "owner:" name decodes to itself and never fails.
 	spec = cluster.DecodeSpecName(spec)
+	// Nothing local yet: this call would create the sandbox. Take the id's
+	// create lease first, the one a placement-only DELETE also takes
+	// (destroy_unmaterialized.go), and confirm under it that the placement
+	// the watcher read is still this node's to create: a DELETE may have
+	// committed since the watcher's tick began. A materialized sandbox skips
+	// this, so a steady-state tick adds no control-plane read.
+	if _, err := s.store.Get(ctx, id); errors.Is(err, store.ErrNotFound) {
+		var release func()
+		var leaseErr error
+		ctx, release, leaseErr = s.beginCreateLease(ctx, id, spec.CreateRequestDigests)
+		if leaseErr != nil {
+			return true, leaseErr
+		}
+		defer release()
+		owned, err := s.failoverRecreateStillOwned(ctx, id, secrets)
+		if err != nil {
+			return true, err
+		}
+		if !owned {
+			return false, nil
+		}
+	}
 	if strings.TrimSpace(spec.Runtime) == models.RuntimeWasm && spec.Durability == models.DurabilityDurable {
 		nodeID := ""
 		if c := s.Cluster(); c != nil {
@@ -1968,6 +2013,12 @@ func gpuVendorForCapacity(req *models.GPURequest) string {
 }
 
 func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxRequest, idOverride string) (resp *models.CreateSandboxResponse, err error) {
+	// The work before the runtime driver, as back-to-back Server-Timing
+	// stages (svc_validate, svc_quota, svc_policy, then on the container
+	// path svc_keygen, svc_admit, svc_pre_driver), so none of it is time no
+	// stage covers. Boot-path (pr-review §2): a timer read and a RecordStage
+	// per mark on a timed create; nil, and free, when nothing times it.
+	clock := createtiming.StartClock(ctx)
 	// The runtime that serves this create from something already running
 	// (a warm pool slot, a parked container) marks it warm (O1).
 	ctx, warm := scaleobs.WithWarmStart(ctx)
@@ -2060,6 +2111,7 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 	if err := s.checkPlacementRule(&req); err != nil {
 		return nil, err
 	}
+	clock.Mark("svc_validate")
 
 	// Owner attribution: a validated user token stamps its account onto the
 	// new sandbox; operator/PAT and internal creates are owner-less (""). The
@@ -2098,6 +2150,7 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 		return nil, err
 	}
 	defer func() { quotaTicket.settle(resp, err) }()
+	clock.Mark("svc_quota")
 	// Custom-domain validation runs early so an invalid or unsupported
 	// payload fails before admission/mounts/docker.Create burn resources.
 	// On success req.CustomDomains is rewritten with the canonical slice.
@@ -2282,6 +2335,7 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 				chosenRuntime, models.ErrRuntimeNotImplemented)
 		}
 		req.Runtime = chosenRuntime
+		clock.Mark("svc_policy")
 		return s.createFirecrackerSandbox(ctx, req, idOverride)
 	}
 	if chosenRuntime == models.RuntimeWasm {
@@ -2297,6 +2351,7 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 			req.MemoryMB = 0
 		}
 		req.Runtime = chosenRuntime
+		clock.Mark("svc_policy")
 		return s.createWasmSandbox(ctx, req, idOverride)
 	}
 	// "isolate" is the fifth runtime (V8 isolates, Workers model), dispatched
@@ -2313,6 +2368,7 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 				chosenRuntime, models.ErrRuntimeNotImplemented)
 		}
 		req.Runtime = chosenRuntime
+		clock.Mark("svc_policy")
 		return s.createIsolateSandbox(ctx, req, idOverride)
 	}
 	req.Runtime = chosenRuntime
@@ -2368,6 +2424,7 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 	if s.testSealedMountsOverride != nil {
 		sealedMounts = s.testSealedMountsOverride
 	}
+	clock.Mark("svc_policy")
 
 	toolboxToken, err := generateToolboxToken()
 	if err != nil {
@@ -2392,6 +2449,7 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 			return nil, fmt.Errorf("generate sandbox id: %w", err)
 		}
 	}
+	clock.Mark("svc_keygen")
 
 	// Cluster mode carries the redacted spec inside the placement's raft log
 	// entry, which is size-capped (cluster.ValidateRecoveryPayloadSize) — there
@@ -2437,6 +2495,7 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 	if err != nil {
 		return nil, err
 	}
+	clock.Mark("svc_admit")
 
 	prepareStart := time.Now()
 	egressPol, err := compileCreateEgressEffective(&req)
@@ -2583,6 +2642,9 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 	egressCommitted := false
 	defer func() { early.end(egressCommitted) }()
 	clearGen := s.egressClears.now()
+	// svc_pre_driver: egress compile, mounts and the runtime pick. A
+	// gateway create's svc_egress_prepare is a part of it.
+	clock.Mark("svc_pre_driver")
 	state, err := ociRt.Create(createCtx, driverReq, sandboxID, toolboxToken, append(binds, inspectBinds...))
 	if err != nil {
 		// A driver that reported the address and failed let it go through
@@ -3669,6 +3731,12 @@ const (
 // startSandboxLocked is the start itself. The caller holds the lifecycle
 // boundary for id.
 func (s *Service) startSandboxLocked(ctx context.Context, id string, cause startCause) (_ *models.Sandbox, err error) {
+	// A fenced sandbox may be running on another node by now: no start of
+	// any kind (API, wake, restart on failure) until ownership is confirmed
+	// (ownership_lease.go).
+	if s.OwnershipFenced(id) {
+		return nil, ErrOwnershipFenced
+	}
 	// A started sandbox gets a fresh identity token at once, a restart on
 	// failure included (no-op for one without an identity, or a deployment
 	// that is not an issuer).
@@ -3907,7 +3975,24 @@ func (s *Service) StopSandbox(ctx context.Context, id string) (*models.Sandbox, 
 // DestroySandbox deletes a sandbox inside the lifecycle boundary, so a start
 // or a restart on failure in flight cannot write the row back after the
 // delete (Upsert inserts a missing row).
+//
+// With no local row, a cluster node may still own the sandbox's placement:
+// one reassigned to it by a failover that its owner watcher has not recreated
+// yet. destroyUnmaterializedPlacement deletes that placement instead of
+// answering 404. It runs after the lifecycle lock is released, because it
+// takes the create lease, and the lock order is create lease, then lifecycle
+// lock (a create's rollback destroys under its lease).
 func (s *Service) DestroySandbox(ctx context.Context, id string) error {
+	err := s.destroySandboxUnderLifecycleLock(ctx, id)
+	if errors.Is(err, store.ErrNotFound) {
+		return s.destroyUnmaterializedPlacement(ctx, id, err)
+	}
+	return err
+}
+
+// destroySandboxUnderLifecycleLock runs the local destroy inside the
+// lifecycle boundary for id.
+func (s *Service) destroySandboxUnderLifecycleLock(ctx context.Context, id string) error {
 	unlock, err := s.lifecycleLocks.lockCtx(ctx, id)
 	if err != nil {
 		return err
@@ -4714,6 +4799,12 @@ func (s *Service) CountSnapshots(ctx context.Context, sourceSandboxID string) (i
 // never fails the create. It is a no-op single-node (the Noop client). The
 // write detaches from the request context so a client that disconnected right
 // after the commit still gets the snapshot registered.
+//
+// A snapshot whose image is only here (not, or not yet, pushed to the
+// registry) also gets the local-only key, so a create by its name that lands
+// on another node runs here instead of pulling a copy that does not exist
+// (UC-459). The push worker drops that key when the push lands
+// (forgetSnapshotLocalOnly).
 func (s *Service) registerSnapshotHome(ctx context.Context, snapshot *models.SandboxSnapshot) {
 	c := s.Cluster()
 	if c == nil {
@@ -4723,7 +4814,11 @@ func (s *Service) registerSnapshotHome(ctx context.Context, snapshot *models.San
 	if self == "" {
 		return
 	}
-	for _, key := range snapshotHomeKeys(snapshot) {
+	keys := snapshotHomeKeys(snapshot)
+	if SnapshotNeedsPush(snapshot) {
+		keys = append(keys, cluster.SnapshotLocalOnlyKey(snapshot.OwnerRef, snapshot.Name))
+	}
+	for _, key := range keys {
 		if err := c.RegisterSnapshotNode(context.WithoutCancel(ctx), key, self); err != nil && s.logger != nil {
 			s.logger.Warn("snapshot home-node register failed", "snapshot", snapshot.Name, "error", err)
 		}
@@ -4732,15 +4827,34 @@ func (s *Service) registerSnapshotHome(ctx context.Context, snapshot *models.San
 
 // forgetSnapshotHome drops the snapshot's home entries after it is deleted.
 // Best-effort: a stale entry is also swept when its node leaves the cluster.
+// The local-only key goes too, whatever the row's push state: a push whose
+// own forget failed left it behind, and it would keep sending creates by this
+// name to a node that no longer has the snapshot.
 func (s *Service) forgetSnapshotHome(ctx context.Context, snapshot *models.SandboxSnapshot) {
 	c := s.Cluster()
 	if c == nil {
 		return
 	}
-	for _, key := range snapshotHomeKeys(snapshot) {
+	keys := append(snapshotHomeKeys(snapshot), cluster.SnapshotLocalOnlyKey(snapshot.OwnerRef, snapshot.Name))
+	for _, key := range keys {
 		if err := c.ForgetSnapshotNode(context.WithoutCancel(ctx), key); err != nil && s.logger != nil {
 			s.logger.Warn("snapshot home-node forget failed", "snapshot", snapshot.Name, "error", err)
 		}
+	}
+}
+
+// forgetSnapshotLocalOnly drops a snapshot's local-only key once its push has
+// landed: the registry copy exists now, so a create by its name may run on any
+// node again. The push worker calls it (SnapshotPushReconciler.onPushed).
+// Best-effort: a failed forget only keeps those creates on this node, where
+// the snapshot still runs, until the snapshot is deleted.
+func (s *Service) forgetSnapshotLocalOnly(ctx context.Context, snapshot *models.SandboxSnapshot) {
+	c := s.Cluster()
+	if c == nil || snapshot == nil {
+		return
+	}
+	if err := c.ForgetSnapshotNode(context.WithoutCancel(ctx), cluster.SnapshotLocalOnlyKey(snapshot.OwnerRef, snapshot.Name)); err != nil && s.logger != nil {
+		s.logger.Warn("snapshot local-only key forget failed; creates by its name stay on this node", "snapshot", snapshot.Name, "error", err)
 	}
 }
 
@@ -5687,17 +5801,23 @@ func (s *Service) installHTTPPortRoute(ctx context.Context, sandbox *models.Sand
 // intent from a new one, so only the lock plus a fresh read keep an old
 // public intent from replacing a newer gated route.
 func (s *Service) applyHTTPPortRoute(ctx context.Context, sandbox *models.Sandbox, port int) error {
+	// Every shape takes the lock, not just the direct one: a writer that
+	// read the gate before an expose stored "token" must finish before
+	// that expose's wake write starts, or its direct write lands last. The
+	// ownership fence is read under it for the same reason: the fence and
+	// the confirm that lifts it each rewrite the route after changing the
+	// fence, so the last write for a port always matches the fence.
+	unlock := s.httpRouteLocks.lock(portLockKey{id: sandbox.ID, port: port})
+	defer unlock()
+	if s.OwnershipFenced(sandbox.ID) {
+		return s.applyFencedHTTPPortRoute(ctx, sandbox.ID, port)
+	}
 	if s.isWasmSandbox(sandbox) {
 		return s.installWasmHTTPPortRoute(ctx, sandbox, port)
 	}
 	if s.isIsolateSandbox(sandbox) {
 		return s.installIsolateHTTPPortRoute(ctx, sandbox, port)
 	}
-	// Every shape takes the lock, not just the direct one: a writer that
-	// read the gate before an expose stored "token" must finish before
-	// that expose's wake write starts, or its direct write lands last.
-	unlock := s.httpRouteLocks.lock(portLockKey{id: sandbox.ID, port: port})
-	defer unlock()
 	// The direct route is where DIRECT-path Host masking is enforced; the
 	// serverless wake route can't carry it (the loopback ingress proxy
 	// overwrites Host on re-dial), so that path masks in the proxy instead.
@@ -6515,6 +6635,11 @@ func (s *Service) Reconcile(ctx context.Context) error {
 	// running would double-bill capacity and serve stale state.
 	s.reconcileStaleOwnership(ctx)
 
+	// Creates reported as failed whose rollback did not finish (no leader
+	// for the placement fence at the time): finish them before the list
+	// below, so a destroyed row is not reconciled as a live one.
+	s.reconcileRollbackPending(ctx)
+
 	known, err := s.store.List(ctx)
 	if err != nil {
 		return err
@@ -7306,6 +7431,12 @@ func (s *Service) runLifecycleAction(ctx context.Context, id string, now time.Ti
 	if err != nil {
 		return err
 	}
+	// A fenced sandbox is frozen, so its idle clock is not real, and stopping
+	// or destroying it needs ownership this node has not confirmed
+	// (ownership_lease.go). Its timers resume with it.
+	if s.OwnershipFenced(id) {
+		return nil
+	}
 	action, reason := lifecycleDecision(sandbox, now, globalIdle, s.activityFloorFor(sandbox, netstatsFallback))
 	switch action {
 	case lifecycleDestroy:
@@ -7694,9 +7825,11 @@ func (s *Service) addClusterIngressExpectedRoutes(expectedHTTP, expectedTCPServe
 		if !placementAllowsPublicTraffic(p) {
 			continue
 		}
-		// Orphaned placement: the in-flux 503 routes are the expected
-		// state. Keep them; the live routes are intentionally absent.
-		if p.OwnerNodeID == "" {
+		// Orphaned placement, or an owner this ingress cannot confirm (its
+		// addresses blanked past the age limit): the in-flux 503 routes are
+		// the expected state. Keep them; the live routes are intentionally
+		// absent. Same test as buildClusterIngressIntents.
+		if p.OwnerNodeID == "" || dataPlaneHostForPlacement(p) == "" {
 			expectedHTTP[caddy.InFluxSandboxRouteID(p.SandboxID)] = struct{}{}
 			for port, route := range cluster.ExposedPortRoutesForPlacement(p) {
 				if route.Protocol == models.ExposedPortProtocolTCP {

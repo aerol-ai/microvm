@@ -43,7 +43,7 @@ type c96bReassignCluster struct {
 	err error
 }
 
-func (c *c96bReassignCluster) ReassignStuckPlacement(context.Context, string, string, string) error {
+func (c *c96bReassignCluster) ReassignStuckPlacement(context.Context, string, string, string, bool) error {
 	return c.err
 }
 

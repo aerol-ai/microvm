@@ -220,6 +220,7 @@ The placement map is the record of which sandbox lives on which worker. Only nod
 
 - **A worker dies.** After `SB_DEAD_OWNER_GRACE` (30 seconds by default), its normal sandboxes are marked orphaned (they have no owner). Clients get `410 Gone` and must create them again. Sandboxes created with `failover.policy="recreate"` move to a healthy worker and are rebuilt from their saved settings. See [Durability and failover](/durability/).
 - **An ingress node dies.** The load balancer stops sending traffic to it. Public URLs keep working through the other ingress nodes. Voting is not affected.
+- **An ingress node loses touch with the servers.** An ingress node keeps a copy of the placement map that it reads from the servers. This is true with `SB_INGRESS_PROXY_ROUTING` on or off. If no server has answered for half of `SB_DEAD_OWNER_GRACE` (15 seconds by default), it stops trusting that copy for sandboxes created with `failover.policy="recreate"`. Their URLs through that node return `503` ("sandbox is moving; retry") until a server answers again. This stops it from sending traffic to a worker that may no longer own the sandbox. Other sandboxes keep working, even when every server is down: when a worker fails, the servers do not start them anywhere else, so their worker is still the only place they run.
 - **A server node dies.** While a majority of the voting servers is up (the quorum), the cluster keeps making changes. Without a majority, changes pause until enough servers return.
 
 ## Limits

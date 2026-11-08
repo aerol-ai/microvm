@@ -471,6 +471,8 @@ A placed sandbox stays on its owner node, and every other node forwards requests
 
 **Loop detection.** A stale placement view could bounce a request between two nodes that each think the other owns sandbox X. `forward.go` sets `X-Cluster-Forwarded: 1` on the way out. A node that receives a request with that header, and is about to forward it again, returns 421 Misdirected Request instead. The caller then retries against fresh placement.
 
+**A server cut off from the leader stops answering placement questions.** Worker and ingress nodes keep no placement state; they ask a server-role node. A follower's copy only moves when the leader sends it changes, so a follower on the wrong side of a network split would keep naming an owner the leader may already have replaced. Once a follower has heard nothing from the leader for twice the Raft heartbeat timeout (2 seconds by default), it answers those questions with 503, and the asking node tries the next server. The leader always answers. `stale_read.go` holds the rule.
+
 Every node runs the same check on a request for a sandbox, whether the request came from a caller or from another node:
 
 ```mermaid
@@ -487,6 +489,13 @@ flowchart TB
 
 - A request is forwarded at most once. A second hop would mean two nodes disagree about the owner, so the request stops with 421.
 - Finding the owner is only a read. No Raft write happens on this path.
+
+**Owner cache (off by default).** A worker or ingress node holds no placement table, so each "who owns X?" is a call to the server tier, and the owner makes the same call again. With `SB_CLUSTER_OWNER_CACHE=true`, a worker or ingress node remembers the owner its last lookup found and forwards straight there. The cache only picks where a request goes, never the answer:
+
+- The owner still looks itself up on every request. If the answer is not "this node", it does not serve, 404 or 410. It answers `421` with a private header that repeats a one-time token the edge sent, so nothing else can fake that answer.
+- The edge then drops the entry and routes the request once more from a fresh lookup, as it would with the cache off. That second try never uses the cache, so the edge sends a request at most twice.
+- An entry lasts 30 seconds. The cache holds at most 16,384 sandboxes, about 4 MiB. A node that gossip reports dead gets no cached traffic.
+- Turn it on only after every node runs a build that has it: an owner on an older build would serve or 404 a stale forward.
 
 **The trade.** Owner-sharded execution buys local consistency. The toolbox sessions, the SQLite row and the container for one sandbox all live on one host. So that sandbox's state needs no agreement across nodes.
 
@@ -528,6 +537,8 @@ flowchart TB
 
 - The rebuild is safe to repeat. A sandbox that already runs here is left as it is.
 - If no other node can take it, the sandbox stays here and the watcher keeps trying.
+
+**The old owner pauses its copy first.** "Dead" only means the leader cannot hear the node. A node cut off by a network split may still be running its sandboxes. So every worker keeps a lease on what it owns: each time the leader answers one of its placement reads (every 5 seconds by default), the lease is renewed. If half of `ClusterDeadOwnerGrace` (15 seconds by default) passes with no answer, the worker pauses each of its recreate-policy sandboxes in place (docker and containerd freeze them with the cgroup freezer) and refuses to start or serve them; API calls for them and their public HTTP port URLs get 503 with `Retry-After` (a paused process would take the connection and never answer). That happens well before the leader may hand them to another node. When the leader answers again, a sandbox whose placement still names this node resumes where it stopped; one that moved stays paused until the stale-ownership check removes it. Firecracker, WASM and isolate sandboxes cannot be paused in place yet: they are refused, but keep running. `ownership_lease.go` in `internal/service` holds the rule.
 
 Orphaned sandboxes have two ways out:
 

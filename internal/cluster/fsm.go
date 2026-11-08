@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/cloudidentity"
@@ -248,6 +249,14 @@ type command struct {
 	// an older build never sets it, so its spec writes are always checked.
 	// Apply ignores it.
 	QuotaReplay bool `json:"quota_replay,omitempty"`
+	// RefuseDeletedLifecycle asks opPlace to refuse a missing row whose
+	// (SandboxID, IncarnationID) has a post-delete record
+	// (deletedLifecycleRetainedLocked). Entries written before the fence carry
+	// false and apply exactly as they did, so a log replay reaches the same
+	// state. A proposer sets it only once every server applies it
+	// (deletedLifecycleFenceFSMOpsVersion), so a mixed-version server tier
+	// never splits on one entry.
+	RefuseDeletedLifecycle bool `json:"refuse_deleted_lifecycle,omitempty"`
 }
 
 type reservationCommand struct {
@@ -612,6 +621,14 @@ type placementFSM struct {
 	// then takes subMu to fan out.
 	subMu       sync.Mutex
 	subscribers []chan<- struct{}
+
+	// unreported receives load an apply stops counting as pending before
+	// the owner's capacity heartbeat can show it (capacity_unreported.go).
+	// It is this server's, written by apply and never read by it, and not
+	// in snapshots, so replicated state stays a function of the log alone.
+	// Atomic so a test can install one beside a running raft; nil records
+	// nothing.
+	unreported atomic.Pointer[unreportedLoad]
 }
 
 type placementRecovery struct {
@@ -838,6 +855,21 @@ func (f *placementFSM) retainAuditACLLocked(acl AuditACL, cap int64) {
 	}
 }
 
+// deletedLifecycleRetainedLocked reports whether opDelete left a post-delete
+// record for this exact lifetime. It checks presence, not ExpiresUnix, so it
+// needs no clock: the record leaves the map only through opPruneAuditACL or
+// cap eviction, both log entries, so every replica gives the same answer at
+// the same index. A record past its expiry but not pruned yet still proves
+// the delete.
+func (f *placementFSM) deletedLifecycleRetainedLocked(sandboxID, incarnationID string) bool {
+	incarnationID = strings.TrimSpace(incarnationID)
+	if incarnationID == "" {
+		return false
+	}
+	_, ok := f.auditACLs[auditACLKey(sandboxID, incarnationID)]
+	return ok
+}
+
 func (f *placementFSM) removeAuditACLLocked(key string) {
 	acl, ok := f.auditACLs[key]
 	if !ok {
@@ -911,6 +943,24 @@ func (f *placementFSM) Apply(log *raft.Log) interface{} {
 	return res
 }
 
+// applyNow is the time an entry is applied "at": the leader's timestamp from
+// when it first appended the entry. Every decision apply makes from time
+// (whether a reservation or a delete fence has expired) must come out the
+// same on every server and on every replay, and the applying server's own
+// clock does not: a lagging follower, or a server replaying its log after a
+// restart, read a later time than the leader and could overwrite a
+// reservation the leader had refused, leaving servers that disagree on a
+// sandbox's owner and incarnation. raft sets AppendedAt once on the leader,
+// the transport sends it with the entry, and both log stores (raft-boltdb
+// and raft-wal) persist it. An entry without one (built by hand in tests)
+// falls back to the local clock.
+func applyNow(log *raft.Log) int64 {
+	if log != nil && !log.AppendedAt.IsZero() {
+		return log.AppendedAt.Unix()
+	}
+	return time.Now().Unix()
+}
+
 // ownerSinceAfter is the OwnerSinceUnixNano a placement carries once the
 // entry log makes newOwner its owner; prev is the row before the entry and
 // existed is false for a new row. A new row has had no other owner, so it
@@ -967,7 +1017,12 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 	// and reset to 0 on every cold restart, which broke watchers that
 	// expected a monotonic revision across restores (B9).
 	f.version = log.Index
-	now := time.Now().Unix()
+	now := applyNow(log)
+	// The pending-load index is replicated state, so only apply prunes it,
+	// and by the entry's time: every server then drops the same claims at the
+	// same log position. Reads used to prune with the reading server's clock,
+	// which made servers disagree once apply stopped reading the clock (C1).
+	f.pruneExpiredPendingReservationsLocked(now)
 
 	switch cmd.Op {
 	case opPlace:
@@ -992,6 +1047,12 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 			if existing.IsDeleting() {
 				return fmt.Errorf("%w: %s is being deleted", ErrReservationConflict, cmd.SandboxID)
 			}
+		}
+		// A missing row is not proof the lifetime is new: a node that was cut
+		// off while the cluster deleted its sandbox replays the old
+		// incarnation here. Without this the placement came back (C2).
+		if !exists && cmd.RefuseDeletedLifecycle && f.deletedLifecycleRetainedLocked(cmd.SandboxID, cmd.IncarnationID) {
+			return fmt.Errorf("%w: %s incarnation %q", ErrPlacementDeleted, cmd.SandboxID, strings.TrimSpace(cmd.IncarnationID))
 		}
 		if exists && existing.OwnerNodeID == cmd.OwnerNodeID && cmd.Spec == nil && !cmd.hasSecretUpdate() && !existing.IsReserved() {
 			return nil
@@ -1115,6 +1176,8 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 			// to recompute it from and must not silently make the sandbox
 			// private. A present spec still overrides it.
 			PublicTraffic: exists && existing.PublicTraffic,
+			// Same rule for the failover policy mirror.
+			FailoverRecreate: exists && existing.FailoverRecreate,
 			// opPlace is the promotion path for reservations: writing the
 			// empty State here transitions a Reserved row back to Placed.
 			// ExpiresUnix is cleared by the zero-value as well so the GC
@@ -1129,6 +1192,11 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 		f.claimShardLocked(cmd.SandboxID)
 		f.claimOwnerRefLocked(cmd.SandboxID, ownerRef)
 		f.claimOwnerLocked(cmd.SandboxID, p)
+		if exists && existing.IsReserved() {
+			// The reservation's pending load was released above, and the
+			// owner's next heartbeat has not been taken yet.
+			f.recordUnreportedLocked(cmd.OwnerNodeID, spec)
+		}
 		return nil
 	case opReserve:
 		// Reservations are the first-half of the two-step create: the router
@@ -1345,6 +1413,21 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 			f.claimOwnerLocked(cmd.SandboxID, existing)
 		}
 		if cmd.ReassignCause == reassignCauseFailover {
+			// A reserved row keeps its load pending under the new owner
+			// (claimed just above). A placed one was never pending, so
+			// without this the new owner looked as empty as its last
+			// heartbeat to every reassign after this one in the same
+			// eviction. It counts until the new owner's next heartbeat; one
+			// taken before the owner watcher there recreates the sandbox
+			// still misses it (live run UC-478: a heartbeat half way through
+			// an eviction over-assigned both survivors). The worker's
+			// admitter then refuses the overflow and the owner watcher
+			// hands it back (handBackRefusedPlacement). Only failover moves
+			// count: a WASM migrate reassigns to the node that already
+			// holds the sandbox.
+			if !wasReserved && ownerChanged {
+				f.recordUnreportedLocked(cmd.OwnerNodeID, existing.Spec)
+			}
 			return reassignApplyResult{Changed: ownerChanged}
 		}
 		return nil
@@ -2169,6 +2252,14 @@ func placementName(p Placement) string {
 	return specName(p.Spec)
 }
 
+// validateReservationBatchLocked refuses an opReserveBatch before any item is
+// written, so a batch is all-or-nothing. Each item must pass
+// checkReservationLocked, the same check a single opReserve makes, against
+// the state before the batch; a hand-copied subset here once let a later
+// item fail after earlier items were stored. On top of that no two items may
+// share a sandbox id or a name. Items cannot unblock each other: with ids
+// unique, an earlier write touches only its own row plus the name index,
+// which the name check below already covers.
 func (f *placementFSM) validateReservationBatchLocked(reservations []reservationCommand, now int64) error {
 	seenIDs := make(map[string]struct{}, len(reservations))
 	seenNames := make(map[string]string, len(reservations))
@@ -2181,13 +2272,9 @@ func (f *placementFSM) validateReservationBatchLocked(reservations []reservation
 		}
 		seenIDs[r.SandboxID] = struct{}{}
 
-		if existing, exists := f.fullPlacementLocked(r.SandboxID); exists {
-			if !existing.IsReserved() {
-				return fmt.Errorf("%w: %s already placed by %s", ErrReservationConflict, r.SandboxID, existing.OwnerNodeID)
-			}
-			if existing.OwnerNodeID != r.OwnerNodeID && now <= existing.ExpiresUnix {
-				return fmt.Errorf("%w: %s reserved by %s", ErrReservationConflict, r.SandboxID, existing.OwnerNodeID)
-			}
+		existing, exists := f.fullPlacementLocked(r.SandboxID)
+		if err := f.checkReservationLocked(commandFromReservation(r), existing, exists, now); err != nil {
+			return err
 		}
 
 		name := specName(r.Spec)
@@ -2198,14 +2285,25 @@ func (f *placementFSM) validateReservationBatchLocked(reservations []reservation
 			return fmt.Errorf("%w: %q appears more than once in reservation batch", ErrNameConflict, name)
 		}
 		seenNames[name] = r.SandboxID
-		if err := f.validateNameUniqueLocked(r.SandboxID, name); err != nil {
-			return err
-		}
 	}
 	return nil
 }
 
-func (f *placementFSM) reservePlacementLocked(cmd command, now int64) error {
+// isReservationRetry reports whether cmd re-reserves a live reservation from
+// the same owner. The check and the write share it so they cannot disagree
+// about which branch a command takes.
+func isReservationRetry(existing Placement, cmd command, now int64) bool {
+	return existing.OwnerNodeID == cmd.OwnerNodeID && now <= existing.ExpiresUnix
+}
+
+// checkReservationLocked returns the error reservePlacementLocked would
+// return for cmd, without writing anything. It is the single list of
+// opReserve rejections: validateReservationBatchLocked runs it for every
+// batch item before the first write, so a rule added here is enforced
+// atomically for batches too. existing/exists are the caller's
+// fullPlacementLocked lookup, passed in so the hot opReserve path hydrates
+// the recovery payload once.
+func (f *placementFSM) checkReservationLocked(cmd command, existing Placement, exists bool, now int64) error {
 	if cmd.SandboxID == "" || cmd.OwnerNodeID == "" {
 		return fmt.Errorf("placementFSM: opReserve requires sandbox_id and owner_node_id")
 	}
@@ -2214,17 +2312,17 @@ func (f *placementFSM) reservePlacementLocked(cmd command, now int64) error {
 			return err
 		}
 	}
-	existing, exists := f.fullPlacementLocked(cmd.SandboxID)
 	if exists {
 		// Reject when the slot is already materialized — a router racing a
 		// completed sandbox should back off and let the caller see 409.
 		if !existing.IsReserved() {
 			return fmt.Errorf("%w: %s already placed by %s", ErrReservationConflict, cmd.SandboxID, existing.OwnerNodeID)
 		}
-		// Re-reserve from the same owner before expiry is an idempotent retry —
-		// refresh the TTL (and recipient set when supplied) and treat it as a
-		// no-op otherwise.
-		if existing.OwnerNodeID == cmd.OwnerNodeID && now <= existing.ExpiresUnix {
+		if isReservationRetry(existing, cmd, now) {
+			// A retry refreshes the TTL only, so it must be the same create:
+			// same incarnation and, when it carries one, the same secret
+			// handle. The name is not re-checked because a retry keeps the
+			// row's spec.
 			if strings.TrimSpace(existing.IncarnationID) != strings.TrimSpace(cmd.IncarnationID) {
 				return fmt.Errorf("%w: reservation retry changed its incarnation", ErrIncarnationConflict)
 			}
@@ -2232,6 +2330,28 @@ func (f *placementFSM) reservePlacementLocked(cmd command, now int64) error {
 				existing.SecretSealGeneration != cmd.SecretSealGeneration) {
 				return fmt.Errorf("%w: reservation retry changed its secret handle", ErrInvalidSecretHandle)
 			}
+			return nil
+		}
+		if now <= existing.ExpiresUnix {
+			return fmt.Errorf("%w: %s reserved by %s", ErrReservationConflict, cmd.SandboxID, existing.OwnerNodeID)
+		}
+		// Expired: the write path releases the old row's indexes and
+		// overwrites it. The old row's own name maps to this same sandbox
+		// id, so it never blocks the check below.
+	}
+	return f.validateNameUniqueLocked(cmd.SandboxID, specName(cmd.Spec))
+}
+
+func (f *placementFSM) reservePlacementLocked(cmd command, now int64) error {
+	existing, exists := f.fullPlacementLocked(cmd.SandboxID)
+	if err := f.checkReservationLocked(cmd, existing, exists, now); err != nil {
+		return err
+	}
+	if exists {
+		// Re-reserve from the same owner before expiry is an idempotent retry —
+		// refresh the TTL (and recipient set when supplied) and treat it as a
+		// no-op otherwise.
+		if isReservationRetry(existing, cmd, now) {
 			existing.ExpiresUnix = cmd.ExpiresUnix
 			existing.Version = f.version
 			existing.UpdatedUnix = now
@@ -2252,22 +2372,16 @@ func (f *placementFSM) reservePlacementLocked(cmd command, now int64) error {
 			f.refreshPendingReservationExpiryLocked(cmd.SandboxID, cmd.ExpiresUnix)
 			return nil
 		}
-		// Expired reservations are eligible for overwrite by a fresh reservation.
-		if now > existing.ExpiresUnix {
-			f.releasePendingReservationLocked(cmd.SandboxID)
-			f.releasePendingReservationOwnerLocked(cmd.SandboxID, existing.OwnerNodeID)
-			f.releaseNameLocked(cmd.SandboxID, placementName(existing))
-			f.releaseShardLocked(cmd.SandboxID)
-			f.releaseOwnerRefLocked(cmd.SandboxID, existing.OwnerRef)
-			f.releaseVolumeAttachmentsForIncarnationLocked(cmd.SandboxID, existing.IncarnationID)
-		} else {
-			return fmt.Errorf("%w: %s reserved by %s", ErrReservationConflict, cmd.SandboxID, existing.OwnerNodeID)
-		}
+		// checkReservationLocked refused a live reservation held by another
+		// owner, so this row has expired and a fresh reservation overwrites it.
+		f.releasePendingReservationLocked(cmd.SandboxID)
+		f.releasePendingReservationOwnerLocked(cmd.SandboxID, existing.OwnerNodeID)
+		f.releaseNameLocked(cmd.SandboxID, placementName(existing))
+		f.releaseShardLocked(cmd.SandboxID)
+		f.releaseOwnerRefLocked(cmd.SandboxID, existing.OwnerRef)
+		f.releaseVolumeAttachmentsForIncarnationLocked(cmd.SandboxID, existing.IncarnationID)
 	}
 	name := specName(cmd.Spec)
-	if err := f.validateNameUniqueLocked(cmd.SandboxID, name); err != nil {
-		return err
-	}
 	secrets := applyCommandSecretUpdate(Placement{}, false, cmd)
 	p := Placement{
 		SandboxID:            cmd.SandboxID,
@@ -2589,6 +2703,18 @@ func (f *placementFSM) validateHostPortAvailableLocked(sandboxID string, port in
 	return nil
 }
 
+// recordUnreportedLocked hands owner's new load to this server's unreported
+// ledger. It runs on every server and on log replay; a replayed entry is
+// counted until the owner's next heartbeat, which is over-counting, the safe
+// direction.
+func (f *placementFSM) recordUnreportedLocked(owner string, spec *models.CreateSandboxRequest) {
+	u := f.unreported.Load()
+	if u == nil || owner == "" {
+		return
+	}
+	u.record(owner, capacityRequestFromSpec(spec))
+}
+
 func (f *placementFSM) claimPendingReservationLocked(sandboxID string, p Placement) {
 	if sandboxID == "" || !p.IsReserved() {
 		return
@@ -2692,12 +2818,19 @@ func (f *placementFSM) livePendingReservationCount(owner string, now int64) int 
 	if owner == "" {
 		return 0
 	}
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	if f.pendingReservationIDsByOwner == nil {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	return f.livePendingReservationCountLocked(owner, now)
+}
+
+// livePendingReservationCountLocked is livePendingReservationCount for a
+// caller that holds f.mu.
+func (f *placementFSM) livePendingReservationCountLocked(owner string, now int64) int {
+	if owner == "" || f.pendingReservationIDsByOwner == nil {
 		return 0
 	}
-	f.pruneExpiredPendingReservationsLocked(now)
+	// No prune here: see pendingReservationLoadByNode. Expired claims are
+	// skipped below instead.
 	ids := f.pendingReservationIDsByOwner[owner]
 	if len(ids) == 0 {
 		return 0
@@ -2716,11 +2849,16 @@ func (f *placementFSM) livePendingReservationCount(owner string, now int64) int 
 }
 
 func (f *placementFSM) refreshPendingReservationExpiryLocked(sandboxID string, expiresUnix int64) {
-	if f.pendingReservationClaims == nil {
-		return
-	}
 	claim, ok := f.pendingReservationClaims[sandboxID]
 	if !ok {
+		// Apply prunes claims by entry time. Entry times normally rise, but a
+		// new leader's clock can run behind the old one's, so a retry stamped
+		// before the old expiry can follow an entry that already pruned this
+		// claim. The caller has just stored the row, still reserved, with its
+		// new expiry: count its load again rather than lose it (I4).
+		if p, exists := f.fullPlacementLocked(sandboxID); exists && p.IsReserved() {
+			f.claimPendingReservationLocked(sandboxID, p)
+		}
 		return
 	}
 	claim.ExpiresUnix = expiresUnix
@@ -2937,6 +3075,9 @@ func splitPlacement(p Placement) (Placement, placementRecovery) {
 	// the hot row already carries rather than clearing it.
 	if p.Spec != nil {
 		p.PublicTraffic = p.Spec.AllowPublicTraffic != nil && *p.Spec.AllowPublicTraffic
+		// The failover policy rides the hot row for the same readers: an
+		// ingress's age limit reads it to put only movable sandboxes in flux.
+		p.FailoverRecreate = specWantsFailoverRecreate(p.Spec)
 		// Egress profile references ride the hot row too: the FSM's
 		// reference index and apply-time cap check read them without
 		// hydrating the spec.
@@ -3107,10 +3248,19 @@ func (f *placementFSM) pendingReservationsByNode(now int64) map[string]capacity.
 // reservations counted by owner and runtime, read under one lock so the two
 // agree. Placement needs both: the aggregate for CPU, memory and disk, the
 // counts for network slots (a pool serves some runtimes, not others).
+//
+// It never prunes: the index is replicated state that only apply may change
+// (see apply). Claims that expired after the last applied entry are left out
+// of the answer instead, so a read at a later time still sees the right load.
 func (f *placementFSM) pendingReservationLoadByNode(now int64) (map[string]capacity.Request, map[string]map[string]int) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.pruneExpiredPendingReservationsLocked(now)
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	return f.pendingReservationLoadByNodeLocked(now)
+}
+
+// pendingReservationLoadByNodeLocked is pendingReservationLoadByNode for a
+// caller that holds f.mu. The maps it returns are copies.
+func (f *placementFSM) pendingReservationLoadByNodeLocked(now int64) (map[string]capacity.Request, map[string]map[string]int) {
 	out := make(map[string]capacity.Request, len(f.pendingReservationCapacity))
 	for owner, req := range f.pendingReservationCapacity {
 		out[owner] = req
@@ -3123,7 +3273,165 @@ func (f *placementFSM) pendingReservationLoadByNode(now int64) (map[string]capac
 		}
 		runtimes[owner] = cp
 	}
+	f.forEachExpiredClaimLocked(now, func(claim pendingReservationClaim) {
+		subtractPendingLoad(out, runtimes, claim.OwnerNodeID, claim.Request)
+	})
 	return out, runtimes
+}
+
+// heldReservation is a reservation the leader has admitted and proposed but
+// has not yet seen applied: one item of an admission hold
+// (admission_ledger.go).
+type heldReservation struct {
+	SandboxID     string
+	OwnerNodeID   string
+	IncarnationID string
+	Request       capacity.Request
+}
+
+// admissionPendingLoad is the pending load the leader admits a reservation
+// against: live claims in the index (pendingReservationLoadByNode), the live
+// pending count of each of owners (livePendingReservationCount), and every
+// held reservation the index does not count yet.
+//
+// All of it is read under one lock. A hold is released only after apply has
+// added its claim to the index, and the caller holds the admission lock, so
+// no hold leaves while this runs; the claims may still change. Deciding "is
+// this hold in the index already?" from the same read as the index totals is
+// what counts every reservation exactly once: as a claim or as a hold. From
+// two reads, an apply in between could hide one from both (I4), or show it
+// in both and refuse a create that fits.
+//
+// A hold counts unless the index has a live claim for the same sandbox on
+// the same owner with the same load: that claim is the hold's own entry,
+// already applied, or the reservation it retries. Anything else (no claim,
+// an expired one, another owner or size) is counted again, which can only
+// over-count. Holds for the same sandbox, owner and incarnation are one
+// create sent twice and count once.
+func (f *placementFSM) admissionPendingLoad(now int64, owners []string, held []heldReservation) (map[string]capacity.Request, map[string]map[string]int, map[string]int) {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	load, runtimes := f.pendingReservationLoadByNodeLocked(now)
+	counts := make(map[string]int, len(owners))
+	for _, owner := range owners {
+		if _, ok := counts[owner]; !ok {
+			counts[owner] = f.livePendingReservationCountLocked(owner, now)
+		}
+	}
+	type heldKey struct{ sandbox, owner, incarnation string }
+	seen := make(map[heldKey]struct{}, len(held))
+	for _, h := range held {
+		if h.SandboxID == "" || h.OwnerNodeID == "" {
+			continue
+		}
+		key := heldKey{h.SandboxID, h.OwnerNodeID, h.IncarnationID}
+		if _, dup := seen[key]; dup {
+			continue
+		}
+		seen[key] = struct{}{}
+		if claim, ok := f.pendingReservationClaims[h.SandboxID]; ok && claim.OwnerNodeID == h.OwnerNodeID &&
+			(claim.ExpiresUnix <= 0 || now <= claim.ExpiresUnix) && samePendingLoad(claim.Request, h.Request) {
+			continue
+		}
+		addPendingLoad(load, runtimes, h.OwnerNodeID, h.Request)
+		if _, ok := counts[h.OwnerNodeID]; ok {
+			counts[h.OwnerNodeID]++
+		}
+	}
+	return load, runtimes, counts
+}
+
+// samePendingLoad compares the fields the pending index sums.
+func samePendingLoad(a, b capacity.Request) bool {
+	return a.CPU == b.CPU && a.MemoryMB == b.MemoryMB && a.DiskGB == b.DiskGB && a.GPUs == b.GPUs && a.Runtime == b.Runtime
+}
+
+// addPendingLoad adds one reservation to a copy of the pending aggregates,
+// the same way addPendingCapacityLocked does on the index.
+func addPendingLoad(load map[string]capacity.Request, runtimes map[string]map[string]int, owner string, req capacity.Request) {
+	cur := load[owner]
+	cur.CPU += req.CPU
+	cur.MemoryMB += req.MemoryMB
+	cur.DiskGB += req.DiskGB
+	cur.GPUs += req.GPUs
+	load[owner] = cur
+	byRuntime := runtimes[owner]
+	if byRuntime == nil {
+		byRuntime = make(map[string]int)
+		runtimes[owner] = byRuntime
+	}
+	byRuntime[req.Runtime]++
+}
+
+// forEachExpiredClaimLocked calls fn once for every claim that has expired
+// by now but is still in the index (apply has not yet reached an entry past
+// its expiry). It walks only the expired part of the expiry min-heap: a node
+// that has not expired has no expired descendants, so the cost is the number
+// of expired entries, not the number of reservations. Heap entries left by a
+// refresh (an older expiry for the same claim) are skipped. Caller holds f.mu
+// for reading.
+func (f *placementFSM) forEachExpiredClaimLocked(now int64, fn func(pendingReservationClaim)) {
+	h := f.pendingReservationExpiries
+	if now <= 0 || len(h) == 0 {
+		return
+	}
+	var seen map[string]struct{}
+	stack := []int{0}
+	for len(stack) > 0 {
+		i := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		if i >= len(h) {
+			continue
+		}
+		e := h[i]
+		if e.ExpiresUnix <= 0 || now <= e.ExpiresUnix {
+			continue
+		}
+		stack = append(stack, 2*i+1, 2*i+2)
+		claim, ok := f.pendingReservationClaims[e.SandboxID]
+		if !ok || claim.ExpiresUnix != e.ExpiresUnix {
+			continue
+		}
+		if _, dup := seen[e.SandboxID]; dup {
+			continue
+		}
+		if seen == nil {
+			seen = make(map[string]struct{})
+		}
+		seen[e.SandboxID] = struct{}{}
+		fn(claim)
+	}
+}
+
+// subtractPendingLoad removes one claim from a copy of the pending
+// aggregates, the same way subtractPendingCapacityLocked does on the index.
+func subtractPendingLoad(load map[string]capacity.Request, runtimes map[string]map[string]int, owner string, req capacity.Request) {
+	if owner == "" {
+		return
+	}
+	if byRuntime := runtimes[owner]; byRuntime != nil {
+		if byRuntime[req.Runtime] <= 1 {
+			delete(byRuntime, req.Runtime)
+		} else {
+			byRuntime[req.Runtime]--
+		}
+		if len(byRuntime) == 0 {
+			delete(runtimes, owner)
+		}
+	}
+	cur, ok := load[owner]
+	if !ok {
+		return
+	}
+	cur.CPU -= req.CPU
+	cur.MemoryMB -= req.MemoryMB
+	cur.DiskGB -= req.DiskGB
+	cur.GPUs -= req.GPUs
+	if cur.CPU == 0 && cur.MemoryMB == 0 && cur.DiskGB == 0 && cur.GPUs == 0 {
+		delete(load, owner)
+		return
+	}
+	load[owner] = cur
 }
 
 func (f *placementFSM) expiredReservationIDs(now int64) []string {

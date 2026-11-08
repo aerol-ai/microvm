@@ -29,9 +29,14 @@ import (
 type hangUpPoint string
 
 const (
-	hangUpInNewTask   hangUpPoint = "new task"
-	hangUpInStart     hangUpPoint = "task start"
-	hangUpInReadiness hangUpPoint = "readiness wait"
+	// hangUpInNewContainer is inside NewContainer, after cntr.WithNewSnapshot
+	// prepared the snapshot and before the container was written: the step
+	// the UC-450 live run of 2026-11-08 hung up in ("create container:
+	// context canceled").
+	hangUpInNewContainer hangUpPoint = "new container"
+	hangUpInNewTask      hangUpPoint = "new task"
+	hangUpInStart        hangUpPoint = "task start"
+	hangUpInReadiness    hangUpPoint = "readiness wait"
 )
 
 // hangUpHarness is a fake containerd for these tests. Its calls fail with the
@@ -47,12 +52,16 @@ type hangUpHarness struct {
 	hangUp context.CancelFunc
 	netns  map[string]bool // sandbox ID → holds a netns slot
 	leases map[string]bool // live image leases
+	// snapshots holds each prepared snapshot by key. NewContainer prepares a
+	// container's snapshot under the container's own ID before it writes the
+	// container, and deleting the container with WithSnapshotCleanup removes it.
+	snapshots map[string]bool
 }
 
 func newHangUpHarness(t *testing.T, at hangUpPoint) *hangUpHarness {
 	t.Helper()
 	stubToolboxProbe(t)
-	h := &hangUpHarness{at: at, tr: newFakeTransport(), netns: map[string]bool{}, leases: map[string]bool{}}
+	h := &hangUpHarness{at: at, tr: newFakeTransport(), netns: map[string]bool{}, leases: map[string]bool{}, snapshots: map[string]bool{}}
 	h.tr.image = digestImage()
 	h.tr.newContainerFn = h.newContainer
 
@@ -65,9 +74,12 @@ func newHangUpHarness(t *testing.T, at hangUpPoint) *hangUpHarness {
 	}
 	origLeases := leasesServiceFn
 	leasesServiceFn = func(*Client) leaseManager { return hangUpLeases{h} }
+	origSnapshots := snapshotsFn
+	snapshotsFn = func(*Client) snapshotRemover { return hangUpSnapshots{h} }
 	t.Cleanup(func() {
 		pollToolboxHealthFn = origProbe
 		leasesServiceFn = origLeases
+		snapshotsFn = origSnapshots
 	})
 
 	h.d = newTestDriver(t)
@@ -116,9 +128,37 @@ func (h *hangUpHarness) liveLeases() int {
 	return len(h.leases)
 }
 
+func (h *hangUpHarness) hasSnapshot(key string) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.snapshots[key]
+}
+
+// prepareSnapshot is cntr.WithNewSnapshot's Prepare: false (AlreadyExists)
+// when a snapshot holds the key.
+func (h *hangUpHarness) prepareSnapshot(key string) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.snapshots[key] {
+		return false
+	}
+	h.snapshots[key] = true
+	return true
+}
+
+// newContainer is containerd's NewContainer: the snapshot first, under the
+// container's ID, then the container. A client that hangs up in between
+// leaves the snapshot and no container, as containerd does: the call's own
+// lease, which pins the snapshot, is deleted on the cancelled context too.
 func (h *hangUpHarness) newContainer(ctx context.Context, id string, _ ...cntr.NewContainerOpts) (cntr.Container, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
+	}
+	if !h.prepareSnapshot(id) {
+		return nil, errdefs.ErrAlreadyExists
+	}
+	if h.fire(hangUpInNewContainer) {
+		return nil, ctx.Err()
 	}
 	h.tr.mu.Lock()
 	defer h.tr.mu.Unlock()
@@ -159,8 +199,12 @@ func (c *hangUpContainer) Delete(ctx context.Context, _ ...cntr.DeleteOpts) erro
 		return errdefs.ErrFailedPrecondition
 	}
 	c.h.tr.mu.Lock()
-	defer c.h.tr.mu.Unlock()
 	delete(c.h.tr.containers, c.id)
+	c.h.tr.mu.Unlock()
+	// The driver deletes with WithSnapshotCleanup: the snapshot goes too.
+	c.h.mu.Lock()
+	delete(c.h.snapshots, c.id)
+	c.h.mu.Unlock()
 	return nil
 }
 
@@ -249,6 +293,23 @@ func (hangUpLeases) AddResource(ctx context.Context, _ leases.Lease, _ leases.Re
 	return ctx.Err()
 }
 
+// hangUpSnapshots is the default snapshotter. Like containerd's, its Remove
+// does not look at containers: the driver checks for one first.
+type hangUpSnapshots struct{ h *hangUpHarness }
+
+func (s hangUpSnapshots) Remove(ctx context.Context, key string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	s.h.mu.Lock()
+	defer s.h.mu.Unlock()
+	if !s.h.snapshots[key] {
+		return errdefs.ErrNotFound
+	}
+	delete(s.h.snapshots, key)
+	return nil
+}
+
 // TestUndoContextOutlivesTheRequestWithinItsBudget pins what the undo of a
 // failed create runs on: not cancelled with the request, still carrying the
 // request's values (the address observer), and bounded.
@@ -272,13 +333,14 @@ func TestUndoContextOutlivesTheRequestWithinItsBudget(t *testing.T) {
 
 // TestCreateClientHangUpUndoesSoTheRetryCreates is the UC-450 regression. A
 // create whose client hangs up mid-create fails, and must leave nothing under
-// its sandbox ID: no container (with its snapshot and task), no netns slot,
-// no image lease. Then the retry of the same ID creates the sandbox instead
-// of failing with ErrSandboxContainerExists.
+// its sandbox ID: no container, no snapshot (even one NewContainer prepared
+// for a container it never wrote), no netns slot, no image lease. Then the
+// retry of the same ID creates the sandbox instead of failing with
+// ErrSandboxContainerExists.
 func TestCreateClientHangUpUndoesSoTheRetryCreates(t *testing.T) {
 	const id = "sb-uc450"
 	req := models.CreateSandboxRequest{Image: "alpine:3.20", ContainerCommand: []string{"sleep", "inf"}}
-	for _, at := range []hangUpPoint{hangUpInNewTask, hangUpInStart, hangUpInReadiness} {
+	for _, at := range []hangUpPoint{hangUpInNewContainer, hangUpInNewTask, hangUpInStart, hangUpInReadiness} {
 		t.Run(string(at), func(t *testing.T) {
 			h := newHangUpHarness(t, at)
 			ctx, cancel := context.WithCancel(context.Background())
@@ -289,6 +351,9 @@ func TestCreateClientHangUpUndoesSoTheRetryCreates(t *testing.T) {
 			}
 			if h.hasContainer(id) {
 				t.Errorf("the failed create left its container %s behind", id)
+			}
+			if h.hasSnapshot(id) {
+				t.Errorf("the failed create left its snapshot %s behind", id)
 			}
 			if h.holdsNetns(id) {
 				t.Errorf("the failed create kept its netns slot")
@@ -310,6 +375,96 @@ func TestCreateClientHangUpUndoesSoTheRetryCreates(t *testing.T) {
 			}
 			if !h.hasContainer(id) || h.liveLeases() != 1 {
 				t.Fatalf("retry: container=%v leases=%d, want its container and its one lease", h.hasContainer(id), h.liveLeases())
+			}
+		})
+	}
+}
+
+// TestDestroyRemovesTheSnapshotOfAMissingContainer: Destroy of an ID with no
+// container still removes the snapshot named after it. That is the leftover
+// a create cancelled inside NewContainer leaves when containerd prepares the
+// snapshot after the create's undo has looked, and the service's leftover
+// removal (create_leftover.go) relies on Destroy to clear it before it
+// creates the ID again. It used to find no container, return nil, and leave
+// the snapshot for the second create to meet as AlreadyExists (UC-450 live,
+// 2026-11-08).
+func TestDestroyRemovesTheSnapshotOfAMissingContainer(t *testing.T) {
+	const id = "sb-uc450"
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	cases := []struct {
+		name         string
+		snapshot     bool
+		ctx          context.Context
+		wantErr      error
+		wantSnapshot bool
+	}{
+		{name: "snapshot without its container is removed", snapshot: true, ctx: context.Background()},
+		{name: "nothing under the id is already gone", ctx: context.Background()},
+		{name: "a failed removal is reported and keeps the snapshot", snapshot: true, ctx: cancelled, wantErr: context.Canceled, wantSnapshot: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHangUpHarness(t, "")
+			h.snapshots[id] = tc.snapshot
+			err := h.d.Destroy(tc.ctx, &models.Sandbox{ID: id, ContainerID: id})
+			if !errors.Is(err, tc.wantErr) || (tc.wantErr == nil && err != nil) {
+				t.Fatalf("Destroy = %v, want %v", err, tc.wantErr)
+			}
+			if got := h.hasSnapshot(id); got != tc.wantSnapshot {
+				t.Fatalf("snapshot after Destroy = %v, want %v", got, tc.wantSnapshot)
+			}
+			if tc.wantSnapshot {
+				return
+			}
+			req := models.CreateSandboxRequest{Image: "alpine:3.20", ContainerCommand: []string{"sleep", "inf"}}
+			if _, err := h.d.Create(context.Background(), req, id, "tok", nil); err != nil {
+				t.Fatalf("create of %s after Destroy: %v", id, err)
+			}
+		})
+	}
+}
+
+// TestCreateUndoRemovesOnlyAnOrphanSnapshot pins the guard on the failed
+// create's snapshot removal: it removes the snapshot named after the sandbox
+// ID only when containerd says no container holds the ID. A container's
+// snapshot is its rootfs, and containerd's Remove does not check for one.
+func TestCreateUndoRemovesOnlyAnOrphanSnapshot(t *testing.T) {
+	const id = "sb-uc450"
+	req := models.CreateSandboxRequest{Image: "alpine:3.20", ContainerCommand: []string{"sleep", "inf"}}
+	cases := []struct {
+		name         string
+		container    bool  // a container holds the ID
+		loadErr      error // containerd cannot answer for the ID
+		wantSnapshot bool
+	}{
+		{name: "no container: the snapshot goes"},
+		{name: "a container holds the id: its snapshot stays", container: true, wantSnapshot: true},
+		{name: "containerd cannot say: the snapshot stays", loadErr: errors.New("connection refused"), wantSnapshot: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHangUpHarness(t, "")
+			h.snapshots[id] = true
+			if tc.container {
+				h.tr.containers[id] = &fakeContainer{id: id}
+			}
+			if tc.loadErr != nil {
+				h.tr.loadContainerFn = func(context.Context, string) (cntr.Container, error) { return nil, tc.loadErr }
+			}
+			// A NewContainer that fails for a reason other than AlreadyExists.
+			h.tr.newContainerFn = func(context.Context, string, ...cntr.NewContainerOpts) (cntr.Container, error) {
+				return nil, errors.New("transport is closing")
+			}
+			_, err := h.d.Create(context.Background(), req, id, "tok", nil)
+			if err == nil || errors.Is(err, dockerpkg.ErrSandboxContainerExists) {
+				t.Fatalf("create = %v, want the NewContainer failure", err)
+			}
+			if got := h.hasSnapshot(id); got != tc.wantSnapshot {
+				t.Fatalf("snapshot after the failed create = %v, want %v", got, tc.wantSnapshot)
+			}
+			if tc.container && !h.hasContainer(id) {
+				t.Fatal("the failed create removed a container it never made")
 			}
 		})
 	}

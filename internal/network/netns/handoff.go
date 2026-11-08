@@ -3,6 +3,8 @@ package netns
 import (
 	"context"
 	"time"
+
+	"github.com/aerol-ai/microvm/pkg/createtiming"
 )
 
 // RuntimeHandoff adapts the native netns pool to the containerd driver's
@@ -28,6 +30,13 @@ func (h *RuntimeHandoff) Provision(ctx context.Context, sandboxID string) (netns
 	if h == nil || h.builder == nil {
 		return "", "", nil
 	}
+	// The create's containerd_netns stage: the real time, with whether the
+	// warm queue served it ("hit": a claimed slot) or the create built the
+	// namespace itself ("miss": reserve, CNI ADD, adopt). The wall clock, not
+	// h.now, which tests pin. A park has no recorder on ctx and records no
+	// stage. Boot-path (pr-review §2): one time.Now, one expvar add, and one
+	// RecordStageDesc on a timed create.
+	start := time.Now()
 	now := h.now()
 	// Treat a claim as a ready hit only when the slot is actually realized
 	// (non-empty netns path AND IP). ClaimPooled/Reserve short-circuit on any
@@ -39,12 +48,16 @@ func (h *RuntimeHandoff) Provision(ctx context.Context, sandboxID string) (netns
 	if slot, hit, err := h.pool.ClaimPooled(ctx, sandboxID, now); err != nil {
 		return "", "", err
 	} else if hit && slot != nil && slot.NetnsPath != "" && slot.ContainerIP != "" {
+		metricHits.Add(1)
+		createtiming.From(ctx).RecordStageDesc("containerd_netns", time.Since(start), "hit")
 		return slot.NetnsPath, slot.ContainerIP, nil
 	}
+	metricMisses.Add(1)
 	slot, err := h.builder.Build(ctx, sandboxID)
 	if err != nil {
 		return "", "", err
 	}
+	createtiming.From(ctx).RecordStageDesc("containerd_netns", time.Since(start), "miss")
 	return slot.NetnsPath, slot.ContainerIP, nil
 }
 

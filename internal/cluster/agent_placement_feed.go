@@ -2,6 +2,7 @@ package cluster
 
 import (
 	"context"
+	"expvar"
 	"fmt"
 	"net/http"
 	"sync"
@@ -25,12 +26,46 @@ import (
 //
 // With the flag off, none of this runs: PlacementsForShards keeps its page
 // walk and SubscribePlacement returns nil, exactly as before.
+//
+// Age limit (plan C4 part 3, invariant I7). The rows are only as fresh as the
+// last poll the control plane answered. An ingress cut off from every server
+// used to keep routing by them for as long as the cut lasted, and so kept
+// sending traffic to an owner the leader may have replaced. Once maxStale
+// (OwnershipLease: half the dead-owner grace) passes without an answered poll
+// or resync, the feed hands every failover.policy=recreate row out in flux:
+// the same row, with the owner's addresses blanked (staleViewPlacement). Both
+// ingress routers already read a row with no owner address as in flux and
+// answer 503 + Retry-After (routedns.addPlacementHosts,
+// service.buildClusterIngressIntents). Every other row keeps its route: the
+// leader orphans such a sandbox when its owner dies and never starts a second
+// copy, so its owner is the only place it can run, and an outage of the whole
+// server tier does not take it offline. The next answered poll hands the real
+// rows back.
+//
+//	fresh ──(no answered poll for maxStale)──▶ in flux: watchers get a full view with recreate rows in flux
+//	in flux ──(an answered poll or resync)──▶ fresh: watchers get the real full view
 
 type agentPlacementFeed struct {
 	mu     sync.RWMutex
 	rows   map[string]Placement
 	synced bool
 	cursor uint64
+
+	// lastAnswered is when the control plane last answered a poll or a
+	// resync. maxStale is the age past which the rows are handed out in flux;
+	// zero turns the limit off (a feed built without one, in tests).
+	lastAnswered time.Time
+	maxStale     time.Duration
+	// inFluxSent says watchers were last given the all-in-flux view, so the
+	// watchdog sends it once and the next answered poll knows to send the
+	// real view back. Guarded by mu.
+	inFluxSent bool
+	// transitionMu orders the full views watchers receive: a view is built
+	// and delivered under it, so a late in-flux view can never land after the
+	// real view that replaced it (or the other way round).
+	transitionMu sync.Mutex
+	// clock is time.Now except in tests.
+	clock func() time.Time
 
 	subMu       sync.Mutex
 	subs        []chan struct{}
@@ -40,6 +75,11 @@ type agentPlacementFeed struct {
 	stop context.CancelFunc
 	done chan struct{}
 }
+
+// clusterPlacementFeedInFlux is 1 while this ingress hands out every
+// recreate-policy route in flux because the control plane has not answered
+// its feed within the age limit.
+var clusterPlacementFeedInFlux = expvar.NewInt("aerolvm_cluster_placement_feed_in_flux")
 
 // feedBackoff bounds retries after a failed poll or walk.
 var (
@@ -54,7 +94,13 @@ func (a *Agent) startPlacementFeed() {
 		return
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	a.feed = &agentPlacementFeed{rows: make(map[string]Placement), stop: cancel, done: make(chan struct{})}
+	a.feed = &agentPlacementFeed{
+		rows:     make(map[string]Placement),
+		maxStale: OwnershipLease(a.cfg),
+		stop:     cancel,
+		done:     make(chan struct{}),
+	}
+	go a.watchPlacementFeedAge(ctx, a.feed)
 	go a.runPlacementFeed(ctx, a.feed)
 }
 
@@ -69,13 +115,20 @@ func (a *Agent) stopPlacementFeed() {
 func (a *Agent) runPlacementFeed(ctx context.Context, f *agentPlacementFeed) {
 	defer close(f.done)
 	backoff := feedBackoffMin
+	// Retries keep several attempts inside one age window, so a control plane
+	// that comes back is noticed within a quarter of the window rather than
+	// after a 30s backoff that would leave every route in flux meanwhile.
+	maxBackoff := feedBackoffMax
+	if f.maxStale > 0 {
+		maxBackoff = max(min(maxBackoff, f.maxStale/4), feedBackoffMin)
+	}
 	sleep := func() bool {
 		select {
 		case <-ctx.Done():
 			return false
 		case <-time.After(backoff):
 		}
-		backoff = min(backoff*2, feedBackoffMax)
+		backoff = min(backoff*2, maxBackoff)
 		return true
 	}
 	for ctx.Err() == nil {
@@ -97,7 +150,16 @@ func (a *Agent) runPlacementFeed(ctx context.Context, f *agentPlacementFeed) {
 			backoff = feedBackoffMin
 			continue
 		}
-		resp, err := a.pollPlacementChanges(ctx, cursor)
+		// While the rows are past the age limit, ask without parking: the
+		// first answer ends the in-flux period, and a parked poll would
+		// keep every route at 503 for up to one more wait.
+		var resp PlacementChangesResponse
+		var err error
+		if f.isStale() {
+			resp, err = a.fetchPlacementChanges(ctx, cursor, 0)
+		} else {
+			resp, err = a.pollPlacementChanges(ctx, cursor)
+		}
 		if err != nil {
 			if ctx.Err() != nil {
 				return
@@ -115,10 +177,20 @@ func (a *Agent) runPlacementFeed(ctx context.Context, f *agentPlacementFeed) {
 			f.mu.Unlock()
 			continue
 		}
-		if a.applyPlacementChanges(f, resp) {
+		f.transitionMu.Lock()
+		changed := a.applyPlacementChanges(f, resp)
+		if full, wasInFlux := f.markAnswered(); wasInFlux {
+			// Watchers hold the all-in-flux view: the deltas alone would
+			// leave every untouched row in flux, so they get the whole real
+			// view (which already includes these changes).
+			f.notifyWatchers(full, nil)
+			f.signal()
+			a.logger.Info("cluster agent: placement feed answered again; routing by the real view")
+		} else if changed {
 			f.notifyWatchers(nil, resp.Changes)
 			f.signal()
 		}
+		f.transitionMu.Unlock()
 	}
 }
 
@@ -135,6 +207,8 @@ func (a *Agent) resyncPlacementFeed(ctx context.Context, f *agentPlacementFeed) 
 	if err != nil {
 		return err
 	}
+	f.transitionMu.Lock()
+	defer f.transitionMu.Unlock()
 	f.mu.Lock()
 	next := make(map[string]Placement, len(walked))
 	for _, p := range walked {
@@ -145,6 +219,12 @@ func (a *Agent) resyncPlacementFeed(ctx context.Context, f *agentPlacementFeed) 
 	f.rows = next
 	f.cursor = v0
 	f.synced = true
+	f.lastAnswered = f.now()
+	if f.inFluxSent {
+		// The full view below replaces the all-in-flux one watchers hold.
+		f.inFluxSent = false
+		clusterPlacementFeedInFlux.Set(0)
+	}
 	full := make([]Placement, 0, len(next))
 	for _, p := range next {
 		full = append(full, p)
@@ -157,11 +237,16 @@ func (a *Agent) resyncPlacementFeed(ctx context.Context, f *agentPlacementFeed) 
 }
 
 // feedWait asks the server to park for a little less than this agent's own
-// HTTP client timeout, so a parked poll is never cut off client-side.
+// HTTP client timeout, so a parked poll is never cut off client-side, and for
+// at most a third of the age limit, so a healthy but quiet feed is answered
+// several times per window and never ages into in flux between two polls.
 func (a *Agent) feedWait() time.Duration {
 	wait := MaxPlacementChangesWait
 	if a.internalClient != nil && a.internalClient.Timeout > 0 {
 		wait = min(wait, a.internalClient.Timeout-2*time.Second)
+	}
+	if a.feed != nil && a.feed.maxStale > 0 {
+		wait = min(wait, a.feed.maxStale/3)
 	}
 	return max(wait, time.Second)
 }
@@ -215,6 +300,9 @@ func (a *Agent) applyPlacementChanges(f *agentPlacementFeed, resp PlacementChang
 
 // feedPlacements answers PlacementsForShards from the synced view: no
 // control-plane read at all. ok=false means "not synced, use the page walk".
+// Past the age limit every recreate-policy row comes back in flux
+// (staleViewPlacement); the page walk is not a way out, since its own cache
+// is older still.
 func (a *Agent) feedPlacements(filter PlacementShardFilter) ([]Placement, bool) {
 	if a == nil || a.feed == nil {
 		return nil, false
@@ -222,7 +310,8 @@ func (a *Agent) feedPlacements(filter PlacementShardFilter) ([]Placement, bool) 
 	f := a.feed
 	f.mu.RLock()
 	defer f.mu.RUnlock()
-	if !f.synced {
+	stale := f.staleLocked(f.now())
+	if !f.synced && !stale {
 		return nil, false
 	}
 	filter = filter.Normalize()
@@ -238,9 +327,126 @@ func (a *Agent) feedPlacements(filter PlacementShardFilter) ([]Placement, bool) 
 				continue
 			}
 		}
+		if stale {
+			p = staleViewPlacement(p)
+		}
 		out = append(out, p)
 	}
 	return clonePlacements(out), true
+}
+
+// inFluxPlacement is p with the owner's addresses blanked: what the two
+// ingress routers read as "owner unknown right now" and answer with 503 +
+// Retry-After. The owner id and the rest of the row stay, so the sandbox
+// reads as in flux, not as orphaned (410) or unknown (404).
+func inFluxPlacement(p Placement) Placement {
+	p.OwnerAPIURL = ""
+	p.OwnerDataPlaneHost = ""
+	return p
+}
+
+// staleViewPlacement is how a row goes out once the view is past the age
+// limit: in flux if the leader may have moved it (placementMovableOnFailover),
+// unchanged otherwise.
+func staleViewPlacement(p Placement) Placement {
+	if placementMovableOnFailover(p) {
+		return inFluxPlacement(p)
+	}
+	return p
+}
+
+func (f *agentPlacementFeed) now() time.Time {
+	if f.clock != nil {
+		return f.clock()
+	}
+	return time.Now()
+}
+
+// staleLocked reports whether the rows are past the age limit. A feed that
+// has never been answered holds no rows and is not stale: the page walk
+// serves it. A feed waiting to resync (after a resnapshot) still holds its
+// last rows and ages like any other, since the page-walk cache it would fall
+// back to is older still. The caller holds mu.
+func (f *agentPlacementFeed) staleLocked(now time.Time) bool {
+	return f.maxStale > 0 && !f.lastAnswered.IsZero() && now.Sub(f.lastAnswered) > f.maxStale
+}
+
+// isStale is staleLocked at the current time, under mu.
+func (f *agentPlacementFeed) isStale() bool {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	return f.staleLocked(f.now())
+}
+
+// markAnswered records an answered poll. When watchers were holding the
+// all-in-flux view it returns the real full view to send them instead. The
+// caller holds transitionMu.
+func (f *agentPlacementFeed) markAnswered() (full []Placement, wasInFlux bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.lastAnswered = f.now()
+	if !f.inFluxSent {
+		return nil, false
+	}
+	f.inFluxSent = false
+	clusterPlacementFeedInFlux.Set(0)
+	full = make([]Placement, 0, len(f.rows))
+	for _, p := range f.rows {
+		full = append(full, p)
+	}
+	return clonePlacements(full), true
+}
+
+// checkPlacementFeedAge hands watchers the stale view (recreate-policy rows in
+// flux) once the rows pass the age limit, and wakes the ingress reconciler so
+// it re-reads them too. It reports whether it made that transition.
+func (a *Agent) checkPlacementFeedAge(f *agentPlacementFeed) bool {
+	f.transitionMu.Lock()
+	defer f.transitionMu.Unlock()
+	f.mu.Lock()
+	now := f.now()
+	if f.inFluxSent || !f.staleLocked(now) {
+		f.mu.Unlock()
+		return false
+	}
+	f.inFluxSent = true
+	age := now.Sub(f.lastAnswered)
+	full := make([]Placement, 0, len(f.rows))
+	inFlux := 0
+	for _, p := range f.rows {
+		if placementMovableOnFailover(p) {
+			inFlux++
+		}
+		full = append(full, staleViewPlacement(p))
+	}
+	f.mu.Unlock()
+	clusterPlacementFeedInFlux.Set(1)
+	if a.logger != nil {
+		a.logger.Warn("cluster agent: placement feed has had no answer from the control plane past its age limit; failover.policy=recreate sandbox routes are in flux (503) until it answers",
+			"since_last_answer", age.Round(time.Millisecond), "age_limit", f.maxStale, "placements", len(full), "in_flux", inFlux)
+	}
+	f.notifyWatchers(clonePlacements(full), nil)
+	f.signal()
+	return true
+}
+
+// watchPlacementFeedAge runs checkPlacementFeedAge a few times per age
+// window. The poll loop cannot do it: it can sit inside one poll for longer
+// than the window.
+func (a *Agent) watchPlacementFeedAge(ctx context.Context, f *agentPlacementFeed) {
+	if f.maxStale <= 0 {
+		return
+	}
+	t := time.NewTicker(max(f.maxStale/10, 50*time.Millisecond))
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			a.checkPlacementFeedAge(f)
+		}
+	}
 }
 
 // subscribe registers a cap-1 wake channel, coalescing like the FSM's
@@ -306,9 +512,13 @@ func (a *Agent) WatchPlacementChanges(ctx context.Context, fn PlacementChangeHan
 	}
 	f.watchers[id] = fn
 	f.subMu.Unlock()
+	// Under transitionMu so a fresh or in-flux transition cannot deliver its
+	// view to fn before this older initial view does.
+	f.transitionMu.Lock()
 	if rows, ok := a.feedPlacements(PlacementShardFilter{}); ok {
 		fn(rows, nil)
 	}
+	f.transitionMu.Unlock()
 	go func() {
 		<-ctx.Done()
 		f.subMu.Lock()

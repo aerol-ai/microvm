@@ -42,6 +42,21 @@ func TestContainerAndFirecrackerDriversStartWithIdentity(t *testing.T) {
 	}
 }
 
+// The ownership fence freezes in place where the runtime can: the two
+// container engines. Firecracker, WASM and isolate cannot yet, and the fence
+// only refuses their sandboxes; this pins which is which.
+func TestFreezerOptIn(t *testing.T) {
+	var _ runtime.Freezer = (*docker.Client)(nil)
+	var _ runtime.Freezer = (*containerdruntime.Driver)(nil)
+	for name, rt := range map[string]runtime.Runtime{
+		"firecracker": (*firecracker.Driver)(nil), "wasm": (*wasmruntime.Driver)(nil),
+	} {
+		if _, ok := rt.(runtime.Freezer); ok {
+			t.Errorf("%s now implements Freezer: drop it from the fence's refuse-only list", name)
+		}
+	}
+}
+
 func TestContainerdDriverSatisfiesContainerRuntime(t *testing.T) {
 	var _ runtime.Runtime = (*containerdruntime.Driver)(nil)
 	var _ runtime.ContainerRuntime = (*containerdruntime.Driver)(nil)
