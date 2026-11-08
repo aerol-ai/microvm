@@ -1599,6 +1599,14 @@ type Config struct {
 	// the new token as SB_PAT_TOKEN, restart in turn, then remove it.
 	// SB_PAT_TOKEN_PREVIOUS (plans/identity-and-access.md §5.11).
 	PATTokenPrevious string
+	// PATTokenSHA256 holds the lowercase hex SHA-256 of the operator PAT,
+	// and during a rotation of the previous one too. A worker or ingress
+	// node that joined without the PAT holds these instead of it
+	// (pat_verifier.go): it accepts a bearer whose hash is listed as the
+	// PAT, and its own SB_PAT_TOKEN, which then does not match, works
+	// only for local tools on this node. SB_PAT_TOKEN_SHA256, comma
+	// separated.
+	PATTokenSHA256 []string
 	// PATScope is where the PAT is accepted: PATScopeAny (default, as
 	// before) or PATScopeHost (a loopback TCP peer on the API listener and
 	// mTLS cluster peers only). SB_PAT_SCOPE.
