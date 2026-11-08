@@ -34,10 +34,12 @@ import (
 var userCommandPID atomic.Int64
 
 // sandboxEnv is the sandbox env a Firecracker host pushes over vsock
-// (set_env). Empty on a container runtime, whose sandbox env is already in
-// os.Environ(). Every child toolboxd starts for the user takes its
-// environment from childEnviron, so the pushed env reaches exec, sessions,
-// terminals, SSH, envd and Daytona processes alike.
+// (set_env), or a containerd host sends in a warm-pool adopt frame
+// (applyAdoptFrame). Empty on a container created cold, whose sandbox env is
+// already in os.Environ(). Every child toolboxd starts for the user takes
+// its environment from childEnviron, so the pushed env reaches the held-back
+// image command, exec, sessions, terminals, SSH, envd and Daytona processes
+// alike.
 var sandboxEnv = &sandboxenv.Store{}
 
 // childEnviron is the environment a user-facing child starts from: toolboxd's
