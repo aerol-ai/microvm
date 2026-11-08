@@ -37,6 +37,13 @@ func (d *Driver) execSandbox(ctx context.Context, sandboxID string, req models.E
 	if wallTimeout <= 0 {
 		wallTimeout = d.cfg.DefaultWallTimeout
 	}
+	// An exec never listens. The zero WASIListenPort means "listen on an
+	// ephemeral port", so leaving it unset gave every exec on a per-sandbox
+	// worker a TCP listener fd. That extra fd sits where a module with an
+	// embedded file system (the standard Python) expects its own preopens,
+	// and Python then fails at start with "error evaluating path" (Not a
+	// directory). The resident host never adds listeners, which is why the
+	// same exec worked there and broke after a move to a per-sandbox worker.
 	caps := wasmengine.CapsFromResourceLimits(wasmengine.Capabilities{
 		Env:  env,
 		Args: args,
@@ -44,6 +51,7 @@ func (d *Driver) execSandbox(ctx context.Context, sandboxID string, req models.E
 			GuestPath: "/work",
 			HostPath:  inst.workDir,
 		}},
+		WASIListenPort: wasmengine.WASIListenPortDisabled,
 	}, inst.memoryMB, wallTimeout)
 	d.bindNetworkBlocks(sandboxID, &caps)
 
