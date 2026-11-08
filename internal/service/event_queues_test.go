@@ -126,13 +126,21 @@ type recordedEvents struct {
 	mu   sync.Mutex
 	seen map[string][]string
 	hold map[string]chan struct{}
+	// taken, when set for a sandbox, is closed once its held event reaches
+	// the handler, so a test can wait for the worker to hold it.
+	taken map[string]chan struct{}
 }
 
 func (r *recordedEvents) handle(_ context.Context, ev docker.DockerEvent) {
 	r.mu.Lock()
 	gate := r.hold[ev.SandboxID]
 	delete(r.hold, ev.SandboxID)
+	taken := r.taken[ev.SandboxID]
+	delete(r.taken, ev.SandboxID)
 	r.mu.Unlock()
+	if taken != nil {
+		close(taken)
+	}
 	if gate != nil {
 		<-gate
 	}
@@ -280,7 +288,9 @@ func TestFeedEventsNeverWaitsForOneFullSandbox(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	gate := make(chan struct{})
-	rec := &recordedEvents{seen: map[string][]string{}, hold: map[string]chan struct{}{"busy": gate}}
+	busyTaken := make(chan struct{})
+	rec := &recordedEvents{seen: map[string][]string{}, hold: map[string]chan struct{}{"busy": gate},
+		taken: map[string]chan struct{}{"busy": busyTaken}}
 	q := newSandboxEventQueues(ctx, 2, rec.handle)
 	events := make(chan docker.DockerEvent) // unbuffered: each send is taken by the loop
 	fed := make(chan struct{})
@@ -298,18 +308,21 @@ func TestFeedEventsNeverWaitsForOneFullSandbox(t *testing.T) {
 		}
 	}
 	// busy's first event holds its worker (the handler waits on gate);
-	// wait until the worker has taken it, so the queue holds only what
-	// comes after.
+	// wait until the handler has it, so the queue holds only what comes
+	// after. Polling pending("busy") for 0 raced: send returns when the loop
+	// receives the event, before it is queued, so 0 could mean "not queued
+	// yet" and the burst below then dropped start:0 as the oldest entry.
 	send(docker.DockerEvent{SandboxID: "busy", Action: "start", ExitCode: 0})
-	deadline := time.Now().Add(2 * time.Second)
-	for q.pending("busy") != 0 && time.Now().Before(deadline) {
-		time.Sleep(time.Millisecond)
+	select {
+	case <-busyTaken:
+	case <-time.After(2 * time.Second):
+		t.Fatal("busy's first event never reached its handler")
 	}
 	for i := 1; i < 10; i++ { // far past busy's limit of 2
 		send(docker.DockerEvent{SandboxID: "busy", Action: "start", ExitCode: i})
 	}
 	send(docker.DockerEvent{SandboxID: "other", Action: "die", ExitCode: 7})
-	deadline = time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(2 * time.Second)
 	for len(rec.of("other")) == 0 && time.Now().Before(deadline) {
 		time.Sleep(time.Millisecond)
 	}
