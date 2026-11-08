@@ -152,6 +152,12 @@ func Prepare(w http.ResponseWriter, r *http.Request, svc *service.Service, req m
 		}
 		sandboxID := strings.TrimSpace(r.Header.Get(HeaderID))
 		if sandboxID == "" {
+			// A create by the name of a snapshot this node holds, sent here
+			// by snapshotNameHome because the image is only here: serve it
+			// like a create sent here directly.
+			if held, err := svc.HoldsSnapshotNamed(r.Context(), req.Image); err == nil && held {
+				return Decision{}, true
+			}
 			writeMsg(w, http.StatusBadRequest, "cluster: forwarded create missing "+HeaderID)
 			return Decision{}, false
 		}
@@ -176,6 +182,11 @@ func Prepare(w http.ResponseWriter, r *http.Request, svc *service.Service, req m
 		w.Header().Set("Retry-After", strconv.Itoa(cluster.CapacityRetryAfterSeconds))
 		writeMsg(w, http.StatusServiceUnavailable, "cluster: snapshot home lookup: "+err.Error())
 		return Decision{}, false
+	}
+	if snapshotHome == "" {
+		// The same for a create by the name of a snapshot that is not in
+		// the registry yet: its image is only on its home.
+		snapshotHome = snapshotNameHome(r.Context(), svc, c, req)
 	}
 	if snapshotHome == "" {
 		if err := svc.NormalizeCreateImageDistribution(r.Context(), &req); err != nil {
@@ -486,6 +497,37 @@ func snapshotTagHome(ctx context.Context, svc *service.Service, c cluster.Client
 		return "", nil
 	}
 	return node, nil
+}
+
+// snapshotNameHome returns the node a create is sent to because its image
+// names a snapshot whose image exists only on that node: the snapshot's push
+// to the registry has not landed (pending, running or failing), or the
+// cluster does not push snapshots. This node would build the registry ref and
+// place the create anywhere, and the target would fail to pull a copy that is
+// not there (UC-459: the pull ran 170 ms before the push finished). The home
+// resolves the name through its own row, with the caller's token. Once the
+// push lands the home drops the key and creates by name spread again.
+//
+// "" keeps today's path: the image is not a bare name; this node holds a
+// snapshot of that name (it resolves the name itself); the caller named a
+// registry copy; no local-only key is registered (pushed, or made before the
+// key existed); the key names this node; or the read failed. Most bare names
+// are plain images, so a failed read must not fail their creates.
+func snapshotNameHome(ctx context.Context, svc *service.Service, c cluster.Client, req models.CreateSandboxRequest) string {
+	if service.ImageRequiresLocalPlacement(req) || !service.IsBareSnapshotName(req.Image) {
+		return ""
+	}
+	if dist := req.ImageDistribution(); dist.Mode == models.ImageDistributionAOCR && strings.TrimSpace(dist.RegistryRef) != "" {
+		return ""
+	}
+	if held, err := svc.HoldsSnapshotNamed(ctx, req.Image); err != nil || held {
+		return ""
+	}
+	node, ok, err := c.SnapshotHomeNode(ctx, cluster.SnapshotLocalOnlyKey(service.OwnerRefForCreate(ctx), strings.TrimSpace(req.Image)))
+	if err != nil || !ok || node == c.SelfNodeID() {
+		return ""
+	}
+	return node
 }
 
 // forwardReservedCreate forwards a create this router just reserved and, when
