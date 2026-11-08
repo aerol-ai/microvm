@@ -163,7 +163,7 @@ func runOwnerWatcher(t *testing.T, svc *Service, snapshot []cluster.Placement) {
 	for _, p := range snapshot {
 		_, err := svc.RecreateSandboxReport(context.Background(), p.SandboxID, *p.Spec, cluster.PlacementSecrets{
 			OwnerRef: p.OwnerRef, IncarnationID: p.IncarnationID,
-		}, cluster.ExposedPortRoutesForPlacement(p))
+		}, cluster.ExposedPortRoutesForPlacement(p), p.OwnerSinceUnixNano)
 		if err != nil {
 			t.Logf("owner watcher recreate %s: %v", p.SandboxID, err)
 		}
@@ -511,7 +511,7 @@ func TestFailoverRecreateStillOwned(t *testing.T) {
 			t.Fatal("an unreadable placement was taken as owned")
 		}
 		// The watcher counts it as a failed attempt and retries next tick.
-		attempted, err := svc.RecreateSandboxReport(ctx, id, models.CreateSandboxRequest{Image: "alpine:3.20"}, secrets, nil)
+		attempted, err := svc.RecreateSandboxReport(ctx, id, models.CreateSandboxRequest{Image: "alpine:3.20"}, secrets, nil, 0)
 		if err == nil || !attempted || rt.createCalls != 0 {
 			t.Fatalf("recreate with an unreadable placement = attempted %v, err %v, creates %d", attempted, err, rt.createCalls)
 		}
