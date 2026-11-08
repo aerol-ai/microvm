@@ -6,9 +6,11 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"testing"
 
 	"github.com/aerol-ai/microvm/internal/config"
+	"github.com/aerol-ai/microvm/pkg/controlplane"
 	"github.com/hashicorp/raft"
 )
 
@@ -163,5 +165,37 @@ func TestAgentOwnerOfCarriesTheEpoch(t *testing.T) {
 	owner, err := agent.OwnerOf("sb-epoch")
 	if err != nil || owner.Epoch != 77 || owner.IsSelf {
 		t.Fatalf("OwnerOf() = (%+v, %v), want worker-b at epoch 77", owner, err)
+	}
+}
+
+// The forward stamp carries the epoch only from the request context, and
+// clears a copy that came in with the request (a client cannot plant one).
+func TestStampForwardCarriesTheOwnerEpochFromContext(t *testing.T) {
+	in := httptest.NewRequest(http.MethodGet, "/v1/sandboxes/sb-1", nil)
+	if ctx := ContextWithOwnerEpoch(in.Context(), 0); ctx != in.Context() {
+		t.Fatal("epoch 0 must leave the context unchanged")
+	}
+
+	out := in.WithContext(ContextWithOwnerEpoch(in.Context(), 42))
+	StampForward(out, controlplane.Access{})
+	if got := out.Header.Get(HeaderOwnerEpoch); got != "42" {
+		t.Fatalf("stamped epoch %q, want 42", got)
+	}
+	if got := ForwardedOwnerEpoch(out.Header); got != 42 {
+		t.Fatalf("read back %d, want 42", got)
+	}
+
+	planted := httptest.NewRequest(http.MethodGet, "/v1/sandboxes/sb-1", nil)
+	planted.Header.Set(HeaderOwnerEpoch, "999")
+	StampForward(planted, controlplane.Access{})
+	if got := planted.Header.Get(HeaderOwnerEpoch); got != "" {
+		t.Fatalf("a header with no context epoch survived: %q", got)
+	}
+	for _, bad := range []string{"", "x", "-3", "18446744073709551616"} {
+		h := http.Header{}
+		h.Set(HeaderOwnerEpoch, bad)
+		if got := ForwardedOwnerEpoch(h); got != 0 {
+			t.Errorf("ForwardedOwnerEpoch(%q) = %d, want 0", bad, got)
+		}
 	}
 }
