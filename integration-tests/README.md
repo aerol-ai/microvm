@@ -98,6 +98,38 @@ Artifacts expire from the bucket after 7 days; presigned URLs default to 12h,
 which covers a slow `*.metal` provision. `reports/<scenario>.json` carries a
 `build` block naming the tree that produced its numbers.
 
+### When GitHub's downloads fail
+
+GitHub's release downloads once answered 504 for hours while its status page
+stayed green, and every run failed. The harness and `install.sh` now fall back
+to the public download mirror (`s3://aerolvm-downloads`, filled by
+`scripts/mirror-sync.sh`), which holds each release at `aerolvm/<tag>/<file>`
+and each pinned third-party file at `deps/<project>/<version>/<file>`.
+
+| Variable | Default | What it does |
+|---|---|---|
+| `AEROL_RELEASE_BASE` | `https://github.com/aerol-ai/microvm/releases` | The releases URL `--version` pins and the released Caddy are taken from. |
+| `AEROL_DOWNLOAD_MIRROR` | `https://aerolvm-downloads.s3.us-east-1.amazonaws.com` | The mirror. `""` or `off` turns it off. |
+| `AEROL_RELEASE_API` | GitHub's releases API for `aerol-ai/microvm` | Where `build.sh` asks which release carries the custom Caddy. For tests. |
+
+- **`--version <tag>`** probes the release's `checksums.txt` on GitHub, then on
+  the mirror, and pins every file to whichever answered.
+- **The released Caddy** (local builds without `--with-caddy`) is probed the
+  same way. When GitHub's API does not answer either, the mirror's
+  `aerolvm/latest.txt` names the release.
+- **The nodes' own downloads** go through `install.sh`'s fallback, which uses
+  the public mirror by default. To change that, set `AEROL_DOWNLOAD_MIRROR`
+  when you run the harness: in local-build mode `build.sh` then hands the nodes
+  a copy of the build's `install.sh` with that value as its default
+  (`install.mirror-<hash>.sh` beside it). The bootstrap runs `install.sh` under
+  `sudo`, so no variable would reach it, and the bootstrap template is not
+  touched. Unset, the nodes get the build's `install.sh` unchanged. A
+  `--version` or `--released` run uses that release's own `install.sh`.
+- **Not covered:** the Terraform bootstrap's own CNI and BuildKit steps
+  (containerd nodes, the default) and its Firecracker download still fetch
+  from GitHub. Those live in `bootstrap.sh.tftpl`, and changing it replaces
+  every node of a running cluster.
+
 ## Container engine
 
 **containerd is the default engine for every scenario.** `run.sh` writes

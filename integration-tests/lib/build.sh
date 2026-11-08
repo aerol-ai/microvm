@@ -648,6 +648,47 @@ presign() {
     --expires-in "$TTL_SECONDS"
 }
 
+# publish_mirror_install_script passes AEROL_DOWNLOAD_MIRROR to the nodes,
+# and prints the key of the install.sh they should download.
+#
+# The bootstrap runs `sudo /tmp/install.sh`, so no variable from here reaches
+# it, and changing Terraform/templates/bootstrap.sh.tftpl would replace every
+# node of a running production cluster (user_data_replace_on_change). The one
+# thing the harness already controls is which install.sh the nodes fetch, so
+# this uploads a copy of the build's install.sh whose default mirror is the
+# operator's value, beside the original. Its key carries the copy's hash, so
+# re-presigning the same build and value reuses it. Called only when
+# AEROL_DOWNLOAD_MIRROR is set; otherwise nodes get the build's install.sh
+# unchanged.
+publish_mirror_install_script() {
+  local bucket="$1" region="$2" prefix="$3"
+  local value="$AEROL_DOWNLOAD_MIRROR"
+  # The value lands inside a double-quoted bash string on the node, and in
+  # a sed replacement here: no quotes, $, backslash, & or |.
+  # (No empty alternative in the pattern: macOS's regex library rejects it.)
+  if [[ -n "$value" && "$value" != "off" && ! "$value" =~ ^https://[A-Za-z0-9.-]+(:[0-9]+)?(/[A-Za-z0-9._~/-]*)?$ ]]; then
+    die "AEROL_DOWNLOAD_MIRROR must be an https:// URL, \"off\" or empty (got ${value})"
+  fi
+  local tmp
+  tmp=$(mktemp -d)
+  "${AWSCLI[@]}" --region "$region" s3 cp "s3://${bucket}/${prefix}/install.sh" "${tmp}/install.sh" --only-show-errors >&2 ||
+    { rm -rf "$tmp"; die "cannot read s3://${bucket}/${prefix}/install.sh"; }
+  if [[ "$(grep -c '^DOWNLOAD_MIRROR_DEFAULT="[^"]*"$' "${tmp}/install.sh")" != 1 ]]; then
+    rm -rf "$tmp"
+    log "urls: this build's install.sh predates the download mirror; AEROL_DOWNLOAD_MIRROR does not reach the nodes"
+    printf '%s' "${prefix}/install.sh"
+    return
+  fi
+  sed "s|^DOWNLOAD_MIRROR_DEFAULT=\"[^\"]*\"\$|DOWNLOAD_MIRROR_DEFAULT=\"${value}\"|" "${tmp}/install.sh" >"${tmp}/mirror.sh"
+  local key
+  key="${prefix}/install.mirror-$(sha256_stdin <"${tmp}/mirror.sh" | cut -c1-12).sh"
+  "${AWSCLI[@]}" --region "$region" s3 cp "${tmp}/mirror.sh" "s3://${bucket}/${key}" --only-show-errors >&2 ||
+    { rm -rf "$tmp"; die "cannot upload s3://${bucket}/${key}"; }
+  rm -rf "$tmp"
+  log "urls: nodes get install.sh with AEROL_DOWNLOAD_MIRROR=${value:-<off>} (${key})"
+  printf '%s' "$key"
+}
+
 # emit_urls writes ready-to-chain tfvars to STDOUT (status goes to stderr), so
 # `build.sh urls > artifacts.tfvars` composes directly into run.sh's
 # -var-file chain.
@@ -691,7 +732,11 @@ emit_urls() {
   printf 'sandboxd_url            = "%s"\n' "$(presign "$bucket" "$region" "${prefix}/sandboxd_linux_${arch}")"
   printf 'toolboxd_url            = "%s"\n' "$(presign "$bucket" "$region" "${prefix}/toolboxd_linux_${arch}")"
   printf 'checksums_url           = "%s"\n' "$(presign "$bucket" "$region" "${prefix}/checksums.txt")"
-  printf 'install_script_url      = "%s"\n' "$(presign "$bucket" "$region" "${prefix}/install.sh")"
+  local install_key="${prefix}/install.sh"
+  if [[ -n "${AEROL_DOWNLOAD_MIRROR+set}" ]]; then
+    install_key=$(publish_mirror_install_script "$bucket" "$region" "$prefix")
+  fi
+  printf 'install_script_url      = "%s"\n' "$(presign "$bucket" "$region" "$install_key")"
   printf 'cluster_init_script_url = "%s"\n' "$(presign "$bucket" "$region" "${prefix}/cluster-init.sh")"
   printf 'cluster_join_script_url = "%s"\n' "$(presign "$bucket" "$region" "${prefix}/cluster-join.sh")"
   if (( have_sign_node )); then
@@ -721,15 +766,46 @@ emit_urls() {
 # installs sandboxd. The custom Caddy doesn't track sandboxd's version, so an
 # older release's binary is the right one. Falls back to releases/latest
 # when GitHub can't be asked.
+#
+# GitHub's release downloads can fail while its API answers (504s for hours
+# on 2026-11-08), so the chosen file is probed, and the download mirror's
+# copy (aerolvm/<tag>/caddy_linux_<arch>, filled by scripts/mirror-sync.sh)
+# is named instead when GitHub's does not answer. When the API itself is
+# down, the mirror's aerolvm/latest.txt names the release: mirror-sync.sh
+# only syncs a release whose files all checked out, so it carries Caddy.
+# AEROL_RELEASE_BASE replaces the GitHub releases URL; AEROL_DOWNLOAD_MIRROR
+# the mirror ("" or "off" turns it off).
 release_caddy_url() {
   local arch=$1 tag=""
-  tag=$(curl -fsSL "https://api.github.com/repos/aerol-ai/microvm/releases?per_page=30" 2>/dev/null |
-    jq -r --arg a "caddy_linux_${arch}" 'first(.[] | select((.draft | not) and (.prerelease | not) and any(.assets[]; .name == $a)) | .tag_name) // empty' 2>/dev/null) || tag=""
+  local base="${AEROL_RELEASE_BASE:-https://github.com/aerol-ai/microvm/releases}"
+  local mirror="${AEROL_DOWNLOAD_MIRROR-https://aerolvm-downloads.s3.us-east-1.amazonaws.com}"
+  local api="${AEROL_RELEASE_API:-https://api.github.com/repos/aerol-ai/microvm/releases?per_page=30}"
+  local file="caddy_linux_${arch}"
+  [[ "$mirror" == "off" ]] && mirror=""
+  mirror="${mirror%/}"
+  tag=$(curl -fsSL "$api" 2>/dev/null |
+    jq -r --arg a "$file" 'first(.[] | select((.draft | not) and (.prerelease | not) and any(.assets[]; .name == $a)) | .tag_name) // empty' 2>/dev/null) || tag=""
   if [[ -z "$tag" ]]; then
-    printf 'https://github.com/aerol-ai/microvm/releases/latest/download/caddy_linux_%s' "$arch"
+    if [[ -n "$mirror" ]]; then
+      tag=$(curl -fsS --max-time 20 "${mirror}/aerolvm/latest.txt" 2>/dev/null | tr -d '[:space:]') || tag=""
+      if [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]] &&
+        curl -fsIL -o /dev/null --max-time 20 "${mirror}/aerolvm/${tag}/${file}"; then
+        log "release_caddy_url: GitHub's API did not answer; using the mirror's ${tag}"
+        printf '%s/aerolvm/%s/%s' "$mirror" "$tag" "$file"
+        return
+      fi
+    fi
+    printf '%s/latest/download/%s' "$base" "$file"
     return
   fi
-  printf 'https://github.com/aerol-ai/microvm/releases/download/%s/caddy_linux_%s' "$tag" "$arch"
+  local primary="${base}/download/${tag}/${file}"
+  if [[ -n "$mirror" ]] && ! curl -fsIL -o /dev/null --max-time 20 "$primary" &&
+    curl -fsIL -o /dev/null --max-time 20 "${mirror}/aerolvm/${tag}/${file}"; then
+    log "release_caddy_url: ${primary} did not answer; using the mirror's copy"
+    printf '%s/aerolvm/%s/%s' "$mirror" "$tag" "$file"
+    return
+  fi
+  printf '%s' "$primary"
 }
 
 cmd_urls() {
