@@ -222,11 +222,21 @@ type JoinResponse struct {
 	Version        string           `json:"version"`
 	Replay         bool             `json:"replay,omitempty"`
 	DialBack       []DialBackResult `json:"dial_back,omitempty"`
-	// PATToken is the cluster's shared SB_PAT_TOKEN. Peers prove they are
-	// nodes with it on every internal call (pkg/api/auth.go), so a node with
-	// another PAT is refused everywhere; an operator used to copy it by hand
-	// with the other join secrets (C1). Replacing it is out of scope (§12).
+	// PATToken is the operator PAT (SB_PAT_TOKEN). A server gets it: it
+	// already gets the CA key, and the operator's tools on it use the PAT.
+	// A worker or ingress node gets it only from a cluster where some
+	// member still needs it on peer calls (PATFreeJoin); otherwise it gets
+	// PATSHA256 instead, so a leaked worker or ingress token never yields
+	// an admin credential that also works from outside.
 	PATToken string `json:"pat_token,omitempty"`
+	// PATSHA256 lists the hex SHA-256 of each operator PAT the cluster
+	// accepts, current first, for a node joined without the PAT: it checks
+	// the PAT operators send it against these (SB_PAT_TOKEN_SHA256).
+	PATSHA256 []string `json:"pat_sha256,omitempty"`
+	// OperatorVolumeScope is the cluster's operator volume scope, sent with
+	// PATSHA256: the scope is a hash of the PAT unless pinned, and a node
+	// without the PAT must still put operator volumes where the others do.
+	OperatorVolumeScope string `json:"operator_volume_scope,omitempty"`
 }
 
 // DialBackResult is one port the join server dialled on the caller.
@@ -950,12 +960,13 @@ func (c *Cluster) Join(ctx context.Context, req JoinRequest, source netip.Addr) 
 		NodeCert: string(certPEM), CACert: string(signer.CertPEM()),
 		GossipKey: c.cfg.ClusterGossipSecretKey, BootstrapPeers: c.bootstrapPeers(), JoinURLs: c.joinURLs(),
 		Credentials: c.credentialBundle(), NotAfter: leaf.NotAfter.UTC(), Version: c.joinVersion(),
-		Replay: admitted.Replay, DialBack: results, PATToken: c.patToken,
+		Replay: admitted.Replay, DialBack: results,
 	}
 	// The CA key goes to servers only (D5), by the token's role.
 	if admitted.Node.IsServer() {
 		out.CAKey = string(signer.KeyPEM())
 	}
+	c.addJoinPAT(&out, admitted.Node.IsServer())
 	if c.logger != nil {
 		c.logger.Info("cluster: node joined", "node_id", nodeID, "role", out.Role, "token_id", tok.ID,
 			"source", source.String(), "replay", admitted.Replay, "replaced_deny", admitted.ReplacedDeny)

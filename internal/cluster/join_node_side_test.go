@@ -7,14 +7,13 @@ import (
 	"testing"
 	"time"
 
-	"github.com/aerol-ai/microvm/internal/config"
 	"github.com/aerol-ai/microvm/internal/version"
 )
 
 // What the node side of a join (sandboxd init, join and preflight, Phase
 // 2b) needs from the join service: a token the caller made registered as
-// is and safely again, the cluster PAT in the join answer, and preflight's
-// node ID check.
+// is and safely again, and preflight's node ID check. What the answer
+// says about the PAT is in peer_cert_auth_test.go.
 
 func TestCreateJoinTokenRegistersAGivenToken(t *testing.T) {
 	if testing.Short() {
@@ -75,31 +74,6 @@ func TestCreateJoinTokenRegistersAGivenToken(t *testing.T) {
 	info, err := leader.ClusterInfo(id)
 	if err != nil || !VerifyClusterInfo(given, info) {
 		t.Fatalf("cluster-info for a given token = %+v %v", info, err)
-	}
-}
-
-func TestJoinAnswerCarriesTheClusterPAT(t *testing.T) {
-	if testing.Short() {
-		t.Skip("starts a raft node")
-	}
-	leader, cleanup := newJoinTestCluster(t, "pat-seed", true, nil, joinClusterOpts{caDir: writeSharedCAStore(t), mutate: func(c *config.Config) {
-		c.PATToken = "cluster-pat"
-	}})
-	defer cleanup()
-	waitForLeader(t, leader, 10*time.Second)
-	ctx := context.Background()
-	created, err := leader.CreateJoinToken(ctx, JoinTokenCreateRequest{Role: JoinRoleWorker})
-	if err != nil {
-		t.Fatal(err)
-	}
-	ports := dialBackListeners(t, 2)
-	_, csr := newCSR(t, "pat-wkr")
-	resp, err := leader.Join(ctx, JoinRequest{
-		Token: created.Token, NodeID: "pat-wkr", CSR: csr, Version: version.Version,
-		Ports: &JoinPorts{Gossip: ports[0], Internal: ports[1]},
-	}, netip.MustParseAddr("127.0.0.1"))
-	if err != nil || resp.PATToken != "cluster-pat" || resp.CAKey != "" {
-		t.Fatalf("join = pat %q ca key %t, %v", resp.PATToken, resp.CAKey != "", err)
 	}
 }
 
