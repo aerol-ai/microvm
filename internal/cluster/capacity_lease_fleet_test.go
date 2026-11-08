@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/config"
@@ -31,6 +32,12 @@ import (
 // not the scheduler. Real-socket throughput at fleet scale is an environment
 // property and belongs in a representative-environment run; the single-peer
 // tests in capacity_lease_additional_test.go still exercise the real TLS path.
+//
+// Each test runs in a synctest bubble, so the clock moves only when every
+// goroutine is waiting: a sweep's budget is spent on the scripted latencies
+// and nothing else. That is the scheduling property with the machine taken
+// out entirely, so the tests also hold under -race, and two TTL windows at
+// the real cadence take well under a second instead of 30 s each.
 
 // scriptedPeerTransport answers /v1/capacity for every peer. Latency is chosen
 // per peer by host prefix: "fast-" answers at once, "slow-" after slow,
@@ -112,6 +119,10 @@ func (f *scriptedFleet) add(prefix string, n int, leased, classifiedSlow bool) [
 		ids = append(ids, id)
 	}
 	f.ids = append(f.ids, ids...)
+	// In the bubble the clock stands still until something waits, so without
+	// this a seeded lease would carry the same instant as a `since` taken
+	// right after, and refreshedSince would count it as renewed.
+	time.Sleep(time.Millisecond)
 	return ids
 }
 
@@ -148,12 +159,6 @@ func (f *scriptedFleet) refreshedSince(ids []string, since time.Time) (stale int
 // healthy lease expires at any sample point between sweeps, or is not
 // refreshed within a window.
 func (f *scriptedFleet) runWindows(t *testing.T, healthy []string, windows int) {
-	if raceEnabled {
-		// The race detector slows the sweeps enough that a healthy lease can
-		// outlive the TTL between samples, which is a timing artefact, not a
-		// bug. The go-tests job runs these at the real cadence without -race.
-		t.Skip("real-cadence TTL windows don't hold under -race")
-	}
 	t.Helper()
 	ttl := f.c.capacityLeases.ttl
 	sweepsPerWindow := int(ttl / f.c.capacityLeaseSweepBudget())
@@ -176,83 +181,79 @@ func (f *scriptedFleet) runWindows(t *testing.T, healthy []string, windows int) 
 // path — 1.9s, inside the 2s per-request timeout — keep every lease alive over
 // multiple TTL windows at the real cadence. This is the reviewer's shape.
 func TestCapacityKeepsTheSupportedFleetFreshAcrossTTLWindows(t *testing.T) {
-	if testing.Short() {
-		t.Skip("runs two TTL windows at the real cadence")
-	}
-	// Each builds its own Cluster and transport and mostly waits on
-	// scripted slow peers, so the two 30 s cadence tests share the wall clock.
-	t.Parallel()
-	f := newScriptedFleet(1900 * time.Millisecond)
-	healthy := f.add("slow", 2000, true, true)
-	f.runWindows(t, healthy, 2)
+	synctest.Test(t, func(t *testing.T) {
+		f := newScriptedFleet(1900 * time.Millisecond)
+		healthy := f.add("slow", 2000, true, true)
+		f.runWindows(t, healthy, 2)
+	})
 }
 
 // The same fleet with ONE newcomer that never answers. First contact must not
 // take time from renewals: a slow peer needs one slot for two seconds, not two
 // seconds of the whole pool.
 func TestCapacityKeepsTheFleetFreshWithANewcomerPending(t *testing.T) {
-	if testing.Short() {
-		t.Skip("runs two TTL windows at the real cadence")
-	}
-	// Each builds its own Cluster and transport and mostly waits on
-	// scripted slow peers, so the two 30 s cadence tests share the wall clock.
-	t.Parallel()
-	f := newScriptedFleet(1900 * time.Millisecond)
-	healthy := f.add("slow", 1999, true, true)
-	f.add("hole", 1, false, false)
-	f.runWindows(t, healthy, 2)
-	// And the newcomer really was tried, and is now paced rather than
-	// holding a slot every sweep.
-	if f.c.capacityLeases.due("hole-0000", time.Now()) {
-		t.Fatal("a newcomer that never answers was not backed off after repeated failures")
-	}
+	synctest.Test(t, func(t *testing.T) {
+		f := newScriptedFleet(1900 * time.Millisecond)
+		healthy := f.add("slow", 1999, true, true)
+		f.add("hole", 1, false, false)
+		f.runWindows(t, healthy, 2)
+		// And the newcomer really was tried, and is now paced rather than
+		// holding a slot every sweep.
+		if f.c.capacityLeases.due("hole-0000", time.Now()) {
+			t.Fatal("a newcomer that never answers was not backed off after repeated failures")
+		}
+	})
 }
 
 // Peers that answer at once must be renewed however many others are slow:
 // 1,296 slow and 704 instant, all renewals, before anything is classified.
 func TestCapacityRenewsInstantRespondersBehindASlowFleet(t *testing.T) {
-	f := newScriptedFleet(1200 * time.Millisecond)
-	f.add("slow", 1296, true, false)
-	fast := f.add("fast", 704, true, false)
-	start := time.Now()
-	f.c.refreshCapacityLeases(context.Background())
-	if stale := f.refreshedSince(fast, start); stale > 0 {
-		t.Fatalf("%d of %d instant responders were not renewed in a sweep spent on slow peers", stale, len(fast))
-	}
-	// The slow class is classified and routed straight to the full request,
-	// and is not starved to achieve the above.
-	start = time.Now()
-	f.c.refreshCapacityLeases(context.Background())
-	var slowRefreshed int
-	for _, id := range f.ids {
-		if strings.HasPrefix(id, "slow-") && f.refreshedSince([]string{id}, start) == 0 {
-			slowRefreshed++
+	synctest.Test(t, func(t *testing.T) {
+		f := newScriptedFleet(1200 * time.Millisecond)
+		f.add("slow", 1296, true, false)
+		fast := f.add("fast", 704, true, false)
+		start := time.Now()
+		f.c.refreshCapacityLeases(context.Background())
+		if stale := f.refreshedSince(fast, start); stale > 0 {
+			t.Fatalf("%d of %d instant responders were not renewed in a sweep spent on slow peers", stale, len(fast))
 		}
-	}
-	if slowRefreshed == 0 {
-		t.Fatal("no slow-but-healthy peer was refreshed once classified")
-	}
-	if stale := f.refreshedSince(fast, start); stale > 0 {
-		t.Fatalf("%d instant responders missed the second sweep", stale)
-	}
+		// The slow class is classified and routed straight to the full
+		// request, and is not starved to achieve the above.
+		start = time.Now()
+		f.c.refreshCapacityLeases(context.Background())
+		var slowRefreshed int
+		for _, id := range f.ids {
+			if strings.HasPrefix(id, "slow-") && f.refreshedSince([]string{id}, start) == 0 {
+				slowRefreshed++
+			}
+		}
+		if slowRefreshed == 0 {
+			t.Fatal("no slow-but-healthy peer was refreshed once classified")
+		}
+		if stale := f.refreshedSince(fast, start); stale > 0 {
+			t.Fatalf("%d instant responders missed the second sweep", stale)
+		}
+	})
 }
 
 // A fleet that is uniformly slow-but-healthy must be DISCOVERED: first contact
 // reserves time for the pass that can answer, and a peer measured slower than
 // the probe skips it from then on.
 func TestCapacityDiscoversASlowButHealthyFleet(t *testing.T) {
-	f := newScriptedFleet(400 * time.Millisecond)
-	peers := f.add("slow", 2000, false, false)
-	for range 2 {
+	synctest.Test(t, func(t *testing.T) {
+		f := newScriptedFleet(400 * time.Millisecond)
+		peers := f.add("slow", 2000, false, false)
+		for range 2 {
+			f.c.refreshCapacityLeases(context.Background())
+		}
+		if missing, _ := f.leaseAges(peers); missing > 0 {
+			t.Fatalf("%d of %d slow-but-healthy peers were never discovered in two sweeps", missing, len(peers))
+		}
+		// And once discovered they stay renewed.
+		start := time.Now()
 		f.c.refreshCapacityLeases(context.Background())
-	}
-	if missing, _ := f.leaseAges(peers); missing > 0 {
-		t.Fatalf("%d of %d slow-but-healthy peers were never discovered in two sweeps", missing, len(peers))
-	}
-	// And once discovered they stay renewed.
-	start := time.Now()
-	f.c.refreshCapacityLeases(context.Background())
-	if stale := f.refreshedSince(peers, start); stale > 0 {
-		t.Fatalf("%d discovered peers were not renewed on the next sweep", stale)
-	}
+		if stale := f.refreshedSince(peers, start); stale > 0 {
+			t.Fatalf("%d discovered peers were not renewed on the next sweep", stale)
+		}
+	})
 }
