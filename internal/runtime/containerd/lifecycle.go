@@ -412,7 +412,7 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 // pool's env, so its toolboxd would boot parked and serve nothing; the
 // service starts every containerd sandbox through StartWithIdentity.
 func (d *Driver) Start(ctx context.Context, containerRef string) (*models.SandboxRuntimeState, error) {
-	return d.startTask(ctx, containerRef, "", "")
+	return d.startTask(ctx, containerRef, "", "", nil)
 }
 
 // StartWithIdentity implements runtime.IdentityStarter. A container adopted
@@ -424,13 +424,27 @@ func (d *Driver) Start(ctx context.Context, containerRef string) (*models.Sandbo
 // adopted again. This listens on the slot's socket before the task starts,
 // takes the parked hello and adopts it with the sandbox's own ID and token,
 // exactly as the create did. Any other container starts as Start does.
+// A container adopted with env can't be started this way: it needs
+// StartWithIdentityEnv, which re-sends the env.
 func (d *Driver) StartWithIdentity(ctx context.Context, containerRef, sandboxID, toolboxToken string) (*models.SandboxRuntimeState, error) {
-	return d.startTask(ctx, containerRef, sandboxID, toolboxToken)
+	return d.startTask(ctx, containerRef, sandboxID, toolboxToken, nil)
+}
+
+// StartWithIdentityEnv implements runtime.EnvIdentityStarter: StartWithIdentity
+// for a pool container whose create carried env. That env reached the
+// toolbox in the adopt frame and is in no spec, so the re-adopt must carry
+// it again, as a cold container's start re-reads its env from its spec.
+// loadEnv is called only for a container adopted with env (adoptEnvLabelKey),
+// and before the task is created, so a start that cannot have the env
+// starts nothing.
+func (d *Driver) StartWithIdentityEnv(ctx context.Context, containerRef, sandboxID, toolboxToken string, loadEnv sbruntime.AdoptEnvLoader) (*models.SandboxRuntimeState, error) {
+	return d.startTask(ctx, containerRef, sandboxID, toolboxToken, loadEnv)
 }
 
 // readoptParkedFn waits for a restarted pool container's parked hello and
-// adopts it. Tests stub it to drive the handshake without a guest toolbox.
-var readoptParkedFn = func(ctx context.Context, pl *dockerpkg.ParkedListener, sandboxID, toolboxToken string) error {
+// adopts it with env. Tests stub it to drive the handshake without a guest
+// toolbox.
+var readoptParkedFn = func(ctx context.Context, pl *dockerpkg.ParkedListener, sandboxID, toolboxToken string, env map[string]string) error {
 	if err := pl.WaitParked(ctx); err != nil {
 		return err
 	}
@@ -438,10 +452,36 @@ var readoptParkedFn = func(ctx context.Context, pl *dockerpkg.ParkedListener, sa
 	if err != nil {
 		return err
 	}
-	return pl.Adopt(ctx, sandboxID, toolboxToken, nonce)
+	return pl.AdoptWithEnv(ctx, sandboxID, toolboxToken, nonce, env)
 }
 
-func (d *Driver) startTask(ctx context.Context, containerRef, sandboxID, toolboxToken string) (*models.SandboxRuntimeState, error) {
+// readoptEnv is the env a start re-adopts a pool container with: none for
+// one adopted without env, else loadEnv's answer from the sealed row. A
+// container adopted with env whose start has no loader, or whose env loads
+// empty, is refused: starting it would serve the sandbox without its env.
+// No error here quotes the env.
+func readoptEnv(ctx context.Context, container cntr.Container, loadEnv sbruntime.AdoptEnvLoader) (map[string]string, error) {
+	labels, err := container.Labels(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("load container labels: %w", err)
+	}
+	if labels[adoptEnvLabelKey] != adoptEnvLabelValue {
+		return nil, nil
+	}
+	if loadEnv == nil {
+		return nil, errors.New("warm-pool container was adopted with env: a start needs the sandbox's env to adopt it again")
+	}
+	env, err := loadEnv(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("load the sandbox env to adopt it again: %w", err)
+	}
+	if len(env) == 0 {
+		return nil, errors.New("warm-pool container was adopted with env, but the sandbox's env loaded empty")
+	}
+	return env, nil
+}
+
+func (d *Driver) startTask(ctx context.Context, containerRef, sandboxID, toolboxToken string, loadEnv sbruntime.AdoptEnvLoader) (*models.SandboxRuntimeState, error) {
 	client, err := d.ensureClient()
 	if err != nil {
 		return nil, err
@@ -475,8 +515,12 @@ func (d *Driver) startTask(ctx context.Context, containerRef, sandboxID, toolbox
 	if err != nil {
 		return nil, err
 	}
+	var adoptEnv map[string]string
 	if parked != nil {
 		defer func() { _ = parked.Close() }()
+		if adoptEnv, err = readoptEnv(ctx, container, loadEnv); err != nil {
+			return nil, err
+		}
 	}
 	logPath, err := d.taskLogPath(containerRef)
 	if err != nil {
@@ -522,7 +566,7 @@ func (d *Driver) startTask(ctx context.Context, containerRef, sandboxID, toolbox
 	}
 	if parked != nil {
 		waitCtx, cancel := context.WithTimeout(ctx, d.cfg.ToolboxWaitTimeout)
-		err := readoptParkedFn(waitCtx, parked, sandboxID, toolboxToken)
+		err := readoptParkedFn(waitCtx, parked, sandboxID, toolboxToken, adoptEnv)
 		cancel()
 		if err != nil {
 			// A container that was not adopted serves nothing: don't leave it

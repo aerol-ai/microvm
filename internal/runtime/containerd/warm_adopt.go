@@ -14,21 +14,33 @@ import (
 	"github.com/aerol-ai/microvm/internal/pool/containerdpool"
 	"github.com/aerol-ai/microvm/pkg/createtiming"
 	dockerpkg "github.com/aerol-ai/microvm/pkg/docker"
+	"github.com/aerol-ai/microvm/pkg/gvisorpids"
 	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/aerol-ai/microvm/pkg/mounts"
+	"github.com/aerol-ai/microvm/pkg/readyproto"
 )
 
 const (
 	poolParkLabelKey   = "aerol.pool"
 	poolParkLabelValue = "park"
+	// adoptEnvLabelKey marks a container adopted from the warm pool with a
+	// non-empty env. That env went to the toolbox in the adopt frame and
+	// lives only in its memory: the spec a start re-creates the task from
+	// never had it. So every start must send it again, and a start that
+	// cannot (no loader, or a sealed row that comes back empty) refuses
+	// rather than bring the sandbox back without its env. The value is
+	// always "1", never anything derived from the env.
+	adoptEnvLabelKey   = "aerolvm.adopt_env"
+	adoptEnvLabelValue = "1"
 )
 
-// poolEligible mirrors docker's warm-pool gate: only default-shaped creates can
-// adopt a parked slot without post-create mutation.
+// poolEligible is docker's warm-pool gate (pkg/docker/docker_pool.go) minus
+// env: a parked slot can be adopted only by a create it serves unchanged.
+// Env can ride the adopt frame on this engine (adoptEnvEligible) because
+// every way into a containerd sandbox runs through toolboxd's children,
+// SSH included (a toolbox session); docker keeps env off its pool because
+// its SSH exec path is `docker exec`, which reads the engine's env.
 func poolEligible(req models.CreateSandboxRequest, hostMounts []mounts.ContainerBind) bool {
-	if len(req.Env) > 0 {
-		return false
-	}
 	if len(req.Mounts) > 0 || len(req.PlatformVolumes) > 0 || len(hostMounts) > 0 {
 		return false
 	}
@@ -49,7 +61,61 @@ func poolEligible(req models.CreateSandboxRequest, hostMounts []mounts.Container
 	if req.GPUs != nil {
 		return false
 	}
-	return req.Image != ""
+	// Env last: it is the one check that encodes (ValidateAdoptEnv), and
+	// only a create that passes everything else gets that far.
+	return req.Image != "" && adoptEnvEligible(req.Env)
+}
+
+// adoptEnvEligible reports whether env can reach a parked container in its
+// adopt frame and mean what it means on a cold create. The frame puts env
+// in toolboxd's store for its children; a cold create puts it in toolboxd's
+// own environment too. So a key toolboxd reads for itself at boot would be
+// honoured cold and ignored warm, and keeps the create cold: SB_* (its
+// settings, the gVisor task cap among them), AEROLVM_EGRESS_CA* (the
+// inspect CA bundle it writes at boot), and USER and LOGNAME (the envd user
+// check). An env the frame cannot carry (ValidateAdoptEnv: a bad entry, or
+// over readyproto.MaxAdoptEnvBytes encoded) goes cold too, before a slot is
+// spent on it. Env with mounts or binds (egress inspect rules) is already
+// off the pool through hostMounts.
+func adoptEnvEligible(env map[string]string) bool {
+	if len(env) == 0 {
+		return true
+	}
+	for k := range env {
+		if adoptEnvReservedKey(k) {
+			return false
+		}
+	}
+	return readyproto.ValidateAdoptEnv(env) == nil
+}
+
+func adoptEnvReservedKey(k string) bool {
+	return strings.HasPrefix(k, "SB_") || k == gvisorpids.EnvVar ||
+		strings.HasPrefix(k, "AEROLVM_EGRESS_CA") || k == "USER" || k == "LOGNAME"
+}
+
+// envAdopter is a parked slot's handle that can carry the sandbox's env in
+// its adopt frame (dockerpkg.ParkedListener).
+type envAdopter interface {
+	AdoptWithEnv(ctx context.Context, sandboxID, token, adoptNonce string, env map[string]string) error
+}
+
+// adoptHandle adopts over h with env, refusing a handle that cannot carry a
+// non-empty env rather than adopting without it.
+func adoptHandle(ctx context.Context, h any, sandboxID, token, nonce string, env map[string]string) error {
+	if ea, ok := h.(envAdopter); ok {
+		return ea.AdoptWithEnv(ctx, sandboxID, token, nonce, env)
+	}
+	if len(env) > 0 {
+		return errors.New("parked slot handle cannot carry the sandbox env")
+	}
+	a, ok := h.(interface {
+		Adopt(context.Context, string, string, string) error
+	})
+	if !ok {
+		return errors.New("parked slot handle type mismatch")
+	}
+	return a.Adopt(ctx, sandboxID, token, nonce)
 }
 
 func (d *Driver) tryWarmAdopt(ctx context.Context, req models.CreateSandboxRequest, sandboxID, toolboxToken string, hostMounts []mounts.ContainerBind, effectiveRuntime string) (*models.SandboxRuntimeState, error) {
@@ -123,12 +189,6 @@ func (d *Driver) adoptParked(ctx context.Context, req models.CreateSandboxReques
 	if slot == nil || slot.Handle == nil {
 		return nil, errors.New("parked slot is incomplete")
 	}
-	pl, ok := slot.Handle.(interface {
-		Adopt(context.Context, string, string, string) error
-	})
-	if !ok {
-		return nil, errors.New("parked slot handle type mismatch")
-	}
 	client, err := d.ensureClient()
 	if err != nil {
 		return nil, err
@@ -155,7 +215,11 @@ func (d *Driver) adoptParked(ctx context.Context, req models.CreateSandboxReques
 	}
 	adoptCtx, cancel := context.WithTimeout(ctx, adoptReadyTimeout)
 	defer cancel()
-	if err := pl.Adopt(adoptCtx, sandboxID, toolboxToken, adoptNonce); err != nil {
+	// The env rides the frame, not the spec or the labels: the spec stays
+	// the pool's, so `ctr containers info`, a commit or a snapshot of this
+	// container holds none of it. A missing or wrong env digest in the ack
+	// fails here, and tryWarmAdopt destroys the slot and goes cold.
+	if err := adoptHandle(adoptCtx, slot.Handle, sandboxID, toolboxToken, adoptNonce, req.Env); err != nil {
 		return nil, err
 	}
 	// The park's listener has done its one job: the toolbox holds the
@@ -167,6 +231,9 @@ func (d *Driver) adoptParked(ctx context.Context, req models.CreateSandboxReques
 
 	delete(labels, poolParkLabelKey)
 	labels[sandboxIDLabelKey] = sandboxID
+	if len(req.Env) > 0 {
+		labels[adoptEnvLabelKey] = adoptEnvLabelValue
+	}
 	if ip := strings.TrimSpace(slot.ContainerIP); ip != "" {
 		labels[containerIPLabelKey] = ip
 	}
