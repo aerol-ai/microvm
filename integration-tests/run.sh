@@ -1036,8 +1036,6 @@ prepare_artifacts() {
   # a caps file's go_tags (cluster-chaos: itest_failpoints, for UC-480), and
   # only on the local build below: --released and --version install release
   # binaries, which never carry a tag, and a case that needs one skips there.
-  local go_tags
-  go_tags=$(go_tags_for "${HERE}/scenarios/${scenario}.caps.yml")
 
   case "$BUILD_MODE" in
     released)
@@ -1104,6 +1102,8 @@ EOF
   # `run.sh all` runs scenarios one after another in this shell, and a tag
   # exported for cluster-chaos would build every later scenario's sandboxd
   # with a failpoint in it.
+  local go_tags
+  go_tags=$(go_tags_for "${HERE}/scenarios/${scenario}.caps.yml")
   if [[ -n "$go_tags" ]]; then
     echo "=== artifacts: sandboxd built with -tags ${go_tags} (test-only; the build id says so) ==="
   fi
