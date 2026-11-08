@@ -5,7 +5,7 @@ import "github.com/aerol-ai/microvm/pkg/volumes"
 // What a join answer says about the operator PAT
 // (plans/kubectl-style-cluster-ops.md §8, peer_cert_auth.go).
 //
-//	joiner's role       every live member at fv 14     an older member is live
+//	joiner's role       every live member at fv 15     an older member is live
 //	server              pat_token                      pat_token
 //	worker, ingress     pat_sha256 + volume scope      pat_token (as before)
 //
