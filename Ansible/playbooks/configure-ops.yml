@@ -148,6 +148,17 @@
       SB_CONTAINERD_NAMESPACE: "{{ containerd.namespace | default('aerolvm') }}"
       SB_CONTAINERD_CNI_PLUGIN_DIR: "{{ containerd.cni_plugin_dir | default('/opt/cni/bin') }}"
       SB_CONTAINERD_NATIVE_NETNS_POOL_ENABLED: "{{ containerd.native_netns_pool_enabled | default(true) | bool | string | lower }}"
+      # containerd warm container pool (park + adopt). Off by default; defaults
+      # mirror config.go and Terraform's containerd_pool_cfg so day-0 and day-2
+      # render identically. On a cluster node this lands in cluster.env, which
+      # loads after sandboxd.env, so a value hand-set in sandboxd.env no longer
+      # wins: turn the pool on in config/cluster.yml.
+      SB_CONTAINERD_POOL_ENABLED: "{{ containerd.pool.enabled | default(false) | bool | string | lower }}"
+      SB_CONTAINERD_POOL_DEPTH: "{{ containerd.pool.depth | default(2) | int }}"
+      SB_CONTAINERD_POOL_IMAGES: "{{ containerd.pool.images | default([]) | join(',') }}"
+      SB_CONTAINERD_POOL_MAX_IMAGES: "{{ containerd.pool.max_images | default(8) | int }}"
+      SB_CONTAINERD_POOL_IDLE_TTL: "{{ containerd.pool.idle_ttl | default('15m') }}"
+      SB_CONTAINERD_POOL_REFILL_INTERVAL: "{{ containerd.pool.refill_interval | default('5s') }}"
 
     # S3 Object Lock audit witness (plans/open-audit-witness.md). Kept out of
     # sandboxd_ops_env because it is written only when

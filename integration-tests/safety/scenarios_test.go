@@ -257,7 +257,10 @@ func TestWitnessScenariosUseADeletableS3Witness(t *testing.T) {
 // and the failure looks like a product bug. All five new security scenarios
 // were written without it and this test is why that was caught.
 func TestClusterScenariosDeclareExpectedMembers(t *testing.T) {
-	nodeRe := regexp.MustCompile(`(?m)^\s{2,}([A-Za-z0-9][A-Za-z0-9._-]*)\s*=\s*\{`)
+	// Exactly two spaces: a node entry sits at terraform fmt's first indent
+	// level, while a multi-line map inside a node (a per-node sandboxd_env)
+	// sits at four and must not count as another node.
+	nodeRe := regexp.MustCompile(`(?m)^ {2}([A-Za-z0-9][A-Za-z0-9._-]*)\s*=\s*\{`)
 	memberRe := regexp.MustCompile(`(?m)^expected_members:\s*(\d+)`)
 
 	for _, f := range capsFiles(t) {

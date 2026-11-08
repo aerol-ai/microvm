@@ -80,7 +80,7 @@ func TestBootstrapTemplateRenders(t *testing.T) {
 	for _, branch := range []string{
 		"seed", "joiner", "joiner_kms", "joiner_audit_s3", "joiner_audit_file",
 		"seed_receiver", "joiner_receiver", "seed_public_ca", "seed_wrapped",
-		"joiner_api_lb", "joiner_api_lb_worker",
+		"joiner_api_lb", "joiner_api_lb_worker", "joiner_containerd_pool",
 	} {
 		t.Run(branch, func(t *testing.T) {
 			out, err := run("output", "-raw", branch)
@@ -425,6 +425,43 @@ func TestBootstrapKMSBlockPrecedesEnvOverride(t *testing.T) {
 	restartIdx := strings.LastIndex(out, "\nsudo systemctl restart sandboxd\n")
 	if restartIdx < 0 || override > restartIdx {
 		t.Fatalf("secret env must be written before the final restart; override=%d restart=%d", override, restartIdx)
+	}
+}
+
+// The containerd warm pool reaches a Terraform node only through these lines:
+// run.sh's containerd-pool capability writes containerd.pool into cluster.yml,
+// and without the template the flag would silently do nothing. The default
+// render must keep the pool off. A per-node sandboxd_env must still win,
+// because cluster.env loads after sandboxd.env, so sandboxd_env is now the
+// only way a scenario can change these values without a second restart.
+func TestBootstrapRendersContainerdPoolEnv(t *testing.T) {
+	if off := renderBootstrap(t, "joiner"); !strings.Contains(off, "SB_CONTAINERD_POOL_ENABLED=x") {
+		t.Fatal("default render is missing the containerd pool block")
+	}
+
+	out := renderBootstrap(t, "joiner_containerd_pool")
+	for _, want := range []string{
+		"SB_CONTAINERD_POOL_ENABLED=true\n",
+		"SB_CONTAINERD_POOL_DEPTH=4\n",
+		"SB_CONTAINERD_POOL_IMAGES=alpine:3.20,python:3.12-slim\n",
+		"SB_CONTAINERD_POOL_MAX_IMAGES=8\n",
+		"SB_CONTAINERD_POOL_IDLE_TTL=15m\n",
+		"SB_CONTAINERD_POOL_REFILL_INTERVAL=5s\n",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("rendered bootstrap is missing %q", strings.TrimSpace(want))
+		}
+	}
+
+	cfg := strings.Index(out, "SB_CONTAINERD_POOL_DEPTH=4\n")
+	override := strings.Index(out, "SB_CONTAINERD_POOL_DEPTH=8\n")
+	tee := strings.Index(out, "tee -a /etc/sandboxd/cluster.env")
+	if cfg < 0 || override < 0 || tee < 0 {
+		t.Fatalf("could not locate cfg=%d override=%d tee=%d", cfg, override, tee)
+	}
+	if !(cfg < override && override < tee) {
+		t.Fatalf("sandboxd_env must render after the containerd pool block and before the cluster.env write; got cfg=%d override=%d tee=%d",
+			cfg, override, tee)
 	}
 }
 

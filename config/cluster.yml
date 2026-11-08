@@ -138,6 +138,26 @@ containerd:
   namespace: "aerolvm"
   cni_plugin_dir: "/opt/cni/bin"
   native_netns_pool_enabled: true
+  # Warm container pool (park + adopt) for the containerd engine; same shape
+  # and defaults as docker.pool above. Off by default so turning it on is an
+  # operator's choice: a waiting container costs about 13 MB (2.4 MB in its
+  # cgroup plus 10.8 MB for its containerd shim, outside the cgroup), and a
+  # create that takes one finishes in 11-19 ms server time against ~300 ms
+  # cold (t3.medium, 2026-11-08). Each waiting container also holds a
+  # default-shaped capacity reservation (a real create takes it back when the
+  # node is full) and one netns slot, so depth × images must fit next to real
+  # sandboxes. Only acts when container_engine is containerd and the ready
+  # socket is on (SB_DOCKER_READY_SOCKET_ENABLED, on by default).
+  pool:
+    enabled: false
+    # Warm slots kept per pinned image.
+    depth: 2
+    # Images warmed from daemon start. Empty pins alpine:3.20. Requests for
+    # other images self-warm on miss (LRU-capped by max_images).
+    images: []
+    max_images: 8
+    idle_ttl: "15m"
+    refill_interval: "5s"
 
 # --- Firecracker runtime bootstrap ---------------------------------------
 # Host-level Firecracker enablement is opt-in. The bootstrap path must
