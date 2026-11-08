@@ -214,6 +214,79 @@ The scenario needs the default local build, or a release that has
 whose teardown failed keeps its balancer and Elastic IP until
 `integration-tests/run.sh cluster-3-mixed-lb --destroy-only`.
 
+## Routing gate from inside the VPC (UC-171 / UC-357) and the A/B
+
+The gate for turning `SB_INGRESS_PROXY_ROUTING` on by default
+(`plans/cluster-phase-2.md` §4.2) runs on `cluster-hetero-lite-routing`
+(8 × t3.medium) with the test binary on one of its server nodes, not on a
+laptop. A laptop adds its Wi-Fi and ISP to every latency number, and an SSH
+or DNS blip there fails a case that has nothing to do with the code. A
+server node is a Raft voter that serves no sandbox and is not behind the
+domain, so the load generator neither competes with what it measures nor
+skips the public path: it reaches the domain through the Internet gateway,
+like a customer's servers in the region.
+
+UC-171 also records latency: expose to first 200 on the public URL, and
+p50/p99 of the successful fresh-connection HTTP and raw-TCP probes during
+churn. The numbers are in the test log, in the report row's Detail column,
+and in `<scenario>-bank.json` under `ingress_routing_churn_gate`. Its pass
+rule is still 0 failed connections.
+
+**Run tests from a node.** `scripts/run-on-node.sh` builds
+`go test -c -tags integration ./integration-tests/suite/` for the node's
+architecture, copies it with the harness's SSH key, hands it the same
+`AEROL_*` environment `run.sh` gives the suite (other exported `AEROL_*`
+knobs pass through), starts it detached so an SSH drop here does not kill
+it, and copies back `test.json`, `test.log`, the bank JSON and a report to
+`reports/run-on-node/<scenario>/<stamp>[-<label>]/`. The default node is a
+server-only node (a non-seed one first); `--node <name>` picks another.
+The node has no SSH key, AWS credentials or checkout, so cases that need
+those, and every disruptive case (`AEROL_ALLOW_DISRUPTIVE=0`), belong on
+the laptop. `--dry-run` prints the node and test flags and touches nothing.
+
+**Flip the flag on every node.** `scripts/routing-ab.sh <scenario> off`
+sets `SB_INGRESS_PROXY_ROUTING=false` in a drop-in
+(`/etc/systemd/system/sandboxd.service.d/zz-ab-routing.conf`) and restarts
+sandboxd one node at a time, seed first. Each routing node rolls back to
+per-sandbox Caddy routes in one Caddy load, through its
+`ingress_proxy_routing_last_enabled` marker. `on` removes the drop-in and
+restarts the same way. After each restart it waits for `/health` and for
+the node's own member list to be whole, then checks the flip took (marker
+and Caddy's static `sandbox-ingress-proxy` route), so a node that refused
+to engage fails there and not as an odd A/B number. A node already flipped
+is skipped, so re-running a command that stopped half way finishes it.
+`status` prints each node's state.
+
+The gate, then the A/B (flag on, flag off, and the pair once more, because
+t3 CPU credits add noise):
+
+```bash
+S=cluster-hetero-lite-routing
+GATE='^(TestIngressRoutingChurnGate|TestIngressChurnNewConnectionsAndExecStreams)$'
+# Bring the stack up and keep it (this also runs UC-171 once from the laptop).
+AEROL_TEST_RUN='^TestIngressRoutingChurnGate$' integration-tests/run.sh $S --keep
+
+# Churn gate: 0 failed connections in each case.
+integration-tests/scripts/run-on-node.sh $S --label gate -run "$GATE"
+
+# A/B: flag-on p50/p99 must be no worse than flag-off beyond the spread of
+# the repeated pair. The off runs are expected to fail UC-171 (connections
+# drop on Caddy reloads); their numbers are still written.
+for pass in 1 2; do
+  integration-tests/scripts/run-on-node.sh $S --label on-$pass -run '^TestIngressRoutingChurnGate$'
+  integration-tests/scripts/routing-ab.sh $S off
+  integration-tests/scripts/run-on-node.sh $S --label off-$pass -run '^TestIngressRoutingChurnGate$'
+  integration-tests/scripts/routing-ab.sh $S on
+done
+grep -h ucdetail= integration-tests/reports/run-on-node/$S/*/test.log
+
+integration-tests/run.sh $S --destroy-only
+```
+
+Both scripts read the stack from this worktree's `.tf/<scenario>`; export
+`AEROL_INTEGRATION_TARGETS` (the Terraform `integration_targets` JSON) to
+point them at a stack kept from another worktree.
+
 ## Overload is shed, not restarted (UC-361)
 
 UC-361 (`suite/overload_shed_test.go`) runs on any scenario with `cluster`,

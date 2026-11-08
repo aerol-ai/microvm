@@ -212,6 +212,42 @@ func TestClassifyAttachesInvariantVerdicts(t *testing.T) {
 	}
 }
 
+func TestClassifyAttachesMeasuredDetail(t *testing.T) {
+	// UC-171 logs its latency as a ucdetail= marker before its assertions,
+	// so the numbers reach the row on a pass (flag-on arm) and on a fail
+	// (flag-off arm, where connections drop) alike, and never as a reason.
+	events := []testEvent{
+		{Action: "output", Test: "TestIngressRoutingChurnGate", Output: "    client.go:54: ucid=UC-10\n"},
+		{Action: "output", Test: "TestIngressRoutingChurnGate", Output: "    ingress_routing_test.go:250: ucdetail=expose-to-200 41ms; http p50 3.1ms p99 9.0ms (n=900)\n"},
+		{Action: "pass", Test: "TestIngressRoutingChurnGate"},
+		{Action: "output", Test: "TestOther", Output: "    client.go:54: ucid=UC-11\n"},
+		{Action: "output", Test: "TestOther", Output: "    ingress_routing_test.go:250: ucdetail=http p50 5.0ms\n"},
+		{Action: "output", Test: "TestOther", Output: "    ingress_routing_test.go:260: 12 fresh HTTP connections failed during churn\n"},
+		{Action: "fail", Test: "TestOther"},
+	}
+	by := map[string]Result{}
+	for _, r := range classify(events, reg(), false) {
+		by[r.ID] = r
+	}
+	pass := by["UC-10"]
+	if pass.Status != StatusPass || pass.Detail != "expose-to-200 41ms; http p50 3.1ms p99 9.0ms (n=900)" || pass.Reason != "" {
+		t.Fatalf("UC-10 = %+v, want a pass carrying its measurement and no reason", pass)
+	}
+	fail := by["UC-11"]
+	if fail.Status != StatusFail || fail.Detail != "http p50 5.0ms" {
+		t.Fatalf("UC-11 = %+v, want a fail carrying its measurement", fail)
+	}
+	if strings.Contains(fail.Reason, "ucdetail=") || !strings.Contains(fail.Reason, "failed during churn") {
+		t.Errorf("fail reason = %q, want the assertion and not the marker", fail.Reason)
+	}
+	if cell := detailCell(fail); cell != "http p50 5.0ms — "+fail.Reason {
+		t.Errorf("fail detail cell = %q, want the measurement before the reason", cell)
+	}
+	if md := renderMarkdown(Report{Scenario: "cluster-hetero-lite-routing", Results: classify(events, reg(), false)}); !strings.Contains(md, "| ✅ pass | expose-to-200 41ms") {
+		t.Errorf("markdown does not show the pass row's measurement:\n%s", md)
+	}
+}
+
 func TestApplyFocusDowngradesOnlyUnfocusedMissingRows(t *testing.T) {
 	focusReg := []harness.UseCase{
 		{ID: "UC-10", Implemented: true},
