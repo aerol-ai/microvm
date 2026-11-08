@@ -2157,6 +2157,14 @@ func placementName(p Placement) string {
 	return specName(p.Spec)
 }
 
+// validateReservationBatchLocked refuses an opReserveBatch before any item is
+// written, so a batch is all-or-nothing. Each item must pass
+// checkReservationLocked, the same check a single opReserve makes, against
+// the state before the batch; a hand-copied subset here once let a later
+// item fail after earlier items were stored. On top of that no two items may
+// share a sandbox id or a name. Items cannot unblock each other: with ids
+// unique, an earlier write touches only its own row plus the name index,
+// which the name check below already covers.
 func (f *placementFSM) validateReservationBatchLocked(reservations []reservationCommand, now int64) error {
 	seenIDs := make(map[string]struct{}, len(reservations))
 	seenNames := make(map[string]string, len(reservations))
@@ -2169,13 +2177,9 @@ func (f *placementFSM) validateReservationBatchLocked(reservations []reservation
 		}
 		seenIDs[r.SandboxID] = struct{}{}
 
-		if existing, exists := f.fullPlacementLocked(r.SandboxID); exists {
-			if !existing.IsReserved() {
-				return fmt.Errorf("%w: %s already placed by %s", ErrReservationConflict, r.SandboxID, existing.OwnerNodeID)
-			}
-			if existing.OwnerNodeID != r.OwnerNodeID && now <= existing.ExpiresUnix {
-				return fmt.Errorf("%w: %s reserved by %s", ErrReservationConflict, r.SandboxID, existing.OwnerNodeID)
-			}
+		existing, exists := f.fullPlacementLocked(r.SandboxID)
+		if err := f.checkReservationLocked(commandFromReservation(r), existing, exists, now); err != nil {
+			return err
 		}
 
 		name := specName(r.Spec)
@@ -2186,14 +2190,25 @@ func (f *placementFSM) validateReservationBatchLocked(reservations []reservation
 			return fmt.Errorf("%w: %q appears more than once in reservation batch", ErrNameConflict, name)
 		}
 		seenNames[name] = r.SandboxID
-		if err := f.validateNameUniqueLocked(r.SandboxID, name); err != nil {
-			return err
-		}
 	}
 	return nil
 }
 
-func (f *placementFSM) reservePlacementLocked(cmd command, now int64) error {
+// isReservationRetry reports whether cmd re-reserves a live reservation from
+// the same owner. The check and the write share it so they cannot disagree
+// about which branch a command takes.
+func isReservationRetry(existing Placement, cmd command, now int64) bool {
+	return existing.OwnerNodeID == cmd.OwnerNodeID && now <= existing.ExpiresUnix
+}
+
+// checkReservationLocked returns the error reservePlacementLocked would
+// return for cmd, without writing anything. It is the single list of
+// opReserve rejections: validateReservationBatchLocked runs it for every
+// batch item before the first write, so a rule added here is enforced
+// atomically for batches too. existing/exists are the caller's
+// fullPlacementLocked lookup, passed in so the hot opReserve path hydrates
+// the recovery payload once.
+func (f *placementFSM) checkReservationLocked(cmd command, existing Placement, exists bool, now int64) error {
 	if cmd.SandboxID == "" || cmd.OwnerNodeID == "" {
 		return fmt.Errorf("placementFSM: opReserve requires sandbox_id and owner_node_id")
 	}
@@ -2202,17 +2217,17 @@ func (f *placementFSM) reservePlacementLocked(cmd command, now int64) error {
 			return err
 		}
 	}
-	existing, exists := f.fullPlacementLocked(cmd.SandboxID)
 	if exists {
 		// Reject when the slot is already materialized — a router racing a
 		// completed sandbox should back off and let the caller see 409.
 		if !existing.IsReserved() {
 			return fmt.Errorf("%w: %s already placed by %s", ErrReservationConflict, cmd.SandboxID, existing.OwnerNodeID)
 		}
-		// Re-reserve from the same owner before expiry is an idempotent retry —
-		// refresh the TTL (and recipient set when supplied) and treat it as a
-		// no-op otherwise.
-		if existing.OwnerNodeID == cmd.OwnerNodeID && now <= existing.ExpiresUnix {
+		if isReservationRetry(existing, cmd, now) {
+			// A retry refreshes the TTL only, so it must be the same create:
+			// same incarnation and, when it carries one, the same secret
+			// handle. The name is not re-checked because a retry keeps the
+			// row's spec.
 			if strings.TrimSpace(existing.IncarnationID) != strings.TrimSpace(cmd.IncarnationID) {
 				return fmt.Errorf("%w: reservation retry changed its incarnation", ErrIncarnationConflict)
 			}
@@ -2220,6 +2235,28 @@ func (f *placementFSM) reservePlacementLocked(cmd command, now int64) error {
 				existing.SecretSealGeneration != cmd.SecretSealGeneration) {
 				return fmt.Errorf("%w: reservation retry changed its secret handle", ErrInvalidSecretHandle)
 			}
+			return nil
+		}
+		if now <= existing.ExpiresUnix {
+			return fmt.Errorf("%w: %s reserved by %s", ErrReservationConflict, cmd.SandboxID, existing.OwnerNodeID)
+		}
+		// Expired: the write path releases the old row's indexes and
+		// overwrites it. The old row's own name maps to this same sandbox
+		// id, so it never blocks the check below.
+	}
+	return f.validateNameUniqueLocked(cmd.SandboxID, specName(cmd.Spec))
+}
+
+func (f *placementFSM) reservePlacementLocked(cmd command, now int64) error {
+	existing, exists := f.fullPlacementLocked(cmd.SandboxID)
+	if err := f.checkReservationLocked(cmd, existing, exists, now); err != nil {
+		return err
+	}
+	if exists {
+		// Re-reserve from the same owner before expiry is an idempotent retry —
+		// refresh the TTL (and recipient set when supplied) and treat it as a
+		// no-op otherwise.
+		if isReservationRetry(existing, cmd, now) {
 			existing.ExpiresUnix = cmd.ExpiresUnix
 			existing.Version = f.version
 			existing.UpdatedUnix = now
@@ -2240,22 +2277,16 @@ func (f *placementFSM) reservePlacementLocked(cmd command, now int64) error {
 			f.refreshPendingReservationExpiryLocked(cmd.SandboxID, cmd.ExpiresUnix)
 			return nil
 		}
-		// Expired reservations are eligible for overwrite by a fresh reservation.
-		if now > existing.ExpiresUnix {
-			f.releasePendingReservationLocked(cmd.SandboxID)
-			f.releasePendingReservationOwnerLocked(cmd.SandboxID, existing.OwnerNodeID)
-			f.releaseNameLocked(cmd.SandboxID, placementName(existing))
-			f.releaseShardLocked(cmd.SandboxID)
-			f.releaseOwnerRefLocked(cmd.SandboxID, existing.OwnerRef)
-			f.releaseVolumeAttachmentsForIncarnationLocked(cmd.SandboxID, existing.IncarnationID)
-		} else {
-			return fmt.Errorf("%w: %s reserved by %s", ErrReservationConflict, cmd.SandboxID, existing.OwnerNodeID)
-		}
+		// checkReservationLocked refused a live reservation held by another
+		// owner, so this row has expired and a fresh reservation overwrites it.
+		f.releasePendingReservationLocked(cmd.SandboxID)
+		f.releasePendingReservationOwnerLocked(cmd.SandboxID, existing.OwnerNodeID)
+		f.releaseNameLocked(cmd.SandboxID, placementName(existing))
+		f.releaseShardLocked(cmd.SandboxID)
+		f.releaseOwnerRefLocked(cmd.SandboxID, existing.OwnerRef)
+		f.releaseVolumeAttachmentsForIncarnationLocked(cmd.SandboxID, existing.IncarnationID)
 	}
 	name := specName(cmd.Spec)
-	if err := f.validateNameUniqueLocked(cmd.SandboxID, name); err != nil {
-		return err
-	}
 	secrets := applyCommandSecretUpdate(Placement{}, false, cmd)
 	p := Placement{
 		SandboxID:            cmd.SandboxID,
