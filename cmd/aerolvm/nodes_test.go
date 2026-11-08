@@ -759,10 +759,43 @@ func TestClusterReadsRetryTransientFailures(t *testing.T) {
 	if code := h.run("delete", "node", "wkr-2"); code != exitOK || f.calls["DELETE /v1/cluster/nodes/wkr-2"] != 2 {
 		t.Fatalf("delete after one reset = %d (calls %d): %s", code, f.calls["DELETE /v1/cluster/nodes/wkr-2"], h.stderr.String())
 	}
-	f.status503["POST /v1/cluster/nodes/wkr-1/cordon"] = 1
-	before = f.calls["POST /v1/cluster/nodes/wkr-1/cordon"]
-	if code := h.run("cordon", "wkr-1"); code == exitOK || f.calls["POST /v1/cluster/nodes/wkr-1/cordon"] != before+1 {
-		t.Fatalf("a write was retried: code %d, calls %d -> %d", code, before, f.calls["POST /v1/cluster/nodes/wkr-1/cordon"])
+	// cordon and uncordon only set or clear a node's mark, so a dropped one
+	// or a 503 is retried too (live UC-613: a Caddy reload reset a cordon).
+	cordon := "POST /v1/cluster/nodes/wkr-1/cordon"
+	before = f.calls[cordon]
+	f.dropOnCall[cordon] = before + 1
+	if code := h.run("cordon", "wkr-1"); code != exitOK || f.calls[cordon] != before+2 {
+		t.Fatalf("cordon after one reset = %d (calls %d -> %d): %s", code, before, f.calls[cordon], h.stderr.String())
+	}
+	f.status503["POST /v1/cluster/nodes/wkr-1/uncordon"] = 1
+	if code := h.run("uncordon", "wkr-1"); code != exitOK {
+		t.Fatalf("uncordon after one 503 = %d: %s", code, h.stderr.String())
+	}
+	// A write that is not idempotent is never retried: a second join token
+	// would be a second credential.
+	f.status503["POST /v1/cluster/join-tokens"] = 1
+	before = f.calls["POST /v1/cluster/join-tokens"]
+	if code := h.run("join-command"); code == exitOK || f.calls["POST /v1/cluster/join-tokens"] != before+1 {
+		t.Fatalf("a join token create was retried: code %d, calls %d -> %d", code, before, f.calls["POST /v1/cluster/join-tokens"])
+	}
+}
+
+func TestNodeMarkPost(t *testing.T) {
+	for _, tc := range []struct {
+		method, path string
+		want         bool
+	}{
+		{http.MethodPost, "/v1/cluster/nodes/wkr-1/cordon", true},
+		{http.MethodPost, "/v1/cluster/nodes/wkr-1/uncordon", true},
+		{http.MethodPost, "/v1/cluster/nodes/wkr-1/drain", true},
+		{http.MethodPost, "/v1/cluster/join-tokens", false},
+		{http.MethodPost, "/v1/cluster/wasm-migrate", false},
+		{http.MethodPost, "/v1/cluster/nodes/wkr-1/storage-retired", false},
+		{http.MethodGet, "/v1/cluster/nodes/wkr-1/cordon", false},
+	} {
+		if got := nodeMarkPost(tc.method, tc.path); got != tc.want {
+			t.Errorf("nodeMarkPost(%s %s) = %v, want %v", tc.method, tc.path, got, tc.want)
+		}
 	}
 }
 

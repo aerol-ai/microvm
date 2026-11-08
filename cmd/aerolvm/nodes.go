@@ -118,8 +118,11 @@ type nodeRaw struct {
 // retried the same way: every delete here is idempotent (a node, join token,
 // snapshot, token or sandbox that is already gone counts as deleted), and a
 // Caddy reload on the ingress node can drop a delete in flight (live UC-614,
-// 2026-11-08). Other writes are never retried here; their own idempotency
-// is the server's job.
+// 2026-11-08). cordon, drain and uncordon are retried too: they only set or
+// clear a node's mark (setNodeDrainState), and the same Caddy reload reset a
+// cordon in flight (live UC-613, 2026-11-08). Other writes are never retried
+// here: a second join token would be a second credential, and their own
+// idempotency is the server's job.
 func (a *app) clusterCall(ctx context.Context, c *commonFlags, method, path string, in, out any) error {
 	conn, err := a.resolve(ctx, c)
 	if err != nil {
@@ -127,7 +130,7 @@ func (a *app) clusterCall(ctx context.Context, c *commonFlags, method, path stri
 	}
 	for attempt := 0; ; attempt++ {
 		err = a.callAPI(ctx, c, conn, method, path, in, out)
-		retryable := method == http.MethodGet || method == http.MethodDelete
+		retryable := method == http.MethodGet || method == http.MethodDelete || nodeMarkPost(method, path)
 		if err == nil || !retryable || attempt >= len(clusterReadRetryDelays) || !retryableRead(err) {
 			return err
 		}
@@ -140,6 +143,15 @@ func (a *app) clusterCall(ctx context.Context, c *commonFlags, method, path stri
 		case <-time.After(clusterReadRetryDelays[attempt]):
 		}
 	}
+}
+
+// nodeMarkPost is a POST that only sets or clears a node's mark, so running
+// it twice leaves the same state as running it once.
+func nodeMarkPost(method, path string) bool {
+	if method != http.MethodPost || !strings.HasPrefix(path, "/v1/cluster/nodes/") {
+		return false
+	}
+	return strings.HasSuffix(path, "/cordon") || strings.HasSuffix(path, "/uncordon") || strings.HasSuffix(path, "/drain")
 }
 
 // clusterReadRetryDelays bounds a read's retries: three more tries over about
