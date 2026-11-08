@@ -187,12 +187,19 @@ and accept both during the rollout.
    `SB_OPERATOR_VOLUME_SCOPE=<that value>` on every node and restart in
    turn. sandboxd refuses to boot with `SB_PAT_TOKEN_PREVIOUS` set and the
    scope unpinned while platform volumes are on, and prints the value to pin.
-1. On every node set `SB_PAT_TOKEN=<new>` and `SB_PAT_TOKEN_PREVIOUS=<old>`,
-   then restart one node at a time. Old and new both work everywhere.
+1. On every node that holds the PAT (every server, and any node with no
+   `SB_PAT_TOKEN_SHA256` in `/etc/sandboxd/cluster.env`) set
+   `SB_PAT_TOKEN=<new>` and `SB_PAT_TOKEN_PREVIOUS=<old>`. On a worker or
+   ingress node joined without the PAT (it has `SB_PAT_TOKEN_SHA256`), leave
+   `SB_PAT_TOKEN` alone, it is the node's own token, and set
+   `SB_PAT_TOKEN_SHA256=<sha256 of new>,<sha256 of old>` instead
+   (`printf %s "$NEW" | sha256sum`). Restart one node at a time. Old and new
+   both work everywhere.
 2. Move every client (scripts, `config/secrets.yml` `cluster.pat_token`,
    CI secrets) to the new PAT.
-3. Remove `SB_PAT_TOKEN_PREVIOUS` from every node and restart in turn. The old
-   PAT stops working.
+3. Remove `SB_PAT_TOKEN_PREVIOUS`, and the old hash from
+   `SB_PAT_TOKEN_SHA256`, on every node and restart in turn. The old PAT stops
+   working.
 
 ## RotateScrapeToken
 

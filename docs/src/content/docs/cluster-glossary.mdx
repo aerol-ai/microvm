@@ -23,7 +23,7 @@ This page explains the words you see in cluster logs and docs. It also lists the
 | Ingress | Traffic coming in from the internet, and the nodes that receive it. |
 | Drain | Mark a node so it gets no new sandboxes. Sandboxes already on it keep running. |
 | Orphaned | A sandbox whose owner died. Normal sandboxes then return `410 Gone`. |
-| PAT token | The shared access token (`SB_PAT_TOKEN`) that operators, SDKs and nodes use. |
+| PAT token | The admin access token (`SB_PAT_TOKEN`) that operators, SDKs and server nodes use. Worker and ingress nodes joined with one line hold only its hash (`SB_PAT_TOKEN_SHA256`). |
 
 ## Node roles
 
@@ -110,6 +110,7 @@ Raft keeps its records on disk, so they survive restarts.
 |---|---|---|
 | `SB_CLUSTER_TLS_DIR` | The folder with the cluster's certificate authority and this node's certificate and key (`ca.crt`, `node.crt`, `node.key`). Traffic between nodes then uses mutual TLS (both sides show a certificate). A PAT token alone cannot fake requests between nodes. Required in cluster mode. | Empty |
 | `SB_CLUSTER_INTERNAL_LISTEN` | Where the private node-to-node HTTPS listener binds. | `0.0.0.0:7002` |
+| `SB_PAT_TOKEN_SHA256` | The SHA-256 hash of the admin token, in hex, on a worker or ingress node that `sandboxd join` joined without the token. The node accepts the admin token by this hash, calls other nodes with its certificate alone, and its own `SB_PAT_TOKEN` then works only on its loopback. During a rotation, list two hashes split by a comma, the new one first. `sandboxd join` writes it in `cluster.env`. | Empty (the node holds the admin token) |
 | `SB_CLUSTER_INTERNAL_ADVERTISE` | The HTTPS address other nodes use for that listener, for example `https://10.0.0.5:7002`. | Worked out from the node's main IP |
 | `SB_CREDENTIAL_ENCRYPTION_KEY` | The shared key for the local secrets provider. Required in cluster mode, unless the key file exists. It is not enough for failover on its own. See [Secrets providers](/cluster-secrets/). | Empty |
 | `SB_CREDENTIAL_ENCRYPTION_KEY_PATH` | A file to read that key from. | `/var/lib/sandboxd/credential_encryption.key` |

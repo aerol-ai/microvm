@@ -261,7 +261,7 @@ nodes = {
 }
 ```
 
-How the machines join: the module makes one join token per role. The seed runs the installer with `init` and registers all three. Every other machine runs the installer with `join` and its role's token. The worker and ingress tokens never expire, so a worker you add to `nodes` weeks later still joins. The server token lasts 24 hours.
+How the machines join: the module makes one join token per role. The seed runs the installer with `init` and registers all three. Every other machine runs the installer with `join` and its role's token. The worker and ingress tokens never expire, so a worker you add to `nodes` weeks later still joins. The server token lasts 24 hours. Worker and ingress machines never get the admin token, not even in their user data; see [Keep join tokens safe](#keep-join-tokens-safe).
 
 ### Step 5: Turn on gVisor (optional)
 
@@ -574,14 +574,33 @@ If the seed is gone, run `sudo sandboxd adopt --ca-key <file>` with a saved copy
 
 ## Keep join tokens safe
 
-A join token can make a node. A node gets the cluster's admin token and keys: the gossip key, the key that opens stored secrets (unless [key custody](/enterprise/key-custody/) is wrapped), and for a server, the key that signs every node's certificate. So treat a join token like the admin token:
+A join token can make a node. What the node gets depends on the token's role:
+
+| Role | What the new node gets |
+|---|---|
+| `server` | The admin token, the key that signs every node's certificate, the gossip key, and the key that opens stored secrets (unless [key custody](/enterprise/key-custody/) is wrapped). |
+| `worker`, `ingress` | The gossip key, the key that opens stored secrets (unless key custody is wrapped), and its own certificate. **Not** the admin token: it gets the admin token's SHA-256 hash instead. |
+
+A worker or ingress node does not need the admin token. It talks to the other nodes with its own certificate, and it checks the admin token you send it against the hash. So a worker or ingress token that leaks lets someone add a worker until you revoke it. It never gives them the admin token, a server token or the certificate key: a server refuses to make a server token, hand out the certificate key, or run `adopt` for a caller whose certificate names a worker or ingress node.
+
+A server token gives everything, so treat it like the admin token:
 
 - **Keep lifetimes short.** The default is 2 hours. A server token lasts at most 24 hours.
 - **Keep never-expiring tokens (`--ttl 0`) for workers and ingress nodes,** such as the ones an autoscaler or Terraform adds. In [enterprise mode](/enterprise/enterprise-mode/) they also need wrapped key custody.
 - **Revoke what you no longer need:** `aerolvm get jointokens`, then `aerolvm delete jointoken <id>`.
-- **Keep Terraform's state private.** It holds the module's three join tokens and the admin token.
+- **Keep Terraform's state private.** It holds the module's three join tokens and the admin token. The user data of a worker or ingress machine holds only its own join token, never the admin token.
 
 Every join, and every refused one, is written to the audit log.
+
+### The token on a worker or ingress node
+
+On a worker or ingress node, `SB_PAT_TOKEN` in `/etc/sandboxd/sandboxd.env` is a random token of that node's own, and `/etc/sandboxd/cluster.env` holds the admin token's hash as `SB_PAT_TOKEN_SHA256`. The node's own token works only for tools on that machine that call `http://127.0.0.1:21212` directly, such as `sandboxd reset`. It is refused from anywhere else, through Caddy, and on every other node.
+
+Some things to know:
+
+- **Upgrades.** While any node still runs an older release, joins hand the admin token to every role, as before. Nodes that already hold it keep working. To take it off such a node once the whole cluster runs this release, run its join line again: the node swaps the admin token for a token of its own and the hash.
+- **Rotating the admin token.** On worker and ingress nodes, update the hash instead of the token. Get the new hash with `printf %s "$NEW_TOKEN" | sha256sum`, set `SB_PAT_TOKEN_SHA256=<new hash>,<old hash>` in `/etc/sandboxd/cluster.env`, and restart the node. When every client uses the new token, remove the old hash and restart again.
+- **The hash is only as strong as the admin token.** Use a random admin token of at least 32 bytes (`openssl rand -hex 32`).
 
 ## Tear down
 
