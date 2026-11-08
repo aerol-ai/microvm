@@ -67,7 +67,6 @@ func TestClusterFaultPropertyModel(t *testing.T) {
 		runPropertyModel(t, "pms", seed, steps, false)
 	})
 	t.Run("restarts", func(t *testing.T) {
-		t.Skip("needs PR #1011 (C2): a restarted server's ownership replay places a sandbox deleted while it was away")
 		runPropertyModel(t, "pmr", seed, steps, true)
 	})
 }
@@ -149,7 +148,6 @@ func runPropertyModel(t *testing.T, name string, seed int64, steps int, restarts
 		spec: &models.CreateSandboxRequest{Image: "alpine", CPU: 1, MemoryMB: 64, DiskGB: 1},
 	}
 	t.Run("replicas-identical", func(t *testing.T) {
-		t.Skip("needs PR #1001 (C1): servers stamp rows with their own clock, so replicas differ by a second")
 		r.checkReplicas = true
 	})
 	r.fc = newFaultCluster(t, name, propertyServers)

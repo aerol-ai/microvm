@@ -22,7 +22,6 @@ import (
 // states encode differently. dumpFSM sorts the rows and compares decoded
 // values, plus every placement joined with its recovery payload.
 func TestClusterFaultReplayDeterminism(t *testing.T) {
-	t.Skip("needs PR #1001 (C1): the FSM decides with the applying server's clock, so a replay later disagrees")
 	fc := newFaultCluster(t, "rpl", 3)
 	s1, s2, s3 := fc.servers[0], fc.servers[1], fc.servers[2]
 	for _, s := range fc.servers {

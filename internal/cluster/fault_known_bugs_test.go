@@ -22,7 +22,6 @@ import (
 // logs this ("held although its caller got ...") in about half of its kill
 // runs.
 func TestReserveRetryAtFullCapacityIsAccepted(t *testing.T) {
-	t.Skip("NEW BUG: admitReservationCommand counts a retried reservation twice; no fix PR yet")
 	fc := newFaultCluster(t, "rtry", 1)
 	l := fc.leader().cluster()
 	fc.setLease(l.nodeID, staticCapacity(1))
@@ -51,7 +50,6 @@ func TestReserveRetryAtFullCapacityIsAccepted(t *testing.T) {
 // under-count (I4). On main read and apply both use the local clock, so the
 // path cannot be reached and this test passes there.
 func TestPendingLoadSurvivesReadAfterExpiryThenRefresh(t *testing.T) {
-	t.Skip("NEW BUG with PR #1001: a read-side prune loses a reservation that a later entry refreshes; no fix PR yet")
 	f := newPlacementFSM()
 	// An hour in the past: main applies with the wall clock, which is then
 	// past every expiry below, so the repro shows only where read time and

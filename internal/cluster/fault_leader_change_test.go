@@ -105,7 +105,6 @@ func runLeaderChangeReserves(t *testing.T, name string, change func(fc *faultClu
 	// CreatedUnix, which C1 fixes. The fixing PR deletes the t.Skip line.
 	var checkReplicas bool
 	t.Run("replicas-identical", func(t *testing.T) {
-		t.Skip("needs PR #1001 (C1): servers stamp rows with their own clock, so replicas differ by a second")
 		checkReplicas = true
 	})
 	fc := newFaultCluster(t, name, leaderChangeServers)
