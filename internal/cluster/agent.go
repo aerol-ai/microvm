@@ -983,7 +983,6 @@ func (a *Agent) ApplyEncoded(ctx context.Context, payload []byte) error {
 
 func (a *Agent) AssertOwnership(ctx context.Context, local []LocalSandboxState) error {
 	var firstErr error
-	now := time.Now()
 	for _, st := range local {
 		if st.ID == "" {
 			continue
@@ -1003,10 +1002,8 @@ func (a *Agent) AssertOwnership(ctx context.Context, local []LocalSandboxState) 
 		}
 		switch {
 		case !ok:
-			// A worker is never the sole Raft server: only a young row is
-			// provably not a deleted one (adoptUnplacedRow).
 			record := func() error { return a.RecordPlacement(ctx, st.ID, st.Spec, st.Secrets) }
-			if !placeUnplacedRow(a.logger, a.nodeID, st, now, a.cfg.AuditDeletedGrace, false, record, &firstErr) {
+			if !placeUnplacedRow(a.logger, a.nodeID, st, record, &firstErr) {
 				continue
 			}
 			for port, route := range st.ExposedPorts {

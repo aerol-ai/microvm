@@ -8,7 +8,6 @@ import (
 	"net/http"
 	"sync"
 	"testing"
-	"time"
 
 	"github.com/aerol-ai/microvm/internal/config"
 	"github.com/aerol-ai/microvm/pkg/models"
@@ -47,22 +46,18 @@ func TestCoverage97AssertOwnershipErrorBodies(t *testing.T) {
 	hosts := []string{"replay.example.com"}
 	spec := &models.CreateSandboxRequest{Image: "alpine"}
 
-	// A fresh row: a worker places a row with no placement only when it is
-	// younger than the post-delete grace (adoptUnplacedRow).
 	t.Run("fresh port", func(t *testing.T) {
 		agent := coverage97OwnershipAgent(t, "sb-fresh-port", PlacementLookupResponse{}, false, opAddExposedPort)
-		agent.cfg.AuditDeletedGrace = time.Hour
 		if err := agent.AssertOwnership(context.Background(), []LocalSandboxState{{
-			ID: "sb-fresh-port", Spec: spec, ExposedPorts: ports, CreatedAt: time.Now(),
+			ID: "sb-fresh-port", Spec: spec, ExposedPorts: ports,
 		}}); err == nil {
 			t.Fatal("expected exposed-port failure")
 		}
 	})
 	t.Run("fresh domain", func(t *testing.T) {
 		agent := coverage97OwnershipAgent(t, "sb-fresh-host", PlacementLookupResponse{}, false, opAddCustomDomain)
-		agent.cfg.AuditDeletedGrace = time.Hour
 		if err := agent.AssertOwnership(context.Background(), []LocalSandboxState{{
-			ID: "sb-fresh-host", Spec: spec, CustomHostnames: hosts, CreatedAt: time.Now(),
+			ID: "sb-fresh-host", Spec: spec, CustomHostnames: hosts,
 		}}); err == nil {
 			t.Fatal("expected custom-domain failure")
 		}

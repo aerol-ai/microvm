@@ -570,11 +570,6 @@ type LocalSandboxState struct {
 	// boot — without this a failover-recreate would lose the user's TLS
 	// matchers.
 	CustomHostnames []string
-	// CreatedAt is when the local row was created. A row with no placement
-	// and no post-delete record is placed again only when it is younger than
-	// the post-delete grace, because a delete of it would still have its
-	// record (adoptUnplacedRow). The zero value counts as old.
-	CreatedAt time.Time
 }
 
 // PlacementTarget is returned by SelectPlacement.

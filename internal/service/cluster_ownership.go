@@ -3,8 +3,10 @@ package service
 import (
 	"context"
 	"errors"
+	"expvar"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/aerol-ai/microvm/internal/cluster"
 	"github.com/aerol-ai/microvm/internal/store"
@@ -47,6 +49,7 @@ func (s *Service) assertClusterOwnership(ctx context.Context, sandboxes []*model
 	}
 	states := make([]cluster.LocalSandboxState, 0)
 	var firstErr error
+	now := time.Now()
 	for _, sb := range sandboxes {
 		if sb == nil || sb.ID == "" || sb.Status == models.SandboxStatusDestroyed {
 			continue
@@ -69,19 +72,13 @@ func (s *Service) assertClusterOwnership(ctx context.Context, sandboxes []*model
 			continue
 		}
 		if !placed {
-			// Checked before the row is sealed: a deleted lifecycle must not
-			// get its secrets fanned out to peers again on the way out.
-			incarnationID, deleted, err := s.clusterLifecycleDeleted(ctx, c, sb)
-			if err != nil {
-				if firstErr == nil {
-					firstErr = err
-				}
-				continue
+			// Decided before the row is sealed: a row that is destroyed must
+			// not get its secrets fanned out to peers again on the way out.
+			place, err := s.settleUnplacedRow(ctx, c, sb, now)
+			if err != nil && firstErr == nil {
+				firstErr = err
 			}
-			if deleted {
-				if err := s.destroyDeletedClusterLifecycle(ctx, sb.ID, incarnationID); err != nil && firstErr == nil {
-					firstErr = err
-				}
+			if !place {
 				continue
 			}
 		}
@@ -111,8 +108,8 @@ func (s *Service) assertClusterOwnership(ctx context.Context, sandboxes []*model
 // id could belong to another lifetime.
 //
 // A server answers from its own replica, so it must have caught up first: a
-// restarted node that has not applied the delete yet would answer "no record"
-// and the row would be placed again.
+// restarted node that has not applied the delete yet would answer "no record",
+// and settleUnplacedRow would then decide on a false premise.
 func (s *Service) clusterLifecycleDeleted(ctx context.Context, c cluster.Client, sb *models.Sandbox) (string, bool, error) {
 	if !cluster.CaughtUp(c) {
 		return "", false, fmt.Errorf("ownership replay of %s: %w", sb.ID, cluster.ErrNotCaughtUp)
@@ -128,13 +125,115 @@ func (s *Service) clusterLifecycleDeleted(ctx context.Context, c cluster.Client,
 	return incarnationID, deleted, nil
 }
 
-// destroyDeletedClusterLifecycle destroys this node's copy of a sandbox whose
-// lifecycle the cluster already deleted. It is the ordinary destroy: the
-// placement is gone, so its delete fence and placement delete are no-ops, and
-// the lifetime-wide cleanup (exact-incarnation secrets, routes, runtime) is
-// right because no node owns that lifetime any more. The row is read again
-// under the lifecycle lock, and left alone if it is another lifetime by now.
-func (s *Service) destroyDeletedClusterLifecycle(ctx context.Context, sandboxID, incarnationID string) error {
+// Outcomes for a local row with no placement that the replay does not place,
+// counted in aerolvm_cluster_ownership_replay_unplaced_total.
+const (
+	unplacedDestroyedDeleted  = "destroyed_deleted"
+	unplacedDestroyedUnproven = "destroyed_unproven"
+	unplacedKeptGraceOff      = "kept_grace_off"
+	unplacedKeptNoIncarnation = "kept_no_incarnation"
+)
+
+var clusterUnplacedRows = expvar.NewMap("aerolvm_cluster_ownership_replay_unplaced_total")
+
+// unplacedReplayClockSkew is the clock difference unplacedRowPlaceable allows
+// between the node that stamped a post-delete record's expiry (the deleter),
+// the leader that prunes it, and this node, which stamped the row's
+// CreatedAt.
+const unplacedReplayClockSkew = time.Minute
+
+// unplacedRowPlaceable reports whether a local row with no placement and no
+// post-delete record is provably not a deleted sandbox, so it may be placed:
+//
+//   - soleServer: this node is the only Raft server. Nothing commits without
+//     it, so no delete happened while it was away. This is how a single node
+//     turned into a cluster seed (setup/cluster.md) keeps its sandboxes.
+//   - the row is younger than grace less clock skew. A delete after it was
+//     created would still have its record.
+//
+// The zero CreatedAt counts as old.
+func unplacedRowPlaceable(createdAt, now time.Time, grace time.Duration, soleServer bool) bool {
+	if soleServer {
+		return true
+	}
+	window := grace - unplacedReplayClockSkew
+	if window <= 0 || createdAt.IsZero() {
+		return false
+	}
+	return now.Sub(createdAt) < window
+}
+
+// settleUnplacedRow decides what happens to a local row the cluster has no
+// placement for, and reports whether the caller should hand it to
+// AssertOwnership to be placed. Everything else it does itself.
+//
+// The rule (user decision on C2): destroy the row unless it is provably not
+// a deleted sandbox. A post-delete record for its incarnation means deleted;
+// unplacedRowPlaceable is the proof of the opposite; anything in between is
+// unproven and destroyed too. A cut-off node's placements are orphaned or
+// moved, not removed, so an old row with no placement at all is one that was
+// deleted, or a create that never finished, in almost every case.
+//
+// Two guards keep the rule from destroying on no evidence at all:
+//
+//   - SB_AUDIT_DELETED_GRACE=0 keeps no records, so every outage, however
+//     short, would count as "away longer than the grace". The row is kept
+//     and logged.
+//   - A row with no incarnation cannot be matched to a record, nor finalized
+//     by the cluster destroy path. It is kept and logged.
+//
+// A failed lookup, or a replica that has not caught up, changes nothing.
+func (s *Service) settleUnplacedRow(ctx context.Context, c cluster.Client, sb *models.Sandbox, now time.Time) (bool, error) {
+	incarnationID, deleted, err := s.clusterLifecycleDeleted(ctx, c, sb)
+	if err != nil {
+		return false, err
+	}
+	if deleted {
+		return false, s.destroyUnplacedLocalSandbox(ctx, sb.ID, incarnationID, unplacedDestroyedDeleted)
+	}
+	if unplacedRowPlaceable(sb.CreatedAt, now, s.cfg.AuditDeletedGrace, cluster.SoleRaftServer(c)) {
+		return true, nil
+	}
+	switch {
+	case s.cfg.AuditDeletedGrace <= 0:
+		s.keepUnplacedRow(sb, unplacedKeptGraceOff,
+			"cluster: local sandbox has no placement; SB_AUDIT_DELETED_GRACE=0 keeps no delete records, so it is neither placed nor destroyed")
+		return false, nil
+	case incarnationID == "":
+		s.keepUnplacedRow(sb, unplacedKeptNoIncarnation,
+			"cluster: local sandbox has no placement and no incarnation to check; it is neither placed nor destroyed")
+		return false, nil
+	}
+	return false, s.destroyUnplacedLocalSandbox(ctx, sb.ID, incarnationID, unplacedDestroyedUnproven)
+}
+
+func (s *Service) keepUnplacedRow(sb *models.Sandbox, outcome, message string) {
+	clusterUnplacedRows.Add(outcome, 1)
+	if s.logger != nil {
+		s.logger.Warn(message, "sandbox_id", sb.ID, "created_at", sb.CreatedAt,
+			"audit_deleted_grace", s.cfg.AuditDeletedGrace)
+	}
+}
+
+// destroyUnplacedLocalSandbox destroys this node's copy of a sandbox the
+// cluster has no placement for: one whose lifecycle it deleted
+// (unplacedDestroyedDeleted), or one nothing proves is live
+// (unplacedDestroyedUnproven). It is the ordinary destroy: with no
+// placement, its delete fence and placement delete are no-ops, and the
+// lifetime-wide cleanup (exact-incarnation secrets, routes, runtime) is right
+// because no node owns that lifetime.
+//
+// Under the lifecycle lock it reads the row again (left alone if gone or
+// another lifetime by now) and asks the cluster authoritatively whether the
+// id has a placement. A worker's PlacementOf reports "none" when its lookup
+// fails, and destroying a placed sandbox from here would run the full user
+// delete, placement included. Any placement leaves the row to the paths that
+// handle placed rows.
+func (s *Service) destroyUnplacedLocalSandbox(ctx context.Context, sandboxID, incarnationID, outcome string) error {
+	c := s.Cluster()
+	if c == nil {
+		return fmt.Errorf("%w: placement client unavailable", ErrClusterFinalizationUnavailable)
+	}
 	unlock, err := s.lifecycleLocks.lockCtx(ctx, sandboxID)
 	if err != nil {
 		return err
@@ -154,16 +253,31 @@ func (s *Service) destroyDeletedClusterLifecycle(ctx context.Context, sandboxID,
 	if currentIncarnation != incarnationID {
 		return nil
 	}
-	if s.logger != nil {
-		s.logger.Warn("cluster: destroying local sandbox; the cluster deleted it while this node was away",
-			"sandbox_id", sandboxID, "incarnation_id", incarnationID)
+	placements, err := c.AuthoritativePlacementsByIDs(ctx, []string{sandboxID})
+	if err != nil {
+		return fmt.Errorf("ownership replay of %s: confirm no placement before destroy: %w", sandboxID, err)
 	}
-	done := s.beginSystemAction(ctx, sandboxID, systemActionClusterDeleted)
+	if _, ok := placements[sandboxID]; ok {
+		return nil
+	}
+	action := systemActionClusterDeleted
+	message := "cluster: destroying local sandbox; the cluster deleted it while this node was away"
+	if outcome == unplacedDestroyedUnproven {
+		action = systemActionClusterUnproven
+		message = "cluster: destroying local sandbox; it has no placement and nothing proves it was not deleted while this node was away"
+	}
+	if s.logger != nil {
+		s.logger.Warn(message, "sandbox_id", sandboxID, "incarnation_id", incarnationID, "created_at", current.CreatedAt)
+	}
+	done := s.beginSystemAction(ctx, sandboxID, action)
 	err = s.destroySandboxLocked(ctx, sandboxID)
 	if errors.Is(err, store.ErrNotFound) {
 		err = nil
 	}
 	done(err)
+	if err == nil {
+		clusterUnplacedRows.Add(outcome, 1)
+	}
 	return err
 }
 
@@ -286,7 +400,6 @@ func (s *Service) localSandboxStateForCluster(ctx context.Context, c cluster.Cli
 		Secrets:         secrets,
 		ExposedPorts:    clusterPortsFromSandbox(sb),
 		CustomHostnames: sandboxCustomHostnamesList(sb),
-		CreatedAt:       sb.CreatedAt,
 	}, nil
 }
 

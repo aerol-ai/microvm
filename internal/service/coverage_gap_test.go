@@ -186,6 +186,10 @@ func TestReplayClusterOwnershipAndReconcile(t *testing.T) {
 		placements: map[string]cluster.Placement{},
 	}
 	svc.cfg.EnableCluster = true
+	// A fresh row with no placement is placed only when the post-delete
+	// grace proves it was never deleted (settleUnplacedRow); 1h is the
+	// SB_AUDIT_DELETED_GRACE default.
+	svc.cfg.AuditDeletedGrace = time.Hour
 	svc.AttachCluster(recorder)
 
 	now := time.Now().UTC()
