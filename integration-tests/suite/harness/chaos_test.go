@@ -210,10 +210,137 @@ func TestChaosScriptsParse(t *testing.T) {
 		"netem off": NetemClearScript(),
 		"reconcile": ReconcileIntervalScript,
 		"restore":   HardKillRestoreEngineScript("containerd"),
+		"kill":      KillSandboxdScript,
+		"fp arm":    FailpointArmScript("create-before-persist", "cluster-chaos-it's-a-name"),
+		"fp hit":    FailpointHitScript("create-before-persist"),
+		"fp disarm": FailpointDisarmScript("create-before-persist"),
+		"soak":      SoakNodeScript,
 	}
 	for name, s := range scripts {
 		if out, err := exec.Command(bash, "-n", "-c", s).CombinedOutput(); err != nil {
 			t.Errorf("%s script does not parse: %v\n%s\n---\n%s", name, err, out, s)
 		}
+	}
+}
+
+func TestFailpointScriptsTargetTheDaemonsDirectory(t *testing.T) {
+	arm := FailpointArmScript("create-before-persist", "chaos-480-")
+	for _, want := range []string{
+		"/run/sandboxd/failpoints/create-before-persist.hit", // a stale marker is cleared first
+		"'chaos-480-' | sudo tee '/run/sandboxd/failpoints/create-before-persist'",
+		"echo ARMED",
+	} {
+		if !strings.Contains(arm, want) {
+			t.Errorf("arm script lacks %q:\n%s", want, arm)
+		}
+	}
+	if !strings.Contains(FailpointDisarmScript("create-before-persist"), "'/run/sandboxd/failpoints/create-before-persist' '/run/sandboxd/failpoints/create-before-persist.hit'") {
+		t.Errorf("disarm does not remove both files: %s", FailpointDisarmScript("create-before-persist"))
+	}
+}
+
+func TestParseFailpointHit(t *testing.T) {
+	tests := []struct {
+		name    string
+		out     string
+		wantKey string
+		wantHit bool
+		wantErr bool
+	}{
+		{name: "hit", out: "HIT cluster-chaos-x-1\nFP-DONE\n", wantKey: "cluster-chaos-x-1", wantHit: true},
+		{name: "no hit", out: "NOHIT\nFP-DONE\n"},
+		{name: "a banner line is ignored", out: "Warning: something\nNOHIT\nFP-DONE\n"},
+		// An SSH drop must never read as "the failpoint did not fire":
+		// that answer makes UC-480 skip.
+		{name: "cut short", out: "NOHIT\n", wantErr: true},
+		{name: "empty", out: "", wantErr: true},
+		{name: "marker without a key", out: "HIT\nFP-DONE\n", wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			key, hit, err := ParseFailpointHit(tt.out)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("err = %v, wantErr %v", err, tt.wantErr)
+			}
+			if key != tt.wantKey || hit != tt.wantHit {
+				t.Fatalf("got (%q, %v), want (%q, %v)", key, hit, tt.wantKey, tt.wantHit)
+			}
+		})
+	}
+}
+
+func TestRecoveredAt(t *testing.T) {
+	t0 := time.Date(2026, 11, 8, 12, 0, 0, 0, time.UTC)
+	at := func(s float64) time.Time { return t0.Add(time.Duration(s * float64(time.Second))) }
+	p := func(sent, answered float64, ok bool) RecoveryProbe {
+		return RecoveryProbe{Sent: at(sent), Answered: at(answered), OK: ok}
+	}
+	tests := []struct {
+		name       string
+		probes     []RecoveryProbe
+		want       float64
+		wantOutage bool
+		wantOK     bool
+		wantStreak int
+	}{
+		{
+			name:       "fails then recovers",
+			probes:     []RecoveryProbe{p(0, 0.1, false), p(1, 1.1, false), p(2, 2.2, true), p(3, 3.1, true)},
+			want:       2.2,
+			wantOutage: true, wantOK: true, wantStreak: 2,
+		},
+		{
+			// A node answered from its cache before it noticed the kill.
+			name:       "an early cached success does not count",
+			probes:     []RecoveryProbe{p(0, 0.1, true), p(1, 1.1, false), p(2, 2.1, false), p(3, 3.4, true)},
+			want:       3.4,
+			wantOutage: true, wantOK: true, wantStreak: 1,
+		},
+		{
+			// Sent during the outage, it waited for the leader and then
+			// succeeded: the signal was back when it answered.
+			name:       "a hung probe counts from its answer",
+			probes:     []RecoveryProbe{p(0, 0.2, false), p(1, 9, true), p(2, 9.1, true)},
+			want:       9,
+			wantOutage: true, wantOK: true, wantStreak: 2,
+		},
+		{
+			name:       "flapped back down: only the last streak counts",
+			probes:     []RecoveryProbe{p(0, 0.1, false), p(1, 1.1, true), p(2, 2.1, false), p(3, 3.2, true)},
+			want:       3.2,
+			wantOutage: true, wantOK: true, wantStreak: 1,
+		},
+		{
+			name:       "probes out of order are sorted by send time",
+			probes:     []RecoveryProbe{p(3, 3.2, true), p(0, 0.1, false), p(2, 2.6, true), p(1, 1.1, false)},
+			want:       2.6,
+			wantOutage: true, wantOK: true, wantStreak: 2,
+		},
+		{
+			name:       "never failed",
+			probes:     []RecoveryProbe{p(0, 0.1, true), p(1, 1.1, true)},
+			want:       0.1,
+			wantOutage: false, wantOK: true, wantStreak: 2,
+		},
+		{
+			name:       "never came back",
+			probes:     []RecoveryProbe{p(0, 0.1, true), p(1, 1.1, false)},
+			wantOutage: true, wantOK: false, wantStreak: 0,
+		},
+		{name: "no probes", wantOK: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, outage, ok := RecoveredAt(tt.probes)
+			if ok != tt.wantOK || outage != tt.wantOutage {
+				t.Fatalf("ok=%v outage=%v, want ok=%v outage=%v", ok, outage, tt.wantOK, tt.wantOutage)
+			}
+			if ok && !got.Equal(at(tt.want)) {
+				t.Fatalf("recovered at +%s, want +%vs", got.Sub(t0), tt.want)
+			}
+			if s := RecoveryStreak(tt.probes); s != tt.wantStreak {
+				t.Fatalf("streak %d, want %d", s, tt.wantStreak)
+			}
+		})
 	}
 }
