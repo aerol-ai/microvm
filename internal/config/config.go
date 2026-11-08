@@ -227,7 +227,10 @@ type Config struct {
 	// buildkitd at the default socket with a containerd worker on the aerolvm
 	// namespace. SB_CONTAINERD_BUILDKIT_ADDR.
 	ContainerdBuildKitAddr string
-	// ContainerdNetnsPoolRefillInterval drives native netns pool refill.
+	// ContainerdNetnsPoolRefillInterval is the native netns pool's refill
+	// backstop tick. A claim from the warm queue wakes the refiller at
+	// once; the tick covers freed slots, failed refills and the retry of
+	// slots parked as releasing.
 	ContainerdNetnsPoolRefillInterval time.Duration
 	// ContainerdPoolEnabled gates the warm containerd task pool (Phase 3).
 	// SB_CONTAINERD_POOL_ENABLED.

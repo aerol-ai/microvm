@@ -37,12 +37,31 @@ type Pool struct {
 	// by the seeded pool size.
 	slotLocks sync.Map // slot id -> *sync.Mutex
 
+	// claimed wakes the refiller each time a create takes a slot: a warm
+	// one (ClaimPooled), or after a miss a free one for its inline build
+	// (Reserve). A 2 s ticker alone let any burst above about 2 creates a
+	// second per node drain the queue, and every create after that built
+	// its namespace inline (plan PR #1000, item L5). One slot of buffer: a
+	// burst of claims folds into a single pending refill pass, and the
+	// claiming create never waits on the refiller.
+	claimed chan struct{}
+
 	logMu  sync.RWMutex
 	logger *slog.Logger
 }
 
 func New(st *store.Store) *Pool {
-	return &Pool{st: st}
+	return &Pool{st: st, claimed: make(chan struct{}, 1)}
+}
+
+// wakeRefiller asks the refiller for a pass without ever blocking: when a
+// pass is already pending the wake is dropped, because that pass reads the
+// queue depth when it starts and so covers this claim too.
+func (p *Pool) wakeRefiller() {
+	select {
+	case p.claimed <- struct{}{}:
+	default:
+	}
 }
 
 // SetLogger routes the pool's teardown warnings (failed CNI DEL / netns
@@ -127,11 +146,16 @@ func (s Slot) netnsName() string {
 }
 
 // Reserve claims a slot for sandboxID. Idempotent for the same sandbox.
+// A create reserves after a warm queue miss, to build inline, so this is
+// where a miss wakes the refiller: only once the create holds its slot.
+// Woken at the miss itself, the refill could take the last free slot first
+// and fail a create that would have fit.
 func (p *Pool) Reserve(ctx context.Context, sandboxID string, now time.Time) (*Slot, error) {
 	raw, err := p.st.ReserveContainerNetnsSlot(ctx, sandboxID, now)
 	if err != nil {
 		return nil, err
 	}
+	p.wakeRefiller()
 	return slotFromStore(raw), nil
 }
 
