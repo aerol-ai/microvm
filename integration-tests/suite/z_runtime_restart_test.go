@@ -422,10 +422,61 @@ sudo systemctl start sandboxd`
 	}
 }
 
-// isolateCounter counts fetches in a module global: it lives as long as the
-// isolate that runs the sandbox.
+// isolateCounter counts fetches of any path but /ping in a module global: it
+// lives as long as the isolate that runs the sandbox. /ping answers without
+// counting, so a case can keep the isolate in use while it waits: the idle
+// reaper stops a group that sees no request for SB_ISOLATE_GROUP_IDLE_TTL
+// (5m by default), and its sandboxes then start fresh.
 const isolateCounter = `let n = 0;
-export default { async fetch() { n++; return new Response(String(n)); } };`
+export default { async fetch(req) {
+  if (new URL(req.url).pathname === "/ping") return new Response("alive");
+  n++; return new Response(String(n));
+} };`
+
+// keepIsolateInUse pings sb every interval until the returned stop is
+// called, so a long wait (an upgrade's upload) never leaves its group idle
+// long enough for the idle reaper. A ping that fails (sandboxd is down for
+// its restart) is only counted.
+func keepIsolateInUse(t *testing.T, sb *microvm.Sandbox, interval time.Duration) (stop func()) {
+	t.Helper()
+	done := make(chan struct{})
+	finished := make(chan struct{})
+	ok, failed := 0, 0
+	go func() {
+		defer close(finished)
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-ticker.C:
+				ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+				res, err := sb.ExecCommand(ctx, "/ping")
+				cancel()
+				if err == nil && strings.TrimSpace(res.Stdout) == "alive" {
+					ok++
+				} else {
+					failed++
+				}
+			}
+		}
+	}()
+	return func() {
+		close(done)
+		<-finished
+		t.Logf("kept isolate %s in use: %d pings answered, %d failed", sb.ID, ok, failed)
+	}
+}
+
+// isolateReapedSince reports whether the idle reaper stopped group since
+// began, from sandboxd's journal: an isolate that answers 1 after a long
+// wait was reaped for idleness, which is not a failed takeover.
+func isolateReapedSince(t *testing.T, target, group string, began time.Time) string {
+	t.Helper()
+	out, _ := harness.SSHRun(t, target, fmt.Sprintf("sudo journalctl -u sandboxd --since '@%d' --no-pager -o cat | grep -F 'isolate idle reaper stopped a group' | grep -F 'group=%s ' || true", began.Unix()-1, group))
+	return strings.TrimSpace(out)
+}
 
 // newIsolateCounterSubject creates an isolate sandbox with the counter
 // bundle and fetches it to 2.

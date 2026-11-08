@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/aerol-ai/microvm/integration-tests/suite/harness"
 	sdktypes "github.com/aerol-ai/microvm/sdk/go/pkg/types"
@@ -74,8 +75,17 @@ func TestUpgradeKeepsWasmAndIsolateRunning(t *testing.T) {
 		t.Fatalf("plan = %d\n%s", plan.code, plan.stdout)
 	}
 
+	// The upload alone can take longer than the isolate idle TTL (5m; 628 s
+	// on one run), and the old sandboxd runs all through it: left alone, its
+	// idle reaper stops the isolate's group before the upgrade even starts,
+	// and the isolate comes back fresh. That is scale-to-zero working, not
+	// a takeover failure, so the isolate is kept in use with pings that do
+	// not count.
+	began := time.Now()
 	t14MeasureWith(t, target, subjects, func() {
+		stop := keepIsolateInUse(t, isolate.sb, time.Minute)
 		r := aerolvmLong(t, "upgrade", "apply", versionB, "--from", dirB, "--allow-unversioned", "--wait")
+		stop()
 		if r.code != 0 {
 			t.Fatalf("apply = %d", r.code)
 		}
@@ -85,6 +95,9 @@ func TestUpgradeKeepsWasmAndIsolateRunning(t *testing.T) {
 	}
 	t14AssertKept(t, wasmDefault, "4", "marker: marker-"+wasmDefault.sb.ID)
 	t14AssertKept(t, wasmPassive, "4", "marker: marker-"+wasmPassive.sb.ID)
+	if reaped := isolateReapedSince(t, target, "itest-uc703", began); reaped != "" {
+		t.Errorf("the idle reaper stopped the isolate's group during the upgrade, so it came back fresh: the keep-alive did not keep it in use\n%s", reaped)
+	}
 	t14AssertKept(t, isolate, "4", "in-memory counter 4")
 
 	// Back to A, as UC-664 does, so later cases find the build they expect.
