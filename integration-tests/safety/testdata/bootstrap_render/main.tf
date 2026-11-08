@@ -33,7 +33,7 @@ locals {
     with_firecracker = false
     with_gvisor = false
     with_isolate = false
-    ingress_proxy_routing = false
+    ingress_proxy_routing = null # the variable's default: no routing flag
     with_nvidia_gpu = false
     with_amd_gpu = false
     idle_timeout_min = 30
@@ -172,6 +172,15 @@ locals {
 }
 output "seed"   { value = templatefile("__TEMPLATE__", merge(local.base, { is_seed = true })) }
 output "joiner" { value = templatefile("__TEMPLATE__", merge(local.base, { is_seed = false })) }
+
+# default_ingress_proxy_routing is three-valued (Terraform/variables.tf): the
+# base above is null (no flag, install.sh's default); these set it.
+output "joiner_routing_on" {
+  value = templatefile("__TEMPLATE__", merge(local.base, { is_seed = false, ingress_proxy_routing = true }))
+}
+output "joiner_routing_off" {
+  value = templatefile("__TEMPLATE__", merge(local.base, { is_seed = false, ingress_proxy_routing = false }))
+}
 
 # install.sh --pat-scope host and --l4-proxy-protocol (identity-and-access
 # T10/T12): the Caddy halves are written by install.sh, so the template only

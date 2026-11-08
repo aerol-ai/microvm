@@ -119,6 +119,40 @@ func TestInstallRunsWithoutHOME(t *testing.T) {
 	}
 }
 
+// Routing is on by default with --domain, so --no-ingress-proxy-routing is
+// how a domain install stays on per-sandbox Caddy routes. Both routing flags
+// must parse: the run gets past the flag loop to a later refusal (--no-start
+// with --local) instead of stopping at "Unknown argument". The help names
+// the off switch. In noInstallEnv, so a missing guard cannot install.
+func TestInstallParsesTheRoutingFlags(t *testing.T) {
+	if _, err := exec.LookPath("bash"); err != nil {
+		t.Skip("bash not available")
+	}
+	script, err := filepath.Abs(filepath.Join("..", "..", "scripts", "install.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, flag := range []string{"--ingress-proxy-routing", "--no-ingress-proxy-routing"} {
+		t.Run(flag, func(t *testing.T) {
+			cmd := exec.Command("bash", script, flag, "--local", "--no-start")
+			cmd.Dir = t.TempDir()
+			cmd.Env = noInstallEnv(t)
+			out, err := cmd.CombinedOutput()
+			if err == nil || strings.Contains(string(out), "Unknown argument") ||
+				!strings.Contains(string(out), "--no-start is for a node cluster-join.sh will start") {
+				t.Fatalf("install.sh %s --local --no-start = %v, want the --no-start refusal (the flag parsed):\n%s", flag, err, out)
+			}
+		})
+	}
+	cmd := exec.Command("bash", script, "--help")
+	cmd.Dir = t.TempDir()
+	cmd.Env = noInstallEnv(t)
+	out, err := cmd.CombinedOutput()
+	if err != nil || !strings.Contains(string(out), "--no-ingress-proxy-routing") || !strings.Contains(string(out), "On by default with --domain") {
+		t.Fatalf("install.sh --help = %v, want the routing default and its off switch:\n%s", err, out)
+	}
+}
+
 // noInstallEnv is an environment in which install.sh cannot change the
 // machine running the test: HOME is a temp dir and every tool an install step
 // reaches for (downloads, launchd, systemd, apt, sudo, docker) fails at once.

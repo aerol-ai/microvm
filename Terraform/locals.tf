@@ -93,6 +93,9 @@ locals {
       )
       # bool defaults need explicit null handling — coalesce treats `false` as
       # a real value, but optional() without a default returns null.
+      # ingress_proxy_routing may stay null on purpose (its default is null):
+      # null renders no routing flag, so the node follows install.sh's own
+      # default (templates/bootstrap.sh.tftpl). coalesce would error there.
       with_firecracker      = n.with_firecracker == null ? var.default_with_firecracker : n.with_firecracker
       with_gvisor           = n.with_gvisor == null ? var.default_with_gvisor : n.with_gvisor
       with_isolate          = n.with_isolate == null ? var.default_with_isolate : n.with_isolate

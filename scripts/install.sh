@@ -35,8 +35,10 @@ RUNSC_PATH=""
 WITH_ISOLATE="false"
 # Routing without per-sandbox Caddy writes (plans/ingress-proxy-routing.md).
 # Sets SB_INGRESS_PROXY_ROUTING and routes *.rt.internal to the sandboxd
-# route responder via systemd-resolved.
-INGRESS_PROXY_ROUTING="false"
+# route responder via systemd-resolved. Empty until the flags are parsed:
+# --ingress-proxy-routing / --no-ingress-proxy-routing decide, and without
+# either resolve_ingress_proxy_routing turns it on for a --domain install.
+INGRESS_PROXY_ROUTING=""
 ROUTE_DNS_ADDR="127.0.0.1:53053"
 # The aerolvm-rt link's own address. systemd-resolved sends *.rt.internal
 # here, not to ROUTE_DNS_ADDR (write_route_dns_resolver says why), and
@@ -239,7 +241,11 @@ Options:
   --ingress-proxy-routing      Route sandboxes without per-sandbox Caddy
                                writes (static routes + sandboxd route
                                responder; configures systemd-resolved for
-                               *.rt.internal). Off by default.
+                               *.rt.internal). On by default with --domain;
+                               it does not apply without one.
+  --no-ingress-proxy-routing   Keep a --domain install on per-sandbox Caddy
+                               routes (every expose and destroy reloads
+                               Caddy). Writes SB_INGRESS_PROXY_ROUTING=false.
   --with-isolate               Install Cloudflare's workerd (version-pinned,
                                SHA-256 verified against hashes embedded in
                                this script) to /usr/local/bin/workerd and
@@ -517,6 +523,25 @@ sha256_check() {
 	fi
 }
 
+# resolve_ingress_proxy_routing settles the routing flag once the flags are
+# parsed. An explicit --ingress-proxy-routing or --no-ingress-proxy-routing
+# wins. Otherwise it is on for a --domain install, the only kind it applies
+# to: sandboxd routes names under the domain with static Caddy routes and
+# its own responder, so an expose or destroy no longer reloads Caddy and
+# drops new connections (plans/ingress-proxy-routing.md §1). Without a domain, or
+# with --local (no Caddy), it is off: sandboxd would skip it anyway, and the
+# resolver link would be set up for nothing.
+resolve_ingress_proxy_routing() {
+	if [[ -n "$INGRESS_PROXY_ROUTING" ]]; then
+		return
+	fi
+	if [[ -n "$DOMAIN" && "$LOCAL_MODE" != "true" ]]; then
+		INGRESS_PROXY_ROUTING="true"
+	else
+		INGRESS_PROXY_ROUTING="false"
+	fi
+}
+
 # install_cli installs the aerolvm agent CLI alone
 # (plans/mcp-server-and-agent-cli.md §5.8): the path for laptops and CI
 # runners that drive a sandboxd running somewhere else.
@@ -686,6 +711,10 @@ while [[ $# -gt 0 ]]; do
 			INGRESS_PROXY_ROUTING="true"
 			shift
 			;;
+		--no-ingress-proxy-routing)
+			INGRESS_PROXY_ROUTING="false"
+			shift
+			;;
 		--workerd-path)
 			WORKERD_PATH="$2"
 			shift 2
@@ -801,6 +830,8 @@ if [[ "$CLI_ONLY" == "true" ]]; then
 	install_cli
 	exit 0
 fi
+
+resolve_ingress_proxy_routing
 
 if [[ "$NO_START" == "true" && "$LOCAL_MODE" == "true" ]]; then
 	echo "--no-start is for a node cluster-join.sh will start; --local never joins a cluster" >&2
@@ -1812,8 +1843,10 @@ write_route_dns_resolver() {
 		rm -f /etc/systemd/resolved.conf.d/aerolvm-route-dns.conf
 	fi
 	if ! systemctl is-active --quiet systemd-networkd || ! systemctl is-active --quiet systemd-resolved; then
-		echo "WARNING: --ingress-proxy-routing needs systemd-networkd + systemd-resolved to scope *.rt.internal;" >&2
-		echo "         not configuring it. sandboxd will refuse the flag at boot and keep per-sandbox Caddy routes." >&2
+		# Routing is on by default with --domain, so say how to turn it off.
+		echo "WARNING: ingress proxy routing needs systemd-networkd + systemd-resolved to scope *.rt.internal;" >&2
+		echo "         not configuring it. On a cluster ingress node sandboxd will refuse the flag at boot and keep" >&2
+		echo "         per-sandbox Caddy routes. Re-run with --no-ingress-proxy-routing to turn it off." >&2
 		return
 	fi
 	mkdir -p /etc/systemd/network
@@ -1832,7 +1865,7 @@ EOF
 		fi
 		sleep 1
 	done
-	echo "WARNING: aerolvm-rt never got a DNS scope; sandboxd will refuse --ingress-proxy-routing at boot." >&2
+	echo "WARNING: aerolvm-rt never got a DNS scope; on a cluster ingress node sandboxd will refuse ingress proxy routing at boot." >&2
 }
 
 write_caddy_systemd_dropin() {

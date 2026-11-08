@@ -59,6 +59,11 @@ func startIngressRouting(ctx context.Context, cfg config.Config, svc routingServ
 			}
 			b.writeMarker(false)
 		}
+		if !cfg.IngressProxyRoutingApplies() {
+			// config.Load cleared the default-on flag: there is nothing to
+			// route here. Debug only, so local and IP-mode installs stay quiet.
+			logger.Debug("ingress proxy routing not applicable on this node (it needs SB_ENABLE_CADDY and SB_DOMAIN)")
+		}
 		return b
 	}
 	if !cfg.IsWorker() && !cfg.IsIngress() {
@@ -142,6 +147,18 @@ func (b *ingressRoutingBoot) writeMarker(v bool) {
 		b.logger.Warn("write ingress proxy routing marker failed; rollback detection may misfire next boot",
 			"marker_path", b.marker, "error", err)
 	}
+}
+
+// hostPortForwarderFor returns the kernel forwarder when this boot can need
+// it: the flag is on, or the previous boot engaged and the rollback must
+// remove its rules. Otherwise nil without probing iptables, so a node the
+// flag does not apply to (macOS local mode has no iptables) logs no warning
+// about a feature it is not using.
+func hostPortForwarderFor(cfg config.Config, logger *slog.Logger) service.HostPortForwarder {
+	if !cfg.IngressProxyRouting && !readBypassMarker(ingressRoutingMarkerPath(cfg)) {
+		return nil
+	}
+	return newHostPortForwarder(logger)
 }
 
 // newHostPortForwarder returns the kernel forwarder, or nil where iptables
