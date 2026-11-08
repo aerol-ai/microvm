@@ -5,7 +5,7 @@
 #   scripts/mirror-sync.sh --release <tag> [--latest | --no-latest]
 #   scripts/mirror-sync.sh --deps
 #
-# Options for both: --bucket <name>, --region <region>, --dry-run,
+# Options for both: --bucket <name>, --region <region>, --dry-run, --force,
 # --repo <owner/repo> (releases only), --install-sh <path> (deps only).
 #
 # --release downloads every file of an AerolVM release with gh, checks each
@@ -18,6 +18,13 @@
 # install.sh, checks its pinned SHA-256, and uploads it to
 # deps/<project>/<version>/<file>. The pins are read from install.sh itself
 # (the DOWNLOAD PINS block), so the mirror and the installer cannot disagree.
+#
+# A file already on the mirror at the same size is not uploaded again, so a
+# re-run (or a release workflow re-running) sends only what is missing; on
+# 2026-11-08 a plain sync re-sent all of v0.6.11 because every freshly
+# downloaded file looked newer. Deps paths are versioned and never change in
+# place. A release re-cut under the same tag, with a file that changed but
+# kept its size, needs --force, which uploads every file.
 #
 # Nothing is uploaded unless every file checked out. --dry-run prints the
 # plan and downloads or uploads nothing. Uploading needs AWS credentials
@@ -33,6 +40,7 @@ MODE=""
 TAG=""
 LATEST="auto"
 DRY_RUN="false"
+FORCE="false"
 INSTALL_SH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/install.sh"
 
 TAG_RE='^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$'
@@ -141,7 +149,7 @@ sync_release() {
 	gh release download "$tag" --repo "$REPO" --dir "$dir"
 	check_release "$dir" "$tag"
 	echo "Every file of ${tag} matches its checksums.txt; uploading to ${dest}"
-	aws s3 sync "$dir" "$dest" --region "$REGION" --only-show-errors --no-progress
+	aws s3 sync "$dir" "$dest" "${SYNC_OPTS[@]}"
 	if [[ "$mark" == "yes" ]]; then
 		printf '%s\n' "$tag" >"$WORK/latest.txt"
 		# latest.txt moves only after every file of the release is up, so
@@ -229,7 +237,7 @@ sync_deps() {
 	done <<<"$rows"
 	[[ "$DRY_RUN" == "true" ]] && return 0
 	echo "All ${count} pinned files match; uploading to s3://${BUCKET}/deps/"
-	aws s3 sync "$stage/deps" "s3://${BUCKET}/deps" --region "$REGION" --only-show-errors --no-progress
+	aws s3 sync "$stage/deps" "s3://${BUCKET}/deps" "${SYNC_OPTS[@]}"
 	echo "Done: ${count} files are on the mirror"
 }
 
@@ -250,6 +258,7 @@ while [[ $# -gt 0 ]]; do
 		--latest) LATEST="yes"; shift ;;
 		--no-latest) LATEST="no"; shift ;;
 		--dry-run) DRY_RUN="true"; shift ;;
+		--force) FORCE="true"; shift ;;
 		--bucket)
 			[[ $# -ge 2 && "$2" =~ ^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$ ]] || die "--bucket needs an S3 bucket name"
 			BUCKET="$2"
@@ -285,6 +294,12 @@ done
 if [[ "$MODE" == "deps" && "$LATEST" != "auto" ]]; then
 	die "--latest and --no-latest go with --release"
 fi
+
+# --size-only skips a file the mirror already holds at the same size; the
+# default sync also re-sends any local file with a newer mtime, which is
+# every file just downloaded.
+SYNC_OPTS=(--region "$REGION" --only-show-errors --no-progress)
+[[ "$FORCE" == "true" ]] || SYNC_OPTS+=(--size-only)
 
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT

@@ -54,6 +54,7 @@ gh release create vX.Y.Z --target <main commit> --title "vX.Y.Z: <short summary>
   scripts/mirror-sync.sh --release vX.Y.Z
   ```
 
+- **A re-run uploads only what is missing.** A file already on the mirror at the same size is skipped. If you re-cut a release under the same tag, run `scripts/mirror-sync.sh --release <tag> --force` so every file is sent again.
 - **Re-sync third-party files only when a pin changes.** The pins are the `DOWNLOAD PINS` block in `scripts/install.sh`. After you bump a version and its hashes there, and before the release that ships the new `install.sh`, run `scripts/mirror-sync.sh --deps`. It reads the pins from `install.sh`, checks every file against its pin, and uploads nothing unless all of them match.
 
 ## 4. Sync the changelog

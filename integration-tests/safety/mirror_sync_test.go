@@ -55,16 +55,29 @@ fi
 const fakeS3 = `#!/usr/bin/env bash
 echo "aws $*" >>"$TOOL_LOG"
 args=()
+size_only=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --region|--content-type|--cache-control) shift 2 ;;
     --only-show-errors|--no-progress) shift ;;
+    --size-only) size_only=1; shift ;;
     *) args+=("$1"); shift ;;
   esac
 done
 dst="$FAKE_S3/${args[3]#s3://}"
 case "${args[0]} ${args[1]}" in
-  "s3 sync") mkdir -p "$dst"; cp -R "${args[2]}/." "$dst/" ;;
+  "s3 sync")
+    # Like aws s3 sync: with --size-only a file already there at the same
+    # size is left alone.
+    src="${args[2]}"
+    (cd "$src" && find . -type f) | while read -r rel; do
+      to="$dst/${rel#./}"
+      if [[ -n "$size_only" && -f "$to" && $(wc -c <"$src/$rel") -eq $(wc -c <"$to") ]]; then
+        echo "skip ${rel#./}" >>"$TOOL_LOG"
+        continue
+      fi
+      mkdir -p "$(dirname "$to")"; cp "$src/$rel" "$to"
+    done ;;
   "s3 cp") mkdir -p "$(dirname "$dst")"; cp "${args[2]}" "$dst" ;;
   *) echo "fake aws: $*" >&2; exit 2 ;;
 esac
@@ -402,5 +415,45 @@ func TestMirrorSyncDepsPlanCoversTheMirrorLayout(t *testing.T) {
 		if !strings.Contains(r.stdout, "s3://aerolvm-downloads/"+key) {
 			t.Errorf("the plan has no %s", key)
 		}
+	}
+}
+
+// A re-run sends only what the mirror lacks: a file already there at the
+// same size is left alone (on 2026-11-08 a plain sync re-sent all of v0.6.11
+// because every freshly downloaded file looked newer). --force sends every
+// file again, for a release re-cut under the same tag.
+func TestMirrorSyncSkipsFilesAlreadyOnTheMirror(t *testing.T) {
+	const repo, tag = "aerol-ai/microvm", "v1.2.3"
+	r := newSyncRig(t)
+	files := map[string]string{"sandboxd_linux_amd64": "sandboxd", "install.sh": "#!/bin/sh\n"}
+	files["checksums.txt"] = checksumsFor(files)
+	r.release(repo, tag, files)
+	mustWrite(t, filepath.Join(r.gh, repo, "LATEST"), tag+"\n")
+
+	r.run("--release", tag)
+	if r.code != 0 {
+		t.Fatalf("first sync exit %d", r.code)
+	}
+	key := filepath.Join(r.s3, "aerolvm-downloads", "aerolvm", tag, "sandboxd_linux_amd64")
+	// Same size, different bytes: a skipped file keeps them.
+	mustWrite(t, key, "SANDBOXD")
+
+	r.run("--release", tag)
+	if r.code != 0 {
+		t.Fatalf("second sync exit %d", r.code)
+	}
+	if got := r.uploaded()["aerolvm-downloads/aerolvm/"+tag+"/sandboxd_linux_amd64"]; got != "SANDBOXD" {
+		t.Fatalf("a file already on the mirror at the same size was uploaded again (now %q)", got)
+	}
+	if !strings.Contains(r.logs, "skip sandboxd_linux_amd64") {
+		t.Fatal("the sync did not ask to skip files already there (--size-only)")
+	}
+
+	r.run("--release", tag, "--force")
+	if r.code != 0 {
+		t.Fatalf("forced sync exit %d", r.code)
+	}
+	if got := r.uploaded()["aerolvm-downloads/aerolvm/"+tag+"/sandboxd_linux_amd64"]; got != "sandboxd" {
+		t.Fatalf("--force left %q, want the released bytes", got)
 	}
 }
