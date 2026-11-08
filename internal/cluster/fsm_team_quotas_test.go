@@ -312,6 +312,9 @@ func TestTeamQuotaConcurrentReservationsAcrossNodes(t *testing.T) {
 	follower, cleanupFollower := newTestCluster(t, "quota-fol", false, []string{leader.gossip.ml.LocalNode().Address()})
 	defer cleanupFollower()
 	waitForVoter(t, leader, follower.nodeID, 20*time.Second)
+	// Every write below goes through the follower first; until its Raft has
+	// heard from the leader it answers ErrNotLeader (CI flake, 2026-11-07).
+	waitForFollowerToReachLeader(t, follower, leader.nodeID, 20*time.Second)
 	giveFreshCapacity(leader)
 	giveFreshCapacity(follower)
 	ctx := context.Background()

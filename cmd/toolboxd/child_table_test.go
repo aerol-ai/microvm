@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -317,6 +318,32 @@ func TestIsExitStatus(t *testing.T) {
 	for _, tc := range cases {
 		if got := isExitStatus(tc.err); got != tc.want {
 			t.Errorf("%s: isExitStatus(%v) = %v, want %v", tc.name, tc.err, got, tc.want)
+		}
+	}
+}
+
+// withWaitError is the one rule handleExec and handleDaytonaCodeRun use to
+// put a wait error into stderr. The failure branch cannot be reached through
+// a real exec on demand (it needs the deadline to land just as the command
+// exits 0), so it is pinned here with made-up errors.
+func TestWithWaitError(t *testing.T) {
+	ranExit3 := exec.Command("sh", "-c", "exit 3").Run()
+	cases := []struct {
+		name   string
+		stderr string
+		err    error
+		want   string
+	}{
+		{"no error", "warn\n", nil, "warn\n"},
+		{"Go's exit error", "bad\n", ranExit3, "bad\n"},
+		{"the reaper's exit status (UC-458)", "bad\n", &reapedExit{status: syscall.WaitStatus(3 << 8)}, "bad\n"},
+		{"reaped elsewhere", "bad\n", syscall.ECHILD, "bad\n"},
+		{"a deadline that won over a clean exit", "partial\n", context.DeadlineExceeded, "partial\n\ncontext deadline exceeded"},
+		{"a pipe error, empty stderr", "", fmt.Errorf("read |0: %w", os.ErrClosed), "read |0: file already closed"},
+	}
+	for _, tc := range cases {
+		if got := withWaitError(tc.stderr, tc.err); got != tc.want {
+			t.Errorf("%s: withWaitError(%q, %v) = %q, want %q", tc.name, tc.stderr, tc.err, got, tc.want)
 		}
 	}
 }

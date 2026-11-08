@@ -494,14 +494,90 @@ fi
 # as long as that scenario's .tf dir does. $1 is this scenario's own pin
 # path, which is excluded so a kept scenario can re-lease what it already
 # holds.
+#
+# Pins are read from EVERY worktree of this clone, not just REPO_ROOT's.
+# Parallel lanes and agent sessions each run from their own worktree, and
+# each keeps its pins under its own .tf, so a lease that read only its own
+# tree handed out a domain another worktree was live on (2026-11-07: two
+# stacks behind one name, its A records round-robined between two ingresses,
+# and the suite saw "sandbox not found" and 401 invalid_signature). A worktree
+# whose run.sh predates this still reads only its own pins.
 domains_in_use() {
-  local own="${1:-}" f
-  for f in "${REPO_ROOT}"/integration-tests/.tf/*/.leased-domain; do
-    [[ -f "$f" ]] || continue
-    [[ -n "$own" && "$f" == "$own" ]] && continue
-    tr -d '[:space:]' < "$f"
-    echo
+  local own="${1:-}"
+  domain_pins "$own" | cut -d' ' -f1
+}
+
+# domain_pins prints "<domain> <pin path>" for every pin held in any worktree
+# of this clone, except $1 (this scenario's own pin).
+domain_pins() {
+  local own="${1:-}" root f
+  while IFS= read -r root; do
+    for f in "$root"/integration-tests/.tf/*/.leased-domain; do
+      [[ -f "$f" ]] || continue
+      [[ -n "$own" && "$f" == "$own" ]] && continue
+      printf '%s %s\n' "$(tr -d '[:space:]' < "$f")" "$f"
+    done
+  done < <(worktree_roots)
+}
+
+# worktree_roots prints REPO_ROOT first (so its pins keep the exact paths the
+# own-pin check compares against), then every other existing worktree of this
+# clone, once each. Outside a git checkout (a test tree) it is REPO_ROOT alone.
+worktree_roots() {
+  local self wt
+  printf '%s\n' "$REPO_ROOT"
+  self=$(cd "$REPO_ROOT" && pwd -P)
+  { git -C "$REPO_ROOT" worktree list --porcelain 2>/dev/null || true; } | sed -n 's/^worktree //p' |
+    while IFS= read -r wt; do
+      [[ -d "$wt" ]] || continue
+      [[ "$(cd "$wt" && pwd -P)" == "$self" ]] && continue
+      printf '%s\n' "$wt"
+    done
+}
+
+# The lease lock spans "read every pin" to "write ours", so two runs started
+# in the same second cannot both pick the one free domain. It is a directory
+# (mkdir is atomic everywhere; macOS has no flock) in the clone's shared git
+# dir, which every worktree sees. A lease holds it for well under a second, so
+# one older than a minute was left by a run killed mid-lease and is cleared.
+# find's -mmin rounding differs (BSD rounds up, GNU truncates), so "older than
+# a minute" can mean up to two; the wait runs for three, so a lock a killed run
+# left behind delays the next run but never fails it.
+lease_lock_path() {
+  local gitdir
+  gitdir=$(git -C "$REPO_ROOT" rev-parse --git-common-dir 2>/dev/null) || gitdir=""
+  if [[ -z "$gitdir" ]]; then
+    echo "${REPO_ROOT}/integration-tests/.tf/.domain-lease.lock"
+    return
+  fi
+  [[ "$gitdir" == /* ]] || gitdir="${REPO_ROOT}/${gitdir}"
+  echo "${gitdir}/aerol-itest-domain-lease.lock"
+}
+
+lease_lock_acquire() {
+  local lock tries=0
+  lock=$(lease_lock_path)
+  mkdir -p "$(dirname "$lock")"
+  until mkdir "$lock" 2>/dev/null; do
+    if [[ -n "$(find "$lock" -maxdepth 0 -mmin +1 2>/dev/null)" ]]; then
+      rmdir "$lock" 2>/dev/null || true
+      continue
+    fi
+    tries=$((tries + 1))
+    if [[ "$tries" -gt 1800 ]]; then
+      echo "domain lease: ${lock} is still held after 3 minutes; remove it by hand if no run is leasing" >&2
+      return 1
+    fi
+    sleep 0.1
   done
+  LEASE_LOCK="$lock"
+}
+
+lease_lock_release() {
+  if [[ -n "${LEASE_LOCK:-}" ]]; then
+    rmdir "$LEASE_LOCK" 2>/dev/null || true
+  fi
+  LEASE_LOCK=""
 }
 
 lease_domain() {
@@ -543,8 +619,9 @@ lease_domain() {
   # Fail loudly. Silently double-booking is how a live run gets its DNS
   # taken out from under it.
   echo "domain pool exhausted: all ${n} domains in ${DOMAINS_FILE} are held by another scenario" >&2
-  echo "held: $(tr '\n' ' ' <<<"$in_use")" >&2
-  echo "tear a scenario down (run.sh --destroy-only <scenario>) or add a domain to the pool" >&2
+  echo "held (domain, pin; pins in other worktrees count too):" >&2
+  domain_pins "$own_pin" | sed 's/^/  /' >&2
+  echo "tear a scenario down (run.sh --destroy-only <scenario>, from the worktree that holds it) or add a domain to the pool" >&2
   return 1
 }
 
@@ -609,13 +686,16 @@ lease_domain_for_scenario() {
   # an EMPTY pin, echoed nothing and returned 0, and a domain scenario went on
   # toward Terraform with no test domain (2026-10-16). A blank pool entry is no
   # lease either, so the pin is written only once there is a name to put in it.
-  domain=$(lease_domain "$pin") || return 1
+  lease_lock_acquire || return 1
+  domain=$(lease_domain "$pin") || { lease_lock_release; return 1; }
   if [[ -z "$domain" || "$domain" == "null" ]]; then
+    lease_lock_release
     echo "scenario ${scenario}: ${DOMAINS_FILE} handed out a blank entry; refusing to lease it" >&2
     return 1
   fi
   mkdir -p "$sdir"
   printf '%s\n' "$domain" > "$pin"
+  lease_lock_release
   echo "$domain"
 }
 

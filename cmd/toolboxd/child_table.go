@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os/exec"
+	"strings"
 	"sync"
 	"syscall"
 )
@@ -99,6 +100,19 @@ func isExitStatus(err error) bool {
 	var exitErr *exec.ExitError
 	var reaped *reapedExit
 	return errors.As(err, &exitErr) || errors.As(err, &reaped) || reapedElsewhere(err)
+}
+
+// withWaitError returns stderr with waitErr added at the end when waitErr is
+// a real failure, so the caller sees why the run broke (with these pipes, in
+// practice the exec's deadline landing just as the command exited 0). A wait
+// error that is the command's own exit status (isExitStatus) is the result,
+// not a failure, and leaves stderr as it was. handleExec and
+// handleDaytonaCodeRun share it so the two cannot drift apart again.
+func withWaitError(stderr string, waitErr error) string {
+	if waitErr == nil || isExitStatus(waitErr) {
+		return stderr
+	}
+	return strings.TrimSpace(stderr + "\n" + waitErr.Error())
 }
 
 // settle is wait after cmd.Wait returned err.
