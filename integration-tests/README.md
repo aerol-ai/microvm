@@ -282,6 +282,7 @@ plan's fixes C2..C7 land; each test's doc comment in
 | UC-477 | Every server restarted in turn, leader last | I6 | C1 |
 | UC-478 | Loaded worker killed when the survivors have less room | I4, I6 | C7 |
 | UC-479 | Owner killed for real; the old node returns | I1, I6 | C4, C2 |
+| UC-484 | Owner worker cut off from the servers only; its paused sandbox's toolbox URL, HTTP port and raw TCP port probed on the worker | I7 | C4 (#1050) |
 
 - **Topology.** 3 servers, 3 workers, 1 ingress, all t3.medium on-demand
   (`scenarios/cluster-chaos.tfvars` says why each). About $0.29/h; bring-up

@@ -1081,6 +1081,7 @@ var Registry = []UseCase{
 	{ID: "UC-477", Title: "Chaos (I6; C1): every server is restarted one at a time; after each restart a leader is back, every committed placement keeps its owner and incarnation, every sandbox still runs once on its owner, and the cluster takes a new create", Requires: []Capability{CapCluster, CapClusterChaos}, Implemented: true},
 	{ID: "UC-478", Title: "Chaos (I4, I6; C7): a worker holding many recreate-policy sandboxes is killed while the survivors have less room than it held; no worker ever runs more than its budget, and every sandbox placed on a survivor runs there within the failover bound", Requires: []Capability{CapCluster, CapClusterChaos}, Implemented: true},
 	{ID: "UC-479", Title: "Chaos (I1, I6; C2, C4): after a real owner kill (sandboxd and the container runtime) and failover, the old node returns and never runs a copy of the sandbox; exactly one copy runs, on the new owner", Requires: []Capability{CapCluster, CapClusterChaos}, Implemented: true},
+	{ID: "UC-484", Title: "Chaos (I7; C4): a worker cut off from the servers pauses its recreate-policy sandbox, and every public address of it answers within seconds: the toolbox URL and the HTTP port with 503, the raw TCP port by closing the connection; after the heal they answer as before (#1050)", Requires: []Capability{CapCluster, CapClusterChaos}, Implemented: true},
 }
 
 // byID is a lookup built once for the report generator.
