@@ -240,13 +240,13 @@ func TestReassignStuckPlacementRejectsNonOwner(t *testing.T) {
 	c.fsm.claimOwnerLocked(p.SandboxID, p)
 	c.fsm.mu.Unlock()
 
-	if err := c.ReassignStuckPlacement(context.Background(), "wrk-old", "sb-moved", ""); !errors.Is(err, ErrStuckReassignNotOwner) {
+	if err := c.ReassignStuckPlacement(context.Background(), "wrk-old", "sb-moved", "", false); !errors.Is(err, ErrStuckReassignNotOwner) {
 		t.Fatalf("previous owner's reassign = %v, want ErrStuckReassignNotOwner", err)
 	}
-	if err := c.ReassignStuckPlacement(context.Background(), "wrk-new", "sb-moved", "inc-stale"); !errors.Is(err, ErrStuckReassignNotOwner) {
+	if err := c.ReassignStuckPlacement(context.Background(), "wrk-new", "sb-moved", "inc-stale", false); !errors.Is(err, ErrStuckReassignNotOwner) {
 		t.Fatalf("stale incarnation reassign = %v, want ErrStuckReassignNotOwner", err)
 	}
-	if err := c.ReassignStuckPlacement(context.Background(), "wrk-new", "sb-absent", ""); !errors.Is(err, ErrUnknownSandbox) {
+	if err := c.ReassignStuckPlacement(context.Background(), "wrk-new", "sb-absent", "", false); !errors.Is(err, ErrUnknownSandbox) {
 		t.Fatalf("unknown sandbox reassign = %v, want ErrUnknownSandbox", err)
 	}
 }
@@ -391,7 +391,7 @@ func TestReassignStuckPlacementExcludesTheFailingWorker(t *testing.T) {
 	})
 
 	p := placeFailoverPlacement(t, c, "sb-stuck-exclude", "stuck-worker")
-	if err := c.ReassignStuckPlacement(context.Background(), "stuck-worker", p.SandboxID, p.IncarnationID); err != nil {
+	if err := c.ReassignStuckPlacement(context.Background(), "stuck-worker", p.SandboxID, p.IncarnationID, false); err != nil {
 		t.Fatalf("ReassignStuckPlacement: %v", err)
 	}
 
@@ -417,7 +417,7 @@ func TestReassignStuckPlacementReportsWhenNoAlternateExists(t *testing.T) {
 	seedGossipView(t, c, []Member{recreateCandidate("lonely-worker", config.NodeRoleWorker, 100)})
 
 	p := placeFailoverPlacement(t, c, "sb-no-alternate", "lonely-worker")
-	err := c.ReassignStuckPlacement(context.Background(), "lonely-worker", p.SandboxID, p.IncarnationID)
+	err := c.ReassignStuckPlacement(context.Background(), "lonely-worker", p.SandboxID, p.IncarnationID, false)
 	if !errors.Is(err, ErrNoReassignTarget) {
 		t.Fatalf("reassign with no alternate = %v, want ErrNoReassignTarget", err)
 	}

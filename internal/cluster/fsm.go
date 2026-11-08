@@ -1419,9 +1419,12 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 			// heartbeat to every reassign after this one in the same
 			// eviction. It counts until the new owner's next heartbeat; one
 			// taken before the owner watcher there recreates the sandbox
-			// still misses it, and then the worker's admitter refuses the
-			// overflow, as before. Only failover moves count: a WASM
-			// migrate reassigns to the node that already holds the sandbox.
+			// still misses it (live run UC-478: a heartbeat half way through
+			// an eviction over-assigned both survivors). The worker's
+			// admitter then refuses the overflow and the owner watcher
+			// hands it back (handBackRefusedPlacement). Only failover moves
+			// count: a WASM migrate reassigns to the node that already
+			// holds the sandbox.
 			if !wasReserved && ownerChanged {
 				f.recordUnreportedLocked(cmd.OwnerNodeID, existing.Spec)
 			}
