@@ -359,3 +359,15 @@ output "joiner_join" {
     join_token    = "aaaaaa.00000000000000000000000000000000"
   }))
 }
+
+# A one-line worker or ingress joiner: Terraform passes no PAT (nodes.tf),
+# so its user data never holds the operator's admin token.
+output "joiner_join_worker" {
+  value = templatefile("__TEMPLATE__", merge(local.base, {
+    is_seed       = false
+    role          = "worker"
+    one_line_join = true
+    pat_token     = ""
+    join_token    = "aaaaaa.00000000000000000000000000000000"
+  }))
+}

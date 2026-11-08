@@ -4,7 +4,8 @@
 #
 # Variables expected:
 #   node_name, role, is_seed (bool),
-#   pat_token, domain, cloudflare_api_token,
+#   pat_token (empty for a one-line worker or ingress joiner), domain,
+#   cloudflare_api_token,
 #   with_firecracker (bool), with_gvisor (bool), with_isolate (bool), ingress_proxy_routing (bool), with_nvidia_gpu (bool), with_amd_gpu (bool),
 #   idle_timeout_min (number; 0 disables),
 #   pat_scope ("any" | "host"), l4_proxy_protocol (bool),
@@ -207,7 +208,10 @@ fi
 curl_download '${install_script_url}' -o /tmp/install.sh
 chmod +x /tmp/install.sh
 
-INSTALL_ARGS=(--pat-token '${pat_token}' --node-name '${node_name}')
+INSTALL_ARGS=(--node-name '${node_name}')
+%{ if pat_token != "" ~}
+INSTALL_ARGS+=(--pat-token '${pat_token}')
+%{ endif ~}
 if [ -n '${domain}' ]; then
   INSTALL_ARGS+=(
     --domain '${domain}'

@@ -338,7 +338,7 @@ resource "aws_instance" "joiner" {
     enable_custom_domains                    = local.enable_custom_domains
     custom_domain_txt_prefix                 = local.custom_domain_txt_prefix
     custom_domain_txt_value_prefix           = local.custom_domain_txt_value_prefix
-    pat_token                                = local.pat_token
+    pat_token                                = local.node_pat_token[each.key]
     cloudflare_api_token                     = local.cloudflare_api_token
     acme_email                               = local.acme_email
     acme_ca                                  = local.acme_ca

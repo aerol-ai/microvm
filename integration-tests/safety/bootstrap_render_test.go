@@ -81,7 +81,7 @@ func TestBootstrapTemplateRenders(t *testing.T) {
 	for _, branch := range []string{
 		"seed", "joiner", "joiner_kms", "joiner_audit_s3", "joiner_audit_file",
 		"seed_receiver", "joiner_receiver", "seed_public_ca", "seed_wrapped",
-		"joiner_api_lb", "joiner_api_lb_worker", "joiner_routing_on", "joiner_routing_off", "joiner_containerd_pool", "seed_join", "joiner_join", "joiner_blank",
+		"joiner_api_lb", "joiner_api_lb_worker", "joiner_routing_on", "joiner_routing_off", "joiner_containerd_pool", "seed_join", "joiner_join", "joiner_blank", "joiner_join_worker",
 		"joiner_download_mirror",
 	} {
 		t.Run(branch, func(t *testing.T) {
@@ -182,12 +182,17 @@ func TestBootstrapTemplateRenders(t *testing.T) {
 					"--token 'server=cccccc.00000000000000000000000000000000:24h'",
 					"written before sandboxd init / join.\nSB_CLUSTER_NODE_CERT_TTL=10m",
 				},
-				"joiner_join": {"join 'https://x:7003'", `--token "$JOIN_TOKEN"`, "/v1/join/cluster-info?token_id="},
+				"joiner_join":        {"join 'https://x:7003'", `--token "$JOIN_TOKEN"`, "/v1/join/cluster-info?token_id=", "--pat-token 'x'"},
+				"joiner_join_worker": {"join 'https://x:7003'", `--token "$JOIN_TOKEN"`},
 			}
 			for _, want := range joinMode[branch] {
 				if !strings.Contains(out, want) {
 					t.Errorf("rendered %s bootstrap is missing %q", branch, want)
 				}
+			}
+			// A one-line worker or ingress joiner never carries the PAT.
+			if branch == "joiner_join_worker" && strings.Contains(out, "--pat-token") {
+				t.Errorf("a one-line worker's bootstrap passes --pat-token")
 			}
 			// A blank node stops before installing anything.
 			if branch == "joiner_blank" {

@@ -55,6 +55,15 @@ locals {
       contains(split(",", replace(n.role, " ", "")), "worker") ? "worker" : "ingress"
     )
   }
+
+  # The operator PAT a joiner's user data carries. A one-line worker or
+  # ingress joiner gets none: the join answer brings the PAT's hash and the
+  # node calls its peers with its cert alone, so a leaked worker or ingress
+  # token (it sits in that user data) yields no admin credential. Servers
+  # still get the PAT, and the old two-pass join needs it on every node.
+  node_pat_token = {
+    for name, role in local.node_join_role : name => (var.one_line_join && role != "server" ? "" : local.pat_token)
+  }
 }
 
 resource "random_string" "join_token_id" {
