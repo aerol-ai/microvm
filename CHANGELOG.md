@@ -14,12 +14,12 @@ timeline
     July 2026 : 1 release : v0.5.5
     September 2026 : 3 releases : v0.5.6 to v0.6.0
     October 2026 : 8 releases : v0.6.1 to v0.6.8
-    November 2026 : 3 releases : v0.6.9 to v0.6.11
+    November 2026 : 4 releases : v0.6.9 to v0.6.12
 ```
 
 | Release line | Releases | Dates | Latest |
 |---|---|---|---|
-| [0.6](#06-release-line) | 12 | Sep 28, 2026 to Nov 4, 2026 | [v0.6.11](#v0611-firecracker-from-installsh-snapshots-and-vms-that-survive-a-restart) |
+| [0.6](#06-release-line) | 13 | Sep 28, 2026 to Nov 8, 2026 | [v0.6.12](#v0612-safer-cluster-failover-sandbox-lifecycle-controls-and-a-download-mirror) |
 | [0.5](#05-release-line) | 7 | Jun 1, 2026 to Sep 28, 2026 | [v0.5.7](#v057-dependency-updates) |
 | [0.4](#04-release-line) | 1 | May 28, 2026 | [v0.4.1](#v041-firecracker-runtime-wiring) |
 | [0.3](#03-release-line) | 1 | May 24, 2026 | [v0.3.1](#v031-custom-domains-and-image-garbage-collection) |
@@ -27,6 +27,29 @@ timeline
 | [0.1](#01-release-line) | 8 | May 8, 2026 to May 16, 2026 | [v0.1.7](#v017-daytona-and-e2b-compatibility-snapshots-image-builds) |
 
 ## 0.6 release line
+
+### v0.6.12: Safer cluster failover, sandbox lifecycle controls, and a download mirror
+
+*November 8, 2026* · [Full notes](https://github.com/aerol-ai/microvm/releases/tag/v0.6.12)
+
+> **Upgrade every server in one window.** Some cluster fixes change how servers apply the Raft log. An old and a new server can disagree on rare edge cases while both run. See "Upgrade notes".
+
+- **Cluster mode is safer when nodes fail or get cut off.** A worker that loses touch with the servers pauses its sandboxes before the leader moves them, so a sandbox never runs twice. A sandbox deleted while its node was away does not come back. Every public address of a paused sandbox answers at once instead of hanging. (#1032, #1050)
+- **Sandboxes manage their own lifetime.** A sandbox can restart after a crash, delete itself when its program ends or at a set time, and says why it stopped. (#924)
+- **More Daytona and E2B SDK calls work.** Daytona terminals, folder watching on gVisor and Firecracker, file copy as tar, ranged downloads, and commands given as a list. (#924)
+- **New access controls.** Signed per-sandbox tokens you can hand to a browser, ports shared behind a token, a cloud identity for each sandbox, per-team quotas, and placement rules by zone and node label. (#924)
+- **Sandbox routing without per-sandbox Caddy writes is on by default** on nodes with Caddy and a domain (`SB_INGRESS_PROXY_ROUTING`). Public sandboxes and exposed ports no longer need a Caddy route each, so they no longer wait on a Caddy reload, and a reload no longer drops the first request. (#1046)
+- **Installs keep working when GitHub downloads fail.** `install.sh` tries GitHub, then a public mirror on S3, then the vendor's own site. (#1051, #1052)
+
+**Before you upgrade:**
+
+- **Upgrade every server in one window.** The new FSM rule for deleted sandboxes waits until every server runs it. Three other changes do not wait, so mixed servers can disagree on rare edge cases.
+- **`destroy_at` in a lifecycle update** is refused until every node runs this release.
+- **Routing default.** `SB_INGRESS_PROXY_ROUTING` is on by default where it applies. It is on for new installs with a domain. It is also on for nodes upgraded without re-running `install.sh` whose env file has no routing line (installs older than v0.6.0). Installs from v0.6.0 on keep the value their env file names. To stay on per-sandbox Caddy routes, set `SB_INGRESS_PROXY_ROUTING=false` or pass `install.sh --no-ingress-proxy-routing`.
+- **Terraform:** `default_ingress_proxy_routing` now defaults to `null`, which follows the installer (on for a domain install). `null` leaves user data unchanged, so no node is replaced. Setting it to `true` or `false` changes user data once, which replaces each node once. `false` passes `--no-ingress-proxy-routing`, which `install.sh` first knows in v0.6.12; an older `install.sh` stops on it ("Unknown argument"). So with `false`, use an install script from v0.6.12 or later (the default `install_script_url` follows the latest release).
+- **Downgrade:** going back to an older release restarts a sandbox that took a warm-pool container with env without its env.
+- **Containerd warm pool:** still off by default. Its settings are now in every cluster deploy file, off.
+- **SDK features** need SDK 0.8.2 or later.
 
 ### v0.6.11: Firecracker from install.sh, snapshots, and VMs that survive a restart
 
