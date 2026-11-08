@@ -1282,7 +1282,7 @@ run_one() {
 
   # Capability checks read the structured list (not a substring grep, which
   # would false-match the word "domain" in a caps-file comment).
-  local caps_domain caps_wasm caps_cluster caps_platform_volumes caps_docker_pool caps_docker_netns_pool caps_docker_engine
+  local caps_domain caps_wasm caps_cluster caps_platform_volumes caps_docker_pool caps_docker_netns_pool caps_docker_engine caps_containerd_pool
   caps_domain=$(yq -r '.capabilities | contains(["domain"])' "$caps_file")
   caps_wasm=$(yq -r '.capabilities | contains(["wasm"])' "$caps_file")
   caps_cluster=$(yq -r '.capabilities | contains(["cluster"])' "$caps_file")
@@ -1290,6 +1290,7 @@ run_one() {
   caps_docker_pool=$(yq -r '.capabilities | contains(["docker-pool"])' "$caps_file")
   caps_docker_netns_pool=$(yq -r '.capabilities | contains(["docker-netns-pool"])' "$caps_file")
   caps_docker_engine=$(yq -r '.capabilities | contains(["docker-engine"])' "$caps_file")
+  caps_containerd_pool=$(yq -r '.capabilities | contains(["containerd-pool"])' "$caps_file")
   caps_obs=$(yq -r '.capabilities | contains(["observability"])' "$caps_file")
   # Identity and access (plans/identity-and-access.md T12). pat-scope-host:
   # the nodes run SB_PAT_SCOPE=host, so the PAT works only from a loopback
@@ -1388,6 +1389,14 @@ run_one() {
   # scenarios. Depth override mirrors the other pools.
   local docker_netns_pool_depth
   docker_netns_pool_depth="${AEROL_DOCKER_NETNS_POOL_DEPTH:-4}"
+  # containerd warm pool follows its own containerd-pool capability, for the
+  # same reason as docker-pool: each waiting container holds a default-shaped
+  # capacity reservation and a netns slot, which moves the UC-95 density
+  # ceiling, so a scenario opts in on purpose. It is written false otherwise so
+  # a pool an operator turned on in config/cluster.yml never leaks into a run.
+  # It only acts on the containerd engine; a docker-engine scenario ignores it.
+  local containerd_pool_depth
+  containerd_pool_depth="${AEROL_CONTAINERD_POOL_DEPTH:-2}"
   # Container engine policy: containerd is the DEFAULT engine for every
   # deployment mode. Only a scenario advertising the `docker-engine` capability
   # opts back out to dockerd — the local dev install (local-mode) and the docker
@@ -1416,6 +1425,8 @@ run_one() {
       | .docker.pool.depth = '"$docker_pool_depth"'
       | .docker.netns_pool.enabled = '"$caps_docker_netns_pool"'
       | .docker.netns_pool.depth = '"$docker_netns_pool_depth"'
+      | .containerd.pool.enabled = '"$caps_containerd_pool"'
+      | .containerd.pool.depth = '"$containerd_pool_depth"'
       | .container_engine = "'"$container_engine"'"
       | .platform_volumes.enabled = '"$caps_platform_volumes"'
       | .platform_volumes.backend = "s3"

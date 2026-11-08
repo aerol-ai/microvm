@@ -128,6 +128,14 @@ const (
 	// dockerd-coexistence restart stays off the runtime/metal scenarios where a
 	// pure-containerd host makes it not-applicable.
 	CapContainerdEngine Capability = "containerd-engine"
+	// CapContainerdPool is consumed by run.sh's config overlay, like
+	// CapDockerPool: it flips containerd.pool.enabled in the scenario's
+	// cluster.yml, which Terraform renders into SB_CONTAINERD_POOL_ENABLED.
+	// Separate from CapContainerdEngine because each waiting container holds a
+	// default-shaped capacity reservation and a netns slot, lowering the UC-95
+	// density ceiling, and because the engine scenarios exist to measure the
+	// cold path. No scenario advertises it yet: the pool ships off by default.
+	CapContainerdPool Capability = "containerd-pool"
 	// CapObservability gates UC-106/107 ("Grafana up", "Prometheus sees all
 	// sandboxd nodes") and tells run.sh to pass -var deploy_obs=true so
 	// Terraform/obs.tf provisions the dedicated obs EC2. Advertisement +
@@ -318,7 +326,7 @@ var KnownCapabilities = map[Capability]bool{
 	CapCluster: true, CapCustomDomains: true, CapExternalDNSZone: true,
 	CapMixedArchNegative: true, CapPlatformVolumes: true, CapBenchmark: true, CapNoHostFirewall: true,
 	CapDockerPool: true, CapDockerNetnsPool: true, CapDockerEngine: true,
-	CapContainerdEngine: true, CapObservability: true, CapSimulations: true,
+	CapContainerdEngine: true, CapContainerdPool: true, CapObservability: true, CapSimulations: true,
 	CapSecrets: true, CapSecretsKMS: true, CapEnterprise: true,
 	CapClusterMTLS: true, CapAuditExport: true, CapAuditWitness: true,
 	CapRemoteMCP: true, CapEgressFQDN: true, CapPrivateCloud: true,
@@ -1089,6 +1097,9 @@ var Registry = []UseCase{
 	{ID: "UC-480", Title: "Chaos (I8, I6): a worker's sandboxd is SIGKILLed while a create is parked by a failpoint between the runtime start and the store write; within the convergence bound the sandbox runs on no worker, has no placement, answers 404, and holds no netns slot or container (skips on a binary built without -tags itest_failpoints)", Requires: []Capability{CapCluster, CapClusterChaos}, Implemented: true},
 	{ID: "UC-481", Title: "Chaos (I6, I8): sandboxd is SIGKILLed on all three servers at once (or only the leader); the leader answer, a placement read and a new create all come back within AEROL_CHAOS_RTO_BUDGET_SECONDS (the recovery time is in the detail), every placement keeps its owner and incarnation, and creates sent during the outage end fully created or fully absent", Requires: []Capability{CapCluster, CapClusterChaos}, Implemented: true},
 	{ID: "UC-482", Title: "Soak (I6): closed-loop workers create, probe and delete for AEROL_SOAK_MINUTES while every node is sampled; after the drain and one reconcile interval every count (tasks, snapshots, netns slots, host ports, rows, routes, placements) is back at baseline, and goroutines, RSS, fds, WAL and Raft size level off; no sandboxd restarts", Requires: []Capability{CapCluster, CapClusterChaos}, Implemented: true},
+
+	// Warm pool with env (plans/cluster-phase-2.md §2, L3).
+	{ID: "UC-483", Title: "Warm pool (L3): on the containerd engine a create that carries env is a warm hit (Server-Timing has containerd_pool and no containerd_create), its processes read the env, the env is still there after a stop and start, and a create that sets an SB_ key still starts cold", Requires: []Capability{CapContainerdPool}, Implemented: true},
 }
 
 // byID is a lookup built once for the report generator.

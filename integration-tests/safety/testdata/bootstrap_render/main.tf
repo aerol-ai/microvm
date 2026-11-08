@@ -167,6 +167,7 @@ locals {
     docker_netns_pool_cfg = { enabled = "x", depth = "x", pause_image = "x", refill_interval = "x" }
     container_engine = "x"
     containerd_cfg = { socket = "x", namespace = "x", cni_plugin_dir = "x", native_netns_pool_enabled = "x" }
+    containerd_pool_cfg = { enabled = "false", depth = "x", images = "x", max_images = "x", idle_ttl = "x", refill_interval = "x" }
     platform_volumes_cfg = { enabled = "x", backend = "x", max_per_tenant = "x", nfs_export = "x", nfs_options = "x", nfs_server = "x", reclaim_concurrency = "x", reclaim_interval = "x", reclaim_mount_root = "x", s3_access_key_id = "x", s3_bucket = "x", s3_endpoint = "x", s3_prefix = "x", s3_region = "x", s3_secret_access_key = "x" }
   }
 }
@@ -298,5 +299,25 @@ output "joiner_api_lb_worker" {
   value = templatefile("__TEMPLATE__", merge(local.base, {
     is_seed        = false
     l4_public_host = "tcp.x.example.com"
+  }))
+}
+
+# containerd warm pool turned on from cluster.yml (containerd_pool_cfg), plus a
+# per-node sandboxd_env that changes its depth. Every other output has the pool
+# off, which must render nothing (TestBootstrapContainerdPoolOffRendersNothing);
+# this one checks the lines when on, and that a node's sandboxd_env still
+# renders after them and so wins.
+output "joiner_containerd_pool" {
+  value = templatefile("__TEMPLATE__", merge(local.base, {
+    is_seed = false
+    containerd_pool_cfg = {
+      enabled         = "true"
+      depth           = "4"
+      images          = "alpine:3.20,python:3.12-slim"
+      max_images      = "8"
+      idle_ttl        = "15m"
+      refill_interval = "5s"
+    }
+    sandboxd_env = { SB_CONTAINERD_POOL_DEPTH = "8" }
   }))
 }
