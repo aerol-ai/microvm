@@ -49,6 +49,16 @@ func TestUpgradeKeepsWasmAndIsolateRunning(t *testing.T) {
 		t.Skipf("the node runs %q, not this tree's build A itest-%s (an earlier case left it on another build)", versionA, buildID)
 	}
 	dirB, versionB := upgradeLive.dirB, "itest-"+buildID+"-b"
+	// AEROL_UPGRADE_B_DIR reuses a B already built from the node's tree
+	// (.build/<id>/variant-b), for a rerun on a kept stack whose own tree
+	// has moved on by test-only commits. It must still name the node's
+	// build id, so B is always the node's code under another version.
+	if reuse := os.Getenv("AEROL_UPGRADE_B_DIR"); dirB == "" && reuse != "" {
+		if filepath.Base(filepath.Dir(reuse)) != buildID {
+			t.Fatalf("AEROL_UPGRADE_B_DIR %s is not a variant of the node's build %s", reuse, buildID)
+		}
+		dirB = reuse
+	}
 	if dirB == "" {
 		cmd := exec.Command("bash", "../lib/build.sh", "variant", "b")
 		var stderr bytes.Buffer
