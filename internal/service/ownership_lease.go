@@ -86,6 +86,91 @@ type ownershipLease struct {
 	// actionMu serializes the expiry check and the confirm, which both
 	// freeze or thaw runtime instances.
 	actionMu sync.Mutex
+
+	// owned is what the last successful authoritative read proved, per
+	// local sandbox: the placement names this node, is placed, is the same
+	// lifetime as the local row, at this OwnerEpoch. ownedAt is when that
+	// read was sent. Kept only with SB_CLUSTER_OWNER_CACHE on (E3b): the
+	// router then serves a forward whose epoch matches without looking the
+	// sandbox up again (OwnerLeaseCheck).
+	owned   map[string]uint64
+	ownedAt time.Time
+}
+
+// OwnerLeaseVerdict is what the owner's last authoritative read says about a
+// forward that carries an owner epoch (cluster.HeaderOwnerEpoch).
+type OwnerLeaseVerdict int
+
+const (
+	// OwnerLeaseUnknown: the read cannot decide (no read, too old, no
+	// entry, an older epoch than the forward's, the sandbox is fenced, the
+	// flag is off). The router looks the sandbox up, as without E3b.
+	OwnerLeaseUnknown OwnerLeaseVerdict = iota
+	// OwnerLeaseOwned: the read proves this node owns the sandbox at the
+	// forward's epoch. Two authoritative readings agree, so the router
+	// serves without a lookup.
+	OwnerLeaseOwned
+	// OwnerLeaseNewer: the read holds a newer epoch than the forward's: the
+	// edge's view predates an owner change this node already saw.
+	OwnerLeaseNewer
+)
+
+// ownerLeaseHintedMaxAge bounds how old a read may be to vouch for a
+// cache-routed forward. The edge's entry may be up to the cache TTL old, so
+// the owner's read is the only fresh evidence; 2 s matches how far behind a
+// follower may answer a lookup before it refuses (cluster stale-read bound),
+// which is what the owner's own lookup would have risked.
+const ownerLeaseHintedMaxAge = 2 * time.Second
+
+// ownerFastPathEnabled reports whether the lease keeps per-sandbox owner
+// epochs for the router (E3b). It rides the owner cache flag: the two halves
+// are turned on together. A server-role node answers lookups from its own
+// placement copy, so it has no round trip to save and keeps the lease's
+// smaller read, as the owner cache ignores the flag there too.
+func (s *Service) ownerFastPathEnabled() bool {
+	return s != nil && s.cfg.EnableCluster && s.cfg.ClusterOwnerCache && !s.cfg.IsServer()
+}
+
+// OwnerLeaseCheck compares a forward's owner epoch with the last
+// authoritative read. A forward that came from a fresh edge lookup (hinted
+// false) may lean on a read as old as the lease itself: the edge's lookup is
+// the fresh evidence and the read only has to agree with it. A cache-routed
+// forward (hinted true) needs a read under ownerLeaseHintedMaxAge.
+func (s *Service) OwnerLeaseCheck(id string, epoch uint64, hinted bool, now time.Time) OwnerLeaseVerdict {
+	if !s.ownerFastPathEnabled() || epoch == 0 || id == "" {
+		return OwnerLeaseUnknown
+	}
+	maxAge := cluster.OwnershipLease(s.cfg)
+	if hinted {
+		maxAge = min(maxAge, ownerLeaseHintedMaxAge)
+	}
+	s.ownership.mu.Lock()
+	defer s.ownership.mu.Unlock()
+	if s.ownership.owned == nil || s.ownership.ownedAt.IsZero() || now.Sub(s.ownership.ownedAt) > maxAge {
+		return OwnerLeaseUnknown
+	}
+	if _, fenced := s.ownership.fenced[id]; fenced {
+		return OwnerLeaseUnknown
+	}
+	have, ok := s.ownership.owned[id]
+	switch {
+	case !ok:
+		return OwnerLeaseUnknown
+	case have == epoch:
+		return OwnerLeaseOwned
+	case have > epoch:
+		return OwnerLeaseNewer
+	default:
+		return OwnerLeaseUnknown
+	}
+}
+
+// SetOwnerLeaseForTest installs an owned-epoch reading taken at at, for
+// tests outside this package that exercise the router's fast path.
+func (s *Service) SetOwnerLeaseForTest(owned map[string]uint64, at time.Time) {
+	s.ownership.mu.Lock()
+	defer s.ownership.mu.Unlock()
+	s.ownership.owned, s.ownership.ownedAt = owned, at
 }
 
 // fencedSandbox is one sandbox held by the fence.
@@ -205,15 +290,24 @@ func (s *Service) confirmOwnership(ctx context.Context, sent time.Time) error {
 	}
 	s.ownership.actionMu.Lock()
 	defer s.ownership.actionMu.Unlock()
-	rows, err := s.localRecreateSandboxes(ctx)
+	live, err := s.localLiveSandboxes(ctx)
 	if err != nil {
 		return err
 	}
+	rows := recreateSandboxes(live)
+	// The lease itself needs only the recreate-policy sandboxes: no other
+	// sandbox is ever moved away from a live node. With the router's fast
+	// path on (E3b), the read covers every local sandbox, so the router can
+	// trust its epochs for all of them.
+	read := rows
+	if s.ownerFastPathEnabled() {
+		read = live
+	}
 	c := s.Cluster()
 	var placements map[string]cluster.Placement
-	if len(rows) > 0 {
-		ids := make([]string, 0, len(rows))
-		for _, sb := range rows {
+	if len(read) > 0 {
+		ids := make([]string, 0, len(read))
+		for _, sb := range read {
 			ids = append(ids, sb.ID)
 		}
 		placements, err = authoritativePlacementsForLease(ctx, c, ids)
@@ -225,9 +319,19 @@ func (s *Service) confirmOwnership(ctx context.Context, sent time.Time) error {
 		}
 	}
 
+	self := strings.TrimSpace(c.SelfNodeID())
 	s.ownership.mu.Lock()
 	if sent.After(s.ownership.confirmed) {
 		s.ownership.confirmed = sent
+	}
+	if s.ownerFastPathEnabled() && sent.After(s.ownership.ownedAt) {
+		owned := make(map[string]uint64, len(read))
+		for _, sb := range read {
+			if p, ok := placements[sb.ID]; ownershipProven(p, ok, self, sb) && p.OwnerEpoch != 0 {
+				owned[sb.ID] = p.OwnerEpoch
+			}
+		}
+		s.ownership.owned, s.ownership.ownedAt = owned, sent
 	}
 	firstSinceStart := !s.ownership.confirmedSinceStart && len(rows) > 0
 	if len(rows) > 0 {
@@ -248,7 +352,6 @@ func (s *Service) confirmOwnership(ctx context.Context, sent time.Time) error {
 	}
 	s.ownership.mu.Unlock()
 
-	self := strings.TrimSpace(c.SelfNodeID())
 	for _, sb := range rows {
 		frozen, isFenced := fenced[sb.ID]
 		if !isFenced && !firstSinceStart {
@@ -501,6 +604,15 @@ func (s *Service) thawSandbox(ctx context.Context, sb *models.Sandbox) error {
 // localRecreateSandboxes lists this node's failover.policy=recreate rows: the
 // only sandboxes another node can be handed while this one still runs them.
 func (s *Service) localRecreateSandboxes(ctx context.Context) ([]*models.Sandbox, error) {
+	live, err := s.localLiveSandboxes(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return recreateSandboxes(live), nil
+}
+
+// localLiveSandboxes lists every local sandbox row that is not destroyed.
+func (s *Service) localLiveSandboxes(ctx context.Context) ([]*models.Sandbox, error) {
 	all, err := s.store.List(ctx)
 	if err != nil {
 		return nil, err
@@ -510,12 +622,20 @@ func (s *Service) localRecreateSandboxes(ctx context.Context) ([]*models.Sandbox
 		if sb == nil || sb.ID == "" || sb.Status == models.SandboxStatusDestroyed {
 			continue
 		}
-		if sb.Failover == nil || !sb.Failover.ShouldRecreate() {
-			continue
-		}
 		out = append(out, sb)
 	}
 	return out, nil
+}
+
+// recreateSandboxes keeps the failover.policy=recreate rows of live.
+func recreateSandboxes(live []*models.Sandbox) []*models.Sandbox {
+	out := make([]*models.Sandbox, 0, len(live))
+	for _, sb := range live {
+		if sb.Failover != nil && sb.Failover.ShouldRecreate() {
+			out = append(out, sb)
+		}
+	}
+	return out
 }
 
 // authoritativePlacementsForLease reads ids from the leader in pages the

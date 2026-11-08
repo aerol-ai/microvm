@@ -76,6 +76,9 @@ var (
 	ownerCacheRetries  = expvar.NewInt("aerolvm_cluster_owner_cache_retries_total")
 	ownerCacheNotOwner = expvar.NewInt("aerolvm_cluster_owner_cache_not_owner_total")
 	ownerCacheEntries  = expvar.NewInt("aerolvm_cluster_owner_cache_entries")
+	// ownerLeaseServes counts forwards the owner served from its ownership
+	// lease reading without looking the sandbox up (E3b).
+	ownerLeaseServes = expvar.NewInt("aerolvm_cluster_owner_lease_serves_total")
 
 	// Restart catch-up (catch_up.go). catching_up is 1 from New until the
 	// FSM applies the leader's read index; a node stuck at 1 cannot reach a
@@ -216,6 +219,10 @@ func RecordRouteLookup(hop string) { scaleobs.Add(clusterRouteLookups, hop, 1) }
 
 // RecordOwnerCacheHit counts one forward routed from an owner-cache entry.
 func RecordOwnerCacheHit() { ownerCacheHits.Add(1) }
+
+// RecordOwnerLeaseServe counts one forward the owner served from its lease
+// reading, with no lookup (E3b).
+func RecordOwnerLeaseServe() { ownerLeaseServes.Add(1) }
 
 // RecordOwnerCacheMiss counts one routed call that found no usable entry.
 func RecordOwnerCacheMiss() { ownerCacheMisses.Add(1) }

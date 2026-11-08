@@ -3,6 +3,7 @@ package clusterroute
 import (
 	"context"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -11,6 +12,8 @@ import (
 	"testing"
 
 	"github.com/aerol-ai/microvm/internal/cluster"
+	"github.com/aerol-ai/microvm/internal/config"
+	"github.com/aerol-ai/microvm/internal/service"
 	"github.com/aerol-ai/microvm/pkg/auditlog"
 	"github.com/aerol-ai/microvm/pkg/controlplane"
 )
@@ -44,6 +47,7 @@ type fleetNode struct {
 	f     *fleet
 	id    string
 	cache *cluster.OwnerCache
+	svc   *service.Service
 	h     http.Handler
 	// view, when set, replaces the shared table for this node: a lagging
 	// placement view.
@@ -65,6 +69,14 @@ type fleetNode struct {
 // on for every node, as SB_CLUSTER_OWNER_CACHE would on each worker/ingress.
 func newFleet(t testing.TB, withCache bool, ids ...string) *fleet {
 	t.Helper()
+	return newFleetWithConfig(t, withCache, config.Config{}, ids...)
+}
+
+// newFleetWithConfig is newFleet with each node's service built from cfg
+// (for example cluster mode with the owner cache flag, which turns on the
+// owner's lease fast path).
+func newFleetWithConfig(t testing.TB, withCache bool, cfg config.Config, ids ...string) *fleet {
+	t.Helper()
 	f := &fleet{
 		t:     t,
 		place: map[string]fleetPlacement{},
@@ -77,8 +89,10 @@ func newFleet(t testing.TB, withCache bool, ids ...string) *fleet {
 		if withCache {
 			n.cache = cluster.NewOwnerCache(id, 0, 0, f.member)
 		}
+		n.svc = service.New(cfg, slog.New(slog.NewTextHandler(io.Discard, nil)), nil, nil, nil, nil, nil, nil, nil)
+		n.svc.AttachCluster(n)
 		mux := http.NewServeMux()
-		mux.Handle("/x/{id}", Wrap(svcWith(t, n), Options{WriteError: writeErr}, http.HandlerFunc(n.serveLocal)))
+		mux.Handle("/x/{id}", Wrap(n.svc, Options{WriteError: writeErr}, http.HandlerFunc(n.serveLocal)))
 		n.h = mux
 		f.nodes[id] = n
 	}
