@@ -6,6 +6,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/aerol-ai/microvm/internal/failpoint"
 )
 
 // Node-side scripts and parsers for the cluster-correctness fault cases
@@ -303,6 +305,112 @@ func ParseReconcileInterval(out string, def time.Duration) time.Duration {
 		}
 	}
 	return def
+}
+
+// KillSandboxdScript SIGKILLs sandboxd the way a crash or the OOM killer
+// does: no shutdown path runs, nothing is flushed or handed off. systemd
+// then restarts it by itself (Restart=always, RestartSec=5), which is the
+// recovery a real node gets; a stop would run the graceful path instead.
+const KillSandboxdScript = "sudo systemctl kill -s SIGKILL sandboxd && echo KILLED"
+
+// FailpointArmScript arms failpoint name on the node for sandbox names that
+// start with prefix (internal/failpoint), clearing a stale marker first so a
+// hit read later is this arm's.
+func FailpointArmScript(name, prefix string) string {
+	path := failpoint.Dir + "/" + name
+	return "set -e\n" +
+		"sudo mkdir -p " + shQuote(failpoint.Dir) + "\n" +
+		"sudo rm -f " + shQuote(path+failpoint.HitSuffix) + "\n" +
+		"printf '%s\\n' " + shQuote(prefix) + " | sudo tee " + shQuote(path) + " >/dev/null\n" +
+		"echo ARMED\n"
+}
+
+// FailpointDisarmScript removes the arm and the marker.
+func FailpointDisarmScript(name string) string {
+	path := failpoint.Dir + "/" + name
+	return "sudo rm -f " + shQuote(path) + " " + shQuote(path+failpoint.HitSuffix) + " && echo DISARMED"
+}
+
+// FailpointHitScript prints "HIT <key>" when the failpoint fired on the node
+// and "NOHIT" when it did not, then FP-DONE.
+func FailpointHitScript(name string) string {
+	marker := shQuote(failpoint.Dir + "/" + name + failpoint.HitSuffix)
+	return "if sudo test -f " + marker + "; then printf 'HIT %s\\n' \"$(sudo cat " + marker + ")\"; else echo NOHIT; fi; echo FP-DONE"
+}
+
+// ParseFailpointHit reads FailpointHitScript's output. Output cut short is an
+// error, never "no hit": a missed hit makes UC-480 skip as if the binary had
+// no failpoints, which would hide the case rather than fail it.
+func ParseFailpointHit(out string) (key string, hit bool, err error) {
+	done, seen := false, false
+	for _, raw := range strings.Split(out, "\n") {
+		f := strings.Fields(raw)
+		switch {
+		case len(f) == 0:
+		case f[0] == "HIT" && len(f) == 2:
+			key, hit, seen = f[1], true, true
+		case f[0] == "NOHIT" && len(f) == 1:
+			seen = true
+		case f[0] == "FP-DONE":
+			done = true
+		}
+	}
+	if !done || !seen {
+		return "", false, fmt.Errorf("failpoint check incomplete: %s", strings.TrimSpace(snippet([]byte(out))))
+	}
+	return key, hit, nil
+}
+
+// RecoveryProbe is one probe of something the control plane must answer
+// (UC-481): when it was sent, when the answer came, and whether it was right.
+type RecoveryProbe struct {
+	Sent     time.Time
+	Answered time.Time
+	OK       bool
+}
+
+// RecoveredAt is when a probed signal came back for good: the answer time of
+// the first success sent after the last failure. "For good" matters both
+// ways. A node may answer from a cache for a moment after a kill before it
+// notices, so an early success must not count when failures follow it. And a
+// probe sent during the outage that hung and then succeeded proves the
+// signal was back when it answered, not when it was sent.
+//
+// sawOutage is false when no probe failed (the signal never went away, or
+// was served from a cache throughout); ok is false when no success follows
+// the last failure.
+func RecoveredAt(probes []RecoveryProbe) (at time.Time, sawOutage, ok bool) {
+	ps := append([]RecoveryProbe(nil), probes...)
+	sort.SliceStable(ps, func(i, j int) bool { return ps[i].Sent.Before(ps[j].Sent) })
+	last := -1
+	for i, p := range ps {
+		if !p.OK {
+			last = i
+		}
+	}
+	for _, p := range ps[last+1:] {
+		if p.OK {
+			return p.Answered, last >= 0, true
+		}
+	}
+	return time.Time{}, last >= 0, false
+}
+
+// RecoveryStreak is how many probes (by send time) have succeeded since the
+// last failure: the prober keeps going until every signal has a streak, so a
+// recovery that flaps back down is still seen.
+func RecoveryStreak(probes []RecoveryProbe) int {
+	ps := append([]RecoveryProbe(nil), probes...)
+	sort.SliceStable(ps, func(i, j int) bool { return ps[i].Sent.Before(ps[j].Sent) })
+	n := 0
+	for _, p := range ps {
+		if p.OK {
+			n++
+		} else {
+			n = 0
+		}
+	}
+	return n
 }
 
 func shQuote(s string) string { return "'" + strings.ReplaceAll(s, "'", `'"'"'`) + "'" }
