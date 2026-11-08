@@ -1089,6 +1089,7 @@ var Registry = []UseCase{
 	{ID: "UC-477", Title: "Chaos (I6; C1): every server is restarted one at a time; after each restart a leader is back, every committed placement keeps its owner and incarnation, every sandbox still runs once on its owner, and the cluster takes a new create", Requires: []Capability{CapCluster, CapClusterChaos}, Implemented: true},
 	{ID: "UC-478", Title: "Chaos (I4, I6; C7): a worker holding many recreate-policy sandboxes is killed while the survivors have less room than it held; no worker ever runs more than its budget, and every sandbox placed on a survivor runs there within the failover bound", Requires: []Capability{CapCluster, CapClusterChaos}, Implemented: true},
 	{ID: "UC-479", Title: "Chaos (I1, I6; C2, C4): after a real owner kill (sandboxd and the container runtime) and failover, the old node returns and never runs a copy of the sandbox; exactly one copy runs, on the new owner", Requires: []Capability{CapCluster, CapClusterChaos}, Implemented: true},
+	{ID: "UC-483", Title: "Warm pool (L3): on the containerd engine a create that carries env is a warm hit (Server-Timing has containerd_pool and no containerd_create), its processes read the env, the env is still there after a stop and start, and a create that sets an SB_ key still starts cold", Requires: []Capability{CapContainerdPool}, Implemented: true},
 }
 
 // byID is a lookup built once for the report generator.

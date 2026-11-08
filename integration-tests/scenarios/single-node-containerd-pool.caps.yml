@@ -1,0 +1,22 @@
+# Single node, containerd engine, with the containerd warm pool on (plan
+# cluster-phase-2 L3/L4): the containerd-pool capability makes run.sh turn
+# containerd.pool.enabled on in this scenario's cluster.yml. It exists so the
+# pool path (and UC-483, env through the adopt frame) has a live run without
+# changing single-node-containerd, which measures the cold path.
+# Capabilities for the single-node containerd-engine soak scenario
+# (plans/containerd-engine.md Phase 5 / §8). containerd is the harness default
+# engine now, so this scenario would run containerd regardless; the
+# containerd-engine cap is what OPTS IN the containerd-specific soak UCs
+# (UC-99..102) — it no longer selects the engine.
+name: single-node-containerd-pool
+capabilities:
+  - containerd-pool
+  - docker
+  - containerd-engine
+  - platform-volumes
+  - domain
+  - custom-domains
+  # Hostname egress filtering (plans/egress-domain-filtering.md P1-10): install.sh
+  # starts the aerolvm-egress-gateway units and SB_EGRESS_FQDN_ENABLED defaults
+  # on, so UC-180..182 run here.
+  - egress-fqdn
