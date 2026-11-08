@@ -381,6 +381,11 @@ func Classify(err error) Classification {
 	// the sandbox, its secrets and its capacity).
 	case errors.Is(err, cluster.ErrNotCaughtUp):
 		return Classification{Status: http.StatusServiceUnavailable, RetryAfter: cluster.CatchUpRetryAfterSeconds, Message: "this node is catching up with the cluster after a restart; retry shortly"}
+	// A failover.policy=recreate sandbox paused because its node could not
+	// confirm it still owns it: retry, by then the node has either resumed
+	// it or learned where it moved.
+	case errors.Is(err, service.ErrOwnershipFenced):
+		return Classification{Status: http.StatusServiceUnavailable, RetryAfter: cluster.LeaderChangeRetryAfterSeconds, Message: "this sandbox's node has lost contact with the cluster, so the sandbox is paused; retry shortly"}
 
 	default:
 		return Classification{Status: http.StatusBadRequest, Message: truncate(err.Error()), Kind: ErrKindUnclassified, LogLevel: slog.LevelWarn, Log: true}

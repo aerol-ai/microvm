@@ -633,6 +633,9 @@ type Service struct {
 	cluster      cluster.Client
 	clusterMu    sync.Mutex
 	clusterReady atomic.Bool
+	// ownership is the worker's ownership lease and fence
+	// (ownership_lease.go). Zero value: not begun, fences nothing.
+	ownership ownershipLease
 
 	// expectedStops tracks sandboxes whose stop was issued by sandboxd
 	// itself (manual API call or lifecycle sweep). The Docker /events
@@ -3704,6 +3707,12 @@ const (
 // startSandboxLocked is the start itself. The caller holds the lifecycle
 // boundary for id.
 func (s *Service) startSandboxLocked(ctx context.Context, id string, cause startCause) (_ *models.Sandbox, err error) {
+	// A fenced sandbox may be running on another node by now: no start of
+	// any kind (API, wake, restart on failure) until ownership is confirmed
+	// (ownership_lease.go).
+	if s.OwnershipFenced(id) {
+		return nil, ErrOwnershipFenced
+	}
 	// A started sandbox gets a fresh identity token at once, a restart on
 	// failure included (no-op for one without an identity, or a deployment
 	// that is not an issuer).
@@ -7356,6 +7365,12 @@ func (s *Service) runLifecycleAction(ctx context.Context, id string, now time.Ti
 	}
 	if err != nil {
 		return err
+	}
+	// A fenced sandbox is frozen, so its idle clock is not real, and stopping
+	// or destroying it needs ownership this node has not confirmed
+	// (ownership_lease.go). Its timers resume with it.
+	if s.OwnershipFenced(id) {
+		return nil
 	}
 	action, reason := lifecycleDecision(sandbox, now, globalIdle, s.activityFloorFor(sandbox, netstatsFallback))
 	switch action {

@@ -895,6 +895,10 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 			svc.StartReconcileLoop(ctx)
 		}
 		svc.StartLifecycleSweep(ctx)
+		// Pauses this worker's failover.policy=recreate sandboxes when it
+		// cannot confirm it still owns them (ownership_lease.go). A no-op
+		// outside cluster mode.
+		svc.StartOwnershipLease(ctx)
 		svc.StartDiskLimitWatch(ctx)
 		svc.StartEventMonitor(ctx)
 		svc.StartBuiltImageGC(ctx)

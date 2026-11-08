@@ -1157,7 +1157,7 @@ file themselves can set them directly in `/etc/sandboxd/cluster.env`.
 | `SB_BOOTSTRAP_PEERS` | join only | Comma-separated gossip-advertise addresses. Empty on the seed. |
 | `SB_CLUSTER_BOOTSTRAP` | yes | `true` only on the seed; `false` on joiners. |
 | `SB_CLUSTER_MAX_AUTO_VOTERS` | no | Max gossip-discovered **server-role** nodes auto-promoted as raft voters. Default `5`; additional server nodes become non-voters that still replicate the full FSM. Set `0` for unlimited. Does not bound replica count — the live server tier is separately capped at 7 nodes. |
-| `SB_DEAD_OWNER_GRACE` | no | Wait before reassigning a dead node's placements. Default `30s`. |
+| `SB_DEAD_OWNER_GRACE` | no | Wait before reassigning a dead node's placements. Default `30s`. Workers also pause their `failover.policy=recreate` sandboxes after half this long without an answer from the leader, so set it the same on every node. |
 | `SB_OTEL_METRICS_ENDPOINT` | no | OTLP/HTTP metrics endpoint, for example `http://otel-collector:4318/v1/metrics`. Setting it enables OTEL metrics. |
 | `SB_OTEL_METRICS_ENABLED` | no | Enables OTEL metrics without an explicit endpoint; the OTEL exporter env defaults apply. |
 | `SB_OTEL_METRICS_INTERVAL` | no | OTEL export interval. Default `30s`. |
