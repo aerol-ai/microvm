@@ -91,10 +91,13 @@ func (s *Service) AdoptWasmSandboxes(ctx context.Context) WasmAdoptReport {
 		if sb == nil || !s.isWasmSandbox(sb) {
 			continue
 		}
-		if sb.Status != models.SandboxStatusStarted && sb.Status != models.SandboxStatusCreating {
-			continue
+		// passivate_failed is a sandbox an older sandboxd's shutdown drain
+		// tried and failed to save (a resident host serves no checkpoint):
+		// its /work is still there after a restart, so it is restored too.
+		switch sb.Status {
+		case models.SandboxStatusStarted, models.SandboxStatusCreating, models.SandboxStatusPassivateFailed:
+			jobs <- sb
 		}
-		jobs <- sb
 	}
 	close(jobs)
 	wg.Wait()
@@ -135,11 +138,13 @@ func (s *Service) adoptWasmSandbox(ctx context.Context, adopter wasmAdopter, sb 
 		binds = s.mounts.HostBindsFor(sb.ID)
 	}
 	if _, err := adopter.AdoptSandbox(ctx, sb, binds); err == nil {
+		s.markWasmRunning(ctx, sb)
 		return wasmAdopted
 	}
 	if adopter.HasWorkDir(sb.ID) {
 		if err := s.restoreWasmSandbox(ctx, adopter, sb, binds); err == nil {
 			s.logger.Info("wasm adopt: sandbox restored over its kept work dir", "sandbox_id", sb.ID)
+			s.markWasmRunning(ctx, sb)
 			return wasmRestored
 		} else {
 			s.logger.Warn("wasm adopt: restore failed", "sandbox_id", sb.ID, "error", err)
@@ -157,6 +162,18 @@ func (s *Service) restoreWasmSandbox(ctx context.Context, adopter wasmAdopter, s
 	}
 	_, err := adopter.RestoreSandbox(ctx, sb, binds)
 	return err
+}
+
+// markWasmRunning records a sandbox brought back from passivate_failed as
+// started again; a started row is already right.
+func (s *Service) markWasmRunning(ctx context.Context, sb *models.Sandbox) {
+	if sb.Status == models.SandboxStatusStarted {
+		return
+	}
+	if err := s.store.UpdateWasmCheckpoint(ctx, sb.ID, sb.AuditIncarnationID,
+		string(models.SandboxStatusStarted), sb.CheckpointPath, sb.CloneGeneration, ""); err != nil {
+		s.logger.Warn("wasm adopt: restored sandbox not marked started", "sandbox_id", sb.ID, "error", err)
+	}
 }
 
 // markWasmLost records a started sandbox nothing could keep (a reboot took

@@ -70,8 +70,8 @@ func TestAdoptWasmSandboxesAtBoot(t *testing.T) {
 	}
 	rt := &adoptingWasmRuntime{
 		adoptable: map[string]bool{"sb-adopt": true},
-		workDirs:  map[string]bool{"sb-restore": true, "sb-restore-fail": true},
-		restoreOK: map[string]bool{"sb-restore": true},
+		workDirs:  map[string]bool{"sb-restore": true, "sb-restore-fail": true, "sb-pfailed": true},
+		restoreOK: map[string]bool{"sb-restore": true, "sb-pfailed": true},
 	}
 	svc, st, _ := newServiceRuntimeHarness(t, &recordingRuntime{})
 	svc.cfg.EnableWasm = true
@@ -85,6 +85,7 @@ func TestAdoptWasmSandboxesAtBoot(t *testing.T) {
 		{ID: "sb-passive", Runtime: models.RuntimeWasm, Status: models.SandboxStatusStarted, Durability: models.DurabilityPassivatable, CheckpointPath: checkpoint},
 		{ID: "sb-passive-nockpt", Runtime: models.RuntimeWasm, Status: models.SandboxStatusStarted, Durability: models.DurabilityPassivatable},
 		{ID: "sb-stopped", Runtime: models.RuntimeWasm, Status: models.SandboxStatusStopped},
+		{ID: "sb-pfailed", Runtime: models.RuntimeWasm, Status: models.SandboxStatusPassivateFailed, Durability: models.DurabilityPassivatable},
 		{ID: "sb-docker", Runtime: models.RuntimeDocker, Status: models.SandboxStatusStarted},
 	}
 	for _, sb := range rows {
@@ -110,7 +111,7 @@ func TestAdoptWasmSandboxesAtBoot(t *testing.T) {
 	}
 	rt.adoptable["sb-badenv"] = true
 	report := svc.AdoptWasmSandboxes(ctx)
-	if report.Adopted != 1 || report.Restored != 1 || report.Lost != 4 {
+	if report.Adopted != 1 || report.Restored != 2 || report.Lost != 4 {
 		t.Fatalf("report = %+v", report)
 	}
 	if rt.finished != 1 {
@@ -133,6 +134,7 @@ func TestAdoptWasmSandboxesAtBoot(t *testing.T) {
 		"sb-passive":        models.SandboxStatusPassivated,
 		"sb-passive-nockpt": models.SandboxStatusStopped,
 		"sb-stopped":        models.SandboxStatusStopped,
+		"sb-pfailed":        models.SandboxStatusStarted,
 		"sb-docker":         models.SandboxStatusStarted,
 	}
 	for id, status := range want {
