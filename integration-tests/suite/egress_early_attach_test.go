@@ -190,6 +190,12 @@ func snapshotEgressNode(t *testing.T, node harness.IntegrationNode) egressNodeSt
 	// block on them by design (pkg/docker parkContainer): a refill during a
 	// test parks a new one, which is not something left behind.
 	script.WriteString("echo '## park'; command -v docker >/dev/null && for id in $(sudo docker ps -q --filter label=aerol.pool=park 2>/dev/null); do sudo docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}' \"$id\" 2>/dev/null; done; ")
+	// The containerd engine's pool parks containerd containers with the same
+	// park block (internal/runtime/containerd warm_park.go); docker cannot see
+	// them, so read each one's address from inside its task's network
+	// namespace. Without this a containerd-pool scenario counted every park
+	// refilled during the churn as left behind (UC-343, 2026-11-08).
+	script.WriteString("command -v ctr >/dev/null && for id in $(sudo ctr -n aerolvm c ls -q 'labels.\"aerol.pool\"==park' 2>/dev/null); do pid=$(sudo ctr -n aerolvm t ls 2>/dev/null | awk -v id=\"$id\" '$1==id {print $2}'); [ -n \"$pid\" ] && sudo nsenter -t \"$pid\" -n ip -4 -o addr show 2>/dev/null | awk '$2 != \"lo\" {split($4, a, \"/\"); print a[1]}'; done; ")
 	script.WriteString("true")
 	out := nodeSSH(t, node, script.String())
 	st := egressNodeState{}
