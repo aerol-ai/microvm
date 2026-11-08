@@ -837,9 +837,7 @@ func (s *server) handleExec(w http.ResponseWriter, r *http.Request) {
 
 	result.ExitCode, _ = interpretWaitResult(waitErr)
 	result.Signal = waitSignal(waitErr)
-	if waitErr != nil && !isExitStatus(waitErr) {
-		result.Stderr = strings.TrimSpace(result.Stderr + "\n" + waitErr.Error())
-	}
+	result.Stderr = withWaitError(result.Stderr, waitErr)
 
 	writeJSON(w, http.StatusOK, result)
 }
