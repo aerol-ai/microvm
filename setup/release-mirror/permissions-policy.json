@@ -1,0 +1,22 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "WriteReleaseFiles",
+      "Effect": "Allow",
+      "Action": "s3:PutObject",
+      "Resource": "arn:aws:s3:::aerolvm-downloads/aerolvm/*"
+    },
+    {
+      "Sid": "ListReleaseFiles",
+      "Effect": "Allow",
+      "Action": "s3:ListBucket",
+      "Resource": "arn:aws:s3:::aerolvm-downloads",
+      "Condition": {
+        "StringLike": {
+          "s3:prefix": ["aerolvm/*"]
+        }
+      }
+    }
+  ]
+}
