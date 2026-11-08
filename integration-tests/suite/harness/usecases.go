@@ -128,6 +128,14 @@ const (
 	// dockerd-coexistence restart stays off the runtime/metal scenarios where a
 	// pure-containerd host makes it not-applicable.
 	CapContainerdEngine Capability = "containerd-engine"
+	// CapContainerdPool is consumed by run.sh's config overlay, like
+	// CapDockerPool: it flips containerd.pool.enabled in the scenario's
+	// cluster.yml, which Terraform renders into SB_CONTAINERD_POOL_ENABLED.
+	// Separate from CapContainerdEngine because each waiting container holds a
+	// default-shaped capacity reservation and a netns slot, lowering the UC-95
+	// density ceiling, and because the engine scenarios exist to measure the
+	// cold path. No scenario advertises it yet: the pool ships off by default.
+	CapContainerdPool Capability = "containerd-pool"
 	// CapObservability gates UC-106/107 ("Grafana up", "Prometheus sees all
 	// sandboxd nodes") and tells run.sh to pass -var deploy_obs=true so
 	// Terraform/obs.tf provisions the dedicated obs EC2. Advertisement +
@@ -317,7 +325,7 @@ var KnownCapabilities = map[Capability]bool{
 	CapCluster: true, CapCustomDomains: true, CapExternalDNSZone: true,
 	CapMixedArchNegative: true, CapPlatformVolumes: true, CapBenchmark: true, CapNoHostFirewall: true,
 	CapDockerPool: true, CapDockerNetnsPool: true, CapDockerEngine: true,
-	CapContainerdEngine: true, CapObservability: true, CapSimulations: true,
+	CapContainerdEngine: true, CapContainerdPool: true, CapObservability: true, CapSimulations: true,
 	CapSecrets: true, CapSecretsKMS: true, CapEnterprise: true,
 	CapClusterMTLS: true, CapAuditExport: true, CapAuditWitness: true,
 	CapRemoteMCP: true, CapEgressFQDN: true, CapPrivateCloud: true,
