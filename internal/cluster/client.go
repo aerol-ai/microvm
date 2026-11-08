@@ -39,6 +39,9 @@ type Cluster struct {
 	// in tests that need a lagging local replica next to a live leader.
 	// Always nil in production.
 	authoritativePlacementsHook func(context.Context, []string) (map[string]Placement, error)
+	// leaderContactHook stands in for raft's state and last-leader-contact
+	// time in tests (stale_read.go). Always nil in production.
+	leaderContactHook func() (raft.RaftState, time.Time)
 
 	// patToken authenticates leader-forwarded raft applies. Sourced from
 	// cfg.PATToken at construction; same value every node already shares for
