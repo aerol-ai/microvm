@@ -225,11 +225,30 @@ func TestReestablishRemountsWhenTheHelperDied(t *testing.T) {
 	}
 }
 
+// waitExeced waits until pid runs argv. Right after Start the child may not
+// have exec'd yet, and its /proc cmdline is still the test binary's, which
+// openHelperProcess rightly calls a different process.
+func waitExeced(t *testing.T, pid int, argv []string) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		got, err := readCmdline(pid)
+		if err == nil && slices.Equal(got, argv) {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("pid %d never ran %q (cmdline %q, %v)", pid, argv, got, err)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
 func TestOpenHelperProcess(t *testing.T) {
 	cmd := exec.Command("sh", "-c", "sleep 300; :", "probe")
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
+	waitExeced(t, cmd.Process.Pid, cmd.Args)
 	exit := watchExit(cmd)
 	t.Cleanup(func() { _ = cmd.Process.Kill(); <-exit.done })
 	argv := []string{"sh", "-c", "sleep 300; :", "probe"}
@@ -274,6 +293,7 @@ func TestOpenHelperProcess(t *testing.T) {
 	if err := cmd2.Start(); err != nil {
 		t.Fatal(err)
 	}
+	waitExeced(t, cmd2.Process.Pid, cmd2.Args)
 	p2, err := openHelperProcess(cmd2.Process.Pid, []string{"sh", "-c", "sleep 300; :", "probe2"})
 	if err != nil {
 		t.Fatal(err)
