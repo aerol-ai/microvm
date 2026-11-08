@@ -63,7 +63,7 @@ func FromDaemonConfig(cfg config.Config) Config {
 		DefaultRuntime:     cfg.Runtime,
 		WaitTimeout:        cfg.DockerRuntimeWaitTimeout,
 		ToolboxWaitTimeout: cfg.ToolboxWaitTimeout,
-		ReadyEnabled:       cfg.DockerReadySocketEffective(),
+		ReadyEnabled:       cfg.ContainerdReadySocketEffective(),
 		ReadyDir:           cfg.DockerReadySocketDir(),
 		ReadinessPollInit:  cfg.DockerReadinessPollInitial,
 		ReadinessPollMax:   cfg.DockerReadinessPollMax,
