@@ -47,15 +47,15 @@ gh release create vX.Y.Z --target <main commit> --title "vX.Y.Z: <short summary>
 
 `install.sh` falls back to a public download mirror, `s3://aerolvm-downloads` (`https://aerolvm-downloads.s3.us-east-1.amazonaws.com`), when GitHub fails. It holds each release at `aerolvm/<tag>/<file>`, under the same names as on GitHub, and pinned third-party files at `deps/<project>/<version>/<file>`. `scripts/mirror-sync.sh` fills it.
 
-- **The release workflow copies the release to the mirror** once its files are attached, with `scripts/mirror-sync.sh --release <tag>`. That checks every file against the release's `checksums.txt` before it uploads anything. If the tag is GitHub's latest release, it then points `aerolvm/latest.txt` at it, which is how `install.sh` finds "latest" on the mirror.
-- **If that step failed or was skipped,** run it yourself with AWS credentials that can write to the bucket and `gh` logged in:
+- **The release workflow copies the release to the mirror** in its `mirror` job (see "The download mirror" below). It checks every file against the release's `checksums.txt` before it uploads anything, and, if the tag is GitHub's latest release, points `aerolvm/latest.txt` at it, which is how `install.sh` finds "latest" on the mirror.
+- **If that job failed or was skipped,** do the same by hand with `scripts/mirror-sync.sh`, with AWS credentials that can write to the bucket and `gh` logged in:
 
   ```bash
   scripts/mirror-sync.sh --release vX.Y.Z --dry-run   # prints the plan
   scripts/mirror-sync.sh --release vX.Y.Z
   ```
 
-- **A re-run uploads only what is missing.** A file already on the mirror at the same size is skipped. If you re-cut a release under the same tag, run `scripts/mirror-sync.sh --release <tag> --force` so every file is sent again.
+- **A re-run of `mirror-sync.sh` uploads only what is missing:** a file already on the mirror at the same size is skipped. When the mirror's `checksums.txt` for the tag differs from the release's (a re-cut), it sends every file; `--force` does that in any case.
 - **Re-sync third-party files only when a pin changes.** The pins are the `DOWNLOAD PINS` block in `scripts/install.sh`. After you bump a version and its hashes there, and before the release that ships the new `install.sh`, run `scripts/mirror-sync.sh --deps`. It reads the pins from `install.sh`, checks every file against its pin, and uploads nothing unless all of them match.
 
 ## 4. Sync the changelog
