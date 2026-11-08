@@ -522,6 +522,7 @@ func TestRecreateSandboxWasmDurableFailoverE2E(t *testing.T) {
 	puller := &fakeWasmCheckpointStore{pullSrc: remoteSnap}
 	rt := &fakeWasmRecreateRuntime{}
 	svc := New(config.Config{EnableWasm: true, WasmModulesDir: modulesDir, EnableCluster: true}, slog.Default(), st, rt, nil, nil, nil, nil, nil)
+	svc.AttachCluster(newRecreateOwnerCluster("self"))
 	svc.SetWasmRuntime(rt)
 	svc.AttachWasmCheckpointPusher(puller)
 

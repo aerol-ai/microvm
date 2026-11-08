@@ -17,6 +17,7 @@ import (
 	"github.com/aerol-ai/microvm/internal/cluster"
 	"github.com/aerol-ai/microvm/internal/service"
 	"github.com/aerol-ai/microvm/pkg/capacity"
+	"github.com/aerol-ai/microvm/pkg/createtiming"
 	"github.com/aerol-ai/microvm/pkg/docker"
 	"github.com/aerol-ai/microvm/pkg/egresspolicy"
 	"github.com/aerol-ai/microvm/pkg/models"
@@ -61,6 +62,27 @@ type ErrorWriter func(w http.ResponseWriter, status int, code, message string)
 
 type Decision struct {
 	ReservationID string
+	// reserveStages is how long the router took to pick this node and to
+	// write the reservation, both before the create's create;dur starts.
+	// Set only when Prepare reserved on this node itself.
+	reserveStages []reserveStage
+}
+
+// reserveStage is one router-side step of a reservation-first create.
+type reserveStage struct {
+	name string
+	d    time.Duration
+}
+
+// RecordReserveStages adds the router's cluster_place and cluster_reserve
+// stages to the local create's recorder, so its Server-Timing covers the
+// time before create;dur started. Nil-safe; a Decision from a forwarded
+// create carries none (the router reports its own, see
+// forwardReservedCreate).
+func (d Decision) RecordReserveStages(timing *createtiming.CreateTiming) {
+	for _, st := range d.reserveStages {
+		timing.RecordStage(st.name, st.d)
+	}
 }
 
 type PrepareOptions struct {
@@ -130,6 +152,12 @@ func Prepare(w http.ResponseWriter, r *http.Request, svc *service.Service, req m
 		}
 		sandboxID := strings.TrimSpace(r.Header.Get(HeaderID))
 		if sandboxID == "" {
+			// A create by the name of a snapshot this node holds, sent here
+			// by snapshotNameHome because the image is only here: serve it
+			// like a create sent here directly.
+			if held, err := svc.HoldsSnapshotNamed(r.Context(), req.Image); err == nil && held {
+				return Decision{}, true
+			}
 			writeMsg(w, http.StatusBadRequest, "cluster: forwarded create missing "+HeaderID)
 			return Decision{}, false
 		}
@@ -154,6 +182,11 @@ func Prepare(w http.ResponseWriter, r *http.Request, svc *service.Service, req m
 		w.Header().Set("Retry-After", strconv.Itoa(cluster.CapacityRetryAfterSeconds))
 		writeMsg(w, http.StatusServiceUnavailable, "cluster: snapshot home lookup: "+err.Error())
 		return Decision{}, false
+	}
+	if snapshotHome == "" {
+		// The same for a create by the name of a snapshot that is not in
+		// the registry yet: its image is only on its home.
+		snapshotHome = snapshotNameHome(r.Context(), svc, c, req)
 	}
 	if snapshotHome == "" {
 		if err := svc.NormalizeCreateImageDistribution(r.Context(), &req); err != nil {
@@ -299,7 +332,12 @@ func Prepare(w http.ResponseWriter, r *http.Request, svc *service.Service, req m
 	if svc.WantsSecretRecipientFanout(req) {
 		recipientBackups = svc.SecretRecipientBackupCount()
 	}
+	// cluster_place and cluster_reserve: the two router steps before any
+	// create;dur starts (plan PR #1000 item L1). Boot-path (pr-review §2):
+	// three timer reads per cluster create, no other work.
+	placeStart := time.Now()
 	target, recipients, err := c.SelectPlacementForCreate(CapacityRequestFromCreate(req), sandboxID, recipientBackups)
+	placeDur := time.Since(placeStart)
 	if err != nil {
 		if writeNoEgressGateway(w, err, writeError) || writePlacementUnsatisfiable(w, err, writeError) {
 			return Decision{}, false
@@ -338,8 +376,10 @@ func Prepare(w http.ResponseWriter, r *http.Request, svc *service.Service, req m
 	}
 	reserveSecrets := cluster.PlacementSecrets{Recipients: recipients, OwnerRef: reserveOwner}
 	commitCtx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	reserveStart := time.Now()
 	err = c.ReserveOnTarget(commitCtx, sandboxID, target, &redacted, reserveSecrets, ReservationTTL)
 	cancel()
+	stages := []reserveStage{{"cluster_place", placeDur}, {"cluster_reserve", time.Since(reserveStart)}}
 	if err != nil {
 		// A keyed retry that finds its id reserved goes to the reservation's
 		// node, which replays the sandbox, or holds the retry until the create
@@ -419,11 +459,11 @@ func Prepare(w http.ResponseWriter, r *http.Request, svc *service.Service, req m
 	r.Header.Set(HeaderID, sandboxID)
 	if target.IsSelf {
 		service.RecordCreateReservationState("reserve_local")
-		return Decision{ReservationID: sandboxID}, true
+		return Decision{ReservationID: sandboxID, reserveStages: stages}, true
 	}
 	service.RecordCreateReservationState("reserve_remote")
 	forwardReservedCreate(w, r, c, cluster.Endpoint{NodeID: target.NodeID, InternalURL: target.InternalURL, APIURL: target.APIURL},
-		sandboxID, opts.PreferredSandboxID == "", opts.Logger)
+		sandboxID, opts.PreferredSandboxID == "", opts.Logger, stages)
 	return Decision{}, false
 }
 
@@ -459,6 +499,37 @@ func snapshotTagHome(ctx context.Context, svc *service.Service, c cluster.Client
 	return node, nil
 }
 
+// snapshotNameHome returns the node a create is sent to because its image
+// names a snapshot whose image exists only on that node: the snapshot's push
+// to the registry has not landed (pending, running or failing), or the
+// cluster does not push snapshots. This node would build the registry ref and
+// place the create anywhere, and the target would fail to pull a copy that is
+// not there (UC-459: the pull ran 170 ms before the push finished). The home
+// resolves the name through its own row, with the caller's token. Once the
+// push lands the home drops the key and creates by name spread again.
+//
+// "" keeps today's path: the image is not a bare name; this node holds a
+// snapshot of that name (it resolves the name itself); the caller named a
+// registry copy; no local-only key is registered (pushed, or made before the
+// key existed); the key names this node; or the read failed. Most bare names
+// are plain images, so a failed read must not fail their creates.
+func snapshotNameHome(ctx context.Context, svc *service.Service, c cluster.Client, req models.CreateSandboxRequest) string {
+	if service.ImageRequiresLocalPlacement(req) || !service.IsBareSnapshotName(req.Image) {
+		return ""
+	}
+	if dist := req.ImageDistribution(); dist.Mode == models.ImageDistributionAOCR && strings.TrimSpace(dist.RegistryRef) != "" {
+		return ""
+	}
+	if held, err := svc.HoldsSnapshotNamed(ctx, req.Image); err != nil || held {
+		return ""
+	}
+	node, ok, err := c.SnapshotHomeNode(ctx, cluster.SnapshotLocalOnlyKey(service.OwnerRefForCreate(ctx), strings.TrimSpace(req.Image)))
+	if err != nil || !ok || node == c.SelfNodeID() {
+		return ""
+	}
+	return node
+}
+
 // forwardReservedCreate forwards a create this router just reserved and, when
 // the target refuses it with a 4xx, releases the reservation before the
 // refusal reaches the client.
@@ -488,8 +559,8 @@ func snapshotTagHome(ctx context.Context, svc *service.Service, c cluster.Client
 // A 5xx, a transport failure or a timeout keeps the reservation, as before:
 // the target may still be creating, and cancelling under a live create would
 // leave an untracked sandbox. The expiry sweep stays the safety net there.
-func forwardReservedCreate(w http.ResponseWriter, r *http.Request, c cluster.Client, target cluster.Endpoint, sandboxID string, freshID bool, logger *slog.Logger) {
-	hold := &rejectionHold{ResponseWriter: w}
+func forwardReservedCreate(w http.ResponseWriter, r *http.Request, c cluster.Client, target cluster.Endpoint, sandboxID string, freshID bool, logger *slog.Logger, stages []reserveStage) {
+	hold := &rejectionHold{ResponseWriter: w, routerStages: stages, forwardStart: time.Now()}
 	defer hold.release()
 	c.ForwardHTTP(target, hold, r)
 	if !hold.rejected() || (!freshID && !hold.refusedForEveryReplay()) {
@@ -518,6 +589,11 @@ type rejectionHold struct {
 	status int
 	held   bool
 	body   bytes.Buffer
+
+	// routerStages and forwardStart are the router's side of the create's
+	// Server-Timing; addRouterTiming writes them onto the response.
+	routerStages []reserveStage
+	forwardStart time.Time
 }
 
 func (h *rejectionHold) WriteHeader(status int) {
@@ -529,6 +605,7 @@ func (h *rejectionHold) WriteHeader(status int) {
 	if h.status != 0 {
 		return
 	}
+	h.addRouterTiming()
 	h.status = status
 	if h.rejected() {
 		h.held = true
@@ -549,6 +626,30 @@ func (h *rejectionHold) Write(p []byte) (int, error) {
 		return h.ResponseWriter.Write(p)
 	}
 	return h.body.Write(p)
+}
+
+// addRouterTiming appends the router's stages (cluster_place,
+// cluster_reserve, and cluster_forward: the forwarded round trip as the
+// router saw it, the target's create;dur included) to the target's
+// Server-Timing. The reverse proxy has copied the target's headers by the
+// time it writes the status, and the result is set as ONE header line: a
+// reader that takes only the first Server-Timing value (Header.Get) then
+// still sees create;dur and the router's stages together.
+func (h *rejectionHold) addRouterTiming() {
+	if len(h.routerStages) == 0 {
+		return
+	}
+	timing := &createtiming.CreateTiming{}
+	for _, st := range h.routerStages {
+		timing.RecordStage(st.name, st.d)
+	}
+	timing.RecordStage("cluster_forward", time.Since(h.forwardStart))
+	header := h.Header()
+	parts := header.Values("Server-Timing")
+	for _, st := range timing.Stages() {
+		parts = append(parts, createtiming.FormatStage(st))
+	}
+	header.Set("Server-Timing", strings.Join(parts, ", "))
 }
 
 // Flush forwards a proxy flush, except while a refusal is held.
@@ -878,12 +979,17 @@ func clusterCreateSelfCanOwnSandbox(c cluster.Client) bool {
 // is conditional on complete local destruction: retaining the row and its
 // lifecycle identity is safer than creating an untracked live runtime when a
 // runtime, secret, or store finalizer fails.
+//
+// The retained row is marked rollback-pending first, so the ownership replay
+// does not place it (here there is no placement at all, so the replay would
+// create one) and reconcile finishes the destroy (markRollbackPending).
 func RollbackLocalCreate(ctx context.Context, svc *service.Service, logger *slog.Logger, sandboxID string) {
 	if svc == nil || strings.TrimSpace(sandboxID) == "" {
 		return
 	}
 	rbCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
+	markRollbackPending(rbCtx, svc, logger, sandboxID)
 	if err := svc.DestroySandbox(rbCtx, sandboxID); err != nil {
 		if logger != nil {
 			logger.Error("cluster: rollback destroy failed; retaining placement for reconciliation",

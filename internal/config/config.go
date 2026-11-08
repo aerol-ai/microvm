@@ -227,7 +227,10 @@ type Config struct {
 	// buildkitd at the default socket with a containerd worker on the aerolvm
 	// namespace. SB_CONTAINERD_BUILDKIT_ADDR.
 	ContainerdBuildKitAddr string
-	// ContainerdNetnsPoolRefillInterval drives native netns pool refill.
+	// ContainerdNetnsPoolRefillInterval is the native netns pool's refill
+	// backstop tick. A claim from the warm queue wakes the refiller at
+	// once; the tick covers freed slots, failed refills and the retry of
+	// slots parked as releasing.
 	ContainerdNetnsPoolRefillInterval time.Duration
 	// ContainerdPoolEnabled gates the warm containerd task pool (Phase 3).
 	// SB_CONTAINERD_POOL_ENABLED.
@@ -1207,6 +1210,17 @@ type Config struct {
 	// instead of the 5s full page-walk. Default off; per-node; rationale in
 	// setup/config-defaults.md. SB_INGRESS_PROXY_ROUTING.
 	IngressProxyRouting bool
+	// ClusterOwnerCache turns on the owner cache on worker and ingress nodes
+	// (internal/cluster/owner_cache.go, plan PR #1000 item E3a). Such a node
+	// remembers which node owns a sandbox and forwards there without asking
+	// the server tier first. The owner still checks every request and
+	// answers 421 "not here" to a stale entry, so the cache changes where a
+	// request goes, never the answer. Default off. Turn it on only once every
+	// node runs a build that answers "not here": an older owner would serve
+	// or 404 a stale forward instead. Ignored on server-role nodes, which
+	// read their own placement copy. Rationale in setup/config-defaults.md.
+	// SB_CLUSTER_OWNER_CACHE.
+	ClusterOwnerCache bool
 	// RouteDNSAddr is the loopback address of the sandboxd route responder
 	// that the static Caddy routes query (plans/ingress-proxy-routing.md
 	// §3.2). On ingress nodes the resolver routes *.rt.internal here.
@@ -2248,6 +2262,7 @@ func load(keyTool bool) (Config, error) {
 		L4PublicHost:                     normalizeAdvertiseHost(os.Getenv("SB_L4_PUBLIC_HOST")),
 		ClusterShardAwareIngress:         getEnvBool("SB_CLUSTER_SHARD_AWARE_INGRESS", false),
 		IngressProxyRouting:              getEnvBool("SB_INGRESS_PROXY_ROUTING", false),
+		ClusterOwnerCache:                getEnvBool("SB_CLUSTER_OWNER_CACHE", false),
 		RouteDNSAddr:                     getEnv("SB_ROUTE_DNS_ADDR", "127.0.0.1:53053"),
 		RouteDNSLinkAddr:                 getEnv("SB_ROUTE_DNS_LINK_ADDR", ""),
 		HostPortRedirectPort:             getEnvInt("SB_HOSTPORT_REDIRECT_PORT", 21215),
@@ -3463,6 +3478,16 @@ func (c Config) DockerPoolEffective() bool {
 func (c Config) ContainerdPoolEffective() bool {
 	return c.ContainerEngine == models.ContainerEngineContainerd &&
 		c.ContainerdPoolEnabled && c.DockerReadySocketEnabled
+}
+
+// ContainerdReadySocketEffective is the containerd driver's ready-socket gate:
+// the docker gate, widened by the containerd warm pool. Park and adopt both
+// run over the held socket, so without the widening a single-node host that
+// turns on only SB_CONTAINERD_POOL_ENABLED wires the pool but never parks a
+// slot. It is a separate gate, not a change to DockerReadySocketEffective,
+// so the docker client and its boot-time ready-dir sweep stay as they were.
+func (c Config) ContainerdReadySocketEffective() bool {
+	return c.DockerReadySocketEffective() || c.ContainerdPoolEffective()
 }
 
 // DockerReadySocketDir is the host directory for per-create readiness sockets.

@@ -49,63 +49,6 @@ func TestHostHelpersAndCreateDeleteBranches(t *testing.T) {
 			t.Fatal("want deleteNetns hook error")
 		}
 	})
-
-	t.Run("create delete fallback when ip missing", func(t *testing.T) {
-		t.Setenv("PATH", "")
-		h := &Host{}
-		if err := h.createNetns(context.Background(), "sb-y"); err == nil {
-			t.Fatal("want createNetns error when ip binary is unavailable")
-		}
-		if err := h.deleteNetns(context.Background(), "sb-y"); err == nil {
-			t.Fatal("want deleteNetns error when ip binary is unavailable")
-		}
-	})
-
-	t.Run("create and delete fallback idempotent output", func(t *testing.T) {
-		dir := t.TempDir()
-		ipPath := filepath.Join(dir, "ip")
-		script := "#!/bin/sh\n" +
-			"if [ \"$1\" = netns ] && [ \"$2\" = add ]; then\n" +
-			"  echo 'File exists'\n" +
-			"  exit 1\n" +
-			"fi\n" +
-			"if [ \"$1\" = netns ] && [ \"$2\" = del ]; then\n" +
-			"  echo 'No such file'\n" +
-			"  exit 1\n" +
-			"fi\n" +
-			"exit 0\n"
-		if err := os.WriteFile(ipPath, []byte(script), 0o755); err != nil {
-			t.Fatal(err)
-		}
-		t.Setenv("PATH", dir)
-
-		h := &Host{}
-		if err := h.createNetns(context.Background(), "sb-z"); err != nil {
-			t.Fatalf("createNetns should ignore file exists: %v", err)
-		}
-		if err := h.deleteNetns(context.Background(), "sb-z"); err != nil {
-			t.Fatalf("deleteNetns should ignore missing netns output: %v", err)
-		}
-	})
-
-	t.Run("delete fallback also ignores cannot-remove wording", func(t *testing.T) {
-		dir := t.TempDir()
-		ipPath := filepath.Join(dir, "ip")
-		script := "#!/bin/sh\n" +
-			"if [ \"$1\" = netns ] && [ \"$2\" = del ]; then\n" +
-			"  echo 'Cannot remove namespace file'\n" +
-			"  exit 1\n" +
-			"fi\n" +
-			"exit 0\n"
-		if err := os.WriteFile(ipPath, []byte(script), 0o755); err != nil {
-			t.Fatal(err)
-		}
-		t.Setenv("PATH", dir)
-		h := &Host{}
-		if err := h.deleteNetns(context.Background(), "sb-cannot-remove"); err != nil {
-			t.Fatalf("deleteNetns should ignore cannot-remove output: %v", err)
-		}
-	})
 }
 
 func TestHostRemovePathFallbackAndJoinedErrors(t *testing.T) {

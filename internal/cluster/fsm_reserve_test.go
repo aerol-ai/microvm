@@ -166,6 +166,37 @@ func TestFSMReserveRejectsNameCollision(t *testing.T) {
 	}
 }
 
+// TestFSMReserveOverExpiredRowRejectsNameCollisionWithoutRelease pins that a
+// reserve refused for its name changes nothing, even when it would have
+// overwritten an expired reservation. The old code released the expired
+// row's indexes first and checked the name second, so a refused entry still
+// dropped the old row's name claim while the row itself stayed.
+func TestFSMReserveOverExpiredRowRejectsNameCollisionWithoutRelease(t *testing.T) {
+	fsm := newPlacementFSM()
+	applyOp(t, fsm, command{
+		Op: opReserve, SandboxID: "sb-expired", OwnerNodeID: "B", IncarnationID: "inc-old",
+		Spec: &models.CreateSandboxRequest{Name: "old-name"}, ExpiresUnix: time.Now().Add(-time.Second).Unix(),
+	})
+	applyOp(t, fsm, command{
+		Op: opReserve, SandboxID: "sb-holder", OwnerNodeID: "C", IncarnationID: "inc-holder",
+		Spec: &models.CreateSandboxRequest{Name: "taken"}, ExpiresUnix: time.Now().Add(60 * time.Second).Unix(),
+	})
+
+	got := applyOp(t, fsm, command{
+		Op: opReserve, SandboxID: "sb-expired", OwnerNodeID: "C", IncarnationID: "inc-new",
+		Spec: &models.CreateSandboxRequest{Name: "taken"}, ExpiresUnix: time.Now().Add(60 * time.Second).Unix(),
+	})
+	if err, ok := got.(error); !ok || !errors.Is(err, ErrNameConflict) {
+		t.Fatalf("opReserve over expired row with a held name = %v, want ErrNameConflict", got)
+	}
+	if id, ok := fsm.sandboxIDByName("old-name"); !ok || id != "sb-expired" {
+		t.Fatalf("name old-name -> (%q, %v) after a refused reserve, want still held by sb-expired", id, ok)
+	}
+	if p, _ := fsm.get("sb-expired"); p.IncarnationID != "inc-old" || p.OwnerNodeID != "B" {
+		t.Fatalf("expired row changed by a refused reserve: %+v", p)
+	}
+}
+
 func TestFSMReserveBatchWritesReservationsAtomically(t *testing.T) {
 	fsm := newPlacementFSM()
 	expiry := time.Now().Add(60 * time.Second).Unix()
@@ -209,6 +240,109 @@ func TestFSMReserveBatchRejectsDuplicateNameWithoutPartialWrite(t *testing.T) {
 	}
 	if _, ok := fsm.get("sb-batch-2"); ok {
 		t.Fatal("second batch row was written despite duplicate-name rejection")
+	}
+}
+
+// TestFSMReserveBatchRejectsLaterItemWithoutPartialWrite pins that a batch is
+// all-or-nothing for every rule a single opReserve enforces, not only the
+// ones the batch pre-check used to repeat. Each case puts a valid fresh
+// reservation first and a reservation that a single opReserve would refuse
+// second. Before the fix the pre-check missed these rules, so the first item
+// was stored, the second failed, and Raft recorded a failed entry that had
+// still changed state: a held name, pending capacity, and a refreshed TTL on
+// the live row that nobody asked to keep.
+func TestFSMReserveBatchRejectsLaterItemWithoutPartialWrite(t *testing.T) {
+	const (
+		liveID  = "sb-batch-live"
+		freshID = "sb-batch-fresh"
+		owner   = "worker-a"
+	)
+	cases := []struct {
+		name string
+		// live is applied as a single opReserve before the batch; nil means
+		// the batch's second item has no existing row.
+		live    *command
+		second  reservationCommand
+		wantErr error
+	}{
+		{
+			name: "same-owner retry changed its incarnation",
+			live: &command{Op: opReserve, SandboxID: liveID, OwnerNodeID: owner, IncarnationID: "inc-live"},
+			second: reservationCommand{
+				SandboxID: liveID, OwnerNodeID: owner, IncarnationID: "inc-other",
+			},
+			wantErr: ErrIncarnationConflict,
+		},
+		{
+			name: "same-owner retry changed its secret handle",
+			live: &command{
+				Op: opReserve, SandboxID: liveID, OwnerNodeID: owner, IncarnationID: "inc-live",
+				SecretRef: testSecretRef(liveID, "inc-live"), SecretVersion: 1, SecretSealGeneration: 1,
+			},
+			second: reservationCommand{
+				SandboxID: liveID, OwnerNodeID: owner, IncarnationID: "inc-live",
+				SecretRef: testSecretRef(liveID, "inc-live"), SecretVersion: 1, SecretSealGeneration: 2,
+			},
+			wantErr: ErrInvalidSecretHandle,
+		},
+		{
+			name: "secret handle names another sandbox",
+			second: reservationCommand{
+				SandboxID: liveID, OwnerNodeID: owner, IncarnationID: "inc-live",
+				SecretRef: testSecretRef("sb-someone-else", "inc-live"), SecretVersion: 1, SecretSealGeneration: 1,
+			},
+			wantErr: ErrInvalidSecretHandle,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fsm := newPlacementFSM()
+			liveExpiry := time.Now().Add(60 * time.Second).Unix()
+			var before Placement
+			if tc.live != nil {
+				live := *tc.live
+				live.ExpiresUnix = liveExpiry
+				if got := applyOp(t, fsm, live); got != nil {
+					t.Fatalf("seed opReserve = %v, want nil", got)
+				}
+				before, _ = fsm.get(liveID)
+			}
+			pendingBefore := fsm.pendingReservationsByNode(time.Now().Unix())[owner]
+
+			batchExpiry := time.Now().Add(300 * time.Second).Unix()
+			second := tc.second
+			second.ExpiresUnix = batchExpiry
+			got := applyOp(t, fsm, command{
+				Op: opReserveBatch,
+				Reservations: []reservationCommand{
+					{SandboxID: freshID, OwnerNodeID: owner, IncarnationID: "inc-fresh", Spec: &models.CreateSandboxRequest{Name: "fresh-name", CPU: 1}, ExpiresUnix: batchExpiry},
+					second,
+				},
+			})
+			err, ok := got.(error)
+			if !ok || !errors.Is(err, tc.wantErr) {
+				t.Fatalf("opReserveBatch = %v, want %v", got, tc.wantErr)
+			}
+			if p, ok := fsm.get(freshID); ok {
+				t.Fatalf("first batch item was stored despite the batch failing: %+v", p)
+			}
+			if id, ok := fsm.sandboxIDByName("fresh-name"); ok {
+				t.Fatalf("name %q is held by %q after a failed batch", "fresh-name", id)
+			}
+			if got := fsm.pendingReservationsByNode(time.Now().Unix())[owner]; got.CPU != pendingBefore.CPU || got.MemoryMB != pendingBefore.MemoryMB {
+				t.Fatalf("pending capacity on %s = %+v after failed batch, want unchanged %+v", owner, got, pendingBefore)
+			}
+			after, exists := fsm.get(liveID)
+			if tc.live == nil {
+				if exists {
+					t.Fatalf("second batch item was stored despite its own rejection: %+v", after)
+				}
+				return
+			}
+			if after.ExpiresUnix != before.ExpiresUnix || after.Version != before.Version || after.IncarnationID != before.IncarnationID {
+				t.Fatalf("live reservation changed by a failed batch: before %+v after %+v", before, after)
+			}
+		})
 	}
 }
 

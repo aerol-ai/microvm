@@ -185,3 +185,118 @@ func TestIndexRouteWriterFeedsTheResponder(t *testing.T) {
 		t.Fatal("sanity: derived port")
 	}
 }
+
+// Under proxy routing the fence's 503 is the port host in flux, recorded
+// under the port route's id: the next UpsertPortRoute puts the live target
+// back, and DeletePortRoute (a destroy while fenced) removes it.
+func TestIndexRouteWriterFencedPortRoute(t *testing.T) {
+	table := routedns.NewOwnerTable()
+	w := newIndexRouteWriter(table, "d.test")
+	ctx := context.Background()
+
+	_ = w.UpsertPortRoute(ctx, "sb", "10.0.0.9", 8080)
+	if err := w.UpsertFencedPortRoute(ctx, "sb", 8080); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := table.Lookup("sb-8080.d.test"); got.State != routedns.TargetInFlux {
+		t.Fatalf("fenced port = %+v, want in flux (503)", got)
+	}
+	_ = w.UpsertPortRoute(ctx, "sb", "10.0.0.9", 8080)
+	if got, _ := table.Lookup("sb-8080.d.test"); got.State == routedns.TargetInFlux || got.Port != 8080 {
+		t.Fatalf("after the swap back the port = %+v, want the live target", got)
+	}
+	_ = w.UpsertFencedPortRoute(ctx, "sb", 8080)
+	_ = w.DeletePortRoute(ctx, "sb", 8080)
+	if _, ok := table.Lookup("sb-8080.d.test"); ok {
+		t.Fatal("DeletePortRoute left the fenced port behind")
+	}
+}
+
+// A port exposed with visibility "token" under SB_INGRESS_PROXY_ROUTING: the
+// owner table must keep its host as a wake entry, so the owner's router
+// sends the request to the token gate. The route write puts the wake entry
+// in and then removes the direct route; both name the same host here, so
+// that remove must not take the wake entry with it. When it did, the host
+// was missing, and in a cluster the owner's router answered 421 to every
+// request the ingress spliced to it (live UC-426, UC-465, UC-466).
+func TestIndexRouteWriterKeepsTheTokenGatedPort(t *testing.T) {
+	svc, admin := newPublicRouteHarness(t)
+	table := routedns.NewOwnerTable()
+	svc.setRouteWriter(newIndexRouteWriter(table, "sandbox.test"))
+	ctx := context.Background()
+
+	// Private, like the live check: the expose itself makes it public.
+	private := false
+	resp, err := svc.CreateSandbox(ctx, models.CreateSandboxRequest{Image: "alpine:3.20", AllowPublicTraffic: &private})
+	if err != nil {
+		t.Fatal(err)
+	}
+	host := resp.ID + "-3000.sandbox.test"
+	wantWake := func(step string) {
+		t.Helper()
+		got, ok := table.Lookup(host)
+		if !ok {
+			t.Fatalf("%s: the token port's host is missing from the owner table (the router would answer 421)", step)
+		}
+		if got.State != routedns.TargetWake || got.SandboxID != resp.ID || got.GuestPort != 3000 {
+			t.Fatalf("%s: token port host = %+v, want a wake entry for %s:3000", step, got, resp.ID)
+		}
+	}
+
+	if _, err := svc.ExposePortWithVisibility(ctx, resp.ID, 3000, "http", models.ExposedPortVisibilityToken); err != nil {
+		t.Fatalf("expose token: %v", err)
+	}
+	wantWake("after expose")
+
+	// A retry that names no visibility, and a route re-write from a stale
+	// copy (reconcile, a start), keep the gate and the entry.
+	if _, err := svc.ExposePort(ctx, resp.ID, 3000, "http"); err != nil {
+		t.Fatal(err)
+	}
+	wantWake("after a plain re-expose")
+	sb, err := svc.store.Get(ctx, resp.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.installHTTPPortRoute(ctx, sb, 3000); err != nil {
+		t.Fatal(err)
+	}
+	wantWake("after a route re-write")
+
+	// Unexpose removes both shapes, so the host goes.
+	if err := svc.UnexposePort(ctx, resp.ID, 3000); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := table.Lookup(host); ok {
+		t.Fatal("the token port's host survived unexpose")
+	}
+	if got := admin.snapshot(); len(got) != 0 {
+		t.Fatalf("Caddy admin writes with the index writer: %v", got)
+	}
+}
+
+// The wake route and the direct route are two Caddy routes for one host, so
+// deleting either leaves the other, as Caddy does. Deleting the direct route
+// still removes a direct entry.
+func TestIndexRouteWriterDirectDeleteKeepsTheWakeRoute(t *testing.T) {
+	table := routedns.NewOwnerTable()
+	w := newIndexRouteWriter(table, "d.test")
+	ctx := context.Background()
+
+	_ = w.UpsertPortRoute(ctx, "sb", "10.0.0.9", 8080)
+	_ = w.UpsertWakeHTTPPortRoute(ctx, "sb", "127.0.0.1:21213", 8080)
+	_ = w.DeletePortRoute(ctx, "sb", 8080)
+	if got, ok := table.Lookup("sb-8080.d.test"); !ok || got.State != routedns.TargetWake {
+		t.Fatalf("after deleting the direct route the host = %+v ok=%v, want the wake entry kept", got, ok)
+	}
+	_ = w.DeleteWakeHTTPPortRoute(ctx, "sb", 8080)
+	if _, ok := table.Lookup("sb-8080.d.test"); ok {
+		t.Fatal("the wake entry survived its own delete")
+	}
+
+	_ = w.UpsertPortRoute(ctx, "sb", "10.0.0.9", 8080)
+	_ = w.DeletePortRoute(ctx, "sb", 8080)
+	if _, ok := table.Lookup("sb-8080.d.test"); ok {
+		t.Fatal("DeletePortRoute left the direct route behind")
+	}
+}

@@ -22,9 +22,16 @@ var (
 	ErrStaleImage = dockerpool.ErrStaleImage
 )
 
+// metrics is the containerd pool's own series (aerolvm_containerd_pool_*).
+// Its events still count into the shared aerolvm_docker_pool_* series too,
+// which the warm-pool dashboards read (dockerpool.MetricFamily).
+var metrics = dockerpool.NewMetricFamily("aerolvm_containerd_pool")
+
 // New constructs a warm pool for containerd park/adopt (Phase 3).
 func New(logger *slog.Logger) *Pool {
-	return dockerpool.New(logger)
+	p := dockerpool.New(logger)
+	p.SetMetricFamily(metrics)
+	return p
 }
 
 // KeyFromRequest builds a pool key from a create request and resolved runtime.

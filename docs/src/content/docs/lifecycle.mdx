@@ -477,6 +477,8 @@ Each record's `ref` says what happened, and `reason` says why, using the same wo
 | `SYSTEM runtime.removed` | `system:runtime` | The sandbox's container was removed outside the server. |
 | `SYSTEM reconcile.found_stopped` | `system:reconcile` | The server found the sandbox stopped without seeing it stop. |
 | `SYSTEM reconcile.reap` | `system:reconcile` | The sandbox's container was gone, so the server deleted the sandbox. |
+| `SYSTEM cluster.deleted_while_away` | `system:boot-restore` or `system:reconcile` | The sandbox was deleted while its server was cut off from the cluster. When the server came back, it deleted its leftover copy. |
+| `SYSTEM cluster.unproven_while_away` | `system:boot-restore` or `system:reconcile` | The server came back after being cut off for longer than the cluster keeps its delete records (`SB_AUDIT_DELETED_GRACE`, 1 hour by default). The cluster had no record of this sandbox, so nothing showed it was still meant to exist, and the server deleted its copy. |
 | `SYSTEM failover.recreated` | `system:failover` | The sandbox was created again on another server after its server failed. |
 
 A stop or delete that you ask for is in the same log, under your own caller. Reading the audit log needs the `audit.read` permission.

@@ -99,24 +99,13 @@ func (l *createLeases) acquire(ctx context.Context, id string, digests []string,
 		l.mu.Lock()
 		held := l.leases[id]
 		if held == nil {
-			lease := &createLease{done: make(chan struct{})}
+			digest := ""
 			if len(digests) > 0 {
-				lease.digest = digests[0]
+				digest = digests[0]
 			}
-			if l.leases == nil {
-				l.leases = map[string]*createLease{}
-			}
-			l.leases[id] = lease
+			release := l.grantLocked(id, digest)
 			l.mu.Unlock()
-			var once sync.Once
-			return func() {
-				once.Do(func() {
-					l.mu.Lock()
-					delete(l.leases, id)
-					l.mu.Unlock()
-					close(lease.done)
-				})
-			}, nil
+			return release, nil
 		}
 		mismatch := held.digest != "" && len(digests) > 0 && !createDigestsMatch(held.digest, digests)
 		l.mu.Unlock()
@@ -136,6 +125,36 @@ func (l *createLeases) acquire(ctx context.Context, id string, digests []string,
 		case <-expired:
 			return nil, ErrCreateInProgress
 		}
+	}
+}
+
+// tryAcquire takes id's lease only when no create holds it, and never waits;
+// ok is false when the lease is taken.
+func (l *createLeases) tryAcquire(id string) (release func(), ok bool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.leases[id] != nil {
+		return nil, false
+	}
+	return l.grantLocked(id, ""), true
+}
+
+// grantLocked records a new lease on id and returns its release, which runs
+// once. The caller holds l.mu and has seen that no lease is held.
+func (l *createLeases) grantLocked(id, digest string) func() {
+	lease := &createLease{digest: digest, done: make(chan struct{})}
+	if l.leases == nil {
+		l.leases = map[string]*createLease{}
+	}
+	l.leases[id] = lease
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			l.mu.Lock()
+			delete(l.leases, id)
+			l.mu.Unlock()
+			close(lease.done)
+		})
 	}
 }
 
@@ -181,6 +200,25 @@ func (s *Service) beginCreateLease(ctx context.Context, id string, digests []str
 		return ctx, noop, err
 	}
 	return context.WithValue(withCreateRequestDigests(ctx, digests), createLeaseCtxKey{}, id), release, nil
+}
+
+// tryCreateLease is beginCreateLease for a caller that must not wait: it
+// answers ErrCreateInProgress at once when a create of id holds the lease.
+// The placement-only delete (destroy_unmaterialized.go) uses it because
+// DestroySandbox is also called from inside a create's own rollback, which
+// holds the lease without carrying it in the context it passes: a waiting
+// take there would wait for itself.
+func (s *Service) tryCreateLease(ctx context.Context, id string) (context.Context, func(), error) {
+	noop := func() {}
+	id = strings.TrimSpace(id)
+	if id == "" || holdsCreateLease(ctx, id) {
+		return ctx, noop, nil
+	}
+	release, ok := s.createLeases.tryAcquire(id)
+	if !ok {
+		return ctx, noop, ErrCreateInProgress
+	}
+	return context.WithValue(ctx, createLeaseCtxKey{}, id), release, nil
 }
 
 // BeginSandboxCreate takes id's create lease for a caller that runs steps of

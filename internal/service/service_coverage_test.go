@@ -2049,7 +2049,7 @@ func TestRecreateDurableWasmWave15(t *testing.T) {
 	svc.cfg.EnableWasm = true
 	svc.cfg.EnableCluster = true
 	svc.SetWasmRuntime(&recordingRuntime{})
-	svc.AttachCluster(cluster.NewNoop("self", "http://self", "h"))
+	svc.AttachCluster(newRecreateOwnerCluster("self"))
 	svc.cipher = newTestCipher(t)
 
 	err := svc.RecreateSandbox(ctx, "sb-wasm-new15", models.CreateSandboxRequest{

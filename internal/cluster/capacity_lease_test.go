@@ -14,6 +14,13 @@ import (
 	"github.com/aerol-ai/microvm/pkg/capacity"
 )
 
+// set stores a heartbeat as if it were requested just now, so it covers every
+// unreported entry recorded so far. Production stores go through setReported
+// with the mark taken before the request.
+func (c *capacityLeaseCache) set(nodeID string, snap capacity.Snapshot, updated time.Time) {
+	c.setReported(nodeID, snap, updated, c.unreportedMark())
+}
+
 func TestCapacityLeaseCacheMarksMissingAndStaleWorkers(t *testing.T) {
 	now := time.Unix(1000, 0)
 	cache := newCapacityLeaseCache("self", nil, 5*time.Second, nil)

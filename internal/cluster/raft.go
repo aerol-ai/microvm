@@ -54,6 +54,13 @@ type raftSetupConfig struct {
 	TLS *ClusterTLS
 }
 
+// testTuneRaft is set only by this package's TestMain, to shorten Raft's
+// timers for in-process test clusters; it is nil in every binary. With raft's
+// default 1 s heartbeat and election timeouts, each test cluster waited 1-2 s
+// to elect a leader before its test could start: 133 tests took 1-2.5 s
+// each, 254 s of the package's 623 s.
+var testTuneRaft func(*raft.Config)
+
 // setupRaft starts a raft node with the placement FSM. On success the caller
 // owns shutdown via raftNode.Close.
 func setupRaft(cfg raftSetupConfig, fsm *placementFSM, logger *slog.Logger) (*raftNode, error) {
@@ -77,6 +84,9 @@ func setupRaft(cfg raftSetupConfig, fsm *placementFSM, logger *slog.Logger) (*ra
 	// peak; trades disk I/O for memory and faster follower recovery.
 	rcfg.SnapshotInterval = 30 * time.Second
 	rcfg.SnapshotThreshold = 1024
+	if testTuneRaft != nil {
+		testTuneRaft(rcfg)
+	}
 
 	// Format detection BEFORE recovery: if raft-log.bolt is present keep Bolt
 	// (existing nodes); otherwise open raft-wal. Detection keys off the bolt

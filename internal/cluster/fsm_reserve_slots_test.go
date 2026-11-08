@@ -95,10 +95,13 @@ func TestFSMPendingReservationRuntimesPruneOnExpiry(t *testing.T) {
 	if got := pendingRuntimesAt(fsm, now.Add(time.Minute)); len(got) != 0 {
 		t.Fatalf("expired reservation still counted: %v", got)
 	}
-	// The read returns copies: a caller cannot reach the FSM's maps.
+	// The read returns copies: a caller cannot reach the FSM's maps. Read a
+	// minute ahead, where only sb2 is live: reads no longer prune, so sb1 is
+	// still in the index and still live at `now`.
 	applyOp(t, fsm, command{Op: opReserve, SandboxID: "sb2", OwnerNodeID: "B", Spec: &models.CreateSandboxRequest{CPU: 1}, ExpiresUnix: now.Add(time.Hour).Unix()})
-	pendingRuntimesAt(fsm, now)["B"][models.RuntimeDocker] = 99
-	if got := pendingRuntimesAt(fsm, now)["B"][models.RuntimeDocker]; got != 1 {
+	later := now.Add(time.Minute)
+	pendingRuntimesAt(fsm, later)["B"][models.RuntimeDocker] = 99
+	if got := pendingRuntimesAt(fsm, later)["B"][models.RuntimeDocker]; got != 1 {
 		t.Fatalf("caller mutation reached the FSM index: %d", got)
 	}
 }

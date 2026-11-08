@@ -15,3 +15,11 @@ func placementWantsFailoverRecreate(p Placement) bool {
 func specWantsFailoverRecreate(spec *models.CreateSandboxRequest) bool {
 	return spec != nil && spec.ShouldRecreateOnFailover()
 }
+
+// placementMovableOnFailover reports whether the leader may hand p to another
+// worker when its owner looks dead: the only rows a cut-off reader cannot keep
+// routing by. It is placementWantsFailoverRecreate, plus the hot-row mirror
+// for the paged and feed reads, which carry no Spec.
+func placementMovableOnFailover(p Placement) bool {
+	return placementWantsFailoverRecreate(p) || (!p.IsDeleting() && p.FailoverRecreate)
+}

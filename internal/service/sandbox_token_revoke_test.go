@@ -287,6 +287,7 @@ func TestWasmFailoverRecreateSetsTokensNotBefore(t *testing.T) {
 	t.Cleanup(func() { _ = st.Close() })
 	rt := &fakeWasmRecreateRuntime{}
 	svc := New(config.Config{EnableWasm: true, WasmModulesDir: modulesDir, EnableCluster: true}, slog.Default(), st, rt, nil, nil, nil, nil, nil)
+	svc.AttachCluster(newRecreateOwnerCluster("self"))
 	svc.SetWasmRuntime(rt)
 	svc.AttachWasmCheckpointPusher(&fakeWasmCheckpointStore{pullSrc: remoteSnap})
 	spec := models.CreateSandboxRequest{Runtime: models.RuntimeWasm, Durability: models.DurabilityDurable, ModuleRef: "file:///tmp/demo.wasm"}
@@ -456,6 +457,9 @@ func wasmFailbackService(t *testing.T, path string) (*Service, *store.Store, mod
 	rt := &fakeWasmRecreateRuntime{}
 	svc := New(config.Config{EnableWasm: true, WasmModulesDir: t.TempDir(), EnableCluster: true}, slog.Default(), st, rt, nil, nil, nil, nil, nil)
 	svc.SetWasmRuntime(rt)
+	// The recreate re-reads the placement and creates only one this node
+	// still owns (failoverRecreateStillOwned), as the owner watcher's does.
+	svc.AttachCluster(newRecreateOwnerCluster("self"))
 	svc.AttachWasmCheckpointPusher(&fakeWasmCheckpointStore{pullSrc: remoteSnap})
 	spec := models.CreateSandboxRequest{Runtime: models.RuntimeWasm, Durability: models.DurabilityDurable, ModuleRef: "file:///tmp/demo.wasm"}
 	secrets := cluster.PlacementSecrets{IncarnationID: "inc-sb-wasm-failback"}

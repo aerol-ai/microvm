@@ -177,8 +177,11 @@ func TestStorageAndWasmHelperCoverage(t *testing.T) {
 		t.Cleanup(func() { _ = st.Close() })
 
 		cipher := newTestCipher(t)
+		// A fresh row with no placement is placed only when the post-delete
+		// grace proves it was never deleted (settleUnplacedRow); 1h is the
+		// SB_AUDIT_DELETED_GRACE default.
 		svc := &Service{
-			cfg:            config.Config{EnableCluster: true},
+			cfg:            config.Config{EnableCluster: true, AuditDeletedGrace: time.Hour},
 			store:          st,
 			cipher:         cipher,
 			secretProvider: secrets.NewLocalProvider(cipher, newSecretBlobStore(st)),
@@ -202,6 +205,7 @@ func TestStorageAndWasmHelperCoverage(t *testing.T) {
 			CustomDomains:      []models.CustomDomain{{Hostname: "api.acme.com"}},
 			ExposedPorts:       []models.ExposedPort{{Port: 8080, Protocol: models.ExposedPortProtocolHTTP, HostPort: 18080, PublicURL: "http://127.0.0.1:18080"}},
 			ContainerCommand:   []string{"entry"},
+			CreatedAt:          time.Now().UTC(),
 		}
 
 		spec, err := svc.specFromSandbox(context.Background(), sb)

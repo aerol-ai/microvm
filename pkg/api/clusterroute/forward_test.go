@@ -34,7 +34,7 @@ func (c *stubCluster) ForwardHTTP(_ cluster.Endpoint, w http.ResponseWriter, _ *
 	w.WriteHeader(http.StatusAccepted)
 }
 
-func svcWith(t *testing.T, c cluster.Client) *service.Service {
+func svcWith(t testing.TB, c cluster.Client) *service.Service {
 	t.Helper()
 	svc := service.New(config.Config{}, slog.New(slog.NewTextHandler(io.Discard, nil)), nil, nil, nil, nil, nil, nil, nil)
 	if c != nil {

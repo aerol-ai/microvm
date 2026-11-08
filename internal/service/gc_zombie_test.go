@@ -338,6 +338,52 @@ func TestGCZombieCaddyEntriesKeepsRemoteClusterIngressRoutes(t *testing.T) {
 	}
 }
 
+// TestGCZombieCaddyEntriesKeepsInFluxRoutesOfAnUnconfirmedOwner: a cut-off
+// ingress hands its rows out in flux (the owner id kept, its addresses
+// blanked; C4 part 3), and the ingress reconciler answers them with the 503
+// in-flux routes. The zombie sweep must keep those routes. It used to treat
+// a row as in flux only when it had no owner id, so it deleted them on its
+// next pass and the URL fell through to "Sandbox not found" (404, not the
+// 421/503 that I7 asks for) until the ingress audit put them back.
+func TestGCZombieCaddyEntriesKeepsInFluxRoutesOfAnUnconfirmedOwner(t *testing.T) {
+	fake := newGCCaddyFake()
+	fake.httpRouteIDs[caddy.InFluxSandboxRouteID("remote")] = struct{}{}
+	fake.httpRouteIDs[caddy.InFluxPortRouteID("remote", 8080)] = struct{}{}
+
+	server := httptest.NewServer(fake.handler(t))
+	t.Cleanup(server.Close)
+
+	caddyClient := caddy.New(config.Config{
+		CaddyAdminURL:     server.URL,
+		CaddyServerID:     "srv0",
+		EnableCaddy:       true,
+		HTTPClientTimeout: 5 * time.Second,
+	})
+	svc := &Service{
+		cfg:    config.Config{EnableCluster: true, Domain: "sandbox.example.com"},
+		logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		caddy:  caddyClient,
+	}
+	svc.AttachCluster(&stubIngressCluster{
+		Noop: cluster.NewNoop("self", "http://self", ""),
+		placements: []cluster.Placement{{
+			SandboxID:   "remote",
+			OwnerNodeID: "other", // kept: in flux, not orphaned
+			Spec:        &models.CreateSandboxRequest{AllowPublicTraffic: privateFlag(true)},
+			ExposedPortRoutes: map[int]cluster.ExposedPortRoute{
+				8080: {Protocol: models.ExposedPortProtocolHTTP},
+			},
+		}},
+	})
+
+	svc.gcZombieCaddyEntries(context.Background(), nil)
+
+	want := []string{caddy.InFluxSandboxRouteID("remote"), caddy.InFluxPortRouteID("remote", 8080)}
+	if got := fake.keys(fake.httpRouteIDs); !equalSorted(got, want) {
+		t.Fatalf("http routes after gc: got %v, want the in-flux routes kept %v", got, want)
+	}
+}
+
 func TestReconcileClusterIngressGCsRoutesWhenPlacementGone(t *testing.T) {
 	fake := newGCCaddyFake()
 	fake.httpRouteIDs["sandbox-gone"] = struct{}{}
