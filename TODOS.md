@@ -356,9 +356,18 @@ the skip.
 - **Start:** `internal/runtime/containerd/events.go`, then `Reconcile`'s
   missing-runtime branch.
 
-## Isolate orphan sweep survives a daemon restart (runtime) — part 2
+## Isolate orphan sweep survives a daemon restart (runtime) — part 2 — DONE 2026-11-08
 
-- **What:** give `internal/runtime/isolate` a host-backed enumeration so
+- **Done by the WASM/isolate restart work (`fix/kops-wasm-isolate-restart`):**
+  a group host now outlives sandboxd and keeps a record on tmpfs
+  (`pkg/isolate/adopt.go`). At boot `workerdSupervisor.AdoptGroups` takes
+  over the hosts whose workerd still runs and then
+  `pkg/isolate.SweepLeftovers` kills every group-host process (the
+  `aerolvm-isolate-hosts` cgroup, and each `aerolvm-isolate-<key>` jail
+  cgroup) and removes every chroot no adopted host owns. It runs once, at
+  boot, before any spawn, so there is no enumerate-while-spawning race.
+  `Driver.ListManaged` stays the in-memory map: after boot it is complete.
+- **Was:** give `internal/runtime/isolate` a host-backed enumeration so
   `Reconcile`'s orphan sweep can find workerd groups leaked across a
   restart. `Driver.ListManaged` (`internal/runtime/isolate/driver.go:205-213`)
   returns the driver's in-memory `byID` map, and `HostSupervisor`
