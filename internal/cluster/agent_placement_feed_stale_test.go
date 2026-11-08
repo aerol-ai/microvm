@@ -145,8 +145,14 @@ func TestAgentPlacementFeedMarksRecreateEntriesInFluxWhenPollsStop(t *testing.T)
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	if got := time.Since(cutOff); got < 500*time.Millisecond {
-		t.Fatalf("entries went in flux %s after the cut-off, before the 500ms lease ran out", got)
+	// The lease runs from the last poll the control plane answered, which
+	// can come a little before cutOff. Measured from cutOff, a busy runner
+	// saw a correct feed go in flux at 497.6ms and failed it.
+	agent.feed.mu.RLock()
+	lastAnswered := agent.feed.lastAnswered
+	agent.feed.mu.RUnlock()
+	if got := time.Since(lastAnswered); got < 500*time.Millisecond {
+		t.Fatalf("entries went in flux %s after the last answered poll, before the 500ms lease ran out", got)
 	}
 	t.Logf("recreate-policy entry in flux %s after the control plane stopped answering (lease 500ms)", time.Since(cutOff).Round(10*time.Millisecond))
 	// In flux, not gone: the rows stay (with their owner), so a router answers

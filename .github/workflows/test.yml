@@ -93,6 +93,7 @@ jobs:
               - 'integration-tests/suite/harness/**'
               - '.github/workflows/test.yml'
               - 'scripts/scale-gates.sh'
+              - 'scripts/go-test-split.sh'
               # cmd/aerolvm and the MCP packages build on the Go SDK, and
               # cmd/aerolvm/distribution_test.go checks what ships around
               # the aerolvm binary.
@@ -121,10 +122,40 @@ jobs:
             rust_sdk:
               - 'sdk/rust/**'
 
+  # go-tests and go-race each run as two jobs. "cluster-service" runs
+  # internal/cluster and internal/service, each split by test name into parts
+  # that run side by side (scripts/go-test-split.sh); they ran their tests one
+  # at a time and took most of each job. "rest" runs every other package. The
+  # two need separate runners: next to the CPU-heavy packages, the cluster
+  # package's Raft tests (250 ms election timers) lost their leader mid-test.
+  # Each cluster-service part also gets its own network namespace
+  # (GO_TEST_NETNS), so one part's Raft and gossip nodes never reach another's.
+  #
+  # Each job keeps its own Go build cache. setup-go's cache uses one key for
+  # every Go job, and the first job to finish saves it: baseline-tests, with
+  # only the Go SDK build (28 MB). go-tests and go-race then restored that,
+  # rebuilt every package (2-4 min) and could not save their own. These
+  # caches are saved only from pushes to main; pull requests restore main's
+  # newest one.
   go-tests:
     needs: paths
     if: needs.paths.outputs.go_main == 'true'
+    name: go-tests (${{ matrix.group }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - group: cluster-service
+            packages: ./internal/cluster ./internal/service
+            split: ./internal/cluster=3 ./internal/service=2
+            skip: ""
+            netns: "1"
+          - group: rest
+            packages: ./cmd/... ./internal/... ./pkg/... ./images/...
+            split: ""
+            skip: ./internal/cluster ./internal/service
+            netns: ""
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -133,7 +164,18 @@ jobs:
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
           go-version-file: go.mod
-          cache: true
+          cache: false
+
+      - name: Restore Go build cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: ${{ github.job }}-${{ matrix.group }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.mod', 'go.sum') }}-${{ github.sha }}
+          restore-keys: |
+            ${{ github.job }}-${{ matrix.group }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.mod', 'go.sum') }}-
+            ${{ github.job }}-${{ matrix.group }}-${{ runner.os }}-${{ runner.arch }}-
 
       - name: Install build dependencies
         # softhsm2 lets pkg/secrets/pkcs11 test its real PKCS#11 adapter
@@ -144,16 +186,27 @@ jobs:
           sudo apt-get install -y build-essential softhsm2
 
       - name: Run unit tests with coverage
+        env:
+          AEROLVM_SCALE_GATES: "1"
+          GO_TEST_SPLIT: ${{ matrix.split }}
+          GO_TEST_SKIP: ${{ matrix.skip }}
+          GO_TEST_NETNS: ${{ matrix.netns }}
+          GO_TEST_COVERPROFILE: coverage.out
+          PACKAGES: ${{ matrix.packages }}
         run: |
-          AEROLVM_SCALE_GATES=1 go test -count=1 -timeout 20m -coverprofile=coverage.out ./cmd/... ./internal/... ./pkg/... ./images/...
+          # PACKAGES is a space-separated list of patterns: split it.
+          # shellcheck disable=SC2086
+          scripts/go-test-split.sh -count=1 -timeout 20m -- $PACKAGES
           go tool cover -func=coverage.out | tail -n 1
 
       - name: Upload coverage artifact
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
-          name: go-coverage
+          name: go-coverage-${{ matrix.group }}
           path: coverage.out
 
+      # The two jobs cover different packages; Codecov merges their uploads
+      # for the commit.
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@a99c28d3f0da835de33ff2feb2e15691c7b9641f # v7
         with:
@@ -163,11 +216,38 @@ jobs:
           flags: go-main
           fail_ci_if_error: false
 
+      # A failed test run still leaves a good build cache.
+      - name: Save Go build cache
+        if: ${{ !cancelled() && github.event_name == 'push' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: ${{ github.job }}-${{ matrix.group }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.mod', 'go.sum') }}-${{ github.sha }}
+
   go-race:
     needs: paths
     if: needs.paths.outputs.go_main == 'true'
+    name: go-race (${{ matrix.group }})
     runs-on: ubuntu-latest
     timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - group: cluster-service
+            packages: ./internal/cluster ./internal/service
+            split: ./internal/cluster=3 ./internal/service=2
+            skip: ""
+            netns: "1"
+          # Under -race, internal/runtime/wasm is the slowest of the rest
+          # (~300 s): a handful of tests compile wasm guests, CPU-bound.
+          - group: rest
+            packages: ./cmd/... ./internal/... ./pkg/...
+            split: ./internal/runtime/wasm=2
+            skip: ./internal/cluster ./internal/service
+            netns: ""
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -176,7 +256,18 @@ jobs:
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
           go-version-file: go.mod
-          cache: true
+          cache: false
+
+      - name: Restore Go build cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: ${{ github.job }}-${{ matrix.group }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.mod', 'go.sum') }}-${{ github.sha }}
+          restore-keys: |
+            ${{ github.job }}-${{ matrix.group }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.mod', 'go.sum') }}-
+            ${{ github.job }}-${{ matrix.group }}-${{ runner.os }}-${{ runner.arch }}-
 
       - name: Install build dependencies
         run: |
@@ -184,7 +275,24 @@ jobs:
           sudo apt-get install -y build-essential softhsm2
 
       - name: Race test all daemon packages
-        run: go test -race -count=1 -timeout 25m ./cmd/... ./internal/... ./pkg/...
+        env:
+          GO_TEST_SPLIT: ${{ matrix.split }}
+          GO_TEST_SKIP: ${{ matrix.skip }}
+          GO_TEST_NETNS: ${{ matrix.netns }}
+          PACKAGES: ${{ matrix.packages }}
+        run: |
+          # PACKAGES is a space-separated list of patterns: split it.
+          # shellcheck disable=SC2086
+          scripts/go-test-split.sh -race -count=1 -timeout 25m -- $PACKAGES
+
+      - name: Save Go build cache
+        if: ${{ !cancelled() && github.event_name == 'push' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: ${{ github.job }}-${{ matrix.group }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.mod', 'go.sum') }}-${{ github.sha }}
 
   # Every sandboxd release target builds with cgo (go-sqlite3, and the
   # PKCS#11 helper's miekg/pkcs11 since plans/customer-key-custody.md Phase
