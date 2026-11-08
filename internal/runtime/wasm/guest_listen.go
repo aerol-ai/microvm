@@ -81,7 +81,29 @@ func wasip1ListenPort(exposed []int) int {
 	return 0
 }
 
+// guestListening reports whether a serving guest still accepts on port. A
+// var so tests need no real listener.
+var guestListening = func(port int) bool {
+	if port <= 0 {
+		return false
+	}
+	conn, err := net.DialTimeout("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)), 200*time.Millisecond)
+	if err != nil {
+		return false
+	}
+	_ = conn.Close()
+	return true
+}
+
 // syncGuestListenPort hot-updates the worker listener and (re)starts the guest HTTP accept loop.
+//
+// A guest that already serves on its port is left alone. Every reconcile
+// pass syncs the ports of every started sandbox, and SetListenPort
+// re-instantiates the guest: before, that restarted a serving HTTP guest on
+// every pass (dropping its memory and any request in flight), and it would
+// restart one a restarted sandboxd had just taken over. A guest that died
+// (an exec replaced it, a crash) answers no dial and is started again here,
+// as before.
 func (d *Driver) syncGuestListenPort(ctx context.Context, inst *sandboxInstance, client WorkerClient, listenPort int) error {
 	if listenPort == wasmengine.WASIListenPortDisabled {
 		inst.bumpRunGeneration()
@@ -89,7 +111,11 @@ func (d *Driver) syncGuestListenPort(ctx context.Context, inst *sandboxInstance,
 		if err := client.SetListenPort(inst.sandboxID, wasmengine.WASIListenPortDisabled, ""); err != nil {
 			return err
 		}
+		d.recordInstance(inst)
 		_ = ctx
+		return nil
+	}
+	if inst.resolvedListenPort > 0 && guestListening(inst.resolvedListenPort) {
 		return nil
 	}
 
@@ -110,6 +136,7 @@ func (d *Driver) syncGuestListenPort(ctx context.Context, inst *sandboxInstance,
 		}
 	}
 	inst.resolvedListenPort = resolved
+	d.recordInstance(inst)
 	export := inst.entryExport
 	if export == "" {
 		export = "_start"

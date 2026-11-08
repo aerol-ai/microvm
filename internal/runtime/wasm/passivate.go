@@ -140,6 +140,7 @@ func (d *Driver) RehydrateSandbox(ctx context.Context, sandbox *models.Sandbox, 
 	d.mu.Lock()
 	d.byID[sandbox.ID] = inst
 	d.mu.Unlock()
+	d.recordInstance(inst)
 	return d.runtimeState(inst), nil
 }
 
