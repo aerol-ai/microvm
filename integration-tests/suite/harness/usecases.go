@@ -266,7 +266,8 @@ const (
 	// is told 429.
 	CapAPIListFairness Capability = "api-list-fairness"
 	// CapClusterChaos gates the cluster-correctness fault cases UC-470..479
-	// (plans/cluster-correctness-and-create-latency.md §3.2). The scenario is
+	// (plans/cluster-correctness-and-create-latency.md §3.2) and the
+	// release-gate tools UC-480..482 (plans/cluster-phase-2.md §5). The scenario is
 	// role-separated (three dedicated servers, at least two workers, one
 	// ingress) and on-demand, the suite can SSH to every node, and the
 	// operator accepts partitions, packet loss, runtime kills and Raft leader
@@ -1081,6 +1082,13 @@ var Registry = []UseCase{
 	{ID: "UC-477", Title: "Chaos (I6; C1): every server is restarted one at a time; after each restart a leader is back, every committed placement keeps its owner and incarnation, every sandbox still runs once on its owner, and the cluster takes a new create", Requires: []Capability{CapCluster, CapClusterChaos}, Implemented: true},
 	{ID: "UC-478", Title: "Chaos (I4, I6; C7): a worker holding many recreate-policy sandboxes is killed while the survivors have less room than it held; no worker ever runs more than its budget, and every sandbox placed on a survivor runs there within the failover bound", Requires: []Capability{CapCluster, CapClusterChaos}, Implemented: true},
 	{ID: "UC-479", Title: "Chaos (I1, I6; C2, C4): after a real owner kill (sandboxd and the container runtime) and failover, the old node returns and never runs a copy of the sandbox; exactly one copy runs, on the new owner", Requires: []Capability{CapCluster, CapClusterChaos}, Implemented: true},
+
+	// Release-gate tools (plans/cluster-phase-2.md §5): a crash at an exact
+	// point (internal/failpoint), control-plane recovery time, and a soak.
+	// Same scenario and verdict markers as the chaos cases above.
+	{ID: "UC-480", Title: "Chaos (I8, I6): a worker's sandboxd is SIGKILLed while a create is parked by a failpoint between the runtime start and the store write; within the convergence bound the sandbox runs on no worker, has no placement, answers 404, and holds no netns slot or container (skips on a binary built without -tags itest_failpoints)", Requires: []Capability{CapCluster, CapClusterChaos}, Implemented: true},
+	{ID: "UC-481", Title: "Chaos (I6, I8): sandboxd is SIGKILLed on all three servers at once (or only the leader); the leader answer, a placement read and a new create all come back within AEROL_CHAOS_RTO_BUDGET_SECONDS (the recovery time is in the detail), every placement keeps its owner and incarnation, and creates sent during the outage end fully created or fully absent", Requires: []Capability{CapCluster, CapClusterChaos}, Implemented: true},
+	{ID: "UC-482", Title: "Soak (I6): closed-loop workers create, probe and delete for AEROL_SOAK_MINUTES while every node is sampled; after the drain and one reconcile interval every count (tasks, snapshots, netns slots, host ports, rows, routes, placements) is back at baseline, and goroutines, RSS, fds, WAL and Raft size level off; no sandboxd restarts", Requires: []Capability{CapCluster, CapClusterChaos}, Implemented: true},
 }
 
 // byID is a lookup built once for the report generator.
