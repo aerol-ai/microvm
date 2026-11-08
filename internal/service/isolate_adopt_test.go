@@ -32,9 +32,9 @@ func TestAdoptIsolateSandboxesAtBoot(t *testing.T) {
 	rt := &adoptingIsolateRuntime{policyMediatorRuntime: newMediator(), report: isolateruntime.AdoptReport{Groups: 1, Adopted: 1, Reloading: 1}}
 	svc.SetIsolateRuntime(rt)
 	now := time.Now().UTC()
-	yes := true
+	yes, no := true, false
 	rows := []*models.Sandbox{
-		{ID: "sb-a", Runtime: models.RuntimeIsolate, Status: models.SandboxStatusStarted, NetworkAllowOut: []string{"example.com"}},
+		{ID: "sb-a", Runtime: models.RuntimeIsolate, Status: models.SandboxStatusStarted, NetworkAllowOut: []string{"example.com"}, AllowPublicTraffic: &no},
 		{ID: "sb-b", Runtime: models.RuntimeIsolate, Status: models.SandboxStatusStarted, NetworkBlockAll: true, AllowPublicTraffic: &yes, ContainerIP: "127.0.0.1"},
 		{ID: "sb-stopped", Runtime: models.RuntimeIsolate, Status: models.SandboxStatusStopped},
 		{ID: "sb-docker", Runtime: models.RuntimeDocker, Status: models.SandboxStatusStarted},
@@ -81,5 +81,11 @@ func TestAdoptIsolateSandboxesNoopAndErrors(t *testing.T) {
 	svc.AdoptIsolateSandboxes(context.Background())
 	if len(rt.rows) != 1 {
 		t.Fatalf("rows = %v", rt.rows)
+	}
+	// A store that cannot list: nothing reaches the driver.
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if r := svc.AdoptIsolateSandboxes(canceled); r != (isolateruntime.AdoptReport{}) || len(rt.rows) != 1 {
+		t.Fatalf("failed list: %+v rows %v", r, rt.rows)
 	}
 }

@@ -152,6 +152,51 @@ func TestAdoptWasmSandboxesAtBoot(t *testing.T) {
 	}
 }
 
+// TestAdoptWasmSandboxesLeavesUnreadableRows: a row whose mounts cannot be
+// read is left to reconcile, and a store that cannot list leaves every row
+// to reconcile; neither reaches the driver.
+func TestAdoptWasmSandboxesLeavesUnreadableRows(t *testing.T) {
+	ctx := context.Background()
+	rt := &adoptingWasmRuntime{adoptable: map[string]bool{"sb-m": true}}
+	svc, st, _ := newServiceRuntimeHarness(t, &recordingRuntime{})
+	svc.cfg.EnableWasm = true
+	svc.SetWasmRuntime(rt)
+	now := time.Now().UTC()
+	if err := st.Create(ctx, &models.Sandbox{ID: "sb-m", Runtime: models.RuntimeWasm, Status: models.SandboxStatusStarted, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.PutMounts(ctx, "sb-m", []byte("not-a-seal")); err != nil {
+		t.Fatal(err)
+	}
+	// A mount that cannot be set up again leaves its row to reconcile too.
+	if err := st.Create(ctx, &models.Sandbox{ID: "sb-mb", Runtime: models.RuntimeWasm, Status: models.SandboxStatusStarted, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	sealed, err := svc.sealMounts([]models.MountSpec{{Type: "bogus", Target: "/data", Source: "bucket"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.PutMounts(ctx, "sb-mb", sealed); err != nil {
+		t.Fatal(err)
+	}
+	rt.adoptable["sb-mb"] = true
+	if r := svc.AdoptWasmSandboxes(ctx); r != (WasmAdoptReport{}) || len(rt.adopted) != 0 {
+		t.Fatalf("report = %+v adopted %v", r, rt.adopted)
+	}
+	got, _ := st.Get(ctx, "sb-m")
+	if got.Status != models.SandboxStatusStarted {
+		t.Fatalf("an unreadable row was changed to %s", got.Status)
+	}
+	canceled, cancel := context.WithCancel(ctx)
+	cancel()
+	if r := svc.AdoptWasmSandboxes(canceled); r != (WasmAdoptReport{}) {
+		t.Fatalf("report on a failed list = %+v", r)
+	}
+	if rt.finished != 2 {
+		t.Fatalf("FinishAdoption ran %d times; it must run even when the list fails", rt.finished)
+	}
+}
+
 func TestAdoptWasmSandboxesNoop(t *testing.T) {
 	svc, _, _ := newServiceRuntimeHarness(t, &recordingRuntime{})
 	if r := svc.AdoptWasmSandboxes(context.Background()); r != (WasmAdoptReport{}) {
