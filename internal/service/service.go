@@ -3845,7 +3845,9 @@ func (s *Service) startSandboxLocked(ctx context.Context, id string, cause start
 		}
 	}
 	if state == nil {
-		if is, ok := runtime.AsIdentityStarter(rt); ok {
+		if es, ok := runtime.AsEnvIdentityStarter(rt); ok {
+			state, err = es.StartWithIdentityEnv(ctx, s.runtimeRef(sandbox), sandbox.ID, sandbox.ToolboxToken, s.adoptEnvLoader(sandbox))
+		} else if is, ok := runtime.AsIdentityStarter(rt); ok {
 			state, err = is.StartWithIdentity(ctx, s.runtimeRef(sandbox), sandbox.ID, sandbox.ToolboxToken)
 		} else {
 			state, err = rt.Start(ctx, s.runtimeRef(sandbox))

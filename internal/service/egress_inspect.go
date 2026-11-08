@@ -13,6 +13,7 @@ import (
 
 	"github.com/aerol-ai/microvm/internal/egress"
 	"github.com/aerol-ai/microvm/internal/egress/inspect"
+	"github.com/aerol-ai/microvm/internal/runtime"
 	"github.com/aerol-ai/microvm/pkg/egresspolicy"
 	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/aerol-ai/microvm/pkg/mounts"
@@ -279,6 +280,29 @@ func withheldKeys(req *models.CreateSandboxRequest) []string {
 		}
 	}
 	return keys
+}
+
+// adoptEnvLoader returns the env a start hands a containerd warm-pool
+// container again (runtime.EnvIdentityStarter). That container got its env
+// in the adopt frame, so its spec holds none, and the re-adopt must carry
+// exactly what the create's driver request did: the sealed env (which
+// startSandboxLocked has already loaded into sb.Env) with placeholders for
+// the keys the egress gateway injects (P3-2), as createSandbox builds it.
+// Inspect rules' env never needs rebuilding here: their binds keep a create
+// off the pool. The withheld keys are the stored ones (they stay withheld
+// for the sandbox's life) plus what its current rules inject; the store is
+// read only when the driver calls this, which is only for a container
+// adopted with env, so no other start does more work. A store error fails
+// the start rather than risk a real value where a placeholder belongs.
+func (s *Service) adoptEnvLoader(sb *models.Sandbox) runtime.AdoptEnvLoader {
+	env, id, rules := sb.Env, sb.ID, sb.NetworkEgressRules
+	return func(ctx context.Context) (map[string]string, error) {
+		st, err := s.store.GetEgressState(ctx, id)
+		if err != nil {
+			return nil, fmt.Errorf("load withheld env keys: %w", err)
+		}
+		return withholdEnv(env, withheldKeys(&models.CreateSandboxRequest{EgressWithheldEnv: st.Withheld, NetworkEgressRules: rules})), nil
+	}
 }
 
 // withholdEnv replaces keys' values in a copy of env with placeholders.
