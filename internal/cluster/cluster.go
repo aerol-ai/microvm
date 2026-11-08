@@ -153,6 +153,12 @@ var ErrInvalidSecretHandle = errors.New("cluster: invalid secret handle")
 // a different lifetime of the same sandbox ID.
 var ErrIncarnationConflict = errors.New("cluster: sandbox incarnation conflict")
 
+// ErrPlacementDeleted refuses an opPlace that would write back the placement
+// of a lifetime (sandbox ID + incarnation) the cluster already deleted. It is
+// what a node that was cut off gets when its ownership replay tries to place
+// a sandbox someone deleted meanwhile; that node must destroy its copy.
+var ErrPlacementDeleted = errors.New("cluster: sandbox lifecycle was deleted")
+
 // ErrNoPlacementTarget is returned when no alive worker-capable node can
 // accept a new sandbox. This is distinct from "self wins": a pure server or
 // ingress node must not silently fall back to local Docker ownership.
@@ -564,6 +570,11 @@ type LocalSandboxState struct {
 	// boot — without this a failover-recreate would lose the user's TLS
 	// matchers.
 	CustomHostnames []string
+	// CreatedAt is when the local row was created. A row with no placement
+	// and no post-delete record is placed again only when it is younger than
+	// the post-delete grace, because a delete of it would still have its
+	// record (adoptUnplacedRow). The zero value counts as old.
+	CreatedAt time.Time
 }
 
 // PlacementTarget is returned by SelectPlacement.

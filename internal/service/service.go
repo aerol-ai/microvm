@@ -1509,7 +1509,9 @@ func (s *Service) reconcileStaleOwnership(ctx context.Context) {
 		placement, ok := placements[sb.ID]
 		// No placement can be a fresh local create awaiting ownership replay;
 		// an orphan has no replacement owner yet. Neither is proof that this
-		// node's runtime is stale.
+		// node's runtime is stale. A row with no placement whose lifecycle
+		// the cluster deleted is the ownership replay's to destroy: it asks
+		// for the post-delete record (clusterLifecycleDeleted).
 		if !ok || placement.IsOrphaned() || strings.TrimSpace(placement.OwnerNodeID) == self {
 			continue
 		}

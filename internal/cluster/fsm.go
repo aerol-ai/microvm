@@ -248,6 +248,14 @@ type command struct {
 	// an older build never sets it, so its spec writes are always checked.
 	// Apply ignores it.
 	QuotaReplay bool `json:"quota_replay,omitempty"`
+	// RefuseDeletedLifecycle asks opPlace to refuse a missing row whose
+	// (SandboxID, IncarnationID) has a post-delete record
+	// (deletedLifecycleRetainedLocked). Entries written before the fence carry
+	// false and apply exactly as they did, so a log replay reaches the same
+	// state. A proposer sets it only once every server applies it
+	// (deletedLifecycleFenceFSMOpsVersion), so a mixed-version server tier
+	// never splits on one entry.
+	RefuseDeletedLifecycle bool `json:"refuse_deleted_lifecycle,omitempty"`
 }
 
 type reservationCommand struct {
@@ -838,6 +846,21 @@ func (f *placementFSM) retainAuditACLLocked(acl AuditACL, cap int64) {
 	}
 }
 
+// deletedLifecycleRetainedLocked reports whether opDelete left a post-delete
+// record for this exact lifetime. It checks presence, not ExpiresUnix, so it
+// needs no clock: the record leaves the map only through opPruneAuditACL or
+// cap eviction, both log entries, so every replica gives the same answer at
+// the same index. A record past its expiry but not pruned yet still proves
+// the delete.
+func (f *placementFSM) deletedLifecycleRetainedLocked(sandboxID, incarnationID string) bool {
+	incarnationID = strings.TrimSpace(incarnationID)
+	if incarnationID == "" {
+		return false
+	}
+	_, ok := f.auditACLs[auditACLKey(sandboxID, incarnationID)]
+	return ok
+}
+
 func (f *placementFSM) removeAuditACLLocked(key string) {
 	acl, ok := f.auditACLs[key]
 	if !ok {
@@ -975,6 +998,12 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 			if existing.IsDeleting() {
 				return fmt.Errorf("%w: %s is being deleted", ErrReservationConflict, cmd.SandboxID)
 			}
+		}
+		// A missing row is not proof the lifetime is new: a node that was cut
+		// off while the cluster deleted its sandbox replays the old
+		// incarnation here. Without this the placement came back (C2).
+		if !exists && cmd.RefuseDeletedLifecycle && f.deletedLifecycleRetainedLocked(cmd.SandboxID, cmd.IncarnationID) {
+			return fmt.Errorf("%w: %s incarnation %q", ErrPlacementDeleted, cmd.SandboxID, strings.TrimSpace(cmd.IncarnationID))
 		}
 		if exists && existing.OwnerNodeID == cmd.OwnerNodeID && cmd.Spec == nil && !cmd.hasSecretUpdate() && !existing.IsReserved() {
 			return nil

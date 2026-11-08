@@ -65,6 +65,11 @@ func ApplyErrorStatus(err error) int {
 		// only works if the sentinel survives the hop; as a 500 the retry
 		// answered 503 (seen live on cluster-hetero-lite, UC-367).
 		return http.StatusConflict
+	case errors.Is(err, ErrPlacementDeleted):
+		// A verdict: the lifetime is deleted for good. As a 500 a returning
+		// node's ownership replay could not tell it from a transient fault
+		// and would keep its copy of a deleted sandbox.
+		return http.StatusConflict
 	default:
 		return http.StatusInternalServerError
 	}
@@ -109,6 +114,8 @@ func forwardApplyStatus(status int, message string) error {
 			return fmt.Errorf("%w: %s", ErrIncarnationConflict, message)
 		case strings.Contains(message, ErrPlacementUnsatisfiable.Error()):
 			return fmt.Errorf("%w: %s", ErrPlacementUnsatisfiable, message)
+		case strings.Contains(message, ErrPlacementDeleted.Error()):
+			return fmt.Errorf("%w: %s", ErrPlacementDeleted, message)
 		}
 	case http.StatusServiceUnavailable:
 		switch {

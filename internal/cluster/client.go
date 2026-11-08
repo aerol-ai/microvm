@@ -529,6 +529,9 @@ func (c *Cluster) RecordPlacement(ctx context.Context, sandboxID string, spec *m
 		IncarnationID:         incarnationID,
 		ExpectedIncarnationID: expectedIncarnationID,
 		OwnerRef:              secrets.OwnerRef,
+		// No caller may place a lifetime the cluster deleted; see
+		// deleted_lifecycle.go for why this is gated on server versions.
+		RefuseDeletedLifecycle: c.deletedLifecycleFenceReplicated(),
 	}
 	return c.applyCommand(ctx, cmd)
 }
@@ -1263,8 +1266,11 @@ func (c *Cluster) IsNodeDrained(nodeID string) bool {
 // ownership (never overwrite an existing non-self owner):
 //
 //   - **No FSM placement.** Write opPlace claiming self as owner, with spec +
-//     secret ref so the new placement is born recoverable. This is the
-//     normal case for sandboxes created before AssertOwnership last ran.
+//     secret ref so the new placement is born recoverable — but only when
+//     that cannot bring back a deleted sandbox (adoptUnplacedRow), and the
+//     FSM refuses it anyway when the lifecycle has a post-delete record
+//     (ErrPlacementDeleted). This is the case for sandboxes created before
+//     AssertOwnership last ran, e.g. on a single node turned into a cluster.
 //
 //   - **FSM owner == self.** No ownership change. Backfill missing Spec /
 //     secret ref via opUpsertSpec (closes the pre-spec-replication gap)
@@ -1303,6 +1309,8 @@ func (c *Cluster) AssertOwnership(ctx context.Context, local []LocalSandboxState
 		return err
 	}
 	var firstErr error
+	now := time.Now()
+	soleServer := c.soleRaftServer()
 	for _, st := range local {
 		if st.ID == "" {
 			continue
@@ -1315,10 +1323,12 @@ func (c *Cluster) AssertOwnership(ctx context.Context, local []LocalSandboxState
 
 		switch {
 		case !ok:
-			// No placement exists — claim ownership. Pass spec + secret handle
-			// so the placement is born recoverable.
-			if err := c.RecordPlacement(ctx, st.ID, st.Spec, st.Secrets); err != nil && firstErr == nil {
-				firstErr = err
+			// No placement exists — claim ownership when that cannot
+			// resurrect a deleted sandbox. Pass spec + secret handle so the
+			// placement is born recoverable.
+			record := func() error { return c.RecordPlacement(ctx, st.ID, st.Spec, st.Secrets) }
+			if !placeUnplacedRow(c.logger, c.nodeID, st, now, c.cfg.AuditDeletedGrace, soleServer, record, &firstErr) {
+				continue
 			}
 			// Replay port intents so the FSM matches local truth.
 			for port, route := range st.ExposedPorts {
