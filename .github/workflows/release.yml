@@ -461,6 +461,97 @@ jobs:
           fi
           gh release edit "$VERSION" --latest
 
+  # A second home for the release files, for when github.com release
+  # downloads fail (they returned 504 for hours on 2026-11-08, from a laptop
+  # and from AWS alike, so new nodes could not install Caddy). The same files
+  # go to s3://aerolvm-downloads/aerolvm/<tag>/, which anyone can read; the
+  # download side that falls back to it lives in install.sh and the harness.
+  # A job of its own, after the GitHub release: a mirror failure never holds
+  # back the binaries, and "Re-run failed jobs" retries just this. It reads
+  # the published release, checks every file against its checksums.txt, then
+  # syncs, so the mirror holds exactly what GitHub serves; a release that
+  # became GitHub's latest also becomes the mirror's (latest.txt). Off until the
+  # one-time setup is done (RELEASING.md, "The download mirror"): set the
+  # repository variable AEROLVM_MIRROR_ROLE_ARN to the role it assumes.
+  mirror:
+    name: Copy the release files to the download mirror
+    needs: release
+    if: vars.AEROLVM_MIRROR_ROLE_ARN != ''
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      VERSION: ${{ github.event.release.tag_name }}
+      MIRROR_BUCKET: aerolvm-downloads
+    steps:
+      - name: Reject a release tag that is not a version
+        run: |
+          # Same check as the test job. The tag becomes part of the S3 key.
+          if [[ ! "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
+            echo "::error::release tag must look like v1.2.3"
+            exit 1
+          fi
+
+      - name: Download the published release files
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: gh release download "$VERSION" --dir dist
+
+      - name: Check every file against checksums.txt
+        run: |
+          cd dist
+          sha256sum --check --strict checksums.txt
+          # checksums.txt does not list itself or the provenance bundle;
+          # anything else unlisted would be an extra, unchecked file.
+          unlisted=$(comm -23 <(ls | sort) <(awk '{print $2}' checksums.txt | sort) \
+            | grep -vxF -e checksums.txt -e "${VERSION}.intoto.jsonl" || true)
+          if [[ -n "$unlisted" ]]; then
+            echo "::error::release files not in checksums.txt: $unlisted"
+            exit 1
+          fi
+
+      - name: Get AWS credentials for the mirror (GitHub OIDC, no stored keys)
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.AEROLVM_MIRROR_ROLE_ARN }}
+          role-session-name: release-mirror-${{ github.run_id }}
+          role-duration-seconds: 3600
+          aws-region: us-east-1
+
+      - name: Copy the files to the mirror
+        run: aws s3 sync dist/ "s3://${MIRROR_BUCKET}/aerolvm/${VERSION}/" --only-show-errors --no-progress
+
+      - name: Check the mirror serves the same checksums.txt
+        run: |
+          url="https://${MIRROR_BUCKET}.s3.us-east-1.amazonaws.com/aerolvm/${VERSION}/checksums.txt"
+          if ! curl -fsSL --retry 3 "$url" | cmp -s - dist/checksums.txt; then
+            echo "::error::$url does not match the release's checksums.txt"
+            exit 1
+          fi
+          echo "Mirrored $(ls dist | wc -l) files to $url"
+
+      # install.sh finds "latest" on the mirror by reading aerolvm/latest.txt
+      # (#1051, the download side). It names this tag only when the release
+      # job made it GitHub's latest, and moves only after every file is up and
+      # checked above, so an install that reads it never finds a release half
+      # uploaded. Same format as scripts/mirror-sync.sh writes.
+      - name: Point the mirror's latest.txt at this release, if it is GitHub's latest
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          latest="$(gh release view --json tagName --jq .tagName)"
+          if [[ "$latest" != "$VERSION" ]]; then
+            echo "GitHub's latest release is $latest, so aerolvm/latest.txt stays as it is."
+            exit 0
+          fi
+          printf '%s\n' "$VERSION" > latest.txt
+          aws s3 cp latest.txt "s3://${MIRROR_BUCKET}/aerolvm/latest.txt" \
+            --content-type text/plain --cache-control no-cache --only-show-errors --no-progress
+          echo "aerolvm/latest.txt now names $VERSION"
+
   # npm and the MCP Registry are opt-in until their one-time setup is done
   # (npm/README.md): set the repository variable AEROLVM_NPM_PUBLISH=true.
   # Both run after the GitHub release, so a failure here never holds back
