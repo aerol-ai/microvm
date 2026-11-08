@@ -31,14 +31,47 @@ func placeAt(id, owner, host string) command {
 	return command{Op: opPlace, SandboxID: id, OwnerNodeID: owner, OwnerAPIURL: "http://" + host + ":8080", OwnerDataPlaneHost: host, IncarnationID: "inc-" + id}
 }
 
-// TestAgentPlacementFeedMarksEveryEntryInFluxWhenPollsStop is the I7
+// placeRecreateAt is placeAt for a failover.policy=recreate sandbox: the only
+// kind the leader may move, so the only kind the age limit puts in flux.
+func placeRecreateAt(id, owner, host string) command {
+	cmd := placeAt(id, owner, host)
+	cmd.Spec = recreateSpec()
+	return cmd
+}
+
+// staleShape reports whether rows are sb1 (recreate policy) in flux and sb2
+// (no policy) still routed: what a view past the age limit must look like.
+func staleShape(rows []Placement) bool {
+	if len(rows) != 2 {
+		return false
+	}
+	for _, p := range rows {
+		if routable(p) != (p.SandboxID == "sb2") {
+			return false
+		}
+	}
+	return true
+}
+
+func rowByID(rows []Placement, id string) (Placement, bool) {
+	for _, p := range rows {
+		if p.SandboxID == id {
+			return p, true
+		}
+	}
+	return Placement{}, false
+}
+
+// TestAgentPlacementFeedMarksRecreateEntriesInFluxWhenPollsStop is the I7
 // regression for the ingress data path. An ingress on the cut-off side of a
 // partition kept routing by the last rows its feed received, with no age
 // limit, so it sent traffic to an owner the leader may since have replaced.
-// After the lease (half the dead-owner grace) without a successful poll, every
-// entry must be handed out in flux; once polls succeed again the real view
+// After the lease (half the dead-owner grace) without a successful poll,
+// every failover.policy=recreate entry must be handed out in flux. Every other
+// entry keeps its route for the whole outage: the leader cannot move it, so
+// its owner is still the only copy. Once polls succeed again the real view
 // comes back.
-func TestAgentPlacementFeedMarksEveryEntryInFluxWhenPollsStop(t *testing.T) {
+func TestAgentPlacementFeedMarksRecreateEntriesInFluxWhenPollsStop(t *testing.T) {
 	oldMin := feedBackoffMin
 	feedBackoffMin = 20 * time.Millisecond
 	defer func() { feedBackoffMin = oldMin }()
@@ -47,7 +80,7 @@ func TestAgentPlacementFeedMarksEveryEntryInFluxWhenPollsStop(t *testing.T) {
 	defer cleanup()
 	waitForLeader(t, srv, 10*time.Second)
 	ctx := context.Background()
-	for _, cmd := range []command{placeAt("sb1", "w1", "10.0.0.1"), placeAt("sb2", "w2", "10.0.0.2")} {
+	for _, cmd := range []command{placeRecreateAt("sb1", "w1", "10.0.0.1"), placeAt("sb2", "w2", "10.0.0.2")} {
 		if err := srv.applyCommand(ctx, cmd); err != nil {
 			t.Fatal(err)
 		}
@@ -100,11 +133,14 @@ func TestAgentPlacementFeedMarksEveryEntryInFluxWhenPollsStop(t *testing.T) {
 	deadline := cutOff.Add(5 * time.Second)
 	for {
 		rows := agent.PlacementsForShards(PlacementShardFilter{})
-		if allRoutable(rows, false) && allRoutable(watcherView(), false) {
+		if p, ok := rowByID(rows, "sb2"); !ok || !routable(p) {
+			t.Fatalf("the sandbox with no recreate policy lost its route during the outage: %v", ownerHosts(rows))
+		}
+		if staleShape(rows) && staleShape(watcherView()) {
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("%s after the last successful poll the feed still routes by its old rows (PlacementsForShards %v, watcher %v); want every entry in flux after the 500ms lease",
+			t.Fatalf("%s after the last successful poll the feed still routes by its old rows (PlacementsForShards %v, watcher %v); want the recreate-policy entry in flux after the 500ms lease and the other routed",
 				time.Since(cutOff).Round(time.Millisecond), ownerHosts(rows), ownerHosts(watcherView()))
 		}
 		time.Sleep(20 * time.Millisecond)
@@ -112,7 +148,7 @@ func TestAgentPlacementFeedMarksEveryEntryInFluxWhenPollsStop(t *testing.T) {
 	if got := time.Since(cutOff); got < 500*time.Millisecond {
 		t.Fatalf("entries went in flux %s after the cut-off, before the 500ms lease ran out", got)
 	}
-	t.Logf("every entry in flux %s after the control plane stopped answering (lease 500ms)", time.Since(cutOff).Round(10*time.Millisecond))
+	t.Logf("recreate-policy entry in flux %s after the control plane stopped answering (lease 500ms)", time.Since(cutOff).Round(10*time.Millisecond))
 	// In flux, not gone: the rows stay (with their owner), so a router answers
 	// 503 + Retry-After rather than 404.
 	for _, p := range agent.PlacementsForShards(PlacementShardFilter{}) {
@@ -156,7 +192,8 @@ func TestPlacementFeedAgeRule(t *testing.T) {
 	clock := &fakeFeedClock{now: time.Unix(1_000, 0)}
 	f := &agentPlacementFeed{
 		rows: map[string]Placement{
-			"sb1": {SandboxID: "sb1", OwnerNodeID: "w1", OwnerAPIURL: "http://10.0.0.1:8080", OwnerDataPlaneHost: "10.0.0.1"},
+			"sb1": {SandboxID: "sb1", OwnerNodeID: "w1", OwnerAPIURL: "http://10.0.0.1:8080", OwnerDataPlaneHost: "10.0.0.1", FailoverRecreate: true},
+			"sb2": {SandboxID: "sb2", OwnerNodeID: "w2", OwnerAPIURL: "http://10.0.0.2:8080", OwnerDataPlaneHost: "10.0.0.2"},
 		},
 		synced:       true,
 		lastAnswered: clock.Now(),
@@ -177,7 +214,7 @@ func TestPlacementFeedAgeRule(t *testing.T) {
 	if agent.checkPlacementFeedAge(f) {
 		t.Fatal("feed went in flux at exactly the age limit")
 	}
-	if rows, _ := agent.feedPlacements(PlacementShardFilter{}); !routable(rows[0]) {
+	if rows, _ := agent.feedPlacements(PlacementShardFilter{}); !allRoutableRows(rows) {
 		t.Fatal("rows in flux at exactly the age limit")
 	}
 
@@ -188,8 +225,11 @@ func TestPlacementFeedAgeRule(t *testing.T) {
 	if agent.checkPlacementFeedAge(f) {
 		t.Fatal("the in-flux view was sent twice")
 	}
-	if len(views) != 1 || len(views[0]) != 1 || routable(views[0][0]) || views[0][0].OwnerNodeID != "w1" {
-		t.Fatalf("watcher views = %+v, want one all-in-flux view keeping the owner id", views)
+	if len(views) != 1 || !staleShape(views[0]) {
+		t.Fatalf("watcher views = %+v, want one view with the recreate-policy row in flux and the other routed", views)
+	}
+	if p, _ := rowByID(views[0], "sb1"); p.OwnerNodeID != "w1" {
+		t.Fatalf("in-flux row lost its owner id: %+v", p)
 	}
 	select {
 	case <-wake:
@@ -200,21 +240,21 @@ func TestPlacementFeedAgeRule(t *testing.T) {
 		t.Fatalf("in-flux gauge = %d, want 1", got)
 	}
 	rows, ok := agent.feedPlacements(PlacementShardFilter{})
-	if !ok || routable(rows[0]) {
-		t.Fatalf("PlacementsForShards = %+v ok=%v, want the row in flux", rows, ok)
+	if !ok || !staleShape(rows) {
+		t.Fatalf("PlacementsForShards = %+v ok=%v, want the recreate-policy row in flux and the other routed", rows, ok)
 	}
 	if !routable(f.rows["sb1"]) {
 		t.Fatal("the stored row was rewritten; only the copies handed out may be in flux")
 	}
 
 	full, wasInFlux := f.markAnswered()
-	if !wasInFlux || len(full) != 1 || !routable(full[0]) {
+	if !wasInFlux || len(full) != 2 || !allRoutableRows(full) {
 		t.Fatalf("markAnswered = %+v, %v; want the real view back", full, wasInFlux)
 	}
 	if got := clusterPlacementFeedInFlux.Value(); got != 0 {
 		t.Fatalf("in-flux gauge = %d after an answer, want 0", got)
 	}
-	if rows, _ := agent.feedPlacements(PlacementShardFilter{}); !routable(rows[0]) {
+	if rows, _ := agent.feedPlacements(PlacementShardFilter{}); !allRoutableRows(rows) {
 		t.Fatal("rows still in flux after an answered poll")
 	}
 	if _, again := f.markAnswered(); again {
@@ -227,7 +267,7 @@ func TestPlacementFeedAgeRule(t *testing.T) {
 // page walk; a zero limit turns the rule off.
 func TestPlacementFeedAgeEdges(t *testing.T) {
 	clock := &fakeFeedClock{now: time.Unix(2_000, 0)}
-	row := Placement{SandboxID: "sb1", OwnerNodeID: "w1", OwnerDataPlaneHost: "10.0.0.1"}
+	row := Placement{SandboxID: "sb1", OwnerNodeID: "w1", OwnerDataPlaneHost: "10.0.0.1", FailoverRecreate: true}
 
 	resyncing := &agentPlacementFeed{rows: map[string]Placement{"sb1": row}, lastAnswered: clock.Now(), maxStale: time.Second, clock: clock.Now}
 	never := &agentPlacementFeed{rows: map[string]Placement{}, maxStale: time.Second, clock: clock.Now}
@@ -264,4 +304,101 @@ func TestPlacementFeedPollingFitsTheAgeLimit(t *testing.T) {
 	if got := agent.feedWait(); got != MaxPlacementChangesWait {
 		t.Fatalf("feedWait without an age limit = %s, want %s", got, MaxPlacementChangesWait)
 	}
+}
+
+// TestAgentPageWalkMarksRecreateEntriesInFluxWhenTheControlPlaneStops is the I7
+// regression for an ingress WITHOUT SB_INGRESS_PROXY_ROUTING, which is the
+// default and what the live cluster-chaos scenario runs (UC-470, 2026-11-08).
+// That ingress has no feed: PlacementsForShards walks the pages, and when
+// the walk fails it falls back to the rows of the last walk that worked,
+// with no age limit. A cut-off ingress therefore kept its SNI route to the
+// old owner; the owner had paused the sandbox (C4 part 1), and the paused
+// process took the connection but never answered, so the probe hung until
+// its 10 s timeout instead of getting a quick 503. After the lease without
+// an answered walk, the cached recreate-policy rows must come back in flux;
+// every other row keeps its route for the whole outage (the leader cannot
+// move it), and the real rows come back on the next walk that works.
+func TestAgentPageWalkMarksRecreateEntriesInFluxWhenTheControlPlaneStops(t *testing.T) {
+	srv, cleanup := newTestCluster(t, "srv-walk-stale", true, nil)
+	defer cleanup()
+	waitForLeader(t, srv, 10*time.Second)
+	ctx := context.Background()
+	for _, cmd := range []command{placeRecreateAt("sb1", "w1", "10.0.0.1"), placeAt("sb2", "w2", "10.0.0.2")} {
+		if err := srv.applyCommand(ctx, cmd); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	var offline atomic.Bool
+	agent := newAgentControlPlaneHarness(t, feedControlPlane(srv, nil, &offline), Member{NodeID: "worker-self", Alive: true, Role: config.NodeRoleWorker})
+	// No IngressProxyRouting: no feed, the page walk serves every read.
+	// A 1s grace makes the lease 500ms.
+	agent.cfg.ClusterDeadOwnerGrace = time.Second
+	allRoutable := func(rows []Placement, want bool) bool {
+		if len(rows) != 2 {
+			return false
+		}
+		for _, p := range rows {
+			if routable(p) != want {
+				return false
+			}
+		}
+		return true
+	}
+	// The lease runs from the start of the last answered walk.
+	lastWalk := time.Now()
+	if rows := agent.PlacementsForShards(PlacementShardFilter{}); !allRoutable(rows, true) {
+		t.Fatalf("the first walk = %v, want both sandboxes routed", ownerHosts(rows))
+	}
+
+	// The control plane stops answering: every walk fails from now on.
+	offline.Store(true)
+	cutOff := time.Now()
+	if rows := agent.PlacementsForShards(PlacementShardFilter{}); !allRoutable(rows, true) {
+		t.Fatalf("one failed walk inside the lease = %v, want the cached rows still routed", ownerHosts(rows))
+	}
+	deadline := cutOff.Add(5 * time.Second)
+	for {
+		rows := agent.PlacementsForShards(PlacementShardFilter{})
+		if p, ok := rowByID(rows, "sb2"); !ok || !routable(p) {
+			t.Fatalf("the sandbox with no recreate policy lost its route during the outage: %v", ownerHosts(rows))
+		}
+		if staleShape(rows) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%s after the last answered walk the ingress still routes by its cached rows %v; want the recreate-policy entry in flux after the 500ms lease and the other routed",
+				time.Since(cutOff).Round(time.Millisecond), ownerHosts(rows))
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if got := time.Since(lastWalk); got < 500*time.Millisecond {
+		t.Fatalf("entries went in flux %s after the last answered walk began, before the 500ms lease ran out", got)
+	}
+	// In flux, not gone and not orphaned: the owner id stays, so the router
+	// answers 503 + Retry-After rather than 404 or 410.
+	for _, p := range agent.PlacementsForShards(PlacementShardFilter{}) {
+		if p.OwnerNodeID == "" {
+			t.Fatalf("in-flux row %s lost its owner; it must read as in flux, not orphaned", p.SandboxID)
+		}
+	}
+	// Only the copies handed out are in flux: the cache keeps the real rows.
+	if cached := agent.cachedPlacementsForShards(PlacementShardFilter{}); !allRoutable(cached, true) {
+		t.Fatalf("the cached rows were rewritten: %v", ownerHosts(cached))
+	}
+
+	// The control plane answers again: the next walk routes by the real rows.
+	offline.Store(false)
+	if rows := agent.PlacementsForShards(PlacementShardFilter{}); !allRoutable(rows, true) {
+		t.Fatalf("the first answered walk = %v, want both sandboxes routed again", ownerHosts(rows))
+	}
+}
+
+func allRoutableRows(rows []Placement) bool {
+	for _, p := range rows {
+		if !routable(p) {
+			return false
+		}
+	}
+	return len(rows) > 0
 }

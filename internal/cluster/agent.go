@@ -186,7 +186,11 @@ type Agent struct {
 
 	cacheMu        sync.RWMutex
 	placementCache []Placement
-	shardCache     map[string][]Placement
+	// placementWalkAnswered is when the last page walk that the control
+	// plane answered began. Past OwnershipLease the cached rows are handed
+	// out in flux (PlacementsForShards).
+	placementWalkAnswered time.Time
+	shardCache            map[string][]Placement
 	// shardCacheOrder is the insertion order of shardCache keys, oldest first,
 	// so superseded ring generations can be evicted.
 	shardCacheOrder []string
@@ -1193,13 +1197,35 @@ func (a *Agent) PlacementsForShards(filter PlacementShardFilter) []Placement {
 	}
 	out, err := a.fetchPlacementPages(filter)
 	if err != nil {
-		a.logger.Warn("cluster agent: paged placement lookup failed; using cached placement view",
-			"err", err, "shards", len(filter.Shards), "all_shards", filter.allShards())
+		// Age limit (plan C4 part 3, invariant I7), as the feed has. Without
+		// SB_INGRESS_PROXY_ROUTING this walk is the ingress's only view, and
+		// a cut-off ingress kept routing by its last rows for the whole cut:
+		// to an owner the leader may have replaced, or one that has paused
+		// the sandbox (C4 part 1), whose paused process takes the connection
+		// and never answers. Past the lease the recreate-policy rows go out
+		// in flux, which the ingress answers with 503 + Retry-After; the rest
+		// keep routing (staleViewPlacement).
 		cached := a.cachedPlacementsForShards(filter)
+		a.cacheMu.RLock()
+		answered := a.placementWalkAnswered
+		a.cacheMu.RUnlock()
+		age := time.Since(answered)
+		inFlux := !answered.IsZero() && age > OwnershipLease(a.cfg)
+		if inFlux {
+			for i := range cached {
+				cached[i] = staleViewPlacement(cached[i])
+			}
+		}
+		a.logger.Warn("cluster agent: paged placement lookup failed; using cached placement view",
+			"err", err, "shards", len(filter.Shards), "all_shards", filter.allShards(),
+			"since_last_answer", age.Round(time.Millisecond), "in_flux", inFlux)
 		recordPlacementCacheRefresh(time.Since(start), len(cached), a.shardCacheEntryCount(), err)
 		return cached
 	}
 	a.cacheMu.Lock()
+	if start.After(a.placementWalkAnswered) {
+		a.placementWalkAnswered = start
+	}
 	if filter.allShards() {
 		a.placementCache = clonePlacements(out)
 	}

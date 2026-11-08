@@ -1176,6 +1176,8 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 			// to recompute it from and must not silently make the sandbox
 			// private. A present spec still overrides it.
 			PublicTraffic: exists && existing.PublicTraffic,
+			// Same rule for the failover policy mirror.
+			FailoverRecreate: exists && existing.FailoverRecreate,
 			// opPlace is the promotion path for reservations: writing the
 			// empty State here transitions a Reserved row back to Placed.
 			// ExpiresUnix is cleared by the zero-value as well so the GC
@@ -3070,6 +3072,9 @@ func splitPlacement(p Placement) (Placement, placementRecovery) {
 	// the hot row already carries rather than clearing it.
 	if p.Spec != nil {
 		p.PublicTraffic = p.Spec.AllowPublicTraffic != nil && *p.Spec.AllowPublicTraffic
+		// The failover policy rides the hot row for the same readers: an
+		// ingress's age limit reads it to put only movable sandboxes in flux.
+		p.FailoverRecreate = specWantsFailoverRecreate(p.Spec)
 		// Egress profile references ride the hot row too: the FSM's
 		// reference index and apply-time cap check read them without
 		// hydrating the spec.
