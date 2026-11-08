@@ -229,7 +229,13 @@ func (d *Driver) adoptParked(ctx context.Context, req models.CreateSandboxReques
 	// socket out from under a start.
 	_ = slot.Handle.Close()
 
-	delete(labels, poolParkLabelKey)
+	// containerd's SetLabels updates only the keys it is given and leaves
+	// every other label alone, so deleting the park key from this map kept
+	// it on the container. The adopted sandbox then still read as park
+	// inventory, and sandboxd's next shutdown drained it like a parked slot:
+	// its task was stopped while the store still said started (live UC-212,
+	// 2026-11-08). An empty value is how containerd deletes a label.
+	labels[poolParkLabelKey] = ""
 	labels[sandboxIDLabelKey] = sandboxID
 	if len(req.Env) > 0 {
 		labels[adoptEnvLabelKey] = adoptEnvLabelValue
@@ -393,8 +399,12 @@ func (d *Driver) applyAdoptNetworkPolicy(containerIP string, req models.CreateSa
 }
 
 // IsParkedContainerLabels reports warm-pool park inventory for ListManaged.
+// A park never carries a sandbox id; an adopt sets one. Requiring its absence
+// keeps a sandbox adopted by an older build, whose adopt left the park label
+// on (see adoptParked), from being drained or listed as park inventory.
 func IsParkedContainerLabels(labels map[string]string) bool {
-	return labels != nil && labels[poolParkLabelKey] == poolParkLabelValue
+	return labels != nil && labels[poolParkLabelKey] == poolParkLabelValue &&
+		strings.TrimSpace(labels[sandboxIDLabelKey]) == ""
 }
 
 // IsParkedSandboxID reports park-<hex> slot ids.

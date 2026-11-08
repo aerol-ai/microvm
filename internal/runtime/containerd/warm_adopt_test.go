@@ -100,6 +100,14 @@ func TestIsParkedLabels(t *testing.T) {
 	if !IsParkedContainerLabels(map[string]string{poolParkLabelKey: poolParkLabelValue}) {
 		t.Fatal("expected parked")
 	}
+	// An older build's adopt left the park label next to the sandbox id;
+	// that container is a sandbox, not park inventory.
+	if IsParkedContainerLabels(map[string]string{poolParkLabelKey: poolParkLabelValue, sandboxIDLabelKey: "sb-1"}) {
+		t.Fatal("a container with a sandbox id is not parked")
+	}
+	if IsParkedContainerLabels(nil) || IsParkedContainerLabels(map[string]string{sandboxIDLabelKey: "sb-1"}) {
+		t.Fatal("no park label means not parked")
+	}
 	if IsParkedSandboxID("park-deadbeef") != true {
 		t.Fatal("expected park id")
 	}

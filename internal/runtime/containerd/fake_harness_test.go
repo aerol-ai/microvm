@@ -329,8 +329,17 @@ func (c *fakeContainer) SetLabels(_ context.Context, labels map[string]string) (
 	if c.setLabelsErr != nil {
 		return nil, c.setLabelsErr
 	}
-	c.labels = make(map[string]string, len(labels))
+	// Like containerd: only the given keys change, the rest stay, and an
+	// empty value deletes its label (client container.SetLabels and
+	// metadata boltutil.writeMap).
+	if c.labels == nil {
+		c.labels = make(map[string]string, len(labels))
+	}
 	for k, v := range labels {
+		if v == "" {
+			delete(c.labels, k)
+			continue
+		}
 		c.labels[k] = v
 	}
 	return c.labels, nil
