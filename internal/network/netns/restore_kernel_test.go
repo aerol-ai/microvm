@@ -60,7 +60,7 @@ func (r *dummyRunner) Del(ctx context.Context, netnsPath, _ string) error {
 
 // kernelRunner uses the real plugins from AEROL_KT_CNI_DIR (a checkout-
 // relative dir works: the test runs in the package dir) or /opt/cni/bin.
-func kernelRunner(t *testing.T) cni.Runner {
+func kernelRunner(t testing.TB) cni.Runner {
 	t.Helper()
 	pluginDir := "/opt/cni/bin"
 	if d := os.Getenv("AEROL_KT_CNI_DIR"); d != "" {

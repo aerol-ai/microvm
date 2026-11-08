@@ -364,3 +364,60 @@ func TestForwardHTTPStampsSSHGateway(t *testing.T) {
 		t.Fatalf("owner parsed %+v ok=%v", call, ok)
 	}
 }
+
+// TestStampForwardRouteHint: a forward the edge routed from its owner cache
+// (the context carries the token) is sent with X-Cluster-Route-Hint. Every
+// other forward carries none, even one that arrived with a stale or forged
+// header: the hint follows the context, never a header that came in.
+func TestStampForwardRouteHint(t *testing.T) {
+	cases := []struct {
+		name, token, stale, want string
+	}{
+		{name: "cache-routed", token: "tok-1", want: "tok-1"},
+		{name: "cache-routed replaces a stale hint", token: "tok-1", stale: "tok-0", want: "tok-1"},
+		{name: "an ordinary forward", want: ""},
+		{name: "an ordinary forward drops a forged hint", stale: "tok-0", want: ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			if tc.token != "" {
+				ctx = ContextWithRouteHint(ctx, tc.token)
+			}
+			out, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://peer/v1/sandboxes/sb-1", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tc.stale != "" {
+				out.Header.Set(HeaderRouteHint, tc.stale)
+			}
+			StampForward(out, controlplane.OperatorAccess())
+			if got := out.Header.Values(HeaderRouteHint); (tc.want == "" && len(got) != 0) || (tc.want != "" && (len(got) != 1 || got[0] != tc.want)) {
+				t.Fatalf("%s = %v, want %q", HeaderRouteHint, got, tc.want)
+			}
+		})
+	}
+	if RouteHintFromContext(context.Background()) != "" {
+		t.Fatal("hint from an empty context")
+	}
+}
+
+// TestForwardHTTPCarriesTheRouteHint drives a cache-routed forward over a real
+// node-bound mTLS hop: the owner sees the token, and its "not here" (421 with
+// the token in X-Cluster-Not-Owner) comes back to the edge intact.
+func TestForwardHTTPCarriesTheRouteHint(t *testing.T) {
+	srv, client := newNodeBoundForwardServer(t, "edge-1", "owner-1", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set(HeaderNotOwner, r.Header.Get(HeaderRouteHint))
+		http.Error(w, "not here", http.StatusMisdirectedRequest)
+	}))
+	c := newForwardingCluster(t, client.Transport)
+	c.nodeID = "edge-1"
+
+	in := httptest.NewRequest(http.MethodGet, "/v1/sandboxes/sb-1", nil)
+	in = in.WithContext(ContextWithRouteHint(in.Context(), "tok-9"))
+	rr := httptest.NewRecorder()
+	c.ForwardHTTP(Endpoint{NodeID: "owner-1", InternalURL: srv.URL}, rr, in)
+	if rr.Code != http.StatusMisdirectedRequest || rr.Header().Get(HeaderNotOwner) != "tok-9" {
+		t.Fatalf("got %d %s=%q, want 421 echoing tok-9", rr.Code, HeaderNotOwner, rr.Header().Get(HeaderNotOwner))
+	}
+}

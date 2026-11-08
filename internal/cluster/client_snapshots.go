@@ -42,6 +42,23 @@ func SnapshotImageHomeKey(image string) string {
 	return tag
 }
 
+// SnapshotLocalOnlyKey is the key a snapshot's home is also recorded under
+// while its image exists only on that node: its registry push has not landed
+// yet (pending, running or failing), or the cluster does not push snapshots.
+// A create by snapshot name that reaches another node must then run on the
+// home, because the registry copy that node would pull is not there. The home
+// drops the key once the push lands, and creates spread through the registry
+// copy again.
+//
+// The leading NUL keeps it apart from every other key: a name key starts with
+// the owner or the name, and a tag key carries no NUL. "" for an empty name.
+func SnapshotLocalOnlyKey(owner, name string) string {
+	if strings.TrimSpace(name) == "" {
+		return ""
+	}
+	return "\x00local-only\x00" + SnapshotHomeKey(owner, name)
+}
+
 // Snapshot-home routing on the raft-voter Cluster. Writes go through the ordered
 // log (applyCommand handles leader-forward); the read comes from the local
 // replicated FSM, so any server node can route a snapshot-by-id request after

@@ -354,6 +354,10 @@ type fakeTask struct {
 	startErr  error
 	onStart   func()
 	killed    int
+	// pauses / resumes count Pause and Resume calls (freeze_test.go).
+	pauses    int
+	resumes   int
+	resumeErr error
 }
 
 func (t *fakeTask) Pid() uint32 { return 0 }
@@ -377,12 +381,16 @@ func (t *fakeTask) Kill(context.Context, syscall.Signal, ...cntr.KillOpts) error
 	return nil
 }
 func (t *fakeTask) Pause(context.Context) error {
+	t.pauses++
 	if t.pauseErr != nil {
 		return t.pauseErr
 	}
 	return nil
 }
-func (t *fakeTask) Resume(context.Context) error { return nil }
+func (t *fakeTask) Resume(context.Context) error {
+	t.resumes++
+	return t.resumeErr
+}
 func (t *fakeTask) Status(context.Context) (cntr.Status, error) {
 	if t.statusErr != nil {
 		return cntr.Status{}, t.statusErr

@@ -32,9 +32,10 @@ func TestQueryValuesEmpty(t *testing.T) {
 func TestContainerStatusUnknownIsError(t *testing.T) {
 	in := containerInspect{}
 	in.State = &struct {
-		Running bool   `json:"Running"`
-		Status  string `json:"Status"`
-		Pid     int    `json:"Pid"`
+		Running   bool   `json:"Running"`
+		Status    string `json:"Status"`
+		Pid       int    `json:"Pid"`
+		StartedAt string `json:"StartedAt"`
 	}{Running: false, Status: "restarting"}
 	if got := containerStatus(in); got != models.SandboxStatusError {
 		t.Fatalf("containerStatus(restarting) = %q, want error", got)

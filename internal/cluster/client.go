@@ -39,6 +39,9 @@ type Cluster struct {
 	// in tests that need a lagging local replica next to a live leader.
 	// Always nil in production.
 	authoritativePlacementsHook func(context.Context, []string) (map[string]Placement, error)
+	// leaderContactHook stands in for raft's state and last-leader-contact
+	// time in tests (stale_read.go). Always nil in production.
+	leaderContactHook func() (raft.RaftState, time.Time)
 
 	// patToken authenticates leader-forwarded raft applies. Sourced from
 	// cfg.PATToken at construction; same value every node already shares for
@@ -99,16 +102,26 @@ type Cluster struct {
 	// be admitted. Nothing repairs that afterwards: an already-configured
 	// server skips the admission check on every later reconcile.
 	raftMembershipMu sync.Mutex
-	// reservationAdmissionMu serializes leader-side reservation admission.
-	// Capacity leases are outside the Raft FSM, so the leader must check
-	// target capacity + per-worker pending caps under one queue before
-	// appending opReserve/opReserveBatch. Otherwise two routers can both
-	// validate against the same pending snapshot and overfill a worker.
+	// reservationAdmissionMu serializes leader-side admission checks (the
+	// capacity and pending-create cap of opReserve/opReserveBatch, and team
+	// quotas) and guards the admission ledger. Capacity leases are outside
+	// the Raft FSM, so two routers checking the same pending snapshot at once
+	// could both fill a worker's last slot. It is held for the check only,
+	// never across the Raft commit: what is admitted but not yet applied is
+	// counted from the ledger instead (admission_ledger.go).
 	reservationAdmissionMu sync.Mutex
-	// quotaBarrierTerm is the Raft term this leader last ran its team-quota
-	// barrier in (team_quotas.go): quota admission reads usage only once the
-	// FSM holds every entry committed before the term began.
-	quotaBarrierTerm atomic.Uint64
+	// admission is the leader's ledger of in-flight admissions for its
+	// current term, guarded by reservationAdmissionMu.
+	admission admissionLedger
+	// admissionEnqueue is held for reading from a passed admission check
+	// until raft has taken the entry, and for writing by a term change before
+	// its barrier, so every entry admitted in an earlier term is in the log
+	// ahead of that barrier (admission_ledger.go).
+	admissionEnqueue sync.RWMutex
+	// leaderTermHook and admissionBarrierHook stand in for raft's state, term
+	// and barrier in admission tests. Always nil in production.
+	leaderTermHook       func() (bool, uint64)
+	admissionBarrierHook func() error
 	// authoritativeBarrierOnce/authoritativeBarrier admit ONE fsm barrier at
 	// a time. A raft barrier cannot be cancelled, so the goroutine waiting on
 	// one outlives an abandoned read; holding the slot until raft returns is
@@ -143,6 +156,10 @@ type Cluster struct {
 	readIndexHook func(context.Context) (uint64, error)
 	// catchUpLogEvery overrides catchUpStillWaitingLogEvery in tests.
 	catchUpLogEvery time.Duration
+	// evictDeadOwnerStepHook runs just before each write evictDeadOwner
+	// makes, so tests can move a placement or revive the node between the
+	// read and the write. Always nil in production.
+	evictDeadOwnerStepHook func(step evictDeadOwnerStep, sandboxID string)
 }
 
 // New constructs the server-role Cluster for cfg.EnableCluster=true. Caller
@@ -173,6 +190,11 @@ func New(cfg config.Config, logger *slog.Logger, admitter *capacity.Admitter) (*
 	if err != nil {
 		return nil, fmt.Errorf("cluster.New: recovery store: %w", err)
 	}
+	// Installed before raft starts so every entry this server applies is
+	// recorded. The capacity lease cache built below shares it and clears
+	// what each heartbeat covers (capacity_unreported.go).
+	unreported := newUnreportedLoad()
+	fsm.unreported.Store(unreported)
 
 	// Load cluster TLS material first — both raft transport and the internal
 	// HTTPS listener need it. Cluster configuration rejects an empty TLS dir.
@@ -295,7 +317,9 @@ func New(cfg config.Config, logger *slog.Logger, admitter *capacity.Admitter) (*
 			return ok && m.Alive
 		})
 	}
-	c.capacityLeases = newCapacityLeaseCache(c.nodeID, admitter, cfg.ClusterCapacityGossipInterval, logger)
+	leases := newCapacityLeaseCache(c.nodeID, admitter, cfg.ClusterCapacityGossipInterval, logger)
+	leases.unreported = unreported
+	c.capacityLeases = leases
 	c.startCapacityLeaseLoop(cfg.ClusterCapacityGossipInterval)
 
 	// Slow reconcile loop: catches the "joined too fast" race where the
@@ -525,6 +549,9 @@ func (c *Cluster) RecordPlacement(ctx context.Context, sandboxID string, spec *m
 		IncarnationID:         incarnationID,
 		ExpectedIncarnationID: expectedIncarnationID,
 		OwnerRef:              secrets.OwnerRef,
+		// No caller may place a lifetime the cluster deleted; see
+		// deleted_lifecycle.go for why this is gated on server versions.
+		RefuseDeletedLifecycle: c.deletedLifecycleFenceReplicated(),
 	}
 	return c.applyCommand(ctx, cmd)
 }
@@ -1259,8 +1286,12 @@ func (c *Cluster) IsNodeDrained(nodeID string) bool {
 // ownership (never overwrite an existing non-self owner):
 //
 //   - **No FSM placement.** Write opPlace claiming self as owner, with spec +
-//     secret ref so the new placement is born recoverable. This is the
-//     normal case for sandboxes created before AssertOwnership last ran.
+//     secret ref so the new placement is born recoverable. The service only
+//     hands over such a row when it is provably not a deleted sandbox
+//     (service.settleUnplacedRow destroys the others), and the FSM refuses
+//     one whose lifecycle has a post-delete record (ErrPlacementDeleted).
+//     This is the case for sandboxes created before AssertOwnership last
+//     ran, e.g. on a single node turned into a cluster.
 //
 //   - **FSM owner == self.** No ownership change. Backfill missing Spec /
 //     secret ref via opUpsertSpec (closes the pre-spec-replication gap)
@@ -1311,10 +1342,11 @@ func (c *Cluster) AssertOwnership(ctx context.Context, local []LocalSandboxState
 
 		switch {
 		case !ok:
-			// No placement exists — claim ownership. Pass spec + secret handle
-			// so the placement is born recoverable.
-			if err := c.RecordPlacement(ctx, st.ID, st.Spec, st.Secrets); err != nil && firstErr == nil {
-				firstErr = err
+			// No placement exists — claim ownership. Pass spec + secret
+			// handle so the placement is born recoverable.
+			record := func() error { return c.RecordPlacement(ctx, st.ID, st.Spec, st.Secrets) }
+			if !placeUnplacedRow(c.logger, c.nodeID, st, record, &firstErr) {
+				continue
 			}
 			// Replay port intents so the FSM matches local truth.
 			for port, route := range st.ExposedPorts {
@@ -1496,19 +1528,17 @@ func (c *Cluster) ApplyEncoded(ctx context.Context, payload []byte) error {
 	return c.applyEncodedLocal(ctx, payload)
 }
 
+// applyReservationEncodedLocal admits a reservation (capacity, pending cap,
+// team quota) against committed state plus the leader's in-flight holds, then
+// proposes it without holding the admission lock across the commit
+// (admission_ledger.go).
 func (c *Cluster) applyReservationEncodedLocal(ctx context.Context, payload []byte, cmd command) error {
-	c.reservationAdmissionMu.Lock()
-	defer c.reservationAdmissionMu.Unlock()
-	if c.raft.raft.State() != raft.Leader {
-		return ErrNotLeader
-	}
-	if err := c.admitReservationCommand(cmd); err != nil {
-		return err
-	}
-	if err := c.admitTeamQuotaCommand(cmd); err != nil {
-		return err
-	}
-	return c.applyEncodedLocal(ctx, payload)
+	return c.applyAdmittedEncodedLocal(ctx, payload, cmd, func() error {
+		if err := c.admitReservationCommand(cmd); err != nil {
+			return err
+		}
+		return c.admitTeamQuotaCommand(cmd)
+	})
 }
 
 // applyEncodedLocal submits an already-encoded command to the local raft.
@@ -1522,7 +1552,17 @@ func (c *Cluster) applyEncodedLocal(ctx context.Context, payload []byte) error {
 
 // applyEncodedLocalResult is applyEncodedLocal for the ops whose FSM answer
 // the caller needs (an allocated token, say). Everything else discards it.
-func (c *Cluster) applyEncodedLocalResult(ctx context.Context, payload []byte) (result any, err error) {
+func (c *Cluster) applyEncodedLocalResult(ctx context.Context, payload []byte) (any, error) {
+	result, _, err := c.applyEncodedLocalOutcome(ctx, payload, nil)
+	return result, err
+}
+
+// applyEncodedLocalOutcome is applyEncodedLocalResult plus whether the entry
+// can still commit after an error (raftApplyOutcome), which the admission
+// ledger needs to know when to let go of a hold. enqueued, when not nil, is
+// called as soon as raft has taken the entry (or refused to), before the
+// wait for its commit.
+func (c *Cluster) applyEncodedLocalOutcome(ctx context.Context, payload []byte, enqueued func()) (result any, outcome admissionOutcome, err error) {
 	done := beginRaftApply()
 	defer func() { done(err) }()
 	timeout := c.commitTimeout
@@ -1532,17 +1572,21 @@ func (c *Cluster) applyEncodedLocalResult(ctx context.Context, payload []byte) (
 		}
 	}
 	f := c.raft.raft.Apply(payload, timeout)
+	if enqueued != nil {
+		enqueued()
+	}
 	if applyErr := f.Error(); applyErr != nil {
+		outcome = raftApplyOutcome(applyErr)
 		if errors.Is(applyErr, raft.ErrNotLeader) || errors.Is(applyErr, raft.ErrLeadershipLost) {
-			return nil, ErrNotLeader
+			return nil, outcome, ErrNotLeader
 		}
 		err = fmt.Errorf("cluster: raft apply: %w", applyErr)
-		return nil, err
+		return nil, outcome, err
 	}
 	response := f.Response()
 	if appErr, ok := response.(error); ok && appErr != nil {
 		err = fmt.Errorf("cluster: fsm apply: %w", appErr)
-		return nil, err
+		return nil, outcomeSettled, err
 	}
 	if reassigned, ok := response.(reassignApplyResult); ok && reassigned.Changed {
 		// This runs once on the leader after its FSM confirms the ownership
@@ -1550,7 +1594,7 @@ func (c *Cluster) applyEncodedLocalResult(ctx context.Context, payload []byte) (
 		// wrapper, and a lost HTTP acknowledgement cannot erase the count.
 		recordFailoverReassign()
 	}
-	return response, nil
+	return response, outcomeSettled, nil
 }
 
 // forwardApplyToLeader posts an encoded raft command to the current leader's
@@ -1722,6 +1766,28 @@ func (c *Cluster) membersWithCapacity() []Member {
 		return members
 	}
 	return c.capacityLeases.apply(members, time.Now())
+}
+
+// pendingLoadByNode is the load placement adds to each node's last capacity
+// heartbeat: reservations still in flight (the FSM) plus load the FSM stopped
+// counting at a promote or failover reassign that the heartbeat does not show
+// yet (capacity_unreported.go). Without the second part a promoted sandbox
+// counted nowhere until the next heartbeat (plan item C7).
+//
+// Look nodes up with of only AFTER reading the members the load is added to.
+// That read re-reads this server's own admitter, which clears the entries the
+// admitter now shows; looked up first, this server's last promote would count
+// twice on the next create here. The cost of this order is a peer heartbeat
+// stored between the two reads: its entries are gone while the copied member
+// still has the older snapshot, so that one decision misses them, as every
+// decision did before this change.
+func (c *Cluster) pendingLoadByNode(now int64) pendingLoad {
+	reserved, runtimes := c.fsm.pendingReservationLoadByNode(now)
+	load := pendingLoad{reserved: reserved, runtimes: runtimes}
+	if c.capacityLeases != nil {
+		load.unreported = c.capacityLeases.unreported
+	}
+	return load
 }
 
 func (c *Cluster) Placements() []Placement {

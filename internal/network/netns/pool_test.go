@@ -33,7 +33,7 @@ func TestPoolCapacityIsSeedSize(t *testing.T) {
 	}
 }
 
-func openTestStore(t *testing.T) *store.Store {
+func openTestStore(t testing.TB) *store.Store {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "state.db")
 	st, err := store.Open(path)
@@ -44,7 +44,7 @@ func openTestStore(t *testing.T) *store.Store {
 	return st
 }
 
-func testPool(t *testing.T, size int) *Pool {
+func testPool(t testing.TB, size int) *Pool {
 	t.Helper()
 	st := openTestStore(t)
 	ctx := context.Background()

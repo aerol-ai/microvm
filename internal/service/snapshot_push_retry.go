@@ -63,6 +63,10 @@ type SnapshotPushReconciler struct {
 	// testAfterList, when set, runs after every page is listed. Nil in
 	// production; tests use it to line two sweeps up on the same rows.
 	testAfterList func()
+	// onPushed runs after a push lands and its row is marked distributable,
+	// so the service can drop the snapshot's local-only routing key
+	// (Service.forgetSnapshotLocalOnly). Nil when no service is attached.
+	onPushed func(context.Context, *models.SandboxSnapshot)
 }
 
 // NewSnapshotPushReconciler builds the reconciler. Returns nil if the
@@ -299,6 +303,9 @@ func (r *SnapshotPushReconciler) pushOne(ctx context.Context, listed *models.San
 		return snapshotPushSkipped
 	}
 	r.logger.Info("snapshot push: succeeded", "snapshot", name, "registry_ref", result.RegistryRef)
+	if r.onPushed != nil {
+		r.onPushed(ctx, snapshot)
+	}
 	return snapshotPushSucceeded
 }
 

@@ -90,3 +90,43 @@ func TestSnapshotImageHomeKey(t *testing.T) {
 		t.Fatalf("tag key home after forgetting the name key = %q,%v, want node-1,true", node, ok)
 	}
 }
+
+// The local-only key lives beside the name and tag keys of the same snapshot
+// without colliding with either, is tenant-scoped like the name key, and is
+// forgotten on its own: the push landing drops it and leaves the snapshot's
+// name and tag routing in place.
+func TestSnapshotLocalOnlyKey(t *testing.T) {
+	if SnapshotLocalOnlyKey("", "") != "" || SnapshotLocalOnlyKey("tenant-a", "  ") != "" {
+		t.Fatal("an empty name must give no key")
+	}
+	if SnapshotLocalOnlyKey("a", "prod") == SnapshotLocalOnlyKey("b", "prod") {
+		t.Fatal("two owners' local-only keys for the same name collide")
+	}
+	tag := docker.SnapshotImageTagForOwner("tenant-a", "prod")
+	nameKey := SnapshotHomeKey("tenant-a", "prod")
+	tagKey := SnapshotImageHomeKey(tag)
+	localKey := SnapshotLocalOnlyKey("tenant-a", "prod")
+	for _, other := range []string{nameKey, tagKey, SnapshotHomeKey("", "prod"), SnapshotHomeKey("local-only", "tenant-a\x00prod")} {
+		if localKey == other {
+			t.Fatalf("local-only key %q collides with %q", localKey, other)
+		}
+	}
+
+	fsm := newPlacementFSM()
+	for i, key := range []string{nameKey, tagKey, localKey} {
+		if got := fsm.Apply(&raft.Log{Index: uint64(i + 1), Data: mustEncode(t, registerSnapCmd(key, "node-1"))}); got != nil {
+			t.Fatalf("register %q: %v", key, got)
+		}
+	}
+	if got := fsm.Apply(&raft.Log{Index: 4, Data: mustEncode(t, command{Op: opForgetSnapshotNode, SnapshotName: localKey})}); got != nil {
+		t.Fatalf("forget local-only key: %v", got)
+	}
+	if _, ok := fsm.snapshotHomeNode(localKey); ok {
+		t.Fatal("local-only key still set after it was forgotten")
+	}
+	for _, key := range []string{nameKey, tagKey} {
+		if node, ok := fsm.snapshotHomeNode(key); !ok || node != "node-1" {
+			t.Fatalf("home %q after forgetting the local-only key = %q,%v, want node-1,true", key, node, ok)
+		}
+	}
+}

@@ -311,10 +311,11 @@ func TestAddClusterIngressExpectedRoutesBranches(t *testing.T) {
 					},
 				},
 				{
-					SandboxID:       "sb-peer",
-					OwnerNodeID:     "peer",
-					Spec:            &models.CreateSandboxRequest{AllowPublicTraffic: privateFlag(true)},
-					CustomHostnames: []string{"api.external.test", "www.external.test"},
+					SandboxID:          "sb-peer",
+					OwnerNodeID:        "peer",
+					OwnerDataPlaneHost: "10.0.0.2",
+					Spec:               &models.CreateSandboxRequest{AllowPublicTraffic: privateFlag(true)},
+					CustomHostnames:    []string{"api.external.test", "www.external.test"},
 					ExposedPortRoutes: map[int]cluster.ExposedPortRoute{
 						8080: {Protocol: models.ExposedPortProtocolHTTP},
 						8443: {Protocol: models.ExposedPortProtocolTLS},
@@ -358,9 +359,10 @@ func TestAddClusterIngressExpectedRoutesBranches(t *testing.T) {
 			Noop: cluster.NewNoop("self", "http://self", ""),
 			placements: []cluster.Placement{
 				{
-					SandboxID:   "sb-direct",
-					OwnerNodeID: "peer",
-					Spec:        &models.CreateSandboxRequest{AllowPublicTraffic: privateFlag(true)},
+					SandboxID:          "sb-direct",
+					OwnerNodeID:        "peer",
+					OwnerDataPlaneHost: "10.0.0.2",
+					Spec:               &models.CreateSandboxRequest{AllowPublicTraffic: privateFlag(true)},
 					ExposedPortRoutes: map[int]cluster.ExposedPortRoute{
 						8080: {Protocol: models.ExposedPortProtocolHTTP},
 						8443: {Protocol: models.ExposedPortProtocolTLS},

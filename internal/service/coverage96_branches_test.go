@@ -1793,7 +1793,7 @@ func TestCB96ServiceHelperBranches(t *testing.T) {
 		"":     {},
 		"mine": {SandboxID: "mine", OwnerNodeID: "self", PublicTraffic: true},
 		"priv": {SandboxID: "priv", OwnerNodeID: "peer"},
-		"pub":  {SandboxID: "pub", OwnerNodeID: "peer", PublicTraffic: true, ExposedPorts: map[int]string{8080: ""}},
+		"pub":  {SandboxID: "pub", OwnerNodeID: "peer", OwnerDataPlaneHost: "10.0.0.2", PublicTraffic: true, ExposedPorts: map[int]string{8080: ""}},
 	}}}
 	ingress.addClusterIngressExpectedRoutes(expectedHTTP, tcp, tls)
 	if _, ok := expectedHTTP["sandbox-pub-port-8080"]; !ok {

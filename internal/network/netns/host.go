@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -30,13 +29,14 @@ type Host struct {
 	// mkdir is a test seam for the netns root dir; production leaves nil.
 	mkdir func(path string, perm os.FileMode) error
 	// addNetns/delNetns create and remove a REAL named network namespace.
-	// Production leaves them nil and execs `ip netns add/del`; tests stub them
-	// so unit tests need neither `ip` nor CAP_NET_ADMIN.
+	// Production leaves them nil and does it in-process, the way `ip netns
+	// add/del` does (host_linux.go); tests stub them so unit tests need no
+	// CAP_SYS_ADMIN.
 	addNetns func(ctx context.Context, name string) error
 	delNetns func(ctx context.Context, name string) error
 	// loopbackUp flips `lo` up inside the named netns. Test seam like
-	// addNetns/delNetns; production leaves it nil and execs `ip -n <name> link
-	// set lo up`.
+	// addNetns/delNetns; production leaves it nil and sets it over netlink,
+	// as `ip -n <name> link set lo up` does.
 	loopbackUp func(ctx context.Context, name string) error
 	// readIPv4 lists the IPv4 addresses inside the netns at a path. Test
 	// seam like addNetns; production leaves it nil and reads them over
@@ -59,8 +59,8 @@ func (h *Host) Realize(ctx context.Context, slot Slot) (string, string, error) {
 	// name back from the recorded path (Slot.netnsName).
 	name := slot.netnsName()
 	// Create a REAL network namespace, not just a directory: the CNI plugin and
-	// the containerd shim both open this path as a netns. `ip netns add` bind-
-	// mounts a fresh netns at /run/netns/<name>; a plain mkdir'd directory makes
+	// the containerd shim both open this path as a netns. createNetns bind-
+	// mounts a fresh netns at <root>/<name>; a plain mkdir'd directory makes
 	// CNI ADD fail with a bare "exit status 1" (the plugin cannot enter a dir).
 	if err := h.createNetns(ctx, name); err != nil {
 		return "", "", fmt.Errorf("netns host: create netns %s: %w", name, err)
@@ -135,30 +135,25 @@ func (h *Host) IPv4Addrs(_ context.Context, slot Slot) ([]string, error) {
 }
 
 // createNetns creates a persistent named netns (bind-mounted at
-// /run/netns/<name>). Idempotent: an already-present netns is not an error.
+// <root>/<name>). Idempotent: an already-present netns is not an error.
+// It used to fork `ip netns add`, and loopback another `ip`: two process
+// starts on every namespace build, which is a create's own build on a warm
+// queue miss (plan PR #1000, item L5). The in-process steps are the same
+// ones iproute2 runs (host_linux.go).
 func (h *Host) createNetns(ctx context.Context, name string) error {
 	if h.addNetns != nil {
 		return h.addNetns(ctx, name)
 	}
-	out, err := exec.CommandContext(ctx, "ip", "netns", "add", name).CombinedOutput()
-	if err != nil && !strings.Contains(strings.ToLower(string(out)), "file exists") {
-		return fmt.Errorf("ip netns add: %v: %s", err, strings.TrimSpace(string(out)))
-	}
-	return nil
+	return createNamedNetns(h.netnsRoot(), name)
 }
 
-// bringLoopbackUp flips `lo` up inside the named netns. Idempotent: bringing an
-// already-up loopback up again is a no-op in iproute2. Uses `ip -n <name>`
-// (runs in the netns at /run/netns/<name> created by createNetns).
+// bringLoopbackUp flips `lo` up inside the named netns created by
+// createNetns. Idempotent: setting an up link up again changes nothing.
 func (h *Host) bringLoopbackUp(ctx context.Context, name string) error {
 	if h.loopbackUp != nil {
 		return h.loopbackUp(ctx, name)
 	}
-	out, err := exec.CommandContext(ctx, "ip", "-n", name, "link", "set", "lo", "up").CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("ip -n %s link set lo up: %v: %s", name, err, strings.TrimSpace(string(out)))
-	}
-	return nil
+	return loopbackUpIn(h.netnsPathFor(name))
 }
 
 // deleteNetns removes a named netns. Idempotent: a missing netns is not an error.
@@ -166,15 +161,7 @@ func (h *Host) deleteNetns(ctx context.Context, name string) error {
 	if h.delNetns != nil {
 		return h.delNetns(ctx, name)
 	}
-	out, err := exec.CommandContext(ctx, "ip", "netns", "del", name).CombinedOutput()
-	if err != nil {
-		low := strings.ToLower(string(out))
-		if strings.Contains(low, "no such file") || strings.Contains(low, "cannot remove") {
-			return nil
-		}
-		return fmt.Errorf("ip netns del: %v: %s", err, strings.TrimSpace(string(out)))
-	}
-	return nil
+	return deleteNamedNetns(h.netnsRoot(), name)
 }
 
 // Remove deletes everything Realize created for slot: the CNI attachment

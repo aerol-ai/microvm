@@ -126,6 +126,14 @@ type SandboxRuntimeState struct {
 	// AdoptedParkID is non-empty when Create adopted a warm-pool slot; the
 	// service uses it to release the park capacity reservation (§4).
 	AdoptedParkID string
+	// StartedAt is when the run a start began, on the clock the engine's
+	// exit events are stamped with: Docker's State.StartedAt, or the
+	// containerd driver's host clock just before it makes the new task. The
+	// service tells an exit event of an earlier run by it (run_starts.go),
+	// so it must be no later than anything the new run can report, and no
+	// earlier than the exit of the run before. Zero when the runtime does
+	// not say (Firecracker, WASM and isolate send no exit events).
+	StartedAt time.Time
 }
 
 // User-facing runtime identifiers. These are the values the API, SDK, and
@@ -990,7 +998,13 @@ type Sandbox struct {
 	// RunGeneration says which run of the sandbox this row was read in: the
 	// store adds one each time the sandbox starts. A main-program exit is
 	// stored only for the run it was read from. Never on the wire.
-	RunGeneration    int64     `json:"-"`
+	RunGeneration int64 `json:"-"`
+	// RollbackPending marks a sandbox whose create the client was told
+	// failed but whose rollback could not finish (a cluster create whose
+	// rollback destroy needed a Raft leader that was not there). The
+	// ownership replay never publishes such a row and reconcile keeps
+	// destroying it. Set once, by the rollback; never on the wire or in Raft.
+	RollbackPending  bool      `json:"-"`
 	ContainerCommand []string  `json:"container_command,omitempty"`
 	Lifecycle        Lifecycle `json:"lifecycle"`
 	Failover         *Failover `json:"failover,omitempty"`
