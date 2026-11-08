@@ -226,6 +226,22 @@ about an hour, no code change):
    `containerd_pool;desc=hit`) and refill.
 5. Destroy (`--destroy-only`).
 
+**Result (2026-11-08, one spot t3.medium, containerd engine, depth 4 for
+`alpine:3.20`, `python:3.12-slim` and `python:3.12`):**
+
+| Measure | Value |
+|---|---|
+| Container cgroup `memory.current`, average of 12 | 2.4 MB (peak 4.3 MB, anon 1.8 MB) |
+| containerd shim RSS per container (outside the cgroup) | 10.8 MB |
+| `MemAvailable` drop for 12 waiting containers | 123 MB, about 10 MB each |
+| Same for every image? | Yes: only toolboxd runs while a container waits |
+| Create that took a waiting container (4 of 5) | 11–19 ms server time (`containerd_pool;desc=hit`, 5–6 ms of it) |
+| Create that found none left (1 of 5) | 306 ms server time (cold) |
+| Refill back to 4 per image | Under a minute |
+
+So a waiting sandbox costs about 13 MB, and the code defaults (depth 2,
+at most 8 images) would hold at most 16 of them, about 210 MB per worker.
+
 ### 3.2 Then the deploy settings
 
 Copy the docker pool's path end to end: `config/cluster.yml` →
@@ -233,7 +249,8 @@ Copy the docker pool's path end to end: `config/cluster.yml` →
 `Terraform/templates/bootstrap.sh.tftpl` → `/etc/sandboxd/cluster.env`, and
 `Ansible/playbooks/configure-ops.yml`; a harness capability in
 `integration-tests/run.sh` and `harness/usecases.go`; the rows in
-`setup/config-defaults.md`. The default comes from the owner after 3.1.
+`setup/config-defaults.md`. **Owner's decision (2026-11-08): add the settings
+but keep the pool off by default**; operators turn it on.
 
 **Notes from the code:** a parked container reserves a full default shape
 of capacity, which a real create takes back when the node is full; it also
@@ -280,11 +297,11 @@ are not public.
 - **Go default** on, with a quiet skip (no ERROR line, no 60 s probe) when
   the node has no Caddy domain, so local and IP-mode installs stay silent.
 - **install.sh:** default on when `--domain` is given.
-- **Terraform: not flipped by default.** Nodes use
-  `user_data_replace_on_change = true`, so a changed default would replace
-  every node of a running cluster on the next `terraform apply`. New
+- **Terraform: not flipped by default** (owner's decision, 2026-11-08).
+  Nodes use `user_data_replace_on_change = true`, so a changed default would
+  replace every node of a running cluster on the next `terraform apply`. New
   clusters set `default_ingress_proxy_routing = true`; the example config
-  and docs say so. Open question 1 asks the owner.
+  and docs say so.
 - **Docs:** `setup/config-defaults.md`, `installer-options.mdx`, the
   `TODOS.md` entry that blocks the flip, and `plans/ingress-proxy-routing.md`
   (the gate moved from the flagship to t3.medium).
@@ -323,8 +340,8 @@ as short smoke runs inside the final live runs.
   the latest of the three.
 - Pass: placements match the snapshot taken before the kill; creates made
   during the outage end as `chaosCheckCreates` expects; recovery time under
-  `AEROL_CHAOS_RTO_BUDGET_SECONDS`. The budget is set from the first
-  measured run (open question 3).
+  `AEROL_CHAOS_RTO_BUDGET_SECONDS`, 120 s to start; then about 1.5 times
+  what the first run measures (owner's decision, 2026-11-08).
 
 ### 5.3 Soak driver
 
@@ -368,13 +385,9 @@ until those pass.
 | `cluster-hetero-lite-routing` with the routing gate and A/B run from a server node | Epoch, E3b, routing gate | ~$1.20 |
 | `single-node` | Nothing breaks single-node mode | ~$0.03 |
 
-## 8. Open questions for the owner
+## 8. Decisions (2026-11-08)
 
-1. **Terraform routing default:** keep it off and tell new clusters to turn
-   it on (recommended, because a changed default replaces every node on the
-   next apply), or flip it with a release note telling operators to pin
-   `false` first?
-2. **L4 default** (after 3.1): which images, how deep, how much memory per
-   node for waiting sandboxes, and gVisor too or not.
-3. **Recovery-time budget:** set from the first UC-481 run, or a number you
-   want (for example 60 s)?
+1. **Terraform routing default:** stays off; new clusters turn it on.
+2. **L4:** add the warm-pool settings to the deploy files, off by default.
+3. **Recovery-time budget:** 120 s to start, then about 1.5 times the first
+   measured run.
