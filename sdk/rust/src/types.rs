@@ -725,8 +725,27 @@ pub enum ExposeResult {
     },
 }
 
+/// Everything an expose call reports, including who can open the URL.
+/// [`Client::expose_port_info`](crate::Client::expose_port_info) returns it.
+/// It exists beside [`ExposeResult`] because that enum's variants have no
+/// room for the visibility: adding a field to them would break every match
+/// on `ExposeResult::Http { url }`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExposePortInfo {
+    pub protocol: ExposeProtocol,
+    pub url: String,
+    /// Set for TCP exposures: native clients (psql, redis-cli) dial it.
+    pub host: Option<String>,
+    /// Set for TCP exposures, with `host`.
+    pub host_port: Option<u16>,
+    /// `Token` when the URL needs a sandbox token, `Public` otherwise. The
+    /// server leaves the field out for a public port, and servers from
+    /// before token-only ports never send it; both read as `Public`.
+    pub visibility: ExposeVisibility,
+}
+
 /// Wire shape for the expose response — kept private; callers consume the
-/// public [`ExposeResult`] enum instead.
+/// public [`ExposeResult`] enum or [`ExposePortInfo`] instead.
 #[derive(Deserialize)]
 pub(crate) struct ExposePortResponseWire {
     pub protocol: String,
@@ -736,6 +755,8 @@ pub(crate) struct ExposePortResponseWire {
     pub host: Option<String>,
     #[serde(rename = "host_port", default)]
     pub host_port: Option<u16>,
+    #[serde(default)]
+    pub visibility: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
