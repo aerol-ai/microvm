@@ -60,6 +60,11 @@ func TestServePrometheusMetrics(t *testing.T) {
 	if !strings.Contains(body, "aerolvm_test_map") {
 		t.Errorf("missing test_map in output")
 	}
+	// Registered by internal/observability, which this package imports: the
+	// soak run (UC-482) reads it from /v1/metrics on every node.
+	if !strings.Contains(body, "\naerolvm_go_goroutines ") {
+		t.Errorf("missing aerolvm_go_goroutines in output")
+	}
 }
 
 type badString struct{}

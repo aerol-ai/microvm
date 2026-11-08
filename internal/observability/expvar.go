@@ -3,9 +3,21 @@ package observability
 import (
 	"expvar"
 	"math"
+	"runtime"
 	"strconv"
 	"strings"
 )
+
+// aerolvm_go_goroutines is the process's live goroutine count, read when
+// scraped. A goroutine that never exits (a watcher per sandbox, a blocked
+// send) is the leak a soak run looks for first (UC-482), and the daemon has
+// no other window onto it short of /debug/pprof. Published from this
+// package's init because pkg/api and pkg/daemon both import it, so every
+// sandboxd registers it and /v1/metrics and the OTEL exporter, which walk
+// every aerolvm_* expvar, export it with no change of their own.
+func init() {
+	expvar.Publish("aerolvm_go_goroutines", expvar.Func(func() any { return runtime.NumGoroutine() }))
+}
 
 type ExpvarSample struct {
 	Name   string

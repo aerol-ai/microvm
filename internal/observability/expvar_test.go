@@ -170,3 +170,30 @@ func TestCollectExpvarSamplesNestedMap(t *testing.T) {
 		t.Fatalf("nested labels = %+v", samples[0].Labels)
 	}
 }
+
+// The goroutine gauge is an expvar.Func, which reaches the collector through
+// its String() form, and must read the live count, not a value frozen at
+// registration.
+func TestGoGoroutinesGaugeIsLive(t *testing.T) {
+	read := func() int64 {
+		for _, s := range CollectAerolVMExpvars() {
+			if s.Name == "aerolvm_go_goroutines" && s.Int64 != nil {
+				return *s.Int64
+			}
+		}
+		t.Fatal("aerolvm_go_goroutines is not collected")
+		return 0
+	}
+	before := read()
+	if before <= 0 {
+		t.Fatalf("aerolvm_go_goroutines = %d, want the live count", before)
+	}
+	stop := make(chan struct{})
+	for i := 0; i < 50; i++ {
+		go func() { <-stop }()
+	}
+	defer close(stop)
+	if after := read(); after < before+50 {
+		t.Fatalf("aerolvm_go_goroutines went %d -> %d with 50 more goroutines parked", before, after)
+	}
+}
