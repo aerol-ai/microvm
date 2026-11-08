@@ -130,7 +130,7 @@ func runUpgradePlan(ctx context.Context, a *app, args []string) int {
 		return a.flagError(c, "upgrade", err)
 	}
 	if len(pos) != 1 {
-		return a.usageError(c, "upgrade", "plan needs one version, such as `aerolvm upgrade plan v0.6.12`")
+		return a.usageError(c, "upgrade", "plan needs one version, such as `aerolvm upgrade plan v0.7.0`")
 	}
 	version := pos[0]
 	if code := a.checkUpgradeVersion(c, version, unversioned); code >= 0 {

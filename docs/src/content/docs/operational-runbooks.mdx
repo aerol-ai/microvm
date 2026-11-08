@@ -57,7 +57,7 @@ You need no copy of the repository. Every tool below ships in a release or insid
 | [`uninstall.sh`](https://github.com/aerol-ai/microvm/releases/latest/download/uninstall.sh) | On a node | Removes the AerolVM server from a machine. |
 | `aerolvm-ops-<release>.tar.gz` | Your monitoring | Every release ships one: the Prometheus alert rules, the Grafana dashboards, the Alertmanager example and these runbooks, for that release. |
 
-Use the copies that match the release your servers run. `sudo sandboxd version` prints it, such as `v0.6.12`. For another release's files, use `https://github.com/aerol-ai/microvm/releases/download/<release>/<file>`.
+Use the copies that match the release your servers run. `sudo sandboxd version` prints it, such as `v0.7.0`. For another release's files, use `https://github.com/aerol-ai/microvm/releases/download/<release>/<file>`.
 
 <Aside type="caution">
 Use `sandboxd recover-quorum` only while you follow the lost-quorum runbook. It can make the cluster keep changes that a majority never agreed on. Try to bring the original voting servers back first.

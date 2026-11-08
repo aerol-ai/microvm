@@ -47,11 +47,11 @@ Linux only. [Cluster setup](/cluster-setup/) walks through it, and lists the opt
 
 ## Upgrade an install
 
-On a server whose release has `aerolvm upgrade` (v0.6.12 and later), upgrade from your computer:
+On a server whose release has `aerolvm upgrade` (v0.7.0 and later), upgrade from your computer:
 
 ```bash
-aerolvm upgrade plan v0.6.12
-aerolvm upgrade apply v0.6.12 --wait
+aerolvm upgrade plan v0.7.0
+aerolvm upgrade apply v0.7.0 --wait
 ```
 
 It checks the files against the release's checksums, backs up the database, keeps the old files, and goes back to them if the new server does not come up. On a cluster it upgrades every node in a safe order; see [Upgrade a cluster](/cluster-setup/#upgrade-a-cluster).

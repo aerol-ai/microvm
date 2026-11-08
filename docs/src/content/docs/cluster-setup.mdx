@@ -182,7 +182,7 @@ my-cluster/
 
 ```hcl
 module "aerolvm" {
-  source = "git::https://github.com/aerol-ai/microvm//Terraform?ref=v0.6.12"
+  source = "git::https://github.com/aerol-ai/microvm//Terraform?ref=v0.7.0"
 
   cluster_name        = "aerolvm"
   aws_region          = "us-east-1"
@@ -510,8 +510,8 @@ To take a server out, keep a majority of the voting servers up: with three serve
 From your computer:
 
 ```bash
-aerolvm upgrade plan v0.6.12
-aerolvm upgrade apply v0.6.12 --wait
+aerolvm upgrade plan v0.7.0
+aerolvm upgrade apply v0.7.0 --wait
 ```
 
 `plan` changes nothing. It prints each node's role and version, whether the jump is allowed, the order the nodes go in, and what restarts on each. `apply` checks every file against the release's checksums and hands the upgrade to the cluster's leader, so it goes on even if your computer goes to sleep. The order is:
@@ -544,8 +544,8 @@ The toolbox inside a running sandbox stays the old one. New sandboxes get the ne
 Pull the release into one file on a machine that has internet, carry it over, and upgrade from it:
 
 ```bash
-aerolvm release pull v0.6.12 -o aerolvm-v0.6.12.tgz
-aerolvm upgrade apply v0.6.12 --from aerolvm-v0.6.12.tgz --wait
+aerolvm release pull v0.7.0 -o aerolvm-v0.7.0.tgz
+aerolvm upgrade apply v0.7.0 --from aerolvm-v0.7.0.tgz --wait
 ```
 
 `release pull` checks every file against the release's checksums as it downloads. `apply` checks them again before it sends anything. The servers hand the files on to the other nodes, so the nodes need no internet access.

@@ -84,7 +84,7 @@ module "aerolvm" {
   # Pin a release tag. Upgrade the cluster's software with
   # `aerolvm upgrade apply`, not by changing this ref: a new ref can change
   # user data, and new user data replaces the machines.
-  source = "git::https://github.com/aerol-ai/microvm//Terraform?ref=v0.6.12"
+  source = "git::https://github.com/aerol-ai/microvm//Terraform?ref=v0.7.0"
 
   cluster_name        = local.cluster_name
   aws_region          = var.aws_region

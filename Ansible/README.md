@@ -10,8 +10,8 @@ owns infra (VPC, EC2, SG, DNS); Ansible owns host settings, ops files and
 reaches the API:
 
 ```bash
-aerolvm upgrade plan v0.6.12
-aerolvm upgrade apply v0.6.12 --wait
+aerolvm upgrade plan v0.7.0
+aerolvm upgrade apply v0.7.0 --wait
 ```
 
 It needs no repo, no SSH and no inventory. Servers go one at a time with

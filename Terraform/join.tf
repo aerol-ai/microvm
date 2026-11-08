@@ -26,7 +26,7 @@
 ###############################################################################
 
 variable "one_line_join" {
-  description = "Join nodes with `install.sh ... init|join` and one token per role, made here (the default). false is the old S3 bundle hand-off and the seed's CSR loop, kept for one release for clusters built that way: changing it replaces every node. Needs a release with `sandboxd join` (v0.6.12 or later). A cluster with no domain can't join this way (install.sh --local never joins): set it to false there."
+  description = "Join nodes with `install.sh ... init|join` and one token per role, made here (the default). false is the old S3 bundle hand-off and the seed's CSR loop, kept for one release for clusters built that way: changing it replaces every node. Needs a release with `sandboxd join` (v0.7.0 or later). A cluster with no domain can't join this way (install.sh --local never joins): set it to false there."
   type        = bool
   default     = true
   # A root that passes null gets the default, not a null the template can't

@@ -68,7 +68,7 @@ type releaseSet struct {
 	// where the nodes download them.
 	paths map[string]string
 	// meta is release.json; nil when the release has none (releases before
-	// v0.6.12, dev builds).
+	// v0.7.0, dev builds).
 	meta *release.Metadata
 	// bundle is set for an offline bundle: its manifest.
 	bundle *bundleManifest

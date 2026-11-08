@@ -3,7 +3,7 @@
 // (plans/kubectl-style-cluster-ops.md §6.5). release.yml runs it, so the
 // published file always matches the code it describes:
 //
-//	go run ./cmd/releasemeta -version v0.6.12 -install-script dist/install.sh -o dist/release.json
+//	go run ./cmd/releasemeta -version v0.7.0 -install-script dist/install.sh -o dist/release.json
 //
 // Where each field comes from:
 //

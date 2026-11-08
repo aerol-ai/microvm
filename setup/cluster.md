@@ -1069,8 +1069,8 @@ restarts. For a 3-node cluster: never restart two at once.
 ### Upgrading
 
 ```bash
-aerolvm upgrade plan v0.6.12
-aerolvm upgrade apply v0.6.12 --wait
+aerolvm upgrade plan v0.7.0
+aerolvm upgrade apply v0.7.0 --wait
 ```
 
 `apply` stores a rollout in Raft and the leader drives it, so it goes on
@@ -1091,9 +1091,9 @@ restart today**: a WASM sandbox comes back `stopped` with its state gone,
 and an isolate sandbox is gone. Drain those nodes first, or recreate those
 sandboxes after.
 
-Offline sites: `aerolvm release pull v0.6.12 -o aerolvm-v0.6.12.tgz` on a
-machine with internet, then `aerolvm upgrade apply v0.6.12 --from
-aerolvm-v0.6.12.tgz`. A node with `SB_REMOTE_UPGRADE=false` (the default in
+Offline sites: `aerolvm release pull v0.7.0 -o aerolvm-v0.7.0.tgz` on a
+machine with internet, then `aerolvm upgrade apply v0.7.0 --from
+aerolvm-v0.7.0.tgz`. A node with `SB_REMOTE_UPGRADE=false` (the default in
 enterprise mode) is marked `manual`; `aerolvm upgrade status` prints the
 `sudo sandboxd upgrade node ...` line to run on it.
 

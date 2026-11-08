@@ -32,8 +32,8 @@ Don't `scp` a binary onto a node by hand.
 ## Path A - a release
 
 ```bash
-aerolvm upgrade plan v0.6.12
-aerolvm upgrade apply v0.6.12 --wait
+aerolvm upgrade plan v0.7.0
+aerolvm upgrade apply v0.7.0 --wait
 ```
 
 `plan` changes nothing. It shows each node's version, the order the nodes

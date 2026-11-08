@@ -90,9 +90,9 @@ Needs an admin. A node with SB_REMOTE_UPGRADE=false takes no upgrade over
 the API: run "sudo sandboxd upgrade node" on it (status prints the command).
 
 Examples:
-  aerolvm upgrade plan v0.6.12
-  aerolvm upgrade apply v0.6.12 --wait
-  aerolvm upgrade apply v0.6.12 --from aerolvm-v0.6.12.tgz --pause-after 2 --wait
+  aerolvm upgrade plan v0.7.0
+  aerolvm upgrade apply v0.7.0 --wait
+  aerolvm upgrade apply v0.7.0 --from aerolvm-v0.7.0.tgz --pause-after 2 --wait
   aerolvm upgrade resume
 `
 
@@ -390,7 +390,7 @@ func runUpgradeApply(ctx context.Context, a *app, args []string) int {
 		}
 	})
 	if len(pos) != 1 {
-		return a.usageError(c, "upgrade", "apply needs one version, such as `aerolvm upgrade apply v0.6.12`")
+		return a.usageError(c, "upgrade", "apply needs one version, such as `aerolvm upgrade apply v0.7.0`")
 	}
 	o.version = pos[0]
 	if code := a.checkUpgradeVersion(c, o.version, o.unversioned); code >= 0 {
@@ -444,7 +444,7 @@ func (a *app) checkUpgradeVersion(c *commonFlags, version string, unversioned bo
 		return a.usageError(c, "upgrade", "%q is not a version", version)
 	}
 	if _, err := release.ParseVersion(version); err != nil && !unversioned {
-		return a.usageError(c, "upgrade", "%s is not a release tag such as v0.6.12; pass --allow-unversioned for a dev or test build", version)
+		return a.usageError(c, "upgrade", "%s is not a release tag such as v0.7.0; pass --allow-unversioned for a dev or test build", version)
 	}
 	return -1
 }

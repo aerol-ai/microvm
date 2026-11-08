@@ -46,7 +46,7 @@ Flags:
   --json             print the manifest
 
 Example:
-  aerolvm release pull v0.6.12 -o aerolvm-v0.6.12.tgz
+  aerolvm release pull v0.7.0 -o aerolvm-v0.7.0.tgz
 `
 
 func runRelease(ctx context.Context, a *app, args []string) int {
@@ -75,7 +75,7 @@ func runReleasePull(ctx context.Context, a *app, args []string) int {
 		return a.flagError(c, "release", err)
 	}
 	if len(pos) != 1 {
-		return a.usageError(c, "release", "pull needs one version, such as `aerolvm release pull v0.6.12`")
+		return a.usageError(c, "release", "pull needs one version, such as `aerolvm release pull v0.7.0`")
 	}
 	version := pos[0]
 	if !releaseVersionRe.MatchString(version) {

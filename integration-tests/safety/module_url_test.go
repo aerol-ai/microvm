@@ -137,7 +137,7 @@ func TestPrepareModuleRootFetchesTheModuleByURL(t *testing.T) {
 	}
 
 	t.Run("given URL", func(t *testing.T) {
-		src := "git::https://github.com/aerol-ai/microvm//Terraform?ref=v0.6.12"
+		src := "git::https://github.com/aerol-ai/microvm//Terraform?ref=v0.7.0"
 		out, code := runModuleURL(t, repo, funcs, `prepare_module_root by-url`, "AEROL_TF_MODULE_SOURCE="+src)
 		if code != 0 {
 			t.Fatalf("prepare_module_root exited %d: %s", code, out)

@@ -37,7 +37,7 @@ The module block in that example is:
 
 ```hcl
 module "aerolvm" {
-  source = "git::https://github.com/aerol-ai/microvm//Terraform?ref=v0.6.12"
+  source = "git::https://github.com/aerol-ai/microvm//Terraform?ref=v0.7.0"
 
   cluster_name        = "aerolvm"
   config_dir          = "${path.module}/config"

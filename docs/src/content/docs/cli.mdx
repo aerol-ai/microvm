@@ -161,10 +161,10 @@ aerolvm get nodes
 
 ```
 NAME         ROLE     STATUS                     VERSION   SANDBOXES
-srv-1        server   Ready,Leader               v0.6.12   0
-srv-2        server   Ready                      v0.6.12   0
-wrk-1        worker   Ready                      v0.6.12   212
-wrk-2        worker   Ready,SchedulingDisabled   v0.6.12   9
+srv-1        server   Ready,Leader               v0.7.0    0
+srv-2        server   Ready                      v0.7.0    0
+wrk-1        worker   Ready                      v0.7.0    212
+wrk-2        worker   Ready,SchedulingDisabled   v0.7.0    9
 ```
 
 `Ready` means the node is alive. `NotReady` means the cluster cannot reach it. `SchedulingDisabled` means it is cordoned: no new sandboxes land on it. `Leader` marks the server that leads the cluster.
@@ -222,8 +222,8 @@ A join token can make a node, and a node gets the cluster's admin token and keys
 ### Upgrade the cluster
 
 ```bash
-aerolvm upgrade plan v0.6.12
-aerolvm upgrade apply v0.6.12 --wait
+aerolvm upgrade plan v0.7.0
+aerolvm upgrade apply v0.7.0 --wait
 ```
 
 `plan` changes nothing. It shows each node's version, whether the jump is allowed, the order the nodes go in, and what restarts. `apply` checks every file against the release's checksums, then hands the upgrade to the cluster. The servers go one at a time with the leader last, then the ingress nodes, then the workers in batches. Each node keeps its old files and goes back to them if the new ones do not come up. Without `--wait` it returns at once, and the upgrade goes on without you.
@@ -231,17 +231,17 @@ aerolvm upgrade apply v0.6.12 --wait
 | To do this | Run |
 |---|---|
 | Follow it, or see where it stands | `aerolvm upgrade status` |
-| Upgrade 2 workers, then pause | `aerolvm upgrade apply v0.6.12 --pause-after 2` |
+| Upgrade 2 workers, then pause | `aerolvm upgrade apply v0.7.0 --pause-after 2` |
 | Go on after a pause | `aerolvm upgrade resume` |
 | Finish the nodes in progress and start no more | `aerolvm upgrade stop` |
 | Put every node back on the old version | `aerolvm upgrade rollback --wait` |
-| Keep new features off until you say so | `aerolvm upgrade apply v0.6.12 --hold`, later `aerolvm upgrade finalize` |
+| Keep new features off until you say so | `aerolvm upgrade apply v0.7.0 --hold`, later `aerolvm upgrade finalize` |
 
 **No internet on the nodes?** Pull the release into one file on a machine that has internet, carry it over, and upgrade from it:
 
 ```bash
-aerolvm release pull v0.6.12 -o aerolvm-v0.6.12.tgz
-aerolvm upgrade apply v0.6.12 --from aerolvm-v0.6.12.tgz --wait
+aerolvm release pull v0.7.0 -o aerolvm-v0.7.0.tgz
+aerolvm upgrade apply v0.7.0 --from aerolvm-v0.7.0.tgz --wait
 ```
 
 The same commands upgrade a single server, too: `apply` upgrades that one node. [Upgrade a cluster](/cluster-setup/#upgrade-a-cluster) says what running sandboxes see during an upgrade, and how to make the first upgrade from a release older than these commands.
