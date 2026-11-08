@@ -415,10 +415,20 @@ type Placement struct {
 	// it when it reuses a local row from an earlier ownership, to refuse the
 	// sandbox tokens issued before the takeover (another node may have
 	// revoked them): Service.RecreateSandboxReport.
-	OwnerSinceUnixNano int64  `json:"owner_since_unix_nano,omitempty"`
-	Version            uint64 `json:"version"`
-	CreatedUnix        int64  `json:"created_unix"`
-	UpdatedUnix        int64  `json:"updated_unix"`
+	OwnerSinceUnixNano int64 `json:"owner_since_unix_nano,omitempty"`
+	// OwnerEpoch is the Raft log index of the entry that last changed
+	// OwnerNodeID: the entry that wrote the row, and every reassign, orphaning
+	// and claim since (invariant I2, plan C4 part 4). Unlike
+	// OwnerSinceUnixNano it is a log index, not a leader's clock, so a later
+	// owner change always has a larger epoch, even across leader changes. A
+	// forward carries the epoch the edge saw (HeaderOwnerEpoch), and the owner
+	// compares it with its own reading. 0 means unknown (a row written by an
+	// older build, or restored from its snapshot): readers then fall back to
+	// looking the owner up.
+	OwnerEpoch  uint64 `json:"owner_epoch,omitempty"`
+	Version     uint64 `json:"version"`
+	CreatedUnix int64  `json:"created_unix"`
+	UpdatedUnix int64  `json:"updated_unix"`
 	// Name is the small, hot copy of Spec.Name used to rebuild the cluster-wide
 	// uniqueness index without loading the larger recovery spec payload.
 	Name string `json:"name,omitempty"`
@@ -621,6 +631,8 @@ type OwnerInfo struct {
 	// InternalURL is the owner's required cluster-internal mTLS URL.
 	InternalURL string
 	IsSelf      bool
+	// Epoch is the placement's OwnerEpoch when it was read (0: unknown).
+	Epoch uint64
 }
 
 // Endpoint binds a peer identity to its cluster-internal mTLS URL. APIURL is

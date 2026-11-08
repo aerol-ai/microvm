@@ -51,6 +51,12 @@ extra_sandboxd_env = {
   # local records they vouch for are kept, and enterprise refuses zero, so
   # the one-day lock needs one-day retention (D13).
   SB_SECRET_AUDIT_RETENTION_DAYS = "1"
+  # The owner cache on the worker and ingress nodes, which also turns on the
+  # owner's lease fast path (plan cluster-phase-2 E3b): this is the scenario
+  # with split roles, where a lookup is a round trip to the server tier, so it
+  # is where both halves are exercised live. cluster-3-mixed-routing keeps the
+  # flag off (its nodes are server-role, where the flag does nothing anyway).
+  SB_CLUSTER_OWNER_CACHE = "true"
 }
 
 # install.sh --pat-scope host (T10): Caddy proxies to the public Unix socket and

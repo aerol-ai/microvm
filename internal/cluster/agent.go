@@ -376,6 +376,8 @@ func (a *Agent) OwnerOf(sandboxID string) (OwnerInfo, error) {
 	}
 	owner := lookup.Owner
 	owner.IsSelf = owner.NodeID == a.nodeID
+	// The epoch rides the placement, which every server version returns.
+	owner.Epoch = lookup.Placement.OwnerEpoch
 	return owner, nil
 }
 
@@ -438,6 +440,7 @@ func (a *Agent) ownerFromNameLookup(lookup PlacementLookupResponse) (string, Own
 	}
 	owner := lookup.Owner
 	owner.IsSelf = owner.NodeID == a.nodeID
+	owner.Epoch = lookup.Placement.OwnerEpoch
 	return lookup.SandboxID, owner, nil
 }
 

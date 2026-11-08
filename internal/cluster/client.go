@@ -456,6 +456,7 @@ func (c *Cluster) OwnerOf(sandboxID string) (OwnerInfo, error) {
 		APIURL:      apiURL,
 		InternalURL: internalURL,
 		IsSelf:      p.OwnerNodeID == c.nodeID,
+		Epoch:       p.OwnerEpoch,
 	}, nil
 }
 

@@ -58,7 +58,7 @@ func serveFromOwnerCache(c cluster.Client, cache *cluster.OwnerCache, id string,
 	catcher := &notOwnerCatcher{w: w, token: token, before: w.Header().Clone()}
 	// The attempt gets its own headers (ForwardHTTP marks them), so a retry
 	// starts from exactly the request the client sent.
-	attempt := r.WithContext(cluster.ContextWithRouteHint(r.Context(), token))
+	attempt := r.WithContext(cluster.ContextWithOwnerEpoch(cluster.ContextWithRouteHint(r.Context(), token), route.Epoch))
 	attempt.Header = r.Header.Clone()
 	attempt.Body = body()
 	c.ForwardHTTP(route.Endpoint, catcher, attempt)

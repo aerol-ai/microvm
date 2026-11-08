@@ -52,6 +52,10 @@ type OwnerRoute struct {
 	// lookup that filled the entry read the placement for a scoped caller.
 	OwnerRef    string
 	HasOwnerRef bool
+	// Epoch is the placement's OwnerEpoch the lookup that filled the entry
+	// read (0: unknown). The forward carries it, and the owner turns down an
+	// entry older than its own reading (HeaderOwnerEpoch).
+	Epoch uint64
 }
 
 // OwnerCache is a bounded, least-recently-used map from sandbox id to owner
@@ -75,6 +79,7 @@ type ownerCacheEntry struct {
 	node        unique.Handle[string]
 	ownerRef    unique.Handle[string]
 	hasOwnerRef bool
+	epoch       uint64
 	expires     time.Time
 }
 
@@ -119,7 +124,7 @@ func (oc *OwnerCache) Get(sandboxID string) (OwnerRoute, bool) {
 		return OwnerRoute{}, false
 	}
 	oc.lru.MoveToFront(el)
-	node, ownerRef, hasOwnerRef := e.node.Value(), e.ownerRef.Value(), e.hasOwnerRef
+	node, ownerRef, hasOwnerRef, epoch := e.node.Value(), e.ownerRef.Value(), e.hasOwnerRef, e.epoch
 	oc.mu.Unlock()
 
 	// Gossip marks a node dead within seconds; the cache must not keep
@@ -136,6 +141,7 @@ func (oc *OwnerCache) Get(sandboxID string) (OwnerRoute, bool) {
 		Endpoint:    Endpoint{NodeID: node, InternalURL: m.InternalURL, APIURL: m.APIURL},
 		OwnerRef:    ownerRef,
 		HasOwnerRef: hasOwnerRef,
+		Epoch:       epoch,
 	}, true
 }
 
@@ -161,7 +167,7 @@ func (oc *OwnerCache) Put(sandboxID string, owner OwnerInfo, ownerRef string, ha
 		if !hasOwnerRef && e.hasOwnerRef && e.node == nodeHandle {
 			ownerRef, hasOwnerRef = e.ownerRef.Value(), true
 		}
-		e.node, e.ownerRef, e.hasOwnerRef, e.expires = nodeHandle, unique.Make(ownerRef), hasOwnerRef, expires
+		e.node, e.ownerRef, e.hasOwnerRef, e.epoch, e.expires = nodeHandle, unique.Make(ownerRef), hasOwnerRef, owner.Epoch, expires
 		oc.lru.MoveToFront(el)
 		return
 	}
@@ -170,6 +176,7 @@ func (oc *OwnerCache) Put(sandboxID string, owner OwnerInfo, ownerRef string, ha
 		node:        nodeHandle,
 		ownerRef:    unique.Make(ownerRef),
 		hasOwnerRef: hasOwnerRef,
+		epoch:       owner.Epoch,
 		expires:     expires,
 	})
 	for oc.lru.Len() > oc.max {

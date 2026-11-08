@@ -990,12 +990,30 @@ func ownerSinceAfter(prev Placement, existed bool, newOwner string, log *raft.Lo
 	return log.AppendedAt.UnixNano()
 }
 
+// ownerEpochAfter is the OwnerEpoch a placement carries once the entry at
+// index makes newOwner its owner; prev is the row before the entry and existed
+// is false for a new row. A new row, and any change of OwnerNodeID (an
+// orphaning to "" and a claim back included), take the entry's index; any
+// other write keeps the epoch. index 0 (no log entry, in tests) records 0,
+// which readers treat as unknown.
+func ownerEpochAfter(prev Placement, existed bool, newOwner string, index uint64) uint64 {
+	if existed && strings.TrimSpace(newOwner) == strings.TrimSpace(prev.OwnerNodeID) {
+		return prev.OwnerEpoch
+	}
+	return index
+}
+
 // setPlacementOwner moves an existing placement to owner ("" orphans it; the
 // caller keeps the orphan bookkeeping) and keeps OwnerSinceUnixNano in step.
 // Every apply that changes the owner of an existing row goes through it, so
 // the takeover time cannot drift from the owner it describes.
 func setPlacementOwner(p *Placement, owner, apiURL, dataPlaneHost string, log *raft.Log) {
 	p.OwnerSinceUnixNano = ownerSinceAfter(*p, true, owner, log)
+	var index uint64
+	if log != nil {
+		index = log.Index
+	}
+	p.OwnerEpoch = ownerEpochAfter(*p, true, owner, index)
 	p.OwnerNodeID = owner
 	p.OwnerAPIURL = apiURL
 	p.OwnerDataPlaneHost = dataPlaneHost
@@ -1155,6 +1173,7 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 			OwnerAPIURL:          cmd.OwnerAPIURL,
 			OwnerDataPlaneHost:   dataPlaneHost,
 			OwnerSinceUnixNano:   ownerSinceAfter(existing, exists, cmd.OwnerNodeID, log),
+			OwnerEpoch:           ownerEpochAfter(existing, exists, cmd.OwnerNodeID, f.version),
 			Version:              f.version,
 			CreatedUnix:          created,
 			UpdatedUnix:          now,
@@ -2388,6 +2407,7 @@ func (f *placementFSM) reservePlacementLocked(cmd command, now int64) error {
 		OwnerNodeID:          cmd.OwnerNodeID,
 		OwnerAPIURL:          cmd.OwnerAPIURL,
 		OwnerDataPlaneHost:   cmd.OwnerDataPlaneHost,
+		OwnerEpoch:           f.version,
 		Version:              f.version,
 		CreatedUnix:          now,
 		UpdatedUnix:          now,

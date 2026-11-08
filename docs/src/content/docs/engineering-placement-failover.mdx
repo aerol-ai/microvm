@@ -42,7 +42,7 @@ These are the rules every change to `internal/cluster/` is checked against. The 
 | # | Rule | How it holds today |
 |---|---|---|
 | I1 | **One executor.** A node runs or serves sandbox X only while it may own X. | A worker that cannot reach the leader for half of `SB_DEAD_OWNER_GRACE` pauses its recreate-policy sandboxes before any move can start. Other sandboxes are never moved (they are orphaned), so their node stays their only executor. |
-| I2 | **Ownership epoch.** Every owner change raises a number, and anything carrying an older number is refused. | Not yet. Instead, routing checks the owner again on every request. |
+| I2 | **Ownership epoch.** Every owner change raises a number, and anything carrying an older number is refused. | Every owner change records the Raft log index of that change as the placement's owner epoch, and every forward carries the epoch the edge read. An owner whose own reading is newer turns a cache-routed forward down, and the edge routes it again from a fresh lookup. A forward from a fresh lookup is still checked against the owner's own lookup. |
 | I3 | **No resurrection.** Once a sandbox's lifetime is deleted, it never runs or answers again. | The cluster keeps a delete record. A server that comes back deletes its leftover copy, and Raft refuses to place it. A delete that lands during a failover rebuild still finishes. |
 | I4 | **Capacity.** A worker never runs more than its budget, and the leader never under-counts a worker's load. | Each worker checks its own budget before it starts anything. The leader counts moved and promoted sandboxes until the worker's next capacity report shows them. |
 | I5 | **Same result on every server.** Applying a log entry depends only on the state and the entry. | Apply takes its time from the log entry, never from the server's clock. |
@@ -512,6 +512,14 @@ flowchart TB
 - An entry lasts 30 seconds. The cache holds at most 16,384 sandboxes, about 4 MiB. A node that gossip reports dead gets no cached traffic.
 - Turn it on only after every node runs a build that has it: an owner on an older build would serve or 404 a stale forward.
 
+**The owner skips its own lookup when it can prove ownership.** Every forward carries the placement's owner epoch: the Raft log index of the entry that last changed the owner. With `SB_CLUSTER_OWNER_CACHE=true`, each worker's ownership lease reads all of its sandboxes from the leader every 5 seconds and keeps their epochs. A forward whose epoch matches that reading is served with no lookup, because two authoritative readings agree:
+
+- A forward from a fresh edge lookup may use a reading as old as the lease (15 seconds by default).
+- A forward from the edge's cache needs a reading under 2 seconds old. That is the same staleness the owner's own lookup could get from a follower before it refuses.
+- A reading that holds a newer epoch turns a cached forward down. A missing epoch, a fenced sandbox or an older reading falls back to the lookup.
+
+With both halves on, a routed call in steady state asks the server tier nothing.
+
 **The trade.** Owner-sharded execution buys local consistency. The toolbox sessions, the SQLite row and the container for one sandbox all live on one host. So that sandbox's state needs no agreement across nodes.
 
 The cost is an extra forwarding hop on every cross-node API call. It also ties the sandbox to its owner: a long-lived sandbox cannot move except through the failover path.
@@ -613,6 +621,7 @@ Each server offers these counters at `GET /v1/metrics` (see [Dashboard](/dashboa
 | `aerolvm_cluster_ownership_replay_unplaced_total` | Local copies with no placement that a returning server handled, by `outcome`: `destroyed_deleted` (deleted while it was away), `destroyed_unproven` (away longer than delete records are kept), `kept_grace_off` (`SB_AUDIT_DELETED_GRACE=0`, so there are no records to check) or `kept_no_incarnation`. Kept rows are logged. |
 | `aerolvm_cluster_ownership_replay_refused_total` | Times Raft refused to place a returning server's copy of a deleted sandbox. The server checks first, so this moves only when a delete races the return. |
 | `aerolvm_cluster_route_requests_total`, `aerolvm_cluster_route_lookups_total` | Calls for one sandbox that clients sent to this node, and the owner lookups the router made for them, by `hop` (`edge` is the node the client called, `owner` the node a forward reached). Summed over all nodes, lookups divided by requests is what one call costs the server tier. |
+| `aerolvm_cluster_owner_lease_serves_total` | Forwards this node served from its ownership lease reading, with no lookup. |
 | `aerolvm_cluster_owner_cache_hits_total`, `_misses_total`, `_retries_total`, `_not_owner_total`, `_entries` | The owner cache, when it is on: calls routed from an entry, calls with no usable entry, cached forwards the owner turned down that were routed again, cached forwards this node turned down, and entries held. |
 
 ## Keeping secrets out of the Raft log
