@@ -285,7 +285,7 @@ variable "nodes" {
       with_firecracker (bool,    default var.default_with_firecracker)
       with_gvisor      (bool,    default var.default_with_gvisor)
       with_isolate     (bool,    default var.default_with_isolate)
-      ingress_proxy_routing (bool, default var.default_ingress_proxy_routing)
+      ingress_proxy_routing (bool or null, default var.default_ingress_proxy_routing; null = install.sh's default)
       with_nvidia_gpu  (bool,    default var.default_with_nvidia_gpu)
       with_amd_gpu     (bool,    default var.default_with_amd_gpu)
       idle_timeout_min (number,  default var.default_idle_timeout_min; 0 disables)
@@ -434,10 +434,16 @@ variable "default_with_isolate" {
   default     = false
 }
 
+# Three values on purpose. null (the default) passes no routing flag, so the
+# node gets install.sh's own default: on for a domain install. It renders
+# exactly what the old default false rendered, so a cluster that never set
+# this keeps byte-identical user_data and no node is replaced
+# (user_data_replace_on_change). true and false pass an explicit flag.
 variable "default_ingress_proxy_routing" {
-  description = "Route sandboxes without per-sandbox Caddy writes (plans/ingress-proxy-routing.md): install.sh --ingress-proxy-routing writes SB_INGRESS_PROXY_ROUTING=true and routes *.rt.internal to the sandboxd route responder. Per-node, no flag-day; per-node override via nodes[*].ingress_proxy_routing. Default off (setup/config-defaults.md)."
+  description = "Route sandboxes without per-sandbox Caddy writes (plans/ingress-proxy-routing.md). null (default): no installer flag, so install.sh's default applies, which is on for a domain install. true: install.sh --ingress-proxy-routing. false: install.sh --no-ingress-proxy-routing (per-sandbox Caddy routes). Per-node, no flag-day; per-node override via nodes[*].ingress_proxy_routing. See Terraform/README.md, \"Ingress proxy routing\"."
   type        = bool
-  default     = false
+  default     = null
+  nullable    = true
 }
 
 variable "default_with_nvidia_gpu" {
