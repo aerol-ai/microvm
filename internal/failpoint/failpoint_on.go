@@ -34,16 +34,19 @@ func Hit(name, key string) {
 	if prefix == "" || !strings.HasPrefix(key, prefix) {
 		return
 	}
-	// Only the caller whose Remove succeeds fires. Two creates matching the
-	// same prefix at once would otherwise both hang, and the suite kills one
-	// process for one hit.
-	if os.Remove(path) != nil {
+	// Claim by renaming the arm onto the marker. A rename moves a name
+	// exactly once, so of several creates matching at the same moment only
+	// one fires (the suite kills one process for one hit), and the marker
+	// exists the instant it does. Removing the arm would not do: two unlinks
+	// of one path can both succeed on some filesystems (APFS does it under
+	// contention). A rename that fails left no marker, so nobody would know
+	// to kill this process: don't block.
+	marker := path + HitSuffix
+	if os.Rename(path, marker) != nil {
 		return
 	}
-	// Without the marker nobody learns this process is parked and nobody
-	// kills it, so a failed write must not block.
-	if os.WriteFile(path+HitSuffix, []byte(key+"\n"), 0o600) != nil {
-		return
-	}
+	// The key says which create parked; the marker's existence alone says
+	// which node to kill, so a failed write still blocks.
+	_ = os.WriteFile(marker, []byte(key+"\n"), 0o600)
 	block()
 }

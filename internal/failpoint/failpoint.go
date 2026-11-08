@@ -9,10 +9,10 @@
 //
 // Protocol, under the tag: the suite writes a sandbox-name prefix to
 // Dir/<name>. The first Hit(name, key) whose key starts with that prefix
-// removes the file (a failpoint fires once), writes Dir/<name>.hit holding
-// the key, and blocks for the life of the process. The suite waits for the
-// .hit file, which also tells it which node to kill, and SIGKILLs sandboxd
-// there.
+// renames the file to Dir/<name>.hit (a failpoint fires once), writes the
+// key into it, and blocks for the life of the process. The suite waits for
+// the .hit file, which also tells it which node to kill, and SIGKILLs
+// sandboxd there.
 package failpoint
 
 // Dir is where armed failpoints live on a node. /run/sandboxd is made by the

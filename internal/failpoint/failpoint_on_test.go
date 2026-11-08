@@ -97,9 +97,13 @@ func TestHitFiresOnceWritesTheMarkerAndBlocks(t *testing.T) {
 	if exists(filepath.Join(d, CreateBeforePersist)) {
 		t.Fatal("the arm survived a hit; the failpoint would fire again")
 	}
-	raw, err := os.ReadFile(filepath.Join(d, CreateBeforePersist+HitSuffix))
-	if err != nil || string(raw) != "chaos-480-abc\n" {
-		t.Fatalf("hit marker = %q, %v; want the key", raw, err)
+	// The key is written just after the rename that fires; give it a moment.
+	var raw []byte
+	for deadline := time.Now().Add(5 * time.Second); string(raw) != "chaos-480-abc\n"; time.Sleep(time.Millisecond) {
+		raw, _ = os.ReadFile(filepath.Join(d, CreateBeforePersist+HitSuffix))
+		if time.Now().After(deadline) {
+			t.Fatalf("hit marker = %q; want the key", raw)
+		}
 	}
 
 	// Fired once: the next matching create goes straight through.
@@ -129,7 +133,7 @@ func TestConcurrentMatchesFireExactlyOnce(t *testing.T) {
 	deadline := time.Now().Add(5 * time.Second)
 	for returned.Load() < callers-1 {
 		if time.Now().After(deadline) {
-			t.Fatalf("only %d of %d callers returned; more than one fired", returned.Load(), callers)
+			t.Fatalf("only %d of %d callers returned; %d fired", returned.Load(), callers, fired.Load())
 		}
 		time.Sleep(time.Millisecond)
 	}
@@ -156,15 +160,46 @@ func TestHitRefusesANameOutsideTheDirectory(t *testing.T) {
 	}
 }
 
-func TestHitDoesNotBlockWhenTheMarkerCannotBeWritten(t *testing.T) {
+// The rename that claims the failpoint also makes the marker; when it
+// cannot (here a directory sits where the marker goes), there is no marker to
+// tell the suite which process to kill, so Hit must not block.
+func TestHitDoesNotBlockWhenTheMarkerCannotBeMade(t *testing.T) {
 	d, fired, _ := useTempDir(t)
 	arm(t, d, CreateBeforePersist, "k")
-	// A directory where the marker goes makes the write fail.
 	if err := os.Mkdir(filepath.Join(d, CreateBeforePersist+HitSuffix), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(d, CreateBeforePersist+HitSuffix, "x"), nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
 	Hit(CreateBeforePersist, "key")
 	if fired.Load() != 0 {
 		t.Fatal("Hit blocked with no marker to tell the suite which process to kill")
 	}
+}
+
+// A marker an earlier hit left (the suite never disarmed) is replaced, and
+// the new one names the new key.
+func TestHitReplacesAStaleMarker(t *testing.T) {
+	d, fired, release := useTempDir(t)
+	marker := filepath.Join(d, CreateBeforePersist+HitSuffix)
+	if err := os.WriteFile(marker, []byte("old-key\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	arm(t, d, CreateBeforePersist, "new-")
+	done := make(chan struct{})
+	go func() {
+		Hit(CreateBeforePersist, "new-key")
+		close(done)
+	}()
+	for deadline := time.Now().Add(5 * time.Second); fired.Load() == 0; time.Sleep(time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("Hit never fired")
+		}
+	}
+	if raw, err := os.ReadFile(marker); err != nil || string(raw) != "new-key\n" {
+		t.Fatalf("marker = %q, %v; want the new key", raw, err)
+	}
+	close(release)
+	<-done
 }
