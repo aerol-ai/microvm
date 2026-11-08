@@ -90,20 +90,28 @@ func (s *Service) consumeEvents(ctx context.Context, events <-chan docker.Docker
 	queues.wait()
 }
 
-// feedEvents hands each event to its sandbox's queue until the stream ends
-// or ctx does. It waits only when one sandbox's queue is full, never for a
-// sandbox's lifecycle boundary: a sandbox held by a long step delays its own
-// events, not the node's.
+// feedEvents hands each event to its sandbox's queue until the stream ends,
+// ctx does, or the queues' context does. It never waits for a sandbox: not
+// for its lifecycle boundary, and not for room in its queue (a full queue
+// drops its oldest entry), so a sandbox held by a long step delays only its
+// own events, never the node's.
 func (s *Service) feedEvents(ctx context.Context, events <-chan docker.DockerEvent, queues *sandboxEventQueues) {
-	for event := range events {
-		if ctx.Err() != nil || !queues.add(ctx, event) {
+	for {
+		select {
+		case <-ctx.Done():
 			return
+		case <-queues.ctx.Done():
+			return
+		case event, ok := <-events:
+			if !ok || !queues.add(ctx, event) {
+				return
+			}
 		}
 	}
 }
 
 func (s *Service) newEventQueues(ctx context.Context) *sandboxEventQueues {
-	return newSandboxEventQueues(ctx, maxQueuedEventsPerSandbox, func(ctx context.Context, event docker.DockerEvent) {
+	q := newSandboxEventQueues(ctx, maxQueuedEventsPerSandbox, func(ctx context.Context, event docker.DockerEvent) {
 		if err := s.handleDockerEvent(ctx, event); err != nil {
 			s.logger.Warn("handle docker event failed",
 				"sandbox_id", event.SandboxID,
@@ -112,6 +120,16 @@ func (s *Service) newEventQueues(ctx context.Context) *sandboxEventQueues {
 			)
 		}
 	})
+	q.dropped = func(event docker.DockerEvent, times int) {
+		if s.logger != nil {
+			s.logger.Warn("sandbox event queue full: oldest event dropped; reconcile catches up",
+				"sandbox_id", event.SandboxID,
+				"action", event.Action,
+				"times", times,
+			)
+		}
+	}
+	return q
 }
 
 func (s *Service) handleDockerEvent(ctx context.Context, event docker.DockerEvent) error {
@@ -151,6 +169,21 @@ func (s *Service) handleDockerEvent(ctx context.Context, event docker.DockerEven
 		s.noteSandboxOOM(sandbox)
 		return nil
 	case "die", "stop":
+		// An exit of a run before the current one (its event waited out a
+		// start) says nothing about this run: no status, exit, restart or
+		// teardown (run_starts.go). An oom noted before it is that run's
+		// too, so it cannot label this run's exit.
+		if runStart, old := s.runStarts.predates(sandbox.ID, event.Time); old {
+			s.sandboxOOMs.forget(sandbox.ID)
+			s.logger.Info("ignore exit event of an earlier run",
+				"sandbox_id", sandbox.ID,
+				"action", event.Action,
+				"exit_code", event.ExitCode,
+				"event_time", event.Time,
+				"run_started_at", runStart,
+			)
+			return nil
+		}
 		if err := s.markSandboxStopped(ctx, sandbox, event); err != nil {
 			return err
 		}
@@ -433,6 +466,7 @@ func (s *Service) handleDestroyEvent(ctx context.Context, sandbox *models.Sandbo
 	if err := s.store.Delete(ctx, sandbox.ID); err != nil && !errors.Is(err, store.ErrNotFound) {
 		return fmt.Errorf("delete sandbox: %w", err)
 	}
+	s.runStarts.forget(sandbox.ID)
 	s.finishSandboxVolumeDeletes(ctx, sandbox.ID, dwsVolumes)
 	if s.admitter != nil {
 		s.admitter.Release(sandbox.ID)

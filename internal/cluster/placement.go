@@ -128,7 +128,9 @@ func (c *Cluster) SelectPlacementWithCandidates(req capacity.Request) (Placement
 	// arrive between gossip ticks both pick the same "best" node and double-
 	// book it. The FSM serializes opReserve through raft, so the second
 	// SelectPlacement on the same leader sees the first reservation here.
-	pending, pendingRuntimes := c.fsm.pendingReservationLoadByNode(time.Now().Unix())
+	// Promoted and failed-over sandboxes the heartbeat does not show yet are
+	// counted too: that window is the same double-booking one step later.
+	pending := c.pendingLoadByNode(time.Now().Unix())
 	// Drained nodes are excluded from the candidate set entirely. Cheaper and
 	// clearer than threading the flag through nodeFits — drain is a hard
 	// admission rule (operator says "don't put more work here"), not a
@@ -206,7 +208,8 @@ func (c *Cluster) SelectPlacementWithCandidates(req capacity.Request) (Placement
 			rejects["mediated_egress"]++
 			continue
 		}
-		switch nodeFitVerdict(m, req, pending[m.NodeID]) {
+		extra, extraByRuntime := pending.of(m.NodeID)
+		switch nodeFitVerdict(m, req, extra) {
 		case fitIncompatible:
 			rejects["capacity"]++
 			continue
@@ -218,7 +221,7 @@ func (c *Cluster) SelectPlacementWithCandidates(req capacity.Request) (Placement
 		// A node with CPU and memory to spare is still full for this
 		// runtime when its network-slot pool is: the create would fail
 		// there with "no free slot" (bank density run, 2026-11-01).
-		if !slotsFit(m, req, pendingRuntimes[m.NodeID]) {
+		if !slotsFit(m, req, extraByRuntime) {
 			rejects["network_slots"]++
 			full = true
 			continue
@@ -235,8 +238,12 @@ func (c *Cluster) SelectPlacementWithCandidates(req capacity.Request) (Placement
 	// Power-of-two-choices.
 	a, b := pickTwo(candidates)
 	winner := a
-	if !sameNode(a, b) && placementScore(b, req, pending[b.NodeID], pendingRuntimes[b.NodeID]) > placementScore(a, req, pending[a.NodeID], pendingRuntimes[a.NodeID]) {
-		winner = b
+	if !sameNode(a, b) {
+		extraA, byRuntimeA := pending.of(a.NodeID)
+		extraB, byRuntimeB := pending.of(b.NodeID)
+		if placementScore(b, req, extraB, byRuntimeB) > placementScore(a, req, extraA, byRuntimeA) {
+			winner = b
+		}
 	}
 
 	if winner.NodeID == c.nodeID {
@@ -504,10 +511,11 @@ func freeSlotsAfterPending(m Member, req capacity.Request, pendingByRuntime map[
 // empty SupportedRuntimes), so a rolling upgrade places exactly as before.
 //
 // The heartbeat can lag a create that has already been promoted (the pending
-// claim is gone, the next pull has not run): within one capacity interval a
-// node can still be picked for its last slots. The worker then refuses with
-// its pool's capacity error (503 + Retry-After) and the retry is placed again;
-// that is the same window CPU and memory accounting have.
+// claim is gone, the next pull has not run). pendingByRuntime carries those
+// creates too until a heartbeat requested after the promote is stored
+// (capacity_unreported.go), so the window that remains is a failover recreate
+// the new owner has not started yet. There the worker refuses with its pool's
+// capacity error (503 + Retry-After), the same as for CPU and memory.
 func slotsFit(m Member, req capacity.Request, pendingByRuntime map[string]int) bool {
 	free, _, ok := freeSlotsAfterPending(m, req, pendingByRuntime)
 	return !ok || free >= 1
@@ -586,18 +594,66 @@ func pickTwo(c []Member) (Member, Member) {
 
 func sameNode(a, b Member) bool { return a.NodeID == b.NodeID }
 
+// reservationRetryAdmitMargin is how long a reservation must still have to
+// live for admission to treat a resend of it as a refresh. Admission reads
+// the leader's clock; the FSM decides by the time the same leader stamps on
+// the entry a moment later. Inside this margin the FSM may find the row
+// expired and reserve afresh, which needs a normal admission.
+const reservationRetryAdmitMargin = 5 // seconds
+
+// withoutLiveReservationRetries drops the reservations the FSM will apply as
+// a TTL refresh of a live reservation: same sandbox, same owner, same
+// incarnation (reservePlacementLocked's retry branch). Their load is already
+// in the pending index, so admitting them again counted one sandbox twice: a
+// create whose first answer was lost in a leader change, resent to the next
+// server, was refused on a full worker while its reservation kept the slot
+// until the TTL sweep. Found by the offline fault harness (PR #1017, Bug A).
+// A resend that changed its incarnation is admitted as usual; the FSM
+// refuses it anyway.
+func withoutLiveReservationRetries(fsm *placementFSM, reservations []reservationCommand, now int64) []reservationCommand {
+	var kept []reservationCommand
+	for i, r := range reservations {
+		if !isLiveReservationRetry(fsm, r, now) {
+			if kept != nil {
+				kept = append(kept, r)
+			}
+			continue
+		}
+		if kept == nil {
+			kept = append(make([]reservationCommand, 0, len(reservations)), reservations[:i]...)
+		}
+	}
+	if kept == nil {
+		return reservations
+	}
+	return kept
+}
+
+func isLiveReservationRetry(fsm *placementFSM, r reservationCommand, now int64) bool {
+	incarnation := strings.TrimSpace(r.IncarnationID)
+	if fsm == nil || r.SandboxID == "" || incarnation == "" {
+		return false
+	}
+	p, ok := fsm.get(r.SandboxID)
+	return ok && p.IsReserved() &&
+		strings.TrimSpace(p.OwnerNodeID) == strings.TrimSpace(r.OwnerNodeID) &&
+		strings.TrimSpace(p.IncarnationID) == incarnation &&
+		now+reservationRetryAdmitMargin <= p.ExpiresUnix
+}
+
+// admitReservationCommand is the leader's capacity answer for a reservation
+// command. It runs under reservationAdmissionMu and counts, besides the
+// owner's heartbeat, the committed pending load plus every reservation the
+// leader has admitted but not yet seen applied (admission_ledger.go). A
+// resend of a create still in flight is not counted again.
 func (c *Cluster) admitReservationCommand(cmd command) error {
-	reservations := reservationCommands(cmd)
+	// Two kinds of resend add no load: one of a reservation the FSM already
+	// holds live (Bug A, PR #1021), and one of a create still in flight on
+	// this leader (the ledger, PR #1024).
+	reservations := withoutLiveReservationRetries(c.fsm, reservationCommands(cmd), time.Now().Unix())
+	reservations = c.admission.withoutHeldResends(reservations)
 	if len(reservations) == 0 {
 		return nil
-	}
-	now := time.Now().Unix()
-	pending, pendingRuntimes := c.fsm.pendingReservationLoadByNode(now)
-	pendingCounts := make(map[string]int, len(reservations))
-	for _, r := range reservations {
-		if _, ok := pendingCounts[r.OwnerNodeID]; !ok {
-			pendingCounts[r.OwnerNodeID] = c.fsm.livePendingReservationCount(r.OwnerNodeID, now)
-		}
 	}
 	templateIDs := make([]string, 0, len(reservations))
 	for _, r := range reservations {
@@ -605,7 +661,27 @@ func (c *Cluster) admitReservationCommand(cmd command) error {
 			templateIDs = append(templateIDs, r.Spec.TemplateID)
 		}
 	}
+	// Heartbeats before pending lookups, as pendingLoadByNode requires (C7).
 	members := c.withCatalogueTemplateHolders(c.membersWithCapacity(), templateIDs...)
+	now := time.Now().Unix()
+	owners := make([]string, 0, len(reservations))
+	for _, r := range reservations {
+		owners = append(owners, r.OwnerNodeID)
+	}
+	// Committed pending load plus the ledger's in-flight holds (E2), then the
+	// load promoted or failed over since the owner's last heartbeat (C7).
+	reserved, reservedRuntimes, pendingCounts := c.fsm.admissionPendingLoad(now, owners, c.admission.heldReservations())
+	load := pendingLoad{reserved: reserved, runtimes: reservedRuntimes}
+	if c.capacityLeases != nil {
+		load.unreported = c.capacityLeases.unreported
+	}
+	pending := make(map[string]capacity.Request, len(reservations))
+	pendingRuntimes := make(map[string]map[string]int, len(reservations))
+	for _, r := range reservations {
+		if _, ok := pending[r.OwnerNodeID]; !ok {
+			pending[r.OwnerNodeID], pendingRuntimes[r.OwnerNodeID] = load.of(r.OwnerNodeID)
+		}
+	}
 	return admitReservationCommands(members, pending, pendingRuntimes, pendingCounts, c.cfg.ClusterCreateMaxPendingPerWorker, reservations)
 }
 

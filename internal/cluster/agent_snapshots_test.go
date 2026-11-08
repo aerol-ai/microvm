@@ -61,6 +61,37 @@ func TestAgentDelegatesSnapshotHomeToControlPlane(t *testing.T) {
 	if err := agent.ForgetSnapshotNode(ctx, "snap-agent"); err != nil {
 		t.Fatalf("agent ForgetSnapshotNode: %v", err)
 	}
+	// The local-only key carries NULs; it survives the apply channel and the
+	// query string both ways, as a worker's push worker and an ingress router
+	// use it.
+	localKey := SnapshotLocalOnlyKey("tenant-a", "snap-agent")
+	if err := agent.RegisterSnapshotNode(ctx, localKey, "node-y"); err != nil {
+		t.Fatalf("agent RegisterSnapshotNode(local-only): %v", err)
+	}
+	found = false
+	deadline = time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if node, found, err = agent.SnapshotHomeNode(ctx, localKey); err == nil && found {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !found || node != "node-y" {
+		t.Fatalf("agent SnapshotHomeNode(local-only) = %q,%v, want node-y/true", node, found)
+	}
+	if err := agent.ForgetSnapshotNode(ctx, localKey); err != nil {
+		t.Fatalf("agent ForgetSnapshotNode(local-only): %v", err)
+	}
+	deadline = time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, found, err = agent.SnapshotHomeNode(ctx, localKey); err == nil && !found {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if found {
+		t.Fatal("local-only key still found after the agent forgot it")
+	}
 	// Empty name is a local no-op on the agent (no control-plane hop).
 	if _, found, err := agent.SnapshotHomeNode(ctx, ""); err != nil || found {
 		t.Fatalf("empty name = found=%v err=%v, want not-found/nil", found, err)

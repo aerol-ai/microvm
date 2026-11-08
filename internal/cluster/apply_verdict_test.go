@@ -43,6 +43,13 @@ func TestApplyVerdictCarriesReservationAndNameConflicts(t *testing.T) {
 			sentinel: ErrIncarnationConflict,
 		},
 		{
+			// C2: a returning node's replay of a deleted lifecycle.
+			name:     "deleted lifecycle",
+			err:      fmt.Errorf("cluster: fsm apply: %w: sb-x incarnation %q", ErrPlacementDeleted, "inc-x"),
+			wantCode: http.StatusConflict,
+			sentinel: ErrPlacementDeleted,
+		},
+		{
 			name:     "superseded still carried",
 			err:      fmt.Errorf("%w: template/worker-a", ErrArtifactCatalogSuperseded),
 			wantCode: http.StatusConflict,
@@ -100,6 +107,8 @@ func TestAgentControlPlaneCarriesReservationAndNameConflicts(t *testing.T) {
 		// Placement rules: the leader refused a reservation outside the
 		// rule; an agent-routed create must still answer 409, not 503.
 		{"placement rule", "worker w1: " + ErrPlacementUnsatisfiable.Error() + ": no node has the labels zone=z", ErrPlacementUnsatisfiable},
+		// C2: a worker's ownership replay of a deleted lifecycle.
+		{"deleted lifecycle", "cluster: fsm apply: " + ErrPlacementDeleted.Error() + ": sb-x incarnation \"inc\"", ErrPlacementDeleted},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

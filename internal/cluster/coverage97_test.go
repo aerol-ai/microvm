@@ -250,10 +250,10 @@ func TestCoverage97NilReceiversAndCatalogGuards(t *testing.T) {
 	if _, err := clusterNil.ArtifactCatalog(ctx, ArtifactCatalogRequest{}); err == nil {
 		t.Fatal("nil cluster read a catalogue")
 	}
-	if err := clusterNil.ReassignStuckPlacement(ctx, "node-a", "sb", "inc"); !errors.Is(err, ErrUnknownSandbox) {
+	if err := clusterNil.ReassignStuckPlacement(ctx, "node-a", "sb", "inc", false); !errors.Is(err, ErrUnknownSandbox) {
 		t.Fatalf("nil reassign = %v", err)
 	}
-	if err := (&Cluster{fsm: &placementFSM{}}).ReassignStuckPlacement(ctx, "", "sb", "inc"); !errors.Is(err, ErrUnknownSandbox) {
+	if err := (&Cluster{fsm: &placementFSM{}}).ReassignStuckPlacement(ctx, "", "sb", "inc", false); !errors.Is(err, ErrUnknownSandbox) {
 		t.Fatalf("blank reassign = %v", err)
 	}
 	if got := (&Cluster{}).recreationCandidates(Placement{SecretRef: "ref"}); got != nil {

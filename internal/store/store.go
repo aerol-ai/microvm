@@ -1158,6 +1158,13 @@ func open(path string, secretCipher *secrets.Cipher) (*Store, error) {
 		// run exited (review 2 finding 10). 0 on every pre-migration row; the
 		// next start makes it 1.
 		`ALTER TABLE sandboxes ADD COLUMN run_generation INTEGER NOT NULL DEFAULT 0;`,
+		// A failed cluster create whose rollback could not finish (its
+		// destroy needs the Raft leader, and there was none) leaves a local
+		// row the client was told is gone. 1 keeps the ownership replay from
+		// publishing it and tells reconcile to destroy it (plan item C5). Only MarkSandboxRollbackPending writes
+		// it, and Create and Upsert never do: a whole-row write from a read
+		// taken before the mark must not clear it. 0 on every existing row.
+		`ALTER TABLE sandboxes ADD COLUMN rollback_pending INTEGER NOT NULL DEFAULT 0;`,
 		// Checkpoint pushes are async and outlive their sandbox: without the
 		// lifecycle they were started for, a push that lands after the id is
 		// reused writes the old incarnation's artifact into the new one.
@@ -1284,6 +1291,12 @@ func open(path string, secretCipher *secrets.Cipher) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("create sandboxes auto_import_pending index: %w", err)
 	}
+	// Same shape for the rollback-pending reconcile scan: zero rows in the
+	// steady state, so every reconcile pass is one empty index probe.
+	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_sandboxes_rollback_pending ON sandboxes(id) WHERE rollback_pending = 1;`); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("create sandboxes rollback_pending index: %w", err)
+	}
 
 	// Partial index on the new template_id column. The template GC and
 	// DELETE-template both call IsTemplateReferenced (a SELECT 1 ... WHERE
@@ -1305,6 +1318,10 @@ func open(path string, secretCipher *secrets.Cipher) (*Store, error) {
 	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_sandboxes_module_digest ON sandboxes(module_digest) WHERE module_digest <> '';`); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("create sandboxes module_digest index: %w", err)
+	}
+	if _, err := db.Exec(sandboxNameLookupIndexDDL); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("create sandboxes name lookup index: %w", err)
 	}
 	if err := migrateLegacyPlaintextSecrets(db, secretCipher); err != nil {
 		db.Close()
@@ -1604,6 +1621,26 @@ func migratePendingImageGCKey(db *sql.DB) error {
 // themselves.
 // Daytona, the v1 ?name= lookup and the aerolvm CLI resolve names through it.
 const sandboxNameIndexDDL = `CREATE UNIQUE INDEX IF NOT EXISTS idx_sandboxes_name ON sandboxes(owner_ref, name) WHERE name <> '';`
+
+// sandboxNameLookupIndexDDL serves the create-time check that a new id is not
+// another sandbox's name (sandboxIDTakenAsNameSQL). idx_sandboxes_name leads
+// with owner_ref and cannot answer a name-only lookup, so without this index
+// every create scanned the whole table: create p50 grew by about 0.1 ms per
+// 1,000 rows (3.4 ms at 30,000; BenchmarkStoreCreate). Not unique: owners
+// may share a name. Building it on an existing database is a one-time cost
+// at the first start after upgrade.
+const sandboxNameLookupIndexDDL = `CREATE INDEX IF NOT EXISTS idx_sandboxes_name_lookup ON sandboxes(name) WHERE name <> '';`
+
+// sandboxIDTakenAsNameSQL finds another sandbox whose name equals a new id.
+// It repeats the partial index's condition (the name is not empty) so SQLite
+// may use the index: a bound parameter alone does not prove it. The caller
+// only runs it for a non-empty id, so the extra condition never changes the
+// answer.
+const sandboxIDTakenAsNameSQL = `
+	SELECT id FROM sandboxes
+	WHERE name = ? AND name <> '' AND id <> ?
+	LIMIT 1
+`
 
 // backfillSnapshotOwners stamps pre-migration snapshot rows with the owner of
 // their source sandbox while that sandbox still exists. A row whose source is
@@ -2828,7 +2865,8 @@ func (s *Store) Get(ctx context.Context, id string) (*models.Sandbox, error) {
 			restart_on_failure, restart_failures, restart_at, last_restarted_at,
 			destroy_after_exit_for_ns, program_exited_at,
 			tokens_not_before,
-			run_generation
+			run_generation,
+			rollback_pending
 		FROM sandboxes
 		WHERE id = ?
 	`, id)
@@ -2902,7 +2940,8 @@ func (s *Store) List(ctx context.Context) ([]*models.Sandbox, error) {
 			restart_on_failure, restart_failures, restart_at, last_restarted_at,
 			destroy_after_exit_for_ns, program_exited_at,
 			tokens_not_before,
-			run_generation
+			run_generation,
+			rollback_pending
 		FROM sandboxes
 		ORDER BY created_at DESC
 	`)
@@ -2978,7 +3017,8 @@ func (s *Store) ListByOwner(ctx context.Context, ownerRef string) ([]*models.San
 			restart_on_failure, restart_failures, restart_at, last_restarted_at,
 			destroy_after_exit_for_ns, program_exited_at,
 			tokens_not_before,
-			run_generation
+			run_generation,
+			rollback_pending
 		FROM sandboxes
 		WHERE owner_ref = ?
 		ORDER BY created_at DESC
@@ -3041,7 +3081,8 @@ func (s *Store) ListByRuntime(ctx context.Context, runtime string) ([]*models.Sa
 			restart_on_failure, restart_failures, restart_at, last_restarted_at,
 			destroy_after_exit_for_ns, program_exited_at,
 			tokens_not_before,
-			run_generation
+			run_generation,
+			rollback_pending
 		FROM sandboxes
 		WHERE runtime = ?
 		ORDER BY created_at DESC
@@ -3691,6 +3732,51 @@ func (s *Store) ListAutoImportPendingIDs(ctx context.Context) ([]string, error) 
 	return ids, rows.Err()
 }
 
+// MarkSandboxRollbackPending records that the create of id failed and its
+// rollback has not finished (models.Sandbox.RollbackPending). It only ever
+// sets the flag: the row's delete is what ends it. ErrNotFound when there is
+// no row, which for a rollback means there is nothing left to roll back.
+func (s *Store) MarkSandboxRollbackPending(ctx context.Context, id string) error {
+	result, err := s.db.ExecContext(ctx,
+		`UPDATE sandboxes SET rollback_pending = 1, updated_at = ? WHERE id = ?`,
+		time.Now().UTC(), id)
+	if err != nil {
+		return fmt.Errorf("mark rollback_pending: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("mark rollback_pending rows affected: %w", err)
+	}
+	if affected == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// ListRollbackPendingIDs returns the ids of rows marked rollback-pending,
+// least recently written first. It hits the partial index on
+// (rollback_pending = 1), so it is an empty probe in the steady state.
+func (s *Store) ListRollbackPendingIDs(ctx context.Context) ([]string, error) {
+	rows, err := s.rdb.QueryContext(ctx, `
+		SELECT id FROM sandboxes
+		WHERE rollback_pending = 1
+		ORDER BY updated_at ASC
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("list rollback_pending sandboxes: %w", err)
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("scan rollback_pending id: %w", err)
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
+}
+
 // Delete removes a sandbox row. The FK cascade takes its volume attachments
 // with it, which can be the last link from any sandbox to a
 // delete_with_sandbox volume; so the same transaction writes the reclaim
@@ -3796,11 +3882,7 @@ func ensureSandboxLookupNameAvailable(ctx context.Context, q queryRower, id, nam
 	}
 	if id != "" {
 		var existingID string
-		err := q.QueryRowContext(ctx, `
-			SELECT id FROM sandboxes
-			WHERE name = ? AND id <> ?
-			LIMIT 1
-		`, id, id).Scan(&existingID)
+		err := q.QueryRowContext(ctx, sandboxIDTakenAsNameSQL, id, id).Scan(&existingID)
 		if err == nil {
 			return ErrSandboxNameConflict
 		}
@@ -5894,6 +5976,7 @@ func (s *Store) scanSandbox(scanner interface {
 	var restartAt, lastRestartedAt sql.NullTime
 	var destroyAfterExitNs int64
 	var programExitedAt sql.NullTime
+	var rollbackPending int
 
 	err := scanner.Scan(
 		&sandbox.ID,
@@ -5962,6 +6045,7 @@ func (s *Store) scanSandbox(scanner interface {
 		&programExitedAt,
 		&sandbox.TokensNotBefore,
 		&sandbox.RunGeneration,
+		&rollbackPending,
 	)
 	if err != nil {
 		return nil, err
@@ -5971,6 +6055,7 @@ func (s *Store) scanSandbox(scanner interface {
 	sandbox.LastRestartedAt = timeFromNull(lastRestartedAt)
 	sandbox.ProgramExitedAt = timeFromNull(programExitedAt)
 	sandbox.FleetSuspended = fleetSuspended == 1
+	sandbox.RollbackPending = rollbackPending == 1
 	sandbox.NetworkQuotaExceeded = netQuotaExceeded == 1
 	if netQuotaExceededAt.Valid {
 		t := netQuotaExceededAt.Time.UTC()

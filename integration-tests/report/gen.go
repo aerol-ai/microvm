@@ -59,6 +59,11 @@ type Result struct {
 	// passes. Surfaced in the JSON and the markdown "Detail" column so a red run
 	// is debuggable without re-reading the raw test.json.
 	Reason string `json:"reason,omitempty"`
+	// Invariants are the cluster-correctness verdicts (I1..I8) the use case's
+	// test recorded with harness.TrackInvariants, one per invariant it checks.
+	// A pass row carries them too: "held, over 61 samples" is the evidence
+	// that the case injected its fault, which a bare pass does not show.
+	Invariants []harness.InvariantResult `json:"invariants,omitempty"`
 }
 
 // Report is the serialized per-scenario artifact.
@@ -129,6 +134,7 @@ func classify(events []testEvent, reg []harness.UseCase, forceInconclusive bool)
 	// the id only through the marker, not the test name.
 	testToUC := map[string][]string{}
 	testOut := map[string][]string{}
+	testInv := map[string][]harness.InvariantResult{}
 	for _, ev := range events {
 		if ev.Action != "output" || ev.Test == "" {
 			continue
@@ -136,6 +142,10 @@ func classify(events []testEvent, reg []harness.UseCase, forceInconclusive bool)
 		if m := ucMarkerRE.FindStringSubmatch(ev.Output); m != nil {
 			testToUC[ev.Test] = appendUnique(testToUC[ev.Test], m[1])
 			continue // the marker line itself is not a reason
+		}
+		if inv, ok := harness.ParseInvariantMarker(ev.Output); ok {
+			testInv[ev.Test] = append(testInv[ev.Test], inv)
+			continue // nor is an invariant verdict; it has its own field
 		}
 		if line := meaningfulLine(ev.Output); line != "" {
 			testOut[ev.Test] = append(testOut[ev.Test], line)
@@ -148,6 +158,7 @@ func classify(events []testEvent, reg []harness.UseCase, forceInconclusive bool)
 	type outcome struct {
 		st     Status
 		reason string
+		invs   []harness.InvariantResult
 	}
 	got := map[string]outcome{}
 	for _, ev := range events {
@@ -168,7 +179,7 @@ func classify(events []testEvent, reg []harness.UseCase, forceInconclusive bool)
 			if prev, ok := got[id]; ok && prev.st == StatusFail {
 				continue // fail is sticky
 			}
-			got[id] = outcome{st: st, reason: reason}
+			got[id] = outcome{st: st, reason: reason, invs: testInv[ev.Test]}
 		}
 	}
 
@@ -184,6 +195,7 @@ func classify(events []testEvent, reg []harness.UseCase, forceInconclusive bool)
 			if o, ok := got[uc.ID]; ok {
 				r.Status = o.st
 				r.Reason = o.reason
+				r.Invariants = o.invs
 			} else {
 				// Implemented but produced no terminal event — surface as
 				// missing (counts against the run) rather than silently green.
@@ -194,6 +206,73 @@ func classify(events []testEvent, reg []harness.UseCase, forceInconclusive bool)
 		results = append(results, r)
 	}
 	return results
+}
+
+// focusSkipReason is the reason a focused scenario gives the use cases it
+// does not run. Exported in the JSON, so keep it stable.
+const focusSkipReason = "not in this focused scenario (it runs only the %s use cases)"
+
+// validateFocus refuses a focus capability that would turn the whole matrix
+// into skips. An unknown or unused capability is required by no use case, so
+// applyFocus would downgrade EVERY missing row, the focused cases included,
+// and a scenario whose cases all crashed would report green.
+func validateFocus(focus harness.Capability, reg []harness.UseCase) error {
+	if !harness.KnownCapabilities[focus] {
+		return fmt.Errorf("focus capability %q is not a known capability", focus)
+	}
+	for _, uc := range reg {
+		if uc.Implemented && slices.Contains(uc.Requires, focus) {
+			return nil
+		}
+	}
+	return fmt.Errorf("no implemented use case requires the focus capability %q, so a focused run would test nothing", focus)
+}
+
+// applyFocus is classify's companion for a focused scenario (a caps file
+// with a `focus:` block): the scenario runs only the tests claiming use
+// cases that require focus, so a use case that does not require it and has
+// no result is "not run here" (skip), not "crashed before reporting"
+// (missing). A focused use case with no result stays missing: that is still
+// a test that never reported, and the gate must stay red for it. Pure.
+func applyFocus(results []Result, reg []harness.UseCase, focus harness.Capability) []Result {
+	needsFocus := map[string]bool{}
+	for _, uc := range reg {
+		needsFocus[uc.ID] = slices.Contains(uc.Requires, focus)
+	}
+	out := make([]Result, len(results))
+	for i, r := range results {
+		if r.Status == StatusMissing && !needsFocus[r.ID] {
+			r.Status = StatusSkip
+			r.Reason = fmt.Sprintf(focusSkipReason, focus)
+		}
+		out[i] = r
+	}
+	return out
+}
+
+// invariantSummary is the short form of a row's invariant verdicts for the
+// markdown cell ("I1 held · I7 violated"); the details are in the JSON.
+func invariantSummary(invs []harness.InvariantResult) string {
+	parts := make([]string, 0, len(invs))
+	for _, inv := range invs {
+		parts = append(parts, inv.ID+" "+inv.Result)
+	}
+	return strings.Join(parts, " · ")
+}
+
+// detailCell is a row's Detail column: its invariant verdicts first (they
+// are the point of a chaos row, and the length cap must not cut them off),
+// then the reason.
+func detailCell(r Result) string {
+	inv := invariantSummary(r.Invariants)
+	switch {
+	case inv == "":
+		return r.Reason
+	case r.Reason == "":
+		return inv
+	default:
+		return inv + " — " + r.Reason
+	}
 }
 
 // appendUnique adds id to ids if not already present (markers can repeat).
@@ -358,7 +437,7 @@ func renderMarkdown(rep Report) string {
 	b.WriteString("| UC | Title | Status | Detail |\n|----|-------|--------|--------|\n")
 	for _, r := range rep.Results {
 		fmt.Fprintf(&b, "| %s | %s | %s %s | %s |\n",
-			r.ID, r.Title, icon(r.Status), r.Status, mdCell(r.Reason))
+			r.ID, r.Title, icon(r.Status), r.Status, mdCell(detailCell(r)))
 	}
 	return b.String()
 }
@@ -370,6 +449,7 @@ func main() {
 		inconclusive  = flag.Bool("inconclusive", false, "mark all implemented UCs inconclusive (spot reclaim)")
 		jsonInputPath = flag.String("json", "", "path to go test -json output; empty reads stdin")
 		indexOnly     = flag.Bool("index-only", false, "rebuild reports/index.md from the existing *.json and exit")
+		focusCap      = flag.String("focus-cap", "", "focused scenario: use cases that do not require this capability and have no result report as skip, not missing")
 	)
 	flag.Parse()
 
@@ -408,6 +488,14 @@ func main() {
 	}
 
 	results := classify(events, harness.Registry, *inconclusive)
+	if *focusCap != "" {
+		focus := harness.Capability(*focusCap)
+		if err := validateFocus(focus, harness.Registry); err != nil {
+			fmt.Fprintf(os.Stderr, "error: -focus-cap: %v\n", err)
+			os.Exit(2)
+		}
+		results = applyFocus(results, harness.Registry, focus)
+	}
 	rep := Report{Scenario: *scenario, Build: buildFromEnv(), Results: results, Summary: summarize(results)}
 
 	if err := os.MkdirAll(*out, 0o755); err != nil {

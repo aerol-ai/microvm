@@ -179,6 +179,9 @@ func TestCapacityKeepsTheSupportedFleetFreshAcrossTTLWindows(t *testing.T) {
 	if testing.Short() {
 		t.Skip("runs two TTL windows at the real cadence")
 	}
+	// Each builds its own Cluster and transport and mostly waits on
+	// scripted slow peers, so the two 30 s cadence tests share the wall clock.
+	t.Parallel()
 	f := newScriptedFleet(1900 * time.Millisecond)
 	healthy := f.add("slow", 2000, true, true)
 	f.runWindows(t, healthy, 2)
@@ -191,6 +194,9 @@ func TestCapacityKeepsTheFleetFreshWithANewcomerPending(t *testing.T) {
 	if testing.Short() {
 		t.Skip("runs two TTL windows at the real cadence")
 	}
+	// Each builds its own Cluster and transport and mostly waits on
+	// scripted slow peers, so the two 30 s cadence tests share the wall clock.
+	t.Parallel()
 	f := newScriptedFleet(1900 * time.Millisecond)
 	healthy := f.add("slow", 1999, true, true)
 	f.add("hole", 1, false, false)

@@ -92,7 +92,10 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 			return nil, fmt.Errorf("provision netns: %w", err)
 		}
 		netnsProvisioned = true
-		createtiming.From(ctx).RecordStageDesc("containerd_netns", 0, "provisioned")
+		// The containerd_netns stage is the handoff's to record: only it
+		// knows a warm claim (hit) from an inline build (miss), and it times
+		// both (netns.RuntimeHandoff.Provision). This used to record a fixed
+		// 0 here, which the docs then published as "Network setup 0 ms".
 	}
 
 	committed := false
@@ -106,6 +109,10 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 	// createdContainer, which wrongly leaked host files / ready socket / netns
 	// slot / lease on any failure BEFORE NewContainer.)
 	lostRace := false
+	// snapshotLeft is set when NewContainer failed for any reason but
+	// AlreadyExists: it may have prepared the sandbox's snapshot and not
+	// written the container (see removeOrphanSnapshot).
+	snapshotLeft := false
 	var (
 		container cntr.Container
 		task      cntr.Task
@@ -130,6 +137,12 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		// rule cleared after the slot is free could be the next owner's);
 		// and the slot goes back to the pool last.
 		d.lifoTeardown(ctx, client, container, task, logPath, hostFiles)
+		if snapshotLeft {
+			if err := d.removeOrphanSnapshot(ctx, client, sandboxID); err != nil {
+				d.logger.Warn("containerd: failed create's snapshot not removed; the next create of the id removes it as a leftover",
+					"sandbox_id", sandboxID, "error", err)
+			}
+		}
 		if !netnsProvisioned || d.netns == nil {
 			return
 		}
@@ -161,6 +174,11 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		return nil, err
 	}
 	createtiming.From(ctx).RecordStageDesc("containerd_image", time.Since(imageStart), "resolved")
+	// containerd_spec: everything between the image and the image lease
+	// (the image's user and command, the host files, the env, the OCI spec
+	// options and the ready socket). Boot-path (pr-review §2): this and the
+	// stages below add timer reads and RecordStage calls only.
+	specStart := time.Now()
 	// The operator create policy's require_non_root rule: the image config is
 	// the first place the user is known, before any host file or container.
 	if req.RequireNonRootUser {
@@ -251,10 +269,13 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 	if ip := strings.TrimSpace(prepaidIP); ip != "" {
 		containerLabels[containerIPLabelKey] = ip
 	}
+	createtiming.From(ctx).RecordStage("containerd_spec", time.Since(specStart))
+	leaseStart := time.Now()
 	leaseID, err = d.pinImageLease(ctx, client, image)
 	if err != nil {
 		return nil, err
 	}
+	createtiming.From(ctx).RecordStage("containerd_lease", time.Since(leaseStart))
 	if leaseID != "" {
 		containerLabels[imageLeaseLabelKey] = leaseID
 	}
@@ -282,8 +303,13 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 			lostRace = true
 			return nil, fmt.Errorf("%w: sandbox container already exists", dockerpkg.ErrSandboxContainerExists)
 		}
+		snapshotLeft = true
 		return nil, fmt.Errorf("create container: %w", err)
 	}
+	// containerd_create keeps its old span (NewContainer through NewTask), so
+	// it compares with every report before it; containerd_container and
+	// containerd_task are its two parts.
+	createtiming.From(ctx).RecordStage("containerd_container", time.Since(createStart))
 	// The prepaid address is this sandbox's from here (a duplicate create
 	// stopped at NewContainer above), and the workload hasn't started: put
 	// the request's rules on it now, so the workload never runs without
@@ -304,6 +330,7 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		sbruntime.NotifyAddressKnown(ctx, ip)
 	}
 
+	taskStart := time.Now()
 	logPath, err = d.taskLogPath(sandboxID)
 	if err != nil {
 		return nil, err
@@ -318,6 +345,7 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 	if err != nil {
 		return nil, fmt.Errorf("create task: %w", err)
 	}
+	createtiming.From(ctx).RecordStage("containerd_task", time.Since(taskStart))
 	createtiming.From(ctx).RecordStage("containerd_create", time.Since(createStart))
 
 	startStart := time.Now()
@@ -326,10 +354,14 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 	}
 	createtiming.From(ctx).RecordStage("containerd_start", time.Since(startStart))
 
+	// containerd_address: reading the started task's IPv4 back (the netns
+	// probe; for gVisor, the fallback to the prepaid address or label).
+	addressStart := time.Now()
 	state, err := d.runtimeStateAfterStart(ctx, container, task, sandboxID, prepaidIP)
 	if err != nil {
 		return nil, err
 	}
+	createtiming.From(ctx).RecordStage("containerd_address", time.Since(addressStart))
 
 	// Attribute the readiness wait for Server-Timing (parity with the docker
 	// driver): the ready socket is the fast path ("socket"); the HTTP health
@@ -466,11 +498,21 @@ func (d *Driver) startTask(ctx context.Context, containerRef, sandboxID, toolbox
 	// the exact socket (nonce from the spec mount path, token from the spec env)
 	// so the mount succeeds and the restarted toolbox can re-signal readiness.
 	// A pool container's park socket is the parked listener above.
-	if d.cfg.ReadyEnabled && parked == nil {
+	// The stored spec decides, not today's ReadyEnabled: a sandbox created
+	// while the socket was on still bind-mounts it after an operator turns
+	// the socket (or the warm pool that widens it) off, and without the file
+	// runc refuses the task. recreateResumeReadySocket is a no-op for a spec
+	// with no ready mount.
+	if parked == nil {
 		if rl := d.recreateResumeReadySocket(spec); rl != nil {
 			defer func() { _ = rl.Close() }()
 		}
 	}
+	// The new run's start time (SandboxRuntimeState.StartedAt): taken after
+	// the old task was deleted, so after its exit, and before the new task
+	// exists, so before anything it can report. The shims stamp exits on
+	// this same host clock.
+	startedAt := time.Now().UTC()
 	task, err = container.NewTask(ctx, logIO)
 	if err != nil {
 		return nil, fmt.Errorf("create task: %w", err)
@@ -490,7 +532,12 @@ func (d *Driver) startTask(ctx context.Context, containerRef, sandboxID, toolbox
 			return nil, fmt.Errorf("re-adopt warm-pool container: %w", err)
 		}
 	}
-	return d.runtimeStateAfterStart(ctx, container, task, containerRef, "")
+	state, err := d.runtimeStateAfterStart(ctx, container, task, containerRef, "")
+	if err != nil {
+		return nil, err
+	}
+	state.StartedAt = startedAt
+	return state, nil
 }
 
 // parkedRestartListener returns the listener a start of a warm-pool
@@ -597,8 +644,9 @@ func (d *Driver) Destroy(ctx context.Context, sandbox *models.Sandbox) error {
 	return destroyErr
 }
 
-// destroyContainer kills the sandbox's task and deletes its container; a
-// container containerd doesn't have is already gone.
+// destroyContainer kills the sandbox's task and deletes its container with
+// its snapshot. A container containerd doesn't have is gone, but the snapshot
+// named after it can still be there (removeOrphanSnapshot), so that goes too.
 func (d *Driver) destroyContainer(ctx context.Context, sandbox *models.Sandbox) error {
 	client, err := d.ensureClient()
 	if err != nil {
@@ -611,7 +659,7 @@ func (d *Driver) destroyContainer(ctx context.Context, sandbox *models.Sandbox) 
 	container, err := client.LoadContainer(ctx, ref)
 	if err != nil {
 		if errdefs.IsNotFound(err) {
-			return nil
+			return removeSnapshot(ctx, client, ref)
 		}
 		return err
 	}
@@ -623,6 +671,64 @@ func (d *Driver) destroyContainer(ctx context.Context, sandbox *models.Sandbox) 
 		_, _ = task.Delete(ctx, cntr.WithProcessKill)
 	}
 	return container.Delete(ctx, cntr.WithSnapshotCleanup)
+}
+
+// removeOrphanSnapshot removes the snapshot named id when containerd says no
+// container holds id.
+//
+// NewContainer prepares a container's snapshot (cntr.WithNewSnapshot, keyed by
+// the container's own id, here the sandbox ID) before it writes the
+// container. A NewContainer that fails in between leaves the snapshot with no
+// container, most often a create whose client hung up (an SDK timeout): its
+// context is cancelled, the container write fails, and so does the delete of
+// NewContainer's own lease, which keeps the snapshot pinned for a day. The
+// next create of the ID, an Idempotency-Key retry, fails its prepare with
+// AlreadyExists, and the service answered 409 "sandbox already exists"
+// (UC-450 live, 2026-11-08).
+//
+// A snapshot whose container exists is that container's rootfs, and
+// containerd's Remove does not check for one, so the container is looked up
+// first and a lookup that fails leaves the snapshot. Nothing else can hold a
+// snapshot under a sandbox ID with no container: the service runs one create
+// of an ID at a time (its create lease), and every other snapshot this driver
+// makes is named after a warm-pool slot.
+func (d *Driver) removeOrphanSnapshot(ctx context.Context, client *Client, id string) error {
+	if _, err := client.LoadContainer(ctx, id); !errdefs.IsNotFound(err) {
+		return err
+	}
+	return removeSnapshot(ctx, client, id)
+}
+
+// removeSnapshot removes the snapshot named key from the default snapshotter;
+// one that is not there is already gone.
+func removeSnapshot(ctx context.Context, client *Client, key string) error {
+	s := snapshotsFn(client)
+	if s == nil {
+		return nil
+	}
+	if err := s.Remove(client.withNS(ctx), key); err != nil && !errdefs.IsNotFound(err) {
+		return fmt.Errorf("remove snapshot %q: %w", key, err)
+	}
+	return nil
+}
+
+// snapshotRemover is the containerd snapshotter surface the orphan-snapshot
+// cleanup needs. Tests inject a fake so the path is covered offline.
+type snapshotRemover interface {
+	Remove(ctx context.Context, key string) error
+}
+
+// snapshotsFn resolves the default snapshotter, the one cntr.WithNewSnapshot
+// prepares every sandbox's snapshot on (Create names none). Production uses
+// client.Raw(); tests override.
+var snapshotsFn = func(client *Client) snapshotRemover {
+	if client == nil || client.Raw() == nil {
+		return nil
+	}
+	if s := client.Raw().SnapshotService(""); s != nil {
+		return s
+	}
+	return nil
 }
 
 // Inspect reports what containerd knows about one container. An error

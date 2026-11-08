@@ -23,6 +23,7 @@ type ownedRecoveryStubCluster struct {
 	reassignFrom  string
 	reassignID    string
 	reassignIncID string
+	reassignCap   bool
 	reassignErr   error
 }
 
@@ -34,8 +35,8 @@ func (c *ownedRecoveryStubCluster) OwnedRecoveryPlacements(ownerID string, limit
 	}
 }
 
-func (c *ownedRecoveryStubCluster) ReassignStuckPlacement(_ context.Context, requesterID, sandboxID, incarnationID string) error {
-	c.reassignFrom, c.reassignID, c.reassignIncID = requesterID, sandboxID, incarnationID
+func (c *ownedRecoveryStubCluster) ReassignStuckPlacement(_ context.Context, requesterID, sandboxID, incarnationID string, capacityRefused bool) error {
+	c.reassignFrom, c.reassignID, c.reassignIncID, c.reassignCap = requesterID, sandboxID, incarnationID, capacityRefused
 	return c.reassignErr
 }
 
@@ -107,8 +108,16 @@ func TestClusterInternalReassignStuck(t *testing.T) {
 	if rr.Code != http.StatusAccepted {
 		t.Fatalf("status = %d body=%s", rr.Code, rr.Body.String())
 	}
-	if stub.reassignFrom != "wrk-a" || stub.reassignID != "sb-stuck" || stub.reassignIncID != "inc-1" {
-		t.Fatalf("reassign from=%q id=%q inc=%q", stub.reassignFrom, stub.reassignID, stub.reassignIncID)
+	if stub.reassignFrom != "wrk-a" || stub.reassignID != "sb-stuck" || stub.reassignIncID != "inc-1" || stub.reassignCap {
+		t.Fatalf("reassign from=%q id=%q inc=%q capacity refused=%v", stub.reassignFrom, stub.reassignID, stub.reassignIncID, stub.reassignCap)
+	}
+	// A worker whose admitter refused the recreate says so; the leader needs
+	// it to hand back a placement no other node can take.
+	refused := withPeer(httptest.NewRequest(http.MethodPost, cluster.PublicInternalReassignStuckPath,
+		strings.NewReader(`{"sandbox_id":"sb-stuck","incarnation_id":"inc-1","capacity_refused":true}`)), "wrk-a")
+	h.clusterInternalReassignStuck(httptest.NewRecorder(), refused)
+	if !stub.reassignCap {
+		t.Fatal("capacity_refused did not reach ReassignStuckPlacement")
 	}
 
 	stub.reassignErr = cluster.ErrStuckReassignNotOwner

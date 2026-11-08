@@ -889,7 +889,7 @@ func TestEvictDeadOwnerRemovesRaftVoter(t *testing.T) {
 		t.Fatalf("place on follower: %v", err)
 	}
 
-	leader.gossip.memberIndex.upsert(Member{NodeID: follower.nodeID, Alive: false, Role: config.NodeRoleServer, RaftAddr: follower.cfg.RaftAdvertiseAddr})
+	markGossipDead(t, leader, follower.nodeID)
 	leader.deadOwners.markDead(follower.nodeID, time.Now().Add(-time.Hour))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)

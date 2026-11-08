@@ -7,7 +7,8 @@ description: Add a column or table to the SQLite store at internal/store/store.g
 
 ## Architecture constraints
 
-- **SQLite, single-writer in-process.** `Open()` sets `MaxOpenConns=1` so API handlers, the event monitor, and background sweeps queue through `database/sql` instead of racing separate SQLite connections into "database is locked". Don't add a second `*sql.DB`.
+- **SQLite: one writer plus a read-only pool.** `open()` keeps one writer connection (`Store.db`, `MaxOpenConns=1`) for every write and transaction, so writers queue in `database/sql` instead of racing into "database is locked". Plain reads outside a transaction use the `query_only` pool (`Store.rdb`). Don't open another writable `*sql.DB`; a statement that writes (including `UPDATE … RETURNING`) and every claim path uses `s.db` (see CLAUDE.md and `TestClaimPathsReadOnWriter`).
+- **Indexes.** Add `CREATE INDEX IF NOT EXISTS` with the table's other indexes in `open()`. SQLite uses a partial index (`… WHERE name <> ''`) only when the query repeats that condition; a bound parameter does not prove it. Check the plan with the `queryPlan` test helper (see `TestSandboxIDAsNameCheckSeeksAnIndex`).
 - **No migrations framework.** The schema is additive + idempotent on startup: `CREATE TABLE IF NOT EXISTS` and additive `ALTER TABLE` only. Renames and drops are not supported.
 - **Secrets on disk.** `env_json`, `toolbox_token`, and sealed mount blobs live in this DB. `Open()` chmods the directory and file to 0700. Don't loosen those modes.
 

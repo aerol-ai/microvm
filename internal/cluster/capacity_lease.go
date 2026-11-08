@@ -77,6 +77,10 @@ const (
 type capacityLease struct {
 	snapshot capacity.Snapshot
 	updated  time.Time
+	// mark is the unreported-load position taken before this snapshot was
+	// requested (capacity_unreported.go). A snapshot requested earlier never
+	// replaces it: the entries it cleared are not all in the older one.
+	mark uint64
 }
 
 type capacityLeaseCache struct {
@@ -125,6 +129,12 @@ type capacityLeaseCache struct {
 	// their free counts) onto our own lease, as /v1/capacity does for peers.
 	// nil = no bounded pool here, which placement reads as "no slot limit".
 	localSlotPools func() []capacity.SlotPool
+
+	// unreported is load the FSM stopped counting as pending that a node's
+	// heartbeat may not show yet. Each stored heartbeat clears what it
+	// covers. Never nil after newCapacityLeaseCache; New shares it with the
+	// FSM, which records into it.
+	unreported *unreportedLoad
 }
 
 func newCapacityLeaseCache(selfID string, admitter *capacity.Admitter, interval time.Duration, logger *slog.Logger) *capacityLeaseCache {
@@ -145,6 +155,7 @@ func newCapacityLeaseCache(selfID string, admitter *capacity.Admitter, interval 
 		failures:    make(map[string]int),
 		lastAttempt: make(map[string]time.Time),
 		slowPeers:   make(map[string]bool),
+		unreported:  newUnreportedLoad(),
 	}
 }
 
@@ -208,6 +219,9 @@ func (c *capacityLeaseCache) refreshLocal(now time.Time) {
 	if admitter == nil {
 		return
 	}
+	// Marked before the admitter is read, like a peer's mark before its
+	// request goes out: a promote recorded after this may be missing.
+	mark := c.unreportedMark()
 	snap := admitter.Snapshot()
 	// Overlay PR-D template inventory before storing — placement reads
 	// straight off this lease, so without the overlay our own snapshot
@@ -237,7 +251,7 @@ func (c *capacityLeaseCache) refreshLocal(now time.Time) {
 	if slotPools != nil {
 		snap.SlotPools = slotPools()
 	}
-	c.set(c.selfID, snap, now)
+	c.setReported(c.selfID, snap, now, mark)
 }
 
 // SetLocalTemplateIDsProvider installs the PR-D callback the capacity
@@ -298,7 +312,9 @@ func (c *capacityLeaseCache) SetLocalSlotPoolsProvider(fn func() []capacity.Slot
 	c.localSlotPools = fn
 }
 
-func (c *capacityLeaseCache) set(nodeID string, snap capacity.Snapshot, updated time.Time) {
+// setReported stores a snapshot requested after mark and drops the unreported
+// load it now shows. Callers take mark before the request goes out.
+func (c *capacityLeaseCache) setReported(nodeID string, snap capacity.Snapshot, updated time.Time, mark uint64) {
 	if c == nil || nodeID == "" {
 		return
 	}
@@ -306,8 +322,23 @@ func (c *capacityLeaseCache) set(nodeID string, snap capacity.Snapshot, updated 
 	if c.leases == nil {
 		c.leases = make(map[string]capacityLease)
 	}
-	c.leases[nodeID] = capacityLease{snapshot: snap, updated: updated}
+	// Our own lease is refreshed by every placement call at once, so two
+	// reads of the admitter can finish out of order. Storing the older one
+	// last would put back a snapshot that misses load the newer one cleared.
+	if cur, ok := c.leases[nodeID]; !ok || mark >= cur.mark {
+		c.leases[nodeID] = capacityLease{snapshot: snap, updated: updated, mark: mark}
+	}
 	c.mu.Unlock()
+	c.unreported.reported(nodeID, mark)
+}
+
+// unreportedMark is the position a heartbeat requested now is measured
+// against; take it before the request.
+func (c *capacityLeaseCache) unreportedMark() uint64 {
+	if c == nil {
+		return 0
+	}
+	return c.unreported.mark()
 }
 
 // due reports whether nodeID may be attempted now. A peer in backoff is
@@ -424,6 +455,7 @@ func (c *capacityLeaseCache) retain(live map[string]struct{}) int {
 	if c == nil || len(live) == 0 {
 		return 0
 	}
+	c.unreported.retain(live, c.selfID)
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	dropped := 0
@@ -745,6 +777,10 @@ func (c *Cluster) runCapacityFetchPhase(ctx context.Context, members []Member, b
 			defer wg.Done()
 			for m := range jobs {
 				dialled := time.Now()
+				// Before the request: the peer's answer covers every
+				// promote this server applied up to here, and maybe not
+				// one applied while the request is in flight.
+				mark := c.capacityLeases.unreportedMark()
 				snap, err := c.fetchMemberCapacity(phaseCtx, m, pass.attemptTimeout)
 				// The fairness clock moves only for an attempt that resolved
 				// on the PEER's terms. It orders the next sweep, so advancing
@@ -783,7 +819,7 @@ func (c *Cluster) runCapacityFetchPhase(ctx context.Context, members []Member, b
 				// the process.
 				c.capacityLeases.recordResponsiveness(m.NodeID, time.Since(dialled) <= capacityLeaseQuickProbeTimeout)
 				c.capacityLeases.recordFetchResult(m.NodeID, time.Now(), nil)
-				c.capacityLeases.set(m.NodeID, snap, time.Now())
+				c.capacityLeases.setReported(m.NodeID, snap, time.Now(), mark)
 				mu.Lock()
 				refreshed[m.NodeID] = struct{}{}
 				mu.Unlock()

@@ -153,6 +153,12 @@ var ErrInvalidSecretHandle = errors.New("cluster: invalid secret handle")
 // a different lifetime of the same sandbox ID.
 var ErrIncarnationConflict = errors.New("cluster: sandbox incarnation conflict")
 
+// ErrPlacementDeleted refuses an opPlace that would write back the placement
+// of a lifetime (sandbox ID + incarnation) the cluster already deleted. It is
+// what a node that was cut off gets when its ownership replay tries to place
+// a sandbox someone deleted meanwhile; that node must destroy its copy.
+var ErrPlacementDeleted = errors.New("cluster: sandbox lifecycle was deleted")
+
 // ErrNoPlacementTarget is returned when no alive worker-capable node can
 // accept a new sandbox. This is distinct from "self wins": a pure server or
 // ingress node must not silently fall back to local Docker ownership.
@@ -398,9 +404,21 @@ type Placement struct {
 	OwnerState          PlacementOwnerState `json:"owner_state,omitempty"`
 	OrphanedOwnerNodeID string              `json:"orphaned_owner_node_id,omitempty"`
 	OrphanedUnix        int64               `json:"orphaned_unix,omitempty"`
-	Version             uint64              `json:"version"`
-	CreatedUnix         int64               `json:"created_unix"`
-	UpdatedUnix         int64               `json:"updated_unix"`
+	// OwnerSinceUnixNano is when OwnerNodeID took the placement over from
+	// another node: the leader's append time (raft.Log.AppendedAt) of the
+	// entry that moved it, never a clock read in apply, so every replica and
+	// every replay computes the same value. 0 means no takeover is known: the
+	// placement still has the owner it was created (reserved or placed)
+	// with, the entry carried no append time, or an older build applied it.
+	// Orphaning, and a claim back by the node it was orphaned from, keep the
+	// value, as no other node owned the sandbox in between. The owner reads
+	// it when it reuses a local row from an earlier ownership, to refuse the
+	// sandbox tokens issued before the takeover (another node may have
+	// revoked them): Service.RecreateSandboxReport.
+	OwnerSinceUnixNano int64  `json:"owner_since_unix_nano,omitempty"`
+	Version            uint64 `json:"version"`
+	CreatedUnix        int64  `json:"created_unix"`
+	UpdatedUnix        int64  `json:"updated_unix"`
 	// Name is the small, hot copy of Spec.Name used to rebuild the cluster-wide
 	// uniqueness index without loading the larger recovery spec payload.
 	Name string `json:"name,omitempty"`
@@ -423,6 +441,14 @@ type Placement struct {
 	// field"; placementAllowsPublicTraffic still consults Spec when present,
 	// so a legacy row behaves exactly as before until its next write.
 	PublicTraffic bool `json:"public_traffic,omitempty"`
+	// FailoverRecreate mirrors Spec.Failover.ShouldRecreate() on the HOT row,
+	// for the same reason as PublicTraffic: an ingress reads only redacted
+	// pages and feed rows. When it loses the servers past the ownership
+	// lease it puts only these sandboxes in flux, since only they can be
+	// handed to another worker behind its back (placementMovableOnFailover).
+	// false means "no recreate policy, or recorded by a build that predates
+	// this field"; a row read with its Spec still consults the Spec.
+	FailoverRecreate bool `json:"failover_recreate,omitempty"`
 	// EgressProfiles / EgressInlineHostnames mirror Spec.EgressProfiles and
 	// the hostname count of Spec.NetworkAllowOut on the HOT row, for the
 	// FSM's profile reference index and union-cap check (D21). Empty for a
@@ -635,8 +661,14 @@ type SandboxRecreator interface {
 // no-op where the sandbox and its replicated routes were already present.
 // Failures always report attempted=true so retry/error metrics retain the
 // signal that drives stuck-placement reassignment.
+//
+// ownerSinceUnixNano is the placement's OwnerSinceUnixNano, handed over from
+// the row the watcher already read: an owner that finds a local row from an
+// earlier ownership refuses the sandbox tokens issued before it took the
+// placement back. Reading the placement again in the service instead would
+// cost a worker one control-plane round trip per owned sandbox per tick.
 type SandboxRecreateReporter interface {
-	RecreateSandboxReport(ctx context.Context, id string, spec models.CreateSandboxRequest, secrets PlacementSecrets, exposedPorts map[int]ExposedPortRoute) (attempted bool, err error)
+	RecreateSandboxReport(ctx context.Context, id string, spec models.CreateSandboxRequest, secrets PlacementSecrets, exposedPorts map[int]ExposedPortRoute, ownerSinceUnixNano int64) (attempted bool, err error)
 }
 
 // Client is the surface the rest of the daemon (Service, API handlers)

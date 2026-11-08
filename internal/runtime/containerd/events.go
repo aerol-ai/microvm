@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"time"
 
+	apievents "github.com/containerd/containerd/api/events"
 	cntr "github.com/containerd/containerd/v2/client"
 	"github.com/containerd/containerd/v2/core/events"
 	"github.com/containerd/containerd/v2/core/runtime"
@@ -107,16 +108,24 @@ func normalizeContainerdEvent(ev *events.Envelope) (docker.DockerEvent, bool) {
 		// ignored by the consumer; parity requires the same here.
 		return docker.DockerEvent{}, false
 	}
-	id, exitCode := containerIDAndExitFromEvent(ev)
+	id, exitCode, exitedAt := decodeTaskEvent(ev)
 	if id == "" {
 		return docker.DockerEvent{}, false
+	}
+	// An exit is stamped with when the shim saw the process exit, not when
+	// the envelope was published: the shim publishes from a queue, and a
+	// late publish of the previous task's exit can come after the start of
+	// the next task (DockerEvent.Time, internal/service/run_starts.go).
+	at := ev.Timestamp
+	if !exitedAt.IsZero() {
+		at = exitedAt
 	}
 	return docker.DockerEvent{
 		ContainerID: id,
 		SandboxID:   id, // enriched with sandbox_id label in StreamEvents
 		Action:      action,
 		ExitCode:    exitCode,
-		Time:        ev.Timestamp,
+		Time:        at,
 	}, true
 }
 
@@ -129,12 +138,20 @@ func containerIDFromEvent(ev *events.Envelope) string {
 }
 
 func containerIDAndExitFromEvent(ev *events.Envelope) (string, int) {
+	id, exitCode, _ := decodeTaskEvent(ev)
+	return id, exitCode
+}
+
+// decodeTaskEvent decodes the payload once: the container ID, the exit
+// status, and, for a TaskExit, when the process exited (zero when the shim
+// gave none).
+func decodeTaskEvent(ev *events.Envelope) (string, int, time.Time) {
 	if ev == nil || ev.Event == nil {
-		return "", 0
+		return "", 0, time.Time{}
 	}
 	decoded, err := typeurl.UnmarshalAny(ev.Event)
 	if err != nil {
-		return "", 0
+		return "", 0, time.Time{}
 	}
 	id := ""
 	if g, ok := decoded.(interface{ GetContainerID() string }); ok {
@@ -153,7 +170,13 @@ func containerIDAndExitFromEvent(ev *events.Envelope) (string, int) {
 	if g, ok := decoded.(interface{ GetExitStatus() uint32 }); ok {
 		exitCode = int(g.GetExitStatus())
 	}
-	return id, exitCode
+	var exitedAt time.Time
+	if exit, ok := decoded.(*apievents.TaskExit); ok {
+		if ts := exit.GetExitedAt(); ts != nil {
+			exitedAt = ts.AsTime()
+		}
+	}
+	return id, exitCode, exitedAt
 }
 
 // ContainerPID returns the init PID for a running task. "Not running here"

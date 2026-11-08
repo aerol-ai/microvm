@@ -51,7 +51,7 @@ func TestRecreateWasmDurableSandboxRetryRestoresSealedEnv(t *testing.T) {
 	}
 
 	rt.rehydrateErr = errors.New("restore boom")
-	if _, err := svc.recreateWasmDurableSandbox(ctx, id, "inc-1", spec, nil); err == nil {
+	if _, err := svc.recreateWasmDurableSandbox(ctx, id, "inc-1", spec, nil, 0); err == nil {
 		t.Fatal("seeded restore failure did not surface")
 	}
 	if _, err := st.Get(ctx, id); err != nil {
@@ -67,7 +67,7 @@ func TestRecreateWasmDurableSandboxRetryRestoresSealedEnv(t *testing.T) {
 	rt.rehydrateErr = nil
 	retrySpec := spec
 	retrySpec.Env = nil
-	if _, err := svc.recreateWasmDurableSandbox(ctx, id, "inc-1", retrySpec, nil); err != nil {
+	if _, err := svc.recreateWasmDurableSandbox(ctx, id, "inc-1", retrySpec, nil, 0); err != nil {
 		t.Fatalf("retry after a failed restore: %v", err)
 	}
 	if len(rt.rehydratedEnv) != 1 {
@@ -108,7 +108,7 @@ func TestRecreateWasmDurableSandboxRepairsMissingSealedEnvFromSpec(t *testing.T)
 		Durability: models.DurabilityDurable,
 		ModuleRef:  "file:///tmp/demo.wasm",
 		Env:        map[string]string{"TOKEN": "from-spec"},
-	}, nil); err != nil {
+	}, nil, 0); err != nil {
 		t.Fatalf("recreate with an unsealed row: %v", err)
 	}
 	if len(rt.rehydratedEnv) != 1 || rt.rehydratedEnv[0]["TOKEN"] != "from-spec" {
@@ -214,11 +214,11 @@ func TestRecreateWasmDurableSandboxWithoutEnvStaysEmpty(t *testing.T) {
 		ModuleRef:  "file:///tmp/demo.wasm",
 	}
 	rt.rehydrateErr = errors.New("restore boom")
-	if _, err := svc.recreateWasmDurableSandbox(ctx, id, "inc-1", spec, nil); err == nil {
+	if _, err := svc.recreateWasmDurableSandbox(ctx, id, "inc-1", spec, nil, 0); err == nil {
 		t.Fatal("seeded restore failure did not surface")
 	}
 	rt.rehydrateErr = nil
-	if _, err := svc.recreateWasmDurableSandbox(ctx, id, "inc-1", spec, nil); err != nil {
+	if _, err := svc.recreateWasmDurableSandbox(ctx, id, "inc-1", spec, nil, 0); err != nil {
 		t.Fatalf("retry without env: %v", err)
 	}
 	if len(rt.rehydratedEnv) != 1 || len(rt.rehydratedEnv[0]) != 0 {

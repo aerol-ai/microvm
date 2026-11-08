@@ -12,6 +12,7 @@ package createtiming
 
 import (
 	"context"
+	"strconv"
 	"sync"
 	"time"
 )
@@ -130,4 +131,49 @@ func (t *CreateTiming) Stages() []Stage {
 	out := make([]Stage, len(t.stages))
 	copy(out, t.stages)
 	return out
+}
+
+// FormatStage renders one stage as a Server-Timing entry
+// ("name;dur=12.3" or "name;dur=12.3;desc=hit"). Every place that writes a
+// create's Server-Timing uses it, so the router's stages and the owner's
+// parse the same way.
+func FormatStage(st Stage) string {
+	entry := st.Name + ";dur=" + strconv.FormatFloat(st.DurMS, 'f', 1, 64)
+	if st.Desc != "" {
+		entry += ";desc=" + st.Desc
+	}
+	return entry
+}
+
+// Clock splits one run of work into back-to-back stages: each Mark records
+// the time since the previous Mark (or since StartClock), so the stages of a
+// run add up to the time the run took, with no gap left unnamed.
+//
+// Boot-path (pr-review §2): StartClock on a context with no recorder returns
+// nil, and every method of a nil Clock returns at once without reading the
+// time, so a create nobody is timing pays nothing. A timed create pays one
+// time.Now and one RecordStage per Mark.
+type Clock struct {
+	timing *CreateTiming
+	last   time.Time
+}
+
+// StartClock starts a Clock on ctx's recorder, or returns nil when ctx
+// carries none.
+func StartClock(ctx context.Context) *Clock {
+	timing := From(ctx)
+	if timing == nil {
+		return nil
+	}
+	return &Clock{timing: timing, last: time.Now()}
+}
+
+// Mark records the time since the previous mark as stage name.
+func (c *Clock) Mark(name string) {
+	if c == nil {
+		return
+	}
+	now := time.Now()
+	c.timing.RecordStage(name, now.Sub(c.last))
+	c.last = now
 }

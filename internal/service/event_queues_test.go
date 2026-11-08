@@ -126,13 +126,21 @@ type recordedEvents struct {
 	mu   sync.Mutex
 	seen map[string][]string
 	hold map[string]chan struct{}
+	// taken, when set for a sandbox, is closed once its held event reaches
+	// the handler, so a test can wait for the worker to hold it.
+	taken map[string]chan struct{}
 }
 
 func (r *recordedEvents) handle(_ context.Context, ev docker.DockerEvent) {
 	r.mu.Lock()
 	gate := r.hold[ev.SandboxID]
 	delete(r.hold, ev.SandboxID)
+	taken := r.taken[ev.SandboxID]
+	delete(r.taken, ev.SandboxID)
 	r.mu.Unlock()
+	if taken != nil {
+		close(taken)
+	}
 	if gate != nil {
 		<-gate
 	}
@@ -149,8 +157,8 @@ func (r *recordedEvents) of(id string) []string {
 
 // TestSandboxEventQueuesOrderFoldAndBound: each sandbox's events run in
 // order; a held sandbox holds up only its own; a burst of OOM kills takes
-// one entry and every kill is still handled; a full queue makes only the
-// add for that sandbox wait, and nothing is dropped.
+// one entry and every kill is still handled; a full queue drops its oldest
+// pending entry and the add returns at once.
 func TestSandboxEventQueuesOrderFoldAndBound(t *testing.T) {
 	ctx := context.Background()
 	gate := make(chan struct{})
@@ -193,26 +201,37 @@ func TestSandboxEventQueuesOrderFoldAndBound(t *testing.T) {
 		t.Fatalf("b while a is held: %v", got)
 	}
 
-	// a's queue is full: an add for a waits, one that gives up says so.
+	// a's queue is full: an add for a does not wait. It drops the oldest
+	// pending entry (the five folded OOM kills) and is counted and reported.
+	var droppedAction string
+	var droppedTimes int
+	q.dropped = func(e docker.DockerEvent, times int) { droppedAction, droppedTimes = e.Action, times }
+	before := sandboxEventsDropped.Value()
 	gaveUp, cancel := context.WithCancel(ctx)
 	cancel()
 	if q.add(gaveUp, ev("a", "start", 9)) {
-		t.Fatal("an add to a full queue with a done context was taken")
+		t.Fatal("an add with a done context was taken")
 	}
 	added := make(chan bool, 1)
 	go func() { added <- q.add(ctx, ev("a", "start", 0)) }()
 	select {
-	case <-added:
-		t.Fatal("an add to a full queue did not wait for room")
-	case <-time.After(50 * time.Millisecond):
+	case ok := <-added:
+		if !ok {
+			t.Fatal("an add to a full queue was refused")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("an add to a full queue waited")
+	}
+	if droppedAction != "oom" || droppedTimes != 5 || sandboxEventsDropped.Value()-before != 5 {
+		t.Fatalf("dropped %q x%d (counter +%d), want the oldest entry: oom x5", droppedAction, droppedTimes, sandboxEventsDropped.Value()-before)
+	}
+	if n := q.pending("a"); n != 4 {
+		t.Fatalf("pending for a = %d, want the limit 4", n)
 	}
 
 	close(gate)
-	if !<-added {
-		t.Fatal("the waiting add was dropped")
-	}
 	q.wait()
-	want := []string{"die:1", "oom:0", "oom:0", "oom:0", "oom:0", "oom:0", "start:0", "die:2", "stop:0", "start:0"}
+	want := []string{"die:1", "start:0", "die:2", "stop:0", "start:0"}
 	if got := rec.of("a"); !slices.Equal(got, want) {
 		t.Fatalf("a handled %v, want %v", got, want)
 	}
@@ -244,7 +263,7 @@ func TestSandboxEventQueuesStopWithTheirContext(t *testing.T) {
 	events <- docker.DockerEvent{SandboxID: "a", Action: "stop"}
 	fed := make(chan struct{})
 	go func() {
-		svc.feedEvents(context.Background(), events, q) // waits for room in a
+		svc.feedEvents(context.Background(), events, q) // a is full: drops its oldest, then waits for more events
 		close(fed)
 	}()
 	time.Sleep(20 * time.Millisecond)
@@ -258,5 +277,63 @@ func TestSandboxEventQueuesStopWithTheirContext(t *testing.T) {
 	q.wait()
 	if got := rec.of("a"); !slices.Equal(got, []string{"die:0"}) {
 		t.Fatalf("handled after the context ended: %v", got)
+	}
+}
+
+// TestFeedEventsNeverWaitsForOneFullSandbox: one sandbox held by a long step
+// with a full queue must not hold up the stream loop. Before, the loop
+// waited for room in that queue, and every other sandbox's events waited
+// with it (up to restartStartTimeout).
+func TestFeedEventsNeverWaitsForOneFullSandbox(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	gate := make(chan struct{})
+	busyTaken := make(chan struct{})
+	rec := &recordedEvents{seen: map[string][]string{}, hold: map[string]chan struct{}{"busy": gate},
+		taken: map[string]chan struct{}{"busy": busyTaken}}
+	q := newSandboxEventQueues(ctx, 2, rec.handle)
+	events := make(chan docker.DockerEvent) // unbuffered: each send is taken by the loop
+	fed := make(chan struct{})
+	svc := &Service{}
+	go func() {
+		svc.feedEvents(ctx, events, q)
+		close(fed)
+	}()
+	send := func(e docker.DockerEvent) {
+		t.Helper()
+		select {
+		case events <- e:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("the stream loop did not take %s for %s: it is waiting on a full queue", e.Action, e.SandboxID)
+		}
+	}
+	// busy's first event holds its worker (the handler waits on gate);
+	// wait until the handler has it, so the queue holds only what comes
+	// after. Polling pending("busy") for 0 raced: send returns when the loop
+	// receives the event, before it is queued, so 0 could mean "not queued
+	// yet" and the burst below then dropped start:0 as the oldest entry.
+	send(docker.DockerEvent{SandboxID: "busy", Action: "start", ExitCode: 0})
+	select {
+	case <-busyTaken:
+	case <-time.After(2 * time.Second):
+		t.Fatal("busy's first event never reached its handler")
+	}
+	for i := 1; i < 10; i++ { // far past busy's limit of 2
+		send(docker.DockerEvent{SandboxID: "busy", Action: "start", ExitCode: i})
+	}
+	send(docker.DockerEvent{SandboxID: "other", Action: "die", ExitCode: 7})
+	deadline := time.Now().Add(2 * time.Second)
+	for len(rec.of("other")) == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if got := rec.of("other"); !slices.Equal(got, []string{"die:7"}) {
+		t.Fatalf("other sandbox while busy is held with a full queue: %v", got)
+	}
+	close(gate)
+	close(events)
+	<-fed
+	q.wait()
+	if got := rec.of("busy"); len(got) != 3 || got[0] != "start:0" || got[2] != "start:9" {
+		t.Fatalf("busy handled %v, want its first event and the newest two", got)
 	}
 }

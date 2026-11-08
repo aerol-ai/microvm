@@ -39,6 +39,11 @@ type ReassignStuckRequest struct {
 	// IncarnationID fences the request against a placement that has already
 	// moved on since this node last read it.
 	IncarnationID string `json:"incarnation_id,omitempty"`
+	// CapacityRefused says this node's admitter refused the recreate for
+	// room. With no other node to take it, the leader then orphans the
+	// placement rather than leave it here, where it cannot run. A server that
+	// predates the field ignores it and keeps the placement here, as before.
+	CapacityRefused bool `json:"capacity_refused,omitempty"`
 }
 
 // ErrStuckReassignNotOwner rejects a reassignment request from a node that is
@@ -186,10 +191,10 @@ func (a *Agent) fetchOwnedRecoveryPage(ctx context.Context, pageToken string) (O
 // reassignment for a sandbox this worker keeps failing to recreate. The worker
 // deliberately does not choose the target: that needs drain state, pending
 // reservations and capacity leases the FSM owns.
-func (a *Agent) requestReassignStuckPlacement(ctx context.Context, id string, p Placement) {
+func (a *Agent) requestReassignStuckPlacement(ctx context.Context, id string, p Placement, cause error) {
 	reqCtx, cancel := context.WithTimeout(ctx, controlPlaneRequestTimeout)
 	defer cancel()
-	body := ReassignStuckRequest{SandboxID: id, IncarnationID: strings.TrimSpace(p.IncarnationID)}
+	body := ReassignStuckRequest{SandboxID: id, IncarnationID: strings.TrimSpace(p.IncarnationID), CapacityRefused: refusedForCapacity(cause)}
 	if err := a.doControlPlaneJSON(reqCtx, http.MethodPost, PublicInternalReassignStuckPath, PublicInternalReassignStuckPath, body, nil); err != nil {
 		a.logger.Warn("cluster agent: reassign request for stuck placement failed; will retry",
 			"sandbox_id", id, "err", err)
@@ -265,7 +270,9 @@ func (c *Cluster) OwnedRecoveryPlacements(ownerID string, limit int, pageToken s
 // ReassignStuckPlacement runs the leader's stuck-placement reassignment on
 // behalf of a worker that cannot recreate a sandbox it owns. requesterID is
 // the mTLS-authenticated caller; only the current owner may ask.
-func (c *Cluster) ReassignStuckPlacement(ctx context.Context, requesterID, sandboxID, incarnationID string) error {
+// capacityRefused is the worker's word that its admitter had no room: then a
+// placement no other node can take is handed back (handBackRefusedPlacement).
+func (c *Cluster) ReassignStuckPlacement(ctx context.Context, requesterID, sandboxID, incarnationID string, capacityRefused bool) error {
 	requesterID = strings.TrimSpace(requesterID)
 	sandboxID = strings.TrimSpace(sandboxID)
 	if c == nil || c.fsm == nil {
@@ -290,5 +297,8 @@ func (c *Cluster) ReassignStuckPlacement(ctx context.Context, requesterID, sandb
 	// failure counter driving its escalation, so answering success for a
 	// move that did not happen turns a stuck sandbox into an endless local
 	// retry loop with no escalation left.
+	if capacityRefused {
+		return c.handBackRefusedPlacement(ctx, sandboxID, p)
+	}
 	return c.tryReassignStuckPlacement(ctx, sandboxID, p)
 }
