@@ -315,9 +315,9 @@ locals {
   # containerd.pool block. Mirrors docker_pool_cfg, including the try()
   # fallbacks equal to config.go's defaults, so an older cluster.yml with no
   # containerd.pool block renders the pool off rather than failing the plan.
-  # It is written even on a docker-engine node: sandboxd ignores it there
-  # (ContainerdPoolEffective needs the containerd engine), and one unconditional
-  # block keeps Terraform and Ansible rendering the same env on every node.
+  # bootstrap.sh.tftpl writes these lines only when enabled is "true": off
+  # must leave the rendered user_data unchanged, or the next apply replaces
+  # every node (user_data_replace_on_change). Ansible applies the same rule.
   containerd_pool_cfg = {
     enabled         = try(local.cluster_ops.containerd.pool.enabled, false) ? "true" : "false"
     depth           = tostring(try(local.cluster_ops.containerd.pool.depth, 2))

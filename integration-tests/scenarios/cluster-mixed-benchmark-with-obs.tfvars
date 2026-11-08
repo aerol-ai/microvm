@@ -46,24 +46,16 @@ caddy_shared_cert_storage = {
 # (network) pool is already on by default (containerd.native_netns_pool_enabled).
 # NOTE: warm slots hold capacity, so UC-95 density is measured with the pool
 # resident (Perf-1 -p 1 keeps sims off the density window).
-#
-# The pool settings ride extra_sandboxd_env, not an echo into sandboxd.env:
-# the bootstrap now writes SB_CONTAINERD_POOL_* (off by default) into
-# cluster.env, which systemd loads after sandboxd.env, so a sandboxd.env line
-# would silently lose. extra_sandboxd_env renders last in cluster.env and wins.
-extra_sandboxd_env = {
-  SB_CONTAINERD_POOL_ENABLED         = "true"
-  SB_CONTAINERD_POOL_IMAGES          = "alpine:3.20"
-  SB_CONTAINERD_POOL_DEPTH           = "8"
-  SB_CONTAINERD_POOL_REFILL_INTERVAL = "2s"
-}
-
 nodes = {
   node1 = {
     role            = "mixed", seed = true, spot = false
     extra_user_data = <<-EOT
       echo 'SB_WASM_RESIDENT_HOST_ENABLED=true' | sudo tee -a /etc/sandboxd/cluster.env >/dev/null
       echo 'SB_ISOLATE_USE_JAIL=false' | sudo tee -a /etc/sandboxd/sandboxd.env >/dev/null
+      echo 'SB_CONTAINERD_POOL_ENABLED=true' | sudo tee -a /etc/sandboxd/sandboxd.env >/dev/null
+      echo 'SB_CONTAINERD_POOL_IMAGES=alpine:3.20' | sudo tee -a /etc/sandboxd/sandboxd.env >/dev/null
+      echo 'SB_CONTAINERD_POOL_DEPTH=8' | sudo tee -a /etc/sandboxd/sandboxd.env >/dev/null
+      echo 'SB_CONTAINERD_POOL_REFILL_INTERVAL=2s' | sudo tee -a /etc/sandboxd/sandboxd.env >/dev/null
       sudo systemctl restart sandboxd
     EOT
   }
@@ -72,6 +64,10 @@ nodes = {
     extra_user_data = <<-EOT
       echo 'SB_WASM_RESIDENT_HOST_ENABLED=true' | sudo tee -a /etc/sandboxd/cluster.env >/dev/null
       echo 'SB_ISOLATE_USE_JAIL=false' | sudo tee -a /etc/sandboxd/sandboxd.env >/dev/null
+      echo 'SB_CONTAINERD_POOL_ENABLED=true' | sudo tee -a /etc/sandboxd/sandboxd.env >/dev/null
+      echo 'SB_CONTAINERD_POOL_IMAGES=alpine:3.20' | sudo tee -a /etc/sandboxd/sandboxd.env >/dev/null
+      echo 'SB_CONTAINERD_POOL_DEPTH=8' | sudo tee -a /etc/sandboxd/sandboxd.env >/dev/null
+      echo 'SB_CONTAINERD_POOL_REFILL_INTERVAL=2s' | sudo tee -a /etc/sandboxd/sandboxd.env >/dev/null
       sudo systemctl restart sandboxd
     EOT
   }
@@ -80,6 +76,10 @@ nodes = {
     extra_user_data = <<-EOT
       echo 'SB_WASM_RESIDENT_HOST_ENABLED=true' | sudo tee -a /etc/sandboxd/cluster.env >/dev/null
       echo 'SB_ISOLATE_USE_JAIL=false' | sudo tee -a /etc/sandboxd/sandboxd.env >/dev/null
+      echo 'SB_CONTAINERD_POOL_ENABLED=true' | sudo tee -a /etc/sandboxd/sandboxd.env >/dev/null
+      echo 'SB_CONTAINERD_POOL_IMAGES=alpine:3.20' | sudo tee -a /etc/sandboxd/sandboxd.env >/dev/null
+      echo 'SB_CONTAINERD_POOL_DEPTH=8' | sudo tee -a /etc/sandboxd/sandboxd.env >/dev/null
+      echo 'SB_CONTAINERD_POOL_REFILL_INTERVAL=2s' | sudo tee -a /etc/sandboxd/sandboxd.env >/dev/null
       sudo systemctl restart sandboxd
     EOT
   }

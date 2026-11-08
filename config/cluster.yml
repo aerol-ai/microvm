@@ -148,6 +148,10 @@ containerd:
   # node is full) and one netns slot, so depth × images must fit next to real
   # sandboxes. Only acts when container_engine is containerd and the ready
   # socket is on (SB_DOCKER_READY_SOCKET_ENABLED, on by default).
+  # Off writes nothing to the nodes, so the default leaves every node's
+  # Terraform bootstrap unchanged. Turning it on changes that bootstrap, and
+  # nodes use user_data_replace_on_change: on a running cluster the next
+  # apply replaces every node. configure-ops.yml changes running nodes in place.
   pool:
     enabled: false
     # Warm slots kept per pinned image.

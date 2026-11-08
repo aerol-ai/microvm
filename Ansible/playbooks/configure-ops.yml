@@ -148,12 +148,15 @@
       SB_CONTAINERD_NAMESPACE: "{{ containerd.namespace | default('aerolvm') }}"
       SB_CONTAINERD_CNI_PLUGIN_DIR: "{{ containerd.cni_plugin_dir | default('/opt/cni/bin') }}"
       SB_CONTAINERD_NATIVE_NETNS_POOL_ENABLED: "{{ containerd.native_netns_pool_enabled | default(true) | bool | string | lower }}"
-      # containerd warm container pool (park + adopt). Off by default; defaults
-      # mirror config.go and Terraform's containerd_pool_cfg so day-0 and day-2
-      # render identically. On a cluster node this lands in cluster.env, which
-      # loads after sandboxd.env, so a value hand-set in sandboxd.env no longer
-      # wins: turn the pool on in config/cluster.yml.
-      SB_CONTAINERD_POOL_ENABLED: "{{ containerd.pool.enabled | default(false) | bool | string | lower }}"
+
+    # containerd warm container pool (park + adopt). Kept out of
+    # sandboxd_ops_env because it is written only when containerd.pool.enabled
+    # is true, the same rule as Terraform's bootstrap: off writes nothing, so a
+    # value an operator set by hand in sandboxd.env is not overridden by an
+    # explicit false in cluster.env (which loads after it). Defaults mirror
+    # config.go and Terraform's containerd_pool_cfg.
+    sandboxd_containerd_pool_env:
+      SB_CONTAINERD_POOL_ENABLED: "true"
       SB_CONTAINERD_POOL_DEPTH: "{{ containerd.pool.depth | default(2) | int }}"
       SB_CONTAINERD_POOL_IMAGES: "{{ containerd.pool.images | default([]) | join(',') }}"
       SB_CONTAINERD_POOL_MAX_IMAGES: "{{ containerd.pool.max_images | default(8) | int }}"
@@ -791,6 +794,23 @@
         owner: root
         group: root
       loop: "{{ sandboxd_ops_env | dict2items }}"
+      notify: Apply sandboxd ops config
+
+    # Only when the pool is on (see sandboxd_containerd_pool_env). Off writes
+    # nothing, so turning the pool back off does not remove lines an earlier
+    # run wrote: delete the SB_CONTAINERD_POOL_* lines from the env file (or
+    # set SB_CONTAINERD_POOL_ENABLED=false there) and restart sandboxd.
+    - name: Write containerd warm pool env vars
+      when: containerd.pool.enabled | default(false) | bool
+      ansible.builtin.lineinfile:
+        path: "{{ sandboxd_ops_env_file }}"
+        regexp: "^{{ item.key }}="
+        line: "{{ item.key }}={{ item.value }}"
+        create: false
+        mode: "0600"
+        owner: root
+        group: root
+      loop: "{{ sandboxd_containerd_pool_env | dict2items }}"
       notify: Apply sandboxd ops config
 
     # Only ever written, never removed: an empty sandboxd_node_id leaves the

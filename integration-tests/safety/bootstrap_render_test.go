@@ -287,12 +287,27 @@ func TestBootstrapRendersExtraSandboxdEnvBeforeRestart(t *testing.T) {
 // renderBootstrap is the shared setup for the ordering/gating assertions below.
 func renderBootstrap(t *testing.T, output string) string {
 	t.Helper()
+	return renderBootstrapOutputs(t, bootstrapTemplatePath(t), output)[output]
+}
+
+func bootstrapTemplatePath(t *testing.T) string {
+	t.Helper()
+	repoRoot := filepath.Join(filepath.Dir(buildScript(t)), "..", "..")
+	tplPath, err := filepath.Abs(filepath.Join(repoRoot, "Terraform", "templates", "bootstrap.sh.tftpl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return tplPath
+}
+
+// renderBootstrapOutputs renders the fixture against tplPath once and returns
+// the named outputs, so a test can compare two templates branch by branch.
+func renderBootstrapOutputs(t *testing.T, tplPath string, outputs ...string) map[string]string {
+	t.Helper()
 	tf, err := exec.LookPath("terraform")
 	if err != nil {
 		t.Skip("terraform not on PATH")
 	}
-	repoRoot := filepath.Join(filepath.Dir(buildScript(t)), "..", "..")
-	tplPath, _ := filepath.Abs(filepath.Join(repoRoot, "Terraform", "templates", "bootstrap.sh.tftpl"))
 	// See TestBootstrapTemplateRenders: reading the template is what keeps
 	// Go's test cache honest about a terraform subprocess's inputs.
 	if _, err := os.ReadFile(tplPath); err != nil {
@@ -320,11 +335,15 @@ func renderBootstrap(t *testing.T, output string) string {
 	if out, err := run("apply", "-auto-approve", "-input=false"); err != nil {
 		t.Fatalf("apply: %v\n%s", err, out)
 	}
-	out, err := run("output", "-raw", output)
-	if err != nil {
-		t.Fatalf("output %s: %v\n%s", output, err, out)
+	rendered := make(map[string]string, len(outputs))
+	for _, output := range outputs {
+		out, err := run("output", "-raw", output)
+		if err != nil {
+			t.Fatalf("output %s: %v\n%s", output, err, out)
+		}
+		rendered[output] = out
 	}
-	return out
+	return rendered
 }
 
 // pat_scope and l4_proxy_protocol are install.sh flags (plans/identity-and-
@@ -428,17 +447,11 @@ func TestBootstrapKMSBlockPrecedesEnvOverride(t *testing.T) {
 	}
 }
 
-// The containerd warm pool reaches a Terraform node only through these lines:
-// run.sh's containerd-pool capability writes containerd.pool into cluster.yml,
-// and without the template the flag would silently do nothing. The default
-// render must keep the pool off. A per-node sandboxd_env must still win,
-// because cluster.env loads after sandboxd.env, so sandboxd_env is now the
-// only way a scenario can change these values without a second restart.
-func TestBootstrapRendersContainerdPoolEnv(t *testing.T) {
-	if off := renderBootstrap(t, "joiner"); !strings.Contains(off, "SB_CONTAINERD_POOL_ENABLED=x") {
-		t.Fatal("default render is missing the containerd pool block")
-	}
-
+// With containerd.pool.enabled true the six pool lines reach cluster.env:
+// without them run.sh's containerd-pool capability would silently do nothing.
+// A node's sandboxd_env must still render after them, so a scenario can
+// override one value without a second restart.
+func TestBootstrapRendersContainerdPoolEnvWhenEnabled(t *testing.T) {
 	out := renderBootstrap(t, "joiner_containerd_pool")
 	for _, want := range []string{
 		"SB_CONTAINERD_POOL_ENABLED=true\n",
@@ -462,6 +475,60 @@ func TestBootstrapRendersContainerdPoolEnv(t *testing.T) {
 	if !(cfg < override && override < tee) {
 		t.Fatalf("sandboxd_env must render after the containerd pool block and before the cluster.env write; got cfg=%d override=%d tee=%d",
 			cfg, override, tee)
+	}
+}
+
+// With the pool off (the default) the template must add not one byte to any
+// node's bootstrap. Nodes use user_data_replace_on_change, so a changed
+// rendering replaces every node of a running cluster on the next apply; and
+// an explicit "false" in cluster.env, which loads after sandboxd.env, would
+// override a value an operator set by hand there.
+//
+// The check renders every pool-off branch twice, from the real template and
+// from a copy with the whole %{ if containerd_pool_cfg.enabled } block cut
+// out (which is what the template was before the block existed), and wants
+// the two byte for byte equal. That catches a stray line outside the block
+// and a lost ~ strip marker leaving a blank line behind.
+func TestBootstrapContainerdPoolOffRendersNothing(t *testing.T) {
+	tplPath := bootstrapTemplatePath(t)
+	raw, err := os.ReadFile(tplPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const open = "%{ if containerd_pool_cfg.enabled == \"true\" ~}\n"
+	const closeTag = "%{ endif ~}\n"
+	start := strings.Index(string(raw), open)
+	if start < 0 {
+		t.Fatalf("template has no %q block; the pool lines must be gated on it", strings.TrimSpace(open))
+	}
+	end := strings.Index(string(raw)[start:], closeTag)
+	if end < 0 {
+		t.Fatal("containerd pool block has no closing endif")
+	}
+	without := string(raw)[:start] + string(raw)[start+end+len(closeTag):]
+	if strings.Contains(without, "containerd_pool_cfg") {
+		t.Fatal("containerd_pool_cfg is referenced outside its enabled block, so pool-off still renders it")
+	}
+	strippedPath := filepath.Join(t.TempDir(), "bootstrap.sh.tftpl")
+	if err := os.WriteFile(strippedPath, []byte(without), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	offBranches := []string{
+		"seed", "joiner", "joiner_kms", "joiner_audit_s3", "joiner_audit_file",
+		"seed_receiver", "joiner_receiver", "seed_public_ca", "seed_wrapped",
+		"joiner_api_lb", "joiner_api_lb_worker", "joiner_identity_flags",
+	}
+	got := renderBootstrapOutputs(t, tplPath, offBranches...)
+	want := renderBootstrapOutputs(t, strippedPath, offBranches...)
+	for _, branch := range offBranches {
+		if strings.Contains(got[branch], "SB_CONTAINERD_POOL_") {
+			t.Errorf("%s: pool-off bootstrap writes SB_CONTAINERD_POOL_* lines", branch)
+		}
+		if got[branch] != want[branch] {
+			t.Errorf("%s: pool-off bootstrap differs from the template without the pool block (%d vs %d bytes), so the next apply on a running cluster would replace every node",
+				branch, len(got[branch]), len(want[branch]))
+		}
 	}
 }
 

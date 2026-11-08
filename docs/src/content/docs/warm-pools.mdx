@@ -18,7 +18,7 @@ Warm pools are off by default. A server keeps waiting sandboxes only when its op
 
 Both also need the ready socket, which is on unless the operator set `SB_DOCKER_READY_SOCKET_ENABLED=false`. A server with the pool off keeps your entries but warms nothing. Its settings `SB_DOCKER_POOL_DEPTH` and `SB_DOCKER_POOL_IMAGES` (or the `SB_CONTAINERD_POOL_*` ones) stay the default for every image that has no entry.
 
-On a cluster, turn the pool on in `config/cluster.yml`, not on each server: set `docker.pool.enabled` or `containerd.pool.enabled` to `true`. Terraform writes it to new servers, and `configure-ops.yml` pushes it to running ones. On containerd, each waiting sandbox uses about 13 MB of memory.
+On a cluster, turn the pool on in `config/cluster.yml`, not on each server: set `docker.pool.enabled` or `containerd.pool.enabled` to `true`. Then run `configure-ops.yml` to push it to running servers. Terraform also writes it into each server's setup script, so the next Terraform `apply` replaces every server of a running cluster. If you can, turn it on before the first `apply`. On containerd, each waiting sandbox uses about 13 MB of memory.
 
 ## Add an entry
 

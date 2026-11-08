@@ -54,21 +54,16 @@ nodes = {
   # container creates adopt a ready task instead of paying engine create+start —
   # best-case latency. The netns (network) pool is already on by default
   # (config/cluster.yml containerd.native_netns_pool_enabled: true).
-  # The pool rides sandboxd_env, not an echo into sandboxd.env: the bootstrap
-  # writes SB_CONTAINERD_POOL_* (off by default) into cluster.env, which
-  # systemd loads after sandboxd.env, so a sandboxd.env line would lose.
   worker-c = {
     role = "worker", spot = false
     instance_type = "c5.metal", volume_size_gb = 80
     volume_iops = 8000, volume_throughput = 250
-    sandboxd_env = {
-      SB_CONTAINERD_POOL_ENABLED         = "true"
-      SB_CONTAINERD_POOL_IMAGES          = "alpine:3.20"
-      SB_CONTAINERD_POOL_DEPTH           = "8"
-      SB_CONTAINERD_POOL_REFILL_INTERVAL = "2s"
-    }
     extra_user_data = <<-EOT
       echo 'SB_WASM_RESIDENT_HOST_ENABLED=false' | sudo tee -a /etc/sandboxd/cluster.env >/dev/null || true
+      echo 'SB_CONTAINERD_POOL_ENABLED=true' | sudo tee -a /etc/sandboxd/sandboxd.env >/dev/null || true
+      echo 'SB_CONTAINERD_POOL_IMAGES=alpine:3.20' | sudo tee -a /etc/sandboxd/sandboxd.env >/dev/null || true
+      echo 'SB_CONTAINERD_POOL_DEPTH=8' | sudo tee -a /etc/sandboxd/sandboxd.env >/dev/null || true
+      echo 'SB_CONTAINERD_POOL_REFILL_INTERVAL=2s' | sudo tee -a /etc/sandboxd/sandboxd.env >/dev/null || true
       sudo systemctl restart sandboxd || true
     EOT
   }
