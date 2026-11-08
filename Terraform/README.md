@@ -112,12 +112,28 @@ Per-node fields:
 | `ami_id`            | latest Ubuntu 22.04 LTS amd64    |                                                  |
 | `with_firecracker`  | `var.default_with_firecracker`   | worker-capable nodes only; writes `SB_ENABLE_FIRECRACKER` and optional host downloads |
 | `with_gvisor`       | `var.default_with_gvisor`        | adds `--with-gvisor` to install.sh               |
-| `ingress_proxy_routing` | `var.default_ingress_proxy_routing` | adds `--ingress-proxy-routing` to install.sh |
+| `ingress_proxy_routing` | `var.default_ingress_proxy_routing` | `true` adds `--ingress-proxy-routing` to install.sh; `false` adds nothing (see below) |
 | `with_nvidia_gpu`   | `var.default_with_nvidia_gpu`    | adds `--with-nvidia-gpu` (driver must be loaded) |
 | `with_amd_gpu`      | `var.default_with_amd_gpu`       | adds `--with-amd-gpu` (x86_64 only)              |
 | `idle_timeout_min`  | `var.default_idle_timeout_min`   | sandbox auto-stop minutes; 0 disables            |
 | `extra_user_data`   | `""`                             | shell, appended to bootstrap                     |
 | `tags`              | `{}`                             |                                                  |
+
+**Ingress proxy routing.** New clusters should set
+`default_ingress_proxy_routing = true`. An expose or a destroy then writes
+nothing to Caddy, so it never reloads Caddy and drops new connections
+(`plans/ingress-proxy-routing.md`). The module's default stays `false` on
+purpose: nodes have `user_data_replace_on_change = true`, so a changed
+default rewrites every node's user data and replaces every node of a running
+cluster on the next `terraform apply`. Note that `false` adds no installer
+flag, and install.sh now turns routing on by default for a `--domain`
+install. A node this module creates after that install.sh release (a new
+cluster, a scale-out, a replaced node) therefore comes up with routing on
+even when the variable says `false`; the nodes already running keep the
+value their install wrote. To keep new nodes off, set
+`SB_INGRESS_PROXY_ROUTING = "false"` in `extra_sandboxd_env` (or one node's
+`sandboxd_env`); that too changes user data, so it replaces the nodes it
+applies to.
 
 **Ingress tier size.** Up to 10 ingress-capable nodes (`ingress`, any hybrid
 containing it, or `mixed`) work behind the Cloudflare records this module

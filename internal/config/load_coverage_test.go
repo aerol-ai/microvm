@@ -135,14 +135,15 @@ func TestLoad_ValidationErrors(t *testing.T) {
 			env:  map[string]string{"SB_L4_PORT_RANGE_START": "999", "SB_L4_PORT_RANGE_END": "1000"},
 			want: "invalid SB_L4_PORT_RANGE_START/END",
 		},
+		// Domain mode: the flag applies there, and it is on by default.
 		{
 			name: "hostport redirect port inside the l4 pool",
-			env:  map[string]string{"SB_INGRESS_PROXY_ROUTING": "true", "SB_HOSTPORT_REDIRECT_PORT": "22500"},
+			env:  map[string]string{"SB_DOMAIN": "sandbox.example.com", "SB_HOSTPORT_REDIRECT_PORT": "22500"},
 			want: "invalid SB_HOSTPORT_REDIRECT_PORT 22500",
 		},
 		{
 			name: "hostport redirect port out of range",
-			env:  map[string]string{"SB_INGRESS_PROXY_ROUTING": "true", "SB_HOSTPORT_REDIRECT_PORT": "0"},
+			env:  map[string]string{"SB_DOMAIN": "sandbox.example.com", "SB_INGRESS_PROXY_ROUTING": "true", "SB_HOSTPORT_REDIRECT_PORT": "0"},
 			want: "invalid SB_HOSTPORT_REDIRECT_PORT 0",
 		},
 		{
@@ -398,6 +399,64 @@ func TestLoad_ValidationErrors(t *testing.T) {
 				t.Fatalf("err = %v, want substring %q", err, tc.want)
 			}
 		})
+	}
+}
+
+// SB_INGRESS_PROXY_ROUTING defaults on where it applies, a node with Caddy
+// and a domain, and is cleared where it cannot apply (plans/cluster-phase-2.md
+// §4.3), so a local or IP-mode node never refuses it at boot.
+func TestLoad_IngressProxyRoutingDefault(t *testing.T) {
+	const domain = "sandbox.example.com"
+	cases := []struct {
+		name string
+		env  map[string]string
+		want bool
+	}{
+		{"domain mode: on by default", map[string]string{"SB_DOMAIN": domain}, true},
+		{"domain mode, turned off", map[string]string{"SB_DOMAIN": domain, "SB_INGRESS_PROXY_ROUTING": "false"}, false},
+		{"IP mode: not applicable", map[string]string{"SB_PUBLIC_HOST": "203.0.113.10"}, false},
+		{"IP mode, set on: still not applicable", map[string]string{"SB_PUBLIC_HOST": "203.0.113.10", "SB_INGRESS_PROXY_ROUTING": "true"}, false},
+		{"Caddy off (local mode): not applicable", map[string]string{"SB_DOMAIN": domain, "SB_ENABLE_CADDY": "false"}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("SB_PAT_TOKEN", "operator-pat")
+			t.Setenv("SB_DOMAIN", "")
+			for k, v := range tc.env {
+				t.Setenv(k, v)
+			}
+			cfg, err := Load()
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			if cfg.IngressProxyRouting != tc.want {
+				t.Fatalf("IngressProxyRouting = %v, want %v", cfg.IngressProxyRouting, tc.want)
+			}
+			if cfg.IngressProxyRoutingApplies() != (cfg.EnableCaddy && cfg.Domain != "") {
+				t.Fatalf("IngressProxyRoutingApplies = %v with caddy=%v domain=%q", cfg.IngressProxyRoutingApplies(), cfg.EnableCaddy, cfg.Domain)
+			}
+			// The redirect listener is a control port only where it opens.
+			hasRedirect := false
+			for _, p := range cfg.NodeControlPorts() {
+				hasRedirect = hasRedirect || int(p) == cfg.HostPortRedirectPort
+			}
+			if hasRedirect != tc.want {
+				t.Fatalf("redirect port %d guarded = %v, want %v", cfg.HostPortRedirectPort, hasRedirect, tc.want)
+			}
+		})
+	}
+}
+
+// Before the default flip, a node off domain mode never had the flag on, so
+// a redirect port inside its L4 range was harmless. Clearing the flag before
+// that check keeps such a node booting: it will never open the listener.
+func TestLoad_IngressProxyRoutingNotApplicableSkipsRedirectPortCheck(t *testing.T) {
+	t.Setenv("SB_PAT_TOKEN", "operator-pat")
+	t.Setenv("SB_DOMAIN", "")
+	t.Setenv("SB_PUBLIC_HOST", "203.0.113.10")
+	t.Setenv("SB_HOSTPORT_REDIRECT_PORT", "22500")
+	if _, err := Load(); err != nil {
+		t.Fatalf("Load refused an IP-mode node over a listener it never opens: %v", err)
 	}
 }
 

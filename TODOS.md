@@ -153,7 +153,7 @@ Every entry was re-verified against `main` at `704c9e74` on 2026-10-06.
   `secret_audit_index.go`. An E2b witness sink may double as the central
   store.
 
-## Ingress route changes reset in-flight TLS connections on :443 — IMPLEMENTED behind `SB_INGRESS_PROXY_ROUTING`; default flip pending
+## Ingress route changes reset in-flight TLS connections on :443 — IMPLEMENTED behind `SB_INGRESS_PROXY_ROUTING`; default on (Go + install.sh), Terraform still off
 
 - **Shipped 2026-09-28 (#503–#512, released in v0.6.0; design in
   `plans/ingress-proxy-routing.md`):** a static Caddy config, with sandboxd
@@ -171,17 +171,27 @@ Every entry was re-verified against `main` at `704c9e74` on 2026-10-06.
   - UC-172: established sessions survive sandboxd restarts on the ingress
     and the owner.
   - UC-173: no per-sandbox Caddy routes on any node.
-- **Still off by default everywhere (2026-10-06):**
-  `internal/config/config.go:1781`, `setup/config-defaults.md:177`,
-  `Terraform/variables.tf:379-383`, `scripts/install.sh:29`. Only the two
-  t3.medium `-routing` scenarios turn it on. The 2026-10-04 cluster-hetero
-  run behind #595 ran with it off.
-- **Remaining before the default flips on:** a green run of
-  `cluster-bank-flagship` (the metal flagship), which now runs with the flag
-  on and carries the routing gate plus UC-357, and a latency/throughput A/B
-  against the flag-off flagship runs (`plans/ingress-proxy-routing.md:300-301`,
-  `:494-496`). Then the flip is `default_ingress_proxy_routing = true` in
-  `Terraform/variables.tf` plus the `setup/config-defaults.md` row.
+- **The gate moved (`plans/cluster-phase-2.md` §4.2):** from the metal
+  flagship to `cluster-hetero-lite-routing` (8 × t3.medium), with the test
+  binary on one of its server nodes rather than a laptop, so neither the
+  laptop's network nor its SSH and DNS blips are in the numbers
+  (`integration-tests/scripts/run-on-node.sh`). Churn: UC-171 and UC-357
+  with 0 failed connections. A/B: UC-171 records expose-to-first-200 and
+  p50/p99 of fresh-connection requests; run it flag on, flip every node off
+  (`integration-tests/scripts/routing-ab.sh <scenario> off`), run again, flip
+  back, and repeat the pair once (t3 CPU credits add noise). Pass: flag-on
+  p50/p99 no worse than flag-off beyond that noise. The commands are in
+  `integration-tests/README.md`, "Routing gate from inside the VPC".
+- **Default on where it applies:** `internal/config/config.go` defaults the
+  flag on and clears it on a node without a Caddy domain (no ERROR, no
+  probe). `scripts/install.sh` turns it on for a `--domain` install
+  (`--no-ingress-proxy-routing` for off). **Terraform still defaults it
+  off** (`default_ingress_proxy_routing`): changing the default would
+  replace every node of a running cluster (`user_data_replace_on_change`).
+  New clusters set it true. Because `false` adds no installer flag, nodes
+  Terraform creates after the install.sh change come up on anyway; whether
+  to keep that, render an explicit off for `false`, or make the variable
+  nullable is open (`plans/cluster-phase-2.md` §8, question 1).
 - **Why it matters (cluster-bank-flagship, 2026-11-01, flag off):** UC-230
   and UC-266 exec-stream dials failed with `unexpected EOF`, 1 run in 20.
   Every create or destroy anywhere in the cluster made both dedicated
@@ -302,8 +312,9 @@ Every entry was re-verified against `main` at `704c9e74` on 2026-10-06.
   **Cons:** it removes the rollback lever, so do it only after a soak at
   default-on.
 - **Context:** `plans/ingress-proxy-routing.md` §3.6.
-- **Depends on:** `SB_INGRESS_PROXY_ROUTING` defaulting to true (still
-  false, see above), plus a soak of about one release cycle.
+- **Depends on:** `SB_INGRESS_PROXY_ROUTING` defaulting to true (on in Go
+  and install.sh, still off in Terraform, see above), plus a soak of about
+  one release cycle.
 
 ## Warm-adopted (`park-*`) destroys fall to reconcile (containerd)
 

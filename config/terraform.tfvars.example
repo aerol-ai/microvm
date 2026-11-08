@@ -59,6 +59,15 @@ default_volume_type       = "gp3"
 # default_with_nvidia_gpu  = false   # adds --with-nvidia-gpu (driver must be loaded)
 # default_with_amd_gpu     = false   # adds --with-amd-gpu (x86_64 only)
 # default_idle_timeout_min = 0       # sandbox auto-stop minutes; 0 disables
+#
+# Ingress proxy routing: an expose or destroy writes nothing to Caddy, so it
+# never reloads Caddy and drops new connections. New clusters: set it true.
+# The default stays false only because changing a default rewrites every
+# node's user data, and a node whose user data changes is replaced
+# (user_data_replace_on_change). false adds no installer flag, and
+# install.sh turns routing on for a domain install by default, so new nodes
+# come up on anyway; Terraform/README.md says how to keep them off.
+# default_ingress_proxy_routing = true   # adds --ingress-proxy-routing
 
 # Firecracker host onboarding. URLs are optional: set them to let Terraform
 # bootstrap download the firecracker/jailer/kernel artifacts, or leave them

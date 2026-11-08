@@ -431,7 +431,7 @@ variable "default_with_isolate" {
 }
 
 variable "default_ingress_proxy_routing" {
-  description = "Route sandboxes without per-sandbox Caddy writes (plans/ingress-proxy-routing.md): install.sh --ingress-proxy-routing writes SB_INGRESS_PROXY_ROUTING=true and routes *.rt.internal to the sandboxd route responder. Per-node, no flag-day; per-node override via nodes[*].ingress_proxy_routing. Default off (setup/config-defaults.md)."
+  description = "Route sandboxes without per-sandbox Caddy writes (plans/ingress-proxy-routing.md): true adds install.sh --ingress-proxy-routing, which writes SB_INGRESS_PROXY_ROUTING=true and routes *.rt.internal to the sandboxd route responder. false adds no flag, so the node gets install.sh's own default, which is on for a domain install (Terraform/README.md, \"Ingress proxy routing\"). New clusters should set true. The default stays false because changing it would replace every node of a running cluster (user_data_replace_on_change). Per-node, no flag-day; per-node override via nodes[*].ingress_proxy_routing."
   type        = bool
   default     = false
 }

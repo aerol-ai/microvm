@@ -1207,8 +1207,11 @@ type Config struct {
 	// IngressProxyRouting enables routing without per-sandbox Caddy writes
 	// (plans/ingress-proxy-routing.md): static Caddy routes, a sandboxd route
 	// responder, and on ingress Agents a versioned placement delta feed
-	// instead of the 5s full page-walk. Default off; per-node; rationale in
+	// instead of the 5s full page-walk. Default on; per-node; rationale in
 	// setup/config-defaults.md. SB_INGRESS_PROXY_ROUTING.
+	//
+	// Load clears it on a node it cannot apply to (no Caddy domain, see
+	// IngressProxyRoutingApplies), so every reader sees it off there.
 	IngressProxyRouting bool
 	// ClusterOwnerCache turns on the owner cache on worker and ingress nodes
 	// (internal/cluster/owner_cache.go, plan PR #1000 item E3a). Such a node
@@ -2261,7 +2264,7 @@ func load(keyTool bool) (Config, error) {
 		IngressAdvertiseHost:             normalizeAdvertiseHost(os.Getenv("SB_INGRESS_ADVERTISE_HOST")),
 		L4PublicHost:                     normalizeAdvertiseHost(os.Getenv("SB_L4_PUBLIC_HOST")),
 		ClusterShardAwareIngress:         getEnvBool("SB_CLUSTER_SHARD_AWARE_INGRESS", false),
-		IngressProxyRouting:              getEnvBool("SB_INGRESS_PROXY_ROUTING", false),
+		IngressProxyRouting:              getEnvBool("SB_INGRESS_PROXY_ROUTING", true),
 		ClusterOwnerCache:                getEnvBool("SB_CLUSTER_OWNER_CACHE", false),
 		RouteDNSAddr:                     getEnv("SB_ROUTE_DNS_ADDR", "127.0.0.1:53053"),
 		RouteDNSLinkAddr:                 getEnv("SB_ROUTE_DNS_LINK_ADDR", ""),
@@ -2815,6 +2818,20 @@ func load(keyTool bool) (Config, error) {
 		}
 	}
 
+	// SB_INGRESS_PROXY_ROUTING is on by default, but it routes names under a
+	// Caddy domain and nothing else. On a node without one (local mode, IP
+	// mode, Caddy off) it is not applicable, so it is cleared here instead of
+	// refused at boot: refusing logged an ERROR, and on a cluster ingress ran
+	// 60 s of resolver probes, on every such node for a mode it can never
+	// use. Clearing it in one place keeps every reader consistent: the
+	// ingress placement feed, the node control-port guard, the redirect-port
+	// check below. A node whose previous boot engaged still rolls back,
+	// because the daemon keys that off its marker file, not this flag. Before
+	// the redirect-port check, so an IP-mode node with a custom L4 range does
+	// not start failing boot over a listener it will never open.
+	if cfg.IngressProxyRouting && !cfg.IngressProxyRoutingApplies() {
+		cfg.IngressProxyRouting = false
+	}
 	// L4 port pool sanity. Out-of-range or inverted bounds would silently
 	// brick raw-TCP exposure later; surface it at boot instead.
 	if cfg.IngressProxyRouting && (cfg.HostPortRedirectPort <= 0 || cfg.HostPortRedirectPort > 65535 ||
@@ -3362,6 +3379,13 @@ func (c Config) IsWorker() bool { return c.hasRole(NodeRoleWorker) }
 // remote sandboxes. Pure server/worker nodes return false; mixed and any
 // hybrid that includes "ingress" return true.
 func (c Config) IsIngress() bool { return c.hasRole(NodeRoleIngress) }
+
+// IngressProxyRoutingApplies reports whether this node has what
+// SB_INGRESS_PROXY_ROUTING routes: Caddy fronting sandboxes under a domain.
+// The static routes match "*.<domain>" names and the responder answers
+// under that domain; IP-mode path routes are still per-sandbox (TODOS.md,
+// "IP mode on the ingress router").
+func (c Config) IngressProxyRoutingApplies() bool { return c.EnableCaddy && c.Domain != "" }
 
 // RunsSSHGateway reports whether this node binds the per-sandbox SSH gateway:
 // SB_ENABLE_SSH_GATEWAY on a node whose role needs one. Workers run it
