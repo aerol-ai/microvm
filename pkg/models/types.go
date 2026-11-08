@@ -126,6 +126,14 @@ type SandboxRuntimeState struct {
 	// AdoptedParkID is non-empty when Create adopted a warm-pool slot; the
 	// service uses it to release the park capacity reservation (§4).
 	AdoptedParkID string
+	// StartedAt is when the run a start began, on the clock the engine's
+	// exit events are stamped with: Docker's State.StartedAt, or the
+	// containerd driver's host clock just before it makes the new task. The
+	// service tells an exit event of an earlier run by it (run_starts.go),
+	// so it must be no later than anything the new run can report, and no
+	// earlier than the exit of the run before. Zero when the runtime does
+	// not say (Firecracker, WASM and isolate send no exit events).
+	StartedAt time.Time
 }
 
 // User-facing runtime identifiers. These are the values the API, SDK, and

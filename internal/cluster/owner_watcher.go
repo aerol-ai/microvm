@@ -162,7 +162,7 @@ func recreateOwnedPlacement(ctx context.Context, deps ownerRecreateDeps, id stri
 	attempted := true
 	var err error
 	if reporter, ok := deps.recreator.(SandboxRecreateReporter); ok {
-		attempted, err = reporter.RecreateSandboxReport(ctx, id, spec, secretsFromPlacement(p), ports)
+		attempted, err = reporter.RecreateSandboxReport(ctx, id, spec, secretsFromPlacement(p), ports, p.OwnerSinceUnixNano)
 	} else {
 		err = deps.recreator.RecreateSandbox(ctx, id, spec, secretsFromPlacement(p), ports)
 	}

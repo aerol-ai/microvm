@@ -102,7 +102,7 @@ func TestRecreateSandboxReplaysPortsForExistingSandbox(t *testing.T) {
 
 	attempted, err := svc.RecreateSandboxReport(ctx, sandboxID, models.CreateSandboxRequest{}, cluster.PlacementSecrets{}, map[int]cluster.ExposedPortRoute{
 		3000: {Protocol: models.ExposedPortProtocolHTTP},
-	})
+	}, 0)
 	if err != nil {
 		t.Fatalf("RecreateSandbox existing replay: %v", err)
 	}
@@ -150,7 +150,7 @@ func TestRecreateSandboxExistingReplayFailureCountsAttempt(t *testing.T) {
 
 	attempted, err := svc.RecreateSandboxReport(ctx, sandboxID, models.CreateSandboxRequest{}, cluster.PlacementSecrets{}, map[int]cluster.ExposedPortRoute{
 		5432: {Protocol: models.ExposedPortProtocolTCP, HostPort: 30505},
-	})
+	}, 0)
 	if !attempted {
 		t.Fatal("failed existing route replay reported attempted=false")
 	}

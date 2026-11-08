@@ -719,6 +719,11 @@ type Service struct {
 	// not a stop.
 	sandboxOOMs sandboxOOMTracker
 
+	// runStarts holds when each sandbox's current run started, on the
+	// engine's clock, so a die or stop event of an earlier run changes
+	// nothing (run_starts.go).
+	runStarts sandboxRunStarts
+
 	// touchCoalescer debounces last_active_at flushes per sandbox so a
 	// burst of HTTP requests (wake-aware ingress proxy, toolbox/session/
 	// runtime proxies, SSH gateway) does not become one SQLite UPDATE
@@ -1616,6 +1621,7 @@ func (s *Service) finalizeStaleLocalSandbox(ctx context.Context, sandbox *models
 	s.forgetWakeFlight(sandbox.ID)
 	s.invalidateWarm(sandbox.ID)
 	s.forgetNetstatsActivity(sandbox.ID)
+	s.runStarts.forget(sandbox.ID)
 	if s.admitter != nil {
 		s.admitter.Release(sandbox.ID)
 	}
@@ -1690,8 +1696,11 @@ func (s *Service) placementIncarnation(id string, secrets cluster.PlacementSecre
 //
 // Only placements whose create spec opted into failover.policy=recreate reach
 // this path; default sandboxes remain non-HA and are orphaned on owner death.
+//
+// It knows no takeover time (the owner watcher calls RecreateSandboxReport),
+// so a reused local row keeps its tokens_not_before.
 func (s *Service) RecreateSandbox(ctx context.Context, id string, spec models.CreateSandboxRequest, secrets cluster.PlacementSecrets, exposedPorts map[int]cluster.ExposedPortRoute) error {
-	_, err := s.RecreateSandboxReport(ctx, id, spec, secrets, exposedPorts)
+	_, err := s.RecreateSandboxReport(ctx, id, spec, secrets, exposedPorts, 0)
 	return err
 }
 
@@ -1699,7 +1708,13 @@ func (s *Service) RecreateSandbox(ctx context.Context, id string, spec models.Cr
 // is false when a watcher tick finds an already-materialized sandbox and all
 // idempotent route replay work is already healthy. This keeps the failover
 // recreate counter from becoming a constant five-second polling rate.
-func (s *Service) RecreateSandboxReport(ctx context.Context, id string, spec models.CreateSandboxRequest, secrets cluster.PlacementSecrets, exposedPorts map[int]cluster.ExposedPortRoute) (bool, error) {
+//
+// ownerSinceUnixNano is the placement's OwnerSinceUnixNano (0: no takeover
+// known). A local row this node kept from an earlier ownership is reused,
+// not recreated, so it does not get a new row's not-before; its
+// tokens_not_before is raised to the takeover instead
+// (raiseTokensNotBeforeToTakeover).
+func (s *Service) RecreateSandboxReport(ctx context.Context, id string, spec models.CreateSandboxRequest, secrets cluster.PlacementSecrets, exposedPorts map[int]cluster.ExposedPortRoute, ownerSinceUnixNano int64) (bool, error) {
 	// The owner watcher calls this for a placement that failed over to us;
 	// no request is behind it.
 	ctx = withAuditSubsystem(ctx, auditSubsystemFailover)
@@ -1738,7 +1753,7 @@ func (s *Service) RecreateSandboxReport(ctx context.Context, id string, spec mod
 		if err != nil {
 			return true, fmt.Errorf("recreate %s: %w", id, err)
 		}
-		attempted, err := s.recreateWasmDurableSandbox(ctx, id, s.placementIncarnation(id, secrets), merged, exposedPorts)
+		attempted, err := s.recreateWasmDurableSandbox(ctx, id, s.placementIncarnation(id, secrets), merged, exposedPorts, ownerSinceUnixNano)
 		if err != nil {
 			return true, err
 		}
@@ -1751,6 +1766,11 @@ func (s *Service) RecreateSandboxReport(ctx context.Context, id string, spec mod
 		return attempted, nil
 	}
 	if existing, err := s.store.Get(ctx, id); err == nil && existing != nil {
+		// First, so a failed replay below cannot leave the revoked tokens
+		// working until a later tick.
+		if err := s.raiseTokensNotBeforeToTakeover(ctx, existing, ownerSinceUnixNano); err != nil {
+			return true, fmt.Errorf("recreate %s: %w", id, err)
+		}
 		attempted := false
 		if s.isWasmSandbox(existing) && existing.Durability == models.DurabilityDurable &&
 			existing.Status == models.SandboxStatusPassivated {
@@ -3841,6 +3861,10 @@ func (s *Service) startSandboxLocked(ctx context.Context, id string, cause start
 			return nil, err
 		}
 	}
+	// The runtime has a new run from here, whatever fails below: an exit
+	// event of an earlier run, queued behind this start, is told apart from
+	// now on (run_starts.go).
+	s.noteRunStart(id, state.StartedAt)
 	sandbox.ContainerID = state.ContainerID
 	sandbox.ContainerIP = state.ContainerIP
 	sandbox.Status = state.Status
@@ -4110,6 +4134,7 @@ func (s *Service) destroySandboxLocked(ctx context.Context, id string) error {
 	s.forgetWakeFlight(id)
 	s.invalidateWarm(id)
 	s.forgetNetstatsActivity(id)
+	s.runStarts.forget(id)
 	if s.admitter != nil {
 		s.admitter.Release(id)
 	}
@@ -6802,6 +6827,7 @@ func (s *Service) Reconcile(ctx context.Context) error {
 			s.forgetWakeFlight(sandbox.ID)
 			s.invalidateWarm(sandbox.ID)
 			s.forgetNetstatsActivity(sandbox.ID)
+			s.runStarts.forget(sandbox.ID)
 			// Again for a request that read the row before it went.
 			s.endToolboxCalls(sandbox.ID, toolboxEndGone, "runtime gone")
 			if s.admitter != nil {

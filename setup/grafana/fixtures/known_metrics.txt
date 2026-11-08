@@ -159,6 +159,7 @@ aerolvm_toolbox_dial_retries_total
 # Lifecycle counters and the warm/cold create latency
 # (plans/agent-sandbox-feature-parity.md O1).
 aerolvm_create_latency_by_start_seconds_bucket
+aerolvm_sandbox_events_dropped_total
 aerolvm_sandbox_expired_total
 aerolvm_sandbox_finished_total
 aerolvm_sandbox_starts_total
