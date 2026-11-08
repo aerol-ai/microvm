@@ -260,7 +260,7 @@ over 30 s, and no sandboxd restarted (UC-361's checks). The numbers land in
 each node's `429`/`503` counts. A run whose noisy team never got a `429`
 fails and says to raise `AEROL_FAIRNESS_NOISY`.
 
-## Cluster correctness under faults (UC-470..UC-479)
+## Cluster correctness under faults (UC-470..UC-482)
 
 `cluster-chaos` (`make integration-cluster-chaos`) is the live layer of
 `plans/cluster-correctness-and-create-latency.md` §3.2. Each case injects one
@@ -282,10 +282,39 @@ plan's fixes C2..C7 land; each test's doc comment in
 | UC-477 | Every server restarted in turn, leader last | I6 | C1 |
 | UC-478 | Loaded worker killed when the survivors have less room | I4, I6 | C7 |
 | UC-479 | Owner killed for real; the old node returns | I1, I6 | C4, C2 |
+| UC-480 | Worker's sandboxd SIGKILLed while a failpoint parks a create between the runtime start and the store write | I8, I6 | release gate |
+| UC-481 | sandboxd SIGKILLed on every server at once (or the leader); control-plane recovery time measured | I6, I8, I4 | release gate |
+| UC-482 | Soak: closed-loop create, probe, delete for 15 min, every node sampled | I6 | release gate |
+
+UC-480..482 are the release-gate tools of `plans/cluster-phase-2.md` §5,
+run as short smoke runs in this scenario:
+
+- **UC-480 needs a failpoint build.** run.sh compiles this scenario's local
+  sandboxd with `-tags itest_failpoints` (the caps file's `go_tags`, passed
+  to `lib/build.sh` as `AEROL_GO_TAGS`; the build id ends
+  `-tags-itest_failpoints`). The case arms
+  `/run/sandboxd/failpoints/create-before-persist` on every worker for one
+  sandbox name, waits for the `.hit` marker, and SIGKILLs sandboxd on that
+  node. On `--released` / `--version`, whose binaries have no failpoints, it
+  skips. Every other scenario builds without tags, and
+  `safety/go_tags_test.go` keeps any `go_tags` entry `itest_*`.
+- **UC-481** probes once a second through the API domain: the leader, a
+  placement read for a sandbox made before the kill, and a create. Each
+  signal recovers at its first success after its last failure; the recovery
+  time is the latest of the three, logged as `rto ... recovery_seconds=` and
+  written into the I6 detail of `reports/cluster-chaos.json`.
+- **UC-482** writes one JSON line per sample to `AEROL_SOAK_OUT`. The pass
+  rule is `harness.SoakVerdict`: counts back at baseline after the drain
+  plus one reconcile interval; for goroutines (`aerolvm_go_goroutines`),
+  RSS, fds, WAL and Raft size, the last third's median within the larger of
+  20% and a floor of the first third's; no sandboxd restart. The 72-hour run
+  is the same case with a longer `AEROL_SOAK_MINUTES` and
+  `AEROL_SUITE_TIMEOUT`.
 
 - **Topology.** 3 servers, 3 workers, 1 ingress, all t3.medium on-demand
   (`scenarios/cluster-chaos.tfvars` says why each). About $0.29/h; bring-up
-  ~20 min, the ten cases ~80 min, teardown ~5 min, so ~$0.45-0.65 a run.
+  ~20 min, the ten fault cases ~80 min plus ~35 min for UC-480..482 (the
+  soak is 15 of it), teardown ~5 min, so ~$0.60-0.80 a run.
   The scenario sets `SB_RECONCILE_INTERVAL=60s`; the cases read it off a node
   and wait two intervals plus a minute before calling a state converged.
 - **Focused.** The caps file's `focus` block makes run.sh pass
@@ -321,6 +350,14 @@ plan's fixes C2..C7 land; each test's doc comment in
 | `AEROL_CHAOS_MASS_SANDBOXES` / `_CPU` / `_MEMORY_MB` / `_SURVIVOR_FREE_CPU` | `12` / `1.0` / `256` / `4` | UC-478 |
 | `AEROL_CHAOS_FAILOVER_BOUND_SECONDS` | `300` | how long a reassign, and a reassigned sandbox's start, may take |
 | `AEROL_CHAOS_CONVERGE_SECONDS` | 2 x reconcile + 60 | override the convergence bound T |
+| `AEROL_CHAOS_RTO_MODE` | `all` | UC-481: `all` SIGKILLs every server at once, `leader` only the Raft leader |
+| `AEROL_CHAOS_RTO_BUDGET_SECONDS` | `120` | UC-481's recovery-time budget; to be set from the first measured runs |
+| `AEROL_CHAOS_RTO_SANDBOXES` / `_MAX_CREATES` | `3` / `120` | UC-481: sandboxes whose placements must survive, and a cap on the prober's creates |
+| `AEROL_SOAK_MINUTES` | `15` | UC-482's load duration |
+| `AEROL_SOAK_WORKERS` | `4` | UC-482's closed-loop workers |
+| `AEROL_SOAK_SAMPLE_SECONDS` | `60` | UC-482's sampling interval |
+| `AEROL_SOAK_OUT` | `<reports>/<scenario>-soak.jsonl` | UC-482's samples, one JSON line each |
+| `AEROL_GO_TAGS` | caps `go_tags` | test-only Go build tags for the local sandboxd build (overrides the caps file) |
 
 ## Enterprise scenarios and the audit witness
 

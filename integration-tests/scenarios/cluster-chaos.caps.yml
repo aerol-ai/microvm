@@ -1,5 +1,6 @@
 # cluster-chaos: the cluster-correctness fault scenario (UC-470..UC-479,
-# plans/cluster-correctness-and-create-latency.md §3.2). 3 server / 3 worker /
+# plans/cluster-correctness-and-create-latency.md §3.2) and the release-gate
+# tools (UC-480..UC-482, plans/cluster-phase-2.md §5). 3 server / 3 worker /
 # 1 ingress, all t3.medium on-demand; see cluster-chaos.tfvars for why.
 name: cluster-chaos
 capabilities:

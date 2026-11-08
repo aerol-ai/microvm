@@ -1,5 +1,6 @@
 # cluster-chaos: the cluster-correctness fault scenario
 # (plans/cluster-correctness-and-create-latency.md §3.2, UC-470..UC-479,
+# and the release-gate tools UC-480..UC-482, plans/cluster-phase-2.md §5;
 # `make integration-cluster-chaos`).
 #
 #   3x server  (t3.medium)  Raft voters only: no sandboxes, no public traffic
@@ -25,7 +26,8 @@
 #
 # Cost: 7 x t3.medium on-demand = 7 x $0.0416/h = $0.29/h (us-east-1), plus
 # 4 x 40 GiB + 4 x 20 GiB gp3 (~$0.02/h). A full run (bring-up, the ten
-# chaos cases, teardown) is about 1.5 to 2 hours, so about $0.45 to $0.65.
+# chaos cases, the ~35 minutes of UC-480..482, teardown) is about 2 to 2.5
+# hours, so about $0.60 to $0.80.
 cluster_name = "aerolvm-itest-cluster-chaos"
 
 extra_tags = {

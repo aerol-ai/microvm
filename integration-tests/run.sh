@@ -33,7 +33,7 @@
 #            cluster-3-mixed-kms-switch | single-node-wrapped-kms
 # Ingress proxy routing gate: cluster-3-mixed-routing | cluster-hetero-lite-routing
 # Ingress load balancer (UC-356): cluster-3-mixed-lb
-# Cluster correctness faults (UC-470..479, focused): cluster-chaos
+# Cluster correctness faults + release-gate tools (UC-470..482, focused): cluster-chaos
 #
 # Safety: every dangerous input is gated by provision.sh check-safety BEFORE any
 # apply. Teardown runs on EXIT/INT/TERM (trap) so a crash can't leak EC2; the
