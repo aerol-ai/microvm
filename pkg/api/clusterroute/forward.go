@@ -11,6 +11,7 @@ import (
 	"errors"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/aerol-ai/microvm/internal/cluster"
 	"github.com/aerol-ai/microvm/internal/service"
@@ -72,6 +73,7 @@ func Wrap(svc *service.Service, opts Options, local http.Handler) http.Handler {
 		_, single := c.(*cluster.Noop)
 		hop := cluster.RouteHopEdge
 		hint := ""
+		var forwardEpoch uint64
 		if r.Header.Get(cluster.HeaderForwarded) == "1" {
 			hop = cluster.RouteHopOwner
 			// Take the owner-cache token and drop the header before any
@@ -79,6 +81,8 @@ func Wrap(svc *service.Service, opts Options, local http.Handler) http.Handler {
 			// the sandbox) can see the token and forge a "not here".
 			hint = r.Header.Get(cluster.HeaderRouteHint)
 			r.Header.Del(cluster.HeaderRouteHint)
+			forwardEpoch = cluster.ForwardedOwnerEpoch(r.Header)
+			r.Header.Del(cluster.HeaderOwnerEpoch)
 		} else if !single {
 			cluster.RecordRouteRequest()
 		}
@@ -90,6 +94,48 @@ func Wrap(svc *service.Service, opts Options, local http.Handler) http.Handler {
 		cache := cluster.OwnerCacheOf(c) // nil unless worker/ingress with the flag on
 		if hop == cluster.RouteHopEdge && cache != nil && serveFromOwnerCache(c, cache, id, w, r, write) {
 			return
+		}
+
+		// serveLocal hands the request to the local handler, whose answer
+		// for an id with no local row is 404. While this node's placement
+		// view is catching up after a restart that 404 is a guess: the
+		// placement (or the move away from this node) may simply not have
+		// been applied here yet. Serve a row this node holds; for one it
+		// does not, answer 503 + Retry-After instead of a false "gone".
+		serveLocal := func(localID string) {
+			// A sandbox held by the ownership fence may be running on
+			// another node by now: this node could not confirm it still
+			// owns it, so it must not answer for it (I1).
+			if svc.OwnershipFenced(localID) {
+				WriteOwnershipFenced(w, write)
+				return
+			}
+			if !cluster.CaughtUp(c) && !svc.HasLocalSandbox(r.Context(), localID) {
+				WriteNotCaughtUp(w, write)
+				return
+			}
+			local.ServeHTTP(w, r)
+		}
+		// E3b: a forward carrying the edge's owner epoch, which this node's
+		// last authoritative read (the ownership lease) proves it owns at
+		// that same epoch, is served without looking the sandbox up again:
+		// the leader's recent answer and the edge's lookup agree. The edge
+		// already checked the caller's tenant against the placement, and the
+		// local handler scopes by owner again. A read holding a newer epoch
+		// turns a cache-routed forward down, as the lookup below would; every
+		// other case takes the lookup path.
+		if hop == cluster.RouteHopOwner && forwardEpoch != 0 {
+			switch svc.OwnerLeaseCheck(id, forwardEpoch, hint != "", time.Now()) {
+			case service.OwnerLeaseOwned:
+				cluster.RecordOwnerLeaseServe()
+				serveLocal(id)
+				return
+			case service.OwnerLeaseNewer:
+				if hint != "" {
+					writeNotOwner(w, r, hint, write)
+					return
+				}
+			}
 		}
 
 		// An owner-scoped (validated user-token) caller must not learn that
@@ -117,26 +163,6 @@ func Wrap(svc *service.Service, opts Options, local http.Handler) http.Handler {
 			}
 			ownerRef, ownerRefKnown = callerOwner, ok
 		}
-		// serveLocal hands the request to the local handler, whose answer
-		// for an id with no local row is 404. While this node's placement
-		// view is catching up after a restart that 404 is a guess: the
-		// placement (or the move away from this node) may simply not have
-		// been applied here yet. Serve a row this node holds; for one it
-		// does not, answer 503 + Retry-After instead of a false "gone".
-		serveLocal := func(localID string) {
-			// A sandbox held by the ownership fence may be running on
-			// another node by now: this node could not confirm it still
-			// owns it, so it must not answer for it (I1).
-			if svc.OwnershipFenced(localID) {
-				WriteOwnershipFenced(w, write)
-				return
-			}
-			if !cluster.CaughtUp(c) && !svc.HasLocalSandbox(r.Context(), localID) {
-				WriteNotCaughtUp(w, write)
-				return
-			}
-			local.ServeHTTP(w, r)
-		}
 		localID := id
 		lookup()
 		owner, err := c.OwnerOf(id)
@@ -157,6 +183,15 @@ func Wrap(svc *service.Service, opts Options, local http.Handler) http.Handler {
 			// lookup does not say it owns the sandbox (or cannot say).
 			// Serving it, or answering 404, 410 or 503, would be the stale
 			// entry answering; the edge looks the sandbox up itself.
+			writeNotOwner(w, r, hint, write)
+			return
+		}
+		if hint != "" && forwardEpoch != 0 && owner.Epoch > forwardEpoch {
+			// The edge's entry predates an owner change: the sandbox moved
+			// away and came back to this node since the edge read it. This
+			// node does own it, but an older epoch is turned down (I2): the
+			// edge drops the entry and routes once more from a fresh lookup,
+			// so its next entry carries the current epoch.
 			writeNotOwner(w, r, hint, write)
 			return
 		}
@@ -202,6 +237,7 @@ func Wrap(svc *service.Service, opts Options, local http.Handler) http.Handler {
 			// reused, and the owner re-checks every entry anyway.
 			cache.Put(id, owner, ownerRef, ownerRefKnown)
 		}
+		r = r.WithContext(cluster.ContextWithOwnerEpoch(r.Context(), owner.Epoch))
 		c.ForwardHTTP(cluster.Endpoint{NodeID: owner.NodeID, InternalURL: owner.InternalURL, APIURL: owner.APIURL}, w, r)
 	})
 }

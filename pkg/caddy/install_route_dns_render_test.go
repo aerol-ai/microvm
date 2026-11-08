@@ -87,3 +87,55 @@ func TestInstallRoutesTheZoneToTheLinkAddress(t *testing.T) {
 		}
 	}
 }
+
+// install.sh turns routing on by default for a --domain install
+// (plans/cluster-phase-2.md §4.3), and only there: it routes names under the
+// domain, so IP mode and --local get it off. An explicit flag always wins,
+// --no-ingress-proxy-routing being the way to keep a domain install on
+// per-sandbox Caddy routes.
+func TestInstallIngressProxyRoutingDefault(t *testing.T) {
+	bash, err := exec.LookPath("bash")
+	if err != nil {
+		t.Skip("bash not found")
+	}
+	raw, err := os.ReadFile("../../scripts/install.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fn := installShFunc(t, string(raw), "resolve_ingress_proxy_routing")
+	for _, tc := range []struct {
+		name, explicit, domain, local, want string
+	}{
+		{"--domain: on", "", "sandbox.example.com", "false", "true"},
+		{"--domain --no-ingress-proxy-routing: off", "false", "sandbox.example.com", "false", "false"},
+		{"IP mode: off", "", "", "false", "false"},
+		{"--local: off", "", "", "true", "false"},
+		{"--local with a domain: off (no Caddy)", "", "sandbox.example.com", "true", "false"},
+		{"IP mode --ingress-proxy-routing: as asked", "true", "", "false", "true"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			script := "set -euo pipefail\nINGRESS_PROXY_ROUTING='" + tc.explicit + "'\nDOMAIN='" + tc.domain + "'\nLOCAL_MODE='" + tc.local + "'\n" +
+				fn + "resolve_ingress_proxy_routing\nprintf '%s' \"$INGRESS_PROXY_ROUTING\"\n"
+			out, err := exec.Command(bash, "-c", script).CombinedOutput()
+			if err != nil || string(out) != tc.want {
+				t.Fatalf("INGRESS_PROXY_ROUTING = %q (%v), want %q", out, err, tc.want)
+			}
+		})
+	}
+
+	// The default is settled after the flags are parsed and before anything
+	// reads it (write_environment, write_route_dns_resolver).
+	src := string(raw)
+	call := strings.Index(src, "\nresolve_ingress_proxy_routing\n")
+	parsed := strings.Index(src, "\n\t\t--no-ingress-proxy-routing)\n")
+	firstUse := strings.Index(src, "\nwrite_environment\n")
+	if call < 0 || parsed < 0 || firstUse < 0 {
+		t.Fatalf("install.sh lost the call (%d), the flag (%d) or the env write (%d)", call, parsed, firstUse)
+	}
+	if !(parsed < call && call < firstUse) {
+		t.Fatalf("resolve_ingress_proxy_routing must run after the flag loop and before write_environment (flag %d, call %d, write %d)", parsed, call, firstUse)
+	}
+	if !strings.Contains(src, "\nINGRESS_PROXY_ROUTING=\"\"\n") {
+		t.Fatal(`INGRESS_PROXY_ROUTING must start empty ("not chosen"), or the default can never apply`)
+	}
+}

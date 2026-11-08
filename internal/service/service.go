@@ -28,6 +28,7 @@ import (
 	"github.com/aerol-ai/microvm/internal/createpolicy"
 	"github.com/aerol-ai/microvm/internal/egress"
 	"github.com/aerol-ai/microvm/internal/egress/operator"
+	"github.com/aerol-ai/microvm/internal/failpoint"
 	"github.com/aerol-ai/microvm/internal/identity"
 	"github.com/aerol-ai/microvm/internal/netsplice"
 	"github.com/aerol-ai/microvm/internal/runtime"
@@ -2777,6 +2778,12 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 		createtiming.From(ctx).RecordStage("svc_caddy", time.Since(caddyStart))
 	}
 
+	// UC-480's crash window: the container runs, its route and network slot
+	// are held, and no row records any of it. Last before the store write so
+	// the crash leaves everything a restart has to clean up. Compiled to
+	// nothing outside itest builds (internal/failpoint).
+	failpoint.Hit(failpoint.CreateBeforePersist, sandbox.Name)
+
 	persistStart := time.Now()
 	sandbox.OwnerRef = ownerRef
 	if err := s.persistSandboxCreate(ctx, sandbox); err != nil {
@@ -3852,7 +3859,9 @@ func (s *Service) startSandboxLocked(ctx context.Context, id string, cause start
 		}
 	}
 	if state == nil {
-		if is, ok := runtime.AsIdentityStarter(rt); ok {
+		if es, ok := runtime.AsEnvIdentityStarter(rt); ok {
+			state, err = es.StartWithIdentityEnv(ctx, s.runtimeRef(sandbox), sandbox.ID, sandbox.ToolboxToken, s.adoptEnvLoader(sandbox))
+		} else if is, ok := runtime.AsIdentityStarter(rt); ok {
 			state, err = is.StartWithIdentity(ctx, s.runtimeRef(sandbox), sandbox.ID, sandbox.ToolboxToken)
 		} else {
 			state, err = rt.Start(ctx, s.runtimeRef(sandbox))

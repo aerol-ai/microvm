@@ -1,6 +1,6 @@
 # Releasing
 
-The maintainer publishes releases, as [GOVERNANCE.md](GOVERNANCE.md) describes. A release takes four steps.
+The maintainer publishes releases, as [GOVERNANCE.md](GOVERNANCE.md) describes. A release takes five steps.
 
 ## 1. Write the release notes
 
@@ -43,7 +43,22 @@ gh release create vX.Y.Z --target <main commit> --title "vX.Y.Z: <short summary>
 - **Re-running the workflow for an older release does not make it latest.** Only the newest stable release becomes latest. A prerelease never does.
 - **The workflow also copies the files to the download mirror,** in its `mirror` job: see "The download mirror" below.
 
-## 3. Sync the changelog
+## 3. Check the download mirror
+
+`install.sh` falls back to a public download mirror, `s3://aerolvm-downloads` (`https://aerolvm-downloads.s3.us-east-1.amazonaws.com`), when GitHub fails. It holds each release at `aerolvm/<tag>/<file>`, under the same names as on GitHub, and pinned third-party files at `deps/<project>/<version>/<file>`. `scripts/mirror-sync.sh` fills it.
+
+- **The release workflow copies the release to the mirror** in its `mirror` job (see "The download mirror" below). It checks every file against the release's `checksums.txt` before it uploads anything, and, if the tag is GitHub's latest release, points `aerolvm/latest.txt` at it, which is how `install.sh` finds "latest" on the mirror.
+- **If that job failed or was skipped,** do the same by hand with `scripts/mirror-sync.sh`, with AWS credentials that can write to the bucket and `gh` logged in:
+
+  ```bash
+  scripts/mirror-sync.sh --release vX.Y.Z --dry-run   # prints the plan
+  scripts/mirror-sync.sh --release vX.Y.Z
+  ```
+
+- **A re-run of `mirror-sync.sh` uploads only what is missing:** a file already on the mirror at the same size is skipped. When the mirror's `checksums.txt` for the tag differs from the release's (a re-cut), it sends every file; `--force` does that in any case.
+- **Re-sync third-party files only when a pin changes.** The pins are the `DOWNLOAD PINS` block in `scripts/install.sh`. After you bump a version and its hashes there, and before the release that ships the new `install.sh`, run `scripts/mirror-sync.sh --deps`. It reads the pins from `install.sh`, checks every file against its pin, and uploads nothing unless all of them match.
+
+## 4. Sync the changelog
 
 After the release workflow finishes, and again whenever you edit a release's notes on GitHub:
 
@@ -56,7 +71,7 @@ npm run releases:sync
 - **The docs Changelog page updates itself** at the next docs build. This step keeps `CHANGELOG.md` current, and keeps the copy the page uses when GitHub cannot be reached during a build.
 - **Set `GITHUB_TOKEN`** if GitHub rate-limits the script.
 
-## 4. Publish SDKs, if they changed
+## 5. Publish SDKs, if they changed
 
 SDK packages are published separately, with the **Publish SDKs** workflow, run by hand. A server release does not need an SDK release.
 

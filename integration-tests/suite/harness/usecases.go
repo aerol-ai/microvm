@@ -128,6 +128,14 @@ const (
 	// dockerd-coexistence restart stays off the runtime/metal scenarios where a
 	// pure-containerd host makes it not-applicable.
 	CapContainerdEngine Capability = "containerd-engine"
+	// CapContainerdPool is consumed by run.sh's config overlay, like
+	// CapDockerPool: it flips containerd.pool.enabled in the scenario's
+	// cluster.yml, which Terraform renders into SB_CONTAINERD_POOL_ENABLED.
+	// Separate from CapContainerdEngine because each waiting container holds a
+	// default-shaped capacity reservation and a netns slot, lowering the UC-95
+	// density ceiling, and because the engine scenarios exist to measure the
+	// cold path. No scenario advertises it yet: the pool ships off by default.
+	CapContainerdPool Capability = "containerd-pool"
 	// CapObservability gates UC-106/107 ("Grafana up", "Prometheus sees all
 	// sandboxd nodes") and tells run.sh to pass -var deploy_obs=true so
 	// Terraform/obs.tf provisions the dedicated obs EC2. Advertisement +
@@ -266,7 +274,8 @@ const (
 	// is told 429.
 	CapAPIListFairness Capability = "api-list-fairness"
 	// CapClusterChaos gates the cluster-correctness fault cases UC-470..479
-	// (plans/cluster-correctness-and-create-latency.md §3.2). The scenario is
+	// (plans/cluster-correctness-and-create-latency.md §3.2) and the
+	// release-gate tools UC-480..482 (plans/cluster-phase-2.md §5). The scenario is
 	// role-separated (three dedicated servers, at least two workers, one
 	// ingress) and on-demand, the suite can SSH to every node, and the
 	// operator accepts partitions, packet loss, runtime kills and Raft leader
@@ -317,7 +326,7 @@ var KnownCapabilities = map[Capability]bool{
 	CapCluster: true, CapCustomDomains: true, CapExternalDNSZone: true,
 	CapMixedArchNegative: true, CapPlatformVolumes: true, CapBenchmark: true, CapNoHostFirewall: true,
 	CapDockerPool: true, CapDockerNetnsPool: true, CapDockerEngine: true,
-	CapContainerdEngine: true, CapObservability: true, CapSimulations: true,
+	CapContainerdEngine: true, CapContainerdPool: true, CapObservability: true, CapSimulations: true,
 	CapSecrets: true, CapSecretsKMS: true, CapEnterprise: true,
 	CapClusterMTLS: true, CapAuditExport: true, CapAuditWitness: true,
 	CapRemoteMCP: true, CapEgressFQDN: true, CapPrivateCloud: true,
@@ -1081,6 +1090,18 @@ var Registry = []UseCase{
 	{ID: "UC-477", Title: "Chaos (I6; C1): every server is restarted one at a time; after each restart a leader is back, every committed placement keeps its owner and incarnation, every sandbox still runs once on its owner, and the cluster takes a new create", Requires: []Capability{CapCluster, CapClusterChaos}, Implemented: true},
 	{ID: "UC-478", Title: "Chaos (I4, I6; C7): a worker holding many recreate-policy sandboxes is killed while the survivors have less room than it held; no worker ever runs more than its budget, and every sandbox placed on a survivor runs there within the failover bound", Requires: []Capability{CapCluster, CapClusterChaos}, Implemented: true},
 	{ID: "UC-479", Title: "Chaos (I1, I6; C2, C4): after a real owner kill (sandboxd and the container runtime) and failover, the old node returns and never runs a copy of the sandbox; exactly one copy runs, on the new owner", Requires: []Capability{CapCluster, CapClusterChaos}, Implemented: true},
+
+	// Release-gate tools (plans/cluster-phase-2.md §5): a crash at an exact
+	// point (internal/failpoint), control-plane recovery time, and a soak.
+	// Same scenario and verdict markers as the chaos cases above.
+	{ID: "UC-480", Title: "Chaos (I8, I6): a worker's sandboxd is SIGKILLed while a create is parked by a failpoint between the runtime start and the store write; within the convergence bound the sandbox runs on no worker, has no placement, answers 404, and holds no netns slot or container (skips on a binary built without -tags itest_failpoints)", Requires: []Capability{CapCluster, CapClusterChaos}, Implemented: true},
+	{ID: "UC-481", Title: "Chaos (I6, I8): sandboxd is SIGKILLed on all three servers at once (or only the leader); the leader answer, a placement read and a new create all come back within AEROL_CHAOS_RTO_BUDGET_SECONDS (the recovery time is in the detail), every placement keeps its owner and incarnation, and creates sent during the outage end fully created or fully absent", Requires: []Capability{CapCluster, CapClusterChaos}, Implemented: true},
+	{ID: "UC-482", Title: "Soak (I6): closed-loop workers create, probe and delete for AEROL_SOAK_MINUTES while every node is sampled; after the drain and one reconcile interval every count (tasks, snapshots, netns slots, host ports, rows, routes, placements) is back at baseline, and goroutines, RSS, fds, WAL and Raft size level off; no sandboxd restarts", Requires: []Capability{CapCluster, CapClusterChaos}, Implemented: true},
+
+	// Warm pool with env (plans/cluster-phase-2.md §2, L3).
+	{ID: "UC-483", Title: "Warm pool (L3): on the containerd engine a create that carries env is a warm hit (Server-Timing has containerd_pool and no containerd_create), its processes read the env, the env is still there after a stop and start, and a create that sets an SB_ key still starts cold", Requires: []Capability{CapContainerdPool}, Implemented: true},
+
+	// A paused sandbox on every public address (#1050).
 	{ID: "UC-484", Title: "Chaos (I7; C4): a worker cut off from the servers pauses its recreate-policy sandbox, and every public address of it answers within seconds: the toolbox URL and the HTTP port with 503, the raw TCP port by closing the connection; after the heal they answer as before (#1050)", Requires: []Capability{CapCluster, CapClusterChaos}, Implemented: true},
 }
 

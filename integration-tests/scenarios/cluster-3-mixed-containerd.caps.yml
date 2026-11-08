@@ -15,10 +15,12 @@
 #
 # NOTE: the docker warm-container / pause-netns pools (docker-pool,
 # docker-netns-pool) are deliberately ABSENT — those are docker-engine features.
-# The containerd warm pools (SB_CONTAINERD_POOL_ENABLED /
-# SB_CONTAINERD_NATIVE_NETNS_POOL_ENABLED) are still ship-dark
-# (plans/containerd-engine.md §8), so this scenario measures the containerd COLD
-# create path, which is the honest baseline against the docker-cold bench row.
+# The containerd warm container pool (SB_CONTAINERD_POOL_ENABLED) is now in the
+# deploy files but off by default; run.sh turns it on only for a scenario that
+# advertises the containerd-pool capability, and this one deliberately does
+# not. So this scenario measures the containerd COLD create path, which is the
+# honest baseline against the docker-cold bench row. (The native netns pool,
+# containerd.native_netns_pool_enabled, is on in the shipped cluster.yml.)
 #
 # The benchmark capability opts UC-94/UC-95 in for make integration-benchmark-containerd.
 name: cluster-3-mixed-containerd

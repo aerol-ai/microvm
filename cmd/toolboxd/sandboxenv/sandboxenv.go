@@ -1,17 +1,23 @@
 // Package sandboxenv holds the environment a sandbox was created with, for a
 // guest whose agent cannot inherit it.
 //
-// A container runtime starts toolboxd with the sandbox's env already in its
-// own process environment, so every exec, session and terminal inherits it
-// through os.Environ(). A Firecracker guest boots from a rootfs or a template
-// snapshot that never saw the create request, so the host pushes the env over
-// vsock once the agent is up (the set_env op) and toolboxd keeps it here.
+// A container created cold starts toolboxd with the sandbox's env already in
+// its own process environment, so every exec, session and terminal inherits
+// it through os.Environ(). A Firecracker guest boots from a rootfs or a
+// template snapshot that never saw the create request, so the host pushes the
+// env over vsock once the agent is up (the set_env op) and toolboxd keeps it
+// here. A containerd warm-pool container was started from the pool's spec,
+// which never saw the create request either: the host sends the env in the
+// adopt frame on the ready socket, and toolboxd keeps it here before it takes
+// the identity and starts the held-back image command.
 //
 // The env is how users pass secrets, so this package keeps it in memory only:
 // nothing here writes it to a file or logs it, and errors never quote a key
 // or a value. toolboxd is PID 1 in a Firecracker guest (toolboxd-init execs
 // it), so there is no in-guest restart that could come back without it: if
-// toolboxd exits the guest kernel panics and the VM is gone.
+// toolboxd exits the guest kernel panics and the VM is gone. In a container
+// toolboxd is PID 1 too, and a restart is a new task that boots parked again
+// and is adopted again, with the env re-sent from the sealed row.
 package sandboxenv
 
 import (

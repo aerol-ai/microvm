@@ -132,6 +132,12 @@ func setBaseRunEnv(t *testing.T) runTestPaths {
 	t.Setenv("SB_ENABLE_NETWORK_RULES", "false")
 	t.Setenv("SB_AUTO_RECONCILE", "false")
 	t.Setenv("SB_ENABLE_CADDY", "false")
+	// Pinned off. It defaults on in domain mode, and the cases that turn
+	// Caddy and a domain on for other reasons would then engage it: bind
+	// the route responder (127.0.0.1:53053) and the :21215 redirect
+	// listener on the test host, and on a host with iptables try to write
+	// rules. Cases about routing set it themselves.
+	t.Setenv("SB_INGRESS_PROXY_ROUTING", "false")
 	t.Setenv("SB_ENABLE_EVENT_MONITOR", "false")
 	t.Setenv("SB_ENABLE_SERVERLESS", "false")
 	t.Setenv("SB_ENABLE_CUSTOM_DOMAINS", "false")

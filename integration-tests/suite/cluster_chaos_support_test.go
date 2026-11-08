@@ -35,6 +35,7 @@ import (
 	"time"
 
 	"github.com/aerol-ai/microvm/integration-tests/suite/harness"
+	"github.com/aerol-ai/microvm/pkg/capacity"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
 
@@ -746,9 +747,25 @@ func chaosKillLeader(t *testing.T, tp chaosTopo, ids map[string]string, leaderID
 // rejoin before starting the second would wait forever.
 func chaosStopVoters(t *testing.T, nodes []harness.IntegrationNode) func() {
 	t.Helper()
+	return chaosDownVoters(t, nodes, "sudo systemctl stop sandboxd", "stop")
+}
+
+// chaosKillVoters SIGKILLs sandboxd on several servers at once
+// (harness.KillSandboxdScript): a crash, not a shutdown. systemd restarts
+// each by itself; the restore is chaosStopVoters', whose start is a no-op on
+// a unit already back, and which waits for every node to rejoin.
+func chaosKillVoters(t *testing.T, nodes []harness.IntegrationNode) func() {
+	t.Helper()
+	return chaosDownVoters(t, nodes, harness.KillSandboxdScript, "SIGKILL")
+}
+
+// chaosDownVoters runs down on every node in parallel, so they go down
+// together, and returns the shared restore.
+func chaosDownVoters(t *testing.T, nodes []harness.IntegrationNode, down, verb string) func() {
+	t.Helper()
 	for _, n := range nodes {
 		if n.Seed {
-			t.Logf("stopping the seed %s on purpose (UC-170 proves it rejoins)", n.Name)
+			t.Logf("%s on the seed %s on purpose (UC-170 proves it rejoins)", verb, n.Name)
 		}
 	}
 	var once sync.Once
@@ -776,14 +793,77 @@ func chaosStopVoters(t *testing.T, nodes []harness.IntegrationNode) func() {
 		go func(n harness.IntegrationNode) {
 			defer wg.Done()
 			target, _ := harness.SSHTarget(n)
-			if out, err := harness.SSHRun(t, target, "sudo systemctl stop sandboxd"); err != nil {
-				t.Errorf("stop sandboxd on %s: %v %s", n.Name, err, out)
+			if out, err := harness.SSHRun(t, target, down); err != nil {
+				t.Errorf("%s sandboxd on %s: %v %s", verb, n.Name, err, out)
 			}
 			harness.MarkNodeDown(n.PublicIP)
 		}(n)
 	}
 	wg.Wait()
 	return restore
+}
+
+// chaosArmFailpoint arms failpoint name for sandbox names starting with
+// prefix on every node, and disarms them all in the cleanup: a failpoint
+// left armed would park the next matching create on that node.
+func chaosArmFailpoint(t *testing.T, nodes []harness.IntegrationNode, name, prefix string) {
+	t.Helper()
+	t.Cleanup(func() {
+		for _, n := range nodes {
+			target, _ := harness.SSHTarget(n)
+			if out, err := harness.SSHRun(t, target, harness.FailpointDisarmScript(name)); err != nil || !strings.Contains(out, "DISARMED") {
+				t.Errorf("RESTORE FAILED: failpoint %s may still be armed on %s: %v %s", name, n.Name, err, out)
+			}
+		}
+	})
+	for _, n := range nodes {
+		target, _ := harness.SSHTarget(n)
+		if out, err := harness.SSHRun(t, target, harness.FailpointArmScript(name, prefix)); err != nil || !strings.Contains(out, "ARMED") {
+			t.Fatalf("arm failpoint %s on %s: %v %s", name, n.Name, err, out)
+		}
+	}
+}
+
+// chaosFailpointHit reports whether failpoint name fired on node, and the key
+// it fired for. An SSH failure is an error, not "no hit".
+func chaosFailpointHit(t *testing.T, node harness.IntegrationNode, name string) (string, bool, error) {
+	t.Helper()
+	target, _ := harness.SSHTarget(node)
+	out, err := harness.SSHRun(t, target, harness.FailpointHitScript(name))
+	if err != nil {
+		return "", false, fmt.Errorf("%s: %v %s", node.Name, err, strings.TrimSpace(out))
+	}
+	return harness.ParseFailpointHit(out)
+}
+
+// chaosNetnsInUse is how many of a worker's containerd netns pool slots are
+// held, from its own /v1/capacity (the pool's total less its free and
+// prewarmed slots). ok is false when the node reports no such pool (the
+// docker engine), where there is nothing to count.
+func chaosNetnsInUse(ctx context.Context, api *harness.APIClient) (int, bool, error) {
+	resp, err := api.Do(ctx, http.MethodGet, "/v1/capacity", nil)
+	if err != nil {
+		return 0, false, err
+	}
+	if resp.Status != http.StatusOK {
+		return 0, false, fmt.Errorf("capacity: %s", resp)
+	}
+	var c struct {
+		SlotPools []struct {
+			Name  string `json:"name"`
+			Total int    `json:"total"`
+			Free  int    `json:"free"`
+		} `json:"slot_pools"`
+	}
+	if err := resp.JSON(&c); err != nil {
+		return 0, false, err
+	}
+	for _, p := range c.SlotPools {
+		if p.Name == capacity.SlotPoolContainerNetns {
+			return p.Total - p.Free, true, nil
+		}
+	}
+	return 0, false, nil
 }
 
 // chaosRestartDaemon restarts sandboxd on node and waits until it has

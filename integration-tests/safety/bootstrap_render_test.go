@@ -4,6 +4,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 )
@@ -80,7 +81,7 @@ func TestBootstrapTemplateRenders(t *testing.T) {
 	for _, branch := range []string{
 		"seed", "joiner", "joiner_kms", "joiner_audit_s3", "joiner_audit_file",
 		"seed_receiver", "joiner_receiver", "seed_public_ca", "seed_wrapped",
-		"joiner_api_lb", "joiner_api_lb_worker",
+		"joiner_api_lb", "joiner_api_lb_worker", "joiner_routing_on", "joiner_routing_off", "joiner_containerd_pool",
 	} {
 		t.Run(branch, func(t *testing.T) {
 			out, err := run("output", "-raw", branch)
@@ -287,12 +288,27 @@ func TestBootstrapRendersExtraSandboxdEnvBeforeRestart(t *testing.T) {
 // renderBootstrap is the shared setup for the ordering/gating assertions below.
 func renderBootstrap(t *testing.T, output string) string {
 	t.Helper()
+	return renderBootstrapOutputs(t, bootstrapTemplatePath(t), output)[output]
+}
+
+func bootstrapTemplatePath(t *testing.T) string {
+	t.Helper()
+	repoRoot := filepath.Join(filepath.Dir(buildScript(t)), "..", "..")
+	tplPath, err := filepath.Abs(filepath.Join(repoRoot, "Terraform", "templates", "bootstrap.sh.tftpl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return tplPath
+}
+
+// renderBootstrapOutputs renders the fixture against tplPath once and returns
+// the named outputs, so a test can compare two templates branch by branch.
+func renderBootstrapOutputs(t *testing.T, tplPath string, outputs ...string) map[string]string {
+	t.Helper()
 	tf, err := exec.LookPath("terraform")
 	if err != nil {
 		t.Skip("terraform not on PATH")
 	}
-	repoRoot := filepath.Join(filepath.Dir(buildScript(t)), "..", "..")
-	tplPath, _ := filepath.Abs(filepath.Join(repoRoot, "Terraform", "templates", "bootstrap.sh.tftpl"))
 	// See TestBootstrapTemplateRenders: reading the template is what keeps
 	// Go's test cache honest about a terraform subprocess's inputs.
 	if _, err := os.ReadFile(tplPath); err != nil {
@@ -320,11 +336,15 @@ func renderBootstrap(t *testing.T, output string) string {
 	if out, err := run("apply", "-auto-approve", "-input=false"); err != nil {
 		t.Fatalf("apply: %v\n%s", err, out)
 	}
-	out, err := run("output", "-raw", output)
-	if err != nil {
-		t.Fatalf("output %s: %v\n%s", output, err, out)
+	rendered := make(map[string]string, len(outputs))
+	for _, output := range outputs {
+		out, err := run("output", "-raw", output)
+		if err != nil {
+			t.Fatalf("output %s: %v\n%s", output, err, out)
+		}
+		rendered[output] = out
 	}
-	return out
+	return rendered
 }
 
 // pat_scope and l4_proxy_protocol are install.sh flags (plans/identity-and-
@@ -425,6 +445,91 @@ func TestBootstrapKMSBlockPrecedesEnvOverride(t *testing.T) {
 	restartIdx := strings.LastIndex(out, "\nsudo systemctl restart sandboxd\n")
 	if restartIdx < 0 || override > restartIdx {
 		t.Fatalf("secret env must be written before the final restart; override=%d restart=%d", override, restartIdx)
+	}
+}
+
+// With containerd.pool.enabled true the six pool lines reach cluster.env:
+// without them run.sh's containerd-pool capability would silently do nothing.
+// A node's sandboxd_env must still render after them, so a scenario can
+// override one value without a second restart.
+func TestBootstrapRendersContainerdPoolEnvWhenEnabled(t *testing.T) {
+	out := renderBootstrap(t, "joiner_containerd_pool")
+	for _, want := range []string{
+		"SB_CONTAINERD_POOL_ENABLED=true\n",
+		"SB_CONTAINERD_POOL_DEPTH=4\n",
+		"SB_CONTAINERD_POOL_IMAGES=alpine:3.20,python:3.12-slim\n",
+		"SB_CONTAINERD_POOL_MAX_IMAGES=8\n",
+		"SB_CONTAINERD_POOL_IDLE_TTL=15m\n",
+		"SB_CONTAINERD_POOL_REFILL_INTERVAL=5s\n",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("rendered bootstrap is missing %q", strings.TrimSpace(want))
+		}
+	}
+
+	cfg := strings.Index(out, "SB_CONTAINERD_POOL_DEPTH=4\n")
+	override := strings.Index(out, "SB_CONTAINERD_POOL_DEPTH=8\n")
+	tee := strings.Index(out, "tee -a /etc/sandboxd/cluster.env")
+	if cfg < 0 || override < 0 || tee < 0 {
+		t.Fatalf("could not locate cfg=%d override=%d tee=%d", cfg, override, tee)
+	}
+	if !(cfg < override && override < tee) {
+		t.Fatalf("sandboxd_env must render after the containerd pool block and before the cluster.env write; got cfg=%d override=%d tee=%d",
+			cfg, override, tee)
+	}
+}
+
+// With the pool off (the default) the template must add not one byte to any
+// node's bootstrap. Nodes use user_data_replace_on_change, so a changed
+// rendering replaces every node of a running cluster on the next apply; and
+// an explicit "false" in cluster.env, which loads after sandboxd.env, would
+// override a value an operator set by hand there.
+//
+// The check renders every pool-off branch twice, from the real template and
+// from a copy with the whole %{ if containerd_pool_cfg.enabled } block cut
+// out (which is what the template was before the block existed), and wants
+// the two byte for byte equal. That catches a stray line outside the block
+// and a lost ~ strip marker leaving a blank line behind.
+func TestBootstrapContainerdPoolOffRendersNothing(t *testing.T) {
+	tplPath := bootstrapTemplatePath(t)
+	raw, err := os.ReadFile(tplPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const open = "%{ if containerd_pool_cfg.enabled == \"true\" ~}\n"
+	const closeTag = "%{ endif ~}\n"
+	start := strings.Index(string(raw), open)
+	if start < 0 {
+		t.Fatalf("template has no %q block; the pool lines must be gated on it", strings.TrimSpace(open))
+	}
+	end := strings.Index(string(raw)[start:], closeTag)
+	if end < 0 {
+		t.Fatal("containerd pool block has no closing endif")
+	}
+	without := string(raw)[:start] + string(raw)[start+end+len(closeTag):]
+	if strings.Contains(without, "containerd_pool_cfg") {
+		t.Fatal("containerd_pool_cfg is referenced outside its enabled block, so pool-off still renders it")
+	}
+	strippedPath := filepath.Join(t.TempDir(), "bootstrap.sh.tftpl")
+	if err := os.WriteFile(strippedPath, []byte(without), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	offBranches := []string{
+		"seed", "joiner", "joiner_kms", "joiner_audit_s3", "joiner_audit_file",
+		"seed_receiver", "joiner_receiver", "seed_public_ca", "seed_wrapped",
+		"joiner_api_lb", "joiner_api_lb_worker", "joiner_identity_flags",
+	}
+	got := renderBootstrapOutputs(t, tplPath, offBranches...)
+	want := renderBootstrapOutputs(t, strippedPath, offBranches...)
+	for _, branch := range offBranches {
+		if strings.Contains(got[branch], "SB_CONTAINERD_POOL_") {
+			t.Errorf("%s: pool-off bootstrap writes SB_CONTAINERD_POOL_* lines", branch)
+		}
+		if got[branch] != want[branch] {
+			t.Errorf("%s: pool-off bootstrap differs from the template without the pool block (%d vs %d bytes), so the next apply on a running cluster would replace every node",
+				branch, len(got[branch]), len(want[branch]))
+		}
 	}
 }
 
@@ -591,4 +696,66 @@ func TestBootstrapJoinerInstallsWithoutStarting(t *testing.T) {
 	if i, j := strings.Index(joiner, flag), strings.Index(joiner, `sudo /tmp/install.sh "${INSTALL_ARGS[@]}"`); i < 0 || j < 0 || i > j {
 		t.Errorf("--no-start is not added before install.sh runs (flag at %d, install at %d)", i, j)
 	}
+}
+
+// default_ingress_proxy_routing is three-valued. null, its default, must
+// render exactly what the old default false rendered, which was no routing
+// text at all: nodes have user_data_replace_on_change, so one extra byte
+// would replace every node of every cluster that never set the variable.
+// true must render today's single line and nothing else (clusters that set
+// it keep their nodes too); false renders the off switch, because without a
+// flag install.sh turns routing on for a domain install.
+func TestBootstrapIngressProxyRoutingIsThreeValued(t *testing.T) {
+	null := renderBootstrap(t, "joiner")
+	on := renderBootstrap(t, "joiner_routing_on")
+	off := renderBootstrap(t, "joiner_routing_off")
+
+	if strings.Contains(null, "ingress-proxy-routing") {
+		t.Fatal("the null (default) render mentions ingress-proxy-routing; it must render no routing text at all")
+	}
+	added, ok := insertedLines(null, on)
+	if !ok || len(added) != 1 || added[0] != "INSTALL_ARGS+=(--ingress-proxy-routing)" {
+		t.Fatalf("true must add exactly the one flag line to the null render; added %q (contiguous=%v)", added, ok)
+	}
+	added, ok = insertedLines(null, off)
+	if !ok || len(added) == 0 || added[len(added)-1] != "INSTALL_ARGS+=(--no-ingress-proxy-routing)" {
+		t.Fatalf("false must add the off flag to the null render; added %q (contiguous=%v)", added, ok)
+	}
+	for _, l := range added[:len(added)-1] {
+		if !strings.HasPrefix(l, "#") {
+			t.Errorf("false adds a non-comment line besides the flag: %q", l)
+		}
+	}
+
+	// And the default really is null: a default of false would now render
+	// the off switch on every node and replace them all.
+	raw, err := os.ReadFile(filepath.Join(filepath.Dir(buildScript(t)), "..", "..", "Terraform", "variables.tf"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	block := regexp.MustCompile(`(?s)variable "default_ingress_proxy_routing" \{.*?\n\}`).FindString(string(raw))
+	if block == "" || !regexp.MustCompile(`\n\s*default\s*=\s*null\s*\n`).MatchString(block) {
+		t.Fatalf("default_ingress_proxy_routing must default to null:\n%s", block)
+	}
+}
+
+// insertedLines returns the lines with adds to base, when with is base plus
+// one contiguous run of lines (ok false otherwise).
+func insertedLines(base, with string) ([]string, bool) {
+	b, w := strings.Split(base, "\n"), strings.Split(with, "\n")
+	if len(w) < len(b) {
+		return nil, false
+	}
+	pre := 0
+	for pre < len(b) && b[pre] == w[pre] {
+		pre++
+	}
+	suf := 0
+	for suf < len(b)-pre && b[len(b)-1-suf] == w[len(w)-1-suf] {
+		suf++
+	}
+	if pre+suf != len(b) {
+		return nil, false
+	}
+	return w[pre : len(w)-suf], true
 }

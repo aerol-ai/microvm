@@ -28,6 +28,8 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"os"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -36,6 +38,7 @@ import (
 	"time"
 
 	"github.com/aerol-ai/microvm/integration-tests/suite/harness"
+	"github.com/aerol-ai/microvm/internal/failpoint"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
 
@@ -924,7 +927,29 @@ func TestClusterChaosRollingServerRestart(t *testing.T) {
 		}
 	}
 
-	fresh := chaosNewSandbox(t, api, chaosRequest(harness.UniqueName(sc, t)+"-after", tag, false, cpu, mem, "", nil))
+	// The last restart was the leader's. Its replacement answers placement
+	// reads at once but places nothing until each worker's next capacity
+	// report reaches it, about 20 s (UC-481 measures the same gap), and says
+	// so with a retryable 503. So the create retries a 503 for a bounded
+	// time, as a client would, and the wait is logged.
+	afterReq := chaosRequest(harness.UniqueName(sc, t)+"-after", tag, false, cpu, mem, "", nil)
+	createStart := time.Now()
+	var made chaosCreateResult
+	for {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		made = chaosCreate(ctx, api, afterReq)
+		cancel()
+		if made.ok() || made.Status != http.StatusServiceUnavailable || time.Since(createStart) > 90*time.Second {
+			break
+		}
+		time.Sleep(3 * time.Second)
+	}
+	if !made.ok() {
+		t.Fatalf("create %s after the restarts: %s %v %s (retried 503s for %s)", afterReq.Name, made.describe(), made.Err, made.Body, time.Since(createStart).Round(time.Second))
+	}
+	t.Logf("the first create after the restarts succeeded %s after the leader's restart", time.Since(createStart).Round(time.Second))
+	chaosAwaitStarted(t, api, made.ID, 3*time.Minute)
+	fresh := made.ID
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	st, err := chaosDelete(ctx, api, fresh)
 	cancel()
@@ -1285,6 +1310,434 @@ func TestClusterChaosOldCopyDiesAfterReturn(t *testing.T) {
 		inv.Violate("I1", "the returned %s ran the sandbox at %d of %d samples (first %s after it started coming back), while %s owned it", w1.Name, onOld, samples, firstOld, w2.Name)
 	default:
 		inv.Hold("I1", "the returned %s ran no copy over %d samples (%s)", w1.Name, samples, time.Since(sampleStart).Round(time.Second))
+	}
+}
+
+// UC-480 — a worker crashes between starting a sandbox and storing its row.
+// The failpoint internal/failpoint.CreateBeforePersist is armed on every
+// worker for this case's unique name; the one worker the create lands on
+// parks it with the container running, its route and network slot held,
+// its placement reserved, and no row; the case SIGKILLs sandboxd there
+// (systemd restarts it at once, as on a real node).
+//
+// I8: once the reservation TTL and chaosConvergeBound have passed, the
+// create is fully created (an answered 2xx: placed, and running once on its
+// owner) or fully absent: the crashed attempt runs on no worker, has no
+// placement, the API answers 404 for it, the worker holds no extra netns
+// slot, and no container runs without a placement (chaosCheckCreates). I6:
+// no reservation outlives its TTL.
+//
+// Needs sandboxd built with -tags itest_failpoints: run.sh's local build of
+// cluster-chaos adds it (caps go_tags). On a binary without it the
+// failpoint never fires and the create succeeds; the case then skips.
+func TestClusterChaosCrashBeforeCreatePersists(t *testing.T) {
+	harness.Require(t, sc, "UC-480")
+	requireDisruptive(t, "this SIGKILLs a worker's sandboxd in the middle of a create")
+	tp := chaosTopology(t)
+	inv := harness.TrackInvariants(t, "I8", "I6")
+	tag := chaosTag(t)
+	observer := chaosAPI(t, tp.servers[0])
+	ids := chaosNodeIDs(t, observer, tp)
+	wapis := chaosWorkerAPIs(t, tp)
+	budgets := chaosBudgets(t, wapis)
+	bound := chaosConvergeBound(t, tp)
+	baseline := chaosCensusAll(t, tp.workers)
+	if !baseline.complete() {
+		t.Fatalf("baseline census incomplete: %s", baseline.errSummary())
+	}
+	slotsBefore := map[string]int{}
+	for name, api := range wapis {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		n, ok, err := chaosNetnsInUse(ctx, api)
+		cancel()
+		if err != nil {
+			t.Fatalf("read %s's netns pool: %v", name, err)
+		}
+		if ok {
+			slotsBefore[name] = n
+		}
+	}
+
+	name := harness.UniqueName(sc, t)
+	chaosArmFailpoint(t, tp.workers, failpoint.CreateBeforePersist, name)
+	cpu, mem := chaosSmallSize()
+	done := make(chan chaosCreateResult, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+		defer cancel()
+		done <- chaosCreate(ctx, operatorAPI(), chaosRequest(name, tag, false, cpu, mem, "", nil))
+	}()
+
+	// Wait for the hit, or for the create to answer without one. The create
+	// is read before the markers in each round, so the round that sees it
+	// answered still checks every worker once more after it.
+	var (
+		victim   harness.IntegrationNode
+		res      chaosCreateResult
+		answered bool
+	)
+	for deadline := time.Now().Add(4 * time.Minute); victim.Name == ""; time.Sleep(time.Second) {
+		select {
+		case res = <-done:
+			answered = true
+		default:
+		}
+		for _, w := range tp.workers {
+			key, hit, err := chaosFailpointHit(t, w, failpoint.CreateBeforePersist)
+			if err != nil {
+				t.Logf("failpoint check: %v", err)
+				continue
+			}
+			if hit {
+				victim = w
+				t.Logf("the create of %q parked on %s before its row was stored", key, w.Name)
+			}
+		}
+		if victim.Name != "" || answered {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("neither did the failpoint fire nor did the create of %s answer within 4m", name)
+		}
+	}
+	if victim.Name == "" {
+		if res.ok() {
+			t.Skipf("the failpoint never fired and the create succeeded (%s): sandboxd on the workers has no failpoints. "+
+				"run.sh builds cluster-chaos with -tags itest_failpoints (caps go_tags; the build id ends -tags-itest_failpoints, this run's is %q); "+
+				"a --released or --version run installs release binaries without them", res.ID, os.Getenv("AEROL_BUILD_ID"))
+		}
+		t.Fatalf("precondition: the create failed before it reached the failpoint: %s %v %s", res.describe(), res.Err, res.Body)
+	}
+
+	// Which sandbox: the reservation the leader holds for the name, and the
+	// new task the victim runs. Either may be missing; each found one is
+	// checked.
+	var crashed []string
+	for _, r := range chaosIndexEventually(t, observer) {
+		if r.Name == name {
+			crashed = append(crashed, r.SandboxID)
+		}
+	}
+	if c, err := chaosCensus(t, victim); err == nil {
+		for _, id := range c.RunningIDs() {
+			if !baseline.byNode[victim.Name].Running(id) && !slices.Contains(crashed, id) {
+				crashed = append(crashed, id)
+			}
+		}
+	} else {
+		t.Logf("census of %s before the kill: %v", victim.Name, err)
+	}
+	t.Logf("the parked create is %v on %s", crashed, victim.Name)
+
+	target, _ := harness.SSHTarget(victim)
+	var once sync.Once
+	restore := func() { once.Do(func() { restoreNodeDaemon(t, victim, target) }) }
+	t.Cleanup(restore)
+	out, err := harness.SSHRun(t, target, harness.KillSandboxdScript)
+	harness.MarkNodeDown(victim.PublicIP)
+	killedAt := time.Now()
+	if err != nil || !strings.Contains(out, "KILLED") {
+		t.Fatalf("SIGKILL sandboxd on %s: %v %s", victim.Name, err, out)
+	}
+	// systemd restarts it (Restart=always); restore only waits for the
+	// rejoin, its start being a no-op on a unit that is back.
+	restore()
+	t.Logf("SIGKILLed sandboxd on %s; back after %s", victim.Name, time.Since(killedAt).Round(time.Second))
+	if !answered {
+		select {
+		case res = <-done:
+		case <-time.After(3 * time.Minute):
+			t.Errorf("the create of %s was still unanswered 3m after its worker died", name)
+			// Judged as a failed create below: it must still leave nothing.
+			res = chaosCreateResult{Name: name, Err: fmt.Errorf("unanswered 3m after its worker died")}
+		}
+	}
+	t.Logf("the create answered %s %v %s", res.describe(), res.Err, res.Body)
+
+	settle := chaosReservationTTL + 30*time.Second
+	if bound > settle {
+		settle = bound
+	}
+	if wait := settle - time.Since(killedAt); wait > 0 {
+		t.Logf("waiting %s for the reservation to expire and reconcile to converge", wait.Round(time.Second))
+		time.Sleep(wait)
+	}
+	chaosCheckCreates(t, inv, tp, observer, ids, []chaosCreateResult{res}, name, baseline, cpu, budgets)
+
+	// The crashed attempt itself, unless the create answered with it (a
+	// replay that finished the create elsewhere is fully created, which
+	// chaosCheckCreates just checked).
+	fc := chaosCensusAll(t, tp.workers)
+	if !fc.complete() {
+		t.Fatalf("census after convergence is incomplete: %s", fc.errSummary())
+	}
+	for _, id := range crashed {
+		if res.ok() && res.ID == id {
+			continue
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		pv, found, perr := chaosPlacement(ctx, observer, id)
+		st, _, gerr := chaosGetStatus(ctx, operatorAPI(), id)
+		cancel()
+		switch {
+		case perr != nil:
+			t.Errorf("placement of %s: %v", id, perr)
+		case found:
+			inv.Violate("I8", "the crashed create %s still has a placement (owner %q, state %q) %s after the kill", id, pv.Owner.NodeID, pv.OwnerState, time.Since(killedAt).Round(time.Second))
+		}
+		switch {
+		case gerr != nil:
+			t.Errorf("get %s: %v", id, gerr)
+		case st != http.StatusNotFound:
+			inv.Violate("I8", "the crashed create %s answers %d on the API, not 404", id, st)
+		}
+		if on := fc.runningOn(id); len(on) > 0 {
+			inv.Violate("I8", "the crashed create %s still runs on %v %s after the kill", id, on, time.Since(killedAt).Round(time.Second))
+		}
+	}
+
+	// Its netns slot: the victim may hold one more only for a sandbox of
+	// this create that is placed and running there.
+	if before, ok := slotsBefore[victim.Name]; ok {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		after, _, err := chaosNetnsInUse(ctx, wapis[victim.Name])
+		cancel()
+		legit := 0
+		if res.ok() && slices.Contains(fc.runningOn(res.ID), victim.Name) {
+			legit = 1
+		}
+		switch {
+		case err != nil:
+			t.Errorf("read %s's netns pool after the crash: %v", victim.Name, err)
+		case after > before+legit:
+			inv.Violate("I8", "%s holds %d netns slots, %d before the crashed create (%d for a sandbox it now runs)", victim.Name, after, before, legit)
+		}
+	} else {
+		t.Logf("%s reports no containerd netns pool; the slot check does not apply", victim.Name)
+	}
+
+	if !inv.Violated("I8") {
+		inv.Hold("I8", "a create SIGKILLed on %s between the runtime start and the store write (%v) left no placement, no container and no netns slot %s after the kill; the create answered %s",
+			victim.Name, crashed, settle.Round(time.Second), res.describe())
+	}
+	if !inv.Violated("I6") {
+		inv.Hold("I6", "no reservation or stray copy left %s after the kill", settle.Round(time.Second))
+	}
+}
+
+// UC-481 — control-plane recovery time. sandboxd is SIGKILLed on all three
+// servers at once (AEROL_CHAOS_RTO_MODE=leader kills only the Raft leader),
+// and systemd restarts them as it would after a crash. A prober sends,
+// every second, through the API domain: GET /v1/cluster/leader (it must
+// name a leader), a placement read for a sandbox made before the kill (it
+// must name the owner it had), and a create. Each signal's recovery is the
+// answer time of its first success after its last failure
+// (harness.RecoveredAt); the control plane's recovery time is the latest of
+// the three, logged and put in the report's detail.
+//
+// I6: recovery within AEROL_CHAOS_RTO_BUDGET_SECONDS (default 55: about 1.5
+// times the first measured run, 34.5 s on 2026-11-08 with t3.medium servers;
+// leader and placement reads were back at 13.3 s, and creates waited for the
+// new leader's first worker capacity reports), and afterwards every placement made before
+// the kill has the owner and incarnation it had, read on every server, and
+// still runs once on that owner. I8, I4: the creates the prober sent during
+// the outage end as chaosCheckCreates expects.
+func TestClusterChaosControlPlaneRecoveryTime(t *testing.T) {
+	harness.Require(t, sc, "UC-481")
+	requireDisruptive(t, "this SIGKILLs sandboxd on the Raft servers")
+	tp := chaosTopology(t)
+	inv := harness.TrackInvariants(t, "I6", "I8", "I4")
+	tag := chaosTag(t)
+	observer := chaosAPI(t, tp.servers[0])
+	ids := chaosNodeIDs(t, observer, tp)
+	budgets := chaosBudgets(t, chaosWorkerAPIs(t, tp))
+	bound := chaosConvergeBound(t, tp)
+	budget := chaosSeconds("AEROL_CHAOS_RTO_BUDGET_SECONDS", 55)
+	mode := chaosString("AEROL_CHAOS_RTO_MODE", "all")
+	if mode != "all" && mode != "leader" {
+		t.Fatalf("AEROL_CHAOS_RTO_MODE=%q: want all or leader", mode)
+	}
+	api := operatorAPI()
+	cpu, mem := chaosSmallSize()
+
+	k := envInt("AEROL_CHAOS_RTO_SANDBOXES", 3)
+	var sbs []string
+	for i := 0; i < k; i++ {
+		sbs = append(sbs, chaosNewSandbox(t, api, chaosRequest(fmt.Sprintf("%s-%d", harness.UniqueName(sc, t), i), tag, false, cpu, mem, "", nil)))
+	}
+	type committed struct{ owner, incarnation string }
+	snapshot := func(view *harness.APIClient) map[string]committed {
+		out := map[string]committed{}
+		for _, r := range chaosIndexEventually(t, view) {
+			out[r.SandboxID] = committed{owner: r.OwnerNodeID, incarnation: r.IncarnationID}
+		}
+		return out
+	}
+	before := snapshot(observer)
+	for _, id := range sbs {
+		if before[id].owner == "" || before[id].incarnation == "" {
+			t.Fatalf("no committed placement for %s before the kill: %+v", id, before[id])
+		}
+	}
+	probeID, wantOwner := sbs[0], before[sbs[0]].owner
+	baseline := chaosCensusAll(t, tp.workers)
+	if !baseline.complete() {
+		t.Fatalf("baseline census incomplete: %s", baseline.errSummary())
+	}
+
+	victims := tp.servers
+	if mode == "leader" {
+		leader, ok := chaosNodeByID(tp, ids, chaosLeaderID(t, observer))
+		if !ok {
+			t.Fatal("the Raft leader is not a provisioned node")
+		}
+		victims = []harness.IntegrationNode{leader}
+	}
+
+	var (
+		mu                           sync.Mutex
+		leaderP, placeP, createP     []harness.RecoveryProbe
+		results                      []chaosCreateResult
+		probes, creates              sync.WaitGroup
+		createsSent, createsInFlight atomic.Int64
+	)
+	prefix := fmt.Sprintf("chaos481-%d-", time.Now().Unix())
+	maxCreates := int64(envInt("AEROL_CHAOS_RTO_MAX_CREATES", 120))
+	record := func(dst *[]harness.RecoveryProbe, sent time.Time, ok bool) {
+		mu.Lock()
+		*dst = append(*dst, harness.RecoveryProbe{Sent: sent, Answered: time.Now(), OK: ok})
+		mu.Unlock()
+	}
+	streaks := func() (l, p, c int) {
+		mu.Lock()
+		defer mu.Unlock()
+		return harness.RecoveryStreak(leaderP), harness.RecoveryStreak(placeP), harness.RecoveryStreak(createP)
+	}
+	// Five in a row: one success can be a cache or a lucky retry.
+	const stable = 5
+
+	restore := chaosKillVoters(t, victims)
+	killedAt := time.Now()
+	t.Logf("SIGKILLed sandboxd on %v (mode %s)", chaosNames(victims), mode)
+	deadline := killedAt.Add(budget + 3*time.Minute)
+	for tick := time.NewTicker(time.Second); ; <-tick.C {
+		now := time.Now()
+		l, p, c := streaks()
+		// At least ten seconds: the servers come back no sooner than
+		// RestartSec (5 s), and the first answers may still be cached.
+		if (now.Sub(killedAt) >= 10*time.Second && l >= stable && p >= stable && c >= stable) || now.After(deadline) {
+			tick.Stop()
+			break
+		}
+		probes.Add(2)
+		go func(sent time.Time) {
+			defer probes.Done()
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			resp, err := api.Do(ctx, http.MethodGet, "/v1/cluster/leader", nil)
+			record(&leaderP, sent, err == nil && resp.Status == http.StatusOK && harness.ParseLeaderJSON(string(resp.Body)) != "")
+		}(now)
+		go func(sent time.Time) {
+			defer probes.Done()
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			pv, found, err := chaosPlacement(ctx, api, probeID)
+			record(&placeP, sent, err == nil && found && pv.Owner.NodeID == wantOwner)
+		}(now)
+		// A create a second until creates are stably back, at most 16 in
+		// flight: during the outage they hang, and a pile of them would
+		// measure the client, not the cluster.
+		if c < stable && createsSent.Load() < maxCreates && createsInFlight.Load() < 16 {
+			i := createsSent.Add(1)
+			createsInFlight.Add(1)
+			creates.Add(1)
+			go func(sent time.Time, i int64) {
+				defer creates.Done()
+				defer createsInFlight.Add(-1)
+				ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+				defer cancel()
+				r := chaosCreate(ctx, api, chaosRequest(fmt.Sprintf("%s%03d", prefix, i), tag, false, cpu, mem, "", nil))
+				mu.Lock()
+				results = append(results, r)
+				mu.Unlock()
+				record(&createP, sent, r.ok())
+			}(now, i)
+		}
+	}
+	probes.Wait()
+	creates.Wait()
+	restore()
+
+	mu.Lock()
+	lAt, lOut, lOK := harness.RecoveredAt(leaderP)
+	pAt, pOut, pOK := harness.RecoveredAt(placeP)
+	cAt, cOut, cOK := harness.RecoveredAt(createP)
+	batch := append([]chaosCreateResult(nil), results...)
+	mu.Unlock()
+	since := func(at time.Time, ok bool) string {
+		if !ok {
+			return "never"
+		}
+		return at.Sub(killedAt).Round(100 * time.Millisecond).String()
+	}
+	signals := fmt.Sprintf("leader %s, placement read %s, create %s; outage seen: leader %v, placement %v, create %v",
+		since(lAt, lOK), since(pAt, pOK), since(cAt, cOK), lOut, pOut, cOut)
+	recovery := time.Duration(-1)
+	if lOK && pOK && cOK {
+		recovery = max(lAt.Sub(killedAt), pAt.Sub(killedAt), cAt.Sub(killedAt))
+	}
+	t.Logf("rto mode=%s recovery_seconds=%.1f budget_seconds=%.0f (%s)", mode, recovery.Seconds(), budget.Seconds(), signals)
+	if mode == "all" && !cOut {
+		t.Errorf("precondition: no create failed after every server was SIGKILLed, so the kill did not take effect (%s)", signals)
+	}
+	switch {
+	case recovery < 0:
+		inv.Violate("I6", "the control plane had not recovered %s after the kill (mode %s; %s)", deadline.Sub(killedAt).Round(time.Second), mode, signals)
+	case recovery > budget:
+		inv.Violate("I6", "control-plane recovery took %s, over the %s budget (mode %s; %s)", recovery.Round(100*time.Millisecond), budget, mode, signals)
+	}
+
+	settle := chaosReservationTTL + 30*time.Second
+	if bound > settle {
+		settle = bound
+	}
+	if wait := settle - time.Since(killedAt); wait > 0 {
+		t.Logf("waiting %s for reservations to expire and reconcile to converge", wait.Round(time.Second))
+		time.Sleep(wait)
+	}
+	res := chaosCheckCreates(t, inv, tp, observer, ids, batch, prefix, baseline, cpu, budgets)
+	t.Logf("%d creates sent across the outage: %d created, %d failed (%d absent, %d applied anyway)", len(batch), res.created, res.failed, res.absent, res.appliedAnyway)
+
+	// Every placement made before the kill, read on every server.
+	for _, s := range tp.servers {
+		view := chaosAPI(t, s)
+		after := snapshot(view)
+		for _, id := range sbs {
+			if got, want := after[id], before[id]; got != want {
+				inv.Violate("I6", "after the kill %s reads %s as owner %q incarnation %q; before it was %q %q", s.Name, id, got.owner, got.incarnation, want.owner, want.incarnation)
+			}
+		}
+	}
+	fc := chaosCensusAll(t, tp.workers)
+	if !fc.complete() {
+		t.Errorf("census after the recovery is incomplete: %s", fc.errSummary())
+	}
+	for _, id := range sbs {
+		owner, _ := chaosNodeByID(tp, ids, before[id].owner)
+		if on := fc.runningOn(id); len(on) != 1 || on[0] != owner.Name {
+			inv.Violate("I6", "after the kill %s runs on %v; its owner is %s", id, on, owner.Name)
+		}
+	}
+
+	if !inv.Violated("I6") {
+		inv.Hold("I6", "control plane recovered in %s, within the %s budget (mode %s; %s); %d placements kept owner and incarnation on every server",
+			recovery.Round(100*time.Millisecond), budget, mode, signals, len(sbs))
+	}
+	if !inv.Violated("I8") {
+		inv.Hold("I8", "%d creates across the outage: %d created, %d failed and left nothing, %d applied after an error", len(batch), res.created, res.absent, res.appliedAnyway)
+	}
+	if !inv.Violated("I4") {
+		inv.Hold("I4", "every worker within its CPU budget")
 	}
 }
 

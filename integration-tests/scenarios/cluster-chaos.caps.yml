@@ -1,5 +1,6 @@
 # cluster-chaos: the cluster-correctness fault scenario (UC-470..UC-479,
-# plans/cluster-correctness-and-create-latency.md §3.2). 3 server / 3 worker /
+# plans/cluster-correctness-and-create-latency.md §3.2) and the release-gate
+# tools (UC-480..UC-482, plans/cluster-phase-2.md §5). 3 server / 3 worker /
 # 1 ingress, all t3.medium on-demand; see cluster-chaos.tfvars for why.
 name: cluster-chaos
 capabilities:
@@ -15,6 +16,14 @@ expected_members: 7
 
 # Every case here injects a fault.
 disruptive: true
+
+# Test-only Go build tags for this scenario's LOCAL build of sandboxd
+# (run.sh go_tags_for -> lib/build.sh AEROL_GO_TAGS; the tags land in the
+# build id). itest_failpoints compiles in internal/failpoint, which UC-480
+# arms to park a create between the runtime start and the store write. A
+# --released or --version run installs release binaries without it, and
+# UC-480 skips there. safety/build_test.go keeps every go_tags entry itest_*.
+go_tags: itest_failpoints
 
 # Only the chaos cases run on this scenario. run.sh passes `run` to go test as
 # -run, and the report marks every use case that does not need `capability`

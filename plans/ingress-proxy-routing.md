@@ -264,8 +264,16 @@ extra, because the responder starts with the daemon.
 
 ## 5. Rollout
 
-- **Flag:** `SB_INGRESS_PROXY_ROUTING`, default **false**. Its rationale goes in
-  `setup/config-defaults.md`.
+- **Flag:** `SB_INGRESS_PROXY_ROUTING`. It shipped default **false** and is
+  now default **true** where it applies (a node with Caddy and a domain; the
+  config clears it elsewhere, so local and IP-mode nodes stay silent).
+  `install.sh` turns it on for a `--domain` install
+  (`--no-ingress-proxy-routing` for off). Terraform's
+  `default_ingress_proxy_routing` is nullable: null (the default) passes no
+  flag, so install.sh's default applies, and renders the same user data as
+  the old default false, so no running node is replaced; `true` or `false`
+  passes an explicit flag (`plans/cluster-phase-2.md` §4.3). The rationale
+  is in `setup/config-defaults.md`.
 - **Per-node, no flag-day.** Owner and ingress flags are independent; the
   matrix is tested (6A).
 - **Flag on:** verify the resolver routing domain, install the static routes,
@@ -304,8 +312,13 @@ extra, because the responder starts with the daemon.
   100k.
 - **Delta feed:** control-plane load scales with churn, not with ingress count
   × fleet size.
-- **Before any default flip:** the repro harness (0% target) plus a
-  latency/throughput A/B.
+- **Before the default flip:** the repro harness (0% target) plus a latency
+  A/B. The gate moved from the metal flagship to t3.medium
+  (`cluster-hetero-lite-routing`), with the test binary on one of its
+  server nodes inside AWS, not on a laptop (`plans/cluster-phase-2.md`
+  §4.2): UC-171 and UC-357 with 0 failed connections, then UC-171's
+  expose-to-first-200 and fresh-connection p50/p99 with the flag on and off,
+  the pair repeated once.
 
 ## 8. Test plan (build contract)
 
@@ -349,7 +362,7 @@ extra, because the responder starts with the daemon.
     churn (HTTP and TCP);
   - a sandboxd-restart UC: established WebSocket and TCP sessions survive;
   - UC-09, 29, 31, custom-domain, serverless and TCP/TLS-port UCs with the
-    flag on (hetero-lite + flagship).
+    flag on (hetero-lite; the flagship was dropped from the gate, §7).
 - **Coverage:** 85% or higher per package.
 
 ## 9. Follow-ups (TODOS)
@@ -497,10 +510,11 @@ No critical gaps: every row has a test and handling.
     4. Bootstrap restarts refused the flag, and a refusal left Caddy
        half-switched. Fixed with a bind retry, a 60s probe budget, and a
        rollback when an engage is refused after a flag-on boot.
-  - Outstanding: hetero-lite with the flag on (`make
-    integration-routing-hetero-lite`), then the flagship.
+  - Hetero-lite with the flag on: 125 pass / 0 fail. The default-flip gate
+    then moved off the flagship to hetero-lite, run from a server node
+    (§7; `integration-tests/README.md`, "Routing gate from inside the VPC").
   - Surfaced by: the §8 integration line.
-  - Verify: hetero-lite plus flagship with the flag on.
+  - Verify: hetero-lite with the flag on, and the §7 gate.
 
 ## GSTACK REVIEW REPORT
 

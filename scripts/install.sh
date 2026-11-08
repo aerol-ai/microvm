@@ -21,13 +21,6 @@ ACME_CA=""
 ACME_CA_ROOT=""
 TLS_ISSUER="acme"
 CADDY_BUILD_URL_BASE="https://caddyserver.com/api/download"
-# The stock Caddy package, which provides the caddy user, caddy.service and
-# /etc/caddy; install_custom_caddy then swaps in the plugin build. It comes
-# from Caddy's GitHub release, not the Cloudsmith apt repository: that
-# answers 402 Payment Required whenever Cloudsmith's bandwidth quota runs
-# out (2023, 2024, and from 2026-10-09), and then every install failed.
-CADDY_PACKAGE_VERSION="2.11.7"
-CADDY_PACKAGE_URL_BASE="https://github.com/caddyserver/caddy/releases/download"
 CADDY_BINARY_URL=""
 CADDY_BINARY_URL_EXPLICIT="false"
 WITH_GVISOR="false"
@@ -35,8 +28,10 @@ RUNSC_PATH=""
 WITH_ISOLATE="false"
 # Routing without per-sandbox Caddy writes (plans/ingress-proxy-routing.md).
 # Sets SB_INGRESS_PROXY_ROUTING and routes *.rt.internal to the sandboxd
-# route responder via systemd-resolved.
-INGRESS_PROXY_ROUTING="false"
+# route responder via systemd-resolved. Empty until the flags are parsed:
+# --ingress-proxy-routing / --no-ingress-proxy-routing decide, and without
+# either resolve_ingress_proxy_routing turns it on for a --domain install.
+INGRESS_PROXY_ROUTING=""
 ROUTE_DNS_ADDR="127.0.0.1:53053"
 # The aerolvm-rt link's own address. systemd-resolved sends *.rt.internal
 # here, not to ROUTE_DNS_ADDR (write_route_dns_resolver says why), and
@@ -44,31 +39,7 @@ ROUTE_DNS_ADDR="127.0.0.1:53053"
 ROUTE_DNS_LINK_IP="169.254.53.53"
 ROUTE_DNS_LINK_ADDR="${ROUTE_DNS_LINK_IP}:53053"
 WORKERD_PATH=""
-# Version-pinned workerd release for --with-isolate (plans/isolate-runtime.md
-# Phase 1). Upstream ships gzipped standalone binaries with no checksum
-# sidecar, so the per-arch SHA-256 is pinned here and MUST be bumped together
-# with the version — see setup/runbooks for the upgrade recipe.
-WORKERD_VERSION="v1.20260717.1"
-WORKERD_SHA256_LINUX_64="7ff61e052347ab3122c43b1e2419ccd68bd91e3c766f9770320591798e0e89a0"
-WORKERD_SHA256_LINUX_ARM64="3ef71b4a692d2705fa4db0636724409be833402f1c9b99094294a5901989680d"
 WITH_FIRECRACKER="false"
-# Version-pinned Firecracker for --with-firecracker: the release and guest
-# kernel Terraform (Terraform/variables.tf) and Ansible
-# (Ansible/inventory/group_vars/all/defaults.yml) pin, so a node set up by
-# hand boots what the cluster tooling is tested on. The kernel bucket
-# publishes no checksums, and the release's .sha256.txt comes from the same
-# place as the tarball, so it cannot catch a replaced release. Every file is
-# checked against a SHA-256 pinned here instead, as for workerd. Bump the
-# versions and all six hashes together.
-FIRECRACKER_VERSION="v1.15.1"
-FIRECRACKER_KERNEL_CI_VERSION="v1.15"
-FIRECRACKER_KERNEL_VERSION="5.10.245"
-FIRECRACKER_SHA256_X86_64="d4a32ab2322d887ca1bc4a4e7afa9cc35393e6362dfc2b3becb389d362e4275a"
-FIRECRACKER_SHA256_AARCH64="00654ac1e702a22744121ea9f10a4f792ebd7c3a744cba587dfac9fcb79b41a5"
-FIRECRACKER_KERNEL_SHA256_X86_64="c453f36520d2f2792ab8e4532a814e4a647a4a41a4c94d4e9083a502800159b1"
-FIRECRACKER_KERNEL_SHA256_AARCH64="f88e4f934b8d9c3f3a58a4df24c3cef4e6d94976d34a9360525c008e7e5df0a7"
-FIRECRACKER_KERNEL_CONFIG_SHA256_X86_64="bccb4a2403d902e1e184e6281270b2b755c6ad6eff1a830c5b8bc788c7b205f8"
-FIRECRACKER_KERNEL_CONFIG_SHA256_AARCH64="ecd245d7a011920456813472f5182db730884a3088dbe79aad4c1e7e23401656"
 # The daemon's own defaults (SB_FIRECRACKER_BINARY, SB_JAILER_BINARY,
 # SB_FIRECRACKER_KERNEL, SB_FIRECRACKER_TEMPLATES_DIR, SB_JAILER_CHROOT_BASE),
 # so sandboxd.env carries no path settings for them.
@@ -113,6 +84,22 @@ DOWNLOAD_LOW_SPEED_TIME="${AEROL_DOWNLOAD_LOW_SPEED_TIME:-30}"
 DOWNLOAD_RETRY="${AEROL_DOWNLOAD_RETRY:-60}"
 DOWNLOAD_RETRY_DELAY="${AEROL_DOWNLOAD_RETRY_DELAY:-5}"
 DOWNLOAD_RETRY_MAX_TIME="${AEROL_DOWNLOAD_RETRY_MAX_TIME:-900}"
+
+# The download mirror fetch_with_fallback tries when a file's own source
+# fails. On 2026-11-08 GitHub's release downloads answered 504 for hours
+# while its status page stayed green, and every install, Terraform node and
+# integration run failed, because GitHub was the only source. The public
+# bucket holds each AerolVM release at aerolvm/<tag>/<file> and each pinned
+# third-party file at deps/<project>/<version>/<file>; scripts/mirror-sync.sh
+# fills it. It is checked like GitHub is: release files against the
+# release's checksums.txt, third-party files against the SHA-256 pins below.
+# AEROL_DOWNLOAD_MIRROR or --download-mirror replace it; "" or "off" turns it
+# off. ${VAR-default}, not :-, so an empty AEROL_DOWNLOAD_MIRROR turns it off.
+DOWNLOAD_MIRROR_DEFAULT="https://aerolvm-downloads.s3.us-east-1.amazonaws.com"
+DOWNLOAD_MIRROR="${AEROL_DOWNLOAD_MIRROR-$DOWNLOAD_MIRROR_DEFAULT}"
+# The latest release on the mirror, read once from aerolvm/latest.txt when a
+# "latest" download first needs it ("none" once that read failed).
+MIRROR_LATEST_TAG=""
 
 # Shared Caddy cert storage (S3). All default empty / off; the feature is
 # off unless --caddy-storage-s3 is passed. When enabled, every node points
@@ -163,6 +150,126 @@ SANDBOXD_HEALTH_URL="http://127.0.0.1:21212/health"
 SANDBOXD_READY_TRIES=60
 SANDBOXD_WAS_ACTIVE="false"
 SANDBOXD_CONFIG_BEFORE=""
+# Where install_buildkit puts buildkitd, buildctl and their unit: the paths
+# the Terraform bootstrap uses (tests point them elsewhere).
+BUILDKIT_BIN_DIR="/usr/local/bin"
+BUILDKIT_UNIT_FILE="/etc/systemd/system/buildkit.service"
+
+# --- BEGIN DOWNLOAD PINS ------------------------------------------------------
+# Every pinned third-party download, with its SHA-256. A file is installed
+# only if it has the pinned hash, whichever source served it, so neither
+# GitHub nor the mirror has to be trusted with these files.
+# scripts/mirror-sync.sh --deps runs this block (and nothing else from this
+# file) to copy each file listed by download_pins to the mirror, so the
+# installer and the mirror cannot disagree about a version or a hash. Keep it
+# to NAME="value" lines and download_pins. Bump a version and its hashes
+# together, and run mirror-sync.sh --deps before the release that ships them.
+
+# The stock Caddy package, which provides the caddy user, caddy.service and
+# /etc/caddy; install_custom_caddy then swaps in the plugin build. It comes
+# from Caddy's GitHub release, not the Cloudsmith apt repository: that
+# answers 402 Payment Required whenever Cloudsmith's bandwidth quota runs
+# out (2023, 2024, and from 2026-10-09), and then every install failed. The
+# hashes are the release's .deb files (their SHA-512 matches
+# caddy_2.11.7_checksums.txt).
+CADDY_PACKAGE_VERSION="2.11.7"
+CADDY_PACKAGE_URL_BASE="https://github.com/caddyserver/caddy/releases/download"
+CADDY_PACKAGE_SHA256_AMD64="a22b914ffd1958da42bc7ab13b7b62c6100634e0798ab594891d2d61d53ba749"
+CADDY_PACKAGE_SHA256_ARM64="ca8ae5a50439642d7672344b4ec64e47cbddf81beb5da302420a78522eb5a47e"
+CADDY_PACKAGE_SHA256_ARMV7="a423a263b42ffbfb4cf5207c71a76b8b86c0139ee6a0cf29ca4f74bc898b95c8"
+CADDY_PACKAGE_SHA256_ARMV6="0cc377e95a13152c852b274fa610cf3410213aef959b99f5a5df60d06970cc16"
+
+# Version-pinned workerd release for --with-isolate (plans/isolate-runtime.md
+# Phase 1). Upstream ships gzipped standalone binaries with no checksum
+# sidecar, so the per-arch SHA-256 is pinned here and MUST be bumped together
+# with the version — see setup/runbooks for the upgrade recipe.
+WORKERD_VERSION="v1.20260717.1"
+WORKERD_SHA256_LINUX_64="7ff61e052347ab3122c43b1e2419ccd68bd91e3c766f9770320591798e0e89a0"
+WORKERD_SHA256_LINUX_ARM64="3ef71b4a692d2705fa4db0636724409be833402f1c9b99094294a5901989680d"
+
+# Version-pinned Firecracker for --with-firecracker: the release and guest
+# kernel Terraform (Terraform/variables.tf) and Ansible
+# (Ansible/inventory/group_vars/all/defaults.yml) pin, so a node set up by
+# hand boots what the cluster tooling is tested on. The kernel bucket
+# publishes no checksums, and the release's .sha256.txt comes from the same
+# place as the tarball, so it cannot catch a replaced release. Every file is
+# checked against a SHA-256 pinned here instead, as for workerd. Bump the
+# versions and all six hashes together. The BIN hashes are the firecracker
+# and jailer binaries inside each tarball (its own SHA256SUMS lists the
+# same): install.sh never downloads them alone, but the mirror holds them so
+# a Terraform operator can point firecracker_binary_url and
+# firecracker_jailer_url at it.
+FIRECRACKER_VERSION="v1.15.1"
+FIRECRACKER_KERNEL_CI_VERSION="v1.15"
+FIRECRACKER_KERNEL_VERSION="5.10.245"
+FIRECRACKER_SHA256_X86_64="d4a32ab2322d887ca1bc4a4e7afa9cc35393e6362dfc2b3becb389d362e4275a"
+FIRECRACKER_SHA256_AARCH64="00654ac1e702a22744121ea9f10a4f792ebd7c3a744cba587dfac9fcb79b41a5"
+FIRECRACKER_KERNEL_SHA256_X86_64="c453f36520d2f2792ab8e4532a814e4a647a4a41a4c94d4e9083a502800159b1"
+FIRECRACKER_KERNEL_SHA256_AARCH64="f88e4f934b8d9c3f3a58a4df24c3cef4e6d94976d34a9360525c008e7e5df0a7"
+FIRECRACKER_KERNEL_CONFIG_SHA256_X86_64="bccb4a2403d902e1e184e6281270b2b755c6ad6eff1a830c5b8bc788c7b205f8"
+FIRECRACKER_KERNEL_CONFIG_SHA256_AARCH64="ecd245d7a011920456813472f5182db730884a3088dbe79aad4c1e7e23401656"
+FIRECRACKER_BIN_SHA256_X86_64="7e8b57e88c459396d4680d83dcdd8c7f72305447cb55b11f4ac98ad70a3f7825"
+FIRECRACKER_BIN_SHA256_AARCH64="e9ce7466c3b0d879d7a9158f4bf710dd5e131bbc5e580e5269fec66d5b5a0f0a"
+JAILER_BIN_SHA256_X86_64="4830a9b1fc6cece036d8992ff12f1fe9c5247aacad77f42c7aba683c7a08622e"
+JAILER_BIN_SHA256_AARCH64="7faa581395fd1994ee005efc0a9c8826b4a9f0616dd942c2486adb8a8eac13f0"
+
+# CNI plugins and BuildKit for --with-containerd-engine: the versions the
+# Terraform bootstrap installs (Terraform/templates/bootstrap.sh.tftpl), so a
+# node where install.sh put them first, and the bootstrap skips its own
+# install, ends up the same. Hashes: the CNI release's .sha256 files, and
+# the subject digests in BuildKit's provenance attestations.
+CNI_PLUGINS_VERSION="v1.5.1"
+CNI_PLUGINS_SHA256_AMD64="77baa2f669980a82255ffa2f2717de823992480271ee778aa51a9c60ae89ff9b"
+CNI_PLUGINS_SHA256_ARM64="c2a292714d0fad98a3491ae43df8ad58354b3c0bdf5d5a3e281777967c70fcff"
+BUILDKIT_VERSION="v0.17.2"
+BUILDKIT_SHA256_AMD64="24d73e4456ebbe6dbb53779e362b2164a000e9636cd9ca8bd90f742fb024b731"
+BUILDKIT_SHA256_ARM64="77384e2726c93d7c2bd7b745c079e1953f92683570203c7bfca361965db2f0c2"
+
+# download_pins prints one line per file the mirror holds:
+#   <project> <version> <file> <sha256> <origin>
+# The mirror keeps it at deps/<project>/<version>/<file>. <origin> is the
+# file's own URL, or tar:<file>:<member> for a file mirror-sync.sh takes out
+# of another file already listed (and checked) for the same project and
+# version. fetch_pinned looks downloads up here.
+download_pins() {
+	local caddy="${CADDY_PACKAGE_URL_BASE}/v${CADDY_PACKAGE_VERSION}"
+	local workerd="https://github.com/cloudflare/workerd/releases/download/${WORKERD_VERSION}"
+	local fc="https://github.com/firecracker-microvm/firecracker/releases/download/${FIRECRACKER_VERSION}"
+	local cni="https://github.com/containernetworking/plugins/releases/download/${CNI_PLUGINS_VERSION}"
+	local buildkit="https://github.com/moby/buildkit/releases/download/${BUILDKIT_VERSION}"
+	local v="$CADDY_PACKAGE_VERSION"
+	echo "caddy v${v} caddy_${v}_linux_amd64.deb ${CADDY_PACKAGE_SHA256_AMD64} ${caddy}/caddy_${v}_linux_amd64.deb"
+	echo "caddy v${v} caddy_${v}_linux_arm64.deb ${CADDY_PACKAGE_SHA256_ARM64} ${caddy}/caddy_${v}_linux_arm64.deb"
+	echo "caddy v${v} caddy_${v}_linux_armv7.deb ${CADDY_PACKAGE_SHA256_ARMV7} ${caddy}/caddy_${v}_linux_armv7.deb"
+	echo "caddy v${v} caddy_${v}_linux_armv6.deb ${CADDY_PACKAGE_SHA256_ARMV6} ${caddy}/caddy_${v}_linux_armv6.deb"
+	echo "workerd ${WORKERD_VERSION} workerd-linux-64.gz ${WORKERD_SHA256_LINUX_64} ${workerd}/workerd-linux-64.gz"
+	echo "workerd ${WORKERD_VERSION} workerd-linux-arm64.gz ${WORKERD_SHA256_LINUX_ARM64} ${workerd}/workerd-linux-arm64.gz"
+	v="$FIRECRACKER_VERSION"
+	echo "firecracker ${v} firecracker-${v}-x86_64.tgz ${FIRECRACKER_SHA256_X86_64} ${fc}/firecracker-${v}-x86_64.tgz"
+	echo "firecracker ${v} firecracker-${v}-aarch64.tgz ${FIRECRACKER_SHA256_AARCH64} ${fc}/firecracker-${v}-aarch64.tgz"
+	echo "firecracker ${v} firecracker-${v}-x86_64 ${FIRECRACKER_BIN_SHA256_X86_64} tar:firecracker-${v}-x86_64.tgz:release-${v}-x86_64/firecracker-${v}-x86_64"
+	echo "firecracker ${v} jailer-${v}-x86_64 ${JAILER_BIN_SHA256_X86_64} tar:firecracker-${v}-x86_64.tgz:release-${v}-x86_64/jailer-${v}-x86_64"
+	echo "firecracker ${v} firecracker-${v}-aarch64 ${FIRECRACKER_BIN_SHA256_AARCH64} tar:firecracker-${v}-aarch64.tgz:release-${v}-aarch64/firecracker-${v}-aarch64"
+	echo "firecracker ${v} jailer-${v}-aarch64 ${JAILER_BIN_SHA256_AARCH64} tar:firecracker-${v}-aarch64.tgz:release-${v}-aarch64/jailer-${v}-aarch64"
+	v="$CNI_PLUGINS_VERSION"
+	echo "cni-plugins ${v} cni-plugins-linux-amd64-${v}.tgz ${CNI_PLUGINS_SHA256_AMD64} ${cni}/cni-plugins-linux-amd64-${v}.tgz"
+	echo "cni-plugins ${v} cni-plugins-linux-arm64-${v}.tgz ${CNI_PLUGINS_SHA256_ARM64} ${cni}/cni-plugins-linux-arm64-${v}.tgz"
+	v="$BUILDKIT_VERSION"
+	echo "buildkit ${v} buildkit-${v}.linux-amd64.tar.gz ${BUILDKIT_SHA256_AMD64} ${buildkit}/buildkit-${v}.linux-amd64.tar.gz"
+	echo "buildkit ${v} buildkit-${v}.linux-arm64.tar.gz ${BUILDKIT_SHA256_ARM64} ${buildkit}/buildkit-${v}.linux-arm64.tar.gz"
+	# Upstream's own checksum files, kept beside the files on the mirror for
+	# anyone checking by hand. install.sh does not read them, so their
+	# hashes need bumping only when CADDY_PACKAGE_VERSION or
+	# CNI_PLUGINS_VERSION changes (and then these lines must change anyway).
+	v="$CADDY_PACKAGE_VERSION"
+	echo "caddy v${v} caddy_${v}_checksums.txt 5d27b76b95f496638d79208c55250317b8755fd9e90005f7466aa32956944a90 ${caddy}/caddy_${v}_checksums.txt"
+	v="$CNI_PLUGINS_VERSION"
+	echo "cni-plugins ${v} cni-plugins-linux-amd64-${v}.tgz.sha256 c96ab6bec7d59dd01f2f3373fe6ce7cc17a13f21df13541cc8f06d4ef5bb5763 ${cni}/cni-plugins-linux-amd64-${v}.tgz.sha256"
+	echo "cni-plugins ${v} cni-plugins-linux-amd64-${v}.tgz.sha512 0f9b6f929b9eb5817549b439709e88ce3d24c4728eb1e8949e2f086105a33948 ${cni}/cni-plugins-linux-amd64-${v}.tgz.sha512"
+	echo "cni-plugins ${v} cni-plugins-linux-arm64-${v}.tgz.sha256 2a484d561f4a9c75f820ca0fa2d5f21cbf47b460668b055dac3ce0754874cdea ${cni}/cni-plugins-linux-arm64-${v}.tgz.sha256"
+	echo "cni-plugins ${v} cni-plugins-linux-arm64-${v}.tgz.sha512 705b6aa2498e03eef13df8a5993852e1d3e9ac64606c98a60f7551d9d905f2c5 ${cni}/cni-plugins-linux-arm64-${v}.tgz.sha512"
+}
+# --- END DOWNLOAD PINS --------------------------------------------------------
 
 usage() {
 	cat <<'EOF'
@@ -182,6 +289,16 @@ Options:
                                certmagic-s3. Defaults to the matching GitHub
                                release asset when available, then falls back to
                                Caddy's build service.
+  --download-mirror <url|off>  Where a download goes next when its own source
+                               (GitHub, for most files) fails: release files
+                               from <url>/aerolvm/<tag>/, pinned third-party
+                               files from <url>/deps/. Every file is still
+                               checked: release files against the release's
+                               checksums.txt, third-party files against the
+                               SHA-256 pinned in this script. Must be https.
+                               "off" or "" turns the mirror off. Default:
+                               https://aerolvm-downloads.s3.us-east-1.amazonaws.com
+                               or $AEROL_DOWNLOAD_MIRROR when that is set.
   --install-prefix <dir>       Binary install directory (default: /usr/local/bin)
   --idle-timeout-min <minutes> Idle auto-stop timeout in minutes
   --build-from-source          Build binaries from the current checkout
@@ -227,7 +344,9 @@ Options:
   --with-containerd-engine     Opt into SB_CONTAINER_ENGINE=containerd
                                (dark default remains docker). Installs CNI
                                bridge + host-local plugins under /opt/cni/bin
-                               and writes SB_CONTAINER_ENGINE=containerd into
+                               and BuildKit (buildkitd, buildctl and
+                               buildkit.service) for image builds, and writes
+                               SB_CONTAINER_ENGINE=containerd into
                                sandboxd.env. Requires a system containerd
                                socket (usually /run/containerd/containerd.sock).
                                Server install only: refused with --local and
@@ -239,7 +358,11 @@ Options:
   --ingress-proxy-routing      Route sandboxes without per-sandbox Caddy
                                writes (static routes + sandboxd route
                                responder; configures systemd-resolved for
-                               *.rt.internal). Off by default.
+                               *.rt.internal). On by default with --domain;
+                               it does not apply without one.
+  --no-ingress-proxy-routing   Keep a --domain install on per-sandbox Caddy
+                               routes (every expose and destroy reloads
+                               Caddy). Writes SB_INGRESS_PROXY_ROUTING=false.
   --with-isolate               Install Cloudflare's workerd (version-pinned,
                                SHA-256 verified against hashes embedded in
                                this script) to /usr/local/bin/workerd and
@@ -457,7 +580,7 @@ download_asset() {
 	local url="$1"
 	local output="$2"
 
-	curl_download "$url" -o "$output"
+	fetch_with_fallback "$output" "$(release_mirror_path "$url")" "$url"
 }
 
 curl_download() {
@@ -477,6 +600,166 @@ curl_download() {
 		"$url" "$@"
 }
 
+# fetch_with_fallback [--sha256 <hex>] <dest> <mirror-path> <primary-url> [vendor-url...]
+#
+# Downloads one file to <dest>, trying its sources in order: <primary-url>
+# (the file's origin, usually GitHub), then the download mirror at
+# $DOWNLOAD_MIRROR/<mirror-path>, then each vendor URL. An empty mirror path,
+# or the mirror turned off, skips the mirror.
+#
+# Every source but the last gets two quick retries, so a 504 moves on to the
+# next source in seconds, not after curl_download's 15 minutes. The last
+# source keeps curl_download's patient retries: there is nothing left to
+# move on to, so waiting out a blip costs nothing.
+#
+# With --sha256 the file must have that SHA-256, whichever source served it.
+# A mismatch fails at once, without trying the next source: either the pin
+# is wrong or a source serves a different file, and a person must look.
+fetch_with_fallback() {
+	local want=""
+	if [[ "${1:-}" == "--sha256" ]]; then
+		want="$2"
+		shift 2
+	fi
+	local dest="$1" mirror_path="$2"
+	shift 2
+	local sources=("$1")
+	shift
+	if [[ -n "$mirror_path" ]] && download_mirror_on; then
+		sources+=("mirror:${mirror_path}")
+	fi
+	sources+=("$@")
+
+	local i url got mode last=$((${#sources[@]} - 1)) tried=()
+	for i in "${!sources[@]}"; do
+		url="${sources[$i]}"
+		if [[ "$url" == mirror:* ]]; then
+			if ! mirror_url_for "${url#mirror:}"; then
+				tried+=("the mirror (${DOWNLOAD_MIRROR}): no latest release named there")
+				continue
+			fi
+			url="$MIRROR_URL"
+		fi
+		mode="quick"
+		((i < last)) || mode="patient"
+		rm -f "$dest"
+		if ! fetch_source "$url" "$dest" "$mode"; then
+			tried+=("$url")
+			if ((i < last)); then
+				echo "Download failed: ${url}; trying the next source" >&2
+			fi
+			continue
+		fi
+		if [[ -n "$want" ]]; then
+			got="$(sha256_of "$dest")"
+			if [[ "$got" != "$want" ]]; then
+				rm -f "$dest"
+				echo "checksum verification failed for ${dest##*/}: got ${got}, pinned ${want} (served by ${url}); refusing it" >&2
+				return 1
+			fi
+		fi
+		if ((i > 0)); then
+			echo "Downloaded ${dest##*/} from ${url}"
+		fi
+		return 0
+	done
+	echo "Failed to download ${dest##*/} from every source:" >&2
+	local t
+	for t in "${tried[@]}"; do
+		echo "  ${t}" >&2
+	done
+	return 1
+}
+
+# fetch_source downloads one URL to dest ("-" for stdout). "quick" overrides
+# curl_download's retry settings for this one call (bash locals are visible
+# to the functions they call); "patient" keeps them.
+fetch_source() {
+	local url="$1" dest="$2" mode="$3"
+	if [[ "$mode" == "quick" ]]; then
+		local DOWNLOAD_RETRY=2 DOWNLOAD_RETRY_DELAY=2 DOWNLOAD_RETRY_MAX_TIME=30
+	fi
+	curl_download "$url" -o "$dest"
+}
+
+download_mirror_on() {
+	[[ -n "${DOWNLOAD_MIRROR:-}" && "${DOWNLOAD_MIRROR:-}" != "off" ]]
+}
+
+# mirror_url_for sets MIRROR_URL to the mirror's URL for a mirror path. A path
+# under aerolvm/latest/ names a file of the latest release, which the mirror
+# records in aerolvm/latest.txt; that is read once, and fails when the
+# mirror has none. A global rather than printed output, so that one read
+# serves every later file instead of being lost in a $(...) subshell.
+mirror_url_for() {
+	local path="$1" base="${DOWNLOAD_MIRROR%/}"
+	MIRROR_URL=""
+	download_mirror_on || return 1
+	if [[ "$path" == aerolvm/latest/* ]]; then
+		if [[ -z "${MIRROR_LATEST_TAG:-}" ]]; then
+			local tag
+			tag="$(fetch_source "${base}/aerolvm/latest.txt" - quick 2>/dev/null)" || tag=""
+			tag="${tag//[[:space:]]/}"
+			if [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
+				MIRROR_LATEST_TAG="$tag"
+			else
+				MIRROR_LATEST_TAG="none"
+			fi
+		fi
+		[[ "$MIRROR_LATEST_TAG" != "none" ]] || return 1
+		path="aerolvm/${MIRROR_LATEST_TAG}/${path#aerolvm/latest/}"
+	fi
+	MIRROR_URL="${base}/${path}"
+}
+
+# release_mirror_path prints where the mirror keeps a file of an AerolVM
+# GitHub release URL: aerolvm/<tag>/<file>, or aerolvm/latest/<file> for a
+# releases/latest URL. For any other URL (a fork's release, a presigned
+# bucket URL, an operator's own server) it prints nothing, and that download
+# has no mirror. The mirror holds aerol-ai/microvm's releases only.
+release_mirror_path() {
+	local re='^https://github\.com/aerol-ai/microvm/releases/(download/(v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?)|latest/download)/([A-Za-z0-9._-]+)$'
+	[[ "$1" =~ $re ]] || return 0
+	if [[ -n "${BASH_REMATCH[2]}" ]]; then
+		echo "aerolvm/${BASH_REMATCH[2]}/${BASH_REMATCH[4]}"
+	else
+		echo "aerolvm/latest/${BASH_REMATCH[4]}"
+	fi
+}
+
+# fetch_pinned <dest> <project> <file> [vendor-url...] downloads a file
+# listed in download_pins: from its origin, then the mirror's copy at
+# deps/<project>/<version>/<file>, then the vendor URLs, and refuses it
+# unless it has the pinned SHA-256.
+fetch_pinned() {
+	local dest="$1" project="$2" file="$3"
+	shift 3
+	local p v f sha origin row=""
+	while read -r p v f sha origin; do
+		if [[ "$p" == "$project" && "$f" == "$file" ]]; then
+			row="${v} ${sha} ${origin}"
+			break
+		fi
+	done < <(download_pins)
+	if [[ -z "$row" ]]; then
+		echo "install.sh: no pinned download for ${project} ${file}" >&2
+		return 1
+	fi
+	read -r v sha origin <<<"$row"
+	fetch_with_fallback --sha256 "$sha" "$dest" "deps/${project}/${v}/${file}" "$origin" "$@"
+}
+
+# sha256_of prints a file's SHA-256. macOS before 14 has no sha256sum.
+sha256_of() {
+	local out
+	if command -v sha256sum >/dev/null 2>&1; then
+		out="$(sha256sum "$1")"
+	else
+		out="$(shasum -a 256 "$1")"
+	fi
+	echo "${out%% *}"
+}
+
 verify_downloads() {
 	local tmp_dir="$1"
 	shift
@@ -491,7 +774,7 @@ verify_downloads() {
 		return 1
 	fi
 
-	(
+	if ! (
 		cd "$tmp_dir"
 		: > selected-checksums.txt
 		local asset
@@ -504,7 +787,14 @@ verify_downloads() {
 			cat "checksum-${asset}.txt" >> selected-checksums.txt
 		done
 		sha256_check selected-checksums.txt
-	)
+	); then
+		# With --version latest, a GitHub that fails part way through can
+		# leave some files from GitHub's latest release and some from the
+		# mirror's, which may be one release behind.
+		echo "Release files do not match checksums.txt; refusing to install them." >&2
+		echo "If some downloads fell back to the mirror, run the installer again, or pin one release with --version <tag>." >&2
+		return 1
+	fi
 }
 
 # sha256_check verifies a checksum file. macOS before 14 has no sha256sum,
@@ -514,6 +804,25 @@ sha256_check() {
 		sha256sum -c "$1"
 	else
 		shasum -a 256 -c "$1"
+	fi
+}
+
+# resolve_ingress_proxy_routing settles the routing flag once the flags are
+# parsed. An explicit --ingress-proxy-routing or --no-ingress-proxy-routing
+# wins. Otherwise it is on for a --domain install, the only kind it applies
+# to: sandboxd routes names under the domain with static Caddy routes and
+# its own responder, so an expose or destroy no longer reloads Caddy and
+# drops new connections (plans/ingress-proxy-routing.md §1). Without a domain, or
+# with --local (no Caddy), it is off: sandboxd would skip it anyway, and the
+# resolver link would be set up for nothing.
+resolve_ingress_proxy_routing() {
+	if [[ -n "$INGRESS_PROXY_ROUTING" ]]; then
+		return
+	fi
+	if [[ -n "$DOMAIN" && "$LOCAL_MODE" != "true" ]]; then
+		INGRESS_PROXY_ROUTING="true"
+	else
+		INGRESS_PROXY_ROUTING="false"
 	fi
 }
 
@@ -638,6 +947,10 @@ while [[ $# -gt 0 ]]; do
 			BUILD_FROM_SOURCE="true"
 			shift
 			;;
+		--download-mirror)
+			DOWNLOAD_MIRROR="$2"
+			shift 2
+			;;
 		--dns-provider)
 			DNS_PROVIDER="$2"
 			shift 2
@@ -684,6 +997,10 @@ while [[ $# -gt 0 ]]; do
 			;;
 		--ingress-proxy-routing)
 			INGRESS_PROXY_ROUTING="true"
+			shift
+			;;
+		--no-ingress-proxy-routing)
+			INGRESS_PROXY_ROUTING="false"
 			shift
 			;;
 		--workerd-path)
@@ -796,11 +1113,23 @@ if [[ "$WITH_CONTAINERD_ENGINE" == "true" && ("$CLI_ONLY" == "true" || "$LOCAL_M
 	echo "--with-containerd-engine sets up a server node; it does not work with --cli-only or --local" >&2
 	exit 1
 fi
+# Release files from the mirror are checked against a checksums.txt from the
+# same mirror, so only TLS keeps a network attacker from swapping both.
+case "$DOWNLOAD_MIRROR" in
+	"" | off) ;;
+	https://*) DOWNLOAD_MIRROR="${DOWNLOAD_MIRROR%/}" ;;
+	*)
+		echo "--download-mirror (or AEROL_DOWNLOAD_MIRROR) must be an https:// URL, \"off\" or empty (got ${DOWNLOAD_MIRROR})" >&2
+		exit 1
+		;;
+esac
 
 if [[ "$CLI_ONLY" == "true" ]]; then
 	install_cli
 	exit 0
 fi
+
+resolve_ingress_proxy_routing
 
 if [[ "$NO_START" == "true" && "$LOCAL_MODE" == "true" ]]; then
 	echo "--no-start is for a node cluster-join.sh will start; --local never joins a cluster" >&2
@@ -1041,10 +1370,10 @@ drop_caddy_apt_source() {
 }
 
 # install_caddy_package installs the stock Caddy .deb from Caddy's GitHub
-# release, checked against the release's SHA-512 list. It is the same
-# package Cloudsmith served: its postinst creates the caddy user, and it
-# ships caddy.service and /etc/caddy, which the rest of this installer
-# builds on.
+# release (or the mirror's copy), checked against the SHA-256 pinned in the
+# download pins. It is the same package Cloudsmith served: its postinst
+# creates the caddy user, and it ships caddy.service and /etc/caddy, which
+# the rest of this installer builds on.
 install_caddy_package() {
 	local arch
 	case "$(uname -m)" in
@@ -1057,25 +1386,12 @@ install_caddy_package() {
 			exit 1
 			;;
 	esac
-	local base="${CADDY_PACKAGE_URL_BASE}/v${CADDY_PACKAGE_VERSION}"
 	local asset="caddy_${CADDY_PACKAGE_VERSION}_linux_${arch}.deb"
-	local sums="caddy_${CADDY_PACKAGE_VERSION}_checksums.txt"
 	local tmp_dir
 	tmp_dir="$(mktemp -d)"
-	if ! curl_download "${base}/${asset}" -o "${tmp_dir}/${asset}" \
-		|| ! curl_download "${base}/${sums}" -o "${tmp_dir}/${sums}"; then
+	if ! fetch_pinned "${tmp_dir}/${asset}" caddy "$asset"; then
 		rm -rf "$tmp_dir"
-		echo "Failed to download the Caddy ${CADDY_PACKAGE_VERSION} package" >&2
-		exit 1
-	fi
-	if ! (
-		cd "$tmp_dir" \
-			&& awk -v name="$asset" '$2 == name { print }' "$sums" > selected-checksum.txt \
-			&& [[ "$(wc -l < selected-checksum.txt)" -eq 1 ]] \
-			&& sha512sum -c selected-checksum.txt
-	); then
-		rm -rf "$tmp_dir"
-		echo "Caddy package checksum verification failed; refusing to install it" >&2
+		echo "Failed to download the Caddy ${CADDY_PACKAGE_VERSION} package, or it failed its checksum; refusing to install it" >&2
 		exit 1
 	fi
 	apt-get install -y "${tmp_dir}/${asset}"
@@ -1270,7 +1586,9 @@ install_custom_caddy() {
 		prebuilt_asset="$(basename "${CADDY_BINARY_URL%%\?*}")"
 		tmp_binary="$prebuilt_dir/$prebuilt_asset"
 		echo "Downloading prebuilt custom Caddy from ${CADDY_BINARY_URL}"
-		if curl_download "$CADDY_BINARY_URL" -o "$tmp_binary"; then
+		# An AerolVM release URL, explicit or not, falls back to the
+		# mirror's copy of the same release file before the build service.
+		if fetch_with_fallback "$tmp_binary" "$(release_mirror_path "$CADDY_BINARY_URL")" "$CADDY_BINARY_URL"; then
 			if [[ "$CADDY_BINARY_URL_EXPLICIT" != "true" ]] \
 				&& ! verify_downloads "$prebuilt_dir" "$prebuilt_asset"; then
 				rm -rf "$prebuilt_dir"
@@ -1812,8 +2130,10 @@ write_route_dns_resolver() {
 		rm -f /etc/systemd/resolved.conf.d/aerolvm-route-dns.conf
 	fi
 	if ! systemctl is-active --quiet systemd-networkd || ! systemctl is-active --quiet systemd-resolved; then
-		echo "WARNING: --ingress-proxy-routing needs systemd-networkd + systemd-resolved to scope *.rt.internal;" >&2
-		echo "         not configuring it. sandboxd will refuse the flag at boot and keep per-sandbox Caddy routes." >&2
+		# Routing is on by default with --domain, so say how to turn it off.
+		echo "WARNING: ingress proxy routing needs systemd-networkd + systemd-resolved to scope *.rt.internal;" >&2
+		echo "         not configuring it. On a cluster ingress node sandboxd will refuse the flag at boot and keep" >&2
+		echo "         per-sandbox Caddy routes. Re-run with --no-ingress-proxy-routing to turn it off." >&2
 		return
 	fi
 	mkdir -p /etc/systemd/network
@@ -1832,7 +2152,7 @@ EOF
 		fi
 		sleep 1
 	done
-	echo "WARNING: aerolvm-rt never got a DNS scope; sandboxd will refuse --ingress-proxy-routing at boot." >&2
+	echo "WARNING: aerolvm-rt never got a DNS scope; on a cluster ingress node sandboxd will refuse ingress proxy routing at boot." >&2
 }
 
 write_caddy_systemd_dropin() {
@@ -2366,30 +2686,25 @@ install_workerd_binary() {
 	# runsc shim). Assets are gzipped standalone binaries
 	# (workerd-linux-{64,arm64}.gz); upstream publishes no checksum sidecar,
 	# so verification runs against the SHA-256 pinned next to WORKERD_VERSION
-	# at the top of this script. Bump version + hashes together.
-	local arch sha
+	# in the download pins. Bump version + hashes together.
+	local arch
 	case "$(uname -m)" in
-		x86_64|amd64)   arch="linux-64";    sha="$WORKERD_SHA256_LINUX_64" ;;
-		aarch64|arm64)  arch="linux-arm64"; sha="$WORKERD_SHA256_LINUX_ARM64" ;;
+		x86_64|amd64)   arch="linux-64" ;;
+		aarch64|arm64)  arch="linux-arm64" ;;
 		*)
 			echo "--with-isolate: unsupported architecture $(uname -m) for workerd" >&2
 			exit 1
 			;;
 	esac
 
-	local url="https://github.com/cloudflare/workerd/releases/download/${WORKERD_VERSION}/workerd-${arch}.gz"
 	local tmp_dir
 	tmp_dir="$(mktemp -d)"
 	# shellcheck disable=SC2064  # capture tmp_dir at trap-install time, not at exit
 	trap "rm -rf '$tmp_dir'" RETURN
 
-	echo "Downloading workerd ${WORKERD_VERSION} for ${arch} from ${url}"
-	if ! curl_download "$url" -o "${tmp_dir}/workerd.gz"; then
-		echo "--with-isolate: failed to download workerd from ${url}" >&2
-		exit 1
-	fi
-	if ! echo "${sha}  ${tmp_dir}/workerd.gz" | sha256sum -c -; then
-		echo "--with-isolate: workerd checksum verification failed (pinned ${sha} for ${WORKERD_VERSION}/${arch})" >&2
+	echo "Downloading workerd ${WORKERD_VERSION} for ${arch}"
+	if ! fetch_pinned "${tmp_dir}/workerd.gz" workerd "workerd-${arch}.gz"; then
+		echo "--with-isolate: failed to download workerd ${WORKERD_VERSION}/${arch}, or it failed its checksum" >&2
 		exit 1
 	fi
 	gunzip -f "${tmp_dir}/workerd.gz"
@@ -2465,23 +2780,21 @@ firecracker_verify() {
 }
 
 # install_firecracker_release installs firecracker and jailer from the pinned
-# release, unless both already report the pinned version. A different version
-# is replaced, as the Ansible install does.
+# release (GitHub, then the mirror), unless both already report the pinned
+# version. A different version is replaced, as the Ansible install does.
 install_firecracker_release() {
-	local arch="$1" sha="$2" tmp_dir="$3"
+	local arch="$1" tmp_dir="$2"
 	if [[ "$(firecracker_binary_version "$FIRECRACKER_BIN")" == "Firecracker $FIRECRACKER_VERSION" &&
 		"$(firecracker_binary_version "$JAILER_BIN")" == "Jailer $FIRECRACKER_VERSION" ]]; then
 		echo "firecracker and jailer $FIRECRACKER_VERSION already installed"
 		return 0
 	fi
 	local tarball="firecracker-${FIRECRACKER_VERSION}-${arch}.tgz"
-	local url="https://github.com/firecracker-microvm/firecracker/releases/download/${FIRECRACKER_VERSION}/${tarball}"
-	echo "Downloading Firecracker ${FIRECRACKER_VERSION} for ${arch} from ${url}"
-	if ! curl_download "$url" -o "${tmp_dir}/${tarball}"; then
-		echo "--with-firecracker: failed to download ${url}" >&2
+	echo "Downloading Firecracker ${FIRECRACKER_VERSION} for ${arch}"
+	if ! fetch_pinned "${tmp_dir}/${tarball}" firecracker "$tarball"; then
+		echo "--with-firecracker: failed to download ${tarball}, or it failed its checksum" >&2
 		exit 1
 	fi
-	firecracker_verify "${tmp_dir}/${tarball}" "$sha"
 	tar -xzf "${tmp_dir}/${tarball}" -C "$tmp_dir"
 	local release="${tmp_dir}/release-${FIRECRACKER_VERSION}-${arch}"
 	install -m 0755 "${release}/firecracker-${FIRECRACKER_VERSION}-${arch}" "$FIRECRACKER_BIN"
@@ -2539,17 +2852,15 @@ install_firecracker_kernel() {
 # jailer's user. Every download is checked before anything is installed from
 # it. Same artifacts as the Terraform bootstrap and Ansible configure-ops.yml.
 install_firecracker() {
-	local arch release_sha kernel_sha config_sha
+	local arch kernel_sha config_sha
 	case "$(uname -m)" in
 		x86_64 | amd64)
 			arch="x86_64"
-			release_sha="$FIRECRACKER_SHA256_X86_64"
 			kernel_sha="$FIRECRACKER_KERNEL_SHA256_X86_64"
 			config_sha="$FIRECRACKER_KERNEL_CONFIG_SHA256_X86_64"
 			;;
 		aarch64 | arm64)
 			arch="aarch64"
-			release_sha="$FIRECRACKER_SHA256_AARCH64"
 			kernel_sha="$FIRECRACKER_KERNEL_SHA256_AARCH64"
 			config_sha="$FIRECRACKER_KERNEL_CONFIG_SHA256_AARCH64"
 			;;
@@ -2568,7 +2879,7 @@ install_firecracker() {
 	# shellcheck disable=SC2064  # capture tmp_dir at trap-install time, not at return
 	trap "rm -rf '$tmp_dir'" RETURN
 
-	install_firecracker_release "$arch" "$release_sha" "$tmp_dir"
+	install_firecracker_release "$arch" "$tmp_dir"
 	install_firecracker_kernel "$arch" "$kernel_sha" "$config_sha" "$tmp_dir"
 	install -d -m 0755 "$FIRECRACKER_TEMPLATES_DIR" "$JAILER_CHROOT_BASE"
 	if ! getent passwd "$JAILER_USER" >/dev/null 2>&1; then
@@ -2603,16 +2914,15 @@ install_cni_plugins() {
 			;;
 	esac
 
-	local ver="v1.5.1"
-	local url="https://github.com/containernetworking/plugins/releases/download/${ver}/cni-plugins-linux-${arch}-${ver}.tgz"
+	local file="cni-plugins-linux-${arch}-${CNI_PLUGINS_VERSION}.tgz"
 	local tmp_dir
 	tmp_dir="$(mktemp -d)"
 	# shellcheck disable=SC2064
 	trap "rm -rf '$tmp_dir'" RETURN
 
-	echo "Downloading CNI plugins ${ver} (${arch}) from ${url}"
-	if ! curl_download "$url" -o "${tmp_dir}/cni.tgz"; then
-		echo "--with-containerd-engine: failed to download CNI plugins from ${url}" >&2
+	echo "Downloading CNI plugins ${CNI_PLUGINS_VERSION} (${arch})"
+	if ! fetch_pinned "${tmp_dir}/cni.tgz" cni-plugins "$file"; then
+		echo "--with-containerd-engine: failed to download ${file}, or it failed its checksum" >&2
 		exit 1
 	fi
 	mkdir -p /opt/cni/bin
@@ -2624,6 +2934,70 @@ install_cni_plugins() {
 		fi
 	done
 	echo "Installed CNI plugins to /opt/cni/bin (bridge, host-local, loopback)"
+}
+
+# install_buildkit sets up BuildKit for image builds on the containerd engine
+# (POST /v1/images/build, snapshot from a Dockerfile) exactly as the
+# Terraform bootstrap does: the same release, the same two binaries and the
+# same unit, each skipped when already there. The bootstrap runs install.sh
+# before its own BuildKit step, which it skips when buildkitd and the unit
+# exist, so a node where this ran first must end up the same. The bootstrap
+# downloads from GitHub only; this goes through the mirror. (Today's
+# bootstrap does not pass --with-containerd-engine, so on a Terraform node
+# its own step still does the install.)
+install_buildkit() {
+	if ! command -v buildkitd >/dev/null 2>&1; then
+		local arch
+		case "$(uname -m)" in
+			x86_64|amd64)   arch="amd64" ;;
+			aarch64|arm64)  arch="arm64" ;;
+			*)
+				echo "--with-containerd-engine: unsupported architecture $(uname -m) for BuildKit" >&2
+				exit 1
+				;;
+		esac
+		local file="buildkit-${BUILDKIT_VERSION}.linux-${arch}.tar.gz"
+		local tmp_dir
+		tmp_dir="$(mktemp -d)"
+		# shellcheck disable=SC2064  # capture tmp_dir at trap-install time, not at return
+		trap "rm -rf '$tmp_dir'" RETURN
+		echo "Downloading BuildKit ${BUILDKIT_VERSION} (${arch})"
+		if ! fetch_pinned "${tmp_dir}/${file}" buildkit "$file"; then
+			echo "--with-containerd-engine: failed to download ${file}, or it failed its checksum" >&2
+			exit 1
+		fi
+		tar -xzf "${tmp_dir}/${file}" -C "$tmp_dir"
+		install -m 0755 "${tmp_dir}/bin/buildkitd" "${BUILDKIT_BIN_DIR}/buildkitd"
+		install -m 0755 "${tmp_dir}/bin/buildctl" "${BUILDKIT_BIN_DIR}/buildctl"
+		echo "Installed buildkitd and buildctl ${BUILDKIT_VERSION} to ${BUILDKIT_BIN_DIR}"
+	fi
+	if [[ ! -f "$BUILDKIT_UNIT_FILE" ]]; then
+		buildkit_unit > "$BUILDKIT_UNIT_FILE"
+		systemctl daemon-reload
+	fi
+	systemctl enable --now buildkit.service || echo "warning: buildkit.service failed to start" >&2
+}
+
+# buildkit_unit prints the bootstrap's buildkit.service, rendered with the
+# socket and namespace this installer writes into sandboxd.env (and
+# Terraform's defaults): the containerd worker only, in the aerolvm namespace,
+# so builds land in the image store the driver runs from. Host networking
+# for RUN steps avoids a separate BuildKit CNI config.
+buildkit_unit() {
+	cat <<'UNIT'
+[Unit]
+Description=BuildKit (aerolvm containerd worker)
+Requires=containerd.service
+After=containerd.service
+
+[Service]
+ExecStart=/usr/local/bin/buildkitd --oci-worker=false --containerd-worker=true --containerd-worker-addr=/run/containerd/containerd.sock --containerd-worker-namespace=aerolvm --containerd-worker-net=host
+Restart=on-failure
+Delegate=yes
+
+[Install]
+WantedBy=multi-user.target
+UNIT
 }
 
 register_gvisor_runtime() {
@@ -3069,6 +3443,7 @@ if [[ "$WITH_FIRECRACKER" == "true" ]]; then
 fi
 if [[ "$WITH_CONTAINERD_ENGINE" == "true" ]]; then
 	install_cni_plugins
+	install_buildkit
 fi
 if [[ "$WITH_NVIDIA_GPU" == "true" ]]; then
 	install_nvidia_gpu

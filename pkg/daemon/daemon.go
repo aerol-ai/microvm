@@ -742,10 +742,7 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 	// roll back) BEFORE the boot reconciles below, so they fill the
 	// in-memory route tables instead of writing Caddy. The Caddy side (one
 	// load) is committed once the router is serving.
-	var hostPortForwarder service.HostPortForwarder
-	if cfg.IngressProxyRouting || readBypassMarker(ingressRoutingMarkerPath(cfg)) {
-		hostPortForwarder = newHostPortForwarder(logger)
-	}
+	hostPortForwarder := hostPortForwarderFor(cfg, logger)
 	routingBoot := startIngressRouting(ctx, cfg, svc, hostPortForwarder, logger)
 	wireEgressOperator(ctx, cfg, svc, logger)
 	wireCreatePolicy(ctx, cfg, svc, logger)

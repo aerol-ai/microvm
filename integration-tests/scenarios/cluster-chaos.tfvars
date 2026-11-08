@@ -1,5 +1,6 @@
 # cluster-chaos: the cluster-correctness fault scenario
 # (plans/cluster-correctness-and-create-latency.md §3.2, UC-470..UC-479,
+# and the release-gate tools UC-480..UC-482, plans/cluster-phase-2.md §5;
 # `make integration-cluster-chaos`).
 #
 #   3x server  (t3.medium)  Raft voters only: no sandboxes, no public traffic
@@ -25,7 +26,8 @@
 #
 # Cost: 7 x t3.medium on-demand = 7 x $0.0416/h = $0.29/h (us-east-1), plus
 # 4 x 40 GiB + 4 x 20 GiB gp3 (~$0.02/h). A full run (bring-up, the ten
-# chaos cases, teardown) is about 1.5 to 2 hours, so about $0.45 to $0.65.
+# chaos cases, the ~35 minutes of UC-480..482, teardown) is about 2 to 2.5
+# hours, so about $0.60 to $0.80.
 cluster_name = "aerolvm-itest-cluster-chaos"
 
 extra_tags = {
@@ -39,6 +41,14 @@ default_volume_size_gb = 40
 caddy_shared_cert_storage = {
   enabled = true
 }
+
+# Pinned off. The chaos cases were written and proven against an ingress
+# with the flag off, which reads placements through the page walk, not the
+# delta feed (UC-470's cut-off owner is the walk's age limit; see
+# internal/cluster/agent_placement_feed_stale_test.go). Left unset, install.sh
+# would now turn routing on for this domain install and change what every
+# case measures. A flag-on chaos run is its own scenario when wanted.
+default_ingress_proxy_routing = false
 
 extra_sandboxd_env = {
   # Several cases wait out two reconcile intervals before they call a state

@@ -98,6 +98,38 @@ Artifacts expire from the bucket after 7 days; presigned URLs default to 12h,
 which covers a slow `*.metal` provision. `reports/<scenario>.json` carries a
 `build` block naming the tree that produced its numbers.
 
+### When GitHub's downloads fail
+
+GitHub's release downloads once answered 504 for hours while its status page
+stayed green, and every run failed. The harness and `install.sh` now fall back
+to the public download mirror (`s3://aerolvm-downloads`, filled by
+`scripts/mirror-sync.sh`), which holds each release at `aerolvm/<tag>/<file>`
+and each pinned third-party file at `deps/<project>/<version>/<file>`.
+
+| Variable | Default | What it does |
+|---|---|---|
+| `AEROL_RELEASE_BASE` | `https://github.com/aerol-ai/microvm/releases` | The releases URL `--version` pins and the released Caddy are taken from. |
+| `AEROL_DOWNLOAD_MIRROR` | `https://aerolvm-downloads.s3.us-east-1.amazonaws.com` | The mirror. `""` or `off` turns it off. |
+| `AEROL_RELEASE_API` | GitHub's releases API for `aerol-ai/microvm` | Where `build.sh` asks which release carries the custom Caddy. For tests. |
+
+- **`--version <tag>`** probes the release's `checksums.txt` on GitHub, then on
+  the mirror, and pins every file to whichever answered.
+- **The released Caddy** (local builds without `--with-caddy`) is probed the
+  same way. When GitHub's API does not answer either, the mirror's
+  `aerolvm/latest.txt` names the release.
+- **The nodes' own downloads** go through `install.sh`'s fallback, which uses
+  the public mirror by default. To change that, set `AEROL_DOWNLOAD_MIRROR`
+  when you run the harness: in local-build mode `build.sh` then hands the nodes
+  a copy of the build's `install.sh` with that value as its default
+  (`install.mirror-<hash>.sh` beside it). The bootstrap runs `install.sh` under
+  `sudo`, so no variable would reach it, and the bootstrap template is not
+  touched. Unset, the nodes get the build's `install.sh` unchanged. A
+  `--version` or `--released` run uses that release's own `install.sh`.
+- **Not covered:** the Terraform bootstrap's own CNI and BuildKit steps
+  (containerd nodes, the default) and its Firecracker download still fetch
+  from GitHub. Those live in `bootstrap.sh.tftpl`, and changing it replaces
+  every node of a running cluster.
+
 ## Container engine
 
 **containerd is the default engine for every scenario.** `run.sh` writes
@@ -214,6 +246,79 @@ The scenario needs the default local build, or a release that has
 whose teardown failed keeps its balancer and Elastic IP until
 `integration-tests/run.sh cluster-3-mixed-lb --destroy-only`.
 
+## Routing gate from inside the VPC (UC-171 / UC-357) and the A/B
+
+The gate for turning `SB_INGRESS_PROXY_ROUTING` on by default
+(`plans/cluster-phase-2.md` §4.2) runs on `cluster-hetero-lite-routing`
+(8 × t3.medium) with the test binary on one of its server nodes, not on a
+laptop. A laptop adds its Wi-Fi and ISP to every latency number, and an SSH
+or DNS blip there fails a case that has nothing to do with the code. A
+server node is a Raft voter that serves no sandbox and is not behind the
+domain, so the load generator neither competes with what it measures nor
+skips the public path: it reaches the domain through the Internet gateway,
+like a customer's servers in the region.
+
+UC-171 also records latency: expose to first 200 on the public URL, and
+p50/p99 of the successful fresh-connection HTTP and raw-TCP probes during
+churn. The numbers are in the test log, in the report row's Detail column,
+and in `<scenario>-bank.json` under `ingress_routing_churn_gate`. Its pass
+rule is still 0 failed connections.
+
+**Run tests from a node.** `scripts/run-on-node.sh` builds
+`go test -c -tags integration ./integration-tests/suite/` for the node's
+architecture, copies it with the harness's SSH key, hands it the same
+`AEROL_*` environment `run.sh` gives the suite (other exported `AEROL_*`
+knobs pass through), starts it detached so an SSH drop here does not kill
+it, and copies back `test.json`, `test.log`, the bank JSON and a report to
+`reports/run-on-node/<scenario>/<stamp>[-<label>]/`. The default node is a
+server-only node (a non-seed one first); `--node <name>` picks another.
+The node has no SSH key, AWS credentials or checkout, so cases that need
+those, and every disruptive case (`AEROL_ALLOW_DISRUPTIVE=0`), belong on
+the laptop. `--dry-run` prints the node and test flags and touches nothing.
+
+**Flip the flag on every node.** `scripts/routing-ab.sh <scenario> off`
+sets `SB_INGRESS_PROXY_ROUTING=false` in a drop-in
+(`/etc/systemd/system/sandboxd.service.d/zz-ab-routing.conf`) and restarts
+sandboxd one node at a time, seed first. Each routing node rolls back to
+per-sandbox Caddy routes in one Caddy load, through its
+`ingress_proxy_routing_last_enabled` marker. `on` removes the drop-in and
+restarts the same way. After each restart it waits for `/health` and for
+the node's own member list to be whole, then checks the flip took (marker
+and Caddy's static `sandbox-ingress-proxy` route), so a node that refused
+to engage fails there and not as an odd A/B number. A node already flipped
+is skipped, so re-running a command that stopped half way finishes it.
+`status` prints each node's state.
+
+The gate, then the A/B (flag on, flag off, and the pair once more, because
+t3 CPU credits add noise):
+
+```bash
+S=cluster-hetero-lite-routing
+GATE='^(TestIngressRoutingChurnGate|TestIngressChurnNewConnectionsAndExecStreams)$'
+# Bring the stack up and keep it (this also runs UC-171 once from the laptop).
+AEROL_TEST_RUN='^TestIngressRoutingChurnGate$' integration-tests/run.sh $S --keep
+
+# Churn gate: 0 failed connections in each case.
+integration-tests/scripts/run-on-node.sh $S --label gate -run "$GATE"
+
+# A/B: flag-on p50/p99 must be no worse than flag-off beyond the spread of
+# the repeated pair. The off runs are expected to fail UC-171 (connections
+# drop on Caddy reloads); their numbers are still written.
+for pass in 1 2; do
+  integration-tests/scripts/run-on-node.sh $S --label on-$pass -run '^TestIngressRoutingChurnGate$'
+  integration-tests/scripts/routing-ab.sh $S off
+  integration-tests/scripts/run-on-node.sh $S --label off-$pass -run '^TestIngressRoutingChurnGate$'
+  integration-tests/scripts/routing-ab.sh $S on
+done
+grep -h ucdetail= integration-tests/reports/run-on-node/$S/*/test.log
+
+integration-tests/run.sh $S --destroy-only
+```
+
+Both scripts read the stack from this worktree's `.tf/<scenario>`; export
+`AEROL_INTEGRATION_TARGETS` (the Terraform `integration_targets` JSON) to
+point them at a stack kept from another worktree.
+
 ## Overload is shed, not restarted (UC-361)
 
 UC-361 (`suite/overload_shed_test.go`) runs on any scenario with `cluster`,
@@ -260,7 +365,7 @@ over 30 s, and no sandboxd restarted (UC-361's checks). The numbers land in
 each node's `429`/`503` counts. A run whose noisy team never got a `429`
 fails and says to raise `AEROL_FAIRNESS_NOISY`.
 
-## Cluster correctness under faults (UC-470..UC-479)
+## Cluster correctness under faults (UC-470..UC-482)
 
 `cluster-chaos` (`make integration-cluster-chaos`) is the live layer of
 `plans/cluster-correctness-and-create-latency.md` §3.2. Each case injects one
@@ -282,11 +387,40 @@ plan's fixes C2..C7 land; each test's doc comment in
 | UC-477 | Every server restarted in turn, leader last | I6 | C1 |
 | UC-478 | Loaded worker killed when the survivors have less room | I4, I6 | C7 |
 | UC-479 | Owner killed for real; the old node returns | I1, I6 | C4, C2 |
+| UC-480 | Worker's sandboxd SIGKILLed while a failpoint parks a create between the runtime start and the store write | I8, I6 | release gate |
+| UC-481 | sandboxd SIGKILLed on every server at once (or the leader); control-plane recovery time measured | I6, I8, I4 | release gate |
+| UC-482 | Soak: closed-loop create, probe, delete for 15 min, every node sampled | I6 | release gate |
 | UC-484 | Owner worker cut off from the servers only; its paused sandbox's toolbox URL, HTTP port and raw TCP port probed on the worker | I7 | C4 (#1050) |
+
+UC-480..482 are the release-gate tools of `plans/cluster-phase-2.md` §5,
+run as short smoke runs in this scenario:
+
+- **UC-480 needs a failpoint build.** run.sh compiles this scenario's local
+  sandboxd with `-tags itest_failpoints` (the caps file's `go_tags`, passed
+  to `lib/build.sh` as `AEROL_GO_TAGS`; the build id ends
+  `-tags-itest_failpoints`). The case arms
+  `/run/sandboxd/failpoints/create-before-persist` on every worker for one
+  sandbox name, waits for the `.hit` marker, and SIGKILLs sandboxd on that
+  node. On `--released` / `--version`, whose binaries have no failpoints, it
+  skips. Every other scenario builds without tags, and
+  `safety/go_tags_test.go` keeps any `go_tags` entry `itest_*`.
+- **UC-481** probes once a second through the API domain: the leader, a
+  placement read for a sandbox made before the kill, and a create. Each
+  signal recovers at its first success after its last failure; the recovery
+  time is the latest of the three, logged as `rto ... recovery_seconds=` and
+  written into the I6 detail of `reports/cluster-chaos.json`.
+- **UC-482** writes one JSON line per sample to `AEROL_SOAK_OUT`. The pass
+  rule is `harness.SoakVerdict`: counts back at baseline after the drain
+  plus one reconcile interval; for goroutines (`aerolvm_go_goroutines`),
+  RSS, fds, WAL and Raft size, the last third's median within the larger of
+  20% and a floor of the first third's; no sandboxd restart. The 72-hour run
+  is the same case with a longer `AEROL_SOAK_MINUTES` and
+  `AEROL_SUITE_TIMEOUT`.
 
 - **Topology.** 3 servers, 3 workers, 1 ingress, all t3.medium on-demand
   (`scenarios/cluster-chaos.tfvars` says why each). About $0.29/h; bring-up
-  ~20 min, the ten cases ~80 min, teardown ~5 min, so ~$0.45-0.65 a run.
+  ~20 min, the ten fault cases ~80 min plus ~35 min for UC-480..482 (the
+  soak is 15 of it), teardown ~5 min, so ~$0.60-0.80 a run.
   The scenario sets `SB_RECONCILE_INTERVAL=60s`; the cases read it off a node
   and wait two intervals plus a minute before calling a state converged.
 - **Focused.** The caps file's `focus` block makes run.sh pass
@@ -322,6 +456,14 @@ plan's fixes C2..C7 land; each test's doc comment in
 | `AEROL_CHAOS_MASS_SANDBOXES` / `_CPU` / `_MEMORY_MB` / `_SURVIVOR_FREE_CPU` | `12` / `1.0` / `256` / `4` | UC-478 |
 | `AEROL_CHAOS_FAILOVER_BOUND_SECONDS` | `300` | how long a reassign, and a reassigned sandbox's start, may take |
 | `AEROL_CHAOS_CONVERGE_SECONDS` | 2 x reconcile + 60 | override the convergence bound T |
+| `AEROL_CHAOS_RTO_MODE` | `all` | UC-481: `all` SIGKILLs every server at once, `leader` only the Raft leader |
+| `AEROL_CHAOS_RTO_BUDGET_SECONDS` | `55` | UC-481's recovery-time budget: about 1.5 times the first measured run (34.5 s, 2026-11-08) |
+| `AEROL_CHAOS_RTO_SANDBOXES` / `_MAX_CREATES` | `3` / `120` | UC-481: sandboxes whose placements must survive, and a cap on the prober's creates |
+| `AEROL_SOAK_MINUTES` | `15` | UC-482's load duration |
+| `AEROL_SOAK_WORKERS` | `4` | UC-482's closed-loop workers |
+| `AEROL_SOAK_SAMPLE_SECONDS` | `60` | UC-482's sampling interval |
+| `AEROL_SOAK_OUT` | `<reports>/<scenario>-soak.jsonl` | UC-482's samples, one JSON line each |
+| `AEROL_GO_TAGS` | caps `go_tags` | test-only Go build tags for the local sandboxd build (overrides the caps file) |
 
 ## Enterprise scenarios and the audit witness
 

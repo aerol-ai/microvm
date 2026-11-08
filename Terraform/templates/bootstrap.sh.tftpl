@@ -180,8 +180,13 @@ INSTALL_ARGS+=(--with-gvisor)
 %{ if with_isolate ~}
 INSTALL_ARGS+=(--with-isolate)
 %{ endif ~}
-%{ if ingress_proxy_routing ~}
+%{ if ingress_proxy_routing == true ~}
 INSTALL_ARGS+=(--ingress-proxy-routing)
+%{ endif ~}
+%{ if ingress_proxy_routing == false ~}
+# Explicitly off in Terraform. Without the flag, install.sh would turn
+# routing on for this --domain install.
+INSTALL_ARGS+=(--no-ingress-proxy-routing)
 %{ endif ~}
 %{ if with_nvidia_gpu ~}
 INSTALL_ARGS+=(--with-nvidia-gpu)
@@ -971,6 +976,23 @@ SB_CONTAINERD_NAMESPACE=${containerd_cfg.namespace}
 SB_CONTAINERD_CNI_PLUGIN_DIR=${containerd_cfg.cni_plugin_dir}
 SB_CONTAINERD_NATIVE_NETNS_POOL_ENABLED=${containerd_cfg.native_netns_pool_enabled}
 
+%{ if containerd_pool_cfg.enabled == "true" ~}
+# Managed by Terraform bootstrap: containerd warm container pool (park +
+# adopt), rendered only when cluster.yml's containerd.pool.enabled is true.
+# Off renders nothing, not "=false": nodes use user_data_replace_on_change,
+# so any new byte here would replace every node of a running cluster on the
+# next apply, and an explicit false in cluster.env (loaded after
+# sandboxd.env) would override a value set by hand in sandboxd.env. When on,
+# these lines do win over sandboxd.env; extra_sandboxd_env still wins over
+# them. Without them the containerd-pool capability would silently no-op.
+SB_CONTAINERD_POOL_ENABLED=${containerd_pool_cfg.enabled}
+SB_CONTAINERD_POOL_DEPTH=${containerd_pool_cfg.depth}
+SB_CONTAINERD_POOL_IMAGES=${containerd_pool_cfg.images}
+SB_CONTAINERD_POOL_MAX_IMAGES=${containerd_pool_cfg.max_images}
+SB_CONTAINERD_POOL_IDLE_TTL=${containerd_pool_cfg.idle_ttl}
+SB_CONTAINERD_POOL_REFILL_INTERVAL=${containerd_pool_cfg.refill_interval}
+
+%{ endif ~}
 %{ if secret_kms_key_arn != "" ~}
 # Managed by Terraform bootstrap: cluster secret provider backed by a real KMS
 # CMK. The daemon reaches it through the instance role — pkg/secrets/awskms.go

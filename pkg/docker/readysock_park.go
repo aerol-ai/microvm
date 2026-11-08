@@ -216,6 +216,18 @@ func (l *ParkedListener) Alive() bool {
 
 // Adopt sends the adopt frame and waits for the ready ack.
 func (l *ParkedListener) Adopt(ctx context.Context, sandboxID, token, adoptNonce string) error {
+	return l.AdoptWithEnv(ctx, sandboxID, token, adoptNonce, nil)
+}
+
+// AdoptWithEnv is Adopt with the sandbox's env in the frame: the toolbox
+// loads it before it takes the identity and starts the held-back command
+// (plans/cluster-phase-2.md §2). The ack must then carry
+// readyproto.EnvDigest(adoptNonce, env). An agent built before frames
+// carried env drops the field without a word and acks without a digest, so
+// a missing or wrong digest fails the adopt: the caller tears the slot down
+// and goes cold, and no sandbox is ever served without its env. Nothing
+// here logs env or puts it in an error.
+func (l *ParkedListener) AdoptWithEnv(ctx context.Context, sandboxID, token, adoptNonce string, env map[string]string) error {
 	if l == nil {
 		return errors.New("park listener is nil")
 	}
@@ -253,6 +265,7 @@ func (l *ParkedListener) Adopt(ctx context.Context, sandboxID, token, adoptNonce
 		SandboxID: sandboxID,
 		Token:     token,
 		Nonce:     adoptNonce,
+		Env:       env,
 	}); err != nil {
 		return fmt.Errorf("send adopt: %w", err)
 	}
@@ -266,6 +279,11 @@ func (l *ParkedListener) Adopt(ctx context.Context, sandboxID, token, adoptNonce
 	}
 	if subtle.ConstantTimeCompare([]byte(sig.Token), []byte(token)) != 1 {
 		return errors.New("adopt ack token mismatch")
+	}
+	// An env-less adopt accepts an ack without a digest, as every agent
+	// has always sent; one that does carry a digest must still be right.
+	if (len(env) > 0 || sig.EnvDigest != "") && !readyproto.EnvDigestMatches(adoptNonce, env, sig.EnvDigest) {
+		return errors.New("adopt ack env digest missing or wrong: the toolbox did not apply the sandbox env")
 	}
 	_ = conn.Close()
 	l.connMu.Lock()

@@ -410,8 +410,11 @@ integration-cluster-hetero-lite:
 
 # Cluster correctness under faults (UC-470..UC-479,
 # plans/cluster-correctness-and-create-latency.md §3.2): partitions, packet
-# loss, owner and runtime kills, Raft leader kills. 3 server / 3 worker /
-# 1 ingress, 7 x t3.medium on-demand (~$0.29/h; a run is ~1.5-2 h, ~$0.45-0.65).
+# loss, owner and runtime kills, Raft leader kills; plus the release-gate
+# tools (UC-480..UC-482: a failpoint crash, control-plane recovery time, a
+# 15-minute soak; sandboxd is built with -tags itest_failpoints here only).
+# 3 server / 3 worker / 1 ingress, 7 x t3.medium on-demand (~$0.29/h; a run
+# is ~2-2.5 h, ~$0.60-0.80).
 # A FOCUSED scenario: only the chaos cases run (the focus block in
 # scenarios/cluster-chaos.caps.yml) and the report marks every other use case
 # skip. Several cases fail on main until the plan's C2-C7 fixes land; each

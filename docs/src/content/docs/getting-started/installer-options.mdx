@@ -141,7 +141,7 @@ The SSH gateway listens on `0.0.0.0:2220`. Change it with `SB_SSH_LISTEN_ADDR`.
 ### What the extra flags change
 
 - `--with-gvisor` installs `runsc` and `containerd-shim-runsc-v1`, registers `runsc` in `/etc/docker/daemon.json`, and restarts Docker if that file changed. It also writes `SB_HOST_RUNTIMES=docker,gvisor`. Use `--runsc-path` to point at a `runsc` you already have.
-- `--with-containerd-engine` installs the CNI networking plugins (`bridge`, `host-local`, `loopback`) in `/opt/cni/bin` and writes `SB_CONTAINER_ENGINE=containerd`. Docker stays installed, so older sandboxes keep working. Not with `--local`: a local install always uses Docker.
+- `--with-containerd-engine` installs the CNI networking plugins (`bridge`, `host-local`, `loopback`) in `/opt/cni/bin` and writes `SB_CONTAINER_ENGINE=containerd`. It also installs BuildKit, which builds images on containerd: `buildkitd` and `buildctl` in `/usr/local/bin`, and the `buildkit.service` unit. A BuildKit that is already there is kept. Docker stays installed, so older sandboxes keep working. Not with `--local`: a local install always uses Docker.
 - `--with-isolate` installs `workerd`, Cloudflare's program for running JavaScript, to `/usr/local/bin/workerd`. The version is pinned and its checksum is checked. It writes `SB_ENABLE_ISOLATE=true` and creates a `sandboxd-isolate` system user and the jail folder `/srv/isolate-jail`, so each workerd process runs locked down. Use `--workerd-path` to point at a `workerd` you already have.
 - `--with-firecracker` first checks that the server has `/dev/kvm`, and stops before it installs anything if not. Then it installs `firecracker` and `jailer` to `/usr/local/bin`, a guest Linux kernel to `/var/lib/sandboxd/firecracker/vmlinux`, and `skopeo`, `umoci` and `e2fsprogs`, which turn container images into virtual machine disks. The versions are pinned and every download's checksum is checked. It creates a `sandboxd-jailer` system user, so each virtual machine runs without root rights, and writes `SB_ENABLE_FIRECRACKER=true`. Not with `--local`.
 
@@ -201,14 +201,45 @@ The `sandboxd-jailer` user keeps each virtual machine from running as a login us
 
 Add `SB_ENABLE_WASM=true` to `/etc/sandboxd/sandboxd.env` and restart `sandboxd`. The server looks for modules in `/var/lib/sandboxd/wasm/modules` (change it with `SB_WASM_MODULES_DIR`). See [WASM modules](/wasm-modules/).
 
+### Where downloads come from
+
+Most files the installer downloads live on GitHub. If GitHub fails, the installer gets the same file from a copy we keep, called the mirror. The mirror is a public bucket at `https://aerolvm-downloads.s3.us-east-1.amazonaws.com`.
+
+For each file, the installer tries these places in order and stops at the first one that works:
+
+| Order | Where | Notes |
+|---|---|---|
+| 1 | The file's own home | GitHub for AerolVM releases, Caddy, CNI plugins, BuildKit, `workerd` and Firecracker. |
+| 2 | The mirror | AerolVM releases are under `aerolvm/<tag>/`, with the same file names as on GitHub. Other projects' files are under `deps/<project>/<version>/`. |
+| 3 | The project's own download site | Only where one exists. The custom Caddy build falls back to Caddy's build service. |
+
+A place that fails is retried twice, a few seconds apart, and then the installer moves on. So a GitHub outage costs seconds, not minutes. The last place is retried for longer, because there is nothing after it.
+
+The mirror changes where a file comes from, not how it is checked. Every file is checked the same way, wherever it came from:
+
+- AerolVM release files must match the release's `checksums.txt`.
+- Every other file must match a SHA-256 hash written into the installer.
+
+If a file does not match, the installer stops. It does not try the next place.
+
+To use your own mirror, pass `--download-mirror <url>` or set `AEROL_DOWNLOAD_MIRROR`. The flag wins if you set both. Your mirror must use `https` and the same folder layout. To turn the mirror off, pass `--download-mirror off`, or set `AEROL_DOWNLOAD_MIRROR` to an empty value.
+
+<Aside>
+If you install the newest release and GitHub fails part way through, some files can come from GitHub's newest release and some from the mirror's. They may then be from different releases, and the checksum check stops the install. Run the installer again, or pass `--version <tag>` so every file comes from one release.
+</Aside>
+
+The [cluster setup](/cluster-setup/#step-6-turn-on-firecracker-optional) downloads Firecracker from GitHub on its own. To use the mirror there too, set `binary_url` and `jailer_url` in its `firecracker` block to the mirror's copies.
+
 ### More installer options
 
 | Option | What it does |
 |---|---|
+| `--download-mirror <url\|off>` | Where to get a file when GitHub fails. Defaults to the public mirror, or to `AEROL_DOWNLOAD_MIRROR` when that is set. `off` turns it off. See [Where downloads come from](#where-downloads-come-from). |
 | `--acme-ca <url>` and `--acme-ca-root <pem>` | Get certificates from your own ACME server (the protocol Let's Encrypt uses) instead of Let's Encrypt. For private networks that cannot reach the internet. |
 | `--tls-issuer internal` | Caddy's own certificate authority signs every certificate. No DNS provider needed, but clients must trust Caddy's root certificate. For labs. |
 | `--caddy-storage-s3` and the `--caddy-storage-s3-*` options | Share certificates between several servers through an S3 bucket. |
-| `--ingress-proxy-routing` | Route sandbox links without writing a Caddy route for each sandbox. Off by default. |
+| `--ingress-proxy-routing` | Route sandbox links without a Caddy route for each sandbox. Then creating or deleting a sandbox, or opening a port, does not make Caddy reload and drop new connections ([TLS ports](/tcp-vs-tls-ports/) still do). On by default with `--domain`. Does nothing without a domain. |
+| `--no-ingress-proxy-routing` | Domain mode only. Turns that routing off: Caddy gets a route for each sandbox, as before. With neither option, a `--domain` install gets routing on and an install without a domain gets it off. A later run of the installer without this option turns routing back on. In the [cluster setup](/cluster-setup/), `default_ingress_proxy_routing` picks: unset passes neither option, `true` passes `--ingress-proxy-routing`, `false` passes this one. |
 | `--pat-scope <any\|host>` | Where the server's token (`--pat-token`) works. `any`, the default, keeps today's behavior. `host` accepts it only on the server itself (`127.0.0.1:21212`) and from other cluster servers. Everyone else must sign in with SSO or use a named API token. Caddy then talks to the server through a private socket. [Enterprise mode](/enterprise/enterprise-mode/) requires `host`. Turn it on only after every server runs a release that has it, and see the caution above about settings you added by hand. See [SSO](/enterprise/sso/#step-5-limit-the-server-token-to-the-server). |
 | `--l4-proxy-protocol` | Domain mode only. Passes each caller's real address through Caddy to the server, so audit records and alerts show it instead of `127.0.0.1`. Off by default. |
 | `--lb-health-port <port>` | Domain mode only. For a server behind a load balancer: serves `/health` on this port over plain HTTP for the balancer's health check. It answers `200` only when the whole path a user takes works (Caddy, its port 443 and the AerolVM server), so the balancer stops sending users to this server while any part is down. Open the port to the load balancer only. Off by default. See [Put a load balancer in front](/cluster-setup/#put-a-load-balancer-in-front). |

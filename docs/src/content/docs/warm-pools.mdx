@@ -18,6 +18,8 @@ Warm pools are off by default. A server keeps waiting sandboxes only when its op
 
 Both also need the ready socket, which is on unless the operator set `SB_DOCKER_READY_SOCKET_ENABLED=false`. A server with the pool off keeps your entries but warms nothing. Its settings `SB_DOCKER_POOL_DEPTH` and `SB_DOCKER_POOL_IMAGES` (or the `SB_CONTAINERD_POOL_*` ones) stay the default for every image that has no entry.
 
+On a cluster, turn the pool on in `config/cluster.yml`, not on each server: set `docker.pool.enabled` or `containerd.pool.enabled` to `true`. Then run `configure-ops.yml` to push it to running servers. Terraform also writes it into each server's setup script, so the next Terraform `apply` replaces every server of a running cluster. If you can, turn it on before the first `apply`. On containerd, each waiting sandbox uses about 13 MB of memory.
+
 ## Add an entry
 
 Name the image exactly as your creates name it, and say how many waiting sandboxes each server should keep. Calling it again with the same values changes nothing, so it is safe to run on every deploy.
@@ -220,11 +222,15 @@ There is nothing new to call. Create a sandbox from the image as usual, and a se
 
 A create can only take a waiting sandbox when it asks for nothing that a waiting sandbox does not already have. These settings make the create start a new sandbox instead:
 
-- environment variables, mounts or volumes
+- mounts or volumes
+- environment variables on a Docker server
+- on a containerd server, environment variables that the server can't hand over: a name that starts with `SB_` or `AEROLVM_EGRESS_CA`, the names `USER` or `LOGNAME`, or more than about 252 KiB of variables in all
 - a user other than `root`, or a custom start command
 - a private-registry login
 - a GPU
 - on Docker servers that limit disk size, a disk size other than the default
+
+On a containerd server, the waiting sandbox gets your environment variables when it is handed to you, before its start command runs. So the start command, your commands and terminals all see them, just as on a new sandbox. The server sends them to the sandbox's agent over a private channel and never writes them into the container's settings. If the agent can't prove it got them, the server throws that sandbox away and starts a new one for you.
 
 The image name must match the entry exactly. An entry for `python:3.12` does not serve a create of `docker.io/library/python:3.12`.
 
