@@ -143,6 +143,10 @@ type Cluster struct {
 	readIndexHook func(context.Context) (uint64, error)
 	// catchUpLogEvery overrides catchUpStillWaitingLogEvery in tests.
 	catchUpLogEvery time.Duration
+	// evictDeadOwnerStepHook runs just before each write evictDeadOwner
+	// makes, so tests can move a placement or revive the node between the
+	// read and the write. Always nil in production.
+	evictDeadOwnerStepHook func(step evictDeadOwnerStep, sandboxID string)
 }
 
 // New constructs the server-role Cluster for cfg.EnableCluster=true. Caller
