@@ -2780,7 +2780,13 @@ func (f *placementFSM) livePendingReservationCount(owner string, now int64) int 
 	}
 	f.mu.RLock()
 	defer f.mu.RUnlock()
-	if f.pendingReservationIDsByOwner == nil {
+	return f.livePendingReservationCountLocked(owner, now)
+}
+
+// livePendingReservationCountLocked is livePendingReservationCount for a
+// caller that holds f.mu.
+func (f *placementFSM) livePendingReservationCountLocked(owner string, now int64) int {
+	if owner == "" || f.pendingReservationIDsByOwner == nil {
 		return 0
 	}
 	// No prune here: see pendingReservationLoadByNode. Expired claims are
@@ -3206,6 +3212,12 @@ func (f *placementFSM) pendingReservationsByNode(now int64) map[string]capacity.
 func (f *placementFSM) pendingReservationLoadByNode(now int64) (map[string]capacity.Request, map[string]map[string]int) {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
+	return f.pendingReservationLoadByNodeLocked(now)
+}
+
+// pendingReservationLoadByNodeLocked is pendingReservationLoadByNode for a
+// caller that holds f.mu. The maps it returns are copies.
+func (f *placementFSM) pendingReservationLoadByNodeLocked(now int64) (map[string]capacity.Request, map[string]map[string]int) {
 	out := make(map[string]capacity.Request, len(f.pendingReservationCapacity))
 	for owner, req := range f.pendingReservationCapacity {
 		out[owner] = req
@@ -3222,6 +3234,90 @@ func (f *placementFSM) pendingReservationLoadByNode(now int64) (map[string]capac
 		subtractPendingLoad(out, runtimes, claim.OwnerNodeID, claim.Request)
 	})
 	return out, runtimes
+}
+
+// heldReservation is a reservation the leader has admitted and proposed but
+// has not yet seen applied: one item of an admission hold
+// (admission_ledger.go).
+type heldReservation struct {
+	SandboxID     string
+	OwnerNodeID   string
+	IncarnationID string
+	Request       capacity.Request
+}
+
+// admissionPendingLoad is the pending load the leader admits a reservation
+// against: live claims in the index (pendingReservationLoadByNode), the live
+// pending count of each of owners (livePendingReservationCount), and every
+// held reservation the index does not count yet.
+//
+// All of it is read under one lock. A hold is released only after apply has
+// added its claim to the index, and the caller holds the admission lock, so
+// no hold leaves while this runs; the claims may still change. Deciding "is
+// this hold in the index already?" from the same read as the index totals is
+// what counts every reservation exactly once: as a claim or as a hold. From
+// two reads, an apply in between could hide one from both (I4), or show it
+// in both and refuse a create that fits.
+//
+// A hold counts unless the index has a live claim for the same sandbox on
+// the same owner with the same load: that claim is the hold's own entry,
+// already applied, or the reservation it retries. Anything else (no claim,
+// an expired one, another owner or size) is counted again, which can only
+// over-count. Holds for the same sandbox, owner and incarnation are one
+// create sent twice and count once.
+func (f *placementFSM) admissionPendingLoad(now int64, owners []string, held []heldReservation) (map[string]capacity.Request, map[string]map[string]int, map[string]int) {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	load, runtimes := f.pendingReservationLoadByNodeLocked(now)
+	counts := make(map[string]int, len(owners))
+	for _, owner := range owners {
+		if _, ok := counts[owner]; !ok {
+			counts[owner] = f.livePendingReservationCountLocked(owner, now)
+		}
+	}
+	type heldKey struct{ sandbox, owner, incarnation string }
+	seen := make(map[heldKey]struct{}, len(held))
+	for _, h := range held {
+		if h.SandboxID == "" || h.OwnerNodeID == "" {
+			continue
+		}
+		key := heldKey{h.SandboxID, h.OwnerNodeID, h.IncarnationID}
+		if _, dup := seen[key]; dup {
+			continue
+		}
+		seen[key] = struct{}{}
+		if claim, ok := f.pendingReservationClaims[h.SandboxID]; ok && claim.OwnerNodeID == h.OwnerNodeID &&
+			(claim.ExpiresUnix <= 0 || now <= claim.ExpiresUnix) && samePendingLoad(claim.Request, h.Request) {
+			continue
+		}
+		addPendingLoad(load, runtimes, h.OwnerNodeID, h.Request)
+		if _, ok := counts[h.OwnerNodeID]; ok {
+			counts[h.OwnerNodeID]++
+		}
+	}
+	return load, runtimes, counts
+}
+
+// samePendingLoad compares the fields the pending index sums.
+func samePendingLoad(a, b capacity.Request) bool {
+	return a.CPU == b.CPU && a.MemoryMB == b.MemoryMB && a.DiskGB == b.DiskGB && a.GPUs == b.GPUs && a.Runtime == b.Runtime
+}
+
+// addPendingLoad adds one reservation to a copy of the pending aggregates,
+// the same way addPendingCapacityLocked does on the index.
+func addPendingLoad(load map[string]capacity.Request, runtimes map[string]map[string]int, owner string, req capacity.Request) {
+	cur := load[owner]
+	cur.CPU += req.CPU
+	cur.MemoryMB += req.MemoryMB
+	cur.DiskGB += req.DiskGB
+	cur.GPUs += req.GPUs
+	load[owner] = cur
+	byRuntime := runtimes[owner]
+	if byRuntime == nil {
+		byRuntime = make(map[string]int)
+		runtimes[owner] = byRuntime
+	}
+	byRuntime[req.Runtime]++
 }
 
 // forEachExpiredClaimLocked calls fn once for every claim that has expired

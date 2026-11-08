@@ -102,16 +102,26 @@ type Cluster struct {
 	// be admitted. Nothing repairs that afterwards: an already-configured
 	// server skips the admission check on every later reconcile.
 	raftMembershipMu sync.Mutex
-	// reservationAdmissionMu serializes leader-side reservation admission.
-	// Capacity leases are outside the Raft FSM, so the leader must check
-	// target capacity + per-worker pending caps under one queue before
-	// appending opReserve/opReserveBatch. Otherwise two routers can both
-	// validate against the same pending snapshot and overfill a worker.
+	// reservationAdmissionMu serializes leader-side admission checks (the
+	// capacity and pending-create cap of opReserve/opReserveBatch, and team
+	// quotas) and guards the admission ledger. Capacity leases are outside
+	// the Raft FSM, so two routers checking the same pending snapshot at once
+	// could both fill a worker's last slot. It is held for the check only,
+	// never across the Raft commit: what is admitted but not yet applied is
+	// counted from the ledger instead (admission_ledger.go).
 	reservationAdmissionMu sync.Mutex
-	// quotaBarrierTerm is the Raft term this leader last ran its team-quota
-	// barrier in (team_quotas.go): quota admission reads usage only once the
-	// FSM holds every entry committed before the term began.
-	quotaBarrierTerm atomic.Uint64
+	// admission is the leader's ledger of in-flight admissions for its
+	// current term, guarded by reservationAdmissionMu.
+	admission admissionLedger
+	// admissionEnqueue is held for reading from a passed admission check
+	// until raft has taken the entry, and for writing by a term change before
+	// its barrier, so every entry admitted in an earlier term is in the log
+	// ahead of that barrier (admission_ledger.go).
+	admissionEnqueue sync.RWMutex
+	// leaderTermHook and admissionBarrierHook stand in for raft's state, term
+	// and barrier in admission tests. Always nil in production.
+	leaderTermHook       func() (bool, uint64)
+	admissionBarrierHook func() error
 	// authoritativeBarrierOnce/authoritativeBarrier admit ONE fsm barrier at
 	// a time. A raft barrier cannot be cancelled, so the goroutine waiting on
 	// one outlives an abandoned read; holding the slot until raft returns is
@@ -1518,19 +1528,17 @@ func (c *Cluster) ApplyEncoded(ctx context.Context, payload []byte) error {
 	return c.applyEncodedLocal(ctx, payload)
 }
 
+// applyReservationEncodedLocal admits a reservation (capacity, pending cap,
+// team quota) against committed state plus the leader's in-flight holds, then
+// proposes it without holding the admission lock across the commit
+// (admission_ledger.go).
 func (c *Cluster) applyReservationEncodedLocal(ctx context.Context, payload []byte, cmd command) error {
-	c.reservationAdmissionMu.Lock()
-	defer c.reservationAdmissionMu.Unlock()
-	if c.raft.raft.State() != raft.Leader {
-		return ErrNotLeader
-	}
-	if err := c.admitReservationCommand(cmd); err != nil {
-		return err
-	}
-	if err := c.admitTeamQuotaCommand(cmd); err != nil {
-		return err
-	}
-	return c.applyEncodedLocal(ctx, payload)
+	return c.applyAdmittedEncodedLocal(ctx, payload, cmd, func() error {
+		if err := c.admitReservationCommand(cmd); err != nil {
+			return err
+		}
+		return c.admitTeamQuotaCommand(cmd)
+	})
 }
 
 // applyEncodedLocal submits an already-encoded command to the local raft.
@@ -1544,7 +1552,17 @@ func (c *Cluster) applyEncodedLocal(ctx context.Context, payload []byte) error {
 
 // applyEncodedLocalResult is applyEncodedLocal for the ops whose FSM answer
 // the caller needs (an allocated token, say). Everything else discards it.
-func (c *Cluster) applyEncodedLocalResult(ctx context.Context, payload []byte) (result any, err error) {
+func (c *Cluster) applyEncodedLocalResult(ctx context.Context, payload []byte) (any, error) {
+	result, _, err := c.applyEncodedLocalOutcome(ctx, payload, nil)
+	return result, err
+}
+
+// applyEncodedLocalOutcome is applyEncodedLocalResult plus whether the entry
+// can still commit after an error (raftApplyOutcome), which the admission
+// ledger needs to know when to let go of a hold. enqueued, when not nil, is
+// called as soon as raft has taken the entry (or refused to), before the
+// wait for its commit.
+func (c *Cluster) applyEncodedLocalOutcome(ctx context.Context, payload []byte, enqueued func()) (result any, outcome admissionOutcome, err error) {
 	done := beginRaftApply()
 	defer func() { done(err) }()
 	timeout := c.commitTimeout
@@ -1554,17 +1572,21 @@ func (c *Cluster) applyEncodedLocalResult(ctx context.Context, payload []byte) (
 		}
 	}
 	f := c.raft.raft.Apply(payload, timeout)
+	if enqueued != nil {
+		enqueued()
+	}
 	if applyErr := f.Error(); applyErr != nil {
+		outcome = raftApplyOutcome(applyErr)
 		if errors.Is(applyErr, raft.ErrNotLeader) || errors.Is(applyErr, raft.ErrLeadershipLost) {
-			return nil, ErrNotLeader
+			return nil, outcome, ErrNotLeader
 		}
 		err = fmt.Errorf("cluster: raft apply: %w", applyErr)
-		return nil, err
+		return nil, outcome, err
 	}
 	response := f.Response()
 	if appErr, ok := response.(error); ok && appErr != nil {
 		err = fmt.Errorf("cluster: fsm apply: %w", appErr)
-		return nil, err
+		return nil, outcomeSettled, err
 	}
 	if reassigned, ok := response.(reassignApplyResult); ok && reassigned.Changed {
 		// This runs once on the leader after its FSM confirms the ownership
@@ -1572,7 +1594,7 @@ func (c *Cluster) applyEncodedLocalResult(ctx context.Context, payload []byte) (
 		// wrapper, and a lost HTTP acknowledgement cannot erase the count.
 		recordFailoverReassign()
 	}
-	return response, nil
+	return response, outcomeSettled, nil
 }
 
 // forwardApplyToLeader posts an encoded raft command to the current leader's

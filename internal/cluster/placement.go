@@ -641,8 +641,17 @@ func isLiveReservationRetry(fsm *placementFSM, r reservationCommand, now int64) 
 		now+reservationRetryAdmitMargin <= p.ExpiresUnix
 }
 
+// admitReservationCommand is the leader's capacity answer for a reservation
+// command. It runs under reservationAdmissionMu and counts, besides the
+// owner's heartbeat, the committed pending load plus every reservation the
+// leader has admitted but not yet seen applied (admission_ledger.go). A
+// resend of a create still in flight is not counted again.
 func (c *Cluster) admitReservationCommand(cmd command) error {
+	// Two kinds of resend add no load: one of a reservation the FSM already
+	// holds live (Bug A, PR #1021), and one of a create still in flight on
+	// this leader (the ledger, PR #1024).
 	reservations := withoutLiveReservationRetries(c.fsm, reservationCommands(cmd), time.Now().Unix())
+	reservations = c.admission.withoutHeldResends(reservations)
 	if len(reservations) == 0 {
 		return nil
 	}
@@ -652,17 +661,25 @@ func (c *Cluster) admitReservationCommand(cmd command) error {
 			templateIDs = append(templateIDs, r.Spec.TemplateID)
 		}
 	}
-	// Heartbeats before pending lookups, as pendingLoadByNode requires.
+	// Heartbeats before pending lookups, as pendingLoadByNode requires (C7).
 	members := c.withCatalogueTemplateHolders(c.membersWithCapacity(), templateIDs...)
 	now := time.Now().Unix()
-	load := c.pendingLoadByNode(now)
+	owners := make([]string, 0, len(reservations))
+	for _, r := range reservations {
+		owners = append(owners, r.OwnerNodeID)
+	}
+	// Committed pending load plus the ledger's in-flight holds (E2), then the
+	// load promoted or failed over since the owner's last heartbeat (C7).
+	reserved, reservedRuntimes, pendingCounts := c.fsm.admissionPendingLoad(now, owners, c.admission.heldReservations())
+	load := pendingLoad{reserved: reserved, runtimes: reservedRuntimes}
+	if c.capacityLeases != nil {
+		load.unreported = c.capacityLeases.unreported
+	}
 	pending := make(map[string]capacity.Request, len(reservations))
 	pendingRuntimes := make(map[string]map[string]int, len(reservations))
-	pendingCounts := make(map[string]int, len(reservations))
 	for _, r := range reservations {
-		if _, ok := pendingCounts[r.OwnerNodeID]; !ok {
+		if _, ok := pending[r.OwnerNodeID]; !ok {
 			pending[r.OwnerNodeID], pendingRuntimes[r.OwnerNodeID] = load.of(r.OwnerNodeID)
-			pendingCounts[r.OwnerNodeID] = c.fsm.livePendingReservationCount(r.OwnerNodeID, now)
 		}
 	}
 	return admitReservationCommands(members, pending, pendingRuntimes, pendingCounts, c.cfg.ClusterCreateMaxPendingPerWorker, reservations)
