@@ -1,6 +1,7 @@
 # Cluster correctness first, then create latency
 
-Status: draft, 2026-11-07. Not reviewed. Next gate: `/plan-eng-review`.
+Status: items C1–C8, D1, E2, E3a, L1, L2 and L5 merged to `main` on 2026-11-08
+(see Section 9). The rest is not started; Section 9 says why.
 Base: `main` at 58c9a0bd4ab4aa2fbd10910a00a66686b26f970c.
 
 ## 0. Why this plan exists
@@ -368,6 +369,69 @@ scenario costs about the same as its first run.
    per waiting sandbox acceptable for the target density?
 5. Comparison with Kubernetes: the same image, hardware, security settings and
    readiness definition on both, cold against cold and warm against warm.
+
+## 9. Outcome (2026-11-08)
+
+**Merged.** One combined PR, #1032 (merge commit
+676b20a90ac108b89954d1a177843d920a01f8d2), brought in every fix PR below
+after the live runs. This plan (#1000), the installer fix (#1025) and the
+UC-124 test fix (#1034) merged on their own the same day.
+
+| Item | PR | State |
+|---|---|---|
+| C1 FSM time from the log entry | #1001 | Merged |
+| C2 no resurrection | #1011, #1013 | Merged. Open question 1 answered: destroy the local copy, and write an audit event |
+| C3 delete during failover | #1005 | Merged |
+| C4 parts 1–3: worker lease, no stale reads, feed age limit, 503 instead of a hang | #1020, #1016, #1019, #1027, #1028 | Merged |
+| C5 rollback-pending | #1007 | Merged |
+| C6 eviction fence | #1006 | Merged |
+| C7 capacity lag, and handing back a recreate refused for room | #1015, #1031 | Merged |
+| C8 all-or-nothing batch | #1003 | Merged |
+| D1 gossip data race | #1009 | Merged |
+| Offline fault harness (3.1) and the two bugs it found | #1017, #1021, #1023 | Merged |
+| Live chaos scenario (3.2) | #1008 | Merged |
+| E2 admission ledger | #1024 | Merged |
+| E3a owner cache (off by default) | #1018 | Merged |
+| L1 create-stage timing | #1010 | Merged |
+| L2 single-node containerd pool | #1004 | Merged |
+| L5 netns refill on claim | #1014 | Merged |
+| Fast test timers | #1002 | Merged |
+| Bugs the live runs found | #1026 (UC-450), #1029 (UC-459), #1033 (token-gated ports with proxy routing), #1030 (flaky test) | Merged |
+
+**Live results on the merged code.**
+
+- `cluster-chaos`: 10 of 10. At most 1 running copy in 24 samples through a
+  120 s partition (I1); a cut-off ingress answered 503 15 times out of 15
+  (I7); no deleted sandbox came back (I3); 200 creates with the leader killed
+  left 34 sandboxes and nothing from the 166 that failed (I8).
+- `single-node`: 238 pass, 0 fail.
+- `cluster-hetero-lite-routing` (routing flag on): at 449 of 460 cases when this was written: 283 pass, including UC-426,
+  UC-465 and UC-466 (#1033); 162 skip as expected; 3 fail, none from this
+  work. UC-124 was a test bug (it drained two nodes that hold no secret copy;
+  fixed in #1034). UC-285: the laptop's SSH tunnel to a worker never opened.
+  UC-171: 1 HTTP and 1 TCP connection timed out together during route churn;
+  timeouts, not resets, and the ingress logged no error or reload.
+
+**Not started, and why.**
+
+| Item | Why not yet | What unblocks it |
+|---|---|---|
+| E3b owner-side lease | Gated on C4 (Section 5) | Nothing now: C4 is merged |
+| C4 part 4, ownership epoch | Parts 1–3 already passed the live partition test. Part 4 changes what forwarded requests carry, so it needs a mixed-version upgrade plan | A short design |
+| L3 wider warm-pool use | Hands sealed env to a container that is already running; needs its own design | A design |
+| L4 warm pool in cluster deploys | Memory per waiting sandbox not measured; the default is open question 4 | One measurement run, then a decision |
+| L6 smaller `containerd_create` | The saving is an estimate | A measurement with the containerd spike test |
+| E1 combined multi-reserve op | Optional; raft already groups concurrent applies now that E2 is in | Numbers that show it is needed |
+| Release gates: crash recovery time, 72-hour soak | No long-running churn driver, and no failpoint in the create path | Build them |
+| Caddy reload drops the first request (UC-393, UC-472, UC-357) | Not part of this plan; the fix is the existing routing flag | A decision to turn it on by default, and a flagship run with it on |
+
+**Release note.** Upgrade every server in one window. C2's FSM refusal waits
+until every server runs the new FSM version, but C1, C8 and the pending-load
+prune (harness Bug B) do not: an old and a new server can disagree on rare
+edge cases while both run.
+
+**Open questions still open:** 2 (how short the grace can be), 3 (reconcile
+interval), 4 (warm-pool default), 5 (fair comparison with Kubernetes).
 
 ## Sources
 
