@@ -470,17 +470,11 @@ teardown() {
   fi
   if [[ "$destroyed" == "1" ]]; then
     rm -f "${REPO_ROOT}/integration-tests/.tf/${scenario}/.leased-domain"
+    release_scenario_claim "$scenario"
   else
     echo "teardown: destroy returned non-zero for ${scenario} — run 'make integration-reap'" >&2
   fi
 }
-
-if [[ "$DESTROY_ONLY" == "1" ]]; then
-  # Fast path: teardown() returns early when KEEP=1; force a real destroy here.
-  KEEP=0
-  teardown "$SCENARIO"
-  exit 0
-fi
 
 # lease_domain picks a RANDOM test domain from the pool for fresh runs, never
 # repeating the previous fresh pick. Reusing one name re-requests the same cert
@@ -579,6 +573,76 @@ lease_lock_release() {
   fi
   LEASE_LOCK=""
 }
+
+# One worktree at a time may work on a scenario name. Every worktree of the
+# clone uses the same Terraform state key for a scenario
+# (integration/<scenario>/terraform.tfstate) and the same cluster name, so a
+# second worktree that ran, kept or destroyed the scenario would apply over,
+# or destroy, the first one's live stack. A run claims the name in
+# .tf/<scenario>/.state-claim before anything is applied, and teardown drops
+# the claim with the pin once the destroy succeeds; a kept stack keeps both.
+# A domain pin in another worktree counts as a claim too, so a stack started
+# by a run.sh from before claims existed still blocks.
+
+# scenario_holders prints the claim and pin files other worktrees hold for $1.
+scenario_holders() {
+  local scenario="$1" root f first=1
+  while IFS= read -r root; do
+    if [[ "$first" == "1" ]]; then
+      first=0 # REPO_ROOT itself: our own claim never blocks us
+      continue
+    fi
+    for f in "${root}/integration-tests/.tf/${scenario}/.state-claim" \
+      "${root}/integration-tests/.tf/${scenario}/.leased-domain"; do
+      if [[ -f "$f" ]]; then
+        printf '%s\n' "$f"
+      fi
+    done
+  done < <(worktree_roots)
+}
+
+# refuse_if_scenario_held returns 1, saying why, when another worktree holds $1.
+refuse_if_scenario_held() {
+  local scenario="$1" holders
+  holders=$(scenario_holders "$scenario")
+  [[ -z "$holders" ]] && return 0
+  echo "scenario ${scenario}: another worktree holds it, so this run will not touch integration/${scenario}/terraform.tfstate:" >&2
+  sed 's/^/  /' <<<"$holders" >&2
+  echo "  Every worktree shares that state, so running, keeping or destroying ${scenario} here would act on that stack." >&2
+  echo "  Run it from that worktree or wait for it to finish. If its stack is already gone, run" >&2
+  echo "  'integration-tests/run.sh ${scenario} --destroy-only' in that worktree, or delete the file." >&2
+  return 1
+}
+
+# claim_scenario checks and writes the claim under the lease lock, so two
+# worktrees that start the same scenario together cannot both get it.
+claim_scenario() {
+  local scenario="$1"
+  local sdir="${REPO_ROOT}/integration-tests/.tf/${scenario}"
+  lease_lock_acquire || return 1
+  if ! refuse_if_scenario_held "$scenario"; then
+    lease_lock_release
+    return 1
+  fi
+  mkdir -p "$sdir"
+  printf 'worktree=%s\nstate_key=integration/%s/terraform.tfstate\nsince=%s\n' \
+    "$REPO_ROOT" "$scenario" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "${sdir}/.state-claim"
+  lease_lock_release
+}
+
+release_scenario_claim() {
+  rm -f "${REPO_ROOT}/integration-tests/.tf/${1}/.state-claim"
+}
+
+if [[ "$DESTROY_ONLY" == "1" ]]; then
+  # Another worktree's live stack sits behind the same state key; destroying
+  # from here would destroy it.
+  refuse_if_scenario_held "$SCENARIO" || exit 1
+  # Fast path: teardown() returns early when KEEP=1; force a real destroy here.
+  KEEP=0
+  teardown "$SCENARIO"
+  exit 0
+fi
 
 lease_domain() {
   local own_pin="${1:-}"
@@ -1169,6 +1233,17 @@ run_one() {
   if [[ ! -f "$tfvars_file" || ! -f "$caps_file" ]]; then
     echo "scenario ${scenario}: missing $(basename "$tfvars_file") or $(basename "$caps_file")" >&2
     return 2
+  fi
+
+  # Claim the scenario name before the domain lease, so a refused run leaves
+  # no pin behind. A claim this run made is dropped again if it exits before
+  # the teardown trap below takes over: nothing has been applied yet. A claim
+  # that was already here belongs to a kept stack and stays.
+  local had_claim=0
+  [[ -f "${sdir}/.state-claim" ]] && had_claim=1
+  claim_scenario "$scenario" || return 1
+  if [[ "$had_claim" == "0" ]]; then
+    trap "release_scenario_claim '${scenario}'" EXIT INT TERM
   fi
 
   mkdir -p "$overlay"
@@ -2017,6 +2092,12 @@ run_obs_snapshot_only() {
       http://127.0.0.1:3000/api/snapshots" > "${out_dir}/d1-snapshot.json" 2>/dev/null || true
   echo "obs snapshots in ${out_dir}" >&2
 }
+
+# These modes read or load the stack behind the shared state key, which may be
+# another worktree's.
+if [[ "$COLLECT_LOGS_ONLY" == "1" || "$OBS_SNAPSHOT_ONLY" == "1" || "$BENCH_ONLY" == "1" ]]; then
+  refuse_if_scenario_held "$SCENARIO" || exit 1
+fi
 
 if [[ "$COLLECT_LOGS_ONLY" == "1" ]]; then
   collect_logs_only "$SCENARIO"

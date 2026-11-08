@@ -709,6 +709,14 @@ The live suite is behind the `integration` build tag, so the everyday
 
 - **State:** `-backend-config=key=integration/<scenario>/...` + separate
   `TF_DATA_DIR`. The prod key (`prod/terraform.tfstate`) is never opened.
+- **One worktree per scenario:** every worktree of a clone shares a
+  scenario's state key and cluster name, so `run.sh` claims the name in
+  `.tf/<scenario>/.state-claim` before anything is applied. While another
+  worktree holds the claim (or a domain pin for that scenario), a run,
+  `--destroy-only`, `--collect-logs-only`, `--bench-only` or
+  `--obs-snapshot-only` here is refused and names the file. Teardown drops the
+  claim after a successful destroy; a kept stack keeps it. Test domains work
+  the same way: a lease skips every domain any worktree has pinned.
 - **Tripwires** (`lib/provision.sh check-safety`, unit-tested in `safety/`):
   abort before any apply if the state key targets prod, the leased domain is
   empty or collides with the prod domain, or `cluster_name` lacks the `itest`
