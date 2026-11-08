@@ -17,6 +17,7 @@ import (
 	"github.com/aerol-ai/microvm/internal/cluster"
 	"github.com/aerol-ai/microvm/internal/service"
 	"github.com/aerol-ai/microvm/pkg/capacity"
+	"github.com/aerol-ai/microvm/pkg/createtiming"
 	"github.com/aerol-ai/microvm/pkg/docker"
 	"github.com/aerol-ai/microvm/pkg/egresspolicy"
 	"github.com/aerol-ai/microvm/pkg/models"
@@ -61,6 +62,27 @@ type ErrorWriter func(w http.ResponseWriter, status int, code, message string)
 
 type Decision struct {
 	ReservationID string
+	// reserveStages is how long the router took to pick this node and to
+	// write the reservation, both before the create's create;dur starts.
+	// Set only when Prepare reserved on this node itself.
+	reserveStages []reserveStage
+}
+
+// reserveStage is one router-side step of a reservation-first create.
+type reserveStage struct {
+	name string
+	d    time.Duration
+}
+
+// RecordReserveStages adds the router's cluster_place and cluster_reserve
+// stages to the local create's recorder, so its Server-Timing covers the
+// time before create;dur started. Nil-safe; a Decision from a forwarded
+// create carries none (the router reports its own, see
+// forwardReservedCreate).
+func (d Decision) RecordReserveStages(timing *createtiming.CreateTiming) {
+	for _, st := range d.reserveStages {
+		timing.RecordStage(st.name, st.d)
+	}
 }
 
 type PrepareOptions struct {
@@ -299,7 +321,12 @@ func Prepare(w http.ResponseWriter, r *http.Request, svc *service.Service, req m
 	if svc.WantsSecretRecipientFanout(req) {
 		recipientBackups = svc.SecretRecipientBackupCount()
 	}
+	// cluster_place and cluster_reserve: the two router steps before any
+	// create;dur starts (plan PR #1000 item L1). Boot-path (pr-review §2):
+	// three timer reads per cluster create, no other work.
+	placeStart := time.Now()
 	target, recipients, err := c.SelectPlacementForCreate(CapacityRequestFromCreate(req), sandboxID, recipientBackups)
+	placeDur := time.Since(placeStart)
 	if err != nil {
 		if writeNoEgressGateway(w, err, writeError) || writePlacementUnsatisfiable(w, err, writeError) {
 			return Decision{}, false
@@ -338,8 +365,10 @@ func Prepare(w http.ResponseWriter, r *http.Request, svc *service.Service, req m
 	}
 	reserveSecrets := cluster.PlacementSecrets{Recipients: recipients, OwnerRef: reserveOwner}
 	commitCtx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	reserveStart := time.Now()
 	err = c.ReserveOnTarget(commitCtx, sandboxID, target, &redacted, reserveSecrets, ReservationTTL)
 	cancel()
+	stages := []reserveStage{{"cluster_place", placeDur}, {"cluster_reserve", time.Since(reserveStart)}}
 	if err != nil {
 		// A keyed retry that finds its id reserved goes to the reservation's
 		// node, which replays the sandbox, or holds the retry until the create
@@ -419,11 +448,11 @@ func Prepare(w http.ResponseWriter, r *http.Request, svc *service.Service, req m
 	r.Header.Set(HeaderID, sandboxID)
 	if target.IsSelf {
 		service.RecordCreateReservationState("reserve_local")
-		return Decision{ReservationID: sandboxID}, true
+		return Decision{ReservationID: sandboxID, reserveStages: stages}, true
 	}
 	service.RecordCreateReservationState("reserve_remote")
 	forwardReservedCreate(w, r, c, cluster.Endpoint{NodeID: target.NodeID, InternalURL: target.InternalURL, APIURL: target.APIURL},
-		sandboxID, opts.PreferredSandboxID == "", opts.Logger)
+		sandboxID, opts.PreferredSandboxID == "", opts.Logger, stages)
 	return Decision{}, false
 }
 
@@ -488,8 +517,8 @@ func snapshotTagHome(ctx context.Context, svc *service.Service, c cluster.Client
 // A 5xx, a transport failure or a timeout keeps the reservation, as before:
 // the target may still be creating, and cancelling under a live create would
 // leave an untracked sandbox. The expiry sweep stays the safety net there.
-func forwardReservedCreate(w http.ResponseWriter, r *http.Request, c cluster.Client, target cluster.Endpoint, sandboxID string, freshID bool, logger *slog.Logger) {
-	hold := &rejectionHold{ResponseWriter: w}
+func forwardReservedCreate(w http.ResponseWriter, r *http.Request, c cluster.Client, target cluster.Endpoint, sandboxID string, freshID bool, logger *slog.Logger, stages []reserveStage) {
+	hold := &rejectionHold{ResponseWriter: w, routerStages: stages, forwardStart: time.Now()}
 	defer hold.release()
 	c.ForwardHTTP(target, hold, r)
 	if !hold.rejected() || (!freshID && !hold.refusedForEveryReplay()) {
@@ -518,6 +547,11 @@ type rejectionHold struct {
 	status int
 	held   bool
 	body   bytes.Buffer
+
+	// routerStages and forwardStart are the router's side of the create's
+	// Server-Timing; addRouterTiming writes them onto the response.
+	routerStages []reserveStage
+	forwardStart time.Time
 }
 
 func (h *rejectionHold) WriteHeader(status int) {
@@ -529,6 +563,7 @@ func (h *rejectionHold) WriteHeader(status int) {
 	if h.status != 0 {
 		return
 	}
+	h.addRouterTiming()
 	h.status = status
 	if h.rejected() {
 		h.held = true
@@ -549,6 +584,30 @@ func (h *rejectionHold) Write(p []byte) (int, error) {
 		return h.ResponseWriter.Write(p)
 	}
 	return h.body.Write(p)
+}
+
+// addRouterTiming appends the router's stages (cluster_place,
+// cluster_reserve, and cluster_forward: the forwarded round trip as the
+// router saw it, the target's create;dur included) to the target's
+// Server-Timing. The reverse proxy has copied the target's headers by the
+// time it writes the status, and the result is set as ONE header line: a
+// reader that takes only the first Server-Timing value (Header.Get) then
+// still sees create;dur and the router's stages together.
+func (h *rejectionHold) addRouterTiming() {
+	if len(h.routerStages) == 0 {
+		return
+	}
+	timing := &createtiming.CreateTiming{}
+	for _, st := range h.routerStages {
+		timing.RecordStage(st.name, st.d)
+	}
+	timing.RecordStage("cluster_forward", time.Since(h.forwardStart))
+	header := h.Header()
+	parts := header.Values("Server-Timing")
+	for _, st := range timing.Stages() {
+		parts = append(parts, createtiming.FormatStage(st))
+	}
+	header.Set("Server-Timing", strings.Join(parts, ", "))
 }
 
 // Flush forwards a proxy flush, except while a refusal is held.

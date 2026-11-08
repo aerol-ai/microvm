@@ -26,8 +26,46 @@ var (
 	adoptMS           = expvar.NewFloat("aerolvm_docker_pool_adopt_ms")
 )
 
+// MetricFamily is a second set of process-wide counters a pool also counts
+// into. The containerd warm pool is this same queue, so its events have
+// always landed in the aerolvm_docker_pool_* series above, which the
+// warm-pool dashboards read; that stays as it is. A family adds the
+// engine's own series beside it, so a reader can tell the two pools apart
+// (aerolvm_containerd_pool_*, TODOS.md: containerdpool exported none).
+type MetricFamily struct {
+	hits, misses, refills, orphans, spawnFails *expvar.Int
+	parked                                     *expvar.Int
+}
+
+// NewMetricFamily registers prefix_hits_total, prefix_misses_total,
+// prefix_refills_total, prefix_orphans_total, prefix_spawn_fails_total and
+// the prefix_parked gauge. Call it once per prefix (package init): expvar
+// refuses a name twice.
+func NewMetricFamily(prefix string) *MetricFamily {
+	return &MetricFamily{
+		hits:       expvar.NewInt(prefix + "_hits_total"),
+		misses:     expvar.NewInt(prefix + "_misses_total"),
+		refills:    expvar.NewInt(prefix + "_refills_total"),
+		orphans:    expvar.NewInt(prefix + "_orphans_total"),
+		spawnFails: expvar.NewInt(prefix + "_spawn_fails_total"),
+		parked:     expvar.NewInt(prefix + "_parked"),
+	}
+}
+
+// SetMetricFamily makes the pool count into f as well as the shared docker
+// series. Set it before the pool is in use (containerdpool.New does).
+func (p *Pool) SetMetricFamily(f *MetricFamily) {
+	if p == nil || p.metrics == nil {
+		return
+	}
+	p.metrics.family = f
+}
+
 // Metrics exposes pool counters for tests and expvar export.
 type Metrics struct {
+	// family, when set, is counted into alongside the shared series.
+	family *MetricFamily
+
 	hits         atomic.Int64
 	misses       atomic.Int64
 	refilled     atomic.Int64
@@ -63,21 +101,33 @@ type Snapshot struct {
 func (m *Metrics) recordHit() {
 	m.hits.Add(1)
 	metricHit.Add(1)
+	if m.family != nil {
+		m.family.hits.Add(1)
+	}
 }
 
 func (m *Metrics) recordMiss() {
 	m.misses.Add(1)
 	metricMiss.Add(1)
+	if m.family != nil {
+		m.family.misses.Add(1)
+	}
 }
 
 func (m *Metrics) recordRefill() {
 	m.refilled.Add(1)
 	metricRefill.Add(1)
+	if m.family != nil {
+		m.family.refills.Add(1)
+	}
 }
 
 func (m *Metrics) recordOrphan() {
 	m.orphans.Add(1)
 	metricOrphan.Add(1)
+	if m.family != nil {
+		m.family.orphans.Add(1)
+	}
 }
 
 func (m *Metrics) recordStaleImage() {
@@ -88,6 +138,9 @@ func (m *Metrics) recordStaleImage() {
 func (m *Metrics) RecordSpawnFail() {
 	m.spawnFail.Add(1)
 	metricSpawnFail.Add(1)
+	if m.family != nil {
+		m.family.spawnFails.Add(1)
+	}
 }
 
 func (m *Metrics) recordTargetEvict() {
@@ -110,7 +163,12 @@ func (m *Metrics) recordDestroyFail() {
 	metricDestroyFail.Add(1)
 }
 
-func (m *Metrics) setParked(n int) { metricParked.Set(int64(n)) }
+func (m *Metrics) setParked(n int) {
+	metricParked.Set(int64(n))
+	if m.family != nil {
+		m.family.parked.Set(int64(n))
+	}
+}
 
 // RecordAdoptMS publishes the latest successful adopt handshake duration.
 // Exported because the adopt happens in pkg/docker, not in this package.

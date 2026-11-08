@@ -27,6 +27,7 @@ func (p *Pool) Prewarm(ctx context.Context, host HostManager, now time.Time) err
 	reset := func() error { return p.st.ResetContainerNetnsSlotToFree(ctx, slot.SlotID, now) }
 	path, ip, err := host.Realize(ctx, work)
 	if err != nil {
+		metricRefillFailures.Add(1)
 		// The slot is free and named after itself, so anything still held
 		// under its name is a leftover, never a live sandbox's: most often a
 		// host-local lease that an earlier DEL missed (binaries before this fix
@@ -38,10 +39,12 @@ func (p *Pool) Prewarm(ctx context.Context, host HostManager, now time.Time) err
 		return err
 	}
 	if err := p.st.FinishPrewarmContainerNetnsSlot(ctx, slot.SlotID, path, ip, now); err != nil {
+		metricRefillFailures.Add(1)
 		work.NetnsPath, work.ContainerIP = path, ip
 		_ = p.teardown(ctx, host, work, slot.SlotID, reset, now)
 		return err
 	}
+	metricRefills.Add(1)
 	return nil
 }
 

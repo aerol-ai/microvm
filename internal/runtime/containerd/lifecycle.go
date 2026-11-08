@@ -92,7 +92,10 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 			return nil, fmt.Errorf("provision netns: %w", err)
 		}
 		netnsProvisioned = true
-		createtiming.From(ctx).RecordStageDesc("containerd_netns", 0, "provisioned")
+		// The containerd_netns stage is the handoff's to record: only it
+		// knows a warm claim (hit) from an inline build (miss), and it times
+		// both (netns.RuntimeHandoff.Provision). This used to record a fixed
+		// 0 here, which the docs then published as "Network setup 0 ms".
 	}
 
 	committed := false
@@ -161,6 +164,11 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		return nil, err
 	}
 	createtiming.From(ctx).RecordStageDesc("containerd_image", time.Since(imageStart), "resolved")
+	// containerd_spec: everything between the image and the image lease
+	// (the image's user and command, the host files, the env, the OCI spec
+	// options and the ready socket). Boot-path (pr-review §2): this and the
+	// stages below add timer reads and RecordStage calls only.
+	specStart := time.Now()
 	// The operator create policy's require_non_root rule: the image config is
 	// the first place the user is known, before any host file or container.
 	if req.RequireNonRootUser {
@@ -251,10 +259,13 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 	if ip := strings.TrimSpace(prepaidIP); ip != "" {
 		containerLabels[containerIPLabelKey] = ip
 	}
+	createtiming.From(ctx).RecordStage("containerd_spec", time.Since(specStart))
+	leaseStart := time.Now()
 	leaseID, err = d.pinImageLease(ctx, client, image)
 	if err != nil {
 		return nil, err
 	}
+	createtiming.From(ctx).RecordStage("containerd_lease", time.Since(leaseStart))
 	if leaseID != "" {
 		containerLabels[imageLeaseLabelKey] = leaseID
 	}
@@ -284,6 +295,10 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		}
 		return nil, fmt.Errorf("create container: %w", err)
 	}
+	// containerd_create keeps its old span (NewContainer through NewTask), so
+	// it compares with every report before it; containerd_container and
+	// containerd_task are its two parts.
+	createtiming.From(ctx).RecordStage("containerd_container", time.Since(createStart))
 	// The prepaid address is this sandbox's from here (a duplicate create
 	// stopped at NewContainer above), and the workload hasn't started: put
 	// the request's rules on it now, so the workload never runs without
@@ -304,6 +319,7 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		sbruntime.NotifyAddressKnown(ctx, ip)
 	}
 
+	taskStart := time.Now()
 	logPath, err = d.taskLogPath(sandboxID)
 	if err != nil {
 		return nil, err
@@ -318,6 +334,7 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 	if err != nil {
 		return nil, fmt.Errorf("create task: %w", err)
 	}
+	createtiming.From(ctx).RecordStage("containerd_task", time.Since(taskStart))
 	createtiming.From(ctx).RecordStage("containerd_create", time.Since(createStart))
 
 	startStart := time.Now()
@@ -326,10 +343,14 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 	}
 	createtiming.From(ctx).RecordStage("containerd_start", time.Since(startStart))
 
+	// containerd_address: reading the started task's IPv4 back (the netns
+	// probe; for gVisor, the fallback to the prepaid address or label).
+	addressStart := time.Now()
 	state, err := d.runtimeStateAfterStart(ctx, container, task, sandboxID, prepaidIP)
 	if err != nil {
 		return nil, err
 	}
+	createtiming.From(ctx).RecordStage("containerd_address", time.Since(addressStart))
 
 	// Attribute the readiness wait for Server-Timing (parity with the docker
 	// driver): the ready socket is the fast path ("socket"); the HTTP health
