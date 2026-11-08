@@ -192,3 +192,47 @@ func TestAdoptedEnvReachesCommandExecAndSessions(t *testing.T) {
 		t.Fatalf("a log line carries the env: %q", logs.String())
 	}
 }
+
+// A create that sets PATH resolves the image command on that PATH warm, as
+// the engine resolves an entrypoint on a cold container: a name only the
+// sandbox's PATH holds runs, and a name only toolboxd's own PATH holds does
+// not.
+func TestHeldCommandResolvesOnTheAdoptedPath(t *testing.T) {
+	old := mainProgram
+	t.Cleanup(func() { mainProgram = old; userCommandPID.Store(0) })
+	bin := t.TempDir()
+	out := filepath.Join(t.TempDir(), "ran")
+	script := "#!/bin/sh\nprintf ok > " + out + "\n"
+	if err := os.WriteFile(filepath.Join(bin, "aerolvm-adopt-tool"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	withSandboxEnv(t, nil)
+	srv := &server{logger: logger, parkedMode: true}
+	if _, err := srv.applyAdoptFrame(adoptFrameWith(map[string]string{"PATH": bin + ":/usr/bin:/bin"})); err != nil {
+		t.Fatal(err)
+	}
+	mainProgram = &mainProgramState{state: mainProgramNone}
+	startUserCommand(logger, []string{"aerolvm-adopt-tool"})
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		if b, err := os.ReadFile(out); err == nil && string(b) == "ok" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("a command on the sandbox's PATH did not run: %v", mainProgram.snapshot())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// A PATH without sh: toolboxd's own PATH has it, the sandbox's does not.
+	if _, err := srv.applyAdoptFrame(adoptFrameWith(map[string]string{"PATH": bin})); err != nil {
+		t.Fatal(err)
+	}
+	mainProgram = &mainProgramState{state: mainProgramNone}
+	startUserCommand(logger, []string{"sh", "-c", "exit 0"})
+	if snap := mainProgram.snapshot(); snap["state"] != "exited" || snap["exit_code"] != 127 {
+		t.Fatalf("a name off the sandbox's PATH started: %v", snap)
+	}
+}
