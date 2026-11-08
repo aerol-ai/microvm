@@ -291,4 +291,9 @@ func TestLogPATBootSettings(t *testing.T) {
 	if got := logs(cfg); !strings.Contains(got, "operator volume scope unresolved") {
 		t.Errorf("an unresolvable scope warns:\n%s", got)
 	}
+	// A node joined without the PAT says so, once.
+	patFree := config.Config{PATToken: "own-token", PATTokenSHA256: []string{config.PATSHA256("pat")}}
+	if got := logs(patFree); strings.Count(got, "SB_PAT_TOKEN_SHA256") != 1 || !strings.Contains(got, "hashes=1") {
+		t.Errorf("a node without the PAT logs:\n%s", got)
+	}
 }
