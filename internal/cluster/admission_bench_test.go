@@ -82,6 +82,13 @@ func newReserveBenchCluster(tb testing.TB, delay time.Duration) *reserveBenchClu
 // workerCPU one-CPU slots.
 func newReserveTestCluster(tb testing.TB, delay time.Duration, workerCPU int) *reserveBenchCluster {
 	tb.Helper()
+	return newReserveTestClusterTuned(tb, delay, workerCPU, nil)
+}
+
+// newReserveTestClusterTuned is newReserveTestCluster with tune applied to
+// every server's Raft config after the fast defaults below.
+func newReserveTestClusterTuned(tb testing.TB, delay time.Duration, workerCPU int, tune func(*raft.Config)) *reserveBenchCluster {
+	tb.Helper()
 	ids := []string{"bench-s1", "bench-s2", "bench-s3"}
 	transports := make([]*raft.InmemTransport, len(ids))
 	servers := make([]raft.Server, len(ids))
@@ -106,6 +113,9 @@ func newReserveTestCluster(tb testing.TB, delay time.Duration, workerCPU int) *r
 		conf.ElectionTimeout = 300 * time.Millisecond
 		conf.LeaderLeaseTimeout = 150 * time.Millisecond
 		conf.LogOutput = io.Discard
+		if tune != nil {
+			tune(conf)
+		}
 		stores[i] = &slowLogStore{InmemStore: raft.NewInmemStore(), delay: delay}
 		stable, snaps := raft.NewInmemStore(), raft.NewInmemSnapshotStore()
 		if err := raft.BootstrapCluster(conf, stores[i], stable, snaps, transports[i], raft.Configuration{Servers: servers}); err != nil {

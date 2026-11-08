@@ -552,12 +552,13 @@ func TestAdmissionLedgerConcurrentReservesThroughRaft(t *testing.T) {
 func TestAdmissionLedgerLeadershipLostThenRegained(t *testing.T) {
 	t.Run("entry commits in the next term", func(t *testing.T) {
 		bc, idx, oldTerm := cutOffLeaderWithEntryInFlight(t, false)
-		// Heal only the links to the old leader. Its log is the longest, and
-		// the followers cannot reach each other, so only it can win the next
-		// term; its first entry there commits sb-cut.
+		// Heal only the links to the old leader; the followers still cannot
+		// reach each other. Then every server that can win the next term
+		// holds sb-cut: a follower needs the old leader's vote, which it gets
+		// only once its log has caught up with sb-cut, and a log entry that a
+		// leader of the new term has replicated to a majority commits.
 		bc.link(idx, true)
-		waitForInmemLeaderIs(t, bc, idx, oldTerm)
-		err := bc.leader.ReserveOnTarget(context.Background(), "sb-after", bc.target, ledgerSpec, PlacementSecrets{}, time.Minute)
+		err := bc.reserveOnRegainedLeader(t, idx, oldTerm, "sb-after")
 		if !errors.Is(err, ErrCapacityExceeded) {
 			t.Fatalf("reserve in the new term = %v, want ErrCapacityExceeded: sb-cut committed and holds the only slot", err)
 		}
@@ -568,14 +569,15 @@ func TestAdmissionLedgerLeadershipLostThenRegained(t *testing.T) {
 	})
 	t.Run("entry is overwritten", func(t *testing.T) {
 		bc, idx, oldTerm := cutOffLeaderWithEntryInFlight(t, true)
-		// The two followers elect one of them; its term overwrites sb-cut.
+		// The two followers elect one of them. Its barrier commits its own
+		// entries on both followers, so sb-cut, which only the old leader
+		// has, can never commit: no server will vote for a log without them.
 		other := waitForInmemLeader(t, bc.nodes, idx)
-		bc.link(idx, true)
-		if err := bc.nodes[other].LeadershipTransferToServer(raft.ServerID(bc.ids[idx]), raft.ServerAddress(bc.ids[idx])).Error(); err != nil {
-			t.Fatalf("transfer back: %v", err)
+		if err := bc.nodes[other].Barrier(30 * time.Second).Error(); err != nil {
+			t.Fatalf("barrier on the followers' leader: %v", err)
 		}
-		waitForInmemLeaderIs(t, bc, idx, oldTerm)
-		if err := bc.leader.ReserveOnTarget(context.Background(), "sb-after", bc.target, ledgerSpec, PlacementSecrets{}, time.Minute); err != nil {
+		bc.link(idx, true)
+		if err := bc.reserveOnRegainedLeader(t, idx, oldTerm, "sb-after"); err != nil {
 			t.Fatalf("reserve in the new term = %v, want admitted: sb-cut never committed", err)
 		}
 		if _, ok := bc.leader.fsm.get("sb-cut"); ok {
@@ -587,6 +589,19 @@ func TestAdmissionLedgerLeadershipLostThenRegained(t *testing.T) {
 
 var ledgerSpec = &models.CreateSandboxRequest{Image: "alpine", CPU: 1, MemoryMB: 64}
 
+// leadershipTestTimers are raft's own defaults. The leadership tests cut a
+// leader off and wait for elections, so they do not use the benchmark's
+// faster timers: on a loaded machine under -race those make a fresh leader
+// lose its lease again before the test can use it.
+func leadershipTestTimers(c *raft.Config) {
+	c.HeartbeatTimeout = time.Second
+	c.ElectionTimeout = time.Second
+	c.LeaderLeaseTimeout = 500 * time.Millisecond
+}
+
+// leadershipTestWait bounds every wait for an election in these tests.
+const leadershipTestWait = 60 * time.Second
+
 // cutOffLeaderWithEntryInFlight starts a cluster whose worker has one slot,
 // cuts the leader off from both followers (and the followers from each other
 // unless followersLinked), and reserves the slot on the cut-off leader, which
@@ -594,7 +609,7 @@ var ledgerSpec = &models.CreateSandboxRequest{Image: "alpine", CPU: 1, MemoryMB:
 // leader's index and its term.
 func cutOffLeaderWithEntryInFlight(t *testing.T, followersLinked bool) (*reserveBenchCluster, int, uint64) {
 	t.Helper()
-	bc := newReserveTestCluster(t, 0, 1)
+	bc := newReserveTestClusterTuned(t, 0, 1, leadershipTestTimers)
 	ctx := context.Background()
 	// The first admission of the term (and its barrier) happens while the
 	// cluster is whole.
@@ -670,24 +685,51 @@ func (bc *reserveBenchCluster) requireFreshLedger(t *testing.T, oldTerm uint64) 
 	}
 }
 
-// waitForInmemLeaderIs waits until server idx leads in a term after oldTerm.
-func waitForInmemLeaderIs(t *testing.T, bc *reserveBenchCluster, idx int, oldTerm uint64) {
+// reserveOnRegainedLeader makes server idx lead again in a term after
+// oldTerm and reserves id there. Elections after a partition are not
+// deterministic, so it drives them: while another server leads it asks that
+// one to hand leadership to idx, and a reserve that meets a leadership change
+// is retried, as a router would. The retry keeps one incarnation, so it is
+// the same create. Bounded by leadershipTestWait.
+func (bc *reserveBenchCluster) reserveOnRegainedLeader(t *testing.T, idx int, oldTerm uint64, id string) error {
 	t.Helper()
 	r := bc.nodes[idx]
-	deadline := time.Now().Add(15 * time.Second)
-	for time.Now().Before(deadline) {
+	deadline := time.Now().Add(leadershipTestWait)
+	for {
 		if r.State() == raft.Leader && r.CurrentTerm() > oldTerm {
-			return
+			err := bc.leader.ReserveOnTarget(context.Background(), id, bc.target, ledgerSpec, PlacementSecrets{IncarnationID: "inc-" + id}, time.Minute)
+			if !errors.Is(err, ErrNotLeader) && !errors.Is(err, raft.ErrLeadershipTransferInProgress) {
+				if errors.Is(err, ErrCapacityExceeded) {
+					// An earlier attempt committed before its answer was
+					// lost, and admission counted the resend on top of it
+					// (PR #1021 fixes that). The slot was free for this
+					// create, which is what the caller asked.
+					if p, ok := bc.leader.fsm.get(id); ok && p.IsReserved() && p.IncarnationID == "inc-"+id {
+						return nil
+					}
+				}
+				return err
+			}
 		}
-		time.Sleep(10 * time.Millisecond)
+		if time.Now().After(deadline) {
+			t.Fatalf("server %s did not lead again after term %d within %s: state %v, term %d",
+				bc.ids[idx], oldTerm, leadershipTestWait, r.State(), r.CurrentTerm())
+		}
+		for i, n := range bc.nodes {
+			if i != idx && n.State() == raft.Leader {
+				// Fails when the target is not caught up yet or leadership
+				// moved meanwhile; the next round tries again.
+				_ = n.LeadershipTransferToServer(raft.ServerID(bc.ids[idx]), raft.ServerAddress(bc.ids[idx])).Error()
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
-	t.Fatalf("server %s did not lead again after term %d: state %v, term %d", bc.ids[idx], oldTerm, r.State(), r.CurrentTerm())
 }
 
 // waitForInmemLeader returns the index of a leader other than not.
 func waitForInmemLeader(t *testing.T, nodes []*raft.Raft, not int) int {
 	t.Helper()
-	deadline := time.Now().Add(15 * time.Second)
+	deadline := time.Now().Add(leadershipTestWait)
 	for time.Now().Before(deadline) {
 		for i, r := range nodes {
 			if i != not && r.State() == raft.Leader {
