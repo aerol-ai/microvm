@@ -72,6 +72,7 @@ func Wrap(svc *service.Service, opts Options, local http.Handler) http.Handler {
 		_, single := c.(*cluster.Noop)
 		hop := cluster.RouteHopEdge
 		hint := ""
+		var forwardEpoch uint64
 		if r.Header.Get(cluster.HeaderForwarded) == "1" {
 			hop = cluster.RouteHopOwner
 			// Take the owner-cache token and drop the header before any
@@ -79,6 +80,8 @@ func Wrap(svc *service.Service, opts Options, local http.Handler) http.Handler {
 			// the sandbox) can see the token and forge a "not here".
 			hint = r.Header.Get(cluster.HeaderRouteHint)
 			r.Header.Del(cluster.HeaderRouteHint)
+			forwardEpoch = cluster.ForwardedOwnerEpoch(r.Header)
+			r.Header.Del(cluster.HeaderOwnerEpoch)
 		} else if !single {
 			cluster.RecordRouteRequest()
 		}
@@ -160,6 +163,15 @@ func Wrap(svc *service.Service, opts Options, local http.Handler) http.Handler {
 			writeNotOwner(w, r, hint, write)
 			return
 		}
+		if hint != "" && forwardEpoch != 0 && owner.Epoch > forwardEpoch {
+			// The edge's entry predates an owner change: the sandbox moved
+			// away and came back to this node since the edge read it. This
+			// node does own it, but an older epoch is turned down (I2): the
+			// edge drops the entry and routes once more from a fresh lookup,
+			// so its next entry carries the current epoch.
+			writeNotOwner(w, r, hint, write)
+			return
+		}
 		switch {
 		case errors.Is(err, cluster.ErrUnknownSandbox):
 			// Not a cluster-known sandbox: let the local handler answer
@@ -202,6 +214,7 @@ func Wrap(svc *service.Service, opts Options, local http.Handler) http.Handler {
 			// reused, and the owner re-checks every entry anyway.
 			cache.Put(id, owner, ownerRef, ownerRefKnown)
 		}
+		r = r.WithContext(cluster.ContextWithOwnerEpoch(r.Context(), owner.Epoch))
 		c.ForwardHTTP(cluster.Endpoint{NodeID: owner.NodeID, InternalURL: owner.InternalURL, APIURL: owner.APIURL}, w, r)
 	})
 }

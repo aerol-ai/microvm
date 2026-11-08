@@ -29,12 +29,14 @@ type fleet struct {
 	nodes   map[string]*fleetNode
 	dead    map[string]bool // nodes gossip reports dead
 	lookups atomic.Int64    // control-plane reads made by every node's router
+	index   uint64          // the last "log index": every owner change takes the next one
 }
 
 type fleetPlacement struct {
 	node     string
 	ownerRef string
 	orphaned bool
+	epoch    uint64 // OwnerEpoch: the index of the last owner change
 }
 
 type fleetNode struct {
@@ -55,6 +57,8 @@ type fleetNode struct {
 	// row it holds (the sandbox's own answer).
 	localAnswer func(w http.ResponseWriter, r *http.Request)
 	lastState   *auditlog.CallState // audit state of the last forward this node received
+	sentEpochs  []string            // HeaderOwnerEpoch of each forward this node sent
+	localEpoch  string              // HeaderOwnerEpoch the local handler last saw (must stay "")
 }
 
 // newFleet builds nodes with the given ids; withCache turns the owner cache
@@ -85,7 +89,8 @@ func newFleet(t testing.TB, withCache bool, ids ...string) *fleet {
 func (f *fleet) placeOn(id, node, ownerRef string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.place[id] = fleetPlacement{node: node, ownerRef: ownerRef}
+	f.index++
+	f.place[id] = fleetPlacement{node: node, ownerRef: ownerRef, epoch: f.index}
 	f.holdLocked(node, id)
 }
 
@@ -102,7 +107,8 @@ func (f *fleet) move(id, node string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	p := f.place[id]
-	p.node = node
+	f.index++
+	p.node, p.epoch = node, f.index
 	f.place[id] = p
 	f.holdLocked(node, id)
 }
@@ -117,7 +123,8 @@ func (f *fleet) orphan(id string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	p := f.place[id]
-	p.node, p.orphaned = "", true
+	f.index++
+	p.node, p.orphaned, p.epoch = "", true, f.index
 	f.place[id] = p
 }
 
@@ -156,7 +163,7 @@ func (n *fleetNode) OwnerOf(id string) (cluster.OwnerInfo, error) {
 	case p.orphaned:
 		return cluster.OwnerInfo{}, cluster.ErrOrphaned
 	}
-	return cluster.OwnerInfo{NodeID: p.node, APIURL: "http://" + p.node, InternalURL: "https://" + p.node + ":7002", IsSelf: p.node == n.id}, nil
+	return cluster.OwnerInfo{NodeID: p.node, APIURL: "http://" + p.node, InternalURL: "https://" + p.node + ":7002", IsSelf: p.node == n.id, Epoch: p.epoch}, nil
 }
 
 func (n *fleetNode) PlacementOf(id string) (cluster.Placement, bool) {
@@ -187,6 +194,9 @@ func (n *fleetNode) ForwardHTTP(target cluster.Endpoint, w http.ResponseWriter, 
 	if out.Header.Get(cluster.HeaderRouteHint) != "" {
 		n.hinted.Add(1)
 	}
+	n.f.mu.Lock()
+	n.sentEpochs = append(n.sentEpochs, out.Header.Get(cluster.HeaderOwnerEpoch))
+	n.f.mu.Unlock()
 	// What arrives at the peer: a fresh request context carrying only the
 	// re-authenticated caller and the peer's own audit state.
 	ctx := context.Background()
@@ -213,6 +223,9 @@ func (n *fleetNode) serveLocal(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	n.served.Add(1)
+	n.f.mu.Lock()
+	n.localEpoch = r.Header.Get(cluster.HeaderOwnerEpoch)
+	n.f.mu.Unlock()
 	if n.localAnswer != nil {
 		n.localAnswer(w, r)
 		return
