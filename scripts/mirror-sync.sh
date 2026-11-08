@@ -23,8 +23,9 @@
 # re-run (or a release workflow re-running) sends only what is missing; on
 # 2026-11-08 a plain sync re-sent all of v0.6.11 because every freshly
 # downloaded file looked newer. Deps paths are versioned and never change in
-# place. A release re-cut under the same tag, with a file that changed but
-# kept its size, needs --force, which uploads every file.
+# place. A release re-cut under the same tag can change a file and keep its
+# size, so when the mirror's checksums.txt for the tag differs from the
+# release's, every file is sent. --force sends every file in any case.
 #
 # Nothing is uploaded unless every file checked out. --dry-run prints the
 # plan and downloads or uploads nothing. Uploading needs AWS credentials
