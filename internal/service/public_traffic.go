@@ -54,7 +54,7 @@ func (s *Service) syncSandboxPublicRoute(ctx context.Context, sandbox *models.Sa
 		return s.deleteSandboxPublicRoutes(ctx, sandbox)
 	}
 	if !hasPortCustomDomain(sandbox) {
-		return s.publicRoutes().UpsertSandboxRoute(ctx, sandbox.ID, sandbox.ContainerIP, s.cfg.ToolboxPort, sandboxCustomHostnames(sandbox))
+		return s.writeSandboxPublicRoute(ctx, sandbox)
 	}
 	unlock := s.customDomainRouteLocks.lock(sandbox.ID)
 	defer unlock()
@@ -75,7 +75,23 @@ func (s *Service) syncSandboxPublicRouteHeld(ctx context.Context, sandbox *model
 	if err != nil {
 		return err
 	}
-	return s.publicRoutes().UpsertSandboxRoute(ctx, current.ID, current.ContainerIP, s.cfg.ToolboxPort, sandboxCustomHostnames(current))
+	return s.writeSandboxPublicRoute(ctx, current)
+}
+
+// writeSandboxPublicRoute writes the root route and the custom-domain routes
+// in the shape the ownership fence asks for: while this node cannot confirm
+// it still owns the sandbox (it is paused), every one of those URLs answers
+// 503 instead of proxying to a process that will not answer. The fence is
+// read under rootRouteLocks, which the fence's own swap also takes (via
+// syncSandboxPublicRoute), so a reconcile or start that read the fence just
+// before it went up cannot land its live route after the 503.
+func (s *Service) writeSandboxPublicRoute(ctx context.Context, sandbox *models.Sandbox) error {
+	unlock := s.rootRouteLocks.lock(sandbox.ID)
+	defer unlock()
+	if s.OwnershipFenced(sandbox.ID) {
+		return s.publicRoutes().UpsertFencedSandboxRoute(ctx, sandbox.ID, sandboxCustomHostnamesList(sandbox))
+	}
+	return s.publicRoutes().UpsertSandboxRoute(ctx, sandbox.ID, sandbox.ContainerIP, s.cfg.ToolboxPort, sandboxCustomHostnames(sandbox))
 }
 
 // enableSandboxPublicTraffic flips a private sandbox to public in place:
