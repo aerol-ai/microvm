@@ -32,6 +32,10 @@ WITH_ISOLATE="false"
 # --ingress-proxy-routing / --no-ingress-proxy-routing decide, and without
 # either resolve_ingress_proxy_routing turns it on for a --domain install.
 INGRESS_PROXY_ROUTING=""
+# true once resolve_ingress_proxy_routing chose the value itself, so node.json
+# keeps "auto" rather than freezing what this run derived: a node that gets a
+# --domain later would otherwise keep routing off.
+INGRESS_PROXY_ROUTING_AUTO="false"
 ROUTE_DNS_ADDR="127.0.0.1:53053"
 # The aerolvm-rt link's own address. systemd-resolved sends *.rt.internal
 # here, not to ROUTE_DNS_ADDR (write_route_dns_resolver says why), and
@@ -854,6 +858,7 @@ resolve_ingress_proxy_routing() {
 	if [[ -n "$INGRESS_PROXY_ROUTING" ]]; then
 		return
 	fi
+	INGRESS_PROXY_ROUTING_AUTO="true"
 	if [[ -n "$DOMAIN" && "$LOCAL_MODE" != "true" ]]; then
 		INGRESS_PROXY_ROUTING="true"
 	else
@@ -871,6 +876,10 @@ resolve_ingress_proxy_routing() {
 #     --build-from-source, --no-start, --cli-only): a re-run with no flags
 #     installs the latest release, which is how a node is upgraded, and
 #     --no-start is only for a joiner's first install.
+# Types: string; bool, a switch saved as true or false; auto, a switch whose
+# default depends on other settings, saved as true or false only when a flag
+# gave it and as "auto" otherwise, so a re-run derives it again. A --no-<flag>
+# given now wins over a saved bool or auto setting, like <flag> itself.
 NODE_SETTINGS=(
 	DOMAIN:--domain:string
 	PUBLIC_HOST:--public-host:string
@@ -884,7 +893,7 @@ NODE_SETTINGS=(
 	ACME_CA_ROOT:--acme-ca-root:string
 	TLS_ISSUER:--tls-issuer:string
 	LOCAL_MODE:--local:bool
-	INGRESS_PROXY_ROUTING:--ingress-proxy-routing:bool
+	INGRESS_PROXY_ROUTING:--ingress-proxy-routing:auto
 	WITH_GVISOR:--with-gvisor:bool
 	RUNSC_PATH:--runsc-path:string
 	WITH_CONTAINERD_ENGINE:--with-containerd-engine:bool
@@ -1072,8 +1081,14 @@ load_saved_node_settings() {
 		# is always saved with its value.
 		[[ -n "$value" ]] || continue
 		flag_given "$flag" && continue
-		if [[ "$kind" == bool && "$value" != true && "$value" != false ]]; then
-			echo "$NODE_SETTINGS_FILE: $key must be true or false, got '$value'" >&2
+		[[ "$kind" != string ]] && flag_given "--no-${flag#--}" && continue
+		[[ "$kind" == auto && "$value" == auto ]] && continue
+		if [[ "$kind" != string && "$value" != true && "$value" != false ]]; then
+			if [[ "$kind" == auto ]]; then
+				echo "$NODE_SETTINGS_FILE: $key must be true, false or auto, got '$value'" >&2
+			else
+				echo "$NODE_SETTINGS_FILE: $key must be true or false, got '$value'" >&2
+			fi
 			exit 1
 		fi
 		printf -v "$var" '%s' "$value"
@@ -1121,6 +1136,9 @@ node_setting_answer() {
 	CADDY_STORAGE_S3_ENDPOINT)
 		[[ "$CADDY_STORAGE_S3_ENDPOINT" == "s3.${CADDY_STORAGE_S3_REGION}.amazonaws.com" ]] && return 0
 		;;
+	INGRESS_PROXY_ROUTING)
+		[[ "$INGRESS_PROXY_ROUTING_AUTO" == "true" ]] && return 0
+		;;
 	esac
 	printf '%s' "${!1}"
 }
@@ -1142,6 +1160,8 @@ write_node_settings() {
 			value="$(node_setting_answer "$var")"
 			if [[ "$kind" == bool ]]; then
 				[[ "$value" == "true" ]] || value="false"
+			elif [[ "$kind" == auto ]]; then
+				[[ "$value" == "true" || "$value" == "false" ]] || value='"auto"'
 			else
 				value="$(json_string "$value" "$flag")" || {
 					rm -f "$tmp"

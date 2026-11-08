@@ -90,7 +90,9 @@ func newInstallRig(t *testing.T) *installRig {
 	// renders the files this run would write. Where the key-store settings
 	// came from differs between a first run and a re-run by design, so those
 	// two only go to the shell; the rendered env file compares the result.
-	shellOnly := []string{"SECRET_PROVIDER_ENV", "SAVED_SECRET_PROVIDER_LINES"}
+	// INGRESS_PROXY_ROUTING_AUTO differs the same way: a value read back from
+	// an older node's env file counts as given.
+	shellOnly := []string{"SECRET_PROVIDER_ENV", "SAVED_SECRET_PROVIDER_LINES", "INGRESS_PROXY_ROUTING_AUTO"}
 	dump := "aerol_test_dump() {\n\tlocal v\n\tfor v in " + strings.Join(vars, " ") + "; do printf '%s\\0%s\\0' \"$v\" \"${!v}\"; done >\"$AEROL_DUMP\"\n" +
 		"\tdeclare -p " + strings.Join(append(slices.Clone(vars), shellOnly...), " ") + " >\"$AEROL_DUMP.sh\"\n}\n"
 	stubs := "uname() { case \"${1:-}\" in -m) echo x86_64 ;; *) echo Linux ;; esac; }\n" +
@@ -335,7 +337,11 @@ func checkNodeJSON(t *testing.T, rig *installRig, entries []nodeSettingsEntry, s
 			t.Errorf("node.json has no %q (for %s)", key, e.flag)
 			continue
 		}
-		if _, isBool := v.(bool); isBool != (e.kind == "bool") {
+		_, isBool := v.(bool)
+		if e.kind == "auto" && (isBool || v == "auto") {
+			continue
+		}
+		if isBool != (e.kind == "bool") {
 			t.Errorf("node.json %q = %#v, want a %s", key, v, e.kind)
 		}
 	}
@@ -372,6 +378,61 @@ func TestInstallNodeJSONKeepsEverySetting(t *testing.T) {
 	}
 }
 
+// --ingress-proxy-routing is on by default only where it applies (a
+// --domain install), so node.json keeps the operator's answer, not what one
+// run derived: no flag saves "auto" and the next run derives it again, so a
+// node that gets a --domain later turns routing on. An explicit
+// --no-ingress-proxy-routing is saved and wins over a saved true, and the
+// flag wins over a saved false.
+func TestInstallRoutingSavesOnlyAGivenAnswer(t *testing.T) {
+	domain := []string{"--domain", "sb.example.com", "--dns-provider", "cloudflare", "--dns-api-token", "t"}
+	saved := func(t *testing.T, rig *installRig) any {
+		t.Helper()
+		raw, err := os.ReadFile(rig.path("sandboxd/node.json"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var doc map[string]any
+		if err := json.Unmarshal(raw, &doc); err != nil {
+			t.Fatalf("node.json: %v\n%s", err, raw)
+		}
+		return doc["ingress_proxy_routing"]
+	}
+	step := func(t *testing.T, rig *installRig, want string, wantSaved any, args ...string) {
+		t.Helper()
+		got, dumpSh, _ := rig.mustRun(args...)
+		if got["INGRESS_PROXY_ROUTING"] != want {
+			t.Fatalf("install.sh %q: INGRESS_PROXY_ROUTING = %q, want %q", args, got["INGRESS_PROXY_ROUTING"], want)
+		}
+		// The files an install writes, so the next run reads the DNS token
+		// back from them, then node.json.
+		rig.render(got, dumpSh)
+		rig.shell(dumpSh, "write_node_settings\n")
+		if v := saved(t, rig); v != wantSaved {
+			t.Fatalf("install.sh %q: node.json ingress_proxy_routing = %#v, want %#v", args, v, wantSaved)
+		}
+	}
+
+	t.Run("derived on a --domain install, kept as auto", func(t *testing.T) {
+		rig := newInstallRig(t)
+		step(t, rig, "true", "auto", domain...)
+		step(t, rig, "true", "auto")
+	})
+	t.Run("an explicit off is kept and the flag turns it back on", func(t *testing.T) {
+		rig := newInstallRig(t)
+		step(t, rig, "true", "auto", domain...)
+		step(t, rig, "false", false, "--no-ingress-proxy-routing")
+		step(t, rig, "false", false)
+		step(t, rig, "true", true, "--ingress-proxy-routing")
+		step(t, rig, "false", false, "--no-ingress-proxy-routing")
+	})
+	t.Run("an IP-mode node that gets a domain later turns routing on", func(t *testing.T) {
+		rig := newInstallRig(t)
+		step(t, rig, "false", "auto")
+		step(t, rig, "true", "auto", domain...)
+	})
+}
+
 // A saved setting is checked exactly like the flag, and a node.json that
 // install.sh cannot read fails the run instead of being half applied.
 func TestInstallRefusesABadSavedSetting(t *testing.T) {
@@ -388,6 +449,8 @@ func TestInstallRefusesABadSavedSetting(t *testing.T) {
 			"", "--dns-provider requires --dns-api-token"},
 		{"a broken line", []string{`"format": 1,`, `"domain" "x"`}, "", `line 3 is not one "key": value setting`},
 		{"a switch that is not a boolean", []string{`"format": 1,`, `"with_gvisor": "yes"`}, "", "with_gvisor must be true or false"},
+		{"an auto switch that is neither", []string{`"format": 1,`, `"ingress_proxy_routing": "maybe"`}, "",
+			"ingress_proxy_routing must be true, false or auto"},
 		{"a newer format", []string{`"format": 2`}, "", "has format '2'"},
 		{"an escape install.sh never writes", []string{`"format": 1,`, `"node_name": "a\nb"`}, "", "unsupported escape"},
 	} {
@@ -449,11 +512,16 @@ func TestInstallSortsEveryFlag(t *testing.T) {
 	saved := map[string]bool{}
 	for _, e := range nodeSettingsEntries(t, src) {
 		saved[e.flag] = true
+		// --no-<flag> turns a saved switch off; load_saved_node_settings
+		// treats it as that setting given.
+		if e.kind != "string" {
+			saved["--no-"+strings.TrimPrefix(e.flag, "--")] = true
+		}
 	}
 	secrets := []string{"--pat-token", "--dns-api-token", "--caddy-storage-s3-access-key", "--caddy-storage-s3-secret-key",
 		"--caddy-storage-s3-encryption-key", "--secret-provider-env"}
 	perRun := []string{"--version", "--sandboxd-url", "--toolboxd-url", "--checksums-url", "--caddy-binary-url",
-		"--build-from-source", "--no-start", "--cli-only", "--cli-url", "--help"}
+		"--build-from-source", "--no-start", "--cli-only", "--cli-url", "--download-mirror", "--help"}
 	start := strings.Index(src, "\nwhile [[ $# -gt 0 ]]; do\n")
 	end := strings.Index(src[start:], "\ndone\n")
 	if start < 0 || end < 0 {
