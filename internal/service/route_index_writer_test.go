@@ -300,3 +300,46 @@ func TestIndexRouteWriterDirectDeleteKeepsTheWakeRoute(t *testing.T) {
 		t.Fatal("DeletePortRoute left the direct route behind")
 	}
 }
+
+// Under proxy routing the fence's 503 for the root route and custom domains
+// is each host in flux, under the ids the live writes use: the next
+// UpsertSandboxRoute (or custom-domain write) puts the live target back.
+func TestIndexRouteWriterFencedSandboxRoute(t *testing.T) {
+	table := routedns.NewOwnerTable()
+	w := newIndexRouteWriter(table, "d.test")
+	ctx := context.Background()
+	customs := []caddy.CustomHostnameRoute{{Hostname: "app.example.com"}, {Hostname: "api.example.com", TargetPort: 8080}}
+
+	_ = w.UpsertSandboxRoute(ctx, "sb", "10.0.0.9", 2280, customs)
+	if err := w.UpsertFencedSandboxRoute(ctx, "sb", []string{"app.example.com", "api.example.com"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, host := range []string{"sb.d.test", "app.example.com", "api.example.com"} {
+		if got, _ := table.Lookup(host); got.State != routedns.TargetInFlux {
+			t.Fatalf("fenced %s = %+v, want in flux (503)", host, got)
+		}
+	}
+	_ = w.UpsertSandboxRoute(ctx, "sb", "10.0.0.9", 2280, customs)
+	for host, port := range map[string]int{"sb.d.test": 2280, "app.example.com": 2280, "api.example.com": 8080} {
+		if got, _ := table.Lookup(host); got.State == routedns.TargetInFlux || got.Port != port {
+			t.Fatalf("after the swap back %s = %+v, want the live target on %d", host, got, port)
+		}
+	}
+
+	// A WASM custom domain: its own write and its own fence.
+	_ = w.UpsertCustomDomainHTTPRouteWithDial(ctx, "sb", "wasm.example.com", "10.0.0.9:8081")
+	if err := w.UpsertFencedCustomDomainRoute(ctx, "sb", "wasm.example.com"); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := table.Lookup("wasm.example.com"); got.State != routedns.TargetInFlux {
+		t.Fatalf("fenced WASM custom domain = %+v, want in flux", got)
+	}
+	// A destroy while fenced removes every fenced host.
+	_ = w.UpsertFencedSandboxRoute(ctx, "sb", []string{"app.example.com", "api.example.com"})
+	_ = w.DeleteSandboxRoute(ctx, "sb")
+	for _, host := range []string{"sb.d.test", "app.example.com", "api.example.com", "wasm.example.com"} {
+		if _, ok := table.Lookup(host); ok {
+			t.Fatalf("DeleteSandboxRoute left the fenced %s behind", host)
+		}
+	}
+}

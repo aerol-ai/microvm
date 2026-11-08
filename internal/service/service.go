@@ -704,7 +704,14 @@ type Service struct {
 	// on a copy from before a change to "token" (route_gate.go).
 	httpRouteLocks         keyedLocks[portLockKey]
 	customDomainRouteLocks keyedLocks[string]
-	allowlistLocks         keyedLocks[string]
+	// rootRouteLocks: every writer of a sandbox's root (toolbox) route and
+	// custom-domain routes takes it and reads the ownership fence under it,
+	// as applyHTTPPortRoute does with httpRouteLocks, so the last write
+	// always matches the fence. Innermost: taken after customDomainRouteLocks.
+	rootRouteLocks keyedLocks[string]
+	// l4RouteLocks is the same rule for a TCP or TLS exposure's route.
+	l4RouteLocks   keyedLocks[portLockKey]
+	allowlistLocks keyedLocks[string]
 	// testAfterRouteGateRead runs inside those locks, right after the read.
 	// Nil in production.
 	testAfterRouteGateRead func(stage string)
@@ -5886,6 +5893,13 @@ func (s *Service) installTCPPortRoute(ctx context.Context, sandbox *models.Sandb
 	if err := s.EnsureLayer4Ready(ctx); err != nil {
 		return err
 	}
+	// The fence is read under the port's l4RouteLocks, as applyHTTPPortRoute
+	// reads it under httpRouteLocks: the last write always matches it.
+	unlock := s.l4RouteLocks.lock(portLockKey{id: sandbox.ID, port: port})
+	defer unlock()
+	if s.OwnershipFenced(sandbox.ID) {
+		return s.publicRoutes().UpsertFencedTCPRoute(ctx, sandbox.ID, port, hostPort)
+	}
 	switch s.chooseRouteShape(sandbox, RouteKindL4) {
 	case RouteShapeDirect:
 		return s.publicRoutes().UpsertTCPRoute(ctx, sandbox.ID, sandbox.ContainerIP, port, hostPort)
@@ -5916,6 +5930,13 @@ func (s *Service) installTLSPortRoute(ctx context.Context, sandbox *models.Sandb
 		return err
 	}
 	sniHost := s.caddy.SNIHost(sandbox.ID, port)
+	unlock := s.l4RouteLocks.lock(portLockKey{id: sandbox.ID, port: port})
+	defer unlock()
+	if s.OwnershipFenced(sandbox.ID) {
+		// A wake listener, if any, stays: the swap back re-points the
+		// route at it (ensureTLSWakeListener is idempotent).
+		return s.caddy.UpsertFencedTLSSNIRoute(ctx, sandbox.ID, sniHost, port)
+	}
 	switch s.chooseRouteShape(sandbox, RouteKindL4) {
 	case RouteShapeDirect:
 		if err := s.caddy.UpsertTLSSNIRoute(ctx, sandbox.ID, sniHost, sandbox.ContainerIP, port); err != nil {

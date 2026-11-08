@@ -59,6 +59,17 @@ func (s *Service) wasmCustomDomainDial(ctx context.Context, sandbox *models.Sand
 }
 
 func (s *Service) installWasmCustomDomainHTTPRoute(ctx context.Context, sandbox *models.Sandbox, hostname string, targetPort int) error {
+	if sandbox == nil {
+		return fmt.Errorf("sandbox is nil")
+	}
+	// Same fence rule as writeSandboxPublicRoute: this rewrite runs after an
+	// expose or a domain change, and must not put a paused sandbox's live
+	// route back over its 503.
+	unlock := s.rootRouteLocks.lock(sandbox.ID)
+	defer unlock()
+	if s.OwnershipFenced(sandbox.ID) {
+		return s.publicRoutes().UpsertFencedCustomDomainRoute(ctx, sandbox.ID, hostname)
+	}
 	dial, err := s.wasmCustomDomainDial(ctx, sandbox, targetPort)
 	if err != nil {
 		return err

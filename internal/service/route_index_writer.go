@@ -28,6 +28,7 @@ import (
 //	UpsertPortRoute*(id, ip, p, opts)    → {id}-{p}.{domain} = ip:p (router if masked)
 //	UpsertWakeHTTPPortRoute(id, _, p)    → {id}-{p}.{domain} state=wake
 //	UpsertInFlux*(id[, p])               → host state=in-flux
+//	UpsertFenced*(id, ...)               → the live route's host(s) state=in-flux, same ids
 //	Delete*/DeleteRouteByID              → remove (routeID→host map mirrors Caddy GC)
 //
 // SNI passthrough and raw-TCP intents are not owner http routes. The ingress
@@ -194,6 +195,24 @@ func (w *indexRouteWriter) UpsertFencedPortRoute(_ context.Context, id string, p
 	return nil
 }
 
+// UpsertFencedSandboxRoute puts the root host and each custom hostname in
+// flux (503) under the ids UpsertSandboxRoute records them by, so the live
+// write that lifts the fence replaces each entry in place.
+func (w *indexRouteWriter) UpsertFencedSandboxRoute(_ context.Context, id string, customHostnames []string) error {
+	w.set(caddy.SandboxRouteID(id), id, w.rootHost(id), routedns.OwnerTarget{State: routedns.TargetInFlux, SandboxID: id})
+	for _, h := range customHostnames {
+		w.set("", id, h, routedns.OwnerTarget{State: routedns.TargetInFlux, SandboxID: id})
+	}
+	return nil
+}
+
+// UpsertFencedCustomDomainRoute is the in-flux entry for one custom hostname,
+// under the id UpsertCustomDomainHTTPRouteWithDial records it by.
+func (w *indexRouteWriter) UpsertFencedCustomDomainRoute(_ context.Context, sandboxID, hostname string) error {
+	w.set(caddy.IngressCustomDomainHTTPRouteID(sandboxID, hostname), sandboxID, hostname, routedns.OwnerTarget{State: routedns.TargetInFlux, SandboxID: sandboxID})
+	return nil
+}
+
 // DeletePortRoute removes the direct route's entry and leaves a wake entry,
 // the mirror of DeleteWakeHTTPPortRoute: in Caddy they are two routes, and
 // the wake shape (a token-gated port, a stopped serverless sandbox) writes
@@ -302,6 +321,17 @@ func (w *indexRouteWriter) UpsertTCPRoute(_ context.Context, _ string, container
 		return w.tcp.Ensure(hostPort, hostport.Target{Kind: hostport.Redirect, RedirectPort: w.redirectPort})
 	}
 	return w.tcp.Ensure(hostPort, hostport.Target{Kind: hostport.DNAT, Addr: netip.AddrPortFrom(ip, uint16(port))})
+}
+
+// UpsertFencedTCPRoute (owner, paused by the ownership fence): no forward at
+// all, so a new connection to the host port is refused at once instead of
+// being DNATed to a frozen process that never answers. The next UpsertTCPRoute
+// puts the forward back.
+func (w *indexRouteWriter) UpsertFencedTCPRoute(_ context.Context, _ string, _ int, hostPort int) error {
+	if w.tcp == nil {
+		return nil
+	}
+	return w.tcp.Remove(hostPort)
 }
 
 // UpsertWakeTCPRoute (owner, stopped serverless): REDIRECT to the sandboxd

@@ -362,7 +362,7 @@ func (s *Service) fenceSandbox(ctx context.Context, id string) {
 	s.ownership.mu.Unlock()
 	// The ingress proxy's warm fast path must not reach it either.
 	s.invalidateWarm(id)
-	// Its public ports answer 503 before it freezes, so no request is
+	// Its public URLs answer 503 before it freezes, so no request is
 	// proxied to a process that will never answer.
 	if !routed {
 		s.fenceSandboxRoutes(ctx, sb)
@@ -396,12 +396,13 @@ func (s *Service) fenceSandbox(ctx context.Context, id string) {
 	s.ownership.mu.Unlock()
 }
 
-// fenceSandboxRoutes swaps every public HTTP port route of a fenced sandbox
-// for the 503 (applyHTTPPortRoute reads the fence). A failure leaves
-// routesFenced unset, so the next check retries; ports already swapped are
-// rewritten in place, which is idempotent.
+// fenceSandboxRoutes swaps every public route of a fenced sandbox for its
+// fenced shape (syncPublicRoutes): 503 for HTTP ports, the root (toolbox)
+// route and custom domains; an immediate close for raw TCP and TLS ports. A
+// failure leaves routesFenced unset, so the next check retries; routes
+// already swapped are rewritten in place, which is idempotent.
 func (s *Service) fenceSandboxRoutes(ctx context.Context, sb *models.Sandbox) {
-	err := s.syncHTTPPortRoutes(ctx, sb)
+	err := s.syncPublicRoutes(ctx, sb)
 	s.ownership.mu.Lock()
 	if f, ok := s.ownership.fenced[sb.ID]; ok {
 		f.routesFenced = err == nil
@@ -411,7 +412,7 @@ func (s *Service) fenceSandboxRoutes(ctx context.Context, sb *models.Sandbox) {
 	delete(s.ownership.routeRestore, sb.ID)
 	s.ownership.mu.Unlock()
 	if err != nil && s.logger != nil {
-		s.logger.Warn("cluster: could not point a fenced sandbox's public ports at 503; will retry", "sandbox_id", sb.ID, "error", err)
+		s.logger.Warn("cluster: could not point a fenced sandbox's public URLs at 503; will retry", "sandbox_id", sb.ID, "error", err)
 	}
 }
 
@@ -438,9 +439,9 @@ func (s *Service) restoreFencedRoutes(ctx context.Context) {
 			continue
 		}
 		if err == nil {
-			if err := s.syncHTTPPortRoutes(ctx, sb); err != nil {
+			if err := s.syncPublicRoutes(ctx, sb); err != nil {
 				if s.logger != nil {
-					s.logger.Warn("cluster: could not restore a resumed sandbox's public ports; they answer 503 until a retry lands", "sandbox_id", id, "error", err)
+					s.logger.Warn("cluster: could not restore a resumed sandbox's public URLs; they answer 503 until a retry lands", "sandbox_id", id, "error", err)
 				}
 				continue
 			}
@@ -451,15 +452,29 @@ func (s *Service) restoreFencedRoutes(ctx context.Context) {
 	}
 }
 
-// syncHTTPPortRoutes rewrites the route of every HTTP exposure of sb, in the
+// syncPublicRoutes rewrites every public route of sb in the shape its state
+// asks for, fenced or not: its exposed ports of every protocol
+// (syncExposedPortRoutes), its root route and custom domains
+// (syncSandboxPublicRoute, then the WASM mediator dials). The fence and the
+// restore both call it.
+func (s *Service) syncPublicRoutes(ctx context.Context, sb *models.Sandbox) error {
+	err := s.syncExposedPortRoutes(ctx, sb)
+	if rerr := s.syncSandboxPublicRoute(ctx, sb); rerr != nil && err == nil {
+		err = rerr
+	}
+	if werr := s.syncWasmCustomDomainRoutes(ctx, sb); werr != nil && err == nil {
+		err = werr
+	}
+	return err
+}
+
+// syncExposedPortRoutes rewrites the route of every exposure of sb, in the
 // shape its state asks for (syncExposedPortRoute: public or not, then
-// applyHTTPPortRoute: fenced or not, serverless or not).
-func (s *Service) syncHTTPPortRoutes(ctx context.Context, sb *models.Sandbox) error {
+// applyHTTPPortRoute, installTCPPortRoute or installTLSPortRoute: fenced or
+// not, serverless or not).
+func (s *Service) syncExposedPortRoutes(ctx context.Context, sb *models.Sandbox) error {
 	var firstErr error
 	for _, port := range sb.ExposedPorts {
-		if port.Protocol != "" && port.Protocol != models.ExposedPortProtocolHTTP {
-			continue
-		}
 		if err := s.syncExposedPortRoute(ctx, sb, port); err != nil && firstErr == nil {
 			firstErr = err
 		}

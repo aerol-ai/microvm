@@ -3,9 +3,11 @@ package caddy
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -282,5 +284,132 @@ func TestUpsertFencedPortRoute(t *testing.T) {
 	}
 	if strings.Contains(string(body), "reverse_proxy") {
 		t.Fatalf("fenced route still proxies: %s", body)
+	}
+}
+
+// UpsertFencedSandboxRoute writes the 503 under the root route's own @id and
+// under each custom hostname's route id, so each replaces its live route in
+// place. In IP mode the root route is a path route (as UpsertSandboxRoute
+// writes it) and custom hostnames do not exist; a disabled client writes
+// nothing.
+func TestUpsertFencedSandboxRoute(t *testing.T) {
+	ctx := context.Background()
+	fake := newFakeCaddy(t)
+	off := &Client{enabled: false, domain: "d.test", serverID: "srv0", baseURL: fake.URL, httpClient: fake.Client}
+	if err := off.UpsertFencedSandboxRoute(ctx, "abc", []string{"app.example.com"}); err != nil {
+		t.Fatal(err)
+	}
+	if len(fake.routes) != 0 {
+		t.Fatalf("a disabled client wrote routes: %v", fake.routes)
+	}
+
+	client := &Client{enabled: true, domain: "d.test", serverID: "srv0", baseURL: fake.URL, httpClient: fake.Client}
+	customs := []CustomHostnameRoute{{Hostname: "app.example.com"}, {Hostname: "api.example.com", TargetPort: 8080}}
+	if err := client.UpsertSandboxRoute(ctx, "abc", "10.0.0.1", 2280, customs); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.UpsertFencedSandboxRoute(ctx, "abc", []string{"App.Example.com", " api.example.com", ""}); err != nil {
+		t.Fatalf("UpsertFencedSandboxRoute: %v", err)
+	}
+	if len(fake.routes) != 3 {
+		t.Fatalf("routes = %v, want the root and the two custom-domain routes, rewritten in place", fake.routes)
+	}
+	for id, host := range map[string]string{
+		SandboxRouteID("abc"): "abc.d.test",
+		IngressCustomDomainHTTPRouteID("abc", "app.example.com"): "app.example.com",
+		IngressCustomDomainHTTPRouteID("abc", "api.example.com"): "api.example.com",
+	} {
+		body, _ := json.Marshal(fake.routes[id])
+		for _, want := range []string{`"static_response"`, `"status_code":503`, `"Retry-After":["2"]`, `"` + host + `"`} {
+			if !strings.Contains(string(body), want) {
+				t.Fatalf("fenced route %s = %s, lacks %s", id, body, want)
+			}
+		}
+		if strings.Contains(string(body), "reverse_proxy") {
+			t.Fatalf("fenced route %s still proxies: %s", id, body)
+		}
+	}
+
+	ipFake := newFakeCaddy(t)
+	ip := &Client{enabled: true, serverID: "srv0", baseURL: ipFake.URL, httpClient: ipFake.Client}
+	if err := ip.UpsertFencedSandboxRoute(ctx, "abc", []string{"app.example.com"}); err != nil {
+		t.Fatal(err)
+	}
+	body, _ := json.Marshal(ipFake.routes[SandboxRouteID("abc")])
+	if len(ipFake.routes) != 1 || !strings.Contains(string(body), `"/abc/*"`) || !strings.Contains(string(body), `"status_code":503`) {
+		t.Fatalf("IP mode: routes = %v (root %s), want only the root path route as a 503", ipFake.routes, body)
+	}
+}
+
+// The fenced TCP server keeps its listener and closes each connection; the
+// fenced TLS route keeps its SNI matcher and closes. Neither proxies.
+func TestUpsertFencedTCPAndTLSRoutes(t *testing.T) {
+	ctx := context.Background()
+	var mu sync.Mutex
+	bodies := map[string]string{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		mu.Lock()
+		bodies[r.Method+" "+r.URL.Path] = string(b)
+		mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+	off := &Client{enabled: false, domain: "d.test", baseURL: srv.URL, httpClient: srv.Client()}
+	if err := off.UpsertFencedTCPRoute(ctx, "abc", 5432, 40001); err != nil {
+		t.Fatal(err)
+	}
+	if err := off.UpsertFencedTLSSNIRoute(ctx, "abc", "abc-6379.d.test", 6379); err != nil {
+		t.Fatal(err)
+	}
+	if len(bodies) != 0 {
+		t.Fatalf("a disabled client wrote %v", bodies)
+	}
+	c := &Client{enabled: true, domain: "d.test", baseURL: srv.URL, httpClient: srv.Client()}
+	if err := c.UpsertFencedTCPRoute(ctx, "abc", 5432, 0); err == nil {
+		t.Fatal("host port 0 must be refused, like UpsertTCPRoute")
+	}
+	if err := c.UpsertFencedTCPRoute(ctx, "abc", 5432, 40001); err != nil {
+		t.Fatal(err)
+	}
+	tcp := bodies["POST /config/apps/layer4/servers/tcp-port-40001"]
+	for _, want := range []string{`"listen":[":40001"]`, `"@id":"sandbox-abc-port-5432-tcp"`, `"handler":"close"`} {
+		if !strings.Contains(tcp, want) {
+			t.Fatalf("fenced tcp server %s lacks %s", tcp, want)
+		}
+	}
+	if err := c.UpsertFencedTLSSNIRoute(ctx, "abc", "abc-6379.d.test", 6379); err != nil {
+		t.Fatal(err)
+	}
+	tls := bodies["PATCH /id/sandbox-abc-port-6379-tls"]
+	for _, want := range []string{`"sni":["abc-6379.d.test"]`, `"handler":"close"`} {
+		if !strings.Contains(tls, want) {
+			t.Fatalf("fenced tls route %s lacks %s", tls, want)
+		}
+	}
+	for _, b := range []string{tcp, tls} {
+		if strings.Contains(b, `"proxy"`) {
+			t.Fatalf("a fenced route still proxies: %s", b)
+		}
+	}
+}
+
+// The fenced TCP writer reports a refused write and an unreachable admin API
+// like UpsertTCPRoute does, so the fence retries on the next check.
+func TestUpsertFencedTCPRouteErrors(t *testing.T) {
+	ctx := context.Background()
+	refuse := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "nope", http.StatusInternalServerError)
+	}))
+	defer refuse.Close()
+	c := &Client{enabled: true, domain: "d.test", baseURL: refuse.URL, httpClient: refuse.Client()}
+	if err := c.UpsertFencedTCPRoute(ctx, "abc", 5432, 40001); err == nil || !strings.Contains(err.Error(), "500") {
+		t.Fatalf("a 500 from the admin API = %v, want an error naming it", err)
+	}
+	gone := httptest.NewServer(http.NotFoundHandler())
+	gone.Close()
+	c = &Client{enabled: true, domain: "d.test", baseURL: gone.URL, httpClient: gone.Client()}
+	if err := c.UpsertFencedTCPRoute(ctx, "abc", 5432, 40001); err == nil {
+		t.Fatal("an unreachable admin API must be an error")
 	}
 }
