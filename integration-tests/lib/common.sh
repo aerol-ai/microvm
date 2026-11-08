@@ -413,9 +413,20 @@ direct_resolve_args() {
   return 0
 }
 
-# direct_resolve_ip <host> — the last A record, from a direct DNS query.
+# direct_resolve_ip <host> — the last A record, asked of the zone's own
+# nameservers first. A recursive resolver (the laptop's, often 8.8.8.8)
+# caches a miss for the zone's SOA minimum (1800 s on the test zones): one
+# lookup made while the record did not exist yet, by a person or an earlier
+# run, then breaks every curl for half an hour (2026-11-08, adopt gate step 2).
+# The zone is the host's last two labels, which holds for every test domain.
 direct_resolve_ip() {
-  dig +short A "$1" 2>/dev/null | grep -E '^[0-9]+(\.[0-9]+){3}$' | tail -1
+  local host="$1" zone ns ip
+  zone=$(printf '%s' "$host" | awk -F. 'NF>=2 {print $(NF-1)"."$NF}')
+  for ns in $(dig +short NS "$zone" 2>/dev/null); do
+    ip=$(dig +short A "$host" "@${ns%.}" 2>/dev/null | grep -E '^[0-9]+(\.[0-9]+){3}$' | tail -1)
+    if [[ -n "$ip" ]]; then printf '%s\n' "$ip"; return 0; fi
+  done
+  dig +short A "$host" 2>/dev/null | grep -E '^[0-9]+(\.[0-9]+){3}$' | tail -1
 }
 
 # mint_suite_token <ssh_target> <pat> <scenario> [timeout_s]
