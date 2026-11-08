@@ -473,6 +473,43 @@ func (c *Client) UpsertFencedPortRoute(ctx context.Context, id string, port int)
 	return c.upsertRoute(ctx, routeID, inFluxRoute(routeID, match))
 }
 
+// UpsertFencedSandboxRoute is UpsertFencedPortRoute for a sandbox's root
+// (toolbox) route and each of its custom hostnames: each URL answers 503 +
+// Retry-After under the live route's own @id and matcher, so the swap there
+// and back is one write in place and route order never changes. It mirrors
+// UpsertSandboxRoute's modes: the root route is swapped in IP (path) mode
+// too, custom hostnames exist only in domain mode.
+func (c *Client) UpsertFencedSandboxRoute(ctx context.Context, id string, customHostnames []string) error {
+	if !c.enabled {
+		return nil
+	}
+	routeID := sandboxRouteID(id)
+	if err := c.upsertRoute(ctx, routeID, inFluxRoute(routeID, c.inFluxMatchSandbox(id))); err != nil {
+		return err
+	}
+	for _, h := range customHostnames {
+		if err := c.UpsertFencedCustomDomainRoute(ctx, id, h); err != nil {
+			return fmt.Errorf("fence custom-domain route %q: %w", h, err)
+		}
+	}
+	return nil
+}
+
+// UpsertFencedCustomDomainRoute writes the 503 for one custom hostname under
+// that hostname's route id (IngressCustomDomainHTTPRouteID), the id
+// UpsertCustomDomainHTTPRouteWithDial writes the live route under.
+func (c *Client) UpsertFencedCustomDomainRoute(ctx context.Context, sandboxID, hostname string) error {
+	if !c.enabled || c.domain == "" {
+		return nil
+	}
+	host := strings.TrimSpace(strings.ToLower(hostname))
+	if host == "" {
+		return nil
+	}
+	routeID := IngressCustomDomainHTTPRouteID(sandboxID, host)
+	return c.upsertRoute(ctx, routeID, inFluxRoute(routeID, []map[string]any{{"host": []string{host}}}))
+}
+
 // UpsertPortRouteToPeer installs the IP/path-mode per-port route for a
 // sandbox owned by another node. In domain mode this is handled by SNI
 // pass-through routes in the layer4 mux.
@@ -1341,6 +1378,43 @@ func (c *Client) UpsertWakeTCPRoute(ctx context.Context, id string, port, hostPo
 	return nil
 }
 
+// UpsertFencedTCPRoute is UpsertTCPRoute for a sandbox whose node cannot
+// confirm it still owns it (paused): the host port keeps its listener, but
+// its one route closes each new connection at once. layer4.handlers.close
+// ships in caddy-l4, which the custom Caddy build includes whole. Raw TCP has
+// no way to say "retry later", but a closed connection is an answer a client
+// acts on, where a proxy to the frozen process would hang it.
+func (c *Client) UpsertFencedTCPRoute(ctx context.Context, id string, port, hostPort int) error {
+	if !c.enabled {
+		return nil
+	}
+	if hostPort <= 0 {
+		return errors.New("host port must be positive")
+	}
+	server := map[string]any{
+		"listen": []string{fmt.Sprintf(":%d", hostPort)},
+		"routes": []any{
+			map[string]any{
+				"@id":    tcpRouteID(id, port),
+				"handle": []map[string]any{{"handler": "close"}},
+			},
+		},
+	}
+	body, err := json.Marshal(server)
+	if err != nil {
+		return fmt.Errorf("marshal fenced tcp server: %w", err)
+	}
+	target := fmt.Sprintf("%s/config/apps/layer4/servers/%s", c.baseURL, tcpServerID(hostPort))
+	status, err := c.sendJSON(ctx, http.MethodPost, target, body)
+	if err != nil {
+		return err
+	}
+	if status >= 400 {
+		return fmt.Errorf("upsert fenced tcp server failed: %d", status)
+	}
+	return nil
+}
+
 // UpsertTCPProxyRoute creates a raw-TCP ingress server bound to hostPort that
 // forwards to another node's hostPort. This is the non-owner half of stable
 // cluster TCP exposure: every node can accept tcp://cluster-host:hostPort, but
@@ -1448,6 +1522,29 @@ func (c *Client) UpsertTLSSNIRoute(ctx context.Context, id, sniHost, containerIP
 		return fmt.Errorf("marshal tls sni route: %w", err)
 	}
 	return c.upsertTLSMuxRoute(ctx, "tls sni route", routeID, body)
+}
+
+// UpsertFencedTLSSNIRoute is UpsertTLSSNIRoute for a paused sandbox: the same
+// @id and SNI matcher (read from the ClientHello, no handshake), with a
+// handler that closes the connection. It is terminal, so the mux's fallback
+// route never sees the connection.
+func (c *Client) UpsertFencedTLSSNIRoute(ctx context.Context, id, sniHost string, port int) error {
+	if !c.enabled {
+		return nil
+	}
+	routeID := tlsRouteID(id, port)
+	route := map[string]any{
+		"@id": routeID,
+		"match": []map[string]any{{
+			"tls": map[string]any{"sni": []string{sniHost}},
+		}},
+		"handle": []map[string]any{{"handler": "close"}},
+	}
+	body, err := json.Marshal(route)
+	if err != nil {
+		return fmt.Errorf("marshal fenced tls sni route: %w", err)
+	}
+	return c.upsertTLSMuxRoute(ctx, "fenced tls sni route", routeID, body)
 }
 
 // upsertTLSMuxRoute is upsertRoute for the tls-mux layer4 server: PATCH
