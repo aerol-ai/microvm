@@ -16,6 +16,9 @@ func TestNodeUpgradesController(t *testing.T) {
 	for _, remote := range []bool{true, false} {
 		db := filepath.Join(t.TempDir(), "state.db")
 		svc := New(config.Config{DBPath: db, RemoteUpgrade: remote}, logger, nil, nil, nil, nil, nil, nil, nil)
+		// The audit writer runs beside the database; stop it before the
+		// temp dir is removed, or a late write races the cleanup.
+		t.Cleanup(svc.CloseSecretAuditSink)
 		if svc.RemoteUpgradeEnabled() != remote {
 			t.Fatalf("RemoteUpgradeEnabled = %v, want %v", svc.RemoteUpgradeEnabled(), remote)
 		}
@@ -29,6 +32,7 @@ func TestNodeUpgradesController(t *testing.T) {
 	}
 	// A controller attached first is the one used.
 	svc := New(config.Config{}, logger, nil, nil, nil, nil, nil, nil, nil)
+	t.Cleanup(svc.CloseSecretAuditSink)
 	mine := &nodeupgrade.Local{StateDir: "/x"}
 	svc.AttachNodeUpgrades(mine)
 	if svc.NodeUpgrades() != mine {
