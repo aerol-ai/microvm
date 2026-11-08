@@ -32,7 +32,10 @@ type fakeReleases struct {
 	// files: version -> asset -> body.
 	files map[string]map[string][]byte
 	// lie serves other bytes for "version/asset" than checksums.txt says.
-	lie  map[string]bool
+	lie map[string]bool
+	// fail answers "version/asset" 500, a broken mirror rather than a
+	// missing file.
+	fail map[string]bool
 	gets []string
 }
 
@@ -45,6 +48,10 @@ func newFakeReleases(t *testing.T) *fakeReleases {
 		parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/releases/"), "/")
 		if len(parts) != 2 {
 			http.NotFound(w, r)
+			return
+		}
+		if f.fail[parts[0]+"/"+parts[1]] {
+			http.Error(w, "mirror broken", http.StatusInternalServerError)
 			return
 		}
 		body, ok := f.files[parts[0]][parts[1]]
@@ -158,10 +165,13 @@ type fakeUpgrade struct {
 	rollout *upgradewire.Rollout
 	advance bool
 	// onGet changes the rollout before a GET answers it.
-	onGet     func(*upgradewire.Rollout)
-	applyReqs []upgradewire.ApplyRequest
-	manual    map[string]bool
-	nextID    int
+	onGet func(*upgradewire.Rollout)
+	// failRolloutGets answers this many reads of a rollout 503, as the
+	// API does while a server restarts.
+	failRolloutGets int
+	applyReqs       []upgradewire.ApplyRequest
+	manual          map[string]bool
+	nextID          int
 }
 
 func newFakeUpgrade(t *testing.T, cluster bool, running string) *fakeUpgrade {
@@ -453,6 +463,11 @@ func (f *fakeUpgrade) serveRollout(w http.ResponseWriter, r *http.Request, path 
 	if path == upgradewire.ClusterUpgradePath && r.Method == http.MethodGet {
 		if ro == nil {
 			f.refuse(w, http.StatusNotFound, "not_found", "no rollout has run on this cluster", "")
+			return
+		}
+		if f.failRolloutGets > 0 {
+			f.failRolloutGets--
+			writeFakeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "restarting"})
 			return
 		}
 		f.step()
