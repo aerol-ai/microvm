@@ -15,6 +15,7 @@ import (
 	"path"
 	"regexp"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"syscall"
@@ -1252,4 +1253,67 @@ func TestWithNodeEnvRestartLoopIsNotAStart(t *testing.T) {
 		fake.restarting = false
 		fake.mu.Unlock()
 	})
+}
+
+func TestResealDrainPlan(t *testing.T) {
+	hetero := []NodeRole{
+		{"worker-w", "worker"}, {"server-3", "server"}, {"worker-y", "worker"},
+		{"worker-z", "worker"}, {"server-2", "server"}, {"ingress-1", "ingress"},
+		{"server-1", "server"}, {"worker-x", "worker"},
+	}
+	three := []NodeRole{{"a", "server"}, {"b", "server"}, {"c", "server"}}
+	cases := []struct {
+		name        string
+		holders     []string
+		members     []NodeRole
+		owner       string
+		wantVictims []string
+		wantCanHold []string
+	}{
+		{
+			// The live failure: member order put ingress-1 and server-1
+			// first, and neither holds a copy.
+			name:        "hetero drains the two holders that are not the owner",
+			holders:     []string{"worker-x", "worker-y", "worker-z"},
+			members:     hetero,
+			owner:       "worker-x",
+			wantVictims: []string{"worker-y", "worker-z"},
+			wantCanHold: []string{"worker-w", "worker-y", "worker-z", "worker-x"},
+		},
+		{
+			name:        "an owner outside the holders leaves two holders to drain",
+			holders:     []string{"worker-x", "worker-y", "worker-z"},
+			members:     hetero,
+			owner:       "worker-w",
+			wantVictims: []string{"worker-x", "worker-y"},
+			wantCanHold: []string{"worker-w", "worker-y", "worker-z", "worker-x"},
+		},
+		{
+			name:        "one holder besides the owner is drained with another node",
+			holders:     []string{"a", "b"},
+			members:     three,
+			owner:       "a",
+			wantVictims: []string{"b", "c"},
+			wantCanHold: []string{"a", "b", "c"},
+		},
+		{
+			name:        "too few nodes gives fewer than two victims",
+			holders:     []string{"a", "b"},
+			members:     three[:2],
+			owner:       "a",
+			wantVictims: []string{"b"},
+			wantCanHold: []string{"a", "b"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			victims, canHold := ResealDrainPlan(tc.holders, tc.members, tc.owner)
+			if !slices.Equal(victims, tc.wantVictims) {
+				t.Errorf("victims = %v, want %v", victims, tc.wantVictims)
+			}
+			if !slices.Equal(canHold, tc.wantCanHold) {
+				t.Errorf("canHold = %v, want %v", canHold, tc.wantCanHold)
+			}
+		})
+	}
 }

@@ -243,18 +243,17 @@ func TestConcurrentResealTriggersConverge(t *testing.T) {
 	})
 	owner := resolvePlacementOwner(t, c, sb.ID)
 
-	all := clusterNodeIDs(t, c)
-	// Drain two nodes that are not the owner. Draining the owner would move
-	// the sandbox, which is a different experiment.
-	var victims []string
-	for _, id := range all {
-		if id != owner && len(victims) < 2 {
-			victims = append(victims, id)
-		}
+	// Drain two nodes that are not the owner, holders first: a node with no
+	// copy owes no reseal (harness.ResealDrainPlan says why).
+	var members []harness.NodeRole
+	for _, m := range fetchMembers(t, c).Members {
+		members = append(members, harness.NodeRole{NodeID: m.NodeID, Role: m.Role})
 	}
+	victims, canHold := harness.ResealDrainPlan(before.Holders, members, owner)
 	if len(victims) < 2 {
-		t.Skipf("need two non-owner nodes to drain concurrently, cluster has %v", all)
+		t.Skipf("need two non-owner nodes to drain concurrently, cluster has %v", members)
 	}
+	t.Logf("owner %s, holders %v, draining %v", owner, before.Holders, victims)
 
 	t.Cleanup(func() {
 		cctx, ccancel := context.WithTimeout(context.Background(), 3*time.Minute)
@@ -282,11 +281,12 @@ func TestConcurrentResealTriggersConverge(t *testing.T) {
 
 	// Converged means: no outstanding outbox work AND two consecutive reads
 	// agree. One read can catch a moment between two competing reseals.
-	// With a node left outside the owner and both victims, the drains
-	// reseal once onto a set without them. Without one (a 3-node cluster)
-	// the durability floor holds: a drained copy stays until a replacement
-	// holds the new one, so nothing moves and nothing is owed.
-	replacementExists := len(withoutAll(all, append([]string{owner}, victims...))) > 0
+	// With a node that can hold a copy left outside the owner and both
+	// victims, the drains reseal once onto a set without them. Without one
+	// (a 3-node cluster) the durability floor holds: a drained copy stays
+	// until a replacement holds the new one, so nothing moves and nothing is
+	// owed.
+	replacementExists := len(withoutAll(canHold, append([]string{owner}, victims...))) > 0
 	settled := harness.AwaitSecretHolders(t, c, sb.ID, resealTimeout, func(v harness.SecretHoldersView) bool {
 		if !v.Converged() || len(v.Holders) == 0 {
 			return false
