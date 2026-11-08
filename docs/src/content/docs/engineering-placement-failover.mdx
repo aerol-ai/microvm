@@ -35,6 +35,21 @@ Three things in `internal/cluster/` are worth understanding before you read the 
 
 `Noop` (`internal/cluster/noop.go`) is used when `cfg.EnableCluster=false`, so the `cluster.Client` interface still works in single-node mode. Function and type names on this page are real, so you can search the code for them.
 
+## The rules the cluster keeps
+
+These are the rules every change to `internal/cluster/` is checked against. The fault tests (offline in `internal/cluster`, live in the `cluster-chaos` scenario) try to break them.
+
+| # | Rule | How it holds today |
+|---|---|---|
+| I1 | **One executor.** A node runs or serves sandbox X only while it may own X. | A worker that cannot reach the leader for half of `SB_DEAD_OWNER_GRACE` pauses its recreate-policy sandboxes before any move can start. Other sandboxes are never moved (they are orphaned), so their node stays their only executor. |
+| I2 | **Ownership epoch.** Every owner change raises a number, and anything carrying an older number is refused. | Not yet. Instead, routing checks the owner again on every request. |
+| I3 | **No resurrection.** Once a sandbox's lifetime is deleted, it never runs or answers again. | The cluster keeps a delete record. A server that comes back deletes its leftover copy, and Raft refuses to place it. A delete that lands during a failover rebuild still finishes. |
+| I4 | **Capacity.** A worker never runs more than its budget, and the leader never under-counts a worker's load. | Each worker checks its own budget before it starts anything. The leader counts moved and promoted sandboxes until the worker's next capacity report shows them. |
+| I5 | **Same result on every server.** Applying a log entry depends only on the state and the entry. | Apply takes its time from the log entry, never from the server's clock. |
+| I6 | **Convergence.** After failures stop, every sandbox ends up with exactly one copy, on its owner. | Yes, within the reconcile interval (5 minutes by default). |
+| I7 | **Routing safety.** Only the current owner serves X; any other node answers 421 or 503. | Every request checks the owner. A server cut off from the leader refuses placement reads, a cut-off ingress treats recreate-policy routes as moving (503), and a paused sandbox answers 503. |
+| I8 | **A failed create leaves nothing.** A create reported as failed leaves no sandbox and no placement. | A create whose cleanup could not finish is marked, never published, and reconcile keeps deleting it. |
+
 ## Why not a single central scheduler
 
 AerolVM spreads placement decisions across nodes instead of running one central scheduler. Two assumptions about the workload drive that choice:
