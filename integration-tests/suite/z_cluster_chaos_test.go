@@ -926,7 +926,29 @@ func TestClusterChaosRollingServerRestart(t *testing.T) {
 		}
 	}
 
-	fresh := chaosNewSandbox(t, api, chaosRequest(harness.UniqueName(sc, t)+"-after", tag, false, cpu, mem, "", nil))
+	// The last restart was the leader's. Its replacement answers placement
+	// reads at once but places nothing until each worker's next capacity
+	// report reaches it, about 20 s (UC-481 measures the same gap), and says
+	// so with a retryable 503. So the create retries a 503 for a bounded
+	// time, as a client would, and the wait is logged.
+	afterReq := chaosRequest(harness.UniqueName(sc, t)+"-after", tag, false, cpu, mem, "", nil)
+	createStart := time.Now()
+	var made chaosCreateResult
+	for {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		made = chaosCreate(ctx, api, afterReq)
+		cancel()
+		if made.ok() || made.Status != http.StatusServiceUnavailable || time.Since(createStart) > 90*time.Second {
+			break
+		}
+		time.Sleep(3 * time.Second)
+	}
+	if !made.ok() {
+		t.Fatalf("create %s after the restarts: %s %v %s (retried 503s for %s)", afterReq.Name, made.describe(), made.Err, made.Body, time.Since(createStart).Round(time.Second))
+	}
+	t.Logf("the first create after the restarts succeeded %s after the leader's restart", time.Since(createStart).Round(time.Second))
+	chaosAwaitStarted(t, api, made.ID, 3*time.Minute)
+	fresh := made.ID
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	st, err := chaosDelete(ctx, api, fresh)
 	cancel()
@@ -1512,8 +1534,10 @@ func TestClusterChaosCrashBeforeCreatePersists(t *testing.T) {
 // (harness.RecoveredAt); the control plane's recovery time is the latest of
 // the three, logged and put in the report's detail.
 //
-// I6: recovery within AEROL_CHAOS_RTO_BUDGET_SECONDS (default 120 until the
-// first measured runs set it), and afterwards every placement made before
+// I6: recovery within AEROL_CHAOS_RTO_BUDGET_SECONDS (default 55: about 1.5
+// times the first measured run, 34.5 s on 2026-11-08 with t3.medium servers;
+// leader and placement reads were back at 13.3 s, and creates waited for the
+// new leader's first worker capacity reports), and afterwards every placement made before
 // the kill has the owner and incarnation it had, read on every server, and
 // still runs once on that owner. I8, I4: the creates the prober sent during
 // the outage end as chaosCheckCreates expects.
@@ -1527,7 +1551,7 @@ func TestClusterChaosControlPlaneRecoveryTime(t *testing.T) {
 	ids := chaosNodeIDs(t, observer, tp)
 	budgets := chaosBudgets(t, chaosWorkerAPIs(t, tp))
 	bound := chaosConvergeBound(t, tp)
-	budget := chaosSeconds("AEROL_CHAOS_RTO_BUDGET_SECONDS", 120)
+	budget := chaosSeconds("AEROL_CHAOS_RTO_BUDGET_SECONDS", 55)
 	mode := chaosString("AEROL_CHAOS_RTO_MODE", "all")
 	if mode != "all" && mode != "leader" {
 		t.Fatalf("AEROL_CHAOS_RTO_MODE=%q: want all or leader", mode)

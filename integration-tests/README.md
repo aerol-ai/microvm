@@ -351,7 +351,7 @@ run as short smoke runs in this scenario:
 | `AEROL_CHAOS_FAILOVER_BOUND_SECONDS` | `300` | how long a reassign, and a reassigned sandbox's start, may take |
 | `AEROL_CHAOS_CONVERGE_SECONDS` | 2 x reconcile + 60 | override the convergence bound T |
 | `AEROL_CHAOS_RTO_MODE` | `all` | UC-481: `all` SIGKILLs every server at once, `leader` only the Raft leader |
-| `AEROL_CHAOS_RTO_BUDGET_SECONDS` | `120` | UC-481's recovery-time budget; to be set from the first measured runs |
+| `AEROL_CHAOS_RTO_BUDGET_SECONDS` | `55` | UC-481's recovery-time budget: about 1.5 times the first measured run (34.5 s, 2026-11-08) |
 | `AEROL_CHAOS_RTO_SANDBOXES` / `_MAX_CREATES` | `3` / `120` | UC-481: sandboxes whose placements must survive, and a cap on the prober's creates |
 | `AEROL_SOAK_MINUTES` | `15` | UC-482's load duration |
 | `AEROL_SOAK_WORKERS` | `4` | UC-482's closed-loop workers |
