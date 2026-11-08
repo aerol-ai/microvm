@@ -255,6 +255,17 @@ download_pins() {
 	v="$BUILDKIT_VERSION"
 	echo "buildkit ${v} buildkit-${v}.linux-amd64.tar.gz ${BUILDKIT_SHA256_AMD64} ${buildkit}/buildkit-${v}.linux-amd64.tar.gz"
 	echo "buildkit ${v} buildkit-${v}.linux-arm64.tar.gz ${BUILDKIT_SHA256_ARM64} ${buildkit}/buildkit-${v}.linux-arm64.tar.gz"
+	# Upstream's own checksum files, kept beside the files on the mirror for
+	# anyone checking by hand. install.sh does not read them, so their
+	# hashes need bumping only when CADDY_PACKAGE_VERSION or
+	# CNI_PLUGINS_VERSION changes (and then these lines must change anyway).
+	v="$CADDY_PACKAGE_VERSION"
+	echo "caddy v${v} caddy_${v}_checksums.txt 5d27b76b95f496638d79208c55250317b8755fd9e90005f7466aa32956944a90 ${caddy}/caddy_${v}_checksums.txt"
+	v="$CNI_PLUGINS_VERSION"
+	echo "cni-plugins ${v} cni-plugins-linux-amd64-${v}.tgz.sha256 c96ab6bec7d59dd01f2f3373fe6ce7cc17a13f21df13541cc8f06d4ef5bb5763 ${cni}/cni-plugins-linux-amd64-${v}.tgz.sha256"
+	echo "cni-plugins ${v} cni-plugins-linux-amd64-${v}.tgz.sha512 0f9b6f929b9eb5817549b439709e88ce3d24c4728eb1e8949e2f086105a33948 ${cni}/cni-plugins-linux-amd64-${v}.tgz.sha512"
+	echo "cni-plugins ${v} cni-plugins-linux-arm64-${v}.tgz.sha256 2a484d561f4a9c75f820ca0fa2d5f21cbf47b460668b055dac3ce0754874cdea ${cni}/cni-plugins-linux-arm64-${v}.tgz.sha256"
+	echo "cni-plugins ${v} cni-plugins-linux-arm64-${v}.tgz.sha512 705b6aa2498e03eef13df8a5993852e1d3e9ac64606c98a60f7551d9d905f2c5 ${cni}/cni-plugins-linux-arm64-${v}.tgz.sha512"
 }
 # --- END DOWNLOAD PINS --------------------------------------------------------
 
