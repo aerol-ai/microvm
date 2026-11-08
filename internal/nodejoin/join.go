@@ -177,12 +177,11 @@ func (j *Joiner) Run(ctx context.Context, o JoinOptions) (JoinResult, error) {
 	} else {
 		j.printf("[join] every file is already as the cluster says; sandboxd keeps running\n")
 	}
-	pat := resp.PATToken
-	if pat == "" {
-		pat = env.get("SB_PAT_TOKEN")
+	// The files now name the token sandboxd takes from local tools.
+	if written, err := loadNodeEnv(j.Paths); err == nil {
+		env = written
 	}
 	api := env.localAPI(j.LocalAPI)
-	api.pat = pat
 	timeout := o.WaitTimeout
 	if timeout <= 0 {
 		timeout = DefaultWaitTimeout
@@ -198,6 +197,9 @@ func (j *Joiner) Run(ctx context.Context, o JoinOptions) (JoinResult, error) {
 		again = " (already joined; nothing changed)"
 	}
 	j.printf("[join] %s joined the cluster as a %s node%s\n", nodeID, resp.Role, again)
+	if resp.PATToken == "" && len(resp.PATSHA256) > 0 {
+		j.printf("[join] it holds the operator token's hash, not the token: it checks the token by hash and calls its peers with its cert; its own SB_PAT_TOKEN works only for tools on this machine\n")
+	}
 	if resp.Role == cluster.JoinRoleServer && !m.Voter {
 		j.printf("[join] it is not a Raft voter yet; the leader adds servers as voters up to the voter cap\n")
 	}
@@ -342,16 +344,22 @@ func (j *Joiner) writeJoinFiles(jr *fileJournal, env nodeEnv, resp cluster.JoinR
 	if err := j.writeCredentials(jr, env, resp.Credentials, &set); err != nil {
 		return err
 	}
+	patSettings(&set, resp)
 	if err := jr.mergeEnv(j.Paths.ClusterEnv, clusterEnvHeader, set); err != nil {
 		return err
 	}
-	// The cluster's PAT replaces the random one install.sh made: peers
-	// prove themselves with it. It lives in sandboxd.env, where install.sh
-	// reads it back on every re-run.
-	if resp.PATToken != "" && env.base["SB_PAT_TOKEN"] != resp.PATToken {
-		var pat envSet
-		pat.set("SB_PAT_TOKEN", resp.PATToken)
-		if err := jr.mergeEnv(j.Paths.EnvFile, "", pat); err != nil {
+	// A server's answer carries the cluster's PAT, which replaces the
+	// random one install.sh made; a worker or ingress node gets the PAT's
+	// hashes instead and keeps (or gets) a token of its own (pat.go). It
+	// lives in sandboxd.env, where install.sh reads it back on every re-run.
+	pat, changed, err := joinPAT(env.base["SB_PAT_TOKEN"], resp)
+	if err != nil {
+		return err
+	}
+	if changed {
+		var set envSet
+		set.set("SB_PAT_TOKEN", pat)
+		if err := jr.mergeEnv(j.Paths.EnvFile, "", set); err != nil {
 			return err
 		}
 	}

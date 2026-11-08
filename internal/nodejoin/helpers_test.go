@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/cluster"
+	"github.com/aerol-ai/microvm/internal/config"
 )
 
 func init() { pollEvery = 5 * time.Millisecond }
@@ -167,6 +168,9 @@ type fakeJoinServer struct {
 	badMAC   bool
 	skew     time.Duration
 	joins    int
+	// patFree answers a worker or ingress join without the PAT, the way a
+	// server answers once every member takes cert-only calls.
+	patFree bool
 }
 
 type joinRefuseSpec struct {
@@ -339,6 +343,8 @@ func (f *fakeJoinServer) join(w http.ResponseWriter, r *http.Request) {
 	}
 	if role == cluster.JoinRoleServer {
 		resp.CAKey = string(f.ca.KeyPEM())
+	} else if f.patFree {
+		resp.PATToken, resp.PATSHA256, resp.OperatorVolumeScope = "", []string{config.PATSHA256(f.pat)}, "op-cluster"
 	}
 	_ = json.NewEncoder(w).Encode(resp)
 }
