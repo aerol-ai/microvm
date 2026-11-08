@@ -35,8 +35,10 @@ func pickDeletableWorker(t *testing.T, targets *harness.IntegrationTargets) harn
 }
 
 // internalCallFrom has node call a Raft server's internal mTLS listener
-// with its OWN certificate and token, as its sandboxd does, and returns the
-// status and body. It reads the drained set: a route every build serves.
+// the way its sandboxd does: with its OWN certificate, plus the PAT when the
+// node holds it (a node joined without the PAT has SB_PAT_TOKEN_SHA256 and
+// calls with its cert alone). It returns the status and body. It reads the
+// drained set: a route every build serves.
 func internalCallFrom(t *testing.T, node, server harness.IntegrationNode) (int, string, error) {
 	t.Helper()
 	target, ok := harness.SSHTarget(node)
@@ -45,9 +47,9 @@ func internalCallFrom(t *testing.T, node, server harness.IntegrationNode) (int, 
 	}
 	script := `sudo bash -c 'set -a; . /etc/sandboxd/sandboxd.env 2>/dev/null || true; . /etc/sandboxd/cluster.env; set +a; ` +
 		`base="${SB_CLUSTER_INTERNAL_ADVERTISE%/}"; hostport="${base#https://}"; port="${hostport##*:}"; ` +
+		`if [ -z "${SB_PAT_TOKEN_SHA256:-}" ]; then set -- -H "Authorization: Bearer $SB_PAT_TOKEN"; else set --; fi; ` +
 		`curl -sS -o /tmp/aerolvm-uc615.body -w "\nPROBE_CODE=%{http_code}\n" --max-time 20 ` +
-		`--resolve "aerolvm-cluster-node:$port:` + server.PrivateIP + `" ` +
-		`-H "Authorization: Bearer $SB_PAT_TOKEN" ` +
+		`--resolve "aerolvm-cluster-node:$port:` + server.PrivateIP + `" "$@" ` +
 		`--cert "$SB_CLUSTER_TLS_DIR/node.crt" --key "$SB_CLUSTER_TLS_DIR/node.key" --cacert "$SB_CLUSTER_TLS_DIR/ca.crt" ` +
 		`"https://aerolvm-cluster-node:$port/v1/cluster/internal/drained-nodes"; rc=$?; ` +
 		`echo; echo PROBE_BODY_START; head -c 2000 /tmp/aerolvm-uc615.body; echo; echo PROBE_BODY_END; printf "PROBE_RC=%s\n" "$rc"'`

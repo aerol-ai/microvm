@@ -1154,6 +1154,14 @@ var Registry = []UseCase{
 	{ID: "UC-685", Title: "A sandbox runs on the module-url cluster and answers exec", Requires: []Capability{CapModuleURL, CapCluster}, Implemented: true},
 	{ID: "UC-686", Title: "The module made one join token per role and the seed registered them: reusable worker and ingress tokens that never expire and a reusable server token that ends within 24 hours", Requires: []Capability{CapModuleURL, CapCluster}, Implemented: true},
 	{ID: "UC-687", Title: "The line aerolvm join-command prints, run on a blank machine, makes it one more worker under its host name, and aerolvm get nodes lists it Ready", Requires: []Capability{CapModuleURL, CapCluster}, Implemented: true},
+	// Worker and ingress nodes without the operator PAT
+	// (plans/kubectl-style-cluster-ops.md §8; pat_free_join_test.go). A
+	// one-line join gives them the PAT's hash, and they call their peers
+	// with their node certs alone.
+	{ID: "UC-690", Title: "A one-line worker and ingress node hold no operator PAT: their SB_PAT_TOKEN is a token of their own, cluster.env holds the PAT's SHA-256, and the PAT is in none of their /etc/sandboxd files, user data or bootstrap logs; every server holds the PAT and no hash", Requires: []Capability{CapOneLineJoin, CapCluster}, Implemented: true},
+	{ID: "UC-691", Title: "The join answer for a worker and an ingress token carries no pat_token and no CA key, only the PAT's SHA-256 and the operator volume scope", Requires: []Capability{CapOneLineJoin, CapCluster}, Implemented: true},
+	{ID: "UC-692", Title: "The old worker-token-to-CA-key path is refused end to end: a worker's cert alone is a live peer on a server's internal listener but is refused a server join token, the CA key and adopt; the worker's own token is refused by the server, by the load balancer and on the worker's own public API, and works only on the worker's loopback", Requires: []Capability{CapOneLineJoin, CapCluster}, Implemented: true},
+	{ID: "UC-693", Title: "A worker's own API still serves sandbox calls: with the operator PAT (checked by its hash) it creates a sandbox that answers exec, and reads and runs exec in one another node owns; the worker's own token on loopback reads a sandbox another node owns (the forward goes as the worker)", Requires: []Capability{CapOneLineJoin, CapCluster}, Implemented: true},
 	// Cluster rollouts, Phase 3b live gate and the Phase 3a cluster-side
 	// items (plans/kubectl-style-cluster-ops.md §6, §9; zz_rollout_test.go).
 	// Build B is this tree with another version stamp; the cases run in
