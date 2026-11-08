@@ -288,6 +288,7 @@ func TestConfigRenameDeleteViewImport(t *testing.T) {
 		{[]string{"config", "use-context", "ghost"}, exitError, `no context named "ghost"`},
 		{[]string{"config", "use-context"}, exitUsage, "one context name"},
 		{[]string{"config", "delete-context", "ghost"}, exitError, `no context named "ghost"`},
+		{[]string{"config", "delete-context"}, exitUsage, "delete-context takes one context name"},
 		{[]string{"config", "current-context", "extra"}, exitUsage, "takes no arguments"},
 		{[]string{"config", "get-contexts", "--nope"}, exitUsage, "nope"},
 		{[]string{"config", "view", "x"}, exitUsage, "takes no arguments"},

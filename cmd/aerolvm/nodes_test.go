@@ -758,3 +758,14 @@ func TestClusterReadsRetryTransientFailures(t *testing.T) {
 		t.Fatalf("a write was retried: code %d, calls %d -> %d", code, before, f.calls["POST /v1/cluster/nodes/wkr-1/cordon"])
 	}
 }
+
+// A drain that times out says how many sandboxes are left when it knows,
+// and only that some are when its last read failed.
+func TestDrainTimeoutMessage(t *testing.T) {
+	if got := drainTimeout("wkr-1", time.Minute, 3).Error(); !strings.Contains(got, "node wkr-1 still has 3 sandbox(es) after 1m0s") {
+		t.Fatalf("known count = %q", got)
+	}
+	if got := drainTimeout("wkr-1", time.Minute, -1).Error(); !strings.Contains(got, "node wkr-1 still has sandboxes after 1m0s") {
+		t.Fatalf("unknown count = %q", got)
+	}
+}
