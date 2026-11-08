@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -443,10 +444,28 @@ func TestAuditFileGenerationAndLargeBatchDrain(t *testing.T) {
 	svc := &Service{cfg: config.Config{DBPath: filepath.Join(t.TempDir(), "state.db")}}
 	svc.ensureSecretAuditSink()
 	t.Cleanup(svc.CloseSecretAuditSink)
-	for i := 0; i < secretAuditExportBatchMax+1; i++ {
-		if err := svc.secretAuditFile.EmitDurable(SecretAuditEvent{EventID: "batch-" + strconv.Itoa(i), SandboxID: "sb"}); err != nil {
-			t.Fatal(err)
-		}
+	// One durable append after another is one fsync each: 4,097 of them took
+	// 121 s on macOS, where fsync is a full flush to the disk. Callers that
+	// wait at the same time share the writer's group commit, so the file
+	// gets the same durable records in far fewer syncs. Only the count
+	// matters below, not the order.
+	const writers = 32
+	emitErrs := make(chan error, writers)
+	var wg sync.WaitGroup
+	for w := range writers {
+		wg.Go(func() {
+			for i := w; i < secretAuditExportBatchMax+1; i += writers {
+				if err := svc.secretAuditFile.EmitDurable(SecretAuditEvent{EventID: "batch-" + strconv.Itoa(i), SandboxID: "sb"}); err != nil {
+					emitErrs <- err
+					return
+				}
+			}
+		})
+	}
+	wg.Wait()
+	close(emitErrs)
+	for err := range emitErrs {
+		t.Fatal(err)
 	}
 	exporter := &maliciousOffsetExporter{}
 	setAuditExporter(svc, exporter)
