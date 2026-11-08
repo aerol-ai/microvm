@@ -114,7 +114,7 @@ Later commands (15 and up) cover platform volumes, audit cleanup, secret recipie
 
 Because every change is one Raft log entry, placement state ends up the same on every replica (copy of the FSM). On apply, `f.version = log.Index` makes the Raft log index the FSM version. That version survives Raft snapshots (compact saved copies of the state) and matches between leader and followers with no extra bookkeeping. An earlier in-process counter reset to zero on every cold restart and broke watchers; tying the version to `log.Index` fixed that.
 
-One caveat: apply also sets `now := time.Now().Unix()`. So timestamps such as `UpdatedUnix` and `OrphanedUnix` come from each server's own clock, and differ between leader and followers by milliseconds. Placement correctness does not need those fields to match byte for byte. It needs the keys and ownership fields to match, and they do.
+Apply never reads the server's own clock. It takes "now" from the time the leader stamped on the log entry (`raft.Log.AppendedAt`, read by `applyNow` in `fsm.go`). So timestamps such as `UpdatedUnix` and `OrphanedUnix`, and every time check apply makes (a reservation that has run out, a delete record past its keep time), come out the same on every server and on every replay of the log. Only an entry written before Raft stamped that time falls back to the local clock.
 
 Reads come from the local FSM copy. The leader is only on the write path.
 
@@ -536,7 +536,8 @@ flowchart TB
 ```
 
 - The rebuild is safe to repeat. A sandbox that already runs here is left as it is.
-- If no other node can take it, the sandbox stays here and the watcher keeps trying.
+- For that move, the leader picks the new node from the nodes' capacity reports, so it only picks a node that has room.
+- If this node failed because it has no room (its own admission check said no), and no other node has room either, the leader orphans the sandbox (410 Gone) instead of leaving it on a node that cannot run it. For any other failure, if no other node can take it, the sandbox stays here and the watcher keeps trying.
 
 **The old owner pauses its copy first.** "Dead" only means the leader cannot hear the node. A node cut off by a network split may still be running its sandboxes. So every worker keeps a lease on what it owns: each time the leader answers one of its placement reads (every 5 seconds by default), the lease is renewed. If half of `ClusterDeadOwnerGrace` (15 seconds by default) passes with no answer, the worker pauses each of its recreate-policy sandboxes in place (docker and containerd freeze them with the cgroup freezer) and refuses to start or serve them; API calls for them and their public HTTP port URLs get 503 with `Retry-After` (a paused process would take the connection and never answer). That happens well before the leader may hand them to another node. When the leader answers again, a sandbox whose placement still names this node resumes where it stopped; one that moved stays paused until the stale-ownership check removes it. Firecracker, WASM and isolate sandboxes cannot be paused in place yet: they are refused, but keep running. `ownership_lease.go` in `internal/service` holds the rule.
 
@@ -576,6 +577,7 @@ stateDiagram-v2
     Reserved --> [*] : create failed, timer ran out or owner died
     Placed --> Placed : owner died, recreate policy moves it with opReassign
     Placed --> Orphaned : owner died, no recreate policy
+    Placed --> Orphaned : recreate refused for room, no node has room
     Orphaned --> Placed : original owner returns, opClaimOrphan
     Orphaned --> [*] : operator deletes it
     Placed --> [*] : sandbox deleted
@@ -583,6 +585,20 @@ stateDiagram-v2
 
 - A reservation never turns into an orphan. When its owner dies, `opOrphanOwner` releases it in the same command.
 - Every change in the picture is written through Raft, so every server ends up with the same state.
+
+### What to watch
+
+Each server offers these counters at `GET /v1/metrics` (see [Dashboard](/dashboard/)):
+
+| Metric | What it tells you |
+|---|---|
+| `aerolvm_cluster_ownership_fenced_sandboxes` | Sandboxes this worker has paused because its lease ran out. Above 0 means the node cannot reach the leader, and those sandboxes answer 503 until it can. |
+| `aerolvm_cluster_stale_placement_read_rejects_total` | Placement questions a server refused because it lost touch with the leader. A count that keeps rising on one server means that server is cut off. |
+| `aerolvm_cluster_placement_feed_in_flux` | 1 while an ingress node treats every recreate-policy route as moving, because no server has answered its placement feed in time. |
+| `aerolvm_cluster_ownership_replay_unplaced_total` | Local copies with no placement that a returning server handled, by `outcome`: `destroyed_deleted` (deleted while it was away), `destroyed_unproven` (away longer than delete records are kept), `kept_grace_off` (`SB_AUDIT_DELETED_GRACE=0`, so there are no records to check) or `kept_no_incarnation`. Kept rows are logged. |
+| `aerolvm_cluster_ownership_replay_refused_total` | Times Raft refused to place a returning server's copy of a deleted sandbox. The server checks first, so this moves only when a delete races the return. |
+| `aerolvm_cluster_route_requests_total`, `aerolvm_cluster_route_lookups_total` | Calls for one sandbox that clients sent to this node, and the owner lookups the router made for them, by `hop` (`edge` is the node the client called, `owner` the node a forward reached). Summed over all nodes, lookups divided by requests is what one call costs the server tier. |
+| `aerolvm_cluster_owner_cache_hits_total`, `_misses_total`, `_retries_total`, `_not_owner_total`, `_entries` | The owner cache, when it is on: calls routed from an entry, calls with no usable entry, cached forwards the owner turned down that were routed again, cached forwards this node turned down, and entries held. |
 
 ## Keeping secrets out of the Raft log
 

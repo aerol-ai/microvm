@@ -1116,6 +1116,12 @@ restarts. For a 3-node cluster: never restart two at once.
 Re-run `install.sh` on each node in turn (rolling). The cluster overlay is
 preserved.
 
+Go one node at a time, as in a rolling restart, but finish every server node
+in the same session. Do not leave old and new servers running side by side
+for hours. When a release changes how the Raft state machine applies entries,
+an old and a new server can disagree on rare edge cases while both run. Such
+a release says "upgrade every server in one window" in its release notes.
+
 ### Taking a node out of cluster mode
 
 ```bash
