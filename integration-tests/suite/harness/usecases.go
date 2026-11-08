@@ -1100,6 +1100,9 @@ var Registry = []UseCase{
 
 	// Warm pool with env (plans/cluster-phase-2.md §2, L3).
 	{ID: "UC-483", Title: "Warm pool (L3): on the containerd engine a create that carries env is a warm hit (Server-Timing has containerd_pool and no containerd_create), its processes read the env, the env is still there after a stop and start, and a create that sets an SB_ key still starts cold", Requires: []Capability{CapContainerdPool}, Implemented: true},
+
+	// A paused sandbox on every public address (#1050).
+	{ID: "UC-484", Title: "Chaos (I7; C4): a worker cut off from the servers pauses its recreate-policy sandbox, and every public address of it answers within seconds: the toolbox URL and the HTTP port with 503, the raw TCP port by closing the connection; after the heal they answer as before (#1050)", Requires: []Capability{CapCluster, CapClusterChaos}, Implemented: true},
 }
 
 // byID is a lookup built once for the report generator.

@@ -49,7 +49,7 @@ pub use types::{
     CustomDomain,
     CustomDomainDnsRecords,
     CustomDomainStatus, DnsRecord, ExecExitInfo, ExecRequest, ExecResult, ExposeOptions, FileEvent,
-    ExposeProtocol, ExposeResult, ExposedPort, Failover, GPUOptions, GPUVendor, HealthStatus,
+    ExposePortInfo, ExposeProtocol, ExposeResult, ExposedPort, Failover, GPUOptions, GPUVendor, HealthStatus,
     IngressTarget, Lifecycle,
     MountSpec, MountSpecRedacted, MountType, NetworkUsage, PlacementRule, PlatformVolumeMount,
     TeamQuota, TeamQuotaOptions, TeamQuotaUsage,
@@ -1030,6 +1030,16 @@ impl Sandbox {
     /// pattern-match on it to read the variant-specific fields.
     pub fn expose_port(&self, port: u16, options: ExposeOptions) -> Result<ExposeResult, Error> {
         self.client.expose_port(&self.data.id, port, options)
+    }
+
+    /// Like [`Sandbox::expose_port`], but returns every field the server
+    /// reports, including the port's visibility. See [`ExposePortInfo`].
+    pub fn expose_port_info(
+        &self,
+        port: u16,
+        options: ExposeOptions,
+    ) -> Result<ExposePortInfo, Error> {
+        self.client.expose_port_info(&self.data.id, port, options)
     }
 
     pub fn unexpose_port(&self, port: u16) -> Result<(), Error> {
@@ -2412,6 +2422,62 @@ impl Client {
         port: u16,
         options: ExposeOptions,
     ) -> Result<ExposeResult, Error> {
+        let wire = self.expose_port_wire(id, port, options)?;
+        match wire.protocol.as_str() {
+            "tcp" => Ok(ExposeResult::Tcp {
+                url: wire.public_url,
+                host: wire.host.unwrap_or_default(),
+                host_port: wire.host_port.unwrap_or(0),
+            }),
+            "tls" => Ok(ExposeResult::Tls {
+                url: wire.public_url,
+            }),
+            "http" | "" => Ok(ExposeResult::Http {
+                url: wire.public_url,
+            }),
+            other => Err(Error::Client(format!("unknown expose protocol: {}", other))),
+        }
+    }
+
+    /// Like [`Client::expose_port`], but returns every field the server
+    /// reports, including the port's visibility, in one struct.
+    pub fn expose_port_info(
+        &self,
+        id: &str,
+        port: u16,
+        options: ExposeOptions,
+    ) -> Result<ExposePortInfo, Error> {
+        let wire = self.expose_port_wire(id, port, options)?;
+        let protocol = match wire.protocol.as_str() {
+            "tcp" => ExposeProtocol::Tcp,
+            "tls" => ExposeProtocol::Tls,
+            "http" | "" => ExposeProtocol::Http,
+            other => return Err(Error::Client(format!("unknown expose protocol: {}", other))),
+        };
+        // An unknown value is an error, not Public: reporting a gated port
+        // as open to everyone would be the wrong way to be lenient.
+        let visibility = match wire.visibility.as_deref() {
+            None | Some("") | Some("public") => ExposeVisibility::Public,
+            Some("token") => ExposeVisibility::Token,
+            Some(other) => {
+                return Err(Error::Client(format!("unknown port visibility: {}", other)))
+            }
+        };
+        Ok(ExposePortInfo {
+            protocol,
+            url: wire.public_url,
+            host: wire.host.filter(|h| !h.is_empty()),
+            host_port: wire.host_port.filter(|p| *p != 0),
+            visibility,
+        })
+    }
+
+    fn expose_port_wire(
+        &self,
+        id: &str,
+        port: u16,
+        options: ExposeOptions,
+    ) -> Result<ExposePortResponseWire, Error> {
         let protocol_str = match options.protocol {
             ExposeProtocol::Http => "http",
             ExposeProtocol::Tcp => "tcp",
@@ -2431,25 +2497,11 @@ impl Client {
         } else {
             Some(Value::Object(fields))
         };
-        let wire = self.do_json::<Value, ExposePortResponseWire>(
+        self.do_json::<Value, ExposePortResponseWire>(
             Method::POST,
             &format!("{}/sandboxes/{}/ports/{}", self.version_prefix(), id, port),
             body.as_ref(),
-        )?;
-        match wire.protocol.as_str() {
-            "tcp" => Ok(ExposeResult::Tcp {
-                url: wire.public_url,
-                host: wire.host.unwrap_or_default(),
-                host_port: wire.host_port.unwrap_or(0),
-            }),
-            "tls" => Ok(ExposeResult::Tls {
-                url: wire.public_url,
-            }),
-            "http" | "" => Ok(ExposeResult::Http {
-                url: wire.public_url,
-            }),
-            other => Err(Error::Client(format!("unknown expose protocol: {}", other))),
-        }
+        )
     }
 
     pub fn unexpose_port(&self, id: &str, port: u16) -> Result<(), Error> {
@@ -6273,6 +6325,110 @@ mod tests {
                 Some(body) => assert_eq!(request_json_body(&request), body),
                 None => assert!(request.ends_with("\r\n\r\n"), "unexpected body: {}", request),
             }
+        }
+    }
+
+    // expose_port_info reports what the server sent, visibility included,
+    // which ExposeResult has no field for.
+    #[test]
+    fn expose_port_info_reports_every_field() {
+        let cases: Vec<(&[u8], ExposePortInfo)> = vec![
+            (
+                br#"{"protocol":"http","public_url":"https://sb-1-3000.example.com","visibility":"token"}"#,
+                ExposePortInfo {
+                    protocol: ExposeProtocol::Http,
+                    url: "https://sb-1-3000.example.com".into(),
+                    host: None,
+                    host_port: None,
+                    visibility: ExposeVisibility::Token,
+                },
+            ),
+            (
+                // A public port: the server leaves visibility out.
+                br#"{"protocol":"http","public_url":"https://sb-1-3000.example.com"}"#,
+                ExposePortInfo {
+                    protocol: ExposeProtocol::Http,
+                    url: "https://sb-1-3000.example.com".into(),
+                    host: None,
+                    host_port: None,
+                    visibility: ExposeVisibility::Public,
+                },
+            ),
+            (
+                br#"{"protocol":"tcp","public_url":"tcp://example.com:40001","host":"example.com","host_port":40001}"#,
+                ExposePortInfo {
+                    protocol: ExposeProtocol::Tcp,
+                    url: "tcp://example.com:40001".into(),
+                    host: Some("example.com".into()),
+                    host_port: Some(40001),
+                    visibility: ExposeVisibility::Public,
+                },
+            ),
+            (
+                br#"{"protocol":"tls","public_url":"tls://sb-1-5432.example.com:443"}"#,
+                ExposePortInfo {
+                    protocol: ExposeProtocol::Tls,
+                    url: "tls://sb-1-5432.example.com:443".into(),
+                    host: None,
+                    host_port: None,
+                    visibility: ExposeVisibility::Public,
+                },
+            ),
+        ];
+        for (body, want) in cases {
+            let (url, request_rx) =
+                spawn_response_server("200 OK", "application/json", body.to_vec());
+            let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+            let got = client
+                .expose_port_info("sb-1", 3000, ExposeOptions::default())
+                .expect("expose_port_info should succeed");
+            assert_eq!(got, want);
+            let request = request_rx.recv().expect("request should be captured");
+            assert!(
+                request.starts_with("POST /v1/sandboxes/sb-1/ports/3000 "),
+                "request: {}",
+                request
+            );
+        }
+    }
+
+    // A value this SDK does not know is an error, never Public: reading a
+    // gated port as open to everyone is the unsafe mistake.
+    #[test]
+    fn expose_port_info_refuses_unknown_values() {
+        for (body, want) in [
+            (
+                br#"{"protocol":"http","public_url":"https://x","visibility":"team"}"#.as_slice(),
+                "unknown port visibility: team",
+            ),
+            (
+                br#"{"protocol":"udp","public_url":"udp://x"}"#.as_slice(),
+                "unknown expose protocol: udp",
+            ),
+        ] {
+            let (url, _request_rx) =
+                spawn_response_server("200 OK", "application/json", body.to_vec());
+            let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+            match client.expose_port_info("sb-1", 3000, ExposeOptions::token()) {
+                Err(Error::Client(msg)) => assert_eq!(msg, want),
+                other => panic!("want Error::Client({want}), got {other:?}"),
+            }
+        }
+    }
+
+    // expose_port is unchanged: same variants, and a visibility it cannot
+    // carry is ignored, so existing callers see no difference.
+    #[test]
+    fn expose_port_keeps_its_shape() {
+        let (url, _request_rx) = spawn_response_server(
+            "200 OK",
+            "application/json",
+            br#"{"protocol":"http","public_url":"https://sb-1-3000.example.com","visibility":"team"}"#.to_vec(),
+        );
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        match client.expose_port("sb-1", 3000, ExposeOptions::default()) {
+            Ok(ExposeResult::Http { url }) => assert_eq!(url, "https://sb-1-3000.example.com"),
+            other => panic!("unexpected: {other:?}"),
         }
     }
 

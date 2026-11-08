@@ -39,6 +39,7 @@ import (
 
 	"github.com/aerol-ai/microvm/integration-tests/suite/harness"
 	"github.com/aerol-ai/microvm/internal/failpoint"
+	"github.com/aerol-ai/microvm/pkg/models"
 )
 
 // UC-470 — partition an owner worker AND the ingress from the servers (and
@@ -1738,4 +1739,106 @@ func TestClusterChaosControlPlaneRecoveryTime(t *testing.T) {
 	if !inv.Violated("I4") {
 		inv.Hold("I4", "every worker within its CPU budget")
 	}
+}
+
+// UC-484 — a paused sandbox answers on every public address at once (#1050,
+// the follow-up to #1028). The owner worker is cut off from the servers only:
+// its ownership lease runs out and it pauses its recreate-policy sandbox,
+// while the other workers keep it alive in gossip, so the placement normally
+// stays put and the resume can be checked on the same node. The probes run
+// on the worker over SSH against its own Caddy, because the ingress (#1027)
+// would answer for a cut-off owner before a request ever reached it.
+//
+// I7: while paused, the toolbox URL and the HTTP port answer 503 within
+// seconds and the raw TCP port closes the connection (or refuses it) within
+// seconds. A hang (curl giving up, the TCP read timing out) or a live answer
+// is the violation. After the heal, if the placement did not move, every
+// address answers as before.
+func TestClusterChaosPausedSandboxAnswersEveryAddress(t *testing.T) {
+	harness.Require(t, sc, "UC-484")
+	requireDisruptive(t, "this cuts a worker off from the servers")
+	tp := chaosTopology(t)
+	inv := harness.TrackInvariants(t, "I7")
+	tag := chaosTag(t)
+	api := chaosAPI(t, tp.servers[len(tp.servers)-1])
+	ids := chaosNodeIDs(t, api, tp)
+
+	cpu, mem := chaosSmallSize()
+	id := chaosNewSandbox(t, operatorAPI(), chaosRequest(harness.UniqueName(sc, t), tag, true, cpu, mem,
+		"python:3.12-alpine", []string{"python3", "-c", chaosBannerServer}))
+	ownerID := chaosOwner(t, api, id)
+	owner, ok := chaosNodeByID(tp, ids, ownerID)
+	if !ok || owner.Role != "worker" {
+		t.Fatalf("owner %s of %s is not a worker", ownerID, id)
+	}
+	hc := chaosProbeClient()
+	chaosAwaitServed(t, hc, chaosExpose(t, operatorAPI(), id), 3*time.Minute)
+	resp := statusAs(t, operatorAPI(), http.MethodPost, "/v1/sandboxes/"+id+"/ports/9000", models.ExposePortRequest{Protocol: "tcp"})
+	var tcp models.ExposePortResponse
+	if resp.Status/100 != 2 || resp.JSON(&tcp) != nil || tcp.HostPort == 0 {
+		t.Fatalf("expose tcp 9000 on %s: %s", id, resp)
+	}
+	probe := chaosPausedProbeScript(id+"."+sc.Domain, fmt.Sprintf("%s-8080.%s", id, sc.Domain), tcp.HostPort)
+	target, _ := harness.SSHTarget(owner)
+	run := func() chaosAddressProbe {
+		out, err := harness.SSHRun(t, target, probe)
+		if err != nil {
+			t.Logf("probe on %s: %v %s", owner.Name, err, strings.TrimSpace(out))
+		}
+		return parseChaosAddressProbe(out)
+	}
+
+	var before chaosAddressProbe
+	for end := time.Now().Add(2 * time.Minute); time.Now().Before(end); time.Sleep(3 * time.Second) {
+		if before = run(); before.live() {
+			break
+		}
+	}
+	if !before.live() {
+		t.Fatalf("precondition: before the cut %s did not answer live on %s: %s", id, owner.Name, before)
+	}
+	t.Logf("before the cut, on %s: %s", owner.Name, before)
+
+	heal := chaosPartition(t, []harness.IntegrationNode{owner}, tp.servers, 4*time.Minute)
+	cut := time.Now()
+	var paused chaosAddressProbe
+	for time.Since(cut) < 75*time.Second {
+		if paused = run(); paused.toolbox.code == 503 && paused.port.code == 503 {
+			break
+		}
+		time.Sleep(2 * time.Second)
+	}
+	heal()
+	healedAt := time.Now()
+	t.Logf("paused (+%s after the cut), on %s: %s", healedAt.Sub(cut).Round(time.Second), owner.Name, paused)
+	switch {
+	case paused.port.code != 503:
+		t.Errorf("precondition: %s never paused within 75 s of the cut (its HTTP port answered %s), so nothing was exercised", id, paused.port)
+	default:
+		bad := paused.pausedProblems()
+		if len(bad) > 0 {
+			inv.Violate("I7", "while paused on %s: %s", owner.Name, strings.Join(bad, "; "))
+		} else {
+			inv.Hold("I7", "while paused on %s: toolbox %s, port %s, tcp %s", owner.Name, paused.toolbox, paused.port, paused.tcp)
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	pv, found, err := chaosPlacement(ctx, api, id)
+	cancel()
+	if err != nil || !found || pv.Owner.NodeID != ownerID {
+		t.Logf("the placement of %s moved during the cut (now %q, err %v); the resume on %s is not checked here (UC-470 and UC-479 cover a move)", id, pv.Owner.NodeID, err, owner.Name)
+		return
+	}
+	var after chaosAddressProbe
+	for end := time.Now().Add(90 * time.Second); time.Now().Before(end); time.Sleep(3 * time.Second) {
+		if after = run(); after.live() {
+			break
+		}
+	}
+	if !after.live() {
+		inv.Violate("I7", "%s after the heal %s still answers as paused on %s: %s", time.Since(healedAt).Round(time.Second), id, owner.Name, after)
+		return
+	}
+	t.Logf("after the heal (+%s), on %s: %s", time.Since(healedAt).Round(time.Second), owner.Name, after)
 }

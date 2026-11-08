@@ -1237,3 +1237,155 @@ func chaosCheckCreates(t *testing.T, inv *harness.Invariants, tp chaosTopo, api 
 	}
 	return out
 }
+
+// chaosBannerServer is chaosCopyServer plus a raw TCP listener on 9000 that
+// sends "banner=<copy id>" and closes, so a probe can tell a live TCP answer
+// from a closed connection and from a hang (UC-484).
+const chaosBannerServer = `import http.server, socket, threading, uuid
+cid = uuid.uuid4().hex
+open("/tmp/copy-id", "w").write(cid)
+def tcp():
+    s = socket.socket()
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind(("0.0.0.0", 9000))
+    s.listen(64)
+    while True:
+        c, _ = s.accept()
+        try:
+            c.sendall(("banner=" + cid + "\n").encode())
+        finally:
+            c.close()
+threading.Thread(target=tcp, daemon=True).start()
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        b = ("copy=" + cid + "\n").encode()
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(b)))
+        self.end_headers()
+        self.wfile.write(b)
+    def log_message(self, *a):
+        pass
+http.server.ThreadingHTTPServer(("0.0.0.0", 8080), H).serve_forever()
+`
+
+// chaosPausedProbeScript asks a node's own Caddy, over loopback, for the
+// toolbox URL and the HTTP port URL (curl gives up after 8 s) and reads the
+// raw TCP host port (timeout 6 s), printing one line each with the time
+// taken. A hang shows as code 000 or rc=124; a refused TCP connect is rc=1, a
+// connection closed with nothing read is rc=0 with no banner.
+func chaosPausedProbeScript(toolboxHost, portHost string, hostPort int) string {
+	return fmt.Sprintf(`probe() { curl -sk -o /dev/null -w '%%{http_code} %%{time_total}' --max-time 8 --resolve "$1:443:127.0.0.1" "https://$1/" 2>/dev/null || true; }
+echo "TOOLBOX $(probe %[1]s)"
+echo "PORT $(probe %[2]s)"
+s=$(date +%%s.%%N)
+out=$(timeout 6 bash -c 'exec 3<>/dev/tcp/127.0.0.1/%[3]d && cat <&3' 2>/dev/null)
+rc=$?
+e=$(date +%%s.%%N)
+echo "TCP rc=$rc secs=$(awk -v s="$s" -v e="$e" 'BEGIN{printf "%%.2f", e-s}') out=$(printf %%s "$out" | head -c 48 | tr -d '\n ')"
+`, toolboxHost, portHost, hostPort)
+}
+
+type chaosHTTPAnswer struct {
+	code int
+	secs float64
+}
+
+func (a chaosHTTPAnswer) String() string { return fmt.Sprintf("%d in %.2fs", a.code, a.secs) }
+
+type chaosTCPAnswer struct {
+	rc     int
+	secs   float64
+	banner bool
+}
+
+func (a chaosTCPAnswer) String() string {
+	what := "closed"
+	switch {
+	case a.banner:
+		what = "banner"
+	case a.rc == 124:
+		what = "hung"
+	case a.rc == 1:
+		what = "refused"
+	}
+	return fmt.Sprintf("%s (rc=%d) in %.2fs", what, a.rc, a.secs)
+}
+
+// chaosAddressProbe is one run of chaosPausedProbeScript.
+type chaosAddressProbe struct {
+	toolbox, port chaosHTTPAnswer
+	tcp           chaosTCPAnswer
+}
+
+func (p chaosAddressProbe) String() string {
+	return fmt.Sprintf("toolbox %s, port %s, tcp %s", p.toolbox, p.port, p.tcp)
+}
+
+// live: the toolbox URL answers with anything but 503 (toolboxd's own 401
+// counts), the HTTP port serves 200, and the TCP port sends the banner.
+func (p chaosAddressProbe) live() bool {
+	return p.toolbox.code != 0 && p.toolbox.code != 503 && p.port.code == 200 && p.tcp.banner
+}
+
+// chaosPausedAnswerBound: an answer slower than this is a hang, not a quick
+// refusal (curl gives up at 8 s, the TCP read at 6 s).
+const chaosPausedAnswerBound = 5.0
+
+// pausedProblems lists what is wrong with p for a paused sandbox: each HTTP
+// address must answer 503 within the bound, and the TCP port must close or
+// refuse within it, with no banner (a banner means it still reaches the
+// sandbox).
+func (p chaosAddressProbe) pausedProblems() []string {
+	var bad []string
+	for _, a := range []struct {
+		name string
+		ans  chaosHTTPAnswer
+	}{{"toolbox URL", p.toolbox}, {"HTTP port", p.port}} {
+		if a.ans.code != 503 || a.ans.secs >= chaosPausedAnswerBound {
+			bad = append(bad, fmt.Sprintf("%s answered %s, want 503 within %.0fs", a.name, a.ans, chaosPausedAnswerBound))
+		}
+	}
+	switch {
+	case p.tcp.banner:
+		bad = append(bad, "TCP port still reached the sandbox: "+p.tcp.String())
+	case p.tcp.rc == 124 || p.tcp.secs >= chaosPausedAnswerBound:
+		bad = append(bad, "TCP port hung: "+p.tcp.String())
+	}
+	return bad
+}
+
+func parseChaosAddressProbe(out string) chaosAddressProbe {
+	var p chaosAddressProbe
+	for _, line := range strings.Split(out, "\n") {
+		f := strings.Fields(line)
+		if len(f) == 0 {
+			continue
+		}
+		switch f[0] {
+		case "TOOLBOX", "PORT":
+			var a chaosHTTPAnswer
+			if len(f) >= 3 {
+				a.code, _ = strconv.Atoi(f[1])
+				a.secs, _ = strconv.ParseFloat(f[2], 64)
+			}
+			if f[0] == "TOOLBOX" {
+				p.toolbox = a
+			} else {
+				p.port = a
+			}
+		case "TCP":
+			for _, kv := range f[1:] {
+				k, v, _ := strings.Cut(kv, "=")
+				switch k {
+				case "rc":
+					p.tcp.rc, _ = strconv.Atoi(v)
+				case "secs":
+					p.tcp.secs, _ = strconv.ParseFloat(v, 64)
+				case "out":
+					p.tcp.banner = strings.HasPrefix(v, "banner=")
+				}
+			}
+		}
+	}
+	return p
+}

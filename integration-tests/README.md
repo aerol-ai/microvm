@@ -390,6 +390,7 @@ plan's fixes C2..C7 land; each test's doc comment in
 | UC-480 | Worker's sandboxd SIGKILLed while a failpoint parks a create between the runtime start and the store write | I8, I6 | release gate |
 | UC-481 | sandboxd SIGKILLed on every server at once (or the leader); control-plane recovery time measured | I6, I8, I4 | release gate |
 | UC-482 | Soak: closed-loop create, probe, delete for 15 min, every node sampled | I6 | release gate |
+| UC-484 | Owner worker cut off from the servers only; its paused sandbox's toolbox URL, HTTP port and raw TCP port probed on the worker | I7 | C4 (#1050) |
 
 UC-480..482 are the release-gate tools of `plans/cluster-phase-2.md` §5,
 run as short smoke runs in this scenario:
