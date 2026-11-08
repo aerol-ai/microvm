@@ -248,10 +248,16 @@ func newTestCluster(t *testing.T, nodeID string, bootstrap bool, gossipPeers []s
 // run concurrently after New returns (two-node tests).
 func newTestClusterWithAPI(t *testing.T, nodeID string, bootstrap bool, gossipPeers []string, apiURL string) (*Cluster, func()) {
 	t.Helper()
-	testClusterMu.Lock()
-	dir := t.TempDir()
+	return newTestClusterFromConfig(t, testClusterConfig(t, nodeID, bootstrap, gossipPeers, apiURL, t.TempDir()))
+}
 
-	cfg := config.Config{
+// testClusterConfig is the config every harness cluster starts from: all
+// listeners on loopback with OS-chosen ports, Raft state under dir/raft.
+// Callers that must come back as the same Raft server after a restart (the
+// fault harness) pin the ports and reuse dir.
+func testClusterConfig(t *testing.T, nodeID string, bootstrap bool, gossipPeers []string, apiURL, dir string) config.Config {
+	t.Helper()
+	return config.Config{
 		EnableCluster:                 true,
 		NodeID:                        nodeID,
 		RaftBindAddr:                  "127.0.0.1:0",
@@ -267,7 +273,14 @@ func newTestClusterWithAPI(t *testing.T, nodeID string, bootstrap bool, gossipPe
 		ClusterTLSDir:                 writeTestClusterTLSDir(t, nodeID),
 		ClusterInternalListenAddr:     "127.0.0.1:0",
 	}
+}
 
+// newTestClusterFromConfig starts a real *Cluster from cfg and returns it
+// with a cleanup that closes it.
+func newTestClusterFromConfig(t *testing.T, cfg config.Config) (*Cluster, func()) {
+	t.Helper()
+	nodeID := cfg.NodeID
+	testClusterMu.Lock()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	c, err := New(cfg, logger, nil)
 	testClusterMu.Unlock()
