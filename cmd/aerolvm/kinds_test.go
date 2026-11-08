@@ -674,3 +674,24 @@ func TestSelectorParse(t *testing.T) {
 		t.Fatal("an empty selector matches everything and filters nothing")
 	}
 }
+
+// get and describe on snapshots and tokens refuse an output they can't
+// print, and describe needs exactly one name.
+func TestSnapshotAndTokenKindUsage(t *testing.T) {
+	h, f := newKindsHarness(t)
+	kindsFixture(h, f)
+	for _, args := range [][]string{
+		{"get", "snapshots", "-o", "jsonpath={.name}"},
+		{"describe", "snapshot"},
+		{"describe", "snapshot", "snap-a", "snap-b"},
+		{"describe", "snapshot", "snap-a", "-o", "wide"},
+		{"get", "tokens", "-o", "jsonpath={.id}"},
+		{"describe", "token"},
+		{"describe", "token", "a", "b"},
+		{"describe", "token", "a", "-o", "wide"},
+	} {
+		if code := h.run(args...); code != exitUsage {
+			t.Errorf("%v = %d, want usage (stderr %q)", args, code, h.stderr.String())
+		}
+	}
+}
