@@ -64,6 +64,10 @@ type Result struct {
 	// A pass row carries them too: "held, over 61 samples" is the evidence
 	// that the case injected its fault, which a bare pass does not show.
 	Invariants []harness.InvariantResult `json:"invariants,omitempty"`
+	// Detail is what the case measured (harness.ReportDetail), whatever its
+	// verdict: UC-171's latency is read across the passing flag-on runs and
+	// the failing flag-off runs of the routing A/B alike.
+	Detail string `json:"detail,omitempty"`
 }
 
 // Report is the serialized per-scenario artifact.
@@ -135,6 +139,7 @@ func classify(events []testEvent, reg []harness.UseCase, forceInconclusive bool)
 	testToUC := map[string][]string{}
 	testOut := map[string][]string{}
 	testInv := map[string][]harness.InvariantResult{}
+	testDetail := map[string][]string{}
 	for _, ev := range events {
 		if ev.Action != "output" || ev.Test == "" {
 			continue
@@ -146,6 +151,10 @@ func classify(events []testEvent, reg []harness.UseCase, forceInconclusive bool)
 		if inv, ok := harness.ParseInvariantMarker(ev.Output); ok {
 			testInv[ev.Test] = append(testInv[ev.Test], inv)
 			continue // nor is an invariant verdict; it has its own field
+		}
+		if d, ok := harness.ParseDetailMarker(ev.Output); ok {
+			testDetail[ev.Test] = append(testDetail[ev.Test], d)
+			continue // nor a measurement
 		}
 		if line := meaningfulLine(ev.Output); line != "" {
 			testOut[ev.Test] = append(testOut[ev.Test], line)
@@ -159,6 +168,7 @@ func classify(events []testEvent, reg []harness.UseCase, forceInconclusive bool)
 		st     Status
 		reason string
 		invs   []harness.InvariantResult
+		detail string
 	}
 	got := map[string]outcome{}
 	for _, ev := range events {
@@ -179,7 +189,7 @@ func classify(events []testEvent, reg []harness.UseCase, forceInconclusive bool)
 			if prev, ok := got[id]; ok && prev.st == StatusFail {
 				continue // fail is sticky
 			}
-			got[id] = outcome{st: st, reason: reason, invs: testInv[ev.Test]}
+			got[id] = outcome{st: st, reason: reason, invs: testInv[ev.Test], detail: strings.Join(testDetail[ev.Test], "; ")}
 		}
 	}
 
@@ -196,6 +206,7 @@ func classify(events []testEvent, reg []harness.UseCase, forceInconclusive bool)
 				r.Status = o.st
 				r.Reason = o.reason
 				r.Invariants = o.invs
+				r.Detail = o.detail
 			} else {
 				// Implemented but produced no terminal event — surface as
 				// missing (counts against the run) rather than silently green.
@@ -262,17 +273,19 @@ func invariantSummary(invs []harness.InvariantResult) string {
 
 // detailCell is a row's Detail column: its invariant verdicts first (they
 // are the point of a chaos row, and the length cap must not cut them off),
-// then the reason.
+// then what the case measured, then the reason.
 func detailCell(r Result) string {
-	inv := invariantSummary(r.Invariants)
-	switch {
-	case inv == "":
-		return r.Reason
-	case r.Reason == "":
-		return inv
-	default:
-		return inv + " — " + r.Reason
+	var parts []string
+	if inv := invariantSummary(r.Invariants); inv != "" {
+		parts = append(parts, inv)
 	}
+	if r.Detail != "" {
+		parts = append(parts, r.Detail)
+	}
+	if r.Reason != "" {
+		parts = append(parts, r.Reason)
+	}
+	return strings.Join(parts, " — ")
 }
 
 // appendUnique adds id to ids if not already present (markers can repeat).

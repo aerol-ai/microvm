@@ -50,10 +50,17 @@ type routingTarget struct {
 	sb      *microvm.Sandbox
 	httpURL string
 	tcpAddr string
+	// exposeToFirst200 runs from the http expose call to the first 200 on
+	// the public URL. It is the user-visible cost of a route change: with
+	// per-sandbox routes it includes a Caddy write and reload, with the
+	// routing flag only an index update.
+	exposeToFirst200 time.Duration
 }
 
 // newRoutingTarget starts the echo sandbox, exposes 8080 (http) and 9000
-// (tcp), and waits until both answer through the ingress.
+// (tcp), and waits until both answer through the ingress. The http port is
+// exposed and polled to its first 200 before the tcp expose, so the tcp
+// expose (a second Caddy write with the flag off) is not in the measurement.
 func newRoutingTarget(t *testing.T, c *harness.Client) routingTarget {
 	t.Helper()
 	sb := c.NewSandbox(t, sdktypes.CreateSandboxOptions{
@@ -64,21 +71,26 @@ func newRoutingTarget(t *testing.T, c *harness.Client) routingTarget {
 	waitRunning(t, sb)
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
+	exposeStart := time.Now()
 	hp, err := sb.ExposePort(ctx, 8080)
 	if err != nil {
 		t.Fatalf("expose http: %v", err)
 	}
+	if hp.PublicURL == "" {
+		t.Fatalf("http exposure has no public URL: %+v", hp)
+	}
+	if err := waitFirst200(hp.PublicURL, 2*time.Minute); err != nil {
+		t.Fatalf("http %s never served 200: %v", hp.PublicURL, err)
+	}
+	firstOK := time.Since(exposeStart)
 	tp, err := sb.ExposePort(ctx, 9000, microvm.WithProtocol("tcp"))
 	if err != nil {
 		t.Fatalf("expose tcp: %v", err)
 	}
-	if hp.PublicURL == "" || tp.Host == "" || tp.HostPort == 0 {
-		t.Fatalf("exposures missing endpoints: http=%+v tcp=%+v", hp, tp)
+	if tp.Host == "" || tp.HostPort == 0 {
+		t.Fatalf("tcp exposure missing its endpoint: %+v", tp)
 	}
-	target := routingTarget{sb: sb, httpURL: hp.PublicURL, tcpAddr: net.JoinHostPort(tp.Host, fmt.Sprint(tp.HostPort))}
-	if code, err := reachableHTTP(target.httpURL, 2*time.Minute); err != nil || code != http.StatusOK {
-		t.Fatalf("http %s never served 200 (code %d): %v", target.httpURL, code, err)
-	}
+	target := routingTarget{sb: sb, httpURL: hp.PublicURL, tcpAddr: net.JoinHostPort(tp.Host, fmt.Sprint(tp.HostPort)), exposeToFirst200: firstOK}
 	deadline := time.Now().Add(2 * time.Minute)
 	for {
 		err := tcpEchoOnce(target.tcpAddr)
@@ -91,6 +103,35 @@ func newRoutingTarget(t *testing.T, c *harness.Client) routingTarget {
 		time.Sleep(3 * time.Second)
 	}
 	return target
+}
+
+// waitFirst200 polls url until it answers 200, each attempt on a FRESH
+// connection, and returns nil at the first 200. A fresh connection per
+// attempt matters for the measurement: the ingress picks a connection's
+// target once, at its TLS handshake, so a connection opened before the
+// route existed would keep answering from the fallback. The poll interval
+// is short because the gap it measures is tens of milliseconds with the
+// routing flag on; reachableHTTP's 3 s sleep would swamp it.
+func waitFirst200(url string, timeout time.Duration) error {
+	c := &http.Client{Timeout: 10 * time.Second, Transport: &http.Transport{DisableKeepAlives: true}}
+	deadline := time.Now().Add(timeout)
+	var last string
+	for {
+		resp, err := c.Get(url)
+		if err == nil {
+			resp.Body.Close()
+			if resp.StatusCode == http.StatusOK {
+				return nil
+			}
+			last = fmt.Sprintf("status %d", resp.StatusCode)
+		} else {
+			last = err.Error()
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("no 200 within %s (last: %s)", timeout, last)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
 }
 
 // tcpEchoOnce opens a FRESH connection, round-trips one line, and closes.
@@ -164,6 +205,11 @@ func (f *failureTally) summary() string {
 // created, exposed (http + tcp) and destroyed. With per-sandbox Caddy routes,
 // every churn step reloaded Caddy and ~2.6% of new connections dropped. With
 // routing through the responder and kernel DNAT, the target is 0.
+//
+// It also records the latency the routing A/B compares (plans/
+// cluster-phase-2.md §4.2): expose to first 200, and p50/p99 of the
+// successful fresh-connection probes. They go to the log, the report row
+// and <reports>/<scenario>-bank.json; the pass rule is still 0 failures.
 func TestIngressRoutingChurnGate(t *testing.T) {
 	harness.Require(t, sc, "UC-171")
 	c := client(t)
@@ -176,18 +222,25 @@ func TestIngressRoutingChurnGate(t *testing.T) {
 		Transport: &http.Transport{DisableKeepAlives: true}, // a new connection per request
 	}
 	var httpT, tcpT failureTally
+	// Only successful probes are timed: a failure is counted above, and its
+	// duration (a timeout, an instant reset) says nothing about the path.
+	var httpLat, tcpLat harness.Latencies
 	var wg sync.WaitGroup
 	for i := 0; i < 6; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			for time.Now().Before(stop) {
+				start := time.Now()
 				resp, err := httpClient.Get(target.httpURL)
 				if err == nil {
 					resp.Body.Close()
 					if resp.StatusCode != http.StatusOK {
 						err = fmt.Errorf("status %d", resp.StatusCode)
 					}
+				}
+				if err == nil {
+					httpLat.Add(time.Since(start))
 				}
 				httpT.record(err)
 			}
@@ -198,7 +251,12 @@ func TestIngressRoutingChurnGate(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for time.Now().Before(stop) {
-				tcpT.record(tcpEchoOnce(target.tcpAddr))
+				start := time.Now()
+				err := tcpEchoOnce(target.tcpAddr)
+				if err == nil {
+					tcpLat.Add(time.Since(start))
+				}
+				tcpT.record(err)
 			}
 		}()
 	}
@@ -235,6 +293,22 @@ func TestIngressRoutingChurnGate(t *testing.T) {
 
 	t.Logf("churn gate: %d churn cycles (%d errors); http %d ok / %d failed; tcp %d ok / %d failed",
 		churnOps, churnErrs, httpT.ok.Load(), httpT.bad.Load(), tcpT.ok.Load(), tcpT.bad.Load())
+	httpSum, tcpSum := httpLat.Summary(), tcpLat.Summary()
+	t.Logf("churn gate latency: expose to first 200 %dms; fresh http %s; fresh tcp %s",
+		target.exposeToFirst200.Milliseconds(), httpSum, tcpSum)
+	// Before the assertions, so the flag-off arm of the A/B, which is
+	// expected to drop connections and fail, still reports its numbers.
+	harness.ReportDetail(t, "expose-to-200 %dms; http %s, %d failed; tcp %s, %d failed; %d churn cycles",
+		target.exposeToFirst200.Milliseconds(), httpSum, httpT.bad.Load(), tcpSum, tcpT.bad.Load(), churnOps)
+	bankRecord(t, "ingress_routing_churn_gate", map[string]any{
+		"window_s":               window.Seconds(),
+		"churn_cycles":           churnOps,
+		"churn_errors":           churnErrs,
+		"expose_to_first_200_ms": target.exposeToFirst200.Milliseconds(),
+		"http":                   map[string]any{"ok": httpT.ok.Load(), "failed": httpT.bad.Load(), "latency": httpSum},
+		"tcp":                    map[string]any{"ok": tcpT.ok.Load(), "failed": tcpT.bad.Load(), "latency": tcpSum},
+		"measured_at":            time.Now().UTC().Format(time.RFC3339),
+	})
 	if churnOps < 3 {
 		t.Fatalf("only %d churn cycles in %s: the gate measured no churn", churnOps, window)
 	}
