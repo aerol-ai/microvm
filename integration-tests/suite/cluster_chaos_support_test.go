@@ -747,7 +747,7 @@ func chaosKillLeader(t *testing.T, tp chaosTopo, ids map[string]string, leaderID
 // rejoin before starting the second would wait forever.
 func chaosStopVoters(t *testing.T, nodes []harness.IntegrationNode) func() {
 	t.Helper()
-	return chaosDownVoters(t, nodes, "sudo systemctl stop sandboxd", "stop")
+	return chaosDownVoters(t, nodes, false)
 }
 
 // chaosKillVoters SIGKILLs sandboxd on several servers at once
@@ -756,13 +756,21 @@ func chaosStopVoters(t *testing.T, nodes []harness.IntegrationNode) func() {
 // a unit already back, and which waits for every node to rejoin.
 func chaosKillVoters(t *testing.T, nodes []harness.IntegrationNode) func() {
 	t.Helper()
-	return chaosDownVoters(t, nodes, harness.KillSandboxdScript, "SIGKILL")
+	return chaosDownVoters(t, nodes, true)
 }
 
-// chaosDownVoters runs down on every node in parallel, so they go down
-// together, and returns the shared restore.
-func chaosDownVoters(t *testing.T, nodes []harness.IntegrationNode, down, verb string) func() {
+// chaosDownVoters takes sandboxd down on every node in parallel, so they go
+// down together (a stop, or a SIGKILL when kill is set), and returns the
+// shared restore. The down command lives here, beside the rejoin wait and
+// the seed handling, so restart_node_test.go's guards, which read one
+// function at a time, see all three in the function that takes the daemon
+// down.
+func chaosDownVoters(t *testing.T, nodes []harness.IntegrationNode, kill bool) func() {
 	t.Helper()
+	down, verb := "sudo systemctl stop sandboxd", "stop"
+	if kill {
+		down, verb = harness.KillSandboxdScript, "SIGKILL"
+	}
 	for _, n := range nodes {
 		if n.Seed {
 			t.Logf("%s on the seed %s on purpose (UC-170 proves it rejoins)", verb, n.Name)

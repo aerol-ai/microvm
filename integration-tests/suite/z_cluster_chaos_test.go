@@ -1429,6 +1429,9 @@ func TestClusterChaosCrashBeforeCreatePersists(t *testing.T) {
 	}
 	t.Logf("the parked create is %v on %s", crashed, victim.Name)
 
+	// The victim is a worker and the seed is a server, so this never skips;
+	// it states the choice for restart_node_test.go's seed guard.
+	requireNonSeedVictim(t, victim)
 	target, _ := harness.SSHTarget(victim)
 	var once sync.Once
 	restore := func() { once.Do(func() { restoreNodeDaemon(t, victim, target) }) }
