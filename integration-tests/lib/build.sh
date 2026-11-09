@@ -869,6 +869,90 @@ cmd_build_id() {
 }
 
 ###############################################################################
+# stage: files for a test node, through S3 (never scp from this machine)
+###############################################################################
+
+# A test node gets a file from this machine through S3, not over scp. One scp
+# is one TCP stream over this laptop's uplink: 10-170 KB/s to us-east-1, so
+# the adopt gate's 129 MB build took 20+ minutes per node, every node, and
+# slowed every other session's uploads meanwhile. An S3 upload runs many
+# connections at once (~1.4 MB/s from the same laptop) and happens once, and
+# a published build is already there, so it often costs nothing; each node
+# then downloads inside AWS in seconds. lib/stage.sh's stage_to_node is the
+# caller; scripts/stage-to-node.sh is the same thing for a person or agent.
+
+STAGE_TTL_SECONDS=3600 # a staged file is fetched within minutes
+
+# stage_build_key echoes builds/<id>/<name> when file sits directly in a
+# build folder (integration-tests/.build/<id>/), where publish puts the same
+# bytes, and nothing otherwise.
+stage_build_key() {
+  local f="$1" dir root
+  dir="$(cd "$(dirname "$f")" 2>/dev/null && pwd -P)" || return 0
+  root="$(cd "$BUILD_ROOT" 2>/dev/null && pwd -P)" || return 0
+  [[ "$(dirname "$dir")" == "$root" ]] || return 0
+  printf 'builds/%s/%s' "$(basename "$dir")" "$(basename "$f")"
+}
+
+# stage_content_key is where a file that is not in a published build goes:
+# keyed by its SHA-256, so the same bytes are uploaded once however many
+# nodes or runs ask for them. Under builds/, so the 7-day expiry covers it.
+stage_content_key() {
+  printf 'builds/stage/%s/%s' "$1" "$(basename "$2")"
+}
+
+# stage_file_mode keeps the one permission bit scp used to carry over.
+stage_file_mode() {
+  if [[ -x "$1" ]]; then echo 0755; else echo 0644; fi
+}
+
+# cmd_stage puts each file where a node can fetch it and prints one line per
+# file on stdout: "<sha256> <mode> <name> <presigned GET url>". It uploads
+# only what the bucket lacks. The node checks the SHA-256 of what it fetched
+# against this machine's copy (stage_remote_script), so reusing a published
+# object can never hand a node other bytes than the ones named here.
+cmd_stage() {
+  local files=() ttl
+  TTL_SECONDS="$STAGE_TTL_SECONDS"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --ttl) ttl="$(parse_ttl "${2:?--ttl needs a duration}")" || exit 1; TTL_SECONDS="$ttl"; shift 2 ;;
+      --)    shift; files+=("$@"); break ;;
+      -*)    die "stage: unknown flag: $1" ;;
+      *)     files+=("$1"); shift ;;
+    esac
+  done
+  [[ ${#files[@]} -gt 0 ]] || die "stage: no files given"
+  local f
+  for f in "${files[@]}"; do
+    [[ -f "$f" ]] || die "stage: ${f} is not a file"
+  done
+
+  resolve_aws
+  local region="$AWS_REGION_RESOLVED" bucket="$ARTIFACT_BUCKET"
+  local sha size key remote_size
+  for f in "${files[@]}"; do
+    sha="$(sha256_stdin <"$f")"
+    size="$(wc -c <"$f" | tr -d '[:space:]')"
+    key="$(stage_build_key "$f")"
+    if [[ -n "$key" ]]; then
+      remote_size="$("${AWSCLI[@]}" --region "$region" s3api head-object --bucket "$bucket" --key "$key" \
+        --query ContentLength --output text 2>/dev/null || true)"
+      [[ "$remote_size" == "$size" ]] || key=""
+    fi
+    if [[ -z "$key" ]]; then
+      key="$(stage_content_key "$sha" "$f")"
+      if ! "${AWSCLI[@]}" --region "$region" s3api head-object --bucket "$bucket" --key "$key" >/dev/null 2>&1; then
+        log "stage: uploading $(basename "$f") ($((size / 1048576)) MB) to s3://${bucket}/${key}"
+        "${AWSCLI[@]}" --region "$region" s3 cp --only-show-errors "$f" "s3://${bucket}/${key}" >&2 \
+          || die "stage: upload of ${f} failed"
+      fi
+    fi
+    printf '%s %s %s %s\n' "$sha" "$(stage_file_mode "$f")" "$(basename "$f")" "$(presign "$bucket" "$region" "$key")"
+  done
+}
+
+###############################################################################
 
 main() {
   local cmd="${1:-}"
@@ -878,6 +962,7 @@ main() {
     publish)        cmd_publish "$@" ;;
     urls)           cmd_urls "$@" ;;
     build-id)       cmd_build_id "$@" ;;
+    stage)          cmd_stage "$@" ;;
     artifacts-init) cmd_artifacts_init ;;
     *)
       cat >&2 <<'USAGE'
@@ -891,6 +976,10 @@ usage: build.sh <command> [flags]
           Re-presign an already-published build (stdout = tfvars).
   build-id [--ref <commit>]
           Print AEROL_BUILD_ID only.
+  stage   [--ttl 1h] <file>...
+          Put local files in S3 for a test node (reusing a published build's
+          copy) and print "<sha256> <mode> <name> <url>" per file. Use
+          lib/stage.sh's stage_to_node, not this, to move files to a node.
   artifacts-init
           One-time per-account artifacts bucket bootstrap.
 USAGE

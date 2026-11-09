@@ -14,6 +14,11 @@
 SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
   -o ConnectTimeout=10 -o BatchMode=yes -o LogLevel=ERROR)
 
+# stage_to_node: every file this machine hands a node goes through S3, never
+# scp (lib/stage.sh says why). Sourced here so every harness script has it.
+# shellcheck source=stage.sh
+source "$(dirname "${BASH_SOURCE[0]}")/stage.sh"
+
 # resolve_ssh_identity picks the private key the deployment's nodes actually
 # trust and wires it into SSH_OPTS, so every harness SSH call gets it — not
 # just the test suite.
@@ -334,8 +339,9 @@ stage_wasm_modules() {
       if ! ssh "${SSH_OPTS[@]}" "$tgt" \
              "curl -fsSL --retry 3 --max-time 300 -o '/tmp/${alias}.wasm' '${ref}' \
               && echo '${digest#sha256:}  /tmp/${alias}.wasm' | sha256sum -c --quiet -"; then
-        echo "stage_wasm: ${tgt} could not download ${alias}; copying the local fixture" >&2
-        if ! scp "${SSH_OPTS[@]}" "$file" "${tgt}:/tmp/${alias}.wasm"; then
+        echo "stage_wasm: ${tgt} could not download ${alias}; staging the local fixture through S3" >&2
+        if ! stage_to_node "$tgt" /tmp/aerol-wasm-stage "$file" ||
+           ! ssh "${SSH_OPTS[@]}" "$tgt" "mv -f '/tmp/aerol-wasm-stage/$(basename "$file")' '/tmp/${alias}.wasm'"; then
           echo "stage_wasm: staging ${alias} on ${tgt} failed" >&2
           return 1
         fi
