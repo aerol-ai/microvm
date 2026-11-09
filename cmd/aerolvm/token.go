@@ -247,6 +247,11 @@ func (a *app) callAPI(ctx context.Context, c *commonFlags, conn connection, meth
 		if s, err := strconv.Atoi(resp.Header.Get("Retry-After")); err == nil && s > 0 {
 			apiErr.RetryAfter = time.Duration(s) * time.Second
 		}
+		if membershipPending(resp.StatusCode, raw) {
+			// As main's PR #1074 answers it for forwarded writes: unavailable
+			// for a moment, not a refusal of the caller.
+			apiErr.StatusCode, apiErr.Code, apiErr.Message, apiErr.RetryAfter = http.StatusServiceUnavailable, "unavailable", membershipPendingMessage, time.Second
+		}
 		return &apiRefusal{APIError: apiErr, body: e}
 	}
 	if out == nil || resp.StatusCode == http.StatusNoContent {

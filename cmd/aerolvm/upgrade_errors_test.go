@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -231,5 +232,37 @@ func TestFromDirRefusesAFileOverTheUploadLimit(t *testing.T) {
 func TestHumanBytesMiB(t *testing.T) {
 	if got := humanBytes(3 << 20); got != "3.0 MiB" {
 		t.Fatal(got)
+	}
+}
+
+// A leader that just restarted answers a forwarded call with a plain-text
+// 403 "cluster peer not in membership" until gossip catches up (live UC-667
+// on the final kops tip, 2026-11-09). The call never ran: it is a short
+// outage, not a refusal of the caller, so --wait rides it out. Any other
+// 403 stays final.
+func TestUpgradeWaitRidesOutMembershipLag(t *testing.T) {
+	err := upgradeRefusal(http.StatusForbidden, []byte("cluster peer not in membership\n"))
+	var e *agenttools.Error
+	if !errors.As(err, &e) || !e.Retryable || e.Code != agenttools.CodeUnavailable || !transient(err) {
+		t.Fatalf("membership 403 = %#v", err)
+	}
+	if err := upgradeRefusal(http.StatusForbidden, []byte(`{"error":"forbidden","reason":"operator authorization required"}`)); transient(err) {
+		t.Fatalf("an authorization 403 was transient: %v", err)
+	}
+
+	old := clusterReadRetryDelays
+	clusterReadRetryDelays = []time.Duration{time.Millisecond, time.Millisecond, time.Millisecond}
+	t.Cleanup(func() { clusterReadRetryDelays = old })
+	f := newFakeUpgrade(t, true, "v0.6.12")
+	stdFleet(f, "v0.6.12")
+	h := upgradeHarness(t, f)
+	dir, _ := distDir(t, "v0.6.13", true)
+	f.advance = true
+	f.membershipRolloutGets = 2 * (len(clusterReadRetryDelays) + 1)
+	if code := h.run("upgrade", "apply", "v0.6.13", "--from", dir, "--wait"); code != exitOK {
+		t.Fatalf("apply --wait = %d %s", code, h.stderr.String())
+	}
+	if f.membershipRolloutGets != 0 || f.rollout.State != upgradewire.StateFinalized {
+		t.Fatalf("left %d refused reads, rollout %s", f.membershipRolloutGets, f.rollout.State)
 	}
 }

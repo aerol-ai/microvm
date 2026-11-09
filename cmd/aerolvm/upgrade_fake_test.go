@@ -174,9 +174,13 @@ type fakeUpgrade struct {
 	// failRolloutGets answers this many reads of a rollout 503, as the
 	// API does while a server restarts.
 	failRolloutGets int
-	applyReqs       []upgradewire.ApplyRequest
-	manual          map[string]bool
-	nextID          int
+	// membershipRolloutGets answers this many reads of a rollout with the
+	// leader's plain-text 403 "cluster peer not in membership", as a
+	// leader that just restarted does until gossip catches up.
+	membershipRolloutGets int
+	applyReqs             []upgradewire.ApplyRequest
+	manual                map[string]bool
+	nextID                int
 }
 
 func newFakeUpgrade(t *testing.T, cluster bool, running string) *fakeUpgrade {
@@ -483,6 +487,11 @@ func (f *fakeUpgrade) serveRollout(w http.ResponseWriter, r *http.Request, path 
 		if f.failRolloutGets > 0 {
 			f.failRolloutGets--
 			writeFakeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "restarting"})
+			return
+		}
+		if f.membershipRolloutGets > 0 {
+			f.membershipRolloutGets--
+			http.Error(w, "cluster peer not in membership", http.StatusForbidden)
 			return
 		}
 		f.step()

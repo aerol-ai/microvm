@@ -224,8 +224,28 @@ func (a *app) upgradeDo(ctx context.Context, c *commonFlags, conn connection, ca
 	return resp.StatusCode, nil
 }
 
+// peerNotInMembership is the plain-text 403 a cluster node answers when the
+// node that forwarded a call is not in its gossip view yet
+// (cluster.PeerNotInMembershipMessage; the CLI keeps no server types). It
+// lasts a few seconds after a restart or a leader change, which is exactly
+// when an upgrade is polled, and the call never ran, so it is safe to retry.
+// Main's PR #1074 answers it as 503 for forwarded writes; a call proxied to
+// the leader, like the upgrade API's, still passes the 403 through.
+const peerNotInMembership = "cluster peer not in membership"
+
+// membershipPending reports that refusal.
+func membershipPending(status int, raw []byte) bool {
+	return status == http.StatusForbidden && strings.Contains(string(raw), peerNotInMembership)
+}
+
+// membershipPendingMessage is what the CLI says instead of "Forbidden".
+const membershipPendingMessage = "the cluster leader does not see the node that forwarded this call yet (a restart or leader change is in progress); retry shortly"
+
 // upgradeRefusal turns a refusal body into the CLI's error.
 func upgradeRefusal(status int, raw []byte) error {
+	if membershipPending(status, raw) {
+		return &agenttools.Error{Code: agenttools.CodeUnavailable, HTTPStatus: status, Message: membershipPendingMessage, Retryable: true}
+	}
 	var e upgradewire.ErrorResponse
 	jsonErr := json.Unmarshal(raw, &e)
 	if (jsonErr != nil || e.Error == "") && (status == http.StatusNotFound || status == http.StatusMethodNotAllowed) {

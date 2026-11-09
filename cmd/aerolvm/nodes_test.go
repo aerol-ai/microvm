@@ -37,6 +37,7 @@ type fakeCluster struct {
 	failOnCall    map[string]int // "METHOD path" -> fail only the Nth call
 	dropOnCall    map[string]int // "METHOD path" -> drop the connection on the Nth call
 	status503     map[string]int // "METHOD path" -> answer 503 this many times
+	membership403 map[string]int // "METHOD path" -> answer the leader's plain-text membership 403 this many times
 	calls         map[string]int
 	slowNodeGet   time.Duration
 	drainRunning  bool // each node GET lowers running by one
@@ -49,7 +50,8 @@ type fakeCluster struct {
 func newFakeCluster(t *testing.T) *fakeCluster {
 	f := &fakeCluster{t: t, owned: map[string][]string{}, runtimes: map[string]string{}, running: map[string]int{},
 		unknown: map[string]bool{}, cordoned: map[string]bool{}, deleted: map[string]bool{}, fail: map[string]int{}, busy: map[string]bool{},
-		failOnCall: map[string]int{}, calls: map[string]int{}, dropOnCall: map[string]int{}, status503: map[string]int{}}
+		failOnCall: map[string]int{}, calls: map[string]int{}, dropOnCall: map[string]int{}, status503: map[string]int{},
+		membership403: map[string]int{}}
 	f.srv = httptest.NewServer(http.HandlerFunc(f.serve))
 	t.Cleanup(f.srv.Close)
 	return f
@@ -94,6 +96,11 @@ func (f *fakeCluster) serve(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
+	}
+	if f.membership403[key] > 0 {
+		f.membership403[key]--
+		http.Error(w, "cluster peer not in membership", http.StatusForbidden)
+		return
 	}
 	if f.status503[key] > 0 {
 		f.status503[key]--
@@ -743,6 +750,12 @@ func TestClusterReadsRetryTransientFailures(t *testing.T) {
 	f.status503["GET /v1/cluster/members"] = 2
 	if code := h.run("get", "nodes"); code != exitOK {
 		t.Fatalf("get nodes after two 503s = %d: %s", code, h.stderr.String())
+	}
+	// A leader that just restarted refuses a forwarded call with a plain-text
+	// 403 until gossip catches up: a short outage, retried like a 503.
+	f.membership403["GET /v1/cluster/members"] = 2
+	if code := h.run("get", "nodes"); code != exitOK {
+		t.Fatalf("get nodes after two membership 403s = %d: %s", code, h.stderr.String())
 	}
 	f.status503["GET /v1/cluster/members"] = 4
 	if code := h.run("get", "nodes"); code == exitOK {

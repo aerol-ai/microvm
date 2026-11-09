@@ -115,8 +115,12 @@ func upgradeCall(t *testing.T, method, path string, body any) (int, []byte) {
 			b, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
 			resp.Body.Close()
 			// The leader may be restarting: the API answers 502/503 for a
-			// moment. A command is idempotent (§6.6), so a retry is safe.
-			if (resp.StatusCode == http.StatusBadGateway || resp.StatusCode == http.StatusServiceUnavailable || resp.StatusCode == http.StatusGatewayTimeout) && attempt < 20 {
+			// moment, or, from a leader whose gossip hasn't caught up with
+			// the node that forwarded the call, a plain-text 403 "cluster
+			// peer not in membership". A command is idempotent (§6.6), so a
+			// retry is safe.
+			pending := resp.StatusCode == http.StatusForbidden && strings.Contains(string(b), "cluster peer not in membership")
+			if (resp.StatusCode == http.StatusBadGateway || resp.StatusCode == http.StatusServiceUnavailable || resp.StatusCode == http.StatusGatewayTimeout || pending) && attempt < 20 {
 				time.Sleep(3 * time.Second)
 				if body != nil {
 					b2, _ := json.Marshal(body)
