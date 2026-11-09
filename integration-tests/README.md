@@ -157,10 +157,17 @@ and each pinned third-party file at `deps/<project>/<version>/<file>`.
   `sudo`, so no variable would reach it, and the bootstrap template is not
   touched. Unset, the nodes get the build's `install.sh` unchanged. A
   `--version` or `--released` run uses that release's own `install.sh`.
-- **Not covered:** the Terraform bootstrap's own CNI and BuildKit steps
-  (containerd nodes, the default) and its Firecracker download still fetch
-  from GitHub. Those live in `bootstrap.sh.tftpl`, and changing it replaces
-  every node of a running cluster.
+- **The Terraform bootstrap's own downloads** (`install.sh`, the cluster
+  scripts, and the CNI plugins, BuildKit and Firecracker) fall back to the
+  mirror when the Terraform variable `download_mirror` is set. The harness
+  passes it on every apply and destroy, set to the same `AEROL_DOWNLOAD_MIRROR`
+  (`""` or `off` passes nothing, and the bootstrap renders as it did before).
+  Terraform/README.md, "Download mirror", has the details.
+- **`terraform init`'s provider downloads** (the Cloudflare provider is a
+  GitHub release asset) go through one plugin cache shared by every run and
+  worktree, `AEROL_TF_PLUGIN_CACHE` (default `~/.terraform.d/plugin-cache`).
+  If `init` still fails, it is retried once with that cache as `-plugin-dir`,
+  which needs no download at all (`tf_init_failover` in `lib/common.sh`).
 
 ## Container engine
 
