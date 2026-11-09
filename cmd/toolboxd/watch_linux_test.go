@@ -172,6 +172,75 @@ func TestInotifyRecursiveWatchesExistingAndNewFolders(t *testing.T) {
 	}
 }
 
+// mkdir -p races the scan of a new folder: the scan watches a subfolder whose
+// own IN_CREATE is already queued. Handling that event watches it again, and
+// must not need a free slot: with every slot spent, a folder watched all
+// along was refused and reported as a watch_limit overflow, and below the
+// cap the shared budget counted it twice for a moment (the 7-for-6 flake in
+// TestInotifyRecursiveWatchesExistingAndNewFolders).
+func TestInotifyCreateOfFolderTheScanWatched(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		budget  *watchBudget
+		maxDirs int
+	}{
+		// Three slots: the root, new and new/a.
+		{"stream cap", newWatchBudget(4, 64), 3},
+		{"toolboxd cap", newWatchBudget(4, 3), 64},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			batch := newWatchBatch(watchMaxPending)
+			// Not started: the test reads the queue itself, to put the scan
+			// before the event every time.
+			w, err := openInotifyWatcher(root, true, batch, tc.budget, tc.maxDirs)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = w.file.Close() })
+			buf := make([]byte, inotifyReadBuffer)
+			handleQueued := func() {
+				t.Helper()
+				n, err := w.file.Read(buf)
+				must(t, err)
+				if w.handle(buf[:n]) {
+					t.Fatal("handle ended the watch")
+				}
+			}
+
+			parent, sub := filepath.Join(root, "new"), filepath.Join(root, "new", "a")
+			must(t, os.Mkdir(parent, 0o755))
+			handleQueued() // watches new; its scan finds nothing yet
+			must(t, os.Mkdir(sub, 0o755))
+			// The scan of new, had a appeared just after new's watch: it
+			// watches a, and a's IN_CREATE stays queued.
+			w.watchTree(parent, true)
+			handleQueued()
+			if got := batch.take(); hasOverflow(got) {
+				t.Fatalf("a folder already watched was reported as lost: %v", got)
+			}
+			if _, dirs := tc.budget.usage(); dirs != 3 || len(w.byWD) != 3 {
+				t.Fatalf("budget %d folders, %d watches; want 3 of each", dirs, len(w.byWD))
+			}
+			file := filepath.Join(sub, "f.txt")
+			must(t, os.WriteFile(file, nil, 0o644))
+			handleQueued()
+			if got := batch.take(); !hasSubsequence(got, []watchEvent{{Type: watchEventCreate, Path: file}}) {
+				t.Fatalf("events %v, want a create for %s", got, file)
+			}
+		})
+	}
+}
+
+func hasOverflow(events []watchEvent) bool {
+	for _, ev := range events {
+		if ev.Type == watchEventOverflow {
+			return true
+		}
+	}
+	return false
+}
+
 func TestInotifyFolderMovedOutIsUnwatched(t *testing.T) {
 	root, outside := t.TempDir(), t.TempDir()
 	sub := filepath.Join(root, "sub")

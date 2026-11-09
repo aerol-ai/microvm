@@ -131,13 +131,15 @@ func (w *inotifyWatcher) Close() {
 
 // addWatch watches one folder, counting it against the stream's and
 // toolboxd's caps.
+//
+// It asks the kernel first and charges the caps only for a watch the kernel
+// says is new. One folder is often added twice: under mkdir -p, the scan of
+// a new parent watches a subfolder whose own IN_CREATE is still queued.
+// Charging first made that second add take a slot just to give it back, so
+// for a moment the shared budget counted the folder twice, and at a cap a
+// folder watched all along was refused and reported as a watch_limit
+// overflow.
 func (w *inotifyWatcher) addWatch(path string, follow bool) (int32, error) {
-	if len(w.byWD) >= w.maxDirs {
-		return 0, errWatchLimit
-	}
-	if !w.budget.takeDir() {
-		return 0, errWatchLimit
-	}
 	mask := uint32(inotifyMask)
 	if !follow {
 		mask |= unix.IN_DONT_FOLLOW
@@ -150,7 +152,6 @@ func (w *inotifyWatcher) addWatch(path string, follow bool) (int32, error) {
 		addErr = err
 	}
 	if addErr != nil {
-		w.budget.giveDirs(1)
 		if errors.Is(addErr, unix.ENOSPC) {
 			// fs.inotify.max_user_watches: the kernel's own cap.
 			return 0, errWatchLimit
@@ -159,10 +160,17 @@ func (w *inotifyWatcher) addWatch(path string, follow bool) (int32, error) {
 	}
 	id := int32(wd)
 	if old, ok := w.byWD[id]; ok {
-		// The kernel gives one watch per folder, so this folder was already
-		// watched under another path (a bind mount): keep the newer path.
-		w.budget.giveDirs(1)
+		// The kernel gives one watch per folder, so this folder is already
+		// watched and paid for: by this path, or by another one (a bind
+		// mount). Keep the newer path.
 		delete(w.byPath, old)
+	} else if len(w.byWD) >= w.maxDirs || !w.budget.takeDir() {
+		// Over a cap: drop the watch just made. Its events, IN_IGNORED
+		// included, name a wd never recorded, so handleEvent skips them.
+		_ = w.conn.Control(func(fd uintptr) {
+			_, _ = unix.InotifyRmWatch(int(fd), uint32(wd))
+		})
+		return 0, errWatchLimit
 	}
 	w.byWD[id] = path
 	w.byPath[path] = id
