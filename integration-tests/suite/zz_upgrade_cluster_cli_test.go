@@ -26,6 +26,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -142,6 +143,7 @@ func TestUpgradeCLICluster02HandRunKeepsQuorum(t *testing.T) {
 	if len(servers) != 3 {
 		t.Skipf("needs three SSH-reachable servers, found %d", len(servers))
 	}
+	waitServersListed(t, c, servers)
 	leaderID := currentLeader(t, c)
 	var leader harness.IntegrationNode
 	var followers []harness.IntegrationNode
@@ -236,6 +238,35 @@ func TestUpgradeCLICluster03Rollback(t *testing.T) {
 }
 
 // waitVoter waits until the voter nodeID is alive (or down) in gossip.
+// waitServersListed waits until /v1/cluster/members lists every server
+// alive. UC-667's rollout upgrades the old leader last, and a restart leaves
+// gossip cleanly, so for a few seconds after the rollout ends the member list
+// does not show that server at all. Resolving node ids then fell back to a
+// guessed id (heteroNodeID), and UC-646 waited 5 minutes for a node that does
+// not exist to go down (2026-11-09: it started 25 s after server-1's restart).
+func waitServersListed(t *testing.T, c *harness.Client, servers []harness.IntegrationNode) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Minute)
+	for {
+		views := listNodeViews(t, c)
+		var missing []string
+		for _, s := range servers {
+			if !slices.ContainsFunc(views, func(m nodeView) bool {
+				return m.Alive && (m.NodeID == s.Name || strings.HasSuffix(m.NodeID, "-"+s.Name))
+			}) {
+				missing = append(missing, s.Name)
+			}
+		}
+		if len(missing) == 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("servers %v are not listed alive in /v1/cluster/members", missing)
+		}
+		time.Sleep(3 * time.Second)
+	}
+}
+
 func waitVoter(t *testing.T, c *harness.Client, nodeID string, alive bool) {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Minute)
