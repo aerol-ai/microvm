@@ -1135,6 +1135,13 @@ EOF
       else
         need_local+=(cluster_sign_node_script_url)
       fi
+      # The release's own Caddy. Without it an older install.sh downloads
+      # releases/latest/caddy_linux_amd64 and checks it against this
+      # release's checksums.txt, which fails as soon as a newer release ships
+      # (the adopt gate's v0.6.11 base, the day v0.6.12 came out).
+      if curl -fsIL -o /dev/null --max-time 20 "${base}/caddy_linux_amd64"; then
+        printf 'caddy_binary_url = "%s"\n' "${base}/caddy_linux_amd64" >>"$out"
+      fi
       if grep -Eq '^[[:space:]]*audit_receiver_enabled[[:space:]]*=[[:space:]]*true' "${HERE}/scenarios/${scenario}.tfvars"; then
         need_local+=(audit_receiver_url)
       fi
