@@ -184,6 +184,43 @@ phases:
    node: OTEL metrics settings and image-pull storm controls. The bootstrap
    then restarts sandboxd once so those env vars are active immediately.
 
+### Download mirror
+
+The bootstrap downloads `install.sh`, the cluster scripts, and on containerd
+nodes the CNI plugins and BuildKit (and Firecracker where you turn it on).
+Most of these come from GitHub release downloads, and those can fail for
+hours while GitHub's status page stays green. That happened on 2026-11-09: a
+GitHub `504` on the CNI plugins stopped the bootstrap on two servers and the
+ingress of a test cluster.
+
+Set `download_mirror` to give every one of those downloads a fallback:
+
+```hcl
+download_mirror = "https://aerolvm-downloads.s3.us-east-1.amazonaws.com"
+```
+
+- **What happens.** Each file is tried at its own source first, with a few
+  quick retries. If that fails, the same file is fetched from the mirror: AerolVM
+  release files from `aerolvm/<tag>/` (the mirror's `aerolvm/latest.txt`
+  names the latest release), and the CNI plugins, BuildKit and Firecracker
+  from `deps/<project>/<version>/`. A URL the mirror has no copy of (your own
+  `install_script_url` server, a presigned bucket URL, the Firecracker CI
+  kernel) is downloaded as before.
+- **Checks.** The CNI plugins and BuildKit are checked against the SHA-256
+  values pinned in `install.sh`, whichever source served them. Firecracker is
+  checked against its own `.sha256.txt`, as before.
+- **The mirror.** The public one above is filled by `scripts/mirror-sync.sh`
+  and by each release (`.github/workflows/release.yml`). You can run your own
+  copy of it and point `download_mirror` there.
+- **Changing it replaces nodes.** Unset (the default, `null`), the bootstrap
+  renders exactly as before, so an existing cluster sees no change. Setting it
+  changes every node's `user_data`, so the next `terraform apply` replaces each
+  node once (`user_data_replace_on_change`). Plan that like any node
+  replacement.
+- `install.sh` has its own mirror fallback for what it downloads (sandboxd,
+  Caddy and the rest), on by default; see `install.sh --help`
+  (`--download-mirror`).
+
 ## Onboarding Firecracker nodes
 
 Terraform now exposes Firecracker directly in the node schema instead of
