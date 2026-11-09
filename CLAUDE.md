@@ -260,6 +260,11 @@ Live integration runs (`make integration-single`, `integration-cluster-*`,
 `integration-all`) provision **real AWS** via the prod Terraform module and
 cost money — they are operator-run, not part of `make test`. `make
 integration-reap` terminates leaked instances. See `integration-tests/README.md`.
+To put a file on a test node (a hot-patched `sandboxd`, a test binary), use
+`integration-tests/scripts/stage-to-node.sh` or `stage_to_node` from
+`integration-tests/lib/stage.sh`: it goes through S3. Never `scp` a build from
+this machine to a node; one scp stream over a laptop uplink takes 20+ minutes
+per node, and `safety/stage_test.go` fails on it.
 
 ## Project skills
 

@@ -98,6 +98,38 @@ Artifacts expire from the bucket after 7 days; presigned URLs default to 12h,
 which covers a slow `*.metal` provision. `reports/<scenario>.json` carries a
 `build` block naming the tree that produced its numbers.
 
+### Getting a file onto a node: S3, never scp
+
+To put a file on a running test node (a new `sandboxd` for a kept stack, a
+test binary, a fixture), use `stage_to_node`. Never `scp` it from your
+machine.
+
+- **Why.** One `scp` is one connection over your uplink: 10–170 KB/s from a
+  laptop to us-east-1. The adopt gate's 129 MB build took 20+ minutes per node
+  that way, and slowed every other upload from the same machine. An S3 upload
+  uses many connections (about 1.4 MB/s from the same laptop) and happens
+  once, and each node then downloads inside AWS in seconds.
+- **What it does.** `lib/build.sh stage` puts each file in the artifacts
+  bucket. A file from a published build (`.build/<id>/`) is already there
+  under `builds/<id>/`, so nothing is uploaded. Anything else goes up once,
+  under `builds/stage/<sha256>/` (same 7-day expiry). The node gets a
+  one-hour presigned link, downloads the file and checks its SHA-256 against
+  your copy before it keeps it. It keeps the executable bit.
+- **In a script.** `lib/common.sh` sources `lib/stage.sh`, so every harness
+  script has
+  `stage_to_node ubuntu@<ip> <remote-dir> <file>...`. `upgrade-gate.sh`,
+  `scripts/run-on-node.sh` and the WASM fixture fallback use it.
+- **By hand or from an agent:**
+
+  ```bash
+  integration-tests/scripts/stage-to-node.sh --scenario cluster-chaos /tmp/aerol-stage \
+    integration-tests/.build/<build id>/sandboxd_linux_amd64 -- <node ip>...
+  ```
+
+- **Enforced.** `safety/stage_test.go` fails on any `scp` upload in a harness
+  script. Copying a file *from* a node (`scp user@host:path .`) is allowed:
+  that uses your downlink.
+
 ### When GitHub's downloads fail
 
 GitHub's release downloads once answered 504 for hours while its status page

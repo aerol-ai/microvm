@@ -128,8 +128,9 @@ file "$BIN" | grep -q x86-64 || { echo "built binary is not x86-64: $(file "$BIN
 echo "  upgrade binary: $BIN"
 for ip in "${IPS[@]}"; do
   echo "  upgrading $ip ..."
-  scp "${SSH_ID[@]}" "$BIN" "ubuntu@$ip:/tmp/sandboxd.new" >/dev/null 2>&1 || { die "scp to $ip failed"; continue; }
-  on_node "$ip" "sudo systemctl stop sandboxd && sudo install -m0755 /tmp/sandboxd.new /usr/local/bin/sandboxd && sudo systemctl start sandboxd" \
+  # Through S3, not scp: one upload from here, then a download inside AWS.
+  stage_to_node "ubuntu@$ip" /tmp/aerol-upgrade "$BIN" >/dev/null || { die "staging the binary on $ip failed"; continue; }
+  on_node "$ip" "sudo systemctl stop sandboxd && sudo install -m0755 /tmp/aerol-upgrade/sandboxd_linux_amd64 /usr/local/bin/sandboxd && sudo systemctl start sandboxd" \
     || { die "restart on $ip failed"; continue; }
 done
 wait_for_health "$BASE" "$TOKEN" || die "cluster not healthy after upgrade"
