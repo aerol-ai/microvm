@@ -277,13 +277,17 @@ func (c *Cluster) settleHold(id uint64, outcome admissionOutcome) {
 
 // applyAdmittedEncodedLocal admits cmd, proposes it and keeps its hold until
 // raft answers. admit runs under the admission lock; the commit does not.
+// The hold is settled by raft's answer, not by the caller's return: a caller
+// that stopped waiting (its ctx ended, or this server stopped leading) leaves
+// the hold counting until the entry's outcome is known or the term changes.
 func (c *Cluster) applyAdmittedEncodedLocal(ctx context.Context, payload []byte, cmd command, admit func() error) error {
 	id, enqueued, err := c.admitHold(cmd, admit)
 	if err != nil {
 		return err
 	}
 	defer enqueued()
-	_, outcome, err := c.applyEncodedLocalOutcome(ctx, payload, enqueued)
-	c.settleHold(id, outcome)
+	_, _, err = c.applyEncodedLocalOutcome(ctx, payload, enqueued, func(outcome admissionOutcome) {
+		c.settleHold(id, outcome)
+	})
 	return err
 }
