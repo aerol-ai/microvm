@@ -94,7 +94,8 @@ func TestUpgradeKeepsWasmAndIsolateRunning(t *testing.T) {
 	began := time.Now()
 	t14MeasureWith(t, target, subjects, func() {
 		stop := keepIsolateInUse(t, isolate.sb, time.Minute)
-		r := aerolvmLong(t, "upgrade", "apply", versionB, "--from", dirB, "--allow-unversioned", "--wait")
+		// The upload runs from a node inside AWS (client_in_vpc_test.go).
+		r := aerolvmOnNode(t, "upgrade", "apply", versionB, "--from", dirB, "--allow-unversioned", "--wait")
 		stop()
 		if r.code != 0 {
 			t.Fatalf("apply = %d", r.code)

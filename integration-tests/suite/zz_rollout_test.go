@@ -37,6 +37,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -468,29 +469,32 @@ func TestRolloutLive02UploadRoutes(t *testing.T) {
 	rl.versionB = rl.versionA + "-b"
 	rl.buildDir, rl.filesB = buildB(t, rl.versionB)
 	t.Logf("build A %s, build B %s: %v", rl.versionA, rl.versionB, rl.filesB)
+	// The PUTs run from a node inside AWS (client_in_vpc_test.go): B goes
+	// to S3 once and the node sends it to the same route.
+	client := clientNode(t)
+	var local []string
+	for name := range rl.filesB {
+		local = append(local, filepath.Join(rl.buildDir, name))
+	}
+	sort.Strings(local)
+	staged := clientRoot + "/b-" + rl.versionB
+	stageOnNode(t, client, staged, local...)
 	for name, sum := range rl.filesB {
 		if headFile(t, sum) == http.StatusOK {
 			continue
 		}
-		f, err := os.Open(filepath.Join(rl.buildDir, name))
-		if err != nil {
-			t.Fatal(err)
-		}
-		fi, _ := f.Stat()
 		start := time.Now()
-		code, body := putFile(t, sum, f, fi.Size())
-		f.Close()
+		code, body := putFileFromNode(t, client, staged+"/"+name, sum)
 		if code != http.StatusCreated && code != http.StatusOK {
 			t.Fatalf("PUT %s = %d %s", name, code, body)
 		}
-		t.Logf("uploaded %s (%d MiB) in %s: %d", name, fi.Size()>>20, time.Since(start).Round(time.Second), code)
+		t.Logf("uploaded %s from %s in %s: %d", name, client.Name, time.Since(start).Round(time.Second), code)
 	}
 	for name, sum := range rl.filesB {
 		if code := headFile(t, sum); code != http.StatusOK {
 			t.Fatalf("HEAD %s = %d after upload", name, code)
 		}
-		raw, _ := os.ReadFile(filepath.Join(rl.buildDir, name))
-		if code, body := putFile(t, sum, bytes.NewReader(raw), int64(len(raw))); code != http.StatusOK {
+		if code, body := putFileFromNode(t, client, staged+"/"+name, sum); code != http.StatusOK {
 			t.Fatalf("repeat PUT %s = %d %s, want 200", name, code, body)
 		}
 	}

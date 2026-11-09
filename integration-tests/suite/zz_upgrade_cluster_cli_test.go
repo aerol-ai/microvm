@@ -111,7 +111,8 @@ func TestUpgradeCLICluster01Apply(t *testing.T) {
 	execOK(t, sb, "echo before > /tmp/uc667")
 
 	start := time.Now()
-	r = aerolvmLong(t, "upgrade", "apply", clusterCLI.versionC, "--from", clusterCLI.dirC, "--allow-unversioned",
+	// The upload runs from a node inside AWS (client_in_vpc_test.go).
+	r = aerolvmOnNode(t, "upgrade", "apply", clusterCLI.versionC, "--from", clusterCLI.dirC, "--allow-unversioned",
 		"--hold", "--batch", "50%", "--wait")
 	t.Logf("apply --wait took %s\n%s\n%s", time.Since(start).Round(time.Second), r.stdout, r.stderr)
 	if r.code != 0 {

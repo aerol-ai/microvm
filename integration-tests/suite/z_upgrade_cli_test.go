@@ -264,7 +264,7 @@ func TestUpgradeCLIApplySingleNode(t *testing.T) {
 	execOK(t, sb, "echo before > /tmp/uc661")
 
 	start := time.Now()
-	r := aerolvmLong(t, "upgrade", "apply", upgradeLive.versionB, "--from", upgradeLive.dirB, "--allow-unversioned", "--wait")
+	r := aerolvmOnNode(t, "upgrade", "apply", upgradeLive.versionB, "--from", upgradeLive.dirB, "--allow-unversioned", "--wait")
 	if r.code != 0 {
 		t.Fatalf("apply = %d", r.code)
 	}
@@ -290,7 +290,7 @@ func TestUpgradeCLIApplyAgainIsNoop(t *testing.T) {
 		t.Skip("UC-661 did not upgrade")
 	}
 	before := latestNodeOp(t)
-	r := aerolvmLong(t, "upgrade", "apply", upgradeLive.versionB, "--from", upgradeLive.dirB, "--allow-unversioned", "--wait")
+	r := aerolvmOnNode(t, "upgrade", "apply", upgradeLive.versionB, "--from", upgradeLive.dirB, "--allow-unversioned", "--wait")
 	if r.code != 0 || !strings.Contains(r.stdout, "node already runs "+upgradeLive.versionB+"; nothing to do") ||
 		strings.Contains(r.stderr, "uploading") || !strings.Contains(r.stderr, "sandboxd_linux_amd64 is already there") {
 		t.Fatalf("repeat = %d %s %s", r.code, r.stdout, r.stderr)
