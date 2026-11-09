@@ -225,6 +225,42 @@ func currentLeader(t *testing.T, c *harness.Client) string {
 	return ""
 }
 
+// waitMemberOn waits until the member list shows id alive on version. A
+// node that just restarted is missing from the list for a few seconds (a
+// restart leaves gossip), so a single read right after it reads "" (UC-644,
+// 2026-11-09).
+func waitMemberOn(t *testing.T, c *harness.Client, id, version string, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for {
+		vs := memberVersions(t, c)
+		if vs[id] == version {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%s gossips %q, want %s: %v", id, vs[id], version, vs)
+		}
+		time.Sleep(3 * time.Second)
+	}
+}
+
+// waitLeader waits until the member list names a leader other than not
+// ("" accepts any) and returns it. Right after a leader hands off and
+// restarts, the answering server may not have the new leader yet.
+func waitLeader(t *testing.T, c *harness.Client, not string, timeout time.Duration) string {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for {
+		if l := currentLeader(t, c); l != "" && l != not {
+			return l
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("no leader other than %q within %s", not, timeout)
+		}
+		time.Sleep(2 * time.Second)
+	}
+}
+
 // waitAllOn waits until every alive member gossips version.
 func waitAllOn(t *testing.T, c *harness.Client, version string, timeout time.Duration) {
 	t.Helper()
@@ -671,9 +707,9 @@ func TestRolloutLive05ForcedFailureRollsNodeBack(t *testing.T) {
 	if strings.Contains(out, rl.filesB["toolboxd_linux_amd64"]) || !strings.Contains(out, rl.versionA) {
 		t.Fatalf("%s did not go back to build A: %s", next.Name, out)
 	}
-	if v := memberVersions(t, c)[nextID]; v != rl.versionA {
-		t.Fatalf("%s gossips %q, want %s", nextID, v, rl.versionA)
-	}
+	// The node has just restarted its old sandboxd, and a restart leaves
+	// gossip: it is listed again a few seconds after /health answers.
+	waitMemberOn(t, c, nextID, rl.versionA, 2*time.Minute)
 	sshRoot(t, next, "chattr -i /usr/local/bin/sandboxd")
 	restored = true
 	rl.ready = true
@@ -705,9 +741,7 @@ func TestRolloutLive06FinishesAndKeepsSandboxes(t *testing.T) {
 		}
 	}
 	waitAllOn(t, c, rl.versionB, 5*time.Minute)
-	if leader := currentLeader(t, c); leader == "" {
-		t.Fatal("no leader after the rollout")
-	}
+	waitLeader(t, c, "", time.Minute)
 	found := false
 	for _, n := range r.Nodes {
 		if n.NodeID == rl.firstLeader && n.State == upgradewire.NodeDone {

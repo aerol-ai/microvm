@@ -198,9 +198,7 @@ func TestUpgradeCLICluster02HandRunKeepsQuorum(t *testing.T) {
 	if !strings.Contains(out, "exit=0") || !strings.Contains(out, "handed leadership to") {
 		t.Fatalf("hand run on the leader:\n%s", out)
 	}
-	if now := currentLeader(t, c); now == leaderID || now == "" {
-		t.Fatalf("leader after the hand run = %q (was %s)", now, leaderID)
-	}
+	waitLeader(t, c, leaderID, time.Minute)
 	deadline := time.Now().Add(5 * time.Minute)
 	for memberVersions(t, c)[leaderID] != clusterCLI.versionPrev {
 		if time.Now().After(deadline) {
