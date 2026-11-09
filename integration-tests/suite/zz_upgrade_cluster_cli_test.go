@@ -186,7 +186,12 @@ func TestUpgradeCLICluster02HandRunKeepsQuorum(t *testing.T) {
 	downID := ids[down.Name]
 	waitVoter(t, c, downID, false)
 	out := sshRoot(t, other, handRun)
-	if !strings.Contains(out, "exit=1") || !strings.Contains(out, "refusing to stop sandboxd") || !strings.Contains(out, "1 of 3 voting servers") {
+	// The guard re-reads the member list for up to 30 s before it refuses,
+	// and the leader evicts a server down for SB_DEAD_OWNER_GRACE (30 s)
+	// from the Raft configuration, so by the time it answers the stopped
+	// server may no longer be a voter: 1 of 2 left is the same refusal.
+	if !strings.Contains(out, "exit=1") || !strings.Contains(out, "refusing to stop sandboxd") ||
+		!(strings.Contains(out, "1 of 3 voting servers") || strings.Contains(out, "1 of 2 voting servers")) {
 		t.Fatalf("hand run with a server down was not refused:\n%s", out)
 	}
 	if v := strings.TrimSpace(sshRoot(t, other, "systemctl is-active sandboxd")); v != "active" {
@@ -198,6 +203,10 @@ func TestUpgradeCLICluster02HandRunKeepsQuorum(t *testing.T) {
 		t.FailNow() // the restore said why; the leader's hand run needs all three servers
 	}
 	waitVoter(t, c, downID, true)
+	// If it was evicted above, it is a voter again only once the leader
+	// re-adds it (voter auto-join); until then the hand run on the leader
+	// below would be refused as 1 of 2.
+	waitRaftVoter(t, c, downID)
 
 	// On the leader: leadership moves first, then the node rolls back.
 	out = sshRoot(t, leader, handRun)
@@ -266,6 +275,35 @@ func waitServersListed(t *testing.T, c *harness.Client, servers []harness.Integr
 		}
 		if time.Now().After(deadline) {
 			t.Fatalf("servers %v are not listed alive in /v1/cluster/members", missing)
+		}
+		time.Sleep(3 * time.Second)
+	}
+}
+
+// waitRaftVoter waits until nodeID is a Raft voter again: listed alive
+// with voter set (the answering server annotates voter from its Raft view,
+// and a worker or ingress passes on the control plane's annotation), or
+// named in raft_voters when a server answers.
+func waitRaftVoter(t *testing.T, c *harness.Client, nodeID string) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Minute)
+	for {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		var resp struct {
+			Members    []nodeView `json:"members"`
+			RaftVoters []string   `json:"raft_voters"`
+		}
+		err := c.GetJSON(ctx, "/v1/cluster/members", &resp)
+		cancel()
+		if err == nil {
+			if slices.Contains(resp.RaftVoters, nodeID) || slices.ContainsFunc(resp.Members, func(m nodeView) bool {
+				return m.NodeID == nodeID && m.Alive && m.Voter
+			}) {
+				return
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%s is not a Raft voter again (raft_voters %v, err %v)", nodeID, resp.RaftVoters, err)
 		}
 		time.Sleep(3 * time.Second)
 	}
