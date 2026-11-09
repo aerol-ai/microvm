@@ -306,6 +306,10 @@ locals {
   # docker in cluster.yml to keep a legacy dockerd host). Ansible
   # configure-ops.yml installs CNI plugins for containerd; Terraform only writes
   # the env (bootstrap assumes CNI already on the AMI / day-2 Ansible).
+  # The bootstrap template renders its mirror fallback only for a non-empty
+  # value, so null renders exactly what it did before (variables.tf).
+  download_mirror = var.download_mirror == null ? "" : trimsuffix(var.download_mirror, "/")
+
   container_engine = try(local.cluster_ops.container_engine, "containerd")
   containerd_cfg = {
     socket                    = try(local.cluster_ops.containerd.socket, "/run/containerd/containerd.sock")
