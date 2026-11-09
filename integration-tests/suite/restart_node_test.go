@@ -10,7 +10,12 @@ import (
 )
 
 // splitGoFuncs returns each top-level func body in a source file, keyed by
-// its signature line.
+// its signature line, with comment lines dropped.
+//
+// A body runs to the next "\nfunc ", so it also holds the doc comment of the
+// function after it. Keeping comments let prose about a helper count as code:
+// chaosStopVoters was reported as taking sandboxd down because the comment
+// above chaosKillVoters names KillSandboxdScript.
 //
 // File granularity is not enough here. z_audit_tamper_test.go holds both
 // UC-134 (which stops a node) and UC-135 (which uses KillNodeDaemon), so a
@@ -25,9 +30,26 @@ func splitGoFuncs(src string) map[string]string {
 		if nl < 0 {
 			continue
 		}
-		out["func "+p[:nl]] = p
+		var code []string
+		for _, line := range strings.Split(p, "\n") {
+			if !strings.HasPrefix(strings.TrimSpace(line), "//") {
+				code = append(code, line)
+			}
+		}
+		out["func "+p[:nl]] = strings.Join(code, "\n")
 	}
 	return out
+}
+
+// takesSandboxdDown reports whether a function body stops, restarts or
+// SIGKILLs sandboxd. KillSandboxdScript is listed because the two guards
+// below once keyed only on the stop and restart strings, so the SIGKILL
+// paths (UC-480, UC-481) were never inspected at all.
+func takesSandboxdDown(body string) bool {
+	return strings.Contains(body, "systemctl stop sandboxd") ||
+		strings.Contains(body, "systemctl restart sandboxd") ||
+		strings.Contains(body, "KillSandboxdScript") ||
+		strings.Contains(body, "KillNodeDaemon")
 }
 
 // Any case that takes sandboxd down must bring it back AND wait for the node
@@ -60,9 +82,7 @@ func TestEveryCaseThatStopsSandboxdWaitsForTheRejoin(t *testing.T) {
 			t.Fatal(err)
 		}
 		for sig, body := range splitGoFuncs(string(raw)) {
-			stops := strings.Contains(body, "systemctl stop sandboxd") ||
-				strings.Contains(body, "systemctl restart sandboxd") ||
-				strings.Contains(body, "KillNodeDaemon")
+			stops := takesSandboxdDown(body)
 			if !stops {
 				continue
 			}
@@ -159,9 +179,7 @@ func TestDisruptiveCasesChooseANonSeedVictim(t *testing.T) {
 			t.Fatal(err)
 		}
 		for sig, body := range splitGoFuncs(string(raw)) {
-			stops := strings.Contains(body, "systemctl stop sandboxd") ||
-				strings.Contains(body, "systemctl restart sandboxd") ||
-				strings.Contains(body, "KillNodeDaemon")
+			stops := takesSandboxdDown(body)
 			if !stops {
 				continue
 			}
