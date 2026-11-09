@@ -63,7 +63,7 @@ Power-of-two-choices on per-node capacity reaches roughly balanced at a fixed co
 
 **Where it sits on CAP.** The CAP theorem says that when a network splits, a distributed system must choose between consistency and availability. The placement FSM is CP: it chooses consistency. Placement writes (`opReserve`, `opPlace`, `opReassign` and the custom-domain commands) need a Raft leader, the one server that writes new log entries.
 
-During a leader election, those writes fail with `ErrNotLeader` and the API returns 503. Sandboxes already placed keep serving. Reads routed to the owner never touch Raft, and neither does toolbox traffic. (The toolbox is the small agent inside each sandbox that runs commands and file operations.)
+During a leader election, those writes fail with `ErrNotLeader` and the API returns 503. A write that was already waiting on a server when it stopped leading gets that answer within about 2 seconds, even if Raft itself never replies (it can drop the reply when it shuts down). The caller then retries on the new leader (`awaitApply` in `client.go`). Sandboxes already placed keep serving. Reads routed to the owner never touch Raft, and neither does toolbox traffic. (The toolbox is the small agent inside each sandbox that runs commands and file operations.)
 
 ## Topology
 

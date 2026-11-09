@@ -122,6 +122,9 @@ type Cluster struct {
 	// and barrier in admission tests. Always nil in production.
 	leaderTermHook       func() (bool, uint64)
 	admissionBarrierHook func() error
+	// applyWaitBoundsHook shortens awaitApply's leader-loss grace and poll
+	// interval in tests. Always nil in production.
+	applyWaitBoundsHook func() (grace, interval time.Duration)
 	// authoritativeBarrierOnce/authoritativeBarrier admit ONE fsm barrier at
 	// a time. A raft barrier cannot be cancelled, so the goroutine waiting on
 	// one outlives an abandoned read; holding the slot until raft returns is
@@ -1557,7 +1560,7 @@ func (c *Cluster) applyEncodedLocal(ctx context.Context, payload []byte) error {
 // applyEncodedLocalResult is applyEncodedLocal for the ops whose FSM answer
 // the caller needs (an allocated token, say). Everything else discards it.
 func (c *Cluster) applyEncodedLocalResult(ctx context.Context, payload []byte) (any, error) {
-	result, _, err := c.applyEncodedLocalOutcome(ctx, payload, nil)
+	result, _, err := c.applyEncodedLocalOutcome(ctx, payload, nil, nil)
 	return result, err
 }
 
@@ -1565,8 +1568,9 @@ func (c *Cluster) applyEncodedLocalResult(ctx context.Context, payload []byte) (
 // can still commit after an error (raftApplyOutcome), which the admission
 // ledger needs to know when to let go of a hold. enqueued, when not nil, is
 // called as soon as raft has taken the entry (or refused to), before the
-// wait for its commit.
-func (c *Cluster) applyEncodedLocalOutcome(ctx context.Context, payload []byte, enqueued func()) (result any, outcome admissionOutcome, err error) {
+// wait for its commit. settle, when not nil, gets the outcome once raft
+// answers, even if the wait gave up first (awaitApply).
+func (c *Cluster) applyEncodedLocalOutcome(ctx context.Context, payload []byte, enqueued func(), settle func(admissionOutcome)) (result any, outcome admissionOutcome, err error) {
 	done := beginRaftApply()
 	defer func() { done(err) }()
 	timeout := c.commitTimeout
@@ -1575,30 +1579,113 @@ func (c *Cluster) applyEncodedLocalOutcome(ctx context.Context, payload []byte, 
 			timeout = remaining
 		}
 	}
+	_, term := c.leaderTerm()
 	f := c.raft.raft.Apply(payload, timeout)
 	if enqueued != nil {
 		enqueued()
 	}
-	if applyErr := f.Error(); applyErr != nil {
-		outcome = raftApplyOutcome(applyErr)
-		if errors.Is(applyErr, raft.ErrNotLeader) || errors.Is(applyErr, raft.ErrLeadershipLost) {
-			return nil, outcome, ErrNotLeader
+	return c.awaitApply(ctx, f, term, settle)
+}
+
+const (
+	// applyLeaderLossGrace is how long a write still waits for raft's own
+	// answer after this server stopped leading the term it was proposed in.
+	// raft answers in-flight entries as it steps down, and the FSM keeps
+	// applying the ones it already committed, so a real answer comes within
+	// milliseconds; the grace only covers a slow FSM batch.
+	applyLeaderLossGrace = 2 * time.Second
+	// applyLeaderPollInterval is how often a waiting write checks that this
+	// server still leads. A healthy commit answers well before the first check.
+	applyLeaderPollInterval = 100 * time.Millisecond
+)
+
+// applyAnswer is raft's answer to one proposed entry.
+type applyAnswer struct {
+	result  any
+	outcome admissionOutcome
+	err     error
+}
+
+// awaitApply waits for raft's answer to f, proposed while this server led
+// term. raft does not always answer: when it shuts down, a batch the leader
+// has committed and queued for the FSM (raft's fsmMutateCh is buffered) is
+// dropped if runFSM picks shutdownCh first, and the batch's futures have
+// already left the leader's in-flight list, which is the only one the
+// step-down answers. A bare f.Error() then blocks forever (the hang that
+// TestClusterFaultLeaderChangeDuringConcurrentReserves/kill hit about 1 run
+// in 12).
+//
+// So the caller is let go when its ctx ends, or when this server has stopped
+// leading term and raft has still not answered after applyLeaderLossGrace.
+// Both give outcomeUnknown, the same as raft's own ErrLeadershipLost: the
+// entry may still commit, and every caller already treats ErrNotLeader as
+// "retry the idempotent command". settle still gets the real outcome if raft
+// answers later, so an admission hold whose caller went away is released by
+// the commit, not kept for the rest of the term.
+func (c *Cluster) awaitApply(ctx context.Context, f raft.ApplyFuture, term uint64, settle func(admissionOutcome)) (any, admissionOutcome, error) {
+	answered := make(chan applyAnswer, 1)
+	go func() {
+		a := applyAnswerOf(f)
+		if settle != nil {
+			settle(a.outcome)
 		}
-		err = fmt.Errorf("cluster: raft apply: %w", applyErr)
-		return nil, outcome, err
+		answered <- a
+	}()
+	grace, interval := c.applyWaitBounds()
+	poll := time.NewTicker(interval)
+	defer poll.Stop()
+	var giveUp <-chan time.Time
+	for {
+		select {
+		case a := <-answered:
+			return a.result, a.outcome, a.err
+		case <-ctx.Done():
+			return nil, outcomeUnknown, fmt.Errorf("cluster: raft apply: %w", ctx.Err())
+		case <-giveUp:
+			return nil, outcomeUnknown, ErrNotLeader
+		case <-poll.C:
+			if giveUp != nil {
+				continue
+			}
+			if leading, now := c.leaderTerm(); !leading || now != term {
+				giveUp = time.After(grace)
+			}
+		}
+	}
+}
+
+// applyWaitBounds returns awaitApply's grace and poll interval; tests shorten
+// them.
+func (c *Cluster) applyWaitBounds() (grace, interval time.Duration) {
+	grace, interval = applyLeaderLossGrace, applyLeaderPollInterval
+	if c.applyWaitBoundsHook != nil {
+		grace, interval = c.applyWaitBoundsHook()
+	}
+	return grace, interval
+}
+
+// applyAnswerOf blocks until raft answers f and maps the answer to the
+// cluster's errors.
+func applyAnswerOf(f raft.ApplyFuture) applyAnswer {
+	if applyErr := f.Error(); applyErr != nil {
+		outcome := raftApplyOutcome(applyErr)
+		if errors.Is(applyErr, raft.ErrNotLeader) || errors.Is(applyErr, raft.ErrLeadershipLost) {
+			return applyAnswer{outcome: outcome, err: ErrNotLeader}
+		}
+		return applyAnswer{outcome: outcome, err: fmt.Errorf("cluster: raft apply: %w", applyErr)}
 	}
 	response := f.Response()
 	if appErr, ok := response.(error); ok && appErr != nil {
-		err = fmt.Errorf("cluster: fsm apply: %w", appErr)
-		return nil, outcomeSettled, err
+		return applyAnswer{outcome: outcomeSettled, err: fmt.Errorf("cluster: fsm apply: %w", appErr)}
 	}
 	if reassigned, ok := response.(reassignApplyResult); ok && reassigned.Changed {
 		// This runs once on the leader after its FSM confirms the ownership
 		// transition. Followers apply the same log entry but never execute this
-		// wrapper, and a lost HTTP acknowledgement cannot erase the count.
+		// wrapper, and a lost HTTP acknowledgement cannot erase the count. It
+		// runs even when the caller stopped waiting: the transition happened.
 		recordFailoverReassign()
 	}
-	return response, outcomeSettled, nil
+	return applyAnswer{result: response, outcome: outcomeSettled}
 }
 
 // forwardApplyToLeader posts an encoded raft command to the current leader's
