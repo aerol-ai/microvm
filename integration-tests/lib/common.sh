@@ -23,10 +23,16 @@ SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
 #      ~/.terraform.d/plugin-cache), so a provider any run in any worktree
 #      downloaded once is reused instead of downloaded again;
 #   2. if init still fails, it is retried once with -plugin-dir pointed at
-#      that cache, which installs providers with no network at all.
+#      that cache, which installs providers with no network at all;
+#   3. a new machine has nothing in that cache, so if that fails too, init
+#      is retried with the download mirror's copy of the providers
+#      (<mirror>/tf-providers/, a Terraform network mirror on S3 that
+#      scripts/mirror-sync.sh --tf-providers fills on every release) as the
+#      only provider source. AEROL_DOWNLOAD_MIRROR=off skips it.
 # Usage: TF_DATA_DIR=... tf_init_failover -chdir=<dir> init <init flags...>
 tf_init_failover() {
   local cache="${AEROL_TF_PLUGIN_CACHE:-$HOME/.terraform.d/plugin-cache}"
+  local mirror="${AEROL_DOWNLOAD_MIRROR-https://aerolvm-downloads.s3.us-east-1.amazonaws.com}"
   mkdir -p "$cache"
   # The repo's lock file is not committed, so without this Terraform >= 1.4
   # would skip the cache for every provider it has no recorded checksum for.
@@ -35,7 +41,18 @@ tf_init_failover() {
     return 0
   fi
   echo "terraform init failed; retrying with the providers already in ${cache} (no download)" >&2
-  terraform "$@" -plugin-dir="$cache"
+  if terraform "$@" -plugin-dir="$cache"; then
+    return 0
+  fi
+  [[ -n "$mirror" && "$mirror" != "off" ]] || return 1
+  echo "terraform init failed again; retrying with the providers on ${mirror%/}/tf-providers/" >&2
+  # The plugin cache still applies, so what this downloads is reused next time.
+  local rc=0 tfrc
+  tfrc="$(mktemp)"
+  printf 'provider_installation {\n  network_mirror {\n    url = "%s/tf-providers/"\n  }\n}\n' "${mirror%/}" >"$tfrc"
+  TF_CLI_CONFIG_FILE="$tfrc" terraform "$@" || rc=$?
+  rm -f "$tfrc"
+  return "$rc"
 }
 
 # download_mirror_tfvar_args prints the Terraform flag that turns on the node

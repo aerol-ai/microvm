@@ -14,13 +14,19 @@
       "Resource": "arn:aws:s3:::aerolvm-downloads/deps/*"
     },
     {
+      "Sid": "WriteTerraformProviders",
+      "Effect": "Allow",
+      "Action": "s3:PutObject",
+      "Resource": "arn:aws:s3:::aerolvm-downloads/tf-providers/*"
+    },
+    {
       "Sid": "ListReleaseAndThirdPartyFiles",
       "Effect": "Allow",
       "Action": "s3:ListBucket",
       "Resource": "arn:aws:s3:::aerolvm-downloads",
       "Condition": {
         "StringLike": {
-          "s3:prefix": ["aerolvm/*", "deps/*"]
+          "s3:prefix": ["aerolvm/*", "deps/*", "tf-providers/*"]
         }
       }
     }

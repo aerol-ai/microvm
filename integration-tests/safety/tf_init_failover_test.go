@@ -96,6 +96,94 @@ func TestTfInitFailover(t *testing.T) {
 	})
 }
 
+// fakeTerraformNewMachine models a machine whose plugin cache is empty: a
+// plain init and -plugin-dir both fail. Only a call with a CLI config file
+// (the provider mirror) succeeds, unless FAKE_TF_MIRROR_FAIL is set. It logs
+// that config's text on one line, and whether the file still exists later
+// is up to the caller to check.
+const fakeTerraformNewMachine = `#!/usr/bin/env bash
+cfg=""
+[ -n "${TF_CLI_CONFIG_FILE:-}" ] && cfg="$(tr '\n' ' ' <"$TF_CLI_CONFIG_FILE")"
+echo "args=$* cache=${TF_PLUGIN_CACHE_DIR:-} tfrc=${TF_CLI_CONFIG_FILE:-} cfg=$cfg" >>"$FAKE_TF_LOG"
+[ -n "${TF_CLI_CONFIG_FILE:-}" ] && [ -z "${FAKE_TF_MIRROR_FAIL:-}" ]
+`
+
+// A new machine has nothing in its plugin cache, so the cache retry cannot
+// help it; the last try installs from the download mirror's tf-providers/.
+func TestTfInitFailoverFallsBackToTheProviderMirror(t *testing.T) {
+	cases := []struct {
+		name      string
+		mirror    *string
+		mirrorBad bool
+		wantCalls int
+		wantOK    bool
+		wantURL   string
+	}{
+		{name: "unset: the public mirror's copy", wantCalls: 3, wantOK: true,
+			wantURL: `url = "https://aerolvm-downloads.s3.us-east-1.amazonaws.com/tf-providers/"`},
+		{name: "own mirror, trailing slash dropped", mirror: ptr("https://m.example.com/x/"), wantCalls: 3, wantOK: true,
+			wantURL: `url = "https://m.example.com/x/tf-providers/"`},
+		{name: "the mirror fails too: the error stands", mirrorBad: true, wantCalls: 3, wantOK: false},
+		{name: "mirror off: stops after the cache", mirror: ptr("off"), wantCalls: 2, wantOK: false},
+		{name: "mirror empty: stops after the cache", mirror: ptr(""), wantCalls: 2, wantOK: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			bin, cache, log := filepath.Join(dir, "bin"), filepath.Join(dir, "cache"), filepath.Join(dir, "tf.log")
+			writeStageFile(t, filepath.Join(bin, "terraform"), fakeTerraformNewMachine, 0o755)
+			env := []string{
+				"PATH=" + bin + string(os.PathListSeparator) + os.Getenv("PATH"),
+				"FAKE_TF_LOG=" + log, "AEROL_TF_PLUGIN_CACHE=" + cache, "TMPDIR=" + dir,
+			}
+			snippet := `unset AEROL_DOWNLOAD_MIRROR TF_CLI_CONFIG_FILE; tf_init_failover -chdir=/x init -input=false`
+			if tc.mirror != nil {
+				env = append(env, "AEROL_DOWNLOAD_MIRROR="+*tc.mirror)
+				snippet = `unset TF_CLI_CONFIG_FILE; tf_init_failover -chdir=/x init -input=false`
+			}
+			if tc.mirrorBad {
+				env = append(env, "FAKE_TF_MIRROR_FAIL=1")
+			}
+			out, err := runCommonSnippet(t, env, snippet)
+			if (err == nil) != tc.wantOK {
+				t.Fatalf("tf_init_failover error = %v, want ok=%v\n%s", err, tc.wantOK, out)
+			}
+			b, _ := os.ReadFile(log)
+			calls := strings.Split(strings.TrimSpace(string(b)), "\n")
+			if len(calls) != tc.wantCalls {
+				t.Fatalf("terraform called %d times, want %d:\n%s", len(calls), tc.wantCalls, b)
+			}
+			for i, c := range calls {
+				if !strings.Contains(c, "args=-chdir=/x init -input=false") || !strings.Contains(c, "cache="+cache) {
+					t.Errorf("call %d lost the caller's arguments or the plugin cache: %s", i, c)
+				}
+				if i < 2 && strings.Contains(c, "tfrc=/") {
+					t.Errorf("call %d used a CLI config before the cache retry failed: %s", i, c)
+				}
+			}
+			if tc.wantCalls < 3 {
+				return
+			}
+			last := calls[2]
+			if strings.Contains(last, "-plugin-dir") {
+				t.Errorf("mirror call still has -plugin-dir: %s", last)
+			}
+			if !strings.Contains(last, "network_mirror {") {
+				t.Errorf("mirror call's CLI config has no network_mirror block: %s", last)
+			}
+			if tc.wantURL != "" && !strings.Contains(last, tc.wantURL) {
+				t.Errorf("mirror call's CLI config = %s, want %s", last, tc.wantURL)
+			}
+			tfrc := strings.Fields(strings.SplitN(last, "tfrc=", 2)[1])[0]
+			if _, err := os.Stat(tfrc); !os.IsNotExist(err) {
+				t.Errorf("the temporary CLI config %s was left behind (stat: %v)", tfrc, err)
+			}
+		})
+	}
+}
+
+func ptr(s string) *string { return &s }
+
 func TestDownloadMirrorTfvarArgs(t *testing.T) {
 	cases := []struct {
 		name string

@@ -56,9 +56,11 @@ const fakeS3 = `#!/usr/bin/env bash
 echo "aws $*" >>"$TOOL_LOG"
 args=()
 size_only=""
+exclude=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --region|--content-type|--cache-control) shift 2 ;;
+    --exclude) exclude="$2"; shift 2 ;;
     --only-show-errors|--no-progress) shift ;;
     --size-only) size_only=1; shift ;;
     *) args+=("$1"); shift ;;
@@ -78,6 +80,8 @@ case "${args[0]} ${args[1]}" in
     # size is left alone.
     src="${args[2]}"
     (cd "$src" && find . -type f) | while read -r rel; do
+      # shellcheck disable=SC2053 # a glob, as aws --exclude takes
+      if [[ -n "$exclude" && "${rel#./}" == $exclude ]]; then continue; fi
       to="$dst/${rel#./}"
       if [[ -n "$size_only" && -f "$to" && $(wc -c <"$src/$rel") -eq $(wc -c <"$to") ]]; then
         echo "skip ${rel#./}" >>"$TOOL_LOG"
@@ -95,6 +99,7 @@ type syncRig struct {
 	gh, s3, log, binDir  string
 	stdout, stderr, logs string
 	code                 int
+	env                  []string // extra environment for the script and its fakes
 }
 
 func newSyncRig(t *testing.T) *syncRig {
@@ -135,6 +140,7 @@ func (r *syncRig) run(args ...string) {
 	cmd.Dir = r.t.TempDir()
 	cmd.Env = []string{"PATH=" + r.binDir + string(os.PathListSeparator) + os.Getenv("PATH"), "HOME=" + r.t.TempDir(),
 		"TOOL_LOG=" + r.log, "FAKE_GH=" + r.gh, "FAKE_S3=" + r.s3, "FAKE_WEB=" + filepath.Join(r.gh, "web")}
+	cmd.Env = append(cmd.Env, r.env...)
 	var out, errOut strings.Builder
 	cmd.Stdout, cmd.Stderr = &out, &errOut
 	err = cmd.Run()
