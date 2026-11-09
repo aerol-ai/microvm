@@ -102,6 +102,8 @@ Gossip (`hashicorp/memberlist`) carries only identity and role. Its payload must
 
 Instead, `capacityLeaseCache` fetches `capacity.Snapshot`, a point-in-time report of free resources, from each worker-capable peer. It uses an authenticated `/v1/capacity` GET request on the gossip interval. That interval is 5 seconds by default, and a report expires after 3 intervals or 15 seconds, whichever is longer (see `capacity_lease.go`).
 
+The leader checks every create against its own report for the chosen worker. A server that has just started may not have one yet, and if it becomes leader then, it used to refuse those creates with 503 for about 20 seconds. Now the leader asks the worker for a report first, then decides. One request is shared by all the creates waiting on that worker, and it is not repeated within a second of a failed one (`capacity_lease_ondemand.go`).
+
 Worker and Agent nodes do not join Raft. They call any server-role member over RPC, and writes get forwarded to the leader.
 
 ## The placement FSM

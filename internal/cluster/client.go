@@ -1534,6 +1534,9 @@ func (c *Cluster) ApplyEncoded(ctx context.Context, payload []byte) error {
 // proposes it without holding the admission lock across the commit
 // (admission_ledger.go).
 func (c *Cluster) applyReservationEncodedLocal(ctx context.Context, payload []byte, cmd command) error {
+	// Outside the admission lock: a lease this leader lacks is fetched from
+	// the owner first (capacity_lease_ondemand.go).
+	c.ensureOwnerLeases(ctx, cmd)
 	return c.applyAdmittedEncodedLocal(ctx, payload, cmd, func() error {
 		if err := c.admitReservationCommand(cmd); err != nil {
 			return err
