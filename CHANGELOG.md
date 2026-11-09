@@ -14,12 +14,12 @@ timeline
     July 2026 : 1 release : v0.5.5
     September 2026 : 3 releases : v0.5.6 to v0.6.0
     October 2026 : 8 releases : v0.6.1 to v0.6.8
-    November 2026 : 4 releases : v0.6.9 to v0.6.12
+    November 2026 : 5 releases : v0.6.9 to v0.6.13
 ```
 
 | Release line | Releases | Dates | Latest |
 |---|---|---|---|
-| [0.6](#06-release-line) | 13 | Sep 28, 2026 to Nov 8, 2026 | [v0.6.12](#v0612-safer-cluster-failover-sandbox-lifecycle-controls-and-a-download-mirror) |
+| [0.6](#06-release-line) | 14 | Sep 28, 2026 to Nov 9, 2026 | [v0.6.13](#v0613-cluster-writes-that-never-hang-creates-right-after-a-leader-change-and-a-mirror-fallback-for-terraform-nodes) |
 | [0.5](#05-release-line) | 7 | Jun 1, 2026 to Sep 28, 2026 | [v0.5.7](#v057-dependency-updates) |
 | [0.4](#04-release-line) | 1 | May 28, 2026 | [v0.4.1](#v041-firecracker-runtime-wiring) |
 | [0.3](#03-release-line) | 1 | May 24, 2026 | [v0.3.1](#v031-custom-domains-and-image-garbage-collection) |
@@ -27,6 +27,20 @@ timeline
 | [0.1](#01-release-line) | 8 | May 8, 2026 to May 16, 2026 | [v0.1.7](#v017-daytona-and-e2b-compatibility-snapshots-image-builds) |
 
 ## 0.6 release line
+
+### v0.6.13: Cluster writes that never hang, creates right after a leader change, and a mirror fallback for Terraform nodes
+
+*November 9, 2026* · [Full notes](https://github.com/aerol-ai/microvm/releases/tag/v0.6.13)
+
+- **Cluster API calls no longer hang when a server stops in the middle of a write.** When a leader's sandboxd stopped, restarted or was upgraded while writes were in flight, a write it had already committed could wait for an answer forever. Now it answers "not the leader, retry" within about 2 seconds, and SDKs retry it on the new leader. (#1091)
+- **Creates keep working right after a leader change.** A newly elected leader used to refuse creates with a retryable 503 ("worker has no fresh capacity heartbeat") for up to about 20 seconds, while its own view of the workers filled. Now it asks the worker for its capacity directly and decides. (#1092)
+- **Terraform-built nodes can fall back to the download mirror.** Set the new Terraform variable `download_mirror` and every file the node setup downloads (the install and cluster scripts, the CNI plugins, BuildKit and Firecracker) falls back to the public mirror when GitHub fails. The CNI plugins and BuildKit are checked against pinned SHA-256 values. Off by default. (#1093)
+
+**Before you upgrade:**
+
+- **No Raft state machine change.** Servers can be upgraded one at a time, and old and new servers can run side by side.
+- **`download_mirror` is off by default,** and leaving it unset changes nothing for an existing cluster: its node setup scripts render exactly as before. Setting it changes every node's `user_data`, so the next `terraform apply` replaces each node once. Plan it like any node replacement.
+- **Contributors with a test stack kept up with `--keep`:** the harness now turns `download_mirror` on, so that stack's nodes are replaced once on its next `run.sh` apply. Set `AEROL_DOWNLOAD_MIRROR=off` to avoid it.
 
 ### v0.6.12: Safer cluster failover, sandbox lifecycle controls, and a download mirror
 
