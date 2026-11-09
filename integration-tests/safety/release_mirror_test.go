@@ -2,6 +2,7 @@ package safety
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -178,31 +179,34 @@ func TestReleaseMirrorRoleTrust(t *testing.T) {
 
 func TestReleaseMirrorRolePermissions(t *testing.T) {
 	p, _ := readPolicy(t, "permissions-policy.json")
-	got := map[string]string{}
+	// The role writes the release files (aerolvm/) and the third-party files
+	// install.sh pins (deps/, mirror-sync.sh --deps in the same job), and
+	// nothing else: no delete, no other prefix or bucket.
+	got := map[string][]string{}
 	for _, s := range p.Statement {
 		action, _ := s.Action.(string)
 		resource, _ := s.Resource.(string)
 		if s.Effect != "Allow" || action == "" || resource == "" || strings.Contains(action, "*") {
 			t.Fatalf("statement %q = %s %v on %v; want one plain Allow action on one resource", s.Sid, s.Effect, s.Action, s.Resource)
 		}
-		got[action] = resource
+		got[action] = append(got[action], resource)
 		if action == "s3:ListBucket" {
 			prefix, _ := s.Condition["StringLike"]["s3:prefix"].([]any)
-			if len(prefix) != 1 || prefix[0] != "aerolvm/*" {
-				t.Errorf("ListBucket prefix condition = %v, want only aerolvm/*", s.Condition)
+			if fmt.Sprint(prefix) != "[aerolvm/* deps/*]" {
+				t.Errorf("ListBucket prefix condition = %v, want only aerolvm/* and deps/*", s.Condition)
 			}
 		}
 	}
-	want := map[string]string{
-		"s3:PutObject":  "arn:aws:s3:::aerolvm-downloads/aerolvm/*",
-		"s3:ListBucket": "arn:aws:s3:::aerolvm-downloads",
+	want := map[string][]string{
+		"s3:PutObject":  {"arn:aws:s3:::aerolvm-downloads/aerolvm/*", "arn:aws:s3:::aerolvm-downloads/deps/*"},
+		"s3:ListBucket": {"arn:aws:s3:::aerolvm-downloads"},
 	}
 	if len(got) != len(want) {
 		t.Errorf("role allows %v, want exactly %v (no delete, no other prefix or bucket)", got, want)
 	}
 	for a, r := range want {
-		if got[a] != r {
-			t.Errorf("%s on %q, want %q", a, got[a], r)
+		if fmt.Sprint(got[a]) != fmt.Sprint(r) {
+			t.Errorf("%s on %v, want %v", a, got[a], r)
 		}
 	}
 }

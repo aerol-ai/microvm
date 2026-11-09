@@ -135,6 +135,12 @@ type capacityLeaseCache struct {
 	// covers. Never nil after newCapacityLeaseCache; New shares it with the
 	// FSM, which records into it.
 	unreported *unreportedLoad
+
+	// onDemand / onDemandFailed are the leader's on-demand fetches in
+	// progress and when each worker's last one failed
+	// (capacity_lease_ondemand.go). Guarded by mu.
+	onDemand       map[string]*leaseFlight
+	onDemandFailed map[string]time.Time
 }
 
 func newCapacityLeaseCache(selfID string, admitter *capacity.Admitter, interval time.Duration, logger *slog.Logger) *capacityLeaseCache {

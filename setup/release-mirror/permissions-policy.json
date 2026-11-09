@@ -8,13 +8,19 @@
       "Resource": "arn:aws:s3:::aerolvm-downloads/aerolvm/*"
     },
     {
-      "Sid": "ListReleaseFiles",
+      "Sid": "WritePinnedThirdPartyFiles",
+      "Effect": "Allow",
+      "Action": "s3:PutObject",
+      "Resource": "arn:aws:s3:::aerolvm-downloads/deps/*"
+    },
+    {
+      "Sid": "ListReleaseAndThirdPartyFiles",
       "Effect": "Allow",
       "Action": "s3:ListBucket",
       "Resource": "arn:aws:s3:::aerolvm-downloads",
       "Condition": {
         "StringLike": {
-          "s3:prefix": ["aerolvm/*"]
+          "s3:prefix": ["aerolvm/*", "deps/*"]
         }
       }
     }

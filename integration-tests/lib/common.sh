@@ -14,6 +14,45 @@
 SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
   -o ConnectTimeout=10 -o BatchMode=yes -o LogLevel=ERROR)
 
+# tf_init_failover runs `terraform <args>` (an init) so that a provider
+# download failing does not stop the run. Some providers are served from
+# GitHub release assets (cloudflare), and on 2026-11-09 those answered 504
+# from this laptop for hours: every run died at init with "Failed to install
+# provider". So:
+#   1. every init shares one plugin cache (AEROL_TF_PLUGIN_CACHE, default
+#      ~/.terraform.d/plugin-cache), so a provider any run in any worktree
+#      downloaded once is reused instead of downloaded again;
+#   2. if init still fails, it is retried once with -plugin-dir pointed at
+#      that cache, which installs providers with no network at all.
+# Usage: TF_DATA_DIR=... tf_init_failover -chdir=<dir> init <init flags...>
+tf_init_failover() {
+  local cache="${AEROL_TF_PLUGIN_CACHE:-$HOME/.terraform.d/plugin-cache}"
+  mkdir -p "$cache"
+  # The repo's lock file is not committed, so without this Terraform >= 1.4
+  # would skip the cache for every provider it has no recorded checksum for.
+  export TF_PLUGIN_CACHE_DIR="$cache" TF_PLUGIN_CACHE_MAY_BREAK_DEPENDENCY_LOCK_FILE=true
+  if terraform "$@"; then
+    return 0
+  fi
+  echo "terraform init failed; retrying with the providers already in ${cache} (no download)" >&2
+  terraform "$@" -plugin-dir="$cache"
+}
+
+# download_mirror_tfvar_args prints the Terraform flag that turns on the node
+# bootstrap's download mirror fallback (Terraform variable download_mirror),
+# from DOWNLOAD_MIRROR/AEROL_DOWNLOAD_MIRROR: nothing when it is empty or
+# "off", so the bootstrap then renders exactly as before.
+download_mirror_tfvar_args() {
+  local mirror="${AEROL_DOWNLOAD_MIRROR-https://aerolvm-downloads.s3.us-east-1.amazonaws.com}"
+  [[ -n "$mirror" && "$mirror" != "off" ]] || return 0
+  printf -- '-var=download_mirror=%s\n' "${mirror%/}"
+}
+
+# stage_to_node: every file this machine hands a node goes through S3, never
+# scp (lib/stage.sh says why). Sourced here so every harness script has it.
+# shellcheck source=stage.sh
+source "$(dirname "${BASH_SOURCE[0]}")/stage.sh"
+
 # resolve_ssh_identity picks the private key the deployment's nodes actually
 # trust and wires it into SSH_OPTS, so every harness SSH call gets it — not
 # just the test suite.
@@ -334,8 +373,9 @@ stage_wasm_modules() {
       if ! ssh "${SSH_OPTS[@]}" "$tgt" \
              "curl -fsSL --retry 3 --max-time 300 -o '/tmp/${alias}.wasm' '${ref}' \
               && echo '${digest#sha256:}  /tmp/${alias}.wasm' | sha256sum -c --quiet -"; then
-        echo "stage_wasm: ${tgt} could not download ${alias}; copying the local fixture" >&2
-        if ! scp "${SSH_OPTS[@]}" "$file" "${tgt}:/tmp/${alias}.wasm"; then
+        echo "stage_wasm: ${tgt} could not download ${alias}; staging the local fixture through S3" >&2
+        if ! stage_to_node "$tgt" /tmp/aerol-wasm-stage "$file" ||
+           ! ssh "${SSH_OPTS[@]}" "$tgt" "mv -f '/tmp/aerol-wasm-stage/$(basename "$file")' '/tmp/${alias}.wasm'"; then
           echo "stage_wasm: staging ${alias} on ${tgt} failed" >&2
           return 1
         fi

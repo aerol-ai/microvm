@@ -429,6 +429,7 @@ destroy_scenario() {
   TF_DATA_DIR="${REPO_ROOT}/integration-tests/.tf/${scenario}" \
     terraform -chdir="${REPO_ROOT}/Terraform" destroy -auto-approve -input=false \
     $(tf_varfile_args "$scenario") ${admin[@]+"${admin[@]}"} \
+    $(download_mirror_tfvar_args) \
     -var="config_dir=${REPO_ROOT}/integration-tests/.tf/${scenario}/config" \
     -var="force_on_demand=$(on_demand_tfvar)" \
     -var="deploy_obs=$(deploy_obs_tfvar "${HERE}/scenarios/${scenario}.caps.yml")" \
@@ -1514,11 +1515,12 @@ run_one() {
   trap "teardown '${scenario}'" EXIT INT TERM
 
   echo "=== provisioning ${scenario} (domain=${leased:-none}) ==="
-  TF_DATA_DIR="$sdir" terraform -chdir="${REPO_ROOT}/Terraform" init -reconfigure -input=false \
+  TF_DATA_DIR="$sdir" tf_init_failover -chdir="${REPO_ROOT}/Terraform" init -reconfigure -input=false \
     -backend-config="key=${state_key}"
   # shellcheck disable=SC2046
   TF_DATA_DIR="$sdir" terraform -chdir="${REPO_ROOT}/Terraform" apply -auto-approve -input=false \
     $(tf_varfile_args "$scenario") \
+    $(download_mirror_tfvar_args) \
     -var="config_dir=${overlay}" \
     -var="force_on_demand=$(on_demand_tfvar)" \
     -var="deploy_obs=$(deploy_obs_tfvar "$caps_file")" \

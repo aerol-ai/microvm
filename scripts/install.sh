@@ -259,8 +259,15 @@ download_pins() {
 	echo "buildkit ${v} buildkit-${v}.linux-arm64.tar.gz ${BUILDKIT_SHA256_ARM64} ${buildkit}/buildkit-${v}.linux-arm64.tar.gz"
 	# Upstream's own checksum files, kept beside the files on the mirror for
 	# anyone checking by hand. install.sh does not read them, so their
-	# hashes need bumping only when CADDY_PACKAGE_VERSION or
-	# CNI_PLUGINS_VERSION changes (and then these lines must change anyway).
+	# hashes need bumping only when CADDY_PACKAGE_VERSION,
+	# CNI_PLUGINS_VERSION or FIRECRACKER_VERSION changes (and then these lines
+	# must change anyway). The Terraform bootstrap does read the Firecracker
+	# ones: with download_mirror set it fetches the tarball and its
+	# .sha256.txt from the mirror when GitHub fails, and checks one against
+	# the other.
+	v="$FIRECRACKER_VERSION"
+	echo "firecracker ${v} firecracker-${v}-x86_64.tgz.sha256.txt 3405b4dffd6afdbd99824de84c1eabbcc71030a3166ce1f3255b08cf61e874cc ${fc}/firecracker-${v}-x86_64.tgz.sha256.txt"
+	echo "firecracker ${v} firecracker-${v}-aarch64.tgz.sha256.txt 6215cbde7ae9981d20fafec8d3939c0b8da8d7c9055d48bd963d03199fcd7279 ${fc}/firecracker-${v}-aarch64.tgz.sha256.txt"
 	v="$CADDY_PACKAGE_VERSION"
 	echo "caddy v${v} caddy_${v}_checksums.txt 5d27b76b95f496638d79208c55250317b8755fd9e90005f7466aa32956944a90 ${caddy}/caddy_${v}_checksums.txt"
 	v="$CNI_PLUGINS_VERSION"

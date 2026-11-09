@@ -418,6 +418,8 @@ func TestRunRefusesADomainScenarioWithNoDomainPool(t *testing.T) {
 			toolLog := filepath.Join(root, "tool-calls")
 			mustWrite(t, filepath.Join(it, "run.sh"), string(runSh))
 			mustWrite(t, filepath.Join(it, "lib", "common.sh"), string(common))
+			// common.sh sources stage.sh beside it.
+			mustWrite(t, filepath.Join(it, "lib", "stage.sh"), string(stageLib(t)))
 			mustWrite(t, filepath.Join(it, "lib", "provision.sh"),
 				"#!/usr/bin/env bash\nprintf '%s\\n' \"$*\" >>\""+gateLog+"\"\nexit 97\n")
 			for _, tool := range []string{"terraform", "aws", "curl", "ssh"} {

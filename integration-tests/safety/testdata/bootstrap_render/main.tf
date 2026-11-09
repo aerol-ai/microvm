@@ -89,6 +89,7 @@ locals {
     aws_region = "x"
     seed_private_ip = "x"
     install_script_url = "x"
+    download_mirror = ""
     caddy_binary_url = "x"
     cluster_init_script_url = "x"
     cluster_join_script_url = "x"
@@ -176,6 +177,12 @@ output "joiner" { value = templatefile("__TEMPLATE__", merge(local.base, { is_se
 
 # default_ingress_proxy_routing is three-valued (Terraform/variables.tf): the
 # base above is null (no flag, install.sh's default); these set it.
+# download_mirror set (Terraform/variables.tf): the bootstrap's downloads fall
+# back to the mirror. The base above is "" (null), which must render nothing
+# new.
+output "joiner_download_mirror" {
+  value = templatefile("__TEMPLATE__", merge(local.base, { is_seed = false, download_mirror = "https://mirror.example.com/base" }))
+}
 output "joiner_routing_on" {
   value = templatefile("__TEMPLATE__", merge(local.base, { is_seed = false, ingress_proxy_routing = true }))
 }

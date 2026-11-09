@@ -627,6 +627,22 @@ variable "install_script_url" {
   default     = "https://aerolvm.aerol.ai"
 }
 
+# null (the default) renders the bootstrap exactly as before, so a cluster that
+# never set this keeps byte-identical user_data and no node is replaced
+# (user_data_replace_on_change). Setting it changes user_data once: the next
+# apply replaces each node.
+variable "download_mirror" {
+  description = "Download mirror the node bootstrap falls back to when a file's own source fails: AerolVM release files (install.sh, cluster-init.sh, cluster-join.sh, cluster-sign-node.sh) and the CNI plugins, BuildKit and Firecracker it downloads, with the CNI plugins and BuildKit checked against install.sh's pinned SHA-256. The public mirror is https://aerolvm-downloads.s3.us-east-1.amazonaws.com (scripts/mirror-sync.sh fills it). null (default): no fallback, GitHub only, as before. Setting it replaces each node once. See Terraform/README.md, \"Download mirror\"."
+  type        = string
+  default     = null
+  nullable    = true
+
+  validation {
+    condition     = var.download_mirror == null || can(regex("^https://[A-Za-z0-9.-]+(:[0-9]+)?(/[A-Za-z0-9._~/-]*)?$", var.download_mirror))
+    error_message = "download_mirror must be an https:// URL with no query, quotes or spaces (it is written into the bootstrap script), or null."
+  }
+}
+
 variable "caddy_binary_url" {
   description = "Optional URL of a prebuilt custom Caddy binary containing caddy-l4, caddy-dns/cloudflare, and certmagic-s3. When empty, install.sh uses the matching release asset if present and then falls back to Caddy's build service."
   type        = string

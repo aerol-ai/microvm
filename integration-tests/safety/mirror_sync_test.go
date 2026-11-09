@@ -485,3 +485,82 @@ func TestMirrorSyncSkipsFilesAlreadyOnTheMirror(t *testing.T) {
 		t.Fatal("the re-cut was not detected")
 	}
 }
+
+// onPublicMirror makes the fake curl serve a deps file at the public mirror
+// URL (https://aerolvm-downloads.s3.us-east-1.amazonaws.com/<key>).
+func (r *syncRig) onPublicMirror(key, body string) {
+	p := filepath.Join(r.gh, "web", "aerolvm-downloads.s3.us-east-1.amazonaws.com", key)
+	mustMkdir(r.t, filepath.Dir(p))
+	mustWrite(r.t, p, body)
+}
+
+// --deps --check only reads the public mirror: no credentials, no downloads,
+// no uploads. It is what a pull request that changes install.sh runs, so a
+// pin bumped without its mirror copy shows before the release.
+func TestMirrorSyncDepsCheck(t *testing.T) {
+	rows := []string{
+		"tool ${V} tool-v1.0.0.tgz " + strings.Repeat("a", 64) + " https://github.com/acme/tool/releases/download/${V}/tool-v1.0.0.tgz",
+		"extra ${V} extra.deb " + strings.Repeat("b", 64) + " https://downloads.acme.example/extra.deb",
+	}
+	for _, tc := range []struct {
+		name     string
+		present  []string
+		wantCode int
+		wantOut  string
+	}{
+		{name: "every pinned file on the mirror", present: []string{"deps/tool/v1.0.0/tool-v1.0.0.tgz", "deps/extra/v1.0.0/extra.deb"},
+			wantCode: 0, wantOut: "All 2 pinned files are on the mirror"},
+		{name: "one missing", present: []string{"deps/tool/v1.0.0/tool-v1.0.0.tgz"},
+			wantCode: 1, wantOut: "deps/extra/v1.0.0/extra.deb"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newSyncRig(t)
+			for _, k := range tc.present {
+				r.onPublicMirror(k, "x")
+			}
+			installSh := filepath.Join(t.TempDir(), "install.sh")
+			mustWrite(t, installSh, pinsScript(rows...))
+			r.run("--deps", "--check", "--install-sh", installSh)
+			if r.code != tc.wantCode {
+				t.Fatalf("exit %d, want %d", r.code, tc.wantCode)
+			}
+			if !strings.Contains(r.stdout+r.stderr, tc.wantOut) {
+				t.Errorf("output lacks %q", tc.wantOut)
+			}
+			if strings.Contains(r.logs, "aws ") || strings.Contains(r.logs, "gh ") || len(r.uploaded()) != 0 {
+				t.Errorf("--check called aws or gh or uploaded something:\n%s", r.logs)
+			}
+		})
+	}
+
+	t.Run("--check goes with --deps only", func(t *testing.T) {
+		r := newSyncRig(t)
+		r.run("--release", "v1.0.0", "--check")
+		if r.code == 0 || !strings.Contains(r.stderr, "--check goes with --deps") {
+			t.Fatalf("exit %d, stderr %q; want a refusal", r.code, r.stderr)
+		}
+	})
+}
+
+// The release workflow runs --deps on every release. When the mirror already
+// serves every pinned file (pins rarely change), nothing is downloaded from
+// GitHub or a vendor and nothing is uploaded, so a GitHub outage cannot fail
+// the step for nothing.
+func TestMirrorSyncDepsDoesNothingWhenTheMirrorHasEveryPin(t *testing.T) {
+	r := newSyncRig(t)
+	rows := []string{
+		"tool ${V} tool-v1.0.0.tgz " + strings.Repeat("a", 64) + " https://github.com/acme/tool/releases/download/${V}/tool-v1.0.0.tgz",
+		"tool ${V} tool " + strings.Repeat("c", 64) + " tar:tool-v1.0.0.tgz:release-v1.0.0/tool",
+	}
+	r.onPublicMirror("deps/tool/v1.0.0/tool-v1.0.0.tgz", "x")
+	r.onPublicMirror("deps/tool/v1.0.0/tool", "x")
+	installSh := filepath.Join(t.TempDir(), "install.sh")
+	mustWrite(t, installSh, pinsScript(rows...))
+	r.run("--deps", "--install-sh", installSh)
+	if r.code != 0 || !strings.Contains(r.stdout, "nothing to do") {
+		t.Fatalf("exit %d, stdout %q; want success with nothing to do", r.code, r.stdout)
+	}
+	if strings.Contains(r.logs, "aws ") || strings.Contains(r.logs, "gh ") || len(r.uploaded()) != 0 {
+		t.Errorf("downloaded or uploaded although the mirror had every pin:\n%s", r.logs)
+	}
+}

@@ -145,6 +145,7 @@ resource "aws_instance" "seed" {
     audit_receiver_cert_pem                  = local.audit_receiver_cert_pem
     audit_receiver_key_pem                   = local.audit_receiver_key_pem
     install_script_url                       = var.install_script_url
+    download_mirror                          = local.download_mirror
     caddy_binary_url                         = var.caddy_binary_url
     cluster_init_script_url                  = var.cluster_init_script_url
     cluster_join_script_url                  = var.cluster_join_script_url
@@ -388,6 +389,7 @@ resource "aws_instance" "joiner" {
     # Joiners never serve the receiver, so they must not hold its private key.
     audit_receiver_key_pem       = ""
     install_script_url           = var.install_script_url
+    download_mirror              = local.download_mirror
     caddy_binary_url             = var.caddy_binary_url
     cluster_init_script_url      = var.cluster_init_script_url
     cluster_join_script_url      = var.cluster_join_script_url

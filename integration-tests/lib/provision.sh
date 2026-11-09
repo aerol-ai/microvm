@@ -72,7 +72,7 @@ tf_init() {
   local scenario="$1"
   local key="${STATE_BUCKET_PREFIX}${scenario}/terraform.tfstate"
   TF_DATA_DIR="${REPO_ROOT}/integration-tests/.tf/${scenario}" \
-    terraform -chdir="$TF_DIR" init -reconfigure -input=false \
+    tf_init_failover -chdir="$TF_DIR" init -reconfigure -input=false \
     -backend-config="key=${key}"
 }
 

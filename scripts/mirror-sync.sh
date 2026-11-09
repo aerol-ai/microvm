@@ -3,7 +3,7 @@
 # back to when GitHub fails (s3://aerolvm-downloads, us-east-1).
 #
 #   scripts/mirror-sync.sh --release <tag> [--latest | --no-latest]
-#   scripts/mirror-sync.sh --deps
+#   scripts/mirror-sync.sh --deps [--check]
 #
 # Options for both: --bucket <name>, --region <region>, --dry-run, --force,
 # --repo <owner/repo> (releases only), --install-sh <path> (deps only).
@@ -18,6 +18,13 @@
 # install.sh, checks its pinned SHA-256, and uploads it to
 # deps/<project>/<version>/<file>. The pins are read from install.sh itself
 # (the DOWNLOAD PINS block), so the mirror and the installer cannot disagree.
+# It first asks the public mirror which pinned files it already holds; when
+# it holds all of them (the usual case: pins rarely change), it downloads and
+# uploads nothing, so the release workflow can run it on every release.
+#
+# --deps --check only asks: it lists every pinned file the public mirror
+# lacks and exits 1 if there is one. It needs curl and nothing else (no AWS
+# credentials, no gh), so a pull request check can run it.
 #
 # A file already on the mirror at the same size is not uploaded again, so a
 # re-run (or a release workflow re-running) sends only what is missing; on
@@ -41,6 +48,7 @@ MODE=""
 TAG=""
 LATEST="auto"
 DRY_RUN="false"
+CHECK="false"
 FORCE="false"
 INSTALL_SH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/install.sh"
 
@@ -205,6 +213,27 @@ fetch_origin() {
 	fi
 }
 
+# public_base is where anyone reads the mirror over HTTPS (install.sh's
+# default DOWNLOAD_MIRROR for the default bucket). MIRROR_SYNC_PUBLIC_BASE
+# overrides it, for tests.
+public_base() {
+	echo "${MIRROR_SYNC_PUBLIC_BASE:-https://${BUCKET}.s3.${REGION}.amazonaws.com}"
+}
+
+# deps_missing prints the mirror key of every pinned file the public mirror
+# does not serve. It reads each one's headers only.
+deps_missing() {
+	local base project version file sha origin key
+	base="$(public_base)"
+	while read -r project version file sha origin; do
+		key="deps/${project}/${version}/${file}"
+		# </dev/null: curl must not eat the rows this loop reads.
+		if ! curl -fsSIL --retry 3 --retry-delay 2 --max-time 30 -o /dev/null "${base}/${key}" </dev/null; then
+			echo "$key"
+		fi
+	done <<<"$1"
+}
+
 sync_deps() {
 	load_pins
 	local safe='^[A-Za-z0-9][A-Za-z0-9._+-]*$'
@@ -213,6 +242,23 @@ sync_deps() {
 	local rows
 	rows="$(download_pins)"
 	[[ -n "$rows" ]] || die "download_pins listed nothing"
+	local missing total
+	total="$(grep -c . <<<"$rows")"
+	if [[ "$CHECK" == "true" || ("$DRY_RUN" != "true" && "$FORCE" != "true") ]]; then
+		need curl
+		missing="$(deps_missing "$rows")"
+		if [[ -z "$missing" ]]; then
+			echo "All ${total} pinned files are on the mirror ($(public_base)/deps/); nothing to do"
+			return 0
+		fi
+		if [[ "$CHECK" == "true" ]]; then
+			echo "The mirror lacks $(grep -c . <<<"$missing") of the ${total} files install.sh pins:" >&2
+			sed 's/^/  /' <<<"$missing" >&2
+			echo "Run scripts/mirror-sync.sh --deps with credentials that can write to s3://${BUCKET}/deps/ (the release workflow does this too)." >&2
+			return 1
+		fi
+		echo "The mirror lacks $(grep -c . <<<"$missing") of the ${total} pinned files; checking and uploading"
+	fi
 	if [[ "$DRY_RUN" == "true" ]]; then
 		echo "Plan: copy the files install.sh pins to s3://${BUCKET}/deps/"
 	else
@@ -273,6 +319,7 @@ while [[ $# -gt 0 ]]; do
 		--latest) LATEST="yes"; shift ;;
 		--no-latest) LATEST="no"; shift ;;
 		--dry-run) DRY_RUN="true"; shift ;;
+		--check) CHECK="true"; shift ;;
 		--force) FORCE="true"; shift ;;
 		--bucket)
 			[[ $# -ge 2 && "$2" =~ ^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$ ]] || die "--bucket needs an S3 bucket name"
@@ -308,6 +355,9 @@ done
 [[ -n "$MODE" ]] || { usage >&2; die "pass --release <tag> or --deps"; }
 if [[ "$MODE" == "deps" && "$LATEST" != "auto" ]]; then
 	die "--latest and --no-latest go with --release"
+fi
+if [[ "$CHECK" == "true" && "$MODE" != "deps" ]]; then
+	die "--check goes with --deps"
 fi
 
 # --size-only skips a file the mirror already holds at the same size; the

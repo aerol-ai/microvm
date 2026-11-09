@@ -43,6 +43,12 @@ var (
 	workerLeaseLostTotal    = expvar.NewInt("aerolvm_worker_lease_lost_total")
 	workerLeaseMaxAgeNanos  = expvar.NewInt("aerolvm_worker_lease_max_age_nanos")
 	workerLeaseRefreshNanos = expvar.NewInt("aerolvm_worker_lease_refresh_unix_nanos")
+	// capacityLeaseOnDemandFetches counts leases the leader fetched at
+	// admission because its sweep had no fresh one for the owner
+	// (capacity_lease_ondemand.go). It moves after a leader change onto a
+	// server that just started; steady growth means the sweep is not keeping
+	// leases alive.
+	capacityLeaseOnDemandFetches = expvar.NewInt("aerolvm_capacity_lease_on_demand_fetches_total")
 
 	ownerForwardTotal        = expvar.NewInt("aerolvm_owner_forward_total")
 	ownerForwardErrors       = expvar.NewMap("aerolvm_owner_forward_errors_total")
