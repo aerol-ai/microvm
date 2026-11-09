@@ -552,6 +552,26 @@ jobs:
             --content-type text/plain --cache-control no-cache --only-show-errors --no-progress
           echo "aerolvm/latest.txt now names $VERSION"
 
+      # The third-party files this release's install.sh pins (CNI plugins,
+      # BuildKit, Firecracker, Caddy, workerd) are its fallback too. A pin
+      # bump used to need a hand-run `mirror-sync.sh --deps`, and a forgotten
+      # one left the new version without a mirror copy. This runs it on every
+      # release: it first asks the public mirror, and when every pinned file
+      # is there (the usual case) it downloads and uploads nothing. Otherwise
+      # it checks every file against its pin before uploading any. Last in the
+      # job, so the release files and latest.txt above never wait on it.
+      - name: Check out this release's install.sh (its download pins)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ env.VERSION }}
+          path: src
+          persist-credentials: false
+
+      - name: Copy any pinned third-party file the mirror lacks
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: src/scripts/mirror-sync.sh --deps --bucket "$MIRROR_BUCKET"
+
   # npm and the MCP Registry are opt-in until their one-time setup is done
   # (npm/README.md): set the repository variable AEROLVM_NPM_PUBLISH=true.
   # Both run after the GitHub release, so a failure here never holds back

@@ -5,7 +5,8 @@
 # Creates (or updates) the IAM role that job assumes through GitHub OIDC: only
 # a workflow run of aerol-ai/microvm for a v* tag can assume it (the token
 # names the repository and the ref, not the workflow file), and it can only
-# write and list under s3://aerolvm-downloads/aerolvm/. No keys are
+# write and list under s3://aerolvm-downloads/aerolvm/ (release files) and
+# deps/ (the third-party files install.sh pins). No keys are
 # stored anywhere. The account id is filled in here so it is not in the repo.
 # Needs AWS credentials that can manage IAM, and the GitHub OIDC provider
 # (token.actions.githubusercontent.com) already in the account.
@@ -31,7 +32,7 @@ else
   aws iam create-role --role-name "$ROLE" \
     --assume-role-policy-document "$trust" \
     --max-session-duration 3600 \
-    --description "Release workflow (aerol-ai/microvm, v* tags) copies release files to s3://aerolvm-downloads/aerolvm/" \
+    --description "Release workflow (aerol-ai/microvm, v* tags) copies release files and pinned third-party files to s3://aerolvm-downloads/aerolvm/ and deps/" \
     --tags Key=Purpose,Value=release-download-mirror >/dev/null
 fi
 aws iam put-role-policy --role-name "$ROLE" --policy-name write-release-files \
