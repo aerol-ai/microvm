@@ -44,6 +44,19 @@ import (
 // stopGuardTimeout bounds each call to the local daemon.
 const stopGuardTimeout = 15 * time.Second
 
+// stopGuardSettle is how long the guard keeps re-reading the member list
+// before it refuses because voters are down. A server that just restarted
+// answers /health a few seconds before this node's gossip lists it alive
+// again, and the rollout leader's view runs ahead of this node's: the leader
+// saw the server it had just upgraded healthy and restarted the next one,
+// whose guard still saw the first as down and refused, failing the rollout
+// (cluster-rollout-join, 2026-11-09). A server that is really down stays
+// down, so the guard still refuses, only later. Tests shorten both.
+var (
+	stopGuardSettle     = 30 * time.Second
+	stopGuardSettlePoll = 2 * time.Second
+)
+
 // stopGuardAPI is the local daemon's API: the members list and the leader
 // hand-off. Tests replace newStopGuardAPI.
 type stopGuardAPI interface {
@@ -130,6 +143,9 @@ func guardServerStop(ctx context.Context, e stopGuardEnv, api stopGuardAPI, allo
 			return nil
 		}
 		return fmt.Errorf("refusing to stop sandboxd: cannot ask the local sandboxd who votes and who leads, so quorum cannot be checked (pass --allow-downtime to stop it anyway): %w", err)
+	}
+	if !allowDowntime {
+		list = settleMembers(ctx, api, e.nodeID, list, out)
 	}
 	var self *cluster.Member
 	alive := map[string]bool{}
@@ -286,4 +302,72 @@ func (a *localAPI) TransferLeadership(ctx context.Context) (upgradewire.LeaderTr
 	var out upgradewire.LeaderTransferResponse
 	err := a.do(ctx, http.MethodPost, upgradewire.ClusterLeaderTransferPath, upgradewire.LeaderTransferRequest{}, &out)
 	return out, err
+}
+
+// settleMembers re-reads the member list for up to stopGuardSettle while it
+// would refuse the stop with voters down, and returns the first list that
+// would not, or the last one read. It never turns a refusal into a stop on
+// its own: the caller decides on what it returns. A read that fails keeps
+// the list before it.
+func settleMembers(ctx context.Context, api stopGuardAPI, self string, list memberList, out io.Writer) memberList {
+	down := downVotersBlocking(list, self)
+	if len(down) == 0 {
+		return list
+	}
+	fmt.Fprintf(out, "waiting up to %s for the member list to show %s alive (a server that just restarted takes a few seconds to be listed)\n",
+		stopGuardSettle, strings.Join(down, ", "))
+	deadline := time.Now().Add(stopGuardSettle)
+	for time.Now().Before(deadline) {
+		select {
+		case <-ctx.Done():
+			return list
+		case <-time.After(stopGuardSettlePoll):
+		}
+		next, err := api.Members(ctx)
+		if err != nil {
+			continue
+		}
+		list = next
+		if len(downVotersBlocking(list, self)) == 0 {
+			return list
+		}
+	}
+	return list
+}
+
+// downVotersBlocking lists the voters other than self that are down, but
+// only when stopping self would then leave no majority; it is empty when
+// the stop keeps quorum or nobody is down (nothing a re-read can change).
+func downVotersBlocking(list memberList, self string) []string {
+	alive := map[string]bool{self: true}
+	for _, m := range list.Members {
+		if m.NodeID != self {
+			alive[m.NodeID] = m.Alive
+		}
+	}
+	voters := list.RaftVoters
+	if voters == nil {
+		for _, m := range list.Members {
+			if m.Voter {
+				voters = append(voters, m.NodeID)
+			}
+		}
+	}
+	if len(voters) < 2 || !slices.Contains(voters, self) {
+		return nil
+	}
+	up := 0
+	var down []string
+	for _, id := range voters {
+		if alive[id] {
+			up++
+		} else {
+			down = append(down, id)
+		}
+	}
+	if up-1 >= len(voters)/2+1 {
+		return nil
+	}
+	sort.Strings(down)
+	return down
 }

@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/aerol-ai/microvm/internal/cluster"
 	"github.com/aerol-ai/microvm/internal/nodeupgrade"
@@ -28,24 +29,43 @@ type fakeGuardAPI struct {
 	transfer    upgradewire.LeaderTransferResponse
 	transferErr error
 	transfers   int
+	// after are the member lists the later reads return, one per read, the
+	// last repeating; empty means every read returns members. reads counts
+	// the reads.
+	after [][]cluster.Member
+	reads int
+}
+
+// fastSettle shortens the guard's re-read window, so a refusal takes
+// milliseconds rather than stopGuardSettle.
+func fastSettle(t *testing.T) {
+	t.Helper()
+	settle, poll := stopGuardSettle, stopGuardSettlePoll
+	stopGuardSettle, stopGuardSettlePoll = 30*time.Millisecond, time.Millisecond
+	t.Cleanup(func() { stopGuardSettle, stopGuardSettlePoll = settle, poll })
 }
 
 func (f *fakeGuardAPI) ClusterMode(context.Context) (bool, error) { return true, nil }
 
 func (f *fakeGuardAPI) Members(context.Context) (memberList, error) {
+	f.reads++
+	members := f.members
+	if n := f.reads - 2; n >= 0 && len(f.after) > 0 {
+		members = f.after[min(n, len(f.after)-1)]
+	}
 	if f.membersErr != nil || f.legacy {
-		return memberList{Members: f.members}, f.membersErr
+		return memberList{Members: members}, f.membersErr
 	}
 	voters := f.voters
 	if voters == nil {
 		voters = []string{}
-		for _, m := range f.members {
+		for _, m := range members {
 			if m.Voter {
 				voters = append(voters, m.NodeID)
 			}
 		}
 	}
-	return memberList{Members: f.members, RaftVoters: voters}, nil
+	return memberList{Members: members, RaftVoters: voters}, nil
 }
 
 func (f *fakeGuardAPI) TransferLeadership(context.Context) (upgradewire.LeaderTransferResponse, error) {
@@ -58,6 +78,7 @@ func srv(id string, alive, leader bool) cluster.Member {
 }
 
 func TestGuardServerStop(t *testing.T) {
+	fastSettle(t)
 	worker := cluster.Member{NodeID: "w1", Alive: true}
 	cases := []struct {
 		name          string
@@ -67,7 +88,30 @@ func TestGuardServerStop(t *testing.T) {
 		wantErr       string
 		wantTransfers int
 		wantOut       string
+		// wantReads, when set, is how many member lists the guard read;
+		// wantMoreReads says it re-read at least once.
+		wantReads     int
+		wantMoreReads bool
 	}{
+		// A server the rollout just restarted is back on /health before
+		// this node's gossip lists it alive: the guard re-reads and goes on.
+		{name: "a server that just restarted shows up on a re-read: goes on", self: "s2",
+			api: fakeGuardAPI{members: []cluster.Member{srv("s1", true, true), srv("s2", true, false), srv("s3", false, false)},
+				after: [][]cluster.Member{{srv("s1", true, true), srv("s2", true, false), srv("s3", true, false)}}},
+			wantOut: "waiting up to", wantReads: 2},
+		{name: "a server still down after the window: refuses", self: "s2",
+			api:     fakeGuardAPI{members: []cluster.Member{srv("s1", true, true), srv("s2", true, false), srv("s3", false, false)}},
+			wantErr: "these servers are down: s3", wantOut: "to show s3 alive", wantMoreReads: true},
+		{name: "--allow-downtime does not wait", self: "s2", allow: true,
+			api:       fakeGuardAPI{members: []cluster.Member{srv("s1", true, true), srv("s2", true, false), srv("s3", false, false)}},
+			wantReads: 1, wantOut: "going on because --allow-downtime"},
+		{name: "a down voter that leaves a majority is not waited for", self: "s3",
+			api:       fakeGuardAPI{members: []cluster.Member{srv("s1", true, true), srv("s2", true, false), srv("s3", true, false), srv("s4", true, false), srv("s5", false, false)}},
+			wantReads: 1},
+		{name: "two voters, both up: nothing a re-read can change", self: "s2",
+			api:       fakeGuardAPI{members: []cluster.Member{srv("s1", true, true), srv("s2", true, false)}},
+			wantErr:   "leaves 1 of 2 voting servers up",
+			wantReads: 1},
 		{name: "three servers up, follower: goes on", self: "s2",
 			api: fakeGuardAPI{members: []cluster.Member{srv("s1", true, true), srv("s2", true, false), srv("s3", true, false), worker}}},
 		{name: "a worker never checks quorum", self: "w1",
@@ -160,7 +204,44 @@ func TestGuardServerStop(t *testing.T) {
 			if tc.wantOut != "" && !strings.Contains(out.String(), tc.wantOut) {
 				t.Fatalf("out = %q, want %q", out.String(), tc.wantOut)
 			}
+			if tc.wantReads > 0 && api.reads != tc.wantReads {
+				t.Fatalf("reads = %d, want %d", api.reads, tc.wantReads)
+			}
+			if tc.wantMoreReads && api.reads < 2 {
+				t.Fatalf("reads = %d, want a re-read", api.reads)
+			}
 		})
+	}
+}
+
+// A guard whose caller gave up while it waits refuses at once with what
+// it last read: it never stops sandboxd for want of an answer.
+func TestGuardServerStopCancelledWhileSettling(t *testing.T) {
+	settle, poll := stopGuardSettle, stopGuardSettlePoll
+	stopGuardSettle, stopGuardSettlePoll = time.Minute, time.Second
+	t.Cleanup(func() { stopGuardSettle, stopGuardSettlePoll = settle, poll })
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	api := fakeGuardAPI{members: []cluster.Member{srv("s1", true, true), srv("s2", true, false), srv("s3", false, false)}}
+	start := time.Now()
+	err := guardServerStop(ctx, stopGuardEnv{cluster: true, nodeID: "s2"}, &api, false, &bytes.Buffer{})
+	if err == nil || !strings.Contains(err.Error(), "these servers are down: s3") {
+		t.Fatalf("err = %v", err)
+	}
+	if time.Since(start) > 5*time.Second || api.reads != 1 {
+		t.Fatalf("waited %s with %d reads after the caller gave up", time.Since(start), api.reads)
+	}
+}
+
+// An older daemon without raft_voters: the re-read counts voters from the
+// members' flags, as the guard does.
+func TestDownVotersBlockingFromVoterFlags(t *testing.T) {
+	list := memberList{Members: []cluster.Member{srv("s1", true, true), srv("s2", true, false), srv("s3", false, false)}}
+	if got := downVotersBlocking(list, "s2"); len(got) != 1 || got[0] != "s3" {
+		t.Fatalf("down = %v", got)
+	}
+	if got := downVotersBlocking(list, "w1"); got != nil {
+		t.Fatalf("a node that does not vote = %v", got)
 	}
 }
 
@@ -190,6 +271,7 @@ func TestReadStopGuardEnv(t *testing.T) {
 // The hook on a cluster node uses the local API client, which sends the
 // node's PAT and reads the members and hand-off routes.
 func TestServerStopGuardAgainstTheLocalAPI(t *testing.T) {
+	fastSettle(t)
 	var gotAuth []string
 	voters := []string{"s1", "s2", "s3"}
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
