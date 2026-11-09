@@ -50,6 +50,21 @@ Every entry was re-verified against `main` at `704c9e74` on 2026-10-06.
   the Caddy upstream health config in `pkg/caddy` / `packaging/`, and the
   PR #522 design.
 
+## The snapshot list is node-local on a cluster (API)
+
+`GET /v1/snapshots` (`pkg/api/v1/snapshot.go` `listSnapshots`) reads only the
+answering server's own store; unlike `GET`/`DELETE /v1/snapshots/{id}` it has no
+`snapshotForwardWrap` and no owner fan-out. On a cluster the API usually lands
+on a server or the ingress, which holds no sandboxes, so `aerolvm get snapshots`
+(and the older `aerolvm snapshot` list) shows nothing for snapshots made on
+workers, while get, describe and delete by name work.
+
+Found 2026-11-09 by an unfiltered live run of the kubectl cases (UC-674) on
+cluster-join-token and cluster-rollout-join. UC-674 now skips its list checks on
+a cluster. Fix: page the list across owners the way the sandbox list does
+(`internal/clusterlist`), or list from the Raft artifact catalogue, then drop
+the skip.
+
 ## Destroy events WARN about an already-deleted placement (cluster)
 
 - **What:** stop `handle docker event failed … cluster: unknown sandbox

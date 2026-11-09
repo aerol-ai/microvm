@@ -286,10 +286,15 @@ const (
 	CapClusterChaos Capability = "cluster-chaos"
 	// CapOneLineJoin: every node joined with the one-line installer and a
 	// join token per role (Terraform one_line_join; plans/kubectl-style-
-	// cluster-ops.md §7), not the S3 bundle hand-off and CSR loop, and the
-	// servers sign certs with SB_CLUSTER_NODE_CERT_TTL=10m so renewal is
-	// seen in a run. Gates UC-620..625.
+	// cluster-ops.md §7), not the S3 bundle hand-off and CSR loop. Gates
+	// UC-620..625 (UC-623 also needs CapShortNodeCerts).
 	CapOneLineJoin Capability = "one-line-join"
+	// CapShortNodeCerts: the servers sign node certs with
+	// SB_CLUSTER_NODE_CERT_TTL=10m (the scenario's extra_sandboxd_env), so a
+	// cert renews within a run. Apart from CapOneLineJoin because a rollout
+	// scenario joins by token too but keeps 90-day certs, and UC-623 failed
+	// there on a cert it was never meant to see renew.
+	CapShortNodeCerts Capability = "short-node-certs"
 	// CapModuleURL: the scenario provisions through a root of its own whose
 	// module block fetches Terraform/ by git URL (run.sh
 	// prepare_module_root), not through Terraform/root, and leaves the join
@@ -347,7 +352,7 @@ var KnownCapabilities = map[Capability]bool{
 	CapKeyCustodyVault: true, CapKeyCustodyPKCS11: true, CapKeyCustodyKMSWrapped: true,
 	CapKeyCustodyKMSSwitch: true, CapKeyCustodySingleWrapped: true,
 	CapAPILoadBalancer: true, CapAPIListFairness: true, CapClusterChaos: true, CapOneLineJoin: true,
-	CapModuleURL: true,
+	CapModuleURL: true, CapShortNodeCerts: true,
 }
 
 // Registry is the full use-case catalogue. Order is the matrix row order.
@@ -1129,7 +1134,7 @@ var Registry = []UseCase{
 	{ID: "UC-620", Title: "Every node joined with a token through the one-line installer: its bootstrap ran install.sh init or join, cluster.env is sandboxd's, the cert names the token's role, nothing of the two-pass join ran, servers are the only voters, and each of Terraform's per-role tokens lists the nodes of its role", Requires: []Capability{CapOneLineJoin, CapCluster}, Implemented: true},
 	{ID: "UC-621", Title: "Wrong, reused and revoked join tokens are refused: an unknown token id's cluster-info is 403, a made-up token's join is 403 token_invalid, a used single-use token is 403 token_used for another key, a revoked token's cluster-info is 403; join-command refuses --ttl 0 for servers and warns for a never-expiring worker token", Requires: []Capability{CapOneLineJoin, CapCluster}, Implemented: true},
 	{ID: "UC-622", Title: "A deleted worker can't come back with its old key (403 key_revoked, sandboxd reset named as the fix); after sandboxd reset --yes a fresh join (new key and token) brings the same node ID back as a member", Requires: []Capability{CapOneLineJoin, CapCluster}, Implemented: true},
-	{ID: "UC-623", Title: "Node certs renew themselves: with 10-minute certs a server's and a worker's cert are replaced for the same node and role within 15 minutes, with no sandboxd restart, and sandboxes still place afterwards", Requires: []Capability{CapOneLineJoin, CapCluster}, Implemented: true},
+	{ID: "UC-623", Title: "Node certs renew themselves: with 10-minute certs a server's and a worker's cert are replaced for the same node and role within 15 minutes, with no sandboxd restart, and sandboxes still place afterwards", Requires: []Capability{CapOneLineJoin, CapCluster, CapShortNodeCerts}, Implemented: true},
 	{ID: "UC-624", Title: "aerolvm join-command prints `curl -fsSL <installer> | sudo bash -s -- join <url> --token <t> --ca-cert-hash sha256:<h>`, and those words run as typed on a reset machine make it a worker member under its host name", Requires: []Capability{CapOneLineJoin, CapCluster}, Implemented: true},
 	{ID: "UC-625", Title: "Running a successful join again is a replay: it exits 0, says nothing changed and sandboxd keeps its PID", Requires: []Capability{CapOneLineJoin, CapCluster}, Implemented: true},
 	// Upgrades without restarting sandboxes, Phase 3a live gate for mounts
@@ -1189,9 +1194,9 @@ var Registry = []UseCase{
 	{ID: "UC-671", Title: "aerolvm get sb -l: k=v and k==v (filtered by sandboxd), k!=v, k and !k (filtered by the CLI) select exactly the right tagged sandboxes, and a set-based selector is refused with exit 2", Requires: []Capability{CapDocker}, Implemented: true},
 	{ID: "UC-672", Title: "aerolvm describe sb shows the sandbox's ID, status, tags and network; describe <name> with no kind and the old get <name> still reach the sandbox; a missing sandbox exits 1", Requires: []Capability{CapDocker}, Implemented: true},
 	{ID: "UC-673", Title: "aerolvm delete sb destroys the sandbox (the API answers not found after), a repeat delete exits 0 as already gone, --json matches destroy's results, and delete with a word that is not a kind exits 2 and destroys nothing", Requires: []Capability{CapDocker}, Implemented: true},
-	{ID: "UC-674", Title: "aerolvm get/describe/delete snapshots on a snapshot the old snapshot verb made: listed by name, -o json names its source sandbox, describe shows it, delete removes it (get then exits 1) and a repeat delete exits 0", Requires: []Capability{CapDocker}, Implemented: true},
+	{ID: "UC-674", Title: "aerolvm get/describe/delete snapshots on a snapshot the old snapshot verb made: listed by name, -o json names its source sandbox, describe shows it, delete removes it (get then exits 1) and a repeat delete exits 0 (on a cluster the list checks are skipped: GET /v1/snapshots is node-local there)", Requires: []Capability{CapDocker}, Implemented: true},
 	{ID: "UC-675", Title: "aerolvm get/describe/delete tokens on a token aerolvm token create made: listed by ID, described by name, -o json shows role and team, delete by name is refused, delete by ID revokes it so it leaves the list, and a repeat delete exits 0", Requires: []Capability{CapIdentity}, Implemented: true},
-	{ID: "UC-676", Title: "aerolvm api-resources lists nodes, sandboxes, snapshots and tokens with their short names and verbs, with no login; top nodes on a single node shows the node's reserved CPU and memory against its budget from /v1/capacity", Requires: []Capability{CapDocker}, Implemented: true},
+	{ID: "UC-676", Title: "aerolvm api-resources lists nodes, sandboxes, snapshots and tokens with their short names and verbs, with no login; top nodes shows each node's reserved CPU and memory against its budget from /v1/capacity, and - for a node with no budget (a cluster's ingress or server)", Requires: []Capability{CapDocker}, Implemented: true},
 	// T14 (plans/kubectl-style-cluster-ops.md §6.4): measurements, not pass
 	// or fail on survival. They restart sandboxd, so they live in a file that
 	// sorts late (z_runtime_restart_test.go).

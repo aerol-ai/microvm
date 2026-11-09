@@ -322,3 +322,42 @@ func itoa(n int) string {
 	}
 	return string(b)
 }
+
+// short-node-certs and SB_CLUSTER_NODE_CERT_TTL go together. UC-623 waits
+// for node certs to renew, which takes 10-minute certs. A scenario that
+// declares the capability without the setting fails UC-623 on a 90-day cert
+// (cluster-rollout-join did, when the capability was folded into
+// one-line-join); one that sets it without the capability skips the case it
+// was built for.
+func TestShortNodeCertScenariosSetTheTTL(t *testing.T) {
+	ttlRe := regexp.MustCompile(`(?m)^\s*SB_CLUSTER_NODE_CERT_TTL\s*=\s*"[0-9]+m"\s*$`)
+	checked := 0
+	for _, f := range capsFiles(t) {
+		declared := false
+		for _, c := range capsList(t, f) {
+			if c == "short-node-certs" {
+				declared = true
+			}
+		}
+		tfvars := strings.TrimSuffix(f, ".caps.yml") + ".tfvars"
+		raw, err := os.ReadFile(tfvars)
+		if err != nil {
+			t.Fatal(err)
+		}
+		set := ttlRe.Match(raw)
+		switch {
+		case declared && !set:
+			t.Errorf("%s declares short-node-certs but %s does not set SB_CLUSTER_NODE_CERT_TTL in minutes: UC-623 would wait on a 90-day cert",
+				filepath.Base(f), filepath.Base(tfvars))
+		case set && !declared:
+			t.Errorf("%s sets SB_CLUSTER_NODE_CERT_TTL but %s does not declare short-node-certs, so UC-623 skips where it could run",
+				filepath.Base(tfvars), filepath.Base(f))
+		}
+		if declared {
+			checked++
+		}
+	}
+	if checked == 0 {
+		t.Fatal("no scenario declares short-node-certs; this guard would pass having checked nothing")
+	}
+}
