@@ -145,10 +145,16 @@ func TestUpgradeCLICluster02HandRunKeepsQuorum(t *testing.T) {
 	}
 	waitServersListed(t, c, servers)
 	leaderID := currentLeader(t, c)
+	// Every id is read now, while all three are listed: a server stopped
+	// below leaves gossip and drops out of the list, so its id can no
+	// longer be looked up there (2026-11-09: the lookup after the stop fell
+	// back to a guessed id and the case waited on it for 5 minutes).
+	ids := map[string]string{}
 	var leader harness.IntegrationNode
 	var followers []harness.IntegrationNode
 	for _, s := range servers {
-		if heteroNodeID(t, c, targets, s.Name) == leaderID {
+		ids[s.Name] = heteroNodeID(t, c, targets, s.Name)
+		if ids[s.Name] == leaderID {
 			leader = s
 		} else {
 			followers = append(followers, s)
@@ -177,7 +183,7 @@ func TestUpgradeCLICluster02HandRunKeepsQuorum(t *testing.T) {
 	}()
 	// The guard counts what gossip says, so wait until the cluster sees
 	// the stopped server as down.
-	downID := heteroNodeID(t, c, targets, down.Name)
+	downID := ids[down.Name]
 	waitVoter(t, c, downID, false)
 	out := sshRoot(t, other, handRun)
 	if !strings.Contains(out, "exit=1") || !strings.Contains(out, "refusing to stop sandboxd") || !strings.Contains(out, "1 of 3 voting servers") {
@@ -269,10 +275,20 @@ func waitVoter(t *testing.T, c *harness.Client, nodeID string, alive bool) {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Minute)
 	for {
+		listed := false
 		for _, m := range listNodeViews(t, c) {
-			if m.NodeID == nodeID && m.Alive == alive {
-				return
+			if m.NodeID == nodeID {
+				listed = true
+				if m.Alive == alive {
+					return
+				}
 			}
+		}
+		// A stopped server leaves gossip cleanly and drops out of the list
+		// rather than showing alive=false; the stop guard reads it as down
+		// the same way.
+		if !alive && !listed {
+			return
 		}
 		if time.Now().After(deadline) {
 			t.Fatalf("%s never became alive=%v", nodeID, alive)
