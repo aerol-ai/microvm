@@ -16,6 +16,20 @@ import (
 // can never be dragged back into the cluster it was meant to leave.
 const gossipPeerCacheFile = "gossip-peers.json"
 
+// gossipMemberCacheFile remembers a few members that are not control-plane
+// (workers, ingress), beside gossipPeerCacheFile and for the same lifetime.
+// It is a separate file, not more entries in gossip-peers.json, so that file
+// keeps meaning "control-plane peers": a node that loses every server must
+// never overwrite its way back to them with workers, and an older binary
+// reading gossip-peers.json after a downgrade finds the format it wrote.
+const gossipMemberCacheFile = "gossip-members.json"
+
+// maxCachedMemberPeers is how many non-control-plane members a node
+// remembers. Any one that is still up hands a restarted node the whole
+// membership in a single push/pull, so a few are enough; the rest only
+// survive the case where those few went down too.
+const maxCachedMemberPeers = 3
+
 // maxCachedGossipPeers bounds the rejoin fan-out. memberlist.Join dials the
 // list serially and an address whose host is gone costs a full TCP timeout,
 // so a long stale list turns one rejoin attempt into minutes. Control-plane
@@ -48,6 +62,25 @@ func newGossipPeerCache(dir string) *gossipPeerCache {
 		return nil
 	}
 	return &gossipPeerCache{path: filepath.Join(dir, gossipPeerCacheFile)}
+}
+
+// newGossipMemberCache is the cache for gossipMemberCacheFile. It shares the
+// type, and so the write-only-on-change and never-write-empty rules.
+func newGossipMemberCache(dir string) *gossipPeerCache {
+	if dir == "" {
+		return nil
+	}
+	return &gossipPeerCache{path: filepath.Join(dir, gossipMemberCacheFile)}
+}
+
+// snapshot returns a copy of the remembered list.
+func (c *gossipPeerCache) snapshot() []string {
+	if c == nil {
+		return nil
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]string(nil), c.last...)
 }
 
 // load returns the remembered peers. A missing or unreadable cache is not an
@@ -115,7 +148,15 @@ func (c *gossipPeerCache) remember(peers []string) error {
 // left out — they cannot re-admit anyone to raft, and at fleet scale they
 // would crowd the servers out of the bounded list.
 func liveControlPlanePeerAddrs(nodes []*memberlist.Node, selfNodeID string) []string {
-	var out []string
+	controlPlane, _ := livePeerAddrsByRole(nodes, selfNodeID)
+	return controlPlane
+}
+
+// livePeerAddrsByRole splits the alive peers' gossip addresses into those
+// that can serve the control plane and the rest, in one pass: the refresh
+// loop runs it every tick, and decoding every member's metadata twice would
+// double that cost at fleet size.
+func livePeerAddrsByRole(nodes []*memberlist.Node, selfNodeID string) (controlPlane, others []string) {
 	for _, n := range nodes {
 		if n == nil || n.State != memberlist.StateAlive || len(n.Addr) == 0 {
 			continue
@@ -124,10 +165,33 @@ func liveControlPlanePeerAddrs(nodes []*memberlist.Node, selfNodeID string) []st
 		if m.NodeID == "" || m.NodeID == selfNodeID || n.Name == selfNodeID {
 			continue
 		}
-		if !CanServeControlPlaneRole(m.Role) {
-			continue
+		if CanServeControlPlaneRole(m.Role) {
+			controlPlane = append(controlPlane, n.Address())
+		} else {
+			others = append(others, n.Address())
 		}
-		out = append(out, n.Address())
+	}
+	return controlPlane, others
+}
+
+// pickMemberPeers chooses up to maxCachedMemberPeers addresses from alive.
+// Members already remembered (previous) are kept while they stay alive, and
+// the rest are filled in address order, so the list, and the file behind it,
+// changes only when a chosen member goes away, not on every tick.
+func pickMemberPeers(alive, previous []string) []string {
+	alive = slices.Clone(alive)
+	slices.Sort(alive)
+	alive = slices.Compact(alive)
+	out := make([]string, 0, maxCachedMemberPeers)
+	for _, a := range alive {
+		if len(out) < maxCachedMemberPeers && slices.Contains(previous, a) {
+			out = append(out, a)
+		}
+	}
+	for _, a := range alive {
+		if len(out) < maxCachedMemberPeers && !slices.Contains(out, a) {
+			out = append(out, a)
+		}
 	}
 	return out
 }
