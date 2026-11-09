@@ -715,6 +715,24 @@ jobs:
       - name: Run the harness safety tests and Terraform's validate tests
         run: go test -count=1 ./integration-tests/safety/ ./Terraform/validate/
 
+      # The live suite (build tag integration) only runs against a real
+      # cluster, so a test there that reads source instead of a cluster used
+      # to run only during a live run: two such guards failed on main for
+      # weeks (chaosStopVoters). TestMain needs a scenario, but these tests
+      # never call it, so placeholder values do. go vet compiles the whole
+      # suite, which no other job does.
+      - name: Compile the live suite and run its offline guards
+        env:
+          AEROL_CAPS: ${{ github.workspace }}/integration-tests/scenarios/single-node.caps.yml
+          AEROL_BASE_URL: http://127.0.0.1:1
+          AEROL_PAT: offline
+          AEROL_SCENARIO: single-node
+        run: |
+          go vet -tags integration ./integration-tests/...
+          go test -tags integration -count=1 \
+            -run '^(TestEveryCaseThatStopsSandboxdWaitsForTheRejoin|TestTheRejoinWaitIsWiredEndToEnd|TestDisruptiveCasesChooseANonSeedVictim|TestParseMachineConfigRealScenarios)$' \
+            ./integration-tests/suite/
+
   # Job id stays `changes` because ruleset 16186085 requires that check.
   # It gates the merge on the DCO sign-off (checked in `paths`) and the
   # baseline suite only. The suites above still run on every pull request
