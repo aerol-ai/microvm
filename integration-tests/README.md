@@ -168,6 +168,11 @@ and each pinned third-party file at `deps/<project>/<version>/<file>`.
   worktree, `AEROL_TF_PLUGIN_CACHE` (default `~/.terraform.d/plugin-cache`).
   If `init` still fails, it is retried once with that cache as `-plugin-dir`,
   which needs no download at all (`tf_init_failover` in `lib/common.sh`).
+  A new machine has nothing in that cache, so if that fails too, `init` is
+  retried with the mirror's copy of the providers, `<mirror>/tf-providers/`
+  (a Terraform network mirror, filled by the release workflow with
+  `scripts/mirror-sync.sh --tf-providers`), as the only provider source.
+  `AEROL_DOWNLOAD_MIRROR=off` skips that last try.
 
 ## Container engine
 

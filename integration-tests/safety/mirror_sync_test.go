@@ -56,9 +56,11 @@ const fakeS3 = `#!/usr/bin/env bash
 echo "aws $*" >>"$TOOL_LOG"
 args=()
 size_only=""
+exclude=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --region|--content-type|--cache-control) shift 2 ;;
+    --exclude) exclude="$2"; shift 2 ;;
     --only-show-errors|--no-progress) shift ;;
     --size-only) size_only=1; shift ;;
     *) args+=("$1"); shift ;;
@@ -78,6 +80,8 @@ case "${args[0]} ${args[1]}" in
     # size is left alone.
     src="${args[2]}"
     (cd "$src" && find . -type f) | while read -r rel; do
+      # shellcheck disable=SC2053 # a glob, as aws --exclude takes
+      if [[ -n "$exclude" && "${rel#./}" == $exclude ]]; then continue; fi
       to="$dst/${rel#./}"
       if [[ -n "$size_only" && -f "$to" && $(wc -c <"$src/$rel") -eq $(wc -c <"$to") ]]; then
         echo "skip ${rel#./}" >>"$TOOL_LOG"
@@ -95,6 +99,7 @@ type syncRig struct {
 	gh, s3, log, binDir  string
 	stdout, stderr, logs string
 	code                 int
+	env                  []string // extra environment for the script and its fakes
 }
 
 func newSyncRig(t *testing.T) *syncRig {
@@ -135,6 +140,7 @@ func (r *syncRig) run(args ...string) {
 	cmd.Dir = r.t.TempDir()
 	cmd.Env = []string{"PATH=" + r.binDir + string(os.PathListSeparator) + os.Getenv("PATH"), "HOME=" + r.t.TempDir(),
 		"TOOL_LOG=" + r.log, "FAKE_GH=" + r.gh, "FAKE_S3=" + r.s3, "FAKE_WEB=" + filepath.Join(r.gh, "web")}
+	cmd.Env = append(cmd.Env, r.env...)
 	var out, errOut strings.Builder
 	cmd.Stdout, cmd.Stderr = &out, &errOut
 	err = cmd.Run()
@@ -409,9 +415,9 @@ func TestMirrorSyncDepsPlanCoversTheMirrorLayout(t *testing.T) {
 		"deps/cni-plugins/v1.5.1/cni-plugins-linux-arm64-v1.5.1.tgz",
 		"deps/cni-plugins/v1.5.1/cni-plugins-linux-arm64-v1.5.1.tgz.sha256",
 		"deps/cni-plugins/v1.5.1/cni-plugins-linux-arm64-v1.5.1.tgz.sha512",
-		"deps/caddy/v2.11.7/caddy_2.11.7_linux_amd64.deb",
-		"deps/caddy/v2.11.7/caddy_2.11.7_linux_arm64.deb",
-		"deps/caddy/v2.11.7/caddy_2.11.7_checksums.txt",
+		"deps/caddy/v2.11.9/caddy_2.11.9_linux_amd64.deb",
+		"deps/caddy/v2.11.9/caddy_2.11.9_linux_arm64.deb",
+		"deps/caddy/v2.11.9/caddy_2.11.9_checksums.txt",
 		"deps/buildkit/v0.17.2/buildkit-v0.17.2.linux-amd64.tar.gz (sha256 24d73e4456ebbe6dbb53779e362b2164a000e9636cd9ca8bd90f742fb024b731)",
 		"deps/buildkit/v0.17.2/buildkit-v0.17.2.linux-arm64.tar.gz (sha256 77384e2726c93d7c2bd7b745c079e1953f92683570203c7bfca361965db2f0c2)",
 		"deps/workerd/v1.20260717.1/workerd-linux-64.gz",

@@ -260,6 +260,13 @@ the skip.
   until Caddy reloaded with S3 storage at 06:33:35. At the same boundary
   sandboxd got a 500 installing the on-demand TLS policy ("on-demand TLS
   cannot be enabled without a permission module").
+- **Update (2026-11-10):** the 500 was not storage timing. Since Caddy
+  2.10, the TLS app checks automation policies before it turns the
+  deprecated `ask` into a permission, so an on-demand policy behind `ask`
+  alone always failed, and no custom domain got a certificate. Fixed:
+  `EnsureOnDemandTLS` sends the `http` permission module, and POSTs
+  `on_demand` (PUT answered 409 after every restart). The boot log no longer
+  promises a retry. Proven by `make test-acme-e2e` on Caddy 2.11.9.
 - **Correction (2026-10-06):** that policy is **not** retried on reconcile,
   despite the log line. `pkg/daemon/daemon.go:1006-1007` logs "will retry on
   next reconcile", but `EnsureOnDemandTLS` has only that one boot-time call.

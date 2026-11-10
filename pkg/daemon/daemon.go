@@ -1188,7 +1188,10 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 			if !onDemandTLSOnThisNode(cfg) {
 				logger.Info("caddy on-demand TLS policy skipped: ingress-only node under SB_INGRESS_PROXY_ROUTING (owners terminate custom domains)")
 			} else if err := caddyClient.EnsureOnDemandTLS(ctx, askURL, cfg.TLSOnDemandBurst, cfg.TLSOnDemandInterval); err != nil {
-				logger.Warn("failed to install caddy on-demand TLS policy; will retry on next reconcile",
+				// Nothing retries it: this boot call is the only one. Say so,
+				// so an operator knows custom domains get no certificates
+				// until the cause is fixed and sandboxd restarts.
+				logger.Warn("failed to install caddy on-demand TLS policy; custom domains get no new certificates until sandboxd restarts",
 					"error", err, "ask_url", askURL)
 			} else {
 				logger.Info("caddy on-demand TLS policy installed", "ask_url", askURL)

@@ -194,19 +194,33 @@ BUILDKIT_UNIT_FILE="/etc/systemd/system/buildkit.service"
 # to NAME="value" lines and download_pins. Bump a version and its hashes
 # together, and run mirror-sync.sh --deps before the release that ships them.
 
+# One Caddy version for every Caddy this project installs or builds: the
+# stock package below, the custom build each release attaches
+# (.github/workflows/release.yml), the build-service fallback in
+# install_custom_caddy, the integration harness (integration-tests/lib/
+# build.sh), the e2e tests (Makefile, internal/service/testfixtures/caddyfx).
+# Before this, the release build named no version and shipped whatever Caddy
+# was newest on release day, untested. integration-tests/safety/
+# caddy_version_test.go fails if any of those places names another version or
+# plugin. To move Caddy: change CADDY_VERSION and the package hashes here,
+# then the places that test lists, then run mirror-sync.sh --deps.
+CADDY_VERSION="2.11.9"
+# The plugins in the custom build, at fixed versions.
+CADDY_L4_MODULE="github.com/mholt/caddy-l4@v0.1.2"
+CADDY_DNS_CLOUDFLARE_MODULE="github.com/caddy-dns/cloudflare@v0.2.4"
+CADDY_STORAGE_S3_MODULE="github.com/ss098/certmagic-s3@v0.0.0-20250922022452-8af482af5f39"
 # The stock Caddy package, which provides the caddy user, caddy.service and
 # /etc/caddy; install_custom_caddy then swaps in the plugin build. It comes
 # from Caddy's GitHub release, not the Cloudsmith apt repository: that
 # answers 402 Payment Required whenever Cloudsmith's bandwidth quota runs
 # out (2023, 2024, and from 2026-10-09), and then every install failed. The
 # hashes are the release's .deb files (their SHA-512 matches
-# caddy_2.11.7_checksums.txt).
-CADDY_PACKAGE_VERSION="2.11.7"
+# caddy_2.11.9_checksums.txt).
 CADDY_PACKAGE_URL_BASE="https://github.com/caddyserver/caddy/releases/download"
-CADDY_PACKAGE_SHA256_AMD64="a22b914ffd1958da42bc7ab13b7b62c6100634e0798ab594891d2d61d53ba749"
-CADDY_PACKAGE_SHA256_ARM64="ca8ae5a50439642d7672344b4ec64e47cbddf81beb5da302420a78522eb5a47e"
-CADDY_PACKAGE_SHA256_ARMV7="a423a263b42ffbfb4cf5207c71a76b8b86c0139ee6a0cf29ca4f74bc898b95c8"
-CADDY_PACKAGE_SHA256_ARMV6="0cc377e95a13152c852b274fa610cf3410213aef959b99f5a5df60d06970cc16"
+CADDY_PACKAGE_SHA256_AMD64="bbea4aeaadc86b233c168cc33bad9daa1cbce756dc08949b783b45398f8e65cb"
+CADDY_PACKAGE_SHA256_ARM64="a226cafaddf2db7f392d232cecccc8b3bfaf8b2919f65d80e5e6aed15a97fe66"
+CADDY_PACKAGE_SHA256_ARMV7="e77fa0132065af043c8d7e42ee8aba27d35f3d9aae850d8f13d0fa0b250e5873"
+CADDY_PACKAGE_SHA256_ARMV6="cba34c8025ee631a538b78652186511e5aafa0d7cf166846c881e1f5a357684f"
 
 # Version-pinned workerd release for --with-isolate (plans/isolate-runtime.md
 # Phase 1). Upstream ships gzipped standalone binaries with no checksum
@@ -261,12 +275,12 @@ BUILDKIT_SHA256_ARM64="77384e2726c93d7c2bd7b745c079e1953f92683570203c7bfca361965
 # of another file already listed (and checked) for the same project and
 # version. fetch_pinned looks downloads up here.
 download_pins() {
-	local caddy="${CADDY_PACKAGE_URL_BASE}/v${CADDY_PACKAGE_VERSION}"
+	local caddy="${CADDY_PACKAGE_URL_BASE}/v${CADDY_VERSION}"
 	local workerd="https://github.com/cloudflare/workerd/releases/download/${WORKERD_VERSION}"
 	local fc="https://github.com/firecracker-microvm/firecracker/releases/download/${FIRECRACKER_VERSION}"
 	local cni="https://github.com/containernetworking/plugins/releases/download/${CNI_PLUGINS_VERSION}"
 	local buildkit="https://github.com/moby/buildkit/releases/download/${BUILDKIT_VERSION}"
-	local v="$CADDY_PACKAGE_VERSION"
+	local v="$CADDY_VERSION"
 	echo "caddy v${v} caddy_${v}_linux_amd64.deb ${CADDY_PACKAGE_SHA256_AMD64} ${caddy}/caddy_${v}_linux_amd64.deb"
 	echo "caddy v${v} caddy_${v}_linux_arm64.deb ${CADDY_PACKAGE_SHA256_ARM64} ${caddy}/caddy_${v}_linux_arm64.deb"
 	echo "caddy v${v} caddy_${v}_linux_armv7.deb ${CADDY_PACKAGE_SHA256_ARMV7} ${caddy}/caddy_${v}_linux_armv7.deb"
@@ -288,7 +302,7 @@ download_pins() {
 	echo "buildkit ${v} buildkit-${v}.linux-arm64.tar.gz ${BUILDKIT_SHA256_ARM64} ${buildkit}/buildkit-${v}.linux-arm64.tar.gz"
 	# Upstream's own checksum files, kept beside the files on the mirror for
 	# anyone checking by hand. install.sh does not read them, so their
-	# hashes need bumping only when CADDY_PACKAGE_VERSION,
+	# hashes need bumping only when CADDY_VERSION,
 	# CNI_PLUGINS_VERSION or FIRECRACKER_VERSION changes (and then these lines
 	# must change anyway). The Terraform bootstrap does read the Firecracker
 	# ones: with download_mirror set it fetches the tarball and its
@@ -297,8 +311,8 @@ download_pins() {
 	v="$FIRECRACKER_VERSION"
 	echo "firecracker ${v} firecracker-${v}-x86_64.tgz.sha256.txt 3405b4dffd6afdbd99824de84c1eabbcc71030a3166ce1f3255b08cf61e874cc ${fc}/firecracker-${v}-x86_64.tgz.sha256.txt"
 	echo "firecracker ${v} firecracker-${v}-aarch64.tgz.sha256.txt 6215cbde7ae9981d20fafec8d3939c0b8da8d7c9055d48bd963d03199fcd7279 ${fc}/firecracker-${v}-aarch64.tgz.sha256.txt"
-	v="$CADDY_PACKAGE_VERSION"
-	echo "caddy v${v} caddy_${v}_checksums.txt 5d27b76b95f496638d79208c55250317b8755fd9e90005f7466aa32956944a90 ${caddy}/caddy_${v}_checksums.txt"
+	v="$CADDY_VERSION"
+	echo "caddy v${v} caddy_${v}_checksums.txt e4e1e43b78299733b19b8aeab8abebcf57aef4f5dae617be125016f9e4e0299f ${caddy}/caddy_${v}_checksums.txt"
 	v="$CNI_PLUGINS_VERSION"
 	echo "cni-plugins ${v} cni-plugins-linux-amd64-${v}.tgz.sha256 c96ab6bec7d59dd01f2f3373fe6ce7cc17a13f21df13541cc8f06d4ef5bb5763 ${cni}/cni-plugins-linux-amd64-${v}.tgz.sha256"
 	echo "cni-plugins ${v} cni-plugins-linux-amd64-${v}.tgz.sha512 0f9b6f929b9eb5817549b439709e88ce3d24c4728eb1e8949e2f086105a33948 ${cni}/cni-plugins-linux-amd64-${v}.tgz.sha512"
@@ -1955,12 +1969,12 @@ install_caddy_package() {
 			exit 1
 			;;
 	esac
-	local asset="caddy_${CADDY_PACKAGE_VERSION}_linux_${arch}.deb"
+	local asset="caddy_${CADDY_VERSION}_linux_${arch}.deb"
 	local tmp_dir
 	tmp_dir="$(mktemp -d)"
 	if ! fetch_pinned "${tmp_dir}/${asset}" caddy "$asset"; then
 		rm -rf "$tmp_dir"
-		echo "Failed to download the Caddy ${CADDY_PACKAGE_VERSION} package, or it failed its checksum; refusing to install it" >&2
+		echo "Failed to download the Caddy ${CADDY_VERSION} package, or it failed its checksum; refusing to install it" >&2
 		exit 1
 	fi
 	apt-get install -y "${tmp_dir}/${asset}"
@@ -2067,6 +2081,24 @@ install_packages() {
 	else
 		echo "Only apt-based distributions are supported by this installer right now" >&2
 		exit 1
+	fi
+}
+
+# check_caddy_core_version refuses a Caddy whose core is not CADDY_VERSION.
+# Only the build-service fallback needs it: a release's own Caddy is checked
+# against that release's checksums.txt, and an older release may pin an older
+# Caddy. The build service builds the newest Caddy whatever it is asked for,
+# so after a Caddy release it serves a version no AerolVM release was tested
+# with; refusing it is better than running it unseen.
+check_caddy_core_version() {
+	local binary="$1"
+	local source_label="$2"
+	local got
+	got="$("$binary" version 2>/dev/null | awk '{print $1; exit}')"
+	if [[ "$got" != "v${CADDY_VERSION}" ]]; then
+		echo "${source_label} built Caddy ${got:-of an unknown version}, but this installer pins v${CADDY_VERSION}; refusing it." >&2
+		echo "Retry when GitHub or the download mirror answers, or pass --caddy-binary-url with a v${CADDY_VERSION} build." >&2
+		return 1
 	fi
 }
 
@@ -2189,9 +2221,16 @@ install_custom_caddy() {
 		echo "Prebuilt custom Caddy release asset unavailable; falling back to Caddy build service" >&2
 	fi
 
-	# Caddy build server accepts repeated &p= for additional modules.
-	local download_url="${CADDY_BUILD_URL_BASE}?os=linux&arch=${arch_tag}${arch_extra}&p=github.com/mholt/caddy-l4"
-	if [[ -n "$provider" ]]; then
+	# Caddy build server accepts repeated &p= for additional modules, each
+	# at the version after its @. It always builds the newest Caddy core: it
+	# ignores a requested version (checked 2026-11-10), so the core is
+	# checked after the download instead (check_caddy_core_version).
+	local download_url="${CADDY_BUILD_URL_BASE}?os=linux&arch=${arch_tag}${arch_extra}&p=${CADDY_L4_MODULE}"
+	if [[ "$provider" == "cloudflare" ]]; then
+		download_url="${download_url}&p=${CADDY_DNS_CLOUDFLARE_MODULE}"
+	elif [[ -n "$provider" ]]; then
+		# Only Cloudflare is pinned: it is the only DNS plugin the release
+		# build carries.
 		download_url="${download_url}&p=github.com/caddy-dns/${provider}"
 	fi
 	# Shared cert storage adds the certmagic-s3 plugin so multiple ingress
@@ -2199,7 +2238,7 @@ install_custom_caddy() {
 	# handles distributed locking via S3 conditional writes — no
 	# orchestration code lives in install.sh.
 	if [[ "$CADDY_STORAGE_S3" == "true" ]]; then
-		download_url="${download_url}&p=github.com/ss098/certmagic-s3"
+		download_url="${download_url}&p=${CADDY_STORAGE_S3_MODULE}"
 	fi
 
 	tmp_binary="$(mktemp)"
@@ -2210,7 +2249,8 @@ install_custom_caddy() {
 		exit 1
 	fi
 
-	if ! verify_custom_caddy_binary "$tmp_binary" "Caddy build server" "${required_modules[@]}"; then
+	if ! verify_custom_caddy_binary "$tmp_binary" "Caddy build server" "${required_modules[@]}" \
+		|| ! check_caddy_core_version "$tmp_binary" "Caddy build server"; then
 		rm -f "$tmp_binary"
 		exit 1
 	fi

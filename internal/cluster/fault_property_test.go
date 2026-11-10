@@ -53,6 +53,11 @@ const (
 	// propertyIDs is the sandbox id pool. Small on purpose: ids are reused
 	// after a delete, the way keyed creates (E2B, Runloop) reuse them.
 	propertyIDs = 12
+	// propertySweepTicks bounds opSweep's re-sweeps and a restarted
+	// server's ownership replays: what the product's tickers (reservation
+	// sweep, local ownership reconcile) would do in a few ticks after a
+	// leader change.
+	propertySweepTicks = 3
 	// propertyLongTTL is the TTL of a reservation that is promoted at once.
 	propertyLongTTL = time.Minute
 	// propertyShortTTL is the TTL of a reservation whose create never
@@ -499,14 +504,34 @@ func (r *propertyRun) opSweep() {
 		time.Sleep(50 * time.Millisecond)
 	}
 	start := time.Now().Unix()
-	r.fc.leader().cluster().reconcileReservations(ctx)
-	r.fc.settle()
-	for _, s := range r.fc.up() {
-		for id, p := range s.cluster().fsm.snapshot() {
-			if p.IsReserved() && p.ExpiresUnix > 0 && p.ExpiresUnix < start {
-				r.fail("%s: reservation %s expired at %d and survived the sweep at %d", s.id, id, p.ExpiresUnix, start)
+	// The product sweeps on a ticker, and reconcileReservations is
+	// best-effort: on a server that has just lost leadership it does nothing,
+	// and the next tick finishes the job (dead_owner.go). One sweep that
+	// lands on a leader change is therefore not a bug; a stress run under
+	// load failed 1 of 80 that way. So sweep as the ticker would, a bounded
+	// number of times, and fail only if an expired reservation outlives all
+	// of them.
+	survivor := func() string {
+		for _, s := range r.fc.up() {
+			for id, p := range s.cluster().fsm.snapshot() {
+				if p.IsReserved() && p.ExpiresUnix > 0 && p.ExpiresUnix < start {
+					return fmt.Sprintf("%s: reservation %s expired at %d and survived the sweep at %d", s.id, id, p.ExpiresUnix, start)
+				}
 			}
 		}
+		return ""
+	}
+	var left string
+	for sweep := 1; sweep <= propertySweepTicks; sweep++ {
+		r.fc.leader().cluster().reconcileReservations(ctx)
+		r.fc.settle()
+		if left = survivor(); left == "" {
+			break
+		}
+		r.t.Logf("step %d: sweep %d of %d left %s; sweeping again, as the next tick would", r.step, sweep, propertySweepTicks, left)
+	}
+	if left != "" {
+		r.fail("%s (after %d sweeps)", left, propertySweepTicks)
 	}
 	for id, row := range r.m.rows {
 		if row.state == "reserved" {
@@ -547,8 +572,20 @@ func (r *propertyRun) opStopOrStart() {
 	}
 	ctx, cancel := r.ctx()
 	defer cancel()
-	if err := c.AssertOwnership(ctx, local); err != nil {
-		r.t.Logf("step %d: AssertOwnership on %s: %v", r.step, down.id, err)
+	// The service replays ownership at boot and again on every reconcile
+	// pass (reconcileLocalClusterOwnership: "will retry"); AssertOwnership is
+	// built to run again. A boot replay that lands on a leader change fails
+	// with "not raft leader" (2 of 80 stress runs), and the next pass would
+	// finish it, so replay as those passes would, a bounded number of times.
+	for replay := 1; replay <= propertySweepTicks; replay++ {
+		err := c.AssertOwnership(ctx, local)
+		if err == nil {
+			break
+		}
+		r.t.Logf("step %d: AssertOwnership on %s (pass %d of %d): %v", r.step, down.id, replay, propertySweepTicks, err)
+		if replay < propertySweepTicks {
+			time.Sleep(100 * time.Millisecond)
+		}
 	}
 	r.fc.settle()
 	// What the replay may change: an orphan of this server is claimed back.
