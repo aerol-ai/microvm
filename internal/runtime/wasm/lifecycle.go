@@ -136,6 +136,7 @@ func (d *Driver) Start(ctx context.Context, sandboxID string) (*models.SandboxRu
 	d.mu.Lock()
 	d.byID[sandboxID] = inst
 	d.mu.Unlock()
+	d.recordInstance(inst)
 	return d.runtimeState(inst), nil
 }
 

@@ -69,12 +69,19 @@ const childListId = entry => `sidebar-children${entry.href.replace(/[^a-z0-9]+/g
                 aria-label={`${entry.label.replace(/^-\s*/, '')} sections`}
               />
               <ul id={childListId(entry)} class="children" hidden>
-                {entry.children.map(child => (
-                  <li>
-                    <a href={child.href}>
-                      <span>{child.label}</span>
-                    </a>
-                  </li>
+                {entry.children.map((child, i) => (
+                  <>
+                    {child.reference && !entry.children[i - 1]?.reference && (
+                      <li class="children-heading">
+                        <span>Reference</span>
+                      </li>
+                    )}
+                    <li>
+                      <a href={child.href}>
+                        <span>{child.label}</span>
+                      </a>
+                    </li>
+                  </>
                 ))}
               </ul>
             </>
@@ -97,18 +104,26 @@ const childListId = entry => `sidebar-children${entry.href.replace(/[^a-z0-9]+/g
     list.hidden = !open
   }
 
-  const pathAndHash = (url: { pathname: string; hash: string }) =>
-    url.pathname.replace(/\/$/, '') + url.hash
+  const path = (url: { pathname: string }) => url.pathname.replace(/\/$/, '')
+
+  // A child that is a section of its parent (SSO's providers) is current
+  // when the path and the #anchor match. A child that is a page of its own
+  // (the cluster guide) is current on any anchor of that page: a reader who
+  // lands on /cluster/create/#step-9, or clicks a "step 1" link in it, is
+  // still on that page.
+  const isCurrentLink = (link: HTMLAnchorElement) => {
+    const url = new URL(link.href)
+    return path(url) === path(location) && (!url.hash || url.hash === location.hash)
+  }
 
   const markCurrent = () => {
-    const here = pathAndHash(location)
     document.querySelectorAll<HTMLElement>('.children-toggle').forEach(toggle => {
       const list = listFor(toggle)
       if (!list) return
       let current = false
       list.querySelectorAll<HTMLAnchorElement>('a').forEach(link => {
-        const match = pathAndHash(new URL(link.href)) === here
-        if (match) link.setAttribute('aria-current', 'location')
+        const match = isCurrentLink(link)
+        if (match) link.setAttribute('aria-current', new URL(link.href).hash ? 'location' : 'page')
         else link.removeAttribute('aria-current')
         current ||= match
       })
@@ -263,5 +278,16 @@ const childListId = entry => `sidebar-children${entry.href.replace(/[^a-z0-9]+/g
   ul.children > li > a {
     font-size: 0.8125rem;
     padding: 3px 0;
+  }
+
+  /* Splits a guide's pages from its reference pages in the same list. */
+  ul.children > li.children-heading {
+    margin-top: 0.5rem;
+    font-family: var(--font-condensed);
+    font-size: 0.75rem;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: var(--secondary-text-color);
   }
 </style>

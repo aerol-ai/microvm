@@ -16,7 +16,7 @@ import (
 // because mount tools (mountpoint-s3, sshfs, rclone) don't all show up under
 // a single name and we want to match by argv path.
 func killFUSEProcessesFor(logger *slog.Logger, dir string) {
-	killFUSEProcessesInRoot(logger, dir, "/proc")
+	killFUSEProcessesInRoot(logger, dir, procRoot)
 }
 
 func killFUSEProcessesInRoot(logger *slog.Logger, dir, procRoot string) {

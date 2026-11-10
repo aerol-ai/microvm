@@ -1,0 +1,20 @@
+exit 0
+--- stdout
+rollout r-1 finalized: every node runs v0.6.13
+--- stderr
+aerolvm: rollout r-1 to v0.6.13 is already running
+aerolvm:   node srv-a (server): done, runs v0.6.13
+aerolvm:   node srv-b (server): done, runs v0.6.13
+aerolvm:   node srv-c (server): done, runs v0.6.13
+aerolvm:   node ing-1 (ingress): done, runs v0.6.13
+aerolvm:   node wkr-1 (worker): done, runs v0.6.13
+aerolvm:   node wkr-2 (worker): staged
+aerolvm:   node wkr-3 (worker): staged
+aerolvm: rollout r-1: running
+aerolvm:   node wkr-2 (worker): upgrading
+aerolvm:   node wkr-2 (worker): done, runs v0.6.13
+aerolvm:   node wkr-3 (worker): upgrading
+aerolvm:   node wkr-3 (worker): done, runs v0.6.13
+aerolvm: rollout r-1: done
+aerolvm: rollout r-1: finalizing
+aerolvm: rollout r-1: finalized

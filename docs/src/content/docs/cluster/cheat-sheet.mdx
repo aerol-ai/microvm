@@ -1,0 +1,141 @@
+---
+title: Command cheat sheet
+description: Every cluster command on one page, grouped by task, with where each one runs.
+---
+
+Each block says where it runs. `aerolvm` runs on your computer. `sudo sandboxd` runs on a node, where `sandboxd` is the AerolVM program.
+
+## Start a cluster
+
+```bash title="On node 1"
+export CLOUDFLARE_API_TOKEN=your-cloudflare-token
+curl -fsSL https://aerolvm.aerol.ai | sudo bash -s -- \
+    --domain cluster.example.com \
+    --pat-token your-admin-token \
+    --dns-provider cloudflare \
+    --dns-api-token "$CLOUDFLARE_API_TOKEN" \
+    init
+```
+
+```bash title="On your computer"
+ssh ubuntu@<node-1-ip> sudo cat /etc/sandboxd/admin-context.json > ~/admin-context.json
+aerolvm config import ~/admin-context.json --use
+rm ~/admin-context.json
+```
+
+See [Build a cluster](/cluster/create/).
+
+## Add a node
+
+```bash title="On your computer"
+aerolvm join-command                  # a worker node (the default)
+aerolvm join-command --role mixed     # a mixed node
+aerolvm join-command --role server    # a server node
+aerolvm join-command --role ingress   # an ingress node
+```
+
+```bash title="On the new machine"
+export CLOUDFLARE_API_TOKEN=your-cloudflare-token
+# then paste the join command
+```
+
+```bash title="On a server or mixed node, when your computer's request is refused"
+sudo sandboxd join-command --role server
+```
+
+## Join tokens
+
+```bash title="On your computer"
+aerolvm join-command --ttl 30m        # works for 30 minutes
+aerolvm join-command --reusable       # works for many machines
+aerolvm join-command --ttl 0          # never expires (worker and ingress only)
+aerolvm get jointokens                # list them
+aerolvm delete jointoken <id>         # cancel one
+```
+
+## See the cluster
+
+```bash title="On your computer"
+aerolvm get nodes                     # every node and its status
+aerolvm get nodes -o wide             # more columns
+aerolvm describe node <name>          # one node in detail
+aerolvm top nodes                     # CPU and memory given out per node
+aerolvm cluster-info                  # the leader and the members
+```
+
+## Pause, empty and remove a node
+
+```bash title="On your computer"
+aerolvm cordon <name>                 # no new sandboxes on it
+aerolvm uncordon <name>               # new sandboxes again
+aerolvm drain <name> --timeout 30m    # cordon, then wait until it runs none
+aerolvm drain <name> --delete-sandboxes
+aerolvm delete node <name>            # remove it from the cluster
+```
+
+```bash title="On the removed machine, to use it again"
+sudo sandboxd reset --yes
+```
+
+See [Add and remove nodes](/cluster/nodes/).
+
+## Upgrade
+
+```bash title="On your computer"
+aerolvm upgrade plan v0.7.1           # see what will happen
+aerolvm upgrade apply v0.7.1 --wait   # do it, and follow it
+aerolvm upgrade status                # where it stands
+aerolvm upgrade apply v0.7.1 --pause-after 2
+aerolvm upgrade resume                # go on after a pause
+aerolvm upgrade stop                  # start no more nodes (apply again to go on)
+aerolvm upgrade rollback --wait       # every node back (while paused, stopped or failed)
+aerolvm upgrade finalize              # after --hold: turn the new version on
+aerolvm release pull v0.7.1 -o aerolvm-v0.7.1.tgz
+aerolvm upgrade apply v0.7.1 --from aerolvm-v0.7.1.tgz --wait
+```
+
+See [Upgrade](/cluster/upgrade/).
+
+## Back up and recover
+
+```bash title="On each server or mixed node"
+sudo sandboxd backup --output /var/backups/aerolvm-$(hostname)-$(date +%F).tar.gz --stop
+```
+
+```bash title="On the node to put back"
+sudo systemctl stop sandboxd
+sudo sandboxd restore --input <file.tar.gz> --force --start
+```
+
+```bash title="Most server nodes died: on the chosen survivor, then on each other survivor"
+sudo systemctl stop sandboxd
+sudo sandboxd recover-quorum --start            # on the chosen survivor
+sudo sandboxd recover-quorum --rejoin --start   # on each other survivor
+```
+
+See [Back up and recover](/cluster/backup/).
+
+## Check a node
+
+```bash title="On a node"
+sudo sandboxd preflight               # disk, ports, clock: prints a fix for each problem
+sudo sandboxd version                 # the release this node runs
+sudo journalctl -u sandboxd -n 50     # the last 50 log lines
+sudo journalctl -u sandboxd -f        # follow the log
+```
+
+## Logins
+
+```bash title="On your computer"
+aerolvm login https://cluster.example.com --name prod   # save a login
+aerolvm config get-contexts                             # list saved logins
+aerolvm config use-context prod                         # switch to one
+aerolvm get nodes --context prod                        # use one for one command
+```
+
+`aerolvm` calls a saved login a **context**.
+
+## Next steps
+
+- [Coming from Kubernetes](/cluster/kubernetes/): the same commands, next to their Kubernetes match.
+- [aerolvm CLI](/cli/): every command, including the ones for sandboxes.

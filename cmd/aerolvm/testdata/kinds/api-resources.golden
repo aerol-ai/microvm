@@ -1,0 +1,9 @@
+exit 0
+--- stdout
+NAME         SHORTNAMES                  KIND
+jointokens   jt,join-token,join-tokens   JoinToken
+nodes        no                          Node
+sandboxes    sb                          Sandbox
+snapshots    snap                        Snapshot
+tokens       tok                         Token
+--- stderr

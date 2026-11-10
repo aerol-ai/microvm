@@ -98,6 +98,38 @@ Artifacts expire from the bucket after 7 days; presigned URLs default to 12h,
 which covers a slow `*.metal` provision. `reports/<scenario>.json` carries a
 `build` block naming the tree that produced its numbers.
 
+### Getting a file onto a node: S3, never scp
+
+To put a file on a running test node (a new `sandboxd` for a kept stack, a
+test binary, a fixture), use `stage_to_node`. Never `scp` it from your
+machine.
+
+- **Why.** One `scp` is one connection over your uplink: 10–170 KB/s from a
+  laptop to us-east-1. The adopt gate's 129 MB build took 20+ minutes per node
+  that way, and slowed every other upload from the same machine. An S3 upload
+  uses many connections (about 1.4 MB/s from the same laptop) and happens
+  once, and each node then downloads inside AWS in seconds.
+- **What it does.** `lib/build.sh stage` puts each file in the artifacts
+  bucket. A file from a published build (`.build/<id>/`) is already there
+  under `builds/<id>/`, so nothing is uploaded. Anything else goes up once,
+  under `builds/stage/<sha256>/` (same 7-day expiry). The node gets a
+  one-hour presigned link, downloads the file and checks its SHA-256 against
+  your copy before it keeps it. It keeps the executable bit.
+- **In a script.** `lib/common.sh` sources `lib/stage.sh`, so every harness
+  script has
+  `stage_to_node ubuntu@<ip> <remote-dir> <file>...`. `upgrade-gate.sh`,
+  `scripts/run-on-node.sh` and the WASM fixture fallback use it.
+- **By hand or from an agent:**
+
+  ```bash
+  integration-tests/scripts/stage-to-node.sh --scenario cluster-chaos /tmp/aerol-stage \
+    integration-tests/.build/<build id>/sandboxd_linux_amd64 -- <node ip>...
+  ```
+
+- **Enforced.** `safety/stage_test.go` fails on any `scp` upload in a harness
+  script. Copying a file *from* a node (`scp user@host:path .`) is allowed:
+  that uses your downlink.
+
 ### When GitHub's downloads fail
 
 GitHub's release downloads once answered 504 for hours while its status page
@@ -125,10 +157,22 @@ and each pinned third-party file at `deps/<project>/<version>/<file>`.
   `sudo`, so no variable would reach it, and the bootstrap template is not
   touched. Unset, the nodes get the build's `install.sh` unchanged. A
   `--version` or `--released` run uses that release's own `install.sh`.
-- **Not covered:** the Terraform bootstrap's own CNI and BuildKit steps
-  (containerd nodes, the default) and its Firecracker download still fetch
-  from GitHub. Those live in `bootstrap.sh.tftpl`, and changing it replaces
-  every node of a running cluster.
+- **The Terraform bootstrap's own downloads** (`install.sh`, the cluster
+  scripts, and the CNI plugins, BuildKit and Firecracker) fall back to the
+  mirror when the Terraform variable `download_mirror` is set. The harness
+  passes it on every apply and destroy, set to the same `AEROL_DOWNLOAD_MIRROR`
+  (`""` or `off` passes nothing, and the bootstrap renders as it did before).
+  Terraform/README.md, "Download mirror", has the details.
+- **`terraform init`'s provider downloads** (the Cloudflare provider is a
+  GitHub release asset) go through one plugin cache shared by every run and
+  worktree, `AEROL_TF_PLUGIN_CACHE` (default `~/.terraform.d/plugin-cache`).
+  If `init` still fails, it is retried once with that cache as `-plugin-dir`,
+  which needs no download at all (`tf_init_failover` in `lib/common.sh`).
+  A new machine has nothing in that cache, so if that fails too, `init` is
+  retried with the mirror's copy of the providers, `<mirror>/tf-providers/`
+  (a Terraform network mirror, filled by the release workflow with
+  `scripts/mirror-sync.sh --tf-providers`), as the only provider source.
+  `AEROL_DOWNLOAD_MIRROR=off` skips that last try.
 
 ## Container engine
 
@@ -174,6 +218,88 @@ integration-tests/run.sh cluster-hetero --upgrade-from v0.6.7  # full gate
 
 [`SNAPSHOT-MIGRATION-UPGRADE.md`](./SNAPSHOT-MIGRATION-UPGRADE.md) is the manual
 runbook the automation mirrors (use it to debug a failed gate).
+
+The gate upgrades the way the docs tell an operator to: it copies this
+build's `install.sh`, `sandboxd`, `toolboxd` and `checksums.txt` to each node
+and re-runs `install.sh` with no node flags (only the `--*-url` flags that say
+where those files are). Per node it fails unless the PAT is kept,
+`/etc/sandboxd/node.json` is written (0600, root, no PAT) after the settings
+were read back from the old release's files, sandboxd restarted onto the new
+build (new PID, `/health` version), and `sandboxd --version` prints
+`sandboxd itest-<build id>` without disturbing the daemon. Each node's
+installer output goes to `reports/upgrade-gate-<scenario>-install-<ip>.log`.
+`upgrade-gate.sh <scenario> --from <tag> --swap-binary` upgrades by copying
+the binary in instead, to check a schema migration alone.
+
+`--upgrade-node` (on `run.sh` with `--upgrade-from`, or on `upgrade-gate.sh`)
+upgrades through `sandboxd upgrade node` instead
+(`plans/kubectl-style-cluster-ops.md` §6.3): this build's `sandboxd` runs
+from a temp path with `--from` a directory of this build's files and
+`--allow-unversioned` (the build's version is `itest-<build id>`). Per node it
+fails unless the old binaries are kept as `*.prev`, a `state.db` backup
+exists, sandboxd restarted onto the new build, and a second identical
+upgrade is a noop with the same PID; a container sandbox created before the
+upgrade must still run under the same ID and answer exec. After the schema
+checks, `sandboxd upgrade node <tag> --rollback` must put the old binaries
+back and sandboxd report `<tag>`. The node's upgrader log is
+`/tmp/aerolvm-upgrade-node/upgrade.err`, and the gate prints how long the
+database backup took.
+
+```bash
+integration-tests/run.sh single-node --upgrade-from v0.6.11 --upgrade-node
+```
+
+## Release gate: one-line joins
+
+`plans/kubectl-style-cluster-ops.md` Phase 2 has two halves.
+
+`cluster-join-token` (3 servers, 1 ingress, 2 workers, t3.medium) builds
+every node from blank Ubuntu with Terraform `one_line_join`: the seed runs
+`install.sh ... init` with Terraform's token per role, every other node
+`install.sh ... join https://<seed>:7003 --token <t>`; no S3 hand-off, no
+CSR loop, no scp. Node certs last 10 minutes so renewal happens during the
+run. Its cases are UC-620..625 (`TestJoinToken*`; the disruptive ones delete
+and re-join a worker):
+
+```bash
+AEROL_TEST_RUN='TestJoinToken' integration-tests/run.sh cluster-join-token
+```
+
+`cluster-join-adopt` is the adopt path: provisioned on an old release with
+the old scripts, moved to this build with the `install.sh` first hop,
+adopted with `sandboxd adopt` (the seed, then every other server), and grown
+by one blank machine (`spare-1`, Terraform `nodes[].blank`) with the line
+`aerolvm join-command` prints. `adopt-gate.sh` runs it and prints
+UC-630..634 as PASS or FAIL:
+
+```bash
+integration-tests/run.sh cluster-join-adopt --adopt-from v0.6.11
+```
+
+## Release gate: Terraform used by URL
+
+Terraform/ is a module; every scenario runs it through `Terraform/root`,
+the root a checkout runs (`run.sh` `tf_root`). `plans/kubectl-style-cluster-ops.md`
+Phase 5 asks for a cluster built with the module used by URL, with no
+checkout behind it. A scenario with the `module-url` capability gets that:
+`run.sh` makes a root of its own under `.tf/<scenario>/root` (only `.tf`
+files) whose module block fetches `Terraform/` by git URL, and leaves the
+join to the module's default (one line per node). The URL is
+`AEROL_TF_MODULE_SOURCE` when set (for example the real
+`git::https://github.com/aerol-ai/microvm//Terraform?ref=<tag>` after a
+release), or else a bare clone of this branch's **committed** head, so
+commit `Terraform/` changes before a run.
+
+`cluster-module-url` (3 servers, the seed is `server,ingress`, 1 worker and
+1 blank machine, t3.medium) runs UC-683..687 (`TestModuleURL*`): the module
+came by URL, every node joined with one line, `aerolvm get nodes` shows
+every node Ready, a sandbox answers exec, the module's three tokens are
+registered, and the line `aerolvm join-command` prints adds the blank
+machine as a worker:
+
+```bash
+AEROL_TEST_RUN='TestModuleURL' integration-tests/run.sh cluster-module-url
+```
 
 ## Key custody scenarios
 

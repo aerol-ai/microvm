@@ -140,7 +140,7 @@ func TestCov96RunCustomDomainsInstallsOnDemandTLS(t *testing.T) {
 		onDemand bool
 	)
 	caddyAdmin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodPut && r.URL.Path == "/config/apps/tls/automation/on_demand" {
+		if r.Method == http.MethodPost && r.URL.Path == "/config/apps/tls/automation/on_demand" {
 			mu.Lock()
 			onDemand = true
 			mu.Unlock()

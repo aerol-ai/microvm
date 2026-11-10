@@ -67,6 +67,11 @@ func TestCustodyReport(t *testing.T) {
 	if find(CustodyReport(config.Config{}, CustodyFacts{}), "server key").Custody != CustodyPlaintextFile {
 		t.Fatal("default server key")
 	}
+	// A worker joined without the PAT holds none: its token is its own.
+	patFree := config.Config{PATToken: "own-token", PATTokenSHA256: []string{config.PATSHA256("pat")}}
+	if r := find(CustodyReport(patFree, CustodyFacts{}), "PAT"); r.Custody != CustodyNotConfigured {
+		t.Fatalf("PAT on a node without it = %+v", r)
+	}
 }
 
 func TestPublishKeyCustody(t *testing.T) {

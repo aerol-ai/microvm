@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync/atomic"
+	"time"
 
 	"github.com/aerol-ai/microvm/internal/config"
 	isolatepool "github.com/aerol-ai/microvm/internal/pool/isolate"
@@ -48,7 +49,7 @@ func wireIsolateRuntime(ctx context.Context, cfg config.Config, logger *slog.Log
 		return nil, fmt.Errorf("isolate bundle store: %w", err)
 	}
 	driver.SetBundleResolver(isolateruntime.NewBundleResolver(jsbundle.NewResolver(store)))
-	supervisor := isolateruntime.NewHostSupervisor(isoCfg)
+	supervisor := isolateruntime.NewHostSupervisorWithLogger(isoCfg, logger)
 	// E3a: host-mediated egress destinations → audit JSONL (async, dial path).
 	if cfg.EgressAttributionEnabled {
 		if setter, ok := supervisor.(interface {
@@ -65,11 +66,22 @@ func wireIsolateRuntime(ctx context.Context, cfg config.Config, logger *slog.Log
 		setter.SetEgressDenialObserver(svc.EgressDenialObserver())
 	}
 	driver.SetHostSupervisor(supervisor)
+	svc.SetIsolateBundleStore(store)
+	svc.SetIsolateRuntime(driver)
+
+	// The isolate sandboxes the previous sandboxd left running: their
+	// workerd outlived it (pkg/isolate, adopt.go). Before the warm pool
+	// fills and before the first reconcile, which deleted every isolate
+	// row the driver did not know.
+	if report := svc.AdoptIsolateSandboxes(ctx); report != (isolateruntime.AdoptReport{}) {
+		logger.Info("isolate: running sandboxes taken over from the previous sandboxd",
+			"groups", report.Groups, "adopted", report.Adopted, "reloading", report.Reloading)
+	}
 
 	if cfg.IsolatePoolEnabled {
 		pool := isolatepool.New(logger)
 		pool.SetDepth(cfg.IsolatePoolDepthDefault)
-		pool.SetSpawner(&poolSpawner{supervisor: supervisor, cfg: isoCfg})
+		pool.SetSpawner(&poolSpawner{supervisor: supervisor, cfg: isoCfg, boot: time.Now().Unix()})
 		driver.SetWarmPool(pool)
 		// Boot prewarm + refill: fill blank hosts before the first create
 		// (the wasm prewarm lesson — ticker-only leaves the first creates cold).
@@ -90,8 +102,6 @@ func wireIsolateRuntime(ctx context.Context, cfg config.Config, logger *slog.Log
 		}()
 	}
 
-	svc.SetIsolateBundleStore(store)
-	svc.SetIsolateRuntime(driver)
 	// Honest jail reporting: distinguish "jail requested" (config) from "jail
 	// realizable here" (platform). When jail is requested but not realizable,
 	// isolate creates FAIL CLOSED — say so loudly rather than logging a bare
@@ -133,12 +143,17 @@ func startIsolateBackground(ctx context.Context, cfg config.Config, driver *isol
 type poolSpawner struct {
 	supervisor isolateruntime.HostSupervisor
 	cfg        isolateruntime.Config
-	n          atomic.Int64
+	// boot makes this sandboxd's warm keys its own. A warm host a tenant
+	// claimed keeps its key (its chroot, cgroup and run dir), and it now
+	// outlives sandboxd: a plain warm-<n> from the next boot could name the
+	// same key and spawn into a live tenant's chroot.
+	boot int64
+	n    atomic.Int64
 }
 
 func (s *poolSpawner) Spawn(ctx context.Context) (isolateruntime.GroupHost, error) {
 	n := s.n.Add(1)
-	key := fmt.Sprintf("warm-%d", n)
+	key := fmt.Sprintf("warm-%x-%d", s.boot, n)
 	// A warm blank is jailed exactly like a tenant group — same chroot shape,
 	// same uid, same filter — with unlimited caps until a tenant claims it
 	// (the router then applies theirs). Anything less would hand a tenant an

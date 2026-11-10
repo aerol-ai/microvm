@@ -1,0 +1,5 @@
+exit 2
+--- stdout
+--- stderr
+aerolvm delete: --force works only with `aerolvm delete node`
+run `aerolvm delete --help` for usage

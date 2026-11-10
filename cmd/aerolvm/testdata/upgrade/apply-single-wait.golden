@@ -1,0 +1,15 @@
+exit 0
+--- stdout
+node now runs v0.6.13 (upgrade op-1)
+--- stderr
+aerolvm: 4 files of v0.6.13 match checksums.txt (<dist>)
+aerolvm: uploading caddy_linux_amd64 (20 B)
+aerolvm: uploading release.json (290 B)
+aerolvm: uploading sandboxd_linux_amd64 (23 B)
+aerolvm: uploading toolboxd_linux_amd64 (23 B)
+aerolvm: upgrade op-1 started: v0.6.12 -> v0.6.13
+aerolvm: op-1: staging
+aerolvm: op-1: swapping
+aerolvm: sandboxd is restarting; waiting for it
+aerolvm: op-1: starting
+aerolvm: op-1: done

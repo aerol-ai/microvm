@@ -3,10 +3,18 @@
 #   scripts/terraform.sh init
 #   scripts/terraform.sh apply
 #
-# scripts/terraform.sh runs `terraform -chdir=Terraform` and auto-loads this
-# file via -var-file=../config/terraform.tfvars. Don't run `terraform` directly
-# from Terraform/ — this file is no longer on Terraform's auto-load path.
+# scripts/terraform.sh runs `terraform -chdir=Terraform/root` and loads this
+# file with -var-file. Don't run `terraform` directly: this file is not on
+# Terraform's auto-load path. (Without a checkout, use the module by URL
+# instead: Terraform/examples/from-url.)
 ###############################################################################
+
+# --- Joining ------------------------------------------------------------------
+#
+# A NEW cluster: join every node with one line and a token per role.
+# A cluster built from this checkout before: leave this out (false). Your
+# nodes were built with the old join, and changing it replaces every node.
+# one_line_join = true
 
 # --- Required ---------------------------------------------------------------
 #
@@ -121,7 +129,7 @@ default_volume_type       = "gp3"
 # Roles: "server" | "worker" | "ingress" | "worker,ingress" |
 #        "server,worker" | "server,ingress" | "mixed"
 #
-# Validation (enforced at plan-time, mirrors cluster-init.sh / cluster-join.sh):
+# Validation (enforced at plan-time, mirrors sandboxd init / sandboxd join):
 #   - exactly one node has seed = true
 #   - the seed's role contains "server" or equals "mixed"
 #   - "mixed" cannot be combined with other tokens

@@ -80,6 +80,9 @@ func TestPickGateNode(t *testing.T) {
 		{name: "mixed and combined roles never default", wantErr: "no server-only node", targets: `{"nodes":[
 			{"name":"node1","role":"mixed","seed":true,"public_ip":"198.51.100.1"},{"name":"node2","role":"server, ingress","public_ip":"198.51.100.2"}]}`},
 		{name: "no public IP", wantErr: "has no public IP", targets: `{"nodes":[{"name":"s","role":"server","public_ip":""}]}`},
+		// A blank node has no sandboxd to run from, even with role server.
+		{name: "a blank server never defaults", want: "s\t198.51.100.1", targets: `{"nodes":[
+			{"name":"a-spare","role":"server","blank":true,"public_ip":"198.51.100.9"},{"name":"s","role":"server","seed":true,"public_ip":"198.51.100.1"}]}`},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -104,6 +107,11 @@ func TestNodesSeedFirst(t *testing.T) {
 	want := "a\tserver,ingress\tseed\t1.1.1.1\nb\tworker\t-\t1.1.1.2\n"
 	if code != 0 || out != want {
 		t.Fatalf("nodes_seed_first = %d %q (stderr %q), want %q", code, out, errOut, want)
+	}
+	// A blank node has not joined: nothing to restart on it.
+	withBlank := `{"nodes":[{"name":"b","role":"worker","public_ip":"1.1.1.2"},{"name":"spare-server","role":"server","blank":true,"public_ip":"1.1.1.3"},{"name":"a","role":"server, ingress","seed":true,"public_ip":"1.1.1.1"}]}`
+	if out, errOut, code := nodeRun(t, `nodes_seed_first "$TARGETS"`, "TARGETS="+withBlank); code != 0 || out != want {
+		t.Fatalf("nodes_seed_first with a blank node = %d %q (stderr %q), want %q", code, out, errOut, want)
 	}
 }
 

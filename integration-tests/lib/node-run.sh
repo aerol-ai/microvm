@@ -32,8 +32,11 @@ kept_targets() {
 # comes first: every cluster-wide restart in this harness is seed-first,
 # because joiners restarted while the seed is down have no one to rejoin
 # (harness.WithClusterEnv has the live incident).
+# A blank node (nodes[].blank) is plain Ubuntu that has not joined, so it
+# is left out here and below: there is no sandboxd on it to restart or run
+# from.
 nodes_seed_first() {
-  jq -r '(.nodes // []) | (map(select(.seed == true)) + map(select(.seed != true)))[]
+  jq -r '(.nodes // []) | map(select(.blank != true)) | (map(select(.seed == true)) + map(select(.seed != true)))[]
     | [.name, ((.role // "") | gsub(" "; "")), (if .seed == true then "seed" else "-" end), (.public_ip // "")]
     | @tsv' <<<"$1"
 }
@@ -55,6 +58,7 @@ pick_gate_node() {
     fi
   else
     row=$(jq -r '(.nodes // [])
+      | map(select(.blank != true))
       | map(select(((.role // "") | gsub(" "; "")) == "server"))
       | (map(select(.seed != true)) + map(select(.seed == true)))
       | first // empty

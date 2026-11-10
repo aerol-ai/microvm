@@ -1,0 +1,9 @@
+exit 0
+--- stdout
+rollout r-1 rolled back: every node runs v0.6.12 again
+--- stderr
+aerolvm:   node wkr-2 (worker): skipped: down when its turn came
+aerolvm:   node wkr-3 (worker): manual: remote upgrade is off
+aerolvm:     run on it, as root: sudo sandboxd upgrade node v0.6.13 --sha256 sandboxd_linux_amd64=169ef2fd27b0f984408ea500a8ef8446cf7cf301b86d178fbd66d372574d3c94
+aerolvm: rollout r-1: rolling-back
+aerolvm: rollout r-1: rolled-back

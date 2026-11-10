@@ -1,0 +1,5 @@
+exit 1
+--- stdout
+--- stderr
+aerolvm: snapshot "ghost" not found
+hint: run `aerolvm get snapshots` to list them

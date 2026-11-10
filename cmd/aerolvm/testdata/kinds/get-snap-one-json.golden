@@ -1,0 +1,17 @@
+exit 0
+--- stdout
+{
+  "created_at": "2026-11-04T12:00:00Z",
+  "entrypoint": [
+    "python",
+    "app.py"
+  ],
+  "image": "snapshots/snap-a",
+  "image_digest": "sha256:ddd",
+  "image_distribution_mode": "local",
+  "image_id": "sha256:aaa",
+  "image_verified_at": "2026-11-07T11:00:00Z",
+  "name": "snap-a",
+  "source_sandbox_id": "sb-0000000000000001"
+}
+--- stderr

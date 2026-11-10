@@ -81,7 +81,8 @@ func TestBootstrapTemplateRenders(t *testing.T) {
 	for _, branch := range []string{
 		"seed", "joiner", "joiner_kms", "joiner_audit_s3", "joiner_audit_file",
 		"seed_receiver", "joiner_receiver", "seed_public_ca", "seed_wrapped",
-		"joiner_api_lb", "joiner_api_lb_worker", "joiner_routing_on", "joiner_routing_off", "joiner_containerd_pool",
+		"joiner_api_lb", "joiner_api_lb_worker", "joiner_routing_on", "joiner_routing_off", "joiner_containerd_pool", "seed_join", "joiner_join", "joiner_blank", "joiner_join_worker",
+		"joiner_download_mirror",
 	} {
 		t.Run(branch, func(t *testing.T) {
 			out, err := run("output", "-raw", branch)
@@ -167,6 +168,44 @@ func TestBootstrapTemplateRenders(t *testing.T) {
 			for _, want := range mustContain[branch] {
 				if !strings.Contains(out, want) {
 					t.Errorf("rendered %s bootstrap is missing %q", branch, want)
+				}
+			}
+			// One-line join (Terraform/join.tf): the installer's init and
+			// join words, the per-role tokens, sandboxd_env in cluster.env
+			// before the first cluster-mode boot, and none of the bundle
+			// hand-off or the CSR loop.
+			joinMode := map[string][]string{
+				"seed_join": {
+					`init "${INIT_ARGS[@]}"`,
+					"--token 'worker=aaaaaa.00000000000000000000000000000000:0'",
+					"--token 'ingress=bbbbbb.00000000000000000000000000000000:0'",
+					"--token 'server=cccccc.00000000000000000000000000000000:24h'",
+					"written before sandboxd init / join.\nSB_CLUSTER_NODE_CERT_TTL=10m",
+				},
+				"joiner_join":        {"join 'https://x:7003'", `--token "$JOIN_TOKEN"`, "/v1/join/cluster-info?token_id=", "--pat-token 'x'"},
+				"joiner_join_worker": {"join 'https://x:7003'", `--token "$JOIN_TOKEN"`},
+			}
+			for _, want := range joinMode[branch] {
+				if !strings.Contains(out, want) {
+					t.Errorf("rendered %s bootstrap is missing %q", branch, want)
+				}
+			}
+			// A one-line worker or ingress joiner never carries the PAT.
+			if branch == "joiner_join_worker" && strings.Contains(out, "--pat-token") {
+				t.Errorf("a one-line worker's bootstrap passes --pat-token")
+			}
+			// A blank node stops before installing anything.
+			if branch == "joiner_blank" {
+				blank, _, _ := strings.Cut(out, "exit 0")
+				if !strings.Contains(blank, "blank node: nothing installed") || strings.Contains(blank, "/tmp/install.sh") || strings.Contains(blank, "apt-get") {
+					t.Errorf("blank bootstrap does not stop before the install:\n%s", blank)
+				}
+			}
+			if _, ok := joinMode[branch]; ok {
+				for _, gone := range []string{"/tmp/cluster-init.sh", "/tmp/cluster-join.sh", "aerolvm-csr-signer", "aerolvm-tls-bundle.tar.gz", "sudo /tmp/install.sh"} {
+					if strings.Contains(out, gone) {
+						t.Errorf("one-line %s bootstrap still runs %q", branch, gone)
+					}
 				}
 			}
 			// The internal-CA flags appear exactly when an internal CA is

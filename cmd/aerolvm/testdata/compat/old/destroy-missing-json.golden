@@ -1,0 +1,9 @@
+exit 0
+--- stdout
+{
+  "already_gone": true,
+  "destroyed": true,
+  "ref": "missing"
+}
+--- stderr
+missing: already gone

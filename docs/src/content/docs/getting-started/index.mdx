@@ -14,9 +14,9 @@ Most people start on their own computer. Move to a server when your sandboxes ne
 | | Your computer | One server | A cluster |
 |---|---|---|---|
 | **Best for** | Trying AerolVM and building your app | Real use, with public web links | Many sandboxes, and staying up when a server fails |
-| **Runs on** | macOS or Linux | One Ubuntu or Debian server | Several Linux servers. The guide uses AWS. |
-| **You need** | Docker. On a Mac, Docker Desktop or OrbStack. | A domain name managed by Cloudflare | An AWS account, Terraform and a Cloudflare domain |
-| **How you install** | One command | One command | Edit three config files, then run Terraform |
+| **Runs on** | macOS or Linux | One Ubuntu or Debian server | Three or more Linux machines, on any cloud |
+| **You need** | Docker. On a Mac, Docker Desktop or OrbStack. | A domain name managed by Cloudflare | A domain name managed by Cloudflare, and a private network between the machines |
+| **How you install** | One command | One command | One command on each machine. Or Terraform makes it on AWS. |
 | **Server address** | `http://localhost:21212` | `https://sandbox.example.com` (your domain) | `https://sandbox.example.com` (your domain) |
 | **Public web links for sandboxes** | No | Yes, under your domain | Yes, under your domain |
 | **HTTPS** | No | Yes, set up for you | Yes, set up for you |
@@ -27,7 +27,7 @@ Most people start on their own computer. Move to a server when your sandboxes ne
 
 - **You want to try AerolVM or build your app.** Use [your computer](/getting-started/local-setup/). The [Quickstart](/quick-start/) does this in about five minutes.
 - **People on the internet need to open a sandbox's web page.** Use [one server](/getting-started/single-node-setup/). It gives each sandbox a link like `https://<sandbox-id>-3000.sandbox.example.com`.
-- **You run more sandboxes than one server can hold, or you cannot afford downtime.** Use a [cluster](/cluster-setup/).
+- **You run more sandboxes than one server can hold, or you cannot afford downtime.** Use a [cluster](/cluster/).
 
 ## Good to know
 
@@ -40,6 +40,6 @@ Most people start on their own computer. Move to a server when your sandboxes ne
 <CardGrid>
   <LinkCard title="Install on your computer" description="Run the server on your Mac or Linux computer. No domain needed." href="/getting-started/local-setup/" />
   <LinkCard title="Install on a server" description="One Linux server with your own domain, HTTPS and public links." href="/getting-started/single-node-setup/" />
-  <LinkCard title="Cluster setup" description="Spread sandboxes across many servers on AWS." href="/cluster-setup/" />
+  <LinkCard title="Cluster setup" description="Spread sandboxes across three or more Linux machines, on any cloud." href="/cluster/" />
   <LinkCard title="Quickstart" description="Install on your computer and run your first sandbox." href="/quick-start/" />
 </CardGrid>

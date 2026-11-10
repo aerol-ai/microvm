@@ -1,0 +1,116 @@
+exit 0
+--- stdout
+{
+  "sandboxes": [
+    {
+      "id": "sb-0000000000000001",
+      "image": "python:3.12",
+      "status": "started",
+      "public_url": "https://box.example.com",
+      "cpu": 1.5,
+      "memory_mb": 512,
+      "disk_gb": 0,
+      "os_user": "",
+      "network_block_all": false,
+      "toolbox_enabled": false,
+      "exposed_ports": [
+        {
+          "sandbox_id": "",
+          "port": 8080,
+          "protocol": "http",
+          "public_url": "https://8080-box.example.com",
+          "created_at": "0001-01-01T00:00:00Z"
+        },
+        {
+          "sandbox_id": "",
+          "port": 5432,
+          "protocol": "tcp",
+          "host_port": 22001,
+          "public_url": "",
+          "created_at": "0001-01-01T00:00:00Z"
+        }
+      ],
+      "created_at": "2026-10-04T12:00:00Z",
+      "updated_at": "0001-01-01T00:00:00Z",
+      "last_active_at": "2026-11-07T11:58:30Z",
+      "last_error": "toolbox restarted once",
+      "status_reason": "warm",
+      "exit_code": 3,
+      "lifecycle": {
+        "stop_if_idle_for": 1800000000000,
+        "destroy_at_age": 172800000000000
+      },
+      "name": "box",
+      "tags": {
+        "app": "web",
+        "tier": "front"
+      },
+      "runtime": "docker",
+      "engine": "containerd",
+      "network_bytes_in": 0,
+      "network_bytes_out": 0,
+      "network_bytes_in_limit": 0,
+      "network_bytes_out_limit": 0,
+      "network_allow_out": [
+        "pypi.org",
+        "*.pythonhosted.org"
+      ],
+      "network_quota_exceeded": false
+    },
+    {
+      "id": "sb-0000000000000002",
+      "image": "postgres:17",
+      "status": "started",
+      "public_url": "",
+      "cpu": 0,
+      "memory_mb": 0,
+      "disk_gb": 0,
+      "os_user": "",
+      "network_block_all": true,
+      "toolbox_enabled": false,
+      "created_at": "2026-11-07T07:00:00Z",
+      "updated_at": "0001-01-01T00:00:00Z",
+      "last_active_at": "0001-01-01T00:00:00Z",
+      "lifecycle": {},
+      "name": "db",
+      "tags": {
+        "app": "db"
+      },
+      "runtime": "docker",
+      "network_bytes_in": 0,
+      "network_bytes_out": 0,
+      "network_bytes_in_limit": 0,
+      "network_bytes_out_limit": 0,
+      "network_quota_exceeded": false
+    },
+    {
+      "id": "sb-0000000000000003",
+      "image": "",
+      "status": "stopped",
+      "public_url": "",
+      "cpu": 0,
+      "memory_mb": 0,
+      "disk_gb": 0,
+      "os_user": "",
+      "network_block_all": false,
+      "toolbox_enabled": false,
+      "created_at": "2026-11-07T11:59:15Z",
+      "updated_at": "0001-01-01T00:00:00Z",
+      "last_active_at": "0001-01-01T00:00:00Z",
+      "lifecycle": {},
+      "tags": {
+        "app": "web"
+      },
+      "runtime": "wasm",
+      "network_bytes_in": 0,
+      "network_bytes_out": 0,
+      "network_bytes_in_limit": 0,
+      "network_bytes_out_limit": 0,
+      "network_deny_out": [
+        "10.0.0.0/8"
+      ],
+      "network_quota_exceeded": false
+    }
+  ]
+}
+--- stderr

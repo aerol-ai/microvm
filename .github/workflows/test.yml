@@ -46,6 +46,8 @@ jobs:
       python_integrations: ${{ (github.event_name != 'pull_request' || github.base_ref == 'main') && steps.filter.outputs.python_integrations || 'false' }}
       typescript_sdk: ${{ (github.event_name != 'pull_request' || github.base_ref == 'main') && steps.filter.outputs.typescript_sdk || 'false' }}
       rust_sdk: ${{ (github.event_name != 'pull_request' || github.base_ref == 'main') && steps.filter.outputs.rust_sdk || 'false' }}
+      installer: ${{ (github.event_name != 'pull_request' || github.base_ref == 'main') && steps.filter.outputs.installer || 'false' }}
+      installer_harness: ${{ (github.event_name != 'pull_request' || github.base_ref == 'main') && steps.filter.outputs.installer_harness || 'false' }}
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -121,6 +123,18 @@ jobs:
               - 'sdk/typescript/**'
             rust_sdk:
               - 'sdk/rust/**'
+            # The download pins in install.sh, and the script that copies
+            # them to the mirror.
+            installer:
+              - 'scripts/install.sh'
+              - 'scripts/mirror-sync.sh'
+            # What integration-tests/safety and Terraform/validate test:
+            # the installer and operator scripts, the harness, Terraform.
+            installer_harness:
+              - 'scripts/**'
+              - 'integration-tests/**'
+              - 'Terraform/**'
+              - '.github/workflows/test.yml'
 
   # go-tests and go-race each run as two jobs. "cluster-service" runs
   # internal/cluster and internal/service, each split by test name into parts
@@ -660,6 +674,64 @@ jobs:
 
       - name: Run the Go SDK test suite
         run: go test -count=1 ./sdk/go/...
+
+  # The installer, the integration harness and Terraform. go-tests runs none
+  # of this: its filter (go_main) is the daemon's code, so a pull request that
+  # changed only install.sh, the harness or Terraform ran none of their
+  # offline tests in CI (#1093 merged that way, tested only on laptops).
+  # The mirror step fails when install.sh pins a third-party file the
+  # download mirror does not serve yet, so a forgotten copy shows here and
+  # not after a release; the release workflow's mirror job fills it.
+  # Advisory, like the other suites.
+  installer-and-harness:
+    needs: paths
+    if: needs.paths.outputs.installer_harness == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Every file install.sh pins is on the download mirror
+        if: needs.paths.outputs.installer == 'true'
+        run: scripts/mirror-sync.sh --deps --check
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # The bootstrap render tests run terraform; without it they skip.
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4
+        with:
+          terraform_wrapper: false
+
+      - name: Install yq
+        run: |
+          go install github.com/mikefarah/yq/v4@v4.53.3
+          sudo install -m 0755 "$(go env GOPATH)/bin/yq" /usr/local/bin/yq
+
+      - name: Run the harness safety tests and Terraform's validate tests
+        run: go test -count=1 ./integration-tests/safety/ ./Terraform/validate/
+
+      # The live suite (build tag integration) only runs against a real
+      # cluster, so a test there that reads source instead of a cluster used
+      # to run only during a live run: two such guards failed on main for
+      # weeks (chaosStopVoters). TestMain needs a scenario, but these tests
+      # never call it, so placeholder values do. go vet compiles the whole
+      # suite, which no other job does.
+      - name: Compile the live suite and run its offline guards
+        env:
+          AEROL_CAPS: ${{ github.workspace }}/integration-tests/scenarios/single-node.caps.yml
+          AEROL_BASE_URL: http://127.0.0.1:1
+          AEROL_PAT: offline
+          AEROL_SCENARIO: single-node
+        run: |
+          go vet -tags integration ./integration-tests/...
+          go test -tags integration -count=1 \
+            -run '^(TestEveryCaseThatStopsSandboxdWaitsForTheRejoin|TestTheRejoinWaitIsWiredEndToEnd|TestDisruptiveCasesChooseANonSeedVictim|TestParseMachineConfigRealScenarios)$' \
+            ./integration-tests/suite/
 
   # Job id stays `changes` because ruleset 16186085 requires that check.
   # It gates the merge on the DCO sign-off (checked in `paths`) and the

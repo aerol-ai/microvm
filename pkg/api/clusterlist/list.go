@@ -586,19 +586,20 @@ func fetchPeerJSON(ctx context.Context, peer cluster.Member, path string, opts O
 	// so without them a multi-team caller's page was answered for its first
 	// team on every peer, and each peer minted its own correlation id (E6,
 	// H3). ctx descends from the inbound request, which holds both.
-	access, _ := controlplane.AccessFromContext(ctx)
-	cluster.StampForward(req, access)
 	// mTLS-only: forward the caller's credential so tenant scope is preserved
 	// on the peer. Never substitute the fleet PAT (that was the cross-tenant
 	// enumeration hole). Forward whichever credential the caller used —
 	// Authorization and/or X-API-KEY (E2B accepts the latter) — so the peer
-	// authenticates as the same tenant (B9).
+	// authenticates as the same tenant (B9). StampForward runs after, so it
+	// can drop a credential only this node accepts (a local tool's token).
 	if opts.AuthHeader != "" {
 		req.Header.Set("Authorization", opts.AuthHeader)
 	}
 	if opts.APIKeyHeader != "" {
 		req.Header.Set("X-API-KEY", opts.APIKeyHeader)
 	}
+	access, _ := controlplane.AccessFromContext(ctx)
+	cluster.StampForward(req, access)
 	cluster.SetPeerNodeIDHeader(req, opts.SelfNodeID)
 	resp, err := client.Do(req)
 	if err != nil {

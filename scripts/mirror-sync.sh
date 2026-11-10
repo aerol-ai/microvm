@@ -3,10 +3,12 @@
 # back to when GitHub fails (s3://aerolvm-downloads, us-east-1).
 #
 #   scripts/mirror-sync.sh --release <tag> [--latest | --no-latest]
-#   scripts/mirror-sync.sh --deps
+#   scripts/mirror-sync.sh --deps [--check]
+#   scripts/mirror-sync.sh --tf-providers [--check]
 #
-# Options for both: --bucket <name>, --region <region>, --dry-run, --force,
-# --repo <owner/repo> (releases only), --install-sh <path> (deps only).
+# Options for all: --bucket <name>, --region <region>, --dry-run, --force,
+# --repo <owner/repo> (releases only), --install-sh <path> (deps only),
+# --terraform-dir <path> (tf-providers only, default Terraform/).
 #
 # --release downloads every file of an AerolVM release with gh, checks each
 # one against the release's checksums.txt, and uploads them all to
@@ -18,6 +20,28 @@
 # install.sh, checks its pinned SHA-256, and uploads it to
 # deps/<project>/<version>/<file>. The pins are read from install.sh itself
 # (the DOWNLOAD PINS block), so the mirror and the installer cannot disagree.
+# It first asks the public mirror which pinned files it already holds; when
+# it holds all of them (the usual case: pins rarely change), it downloads and
+# uploads nothing, so the release workflow can run it on every release.
+#
+# --deps --check only asks: it lists every pinned file the public mirror
+# lacks and exits 1 if there is one. It needs curl and nothing else (no AWS
+# credentials, no gh), so a pull request check can run it.
+#
+# --tf-providers runs `terraform providers mirror` for the providers the
+# Terraform configuration needs (Terraform/ by default), for linux and
+# darwin on amd64 and arm64, and uploads the result to tf-providers/: a
+# Terraform network mirror, which the harness's tf_init_failover falls back
+# to when the registries fail and its plugin cache lacks a provider (a new
+# machine). Terraform checks each package's signature as it downloads it.
+# Each provider's index.json is merged with the one already on the mirror,
+# so versions mirrored before stay listed for older lock files. It needs
+# terraform, aws, curl and jq; the release workflow runs it on every release.
+#
+# --tf-providers --check asks Terraform itself: it runs `terraform init`
+# with the public mirror as the only provider source, which succeeds only if
+# the mirror serves every provider the configuration needs for this
+# machine's platform. It needs terraform and nothing else.
 #
 # A file already on the mirror at the same size is not uploaded again, so a
 # re-run (or a release workflow re-running) sends only what is missing; on
@@ -41,8 +65,12 @@ MODE=""
 TAG=""
 LATEST="auto"
 DRY_RUN="false"
+CHECK="false"
 FORCE="false"
 INSTALL_SH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/install.sh"
+TF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/Terraform"
+# The platforms the mirror serves: operators' laptops and CI runners.
+TF_PLATFORMS=(linux_amd64 linux_arm64 darwin_amd64 darwin_arm64)
 
 TAG_RE='^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$'
 
@@ -205,6 +233,27 @@ fetch_origin() {
 	fi
 }
 
+# public_base is where anyone reads the mirror over HTTPS (install.sh's
+# default DOWNLOAD_MIRROR for the default bucket). MIRROR_SYNC_PUBLIC_BASE
+# overrides it, for tests.
+public_base() {
+	echo "${MIRROR_SYNC_PUBLIC_BASE:-https://${BUCKET}.s3.${REGION}.amazonaws.com}"
+}
+
+# deps_missing prints the mirror key of every pinned file the public mirror
+# does not serve. It reads each one's headers only.
+deps_missing() {
+	local base project version file sha origin key
+	base="$(public_base)"
+	while read -r project version file sha origin; do
+		key="deps/${project}/${version}/${file}"
+		# </dev/null: curl must not eat the rows this loop reads.
+		if ! curl -fsSIL --retry 3 --retry-delay 2 --max-time 30 -o /dev/null "${base}/${key}" </dev/null; then
+			echo "$key"
+		fi
+	done <<<"$1"
+}
+
 sync_deps() {
 	load_pins
 	local safe='^[A-Za-z0-9][A-Za-z0-9._+-]*$'
@@ -213,6 +262,23 @@ sync_deps() {
 	local rows
 	rows="$(download_pins)"
 	[[ -n "$rows" ]] || die "download_pins listed nothing"
+	local missing total
+	total="$(grep -c . <<<"$rows")"
+	if [[ "$CHECK" == "true" || ("$DRY_RUN" != "true" && "$FORCE" != "true") ]]; then
+		need curl
+		missing="$(deps_missing "$rows")"
+		if [[ -z "$missing" ]]; then
+			echo "All ${total} pinned files are on the mirror ($(public_base)/deps/); nothing to do"
+			return 0
+		fi
+		if [[ "$CHECK" == "true" ]]; then
+			echo "The mirror lacks $(grep -c . <<<"$missing") of the ${total} files install.sh pins:" >&2
+			sed 's/^/  /' <<<"$missing" >&2
+			echo "Run scripts/mirror-sync.sh --deps with credentials that can write to s3://${BUCKET}/deps/ (the release workflow does this too)." >&2
+			return 1
+		fi
+		echo "The mirror lacks $(grep -c . <<<"$missing") of the ${total} pinned files; checking and uploading"
+	fi
 	if [[ "$DRY_RUN" == "true" ]]; then
 		echo "Plan: copy the files install.sh pins to s3://${BUCKET}/deps/"
 	else
@@ -256,23 +322,123 @@ sync_deps() {
 	echo "Done: ${count} files are on the mirror"
 }
 
+# tf_config copies the Terraform configuration's top-level .tf files into a
+# directory of their own. providers mirror and init read only those, and
+# init run in Terraform/ itself would leave a lock file and .terraform/ in
+# the repository.
+tf_config() {
+	local dir="$1" f found=0
+	[[ -d "$TF_DIR" ]] || die "no Terraform configuration at $TF_DIR"
+	mkdir -p "$dir"
+	for f in "$TF_DIR"/*.tf; do
+		[[ -f "$f" ]] || continue
+		cp "$f" "$dir/"
+		found=1
+	done
+	((found == 1)) || die "no .tf files in $TF_DIR"
+}
+
+# tf_check runs terraform init with the public mirror as the only provider
+# source, so it passes only if the mirror serves every provider at a version
+# the configuration accepts, for this machine's platform.
+tf_check() {
+	need terraform
+	local cfg="$WORK/tf-check"
+	tf_config "$cfg"
+	printf 'provider_installation {\n  network_mirror {\n    url = "%s/tf-providers/"\n  }\n}\n' "$(public_base)" >"$WORK/mirror.tfrc"
+	if ! TF_CLI_CONFIG_FILE="$WORK/mirror.tfrc" TF_DATA_DIR="$WORK/tf-check-data" TF_PLUGIN_CACHE_DIR="" \
+		terraform -chdir="$cfg" init -backend=false -input=false -no-color >"$WORK/tf-check.log" 2>&1; then
+		cat "$WORK/tf-check.log" >&2
+		echo "Terraform cannot install every provider ${TF_DIR} needs from $(public_base)/tf-providers/." >&2
+		echo "Run scripts/mirror-sync.sh --tf-providers with credentials that can write to s3://${BUCKET}/tf-providers/ (the release workflow does this too)." >&2
+		return 1
+	fi
+	grep '^- Installed ' "$WORK/tf-check.log" || true
+	echo "Terraform installs every provider ${TF_DIR} needs from $(public_base)/tf-providers/ alone"
+}
+
+sync_tf_providers() {
+	if [[ "$CHECK" == "true" ]]; then
+		tf_check
+		return
+	fi
+	local cfg="$WORK/tf-config" out="$WORK/tf-providers" platform index rel code
+	local platforms=()
+	for platform in "${TF_PLATFORMS[@]}"; do
+		platforms+=("-platform=${platform}")
+	done
+	tf_config "$cfg"
+	if [[ "$DRY_RUN" == "true" ]]; then
+		echo "Plan: terraform providers mirror ${platforms[*]} for ${TF_DIR}, then copy it to s3://${BUCKET}/tf-providers/"
+		echo "  each provider's index.json merged with the mirror's first, so older versions stay listed"
+		return 0
+	fi
+	need terraform aws curl jq
+	echo "Downloading the providers ${TF_DIR} needs, for ${TF_PLATFORMS[*]}"
+	# An empty CLI config: the operator's own (a network mirror, a plugin
+	# cache) must not decide where the packages come from; the registries do.
+	: >"$WORK/empty.tfrc"
+	TF_CLI_CONFIG_FILE="$WORK/empty.tfrc" TF_PLUGIN_CACHE_DIR="" \
+		terraform -chdir="$cfg" providers mirror "${platforms[@]}" "$out" ||
+		die "terraform providers mirror failed; nothing uploaded"
+	# Keep the versions already on the mirror listed. A missing index.json
+	# (a provider mirrored for the first time) reads as 403 or 404 from the
+	# public URL; any other answer stops the upload, because writing this
+	# run's index over one it could not read would unlist older versions.
+	while IFS= read -r index; do
+		rel="${index#"$out"/}"
+		code="$(curl -sS --retry 3 --retry-delay 2 --max-time 30 -o "$WORK/mirror-index.json" \
+			-w '%{http_code}' "$(public_base)/tf-providers/${rel}" </dev/null)" || code="error"
+		case "$code" in
+			200)
+				jq -s '{versions: (.[0].versions + .[1].versions)}' "$WORK/mirror-index.json" "$index" >"$index.merged" ||
+					die "cannot merge ${rel} with the mirror's; nothing uploaded"
+				mv "$index.merged" "$index"
+				;;
+			403 | 404) ;;
+			*) die "cannot read the mirror's ${rel} (${code}); nothing uploaded" ;;
+		esac
+	done < <(find "$out" -type f -name index.json)
+	echo "Uploading to s3://${BUCKET}/tf-providers/"
+	# Packages and version files first, index.json last, so a version is
+	# listed only once its files are up.
+	aws s3 sync "$out" "s3://${BUCKET}/tf-providers" "${SYNC_OPTS[@]}" --exclude "*index.json"
+	while IFS= read -r index; do
+		rel="${index#"$out"/}"
+		aws s3 cp "$index" "s3://${BUCKET}/tf-providers/${rel}" --region "$REGION" \
+			--content-type application/json --cache-control no-cache --only-show-errors --no-progress
+	done < <(find "$out" -type f -name index.json)
+	echo "Done: Terraform's providers are on the mirror"
+}
+
 while [[ $# -gt 0 ]]; do
 	case "$1" in
 		--release)
-			[[ -z "$MODE" ]] || die "pass --release or --deps, not both"
+			[[ -z "$MODE" ]] || die "pass one of --release, --deps or --tf-providers"
 			[[ $# -ge 2 ]] || die "--release needs a tag"
 			MODE="release"
 			TAG="$2"
 			shift 2
 			;;
 		--deps)
-			[[ -z "$MODE" ]] || die "pass --release or --deps, not both"
+			[[ -z "$MODE" ]] || die "pass one of --release, --deps or --tf-providers"
 			MODE="deps"
 			shift
+			;;
+		--tf-providers)
+			[[ -z "$MODE" ]] || die "pass one of --release, --deps or --tf-providers"
+			MODE="tf-providers"
+			shift
+			;;
+		--terraform-dir)
+			[[ $# -ge 2 ]] || die "--terraform-dir needs a path"
+			TF_DIR="$2"
+			shift 2
 			;;
 		--latest) LATEST="yes"; shift ;;
 		--no-latest) LATEST="no"; shift ;;
 		--dry-run) DRY_RUN="true"; shift ;;
+		--check) CHECK="true"; shift ;;
 		--force) FORCE="true"; shift ;;
 		--bucket)
 			[[ $# -ge 2 && "$2" =~ ^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$ ]] || die "--bucket needs an S3 bucket name"
@@ -305,9 +471,12 @@ while [[ $# -gt 0 ]]; do
 	esac
 done
 
-[[ -n "$MODE" ]] || { usage >&2; die "pass --release <tag> or --deps"; }
-if [[ "$MODE" == "deps" && "$LATEST" != "auto" ]]; then
+[[ -n "$MODE" ]] || { usage >&2; die "pass --release <tag>, --deps or --tf-providers"; }
+if [[ "$MODE" != "release" && "$LATEST" != "auto" ]]; then
 	die "--latest and --no-latest go with --release"
+fi
+if [[ "$CHECK" == "true" && "$MODE" == "release" ]]; then
+	die "--check goes with --deps or --tf-providers"
 fi
 
 # --size-only skips a file the mirror already holds at the same size; the
@@ -322,4 +491,5 @@ trap 'rm -rf "$WORK"' EXIT
 case "$MODE" in
 	release) sync_release "$TAG" ;;
 	deps) sync_deps ;;
+	tf-providers) sync_tf_providers ;;
 esac

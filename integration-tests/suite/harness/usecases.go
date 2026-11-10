@@ -284,6 +284,26 @@ const (
 	// servers" cannot be expressed there; separate from the hetero scenarios
 	// because these cases cost an hour and are a release gate of their own.
 	CapClusterChaos Capability = "cluster-chaos"
+	// CapOneLineJoin: every node joined with the one-line installer and a
+	// join token per role (Terraform one_line_join; plans/kubectl-style-
+	// cluster-ops.md §7), not the S3 bundle hand-off and CSR loop. Gates
+	// UC-620..625 (UC-623 also needs CapShortNodeCerts).
+	CapOneLineJoin Capability = "one-line-join"
+	// CapShortNodeCerts: the servers sign node certs with
+	// SB_CLUSTER_NODE_CERT_TTL=10m (the scenario's extra_sandboxd_env), so a
+	// cert renews within a run. Apart from CapOneLineJoin because a rollout
+	// scenario joins by token too but keeps 90-day certs, and UC-623 failed
+	// there on a cert it was never meant to see renew.
+	CapShortNodeCerts Capability = "short-node-certs"
+	// CapSpareServer: nodes has spare-server, a blank machine (plain Ubuntu,
+	// nothing installed) with role server, so UC-694 can add a server late
+	// through the module's own joiner bootstrap and a fresh join token.
+	CapSpareServer Capability = "spare-server"
+	// CapModuleURL: the scenario provisions through a root of its own whose
+	// module block fetches Terraform/ by git URL (run.sh
+	// prepare_module_root), not through Terraform/root, and leaves the join
+	// to the module's default: one line per node. Gates UC-683..687.
+	CapModuleURL Capability = "module-url"
 )
 
 // UseCase is one row of the coverage matrix.
@@ -335,7 +355,8 @@ var KnownCapabilities = map[Capability]bool{
 	CapL4ProxyProtocol: true, CapPATRotation: true,
 	CapKeyCustodyVault: true, CapKeyCustodyPKCS11: true, CapKeyCustodyKMSWrapped: true,
 	CapKeyCustodyKMSSwitch: true, CapKeyCustodySingleWrapped: true,
-	CapAPILoadBalancer: true, CapAPIListFairness: true, CapClusterChaos: true,
+	CapAPILoadBalancer: true, CapAPIListFairness: true, CapClusterChaos: true, CapOneLineJoin: true,
+	CapModuleURL: true, CapShortNodeCerts: true, CapSpareServer: true,
 }
 
 // Registry is the full use-case catalogue. Order is the matrix row order.
@@ -1103,6 +1124,102 @@ var Registry = []UseCase{
 
 	// A paused sandbox on every public address (#1050).
 	{ID: "UC-484", Title: "Chaos (I7; C4): a worker cut off from the servers pauses its recreate-policy sandbox, and every public address of it answers within seconds: the toolbox URL and the HTTP port with 503, the raw TCP port by closing the connection; after the heal they answer as before (#1050)", Requires: []Capability{CapCluster, CapClusterChaos}, Implemented: true},
+	// kubectl-style node verbs, Phase 1 (plans/kubectl-style-cluster-ops.md
+	// §9; node_verbs_test.go, zz_node_delete_test.go). The delete pair is
+	// disruptive and permanent for the run, so it lives in the file that
+	// sorts last.
+	{ID: "UC-610", Title: "aerolvm get nodes: every member is listed with its role and gossiped build version, exactly one is Ready,Leader and a voter, no worker is a voter, -o json matches /v1/cluster/members, and version --server and cluster-info reach the server", Requires: []Capability{CapCluster}, Implemented: true},
+	{ID: "UC-611", Title: "aerolvm cordon: a cordoned worker reads SchedulingDisabled and gets none of 2x-workers new sandboxes; uncordon clears the mark", Requires: []Capability{CapCluster}, Implemented: true},
+	{ID: "UC-612", Title: "GET /v1/cluster/nodes/{id} and describe node: a worker's owned count grows by the sandboxes placed on it and ?sandboxes= lists their IDs, without paging the sandbox index", Requires: []Capability{CapCluster}, Implemented: true},
+	{ID: "UC-613", Title: "aerolvm drain --delete-sandboxes: a worker with live sandboxes ends cordoned and owning none, and its sandboxes answer 404", Requires: []Capability{CapCluster}, Implemented: true},
+	{ID: "UC-614", Title: "aerolvm delete node (DELETE /v1/cluster/nodes/{id}) removes a worker: it leaves the member list, GET node answers 404, a repeated delete exits 0, and DELETE /v1/cluster/members/{worker} still answers 404 before and after", Requires: []Capability{CapCluster}, Implemented: true},
+	{ID: "UC-615", Title: "A deleted worker cannot rejoin: its own certificate is refused on a server's internal listener with 403 \"was deleted\" (accepted before the delete), and after a sandboxd restart it stays out of the member list", Requires: []Capability{CapCluster}, Implemented: true},
+	// One-line joins, Phase 2b (plans/kubectl-style-cluster-ops.md §4, §7).
+	{ID: "UC-620", Title: "Every node joined with a token through the one-line installer: its bootstrap ran install.sh init or join, cluster.env is sandboxd's, the cert names the token's role, nothing of the two-pass join ran, servers are the only voters, and each of Terraform's per-role tokens lists the nodes of its role", Requires: []Capability{CapOneLineJoin, CapCluster}, Implemented: true},
+	{ID: "UC-621", Title: "Wrong, reused and revoked join tokens are refused: an unknown token id's cluster-info is 403, a made-up token's join is 403 token_invalid, a used single-use token is 403 token_used for another key, a revoked token's cluster-info is 403; join-command refuses --ttl 0 for servers and warns for a never-expiring worker token", Requires: []Capability{CapOneLineJoin, CapCluster}, Implemented: true},
+	{ID: "UC-622", Title: "A deleted worker can't come back with its old key (403 key_revoked, sandboxd reset named as the fix); after sandboxd reset --yes a fresh join (new key and token) brings the same node ID back as a member", Requires: []Capability{CapOneLineJoin, CapCluster}, Implemented: true},
+	{ID: "UC-623", Title: "Node certs renew themselves: with 10-minute certs a server's and a worker's cert are replaced for the same node and role within 15 minutes, with no sandboxd restart, and sandboxes still place afterwards", Requires: []Capability{CapOneLineJoin, CapCluster, CapShortNodeCerts}, Implemented: true},
+	{ID: "UC-624", Title: "aerolvm join-command prints `curl -fsSL <installer> | sudo bash -s -- [--domain <d> --dns-provider cloudflare --dns-api-token \"$CLOUDFLARE_API_TOKEN\"] join <url> --token <t> --ca-cert-hash sha256:<h>`, and those words run as typed (with CLOUDFLARE_API_TOKEN set) on a reset machine make it a worker member under its host name", Requires: []Capability{CapOneLineJoin, CapCluster}, Implemented: true},
+	{ID: "UC-625", Title: "Running a successful join again is a replay: it exits 0, says nothing changed and sandboxd keeps its PID", Requires: []Capability{CapOneLineJoin, CapCluster}, Implemented: true},
+	// Upgrades without restarting sandboxes, Phase 3a live gate for mounts
+	// (plans/kubectl-style-cluster-ops.md §6.3 step 4, §6.4;
+	// z_mount_restart_test.go).
+	// The node's day-2 tools in Go, Phase 5 (plans/kubectl-style-cluster-ops.md
+	// §3.1; z_ops_tools_test.go). UC-680 and UC-681 restore and copy a
+	// single node's database, so they never run on a cluster.
+	{ID: "UC-680", Title: "sandboxd backup then sandboxd restore on a single node: the archive is 0600 and its manifest says VACUUM INTO; restore refuses while sandboxd runs; after stop, restore --start, sandboxd is healthy, a sandbox and a snapshot from before the backup are back and work (exec, create from the snapshot), and a sandbox and a snapshot made after the backup are gone", Excludes: []Capability{CapCluster}, Implemented: true},
+	{ID: "UC-681", Title: "sandboxd backup of a state.db near 1 GiB built from the node's own schema on the node's disk: the VACUUM INTO time (what an upgrade adds to a node's downtime, eng review T15) is measured and under 5 minutes", Excludes: []Capability{CapCluster}, Implemented: true},
+	{ID: "UC-682", Title: "Lost quorum: with two of three servers stopped there is no leader and a create fails; sandboxd recover-quorum --start on the surviving seed (refused while sandboxd runs; --rejoin refused on the seed) backs up, makes it the only voter and it leads and serves creates, a sandbox from before still answers exec; recover-quorum --rejoin --start on each lost server brings it back as a voter, ending with 3 voters and 1 leader", Requires: []Capability{CapCluster}, Implemented: true},
+	// Terraform used by URL, the Phase 5 gate (plans/kubectl-style-cluster-
+	// ops.md §7, §9; zz_module_url_test.go). The cluster-module-url scenario
+	// fetches the module by git URL from a root with no checkout behind it.
+	{ID: "UC-683", Title: "The cluster came from the Terraform module fetched by URL: the scenario's root holds only Terraform files, its module source is a git:: URL that Terraform's module manifest says it fetched, and every member joined with one line (install.sh init on the seed, install.sh join on the rest) with none of the old two-pass join's files", Requires: []Capability{CapModuleURL, CapCluster}, Implemented: true},
+	{ID: "UC-684", Title: "aerolvm get nodes lists every member of the module-url cluster, and every one is Ready", Requires: []Capability{CapModuleURL, CapCluster}, Implemented: true},
+	{ID: "UC-685", Title: "A sandbox runs on the module-url cluster and answers exec", Requires: []Capability{CapModuleURL, CapCluster}, Implemented: true},
+	{ID: "UC-686", Title: "The module made one join token per role and the seed registered them: reusable worker and ingress tokens that never expire and a reusable server token that ends within 24 hours", Requires: []Capability{CapModuleURL, CapCluster}, Implemented: true},
+	{ID: "UC-687", Title: "The line aerolvm join-command prints, run on a blank machine, makes it one more worker under its host name, and aerolvm get nodes lists it Ready", Requires: []Capability{CapModuleURL, CapCluster}, Implemented: true},
+	// Worker and ingress nodes without the operator PAT
+	// (plans/kubectl-style-cluster-ops.md §8; pat_free_join_test.go). A
+	// one-line join gives them the PAT's hash, and they call their peers
+	// with their node certs alone.
+	{ID: "UC-690", Title: "A one-line worker and ingress node hold no operator PAT: their SB_PAT_TOKEN is a token of their own, cluster.env holds the PAT's SHA-256, and the PAT is in none of their /etc/sandboxd files, user data or bootstrap logs; every server holds the PAT and no hash", Requires: []Capability{CapOneLineJoin, CapCluster}, Implemented: true},
+	{ID: "UC-691", Title: "The join answer for a worker and an ingress token carries no pat_token and no CA key, only the PAT's SHA-256 and the operator volume scope", Requires: []Capability{CapOneLineJoin, CapCluster}, Implemented: true},
+	{ID: "UC-692", Title: "The old worker-token-to-CA-key path is refused end to end: a worker's cert alone is a live peer on a server's internal listener but is refused a server join token, the CA key and adopt; the worker's own token is refused by the server, by the load balancer and on the worker's own public API, and works only on the worker's loopback", Requires: []Capability{CapOneLineJoin, CapCluster}, Implemented: true},
+	{ID: "UC-693", Title: "A worker's own API still serves sandbox calls: with the operator PAT (checked by its hash) it creates a sandbox that answers exec, and reads and runs exec in one another node owns; the worker's own token on loopback reads a sandbox another node owns (the forward goes as the worker)", Requires: []Capability{CapOneLineJoin, CapCluster}, Implemented: true},
+	{ID: "UC-694", Title: "A server added after the module's join token stopped working joins with a fresh one, kubeadm's way: a joined server's own bootstrap, given a token the join port refuses, stops after the grace and names sandboxd join-command and node_join_tokens; the same bootstrap with a fresh token from sudo sandboxd join-command --role server --json on a server (what node_join_tokens puts in that node's user data) makes the blank spare-server a live server member", Requires: []Capability{CapOneLineJoin, CapCluster, CapSpareServer}, Implemented: true},
+	// Cluster rollouts, Phase 3b live gate and the Phase 3a cluster-side
+	// items (plans/kubectl-style-cluster-ops.md §6, §9; zz_rollout_test.go).
+	// Build B is this tree with another version stamp; the cases run in
+	// order and each restarts nodes.
+	{ID: "UC-641", Title: "POST /v1/cluster/leader/transfer hands Raft leadership to another voter: the answer names the new leader and term, and the member list shows it", Requires: []Capability{CapCluster}, Implemented: true},
+	{ID: "UC-642", Title: "The active cluster version moves at finalize: after a rollout to build B finalizes, the rollout shows active_version B", Requires: []Capability{CapCluster}, Implemented: true},
+	{ID: "UC-643", Title: "The mixed-version window works: with build A and build B members side by side (a paused rollout), a new sandbox starts and sandboxes made before answer exec", Requires: []Capability{CapCluster}, Implemented: true},
+	{ID: "UC-644", Title: "A forced failure on a node during apply rolls that node back: its upgrader puts the new toolboxd back to A, the old sandboxd starts again, the node stays a live member on A, and the rollout ends failed naming it", Requires: []Capability{CapCluster}, Implemented: true},
+	{ID: "UC-645", Title: "The active cluster version is written once every server runs a build with rollouts: a new rollout shows active_version A and an FSM op version of at least 13", Requires: []Capability{CapCluster}, Implemented: true},
+	{ID: "UC-646", Title: "sandboxd upgrade node run by hand on a server keeps quorum: with one of three servers stopped, a hand-run rollback on another server is refused (it would leave 1 of 3 voters) and leaves sandboxd running; on the leader it hands leadership to another server first, then rolls back", Requires: []Capability{CapCluster}, Implemented: true},
+	{ID: "UC-650", Title: "A node that can't stage fails the rollout before any node restarts: the rollout ends failed naming the node, every member still runs build A, and applying the same version again sends the rollout back to staging", Requires: []Capability{CapCluster}, Implemented: true},
+	{ID: "UC-651", Title: "--pause-after 1: after the servers (the leader last, after a hand-off) and the ingress node, exactly one worker upgrades and the rollout pauses until resume", Requires: []Capability{CapCluster}, Implemented: true},
+	{ID: "UC-652", Title: "The rollout runs in the cluster: with no client attached it finishes, every member runs build B, and the leader that started it was upgraded after handing leadership off", Requires: []Capability{CapCluster}, Implemented: true},
+	{ID: "UC-653", Title: "Zero container restarts and no failover during a rollout: sandboxes made before the first restart keep their owner node, their PID 1 and their files through every node restart", Requires: []Capability{CapCluster}, Implemented: true},
+	{ID: "UC-654", Title: "aerolvm upgrade rollback (POST /v1/cluster/upgrade/rollback) puts every node back on build A and the rollout ends rolled-back; a repeat succeeds", Requires: []Capability{CapCluster}, Implemented: true},
+	{ID: "UC-655", Title: "source release: servers fetch build B from SB_RELEASE_URL, workers and ingress copy it from servers only; without hold the rollout finalizes by itself and every node runs its one-way migrations; rollback after finalize is refused", Requires: []Capability{CapCluster}, Implemented: true},
+	{ID: "UC-656", Title: "Upload routes on the leader: PUT /v1/cluster/upgrade/files/{sha256} stores a file (201, then 200), HEAD answers 200 or 404, a body that does not hash to its path is refused 400 hash_mismatch, and a bad path is a 400", Requires: []Capability{CapCluster}, Implemented: true},
+	{ID: "UC-657", Title: "Rollout commands answer per the §6.6 table: a repeated resume succeeds, another target is refused 409 rollout_conflict while a held rollout is done, stop and resume refuse a done rollout, and the same target answers the existing rollout", Requires: []Capability{CapCluster}, Implemented: true},
+	{ID: "UC-640", Title: "External-storage mounts survive a sandboxd restart: on the node running a sandbox with a platform volume, a file written through the mount reads back after `systemctl restart sandboxd` and a new write lands through the same mount of the same sandbox (never re-created); the mount helper is the same process before and after (adopted, not mounted again) and, on cgroup v2, runs in the aerolvm-mounts cgroup; a second sandbox on the volume reads the new file", Requires: []Capability{CapPlatformVolumes}, Implemented: true},
+	// aerolvm upgrade on a single node and the offline bundle, Phase 3b
+	// (plans/kubectl-style-cluster-ops.md §6.1, §7.1;
+	// z_upgrade_cli_test.go). They restart sandboxd and run in order.
+	{ID: "UC-660", Title: "aerolvm upgrade plan <B> --from <dir> on a single node (the scenario's one-server cluster is first taken out of cluster mode, as install.sh alone leaves a node; UC-666 puts it back): build B (this tree as itest-<id>-b, build.sh variant) is read and checked against its checksums.txt, and the plan (text and -o json) names the one node, its version A and the action upgrade", Requires: []Capability{CapDocker}, Excludes: []Capability{CapCluster}, Implemented: true},
+	{ID: "UC-661", Title: "aerolvm upgrade apply <B> --from <dir> --wait on a single node: the files are uploaded (PUT /v1/node/upgrade/files), POST /v1/node/upgrade starts sandboxd upgrade node, --wait follows it across the restart, /health reports B, and a sandbox from before keeps running with the same ID, its files, and answers exec", Requires: []Capability{CapDocker}, Excludes: []Capability{CapCluster}, Implemented: true},
+	{ID: "UC-662", Title: "The same aerolvm upgrade apply again is a no-op: every file is already on the node (HEAD), nothing is uploaded, the node answers that it runs B, and no new operation starts", Requires: []Capability{CapDocker}, Excludes: []Capability{CapCluster}, Implemented: true},
+	{ID: "UC-663", Title: "aerolvm upgrade status shows the single node's last operation (text and -o json: done, B from A), and upgrade stop says a single node has no rollout", Requires: []Capability{CapDocker}, Excludes: []Capability{CapCluster}, Implemented: true},
+	{ID: "UC-664", Title: "aerolvm upgrade rollback --wait puts A back on the single node (the *.prev files), the sandbox from before still runs and answers exec, and a second rollback is a no-op", Requires: []Capability{CapDocker}, Excludes: []Capability{CapCluster}, Implemented: true},
+	{ID: "UC-665", Title: "aerolvm release pull v0.6.11 --arch amd64 builds a checked bundle from the real GitHub release (manifest.json first, checksums.txt, binaries, SLSA provenance); a copy with one changed byte and a bundle of an unknown format are both refused by apply --from before any call reaches sandboxd", Requires: []Capability{CapDocker}, Excludes: []Capability{CapCluster}, Implemented: true},
+	{ID: "UC-666", Title: "The single-node upload route checks each file against its name: a PUT whose body does not hash to the path answers 400 hash_mismatch, a bad name 400, a HEAD of an unknown file 404, and a POST with a bad version 400", Requires: []Capability{CapDocker}, Excludes: []Capability{CapCluster}, Implemented: true},
+	// The upgrade CLI on a real cluster (zz_upgrade_cluster_cli_test.go).
+	{ID: "UC-667", Title: "aerolvm upgrade plan and apply <C> --from <dir> --hold --wait on a cluster: plan says cluster mode and lists every node, apply uploads the files and every member ends on C, status shows the rollout done and held, and a sandbox from before keeps its files and answers exec", Requires: []Capability{CapCluster}, Implemented: true},
+	{ID: "UC-668", Title: "aerolvm upgrade rollback --wait on a cluster puts every member back on the previous build (a node already rolled back by hand is skipped), status shows rolled-back, and the kept sandbox still answers exec", Requires: []Capability{CapCluster}, Implemented: true},
+	// kubectl grammar for sandboxes, snapshots and tokens, Phase 4
+	// (plans/kubectl-style-cluster-ops.md §3.3, §9; kubectl_polish_test.go).
+	// Stable forms also run through a kubectl-aerolvm copy of the binary,
+	// which must answer the same.
+	{ID: "UC-670", Title: "aerolvm get sandboxes: the table, -o wide, -o name (every page), -o json and -o yaml show the sandboxes the API has, and get sb <name> --json is the same sandbox as the old get <name> --json; kubectl-aerolvm answers the same", Requires: []Capability{CapDocker}, Implemented: true},
+	{ID: "UC-671", Title: "aerolvm get sb -l: k=v and k==v (filtered by sandboxd), k!=v, k and !k (filtered by the CLI) select exactly the right tagged sandboxes, and a set-based selector is refused with exit 2", Requires: []Capability{CapDocker}, Implemented: true},
+	{ID: "UC-672", Title: "aerolvm describe sb shows the sandbox's ID, status, tags and network; describe <name> with no kind and the old get <name> still reach the sandbox; a missing sandbox exits 1", Requires: []Capability{CapDocker}, Implemented: true},
+	{ID: "UC-673", Title: "aerolvm delete sb destroys the sandbox (the API answers not found after), a repeat delete exits 0 as already gone, --json matches destroy's results, and delete with a word that is not a kind exits 2 and destroys nothing", Requires: []Capability{CapDocker}, Implemented: true},
+	{ID: "UC-674", Title: "aerolvm get/describe/delete snapshots on a snapshot the old snapshot verb made: listed by name, -o json names its source sandbox, describe shows it, delete removes it (get then exits 1) and a repeat delete exits 0 (on a cluster the list checks are skipped: GET /v1/snapshots is node-local there)", Requires: []Capability{CapDocker}, Implemented: true},
+	{ID: "UC-675", Title: "aerolvm get/describe/delete tokens on a token aerolvm token create made: listed by ID, described by name, -o json shows role and team, delete by name is refused, delete by ID revokes it so it leaves the list, and a repeat delete exits 0", Requires: []Capability{CapIdentity}, Implemented: true},
+	{ID: "UC-676", Title: "aerolvm api-resources lists nodes, sandboxes, snapshots and tokens with their short names and verbs, with no login; top nodes shows each node's reserved CPU and memory against its budget from /v1/capacity, and - for a node with no budget (a cluster's ingress or server)", Requires: []Capability{CapDocker}, Implemented: true},
+	// T14 (plans/kubectl-style-cluster-ops.md §6.4) found that WASM and
+	// isolate sandboxes did not survive a sandboxd restart; these now assert
+	// that they do. They restart sandboxd, so they live in files that sort
+	// late (z_runtime_restart_test.go, z_upgrade_runtimes_test.go).
+	{ID: "UC-677", Title: "WASM across systemctl restart sandboxd: an ephemeral (default) and a passivatable WASM sandbox on the resident host keep running, answer exec within seconds of /health with their /work counter moved on by exactly one and their marker file intact, sandboxd logs taking each over, and every WASM worker process from before is still running", Requires: []Capability{CapWasm}, Implemented: true},
+	{ID: "UC-678", Title: "V8 isolate across systemctl restart sandboxd: an isolate whose fetch handler counts calls in memory keeps running and answers 4 after 3 (the same isolate, so the same memory), with the jail on (the default; it can be created at all) and with SB_ISOLATE_USE_JAIL=false", Requires: []Capability{CapIsolate}, Implemented: true},
+	{ID: "UC-700", Title: "A WASM sandbox with public traffic on runs on its own per-sandbox worker, and Python there runs a script file from /work and -c (an exec no longer opens a guest listener whose fd broke Python's embedded files)", Requires: []Capability{CapWasm}, Implemented: true},
+	{ID: "UC-701", Title: "A WASM sandbox with public traffic on (its own per-sandbox worker) keeps running across systemctl restart sandboxd with its /work counter moved on by one (asserted in the UC-677 test)", Requires: []Capability{CapWasm}, Implemented: true},
+	{ID: "UC-702", Title: "A WASM sandbox whose worker was killed while sandboxd was stopped is restored at boot over its kept /work: started, exec answers at once, its counter file carries on, and sandboxd logs the restore", Requires: []Capability{CapWasm}, Implemented: true},
+	{ID: "UC-703", Title: "aerolvm upgrade plan <B> --from says WASM and isolate sandboxes keep running, and aerolvm upgrade apply <B> --from --wait on a single node keeps an ephemeral and a passivatable WASM sandbox and a jailed isolate running with their state (counter 3 then 4); then rollback puts A back", Requires: []Capability{CapWasm, CapIsolate, CapDocker}, Excludes: []Capability{CapCluster}, Implemented: true},
 }
 
 // byID is a lookup built once for the report generator.

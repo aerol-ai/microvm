@@ -1,0 +1,160 @@
+exit 0
+--- stdout
+{
+  "target_version": "v0.6.13",
+  "mode": "cluster",
+  "source": "release <releases>/v0.6.13 (each node downloads it)",
+  "files": [
+    "caddy_linux_amd64",
+    "caddy_linux_arm64",
+    "release.json",
+    "sandboxd_linux_amd64",
+    "sandboxd_linux_arm64",
+    "toolboxd_linux_amd64",
+    "toolboxd_linux_arm64"
+  ],
+  "release": {
+    "version": "v0.6.13",
+    "upgrade_from_min": "v0.6.12",
+    "one_way_migrations": [
+      7
+    ],
+    "host_setup_sha256": "5fd06fb01e71912ce6fc80cae061c48045f2f0132a1eb28d58e7c4dc85820ec6",
+    "host_setup_needs_network": false,
+    "egress_gateway_protocol": [
+      1,
+      2
+    ],
+    "fsm_ops_version": 13
+  },
+  "nodes": [
+    {
+      "node_id": "srv-b",
+      "role": "server",
+      "version": "v0.6.12",
+      "alive": true,
+      "voter": true,
+      "tier": "servers",
+      "order": 1,
+      "action": "upgrade"
+    },
+    {
+      "node_id": "srv-c",
+      "role": "server",
+      "version": "v0.6.12",
+      "alive": true,
+      "voter": true,
+      "tier": "servers",
+      "order": 2,
+      "action": "upgrade"
+    },
+    {
+      "node_id": "srv-a",
+      "role": "server",
+      "version": "v0.6.12",
+      "alive": true,
+      "voter": true,
+      "leader": true,
+      "tier": "servers",
+      "order": 3,
+      "action": "upgrade"
+    },
+    {
+      "node_id": "ing-1",
+      "role": "ingress",
+      "version": "v0.6.12",
+      "alive": true,
+      "tier": "ingress",
+      "order": 4,
+      "action": "upgrade"
+    },
+    {
+      "node_id": "wkr-1",
+      "role": "worker",
+      "version": "v0.6.12",
+      "alive": true,
+      "tier": "workers",
+      "order": 5,
+      "batch": 1,
+      "action": "upgrade"
+    },
+    {
+      "node_id": "wkr-2",
+      "role": "worker",
+      "version": "v0.6.12",
+      "alive": false,
+      "tier": "workers",
+      "action": "skip: down (upgraded when it is back)"
+    },
+    {
+      "node_id": "wkr-3",
+      "role": "worker",
+      "version": "v0.6.13",
+      "alive": true,
+      "tier": "workers",
+      "action": "skip: already on the target"
+    },
+    {
+      "node_id": "wkr-4",
+      "role": "worker",
+      "version": "v0.6.12",
+      "alive": true,
+      "tier": "workers",
+      "order": 6,
+      "batch": 2,
+      "action": "upgrade"
+    },
+    {
+      "node_id": "wkr-5",
+      "role": "worker",
+      "version": "v0.6.12",
+      "alive": true,
+      "tier": "workers",
+      "order": 7,
+      "batch": 3,
+      "action": "upgrade"
+    }
+  ],
+  "allowed": true,
+  "warnings": [
+    "down nodes are skipped and upgraded when they come back; finalize waits for them: wkr-2",
+    "2 WASM and 1 V8-isolate sandbox(es) run now: they keep running through each node's restart, but on a node whose running sandboxd predates the hand-over, each restarts once: a WASM sandbox keeps its /work files, an isolate starts fresh on its next request"
+  ],
+  "skew": {
+    "upgrade_from_min": "v0.6.12"
+  },
+  "one_way_migrations": [
+    7
+  ],
+  "rollback_after_finalize": false,
+  "host_setup": "changes",
+  "egress_gateway": "stays up",
+  "batch": "10%",
+  "batch_size": 1,
+  "tiers": [
+    {
+      "name": "servers",
+      "nodes": 3,
+      "steps": 3,
+      "estimate": "about 3 min"
+    },
+    {
+      "name": "ingress",
+      "nodes": 1,
+      "steps": 1,
+      "estimate": "about 1 min"
+    },
+    {
+      "name": "workers",
+      "nodes": 5,
+      "steps": 3,
+      "estimate": "about 3 min"
+    }
+  ],
+  "restart_losers": {
+    "wasm": 2,
+    "isolate": 1,
+    "counted": true
+  }
+}
+--- stderr

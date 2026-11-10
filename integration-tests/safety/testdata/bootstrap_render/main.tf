@@ -89,6 +89,7 @@ locals {
     aws_region = "x"
     seed_private_ip = "x"
     install_script_url = "x"
+    download_mirror = ""
     caddy_binary_url = "x"
     cluster_init_script_url = "x"
     cluster_join_script_url = "x"
@@ -168,6 +169,13 @@ locals {
     container_engine = "x"
     containerd_cfg = { socket = "x", namespace = "x", cni_plugin_dir = "x", native_netns_pool_enabled = "x" }
     containerd_pool_cfg = { enabled = "false", depth = "x", images = "x", max_images = "x", idle_ttl = "x", refill_interval = "x" }
+    one_line_join = false
+    blank = false
+    join_token = ""
+    join_role = "server"
+    join_token_worker = ""
+    join_token_ingress = ""
+    join_token_server = ""
     platform_volumes_cfg = { enabled = "x", backend = "x", max_per_tenant = "x", nfs_export = "x", nfs_options = "x", nfs_server = "x", reclaim_concurrency = "x", reclaim_interval = "x", reclaim_mount_root = "x", s3_access_key_id = "x", s3_bucket = "x", s3_endpoint = "x", s3_prefix = "x", s3_region = "x", s3_secret_access_key = "x" }
   }
 }
@@ -176,6 +184,12 @@ output "joiner" { value = templatefile("__TEMPLATE__", merge(local.base, { is_se
 
 # default_ingress_proxy_routing is three-valued (Terraform/variables.tf): the
 # base above is null (no flag, install.sh's default); these set it.
+# download_mirror set (Terraform/variables.tf): the bootstrap's downloads fall
+# back to the mirror. The base above is "" (null), which must render nothing
+# new.
+output "joiner_download_mirror" {
+  value = templatefile("__TEMPLATE__", merge(local.base, { is_seed = false, download_mirror = "https://mirror.example.com/base" }))
+}
 output "joiner_routing_on" {
   value = templatefile("__TEMPLATE__", merge(local.base, { is_seed = false, ingress_proxy_routing = true }))
 }
@@ -319,5 +333,42 @@ output "joiner_containerd_pool" {
       refill_interval = "5s"
     }
     sandboxd_env = { SB_CONTAINERD_POOL_DEPTH = "8" }
+  }))
+}
+
+# One-line join (Terraform/join.tf): the seed runs install.sh ... init with a
+# token per role, a joiner install.sh ... join against the seed's join port.
+output "seed_join" {
+  value = templatefile("__TEMPLATE__", merge(local.base, {
+    is_seed            = true
+    one_line_join      = true
+    join_token_worker  = "aaaaaa.00000000000000000000000000000000"
+    join_token_ingress = "bbbbbb.00000000000000000000000000000000"
+    join_token_server  = "cccccc.00000000000000000000000000000000"
+    sandboxd_env       = { SB_CLUSTER_NODE_CERT_TTL = "10m" }
+  }))
+}
+
+output "joiner_blank" {
+  value = templatefile("__TEMPLATE__", merge(local.base, { is_seed = false, blank = true }))
+}
+
+output "joiner_join" {
+  value = templatefile("__TEMPLATE__", merge(local.base, {
+    is_seed       = false
+    one_line_join = true
+    join_token    = "aaaaaa.00000000000000000000000000000000"
+  }))
+}
+
+# A one-line worker or ingress joiner: Terraform passes no PAT (nodes.tf),
+# so its user data never holds the operator's admin token.
+output "joiner_join_worker" {
+  value = templatefile("__TEMPLATE__", merge(local.base, {
+    is_seed       = false
+    role          = "worker"
+    one_line_join = true
+    pat_token     = ""
+    join_token    = "aaaaaa.00000000000000000000000000000000"
   }))
 }

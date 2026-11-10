@@ -218,7 +218,9 @@ write_env_file "${WORK}/suite.env" "${ENV_ARGS[@]}"
 } >"${WORK}/runner.sh"
 
 echo "copying the suite to ${NODE_NAME}:${REMOTE_DIR}" >&2
-scp -q "${SSH_OPTS[@]}" "${WORK}/suite.test" "${WORK}/runner.sh" "$CAPS_FILE" "${TARGET}:${REMOTE_DIR}/"
+# Through S3, not scp: the test binary is tens of MB, and one scp stream
+# over this machine's uplink takes minutes (lib/stage.sh).
+stage_to_node "$TARGET" "$REMOTE_DIR" "${WORK}/suite.test" "${WORK}/runner.sh" "$CAPS_FILE"
 # On stdin, into a 0600 file: the env holds the tokens.
 ssh "${SSH_OPTS[@]}" "$TARGET" "umask 077 && cat > ${RDIR_Q}/suite.env" <"${WORK}/suite.env"
 

@@ -316,3 +316,30 @@ func TestNodeMetaWithFSMOpsVersionFitsMetaSize(t *testing.T) {
 		t.Fatalf("decoded meta lost RaftAddr or fv: %+v (%d bytes)", meta, len(enc))
 	}
 }
+
+// `sandboxd version` prints FSMOpsVersion so operators can compare builds
+// before gossip is up. It must be the version gossip advertises, and no
+// feature gate may name a version above it: a gate the build's own fv never
+// reaches would refuse that feature's writes on a fully upgraded cluster.
+func TestFSMOpsVersionCoversEveryFeatureGate(t *testing.T) {
+	if got := FSMOpsVersion(); got != fsmOpsVersion {
+		t.Fatalf("FSMOpsVersion() = %d, want fsmOpsVersion %d", got, fsmOpsVersion)
+	}
+	for name, gate := range map[string]int{
+		"egressProfile":         egressProfileFSMOpsVersion,
+		"auditCaller":           auditCallerFSMOpsVersion,
+		"apiToken":              apiTokenFSMOpsVersion,
+		"ServerKeyRing":         ServerKeyRingFSMOpsVersion,
+		"sshSessionOwnerRecord": sshSessionOwnerRecordFSMOpsVersion,
+		"tokenPort":             tokenPortFSMOpsVersion,
+		"warmPool":              warmPoolFSMOpsVersion,
+		"identity":              identityFSMOpsVersion,
+		"teamQuota":             teamQuotaFSMOpsVersion,
+		"volumeReclaim":         volumeReclaimFSMOpsVersion,
+		"destroyAt":             destroyAtFSMOpsVersion,
+	} {
+		if gate > FSMOpsVersion() {
+			t.Errorf("%sFSMOpsVersion = %d is above the build's FSMOpsVersion() %d", name, gate, FSMOpsVersion())
+		}
+	}
+}

@@ -1,0 +1,21 @@
+# The rollout gate (plans/kubectl-style-cluster-ops.md §9 Phase 3b,
+# UC-641..657 in zz_rollout_test.go): cluster-hetero-lite's 8-member
+# role-separated topology (3 server / 1 ingress / 4 worker) under its own
+# name, so its Terraform state never meets another run of
+# cluster-hetero-lite. Run it with AEROL_TEST_RUN='TestRolloutLive': every
+# case restarts nodes.
+name: cluster-rollout
+capabilities:
+  - docker
+  - platform-volumes
+  - gvisor
+  - wasm
+  - domain
+  - cluster
+  - remote-mcp
+  - egress-fqdn
+
+expected_members: 8
+
+# A rollout restarts every node; role separation keeps the API up.
+disruptive: true

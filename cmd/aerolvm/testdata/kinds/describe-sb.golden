@@ -1,0 +1,20 @@
+exit 0
+--- stdout
+Name:         box
+ID:           sb-0000000000000001
+Status:       started (warm)
+Runtime:      docker
+Image:        python:3.12
+CPU:          1.5
+Memory:       512Mi
+Created:      2026-10-04T12:00:00Z (34d ago)
+Last active:  2026-11-07T11:58:30Z (90s ago)
+URL:          https://box.example.com
+Tags:         app=web,tier=front
+Ports:        8080/http https://8080-box.example.com, 5432/tcp host port 22001
+Network:      outbound only to pypi.org, *.pythonhosted.org
+Lifecycle:    stop if idle 30m, destroy at age 48h
+Engine:       containerd
+Exit code:    3
+Last error:   toolbox restarted once
+--- stderr

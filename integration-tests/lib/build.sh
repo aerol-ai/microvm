@@ -6,6 +6,7 @@
 #   build.sh publish [--ref <commit>] [--ttl 12h] [--arch ...]
 #   build.sh urls    [--ref <commit>] [--ttl 12h] [--arch ...]
 #   build.sh artifacts-init
+#   build.sh variant <suffix> [--arch ...]
 #
 # AEROL_GO_TAGS (e.g. itest_failpoints) compiles sandboxd with test-only Go
 # build tags and becomes part of the build id; unset, the build is the
@@ -328,10 +329,10 @@ build_one_arch() {
     # not touch pkg/caddy. Building it is opt-in for the case where it does.
     log "build: caddy_linux_${arch} (xcaddy)"
     ( cd "$src" && GOOS=linux GOARCH="$goarch" CGO_ENABLED=0 \
-        xcaddy build \
-          --with github.com/mholt/caddy-l4 \
-          --with github.com/caddy-dns/cloudflare \
-          --with github.com/ss098/certmagic-s3 \
+        xcaddy build v2.11.9 \
+          --with github.com/mholt/caddy-l4@v0.1.2 \
+          --with github.com/caddy-dns/cloudflare@v0.2.4 \
+          --with github.com/ss098/certmagic-s3@v0.0.0-20250922022452-8af482af5f39 \
           --output "${out}/caddy_linux_${arch}" )
     assert_linux_elf "${out}/caddy_linux_${arch}" "$arch"
   fi
@@ -384,6 +385,46 @@ cmd_build() {
 
   log "build: done — ${out}"
   printf '%s\n' "$build_id"
+}
+
+# cmd_variant builds this tree again under another version stamp,
+# itest-<build id>-<suffix>, into <build dir>/variant-<suffix>/ with its own
+# checksums.txt, and prints that directory. The upgrade gates
+# (plans/kubectl-style-cluster-ops.md §9 Phase 3b: "two local builds of this
+# stack with different versions") install the normal build, then upgrade to
+# this one: the same code, so the only change an upgrade makes is the
+# version. Cached like build: a second call with the same tree is free.
+cmd_variant() {
+  local suffix="${1:-}"
+  [[ "$suffix" =~ ^[a-z0-9]{1,8}$ ]] || die "variant needs a suffix of 1-8 lower-case letters or digits, e.g. 'variant b'"
+  shift
+  parse_common_flags "$@"
+  preflight
+
+  local build_id out src arch
+  build_id=$(resolve_build_id)
+  out="${BUILD_ROOT}/${build_id}/variant-${suffix}"
+  # checksums.txt is written last, so its presence marks a whole build.
+  if [[ -f "${out}/checksums.txt" ]]; then
+    local complete=1
+    for arch in "${ARCHES[@]}"; do
+      [[ -f "${out}/sandboxd_linux_${arch}" && -f "${out}/toolboxd_linux_${arch}" ]] || complete=0
+    done
+    if (( complete )); then
+      log "build: variant ${suffix} of ${build_id} already built (cache hit) — ${out}"
+      printf '%s\n' "$out"
+      return 0
+    fi
+  fi
+  src=$(source_tree_for "$build_id")
+  rm -rf "$out"
+  mkdir -p "$out"
+  log "build: variant ${suffix} of ${build_id} (version itest-${build_id}-${suffix})"
+  for arch in "${ARCHES[@]}"; do
+    build_one_arch "$src" "$out" "$arch" "${build_id}-${suffix}"
+  done
+  write_checksums "$out"
+  printf '%s\n' "$out"
 }
 
 # prune_build_cache caps local disk.
@@ -869,6 +910,90 @@ cmd_build_id() {
 }
 
 ###############################################################################
+# stage: files for a test node, through S3 (never scp from this machine)
+###############################################################################
+
+# A test node gets a file from this machine through S3, not over scp. One scp
+# is one TCP stream over this laptop's uplink: 10-170 KB/s to us-east-1, so
+# the adopt gate's 129 MB build took 20+ minutes per node, every node, and
+# slowed every other session's uploads meanwhile. An S3 upload runs many
+# connections at once (~1.4 MB/s from the same laptop) and happens once, and
+# a published build is already there, so it often costs nothing; each node
+# then downloads inside AWS in seconds. lib/stage.sh's stage_to_node is the
+# caller; scripts/stage-to-node.sh is the same thing for a person or agent.
+
+STAGE_TTL_SECONDS=3600 # a staged file is fetched within minutes
+
+# stage_build_key echoes builds/<id>/<name> when file sits directly in a
+# build folder (integration-tests/.build/<id>/), where publish puts the same
+# bytes, and nothing otherwise.
+stage_build_key() {
+  local f="$1" dir root
+  dir="$(cd "$(dirname "$f")" 2>/dev/null && pwd -P)" || return 0
+  root="$(cd "$BUILD_ROOT" 2>/dev/null && pwd -P)" || return 0
+  [[ "$(dirname "$dir")" == "$root" ]] || return 0
+  printf 'builds/%s/%s' "$(basename "$dir")" "$(basename "$f")"
+}
+
+# stage_content_key is where a file that is not in a published build goes:
+# keyed by its SHA-256, so the same bytes are uploaded once however many
+# nodes or runs ask for them. Under builds/, so the 7-day expiry covers it.
+stage_content_key() {
+  printf 'builds/stage/%s/%s' "$1" "$(basename "$2")"
+}
+
+# stage_file_mode keeps the one permission bit scp used to carry over.
+stage_file_mode() {
+  if [[ -x "$1" ]]; then echo 0755; else echo 0644; fi
+}
+
+# cmd_stage puts each file where a node can fetch it and prints one line per
+# file on stdout: "<sha256> <mode> <name> <presigned GET url>". It uploads
+# only what the bucket lacks. The node checks the SHA-256 of what it fetched
+# against this machine's copy (stage_remote_script), so reusing a published
+# object can never hand a node other bytes than the ones named here.
+cmd_stage() {
+  local files=() ttl
+  TTL_SECONDS="$STAGE_TTL_SECONDS"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --ttl) ttl="$(parse_ttl "${2:?--ttl needs a duration}")" || exit 1; TTL_SECONDS="$ttl"; shift 2 ;;
+      --)    shift; files+=("$@"); break ;;
+      -*)    die "stage: unknown flag: $1" ;;
+      *)     files+=("$1"); shift ;;
+    esac
+  done
+  [[ ${#files[@]} -gt 0 ]] || die "stage: no files given"
+  local f
+  for f in "${files[@]}"; do
+    [[ -f "$f" ]] || die "stage: ${f} is not a file"
+  done
+
+  resolve_aws
+  local region="$AWS_REGION_RESOLVED" bucket="$ARTIFACT_BUCKET"
+  local sha size key remote_size
+  for f in "${files[@]}"; do
+    sha="$(sha256_stdin <"$f")"
+    size="$(wc -c <"$f" | tr -d '[:space:]')"
+    key="$(stage_build_key "$f")"
+    if [[ -n "$key" ]]; then
+      remote_size="$("${AWSCLI[@]}" --region "$region" s3api head-object --bucket "$bucket" --key "$key" \
+        --query ContentLength --output text 2>/dev/null || true)"
+      [[ "$remote_size" == "$size" ]] || key=""
+    fi
+    if [[ -z "$key" ]]; then
+      key="$(stage_content_key "$sha" "$f")"
+      if ! "${AWSCLI[@]}" --region "$region" s3api head-object --bucket "$bucket" --key "$key" >/dev/null 2>&1; then
+        log "stage: uploading $(basename "$f") ($((size / 1048576)) MB) to s3://${bucket}/${key}"
+        "${AWSCLI[@]}" --region "$region" s3 cp --only-show-errors "$f" "s3://${bucket}/${key}" >&2 \
+          || die "stage: upload of ${f} failed"
+      fi
+    fi
+    printf '%s %s %s %s\n' "$sha" "$(stage_file_mode "$f")" "$(basename "$f")" "$(presign "$bucket" "$region" "$key")"
+  done
+}
+
+###############################################################################
 
 main() {
   local cmd="${1:-}"
@@ -878,6 +1003,8 @@ main() {
     publish)        cmd_publish "$@" ;;
     urls)           cmd_urls "$@" ;;
     build-id)       cmd_build_id "$@" ;;
+    stage)          cmd_stage "$@" ;;
+    variant)        cmd_variant "$@" ;;
     artifacts-init) cmd_artifacts_init ;;
     *)
       cat >&2 <<'USAGE'
@@ -891,6 +1018,13 @@ usage: build.sh <command> [flags]
           Re-presign an already-published build (stdout = tfvars).
   build-id [--ref <commit>]
           Print AEROL_BUILD_ID only.
+  stage   [--ttl 1h] <file>...
+          Put local files in S3 for a test node (reusing a published build's
+          copy) and print "<sha256> <mode> <name> <url>" per file. Use
+          lib/stage.sh's stage_to_node, not this, to move files to a node.
+  variant <suffix> [--arch ...]
+          Build this tree again as version itest-<id>-<suffix> into
+          .build/<id>/variant-<suffix>/ and print that directory.
   artifacts-init
           One-time per-account artifacts bucket bootstrap.
 USAGE

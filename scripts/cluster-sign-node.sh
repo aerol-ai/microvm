@@ -12,8 +12,19 @@
 #       --out /tmp/node.crt
 #
 # Then copy node.crt back to the joiner's /etc/sandboxd/tls/node.crt.
+#
+# Deprecated (plans/kubectl-style-cluster-ops.md D2): with one-line joins the
+# servers sign every joiner's cert themselves (`sandboxd join`), so there is
+# nothing to copy. It stays for one release for the old two-pass join that
+# Terraform's default mode still runs; there is no `sandboxd` command it
+# could wrap, because signing is now the join service's job.
 
 set -euo pipefail
+
+case " $* " in
+	*" --help "* | *" -h "*) ;;
+	*) echo "cluster-sign-node.sh: deprecated, goes away next release; new nodes join with the line \`aerolvm join-command\` prints (sandboxd join), and the servers sign their certs" >&2 ;;
+esac
 
 CSR=""
 NODE_ID=""

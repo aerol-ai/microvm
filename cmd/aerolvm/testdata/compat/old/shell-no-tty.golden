@@ -1,0 +1,5 @@
+exit 125
+--- stdout
+--- stderr
+aerolvm shell: shell needs a terminal; from a script or an agent, use: aerolvm exec <sandbox> -- <command>
+run `aerolvm shell --help` for usage

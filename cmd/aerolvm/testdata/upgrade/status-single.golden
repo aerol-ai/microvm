@@ -1,0 +1,10 @@
+exit 0
+--- stdout
+Node upgrade:  op-1
+State:         done
+Version:       v0.6.13, from v0.6.12
+Rollback:      no
+Node runs:     v0.6.13
+Started:       2026-11-07T10:00:01Z
+Updated:       2026-11-07T10:00:05Z
+--- stderr

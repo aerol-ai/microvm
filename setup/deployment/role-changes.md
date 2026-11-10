@@ -10,16 +10,22 @@ states the rule, explains why, and gives you the implementation.
 **Terraform is the sole writer of node role. Role changes happen by
 recreating the instance, never by editing it in place.**
 
-Ansible never touches `SB_NODE_ROLE` or `/etc/sandboxd/sandboxd.env`. There
-is no `change-role.yml` playbook - and there shouldn't be.
+Ansible never writes `SB_NODE_ROLE` (it lives in `/etc/sandboxd/cluster.env`;
+`configure-ops.yml` adds only ops settings there). There is no
+`change-role.yml` playbook - and there shouldn't be.
 
 ## Why
 
 Three pieces of state describe a node's role:
 
 1. **EC2 `Role` tag** - owned by Terraform's `nodes.tf`.
-2. **`SB_NODE_ROLE` in `/etc/sandboxd/sandboxd.env`** - written by
-   `cluster-init.sh` / `cluster-join.sh` during the user_data bootstrap.
+2. **`SB_NODE_ROLE` in `/etc/sandboxd/cluster.env`** - written by
+   `sandboxd init` / `sandboxd join` (`--role`) during the user_data
+   bootstrap (`cluster-init.sh` / `cluster-join.sh` on a cluster that still
+   uses the old join). It is not in `/etc/sandboxd/sandboxd.env`: that file belongs
+   to `install.sh`, and the systemd drop-in
+   `/etc/systemd/system/sandboxd.service.d/cluster.conf` layers
+   `cluster.env` on top of it.
 3. **Cloudflare A records** - created by Terraform's `dns.tf` for any node
    whose role contains `ingress`.
 
@@ -37,8 +43,8 @@ via API" - is a multi-day feature, not a config change.
 
 ## How (the one-time Terraform setup)
 
-In `Terraform/nodes.tf`, on both `aws_instance.seed` and
-`aws_instance.joiner`, add:
+`Terraform/nodes.tf` already sets this on both `aws_instance.seed` and
+`aws_instance.joiner`:
 
 ```hcl
 user_data_replace_on_change = true
@@ -51,8 +57,8 @@ lifecycle {
 
 With `user_data_replace_on_change = true`, any change to `var.nodes[*].role`
 forces Terraform to recreate that instance because the rendered user_data
-script changes. The new instance boots, runs `cluster-join.sh --role <new>`,
-joins fresh. EC2 tag, env file, and DNS records all reconcile in the same
+script changes. The new instance boots, runs `sandboxd join` with a token
+for its new role (the module makes one per role), and joins fresh. EC2 tag, env file, and DNS records all reconcile in the same
 apply because they were written by the same operation. Drift becomes
 impossible.
 
@@ -61,10 +67,16 @@ impossible.
 Changing a role becomes a normal Terraform change:
 
 ```bash
-# edit Terraform/terraform.tfvars - flip wrk1's role from "worker" to "worker,ingress"
-terraform -chdir=Terraform plan -target='aws_instance.joiner["wrk1"]'
-terraform -chdir=Terraform apply -target='aws_instance.joiner["wrk1"]'
+# edit config/terraform.tfvars - flip wrk1's role from "worker" to "worker,ingress"
+aerolvm drain aerolvm-wrk1 --timeout 30m
+aerolvm delete node aerolvm-wrk1
+scripts/terraform.sh plan  -target='module.aerolvm.aws_instance.joiner["wrk1"]'
+scripts/terraform.sh apply -target='module.aerolvm.aws_instance.joiner["wrk1"]'
 ```
+
+(From your own root module, with the module used by URL, run plain
+`terraform` with the same `-target`; the address starts with your module
+block's name.)
 
 Use `-target` so you change one node at a time. Terraform will show you the
 destroy + recreate plan before doing anything.
@@ -74,7 +86,7 @@ What happens during the apply:
 1. The instance is destroyed (Raft handles the voter loss if it was a server;
    workloads on the node are lost - see "Caveats" below).
 2. A new instance comes up with the new role baked into user_data.
-3. The cluster-join.sh script joins it in its new role.
+3. `sandboxd join` joins it in its new role.
 4. DNS records reconcile: if the node gained ingress, an A record is added;
    if it lost ingress, the record is dropped.
 
@@ -84,9 +96,9 @@ Total time: 5–10 minutes per node.
 
 | Concern | Mitigation |
 |---|---|
-| Workloads on a worker node are lost when it's recreated | Run `ansible-playbook Ansible/playbooks/prepare-role-change.yml --limit <node>` before the Terraform apply. It marks the node drained and waits until the cluster placement index shows zero owned placements. |
+| Workloads on a worker node are lost when it's recreated | Run `aerolvm drain <node>` before the Terraform apply. It cordons the node and waits until it runs no sandboxes (`--delete-sandboxes` destroys what is left). The Ansible playbook `prepare-role-change.yml` does the same over SSH. |
 | Brief capacity dip while the new instance comes up | Use `create_before_destroy = true` in the lifecycle block, especially for ingress nodes. New node + DNS record exist before old one disappears → zero public-traffic downtime. |
-| Losing a Raft voter momentarily | The cluster tolerates `(N-1)/2` voter losses. Change one server-role node at a time and you stay in quorum. After terminating a stale server-role node, call `DELETE /v1/cluster/members/<node-id>` from a survivor to remove it from raft explicitly. |
+| Losing a Raft voter momentarily | The cluster tolerates `(N-1)/2` voter losses. Change one server-role node at a time and you stay in quorum. Before terminating a server-role node, run `aerolvm delete node <node-id>`: it leaves Raft and its ID and key are denied until it joins again with a new token. |
 | "But 5–10 minutes is slow for me!" | If role changes are frequent enough that this hurts, the right fix is the long-term option below, not a faster patch. Role changes in real deployments are rare. |
 
 Pre-drain command:
@@ -110,8 +122,8 @@ still owns everything that isn't declared state:
 | Operation | Tool |
 |---|---|
 | Add / remove / resize / change role | Terraform |
-| Pre-drain before role change | Ansible (`playbooks/prepare-role-change.yml`) |
-| Push a new `sandboxd` binary | Ansible (`playbooks/update-sandboxd.yml`) |
+| Pre-drain before role change | `aerolvm drain` (or Ansible `playbooks/prepare-role-change.yml`) |
+| Upgrade `sandboxd`, `toolboxd`, `caddy` | `aerolvm upgrade apply` |
 | Restart services, rotate PATs, tail logs | Ansible |
 | Run one-off shell commands across many nodes | Ansible |
 
@@ -129,7 +141,7 @@ answer is to move role out of Terraform entirely:
 - Terraform launches every node as `mixed` (or some neutral default).
 - The cluster exposes `POST /v1/cluster/nodes/<id>/role`.
 - Role state lives in the Raft-backed store, reconciled into
-  `/etc/sandboxd/sandboxd.env` by a per-node reconciler that restarts
+  `/etc/sandboxd/cluster.env` by a per-node reconciler that restarts
   sandboxd when role changes.
 - DNS becomes a function of cluster state, not of `var.nodes` - either via a
   cluster-managed DNS controller, or by Terraform reading cluster state at

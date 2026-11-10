@@ -1,0 +1,15 @@
+# One mixed node running docker (containerd engine), WASM and the V8 isolate
+# (jail on), with named credentials. See single-node-wasm-isolate.tfvars for
+# why it exists: T14 (WASM and isolate across a sandboxd restart, UC-677/678)
+# and the Phase 4 kubectl-grammar gate (UC-670..676).
+#
+# `wasm` makes run.sh turn on wasm.enabled and stage the standard modules;
+# `isolate` and `isolate-jail` only advertise what provisioning installed.
+name: single-node-wasm-isolate
+capabilities:
+  - docker
+  - wasm
+  - isolate
+  - isolate-jail
+  - identity
+  - domain

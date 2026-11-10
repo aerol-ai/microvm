@@ -1,0 +1,10 @@
+exit 0
+--- stdout
+id       sb-0000000000000001
+name     box
+status   started
+runtime  docker
+image    python:3.12
+created  2026-10-04T12:00:00Z
+url      https://box.example.com
+--- stderr

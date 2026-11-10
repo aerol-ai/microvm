@@ -1,0 +1,7 @@
+exit 0
+--- stdout
+NAME   ID                    STATUS    RUNTIME   AGE   IMAGE         CPU   MEMORY   URL
+box    sb-0000000000000001   started   docker    34d   python:3.12   1.5   512Mi    https://box.example.com
+db     sb-0000000000000002   started   docker    5h    postgres:17   -     -        -
+-      sb-0000000000000003   stopped   wasm      45s   -             -     -        -
+--- stderr

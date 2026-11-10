@@ -14,6 +14,62 @@
 SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
   -o ConnectTimeout=10 -o BatchMode=yes -o LogLevel=ERROR)
 
+# tf_init_failover runs `terraform <args>` (an init) so that a provider
+# download failing does not stop the run. Some providers are served from
+# GitHub release assets (cloudflare), and on 2026-11-09 those answered 504
+# from this laptop for hours: every run died at init with "Failed to install
+# provider". So:
+#   1. every init shares one plugin cache (AEROL_TF_PLUGIN_CACHE, default
+#      ~/.terraform.d/plugin-cache), so a provider any run in any worktree
+#      downloaded once is reused instead of downloaded again;
+#   2. if init still fails, it is retried once with -plugin-dir pointed at
+#      that cache, which installs providers with no network at all;
+#   3. a new machine has nothing in that cache, so if that fails too, init
+#      is retried with the download mirror's copy of the providers
+#      (<mirror>/tf-providers/, a Terraform network mirror on S3 that
+#      scripts/mirror-sync.sh --tf-providers fills on every release) as the
+#      only provider source. AEROL_DOWNLOAD_MIRROR=off skips it.
+# Usage: TF_DATA_DIR=... tf_init_failover -chdir=<dir> init <init flags...>
+tf_init_failover() {
+  local cache="${AEROL_TF_PLUGIN_CACHE:-$HOME/.terraform.d/plugin-cache}"
+  local mirror="${AEROL_DOWNLOAD_MIRROR-https://aerolvm-downloads.s3.us-east-1.amazonaws.com}"
+  mkdir -p "$cache"
+  # The repo's lock file is not committed, so without this Terraform >= 1.4
+  # would skip the cache for every provider it has no recorded checksum for.
+  export TF_PLUGIN_CACHE_DIR="$cache" TF_PLUGIN_CACHE_MAY_BREAK_DEPENDENCY_LOCK_FILE=true
+  if terraform "$@"; then
+    return 0
+  fi
+  echo "terraform init failed; retrying with the providers already in ${cache} (no download)" >&2
+  if terraform "$@" -plugin-dir="$cache"; then
+    return 0
+  fi
+  [[ -n "$mirror" && "$mirror" != "off" ]] || return 1
+  echo "terraform init failed again; retrying with the providers on ${mirror%/}/tf-providers/" >&2
+  # The plugin cache still applies, so what this downloads is reused next time.
+  local rc=0 tfrc
+  tfrc="$(mktemp)"
+  printf 'provider_installation {\n  network_mirror {\n    url = "%s/tf-providers/"\n  }\n}\n' "${mirror%/}" >"$tfrc"
+  TF_CLI_CONFIG_FILE="$tfrc" terraform "$@" || rc=$?
+  rm -f "$tfrc"
+  return "$rc"
+}
+
+# download_mirror_tfvar_args prints the Terraform flag that turns on the node
+# bootstrap's download mirror fallback (Terraform variable download_mirror),
+# from DOWNLOAD_MIRROR/AEROL_DOWNLOAD_MIRROR: nothing when it is empty or
+# "off", so the bootstrap then renders exactly as before.
+download_mirror_tfvar_args() {
+  local mirror="${AEROL_DOWNLOAD_MIRROR-https://aerolvm-downloads.s3.us-east-1.amazonaws.com}"
+  [[ -n "$mirror" && "$mirror" != "off" ]] || return 0
+  printf -- '-var=download_mirror=%s\n' "${mirror%/}"
+}
+
+# stage_to_node: every file this machine hands a node goes through S3, never
+# scp (lib/stage.sh says why). Sourced here so every harness script has it.
+# shellcheck source=stage.sh
+source "$(dirname "${BASH_SOURCE[0]}")/stage.sh"
+
 # resolve_ssh_identity picks the private key the deployment's nodes actually
 # trust and wires it into SSH_OPTS, so every harness SSH call gets it — not
 # just the test suite.
@@ -334,8 +390,9 @@ stage_wasm_modules() {
       if ! ssh "${SSH_OPTS[@]}" "$tgt" \
              "curl -fsSL --retry 3 --max-time 300 -o '/tmp/${alias}.wasm' '${ref}' \
               && echo '${digest#sha256:}  /tmp/${alias}.wasm' | sha256sum -c --quiet -"; then
-        echo "stage_wasm: ${tgt} could not download ${alias}; copying the local fixture" >&2
-        if ! scp "${SSH_OPTS[@]}" "$file" "${tgt}:/tmp/${alias}.wasm"; then
+        echo "stage_wasm: ${tgt} could not download ${alias}; staging the local fixture through S3" >&2
+        if ! stage_to_node "$tgt" /tmp/aerol-wasm-stage "$file" ||
+           ! ssh "${SSH_OPTS[@]}" "$tgt" "mv -f '/tmp/aerol-wasm-stage/$(basename "$file")' '/tmp/${alias}.wasm'"; then
           echo "stage_wasm: staging ${alias} on ${tgt} failed" >&2
           return 1
         fi
@@ -373,9 +430,20 @@ direct_resolve_args() {
   return 0
 }
 
-# direct_resolve_ip <host> — the last A record, from a direct DNS query.
+# direct_resolve_ip <host> — the last A record, asked of the zone's own
+# nameservers first. A recursive resolver (the laptop's, often 8.8.8.8)
+# caches a miss for the zone's SOA minimum (1800 s on the test zones): one
+# lookup made while the record did not exist yet, by a person or an earlier
+# run, then breaks every curl for half an hour (2026-11-08, adopt gate step 2).
+# The zone is the host's last two labels, which holds for every test domain.
 direct_resolve_ip() {
-  dig +short A "$1" 2>/dev/null | grep -E '^[0-9]+(\.[0-9]+){3}$' | tail -1
+  local host="$1" zone ns ip
+  zone=$(printf '%s' "$host" | awk -F. 'NF>=2 {print $(NF-1)"."$NF}')
+  for ns in $(dig +short NS "$zone" 2>/dev/null); do
+    ip=$(dig +short A "$host" "@${ns%.}" 2>/dev/null | grep -E '^[0-9]+(\.[0-9]+){3}$' | tail -1)
+    if [[ -n "$ip" ]]; then printf '%s\n' "$ip"; return 0; fi
+  done
+  dig +short A "$host" 2>/dev/null | grep -E '^[0-9]+(\.[0-9]+){3}$' | tail -1
 }
 
 # mint_suite_token <ssh_target> <pat> <scenario> [timeout_s]

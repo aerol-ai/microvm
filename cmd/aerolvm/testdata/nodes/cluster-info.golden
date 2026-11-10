@@ -1,0 +1,7 @@
+exit 0
+--- stdout
+sandboxd is running at URL (version v9.9.9)
+Leader: srv-a (https://srv-a:21212)
+Members: 3 alive of 4 (mixed 1, server 1, worker 2); 1 Raft voter(s)
+Cluster version: FSM ops 0 (the lowest any live member runs)
+--- stderr

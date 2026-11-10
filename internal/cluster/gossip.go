@@ -6,11 +6,13 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"runtime"
 	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/aerol-ai/microvm/internal/version"
 	"github.com/aerol-ai/microvm/pkg/capacity"
 	"github.com/hashicorp/memberlist"
 )
@@ -59,6 +61,19 @@ type nodeMeta struct {
 	// aerolvm_pat_scope_drift gauge; it grants nothing, since an owner under
 	// host scope checks each forwarded PAT's origin itself.
 	PATScope string `json:"ps,omitempty"`
+	// BuildVersion is this node's sandboxd build (internal/version), so
+	// `aerolvm get nodes` can show every node's version without asking each
+	// one (plans/kubectl-style-cluster-ops.md §6.5). Display only in this
+	// release: nothing gates on it. A short key, because the 512-byte cap
+	// above is shared with fields that carry Raft identity; an older peer
+	// sends none and reads as "". It rides only the first two fallback tiers,
+	// so a meta near the cap loses the version before it loses RaftAddr.
+	BuildVersion string `json:"bv,omitempty"`
+	// Arch is this node's CPU type (GOARCH: "amd64", "arm64"), so a rollout
+	// knows which release files each node needs, a down node's included,
+	// and servers cache every type the fleet runs (§6.3, Codex eng finding
+	// 6). It rides the same two tiers as bv; an older peer sends none.
+	Arch string `json:"ar,omitempty"`
 }
 
 // GossipPATScope is the value a node gossips for its SB_PAT_SCOPE: "host",
@@ -86,6 +101,11 @@ type gossipDelegate struct {
 	role          string
 	publicHost    string
 	patScope      string
+	// buildVersion is gossiped as "bv" and arch as "ar". Empty in a
+	// delegate built by hand (tests), which keeps that meta byte for byte
+	// what it was.
+	buildVersion string
+	arch         string
 }
 
 func newGossipDelegate(nodeID, nodeName, apiURL, dataPlaneHost, raftAddr, internalURL, role, publicHost string, admitter *capacity.Admitter) *gossipDelegate {
@@ -99,6 +119,8 @@ func newGossipDelegate(nodeID, nodeName, apiURL, dataPlaneHost, raftAddr, intern
 		internalURL:   internalURL,
 		role:          role,
 		publicHost:    publicHost,
+		buildVersion:  version.Version,
+		arch:          runtime.GOARCH,
 	}
 	d.refreshMeta()
 	return d
@@ -122,7 +144,7 @@ func (d *gossipDelegate) refreshMeta() {
 	meta := nodeMeta{
 		NodeID: d.nodeID, NodeName: d.nodeName, APIURL: d.apiURL, DataPlaneHost: d.dataPlaneHost,
 		RaftAddr: d.raftAddr, InternalURL: d.internalURL, Role: d.role, PublicHost: d.publicHost,
-		FSMOpsVersion: fsmOpsVersion, PATScope: patScope,
+		FSMOpsVersion: fsmOpsVersion, PATScope: patScope, BuildVersion: d.buildVersion, Arch: d.arch,
 	}
 	enc, err := json.Marshal(meta)
 	if err != nil {
@@ -153,8 +175,8 @@ func (d *gossipDelegate) NodeMeta(limit int) []byte {
 			// raft/identity loss breaks voter join and cross-node routing.
 			// PATScope rides the first two tiers: dropping it only raises a
 			// false drift alert, never widens access.
-			{NodeID: d.nodeID, APIURL: d.apiURL, DataPlaneHost: d.dataPlaneHost, RaftAddr: d.raftAddr, InternalURL: d.internalURL, Role: d.role, FSMOpsVersion: fsmOpsVersion, PATScope: d.selfMeta.PATScope},
-			{NodeID: d.nodeID, APIURL: d.apiURL, DataPlaneHost: d.dataPlaneHost, RaftAddr: d.raftAddr, Role: d.role, FSMOpsVersion: fsmOpsVersion, PATScope: d.selfMeta.PATScope},
+			{NodeID: d.nodeID, APIURL: d.apiURL, DataPlaneHost: d.dataPlaneHost, RaftAddr: d.raftAddr, InternalURL: d.internalURL, Role: d.role, FSMOpsVersion: fsmOpsVersion, PATScope: d.selfMeta.PATScope, BuildVersion: d.buildVersion, Arch: d.arch},
+			{NodeID: d.nodeID, APIURL: d.apiURL, DataPlaneHost: d.dataPlaneHost, RaftAddr: d.raftAddr, Role: d.role, FSMOpsVersion: fsmOpsVersion, PATScope: d.selfMeta.PATScope, BuildVersion: d.buildVersion, Arch: d.arch},
 			{NodeID: d.nodeID, APIURL: d.apiURL, RaftAddr: d.raftAddr, Role: d.role, FSMOpsVersion: fsmOpsVersion},
 			{NodeID: d.nodeID, RaftAddr: d.raftAddr, Role: d.role, FSMOpsVersion: fsmOpsVersion},
 			{NodeID: d.nodeID, RaftAddr: d.raftAddr, FSMOpsVersion: fsmOpsVersion},
@@ -196,6 +218,9 @@ type gossipNode struct {
 	// peerCache remembers live control-plane peers across restarts; nil when
 	// no directory was configured. See gossip_peer_cache.go for why.
 	peerCache *gossipPeerCache
+	// memberCache remembers a few live workers or ingress nodes, for
+	// syncRememberedPeers; nil when no directory was configured.
+	memberCache *gossipPeerCache
 	// selfGossipAddr is excluded from every rejoin list.
 	selfGossipAddr string
 	// rejoinInFlight keeps a slow rejoin (serial dials, TCP timeouts to a
@@ -232,6 +257,12 @@ type gossipMemberIndex struct {
 	// once before memberlist starts delivering events; the drift gauge
 	// counts alive members that gossip a different one.
 	selfPATScope string
+	// selfID and denied keep deleted nodes out of the index (gossip_deny.go):
+	// a denied member is dropped on its next upsert and on every refresh.
+	// Self is never dropped. A nil denied (tests, and any index built
+	// without a deny source) keeps every member.
+	selfID string
+	denied func(string) bool
 }
 
 func newGossipMemberIndex() *gossipMemberIndex {
@@ -275,10 +306,15 @@ func (i *gossipMemberIndex) upsert(m Member) {
 	if i.seen == nil {
 		i.seen = make(map[string]int64)
 	}
-	if m.Alive {
-		i.seen[m.NodeID] = now
+	if !i.keep(m.NodeID) {
+		delete(i.members, m.NodeID)
+		delete(i.seen, m.NodeID)
+	} else {
+		if m.Alive {
+			i.seen[m.NodeID] = now
+		}
+		i.members[m.NodeID] = m
 	}
-	i.members[m.NodeID] = m
 	i.rebuildControlPlaneLocked()
 	i.recordFeatureFloorLocked()
 	i.recordMetricsLocked(now)
@@ -323,7 +359,7 @@ func (i *gossipMemberIndex) replace(members []Member) {
 	now := time.Now().UnixNano()
 	next := make(map[string]Member, len(members))
 	for _, m := range members {
-		if m.NodeID == "" {
+		if m.NodeID == "" || !i.keep(m.NodeID) {
 			continue
 		}
 		next[m.NodeID] = m
@@ -550,6 +586,11 @@ type gossipSetupConfig struct {
 	PeerCacheDir string
 	// PATScope is this node's SB_PAT_SCOPE, gossiped for the drift gauge.
 	PATScope string
+	// Denied reports deleted node IDs (gossip_deny.go): gossip refuses their
+	// alive messages and the member index drops them. nil denies nothing.
+	Denied func(string) bool
+	// DenyHits counts and logs those refusals.
+	DenyHits *denyHitRecorder
 }
 
 // testTuneMemberlist is set only by this package's TestMain, to shorten
@@ -580,6 +621,11 @@ func setupGossip(cfg gossipSetupConfig, admitter *capacity.Admitter, logger *slo
 	memberIndex := newGossipMemberIndex()
 	memberIndex.selfPATScope = GossipPATScope(cfg.PATScope)
 	nodeTable := newGossipNodeTable()
+	memberIndex.selfID = cfg.NodeID
+	memberIndex.denied = cfg.Denied
+	if cfg.Denied != nil {
+		mlCfg.Alive = &gossipAliveDelegate{selfID: cfg.NodeID, denied: cfg.Denied, hits: cfg.DenyHits}
+	}
 	mlCfg.Delegate = delegate
 	mlCfg.Events = &indexedEventDelegate{index: memberIndex, nodes: nodeTable, logger: logger, next: cfg.Events, onLeave: cfg.OnLeave}
 	if len(cfg.SecretKey) > 0 {
@@ -668,15 +714,25 @@ func setupGossip(cfg gossipSetupConfig, admitter *capacity.Admitter, logger *slo
 		bootstrapPeers:     append([]string(nil), cfg.BootstrapPeers...),
 		joinBootstrapPeers: ml.Join,
 		peerCache:          newGossipPeerCache(cfg.PeerCacheDir),
+		memberCache:        newGossipMemberCache(cfg.PeerCacheDir),
 		selfGossipAddr:     selfGossipAddr,
 	}
 	// Loaded but deliberately not dialled here: setupGossip is on the boot
 	// path, and a stale entry whose host is gone costs a full TCP timeout.
-	// The refresh loop's first tick rejoins through them in the background.
+	// syncRememberedPeers dials them in the background instead.
 	if cached := gn.peerCache.load(); len(cached) > 0 && logger != nil {
 		logger.Info("cluster gossip remembered peers loaded", "peers", cached)
 	}
+	if cached := gn.memberCache.load(); len(cached) > 0 && logger != nil {
+		logger.Info("cluster gossip remembered members loaded", "members", cached)
+	}
 	gn.refreshMemberIndex()
+	if gn.rejoinInFlight.CompareAndSwap(false, true) {
+		go func() {
+			defer gn.rejoinInFlight.Store(false)
+			gn.syncRememberedPeers()
+		}()
+	}
 	go func() {
 		defer close(gn.refreshDone)
 		gn.runRefreshLoop(refreshCtx, interval)
@@ -711,30 +767,77 @@ func (g *gossipNode) runRefreshLoop(ctx context.Context, interval time.Duration)
 	}
 }
 
-// rememberLivePeers persists the currently-alive control-plane peers. A write
-// failure only costs the next restart its fallback, so it is logged, not fatal.
+// rememberLivePeers persists the currently-alive control-plane peers, and a
+// few other alive members (pickMemberPeers). A write failure only costs the
+// next restart its fallback, so it is logged, not fatal.
 func (g *gossipNode) rememberLivePeers(nodes []*memberlist.Node) {
-	if g == nil || g.peerCache == nil {
+	if g == nil || (g.peerCache == nil && g.memberCache == nil) {
 		return
 	}
 	selfNodeID := ""
 	if g.delegate != nil {
 		selfNodeID = g.delegate.nodeID
 	}
-	if err := g.peerCache.remember(liveControlPlanePeerAddrs(nodes, selfNodeID)); err != nil && g.logger != nil {
+	controlPlane, others := livePeerAddrsByRole(nodes, selfNodeID)
+	if err := g.peerCache.remember(controlPlane); err != nil && g.logger != nil {
 		g.logger.Warn("cluster gossip could not persist remembered peers", "path", g.peerCache.path, "error", err)
+	}
+	if err := g.memberCache.remember(pickMemberPeers(selfNodeID, others, g.memberCache.snapshot())); err != nil && g.logger != nil {
+		g.logger.Warn("cluster gossip could not persist remembered members", "path", g.memberCache.path, "error", err)
 	}
 }
 
-// rejoinPeers is configured peers plus remembered ones, minus self.
+// rejoinPeers is configured peers plus remembered ones (control-plane peers
+// first, then members), minus self.
 func (g *gossipNode) rejoinPeers() []string {
-	var cached []string
-	if g.peerCache != nil {
-		g.peerCache.mu.Lock()
-		cached = append([]string(nil), g.peerCache.last...)
-		g.peerCache.mu.Unlock()
-	}
+	cached := append(g.peerCache.snapshot(), g.memberCache.snapshot()...)
 	return mergeRejoinPeers(g.bootstrapPeers, cached, g.selfGossipAddr)
+}
+
+// syncRememberedPeers runs once, in the background, when gossip starts: it
+// dials every remembered peer this node cannot see yet, so one push/pull
+// with a member that did not restart hands over the whole membership.
+//
+// Why: memberlist keeps nothing across a restart, so a restarted node knows
+// only what its bootstrap join returned. When every server restarts at once
+// (UC-481), that is the other servers and none of the workers or ingress
+// nodes. The agents call back only through maybeRejoinBootstrapPeers, once
+// every server looks dead to them, and a restarted server answers their
+// probes under its old name, so that took 12 to 22 s in a loopback repro.
+// They call back only the servers in their own peer cache, which had already
+// lost a server that looked dead before the others; that server waited for
+// an agent's periodic full sync (30 s on memberlist's LAN defaults) and kept
+// refusing the ingress with "not in membership": 58 s in a live run, against
+// UC-481's 55 s budget. Dialling is never on the boot path: a remembered
+// host that is gone costs a TCP timeout here, in the background.
+func (g *gossipNode) syncRememberedPeers() {
+	if g == nil || g.joinBootstrapPeers == nil {
+		return
+	}
+	visible := make(map[string]bool)
+	for _, n := range g.memberlistNodes() {
+		if n != nil && n.State == memberlist.StateAlive && len(n.Addr) > 0 {
+			visible[n.Address()] = true
+		}
+	}
+	var peers []string
+	for _, p := range mergeRejoinPeers(nil, append(g.peerCache.snapshot(), g.memberCache.snapshot()...), g.selfGossipAddr) {
+		if !visible[p] {
+			peers = append(peers, p)
+		}
+	}
+	if len(peers) == 0 {
+		return
+	}
+	joined, err := g.joinBootstrapPeers(peers)
+	if g.logger == nil {
+		return
+	}
+	if err != nil {
+		g.logger.Warn("cluster gossip could not sync with remembered peers", "peers", peers, "joined", joined, "error", err)
+		return
+	}
+	g.logger.Info("cluster gossip synced with remembered peers", "peers", peers, "joined", joined)
 }
 
 func (g *gossipNode) memberlistNodes() []*memberlist.Node {
@@ -840,6 +943,21 @@ func (g *gossipNode) scanMembers() []Member {
 	return out
 }
 
+// memberlistMember is lookupMember without the deny filter: memberlist's own
+// view, which still holds a deleted node until it stops answering probes. It
+// scans every node, so only the operator's node-delete path uses it.
+func (g *gossipNode) memberlistMember(id string) (Member, bool) {
+	if m, ok := g.lookupMember(id); ok {
+		return m, true
+	}
+	for _, n := range g.memberlistNodes() {
+		if n != nil && n.Name == id {
+			return memberFromMemberlistNode(n), true
+		}
+	}
+	return Member{}, false
+}
+
 func memberFromMemberlistNode(n *memberlist.Node) Member {
 	if n == nil {
 		return Member{}
@@ -860,6 +978,8 @@ func memberFromMemberlistNode(n *memberlist.Node) Member {
 			m.PublicHost = meta.PublicHost
 			m.FSMOpsVersion = meta.FSMOpsVersion
 			m.PATScope = meta.PATScope
+			m.Version = meta.BuildVersion
+			m.Arch = meta.Arch
 			// m.Capacity stays zero here — capacity no longer travels in
 			// nodeMeta (see the type comment). Cluster.Members and
 			// SelectPlacement overlay fresh capacity leases later.
@@ -894,6 +1014,8 @@ func (g *gossipNode) selfMember() Member {
 		PublicHost:    meta.PublicHost,
 		FSMOpsVersion: meta.FSMOpsVersion,
 		PATScope:      meta.PATScope,
+		Version:       meta.BuildVersion,
+		Arch:          meta.Arch,
 		Alive:         true,
 		Capacity:      snap,
 	}

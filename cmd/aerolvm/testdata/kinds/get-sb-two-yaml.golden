@@ -1,0 +1,51 @@
+exit 0
+--- stdout
+sandboxes:
+    - cpu: 0
+      created_at: "2026-11-07T07:00:00Z"
+      disk_gb: 0
+      id: sb-0000000000000002
+      image: postgres:17
+      last_active_at: "0001-01-01T00:00:00Z"
+      lifecycle: {}
+      memory_mb: 0
+      name: db
+      network_block_all: true
+      network_bytes_in: 0
+      network_bytes_in_limit: 0
+      network_bytes_out: 0
+      network_bytes_out_limit: 0
+      network_quota_exceeded: false
+      os_user: ""
+      public_url: ""
+      runtime: docker
+      status: started
+      tags:
+        app: db
+      toolbox_enabled: false
+      updated_at: "0001-01-01T00:00:00Z"
+    - cpu: 0
+      created_at: "2026-11-07T11:59:15Z"
+      disk_gb: 0
+      id: sb-0000000000000003
+      image: ""
+      last_active_at: "0001-01-01T00:00:00Z"
+      lifecycle: {}
+      memory_mb: 0
+      network_block_all: false
+      network_bytes_in: 0
+      network_bytes_in_limit: 0
+      network_bytes_out: 0
+      network_bytes_out_limit: 0
+      network_deny_out:
+        - 10.0.0.0/8
+      network_quota_exceeded: false
+      os_user: ""
+      public_url: ""
+      runtime: wasm
+      status: stopped
+      tags:
+        app: web
+      toolbox_enabled: false
+      updated_at: "0001-01-01T00:00:00Z"
+--- stderr

@@ -108,6 +108,9 @@ type ssoRequest struct {
 	// canAsk: stdin is a terminal nobody has used up, so login may ask
 	// which provider to use.
 	canAsk bool
+	// name is the context the login is saved as (--name); empty names it
+	// after the host.
+	name string
 }
 
 // httpStatusError is a discovery document that did not come back 200.
@@ -382,7 +385,7 @@ func (a *app) loginSSO(ctx context.Context, c *commonFlags, issuers []identitywi
 	if err != nil {
 		return a.fail(c, signInRefusal(req.apiURL, login.DisplayName, claims, err), exitError)
 	}
-	if err := saveLogin(req.path, savedLogin{APIURL: req.apiURL, Token: idToken, Team: req.team, SSO: login}); err != nil {
+	if _, err := a.saveCurrentLogin(req.name, savedLogin{APIURL: req.apiURL, Token: idToken, Team: req.team, SSO: login}); err != nil {
 		return a.fail(c, err, exitError)
 	}
 	if c.json {
@@ -800,6 +803,9 @@ func listUpTo(items []string, max int) string {
 type ssoSession struct {
 	a    *app
 	path string
+	// context names the contexts.json entry this login lives in when it is
+	// not the current context; empty means config.json (path).
+	context string
 	// client reaches the provider (the --debug logger when asked).
 	client *http.Client
 
@@ -878,7 +884,7 @@ func (s *ssoSession) renew(ctx context.Context) error {
 	// this login while this one waited, and rotated the refresh token in
 	// doing so: take its result rather than spend the old refresh token,
 	// which a provider with rotation treats as theft.
-	fresh, exists, err := s.a.loadLogin(s.path)
+	fresh, exists, err := s.load()
 	stillSaved := err == nil && exists && s.sameLogin(fresh)
 	if stillSaved {
 		s.login = fresh
@@ -910,12 +916,28 @@ func (s *ssoSession) renew(ctx context.Context) error {
 	// A login replaced or removed since this command started is not brought
 	// back: the renewed token then lives in this process only.
 	if stillSaved {
-		if err := saveLogin(s.path, next); err != nil {
+		if err := s.save(next); err != nil {
 			return err
 		}
 	}
 	s.login = next
 	return nil
+}
+
+// load and save reach the file this login lives in: config.json for the
+// current context, contexts.json for any other.
+func (s *ssoSession) load() (savedLogin, bool, error) {
+	if s.context != "" {
+		return s.a.loadContextLogin(s.context)
+	}
+	return s.a.loadLogin(s.path)
+}
+
+func (s *ssoSession) save(l savedLogin) error {
+	if s.context != "" {
+		return s.a.saveContextLogin(s.context, l)
+	}
+	return saveLogin(s.path, l)
 }
 
 // renewalFailedError is DR15's refresh-failure line.

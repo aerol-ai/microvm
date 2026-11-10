@@ -1,0 +1,4 @@
+exit 1
+--- stdout
+--- stderr
+aerolvm: sandbox "ghost" not found

@@ -1,0 +1,5 @@
+exit 0
+--- stdout
+sb-0000000000000001
+--- stderr
+using existing sandbox box (sb-0000000000000001)

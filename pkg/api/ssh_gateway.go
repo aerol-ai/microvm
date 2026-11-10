@@ -30,7 +30,11 @@ import (
 // a call made with any other credential is never re-attributed) and one of
 // the sessions routes (a forged or leaked marker cannot relabel a delete or
 // an exec). The authorization the call gets is unchanged: only the record
-// names someone else.
+// names someone else. On a node joined without the PAT the gateway's
+// loopback credential is the node's local token, which no peer knows, so
+// the forward goes as the edge node (cluster.HeaderCaller) and the owner
+// takes the marker from that node: the same peer that, holding the PAT,
+// would have sent it with the PAT.
 
 // sshGatewayRoutes are the routes the gateway bridges a session through
 // (pkg/sshgateway forward.go), as the mux matched them.
@@ -46,7 +50,17 @@ var sshGatewayRoutes = map[string]bool{
 func sshGatewayCall(r *http.Request, access controlplane.Access) (auditlog.SSHGatewayCall, bool) {
 	sandboxID := strings.TrimSpace(r.PathValue("id"))
 	local, attested := sshgateway.TakeBridgedCall(r.Header, sandboxID)
-	if access.Principal.Kind != controlplane.PrincipalOperator || sandboxID == "" || !sshGatewayRoutes[routePattern(r)] {
+	if sandboxID == "" || !sshGatewayRoutes[routePattern(r)] {
+		return auditlog.SSHGatewayCall{}, false
+	}
+	switch access.Principal.Kind {
+	case controlplane.PrincipalOperator:
+	case controlplane.PrincipalNode:
+		// Only as a forward: a node calling as itself bridges nothing.
+		if !isForwarded(r) {
+			return auditlog.SSHGatewayCall{}, false
+		}
+	default:
 		return auditlog.SSHGatewayCall{}, false
 	}
 	if !isForwarded(r) {

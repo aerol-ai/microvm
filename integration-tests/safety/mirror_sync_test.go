@@ -56,9 +56,11 @@ const fakeS3 = `#!/usr/bin/env bash
 echo "aws $*" >>"$TOOL_LOG"
 args=()
 size_only=""
+exclude=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --region|--content-type|--cache-control) shift 2 ;;
+    --exclude) exclude="$2"; shift 2 ;;
     --only-show-errors|--no-progress) shift ;;
     --size-only) size_only=1; shift ;;
     *) args+=("$1"); shift ;;
@@ -78,6 +80,8 @@ case "${args[0]} ${args[1]}" in
     # size is left alone.
     src="${args[2]}"
     (cd "$src" && find . -type f) | while read -r rel; do
+      # shellcheck disable=SC2053 # a glob, as aws --exclude takes
+      if [[ -n "$exclude" && "${rel#./}" == $exclude ]]; then continue; fi
       to="$dst/${rel#./}"
       if [[ -n "$size_only" && -f "$to" && $(wc -c <"$src/$rel") -eq $(wc -c <"$to") ]]; then
         echo "skip ${rel#./}" >>"$TOOL_LOG"
@@ -95,6 +99,7 @@ type syncRig struct {
 	gh, s3, log, binDir  string
 	stdout, stderr, logs string
 	code                 int
+	env                  []string // extra environment for the script and its fakes
 }
 
 func newSyncRig(t *testing.T) *syncRig {
@@ -135,6 +140,7 @@ func (r *syncRig) run(args ...string) {
 	cmd.Dir = r.t.TempDir()
 	cmd.Env = []string{"PATH=" + r.binDir + string(os.PathListSeparator) + os.Getenv("PATH"), "HOME=" + r.t.TempDir(),
 		"TOOL_LOG=" + r.log, "FAKE_GH=" + r.gh, "FAKE_S3=" + r.s3, "FAKE_WEB=" + filepath.Join(r.gh, "web")}
+	cmd.Env = append(cmd.Env, r.env...)
 	var out, errOut strings.Builder
 	cmd.Stdout, cmd.Stderr = &out, &errOut
 	err = cmd.Run()
@@ -409,9 +415,9 @@ func TestMirrorSyncDepsPlanCoversTheMirrorLayout(t *testing.T) {
 		"deps/cni-plugins/v1.5.1/cni-plugins-linux-arm64-v1.5.1.tgz",
 		"deps/cni-plugins/v1.5.1/cni-plugins-linux-arm64-v1.5.1.tgz.sha256",
 		"deps/cni-plugins/v1.5.1/cni-plugins-linux-arm64-v1.5.1.tgz.sha512",
-		"deps/caddy/v2.11.7/caddy_2.11.7_linux_amd64.deb",
-		"deps/caddy/v2.11.7/caddy_2.11.7_linux_arm64.deb",
-		"deps/caddy/v2.11.7/caddy_2.11.7_checksums.txt",
+		"deps/caddy/v2.11.9/caddy_2.11.9_linux_amd64.deb",
+		"deps/caddy/v2.11.9/caddy_2.11.9_linux_arm64.deb",
+		"deps/caddy/v2.11.9/caddy_2.11.9_checksums.txt",
 		"deps/buildkit/v0.17.2/buildkit-v0.17.2.linux-amd64.tar.gz (sha256 24d73e4456ebbe6dbb53779e362b2164a000e9636cd9ca8bd90f742fb024b731)",
 		"deps/buildkit/v0.17.2/buildkit-v0.17.2.linux-arm64.tar.gz (sha256 77384e2726c93d7c2bd7b745c079e1953f92683570203c7bfca361965db2f0c2)",
 		"deps/workerd/v1.20260717.1/workerd-linux-64.gz",
@@ -483,5 +489,84 @@ func TestMirrorSyncSkipsFilesAlreadyOnTheMirror(t *testing.T) {
 	}
 	if !strings.Contains(r.stdout, "differs from the release's") {
 		t.Fatal("the re-cut was not detected")
+	}
+}
+
+// onPublicMirror makes the fake curl serve a deps file at the public mirror
+// URL (https://aerolvm-downloads.s3.us-east-1.amazonaws.com/<key>).
+func (r *syncRig) onPublicMirror(key, body string) {
+	p := filepath.Join(r.gh, "web", "aerolvm-downloads.s3.us-east-1.amazonaws.com", key)
+	mustMkdir(r.t, filepath.Dir(p))
+	mustWrite(r.t, p, body)
+}
+
+// --deps --check only reads the public mirror: no credentials, no downloads,
+// no uploads. It is what a pull request that changes install.sh runs, so a
+// pin bumped without its mirror copy shows before the release.
+func TestMirrorSyncDepsCheck(t *testing.T) {
+	rows := []string{
+		"tool ${V} tool-v1.0.0.tgz " + strings.Repeat("a", 64) + " https://github.com/acme/tool/releases/download/${V}/tool-v1.0.0.tgz",
+		"extra ${V} extra.deb " + strings.Repeat("b", 64) + " https://downloads.acme.example/extra.deb",
+	}
+	for _, tc := range []struct {
+		name     string
+		present  []string
+		wantCode int
+		wantOut  string
+	}{
+		{name: "every pinned file on the mirror", present: []string{"deps/tool/v1.0.0/tool-v1.0.0.tgz", "deps/extra/v1.0.0/extra.deb"},
+			wantCode: 0, wantOut: "All 2 pinned files are on the mirror"},
+		{name: "one missing", present: []string{"deps/tool/v1.0.0/tool-v1.0.0.tgz"},
+			wantCode: 1, wantOut: "deps/extra/v1.0.0/extra.deb"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newSyncRig(t)
+			for _, k := range tc.present {
+				r.onPublicMirror(k, "x")
+			}
+			installSh := filepath.Join(t.TempDir(), "install.sh")
+			mustWrite(t, installSh, pinsScript(rows...))
+			r.run("--deps", "--check", "--install-sh", installSh)
+			if r.code != tc.wantCode {
+				t.Fatalf("exit %d, want %d", r.code, tc.wantCode)
+			}
+			if !strings.Contains(r.stdout+r.stderr, tc.wantOut) {
+				t.Errorf("output lacks %q", tc.wantOut)
+			}
+			if strings.Contains(r.logs, "aws ") || strings.Contains(r.logs, "gh ") || len(r.uploaded()) != 0 {
+				t.Errorf("--check called aws or gh or uploaded something:\n%s", r.logs)
+			}
+		})
+	}
+
+	t.Run("--check goes with --deps only", func(t *testing.T) {
+		r := newSyncRig(t)
+		r.run("--release", "v1.0.0", "--check")
+		if r.code == 0 || !strings.Contains(r.stderr, "--check goes with --deps") {
+			t.Fatalf("exit %d, stderr %q; want a refusal", r.code, r.stderr)
+		}
+	})
+}
+
+// The release workflow runs --deps on every release. When the mirror already
+// serves every pinned file (pins rarely change), nothing is downloaded from
+// GitHub or a vendor and nothing is uploaded, so a GitHub outage cannot fail
+// the step for nothing.
+func TestMirrorSyncDepsDoesNothingWhenTheMirrorHasEveryPin(t *testing.T) {
+	r := newSyncRig(t)
+	rows := []string{
+		"tool ${V} tool-v1.0.0.tgz " + strings.Repeat("a", 64) + " https://github.com/acme/tool/releases/download/${V}/tool-v1.0.0.tgz",
+		"tool ${V} tool " + strings.Repeat("c", 64) + " tar:tool-v1.0.0.tgz:release-v1.0.0/tool",
+	}
+	r.onPublicMirror("deps/tool/v1.0.0/tool-v1.0.0.tgz", "x")
+	r.onPublicMirror("deps/tool/v1.0.0/tool", "x")
+	installSh := filepath.Join(t.TempDir(), "install.sh")
+	mustWrite(t, installSh, pinsScript(rows...))
+	r.run("--deps", "--install-sh", installSh)
+	if r.code != 0 || !strings.Contains(r.stdout, "nothing to do") {
+		t.Fatalf("exit %d, stdout %q; want success with nothing to do", r.code, r.stdout)
+	}
+	if strings.Contains(r.logs, "aws ") || strings.Contains(r.logs, "gh ") || len(r.uploaded()) != 0 {
+		t.Errorf("downloaded or uploaded although the mirror had every pin:\n%s", r.logs)
 	}
 }

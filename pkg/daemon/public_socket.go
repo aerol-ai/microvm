@@ -121,6 +121,10 @@ func logPATBootSettings(logger *slog.Logger, cfg config.Config) {
 	if cfg.PATTokenPrevious != "" {
 		logger.Info("previous operator token accepted during a rotation (SB_PAT_TOKEN_PREVIOUS); remove it once every node runs the new one")
 	}
+	if cfg.PATIsNodeLocal() {
+		logger.Info("this node holds the operator token's hash, not the token (SB_PAT_TOKEN_SHA256): it checks the operator token by hash, calls peers with its node cert alone, and its own SB_PAT_TOKEN works only for local tools on its loopback",
+			"hashes", len(cfg.PATTokenSHA256))
+	}
 	if cfg.L4FallbackProxyProtocol {
 		logger.Info("caddy-l4 fallback sends PROXY protocol v2 to the HTTPS site (SB_L4_FALLBACK_PROXY_PROTOCOL=true); the site needs the proxy_protocol listener wrapper install.sh writes, or every public HTTPS handshake fails",
 			"fallback", cfg.L4TLSFallback)
