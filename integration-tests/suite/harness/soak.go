@@ -165,7 +165,7 @@ var SoakGrowthLimits = map[string]SoakLimit{
 	// SQLite never shrinks the WAL after a checkpoint: it sits at its
 	// high-water mark, which a burst can raise once.
 	"wal_bytes": {Ratio: 0.20, Floor: 64 << 20},
-	// raft-wal works in segment files and a snapshot every 1024 entries
+	// raft-wal works in segment files and a snapshot every 8,192 entries
 	// (internal/cluster/raft.go), so the directory moves in steps.
 	"raft_kb": {Ratio: 0.20, Floor: 128 << 10},
 }
