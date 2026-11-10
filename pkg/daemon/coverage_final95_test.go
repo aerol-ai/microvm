@@ -25,7 +25,7 @@ func TestFinal95RunReadySocketDirFailure(t *testing.T) {
 	t.Setenv("SB_DOCKER_READY_SOCKET_ENABLED", "true")
 	t.Setenv("SB_DOCKER_POOL_ENABLED", "true")
 	t.Setenv("SB_MOUNTS_CRED_DIR", blocker)
-	if err := runWithAutoCancel(t, 500*time.Millisecond, nil); err == nil {
+	if err := runUntilBootFails(t, nil); err == nil {
 		t.Fatal("expected ready socket dir failure")
 	}
 }

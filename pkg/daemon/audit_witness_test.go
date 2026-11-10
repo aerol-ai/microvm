@@ -51,7 +51,7 @@ func TestAuditWitnessSettingsWithoutBackendAreInert(t *testing.T) {
 	fake := witnessFake(t)
 	t.Setenv("SB_AUDIT_WITNESS_BACKEND", "")
 	t.Setenv("SB_SECRET_AUDIT_EXTERNAL_WITNESS", "true")
-	err := runWithAutoCancel(t, 800*time.Millisecond, nil)
+	err := runUntilBootFails(t, nil)
 	if err == nil || !strings.Contains(err.Error(), "requires a non-noop controlplane.Witness") {
 		t.Fatalf("err = %v, want the existing external-witness refusal", err)
 	}
@@ -129,7 +129,7 @@ func TestAuditWitnessBackendRefusesUnlockedBucket(t *testing.T) {
 	fake.CreateBucket("plain", s3fake.BucketOptions{Versioning: true})
 	t.Setenv("SB_AUDIT_WITNESS_BACKEND", "s3")
 	t.Setenv("SB_AUDIT_WITNESS_S3_BUCKET", "plain")
-	err := runWithAutoCancel(t, 800*time.Millisecond, nil)
+	err := runUntilBootFails(t, nil)
 	if err == nil || !strings.Contains(err.Error(), "open audit witness") || !strings.Contains(err.Error(), "does not have Object Lock") {
 		t.Fatalf("err = %v", err)
 	}

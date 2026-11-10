@@ -647,7 +647,7 @@ func TestCoverage95LiftRunErrorBranches(t *testing.T) {
 		port := ln.Addr().(*net.TCPAddr).Port
 		t.Setenv("SB_EGRESS_ATTRIBUTION_ENABLED", "true")
 		t.Setenv("SB_AUDIT_INGEST_PORT", strconv.Itoa(port))
-		if err := runWithAutoCancel(t, 500*time.Millisecond, nil); err == nil {
+		if err := runUntilBootFails(t, nil); err == nil {
 			t.Fatal("expected audit ingest listen failure")
 		}
 	})
@@ -661,7 +661,7 @@ func TestCoverage95LiftRunErrorBranches(t *testing.T) {
 		t.Setenv("SB_MOUNTS_CRED_DIR", blocked)
 		t.Setenv("SB_DOCKER_POOL_ENABLED", "true")
 		t.Setenv("SB_DOCKER_READY_SOCKET_ENABLED", "true")
-		if err := runWithAutoCancel(t, 500*time.Millisecond, nil); err == nil {
+		if err := runUntilBootFails(t, nil); err == nil {
 			t.Fatal("expected ready-socket dir failure")
 		}
 	})
@@ -699,7 +699,7 @@ func TestCoverage95LiftRunErrorBranches(t *testing.T) {
 		t.Setenv("AWS_EC2_METADATA_DISABLED", "true")
 		t.Setenv("AWS_CONFIG_FILE", filepath.Join(t.TempDir(), "no-aws-config"))
 		t.Setenv("AWS_SHARED_CREDENTIALS_FILE", filepath.Join(t.TempDir(), "no-aws-creds"))
-		if err := runWithAutoCancel(t, 800*time.Millisecond, nil); err == nil {
+		if err := runUntilBootFails(t, nil); err == nil {
 			t.Fatal("expected awskms configure failure")
 		}
 	})
@@ -708,7 +708,7 @@ func TestCoverage95LiftRunErrorBranches(t *testing.T) {
 		paths := setBaseRunEnv(t)
 		t.Setenv("SB_ENABLE_SSH_GATEWAY", "true")
 		t.Setenv("SB_SSH_HOST_KEY_PATH", paths.rootDir)
-		if err := runWithAutoCancel(t, 500*time.Millisecond, nil); err == nil {
+		if err := runUntilBootFails(t, nil); err == nil {
 			t.Fatal("expected ssh host-key failure")
 		}
 	})
@@ -752,7 +752,7 @@ func TestCoverage95LiftRunErrorBranches(t *testing.T) {
 		t.Setenv("SB_GOSSIP_BIND_ADDR", "127.0.0.1:0")
 		t.Setenv("SB_GOSSIP_ADVERTISE_ADDR", "127.0.0.1:0")
 		t.Setenv("SB_SELF_API_ADVERTISE_URL", "http://127.0.0.1:8080")
-		if err := runWithAutoCancel(t, 800*time.Millisecond, nil); err == nil {
+		if err := runUntilBootFails(t, nil); err == nil {
 			t.Fatal("expected cluster start failure")
 		}
 	})
@@ -799,7 +799,7 @@ func TestCoverage95LiftEnterpriseWitnessMismatch(t *testing.T) {
 	setEnterpriseCredentialEnv(t)
 	t.Setenv("SB_PAT_TOKEN", "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx")
 	t.Setenv("SB_SECRET_AUDIT_STRICT_BOOT", "true")
-	err := runWithAutoCancel(t, 800*time.Millisecond, func(context.Context, FleetConfig) (controlplane.Provider, error) {
+	err := runUntilBootFails(t, func(context.Context, FleetConfig) (controlplane.Provider, error) {
 		return controlplane.Provider{
 			Witness:       mismatchWitness{},
 			AuditExporter: liftAuditExporter{},
@@ -821,7 +821,7 @@ func TestCoverage95LiftEnterpriseNeedsExporter(t *testing.T) {
 	setEnterpriseCredentialEnv(t)
 	t.Setenv("SB_PAT_TOKEN", "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx")
 	t.Setenv("SB_SECRET_AUDIT_STRICT_BOOT", "true")
-	err := runWithAutoCancel(t, 800*time.Millisecond, func(context.Context, FleetConfig) (controlplane.Provider, error) {
+	err := runUntilBootFails(t, func(context.Context, FleetConfig) (controlplane.Provider, error) {
 		return controlplane.Provider{Witness: liftWitness{}}.WithDefaults(), nil
 	})
 	if err == nil {
@@ -834,7 +834,7 @@ func TestCoverage95LiftEnterpriseNeedsExporter(t *testing.T) {
 
 func TestCoverage95LiftProviderFactoryError(t *testing.T) {
 	_ = setBaseRunEnv(t)
-	err := runWithAutoCancel(t, 500*time.Millisecond, func(context.Context, FleetConfig) (controlplane.Provider, error) {
+	err := runUntilBootFails(t, func(context.Context, FleetConfig) (controlplane.Provider, error) {
 		return controlplane.Noop(), errors.New("provider boom")
 	})
 	if err == nil {
@@ -1132,21 +1132,14 @@ func TestCoverage95RunExtendedWiringBranches(t *testing.T) {
 			for k, v := range tc.env {
 				t.Setenv(k, v)
 			}
-			err := runWithAutoCancel(t, 600*time.Millisecond, nil)
-			if tc.name == "netrules_unknown_backend" {
+			if tc.name == "netrules_unknown_backend" && runtime.GOOS == "linux" {
 				// Linux validates backends; other GOOS returns a disabled manager.
-				if runtime.GOOS == "linux" {
-					if err == nil {
-						t.Fatal("want unknown netrules backend error on linux")
-					}
-					return
-				}
-				if err != nil {
-					t.Fatalf("Run %s: %v", tc.name, err)
+				if err := runUntilBootFails(t, nil); err == nil {
+					t.Fatal("want unknown netrules backend error on linux")
 				}
 				return
 			}
-			if err != nil {
+			if err := runWithAutoCancel(t, 600*time.Millisecond, nil); err != nil {
 				// Offline Linux containers often lack iptables/nft; the branch
 				// still exercised the enabled-manager create path before failing.
 				if tc.name == "netrules_enabled" && isNetrulesHostUnavailable(err) {
@@ -1200,7 +1193,7 @@ func TestCoverage95RunIsolateAndContainerdWiring(t *testing.T) {
 		}
 		t.Setenv("SB_ISOLATE_USE_JAIL", "true")
 		t.Setenv("SB_ISOLATE_JAIL_CHROOT_BASE", paths.rootDir+"/jail")
-		err := runWithAutoCancel(t, 150*time.Millisecond, nil)
+		err := runUntilBootFails(t, nil)
 		if err == nil || !strings.Contains(err.Error(), "isolate jail") {
 			t.Fatalf("Run with an unrealizable required jail = %v, want boot refusal", err)
 		}

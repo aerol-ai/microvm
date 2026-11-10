@@ -171,6 +171,29 @@ func runWithAutoCancel(t *testing.T, delay time.Duration, makeProvider ProviderF
 	return Run(ctx, testLogger(), makeProvider)
 }
 
+// bootFailureSafetyNet stops a runUntilBootFails Run that booted when it
+// should have failed. Nothing waits for it on the normal path: a failing
+// boot step returns at once.
+const bootFailureSafetyNet = 30 * time.Second
+
+// runUntilBootFails runs Run for a test that expects a boot step to fail, and
+// returns that error. It does not stop Run on a short timer the way
+// runWithAutoCancel does. A stop that lands mid-boot turns the failing step's
+// error into a clean exit (bootStopped, by design), so on a loaded CI runner
+// whose boot was slower than the timer the expected error came back as nil.
+func runUntilBootFails(t *testing.T, makeProvider ProviderFactory) error {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	safety := time.AfterFunc(bootFailureSafetyNet, cancel)
+	defer safety.Stop()
+	err := Run(ctx, testLogger(), makeProvider)
+	if ctx.Err() != nil {
+		t.Fatalf("Run still running after %s: no boot step failed (Run = %v)", bootFailureSafetyNet, err)
+	}
+	return err
+}
+
 func TestRun_GracefulShutdownWithProviderAndSSH(t *testing.T) {
 	paths := setBaseRunEnv(t)
 	t.Setenv("SB_ENABLE_SSH_GATEWAY", "true")
