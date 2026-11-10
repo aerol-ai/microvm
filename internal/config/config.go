@@ -1226,11 +1226,11 @@ type Config struct {
 	// remembers which node owns a sandbox and forwards there without asking
 	// the server tier first. The owner still checks every request and
 	// answers 421 "not here" to a stale entry, so the cache changes where a
-	// request goes, never the answer. Default off. Turn it on only once every
-	// node runs a build that answers "not here": an older owner would serve
-	// or 404 a stale forward instead. Ignored on server-role nodes, which
-	// read their own placement copy. Rationale in setup/config-defaults.md.
-	// SB_CLUSTER_OWNER_CACHE.
+	// request goes, never the answer. Default on: every supported build
+	// (v0.6.12 and later) answers "not here". It was off while an older
+	// owner, which would serve or 404 a stale forward, could still be in a
+	// cluster. Ignored on server-role nodes, which read their own placement
+	// copy. Rationale in setup/config-defaults.md. SB_CLUSTER_OWNER_CACHE.
 	ClusterOwnerCache bool
 	// RouteDNSAddr is the loopback address of the sandboxd route responder
 	// that the static Caddy routes query (plans/ingress-proxy-routing.md
@@ -2300,7 +2300,7 @@ func load(keyTool bool) (Config, error) {
 		L4PublicHost:                     normalizeAdvertiseHost(os.Getenv("SB_L4_PUBLIC_HOST")),
 		ClusterShardAwareIngress:         getEnvBool("SB_CLUSTER_SHARD_AWARE_INGRESS", false),
 		IngressProxyRouting:              getEnvBool("SB_INGRESS_PROXY_ROUTING", true),
-		ClusterOwnerCache:                getEnvBool("SB_CLUSTER_OWNER_CACHE", false),
+		ClusterOwnerCache:                getEnvBool("SB_CLUSTER_OWNER_CACHE", true),
 		RouteDNSAddr:                     getEnv("SB_ROUTE_DNS_ADDR", "127.0.0.1:53053"),
 		RouteDNSLinkAddr:                 getEnv("SB_ROUTE_DNS_LINK_ADDR", ""),
 		HostPortRedirectPort:             getEnvInt("SB_HOSTPORT_REDIRECT_PORT", 21215),

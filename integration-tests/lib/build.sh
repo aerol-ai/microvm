@@ -330,6 +330,7 @@ build_one_arch() {
     log "build: caddy_linux_${arch} (xcaddy)"
     ( cd "$src" && GOOS=linux GOARCH="$goarch" CGO_ENABLED=0 \
         xcaddy build v2.11.8-0.20261106223313-31f9f0cb9949 \
+          --with github.com/aerol-ai/microvm/caddymod=./caddymod \
           --with github.com/mholt/caddy-l4@v0.1.2 \
           --with github.com/caddy-dns/cloudflare@v0.2.4 \
           --with github.com/ss098/certmagic-s3@v0.0.0-20250922022452-8af482af5f39 \

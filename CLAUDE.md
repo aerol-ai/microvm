@@ -179,6 +179,12 @@ pkg/
                  validates the artifact.
   isolate/       workerd engine host (pkg/isolate) — group supervisor, jail
                  spec, per-slot egress pool. Driven by internal/runtime/isolate.
+caddymod/        AerolVM's Caddy plugins. Its own Go module (so Caddy's build
+                 takes only Caddy's deps), built into every release Caddy by
+                 xcaddy (release.yml). aerolvm_route is the owner static
+                 route's upstream lookup; sandboxd asks Caddy for it
+                 (pkg/caddy HasRouteUpstream) and falls back to Caddy's stock
+                 "a" source without it. Not covered by `make test`.
 sdk/
   typescript/    @aerol-ai/aerolvm-sdk. src/MicroVM.ts + Sandbox.ts; transport
                  in src/internal/api/v1/.
@@ -250,6 +256,7 @@ Per-SDK tests:
 (cd sdk/go && go test ./...)
 (cd sdk/java && mvn -B -ntp test)
 (cd sdk/rust && cargo test)
+(cd caddymod && go test -race ./...)   # the Caddy plugin (own Go module)
 ```
 
 CI is path-filtered (`.github/workflows/test.yml`): touching `docs/**`
@@ -299,7 +306,7 @@ For changes that don't match a skill, the file-level "where to look" map is:
 | Live AWS integration scenarios | `integration-tests/suite/` + `harness/`; run via `make integration-*` |
 | Cluster placement / Raft FSM / gossip / failover | `internal/cluster/` — see `cluster.go` for the package overview, `fsm.go` + `placement.go` for owner assignment, `recovery_*.go` for failover replicas |
 | OTEL traces / expvar metrics exporter | `internal/observability/` |
-| Caddy route / TLS / L4 wiring | `pkg/caddy/client.go` |
+| Caddy route / TLS / L4 wiring | `pkg/caddy/client.go`; owner route lookup plugin `caddymod/` |
 | Capacity / admission rules | `pkg/capacity/` |
 | Docker events / image GC | `pkg/docker/events.go`, `pkg/docker/image_gc_test.go` |
 | SSH gateway behavior | `pkg/sshgateway/gateway.go` |

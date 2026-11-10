@@ -6257,16 +6257,9 @@ func (s *Service) acquireWakeStartSlot(ctx context.Context) (func(), error) {
 }
 
 func (s *Service) Health(ctx context.Context) (models.HealthStatus, error) {
-	sandboxes, err := s.store.List(ctx)
+	live, err := s.store.CountLive(ctx)
 	if err != nil {
 		return models.HealthStatus{}, err
-	}
-
-	live := 0
-	for _, sandbox := range sandboxes {
-		if sandbox.Status != models.SandboxStatusDestroyed {
-			live++
-		}
 	}
 
 	dockerStatus := "ok"
