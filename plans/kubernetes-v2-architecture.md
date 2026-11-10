@@ -140,7 +140,7 @@ machines and processes. AerolVM owns everything about sandboxes.
 | Find the other AerolVM programs at start-up | Kubernetes DNS | Headless Service names |
 | Prove which pod is which | Kubernetes: ServiceAccount tokens and TokenReview | The operator checks the pod, then mints it a single-use v0.7.0 join token (R2) |
 | Sign certificates | AerolVM's servers by default, as on VMs (v0.7.0). In external-CA mode, the bank's issuer through cert-manager, and the CA key never enters the cluster (D11) | R2 |
-| Public load balancer | The cloud's load balancer, through a Service | NLB on AWS, Azure Load Balancer on Azure |
+| Public load balancer | The cloud's load balancer, through a Service, or the bank's own Kubernetes Gateway (§7.1) | NLB on AWS, Azure Load Balancer on Azure; or a few fixed Gateway API routes, never one per sandbox |
 | Disks for the servers | Kubernetes volumes (EBS, Azure Disk) | One per server |
 | Settings and keys | Kubernetes Secrets and our CRDs, plus the cloud KMS | They change rarely |
 | **Choose a machine for a sandbox** | **AerolVM** | Thousands per second, in milliseconds |
@@ -213,6 +213,8 @@ own schedulers place the small, fast work inside them.
 | C. Privileged DaemonSet using the machine's containerd | The earlier plan | **No.** It changes the machine outside the pod (host firewall next to kube-proxy and the CNI, host cgroups, `runsc` copied into `/usr/local/bin`). Kubernetes cannot see sandbox use, so the autoscaler sees busy machines as empty. A slow pod restart trips the 30-second death rule. |
 | **D. One self-contained worker pod per machine** | Sandboxes live inside a node-sized pod that holds its own containerd and network | **Chosen.** Kubernetes sees true use, nothing touches the machine, upgrades keep sandboxes running. |
 | E. CockroachDB's multi-Raft (one Raft group per slice of sandboxes) inside one cluster | Split the placement table into ranges, each with its own Raft group | **Not now.** Sandboxes never need a transaction across two sandboxes, so the simpler answer is cells (section 12). Revisit only if one cell cannot reach its target. |
+| F. The Kubernetes Gateway API picks the worker | One `HTTPRoute` or `TLSRoute` per sandbox, served by the bank's Gateway product | **No, for picking the worker. Yes, as the front door (§7.1).** A route can only send traffic to a Kubernetes Service, and a sandbox is not one: it sits on a private network inside the worker pod (§8.4). Picking the worker would need one route object per sandbox, about 100,000 in etcd, written on every create and delete. K5 forbids that, and a link would work only after the Gateway's controller had pushed the new route to its proxy. Per-sandbox route changes already hurt us once: Caddy reloads dropped about 2.6% of new connections under churn (`plans/ingress-proxy-routing.md`). And the gateway does work no proxy does: API keys, the Daytona, E2B and Runloop facades, and the SSH gateway. |
+| G. No AerolVM gateways: the Gateway sends to any worker, which forwards | The bank's Gateway spreads traffic over all workers; the worker that gets it forwards to the owner | **No.** Internet traffic would land on privileged pods, which only gateways, servers and other workers may reach (§8.7, wall 3). Every worker would also need the full placement index, and most requests would take one more hop. |
 
 ---
 
@@ -304,8 +306,8 @@ A gateway keeps a cache of "sandbox X lives on worker W", filled from the
 placement change feed that already exists
 (`internal/cluster/placement_changelog.go`). Today a worker or ingress node
 asked a server on **every** routed request. An owner cache now exists
-(`internal/cluster/agent.go:177-179`, #1018) but is off by default
-(`SB_CLUSTER_OWNER_CACHE`); the chart turns it on. A stale cache entry must be
+(`internal/cluster/agent.go:177-179`, #1018) and is on by default since #1116
+(`SB_CLUSTER_OWNER_CACHE`); the chart keeps it on. A stale cache entry must be
 safe: the worker checks that it owns the sandbox and answers "not here",
 which refreshes the cache (fix E3 in section 9.4). CockroachDB's gateways work
 the same way with their range cache.
@@ -314,6 +316,25 @@ Long streams (exec output, sessions, terminals) hold no state in the gateway.
 If a gateway dies, the client reconnects through any other gateway and
 re-attaches. Sessions live in `toolboxd` inside the sandbox, which keeps
 running (`docs/src/content/docs/sessions.mdx`).
+
+**The bank's own Kubernetes Gateway can stand in front.** Many banks send all
+traffic through one Gateway API product (Envoy Gateway, Istio, NGINX Gateway
+Fabric and others) and do not want a second load balancer. The chart supports
+this: with `gateways.gatewayRef` set, it writes a few fixed routes once, at
+install, in place of its own `LoadBalancer` Service. Every route points at the
+AerolVM gateways' Service:
+
+| Route | Host or port | Rule |
+|---|---|---|
+| `HTTPRoute` | The API host, for example `api.example.com` | The bank's Gateway may end TLS here with its own certificate, and connects on to the gateways over TLS. |
+| `TLSRoute` | The sandbox-link wildcard, for example `*.sbx.example.com` | **Passthrough only.** The worker's Caddy ends TLS, so a link stays encrypted all the way to the worker, as today. |
+| `TCPRoute` | SSH, and each plain TCP port from the per-install pool | Passthrough. Each port still needs its own listener, so the 50-listener NLB limit still applies. |
+
+No route is ever written per sandbox, so K5 still holds. TLSRoute has been in
+Gateway API's Standard channel since v1.5.0 and TCPRoute since v1.6.0 (Sources).
+Support still differs between products and versions, so P8 checks that each
+route is accepted and that the sandbox-link listener is in passthrough mode.
+Choosing the worker always stays in the AerolVM gateway (§5, option F).
 
 ### 7.2 Server
 
@@ -759,6 +780,7 @@ spec:
     minReplicas: 3
     maxReplicas: 30
     service: {type: LoadBalancer}
+    # gatewayRef: {name: bank-gateway, namespace: gateways}   # instead of service: sit behind the bank's own Gateway (§7.1)
   workerPools:
     - name: gvisor-general
       runtimes: [gvisor]
@@ -1275,12 +1297,12 @@ example admission policy that refuses unsigned AerolVM images.
 |---|---|---|
 | P1 | Four images (eng review D1): `aerolvm` (`sandboxd`; the gateway, server and agent pods run it, and a setting picks the role), `aerolvm-operator` (the operator, so a flaw in its Kubernetes libraries is reported on this image only), `aerolvm-runtime` (the supervisor, containerd, `runsc` and its shim), and `aerolvm-edge` (the custom Caddy build: layer-4, DNS and the `aerolvm_route` plugin from `603240eb`) | Published on `ghcr.io/aerol-ai/*` for amd64 and arm64 (multi-arch manifests), with cosign keyless signatures, an SBOM and SLSA provenance; the chart is a signed OCI artifact on the same registry; both are copied to the existing download mirror, and `aerolvm release pull --images` bundles them for a bank's own registry (eng review D2). |
 | P2 | The operator: `AerolCluster`, `AerolNode`, node identity (R2: TokenReview, then a single-use join token per pod, or cert-manager in external-CA mode), scaling, upgrades, decommission Machine retirement (eng review OV-E6): an idempotent sequence recorded in `AerolNode`: cordon the Node, decommission, delete the worker pod, delete the Karpenter/NAP NodeClaim; RBAC gains Node patch and NodeClaim delete. | Go, controller-runtime. Talks to AerolVM only through `sdk/go` and the admin API. |
-| P3 | The Helm chart | Installs the operator and CRDs. A `single` mode (one pod, no operator) for kind and laptops. |
+| P3 | The Helm chart | Installs the operator and CRDs. A `single` mode (one pod, no operator) for kind and laptops. With `gateways.gatewayRef`, it writes the fixed Gateway API routes of §7.1 in place of its own `LoadBalancer` Service. |
 | P4 | `make k8s-dev` and `kubernetes.mdx` | Five SDK languages, as every docs page. |
 | P5 | Live scenarios in `integration-tests/` | Section 19 |
 | P6 | Runbook `setup/runbooks/kubernetes.md` and the alerts in section 19 | D13 |
 | P7 | Bank security evidence pack (CEO review CE2): each pod's exact rights and why, threat model, network walls, data flows, how to verify signatures, the admission policy and its one named exception, the create policy (`SB_CREATE_POLICY_FILE`) and how sandboxes get cloud credentials without stored keys (`internal/cloudidentity`). Versioned with the chart. | Phase 0: draft v1, sent to the bank with Q6 on day one (R4), then updated with S7's result. Final in Phase 2, when the full layout exists. |
-| P8 | `aerolvm k8s verify` (CEO review CE2): checks a live install against P7, exit 1 on any miss. Phase 1 (`single` mode): images signed, no host mounts, no Kubernetes API rights, and a probe sandbox cannot reach a private address or its worker's ports (C24). Phase 2 adds privileged only in the worker namespace, NetworkPolicies present, and the IMDS hop limit, read through the cloud API with the caller's own credentials and skipped with a warning when none are given. | Phase 1 subset, Phase 2 full |
+| P8 | `aerolvm k8s verify` (CEO review CE2): checks a live install against P7, exit 1 on any miss. Phase 1 (`single` mode): images signed, no host mounts, no Kubernetes API rights, and a probe sandbox cannot reach a private address or its worker's ports (C24). Phase 2 adds privileged only in the worker namespace, NetworkPolicies present, and the IMDS hop limit, read through the cloud API with the caller's own credentials and skipped with a warning when none are given. With `gateways.gatewayRef`, Phase 2 also checks that the Gateway accepted every §7.1 route and that the sandbox-link listener is in passthrough mode. | Phase 1 subset, Phase 2 full |
 | P9 | Chart monitoring (CEO review CE4): a ServiceMonitor, the PrometheusRules that implement P6's alert list, and Grafana dashboards, including per-team use from C20 | Phase 2 |
 | P10 | Platform polish (CEO review CE6). Phase 1: Helm install notes with the next three commands and a health check. Phase 2: a preflight init container in every worker pod (cgroup v2, kernel version; `/dev/kvm` only on Firecracker pools), so every machine is checked, including ones added later, and a failed check keeps that worker out of service with a clear reason on its `AerolNode`; `kubectl get aerolnodes` printer columns (zone, state, version, sandboxes, free CPU) read from `AerolNode` status, which the operator updates at most once a minute; Kubernetes Events on `AerolNode` for decommission progress, at most one per 10% of progress per node; an Argo CD health check in the docs; and a `values-bank-eks.yaml` preset linked from P7. All inside the G4 write budget. | Phases 1 and 2 |
 
@@ -1466,6 +1488,9 @@ root at commit `d33b78c3` (branch `plans/kubernetes-ceo-review`). The CEO review
 | EKS pods per node (234 on m7i.8xlarge; cap of 250 above 30 vCPUs) | [EKS: choosing an instance type](https://docs.aws.amazon.com/eks/latest/userguide/choosing-instance-type.html) |
 | 110 pods per node; 5,000 nodes upstream | [Kubernetes: large clusters](https://kubernetes.io/docs/setup/best-practices/cluster-large/) |
 | AWS NLB: 50 listeners, not adjustable | [NLB quotas](https://docs.aws.amazon.com/elasticloadbalancing/latest/network/load-balancer-limits.html) |
+| Gateway API routes send traffic to Kubernetes Services (core support) | [Gateway API: HTTPRoute](https://gateway-api.sigs.k8s.io/reference/api-types/httproute/), [TCPRoute](https://gateway-api.sigs.k8s.io/reference/api-types/tcproute/) |
+| TLSRoute in the Standard channel since v1.5.0; passthrough is core support | [Gateway API: TLSRoute](https://gateway-api.sigs.k8s.io/reference/api-types/tlsroute/), [Kubernetes blog: Gateway API v1.5](https://kubernetes.io/blog/2026/04/21/gateway-api-v1-5/) |
+| TCPRoute in the Standard channel since v1.6.0 | [Kubernetes blog: Gateway API v1.6](https://kubernetes.io/blog/2026/08/03/gateway-api-v1-6-release/) |
 | EKS up to 100,000 nodes per cluster | [AWS What's New, 2025-07](https://aws.amazon.com/about-aws/whats-new/2025/07/amazon-eks-100000-worker-nodes-per-cluster) |
 | AKS 5,000 nodes per cluster, 1,000 per pool | [AKS quotas](https://learn.microsoft.com/en-us/azure/aks/quotas-skus-regions) |
 | Kubernetes pod start goal: 99% within 5 s | [SIG Scalability SLO](https://github.com/kubernetes/community/blob/main/sig-scalability/slos/pod_startup_latency.md) |
@@ -1529,7 +1554,7 @@ Phase 1, after the 2–3 week Phase 0 spikes.
 |---|---|---|
 | §9.3 L-a, lock held across the Raft commit (the "~150 creates/s" limit) | Fixed by §9.4 fix E2 | `internal/cluster/admission_ledger.go` (header comment); #1024 |
 | §9.3 L-b, no group commit | Mostly moot: raft groups concurrent applies now that §9.4 E2 is in | `plans/cluster-correctness-and-create-latency.md` §5 |
-| §9.3 L-d, no owner cache | Built, but **off by default** | `internal/cluster/agent.go:177-179` (`SB_CLUSTER_OWNER_CACHE`); #1018. Owner lease E3b: #1042 |
+| §9.3 L-d, no owner cache | Built, and **on by default** since #1116 | `internal/cluster/agent.go:177-179` (`SB_CLUSTER_OWNER_CACHE`); #1018. Owner lease E3b: #1042 |
 | C13, cluster version and finalization | Shipped in v0.7.0: leader-driven rollout with `finalize` and one-way migrations | `internal/cluster/rollout_state.go:147-148`, `rollout_driver.go:467` |
 | C8, "restarting" is not "leaving" | Partly: a node the rollout is upgrading is not failed over before its deadline | `internal/cluster/dead_owner.go:178-183` |
 | §7.2 change 3, hand off leadership on stop | The primitive exists (`TransferLeadership`); a plain `SIGTERM` does not call it | `internal/cluster/rollout.go:250-267` |
@@ -1545,7 +1570,7 @@ Phase 1, after the 2–3 week Phase 0 spikes.
 - REALITY: binding-decisions finding. The 2026-09-30 decisions put the agent-sandbox API facade in Phase 3 and replace own CRDs. v2 moves the facade to Phase 6 and adds its own `SandboxTemplate` and `SandboxPool` CRDs. It withdraws husk pods and the license gate, which is an announced, user-driven reversal (2026-11-04). §10.1 and §16 `plans/kubernetes-deployment.md:23`
 - REALITY: numbers finding. 751 B per placement [measured: secrets-hardening fleet-scale]. gVisor 284 ms and containerd 189 ms warm [measured: `plans/investor-benchmark-observability.md:28`]. A 6–7 ms commit [measured: `plans/warm-create-latency-tier1.md:60`]. "~150 creates/s" [estimated, now stale: E2 expects 1,000–3,000 reserves/s, also an estimate; re-measure before the gate]. The ID-clash chance of about 1 in 140,000 at 1M live re-derives as n²/2^57 ≈ 1 in 144,000. §9.3 L-a
 - REALITY: deferred-asks pass. No linked issue. the plan header `plans/kubernetes-v2-architecture.md:3`
-- REALITY: pr-count pass. No `.gstack/ship-policy.json`, so the default is one PR per wave. The plan ships each phase as stacked PRs. §18 `plans/kubernetes-v2-architecture.md:1289`
+- REALITY: pr-count pass. No `.gstack/ship-policy.json`, so the default is one PR per wave. The plan ships each phase as stacked PRs. §18 `plans/kubernetes-v2-architecture.md:1311`
 
 **0C. Dream state.**
 ```
@@ -2153,7 +2178,7 @@ System with the CEO-review additions (new or changed parts marked `*`):
 ```
  clients ──► cloud LB ──► gateways (Deployment, >=3, restricted)
                             │  API, sandbox links (SNI pass-through), SSH, TLS ports
-                            │  owner cache ON (SB_CLUSTER_OWNER_CACHE)        [shipped, flag]
+                            │  owner cache ON (SB_CLUSTER_OWNER_CACHE)        [shipped, on by default]
                             ▼
                  servers (3|5 pods, one disk each) ── Raft ── leader
                    │   leader rollout (order, stage, canary, finalize)    [v0.7.0]
@@ -2872,7 +2897,7 @@ Reality rows (eng):
 - REALITY: binding-decisions pass. This review keeps every CEO answer (RQ1–RQ17) and the 2026-11-10 decision-log entries. `plans/kubernetes-v2-architecture.md:3`
 - REALITY: numbers finding. The CEO-review tags hold; S4's restore time must be re-measured with the new snapshot interval [re-measure before gate]. `internal/config/config.go:2171`
 - REALITY: deferred-asks pass. No linked issue. `plans/kubernetes-v2-architecture.md:1`
-- REALITY: pr-count pass. No ship policy; each phase ships as stacked PRs. `plans/kubernetes-v2-architecture.md:1289`
+- REALITY: pr-count pass. No ship policy; each phase ships as stacked PRs. `plans/kubernetes-v2-architecture.md:1311`
 
 
 
