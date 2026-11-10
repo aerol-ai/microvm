@@ -1,0 +1,5 @@
+exit 0
+--- stdout
+NAME        CPU(cores)   CPU%   MEMORY(MiB)   MEMORY%   SANDBOXES
+127.0.0.1   1.0          25%    512           25%       2
+--- stderr

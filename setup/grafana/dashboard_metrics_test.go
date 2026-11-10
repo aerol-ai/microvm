@@ -76,6 +76,12 @@ func TestKeyCustodyRowMetricsAreRegistered(t *testing.T) {
 	rowMetricsRegistered(t, "d9-security-isolation.json", "Key custody")
 }
 
+// TestRolloutRowMetricsAreRegistered is the same check for the D5
+// "Rollouts" row (plans/kubectl-style-cluster-ops.md §10.1).
+func TestRolloutRowMetricsAreRegistered(t *testing.T) {
+	rowMetricsRegistered(t, "d5-cluster-health.json", "Rollouts")
+}
+
 func rowMetricsRegistered(t *testing.T, dashboard, row string) {
 	t.Helper()
 	_, filename, _, ok := runtime.Caller(0)

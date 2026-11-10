@@ -1,0 +1,7 @@
+exit 0
+--- stdout
+NAME     SOURCE                AGE    IMAGE                     DISTRIBUTION
+snap-a   sb-0000000000000001   3d     snapshots/snap-a          local
+snap-b   sb-0000000000000002   400d   registry.example/snap-b   external_registry
+snap-c   -                     -      snapshots/snap-c          -
+--- stderr

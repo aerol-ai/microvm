@@ -60,6 +60,9 @@ func (cfg *Config) loadPATScopeConfig() error {
 		old, _ := volumes.OperatorScope("", cfg.PATTokenPrevious)
 		return fmt.Errorf("SB_PAT_TOKEN_PREVIOUS is set while SB_OPERATOR_VOLUME_SCOPE is not: a new PAT would move every operator volume; pin the old scope first with SB_OPERATOR_VOLUME_SCOPE=%s", old)
 	}
+	if err := cfg.loadPATVerifier(); err != nil {
+		return err
+	}
 
 	l4Proxy, _, err := envBoolStrict("SB_L4_FALLBACK_PROXY_PROTOCOL")
 	if err != nil {

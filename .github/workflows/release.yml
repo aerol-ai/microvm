@@ -243,6 +243,24 @@ jobs:
           go build -trimpath -ldflags "$LDFLAGS" -o dist/sandboxd_${{ matrix.suffix }} ./cmd/sandboxd
           chmod 0755 dist/sandboxd_${{ matrix.suffix }}
 
+      # Upgrade checks (`sandboxd upgrade node`, the docs' "Upgrading"
+      # steps, integration-tests/upgrade-gate.sh) read the version from the
+      # binary (`sandboxd version`, `sandboxd --version`), so a release whose
+      # binary misreports it would pass them all while running the wrong
+      # build.
+      - name: Check the linux_amd64 sandboxd reports the release version
+        if: matrix.suffix == 'linux_amd64'
+        shell: bash
+        run: |
+          # The whole output first, then its first line: `| head -n1` under
+          # pipefail can fail on SIGPIPE when head exits before the rest.
+          out="$(dist/sandboxd_linux_amd64 --version)"
+          got="${out%%$'\n'*}"
+          if [[ "$got" != "sandboxd $VERSION" ]]; then
+            echo "::error::sandboxd --version printed '$got', want 'sandboxd $VERSION'"
+            exit 1
+          fi
+
       # Same check as test.yml: macOS kills an unsigned arm64 binary at launch.
       - name: Check the darwin binary is signed
         if: matrix.suffix == 'darwin_arm64'
@@ -268,9 +286,12 @@ jobs:
         shell: bash
         run: |
           mkdir -p dist
+          # The Caddy version and plugins are pinned in scripts/install.sh
+          # (CADDY_VERSION and the CADDY_*_MODULE lines);
+          # integration-tests/safety/caddy_version_test.go keeps this in step.
           go install github.com/caddyserver/xcaddy/cmd/xcaddy@v0.4.6
           CGO_ENABLED=0 GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} GOARM=${{ matrix.goarm }} \
-            "$(go env GOPATH)/bin/xcaddy" build \
+            "$(go env GOPATH)/bin/xcaddy" build v2.11.9 \
             --output dist/caddy_${{ matrix.suffix }} \
             --with github.com/mholt/caddy-l4@v0.1.2 \
             --with github.com/caddy-dns/cloudflare@v0.2.4 \
@@ -281,6 +302,7 @@ jobs:
             dist/caddy_${{ matrix.suffix }} list-modules | grep -qx 'layer4.handlers.proxy'
             dist/caddy_${{ matrix.suffix }} list-modules | grep -qx 'dns.providers.cloudflare'
             dist/caddy_${{ matrix.suffix }} list-modules | grep -qx 'caddy.storage.s3'
+            dist/caddy_${{ matrix.suffix }} version | grep -q '^v2\.11\.9 '
           fi
 
       - name: Upload build artifacts
@@ -389,16 +411,48 @@ jobs:
           merge-multiple: true
 
       # Terraform's seed bootstrap downloads cluster-sign-node.sh from
-      # /releases/latest/download/ (Terraform/variables.tf), so every script a
-      # Terraform default names must ship here; integration-tests/safety
-      # TestTerraformReleaseURLsNameShippedAssets keeps the two in step.
+      # /releases/latest/download/ (Terraform/variables.tf), and the operator
+      # docs download uninstall.sh from there, so every script a Terraform
+      # default or a doc names must ship here; integration-tests/safety
+      # TestTerraformReleaseURLsNameShippedAssets and
+      # TestDocsReleaseURLsNameShippedAssets keep them in step.
       - name: Copy install scripts
         run: |
           cp scripts/install.sh dist/install.sh
+          cp scripts/uninstall.sh dist/uninstall.sh
           cp scripts/cluster-init.sh dist/cluster-init.sh
           cp scripts/cluster-join.sh dist/cluster-join.sh
           cp scripts/cluster-sign-node.sh dist/cluster-sign-node.sh
-          chmod 0755 dist/install.sh dist/cluster-init.sh dist/cluster-join.sh dist/cluster-sign-node.sh
+          chmod 0755 dist/install.sh dist/uninstall.sh dist/cluster-init.sh dist/cluster-join.sh dist/cluster-sign-node.sh
+
+      # release.json says which versions may upgrade straight to this one and
+      # what the upgrade changes (plans/kubectl-style-cluster-ops.md §6.5). It
+      # is generated from the tagged tree through the pkg/release type, never
+      # written by hand, and hashes the install.sh shipped above. It runs
+      # before the tagged copies and checksums.txt so both cover it.
+      # integration-tests/safety TestReleaseWorkflowGeneratesReleaseJSON keeps
+      # it in that place.
+      - name: Generate release.json
+        run: go run ./cmd/releasemeta -version "$VERSION" -install-script dist/install.sh -o dist/release.json
+
+      # The operator files from setup/ (alert rules, Alertmanager config,
+      # Grafana dashboards, runbooks), so nobody needs a checkout for them
+      # (plans/kubectl-style-cluster-ops.md §7). The file list is the tree
+      # itself; cmd/opsbundle's tests check the bundle holds what setup/
+      # has. Before checksums.txt, so it covers the bundle;
+      # integration-tests/safety TestReleaseWorkflowShipsTheOpsBundle keeps
+      # it there.
+      - name: Bundle the ops files
+        run: go run ./cmd/opsbundle -version "$VERSION" -setup setup -mtime "$(git log -1 --format=%ct)" -o "dist/aerolvm-ops-${VERSION}.tar.gz"
+
+      # Krew installs only from archives, so aerolvm ships as
+      # aerolvm_<os>_<arch>.tar.gz too, with a Krew manifest and a Homebrew
+      # formula built from those archives' names and hashes
+      # (plans/kubectl-style-cluster-ops.md §7, D13). Like release.json it is
+      # generated, never hand-synced, and runs before the tagged copies and
+      # checksums.txt so both cover it; cmd/aerolvmdist's tests keep it here.
+      - name: Package aerolvm for Krew and Homebrew
+        run: go run ./cmd/aerolvmdist -version "$VERSION" -dist dist -repo "$GITHUB_REPOSITORY"
 
       - name: Generate CycloneDX SBOM
         run: go run github.com/CycloneDX/cyclonedx-gomod/cmd/cyclonedx-gomod@v1.10.0 mod -json -output dist/sbom.cdx.json
@@ -411,7 +465,8 @@ jobs:
           cd dist
           for asset in *; do
             case "$asset" in
-              checksums.txt|sbom.cdx.json|*.intoto.jsonl) continue ;;
+              # The ops bundle's name already carries the tag.
+              checksums.txt|sbom.cdx.json|*.intoto.jsonl|aerolvm-ops-*) continue ;;
             esac
             cp "$asset" "${VERSION}_${asset}"
           done
@@ -552,6 +607,44 @@ jobs:
             --content-type text/plain --cache-control no-cache --only-show-errors --no-progress
           echo "aerolvm/latest.txt now names $VERSION"
 
+      # The third-party files this release's install.sh pins (CNI plugins,
+      # BuildKit, Firecracker, Caddy, workerd) are its fallback too. A pin
+      # bump used to need a hand-run `mirror-sync.sh --deps`, and a forgotten
+      # one left the new version without a mirror copy. This runs it on every
+      # release: it first asks the public mirror, and when every pinned file
+      # is there (the usual case) it downloads and uploads nothing. Otherwise
+      # it checks every file against its pin before uploading any. Last in the
+      # job, so the release files and latest.txt above never wait on it.
+      - name: Check out this release's install.sh (its download pins)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ env.VERSION }}
+          path: src
+          persist-credentials: false
+
+      - name: Copy any pinned third-party file the mirror lacks
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: src/scripts/mirror-sync.sh --deps --bucket "$MIRROR_BUCKET"
+
+      # Terraform's providers for this release's Terraform/, as a network
+      # mirror under tf-providers/: the harness's tf_init_failover falls back
+      # to it when the registries fail on a machine whose plugin cache lacks
+      # a provider (cloudflare's GitHub-hosted packages answered 504 for
+      # hours on 2026-11-09). Terraform checks each package's signature as
+      # it downloads it; a version already on the mirror is not sent again.
+      # Then the check installs every provider from the mirror alone.
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4
+        with:
+          terraform_wrapper: false
+
+      - name: Copy Terraform's providers to the mirror
+        run: src/scripts/mirror-sync.sh --tf-providers --bucket "$MIRROR_BUCKET"
+
+      - name: Check Terraform installs every provider from the mirror alone
+        run: src/scripts/mirror-sync.sh --tf-providers --check --bucket "$MIRROR_BUCKET"
+
   # npm and the MCP Registry are opt-in until their one-time setup is done
   # (npm/README.md): set the repository variable AEROLVM_NPM_PUBLISH=true.
   # Both run after the GitHub release, so a failure here never holds back
@@ -620,6 +713,76 @@ jobs:
             fi
             (cd "npm-dist/$dir" && "$npm_bin" publish --access public --tag "$tag")
           done < npm-dist/order.txt
+
+  # The Homebrew tap is opt-in like npm, until its one-time setup is done:
+  # the repository variable AEROLVM_HOMEBREW_TAP names the tap (owner/repo,
+  # for example aerol-ai/homebrew-tap, so `brew install aerol-ai/tap/aerolvm`
+  # works) and the secret HOMEBREW_TAP_TOKEN may push to it. It runs after the
+  # GitHub release, for stable releases only, and copies the aerolvm.rb that
+  # release published, so the tap always names that release's own archives
+  # and hashes. Safe to re-run: an unchanged formula makes no commit.
+  homebrew:
+    name: Publish the Homebrew formula
+    needs: release
+    if: vars.AEROLVM_HOMEBREW_TAP != '' && !github.event.release.prerelease
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      VERSION: ${{ github.event.release.tag_name }}
+      TAP: ${{ vars.AEROLVM_HOMEBREW_TAP }}
+    steps:
+      - name: Reject a release tag or tap that is not well formed
+        run: |
+          # Same check as the test job, stable versions only. The tag and the
+          # tap reach gh and git below.
+          if [[ ! "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::release tag must look like v1.2.3"
+            exit 1
+          fi
+          if [[ ! "$TAP" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+            echo "::error::AEROLVM_HOMEBREW_TAP must look like owner/homebrew-tap"
+            exit 1
+          fi
+
+      - name: Download the formula this release published
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: gh release download "$VERSION" --pattern aerolvm.rb --dir formula
+
+      - name: Check out the tap
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: ${{ vars.AEROLVM_HOMEBREW_TAP }}
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: tap
+
+      # Re-running this workflow for an older tag must not move the tap back,
+      # the same rule as "Mark the release as latest".
+      - name: Commit the formula if this is the newest release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          newest="$(gh release list --exclude-drafts --exclude-pre-releases --limit 1000 --json tagName --jq '.[].tagName' \
+            | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n 1)"
+          if [[ "$newest" != "$VERSION" ]]; then
+            echo "$newest is newer than $VERSION, so the tap stays on $newest."
+            exit 0
+          fi
+          mkdir -p tap/Formula
+          cp formula/aerolvm.rb tap/Formula/aerolvm.rb
+          cd tap
+          git add Formula/aerolvm.rb
+          if git diff --cached --quiet; then
+            echo "The tap already has the $VERSION formula."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "aerolvm ${VERSION}"
+          git push
 
   mcp-registry:
     name: Publish to the MCP Registry

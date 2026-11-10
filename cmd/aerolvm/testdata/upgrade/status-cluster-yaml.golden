@@ -1,0 +1,72 @@
+exit 0
+--- stdout
+active_version: v0.6.12
+batch: 10%
+caller: operator
+created_at: "2026-11-07T10:00:01Z"
+direction: upgrade
+hold: true
+id: r-1
+node_timeout: 10m0s
+nodes:
+    - arch: amd64
+      node_id: srv-a
+      order: 1
+      role: server
+      state: pending
+      updated_at: "2026-11-07T10:00:01Z"
+      version: v0.6.12
+    - arch: amd64
+      node_id: srv-b
+      order: 2
+      role: server
+      state: pending
+      updated_at: "2026-11-07T10:00:01Z"
+      version: v0.6.12
+    - arch: amd64
+      node_id: srv-c
+      order: 3
+      role: server
+      state: pending
+      updated_at: "2026-11-07T10:00:01Z"
+      version: v0.6.12
+    - arch: amd64
+      node_id: ing-1
+      order: 4
+      role: ingress
+      state: pending
+      updated_at: "2026-11-07T10:00:01Z"
+      version: v0.6.12
+    - arch: amd64
+      batch: 1
+      node_id: wkr-1
+      order: 5
+      role: worker
+      state: pending
+      updated_at: "2026-11-07T10:00:01Z"
+      version: v0.6.12
+    - arch: amd64
+      batch: 1
+      error: down when its turn came
+      node_id: wkr-2
+      order: 6
+      role: worker
+      state: skipped
+      updated_at: "2026-11-07T10:00:01Z"
+      version: v0.6.12
+    - arch: amd64
+      batch: 1
+      error: remote upgrade is off
+      manual_command: sudo sandboxd upgrade node v0.6.13 --sha256 sandboxd_linux_amd64=169ef2fd27b0f984408ea500a8ef8446cf7cf301b86d178fbd66d372574d3c94
+      node_id: wkr-3
+      order: 7
+      role: worker
+      state: manual
+      updated_at: "2026-11-07T10:00:01Z"
+      version: v0.6.12
+previous_version: v0.6.12
+source: upload
+state: staging
+target_version: v0.6.13
+updated_at: "2026-11-07T10:00:01Z"
+--- stderr

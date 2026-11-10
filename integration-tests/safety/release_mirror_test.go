@@ -2,6 +2,7 @@ package safety
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -120,6 +121,32 @@ func TestReleaseMirrorJob(t *testing.T) {
 	if l := job.Steps[latest].Run; !strings.Contains(l, `gh release view --json tagName`) || !strings.Contains(l, `"$latest" != "$VERSION"`) {
 		t.Errorf("the latest.txt step does not check that this release is GitHub's latest:\n%s", l)
 	}
+	// Terraform's providers go up last, so the release files, latest.txt and
+	// the pinned files never wait on the registries, and the check runs on
+	// what was just uploaded.
+	deps := stepIndex(func(s workflowStep) bool {
+		return strings.Contains(s.Run, `mirror-sync.sh --deps --bucket "$MIRROR_BUCKET"`)
+	})
+	tfSync := stepIndex(func(s workflowStep) bool {
+		return strings.Contains(s.Run, `mirror-sync.sh --tf-providers --bucket "$MIRROR_BUCKET"`)
+	})
+	tfCheck := stepIndex(func(s workflowStep) bool {
+		return strings.Contains(s.Run, `mirror-sync.sh --tf-providers --check --bucket "$MIRROR_BUCKET"`)
+	})
+	tfSetup := stepIndex(func(s workflowStep) bool {
+		return strings.HasPrefix(s.Uses, "hashicorp/setup-terraform@")
+	})
+	if deps < 0 || tfSync < 0 || tfCheck < 0 || tfSetup < 0 {
+		t.Fatalf("mirror job lacks a step: deps %d, setup-terraform %d, tf-providers sync %d, check %d", deps, tfSetup, tfSync, tfCheck)
+	}
+	if !(latest < deps && deps < tfSetup && tfSetup < tfSync && tfSync < tfCheck && tfCheck == len(job.Steps)-1) {
+		t.Errorf("steps out of order (latest.txt %d, deps %d, setup-terraform %d, tf-providers %d, check %d of %d): the providers go last, then the check",
+			latest, deps, tfSetup, tfSync, tfCheck, len(job.Steps))
+	}
+	if u := job.Steps[tfSetup].Uses; !regexp.MustCompile(`^hashicorp/setup-terraform@[0-9a-f]{40}$`).MatchString(u) {
+		t.Errorf("setup-terraform %q is not pinned to a full commit SHA", u)
+	}
+
 	c := job.Steps[creds]
 	if !regexp.MustCompile(`^aws-actions/configure-aws-credentials@[0-9a-f]{40}$`).MatchString(c.Uses) {
 		t.Errorf("credentials action %q is not pinned to a full commit SHA", c.Uses)
@@ -178,31 +205,35 @@ func TestReleaseMirrorRoleTrust(t *testing.T) {
 
 func TestReleaseMirrorRolePermissions(t *testing.T) {
 	p, _ := readPolicy(t, "permissions-policy.json")
-	got := map[string]string{}
+	// The role writes the release files (aerolvm/), the third-party files
+	// install.sh pins (deps/, mirror-sync.sh --deps in the same job) and
+	// Terraform's providers (tf-providers/, mirror-sync.sh --tf-providers),
+	// and nothing else: no delete, no other prefix or bucket.
+	got := map[string][]string{}
 	for _, s := range p.Statement {
 		action, _ := s.Action.(string)
 		resource, _ := s.Resource.(string)
 		if s.Effect != "Allow" || action == "" || resource == "" || strings.Contains(action, "*") {
 			t.Fatalf("statement %q = %s %v on %v; want one plain Allow action on one resource", s.Sid, s.Effect, s.Action, s.Resource)
 		}
-		got[action] = resource
+		got[action] = append(got[action], resource)
 		if action == "s3:ListBucket" {
 			prefix, _ := s.Condition["StringLike"]["s3:prefix"].([]any)
-			if len(prefix) != 1 || prefix[0] != "aerolvm/*" {
-				t.Errorf("ListBucket prefix condition = %v, want only aerolvm/*", s.Condition)
+			if fmt.Sprint(prefix) != "[aerolvm/* deps/* tf-providers/*]" {
+				t.Errorf("ListBucket prefix condition = %v, want only aerolvm/*, deps/* and tf-providers/*", s.Condition)
 			}
 		}
 	}
-	want := map[string]string{
-		"s3:PutObject":  "arn:aws:s3:::aerolvm-downloads/aerolvm/*",
-		"s3:ListBucket": "arn:aws:s3:::aerolvm-downloads",
+	want := map[string][]string{
+		"s3:PutObject":  {"arn:aws:s3:::aerolvm-downloads/aerolvm/*", "arn:aws:s3:::aerolvm-downloads/deps/*", "arn:aws:s3:::aerolvm-downloads/tf-providers/*"},
+		"s3:ListBucket": {"arn:aws:s3:::aerolvm-downloads"},
 	}
 	if len(got) != len(want) {
 		t.Errorf("role allows %v, want exactly %v (no delete, no other prefix or bucket)", got, want)
 	}
 	for a, r := range want {
-		if got[a] != r {
-			t.Errorf("%s on %q, want %q", a, got[a], r)
+		if fmt.Sprint(got[a]) != fmt.Sprint(r) {
+			t.Errorf("%s on %v, want %v", a, got[a], r)
 		}
 	}
 }

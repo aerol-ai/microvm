@@ -63,7 +63,7 @@ Power-of-two-choices on per-node capacity reaches roughly balanced at a fixed co
 
 **Where it sits on CAP.** The CAP theorem says that when a network splits, a distributed system must choose between consistency and availability. The placement FSM is CP: it chooses consistency. Placement writes (`opReserve`, `opPlace`, `opReassign` and the custom-domain commands) need a Raft leader, the one server that writes new log entries.
 
-During a leader election, those writes fail with `ErrNotLeader` and the API returns 503. Sandboxes already placed keep serving. Reads routed to the owner never touch Raft, and neither does toolbox traffic. (The toolbox is the small agent inside each sandbox that runs commands and file operations.)
+During a leader election, those writes fail with `ErrNotLeader` and the API returns 503. A write that was already waiting on a server when it stopped leading gets that answer within about 2 seconds, even if Raft itself never replies (it can drop the reply when it shuts down). The caller then retries on the new leader (`awaitApply` in `client.go`). Sandboxes already placed keep serving. Reads routed to the owner never touch Raft, and neither does toolbox traffic. (The toolbox is the small agent inside each sandbox that runs commands and file operations.)
 
 ## Topology
 
@@ -101,6 +101,8 @@ graph TB
 Gossip (`hashicorp/memberlist`) carries only identity and role. Its payload must fit memberlist's 512-byte `NodeMeta` limit, and a capacity report is bigger than that. (`gossip.go` documents the bug that led to splitting them.)
 
 Instead, `capacityLeaseCache` fetches `capacity.Snapshot`, a point-in-time report of free resources, from each worker-capable peer. It uses an authenticated `/v1/capacity` GET request on the gossip interval. That interval is 5 seconds by default, and a report expires after 3 intervals or 15 seconds, whichever is longer (see `capacity_lease.go`).
+
+The leader checks every create against its own report for the chosen worker. A server that has just started may not have one yet, and if it becomes leader then, it used to refuse those creates with 503 for about 20 seconds. Now the leader asks the worker for a report first, then decides. One request is shared by all the creates waiting on that worker, and it is not repeated within a second of a failed one (`capacity_lease_ondemand.go`).
 
 Worker and Agent nodes do not join Raft. They call any server-role member over RPC, and writes get forwarded to the leader.
 
@@ -687,7 +689,7 @@ These are the current limits of cluster mode. This page would be dishonest if it
 - **`failover.policy = "recreate"` is best effort.** The new owner rebuilds from the spec. Anything kept only in the container's writable layer is gone; see [Durability and failover](/durability/) for the full table.
 - **Raft needs a majority.** Two server-role nodes cannot survive losing one; three can, so run an odd number of server-role nodes. Above 10 live nodes, `LargeClusterTopologyError` (in `topology.go`) also requires dedicated server, worker and ingress roles, and it caps the server tier at 7 nodes.
 
-None of this is hidden. Operators planning a cluster need to know the guarantees and the failure modes. [Cluster setup](/cluster-setup/) covers how to run one.
+None of this is hidden. Operators planning a cluster need to know the guarantees and the failure modes. [Cluster setup](/cluster/) covers how to run one.
 
 ## What this buys you
 
@@ -835,7 +837,7 @@ The same create call works on one node, on three nodes, and in the middle of a f
 ## Next steps
 
 - [Durability and failover](/durability/): what survives a host loss, and what `failover.policy = "recreate"` keeps.
-- [Cluster setup](/cluster-setup/): how to deploy a cluster, and the quorum rules.
+- [Cluster setup](/cluster/): how to deploy a cluster, and the quorum rules.
 - [Safe retries (idempotency)](/engineering-idempotency/): the single-node rules (name uniqueness, partial unique indexes) that the FSM mirrors across the cluster.
 - [Secrets providers](/cluster-secrets/): how sealed secrets are copied to the nodes that may need them.
 - [Staying up under overload](/overload-protection-architecture/): how a node protects itself when too many cluster-wide lists read the placement table at once.

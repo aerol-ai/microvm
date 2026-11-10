@@ -1,0 +1,7 @@
+exit 0
+--- stdout
+ID                   NAME   STATUS   RUNTIME  CREATED
+sb-0000000000000001  box    started  docker   2026-10-04T12:00:00Z
+sb-0000000000000002  db     started  docker   2026-10-04T12:00:00Z
+sb-0000000000000003  nodes  started  docker   2026-10-04T12:00:00Z
+--- stderr

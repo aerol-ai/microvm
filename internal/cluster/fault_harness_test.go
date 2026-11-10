@@ -56,7 +56,8 @@ type faultCluster struct {
 	// leases is the capacity every server's lease cache reports for each
 	// owner node. The harness runs no sandbox runtime and no /v1/capacity
 	// endpoint, so a background loop writes these snapshots into every live
-	// server's cache, standing in for the capacity heartbeat.
+	// server's cache, standing in for the capacity heartbeat (start stops
+	// the real one).
 	leaseMu sync.Mutex
 	leases  map[string]capacity.Snapshot
 	stop    chan struct{}
@@ -88,10 +89,13 @@ func newFaultCluster(t *testing.T, name string, n int) *faultCluster {
 	}
 	for i := 1; i <= n; i++ {
 		fc.servers = append(fc.servers, &faultServer{
-			id:         fmt.Sprintf("%s-s%d", name, i),
-			dir:        t.TempDir(),
-			raftAddr:   fmt.Sprintf("127.0.0.1:%d", pickFreeTCPPort(t)),
-			gossipAddr: fmt.Sprintf("127.0.0.1:%d", pickFreeTCPPort(t)),
+			id:       fmt.Sprintf("%s-s%d", name, i),
+			dir:      t.TempDir(),
+			raftAddr: fmt.Sprintf("127.0.0.1:%d", pickFreeTCPPort(t)),
+			// Gossip binds UDP and TCP on the same port; a TCP-only pick
+			// once handed out a port whose UDP side another test process
+			// held ("failed to start UDP listener ... bind").
+			gossipAddr: fmt.Sprintf("127.0.0.1:%d", freeGossipPort(t)),
 			apiURL:     fmt.Sprintf("http://127.0.0.1:%d", pickFreeTCPPort(t)),
 		})
 	}
@@ -128,10 +132,61 @@ func (fc *faultCluster) start(s *faultServer, bootstrap bool) {
 	// in the middle of a test; eviction is driven explicitly instead.
 	cfg.ClusterDeadOwnerGrace = time.Hour
 	c, cleanup := newTestClusterFromConfig(fc.t, cfg)
+	// The harness serves no /v1/capacity, so this server's capacity sweep
+	// (refreshCapacityLeases) never stores a lease. All it can do here is
+	// delete one: retain drops the lease of any server its gossip does not
+	// list, and a restarted server stays unlisted on a peer until that peer
+	// takes its refute of the old leave. A leader that lost a lease that way
+	// refused the next create onto the server with "no fresh capacity
+	// heartbeat" until leaseLoop wrote it again. leaseLoop is the only lease
+	// source here, so the sweep is stopped and nothing takes a lease back.
+	if c.capacityLeaseStop != nil {
+		c.capacityLeaseStop()
+	}
 	s.mu.Lock()
 	s.c, s.cleanup = c, cleanup
 	s.mu.Unlock()
+	// Leases go in after gossip converges: New started one sweep before it
+	// could be stopped, and that sweep runs its retain before its first fetch.
+	fc.awaitGossip()
 	fc.writeLeases()
+}
+
+// awaitGossip waits until every live server's gossip lists every live server
+// alive. Raft does not wait for gossip: a restarted server can be caught up
+// while a peer still holds its old leave, and until the peer takes the
+// refute, its admission refuses every reservation onto that server.
+func (fc *faultCluster) awaitGossip() {
+	fc.t.Helper()
+	deadline := time.Now().Add(faultWait)
+	for {
+		missing := fc.gossipGap()
+		if missing == "" {
+			return
+		}
+		if time.Now().After(deadline) {
+			fc.t.Fatalf("gossip never converged within %s: %s", faultWait, missing)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// gossipGap names a live server that some live server's gossip does not list
+// alive, or returns "" when every one lists every other.
+func (fc *faultCluster) gossipGap() string {
+	up := fc.up()
+	for _, s := range up {
+		c := s.cluster()
+		if c == nil {
+			continue
+		}
+		for _, o := range up {
+			if m, ok := c.gossip.lookupMember(o.id); !ok || !m.Alive {
+				return fmt.Sprintf("%s does not list %s alive", s.id, o.id)
+			}
+		}
+	}
+	return ""
 }
 
 // stopServer closes s the way a crash-free shutdown does: gossip leaves, the
@@ -303,13 +358,13 @@ func (fc *faultCluster) leader() *faultServer {
 func (fc *faultCluster) transferLeadership(to *faultServer) *faultServer {
 	fc.t.Helper()
 	old := fc.leader()
-	var f raft.Future
-	if to != nil {
-		f = old.cluster().raft.raft.LeadershipTransferToServer(raft.ServerID(to.id), raft.ServerAddress(to.raftAddr))
-	} else {
-		f = old.cluster().raft.raft.LeadershipTransfer()
-	}
-	if err := f.Error(); err != nil {
+	err := transferWithRetry(faultTransferAttempts, func() error {
+		if to != nil {
+			return old.cluster().raft.raft.LeadershipTransferToServer(raft.ServerID(to.id), raft.ServerAddress(to.raftAddr)).Error()
+		}
+		return old.cluster().raft.raft.LeadershipTransfer().Error()
+	}, func() bool { return fc.leader() != old }, fc.t.Logf)
+	if err != nil {
 		fc.t.Fatalf("leadership transfer from %s: %v", old.id, err)
 	}
 	deadline := time.Now().Add(faultWait)
@@ -321,6 +376,47 @@ func (fc *faultCluster) transferLeadership(to *faultServer) *faultServer {
 	}
 	fc.t.Fatalf("leadership never left %s", old.id)
 	return nil
+}
+
+// faultTransferAttempts bounds transferWithRetry, so a transfer that never
+// works still fails the test.
+const faultTransferAttempts = 3
+
+// transferWithRetry runs a leadership transfer, retrying what a loaded
+// machine causes, not what a bug would. With 250 ms raft timers in these
+// tests (main_test.go):
+//   - "leadership transfer timeout": the target did not take over within one
+//     election timeout (7 of 160 stress runs failed that way); the old leader
+//     keeps leading, so trying again is safe;
+//   - ErrNotLeader: leadership moved between reading the leader and asking it
+//     to transfer (3 of 80 stress runs);
+//   - ErrLeadershipTransferInProgress right after a timeout: raft reports it
+//     for a moment after one (its own comment in raft.go says so).
+//
+// Any other error fails at once. moved reports whether leadership already
+// left the old leader; then the transfer's purpose is met and nothing is
+// retried.
+func transferWithRetry(attempts int, transfer func() error, moved func() bool, logf func(string, ...any)) error {
+	var err error
+	for attempt := 1; attempt <= attempts; attempt++ {
+		if err = transfer(); err == nil {
+			return nil
+		}
+		retryable := err.Error() == "leadership transfer timeout" ||
+			errors.Is(err, raft.ErrNotLeader) ||
+			(attempt > 1 && errors.Is(err, raft.ErrLeadershipTransferInProgress))
+		if !retryable {
+			return err
+		}
+		if moved() {
+			return nil
+		}
+		if attempt < attempts {
+			logf("leadership transfer attempt %d of %d: %v; retrying", attempt, attempts, err)
+			time.Sleep(50 * time.Millisecond)
+		}
+	}
+	return err
 }
 
 // settle waits until every live server has applied the same FSM log prefix

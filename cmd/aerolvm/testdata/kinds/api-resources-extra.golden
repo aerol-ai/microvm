@@ -1,0 +1,5 @@
+exit 2
+--- stdout
+--- stderr
+aerolvm api-resources: unexpected argument "sb"
+run `aerolvm api-resources --help` for usage

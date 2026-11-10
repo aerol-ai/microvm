@@ -1,0 +1,6 @@
+exit 0
+--- stdout
+snapshot/snap-a
+snapshot/snap-b
+snapshot/snap-c
+--- stderr

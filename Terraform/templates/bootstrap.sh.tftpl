@@ -4,7 +4,8 @@
 #
 # Variables expected:
 #   node_name, role, is_seed (bool),
-#   pat_token, domain, cloudflare_api_token,
+#   pat_token (empty for a one-line worker or ingress joiner), domain,
+#   cloudflare_api_token,
 #   with_firecracker (bool), with_gvisor (bool), with_isolate (bool), ingress_proxy_routing (bool), with_nvidia_gpu (bool), with_amd_gpu (bool),
 #   idle_timeout_min (number; 0 disables),
 #   pat_scope ("any" | "host"), l4_proxy_protocol (bool),
@@ -55,6 +56,12 @@ set -euxo pipefail
 exec > >(tee -a /var/log/aerolvm-bootstrap.log) 2>&1
 
 echo "[bootstrap] node=${node_name} role=${role} seed=${is_seed}"
+%{ if blank ~}
+# A blank node (Terraform nodes[].blank): plain Ubuntu with nothing
+# installed, so a test can join it later with the one-line installer.
+echo "[bootstrap] blank node: nothing installed"
+exit 0
+%{ endif ~}
 
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -y
@@ -76,6 +83,82 @@ curl_download() {
     "$url" "$@"
 }
 
+%{ if download_mirror != "" ~}
+# download_mirror is set: every download that has a copy on the AerolVM
+# download mirror falls back to it. GitHub's release downloads have answered
+# 504 for hours while its status page stayed green (2026-11-08 and -09), and
+# then one GitHub-only download stopped this script on a node. The original
+# source is tried first with a few quick retries; the mirror copy then gets
+# the full retry budget. A URL with no mirror copy (a presigned bucket URL,
+# an operator's own server, the Firecracker CI kernel) keeps the old
+# behaviour. Unset (the default), none of this is rendered, so the script is
+# byte for byte what it was and no existing node is replaced
+# (user_data_replace_on_change).
+curl_retry() {
+  local tries="$1" url="$2"
+  shift 2
+  curl -fsSL \
+    --retry "$tries" \
+    --retry-delay 5 \
+    --retry-all-errors \
+    --retry-max-time 900 \
+    --retry-connrefused \
+    --connect-timeout 20 \
+    --max-time 300 \
+    --speed-limit 1024 \
+    --speed-time 30 \
+    "$url" "$@"
+}
+
+# mirror_path_for prints where the mirror keeps the file a URL names, or
+# nothing when it keeps no copy. Same layout as install.sh's
+# release_mirror_path and download_pins: aerolvm/<tag>/<file> for AerolVM
+# releases (aerolvm/latest/<file> until latest.txt names the tag) and
+# deps/<project>/<version>/<file> for pinned third-party files.
+mirror_path_for() {
+  local u="$1"
+  case "$u" in
+    https://aerolvm.aerol.ai|https://aerolvm.aerol.ai/) echo "aerolvm/latest/install.sh" ;;
+    https://github.com/aerol-ai/microvm/releases/latest/download/*) echo "aerolvm/latest/$${u##*/}" ;;
+    https://github.com/aerol-ai/microvm/releases/download/*/*)
+      u="$${u#https://github.com/aerol-ai/microvm/releases/download/}"
+      echo "aerolvm/$${u%%/*}/$${u#*/}" ;;
+    https://github.com/firecracker-microvm/firecracker/releases/download/*/*)
+      u="$${u#https://github.com/firecracker-microvm/firecracker/releases/download/}"
+      echo "deps/firecracker/$${u%%/*}/$${u#*/}" ;;
+    https://github.com/containernetworking/plugins/releases/download/*/*)
+      u="$${u#https://github.com/containernetworking/plugins/releases/download/}"
+      echo "deps/cni-plugins/$${u%%/*}/$${u#*/}" ;;
+    https://github.com/moby/buildkit/releases/download/*/*)
+      u="$${u#https://github.com/moby/buildkit/releases/download/}"
+      echo "deps/buildkit/$${u%%/*}/$${u#*/}" ;;
+  esac
+}
+
+curl_download() {
+  local url="$1" path tag
+  shift
+  path="$(mirror_path_for "$url")"
+  if [ -z "$path" ]; then
+    curl_retry 60 "$url" "$@"
+    return
+  fi
+  if curl_retry 3 "$url" "$@"; then
+    return 0
+  fi
+  echo "[bootstrap] $url failed; trying the download mirror" >&2
+  case "$path" in
+    aerolvm/latest/*)
+      tag="$(curl_retry 10 '${download_mirror}/aerolvm/latest.txt' | tr -d '[:space:]')" || tag=""
+      case "$tag" in
+        v[0-9]*) path="aerolvm/$tag/$${path#aerolvm/latest/}" ;;
+        *) echo "[bootstrap] the download mirror names no latest release" >&2; return 1 ;;
+      esac
+      ;;
+  esac
+  curl_retry 60 '${download_mirror}'"/$path" "$@"
+}
+%{ endif ~}
 %{ if aocr_enabled && aocr_mirror_host != "" ~}
 ###############################################################################
 # 0. Docker Hub mirror (AOCR) — day-0 daemon.json
@@ -125,7 +208,10 @@ fi
 curl_download '${install_script_url}' -o /tmp/install.sh
 chmod +x /tmp/install.sh
 
-INSTALL_ARGS=(--pat-token '${pat_token}' --node-name '${node_name}')
+INSTALL_ARGS=(--node-name '${node_name}')
+%{ if pat_token != "" ~}
+INSTALL_ARGS+=(--pat-token '${pat_token}')
+%{ endif ~}
 if [ -n '${domain}' ]; then
   INSTALL_ARGS+=(
     --domain '${domain}'
@@ -253,9 +339,50 @@ INSTALL_ARGS+=(--key-custody wrapped --secret-provider-env /tmp/aerolvm-secret-p
 # server key of its own (with wrapped custody, a wrap through the key store).
 INSTALL_ARGS+=(--no-start)
 %{ endif ~}
+%{ if one_line_join ~}
+# One-line join (Terraform/join.tf): the install runs below as the one line
+# `install.sh ... init|join`. What this node's sandboxd needs from its first
+# cluster-mode boot (sandboxd_env, such as the node-cert TTL the join service
+# signs with) goes into cluster.env first; sandboxd init and join keep the
+# lines they do not own.
+sudo install -d -m 0755 /etc/sandboxd
+sudo tee /etc/sandboxd/cluster.env >/dev/null <<'EOF'
+# Managed by Terraform bootstrap: sandboxd_env, written before sandboxd init / join.
+%{ for k, v in sandboxd_env ~}
+${k}=${v}
+%{ endfor ~}
+EOF
+sudo chmod 0600 /etc/sandboxd/cluster.env
+%{ else ~}
 sudo /tmp/install.sh "$${INSTALL_ARGS[@]}"
+%{ endif ~}
 
 %{ if is_seed ~}
+%{ if one_line_join ~}
+###############################################################################
+# 2a. Seed, one-line join: install.sh ... init. sandboxd init makes the CA,
+# the gossip key and the server key, starts Raft, and registers Terraform's
+# token per role: worker and ingress never expire (scale-out weeks later
+# still joins), the server token lasts 24h. No S3 hand-off and no CSR loop:
+# the servers sign every joiner's cert. set +x keeps the tokens out of the
+# bootstrap log.
+###############################################################################
+set +x
+INIT_ARGS=(
+  --role '${role}'
+  --node-id '${node_name}'
+  --ingress-advertise-host '${domain}'
+  --token 'worker=${join_token_worker}:0'
+  --token 'ingress=${join_token_ingress}:0'
+  --token 'server=${join_token_server}:24h'
+)
+%{ if key_custody == "wrapped" ~}
+INIT_ARGS+=(--key-custody wrapped)
+%{ endif ~}
+curl -fsSL '${install_script_url}' | sudo bash -s -- "$${INSTALL_ARGS[@]}" init "$${INIT_ARGS[@]}"
+set -x
+echo "[bootstrap] seed started the cluster with sandboxd init"
+%{ else ~}
 ###############################################################################
 # 2a. Seed: cluster-init.sh
 #
@@ -375,6 +502,7 @@ sudo systemd-run --unit=aerolvm-csr-signer --description='AerolVM CSR signing re
   "$(( $(date +%s) + ${seed_wait_max_seconds} ))" \
   || echo "[bootstrap] WARNING: could not start the CSR signer; joiners will not get certs" >&2
 echo "[bootstrap] seed CSR signer started (deadline ${seed_wait_max_seconds}s)"
+%{ endif ~}
 
 %{ if audit_receiver_endpoint != "" && audit_receiver_url != "" ~}
 ###############################################################################
@@ -431,6 +559,64 @@ sudo systemctl enable --now aerol-audit-receiver.service \
   || echo "[bootstrap] WARNING: audit receiver failed to start" >&2
 echo "[bootstrap] audit receiver started on :${audit_receiver_port}"
 %{ endif ~}
+%{ else ~}
+%{ if one_line_join ~}
+###############################################################################
+# 2b. Joiner, one-line join: wait until the seed's join port answers for this
+# node's token (the seed registers it at the end of sandboxd init), then run
+# install.sh ... join. A join is safe to run again (the same key gets the
+# same answer), so a failed attempt is retried. set +x keeps the token out
+# of the bootstrap log.
+###############################################################################
+set +x
+JOIN_TOKEN='${join_token}'
+# wait_for_join_port waits while the seed's join port does not answer. Once
+# it answers, a refused token gets JOIN_REFUSED_GRACE seconds (the seed
+# registers the module's tokens a little after the port opens), then the
+# wait stops and says what to do, as kubeadm's discovery does. The port
+# says "invalid" for a token that is unknown, expired or revoked alike, and
+# the module's server token lasts 24h, so a server added later needs a
+# fresh token (node_join_tokens), not 30 minutes of waiting on this one.
+wait_for_join_port() {
+  local grace="$${JOIN_REFUSED_GRACE:-300}" poll="$${JOIN_POLL_SECONDS:-10}"
+  local deadline=$(( $(date +%s) + ${seed_wait_max_seconds} )) refused_since="" code now
+  while :; do
+    code=$(curl -sk -o /dev/null -w '%%{http_code}' --max-time 5 "https://${seed_private_ip}:7003/v1/join/cluster-info?token_id=$${JOIN_TOKEN%%.*}" 2>/dev/null) || true
+    now=$(date +%s)
+    case "$code" in
+      200) return 0 ;;
+      "" | 000) refused_since="" ;;
+      *) [ -n "$refused_since" ] || refused_since=$now ;;
+    esac
+    if [ -n "$refused_since" ] && [ $(( now - refused_since )) -ge "$grace" ]; then
+      echo "[bootstrap] the cluster's join port refused this node's join token for $(( now - refused_since ))s (HTTP $code): it is unknown, expired or revoked. The module's server token lasts 24h. Make a fresh token on a server with: sudo sandboxd join-command --role ${join_role} --ttl 2h --json, set node_join_tokens[\"${node_name}\"] to its \"token\", and apply again." >&2
+      return 1
+    fi
+    if [ "$now" -ge "$deadline" ]; then
+      echo "[bootstrap] timed out waiting for the seed's join port (last answer: HTTP $${code:-none})" >&2
+      return 1
+    fi
+    echo "[bootstrap] waiting for the seed's join port (HTTP $${code:-none})..."
+    sleep "$poll"
+  done
+}
+wait_for_join_port || exit 1
+joined=0
+for attempt in 1 2 3; do
+  if curl -fsSL '${install_script_url}' | sudo bash -s -- "$${INSTALL_ARGS[@]}" join 'https://${seed_private_ip}:7003' \
+       --token "$JOIN_TOKEN" --node-id '${node_name}' --role '${role}' --ingress-advertise-host '${domain}'; then
+    joined=1
+    break
+  fi
+  echo "[bootstrap] join attempt $attempt failed; retrying" >&2
+  sleep 20
+done
+set -x
+if [ "$joined" != 1 ]; then
+  echo "[bootstrap] could not join the cluster" >&2
+  exit 1
+fi
+echo "[bootstrap] joined the cluster with sandboxd join"
 %{ else ~}
 ###############################################################################
 # 2b. Joiner: cluster-join.sh
@@ -569,6 +755,7 @@ else
   sudo /tmp/cluster-join.sh "$${JOIN_ARGS[@]}" --signed-cert /tmp/node.crt
   echo "[bootstrap] joiner installed a seed-signed cert and joined"
 fi
+%{ endif ~}
 %{ endif ~}
 
 ###############################################################################
@@ -1137,7 +1324,22 @@ if [ "${container_engine}" = "containerd" ]; then
     cni_url="https://github.com/containernetworking/plugins/releases/download/$${cni_ver}/cni-plugins-linux-$${cni_arch}-$${cni_ver}.tgz"
     echo "[bootstrap] installing CNI plugins $${cni_ver} ($${cni_arch}) to $${cni_dir}"
     sudo mkdir -p "$${cni_dir}"
+%{~ if download_mirror != "" }
+    # Through curl_download, so GitHub failing falls back to the mirror, and
+    # checked against install.sh's pins (CNI_PLUGINS_SHA256_*) wherever it came
+    # from. safety/bootstrap_render_test.go keeps the two in step.
+    case "$${cni_arch}" in
+      amd64) cni_sha=77baa2f669980a82255ffa2f2717de823992480271ee778aa51a9c60ae89ff9b ;;
+      arm64) cni_sha=c2a292714d0fad98a3491ae43df8ad58354b3c0bdf5d5a3e281777967c70fcff ;;
+    esac
+    cni_tmp="$(mktemp -d)"
+    curl_download "$${cni_url}" -o "$${cni_tmp}/cni-plugins.tgz"
+    echo "$${cni_sha}  $${cni_tmp}/cni-plugins.tgz" | sha256sum -c -
+    sudo tar -xz -C "$${cni_dir}" -f "$${cni_tmp}/cni-plugins.tgz"
+    rm -rf "$${cni_tmp}"
+%{~ else }
     curl -fsSL "$${cni_url}" | sudo tar -xz -C "$${cni_dir}"
+%{~ endif }
     for p in bridge host-local loopback; do
       if [ ! -x "$${cni_dir}/$${p}" ]; then
         echo "[bootstrap] expected $${cni_dir}/$${p} after CNI extract" >&2
@@ -1162,7 +1364,19 @@ if [ "${container_engine}" = "containerd" ]; then
     bk_url="https://github.com/moby/buildkit/releases/download/$${bk_ver}/buildkit-$${bk_ver}.linux-$${bk_arch}.tar.gz"
     echo "[bootstrap] installing buildkit $${bk_ver} ($${bk_arch})"
     bk_tmp="$(mktemp -d)"
+%{~ if download_mirror != "" }
+    # Same as the CNI plugins: mirror fallback, install.sh's pins
+    # (BUILDKIT_SHA256_*).
+    case "$${bk_arch}" in
+      amd64) bk_sha=24d73e4456ebbe6dbb53779e362b2164a000e9636cd9ca8bd90f742fb024b731 ;;
+      arm64) bk_sha=77384e2726c93d7c2bd7b745c079e1953f92683570203c7bfca361965db2f0c2 ;;
+    esac
+    curl_download "$${bk_url}" -o "$${bk_tmp}/buildkit.tar.gz"
+    echo "$${bk_sha}  $${bk_tmp}/buildkit.tar.gz" | sha256sum -c -
+    sudo tar -xz -C "$${bk_tmp}" -f "$${bk_tmp}/buildkit.tar.gz"
+%{~ else }
     curl -fsSL "$${bk_url}" | sudo tar -xz -C "$${bk_tmp}"
+%{~ endif }
     sudo install -m 0755 "$${bk_tmp}/bin/buildkitd" /usr/local/bin/buildkitd
     sudo install -m 0755 "$${bk_tmp}/bin/buildctl" /usr/local/bin/buildctl
     rm -rf "$${bk_tmp}"

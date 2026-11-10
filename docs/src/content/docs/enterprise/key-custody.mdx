@@ -180,7 +180,7 @@ SB_SECRET_PROVIDER_STRICT_BOOT=true
 Pointing AerolVM at a key store protects the failover copies. To keep the **server key** in your key store too, wrap it.
 
 - **A new server:** `install.sh --key-custody wrapped --secret-provider-env /path/to/key-store.env`. The first start makes a key and writes only the wrapped copy.
-- **A new cluster:** `cluster-init.sh --key-custody wrapped` on the first server. It puts only the wrapped key in the bundle other servers join with.
+- **A new cluster:** `sandboxd init --key-custody wrapped` on the first server (with the installer: `... init --role server --key-custody wrapped`). Joining nodes get only the wrapped key, and open it through their own access to your key store. Wrapped custody is also what lets you make never-expiring join tokens (`aerolvm join-command --ttl 0`) in enterprise mode: a leaked token then hands out no plain key.
 - **An existing server or cluster:**
   1. On one server: `sandboxd key wrap`. It writes `credential_encryption.key.wrapped` and reads it back through your key store.
   2. Copy that file to every server. It is safe to copy: it is encrypted.

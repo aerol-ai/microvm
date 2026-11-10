@@ -12,9 +12,14 @@ export interface NavigationLink extends NavigationItem {
   description?: string
   external?: boolean
   exact?: boolean
-  // Anchors inside this page, listed under it in a list that starts closed.
-  // They are not pages, so pagination and Explore More skip them.
+  // Links listed under this one, in a list that starts closed (the + button).
+  // Anchors inside this page are not pages, so pagination and Explore More
+  // skip them. Child pages (no "#") join both, right after this link.
   children?: NavigationLink[]
+  // A child page that is reference rather than a step of its parent's guide.
+  // It is listed under a "Reference" heading after the guide's pages, and
+  // pagination and Explore More skip it, so "Next" stays on the guide.
+  reference?: boolean
 }
 
 export interface NavigationGroup extends NavigationItem {
@@ -40,11 +45,22 @@ function groupHomePageLink(entry: NavigationGroup): NavigationLink[] {
   return [{ type: 'link', href: entry.homePageHref, label: entry.label }]
 }
 
-function flattenEntries(entries: NavigationEntry[]): NavigationLink[] {
+// A child without "#" is a page of its own (the cluster guide's pages), so it
+// joins pagination, the section label and Explore More right after its
+// parent. A child with "#" is a section of its parent's page (SSO's
+// providers), so those skip it. Reference children join only the section
+// label (withReference), so a reader landing on one still sees where it sits.
+function childPages(entry: NavigationLink, withReference: boolean): NavigationLink[] {
+  return (entry.children || []).filter(
+    child => !child.href.includes('#') && (withReference || !child.reference)
+  )
+}
+
+function flattenEntries(entries: NavigationEntry[], withReference = false): NavigationLink[] {
   return entries.flatMap(entry =>
     entry.type === 'link'
-      ? [entry]
-      : [...groupHomePageLink(entry), ...flattenEntries(entry.entries || [])]
+      ? [entry, ...childPages(entry, withReference)]
+      : [...groupHomePageLink(entry), ...flattenEntries(entry.entries || [], withReference)]
   )
 }
 
@@ -88,7 +104,7 @@ export function getSectionLabel(
   currentPath: string
 ): string | undefined {
   return sidebarConfig.find(group =>
-    flattenEntries(group.entries || []).some(link => comparePaths(link.href, currentPath))
+    flattenEntries(group.entries || [], true).some(link => comparePaths(link.href, currentPath))
   )?.label
 }
 

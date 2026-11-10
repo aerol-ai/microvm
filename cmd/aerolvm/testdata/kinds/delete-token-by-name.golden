@@ -1,0 +1,5 @@
+exit 2
+--- stdout
+--- stderr
+aerolvm delete: "ci" is not a token id: an id looks like tok_ followed by 12 letters or digits
+run `aerolvm delete --help` for usage

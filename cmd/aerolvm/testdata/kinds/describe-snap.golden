@@ -1,0 +1,13 @@
+exit 0
+--- stdout
+Name:            snap-a
+Source sandbox:  sb-0000000000000001
+Created:         2026-11-04T12:00:00Z (3d ago)
+Image:           snapshots/snap-a
+Image ID:        sha256:aaa
+Distribution:    local
+Digest:          sha256:ddd
+Registry ref:    -
+Verified:        2026-11-07T11:00:00Z (60m ago)
+Entrypoint:      python app.py
+--- stderr

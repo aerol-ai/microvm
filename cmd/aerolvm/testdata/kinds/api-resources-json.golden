@@ -1,0 +1,73 @@
+exit 0
+--- stdout
+{
+  "resources": [
+    {
+      "name": "jointokens",
+      "singular_name": "jointoken",
+      "short_names": [
+        "jt",
+        "join-token",
+        "join-tokens"
+      ],
+      "kind": "JoinToken",
+      "verbs": [
+        "get",
+        "delete"
+      ]
+    },
+    {
+      "name": "nodes",
+      "singular_name": "node",
+      "short_names": [
+        "no"
+      ],
+      "kind": "Node",
+      "verbs": [
+        "get",
+        "describe",
+        "delete"
+      ]
+    },
+    {
+      "name": "sandboxes",
+      "singular_name": "sandbox",
+      "short_names": [
+        "sb"
+      ],
+      "kind": "Sandbox",
+      "verbs": [
+        "get",
+        "describe",
+        "delete"
+      ]
+    },
+    {
+      "name": "snapshots",
+      "singular_name": "snapshot",
+      "short_names": [
+        "snap"
+      ],
+      "kind": "Snapshot",
+      "verbs": [
+        "get",
+        "describe",
+        "delete"
+      ]
+    },
+    {
+      "name": "tokens",
+      "singular_name": "token",
+      "short_names": [
+        "tok"
+      ],
+      "kind": "Token",
+      "verbs": [
+        "get",
+        "describe",
+        "delete"
+      ]
+    }
+  ]
+}
+--- stderr

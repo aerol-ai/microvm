@@ -283,21 +283,21 @@ func TestEnsureOnDemandTLSValidationAndDisabled(t *testing.T) {
 func TestEnsureOnDemandTLSFailures(t *testing.T) {
 	ctx := context.Background()
 
-	t.Run("put-fails", func(t *testing.T) {
+	t.Run("on-demand-write-fails", func(t *testing.T) {
 		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusInternalServerError)
 		}))
 		defer ts.Close()
 		c := &Client{enabled: true, baseURL: ts.URL, httpClient: ts.Client()}
 		if err := c.EnsureOnDemandTLS(ctx, "http://ask", 1, time.Minute); err == nil {
-			t.Fatal("expected PUT failure")
+			t.Fatal("expected the on_demand write to fail")
 		}
 	})
 
 	t.Run("policy-post-fails", func(t *testing.T) {
 		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			switch {
-			case r.Method == http.MethodPut:
+			case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/on_demand"):
 				w.WriteHeader(http.StatusOK)
 			case r.Method == http.MethodGet:
 				w.WriteHeader(http.StatusOK)
@@ -319,7 +319,7 @@ func TestEnsureOnDemandTLSFailures(t *testing.T) {
 		var posted bool
 		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			switch {
-			case r.Method == http.MethodPut:
+			case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/on_demand"):
 				w.WriteHeader(http.StatusOK)
 			case r.Method == http.MethodGet:
 				w.WriteHeader(http.StatusOK)
@@ -652,7 +652,7 @@ func TestEnsureOnDemandTLSInstallsPolicyWhenAbsent(t *testing.T) {
 	var posted bool
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
-		case r.Method == http.MethodPut && strings.HasSuffix(r.URL.Path, "/on_demand"):
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/on_demand"):
 			w.WriteHeader(http.StatusOK)
 		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/policies"):
 			w.WriteHeader(http.StatusOK)
@@ -795,7 +795,7 @@ func TestEnsureOnDemandTLSSkipsPolicyWhenPresent(t *testing.T) {
 	var posted bool
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
-		case r.Method == http.MethodPut && strings.HasSuffix(r.URL.Path, "/on_demand"):
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/on_demand"):
 			w.WriteHeader(http.StatusOK)
 		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/policies"):
 			w.WriteHeader(http.StatusOK)
@@ -892,7 +892,7 @@ func TestEnsureLayer4PutLayer4AppError(t *testing.T) {
 func TestEnsureOnDemandTLSPolicyPostError(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
-		case r.Method == http.MethodPut && strings.HasSuffix(r.URL.Path, "/on_demand"):
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/on_demand"):
 			w.WriteHeader(http.StatusOK)
 		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/policies"):
 			w.WriteHeader(http.StatusOK)

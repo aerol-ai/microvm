@@ -31,7 +31,7 @@ const (
 // it once per release that adds such a feature, and give the feature its
 // own constant naming the version that introduced it.
 const (
-	fsmOpsVersion              = 11
+	fsmOpsVersion              = 15
 	egressProfileFSMOpsVersion = 1 // opPutEgressProfile, opDeleteEgressProfile
 	// auditCallerFSMOpsVersion: audit records carry a hash-covered caller
 	// field (AuditCallerWritesAllowed).
@@ -69,7 +69,20 @@ const (
 // fsm_team_quotas.go); 10 is the delete_with_sandbox volume reclaim ledger
 // (volumeReclaimFSMOpsVersion in fsm_volume_reclaims.go); 11 is the
 // deleted-lifecycle fence on opPlace (deletedLifecycleFenceFSMOpsVersion in
-// deleted_lifecycle.go). Versions 6 to 8 are the gates in the block above.
+// deleted_lifecycle.go); 12 is the node deny records (nodeDenyFSMOpsVersion
+// in fsm_node_deny.go); 13 is the join tokens, admitted keys and tombstones
+// (joinFSMOpsVersion in fsm_join.go); 14 is the active cluster version and
+// the rollout record (rolloutFSMOpsVersion in fsm_rollout.go); 15 is peer
+// calls by node cert alone, which lets a join leave the PAT out
+// (peerCertAuthFSMOpsVersion in peer_cert_auth.go, no FSM op). Versions 6
+// to 8 are the gates in the block above.
+
+// FSMOpsVersion returns fsmOpsVersion, so `sandboxd version` can print it
+// without a cluster: an operator compares it across nodes before and during
+// a rolling upgrade, when gossip may not be up yet. A function, not an
+// exported constant, so code outside this package cannot gate on it at
+// compile time and skip the per-member checks.
+func FSMOpsVersion() int { return fsmOpsVersion }
 
 var (
 	// ErrEgressProfileInUse is a delete of a profile placements reference.

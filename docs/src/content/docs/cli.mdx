@@ -1,9 +1,9 @@
 ---
 title: aerolvm CLI
-description: Create sandboxes, run commands, copy files and share ports from your terminal. Scripts and AI agents can use it too.
+description: Create sandboxes, run commands, copy files and share ports from your terminal, and run a cluster's nodes and upgrades. Scripts and AI agents can use it too.
 ---
 
-import { Tabs, TabItem } from '@astrojs/starlight/components';
+import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
 
 `aerolvm` lets you work with sandboxes from your terminal. You can create a sandbox, run commands in it, copy files in and out, and share a web server from it. It talks to the same server as the SDKs, so it works with a local install, one server or a cluster.
 
@@ -21,6 +21,8 @@ Other ways to install:
 
 - **With Go:** `go install github.com/aerol-ai/microvm/cmd/aerolvm@latest`
 - **By hand, including on Windows:** download the file for your system from [GitHub releases](https://github.com/aerol-ai/microvm/releases). Check it against `checksums.txt`, then put it in a folder on your `PATH`.
+- **As a kubectl plugin, with Krew:** `kubectl krew install --manifest-url=https://github.com/aerol-ai/microvm/releases/latest/download/aerolvm.krew.yaml`. Then `kubectl aerolvm get nodes` works like `aerolvm get nodes`. Any copy of the program named `kubectl-aerolvm` on your `PATH` works the same way.
+- **With Homebrew:** each release also carries a Homebrew formula, `aerolvm.rb`. The public tap is not up yet, so use one of the ways above for now.
 
 ## Sign in
 
@@ -120,6 +122,23 @@ More in [Shell details](#shell-details).
 
 You can name a sandbox by its name or by its ID (`sb-` and 16 hex digits). `--background` prints the session ID that `logs` needs.
 
+### kubectl-style commands
+
+If you know `kubectl`, the same words work. `get`, `describe` and `delete` take a kind first:
+
+| To do this | Run |
+|---|---|
+| List sandboxes as a table | `aerolvm get sandboxes` (or `aerolvm get sb`) |
+| Only sandboxes with a tag | `aerolvm get sb -l app=web` |
+| One sandbox as YAML | `aerolvm get sb build-box -o yaml` |
+| See a sandbox in detail | `aerolvm describe sb build-box` |
+| Delete a sandbox | `aerolvm delete sb build-box` |
+| Snapshots and API tokens | `aerolvm get snapshots`, `aerolvm get tokens` |
+| Open a shell, like `kubectl exec -it` | `aerolvm exec -it build-box` |
+| List the kinds and their short names | `aerolvm api-resources` |
+
+`-o` takes `wide`, `json`, `yaml` or `name`. The old forms keep working with the same output: `aerolvm get build-box` still shows that sandbox, and `aerolvm list` and `aerolvm destroy` are unchanged. A sandbox named like a kind (say, `nodes`) is reached with `aerolvm get sb nodes`. `delete` always needs the kind, so a typo never deletes a sandbox.
+
 ## Limit what a sandbox can reach
 
 A new sandbox can reach the internet. To allow only some sites, list them when you create it:
@@ -129,6 +148,121 @@ aerolvm create --name build-box --image python:3.12 --allow-host pypi.org --allo
 ```
 
 Everything else is refused. An entry can be a site name, a `*.` wildcard, `host:port`, or a range of IP addresses such as `10.0.0.0/8`. To turn the internet off completely, use `--block-network` instead. To change the list later, use an SDK. [Allow only some websites](/network-access/#allow-only-some-websites) has the details.
+
+## Run a cluster
+
+These commands manage the machines of a [cluster](/cluster/), not sandboxes. They need an admin login, such as the cluster's admin token. They run from your own computer, over the API, with no SSH and no copy of the repository.
+
+### See the nodes
+
+```bash
+aerolvm get nodes
+```
+
+```
+NAME         ROLE     STATUS                     VERSION   SANDBOXES
+srv-1        server   Ready,Leader               v0.7.0    0
+srv-2        server   Ready                      v0.7.0    0
+wrk-1        worker   Ready                      v0.7.0    212
+wrk-2        worker   Ready,SchedulingDisabled   v0.7.0    9
+```
+
+`Ready` means the node is alive. `NotReady` means the cluster cannot reach it. `SchedulingDisabled` means it is cordoned: no new sandboxes land on it. `Leader` marks the server that leads the cluster.
+
+| To do this | Run |
+|---|---|
+| More columns: CPU, memory, zone, address | `aerolvm get nodes -o wide` |
+| One node in detail | `aerolvm describe node wrk-1` |
+| CPU and memory each node has handed out | `aerolvm top nodes` |
+| The leader, the members and the cluster version | `aerolvm cluster-info` |
+
+### Take a node out of service
+
+| To do this | Run |
+|---|---|
+| Stop new sandboxes landing on it | `aerolvm cordon wrk-2` |
+| Let them land on it again | `aerolvm uncordon wrk-2` |
+| Cordon it and wait until it runs no sandboxes | `aerolvm drain wrk-2 --timeout 30m` |
+| The same, and destroy what is left | `aerolvm drain wrk-2 --delete-sandboxes` |
+| Remove it from the cluster | `aerolvm delete node wrk-2` |
+
+`drain` waits 10 minutes by default and leaves the node cordoned either way. `--migrate` moves its WASM sandboxes to another worker first. `delete node` works for every role. A deleted node is refused by every other node until it joins again with a new token, so run `sudo sandboxd reset --yes` on that machine before you reuse it. Deleting a node that still owns sandboxes needs `--force`. Each of these is safe to run again.
+
+### Add a node
+
+```bash
+aerolvm join-command
+```
+
+This makes a join token and prints one join command. On a cluster with a domain, it looks like this:
+
+```
+curl -fsSL https://aerolvm.aerol.ai | sudo bash -s -- --domain cluster.example.com --dns-provider cloudflare --dns-api-token "$CLOUDFLARE_API_TOKEN" join https://10.0.1.5:7003 --token abc123.0f1e2d3c4b5a69780f1e2d3c4b5a6978 --ca-cert-hash sha256:9a1c…
+```
+
+On the new machine, set your Cloudflare API token with `export CLOUDFLARE_API_TOKEN=...`. Then paste the join command, as it is. It installs AerolVM with the cluster's domain, checks the cluster's identity, and joins. The command reads the Cloudflare token from the machine, so the printed command never holds it. On a cluster without a domain, the command starts at `join`. The token decides the role:
+
+| Flag | What it does |
+|---|---|
+| `--role worker` | The default. `ingress`, `server` and `mixed` work too. A mixed node takes a server token, and the command adds `--role mixed`. |
+| `--ttl 2h` | How long the token works. The default is 2 hours; a server token lasts at most 24 hours. `--ttl 0` never expires, and is only for worker and ingress tokens. |
+| `--reusable` | Let many machines join with the same token. Without it, a token works for one machine. |
+
+A **server** token is made only when a server or mixed node asks. If your API URL leads to an ingress node, make server tokens on a server or mixed node instead, with the same flags: `sudo sandboxd join-command --role server`. It prints the same join command, or the token with `--json`.
+
+List and revoke tokens:
+
+```bash
+aerolvm get jointokens
+aerolvm delete jointoken abc123
+```
+
+[Build a cluster](/cluster/create/) walks through it from the first machine. [Add and remove nodes](/cluster/nodes/) covers every role.
+
+<Aside type="caution" title="Treat a join token like the admin token">
+A join token can make a node. Every node gets the key that opens stored secrets, unless [key custody](/enterprise/key-custody/) is wrapped. A server or mixed node also gets the admin token, and the key that signs every node's certificate. A worker or ingress node gets only a fingerprint of the admin token. Keep join tokens as private as the admin token. Use short lifetimes. Keep `--ttl 0` tokens for worker and ingress nodes that an autoscaler adds, and cancel a token you no longer need. In [enterprise mode](/enterprise/enterprise-mode/), a never-expiring token also needs wrapped key custody. See [Keep it safe](/cluster/security/).
+</Aside>
+
+### Upgrade the cluster
+
+```bash
+aerolvm upgrade plan v0.7.0
+aerolvm upgrade apply v0.7.0 --wait
+```
+
+`plan` changes nothing. It shows each node's version, whether the jump is allowed, the order the nodes go in, and what restarts. `apply` checks every file against the release's checksums, then hands the upgrade to the cluster. The servers go one at a time with the leader last, then the ingress nodes, then the workers in batches. Each node keeps its old files and goes back to them if the new ones do not come up. Without `--wait` it returns at once, and the upgrade goes on without you.
+
+| To do this | Run |
+|---|---|
+| Follow it, or see where it stands | `aerolvm upgrade status` |
+| Upgrade 2 workers, then pause | `aerolvm upgrade apply v0.7.0 --pause-after 2` |
+| Go on after a pause | `aerolvm upgrade resume` |
+| Finish the nodes in progress and start no more | `aerolvm upgrade stop` |
+| Put every node back on the old version | `aerolvm upgrade rollback --wait` |
+| Keep new features off until you say so | `aerolvm upgrade apply v0.7.0 --hold`, later `aerolvm upgrade finalize` |
+
+**No internet on the nodes?** Pull the release into one file on a machine that has internet, carry it over, and upgrade from it:
+
+```bash
+aerolvm release pull v0.7.0 -o aerolvm-v0.7.0.tgz
+aerolvm upgrade apply v0.7.0 --from aerolvm-v0.7.0.tgz --wait
+```
+
+The same commands upgrade a single server, too: `apply` upgrades that one node. [Upgrade](/cluster/upgrade/) says what running sandboxes see during an upgrade, and how to make the first upgrade from a release older than these commands.
+
+### Use more than one cluster
+
+Each login is saved as a context, so you can switch between clusters:
+
+```bash
+aerolvm login https://api.staging.example.com --name staging
+aerolvm login https://api.prod.example.com --name prod
+aerolvm config get-contexts
+aerolvm config use-context staging
+aerolvm get nodes --context prod
+```
+
+`sudo sandboxd init` writes the new cluster's admin login to `/etc/sandboxd/admin-context.json` on its first server. Copy that file to your computer and run `aerolvm config import admin-context.json --use`. It holds the admin token: keep it private.
 
 ## Reference
 

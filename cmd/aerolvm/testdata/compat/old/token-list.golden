@@ -1,0 +1,5 @@
+exit 0
+--- stdout
+ID                NAME  ROLE    TEAM  EXPIRES     CREATED BY
+tok_aaaaaaaaaaaa  ci    runner  ml    2027-01-15  operator
+--- stderr

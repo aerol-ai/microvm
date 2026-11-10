@@ -1,0 +1,17 @@
+exit 0
+--- stdout
+Name:         db
+ID:           sb-0000000000000002
+Status:       started
+Runtime:      docker
+Image:        postgres:17
+CPU:          -
+Memory:       -
+Created:      2026-11-07T07:00:00Z (5h ago)
+Last active:  -
+URL:          -
+Tags:         app=db
+Ports:        -
+Network:      all outbound blocked
+Lifecycle:    -
+--- stderr

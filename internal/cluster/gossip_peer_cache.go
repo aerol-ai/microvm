@@ -1,7 +1,9 @@
 package cluster
 
 import (
+	"cmp"
 	"encoding/json"
+	"hash/fnv"
 	"os"
 	"path/filepath"
 	"slices"
@@ -15,6 +17,20 @@ import (
 // re-initialise a node also forgets the old peers, so a fresh `cluster-init`
 // can never be dragged back into the cluster it was meant to leave.
 const gossipPeerCacheFile = "gossip-peers.json"
+
+// gossipMemberCacheFile remembers a few members that are not control-plane
+// (workers, ingress), beside gossipPeerCacheFile and for the same lifetime.
+// It is a separate file, not more entries in gossip-peers.json, so that file
+// keeps meaning "control-plane peers": a node that loses every server must
+// never overwrite its way back to them with workers, and an older binary
+// reading gossip-peers.json after a downgrade finds the format it wrote.
+const gossipMemberCacheFile = "gossip-members.json"
+
+// maxCachedMemberPeers is how many non-control-plane members a node
+// remembers. Any one that is still up hands a restarted node the whole
+// membership in a single push/pull, so a few are enough; the rest only
+// survive the case where those few went down too.
+const maxCachedMemberPeers = 3
 
 // maxCachedGossipPeers bounds the rejoin fan-out. memberlist.Join dials the
 // list serially and an address whose host is gone costs a full TCP timeout,
@@ -48,6 +64,25 @@ func newGossipPeerCache(dir string) *gossipPeerCache {
 		return nil
 	}
 	return &gossipPeerCache{path: filepath.Join(dir, gossipPeerCacheFile)}
+}
+
+// newGossipMemberCache is the cache for gossipMemberCacheFile. It shares the
+// type, and so the write-only-on-change and never-write-empty rules.
+func newGossipMemberCache(dir string) *gossipPeerCache {
+	if dir == "" {
+		return nil
+	}
+	return &gossipPeerCache{path: filepath.Join(dir, gossipMemberCacheFile)}
+}
+
+// snapshot returns a copy of the remembered list.
+func (c *gossipPeerCache) snapshot() []string {
+	if c == nil {
+		return nil
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]string(nil), c.last...)
 }
 
 // load returns the remembered peers. A missing or unreadable cache is not an
@@ -115,7 +150,15 @@ func (c *gossipPeerCache) remember(peers []string) error {
 // left out — they cannot re-admit anyone to raft, and at fleet scale they
 // would crowd the servers out of the bounded list.
 func liveControlPlanePeerAddrs(nodes []*memberlist.Node, selfNodeID string) []string {
-	var out []string
+	controlPlane, _ := livePeerAddrsByRole(nodes, selfNodeID)
+	return controlPlane
+}
+
+// livePeerAddrsByRole splits the alive peers' gossip addresses into those
+// that can serve the control plane and the rest, in one pass: the refresh
+// loop runs it every tick, and decoding every member's metadata twice would
+// double that cost at fleet size.
+func livePeerAddrsByRole(nodes []*memberlist.Node, selfNodeID string) (controlPlane, others []string) {
 	for _, n := range nodes {
 		if n == nil || n.State != memberlist.StateAlive || len(n.Addr) == 0 {
 			continue
@@ -124,10 +167,61 @@ func liveControlPlanePeerAddrs(nodes []*memberlist.Node, selfNodeID string) []st
 		if m.NodeID == "" || m.NodeID == selfNodeID || n.Name == selfNodeID {
 			continue
 		}
-		if !CanServeControlPlaneRole(m.Role) {
+		if CanServeControlPlaneRole(m.Role) {
+			controlPlane = append(controlPlane, n.Address())
+		} else {
+			others = append(others, n.Address())
+		}
+	}
+	return controlPlane, others
+}
+
+// pickMemberPeers chooses up to maxCachedMemberPeers addresses from alive for
+// the node self. Members already remembered (previous) are kept while they
+// stay alive, so the list, and the file behind it, changes only when a chosen
+// member goes away, not on every tick.
+//
+// The rest are filled by rendezvous hashing on self and the address, not in
+// address order: with address order every node remembered the same lowest
+// few, so after a fleet-wide restart every node's startup sync would push/pull
+// with those same three members. Hashing gives each node its own few, stable
+// for that node, and spreads the syncs across the fleet.
+func pickMemberPeers(self string, alive, previous []string) []string {
+	alive = slices.Clone(alive)
+	slices.Sort(alive)
+	alive = slices.Compact(alive)
+	out := make([]string, 0, maxCachedMemberPeers)
+	for _, a := range alive {
+		if len(out) < maxCachedMemberPeers && slices.Contains(previous, a) {
+			out = append(out, a)
+		}
+	}
+	if len(out) == maxCachedMemberPeers {
+		return out
+	}
+	type ranked struct {
+		addr string
+		rank uint64
+	}
+	candidates := make([]ranked, 0, len(alive))
+	for _, a := range alive {
+		if slices.Contains(out, a) {
 			continue
 		}
-		out = append(out, n.Address())
+		h := fnv.New64a()
+		_, _ = h.Write([]byte(self))
+		_, _ = h.Write([]byte{0})
+		_, _ = h.Write([]byte(a))
+		candidates = append(candidates, ranked{addr: a, rank: h.Sum64()})
+	}
+	// Stable over the address-sorted input, so equal ranks fall back to
+	// address order and the pick never depends on map or input order.
+	slices.SortStableFunc(candidates, func(x, y ranked) int { return cmp.Compare(x.rank, y.rank) })
+	for _, c := range candidates {
+		if len(out) == maxCachedMemberPeers {
+			break
+		}
+		out = append(out, c.addr)
 	}
 	return out
 }

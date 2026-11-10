@@ -1,0 +1,9 @@
+exit 0
+--- stdout
+from: v0.6.12
+op: op-1
+started_at: "2026-11-07T10:00:01Z"
+state: done
+updated_at: "2026-11-07T10:00:05Z"
+version: v0.6.13
+--- stderr

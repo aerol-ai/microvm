@@ -1,0 +1,5 @@
+exit 2
+--- stdout
+--- stderr
+aerolvm delete: name at least one snapshot
+run `aerolvm delete --help` for usage

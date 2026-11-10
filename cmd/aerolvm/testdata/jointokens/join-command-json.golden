@@ -1,0 +1,16 @@
+exit 0
+--- stdout
+{
+  "token": "abc123.0123456789abcdefghijklmnopqrstuv",
+  "id": "abc123",
+  "role": "worker",
+  "reusable": false,
+  "expires_at": "2026-11-07T12:00:00Z",
+  "ca_cert_hash": "sha256:9a1c",
+  "join_urls": [
+    "https://10.0.0.5:7003",
+    "https://10.0.0.6:7003"
+  ],
+  "command": "curl -fsSL https://aerolvm.aerol.ai | sudo bash -s -- join https://10.0.0.5:7003 --token abc123.0123456789abcdefghijklmnopqrstuv --ca-cert-hash sha256:9a1c"
+}
+--- stderr

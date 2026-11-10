@@ -107,7 +107,7 @@ func TestHarnessSuppliesAdminCIDRs(t *testing.T) {
 	}
 	gate := strings.Index(run, `bash "$PROVISION" check-safety`)
 	emit := strings.Index(run, `emit_admin_cidrs_tfvars "$sdir"`)
-	apply := strings.Index(run, `terraform -chdir="${REPO_ROOT}/Terraform" apply`)
+	apply := strings.Index(run, `terraform -chdir="$(tf_root "$scenario")" apply`)
 	if gate < 0 || emit < 0 || apply < 0 || emit < gate || emit > apply {
 		t.Fatalf("emit_admin_cidrs_tfvars must run after the safety gate and before the apply (gate %d, emit %d, apply %d)", gate, emit, apply)
 	}

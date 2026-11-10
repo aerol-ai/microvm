@@ -1,0 +1,5 @@
+exit 2
+--- stdout
+--- stderr
+aerolvm get: -l selects by tag and works only with `aerolvm get sandboxes`
+run `aerolvm get --help` for usage

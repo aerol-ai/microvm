@@ -1,0 +1,9 @@
+exit 0
+--- stdout
+{
+  "name": "snap-1",
+  "image": "snapshots/snap-1",
+  "source_sandbox_id": "sb-0000000000000001",
+  "created_at": "0001-01-01T00:00:00Z"
+}
+--- stderr

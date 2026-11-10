@@ -50,8 +50,10 @@ From a source checkout, `./scripts/install.sh --local` builds the binaries
 instead of downloading them.
 
 If you omit `--pat-token`, the installer generates a random token and prints
-it once at the end. Save it - see "Re-read PAT" below. Re-running the macOS
-installer keeps the existing token.
+it once at the end. Save it - see "Re-read PAT" below. Re-running the
+installer keeps the existing token, on macOS and on Linux. On Linux it also
+remembers your other options in `/etc/sandboxd/node.json`, so a re-run with
+no options upgrades the install in place and keeps `--local`.
 
 What the installer does on **macOS** (nothing outside `$HOME`):
 

@@ -352,7 +352,7 @@ This works only when the AerolVM server runs on a Mac with Docker Desktop. On a 
 
 ## For server operators
 
-Install the GPU software when you install the server. Add `--with-nvidia-gpu` or `--with-amd-gpu` to the install command (see [Install on a server](/getting-started/single-node-setup/)). On a cluster, set `with_nvidia_gpu = true` or `with_amd_gpu = true` on the worker in `terraform.tfvars` (see [Cluster setup](/cluster-setup/)).
+Install the GPU software when you install the server. Add `--with-nvidia-gpu` or `--with-amd-gpu` to the install command (see [Install on a server](/getting-started/single-node-setup/)). On a cluster, set `with_nvidia_gpu = true` or `with_amd_gpu = true` on the worker in `terraform.tfvars` (see [Cluster setup](/cluster/aws/#step-5-turn-on-more-kinds-of-sandbox-optional)).
 
 - `--with-nvidia-gpu` installs the NVIDIA Container Toolkit and connects it to Docker. The NVIDIA drivers must already be installed.
 - `--with-amd-gpu` installs ROCm from AMD's package repository. The `amdgpu` kernel module must already be loaded, so `/dev/kfd` exists.
@@ -376,4 +376,4 @@ GPU passthrough is built into the Docker engine only. AerolVM can also run conta
 - [CPU, memory and disk](/sandboxes/#give-the-sandbox-more-cpu-memory-or-disk): pick CPU and memory.
 - [Lifecycle](/lifecycle/): stop or delete a sandbox automatically.
 - [Run commands](/exec-streaming/): run your GPU program and stream its output.
-- [Cluster setup](/cluster-setup/): add GPU workers to a cluster.
+- [Cluster setup](/cluster/aws/#step-5-turn-on-more-kinds-of-sandbox-optional): add GPU workers to a cluster.

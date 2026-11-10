@@ -51,6 +51,7 @@ func (d *Driver) reapIdleGroups(ttl time.Duration) {
 	type victim struct {
 		key  string
 		host GroupHost
+		idle time.Duration
 	}
 	var victims []victim
 
@@ -70,30 +71,41 @@ func (d *Driver) reapIdleGroups(ttl time.Duration) {
 		// Remove before Stop so a concurrent acquireGroup spawns fresh
 		// rather than joining a host we are about to kill.
 		delete(d.groups, key)
-		victims = append(victims, victim{key: key, host: g.host})
+		victims = append(victims, victim{key: key, host: g.host, idle: now.Sub(last)})
 	}
 	d.groupsMu.Unlock()
 
 	for _, v := range victims {
-		d.markGroupMembersStopped(v.key)
+		n := d.markGroupMembersStopped(v.key)
 		_ = v.host.Stop()
+		// Said out loud: a reaped isolate loses what it held in memory and
+		// starts fresh on its next request, which looks like a lost
+		// sandbox to anyone who does not know the group sat idle.
+		if d.logger != nil {
+			d.logger.Info("isolate idle reaper stopped a group; its sandboxes start fresh on their next request",
+				"group", v.key, "sandboxes", n, "idle", v.idle.Round(time.Second).String(), "idle_ttl", ttl.String())
+		}
 	}
 }
 
 // markGroupMembersStopped flips every sandbox pinned to groupKey to Stopped
 // and clears the groupKey so a later Destroy is a no-op against the dead host.
 // The sandbox record stays in byID so Inspect/ListManaged still see it; Start
-// re-acquires a group and re-loads the bundle.
-func (d *Driver) markGroupMembersStopped(groupKey string) {
+// re-acquires a group and re-loads the bundle. It returns how many it
+// flipped.
+func (d *Driver) markGroupMembersStopped(groupKey string) int {
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	n := 0
 	for _, rec := range d.byID {
 		if rec != nil && rec.groupKey == groupKey {
 			rec.state.Status = models.SandboxStatusStopped
 			rec.groupKey = ""
 			rec.needsReload = true
+			n++
 		}
 	}
+	return n
 }
 
 // touchGroup records activity on a live group so the idle reaper leaves it alone.

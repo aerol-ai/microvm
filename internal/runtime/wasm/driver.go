@@ -12,9 +12,11 @@ import (
 
 	"github.com/aerol-ai/microvm/internal/runtime/wasm/statekv"
 	"github.com/aerol-ai/microvm/pkg/egresspolicy"
+	"github.com/aerol-ai/microvm/pkg/hostproc"
 	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/aerol-ai/microvm/pkg/mounts"
 	wasmengine "github.com/aerol-ai/microvm/pkg/wasm"
+	"github.com/aerol-ai/microvm/pkg/wasm/worker"
 )
 
 // Driver implements runtime.Runtime for WASM sandboxes. WASM satisfies only the
@@ -39,6 +41,13 @@ type Driver struct {
 	residentSupervisor WorkerSupervisor
 	residentMu         sync.Mutex
 	residentBuckets    map[string]*residentBucket
+
+	// workerCgroup is where the workers run, outside sandboxd's unit
+	// (adopt.go). pendingWorkers holds, by socket, the per-sandbox workers
+	// AdoptWorkers found at boot until a sandbox claims one; residentMu
+	// guards it.
+	workerCgroup   *hostproc.Cgroup
+	pendingWorkers map[string]worker.FoundWorker
 
 	mu   sync.Mutex
 	byID map[string]*sandboxInstance

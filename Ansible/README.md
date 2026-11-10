@@ -1,8 +1,26 @@
 # AerolVM cluster - Ansible
 
 Day-N operations against the cluster that `../Terraform` provisions. Terraform
-owns infra (VPC, EC2, SG, DNS); Ansible owns "push a new binary, restart a
-service, tail logs across all nodes."
+owns infra (VPC, EC2, SG, DNS); Ansible owns host settings, ops files and
+"tail logs across all nodes."
+
+**Upgrades are not done here any more.** The `update-sandboxd.yml` and
+`update-toolboxd.yml` playbooks are gone. Upgrade every node, with
+`sandboxd`, `toolboxd` and `caddy` in one step, from any machine that
+reaches the API:
+
+```bash
+aerolvm upgrade plan v0.7.0
+aerolvm upgrade apply v0.7.0 --wait
+```
+
+It needs no repo, no SSH and no inventory. Servers go one at a time with
+the leader last, then ingress nodes, then workers in batches; each node
+keeps its old files and rolls back if the new ones do not come up. See
+[`../setup/runbooks/cluster-upgrades.md`](../setup/runbooks/cluster-upgrades.md).
+For a dev build, `aerolvm upgrade apply <version> --from ./dist
+--allow-unversioned --wait` pushes the files in `./dist` (with their
+`checksums.txt`) to every node.
 
 ## Prereqs
 
@@ -76,7 +94,7 @@ You'll get groups for free, derived from the tags Terraform sets:
 Target any group with `--limit`:
 
 ```bash
-ansible-playbook playbooks/update-sandboxd.yml --limit aerolvm_role_worker -e ...
+ansible-playbook playbooks/configure-ops.yml --limit aerolvm_role_worker
 ```
 
 ## Common playbooks
@@ -84,23 +102,6 @@ ansible-playbook playbooks/update-sandboxd.yml --limit aerolvm_role_worker -e ..
 ```bash
 # Reachability check (run this first to verify SSH + sudo work):
 ansible-playbook playbooks/ping.yml
-
-# Push the LATEST released sandboxd binary across the fleet (most common):
-ansible-playbook playbooks/update-sandboxd.yml \
-  -e sandboxd_remote_url=https://github.com/aerol-ai/microvm/releases/latest/download/sandboxd_linux_amd64
-
-# arm64 / Graviton nodes:
-ansible-playbook playbooks/update-sandboxd.yml \
-  -e sandboxd_remote_url=https://github.com/aerol-ai/microvm/releases/latest/download/sandboxd_linux_arm64
-
-# Pin to a specific release instead of "latest":
-ansible-playbook playbooks/update-sandboxd.yml \
-  -e sandboxd_remote_url=https://github.com/aerol-ai/microvm/releases/download/v0.2.2/sandboxd_linux_amd64
-
-# Push a locally-built binary (dev loop):
-make -C .. build-sandboxd
-ansible-playbook playbooks/update-sandboxd.yml \
-  -e sandboxd_local_binary=../bin/sandboxd
 
 # Tail recent sandboxd logs from every node:
 ansible-playbook playbooks/tail-logs.yml -e lines=200
@@ -117,21 +118,9 @@ ansible-playbook playbooks/configure-ops.yml \
   -e sandboxd_backup_enabled=true
 ```
 
-`update-sandboxd.yml` runs `serial: 1` - one host at a time, with
-`any_errors_fatal: true` - so a failed health check on node 1 stops the
-rollout before it touches the Raft quorum. Limit to a single non-seed test
-node first (use a hostname from `ansible-inventory --graph`, e.g. one that
-shows up under `@aerolvm_false`):
-
-```bash
-ansible-playbook playbooks/update-sandboxd.yml \
-  -e sandboxd_remote_url=https://github.com/aerol-ai/microvm/releases/latest/download/sandboxd_linux_amd64 \
-  --limit aerolvm-node3
-```
-
-Release asset names come from `.github/workflows/release.yml` and follow
-`sandboxd_<goos>_<goarch>` - `linux_amd64`, `linux_arm64`, `linux_armv7`,
-`linux_armv6`, `linux_386`, `freebsd_amd64`, `darwin_arm64`, etc.
+`aerolvm drain <node>` does the same wait as `prepare-role-change.yml`
+from your laptop, with no SSH: it cordons the node and waits until it runs
+no sandboxes.
 
 ## Per-machine config
 
@@ -164,7 +153,6 @@ inventory/
                        # repo root)
 playbooks/
   ping.yml             # connectivity smoke test
-  update-sandboxd.yml  # rolling binary push + restart + healthcheck
   prepare-role-change.yml # drain + wait-empty guard before Terraform role changes
   configure-ops.yml    # OTEL env, image-pull knobs, ops alert/dashboard/runbook files
   tail-logs.yml        # journalctl across the fleet
@@ -548,8 +536,8 @@ lifecycle, so it lives here instead.
 |-------------------------------------------------|-------------|
 | Add / remove / resize nodes                     | Terraform   |
 | Change SG rules, DNS, AMI                       | Terraform   |
-| Drain a node before Terraform role changes      | Ansible     |
-| Push a new `sandboxd` binary                    | Ansible     |
+| Drain a node before Terraform role changes      | `aerolvm drain` (or Ansible) |
+| Upgrade `sandboxd`, `toolboxd` and `caddy`      | `aerolvm upgrade apply` |
 | Change OTEL/image-pull env on running nodes     | Ansible     |
 | Deploy backup/recovery helpers or backup cron   | Ansible     |
 | Deploy Grafana/Prometheus/Alertmanager artifacts | Ansible     |

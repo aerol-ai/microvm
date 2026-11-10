@@ -5,9 +5,15 @@ description: Make the server's sandbox records match the sandboxes that really e
 
 import { Tabs, TabItem } from '@astrojs/starlight/components';
 
-The AerolVM server keeps a database of every sandbox. Sometimes that database falls out of step with the containers that really exist. This happens after a server reboot, a crash, or when someone removes a container by hand (for example with `docker rm`).
+`sandboxd` is the AerolVM program on each node. It keeps a **record** of every sandbox in its database. Sometimes these records stop matching the sandboxes that really exist. This happens when:
 
-**Reconcile** fixes that. It checks every sandbox record against the real containers and corrects the records. The server does this on its own, so most of the time you do nothing. You run it by hand when you need the records to be right *now*.
+- the machine reboots,
+- `sandboxd` crashes,
+- someone removes a container by hand, for example with `docker rm`.
+
+**Reconcile** fixes that. It compares each sandbox record with what the runtime reports, then corrects the record. The **runtime** is the part that runs sandboxes on a node, such as Docker, containerd or Firecracker.
+
+`sandboxd` reconciles on its own, so most of the time you do nothing. Run it yourself when you need the records to be right now.
 
 ## Reconcile now
 
@@ -41,16 +47,18 @@ The AerolVM server keeps a database of every sandbox. Sometimes that database fa
   </TabItem>
 </Tabs>
 
-The call waits until the whole check is done. On success it returns nothing. On failure it raises an error with the server's message.
+The call waits until the whole check is done. On success, it returns nothing. On failure, you get an error with the server's message.
 
 Good to know:
 
-- **It needs operator access.** Use the server's own PAT token (its main access token, `SB_PAT_TOKEN`). Tenant tokens on a managed server are refused.
-- **It checks one server.** The call runs on the server your SDK talks to. In a cluster, each node that runs sandboxes also reconciles itself on a timer.
+- **It needs the admin token.** That is the password in `SB_PAT_TOKEN`. An API token with the `admin` role also works. Every other token is refused, including tenant tokens on a managed server.
+- **It checks one node.** It runs on the node your SDK talks to. In a cluster, each node that runs sandboxes also reconciles itself on a timer.
 
 ## Fix "host capacity exceeded" after a restart
 
-Each sandbox reserves some CPU and memory on the server. If the server rebooted, or containers were removed outside the API, the old records still hold those reservations. Then a new create fails with `host capacity exceeded`, even though the server is nearly empty.
+Each running sandbox holds a share of the node's CPU and memory. This share is its **reservation**.
+
+Did the machine reboot, or did someone remove containers outside the API? Then old records can still hold reservations. A new create then fails with `host capacity exceeded`, even though the node is nearly empty.
 
 Reconcile first, then create:
 
@@ -110,39 +118,100 @@ Reconcile first, then create:
   </TabItem>
 </Tabs>
 
+With `SB_AUTO_RECONCILE=true`, the default, `sandboxd` also runs this check each time it starts.
+
 ## What reconcile changes
 
-For each sandbox record, the server asks the container engine about its container. The engine gives one of three answers:
+For each sandbox record, `sandboxd` asks the runtime about that sandbox. It gets one of three answers. Only the first answer deletes a record.
 
-- **The container does not exist.** The server removes the sandbox's web routes and exposed ports, and unmounts its storage. Then it deletes the record. That frees the sandbox's CPU and memory reservation, and any TCP port it held.
-- **The container is there.** The server updates the record's status, IP address and public URL to match the container. It also fixes the CPU and memory reservation, and puts back a "block all internet" rule if one went missing. A container that stopped, or crashed, stays as a stopped sandbox you can start again. If the engine says the container runs but can't tell its IP address this time, the server keeps the address it has.
-- **The engine can't say.** The engine timed out or returned an error. The server changes nothing and asks again on the next check. If the engine still can't answer after 10 minutes and 3 checks in a row, the sandbox's status becomes `error`, with a message that names the engine and its error. The record is never deleted for this. When the engine answers again, the next check sets the real status and clears the message.
+### The sandbox is gone
 
-Only the first answer deletes a record. Before it deletes one, the server asks about that container once more, directly. So a container that was briefly hard to see (for example, while it was starting) is not deleted by mistake.
+The runtime says the sandbox does not exist.
 
-In a cluster, reconcile also removes local copies of sandboxes that another node now owns. This happens when a node comes back after an outage and finds its sandboxes were moved.
+Before it deletes anything, `sandboxd` asks the runtime once more, about that one sandbox. So a sandbox that the first list missed, for example while it was starting, is not deleted by mistake.
+
+When the second answer also says "gone":
+
+| What is lost | What is freed |
+|---|---|
+| The sandbox's record, its web routes and its exposed ports. Its storage is unmounted. | The sandbox's CPU and memory reservation, and any TCP port it held. |
+
+These records stay, even when the runtime lists nothing for them:
+
+- **A stopped Firecracker or WebAssembly sandbox.** Nothing of it runs while it is stopped. Its record stays, so you can start it again.
+- **A containerd sandbox on a node that no longer runs containerd.** `sandboxd` skips it and logs a warning. The sandbox can still run there.
+
+### The sandbox is there
+
+The runtime lists the sandbox. `sandboxd` then fixes the record:
+
+- **For every sandbox,** it updates the record's status, IP address and public URL to match. It holds the reservation for a running sandbox, and frees it for a stopped one.
+- **For a running sandbox,** it puts back a "block all internet" rule if one went missing. It also puts back the sandbox's other internet rules, web routes, exposed ports and storage mounts.
+
+A sandbox that stopped or crashed stays as a stopped sandbox. You can start it again. When reconcile is the first to see the stop, the stop reason is `reconcile`.
+
+Sometimes the runtime says the sandbox runs, but cannot tell its IP address. `sandboxd` then keeps the address it has.
+
+If a start, stop or restart holds the sandbox right then, reconcile leaves the status to that step. The next check sees the result.
+
+### The runtime cannot say
+
+The runtime timed out, or returned an error. `sandboxd` changes nothing. It keeps the record, routes, ports, reservation and cluster placement. It asks again on the next check.
+
+The runtime can stay silent for a long time. Once both of these are true, the sandbox's status becomes `error`:
+
+- at least 10 minutes have passed,
+- at least 3 checks in a row got no answer.
+
+The error message starts with `runtime state unknown:`. It names the runtime and its last error.
+
+- **The record is never deleted for this.** Start and delete work on an `error` sandbox as on any other.
+- **When the runtime answers again,** the next check sets the real status and clears the message.
+- **A restart of `sandboxd` starts the count again.** That only delays the `error` status. It never deletes anything.
+
+### In a cluster
+
+Reconcile also removes local copies of sandboxes that another node now owns. This happens when a node comes back after an outage, and finds that its sandboxes moved. The new owner keeps the sandbox running. The old node deletes only its own copy.
 
 ## When reconcile runs on its own
 
-| When | What happens |
-|---|---|
-| **Server start** | One full check, before the server takes API requests. Only when `SB_AUTO_RECONCILE=true`, which is the default. |
-| **On a timer** | A full check every 5 minutes by default, while the server runs. |
-| **Container events** | When a container exits or is removed, the server updates that one sandbox right away. |
+| When | What happens | Needs |
+|---|---|---|
+| **`sandboxd` starts** | One full check, before the node takes API requests. | `SB_AUTO_RECONCILE=true`, the default. |
+| **On a timer** | One full check every 5 minutes, by default. | `SB_AUTO_RECONCILE=true`, and `SB_RECONCILE_INTERVAL` above `0`. |
+| **Runtime events** | A container exits or is removed. `sandboxd` updates that one sandbox right away. | Nothing. It is always on. |
 
-These run only on nodes that run sandboxes (`worker` or `mixed` nodes). Server-only and ingress-only nodes have no containers to check.
+These run only on nodes that run sandboxes: worker nodes, mixed nodes, and a one-server install. Server nodes and ingress nodes have no sandboxes to check.
 
 ## For server operators
 
 | Variable | What it does | Default |
 |---|---|---|
-| `SB_AUTO_RECONCILE` | Run reconcile at server start and on a timer. Set to `false` to turn off both. | `true` |
+| `SB_AUTO_RECONCILE` | Runs reconcile when `sandboxd` starts, and on a timer. `false` turns off both. Runtime events still update sandboxes. | `true` |
 | `SB_RECONCILE_INTERVAL` | How often the timed check runs. `0` turns off the timer. | `5m` |
 
-If sandboxes go to `error` with a message that starts `runtime state unknown`, the container engine on that node is not answering. The metric `aerolvm_reconcile_runtime_unknown_sandboxes` counts the sandboxes waiting on an answer right now.
+- **Each timed check has 30 seconds to finish.** A check that takes longer stops. The log then says `periodic reconcile failed`. The next check runs one interval later.
+- **Serverless wake needs the timer.** With `SB_ENABLE_SERVERLESS=true`, and `SB_HTTP_WAKE_DIRECT_BYPASS_ENABLED` or `SB_L4_WAKE_DIRECT_BYPASS_ENABLED` on, `SB_RECONCILE_INTERVAL` must be above `0`. Otherwise `sandboxd` does not start.
+- **Ingress proxy routing needs the check at start.** On a worker or mixed node with `SB_INGRESS_PROXY_ROUTING` on, `SB_AUTO_RECONCILE=false` turns that routing off. The node logs `ingress proxy routing refused`, and keeps one Caddy route per sandbox.
+
+Two metrics show a runtime that does not answer:
+
+| Metric | What it counts |
+|---|---|
+| `aerolvm_reconcile_runtime_unknown_sandboxes` | Sandboxes that wait for an answer from their runtime right now. |
+| `aerolvm_reconcile_runtime_unknown_total` | Each time a runtime could not say, by runtime (the `key` label). |
+
+## If something goes wrong
+
+| What you see | What it means | What to do |
+|---|---|---|
+| `host capacity exceeded`, on a nearly empty node | Old records still hold CPU and memory. | [Reconcile now](#reconcile-now), then create again. |
+| Status `error`, with a message that starts `runtime state unknown` | The runtime on that node has not answered for 10 minutes or more. | Check that the runtime runs on that node. Then read the log of `sandboxd`: `sudo journalctl -u sandboxd -n 50`. |
+| `periodic reconcile failed` in the log | A timed check failed, or took more than 30 seconds. | Read the `error` field on the same log line. |
 
 ## Next steps
 
 - [CPU, memory and disk](/sandboxes/#give-the-sandbox-more-cpu-memory-or-disk): how much CPU and memory each sandbox reserves.
 - [Dashboard](/dashboard/): see sandbox counts and node health.
 - [Runbooks](/operational-runbooks/): step-by-step fixes for outages.
+- [Fix problems](/cluster/troubleshooting/): what common cluster messages mean.

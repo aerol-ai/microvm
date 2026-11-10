@@ -2,7 +2,21 @@
 
 Use this when you need to prove backups are usable, restore a failed node, or
 recover from accidental local state loss. This runbook covers the local
-sandboxd backup archive produced by `sandboxd-backup.sh`.
+sandboxd backup archive produced by `sudo sandboxd backup`. The older
+`sandboxd-backup.sh` and `sandboxd-restore.sh` now only call `sandboxd backup`
+and `sandboxd restore` with the same flags.
+
+## Take a Backup
+
+```bash
+sudo sandboxd backup --output /secure/backups/sandboxd-$(hostname)-$(date +%F-%H%M%S).tar.gz
+```
+
+The database is copied with SQLite `VACUUM INTO`, so the copy is consistent
+while sandboxd runs. On a server, add `--stop` to copy the Raft files at rest
+(sandboxd is stopped for the copy and started again after). The command prints
+how long the database copy took; on a 1 GiB `state.db` expect seconds, not
+minutes.
 
 ## Severity
 
@@ -76,14 +90,21 @@ pullable images and valid credentials.
 3. Restore the archive:
 
    ```bash
-   sudo /usr/local/sbin/sandboxd-restore.sh \
+   sudo sandboxd restore \
      --input /secure/backups/sandboxd-node-a-YYYY-MM-DD.tar.gz \
      --target-root / \
      --force
    ```
 
+   It refuses while sandboxd runs, and it reads the whole archive before it
+   changes anything: a truncated archive, or one with files outside the
+   backup layout, is refused with the node untouched. If a write fails part
+   way, what it moved aside is moved back. Add `--start` to start sandboxd
+   afterwards and wait for `/health` (skip it with wrapped custody until
+   `sandboxd key verify` passes).
+
    A replacement node that already ran a fresh install has a database and a
-   Raft log of its own. The script moves `state.db` (with its `-wal` and
+   Raft log of its own. The command moves `state.db` (with its `-wal` and
    `-shm` files) and `raft/` aside as `*.pre-restore-<time>` before it
    extracts, so the restored ones are never mixed with them. The server key
    goes with the database: the node comes back with the archive's key files

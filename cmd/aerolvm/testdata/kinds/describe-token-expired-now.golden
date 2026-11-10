@@ -1,0 +1,10 @@
+exit 0
+--- stdout
+ID:          tok_cccccccccccc
+Name:        deploy
+Role:        admin
+Team:        every team
+Created:     2026-10-17T00:00:00Z (21d ago)
+Created by:  alice
+Expires:     2026-11-07T11:00:00Z
+--- stderr
