@@ -50,7 +50,7 @@ You need no copy of the repository. Every tool below ships in a release or insid
 | Tool | Where it runs | What it does |
 |---|---|---|
 | `aerolvm` | Your computer | The cluster commands: `get nodes`, `cordon`, `drain`, `delete node`, `join-command`, `upgrade`, `release pull`. See [the aerolvm CLI](/cli/#run-a-cluster). |
-| `sudo sandboxd init`, `join`, `preflight`, `adopt`, `reset` | On a node | Start a cluster, add a machine, check a machine first, bring an older cluster onto one-line joins, take a machine out. See [Cluster setup](/cluster-setup/). |
+| `sudo sandboxd init`, `join`, `preflight`, `adopt`, `reset` | On a node | Start a cluster, add a machine, check a machine first, bring an older cluster onto one-line joins, take a machine out. See [Cluster setup](/cluster/). |
 | `sudo sandboxd backup`, `restore`, `recover-quorum` | On a node | Save a node's database, Raft data and settings into one archive, put it back, and the last-resort lost-quorum recovery. |
 | `sudo sandboxd upgrade node` | On a node | Upgrades this one node. Only for a node that takes no remote upgrade, or the first hop from an old release. |
 | [`install.sh`](https://github.com/aerol-ai/microvm/releases/latest/download/install.sh) | On a node | Installs AerolVM on one machine. With `init` or `join` at the end, it also starts or joins a cluster. |
@@ -103,7 +103,7 @@ Record each result in the drill template inside the runbook.
 ## Next steps
 
 - [Dashboard](/dashboard/): the live view of nodes, placements and metrics.
-- [Cluster setup](/cluster-setup/): how the cluster was built in the first place.
+- [Cluster setup](/cluster/): how the cluster was built in the first place.
 - [Ingress nodes](/cluster-ingress/): the topology rules behind the topology alert.
 - [Secrets providers](/cluster-secrets/): background for the secrets runbook.
 - [Staying up under overload](/overload-protection-architecture/): why a busy node answers `503 overloaded`, and why you should not restart it.

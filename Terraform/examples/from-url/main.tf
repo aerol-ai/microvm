@@ -12,7 +12,8 @@
 # token per role, made by the module, and every other node runs
 # `sandboxd join` with its role's token. Worker and ingress tokens never
 # expire, so adding a worker to `nodes` later still joins. Add a server later
-# with a fresh token from `aerolvm join-command --role server`.
+# with a fresh token: run `sudo sandboxd join-command --role server --ttl 2h
+# --json` on a server node, and put its "token" in node_join_tokens.
 #
 # The join tokens are in the Terraform state. A join token can make a node,
 # and a node gets the cluster's keys, so keep the state as safe as the
@@ -94,13 +95,13 @@ module "aerolvm" {
 
   default_instance_type = "t3.large"
 
+  # Three mixed nodes: the smallest cluster that keeps working when one
+  # machine dies. Each one votes, runs sandboxes and takes web traffic. The
+  # docs (/cluster/aws/) show a larger layout with one job per node.
   nodes = {
-    server-1  = { role = "server", seed = true }
-    server-2  = { role = "server" }
-    server-3  = { role = "server" }
-    ingress-1 = { role = "ingress" }
-    worker-1  = { role = "worker", instance_type = "c6i.xlarge", volume_size_gb = 200 }
-    worker-2  = { role = "worker", instance_type = "c6i.xlarge", volume_size_gb = 200 }
+    node1 = { role = "mixed", seed = true }
+    node2 = { role = "mixed" }
+    node3 = { role = "mixed" }
   }
 }
 

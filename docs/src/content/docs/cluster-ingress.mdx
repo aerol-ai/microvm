@@ -84,7 +84,7 @@ What you choose is the address that SDKs and users connect to. Set it with `SB_I
 There are three common ways to put one address in front of the ingress nodes:
 
 1. **DNS round-robin.** DNS is the system that turns names into IP addresses. Point one `A` or `AAAA` record at every ingress node's public IP. It costs nothing. When an ingress node dies, some users keep trying it until their DNS cache expires.
-2. **A cloud TCP load balancer**, such as AWS NLB, GCP TCP load balancing or Cloudflare Spectrum. A load balancer spreads connections across the ingress nodes. It checks their health and stops using a dead node within seconds. The Terraform setup can create an AWS one for you: see [Put a load balancer in front](/cluster-setup/#put-a-load-balancer-in-front).
+2. **A cloud TCP load balancer**, such as AWS NLB, GCP TCP load balancing or Cloudflare Spectrum. A load balancer spreads connections across the ingress nodes. It checks their health and stops using a dead node within seconds. The Terraform setup can create an AWS one for you: see [Put a load balancer in front](/cluster/aws/#step-6-add-a-load-balancer-for-production).
 3. **MetalLB or a BGP virtual IP**, for your own hardware. MetalLB gives a group of machines one shared IP address on your network. It does not know which sandbox lives on which worker, so it does not replace the ingress nodes. Put it in front of them.
 
 Round-robin has one more weak spot. If the AerolVM server on an ingress node stops while Caddy keeps running, clients sent there still connect, so they never try the next record: they get `502` until it is back. A load balancer whose health check reaches the AerolVM server, not just Caddy, avoids that.
@@ -134,64 +134,61 @@ Never set this flag just to silence the check while a plain load balancer sits i
 
 ## Start a split cluster by hand
 
-Terraform does all of this for you (see [Cluster setup](/cluster-setup/#build-a-cluster-on-aws-with-terraform)). Use these steps only when you set up machines yourself. Each machine runs one command, and you need no copy of the repository. [Cluster setup](/cluster-setup/#build-a-cluster-with-one-command-per-machine) explains each step in full.
+Terraform does all of this for you (see [Build it on AWS](/cluster/aws/)). Use these steps only when you set up machines yourself. They follow [Build a cluster](/cluster/create/), which explains each step in full. Only the roles differ.
 
-This example builds three servers, two workers and two ingress nodes.
+This example builds three server nodes, two workers and two ingress nodes.
 
-### Step 1: Start the cluster on the first server
+### Step 1: Start the cluster on the first server node
 
-```sh
+```bash title="On the first server node"
+export CLOUDFLARE_API_TOKEN=your-cloudflare-token
+
 curl -fsSL https://aerolvm.aerol.ai | sudo bash -s -- \
-    --domain sandbox.example.com --pat-token your-secret-pat \
-    --dns-provider cloudflare --dns-api-token your-cloudflare-api-token \
+    --domain sandbox.example.com --pat-token your-admin-token \
+    --dns-provider cloudflare --dns-api-token "$CLOUDFLARE_API_TOKEN" \
     init --role server --ingress-advertise-host ingress.sandbox.example.com
 ```
 
-`init` makes the cluster's certificate authority, the gossip key (a shared secret that stops strangers joining) and the key for sealed secrets. Then copy `/etc/sandboxd/admin-context.json` from the server to your computer and run `aerolvm config import admin-context.json --use`.
+Then copy `/etc/sandboxd/admin-context.json` from it to your computer, and run `aerolvm config import admin-context.json --use`. See [Build a cluster, step 7](/cluster/create/#step-7-connect-your-computer).
 
 ### Step 2: Join every other node
 
-On your computer, make one join command per machine, with its role:
+Make one join command per machine, with its role. Make the server ones on the first server node: the cluster makes a server token only when a server node asks.
 
-```sh
-aerolvm join-command --role server     # the other two servers
-aerolvm join-command --role worker     # each worker
-aerolvm join-command --role ingress    # each ingress node
+```bash title="On the first server node"
+sudo sandboxd join-command --role server     # once for each other server node
 ```
 
-On each machine, run the line it printed, with your domain options before the word `join`, and the same `--ingress-advertise-host` at the end:
-
-```sh
-curl -fsSL https://aerolvm.aerol.ai | sudo bash -s -- \
-    --domain sandbox.example.com \
-    --dns-provider cloudflare --dns-api-token your-cloudflare-api-token \
-    join https://<first-server-ip>:7003 --token <token> --ca-cert-hash sha256:<hash> \
-    --ingress-advertise-host ingress.sandbox.example.com
+```bash title="On your computer"
+aerolvm join-command --role worker     # once for each worker
+aerolvm join-command --role ingress    # once for each ingress node
 ```
 
-The token decides the role. The servers sign each node's certificate, so nothing is copied between machines. `aerolvm get nodes` shows every node `Ready` when you are done.
+Each join command carries the cluster's domain and `--ingress-advertise-host ingress.sandbox.example.com`. On each machine, set your Cloudflare token, then paste its join command as it is:
 
-### Step 3: Point DNS at the ingress nodes
+```bash title="On each new machine"
+export CLOUDFLARE_API_TOKEN=your-cloudflare-token
+
+# Paste this machine's join command here.
+```
+
+The token decides the role. The server nodes sign each node's certificate, so nothing is copied between machines. `aerolvm get nodes` shows every node `Ready` when you are done.
+
+### Step 3: Send DNS to the ingress nodes
 
 Point your wildcard DNS record (`*.sandbox.example.com`) at the ingress nodes, or at the load balancer in front of them. Point `ingress.sandbox.example.com` at the same place.
 
-Sandbox URLs from the SDK then lead there. Each ingress node reads the SNI (the site name a client sends when it opens a TLS connection). It uses that name to pick the worker that owns the sandbox.
+Sandbox URLs from the SDK then lead there. Each ingress node reads the site name a client sends when it opens an HTTPS connection (its **SNI**). It uses that name to pick the worker that owns the sandbox.
 
 ### A smaller layout with edge nodes
 
-For 10 nodes or fewer, you can skip the separate ingress tier. This layout uses three servers and five `worker,ingress` edge nodes. Start and join the servers as above. For each edge node, make a worker token, and add `--role worker,ingress` to the end of the line it prints:
+For 10 nodes or fewer, you can skip the separate ingress tier. This layout uses three server nodes and five `worker,ingress` edge nodes. Start and join the server nodes as above. For each edge node, make its join command with both jobs:
 
-```sh
-aerolvm join-command --role worker
-# then on the edge node:
-curl -fsSL https://aerolvm.aerol.ai | sudo bash -s -- \
-    --domain sandbox.example.com \
-    --dns-provider cloudflare --dns-api-token your-cloudflare-api-token \
-    join https://<first-server-ip>:7003 --token <token> --ca-cert-hash sha256:<hash> \
-    --role worker,ingress --ingress-advertise-host ingress.sandbox.example.com
+```bash title="On your computer"
+aerolvm join-command --role worker,ingress
 ```
 
-`--role` sets the node's full role when it is more than its token's. Point the DNS or load balancer for `ingress.sandbox.example.com` at every edge node. Each one holds the full route table, so any of them can answer for any sandbox. Before the cluster grows past 10 live nodes, move to dedicated `worker` and `ingress` nodes.
+It takes a worker token, and the join command adds `--role worker,ingress`. Point the DNS or load balancer for `ingress.sandbox.example.com` at every edge node. Each one holds the full route table, so any of them can answer for any sandbox. Before the cluster grows past 10 live nodes, move to dedicated `worker` and `ingress` nodes.
 
 ## What runs where
 
@@ -222,7 +219,7 @@ The placement map is the record of which sandbox lives on which worker. Only nod
 
 ## Next steps
 
-- [Cluster setup](/cluster-setup/): create a cluster on AWS with Terraform.
+- [Build it on AWS](/cluster/aws/): create a cluster on AWS with Terraform.
 - [Durability and failover](/durability/): keep sandboxes alive when a worker dies.
 - [Glossary](/cluster-glossary/): every cluster setting in one place.
 - [Runbooks](/operational-runbooks/): fixes for topology alerts and outages.

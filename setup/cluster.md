@@ -355,26 +355,24 @@ aerolvm get nodes      # node-a  ...  Ready,Leader
 On your laptop, make a join command per node:
 
 ```bash
-aerolvm join-command --role server
+aerolvm join-command --role mixed
 ```
 
-It prints one line:
+It prints one line. With a domain, the line carries the seed's `--domain`
+and DNS options before the word `join`, and `--role mixed` at the end
+(`mixed` takes a server token):
 
 ```
-curl -fsSL https://aerolvm.aerol.ai | sudo bash -s -- join https://10.0.0.5:7003 --token <id.secret> --ca-cert-hash sha256:<hex>
+curl -fsSL https://aerolvm.aerol.ai | sudo bash -s -- --domain sandbox.example.com --dns-provider cloudflare --dns-api-token "$CLOUDFLARE_API_TOKEN" join https://10.0.0.5:7003 --token <id.secret> --ca-cert-hash sha256:<hex> --role mixed
 ```
 
-Run it on `node-b`, with the same domain options as the seed before the
-word `join`, and the role and node ID at the end:
+The line reads the Cloudflare token from the new machine, so it never holds
+it. On `node-b`, set it, then run the line as printed. Add `--node-id node-b`
+at the end to pick the node ID (the default is the short host name):
 
 ```bash
-curl -fsSL https://aerolvm.aerol.ai \
-  | sudo bash -s -- \
-      --domain sandbox.example.com \
-      --dns-provider cloudflare \
-      --dns-api-token <cloudflare-token> \
-      join https://10.0.0.5:7003 --token <id.secret> --ca-cert-hash sha256:<hex> \
-      --role mixed --node-id node-b
+export CLOUDFLARE_API_TOKEN=<cloudflare-token>
+curl -fsSL https://aerolvm.aerol.ai | sudo bash -s -- ... --role mixed --node-id node-b
 ```
 
 `sandboxd join`:

@@ -83,7 +83,7 @@ Always use an **odd number** of voting nodes. An even number raises the majority
 | `SB_DATA_PLANE_ADVERTISE_HOST` | The host other nodes use to send sandbox traffic here. Set it when that differs from the API address. | The host in `SB_API_ADVERTISE_URL` |
 | `SB_BOOTSTRAP_PEERS` | Gossip addresses to contact when joining, separated by commas. Required on every node except the seed. | Empty |
 | `SB_INGRESS_ADVERTISE_HOST` | The public host name used in sandbox URLs. See [Ingress nodes](/cluster-ingress/). | Empty |
-| `SB_L4_PUBLIC_HOST` | The host name in raw TCP port addresses (`tcp://<host>:<port>`). Set it when your domain points at a load balancer that cannot carry the TCP port pool. Terraform sets it to `tcp.<domain>` when the [load balancer](/cluster-setup/#put-a-load-balancer-in-front) is on. | Empty: the domain |
+| `SB_L4_PUBLIC_HOST` | The host name in raw TCP port addresses (`tcp://<host>:<port>`). Set it when your domain points at a load balancer that cannot carry the TCP port pool. Terraform sets it to `tcp.<domain>` when the [load balancer](/cluster/aws/#step-6-add-a-load-balancer-for-production) is on. | Empty: the domain |
 
 ### Raft settings
 
@@ -186,7 +186,7 @@ The pool keeps spare microVMs ready ahead of time. It refills itself in the back
 
 ## Next steps
 
-- [Cluster setup](/cluster-setup/): create a cluster with Terraform.
+- [Cluster setup](/cluster/aws/): create a cluster with Terraform.
 - [Ingress nodes](/cluster-ingress/): choose roles for a large cluster.
 - [Secrets providers](/cluster-secrets/): the full story on sealed passwords.
 - [Firecracker](/firecracker-sandbox/): run sandboxes in microVMs.

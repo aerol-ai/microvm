@@ -151,7 +151,7 @@ Everything else is refused. An entry can be a site name, a `*.` wildcard, `host:
 
 ## Run a cluster
 
-These commands manage the machines of a [cluster](/cluster-setup/), not sandboxes. They need an admin login, such as the cluster's admin token. They run from your own computer, over the API, with no SSH and no copy of the repository.
+These commands manage the machines of a [cluster](/cluster/), not sandboxes. They need an admin login, such as the cluster's admin token. They run from your own computer, over the API, with no SSH and no copy of the repository.
 
 ### See the nodes
 
@@ -194,21 +194,21 @@ wrk-2        worker   Ready,SchedulingDisabled   v0.7.0    9
 aerolvm join-command
 ```
 
-This makes a join token and prints one line, like this:
+This makes a join token and prints one join command. On a cluster with a domain, it looks like this:
 
 ```
-curl -fsSL https://aerolvm.aerol.ai | sudo bash -s -- join https://10.0.1.5:7003 --token abc123.0f1e2d3c4b5a69780f1e2d3c4b5a6978 --ca-cert-hash sha256:9a1c…
+curl -fsSL https://aerolvm.aerol.ai | sudo bash -s -- --domain cluster.example.com --dns-provider cloudflare --dns-api-token "$CLOUDFLARE_API_TOKEN" join https://10.0.1.5:7003 --token abc123.0f1e2d3c4b5a69780f1e2d3c4b5a6978 --ca-cert-hash sha256:9a1c…
 ```
 
-Run that line on the new machine, as it is. It installs AerolVM, checks the cluster's identity, and joins. The token decides the role:
+On the new machine, set your Cloudflare API token with `export CLOUDFLARE_API_TOKEN=...`. Then paste the join command, as it is. It installs AerolVM with the cluster's domain, checks the cluster's identity, and joins. The command reads the Cloudflare token from the machine, so the printed command never holds it. On a cluster without a domain, the command starts at `join`. The token decides the role:
 
 | Flag | What it does |
 |---|---|
-| `--role worker` | The default. `ingress` and `server` work too. |
+| `--role worker` | The default. `ingress`, `server` and `mixed` work too. A mixed node takes a server token, and the command adds `--role mixed`. |
 | `--ttl 2h` | How long the token works. The default is 2 hours; a server token lasts at most 24 hours. `--ttl 0` never expires, and is only for worker and ingress tokens. |
 | `--reusable` | Let many machines join with the same token. Without it, a token works for one machine. |
 
-A **server** token is made only when a server asks. If your API URL goes through an ingress node (your domain), make server tokens on a server instead, with the same flags: `sudo sandboxd join-command --role server`. It prints the same line, or the token with `--json`.
+A **server** token is made only when a server or mixed node asks. If your API URL leads to an ingress node, make server tokens on a server or mixed node instead, with the same flags: `sudo sandboxd join-command --role server`. It prints the same join command, or the token with `--json`.
 
 List and revoke tokens:
 
@@ -217,8 +217,10 @@ aerolvm get jointokens
 aerolvm delete jointoken abc123
 ```
 
+[Build a cluster](/cluster/create/) walks through it from the first machine. [Add and remove nodes](/cluster/nodes/) covers every role.
+
 <Aside type="caution" title="Treat a join token like the admin token">
-A join token can make a node, and a node gets the cluster's admin token and keys: the gossip key, the key that opens stored secrets (unless [key custody](/enterprise/key-custody/) is wrapped), and for a server, the key that signs every node's certificate. Keep join tokens as private as the admin token. Use short lifetimes. Keep `--ttl 0` tokens for worker and ingress nodes that an autoscaler adds, and revoke a token you no longer need. In [enterprise mode](/enterprise/enterprise-mode/) a never-expiring token also needs wrapped [key custody](/enterprise/key-custody/).
+A join token can make a node. Every node gets the key that opens stored secrets, unless [key custody](/enterprise/key-custody/) is wrapped. A server or mixed node also gets the admin token, and the key that signs every node's certificate. A worker or ingress node gets only a fingerprint of the admin token. Keep join tokens as private as the admin token. Use short lifetimes. Keep `--ttl 0` tokens for worker and ingress nodes that an autoscaler adds, and cancel a token you no longer need. In [enterprise mode](/enterprise/enterprise-mode/), a never-expiring token also needs wrapped key custody. See [Keep it safe](/cluster/security/).
 </Aside>
 
 ### Upgrade the cluster
@@ -246,7 +248,7 @@ aerolvm release pull v0.7.0 -o aerolvm-v0.7.0.tgz
 aerolvm upgrade apply v0.7.0 --from aerolvm-v0.7.0.tgz --wait
 ```
 
-The same commands upgrade a single server, too: `apply` upgrades that one node. [Upgrade a cluster](/cluster-setup/#upgrade-a-cluster) says what running sandboxes see during an upgrade, and how to make the first upgrade from a release older than these commands.
+The same commands upgrade a single server, too: `apply` upgrades that one node. [Upgrade](/cluster/upgrade/) says what running sandboxes see during an upgrade, and how to make the first upgrade from a release older than these commands.
 
 ### Use more than one cluster
 
