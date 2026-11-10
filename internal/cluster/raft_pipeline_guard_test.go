@@ -2,6 +2,8 @@ package cluster
 
 import (
 	"errors"
+	"expvar"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -47,6 +49,14 @@ func newSlowPipelinePair(t *testing.T, timeout, delay time.Duration) pipelinePai
 		_ = follower.Close()
 	})
 	return pipelinePair{leader: leader, follower: follower}
+}
+
+// stallsFor reads aerolvm_raft_pipeline_stalls_total{key=peer}.
+func stallsFor(peer string) int64 {
+	if v, ok := raftPipelineStalls.Get(peer).(*expvar.Int); ok {
+		return v.Value()
+	}
+	return 0
 }
 
 func appendReq() *raft.AppendEntriesRequest {
@@ -103,7 +113,7 @@ func TestRaftPipelineSendWithNoReaderBlocksUntilTheGuardClosesIt(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		before := raftPipelineStalls.Value()
+		before, otherBefore := stallsFor("f"), stallsFor("other-follower")
 		if err, blocked, _ := sendWithin(p, 5*timeout); blocked || err != nil {
 			t.Fatalf("first send: err %v, blocked %v; want it through", err, blocked)
 		}
@@ -118,8 +128,11 @@ func TestRaftPipelineSendWithNoReaderBlocksUntilTheGuardClosesIt(t *testing.T) {
 		if took := time.Since(start); took < 3*timeout {
 			t.Fatalf("second send returned after %s, before stallAfter (%s)", took, 3*timeout)
 		}
-		if got := raftPipelineStalls.Value() - before; got != 1 {
-			t.Fatalf("aerolvm_raft_pipeline_stalls_total moved by %d, want 1", got)
+		if got := stallsFor("f") - before; got != 1 {
+			t.Fatalf("aerolvm_raft_pipeline_stalls_total{key=f} moved by %d, want 1", got)
+		}
+		if got := stallsFor("other-follower") - otherBefore; got != 0 {
+			t.Fatalf("a stall on f moved another follower's count by %d; the alert counts per follower", got)
 		}
 		if n := g.openPipelines(); n != 0 {
 			t.Fatalf("%d pipelines still tracked after the guard closed the only one", n)
@@ -170,7 +183,7 @@ func TestRaftPipelineGuardLeavesHealthySendsAlone(t *testing.T) {
 			}
 		}
 	}()
-	before := raftPipelineStalls.Value()
+	before := stallsFor("f")
 	for i := range 20 {
 		if err, blocked, _ := sendWithin(p, 5*timeout); blocked || err != nil {
 			t.Fatalf("send %d: err %v, blocked %v", i, err, blocked)
@@ -180,8 +193,8 @@ func TestRaftPipelineGuardLeavesHealthySendsAlone(t *testing.T) {
 	if err, blocked, _ := sendWithin(p, 5*timeout); blocked || err != nil {
 		t.Fatalf("send after an idle pause: err %v, blocked %v; the watchdog must not close a healthy pipeline", err, blocked)
 	}
-	if got := raftPipelineStalls.Value() - before; got != 0 {
-		t.Fatalf("aerolvm_raft_pipeline_stalls_total moved by %d on healthy sends", got)
+	if got := stallsFor("f") - before; got != 0 {
+		t.Fatalf("aerolvm_raft_pipeline_stalls_total{key=f} moved by %d on healthy sends", got)
 	}
 	if n := g.openPipelines(); n != 1 {
 		t.Fatalf("%d pipelines tracked, want the 1 open one", n)
@@ -219,7 +232,7 @@ func TestRaftPipelineGuardLeavesASlowButDrainingPipelineAlone(t *testing.T) {
 			}
 		}
 	}()
-	before := raftPipelineStalls.Value()
+	before := stallsFor("slow")
 	start := time.Now()
 	for i := range 8 {
 		if err, blocked, _ := sendWithin(p, timeout); blocked || err != nil {
@@ -229,11 +242,34 @@ func TestRaftPipelineGuardLeavesASlowButDrainingPipelineAlone(t *testing.T) {
 	if took := time.Since(start); took < 4*delay {
 		t.Fatalf("8 sends took %s; the follower's %s delay was not felt, so this test no longer measures a busy pipeline", took, delay)
 	}
-	if got := raftPipelineStalls.Value() - before; got != 0 {
+	if got := stallsFor("slow") - before; got != 0 {
 		t.Fatalf("the guard fired %d times on a slow but draining pipeline", got)
 	}
 	if n := g.openPipelines(); n != 1 {
 		t.Fatalf("%d pipelines tracked, want the 1 still open", n)
+	}
+}
+
+// A follower's stall series exists, at 0, as soon as the leader opens a
+// pipeline to it, so the first stall shows up as an increase. A series that
+// first appeared at 1 would hide that stall from the alert's increase().
+func TestPipelineGuardExportsEachFollowersSeriesBeforeAStall(t *testing.T) {
+	// raftPipelineStalls is process-wide, so each run needs a follower id no
+	// earlier run (-count>1) has used.
+	peer := fmt.Sprintf("seeded-follower-%d", time.Now().UnixNano())
+	pp := newPipelinePair(t, time.Second)
+	g := newPipelineGuardTransport(pp.leader, time.Hour, nil)
+	if raftPipelineStalls.Get(peer) != nil {
+		t.Fatalf("%s already has a series before its pipeline opened", peer)
+	}
+	p, err := g.AppendEntriesPipeline(raft.ServerID(peer), pp.follower.LocalAddr())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+	v, ok := raftPipelineStalls.Get(peer).(*expvar.Int)
+	if !ok || v.Value() != 0 {
+		t.Fatalf("aerolvm_raft_pipeline_stalls_total{key=%s} = %v after the pipeline opened, want 0", peer, raftPipelineStalls.Get(peer))
 	}
 }
 

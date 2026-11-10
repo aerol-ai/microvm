@@ -51,9 +51,14 @@ var (
 	capacityLeaseOnDemandFetches = expvar.NewInt("aerolvm_capacity_lease_on_demand_fetches_total")
 	// raftPipelineStalls counts raft replication pipelines the stall guard
 	// closed because one send was blocked past any healthy wait
-	// (raft_pipeline_guard.go). Each one is a follower that would otherwise
-	// have stopped receiving the log until the next leader change.
-	raftPipelineStalls = expvar.NewInt("aerolvm_raft_pipeline_stalls_total")
+	// (raft_pipeline_guard.go), per follower: exported as
+	// aerolvm_raft_pipeline_stalls_total{key=<follower server id>}. Each one
+	// is a follower that would otherwise have stopped receiving the log until
+	// the next leader change. Per follower, so the alert can tell one
+	// follower stalling again from two followers each stalling once (two
+	// restarts in a rolling upgrade). Followers are raft servers only, at
+	// most MaxServerTierNodes, so the label set stays small.
+	raftPipelineStalls = expvar.NewMap("aerolvm_raft_pipeline_stalls_total")
 
 	ownerForwardTotal        = expvar.NewInt("aerolvm_owner_forward_total")
 	ownerForwardErrors       = expvar.NewMap("aerolvm_owner_forward_errors_total")

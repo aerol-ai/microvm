@@ -25,13 +25,13 @@ groups:
           runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/slo-breach.md"
 
       - alert: SandboxdRaftPipelineStall
-        expr: sum(increase(aerolvm_raft_pipeline_stalls_total[30m])) >= 2
+        expr: sum by (key) (increase(aerolvm_raft_pipeline_stalls_total[30m])) >= 2
         labels:
           severity: warning
           component: raft
         annotations:
-          summary: "Raft replication to a follower keeps getting stuck"
-          description: "sandboxd reset a stuck Raft replication pipeline at least twice in 30 minutes, so a follower keeps rejecting appends. A single reset after a follower restart or a leader change is expected and does not fire this alert."
+          summary: "Raft replication to follower {{ $labels.key }} keeps getting stuck"
+          description: "sandboxd reset a stuck Raft replication pipeline to {{ $labels.key }} at least twice in 30 minutes (aerolvm_raft_pipeline_stalls_total{key={{ $labels.key }}}, summed over the leaders that saw it), so that follower keeps rejecting appends. A single reset after a follower restart or a leader change is expected, and single resets on different followers (a rolling upgrade) do not add up to fire this alert."
           runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/slo-breach.md"
 
       - alert: SandboxdRaftSnapshotErrors
