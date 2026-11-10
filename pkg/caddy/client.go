@@ -1005,19 +1005,31 @@ func (c *Client) EnsureOnDemandTLS(ctx context.Context, askURL string, burst int
 }
 
 func (c *Client) ensureOnDemandTLSLocked(ctx context.Context, askURL string) error {
-	onDemand := map[string]any{"ask": askURL}
+	// The ask URL goes in as the http permission module, not the deprecated
+	// "ask" field. Since Caddy 2.10, the TLS app provisions automation
+	// policies before it turns "ask" into a permission, so an on-demand
+	// policy behind "ask" alone fails: "on-demand TLS cannot be enabled
+	// without a permission module". Caddy 2.9 converted first, which is why
+	// this worked when it was written; releases built the newest Caddy until
+	// the pin (2.11.x since v0.6.11), so the policy never installed and no
+	// custom domain got a certificate. The http module (Caddy 2.7+) calls the
+	// endpoint with ?domain= exactly as "ask" did.
+	onDemand := map[string]any{"permission": map[string]any{"module": "http", "endpoint": askURL}}
 	onDemandBody, err := json.Marshal(onDemand)
 	if err != nil {
 		return fmt.Errorf("marshal on-demand block: %w", err)
 	}
-	// PUT replaces (or creates) the leaf. Caddy auto-creates intermediate
-	// paths if apps/tls or apps/tls/automation didn't exist.
-	status, err := c.sendJSON(ctx, http.MethodPut, c.baseURL+"/config/apps/tls/automation/on_demand", onDemandBody)
+	// POST sets or replaces the leaf; Caddy creates apps/tls/automation on
+	// the way if it is missing. Not PUT: Caddy's PUT only creates, and
+	// answers 409 "key already exists" once on_demand is set. Caddy keeps its
+	// config across restarts, so every sandboxd start after the first failed
+	// here (logged, never retried) and a changed ask URL never landed.
+	status, detail, err := c.sendJSONDetail(ctx, http.MethodPost, c.baseURL+"/config/apps/tls/automation/on_demand", onDemandBody)
 	if err != nil {
 		return err
 	}
 	if status >= 400 {
-		return fmt.Errorf("install on-demand settings failed: %d", status)
+		return caddyErr("install on-demand settings", status, detail)
 	}
 
 	idx, stored, found, err := c.onDemandPolicy(ctx)
@@ -1037,12 +1049,12 @@ func (c *Client) ensureOnDemandTLSLocked(ctx context.Context, askURL string) err
 	}
 	// POST appends to the array if it exists, or creates a one-element
 	// array if it doesn't. Either way the on-demand policy ends up last.
-	status, err = c.sendJSON(ctx, http.MethodPost, c.baseURL+"/config/apps/tls/automation/policies", policyBody)
+	status, detail, err = c.sendJSONDetail(ctx, http.MethodPost, c.baseURL+"/config/apps/tls/automation/policies", policyBody)
 	if err != nil {
 		return err
 	}
 	if status >= 400 {
-		return fmt.Errorf("install on-demand policy failed: %d", status)
+		return caddyErr("install on-demand policy", status, detail)
 	}
 	return nil
 }

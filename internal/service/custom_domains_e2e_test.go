@@ -39,6 +39,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -54,13 +55,18 @@ import (
 )
 
 const (
-	e2eNetwork    = "aerolvm-e2e"
-	e2eS3Bucket   = "caddy-certs"
-	e2eAKID       = "test"
-	e2eSecret     = "test"
-	e2eHostname   = "api.test.local"
-	e2eSandboxID  = "sb-e2e-1"
-	pebbleImage   = "letsencrypt/pebble:v2.5.1"
+	e2eNetwork  = "aerolvm-e2e"
+	e2eS3Bucket = "caddy-certs"
+	e2eAKID     = "test"
+	e2eSecret   = "test"
+	// Not .local: custom-domain validation refuses reserved local names.
+	// .test is reserved for tests (RFC 2606), and the client dials Caddy
+	// directly, so the name never needs to resolve.
+	e2eHostname  = "api.example.test"
+	e2eSandboxID = "sb-e2e-1"
+	// Pebble left Docker Hub (letsencrypt/pebble is gone); its images are on
+	// GitHub's registry now, tagged without the v.
+	pebbleImage   = "ghcr.io/letsencrypt/pebble:2.5.1"
 	localstackImg = "localstack/localstack:3.4"
 	caddyBaseImg  = "alpine:3.19"
 )
@@ -77,6 +83,10 @@ func TestACME_FirstIssueAndS3Reuse(t *testing.T) {
 	createS3Bucket(t, ls)
 
 	pebbleRoots := fetchPebbleRoots(t, pebble)
+	// Pebble serves its ACME API with a certificate from its own test CA
+	// (minica), not from the roots it issues under; Caddy must trust that one
+	// to talk to Pebble at all.
+	pebbleAPIRoot := dockerCpFromContainer(t, pebble, "/test/certs/pebble.minica.pem")
 	caddyBin := caddyfx.Build(t)
 
 	// In-test HTTP backend so Caddy's reverse_proxy has something to reach
@@ -98,14 +108,28 @@ func TestACME_FirstIssueAndS3Reuse(t *testing.T) {
 
 	// Phase 1 — first issuance + cache hit.
 	caddy1 := cli.Start(t, caddyContainerSpec(caddyBin))
+	// A failed request (a TLS error, say) fails inside mustGet, before the
+	// status checks below print Caddy's log; this prints it on any failure.
+	// Registered after Start, so it runs before the container is removed.
+	t.Cleanup(func() {
+		if t.Failed() {
+			t.Logf("caddy1 log tail:\n%s", caddy1.LogTail(60))
+		}
+	})
 	loadCaddyConfig(t, caddy1, configBytes)
 
-	h := startInProcessSandboxd(t, caddy1)
+	// The domain targets the sandbox's toolbox (port 0), so its route dials
+	// the row's container IP on the toolbox port: point both at the backend.
+	toolboxPort, err := strconv.Atoi(backendPort)
+	if err != nil {
+		t.Fatalf("backend port %q: %v", backendPort, err)
+	}
+	h := startInProcessSandboxd(t, caddy1, toolboxPort)
 	mustCreateE2ESandboxRow(t, h.store, e2eSandboxID)
 	if err := h.svc.AddCustomDomain(context.Background(), e2eSandboxID, e2eHostname, 0); err != nil {
 		t.Fatalf("AddCustomDomain: %v", err)
 	}
-	patchPebbleACME(t, caddy1, pebbleRoots)
+	patchPebbleACME(t, caddy1, pebbleAPIRoot)
 
 	client := httpsClientForCaddy(t, caddy1, pebbleRoots)
 
@@ -128,7 +152,7 @@ func TestACME_FirstIssueAndS3Reuse(t *testing.T) {
 	caddy2 := cli.Start(t, caddyContainerSpec(caddyBin))
 	loadCaddyConfig(t, caddy2, configBytes)
 	rewireSandboxdAt(t, h, caddy2)
-	patchPebbleACME(t, caddy2, pebbleRoots)
+	patchPebbleACME(t, caddy2, pebbleAPIRoot)
 
 	client2 := httpsClientForCaddy(t, caddy2, pebbleRoots)
 	if got := mustGet(t, client2, "https://"+e2eHostname+"/").StatusCode; got != http.StatusOK {
@@ -143,8 +167,10 @@ func TestACME_FirstIssueAndS3Reuse(t *testing.T) {
 
 func localstackSpec() dockerfx.Spec {
 	return dockerfx.Spec{
-		Image:       localstackImg,
-		Name:        "aerolvm-e2e-localstack",
+		Image: localstackImg,
+		Name:  "aerolvm-e2e-localstack",
+		// Caddy's S3 storage dials localstack:4566 (caddyfx config).
+		Aliases:     []string{"localstack"},
 		Env:         []string{"SERVICES=s3", "DEBUG=0"},
 		ExposePorts: []string{"4566/tcp"},
 		Network:     e2eNetwork,
@@ -171,6 +197,9 @@ func pebbleSpec() dockerfx.Spec {
 	return dockerfx.Spec{
 		Image: pebbleImage,
 		Name:  "aerolvm-e2e-pebble",
+		// Caddy's issuer is https://pebble:14000/dir; Pebble's own HTTPS
+		// certificate names "pebble", so the alias must be exactly that.
+		Aliases: []string{"pebble"},
 		Env: []string{
 			"PEBBLE_VA_ALWAYS_VALID=1",
 			"PEBBLE_AUTHZREUSE=0",
@@ -200,8 +229,13 @@ func pebbleSpec() dockerfx.Spec {
 
 func caddyContainerSpec(binPath string) dockerfx.Spec {
 	return dockerfx.Spec{
-		Image:       caddyBaseImg,
-		Cmd:         []string{"/usr/bin/caddy", "run", "--config", "/dev/null"},
+		Image: caddyBaseImg,
+		Cmd:   []string{"/usr/bin/caddy", "run", "--config", "/dev/null"},
+		// The admin API must answer on the published port before the config
+		// that says "0.0.0.0:2019" is loaded through it. With --config
+		// /dev/null Caddy starts on its default, localhost:2019, which the
+		// host cannot reach through the container's port mapping.
+		Env:         []string{"CADDY_ADMIN=0.0.0.0:2019"},
 		HostBinds:   []string{caddyfx.HostMount(binPath)},
 		ExposePorts: []string{"443/tcp", "2019/tcp"},
 		ExtraHosts:  []string{"host.docker.internal:host-gateway"},
@@ -247,12 +281,13 @@ func loadCaddyConfig(t testing.TB, c *dockerfx.Container, body []byte) {
 }
 
 // patchPebbleACME points the on-demand policy's ACME issuer at Pebble and
-// pins Pebble's root as a trusted root. Must be called AFTER AddCustomDomain
-// has driven EnsureOnDemandTLS — the policy at index 0 only exists after that.
-func patchPebbleACME(t testing.TB, c *dockerfx.Container, rootsPEM []byte) {
+// trusts apiRootPEM, the CA of Pebble's own HTTPS certificate, for the ACME
+// connection. Must be called AFTER AddCustomDomain has driven
+// EnsureOnDemandTLS — the policy at index 0 only exists after that.
+func patchPebbleACME(t testing.TB, c *dockerfx.Container, apiRootPEM []byte) {
 	t.Helper()
 	adminPort := c.HostPort("2019/tcp")
-	dockerCpToContainer(t, c, rootsPEM, "/etc/pebble-root.pem")
+	dockerCpToContainer(t, c, apiRootPEM, "/etc/pebble-root.pem")
 
 	issuer := map[string]any{
 		"module":                  "acme",
@@ -278,6 +313,44 @@ func patchPebbleACME(t testing.TB, c *dockerfx.Container, rootsPEM []byte) {
 // dockerCpToContainer uploads a small file into a running container via the
 // Docker daemon's /containers/{id}/archive endpoint. We tar the single file
 // and PUT it at the destination directory.
+// dockerCpFromContainer reads one file out of a container, through the same
+// archive API dockerCpToContainer writes with.
+func dockerCpFromContainer(t testing.TB, c *dockerfx.Container, srcPath string) []byte {
+	t.Helper()
+	q := url.Values{}
+	q.Set("path", srcPath)
+	req, _ := http.NewRequest(http.MethodGet, "http://docker/containers/"+c.ID+"/archive?"+q.Encode(), nil)
+	tr := &http.Transport{
+		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, "unix", "/var/run/docker.sock")
+		},
+	}
+	cli := &http.Client{Transport: tr, Timeout: 10 * time.Second}
+	resp, err := cli.Do(req)
+	if err != nil {
+		t.Fatalf("docker cp out %s: %v", srcPath, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<16))
+		t.Fatalf("docker cp out %s failed: %d %s", srcPath, resp.StatusCode, raw)
+	}
+	tr2 := tar.NewReader(resp.Body)
+	for {
+		hdr, err := tr2.Next()
+		if err != nil {
+			t.Fatalf("docker cp out %s: no file in the archive: %v", srcPath, err)
+		}
+		if hdr.Typeflag == tar.TypeReg {
+			b, err := io.ReadAll(io.LimitReader(tr2, 1<<20))
+			if err != nil {
+				t.Fatalf("docker cp out %s: %v", srcPath, err)
+			}
+			return b
+		}
+	}
+}
+
 func dockerCpToContainer(t testing.TB, c *dockerfx.Container, content []byte, dstPath string) {
 	t.Helper()
 	dir, name := filepath.Split(dstPath)
@@ -361,8 +434,10 @@ func fetchPebbleRoots(t testing.TB, pebble *dockerfx.Container) []byte {
 // pebbleIssuanceCount counts "Signing certificate" lines in Pebble's logs.
 // Combined with PEBBLE_AUTHZREUSE=0 every cache miss produces a fresh order
 // and a fresh log line — a reliable proxy for "new certs issued".
+// pebbleIssuanceCount counts certificates Pebble issued. Pebble 2.x logs
+// "Issued certificate serial <n> for order <id>" for each one (ca/ca.go).
 func pebbleIssuanceCount(pebble *dockerfx.Container) int {
-	return pebble.LogContains("Signing certificate")
+	return pebble.LogContains("Issued certificate serial")
 }
 
 func mustGet(t testing.TB, c *http.Client, urlStr string) *http.Response {
@@ -415,7 +490,7 @@ type e2eHarness struct {
 // startInProcessSandboxd builds a Service + TLS-ask handler bound to an
 // ephemeral 0.0.0.0 port (so the Caddy container reaches it via
 // host.docker.internal) and installs the on-demand TLS policy on Caddy.
-func startInProcessSandboxd(t testing.TB, caddyCont *dockerfx.Container) *e2eHarness {
+func startInProcessSandboxd(t testing.TB, caddyCont *dockerfx.Container, toolboxPort int) *e2eHarness {
 	t.Helper()
 	dbPath := filepath.Join(t.TempDir(), "state.db")
 	st, err := store.Open(dbPath)
@@ -433,10 +508,18 @@ func startInProcessSandboxd(t testing.TB, caddyCont *dockerfx.Container) *e2eHar
 		HTTPClientTimeout:          5 * time.Second,
 		EnableCaddy:                true,
 		CaddyAdminURL:              "http://127.0.0.1:" + caddyCont.HostPort("2019/tcp"),
+		// The HTTP server in caddyfx's config.json.tmpl, and the daemon's
+		// default (SB_CADDY_SERVER_ID); empty, routes went to no server.
+		CaddyServerID: "srv0",
+		ToolboxPort:   toolboxPort,
 	}
 	caddyClient := caddy.New(cfg)
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	svc := service.NewForE2ETest(cfg, logger, st, caddyClient)
+	// AddCustomDomain checks a DNS TXT record proving the caller owns the
+	// domain. The test's operator context carries no owner, so the record
+	// holds the value prefix and the hostname, as an operator publishes it.
+	svc.SetDNSResolver(ownershipTXT{value: models.CustomDomainTXTValue(cfg.CustomDomainVerifyValuePrefix, "", e2eHostname)})
 
 	resolver := storeResolver{st: st}
 	askHandler := ingressproxy.NewTLSAskHandler(ingressproxy.TLSAskDeps{
@@ -509,6 +592,14 @@ func rewireSandboxdAt(t testing.TB, h *e2eHarness, caddyCont *dockerfx.Container
 // cmd/sandboxd/main.go and isn't needed here.
 type storeResolver struct{ st *store.Store }
 
+// ownershipTXT answers every TXT lookup with one record: the domain owner's
+// proof, already published.
+type ownershipTXT struct{ value string }
+
+func (o ownershipTXT) LookupTXT(context.Context, string) ([]string, error) {
+	return []string{o.value}, nil
+}
+
 func (r storeResolver) ResolveCustomDomain(ctx context.Context, hostname string) (string, error) {
 	return r.st.ResolveCustomDomain(ctx, hostname)
 }
@@ -517,9 +608,11 @@ func mustCreateE2ESandboxRow(t testing.TB, st *store.Store, id string) {
 	t.Helper()
 	now := time.Now().UTC()
 	sb := &models.Sandbox{
-		ID:           id,
-		Image:        "test-image",
-		Status:       models.SandboxStatusStarted,
+		ID:     id,
+		Image:  "test-image",
+		Status: models.SandboxStatusStarted,
+		// Caddy runs in a container; the test backend listens on the host.
+		ContainerIP:  "host.docker.internal",
 		CreatedAt:    now,
 		UpdatedAt:    now,
 		LastActiveAt: now,
