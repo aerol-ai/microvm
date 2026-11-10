@@ -41,7 +41,10 @@ type Spec struct {
 	HostBinds   []string // "hostPath:containerPath[:ro]"
 	ExtraHosts  []string // "host.docker.internal:host-gateway"
 	Network     string   // user-defined bridge to attach to
-	ReadyProbe  func(*Container) error
+	// Aliases are extra names other containers on Network reach this one
+	// by. Docker's network DNS knows only the container name otherwise.
+	Aliases    []string
+	ReadyProbe func(*Container) error
 }
 
 // Container is a started container with its inspected runtime details.
@@ -140,8 +143,12 @@ func (c *Client) Start(t testing.TB, s Spec) *Container {
 		body["Cmd"] = s.Cmd
 	}
 	if s.Network != "" {
+		endpoint := map[string]any{}
+		if len(s.Aliases) > 0 {
+			endpoint["Aliases"] = s.Aliases
+		}
 		body["NetworkingConfig"] = map[string]any{
-			"EndpointsConfig": map[string]any{s.Network: map[string]any{}},
+			"EndpointsConfig": map[string]any{s.Network: endpoint},
 		}
 	}
 

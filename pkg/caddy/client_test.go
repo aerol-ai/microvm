@@ -615,8 +615,11 @@ func TestRouteCases(t *testing.T) {
 				if err := client.EnsureOnDemandTLS(context.Background(), "http://ask", 10, time.Second); err != nil {
 					t.Fatalf("EnsureOnDemandTLS error = %v", err)
 				}
-				if countMethod(fake.records, http.MethodPost) != 0 {
-					t.Fatalf("should not POST policy if it exists")
+				// The on_demand leaf is POSTed too; only a policy POST counts.
+				for _, rec := range fake.records {
+					if rec.Method == http.MethodPost && rec.Path == "/config/apps/tls/automation/policies" {
+						t.Fatalf("should not POST policy if it exists")
+					}
 				}
 			},
 		},
@@ -1639,7 +1642,7 @@ func newFakeCaddy(t *testing.T) *fakeCaddy {
 			default:
 				t.Fatalf("unexpected method %s for %s", r.Method, r.URL.Path)
 			}
-		case r.Method == http.MethodPut && r.URL.Path == "/config/apps/tls/automation/on_demand":
+		case r.Method == http.MethodPost && r.URL.Path == "/config/apps/tls/automation/on_demand":
 			fake.hasOnDemand = true
 			w.WriteHeader(http.StatusOK)
 		case r.Method == http.MethodGet && r.URL.Path == "/config/apps/tls/automation/policies":

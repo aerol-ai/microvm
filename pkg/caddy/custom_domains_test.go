@@ -177,8 +177,11 @@ func TestEnsureOnDemandTLS_FreshCaddy(t *testing.T) {
 	if srv.onDemand == nil {
 		t.Fatalf("on_demand leaf not written")
 	}
-	if got := srv.onDemand["ask"]; got != "http://127.0.0.1:21213/internal/tls-ask" {
-		t.Fatalf("ask = %v", got)
+	if got, ok := onDemandEndpoint(srv); !ok || got != "http://127.0.0.1:21213/internal/tls-ask" {
+		t.Fatalf("on_demand = %v, want the http permission module with the ask URL", srv.onDemand)
+	}
+	if _, ok := srv.onDemand["ask"]; ok {
+		t.Fatalf("on_demand still sets the deprecated ask: %v", srv.onDemand)
 	}
 	if _, ok := srv.onDemand["rate_limit"]; ok {
 		t.Fatalf("rate_limit must not be written; deployed Caddy rejects that field: %v", srv.onDemand)
@@ -193,8 +196,36 @@ func TestEnsureOnDemandTLS_FreshCaddy(t *testing.T) {
 	}
 }
 
+// onlyInternalIssuers mirrors Caddy's exception: a policy issued only by
+// Caddy's own CA puts no load on public ACME, so it needs no permission.
+func onlyInternalIssuers(p map[string]any) bool {
+	issuers, _ := p["issuers"].([]any)
+	if len(issuers) == 0 {
+		return false
+	}
+	for _, raw := range issuers {
+		if m, _ := raw.(map[string]any); m["module"] != "internal" {
+			return false
+		}
+	}
+	return true
+}
+
+// onDemandEndpoint is the ask URL the fake holds, from the http permission
+// module.
+func onDemandEndpoint(f *fakeAutomationServer) (string, bool) {
+	perm, _ := f.onDemand["permission"].(map[string]any)
+	if perm["module"] != "http" {
+		return "", false
+	}
+	endpoint, ok := perm["endpoint"].(string)
+	return endpoint, ok
+}
+
 // EnsureOnDemandTLS — second boot. on_demand leaf is replaced (so config
-// changes take effect) but the catch-all policy is NOT duplicated.
+// changes take effect) but the catch-all policy is NOT duplicated. Against a
+// Caddy that already holds on_demand, as after any restart: the client used
+// to PUT it, which Caddy answers 409.
 func TestEnsureOnDemandTLS_Idempotent(t *testing.T) {
 	srv := newFakeAutomationServer(t)
 	defer srv.Close()
@@ -209,7 +240,7 @@ func TestEnsureOnDemandTLS_Idempotent(t *testing.T) {
 	if len(srv.policies) != 1 {
 		t.Fatalf("policy duplicated on second call: %d", len(srv.policies))
 	}
-	if got := srv.onDemand["ask"]; got != "http://x/ask" {
+	if got, _ := onDemandEndpoint(srv); got != "http://x/ask" {
 		t.Fatalf("second call did not replace on_demand leaf: %v", srv.onDemand)
 	}
 }
@@ -252,6 +283,28 @@ func TestEnsureOnDemandTLS_RejectsBadInput(t *testing.T) {
 
 // EnsureOnDemandTLS — Caddy disabled is a no-op (mirrors every other
 // helper).
+// A Caddy that resumed its saved config after a restart already holds
+// on_demand and the on-demand policy. The next sandboxd start must still
+// write the current ask URL: it used to PUT on_demand, which Caddy answers
+// 409 "key already exists", so the boot logged a failure and kept the old URL.
+func TestEnsureOnDemandTLS_AfterRestart(t *testing.T) {
+	srv := newFakeAutomationServer(t)
+	defer srv.Close()
+	srv.onDemand = map[string]any{"permission": map[string]any{"module": "http", "endpoint": "http://old-ingress:21213/internal/tls-ask"}}
+	srv.policies = []map[string]any{{"on_demand": true}}
+	client := &Client{enabled: true, baseURL: srv.URL, httpClient: srv.Client}
+
+	if err := client.EnsureOnDemandTLS(context.Background(), "http://new-ingress:21213/internal/tls-ask", 5, time.Minute); err != nil {
+		t.Fatalf("EnsureOnDemandTLS after a restart: %v", err)
+	}
+	if got, _ := onDemandEndpoint(srv); got != "http://new-ingress:21213/internal/tls-ask" {
+		t.Fatalf("on_demand = %v, want the new ask URL", srv.onDemand)
+	}
+	if len(srv.policies) != 1 {
+		t.Fatalf("policy duplicated: %d", len(srv.policies))
+	}
+}
+
 func TestEnsureOnDemandTLS_Disabled(t *testing.T) {
 	client := &Client{enabled: false}
 	if err := client.EnsureOnDemandTLS(context.Background(), "http://x", 5, time.Minute); err != nil {
@@ -260,7 +313,10 @@ func TestEnsureOnDemandTLS_Disabled(t *testing.T) {
 }
 
 // fakeAutomationServer is a stripped-down Caddy admin emulator covering
-// only the apps/tls/automation/* paths EnsureOnDemandTLS touches.
+// only the apps/tls/automation/* paths EnsureOnDemandTLS touches. It keeps
+// the two Caddy rules the client broke against for months: PUT only creates
+// (409 once a key exists), and since Caddy 2.10 an on-demand policy needs
+// on_demand.permission (the deprecated "ask" is converted too late).
 type fakeAutomationServer struct {
 	URL    string
 	Client *http.Client
@@ -280,7 +336,11 @@ func newFakeAutomationServer(t *testing.T) *fakeAutomationServer {
 		defer f.mu.Unlock()
 		switch r.URL.Path {
 		case "/config/apps/tls/automation/on_demand":
-			if r.Method != http.MethodPut {
+			switch {
+			case r.Method == http.MethodPut && f.onDemand != nil:
+				http.Error(w, `{"error":"[/config/apps/tls/automation/on_demand] key already exists: on_demand"}`, http.StatusConflict)
+				return
+			case r.Method != http.MethodPost && r.Method != http.MethodPut:
 				http.Error(w, "method", http.StatusMethodNotAllowed)
 				return
 			}
@@ -306,6 +366,12 @@ func newFakeAutomationServer(t *testing.T) *fakeAutomationServer {
 				if err := json.Unmarshal(body, &p); err != nil {
 					http.Error(w, "decode", http.StatusBadRequest)
 					return
+				}
+				if on, _ := p["on_demand"].(bool); on && !onlyInternalIssuers(p) {
+					if _, ok := f.onDemand["permission"]; !ok {
+						http.Error(w, `{"error":"loading new config: ... provisioning automation policy 0: on-demand TLS cannot be enabled without a permission module to prevent abuse"}`, http.StatusInternalServerError)
+						return
+					}
 				}
 				f.policies = append(f.policies, p)
 				w.WriteHeader(http.StatusOK)

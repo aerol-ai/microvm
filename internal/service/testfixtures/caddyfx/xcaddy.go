@@ -16,6 +16,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"testing"
 	"text/template"
 )
@@ -56,15 +58,21 @@ func Render(t testing.TB, cfg Config) []byte {
 	return buf.Bytes()
 }
 
-// Build returns a path to a Caddy binary linked with certmagic-s3. The binary
-// is cached in $TMPDIR/aerolvm-e2e-caddy-<version>/caddy and only rebuilt on
+// xcaddyModule is the xcaddy the fixture builds Caddy with, as release.yml.
+const xcaddyModule = "github.com/caddyserver/xcaddy/cmd/xcaddy@v0.4.6"
+
+// Build returns a path to a Linux Caddy binary linked with certmagic-s3, for
+// HostMount: it always runs inside a Linux container, so it is built for
+// linux whatever the host is, on the host's CPU (Docker on a Mac runs a Linux
+// VM of the same architecture). It used to be built for the host, so on a Mac
+// the container could not start it. The binary is cached in
+// $TMPDIR/aerolvm-e2e-caddy-<version>-linux-<arch>/caddy and only rebuilt on
 // absence; the version in the path means a bump never reuses an old build.
-// xcaddy itself is fetched via `go run` so no global install is required.
 // On any toolchain / network failure the test is skipped — this is an
 // operator-runnable path, not a CI gate.
 func Build(t testing.TB) string {
 	t.Helper()
-	cacheDir := filepath.Join(os.TempDir(), "aerolvm-e2e-caddy-"+caddyVersion)
+	cacheDir := filepath.Join(os.TempDir(), "aerolvm-e2e-caddy-"+caddyVersion+"-linux-"+runtime.GOARCH)
 	binPath := filepath.Join(cacheDir, "caddy")
 	if _, err := os.Stat(binPath); err == nil {
 		return binPath
@@ -72,14 +80,16 @@ func Build(t testing.TB) string {
 	if err := os.MkdirAll(cacheDir, 0o755); err != nil {
 		t.Fatalf("caddyfx: mkdir cache: %v", err)
 	}
-	args := []string{
-		"run", "github.com/caddyserver/xcaddy/cmd/xcaddy@v0.4.6",
-		"build", caddyVersion,
-		"--output", binPath,
-		"--with", certmagicS3Module,
+	// xcaddy runs on this host, so it is installed for the host. `go run`
+	// with GOOS=linux would build a Linux xcaddy that a Mac cannot start.
+	gobin := filepath.Join(cacheDir, "bin")
+	install := exec.Command("go", "install", xcaddyModule)
+	install.Env = append(hostEnv(), "GOBIN="+gobin)
+	if out, err := install.CombinedOutput(); err != nil {
+		t.Skipf("caddyfx: go install %s failed (%v); needs Go toolchain + network\n%s", xcaddyModule, err, out)
 	}
-	cmd := exec.Command("go", args...)
-	cmd.Env = append(os.Environ(), "CGO_ENABLED=0")
+	cmd := exec.Command(filepath.Join(gobin, "xcaddy"), "build", caddyVersion, "--output", binPath, "--with", certmagicS3Module)
+	cmd.Env = append(hostEnv(), "CGO_ENABLED=0", "GOOS=linux", "GOARCH="+runtime.GOARCH)
 	cmd.Dir = cacheDir
 	out, err := cmd.CombinedOutput()
 	if err != nil {
@@ -89,6 +99,20 @@ func Build(t testing.TB) string {
 		t.Skipf("caddyfx: xcaddy produced no binary at %s: %v\n%s", binPath, err, out)
 	}
 	return binPath
+}
+
+// hostEnv is this process's environment without GOOS and GOARCH, so a
+// caller's cross-compile settings reach neither the xcaddy install nor
+// override the target set above.
+func hostEnv() []string {
+	var env []string
+	for _, kv := range os.Environ() {
+		if strings.HasPrefix(kv, "GOOS=") || strings.HasPrefix(kv, "GOARCH=") {
+			continue
+		}
+		env = append(env, kv)
+	}
+	return env
 }
 
 // HostMount returns a docker bind spec (`hostPath:containerPath:ro`) that
