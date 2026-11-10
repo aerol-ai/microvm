@@ -74,14 +74,15 @@ Mitigation:
 - If no leader exists, move to lost-quorum recovery.
 - If snapshot errors correlate with disk full, free disk or move the node out
   of service.
-- `SandboxdRaftPipelineStall` (`aerolvm_raft_pipeline_stalls_total` rose by
-  2 or more in 30 minutes): the leader's fast send path to a follower keeps
-  getting stuck. sandboxd resets it each time, and the follower catches up
-  the normal way, but a follower that keeps rejecting appends needs a look.
-  A single reset after a follower restart or a leader change is expected and
-  does not fire the alert. Find the follower in the leader's journal
-  (`raft replication pipeline send stalled`, `peer=`) and check that node's
-  health, disk and Raft log errors.
+- `SandboxdRaftPipelineStall` (`aerolvm_raft_pipeline_stalls_total` for one
+  follower, its `key` label, rose by 2 or more in 30 minutes): the leader's
+  fast send path to that follower keeps getting stuck. sandboxd resets it
+  each time, and the follower catches up the normal way, but a follower that
+  keeps rejecting appends needs a look. A single reset after a follower
+  restart or a leader change is expected, and single resets on different
+  followers (a rolling upgrade) do not fire the alert. The alert names the
+  follower; check that node's health, disk and Raft log errors, and the
+  leader's journal (`raft replication pipeline send stalled`, `peer=`).
 
 ## Scheduler and Capacity Checks
 

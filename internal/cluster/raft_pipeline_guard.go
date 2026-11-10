@@ -70,6 +70,10 @@ func (t *pipelineGuardTransport) AppendEntriesPipeline(id raft.ServerID, target 
 		return nil, err
 	}
 	gp := &guardedPipeline{AppendPipeline: p, guard: t, peer: id}
+	// Export this follower's series at 0 before any stall. A series that
+	// first appears at 1 gives Prometheus's increase() nothing to count, so
+	// the first stall would be invisible to the alert.
+	raftPipelineStalls.Add(string(id), 0)
 	t.mu.Lock()
 	t.open[gp] = struct{}{}
 	t.mu.Unlock()
@@ -110,7 +114,7 @@ type guardedPipeline struct {
 // send the timer is stopped before it fires; nothing else changes.
 func (p *guardedPipeline) AppendEntries(args *raft.AppendEntriesRequest, resp *raft.AppendEntriesResponse) (raft.AppendFuture, error) {
 	watchdog := time.AfterFunc(p.guard.stallAfter, func() {
-		raftPipelineStalls.Add(1)
+		raftPipelineStalls.Add(string(p.peer), 1)
 		if p.guard.logger != nil {
 			p.guard.logger.Warn("raft replication pipeline send stalled; closing the pipeline so the follower falls back to plain replication",
 				"peer", p.peer, "stalled_for", p.guard.stallAfter)
