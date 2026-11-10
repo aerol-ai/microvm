@@ -196,6 +196,9 @@ type gossipNode struct {
 	// peerCache remembers live control-plane peers across restarts; nil when
 	// no directory was configured. See gossip_peer_cache.go for why.
 	peerCache *gossipPeerCache
+	// memberCache remembers a few live workers or ingress nodes, for
+	// syncRememberedPeers; nil when no directory was configured.
+	memberCache *gossipPeerCache
 	// selfGossipAddr is excluded from every rejoin list.
 	selfGossipAddr string
 	// rejoinInFlight keeps a slow rejoin (serial dials, TCP timeouts to a
@@ -668,15 +671,25 @@ func setupGossip(cfg gossipSetupConfig, admitter *capacity.Admitter, logger *slo
 		bootstrapPeers:     append([]string(nil), cfg.BootstrapPeers...),
 		joinBootstrapPeers: ml.Join,
 		peerCache:          newGossipPeerCache(cfg.PeerCacheDir),
+		memberCache:        newGossipMemberCache(cfg.PeerCacheDir),
 		selfGossipAddr:     selfGossipAddr,
 	}
 	// Loaded but deliberately not dialled here: setupGossip is on the boot
 	// path, and a stale entry whose host is gone costs a full TCP timeout.
-	// The refresh loop's first tick rejoins through them in the background.
+	// syncRememberedPeers dials them in the background instead.
 	if cached := gn.peerCache.load(); len(cached) > 0 && logger != nil {
 		logger.Info("cluster gossip remembered peers loaded", "peers", cached)
 	}
+	if cached := gn.memberCache.load(); len(cached) > 0 && logger != nil {
+		logger.Info("cluster gossip remembered members loaded", "members", cached)
+	}
 	gn.refreshMemberIndex()
+	if gn.rejoinInFlight.CompareAndSwap(false, true) {
+		go func() {
+			defer gn.rejoinInFlight.Store(false)
+			gn.syncRememberedPeers()
+		}()
+	}
 	go func() {
 		defer close(gn.refreshDone)
 		gn.runRefreshLoop(refreshCtx, interval)
@@ -711,30 +724,77 @@ func (g *gossipNode) runRefreshLoop(ctx context.Context, interval time.Duration)
 	}
 }
 
-// rememberLivePeers persists the currently-alive control-plane peers. A write
-// failure only costs the next restart its fallback, so it is logged, not fatal.
+// rememberLivePeers persists the currently-alive control-plane peers, and a
+// few other alive members (pickMemberPeers). A write failure only costs the
+// next restart its fallback, so it is logged, not fatal.
 func (g *gossipNode) rememberLivePeers(nodes []*memberlist.Node) {
-	if g == nil || g.peerCache == nil {
+	if g == nil || (g.peerCache == nil && g.memberCache == nil) {
 		return
 	}
 	selfNodeID := ""
 	if g.delegate != nil {
 		selfNodeID = g.delegate.nodeID
 	}
-	if err := g.peerCache.remember(liveControlPlanePeerAddrs(nodes, selfNodeID)); err != nil && g.logger != nil {
+	controlPlane, others := livePeerAddrsByRole(nodes, selfNodeID)
+	if err := g.peerCache.remember(controlPlane); err != nil && g.logger != nil {
 		g.logger.Warn("cluster gossip could not persist remembered peers", "path", g.peerCache.path, "error", err)
+	}
+	if err := g.memberCache.remember(pickMemberPeers(selfNodeID, others, g.memberCache.snapshot())); err != nil && g.logger != nil {
+		g.logger.Warn("cluster gossip could not persist remembered members", "path", g.memberCache.path, "error", err)
 	}
 }
 
-// rejoinPeers is configured peers plus remembered ones, minus self.
+// rejoinPeers is configured peers plus remembered ones (control-plane peers
+// first, then members), minus self.
 func (g *gossipNode) rejoinPeers() []string {
-	var cached []string
-	if g.peerCache != nil {
-		g.peerCache.mu.Lock()
-		cached = append([]string(nil), g.peerCache.last...)
-		g.peerCache.mu.Unlock()
-	}
+	cached := append(g.peerCache.snapshot(), g.memberCache.snapshot()...)
 	return mergeRejoinPeers(g.bootstrapPeers, cached, g.selfGossipAddr)
+}
+
+// syncRememberedPeers runs once, in the background, when gossip starts: it
+// dials every remembered peer this node cannot see yet, so one push/pull
+// with a member that did not restart hands over the whole membership.
+//
+// Why: memberlist keeps nothing across a restart, so a restarted node knows
+// only what its bootstrap join returned. When every server restarts at once
+// (UC-481), that is the other servers and none of the workers or ingress
+// nodes. The agents call back only through maybeRejoinBootstrapPeers, once
+// every server looks dead to them, and a restarted server answers their
+// probes under its old name, so that took 12 to 22 s in a loopback repro.
+// They call back only the servers in their own peer cache, which had already
+// lost a server that looked dead before the others; that server waited for
+// an agent's periodic full sync (30 s on memberlist's LAN defaults) and kept
+// refusing the ingress with "not in membership": 58 s in a live run, against
+// UC-481's 55 s budget. Dialling is never on the boot path: a remembered
+// host that is gone costs a TCP timeout here, in the background.
+func (g *gossipNode) syncRememberedPeers() {
+	if g == nil || g.joinBootstrapPeers == nil {
+		return
+	}
+	visible := make(map[string]bool)
+	for _, n := range g.memberlistNodes() {
+		if n != nil && n.State == memberlist.StateAlive && len(n.Addr) > 0 {
+			visible[n.Address()] = true
+		}
+	}
+	var peers []string
+	for _, p := range mergeRejoinPeers(nil, append(g.peerCache.snapshot(), g.memberCache.snapshot()...), g.selfGossipAddr) {
+		if !visible[p] {
+			peers = append(peers, p)
+		}
+	}
+	if len(peers) == 0 {
+		return
+	}
+	joined, err := g.joinBootstrapPeers(peers)
+	if g.logger == nil {
+		return
+	}
+	if err != nil {
+		g.logger.Warn("cluster gossip could not sync with remembered peers", "peers", peers, "joined", joined, "error", err)
+		return
+	}
+	g.logger.Info("cluster gossip synced with remembered peers", "peers", peers, "joined", joined)
 }
 
 func (g *gossipNode) memberlistNodes() []*memberlist.Node {
