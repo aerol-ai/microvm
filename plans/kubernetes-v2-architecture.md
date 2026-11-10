@@ -1451,22 +1451,44 @@ or the smoke test until the spike worked around it. Phase 1 must fix each in
 | F4 | `/health` reports "degraded" because it pings Docker (confirms C2). Docker's reconcile and event stream log an error every 30 s. | None needed | C2, plus: no Docker client at all on the containerd engine |
 | F5 | The egress floor and node guard for runtime `docker` need Docker, so creates on that runtime are refused; the containerd ones install. | None needed | The same as F4 |
 | F6 | Hostname-filtered egress needs the egress gateway (its user and socket), which the pod lacks, so those creates are refused. | None | The gateway as one more container in the worker pod |
+| F7 | Bottlerocket 1.68 sets `user.max_user_namespaces=0`. gVisor's gofer makes a user namespace, so every gVisor create fails with "fork/exec /proc/self/exe: no space left on device". It also means Kubernetes user namespaces (spike S9) cannot work on a default Bottlerocket node. | Raised to 62775 at run time from a node debug pod | A bank decision, not code: Bottlerocket's `settings.kernel.sysctl` raises it per node pool. The chart's docs and `aerolvm k8s verify` (P8) must check it. |
 
 **S1, where a sandbox lands: half done** (same run).
 
 - **Network: pass.** The bridge `aerolvm0`, the sandboxes' links and the
   network-namespace pool are all inside the pod's network. The machine's own
   links (`lo`, its two ENIs, one VPC CNI link) show none of them.
-- **cgroup: fails as §8.3 predicted.** The sandbox's processes
+- **cgroup, without C7: fails as §8.3 predicted.** The sandbox's processes
   (`runsc-sandbox`, `runsc-gofer`) sit in `/aerolvm/<sandbox id>` at the
   machine's top level, outside the pod's
   `kubepods.slice/kubepods-pod….slice/cri-containerd-….scope`. Only the shim
   and runsc's fd-parking process stay inside. So Kubernetes does not see the
-  sandbox's CPU and memory, and the pod's limit does not cap it. Next: the C7
-  prototype (place every sandbox under the pod's cgroup), then S1 again, on
-  AL2023 and on Bottlerocket.
+  sandbox's CPU and memory, and the pod's limit does not cap it.
+- **cgroup, with the C7 prototype, AL2023: pass** (run `p0-s1-al2023`,
+  2026-11-10). `SB_CONTAINERD_CGROUP_PARENT` puts every sandbox at
+  `<parent>/<id>`; the worker's supervisor moves its own processes into
+  `supervisor/`, hands cpu, memory and pids down, and points `sandboxd` at
+  `<its own group>/sandboxes`. The gVisor sandbox (`gvisor_sentry` and its
+  parent) now sits in `…/cri-containerd-<worker>.scope/sandboxes/<id>`; the
+  shim and runsc's helpers sit in `…/supervisor`. Its memory (13.8 MB) is
+  charged inside the worker container's group, whose `memory.max` is the
+  pod's 12 GiB limit. `kubectl exec` into the worker still works. Cold
+  create: 1,872 ms.
+- **cgroup, with the C7 prototype, Bottlerocket 1.68.1: pass, with F2's and
+  F7's stand-ins** (same cluster, worker node group swapped). Every process
+  of the worker pod sits in the pod's group: `sandboxd`, containerd, the shim
+  and runsc's helpers in `supervisor/`, the gVisor sandbox in
+  `sandboxes/<id>`. The sandbox keeps its own limit inside the pod's
+  (`memory.max` 1 GiB under the container's 12 GiB). Cold create: 1,726 ms.
+  Bottlerocket's node containerd is 2.2.9, AL2023's 2.3.7; both run kernel
+  6.18.56.
 
-**Cost so far:** one cluster, up about 80 minutes, about $0.45.
+**S1 verdict: pass on both EKS images, once C7 and the F2 and F7 stand-ins
+are in place.** K2 and K3 stand so far; S2 (the in-place upgrade) decides the
+rest.
+
+**Cost so far:** two clusters, about 80 and 90 minutes, about $1.00 in
+all.
 
 ## 19. Tests, drills and benchmarks
 

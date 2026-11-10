@@ -58,8 +58,9 @@ anything else, as the plan's Phase 0 exit gate says.
 | Step | State | Where the result is |
 |---|---|---|
 | H0 | **Done, 2026-11-10.** Pass after eight runs on one cluster; six findings for Phase 1 (F1 to F6) | v2 plan §18, "Phase 0 results" |
-| S1 | **Half done.** Network inside the pod: pass. cgroup: sandboxes land outside the pod, as predicted. Next: C7 prototype, then S1 again on AL2023 and Bottlerocket | Same |
-| S2 to S9, N1 | Not started | — |
+| S1 | **Done, 2026-11-10. Pass** on AL2023 and Bottlerocket with the C7 prototype (`SB_CONTAINERD_CGROUP_PARENT`), loading `br_netfilter` (F2) and, on Bottlerocket, raising `user.max_user_namespaces` (F7) | Same |
+| S2 | Next: split the pod into `runtime` and `agent` containers, change the `agent` image in place | — |
+| S3 to S9, N1 | Not started. S9 now has a known blocker on Bottlerocket (F7) | — |
 
 ## Cost, before it is spent
 

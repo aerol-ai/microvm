@@ -45,6 +45,23 @@ token="$(openssl rand -hex 24)"
 umask 077
 echo "$token" > "$sd/api-token"
 
+# F2 stand-in (Phase 0 results, plan §18): stock EKS AL2023 nodes do not
+# load br_netfilter, and sandboxd refuses to start without it. A pod cannot
+# load a module without a host path, so the spike loads it once per worker
+# node from a node debug pod. Phase 1 must remove the need (plan §8.4).
+# modprobe runs in the debug container against the host's /lib/modules
+# (mounted at /host): Bottlerocket's host has no shell to chroot into.
+for n in $(kubectl get nodes -l aerolvm.io/pool=phase0 -o jsonpath='{.items[*].metadata.name}'); do
+  kubectl debug "node/$n" --profile=sysadmin --image=public.ecr.aws/amazonlinux/amazonlinux:2023 -- \
+    sh -c 'dnf -y -q install kmod >/dev/null && modprobe -d /host br_netfilter && echo "br_netfilter: $(grep -c ^br_netfilter /proc/modules) loaded"' >/dev/null 2>&1 || true
+done
+sleep 45
+for d in $(kubectl get pods -o name 2>/dev/null | grep node-debugger || true); do
+  kubectl logs "$d" 2>/dev/null | tail -2 >&2 || true
+  kubectl delete "$d" --wait=false >/dev/null
+done
+say "br_netfilter loaded on the worker nodes (F2 stand-in)"
+
 # 2. The namespace, the boot scripts, the URLs, then the pod.
 kubectl create namespace "$NS" --dry-run=client -o yaml | kubectl apply -f - >/dev/null
 kubectl label namespace "$NS" pod-security.kubernetes.io/enforce=privileged --overwrite >/dev/null
@@ -139,8 +156,12 @@ fi
 node_debug() {
   local before after p
   before="$(kubectl get pods -o name 2>/dev/null | grep node-debugger || true)"
+  # No chroot: Bottlerocket's host has no shell. The debug pod shares the
+  # machine's PID and network namespaces, and as a privileged container it
+  # sees the machine's whole cgroup tree, so /proc and /sys/fs/cgroup here
+  # are the machine's.
   kubectl debug "node/$node" --profile=sysadmin --image=public.ecr.aws/amazonlinux/amazonlinux:2023 -- \
-    chroot /host sh -c "$1" >/dev/null 2>&1 || true
+    sh -c "$1" >/dev/null 2>&1 || true
   for _ in $(seq 1 45); do
     after="$(kubectl get pods -o name 2>/dev/null | grep node-debugger | grep -vxF "$before" | head -1 || true)"
     if [[ -n "$after" ]] && [[ "$(kubectl get "$after" -o jsonpath='{.status.phase}')" =~ ^(Succeeded|Failed)$ ]]; then break; fi
@@ -153,10 +174,10 @@ node_debug() {
     say "(the debug pod did not finish)"
   fi
 }
-say "--- S1: where each runsc process sits, from the machine"
-node_debug "for p in \$(pgrep -f runsc); do printf '%s %s %s\n' \$p \$(cut -c1-30 /proc/\$p/comm) \$(cut -d: -f3 /proc/\$p/cgroup); done"
+say "--- S1: every process in the worker pod's cgroup, from the machine"
+node_debug "for d in /proc/[0-9]*; do g=\$(cut -d: -f3 \$d/cgroup 2>/dev/null); case \$g in *pod${uid}*) echo \${d#/proc/} \$(cat \$d/comm 2>/dev/null) \$g;; esac; done"
 say "--- S1: memory charged to the worker container's group and to its sandboxes"
-node_debug "for d in /sys/fs/cgroup/kubepods.slice/kubepods-pod${uid}.slice/cri-containerd-*.scope /sys/fs/cgroup/kubepods.slice/kubepods-pod${uid}.slice/cri-containerd-*.scope/sandboxes; do [ -d \$d ] && echo \$d memory.current=\$(cat \$d/memory.current) memory.max=\$(cat \$d/memory.max); done"
+node_debug "for d in /sys/fs/cgroup/kubepods.slice/kubepods-pod${uid}.slice/cri-containerd-*.scope /sys/fs/cgroup/kubepods.slice/kubepods-pod${uid}.slice/cri-containerd-*.scope/sandboxes /sys/fs/cgroup/kubepods.slice/kubepods-pod${uid}.slice/cri-containerd-*.scope/sandboxes/*/; do [ -d \$d ] && echo \$d memory.current=\$(cat \$d/memory.current) memory.max=\$(cat \$d/memory.max); done"
 say "--- S1: network links on the machine"
 node_debug "cut -d: -f1 /proc/net/dev | tail -n +3 | tr -d ' '"
 
