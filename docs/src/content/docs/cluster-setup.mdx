@@ -481,18 +481,33 @@ Your domain stops pointing at the nodes, but they keep their public IP addresses
 
 **With Terraform:** add a worker or ingress node to `nodes` and run `terraform apply`. It joins with the module's token for its role, which never expires.
 
-A **server** added later is different: the module's server token lasts 24 hours, so it no longer works. Add the machine with `blank = true`, which leaves it as plain Ubuntu, then join it by hand:
-
-```hcl
-srv4 = { role = "server", blank = true, instance_type = "t3.small" }
-```
+A **server** added later needs a fresh token. The module's server token lasts 24 hours, the same as a `kubeadm` token. So make a new one on one of your servers, the way `kubeadm token create` runs on a control-plane node:
 
 ```bash
-aerolvm join-command --role server
-ssh ubuntu@<srv4-ip>
+ssh ubuntu@<a server's IP>
+sudo sandboxd join-command --role server --ttl 2h --json
 ```
 
-On the machine, run the printed line, with your domain options before the word `join` as in [Step 3](#step-3-add-the-other-machines).
+Run it on a server, not from your computer: the cluster makes a server token only when a server asks, and `aerolvm join-command` from your computer goes through the ingress.
+
+Then add the node, and give it the `token` from that output in `node_join_tokens`:
+
+```hcl
+nodes = {
+  # ... your other nodes ...
+  srv4 = { role = "server", instance_type = "t3.small" }
+}
+
+node_join_tokens = {
+  srv4 = "<the token>"
+}
+```
+
+Run `terraform apply` within the 2 hours. Only `srv4` gets this token, so no other machine changes. Keep the entry after the node joins: removing it changes the node's user data, and Terraform would replace the machine. The token stops working after 2 hours anyway.
+
+If a node's token is refused for 5 minutes (expired, revoked or mistyped), its boot log says so and shows these steps. The log is `/var/log/aerolvm-bootstrap.log` on the node.
+
+You can also add a server by hand: add it with `blank = true`, which leaves it as plain Ubuntu, then run the line `sudo sandboxd join-command --role server` prints (on a server) on it, with your domain options before the word `join` as in [Step 3](#step-3-add-the-other-machines).
 
 ## Take a node out
 

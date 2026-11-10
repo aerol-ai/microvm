@@ -70,8 +70,16 @@ role, shaped `<6>.<32>` of `[a-z0-9]`:
 - Every other node waits for the seed's join port (7003), then runs the
   installer with `join https://<seed>:7003 --token <its role's token>`.
 - The worker and ingress tokens never expire, so a worker added to `nodes`
-  weeks later still joins. The server token lasts 24 hours; for a server
-  added later, make a fresh token with `aerolvm join-command --role server`.
+  weeks later still joins. The server token lasts 24 hours, as a kubeadm
+  token does. For a server added later, make a fresh token on a server
+  with `sudo sandboxd join-command --role server --ttl 2h --json` (a server
+  token can only be made through a server, not through the ingress) and set
+  it for that node only in `node_join_tokens` (`{ srv4 = "<token>" }`); no
+  other node's user data changes. Keep the entry after the node joins,
+  since removing it replaces that node.
+- A node whose token the join port keeps refusing (expired, revoked or
+  mistyped) stops waiting after 5 minutes, and its boot log names these
+  steps, instead of waiting out `seed_wait_max_seconds`.
 
 Nothing is copied between nodes: the servers sign every node's certificate.
 
@@ -271,9 +279,11 @@ phases:
    makes the cluster CA, the gossip key and the server key and starts Raft.
 3. **Every other node - `install.sh ... join`**: it waits for the seed's
    join port (`seed_wait_max_seconds`, default 30 min), then runs
-   `sandboxd join https://<seed-private-ip>:7003 --token <its role's token>
+   `sandboxd join https://<seed-private-ip>:7003 --token <its token>
    --node-id <name> --role <its-role>`, up to three tries (a join is safe to
-   run again).
+   run again). Its token is its `node_join_tokens` entry if it has one, else
+   the module's token for its role. Once the port answers, a token it keeps
+   refusing for 5 minutes stops the wait with what to do.
    With `one_line_join = false` (deprecated) steps 2 and 3 are the old
    `cluster-init.sh` / `cluster-join.sh` pair, with an S3 bucket hand-off
    and a signing loop on the seed.

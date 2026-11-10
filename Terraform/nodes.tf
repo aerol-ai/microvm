@@ -228,6 +228,7 @@ resource "aws_instance" "seed" {
     # One-line join (join.tf): the seed registers a token per role.
     one_line_join      = var.one_line_join
     join_token         = ""
+    join_role          = "server"
     join_token_worker  = local.join_tokens["worker"]
     join_token_ingress = local.join_tokens["ingress"]
     join_token_server  = local.join_tokens["server"]
@@ -489,8 +490,11 @@ resource "aws_instance" "joiner" {
     containerd_pool_cfg    = local.containerd_pool_cfg
     platform_volumes_cfg   = local.platform_volumes_cfg
     # One-line join (join.tf): a joiner holds only its own role's token.
-    one_line_join      = var.one_line_join
-    join_token         = local.join_tokens[local.node_join_role[each.key]]
+    one_line_join = var.one_line_join
+    # A fresh token for this node (node_join_tokens) beats the module's
+    # token for its role, which may have expired.
+    join_token         = lookup(var.node_join_tokens, each.key, local.join_tokens[local.node_join_role[each.key]])
+    join_role          = local.node_join_role[each.key]
     join_token_worker  = ""
     join_token_ingress = ""
     join_token_server  = ""
@@ -514,6 +518,13 @@ resource "aws_instance" "joiner" {
   lifecycle {
     ignore_changes       = [ami]
     replace_triggered_by = [aws_instance.seed]
+
+    # The seed starts the cluster and never joins, and a name that is not
+    # a node is a typo: either way the token would go nowhere.
+    precondition {
+      condition     = alltrue([for name in keys(var.node_join_tokens) : contains(keys(local.joiner_nodes), name)])
+      error_message = "node_join_tokens names a node that does not join: each key must be the name of a non-seed node in nodes."
+    }
   }
 }
 

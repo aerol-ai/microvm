@@ -57,6 +57,7 @@ module "aerolvm" {
   install_script_url                   = var.install_script_url
   caddy_binary_url                     = var.caddy_binary_url
   download_mirror                      = var.download_mirror
+  node_join_tokens                     = var.node_join_tokens
   secret_kms_enabled                   = var.secret_kms_enabled
   key_custody                          = var.key_custody
   secret_kms_strict_boot               = var.secret_kms_strict_boot

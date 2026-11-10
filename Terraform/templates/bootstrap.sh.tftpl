@@ -570,15 +570,37 @@ echo "[bootstrap] audit receiver started on :${audit_receiver_port}"
 ###############################################################################
 set +x
 JOIN_TOKEN='${join_token}'
-deadline=$(( $(date +%s) + ${seed_wait_max_seconds} ))
-until curl -fsSk --max-time 5 "https://${seed_private_ip}:7003/v1/join/cluster-info?token_id=$${JOIN_TOKEN%%.*}" >/dev/null 2>&1; do
-  if [ "$(date +%s)" -ge "$deadline" ]; then
-    echo "[bootstrap] timed out waiting for the seed's join port" >&2
-    exit 1
-  fi
-  echo "[bootstrap] waiting for the seed's join port..."
-  sleep 10
-done
+# wait_for_join_port waits while the seed's join port does not answer. Once
+# it answers, a refused token gets JOIN_REFUSED_GRACE seconds (the seed
+# registers the module's tokens a little after the port opens), then the
+# wait stops and says what to do, as kubeadm's discovery does. The port
+# says "invalid" for a token that is unknown, expired or revoked alike, and
+# the module's server token lasts 24h, so a server added later needs a
+# fresh token (node_join_tokens), not 30 minutes of waiting on this one.
+wait_for_join_port() {
+  local grace="$${JOIN_REFUSED_GRACE:-300}" poll="$${JOIN_POLL_SECONDS:-10}"
+  local deadline=$(( $(date +%s) + ${seed_wait_max_seconds} )) refused_since="" code now
+  while :; do
+    code=$(curl -sk -o /dev/null -w '%%{http_code}' --max-time 5 "https://${seed_private_ip}:7003/v1/join/cluster-info?token_id=$${JOIN_TOKEN%%.*}" 2>/dev/null) || true
+    now=$(date +%s)
+    case "$code" in
+      200) return 0 ;;
+      "" | 000) refused_since="" ;;
+      *) [ -n "$refused_since" ] || refused_since=$now ;;
+    esac
+    if [ -n "$refused_since" ] && [ $(( now - refused_since )) -ge "$grace" ]; then
+      echo "[bootstrap] the cluster's join port refused this node's join token for $(( now - refused_since ))s (HTTP $code): it is unknown, expired or revoked. The module's server token lasts 24h. Make a fresh token on a server with: sudo sandboxd join-command --role ${join_role} --ttl 2h --json, set node_join_tokens[\"${node_name}\"] to its \"token\", and apply again." >&2
+      return 1
+    fi
+    if [ "$now" -ge "$deadline" ]; then
+      echo "[bootstrap] timed out waiting for the seed's join port (last answer: HTTP $${code:-none})" >&2
+      return 1
+    fi
+    echo "[bootstrap] waiting for the seed's join port (HTTP $${code:-none})..."
+    sleep "$poll"
+  done
+}
+wait_for_join_port || exit 1
 joined=0
 for attempt in 1 2 3; do
   if curl -fsSL '${install_script_url}' | sudo bash -s -- "$${INSTALL_ARGS[@]}" join 'https://${seed_private_ip}:7003' \

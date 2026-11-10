@@ -172,6 +172,7 @@ locals {
     one_line_join = false
     blank = false
     join_token = ""
+    join_role = "server"
     join_token_worker = ""
     join_token_ingress = ""
     join_token_server = ""
