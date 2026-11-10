@@ -1533,8 +1533,38 @@ back if Kubernetes or containerd starts delegating a pod's cgroup to its user
 namespace, or for N6's one-team worker pools, where sandboxes sharing one
 limit may be acceptable.
 
-**Cost so far:** four clusters, about 3.9 hours of cluster time in all (78,
-49, 77 and about 31 minutes), about $1.35.
+**S7, a named list of rights instead of `privileged: true`: pass for the
+one-container worker on AL2023, with two stand-ins** (run `p0-s7`,
+2026-11-10). The pod ran with `privileged: false`, these rights added:
+`SYS_ADMIN`, `NET_ADMIN`, `NET_RAW`, `SYS_CHROOT`, `SYS_PTRACE`,
+`SYS_RESOURCE`, `MKNOD`, `SETUID`, `SETGID`, `SETPCAP`, `DAC_OVERRIDE`,
+`FOWNER`, `CHOWN` and `KILL`, and seccomp and AppArmor unconfined. A gVisor
+sandbox was created in 1,594 ms, a command ran, `kubectl exec` still works,
+and with C7 the sandbox sat in `<worker scope>/sandboxes/<id>` with its own
+1 GiB limit inside the pod's 12 GiB. The pod now has its own cgroup
+namespace and sees its group as `/`; the C7 setup handles that.
+
+The two stand-ins, both done with the pod's own `CAP_SYS_ADMIN`:
+
+- `/sys/fs/cgroup` comes read-only; the worker remounts it read-write.
+- `/proc/sys` comes read-only, and `sandboxd` sets per-network settings
+  there (`ip_forward` and the bridge ones, which live in the pod's own
+  network namespace). Kubernetes' own way is the pod's
+  `securityContext.sysctls`, but these count as "unsafe" and need the
+  kubelet's `--allowed-unsafe-sysctls`: a node setting the bank would make.
+
+What S7 does and does not buy, said plainly: `SYS_ADMIN` with seccomp off is
+still close to root on the machine. The gain is that every right not listed
+and the machine's devices are withheld, and the bank gets a list with a
+reason for each line instead of "privileged". It is still not enough for the
+split pod: S2's shared `/run/netns` needs Bidirectional mount propagation,
+which Kubernetes allows only in privileged containers. So S7 holds for the
+split worker only once F8's fix lands (make the namespaces in the runtime
+container). Not yet run: S7 on Bottlerocket (F7 applies there too) and S3
+with the list.
+
+**Cost so far:** five clusters, about 4.5 hours of cluster time in all,
+about $1.55.
 
 ## 19. Tests, drills and benchmarks
 

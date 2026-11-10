@@ -15,14 +15,22 @@ set -euo pipefail
 # shellcheck source=lib.sh
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib.sh"
 
-name="${1:?usage: h0.sh <name> [--c7]}"
-c7=0
-[[ "${2:-}" == "--c7" ]] && c7=1
-lib_init "$name" h0-report.txt
+name="${1:?usage: h0.sh <name> [--c7] [--s7]}"
+c7=0; manifest="$LIB_DIR/manifests/worker-h0.yaml"; rname=h0-report.txt
+for a in "${@:2}"; do
+  case "$a" in
+    --c7) c7=1 ;;
+    # S7: the same worker with a named list of rights, not privileged.
+    --s7) manifest="$LIB_DIR/manifests/worker-s7.yaml"; rname=s7-report.txt ;;
+    *) echo "h0: unknown flag $a" >&2; exit 2 ;;
+  esac
+done
+lib_init "$name" "$rname"
 
 publish_build
 load_br_netfilter
-apply_worker "$LIB_DIR/manifests/worker-h0.yaml" "$c7"
+apply_worker "$manifest" "$c7"
+say "privileged: $(kubectl -n "$NS" get pod "$POD" -o jsonpath='{.spec.containers[0].securityContext.privileged}'); added rights: $(kubectl -n "$NS" get pod "$POD" -o jsonpath='{.spec.containers[0].securityContext.capabilities.add}')"
 wait_ready
 wait_api
 

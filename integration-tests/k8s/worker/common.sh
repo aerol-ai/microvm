@@ -53,6 +53,16 @@ sandboxd_env() {
 c7_setup() {
   local self cg pid
   self="$(cut -d: -f3 /proc/self/cgroup)"
+  # A container that is not privileged gets its own cgroup namespace and sees
+  # its own group as "/" (S7, S9); avoid "//sandboxes".
+  [[ "$self" == / ]] && self=""
+  # It also gets /sys/fs/cgroup read-only. With a real CAP_SYS_ADMIN (not in
+  # a user namespace) it can remount it read-write; in a user namespace (S9)
+  # the remount is refused and the mkdir below fails, as recorded.
+  if awk '$5 == "/sys/fs/cgroup" {print $6}' /proc/self/mountinfo | grep -q '^ro'; then
+    # To stderr: this function's stdout is the path the caller captures.
+    mount -o remount,rw /sys/fs/cgroup >&2 2>&1 || true
+  fi
   cg="/sys/fs/cgroup${self}"
   mkdir -p "$cg/supervisor" "$cg/sandboxes"
   for pid in $(cat "$cg/cgroup.procs"); do

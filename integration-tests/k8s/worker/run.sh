@@ -9,7 +9,7 @@ set -euo pipefail
 # shellcheck source=common.sh
 source "$(dirname "$0")/common.sh"
 
-dnf -y -q install iproute iptables-nft nftables procps-ng >/dev/null
+dnf -y -q install iproute iptables-nft nftables procps-ng util-linux >/dev/null
 export PATH="/opt/aerolvm/bin:$PATH"
 
 # C7 prototype (spike S1): every sandbox goes under this pod's own cgroup.
@@ -29,6 +29,16 @@ for _ in $(seq 1 60); do
   sleep 1
 done
 [[ -S /run/containerd/containerd.sock ]] || { echo "run: containerd did not start" >&2; exit 1; }
+
+# S7 stand-in: a pod that is not privileged gets /proc/sys read-only, and
+# sandboxd sets per-network kernel settings there (ip_forward and the bridge
+# ones; these live in the pod's own network namespace). Kubernetes' own way is
+# the pod's securityContext.sysctls, but these count as "unsafe" and need the
+# kubelet's --allowed-unsafe-sysctls, a node setting. With CAP_SYS_ADMIN the
+# spike remounts it instead.
+if awk '$5 == "/proc/sys" {print $6}' /proc/self/mountinfo | grep -q '^ro'; then
+  mount -o remount,rw /proc/sys && echo "run: /proc/sys remounted read-write (S7 stand-in)"
+fi
 
 prepare_netfilter
 sandboxd_env
