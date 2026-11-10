@@ -54,19 +54,32 @@ func (c *capacityLeaseCache) freshLease(nodeID string, now time.Time) bool {
 	}
 	c.mu.RLock()
 	defer c.mu.RUnlock()
+	return c.freshLeaseLocked(nodeID, now)
+}
+
+// freshLeaseLocked is freshLease for a caller that holds c.mu.
+func (c *capacityLeaseCache) freshLeaseLocked(nodeID string, now time.Time) bool {
 	lease, ok := c.leases[nodeID]
 	return ok && now.Sub(lease.updated) <= c.ttl && hasCapacitySnapshot(lease.snapshot)
 }
 
 // joinOnDemand returns the fetch of nodeID to wait for. own is true when the
 // caller started it and must run it and call endOnDemand. It returns nil when
-// the last on-demand fetch of nodeID failed less than
-// capacityLeaseOnDemandGap ago.
+// nodeID's lease is fresh, or when the last on-demand fetch of nodeID failed
+// less than capacityLeaseOnDemandGap ago.
+//
+// Freshness is checked again here, under the lock that endOnDemand takes:
+// a caller's own freshLease check can run just before a fetch stores its
+// lease, and its joinOnDemand just after that fetch ended, which would
+// otherwise start a second fetch of a lease that is already fresh.
 func (c *capacityLeaseCache) joinOnDemand(nodeID string, now time.Time) (flight *leaseFlight, own bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if f, ok := c.onDemand[nodeID]; ok {
 		return f, false
+	}
+	if c.freshLeaseLocked(nodeID, now) {
+		return nil, false
 	}
 	if failed, ok := c.onDemandFailed[nodeID]; ok && now.Sub(failed) < capacityLeaseOnDemandGap {
 		return nil, false
