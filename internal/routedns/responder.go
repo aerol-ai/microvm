@@ -134,8 +134,10 @@ func (r *Responder) ServeDNS(w dns.ResponseWriter, req *dns.Msg) {
 		m.Answer = append(m.Answer, rr)
 	}
 	// An SOA only for the zone this responder really owns. Owner lookups
-	// (platform and tenant hosts) come straight from Caddy, which caches
-	// nothing, so they need no negative TTL. Claiming the platform domain's
+	// (platform and tenant hosts) come straight from Caddy's upstream source,
+	// which keeps a not-found answer for its own refresh interval (the
+	// aerolvm_route plugin) or not at all (the stock source), never for an
+	// SOA's negative TTL, so they need none. Claiming the platform domain's
 	// SOA is a lie that poisons anything that ever reaches this server by
 	// mistake: a mis-scoped system resolver fed it to Caddy's ACME zone
 	// lookup ("expected 1 zone, got 0 for <domain>"), and no cert issued.

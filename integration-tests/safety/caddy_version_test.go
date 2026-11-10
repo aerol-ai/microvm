@@ -58,6 +58,11 @@ func readCaddyPins(t *testing.T) caddyPins {
 	return p
 }
 
+// caddyPlugin is AerolVM's own Caddy plugin (the sandbox route's upstream
+// lookup), built from the checkout. Not an install.sh pin: Caddy's build
+// service cannot add it, so only xcaddy builds carry it.
+const caddyPlugin = "github.com/aerol-ai/microvm/caddymod=./caddymod"
+
 // caddyBuilders lists every file that builds Caddy, and what each must say.
 // Every one of them builds the custom Caddy, so every one names
 // CADDY_BUILD_VERSION.
@@ -66,6 +71,8 @@ func caddyBuilders(p caddyPins) map[string][]string {
 	return map[string][]string{
 		".github/workflows/release.yml": {
 			`xcaddy" build ` + v + ` \`,
+			"--with " + caddyPlugin + " \\",
+			"list-modules | grep -qx 'http.reverse_proxy.upstreams.aerolvm_route'",
 			"--with " + p.l4 + " ",
 			"--with " + p.cloudflare + " ",
 			"--with " + p.s3 + "\n",
@@ -73,6 +80,7 @@ func caddyBuilders(p caddyPins) map[string][]string {
 		},
 		"integration-tests/lib/build.sh": {
 			"xcaddy build " + v + ` \`,
+			"--with " + caddyPlugin + " \\",
 			"--with " + p.l4 + " ",
 			"--with " + p.cloudflare + " ",
 			"--with " + p.s3 + " ",
@@ -98,6 +106,19 @@ func TestCaddyBuildsUseThePinnedVersion(t *testing.T) {
 				t.Errorf("%s does not contain %q: it must build Caddy %s (install.sh's CADDY_BUILD_VERSION) with install.sh's plugin pins", file, want, p.buildVersion)
 			}
 		}
+	}
+}
+
+// The plugin compiles against the Caddy core a release builds: a Caddy bump
+// that breaks it fails the plugin's own tests, not the release build. Its
+// go.mod also takes part in the release build's version choice, so a
+// dependency it pins lower would not hold back the shipped Caddy, and one it
+// pins higher would raise it.
+func TestCaddyPluginUsesThePinnedVersion(t *testing.T) {
+	p := readCaddyPins(t)
+	src := readRepoFile(t, "caddymod", "go.mod")
+	if want := "\tgithub.com/caddyserver/caddy/v2 " + p.buildVersion + "\n"; !strings.Contains(src, want) {
+		t.Fatalf("caddymod/go.mod must require Caddy %s, install.sh's CADDY_BUILD_VERSION", p.buildVersion)
 	}
 }
 

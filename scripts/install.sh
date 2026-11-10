@@ -218,7 +218,11 @@ CADDY_VERSION="2.11.9"
 # custom build tracks this commit until a Caddy release includes it,
 # then this pin goes back to that tag.
 CADDY_BUILD_VERSION="v2.11.8-0.20261106223313-31f9f0cb9949"
-# The plugins in the custom build, at fixed versions.
+# The plugins in the custom build, at fixed versions. The release build also
+# carries AerolVM's own plugin from the same commit (caddymod/: the sandbox
+# route's upstream lookup). The build service in install_custom_caddy cannot
+# add it, so a Caddy from there routes with Caddy's stock lookup: it works,
+# and sandboxd logs a warning (pkg/caddy HasRouteUpstream).
 CADDY_L4_MODULE="github.com/mholt/caddy-l4@v0.1.2"
 CADDY_DNS_CLOUDFLARE_MODULE="github.com/caddy-dns/cloudflare@v0.2.4"
 CADDY_STORAGE_S3_MODULE="github.com/ss098/certmagic-s3@v0.0.0-20250922022452-8af482af5f39"

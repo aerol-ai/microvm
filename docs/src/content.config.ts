@@ -213,6 +213,7 @@ const getBlogSidebarConfig = (): NavigationGroup[] => [
       link('/engineering-frozen-kernel-problem', '- The frozen-kernel problem'),
       link('/randomness-in-cloned-sandboxes', '- Randomness in FC clones'),
       link('/engineering-sparse-disks', '- Stop and start, disk stays small'),
+      link('/engineering-route-lookup', '- Requests waited past 100 names'),
     ],
   },
   {
