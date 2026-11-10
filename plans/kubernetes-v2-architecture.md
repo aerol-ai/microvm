@@ -1427,6 +1427,47 @@ the gate below is met.**
 Order after the gate: N2 and N6 first, for the bank's security review; then N8;
 then N3, N4 and N5. N7 follows S6.
 
+### Phase 0 results
+
+Filled in as each spike runs (`plans/kubernetes-v2-phase0.md`). Harness:
+`integration-tests/k8s/`.
+
+**H0, the harness: pass** (2026-11-10, run `p0-h0-1`). EKS 1.36.5,
+Amazon Linux 2023 with kernel 6.18.56 on an m7i.xlarge worker. Inside one
+privileged pod: our own containerd 2.1.4, runc 1.3.0, the latest gVisor, and
+`sandboxd` built from this branch on the containerd engine. One gVisor sandbox
+was created in 1,878 ms (cold, image pull included, through a port-forward),
+and a command ran in it. The pod is in the Guaranteed class.
+
+**What the runs found that a VM never showed.** Each one stopped `sandboxd`
+or the smoke test until the spike worked around it. Phase 1 must fix each in
+`sandboxd`:
+
+| # | Found | Spike's stand-in | Phase 1 fix |
+|---|---|---|---|
+| F1 | `sandboxd` adds its `AEROLVM-USER` chain to an `ip filter` table it never creates (`pkg/docker/netrules/netlink_backend.go`, `EnsureUserChain`). On a VM, Docker made the table; a new pod network has none, so `sandboxd` exits. | `run.sh` creates the `filter` tables and their base chains with `nft` | `sandboxd` creates the table and its `FORWARD` chain when they are missing |
+| F2 | Stock EKS AL2023 nodes do not load `br_netfilter`. `sandboxd` refuses to start without `bridge-nf-call-iptables`, rightly: traffic between sandboxes on one bridge would skip the firewall. A pod cannot load a module without the host's `/lib/modules`, a host path K4 forbids. | Loaded once from a node debug pod | A design choice for §8.4: route each sandbox on its own link with no bridge, or bridge-family `nft` rules, or have the bank's node configuration load the module |
+| F3 | Capacity admission sizes itself from the machine (4 cores, 15,705 MB), not the pod's limit (3 CPUs, 12 GiB). | None | Read the limits from the pod's own cgroup |
+| F4 | `/health` reports "degraded" because it pings Docker (confirms C2). Docker's reconcile and event stream log an error every 30 s. | None needed | C2, plus: no Docker client at all on the containerd engine |
+| F5 | The egress floor and node guard for runtime `docker` need Docker, so creates on that runtime are refused; the containerd ones install. | None needed | The same as F4 |
+| F6 | Hostname-filtered egress needs the egress gateway (its user and socket), which the pod lacks, so those creates are refused. | None | The gateway as one more container in the worker pod |
+
+**S1, where a sandbox lands: half done** (same run).
+
+- **Network: pass.** The bridge `aerolvm0`, the sandboxes' links and the
+  network-namespace pool are all inside the pod's network. The machine's own
+  links (`lo`, its two ENIs, one VPC CNI link) show none of them.
+- **cgroup: fails as §8.3 predicted.** The sandbox's processes
+  (`runsc-sandbox`, `runsc-gofer`) sit in `/aerolvm/<sandbox id>` at the
+  machine's top level, outside the pod's
+  `kubepods.slice/kubepods-pod….slice/cri-containerd-….scope`. Only the shim
+  and runsc's fd-parking process stay inside. So Kubernetes does not see the
+  sandbox's CPU and memory, and the pod's limit does not cap it. Next: the C7
+  prototype (place every sandbox under the pod's cgroup), then S1 again, on
+  AL2023 and on Bottlerocket.
+
+**Cost so far:** one cluster, up about 80 minutes, about $0.45.
+
 ## 19. Tests, drills and benchmarks
 
 ### Offline (`make test`)

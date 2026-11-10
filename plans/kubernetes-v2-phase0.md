@@ -53,6 +53,14 @@ anything else, as the plan's Phase 0 exit gate says.
 | S4 | The cell ceiling: Raft writes per second, apply latency, snapshot and restore at 100k, 250k and 1M placements. | Not Kubernetes-specific; runs on the existing EC2 harness | existing harness |
 | N1 | agent-sandbox with gVisor next to AerolVM's worker pod, on one cluster and machine type: cold and warm starts, a burst larger than the pool, several templates, one command's round trip, sandboxes per machine, etcd writes. | Needs H0 to S2 working | m7i.xlarge × 2 |
 
+## Progress
+
+| Step | State | Where the result is |
+|---|---|---|
+| H0 | **Done, 2026-11-10.** Pass after eight runs on one cluster; six findings for Phase 1 (F1 to F6) | v2 plan §18, "Phase 0 results" |
+| S1 | **Half done.** Network inside the pod: pass. cgroup: sandboxes land outside the pod, as predicted. Next: C7 prototype, then S1 again on AL2023 and Bottlerocket | Same |
+| S2 to S9, N1 | Not started | — |
+
 ## Cost, before it is spent
 
 Prices are us-east-1 on-demand. A normal run is 1 to 2 hours:
