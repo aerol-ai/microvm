@@ -5,8 +5,8 @@ package caddy
 // Reload-churn reproduction: why new connections to an ingress fail while
 // sandboxes are created and destroyed, and proof that the static routes of
 // SB_INGRESS_PROXY_ROUTING do not. Operator-runnable, not CI: it needs a
-// Caddy binary built with caddy-l4 (the release build: Caddy v2.11.9 +
-// caddy-l4 v0.1.2, .github/workflows/release.yml), named by
+// Caddy binary built with caddy-l4 (the release build: install.sh's
+// CADDY_BUILD_VERSION + caddy-l4 v0.1.2, .github/workflows/release.yml), named by
 // AEROL_E2E_CADDY_BIN. Run it with `make test-ingress-reload-e2e`. Linux
 // only, like the ingress: the socket handoff below is Linux behaviour, and
 // macOS runs out of ephemeral ports on three fresh hops per dial.

@@ -194,17 +194,30 @@ BUILDKIT_UNIT_FILE="/etc/systemd/system/buildkit.service"
 # to NAME="value" lines and download_pins. Bump a version and its hashes
 # together, and run mirror-sync.sh --deps before the release that ships them.
 
-# One Caddy version for every Caddy this project installs or builds: the
-# stock package below, the custom build each release attaches
-# (.github/workflows/release.yml), the build-service fallback in
-# install_custom_caddy, the integration harness (integration-tests/lib/
-# build.sh), the e2e tests (Makefile, internal/service/testfixtures/caddyfx).
-# Before this, the release build named no version and shipped whatever Caddy
-# was newest on release day, untested. integration-tests/safety/
-# caddy_version_test.go fails if any of those places names another version or
-# plugin. To move Caddy: change CADDY_VERSION and the package hashes here,
-# then the places that test lists, then run mirror-sync.sh --deps.
+# Two Caddy pins. CADDY_VERSION is a Caddy release: the stock package below
+# and the build-service fallback in install_custom_caddy, which can only
+# build releases. CADDY_BUILD_VERSION is the Caddy core (a Go module
+# version) of every custom build this project makes: the build each release
+# attaches (.github/workflows/release.yml), the integration harness
+# (integration-tests/lib/build.sh), the e2e tests (Makefile,
+# internal/service/testfixtures/caddyfx). Before these pins, the release
+# build named no version and shipped whatever Caddy was newest on release
+# day, untested. integration-tests/safety/caddy_version_test.go fails if any
+# of those places names another version or plugin. To move Caddy: change the
+# pins and the package hashes here, then the places that test lists, then
+# run mirror-sync.sh --deps.
 CADDY_VERSION="2.11.9"
+# v2.11.9 still requires github.com/go-jose/go-jose/v3 v3.0.5
+# (GHSA-mgcc-cww5-fp2q, high, denial of service while parsing an RSA
+# JWK). v3 has no patched release; the fix is only in v4. Caddy master
+# 31f9f0cb99491fdd1a27f82793b78d216c5b2a76 (caddyserver/caddy#8368,
+# 2026-11-06) moves github.com/smallstep/certificates to
+# v0.30.3-0.20261105213751-6d5a251fbe01, which drops v3 and leaves
+# go-jose/v4 v4.1.9. No release tag contains that commit yet. An
+# allow-list would leave v3 in the binary a bank scanner reads, so the
+# custom build tracks this commit until a Caddy release includes it,
+# then this pin goes back to that tag.
+CADDY_BUILD_VERSION="v2.11.8-0.20261106223313-31f9f0cb9949"
 # The plugins in the custom build, at fixed versions.
 CADDY_L4_MODULE="github.com/mholt/caddy-l4@v0.1.2"
 CADDY_DNS_CLOUDFLARE_MODULE="github.com/caddy-dns/cloudflare@v0.2.4"

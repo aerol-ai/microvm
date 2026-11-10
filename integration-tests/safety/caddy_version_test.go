@@ -15,12 +15,13 @@ import (
 // newest that day (v2.11.9). The reload e2e test built v2.11.7, the stock
 // package was 2.11.7, and the build-service fallback, the integration
 // harness and the caddyfx fixture took the newest Caddy and plugins. What
-// shipped was never what was tested. scripts/install.sh now pins one
-// CADDY_VERSION and the plugin versions. These tests keep every other Caddy
-// build in step with it.
+// shipped was never what was tested. scripts/install.sh now pins the Caddy
+// release (CADDY_VERSION: the stock package and the build-service fallback),
+// the core of every custom build (CADDY_BUILD_VERSION) and the plugin
+// versions. These tests keep every other Caddy build in step with them.
 
 type caddyPins struct {
-	version, l4, cloudflare, s3 string
+	version, buildVersion, l4, cloudflare, s3 string
 }
 
 // readCaddyPins reads the Caddy pins from install.sh's DOWNLOAD PINS block.
@@ -35,13 +36,19 @@ func readCaddyPins(t *testing.T) caddyPins {
 		return m[1]
 	}
 	p := caddyPins{
-		version:    get("CADDY_VERSION"),
-		l4:         get("CADDY_L4_MODULE"),
-		cloudflare: get("CADDY_DNS_CLOUDFLARE_MODULE"),
-		s3:         get("CADDY_STORAGE_S3_MODULE"),
+		version:      get("CADDY_VERSION"),
+		buildVersion: get("CADDY_BUILD_VERSION"),
+		l4:           get("CADDY_L4_MODULE"),
+		cloudflare:   get("CADDY_DNS_CLOUDFLARE_MODULE"),
+		s3:           get("CADDY_STORAGE_S3_MODULE"),
 	}
 	if !regexp.MustCompile(`^[0-9]+\.[0-9]+\.[0-9]+$`).MatchString(p.version) {
 		t.Fatalf("CADDY_VERSION %q is not x.y.z", p.version)
+	}
+	// A release tag (vX.Y.Z) or a Go pseudo-version of a commit
+	// (vX.Y.Z-0.yyyymmddhhmmss-abcdef123456): xcaddy builds either.
+	if !regexp.MustCompile(`^v[0-9]+\.[0-9]+\.[0-9]+(-0\.[0-9]{14}-[0-9a-f]{12})?$`).MatchString(p.buildVersion) {
+		t.Fatalf("CADDY_BUILD_VERSION %q is neither vX.Y.Z nor a Go pseudo-version", p.buildVersion)
 	}
 	for _, m := range []string{p.l4, p.cloudflare, p.s3} {
 		if !strings.Contains(m, "@v") {
@@ -52,8 +59,10 @@ func readCaddyPins(t *testing.T) caddyPins {
 }
 
 // caddyBuilders lists every file that builds Caddy, and what each must say.
+// Every one of them builds the custom Caddy, so every one names
+// CADDY_BUILD_VERSION.
 func caddyBuilders(p caddyPins) map[string][]string {
-	v := "v" + p.version
+	v := p.buildVersion
 	return map[string][]string{
 		".github/workflows/release.yml": {
 			`xcaddy" build ` + v + ` \`,
@@ -86,7 +95,7 @@ func TestCaddyBuildsUseThePinnedVersion(t *testing.T) {
 		src := readRepoFile(t, strings.Split(file, "/")...)
 		for _, want := range wants {
 			if !strings.Contains(src, want) {
-				t.Errorf("%s does not contain %q: it must build Caddy v%s with install.sh's plugin pins", file, want, p.version)
+				t.Errorf("%s does not contain %q: it must build Caddy %s (install.sh's CADDY_BUILD_VERSION) with install.sh's plugin pins", file, want, p.buildVersion)
 			}
 		}
 	}
@@ -124,7 +133,7 @@ func TestEveryXcaddyBuildIsChecked(t *testing.T) {
 		rel = filepath.ToSlash(rel)
 		if builds.Match(raw) {
 			if _, ok := known[rel]; !ok {
-				t.Errorf("%s builds Caddy with xcaddy but is not in caddyBuilders; pin it to install.sh's CADDY_VERSION and plugins, and add it there", rel)
+				t.Errorf("%s builds Caddy with xcaddy but is not in caddyBuilders; pin it to install.sh's CADDY_BUILD_VERSION and plugins, and add it there", rel)
 			}
 		}
 		return nil
