@@ -101,7 +101,9 @@ true`
 }
 
 // t14Restart restarts sandboxd and waits until /health answers 200 through
-// the scenario's URL. It returns when the restart began and how long it took.
+// the scenario's URL, then until the node is back (waitNodeRejoined; on one
+// node that is the API serving again). It returns when the restart began
+// and how long until /health answered.
 func t14Restart(t *testing.T, target string) (time.Time, float64) {
 	t.Helper()
 	began := time.Now()
@@ -115,7 +117,12 @@ func t14Restart(t *testing.T, target string) (time.Time, float64) {
 		if err == nil {
 			resp.Body.Close()
 			if resp.StatusCode == http.StatusOK {
-				return began, time.Since(began).Seconds()
+				took := time.Since(began).Seconds()
+				// The node is a single-node scenario's only one (t14Node).
+				if err := waitNodeRejoined(t, harness.LoadIntegrationTargets().Nodes[0]); err != nil {
+					t.Fatalf("after the restart: %v", err)
+				}
+				return began, took
 			}
 		}
 		if time.Now().After(deadline) {
@@ -393,9 +400,12 @@ func TestT14IsolateAcrossSandboxdRestart(t *testing.T) {
 		t.Fatalf("turn the jail off: %v\n%s", err, out)
 	}
 	t.Cleanup(func() {
-		if out, err := harness.SSHRun(t, target, "sudo sed -i '/^SB_ISOLATE_USE_JAIL=false$/d' /etc/sandboxd/sandboxd.env && sudo systemctl restart sandboxd && echo ok"); err != nil {
+		if out, err := harness.SSHRun(t, target, "sudo sed -i '/^SB_ISOLATE_USE_JAIL=false$/d' /etc/sandboxd/sandboxd.env && echo ok"); err != nil {
 			t.Errorf("RESTORE: put the jail back: %v\n%s", err, out)
+			return
 		}
+		// Through t14Restart, so the next case starts on a node that is back.
+		t14Restart(t, target)
 	})
 	t14Restart(t, target)
 	if procs := t14Procs(t, target); !slices.ContainsFunc(strings.Split(procs, "\n"), func(l string) bool { return strings.HasPrefix(l, "sandboxd pid=") }) {

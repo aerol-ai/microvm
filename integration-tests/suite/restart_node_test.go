@@ -190,6 +190,7 @@ func TestTheRejoinWaitIsWiredEndToEnd(t *testing.T) {
 var seedVictimCases = map[string]bool{
 	"TestSeedLossSurvivorsKeepALeaderAndTheSeedRejoins": true, // UC-170
 	"TestOpsBackupRestoreRoundTrip":                     true, // UC-680, single-node only (opsSingleNode)
+	"t14Restart":                                        true, // T14, UC-677/678, single-node only (t14Node)
 }
 
 func TestDisruptiveCasesChooseANonSeedVictim(t *testing.T) {
