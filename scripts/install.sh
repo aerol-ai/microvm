@@ -3724,9 +3724,10 @@ buildkit_version_at() {
 }
 
 # cni_version_at prints the release of the CNI plugins in a directory, from
-# its bridge plugin ("CNI bridge plugin v1.9.1"), or nothing.
+# its bridge plugin ("CNI bridge plugin v1.9.1"), or nothing. The plugins
+# print --version to stderr, not stdout.
 cni_version_at() {
-	"$1/bridge" --version 2>/dev/null | awk 'NR == 1 { print $4 }' || true
+	"$1/bridge" --version 2>&1 | awk 'NR == 1 && $1 == "CNI" { print $4 }' || true
 }
 
 # node_env_value prints KEY's value from the node's sandboxd.env or

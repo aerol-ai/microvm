@@ -44,7 +44,14 @@ func TestUpgradeContainerdEngineTools(t *testing.T) {
 		{name: "CNI in a custom directory: a warning, not a write",
 			env: map[string]string{"cluster.env": "SB_CONTAINER_ENGINE=containerd\nSB_CONTAINERD_CNI_PLUGIN_DIR=__CUSTOM__\n"},
 			cni: "v1.5.1", cniDir: "custom",
-			want: []string{"warning: CNI plugins in"}, never: []string{"install_cni_plugins"}},
+			want: []string{"/custom are v1.5.1;"}, never: []string{"install_cni_plugins", "unknown version"}},
+		// The real bridge prints its version to stderr: a reader of stdout
+		// alone saw no version and re-installed the plugins on every run
+		// (seen live on 2026-11-10).
+		{name: "CNI in a custom directory at the pinned release: nothing",
+			env: map[string]string{"cluster.env": "SB_CONTAINER_ENGINE=containerd\nSB_CONTAINERD_CNI_PLUGIN_DIR=__CUSTOM__\n"},
+			cni: cniPin, cniDir: "custom",
+			never: []string{"install_cni_plugins", "warning", "unknown version"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			dir := t.TempDir()
@@ -66,7 +73,7 @@ func TestUpgradeContainerdEngineTools(t *testing.T) {
 				bridgeVersion = tc.cni
 				if tc.cniDir != "" {
 					mustMkdir(t, cniDir)
-					mustWrite(t, filepath.Join(cniDir, "bridge"), "#!/bin/sh\necho 'CNI bridge plugin "+tc.cni+"'\n")
+					mustWrite(t, filepath.Join(cniDir, "bridge"), "#!/bin/sh\necho 'CNI bridge plugin "+tc.cni+"' >&2\necho 'CNI protocol versions supported: 1.0.0' >&2\n")
 					if err := os.Chmod(filepath.Join(cniDir, "bridge"), 0o755); err != nil {
 						t.Fatal(err)
 					}
