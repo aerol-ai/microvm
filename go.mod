@@ -21,7 +21,7 @@ require (
 	// Untagged on purpose: the first x/crypto commit without the openpgp
 	// package (GO-2026-5932). Move to v0.59.0 once it is tagged.
 	golang.org/x/crypto v0.58.1-0.20261009181718-2f1f834330b2
-	golang.org/x/sync v0.24.0
+	golang.org/x/sync v0.25.0
 	gopkg.in/yaml.v3 v3.0.1
 	oras.land/oras-go/v2 v2.7.0
 )
