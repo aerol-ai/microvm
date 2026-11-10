@@ -34,9 +34,13 @@ type closableLogStore interface {
 type raftNode struct {
 	raft      *raft.Raft
 	transport *raft.NetworkTransport
+	// pipelines is the transport raft was given: transport plus the stall
+	// guard on replication pipelines (raft_pipeline_guard.go).
+	pipelines *pipelineGuardTransport
 	logStore  closableLogStore
 	stableStr *raftboltdb.BoltStore
 	snaps     raft.SnapshotStore
+	logger    *slog.Logger
 }
 
 // raftSetupConfig captures the inputs setupRaft needs.
@@ -148,7 +152,9 @@ func setupRaft(cfg raftSetupConfig, fsm *placementFSM, logger *slog.Logger) (*ra
 		return nil, err
 	}
 
-	r, err := raft.NewRaft(rcfg, fsm, logStore, stableStore, snaps, transport)
+	// The raft transport timeout is 10 s on both paths above.
+	pipelines := newPipelineGuardTransport(transport, raftPipelineStallFactor*10*time.Second, logger)
+	r, err := raft.NewRaft(rcfg, fsm, logStore, stableStore, snaps, pipelines)
 	if err != nil {
 		_ = transport.Close()
 		_ = logStore.Close()
@@ -174,9 +180,11 @@ func setupRaft(cfg raftSetupConfig, fsm *placementFSM, logger *slog.Logger) (*ra
 	return &raftNode{
 		raft:      r,
 		transport: transport,
+		pipelines: pipelines,
 		logStore:  logStore,
 		stableStr: stableStore,
 		snaps:     snaps,
+		logger:    logger,
 	}, nil
 }
 
@@ -233,7 +241,11 @@ func (r *raftNode) Close() error {
 	// stores), then close transport + stores.
 	var firstErr error
 	if r.raft != nil {
-		if err := r.raft.Shutdown().Error(); err != nil {
+		var closePipelines func() int
+		if r.pipelines != nil {
+			closePipelines = r.pipelines.closePipelines
+		}
+		if err := awaitRaftShutdown(r.raft.Shutdown(), raftShutdownGrace, closePipelines, r.logger); err != nil {
 			firstErr = fmt.Errorf("raft shutdown: %w", err)
 		}
 	}

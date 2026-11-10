@@ -24,6 +24,16 @@ groups:
           description: "At least one Raft apply has remained in-flight for more than 2 minutes."
           runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/slo-breach.md"
 
+      - alert: SandboxdRaftPipelineStall
+        expr: sum(increase(aerolvm_raft_pipeline_stalls_total[15m])) > 0
+        labels:
+          severity: warning
+          component: raft
+        annotations:
+          summary: "A Raft follower's replication was stuck and was reset"
+          description: "sandboxd closed a Raft replication pipeline whose send was stuck, and that follower fell back to plain replication. Once after a follower restart or a leader change is expected; repeated firing means a follower keeps rejecting appends."
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/slo-breach.md"
+
       - alert: SandboxdRaftSnapshotErrors
         expr: sum(rate(aerolvm_raft_snapshot_errors_total[10m])) > 0
         for: 10m
