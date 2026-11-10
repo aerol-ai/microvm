@@ -2,7 +2,7 @@
 
 Every AerolVM release, newest first: its highlights, and anything to check before you upgrade. The full notes, the merged pull requests and the downloads are on [GitHub Releases](https://github.com/aerol-ai/microvm/releases).
 
-Security fixes land on the newest release line only, which is **0.6** today. See [SUPPORT.md](SUPPORT.md). This project follows [Semantic Versioning](https://semver.org).
+Security fixes land on the newest release line only, which is **0.7** today. See [SUPPORT.md](SUPPORT.md). This project follows [Semantic Versioning](https://semver.org).
 
 <!-- Generated from the GitHub release notes by `npm run releases:sync` in docs/. Edit the release notes on GitHub, then run it again. The docs Changelog page is built from the same notes. -->
 
@@ -14,17 +14,48 @@ timeline
     July 2026 : 1 release : v0.5.5
     September 2026 : 3 releases : v0.5.6 to v0.6.0
     October 2026 : 8 releases : v0.6.1 to v0.6.8
-    November 2026 : 5 releases : v0.6.9 to v0.6.13
+    November 2026 : 6 releases : v0.6.9 to v0.7.0
 ```
 
 | Release line | Releases | Dates | Latest |
 |---|---|---|---|
+| [0.7](#07-release-line) | 1 | Nov 10, 2026 | [v0.7.0](#v070-run-clusters-like-kubernetes-one-line-joins-kubectl-style-commands-and-rolling-upgrades) |
 | [0.6](#06-release-line) | 14 | Sep 28, 2026 to Nov 9, 2026 | [v0.6.13](#v0613-cluster-writes-that-never-hang-creates-right-after-a-leader-change-and-a-mirror-fallback-for-terraform-nodes) |
 | [0.5](#05-release-line) | 7 | Jun 1, 2026 to Sep 28, 2026 | [v0.5.7](#v057-dependency-updates) |
 | [0.4](#04-release-line) | 1 | May 28, 2026 | [v0.4.1](#v041-firecracker-runtime-wiring) |
 | [0.3](#03-release-line) | 1 | May 24, 2026 | [v0.3.1](#v031-custom-domains-and-image-garbage-collection) |
 | [0.2](#02-release-line) | 4 | May 19, 2026 to May 24, 2026 | [v0.2.4](#v024-serverless-wake-on-http-and-snapshot-push) |
 | [0.1](#01-release-line) | 8 | May 8, 2026 to May 16, 2026 | [v0.1.7](#v017-daytona-and-e2b-compatibility-snapshots-image-builds) |
+
+## 0.7 release line
+
+### v0.7.0: Run clusters like Kubernetes: one-line joins, kubectl-style commands and rolling upgrades
+
+*November 10, 2026* · [Full notes](https://github.com/aerol-ai/microvm/releases/tag/v0.7.0)
+
+Run an AerolVM cluster the way you run Kubernetes. Start it with one command. Add each machine with one pasted line. Manage and upgrade it from your computer with `aerolvm`.
+
+> **Upgrading a cluster from v0.6.x?** The first upgrade into v0.7.0 uses the installer, one node at a time. Read "Upgrade notes" at the end first.
+
+- **Start a cluster with one command, and add a machine with one line.** `sandboxd init` on the first machine starts the cluster. `aerolvm join-command` prints one line. Paste it on a new machine, and it joins as a worker, server, ingress or mixed node. Each line holds a join token that works for one machine and lasts 2 hours by default. Your Cloudflare token is never in the line. (#1059, #1064, #1100, #1104)
+- **Manage the cluster with kubectl-style commands.** `aerolvm get nodes`, `describe node`, `top nodes`, `cordon`, `uncordon`, `drain` and `delete node`. `get` and `describe` work for sandboxes, snapshots and tokens too, with `-o json` or `-o yaml`, and `-l` filters by label. Saved contexts let one `aerolvm` talk to several clusters. (#1056, #1065)
+- **Upgrade the whole cluster with `aerolvm upgrade`.** `plan` shows what will happen. `apply` upgrades one node at a time: server nodes first, then ingress nodes, then workers. If a node's new version does not come up healthy, the node goes back to its old version by itself. The upgrade then stops. You can pause, stop and roll back. `--hold` keeps the choice to roll back until you run `finalize`. `aerolvm release pull` makes one file for sites with no internet. (#1058, #1062, #1063)
+- **WebAssembly and V8 isolate sandboxes now survive a `sandboxd` restart and an upgrade.** Containers and Firecracker VMs already did. (#1071)
+- **Custom domains get HTTPS certificates again.** On Caddy 2.10 and later, a custom domain got no certificate. Caddy refused the setting with "on-demand TLS cannot be enabled without a permission module". Fixed. (#1107, #1109)
+- **Fewer known vulnerabilities in what runs on your nodes.** On containerd-engine nodes, BuildKit moves from v0.17.2 to v0.34.2 and the CNI plugins from v1.5.1 to v1.9.1. govulncheck counted 92 known vulnerabilities in the old buildkitd and finds 6 in the new one, which no BuildKit release fixes yet. Re-running the installer upgrades nodes that already have them. `sandboxd`, `toolboxd`, `aerolvm` and the release Caddy now scan clean: golang.org/x/crypto moves to the first commit without the unsafe `openpgp` package (GO-2026-5932). (#632, #1125)
+- **A cluster guide anyone can follow.** The docs have eleven short pages under "Cluster". They cover how a cluster works, building one (also on AWS), adding and removing nodes, upgrades, backups, security and fixing problems. A cheat sheet lists every command. (#1105)
+
+**Before you upgrade:**
+
+- **The first upgrade into v0.7.0 uses the installer.** Releases before v0.7.0 do not have `aerolvm upgrade`. On each node, one at a time, run `curl -fsSL https://aerolvm.aerol.ai | sudo bash`: server nodes first, then ingress nodes, then workers. Wait until `aerolvm get nodes` shows the node `Ready` before you go to the next one. The installer keeps the node's settings and admin token. After that, use `aerolvm upgrade`.
+- **Old and new server nodes can run side by side.** Upgrades, join tokens and node delete turn on only when every server node runs v0.7.0. Until then, those commands answer with an error that says so.
+- **WebAssembly and isolate sandboxes restart once** during this first upgrade. A WebAssembly sandbox keeps its files. An isolate starts fresh on its next request. To avoid that, drain the node first.
+- **Clusters built with `cluster-init.sh`:** to use join commands, run `sudo sandboxd adopt` once on the first server node. Then run it on every other server node. Worker and ingress nodes need nothing.
+- **Terraform clusters built from a checkout:** run `scripts/terraform.sh init` once (the folder moved to `Terraform/root`), then `scripts/terraform.sh plan`. The plan moves resources and replaces no node: on the old join path, every node's user data is exactly what v0.6.13 made. `root/` keeps `one_line_join = false`, because changing it replaces every node. If you move to the module by URL, set `one_line_join = false` there too. (#1125)
+- **BuildKit and the CNI plugins are upgraded when you re-run the installer** on a containerd-engine node. The installer restarts `buildkit.service`, so an image build running at that moment fails and must be started again. A `buildkitd` you installed somewhere else yourself is left alone. On the old Terraform join path, a node added after this release still starts with BuildKit v0.17.2 until the installer runs on it.
+- **The Ansible update playbooks are gone** (`update-sandboxd.yml`, `update-toolboxd.yml`). Use `aerolvm upgrade`.
+- **The owner cache is now on.** To turn it off, set `SB_CLUSTER_OWNER_CACHE=false`.
+- **Add the new alert** `SandboxdRaftPipelineStall` from `setup/prometheus/sandboxd-alerts.yml` to your Prometheus.
 
 ## 0.6 release line
 
