@@ -146,13 +146,20 @@ func TestUpgradeCLICluster02HandRunKeepsQuorum(t *testing.T) {
 	}
 	handRun := "sandboxd upgrade node " + clusterCLI.versionPrev + " --rollback --allow-unversioned 2>&1; echo exit=$?"
 
-	// One follower down: stopping the other would leave 1 of 3 voters.
+	// One follower down: stopping the other would leave 1 of 3 voters. Not
+	// the seed, whose restart costs the rendezvous every joiner needs; of
+	// two followers at least one is not the seed.
 	down, other := followers[0], followers[1]
+	if down.Seed {
+		down, other = other, down
+	}
+	downTarget, _ := harness.SSHTarget(down)
+	harness.MarkNodeDown(down.PublicIP)
 	sshRoot(t, down, "systemctl stop sandboxd")
 	restarted := false
 	defer func() {
 		if !restarted {
-			sshRoot(t, down, "systemctl start sandboxd")
+			restoreNodeDaemon(t, down, downTarget)
 		}
 	}()
 	// The guard counts what gossip says, so wait until the cluster sees
@@ -166,8 +173,11 @@ func TestUpgradeCLICluster02HandRunKeepsQuorum(t *testing.T) {
 	if v := strings.TrimSpace(sshRoot(t, other, "systemctl is-active sandboxd")); v != "active" {
 		t.Fatalf("a refused upgrade stopped sandboxd on %s: %s", other.Name, v)
 	}
-	sshRoot(t, down, "systemctl start sandboxd")
 	restarted = true
+	restoreNodeDaemon(t, down, downTarget)
+	if t.Failed() {
+		t.FailNow() // the restore said why; the leader's hand run needs all three servers
+	}
 	waitVoter(t, c, downID, true)
 
 	// On the leader: leadership moves first, then the node rolls back.
