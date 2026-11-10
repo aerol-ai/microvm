@@ -1,8 +1,10 @@
 # AerolVM on Kubernetes, version 2: the CockroachDB-grade plan
 
-**Status:** Draft, 2026-11-05. CEO review done 2026-11-10 on branch
-`plans/kubernetes-v2-ceo-review` (its record is at the end of this file;
-12 items are handed to the eng review). Next gate: `/plan-eng-review`.
+**Status:** Reviewed. Drafted 2026-11-05. The CEO review and the eng review
+were done 2026-11-10 on branch `plans/kubernetes-v2-ceo-review`. Both records
+are at the end of this file, and every decision in them is answered. Next
+step: Phase 0 (§18). On its first day, send the bank question Q6 and the P7
+evidence pack draft.
 **Date:** 2026-11-05
 **Replaces:** the design in `kubernetes-deployment.md` (sections 2 to 5) and the
 worker design in `kubernetes-full-architecture.md` (section 10). Both files
