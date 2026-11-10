@@ -34,7 +34,7 @@ require (
 	github.com/containerd/typeurl/v2 v2.3.0
 	github.com/coreos/go-oidc/v3 v3.21.0
 	github.com/distribution/reference v0.6.0
-	github.com/go-jose/go-jose/v4 v4.1.6
+	github.com/go-jose/go-jose/v4 v4.1.9
 	github.com/google/jsonschema-go v0.4.3
 	github.com/google/nftables v0.3.0
 	github.com/hashicorp/raft-wal v0.4.2
