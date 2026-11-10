@@ -183,6 +183,8 @@ SANDBOXD_CONFIG_BEFORE=""
 # the Terraform bootstrap uses (tests point them elsewhere).
 BUILDKIT_BIN_DIR="/usr/local/bin"
 BUILDKIT_UNIT_FILE="/etc/systemd/system/buildkit.service"
+# Where upgrade_containerd_engine_tools reads the node's engine settings.
+SANDBOXD_ENV_DIR="/etc/sandboxd"
 
 # --- BEGIN DOWNLOAD PINS ------------------------------------------------------
 # Every pinned third-party download, with its SHA-256. A file is installed
@@ -278,12 +280,19 @@ JAILER_BIN_SHA256_AARCH64="7faa581395fd1994ee005efc0a9c8826b4a9f0616dd942c2486ad
 # node where install.sh put them first, and the bootstrap skips its own
 # install, ends up the same. Hashes: the CNI release's .sha256 files, and
 # the subject digests in BuildKit's provenance attestations.
-CNI_PLUGINS_VERSION="v1.5.1"
-CNI_PLUGINS_SHA256_AMD64="77baa2f669980a82255ffa2f2717de823992480271ee778aa51a9c60ae89ff9b"
-CNI_PLUGINS_SHA256_ARM64="c2a292714d0fad98a3491ae43df8ad58354b3c0bdf5d5a3e281777967c70fcff"
-BUILDKIT_VERSION="v0.17.2"
-BUILDKIT_SHA256_AMD64="24d73e4456ebbe6dbb53779e362b2164a000e9636cd9ca8bd90f742fb024b731"
-BUILDKIT_SHA256_ARM64="77384e2726c93d7c2bd7b745c079e1953f92683570203c7bfca361965db2f0c2"
+#
+# BuildKit v0.17.2 and CNI v1.5.1 (before v0.7.0) were built with Go 1.22:
+# govulncheck counts 92 known vulnerabilities in that buildkitd. The
+# bootstrap installs these versions on the one-line join path only; its old
+# path keeps the old ones, because any byte it changes there replaces every
+# node of a running cluster, and this installer upgrades them in place
+# (upgrade_containerd_engine_tools).
+CNI_PLUGINS_VERSION="v1.9.1"
+CNI_PLUGINS_SHA256_AMD64="b98f74a0f8522f0a83867178729c1aa70f2158f90c45a2ca8fa791db1c76b303"
+CNI_PLUGINS_SHA256_ARM64="56171987d3947707c3563db2f4001bccaf50fd63468611b9f3cbecb1375ee7ec"
+BUILDKIT_VERSION="v0.34.2"
+BUILDKIT_SHA256_AMD64="b9f18b8e37eb450e9e5df03117045237cdd12d3c4a0034ffeeaa857852a15e13"
+BUILDKIT_SHA256_ARM64="a4ad483a33b2f1544c5ccce1c5956c559e1a6e84b8bf6cedd847d695885237a3"
 
 # download_pins prints one line per file the mirror holds:
 #   <project> <version> <file> <sha256> <origin>
@@ -331,10 +340,10 @@ download_pins() {
 	v="$CADDY_VERSION"
 	echo "caddy v${v} caddy_${v}_checksums.txt e4e1e43b78299733b19b8aeab8abebcf57aef4f5dae617be125016f9e4e0299f ${caddy}/caddy_${v}_checksums.txt"
 	v="$CNI_PLUGINS_VERSION"
-	echo "cni-plugins ${v} cni-plugins-linux-amd64-${v}.tgz.sha256 c96ab6bec7d59dd01f2f3373fe6ce7cc17a13f21df13541cc8f06d4ef5bb5763 ${cni}/cni-plugins-linux-amd64-${v}.tgz.sha256"
-	echo "cni-plugins ${v} cni-plugins-linux-amd64-${v}.tgz.sha512 0f9b6f929b9eb5817549b439709e88ce3d24c4728eb1e8949e2f086105a33948 ${cni}/cni-plugins-linux-amd64-${v}.tgz.sha512"
-	echo "cni-plugins ${v} cni-plugins-linux-arm64-${v}.tgz.sha256 2a484d561f4a9c75f820ca0fa2d5f21cbf47b460668b055dac3ce0754874cdea ${cni}/cni-plugins-linux-arm64-${v}.tgz.sha256"
-	echo "cni-plugins ${v} cni-plugins-linux-arm64-${v}.tgz.sha512 705b6aa2498e03eef13df8a5993852e1d3e9ac64606c98a60f7551d9d905f2c5 ${cni}/cni-plugins-linux-arm64-${v}.tgz.sha512"
+	echo "cni-plugins ${v} cni-plugins-linux-amd64-${v}.tgz.sha256 059bc7641eb3e6b5b5086d675e3a1db25a003262c6b9ee0587affcee6abf1320 ${cni}/cni-plugins-linux-amd64-${v}.tgz.sha256"
+	echo "cni-plugins ${v} cni-plugins-linux-amd64-${v}.tgz.sha512 b059f6ab13e3109356492cd07c43734f96c331e0508c108ae1bf946ffe7f5ecc ${cni}/cni-plugins-linux-amd64-${v}.tgz.sha512"
+	echo "cni-plugins ${v} cni-plugins-linux-arm64-${v}.tgz.sha256 641b0eb7769e98671922f91868892f4a63abe03782c6a872a420efb4b6054377 ${cni}/cni-plugins-linux-arm64-${v}.tgz.sha256"
+	echo "cni-plugins ${v} cni-plugins-linux-arm64-${v}.tgz.sha512 16750ad60f2136ad2f097035e5f32f75e1f3f1b5ef4c73dd233e12b6937d04c6 ${cni}/cni-plugins-linux-arm64-${v}.tgz.sha512"
 }
 # --- END DOWNLOAD PINS --------------------------------------------------------
 # --config-only re-renders an installed node's configuration and touches
@@ -3708,6 +3717,55 @@ install_cni_plugins() {
 	echo "Installed CNI plugins to /opt/cni/bin (bridge, host-local, loopback)"
 }
 
+# buildkit_version_at prints the release a buildkitd binary reports
+# ("buildkitd github.com/moby/buildkit v0.34.2 <commit>"), or nothing.
+buildkit_version_at() {
+	"$1" --version 2>/dev/null | awk 'NR == 1 { print $3 }' || true
+}
+
+# cni_version_at prints the release of the CNI plugins in a directory, from
+# its bridge plugin ("CNI bridge plugin v1.9.1"), or nothing.
+cni_version_at() {
+	"$1/bridge" --version 2>/dev/null | awk 'NR == 1 { print $4 }' || true
+}
+
+# node_env_value prints KEY's value from the node's sandboxd.env or
+# cluster.env (the Terraform bootstrap writes the engine to cluster.env),
+# or nothing.
+node_env_value() {
+	local key="$1" f
+	for f in "${SANDBOXD_ENV_DIR}/sandboxd.env" "${SANDBOXD_ENV_DIR}/cluster.env"; do
+		[[ -r "$f" ]] || continue
+		awk -F= -v k="$key" '$1 == k { v = substr($0, length(k) + 2) } END { if (v != "") print v }' "$f"
+	done | tail -n 1
+}
+
+# upgrade_containerd_engine_tools moves a containerd-engine node that was not
+# installed with --with-containerd-engine (the Terraform bootstrap installs
+# CNI and BuildKit itself) to the pinned CNI plugins and BuildKit. It only
+# replaces what is already there: a node without them is left for the
+# bootstrap, which installs them after this script runs.
+upgrade_containerd_engine_tools() {
+	[[ "$(node_env_value SB_CONTAINER_ENGINE)" == "containerd" ]] || return 0
+	local cni_dir have
+	cni_dir="$(node_env_value SB_CONTAINERD_CNI_PLUGIN_DIR)"
+	cni_dir="${cni_dir:-/opt/cni/bin}"
+	if [[ -x "${cni_dir}/bridge" ]]; then
+		have="$(cni_version_at "$cni_dir")"
+		if [[ "$have" != "$CNI_PLUGINS_VERSION" ]]; then
+			if [[ "$cni_dir" == "/opt/cni/bin" ]]; then
+				echo "Upgrading CNI plugins ${have:-(unknown version)} to ${CNI_PLUGINS_VERSION}"
+				install_cni_plugins
+			else
+				echo "warning: CNI plugins in ${cni_dir} are ${have:-of an unknown version}; this installer updates /opt/cni/bin only. Install ${CNI_PLUGINS_VERSION} there by hand." >&2
+			fi
+		fi
+	fi
+	if [[ -x "${BUILDKIT_BIN_DIR}/buildkitd" ]]; then
+		install_buildkit
+	fi
+}
+
 # install_buildkit sets up BuildKit for image builds on the containerd engine
 # (POST /v1/images/build, snapshot from a Dockerfile) exactly as the
 # Terraform bootstrap does: the same release, the same two binaries and the
@@ -3718,7 +3776,19 @@ install_cni_plugins() {
 # bootstrap does not pass --with-containerd-engine, so on a Terraform node
 # its own step still does the install.)
 install_buildkit() {
-	if ! command -v buildkitd >/dev/null 2>&1; then
+	# Three cases. No buildkitd at all: install it. Ours (BUILDKIT_BIN_DIR,
+	# the path this installer and the Terraform bootstrap use) at another
+	# version: replace it, so a re-run moves an older node to the pinned
+	# release. A buildkitd somewhere else on PATH is the operator's own: leave
+	# it alone, as before.
+	local ours="${BUILDKIT_BIN_DIR}/buildkitd" have="" upgrade="false" fresh="false"
+	if [[ -x "$ours" ]]; then
+		have="$(buildkit_version_at "$ours")"
+		[[ "$have" == "$BUILDKIT_VERSION" ]] || upgrade="true"
+	elif ! command -v buildkitd >/dev/null 2>&1; then
+		fresh="true"
+	fi
+	if [[ "$fresh" == "true" || "$upgrade" == "true" ]]; then
 		local arch
 		case "$(uname -m)" in
 			x86_64|amd64)   arch="amd64" ;;
@@ -3739,6 +3809,13 @@ install_buildkit() {
 			exit 1
 		fi
 		tar -xzf "${tmp_dir}/${file}" -C "$tmp_dir"
+		if [[ "$upgrade" == "true" ]]; then
+			# Stopped first: a build in progress fails either way when the
+			# daemon restarts, and nothing then runs the old binary while
+			# it is replaced. enable --now below starts the new one.
+			echo "Upgrading BuildKit ${have:-(unknown version)} to ${BUILDKIT_VERSION}"
+			systemctl stop buildkit.service || true
+		fi
 		install -m 0755 "${tmp_dir}/bin/buildkitd" "${BUILDKIT_BIN_DIR}/buildkitd"
 		install -m 0755 "${tmp_dir}/bin/buildctl" "${BUILDKIT_BIN_DIR}/buildctl"
 		echo "Installed buildkitd and buildctl ${BUILDKIT_VERSION} to ${BUILDKIT_BIN_DIR}"
@@ -4229,6 +4306,8 @@ fi
 if [[ "$WITH_CONTAINERD_ENGINE" == "true" ]]; then
 	install_cni_plugins
 	install_buildkit
+else
+	upgrade_containerd_engine_tools
 fi
 if [[ "$WITH_NVIDIA_GPU" == "true" ]]; then
 	install_nvidia_gpu

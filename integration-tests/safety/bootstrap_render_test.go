@@ -82,7 +82,7 @@ func TestBootstrapTemplateRenders(t *testing.T) {
 		"seed", "joiner", "joiner_kms", "joiner_audit_s3", "joiner_audit_file",
 		"seed_receiver", "joiner_receiver", "seed_public_ca", "seed_wrapped",
 		"joiner_api_lb", "joiner_api_lb_worker", "joiner_routing_on", "joiner_routing_off", "joiner_containerd_pool", "seed_join", "joiner_join", "joiner_blank", "joiner_join_worker",
-		"joiner_download_mirror",
+		"joiner_download_mirror", "joiner_join_download_mirror",
 	} {
 		t.Run(branch, func(t *testing.T) {
 			out, err := run("output", "-raw", branch)

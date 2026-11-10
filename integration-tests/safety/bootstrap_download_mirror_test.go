@@ -44,9 +44,12 @@ func TestBootstrapWithoutDownloadMirrorRendersNoFallback(t *testing.T) {
 
 // With a mirror, the CNI plugins and BuildKit are checked against the same
 // SHA-256 pins install.sh uses (and mirror-sync.sh fills the mirror from), so
-// the two cannot drift apart.
+// the two cannot drift apart. That holds on the one-line join path; the old
+// path keeps v0.6.13's versions and hashes byte for byte, because changing
+// them would replace every node (TestBootstrapOldJoinPathRendersLikeV0613),
+// and install.sh upgrades those nodes in place.
 func TestBootstrapDownloadMirrorPinsMatchInstallSh(t *testing.T) {
-	out := renderBootstrap(t, "joiner_download_mirror")
+	out := renderBootstrap(t, "joiner_join_download_mirror")
 	install, err := os.ReadFile(filepath.Join(integrationDir(t), "..", "scripts", "install.sh"))
 	if err != nil {
 		t.Fatal(err)
