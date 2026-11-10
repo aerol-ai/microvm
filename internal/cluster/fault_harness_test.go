@@ -56,7 +56,8 @@ type faultCluster struct {
 	// leases is the capacity every server's lease cache reports for each
 	// owner node. The harness runs no sandbox runtime and no /v1/capacity
 	// endpoint, so a background loop writes these snapshots into every live
-	// server's cache, standing in for the capacity heartbeat.
+	// server's cache, standing in for the capacity heartbeat (start stops
+	// the real one).
 	leaseMu sync.Mutex
 	leases  map[string]capacity.Snapshot
 	stop    chan struct{}
@@ -128,10 +129,61 @@ func (fc *faultCluster) start(s *faultServer, bootstrap bool) {
 	// in the middle of a test; eviction is driven explicitly instead.
 	cfg.ClusterDeadOwnerGrace = time.Hour
 	c, cleanup := newTestClusterFromConfig(fc.t, cfg)
+	// The harness serves no /v1/capacity, so this server's capacity sweep
+	// (refreshCapacityLeases) never stores a lease. All it can do here is
+	// delete one: retain drops the lease of any server its gossip does not
+	// list, and a restarted server stays unlisted on a peer until that peer
+	// takes its refute of the old leave. A leader that lost a lease that way
+	// refused the next create onto the server with "no fresh capacity
+	// heartbeat" until leaseLoop wrote it again. leaseLoop is the only lease
+	// source here, so the sweep is stopped and nothing takes a lease back.
+	if c.capacityLeaseStop != nil {
+		c.capacityLeaseStop()
+	}
 	s.mu.Lock()
 	s.c, s.cleanup = c, cleanup
 	s.mu.Unlock()
+	// Leases go in after gossip converges: New started one sweep before it
+	// could be stopped, and that sweep runs its retain before its first fetch.
+	fc.awaitGossip()
 	fc.writeLeases()
+}
+
+// awaitGossip waits until every live server's gossip lists every live server
+// alive. Raft does not wait for gossip: a restarted server can be caught up
+// while a peer still holds its old leave, and until the peer takes the
+// refute, its admission refuses every reservation onto that server.
+func (fc *faultCluster) awaitGossip() {
+	fc.t.Helper()
+	deadline := time.Now().Add(faultWait)
+	for {
+		missing := fc.gossipGap()
+		if missing == "" {
+			return
+		}
+		if time.Now().After(deadline) {
+			fc.t.Fatalf("gossip never converged within %s: %s", faultWait, missing)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// gossipGap names a live server that some live server's gossip does not list
+// alive, or returns "" when every one lists every other.
+func (fc *faultCluster) gossipGap() string {
+	up := fc.up()
+	for _, s := range up {
+		c := s.cluster()
+		if c == nil {
+			continue
+		}
+		for _, o := range up {
+			if m, ok := c.gossip.lookupMember(o.id); !ok || !m.Alive {
+				return fmt.Sprintf("%s does not list %s alive", s.id, o.id)
+			}
+		}
+	}
+	return ""
 }
 
 // stopServer closes s the way a crash-free shutdown does: gossip leaves, the
