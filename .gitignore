@@ -121,3 +121,7 @@ integration-tests/fixtures/wasm/*.wasm
 
 # Local build/debug binary; never commit
 /report
+
+# Phase 0 EKS spike runs: per-run Terraform state, kubeconfig and inputs.
+integration-tests/k8s/.state/
+integration-tests/k8s/terraform/.terraform.lock.hcl
