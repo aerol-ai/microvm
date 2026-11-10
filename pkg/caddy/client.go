@@ -977,8 +977,9 @@ func IngressCustomDomainHTTPRouteID(sandboxID, hostname string) string {
 //     field here.
 //   - POST /config/apps/tls/automation/policies/... (a one-element list with
 //     the catch-all policy {on_demand: true, issuers: [acme]}) only when no
-//     on-demand policy is present yet. Discovered by checking pathExists on automation/policies
-//     and re-walking the list; we never insert a duplicate.
+//     on-demand policy is present yet. onDemandPolicy GETs
+//     automation/policies and walks the list first, so a second boot never
+//     inserts a duplicate.
 //
 // askURL must be reachable from Caddy — typically
 // http://127.0.0.1:<api-port>/internal/tls-ask (the InternalIngressAddr
