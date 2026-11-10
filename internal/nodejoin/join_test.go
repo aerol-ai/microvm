@@ -142,7 +142,8 @@ func TestJoinServerGetsTheCAKeyAndKeepsAppendedSettings(t *testing.T) {
 	if env["SB_NODE_ROLE"] != "mixed" || env["SB_INGRESS_ADVERTISE_HOST"] != "api.example.com" || env["SB_RAFT_ADVERTISE_ADDR"] != "10.1.1.1:7000" {
 		t.Fatalf("cluster.env = %v", env)
 	}
-	if !strings.Contains(r.out.String(), "not a Raft voter yet") {
+	if !strings.Contains(r.out.String(), "does not vote on cluster changes yet: the leader makes it a voter by itself, up to the cluster's voter limit (5 by default)") ||
+		!strings.Contains(r.out.String(), "joined the cluster as a mixed node, with a server token") {
 		t.Fatalf("output:\n%s", r.out.String())
 	}
 }

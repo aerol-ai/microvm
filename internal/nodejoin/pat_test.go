@@ -30,7 +30,7 @@ func TestJoinWorkerWithoutThePAT(t *testing.T) {
 	if r.api.auth[len(r.api.auth)-1] != "Bearer node-pat" {
 		t.Fatalf("member wait auth = %v", r.api.auth)
 	}
-	if !strings.Contains(r.out.String(), "holds the operator token's hash, not the token") {
+	if !strings.Contains(r.out.String(), "does not hold the admin token, only a fingerprint (hash) to check it") {
 		t.Fatalf("output:\n%s", r.out.String())
 	}
 	before, restarts := readFile(t, r.paths.ClusterEnv)+readFile(t, r.paths.EnvFile), r.host.restarts

@@ -56,16 +56,101 @@ func ParseTokenSpec(raw string) (TokenSpec, error) {
 	return spec, nil
 }
 
-// JoinCommand is the one line a new machine runs (§3.1).
-func JoinCommand(installer, joinURL, token, caHash string) string {
+// DNSTokenVar is the variable a printed join command reads the DNS
+// provider's API token from, on the new machine. The token is a secret, so
+// the line names the variable instead of holding it: a line that ends up in
+// a terminal log or a chat leaks only the join token.
+const DNSTokenVar = "CLOUDFLARE_API_TOKEN"
+
+// JoinLine is the one command a new machine runs (§3.1): the installer
+// options that give it the cluster's public setup, then `join` and its
+// flags. Pasted as printed, it makes a node that serves the same domain as
+// the others. The CLI's joinCommandLine (cmd/aerolvm) builds the same line.
+type JoinLine struct {
+	Installer  string
+	JoinURL    string
+	Token      string
+	CACertHash string
+	// Domain, IngressHost and TLSIssuer are the cluster's public setup
+	// (SB_DOMAIN, SB_INGRESS_ADVERTISE_HOST, SB_TLS_ISSUER). With a domain,
+	// the installer also needs a DNS provider and its token; Cloudflare is
+	// the only provider install.sh takes, and Caddy's own issuer needs none.
+	// IngressHost is left out when it is the domain: join defaults to it.
+	Domain      string
+	IngressHost string
+	TLSIssuer   string
+	// NodeRole is SB_NODE_ROLE when the node runs more than its token's role
+	// (mixed, or a list such as server,worker): the token decides the
+	// certificate, --role the jobs the node does.
+	NodeRole string
+}
+
+func (l JoinLine) String() string {
+	installer := l.Installer
 	if installer == "" {
 		installer = DefaultInstallerURL
 	}
-	line := fmt.Sprintf("curl -fsSL %s | sudo bash -s -- join %s --token %s", installer, joinURL, token)
-	if caHash != "" {
-		line += " --ca-cert-hash " + caHash
+	var b strings.Builder
+	fmt.Fprintf(&b, "curl -fsSL %s | sudo bash -s --", installer)
+	if l.Domain != "" {
+		fmt.Fprintf(&b, " --domain %s", l.Domain)
+		if strings.EqualFold(l.TLSIssuer, "internal") {
+			b.WriteString(" --tls-issuer internal")
+		} else {
+			fmt.Fprintf(&b, ` --dns-provider cloudflare --dns-api-token "$%s"`, DNSTokenVar)
+		}
 	}
-	return line
+	fmt.Fprintf(&b, " join %s --token %s", l.JoinURL, l.Token)
+	if l.CACertHash != "" {
+		fmt.Fprintf(&b, " --ca-cert-hash %s", l.CACertHash)
+	}
+	if l.NodeRole != "" {
+		fmt.Fprintf(&b, " --role %s", l.NodeRole)
+	}
+	if l.IngressHost != "" && !strings.EqualFold(l.IngressHost, l.Domain) {
+		fmt.Fprintf(&b, " --ingress-advertise-host %s", l.IngressHost)
+	}
+	return b.String()
+}
+
+// NeedsDNSToken reports whether the line reads DNSTokenVar.
+func (l JoinLine) NeedsDNSToken() bool {
+	return l.Domain != "" && !strings.EqualFold(l.TLSIssuer, "internal")
+}
+
+// JoinCommand is the plain line, with no public setup and no role: what a
+// cluster without a domain prints.
+func JoinCommand(installer, joinURL, token, caHash string) string {
+	return JoinLine{Installer: installer, JoinURL: joinURL, Token: token, CACertHash: caHash}.String()
+}
+
+// NodeRoleForJoin splits join-command's --role into the token's role and
+// the --role the line adds: worker (the default), ingress and server are
+// tokens of their own; mixed and lists such as server,worker take the token
+// of their strongest job (joinRoleOf) and run as typed.
+func NodeRoleForJoin(raw string) (tokenRole, nodeRole string, err error) {
+	raw = strings.ToLower(strings.Join(strings.Fields(raw), ""))
+	if raw == "" {
+		return cluster.JoinRoleWorker, "", nil
+	}
+	tokenRole, err = joinRoleOf(raw)
+	if err != nil {
+		return "", "", err
+	}
+	if raw == tokenRole {
+		return tokenRole, "", nil
+	}
+	return tokenRole, raw, nil
+}
+
+// joinLineFor is the line for a token this node made, with this node's
+// public setup.
+func joinLineFor(env nodeEnv, installer, joinURL, token, caHash, nodeRole string) JoinLine {
+	return JoinLine{
+		Installer: installer, JoinURL: joinURL, Token: token, CACertHash: caHash,
+		Domain: env.get("SB_DOMAIN"), IngressHost: env.get("SB_INGRESS_ADVERTISE_HOST"),
+		TLSIssuer: env.get("SB_TLS_ISSUER"), NodeRole: nodeRole,
+	}
 }
 
 // InitOptions is `sandboxd init`.
@@ -102,6 +187,9 @@ type InitResult struct {
 	JoinURL    string
 	APIURL     string
 	JoinTokens []cluster.JoinTokenCreated
+	// Setup is this node's public setup, which every printed join command
+	// repeats (JoinLine without its token fields).
+	Setup JoinLine
 }
 
 // Run does cluster-init.sh's job in Go (§4.1). A re-run on the seed it made
@@ -198,7 +286,8 @@ func (in *Initer) Run(ctx context.Context, o InitOptions) (InitResult, error) {
 	}
 
 	res := InitResult{NodeID: nodeID, ClusterID: cluster.CACertHash(ca.Certificate()), Again: again,
-		JoinURL: "https://" + net.JoinHostPort(advertise, fmt.Sprint(cluster.DefaultJoinPort)), APIURL: env.publicAPIURL(advertise)}
+		JoinURL: "https://" + net.JoinHostPort(advertise, fmt.Sprint(cluster.DefaultJoinPort)), APIURL: env.publicAPIURL(advertise),
+		Setup: joinLineFor(env, "", "", "", "", "")}
 	tokens := o.Tokens
 	if len(tokens) == 0 {
 		// Like kubeadm init: one token, so the printed command works.
@@ -410,22 +499,27 @@ func (in *Initer) writeAdminContext(nodeID, apiURL, pat string) error {
 
 func (in *Initer) printSummary(res InitResult, installer string) {
 	in.printf("\nThe cluster is up. This node, %s, is its first server and its leader.\n", res.NodeID)
-	in.printf("Cluster ID (CA hash): %s\n", res.ClusterID)
+	in.printf("Cluster ID: %s (a new node checks it with --ca-cert-hash)\n", res.ClusterID)
 	for _, t := range res.JoinTokens {
 		life := "never expires"
 		if t.ExpiresAt != nil {
-			life = "valid until " + t.ExpiresAt.Format(time.RFC3339)
+			life = "is valid until " + t.ExpiresAt.Format(time.RFC3339)
 		}
 		article := "a"
 		if t.Role == cluster.JoinRoleIngress {
 			article = "an"
 		}
-		in.printf("\nTo add %s %s node, run this on it (the token %s):\n\n  %s\n", article, t.Role, life, JoinCommand(installer, res.JoinURL, t.Token, res.ClusterID))
+		line := res.Setup
+		line.Installer, line.JoinURL, line.Token, line.CACertHash = installer, res.JoinURL, t.Token, res.ClusterID
+		in.printf("\nTo add %s %s node, run this on it (the token %s):\n\n  %s\n", article, t.Role, life, line)
+		if line.NeedsDNSToken() {
+			in.printf("\n  First set your Cloudflare API token on that machine: export %s=<token>\n", DNSTokenVar)
+		}
 		if t.Warning != "" {
 			in.printf("  warning: %s\n", t.Warning)
 		}
 	}
-	in.printf("\nMake more join commands from your laptop with: aerolvm join-command --role worker\n")
-	in.printf("\nTo use the cluster from your laptop, copy %s there (it holds the admin token; keep it private), then run:\n\n", in.Paths.AdminContext)
+	in.printf("\nMake more join commands from your computer with: aerolvm join-command --role worker (or mixed, server, ingress)\n")
+	in.printf("\nTo use the cluster from your computer, copy %s there (it holds the admin token; keep it private), then run:\n\n", in.Paths.AdminContext)
 	in.printf("  aerolvm config import admin-context.json --use\n\nor log in to %s with: aerolvm login %s --token-stdin\n", res.APIURL, res.APIURL)
 }

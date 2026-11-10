@@ -116,6 +116,15 @@ type JoinTokenCreated struct {
 	JoinURLs   []string   `json:"join_urls"`
 	// Warning is set for a never-expiring token outside enterprise mode.
 	Warning string `json:"warning,omitempty"`
+	// Domain, IngressAdvertiseHost and TLSIssuer are the answering node's
+	// public setup, which the printed join command repeats so a new node
+	// serves the same addresses: SB_DOMAIN, SB_INGRESS_ADVERTISE_HOST when
+	// it is not the domain, and SB_TLS_ISSUER when it is "internal". The API
+	// handler fills them (the cluster package does not hold that config);
+	// none is a secret.
+	Domain               string `json:"domain,omitempty"`
+	IngressAdvertiseHost string `json:"ingress_advertise_host,omitempty"`
+	TLSIssuer            string `json:"tls_issuer,omitempty"`
 }
 
 // JoinTokenInfo is one token in a list. Never the secret or its hash.

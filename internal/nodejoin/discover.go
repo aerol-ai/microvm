@@ -160,12 +160,22 @@ func (e *JoinRefusal) Error() string {
 }
 
 // Fix is the one line that says what to do about a refusal.
-func (e *JoinRefusal) Fix() string {
+func (e *JoinRefusal) Fix() string { return e.FixFor("") }
+
+// FixFor is Fix for a machine that joins as role (its --role, else the
+// token's). A new token must be for that role: `aerolvm join-command` with
+// no --role makes a worker one, so a mixed node that followed a bare hint
+// came back as a worker.
+func (e *JoinRefusal) FixFor(role string) string {
+	newCommand := "`aerolvm join-command`"
+	if role = strings.TrimSpace(role); role != "" && role != cluster.JoinRoleWorker {
+		newCommand = "`aerolvm join-command --role " + role + "`"
+	}
 	switch e.Reason {
 	case "token_invalid", "token_expired":
-		return "the token is wrong, revoked or expired: make a new one with `aerolvm join-command`"
+		return "the token is wrong, cancelled or expired: make a new join command with " + newCommand
 	case "token_used":
-		return "this single-use token joined another node: make a new one with `aerolvm join-command`"
+		return "this single-use token joined another machine: make a new join command with " + newCommand
 	case "role_mismatch":
 		return "the token is for another role: make one for this role with `aerolvm join-command --role <role>`"
 	case "node_id_in_use":

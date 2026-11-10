@@ -33,7 +33,7 @@ var ErrJoinCommandNotOnServer = errors.New("sandboxd join-command runs on a serv
 
 // TokenOptions are join-command's flags.
 type TokenOptions struct {
-	Role         string // worker (default), ingress or server
+	Role         string // worker (default), ingress, server, mixed or a list (NodeRoleForJoin)
 	TTL          string // like 2h; 0 never expires (worker and ingress only); "" is the cluster's default
 	Reusable     bool
 	InstallerURL string
@@ -51,12 +51,9 @@ func (m *TokenMaker) Run(ctx context.Context, o TokenOptions) (TokenResult, erro
 	if !m.Host.IsRoot() {
 		return TokenResult{}, errors.New("run sandboxd join-command as root (sudo): it reads the operator token from sandboxd.env")
 	}
-	role := strings.ToLower(strings.TrimSpace(o.Role))
-	if role == "" {
-		role = cluster.JoinRoleWorker
-	}
-	if !cluster.ValidJoinRole(role) {
-		return TokenResult{}, fmt.Errorf("--role must be worker, ingress or server, got %q", o.Role)
+	role, nodeRole, err := NodeRoleForJoin(o.Role)
+	if err != nil || !cluster.ValidJoinRole(role) {
+		return TokenResult{}, fmt.Errorf("--role must be worker, ingress, server, mixed or a list such as server,worker; got %q", o.Role)
 	}
 	env, err := loadNodeEnv(m.Paths)
 	if err != nil {
@@ -90,13 +87,17 @@ func (m *TokenMaker) Run(ctx context.Context, o TokenOptions) (TokenResult, erro
 	if created.ExpiresAt != nil {
 		life = "expires at " + created.ExpiresAt.UTC().Format(time.RFC3339)
 	}
-	use := "works once"
+	use := "works for one machine"
 	if created.Reusable {
 		use = "works for any number of machines"
 	}
-	m.Printer.printf("sandboxd: %s token %s %s and %s; revoke it with: aerolvm delete jointoken %s\n", created.Role, created.ID, life, use, created.ID)
+	m.Printer.printf("sandboxd: %s token %s %s and %s. To cancel it: aerolvm delete jointoken %s\n", created.Role, created.ID, life, use, created.ID)
 	if created.Warning != "" {
 		m.Printer.printf("warning: %s\n", created.Warning)
 	}
-	return TokenResult{JoinTokenCreated: created, Command: JoinCommand(installer, created.JoinURLs[0], created.Token, created.CACertHash)}, nil
+	line := joinLineFor(env, installer, created.JoinURLs[0], created.Token, created.CACertHash, nodeRole)
+	if line.NeedsDNSToken() {
+		m.Printer.printf("sandboxd: on the new machine, first set your Cloudflare API token: export %s=<token>\n", DNSTokenVar)
+	}
+	return TokenResult{JoinTokenCreated: created, Command: line.String()}, nil
 }

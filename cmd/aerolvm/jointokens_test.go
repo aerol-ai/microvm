@@ -20,6 +20,7 @@ type fakeJoinTokens struct {
 	refuse   string // POST answers 403 with this error
 	noURLs   bool
 	listBody string
+	domain   string // the answering node's SB_DOMAIN, when set
 }
 
 const fakeTokenList = `{"tokens":[
@@ -53,6 +54,9 @@ func newFakeJoinTokens(t *testing.T) (*harness, *fakeJoinTokens) {
 			}
 			if f.noURLs {
 				out["join_urls"] = []string{}
+			}
+			if f.domain != "" {
+				out["domain"] = f.domain
 			}
 			if body["ttl"] == "0" {
 				out["warning"] = "this token never expires"
@@ -118,6 +122,39 @@ func TestJoinCommandOutputs(t *testing.T) {
 	}
 }
 
+// TestJoinCommandMixedWithDomain: --role mixed asks for a server token and
+// the line adds --role mixed; the cluster's domain comes back from the API,
+// so the line carries it with the DNS options and never the Cloudflare
+// token itself.
+func TestJoinCommandMixedWithDomain(t *testing.T) {
+	h, f := newFakeJoinTokens(t)
+	f.domain = "cluster.example.com"
+	code := h.run("join-command", "--role", "mixed")
+	if code != exitOK {
+		t.Fatalf("join-command --role mixed = %d %s", code, h.stderr.String())
+	}
+	checkGoldenIn(t, "jointokens", "join-command-mixed-domain.golden", h.transcript(code))
+	if f.creates[0]["role"] != "server" {
+		t.Fatalf("create = %v, want a server token", f.creates[0])
+	}
+	for _, tc := range []struct {
+		role, token, node string
+	}{
+		{"", "worker", ""}, {"Worker", "worker", ""}, {"server", "server", ""}, {"ingress", "ingress", ""},
+		{"mixed", "server", "mixed"}, {"server, worker", "server", "server,worker"}, {"ingress,worker", "worker", "ingress,worker"},
+		{"worker,worker", "worker", ""},
+	} {
+		token, node, ok := joinRoles(tc.role)
+		if !ok || token != tc.token || node != tc.node {
+			t.Fatalf("joinRoles(%q) = %q %q %v, want %q %q", tc.role, token, node, ok, tc.token, tc.node)
+		}
+	}
+	l := joinLine{Installer: "https://i.example", JoinURL: "https://10.0.0.5:7003", Token: "t", Domain: "c.example.com", TLSIssuer: "internal", IngressHost: "in.example.com"}
+	if got := l.String(); got != "curl -fsSL https://i.example | sudo bash -s -- --domain c.example.com --tls-issuer internal join https://10.0.0.5:7003 --token t --ingress-advertise-host in.example.com" || l.needsDNSToken() {
+		t.Fatalf("internal issuer line = %q", got)
+	}
+}
+
 func TestJoinCommandRefusals(t *testing.T) {
 	h, f := newFakeJoinTokens(t)
 	for _, tc := range []struct {
@@ -125,7 +162,8 @@ func TestJoinCommandRefusals(t *testing.T) {
 		code int
 		want string
 	}{
-		{[]string{"join-command", "--role", "boss"}, exitUsage, "--role must be worker, ingress or server"},
+		{[]string{"join-command", "--role", "boss"}, exitUsage, "--role must be worker, ingress, server, mixed"},
+		{[]string{"join-command", "--role", "mixed,worker"}, exitUsage, "--role must be worker, ingress, server, mixed"},
 		{[]string{"join-command", "--ttl", "soon"}, exitUsage, "--ttl must be a duration"},
 		{[]string{"join-command", "--ttl", "-1h"}, exitUsage, "--ttl must be a duration"},
 		{[]string{"join-command", "--role", "server", "--ttl", "0"}, exitUsage, "only for worker and ingress"},

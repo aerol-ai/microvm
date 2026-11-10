@@ -126,6 +126,9 @@ func (h *handlers) clusterCreateJoinToken(w http.ResponseWriter, r *http.Request
 		writeJoinError(w, err)
 		return
 	}
+	// The printed join command repeats this node's public setup, so the new
+	// machine serves the same domain without the operator retyping it.
+	created.Domain, created.IngressAdvertiseHost, created.TLSIssuer = h.deps.Service.JoinPublicSetup()
 	apihttp.WriteJSON(w, http.StatusCreated, created)
 }
 

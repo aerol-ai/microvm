@@ -93,8 +93,14 @@ func newJoinStub() *joinStubCluster {
 // joinRoutesMux serves the real v1 routes as caller.
 func joinRoutesMux(t *testing.T, c cluster.Client, caller controlplane.Access) *http.ServeMux {
 	t.Helper()
+	return joinRoutesMuxWith(t, c, caller, config.Config{})
+}
+
+// joinRoutesMuxWith is joinRoutesMux on a node with cfg.
+func joinRoutesMuxWith(t *testing.T, c cluster.Client, caller controlplane.Access, cfg config.Config) *http.ServeMux {
+	t.Helper()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	svc := service.New(config.Config{}, logger, nil, nil, nil, nil, nil, nil, nil)
+	svc := service.New(cfg, logger, nil, nil, nil, nil, nil, nil, nil)
 	svc.AttachCluster(c)
 	mux := http.NewServeMux()
 	RegisterRoutes(mux, Deps{Service: svc, Logger: logger, Auth: func(next http.Handler) http.Handler {
@@ -117,6 +123,36 @@ func serveBody(mux http.Handler, method, path, body string) *httptest.ResponseRe
 	}
 	mux.ServeHTTP(rr, httptest.NewRequest(method, path, r))
 	return rr
+}
+
+// TestJoinTokenCarriesPublicSetup: the answer repeats this node's domain,
+// its ingress host when that is not the domain, and Caddy's own issuer, so
+// the printed join command gives a new node the same addresses. A node with
+// no domain adds nothing, and the public ACME issuer is the default.
+func TestJoinTokenCarriesPublicSetup(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		cfg  config.Config
+		want [3]string
+	}{
+		{"no domain", config.Config{}, [3]string{}},
+		{"a domain, the ingress host the same", config.Config{Domain: "c.example.com", IngressAdvertiseHost: "c.example.com", TLSIssuer: "acme"}, [3]string{"c.example.com", "", ""}},
+		{"another ingress host, Caddy's issuer", config.Config{Domain: "c.example.com", IngressAdvertiseHost: "in.example.com", TLSIssuer: "Internal"}, [3]string{"c.example.com", "in.example.com", "internal"}},
+	} {
+		stub := newJoinStub()
+		stub.created = cluster.JoinTokenCreated{Token: "abcdef." + strings.Repeat("x", 32), ID: "abcdef", Role: "server"}
+		rr := serveBody(joinRoutesMuxWith(t, stub, joinOperator(), tc.cfg), http.MethodPost, "/v1/cluster/join-tokens", `{"role":"server"}`)
+		var got cluster.JoinTokenCreated
+		if rr.Code != http.StatusCreated || json.Unmarshal(rr.Body.Bytes(), &got) != nil {
+			t.Fatalf("%s: create = %d %s", tc.name, rr.Code, rr.Body.String())
+		}
+		if [3]string{got.Domain, got.IngressAdvertiseHost, got.TLSIssuer} != tc.want {
+			t.Fatalf("%s: setup = %q %q %q, want %q", tc.name, got.Domain, got.IngressAdvertiseHost, got.TLSIssuer, tc.want)
+		}
+		if tc.cfg.Domain == "" && strings.Contains(rr.Body.String(), "domain") {
+			t.Fatalf("%s: a node with no domain answered %s", tc.name, rr.Body.String())
+		}
+	}
 }
 
 func TestJoinTokenRoutes(t *testing.T) {

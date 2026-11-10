@@ -12,7 +12,6 @@ package suite
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -221,16 +220,13 @@ func TestModuleURLJoinCommandAddsAWorker(t *testing.T) {
 	if !strings.Contains(line.stdout, "--ca-cert-hash sha256:") {
 		t.Fatalf("join-command printed %q", line.stdout)
 	}
-	// The printed words run unchanged. Only the installer is this build's (a
-	// dev build is not on the release CDN), so its URL and the flags that
-	// point it at this build's files go in front of them.
-	quoted := make([]string, 0, len(artifacts)+len(args))
-	for _, a := range append(append([]string{}, artifacts...), args...) {
-		quoted = append(quoted, shellQuote(a))
-	}
+	// The printed words run unchanged, after the Cloudflare token the line
+	// asks for is set. Only the installer is this build's (a dev build is not
+	// on the release CDN), so its URL and the flags that point it at this
+	// build's files go in front of them.
 	hostname, _ := joinNodeSSH(t, spare, "hostname -s")
 	hostname = strings.TrimSpace(hostname)
-	out, code := runOnNode(t, spare, fmt.Sprintf("curl -fsSL %s | sudo bash -s -- %s", shellQuote(installer), strings.Join(quoted, " ")))
+	out, code := runJoinLine(t, spare, members[0], installer, append(append([]string{}, artifacts...), args...))
 	if code != 0 || !strings.Contains(out, "joined the cluster as a worker node") {
 		t.Fatalf("the join-command line on blank %s = %d\n%s", spare.Name, code, out)
 	}

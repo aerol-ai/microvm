@@ -65,15 +65,57 @@ func clusterInfoStatus(t *testing.T, node harness.IntegrationNode, joinURL, toke
 	return strings.TrimSpace(out)
 }
 
-// joinLineArgs is what follows "bash -s -- " in a printed join command.
+// joinLineArgs is what follows "bash -s -- " in a printed join command: the
+// installer options a cluster with a domain adds (--domain and the DNS
+// options), then join and its flags.
 func joinLineArgs(t *testing.T, line string) (installer string, args []string) {
 	t.Helper()
 	line = strings.TrimSpace(line)
-	m := regexp.MustCompile(`^curl -fsSL (\S+) \| sudo bash -s -- (join .+)$`).FindStringSubmatch(line)
+	m := regexp.MustCompile(`^curl -fsSL (\S+) \| sudo bash -s -- ((?:\S+ )*?join .+)$`).FindStringSubmatch(line)
 	if m == nil {
-		t.Fatalf("join-command printed %q, not `curl -fsSL <installer> | sudo bash -s -- join ...`", line)
+		t.Fatalf("join-command printed %q, not `curl -fsSL <installer> | sudo bash -s -- [options] join ...`", line)
 	}
 	return m[1], strings.Fields(m[2])
+}
+
+// dnsTokenWord is how a printed join command reads the DNS API token: the
+// shell on the new machine expands it, so the secret is not in the line.
+const dnsTokenWord = `"$CLOUDFLARE_API_TOKEN"`
+
+// runJoinLine runs a printed join command's words on node as typed, through
+// installer: every word quoted except dnsTokenWord, which the remote shell
+// expands. The token itself is read on member from its Caddy settings and
+// sent on stdin, so it is in no command line and no log.
+func runJoinLine(t *testing.T, node, member harness.IntegrationNode, installer string, words []string) (string, int) {
+	t.Helper()
+	quoted := make([]string, 0, len(words))
+	stdin := ""
+	for _, w := range words {
+		if w != dnsTokenWord {
+			quoted = append(quoted, shellQuote(w))
+			continue
+		}
+		quoted = append(quoted, w)
+		if stdin == "" {
+			tok, err := joinNodeSSH(t, member, `sudo sed -n 's/^SB_DNS_API_TOKEN=//p' /etc/default/caddy`)
+			if tok = strings.TrimSpace(tok); err != nil || tok == "" {
+				t.Fatalf("the join command reads CLOUDFLARE_API_TOKEN, and %s has no DNS API token to set it from: %v", member.Name, err)
+			}
+			stdin = tok + "\n"
+		}
+	}
+	target, ok := harness.SSHTarget(node)
+	if !ok {
+		t.Fatalf("node %s has no SSH address", node.Name)
+	}
+	script := fmt.Sprintf(`IFS= read -r CLOUDFLARE_API_TOKEN || true; export CLOUDFLARE_API_TOKEN; curl -fsSL %s | sudo bash -s -- %s; echo "EXIT=$?"`,
+		shellQuote(installer), strings.Join(quoted, " "))
+	out, _ := harness.SSHRunStdin(t, target, script, stdin)
+	code := -1
+	if i := strings.LastIndex(out, "EXIT="); i >= 0 {
+		fmt.Sscanf(out[i+len("EXIT="):], "%d", &code)
+	}
+	return out, code
 }
 
 func tokenOf(t *testing.T, args []string) string {
@@ -240,16 +282,13 @@ func TestJoinTokenRefusalsAndAFreshJoin(t *testing.T) {
 	if printedInstaller != "https://aerolvm.aerol.ai" || !strings.Contains(line.stdout, "--ca-cert-hash sha256:") {
 		t.Fatalf("UC-624: join-command printed %q", line.stdout)
 	}
-	// The printed words run unchanged. Only the installer is this build's
-	// (a dev build is not on the release CDN), so its URL and the flags that
-	// point it at this build's files go in front of them.
-	quoted := make([]string, 0, len(artifacts)+len(args))
-	for _, a := range append(append([]string{}, artifacts...), args...) {
-		quoted = append(quoted, shellQuote(a))
-	}
+	// The printed words run unchanged, after the Cloudflare token the line
+	// asks for is set. Only the installer is this build's (a dev build is not
+	// on the release CDN), so its URL and the flags that point it at this
+	// build's files go in front of them.
 	hostname, _ := joinNodeSSH(t, victim, "hostname -s")
 	hostname = strings.TrimSpace(hostname)
-	out, code = runOnNode(t, victim, fmt.Sprintf("curl -fsSL %s | sudo bash -s -- %s", shellQuote(installer), strings.Join(quoted, " ")))
+	out, code = runJoinLine(t, victim, pickServer(t, targets), installer, append(append([]string{}, artifacts...), args...))
 	if code != 0 || !strings.Contains(out, "joined the cluster as a worker node") {
 		t.Fatalf("UC-624: the join-command line as typed = %d\n%s", code, out)
 	}

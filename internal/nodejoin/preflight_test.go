@@ -230,6 +230,20 @@ func TestJoinRefusalFix(t *testing.T) {
 	if (&JoinRefusal{Reason: "error"}).Fix() != "" {
 		t.Fatal("an unknown reason got a fix")
 	}
+	// A new token must be for the role this machine joins as: a bare
+	// `aerolvm join-command` makes a worker one.
+	for role, want := range map[string]string{
+		"":       "make a new join command with `aerolvm join-command`",
+		"worker": "make a new join command with `aerolvm join-command`",
+		"mixed":  "make a new join command with `aerolvm join-command --role mixed`",
+		"server": "make a new join command with `aerolvm join-command --role server`",
+	} {
+		for _, reason := range []string{"token_expired", "token_used"} {
+			if got := (&JoinRefusal{Reason: reason}).FixFor(role); !strings.HasSuffix(got, want) {
+				t.Fatalf("%s for %q = %q, want it to end %q", reason, role, got, want)
+			}
+		}
+	}
 	if r := joinRefusal(500, []byte("plain text")); r.Message != "plain text" || r.Reason != "" {
 		t.Fatalf("plain refusal = %+v", r)
 	}

@@ -2,5 +2,5 @@ exit 0
 --- stdout
 curl -fsSL https://aerolvm.aerol.ai | sudo bash -s -- join https://10.0.0.5:7003 --token abc123.0123456789abcdefghijklmnopqrstuv --ca-cert-hash sha256:9a1c
 --- stderr
-aerolvm: worker token abc123 never expires and works for any number of machines; revoke it with: aerolvm delete jointoken abc123
+aerolvm: worker token abc123 never expires and works for any number of machines. To cancel it: aerolvm delete jointoken abc123
 warning: this token never expires

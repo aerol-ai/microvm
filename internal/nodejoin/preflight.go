@@ -321,7 +321,7 @@ func remoteChecksInner(ctx context.Context, h Host, in remoteInput) (*discovery,
 		case errors.As(err, &unreachable):
 			reach.Fix = "open TCP 7003 to the servers, and check the join URL"
 		case errors.As(err, &refusal):
-			reach.Fix = refusal.Fix()
+			reach.Fix = refusal.FixFor(in.role)
 		case errors.Is(err, cluster.ErrJoinTokenFormat):
 			reach.Fix = "copy the whole token: 6 characters, a dot, 32 characters"
 		default:
@@ -351,7 +351,7 @@ func remoteChecksInner(ctx context.Context, h Host, in remoteInput) (*discovery,
 		c := Check{Name: "dial-back", Status: StatusFail, Detail: err.Error()}
 		var refusal *JoinRefusal
 		if errors.As(err, &refusal) {
-			c.Fix = refusal.Fix()
+			c.Fix = refusal.FixFor(in.role)
 		}
 		return d, "", append(out, c)
 	}

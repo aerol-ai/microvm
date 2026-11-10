@@ -202,9 +202,28 @@ func addressSettings(set *envSet, nodeID, advertise string, env nodeEnv, p Paths
 	if o.NodeRole != "" {
 		set.set("SB_NODE_ROLE", o.NodeRole)
 	}
-	if o.IngressAdvertiseHost != "" {
-		set.set("SB_INGRESS_ADVERTISE_HOST", o.IngressAdvertiseHost)
+	if ingress := ingressHostFor(env, o.IngressAdvertiseHost); ingress != "" {
+		set.set("SB_INGRESS_ADVERTISE_HOST", ingress)
 	}
+}
+
+// ingressHostFor is SB_INGRESS_ADVERTISE_HOST for cluster.env: the flag;
+// else nothing when sandboxd.env already sets it (cluster.env would win
+// over the operator's choice); else what an earlier init or join wrote;
+// else the domain. Terraform passes --ingress-advertise-host <domain> to
+// every node, so a node added by hand defaults to the same: the cluster's
+// address for its custom-domain DNS answer, instead of each node's IP.
+func ingressHostFor(env nodeEnv, flag string) string {
+	if flag != "" {
+		return flag
+	}
+	if strings.TrimSpace(env.base["SB_INGRESS_ADVERTISE_HOST"]) != "" {
+		return ""
+	}
+	if h := strings.TrimSpace(env.cluster["SB_INGRESS_ADVERTISE_HOST"]); h != "" {
+		return h
+	}
+	return strings.TrimSpace(env.base["SB_DOMAIN"])
 }
 
 // AddressOptions are the optional address settings init and join share

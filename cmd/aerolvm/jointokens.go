@@ -46,6 +46,10 @@ type joinTokenCreated struct {
 	CACertHash string     `json:"ca_cert_hash"`
 	JoinURLs   []string   `json:"join_urls"`
 	Warning    string     `json:"warning,omitempty"`
+	// The answering node's public setup, which the printed line repeats.
+	Domain               string `json:"domain,omitempty"`
+	IngressAdvertiseHost string `json:"ingress_advertise_host,omitempty"`
+	TLSIssuer            string `json:"tls_issuer,omitempty"`
 }
 
 // joinTokenInfo is one token in GET /v1/cluster/join-tokens.
@@ -81,11 +85,14 @@ func (t joinTokenInfo) expires() string {
 
 const joinCommandHelp = `Make a join token and print the command that adds a machine to the cluster.
 
-Usage: aerolvm join-command [--role worker|ingress|server] [--ttl 2h] [--reusable]
+Usage: aerolvm join-command [--role worker|ingress|server|mixed] [--ttl 2h] [--reusable]
 
 Run the printed line on the new machine, as is: it installs AerolVM (the
-version the cluster runs) and joins it with the token. The token decides the
-role. It works once unless --reusable, and lasts 2h unless --ttl says
+version the cluster runs) and joins it with the token. When the cluster has
+a domain, the line also carries its --domain and DNS options, so the node
+serves the same addresses; it reads your Cloudflare API token from
+$CLOUDFLARE_API_TOKEN on that machine, so set that first. The token decides
+the role. It works for one machine unless --reusable, and lasts 2h unless --ttl says
 otherwise; server tokens last at most 24h. --ttl 0 never expires and is only
 for worker and ingress tokens (for autoscaling); in enterprise mode the
 cluster also needs wrapped key custody for it. Each call makes a new token.
@@ -93,13 +100,17 @@ cluster also needs wrapped key custody for it. Each call makes a new token.
 Stdout is only the command (with --json: the token object and "command").
 Needs an admin.
 
-  --role ROLE       worker (default), ingress or server
+  --role ROLE       worker (default), ingress or server; or mixed (a server
+                    that also runs sandboxes and takes traffic), or a list
+                    such as worker,ingress: the token of its strongest job,
+                    and the line adds --role
   --ttl DURATION    like 30m, 2h or 24h; 0 for never (worker and ingress)
   --reusable        let many machines join with the same token
 
 Examples:
   aerolvm join-command
   aerolvm join-command --role server
+  aerolvm join-command --role mixed
   aerolvm join-command --role worker --ttl 0 --reusable
 `
 
@@ -118,11 +129,9 @@ func runJoinCommand(ctx context.Context, a *app, args []string) int {
 	if len(pos) > 0 {
 		return a.usageError(c, "join-command", "unexpected argument %q", pos[0])
 	}
-	role = strings.ToLower(strings.TrimSpace(role))
-	switch role {
-	case "worker", "ingress", "server":
-	default:
-		return a.usageError(c, "join-command", "--role must be worker, ingress or server, got %q", role)
+	role, nodeRole, ok := joinRoles(role)
+	if !ok {
+		return a.usageError(c, "join-command", "--role must be worker, ingress, server, mixed or a list such as server,worker; got %q", nodeRole)
 	}
 	if ttl = strings.TrimSpace(ttl); ttl != "" && ttl != "0" {
 		d, err := time.ParseDuration(ttl)
@@ -145,7 +154,11 @@ func runJoinCommand(ctx context.Context, a *app, args []string) int {
 		return a.fail(c, &agenttools.Error{Code: agenttools.CodeUnavailable, Message: "the cluster reported no join URL",
 			Hint: "no server has its join port (7003) open; check SB_CLUSTER_JOIN_LISTEN_ADDR on the servers"}, exitError)
 	}
-	command := joinCommandLine(joinInstallerURL, created.JoinURLs[0], created.Token, created.CACertHash)
+	line := joinLine{
+		Installer: joinInstallerURL, JoinURL: created.JoinURLs[0], Token: created.Token, CACertHash: created.CACertHash,
+		Domain: created.Domain, IngressHost: created.IngressAdvertiseHost, TLSIssuer: created.TLSIssuer, NodeRole: nodeRole,
+	}
+	command := line.String()
 	if c.json {
 		a.printJSON(struct {
 			joinTokenCreated
@@ -158,25 +171,100 @@ func runJoinCommand(ctx context.Context, a *app, args []string) int {
 	if created.ExpiresAt != nil {
 		life = "expires at " + created.ExpiresAt.UTC().Format(time.RFC3339)
 	}
-	use := "works once"
+	use := "works for one machine"
 	if created.Reusable {
 		use = "works for any number of machines"
 	}
-	a.note("aerolvm: %s token %s %s and %s; revoke it with: aerolvm delete jointoken %s", created.Role, created.ID, life, use, created.ID)
+	a.note("aerolvm: %s token %s %s and %s. To cancel it: aerolvm delete jointoken %s", created.Role, created.ID, life, use, created.ID)
+	if line.needsDNSToken() {
+		a.note("aerolvm: on the new machine, first set your Cloudflare API token: export %s=<token>", joinDNSTokenVar)
+	}
 	if created.Warning != "" {
 		a.note("warning: %s", created.Warning)
 	}
 	return exitOK
 }
 
-// joinCommandLine is the line sandboxd init prints too (internal/nodejoin
-// JoinCommand); the CLI can't import it, so it is written out here.
-func joinCommandLine(installer, joinURL, token, caHash string) string {
-	line := fmt.Sprintf("curl -fsSL %s | sudo bash -s -- join %s --token %s", installer, joinURL, token)
-	if caHash != "" {
-		line += " --ca-cert-hash " + caHash
+// joinDNSTokenVar is the variable the printed line reads the DNS API token
+// from on the new machine (internal/nodejoin DNSTokenVar): the token is a
+// secret, so the line names it instead of holding it.
+const joinDNSTokenVar = "CLOUDFLARE_API_TOKEN"
+
+// joinLine is the line sandboxd init and sandboxd join-command print too
+// (internal/nodejoin JoinLine): the installer options that give the new
+// machine the cluster's public setup, then join and its flags. The CLI
+// can't import nodejoin, so it is written out here; the golden files pin
+// both to the same words.
+type joinLine struct {
+	Installer, JoinURL, Token, CACertHash string
+	Domain, IngressHost, TLSIssuer        string
+	NodeRole                              string
+}
+
+func (l joinLine) String() string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "curl -fsSL %s | sudo bash -s --", l.Installer)
+	if l.Domain != "" {
+		fmt.Fprintf(&b, " --domain %s", l.Domain)
+		if strings.EqualFold(l.TLSIssuer, "internal") {
+			b.WriteString(" --tls-issuer internal")
+		} else {
+			fmt.Fprintf(&b, ` --dns-provider cloudflare --dns-api-token "$%s"`, joinDNSTokenVar)
+		}
 	}
-	return line
+	fmt.Fprintf(&b, " join %s --token %s", l.JoinURL, l.Token)
+	if l.CACertHash != "" {
+		fmt.Fprintf(&b, " --ca-cert-hash %s", l.CACertHash)
+	}
+	if l.NodeRole != "" {
+		fmt.Fprintf(&b, " --role %s", l.NodeRole)
+	}
+	if l.IngressHost != "" && !strings.EqualFold(l.IngressHost, l.Domain) {
+		fmt.Fprintf(&b, " --ingress-advertise-host %s", l.IngressHost)
+	}
+	return b.String()
+}
+
+func (l joinLine) needsDNSToken() bool {
+	return l.Domain != "" && !strings.EqualFold(l.TLSIssuer, "internal")
+}
+
+// joinRoles splits --role into the token's role and the --role the line
+// adds (internal/nodejoin NodeRoleForJoin): worker, ingress and server are
+// tokens of their own; mixed and lists such as server,worker take the token
+// of their strongest job (any server is a server, else worker beats
+// ingress) and run as typed. On a bad value it returns the cleaned input.
+func joinRoles(raw string) (tokenRole, nodeRole string, ok bool) {
+	raw = strings.ToLower(strings.Join(strings.Fields(raw), ""))
+	switch raw {
+	case "", "worker":
+		return "worker", "", true
+	case "server", "ingress":
+		return raw, "", true
+	case "mixed":
+		return "server", "mixed", true
+	}
+	jobs := map[string]bool{}
+	for part := range strings.SplitSeq(raw, ",") {
+		switch part {
+		case "server", "worker", "ingress":
+			jobs[part] = true
+		default:
+			return "", raw, false
+		}
+	}
+	switch {
+	case jobs["server"]:
+		tokenRole = "server"
+	case jobs["worker"]:
+		tokenRole = "worker"
+	default:
+		tokenRole = "ingress"
+	}
+	if len(jobs) == 1 {
+		return tokenRole, "", true
+	}
+	return tokenRole, raw, true
 }
 
 // joinTokenRefusal adds the fix for the refusals people meet.

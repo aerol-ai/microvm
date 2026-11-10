@@ -133,11 +133,17 @@ func TestInitDefaultsAndDomain(t *testing.T) {
 	if len(r.api.tokens) != 1 || r.api.tokens[0].Role != "worker" || r.api.tokens[0].Token != "" || !r.api.tokens[0].Reusable {
 		t.Fatalf("tokens = %+v", r.api.tokens)
 	}
-	if res.APIURL != "https://api.example.com" || !strings.Contains(r.out.String(), "curl -fsSL https://mirror.example/install.sh | sudo bash -s -- join") {
+	// With a domain, the printed line repeats it with the DNS options, so a
+	// new node pasted from it serves the same domain; the Cloudflare token
+	// stays out of the line.
+	wantLine := `curl -fsSL https://mirror.example/install.sh | sudo bash -s -- --domain api.example.com --dns-provider cloudflare --dns-api-token "$CLOUDFLARE_API_TOKEN" join https://10.0.0.9:7003 --token `
+	if res.APIURL != "https://api.example.com" || !strings.Contains(r.out.String(), wantLine) ||
+		!strings.Contains(r.out.String(), "export CLOUDFLARE_API_TOKEN=<token>") || !strings.Contains(r.out.String(), "the token is valid until") {
 		t.Fatalf("result %+v\n%s", res, r.out.String())
 	}
 	env, _ := readEnvFile(r.paths.ClusterEnv)
-	if env["SB_NODE_ROLE"] != "server" || env["SB_GOSSIP_SECRET_KEY"] != b64(make([]byte, 16)) {
+	// The ingress host defaults to the domain, as Terraform sets it.
+	if env["SB_NODE_ROLE"] != "server" || env["SB_GOSSIP_SECRET_KEY"] != b64(make([]byte, 16)) || env["SB_INGRESS_ADVERTISE_HOST"] != "api.example.com" {
 		t.Fatalf("cluster.env = %v", env)
 	}
 	// SB_CLUSTER_NODE_CERT_TTL sets the seed's cert life too.

@@ -142,7 +142,11 @@ func (j *Joiner) Run(ctx context.Context, o JoinOptions) (JoinResult, error) {
 		}
 		key = k
 	}
-	resp, err := j.join(ctx, d, o.Token, nodeID, role, key)
+	askRole := o.Address.NodeRole
+	if askRole == "" {
+		askRole = role
+	}
+	resp, err := j.join(ctx, d, o.Token, nodeID, role, askRole, key)
 	if err != nil {
 		return JoinResult{}, err
 	}
@@ -196,19 +200,25 @@ func (j *Joiner) Run(ctx context.Context, o JoinOptions) (JoinResult, error) {
 	if resp.Replay {
 		again = " (already joined; nothing changed)"
 	}
-	j.printf("[join] %s joined the cluster as a %s node%s\n", nodeID, resp.Role, again)
+	// Name the jobs the node runs: a mixed node joins with a server token,
+	// and "joined as a server node" read as if --role mixed was lost.
+	if nodeRole != resp.Role {
+		j.printf("[join] %s joined the cluster as a %s node, with a %s token%s\n", nodeID, nodeRole, resp.Role, again)
+	} else {
+		j.printf("[join] %s joined the cluster as a %s node%s\n", nodeID, resp.Role, again)
+	}
 	if resp.PATToken == "" && len(resp.PATSHA256) > 0 {
-		j.printf("[join] it holds the operator token's hash, not the token: it checks the token by hash and calls its peers with its cert; its own SB_PAT_TOKEN works only for tools on this machine\n")
+		j.printf("[join] it does not hold the admin token, only a fingerprint (hash) to check it. Its own SB_PAT_TOKEN works only for tools on this machine.\n")
 	}
 	if resp.Role == cluster.JoinRoleServer && !m.Voter {
-		j.printf("[join] it is not a Raft voter yet; the leader adds servers as voters up to the voter cap\n")
+		j.printf("[join] it does not vote on cluster changes yet: the leader makes it a voter by itself, up to the cluster's voter limit (%s by default)\n", defaultMaxAutoVoters)
 	}
 	return res, nil
 }
 
 // join makes the CSR and calls POST /v1/join with the dial-back listeners
 // open.
-func (j *Joiner) join(ctx context.Context, d *discovery, token, nodeID, role string, key crypto.Signer) (cluster.JoinResponse, error) {
+func (j *Joiner) join(ctx context.Context, d *discovery, token, nodeID, role, askRole string, key crypto.Signer) (cluster.JoinResponse, error) {
 	csr, err := cluster.NewNodeCSR(key, nodeID)
 	if err != nil {
 		return cluster.JoinResponse{}, err
@@ -228,7 +238,7 @@ func (j *Joiner) join(ctx context.Context, d *discovery, token, nodeID, role str
 		if refusal.Reason == "dial_back" {
 			j.printf("fix dial-back: %s\n", dialBackCheck(refusal.DialBack).Detail)
 		}
-		if fix := refusal.Fix(); fix != "" {
+		if fix := refusal.FixFor(askRole); fix != "" {
 			j.printf("fix: %s\n", fix)
 		}
 	}

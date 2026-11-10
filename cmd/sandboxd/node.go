@@ -116,20 +116,24 @@ need nothing. Safe to run again.
   --ca-key <file>   a saved copy of the seed's ca.key, when the seed is gone
 `
 
-const tokenUsage = `usage: sudo sandboxd join-command [--role worker|ingress|server] [--ttl 2h]
+const tokenUsage = `usage: sudo sandboxd join-command [--role worker|ingress|server|mixed] [--ttl 2h]
                           [--reusable] [--json] [--installer-url <url>]
 
 Run on a server: makes a join token through this server's own API and prints
 the line that adds a machine with it, like kubeadm's
 ` + "`kubeadm token create --print-join-command`" + ` on a control-plane node. Run
-the line on the new machine. The token decides the role.
+the line on the new machine, as printed. The token decides the role. With a
+domain, the line also carries this node's --domain and DNS options; it reads
+the Cloudflare API token from $CLOUDFLARE_API_TOKEN on the new machine.
 
 A server token can only be made on a server: the cluster refuses one asked
 through a worker or an ingress node, and ` + "`aerolvm join-command`" + ` from a laptop
 goes through the ingress. So use this for a server added later, for example
 with Terraform's node_join_tokens (--json prints the token in "token").
 
-  --role ROLE       worker (default), ingress or server
+  --role ROLE       worker (default), ingress or server; or mixed, or a list
+                    such as server,worker: a server token, and the line adds
+                    --role so the node also runs sandboxes or takes traffic
   --ttl DURATION    like 30m, 2h or 24h (2h by default; server tokens at most
                     24h); 0 for never, worker and ingress only
   --reusable        let many machines join with the same token
