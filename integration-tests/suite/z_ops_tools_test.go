@@ -259,6 +259,11 @@ func TestOpsLostQuorumRecovery(t *testing.T) {
 	// Lose two of three servers.
 	recovered, rejoined := false, map[string]bool{}
 	t.Cleanup(func() {
+		// The survivor first: a recover-quorum that failed can leave it
+		// stopped, and it is the seed the others rejoin through.
+		if out, err := harness.SSHRun(t, survivorTarget, "sudo systemctl is-active --quiet sandboxd || { sudo systemctl reset-failed sandboxd; sudo systemctl start sandboxd; }"); err != nil {
+			t.Errorf("RESTORE FAILED on %s: %v\n%s", survivor.Name, err, out)
+		}
 		for _, n := range lost {
 			if rejoined[n.Name] {
 				continue
@@ -270,6 +275,15 @@ func TestOpsLostQuorumRecovery(t *testing.T) {
 			target, _ := harness.SSHTarget(n)
 			if out, err := harness.SSHRun(t, target, script); err != nil {
 				t.Errorf("RESTORE FAILED on %s (%s): %v\n%s", n.Name, script, err, out)
+			}
+		}
+		// Back in the API pool only once back in the cluster: a start
+		// returns long before a server rejoins, and the next case must not
+		// be handed a fleet a server short.
+		for _, n := range append([]harness.IntegrationNode{survivor}, lost...) {
+			if err := waitNodeRejoined(t, n); err != nil {
+				t.Errorf("RESTORE INCOMPLETE: %s did not rejoin the cluster: %v; every later case in this run is against a smaller fleet", n.Name, err)
+				continue
 			}
 			harness.MarkNodeUp(n.PublicIP)
 		}

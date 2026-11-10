@@ -183,10 +183,13 @@ func TestTheRejoinWaitIsWiredEndToEnd(t *testing.T) {
 // The guard stays. A case about secrets or audit that also happens to evict
 // the seed is paying for a control-plane event it is not testing, and any
 // red it produces reads as a bug in the wrong subsystem. UC-170 is the one
-// case whose subject IS the seed, so it is named here rather than slipping
-// through on a substring.
+// cluster case whose subject IS the seed, so it is named here rather than
+// slipping through on a substring. The single-node cases after it stop the
+// only node there is: on a single-node scenario that node is the seed, and
+// there is no cluster and no rendezvous to lose.
 var seedVictimCases = map[string]bool{
 	"TestSeedLossSurvivorsKeepALeaderAndTheSeedRejoins": true, // UC-170
+	"TestOpsBackupRestoreRoundTrip":                     true, // UC-680, single-node only (opsSingleNode)
 }
 
 func TestDisruptiveCasesChooseANonSeedVictim(t *testing.T) {
