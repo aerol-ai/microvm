@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+# common.sh: sourced by the worker scripts (run.sh for H0's one container,
+# agent.sh for S2's agent container). Settings mirror what scripts/install.sh
+# writes on a VM with --with-containerd-engine --with-gvisor, minus Caddy.
+
+# prepare_netfilter is the spike's stand-in for finding F1 (plan §18, Phase 0
+# results): a new pod network has no `ip filter` table, and sandboxd adds its
+# AEROLVM-USER chain to that table without creating it. `nft add` is a no-op
+# when the table or chain exists, so an agent restart can run it again.
+prepare_netfilter() {
+  echo "worker: iptables is $(iptables -V 2>&1); tables before: $(nft list tables 2>&1 | tr '\n' ' ')"
+  local fam
+  for fam in ip ip6; do
+    nft add table "$fam" filter
+    nft add chain "$fam" filter INPUT '{ type filter hook input priority 0; policy accept; }'
+    nft add chain "$fam" filter FORWARD '{ type filter hook forward priority 0; policy accept; }'
+    nft add chain "$fam" filter OUTPUT '{ type filter hook output priority 0; policy accept; }'
+  done
+  echo "worker: tables after: $(nft list tables 2>&1 | tr '\n' ' ')"
+}
+
+# sandboxd_env exports a single-node sandboxd on the containerd engine.
+sandboxd_env() {
+  : "${SB_PAT_TOKEN:?}"
+  mkdir -p /var/lib/sandboxd/mounts /var/lib/toolboxd/recordings /run/sandboxd
+  chmod 0700 /var/lib/sandboxd/mounts /run/sandboxd
+  export SB_NODE_NAME="${POD_NAME:-worker}"
+  export SB_API_HOST=0.0.0.0
+  export SB_API_PORT=21212
+  export SB_DB_PATH=/var/lib/sandboxd/state.db
+  export SB_TOOLBOX_BINARY_PATH=/opt/aerolvm/bin/toolboxd
+  export SB_TOOLBOX_MOUNT_PATH=/usr/local/bin/toolboxd
+  export SB_TOOLBOX_PORT=2280
+  export SB_ENABLE_CADDY=false
+  export SB_ENABLE_NETWORK_RULES=true
+  export SB_MOUNTS_ROOT=/var/lib/sandboxd/mounts
+  export SB_MOUNTS_CRED_DIR=/run/sandboxd
+  export SB_RECORDING_DIR=/var/lib/toolboxd/recordings
+  export SB_HOST_RUNTIMES=docker,gvisor
+  export SB_CONTAINER_ENGINE=containerd
+  export SB_CONTAINERD_SOCKET=/run/containerd/containerd.sock
+  export SB_CONTAINERD_NAMESPACE=aerolvm
+  export SB_CONTAINERD_CNI_PLUGIN_DIR=/opt/aerolvm/cni
+  export SB_CONTAINERD_NATIVE_NETNS_POOL_ENABLED=true
+}
+
+# c7_setup puts this container's processes into supervisor/ and makes
+# sandboxes/ hand cpu, memory and pids down (the C7 prototype). It prints the
+# parent path for SB_CONTAINERD_CGROUP_PARENT. A privileged container sees the
+# machine's whole cgroup tree, so /proc/self/cgroup names this container's
+# group; cgroup v2 lets a group hand controllers down only while it holds no
+# processes itself.
+c7_setup() {
+  local self cg pid
+  self="$(cut -d: -f3 /proc/self/cgroup)"
+  cg="/sys/fs/cgroup${self}"
+  mkdir -p "$cg/supervisor" "$cg/sandboxes"
+  for pid in $(cat "$cg/cgroup.procs"); do
+    echo "$pid" > "$cg/supervisor/cgroup.procs" 2>/dev/null || true
+  done
+  echo "+cpu +memory +pids" > "$cg/cgroup.subtree_control"
+  echo "+cpu +memory +pids" > "$cg/sandboxes/cgroup.subtree_control"
+  echo "${self}/sandboxes"
+}

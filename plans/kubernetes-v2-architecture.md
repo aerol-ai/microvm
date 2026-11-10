@@ -1451,6 +1451,7 @@ or the smoke test until the spike worked around it. Phase 1 must fix each in
 | F4 | `/health` reports "degraded" because it pings Docker (confirms C2). Docker's reconcile and event stream log an error every 30 s. | None needed | C2, plus: no Docker client at all on the containerd engine |
 | F5 | The egress floor and node guard for runtime `docker` need Docker, so creates on that runtime are refused; the containerd ones install. | None needed | The same as F4 |
 | F6 | Hostname-filtered egress needs the egress gateway (its user and socket), which the pod lacks, so those creates are refused. | None | The gateway as one more container in the worker pod |
+| F8 | With the agent's `/run/netns` shared to the runtime container by Bidirectional mount propagation, the network namespaces `sandboxd` mounts there land in the machine's own mount table. When the pod is deleted or dies, nothing removes them: the kubelet cannot tear the volume down, and the pod sticks in Terminating. It also breaks K4 (AerolVM touches the machine only through the kernel). | `lib.sh` unmounts them in the machine's mount namespace (`nsenter -t 1 -m`) before replacing a worker pod | Make the namespaces where they are used: in the runtime container, through a small privileged helper (the N2 split), so nothing has to cross containers or reach the machine |
 | F7 | Bottlerocket 1.68 sets `user.max_user_namespaces=0`. gVisor's gofer makes a user namespace, so every gVisor create fails with "fork/exec /proc/self/exe: no space left on device". It also means Kubernetes user namespaces (spike S9) cannot work on a default Bottlerocket node. | Raised to 62775 at run time from a node debug pod | A bank decision, not code: Bottlerocket's `settings.kernel.sysctl` raises it per node pool. The chart's docs and `aerolvm k8s verify` (P8) must check it. |
 
 **S1, where a sandbox lands: half done** (same run).
@@ -1484,11 +1485,37 @@ or the smoke test until the spike worked around it. Phase 1 must fix each in
   6.18.56.
 
 **S1 verdict: pass on both EKS images, once C7 and the F2 and F7 stand-ins
-are in place.** K2 and K3 stand so far; S2 (the in-place upgrade) decides the
-rest.
+are in place.**
 
-**Cost so far:** two clusters, about 80 and 90 minutes, about $1.00 in
-all.
+**S2, the in-place agent upgrade: pass** (run `p0-s2`, AL2023, 2026-11-10).
+The worker pod is split as §8.2 says: `runtime` (the supervisor, containerd
+and every sandbox, with C7's cgroup placement) and `agent` (`sandboxd`). They
+share containerd's root, `sandboxd`'s data, the containerd socket, `/run/sandboxd`,
+the cgroup path and `/run/netns`, each at the same path in both. Changing
+only the agent's image restarted only the agent (agent 1, runtime 0). The
+gVisor sandbox made before the swap kept running: its uptime went from 6.97 s
+to 99.27 s, a file it wrote was still there, and its ten processes had the
+same PIDs before and after. A new sandbox through the new agent took
+1,066 ms. The API was down for 70 s, mostly the spike's own doing: the old
+agent's first process is a bash script that ignores SIGTERM, so Kubernetes
+waited out the 30 s grace period, and the new agent spent about 35 s
+installing tools before `sandboxd` started. A real `agent` image, with
+`sandboxd` as its first process, should take seconds; P1's images will show it.
+
+Two things the split needed that the plan's §8.2 list already implies: the
+agent must see containerd's root at the same path (containerd's client
+library, inside `sandboxd`, mounts an image's snapshot itself to read its
+`/etc/passwd`), and `/run/netns` must propagate from the agent to the runtime
+container, which is what causes F8.
+
+**Verdict after S1 and S2: K2 and K3 stand.** One worker pod per machine,
+with sandboxes inside its box and the agent upgraded in place, works on EKS,
+given the C7 fix and answers to F1 to F8. S2's external-mount check (I/O on a
+mounted file across the swap, eng review OV-E2) is not done yet: it needs a
+mount backend in the harness.
+
+**Cost so far:** three clusters, about 3.4 hours of cluster time in all
+(78, 49 and about 75 minutes), about $1.20.
 
 ## 19. Tests, drills and benchmarks
 
