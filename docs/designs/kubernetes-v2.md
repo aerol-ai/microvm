@@ -29,7 +29,7 @@ warm path [measured] against 5.5 s for a cold pod [measured, kind]), no 110-pod
 or VPC-address limit per machine, and zero etcd writes per sandbox, with no
 code change for the common fields (unsupported upstream fields are refused with
 a clear error). Warm creates are in the same range as agent-sandbox's own warm
-pool (AerolVM's warm path 43 ms p50 on runc [measured,
+pool (AerolVM's warm path 28 ms p50 on runc since v0.6.0, 43 ms before [measured,
 `plans/warm-create-latency-tier1.md`] against 40–50 ms [measured, kind]); gVisor
 from a warm pool is not measured yet, and Phase 0 measures it. A
 bank's security team gets checkable evidence in a week, not a quarter.

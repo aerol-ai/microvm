@@ -604,6 +604,55 @@ because added capabilities go beyond `baseline`. What changes is that the pod
 no longer asks for `privileged: true`. If S7 fails, its findings go in the
 evidence pack (P7) as the reason privileged is needed. It is never a blocker.
 
+**Why the worker needs these rights at all.** agent-sandbox needs no
+privileged pod because it asks Kubernetes for one pod per sandbox. Kubernetes'
+own parts on the machine (the kubelet, the machine's containerd and the
+network plugin) already run as root, and they do the root work. This plan
+does not ask Kubernetes (K5), so the worker pod does that work itself:
+
+| Work done for every sandbox | Needs |
+|---|---|
+| Run our own containerd, and mount each sandbox's filesystem | `CAP_SYS_ADMIN` |
+| A network namespace per sandbox, its link to the bridge, firewall rules and address translation | `CAP_NET_ADMIN` |
+| Each sandbox's CPU and memory box under the pod's cgroup | A writable `/sys/fs/cgroup`; Kubernetes gives normal pods a read-only one |
+| Network namespaces shared between `agent` and `runtime` (`/run/netns`) | Two-way mount propagation, which Kubernetes allows only in privileged containers |
+| External storage through FUSE | `/dev/fuse` and `CAP_SYS_ADMIN` |
+| Firecracker (Phase 5) | `/dev/kvm` and tap devices |
+
+Linux lets only root make namespaces, mount filesystems, write network rules
+and set cgroup limits, with one exception: inside a user namespace. Because
+worker machines are their own tainted pools (wall 1), the worker's root is
+root only on machines that run nothing but AerolVM, the same exposure as
+AerolVM on plain VMs today.
+
+**Phase 0 spike S9: the worker pod in a Kubernetes user namespace.** With
+`hostUsers: false`, root inside the pod maps to an unprivileged user on the
+machine, and rights given to the pod are mostly invalid outside it. Kubernetes
+user namespaces are stable since v1.36 and need containerd 2.0 or later and a
+recent kernel (Sources). S9 answers three questions on a real EKS node, on the
+same machine images as S7:
+
+1. Can the worker still give each sandbox its own CPU and memory limits? A
+   normal pod gets `/sys/fs/cgroup` read-only.
+2. Can it join each sandbox's network to the pod's network? If not, sandboxes
+   need user-space networking, as rootless Podman uses, and S9 measures what
+   that costs.
+3. Does gVisor run there? gVisor documents a rootless mode, with limits.
+
+If S9 passes on a machine image, it becomes that image's one supported mode,
+in place of S7's list or `privileged: true`: S7 only shortens the list of
+rights, while S9 makes the list worthless on the machine. If S9 fails, the
+image keeps S7's result. Like S7, S9 is never a blocker, and its findings go in
+the evidence pack (P7).
+
+Other ways to need less root, kept on record:
+
+| Option | Where root goes | Cost | Status |
+|---|---|---|---|
+| The worker inside a small VM (Kata as its RuntimeClass, or KubeVirt) | Inside the VM; the hardware protects the machine | Nested virtualization or metal; Kata or KubeVirt installed on the machines by a privileged installer; some speed lost | Not planned |
+| Pod mode: one pod per sandbox, made through Kubernetes or through agent-sandbox | To Kubernetes, as in agent-sandbox | The speed and density this plan exists for (option A, §5); K5 does not hold in that mode | `TODOS.md`, triggered by a bank that refuses privileged pods when S9 fails |
+| WASM and V8 isolates only | Not needed in principle: the language runtime keeps code apart | JS, TS and WASM code only. Today's V8 isolates use a PID namespace (`pkg/isolate/host_jail_linux.go`), and both runtimes use cgroups (`pkg/hostproc`), so both would need changes. | Not planned |
+
 ### 8.8 The earlier worker design next to this one
 
 | Problem in the earlier design (`kubernetes-full-architecture.md` §10) | This design |
@@ -1324,7 +1373,7 @@ flowchart TB
 
 | Phase | What | Exit gate |
 |---|---|---|
-| **0. Spikes** (2–3 weeks) | S1: the worker pod on EKS (Amazon Linux 2023 and Bottlerocket) and AKS (Azure Linux and Ubuntu): our containerd and gVisor in a privileged `runtime` container, every sandbox placed under the pod's own cgroup path, bridge in the pod's network. S2: change the `agent` image in place and check no sandbox restarts, and that continuous I/O on an externally mounted file keeps working across the swap (eng review OV-E2). S3: memory pressure: does the kubelet ever evict the worker pod? S3 also records kubelet CPU and memory and the number of cAdvisor container series per worker pod at 100, 500 and 1,000 sandboxes; if that cost is too high, Phase 1 picks a fix through its own decision (eng review D3). S4: how far one cell goes: Raft writes per second, apply latency, snapshot and restore time at 100k, 250k and 1M placements. S5: Karpenter and NAP with `do-not-disrupt`, `expireAfter: Never` and a cordon-triggered decommission; an EKS managed node group upgrade inside its 15-minute limit. S6: `/dev/kvm` and Firecracker speed on an EC2 instance with nested virtualization. S7 (CEO review CE3): the worker pod with a named list of rights instead of `privileged: true`. S8 (eng review D8): per-sandbox disk limits with XFS project quotas on local NVMe, on Amazon Linux 2023 and Bottlerocket. P7: the evidence pack draft v1, sent with the privileged-pod question (Q6) on day one while the spikes run (R4); updated with S7's result. A "no" stops the spikes. | Numbers written into this plan. If S1 or S2 fails, stop and rethink K2 and K3 before Phase 1. |
+| **0. Spikes** (2–3 weeks) | S1: the worker pod on EKS (Amazon Linux 2023 and Bottlerocket) and AKS (Azure Linux and Ubuntu): our containerd and gVisor in a privileged `runtime` container, every sandbox placed under the pod's own cgroup path, bridge in the pod's network. S2: change the `agent` image in place and check no sandbox restarts, and that continuous I/O on an externally mounted file keeps working across the swap (eng review OV-E2). S3: memory pressure: does the kubelet ever evict the worker pod? S3 also records kubelet CPU and memory and the number of cAdvisor container series per worker pod at 100, 500 and 1,000 sandboxes; if that cost is too high, Phase 1 picks a fix through its own decision (eng review D3). S4: how far one cell goes: Raft writes per second, apply latency, snapshot and restore time at 100k, 250k and 1M placements. S5: Karpenter and NAP with `do-not-disrupt`, `expireAfter: Never` and a cordon-triggered decommission; an EKS managed node group upgrade inside its 15-minute limit. S6: `/dev/kvm` and Firecracker speed on an EC2 instance with nested virtualization. S7 (CEO review CE3): the worker pod with a named list of rights instead of `privileged: true`. S8 (eng review D8): per-sandbox disk limits with XFS project quotas on local NVMe, on Amazon Linux 2023 and Bottlerocket. S9: the worker pod in a Kubernetes user namespace (`hostUsers: false`): per-sandbox CPU and memory limits, sandbox networking and gVisor, on the same images as S7 (§8.7). P7: the evidence pack draft v1, sent with the privileged-pod question (Q6) on day one while the spikes run (R4); updated with S7's and S9's results. A "no" stops the spikes. | Numbers written into this plan. If S1 or S2 fails, stop and rethink K2 and K3 before Phase 1. |
 | **1. Ready for pods** | C1–C7, C12, C24 (Phase 1 part), C25, C27, images (P1), chart `single` mode (P3), `make k8s-dev` and docs (P4), `aerolvm k8s verify` single-mode subset (P8), install notes (P10) | kind smoke test in CI; `cosign verify` passes; the `aerolvm k8s verify` subset passes on the kind install and fails on a seeded violation; gVisor create p50 in a pod within 10% of the same machine without Kubernetes (G5) |
 | **2. Cluster mode on EKS** | C8–C11, C13, C19, C20, C22, C23, C24 (Phase 2 part), C26, operator (P2), Karpenter integration, runbook and alerts (P6), chart monitoring (P9), evidence pack final (P7), full `aerolvm k8s verify` (P8), operator preflight, printer columns, Events, Argo CD check and bank preset (P10) | Live `k8s-cell-3zone` scenario green, including the chaos step (section 19); full `aerolvm k8s verify` passes on that cell |
 | **3. Prove it on EKS** | C18 (one fix at a time, measured), every drill in section 19, the scale bench, a 72-hour soak | G1–G12 measured and published in this plan |
@@ -1411,7 +1460,7 @@ after an `agent` restart.
 | Plain TCP ports on Kubernetes | An AWS NLB allows at most 50 listeners, and AWS will not raise it | TLS ports (SNI on 443) are the default on Kubernetes; plain TCP is a small pool per install; question 7 |
 | A restarted server may miss a dead worker | `reconcileDeadOwners` says it marks gossip members that are not alive, but the code only clears live ones (`internal/cluster/dead_owner.go`). Marks come from gossip "leave" events, which a server that was down at the time never saw. Servers restart more often on Kubernetes. | Found by reading the code, not run. Check and fix with C8, with a regression test. |
 | In-place image change | If an EKS or AKS policy, or a GitOps tool, recreates the pod instead, sandboxes die | Phase 0 S2. The operator owns worker pods, and the docs tell GitOps tools to leave them alone. |
-| Bank refuses privileged pods | No worker at all | Same as the earlier plan: one privileged namespace, like the bank's security agents. Ask early (section 21). |
+| Bank refuses privileged pods | No worker at all | Same as the earlier plan: one privileged namespace, like the bank's security agents. Ask early (section 21). Spike S9 may remove the privileged pod (§8.7). If S9 fails, pod mode is the fallback: a `TODOS.md` entry that needs its own design. |
 | The cell ceiling is lower than G3 | More cells sooner | Phase 0 S4. Cells (section 12) are the answer either way. |
 | Decommission takes too long | Machine upgrades crawl | Drain window and per-zone budget are settings; sandboxes without a policy are stopped at the deadline. |
 | Two places say who owns a sandbox during a move | A duplicate or a lost sandbox | Make-before-break uses the same compare-and-swap on the placement row as today's failover; regression tests next to the FSM. |
@@ -1436,6 +1485,8 @@ Each has a recommendation. Engineering review closes them.
    cell once and cache; give derived IDs the cell number where we derive them.
 5. **Shrinking "privileged" to a named list of rights.** Decided in the CEO
    review (CE3): Phase 0 spike S7. Its result is recorded, never a blocker.
+   Added after the reviews: spike S9 tries a Kubernetes user namespace, which
+   would make the remaining rights worthless on the machine (§8.7).
 6. **The question to ask the bank now:** "Will you allow one privileged pod
    per worker machine, in its own namespace and node pool, with nothing
    installed on the machine?" Decided in the CEO review (R4, RQ13): ask on
@@ -1491,6 +1542,8 @@ root at commit `d33b78c3` (branch `plans/kubernetes-ceo-review`). The CEO review
 | Gateway API routes send traffic to Kubernetes Services (core support) | [Gateway API: HTTPRoute](https://gateway-api.sigs.k8s.io/reference/api-types/httproute/), [TCPRoute](https://gateway-api.sigs.k8s.io/reference/api-types/tcproute/) |
 | TLSRoute in the Standard channel since v1.5.0; passthrough is core support | [Gateway API: TLSRoute](https://gateway-api.sigs.k8s.io/reference/api-types/tlsroute/), [Kubernetes blog: Gateway API v1.5](https://kubernetes.io/blog/2026/04/21/gateway-api-v1-5/) |
 | TCPRoute in the Standard channel since v1.6.0 | [Kubernetes blog: Gateway API v1.6](https://kubernetes.io/blog/2026/08/03/gateway-api-v1-6-release/) |
+| User namespaces (`hostUsers: false`): stable since v1.36, containerd 2.0 or later, rights mostly invalid outside the pod | [Kubernetes: User Namespaces](https://kubernetes.io/docs/concepts/workloads/pods/user-namespaces/), [Kubernetes blog: v1.36 user namespaces GA](https://kubernetes.io/blog/2026/04/23/kubernetes-v1-36-userns-ga/) |
+| Bidirectional mount propagation is allowed only in privileged containers | [Kubernetes: Volumes, mount propagation](https://kubernetes.io/docs/concepts/storage/volumes/#mount-propagation) |
 | EKS up to 100,000 nodes per cluster | [AWS What's New, 2025-07](https://aws.amazon.com/about-aws/whats-new/2025/07/amazon-eks-100000-worker-nodes-per-cluster) |
 | AKS 5,000 nodes per cluster, 1,000 per pool | [AKS quotas](https://learn.microsoft.com/en-us/azure/aks/quotas-skus-regions) |
 | Kubernetes pod start goal: 99% within 5 s | [SIG Scalability SLO](https://github.com/kubernetes/community/blob/main/sig-scalability/slos/pod_startup_latency.md) |
@@ -1570,7 +1623,7 @@ Phase 1, after the 2–3 week Phase 0 spikes.
 - REALITY: binding-decisions finding. The 2026-09-30 decisions put the agent-sandbox API facade in Phase 3 and replace own CRDs. v2 moves the facade to Phase 6 and adds its own `SandboxTemplate` and `SandboxPool` CRDs. It withdraws husk pods and the license gate, which is an announced, user-driven reversal (2026-11-04). §10.1 and §16 `plans/kubernetes-deployment.md:23`
 - REALITY: numbers finding. 751 B per placement [measured: secrets-hardening fleet-scale]. gVisor 284 ms and containerd 189 ms warm [measured: `plans/investor-benchmark-observability.md:28`]. A 6–7 ms commit [measured: `plans/warm-create-latency-tier1.md:60`]. "~150 creates/s" [estimated, now stale: E2 expects 1,000–3,000 reserves/s, also an estimate; re-measure before the gate]. The ID-clash chance of about 1 in 140,000 at 1M live re-derives as n²/2^57 ≈ 1 in 144,000. §9.3 L-a
 - REALITY: deferred-asks pass. No linked issue. the plan header `plans/kubernetes-v2-architecture.md:3`
-- REALITY: pr-count pass. No `.gstack/ship-policy.json`, so the default is one PR per wave. The plan ships each phase as stacked PRs. §18 `plans/kubernetes-v2-architecture.md:1311`
+- REALITY: pr-count pass. No `.gstack/ship-policy.json`, so the default is one PR per wave. The plan ships each phase as stacked PRs. §18 `plans/kubernetes-v2-architecture.md:1360`
 
 **0C. Dream state.**
 ```
@@ -1631,7 +1684,7 @@ with the image cached [measured] against 5.5 s for a cold pod [measured, kind]),
 or VPC-address limit per machine, and zero etcd writes per sandbox, with no
 code change for the common fields (unsupported upstream fields are refused with
 a clear error). Warm-pool hits are in the same range as agent-sandbox's own warm
-pool (AerolVM's warm-pool hit 43 ms p50 on runc [measured,
+pool (AerolVM's warm-pool hit 28 ms p50 on runc since v0.6.0, 43 ms before [measured,
 `plans/warm-create-latency-tier1.md`] against 40–50 ms [measured, kind]); gVisor
 from a warm pool is not measured yet, and Phase 0 measures it. And a bank's security team gets the evidence it needs in a week, not
 a quarter. (After RQ10, the agent-sandbox part is Phase 6 work, not Phases 0–2.)
@@ -2897,7 +2950,7 @@ Reality rows (eng):
 - REALITY: binding-decisions pass. This review keeps every CEO answer (RQ1–RQ17) and the 2026-11-10 decision-log entries. `plans/kubernetes-v2-architecture.md:3`
 - REALITY: numbers finding. The CEO-review tags hold; S4's restore time must be re-measured with the new snapshot interval [re-measure before gate]. `internal/config/config.go:2171`
 - REALITY: deferred-asks pass. No linked issue. `plans/kubernetes-v2-architecture.md:1`
-- REALITY: pr-count pass. No ship policy; each phase ships as stacked PRs. `plans/kubernetes-v2-architecture.md:1311`
+- REALITY: pr-count pass. No ship policy; each phase ships as stacked PRs. `plans/kubernetes-v2-architecture.md:1360`
 
 
 
@@ -3491,7 +3544,7 @@ Critical gaps: 0. No path is untested, unhandled and silent at once.
 
 | Step | Modules touched | Depends on |
 |---|---|---|
-| Phase 0 spikes S1–S8 | `integration-tests/` (spike scripts) | — |
+| Phase 0 spikes S1–S9 | `integration-tests/` (spike scripts) | — |
 | A. Images and publishing (P1, D2) | `.github/workflows/`, image build files, chart | — |
 | B. Cluster core (C13, D6, C8/C10 on all clusters, C19) | `internal/cluster/` | — |
 | C. Worker pod runtime (C7, C14, OV-E2, C27) | `internal/runtime/`, `pkg/hostproc`, `pkg/mounts`, `internal/service` (lease file) | Phase 0 S1/S2 |

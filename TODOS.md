@@ -730,6 +730,26 @@ the skip.
 
 ---
 
+## Design a pod mode for banks that refuse privileged pods (Kubernetes, P2)
+
+- **What:** a worker mode where each sandbox is its own Kubernetes pod, made
+  through the Kubernetes API or through agent-sandbox underneath, with
+  AerolVM's API, SDKs, sessions and audit on top.
+- **Why:** `plans/kubernetes-v2-architecture.md` §20 says a bank that refuses
+  privileged pods gets "No worker at all". Spike S9 (§8.7, the worker pod in a
+  Kubernetes user namespace) may remove the privileged pod. If it fails, pod
+  mode is the only way such a bank can run AerolVM.
+- **Pros:** no privileged pod; every Kubernetes tool sees each sandbox.
+- **Cons:** loses the speed and density the plan exists for (option A in §5:
+  seconds to start cold, etcd writes per sandbox, 110 pods per machine); rule
+  K5 does not hold in that mode; egress control needs a new home, because
+  there is no worker firewall.
+- **Effort:** design first, human M / CC S. **Priority:** P2.
+- **Depends on:** spike S9's result. Trigger: a bank refuses privileged pods
+  and S9 fails on its machine image.
+
+---
+
 ## Decide the agent-sandbox facade's storage and namespace rules (Kubernetes, P2)
 
 - **What:** before C17 (`plans/kubernetes-v2-architecture.md` §16, Phase 6) is
