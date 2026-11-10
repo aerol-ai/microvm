@@ -77,7 +77,14 @@ make integration-single                      # builds HEAD, publishes, provision
 make integration-single released             # old behaviour: releases/latest
 make integration-single no-build             # reuse the last published build (fast re-provision)
 make integration-single FLAGS=--version=v0.7.21   # pin a released tag (A/B vs known-good)
+AEROL_WITH_CADDY=1 make integration-single   # also build Caddy from this tree, not the release's
 ```
+
+`AEROL_WITH_CADDY=1` passes `--with-caddy` to the build: the nodes get Caddy
+at `install.sh`'s `CADDY_BUILD_VERSION` with every plugin, `caddymod/`
+included. Use it when a change touches the Caddy build or `caddymod/`;
+without it the nodes run the latest release's Caddy, so the change is not
+tested.
 
 The build id is **content-addressed** —
 `AEROL_BUILD_ID = <short-sha>[-dirty-<tree-hash>]` — so an unchanged tree skips
