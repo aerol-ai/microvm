@@ -98,6 +98,11 @@ type Server struct {
 	patTokenPrevious string
 	patScopeHost     bool
 	l4ProxyProtocol  bool
+	// patSHA256 and localToken are set on a node joined without the
+	// operator PAT (config/pat_verifier.go): the PAT's hashes, and this
+	// node's own token, which works only for local tools.
+	patSHA256  []string
+	localToken string
 
 	// Sign-in discovery (discovery.go): whether identity is on, the
 	// issuers to publish, and SB_DOMAIN for ui_url.
@@ -200,6 +205,12 @@ func NewServer(logger *slog.Logger, service *service.Service, dockerClient *dock
 	listGateLimitMetric.Set(int64(s.listGate.Limit()))
 	listGatePerTenantMetric.Set(int64(s.listGate.PerFlowLimit()))
 	s.patTokenPrevious = cfg.PATTokenPrevious
+	s.patSHA256 = cfg.PATTokenSHA256
+	if len(s.patSHA256) > 0 && !config.PATMatchesSHA256(patToken, s.patSHA256) {
+		// SB_PAT_TOKEN is not the operator PAT here: it is this node's own
+		// token, and the hashes stand for the PAT.
+		s.patToken, s.localToken = "", patToken
+	}
 	s.patScopeHost = cfg.PATScopeHostOnly()
 	s.l4ProxyProtocol = cfg.L4FallbackProxyProtocol
 	s.authChain = buildAuthChain(s.patAuth(), s.sandboxTokenAuth(), validator, options.credentials)

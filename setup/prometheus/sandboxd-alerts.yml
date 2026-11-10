@@ -656,6 +656,36 @@ groups:
           description: "A node leaf has less than 14 days or the cluster CA less than 30 days remaining. Rotate node.crt/node.key atomically; new handshakes hot-reload the pair."
           runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/secrets-and-audit.md"
 
+      # Automatic node cert renewal (plans/kubectl-style-cluster-ops.md
+      # §4.2). Every node renews at 2/3 of its cert's life; failing_since is
+      # when the current run of failures began (0 while renewals work). A
+      # cluster built with the scripts renews only after `sandboxd adopt`;
+      # until then renewals are skipped, not failed, and the expiry alert
+      # above is the backstop.
+      - alert: SandboxdClusterCertRenewalFailing
+        expr: aerolvm_cert_renew_failing_since_unix > 0 and (time() - aerolvm_cert_renew_failing_since_unix) > 86400
+        for: 10m
+        labels:
+          severity: warning
+          component: cluster-mtls
+        annotations:
+          summary: "sandboxd node cert renewal has been failing for more than a day"
+          description: "{{ $labels.instance }} could not renew its cluster node cert for over 24 hours (aerolvm_cert_renew_failures_total keeps rising). Check that a server holds the CA key (`sandboxd adopt` on the seed, then on each server), that the node can reach a server on TCP 7002, and that the node was not deleted. A cert that expires can't renew: the node then needs a new join token."
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/secrets-and-audit.md"
+
+      # One-line joins failing in bulk: a bad token in an autoscaling
+      # template, a firewall blocking the dial-back, or a token spray.
+      - alert: SandboxdClusterJoinsFailing
+        expr: sum by (instance) (rate(aerolvm_join_attempts_total{key="failure"}[15m])) > 0.1 and sum by (instance) (rate(aerolvm_join_attempts_total{key="success"}[15m])) == 0
+        for: 15m
+        labels:
+          severity: warning
+          component: cluster-mtls
+        annotations:
+          summary: "sandboxd join calls are failing"
+          description: "{{ $labels.instance }} refused every join for 15 minutes. aerolvm_join_attempts_total{key=\"failure\"} carries the reason in key2 (token_invalid, token_expired, dial_back, version, rate_limited, ...); the audit log names each caller's address and token id."
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/secrets-and-audit.md"
+
       # Provider boot/runtime canary (local always ok; awskms wrap/unwrap).
       - alert: SandboxdSecretProviderCanaryFailing
         expr: aerolvm_secret_provider_canary_ok == 0
@@ -1009,3 +1039,64 @@ groups:
           summary: "the identity file failed to load"
           description: "The identity file on {{ $labels.instance }} did not validate. A node that booted with it answers SSO with 503 (API tokens and the PAT still work); a running node keeps its last good file. The sandboxd log names the error."
           runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/identity-and-access.md#identityfileloaderrors"
+
+  # Cluster upgrades (plans/kubectl-style-cluster-ops.md §6.6, §10.1). The
+  # rollout gauges are read from the FSM, so every server reports the same
+  # value: max() over the fleet. aerolvm_rollout_state is an expvar map, so
+  # the state is the positional "key" label.
+  - name: sandboxd.rollouts
+    rules:
+      # A node failed to stage, failed its health check, timed out
+      # (--node-timeout), or a server could not restart without losing the
+      # Raft majority. Nothing more restarts until an operator acts.
+      - alert: SandboxdRolloutFailed
+        expr: max(aerolvm_rollout_state{key="failed"}) == 1
+        for: 1m
+        labels:
+          severity: critical
+          component: rollout
+        annotations:
+          summary: "a cluster rollout failed"
+          description: "The rollout is failed and starts no new node. `aerolvm upgrade status` names the failed node and its error. Fix it and run `aerolvm upgrade apply` with the same version to resume, or `aerolvm upgrade rollback`."
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/cluster-upgrades.md#rollout-failed"
+
+      # A rollout that sits in one state for an hour: a node that never
+      # comes back, a pause nobody resumed, a finalize waiting on a down
+      # node. done is left out: --hold keeps a rollout done on purpose.
+      - alert: SandboxdRolloutStuck
+        expr: max(aerolvm_rollout_state{key=~"staging|running|paused|stopped|finalizing|rolling-back"}) == 1 and on() (time() - max(aerolvm_rollout_state_since_unix)) > 3600
+        for: 5m
+        labels:
+          severity: warning
+          component: rollout
+        annotations:
+          summary: "a cluster rollout has been in one state for over an hour"
+          description: "`aerolvm upgrade status` shows which nodes it waits for. A paused rollout continues with `aerolvm upgrade resume`; a stopped one with `aerolvm upgrade apply` and the same version."
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/cluster-upgrades.md#rollout-stuck"
+
+      # A node was down when its turn came (skipped) or has remote upgrade
+      # off (manual) and has waited a day. Finalize waits for every one.
+      - alert: SandboxdRolloutNodeWaiting
+        expr: max(aerolvm_rollout_waiting_node_since_unix) > 0 and (time() - max(aerolvm_rollout_waiting_node_since_unix)) > 86400
+        for: 10m
+        labels:
+          severity: warning
+          component: rollout
+        annotations:
+          summary: "a skipped or manual rollout node has waited for more than a day"
+          description: "A node is still skipped (it was down) or manual (SB_REMOTE_UPGRADE=false). `aerolvm upgrade status` prints the command to run on a manual node. Upgrade it, or delete a node that is gone (`aerolvm delete node`)."
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/cluster-upgrades.md#node-stuck-manual-or-skipped"
+
+      # A member runs a build below the active cluster version: it was down
+      # while the version moved. It gets no placements, and a server is kept
+      # out of Raft until it is upgraded.
+      - alert: SandboxdMemberBelowActiveVersion
+        expr: max(aerolvm_members_below_active_version) > 0
+        for: 15m
+        labels:
+          severity: warning
+          component: rollout
+        annotations:
+          summary: "a cluster member runs below the active cluster version"
+          description: "{{ $value }} live member(s) run a build older than the cluster's active version. They take no new sandboxes and old servers stay out of Raft. Upgrade them (`sudo sandboxd upgrade node` on the node, or a new rollout), or delete them."
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/cluster-upgrades.md#member-below-the-active-version"

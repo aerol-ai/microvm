@@ -1,0 +1,5 @@
+exit 2
+--- stdout
+--- stderr
+aerolvm get: -o is for kinds, as in `aerolvm get nodes -o wide`; for a sandbox use --json
+run `aerolvm get --help` for usage

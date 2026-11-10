@@ -18,7 +18,7 @@ curl -fsSL https://aerolvm.aerol.ai | bash -s -- --help
 | Option | What it does | Default |
 |---|---|---|
 | `--domain <domain>` | The base domain for the API and sandbox links. | None. Without it the server uses [IP mode](#try-it-without-a-domain). |
-| `--pat-token <token>` | The secret token your apps send with every request. | A random token, printed once |
+| `--pat-token <token>` | The secret token your apps send with every request. | A random token, printed once. A new run keeps it. |
 | `--dns-provider cloudflare` | The DNS provider used to get certificates. | None. Required with `--domain`. |
 | `--dns-api-token <token>` | Your Cloudflare API token. | None. Required with `--domain`. |
 | `--acme-email <email>` | Your email address, registered with Let's Encrypt as the contact for your certificates. | None |
@@ -26,16 +26,61 @@ curl -fsSL https://aerolvm.aerol.ai | bash -s -- --help
 | `--version <tag>` | The release to install, such as `v0.6.4`. | `latest` |
 | `--idle-timeout-min <minutes>` | Stops running sandboxes after this many idle minutes. It skips sandboxes that set their own lifecycle. | `0` (off) |
 | `--node-name <name>` | A friendly name for this server, shown in the cluster table of the [dashboard](/dashboard/). | Empty |
-| `--no-start` | Installs and enables everything but leaves the server stopped. Use it on a server that will join a cluster: `cluster-join.sh` starts it once it has the cluster's settings and key. Not with `--local`. | Off: the server starts |
+| `--no-start` | Installs and enables everything but leaves the server stopped. You rarely need it: `init` and `join` (below) do this for you, and start the server once it has the cluster's settings and keys. Not with `--local`. | Off: the server starts |
 
-## Change or upgrade an install
+## Start or join a cluster
 
-Run the installer again with the options you want. This also upgrades AerolVM to the newest release.
+Two words end the installer's options: `init` and `join`. Everything after the word goes to `sandboxd init` or `sandboxd join`, which run once the install is done.
+
+```bash
+# The first node of a new cluster
+curl -fsSL https://aerolvm.aerol.ai | sudo bash -s -- --domain cluster.example.com --pat-token your-secret-pat \
+    --dns-provider cloudflare --dns-api-token your-cloudflare-api-token init
+
+# Every other machine: set CLOUDFLARE_API_TOKEN, then paste the join command `aerolvm join-command` prints
+export CLOUDFLARE_API_TOKEN=your-cloudflare-api-token
+curl -fsSL https://aerolvm.aerol.ai | sudo bash -s -- --domain cluster.example.com \
+    --dns-provider cloudflare --dns-api-token "$CLOUDFLARE_API_TOKEN" \
+    join https://10.0.1.5:7003 --token <token> --ca-cert-hash sha256:<hash>
+```
+
+The join command that `aerolvm join-command` prints already carries the cluster's domain options, before the word `join`. Linux only. [Build a cluster](/cluster/create/) walks through it. `sudo sandboxd init --help` and `sudo sandboxd join --help` list every option.
+
+## Upgrade an install
+
+On a server whose release has `aerolvm upgrade` (v0.7.0 and later), upgrade from your computer:
+
+```bash
+aerolvm upgrade plan v0.7.0
+aerolvm upgrade apply v0.7.0 --wait
+```
+
+It checks the files against the release's checksums, backs up the database, keeps the old files, and goes back to them if the new server does not come up. On a cluster it upgrades every node in a safe order; see [Upgrade a cluster](/cluster/upgrade/).
+
+On an older release, or for a one-off, run the installer again with no options. It upgrades AerolVM to the newest release and keeps your settings:
+
+```bash
+curl -fsSL https://aerolvm.aerol.ai | sudo bash
+```
+
+- **The installer remembers your options.** Each run saves every option except secrets in `/etc/sandboxd/node.json`, which only root can read. Secrets, such as your token and your Cloudflare token, stay in the settings files the installer wrote. A new run reads them back, so your apps keep working with the same token.
+- **Older servers work too.** On a server set up before `node.json` existed, the first new run reads the settings back from those files once, then writes `node.json`.
+- **It starts the new version.** If the run installed a new release, or changed a setting, and the server is running, the installer restarts the server. It waits until the server answers, and only then starts Caddy.
+- **It swaps the programs safely.** When the installed server has `sandboxd upgrade node`, the installer hands the swap to it, the same way `aerolvm upgrade` does: a database backup, the old files kept, and the old files back if the new server does not start.
+- **Sandboxes keep running.** Containers, Firecracker VMs, WebAssembly and V8 isolate sandboxes keep running while the server restarts. The new server picks them up again.
+- **Check the version** with `sudo sandboxd version`. It shows the release and never starts a second server.
+
+## Change an install
+
+Run the installer again with only the options you want to change. Options you pass win over the saved ones. Options you leave out keep their saved values.
+
+- To install one release instead of the newest, add `--version v0.6.4`. The installer does not save it, so the next plain run goes back to the newest release.
+- To turn a saved switch off, such as `--with-gvisor`, set it to `false` in `/etc/sandboxd/node.json`, then run the installer again.
+
+This works on Linux. On macOS, a new run keeps your token, but pass your other options again.
 
 <Aside type="caution">
-Each run rewrites the settings file, `/etc/sandboxd/sandboxd.env`, from scratch. Pass every option again, including `--pat-token`. Without it, the installer makes a new random token, and your apps stop working until you update them. Settings you added to the file by hand are lost too, such as `SB_IDENTITY_ENABLED`, `SB_ENTERPRISE_MODE` or the audit witness settings. Keep them in a file of your own instead (see below).
-
-If a run changes the settings file and the server is running, the installer restarts it. It waits until the server answers, and only then starts Caddy. A run that changes no setting leaves the running server alone, even when it installed a newer release. After an upgrade like that, run `sudo systemctl restart sandboxd` to start the new version.
+Each run still rewrites the settings file, `/etc/sandboxd/sandboxd.env`, from the saved options. Settings you added to that file by hand are lost, such as `SB_IDENTITY_ENABLED`, `SB_ENTERPRISE_MODE` or the audit witness settings. Keep them in a file of your own instead (see below).
 </Aside>
 
 ### Keep your own settings
@@ -116,6 +161,7 @@ IP mode has no HTTPS. Your token and data cross the network unencrypted. Use it 
 
 - Puts `sandboxd` (the server) and `toolboxd` (the helper inside each sandbox) in `/usr/local/bin`. Change the folder with `--install-prefix`.
 - Writes settings to `/etc/sandboxd/sandboxd.env`, readable only by root. After you edit it, run `sudo systemctl restart sandboxd`. A later run rewrites it, so keep your own settings in [a file of your own](#keep-your-own-settings).
+- Saves the options you gave it, except secrets, to `/etc/sandboxd/node.json`, readable only by root. A new run with no options uses them (see [Upgrade an install](#upgrade-an-install)).
 - Keeps state in `/var/lib/sandboxd`.
 - Installs a custom Caddy build with TCP routing (`caddy-l4`) and the Cloudflare DNS plugin. Caddy is the web server that gets the certificates and sends each link to the right sandbox. Its config is `/etc/caddy/Caddyfile`. The Cloudflare token goes in `/etc/default/caddy`.
 - Registers the systemd services `sandboxd`, `caddy` and `aerolvm-egress-gateway`, which handles sandboxes' outbound traffic. If `sandboxd` crashes, systemd restarts it after 5 seconds, up to 10 times in 5 minutes.
@@ -195,7 +241,7 @@ printf 'SB_ENABLE_FIRECRACKER=true\nSB_JAILER_UID=%s\nSB_JAILER_GID=%s\n' \
 sudo systemctl restart sandboxd
 ```
 
-The `sandboxd-jailer` user keeps each virtual machine from running as a login user. If your files live elsewhere, settings such as `SB_FIRECRACKER_BINARY`, `SB_JAILER_BINARY` and `SB_FIRECRACKER_KERNEL` point to them. The [cluster setup](/cluster-setup/) does all of this for you with `with_firecracker = true`. Next, build images with [Firecracker templates](/firecracker-templates/).
+The `sandboxd-jailer` user keeps each virtual machine from running as a login user. If your files live elsewhere, settings such as `SB_FIRECRACKER_BINARY`, `SB_JAILER_BINARY` and `SB_FIRECRACKER_KERNEL` point to them. The [cluster setup](/cluster/aws/#step-5-turn-on-more-kinds-of-sandbox-optional) does all of this for you with `with_firecracker = true`. Next, build images with [Firecracker templates](/firecracker-templates/).
 
 ### Turn on WebAssembly
 
@@ -228,7 +274,7 @@ To use your own mirror, pass `--download-mirror <url>` or set `AEROL_DOWNLOAD_MI
 If you install the newest release and GitHub fails part way through, some files can come from GitHub's newest release and some from the mirror's. They may then be from different releases, and the checksum check stops the install. Run the installer again, or pass `--version <tag>` so every file comes from one release.
 </Aside>
 
-The [cluster setup](/cluster-setup/#step-6-turn-on-firecracker-optional) downloads Firecracker from GitHub on its own. To use the mirror there too, set `binary_url` and `jailer_url` in its `firecracker` block to the mirror's copies.
+The [cluster setup](/cluster/aws/#firecracker-files-and-the-download-mirror) downloads Firecracker from GitHub on its own. To use the mirror there too, set `binary_url` and `jailer_url` in its `firecracker` block to the mirror's copies.
 
 ### More installer options
 
@@ -239,14 +285,14 @@ The [cluster setup](/cluster-setup/#step-6-turn-on-firecracker-optional) downloa
 | `--tls-issuer internal` | Caddy's own certificate authority signs every certificate. No DNS provider needed, but clients must trust Caddy's root certificate. For labs. |
 | `--caddy-storage-s3` and the `--caddy-storage-s3-*` options | Share certificates between several servers through an S3 bucket. |
 | `--ingress-proxy-routing` | Route sandbox links without a Caddy route for each sandbox. Then creating or deleting a sandbox, or opening a port, does not make Caddy reload and drop new connections ([TLS ports](/tcp-vs-tls-ports/) still do). On by default with `--domain`. Does nothing without a domain. |
-| `--no-ingress-proxy-routing` | Domain mode only. Turns that routing off: Caddy gets a route for each sandbox, as before. With neither option, a `--domain` install gets routing on and an install without a domain gets it off. A later run of the installer without this option turns routing back on. In the [cluster setup](/cluster-setup/), `default_ingress_proxy_routing` picks: unset passes neither option, `true` passes `--ingress-proxy-routing`, `false` passes this one. |
+| `--no-ingress-proxy-routing` | Domain mode only. Turns that routing off: Caddy gets a route for each sandbox, as before. With neither option, a `--domain` install gets routing on and an install without a domain gets it off. A later run of the installer without this option turns routing back on. In the [cluster setup](/cluster/aws/), `default_ingress_proxy_routing` picks: unset passes neither option, `true` passes `--ingress-proxy-routing`, `false` passes this one. |
 | `--pat-scope <any\|host>` | Where the server's token (`--pat-token`) works. `any`, the default, keeps today's behavior. `host` accepts it only on the server itself (`127.0.0.1:21212`) and from other cluster servers. Everyone else must sign in with SSO or use a named API token. Caddy then talks to the server through a private socket. [Enterprise mode](/enterprise/enterprise-mode/) requires `host`. Turn it on only after every server runs a release that has it, and see the caution above about settings you added by hand. See [SSO](/enterprise/sso/#step-5-limit-the-server-token-to-the-server). |
 | `--l4-proxy-protocol` | Domain mode only. Passes each caller's real address through Caddy to the server, so audit records and alerts show it instead of `127.0.0.1`. Off by default. |
-| `--lb-health-port <port>` | Domain mode only. For a server behind a load balancer: serves `/health` on this port over plain HTTP for the balancer's health check. It answers `200` only when the whole path a user takes works (Caddy, its port 443 and the AerolVM server), so the balancer stops sending users to this server while any part is down. Open the port to the load balancer only. Off by default. See [Put a load balancer in front](/cluster-setup/#put-a-load-balancer-in-front). |
+| `--lb-health-port <port>` | Domain mode only. For a server behind a load balancer: serves `/health` on this port over plain HTTP for the balancer's health check. It answers `200` only when the whole path a user takes works (Caddy, its port 443 and the AerolVM server), so the balancer stops sending users to this server while any part is down. Open the port to the load balancer only. Off by default. See [Put a load balancer in front](/cluster/aws/#step-6-add-a-load-balancer-for-production). |
 | `--build-from-source` | Build `sandboxd` and `toolboxd` from the current checkout instead of downloading them. |
 
 ## Next steps
 
 - [Install on a server](/getting-started/single-node-setup/): the step-by-step install.
-- [Cluster setup](/cluster-setup/): spread sandboxes across many servers. If a server fails, its sandboxes can be recreated on another one.
+- [Cluster setup](/cluster/): spread sandboxes across many servers. If a server fails, its sandboxes can be recreated on another one.
 - [Runbooks](/operational-runbooks/): backups, restores and other server tasks.

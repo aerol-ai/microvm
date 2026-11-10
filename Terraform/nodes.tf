@@ -16,7 +16,7 @@ resource "aws_instance" "seed" {
   ami                         = local.seed_node.ami_id
   instance_type               = local.seed_node.instance_type
   subnet_id                   = aws_subnet.public.id
-  vpc_security_group_ids      = [aws_security_group.node.id]
+  vpc_security_group_ids      = local.node_join_role[local.seed_name] == "server" ? [aws_security_group.node.id, aws_security_group.join.id] : [aws_security_group.node.id]
   key_name                    = local.effective_key_name
   iam_instance_profile        = aws_iam_instance_profile.seed.name
   associate_public_ip_address = true
@@ -68,6 +68,7 @@ resource "aws_instance" "seed" {
   # then applies to the (far smaller) compressed payload.
   user_data_base64 = base64gzip(templatefile("${path.module}/templates/bootstrap.sh.tftpl", {
     node_name                                = "${var.cluster_name}-${local.seed_node.name}"
+    blank                                    = false
     role                                     = local.seed_node.role
     is_seed                                  = true
     domain                                   = local.domain_name
@@ -224,6 +225,13 @@ resource "aws_instance" "seed" {
     containerd_cfg         = local.containerd_cfg
     containerd_pool_cfg    = local.containerd_pool_cfg
     platform_volumes_cfg   = local.platform_volumes_cfg
+    # One-line join (join.tf): the seed registers a token per role.
+    one_line_join      = var.one_line_join
+    join_token         = ""
+    join_role          = "server"
+    join_token_worker  = local.join_tokens["worker"]
+    join_token_ingress = local.join_tokens["ingress"]
+    join_token_server  = local.join_tokens["server"]
   }))
 
   tags = merge(
@@ -249,6 +257,18 @@ resource "aws_instance" "seed" {
     # Wrapped custody needs a key store to wrap with; the only one this
     # module provisions is the AWS KMS key behind secret_kms_enabled.
     precondition {
+      condition     = !local.seed_node.blank
+      error_message = "The seed can't be blank: it starts the cluster."
+    }
+
+    # One-line joins need a domain install: the installer's --local mode
+    # never joins a cluster.
+    precondition {
+      condition     = !var.one_line_join || local.has_domain
+      error_message = "one_line_join needs a domain: install.sh --local (no domain) never joins a cluster. Set one_line_join = false for a cluster with no domain."
+    }
+
+    precondition {
       condition     = var.key_custody == "file" || var.secret_kms_enabled
       error_message = "key_custody = \"wrapped\" needs secret_kms_enabled = true: the server key is wrapped by that KMS key."
     }
@@ -266,7 +286,7 @@ resource "aws_instance" "joiner" {
   ami                         = each.value.ami_id
   instance_type               = each.value.instance_type
   subnet_id                   = aws_subnet.public.id
-  vpc_security_group_ids      = [aws_security_group.node.id]
+  vpc_security_group_ids      = local.node_join_role[each.key] == "server" ? [aws_security_group.node.id, aws_security_group.join.id] : [aws_security_group.node.id]
   key_name                    = local.effective_key_name
   iam_instance_profile        = aws_iam_instance_profile.joiner.name
   associate_public_ip_address = true
@@ -311,6 +331,7 @@ resource "aws_instance" "joiner" {
   # user_data limit; cloud-init decompresses gzipped user-data transparently.
   user_data_base64 = base64gzip(templatefile("${path.module}/templates/bootstrap.sh.tftpl", {
     node_name                                = "${var.cluster_name}-${each.value.name}"
+    blank                                    = each.value.blank
     role                                     = each.value.role
     is_seed                                  = false
     domain                                   = local.domain_name
@@ -318,7 +339,7 @@ resource "aws_instance" "joiner" {
     enable_custom_domains                    = local.enable_custom_domains
     custom_domain_txt_prefix                 = local.custom_domain_txt_prefix
     custom_domain_txt_value_prefix           = local.custom_domain_txt_value_prefix
-    pat_token                                = local.pat_token
+    pat_token                                = local.node_pat_token[each.key]
     cloudflare_api_token                     = local.cloudflare_api_token
     acme_email                               = local.acme_email
     acme_ca                                  = local.acme_ca
@@ -468,6 +489,15 @@ resource "aws_instance" "joiner" {
     containerd_cfg         = local.containerd_cfg
     containerd_pool_cfg    = local.containerd_pool_cfg
     platform_volumes_cfg   = local.platform_volumes_cfg
+    # One-line join (join.tf): a joiner holds only its own role's token.
+    one_line_join = var.one_line_join
+    # A fresh token for this node (node_join_tokens) beats the module's
+    # token for its role, which may have expired.
+    join_token         = lookup(var.node_join_tokens, each.key, local.join_tokens[local.node_join_role[each.key]])
+    join_role          = local.node_join_role[each.key]
+    join_token_worker  = ""
+    join_token_ingress = ""
+    join_token_server  = ""
   }))
 
   depends_on = [aws_instance.seed]
@@ -488,6 +518,13 @@ resource "aws_instance" "joiner" {
   lifecycle {
     ignore_changes       = [ami]
     replace_triggered_by = [aws_instance.seed]
+
+    # The seed starts the cluster and never joins, and a name that is not
+    # a node is a typo: either way the token would go nowhere.
+    precondition {
+      condition     = alltrue([for name in keys(var.node_join_tokens) : contains(keys(local.joiner_nodes), name)])
+      error_message = "node_join_tokens names a node that does not join: each key must be the name of a non-seed node in nodes."
+    }
   }
 }
 

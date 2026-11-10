@@ -1,0 +1,7 @@
+exit 0
+--- stdout
+ID       ROLE      STATUS    EXPIRES                REUSABLE   USES
+old001   ingress   Expired   2026-11-01T12:00:00Z   false      0
+srv001   server    Used      2026-11-08T10:00:00Z   false      1
+wrk001   worker    Valid     never                  true       2
+--- stderr

@@ -182,6 +182,11 @@ func PATOriginFromContext(ctx context.Context) string {
 //     same way as HeaderSurface.
 //   - HeaderOwnerEpoch, the owner epoch the edge read for its target
 //     (ContextWithOwnerEpoch). Removed from every other request.
+//   - HeaderCaller, for a request a local tool made with this node's own
+//     token (ContextWithLocalCaller): the credential, which no peer would
+//     accept, is dropped, and the edge node speaks for the call
+//     (stampCaller, peer_cert_auth.go). Removed from every other request.
+//     Call it after the credential is set on a fresh request.
 //
 // It also marks the edge's api record as forwarded (auditlog.MarkForwarded):
 // only the node that runs the handler records the call, so the peer writes
@@ -234,6 +239,7 @@ func StampForward(out *http.Request, access controlplane.Access) {
 	} else {
 		out.Header.Del(HeaderOwnerEpoch)
 	}
+	stampCaller(out)
 	auditlog.MarkForwarded(out.Context())
 }
 

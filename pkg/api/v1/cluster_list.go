@@ -378,14 +378,15 @@ func clusterListFromPeer[T any](parent *http.Request, c cluster.Client, peer clu
 		return nil, err
 	}
 	req.Header.Set(forwardedHeader, "1")
-	// The caller's own credential follows; StampForward adds the
-	// forwarded marker, the selected team and the correlation id.
-	access, _ := controlplane.AccessFromContext(parent.Context())
-	cluster.StampForward(req, access)
+	// The caller's own credential follows; StampForward then adds the
+	// forwarded marker, the selected team and the correlation id, and
+	// drops a credential only this node accepts (a local tool's token).
 	cluster.SetPeerNodeIDHeader(req, c.SelfNodeID())
 	if auth := parent.Header.Get("Authorization"); auth != "" {
 		req.Header.Set("Authorization", auth)
 	}
+	access, _ := controlplane.AccessFromContext(parent.Context())
+	cluster.StampForward(req, access)
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err

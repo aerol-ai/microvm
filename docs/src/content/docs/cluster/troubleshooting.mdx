@@ -1,0 +1,93 @@
+---
+title: Fix problems
+description: The first three commands to run when a cluster looks wrong, then what each common message means and what to do.
+---
+
+Something looks wrong? Start with the three checks below. Then find the message you see in the tables.
+
+`sandboxd` is the AerolVM program on each node.
+
+## The first three checks
+
+### 1. List the nodes
+
+```bash title="On your computer"
+aerolvm get nodes
+```
+
+Every node should show `Ready`, and one should show `Leader`. A node that shows `NotReady` is the place to look next.
+
+### 2. Check the machine
+
+```bash title="On the node with the problem"
+sudo sandboxd preflight
+```
+
+It checks the disk space, the ports, the clock and more. It prints a `fix:` line for each problem it finds.
+
+### 3. Read the log
+
+```bash title="On the node with the problem"
+sudo journalctl -u sandboxd -n 50
+```
+
+This prints the last 50 lines of the node's log. Add `-f` to follow new lines as they come. Press `Ctrl-C` to stop.
+
+A node that Terraform made also has a setup log: `sudo tail -n 50 /var/log/aerolvm-bootstrap.log`.
+
+## Joining
+
+| What you see | What it means | What to do |
+|---|---|---|
+| `init sets up a Linux cluster node; this is Darwin` | You ran the installer on a Mac. (Darwin is macOS.) | Run it on a Linux machine. Your computer cannot be a node. |
+| `--dns-provider requires --dns-api-token` | `CLOUDFLARE_API_TOKEN` is not set on this machine. | Run `export CLOUDFLARE_API_TOKEN=...`, then the join command again. |
+| `join token has expired` | The token is older than its time limit: 2 hours, unless you chose another. | Make a new join command with `aerolvm join-command`, with the same `--role`. The `fix:` line shows it. |
+| `join token was already used by another node` | Each token works for one machine. | Make a new join command. |
+| `join token is not valid` | The token was mistyped, or cancelled. A token is also removed one day after it expires. | Make a new join command, and paste it whole. |
+| `the join server could not reach this node back` | The firewall blocks the nodes from each other. (The join server is the server node that answers joins.) | Open TCP `7000` to `7003` and UDP `7001` between all nodes. |
+| `this machine already holds cluster state` | The machine was a node before. | Run `sudo sandboxd reset --yes`, then the join command again. |
+| `this key was revoked (its node was deleted)` | You deleted this machine's node. "Revoked" means cancelled. | Run `sudo sandboxd reset --yes`, then join again with a new join command. |
+| `node ID in use` | Another node has the same name. A node's name is its node ID. | Add `--node-id <new-name>` to the end of the join command. Or delete the old node first. |
+| The node shows role `worker` or `server`, but you wanted `mixed` | It joined with a join command for another role. | Run `sudo sandboxd reset --yes` on it. Then join again with `aerolvm join-command --role mixed`. |
+| `the sandboxd installed here (...) has no 'sandboxd init'` | The installer fetched a release before v0.7.0. | Use a release from v0.7.0 on. |
+
+`init` and `join` are safe to run again. A join that stopped part of the way through can be run again as it is.
+
+## Join tokens and server tokens
+
+| What you see | What it means | What to do |
+|---|---|---|
+| `only server nodes may call this`, or `which is not an admitted server` | You asked for a server token through an ingress node. | Run `sudo sandboxd join-command --role server` (or `--role mixed`) on a server or mixed node. It is the same command as `aerolvm join-command`, run on the node itself. |
+| `refuses never-expiring join tokens unless credential custody is wrapped` | The cluster runs in [enterprise mode](/enterprise/enterprise-mode/), a stricter set of rules. It allows `--ttl 0` only with [wrapped key custody](/enterprise/key-custody/) (the message calls it "credential custody"). | Give the token a time limit, such as `--ttl 24h`. |
+| `the cluster reported no join URL` | No server node has its join port open. | Check that TCP `7003` is open on the server nodes. |
+
+## Nodes
+
+| What you see | What it means | What to do |
+|---|---|---|
+| A node shows `NotReady` | The cluster cannot reach it. | Check that the machine is on. Then read its log, as in the [first three checks](#the-first-three-checks). |
+| A node shows `SchedulingDisabled` | It is **cordoned**: no new sandboxes start on it. | Run `aerolvm uncordon <node>` when it is ready. |
+| No node shows `Leader` | More than half of the server nodes are down. The rest cannot pick a leader. | Start the machines that are down. If they are gone for good, see [Back up and recover](/cluster/backup/#most-server-nodes-died). |
+| Creating a sandbox fails on every node | The cluster has no leader. Or no node that runs sandboxes has free CPU or memory. | Check `aerolvm get nodes` for a `Leader`. Check `aerolvm top nodes`: it shows how much CPU and memory each node has given out, next to what it has. |
+| `get nodes` shows an HTTPS certificate error | A new node is still getting its HTTPS certificate. | Wait two minutes and try again. |
+| One node still shows HTTPS certificate errors an hour after it joined | That node cannot get an HTTPS certificate. | Check that its Cloudflare token works. **Caddy** is the web server AerolVM runs on each node. Read its log with `sudo journalctl -u caddy -n 50` on that node. |
+
+## Upgrades
+
+| What you see | What it means | What to do |
+|---|---|---|
+| `status` shows a node `failed` | Its new version did not come up. It went back to its old version, and the upgrade stopped. | Read its log. Then `aerolvm upgrade rollback --wait`. Or fix it, then run the same `aerolvm upgrade apply` again. |
+| `status` shows a node `skipped` | The node was down when its turn came. The upgrade waits until that node is upgraded or deleted. | Start it again. The leader upgrades it when it is back. |
+| `plan` says the jump is not allowed | The new release cannot be reached in one step. | Upgrade through the releases `plan` lists. |
+| `apply` asks for `--allow-downtime` | The cluster has only one or two server nodes. | Add `--allow-downtime`. The cluster's API is down for a few seconds, each time one of those nodes restarts. Sandboxes keep running. |
+
+See [Upgrade](/cluster/upgrade/#if-something-goes-wrong) for more.
+
+## Runbooks
+
+For outages and alerts, the [runbooks](/operational-runbooks/) give step-by-step fixes. Each alert from Prometheus, the monitoring tool AerolVM works with, links to its runbook.
+
+## Next steps
+
+- [Command cheat sheet](/cluster/cheat-sheet/): every cluster command on one page.
+- [Back up and recover](/cluster/backup/): bring a cluster back after most server nodes died.

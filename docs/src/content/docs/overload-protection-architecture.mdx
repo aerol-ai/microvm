@@ -218,7 +218,7 @@ flowchart LR
 
 **What this shows:** only a dead process gets restarted. A slow or unhealthy one is taken out of rotation, and keeps the work it already has.
 
-The readiness side needs a health-checked load balancer in front of the ingress nodes. Terraform can create one for you ([#864](https://github.com/aerol-ai/microvm/pull/864)); see [Put a load balancer in front](/cluster-setup/#put-a-load-balancer-in-front). Without one, clients keep reaching the node through DNS round-robin. `/health` and the alerts still report the problem, but nothing moves traffic.
+The readiness side needs a health-checked load balancer in front of the ingress nodes. Terraform can create one for you ([#864](https://github.com/aerol-ai/microvm/pull/864)); see [Put a load balancer in front](/cluster/aws/#step-6-add-a-load-balancer-for-production). Without one, clients keep reaching the node through DNS round-robin. `/health` and the alerts still report the problem, but nothing moves traffic.
 
 ### When the watchdog restarts
 
@@ -658,5 +658,5 @@ The [SLO breach runbook](https://github.com/aerol-ai/microvm/blob/main/setup/run
 
 - [Placement and failover](/engineering-placement-failover/): how the control plane decides which worker owns each sandbox, the table every cluster-wide list reads.
 - [Ingress nodes](/cluster-ingress/): the role that took the load in this test, and how to add more.
-- [Cluster setup](/cluster-setup/#put-a-load-balancer-in-front): put a health-checked load balancer in front of the ingress nodes.
+- [Cluster setup](/cluster/aws/#step-6-add-a-load-balancer-for-production): put a health-checked load balancer in front of the ingress nodes.
 - [Runbooks](/operational-runbooks/): what to do when an alert fires.

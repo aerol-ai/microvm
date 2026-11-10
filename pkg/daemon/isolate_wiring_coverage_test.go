@@ -122,7 +122,7 @@ func (r *recordingSupervisor) SpawnGroup(_ context.Context, spec isolateruntime.
 // shim) with unlimited caps; an unjailed pool keeps its run-dir-only spec.
 func TestIsolatePoolSpawnerJailsWarmBlanks(t *testing.T) {
 	rec := &recordingSupervisor{}
-	jailed := &poolSpawner{supervisor: rec, cfg: isolateruntime.Config{
+	jailed := &poolSpawner{supervisor: rec, boot: 0x6a2b, cfg: isolateruntime.Config{
 		UseJail: true, JailChrootBase: "/srv/jail", JailUID: 1001, JailGID: 1001,
 		JailCgroupRoot: "/sys/fs/cgroup/x", SeccompMode: "enforce", ShimPath: "/sandboxd",
 	}}
@@ -131,7 +131,7 @@ func TestIsolatePoolSpawnerJailsWarmBlanks(t *testing.T) {
 		t.Fatalf("spawns = %d", len(rec.specs))
 	}
 	spec := rec.specs[0]
-	if spec.GroupKey != "warm-1" || spec.ChrootDir != "/srv/jail/warm-1" || spec.UID != 1001 || spec.CgroupRoot != "/sys/fs/cgroup/x" ||
+	if spec.GroupKey != "warm-6a2b-1" || spec.ChrootDir != "/srv/jail/warm-6a2b-1" || spec.UID != 1001 || spec.CgroupRoot != "/sys/fs/cgroup/x" ||
 		spec.SeccompMode != "enforce" || spec.ShimPath != "/sandboxd" || spec.CPUQuota != 0 || spec.MemoryLimitMB != 0 {
 		t.Fatalf("warm blank spec = %+v", spec)
 	}
@@ -144,9 +144,9 @@ func TestIsolatePoolSpawnerJailsWarmBlanks(t *testing.T) {
 	if len(rec.specs) != 1 {
 		t.Fatal("an unjailed blank was spawned under a jail-on config")
 	}
-	plain := &poolSpawner{supervisor: rec, cfg: isolateruntime.Config{UseJail: false}}
+	plain := &poolSpawner{supervisor: rec, boot: 0x6a2b, cfg: isolateruntime.Config{UseJail: false}}
 	_, _ = plain.Spawn(context.Background())
-	if got := rec.specs[len(rec.specs)-1]; got.GroupKey != "warm-1" || got.ChrootDir != "" {
+	if got := rec.specs[len(rec.specs)-1]; got.GroupKey != "warm-6a2b-1" || got.ChrootDir != "" {
 		t.Fatalf("unjailed blank spec = %+v", got)
 	}
 }

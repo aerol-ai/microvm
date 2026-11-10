@@ -9,6 +9,12 @@
 # every plan/apply needs an explicit -var-file. This wrapper injects it so
 # operators never have to remember the flag.
 #
+# It runs Terraform/root, the root module a checkout uses. Terraform/ itself
+# is a module (used by URL outside a checkout); Terraform/root calls it by
+# path, keeps this checkout's state backend, and moves state written while
+# Terraform/ was the root into the module on the next plan. Run `init` once
+# after pulling this change: the working directory moved.
+#
 # Usage (from anywhere inside the repo):
 #   scripts/terraform.sh init
 #   scripts/terraform.sh plan
@@ -22,7 +28,7 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-TF_DIR="${REPO_ROOT}/Terraform"
+TF_DIR="${REPO_ROOT}/Terraform/root"
 TFVARS="${REPO_ROOT}/config/terraform.tfvars"
 
 if ! command -v terraform >/dev/null 2>&1; then

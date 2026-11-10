@@ -63,6 +63,8 @@ output "integration_targets" {
         private_ip  = inst.private_ip
         instance_id = inst.id
         spot        = local.nodes_resolved[n].spot
+        # A blank node is plain Ubuntu that has not joined (nodes[].blank).
+        blank = local.nodes_resolved[n].blank
       }
     ]
     grafana_url     = var.deploy_obs ? "http://${aws_instance.obs[0].public_ip}:3000" : ""

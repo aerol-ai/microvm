@@ -148,11 +148,13 @@ func writeJSONFile(path string, v any) error {
 	return os.Rename(tmp.Name(), path)
 }
 
-// connection picks the sandboxd and token for a command. SB_PAT_TOKEN (or
-// its alias SB_API_TOKEN) wins, as for every SDK. Otherwise the saved login
-// is used, but only for the URL it was saved for: with SB_API_URL pointing
-// at another server, the saved token is never sent there. SB_TEAM picks the
-// team for either; without it a login uses the team it was saved with.
+// connection picks the sandboxd and token for a command. --context picks a
+// saved context outright. Otherwise SB_PAT_TOKEN (or its alias SB_API_TOKEN)
+// wins, as for every SDK. Otherwise the saved login is used (AEROLVM_CONTEXT,
+// else the current context), but only for the URL it was saved for: with
+// SB_API_URL pointing at another server, the saved token is never sent
+// there. SB_TEAM picks the team for any of them; without it a login uses the
+// team it was saved with.
 func (a *app) connection() (connection, error) {
 	envURL := strings.TrimSpace(a.getenv("SB_API_URL"))
 	envTeam := strings.TrimSpace(a.getenv("SB_TEAM"))
@@ -163,6 +165,13 @@ func (a *app) connection() (connection, error) {
 			Hint:    "a team name is 1 to 63 characters of a-z, 0-9 and '-'; unset SB_TEAM to act for your first team",
 		}
 	}
+	if a.contextName != "" {
+		conn, err := a.namedConnection(a.contextName, "--context")
+		if err == nil && envTeam != "" {
+			conn.team = envTeam
+		}
+		return conn, err
+	}
 	if name, token := a.envToken(); token != "" {
 		if envURL == "" {
 			envURL = defaultAPIURL
@@ -171,20 +180,27 @@ func (a *app) connection() (connection, error) {
 	}
 	var login savedLogin
 	var exists bool
-	path, err := a.loginPath()
-	if err == nil {
+	var conn connection
+	if name := strings.TrimSpace(a.getenv("AEROLVM_CONTEXT")); name != "" {
+		named, err := a.namedConnection(name, "AEROLVM_CONTEXT")
+		if err != nil {
+			return connection{}, err
+		}
+		conn, exists = named, true
+		login.APIURL = named.apiURL
+	} else if path, err := a.loginPath(); err == nil {
 		if login, exists, err = a.loadLogin(path); err != nil {
 			return connection{}, err
+		}
+		conn = connection{apiURL: login.APIURL, token: login.Token, from: path, saved: true, team: login.Team}
+		if login.SSO != nil {
+			conn.sso = &ssoSession{a: a, path: path, login: login}
 		}
 	}
 	switch {
 	case exists && (envURL == "" || sameAPIURL(envURL, login.APIURL)):
-		conn := connection{apiURL: login.APIURL, token: login.Token, from: path, saved: true, team: login.Team}
 		if envTeam != "" {
 			conn.team = envTeam
-		}
-		if login.SSO != nil {
-			conn.sso = &ssoSession{a: a, path: path, login: login}
 		}
 		return conn, nil
 	case exists:
@@ -292,7 +308,8 @@ func (a *app) explainRefusal(e *agenttools.Error) *agenttools.Error {
 func runLogin(ctx context.Context, a *app, args []string) int {
 	fs, c := a.newFlagSet("login")
 	var tokenStdin, sso, device, secretStdin bool
-	var issuer, team string
+	var issuer, team, name string
+	fs.StringVar(&name, "name", "", "")
 	fs.BoolVar(&tokenStdin, "token-stdin", false, "")
 	fs.BoolVar(&sso, "sso", false, "")
 	fs.BoolVar(&device, "device", false, "")
@@ -309,6 +326,9 @@ func runLogin(ctx context.Context, a *app, args []string) int {
 	team = strings.TrimSpace(team)
 	if team != "" && !identitywire.ValidTeamName(team) {
 		return a.usageError(c, "login", "--team must be a team name (1 to 63 characters of a-z, 0-9 and '-'); leave it out to act for your first team")
+	}
+	if name != "" && !validContextName(name) {
+		return a.usageError(c, "login", "--name must be a context name: 1 to 253 printable characters with no spaces")
 	}
 	// Any SSO flag asks for SSO; --token-stdin asks for a token. Both read
 	// stdin, and one login holds one credential.
@@ -354,7 +374,7 @@ func runLogin(ctx context.Context, a *app, args []string) int {
 	// SSO when asked for, or when the server offers it to a person at a
 	// terminal (§5.6). A script that pipes a token never reads discovery.
 	if wantSSO || ask {
-		req := ssoRequest{apiURL: apiURL, path: path, team: team, issuer: issuer, device: device, canAsk: ask}
+		req := ssoRequest{apiURL: apiURL, path: path, team: team, issuer: issuer, device: device, canAsk: ask, name: name}
 		if secretStdin {
 			b, err := io.ReadAll(io.LimitReader(a.stdin, maxTokenBytes))
 			if err != nil {
@@ -413,7 +433,8 @@ func runLogin(ctx context.Context, a *app, args []string) int {
 	if health, err := tools.Client().Health(ctx); err == nil {
 		version = health.Version
 	}
-	if err := saveLogin(path, savedLogin{APIURL: apiURL, Token: token, Team: team}); err != nil {
+	contextName, err := a.saveCurrentLogin(name, savedLogin{APIURL: apiURL, Token: token, Team: team})
+	if err != nil {
 		return a.fail(c, err, exitError)
 	}
 
@@ -421,6 +442,7 @@ func runLogin(ctx context.Context, a *app, args []string) int {
 		a.printJSON(map[string]string{"api_url": apiURL, "config_path": path, "server_version": version})
 	} else {
 		a.note("aerolvm: logged in to %s (sandboxd %s). The token is saved in %s, readable only by you.", apiURL, dash(version), path)
+		a.note("aerolvm: saved as context %q; aerolvm config get-contexts lists them", contextName)
 	}
 	// An API token's expiry is read now, so the first warning needs no
 	// extra request later (D8).
@@ -466,6 +488,9 @@ func runLogout(_ context.Context, a *app, args []string) int {
 		return exitOK
 	}
 	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return a.fail(c, err, exitError)
+	}
+	if err := a.forgetCurrentContext(); err != nil {
 		return a.fail(c, err, exitError)
 	}
 	if c.json {

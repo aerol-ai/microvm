@@ -1,0 +1,11 @@
+exit 0
+--- stdout
+{
+  "created_at": "2025-10-03T12:00:00Z",
+  "image": "registry.example/snap-b",
+  "image_distribution_mode": "external_registry",
+  "image_registry_ref": "registry.example/snap-b:1",
+  "name": "snap-b",
+  "source_sandbox_id": "sb-0000000000000002"
+}
+--- stderr

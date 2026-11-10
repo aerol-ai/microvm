@@ -1,0 +1,51 @@
+# Single-node integration scenario: one mixed node with public domain + TLS.
+# This is the lowest-cost public deployment shape and runs the Docker,
+# networking, custom-domain-gated, and platform-volume UCs.
+#
+# AWS access (aws_profile, aws_region, ssh_key_name, ...) is inherited from the
+# operator's config/terraform.tfvars, which run.sh chains as the first
+# -var-file.
+cluster_name = "aerolvm-itest-single-node-ops"
+
+extra_tags = {
+  itest = "true"
+  ttl   = "4"
+}
+
+default_instance_type  = "t3.medium"
+default_volume_size_gb = 40
+
+# A single node has nothing to share certs WITH; disable the prod-inherited
+# managed S3 cert bucket so the run doesn't create one. Cluster scenarios re-enable it.
+# NOTE: `make integration-cert-store-init` overrides this at runtime with a BYO
+# persistent bucket (run.sh → emit_cert_storage_tfvars) so the leased-domain
+# wildcard cert is reused across runs instead of re-issued. This stays the
+# fallback for operators who haven't bootstrapped that store.
+caddy_shared_cert_storage = {
+  enabled = false
+}
+
+# Identity and access (plans/identity-and-access.md, task T12): named
+# credentials on, and the identity file the suite installs (capabilities
+# identity and identity-oidc). The file is absent at boot, which sandboxd
+# treats as "OIDC answers 503 until a good file loads" while the PAT and avm_
+# tokens work; the suite writes it, with the test issuer's static JWKS, before
+# the first OIDC use case. Remote MCP is on for UC-286's OAuth flow.
+extra_sandboxd_env = {
+  SB_IDENTITY_ENABLED = "true"
+  SB_IDENTITY_FILE    = "/etc/sandboxd/itest-identity.yaml"
+  SB_MCP_ENABLED      = "true"
+}
+
+nodes = {
+  node1 = {
+    role = "mixed"
+    seed = true
+    spot = true
+  }
+}
+
+# Sandbox cloud identity (plans/sandbox-cloud-identity.md, UC-431..437):
+# every node is an OIDC issuer at https://<domain> (capability
+# cloud-identity).
+identity_issuer_enabled = true

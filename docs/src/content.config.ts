@@ -32,6 +32,33 @@ export enum NavigationCategory {
 
 const link = (href: string, label: string) => ({ type: 'link' as const, href, label })
 
+// The cluster guide sits under one Cluster Setup entry, closed until its +
+// opens it, the way SSO's providers do. Its pages come in reading order, so
+// "Next" walks the guide. The reference pages follow under a "Reference"
+// heading and stay out of "Next".
+const clusterPages = [
+  ...[
+    ['how-it-works', 'How a cluster works'],
+    ['create', 'Build a cluster'],
+    ['aws', 'Build it on AWS'],
+    ['nodes', 'Add and remove nodes'],
+    ['upgrade', 'Upgrade'],
+    ['backup', 'Back up and recover'],
+    ['security', 'Keep it safe'],
+    ['troubleshooting', 'Fix problems'],
+    ['cheat-sheet', 'Command cheat sheet'],
+    ['kubernetes', 'Coming from Kubernetes'],
+  ].map(([id, label]) => link(`/cluster/${id}`, label)),
+  ...[
+    ['/cluster-ingress', 'Ingress nodes'],
+    ['/cluster-secrets', 'Secrets providers'],
+    ['/dashboard', 'Dashboard'],
+    ['/operational-runbooks', 'Runbooks'],
+    ['/reconcile', 'Reconcile'],
+    ['/cluster-glossary', 'Glossary'],
+  ].map(([href, label]) => ({ ...link(href, label), reference: true })),
+]
+
 // Every docs page appears exactly once, in reading order: pagination walks
 // this list, so "Next" on one page is the next thing a newcomer should read.
 // Keep it two levels deep (group -> page); deeper nesting is what made the old
@@ -46,7 +73,7 @@ const getDocsSidebarConfig = (): NavigationGroup[] => [
       // link('/quick-start', 'Quickstart'),
       link('/getting-started/local-setup', '- Local Setup'),
       link('/getting-started/single-node-setup', '- Single Node Cloud Setup'),
-      link('/getting-started/cluster-setup', '- Cluster Setup'),
+      { ...link('/cluster', '- Cluster Setup'), children: clusterPages },
     ],
   },
   {
@@ -144,20 +171,6 @@ const getDocsSidebarConfig = (): NavigationGroup[] => [
       link('/platform-volumes', '- Platform volumes'),
     ],
   },
-  // {
-  //   type: 'group',
-  //   label: 'Run a Cluster',
-  //   category: NavigationCategory.OPERATIONS,
-  //   entries: [
-  //     link('/cluster-setup', 'Cluster setup'),
-  //     link('/cluster-ingress', 'Ingress nodes'),
-  //     link('/cluster-secrets', 'Secrets providers'),
-  //     link('/cluster-glossary', 'Glossary'),
-  //     link('/dashboard', 'Dashboard'),
-  //     link('/reconcile', 'Reconcile'),
-  //     link('/operational-runbooks', 'Runbooks'),
-  //   ],
-  // },
 ]
 
 // Blog posts keep the URLs they had as docs pages, because the docs link to

@@ -1,0 +1,5 @@
+exit 0
+--- stdout
+curl -fsSL https://aerolvm.aerol.ai | sudo bash -s -- join https://10.0.0.5:7003 --token abc123.0123456789abcdefghijklmnopqrstuv --ca-cert-hash sha256:9a1c
+--- stderr
+aerolvm: server token abc123 expires at 2026-11-07T12:00:00Z and works for one machine. To cancel it: aerolvm delete jointoken abc123

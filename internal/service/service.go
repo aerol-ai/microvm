@@ -878,6 +878,9 @@ type Service struct {
 	// expiry sweep may run (idempotency_ledger.go). Claims trigger it, so
 	// the table is pruned without a dedicated background loop.
 	idempotencySweepAt atomic.Int64
+
+	// nodeUpgrades is the single-node upgrade API's state (node_upgrade.go).
+	nodeUpgrades nodeUpgradeState
 }
 
 func New(cfg config.Config, logger *slog.Logger, db *store.Store, runtimeDriver runtime.Runtime, eventsClient docker.EventsSource, caddyClient *caddy.Client, cipher *secrets.Cipher, mountManager *mounts.Manager, admitter *capacity.Admitter) *Service {
@@ -7183,12 +7186,12 @@ func (s *Service) Reconcile(ctx context.Context) error {
 		// uid-owned chroot tree under SB_ISOLATE_JAIL_CHROOT_BASE, so a skipped
 		// sweep strands host state, not just a PID.
 		//
-		// LIMIT: isolate's ListManaged reads the driver's in-memory byID map
-		// (internal/runtime/isolate/driver.go), not the host, so this sweep only
-		// reclaims groups leaked within one daemon lifetime — which is exactly
-		// the finalizeStaleLocalSandbox case that names this sweep as its retry
-		// anchor. Surviving a restart needs a host-backed enumeration seam on
-		// HostSupervisor; tracked in TODOS.md.
+		// isolate's ListManaged reads the driver's in-memory byID map
+		// (internal/runtime/isolate/driver.go), not the host, so this sweep
+		// reclaims groups leaked within one daemon lifetime — the
+		// finalizeStaleLocalSandbox case that names this sweep as its retry
+		// anchor. Leaks across a restart are swept once at boot, before any
+		// spawn (pkg/isolate.SweepLeftovers, after AdoptHosts).
 		removeOrphans(s.isolate, models.RuntimeIsolate, "", isolateManaged)
 	}
 

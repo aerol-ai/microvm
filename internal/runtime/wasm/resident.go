@@ -430,6 +430,7 @@ func (d *Driver) createOnResidentHost(ctx context.Context, req models.CreateSand
 	inst.residentSlotHeld = true
 	d.byID[sandboxID] = inst
 	d.mu.Unlock()
+	d.recordInstance(inst)
 	return d.runtimeState(inst), nil
 }
 
@@ -494,6 +495,7 @@ func (d *Driver) migrateResidentToCold(ctx context.Context, inst *sandboxInstanc
 	// Track the cold worker's spawn count so refreshWorkerInstanceState detects a
 	// later respawn of THIS worker (uses the now-flipped per-sandbox workerKey).
 	d.noteWorkerSpawnCount(inst)
+	d.recordInstance(inst)
 	return nil
 }
 

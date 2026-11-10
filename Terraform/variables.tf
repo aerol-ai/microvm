@@ -292,6 +292,9 @@ variable "nodes" {
       extra_user_data  (string,  default ""; appended to bootstrap.sh)
       sandboxd_env     (map(string), default {}; merged over var.extra_sandboxd_env)
       tags             (map(string), default {})
+      blank            (bool,    default false; plain Ubuntu, nothing installed,
+                        for a test to join by hand. Not a member, so it
+                        gets no DNS record and is not counted.)
   EOT
   type = map(object({
     role                  = optional(string, "mixed")
@@ -316,6 +319,7 @@ variable "nodes" {
     # SB_* profiles (audit rate limits, jail settings) from one node map.
     sandboxd_env = optional(map(string), {})
     tags         = optional(map(string), {})
+    blank        = optional(bool, false)
     # spot requests this node as an EC2 spot instance (one-time, terminate on
     # reclaim). Default false → on-demand, identical to prior behaviour. Only
     # the integration test harness sets this true; prod node maps omit it.
@@ -948,6 +952,22 @@ variable "bundle_bucket_force_destroy" {
   description = "Whether `terraform destroy` may delete the bundle S3 bucket even if it still has objects."
   type        = bool
   default     = true
+}
+
+# kubeadm's way to add a node after its join token expired: make a fresh
+# token on the cluster and give it to the new machine. This is how that
+# fresh token reaches one new node's user data (Terraform/join.tf).
+variable "node_join_tokens" {
+  description = "A join token for one node, by its name in nodes, used instead of the module's token for its role. For a node added after that token stopped working: the module's server token lasts 24h (worker and ingress tokens never expire), so a server added later needs a fresh one. Make it on a server with `sudo sandboxd join-command --role server --ttl 2h --json` (a server token can only be made through a server) and use its \"token\". Only that node's user data changes, so no other node is replaced. Leave the entry in after the node has joined: removing it changes that node's user data, which replaces it."
+  type        = map(string)
+  default     = {}
+  nullable    = false
+  sensitive   = true
+
+  validation {
+    condition     = alltrue([for t in values(var.node_join_tokens) : can(regex("^[a-z0-9]{6}\\.[a-z0-9]{32}$", t))])
+    error_message = "Each node_join_tokens value must be a join token: 6 then 32 characters of a-z and 0-9, joined by a dot, as `aerolvm join-command --json` prints in \"token\"."
+  }
 }
 
 variable "caddy_certs_bucket_force_destroy" {

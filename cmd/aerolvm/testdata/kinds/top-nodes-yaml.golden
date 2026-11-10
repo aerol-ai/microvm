@@ -1,0 +1,11 @@
+exit 0
+--- stdout
+nodes:
+    - cpu_budget: 0
+      cpu_reserved: 0
+      known: false
+      memory_budget_mb: 0
+      memory_reserved_mb: 0
+      node_id: wkr-2
+      sandboxes: 0
+--- stderr

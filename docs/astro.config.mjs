@@ -38,6 +38,10 @@ export default defineConfig({
     '/comparison': '/aerolvm-vs-daytona-vs-e2b',
     // enterprise/access-control.mdx was renamed to enterprise/sso.mdx.
     '/enterprise/access-control': '/enterprise/sso',
+    // The cluster guide became the pages under /cluster/: the overview, then
+    // the step-by-step build that cluster-setup.mdx held.
+    '/getting-started/cluster-setup': '/cluster',
+    '/cluster-setup': '/cluster/create',
   },
   integrations: [
     // Must precede starlight() so it rewrites ```mermaid fenced blocks into

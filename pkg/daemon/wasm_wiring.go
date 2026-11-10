@@ -15,6 +15,7 @@ import (
 	"github.com/aerol-ai/microvm/internal/runtime/wasm/statekv"
 	"github.com/aerol-ai/microvm/internal/service"
 	"github.com/aerol-ai/microvm/internal/store"
+	"github.com/aerol-ai/microvm/pkg/hostproc"
 	"github.com/aerol-ai/microvm/pkg/wasm/worker"
 	"github.com/aerol-ai/microvm/pkg/wasmmod"
 )
@@ -55,6 +56,13 @@ func wireWasmRuntime(ctx context.Context, cfg config.Config, logger *slog.Logger
 	// half-staged or someone else's artifact.
 	resolver.CatalogueLookup = svc.ResolveOwnedWasmModule
 	supervisor := worker.NewSupervisor(worker.DefaultSpawner)
+	// Workers run in their own cgroup, outside sandboxd's unit, so a
+	// restart or an upgrade does not stop them (pkg/hostproc); the next
+	// sandboxd takes them over below. Off by itself where cgroup v2 is not
+	// usable, and then workers die with sandboxd as before.
+	workerCgroup := hostproc.NewCgroup(logger, "", wasmWorkerCgroup, "WASM workers")
+	supervisor.SetCgroup(workerCgroup)
+	driver.SetWorkerCgroup(workerCgroup)
 	driver.SetModuleResolver(resolver)
 	driver.SetWorkerSupervisor(supervisor)
 	driver.SetAuditCapabilityIssuer(func(sandboxID string) (string, string, error) {
@@ -66,7 +74,9 @@ func wireWasmRuntime(ctx context.Context, cfg config.Config, logger *slog.Logger
 	// driver's residentHostEnabled() stays false and every create takes the
 	// per-sandbox path. See plans/wasm-resident-module-host.md.
 	if cfg.WasmResidentHostEnabled {
-		driver.SetResidentHostSupervisor(worker.NewSupervisor(worker.DefaultResidentSpawner))
+		residentSupervisor := worker.NewSupervisor(worker.DefaultResidentSpawner)
+		residentSupervisor.SetCgroup(workerCgroup)
+		driver.SetResidentHostSupervisor(residentSupervisor)
 	}
 	if st != nil {
 		// Wrap the durable host-KV store in a per-sandbox write limiter so a
@@ -89,6 +99,13 @@ func wireWasmRuntime(ctx context.Context, cfg config.Config, logger *slog.Logger
 			_ = os.Setenv("AEROL_WASM_COMPILE_CACHE_DIR", dir)
 		}
 	}
+
+	// The WASM sandboxes the previous sandboxd left running. After the
+	// worker environment above (a restore spawns workers) and before the
+	// warm pool and the resident prewarm below: the prewarm would start a
+	// second host on a socket an adopted one serves, and the first
+	// reconcile would mark every sandbox it does not know stopped.
+	adoptRunningWasm(ctx, driver, svc, logger)
 
 	var pool *wasmpool.Pool
 	if warmPoolEffectivelyEnabled(cfg) {
@@ -168,6 +185,32 @@ func wireWasmRuntime(ctx context.Context, cfg config.Config, logger *slog.Logger
 		wasmWiringTestHook(resolver)
 	}
 	return pool
+}
+
+// wasmWorkerCgroup is the cgroup, under the cgroup v2 root, every WASM
+// worker runs in.
+const wasmWorkerCgroup = "aerolvm-wasm"
+
+// wasmBootAdopter is what boot adoption needs from the WASM driver.
+type wasmBootAdopter interface {
+	AdoptWorkers(ctx context.Context) wasmruntime.AdoptReport
+}
+
+// adoptRunningWasm takes over the workers left in the workers' cgroup, then
+// the started sandboxes they hold (service.AdoptWasmSandboxes). Time on the
+// boot path: one cgroup read, one local RPC per surviving worker and per
+// running WASM sandbox; a restore (worker gone, /work kept) costs one
+// instantiate.
+func adoptRunningWasm(ctx context.Context, driver wasmBootAdopter, svc *service.Service, logger *slog.Logger) {
+	start := time.Now()
+	workers := driver.AdoptWorkers(ctx)
+	sandboxes := svc.AdoptWasmSandboxes(ctx)
+	if workers != (wasmruntime.AdoptReport{}) || sandboxes != (service.WasmAdoptReport{}) {
+		logger.Info("wasm: running sandboxes taken over from the previous sandboxd",
+			"resident_hosts", workers.ResidentHosts, "workers", workers.Workers,
+			"adopted", sandboxes.Adopted, "restored", sandboxes.Restored, "lost", sandboxes.Lost,
+			"took", time.Since(start).String())
+	}
 }
 
 // warmPoolEffectivelyEnabled reports whether the per-sandbox WASM warm pool

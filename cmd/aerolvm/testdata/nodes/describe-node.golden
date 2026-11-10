@@ -1,0 +1,23 @@
+exit 0
+--- stdout
+Name:               wkr-1
+Node name:          worker one
+Role:               worker
+Status:             Ready,SchedulingDisabled
+Version:            v0.6.12
+Voter:              false
+Leader:             false
+Cordoned:           true
+API URL:            https://wkr-1:21212
+Internal URL:       https://wkr-1:7002
+Raft address:       -
+Data plane host:    10.0.0.11
+Public host:        -
+FSM ops version:    11
+Zone:               az-1
+Labels:             gpu=a10,zone=az-1
+Sandboxes owned:    2
+Sandboxes running:  1
+CPU reserved:       2.0 of 8.0 (25%)
+Memory reserved:    1024 MiB of 4096 MiB (25%)
+--- stderr

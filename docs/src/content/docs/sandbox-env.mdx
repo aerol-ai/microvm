@@ -261,7 +261,7 @@ Each time a server opens a sandbox's variables, it writes a `secret_open` record
   </TabItem>
 </Tabs>
 
-A record with `ref` `env:<sandbox-id>` is a read of the variables. Registry passwords and storage credentials show up under the same kind. Each record carries a fingerprint (hash) of the one before it, so a changed or deleted record breaks the chain. The server operator can also send the log to their own storage. See [Auditability](/getting-started/cluster-setup/#auditability).
+A record with `ref` `env:<sandbox-id>` is a read of the variables. Registry passwords and storage credentials show up under the same kind. Each record carries a fingerprint (hash) of the one before it, so a changed or deleted record breaks the chain. The server operator can also send the log to their own storage. See [Auditability](/engineering-audit-witness/).
 
 ## In a cluster
 

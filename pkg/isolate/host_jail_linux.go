@@ -10,21 +10,28 @@ import (
 	"syscall"
 )
 
-// applyJail realizes j for the workerd process cmd describes, before Start.
-// The parent (root) does what needs the filesystem and the cgroup tree:
+// The jail is realized in two steps, because the run dir is shared between
+// the jail and the Go side of the host:
 //
-//   - links the group's chroot from the prepared base (workerd + libs + /dev)
-//     and hands the run dir to the jail uid;
-//   - creates the group's cgroup with its caps and arranges for the child to
-//     be born inside it (UseCgroupFD);
-//   - resolves the seccomp allowlist for this architecture into a filter.
+//   - prepareJailFS builds the group's file system: it links the chroot
+//     from the prepared base (workerd + libs + /dev) and mounts a noexec
+//     tmpfs on the two writable dirs, tmp and run. It must run before the
+//     host writes its config, its controller and its sockets into run: a
+//     tmpfs mounted after them hides them, and workerd then finds no
+//     config and exits at once (T14: "workerd control socket not ready
+//     within 10s" on every jailed spawn).
+//   - applyJail does what needs the process: it creates the group's cgroup
+//     with its caps and arranges for the child to be born inside it
+//     (UseCgroupFD), resolves the seccomp allowlist into a filter, and
+//     rewrites cmd to exec the daemon binary in shim mode with the spec in
+//     its environment. The shim (shim_linux.go) does what must happen in
+//     the child between fork and exec (chroot, chdir, drop to uid/gid,
+//     no_new_privs, install the filter) and execs workerd in the chroot.
 //
-// Then it rewrites cmd to exec the daemon binary in shim mode with the spec
-// in its environment. The shim (shim_linux.go) does what must happen in the
-// child between fork and exec — chroot, chdir, drop to uid/gid, no_new_privs,
-// install the filter — and execs workerd inside the chroot. The returned
-// realized describes what was applied so Stop can tear it down.
-func applyJail(cmd *exec.Cmd, j JailConfig, workerdArgs []string) (*jailRealized, error) {
+// The returned realized describes what was applied so Stop can tear it down.
+
+// prepareJailFS checks the spec and builds the group's file system.
+func prepareJailFS(j JailConfig) (*jailRealized, error) {
 	if !runningAsRoot() {
 		return nil, errNotRoot
 	}
@@ -45,20 +52,34 @@ func applyJail(cmd *exec.Cmd, j JailConfig, workerdArgs []string) (*jailRealized
 		return nil, err
 	}
 	realized := &jailRealized{chrootBase: chrootBase, chrootDir: j.ChrootDir}
+	for _, dir := range []string{filepath.Join(j.ChrootDir, "tmp"), filepath.Join(j.ChrootDir, JailRunDirName)} {
+		if err := mountNoexecTmpfs(dir, j.UID, j.GID); err != nil {
+			_ = realized.teardown()
+			return nil, err
+		}
+		realized.noexecMounts = append(realized.noexecMounts, dir)
+	}
+	return realized, nil
+}
+
+// applyJail realizes the process half of j for the workerd process cmd
+// describes, before Start. realized is what prepareJailFS returned.
+func applyJail(cmd *exec.Cmd, j JailConfig, workerdArgs []string, realized *jailRealized) error {
+	if realized == nil {
+		return fmt.Errorf("isolate jail: file system not prepared")
+	}
 	cg := cgroupFS{root: j.CgroupRoot}
 	if cg.root == "" {
 		cg.root = DefaultCgroupRoot
 	}
 	cgDir, err := cg.ensure(j.CgroupName, j.CPUQuota, j.MemoryLimitMB, j.PidsMax)
 	if err != nil {
-		_ = removeGroupJail(chrootBase, j.ChrootDir)
-		return nil, err
+		return err
 	}
 	realized.cgroup, realized.cgroupDir = cg, cgDir
 	cgFD, err := syscall.Open(cgDir, syscall.O_RDONLY|syscall.O_DIRECTORY|syscall.O_CLOEXEC, 0)
 	if err != nil {
-		realized.teardown()
-		return nil, fmt.Errorf("isolate jail: open cgroup %s: %w", cgDir, err)
+		return fmt.Errorf("isolate jail: open cgroup %s: %w", cgDir, err)
 	}
 	realized.cgroupFD = cgFD
 
@@ -66,8 +87,7 @@ func applyJail(cmd *exec.Cmd, j JailConfig, workerdArgs []string) (*jailRealized
 	if j.SeccompMode != SeccompOff {
 		prog, realized.unknownSyscalls, err = buildSeccompProgram(seccompAuditArch(), seccompSyscallTable(), j.SeccompAllow, j.SeccompArgRules, j.SeccompMode)
 		if err != nil {
-			realized.teardown()
-			return nil, err
+			return err
 		}
 	}
 	spec := jailShimSpec{
@@ -81,8 +101,7 @@ func applyJail(cmd *exec.Cmd, j JailConfig, workerdArgs []string) (*jailRealized
 	}
 	encoded, err := encodeJailShimSpec(spec)
 	if err != nil {
-		realized.teardown()
-		return nil, err
+		return err
 	}
 	cmd.Path = j.ShimPath
 	cmd.Args = []string{j.ShimPath, JailShimFlag}
@@ -97,14 +116,7 @@ func applyJail(cmd *exec.Cmd, j JailConfig, workerdArgs []string) (*jailRealized
 	attr.CgroupFD = cgFD
 	attr.Cloneflags = jailCloneflags()
 	cmd.SysProcAttr = attr
-	for _, dir := range []string{filepath.Join(j.ChrootDir, "tmp"), filepath.Join(j.ChrootDir, JailRunDirName)} {
-		if err := mountNoexecTmpfs(dir, j.UID, j.GID); err != nil {
-			realized.teardown()
-			return nil, err
-		}
-		realized.noexecMounts = append(realized.noexecMounts, dir)
-	}
-	return realized, nil
+	return nil
 }
 
 // jailCloneflags gives each group its own PID namespace. Isolate groups

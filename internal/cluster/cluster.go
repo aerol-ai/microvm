@@ -579,6 +579,18 @@ type Member struct {
 	// the default "any" (and for older builds). It feeds the
 	// aerolvm_pat_scope_drift gauge and grants nothing.
 	PATScope string `json:"pat_scope,omitempty"`
+	// Version is the peer's gossiped sandboxd build ("bv"). Empty for a peer
+	// on a build that predates the field.
+	Version string `json:"version,omitempty"`
+	// Arch is the peer's gossiped CPU type ("ar"). Empty for a peer on a
+	// build that predates the field.
+	Arch string `json:"arch,omitempty"`
+	// Voter and Leader come from the Raft configuration and leadership, not
+	// gossip, so only a Raft server can fill them in (AnnotateRaftRoles).
+	// Both stay false for workers, ingress nodes and any member listed
+	// without a Raft view; an agent's Members() carries a server's answer.
+	Voter  bool `json:"voter,omitempty"`
+	Leader bool `json:"leader,omitempty"`
 }
 
 // LocalSandboxState is one entry in the boot-time AssertOwnership payload.

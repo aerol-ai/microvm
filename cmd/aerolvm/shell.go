@@ -55,6 +55,16 @@ func runShell(ctx context.Context, a *app, args []string) int {
 		a.usageError(c, "shell", "--new and --session contradict each other")
 		return execFailure
 	}
+	ref := ""
+	if len(pos) == 1 {
+		ref = pos[0]
+	}
+	return a.openShell(ctx, c, ref, session, fresh)
+}
+
+// openShell is shell after its flags: ref "" offers a picker. `exec -it`
+// with no command comes here too.
+func (a *app) openShell(ctx context.Context, c *commonFlags, ref, session string, fresh bool) int {
 	if !a.stdinIsTTY || !a.stdoutIsTTY {
 		a.usageError(c, "shell", "shell needs a terminal; from a script or an agent, use: aerolvm exec <sandbox> -- <command>")
 		return execFailure
@@ -64,11 +74,10 @@ func runShell(ctx context.Context, a *app, args []string) int {
 	if err != nil {
 		return a.fail(c, err, execFailure)
 	}
-	ref := ""
-	if len(pos) == 1 {
-		ref = pos[0]
-	} else if ref, err = a.pickSandbox(ctx, tools); err != nil {
-		return a.fail(c, err, execFailure)
+	if ref == "" {
+		if ref, err = a.pickSandbox(ctx, tools); err != nil {
+			return a.fail(c, err, execFailure)
+		}
 	}
 	sb, err := tools.Target(ctx, ref)
 	if err != nil {

@@ -1,0 +1,26 @@
+exit 0
+--- stdout
+rollout r-1 paused after its canary workers
+--- stderr
+aerolvm: rollout r-1 to v0.6.13 is already staging
+aerolvm: rollout r-1: staging
+aerolvm:   node srv-a (server): staged
+aerolvm:   node srv-b (server): staged
+aerolvm:   node srv-c (server): staged
+aerolvm:   node ing-1 (ingress): staged
+aerolvm:   node wkr-1 (worker): staged
+aerolvm:   node wkr-2 (worker): staged
+aerolvm:   node wkr-3 (worker): staged
+aerolvm: rollout r-1: running
+aerolvm:   node srv-a (server): upgrading
+aerolvm:   node srv-a (server): done, runs v0.6.13
+aerolvm:   node srv-b (server): upgrading
+aerolvm:   node srv-b (server): done, runs v0.6.13
+aerolvm:   node srv-c (server): upgrading
+aerolvm:   node srv-c (server): done, runs v0.6.13
+aerolvm:   node ing-1 (ingress): upgrading
+aerolvm:   node ing-1 (ingress): done, runs v0.6.13
+aerolvm:   node wkr-1 (worker): upgrading
+aerolvm:   node wkr-1 (worker): done, runs v0.6.13
+aerolvm: rollout r-1: paused
+aerolvm: check them, then: aerolvm upgrade resume (or aerolvm upgrade rollback)

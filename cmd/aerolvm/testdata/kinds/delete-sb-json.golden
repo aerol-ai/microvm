@@ -1,0 +1,16 @@
+exit 0
+--- stdout
+[
+  {
+    "destroyed": true,
+    "id": "sb-0000000000000001",
+    "name": "box"
+  },
+  {
+    "already_gone": true,
+    "destroyed": true,
+    "ref": "ghost"
+  }
+]
+--- stderr
+ghost: already gone

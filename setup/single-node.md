@@ -191,7 +191,9 @@ languages.
 | Restart Caddy | `sudo systemctl restart caddy` |
 | Re-read PAT | `grep SB_PAT_TOKEN /etc/sandboxd/sandboxd.env` |
 | Re-read Cloudflare token | `cat /etc/default/caddy` |
-| Update binaries | Re-run the installer with the same flags, then `sudo systemctl restart sandboxd`. State and certs are preserved. |
+| Upgrade | Re-run the installer with no flags; see [Upgrading](#upgrading). State and certs are preserved. |
+| Installed version | `sudo sandboxd version` |
+| Saved install options | `sudo cat /etc/sandboxd/node.json` |
 | List sandboxes | `curl -H "Authorization: Bearer $SB_PAT_TOKEN" https://sandbox.example.com/v1/sandboxes` |
 
 The systemd watchdog (`sandboxd-healthcheck.timer`) restarts the daemon only
@@ -258,24 +260,43 @@ its inclusion above.
 
 ---
 
-## Updating
+## Upgrading
 
-Re-run the installer with the same flags, then restart the daemon with
-`sudo systemctl restart sandboxd`. The state DB and certs are preserved. The
-installer restarts a running daemon on its own only when the run changed
-`/etc/sandboxd/sandboxd.env` or the unit; with the same flags neither
-changes, so the old binary keeps running until you restart it.
+Re-run the installer with no flags. It installs the latest release onto the
+same settings:
 
 ```bash
-curl -fsSL https://aerolvm.aerol.ai \
-  | sudo bash -s -- \
-      --domain sandbox.example.com \
-      --pat-token your-secret-pat \
-      --dns-provider cloudflare \
-      --dns-api-token <cloudflare-token>
+curl -fsSL https://aerolvm.aerol.ai | sudo bash
 ```
 
-To pin a version add `--version vX.Y.Z`.
+- **It remembers your options.** Each run saves every option except secrets
+  to `/etc/sandboxd/node.json` (root only). Secrets (the PAT, the Cloudflare
+  token, the S3 keys, the key-store settings) stay in
+  `/etc/sandboxd/sandboxd.env` and `/etc/default/caddy`, and a re-run reads
+  them back, so your apps keep working with the same PAT. On a server
+  installed before `node.json` existed, the first re-run reads the settings
+  back from those files once and writes `node.json`.
+- **Options you pass win over saved ones.** To pin a release, add
+  `--version vX.Y.Z` (the version is not saved, so the next plain re-run
+  goes back to the latest). To turn a saved switch such as `--with-gvisor`
+  off, set it to `false` in `node.json`.
+- **It restarts `sandboxd` onto the new binary.** When the binary, the
+  settings file or the unit changed, the installer restarts a running
+  `sandboxd`, waits until it answers, and only then starts Caddy. The state
+  DB and certs are preserved.
+- **Check the version:**
+
+  ```bash
+  sudo sandboxd version
+  ```
+
+  It prints the release, the commit and the cluster FSM op version, and
+  never starts a second daemon (`-o json` for JSON).
+
+The installer still rewrites `/etc/sandboxd/sandboxd.env` from its settings
+on every run, so a line you added there by hand is lost. Keep such settings
+in a file of your own loaded by a systemd drop-in; see
+[Installer options](https://microvm.aerol.ai/getting-started/installer-options#keep-your-own-settings).
 
 ---
 

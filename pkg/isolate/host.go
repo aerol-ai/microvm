@@ -13,9 +13,11 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/aerol-ai/microvm/pkg/egresspolicy"
+	"github.com/aerol-ai/microvm/pkg/hostproc"
 	"github.com/aerol-ai/microvm/pkg/jsbundle"
 )
 
@@ -46,6 +48,14 @@ type HostConfig struct {
 	// Logger records egress pool-exhaustion spill (no silent caps). Nil →
 	// slog.Default().
 	Logger *slog.Logger
+	// RecordDir holds the record a running host leaves for the next
+	// sandboxd (adopt.go). Empty: no record, and a sandboxd restart stops
+	// the host instead of taking it over.
+	RecordDir string
+	// Cgroup is where an unjailed workerd starts, outside sandboxd's unit,
+	// so a sandboxd restart does not stop it. A jailed workerd has its
+	// group's own cgroup instead. Nil: start in place.
+	Cgroup *hostproc.Cgroup
 }
 
 // Host owns one workerd process for an isolate group and the Go-side
@@ -85,7 +95,21 @@ type Host struct {
 	jail *jailRealized
 	// cmd/ctrlClient/servers are set once in Start and cleared in Stop; guarded
 	// by mu because Invoke reads ctrlClient while Stop nils cmd concurrently.
-	cmd           *exec.Cmd
+	cmd *exec.Cmd
+	// proc is a workerd a previous sandboxd started and this one adopted
+	// (adopt.go). It has no cmd: it is signalled through its pidfd.
+	proc hostproc.Process
+	// exited is closed once workerd has exited; one goroutine reaps it
+	// (cmd.Wait may be called only once), so both the readiness wait and
+	// Stop learn of the exit from here.
+	exited  chan struct{}
+	exitErr error
+	// pid, startTicks and bootID name workerd for the record; recordMu
+	// orders record writes.
+	pid           int
+	startTicks    uint64
+	bootID        string
+	recordMu      sync.Mutex
 	bundleSrv     *http.Server
 	egressDenySrv *http.Server
 	ctrlClient    *http.Client
@@ -212,8 +236,12 @@ func (h *Host) Load(id string, b *jsbundle.Bundle) error {
 		return err
 	}
 	h.mu.Lock()
+	_, had := h.bundles[id]
 	h.bundles[id] = b
 	h.mu.Unlock()
+	if !had {
+		h.writeRecord()
+	}
 	return nil
 }
 
@@ -232,6 +260,7 @@ func (h *Host) Unload(id string) int {
 	}
 	n := len(h.bundles)
 	h.mu.Unlock()
+	h.writeRecord()
 	return n
 }
 
@@ -246,7 +275,30 @@ func (h *Host) LoadedCount() int {
 // the Phase-3 attributed egress server on their unix sockets, spawns workerd,
 // and waits until the control socket answers.
 func (h *Host) Start(ctx context.Context) error {
+	// Fail-closed jail gate: if confinement is REQUIRED but this platform can't
+	// realize it (or the spec is incomplete), refuse to spawn rather than run
+	// untrusted tenant JS unconfined while the operator believes it is jailed.
+	// The jail's file system comes first: its tmpfs on <chroot>/run must be
+	// in place before anything below writes into the run dir (see
+	// prepareJailFS).
+	var realized *jailRealized
+	refuse := func(err error) error {
+		return fmt.Errorf("isolate: jail required but not realized here — refusing to spawn workerd unconfined (set SB_ISOLATE_USE_JAIL=false to run without a jail, accepting the risk): %w", err)
+	}
+	if h.cfg.Jail.Require {
+		var err error
+		if realized, err = prepareJailFS(h.cfg.Jail); err != nil {
+			// A refusal may come after part of the tree was linked. Drop the
+			// group tree so a failed required-jail start never leaves a
+			// half-built chroot.
+			if dir := h.cfg.Jail.ChrootDir; dir != "" {
+				_ = os.RemoveAll(dir)
+			}
+			return refuse(err)
+		}
+	}
 	if err := os.MkdirAll(h.cfg.RunDir, 0o700); err != nil {
+		_ = realized.teardown()
 		return fmt.Errorf("isolate: mkdir run dir: %w", err)
 	}
 	// Stale sockets from a crashed predecessor would make workerd's bind fail.
@@ -256,6 +308,7 @@ func (h *Host) Start(ctx context.Context) error {
 	}
 
 	if err := h.startBundleServer(); err != nil {
+		_ = realized.teardown()
 		return err
 	}
 	// The deny service (EGRESS_DENY) is always up: block-all and pool-exhausted
@@ -263,36 +316,34 @@ func (h *Host) Start(ctx context.Context) error {
 	// driver assigns a slot (SetEgressPolicy), so an idle group holds none.
 	if err := h.startEgressDenyServer(); err != nil {
 		_ = h.stopServers()
+		_ = realized.teardown()
 		return err
 	}
 
 	if err := h.writeConfig(); err != nil {
 		_ = h.stopServers()
+		_ = realized.teardown()
 		return err
 	}
 
 	configPath := filepath.Join(h.cfg.RunDir, "config.capnp")
 	workerdArgs := []string{"serve", "--experimental", h.inJail(configPath)}
-	cmd := exec.Command(h.cfg.WorkerdPath, workerdArgs...)
-	cmd.Dir = h.cfg.RunDir
-	cmd.Stdout = os.Stderr
-	cmd.Stderr = os.Stderr
-	// Fail-closed jail gate: if confinement is REQUIRED but this platform can't
-	// realize it (or the spec is incomplete), refuse to spawn rather than run
-	// untrusted tenant JS unconfined while the operator believes it is jailed.
-	var realized *jailRealized
+	newCmd := func() *exec.Cmd {
+		c := exec.Command(h.cfg.WorkerdPath, workerdArgs...)
+		c.Dir = h.cfg.RunDir
+		// Straight to sandboxd's stderr (the journal), never a pipe
+		// sandboxd reads: workerd outlives sandboxd and must not get
+		// SIGPIPE when it is gone.
+		c.Stdout = os.Stderr
+		c.Stderr = os.Stderr
+		return c
+	}
+	cmd := newCmd()
 	if h.cfg.Jail.Require {
-		var err error
-		realized, err = applyJail(cmd, h.cfg.Jail, workerdArgs)
-		if err != nil {
+		if err := applyJail(cmd, h.cfg.Jail, workerdArgs, realized); err != nil {
 			_ = h.stopServers()
-			// MkdirAll(RunDir) may have created <chroot>/run before applyJail
-			// refused (non-root, missing shim, …). Drop the group tree so a
-			// failed required-jail start never leaves a half-built chroot.
-			if dir := h.cfg.Jail.ChrootDir; dir != "" {
-				_ = os.RemoveAll(dir)
-			}
-			return fmt.Errorf("isolate: jail required but not realized here — refusing to spawn workerd unconfined (set SB_ISOLATE_USE_JAIL=false to run without a jail, accepting the risk): %w", err)
+			_ = realized.teardown()
+			return refuse(err)
 		}
 		if len(realized.unknownSyscalls) > 0 {
 			h.logger.Info("isolate jail: allowlist names absent on this architecture (skipped)", "group", h.cfg.GroupKey, "syscalls", realized.unknownSyscalls)
@@ -305,25 +356,44 @@ func (h *Host) Start(ctx context.Context) error {
 			return err
 		}
 	}
-	if err := cmd.Start(); err != nil {
+	var startErr error
+	if !h.cfg.Jail.Require && h.cfg.Cgroup != nil {
+		// Unjailed, workerd would be sandboxd's child in sandboxd's cgroup
+		// and die with every restart; it starts in the hosts' cgroup.
+		cmd, startErr = h.cfg.Cgroup.Start(func() (*exec.Cmd, error) { return newCmd(), nil })
+	} else {
+		startErr = cmd.Start()
+	}
+	if startErr != nil {
 		realized.closeFD()
 		_ = realized.teardown()
 		_ = h.stopServers()
-		return fmt.Errorf("isolate: start workerd: %w", err)
+		return fmt.Errorf("isolate: start workerd: %w", startErr)
 	}
 	realized.closeFD()
+	h.noteProcess(cmd.Process.Pid)
+	exited := make(chan struct{})
 	client := unixHTTPClient(h.controlSock)
 	h.mu.Lock()
 	h.cmd = cmd
+	h.exited = exited
 	h.jail = realized
 	h.ctrlClient = client
 	h.mu.Unlock()
+	go func() {
+		err := cmd.Wait()
+		h.mu.Lock()
+		h.exitErr = err
+		h.mu.Unlock()
+		close(exited)
+	}()
 
-	if err := h.waitReady(ctx, cmd, client); err != nil {
+	if err := h.waitReady(ctx, exited, client); err != nil {
 		_ = h.Stop()
 		return err
 	}
 	h.started.Store(true)
+	h.writeRecord()
 	return nil
 }
 
@@ -385,10 +455,13 @@ func (h *Host) startBundleServer() error {
 	return nil
 }
 
-// waitReady polls the control socket until the controller answers. cmd and
-// client are passed in (not read from the struct) so this runs entirely on
-// startup-local state — no lock needed and no race with a later Invoke/Stop.
-func (h *Host) waitReady(ctx context.Context, cmd *exec.Cmd, client *http.Client) error {
+// waitReady polls the control socket until the controller answers. exited
+// and client are passed in (not read from the struct) so this runs entirely
+// on startup-local state — no lock needed and no race with a later
+// Invoke/Stop. A workerd that exits stops the wait at once: before, the
+// wait read cmd.ProcessState, which only Wait sets, so an exit was never
+// seen and every failed start cost the full timeout with no cause.
+func (h *Host) waitReady(ctx context.Context, exited <-chan struct{}, client *http.Client) error {
 	deadline := time.Now().Add(h.cfg.StartTimeout)
 	// A readiness probe carries a sentinel id the provider will 404 on; a 502
 	// (load failed) still proves the controller is serving, which is all we
@@ -397,19 +470,31 @@ func (h *Host) waitReady(ctx context.Context, cmd *exec.Cmd, client *http.Client
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, "http://ctrl/", nil)
-		req.Header.Set("x-sb-id", "__readiness__")
-		resp, err := client.Do(req)
-		if err == nil {
-			_ = resp.Body.Close()
+		if probeControl(ctx, client) == nil {
 			return nil
 		}
-		if cmd.ProcessState != nil && cmd.ProcessState.Exited() {
-			return fmt.Errorf("isolate: workerd exited during startup")
+		select {
+		case <-exited:
+			h.mu.RLock()
+			err := h.exitErr
+			h.mu.RUnlock()
+			return fmt.Errorf("isolate: workerd exited during startup (%v); its output is in sandboxd's log", err)
+		case <-time.After(10 * time.Millisecond):
 		}
-		time.Sleep(10 * time.Millisecond)
 	}
 	return fmt.Errorf("isolate: workerd control socket not ready within %s", h.cfg.StartTimeout)
+}
+
+// probeControl asks the controller for a sentinel id. Any HTTP answer means
+// the controller serves.
+func probeControl(ctx context.Context, client *http.Client) error {
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, "http://ctrl/", nil)
+	req.Header.Set("x-sb-id", "__readiness__")
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	return resp.Body.Close()
 }
 
 // Invoke proxies an HTTP request to the sandbox identified by id. The caller's
@@ -460,16 +545,30 @@ func (h *Host) stopServers() error {
 
 // Stop kills the workerd process and tears down the host servers. Idempotent.
 func (h *Host) Stop() error {
+	// The record goes before workerd does, so a sandboxd that dies in
+	// between finds an unrecorded workerd at boot and kills it rather than
+	// adopting a host that is being stopped.
+	h.removeRecord()
 	h.started.Store(false)
 	h.mu.Lock()
 	cmd := h.cmd
+	proc := h.proc
+	exited := h.exited
 	jail := h.jail
 	h.cmd = nil
+	h.proc = nil
 	h.jail = nil
 	h.mu.Unlock()
 	if cmd != nil && cmd.Process != nil {
 		_ = cmd.Process.Kill()
-		_, _ = cmd.Process.Wait()
+		if exited != nil {
+			<-exited
+		}
+	}
+	if proc != nil {
+		_ = proc.Signal(syscall.SIGKILL)
+		<-proc.Done()
+		_ = proc.Close()
 	}
 	err := h.stopServers()
 	if jail != nil {

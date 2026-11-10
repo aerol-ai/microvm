@@ -1,0 +1,28 @@
+exit 0
+--- stdout
+Rollout:         r-1 (upgrade)
+State:           staging
+Target:          v0.6.13, from v0.6.12
+Source:          upload
+Started by:      operator
+Settings:        batch 10%, node timeout 10m0s, hold
+Active version:  v0.6.12
+Created:         2026-11-07T10:00:01Z
+Updated:         2026-11-07T10:00:01Z
+
+ORDER   NODE    ROLE      ARCH    BATCH   STATE     VERSION   NOTE
+1       srv-a   server    amd64   -       pending   v0.6.12   -
+2       srv-b   server    amd64   -       pending   v0.6.12   -
+3       srv-c   server    amd64   -       pending   v0.6.12   -
+4       ing-1   ingress   amd64   -       pending   v0.6.12   -
+5       wkr-1   worker    amd64   1       pending   v0.6.12   -
+6       wkr-2   worker    amd64   1       skipped   v0.6.12   down when its turn came
+7       wkr-3   worker    amd64   1       manual    v0.6.12   remote upgrade is off
+
+Skipped nodes were down when their turn came, and finalize waits for them. For each one:
+  start it again: it stays cordoned, the leader upgrades it, then uncordons it; or
+  delete it: aerolvm delete node wkr-2
+
+These nodes take no upgrade over the API (SB_REMOTE_UPGRADE=false). Run this on each, as root:
+  wkr-3: sudo sandboxd upgrade node v0.6.13 --sha256 sandboxd_linux_amd64=169ef2fd27b0f984408ea500a8ef8446cf7cf301b86d178fbd66d372574d3c94
+--- stderr

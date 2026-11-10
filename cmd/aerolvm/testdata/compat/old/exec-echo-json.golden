@@ -1,0 +1,9 @@
+exit 0
+--- stdout
+{
+  "exit_code": 0,
+  "stdout": "hi\n",
+  "stderr": "",
+  "duration_ms": 0
+}
+--- stderr

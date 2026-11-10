@@ -1,0 +1,4 @@
+exit 0
+--- stdout
+snap-1
+--- stderr

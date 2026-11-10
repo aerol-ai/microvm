@@ -86,6 +86,8 @@ BENCH_ONLY=0
 DESTROY_ONLY=0
 OBS_SNAPSHOT_ONLY=0
 UPGRADE_FROM=""
+UPGRADE_NODE=0
+ADOPT_FROM=""
 SCENARIO=""
 # PID of the local-mode SSH port-forward, so teardown can reap it. Without this
 # the `ssh -fN` forks leak: each leftover keeps local :21212 bound, so the next
@@ -139,20 +141,46 @@ while [[ $# -gt 0 ]]; do
       UPGRADE_FROM="$1"
       ;;
     --upgrade-from=*) UPGRADE_FROM="${arg#--upgrade-from=}" ;;
+    # With --upgrade-from: upgrade through `sandboxd upgrade node` instead of
+    # the install.sh re-run (upgrade-gate.sh --upgrade-node).
+    --upgrade-node) UPGRADE_NODE=1 ;;
+    # The adopt half of the one-line join gate (plans/kubectl-style-cluster-
+    # ops.md §4.4): provision on an OLD tag with the old scripts, move every
+    # node to the local build, `sandboxd adopt`, then join a blank node with
+    # one line. Delegates to adopt-gate.sh, like --upgrade-from.
+    --adopt-from)
+      shift
+      [[ $# -gt 0 ]] || { echo "--adopt-from needs a release tag (e.g. --adopt-from v0.6.11)" >&2; exit 2; }
+      ADOPT_FROM="$1"
+      ;;
+    --adopt-from=*) ADOPT_FROM="${arg#--adopt-from=}" ;;
     -*) echo "unknown flag: $arg" >&2; exit 2 ;;
     *) SCENARIO="$arg" ;;
   esac
   shift
 done
-[[ -n "$SCENARIO" ]] || { echo "usage: run.sh <scenario|all> [--keep] [--prod-tls] [--metal-on-demand] [--no-disruptive] [--collect-logs-only] [--bench-only] [--destroy-only] [--obs-snapshot-only] [--released|--version <tag>] [--upgrade-from <tag>] [--no-build]" >&2; exit 2; }
+[[ -n "$SCENARIO" ]] || { echo "usage: run.sh <scenario|all> [--keep] [--prod-tls] [--metal-on-demand] [--no-disruptive] [--collect-logs-only] [--bench-only] [--destroy-only] [--obs-snapshot-only] [--released|--version <tag>] [--upgrade-from <tag> [--upgrade-node]] [--adopt-from <tag>] [--no-build]" >&2; exit 2; }
+if [[ "$UPGRADE_NODE" == 1 && -z "${UPGRADE_FROM:-}" ]]; then
+  echo "--upgrade-node is a way to run the --upgrade-from gate; give --upgrade-from <tag> too" >&2
+  exit 2
+fi
+GATE_ARGS=()
+[[ "$UPGRADE_NODE" == 1 ]] && GATE_ARGS+=(--upgrade-node)
 # --upgrade-from hands off to the warm-upgrade gate before any normal
 # provisioning. It runs its own old-tag provision and teardown, so returning
 # here afterwards would double-provision; exec replaces this process.
 if [[ -n "${UPGRADE_FROM:-}" ]]; then
   if [[ "$KEEP" == 1 ]]; then
-    exec "${HERE}/upgrade-gate.sh" "$SCENARIO" --from "$UPGRADE_FROM" --keep
+    exec "${HERE}/upgrade-gate.sh" "$SCENARIO" --from "$UPGRADE_FROM" --keep ${GATE_ARGS[@]+"${GATE_ARGS[@]}"}
   else
-    exec "${HERE}/upgrade-gate.sh" "$SCENARIO" --from "$UPGRADE_FROM"
+    exec "${HERE}/upgrade-gate.sh" "$SCENARIO" --from "$UPGRADE_FROM" ${GATE_ARGS[@]+"${GATE_ARGS[@]}"}
+  fi
+fi
+if [[ -n "${ADOPT_FROM:-}" ]]; then
+  if [[ "$KEEP" == 1 ]]; then
+    exec "${HERE}/adopt-gate.sh" "$SCENARIO" --from "$ADOPT_FROM" --keep
+  else
+    exec "${HERE}/adopt-gate.sh" "$SCENARIO" --from "$ADOPT_FROM"
   fi
 fi
 # A pinned tag and "reuse the last local build" describe different artifact
@@ -183,6 +211,77 @@ CONFIG_CLUSTER="${REPO_ROOT}/config/cluster.yml"
 # var-file (chained second) overrides only topology/identity/tags/cert-storage.
 # Terraform applies multiple -var-file in order, last value wins per variable.
 PROD_TFVARS="${REPO_ROOT}/config/terraform.tfvars"
+
+# uses_module_url: the scenario provisions through the module fetched by URL
+# (its caps list module-url), not through Terraform/root.
+uses_module_url() {
+  local caps="${HERE}/scenarios/${1}.caps.yml"
+  [[ -f "$caps" ]] && [[ "$(yq -r '.capabilities | contains(["module-url"])' "$caps")" == "true" ]]
+}
+
+# tf_root echoes the root module directory Terraform runs in for a scenario.
+# Terraform/ is a module, used by URL (plans/kubectl-style-cluster-ops.md
+# §7). Terraform/root is the root a checkout runs: it calls the module by
+# path and passes every variable through, so every scenario renders the same
+# user data it did when Terraform/ was the root. A module-url scenario runs
+# a root of its own, made by prepare_module_root.
+tf_root() {
+  if uses_module_url "$1"; then
+    printf '%s\n' "${HERE}/.tf/${1}/root"
+  else
+    printf '%s\n' "${REPO_ROOT}/Terraform/root"
+  fi
+}
+
+# prepare_module_root makes a module-url scenario's root: a folder of .tf
+# files only, whose module block fetches Terraform/ by git URL, the way an
+# operator with no checkout uses it. Nothing in it points back into the
+# repo: config_dir is passed as an absolute path, and the module brings its
+# own templates. It is Terraform/root's files without the moved blocks (a
+# new root has no old state to move) and with one_line_join left to the
+# module's default.
+#
+# The URL is AEROL_TF_MODULE_SOURCE when set (for example
+# git::https://github.com/aerol-ai/microvm//Terraform?ref=v0.6.13 once a
+# release has it). Otherwise it is a bare clone of this checkout's current
+# branch at its COMMITTED head, so commit Terraform/ changes before a run.
+prepare_module_root() {
+  local scenario="$1"
+  local sdir="${HERE}/.tf/${scenario}"
+  local root="${sdir}/root"
+  local src="${AEROL_TF_MODULE_SOURCE:-}"
+  if [[ -z "$src" ]]; then
+    local bare="${sdir}/module.git" ref
+    ref="$(git -C "$REPO_ROOT" symbolic-ref --short -q HEAD || true)"
+    [[ -n "$ref" ]] || ref="itest-${scenario}"
+    rm -rf "$bare"
+    mkdir -p "$sdir"
+    git init -q --bare "$bare"
+    git -C "$REPO_ROOT" push -q --force "$bare" "HEAD:refs/heads/${ref}"
+    src="git::file://${bare}//Terraform?ref=${ref}"
+  fi
+  # A stale download of the module would hide a new commit under the same ref.
+  rm -rf "$root" "${sdir}/modules"
+  mkdir -p "$root"
+  local f
+  for f in backend.tf providers.tf versions.tf variables.tf outputs.tf; do
+    cp "${REPO_ROOT}/Terraform/root/${f}" "${root}/${f}"
+  done
+  awk -v src="$src" '$0 == "  source = \"../\"" { print "  source = \"" src "\""; next } { print }' \
+    "${REPO_ROOT}/Terraform/root/main.tf" > "${root}/main.tf"
+  if ! grep -qF "source = \"${src}\"" "${root}/main.tf"; then
+    echo "module-url: could not set the module source in ${root}/main.tf" >&2
+    return 1
+  fi
+  cat > "${root}/join.tf" <<'EOF'
+# null leaves one_line_join to the module's default: one-line joins.
+variable "one_line_join" {
+  type    = bool
+  default = null
+}
+EOF
+  echo "module-url: ${scenario} runs the module from ${src}"
+}
 
 # tf_varfile_args echoes the ordered -var-file flags shared by apply + destroy.
 # When run_one has emitted a persistent-cert-store override for this scenario
@@ -376,7 +475,7 @@ EOF
 witness_bucket_of() {
   local scenario="$1" bucket
   bucket=$(TF_DATA_DIR="${REPO_ROOT}/integration-tests/.tf/${scenario}" \
-    terraform -chdir="${REPO_ROOT}/Terraform" output -raw audit_witness_bucket 2>/dev/null) || bucket=""
+    terraform -chdir="$(tf_root "$scenario")" output -raw audit_witness_bucket 2>/dev/null) || bucket=""
   # A bucket name or nothing: a terraform warning must never reach the aws
   # CLI as a bucket to empty.
   if [[ "$bucket" =~ ^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$ ]]; then
@@ -415,6 +514,22 @@ EOF
   return 1
 }
 
+# tf_init_for_teardown points the scenario's data dir at its root and state
+# before a teardown reads outputs or destroys. A --destroy-only run may find
+# the data dir set up for another root: a stack kept from before
+# Terraform/root, or a module-url root that is gone. Init is idempotent, and
+# Terraform/root's moved blocks carry an old stack's state into the module
+# before the destroy plans.
+tf_init_for_teardown() {
+  local scenario="$1"
+  if uses_module_url "$scenario" && [[ ! -f "$(tf_root "$scenario")/main.tf" ]]; then
+    prepare_module_root "$scenario" || return 1
+  fi
+  TF_DATA_DIR="${REPO_ROOT}/integration-tests/.tf/${scenario}" \
+    terraform -chdir="$(tf_root "$scenario")" init -reconfigure -input=false \
+    -backend-config="key=integration/${scenario}/terraform.tfstate" >/dev/null
+}
+
 # destroy_scenario runs terraform destroy with the exact variable set the
 # scenario applied with.
 destroy_scenario() {
@@ -427,7 +542,7 @@ destroy_scenario() {
   fi
   # shellcheck disable=SC2046
   TF_DATA_DIR="${REPO_ROOT}/integration-tests/.tf/${scenario}" \
-    terraform -chdir="${REPO_ROOT}/Terraform" destroy -auto-approve -input=false \
+    terraform -chdir="$(tf_root "$scenario")" destroy -auto-approve -input=false \
     $(tf_varfile_args "$scenario") ${admin[@]+"${admin[@]}"} \
     $(download_mirror_tfvar_args) \
     -var="config_dir=${REPO_ROOT}/integration-tests/.tf/${scenario}/config" \
@@ -457,6 +572,8 @@ teardown() {
   # instances and their role grants are gone and nothing can write to it.
   # A failed first emptying is not retried: it already said why.
   local witness emptied=0 destroyed=0
+  tf_init_for_teardown "$scenario" ||
+    echo "teardown: terraform init for ${scenario} failed; the destroy below may fail too" >&2
   witness=$(witness_bucket_of "$scenario")
   if [[ -n "$witness" ]] && empty_witness_bucket "$scenario" "$witness"; then
     emptied=1
@@ -694,7 +811,7 @@ terraform_state_domain() {
   local scenario="$1" sdir domain
   sdir="${REPO_ROOT}/integration-tests/.tf/${scenario}"
   [[ -d "$sdir" ]] || return 1
-  domain=$(TF_DATA_DIR="$sdir" terraform -chdir="${REPO_ROOT}/Terraform" \
+  domain=$(TF_DATA_DIR="$sdir" terraform -chdir="$(tf_root "$scenario")" \
     output -json integration_targets 2>/dev/null | jq -r '.domain // empty' 2>/dev/null) || return 1
   [[ -n "$domain" && "$domain" != "null" ]] || return 1
   echo "$domain"
@@ -1107,6 +1224,13 @@ EOF
       else
         need_local+=(cluster_sign_node_script_url)
       fi
+      # The release's own Caddy. Without it an older install.sh downloads
+      # releases/latest/caddy_linux_amd64 and checks it against this
+      # release's checksums.txt, which fails as soon as a newer release ships
+      # (the adopt gate's v0.6.11 base, the day v0.6.12 came out).
+      if curl -fsIL -o /dev/null --max-time 20 "${base}/caddy_linux_amd64"; then
+        printf 'caddy_binary_url = "%s"\n' "${base}/caddy_linux_amd64" >>"$out"
+      fi
       if grep -Eq '^[[:space:]]*audit_receiver_enabled[[:space:]]*=[[:space:]]*true' "${HERE}/scenarios/${scenario}.tfvars"; then
         need_local+=(audit_receiver_url)
       fi
@@ -1512,13 +1636,17 @@ run_one() {
   fi
   ln -sf "${REPO_ROOT}/config/secrets.yml" "${overlay}/secrets.yml"
 
+  if uses_module_url "$scenario"; then
+    prepare_module_root "$scenario"
+  fi
+
   trap "teardown '${scenario}'" EXIT INT TERM
 
   echo "=== provisioning ${scenario} (domain=${leased:-none}) ==="
-  TF_DATA_DIR="$sdir" tf_init_failover -chdir="${REPO_ROOT}/Terraform" init -reconfigure -input=false \
+  TF_DATA_DIR="$sdir" tf_init_failover -chdir="$(tf_root "$scenario")" init -reconfigure -input=false \
     -backend-config="key=${state_key}"
   # shellcheck disable=SC2046
-  TF_DATA_DIR="$sdir" terraform -chdir="${REPO_ROOT}/Terraform" apply -auto-approve -input=false \
+  TF_DATA_DIR="$sdir" terraform -chdir="$(tf_root "$scenario")" apply -auto-approve -input=false \
     $(tf_varfile_args "$scenario") \
     $(download_mirror_tfvar_args) \
     -var="config_dir=${overlay}" \
@@ -1528,7 +1656,7 @@ run_one() {
 
   # Discover endpoint.
   local targets base_url pat grafana_url pushgateway_url
-  targets=$(TF_DATA_DIR="$sdir" terraform -chdir="${REPO_ROOT}/Terraform" output -json integration_targets)
+  targets=$(TF_DATA_DIR="$sdir" terraform -chdir="$(tf_root "$scenario")" output -json integration_targets)
   grafana_url=$(echo "$targets" | jq -r '.grafana_url // ""')
   pushgateway_url=$(echo "$targets" | jq -r '.pushgateway_url // ""')
   pat=$(yq -r '.cluster.pat_token' "${REPO_ROOT}/config/secrets.yml")
@@ -1771,7 +1899,7 @@ run_one() {
   # rewrite.
   local witness_bucket witness_prefix witness_region
   witness_bucket=$(witness_bucket_of "$scenario")
-  witness_prefix=$(TF_DATA_DIR="$sdir" terraform -chdir="${REPO_ROOT}/Terraform" \
+  witness_prefix=$(TF_DATA_DIR="$sdir" terraform -chdir="$(tf_root "$scenario")" \
     output -raw audit_witness_prefix 2>/dev/null) || witness_prefix=""
   witness_region=$(tfvar_from_files aws_region "$PROD_TFVARS" "$tfvars_file" "${sdir}/override.tfvars")
   # The suite's own AWS calls (those witness reads and plants, and the EC2
@@ -1798,9 +1926,9 @@ run_one() {
   # the scenario exports to S3.
   local audit_export_bucket="" audit_export_prefix=""
   if [[ "$caps_audit_export_s3" == "true" ]]; then
-    audit_export_bucket=$(TF_DATA_DIR="$sdir" terraform -chdir="${REPO_ROOT}/Terraform" \
+    audit_export_bucket=$(TF_DATA_DIR="$sdir" terraform -chdir="$(tf_root "$scenario")" \
       output -raw audit_export_bucket 2>/dev/null) || audit_export_bucket=""
-    audit_export_prefix=$(TF_DATA_DIR="$sdir" terraform -chdir="${REPO_ROOT}/Terraform" \
+    audit_export_prefix=$(TF_DATA_DIR="$sdir" terraform -chdir="$(tf_root "$scenario")" \
       output -raw audit_export_prefix 2>/dev/null) || audit_export_prefix=""
   fi
 
@@ -1987,7 +2115,7 @@ collect_logs_only() {
     exit 2
   fi
   local targets pat caps_domain
-  targets=$(TF_DATA_DIR="$sdir" terraform -chdir="${REPO_ROOT}/Terraform" output -json integration_targets 2>/dev/null) \
+  targets=$(TF_DATA_DIR="$sdir" terraform -chdir="$(tf_root "$scenario")" output -json integration_targets 2>/dev/null) \
     || { echo "could not read integration_targets from ${sdir} — is the cluster still up?" >&2; exit 2; }
   pat=$(yq -r '.cluster.pat_token' "${REPO_ROOT}/config/secrets.yml")
   caps_domain=$(yq -r '.capabilities | contains(["domain"])' "$caps_file" 2>/dev/null || echo true)
@@ -2054,7 +2182,7 @@ bench_cluster_ready() {
   local sdir="${REPO_ROOT}/integration-tests/.tf/${scenario}"
   [[ -d "$sdir" ]] || return 1
   local targets pat base_url
-  targets=$(TF_DATA_DIR="$sdir" terraform -chdir="${REPO_ROOT}/Terraform" output -json integration_targets 2>/dev/null) \
+  targets=$(TF_DATA_DIR="$sdir" terraform -chdir="$(tf_root "$scenario")" output -json integration_targets 2>/dev/null) \
     || return 1
   base_url=$(echo "$targets" | jq -r '.base_url // empty')
   [[ -n "$base_url" ]] || return 1
@@ -2079,7 +2207,7 @@ run_bench_only() {
   fi
 
   local targets pat base_url leased
-  targets=$(TF_DATA_DIR="$sdir" terraform -chdir="${REPO_ROOT}/Terraform" output -json integration_targets 2>/dev/null) \
+  targets=$(TF_DATA_DIR="$sdir" terraform -chdir="$(tf_root "$scenario")" output -json integration_targets 2>/dev/null) \
     || { echo "could not read integration_targets from ${sdir} — is the cluster still up?" >&2; exit 2; }
   pat=$(yq -r '.cluster.pat_token' "${REPO_ROOT}/config/secrets.yml")
   base_url=$(echo "$targets" | jq -r '.base_url // empty')
@@ -2124,7 +2252,7 @@ run_obs_snapshot_only() {
     exit 2
   fi
   local targets grafana_url obs_ip pw
-  targets=$(TF_DATA_DIR="$sdir" terraform -chdir="${REPO_ROOT}/Terraform" output -json integration_targets 2>/dev/null) \
+  targets=$(TF_DATA_DIR="$sdir" terraform -chdir="$(tf_root "$scenario")" output -json integration_targets 2>/dev/null) \
     || { echo "could not read integration_targets" >&2; exit 2; }
   grafana_url=$(echo "$targets" | jq -r '.grafana_url // empty')
   obs_ip=$(echo "$targets" | jq -r '.obs_public_ip // empty')
@@ -2132,7 +2260,7 @@ run_obs_snapshot_only() {
     echo "obs not deployed for ${scenario} (grafana_url/obs_public_ip empty)" >&2
     exit 2
   fi
-  pw=$(TF_DATA_DIR="$sdir" terraform -chdir="${REPO_ROOT}/Terraform" output -raw grafana_admin_password 2>/dev/null || true)
+  pw=$(TF_DATA_DIR="$sdir" terraform -chdir="$(tf_root "$scenario")" output -raw grafana_admin_password 2>/dev/null || true)
   local out_dir="${HERE}/reports/obs"
   mkdir -p "$out_dir"
   local uids=(

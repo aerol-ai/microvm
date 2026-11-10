@@ -1,0 +1,4 @@
+exit 0
+--- stdout
+--- stderr
+aerolvm: revoked tok_aaaaaaaaaaaa; it no longer works anywhere once every node has synced (seconds)

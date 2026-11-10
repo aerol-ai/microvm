@@ -297,7 +297,14 @@ func TestClusterScenariosDeclareExpectedMembers(t *testing.T) {
 			t.Errorf("%s has no nodes map", filepath.Base(tfvars))
 			continue
 		}
-		nodes := len(nodeRe.FindAllString(body[start:], -1))
+		// A blank node (nodes[].blank) is plain Ubuntu, never a member until
+		// a case joins it, so it is not counted.
+		nodes := 0
+		for _, line := range strings.Split(body[start:], "\n") {
+			if nodeRe.MatchString(line) && !regexp.MustCompile(`\bblank\s*=\s*true\b`).MatchString(line) {
+				nodes++
+			}
+		}
 		if got := m[1]; got != itoa(nodes) {
 			t.Errorf("%s: expected_members = %s but the node map has %d entries", base, got, nodes)
 		}
@@ -314,4 +321,80 @@ func itoa(n int) string {
 		n /= 10
 	}
 	return string(b)
+}
+
+// short-node-certs and SB_CLUSTER_NODE_CERT_TTL go together. UC-623 waits
+// for node certs to renew, which takes 10-minute certs. A scenario that
+// declares the capability without the setting fails UC-623 on a 90-day cert
+// (cluster-rollout-join did, when the capability was folded into
+// one-line-join); one that sets it without the capability skips the case it
+// was built for.
+func TestShortNodeCertScenariosSetTheTTL(t *testing.T) {
+	ttlRe := regexp.MustCompile(`(?m)^\s*SB_CLUSTER_NODE_CERT_TTL\s*=\s*"[0-9]+m"\s*$`)
+	checked := 0
+	for _, f := range capsFiles(t) {
+		declared := false
+		for _, c := range capsList(t, f) {
+			if c == "short-node-certs" {
+				declared = true
+			}
+		}
+		tfvars := strings.TrimSuffix(f, ".caps.yml") + ".tfvars"
+		raw, err := os.ReadFile(tfvars)
+		if err != nil {
+			t.Fatal(err)
+		}
+		set := ttlRe.Match(raw)
+		switch {
+		case declared && !set:
+			t.Errorf("%s declares short-node-certs but %s does not set SB_CLUSTER_NODE_CERT_TTL in minutes: UC-623 would wait on a 90-day cert",
+				filepath.Base(f), filepath.Base(tfvars))
+		case set && !declared:
+			t.Errorf("%s sets SB_CLUSTER_NODE_CERT_TTL but %s does not declare short-node-certs, so UC-623 skips where it could run",
+				filepath.Base(tfvars), filepath.Base(f))
+		}
+		if declared {
+			checked++
+		}
+	}
+	if checked == 0 {
+		t.Fatal("no scenario declares short-node-certs; this guard would pass having checked nothing")
+	}
+}
+
+// spare-server and a blank spare-server node go together: UC-694 joins that
+// machine as a late server. A scenario that declares the capability without
+// the machine fails UC-694 on a node that is not there; one with the machine
+// but not the capability pays for a node no case uses.
+func TestSpareServerScenariosHaveTheMachine(t *testing.T) {
+	nodeRe := regexp.MustCompile(`(?m)^\s*spare-server\s*=\s*\{([^}]*)\}`)
+	checked := 0
+	for _, f := range capsFiles(t) {
+		declared := false
+		for _, c := range capsList(t, f) {
+			if c == "spare-server" {
+				declared = true
+			}
+		}
+		tfvars := strings.TrimSuffix(f, ".caps.yml") + ".tfvars"
+		raw, err := os.ReadFile(tfvars)
+		if err != nil {
+			t.Fatal(err)
+		}
+		m := nodeRe.FindSubmatch(raw)
+		switch {
+		case declared && m == nil:
+			t.Errorf("%s declares spare-server but %s has no spare-server node", filepath.Base(f), filepath.Base(tfvars))
+		case declared && (!regexp.MustCompile(`role\s*=\s*"server"`).Match(m[1]) || !regexp.MustCompile(`blank\s*=\s*true`).Match(m[1])):
+			t.Errorf("%s: spare-server must be role = \"server\" and blank = true: %s", filepath.Base(tfvars), m[1])
+		case !declared && m != nil:
+			t.Errorf("%s has a spare-server node but %s does not declare spare-server, so UC-694 skips where it could run", filepath.Base(tfvars), filepath.Base(f))
+		}
+		if declared {
+			checked++
+		}
+	}
+	if checked == 0 {
+		t.Fatal("no scenario declares spare-server; this guard would pass having checked nothing")
+	}
 }

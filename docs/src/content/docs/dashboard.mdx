@@ -1,149 +1,180 @@
 ---
 title: Dashboard
-description: Open the built-in web page that shows node health, cluster members, sandbox placements and server metrics.
+description: A web page on every node that shows node health, the nodes in your cluster, where each sandbox runs, and server metrics.
 ---
 
 import { Aside } from '@astrojs/starlight/components';
 
-Every AerolVM server has a built-in dashboard for operators. It is one web page, served by `sandboxd` (the AerolVM server program) itself. You sign in with your `SB_PAT_TOKEN` (the server's access token), an admin API token, or, when [access control](/enterprise/sso/) is on, your company account. The page then shows server health, the nodes in your cluster, where each sandbox runs, and the server's internal counters.
+The **dashboard** is a web page for operators. It shows the health of a node, the nodes in your cluster, where each sandbox runs, and the server's counters.
 
-There is nothing to install. If the server is running, the dashboard is there.
+`sandboxd` is the AerolVM program on each node. It serves the dashboard itself. There is nothing to install. If `sandboxd` runs, the dashboard is there.
+
+## Words to know
+
+| Word | What it means |
+|---|---|
+| **Node** | One machine that runs `sandboxd`. A one-server install has one node. |
+| **Admin token** | The password in `SB_PAT_TOKEN`. It can do everything. The dashboard calls it "Server token". |
+| **API token** | A token that starts with `avm_`. You make one with `aerolvm token create`. Each one has a role. |
+| **Role** | What a person or token is allowed to do: `admin`, `viewer`, `runner` or `auditor`. |
+| **Company sign-in** | Signing in with your work account. It needs [access control](/enterprise/sso/) on. The page also calls it SSO (single sign-on). |
+| **Sign-in provider** | The service that holds your work accounts, such as Okta, Entra ID or Google. |
+| **API domain** | The domain name your apps use to reach AerolVM, set in `SB_DOMAIN`. In a cluster, it is the cluster address. |
 
 ## Open the dashboard
 
-Add `/ui` to the same address your SDKs and the CLI use, on the API port (21212 by default):
+Add `/ui` to the node's address, on the API port. The API port is `21212`, unless you changed `SB_API_PORT`.
 
 ```text
-http://<server-host>:21212/ui
+http://<node-address>:21212/ui
 ```
 
-On your own computer, that is `http://localhost:21212/ui`.
+On your own computer, open `http://localhost:21212/ui`.
 
-The server also prints the address when it starts. Look for these lines in its log:
+`sandboxd` also prints the address when it starts. Look for these lines in its log:
 
 ```text
 time=... level=INFO msg="starting sandboxd" version=... addr=0.0.0.0:21212
 time=... level=INFO msg="dashboard available" url=http://0.0.0.0:21212/ui
 ```
 
-The log is at `~/.aerolvm/logs/sandboxd.log` on macOS. On Linux, read it with `journalctl -u sandboxd`.
+| Where `sandboxd` runs | Where its log is |
+|---|---|
+| macOS | The file `~/.aerolvm/logs/sandboxd.log`. |
+| Linux | Run `journalctl -u sandboxd` to read it. |
 
-On a server with a domain, the dashboard is also at `https://<your-domain>/ui`. That is the address to use for company sign-in, which needs HTTPS. If it returns "not found", the server was installed before the domain served the dashboard. Run the [installer](/getting-started/installer-options/#change-or-upgrade-an-install) again to add it.
+When your install has an API domain, the dashboard is also at `https://<api-domain>/ui`. Company sign-in needs this HTTPS address. Does it answer "not found"? Then your install is older than this address. Run the [installer](/getting-started/installer-options/#upgrade-an-install) again to add it.
 
-On a remote server, the safest way in is an SSH tunnel: a secure link from your computer to the server. It keeps your token off the open internet. Leave this running:
+### Open it on a remote node
 
-```bash
-ssh -L 21212:127.0.0.1:21212 <user>@<server-ip>
+On a remote node, use an **SSH tunnel**. It is a private link from your computer to the node, through SSH. Your token then never crosses the open internet. Keep this command running:
+
+```bash title="On your computer"
+ssh -L 21212:127.0.0.1:21212 <user>@<node-ip>
 ```
 
-Then open `http://localhost:21212/ui` in your browser. Type `localhost`, not `127.0.0.1`: company sign-in sends the address you opened to your provider, and your operator registered the `localhost` one.
+Then open `http://localhost:21212/ui` in your browser. Type `localhost`, not `127.0.0.1`. Company sign-in sends the address you opened to your sign-in provider. Your operator registered the `localhost` address there.
 
-The dashboard works on every node: server, worker or ingress (a node that takes public traffic). The node and placement lists come from the whole cluster, whichever node you open.
+Every node serves the dashboard: server, worker, ingress and mixed nodes. The node list and the sandbox list show the whole cluster. It does not matter which node you open.
 
 ## Sign in
 
-The sign-in box shows one **Sign in with ...** button for each company sign-in your operator set up, such as "Sign in with Acme Okta" or Google's own button. Below them, **Use an API token instead** opens a field for a token. With no sign-in buttons, the token field is all you see.
+The sign-in box has one button for each company sign-in your operator set up. Each button says **Sign in with ...**, such as "Sign in with Acme Okta". Google shows its own button. Below the buttons, **Use an API token instead** opens a token field. With no company sign-in set up, you see only the token field.
 
-- **With a token:** paste the `SB_PAT_TOKEN` of the server, or an API token (`avm_…`), then click **Sign in**.
-- **With your company account:** click your provider's button and sign in there. You come back to the dashboard signed in.
+| To sign in with | Do this |
+|---|---|
+| A token | Paste the admin token, or an API token (`avm_…`). Click **Sign in**. |
+| Your company account | Click your provider's button. Sign in there. You come back to the dashboard, signed in. |
 
-The page keeps your sign-in in the browser tab's `sessionStorage` (memory that lasts only as long as the tab). It never writes it to `localStorage` or disk. It sends it only to the AerolVM server. Closing the tab or clicking **Sign out** clears it.
+The page keeps your sign-in in the tab's `sessionStorage`. That is browser memory that lasts only while the tab is open. The page never writes it to `localStorage` or to disk. It sends it only to the AerolVM server. Closing the tab clears it. So does **Sign out**.
 
 If the token is wrong, the form says so and asks you to sign in again. A wrong token changes nothing on the server.
 
 ### Company sign-in needs HTTPS
 
-The sign-in buttons appear only when the page is served over HTTPS, or from `localhost` (for example through an SSH tunnel). On plain HTTP from another computer, the box says "SSO sign-in needs a secure connection" and links to your server's HTTPS address. A token still works there, with a warning that it crosses the network unencrypted.
+The sign-in buttons appear only on an HTTPS page, or on `localhost`. An SSH tunnel counts as `localhost`.
+
+On plain HTTP from another computer, the box says "SSO sign-in needs a secure connection". It links to your server's HTTPS address. A token still works there. The page warns you that the token crosses the network unencrypted.
 
 ### Who sees the console
 
-The console shows fleet health, and almost every panel needs the `admin` role. So after you sign in:
+The **console** is the main view: health, nodes, sandboxes and metrics. Almost every panel needs the `admin` role. After you sign in:
 
-- **An admin, or the server token,** gets the console.
-- **Every other role** (`viewer`, `runner`, `auditor`) gets a short "Signed in as ..." screen instead. It shows your name, role and team, and the two commands to use from a terminal: `aerolvm login <this server>` and `aerolvm list`.
-- **No matching rule:** "You're signed in, but you don't have access here." It lists up to 50 of the groups your sign-in carried, so you can tell your admin what to add. Entra ID sign-ins with too many groups to list say to bind an Entra app role instead.
+| You are | You see |
+|---|---|
+| An `admin`, or the admin token | The console. |
+| Another role: `viewer`, `runner` or `auditor` | A short "Signed in as ..." screen. It shows your name, role and team. It also shows two commands to run in a terminal: `aerolvm login <this server>` and `aerolvm list`. |
+| A person no access rule matches | "You're signed in, but you don't have access here." It lists up to 50 of the groups your sign-in carried. Tell your admin which group to add. |
 
-The header shows who you are: your name and an `admin` badge, or "Server token" with an `operator` badge. With access control on, that badge is in a warning color, because actions taken with the server token are recorded as the server, not a person.
+An Entra ID sign-in can carry too many groups to list. The screen then asks your admin to bind an Entra app role instead.
+
+The header shows who you are. A person sees their name and an `admin` badge. The admin token shows "Server token" with an `operator` badge. With access control on, that badge has a warning color. The reason: actions taken with the admin token are recorded as the server, not as a person.
 
 ### Staying signed in, and signing out
 
-- **A company sign-in lasts as long as your provider allows,** often about an hour. The page renews it on its own about two minutes before it ends. For every provider except Google, the page reloads through your provider and comes back to the same view. Google renews it in place. If renewal fails while your sign-in still works, nothing changes on the page: it keeps using your sign-in and tries again when it ends. Once your sign-in has ended, a banner says "Your sign-in expired" with a **Sign in again** button, and your view stays.
-- **Sign out** clears the tab and stops Google from signing you straight back in. It does not sign you out of your company account, the same as other company apps.
+- **A company sign-in lasts as long as your provider allows.** That is often about one hour.
+- **The page renews it 2 minutes before it ends.** Google renews it in place. Every other provider reloads the page through the provider. You come back to the same view.
+- **A failed renewal changes nothing while your sign-in still works.** The page keeps using your sign-in. It tries again when the sign-in ends.
+- **When your sign-in has ended,** a banner says "Your sign-in expired". It has a **Sign in again** button. Your view stays.
+- **Sign out** clears the tab. It also stops Google from signing you straight back in. It does not sign you out of your company account. Other company apps work the same way.
 - **Use a different account** asks your provider to let you pick another account.
 
 ## What the page shows
 
-Every part of the page reads from an existing API endpoint. The dashboard adds no logic of its own. It only shows what the API already returns.
+Each part of the page reads one API endpoint that already exists. The dashboard adds no logic of its own. It shows only what the API returns.
 
 | Part | Endpoint | What it shows |
 |---|---|---|
-| **Summary tiles** | `GET /v1/cluster/members` | Number of nodes (with how many are drained or stale), number of sandboxes, and how much CPU, memory and disk is in use across the cluster. |
-| **Health** | `GET /health` | Overall status, and whether Docker, Caddy (the built-in web proxy), Firecracker and the SSH gateway are working. Also the server version and the number of live sandboxes. |
-| **Nodes** | `GET /v1/cluster/leader` and `GET /v1/cluster/members` | The current Raft leader (the node that makes cluster changes) and the member count. Then one row per node: name, IP, status, role, sandbox count, and CPU, memory, disk and GPU in use. |
-| **Placements** | `GET /v1/cluster/sandbox-index` (one page at a time) | One row per sandbox in the cluster: ID, owner node, state, runtime status, version, and when it was created and last changed. |
-| **Metrics** | `GET /v1/metrics` | A chosen set of the server's `aerolvm_*` counters, such as Raft write time, forwarded requests and worker health. Open **Show raw /v1/metrics** to see all of them. |
+| **Summary tiles** | `GET /v1/cluster/members` | The number of nodes, and how many are drained or stale. The number of sandboxes. How much CPU, memory and disk the cluster has given out. |
+| **Health** | `GET /health` | The overall status. Whether Docker, Caddy, Firecracker and the SSH gateway work. (Caddy is the web server in front of AerolVM.) The server version, and the number of live sandboxes. |
+| **Nodes** | `GET /v1/cluster/leader` and `GET /v1/cluster/members` | The leader and the number of members. The **leader** is the node that writes down each cluster change. Then one row per node: name, IP, status, role, sandbox count, and the CPU, memory, disk and GPU in use. |
+| **Placements** | `GET /v1/cluster/sandbox-index`, one page at a time | One row per sandbox in the cluster: ID, owner node, state, runtime status, version, and when it was made and last changed. |
+| **Metrics** | `GET /v1/metrics` | A chosen set of the server's `aerolvm_*` counters. Examples: how long the cluster takes to save a change, forwarded requests, and worker health. Open **Show raw /v1/metrics** to see all of them. |
 
 What a node's status means:
 
 | Status | What it means |
 |---|---|
-| `active` | The node is up and taking work. |
-| `dead` | The node is not answering. |
-| `stale` | The node is up, but its latest report of free CPU and memory is old. |
+| `active` | The node is up and takes work. |
+| `dead` | The node does not answer. |
+| `stale` | The node is up. But its last report of free CPU and memory is old. |
 | `drained` | The node gets no new sandboxes. See [Actions](#actions-you-can-take). |
 
-What a sandbox's state means:
+A **placement** is the cluster's record of which node owns a sandbox. What a placement's state means:
 
 | State | What it means |
 |---|---|
 | `placed` | The sandbox has an owner node. |
-| `reserved` | A node is being set up for the sandbox, and the create is not done yet. |
-| `orphaned` | The owner node died, so nothing serves the sandbox. |
+| `reserved` | A node is being set up for the sandbox. The create is not done yet. |
+| `orphaned` | The owner node died, so no node serves the sandbox. |
 
-The runtime column tells you whether the sandbox is running. It shows `started` or `stopped` for sandboxes on the node you opened. For sandboxes on other nodes it shows `remote`.
+The runtime column tells you whether the sandbox runs. For sandboxes on the node you opened, it shows `started` or `stopped`. For sandboxes on other nodes, it shows `remote`.
 
-The page refreshes itself every five seconds while you are looking at it. It pauses when the tab is hidden, so it does not call the API in the background. The header also has a **Refresh** button and an **auto-refresh** switch.
+The page refreshes every 5 seconds while you look at it. It pauses while the tab is hidden. So it makes no API calls in the background. The header also has a **Refresh** button and an **auto-refresh** switch.
 
 ## Actions you can take
 
-The dashboard has a few operator buttons. Only admins and the server token reach the console, so only they see them. Each one asks you to confirm first and shows the API call it will make. Each button only calls an existing API endpoint.
+The console has seven buttons for operators. Only admins and the admin token reach the console. So only they see the buttons. Each button asks you to confirm first. The confirm box shows the API call the button makes. Each button calls one existing API endpoint.
 
 | Button | Where | Endpoint | What it does |
 |---|---|---|---|
-| **Drain** | Nodes, on each row | `POST /v1/cluster/nodes/{id}/drain` | The node gets no new sandboxes. Sandboxes already on it keep running. Safe to repeat. |
-| **Uncordon** | Nodes, on drained rows | `POST /v1/cluster/nodes/{id}/uncordon` | Undoes a drain, so the node can get new sandboxes again. Safe to repeat. |
+| **Drain** | Nodes, on each row | `POST /v1/cluster/nodes/{id}/drain` | The node gets no new sandboxes. Its running sandboxes keep running. Safe to run again. |
+| **Uncordon** | Nodes, on drained rows | `POST /v1/cluster/nodes/{id}/uncordon` | Undoes a drain. The node can get new sandboxes again. Safe to run again. |
 | **Start** | Placements, on stopped sandboxes | `POST /v1/sandboxes/{id}/start` | Starts the sandbox again. |
 | **Stop** | Placements, on started sandboxes | `POST /v1/sandboxes/{id}/stop` | Stops the sandbox. |
 | **Delete** | Placements, on sandboxes that are not orphaned | `DELETE /v1/sandboxes/{id}` | Deletes the sandbox. |
-| **Reclaim local** | Placements, on orphaned rows | `POST /v1/cluster/orphans/{id}/reclaim-local` | Fixes a false alarm, where a node was marked dead but was not. It only works on the node that used to own the sandbox, while that node still has the sandbox's local record. |
-| **Force delete** | Placements, on orphaned rows | `DELETE /v1/cluster/orphans/{id}` | Removes the cluster's placement record for an orphan. Use it when the old owner is gone for good. It deletes no local sandbox, because no owner is left to act on. |
+| **Reclaim local** | Placements, on orphaned rows | `POST /v1/cluster/orphans/{id}/reclaim-local` | Fixes a false alarm. The cluster marked a node dead, but it was not. This works only on the node that used to own the sandbox, so open the dashboard on that node. That node must still have the sandbox's local record. |
+| **Force delete** | Placements, on orphaned rows | `DELETE /v1/cluster/orphans/{id}` | Removes the cluster's placement record of an orphan. Use it when the old owner node will not come back. It deletes no sandbox on any node, because no owner is left to act. |
 
-There are no buttons to create or resize sandboxes. Do that with the [SDKs](/sdk-setup/) or the [aerolvm CLI](/cli/), which use the same login and safety checks as everything else.
+There are no buttons to create or resize sandboxes. Use the [SDKs](/sdk-setup/) or the [aerolvm CLI](/cli/) for that. They use the same login and the same checks as everything else.
 
 ## Security
 
-Two different things are involved:
-
-- **The page itself (`GET /ui`) needs no login.** It is plain HTML and JavaScript. It holds no passwords and no server data. The sign-in form asks for your token before the page calls any API. This is how a normal login page works.
-- **Every API call the page makes needs your credential.** That includes `GET /health`, `GET /v1/...`, `GET /v1/metrics` and the buttons. The page sends it as `Authorization: Bearer <token>`, and the server checks it like any SDK call, with the same role checks. `/v1/metrics` needs a role on every team, because its counters reveal how the whole system is running (lease state, queue lengths, secret decrypt failures). The page never calls `/debug/vars`: Caddy does not forward it from your API domain, and it stays `admin`-only on each node's own port.
+- **The page itself (`GET /ui`) needs no login.** It is plain HTML and JavaScript. It holds no passwords and no server data. You sign in before the page calls any API that needs a login. A normal login page works the same way.
+- **`GET /health` needs no login either.** Load balancers call it to check that a node is up. It reports only the node's own health.
+- **Every other call the page makes needs your token.** That includes `GET /v1/...`, `GET /v1/metrics` and the buttons. The page sends the token as `Authorization: Bearer <token>`. The server checks it like any SDK call, with the same role checks.
+- **`/v1/metrics` needs a role bound to every team.** Its counters show how the whole system runs: lease state, queue lengths and secret decrypt failures.
+- **The page never calls `/debug/vars`.** Caddy does not forward it from your API domain. It stays `admin`-only, on each node's own port.
 - **Company sign-in happens between your browser and your provider.** The server holds no client secret and keeps no session. The browser keeps only the provider's sign-in token, never a refresh token.
-- **The page sends a strict Content-Security-Policy.** Only the page's own script, Google's sign-in script, and your providers' addresses are allowed. Nothing can frame the page.
+- **The page sends a strict Content-Security-Policy.** That is a browser rule that lists what the page is allowed to load and call. It allows only the page's own script, Google's sign-in script, and your providers' addresses. No other site can show the page inside a frame.
 
-The dashboard is protected by whatever protects the API port: TLS (HTTPS encryption), a login proxy in front, or an IP allow list. To keep it on a trusted network only, limit who can reach that port.
+Whatever protects the API port also protects the dashboard: HTTPS, a login proxy in front, or an IP allow list. To keep the dashboard on a trusted network, limit who can reach that port.
 
 ## Use it with several nodes
 
-You do not need a dashboard per node. The Nodes and Placements lists come from the whole cluster, whichever node you open. The buttons are forwarded the same way.
+You do not need one dashboard per node. The Nodes and Placements lists show the whole cluster, from any node you open. Every button except **Reclaim local** reaches the right node, from any node.
 
-The Metrics panel is the exception. It shows only the counters of the server you opened. To compare nodes side by side, open one tab per node.
+The Metrics panel is different. It shows only the counters of the node you opened. To compare nodes side by side, open one tab per node.
 
 ## Collect metrics with Prometheus
 
-Prometheus is a monitoring tool that pulls numbers from servers on a schedule. Each AerolVM server offers its `aerolvm_*` counters for it at `GET /v1/metrics`, in Prometheus's text format. That endpoint needs a credential too.
+**Prometheus** is a monitoring tool. It reads numbers from your servers on a schedule. Each read is called a **scrape**.
 
-Like the Metrics panel, this is per server. Scrape every server, worker and ingress node on its own:
+Each node serves its `aerolvm_*` counters at `GET /v1/metrics`, in Prometheus's text format. That endpoint needs a token too.
 
-```yaml
+Like the Metrics panel, this is per node. Add every server, worker, ingress and mixed node to Prometheus:
+
+```yaml title="prometheus.yml"
 scrape_configs:
   - job_name: sandboxd
     metrics_path: /v1/metrics
@@ -154,52 +185,86 @@ scrape_configs:
           - worker-1.example.com:21212
 ```
 
-With [access control](/enterprise/sso/) on, use a `viewer` token bound to every team instead of the server token: `aerolvm token create --name prometheus --role viewer --team '*' --expires-in 90d`. It cannot create, run or delete anything. It is read-only, not metrics-only: it can also read every team's sandbox details and audit records. A server that briefly loses contact with the cluster's token list still accepts it for metrics.
+With [access control](/enterprise/sso/) on, give Prometheus a `viewer` API token for every team. Do not give it the admin token. Make the token like this:
+
+```bash title="On your computer"
+aerolvm token create --name prometheus --role viewer --team '*' --expires-in 90d
+```
+
+This token cannot create, run or delete anything. It is read-only, but not metrics-only. It can also read every team's sandbox details and audit records.
+
+A node's copy of the token list can be out of date. The node then refuses API tokens with `503`. `/v1/metrics` is the one exception, so Prometheus keeps working.
 
 Good first alerts to set up:
 
-- `aerolvm_raft_apply_errors_total`
-- `aerolvm_ingress_route_desired_revision - aerolvm_ingress_route_applied_revision` (how far behind the ingress routes are)
-- `aerolvm_create_queue_depth`
-- `aerolvm_worker_lease_max_age_nanos`
-- `aerolvm_image_pull_backoff_rejects_total`
-- the `aerolvm_host_pressure_*` gauges
+- `aerolvm_raft_apply_errors_total`: errors while the cluster saves a change.
+- `aerolvm_ingress_route_desired_revision - aerolvm_ingress_route_applied_revision`: how far behind the ingress routes are.
+- `aerolvm_create_queue_depth`: how many creates are in progress right now.
+- `aerolvm_worker_lease_max_age_nanos`: how long ago the cluster last heard from the quietest worker.
+- `aerolvm_image_pull_backoff_rejects_total`: image pulls refused because the last pull of that image failed.
+- The `aerolvm_host_pressure_*` gauges: how much CPU, memory, disk and GPU each node has given out, and how much it has.
 
 ### Sandbox lifecycle metrics
 
-These counters show what happens to sandboxes over time. Each one has a `key` label with a small, fixed set of values. None of them has a label per sandbox.
+These counters show what happens to sandboxes over time. Each one has a `key` label with a short, fixed list of values. None of them has a label per sandbox.
 
-| Metric | `key` values | Counts |
+| Metric | `key` values | What it counts |
 |---|---|---|
 | `aerolvm_sandbox_stops_total` | `user_stop`, `idle`, `max_age`, `out_of_memory`, `disk_limit`, `crashed`, `program_exited`, `reconcile` | Sandboxes that stopped, by their [stop reason](/lifecycle/#why-a-sandbox-stopped). |
-| `aerolvm_sandbox_starts_total` | `requested`, `restarted`, `failover` | Sandboxes that started again: by a call (including a wake), by `restartOnFailure`, or after a server failed. |
-| `aerolvm_sandbox_expired_total` | `idle`, `max_age`, `program_exited` | Sandboxes a lifecycle timer deleted, by the timer. `destroyAt` counts as `max_age`; `destroyAfterExitFor` counts as `program_exited`. |
-| `aerolvm_sandbox_finished_total` | `success`, `failure` | Main programs that ended, by whether the exit code was `0`. A sandbox that goes down with a non-zero code counts as a `crashed` stop, not here. So `failure` only counts programs the server watches for [`destroyAfterExitFor`](/lifecycle/#delete-when-the-program-ends), which end while the sandbox keeps running. |
-| `aerolvm_create_latency_by_start_seconds_bucket` | `warm`, `cold` (`key2` is the bucket) | How long successful creates took, split by whether a warm pool, a parked container or a running V8-isolate group served them. |
+| `aerolvm_sandbox_starts_total` | `requested`, `restarted`, `failover` | Sandboxes that started again. `requested` is a call, including a wake. `restarted` is `restartOnFailure`. `failover` is a sandbox rebuilt after its node failed. |
+| `aerolvm_sandbox_expired_total` | `idle`, `max_age`, `program_exited` | Sandboxes a lifecycle timer deleted, by the timer. `destroyAt` counts as `max_age`. `destroyAfterExitFor` counts as `program_exited`. |
+| `aerolvm_sandbox_finished_total` | `success`, `failure` | Main programs that ended, by whether the exit code was `0`. A sandbox that goes down with another exit code counts as a `crashed` stop instead. So `failure` counts only programs watched for [`destroyAfterExitFor`](/lifecycle/#delete-when-the-program-ends). Those end while the sandbox keeps running. |
+| `aerolvm_create_latency_by_start_seconds_bucket` | `warm`, `cold` (`key2` is the bucket) | How long successful creates took. `warm` means a warm pool, a parked container or a running V8-isolate group served the create. |
 
-A rise in `crashed` or `out_of_memory` stops together with `restarted` starts means sandboxes are crashing over and over. The D2 Capability Matrix dashboard in [`setup/grafana`](https://github.com/aerol-ai/microvm/tree/main/setup/grafana) has a panel with all four counters.
+Do `crashed` or `out_of_memory` stops rise together with `restarted` starts? Then sandboxes crash again and again. The D2 Capability Matrix dashboard in [`setup/grafana`](https://github.com/aerol-ai/microvm/tree/main/setup/grafana) has a panel with all four counters.
 
-`aerolvm_sandbox_events_dropped_total` has no labels. It counts runtime events the server dropped because one sandbox already had 64 events waiting. That only happens while a long step, such as a restart, holds the sandbox. The server then drops that sandbox's oldest waiting event, so other sandboxes' events keep moving. The next reconcile pass reads the runtime and fixes the sandbox's status. A value above `0` means one sandbox sent a flood of events; the server log names it.
+`aerolvm_sandbox_events_dropped_total` has no labels. It counts runtime events that `sandboxd` dropped. A sandbox can hold at most 64 waiting events. That limit is reached only while a long step, such as a restart, holds the sandbox. `sandboxd` then drops that sandbox's oldest waiting event. Other sandboxes' events keep moving. The next reconcile pass reads the runtime and fixes the sandbox's status. A value above `0` means one sandbox sent a flood of events. The log names that sandbox.
 
 ## Profile the server with pprof
 
-pprof is Go's built-in profiler. It shows where the server spends its CPU time, what holds its memory, and what each goroutine (a lightweight Go thread) is doing. It is off by default.
+**pprof** is Go's built-in profiler. It shows where `sandboxd` spends its CPU time and what holds its memory. It also shows what each **goroutine** does. A goroutine is one task that a Go program runs side by side with others.
 
-To turn it on, set `SB_ENABLE_PPROF=true` and restart the server. The profiler then answers under `/debug/pprof/` on each server's own API port (port `21212` by default):
+pprof is off by default. To turn it on, set `SB_ENABLE_PPROF=true`, then restart `sandboxd`. On Linux, the setting goes in `/etc/sandboxd/sandboxd.env`:
 
-- **Only admins can read it.** Use the server token or an `admin` API token. A request with no token gets `401`, and any other token gets `403`.
-- **It is per server.** Caddy does not forward `/debug/` from your API domain, so open each node's own port, the same way as `/debug/vars`.
-- **Turn it off again when you are done.** A profile shows the server's goroutines, memory and command line, and taking one costs CPU while it runs.
+```bash title="On a node"
+sudo systemctl restart sandboxd
+```
 
-Download a profile with your admin token, then open the file with Go's `go tool pprof`. `/debug/pprof/profile?seconds=30` records 30 seconds of CPU time, `/debug/pprof/heap` shows memory, and `/debug/pprof/goroutine?debug=2` lists every goroutine as text. `/debug/pprof/` lists every profile.
+The profiler then answers under `/debug/pprof/`, on each node's own API port (`21212` by default).
+
+- **Only admins can read it.** Use the admin token, or an API token with the `admin` role. A request with no token gets `401`. Any other token gets `403`.
+- **It is per node.** Caddy does not forward `/debug/` from your API domain. So open each node's own port, the same way as `/debug/vars`.
+- **Turn it off when you are done.** Set `SB_ENABLE_PPROF=false`, and restart `sandboxd`. A profile shows the server's goroutines, memory and command line. Taking a profile also costs CPU while it runs.
+
+Download a profile with your admin token. Then open the file with `go tool pprof`.
+
+| Path | What you get |
+|---|---|
+| `/debug/pprof/` | A list of every profile. |
+| `/debug/pprof/profile?seconds=30` | 30 seconds of CPU time. |
+| `/debug/pprof/heap` | What holds the memory. |
+| `/debug/pprof/goroutine?debug=2` | Every goroutine, as text. |
 
 ## Send metrics and traces with OpenTelemetry
 
-OpenTelemetry (OTEL) is a standard way to send metrics and traces (a timed record of each request) to a collector. Prometheus pulls numbers. OTEL pushes them, over OTLP/HTTP.
+**OpenTelemetry** (OTEL) is a standard way to send metrics and traces to a **collector**, a program that gathers them. A **trace** is a timed record of one request. Each timed step in it is a **span**.
 
-Turn it on with `SB_OTEL_METRICS_ENABLED=true` and `SB_OTEL_TRACES_ENABLED=true`, or just set the endpoints:
+Prometheus pulls numbers from the node. OpenTelemetry pushes them from the node, over OTLP/HTTP. OTLP is OpenTelemetry's own format.
 
-```bash
+| Setting | What it does | Default |
+|---|---|---|
+| `SB_OTEL_METRICS_ENABLED` | Sends metrics. | `false` |
+| `SB_OTEL_METRICS_ENDPOINT` | Where to send metrics. Setting it also turns metrics on. If it is empty, `sandboxd` reads `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT`. | empty |
+| `SB_OTEL_METRICS_INTERVAL` | How often to send metrics. It must be above `0`. | `30s` |
+| `SB_OTEL_TRACES_ENABLED` | Sends traces. | `false` |
+| `SB_OTEL_TRACES_ENDPOINT` | Where to send traces. Setting it also turns traces on. If it is empty, `sandboxd` reads `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`. | empty |
+| `SB_OTEL_TRACES_SAMPLE_RATIO` | The share of traces to keep, from `0` to `1`. | `0.05` |
+| `OTEL_SERVICE_NAME` | The service name on every metric and span. | `sandboxd` |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | The standard OpenTelemetry address. Setting it turns on both metrics and traces. | empty |
+
+While metrics or traces are on, a value outside these limits stops `sandboxd` from starting. A sample setup:
+
+```bash title="In the node's settings"
 SB_OTEL_METRICS_ENDPOINT=http://otel-collector:4318/v1/metrics
 SB_OTEL_METRICS_INTERVAL=30s
 SB_OTEL_TRACES_ENDPOINT=http://otel-collector:4318/v1/traces
@@ -207,54 +272,77 @@ SB_OTEL_TRACES_SAMPLE_RATIO=0.05
 OTEL_SERVICE_NAME=sandboxd
 ```
 
-What gets sent:
+What `sandboxd` sends:
 
-- **Metrics:** the same `aerolvm_*` counters, as `aerolvm.expvar.int64` and `aerolvm.expvar.float64`. The original counter name is in the `metric` attribute. Map keys are in `key`, `key2` and so on.
-- **Traces:** one span (a timed step) per API request. The server reads incoming W3C trace context, so its spans join your app's traces. Each span is tagged with `http.route`, status code, node ID, node role, service name and server version.
+- **Metrics:** the same `aerolvm_*` counters, as `aerolvm.expvar.int64` and `aerolvm.expvar.float64`. The counter's own name is in the `metric` attribute. Map keys are in `key`, `key2` and so on.
+- **Traces:** one span per API request. `sandboxd` reads the W3C trace context your app sends. W3C trace context is the standard header that carries a trace ID. So `sandboxd`'s spans join your app's traces. Each span is tagged with `http.route`, the status code, node ID, node role, service name and server version.
 
-**Traces reach the sandbox's helper program.** Every call the server passes to a sandbox's helper program (`toolboxd`: commands, files, terminals, from the AerolVM API and the Daytona, E2B and Runloop APIs) carries a W3C `traceparent`. With tracing on it names the server's own span for the request; with tracing off it is your app's trace context, passed on unchanged. The helper program writes one log line per such request, with the `trace_id`, the method and the path (never the query), to the sandbox's output. So you can find the helper's side of a slow or failed call by its trace id. Only `traceparent` and `tracestate` go into the sandbox, never `baggage`. WASM and V8 isolate sandboxes have no helper program inside them, so for those the server's span is the only record.
+By default, `sandboxd` keeps 5% (`0.05`) of the traces it starts itself. A trace that comes from your app follows your app's choice. So a large cluster can send traces, and a burst of requests does not flood your collector.
 
-By default the server keeps 5% of the traces it starts itself (`0.05`). That way a large cluster can send traces without every burst flooding your collector.
+### Traces reach the sandbox's helper program
+
+`toolboxd` is the **helper program** inside a sandbox. It runs commands, files and terminals for the server. Calls reach it from the AerolVM API and from the Daytona, E2B and Runloop APIs.
+
+- **Every call the server passes to `toolboxd` carries a W3C `traceparent` header.** With tracing on, it names the server's own span for the request. With tracing off, it is your app's trace context, passed on unchanged.
+- **`toolboxd` writes one log line per such request** to the sandbox's output. The line has the `trace_id`, the method and the path. It never has the query. So you can find `toolboxd`'s side of a slow or failed call by its trace ID.
+- **Only `traceparent` and `tracestate` go into the sandbox.** `baggage`, the free-form data your app attached, never does.
+- **WASM and V8-isolate sandboxes have no helper program inside.** For those, the server's span is the only record.
 
 ## Grafana dashboards, alerts and runbooks
 
-Grafana is a tool that draws charts from Prometheus data. The repository has ready-made files you can load:
+**Grafana** is a tool that draws charts from Prometheus numbers. The repository has ready-made files you can load:
 
-- **Grafana dashboard:** [`setup/grafana/sandboxd-slo-dashboard.json`](https://github.com/aerol-ai/microvm/blob/main/setup/grafana/sandboxd-slo-dashboard.json). It covers create queue depth, create latency, worker pressure and worker leases. It also shows route lag, shard health, Raft (cluster agreement) errors and the size of Raft's saved state. And it tracks data-plane errors, secret decrypt health and image-pull storms. More dashboards are in the same folder.
-- **Prometheus alert rules:** [`setup/prometheus/sandboxd-alerts.yml`](https://github.com/aerol-ai/microvm/blob/main/setup/prometheus/sandboxd-alerts.yml). They cover Raft health, stale worker leases, create backlog, worker pressure, ingress route lag, Caddy errors, forwarding errors, image-pull storms, secret decrypt failures, and identity and access (the server token used from outside, a stale token list, failing key fetches).
-- **Alertmanager example:** [`setup/alertmanager/sandboxd-alertmanager-example.yml`](https://github.com/aerol-ai/microvm/blob/main/setup/alertmanager/sandboxd-alertmanager-example.yml), which shows how to route those alerts.
+- **Grafana dashboard:** [`setup/grafana/sandboxd-slo-dashboard.json`](https://github.com/aerol-ai/microvm/blob/main/setup/grafana/sandboxd-slo-dashboard.json). It shows create queue depth, create time, worker pressure, and how long ago each worker last reported. It shows ingress route lag and ingress shard health. It shows errors while the cluster saves a change, and the size of the cluster's saved records. It shows Caddy errors, and errors when a node passes a request on to another node. It also tracks secret decrypt health and image-pull storms. More dashboards are in the same folder.
+- **Prometheus alert rules:** [`setup/prometheus/sandboxd-alerts.yml`](https://github.com/aerol-ai/microvm/blob/main/setup/prometheus/sandboxd-alerts.yml). They cover the health of the cluster's records, workers that stopped reporting, create backlog and worker pressure. They cover ingress route lag, Caddy errors, forwarding errors, image-pull storms and secret decrypt failures. They also cover identity and access: the admin token used from outside, a stale token list, and failing key fetches.
+- **Alertmanager example:** [`setup/alertmanager/sandboxd-alertmanager-example.yml`](https://github.com/aerol-ai/microvm/blob/main/setup/alertmanager/sandboxd-alertmanager-example.yml). Alertmanager sends Prometheus alerts to people. This file shows how to route them.
 
-Each alert links straight to a step-by-step runbook. See [Runbooks](/operational-runbooks/) for the full list.
+Each alert links to a step-by-step runbook. See [Runbooks](/operational-runbooks/) for the full list.
 
 ## Set up sign-in for the dashboard
 
-This section is for the server operator. Company sign-in on the dashboard needs [access control](/enterprise/sso/) on, and an identity file with a dashboard app for each provider you want as a button.
+This section is for the person who runs the server. Company sign-in on the dashboard needs two things:
 
-1. **Register a dashboard app at your provider.** Make it a single-page app, a public client with no secret, using the authorization code flow with PKCE.
-2. **Register `https://<api-domain>/ui`** as its redirect URI, and `https://<api-domain>` as an allowed origin. To sign in through an SSH tunnel too, also register `http://localhost:21212/ui` as a redirect URI and `http://localhost:21212` as an allowed origin. Without that origin, the page can't finish the sign-in and says "didn't sign you in (network_error)". Register `localhost`, not `127.0.0.1`, and tell people to open the tunnel at `http://localhost:21212/ui`. A provider refuses a redirect URI it doesn't know, so a tab opened at `127.0.0.1` gets an "invalid redirect_uri" error.
-3. **Put the groups claim in the ID token.** The dashboard asks for the scopes `openid email profile`, plus `groups` when your provider lists that scope, as Dex does.
-4. **Add the app's client ID** to the issuer's `audiences` and as `clients.dashboard` in the identity file. Set `display_name` to the button label.
+- [Access control](/enterprise/sso/) on.
+- An **identity file** with a dashboard app for each provider you want as a button. The identity file lists your sign-in providers. [SSO](/enterprise/sso/) shows its format.
 
-Only issuers with `clients.dashboard` get a button, in the order of the identity file. Workload issuers, such as GitHub Actions, get none. Only the first Google issuer gets a button, because Google allows one sign-in client per page.
+The steps below use your provider's own words. Pick the options with those names.
+
+1. **Register a dashboard app at your provider.** Make it a single-page app. It is a public client, with no secret. It uses the authorization code flow with PKCE.
+2. **Register the addresses.** Register `https://<api-domain>/ui` as its **redirect URI**: the address the provider sends you back to. Register `https://<api-domain>` as an **allowed origin**: an address the provider accepts browser calls from.
+3. **Register the SSH tunnel addresses too, if people use one.** Add `http://localhost:21212/ui` as a redirect URI, and `http://localhost:21212` as an allowed origin. Without that origin, the page cannot finish the sign-in. It says "didn't sign you in (network_error)".
+4. **Use `localhost`, not `127.0.0.1`.** Tell people to open the tunnel at `http://localhost:21212/ui`. A provider refuses a redirect URI it does not know. So a tab opened at `127.0.0.1` gets an "invalid redirect_uri" error.
+5. **Put the groups claim in the ID token.** The **ID token** is the signed note from your provider that says who you are. The groups claim is the list of your groups in it. The dashboard asks for the scopes `openid email profile`. It adds `groups` when your provider lists that scope, as Dex does.
+6. **Add the app's client ID to the identity file.** Put it in the issuer's `audiences`, and in `clients.dashboard`. Set `display_name` to the button's label.
+
+Which providers get a button:
+
+- Only issuers with `clients.dashboard` get a button. The buttons follow the order of the identity file.
+- Workload issuers, such as GitHub Actions, get no button.
+- Only the first Google issuer gets a button. Google allows one sign-in client per page.
+
+What to set at each provider:
 
 | Provider | What to set |
 |---|---|
 | Okta | A Single-Page app with Authorization Code and PKCE. Add `https://<api-domain>` as a Trusted Origin for CORS. Add a groups claim to the ID token. |
-| Entra ID | An app registration with the "Single-page application" platform and the `/ui` redirect URI. Above 200 groups, Entra leaves the groups out, so bind on app roles. |
-| Keycloak | A public client with the standard flow and PKCE (`S256`). Set Web origins to `https://<api-domain>`, plus `http://localhost:21212` for an SSH tunnel. Add a Group Membership mapper to the ID token, and turn its **Full group path** off. With it on (the default), the groups arrive as `/platform-admins` and no group rule matches. |
-| Google | Use `kind: google`. Create a "Web application" client with `https://<api-domain>` as an authorized JavaScript origin. Google uses its own sign-in button and pop-up. |
-| Authentik | Share one application with the CLI: a Public OAuth2/OpenID provider with an RSA signing key. Add `https://<api-domain>/ui` as a Strict redirect URI; Authentik then allows cross-origin calls from that address. The `profile` scope already puts `groups` in the ID token. |
-| Zitadel | A User Agent app with PKCE, in the CLI app's project, with no other apps in it. Zitadel's own roles claim is an object the server can't read, so add a flat `groups` claim with an Action. [SSO](/enterprise/sso/#zitadel-roles-as-groups) shows how. |
-| Dex | A static client with `public: true` and the `/ui` redirect URI. Set `web.allowedOrigins` to `https://<api-domain>`. Quiet renewal needs Dex's experimental sessions (`DEX_SESSIONS_ENABLED=true`); without them, people sign in again when the ID token expires. [SSO](/enterprise/sso/#dex) has the details. |
+| Entra ID | An app registration with the "Single-page application" platform and the `/ui` redirect URI. Above 200 groups, Entra leaves the groups out. So bind on app roles. |
+| Keycloak | A public client with the standard flow and PKCE (`S256`). Set Web origins to `https://<api-domain>`. For an SSH tunnel, add `http://localhost:21212` too. Add a Group Membership mapper to the ID token. Turn its **Full group path** off. With it on (the default), groups arrive as `/platform-admins`, and no group rule matches. |
+| Google | Use `kind: google`. Make a "Web application" client. Add `https://<api-domain>` as an authorized JavaScript origin. Google uses its own sign-in button and pop-up. |
+| Authentik | Share one application with the CLI. Use a Public OAuth2/OpenID provider with an RSA signing key. Add `https://<api-domain>/ui` as a Strict redirect URI. Authentik then allows browser calls from that address. The `profile` scope already puts `groups` in the ID token. |
+| Zitadel | A User Agent app with PKCE, in the CLI app's project, with no other apps in it. Zitadel's own roles claim is an object the server cannot read. So add a flat `groups` claim with an Action. [SSO](/enterprise/sso/#zitadel-roles-as-groups) shows how. |
+| Dex | A static client with `public: true` and the `/ui` redirect URI. Set `web.allowedOrigins` to `https://<api-domain>`. Quiet renewal needs Dex's experimental sessions (`DEX_SESSIONS_ENABLED=true`). Without them, people sign in again when the ID token expires. [SSO](/enterprise/sso/#dex) has the details. |
 
-Authentik, Zitadel and Dex have not been tested against a live tenant yet. [SSO](/enterprise/sso/#step-3-register-the-apps-at-your-provider) has the full steps for every provider.
+Authentik, Zitadel and Dex have not been tested against a live provider yet. [SSO](/enterprise/sso/#step-3-register-the-apps-at-your-provider) has the full steps for every provider.
 
-- **The browser talks to your provider directly.** It reads the provider's discovery document and trades the sign-in code for a token. So your provider must allow cross-origin requests from your dashboard's address, and its token endpoint must be on the same address as its issuer URL. The page's Content-Security-Policy allows only those addresses.
-- **The discovery document** at `https://<api-domain>/.well-known/aerolvm-auth` lists the buttons and the dashboard's HTTPS address (`ui_url`, from `SB_DOMAIN`). The page reads it to draw the sign-in box.
+How the sign-in works:
+
+- **The browser talks to your provider directly.** It reads the provider's discovery document. It trades the sign-in code for a token. So your provider must allow browser calls from your dashboard's address. (Providers call this CORS.) Its token endpoint must also be on the same address as its issuer URL. The page's Content-Security-Policy allows only those addresses.
+- **AerolVM's discovery document** is at `https://<api-domain>/.well-known/aerolvm-auth`. It lists the buttons, and the dashboard's HTTPS address (`ui_url`, from `SB_DOMAIN`). The page reads it to draw the sign-in box.
 
 ## Next steps
 
 - [SSO](/enterprise/sso/): company sign-in, roles, teams and API tokens.
 - [Runbooks](/operational-runbooks/): what to do when an alert fires.
-- [Cluster setup](/cluster-setup/): create a cluster to watch.
-- [Reconcile](/reconcile/): fix sandbox counts that no longer match reality.
+- [Cluster overview](/cluster/): build a cluster to watch.
+- [Fix problems](/cluster/troubleshooting/): what common cluster messages mean.
+- [Reconcile](/reconcile/): fix sandbox records that no longer match what runs.

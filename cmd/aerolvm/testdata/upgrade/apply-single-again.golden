@@ -1,0 +1,9 @@
+exit 0
+--- stdout
+node already runs v0.6.13; nothing to do
+--- stderr
+aerolvm: 4 files of v0.6.13 match checksums.txt (<dist>)
+aerolvm: caddy_linux_amd64 is already there
+aerolvm: release.json is already there
+aerolvm: sandboxd_linux_amd64 is already there
+aerolvm: toolboxd_linux_amd64 is already there

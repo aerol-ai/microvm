@@ -15,7 +15,8 @@ When to pick this over [`single-node.md`](./single-node.md):
 - You're spreading load across availability zones.
 
 If a single host is enough today, run [`single-node.md`](./single-node.md).
-You can convert it into the seed of a cluster later without losing state.
+You can convert it into the seed of a cluster later without losing state:
+run `sudo sandboxd init` on it.
 
 > **This is the most operationally complex deployment.** Read the
 > [Architecture](#architecture) and [How data flows](#how-data-flows)
@@ -58,7 +59,8 @@ One set of cluster-wide secrets, distributed once on first install:
 |---|---|
 | `SB_PAT_TOKEN` | Public API auth. Internal cluster routes additionally require node-bound mTLS. |
 | `SB_GOSSIP_SECRET_KEY` | AES-encrypts gossip payloads; gates raft voter auto-promotion. |
-| Cluster TLS trust (`ca.crt`) | Cluster-internal mTLS trust anchor. `ca.key` stays on the seed; joiners generate CSR and get `node.crt` via `cluster-sign-node.sh`. |
+| Cluster TLS trust (`ca.crt`) | Cluster-internal mTLS trust anchor. `ca.key` lives on every server (in the CA store); a joiner sends a CSR to the join port and gets `node.crt` signed by a server. Certs renew themselves at 2/3 of their life. |
+| Join tokens | `<id>.<secret>`, stored hashed in Raft; one makes one node of its role. `aerolvm join-command` makes them. |
 | Credential bundle (`credential_encryption.key`) | Decrypts sealed registry passwords + per-mount creds. Ships separately from the CA trust tarball. |
 
 ---
@@ -164,7 +166,10 @@ that placement to a live worker and let the owner watcher call
 ### 4. A node joins for the first time
 
 ```
-new node runs cluster-join.sh
+new node runs sandboxd join (the line aerolvm join-command prints)
+        │
+        ▼
+a server on :7003 checks the token, signs its cert, hands it the keys
         │
         ▼
 joins gossip ring (authenticated by SB_GOSSIP_SECRET_KEY)
@@ -262,60 +267,34 @@ the loss of `(N-1)/2` voters before writes stop.
 
 ## Prerequisites
 
-Same per-node requirements as a single-node install (Linux apt-based, Docker
-prereqs, `sudo`), plus:
+Same per-node requirements as a single-node install (Linux apt-based,
+`sudo`), plus:
 
 - A **private network** the operator controls (VPC, WireGuard mesh,
   dedicated subnet). Cluster-internal traffic must not be reachable from
   the public internet.
-- Same `SB_PAT_TOKEN` on every node. The simplest way is to pass the same
-  `--pat-token` to each `install.sh`.
-- `openssl` available (cluster-init generates the gossip key, the TLS CA,
-  and the credential encryption key with it).
 - Cluster-internal ports open between nodes only:
-  - `7000/TCP` - raft replication
-  - `7001/TCP+UDP` - gossip
-  - `7002/TCP` - required internal mTLS RPC
+  - `7000/TCP` - raft replication, between servers
+  - `7001/TCP+UDP` - gossip, between all nodes
+  - `7002/TCP` - required internal mTLS RPC, between all nodes
+  - `7003/TCP` - joins, from every node to the servers
 - Public ports open as in single-node: `443/TCP`, `2220/TCP`, optionally
   `22000-23000/TCP`.
+- The `aerolvm` CLI on your laptop (`curl -fsSL https://aerolvm.aerol.ai |
+  bash -s -- --cli-only`).
+
+You need no copy of this repository. The admin PAT (`SB_PAT_TOKEN`) must
+be the same on every node; the join hands it to each new node, so you give
+it only to the first one.
 
 ---
 
 ## Step-by-step: bringing up a 3-node cluster
 
 This is the recommended starting topology. Three small VPS hosts behind one
-domain.
+domain. Every step is one command; nothing is copied between nodes by hand.
 
-### Step 1 - Run install.sh on EVERY node
-
-This is the same single-node install. The cluster scripts assume `sandboxd`
-is already installed and managed by systemd. Use the **same PAT token** on
-every node.
-
-On `node-a`, `node-b`, `node-c`:
-
-```bash
-curl -fsSL https://aerolvm.aerol.ai \
-  | sudo bash -s -- \
-      --domain sandbox.example.com \
-      --pat-token shared-pat-token \
-      --dns-provider cloudflare \
-      --dns-api-token <cloudflare-token>
-```
-
-Verify on each:
-
-```bash
-curl https://sandbox.example.com/health
-```
-
-> The `--domain` value can be the same across nodes - they're behind the
-> same DNS records. Or different: each node may resolve a different
-> sub-domain depending on your load-balancer setup. Most operators use a
-> single shared domain plus a load balancer in front. See [DNS for
-> clusters](#dns-for-clusters) below.
-
-### Step 2 - Open cluster-internal ports
+### Step 1 - Open cluster-internal ports
 
 On each node's firewall (cloud security group or `ufw`):
 
@@ -323,102 +302,98 @@ On each node's firewall (cloud security group or `ufw`):
 ALLOW 7000/TCP       from <other-cluster-node-IPs>   # raft
 ALLOW 7001/TCP,UDP   from <other-cluster-node-IPs>   # gossip
 ALLOW 7002/TCP       from <other-cluster-node-IPs>   # required internal mTLS
+ALLOW 7003/TCP       from <other-cluster-node-IPs>   # joins (servers only listen)
 ```
 
 **Never open these to the public internet.** Gossip carries auth tokens;
 raft carries the full FSM.
 
-### Step 3 - Bootstrap the seed (node A)
+### Step 2 - Start the cluster on the seed (node A)
 
-Pick one node to bootstrap. From now on it's "the seed". On `node-a`:
-
-```bash
-sudo curl -fsSL https://github.com/aerol-ai/microvm/releases/latest/download/cluster-init.sh \
-  -o /usr/local/bin/cluster-init.sh
-sudo chmod +x /usr/local/bin/cluster-init.sh
-sudo /usr/local/bin/cluster-init.sh \
-    --node-id node-a \
-    --api-advertise-url http://10.0.0.5:21212
-```
-
-Replace `10.0.0.5` with `node-a`'s private IP. The script:
-
-1. Auto-generates a 32-byte gossip secret key (override with `--gossip-key`).
-2. Generates a self-signed cluster CA + this node's keypair.
-3. Reads or generates the credential encryption key.
-4. Writes two separate bundles: `aerolvm-tls-bundle.tar.gz` contains only the
-   public `ca.crt`; `aerolvm-cred-bundle.tar.gz` contains the credential
-   encryption key. The CA private key is never distributed to joiners.
-5. Writes `/etc/sandboxd/cluster.env` and a systemd drop-in.
-6. Restarts `sandboxd`.
-7. Prints the gossip key and the exact `cluster-join.sh` command for
-   the other nodes.
-
-**Save the printed gossip key and copy the printed bundle path.** The script
-prints a ready-to-run join command - paste it for steps 4 and 5.
-
-Verify the seed came up clean:
+Pick one node to start the cluster. From now on it's "the seed". On
+`node-a`, install AerolVM and run `sandboxd init` in one command:
 
 ```bash
-sudo journalctl -u sandboxd -n 50
+curl -fsSL https://aerolvm.aerol.ai \
+  | sudo bash -s -- \
+      --domain sandbox.example.com \
+      --pat-token shared-pat-token \
+      --dns-provider cloudflare \
+      --dns-api-token <cloudflare-token> \
+      init --role mixed --node-id node-a
 ```
 
-Look for `cluster: leader elected` and absence of any
-`SB_CREDENTIAL_ENCRYPTION_KEY is required` or `SB_GOSSIP_SECRET_KEY is
-required` errors.
+Everything before `init` goes to `install.sh`; everything after it goes to
+`sandboxd init` (`sudo sandboxd init --help` lists its flags). `init`:
 
-### Step 4 - Securely transfer the TLS bundle
+1. Runs the local preflight checks (disk, ports free, cgroup v2, KVM when
+   Firecracker is on) and stops before changing anything if one fails.
+2. Makes the cluster CA (ECDSA P-256, 10 years) into the CA store, the
+   32-byte gossip key, and the credential encryption key (or wraps it, with
+   `--key-custody wrapped`).
+3. Signs this node's certificate (`DNS:node:<id>`, `DNS:role:<role>`).
+4. Writes `/etc/sandboxd/cluster.env` and the systemd drop-in, and
+   restarts `sandboxd` in cluster mode.
+5. Waits until this node leads, then registers the join tokens: the ones
+   given with `--token <role>=<id.secret>[:<ttl>]`, or a 2h worker token.
+6. Writes `/etc/sandboxd/admin-context.json` (0600) and prints a join
+   command per token and the login line.
 
-The TLS bundle contains only the public CA certificate. Transfer the separate
-0600 credential bundle through the same protected channel because it can
-decrypt sealed cluster credentials. The CA private key is never in either
-joiner bundle.
+`init` is safe to run again. The advertise address defaults to the source
+address of the default route; set `--advertise <ip>` when that is wrong.
+
+On your laptop, take the admin login:
 
 ```bash
-# from your laptop or a jump host:
-scp node-a:/path/to/aerolvm-tls-bundle.tar.gz /tmp/
-scp node-a:/path/to/aerolvm-cred-bundle.tar.gz /tmp/
-scp /tmp/aerolvm-tls-bundle.tar.gz node-b:/tmp/
-scp /tmp/aerolvm-tls-bundle.tar.gz node-c:/tmp/
-scp /tmp/aerolvm-cred-bundle.tar.gz node-b:/tmp/
-scp /tmp/aerolvm-cred-bundle.tar.gz node-c:/tmp/
-
-# or pull directly between nodes if they have SSH between them.
+ssh node-a sudo cat /etc/sandboxd/admin-context.json > admin-context.json
+aerolvm config import admin-context.json --use
+aerolvm get nodes      # node-a  ...  Ready,Leader
 ```
 
-Wipe local copies after distribution:
+### Step 3 - Join the rest (node B, node C)
+
+On your laptop, make a join command per node:
 
 ```bash
-shred -u /tmp/aerolvm-tls-bundle.tar.gz
+aerolvm join-command --role mixed
 ```
 
-### Step 5 - Join the rest (node B, node C)
+It prints one line. With a domain, the line carries the seed's `--domain`
+and DNS options before the word `join`, and `--role mixed` at the end
+(`mixed` takes a server token):
 
-On each joining node:
+```
+curl -fsSL https://aerolvm.aerol.ai | sudo bash -s -- --domain sandbox.example.com --dns-provider cloudflare --dns-api-token "$CLOUDFLARE_API_TOKEN" join https://10.0.0.5:7003 --token <id.secret> --ca-cert-hash sha256:<hex> --role mixed
+```
+
+The line reads the Cloudflare token from the new machine, so it never holds
+it. On `node-b`, set it, then run the line as printed. Add `--node-id node-b`
+at the end to pick the node ID (the default is the short host name):
 
 ```bash
-sudo curl -fsSL https://github.com/aerol-ai/microvm/releases/latest/download/cluster-join.sh \
-  -o /usr/local/bin/cluster-join.sh
-sudo chmod +x /usr/local/bin/cluster-join.sh
-sudo /usr/local/bin/cluster-join.sh \
-    --node-id node-b \
-    --gossip-key '<key-from-cluster-init-output>' \
-    --peers 10.0.0.5:7001 \
-    --tls-bundle /tmp/aerolvm-tls-bundle.tar.gz
+export CLOUDFLARE_API_TOKEN=<cloudflare-token>
+curl -fsSL https://aerolvm.aerol.ai | sudo bash -s -- ... --role mixed --node-id node-b
 ```
 
-The script:
+`sandboxd join`:
 
-1. Validates the gossip key length.
-2. Extracts CA + cred-key from the bundle.
-3. Mints a fresh per-node cert signed by the bundled CA.
-4. Installs the credential key at `/var/lib/sandboxd/credential_encryption.key`.
-5. Writes `/etc/sandboxd/cluster.env` with `SB_BOOTSTRAP_PEERS`,
-   `SB_GOSSIP_SECRET_KEY`, `SB_CREDENTIAL_ENCRYPTION_KEY`, and the TLS dir.
-6. Restarts `sandboxd`.
+1. Fetches the cluster's `ca.crt` from the join port (7003, server cert,
+   no client cert) and checks it: against `--ca-cert-hash` when given, else
+   against an HMAC that only a holder of the token's secret can make.
+2. Runs preflight, including a dial-back: the join server opens a
+   connection back to this node's ports.
+3. Makes a P-256 key and CSR and posts the join. One Raft op uses up the
+   token and reserves the node ID for this key; the server signs the
+   certificate with the token's role. The answer carries the gossip key,
+   the bootstrap peers, the credential key (or only its wrapped form), the
+   shared PAT, and, for a server, the CA key.
+4. Writes the certs and `cluster.env`, restarts `sandboxd`, and waits until
+   the node is a member.
 
-`--peers` accepts a comma-separated list - one reachable peer is enough; the
-new node discovers the rest through gossip.
+A join that failed part way can be run again: the same key gets the same
+answer. Do `node-c` the same way. The token decides the role (`--role`
+sets the full role when it is more than the token's, for example `mixed`
+or `server,worker`).
 
 After both joins land, check the seed's log:
 
@@ -434,33 +409,47 @@ cluster: added member as raft non-voter because voter cap is reached node_id=nod
 cluster gossip joined peers ...
 ```
 
-The seed leader auto-promotes new **server-role** joiners to raft voters until
-`SB_CLUSTER_MAX_AUTO_VOTERS` is reached. Additional server joiners are added as
-raft non-voters: they still receive the whole placement log, they just do not
-increase quorum. That is why the live server tier is capped at 7 nodes — see
-"Rules" above. Worker and ingress nodes never appear in these lines at all;
-they run the Agent client, advertise no raft address, and hold no FSM.
+The leader auto-promotes new **server-role** joiners to raft voters until
+`SB_CLUSTER_MAX_AUTO_VOTERS` is reached, using the role the cert was signed
+with, not the role a node gossips. Additional server joiners are added as
+raft non-voters: they still receive the whole placement log, they just do
+not increase quorum. That is why the live server tier is capped at 7 nodes
+— see "Rules" above. Worker and ingress nodes never appear in these lines
+at all; they run the Agent client, advertise no raft address, and hold no
+FSM.
 
-### Step 6 - Verify the cluster
+Check a machine before it joins with `sudo sandboxd preflight --join
+https://10.0.0.5:7003 --token <id.secret>`: it prints a fix for each
+failing check and changes nothing.
 
-From any node:
+### Step 4 - Verify the cluster
+
+From your laptop:
 
 ```bash
-curl -H "Authorization: Bearer $SB_PAT_TOKEN" \
-  http://127.0.0.1:21212/v1/cluster/members
+aerolvm get nodes -o wide
+aerolvm cluster-info
 ```
 
-Expect three entries with `alive: true` and a recent capacity snapshot.
-
-```bash
-curl -H "Authorization: Bearer $SB_PAT_TOKEN" \
-  http://127.0.0.1:21212/v1/cluster/leader
-```
-
-Expect a non-empty leader ID matching one of the three nodes.
+Expect three nodes `Ready`, one of them `Ready,Leader`, and the leader in
+`cluster-info`.
 
 Create a sandbox via the SDK against any node - the cluster picks the owner
 based on capacity, and subsequent calls are transparently forwarded.
+
+### Join tokens are secrets
+
+A join token can make a node, and a node gets the admin PAT, the gossip
+key, the credential key (unless custody is wrapped) and, for a server, the
+CA key. Treat join tokens like the PAT:
+
+- The default token works once and lasts 2h. Server tokens last at most
+  24h.
+- `--reusable --ttl 0` (never expires) is only for worker and ingress
+  tokens, such as an autoscaler's. Enterprise mode refuses it unless key
+  custody is wrapped.
+- `aerolvm get jointokens` lists them; `aerolvm delete jointoken <id>`
+  revokes one. Every join, and every refused one, is audited.
 
 ---
 
@@ -691,12 +680,12 @@ aws ec2 authorize-security-group-ingress --group-id $SG_PUBLIC \
 aws ec2 authorize-security-group-ingress --group-id $SG_PUBLIC \
   --ip-permissions IpProtocol=tcp,FromPort=2220,ToPort=2220,IpRanges='[{CidrIp=0.0.0.0/0}]'
 
-# Cluster-internal (raft, gossip, mTLS) - only from the SG itself.
+# Cluster-internal (raft, gossip, mTLS, joins on 7003) - only from the SG itself.
 SG_CLUSTER=$(aws ec2 create-security-group --vpc-id $VPC_ID \
   --group-name aerolvm-cluster --description "Cluster-internal" \
   --query 'GroupId' --output text)
 aws ec2 authorize-security-group-ingress --group-id $SG_CLUSTER \
-  --source-group $SG_CLUSTER --protocol tcp --port 7000-7002
+  --source-group $SG_CLUSTER --protocol tcp --port 7000-7003
 aws ec2 authorize-security-group-ingress --group-id $SG_CLUSTER \
   --source-group $SG_CLUSTER --protocol udp --port 7001
 
@@ -748,8 +737,7 @@ for name in "${!NODES[@]}"; do
 done
 ```
 
-Get each node's **private** IP (you'll need these for `cluster-init.sh` and
-`cluster-join.sh`):
+Get each node's **private** IP (the join commands use `node-a`'s):
 
 ```bash
 for name in "${!NODES[@]}"; do
@@ -842,97 +830,66 @@ dig +short test.sandbox.example.com
 
 Both should return the NLB's IP(s) (Amazon-assigned, may be multiple).
 
-### Step 6 - Run `install.sh` on each EC2 instance
+### Step 6 - Install and start the cluster on `node-a`
 
-SSH to each instance (the EIPs you allocated earlier are the SSH targets):
+SSH to `node-a` (the EIPs you allocated earlier are the SSH targets) and
+install AerolVM with `init` at the end:
 
 ```bash
 ssh ubuntu@<node-a-EIP>
-sudo curl -fsSL https://aerolvm.aerol.ai \
+curl -fsSL https://aerolvm.aerol.ai \
   | sudo bash -s -- \
       --domain sandbox.example.com \
       --pat-token shared-pat-token-pick-something-strong \
       --dns-provider cloudflare \
-      --dns-api-token <cloudflare-token>
+      --dns-api-token <cloudflare-token> \
+      init --role mixed --node-id node-a --ingress-advertise-host sandbox.example.com
 ```
 
-Repeat on `node-b` and `node-c`. **Use the same `--pat-token` and the same
-`--dns-api-token` on all three.**
+Caddy solves a DNS-01 challenge against Cloudflare (writes a transient
+`_acme-challenge.sandbox.example.com` TXT record, waits for LE to verify,
+deletes the record). Allow 30-90 seconds for first issuance.
 
-Each node's Caddy will independently solve a DNS-01 challenge against
-Cloudflare (writes a transient `_acme-challenge.sandbox.example.com` TXT
-record, waits for LE to verify, deletes the record). Allow 30-90 seconds
-per node for first issuance.
-
-Verify on each node:
+On your laptop, import the admin login `init` wrote:
 
 ```bash
-sudo journalctl -u sandboxd -n 30 --no-pager | grep -iE 'health|caddy|cert'
-curl http://127.0.0.1:21212/health    # local
-curl https://sandbox.example.com/health   # via NLB → some backend
+ssh ubuntu@<node-a-EIP> sudo cat /etc/sandboxd/admin-context.json > admin-context.json
+aerolvm config import admin-context.json --use
 ```
 
-### Step 7 - Bootstrap the cluster on `node-a`
+### Step 7 - Join `node-b` and `node-c`
+
+For each, make a join command on your laptop:
 
 ```bash
-# On node-a:
-NODE_A_PRIVATE_IP=10.0.1.X    # from Step 3 output
-
-sudo curl -fsSL https://github.com/aerol-ai/microvm/releases/latest/download/cluster-init.sh \
-  -o /usr/local/bin/cluster-init.sh
-sudo chmod +x /usr/local/bin/cluster-init.sh
-
-sudo /usr/local/bin/cluster-init.sh \
-    --node-id node-a \
-    --api-advertise-url http://$NODE_A_PRIVATE_IP:21212
+aerolvm join-command --role server
 ```
 
-Save the printed gossip key and bundle path. The bundle is at
-`./aerolvm-tls-bundle.tar.gz` by default (the script prints the exact path).
-
-### Step 8 - Distribute the TLS bundle to `node-b` and `node-c`
-
-From your laptop:
+and run it on the node with the same domain options before `join`:
 
 ```bash
-scp ubuntu@<node-a-EIP>:aerolvm-tls-bundle.tar.gz /tmp/
-scp /tmp/aerolvm-tls-bundle.tar.gz ubuntu@<node-b-EIP>:/tmp/
-scp /tmp/aerolvm-tls-bundle.tar.gz ubuntu@<node-c-EIP>:/tmp/
-shred -u /tmp/aerolvm-tls-bundle.tar.gz
+ssh ubuntu@<node-b-EIP>
+curl -fsSL https://aerolvm.aerol.ai \
+  | sudo bash -s -- \
+      --domain sandbox.example.com \
+      --dns-provider cloudflare \
+      --dns-api-token <cloudflare-token> \
+      join https://<node-a-private-ip>:7003 --token <id.secret> --ca-cert-hash sha256:<hex> \
+      --role mixed --node-id node-b --ingress-advertise-host sandbox.example.com
 ```
 
-### Step 9 - Join `node-b` and `node-c`
+The join brings the shared PAT, so `--pat-token` is not needed here. See
+[Step 3 of the 3-node walkthrough](#step-3---join-the-rest-node-b-node-c)
+for what the join does.
 
-On each joiner:
+### Step 8 - Verify
 
 ```bash
-# On node-b (and node-c, with --node-id node-c):
-NODE_A_PRIVATE_IP=10.0.1.X
-GOSSIP_KEY='<key-from-step-7>'
-
-sudo curl -fsSL https://github.com/aerol-ai/microvm/releases/latest/download/cluster-join.sh \
-  -o /usr/local/bin/cluster-join.sh
-sudo chmod +x /usr/local/bin/cluster-join.sh
-
-sudo /usr/local/bin/cluster-join.sh \
-    --node-id node-b \
-    --gossip-key "$GOSSIP_KEY" \
-    --peers $NODE_A_PRIVATE_IP:7001 \
-    --tls-bundle /tmp/aerolvm-tls-bundle.tar.gz
+aerolvm get nodes
+aerolvm cluster-info
 ```
 
-### Step 10 - Verify
-
-```bash
-PAT=shared-pat-token-pick-something-strong
-
-# From your laptop, hitting the NLB:
-curl -H "Authorization: Bearer $PAT" https://sandbox.example.com/v1/cluster/members
-curl -H "Authorization: Bearer $PAT" https://sandbox.example.com/v1/cluster/leader
-```
-
-You should see all three nodes alive, and a non-empty leader. From the
-SDK:
+You should see all three nodes `Ready`, and one leader. From the SDK:
 
 ```ts
 import { Sandbox } from "@aerol-ai/sdk";
@@ -1040,23 +997,33 @@ restart the placement on a different node via an explicit re-create.
 
 ## Operating the cluster
 
+Every command below runs from your laptop with the `aerolvm` CLI and an
+admin login, unless it says `sudo` (then it runs on the node). No copy of
+this repository is needed.
+
 ### Per-node files (cluster overlay)
 
-Both `cluster-init.sh` and `cluster-join.sh` write the same two files:
+`sandboxd init` and `sandboxd join` write the same two files:
 
 - `/etc/sandboxd/cluster.env` (mode 0600) - cluster env vars.
 - `/etc/systemd/system/sandboxd.service.d/cluster.conf` - drop-in adding
   `EnvironmentFile=/etc/sandboxd/cluster.env`.
 
-The base `/etc/sandboxd/sandboxd.env` from `install.sh` is never modified.
-Re-running `install.sh` later does not overwrite the cluster overlay.
+The base `/etc/sandboxd/sandboxd.env` from `install.sh` is only changed to
+carry the shared PAT a join hands over. Re-running `install.sh` later does
+not overwrite the cluster overlay.
 
 ### Adding a 4th (or 5th, …) node
 
-Run `cluster-join.sh` on the new host with any reachable peer. The script
-takes the same gossip key + TLS bundle as the original joiners. The leader
-adds it as a voter until `SB_CLUSTER_MAX_AUTO_VOTERS` is reached; after that,
-it is added as a non-voter.
+```bash
+aerolvm join-command --role server     # or worker, or ingress
+```
+
+Run the printed line on the new host, with the cluster's domain options
+before the word `join` ([Step 3](#step-3---join-the-rest-node-b-node-c)).
+The leader adds a server as a voter until `SB_CLUSTER_MAX_AUTO_VOTERS` is
+reached; after that, it is added as a non-voter. Workers and ingress nodes
+never join Raft.
 
 > **Tip:** keep voter count odd. Add nodes in pairs: 3 → 5 → 7. A 4-node
 > cluster has the same fault tolerance as a 3-node one but a higher quorum
@@ -1064,39 +1031,26 @@ it is added as a non-voter.
 
 ### Removing a node
 
-For worker or ingress-only nodes, drain admission first, wait until the node
-owns no placements, then replace or terminate the instance:
-
 ```bash
-export SB_PAT_TOKEN=<redacted>
-curl -fsS -X POST -H "Authorization: Bearer $SB_PAT_TOKEN" \
-  http://<any-node>:21212/v1/cluster/nodes/<node-id>/drain
-curl -fsS -H "Authorization: Bearer $SB_PAT_TOKEN" \
-  'http://<any-node>:21212/v1/cluster/sandbox-index?limit=5000'
+aerolvm drain <node-id> --timeout 30m      # cordon, then wait until it runs no sandboxes
+aerolvm delete node <node-id>
 ```
 
-The packaged helper does the same check and fails if long-lived placements are
-still present:
+`drain` reads the node's own counts, so it never pages the fleet's sandbox
+index. `--delete-sandboxes` destroys what is left; `--migrate` first moves
+WASM sandboxes to another worker. `delete node` works for every role:
 
-```bash
-sudo /usr/local/sbin/sandboxd-node-lifecycle.sh pre-role-change <node-id>
-```
+- a Raft server leaves the Raft configuration (it refuses to remove the
+  last voter);
+- a worker or ingress node is cordoned and its placements are handed to
+  other workers when they asked for failover, or else orphaned (`410 Gone`);
+- the node ID and its cert key get a deny record in Raft: every other node
+  refuses its internal calls, its gossip and its cert renewal, until the
+  machine joins again with a new token and a new key.
 
-For server-role raft members, stop the daemon or terminate the instance, then
-remove the stale raft member explicitly from any surviving node:
-
-```bash
-curl -fsS -X DELETE -H "Authorization: Bearer $SB_PAT_TOKEN" \
-  http://<any-survivor>:21212/v1/cluster/members/<node-id>
-```
-
-`DELETE /v1/cluster/members/<node-id>` persists a drain mark, orphans any
-placements owned by that node (`OwnerNodeID = ""`; subsequent API calls return
-`410 Gone` under the current non-HA policy), and calls raft `RemoveServer`.
-It refuses to remove a member that is still gossiped alive unless
-`?force=true` is supplied, and it refuses to remove the last raft voter.
-Any sandboxes that were on the removed node are gone for good under the current
-non-HA policy; clients should create fresh sandboxes.
+Deleting a live node that still owns sandboxes needs `--force`. A second
+call answers "already gone". Then, on the machine, `sudo sandboxd reset
+--yes` takes it out of cluster mode (below).
 
 ### Rolling restart
 
@@ -1104,17 +1058,79 @@ Restart nodes one at a time, waiting for each to rejoin before the next:
 
 ```bash
 sudo systemctl restart sandboxd
-sudo journalctl -u sandboxd -f   # wait for "cluster: leader elected" or peer log
-# then move to next node
+aerolvm get nodes      # wait until it is Ready again, then move to the next node
 ```
 
 Quorum is preserved as long as you don't exceed `(N-1)/2` simultaneous
 restarts. For a 3-node cluster: never restart two at once.
 
-### Updating binaries
+### Upgrading
 
-Re-run `install.sh` on each node in turn (rolling). The cluster overlay is
-preserved.
+```bash
+aerolvm upgrade plan v0.7.0
+aerolvm upgrade apply v0.7.0 --wait
+```
+
+`apply` stores a rollout in Raft and the leader drives it, so it goes on
+after the CLI exits and across a leader change. Every node stages and
+checks the files first; then servers go one at a time with the leader last
+(after a leadership hand-off), then ingress nodes one at a time, then
+workers in batches (`--batch`, default 10%, at least 1), cordoned before
+they restart. Each node runs `sandboxd upgrade node` in its own systemd
+unit: hashes checked, database backed up with `VACUUM INTO`, old files
+kept as `*.prev`, and put back if the new build does not come up. See
+[`runbooks/cluster-upgrades.md`](runbooks/cluster-upgrades.md) for
+`status`, `stop`, `resume`, `finalize`, `rollback` and the alerts.
+
+While `sandboxd` restarts on a node: containers (docker, containerd,
+gVisor) and Firecracker VMs keep running and are adopted again; mount
+helpers keep serving. **WASM and V8-isolate sandboxes do not survive the
+restart today**: a WASM sandbox comes back `stopped` with its state gone,
+and an isolate sandbox is gone. Drain those nodes first, or recreate those
+sandboxes after.
+
+Offline sites: `aerolvm release pull v0.7.0 -o aerolvm-v0.7.0.tgz` on a
+machine with internet, then `aerolvm upgrade apply v0.7.0 --from
+aerolvm-v0.7.0.tgz`. A node with `SB_REMOTE_UPGRADE=false` (the default in
+enterprise mode) is marked `manual`; `aerolvm upgrade status` prints the
+`sudo sandboxd upgrade node ...` line to run on it.
+
+**The first hop from a release without `aerolvm upgrade`** (v0.6.11 and
+older) uses the installer once per node, one at a time, servers first and
+the leader (`aerolvm cluster-info`) last:
+
+```bash
+curl -fsSL https://aerolvm.aerol.ai | sudo bash
+```
+
+It keeps the node's settings (`/etc/sandboxd/node.json`) and the PAT every
+peer shares, restarts `sandboxd` onto the new binary, and never touches the
+cluster overlay. Wait until `aerolvm get nodes` shows the node `Ready`
+before the next one. Check a node with `sudo sandboxd version`. A cluster
+first built with `cluster-init.sh` then needs `sandboxd adopt` once (next
+section).
+
+### Bringing a cluster built with cluster-init.sh onto one-line joins
+
+`cluster-init.sh` kept `ca.key` on the seed only, and admitted nobody in
+Raft, so new joins and cert renewal have nothing to work with. After the
+first hop above:
+
+1. On the seed: `sudo sandboxd adopt`. It imports
+   `/etc/sandboxd/cluster-ca/ca.key` into the CA store and records every
+   live member's node ID and cert key as admitted (one Raft op).
+2. On every other server: `sudo sandboxd adopt`. Each fetches the CA key
+   from the seed over the internal mTLS channel, authenticated by its
+   existing node cert.
+3. Workers and ingress nodes need nothing.
+
+`adopt` is safe to run again ("admitted now: none"). If the seed is gone,
+run `sudo sandboxd adopt --ca-key <file>` on a server with a saved copy of
+its `ca.key` (a `sandboxd backup` archive of the seed has one). Without
+any copy the cluster can't sign new certs; the way out is a new CA, which
+is out of scope here.
+
+From then on `aerolvm join-command` works and node certs renew themselves.
 
 Go one node at a time, as in a rolling restart, but finish every server node
 in the same session. Do not leave old and new servers running side by side
@@ -1125,20 +1141,20 @@ a release says "upgrade every server in one window" in its release notes.
 ### Taking a node out of cluster mode
 
 ```bash
-sudo systemctl stop sandboxd
-sudo rm /etc/sandboxd/cluster.env /etc/systemd/system/sandboxd.service.d/cluster.conf
-sudo systemctl daemon-reload
-sudo systemctl start sandboxd
+sudo sandboxd reset --yes
 ```
 
-The node's local SQLite + sandboxes remain. Only the cluster wiring is
-removed. The remaining cluster eventually reconciles its absence.
+It asks the cluster to delete this node (when it can reach it), stops
+`sandboxd`, and removes `cluster.env`, the certs and keys, the CA store
+and the Raft data. The local SQLite database, the server key and
+`sandboxd.env` stay. Then join again with a new token, or start
+`sandboxd` as a single node.
 
 ---
 
 ## Cluster-mode environment variables
 
-These are managed by the scripts. Operators who prefer to manage the env
+These are written by `sandboxd init` and `sandboxd join`. Operators who prefer to manage the env
 file themselves can set them directly in `/etc/sandboxd/cluster.env`.
 
 | Variable | Required | Description |
@@ -1189,22 +1205,17 @@ Same as a single-node install, plus:
 | `/etc/sandboxd/cluster.env` | Cluster env vars (mode 0600). |
 | `/etc/systemd/system/sandboxd.service.d/cluster.conf` | systemd drop-in. |
 | `/etc/sandboxd/tls/ca.crt` | Cluster CA. |
-| `/etc/sandboxd/cluster-ca/ca.key` | Seed signer key, separate from the daemon TLS directory. Move this signer directory to offline/HSM custody after provisioning. |
-| `/etc/sandboxd/cluster-ca/ca.crt` | Signer-side CA certificate paired with `ca.key`. |
-| `/etc/sandboxd/tls/node.crt` | This node's cert, signed by the cluster CA. |
+| `/etc/sandboxd/cluster-ca/ca.key` | The CA store (`SB_CLUSTER_CA_DIR`): the cluster CA's signing key. Every server holds it, so any server can sign a joining node's cert; workers and ingress nodes never do. |
+| `/etc/sandboxd/cluster-ca/ca.crt` | The CA certificate paired with `ca.key`. |
+| `/etc/sandboxd/tls/node.crt` | This node's cert, signed by the cluster CA (`DNS:node:<id>`, `DNS:role:<role>`). Renewed by itself at 2/3 of its life. |
 | `/etc/sandboxd/tls/node.key` | This node's private key. Mode 0600. |
+| `/etc/sandboxd/admin-context.json` | The seed only: the admin login `sandboxd init` wrote for `aerolvm config import`. Mode 0600. Holds the PAT; delete it once you have copied it. |
 | `/var/lib/sandboxd/raft/` | Raft log + snapshots. |
 | `/var/lib/sandboxd/credential_encryption.key` | Cluster-wide AES key (also exported into env). |
 
-The cluster TLS bundle (`aerolvm-tls-bundle.tar.gz`) is generated by
-`cluster-init.sh` for distribution and should be deleted from any host that
-isn't actively joining a node.
-
-`cluster-init.sh` puts signing material under `/etc/sandboxd/cluster-ca`, never
-under the daemon TLS directory. Move that signer directory to offline/HSM
-custody after provisioning and pass its mounted path via
-`cluster-sign-node.sh --ca-dir` during controlled issuance. The daemon needs
-only `ca.crt`, `node.crt`, and `node.key`.
+Servers hold the CA key because they all sign joins (the same exposure as
+the credential key every node already holds). An external-CA mode, with the
+key off the servers, is not built yet.
 
 ---
 
@@ -1217,30 +1228,31 @@ Per-node, back up:
 
 1. `/var/lib/sandboxd/state.db` - local SQLite (sandboxes this node owns).
 2. `/var/lib/sandboxd/raft/` - local raft log + snapshots.
-3. `/etc/sandboxd/cluster.env`, `/etc/sandboxd/sandboxd.env` - config.
-4. `/etc/sandboxd/tls/` - node cert and CA.
-5. `/var/lib/sandboxd/credential_encryption.key` - required to decrypt
+3. `/etc/sandboxd/` - config, the node cert and CA, and on servers the CA
+   store.
+4. `/var/lib/sandboxd/credential_encryption.key` - required to decrypt
    sealed credentials in the FSM.
 
-For a full cluster recovery from total destruction, you also need the public
-CA trust bundle, the separately protected CA signer key, and the gossip key.
-Store the signer key in an offline secrets system or HSM, never in a daemon
-TLS bundle.
-
-The repo includes a backup helper that packages the local SQLite DB, Raft
-state, and `/etc/sandboxd` config tree into one restricted archive:
+`sandboxd backup` packages all of it into one archive, mode 0600. The
+database is copied with `VACUUM INTO`, so a backup taken while `sandboxd`
+runs is consistent:
 
 ```bash
-sudo scripts/sandboxd-backup.sh --output /secure/backups/sandboxd-$(hostname)-$(date +%F).tar.gz
+sudo sandboxd backup --output /secure/backups/sandboxd-$(hostname)-$(date +%F).tar.gz
 ```
 
-To restore onto a stopped replacement node:
+With wrapped key custody the archive carries only the wrapped key;
+otherwise it carries the plain key, so store it as a secret. To restore onto
+a stopped replacement node:
 
 ```bash
 sudo systemctl stop sandboxd
-sudo scripts/sandboxd-restore.sh --input /secure/backups/sandboxd-node-a-2026-05-20.tar.gz --target-root / --force
-sudo systemctl start sandboxd
+sudo sandboxd restore --input /secure/backups/sandboxd-node-a-2026-05-20.tar.gz --force --start
 ```
+
+`restore` checks the whole archive first and moves what it replaces aside
+as `<name>.pre-restore-<time>`. See
+[`runbooks/backup-restore.md`](runbooks/backup-restore.md).
 
 ---
 
@@ -1254,10 +1266,10 @@ Confirm the diagnosis on a survivor:
 
 ```bash
 sudo journalctl -u sandboxd --since "10 minutes ago" | grep -iE 'leader|election'
-curl -s -H "Authorization: Bearer $SB_PAT_TOKEN" http://127.0.0.1:21212/v1/cluster/leader
+aerolvm cluster-info      # no leader
 ```
 
-A persistent empty `Leader` field with repeated election timeouts is the
+A persistent empty leader with repeated election timeouts is the
 signature.
 
 ### Option A - wait for the lost nodes to come back
@@ -1267,40 +1279,33 @@ configuration. **Try this first** - non-destructive.
 
 ### Option B - manual quorum recovery (last resort, destructive)
 
-If the lost voters are gone for good (disk loss, hardware destroyed):
+If the lost voters are gone for good (disk loss, hardware destroyed),
+follow [`runbooks/lost-quorum-recovery.md`](runbooks/lost-quorum-recovery.md).
+In short:
 
 1. Stop `sandboxd` on every survivor.
-2. On the node with the highest raft `LastIndex` (check `journalctl`),
-   create `/var/lib/sandboxd/raft/peers.json` directly or with the helper:
+2. On the survivor you chose (the one with the highest raft `LastIndex`):
 
    ```bash
-   sudo scripts/raft-lost-quorum-recover.sh \
-     --raft-dir /var/lib/sandboxd/raft \
-     --node-id this-node-id \
-     --raft-address 10.0.0.5:7000
+   sudo sandboxd recover-quorum --start
    ```
 
-3. Start `sandboxd` on that node only. It detects `peers.json`, runs
-   HashiCorp Raft's recovery path, rewrites the raft configuration to the
-   supplied peers, and renames the file to `peers.json.applied.<unix>` after
-   success.
-4. Once it elects itself leader, re-add the other survivors:
+   It backs the node up, writes `peers.json` that makes this server the
+   only voter, starts `sandboxd`, and waits until it leads.
+3. On each other surviving server, once the survivor leads:
 
    ```bash
-   sudo rm -rf /var/lib/sandboxd/raft   # on each rejoining node
-   sudo cluster-join.sh --gossip-key '<key>' \
-                        --peers <recovered-node>:7001 \
-                        --tls-bundle <bundle> \
-                        --force
+   sudo sandboxd recover-quorum --rejoin --start
    ```
 
-5. Inspect placements via `GET /v1/cluster/members`. Any sandboxes owned by
-   permanently-lost nodes are reassigned (or orphaned if no capacity) by
-   the dead-owner reconciler.
+   It moves the stale Raft directory aside so the server rejoins as a new
+   voter.
+4. Delete the servers that are gone for good (`aerolvm delete node <id>`)
+   and add new ones with `aerolvm join-command --role server`.
 
 This is **destructive to durability guarantees** - any committed entry the
-surviving node never replicated is lost. Document this procedure in your
-runbook before you need it.
+surviving node never replicated is lost. Rehearse the runbook before you
+need it.
 
 ---
 
@@ -1308,8 +1313,9 @@ runbook before you need it.
 
 A healthy cluster reports:
 
-- A non-empty `Leader` from `GET /v1/cluster/leader`.
-- All expected node IDs in `GET /v1/cluster/members` with `alive: true`.
+- `aerolvm get nodes`: every expected node `Ready`, one `Ready,Leader`
+  (the API: `GET /v1/cluster/members` with `alive: true`, and a non-empty
+  `GET /v1/cluster/leader`).
 - No repeated `cluster: AssertOwnership skipped, no leader yet` warnings.
 - `cluster: auto-promoted member to raft voter` or `cluster: added member as
   raft non-voter because voter cap is reached` log lines when joiners come
@@ -1371,7 +1377,7 @@ Full incident runbooks are available under `setup/runbooks/`:
 |---|---|---|
 | Joiner stuck, gossip never lands | Wrong `--gossip-key`, or `:7001` blocked | Compare gossip key char-for-char; check security group |
 | Joiner gossiped but no voter promotion | Raft `:7000` blocked | Open `:7000` between nodes |
-| Daemon refuses to start: `SB_GOSSIP_SECRET_KEY is required` | Cluster env file missing or empty | Re-run `cluster-init.sh` / `cluster-join.sh` |
+| Daemon refuses to start: `SB_GOSSIP_SECRET_KEY is required` | Cluster env file missing or empty | Re-run `sandboxd init` (seed) or the join line from `aerolvm join-command` (other nodes); both are safe to repeat |
 | Daemon refuses to start: `SB_CREDENTIAL_ENCRYPTION_KEY is required` | Same - credential key not in `cluster.env` and no key file on disk | Re-run cluster scripts (they now distribute the key); or copy `/var/lib/sandboxd/credential_encryption.key` from another node |
 | Failed-over sandbox can't pull image | Different credential keys across nodes | Verify `sha256sum /var/lib/sandboxd/credential_encryption.key` matches everywhere |
 | `502` from any node for a sandbox URL | Owner node down and grace not yet elapsed | Wait up to `SB_DEAD_OWNER_GRACE`; then dead-owner reconciler reassigns |

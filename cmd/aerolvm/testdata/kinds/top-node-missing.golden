@@ -1,0 +1,5 @@
+exit 1
+--- stdout
+--- stderr
+aerolvm: node "ghost" not found
+hint: run `aerolvm get nodes` to list them

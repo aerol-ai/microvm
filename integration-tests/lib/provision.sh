@@ -19,7 +19,8 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-TF_DIR="${REPO_ROOT}/Terraform"
+# The root a checkout runs; it calls the module in Terraform/ (run.sh tf_root).
+TF_DIR="${REPO_ROOT}/Terraform/root"
 STATE_BUCKET_PREFIX="integration/" # all integration state lives under this key prefix
 
 # check_safety enforces the three tripwires. Returns non-zero with a message on

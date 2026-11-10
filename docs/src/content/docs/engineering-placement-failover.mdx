@@ -689,7 +689,7 @@ These are the current limits of cluster mode. This page would be dishonest if it
 - **`failover.policy = "recreate"` is best effort.** The new owner rebuilds from the spec. Anything kept only in the container's writable layer is gone; see [Durability and failover](/durability/) for the full table.
 - **Raft needs a majority.** Two server-role nodes cannot survive losing one; three can, so run an odd number of server-role nodes. Above 10 live nodes, `LargeClusterTopologyError` (in `topology.go`) also requires dedicated server, worker and ingress roles, and it caps the server tier at 7 nodes.
 
-None of this is hidden. Operators planning a cluster need to know the guarantees and the failure modes. [Cluster setup](/cluster-setup/) covers how to run one.
+None of this is hidden. Operators planning a cluster need to know the guarantees and the failure modes. [Cluster setup](/cluster/) covers how to run one.
 
 ## What this buys you
 
@@ -837,7 +837,7 @@ The same create call works on one node, on three nodes, and in the middle of a f
 ## Next steps
 
 - [Durability and failover](/durability/): what survives a host loss, and what `failover.policy = "recreate"` keeps.
-- [Cluster setup](/cluster-setup/): how to deploy a cluster, and the quorum rules.
+- [Cluster setup](/cluster/): how to deploy a cluster, and the quorum rules.
 - [Safe retries (idempotency)](/engineering-idempotency/): the single-node rules (name uniqueness, partial unique indexes) that the FSM mirrors across the cluster.
 - [Secrets providers](/cluster-secrets/): how sealed secrets are copied to the nodes that may need them.
 - [Staying up under overload](/overload-protection-architecture/): how a node protects itself when too many cluster-wide lists read the placement table at once.

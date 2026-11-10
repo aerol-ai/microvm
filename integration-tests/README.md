@@ -219,6 +219,88 @@ integration-tests/run.sh cluster-hetero --upgrade-from v0.6.7  # full gate
 [`SNAPSHOT-MIGRATION-UPGRADE.md`](./SNAPSHOT-MIGRATION-UPGRADE.md) is the manual
 runbook the automation mirrors (use it to debug a failed gate).
 
+The gate upgrades the way the docs tell an operator to: it copies this
+build's `install.sh`, `sandboxd`, `toolboxd` and `checksums.txt` to each node
+and re-runs `install.sh` with no node flags (only the `--*-url` flags that say
+where those files are). Per node it fails unless the PAT is kept,
+`/etc/sandboxd/node.json` is written (0600, root, no PAT) after the settings
+were read back from the old release's files, sandboxd restarted onto the new
+build (new PID, `/health` version), and `sandboxd --version` prints
+`sandboxd itest-<build id>` without disturbing the daemon. Each node's
+installer output goes to `reports/upgrade-gate-<scenario>-install-<ip>.log`.
+`upgrade-gate.sh <scenario> --from <tag> --swap-binary` upgrades by copying
+the binary in instead, to check a schema migration alone.
+
+`--upgrade-node` (on `run.sh` with `--upgrade-from`, or on `upgrade-gate.sh`)
+upgrades through `sandboxd upgrade node` instead
+(`plans/kubectl-style-cluster-ops.md` §6.3): this build's `sandboxd` runs
+from a temp path with `--from` a directory of this build's files and
+`--allow-unversioned` (the build's version is `itest-<build id>`). Per node it
+fails unless the old binaries are kept as `*.prev`, a `state.db` backup
+exists, sandboxd restarted onto the new build, and a second identical
+upgrade is a noop with the same PID; a container sandbox created before the
+upgrade must still run under the same ID and answer exec. After the schema
+checks, `sandboxd upgrade node <tag> --rollback` must put the old binaries
+back and sandboxd report `<tag>`. The node's upgrader log is
+`/tmp/aerolvm-upgrade-node/upgrade.err`, and the gate prints how long the
+database backup took.
+
+```bash
+integration-tests/run.sh single-node --upgrade-from v0.6.11 --upgrade-node
+```
+
+## Release gate: one-line joins
+
+`plans/kubectl-style-cluster-ops.md` Phase 2 has two halves.
+
+`cluster-join-token` (3 servers, 1 ingress, 2 workers, t3.medium) builds
+every node from blank Ubuntu with Terraform `one_line_join`: the seed runs
+`install.sh ... init` with Terraform's token per role, every other node
+`install.sh ... join https://<seed>:7003 --token <t>`; no S3 hand-off, no
+CSR loop, no scp. Node certs last 10 minutes so renewal happens during the
+run. Its cases are UC-620..625 (`TestJoinToken*`; the disruptive ones delete
+and re-join a worker):
+
+```bash
+AEROL_TEST_RUN='TestJoinToken' integration-tests/run.sh cluster-join-token
+```
+
+`cluster-join-adopt` is the adopt path: provisioned on an old release with
+the old scripts, moved to this build with the `install.sh` first hop,
+adopted with `sandboxd adopt` (the seed, then every other server), and grown
+by one blank machine (`spare-1`, Terraform `nodes[].blank`) with the line
+`aerolvm join-command` prints. `adopt-gate.sh` runs it and prints
+UC-630..634 as PASS or FAIL:
+
+```bash
+integration-tests/run.sh cluster-join-adopt --adopt-from v0.6.11
+```
+
+## Release gate: Terraform used by URL
+
+Terraform/ is a module; every scenario runs it through `Terraform/root`,
+the root a checkout runs (`run.sh` `tf_root`). `plans/kubectl-style-cluster-ops.md`
+Phase 5 asks for a cluster built with the module used by URL, with no
+checkout behind it. A scenario with the `module-url` capability gets that:
+`run.sh` makes a root of its own under `.tf/<scenario>/root` (only `.tf`
+files) whose module block fetches `Terraform/` by git URL, and leaves the
+join to the module's default (one line per node). The URL is
+`AEROL_TF_MODULE_SOURCE` when set (for example the real
+`git::https://github.com/aerol-ai/microvm//Terraform?ref=<tag>` after a
+release), or else a bare clone of this branch's **committed** head, so
+commit `Terraform/` changes before a run.
+
+`cluster-module-url` (3 servers, the seed is `server,ingress`, 1 worker and
+1 blank machine, t3.medium) runs UC-683..687 (`TestModuleURL*`): the module
+came by URL, every node joined with one line, `aerolvm get nodes` shows
+every node Ready, a sandbox answers exec, the module's three tokens are
+registered, and the line `aerolvm join-command` prints adds the blank
+machine as a worker:
+
+```bash
+AEROL_TEST_RUN='TestModuleURL' integration-tests/run.sh cluster-module-url
+```
+
 ## Key custody scenarios
 
 Customer key custody (`plans/customer-key-custody.md` Phase 6) has five

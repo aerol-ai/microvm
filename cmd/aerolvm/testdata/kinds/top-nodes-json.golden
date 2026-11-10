@@ -1,0 +1,34 @@
+exit 0
+--- stdout
+{
+  "nodes": [
+    {
+      "node_id": "srv-a",
+      "known": false,
+      "cpu_reserved": 0,
+      "cpu_budget": 0,
+      "memory_reserved_mb": 0,
+      "memory_budget_mb": 0,
+      "sandboxes": 0
+    },
+    {
+      "node_id": "wkr-1",
+      "known": true,
+      "cpu_reserved": 2.5,
+      "cpu_budget": 8,
+      "memory_reserved_mb": 1024,
+      "memory_budget_mb": 4096,
+      "sandboxes": 3
+    },
+    {
+      "node_id": "wkr-2",
+      "known": false,
+      "cpu_reserved": 0,
+      "cpu_budget": 0,
+      "memory_reserved_mb": 0,
+      "memory_budget_mb": 0,
+      "sandboxes": 0
+    }
+  ]
+}
+--- stderr

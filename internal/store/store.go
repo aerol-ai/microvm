@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/aerol-ai/microvm/pkg/capacity"
@@ -42,6 +43,12 @@ type Store struct {
 	db           *sql.DB
 	rdb          *sql.DB
 	secretCipher *secrets.Cipher
+
+	// migrations is the numbered schema history this build knows (legacy
+	// and newer); RunOneWayMigrations applies its pending one-way entries,
+	// one caller at a time under schemaMu.
+	migrations []schemaMigration
+	schemaMu   sync.Mutex
 }
 
 // SetSecretCipher configures at-rest toolbox-token sealing. Production wiring
@@ -77,6 +84,12 @@ func OpenWithSecretCipher(path string, secretCipher *secrets.Cipher) (*Store, er
 }
 
 func open(path string, secretCipher *secrets.Cipher) (*Store, error) {
+	return openWith(path, secretCipher, newerSchemaMigrations)
+}
+
+// openWith opens the store with newer as the migrations after the legacy
+// baseline. Production passes newerSchemaMigrations; tests pass their own.
+func openWith(path string, secretCipher *secrets.Cipher, newer []schemaMigration) (*Store, error) {
 	// The DB stores encrypted secrets and sandbox metadata.
 	// Lock the directory and file to owner-only so a custom DBPath, a dev
 	// run on a shared host, or any setup that doesn't go through the
@@ -892,13 +905,6 @@ func open(path string, secretCipher *secrets.Cipher) (*Store, error) {
 	}
 	stmts = append(stmts, identitySchema...)
 
-	for _, stmt := range stmts {
-		if _, err := db.Exec(stmt); err != nil {
-			db.Close()
-			return nil, fmt.Errorf("run schema statement: %w", err)
-		}
-	}
-
 	// Additive migrations for sandboxes columns introduced after the original
 	// schema landed. Each ALTER TABLE is run unconditionally; SQLite returns
 	// "duplicate column name" when the column already exists, which we
@@ -1230,104 +1236,12 @@ func open(path string, secretCipher *secrets.Cipher) (*Store, error) {
 		// full rebuild (with the composite FK) happens in migrateSnapshotOwnerPK.
 		`ALTER TABLE snapshot_aliases ADD COLUMN owner_ref TEXT NOT NULL DEFAULT '';`,
 	}
-	for _, stmt := range migrations {
-		if _, err := db.Exec(stmt); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
-			db.Close()
-			return nil, fmt.Errorf("apply schema migration %q: %w", stmt, err)
-		}
-	}
-	// The image-GC ledger predates engine awareness with `image` as its sole
-	// primary key, and SQLite cannot widen a primary key in place. Rebuild it
-	// once so a node that holds the same image under two engines can carry a
-	// cleanup row for each.
-	if err := migratePendingImageGCKey(db); err != nil {
-		db.Close()
-		return nil, err
-	}
-	// owner_ref is a compatibility column, so the per-owner name index can
-	// only be built after the ALTER loop above.
-	if err := migrateSandboxNameIndex(db); err != nil {
-		db.Close()
-		return nil, err
-	}
-	if err := backfillSnapshotOwners(db); err != nil {
-		db.Close()
-		return nil, err
-	}
-	// Widen the snapshot primary key from (name) to (owner_ref, name) so two
-	// tenants can hold a same-named snapshot and one cannot learn or pre-claim
-	// another's names. Runs AFTER backfillSnapshotOwners so owner_ref is
-	// populated before it leads the key. SQLite cannot widen a PK in place, so
-	// this rebuilds sandbox_snapshots and snapshot_aliases (whose FK depends on
-	// it). Idempotent: a no-op once the composite key is in place.
-	if err := migrateSnapshotOwnerPK(db); err != nil {
-		db.Close()
-		return nil, err
-	}
-	if err := ensureSnapshotPushQueueShape(db); err != nil {
-		db.Close()
-		return nil, err
-	}
-	// Widen the WASM catalogue key from (id) to (owner_ref, id) so a second
-	// tenant registering the same module bytes gets its own digest-id row.
-	// Runs after the migrations loop, which adds owner_ref to pre-#724 tables.
-	if err := migrateWasmModuleOwnerPK(db); err != nil {
-		db.Close()
-		return nil, err
-	}
-	// Partial unique index on host_port (only enforced when host_port > 0).
-	// This is the load-bearing primitive of the random-first allocator: two
-	// concurrent ExposePort calls race to INSERT a host_port row, and only
-	// one wins per port. SQLite's single writer keeps the contest serialized.
-	if _, err := db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_exposed_ports_host_port ON exposed_ports(host_port) WHERE host_port > 0;`); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("create exposed_ports host_port index: %w", err)
-	}
-
-	// Partial index keeps the auto-import reconciler scan O(pending), not
-	// O(sandboxes). Steady-state count is zero so the index footprint is
-	// negligible; spikes happen when AOCR is briefly unreachable.
-	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_sandboxes_auto_import_pending ON sandboxes(id) WHERE auto_import_pending = 1;`); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("create sandboxes auto_import_pending index: %w", err)
-	}
-	// Same shape for the rollback-pending reconcile scan: zero rows in the
-	// steady state, so every reconcile pass is one empty index probe.
-	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_sandboxes_rollback_pending ON sandboxes(id) WHERE rollback_pending = 1;`); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("create sandboxes rollback_pending index: %w", err)
-	}
-
-	// Partial index on the new template_id column. The template GC and
-	// DELETE-template both call IsTemplateReferenced (a SELECT 1 ... WHERE
-	// template_id = ? LIMIT 1) which becomes an index probe instead of a
-	// table scan. Predicate keeps the index empty for Docker sandboxes and
-	// for Firecracker sandboxes built from ad-hoc images.
-	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_sandboxes_template_id ON sandboxes(template_id) WHERE template_id <> '';`); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("create sandboxes template_id index: %w", err)
-	}
-
-	// WASM module GC checks whether any sandbox still references a catalogue
-	// row by module_ref or module_digest. These columns are compatibility
-	// migrations, so create the indexes after the ALTER loop above.
-	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_sandboxes_module_ref ON sandboxes(module_ref) WHERE module_ref <> '';`); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("create sandboxes module_ref index: %w", err)
-	}
-	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_sandboxes_module_digest ON sandboxes(module_digest) WHERE module_digest <> '';`); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("create sandboxes module_digest index: %w", err)
-	}
-	if _, err := db.Exec(sandboxNameLookupIndexDDL); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("create sandboxes name lookup index: %w", err)
-	}
-	if err := migrateLegacyPlaintextSecrets(db, secretCipher); err != nil {
-		db.Close()
-		return nil, err
-	}
-	if err := migrateEnvBinding(db, secretCipher); err != nil {
+	// Both lists above are the legacy steps 1 and 2 of the numbered schema
+	// history (schema_migrations.go), which also refuses a database a newer
+	// build has made one-way changes to before running anything. Do not
+	// grow them: a schema change is a new entry in newerSchemaMigrations.
+	schema := append(legacySchemaMigrations(stmts, migrations, secretCipher), newer...)
+	if err := migrateSchema(db, schema); err != nil {
 		db.Close()
 		return nil, err
 	}
@@ -1361,7 +1275,7 @@ func open(path string, secretCipher *secrets.Cipher) (*Store, error) {
 		rdb.SetMaxIdleConns(sqliteReadConns)
 	}
 
-	return &Store{db: db, rdb: rdb, secretCipher: secretCipher}, nil
+	return &Store{db: db, rdb: rdb, secretCipher: secretCipher, migrations: schema}, nil
 }
 
 const legacySecretMigrationBatchSize = 256
