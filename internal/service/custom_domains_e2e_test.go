@@ -310,9 +310,6 @@ func patchPebbleACME(t testing.TB, c *dockerfx.Container, apiRootPEM []byte) {
 	}
 }
 
-// dockerCpToContainer uploads a small file into a running container via the
-// Docker daemon's /containers/{id}/archive endpoint. We tar the single file
-// and PUT it at the destination directory.
 // dockerCpFromContainer reads one file out of a container, through the same
 // archive API dockerCpToContainer writes with.
 func dockerCpFromContainer(t testing.TB, c *dockerfx.Container, srcPath string) []byte {
@@ -351,6 +348,9 @@ func dockerCpFromContainer(t testing.TB, c *dockerfx.Container, srcPath string) 
 	}
 }
 
+// dockerCpToContainer uploads a small file into a running container via the
+// Docker daemon's /containers/{id}/archive endpoint. We tar the single file
+// and PUT it at the destination directory.
 func dockerCpToContainer(t testing.TB, c *dockerfx.Container, content []byte, dstPath string) {
 	t.Helper()
 	dir, name := filepath.Split(dstPath)
@@ -431,11 +431,10 @@ func fetchPebbleRoots(t testing.TB, pebble *dockerfx.Container) []byte {
 	return raw
 }
 
-// pebbleIssuanceCount counts "Signing certificate" lines in Pebble's logs.
-// Combined with PEBBLE_AUTHZREUSE=0 every cache miss produces a fresh order
-// and a fresh log line — a reliable proxy for "new certs issued".
 // pebbleIssuanceCount counts certificates Pebble issued. Pebble 2.x logs
 // "Issued certificate serial <n> for order <id>" for each one (ca/ca.go).
+// Combined with PEBBLE_AUTHZREUSE=0 every cache miss produces a fresh order
+// and a fresh log line — a reliable proxy for "new certs issued".
 func pebbleIssuanceCount(pebble *dockerfx.Container) int {
 	return pebble.LogContains("Issued certificate serial")
 }

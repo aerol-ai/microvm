@@ -657,7 +657,7 @@ func TestEnsureOnDemandTLSInstallsPolicyWhenAbsent(t *testing.T) {
 		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/policies"):
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write([]byte(`[]`))
-		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/policies"):
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/policies/..."):
 			posted = true
 			w.WriteHeader(http.StatusOK)
 		default:
@@ -800,7 +800,7 @@ func TestEnsureOnDemandTLSSkipsPolicyWhenPresent(t *testing.T) {
 		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/policies"):
 			w.WriteHeader(http.StatusOK)
 			_ = json.NewEncoder(w).Encode([]map[string]any{{"on_demand": true}})
-		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/policies"):
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/policies/..."):
 			posted = true
 			w.WriteHeader(http.StatusOK)
 		}
@@ -897,7 +897,7 @@ func TestEnsureOnDemandTLSPolicyPostError(t *testing.T) {
 		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/policies"):
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write([]byte(`[]`))
-		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/policies"):
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/policies/..."):
 			w.WriteHeader(http.StatusInternalServerError)
 		}
 	}))

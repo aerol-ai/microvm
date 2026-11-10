@@ -264,9 +264,12 @@ the skip.
   2.10, the TLS app checks automation policies before it turns the
   deprecated `ask` into a permission, so an on-demand policy behind `ask`
   alone always failed, and no custom domain got a certificate. Fixed:
-  `EnsureOnDemandTLS` sends the `http` permission module, and POSTs
-  `on_demand` (PUT answered 409 after every restart). The boot log no longer
-  promises a retry. Proven by `make test-acme-e2e` on Caddy 2.11.9.
+  `EnsureOnDemandTLS` sends the `http` permission module (Caddy 2.8+), POSTs
+  `on_demand` (PUT answered 409 whenever sandboxd restarted under a running
+  Caddy) with a PUT fallback when its parent keys are missing, and appends
+  the policy as a list to `policies/...` so it also works with no list yet.
+  The boot log no longer promises a retry. Proven by `make test-acme-e2e`
+  on Caddy 2.11.9.
 - **Correction (2026-10-06):** that policy is **not** retried on reconcile,
   despite the log line. `pkg/daemon/daemon.go:1006-1007` logs "will retry on
   next reconcile", but `EnsureOnDemandTLS` has only that one boot-time call.

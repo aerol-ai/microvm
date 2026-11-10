@@ -161,7 +161,7 @@ func TestCov96RunCustomDomainsInstallsOnDemandTLS(t *testing.T) {
 	mu.Lock()
 	defer mu.Unlock()
 	if !onDemand || !strings.Contains(logs, "caddy on-demand TLS policy installed") {
-		t.Fatalf("on-demand PUT seen=%v; log lacks install line", onDemand)
+		t.Fatalf("on-demand write seen=%v; log lacks install line", onDemand)
 	}
 }
 

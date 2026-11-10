@@ -428,7 +428,7 @@ func TestSendJSONDetailUnreadableErrorBody(t *testing.T) {
 func TestEnsureOnDemandTLSPolicyPostTransportError(t *testing.T) {
 	c := scriptedClient(func(key string) scriptedReply {
 		switch key {
-		case "PUT /config/apps/tls/automation/on_demand":
+		case "POST /config/apps/tls/automation/on_demand":
 			return scriptedReply{status: 200}
 		case "GET /config/apps/tls/automation/policies":
 			return scriptedReply{status: 404}

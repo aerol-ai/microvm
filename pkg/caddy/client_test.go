@@ -617,7 +617,7 @@ func TestRouteCases(t *testing.T) {
 				}
 				// The on_demand leaf is POSTed too; only a policy POST counts.
 				for _, rec := range fake.records {
-					if rec.Method == http.MethodPost && rec.Path == "/config/apps/tls/automation/policies" {
+					if rec.Method == http.MethodPost && strings.HasPrefix(rec.Path, "/config/apps/tls/automation/policies") {
 						t.Fatalf("should not POST policy if it exists")
 					}
 				}
@@ -1652,7 +1652,7 @@ func newFakeCaddy(t *testing.T) *fakeCaddy {
 			}
 			w.WriteHeader(http.StatusOK)
 			_ = json.NewEncoder(w).Encode([]any{map[string]any{"on_demand": true}})
-		case r.Method == http.MethodPost && r.URL.Path == "/config/apps/tls/automation/policies":
+		case r.Method == http.MethodPost && r.URL.Path == "/config/apps/tls/automation/policies/...":
 			fake.hasPolicy = true
 			w.WriteHeader(http.StatusOK)
 		case r.Method == http.MethodPut && r.URL.Path == "/config/apps/http/servers/srv0/routes/0":
