@@ -98,6 +98,12 @@ func TestSystemHostFetch(t *testing.T) {
 		t.Fatalf("file URL: %d %v", size, err)
 	}
 	_ = body.Close()
+	// A version or file name is path-escaped into the URL; parsing turns
+	// %2F back into "/", so ".." must not reach a file outside the mirror.
+	escaped := "file://" + filepath.Dir(local) + "/v0.7.0/..%2F..%2F..%2Fetc%2Fpasswd"
+	if _, _, err := h.Fetch(ctx, escaped); err == nil || !strings.Contains(err.Error(), `must not contain ".."`) {
+		t.Fatalf("file URL with ..: %v", err)
+	}
 	for _, bad := range []string{"ftp://x/y", "file:///no/such/file", "http://[::1", "http://127.0.0.1:1/x"} {
 		if _, _, err := h.Fetch(ctx, bad); err == nil {
 			t.Fatalf("fetched %s", bad)

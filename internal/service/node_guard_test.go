@@ -385,3 +385,16 @@ func TestNodeControlAndNodeGuardAgree(t *testing.T) {
 		}
 	}
 }
+
+// A configured port out of range is no port at all, not a wrapped one:
+// uint16(70000) would be 4464.
+func TestPortOf(t *testing.T) {
+	for _, tc := range []struct {
+		in   int
+		want uint16
+	}{{53054, 53054}, {1, 1}, {65535, 65535}, {0, 0}, {-1, 0}, {65536, 0}, {70000, 0}} {
+		if got := portOf(tc.in); got != tc.want {
+			t.Errorf("portOf(%d) = %d, want %d", tc.in, got, tc.want)
+		}
+	}
+}

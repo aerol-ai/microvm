@@ -132,7 +132,18 @@ func (s *Service) gatewayNodePorts() (dns, proxy uint16) {
 	if p := s.nodeGuard.gatewayPorts.Load(); p != nil {
 		return p[0], p[1]
 	}
-	return uint16(s.cfg.EgressDNSPort), uint16(s.cfg.EgressProxyPort)
+	return portOf(s.cfg.EgressDNSPort), portOf(s.cfg.EgressProxyPort)
+}
+
+// portOf is a configured port as a uint16, or 0 when it is out of range: a
+// plain uint16() would wrap SB_EGRESS_DNS_PORT=70000 to 4464 and open that
+// port instead of none. The gateway cannot listen on such a port either,
+// and learnGatewayPorts takes the ports it really listens on once it can.
+func portOf(p int) uint16 {
+	if p < 1 || p > 65535 {
+		return 0
+	}
+	return uint16(p)
 }
 
 // learnGatewayPorts reads the gateway's listeners ("udp:IP:port",
@@ -167,7 +178,7 @@ func (s *Service) learnGatewayPorts(ctx context.Context) {
 	if dns == 0 || proxy == 0 {
 		return
 	}
-	if cd, cp := uint16(s.cfg.EgressDNSPort), uint16(s.cfg.EgressProxyPort); (dns != cd || proxy != cp) && s.nodeGuard.gatewayPorts.Load() == nil {
+	if cd, cp := portOf(s.cfg.EgressDNSPort), portOf(s.cfg.EgressProxyPort); (dns != cd || proxy != cp) && s.nodeGuard.gatewayPorts.Load() == nil {
 		s.logger.Warn("egress gateway listens on other ports than SB_EGRESS_DNS_PORT/SB_EGRESS_PROXY_PORT say; the node guard follows the gateway",
 			"gateway_dns", dns, "gateway_proxy", proxy, "configured_dns", cd, "configured_proxy", cp)
 	}

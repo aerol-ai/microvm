@@ -306,6 +306,8 @@ func TestLocationWithoutToken(t *testing.T) {
 		{"/a", "", "/a"},
 		{"/a b", "token=x&q=1", "/a%20b?q=1"},
 		{"//evil.example/x", "token=x", "/evil.example/x"},
+		// A browser reads "/\\host" as "//host": the backslash is escaped.
+		{"/\\evil.example/x", "token=x", "/%5Cevil.example/x"},
 		{"/a?b", "token=x", "/a%3Fb"},
 		{"", "token=x&&k", "/?k"},
 		{"/p", "tok%65n=x&token2=y", "/p?token2=y"},

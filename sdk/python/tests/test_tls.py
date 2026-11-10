@@ -77,6 +77,7 @@ class TLSOptionTests(unittest.TestCase):
         _Handler.seen = []
         server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.minimum_version = ssl.TLSVersion.TLSv1_2
         context.load_cert_chain(self.path("server.pem"), self.path("server.key"))
         if require_client_cert:
             context.verify_mode = ssl.CERT_REQUIRED
