@@ -22,7 +22,7 @@
     "http-cache-semantics": "file:../third_party/http-cache-semantics",
     "mermaid": "^11.17.2",
     "sass": "^1.107.0",
-    "tailwindcss": "^4.3.3",
+    "tailwindcss": "^4.3.4",
     "typescript": "^7.0.2"
   },
   "devDependencies": {
