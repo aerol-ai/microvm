@@ -21,12 +21,20 @@ type pipelinePair struct {
 
 func newPipelinePair(t *testing.T, timeout time.Duration) pipelinePair {
 	t.Helper()
+	return newSlowPipelinePair(t, timeout, 0)
+}
+
+// newSlowPipelinePair is newPipelinePair with a follower that takes delay to
+// answer each AppendEntries: a healthy but slow follower.
+func newSlowPipelinePair(t *testing.T, timeout, delay time.Duration) pipelinePair {
+	t.Helper()
 	follower, err := raft.NewTCPTransport("127.0.0.1:0", nil, 2, timeout, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	go func() {
 		for rpc := range follower.Consumer() {
+			time.Sleep(delay)
 			rpc.Respond(&raft.AppendEntriesResponse{Success: true}, nil)
 		}
 	}()
@@ -181,6 +189,51 @@ func TestRaftPipelineGuardLeavesHealthySendsAlone(t *testing.T) {
 	_ = p.Close()
 	if n := g.openPipelines(); n != 0 {
 		t.Fatalf("%d pipelines tracked after Close, want 0", n)
+	}
+}
+
+// A follower that is slow but keeps answering makes every send wait about
+// one answer's time for the pipeline's decoder; that is back-pressure, not a
+// stall, and the guard must leave it alone. This pins the margin: if
+// stallAfter is ever cut near a slow answer's time, pipelines to slow
+// followers would churn between pipelining and plain replication.
+func TestRaftPipelineGuardLeavesASlowButDrainingPipelineAlone(t *testing.T) {
+	const (
+		timeout = 2 * time.Second
+		delay   = 150 * time.Millisecond
+	)
+	pp := newSlowPipelinePair(t, timeout, delay)
+	g := newPipelineGuardTransport(pp.leader, 3*delay, nil)
+	p, err := g.AppendEntriesPipeline("slow", pp.follower.LocalAddr())
+	if err != nil {
+		t.Fatal(err)
+	}
+	stop := make(chan struct{})
+	defer close(stop)
+	go func() {
+		for {
+			select {
+			case <-p.Consumer():
+			case <-stop:
+				return
+			}
+		}
+	}()
+	before := raftPipelineStalls.Value()
+	start := time.Now()
+	for i := range 8 {
+		if err, blocked, _ := sendWithin(p, timeout); blocked || err != nil {
+			t.Fatalf("send %d: err %v, blocked %v; a slow but answering follower must keep its pipeline", i, err, blocked)
+		}
+	}
+	if took := time.Since(start); took < 4*delay {
+		t.Fatalf("8 sends took %s; the follower's %s delay was not felt, so this test no longer measures a busy pipeline", took, delay)
+	}
+	if got := raftPipelineStalls.Value() - before; got != 0 {
+		t.Fatalf("the guard fired %d times on a slow but draining pipeline", got)
+	}
+	if n := g.openPipelines(); n != 1 {
+		t.Fatalf("%d pipelines tracked, want the 1 still open", n)
 	}
 }
 
