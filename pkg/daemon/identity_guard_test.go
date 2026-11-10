@@ -88,7 +88,7 @@ func TestRunIdentityBootGuards(t *testing.T) {
 	}
 	_ = setBaseRunEnv(t)
 	t.Setenv("SB_IDENTITY_ENABLED", "true")
-	err := runWithAutoCancel(t, 500*time.Millisecond, managed)
+	err := runUntilBootFails(t, managed)
 	if err == nil || !strings.Contains(err.Error(), "two identity sources") {
 		t.Fatalf("Run err = %v, want the two-identity-sources refusal", err)
 	}

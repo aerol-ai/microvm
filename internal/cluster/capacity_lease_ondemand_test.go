@@ -238,6 +238,31 @@ func TestEnsureOwnerLeasesSharesOneFetch(t *testing.T) {
 	}
 }
 
+// A create that saw no fresh lease, but reaches joinOnDemand only after the
+// fetch it would have joined has stored the lease and ended, starts no second
+// fetch. This is the window that made TestEnsureOwnerLeasesSharesOneFetch
+// flaky in CI ("worker asked 2 times"): the waiter's freshLease ran before
+// setReported, its joinOnDemand after endOnDemand.
+func TestJoinOnDemandAfterTheFetchEndedStartsNoSecondFetch(t *testing.T) {
+	worker := slotWorker("worker-1", 4, containerAndFC)
+	leases := newCapacityLeaseCache("leader", nil, 5*time.Second, nil)
+	checkedAt := time.Now()
+	if leases.freshLease(worker.NodeID, checkedAt) {
+		t.Fatal("an empty cache has a fresh lease")
+	}
+
+	first, own := leases.joinOnDemand(worker.NodeID, checkedAt)
+	if first == nil || !own {
+		t.Fatalf("first caller: flight=%v own=%v, want a flight it owns", first, own)
+	}
+	leases.setReported(worker.NodeID, worker.Capacity, time.Now(), leases.unreportedMark())
+	leases.endOnDemand(worker.NodeID, first, time.Time{})
+
+	if late, own := leases.joinOnDemand(worker.NodeID, checkedAt); late != nil || own {
+		t.Fatalf("late caller: flight=%v own=%v, want nothing: the lease is already fresh", late, own)
+	}
+}
+
 // A failed fetch leaves the sweep's backoff alone; a successful one clears
 // it, as a sweep's success does.
 func TestEnsureOwnerLeasesAndTheSweepBackoff(t *testing.T) {

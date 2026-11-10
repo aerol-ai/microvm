@@ -282,8 +282,18 @@ func TestCreate_SocketPushWinsOverHealthPoll(t *testing.T) {
 func TestCreate_HostnameStyleIDPushFallsBack(t *testing.T) {
 	requireLinuxUnix(t)
 	readyDir := t.TempDir()
+	before := readySocketInvalidAttempts.Value()
+	// The toolbox turns healthy only once the listener has rejected the
+	// push. It used to answer 200 at once, so the two arms raced: on a
+	// loaded runner the health poll won before the listener read the push,
+	// the create closed the listener with the push unread, and the invalid
+	// count never moved ("invalid attempts = 1, want > 1").
 	ip, port, closeFn := toolboxServer(t, func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
+		if readySocketInvalidAttempts.Value() > before {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		w.WriteHeader(http.StatusServiceUnavailable)
 	})
 	t.Cleanup(closeFn)
 
@@ -300,39 +310,48 @@ func TestCreate_HostnameStyleIDPushFallsBack(t *testing.T) {
 		return textResponse(http.StatusOK, inspectBody("cid", "/sb-fb-id", ip, true, "running", 7))
 	}
 
+	// The health arm now waits for the push, so the pusher must not give up
+	// before it lands: it runs until it pushes or the create returns. A
+	// fixed 1s budget could run out on a loaded runner, and a refused dial
+	// (the socket file exists from bind(), before listen()) used to end it
+	// with nothing pushed.
+	createDone := make(chan struct{})
 	var wg sync.WaitGroup
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		deadline := time.Now().Add(time.Second)
-		for time.Now().Before(deadline) {
+		for {
+			select {
+			case <-createDone:
+				return
+			case <-time.After(5 * time.Millisecond):
+			}
 			matches, _ := filepath.Glob(filepath.Join(readyDir, "sb-fb-id.*.sock"))
 			if len(matches) == 0 {
-				time.Sleep(5 * time.Millisecond)
+				continue
+			}
+			parts := strings.Split(strings.TrimSuffix(filepath.Base(matches[0]), ".sock"), ".")
+			if len(parts) < 2 {
 				continue
 			}
 			conn, err := net.Dial("unix", matches[0])
 			if err != nil {
-				return
+				continue
 			}
-			defer conn.Close()
-			base := filepath.Base(matches[0])
-			parts := strings.Split(strings.TrimSuffix(base, ".sock"), ".")
-			if len(parts) < 2 {
-				return
-			}
-			nonce := parts[1]
 			// Pre-fix toolboxd behavior: push container-hostname ID, not API sandbox ID.
-			_ = readyproto.Encode(conn, readyproto.ReadySignal{
-				Event: readyproto.EventReady, SandboxID: "deadbeef1234", Token: "tok", Nonce: nonce,
+			err = readyproto.Encode(conn, readyproto.ReadySignal{
+				Event: readyproto.EventReady, SandboxID: "deadbeef1234", Token: "tok", Nonce: parts[1],
 			})
-			return
+			_ = conn.Close()
+			if err == nil {
+				return
+			}
 		}
 	}()
 
-	before := readySocketInvalidAttempts.Value()
 	ctx, timing := WithCreateTiming(context.Background())
 	_, err := c.Create(ctx, models.CreateSandboxRequest{Image: "img"}, "sb-fb-id", "tok", nil)
+	close(createDone)
 	wg.Wait()
 	if err != nil {
 		t.Fatalf("create: %v", err)

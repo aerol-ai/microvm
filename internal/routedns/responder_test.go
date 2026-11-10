@@ -298,27 +298,57 @@ func TestDerivedPort(t *testing.T) {
 	}
 }
 
+// listenUDPAndTCP binds UDP and TCP on one free loopback port and keeps both.
+// Freeing a probe port and binding it again races every other process on the
+// host: on a busy CI runner a port the kernel gave out as free for UDP was
+// often in use for TCP, ListenAndServe failed its TCP bind, and the test saw
+// only "did not answer".
+func listenUDPAndTCP(t *testing.T) (net.PacketConn, net.Listener) {
+	t.Helper()
+	var busy []net.Listener
+	defer func() {
+		for _, ln := range busy {
+			_ = ln.Close()
+		}
+	}()
+	for range 100 {
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if pc, err := net.ListenPacket("udp", ln.Addr().String()); err == nil {
+			return pc, ln
+		}
+		// That number is in use for UDP. Keep the TCP side until we return,
+		// so the kernel does not hand out the same number again.
+		busy = append(busy, ln)
+	}
+	t.Fatal("no loopback port free for both UDP and TCP")
+	return nil, nil
+}
+
+// The serving half of ListenAndServe, on sockets the test holds from the
+// start. The bind half (busy port, released ports) has its own tests in
+// tables_test.go.
 func TestResponderListenAndServe(t *testing.T) {
 	r := newTestResponder()
 	r.Owner.Set("sb1.sandbox.test", OwnerTarget{IP: net.ParseIP("10.0.0.5"), Port: 2280})
-	pc, _ := net.ListenPacket("udp", "127.0.0.1:0")
+	pc, ln := listenUDPAndTCP(t)
 	addr := pc.LocalAddr().String()
-	_ = pc.Close()
 	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	done := make(chan error, 1)
-	go func() { done <- r.ListenAndServe(ctx, addr) }()
-	var in *dns.Msg
-	for i := 0; i < 50; i++ {
+	go func() { done <- r.serve(ctx, pc, ln) }()
+	// Both sockets are bound already, so the kernel queues a query until
+	// the servers read it: no wait for start-up is needed.
+	for _, network := range []string{"udp", "tcp"} {
 		m := new(dns.Msg)
 		m.SetQuestion("sb1.sandbox.test.", dns.TypeA)
-		if got, _, err := new(dns.Client).Exchange(m, addr); err == nil {
-			in = got
-			break
+		c := &dns.Client{Net: network, Timeout: 10 * time.Second}
+		in, _, err := c.Exchange(m, addr)
+		if err != nil || aOf(in) != "10.0.0.5" {
+			t.Fatalf("%s: answer %v, err %v", network, in, err)
 		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	if in == nil || aOf(in) != "10.0.0.5" {
-		t.Fatalf("ListenAndServe did not answer: %v", in)
 	}
 	cancel()
 	select {

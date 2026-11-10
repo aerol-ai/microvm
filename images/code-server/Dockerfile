@@ -9,7 +9,10 @@
 #
 # The file is self-contained (no COPY), so the SDKs' image builder, which
 # sends only a Dockerfile, builds it as is. Docs: /vscode-in-browser/.
-FROM codercom/code-server:4.144.0
+#
+# The base image is pinned by digest, so a re-pushed tag cannot change what
+# we build. Dependabot moves the tag and the digest together.
+FROM codercom/code-server:4.144.0@sha256:b9e8056bb74bd0c4f90284c7559eddeccd38400cfedc28e64c9d3ca50fef1f83
 
 USER root
 RUN rm -f /etc/sudoers.d/nopasswd \

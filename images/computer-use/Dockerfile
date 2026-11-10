@@ -10,7 +10,10 @@
 #
 # The file is self-contained (no COPY), so the SDKs' image builder, which
 # sends only a Dockerfile, builds it as is. Docs: /computer-use/.
-FROM python:3.12.16-slim-bookworm
+#
+# The base image is pinned by digest, so a re-pushed tag cannot change what
+# we build. Dependabot moves the tag and the digest together.
+FROM python:3.12.16-slim-bookworm@sha256:935c3c5b12357a7e10caa9c1e6ca5692344d97cf229832ef584be2cec9fc03df
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONDONTWRITEBYTECODE=1 \
@@ -25,7 +28,24 @@ RUN apt-get update \
       novnc openbox procps websockify x11-utils x11vnc xvfb \
  && rm -rf /var/lib/apt/lists/*
 
-RUN pip install playwright==1.64.1
+# Playwright and every package it pulls in, each pinned to the sha256 of
+# the wheel pip picks here on amd64 and on arm64. With --require-hashes,
+# pip stops if PyPI serves a different file or if a dependency is missing
+# from the list. --require-hashes must come before -r: OpenSSF Scorecard
+# reads the pip arguments in order and stops at that flag.
+#
+# To move Playwright, run this in the base image, once per platform, and
+# copy each package's version and sha256 into the list:
+#   pip install --dry-run --ignore-installed --only-binary=:all: \
+#     --report /tmp/r.json playwright==<version>
+RUN printf '%s\n' \
+  'playwright==1.64.1 --hash=sha256:577b8d88778c245cfbd145ae17cf53044f084b1b46c55c69081d4069d56057e2 --hash=sha256:a29fda44725e11b0b625c4bff6458a1f6dbee97b88c9788d12e18a8344458c2d' \
+  'greenlet==3.5.6 --hash=sha256:975736b002ed080d124cf81a79cb7e05cb26d6b3f5c7a7b651c0fcce70353aa1 --hash=sha256:e85880b538e59a59f55117b81f208a6660ad5ac328aad9305f812d9b8bc67a0f' \
+  'pyee==14.0.0 --hash=sha256:3ac2d3229a9677f7de2c33d7f52fe25b638a46b19c413fea2edc8c6d0a644e4d' \
+  'typing-extensions==4.16.0 --hash=sha256:481caa481374e813c1b176ada14e97f1f67a4539ce9cfeb3f350d78d6370c2e8' \
+  > /tmp/requirements.txt \
+ && pip install --require-hashes --only-binary=:all: -r /tmp/requirements.txt \
+ && rm /tmp/requirements.txt
 
 # The start script. Each process logs to ~/.desktop/logs. Chromium runs in
 # a loop so closing its window in the desktop does not take DevTools away.

@@ -346,6 +346,14 @@ func (r *Responder) ListenAndServe(ctx context.Context, addr string) error {
 		_ = pc.Close()
 		return err
 	}
+	return r.serve(ctx, pc, ln)
+}
+
+// serve answers on pc (UDP) and ln (TCP) until ctx ends or one server fails,
+// then closes both. It is split from ListenAndServe so a test can hold one
+// port for both protocols from the start; a port freed and bound again can
+// be taken by another process in between.
+func (r *Responder) serve(ctx context.Context, pc net.PacketConn, ln net.Listener) error {
 	udp := &dns.Server{PacketConn: pc, Handler: r}
 	tcp := &dns.Server{Listener: ln, Handler: r}
 	errc := make(chan error, 2)
