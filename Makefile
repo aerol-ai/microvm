@@ -50,8 +50,10 @@ test-acme-e2e:
 # Needs a Caddy with caddy-l4: AEROL_E2E_CADDY_BIN, or this builds the
 # release combination (.github/workflows/release.yml) with xcaddy. Linux
 # only (the test is build-tagged linux): on macOS run it in a Linux container.
-CADDY_E2E_VERSION ?= v2.11.7
-CADDY_E2E_BIN ?= $(BIN_DIR)/caddy-l4-e2e
+# The version and caddy-l4 match scripts/install.sh's pins (caddy_version_test).
+# The version is in the binary's name, so a bump never reuses an old build.
+CADDY_E2E_VERSION ?= v2.11.9
+CADDY_E2E_BIN ?= $(BIN_DIR)/caddy-l4-e2e-$(CADDY_E2E_VERSION)
 test-ingress-reload-e2e:
 	@if [ -z "$$AEROL_E2E_CADDY_BIN" ] && [ ! -x "$(CADDY_E2E_BIN)" ]; then \
 		mkdir -p $(BIN_DIR) && CGO_ENABLED=0 $(GO) run github.com/caddyserver/xcaddy/cmd/xcaddy@v0.4.6 build $(CADDY_E2E_VERSION) \
