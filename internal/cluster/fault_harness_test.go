@@ -89,10 +89,13 @@ func newFaultCluster(t *testing.T, name string, n int) *faultCluster {
 	}
 	for i := 1; i <= n; i++ {
 		fc.servers = append(fc.servers, &faultServer{
-			id:         fmt.Sprintf("%s-s%d", name, i),
-			dir:        t.TempDir(),
-			raftAddr:   fmt.Sprintf("127.0.0.1:%d", pickFreeTCPPort(t)),
-			gossipAddr: fmt.Sprintf("127.0.0.1:%d", pickFreeTCPPort(t)),
+			id:       fmt.Sprintf("%s-s%d", name, i),
+			dir:      t.TempDir(),
+			raftAddr: fmt.Sprintf("127.0.0.1:%d", pickFreeTCPPort(t)),
+			// Gossip binds UDP and TCP on the same port; a TCP-only pick
+			// once handed out a port whose UDP side another test process
+			// held ("failed to start UDP listener ... bind").
+			gossipAddr: fmt.Sprintf("127.0.0.1:%d", freeGossipPort(t)),
 			apiURL:     fmt.Sprintf("http://127.0.0.1:%d", pickFreeTCPPort(t)),
 		})
 	}
@@ -379,23 +382,30 @@ func (fc *faultCluster) transferLeadership(to *faultServer) *faultServer {
 // works still fails the test.
 const faultTransferAttempts = 3
 
-// transferWithRetry runs a leadership transfer, retrying only raft's
-// "leadership transfer timeout". raft returns it when the target has not
-// taken over within one election timeout, 250 ms in these tests
-// (main_test.go); on a loaded machine that is the machine, not a bug: a stress
-// run failed 7 of 160 that way. The old leader keeps leading after it, so
-// trying again is safe. raft can still report ErrLeadershipTransferInProgress
-// for a moment after the timeout (its own comment in raft.go says so), so
-// that is retried after a timeout too. Any other error fails at once.
-// moved reports whether leadership left anyway; then there is nothing to retry.
+// transferWithRetry runs a leadership transfer, retrying what a loaded
+// machine causes, not what a bug would. With 250 ms raft timers in these
+// tests (main_test.go):
+//   - "leadership transfer timeout": the target did not take over within one
+//     election timeout (7 of 160 stress runs failed that way); the old leader
+//     keeps leading, so trying again is safe;
+//   - ErrNotLeader: leadership moved between reading the leader and asking it
+//     to transfer (3 of 80 stress runs);
+//   - ErrLeadershipTransferInProgress right after a timeout: raft reports it
+//     for a moment after one (its own comment in raft.go says so).
+//
+// Any other error fails at once. moved reports whether leadership already
+// left the old leader; then the transfer's purpose is met and nothing is
+// retried.
 func transferWithRetry(attempts int, transfer func() error, moved func() bool, logf func(string, ...any)) error {
 	var err error
 	for attempt := 1; attempt <= attempts; attempt++ {
 		if err = transfer(); err == nil {
 			return nil
 		}
-		timedOut := err.Error() == "leadership transfer timeout"
-		if !timedOut && !(attempt > 1 && errors.Is(err, raft.ErrLeadershipTransferInProgress)) {
+		retryable := err.Error() == "leadership transfer timeout" ||
+			errors.Is(err, raft.ErrNotLeader) ||
+			(attempt > 1 && errors.Is(err, raft.ErrLeadershipTransferInProgress))
+		if !retryable {
 			return err
 		}
 		if moved() {
