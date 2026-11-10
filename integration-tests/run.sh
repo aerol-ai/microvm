@@ -1264,6 +1264,15 @@ EOF
   if [[ -n "$go_tags" ]]; then
     echo "=== artifacts: sandboxd built with -tags ${go_tags} (test-only; the build id says so) ==="
   fi
+  # AEROL_WITH_CADDY=1: the nodes get a Caddy built from this tree
+  # (build.sh --with-caddy: install.sh's CADDY_BUILD_VERSION plus every
+  # plugin, caddymod/ included) instead of the latest release's Caddy. For a
+  # change to the Caddy build or caddymod/.
+  local caddy_flag=()
+  if [[ "${AEROL_WITH_CADDY:-}" == "1" ]]; then
+    caddy_flag=(--with-caddy)
+    echo "=== artifacts: Caddy built from this tree (AEROL_WITH_CADDY=1) ==="
+  fi
   local build_id
   if [[ "$NO_BUILD" == "1" ]]; then
     build_id=$(AEROL_GO_TAGS="$go_tags" "$BUILD_SH" build-id)
@@ -1285,10 +1294,10 @@ EOF
     # stderr is NOT suppressed: if the failure is something other than a
     # missing build (bad credentials, an unreachable bucket) that message is
     # the only clue, and the fallback build would fail for the same reason.
-    if ! AEROL_GO_TAGS="$go_tags" "$BUILD_SH" urls --with-receiver >"$out"; then
+    if ! AEROL_GO_TAGS="$go_tags" "$BUILD_SH" urls --with-receiver ${caddy_flag[@]+"${caddy_flag[@]}"} >"$out"; then
       echo "=== --no-build: ${build_id} is not published; building and publishing it now ===" >&2
-      build_id=$(AEROL_GO_TAGS="$go_tags" "$BUILD_SH" build --with-receiver)
-      AEROL_GO_TAGS="$go_tags" "$BUILD_SH" publish --with-receiver >"$out"
+      build_id=$(AEROL_GO_TAGS="$go_tags" "$BUILD_SH" build --with-receiver ${caddy_flag[@]+"${caddy_flag[@]}"})
+      AEROL_GO_TAGS="$go_tags" "$BUILD_SH" publish --with-receiver ${caddy_flag[@]+"${caddy_flag[@]}"} >"$out"
     fi
   else
     echo "=== artifacts: building locally ==="
@@ -1296,8 +1305,8 @@ EOF
     # the alternative is a scenario that enables the receiver discovering at
     # apply time that this build did not produce one. Skipped automatically on
     # refs that predate it.
-    build_id=$(AEROL_GO_TAGS="$go_tags" "$BUILD_SH" build --with-receiver)
-    AEROL_GO_TAGS="$go_tags" "$BUILD_SH" publish --with-receiver >"$out"
+    build_id=$(AEROL_GO_TAGS="$go_tags" "$BUILD_SH" build --with-receiver ${caddy_flag[@]+"${caddy_flag[@]}"})
+    AEROL_GO_TAGS="$go_tags" "$BUILD_SH" publish --with-receiver ${caddy_flag[@]+"${caddy_flag[@]}"} >"$out"
   fi
 
   export AEROL_BUILD_MODE="local"
