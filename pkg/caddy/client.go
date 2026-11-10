@@ -969,13 +969,15 @@ func IngressCustomDomainHTTPRouteID(sandboxID, hostname string) string {
 // at those paths only, leaving any pre-existing wildcard policy and other
 // automation knobs untouched.
 //
-//   - PUT /config/apps/tls/automation/on_demand → ask URL. Replacing the leaf on
-//     every boot makes handler URL changes take effect without a manual Caddy
-//     reload. The daemon-side ACME budget performs issuance throttling; the
-//     deployed Caddy schema rejects the older `rate_limit` field here.
-//   - POST /config/apps/tls/automation/policies (with a catch-all policy
-//     {on_demand: true, issuers: [acme]}) only when no on-demand policy is
-//     present yet. Discovered by checking pathExists on automation/policies
+//   - POST /config/apps/tls/automation/on_demand → the ask URL, as the http
+//     permission module (PUT when the parent keys do not exist yet). Replacing
+//     the leaf on every boot makes handler URL changes take effect without a
+//     manual Caddy reload. The daemon-side ACME budget performs issuance
+//     throttling; the deployed Caddy schema rejects the older `rate_limit`
+//     field here.
+//   - POST /config/apps/tls/automation/policies/... (a one-element list with
+//     the catch-all policy {on_demand: true, issuers: [acme]}) only when no
+//     on-demand policy is present yet. Discovered by checking pathExists on automation/policies
 //     and re-walking the list; we never insert a duplicate.
 //
 // askURL must be reachable from Caddy — typically
@@ -1012,24 +1014,31 @@ func (c *Client) ensureOnDemandTLSLocked(ctx context.Context, askURL string) err
 	// without a permission module". Caddy 2.9 converted first, which is why
 	// this worked when it was written; releases built the newest Caddy until
 	// the pin (2.11.x since v0.6.11), so the policy never installed and no
-	// custom domain got a certificate. The http module (Caddy 2.7+) calls the
+	// custom domain got a certificate. The http module (Caddy 2.8+) calls the
 	// endpoint with ?domain= exactly as "ask" did.
 	onDemand := map[string]any{"permission": map[string]any{"module": "http", "endpoint": askURL}}
 	onDemandBody, err := json.Marshal(onDemand)
 	if err != nil {
 		return fmt.Errorf("marshal on-demand block: %w", err)
 	}
-	// POST sets or replaces the leaf; Caddy creates apps/tls/automation on
-	// the way if it is missing. Not PUT: Caddy's PUT only creates, and
-	// answers 409 "key already exists" once on_demand is set. Caddy keeps its
-	// config across restarts, so every sandboxd start after the first failed
-	// here (logged, never retried) and a changed ask URL never landed.
-	status, detail, err := c.sendJSONDetail(ctx, http.MethodPost, c.baseURL+"/config/apps/tls/automation/on_demand", onDemandBody)
+	// POST sets or replaces the leaf. PUT alone was wrong: it only creates,
+	// and answers 409 "key already exists" once on_demand is set, so every
+	// sandboxd start while Caddy kept running (the usual restart) failed here,
+	// logged and never retried, and a changed ask URL never landed. But only
+	// PUT creates missing parent keys; POST into a Caddy with no
+	// apps.tls.automation yet fails ("invalid traversal path"). So a refused
+	// POST is retried as PUT, which cannot conflict there: no parent, no key.
+	// If the PUT fails too, the POST's reason is the one to report.
+	onDemandURL := c.baseURL + "/config/apps/tls/automation/on_demand"
+	status, detail, err := c.sendJSONDetail(ctx, http.MethodPost, onDemandURL, onDemandBody)
 	if err != nil {
 		return err
 	}
 	if status >= 400 {
-		return caddyErr("install on-demand settings", status, detail)
+		putStatus, _, putErr := c.sendJSONDetail(ctx, http.MethodPut, onDemandURL, onDemandBody)
+		if putErr != nil || putStatus >= 400 {
+			return caddyErr("install on-demand settings", status, detail)
+		}
 	}
 
 	idx, stored, found, err := c.onDemandPolicy(ctx)
@@ -1043,13 +1052,15 @@ func (c *Client) ensureOnDemandTLSLocked(ctx context.Context, askURL string) err
 		"on_demand": true,
 		"issuers":   []map[string]any{c.onDemandIssuer.config()},
 	}
-	policyBody, err := json.Marshal(policy)
+	// A one-element list POSTed to policies/... appends to the list, or
+	// creates it when there is none, so the on-demand policy ends up last.
+	// A plain POST of the object to policies only appends: with no list yet
+	// Caddy sets policies to the object itself and refuses the config.
+	policyBody, err := json.Marshal([]any{policy})
 	if err != nil {
 		return fmt.Errorf("marshal on-demand policy: %w", err)
 	}
-	// POST appends to the array if it exists, or creates a one-element
-	// array if it doesn't. Either way the on-demand policy ends up last.
-	status, detail, err = c.sendJSONDetail(ctx, http.MethodPost, c.baseURL+"/config/apps/tls/automation/policies", policyBody)
+	status, detail, err = c.sendJSONDetail(ctx, http.MethodPost, c.baseURL+"/config/apps/tls/automation/policies/...", policyBody)
 	if err != nil {
 		return err
 	}

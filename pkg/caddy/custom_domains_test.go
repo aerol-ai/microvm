@@ -162,11 +162,13 @@ func mustDialFromRoute(t *testing.T, route map[string]any) string {
 	return dial
 }
 
-// EnsureOnDemandTLS — fresh Caddy, no apps/tls. PUT installs the on_demand
-// leaf and POST appends the catch-all policy.
+// EnsureOnDemandTLS — fresh Caddy, no apps/tls. The POST of on_demand is
+// refused (Caddy creates no parent keys for POST), the PUT fallback installs
+// it with its parents, and POST appends the catch-all policy.
 func TestEnsureOnDemandTLS_FreshCaddy(t *testing.T) {
 	srv := newFakeAutomationServer(t)
 	defer srv.Close()
+	srv.noAutomation = true
 	client := &Client{enabled: true, baseURL: srv.URL, httpClient: srv.Client}
 
 	if err := client.EnsureOnDemandTLS(context.Background(), "http://127.0.0.1:21213/internal/tls-ask", 5, time.Minute); err != nil {
@@ -281,9 +283,7 @@ func TestEnsureOnDemandTLS_RejectsBadInput(t *testing.T) {
 	}
 }
 
-// EnsureOnDemandTLS — Caddy disabled is a no-op (mirrors every other
-// helper).
-// A Caddy that resumed its saved config after a restart already holds
+// A Caddy that kept running while sandboxd restarted already holds
 // on_demand and the on-demand policy. The next sandboxd start must still
 // write the current ask URL: it used to PUT on_demand, which Caddy answers
 // 409 "key already exists", so the boot logged a failure and kept the old URL.
@@ -305,6 +305,8 @@ func TestEnsureOnDemandTLS_AfterRestart(t *testing.T) {
 	}
 }
 
+// EnsureOnDemandTLS — Caddy disabled is a no-op (mirrors every other
+// helper).
 func TestEnsureOnDemandTLS_Disabled(t *testing.T) {
 	client := &Client{enabled: false}
 	if err := client.EnsureOnDemandTLS(context.Background(), "http://x", 5, time.Minute); err != nil {
@@ -314,16 +316,20 @@ func TestEnsureOnDemandTLS_Disabled(t *testing.T) {
 
 // fakeAutomationServer is a stripped-down Caddy admin emulator covering
 // only the apps/tls/automation/* paths EnsureOnDemandTLS touches. It keeps
-// the two Caddy rules the client broke against for months: PUT only creates
-// (409 once a key exists), and since Caddy 2.10 an on-demand policy needs
-// on_demand.permission (the deprecated "ask" is converted too late).
+// the Caddy admin rules the client depends on: PUT only creates (409 once a
+// key exists) and is the only method that creates missing parent keys; and
+// since Caddy 2.10 an on-demand policy needs on_demand.permission (the
+// deprecated "ask" is converted too late).
 type fakeAutomationServer struct {
 	URL    string
 	Client *http.Client
 
-	mu           sync.Mutex
-	policies     []map[string]any
-	onDemand     map[string]any
+	mu       sync.Mutex
+	policies []map[string]any
+	onDemand map[string]any
+	// noAutomation is a Caddy whose config has no apps.tls.automation yet:
+	// a POST under it fails, a PUT creates it.
+	noAutomation bool
 	issuerWrites []string // "PATCH 0", "PUT 1"
 	server       *httptest.Server
 }
@@ -337,6 +343,9 @@ func newFakeAutomationServer(t *testing.T) *fakeAutomationServer {
 		switch r.URL.Path {
 		case "/config/apps/tls/automation/on_demand":
 			switch {
+			case r.Method == http.MethodPost && f.noAutomation:
+				http.Error(w, `{"error":"invalid traversal path at: config/apps/tls"}`, http.StatusBadRequest)
+				return
 			case r.Method == http.MethodPut && f.onDemand != nil:
 				http.Error(w, `{"error":"[/config/apps/tls/automation/on_demand] key already exists: on_demand"}`, http.StatusConflict)
 				return
@@ -351,8 +360,9 @@ func newFakeAutomationServer(t *testing.T) *fakeAutomationServer {
 				return
 			}
 			f.onDemand = v
+			f.noAutomation = false
 			w.WriteHeader(http.StatusOK)
-		case "/config/apps/tls/automation/policies":
+		case "/config/apps/tls/automation/policies", "/config/apps/tls/automation/policies/...":
 			switch r.Method {
 			case http.MethodGet:
 				if f.policies == nil {
@@ -361,19 +371,38 @@ func newFakeAutomationServer(t *testing.T) *fakeAutomationServer {
 				}
 				_ = json.NewEncoder(w).Encode(f.policies)
 			case http.MethodPost:
+				// Caddy: POST with /... appends a list's items, creating the
+				// list when there is none; a plain POST appends one item to
+				// an existing list, but with no list it sets policies to the
+				// object, which the TLS app refuses.
 				body, _ := io.ReadAll(r.Body)
-				var p map[string]any
-				if err := json.Unmarshal(body, &p); err != nil {
-					http.Error(w, "decode", http.StatusBadRequest)
-					return
-				}
-				if on, _ := p["on_demand"].(bool); on && !onlyInternalIssuers(p) {
-					if _, ok := f.onDemand["permission"]; !ok {
-						http.Error(w, `{"error":"loading new config: ... provisioning automation policy 0: on-demand TLS cannot be enabled without a permission module to prevent abuse"}`, http.StatusInternalServerError)
+				var add []map[string]any
+				if strings.HasSuffix(r.URL.Path, "/...") {
+					if err := json.Unmarshal(body, &add); err != nil {
+						http.Error(w, "final element is not an array", http.StatusBadRequest)
 						return
 					}
+				} else {
+					var p map[string]any
+					if err := json.Unmarshal(body, &p); err != nil {
+						http.Error(w, "decode", http.StatusBadRequest)
+						return
+					}
+					if f.policies == nil {
+						http.Error(w, `{"error":"loading new config: ... cannot unmarshal object into Go struct field AutomationConfig.automation.policies of type []*caddytls.AutomationPolicy"}`, http.StatusInternalServerError)
+						return
+					}
+					add = []map[string]any{p}
 				}
-				f.policies = append(f.policies, p)
+				for _, p := range add {
+					if on, _ := p["on_demand"].(bool); on && !onlyInternalIssuers(p) {
+						if _, ok := f.onDemand["permission"]; !ok {
+							http.Error(w, `{"error":"loading new config: ... provisioning automation policy 0: on-demand TLS cannot be enabled without a permission module to prevent abuse"}`, http.StatusInternalServerError)
+							return
+						}
+					}
+				}
+				f.policies = append(f.policies, add...)
 				w.WriteHeader(http.StatusOK)
 			default:
 				http.Error(w, "method", http.StatusMethodNotAllowed)
