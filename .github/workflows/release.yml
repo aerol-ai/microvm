@@ -572,6 +572,24 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: src/scripts/mirror-sync.sh --deps --bucket "$MIRROR_BUCKET"
 
+      # Terraform's providers for this release's Terraform/, as a network
+      # mirror under tf-providers/: the harness's tf_init_failover falls back
+      # to it when the registries fail on a machine whose plugin cache lacks
+      # a provider (cloudflare's GitHub-hosted packages answered 504 for
+      # hours on 2026-11-09). Terraform checks each package's signature as
+      # it downloads it; a version already on the mirror is not sent again.
+      # Then the check installs every provider from the mirror alone.
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4
+        with:
+          terraform_wrapper: false
+
+      - name: Copy Terraform's providers to the mirror
+        run: src/scripts/mirror-sync.sh --tf-providers --bucket "$MIRROR_BUCKET"
+
+      - name: Check Terraform installs every provider from the mirror alone
+        run: src/scripts/mirror-sync.sh --tf-providers --check --bucket "$MIRROR_BUCKET"
+
   # npm and the MCP Registry are opt-in until their one-time setup is done
   # (npm/README.md): set the repository variable AEROLVM_NPM_PUBLISH=true.
   # Both run after the GitHub release, so a failure here never holds back
