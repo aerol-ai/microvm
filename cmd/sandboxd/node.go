@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -14,7 +15,7 @@ import (
 )
 
 // The node commands of one-line joins (plans/kubectl-style-cluster-ops.md
-// §3.1, §4): init, join, preflight, adopt and reset. Like upgrade, none of
+// §3.1, §4): init, join, preflight, adopt, reset and join-command. Like upgrade, none of
 // them falls through to the daemon: each acts on the node from outside it
 // and talks to the running sandboxd over its API. The work is in
 // internal/nodejoin; this file is the command line.
@@ -24,12 +25,13 @@ const (
 	preflightSubcommand = "preflight"
 	adoptSubcommand     = "adopt"
 	resetSubcommand     = "reset"
+	tokenSubcommand     = "join-command"
 )
 
 // isNodeCommand reports whether arg is one of them.
 func isNodeCommand(arg string) bool {
 	switch arg {
-	case initSubcommand, joinSubcommand, preflightSubcommand, adoptSubcommand, resetSubcommand:
+	case initSubcommand, joinSubcommand, preflightSubcommand, adoptSubcommand, resetSubcommand, tokenSubcommand:
 		return true
 	}
 	return false
@@ -114,6 +116,29 @@ need nothing. Safe to run again.
   --ca-key <file>   a saved copy of the seed's ca.key, when the seed is gone
 `
 
+const tokenUsage = `usage: sudo sandboxd join-command [--role worker|ingress|server] [--ttl 2h]
+                          [--reusable] [--json] [--installer-url <url>]
+
+Run on a server: makes a join token through this server's own API and prints
+the line that adds a machine with it, like kubeadm's
+` + "`kubeadm token create --print-join-command`" + ` on a control-plane node. Run
+the line on the new machine. The token decides the role.
+
+A server token can only be made on a server: the cluster refuses one asked
+through a worker or an ingress node, and ` + "`aerolvm join-command`" + ` from a laptop
+goes through the ingress. So use this for a server added later, for example
+with Terraform's node_join_tokens (--json prints the token in "token").
+
+  --role ROLE       worker (default), ingress or server
+  --ttl DURATION    like 30m, 2h or 24h (2h by default; server tokens at most
+                    24h); 0 for never, worker and ingress only
+  --reusable        let many machines join with the same token
+  --json            print the token object and "command" instead of the line
+  --installer-url   the installer the printed line fetches
+
+Stdout is only the line (or the JSON); notes go to stderr.
+`
+
 const resetUsage = `usage: sudo sandboxd reset --yes
 
 Takes this machine out of its cluster: asks the cluster to delete this node
@@ -134,6 +159,8 @@ type nodeFlags struct {
 	joinURL                           string
 	caKey                             string
 	yes                               bool
+	ttl                               string
+	reusable, json                    bool
 }
 
 func (f *nodeFlags) address() nodejoin.AddressOptions {
@@ -168,6 +195,12 @@ func parseNodeArgs(cmd string, args []string) (*nodeFlags, []string, error) {
 	case resetSubcommand:
 		fs.BoolVar(&f.yes, "yes", false, "")
 		fs.BoolVar(&f.yes, "y", false, "")
+	case tokenSubcommand:
+		fs.StringVar(&f.role, "role", "worker", "")
+		fs.StringVar(&f.ttl, "ttl", "", "")
+		fs.BoolVar(&f.reusable, "reusable", false, "")
+		fs.BoolVar(&f.json, "json", false, "")
+		fs.StringVar(&f.installer, "installer-url", "", "")
 	}
 	switch cmd {
 	case initSubcommand:
@@ -198,7 +231,7 @@ func parseNodeArgs(cmd string, args []string) (*nodeFlags, []string, error) {
 func runNodeCLI(cmd string, args []string, stdout, stderr io.Writer) int {
 	usage := map[string]string{
 		initSubcommand: initUsage, joinSubcommand: joinUsage, preflightSubcommand: preflightUsage,
-		adoptSubcommand: adoptUsage, resetSubcommand: resetUsage,
+		adoptSubcommand: adoptUsage, resetSubcommand: resetUsage, tokenSubcommand: tokenUsage,
 	}[cmd]
 	f, positional, err := parseNodeArgs(cmd, args)
 	if errors.Is(err, flag.ErrHelp) {
@@ -258,6 +291,17 @@ func runNodeCLI(cmd string, args []string, stdout, stderr io.Writer) int {
 	case adoptSubcommand:
 		a := &nodejoin.Adopter{Paths: paths, Host: host, Printer: printer, LocalAPI: nodeLocalAPI}
 		_, err = a.Run(ctx, nodejoin.AdoptOptions{CAKeyFile: f.caKey})
+	case tokenSubcommand:
+		m := &nodejoin.TokenMaker{Paths: paths, Host: host, Printer: nodejoin.Printer{Out: stderr}, LocalAPI: nodeLocalAPI}
+		var res nodejoin.TokenResult
+		if res, err = m.Run(ctx, nodejoin.TokenOptions{Role: f.role, TTL: f.ttl, Reusable: f.reusable, InstallerURL: f.installer}); err == nil {
+			if f.json {
+				raw, _ := json.MarshalIndent(res, "", "  ")
+				fmt.Fprintln(stdout, string(raw))
+			} else {
+				fmt.Fprintln(stdout, res.Command)
+			}
+		}
 	case resetSubcommand:
 		r := &nodejoin.Resetter{Paths: paths, Host: host, Printer: printer, LocalAPI: nodeLocalAPI}
 		err = r.Run(ctx, nodejoin.ResetOptions{Yes: f.yes})

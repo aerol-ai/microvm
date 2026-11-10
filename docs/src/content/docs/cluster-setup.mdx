@@ -146,6 +146,8 @@ Then point your domain at the ingress nodes: an `A` record for `cluster.example.
 
 A join token works for one machine and lasts 2 hours, unless you say otherwise. `--reusable` lets many machines use one token. `--ttl 0` never expires, for worker and ingress nodes that an autoscaler adds. A server token lasts at most 24 hours. See [Keep join tokens safe](#keep-join-tokens-safe).
 
+The cluster makes a **server** token only when a server asks. Once your domain points at an ingress node, `aerolvm join-command --role server` from your computer goes through it and is refused. Then make server tokens on a server instead, with the same flags: `sudo sandboxd join-command --role server`.
+
 A join that fails part way is safe to run again: the same machine gets the same answer.
 
 ### Step 4: Check the cluster

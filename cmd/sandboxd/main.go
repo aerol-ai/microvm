@@ -72,8 +72,8 @@ func main() {
 		}
 		return
 	}
-	// One-line joins (§3.1, §4): init, join, preflight, adopt and reset
-	// act on this node from outside the daemon, like upgrade.
+	// One-line joins (§3.1, §4): init, join, preflight, adopt, reset and
+	// join-command act on this node from outside the daemon, like upgrade.
 	if len(os.Args) >= 2 && isNodeCommand(os.Args[1]) {
 		if code := runNodeCLI(os.Args[1], os.Args[2:], os.Stdout, os.Stderr); code != 0 {
 			osExit(code)

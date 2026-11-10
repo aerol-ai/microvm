@@ -61,7 +61,7 @@ func runNode(cmd string, args ...string) (int, string, string) {
 
 func TestNodeCommandsUsage(t *testing.T) {
 	withNodeSeams(t, true)
-	for _, cmd := range []string{"init", "join", "preflight", "adopt", "reset"} {
+	for _, cmd := range []string{"init", "join", "preflight", "adopt", "reset", "join-command"} {
 		if !isNodeCommand(cmd) {
 			t.Fatalf("%s is not a node command", cmd)
 		}
@@ -89,6 +89,7 @@ func TestNodeCommandsUsage(t *testing.T) {
 		{"preflight", []string{"--join", "https://x"}, "--join and --token go together"},
 		{"preflight", []string{"--role", "boss"}, "--role must be server, worker or ingress"},
 		{"reset", nil, "run it again with --yes"},
+		{"join-command", []string{"extra"}, "unexpected argument"},
 	}
 	for _, tc := range cases {
 		if code, _, errOut := runNode(tc.cmd, tc.args...); code != 2 || !strings.Contains(errOut, tc.has) {
@@ -147,7 +148,7 @@ func TestNodeCommandsRun(t *testing.T) {
 func TestNodeCommandsNeedRoot(t *testing.T) {
 	withNodeSeams(t, false)
 	tok, _ := cluster.GenerateJoinToken()
-	for _, c := range [][]string{{"init"}, {"join", "https://x", "--token", tok}, {"adopt"}, {"reset", "--yes"}} {
+	for _, c := range [][]string{{"init"}, {"join", "https://x", "--token", tok}, {"adopt"}, {"reset", "--yes"}, {"join-command"}} {
 		if code, _, errOut := runNode(c[0], c[1:]...); code != 1 || !strings.Contains(errOut, "as root") {
 			t.Fatalf("%v = %d %s", c, code, errOut)
 		}
@@ -164,5 +165,51 @@ func TestMainDispatchesNodeCommands(t *testing.T) {
 	main()
 	if got != 2 {
 		t.Fatalf("sandboxd reset exit = %d, want 2", got)
+	}
+}
+
+// TestNodeJoinCommand: sandboxd join-command on a server prints only the
+// join line (or, with --json, the token and the line) on stdout, and the
+// note about the token on stderr; off a cluster it fails.
+func TestNodeJoinCommand(t *testing.T) {
+	p := withNodeSeams(t, true)
+	if code, _, errOut := runNode("join-command"); code != 1 || !strings.Contains(errOut, "not in a cluster") {
+		t.Fatalf("join-command off-cluster = %d %s", code, errOut)
+	}
+	if err := os.WriteFile(p.ClusterEnv, []byte("SB_ENABLE_CLUSTER=true\nSB_NODE_ID=srv-1\nSB_NODE_ROLE=server\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var asked []cluster.JoinTokenCreateRequest
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req cluster.JoinTokenCreateRequest
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		asked = append(asked, req)
+		if r.Header.Get("Authorization") != "Bearer p" {
+			http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+			return
+		}
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(cluster.JoinTokenCreated{Token: "abcdef.0123456789abcdefghijklmnopqrstuv", ID: "abcdef", Role: req.Role,
+			CACertHash: "sha256:ff", JoinURLs: []string{"https://10.0.0.5:7003"}})
+	}))
+	defer api.Close()
+	nodeLocalAPI = api.URL
+
+	code, out, errOut := runNode("join-command", "--role", "server", "--ttl", "2h")
+	want := "curl -fsSL https://aerolvm.aerol.ai | sudo bash -s -- join https://10.0.0.5:7003 --token abcdef.0123456789abcdefghijklmnopqrstuv --ca-cert-hash sha256:ff\n"
+	if code != 0 || out != want {
+		t.Fatalf("join-command = %d %q (stderr %q)", code, out, errOut)
+	}
+	if !strings.Contains(errOut, "server token abcdef never expires") || len(asked) != 1 || asked[0].Role != "server" || asked[0].TTL != "2h" {
+		t.Fatalf("stderr %q, asked %+v", errOut, asked)
+	}
+	code, out, _ = runNode("join-command", "--role", "server", "--json")
+	var res struct {
+		Token   string `json:"token"`
+		Role    string `json:"role"`
+		Command string `json:"command"`
+	}
+	if code != 0 || json.Unmarshal([]byte(out), &res) != nil || res.Token != "abcdef.0123456789abcdefghijklmnopqrstuv" || res.Role != "server" || !strings.HasPrefix(res.Command, "curl -fsSL ") {
+		t.Fatalf("join-command --json = %d %s", code, out)
 	}
 }

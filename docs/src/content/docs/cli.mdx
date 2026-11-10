@@ -208,6 +208,8 @@ Run that line on the new machine, as it is. It installs AerolVM, checks the clus
 | `--ttl 2h` | How long the token works. The default is 2 hours; a server token lasts at most 24 hours. `--ttl 0` never expires, and is only for worker and ingress tokens. |
 | `--reusable` | Let many machines join with the same token. Without it, a token works for one machine. |
 
+A **server** token is made only when a server asks. If your API URL goes through an ingress node (your domain), make server tokens on a server instead, with the same flags: `sudo sandboxd join-command --role server`. It prints the same line, or the token with `--json`.
+
 List and revoke tokens:
 
 ```bash

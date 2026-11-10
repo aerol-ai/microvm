@@ -362,6 +362,11 @@ type fakeLocalAPI struct {
 	deleted   []string
 	deleteErr int
 	auth      []string
+	// joinURLs and caHash go in each made token's answer (join-command
+	// prints the line from them); tokenAuth records the token calls' header.
+	joinURLs  []string
+	caHash    string
+	tokenAuth []string
 }
 
 func newFakeLocalAPI(t *testing.T) *fakeLocalAPI {
@@ -391,12 +396,13 @@ func newFakeLocalAPI(t *testing.T) *fakeLocalAPI {
 			return
 		}
 		l.tokens = append(l.tokens, req)
+		l.tokenAuth = append(l.tokenAuth, r.Header.Get("Authorization"))
 		tok := req.Token
 		if tok == "" {
 			tok, _ = cluster.GenerateJoinToken()
 		}
 		id, _, _ := cluster.ParseJoinToken(tok)
-		out := cluster.JoinTokenCreated{Token: tok, ID: id, Role: req.Role, Reusable: req.Reusable}
+		out := cluster.JoinTokenCreated{Token: tok, ID: id, Role: req.Role, Reusable: req.Reusable, JoinURLs: l.joinURLs, CACertHash: l.caHash}
 		if req.TTL != "0" {
 			exp := time.Now().Add(2 * time.Hour)
 			out.ExpiresAt = &exp
