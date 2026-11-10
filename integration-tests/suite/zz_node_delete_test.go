@@ -110,6 +110,7 @@ func TestNodeDeleteWorkerAndItCannotRejoin(t *testing.T) {
 	c := client(t)
 	workers := requireWorkers(t, c, 2)
 	victim := pickDeletableWorker(t, targets)
+	requireNonSeedVictim(t, victim)
 	harness.RequireNodeSSH(t, victim)
 	victimID := heteroNodeID(t, c, targets, victim.Name)
 	if !containsString(workers, victimID) {

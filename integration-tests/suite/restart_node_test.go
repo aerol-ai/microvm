@@ -72,6 +72,7 @@ func TestEveryCaseThatStopsSandboxdWaitsForTheRejoin(t *testing.T) {
 		t.Fatal(err)
 	}
 	checked := 0
+	seen := map[string]bool{}
 	for _, f := range files {
 		switch f {
 		case "restart_node_test.go", "secrets_support_test.go":
@@ -87,6 +88,10 @@ func TestEveryCaseThatStopsSandboxdWaitsForTheRejoin(t *testing.T) {
 				continue
 			}
 			checked++
+			if name := funcName(sig); neverRestoredCases[name] {
+				seen[name] = true
+				continue
+			}
 			// KillNodeDaemon restores and waits by contract;
 			// TestTheRejoinWaitIsWiredEndToEnd holds it to that.
 			if !strings.Contains(body, "restoreNodeDaemon") &&
@@ -100,7 +105,28 @@ func TestEveryCaseThatStopsSandboxdWaitsForTheRejoin(t *testing.T) {
 	if checked == 0 {
 		t.Fatal("no function was inspected; this guard would have passed having checked nothing")
 	}
+	// A stale name would let a new function of that name through unread.
+	for name := range neverRestoredCases {
+		if !seen[name] {
+			t.Errorf("neverRestoredCases names %s, which no longer takes a daemon down; drop it", name)
+		}
+	}
 	t.Logf("checked %d functions that take a daemon down", checked)
+}
+
+// Cases whose subject is a node that must never come back. They take it
+// out for the rest of the run on purpose, so there is no rejoin to wait for:
+// waiting for one would fail the case for passing. Each one marks the node
+// down in the harness (MarkNodeDown) and logs that the run goes on a node
+// short. Named here rather than slipping through on a substring, like
+// seedVictimCases below.
+var neverRestoredCases = map[string]bool{
+	"TestNodeDeleteWorkerAndItCannotRejoin": true, // UC-614, UC-615: a deleted worker is denied for good
+}
+
+// funcName is the name in a splitGoFuncs signature: "func Foo(t ...) {" is Foo.
+func funcName(sig string) string {
+	return strings.TrimSpace(strings.SplitN(strings.TrimPrefix(sig, "func "), "(", 2)[0])
 }
 
 // The wait the guard above accepts on faith: KillNodeDaemon's restore must
@@ -184,7 +210,7 @@ func TestDisruptiveCasesChooseANonSeedVictim(t *testing.T) {
 				continue
 			}
 			checked++
-			if name := strings.TrimSpace(strings.SplitN(strings.TrimPrefix(sig, "func "), "(", 2)[0]); seedVictimCases[name] {
+			if seedVictimCases[funcName(sig)] {
 				continue
 			}
 			// Any of these is a deliberate choice: the pickers exclude the
