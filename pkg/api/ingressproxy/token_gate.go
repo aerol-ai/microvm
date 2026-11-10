@@ -185,9 +185,11 @@ func locationWithoutToken(path, rawQuery string) string {
 	if !strings.HasPrefix(loc, "/") {
 		loc = "/" + loc
 	}
-	// "//host" would be a protocol-relative URL to another site.
-	if strings.HasPrefix(loc, "//") {
-		loc = "/" + strings.TrimLeft(loc, "/")
+	// "//host" would be a protocol-relative URL to another site, and so
+	// would "/\host" in a browser. EscapedPath already writes a backslash
+	// as %5C; the check stays so the rule holds whatever builds loc.
+	if strings.HasPrefix(loc, "//") || strings.HasPrefix(loc, "/\\") {
+		loc = "/" + strings.TrimLeft(loc, "/\\")
 	}
 	if len(kept) > 0 {
 		loc += "?" + strings.Join(kept, "&")

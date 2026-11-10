@@ -79,7 +79,9 @@ func evalIntExpr(expr ast.Expr, consts map[string]ast.Expr, visiting map[string]
 		if e.Kind != token.INT {
 			return 0, fmt.Errorf("%s is not an integer literal", e.Value)
 		}
-		n, err := strconv.ParseInt(e.Value, 0, 64)
+		// 32 bits: these are small policy numbers, and int(n) must not
+		// truncate on any platform.
+		n, err := strconv.ParseInt(e.Value, 0, 32)
 		if err != nil {
 			return 0, fmt.Errorf("integer literal %s: %w", e.Value, err)
 		}

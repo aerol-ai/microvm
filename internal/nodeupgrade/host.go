@@ -151,7 +151,12 @@ func (h *SystemHost) Fetch(ctx context.Context, rawURL string) (io.ReadCloser, i
 	}
 	switch u.Scheme {
 	case "file":
-		// A mirror on a mounted file system.
+		// A mirror on a mounted file system. The version and file name
+		// are path-escaped into the URL, and parsing decodes %2F back to
+		// "/", so refuse ".." rather than open a file outside the mirror.
+		if strings.Contains(u.Path, "..") {
+			return nil, 0, fmt.Errorf("release URL %s: a file:// path must not contain \"..\"", rawURL)
+		}
 		f, err := os.Open(u.Path)
 		if err != nil {
 			return nil, 0, err
