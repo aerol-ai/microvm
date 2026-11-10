@@ -268,9 +268,12 @@ jobs:
         shell: bash
         run: |
           mkdir -p dist
+          # The Caddy version and plugins are pinned in scripts/install.sh
+          # (CADDY_VERSION and the CADDY_*_MODULE lines);
+          # integration-tests/safety/caddy_version_test.go keeps this in step.
           go install github.com/caddyserver/xcaddy/cmd/xcaddy@v0.4.6
           CGO_ENABLED=0 GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} GOARM=${{ matrix.goarm }} \
-            "$(go env GOPATH)/bin/xcaddy" build \
+            "$(go env GOPATH)/bin/xcaddy" build v2.11.9 \
             --output dist/caddy_${{ matrix.suffix }} \
             --with github.com/mholt/caddy-l4@v0.1.2 \
             --with github.com/caddy-dns/cloudflare@v0.2.4 \
@@ -281,6 +284,7 @@ jobs:
             dist/caddy_${{ matrix.suffix }} list-modules | grep -qx 'layer4.handlers.proxy'
             dist/caddy_${{ matrix.suffix }} list-modules | grep -qx 'dns.providers.cloudflare'
             dist/caddy_${{ matrix.suffix }} list-modules | grep -qx 'caddy.storage.s3'
+            dist/caddy_${{ matrix.suffix }} version | grep -q '^v2\.11\.9 '
           fi
 
       - name: Upload build artifacts

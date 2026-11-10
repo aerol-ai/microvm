@@ -23,7 +23,12 @@ import (
 // certmagicS3Module is the storage plugin we link into Caddy. ss098's fork
 // is the path Caddy's official JSON-config docs link to; the JSON shape
 // (host/bucket/access_id/secret_key/prefix/insecure) is fixed here too.
-const certmagicS3Module = "github.com/ss098/certmagic-s3"
+const certmagicS3Module = "github.com/ss098/certmagic-s3@v0.0.0-20250922022452-8af482af5f39"
+
+// caddyVersion is the Caddy core the fixture builds: the one scripts/install.sh
+// pins (CADDY_VERSION), so the e2e tests run the Caddy a release ships.
+// integration-tests/safety/caddy_version_test.go keeps the two in step.
+const caddyVersion = "v2.11.9"
 
 //go:embed config.json.tmpl
 var configTmpl string
@@ -52,13 +57,14 @@ func Render(t testing.TB, cfg Config) []byte {
 }
 
 // Build returns a path to a Caddy binary linked with certmagic-s3. The binary
-// is cached in $TMPDIR/aerolvm-e2e-caddy/caddy and only rebuilt on absence.
+// is cached in $TMPDIR/aerolvm-e2e-caddy-<version>/caddy and only rebuilt on
+// absence; the version in the path means a bump never reuses an old build.
 // xcaddy itself is fetched via `go run` so no global install is required.
 // On any toolchain / network failure the test is skipped — this is an
 // operator-runnable path, not a CI gate.
 func Build(t testing.TB) string {
 	t.Helper()
-	cacheDir := filepath.Join(os.TempDir(), "aerolvm-e2e-caddy")
+	cacheDir := filepath.Join(os.TempDir(), "aerolvm-e2e-caddy-"+caddyVersion)
 	binPath := filepath.Join(cacheDir, "caddy")
 	if _, err := os.Stat(binPath); err == nil {
 		return binPath
@@ -67,8 +73,8 @@ func Build(t testing.TB) string {
 		t.Fatalf("caddyfx: mkdir cache: %v", err)
 	}
 	args := []string{
-		"run", "github.com/caddyserver/xcaddy/cmd/xcaddy@latest",
-		"build",
+		"run", "github.com/caddyserver/xcaddy/cmd/xcaddy@v0.4.6",
+		"build", caddyVersion,
 		"--output", binPath,
 		"--with", certmagicS3Module,
 	}
