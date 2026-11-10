@@ -355,13 +355,13 @@ func (fc *faultCluster) leader() *faultServer {
 func (fc *faultCluster) transferLeadership(to *faultServer) *faultServer {
 	fc.t.Helper()
 	old := fc.leader()
-	var f raft.Future
-	if to != nil {
-		f = old.cluster().raft.raft.LeadershipTransferToServer(raft.ServerID(to.id), raft.ServerAddress(to.raftAddr))
-	} else {
-		f = old.cluster().raft.raft.LeadershipTransfer()
-	}
-	if err := f.Error(); err != nil {
+	err := transferWithRetry(faultTransferAttempts, func() error {
+		if to != nil {
+			return old.cluster().raft.raft.LeadershipTransferToServer(raft.ServerID(to.id), raft.ServerAddress(to.raftAddr)).Error()
+		}
+		return old.cluster().raft.raft.LeadershipTransfer().Error()
+	}, func() bool { return fc.leader() != old }, fc.t.Logf)
+	if err != nil {
 		fc.t.Fatalf("leadership transfer from %s: %v", old.id, err)
 	}
 	deadline := time.Now().Add(faultWait)
@@ -373,6 +373,40 @@ func (fc *faultCluster) transferLeadership(to *faultServer) *faultServer {
 	}
 	fc.t.Fatalf("leadership never left %s", old.id)
 	return nil
+}
+
+// faultTransferAttempts bounds transferWithRetry, so a transfer that never
+// works still fails the test.
+const faultTransferAttempts = 3
+
+// transferWithRetry runs a leadership transfer, retrying only raft's
+// "leadership transfer timeout". raft returns it when the target has not
+// taken over within one election timeout, 250 ms in these tests
+// (main_test.go); on a loaded machine that is the machine, not a bug: a stress
+// run failed 7 of 160 that way. The old leader keeps leading after it, so
+// trying again is safe. raft can still report ErrLeadershipTransferInProgress
+// for a moment after the timeout (its own comment in raft.go says so), so
+// that is retried after a timeout too. Any other error fails at once.
+// moved reports whether leadership left anyway; then there is nothing to retry.
+func transferWithRetry(attempts int, transfer func() error, moved func() bool, logf func(string, ...any)) error {
+	var err error
+	for attempt := 1; attempt <= attempts; attempt++ {
+		if err = transfer(); err == nil {
+			return nil
+		}
+		timedOut := err.Error() == "leadership transfer timeout"
+		if !timedOut && !(attempt > 1 && errors.Is(err, raft.ErrLeadershipTransferInProgress)) {
+			return err
+		}
+		if moved() {
+			return nil
+		}
+		if attempt < attempts {
+			logf("leadership transfer attempt %d of %d: %v; retrying", attempt, attempts, err)
+			time.Sleep(50 * time.Millisecond)
+		}
+	}
+	return err
 }
 
 // settle waits until every live server has applied the same FSM log prefix
