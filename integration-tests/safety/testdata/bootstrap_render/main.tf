@@ -372,3 +372,16 @@ output "joiner_join_worker" {
     join_token    = "aaaaaa.00000000000000000000000000000000"
   }))
 }
+
+# The one-line join path with download_mirror set: its CNI plugins and
+# BuildKit are install.sh's pins (TestBootstrapDownloadMirrorPinsMatchInstallSh).
+# The old path keeps v0.6.13's versions byte for byte
+# (TestBootstrapOldJoinPathRendersLikeV0613).
+output "joiner_join_download_mirror" {
+  value = templatefile("__TEMPLATE__", merge(local.base, {
+    is_seed         = false
+    one_line_join   = true
+    join_token      = "aaaaaa.00000000000000000000000000000000"
+    download_mirror = "https://mirror.example.com/base"
+  }))
+}

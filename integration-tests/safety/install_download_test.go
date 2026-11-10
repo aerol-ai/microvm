@@ -462,7 +462,9 @@ func bootstrapBuildkitUnit(t *testing.T) string {
 // before the bootstrap's BuildKit and CNI steps, which skip themselves when
 // buildkitd, buildkit.service and <cni_dir>/bridge exist. So whatever
 // install.sh puts there must be exactly what the bootstrap would have: the
-// same versions, binaries, paths and unit.
+// same versions, binaries, paths and unit. The versions are the one-line
+// join path's, the first bk_ver= and cni_ver= in the template; the old path
+// keeps v0.6.13's (see TestBootstrapDownloadMirrorPinsMatchInstallSh).
 func TestInstallBuildkitMatchesTheBootstrap(t *testing.T) {
 	src := installShSource(t)
 	tpl := readRepoFile(t, "Terraform", "templates", "bootstrap.sh.tftpl")
@@ -515,9 +517,13 @@ func TestInstallBuildkitMatchesTheBootstrap(t *testing.T) {
 	origin := "https://github.com/moby/buildkit/releases/download/" + version + "/" + file
 	mirror := testMirror + "/deps/buildkit/" + version + "/" + file
 	for _, tc := range []struct {
-		name        string
-		served      map[string][]byte
-		preinstall  bool // buildkitd on PATH and a unit already there
+		name       string
+		served     map[string][]byte
+		preinstall bool // buildkitd on PATH and a unit already there
+		// ours, when set, is the release a buildkitd already in
+		// BUILDKIT_BIN_DIR reports (the path install.sh and the bootstrap
+		// use), with the bootstrap's unit beside it.
+		ours        string
 		want, never []string
 		wantErr     string
 	}{
@@ -529,6 +535,12 @@ func TestInstallBuildkitMatchesTheBootstrap(t *testing.T) {
 			want: []string{"systemctl enable --now buildkit.service"}, never: []string{"GET ", "daemon-reload"}},
 		{name: "a tarball that is not the pinned one is refused", served: map[string][]byte{origin: []byte("junk")},
 			never: []string{"systemctl"}, wantErr: "checksum verification failed"},
+		// A node from before v0.7.0 has BuildKit v0.17.2 (92 known
+		// vulnerabilities): a re-run replaces it and restarts the service.
+		{name: "ours at an older release: stopped, replaced, started", ours: "v0.17.2", served: map[string][]byte{origin: tarball},
+			want: []string{"GET " + origin, "systemctl stop buildkit.service", "systemctl enable --now buildkit.service"}, never: []string{"daemon-reload"}},
+		{name: "ours at the pinned release: nothing downloaded or stopped", ours: version,
+			want: []string{"systemctl enable --now buildkit.service"}, never: []string{"GET ", "systemctl stop", "daemon-reload"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			dir := t.TempDir()
@@ -545,7 +557,7 @@ func TestInstallBuildkitMatchesTheBootstrap(t *testing.T) {
 			// PATH holds only the real tools install_buildkit and the
 			// helpers run, so buildkitd is "installed" only when this case
 			// puts it there, and nothing else on the machine is reached.
-			for _, name := range []string{"mktemp", "rm", "tar", "gzip", "install", "cat", "tr", "shasum", "sha256sum"} {
+			for _, name := range []string{"mktemp", "rm", "tar", "gzip", "install", "cat", "tr", "shasum", "sha256sum", "awk"} {
 				if p, err := exec.LookPath(name); err == nil {
 					if err := os.Symlink(p, filepath.Join(tools, name)); err != nil {
 						t.Fatal(err)
@@ -559,6 +571,14 @@ func TestInstallBuildkitMatchesTheBootstrap(t *testing.T) {
 				}
 				mustWrite(t, unit, "operator's unit\n")
 			}
+			if tc.ours != "" {
+				mustWrite(t, filepath.Join(bin, "buildkitd"), "#!/bin/sh\necho 'buildkitd github.com/moby/buildkit "+tc.ours+" 0123abcd'\n")
+				if err := os.Chmod(filepath.Join(bin, "buildkitd"), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				mustWrite(t, filepath.Join(bin, "buildctl"), "old buildctl\n")
+				mustWrite(t, unit, want)
+			}
 			log := filepath.Join(dir, "calls.log")
 			script := "set -euo pipefail\nPATH='" + tools + "'\nLOG='" + log + "'\nSERVE='" + serve + "'\nTMPDIR='" + dir + "'\n" +
 				"DOWNLOAD_MIRROR='" + testMirror + "'\nBUILDKIT_BIN_DIR='" + bin + "'\nBUILDKIT_UNIT_FILE='" + unit + "'\n" +
@@ -566,6 +586,7 @@ func TestInstallBuildkitMatchesTheBootstrap(t *testing.T) {
 				"uname() { echo x86_64; }\nsystemctl() { echo \"systemctl $*\" >>\"$LOG\"; }\n" +
 				fetchStubs + installShPinsDefaults(t, src) + fetchFuncs(t, src) +
 				extractShellFunc(t, src, "install_buildkit") + extractShellFunc(t, src, "buildkit_unit") +
+				extractShellFunc(t, src, "buildkit_version_at") +
 				"install_buildkit\necho DONE\n"
 			cmd := exec.Command("bash", "-c", script)
 			var out, errOut strings.Builder
@@ -597,6 +618,19 @@ func TestInstallBuildkitMatchesTheBootstrap(t *testing.T) {
 			case tc.preinstall:
 				if len(names) != 0 || string(gotUnit) != "operator's unit\n" {
 					t.Errorf("a node that had BuildKit got binaries %v and unit %q", names, gotUnit)
+				}
+			case tc.ours == version:
+				if got, _ := os.ReadFile(filepath.Join(bin, "buildctl")); string(got) != "old buildctl\n" {
+					t.Errorf("BuildKit at the pinned release was replaced: buildctl is now %q", got)
+				}
+			case tc.ours != "":
+				for name, body := range map[string]string{"buildkitd": "buildkitd", "buildctl": "buildctl"} {
+					if got, _ := os.ReadFile(filepath.Join(bin, name)); string(got) != body {
+						t.Errorf("%s after the upgrade = %q, want the pinned release's", name, got)
+					}
+				}
+				if string(gotUnit) != want {
+					t.Errorf("the upgrade rewrote the unit:\n%s", gotUnit)
 				}
 			default:
 				if strings.Join(names, " ") != "buildctl buildkitd" {

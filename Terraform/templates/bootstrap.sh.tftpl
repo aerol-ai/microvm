@@ -4,8 +4,7 @@
 #
 # Variables expected:
 #   node_name, role, is_seed (bool),
-#   pat_token (empty for a one-line worker or ingress joiner), domain,
-#   cloudflare_api_token,
+#   pat_token, domain, cloudflare_api_token,
 #   with_firecracker (bool), with_gvisor (bool), with_isolate (bool), ingress_proxy_routing (bool), with_nvidia_gpu (bool), with_amd_gpu (bool),
 #   idle_timeout_min (number; 0 disables),
 #   pat_scope ("any" | "host"), l4_proxy_protocol (bool),
@@ -208,9 +207,10 @@ fi
 curl_download '${install_script_url}' -o /tmp/install.sh
 chmod +x /tmp/install.sh
 
-INSTALL_ARGS=(--node-name '${node_name}')
 %{ if pat_token != "" ~}
-INSTALL_ARGS+=(--pat-token '${pat_token}')
+INSTALL_ARGS=(--pat-token '${pat_token}' --node-name '${node_name}')
+%{ else ~}
+INSTALL_ARGS=(--node-name '${node_name}')
 %{ endif ~}
 if [ -n '${domain}' ]; then
   INSTALL_ARGS+=(
@@ -1320,7 +1320,11 @@ if [ "${container_engine}" = "containerd" ]; then
       aarch64|arm64) cni_arch=arm64 ;;
       *) echo "[bootstrap] unsupported arch $(uname -m) for CNI plugins" >&2; exit 1 ;;
     esac
+%{ if one_line_join ~}
+    cni_ver=v1.9.1
+%{ else ~}
     cni_ver=v1.5.1
+%{ endif ~}
     cni_url="https://github.com/containernetworking/plugins/releases/download/$${cni_ver}/cni-plugins-linux-$${cni_arch}-$${cni_ver}.tgz"
     echo "[bootstrap] installing CNI plugins $${cni_ver} ($${cni_arch}) to $${cni_dir}"
     sudo mkdir -p "$${cni_dir}"
@@ -1329,8 +1333,13 @@ if [ "${container_engine}" = "containerd" ]; then
     # checked against install.sh's pins (CNI_PLUGINS_SHA256_*) wherever it came
     # from. safety/bootstrap_render_test.go keeps the two in step.
     case "$${cni_arch}" in
+%{ if one_line_join ~}
+      amd64) cni_sha=b98f74a0f8522f0a83867178729c1aa70f2158f90c45a2ca8fa791db1c76b303 ;;
+      arm64) cni_sha=56171987d3947707c3563db2f4001bccaf50fd63468611b9f3cbecb1375ee7ec ;;
+%{ else ~}
       amd64) cni_sha=77baa2f669980a82255ffa2f2717de823992480271ee778aa51a9c60ae89ff9b ;;
       arm64) cni_sha=c2a292714d0fad98a3491ae43df8ad58354b3c0bdf5d5a3e281777967c70fcff ;;
+%{ endif ~}
     esac
     cni_tmp="$(mktemp -d)"
     curl_download "$${cni_url}" -o "$${cni_tmp}/cni-plugins.tgz"
@@ -1360,7 +1369,11 @@ if [ "${container_engine}" = "containerd" ]; then
       aarch64|arm64) bk_arch=arm64 ;;
       *) echo "[bootstrap] unsupported arch $(uname -m) for buildkit" >&2; exit 1 ;;
     esac
+%{ if one_line_join ~}
+    bk_ver=v0.34.2
+%{ else ~}
     bk_ver=v0.17.2
+%{ endif ~}
     bk_url="https://github.com/moby/buildkit/releases/download/$${bk_ver}/buildkit-$${bk_ver}.linux-$${bk_arch}.tar.gz"
     echo "[bootstrap] installing buildkit $${bk_ver} ($${bk_arch})"
     bk_tmp="$(mktemp -d)"
@@ -1368,8 +1381,13 @@ if [ "${container_engine}" = "containerd" ]; then
     # Same as the CNI plugins: mirror fallback, install.sh's pins
     # (BUILDKIT_SHA256_*).
     case "$${bk_arch}" in
+%{ if one_line_join ~}
+      amd64) bk_sha=b9f18b8e37eb450e9e5df03117045237cdd12d3c4a0034ffeeaa857852a15e13 ;;
+      arm64) bk_sha=a4ad483a33b2f1544c5ccce1c5956c559e1a6e84b8bf6cedd847d695885237a3 ;;
+%{ else ~}
       amd64) bk_sha=24d73e4456ebbe6dbb53779e362b2164a000e9636cd9ca8bd90f742fb024b731 ;;
       arm64) bk_sha=77384e2726c93d7c2bd7b745c079e1953f92683570203c7bfca361965db2f0c2 ;;
+%{ endif ~}
     esac
     curl_download "$${bk_url}" -o "$${bk_tmp}/buildkit.tar.gz"
     echo "$${bk_sha}  $${bk_tmp}/buildkit.tar.gz" | sha256sum -c -
