@@ -716,7 +716,7 @@ the skip.
   inside `sandboxd` (`internal/service/ownership_lease.go:193-197`). containerd
   sandboxes are not in `sandboxd`'s unit cgroup, so they outlive it. After 10
   crashes in 5 minutes systemd stops restarting `sandboxd`
-  (`scripts/install.sh:2809-2810`), and failover then recreates its `recreate`
+  (`scripts/install.sh:2826-2827`), and failover then recreates its `recreate`
   sandboxes elsewhere while the originals keep running. Found by the outside
   voice in the 2026-11-10 CEO review of `plans/kubernetes-v2-architecture.md`,
   whose C7 fixes the same hole for pods.

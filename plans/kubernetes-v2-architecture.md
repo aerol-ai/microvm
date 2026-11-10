@@ -331,7 +331,7 @@ Servers are today's server role (`SB_NODE_ROLE=server`) with four changes:
    Today a stop sends a gossip "leave" with a 2-second timeout and does not
    hand off leadership (`internal/cluster/gossip.go`, `gossipNode.Close`;
    `internal/cluster/client.go`, `Close`). The hand-off itself exists since
-   v0.7.0 (`TransferLeadership`, `internal/cluster/rollout.go:250`); C8 calls it
+   v0.7.0 (`TransferLeadership`, `internal/cluster/rollout.go:251`); C8 calls it
    on `SIGTERM`.
 4. **Three or five voters.** The existing cap of 7 server nodes
    (`cluster.MaxServerTierNodes`: 5 voters plus 2 while one is being
@@ -670,7 +670,7 @@ a lock.
 |---|---|---|---|---|
 | L-a | The reservation lock is held while waiting for the Raft commit | `internal/cluster/client.go`, `applyReservationEncodedLocal` holds `reservationAdmissionMu` across `raft.Apply(...).Error()` | Reservations happen one at a time. With a commit at about 6–7 ms p50 on gp3 (`plans/warm-create-latency-tier1.md`), that is **roughly 150 creates per second for the whole cluster**. This is our estimate from the code, not a measurement. Phase 0 measures it. | Fixed: §9.4 E2 shipped (#1024, `admission_ledger.go`) |
 | L-b | No group commit: one Raft entry per command | `client.go`; `opReserveBatch` exists but only tests use it | Each write pays its own disk sync | Mostly moot: raft groups concurrent applies now that E2 is in |
-| L-c | Every write saves a recovery file, with fsync, under the table's write lock, on every server | `internal/cluster/fsm.go`, `recoveryStore.Put` inside apply | Slower commits, and reads wait too | Mostly fixed: Put defers fsync to snapshot time (`recovery_store.go:84-96`); the write still runs under the table lock |
+| L-c | Every write saves a recovery file, with fsync, under the table's write lock, on every server | `internal/cluster/fsm.go`, `recoveryStore.Put` inside apply | Slower commits, and reads wait too | Mostly fixed: Put defers fsync to snapshot time (`recovery_store.go:91-98`); the write still runs under the table lock |
 | L-d | Workers and ingress nodes ask a server for the owner on **every** routed request | `internal/cluster/agent.go`, `OwnerOf` → `lookupPlacement`, no cache | Server load grows with traffic, not with sandboxes | Fixed behind a flag: owner cache (#1018, `SB_CLUSTER_OWNER_CACHE`, off by default; on in Kubernetes) and owner-side lease (#1042) |
 | L-e | Every server polls every worker's capacity every 5 s | `capacity_lease.go` | 2,000 workers × 5 servers = 2,000 calls per second of pure upkeep | Open; since ef7fecfe a leader with stale capacity asks the worker on demand |
 | L-f | Choosing a worker scans the whole fleet | `internal/cluster/placement.go` | Cost per create grows with the fleet | Open |
@@ -690,7 +690,7 @@ measure before and after each one.
 | E1 | **Group commit.** Many reserves and places share one Raft entry, using hashicorp/raft's batching and the unused `opReserveBatch`. | L-b | Done by raft's own batching once E2 shipped |
 | E2 | **Never wait for the disk while holding the reservation lock.** Check and hold the room in memory under the lock, release it, then commit. A failed commit gives the room back. | L-a | Shipped (#1024) |
 | E3 | **Route cache on gateways and workers**, filled from the placement change feed that already exists (`placement_changelog.go`). The owner answers "not here" to a stale guess. | L-d | Shipped behind `SB_CLUSTER_OWNER_CACHE` (#1018, #1042); the chart turns it on |
-| E4 | **Write the recovery file outside the table lock.** The file is named by its content hash, so it can be written before the commit and safely left behind if the commit fails. | L-c | Open Stale premise (eng review OV-E7): Put already defers fsync to snapshot time (`internal/cluster/recovery_store.go:84-96`), and moving Put before commit would break the GC assumption that Put and snapshot tracking share the FSM lock. Re-measure; drop unless the remaining I/O shows up. |
+| E4 | **Write the recovery file outside the table lock.** The file is named by its content hash, so it can be written before the commit and safely left behind if the commit fails. | L-c | Open Stale premise (eng review OV-E7): Put already defers fsync to snapshot time (`internal/cluster/recovery_store.go:91-98`), and moving Put before commit would break the GC assumption that Put and snapshot tracking share the FSM lock. Re-measure; drop unless the remaining I/O shows up. |
 | E5 | **Capacity work grows with workers, not workers × servers.** Each worker pushes its numbers on change and every few seconds to the leader. Followers learn them from the leader. | L-e | Open |
 | E6 | **Pick from a sample, not the whole fleet.** Keep a list of fitting workers per runtime and zone, draw a few at random, and apply the power of two choices to them. | L-f | Open |
 | E7 | **Failover in batches**, many sandboxes per Raft write, and keep going past a single error. | L-h | Open |
@@ -995,7 +995,7 @@ cannot spread to the others.
 ### 12.3 The cell number lives in the sandbox ID
 
 Today an ID is `sb-` plus 16 hex digits, all random
-(`internal/service/service.go:8423`, `generateSandboxID`). Clients tell an ID from a name by that
+(`internal/service/service.go:8416`, `generateSandboxID`). Clients tell an ID from a name by that
 shape alone (`pkg/models/sandbox_name.go`), so the shape must not change.
 
 The plan: **the first two hex digits become the cell number; the other 14
@@ -1223,11 +1223,11 @@ example admission policy that refuses unsigned AerolVM images.
 | Metrics, alerts, dashboards | `/v1/metrics`, `setup/prometheus/`, `setup/grafana/` |
 | Version gate for new Raft writes | `internal/cluster/fsm_egress_profiles.go` |
 | Leader-driven rollouts: order, staging, canary (`--pause-after`), `finalize` with one-way migrations, rollback; nodes that take no API upgrade report `manual` (v0.7.0) | `internal/cluster/rollout_driver.go`, `rollout_state.go`, `pkg/upgradewire` |
-| Leadership hand-off on demand | `internal/cluster/rollout.go:250` (`TransferLeadership`) |
+| Leadership hand-off on demand | `internal/cluster/rollout.go:251` (`TransferLeadership`) |
 | Join tokens, node certificates that renew themselves, CA on the servers (`sandboxd adopt`), `preflight`, `reset` (v0.7.0) | `internal/nodejoin/`, `cmd/sandboxd/node.go` |
 | `cordon`, `uncordon`, `drain`, `delete node` (hands `recreate` sandboxes to other workers) | `pkg/api/v1/routes.go:272-279`, `cmd/aerolvm/nodes.go` |
 | `sandboxd backup`, `restore`, `recover-quorum` | `cmd/sandboxd/ops.go`, `internal/nodeops/` |
-| Admission without a lock across the commit (§9.4 E2), owner cache and owner lease (§9.4 E3) | `internal/cluster/admission_ledger.go`, `agent.go:166` |
+| Admission without a lock across the commit (§9.4 E2), owner cache and owner lease (§9.4 E3) | `internal/cluster/admission_ledger.go`, `internal/cluster/agent.go:177-179` (owner cache), `internal/service/ownership_lease.go` (owner lease) |
 | Zone and node labels, zone-pinned creates that failover honours | `SB_NODE_ZONE`, `SB_NODE_LABELS` (`internal/config/config.go:1164`), `plans/placement-rules.md` |
 | WASM workers and V8-isolate group hosts that outlive a `sandboxd` restart and are taken over again | `pkg/hostproc`, `internal/runtime/wasm/adopt.go`, `internal/runtime/isolate/adopt.go` |
 | A cloud identity per sandbox (AerolVM is the OIDC issuer; the IRSA model without Kubernetes) | `internal/cloudidentity`, `plans/sandbox-cloud-identity.md` |
@@ -1545,7 +1545,7 @@ Phase 1, after the 2–3 week Phase 0 spikes.
 - REALITY: binding-decisions finding. The 2026-09-30 decisions put the agent-sandbox API facade in Phase 3 and replace own CRDs. v2 moves the facade to Phase 6 and adds its own `SandboxTemplate` and `SandboxPool` CRDs. It withdraws husk pods and the license gate, which is an announced, user-driven reversal (2026-11-04). §10.1 and §16 `plans/kubernetes-deployment.md:23`
 - REALITY: numbers finding. 751 B per placement [measured: secrets-hardening fleet-scale]. gVisor 284 ms and containerd 189 ms warm [measured: `plans/investor-benchmark-observability.md:28`]. A 6–7 ms commit [measured: `plans/warm-create-latency-tier1.md:60`]. "~150 creates/s" [estimated, now stale: E2 expects 1,000–3,000 reserves/s, also an estimate; re-measure before the gate]. The ID-clash chance of about 1 in 140,000 at 1M live re-derives as n²/2^57 ≈ 1 in 144,000. §9.3 L-a
 - REALITY: deferred-asks pass. No linked issue. the plan header `plans/kubernetes-v2-architecture.md:3`
-- REALITY: pr-count pass. No `.gstack/ship-policy.json`, so the default is one PR per wave. The plan ships each phase as stacked PRs. §18 `plans/kubernetes-v2-architecture.md:1272`
+- REALITY: pr-count pass. No `.gstack/ship-policy.json`, so the default is one PR per wave. The plan ships each phase as stacked PRs. §18 `plans/kubernetes-v2-architecture.md:1289`
 
 **0C. Dream state.**
 ```
@@ -2140,7 +2140,7 @@ Effort S (zero new work), risk medium. Phase 0 starts on a yes. ✅ Nothing spen
 |---|---|---|---|
 | Phase 0, day 1 | Send Q6 and P7 v1 to the bank (R4). Pin the EKS images (AL2023; Bottlerocket only if S1 passes). | A "no" ends the plan; everything else is conditional on "yes". | ~2 days / ~2 hours |
 | Phase 0, weeks 1–3 | S1–S7 spikes. S1 (our containerd in a privileged pod, sandboxes under the pod's cgroup) and S2 (in-place `agent` swap) decide K2/K3. | The cgroup v2 "no internal processes" rule; containerd CRI gives privileged pods the host cgroup tree; Bottlerocket's `control_t`. | ~3 weeks / ~4–5 days |
-| Phase 1 | C1–C7, C12, P1 images (new: the release pipeline builds no container images today), P3 single mode, P8 subset, P10 notes. | `/health` still pings Docker (`internal/service/service.go:6273`); images must reach the bank's mirror like release files do. | ~4–5 weeks / ~1–1.5 weeks |
+| Phase 1 | C1–C7, C12, P1 images (new: the release pipeline builds no container images today), P3 single mode, P8 subset, P10 notes. | `/health` still pings Docker (`internal/service/service.go:6266`); images must reach the bank's mirror like release files do. | ~4–5 weeks / ~1–1.5 weeks |
 | Phase 2 | The operator (P2), C8–C11, C13's operator-driven rollout state, C19, C20, C22, C23, P6–P10, Karpenter. | C13 and C20 touch `internal/cluster` (rule 6). The rollout skips `manual` nodes today (`rollout_driver.go:395`). The EKS managed-node-group 15-minute limit. | ~8–10 weeks / ~2–3 weeks |
 | Phase 3 | C18 (E4–E7), every §19 drill, the 72-hour soak, the cell-ceiling bench, using `internal/failpoint` and the cluster-phase-2 soak driver. | Numbers may miss G3; cells are the answer either way. | ~6–8 weeks / ~2 weeks |
 | Phases 4–6 | AKS (C15, NAP), runtimes and C21 gVisor moves, then cells and the agent-sandbox facade (decide its storage first; TODOS). | C21's per-worker address slices; the facade's APIService blast radius. | Planned per phase |
@@ -2872,7 +2872,7 @@ Reality rows (eng):
 - REALITY: binding-decisions pass. This review keeps every CEO answer (RQ1–RQ17) and the 2026-11-10 decision-log entries. `plans/kubernetes-v2-architecture.md:3`
 - REALITY: numbers finding. The CEO-review tags hold; S4's restore time must be re-measured with the new snapshot interval [re-measure before gate]. `internal/config/config.go:2171`
 - REALITY: deferred-asks pass. No linked issue. `plans/kubernetes-v2-architecture.md:1`
-- REALITY: pr-count pass. No ship policy; each phase ships as stacked PRs. `plans/kubernetes-v2-architecture.md:1272`
+- REALITY: pr-count pass. No ship policy; each phase ships as stacked PRs. `plans/kubernetes-v2-architecture.md:1289`
 
 
 
@@ -2986,11 +2986,11 @@ findings (verified by reading code):
 
 1. OV-E1 `[CRITICAL] (confidence: 9/10)` `internal/service/ownership_lease.go:40-48`: "the freeze lands at most lease + lease/15 (16 s by default) after the last proven contact, against an earliest reassignment of grace (30 s)". C19 (§9.6) starts failover "at once" when Kubernetes deletes a Node, which skips that margin, so the old copy may still run. **Fixed as required work** (keeps the shipped invariant I1): C19 may shorten the wait only down to the lease limit, `lease + lease/15` after the last proven contact (16 s by default), never to zero. A test deletes a Node while its worker keeps running.
 2. OV-E2 `[INFORMATIONAL] (confidence: 9/10)` `pkg/mounts/cgroup.go:26-30`: mount helpers run in `/sys/fs/cgroup/aerolvm-mounts` at the host root. In a privileged pod that escapes the pod's accounting, and the fallback dies with `agent`. **Fixed as required work** (C7, Phase 1): mount helpers run under the `runtime` container's cgroup, like `pkg/hostproc`, with Bidirectional mount propagation, so sandboxes keep their mounts across an `agent` restart. S2 adds continuous I/O on a mounted file across an `agent` swap.
-3. OV-E3 `[INFORMATIONAL] (confidence: 8/10)` `internal/runtime/containerd/snapshot.go:252-262`: the snapshot path captures the rootfs diff; C21 moves memory only. **Fixed as required work** (C21): one bundle, taken while the sandbox is paused, holds the memory checkpoint and the rootfs diff (reusing `snapshot.go`). A sandbox with external-storage mounts is refused (the next §10.5 row applies) until re-attach is designed. Tests cover changed files, open file descriptors and a running process.
+3. OV-E3 `[INFORMATIONAL] (confidence: 8/10)` `internal/runtime/containerd/snapshot.go:245-265`: the snapshot path captures the rootfs diff; C21 moves memory only. **Fixed as required work** (C21): one bundle, taken while the sandbox is paused, holds the memory checkpoint and the rootfs diff (reusing `snapshot.go`). A sandbox with external-storage mounts is refused (the next §10.5 row applies) until re-attach is designed. Tests cover changed files, open file descriptors and a running process.
 4. OV-E4 `[INFORMATIONAL] (confidence: 9/10)` `internal/runtime/containerd/lifecycle.go:58-61`: "containerd overlayfs does not [enforce DiskGB]. Soft-ignore." One sandbox can fill the worker's disk (images, database, every sandbox). Decision D8 (answered: A, C27 and S8).
 5. OV-E5 `[INFORMATIONAL] (confidence: 9/10)` `internal/nodejoin/join.go:65-71`: `Joiner.Run` needs root, an installed host layout and a systemd restart. Pods cannot "join exactly as a VM" (§15.2). **Fixed as required work** (C23): a pod-native init and join path. `sandboxd` enrolls in-process at container start, writes its files to the pod volume and never restarts a unit. The first server pod runs `init` (CA on the servers by default). The operator's admin credential is minted by `init` and stored as a Secret in the operator's namespace.
 6. OV-E6 `[INFORMATIONAL] (confidence: 8/10)` §10.6: "the operator replaces machines by age itself, by decommission", but decommission plus deleting the pod leaves the machine running, and a new worker pod can land back on it. **Fixed as required work** (P2, §10.6): an idempotent retirement sequence, recorded in `AerolNode`: cordon the Node, decommission, delete the worker pod, then delete the Karpenter/NAP NodeClaim (managed node groups use their own replacement). The operator's RBAC gains Node patch and NodeClaim delete. A test replaces a machine while the operator restarts mid-sequence.
-7. OV-E7 `[INFORMATIONAL] (confidence: 8/10)` `internal/cluster/recovery_store.go:84-96`: Put already leaves blobs in the page cache and syncs at snapshot time. §9.4 E4's premise ("with fsync, under the table's write lock") is stale, and moving Put before commit would break the GC assumption that Put and snapshot tracking share the FSM lock. **Factual correction**: E4 is marked "re-measure; drop unless the remaining I/O shows up", and L-c's status is updated.
+7. OV-E7 `[INFORMATIONAL] (confidence: 8/10)` `internal/cluster/recovery_store.go:91-98`: Put already leaves blobs in the page cache and syncs at snapshot time. §9.4 E4's premise ("with fsync, under the table's write lock") is stale, and moving Put before commit would break the GC assumption that Put and snapshot tracking share the FSM lock. **Factual correction**: E4 is marked "re-measure; drop unless the remaining I/O shows up", and L-c's status is updated.
 
 ### Decision ledger (eng review)
 
