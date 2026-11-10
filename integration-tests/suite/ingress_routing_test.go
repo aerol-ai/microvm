@@ -6,6 +6,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -136,8 +137,15 @@ func waitFirst200(url string, timeout time.Duration) error {
 
 // tcpEchoOnce opens a FRESH connection, round-trips one line, and closes.
 // A fresh connection per probe is what a routing change can break.
-func tcpEchoOnce(addr string) error {
-	conn, err := net.DialTimeout("tcp", addr, 8*time.Second)
+func tcpEchoOnce(addr string) error { return tcpEchoOnceCounting(addr, nil) }
+
+// tcpEchoOnceCounting is tcpEchoOnce for a churn gate: a connect that timed
+// out is tried once more and counted in retried (harness.DialRetryingLostSYN).
+func tcpEchoOnceCounting(addr string, retried *atomic.Int64) error {
+	d := &net.Dialer{Timeout: 8 * time.Second}
+	conn, err := harness.DialRetryingLostSYN(context.Background(), func(ctx context.Context) (net.Conn, error) {
+		return d.DialContext(ctx, "tcp", addr)
+	}, retried)
 	if err != nil {
 		return err
 	}
@@ -174,8 +182,15 @@ func (f *failureTally) record(err error) {
 	}
 	f.bad.Add(1)
 	msg := err.Error()
-	if len(msg) > 80 {
-		msg = msg[:80]
+	// Drop the URL: it is the same for every probe of a kind, and it pushed
+	// the cause past the cut ("Get \"https://…\": dial tcp 13." on
+	// 2026-11-10 said nothing about why).
+	var ue *url.Error
+	if errors.As(err, &ue) {
+		msg = ue.Op + ": " + ue.Err.Error()
+	}
+	if len(msg) > 160 {
+		msg = msg[:160]
 	}
 	f.mu.Lock()
 	if f.kinds == nil {
@@ -216,10 +231,13 @@ func TestIngressRoutingChurnGate(t *testing.T) {
 	target := newRoutingTarget(t, c)
 
 	const window = 90 * time.Second
+	pl := startPathLossCheck(t)
 	stop := time.Now().Add(window)
 	httpClient := &http.Client{
-		Timeout:   15 * time.Second,
-		Transport: &http.Transport{DisableKeepAlives: true}, // a new connection per request
+		// Room for one retried connect (2 x 10 s) and the request.
+		Timeout: 30 * time.Second,
+		// A new connection per request.
+		Transport: &http.Transport{DisableKeepAlives: true, DialContext: pinnedDialCounting("", &pl.retried)},
 	}
 	var httpT, tcpT failureTally
 	// Only successful probes are timed: a failure is counted above, and its
@@ -252,7 +270,7 @@ func TestIngressRoutingChurnGate(t *testing.T) {
 			defer wg.Done()
 			for time.Now().Before(stop) {
 				start := time.Now()
-				err := tcpEchoOnce(target.tcpAddr)
+				err := tcpEchoOnceCounting(target.tcpAddr, &pl.retried)
 				if err == nil {
 					tcpLat.Add(time.Since(start))
 				}
@@ -293,13 +311,15 @@ func TestIngressRoutingChurnGate(t *testing.T) {
 
 	t.Logf("churn gate: %d churn cycles (%d errors); http %d ok / %d failed; tcp %d ok / %d failed",
 		churnOps, churnErrs, httpT.ok.Load(), httpT.bad.Load(), tcpT.ok.Load(), tcpT.bad.Load())
+	probes := httpT.ok.Load() + httpT.bad.Load() + tcpT.ok.Load() + tcpT.bad.Load()
+	pathErr := pl.verdict(t, probes)
 	httpSum, tcpSum := httpLat.Summary(), tcpLat.Summary()
 	t.Logf("churn gate latency: expose to first 200 %dms; fresh http %s; fresh tcp %s",
 		target.exposeToFirst200.Milliseconds(), httpSum, tcpSum)
 	// Before the assertions, so the flag-off arm of the A/B, which is
 	// expected to drop connections and fail, still reports its numbers.
-	harness.ReportDetail(t, "expose-to-200 %dms; http %s, %d failed; tcp %s, %d failed; %d churn cycles",
-		target.exposeToFirst200.Milliseconds(), httpSum, httpT.bad.Load(), tcpSum, tcpT.bad.Load(), churnOps)
+	harness.ReportDetail(t, "expose-to-200 %dms; http %s, %d failed; tcp %s, %d failed; %d connects retried; %d churn cycles",
+		target.exposeToFirst200.Milliseconds(), httpSum, httpT.bad.Load(), tcpSum, tcpT.bad.Load(), pl.retried.Load(), churnOps)
 	bankRecord(t, "ingress_routing_churn_gate", map[string]any{
 		"window_s":               window.Seconds(),
 		"churn_cycles":           churnOps,
@@ -307,6 +327,7 @@ func TestIngressRoutingChurnGate(t *testing.T) {
 		"expose_to_first_200_ms": target.exposeToFirst200.Milliseconds(),
 		"http":                   map[string]any{"ok": httpT.ok.Load(), "failed": httpT.bad.Load(), "latency": httpSum},
 		"tcp":                    map[string]any{"ok": tcpT.ok.Load(), "failed": tcpT.bad.Load(), "latency": tcpSum},
+		"connects_retried":       pl.retried.Load(),
 		"measured_at":            time.Now().UTC().Format(time.RFC3339),
 	})
 	if churnOps < 3 {
@@ -320,6 +341,9 @@ func TestIngressRoutingChurnGate(t *testing.T) {
 	}
 	if n := tcpT.bad.Load(); n != 0 {
 		t.Errorf("%d fresh TCP connections failed during churn (target 0):%s", n, tcpT.summary())
+	}
+	if pathErr != nil {
+		t.Errorf("connects retried after a timeout count as failures: %v", pathErr)
 	}
 }
 
@@ -347,17 +371,88 @@ func ingressNodes(targets *harness.IntegrationTargets) []harness.IntegrationNode
 // one chosen ingress node with the real hostname for SNI and certificate
 // checks. An empty ip dials the name as given (DNS picks the node).
 func pinnedDial(ip string) func(ctx context.Context, network, addr string) (net.Conn, error) {
+	return pinnedDialCounting(ip, nil)
+}
+
+// pinnedDialCounting is pinnedDial for a churn gate: a connect that timed
+// out is tried once more and counted in retried (harness.DialRetryingLostSYN).
+func pinnedDialCounting(ip string, retried *atomic.Int64) func(ctx context.Context, network, addr string) (net.Conn, error) {
 	d := &net.Dialer{Timeout: 10 * time.Second}
 	return func(ctx context.Context, network, addr string) (net.Conn, error) {
-		if ip == "" {
+		if ip != "" {
+			_, port, err := net.SplitHostPort(addr)
+			if err != nil {
+				return nil, err
+			}
+			addr = net.JoinHostPort(ip, port)
+		}
+		return harness.DialRetryingLostSYN(ctx, func(ctx context.Context) (net.Conn, error) {
 			return d.DialContext(ctx, network, addr)
-		}
-		_, port, err := net.SplitHostPort(addr)
-		if err != nil {
-			return nil, err
-		}
-		return d.DialContext(ctx, network, net.JoinHostPort(ip, port))
+		}, retried)
 	}
+}
+
+// pathLossCheck lets a churn gate tell a connection lost on the way to the
+// ingress from one the ingress dropped (see harness/probe_dial.go). It reads
+// the ingress nodes' listen-drop counters before the window; verdict reads
+// them again and judges the retried connects.
+type pathLossCheck struct {
+	retried atomic.Int64
+	before  int64
+	read    bool
+}
+
+func startPathLossCheck(t *testing.T) *pathLossCheck {
+	t.Helper()
+	p := &pathLossCheck{}
+	p.before, p.read = ingressListenDrops(t)
+	return p
+}
+
+// verdict returns nil when the retried connects may be left out of the
+// gate's failures (harness.PathLossVerdict), and logs what it saw.
+func (p *pathLossCheck) verdict(t *testing.T, probes int64) error {
+	t.Helper()
+	after, read := ingressListenDrops(t)
+	read = read && p.read
+	drops := after - p.before
+	t.Logf("connects that timed out and were retried: %d of %d probes; ingress listen drops in the window: %d (counters read: %v)",
+		p.retried.Load(), probes, drops, read)
+	return harness.PathLossVerdict(p.retried.Load(), probes, read, drops)
+}
+
+// ingressListenDrops sums harness.ListenDropCounters over every ingress
+// node, read over SSH. read is false when a node could not be read; the
+// gate then cannot rule out a drop on the server side.
+func ingressListenDrops(t *testing.T) (total int64, read bool) {
+	t.Helper()
+	nodes := ingressNodes(harness.LoadIntegrationTargets())
+	if len(nodes) == 0 {
+		return 0, false
+	}
+	for _, n := range nodes {
+		target, ok := harness.SSHTarget(n)
+		if !ok {
+			return 0, false
+		}
+		var m map[string]int64
+		var err error
+		// SSH crosses the same lossy path as the probes, so try it 3 times.
+		for range 3 {
+			var out string
+			if out, err = harness.SSHRun(t, target, "nstat -asz "+harness.ListenDropCounters); err == nil {
+				if m, err = harness.ParseNstat(out); err == nil {
+					break
+				}
+			}
+		}
+		if err != nil {
+			t.Logf("ingress listen-drop counters on %s: %v", n.Name, err)
+			return 0, false
+		}
+		total += harness.SumListenDrops(m)
+	}
+	return total, true
 }
 
 // freshGet opens a NEW TLS connection (no keep-alive) for one request and
@@ -385,13 +480,14 @@ func freshGet(c *http.Client, rawURL, token string) error {
 // ip: the WebSocket upgrade, the start message, then stdout until the exit
 // frame. It speaks the SDK's wire protocol (sdk/go/internal/apiclient
 // exec_stream.go) because the SDK's dialer cannot be pinned to a node.
-func pinnedExecStream(ctx context.Context, ip, baseURL, token, sandboxID, marker string) error {
+func pinnedExecStream(ctx context.Context, ip, baseURL, token, sandboxID, marker string, retried *atomic.Int64) error {
 	u, err := url.Parse(baseURL)
 	if err != nil {
 		return err
 	}
 	wsURL := "wss://" + u.Host + "/v1/sandboxes/" + url.PathEscape(sandboxID) + "/toolbox/process/exec/stream"
-	d := websocket.Dialer{NetDialContext: pinnedDial(ip), HandshakeTimeout: 15 * time.Second}
+	// Room for one retried connect (2 x 10 s) and the upgrade.
+	d := websocket.Dialer{NetDialContext: pinnedDialCounting(ip, retried), HandshakeTimeout: 30 * time.Second}
 	h := http.Header{}
 	h.Set("Authorization", "Bearer "+token)
 	conn, resp, err := d.DialContext(ctx, wsURL, h)
@@ -483,6 +579,7 @@ func TestIngressChurnNewConnectionsAndExecStreams(t *testing.T) {
 	}
 
 	const window = 2 * time.Minute
+	pl := startPathLossCheck(t)
 	stop := time.Now().Add(window)
 	ctx, cancel := context.WithTimeout(context.Background(), window+5*time.Minute)
 	defer cancel()
@@ -510,10 +607,11 @@ func TestIngressChurnNewConnectionsAndExecStreams(t *testing.T) {
 	apiURL := strings.TrimRight(sc.BaseURL, "/") + "/v1/sandboxes/" + url.PathEscape(execSB.ID)
 	for _, n := range nodes {
 		fresh := &http.Client{
-			Timeout: 20 * time.Second,
+			// Room for one retried connect (2 x 10 s) and the request.
+			Timeout: 35 * time.Second,
 			// A new TCP and TLS connection per request: a reload breaks
 			// those, never a kept-alive one.
-			Transport: &http.Transport{DialContext: pinnedDial(n.ip), DisableKeepAlives: true, TLSHandshakeTimeout: 10 * time.Second},
+			Transport: &http.Transport{DialContext: pinnedDialCounting(n.ip, &pl.retried), DisableKeepAlives: true, TLSHandshakeTimeout: 10 * time.Second},
 		}
 		for _, k := range []probeKind{apiK, wsK, sbK} {
 			k.tally[n.name] = &failureTally{}
@@ -521,7 +619,7 @@ func TestIngressChurnNewConnectionsAndExecStreams(t *testing.T) {
 		for range 2 {
 			loop(func() error { return freshGet(fresh, apiURL, sc.PAT) }, apiK.tally[n.name])
 			loop(func() error {
-				return pinnedExecStream(ctx, n.ip, sc.BaseURL, sc.PAT, execSB.ID, fmt.Sprintf("ok-357-%d", probeSeq.Add(1)))
+				return pinnedExecStream(ctx, n.ip, sc.BaseURL, sc.PAT, execSB.ID, fmt.Sprintf("ok-357-%d", probeSeq.Add(1)), &pl.retried)
 			}, wsK.tally[n.name])
 			loop(func() error { return freshGet(fresh, target.httpURL, "") }, sbK.tally[n.name])
 		}
@@ -597,6 +695,17 @@ func TestIngressChurnNewConnectionsAndExecStreams(t *testing.T) {
 	t.Logf("UC-357: %d churn cycles (%d errors) in %s across %d ingress node(s)", cycles.Load(), churnErrs.Load(), window, len(nodes))
 	if cycles.Load() < 5 {
 		t.Fatalf("only %d churn cycles in %s: the case measured no churn", cycles.Load(), window)
+	}
+	var probes int64
+	for _, k := range []probeKind{apiK, wsK, sbK} {
+		for _, n := range nodes {
+			probes += k.tally[n.name].ok.Load() + k.tally[n.name].bad.Load()
+		}
+	}
+	// The SDK's own exec streams are not counted: their dialer can't be
+	// wrapped, so a connect that timed out there is never retried.
+	if err := pl.verdict(t, probes); err != nil {
+		t.Errorf("connects retried after a timeout count as failures: %v", err)
 	}
 	for _, k := range []probeKind{apiK, wsK, sbK} {
 		for _, n := range nodes {
