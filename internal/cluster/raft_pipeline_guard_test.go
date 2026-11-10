@@ -361,7 +361,7 @@ func TestSetupRaftUsesThePipelineGuard(t *testing.T) {
 	if rn.pipelines == nil || rn.pipelines.NetworkTransport != rn.transport {
 		t.Fatalf("raft was not given the guard around raftNode.transport (pipelines %v)", rn.pipelines)
 	}
-	if want := raftPipelineStallFactor * 10 * time.Second; rn.pipelines.stallAfter != want {
+	if want := raftPipelineStallFactor * raftTransportTimeout; rn.pipelines.stallAfter != want {
 		t.Fatalf("stallAfter %s, want %s (3 transport timeouts)", rn.pipelines.stallAfter, want)
 	}
 }

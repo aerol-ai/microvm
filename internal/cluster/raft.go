@@ -15,6 +15,11 @@ import (
 	raftwal "github.com/hashicorp/raft-wal"
 )
 
+// raftTransportTimeout bounds each raft RPC's write and read, on both the
+// TLS and the plain TCP transport. The pipeline stall guard derives its
+// limit from it (raftPipelineStallFactor), so they move together.
+const raftTransportTimeout = 10 * time.Second
+
 const (
 	raftLogBoltFilename = "raft-log.bolt"
 	raftLogWALDirname   = "raft-wal"
@@ -132,12 +137,12 @@ func setupRaft(cfg raftSetupConfig, fsm *placementFSM, logger *slog.Logger) (*ra
 		transport = raft.NewNetworkTransportWithConfig(&raft.NetworkTransportConfig{
 			Stream:                stream,
 			MaxPool:               3,
-			Timeout:               10 * time.Second,
+			Timeout:               raftTransportTimeout,
 			Logger:                hclogAdapter(logger),
 			ServerAddressProvider: nil,
 		})
 	} else {
-		transport, err = raft.NewTCPTransportWithLogger(cfg.BindAddr, advertise, 3, 10*time.Second, hclogAdapter(logger))
+		transport, err = raft.NewTCPTransportWithLogger(cfg.BindAddr, advertise, 3, raftTransportTimeout, hclogAdapter(logger))
 		if err != nil {
 			_ = logStore.Close()
 			_ = stableStore.Close()
@@ -152,8 +157,7 @@ func setupRaft(cfg raftSetupConfig, fsm *placementFSM, logger *slog.Logger) (*ra
 		return nil, err
 	}
 
-	// The raft transport timeout is 10 s on both paths above.
-	pipelines := newPipelineGuardTransport(transport, raftPipelineStallFactor*10*time.Second, logger)
+	pipelines := newPipelineGuardTransport(transport, raftPipelineStallFactor*raftTransportTimeout, logger)
 	r, err := raft.NewRaft(rcfg, fsm, logStore, stableStore, snaps, pipelines)
 	if err != nil {
 		_ = transport.Close()
