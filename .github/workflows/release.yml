@@ -492,7 +492,7 @@ jobs:
         run: cp "$BUNDLE_PATH" "dist/${VERSION}.intoto.jsonl"
 
       - name: Publish GitHub release assets
-        uses: softprops/action-gh-release@c12583777ecdfd3be55c69cf75464299dc01057e # v3
+        uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3 # v3
         with:
           tag_name: ${{ env.VERSION }}
           generate_release_notes: true
