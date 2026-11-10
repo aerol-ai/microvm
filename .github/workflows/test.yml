@@ -41,6 +41,7 @@ jobs:
       docs: ${{ (github.event_name != 'pull_request' || github.base_ref == 'main') && steps.filter.outputs.docs || 'false' }}
       go_main: ${{ (github.event_name != 'pull_request' || github.base_ref == 'main') && steps.filter.outputs.go_main || 'false' }}
       go_sdk: ${{ (github.event_name != 'pull_request' || github.base_ref == 'main') && steps.filter.outputs.go_sdk || 'false' }}
+      caddy_plugin: ${{ (github.event_name != 'pull_request' || github.base_ref == 'main') && steps.filter.outputs.caddy_plugin || 'false' }}
       java_sdk: ${{ (github.event_name != 'pull_request' || github.base_ref == 'main') && steps.filter.outputs.java_sdk || 'false' }}
       python_sdk: ${{ (github.event_name != 'pull_request' || github.base_ref == 'main') && steps.filter.outputs.python_sdk || 'false' }}
       python_integrations: ${{ (github.event_name != 'pull_request' || github.base_ref == 'main') && steps.filter.outputs.python_integrations || 'false' }}
@@ -106,6 +107,9 @@ jobs:
               - 'server.json'
               - '.github/workflows/release.yml'
               - '.github/darwin-cross/**'
+              # pkg/caddy's tests check the static route against the plugin's
+              # constants and test config.
+              - 'caddymod/**'
             go_sdk:
               - 'sdk/go/**'
               - 'go.mod'
@@ -123,6 +127,11 @@ jobs:
               - 'sdk/typescript/**'
             rust_sdk:
               - 'sdk/rust/**'
+            # AerolVM's Caddy plugin: its own Go module, so go-tests (./...
+            # from the root) never reaches it.
+            caddy_plugin:
+              - 'caddymod/**'
+              - '.github/workflows/test.yml'
             # The download pins in install.sh, and the script that copies
             # them to the mirror.
             installer:
@@ -135,6 +144,8 @@ jobs:
               - 'integration-tests/**'
               - 'Terraform/**'
               - '.github/workflows/test.yml'
+              # caddy_version_test checks the plugin's Caddy pin.
+              - 'caddymod/go.mod'
 
   # go-tests and go-race each run as two jobs. "cluster-service" runs
   # internal/cluster and internal/service, each split by test name into parts
@@ -504,6 +515,31 @@ jobs:
 
       - name: Run Go SDK tests
         run: go test -count=1 ./sdk/go/...
+
+  # The Caddy plugin in every release Caddy (the sandbox route's upstream
+  # lookup). One of its tests runs a whole Caddy in process.
+  caddy-plugin-tests:
+    needs: paths
+    if: needs.paths.outputs.caddy_plugin == 'true'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: caddymod
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: caddymod/go.sum
+
+      - name: Vet and test the Caddy plugin
+        run: |
+          go vet ./...
+          go test -race -count=1 ./...
 
   java-sdk-tests:
     needs: paths

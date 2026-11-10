@@ -31,12 +31,19 @@ type wholeCaddy struct {
 	emu    http.RoundTripper
 	loads  int
 	writes int
+	plugin bool // built with AerolVM's aerolvm_route plugin (caddymod/)
 }
 
 func (f *wholeCaddy) handler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		f.mu.Lock()
 		defer f.mu.Unlock()
+		if r.URL.Path == "/aerolvm/route-upstream" {
+			if !f.plugin {
+				http.NotFound(w, r)
+			}
+			return
+		}
 		if r.URL.Path == "/load" {
 			var root any
 			if err := json.NewDecoder(r.Body).Decode(&root); err != nil {
@@ -256,6 +263,51 @@ func TestCommitIngressProxyRoutingSkipsPruneAfterIncompleteReassert(t *testing.T
 	}
 	if err := svc.CommitIngressProxyRouting(ctx, nil, true); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// The owner route looks up with the plugin when this Caddy has it, and with
+// Caddy's stock source (IPv4 only) when it does not. Asking costs a read,
+// never a write: commit stays one load either way.
+func TestCommitIngressProxyRoutingPicksTheLookup(t *testing.T) {
+	cases := []struct {
+		name   string
+		plugin bool
+		want   []string
+		absent string
+	}{
+		{"release Caddy with the plugin", true, []string{`"source":"aerolvm_route"`, `"fallback":"127.0.0.1:21213"`}, `"source":"a"`},
+		{"Caddy without the plugin", false, []string{`"source":"a"`, `"versions":{"ipv4":true}`}, `aerolvm_route`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			svc, fc, _, opts := newRoutingHarness(t)
+			fc.plugin = tc.plugin
+			ctx := context.Background()
+			r, err := svc.StartIngressProxyRouting(ctx, opts)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer r.Stop()
+			if err := svc.CommitIngressProxyRouting(ctx, r, true); err != nil {
+				t.Fatal(err)
+			}
+			if loads, writes := fc.counts(); loads != 1 || writes != 0 {
+				t.Fatalf("loads=%d writes=%d, want one load and no other write", loads, writes)
+			}
+			cfg := fc.config(t)
+			for _, want := range tc.want {
+				if !strings.Contains(cfg, want) {
+					t.Errorf("static route missing %s", want)
+				}
+			}
+			if strings.Contains(cfg, tc.absent) {
+				t.Errorf("static route has %s", tc.absent)
+			}
+			if t.Failed() {
+				t.Logf("config:\n%s", cfg)
+			}
+		})
 	}
 }
 

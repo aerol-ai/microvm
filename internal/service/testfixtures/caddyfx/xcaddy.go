@@ -28,9 +28,10 @@ import (
 const certmagicS3Module = "github.com/ss098/certmagic-s3@v0.0.0-20250922022452-8af482af5f39"
 
 // caddyVersion is the Caddy core the fixture builds: the one scripts/install.sh
-// pins (CADDY_VERSION), so the e2e tests run the Caddy a release ships.
+// pins for custom builds (CADDY_BUILD_VERSION), so the e2e tests run the
+// Caddy a release ships.
 // integration-tests/safety/caddy_version_test.go keeps the two in step.
-const caddyVersion = "v2.11.9"
+const caddyVersion = "v2.11.8-0.20261106223313-31f9f0cb9949"
 
 //go:embed config.json.tmpl
 var configTmpl string

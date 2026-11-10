@@ -52,7 +52,7 @@ test-acme-e2e:
 # only (the test is build-tagged linux): on macOS run it in a Linux container.
 # The version and caddy-l4 match scripts/install.sh's pins (caddy_version_test).
 # The version is in the binary's name, so a bump never reuses an old build.
-CADDY_E2E_VERSION ?= v2.11.9
+CADDY_E2E_VERSION ?= v2.11.8-0.20261106223313-31f9f0cb9949
 CADDY_E2E_BIN ?= $(BIN_DIR)/caddy-l4-e2e-$(CADDY_E2E_VERSION)
 test-ingress-reload-e2e:
 	@if [ -z "$$AEROL_E2E_CADDY_BIN" ] && [ ! -x "$(CADDY_E2E_BIN)" ]; then \

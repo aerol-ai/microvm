@@ -212,13 +212,18 @@ func (s *Service) CommitIngressProxyRouting(ctx context.Context, r *IngressRouti
 			s.logger.Warn("ingress proxy routing: ingress reconcile failed; skipping the host-port prune", "error", err)
 		}
 	}
+	// Which lookup the owner route uses depends on the Caddy binary, so it
+	// is asked here, at the one place the route is written, and not in the
+	// batch: a route naming a module this Caddy lacks would fail the load.
+	static := r.opts.Static
+	static.RouteUpstream = s.caddy.HasRouteUpstream(ctx)
 	removed := 0
 	err := s.caddy.Batch(ctx, func() error {
-		if err := s.caddy.EnsureStaticSandboxRoute(ctx, r.opts.Static); err != nil {
+		if err := s.caddy.EnsureStaticSandboxRoute(ctx, static); err != nil {
 			return err
 		}
 		if r.Ingress != nil && s.caddy.L4TLSListen() != "" {
-			if err := s.caddy.EnsureStaticIngressRoutes(ctx, r.opts.Static); err != nil {
+			if err := s.caddy.EnsureStaticIngressRoutes(ctx, static); err != nil {
 				return err
 			}
 		}
@@ -237,7 +242,15 @@ func (s *Service) CommitIngressProxyRouting(ctx context.Context, r *IngressRouti
 		s.logger.Warn("ingress proxy routing: boot re-assert incomplete; kernel host-port rules left for the next boot",
 			"owner_reasserted", ownerReasserted, "ingress_reasserted", ingressReasserted)
 	}
-	s.logger.Info("ingress proxy routing committed", "caddy_entries_removed", removed)
+	if static.RouteUpstream {
+		s.logger.Info("ingress proxy routing committed", "caddy_entries_removed", removed, "route_lookup", "aerolvm_route")
+	} else {
+		// A Caddy without the plugin (install.sh's build-service fallback):
+		// routing works, but past 100 active hosts every request queues
+		// on Caddy's one lookup lock.
+		s.logger.Warn("ingress proxy routing committed with Caddy's stock lookup; install the release Caddy for the aerolvm_route plugin",
+			"caddy_entries_removed", removed, "route_lookup", "a")
+	}
 	return nil
 }
 

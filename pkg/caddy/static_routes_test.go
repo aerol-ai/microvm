@@ -3,9 +3,15 @@ package caddy
 import (
 	"context"
 	"encoding/json"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"reflect"
 	"regexp"
 	"strconv"
 	"strings"
@@ -202,6 +208,8 @@ func TestStaticSandboxRouteShape(t *testing.T) {
 	for _, want := range []string{
 		`"source":"a"`, `"name":"{http.request.host}."`, `"port":"{sbport}"`,
 		`"addresses":["127.0.0.1:53053"]`, `"dial":"127.0.0.1:21213"`, `"defaults":["2280"]`,
+		// The responder answers only A: an AAAA query is a wasted lookup.
+		`"versions":{"ipv4":true}`,
 		`"not":[{"host":["sandbox.test"]}]`, `"flush_interval":-1`,
 	} {
 		if !strings.Contains(js, want) {
@@ -242,5 +250,127 @@ func TestEnsureStaticRouteErrors(t *testing.T) {
 	c2 := New(config.Config{EnableCaddy: true, CaddyAdminURL: srv2.URL, CaddyServerID: "srv0", Domain: "sandbox.test", HTTPClientTimeout: time.Second})
 	if err := c2.EnsureStaticSandboxRoute(context.Background(), testSpec); err == nil {
 		t.Fatal("a failed route-list read must surface")
+	}
+}
+
+// With the plugin, the route's lookup block is exactly the config the
+// plugin's own tests decode and provision. A field renamed on one side
+// fails here or there, never only in production.
+func TestStaticSandboxRouteUsesThePlugin(t *testing.T) {
+	c, _ := newStaticClient(t)
+	spec := testSpec
+	spec.RouteUpstream = true
+	route := c.StaticSandboxRoute(spec)
+	got, _ := json.Marshal(route["handle"].([]map[string]any)[1]["dynamic_upstreams"])
+	want, err := os.ReadFile(filepath.Join("..", "..", "caddymod", "testdata", "static_route_source.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var g, w any
+	_ = json.Unmarshal(got, &g)
+	if err := json.Unmarshal(want, &w); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(g, w) {
+		t.Fatalf("dynamic_upstreams = %s\nwant (caddymod/testdata/static_route_source.json) %s", got, want)
+	}
+	// The static upstream stays: Caddy takes it when the plugin's lookup
+	// fails (the responder down or slow).
+	if js, _ := json.Marshal(route); !strings.Contains(string(js), `"upstreams":[{"dial":"127.0.0.1:21213"}]`) {
+		t.Fatalf("the router is no longer the static upstream:\n%s", js)
+	}
+}
+
+// The plugin's source name and status path are its constants, read from
+// its source: it is its own Go module, so this module cannot import it.
+func TestRouteUpstreamMatchesThePlugin(t *testing.T) {
+	file, err := parser.ParseFile(token.NewFileSet(), filepath.Join("..", "..", "caddymod", "routeupstream.go"), nil, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	consts := map[string]string{}
+	ast.Inspect(file, func(n ast.Node) bool {
+		if vs, ok := n.(*ast.ValueSpec); ok {
+			for i, name := range vs.Names {
+				if i < len(vs.Values) {
+					if lit, ok := vs.Values[i].(*ast.BasicLit); ok && lit.Kind == token.STRING {
+						consts[name.Name], _ = strconv.Unquote(lit.Value)
+					}
+				}
+			}
+		}
+		return true
+	})
+	if consts["SourceName"] != routeUpstreamSource || consts["AdminPath"] != routeUpstreamStatusPath {
+		t.Fatalf("plugin SourceName=%q AdminPath=%q, want %q and %q",
+			consts["SourceName"], consts["AdminPath"], routeUpstreamSource, routeUpstreamStatusPath)
+	}
+}
+
+func TestHasRouteUpstream(t *testing.T) {
+	cases := []struct {
+		name   string
+		status int // what Caddy answers on the status path; 0 = Caddy is down
+		want   bool
+	}{
+		{"a Caddy with the plugin", http.StatusOK, true},
+		{"a stock Caddy", http.StatusNotFound, false},
+		{"an admin API error reads as no", http.StatusInternalServerError, false},
+		{"an unreachable Caddy reads as no", 0, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var gets int
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != routeUpstreamStatusPath || r.Method != http.MethodGet {
+					http.Error(w, "unexpected", http.StatusTeapot)
+					return
+				}
+				gets++
+				w.WriteHeader(tc.status)
+			}))
+			if tc.status == 0 {
+				srv.Close()
+			} else {
+				defer srv.Close()
+			}
+			c := New(config.Config{EnableCaddy: true, CaddyAdminURL: srv.URL, CaddyServerID: "srv0", Domain: "sandbox.test", HTTPClientTimeout: time.Second})
+			if got := c.HasRouteUpstream(context.Background()); got != tc.want {
+				t.Fatalf("HasRouteUpstream = %v, want %v", got, tc.want)
+			}
+			if tc.status != 0 && gets != 1 {
+				t.Fatalf("%d status reads, want 1", gets)
+			}
+		})
+	}
+	if New(config.Config{}).HasRouteUpstream(context.Background()) {
+		t.Fatal("a disabled client has no plugin")
+	}
+}
+
+// Inside a Batch every request goes to the in-memory config, which knows
+// nothing of the plugin. The status read must still reach Caddy.
+func TestHasRouteUpstreamInsideABatch(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case routeUpstreamStatusPath:
+			w.WriteHeader(http.StatusOK)
+		case "/config/":
+			_, _ = io.WriteString(w, `{}`)
+		default:
+			http.Error(w, "unexpected", http.StatusTeapot)
+		}
+	}))
+	defer srv.Close()
+	c := New(config.Config{EnableCaddy: true, CaddyAdminURL: srv.URL, CaddyServerID: "srv0", Domain: "sandbox.test", HTTPClientTimeout: time.Second})
+	var got bool
+	if err := c.Batch(context.Background(), func() error {
+		got = c.HasRouteUpstream(context.Background())
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if !got {
+		t.Fatal("inside a batch the status read did not reach Caddy")
 	}
 }

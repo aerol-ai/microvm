@@ -286,13 +286,16 @@ jobs:
         shell: bash
         run: |
           mkdir -p dist
-          # The Caddy version and plugins are pinned in scripts/install.sh
-          # (CADDY_VERSION and the CADDY_*_MODULE lines);
+          # The Caddy core and plugins are pinned in scripts/install.sh
+          # (CADDY_BUILD_VERSION and the CADDY_*_MODULE lines);
           # integration-tests/safety/caddy_version_test.go keeps this in step.
+          # caddymod is AerolVM's own plugin, from this checkout: the owner
+          # route's upstream lookup (pkg/caddy staticRouteSource).
           go install github.com/caddyserver/xcaddy/cmd/xcaddy@v0.4.6
           CGO_ENABLED=0 GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} GOARM=${{ matrix.goarm }} \
-            "$(go env GOPATH)/bin/xcaddy" build v2.11.9 \
+            "$(go env GOPATH)/bin/xcaddy" build v2.11.8-0.20261106223313-31f9f0cb9949 \
             --output dist/caddy_${{ matrix.suffix }} \
+            --with github.com/aerol-ai/microvm/caddymod=./caddymod \
             --with github.com/mholt/caddy-l4@v0.1.2 \
             --with github.com/caddy-dns/cloudflare@v0.2.4 \
             --with github.com/ss098/certmagic-s3@v0.0.0-20250922022452-8af482af5f39
@@ -302,7 +305,9 @@ jobs:
             dist/caddy_${{ matrix.suffix }} list-modules | grep -qx 'layer4.handlers.proxy'
             dist/caddy_${{ matrix.suffix }} list-modules | grep -qx 'dns.providers.cloudflare'
             dist/caddy_${{ matrix.suffix }} list-modules | grep -qx 'caddy.storage.s3'
-            dist/caddy_${{ matrix.suffix }} version | grep -q '^v2\.11\.9 '
+            dist/caddy_${{ matrix.suffix }} list-modules | grep -qx 'http.reverse_proxy.upstreams.aerolvm_route'
+            dist/caddy_${{ matrix.suffix }} list-modules | grep -qx 'admin.api.aerolvm_route'
+            dist/caddy_${{ matrix.suffix }} version | grep -q '^v2\.11\.8-0\.20261106223313-31f9f0cb9949 '
           fi
 
       - name: Upload build artifacts
