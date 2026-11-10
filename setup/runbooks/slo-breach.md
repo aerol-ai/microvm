@@ -62,7 +62,7 @@ curl -fsS -H "Authorization: Bearer $SB_PAT_TOKEN" \
   http://127.0.0.1:21212/v1/cluster/leader | jq .
 curl -fsS -H "Authorization: Bearer $SB_PAT_TOKEN" \
   http://127.0.0.1:21212/v1/metrics \
-  | grep -E 'aerolvm_raft_apply|aerolvm_raft_snapshot|aerolvm_gossip'
+  | grep -E 'aerolvm_raft_apply|aerolvm_raft_snapshot|aerolvm_raft_pipeline|aerolvm_gossip'
 sudo journalctl -u sandboxd --since "30 minutes ago" --no-pager \
   | grep -iE 'raft|leader|apply|snapshot|election|error'
 ```
@@ -74,6 +74,14 @@ Mitigation:
 - If no leader exists, move to lost-quorum recovery.
 - If snapshot errors correlate with disk full, free disk or move the node out
   of service.
+- `SandboxdRaftPipelineStall` (`aerolvm_raft_pipeline_stalls_total` rose by
+  2 or more in 30 minutes): the leader's fast send path to a follower keeps
+  getting stuck. sandboxd resets it each time, and the follower catches up
+  the normal way, but a follower that keeps rejecting appends needs a look.
+  A single reset after a follower restart or a leader change is expected and
+  does not fire the alert. Find the follower in the leader's journal
+  (`raft replication pipeline send stalled`, `peer=`) and check that node's
+  health, disk and Raft log errors.
 
 ## Scheduler and Capacity Checks
 

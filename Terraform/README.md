@@ -94,6 +94,24 @@ certificate-signing loop on the seed, through `cluster-init.sh` and
 goes away when those scripts leave the release. A cluster with no domain
 still needs it: `install.sh --local` never joins.
 
+**Replacing the seed on the old path.** With `one_line_join = false` the
+seed hands the other nodes its CA, gossip key and credential key as three
+files at fixed names in the cluster's S3 bucket, and those files outlive the
+seed. An apply that replaces the seed also replaces every other node, and
+the new nodes can take the old seed's files before the new seed writes its
+own. Most of them then fail to start with `x509: certificate signed by
+unknown authority` (seen on a test cluster, 2026-11-10). Before an apply
+that replaces the seed, either move the cluster to `one_line_join = true`
+in the same apply (it rebuilds every node anyway, and one-line joins pass
+nothing through S3), or delete the old seed's files first:
+
+```bash
+bucket=$(scripts/terraform.sh output -raw bundle_bucket)
+for f in gossip-key.txt aerolvm-tls-bundle.tar.gz aerolvm-cred-bundle.tar.gz; do
+  aws s3 rm "s3://$bucket/$f"
+done
+```
+
 ## From a checkout of this repo
 
 `scripts/terraform.sh` runs [`root/`](./root/), a root module that calls

@@ -15,6 +15,11 @@ import (
 	raftwal "github.com/hashicorp/raft-wal"
 )
 
+// raftTransportTimeout bounds each raft RPC's write and read, on both the
+// TLS and the plain TCP transport. The pipeline stall guard derives its
+// limit from it (raftPipelineStallFactor), so they move together.
+const raftTransportTimeout = 10 * time.Second
+
 const (
 	raftLogBoltFilename = "raft-log.bolt"
 	raftLogWALDirname   = "raft-wal"
@@ -34,9 +39,13 @@ type closableLogStore interface {
 type raftNode struct {
 	raft      *raft.Raft
 	transport *raft.NetworkTransport
+	// pipelines is the transport raft was given: transport plus the stall
+	// guard on replication pipelines (raft_pipeline_guard.go).
+	pipelines *pipelineGuardTransport
 	logStore  closableLogStore
 	stableStr *raftboltdb.BoltStore
 	snaps     raft.SnapshotStore
+	logger    *slog.Logger
 }
 
 // raftSetupConfig captures the inputs setupRaft needs.
@@ -147,12 +156,12 @@ func setupRaft(cfg raftSetupConfig, fsm *placementFSM, logger *slog.Logger) (*ra
 		transport = raft.NewNetworkTransportWithConfig(&raft.NetworkTransportConfig{
 			Stream:                stream,
 			MaxPool:               3,
-			Timeout:               10 * time.Second,
+			Timeout:               raftTransportTimeout,
 			Logger:                hclogAdapter(logger),
 			ServerAddressProvider: nil,
 		})
 	} else {
-		transport, err = raft.NewTCPTransportWithLogger(cfg.BindAddr, advertise, 3, 10*time.Second, hclogAdapter(logger))
+		transport, err = raft.NewTCPTransportWithLogger(cfg.BindAddr, advertise, 3, raftTransportTimeout, hclogAdapter(logger))
 		if err != nil {
 			_ = logStore.Close()
 			_ = stableStore.Close()
@@ -167,7 +176,8 @@ func setupRaft(cfg raftSetupConfig, fsm *placementFSM, logger *slog.Logger) (*ra
 		return nil, err
 	}
 
-	r, err := raft.NewRaft(rcfg, fsm, logStore, stableStore, snaps, transport)
+	pipelines := newPipelineGuardTransport(transport, raftPipelineStallFactor*raftTransportTimeout, logger)
+	r, err := raft.NewRaft(rcfg, fsm, logStore, stableStore, snaps, pipelines)
 	if err != nil {
 		_ = transport.Close()
 		_ = logStore.Close()
@@ -193,9 +203,11 @@ func setupRaft(cfg raftSetupConfig, fsm *placementFSM, logger *slog.Logger) (*ra
 	return &raftNode{
 		raft:      r,
 		transport: transport,
+		pipelines: pipelines,
 		logStore:  logStore,
 		stableStr: stableStore,
 		snaps:     snaps,
+		logger:    logger,
 	}, nil
 }
 
@@ -252,7 +264,11 @@ func (r *raftNode) Close() error {
 	// stores), then close transport + stores.
 	var firstErr error
 	if r.raft != nil {
-		if err := r.raft.Shutdown().Error(); err != nil {
+		var closePipelines func() int
+		if r.pipelines != nil {
+			closePipelines = r.pipelines.closePipelines
+		}
+		if err := awaitRaftShutdown(r.raft.Shutdown(), raftShutdownGrace, closePipelines, r.logger); err != nil {
 			firstErr = fmt.Errorf("raft shutdown: %w", err)
 		}
 	}
