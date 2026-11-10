@@ -739,7 +739,7 @@ func (g *gossipNode) rememberLivePeers(nodes []*memberlist.Node) {
 	if err := g.peerCache.remember(controlPlane); err != nil && g.logger != nil {
 		g.logger.Warn("cluster gossip could not persist remembered peers", "path", g.peerCache.path, "error", err)
 	}
-	if err := g.memberCache.remember(pickMemberPeers(others, g.memberCache.snapshot())); err != nil && g.logger != nil {
+	if err := g.memberCache.remember(pickMemberPeers(selfNodeID, others, g.memberCache.snapshot())); err != nil && g.logger != nil {
 		g.logger.Warn("cluster gossip could not persist remembered members", "path", g.memberCache.path, "error", err)
 	}
 }

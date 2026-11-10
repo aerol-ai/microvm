@@ -1,7 +1,9 @@
 package cluster
 
 import (
+	"cmp"
 	"encoding/json"
+	"hash/fnv"
 	"os"
 	"path/filepath"
 	"slices"
@@ -174,11 +176,17 @@ func livePeerAddrsByRole(nodes []*memberlist.Node, selfNodeID string) (controlPl
 	return controlPlane, others
 }
 
-// pickMemberPeers chooses up to maxCachedMemberPeers addresses from alive.
-// Members already remembered (previous) are kept while they stay alive, and
-// the rest are filled in address order, so the list, and the file behind it,
-// changes only when a chosen member goes away, not on every tick.
-func pickMemberPeers(alive, previous []string) []string {
+// pickMemberPeers chooses up to maxCachedMemberPeers addresses from alive for
+// the node self. Members already remembered (previous) are kept while they
+// stay alive, so the list, and the file behind it, changes only when a chosen
+// member goes away, not on every tick.
+//
+// The rest are filled by rendezvous hashing on self and the address, not in
+// address order: with address order every node remembered the same lowest
+// few, so after a fleet-wide restart every node's startup sync would push/pull
+// with those same three members. Hashing gives each node its own few, stable
+// for that node, and spreads the syncs across the fleet.
+func pickMemberPeers(self string, alive, previous []string) []string {
 	alive = slices.Clone(alive)
 	slices.Sort(alive)
 	alive = slices.Compact(alive)
@@ -188,10 +196,32 @@ func pickMemberPeers(alive, previous []string) []string {
 			out = append(out, a)
 		}
 	}
+	if len(out) == maxCachedMemberPeers {
+		return out
+	}
+	type ranked struct {
+		addr string
+		rank uint64
+	}
+	candidates := make([]ranked, 0, len(alive))
 	for _, a := range alive {
-		if len(out) < maxCachedMemberPeers && !slices.Contains(out, a) {
-			out = append(out, a)
+		if slices.Contains(out, a) {
+			continue
 		}
+		h := fnv.New64a()
+		_, _ = h.Write([]byte(self))
+		_, _ = h.Write([]byte{0})
+		_, _ = h.Write([]byte(a))
+		candidates = append(candidates, ranked{addr: a, rank: h.Sum64()})
+	}
+	// Stable over the address-sorted input, so equal ranks fall back to
+	// address order and the pick never depends on map or input order.
+	slices.SortStableFunc(candidates, func(x, y ranked) int { return cmp.Compare(x.rank, y.rank) })
+	for _, c := range candidates {
+		if len(out) == maxCachedMemberPeers {
+			break
+		}
+		out = append(out, c.addr)
 	}
 	return out
 }

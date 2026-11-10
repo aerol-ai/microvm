@@ -319,24 +319,69 @@ func TestPickMemberPeersIsStickyAndBounded(t *testing.T) {
 	cases := []struct {
 		name            string
 		alive, previous []string
-		want            []string
+		want            []string // as a set
+		mustKeep        []string
 	}{
-		{"nobody alive", nil, []string{"a:1"}, []string{}},
-		{"fresh pick is the first few in address order", []string{"e:1", "d:1", "c:1", "b:1", "a:1"}, nil, []string{"a:1", "b:1", "c:1"}},
-		{"remembered members stay while alive", []string{"a:1", "b:1", "c:1", "d:1", "e:1"}, []string{"e:1", "d:1"}, []string{"d:1", "e:1", "a:1"}},
-		{"a remembered member that died is replaced", []string{"a:1", "b:1", "c:1"}, []string{"z:1", "c:1"}, []string{"c:1", "a:1", "b:1"}},
-		{"duplicates count once", []string{"a:1", "a:1", "b:1"}, nil, []string{"a:1", "b:1"}},
+		{name: "nobody alive", previous: []string{"a:1"}, want: []string{}},
+		{name: "three alive: all of them", alive: []string{"c:1", "b:1", "a:1"}, want: []string{"a:1", "b:1", "c:1"}},
+		{name: "remembered members stay while alive", alive: []string{"a:1", "b:1", "c:1", "d:1", "e:1"}, previous: []string{"e:1", "d:1"}, mustKeep: []string{"d:1", "e:1"}},
+		{name: "a remembered member that died is replaced", alive: []string{"a:1", "b:1", "c:1"}, previous: []string{"z:1", "c:1"}, want: []string{"a:1", "b:1", "c:1"}},
+		{name: "a full remembered list is kept as it is", alive: []string{"a:1", "b:1", "c:1", "d:1"}, previous: []string{"b:1", "c:1", "d:1"}, want: []string{"b:1", "c:1", "d:1"}},
+		{name: "duplicates count once", alive: []string{"a:1", "a:1", "b:1"}, want: []string{"a:1", "b:1"}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := pickMemberPeers(tc.alive, tc.previous)
-			if !slices.Equal(got, tc.want) {
-				t.Fatalf("got %v, want %v", got, tc.want)
+			got := pickMemberPeers("node-1", tc.alive, tc.previous)
+			if again := pickMemberPeers("node-1", tc.alive, tc.previous); !slices.Equal(got, again) {
+				t.Fatalf("not deterministic: %v then %v", got, again)
 			}
 			if len(got) > maxCachedMemberPeers {
 				t.Fatalf("picked %d, more than maxCachedMemberPeers", len(got))
 			}
+			if tc.want != nil {
+				set := slices.Sorted(slices.Values(got))
+				if !slices.Equal(set, tc.want) {
+					t.Fatalf("got %v, want %v", got, tc.want)
+				}
+			}
+			for _, k := range tc.mustKeep {
+				if !slices.Contains(got, k) {
+					t.Fatalf("got %v, dropped %s although it is remembered and alive", got, k)
+				}
+			}
+			if tc.mustKeep != nil && len(got) != maxCachedMemberPeers {
+				t.Fatalf("got %v, want it filled to %d", got, maxCachedMemberPeers)
+			}
 		})
+	}
+}
+
+// Every node must not remember the same few members: after a fleet-wide
+// restart every node's startup sync would then push/pull with the same
+// three. Rendezvous hashing on the node id spreads the picks.
+func TestPickMemberPeersSpreadsAcrossTheFleet(t *testing.T) {
+	var alive []string
+	for i := range 200 {
+		alive = append(alive, fmt.Sprintf("10.0.%d.%d:7946", i/250, i%250))
+	}
+	const nodes = 300
+	load := map[string]int{}
+	for n := range nodes {
+		for _, a := range pickMemberPeers(fmt.Sprintf("node-%d", n), alive, nil) {
+			load[a]++
+		}
+	}
+	busiest := 0
+	for _, c := range load {
+		busiest = max(busiest, c)
+	}
+	// 900 picks over 200 members average 4.5 each. Address order would put
+	// all 300 nodes on the same 3; allow plenty of hashing noise below that.
+	if len(load) < 150 || busiest > 20 {
+		t.Fatalf("picks landed on %d of %d members, busiest chosen by %d of %d nodes; want them spread", len(load), len(alive), busiest, nodes)
+	}
+	if a, b := pickMemberPeers("node-1", alive, nil), pickMemberPeers("node-2", alive, nil); slices.Equal(a, b) {
+		t.Fatalf("node-1 and node-2 picked the same members %v", a)
 	}
 }
 
