@@ -18,7 +18,9 @@ require (
 	github.com/mattn/go-sqlite3 v1.14.52
 	github.com/opencontainers/image-spec v1.1.1
 	github.com/tetratelabs/wazero v1.12.0
-	golang.org/x/crypto v0.58.0
+	// Untagged on purpose: the first x/crypto commit without the openpgp
+	// package (GO-2026-5932). Move to v0.59.0 once it is tagged.
+	golang.org/x/crypto v0.58.1-0.20261009181718-2f1f834330b2
 	golang.org/x/sync v0.24.0
 	gopkg.in/yaml.v3 v3.0.1
 	oras.land/oras-go/v2 v2.7.0
