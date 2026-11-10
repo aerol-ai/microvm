@@ -92,7 +92,7 @@ func TestUpgradeKeepsWasmAndIsolateRunning(t *testing.T) {
 	// a takeover failure, so the isolate is kept in use with pings that do
 	// not count.
 	began := time.Now()
-	t14MeasureWith(t, target, subjects, func() {
+	t14Measure(t, target, subjects, t14DownUpgrade, func() {
 		stop := keepIsolateInUse(t, isolate.sb, time.Minute)
 		// The upload runs from a node inside AWS (client_in_vpc_test.go).
 		r := aerolvmOnNode(t, "upgrade", "apply", versionB, "--from", dirB, "--allow-unversioned", "--wait")

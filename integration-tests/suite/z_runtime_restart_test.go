@@ -117,33 +117,49 @@ func t14WorkerPIDs(procs, kind string) []string {
 	return out
 }
 
-// t14Restart restarts sandboxd and waits until /health answers 200 through
-// the scenario's URL, then until the node is back (waitNodeRejoined; on one
-// node that is the API serving again). It returns when the restart began
-// and how long until /health answered.
+// t14Down is how a T14 case takes sandboxd down. The scripts live in
+// t14Disrupt, beside the wait for the node, so the restart guards in
+// restart_node_test.go read the stop and the wait in one function.
+type t14Down int
+
+const (
+	t14DownRestart     t14Down = iota // a plain restart of the unit
+	t14DownKillWorkers                // stop, SIGKILL every WASM worker, start (UC-702)
+	t14DownUpgrade                    // the caller's upgrade, which restarts it (UC-703)
+)
+
+// t14Restart restarts sandboxd and waits until it is back (t14Disrupt). It
+// returns when the restart began and how long until /health answered.
 func t14Restart(t *testing.T, target string) (time.Time, float64) {
 	t.Helper()
-	return t14RestartWith(t, target, "sudo systemctl restart sandboxd")
+	return t14Disrupt(t, target, t14DownRestart, nil)
 }
 
-// t14RestartWith runs script on the node (a restart, or a stop, a kill and
-// a start) and waits for /health.
-func t14RestartWith(t *testing.T, target, script string) (time.Time, float64) {
-	t.Helper()
-	return t14Disrupt(t, func() {
-		if out, err := harness.SSHRun(t, target, script); err != nil {
-			t.Fatalf("restart sandboxd: %v\n%s", err, out)
-		}
-	})
-}
-
-// t14Disrupt runs disrupt (a restart, an upgrade) and waits until /health
-// answers 200 through the scenario's URL. It returns when disrupt began and
-// how long until /health answered.
-func t14Disrupt(t *testing.T, disrupt func()) (time.Time, float64) {
+// t14Disrupt takes sandboxd down the way down says (upgrade runs for
+// t14DownUpgrade) and waits until it is back: /health answers 200 through
+// the scenario's URL, then the node has rejoined (waitNodeRejoined; on one
+// node that is the API serving again). It returns when the disruption began
+// and how long until /health answered.
+//
+// The node is the seed. T14 runs only on a single-node scenario (t14Node),
+// whose one node is the seed, and there is no cluster to lose; that is why
+// t14Disrupt is named in seedVictimCases.
+func t14Disrupt(t *testing.T, target string, down t14Down, upgrade func()) (time.Time, float64) {
 	t.Helper()
 	began := time.Now()
-	disrupt()
+	switch down {
+	case t14DownUpgrade:
+		upgrade()
+	case t14DownKillWorkers:
+		// A sandbox's resident host is one of the WASM workers.
+		t14SSH(t, target, `set -e
+sudo systemctl stop sandboxd
+for p in $(cat /sys/fs/cgroup/aerolvm-wasm/cgroup.procs 2>/dev/null); do sudo kill -9 $p || true; done
+sleep 1
+sudo systemctl start sandboxd`)
+	default:
+		t14SSH(t, target, "sudo systemctl restart sandboxd")
+	}
 	httpc := harness.HTTPClient(10 * time.Second)
 	deadline := began.Add(5 * time.Minute)
 	for {
@@ -152,7 +168,6 @@ func t14Disrupt(t *testing.T, disrupt func()) (time.Time, float64) {
 			resp.Body.Close()
 			if resp.StatusCode == http.StatusOK {
 				took := time.Since(began).Seconds()
-				// The node is a single-node scenario's only one (t14Node).
 				if err := waitNodeRejoined(t, harness.LoadIntegrationTargets().Nodes[0]); err != nil {
 					t.Fatalf("after the restart: %v", err)
 				}
@@ -166,20 +181,18 @@ func t14Disrupt(t *testing.T, disrupt func()) (time.Time, float64) {
 	}
 }
 
-// t14Measure probes every subject, restarts sandboxd once with script,
-// then probes each again: at once, then every 3s for up to a minute until
-// its exec answers. It logs the results; the caller asserts them.
-func t14Measure(t *testing.T, target, script string, subjects []*t14Subject) {
+// t14SSH runs script on the node and fails the case if it fails.
+func t14SSH(t *testing.T, target, script string) {
 	t.Helper()
-	t14MeasureWith(t, target, subjects, func() {
-		if out, err := harness.SSHRun(t, target, script); err != nil {
-			t.Fatalf("restart sandboxd: %v\n%s", err, out)
-		}
-	})
+	if out, err := harness.SSHRun(t, target, script); err != nil {
+		t.Fatalf("restart sandboxd: %v\n%s", err, out)
+	}
 }
 
-// t14MeasureWith is t14Measure around any disruption (an upgrade).
-func t14MeasureWith(t *testing.T, target string, subjects []*t14Subject, disrupt func()) {
+// t14Measure probes every subject, takes sandboxd down once (t14Disrupt),
+// then probes each again: at once, then every 3s for up to a minute until
+// its exec answers. It logs the results; the caller asserts them.
+func t14Measure(t *testing.T, target string, subjects []*t14Subject, down t14Down, upgrade func()) {
 	t.Helper()
 	ctx := context.Background()
 	for _, s := range subjects {
@@ -187,7 +200,7 @@ func t14MeasureWith(t *testing.T, target string, subjects []*t14Subject, disrupt
 		s.res.Before = s.probe(ctx)
 	}
 	before := t14Procs(t, target)
-	began, took := t14Disrupt(t, disrupt)
+	began, took := t14Disrupt(t, target, down, upgrade)
 	after := t14Procs(t, target)
 	since := func() float64 { return time.Since(began).Seconds() }
 	for _, s := range subjects {
@@ -344,7 +357,7 @@ func TestT14WasmAcrossSandboxdRestart(t *testing.T) {
 		newWasmCounterSubject(t, c, "passivatable", sdktypes.CreateSandboxOptions{Durability: sdktypes.DurabilityPassivatable}),
 		newWasmCounterSubject(t, c, "public traffic (per-sandbox worker)", sdktypes.CreateSandboxOptions{AllowPublicTraffic: &yes}),
 	}
-	t14Measure(t, target, "sudo systemctl restart sandboxd", subjects)
+	t14Measure(t, target, subjects, t14DownRestart, nil)
 	for _, s := range subjects {
 		if s.res.Before.ExecOut != "3" {
 			t.Fatalf("wasm %s: the measurement's own before-exec read %q, want 3", s.variant, s.res.Before.ExecOut)
@@ -410,12 +423,7 @@ func TestWasmRestoredWhenItsWorkerDied(t *testing.T) {
 	s := newWasmCounterSubject(t, c, "worker killed while sandboxd was down", sdktypes.CreateSandboxOptions{})
 	// Stop sandboxd, kill every WASM worker (the sandbox's resident host is
 	// one of them), start sandboxd.
-	script := `set -e
-sudo systemctl stop sandboxd
-for p in $(cat /sys/fs/cgroup/aerolvm-wasm/cgroup.procs 2>/dev/null); do sudo kill -9 $p || true; done
-sleep 1
-sudo systemctl start sandboxd`
-	t14Measure(t, target, script, []*t14Subject{s})
+	t14Measure(t, target, []*t14Subject{s}, t14DownKillWorkers, nil)
 	t14AssertKept(t, s, "4", "marker: marker-"+s.sb.ID)
 	if !strings.Contains(s.res.Journal, "restored over its kept work dir") {
 		t.Errorf("sandboxd did not log restoring %s:\n%s", s.sb.ID, s.res.Journal)
@@ -542,7 +550,7 @@ func TestT14IsolateAcrossSandboxdRestart(t *testing.T) {
 
 	measure := func(variant, tenant string) {
 		s := newIsolateCounterSubject(t, c, ref, variant, tenant)
-		t14Measure(t, target, "sudo systemctl restart sandboxd", []*t14Subject{s})
+		t14Measure(t, target, []*t14Subject{s}, t14DownRestart, nil)
 		if s.res.Before.ExecOut != "3" {
 			t.Fatalf("isolate %s: the measurement's own before-fetch read %q, want 3", variant, s.res.Before.ExecOut)
 		}
