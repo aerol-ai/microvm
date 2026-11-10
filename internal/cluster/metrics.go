@@ -49,6 +49,11 @@ var (
 	// server that just started; steady growth means the sweep is not keeping
 	// leases alive.
 	capacityLeaseOnDemandFetches = expvar.NewInt("aerolvm_capacity_lease_on_demand_fetches_total")
+	// raftPipelineStalls counts raft replication pipelines the stall guard
+	// closed because one send was blocked past any healthy wait
+	// (raft_pipeline_guard.go). Each one is a follower that would otherwise
+	// have stopped receiving the log until the next leader change.
+	raftPipelineStalls = expvar.NewInt("aerolvm_raft_pipeline_stalls_total")
 
 	ownerForwardTotal        = expvar.NewInt("aerolvm_owner_forward_total")
 	ownerForwardErrors       = expvar.NewMap("aerolvm_owner_forward_errors_total")
