@@ -3094,3 +3094,48 @@ func TestSandboxIDAsNameCheckSeeksAnIndex(t *testing.T) {
 		t.Fatalf("Create(fresh id) = %v", err)
 	}
 }
+
+// CountLive is /health's sandbox count: every row but the destroyed ones,
+// the number Health used to get by listing every sandbox.
+func TestCountLive(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	if n, err := st.CountLive(ctx); err != nil || n != 0 {
+		t.Fatalf("empty store: CountLive = %d, %v", n, err)
+	}
+	statuses := map[string]models.SandboxStatus{
+		"sb-started":   models.SandboxStatusStarted,
+		"sb-stopped":   models.SandboxStatusStopped,
+		"sb-destroyed": models.SandboxStatusDestroyed,
+		"sb-error":     models.SandboxStatusError,
+	}
+	for id, status := range statuses {
+		if err := st.Create(ctx, sampleSandbox(id)); err != nil {
+			t.Fatal(err)
+		}
+		if err := st.UpdateStatus(ctx, id, status, ""); err != nil {
+			t.Fatal(err)
+		}
+	}
+	n, err := st.CountLive(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	all, err := st.List(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	listed := 0
+	for _, sb := range all {
+		if sb.Status != models.SandboxStatusDestroyed {
+			listed++
+		}
+	}
+	if n != 3 || n != listed {
+		t.Fatalf("CountLive = %d, List counts %d live, want 3", n, listed)
+	}
+	_ = st.Close()
+	if _, err := st.CountLive(ctx); err == nil {
+		t.Fatal("CountLive on a closed store: want an error")
+	}
+}

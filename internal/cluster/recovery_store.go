@@ -286,9 +286,13 @@ func (s *placementRecoveryFileStore) SyncRef(ref string) error {
 var recoveryStoreFsync = syncFile
 
 // recoveryStoreSyncWorkers bounds the fsyncs a snapshot runs at once. A
-// snapshot can follow up to SnapshotThreshold entries, so up to ~1000 dirty
-// blobs; one after another at ~10 ms each on a busy gp3 disk that is ten
-// seconds, while concurrent fsyncs on one filesystem share journal commits.
+// snapshot can follow up to raftSnapshotThreshold (8,192) entries, and each
+// placement write among them Put a blob: one after another at ~10 ms each
+// on a busy gp3 disk that is 80 s, and 16 at a time about 5 s, since
+// concurrent fsyncs on one filesystem share journal commits. Every blob is
+// synced once whatever the cadence; a bigger threshold only puts more of
+// them in one snapshot. Persist runs beside Apply, so that time delays log
+// compaction, never a create.
 const recoveryStoreSyncWorkers = 16
 
 // fsyncEach fsyncs every path, recoveryStoreSyncWorkers at a time. It

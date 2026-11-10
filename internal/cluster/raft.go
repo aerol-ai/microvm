@@ -61,6 +61,34 @@ type raftSetupConfig struct {
 // each, 254 s of the package's 623 s.
 var testTuneRaft func(*raft.Config)
 
+// Snapshot cadence. A snapshot copies every placement while Apply waits
+// (raft calls Snapshot and Apply from one goroutine): 8.7 ms and 1.9 MiB at
+// 10k placements, 100 ms and 19 MiB at 100k (BenchmarkFSMSnapshot, M1 Max,
+// minimal specs; real specs are bigger). The cadence used to be 30 s / 1,024 entries "to keep the log
+// small", but raft keeps TrailingLogs (10,240) entries after every snapshot
+// anyway, so the log was never smaller: the stalls just came 4 to 8 times
+// as often. These are the library's defaults, set here so a raft upgrade
+// cannot move them unseen. A restart replays up to ~8k entries since the
+// newest snapshot; an apply costs a few µs (BenchmarkFSMValidateHostPortAt10K:
+// 2.9 µs), so that is tens of ms. recovery_store.go sizes the snapshot's blob
+// fsyncs for SnapshotThreshold.
+const (
+	raftSnapshotInterval  = 120 * time.Second
+	raftSnapshotThreshold = 8192
+)
+
+// newRaftConfig is the production raft config for nodeID.
+func newRaftConfig(nodeID string, logger *slog.Logger) *raft.Config {
+	rcfg := raft.DefaultConfig()
+	rcfg.LocalID = raft.ServerID(nodeID)
+	// Bridge raft's hclog to our slog. We accept some log-level lossiness in
+	// exchange for not running two log destinations.
+	rcfg.Logger = hclogAdapter(logger)
+	rcfg.SnapshotInterval = raftSnapshotInterval
+	rcfg.SnapshotThreshold = raftSnapshotThreshold
+	return rcfg
+}
+
 // setupRaft starts a raft node with the placement FSM. On success the caller
 // owns shutdown via raftNode.Close.
 func setupRaft(cfg raftSetupConfig, fsm *placementFSM, logger *slog.Logger) (*raftNode, error) {
@@ -74,16 +102,7 @@ func setupRaft(cfg raftSetupConfig, fsm *placementFSM, logger *slog.Logger) (*ra
 		return nil, fmt.Errorf("raft setup: mkdir %s: %w", cfg.DataDir, err)
 	}
 
-	rcfg := raft.DefaultConfig()
-	rcfg.LocalID = raft.ServerID(cfg.NodeID)
-	// Bridge raft's hclog to our slog. We accept some log-level lossiness in
-	// exchange for not running two log destinations.
-	rcfg.Logger = hclogAdapter(logger)
-	// More aggressive snapshotting than the default keeps the log small at
-	// high create/destroy churn. 1024 entries ~= a few seconds of churn at
-	// peak; trades disk I/O for memory and faster follower recovery.
-	rcfg.SnapshotInterval = 30 * time.Second
-	rcfg.SnapshotThreshold = 1024
+	rcfg := newRaftConfig(cfg.NodeID, logger)
 	if testTuneRaft != nil {
 		testTuneRaft(rcfg)
 	}
