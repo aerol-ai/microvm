@@ -29,9 +29,21 @@ import (
 
 // joinTokenTargets loads the targets and skips unless the scenario joined
 // its nodes with tokens.
+// joinTokenTargets is the scenario's members: every node Terraform joined
+// (harness.LoadIntegrationTargets leaves blank nodes out).
 func joinTokenTargets(t *testing.T) *harness.IntegrationTargets {
 	t.Helper()
 	targets := harness.LoadIntegrationTargets()
+	if targets == nil {
+		t.Skip("AEROL_INTEGRATION_TARGETS not set (run via integration-tests/run.sh)")
+	}
+	return targets
+}
+
+// allIntegrationTargets is every node Terraform made, blank ones included.
+func allIntegrationTargets(t *testing.T) *harness.IntegrationTargets {
+	t.Helper()
+	targets := harness.LoadAllIntegrationTargets()
 	if targets == nil {
 		t.Skip("AEROL_INTEGRATION_TARGETS not set (run via integration-tests/run.sh)")
 	}

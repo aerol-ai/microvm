@@ -295,6 +295,10 @@ const (
 	// scenario joins by token too but keeps 90-day certs, and UC-623 failed
 	// there on a cert it was never meant to see renew.
 	CapShortNodeCerts Capability = "short-node-certs"
+	// CapSpareServer: nodes has spare-server, a blank machine (plain Ubuntu,
+	// nothing installed) with role server, so UC-694 can add a server late
+	// through the module's own joiner bootstrap and a fresh join token.
+	CapSpareServer Capability = "spare-server"
 	// CapModuleURL: the scenario provisions through a root of its own whose
 	// module block fetches Terraform/ by git URL (run.sh
 	// prepare_module_root), not through Terraform/root, and leaves the join
@@ -352,7 +356,7 @@ var KnownCapabilities = map[Capability]bool{
 	CapKeyCustodyVault: true, CapKeyCustodyPKCS11: true, CapKeyCustodyKMSWrapped: true,
 	CapKeyCustodyKMSSwitch: true, CapKeyCustodySingleWrapped: true,
 	CapAPILoadBalancer: true, CapAPIListFairness: true, CapClusterChaos: true, CapOneLineJoin: true,
-	CapModuleURL: true, CapShortNodeCerts: true,
+	CapModuleURL: true, CapShortNodeCerts: true, CapSpareServer: true,
 }
 
 // Registry is the full use-case catalogue. Order is the matrix row order.
@@ -1162,6 +1166,7 @@ var Registry = []UseCase{
 	{ID: "UC-691", Title: "The join answer for a worker and an ingress token carries no pat_token and no CA key, only the PAT's SHA-256 and the operator volume scope", Requires: []Capability{CapOneLineJoin, CapCluster}, Implemented: true},
 	{ID: "UC-692", Title: "The old worker-token-to-CA-key path is refused end to end: a worker's cert alone is a live peer on a server's internal listener but is refused a server join token, the CA key and adopt; the worker's own token is refused by the server, by the load balancer and on the worker's own public API, and works only on the worker's loopback", Requires: []Capability{CapOneLineJoin, CapCluster}, Implemented: true},
 	{ID: "UC-693", Title: "A worker's own API still serves sandbox calls: with the operator PAT (checked by its hash) it creates a sandbox that answers exec, and reads and runs exec in one another node owns; the worker's own token on loopback reads a sandbox another node owns (the forward goes as the worker)", Requires: []Capability{CapOneLineJoin, CapCluster}, Implemented: true},
+	{ID: "UC-694", Title: "A server added after the module's join token stopped working joins with a fresh one, kubeadm's way: a joined server's own bootstrap, given a token the join port refuses, stops after the grace and names sandboxd join-command and node_join_tokens; the same bootstrap with a fresh token from sudo sandboxd join-command --role server --json on a server (what node_join_tokens puts in that node's user data) makes the blank spare-server a live server member", Requires: []Capability{CapOneLineJoin, CapCluster, CapSpareServer}, Implemented: true},
 	// Cluster rollouts, Phase 3b live gate and the Phase 3a cluster-side
 	// items (plans/kubectl-style-cluster-ops.md §6, §9; zz_rollout_test.go).
 	// Build B is this tree with another version stamp; the cases run in

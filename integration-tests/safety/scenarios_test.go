@@ -361,3 +361,40 @@ func TestShortNodeCertScenariosSetTheTTL(t *testing.T) {
 		t.Fatal("no scenario declares short-node-certs; this guard would pass having checked nothing")
 	}
 }
+
+// spare-server and a blank spare-server node go together: UC-694 joins that
+// machine as a late server. A scenario that declares the capability without
+// the machine fails UC-694 on a node that is not there; one with the machine
+// but not the capability pays for a node no case uses.
+func TestSpareServerScenariosHaveTheMachine(t *testing.T) {
+	nodeRe := regexp.MustCompile(`(?m)^\s*spare-server\s*=\s*\{([^}]*)\}`)
+	checked := 0
+	for _, f := range capsFiles(t) {
+		declared := false
+		for _, c := range capsList(t, f) {
+			if c == "spare-server" {
+				declared = true
+			}
+		}
+		tfvars := strings.TrimSuffix(f, ".caps.yml") + ".tfvars"
+		raw, err := os.ReadFile(tfvars)
+		if err != nil {
+			t.Fatal(err)
+		}
+		m := nodeRe.FindSubmatch(raw)
+		switch {
+		case declared && m == nil:
+			t.Errorf("%s declares spare-server but %s has no spare-server node", filepath.Base(f), filepath.Base(tfvars))
+		case declared && (!regexp.MustCompile(`role\s*=\s*"server"`).Match(m[1]) || !regexp.MustCompile(`blank\s*=\s*true`).Match(m[1])):
+			t.Errorf("%s: spare-server must be role = \"server\" and blank = true: %s", filepath.Base(tfvars), m[1])
+		case !declared && m != nil:
+			t.Errorf("%s has a spare-server node but %s does not declare spare-server, so UC-694 skips where it could run", filepath.Base(tfvars), filepath.Base(f))
+		}
+		if declared {
+			checked++
+		}
+	}
+	if checked == 0 {
+		t.Fatal("no scenario declares spare-server; this guard would pass having checked nothing")
+	}
+}

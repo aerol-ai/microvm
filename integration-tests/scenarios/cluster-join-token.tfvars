@@ -32,4 +32,8 @@ nodes = {
   ingress-1 = { role = "ingress", instance_type = "t3.medium", volume_size_gb = 20, spot = false }
   worker-1  = { role = "worker", instance_type = "t3.medium", spot = false }
   worker-2  = { role = "worker", instance_type = "t3.medium", spot = false }
+  # Plain Ubuntu with nothing installed: UC-694 makes it a server added
+  # late, through a joined server's own bootstrap and a fresh token, as
+  # node_join_tokens would.
+  spare-server = { role = "server", blank = true, instance_type = "t3.medium", volume_size_gb = 20, spot = false }
 }

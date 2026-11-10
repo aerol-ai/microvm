@@ -10,6 +10,8 @@ capabilities:
   - one-line-join
   # The tfvars set SB_CLUSTER_NODE_CERT_TTL=10m (UC-623 sees certs renew).
   - short-node-certs
+  # nodes has a blank spare-server (UC-694 joins it as a late server).
+  - spare-server
 
 expected_members: 6
 

@@ -28,7 +28,7 @@ import (
 // them.
 func moduleURLTargets(t *testing.T) (members, blank []harness.IntegrationNode) {
 	t.Helper()
-	targets := joinTokenTargets(t)
+	targets := allIntegrationTargets(t)
 	for _, n := range targets.Nodes {
 		out, err := joinNodeSSH(t, n, `grep -c "blank node: nothing installed" /var/log/aerolvm-bootstrap.log || true`)
 		if err != nil {
