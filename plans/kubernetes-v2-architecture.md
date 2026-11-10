@@ -1514,8 +1514,27 @@ given the C7 fix and answers to F1 to F8. S2's external-mount check (I/O on a
 mounted file across the swap, eng review OV-E2) is not done yet: it needs a
 mount backend in the harness.
 
-**Cost so far:** three clusters, about 3.4 hours of cluster time in all
-(78, 49 and about 75 minutes), about $1.20.
+**S9, the worker in a Kubernetes user namespace: fails on question 1**
+(run `p0-s9`, AL2023, EKS 1.36.5, node containerd 2.3.7, 2026-11-10). The pod
+had `hostUsers: false`, was not privileged, and had a named list of rights
+(`SYS_ADMIN`, `NET_ADMIN` and others) that apply only inside its namespaces.
+
+| S9 question | Answer |
+|---|---|
+| Does root in the pod stay harmless on the machine? | Yes. The pod's root maps to user 3092512768 on the machine. |
+| 1. Per-sandbox CPU and memory limits | **No.** `/sys/fs/cgroup` is mounted read-only and the pod sees its own group as `/`. A remount to read-write is refused. A fresh cgroup v2 mount works, but its files belong to the machine's root (`65534` as the pod sees them), so making a group or handing a controller down is refused. Kubernetes does not hand a pod's cgroup to the pod's user namespace. |
+| 2. The sandbox network | Yes, all of it: a bridge, new network namespaces, a link from the pod into one, nftables rules, and `bridge-nf-call-iptables` is visible. |
+| 3. gVisor | Starts: `runsc --rootless --network=none --ignore-cgroups do` runs. The full worker did not get that far, because C7 refused the cgroup parent it was given (fail-closed, as designed). |
+
+So S9 cannot replace `privileged` on EKS 1.36 for a worker that serves
+several teams: without per-sandbox limits, one sandbox can use the whole
+pod's CPU and memory. As §8.7 says, each image keeps S7's result. S9 comes
+back if Kubernetes or containerd starts delegating a pod's cgroup to its user
+namespace, or for N6's one-team worker pools, where sandboxes sharing one
+limit may be acceptable.
+
+**Cost so far:** four clusters, about 3.9 hours of cluster time in all (78,
+49, 77 and about 31 minutes), about $1.35.
 
 ## 19. Tests, drills and benchmarks
 

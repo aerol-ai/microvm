@@ -71,7 +71,7 @@ apply_worker() {
   kubectl -n "$NS" create configmap worker-boot \
     --from-file=fetch.sh="$LIB_DIR/worker/fetch.sh" --from-file=common.sh="$LIB_DIR/worker/common.sh" \
     --from-file=run.sh="$LIB_DIR/worker/run.sh" --from-file=runtime.sh="$LIB_DIR/worker/runtime.sh" \
-    --from-file=agent.sh="$LIB_DIR/worker/agent.sh" \
+    --from-file=agent.sh="$LIB_DIR/worker/agent.sh" --from-file=s9-probe.sh="$LIB_DIR/worker/s9-probe.sh" \
     --dry-run=client -o yaml | kubectl apply -f - >/dev/null
   kubectl -n "$NS" create secret generic worker-urls \
     --from-literal=SANDBOXD_URL="$(url_of sandboxd_url)" \

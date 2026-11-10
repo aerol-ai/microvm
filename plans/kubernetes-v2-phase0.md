@@ -60,7 +60,9 @@ anything else, as the plan's Phase 0 exit gate says.
 | H0 | **Done, 2026-11-10.** Pass after eight runs on one cluster; six findings for Phase 1 (F1 to F6) | v2 plan §18, "Phase 0 results" |
 | S1 | **Done, 2026-11-10. Pass** on AL2023 and Bottlerocket with the C7 prototype (`SB_CONTAINERD_CGROUP_PARENT`), loading `br_netfilter` (F2) and, on Bottlerocket, raising `user.max_user_namespaces` (F7) | Same |
 | S2 | **Done, 2026-11-10. Pass:** only the agent restarted; the sandbox kept running with the same processes. Finding F8 (namespace mounts leak onto the machine). The external-mount part (OV-E2) is still to do | v2 plan §18, "Phase 0 results" |
-| S3 to S9, N1 | Not started. S9 now has a known blocker on Bottlerocket (F7) | — |
+| S9 | **Done, 2026-11-10. Fails on per-sandbox limits:** a user-namespaced pod cannot make cgroups (read-only, not delegated). Networking and gVisor work. Images keep S7's answer | v2 plan §18, "Phase 0 results" |
+| S7 | Next: the worker with a named list of rights instead of `privileged: true` | — |
+| S3 to S6, S8, N1 | Not started | — |
 
 ## Cost, before it is spent
 
