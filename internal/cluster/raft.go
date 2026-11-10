@@ -39,13 +39,16 @@ type closableLogStore interface {
 type raftNode struct {
 	raft      *raft.Raft
 	transport *raft.NetworkTransport
-	// pipelines is the transport raft was given: transport plus the stall
-	// guard on replication pipelines (raft_pipeline_guard.go).
+	// pipelines is transport plus the stall guard on replication pipelines
+	// (raft_pipeline_guard.go).
 	pipelines *pipelineGuardTransport
-	logStore  closableLogStore
-	stableStr *raftboltdb.BoltStore
-	snaps     raft.SnapshotStore
-	logger    *slog.Logger
+	// heartbeats is the transport raft was given: pipelines plus the gate
+	// Close shuts before it closes the stores (raft_heartbeat_gate.go).
+	heartbeats *heartbeatGateTransport
+	logStore   closableLogStore
+	stableStr  *raftboltdb.BoltStore
+	snaps      raft.SnapshotStore
+	logger     *slog.Logger
 }
 
 // raftSetupConfig captures the inputs setupRaft needs.
@@ -177,7 +180,8 @@ func setupRaft(cfg raftSetupConfig, fsm *placementFSM, logger *slog.Logger) (*ra
 	}
 
 	pipelines := newPipelineGuardTransport(transport, raftPipelineStallFactor*raftTransportTimeout, logger)
-	r, err := raft.NewRaft(rcfg, fsm, logStore, stableStore, snaps, pipelines)
+	heartbeats := newHeartbeatGateTransport(pipelines)
+	r, err := raft.NewRaft(rcfg, fsm, logStore, stableStore, snaps, heartbeats)
 	if err != nil {
 		_ = transport.Close()
 		_ = logStore.Close()
@@ -201,13 +205,14 @@ func setupRaft(cfg raftSetupConfig, fsm *placementFSM, logger *slog.Logger) (*ra
 	}
 
 	return &raftNode{
-		raft:      r,
-		transport: transport,
-		pipelines: pipelines,
-		logStore:  logStore,
-		stableStr: stableStore,
-		snaps:     snaps,
-		logger:    logger,
+		raft:       r,
+		transport:  transport,
+		pipelines:  pipelines,
+		heartbeats: heartbeats,
+		logStore:   logStore,
+		stableStr:  stableStore,
+		snaps:      snaps,
+		logger:     logger,
 	}, nil
 }
 
@@ -271,6 +276,12 @@ func (r *raftNode) Close() error {
 		if err := awaitRaftShutdown(r.raft.Shutdown(), raftShutdownGrace, closePipelines, r.logger); err != nil {
 			firstErr = fmt.Errorf("raft shutdown: %w", err)
 		}
+	}
+	// raft.Shutdown does not wait for a heartbeat the transport is still
+	// handing to raft, and that heartbeat may write the term to the stable
+	// store: wait for it before the stores close (raft_heartbeat_gate.go).
+	if r.heartbeats != nil {
+		r.heartbeats.closeHeartbeats()
 	}
 	if r.transport != nil {
 		_ = r.transport.Close()

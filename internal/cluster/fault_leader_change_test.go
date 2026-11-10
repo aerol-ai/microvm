@@ -66,8 +66,17 @@ func TestClusterFaultLeaderChangeDuringConcurrentReserves(t *testing.T) {
 			// new leader's admission reads a capacity lease, not its own.
 			for _, s := range fc.servers {
 				if s != old && s != keep {
-					f := old.cluster().raft.raft.LeadershipTransferToServer(raftServerID(s), raftServerAddress(s))
-					if err := f.Error(); err != nil {
+					// Raft gives a transfer one election timeout (250 ms in
+					// these tests) to catch the target up, hand over and see
+					// the old leader step down, with 64 reserves loading every
+					// server. On a busy runner it can take longer: CI saw the
+					// timeout with leadership then moving to the target
+					// anyway, and once with the old leader still leading.
+					// Both are safe to retry (transferWithRetry).
+					err := transferWithRetry(faultTransferAttempts, func() error {
+						return old.cluster().raft.raft.LeadershipTransferToServer(raftServerID(s), raftServerAddress(s)).Error()
+					}, func() bool { return fc.leader() != old }, t.Logf)
+					if err != nil {
 						t.Errorf("leadership transfer %s -> %s: %v", old.id, s.id, err)
 					}
 					return nil
@@ -208,6 +217,14 @@ func runLeaderChangeReserves(t *testing.T, name string, change func(fc *faultClu
 	if elapsed >= leaderChangeTTL-time.Second {
 		t.Fatalf("reserves took %s, too close to the %s TTL for the visibility check to mean anything; raise leaderChangeTTL", elapsed, leaderChangeTTL)
 	}
+	// A new leader learns that the old leader's last entries are committed
+	// only when its own first entry commits, and applies them after that;
+	// until then its FSM can lack a grant the old leader said yes to. The
+	// product's first admission of a term waits for exactly that
+	// (admissionBarrier), but no reserve may have reached the new leader at
+	// all ("0 of them after the change"), so the checks below read its FSM
+	// only after settle has run the same barrier.
+	fc.settle()
 
 	// I4: never more granted than the worker can hold. The FSM count also
 	// covers a reserve whose answer was lost but whose entry committed.

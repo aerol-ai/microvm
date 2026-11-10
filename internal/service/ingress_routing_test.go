@@ -164,7 +164,12 @@ func TestIngressProxyRoutingOwnerCycle(t *testing.T) {
 	defer cancel()
 
 	allow := true
-	resp, err := svc.CreateSandbox(ctx, models.CreateSandboxRequest{Image: "alpine:3.20", AllowPublicTraffic: &allow})
+	// A fixed ID, not a random one. About 1 random ID in 1,850 is all
+	// decimal digits (CI drew sb-5530321697392958). Its root host then
+	// fits the static map's {id}-{port} rule, so the responder answers
+	// NXDOMAIN and Caddy takes the router (TestDerivedPort): the direct
+	// answer checked below never comes.
+	resp, err := svc.CreateSandboxWithID(ctx, models.CreateSandboxRequest{Image: "alpine:3.20", AllowPublicTraffic: &allow}, "sb-0123456789abcdef")
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -110,7 +110,7 @@ func TestRunRevertsAHalfSwappedUpgradeBeforeTheStore(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(stateDir, "op-half.json"), raw, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	err = runWithAutoCancel(t, 5*time.Second, nil)
+	err = runUntilBootFails(t, nil)
 	if err == nil || !strings.Contains(err.Error(), "op-half") {
 		t.Fatalf("Run = %v, want it to stop for the reverted binary", err)
 	}

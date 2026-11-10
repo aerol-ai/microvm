@@ -88,7 +88,7 @@ func TestCov96RunAuditExportBackendOpenFails(t *testing.T) {
 	t.Setenv("SB_AUDIT_EXPORT_BACKEND", "file")
 	t.Setenv("SB_AUDIT_EXPORT_FILE_PATH", filepath.Join(blocker, "audit.ndjson"))
 
-	err := runWithAutoCancel(t, 500*time.Millisecond, nil)
+	err := runUntilBootFails(t, nil)
 	if err == nil || !strings.Contains(err.Error(), "configure audit export connector") {
 		t.Fatalf("Run = %v, want audit export connector failure", err)
 	}

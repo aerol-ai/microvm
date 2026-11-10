@@ -257,7 +257,7 @@ func TestRunPublicSocketFailureStopsBoot(t *testing.T) {
 	t.Cleanup(func() { publicAPISocketGroup = old })
 	t.Setenv("SB_PAT_SCOPE", "host")
 	t.Setenv("SB_PUBLIC_API_SOCKET", filepath.Join(shortDir(t), "api.sock"))
-	err := runWithAutoCancel(t, 2*time.Second, nil)
+	err := runUntilBootFails(t, nil)
 	if err == nil || !strings.Contains(err.Error(), "public API socket") {
 		t.Fatalf("Run err = %v, want the public socket refusal", err)
 	}
