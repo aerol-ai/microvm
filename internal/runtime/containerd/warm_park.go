@@ -221,6 +221,7 @@ func (d *Driver) parkContainer(ctx context.Context, slotID string, key container
 		specOpts = append(specOpts, withNetworkNamespace(netnsPath))
 	}
 	specOpts = append(specOpts, withSandboxIPv6Off())
+	specOpts = append(specOpts, d.cgroupSpecOpts(slotID)...)
 	if ociRuntime == "runsc" {
 		specOpts = append(specOpts, runscSandboxAnnotationOpt())
 	}

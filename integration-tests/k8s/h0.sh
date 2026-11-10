@@ -17,7 +17,9 @@ ROOT="$(cd "$HERE/../.." && pwd)"
 NS=aerolvm-workers
 POD=worker-0
 
-name="${1:?usage: h0.sh <name>}"
+name="${1:?usage: h0.sh <name> [--c7]}"
+c7=0
+[[ "${2:-}" == "--c7" ]] && c7=1
 KUBECONFIG="$("$HERE/cluster.sh" kubeconfig "$name")"
 export KUBECONFIG
 sd="$HERE/.state/$name"
@@ -54,6 +56,7 @@ kubectl -n "$NS" create secret generic worker-urls \
   --from-literal=TOOLBOXD_URL="$(url_of toolboxd_url)" \
   --from-literal=CHECKSUMS_URL="$(url_of checksums_url)" \
   --from-literal=SB_PAT_TOKEN="$token" \
+  --from-literal=AEROL_C7_CGROUP_PARENT="$c7" \
   --dry-run=client -o yaml | kubectl apply -f - >/dev/null
 kubectl -n "$NS" delete pod "$POD" --ignore-not-found --wait=true >/dev/null
 kubectl apply -f "$HERE/manifests/worker-h0.yaml" >/dev/null
@@ -121,36 +124,41 @@ out="$(api "/v1/sandboxes/$id/toolbox/process/execute" -X POST \
   -d '{"command":"echo hello-from-gvisor; uname -r; cat /proc/self/cgroup"}')"
 say "exec: $(jq -c '{exit_code, stdout}' <<<"$out")"
 
-# 5. S1 evidence, recorded as found.
-say "--- S1: cgroups, seen from the worker container"
-kubectl -n "$NS" exec "$POD" -c worker -- bash -c '
-  echo "worker container: $(cat /proc/self/cgroup)"
-  for p in $(pgrep -f "runsc" || true); do
-    echo "pid $p ($(tr "\0" " " < /proc/$p/cmdline | cut -c1-60)): $(cat /proc/$p/cgroup)"
-  done
-' | tee -a "$report"
-say "--- S1: network links inside the pod"
-kubectl -n "$NS" exec "$POD" -c worker -- ip -br link | tee -a "$report"
-say "--- S1: network namespaces inside the pod"
-kubectl -n "$NS" exec "$POD" -c worker -- ip netns list | tee -a "$report" || true
+# 5. S1 evidence, recorded as found. Read from a node debug pod, which sees
+#    the machine's processes, network and cgroup tree: with C7 on, kubectl
+#    exec into the worker may fail (the kernel will not add a process to a
+#    group that hands controllers down), and whether it does is itself noted.
 node="$(kubectl -n "$NS" get pod "$POD" -o jsonpath='{.spec.nodeName}')"
-say "--- S1: network links on the machine ($node), from a host-network debug pod"
-# kubectl debug node runs a pod in the machine's network namespace, so
-# /proc/net/dev lists the machine's links, not the pod's.
-kubectl debug "node/$node" --image=public.ecr.aws/amazonlinux/amazonlinux:2023 -- \
-  sh -c 'cut -d: -f1 /proc/net/dev | tail -n +3 | tr -d " "' >/dev/null 2>&1 || true
-dpod=""
-for _ in $(seq 1 30); do
-  dpod="$(kubectl get pods -o name 2>/dev/null | grep node-debugger | head -1 || true)"
-  if [[ -n "$dpod" ]] && [[ "$(kubectl get "$dpod" -o jsonpath='{.status.phase}')" == Succeeded ]]; then break; fi
-  sleep 2
-done
-if [[ -n "$dpod" ]]; then
-  kubectl logs "$dpod" | tee -a "$report"
-  kubectl delete "$dpod" --wait=false >/dev/null
+uid="$(kubectl -n "$NS" get pod "$POD" -o jsonpath='{.metadata.uid}' | tr - _)"
+say "--- S1: pod uid ${uid}; C7 cgroup placement: $([[ $c7 == 1 ]] && echo on || echo off)"
+if kubectl -n "$NS" exec "$POD" -c worker -- true >/dev/null 2>&1; then
+  say "kubectl exec into the worker: works"
 else
-  say "(the debug pod did not start)"
+  say "kubectl exec into the worker: FAILS ($(kubectl -n "$NS" exec "$POD" -c worker -- true 2>&1 | tail -1 | cut -c1-160))"
 fi
+node_debug() {
+  local before after p
+  before="$(kubectl get pods -o name 2>/dev/null | grep node-debugger || true)"
+  kubectl debug "node/$node" --profile=sysadmin --image=public.ecr.aws/amazonlinux/amazonlinux:2023 -- \
+    chroot /host sh -c "$1" >/dev/null 2>&1 || true
+  for _ in $(seq 1 45); do
+    after="$(kubectl get pods -o name 2>/dev/null | grep node-debugger | grep -vxF "$before" | head -1 || true)"
+    if [[ -n "$after" ]] && [[ "$(kubectl get "$after" -o jsonpath='{.status.phase}')" =~ ^(Succeeded|Failed)$ ]]; then break; fi
+    sleep 2
+  done
+  if [[ -n "$after" ]]; then
+    kubectl logs "$after" | tee -a "$report"
+    kubectl delete "$after" --wait=false >/dev/null
+  else
+    say "(the debug pod did not finish)"
+  fi
+}
+say "--- S1: where each runsc process sits, from the machine"
+node_debug "for p in \$(pgrep -f runsc); do printf '%s %s %s\n' \$p \$(cut -c1-30 /proc/\$p/comm) \$(cut -d: -f3 /proc/\$p/cgroup); done"
+say "--- S1: memory charged to the worker container's group and to its sandboxes"
+node_debug "for d in /sys/fs/cgroup/kubepods.slice/kubepods-pod${uid}.slice/cri-containerd-*.scope /sys/fs/cgroup/kubepods.slice/kubepods-pod${uid}.slice/cri-containerd-*.scope/sandboxes; do [ -d \$d ] && echo \$d memory.current=\$(cat \$d/memory.current) memory.max=\$(cat \$d/memory.max); done"
+say "--- S1: network links on the machine"
+node_debug "cut -d: -f1 /proc/net/dev | tail -n +3 | tr -d ' '"
 
 api "/v1/sandboxes/$id" -X DELETE >/dev/null || true
 say "--- done; report in $report"

@@ -244,6 +244,7 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		specOpts = append(specOpts, withNetworkNamespace(netnsPath))
 	}
 	specOpts = append(specOpts, withSandboxIPv6Off())
+	specOpts = append(specOpts, d.cgroupSpecOpts(sandboxID)...)
 	mountSpecs := buildMounts(d.cfg, hostFiles, hostMounts)
 	if ociRuntime == "runsc" {
 		specOpts = append(specOpts, runscSandboxAnnotationOpt())

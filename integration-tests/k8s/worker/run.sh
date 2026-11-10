@@ -13,6 +13,27 @@ set -euo pipefail
 dnf -y -q install iproute iptables-nft nftables procps-ng >/dev/null
 
 export PATH="/opt/aerolvm/bin:$PATH"
+
+# C7 prototype (spike S1): put every sandbox under this pod's own cgroup.
+# A privileged container sees the machine's whole cgroup tree (no private
+# cgroup namespace), so /proc/self/cgroup names this container's group.
+# cgroup v2 lets a group hand controllers to its children only while it
+# holds no processes itself, so this script and everything it starts move
+# into supervisor/ first; sandboxes go under sandboxes/. sandboxd checks the
+# parent at boot and refuses to start if it cannot hold limits.
+if [[ "${AEROL_C7_CGROUP_PARENT:-0}" == 1 ]]; then
+  self="$(cut -d: -f3 /proc/self/cgroup)"
+  cg="/sys/fs/cgroup${self}"
+  mkdir -p "$cg/supervisor" "$cg/sandboxes"
+  for pid in $(cat "$cg/cgroup.procs"); do
+    echo "$pid" > "$cg/supervisor/cgroup.procs" 2>/dev/null || true
+  done
+  echo "+cpu +memory +pids" > "$cg/cgroup.subtree_control"
+  echo "+cpu +memory +pids" > "$cg/sandboxes/cgroup.subtree_control"
+  export SB_CONTAINERD_CGROUP_PARENT="${self}/sandboxes"
+  echo "run: C7 on; sandboxes go under ${SB_CONTAINERD_CGROUP_PARENT}"
+fi
+
 mkdir -p /run/containerd /etc/containerd /var/lib/sandboxd/mounts \
   /var/lib/toolboxd/recordings /run/sandboxd
 chmod 0700 /var/lib/sandboxd/mounts /run/sandboxd

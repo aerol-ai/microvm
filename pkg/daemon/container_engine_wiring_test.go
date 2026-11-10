@@ -5,12 +5,15 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/config"
+	cntr "github.com/aerol-ai/microvm/internal/runtime/containerd"
 	"github.com/aerol-ai/microvm/internal/service"
 	"github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/docker"
@@ -193,4 +196,46 @@ func TestWireContainerEngineConfiguresContainerdAOCRPullAuth(t *testing.T) {
 			}
 		})
 	}
+}
+
+// A configured cgroup parent that cannot hold sandboxes with their limits
+// stops the daemon at boot (plan C7), before any firewall or driver work.
+func TestWireContainerEngineChecksCgroupParent(t *testing.T) {
+	root := t.TempDir()
+	orig := cntr.CgroupRoot
+	cntr.CgroupRoot = root
+	t.Cleanup(func() { cntr.CgroupRoot = orig })
+	if err := os.WriteFile(filepath.Join(root, "cgroup.controllers"), []byte("cpu memory pids\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	parent := filepath.Join(root, "pod", "sandboxes")
+	if err := os.MkdirAll(parent, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	st, err := store.Open(t.TempDir() + "/state.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	cfg := config.Config{
+		ContainerEngine:        models.ContainerEngineContainerd,
+		EnableNetworkRules:     false,
+		NetrulesBackend:        "exec",
+		ContainerdCgroupParent: "/pod/sandboxes",
+	}
+
+	// No cgroup.subtree_control: controllers are not handed down.
+	if _, err := wireContainerEngine(context.Background(), cfg, testLogger(), &service.Service{}, st, nil, nil, nil); err == nil ||
+		!strings.Contains(err.Error(), "containerd cgroup parent") {
+		t.Fatalf("err = %v, want a cgroup parent refusal", err)
+	}
+
+	if err := os.WriteFile(filepath.Join(parent, "cgroup.subtree_control"), []byte("cpu memory pids\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	w, err := wireContainerEngine(context.Background(), cfg, testLogger(), &service.Service{}, st, nil, nil, nil)
+	if err != nil {
+		t.Fatalf("wireContainerEngine with a ready parent: %v", err)
+	}
+	w.Stop()
 }

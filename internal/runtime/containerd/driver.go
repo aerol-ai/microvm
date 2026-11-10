@@ -36,6 +36,9 @@ type Config struct {
 	LogDir             string
 	RunDir             string
 	NativeNetnsPool    bool
+	// CgroupParent, when set, puts every sandbox's cgroup at
+	// <CgroupParent>/<id> (see cgroup_parent.go).
+	CgroupParent string
 }
 
 // FromDaemonConfig maps internal config into driver-local settings.
@@ -73,6 +76,7 @@ func FromDaemonConfig(cfg config.Config) Config {
 		LogDir:             logDir,
 		RunDir:             runDir,
 		NativeNetnsPool:    cfg.ContainerdNativeNetnsPoolEnabled,
+		CgroupParent:       cfg.ContainerdCgroupParent,
 	}
 }
 

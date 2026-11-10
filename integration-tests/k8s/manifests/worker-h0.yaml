@@ -62,6 +62,13 @@ spec:
             secretKeyRef:
               name: worker-urls
               key: SB_PAT_TOKEN
+        # "1" turns on the C7 cgroup placement in run.sh (spike S1).
+        - name: AEROL_C7_CGROUP_PARENT
+          valueFrom:
+            secretKeyRef:
+              name: worker-urls
+              key: AEROL_C7_CGROUP_PARENT
+              optional: true
       ports:
         - { name: api, containerPort: 21212 }
       # Ready only once sandboxd listens. Not /health: it reports "degraded"
