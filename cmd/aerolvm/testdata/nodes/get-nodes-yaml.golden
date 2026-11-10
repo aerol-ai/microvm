@@ -1,0 +1,22 @@
+exit 0
+--- stdout
+nodes:
+    - alive: true
+      api_url: https://srv-a:21212
+      capacity: {}
+      fsm_ops_version: 11
+      leader: true
+      node_id: srv-a
+      role: server
+      version: v0.6.12
+      voter: true
+    - alive: false
+      api_url: https://wkr-2:21212
+      capacity:
+        host_cpu_cores: 8
+      capacity_stale: true
+      fsm_ops_version: 10
+      node_id: wkr-2
+      role: worker
+      version: v0.6.11
+--- stderr

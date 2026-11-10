@@ -1,0 +1,4 @@
+exit 0
+--- stdout
+token "tok_cccccccccccc" deleted
+--- stderr

@@ -1,109 +1,179 @@
 ---
 title: Runbooks
-description: Find the step-by-step guide for each kind of outage or alert, and the scripts and playbooks those guides use.
+description: Find the step-by-step guide for each kind of outage or alert, and the tools those guides use.
 ---
 
 import { Aside } from '@astrojs/starlight/components';
 
-A **runbook** is a step-by-step guide for one kind of problem. AerolVM's runbooks live in the repository under [`setup/runbooks/`](https://github.com/aerol-ai/microvm/tree/main/setup/runbooks). Each Prometheus alert that ships with AerolVM links straight to the runbook for it.
+A **runbook** is a step-by-step guide for one kind of problem. AerolVM's runbooks are in the repository, in [`setup/runbooks/`](https://github.com/aerol-ai/microvm/tree/main/setup/runbooks). Each Prometheus alert that ships with AerolVM links to its runbook.
 
-Most runbooks follow the same pattern: how serious the problem is, safety rules, checks to run first, the fix, and how to confirm it worked. Many end with a drill checklist so you can practice.
+Most runbooks have the same parts:
+
+- How serious the problem is.
+- Safety rules.
+- Checks to run first.
+- The fix.
+- How to check that the fix worked.
+
+Many end with a drill, so you can practice. For a first look at a cluster that seems wrong, start with [Fix problems](/cluster/troubleshooting/). Come here when an alert fires, or when the fix needs more steps.
+
+`sandboxd` is the AerolVM program on each node.
+
+## Words to know
+
+| Word | What it means |
+|---|---|
+| **Incident** | An outage, or an alert that needs people to act. |
+| **Prometheus** | The tool that collects metrics and fires alerts. |
+| **Grafana** | The tool that shows metrics as dashboards. |
+| **Alertmanager** | The tool that sends Prometheus alerts to people. |
+| **SLO** | Service level objective: a target your service should meet, such as how fast creates finish. |
+| **Leader** | The server node that writes down each cluster change. |
+| **Voter** | A server or mixed node that votes on cluster changes. |
+| **Majority** | More than half of the voters. The cluster needs a majority to make a change. |
+| **Drill** | A practice run of a runbook, on a test cluster. |
 
 ## Pick a runbook
 
 | Runbook | Use it when |
 |---|---|
-| [Backup and restore](https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/backup-restore.md) | You need to restore a node, recover lost local data, or prove your backups work. |
-| [Lost-quorum recovery](https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/lost-quorum-recovery.md) | The cluster has no leader because too many voting servers are gone, and you cannot bring a majority back. This is a last resort. |
-| [SLO breach](https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/slo-breach.md) | Any service-level alert fires and the cause is not clear. Start here, then move to a narrower runbook. |
-| [Image-pull storm](https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/image-pull-storm.md) | Image downloads are queued, failing, rate-limited, or held back after repeated failures. |
-| [Cluster ingress topology](https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/cluster-ingress-topology.md) | The `SandboxdClusterTopologyViolation` alert fires: more than 10 ingress nodes without a shard-aware router, or mixed roles in a cluster of more than 10 nodes. |
-| [Egress gateway](https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/egress-gateway.md) | A `SandboxdEgress*` alert fires, or creates that use a website allow list return `503 egress_gateway_unavailable`. |
-| [Secrets and audit](https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/secrets-and-audit.md) | Secret audit or copy alerts fire, a stored credential will not open, or `failover_ready` stays `false`. |
+| [Backup and restore](https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/backup-restore.md) | You need to put a node back from a backup. Or you lost local data, or need to prove your backups work. See also [Back up and recover](/cluster/backup/). |
+| [Cluster upgrades](https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/cluster-upgrades.md) | An upgrade failed or is stuck. Or it waits on a node marked `manual` or `skipped`. Or you need to finish (finalize) or undo (roll back) an upgrade. It also covers failing joins and failing node certificate renewals. See also [Upgrade](/cluster/upgrade/). |
+| [Lost majority recovery](https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/lost-quorum-recovery.md) (`lost-quorum-recovery.md`) | The cluster has no leader, because too many voters are gone. You cannot bring a majority back. This is the last thing to try. See also [Most server nodes died](/cluster/backup/#most-server-nodes-died). |
+| [SLO breach](https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/slo-breach.md) | An SLO alert fires and the cause is not clear. Start here, then move to a narrower runbook. |
+| [Image-pull storm](https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/image-pull-storm.md) | Image downloads are queued, failing or rate-limited. Or the node holds them back after repeated failures. |
+| [Cluster ingress topology](https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/cluster-ingress-topology.md) | The `SandboxdClusterTopologyViolation` alert fires. One cause: more than 10 ingress nodes, with no router that knows which ingress node holds which sandbox. The other cause: mixed nodes in a cluster of more than 10 nodes. |
+| [Egress gateway](https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/egress-gateway.md) | A `SandboxdEgress*` alert fires. Or creates that use a website allow list return `503 egress_gateway_unavailable`. |
+| [Secrets and audit](https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/secrets-and-audit.md) | An alert fires for secret audit, secret copies or your key store. Or a stored secret does not open, or `failover_ready` stays `false`. Or the startup check of your key store fails. |
 | [Firecracker template health](https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/firecracker-template-health.md) | Alerts fire for Firecracker template builds, uploads, downloads or rebuilds. |
-| [Container engine coexistence](https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/containerd-engine-coexistence.md) | You switch a node between Docker and containerd, or run both on one node while you drain it. |
-| [WASM runtime health](https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/wasm-runtime-health.md) | WASM sandboxes are stuck in `passivated` or `awaiting_runtime`, or stay cold after failover. |
-| [Isolate jail](https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/isolate-jail.md) | You need to check or debug the lock-down around `workerd` for V8 isolates. |
+| [Container engine coexistence](https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/containerd-engine-coexistence.md) | You switch a node between Docker and containerd. Or you run both on one node while you drain it. |
+| [WASM runtime health](https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/wasm-runtime-health.md) | WASM sandboxes are stuck in `passivated` or `awaiting_runtime`. Or they stay cold after failover. Or WASM module uploads and downloads fail in the logs. |
+| [Isolate jail](https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/isolate-jail.md) | You need to check or debug the lock-down around `workerd`, the program that runs V8 isolates. |
 | [Isolate workerd upgrade](https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/isolate-workerd-upgrade.md) | You upgrade, or roll back, the fixed `workerd` version that V8 isolates use. |
-| [Remote MCP](https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/remote-mcp.md) | Agents that use the server's remote MCP endpoint (`/mcp`) report failures, or `SandboxdRemoteMCPErrorRate` fires. |
-| [Identity and access](https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/identity-and-access.md) | An identity alert fires (the server token used from outside, a stale token list, failing key fetches, identity files that differ), your identity provider is down, or you rotate the server token or the metrics scrape token, make the first admin token, or limit the server token to the server. |
+| [Remote MCP](https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/remote-mcp.md) | Agents that use the remote MCP endpoint (`/mcp`) report failures. Or `SandboxdRemoteMCPErrorRate` fires. Or you set up or check an OAuth connector, such as claude.ai or ChatGPT. |
+| [Identity and access](https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/identity-and-access.md) | An identity alert fires: `SandboxdBreakGlassPATUse`, `SandboxdPATScopeDrift` or `SandboxdIdentity*`. Or your sign-in provider is down. Or HTTPS breaks after you turn on the PROXY protocol. Also use it to change the admin token or the metrics scrape token. It shows how to make the first API token with the `admin` role. It also shows how to accept the admin token only on the node itself (`SB_PAT_SCOPE=host`). |
 
-An SLO (service level objective) is a target your service should meet, such as how fast creates finish. Quorum means a majority of the voting servers. See the [Glossary](/cluster-glossary/) for other cluster words.
+The [runbook overview](https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/README.md) lists them too. See the [Glossary](/cluster-glossary/) for other cluster words.
 
 ## The first five minutes of any incident
 
-The [runbook overview](https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/README.md) sets out the same start for every incident:
+The runbook overview sets the same start for every incident:
 
-1. Find the alert that fired and the cluster it affects.
+1. Find the alert that fired, and the cluster it affects.
 2. Open the Grafana dashboard and the current Prometheus alerts page.
-3. Save the cluster leader, the member list and the metrics from one server, one worker and one ingress node (a node that takes public traffic). The [Dashboard](/dashboard/) shows the leader and members.
-4. Stop deploys and changes to the cluster's nodes until the incident lead says it is safe.
-5. Pick the narrowest runbook above. Follow its checks before you change anything.
+3. Save the leader, the member list and the metrics. Take metrics from one server node, one worker node and one ingress node.
+4. Stop deploys and node changes until the incident lead says to go on.
+5. Pick the narrowest runbook above. Run its checks before you change anything.
 
-It also names four incident roles. The **incident lead** makes decisions and keeps the timeline. The **operator** runs the commands. **Comms** keeps users updated. The **observer** records metrics before, during and after the fix. On a small team one person can hold several roles, but keep one lead and one log of commands.
+For step 3, these print the leader and the members:
 
-## Scripts the runbooks use
+```bash title="On your computer"
+aerolvm cluster-info
+aerolvm get nodes -o wide
+```
 
-These live in [`scripts/`](https://github.com/aerol-ai/microvm/tree/main/scripts). Most run on a node, with `sudo`. `terraform.sh` runs on your own computer.
+The [Dashboard](/dashboard/) shows the same. To save the recent log of one node:
 
-| Script | What it does |
+```bash title="On a node"
+sudo journalctl -u sandboxd --since "30 minutes ago" --no-pager
+```
+
+The runbook overview also names four roles:
+
+| Role | What they do |
 |---|---|
-| [`install.sh`](https://github.com/aerol-ai/microvm/blob/main/scripts/install.sh) | Installs or upgrades AerolVM on one machine. See [Install on a server](/getting-started/single-node-setup/). |
-| [`uninstall.sh`](https://github.com/aerol-ai/microvm/blob/main/scripts/uninstall.sh) | Removes the AerolVM server from a machine. |
-| [`terraform.sh`](https://github.com/aerol-ai/microvm/blob/main/scripts/terraform.sh) | Runs Terraform with your `config/` files. See [Cluster setup](/cluster-setup/). |
-| [`cluster-init.sh`](https://github.com/aerol-ai/microvm/blob/main/scripts/cluster-init.sh) | Starts a new cluster on its first server node. |
-| [`cluster-join.sh`](https://github.com/aerol-ai/microvm/blob/main/scripts/cluster-join.sh) | Joins a node to an existing cluster. |
-| [`cluster-sign-node.sh`](https://github.com/aerol-ai/microvm/blob/main/scripts/cluster-sign-node.sh) | On the seed, signs a joining node's certificate request. The signing key never leaves the seed. |
-| [`sandboxd-node-lifecycle.sh`](https://github.com/aerol-ai/microvm/blob/main/scripts/sandboxd-node-lifecycle.sh) | Drains or uncordons a node, removes a member, or empties a node before a role change. |
-| [`sandboxd-backup.sh`](https://github.com/aerol-ai/microvm/blob/main/scripts/sandboxd-backup.sh) | Saves a node's database, Raft data and settings into one archive. |
-| [`sandboxd-restore.sh`](https://github.com/aerol-ai/microvm/blob/main/scripts/sandboxd-restore.sh) | Puts that archive back on a node. It writes nothing unless you pass `--force`. |
-| [`raft-lost-quorum-recover.sh`](https://github.com/aerol-ai/microvm/blob/main/scripts/raft-lost-quorum-recover.sh) | Writes the recovery file (`peers.json`) that makes one surviving server the only voter. |
+| **Incident lead** | Makes the decisions, says how serious it is, and writes down the time of each action. |
+| **Operator** | Runs the commands and changes the cluster. |
+| **Comms** | Keeps users and other people up to date. |
+| **Observer** | Records metrics before, during and after the fix. |
+
+On a small team, one person can hold several roles. Still keep one lead, and one log of commands with their times.
+
+## Tools the runbooks use
+
+You need no copy of the repository. Every tool below ships in a release, or inside a program you already have.
+
+| Tool | Where it runs | What it does |
+|---|---|---|
+| `aerolvm` | Your computer | The cluster commands: `get nodes`, `cordon`, `drain`, `delete node`, `join-command`, `upgrade`, `release pull`. See [the aerolvm CLI](/cli/#run-a-cluster). |
+| `sudo sandboxd init`, `join`, `preflight`, `adopt`, `reset`, `join-command` | On a node | `init` starts a cluster. `join` adds a machine. `preflight` checks a machine before `init` or `join`. `adopt` moves a cluster built with the old scripts onto join commands. `reset` takes a machine out of its cluster. `join-command` prints a join command, on a server node. See [Build a cluster](/cluster/create/) and [Add and remove nodes](/cluster/nodes/). |
+| `sudo sandboxd backup`, `restore`, `recover-quorum` | On a node | `backup` saves the database, cluster records, settings folder and server key of a node into one file. `restore` puts that file back. `recover-quorum` is the last-resort fix when most server nodes died. See [Back up and recover](/cluster/backup/). |
+| `sudo sandboxd upgrade node` | On a node | Upgrades this one node. Use it for a node that `aerolvm upgrade status` shows as `manual`, or a node left on an older version. See [Upgrade](/cluster/upgrade/). |
+| [`install.sh`](https://github.com/aerol-ai/microvm/releases/latest/download/install.sh) | On a node | Installs AerolVM on one machine. With `init` or `join` at the end, it also starts or joins a cluster. |
+| [`uninstall.sh`](https://github.com/aerol-ai/microvm/releases/latest/download/uninstall.sh) | On a node | Removes AerolVM from a machine. |
+| `aerolvm-ops-<release>.tar.gz` | Your monitoring | Each release ships one. It holds the Prometheus alert rules, the Grafana dashboards, the Alertmanager example and these runbooks, for that release. |
+
+What `reset` does:
+
+- It asks the cluster to delete this node, if it can reach the cluster. Then it stops `sandboxd`.
+- **It keeps** the database, the server key and `/etc/sandboxd/sandboxd.env`.
+- **It removes** `/etc/sandboxd/cluster.env`, the node certificate and keys, the signing key folder and the cluster records.
+
+A backup file holds the server key, so keep it like a password. A node with a locked server key (`SB_CREDENTIAL_KEY_CUSTODY=wrapped`) puts only the locked copy in it.
+
+`sudo sandboxd upgrade node` is not for the first upgrade from a release before v0.7.0. For that one, run the installer again on each node. See [Upgrade](/cluster/upgrade/#the-first-upgrade-from-a-release-before-v070).
+
+Use the copies that match the release your nodes run. `sudo sandboxd version` prints it, such as `v0.7.0`. For the files of another release, use `https://github.com/aerol-ai/microvm/releases/download/<release>/<file>`.
 
 <Aside type="caution">
-Use `raft-lost-quorum-recover.sh` only while you follow the lost-quorum runbook. It can make the cluster keep changes that a majority never agreed on. Try to bring the original voting servers back first.
+Use `sandboxd recover-quorum` only while you follow the lost majority runbook. It makes one surviving server node the only voter. Its records become the cluster's records, even changes that a majority never agreed on. Changes that only the dead nodes had are lost. Try to bring the original voters back first.
 </Aside>
+
+**The old scripts are going away.** `cluster-init.sh` and `cluster-join.sh` still ship in this release. They are thin wrappers over `sandboxd init` and `sandboxd join`. `cluster-sign-node.sh` also ships, for the old two-step join. All three go away in a later release. In the repository, `sandboxd-backup.sh`, `sandboxd-restore.sh` and `raft-lost-quorum-recover.sh` now call `sandboxd backup`, `restore` and `recover-quorum`.
 
 ## Ansible playbooks
 
-Ansible is a tool that runs the same steps on many servers over SSH. The playbooks live in [`Ansible/playbooks/`](https://github.com/aerol-ai/microvm/tree/main/Ansible/playbooks). Run them from the `Ansible` folder, which holds the server list and settings. The [Ansible README](https://github.com/aerol-ai/microvm/blob/main/Ansible/README.md) has the full guide.
+**Ansible** is a tool that runs the same steps on many machines over SSH. A **playbook** is one Ansible script. You do not need Ansible to upgrade. `aerolvm upgrade apply` upgrades every node from your computer.
+
+The playbooks are in [`Ansible/playbooks/`](https://github.com/aerol-ai/microvm/tree/main/Ansible/playbooks). They change host settings only. Run them from the `Ansible` folder. It holds `ansible.cfg` and the node list (`inventory/`). The node list finds your nodes in AWS. The settings the playbooks push come from `config/cluster.yml`, at the top of the repository. The [Ansible README](https://github.com/aerol-ai/microvm/blob/main/Ansible/README.md) has the full guide.
 
 | Playbook | What it does |
 |---|---|
 | `ping.yml` | Checks that Ansible can reach every node with SSH and `sudo`. Run it before anything risky. |
-| `configure-ops.yml` | Pushes operations settings to every node, plus the Grafana dashboard, alert rules, Alertmanager example and the main runbooks. |
-| `prepare-role-change.yml` | Drains a node and waits until it owns no sandboxes, before you change its role or replace it. It fails if sandboxes are still there. |
-| `update-sandboxd.yml` | Rolls a new AerolVM server program out across the cluster. |
-| `update-toolboxd.yml` | Rolls a new toolbox (the helper program inside each sandbox) out across the cluster. |
-| `tail-logs.yml` | Shows the latest server log lines from every node. |
-| `stage-wasm-modules.yml` | Copies the standard WASM modules onto every node ahead of time, and checks each file's checksum. |
+| `configure-ops.yml` | Pushes operations settings to every node. It also copies the Grafana SLO dashboard, the alert rules, the Alertmanager example and six runbooks. |
+| `prepare-role-change.yml` | Drains a node, and waits until it runs no sandboxes. Use it before you change the role of a node or replace its machine. `aerolvm drain` does the same from your computer. |
+| `tail-logs.yml` | Shows the latest `sandboxd` log lines from every node. |
+| `stage-wasm-modules.yml` | Copies the standard WASM modules onto every node ahead of time. It checks the checksum of each file. |
 
-## Put the runbooks on your servers
+## Put the runbooks on your nodes
 
-`configure-ops.yml` copies the main runbooks to each node, next to the Grafana dashboard, the Prometheus alert rules and the Alertmanager example. From the top of the repository:
+`configure-ops.yml` copies the runbook overview and six runbooks to each node:
 
-```bash
+- Backup and restore
+- Lost majority recovery
+- Image-pull storm
+- SLO breach
+- Container engine coexistence
+- Cluster ingress topology
+
+They go next to the Grafana SLO dashboard, the Prometheus alert rules and the Alertmanager example. From the top of the repository:
+
+```bash title="On your computer"
 cd Ansible
 ansible-playbook playbooks/configure-ops.yml
 ```
 
-The runbooks land in `/etc/sandboxd/runbooks` by default.
+The runbooks go to `/etc/sandboxd/runbooks` on each node. For every runbook, use the `aerolvm-ops-<release>.tar.gz` file of your release.
 
 ## Practice with drills
 
-Run these drills on a test (staging) cluster at least once a month. They prove your commands, access, metrics and escalation path work before a real outage.
+Run these drills on a test (staging) cluster at least once a month. They prove that your commands, access, metrics and call list work before a real outage.
 
-- **Backup restore:** restore the latest archive onto a replacement node.
-- **Lost quorum:** talk through the decision steps, without creating `peers.json`.
-- **Image-pull storm:** point a test workload at an image tag that does not exist, and check that the backoff alerts fire.
-- **Firecracker template health:** mark a test template `unhealthy` with the rebuild endpoint, and check that the rebuild clears the alert.
-- **SLO breach:** create a backlog of creates with a small, controlled load test. Check the alert, the dashboard and the fix steps.
+- **Backup restore:** put the latest backup onto a replacement node.
+- **Lost majority:** talk through the decision steps. Do not create `peers.json`.
+- **Image-pull storm:** start one test sandbox from an image tag that does not exist. Check that the backoff alerts fire.
+- **Firecracker template health:** mark a test template `unhealthy` with the rebuild endpoint. Check that the rebuild clears the alert.
+- **SLO breach:** make a queue of creates with a small load test that you control. Check the alert, the dashboard and the fix steps.
 
-Record each result in the drill template inside the runbook.
+Write down each result in the drill template inside the runbook.
 
 ## Next steps
 
+- [Fix problems](/cluster/troubleshooting/): the first checks when something looks wrong.
+- [Back up and recover](/cluster/backup/): back up a node, and recover when server nodes die.
+- [Upgrade](/cluster/upgrade/): upgrade every node, and what to do when an upgrade fails.
 - [Dashboard](/dashboard/): the live view of nodes, placements and metrics.
-- [Cluster setup](/cluster-setup/): how the cluster was built in the first place.
-- [Ingress nodes](/cluster-ingress/): the topology rules behind the topology alert.
+- [Clusters](/cluster/): how a cluster works and how you build one.
+- [Ingress nodes](/cluster-ingress/): the rules behind the topology alert.
 - [Secrets providers](/cluster-secrets/): background for the secrets runbook.
 - [Staying up under overload](/overload-protection-architecture/): why a busy node answers `503 overloaded`, and why you should not restart it.

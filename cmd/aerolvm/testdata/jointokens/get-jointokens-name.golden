@@ -1,0 +1,6 @@
+exit 0
+--- stdout
+jointoken/old001
+jointoken/srv001
+jointoken/wrk001
+--- stderr

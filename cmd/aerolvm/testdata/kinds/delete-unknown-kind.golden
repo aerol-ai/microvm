@@ -1,0 +1,5 @@
+exit 2
+--- stdout
+--- stderr
+aerolvm delete: unknown kind "nod": delete takes nodes, sandboxes, snapshots, tokens or jointokens (aerolvm api-resources lists them); to delete a sandbox: aerolvm delete sb <name>
+run `aerolvm delete --help` for usage

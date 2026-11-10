@@ -35,7 +35,7 @@ The managed control-plane build maps its users to `runner` (or `viewer`) on thei
 
 | Actor | Action | What carries it out |
 | :--- | :--- | :--- |
-| Operator | Install `sandboxd`, `toolboxd`, and Caddy. Configure TLS, runtimes, and cluster membership. | `install.sh`, `cluster-init.sh`, `cluster-join.sh`, and the daemon environment. |
+| Operator | Install `sandboxd`, `toolboxd`, and Caddy. Configure TLS, runtimes, and cluster membership. | `install.sh`, `sandboxd init` / `join`, the `aerolvm` cluster commands, and the daemon environment. |
 | Operator | Turn identity on, name the identity providers, bind groups to roles, and block a person at once. | `SB_IDENTITY_ENABLED`, and the identity file (`SB_IDENTITY_FILE`): issuers, bindings and `deny_subjects`. Each node reloads it within one poll or on SIGHUP and writes one `identity_config` audit record per change. |
 | Operator or admin | Mint, list and revoke scoped API tokens. Run fleet operations: reconcile drifted host state, build images, manage templates and cluster members. | `POST/GET/DELETE /v1/tokens` (`aerolvm token`), `POST /v1/admin/reconcile`, `POST /v1/images/build`, `/v1/cluster/*`. A revoke reaches every node within one token-mirror sync. |
 | Person | Sign in, and see who the server thinks they are. | `aerolvm login` (browser or device flow against the provider), `aerolvm whoami`, and the dashboard at `/ui`. Only admins and the operator get the dashboard's console; every other role gets a signed-in screen with a CLI pointer. |

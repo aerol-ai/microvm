@@ -32,6 +32,10 @@ WITH_ISOLATE="false"
 # --ingress-proxy-routing / --no-ingress-proxy-routing decide, and without
 # either resolve_ingress_proxy_routing turns it on for a --domain install.
 INGRESS_PROXY_ROUTING=""
+# true once resolve_ingress_proxy_routing chose the value itself, so node.json
+# keeps "auto" rather than freezing what this run derived: a node that gets a
+# --domain later would otherwise keep routing off.
+INGRESS_PROXY_ROUTING_AUTO="false"
 ROUTE_DNS_ADDR="127.0.0.1:53053"
 # The aerolvm-rt link's own address. systemd-resolved sends *.rt.internal
 # here, not to ROUTE_DNS_ADDR (write_route_dns_resolver says why), and
@@ -130,6 +134,12 @@ PAT_SCOPE="any"
 KEY_CUSTODY="file"
 SECRET_PROVIDER_ENV=""
 NO_START="false"
+# `init` or `join` as a word on the command line (plans/kubectl-style-
+# cluster-ops.md §3.1, §7): install this host, then hand the rest of the
+# arguments to `sandboxd init` / `sandboxd join`.
+NODE_COMMAND=""
+NODE_COMMAND_ARGS=()
+PRINT_JOIN_VERSION="false"
 PUBLIC_API_SOCKET="/run/sandboxd-public/api.sock"
 L4_PROXY_PROTOCOL="false"
 # --lb-health-port: a plain-HTTP /health listener for a load balancer's
@@ -137,11 +147,30 @@ L4_PROXY_PROTOCOL="false"
 # a default install opens no new port.
 LB_HEALTH_PORT=""
 
-# A re-run restarts a running sandboxd when it changed the daemon's settings
-# file or unit (see restart_sandboxd_if_reconfigured). record_sandboxd_state
-# fills the two state variables before anything is written.
+# A re-run restarts a running sandboxd when it changed the daemon's binary,
+# settings file or unit (see restart_sandboxd_if_reconfigured).
+# record_sandboxd_state fills the two state variables before anything is
+# written.
 SANDBOXD_ENV_FILE="/etc/sandboxd/sandboxd.env"
 SANDBOXD_UNIT_FILE="/etc/systemd/system/sandboxd.service"
+# Saved answers (plans/kubectl-style-cluster-ops.md D7). node.json holds
+# every non-secret setting a run used, so a re-run with no flags rebuilds
+# the same node; flags given on a re-run win over it. Secrets stay only in
+# the env files they are written to and are read back from there. On a node
+# installed before node.json existed, the first re-run reads its settings
+# back from the files below once (see migrate_node_settings).
+NODE_SETTINGS_FILE="/etc/sandboxd/node.json"
+CADDY_ENV_FILE="/etc/default/caddy"
+CADDYFILE_PATH="/etc/caddy/Caddyfile"
+# The flags this run was given, each followed by a space (flag_given).
+GIVEN_FLAGS=" "
+# true when PUBLIC_HOST came from this machine's address, not from
+# --public-host or node.json: node.json then keeps it empty, so a machine
+# whose address changed gets its new one on the next run.
+PUBLIC_HOST_DETECTED="false"
+# The key-store lines read back from sandboxd.env when a wrapped-custody
+# node is re-run without --secret-provider-env (secret_provider_lines).
+SAVED_SECRET_PROVIDER_LINES=""
 # The cgroup v2 and proc mounts keep_firecracker_vms_running reads (tests
 # point them at fixtures).
 CGROUP_ROOT="/sys/fs/cgroup"
@@ -291,6 +320,21 @@ download_pins() {
 	echo "cni-plugins ${v} cni-plugins-linux-arm64-${v}.tgz.sha512 705b6aa2498e03eef13df8a5993852e1d3e9ac64606c98a60f7551d9d905f2c5 ${cni}/cni-plugins-linux-arm64-${v}.tgz.sha512"
 }
 # --- END DOWNLOAD PINS --------------------------------------------------------
+# --config-only re-renders an installed node's configuration and touches
+# nothing else (apply_config_only); `sandboxd host apply` runs it.
+CONFIG_ONLY="false"
+# The upgrader hand-off (plans/kubectl-style-cluster-ops.md eng D7). When the
+# installed sandboxd has `sandboxd upgrade node`, a re-run downloads and
+# checks the files as before, puts them in HANDOFF_DIR instead of over the
+# installed ones, and hands them to the upgrader, so every binary swap keeps
+# the *.prev copies, the database backup and running VMs, and is put back if
+# the new set does not come up. A first install, and a node whose sandboxd
+# predates the command, install the files directly as before.
+RELEASE_JSON_URL=""
+UPGRADER_HANDOFF="false"
+HANDOFF_DIR=""
+HANDOFF_VERSION=""
+HANDOFF_UPGRADED="false"
 
 usage() {
 	cat <<'EOF'
@@ -473,6 +517,13 @@ Options:
                                /run/sandboxd-public/api.sock. Enterprise
                                mode requires "host". Turn it on only after
                                every node runs a release that has it.
+  --config-only                Re-render this node's configuration (env files,
+                               Caddyfile, systemd units) from node.json and the
+                               secrets saved in the env files. Downloads
+                               nothing, replaces no binary, installs no package
+                               and starts or restarts no service; it only runs
+                               systemctl daemon-reload. Restart sandboxd to use
+                               the new settings. `sandboxd host apply` runs it.
   --no-start                   Install and enable everything but leave sandboxd
                                stopped, for a node cluster-join.sh will start
                                once it has the cluster's config and server key.
@@ -521,7 +572,33 @@ Options:
                                every server option.
   --cli-url <url>              Download URL for the aerolvm binary
                                (--cli-only).
+  --print-join-version         With join: print the version the cluster asks
+                               new nodes to install, and stop.
   --help                       Show this help
+
+Starting or joining a cluster (one line per machine):
+  install.sh [options] init [sandboxd init options]
+  install.sh [options] join <url> --token <id.secret> [--ca-cert-hash sha256:<hex>] [--node-id <id>]
+  Installs this host (sandboxd is left for the command to start), then runs
+  `sandboxd init` or `sandboxd join` with everything after the word. For
+  join, the installer first asks the cluster which version to install
+  (checked with the token), unless --version or --sandboxd-url says. Get a
+  join line from `aerolvm join-command`; install options go before the word.
+
+Re-running (Linux):
+  Each run saves every option except secrets and download choices to
+  /etc/sandboxd/node.json (root only). Secrets stay in the env files, and
+  a re-run reads them back, so it keeps the PAT. A re-run with no options
+  installs the latest release onto the same settings and restarts sandboxd
+  when its binary or settings changed. Options you pass win over saved
+  ones. To turn a saved switch such as --with-gvisor off, set it to false
+  in node.json.
+
+  When the installed sandboxd has `sandboxd upgrade node`, a re-run hands
+  the downloaded and checked binaries to it instead of copying them over
+  the installed ones: the swap keeps the old files as *.prev and a backup
+  of the database, keeps Firecracker VMs running, and puts the old files
+  back if the new sandboxd does not come up.
 
 Examples:
 	curl -fsSL https://aerolvm.aerol.ai | sudo bash -s -- --domain sandbox.example.com --pat-token my-pat-token
@@ -595,6 +672,10 @@ resolve_release_urls() {
 		CHECKSUMS_URL="${CHECKSUMS_URL:-${release_base}/download/${VERSION}/checksums.txt}"
 		CADDY_BINARY_URL="${CADDY_BINARY_URL:-${release_base}/download/${VERSION}/caddy_${platform}}"
 	fi
+	# release.json sits beside the binaries in every release since it was
+	# added; for an explicit --sandboxd-url it is looked for in the same
+	# place. Only the upgrader hand-off reads it.
+	RELEASE_JSON_URL="${RELEASE_JSON_URL:-${SANDBOXD_URL%/*}/release.json}"
 }
 
 download_asset() {
@@ -840,11 +921,322 @@ resolve_ingress_proxy_routing() {
 	if [[ -n "$INGRESS_PROXY_ROUTING" ]]; then
 		return
 	fi
+	INGRESS_PROXY_ROUTING_AUTO="true"
 	if [[ -n "$DOMAIN" && "$LOCAL_MODE" != "true" ]]; then
 		INGRESS_PROXY_ROUTING="true"
 	else
 		INGRESS_PROXY_ROUTING="false"
 	fi
+}
+
+# NODE_SETTINGS lists every setting node.json keeps, as VARIABLE:--flag:type.
+# A setting's key in node.json is its flag without the dashes, with "_" for
+# "-", so a saved file maps back to flags one to one. Left out on purpose:
+#   - secrets (--pat-token, --dns-api-token, the --caddy-storage-s3-*-key
+#     flags, --secret-provider-env): node.json is not where secrets live;
+#     load_saved_node_settings reads them back from the env files;
+#   - what one run fetches or does (--version, the --*-url flags,
+#     --build-from-source, --no-start, --cli-only, --config-only): a re-run
+#     with no flags installs the latest release, which is how a node is
+#     upgraded, and --no-start is only for a joiner's first install.
+# Types: string; bool, a switch saved as true or false; auto, a switch whose
+# default depends on other settings, saved as true or false only when a flag
+# gave it and as "auto" otherwise, so a re-run derives it again. A --no-<flag>
+# given now wins over a saved bool or auto setting, like <flag> itself.
+NODE_SETTINGS=(
+	DOMAIN:--domain:string
+	PUBLIC_HOST:--public-host:string
+	NODE_NAME:--node-name:string
+	GITHUB_REPO:--github-repo:string
+	INSTALL_PREFIX:--install-prefix:string
+	IDLE_TIMEOUT_MIN:--idle-timeout-min:string
+	DNS_PROVIDER:--dns-provider:string
+	ACME_EMAIL:--acme-email:string
+	ACME_CA:--acme-ca:string
+	ACME_CA_ROOT:--acme-ca-root:string
+	TLS_ISSUER:--tls-issuer:string
+	LOCAL_MODE:--local:bool
+	INGRESS_PROXY_ROUTING:--ingress-proxy-routing:auto
+	WITH_GVISOR:--with-gvisor:bool
+	RUNSC_PATH:--runsc-path:string
+	WITH_CONTAINERD_ENGINE:--with-containerd-engine:bool
+	WITH_ISOLATE:--with-isolate:bool
+	WORKERD_PATH:--workerd-path:string
+	WITH_FIRECRACKER:--with-firecracker:bool
+	WITH_NVIDIA_GPU:--with-nvidia-gpu:bool
+	WITH_AMD_GPU:--with-amd-gpu:bool
+	CADDY_STORAGE_S3:--caddy-storage-s3:bool
+	CADDY_STORAGE_S3_BUCKET:--caddy-storage-s3-bucket:string
+	CADDY_STORAGE_S3_REGION:--caddy-storage-s3-region:string
+	CADDY_STORAGE_S3_ENDPOINT:--caddy-storage-s3-endpoint:string
+	CADDY_STORAGE_S3_PREFIX:--caddy-storage-s3-prefix:string
+	PAT_SCOPE:--pat-scope:string
+	L4_PROXY_PROTOCOL:--l4-proxy-protocol:bool
+	LB_HEALTH_PORT:--lb-health-port:string
+	KEY_CUSTODY:--key-custody:string
+)
+
+# flag_given reports whether this run was given flag $1 on its command line.
+flag_given() {
+	[[ "$GIVEN_FLAGS" == *" $1 "* ]]
+}
+
+# env_file_value prints KEY's value from an env file install.sh wrote
+# (KEY=value lines; the value may hold "="), or nothing.
+env_file_value() {
+	[[ -r "$1" ]] || return 0
+	awk -F= -v key="$2" '$1 == key { value = substr($0, length($1) + 2); found = 1 } END { if (found) print value }' "$1"
+}
+
+# detect_public_host prints this machine's first address, the default
+# public host. macOS hostname has no -I; under pipefail the failed pipeline
+# would exit the script silently, so it falls through to 127.0.0.1.
+detect_public_host() {
+	local host
+	host="$(hostname -I 2>/dev/null | awk '{print $1}' || true)"
+	echo "${host:-127.0.0.1}"
+}
+
+# json_string prints $1 as a JSON string. sed, not ${v//...}: how bash
+# treats a backslash in a replacement changed in 5.2. A control character
+# would need an escape the reader does not take, and it would break the env
+# files anyway, so it fails the run.
+json_string() {
+	if [[ "$1" == *[[:cntrl:]]* ]]; then
+		echo "Cannot save $2: its value holds a control character" >&2
+		exit 1
+	fi
+	printf '"%s"' "$(printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')"
+}
+
+# json_unescape undoes json_string, one character at a time so an escaped
+# backslash is never read as the start of the next escape.
+json_unescape() {
+	local in="$1" out="" c i
+	for ((i = 0; i < ${#in}; i++)); do
+		c="${in:i:1}"
+		if [[ "$c" == '\' ]]; then
+			i=$((i + 1))
+			c="${in:i:1}"
+			case "$c" in
+			'"' | '\' | '/') ;;
+			*)
+				echo "$NODE_SETTINGS_FILE: unsupported escape \\$c; keep values free of control characters" >&2
+				return 1
+				;;
+			esac
+		fi
+		out+="$c"
+	done
+	printf '%s' "$out"
+}
+
+# saved_setting stores one saved value as NODE_JSON_<key>.
+saved_setting() {
+	printf -v "NODE_JSON_$1" '%s' "$2"
+}
+
+# read_node_settings loads node.json into NODE_JSON_<key>. It takes the
+# shape write_node_settings writes (and jq prints): one "key": value per
+# line. Anything else fails the run, so a broken hand edit never silently
+# drops a setting.
+read_node_settings() {
+	local line n=0 value
+	local brace='^[[:space:]]*[{}]?[[:space:]]*$'
+	local re='^[[:space:]]*"([a-z0-9_]+)"[[:space:]]*:[[:space:]]*("(([^"\\]|\\.)*)"|true|false|[0-9]+)[[:space:]]*,?[[:space:]]*$'
+	while IFS= read -r line || [[ -n "$line" ]]; do
+		n=$((n + 1))
+		[[ "$line" =~ $brace ]] && continue
+		if [[ ! "$line" =~ $re ]]; then
+			echo "$NODE_SETTINGS_FILE line $n is not one \"key\": value setting. Fix it, or delete the file to read the settings back from $SANDBOXD_ENV_FILE." >&2
+			exit 1
+		fi
+		value="${BASH_REMATCH[2]}"
+		if [[ "$value" == \"* ]]; then
+			value="$(json_unescape "${BASH_REMATCH[3]}")" || exit 1
+		fi
+		saved_setting "${BASH_REMATCH[1]}" "$value"
+	done <"$NODE_SETTINGS_FILE"
+	if [[ "${NODE_JSON_format:-}" != "1" ]]; then
+		echo "$NODE_SETTINGS_FILE has format '${NODE_JSON_format:-}'; this install.sh reads format 1. Use the install.sh of the release that wrote it." >&2
+		exit 1
+	fi
+}
+
+# migrate_node_settings recovers the non-secret settings of a node installed
+# before node.json existed, from the files those installs wrote: sandboxd.env
+# and, in domain mode, /etc/default/caddy and the Caddyfile. A setting none
+# of them records (--runsc-path, the GPU flags) stays at its default; those
+# only install extra software, which a re-run leaves in place.
+migrate_node_settings() {
+	local env="$SANDBOXD_ENV_FILE" v
+	echo "No $NODE_SETTINGS_FILE yet: reading this node's settings back from $env"
+	saved_setting format 1
+	saved_setting node_name "$(env_file_value "$env" SB_NODE_NAME)"
+	saved_setting idle_timeout_min "$(env_file_value "$env" SB_IDLE_TIMEOUT_MIN)"
+	v="$(env_file_value "$env" SB_TOOLBOX_BINARY_PATH)"
+	[[ -n "$v" ]] && saved_setting install_prefix "$(dirname "$v")"
+	# Only a --local install binds the API to loopback, and it writes none
+	# of the settings below.
+	if [[ "$(env_file_value "$env" SB_API_HOST)" == "127.0.0.1" ]]; then
+		saved_setting local true
+		return 0
+	fi
+	saved_setting domain "$(env_file_value "$env" SB_DOMAIN)"
+	v="$(env_file_value "$env" SB_PUBLIC_HOST)"
+	[[ "$v" == "$(detect_public_host)" ]] || saved_setting public_host "$v"
+	saved_setting acme_ca "$(env_file_value "$env" SB_TLS_ACME_CA)"
+	saved_setting acme_ca_root "$(env_file_value "$env" SB_TLS_ACME_CA_ROOT)"
+	saved_setting tls_issuer "$(env_file_value "$env" SB_TLS_ISSUER)"
+	saved_setting pat_scope "$(env_file_value "$env" SB_PAT_SCOPE)"
+	[[ "$(env_file_value "$env" SB_INGRESS_PROXY_ROUTING)" == "true" ]] && saved_setting ingress_proxy_routing true
+	[[ "$(env_file_value "$env" SB_L4_FALLBACK_PROXY_PROTOCOL)" == "true" ]] && saved_setting l4_proxy_protocol true
+	[[ ",$(env_file_value "$env" SB_HOST_RUNTIMES)," == *,gvisor,* ]] && saved_setting with_gvisor true
+	[[ "$(env_file_value "$env" SB_ENABLE_FIRECRACKER)" == "true" ]] && saved_setting with_firecracker true
+	[[ "$(env_file_value "$env" SB_ENABLE_ISOLATE)" == "true" ]] && saved_setting with_isolate true
+	saved_setting workerd_path "$(env_file_value "$env" SB_ISOLATE_WORKERD_PATH)"
+	[[ "$(env_file_value "$env" SB_CONTAINER_ENGINE)" == "containerd" ]] && saved_setting with_containerd_engine true
+	[[ "$(env_file_value "$env" SB_CREDENTIAL_KEY_CUSTODY)" == "wrapped" ]] && saved_setting key_custody wrapped
+	# Cloudflare is the only DNS provider install.sh supports, and it writes
+	# the provider's token to /etc/default/caddy only when one is set.
+	[[ -n "$(env_file_value "$CADDY_ENV_FILE" SB_DNS_API_TOKEN)" ]] && saved_setting dns_provider cloudflare
+	v="$(env_file_value "$CADDY_ENV_FILE" SB_CADDY_S3_BUCKET)"
+	if [[ -n "$v" ]]; then
+		saved_setting caddy_storage_s3 true
+		saved_setting caddy_storage_s3_bucket "$v"
+		saved_setting caddy_storage_s3_region "$(env_file_value "$CADDY_ENV_FILE" SB_CADDY_S3_REGION)"
+		saved_setting caddy_storage_s3_endpoint "$(env_file_value "$CADDY_ENV_FILE" SB_CADDY_S3_ENDPOINT)"
+		saved_setting caddy_storage_s3_prefix "$(env_file_value "$CADDY_ENV_FILE" SB_CADDY_S3_PREFIX)"
+	fi
+	if [[ -r "$CADDYFILE_PATH" ]]; then
+		saved_setting acme_email "$(awk '/^\temail / { sub(/^\temail /, ""); print; exit }' "$CADDYFILE_PATH")"
+		# Dropping this listener would take the node out of its load
+		# balancer, so it is recovered too.
+		saved_setting lb_health_port "$(sed -n 's/^http:\/\/:\([0-9][0-9]*\) {$/\1/p' "$CADDYFILE_PATH" | head -n1)"
+	fi
+	return 0
+}
+
+# load_saved_node_settings applies the saved settings this run was not
+# given a flag for, then reads back the secrets it was not given. macOS
+# --local keeps its token in the LaunchAgent (reuse_darwin_pat_token) and has
+# no /etc/sandboxd, so this is Linux only.
+load_saved_node_settings() {
+	[[ "$(uname -s)" == "Darwin" ]] && return 0
+	if [[ -f "$NODE_SETTINGS_FILE" ]]; then
+		if [[ ! -r "$NODE_SETTINGS_FILE" ]]; then
+			echo "Cannot read $NODE_SETTINGS_FILE: run install.sh as root" >&2
+			exit 1
+		fi
+		echo "Using the settings saved in $NODE_SETTINGS_FILE; flags given now win over them"
+		read_node_settings
+	elif [[ -f "$SANDBOXD_ENV_FILE" ]]; then
+		migrate_node_settings
+	fi
+	local entry var flag kind key name value
+	for entry in "${NODE_SETTINGS[@]}"; do
+		IFS=: read -r var flag kind <<<"$entry"
+		key="${flag#--}"
+		key="${key//-/_}"
+		name="NODE_JSON_$key"
+		value="${!name-}"
+		# Empty means "the default": every setting with a non-empty default
+		# is always saved with its value.
+		[[ -n "$value" ]] || continue
+		flag_given "$flag" && continue
+		[[ "$kind" != string ]] && flag_given "--no-${flag#--}" && continue
+		[[ "$kind" == auto && "$value" == auto ]] && continue
+		if [[ "$kind" != string && "$value" != true && "$value" != false ]]; then
+			if [[ "$kind" == auto ]]; then
+				echo "$NODE_SETTINGS_FILE: $key must be true, false or auto, got '$value'" >&2
+			else
+				echo "$NODE_SETTINGS_FILE: $key must be true or false, got '$value'" >&2
+			fi
+			exit 1
+		fi
+		printf -v "$var" '%s' "$value"
+	done
+
+	# Secrets. A re-run must never make a new PAT while one exists: every
+	# client, and every peer in a cluster, holds the old one.
+	if ! flag_given --pat-token; then
+		value="$(env_file_value "$SANDBOXD_ENV_FILE" SB_PAT_TOKEN)"
+		[[ -n "$value" ]] && PAT_TOKEN="$value"
+	fi
+	if [[ -n "$DNS_PROVIDER" ]] && ! flag_given --dns-api-token; then
+		DNS_API_TOKEN="$(env_file_value "$CADDY_ENV_FILE" SB_DNS_API_TOKEN)"
+	fi
+	if [[ "$CADDY_STORAGE_S3" == "true" ]]; then
+		flag_given --caddy-storage-s3-access-key || CADDY_STORAGE_S3_ACCESS_KEY="$(env_file_value "$CADDY_ENV_FILE" SB_CADDY_S3_ACCESS_KEY)"
+		flag_given --caddy-storage-s3-secret-key || CADDY_STORAGE_S3_SECRET_KEY="$(env_file_value "$CADDY_ENV_FILE" SB_CADDY_S3_SECRET_KEY)"
+		flag_given --caddy-storage-s3-encryption-key || CADDY_STORAGE_S3_ENCRYPTION_KEY="$(env_file_value "$CADDY_ENV_FILE" SB_CADDY_S3_ENCRYPTION_KEY)"
+	fi
+	if [[ "$KEY_CUSTODY" == "wrapped" ]] && ! flag_given --secret-provider-env && [[ -r "$SANDBOXD_ENV_FILE" ]]; then
+		SAVED_SECRET_PROVIDER_LINES="$(grep -E '^(SB_SECRET_[A-Z0-9_]+|AWS_REGION)=' "$SANDBOXD_ENV_FILE" || true)"
+	fi
+	return 0
+}
+
+# secret_provider_lines prints the key-store settings write_environment
+# appends for --key-custody wrapped: from --secret-provider-env when given,
+# else the lines read back from the existing sandboxd.env.
+secret_provider_lines() {
+	if [[ -n "$SECRET_PROVIDER_ENV" ]]; then
+		grep -E '^(SB_SECRET_[A-Z0-9_]+|AWS_REGION)=' "$SECRET_PROVIDER_ENV" || true
+	elif [[ -n "$SAVED_SECRET_PROVIDER_LINES" ]]; then
+		printf '%s\n' "$SAVED_SECRET_PROVIDER_LINES"
+	fi
+}
+
+# node_setting_answer prints what node.json keeps for a setting: the answer,
+# not what install.sh derived from it. A detected address or the default S3
+# endpoint is left empty, so the next run derives it afresh.
+node_setting_answer() {
+	case "$1" in
+	PUBLIC_HOST)
+		[[ "$PUBLIC_HOST_DETECTED" == "true" ]] && return 0
+		;;
+	CADDY_STORAGE_S3_ENDPOINT)
+		[[ "$CADDY_STORAGE_S3_ENDPOINT" == "s3.${CADDY_STORAGE_S3_REGION}.amazonaws.com" ]] && return 0
+		;;
+	INGRESS_PROXY_ROUTING)
+		[[ "$INGRESS_PROXY_ROUTING_AUTO" == "true" ]] && return 0
+		;;
+	esac
+	printf '%s' "${!1}"
+}
+
+# write_node_settings saves this run's settings to node.json, mode 0600 (it
+# names the key store and buckets the node uses). It is replaced in one
+# rename, so a run that dies mid-write leaves the old file.
+write_node_settings() {
+	local dir entry var flag kind key value tmp
+	dir="$(dirname "$NODE_SETTINGS_FILE")"
+	mkdir -p "$dir"
+	tmp="$(mktemp "$dir/.node.json.XXXXXX")"
+	{
+		printf '{\n  "format": 1'
+		for entry in "${NODE_SETTINGS[@]}"; do
+			IFS=: read -r var flag kind <<<"$entry"
+			key="${flag#--}"
+			key="${key//-/_}"
+			value="$(node_setting_answer "$var")"
+			if [[ "$kind" == bool ]]; then
+				[[ "$value" == "true" ]] || value="false"
+			elif [[ "$kind" == auto ]]; then
+				[[ "$value" == "true" || "$value" == "false" ]] || value='"auto"'
+			else
+				value="$(json_string "$value" "$flag")" || {
+					rm -f "$tmp"
+					exit 1
+				}
+			fi
+			printf ',\n  "%s": %s' "$key" "$value"
+		done
+		printf '\n}\n'
+	} >"$tmp"
+	chmod 0600 "$tmp"
+	mv -f "$tmp" "$NODE_SETTINGS_FILE"
 }
 
 # install_cli installs the aerolvm agent CLI alone
@@ -912,7 +1304,137 @@ install_cli() {
 	echo "Add it to an MCP client: aerolvm mcp config claude-code"
 }
 
+# join_cluster_version asks the join server which build a new node installs
+# (plans/kubectl-style-cluster-ops.md §6.5): GET /v1/join/cluster-info.
+# TLS is not checked yet; the answer is, with a key only the token derives
+# (HKDF, then HMAC over the CA and over the version and join URLs), so a man
+# in the middle can't pick the build. Prints the version; fails with a
+# message on any refusal. Without python3 it prints nothing and warns.
+join_cluster_version() {
+	if ! command -v python3 >/dev/null 2>&1; then
+		echo "python3 not found: installing $VERSION without asking the cluster which version it runs" >&2
+		return 0
+	fi
+	python3 - "$1" "$2" <<'PY'
+import base64, hashlib, hmac, json, re, ssl, sys, urllib.error, urllib.parse, urllib.request
+url, token = sys.argv[1].strip(), sys.argv[2].strip()
+m = re.fullmatch(r"([a-z0-9]{6})\.([a-z0-9]{32})", token)
+if not m:
+    sys.exit("the join token must look like <6 chars>.<32 chars>, lowercase letters and digits")
+tid, secret = m.group(1), m.group(2)
+if "://" not in url:
+    url = "https://" + url
+u = urllib.parse.urlsplit(url)
+if u.scheme != "https" or not u.hostname:
+    sys.exit("the join URL %s must be https://<server>:7003" % url)
+host = u.netloc if u.port else u.netloc + ":7003"
+ctx = ssl._create_unverified_context()  # trust comes from the MACs below
+try:
+    with urllib.request.urlopen("https://%s/v1/join/cluster-info?token_id=%s" % (host, tid), context=ctx, timeout=20) as r:
+        info = json.load(r)
+except urllib.error.HTTPError as e:
+    sys.exit("the join server refused the token (%d): %s; make a new one with: aerolvm join-command" % (e.code, e.read().decode(errors="replace").strip()))
+except Exception as e:
+    sys.exit("can't reach the join server %s: %s; open TCP 7003 to the servers" % (host, e))
+def mac(key, msg):
+    return hmac.new(key, msg, hashlib.sha256).digest()
+key = mac(mac(("aerolvm-join:" + tid).encode(), secret.encode()), b"aerolvm join discovery v1\x01")
+ca = info.get("ca_cert") or ""
+signed = "\n".join(["aerolvm-cluster-info-v1", ca, info.get("cluster_id") or "", info.get("version") or "", ",".join(info.get("join_urls") or [])])
+try:
+    ok = hmac.compare_digest(mac(key, ca.encode()), base64.b64decode(info.get("mac") or "")) and \
+        hmac.compare_digest(mac(key, signed.encode()), base64.b64decode(info.get("info_mac") or ""))
+except Exception:
+    ok = False
+if not ok:
+    sys.exit("the join server could not prove it knows the token: a wrong token, or not this cluster")
+print(info.get("version") or "")
+PY
+}
+
+# resolve_join_version sets VERSION to the cluster's build for `join`,
+# unless the operator chose one (--version or --sandboxd-url).
+resolve_join_version() {
+	local url="" token="" arg prev=""
+	for arg in ${NODE_COMMAND_ARGS[@]+"${NODE_COMMAND_ARGS[@]}"}; do
+		case "$arg" in
+			--token=*) token="${arg#--token=}"; prev=""; continue ;;
+			-*) ;;
+			*)
+				if [[ "$prev" == "--token" ]]; then
+					token="$arg"
+				elif [[ -z "$url" && "$prev" != -* ]]; then
+					url="$arg"
+				fi
+				;;
+		esac
+		prev="$arg"
+	done
+	if [[ -z "$url" || -z "$token" ]]; then
+		echo "join needs the join URL and a token: install.sh join https://<server>:7003 --token <id.secret> (aerolvm join-command prints the whole line)" >&2
+		exit 1
+	fi
+	if [[ "$PRINT_JOIN_VERSION" != "true" ]] && { [[ -n "$SANDBOXD_URL" ]] || flag_given --version; }; then
+		return 0
+	fi
+	local want
+	want="$(join_cluster_version "$url" "$token")" || exit 1
+	if [[ "$PRINT_JOIN_VERSION" == "true" ]]; then
+		echo "$want"
+		exit 0
+	fi
+	[[ -n "$want" ]] || return 0
+	if [[ ! "$want" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.+-][0-9A-Za-z.-]+)?$ ]]; then
+		echo "the cluster runs $want, which is not a release this installer can download; pass --sandboxd-url, --toolboxd-url and --checksums-url for that build (before the word join)" >&2
+		exit 1
+	fi
+	VERSION="$want"
+	echo "The cluster runs $want; installing that version."
+}
+
+# check_node_command refuses init and join where they can't work, before
+# anything on the machine changes.
+check_node_command() {
+	if [[ "$CLI_ONLY" == "true" || "$LOCAL_MODE" == "true" || "$CONFIG_ONLY" == "true" ]]; then
+		echo "$NODE_COMMAND sets up a cluster node; it does not work with --cli-only, --local or --config-only" >&2
+		exit 1
+	fi
+	if [[ "$NODE_COMMAND" == "join" ]]; then
+		resolve_join_version
+	fi
+	if [[ "$(uname -s)" != "Linux" ]]; then
+		echo "$NODE_COMMAND sets up a Linux cluster node; this is $(uname -s)" >&2
+		exit 1
+	fi
+	# sandboxd init and join start sandboxd once the cluster's config and
+	# keys are in place. Booted before that, as a lone node, it would make
+	# a server key of its own.
+	NO_START="true"
+}
+
+# run_node_command hands over to sandboxd init or join with the arguments
+# after the word. A release older than the command can't run it.
+run_node_command() {
+	local bin="$INSTALL_PREFIX/sandboxd"
+	if ! "$bin" version -o json 2>/dev/null | grep -q "\"$NODE_COMMAND\""; then
+		echo "the sandboxd installed here ($("$bin" version 2>/dev/null | head -n1)) has no 'sandboxd $NODE_COMMAND'; install a newer release" >&2
+		exit 1
+	fi
+	echo "Running sandboxd $NODE_COMMAND"
+	exec "$bin" "$NODE_COMMAND" ${NODE_COMMAND_ARGS[@]+"${NODE_COMMAND_ARGS[@]}"}
+}
+
 while [[ $# -gt 0 ]]; do
+	# init and join end the installer's options: everything after the word
+	# belongs to sandboxd, so it is never parsed here.
+	if [[ "$1" == "init" || "$1" == "join" ]]; then
+		NODE_COMMAND="$1"
+		shift
+		NODE_COMMAND_ARGS=("$@")
+		break
+	fi
+	# Every arm shifts its value away, so $1 here is always a flag.
+	GIVEN_FLAGS+="$1 "
 	case "$1" in
 		--domain)
 			DOMAIN="$2"
@@ -1104,9 +1626,17 @@ while [[ $# -gt 0 ]]; do
 			NO_START="true"
 			shift
 			;;
+		--config-only)
+			CONFIG_ONLY="true"
+			shift
+			;;
 		--secret-provider-env)
 			SECRET_PROVIDER_ENV="$2"
 			shift 2
+			;;
+		--print-join-version)
+			PRINT_JOIN_VERSION="true"
+			shift
 			;;
 		--help)
 			usage
@@ -1119,6 +1649,37 @@ while [[ $# -gt 0 ]]; do
 			;;
 	esac
 done
+
+# Before any check, so saved settings are checked exactly like flags. A
+# --cli-only run installs no node and must not pick up a node's settings.
+if [[ "$CLI_ONLY" != "true" ]]; then
+	load_saved_node_settings
+fi
+
+if [[ "$PRINT_JOIN_VERSION" == "true" && "$NODE_COMMAND" != "join" ]]; then
+	echo "--print-join-version goes with join: install.sh --print-join-version join <url> --token <id.secret>" >&2
+	exit 1
+fi
+if [[ -n "$NODE_COMMAND" ]]; then
+	check_node_command
+fi
+
+# --config-only re-renders a node that exists: it never makes a PAT, and with
+# nothing saved there is nothing to re-render.
+if [[ "$CONFIG_ONLY" == "true" ]]; then
+	if [[ "$CLI_ONLY" == "true" || "$(uname -s)" != "Linux" ]]; then
+		echo "--config-only re-renders a Linux node's configuration; it does not work with --cli-only or on $(uname -s)" >&2
+		exit 1
+	fi
+	if [[ ! -f "$NODE_SETTINGS_FILE" && ! -f "$SANDBOXD_ENV_FILE" ]]; then
+		echo "--config-only re-renders an installed node, and this one has neither $NODE_SETTINGS_FILE nor $SANDBOXD_ENV_FILE. Run install.sh without it first." >&2
+		exit 1
+	fi
+	if [[ -z "$PAT_TOKEN" ]]; then
+		echo "--config-only found no SB_PAT_TOKEN in $SANDBOXD_ENV_FILE and never makes a new one: every client holds the old one. Pass --pat-token." >&2
+		exit 1
+	fi
+fi
 
 # Firecracker is a runtime for a server node: --cli-only installs no daemon,
 # and --local is the Docker-only developer install (macOS has no KVM at all).
@@ -1164,12 +1725,15 @@ case "$KEY_CUSTODY" in
 			echo "--key-custody wrapped is not supported with --local" >&2
 			exit 1
 		fi
-		if [[ -z "$SECRET_PROVIDER_ENV" || ! -f "$SECRET_PROVIDER_ENV" ]]; then
+		# A re-run may leave --secret-provider-env out: the settings are then
+		# the ones the last run wrote to sandboxd.env.
+		if [[ -n "$SECRET_PROVIDER_ENV" && ! -f "$SECRET_PROVIDER_ENV" ]] ||
+			[[ -z "$SECRET_PROVIDER_ENV" && -z "$SAVED_SECRET_PROVIDER_LINES" ]]; then
 			echo "--key-custody wrapped needs --secret-provider-env <file> with SB_SECRET_PROVIDER and its settings" >&2
 			exit 1
 		fi
-		if ! grep -Eq '^SB_SECRET_PROVIDER=(awskms|vault|pkcs11)$' "$SECRET_PROVIDER_ENV"; then
-			echo "$SECRET_PROVIDER_ENV must set SB_SECRET_PROVIDER to awskms, vault or pkcs11" >&2
+		if ! grep -Eq '^SB_SECRET_PROVIDER=(awskms|vault|pkcs11)$' <<<"$(secret_provider_lines)"; then
+			echo "${SECRET_PROVIDER_ENV:-$SANDBOXD_ENV_FILE} must set SB_SECRET_PROVIDER to awskms, vault or pkcs11" >&2
 			exit 1
 		fi
 		;;
@@ -1189,10 +1753,8 @@ if [[ -z "$PAT_TOKEN" ]]; then
 fi
 
 if [[ -z "$PUBLIC_HOST" ]]; then
-	# macOS hostname has no -I; under pipefail the failed pipeline would
-	# exit the script silently, so fall through to the default instead.
-	PUBLIC_HOST="$(hostname -I 2>/dev/null | awk '{print $1}' || true)"
-	PUBLIC_HOST="${PUBLIC_HOST:-127.0.0.1}"
+	PUBLIC_HOST="$(detect_public_host)"
+	PUBLIC_HOST_DETECTED="true"
 fi
 
 # Host path of the toolboxd binary bind-mounted into every sandbox.
@@ -1638,6 +2200,14 @@ install_custom_caddy() {
 				rm -rf "$prebuilt_dir"
 				exit 1
 			fi
+			# Checked against the release's checksums.txt, so the upgrader
+			# can be given its hash: it swaps Caddy, and restarts it, only
+			# when the file changed.
+			if [[ "$UPGRADER_HANDOFF" == "true" && "$CADDY_BINARY_URL_EXPLICIT" != "true" ]]; then
+				handoff_add "$tmp_binary" "$prebuilt_asset" "$prebuilt_dir/checksums.txt" caddy
+				rm -rf "$prebuilt_dir"
+				return
+			fi
 			systemctl stop caddy >/dev/null 2>&1 || true
 			install -m 0755 "$tmp_binary" "$caddy_path"
 			rm -rf "$prebuilt_dir"
@@ -1718,6 +2288,13 @@ install_binaries() {
 		download_asset "$TOOLBOXD_URL" "$tmp_dir/$toolboxd_asset"
 		verify_downloads "$tmp_dir" "$sandboxd_asset" "$toolboxd_asset"
 
+		if [[ "$UPGRADER_HANDOFF" == "true" ]]; then
+			# hand_off_to_upgrader installs them.
+			handoff_add "$tmp_dir/$sandboxd_asset" "$sandboxd_asset" "$tmp_dir/checksums.txt" sandboxd
+			handoff_add "$tmp_dir/$toolboxd_asset" "$toolboxd_asset" "$tmp_dir/checksums.txt" toolboxd
+			rm -rf "$tmp_dir"
+			return 0
+		fi
 		install -m 0755 "$tmp_dir/$sandboxd_asset" "$INSTALL_PREFIX/sandboxd"
 		install -m 0755 "$tmp_dir/$toolboxd_asset" "$TOOLBOX_BINARY_PATH"
 		rm -rf "$tmp_dir"
@@ -1873,7 +2450,7 @@ EOF
 			echo "# only wrapped by the key store below; see sandboxd key status."
 			# AWS_REGION too: the AWS KMS client needs it, and the SDK's
 			# IMDS fallback turns a missing region into an opaque timeout.
-			grep -E '^(SB_SECRET_[A-Z0-9_]+|AWS_REGION)=' "$SECRET_PROVIDER_ENV"
+			secret_provider_lines
 			echo "SB_CREDENTIAL_KEY_CUSTODY=wrapped"
 		} >> /etc/sandboxd/sandboxd.env
 	fi
@@ -2184,12 +2761,21 @@ write_route_dns_resolver() {
 		return
 	fi
 	mkdir -p /etc/systemd/network
+	local units_before
+	units_before="$({ cat /etc/systemd/network/10-aerolvm-rt.netdev /etc/systemd/network/10-aerolvm-rt.network 2>/dev/null || true; } | cksum)"
 	cat > /etc/systemd/network/10-aerolvm-rt.netdev <<'EOF'
 [NetDev]
 Name=aerolvm-rt
 Kind=dummy
 EOF
 	route_dns_network_unit > /etc/systemd/network/10-aerolvm-rt.network
+	# --config-only restarts nothing; it says when a restart is owed.
+	if [[ "$CONFIG_ONLY" == "true" ]]; then
+		if [[ "$({ cat /etc/systemd/network/10-aerolvm-rt.netdev /etc/systemd/network/10-aerolvm-rt.network 2>/dev/null || true; } | cksum)" != "$units_before" ]]; then
+			echo "Note: the aerolvm-rt network units changed; apply them with: systemctl restart systemd-networkd systemd-resolved"
+		fi
+		return
+	fi
 	systemctl restart systemd-networkd
 	systemctl restart systemd-resolved
 	local i
@@ -2248,17 +2834,19 @@ WantedBy=multi-user.target
 EOF
 }
 
-# sandboxd_config_fingerprint identifies the two files a running sandboxd
-# read when it started and install.sh rewrites: its settings file and its
-# unit. cksum, not sha256sum, because it is POSIX; it only has to notice a
-# change. On a fresh install neither file exists yet, and under pipefail a
-# failing cat would abort the install, hence the `|| true`.
+# sandboxd_config_fingerprint identifies the three files a running sandboxd
+# was started from and install.sh rewrites: its binary, its settings file
+# and its unit. The binary is in it because re-running the installer is how
+# a node is upgraded: without it, a run that only installed a new release
+# left the old one running. cksum, not sha256sum, because it is POSIX; it
+# only has to notice a change. On a fresh install no file exists yet, and
+# under pipefail a failing cat would abort the install, hence the `|| true`.
 sandboxd_config_fingerprint() {
-	{ cat "$SANDBOXD_ENV_FILE" "$SANDBOXD_UNIT_FILE" 2>/dev/null || true; } | cksum | cut -d' ' -f1-2
+	{ cat "$INSTALL_PREFIX/sandboxd" "$SANDBOXD_ENV_FILE" "$SANDBOXD_UNIT_FILE" 2>/dev/null || true; } | cksum | cut -d' ' -f1-2
 }
 
 # record_sandboxd_state notes, before any file is written, whether sandboxd
-# is running and what its settings were.
+# is running and what it was started from.
 record_sandboxd_state() {
 	SANDBOXD_WAS_ACTIVE="false"
 	if systemctl is-active --quiet sandboxd 2>/dev/null; then
@@ -2313,7 +2901,7 @@ keep_firecracker_vms_running() {
 }
 
 # restart_sandboxd_if_reconfigured restarts sandboxd when it was running
-# before this run and the run changed its settings file or unit.
+# before this run and the run changed its binary, settings file or unit.
 # `systemctl enable --now` only starts a stopped unit, so before this a
 # re-run left the old process on its old settings. Under --pat-scope host
 # that was an outage: Caddy, restarted onto the public socket, proxied to a
@@ -2325,15 +2913,135 @@ restart_sandboxd_if_reconfigured() {
 	if [[ "$SANDBOXD_WAS_ACTIVE" != "true" ]]; then
 		return 0
 	fi
+	# The upgrader restarted it onto the new binary, after this run wrote
+	# the settings and the unit.
+	if [[ "${HANDOFF_UPGRADED:-}" == "true" ]]; then
+		return 0
+	fi
 	if [[ "$(sandboxd_config_fingerprint)" == "$SANDBOXD_CONFIG_BEFORE" ]]; then
 		return 0
 	fi
-	echo "sandboxd settings changed; restarting sandboxd before Caddy"
+	echo "sandboxd binary or settings changed; restarting sandboxd before Caddy"
 	keep_firecracker_vms_running
 	systemctl restart sandboxd
 	if ! wait_for_sandboxd_ready; then
 		echo "warning: sandboxd is not answering ${SANDBOXD_HEALTH_URL} (or has not made ${PUBLIC_API_SOCKET}) ${SANDBOXD_READY_TRIES}s after its restart; starting Caddy anyway. Check: journalctl -u sandboxd" >&2
 	fi
+}
+
+# prepare_upgrader_handoff decides whether this run hands the binaries to
+# `sandboxd upgrade node` (eng D7): only when the installed sandboxd has the
+# command and the release ships a release.json its checksums.txt vouches
+# for, which names the version to pass. Anything else keeps the direct
+# install, so first installs and older nodes work as before.
+prepare_upgrader_handoff() {
+	UPGRADER_HANDOFF="false"
+	[[ "$BUILD_FROM_SOURCE" != "true" && "$(uname -s)" == "Linux" ]] || return 0
+	local bin="$INSTALL_PREFIX/sandboxd"
+	[[ -x "$bin" ]] || return 0
+	# A sandboxd from before the command takes "upgrade" as no argument at
+	# all and boots a second daemon on the live state directory, so it is
+	# only run when it carries the command's usage text.
+	grep -aqF 'usage: sandboxd upgrade node' "$bin" || return 0
+	"$bin" upgrade node --help >/dev/null 2>&1 || return 0
+	HANDOFF_DIR="$(mktemp -d)"
+	# Few retries: an older release has no release.json, and the direct
+	# install is a fine answer to that.
+	if ! curl -fsSL --retry 3 --retry-delay 2 --connect-timeout "$DOWNLOAD_CONNECT_TIMEOUT" --max-time 120 \
+		"$RELEASE_JSON_URL" -o "$HANDOFF_DIR/release.json" 2>/dev/null ||
+		! verify_downloads "$HANDOFF_DIR" release.json >/dev/null 2>&1; then
+		echo "The release has no release.json that checksums.txt vouches for; installing the binaries directly"
+		rm -rf "$HANDOFF_DIR"
+		HANDOFF_DIR=""
+		return 0
+	fi
+	HANDOFF_VERSION="$(sed -n 's/^ *"version": *"\([^"]*\)",* *$/\1/p' "$HANDOFF_DIR/release.json" | head -n1)"
+	if [[ -z "$HANDOFF_VERSION" ]]; then
+		echo "release.json names no version; installing the binaries directly"
+		rm -rf "$HANDOFF_DIR"
+		HANDOFF_DIR=""
+		return 0
+	fi
+	handoff_add "$HANDOFF_DIR/release.json" release.json "$HANDOFF_DIR/checksums.txt" release.json
+	UPGRADER_HANDOFF="true"
+	echo "The installed sandboxd has 'sandboxd upgrade node'; it will install $HANDOFF_VERSION"
+}
+
+# handoff_add puts a downloaded, checked file into HANDOFF_DIR under the name
+# the upgrader takes ($4), and notes its hash from the checksums file it was
+# checked against.
+handoff_add() {
+	local file="$1" asset="$2" sums="$3" name="$4" hash
+	hash="$(awk -v name="$asset" '$2 == name { print $1 }' "$sums" | head -n1)"
+	if [[ -z "$hash" ]]; then
+		echo "No checksum for $asset in $sums" >&2
+		exit 1
+	fi
+	if [[ "$file" != "$HANDOFF_DIR/$name" ]]; then
+		mv -f "$file" "$HANDOFF_DIR/$name"
+	fi
+	echo "$hash $name" >>"$HANDOFF_DIR/handoff.sha256"
+}
+
+# hand_off_to_upgrader runs `sandboxd upgrade node` on the files this run
+# staged. It runs after the settings and units are written and loaded, so
+# the restart it does starts the new binary on them, and it tells the
+# upgrader the host setup is applied: this run just did that. A failure is
+# put back by the upgrader and ends the run.
+hand_off_to_upgrader() {
+	[[ "$UPGRADER_HANDOFF" == "true" ]] || return 0
+	local args=() hash name out
+	while read -r hash name; do
+		[[ -n "$name" ]] && args+=(--sha256 "$name=$hash")
+	done <"$HANDOFF_DIR/handoff.sha256"
+	echo "Handing the new binaries to sandboxd upgrade node $HANDOFF_VERSION"
+	if ! out="$("$INSTALL_PREFIX/sandboxd" upgrade node "$HANDOFF_VERSION" --from "$HANDOFF_DIR" "${args[@]}" --skip-host-apply -o json)"; then
+		printf '%s\n' "$out"
+		rm -rf "$HANDOFF_DIR"
+		echo "sandboxd upgrade node failed and kept (or put back) the previous binaries; see its output above" >&2
+		exit 1
+	fi
+	printf '%s\n' "$out"
+	if grep -q '"result": "upgraded"' <<<"$out"; then
+		HANDOFF_UPGRADED="true"
+	fi
+	rm -rf "$HANDOFF_DIR"
+}
+
+# apply_config_only is --config-only: every file a full run writes from the
+# settings, and nothing else (plans/kubectl-style-cluster-ops.md §6.3 step 7).
+# It never downloads or replaces a binary, never installs a package, and
+# never starts or restarts a service; `sandboxd upgrade node`, which runs it
+# through `sandboxd host apply`, owns the binaries and every restart. So a
+# host change must keep working with the previous binary too.
+apply_config_only() {
+	# What register_isolate_runtime resolves, without its download.
+	if [[ -n "$WORKERD_PATH" ]]; then
+		WORKERD_BIN_RESOLVED="$WORKERD_PATH"
+	elif command -v workerd >/dev/null 2>&1; then
+		WORKERD_BIN_RESOLVED="$(command -v workerd)"
+	else
+		WORKERD_BIN_RESOLVED="/usr/local/bin/workerd"
+	fi
+	if [[ "$LOCAL_MODE" == "true" ]]; then
+		write_local_environment
+		write_node_settings
+		write_local_systemd_unit
+	else
+		write_environment
+		write_node_settings
+		prepare_key_custody
+		write_caddy_env
+		write_caddy_systemd_dropin
+		write_route_dns_resolver
+		write_caddyfile
+		write_systemd_unit
+	fi
+	write_egress_gateway_units
+	write_healthcheck_script
+	write_healthcheck_units
+	systemctl daemon-reload
+	echo "Configuration re-rendered from $NODE_SETTINGS_FILE; no binary or service was touched. Restart sandboxd to use it."
 }
 
 write_healthcheck_script() {
@@ -3427,6 +4135,15 @@ install_darwin_local() {
 	echo "Stop: launchctl bootout $domain/com.aerol.sandboxd"
 }
 
+if [[ "$CONFIG_ONLY" == "true" ]]; then
+	if [[ $EUID -ne 0 ]]; then
+		echo "install.sh --config-only must run as root" >&2
+		exit 1
+	fi
+	apply_config_only
+	exit 0
+fi
+
 if [[ "$LOCAL_MODE" == "true" ]]; then
 	if [[ -n "$DOMAIN" || -n "$DNS_PROVIDER" ]]; then
 		echo "--local is incompatible with --domain and --dns-provider" >&2
@@ -3440,9 +4157,12 @@ if [[ "$LOCAL_MODE" == "true" ]]; then
 		echo "install.sh must run as root (use sudo)" >&2
 		exit 1
 	fi
-	install_binaries
+	prepare_upgrader_handoff
+	# Before install_binaries, so the restart check sees a new binary too.
 	record_sandboxd_state
+	install_binaries
 	write_local_environment
+	write_node_settings
 	# This branch skips install_packages, so it installs the two parts of it
 	# a local server still needs, in the same order: the mount tools (platform
 	# volumes and external storage are mounted on the host), then Docker.
@@ -3456,6 +4176,7 @@ if [[ "$LOCAL_MODE" == "true" ]]; then
 	write_healthcheck_units
 	systemctl daemon-reload
 	systemctl enable --now aerolvm-egress-gateway.socket aerolvm-egress-gateway.service
+	hand_off_to_upgrader
 	restart_sandboxd_if_reconfigured
 	systemctl enable --now sandboxd sandboxd-healthcheck.timer
 	echo "AerolVM installed (local mode)"
@@ -3502,10 +4223,13 @@ fi
 # caddy-l4 (TCP routing for sandbox-exposed ports). DNS plugin gets folded
 # into the same build when --dns-provider is set so we make exactly one
 # trip to the Caddy build server.
+prepare_upgrader_handoff
 install_custom_caddy "$DNS_PROVIDER"
-install_binaries
+# Before install_binaries, so the restart check sees a new binary too.
 record_sandboxd_state
+install_binaries
 write_environment
+write_node_settings
 prepare_key_custody
 write_caddy_env
 write_caddy_systemd_dropin
@@ -3518,6 +4242,7 @@ write_healthcheck_units
 
 systemctl daemon-reload
 systemctl enable --now aerolvm-egress-gateway.socket aerolvm-egress-gateway.service
+hand_off_to_upgrader
 if [[ "$NO_START" == "true" ]]; then
 	# A joiner: cluster-join.sh starts sandboxd once cluster.env and the
 	# cluster's server key are in place (see --no-start).
@@ -3532,11 +4257,17 @@ else
 fi
 
 echo "AerolVM installed"
-if [[ "$NO_START" == "true" ]]; then
+if [[ -n "$NODE_COMMAND" ]]; then
+	echo "sandboxd: enabled, not started; sandboxd $NODE_COMMAND starts it"
+elif [[ "$NO_START" == "true" ]]; then
 	echo "sandboxd: enabled, not started (--no-start); cluster-join.sh starts it"
 fi
-echo "PAT token: $PAT_TOKEN"
-echo "Use header: Authorization: Bearer <PAT token>"
+# A joining node takes the cluster's PAT from its join answer, so this
+# machine's own one is never the one to use.
+if [[ "$NODE_COMMAND" != "join" ]]; then
+	echo "PAT token: $PAT_TOKEN"
+	echo "Use header: Authorization: Bearer <PAT token>"
+fi
 if [[ -n "$DOMAIN" ]]; then
 	echo "API URL: https://$DOMAIN"
 	echo "Health URL: https://$DOMAIN/health"
@@ -3559,3 +4290,8 @@ echo "  kernel never hands these out as outbound source ports — eliminates ran
 echo "  failures on ExposeTCPPort. 1000 slots = max concurrent TCP exposures per host."
 echo "systemd restart policy: always (5 second backoff, 10 restarts per 5 minutes)"
 echo "Health watchdog: sandboxd-healthcheck.timer probes the liveness socket every 30 seconds and restarts sandboxd only after 3 failed probes in a row over 90 seconds"
+
+# init or join: the host is set up; sandboxd does the rest.
+if [[ -n "$NODE_COMMAND" ]]; then
+	run_node_command
+fi

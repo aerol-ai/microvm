@@ -1,0 +1,58 @@
+# Cluster settings the module reads (config_dir). Every key below must be
+# present; the values are a plain start. The repo's own config/cluster.yml
+# documents each one in full.
+
+ingress:
+  # The public name of the API. Each sandbox gets <id>.<domain_name>. The
+  # module makes the DNS records in Cloudflare.
+  domain_name: "cluster.example.com"
+  # Let's Encrypt account email.
+  acme_email: "ops@example.com"
+  enable_custom_domains: false
+  custom_domain_txt_prefix: "_aerol-verify"
+  custom_domain_txt_value_prefix: "aerol-verify="
+
+otel:
+  metrics_enabled: false
+  metrics_endpoint: ""
+  metrics_interval: "30s"
+  traces_enabled: false
+  traces_endpoint: ""
+  traces_sample_ratio: 0.05
+  service_name: "sandboxd"
+
+image_pull:
+  max_concurrent: 4
+  failure_backoff: "30s"
+
+image_gc:
+  whitelist: []
+
+image_build_gc:
+  enabled: true
+  interval: "10m"
+  ttl: "24h"
+
+container_engine: "containerd"
+
+# A pull-through registry mirror (AOCR). Empty host: pull straight from the
+# registries.
+mirror:
+  host: ""
+  push_host: ""
+  upstreams: ""
+  snapshot_push_enabled: false
+
+auto_import:
+  enabled: false
+  hooks_url: ""
+  cluster_id: ""
+  retention_suffix: "--idle-90d"
+  request_timeout: "15s"
+  reconcile_interval: "5m"
+  max_in_flight: 4
+
+fleet_control_plane:
+  enabled: false
+  endpoint: ""
+  contract_refresh: "5m"

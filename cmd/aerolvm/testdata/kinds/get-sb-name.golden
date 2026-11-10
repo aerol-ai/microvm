@@ -1,0 +1,6 @@
+exit 0
+--- stdout
+sandbox/box
+sandbox/db
+sandbox/sb-0000000000000003
+--- stderr

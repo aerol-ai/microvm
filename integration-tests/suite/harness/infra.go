@@ -18,6 +18,9 @@ type IntegrationNode struct {
 	PrivateIP  string `json:"private_ip"`
 	InstanceID string `json:"instance_id"`
 	Spot       bool   `json:"spot"`
+	// Blank is a node Terraform left as plain Ubuntu (nodes[].blank): a
+	// machine for a case to join later, not a member yet.
+	Blank bool `json:"blank"`
 }
 
 // IntegrationTargets mirrors Terraform output integration_targets.
@@ -51,9 +54,29 @@ type IntegrationLoadBalancer struct {
 	TargetGroupARNs map[string]string `json:"target_group_arns"`
 }
 
-// LoadIntegrationTargets parses AEROL_INTEGRATION_TARGETS (JSON from run.sh).
+// LoadIntegrationTargets parses AEROL_INTEGRATION_TARGETS (JSON from run.sh)
+// and keeps the cluster's members: a blank node (nodes[].blank, plain
+// Ubuntu for a case to join later) is left out, since every case that walks
+// the nodes means the joined ones (UC-620 and UC-690 failed on a blank
+// spare-server, 2026-11-10). LoadAllIntegrationTargets keeps blank nodes.
 // Returns nil when unset — disruptive infra helpers skip in that case.
 func LoadIntegrationTargets() *IntegrationTargets {
+	all := LoadAllIntegrationTargets()
+	if all == nil {
+		return nil
+	}
+	members := *all
+	members.Nodes = nil
+	for _, n := range all.Nodes {
+		if !n.Blank {
+			members.Nodes = append(members.Nodes, n)
+		}
+	}
+	return &members
+}
+
+// LoadAllIntegrationTargets is LoadIntegrationTargets with blank nodes kept.
+func LoadAllIntegrationTargets() *IntegrationTargets {
 	raw := strings.TrimSpace(os.Getenv("AEROL_INTEGRATION_TARGETS"))
 	if raw == "" {
 		return nil

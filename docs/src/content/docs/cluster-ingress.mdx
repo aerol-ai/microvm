@@ -1,237 +1,247 @@
 ---
 title: Ingress nodes
-description: Split a large cluster into server, worker and ingress nodes, and pick the address your users connect to.
+description: Split a large cluster into server, worker and ingress nodes, and choose the address your users connect to.
 ---
 
 import { Aside } from '@astrojs/starlight/components';
 
-In a small cluster, every node does three jobs at once:
+In a small cluster, every node does three jobs at once. A large cluster gives each node one job. This page explains how to split the jobs, and how users reach your sandboxes.
 
-- **Server:** it votes on cluster decisions.
-- **Worker:** it runs sandboxes.
-- **Ingress:** it takes public traffic (traffic coming in from the internet) and sends it to the right sandbox.
+A **node** is one machine in the cluster. `sandboxd` is the AerolVM program on each node.
 
-That works up to 10 live nodes. Past that, each all-in-one node adds another voter and another full copy of the public route table. The route table is the list of which web address goes to which sandbox. So large clusters give each node one job, the same way Kubernetes splits its nodes.
+## Words to know
 
-The setting that picks a node's jobs is `SB_NODE_ROLE`. The setup scripts take it as `--role`, and Terraform as `role`. Clusters that do not set it keep working as before.
+| Word | What it means |
+|---|---|
+| **Server node** | A node that votes on cluster changes, and keeps the cluster's records. |
+| **Worker node** | A node that runs sandboxes. |
+| **Ingress node** | A node that takes web traffic from the internet. It passes each request to the worker that runs the sandbox. "Ingress" means traffic coming in. |
+| **Mixed node** | A node that does all three jobs. |
+| **Role** | The jobs a node does. The setting `SB_NODE_ROLE` sets it. |
+| **Voter** | A server or mixed node that votes on cluster changes. |
+| **Majority** | More than half of the voters. A cluster change needs a majority. |
+| **Placement map** | The record of which worker runs which sandbox. |
+| **Route table** | The list of which web address leads to which sandbox. |
+| **Load balancer** | A service that spreads connections across healthy ingress nodes. |
+| **Admin token** | The cluster's password for apps and admins. `--pat-token` and `SB_PAT_TOKEN` hold it. |
+
+## Why split the jobs
+
+A mixed node votes, runs sandboxes and takes public traffic. That works up to 10 live nodes.
+
+Every mixed node keeps a full copy of the cluster's records. It also keeps a full copy of the public route table. Past 10 live nodes, those copies cost too much. So the cluster refuses new sandboxes until each node has one job. Kubernetes splits its nodes the same way.
+
+`SB_NODE_ROLE` picks a node's jobs. The setup scripts take it as `--role`, and Terraform as `role`. A node without it is a mixed node. Any role other than `mixed` also needs `SB_ENABLE_CLUSTER=true`.
 
 ## The four roles
 
-| Role | Votes in Raft | Runs sandboxes | Holds the public route table |
+| Role | Votes | Runs sandboxes | Holds the public route table |
 |---|---|---|---|
 | `server` | Yes | No | No |
 | `worker` | No | Yes | No |
 | `ingress` | No | No | Yes |
 | `mixed` (default) | Yes | Yes | Yes |
 
-**Raft** is the method the server nodes use to agree on the cluster's shared records, such as which sandbox runs on which worker.
-
-`mixed` is the default and keeps the behavior of single servers and small clusters. Do not use it in production clusters with more than 10 live nodes.
+`mixed` is the default. It keeps one-server setups and small clusters working as they are. The cluster refuses it above 10 live nodes.
 
 ## Combine roles in a small cluster
 
-`SB_NODE_ROLE` also accepts two or three of `server`, `worker` and `ingress`, separated by commas. Use this when a small cluster needs nodes that do more than one job but not all three.
+`SB_NODE_ROLE` also takes two or three of `server`, `worker` and `ingress`, split by commas. Use this when a small cluster needs nodes with two jobs.
 
-| Value | Votes? | Runs sandboxes? | Holds route table? | When to use it |
+| Value | Votes | Runs sandboxes | Holds route table | When to use it |
 |---|---|---|---|---|
-| `worker,ingress` | No | Yes | Yes | An "edge" node. It runs sandboxes and serves their public traffic, but stays out of voting. Good for nodes you add as you grow. |
-| `server,ingress` | Yes | No | Yes | Voters that also serve public traffic but never run sandboxes. |
-| `server,worker` | Yes | Yes | No | A voter that also runs sandboxes. Like `mixed` without the ingress job, for clusters with dedicated ingress nodes. |
-| `server,worker,ingress` | Yes | Yes | Yes | The same as `mixed`. Write `mixed` instead, because it is clearer. |
+| `worker,ingress` | No | Yes | Yes | An **edge node**. It runs sandboxes and serves their public traffic. It does not vote. Good for nodes you add as you grow. |
+| `server,ingress` | Yes | No | Yes | A voter that also serves public traffic. It runs no sandboxes. |
+| `server,worker` | Yes | Yes | No | A voter that also runs sandboxes. Use it in a cluster with dedicated ingress nodes. |
+| `server,worker,ingress` | Yes | Yes | Yes | The same jobs as `mixed`. Write `mixed` instead, because it is clearer. |
 
 Rules for these values:
 
-- Single roles such as `SB_NODE_ROLE=worker` mean exactly what they always meant.
+- A single role, such as `worker`, does that one job.
 - Order does not matter. `ingress,worker` and `worker,ingress` are the same.
-- You cannot combine `mixed` with anything. `SB_NODE_ROLE=mixed,worker` stops the server at startup, because `mixed` already means all three.
-- A value without `server` (such as `worker,ingress`) cannot start a new cluster. Start the cluster from a node whose role has `server` in it, or is `mixed`.
-- Combined roles are for clusters of 10 live nodes or fewer. Above that, the cluster refuses new sandboxes until every node has a single role.
+- You cannot add anything to `mixed`. `SB_NODE_ROLE=mixed,worker` stops the node at start, because `mixed` already means all three.
+- A value without `server`, such as `worker,ingress`, cannot start a new cluster. Start the cluster on a node whose role has `server` in it, or is `mixed`.
+- Combined roles work only in clusters of 10 live nodes or fewer. Above that, the cluster refuses new sandboxes until every node has one job.
 
 ## What a split cluster looks like
 
-```text
-                    public DNS
-                        │
-                        ▼
-            cloud NLB / MetalLB VIP / DNS RR
-                        │
-            ┌───────────┼───────────┐
-            ▼           ▼           ▼
-        ingress-1  ingress-2  ingress-3        SB_NODE_ROLE=ingress
-            │           │           │          (Caddy + caddy-l4,
-            │           │           │           public route table)
-            └───────────┼───────────┘
-                        │
-            ┌───────────┼──── … ─────┐
-            ▼           ▼            ▼
-         worker-1   worker-2  …  worker-N      SB_NODE_ROLE=worker
-                                                (sandboxes)
-            ┌───────────┴────────────┐
-            ▼                        ▼
-         server-1  …  server-3                 SB_NODE_ROLE=server
-                                                (Raft voters,
-                                                 placement map)
+```mermaid
+flowchart TB
+    Users(["Your users"]) --> Front["Load balancer or DNS"]
+    Front --> Ingress["3 ingress nodes"]
+    Ingress -->|"pass request"| Workers["Worker nodes"]
+    Servers["3 server nodes"] -.->|"which worker"| Ingress
+    Workers -.->|"free space"| Servers
 ```
 
-This cluster has three servers, three ingress nodes and as many workers as you need. There are still only three voters, however many workers join. The public route table lives on the three ingress nodes, not on every worker.
+| Nodes | `SB_NODE_ROLE` | What they do |
+|---|---|---|
+| 3 ingress nodes | `ingress` | Run Caddy and `caddy-l4`. Hold the public route table. |
+| Any number of worker nodes | `worker` | Run the sandboxes. |
+| 3 server nodes | `server` | Vote. Keep the placement map. |
+
+Only the 3 server nodes vote, however many workers join. The public route table lives on the 3 ingress nodes, not on every worker.
 
 ## Pick the address users connect to
 
-Each ingress node runs Caddy, a web server that forwards traffic, with its layer-4 add-on `caddy-l4` for raw TCP and TLS (encrypted) connections. The ingress node gets the placement map from the server nodes and sets up a Caddy route for each sandbox. So it already knows where to send each request.
+Each ingress node runs **Caddy**, a web server that passes traffic on. It also runs Caddy's add-on `caddy-l4`, for raw TCP and TLS connections. **TLS** is the encryption behind `https://`. The ingress node reads the placement map from the server nodes. So it already knows where to send each request.
 
-What you choose is the address that SDKs and users connect to. Set it with `SB_INGRESS_ADVERTISE_HOST`, or `--ingress-advertise-host` on the setup scripts. Sandbox URLs from the API then use this host name. If it is empty, URLs use `SB_PUBLIC_HOST` or `SB_DOMAIN`, as on a single server.
+You choose the address that apps and users connect to. Set it with `SB_INGRESS_ADVERTISE_HOST`, or with `--ingress-advertise-host` on the setup scripts. Sandbox URLs from the API then use this host name. `sandboxd init` and `sandboxd join` set it to your domain when you do not pass it. If it is empty, URLs use `SB_PUBLIC_HOST` or `SB_DOMAIN`, as on a one-server setup.
 
-There are three common ways to put one address in front of the ingress nodes:
+Put one address in front of the ingress nodes. There are three common ways:
 
-1. **DNS round-robin.** DNS is the system that turns names into IP addresses. Point one `A` or `AAAA` record at every ingress node's public IP. It costs nothing. When an ingress node dies, some users keep trying it until their DNS cache expires.
-2. **A cloud TCP load balancer**, such as AWS NLB, GCP TCP load balancing or Cloudflare Spectrum. A load balancer spreads connections across the ingress nodes. It checks their health and stops using a dead node within seconds. The Terraform setup can create an AWS one for you: see [Put a load balancer in front](/cluster-setup/#put-a-load-balancer-in-front).
-3. **MetalLB or a BGP virtual IP**, for your own hardware. MetalLB gives a group of machines one shared IP address on your network. It does not know which sandbox lives on which worker, so it does not replace the ingress nodes. Put it in front of them.
+1. **DNS records.** **DNS** is the system that turns names into IP addresses. Add one `A` or `AAAA` record for each ingress node's public IP, all with the same name. This is called DNS round-robin. It costs nothing. When an ingress node dies, DNS still sends it its share of users. With 3 ingress nodes, that is 1 user in 3. This lasts until you delete its record, and each user's saved DNS answer expires.
+2. **A cloud TCP load balancer**, such as AWS NLB, GCP TCP load balancing or Cloudflare Spectrum. It spreads connections across the ingress nodes. It checks their health. It stops using a dead node within seconds. Terraform can make an AWS one for you. See [Add a load balancer](/cluster/aws/#step-6-add-a-load-balancer-for-production).
+3. **MetalLB or a BGP virtual IP**, for your own hardware. MetalLB gives a group of machines one shared IP address on your network. It does not know which worker runs which sandbox. So it does not replace the ingress nodes. Put it in front of them.
 
-Round-robin has one more weak spot. If the AerolVM server on an ingress node stops while Caddy keeps running, clients sent there still connect, so they never try the next record: they get `502` until it is back. A load balancer whose health check reaches the AerolVM server, not just Caddy, avoids that.
+DNS records have one more weak spot. Say `sandboxd` stops on an ingress node, but Caddy keeps running. Clients sent there still connect, so they never try the next record. They get `502` until `sandboxd` is back. A load balancer avoids this when its health check reaches `sandboxd`, not just Caddy.
 
-Outside the Terraform setup, AerolVM does not build, run or manage any of these. The ingress nodes do the routing. What sits in front of them is your choice.
+Outside Terraform, AerolVM does not build, run or manage any of these. The ingress nodes do the routing. You choose what sits in front of them.
 
 ## Pick a layout for your cluster size
 
 | Cluster size | Suggested layout |
 |---|---|
-| 10 nodes or fewer | `mixed`, or a small split. Combined roles are allowed here. |
-| 11 nodes or more | Required split: 3 or 5 `server`, any number of `worker`, and 2 to 10 dedicated `ingress` nodes behind a plain load balancer. `mixed` and combined roles are refused. |
-| About 1,000 workers | 3 or 5 `server`, 1,000 `worker`, and an ingress tier sized on its own. Up to 10 ingress nodes work behind any of the three options above. More than 10 needs a router that understands shards (see the next section). |
+| 10 nodes or fewer | `mixed` nodes, or a small split. Combined roles are allowed. |
+| 11 nodes or more | You must split. Use 3 or 5 `server` nodes and any number of `worker` nodes. Add 2 to 10 `ingress` nodes behind a plain load balancer. The cluster refuses `mixed` and combined roles. |
+| About 1,000 workers | Use 3 or 5 `server` nodes and 1,000 `worker` nodes. Size the ingress nodes on their own. Up to 10 ingress nodes work behind any of the three choices above. More than 10 needs a router that knows shards. See the next section. |
 
-Two more limits for clusters with more than 10 live nodes:
+Rules for clusters with more than 10 live nodes:
 
-- **At most 7 live `server` nodes.** Every server keeps a full copy of the placement map. Grow the worker and ingress tiers instead.
-- **Only nodes with `server` in their role ever vote.** `SB_CLUSTER_MAX_AUTO_VOTERS` (default 5) caps how many of them become voters. A node without `server`, such as `worker` or `worker,ingress`, never votes, whatever the cap.
+- **One job per node.** Each node is `server`, `worker` or `ingress`.
+- **At least one node of each job.**
+- **At most 7 live `server` nodes.** Every server node keeps a full copy of the placement map, even one that does not vote. Grow the workers and ingress nodes instead.
+- **Only nodes with `server` in their role vote.** `SB_CLUSTER_MAX_AUTO_VOTERS` (default 5) caps how many of them vote. The other server nodes keep a copy without voting. A node without `server` in its role never votes, whatever the cap.
+
+While a rule is broken, every create returns `503`.
 
 ## Run more than 10 ingress nodes
 
-A plain load balancer sends any user to any ingress node. That only works while every ingress node holds the full route table. AerolVM guarantees this for up to **10 live ingress-capable nodes** (any role with `ingress`, or `mixed`).
+A plain load balancer sends any user to any ingress node. That works only while every ingress node holds the full route table. AerolVM does this for up to **10 live ingress nodes**. That count includes every node with `ingress` in its role, and every `mixed` node.
 
-Above 10, each ingress node holds only its share of the table. The table is cut into pieces called shards. Each shard has a primary owner plus one backup, picked by a fixed formula. A plain load balancer would then send most connections to a node that has no route for them.
+Above 10, each ingress node holds only its share of the table. The table is cut into pieces called **shards**. A fixed formula gives each shard a main owner and one backup. A plain load balancer would then send most connections to a node with no route for them.
 
-The server cannot see what is in front of it. So at that size it refuses to serve public traffic until you say your router understands shards:
+The cluster cannot see what sits in front of it. So at that size, it refuses public traffic until you say your router knows shards:
 
-| Edition | More than 10 ingress nodes, and the flag is not set |
+| Edition | More than 10 ingress nodes, and the setting is off |
 |---|---|
-| Enterprise | The server does not start. The error names `SB_CLUSTER_SHARD_AWARE_INGRESS` and the route endpoint. |
-| Open source | The server logs the problem and never starts routing public traffic. `GET /health` reports `degraded` with the reason. The metric `aerolvm_cluster_topology_ok` is 0, and the `SandboxdClusterTopologyViolation` alert fires. |
+| Enterprise | `sandboxd` does not start. The error names `SB_CLUSTER_SHARD_AWARE_INGRESS` and the route lookup. |
+| Open source | `sandboxd` logs the problem. The ingress node does not route public traffic. `GET /health` reports `degraded`, with the reason. The metric `aerolvm_cluster_topology_ok` is 0. The alert `SandboxdClusterTopologyViolation` fires. |
 
-New sandboxes are refused too. Every create checks this rule, and returns `503` until the flag is set.
+New sandboxes are refused too. Every create checks this rule. It returns `503` until the setting is on.
 
-To run more than 10 ingress nodes, your router must look up the owner of each sandbox before it forwards traffic:
+To run more than 10 ingress nodes, your router must look up the owner of each sandbox first:
 
-1. Call `GET /v1/cluster/ingress-route/{id}` with the operator PAT token (the cluster's main access token), for the sandbox ID or the host name made from it.
-2. Forward to one of the returned `owners[]`, using its `data_plane_host`. The first owner is the shard's primary. The second is its backup.
-3. Cache the answer for a short time.
-4. If the lookup fails, refuse the connection. Do not send it to every ingress node.
+1. Find the sandbox for each connection. A connection names it by its ID, or by a host name made from the ID.
+2. Call `GET /v1/cluster/ingress-route/{id}` with that sandbox ID and the admin token.
+3. Forward to one of the returned `owners[]`, at its `data_plane_host`. The first owner is the shard's main owner. The second is its backup.
+4. Cache each answer for a short time only. Owners change when ingress nodes join or leave.
+5. If the lookup fails, refuse the connection. Do not send it to every ingress node.
 
-Only after that router is live, set `SB_CLUSTER_SHARD_AWARE_INGRESS=true` on every node. With Terraform, set `shard_aware_ingress = true`. Terraform refuses to plan more than 10 ingress-capable nodes without it.
+Only after that router is live, set `SB_CLUSTER_SHARD_AWARE_INGRESS=true` on every node. With Terraform, set `shard_aware_ingress = true`. Terraform refuses to plan more than 10 ingress nodes without it.
 
 <Aside type="caution">
-Never set this flag just to silence the check while a plain load balancer sits in front. The check goes quiet, and most public sandbox traffic is silently dropped. The full procedure is in the [cluster ingress topology runbook](https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/cluster-ingress-topology.md). The router's exact contract is in [the load balancer design](https://github.com/aerol-ai/microvm/blob/main/plans/data-plane-load-balancer.md).
+Never turn on this setting just to quiet the check while a plain load balancer sits in front. The check goes quiet, and most public sandbox traffic is dropped with no error. The full procedure is in the [cluster ingress topology runbook](https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/cluster-ingress-topology.md). The router's exact rules are in [the load balancer design](https://github.com/aerol-ai/microvm/blob/main/plans/data-plane-load-balancer.md).
 </Aside>
 
 ## Start a split cluster by hand
 
-Terraform does all of this for you (see [Cluster setup](/cluster-setup/)). Use these steps only when you set up machines yourself. The scripts live in the repository's `scripts/` folder. Run [`install.sh`](/getting-started/single-node-setup/) on every machine first.
+Terraform does all of this for you. See [Build it on AWS](/cluster/aws/). Use these steps only when you set up the machines yourself. They follow [Build a cluster](/cluster/create/), which explains each step in full. Only the roles differ.
 
-This example builds three servers, two workers and two ingress nodes.
+This example builds three server nodes, two workers and two ingress nodes.
 
-### Step 1: Start the cluster on the first server
+### Step 1: Start the cluster on the first server node
 
-```sh
-sudo ./cluster-init.sh \
-    --role server \
-    --ingress-advertise-host ingress.sandbox.example.com \
-    --gossip-key "$(openssl rand -base64 32)"
+```bash title="On the first server node"
+export CLOUDFLARE_API_TOKEN=your-cloudflare-token
+
+curl -fsSL https://aerolvm.aerol.ai | sudo bash -s -- \
+    --domain sandbox.example.com --pat-token your-admin-token \
+    --dns-provider cloudflare --dns-api-token "$CLOUDFLARE_API_TOKEN" \
+    init --role server --ingress-advertise-host ingress.sandbox.example.com
 ```
 
-The gossip key is a shared secret. Nodes use gossip (a light protocol for finding each other) and the key stops strangers from joining. Save the key the script prints.
-
-The script also writes two files: `aerolvm-tls-bundle.tar.gz` (the cluster's certificate authority) and `aerolvm-cred-bundle.tar.gz` (the key for sealed secrets). Copy both to every other node, for example into `/tmp`.
+Then copy `/etc/sandboxd/admin-context.json` from it to your computer. Run `aerolvm config import admin-context.json --use`. See [Build a cluster, step 7](/cluster/create/#step-7-connect-your-computer).
 
 ### Step 2: Join every other node
 
-Run this on each of the other nodes. Change `--role` to match the node: `server` on the other two servers, `worker` on each worker, `ingress` on each ingress node.
+Make one join command per machine, with its role. Make the ones for server nodes on the first server node. The cluster makes a server token only when a server node asks.
 
-```sh
-sudo ./cluster-join.sh \
-    --role worker \
-    --ingress-advertise-host ingress.sandbox.example.com \
-    --gossip-key '<key>' \
-    --peers '<seed-ip>:7001' \
-    --tls-bundle /tmp/aerolvm-tls-bundle.tar.gz \
-    --cred-bundle /tmp/aerolvm-cred-bundle.tar.gz
+```bash title="On the first server node"
+sudo sandboxd join-command --role server     # once for each other server node
 ```
 
-The first run stops early. It writes a certificate request for the node and prints where it is.
-
-### Step 3: Sign each node's certificate on the seed
-
-Copy the node's request to the seed (the first server) and sign it there:
-
-```sh
-sudo ./cluster-sign-node.sh \
-    --csr /tmp/<node-id>.csr \
-    --node-id <node-id> \
-    --out /tmp/<node-id>.crt
+```bash title="On your computer"
+aerolvm join-command --role worker     # once for each worker
+aerolvm join-command --role ingress    # once for each ingress node
 ```
 
-Copy the signed `.crt` file back to the node. Then run the same `cluster-join.sh` command again, adding `--signed-cert /tmp/node.crt`. The cluster's signing key never leaves the seed.
+Each join command carries the cluster's domain and `--ingress-advertise-host ingress.sandbox.example.com`. On each machine, set your Cloudflare token. Then paste its join command as it is:
 
-### Step 4: Point DNS at the ingress nodes
+```bash title="On each new machine"
+export CLOUDFLARE_API_TOKEN=your-cloudflare-token
 
-Point your wildcard DNS record (`*.sandbox.example.com`) at the ingress nodes, or at the load balancer in front of them. Point `ingress.sandbox.example.com` at the same place.
+# Paste this machine's join command here.
+```
 
-Sandbox URLs from the SDK then lead there. Each ingress node reads the SNI (the site name a client sends when it opens a TLS connection). It uses that name to pick the worker that owns the sandbox.
+The token decides the role. The server nodes sign each new node's node certificate, so nothing is copied between machines. `aerolvm get nodes` shows every node `Ready` when you are done.
+
+### Step 3: Send DNS to the ingress nodes
+
+Make your wildcard DNS record (`*.sandbox.example.com`) lead to the ingress nodes. If a load balancer sits in front of them, make it lead to the load balancer. Make `ingress.sandbox.example.com` lead to the same place.
+
+Sandbox URLs from the SDK then lead there. A client sends a site name when it opens an HTTPS connection. Each ingress node reads that name. It uses the name to pick the worker that runs the sandbox.
 
 ### A smaller layout with edge nodes
 
-For 10 nodes or fewer, you can skip the separate ingress tier. This layout uses three servers and five `worker,ingress` edge nodes. Start and join the servers as above. On each edge node, join with:
+For 10 nodes or fewer, you can skip the separate ingress nodes. This layout uses three server nodes and five `worker,ingress` edge nodes. Start and join the server nodes as above. For each edge node, make its join command with both jobs:
 
-```sh
-sudo ./cluster-join.sh \
-    --role worker,ingress \
-    --ingress-advertise-host ingress.sandbox.example.com \
-    --gossip-key '<key>' \
-    --peers '<seed-ip>:7001' \
-    --tls-bundle /tmp/aerolvm-tls-bundle.tar.gz \
-    --cred-bundle /tmp/aerolvm-cred-bundle.tar.gz
+```bash title="On your computer"
+aerolvm join-command --role worker,ingress
 ```
 
-Point the DNS or load balancer for `ingress.sandbox.example.com` at every edge node. Each one holds the full route table, so any of them can answer for any sandbox. Before the cluster grows past 10 live nodes, move to dedicated `worker` and `ingress` nodes.
+It makes a worker token, and the join command adds `--role worker,ingress`. Make the DNS records or load balancer for `ingress.sandbox.example.com` lead to every edge node. Each one holds the full route table, so any of them can answer for any sandbox. Before the cluster grows past 10 live nodes, move to dedicated `worker` and `ingress` nodes.
 
 ## What runs where
 
 | Part | server | worker | ingress | mixed |
 |---|---|---|---|---|
-| Votes in Raft | Yes | No | No | Yes |
-| Copy of the placement map | Yes | No | No | Yes |
+| Votes on cluster changes | Yes | No | No | Yes |
+| Keeps the cluster's records | Yes | No | No | Yes |
 | Sandboxes | No | Yes | No | Yes |
 | Caddy routes for its own sandboxes | No | Yes | No | Yes |
-| Cluster-wide public route updates | No | No | Yes | Yes |
-| caddy-l4 TLS and TCP listener | No | Yes (for its own sandboxes) | Yes (public) | Yes |
+| Public route updates for the whole cluster | No | No | Yes | Yes |
+| `caddy-l4` listener for TLS and TCP | No | Yes, for its own sandboxes | Yes, public | Yes |
 | Lifecycle checks, image cleanup, container event watcher | No | Yes | No | Yes |
 
-The placement map is the record of which sandbox lives on which worker. Only nodes with `server` in their role (or `mixed`) keep a copy and join Raft. Worker and ingress nodes do not join Raft at all. They ask the server nodes over an authenticated connection.
+Only nodes with `server` in their role, or `mixed`, keep the cluster's records and vote. Worker and ingress nodes do not. They ask the server nodes for what they need. Both sides of that connection show their node certificate first.
 
 ## When a node fails
 
-- **A worker dies.** After `SB_DEAD_OWNER_GRACE` (30 seconds by default), its normal sandboxes are marked orphaned (they have no owner). Clients get `410 Gone` and must create them again. Sandboxes created with `failover.policy="recreate"` move to a healthy worker and are rebuilt from their saved settings. See [Durability and failover](/durability/).
-- **An ingress node dies.** The load balancer stops sending traffic to it. Public URLs keep working through the other ingress nodes. Voting is not affected.
-- **An ingress node loses touch with the servers.** An ingress node keeps a copy of the placement map that it reads from the servers. This is true with `SB_INGRESS_PROXY_ROUTING` on or off. If no server has answered for half of `SB_DEAD_OWNER_GRACE` (15 seconds by default), it stops trusting that copy for sandboxes created with `failover.policy="recreate"`. Their URLs through that node return `503` ("sandbox is moving; retry") until a server answers again. This stops it from sending traffic to a worker that may no longer own the sandbox. Other sandboxes keep working, even when every server is down: when a worker fails, the servers do not start them anywhere else, so their worker is still the only place they run.
-- **A server node dies.** While a majority of the voting servers is up (the quorum), the cluster keeps making changes. Without a majority, changes pause until enough servers return.
+**A worker node dies.** The cluster waits `SB_DEAD_OWNER_GRACE` (30 seconds by default). Then:
+
+- Normal sandboxes on it become **orphaned**: no node runs them. Clients get `410 Gone`. They must create the sandbox again.
+- Sandboxes created with `failover.policy="recreate"` are rebuilt on a healthy worker, from their saved settings. They keep their ID, links and settings. They lose the files on their own disk, and the programs that were running. See [Durability and failover](/durability/).
+
+**An ingress node dies.** A load balancer stops sending traffic to it. Public URLs keep working through the other ingress nodes. Voting does not change. With DNS records alone, the dead node still gets its share of users, as explained above.
+
+**An ingress node loses contact with the server nodes.** An ingress node keeps a read-only copy of the placement map. It gets that copy from the server nodes. This is true with `SB_INGRESS_PROXY_ROUTING` on or off. Say no server node answers it for half of `SB_DEAD_OWNER_GRACE` (15 seconds by default). Then it stops trusting its copy for sandboxes with `failover.policy="recreate"`.
+
+- Their URLs through that node return `503` with `sandbox is moving; retry`. This lasts until a server node answers again. It stops the node sending traffic to the wrong worker, if the cluster moved the sandbox meanwhile.
+- Other sandboxes keep working, even when every server node is down. The cluster never moves them to another worker. So their worker is still the only place they run.
+
+**A server node dies.** While a majority of the voters is up, the cluster keeps making changes. Without a majority, changes stop until enough server nodes return. Running sandboxes keep running, but creates and deletes fail. See [Back up and recover](/cluster/backup/) if the voters do not come back.
 
 ## Limits
 
-- **Failover is opt-in per sandbox.** Raft copies each sandbox's settings, sealed passwords and exposed ports. Only sandboxes with `failover.policy="recreate"` are rebuilt after a worker dies. See [Durability and failover](/durability/).
-- **Routes on ingress nodes can lag.** Server and mixed nodes learn about changes right away. A dedicated ingress node checks again on a timer, so a new route can take up to about 5 seconds. Just after a change, you may see `503` with "Sandbox placement in flux" until the next check.
-- **No UDP.** caddy-l4 carries TCP and TLS traffic only.
+- **Failover is off unless you turn it on for a sandbox.** The server nodes keep each sandbox's settings, sealed passwords and exposed ports. Only sandboxes with `failover.policy="recreate"` are rebuilt after a worker dies. See [Durability and failover](/durability/).
+- **Routes on ingress nodes can lag.** Server and mixed nodes learn about changes right away. A dedicated ingress node checks again every 5 seconds. So a new route can take up to about 5 seconds. Just after a change, you can see `503` with `Sandbox placement in flux` until the next check.
+- **No UDP.** `caddy-l4` carries TCP and TLS traffic only.
 
 ## Next steps
 
-- [Cluster setup](/cluster-setup/): create a cluster on AWS with Terraform.
+- [How a cluster works](/cluster/how-it-works/): the three jobs, and what happens when a machine dies.
+- [Build it on AWS](/cluster/aws/): make a split cluster with Terraform.
 - [Durability and failover](/durability/): keep sandboxes alive when a worker dies.
 - [Glossary](/cluster-glossary/): every cluster setting in one place.
 - [Runbooks](/operational-runbooks/): fixes for topology alerts and outages.

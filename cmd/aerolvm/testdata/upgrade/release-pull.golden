@@ -1,0 +1,11 @@
+exit 0
+--- stdout
+wrote <dir>/x.tgz: v0.6.13, 9 files, <size> (CPU types: amd64, arm64)
+--- stderr
+aerolvm: downloading caddy_linux_amd64
+aerolvm: downloading caddy_linux_arm64
+aerolvm: downloading release.json
+aerolvm: downloading sandboxd_linux_amd64
+aerolvm: downloading sandboxd_linux_arm64
+aerolvm: downloading toolboxd_linux_amd64
+aerolvm: downloading toolboxd_linux_arm64

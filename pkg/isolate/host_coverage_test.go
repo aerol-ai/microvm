@@ -6,7 +6,6 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -215,9 +214,8 @@ func TestWaitReadyDirect(t *testing.T) {
 
 	h := &Host{cfg: HostConfig{StartTimeout: time.Second}}
 	client := unixHTTPClient(sock)
-	// Unstarted cmd: ProcessState stays nil; readiness succeeds on HTTP.
-	cmd := exec.Command("true")
-	if err := h.waitReady(context.Background(), cmd, client); err != nil {
+	// No exit: readiness succeeds on HTTP.
+	if err := h.waitReady(context.Background(), make(chan struct{}), client); err != nil {
 		t.Fatalf("waitReady: %v", err)
 	}
 }

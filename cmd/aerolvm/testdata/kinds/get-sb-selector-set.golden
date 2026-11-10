@@ -1,0 +1,5 @@
+exit 2
+--- stdout
+--- stderr
+aerolvm get: -l supports only k=v, k!=v, k and !k, not set-based terms like "app in (a,b)"
+run `aerolvm get --help` for usage

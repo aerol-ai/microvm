@@ -144,14 +144,15 @@ func (h *handlers) runImageBuildOnTarget(c cluster.Client, parent *http.Request,
 		return 0, nil, nil, err
 	}
 	req.Header.Set(clusterImageBuildRoutedHeader, "1")
-	// The caller's own credential follows; StampForward adds the
-	// forwarded marker, the selected team and the correlation id.
-	access, _ := controlplane.AccessFromContext(parent.Context())
-	cluster.StampForward(req, access)
+	// The caller's own credential follows; StampForward then adds the
+	// forwarded marker, the selected team and the correlation id, and
+	// drops a credential only this node accepts (a local tool's token).
 	cluster.SetPeerNodeIDHeader(req, c.SelfNodeID())
 	if auth := parent.Header.Get("Authorization"); auth != "" {
 		req.Header.Set("Authorization", auth)
 	}
+	access, _ := controlplane.AccessFromContext(parent.Context())
+	cluster.StampForward(req, access)
 	if ct := parent.Header.Get("Content-Type"); ct != "" {
 		req.Header.Set("Content-Type", ct)
 	}

@@ -1,0 +1,19 @@
+# One-line joins (plans/kubectl-style-cluster-ops.md §9 Phase 2 row): every
+# node joined from blank Ubuntu with `install.sh ... init|join` and a token
+# per role. The gate cases are UC-620..625; run them with
+# AEROL_TEST_RUN='TestJoinToken' to skip the rest of the catalogue.
+name: cluster-join-token
+capabilities:
+  - docker
+  - domain
+  - cluster
+  - one-line-join
+  # The tfvars set SB_CLUSTER_NODE_CERT_TTL=10m (UC-623 sees certs renew).
+  - short-node-certs
+  # nodes has a blank spare-server (UC-694 joins it as a late server).
+  - spare-server
+
+expected_members: 6
+
+# UC-621/622/624/625 delete a worker and join it again.
+disruptive: true

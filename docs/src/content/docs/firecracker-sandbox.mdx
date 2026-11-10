@@ -242,7 +242,7 @@ This sandbox gets 2 CPU cores and 1 GB of memory. It stops after 30 idle minutes
 - **No resizing yet.** Changing CPU or memory on a running Firecracker sandbox fails with `not yet implemented`. Create a new sandbox with the size you need.
 - **No GPU.** Firecracker VMs cannot use the server's GPU.
 
-On a cluster, set `with_firecracker = true` and a bare-metal `instance_type` on each worker, and add a `firecracker` block with download links for the binaries and kernel. See [Cluster setup](/cluster-setup/).
+On a cluster, set `with_firecracker = true` and a bare-metal `instance_type` on each worker, and add a `firecracker` block with download links for the binaries and kernel. See [Cluster setup](/cluster/aws/#firecracker-files-and-the-download-mirror).
 
 For how the VMs, snapshots and networking work inside, see [Firecracker architecture](/firecracker-architecture/).
 

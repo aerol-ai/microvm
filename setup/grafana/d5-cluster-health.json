@@ -66,6 +66,96 @@
       ],
       "title": "Forwarding & Placement Cache",
       "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 14 },
+      "id": 6,
+      "panels": [],
+      "title": "Rollouts",
+      "type": "row"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "description": "1 for the rollout's current state (plans/kubectl-style-cluster-ops.md §6.6). Every server reports the same value from its FSM.",
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 15 },
+      "id": 7,
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "single", "sort": "none" } },
+      "targets": [
+        { "expr": "max by (key) (aerolvm_rollout_state)", "legendFormat": "{{key}}", "refId": "A" }
+      ],
+      "title": "Rollout state",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "description": "How many nodes of the current rollout are pending, staged, upgrading, done, failed, manual or skipped.",
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 15 },
+      "id": 8,
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "single", "sort": "none" } },
+      "targets": [
+        { "expr": "max by (key) (aerolvm_rollout_nodes)", "legendFormat": "{{key}}", "refId": "A" }
+      ],
+      "title": "Nodes per state",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "description": "From the leader marking a node upgrading to the node passing the health check (§6.2).",
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 23 },
+      "id": 9,
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "single", "sort": "none" } },
+      "targets": [
+        { "expr": "sum(rate(aerolvm_node_upgrade_seconds_sum[15m])) / clamp_min(sum(rate(aerolvm_node_upgrade_seconds_count[15m])), 1e-9)", "legendFormat": "mean", "refId": "A" },
+        { "expr": "max(aerolvm_node_upgrade_last_seconds)", "legendFormat": "last node", "refId": "B" }
+      ],
+      "title": "Upgrade time per node",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "description": "Release-file copies each server serves to other nodes, capped by SB_UPGRADE_SERVE_MBPS (CEO D15). busy = past 20 copies at once; leader = the leader turning a worker away.",
+      "fieldConfig": { "defaults": { "unit": "Bps" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 23 },
+      "id": 10,
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "single", "sort": "none" } },
+      "targets": [
+        { "expr": "sum by (instance) (rate(aerolvm_upgrade_files_served_bytes_total[5m]))", "legendFormat": "{{instance}}", "refId": "A" },
+        { "expr": "sum by (key) (rate(aerolvm_upgrade_files_refused_total[5m]))", "legendFormat": "refused {{key}}", "refId": "B" }
+      ],
+      "title": "Release bytes served per server",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "description": "The active cluster version's FSM op number (§6.5), and live members below it: they get no placements, and servers stay out of Raft until upgraded.",
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 31 },
+      "id": 11,
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "single", "sort": "none" } },
+      "targets": [
+        { "expr": "max(aerolvm_active_fsm_ops_version)", "legendFormat": "active fv", "refId": "A" },
+        { "expr": "max(aerolvm_members_below_active_version)", "legendFormat": "members below it", "refId": "B" }
+      ],
+      "title": "Active cluster version",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "description": "Node steps a node refused (not_leader, stale_term, not_in_record, remote_upgrade_disabled, ...). A steady stream of not_leader or stale_term means an old leader keeps calling.",
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 31 },
+      "id": 12,
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "single", "sort": "none" } },
+      "targets": [
+        { "expr": "sum by (key) (rate(aerolvm_upgrade_step_refused_total[5m]))", "legendFormat": "{{key}}", "refId": "A" },
+        { "expr": "sum(increase(aerolvm_obsolete_servers_removed_total[1h]))", "legendFormat": "obsolete servers removed", "refId": "B" }
+      ],
+      "title": "Node step refusals",
+      "type": "timeseries"
     }
   ],
   "refresh": "10s",

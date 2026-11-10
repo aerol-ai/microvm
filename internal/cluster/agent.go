@@ -159,6 +159,17 @@ type Agent struct {
 	// identityRoles caches the role tags this worker's creates and token
 	// refreshes ask about (identity.go).
 	identityRoles identityRoleCache
+	// deny is this node's copy of the deleted-node set
+	// (agent_deny_mirror.go); denyMirrorStop ends its poll.
+	deny           agentDenyMirror
+	denyMirrorStop context.CancelFunc
+	// certRenewStop ends the node cert renewal loop (cert_renew.go).
+	certRenewStop context.CancelFunc
+	denyHits      *denyHitRecorder
+	// upgrade is the node side of a rollout step (upgrade_node.go);
+	// upgradePruneStop ends its file-store prune.
+	upgrade          *upgradeNode
+	upgradePruneStop context.CancelFunc
 
 	// feed is the placement delta feed (agent_placement_feed.go), started
 	// only with SB_INGRESS_PROXY_ROUTING. nil means the page walk.
@@ -175,6 +186,8 @@ type Agent struct {
 
 	gossip *gossipNode
 
+	// patToken is cfg.ClusterPeerPAT(): empty on a node joined without the
+	// operator PAT, which then calls peers with its cert alone.
 	patToken string
 
 	internalURL    string
@@ -252,8 +265,9 @@ func NewAgent(cfg config.Config, logger *slog.Logger, admitter *capacity.Admitte
 		nodeID:        nodeID,
 		apiURL:        cfg.SelfAPIAdvertiseURL,
 		dataPlaneHost: cfg.DataPlaneAdvertiseHost,
-		patToken:      cfg.PATToken,
+		patToken:      cfg.ClusterPeerPAT(),
 		tls:           clusterTLS,
+		denyHits:      &denyHitRecorder{logger: logger},
 	}
 
 	if clusterTLS != nil {
@@ -269,6 +283,8 @@ func NewAgent(cfg config.Config, logger *slog.Logger, admitter *capacity.Admitte
 		if err != nil {
 			return nil, fmt.Errorf("cluster.NewAgent: internal server: %w", err)
 		}
+		is.SetPeerDenyCheck(a.refuseDeniedPeer)
+		is.SetPeerKeyCheck(a.CheckPeerKey)
 		a.internalServer = is
 		a.internalURL = deriveInternalAdvertiseURL(cfg.ClusterInternalAdvertiseURL, cfg.ClusterInternalListenAddr, is.Addr())
 	}
@@ -302,6 +318,8 @@ func NewAgent(cfg config.Config, logger *slog.Logger, admitter *capacity.Admitte
 		OnLeave:        a.invalidatePeerClient,
 		PeerCacheDir:   cfg.RaftDataDir,
 		PATScope:       cfg.PATScope,
+		Denied:         a.deny.has,
+		DenyHits:       a.denyHits,
 	}, admitter, logger)
 	if err != nil {
 		if a.internalServer != nil {
@@ -323,7 +341,36 @@ func NewAgent(cfg config.Config, logger *slog.Logger, admitter *capacity.Admitte
 	// AttachRecreator probe silently skipped an Agent.
 	a.startOwnerWatcher()
 	a.startPlacementFeed()
+	a.startDenyMirror(denyMirrorInterval)
+	if clusterTLS != nil {
+		a.certRenewStop = startCertRenewer(&certRenewer{tls: clusterTLS, nodeID: nodeID, logger: logger, renew: a.renewViaServers})
+	}
+	a.startUpgradeNode()
 	return a, nil
+}
+
+// startUpgradeNode wires this worker's or ingress node's half of a
+// rollout step and the prune of its upgrade file store.
+func (a *Agent) startUpgradeNode() {
+	a.upgrade = newUpgradeNode(a.cfg, a.nodeID, false, a.logger)
+	a.upgrade.fence = a.agentFence
+	a.upgrade.servers = func() []Member { return serversForCopy(a.controlPlaneMembers(), a.nodeID, "") }
+	a.upgrade.clientFor = a.ClientForPeer
+	a.upgrade.audit = a.recordUpgradeAudit
+	ctx, cancel := context.WithCancel(context.Background())
+	a.upgradePruneStop = cancel
+	go func() {
+		t := time.NewTicker(upgradePruneEvery)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case now := <-t.C:
+				a.upgrade.pruneKeepingRollout(ctx, now)
+			}
+		}
+	}()
 }
 
 func (a *Agent) SelfNodeID() string { return a.nodeID }
@@ -1469,6 +1516,15 @@ func (a *Agent) Leader() string {
 
 func (a *Agent) Close() error {
 	var firstErr error
+	if a.certRenewStop != nil {
+		a.certRenewStop()
+	}
+	if a.denyMirrorStop != nil {
+		a.denyMirrorStop()
+	}
+	if a.upgradePruneStop != nil {
+		a.upgradePruneStop()
+	}
 	a.stopOwnerWatcher()
 	a.stopPlacementFeed()
 	if a.gossip != nil {

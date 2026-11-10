@@ -1,6 +1,9 @@
 package harness
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestIntegrationNodeForClusterID(t *testing.T) {
 	targets := &IntegrationTargets{Nodes: []IntegrationNode{{Name: "node3"}, {Name: "node13"}, {Name: "worker-x"}}}
@@ -40,5 +43,40 @@ func TestLoadIntegrationTargetsReadsTheLoadBalancer(t *testing.T) {
 	t.Setenv("AEROL_INTEGRATION_TARGETS", `{"domain":"x.example.com","api_load_balancer":null,"nodes":[]}`)
 	if got := LoadIntegrationTargets(); got == nil || got.APILoadBalancer != nil {
 		t.Fatalf("a scenario without a balancer must load api_load_balancer as nil: %+v", got)
+	}
+}
+
+// A blank node (nodes[].blank) is plain Ubuntu that has not joined. The
+// cases that walk the nodes mean the members, so LoadIntegrationTargets
+// leaves it out (UC-620 and UC-690 failed on a blank spare-server);
+// LoadAllIntegrationTargets keeps it for the cases that join it.
+func TestLoadIntegrationTargetsLeavesBlankNodesOut(t *testing.T) {
+	t.Setenv("AEROL_INTEGRATION_TARGETS", `{"domain":"x.example.com","nodes":[`+
+		`{"name":"server-1","role":"server","seed":true,"public_ip":"198.51.100.1"},`+
+		`{"name":"worker-1","role":"worker","public_ip":"198.51.100.2","blank":false},`+
+		`{"name":"spare-server","role":"server","public_ip":"198.51.100.3","blank":true}]}`)
+	names := func(tg *IntegrationTargets) []string {
+		var out []string
+		for _, n := range tg.Nodes {
+			out = append(out, n.Name)
+		}
+		return out
+	}
+	members := LoadIntegrationTargets()
+	if members == nil || strings.Join(names(members), ",") != "server-1,worker-1" || members.Domain != "x.example.com" {
+		t.Fatalf("members = %+v", members)
+	}
+	all := LoadAllIntegrationTargets()
+	if all == nil || strings.Join(names(all), ",") != "server-1,worker-1,spare-server" || !all.Nodes[2].Blank {
+		t.Fatalf("all = %+v", all)
+	}
+	// An output from before the blank field reads every node as a member.
+	t.Setenv("AEROL_INTEGRATION_TARGETS", `{"nodes":[{"name":"server-1","role":"server"}]}`)
+	if got := LoadIntegrationTargets(); got == nil || len(got.Nodes) != 1 {
+		t.Fatalf("old output = %+v", got)
+	}
+	t.Setenv("AEROL_INTEGRATION_TARGETS", "")
+	if LoadIntegrationTargets() != nil || LoadAllIntegrationTargets() != nil {
+		t.Fatal("unset targets must load as nil")
 	}
 }

@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -17,6 +18,7 @@ import (
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/config"
+	"github.com/aerol-ai/microvm/internal/nodeupgrade"
 	"github.com/aerol-ai/microvm/pkg/capacity"
 	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/google/uuid"
@@ -43,13 +45,13 @@ type Cluster struct {
 	// time in tests (stale_read.go). Always nil in production.
 	leaderContactHook func() (raft.RaftState, time.Time)
 
-	// patToken authenticates leader-forwarded raft applies. Sourced from
-	// cfg.PATToken at construction; same value every node already shares for
-	// regular API auth, so no new secret-distribution surface. With mTLS
-	// enabled the PAT is belt-and-braces — the TLS handshake already proved
-	// cluster membership — but we keep sending it so the receiving handler can
-	// stay symmetric with the public endpoint. A selected mTLS request never
-	// downgrades to the public endpoint after a TLS error.
+	// patToken is the bearer this node's own peer calls carry:
+	// cfg.ClusterPeerPAT(), the operator PAT when the node holds it. A node
+	// joined without it sends none and peers know it by its cert alone
+	// (peer_cert_auth.go). The TLS handshake proves membership either way;
+	// a node with the PAT keeps sending it so older peers still accept it.
+	// A selected mTLS request never downgrades to the public endpoint after
+	// a TLS error. The join service also hands it to the servers it joins.
 	patToken string
 	// internalURL is this node's cluster-internal mTLS advertise URL.
 	internalURL string
@@ -163,6 +165,25 @@ type Cluster struct {
 	// makes, so tests can move a placement or revive the node between the
 	// read and the write. Always nil in production.
 	evictDeadOwnerStepHook func(step evictDeadOwnerStep, sandboxID string)
+	// denyHits counts and logs refusals of deleted nodes (gossip_deny.go).
+	denyHits *denyHitRecorder
+
+	// Join service (join.go): the CA signer from the CA store, the join
+	// listener and the port it advertises, the dial-back dialer (tests swap
+	// it; nil is net.Dialer) and the cert renewal loop.
+	ca                caSigner
+	joinServer        *joinServer
+	joinAdvertisePort int
+	joinDial          dialFunc
+	certRenewStop     context.CancelFunc
+
+	// Rollouts (rollout*.go, upgrade_*.go): the node side of an upgrade
+	// step, the release-file server, the leader's driver and its loop.
+	upgrade     *upgradeNode
+	files       *upgradeFileServer
+	driver      *rolloutDriver
+	rolloutStop context.CancelFunc
+	rolloutWake chan struct{}
 }
 
 // New constructs the server-role Cluster for cfg.EnableCluster=true. Caller
@@ -234,10 +255,11 @@ func New(cfg config.Config, logger *slog.Logger, admitter *capacity.Admitter) (*
 		dataPlaneHost: cfg.DataPlaneAdvertiseHost,
 		fsm:           fsm,
 		raft:          rn,
-		patToken:      cfg.PATToken,
+		patToken:      cfg.ClusterPeerPAT(),
 		commitTimeout: commitTimeout,
 		deadOwners:    newDeadOwnerTracker(),
 		tls:           clusterTLS,
+		denyHits:      &denyHitRecorder{logger: logger},
 	}
 	// Not caught up from the first instant anything can read the FSM; the
 	// loop that clears it starts at the end of New (startCatchUpWatch).
@@ -260,6 +282,10 @@ func New(cfg config.Config, logger *slog.Logger, admitter *capacity.Admitter) (*
 			return nil, fmt.Errorf("cluster.New: internal server: %w", err)
 		}
 		is.SetReadIndexHandler(c.LeaderReadIndex)
+		// The FSM exists before the listener, so a deleted node is refused
+		// from the first request, boot window included.
+		is.SetPeerDenyCheck(c.refuseDeniedPeer)
+		is.SetPeerKeyCheck(c.CheckPeerKey)
 		c.internalServer = is
 		c.internalURL = deriveInternalAdvertiseURL(cfg.ClusterInternalAdvertiseURL, cfg.ClusterInternalListenAddr, is.Addr())
 	}
@@ -305,6 +331,8 @@ func New(cfg config.Config, logger *slog.Logger, admitter *capacity.Admitter) (*
 		OnLeave:        c.invalidatePeerClient,
 		PeerCacheDir:   cfg.RaftDataDir,
 		PATScope:       cfg.PATScope,
+		Denied:         fsm.isNodeDenied,
+		DenyHits:       c.denyHits,
 	}, admitter, logger)
 	if err != nil {
 		if c.internalServer != nil {
@@ -357,7 +385,71 @@ func New(cfg config.Config, logger *slog.Logger, admitter *capacity.Admitter) (*
 	// so the loop's first read index finds gossip and the internal client.
 	c.startCatchUpWatch()
 
+	c.startJoinService()
+	c.startRollouts()
+
 	return c, nil
+}
+
+// startRollouts wires the upgrade node, the release-file server and the
+// rollout driver, and starts their loop. Nothing here is on the sandbox
+// boot path: the loop's first tick is rolloutTickEvery after start.
+func (c *Cluster) startRollouts() {
+	c.upgrade = newUpgradeNode(c.cfg, c.nodeID, true, c.logger)
+	c.upgrade.fence = func(ctx context.Context, rolloutID string) (UpgradeFence, error) {
+		return c.serverFence(ctx, rolloutID, c.nodeID)
+	}
+	c.upgrade.servers = func() []Member { return serversForCopy(c.LocalMembers(), c.nodeID, c.Leader()) }
+	c.upgrade.clientFor = c.ClientForPeer
+	c.upgrade.appliedIndex = c.fsm.currentVersion
+	c.upgrade.audit = c.recordUpgradeAudit
+	c.files = newUpgradeFileServer(c.cfg.UpgradeServeMBPS, func() (nodeupgrade.Paths, error) { return c.upgrade.paths() }, c.leaderRefusesCopy)
+	c.driver = newRolloutDriver(clusterRolloutHost{c: c}, clusterNodeClient{c: c}, c.logger)
+	c.rolloutWake = make(chan struct{}, 1)
+	rolloutMetricsSource.Store(c.fsm)
+	activeVersionSource.Store(c)
+	c.startRolloutLoop()
+}
+
+// recordUpgradeAudit hands an upgrade record to the service's audit
+// writer, when one is attached (AttachRecreator).
+func (c *Cluster) recordUpgradeAudit(ev UpgradeAuditEvent) {
+	if rec, ok := c.currentRecreator().(UpgradeAuditRecorder); ok {
+		rec.RecordClusterUpgrade(ev)
+	}
+}
+
+// startJoinService loads the CA store, opens the join listener (servers
+// only, when SB_CLUSTER_JOIN_LISTEN_ADDR resolved to an address) and starts
+// cert renewal. None of it is on the sandbox boot path, and none of it can
+// fail the daemon's start: a cluster that can't join new nodes still serves
+// the ones it has, so problems are logged loudly instead.
+func (c *Cluster) startJoinService() {
+	joinTokenSource.Store(c.fsm)
+	if ca, err := LoadClusterCA(c.cfg.ClusterCADir); err != nil {
+		c.logger.Error("cluster: CA store unreadable; joins and renewals signed here are off until it is fixed", "dir", c.cfg.ClusterCADir, "err", err)
+	} else if ca != nil {
+		if id := c.clusterID(); id != "" && CACertHash(ca.Certificate()) != id {
+			c.logger.Error("cluster: the CA store holds another cluster's CA; not signing with it", "dir", c.cfg.ClusterCADir)
+		} else {
+			c.ca.set(ca)
+		}
+	}
+	if c.tls == nil {
+		return
+	}
+	if addr := c.cfg.ClusterJoinListenAddr; addr != "" {
+		js, err := startJoinServer(addr, c.tls, c, c.recordJoinAudit, c.logger)
+		if err != nil {
+			c.logger.Error("cluster: join listener did not start; one-line joins land on other servers only", "addr", addr, "err", err)
+		} else {
+			c.joinServer = js
+			if tcp, ok := js.listener.Addr().(*net.TCPAddr); ok {
+				c.joinAdvertisePort = tcp.Port
+			}
+		}
+	}
+	c.certRenewStop = startCertRenewer(&certRenewer{tls: c.tls, nodeID: c.nodeID, logger: c.logger, renew: c.renewViaServers})
 }
 
 func (c *Cluster) SelfNodeID() string { return c.nodeID }
@@ -1519,6 +1611,24 @@ func (c *Cluster) ApplyEncoded(ctx context.Context, payload []byte) error {
 	if err := validateCommandLifecycle(cmd); err != nil {
 		return err
 	}
+	if cmd.Op == opDenyNode {
+		// Only this leader's node-delete path writes a deny record, after
+		// its upgrade gate (writeNodeDeny). A peer's raw forward could carry
+		// the op past that gate, or deny another node outright.
+		return errDenyNodeNotForwardable
+	}
+	if isJoinOp(cmd.Op) {
+		// Join state is proposed only by a server's join path (join.go),
+		// after its token, role and upgrade checks; a raw forward from any
+		// peer could admit a key as a server, or skip the gate.
+		return errJoinOpNotForwardable
+	}
+	if isRolloutOp(cmd.Op) {
+		// The active version and the rollout are proposed only by this
+		// leader's rollout code, after its upgrade gate and the transition
+		// tables; a raw forward could move a rollout past both.
+		return errRolloutOpNotForwardable
+	}
 	if isRawObligationReport(cmd) {
 		c.obligations.add(cmd.ObligationReports)
 		return nil
@@ -2054,6 +2164,17 @@ func (c *Cluster) LeaderAPIURL() string {
 // Close shuts down gossip + raft. Idempotent.
 func (c *Cluster) Close() error {
 	var firstErr error
+	if c.certRenewStop != nil {
+		c.certRenewStop()
+	}
+	if c.rolloutStop != nil {
+		c.rolloutStop()
+	}
+	if c.joinServer != nil {
+		if err := c.joinServer.Close(); err != nil {
+			firstErr = fmt.Errorf("cluster: join server close: %w", err)
+		}
+	}
 	if c.voterReconcileStop != nil {
 		c.voterReconcileStop()
 	}
@@ -2076,7 +2197,7 @@ func (c *Cluster) Close() error {
 		c.catchUpStop()
 	}
 	if c.gossip != nil {
-		if err := c.gossip.Close(); err != nil {
+		if err := c.gossip.Close(); err != nil && firstErr == nil {
 			firstErr = fmt.Errorf("cluster: gossip close: %w", err)
 		}
 	}

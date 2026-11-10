@@ -194,33 +194,7 @@ func (c *Cluster) SweepExpiredAPITokens(ctx context.Context, cutoff time.Time) (
 	return swept, nil
 }
 
-// raftServersSupport is the rolling-upgrade gate: every server in the Raft
-// configuration, failed ones included, must report an FSM op set of at
-// least min. A failed server counts at its last-known gossip meta because
-// it replays the log when it returns; one with no gossip entry at all
-// counts as an old build. A half-upgraded cluster answers ErrClusterVersion
-// instead of committing an op some replica would skip.
-func (c *Cluster) raftServersSupport(min int, feature string) error {
-	future := c.raft.raft.GetConfiguration()
-	if err := future.Error(); err != nil {
-		return fmt.Errorf("cluster: read raft configuration: %w", err)
-	}
-	for _, srv := range future.Configuration().Servers {
-		id := string(srv.ID)
-		v := 0
-		if id == c.nodeID {
-			v = fsmOpsVersion
-		} else if c.gossip != nil {
-			if m, ok := c.gossip.lookupMember(id); ok {
-				v = m.FSMOpsVersion
-			}
-		}
-		if v < min {
-			return fmt.Errorf("%w: server %s reports FSM ops version %d, %s need %d", ErrClusterVersion, id, v, feature, min)
-		}
-	}
-	return nil
-}
+// raftServersSupport, the rolling-upgrade gate, lives in active_version.go.
 
 // forwardToLeaderJSON posts in to the leader's internal endpoint path and
 // decodes its 200 body into out: one hop, with this node's PAT over mTLS

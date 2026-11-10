@@ -142,6 +142,45 @@ func goMetricLiterals(t *testing.T, root string) map[string]bool {
 	return out
 }
 
+// TestClusterJoinAlertRules lints the join and cert-renewal alerts
+// (plans/kubectl-style-cluster-ops.md §10.1): both exist, are complete, and
+// every aerolvm_ metric they query is registered in the Go tree.
+func TestClusterJoinAlertRules(t *testing.T) {
+	root := repoRoot(t)
+	raw, err := os.ReadFile(filepath.Join(root, "setup", "prometheus", "sandboxd-alerts.yml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var rules ruleFile
+	if err := yaml.Unmarshal(raw, &rules); err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]bool{"SandboxdClusterCertRenewalFailing": false, "SandboxdClusterJoinsFailing": false}
+	metrics := goMetricLiterals(t, root)
+	metric := regexp.MustCompile(`aerolvm_[a-z0-9_]+`)
+	for _, g := range rules.Groups {
+		for _, r := range g.Rules {
+			if _, ok := want[r.Alert]; !ok {
+				continue
+			}
+			want[r.Alert] = true
+			if r.Expr == "" || r.For == "" || r.Labels["severity"] == "" || r.Annotations["summary"] == "" || r.Annotations["description"] == "" || r.Annotations["runbook_url"] == "" {
+				t.Fatalf("%s is incomplete: %+v", r.Alert, r)
+			}
+			for _, m := range metric.FindAllString(r.Expr, -1) {
+				if !metrics[m] {
+					t.Fatalf("%s queries %s, which no Go code registers", r.Alert, m)
+				}
+			}
+		}
+	}
+	for name, seen := range want {
+		if !seen {
+			t.Fatalf("alert %s missing", name)
+		}
+	}
+}
+
 // TestKeyCustodyAlertRules lints the key-custody alert group
 // (plans/customer-key-custody.md Section 8): the four alerts exist with
 // their severities, every rule is complete, every metric it queries is

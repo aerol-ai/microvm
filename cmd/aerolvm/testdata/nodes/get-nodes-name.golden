@@ -1,0 +1,7 @@
+exit 0
+--- stdout
+node/old-1
+node/srv-a
+node/wkr-1
+node/wkr-2
+--- stderr

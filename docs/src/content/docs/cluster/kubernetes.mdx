@@ -1,0 +1,72 @@
+---
+title: Coming from Kubernetes
+description: Kubernetes ideas and commands, next to their AerolVM match, and the few things that work differently.
+---
+
+If you have run a Kubernetes cluster with `kubeadm` and `kubectl`, most of an AerolVM cluster will feel familiar. This page maps what you know. If you have never used Kubernetes, you can skip it.
+
+`sandboxd` is the AerolVM program on each node. `aerolvm` is the command-line tool on your computer.
+
+## Ideas
+
+| Kubernetes | AerolVM | Notes |
+|---|---|---|
+| Cluster | Cluster | A group of machines that work as one. |
+| Node | Node | One machine in the cluster. |
+| Control plane node | Server node | Votes on cluster changes, and keeps the records. |
+| etcd | The server nodes' own records | Built into `sandboxd`. There is no separate database to run. |
+| Worker node | Worker node | Runs the sandboxes. |
+| Ingress controller | Ingress node | Takes web traffic, and passes it to the right worker. |
+| A node with both jobs | Mixed node | Can vote, runs sandboxes and takes traffic. Good for up to 10 nodes. |
+| Pod | Sandbox | One isolated place where code runs. |
+| kubelet | `sandboxd` | Runs on every node. |
+| Bootstrap token | Join token | A short secret that lets one machine join. |
+| kubeconfig context | Context | A saved login in `aerolvm`. |
+| Node labels and `nodeSelector` | Node labels and placement | See [Choose where a sandbox runs](/engineering-placement-failover/#choose-where-a-sandbox-runs). |
+| Cordoned node | Cordoned node | Takes no new sandboxes. |
+
+## Commands
+
+| Kubernetes | AerolVM |
+|---|---|
+| `kubeadm init` on the first control plane node | The installer with `init`, on node 1 |
+| `kubeadm token create --print-join-command` | `aerolvm join-command`, on your computer. Or `sudo sandboxd join-command`, on a server node. |
+| `kubeadm join ... --discovery-token-ca-cert-hash sha256:...` | The printed join command, which carries `--ca-cert-hash sha256:...` |
+| `kubeadm join ... --control-plane` | A join command made with `--role server` or `--role mixed` |
+| Copy `/etc/kubernetes/admin.conf` to `~/.kube/config` | Copy `/etc/sandboxd/admin-context.json`, then `aerolvm config import` |
+| `kubectl config get-contexts`, `use-context` | `aerolvm config get-contexts`, `use-context` |
+| `kubectl get nodes` | `aerolvm get nodes` |
+| `kubectl describe node` | `aerolvm describe node` |
+| `kubectl top nodes` | `aerolvm top nodes` |
+| `kubectl cluster-info` | `aerolvm cluster-info` |
+| `kubectl cordon`, `uncordon` | `aerolvm cordon`, `uncordon` |
+| `kubectl drain` | `aerolvm drain` (see the difference below) |
+| `kubectl delete node` | `aerolvm delete node` |
+| `kubeadm reset` | `sudo sandboxd reset --yes` |
+| `kubeadm upgrade plan` | `aerolvm upgrade plan` |
+| `kubeadm upgrade apply`, then `kubeadm upgrade node` on every node | One `aerolvm upgrade apply`, for every node |
+| `etcdctl snapshot save` | `sudo sandboxd backup` |
+| `etcdctl snapshot restore` | `sudo sandboxd restore` |
+| `kubectl get pods` | `aerolvm get sandboxes` |
+| `kubectl exec -it` | `aerolvm exec -it` |
+
+## What you do not need
+
+- **No YAML.** You create sandboxes from your code, with an SDK, or with `aerolvm create`.
+- **No network plugin.** Networking between nodes is built in. You open ports `7000` to `7003` on a private network. See [Keep it safe](/cluster/security/#keep-the-private-ports-private).
+- **No separate database.** The server nodes keep their own records. You still [back them up](/cluster/backup/).
+- **One install per node.** The installer sets up `sandboxd`, and the web server in front of it, in one command.
+
+## What works differently
+
+- **`drain` does not move sandboxes.** `kubectl drain` evicts pods, and their controllers start new ones elsewhere. A sandbox has no controller. `aerolvm drain` stops new sandboxes from starting on the node, then waits until it runs none. Add `--delete-sandboxes` to delete them. To move sandboxes, turn on [failover](/cluster/#your-code-does-not-change) when you create them. Then `aerolvm delete node` rebuilds them on other nodes.
+- **A rebuilt sandbox starts fresh.** Failover keeps a sandbox's ID, links and settings. It loses the files on its own disk, like a pod without a volume.
+- **One upgrade command does the whole cluster.** `aerolvm upgrade apply` upgrades every node in order: server nodes, then ingress nodes, then workers in batches. A node whose upgrade fails goes back to its old version, and the upgrade stops.
+- **`finalize` has no Kubernetes match.** A normal `apply` finalizes by itself at the end, and then `rollback` no longer works. With `--hold`, the upgrade waits for `aerolvm upgrade finalize`, and `rollback` works until then. See [Upgrade](/cluster/upgrade/#keep-new-features-off-until-you-are-sure).
+- **Workers do not hold the admin token.** A worker or ingress node keeps only a fingerprint of it.
+- **Only a server node makes a server token.** Does your cluster address lead to an ingress node? Then run `sudo sandboxd join-command --role server` on a server node.
+
+## Next steps
+
+- [Build a cluster](/cluster/create/): three mixed nodes, step by step.
+- [Command cheat sheet](/cluster/cheat-sheet/): every cluster command on one page.

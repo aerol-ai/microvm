@@ -1,0 +1,5 @@
+exit 2
+--- stdout
+--- stderr
+aerolvm describe: expected one sandbox name
+run `aerolvm describe --help` for usage

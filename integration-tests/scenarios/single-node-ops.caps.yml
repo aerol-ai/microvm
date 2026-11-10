@@ -1,0 +1,33 @@
+# single-node-ops: a copy of single-node under its own name, because the
+# harness keys Terraform state by scenario name and other sessions run
+# single-node at the same time. The ops-tools cases (UC-680, UC-681) run here.
+# Capabilities the single-node scenario can satisfy. The suite skips any use
+# case whose required capabilities aren't all present here.
+name: single-node-ops
+capabilities:
+  - docker
+  - platform-volumes
+  - domain
+  # custom-domains advertises that the AddCustomDomain API is enabled
+  # (single-node.tfvars sets enable_custom_domains=true and the Terraform
+  # bootstrap injects SB_ENABLE_CUSTOM_DOMAINS), so the feature is live here.
+  - custom-domains
+  # Hostname egress filtering (plans/egress-domain-filtering.md P1-10): install.sh
+  # starts the aerolvm-egress-gateway units and SB_EGRESS_FQDN_ENABLED defaults
+  # on, so UC-180..182 run here.
+  - egress-fqdn
+  # Identity and access (T12): SB_IDENTITY_ENABLED=true (avm_ tokens) and
+  # SB_IDENTITY_FILE at the path the suite installs the test issuer to.
+  - identity
+  - identity-oidc
+  # identity_issuer_enabled=true: the node is an OIDC issuer for sandbox
+  # cloud identities (UC-431..437).
+  - cloud-identity
+  # SB_MCP_ENABLED=true, for UC-286's OAuth connector flow.
+  - remote-mcp
+  # NOTE: UC-35/36 additionally require external-dns-zone, which this scenario
+  # does NOT advertise. A real custom domain must live OUTSIDE the base domain
+  # (the API rejects hosts under the wildcard) and prove ownership via a TXT
+  # record, which needs a second DNS zone the harness controls. We only control
+  # the leased base zone, so UC-35/36 skip here rather than fail. Add
+  # external-dns-zone + export AEROL_CUSTOM_DOMAIN to enable them.

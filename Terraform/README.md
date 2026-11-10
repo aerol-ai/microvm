@@ -1,19 +1,121 @@
 # AerolVM cluster on AWS - Terraform
 
-Spawns a complete AerolVM cluster on EC2 in one `scripts/terraform.sh apply`:
+This folder is a Terraform **module**. It builds a whole AerolVM cluster on
+EC2 in one `terraform apply`:
 
 - a VPC + public subnet + IGW + security group with the cluster-internal
-  ports (`7000/TCP`, `7001/TCP+UDP`, `7002/TCP`) and public ingress
-  (`80`, `443`) wired per the rules in
-  [`../docs/src/content/docs/cluster-setup-step-by-step.mdx`](../docs/src/content/docs/cluster-setup-step-by-step.mdx),
+  ports (`7000/TCP`, `7001/TCP+UDP`, `7002/TCP`, and `7003/TCP` to servers
+  for joins) and public ingress (`80`, `443`),
 - N EC2 instances, each sized + roled independently
   (`server`, `worker`, `ingress`, `worker,ingress`, `server,worker`,
   `server,ingress`, or `mixed`),
-- an S3 bucket the seed uses to hand its gossip key + TLS bundle to joiners,
-- IAM instance profiles that grant only what each role needs on that bucket,
+- one join token per role, so every node joins with one line (below),
 - Cloudflare `A` + wildcard `A` records pointing at every ingress-bearing
   node's public IP, or, with `api_load_balancer = "nlb"`, at a health-checked
   Network Load Balancer in front of them (see "Load balancer" below).
+
+There are two ways to run it:
+
+| You have | Use | Where |
+|---|---|---|
+| No copy of the repo (most people) | The module **by URL**, from your own root module | [`examples/from-url/`](./examples/from-url/main.tf) |
+| A checkout of this repo | `scripts/terraform.sh`, which runs [`root/`](./root/) | `config/` at the repo root |
+
+## Use the module by URL
+
+You need no clone. Copy [`examples/from-url/`](./examples/from-url/) into
+an empty folder, then:
+
+```bash
+cp config/secrets.example.yml config/secrets.yml
+# edit config/cluster.yml (your domain) and config/secrets.yml (PAT, Cloudflare token)
+terraform init
+terraform apply -var 'admin_allowed_cidrs=["203.0.113.0/24"]' -var ssh_key_name=my-key
+```
+
+The module block in that example is:
+
+```hcl
+module "aerolvm" {
+  source = "git::https://github.com/aerol-ai/microvm//Terraform?ref=v0.7.0"
+
+  cluster_name        = "aerolvm"
+  config_dir          = "${path.module}/config"
+  admin_allowed_cidrs = ["203.0.113.0/24"]
+  ssh_key_name        = "my-key"
+
+  nodes = {
+    server-1 = { role = "server", seed = true }
+    server-2 = { role = "server" }
+    server-3 = { role = "server" }
+    worker-1 = { role = "worker", instance_type = "c6i.xlarge" }
+  }
+}
+```
+
+Your root module configures the `aws` and `cloudflare` providers (the
+module does not, so it works with `count` and `for_each`) and picks the
+state backend. Every variable in [`variables.tf`](./variables.tf) can be set
+in the module block. Pin `ref` to a release tag. Upgrade the software on a
+running cluster with `aerolvm upgrade apply`, not by moving `ref`: a new
+`ref` may change user data, and new user data replaces the machines.
+
+### How nodes join
+
+By default (`one_line_join = true`) the module makes one join token per
+role, shaped `<6>.<32>` of `[a-z0-9]`:
+
+- The seed runs the installer with `init` and registers all three tokens:
+  `--token worker=<t>:0 --token ingress=<t>:0 --token server=<t>:24h`.
+- Every other node waits for the seed's join port (7003), then runs the
+  installer with `join https://<seed>:7003 --token <its role's token>`.
+- The worker and ingress tokens never expire, so a worker added to `nodes`
+  weeks later still joins. The server token lasts 24 hours, as a kubeadm
+  token does. For a server added later, make a fresh token on a server
+  with `sudo sandboxd join-command --role server --ttl 2h --json` (a server
+  token can only be made through a server, not through the ingress) and set
+  it for that node only in `node_join_tokens` (`{ srv4 = "<token>" }`); no
+  other node's user data changes. Keep the entry after the node joins,
+  since removing it replaces that node.
+- A node whose token the join port keeps refusing (expired, revoked or
+  mistyped) stops waiting after 5 minutes, and its boot log names these
+  steps, instead of waiting out `seed_wait_max_seconds`.
+
+Nothing is copied between nodes: the servers sign every node's certificate.
+
+**Keep the state safe.** The join tokens are in the Terraform state and in
+user data, like the admin PAT. A join token can make a node, and a node
+receives the cluster's admin PAT and keys. Treat the state like the PAT: an
+encrypted backend with tight access.
+
+`one_line_join = false` is the old way (an S3 bundle hand-off and a
+certificate-signing loop on the seed, through `cluster-init.sh` and
+`cluster-join.sh`). It is deprecated, prints a warning on every plan, and
+goes away when those scripts leave the release. A cluster with no domain
+still needs it: `install.sh --local` never joins.
+
+## From a checkout of this repo
+
+`scripts/terraform.sh` runs [`root/`](./root/), a root module that calls
+this module by path. It keeps this checkout's S3 backend, passes every
+variable through, and forwards every output under the same name, so
+`config/terraform.tfvars` works as before.
+
+**Already have a cluster built from a checkout?** Run
+`scripts/terraform.sh init` once (the working folder moved to
+`Terraform/root`), then `scripts/terraform.sh plan`. The moved blocks in
+[`root/moved.tf`](./root/moved.tf) move every resource into
+`module.aerolvm`; the plan shows `has moved to` lines and nothing to
+destroy. `root/` keeps `one_line_join = false` as its default, because your
+nodes were built with the old join and changing it replaces every node.
+For a **new** cluster from a checkout, set `one_line_join = true` in
+`config/terraform.tfvars`.
+
+**Moving to the module by URL** from a checkout cluster: copy
+`root/moved.tf` next to your module block (rename `module.aerolvm` if you
+named it differently), use the same backend and state key, and set
+`one_line_join = false` in the module block. Plan first and check that
+nothing is destroyed.
 
 ## Prereqs
 
@@ -27,7 +129,7 @@ Spawns a complete AerolVM cluster on EC2 in one `scripts/terraform.sh apply`:
   `ssh_key_name` to reuse an existing EC2 keypair instead)
 - A shared `SB_PAT_TOKEN` value - the same string is installed on every node
 
-## Quick start
+## Quick start from a checkout
 
 All cluster configuration lives under `config/` at the repo root. From the
 repo root:
@@ -44,10 +146,10 @@ scripts/terraform.sh apply
 ```
 
 > **Always invoke via `scripts/terraform.sh`**, not bare `terraform`. The
-> wrapper runs `terraform -chdir=Terraform` with
-> `-var-file=../config/terraform.tfvars`. Running `terraform` directly from
-> `Terraform/` will silently skip the tfvars file (which no longer sits on
-> Terraform's auto-load path) and produce an incomplete plan.
+> wrapper runs `terraform -chdir=Terraform/root` with
+> `-var-file=<repo>/config/terraform.tfvars`. Running `terraform` directly
+> will silently skip the tfvars file (which is not on Terraform's auto-load
+> path) and produce an incomplete plan.
 
 ### Where each value lives
 
@@ -71,13 +173,12 @@ with:
 ssh ubuntu@<public-ip> sudo tail -f /var/log/aerolvm-bootstrap.log
 ```
 
-Once joiners finish (`[bootstrap] complete`), confirm membership from any
-node:
+Once joiners finish (`[bootstrap] complete`), list the nodes from your
+laptop with the `aerolvm` CLI:
 
 ```bash
-ssh ubuntu@<any-ip> \
-  curl -s -H "Authorization: Bearer $SB_PAT_TOKEN" \
-       http://127.0.0.1:21212/v1/cluster/members | jq .
+aerolvm login https://<domain_name>
+aerolvm get nodes
 ```
 
 ## Configuring nodes
@@ -148,11 +249,12 @@ node); `terraform plan` refuses a larger tier without it because the daemon
 would refuse to boot it. Do not set it with a plain LB in front - see
 `setup/runbooks/cluster-ingress-topology.md`.
 
-### Role rules (validated at plan time, mirrors `cluster-init.sh` / `cluster-join.sh`)
+### Role rules (validated at plan time, mirrors `sandboxd init` / `sandboxd join`)
 
 - Each comma token must be in `{server, worker, ingress, mixed}`.
 - `mixed` (shorthand for `server,worker,ingress`) cannot be combined with other tokens.
-- The seed node's role must contain `server` or equal `mixed` - `cluster-init.sh` refuses to bootstrap from a pure `worker` / `ingress` / `worker,ingress` node.
+- The seed node's role must contain `server` or equal `mixed` - `sandboxd init` refuses to start a cluster from a pure `worker` / `ingress` / `worker,ingress` node.
+- A node's join token is its role's: any role with `server` (or `mixed`) is a server; else `worker` beats `ingress`.
 
 ## How bootstrap works
 
@@ -171,15 +273,20 @@ phases:
    (the real client address through Caddy). If `domain_name` is
    empty the DNS-01 args are dropped and install.sh falls back to IP/path mode
    with no TLS.
-2. **Seed only - `cluster-init.sh`** with `--role <seed-role>
-   --ingress-advertise-host <domain_name> --gossip-key <generated>
-   --tls-bundle-out /tmp/aerolvm-tls-bundle.tar.gz`. The seed then uploads
-   `gossip-key.txt` + `aerolvm-tls-bundle.tar.gz` to the per-cluster S3 bucket.
-3. **Every other node - `cluster-join.sh`** polls the S3 bucket
-   (`seed_wait_max_seconds`, default 30 min), downloads both artifacts, then
-   runs `cluster-join.sh --role <its-role> --ingress-advertise-host
-   <domain_name> --gossip-key <…> --peers <seed-private-ip>:7001 --tls-bundle
-   /tmp/aerolvm-tls-bundle.tar.gz`.
+2. **Seed only - `install.sh ... init`**, which runs `sandboxd init --role
+   <seed-role> --node-id <name> --ingress-advertise-host <domain_name>`
+   with the three join tokens (see "How nodes join" above). `sandboxd init`
+   makes the cluster CA, the gossip key and the server key and starts Raft.
+3. **Every other node - `install.sh ... join`**: it waits for the seed's
+   join port (`seed_wait_max_seconds`, default 30 min), then runs
+   `sandboxd join https://<seed-private-ip>:7003 --token <its token>
+   --node-id <name> --role <its-role>`, up to three tries (a join is safe to
+   run again). Its token is its `node_join_tokens` entry if it has one, else
+   the module's token for its role. Once the port answers, a token it keeps
+   refusing for 5 minutes stops the wait with what to do.
+   With `one_line_join = false` (deprecated) steps 2 and 3 are the old
+   `cluster-init.sh` / `cluster-join.sh` pair, with an S3 bucket hand-off
+   and a signing loop on the seed.
 4. **Operational env** is appended to `/etc/sandboxd/cluster.env` on every
    node: OTEL metrics settings and image-pull storm controls. The bootstrap
    then restarts sandboxd once so those env vars are active immediately.
@@ -372,12 +479,14 @@ target groups and the raw-TCP host.
 | File                        | Purpose                                   |
 |-----------------------------|-------------------------------------------|
 | `versions.tf`               | Required providers + Terraform version    |
-| `providers.tf`              | AWS + Cloudflare provider config          |
 | `variables.tf`              | Every knob, with defaults                 |
+| `join.tf`                   | `one_line_join` and the join token per role |
 | `locals.tf`                 | Node normalisation + ingress derivation   |
 | `network.tf`                | VPC, subnet, IGW, SG rules, AMI lookup    |
 | `iam.tf`                    | Bundle S3 bucket + seed/joiner profiles   |
 | `nodes.tf`                  | Seed `aws_instance` + joiner `for_each`   |
+| `root/`                     | The root a checkout runs: backend, providers, the module call, every variable and output passed through, `moved.tf` |
+| `examples/from-url/`        | A root that uses the module by URL        |
 | `dns.tf`                    | Cloudflare A + wildcard records           |
 | `load_balancer.tf`          | Optional NLB in front of ingress (`api_load_balancer`) |
 | `outputs.tf`                | Node summary, ingress IPs, SSH help       |
@@ -556,7 +665,8 @@ warrant it. The full default set lives in `variables.tf`.
 ## Tear-down
 
 ```bash
-scripts/terraform.sh destroy
+scripts/terraform.sh destroy     # from a checkout
+terraform destroy                # from your own root (module by URL)
 ```
 
 This deletes the VPC, instances, security group, IAM profiles, S3 bundle

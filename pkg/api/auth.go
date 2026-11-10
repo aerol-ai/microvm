@@ -20,6 +20,7 @@ import (
 	"strings"
 
 	"github.com/aerol-ai/microvm/internal/cluster"
+	"github.com/aerol-ai/microvm/internal/config"
 	"github.com/aerol-ai/microvm/pkg/api/apihttp"
 	apie2b "github.com/aerol-ai/microvm/pkg/api/e2b"
 	"github.com/aerol-ai/microvm/pkg/api/remotemcp"
@@ -134,7 +135,8 @@ func (s *Server) sandboxTokenAuth() sandboxTokenAuthenticator {
 
 // patAuth is the server's PAT authenticator.
 func (s *Server) patAuth() patAuthenticator {
-	return patAuthenticator{token: s.patToken, previous: s.patTokenPrevious, hostOnly: s.patScopeHost, trustClientIP: s.l4ProxyProtocol}
+	return patAuthenticator{token: s.patToken, previous: s.patTokenPrevious, sha256: s.patSHA256, local: s.localToken,
+		hostOnly: s.patScopeHost, trustClientIP: s.l4ProxyProtocol}
 }
 
 // patAuthenticator recognises the operator token (PAT).
@@ -143,6 +145,15 @@ type patAuthenticator struct {
 	// previous is SB_PAT_TOKEN_PREVIOUS: during a rolling rotation the old
 	// token keeps working on every node until it is removed (§5.11, H2).
 	previous string
+	// sha256 is SB_PAT_TOKEN_SHA256: the PAT's hashes on a node that was
+	// joined without it (config/pat_verifier.go). A bearer whose hash is
+	// listed is the PAT, with every rule below.
+	sha256 []string
+	// local is this node's own SB_PAT_TOKEN on such a node: not the PAT,
+	// and accepted only from a local tool (localCaller), never from a peer
+	// or through Caddy. It lets the node's own tools and its SSH gateway
+	// act as the operator on this node and nowhere else.
+	local string
 	// hostOnly is SB_PAT_SCOPE=host: the PAT is accepted only from a
 	// loopback TCP peer and from mTLS cluster peers (CEO review D4).
 	hostOnly bool
@@ -161,7 +172,38 @@ func (p patAuthenticator) matches(candidate string) bool {
 	}
 	current := p.token != "" && subtle.ConstantTimeCompare([]byte(candidate), []byte(p.token)) == 1
 	previous := p.previous != "" && subtle.ConstantTimeCompare([]byte(candidate), []byte(p.previous)) == 1
-	return current || previous
+	hashed := len(p.sha256) > 0 && config.PATMatchesSHA256(candidate, p.sha256)
+	return current || previous || hashed
+}
+
+// matchesLocal reports whether candidate is this node's local token, in
+// constant time.
+func (p patAuthenticator) matchesLocal(candidate string) bool {
+	return candidate != "" && p.local != "" && subtle.ConstantTimeCompare([]byte(candidate), []byte(p.local)) == 1
+}
+
+// errLocalToken refuses this node's local token from anywhere but a local
+// tool. The 401 keeps the surface's own text: the caller learns nothing.
+var errLocalToken = errors.New("node-local token refused: not a local caller")
+
+// localCaller reports whether r comes from a tool on this host talking to
+// sandboxd directly: a loopback TCP peer, not the public socket, not a
+// cluster peer, not a forward, and without the headers Caddy adds to every
+// request it proxies (X-Forwarded-For and X-Forwarded-Host, and
+// X-AerolVM-Client-IP with the PROXY protocol). Under the default PAT scope
+// Caddy reaches sandboxd over loopback too, so loopback alone would let a
+// public request through; the token is the secret, this only keeps it on
+// the host.
+func localCaller(r *http.Request) bool {
+	if requestOrigin(r, false) != originHost || isForwarded(r) {
+		return false
+	}
+	for _, h := range []string{"X-Forwarded-For", "X-Forwarded-Host", headerClientIPKey} {
+		if r.Header.Get(h) != "" {
+			return false
+		}
+	}
+	return true
 }
 
 // Authenticate splits the PAT into its two principals (§5.1). A cluster peer
@@ -178,6 +220,12 @@ func (p patAuthenticator) matches(candidate string) bool {
 // runs this release (the runbook's order). Under the default scope "any"
 // nothing here changes (L8).
 func (p patAuthenticator) Authenticate(r *http.Request, bearer string) (controlplane.Access, bool, error) {
+	if p.matchesLocal(bearer) {
+		if !localCaller(r) {
+			return controlplane.Access{}, true, errLocalToken
+		}
+		return controlplane.OperatorAccess(), true, nil
+	}
 	if !p.matches(bearer) {
 		return controlplane.Access{}, false, nil
 	}
@@ -245,6 +293,13 @@ func (s *Server) authenticate(r *http.Request, bearer string) (controlplane.Acce
 		return access, nil
 	}
 	if bearer == "" {
+		if access, ok := nodeCertAccess(r); ok {
+			access, err := runPostMatchSteps(r, access)
+			if err != nil {
+				return controlplane.Access{}, mapAuthFailure(string(controlplane.PrincipalNode), err)
+			}
+			return access, nil
+		}
 		return controlplane.Access{}, &authFailure{status: http.StatusUnauthorized, kind: authKindNone, reason: "missing"}
 	}
 	for _, link := range s.authLinks() {
@@ -286,6 +341,28 @@ func runPostMatchSteps(r *http.Request, access controlplane.Access) (controlplan
 		}
 	}
 	return access, nil
+}
+
+// nodeCertAccess is a cluster peer calling with its node cert and no bearer
+// (internal/cluster/peer_cert_auth.go): a node joined without the operator
+// PAT calls its peers this way. It is node:<peer>, the same principal a peer
+// sending the PAT over mTLS gets. The internal listener's mark says the
+// peer passed the live-member, deny and admitted-key checks; the verified
+// cert must name the same node. A forward counts only when the edge said it
+// speaks for the call itself (a local tool's request, cluster.HeaderCaller):
+// a forward that merely lost the user's credential stays a 401.
+func nodeCertAccess(r *http.Request) (controlplane.Access, bool) {
+	peer, ok := cluster.InternalPeerFromContext(r.Context())
+	if !ok {
+		return controlplane.Access{}, false
+	}
+	if cert, ok := mtlsPeer(r); !ok || cert != peer {
+		return controlplane.Access{}, false
+	}
+	if isForwarded(r) && r.Header.Get(cluster.HeaderCaller) != cluster.CallerNode {
+		return controlplane.Access{}, false
+	}
+	return controlplane.NodeAccess(peer), true
 }
 
 // isForwarded reports whether a peer reverse-proxied this request on a
@@ -543,6 +620,8 @@ func mapAuthFailure(linkKind string, err error) *authFailure {
 		return &authFailure{status: http.StatusUnauthorized, kind: linkKind, reason: "pat_scope", message: patScopeMessage}
 	case errors.Is(err, errPATOrigin):
 		return &authFailure{status: http.StatusUnauthorized, kind: linkKind, reason: "pat_origin", message: patScopeMessage}
+	case errors.Is(err, errLocalToken):
+		return &authFailure{status: http.StatusUnauthorized, kind: linkKind, reason: "local_only"}
 	case errors.Is(err, errBadTeamHeader):
 		return &authFailure{status: http.StatusBadRequest, kind: linkKind, reason: "bad_team", message: err.Error()}
 	case errors.As(err, &notBound):
@@ -639,7 +718,8 @@ func (s *Server) isPATToken(candidate string) bool {
 // plus three error writers (H5).
 func (s *Server) withAuth(surface authSurface, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		access, failure := s.authenticate(r, surface.credential(s, r))
+		credential := surface.credential(s, r)
+		access, failure := s.authenticate(r, credential)
 		s.observeAuth(r, access, failure)
 		if failure != nil {
 			challenge := ""
@@ -664,6 +744,12 @@ func (s *Server) withAuth(surface authSurface, next http.Handler) http.Handler {
 			// the client's headers) a public PAT would pass as the host.
 			if _, inner, _ := remotemcp.Handoff(r.Context()); !inner {
 				ctx = cluster.ContextWithPATOrigin(ctx, patOrigin(r, s.l4ProxyProtocol))
+				if s.patAuth().matchesLocal(credential) {
+					// No peer knows this node's local token: a forward of
+					// this request goes as this node instead
+					// (cluster.StampForward).
+					ctx = cluster.ContextWithLocalCaller(ctx)
+				}
 			}
 		}
 		next.ServeHTTP(w, r.WithContext(withCorrelationID(ctx, r)))

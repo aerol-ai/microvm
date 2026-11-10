@@ -8,7 +8,6 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"syscall"
@@ -561,18 +560,19 @@ func TestHostNilObserverAndWaitReadyExit(t *testing.T) {
 	none.SetEgressObserver(func(string, string, string) {})
 	none.observeEgress("sb", "tcp", "example.com:443")
 
-	truePath, err := exec.LookPath("true")
-	if err != nil {
-		t.Skip("no `true` binary on PATH")
-	}
-	cmd := exec.Command(truePath)
-	if err := cmd.Run(); err != nil {
-		t.Fatal(err)
-	}
-	h := &Host{cfg: HostConfig{StartTimeout: 5 * time.Second}}
+	// A workerd that has exited ends the wait at once, with its exit status,
+	// instead of costing the whole start timeout.
+	exited := make(chan struct{})
+	close(exited)
+	h := &Host{cfg: HostConfig{StartTimeout: 5 * time.Second}, exitErr: errors.New("exit status 1")}
 	client := unixHTTPClient(filepath.Join(t.TempDir(), "absent.sock"))
-	if err := h.waitReady(context.Background(), cmd, client); err == nil || !strings.Contains(err.Error(), "exited") {
-		t.Fatalf("waitReady = %v, want exited", err)
+	start := time.Now()
+	err := h.waitReady(context.Background(), exited, client)
+	if err == nil || !strings.Contains(err.Error(), "exited") || !strings.Contains(err.Error(), "exit status 1") {
+		t.Fatalf("waitReady = %v, want exited with its status", err)
+	}
+	if waited := time.Since(start); waited > time.Second {
+		t.Fatalf("waitReady took %s after the exit; want it to stop at once", waited)
 	}
 }
 

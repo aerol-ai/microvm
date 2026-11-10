@@ -428,30 +428,29 @@ loss. Write down the old id, the new id, the time and the reason.
 **Cluster node:** the node id is also its Raft member id and the `node:<id>`
 name in its certificate, so the node leaves the cluster and joins again.
 
-1. On a surviving node, remove the old member:
+1. From your laptop, remove the old member:
 
    ```bash
-   sudo /usr/local/sbin/sandboxd-node-lifecycle.sh remove-member <old-id>
+   aerolvm delete node <old-id>
    ```
 
-   (`scripts/sandboxd-node-lifecycle.sh` in the repo; Ansible's
-   `configure-ops.yml` installs it there.) It refuses a member that is still
-   gossiped alive; add `--force` only when you are sure the old node is down.
-   Sandboxes the old node owned are gone, as with any removed member.
+   It refuses a member that still owns sandboxes and is still gossiped
+   alive; add `--force` only when you are sure the old node is down.
+   Sandboxes the old node owned are gone unless they asked for failover, as
+   with any removed member. The old id and its key are denied until a fresh
+   join.
 2. On the rebuilt host, stop sandboxd and move the old receipts aside, as in
-   step 1 above. If an old Raft data directory is still there, rejoin with
-   `--force`, which discards it.
-3. Join under the new id, with the same flags the node first joined with:
+   step 1 above. Then run `sudo sandboxd reset --yes`, which removes the old
+   cluster files, certs and Raft data.
+3. Join under the new id with a fresh token:
 
    ```bash
-   sudo ./cluster-join.sh --node-id <new-id> \
-     --gossip-key '<key>' --peers <seed>:7001 \
-     --tls-bundle <path> --cred-bundle <path>
+   aerolvm join-command --role <its role>
    ```
 
-   It writes a CSR for `node:<new-id>` and stops. Sign it on the seed with
-   `cluster-sign-node.sh --csr <csr> --node-id <new-id> --out <crt>`, then run
-   the same `cluster-join.sh` command again with `--signed-cert <crt>`.
+   Run the printed line on the host with `--node-id <new-id>` added at the
+   end. The servers sign a cert for `node:<new-id>`; nothing is copied by
+   hand.
 4. On a Terraform cluster the id is `<cluster_name>-<name>`. Add the
    replacement under a new name in `nodes` and remove the old entry, instead
    of reusing the name.

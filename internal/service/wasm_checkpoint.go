@@ -39,6 +39,7 @@ func (s *Service) DrainWasmSandboxes(ctx context.Context) error {
 		return fmt.Errorf("drain wasm: list managed: %w", err)
 	}
 
+	keeper, _ := s.wasm.(wasmShutdownKeeper)
 	eligible := make([]*models.Sandbox, 0, len(known))
 	for _, sb := range known {
 		if sb == nil || !s.isWasmSandbox(sb) {
@@ -51,6 +52,13 @@ func (s *Service) DrainWasmSandboxes(ctx context.Context) error {
 			continue
 		}
 		if _, live := managed[sb.ID]; !live {
+			continue
+		}
+		// A sandbox whose instance outlives sandboxd (or that sits on a
+		// resident host, which serves no checkpoint) stays running: the
+		// next sandboxd takes it over. Checkpointing it would tear down a
+		// worker that survives, or fail and leave it passivate_failed.
+		if keeper != nil && keeper.KeepOnShutdown(sb.ID) {
 			continue
 		}
 		eligible = append(eligible, sb)

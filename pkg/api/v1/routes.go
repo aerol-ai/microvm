@@ -9,6 +9,7 @@ import (
 	"github.com/aerol-ai/microvm/internal/service"
 	"github.com/aerol-ai/microvm/pkg/api/apihttp"
 	"github.com/aerol-ai/microvm/pkg/controlplane"
+	"github.com/aerol-ai/microvm/pkg/upgradewire"
 )
 
 // Deps holds the shared dependencies a version package needs from the
@@ -269,10 +270,50 @@ func RegisterRoutes(mux apihttp.Mux, d Deps) {
 	mux.Handle("GET "+PathPrefix+"/cluster/sandbox-index", op(http.HandlerFunc(h.clusterSandboxIndex)))
 	mux.Handle("GET "+PathPrefix+"/cluster/ingress-route/{id}", op(http.HandlerFunc(h.clusterIngressRoute)))
 	mux.Handle("POST "+PathPrefix+"/cluster/nodes/{id}/drain", op(http.HandlerFunc(h.clusterDrainNode)))
+	// cordon is drain's clear name (`aerolvm cordon`): the same admission-
+	// only mark. /drain stays for older clients and the lifecycle script.
+	mux.Handle("POST "+PathPrefix+"/cluster/nodes/{id}/cordon", op(http.HandlerFunc(h.clusterDrainNode)))
+	mux.Handle("GET "+PathPrefix+"/cluster/nodes/{id}", op(http.HandlerFunc(h.clusterGetNode)))
+	// Any role. DELETE /cluster/members/{id} keeps its servers-only answers.
+	mux.Handle("DELETE "+PathPrefix+"/cluster/nodes/{id}", op(http.HandlerFunc(h.clusterDeleteNode)))
 	mux.Handle("POST "+PathPrefix+"/cluster/nodes/{id}/uncordon", op(http.HandlerFunc(h.clusterUncordonNode)))
 	mux.Handle("POST "+PathPrefix+"/cluster/nodes/{id}/storage-retired", op(http.HandlerFunc(h.clusterRetireNodeStorage)))
 	mux.Handle("DELETE "+PathPrefix+"/cluster/nodes/{id}/storage-retired", op(http.HandlerFunc(h.clusterRevokeNodeStorageRetirement)))
 	mux.Handle("GET "+PathPrefix+"/cluster/storage-retirements", op(http.HandlerFunc(h.clusterListNodeStorageRetirements)))
+	// Single-node upgrade (plans/kubectl-style-cluster-ops.md §6.1): upload
+	// release files, start `sandboxd upgrade node`, read its progress. 409
+	// cluster_mode on a cluster; the rollout routes own upgrades there.
+	mux.Handle("POST "+upgradewire.NodeUpgradePath, op(http.HandlerFunc(h.nodeUpgradeStart)))
+	mux.Handle("GET "+upgradewire.NodeUpgradePath, op(http.HandlerFunc(h.nodeUpgradeStatus)))
+	mux.Handle("PUT "+upgradewire.NodeUpgradeFilesPath+"/{sha256}", op(http.HandlerFunc(h.nodeUpgradePutFile)))
+	mux.Handle("HEAD "+upgradewire.NodeUpgradeFilesPath+"/{sha256}", op(http.HandlerFunc(h.nodeUpgradeHeadFile)))
+	// Join service (plans/kubectl-style-cluster-ops.md §4): tokens and
+	// adopt for operators; renewal, the CA key and join writes for peers.
+	// The new machine's own calls never reach this mux: they go to the join
+	// listener (:7003) on servers.
+	mux.Handle("POST "+cluster.PublicJoinTokensPath, op(http.HandlerFunc(h.clusterCreateJoinToken)))
+	mux.Handle("GET "+cluster.PublicJoinTokensPath, op(http.HandlerFunc(h.clusterListJoinTokens)))
+	mux.Handle("DELETE "+cluster.PublicJoinTokensPath+"/{id}", op(http.HandlerFunc(h.clusterRevokeJoinToken)))
+	mux.Handle("POST "+cluster.PublicAdoptPath, op(http.HandlerFunc(h.clusterAdopt)))
+	// Cluster upgrades (plans/kubectl-style-cluster-ops.md §6,
+	// cluster_upgrade.go): the rollout for operators; the node step, the
+	// fence and release-file copies for peers.
+	mux.Handle("GET "+upgradewire.ClusterUpgradePath, op(http.HandlerFunc(h.clusterGetUpgrade)))
+	mux.Handle("POST "+upgradewire.ClusterUpgradePath, op(http.HandlerFunc(h.clusterApplyUpgrade)))
+	mux.Handle("POST "+upgradewire.ClusterUpgradeStopPath, op(h.clusterUpgradeCommand(cluster.RolloutStop)))
+	mux.Handle("POST "+upgradewire.ClusterUpgradeResumePath, op(h.clusterUpgradeCommand(cluster.RolloutResume)))
+	mux.Handle("POST "+upgradewire.ClusterUpgradeFinalizePath, op(h.clusterUpgradeCommand(cluster.RolloutFinalize)))
+	mux.Handle("POST "+upgradewire.ClusterUpgradeRollbackPath, op(h.clusterUpgradeCommand(cluster.RolloutRollback)))
+	mux.Handle("PUT "+upgradewire.ClusterUpgradeFilesPath+"/{sha256}", op(http.HandlerFunc(h.clusterUpgradeFile)))
+	mux.Handle("HEAD "+upgradewire.ClusterUpgradeFilesPath+"/{sha256}", op(http.HandlerFunc(h.clusterUpgradeFile)))
+	mux.Handle("POST "+upgradewire.ClusterLeaderTransferPath, op(http.HandlerFunc(h.clusterLeaderTransfer)))
+	mux.Handle("POST "+PathPrefix+"/cluster/nodes/{id}"+cluster.NodeUpgradeStepSuffix, internalOp(http.HandlerFunc(h.clusterNodeUpgradeStep)))
+	mux.Handle("GET "+PathPrefix+"/cluster/nodes/{id}"+cluster.NodeUpgradeStepSuffix, internalOp(http.HandlerFunc(h.clusterNodeUpgradeStatus)))
+	mux.Handle("GET "+cluster.PublicInternalUpgradeFencePath, internalOp(http.HandlerFunc(h.clusterInternalUpgradeFence)))
+	mux.Handle("GET "+cluster.PublicInternalUpgradeFilesPath+"{sha256}", internalOp(http.HandlerFunc(h.clusterInternalUpgradeFile)))
+	mux.Handle("POST "+cluster.PublicInternalJoinWritePath, internalOp(http.HandlerFunc(h.clusterInternalJoinWrite)))
+	mux.Handle("POST "+cluster.PublicInternalRenewCertPath, internalOp(http.HandlerFunc(h.clusterInternalRenewCert)))
+	mux.Handle("POST "+cluster.PublicInternalCAKeyPath, internalOp(http.HandlerFunc(h.clusterInternalCAKey)))
 	mux.Handle("POST "+cluster.PublicWasmMigratePath, op(http.HandlerFunc(h.clusterWasmMigrate)))
 	mux.Handle("GET "+cluster.PublicInternalWasmMigratePath+"{id}/export", internalOp(http.HandlerFunc(h.clusterInternalWasmMigrateExport)))
 	mux.Handle("PUT "+cluster.PublicInternalWasmMigratePath+"{id}/import", internalOp(http.HandlerFunc(h.clusterInternalWasmMigrateImport)))
@@ -309,6 +350,7 @@ func RegisterRoutes(mux apihttp.Mux, d Deps) {
 	mux.Handle("GET "+cluster.PublicInternalSnapshotNodePath, internalOp(http.HandlerFunc(h.clusterInternalSnapshotNode)))
 	mux.Handle("GET "+cluster.PublicInternalDrainStatePath+"{id}", internalOp(http.HandlerFunc(h.clusterInternalDrainState)))
 	mux.Handle("GET "+cluster.PublicInternalDrainedNodesPath, internalOp(http.HandlerFunc(h.clusterInternalDrainedNodes)))
+	mux.Handle("GET "+cluster.PublicInternalDeniedNodesPath, internalOp(http.HandlerFunc(h.clusterInternalDeniedNodes)))
 	mux.Handle("GET "+cluster.PublicInternalStorageObligationsPath, internalOp(http.HandlerFunc(h.clusterInternalStorageObligations)))
 	mux.Handle("POST "+cluster.PublicInternalSecretPath, internalOp(http.HandlerFunc(h.clusterInternalSecretPut)))
 	mux.Handle("HEAD "+cluster.PublicInternalSecretPath+"/{sandboxID}", internalOp(http.HandlerFunc(h.clusterInternalSecretHead)))
@@ -322,6 +364,14 @@ func withInternalMTLS(d Deps, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		peerID, err := cluster.AuthenticatedPeerNodeID(r)
 		if err != nil {
+			http.Error(w, err.Error(), http.StatusForbidden)
+			return
+		}
+		if peerDenied(d, peerID) {
+			http.Error(w, cluster.ErrPeerDeleted.Error(), http.StatusForbidden)
+			return
+		}
+		if err := peerKeyRefused(d, r, peerID); err != nil {
 			http.Error(w, err.Error(), http.StatusForbidden)
 			return
 		}
