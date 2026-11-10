@@ -1334,20 +1334,20 @@ func TestNodeRoleCases(t *testing.T) {
 		}
 	})
 
-	// SB_CLUSTER_OWNER_CACHE is off unless asked for: an older owner would
-	// serve or 404 a stale cache-routed forward instead of saying "not here".
-	t.Run("cluster_owner_cache_defaults_off_and_opts_in", func(t *testing.T) {
+	// SB_CLUSTER_OWNER_CACHE is on unless turned off: every supported owner
+	// answers a stale cache-routed forward with 421 "not here".
+	t.Run("cluster_owner_cache_defaults_on_and_opts_out", func(t *testing.T) {
 		setClusterDefaults(t)
 		cfg, err := Load()
 		if err != nil {
 			t.Fatalf("Load() error = %v", err)
 		}
-		if cfg.ClusterOwnerCache {
-			t.Fatal("ClusterOwnerCache = true by default")
+		if !cfg.ClusterOwnerCache {
+			t.Fatal("ClusterOwnerCache = false by default")
 		}
-		t.Setenv("SB_CLUSTER_OWNER_CACHE", "true")
-		if cfg, err = Load(); err != nil || !cfg.ClusterOwnerCache {
-			t.Fatalf("SB_CLUSTER_OWNER_CACHE=true: ClusterOwnerCache=%v err=%v", cfg.ClusterOwnerCache, err)
+		t.Setenv("SB_CLUSTER_OWNER_CACHE", "false")
+		if cfg, err = Load(); err != nil || cfg.ClusterOwnerCache {
+			t.Fatalf("SB_CLUSTER_OWNER_CACHE=false: ClusterOwnerCache=%v err=%v", cfg.ClusterOwnerCache, err)
 		}
 	})
 
