@@ -2829,6 +2829,19 @@ func (s *Store) CountDistinctSandboxOwners(ctx context.Context, max int) (int, e
 	return n, err
 }
 
+// CountLive counts this node's sandboxes that are not destroyed, from the
+// status index alone. /health reports the number, and a load balancer asks
+// every 5 s: List decodes every row and its side tables to get it.
+func (s *Store) CountLive(ctx context.Context) (int, error) {
+	var n int
+	err := s.rdb.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM sandboxes WHERE status != ?`, string(models.SandboxStatusDestroyed)).Scan(&n)
+	if err != nil {
+		return 0, fmt.Errorf("count live sandboxes: %w", err)
+	}
+	return n, nil
+}
+
 func (s *Store) List(ctx context.Context) ([]*models.Sandbox, error) {
 	rows, err := s.rdb.QueryContext(ctx, `
 		SELECT id, image, status, public_url, container_id, container_ip, cpu, memory_mb, disk_gb,

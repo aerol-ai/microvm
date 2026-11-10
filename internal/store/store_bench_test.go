@@ -375,3 +375,24 @@ func BenchmarkStoreCreateDuringListSweep(b *testing.B) {
 	lat.report(b, "create")
 	b.ReportMetric(float64(sweeps.Load())/elapsed.Seconds(), "sweeps/s")
 }
+
+// BenchmarkStoreHealthCount is what /health pays per call for its sandbox
+// count: CountLive now, and the List it replaced.
+func BenchmarkStoreHealthCount(b *testing.B) {
+	st, _ := benchOpen(b)
+	ctx := context.Background()
+	b.Run("CountLive", func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			if _, err := st.CountLive(ctx); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+	b.Run("List", func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			if _, err := st.List(ctx); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+}
