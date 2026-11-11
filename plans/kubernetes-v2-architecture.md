@@ -1418,7 +1418,7 @@ the gate below is met.**
 
 | # | Item | Why | Today (checked 2026-11-11) | Depends on | Size |
 |---|---|---|---|---|---|
-| N1 | Side-by-side benchmark: agent-sandbox with gVisor next to AerolVM's worker pod, on the same EKS cluster and machine type. Cold and warm start p50 and p99, a burst larger than the warm pool, several templates, one command's round trip, sandboxes per machine until full, etcd writes per sandbox. | Every comparison so far uses numbers from different machines: agent-sandbox on kind on a laptop, AerolVM on EC2. | Not run | S1 | M |
+| N1 | Side-by-side benchmark: agent-sandbox with gVisor next to AerolVM's worker pod, on the same EKS cluster and machine type. Cold and warm start p50 and p99, a burst larger than the warm pool, several templates, one command's round trip, sandboxes per machine until full, etcd writes per sandbox. | Every comparison so far uses numbers from different machines: agent-sandbox on kind on a laptop, AerolVM on EC2. | Done 2026-11-11 (runs `p0-n1`, `p1-n1`; §18, "Phase 0 results") | S1 | M |
 | N2 | Split `sandboxd` on the worker: an unprivileged part reads API calls, uploads and mount settings; a small privileged helper does only the network, firewall, cgroup and mount work, behind a narrow local API. | A bug in the code that reads tenant input stops being root on the machine. This is the largest security gap against agent-sandbox, whose own code never runs privileged on a machine. | `sandboxd` runs as root with no hardening on VMs (`packaging/sandboxd.service`), and mount helpers run on the host (`pkg/mounts/adapters`) | S7 and S9 results | L |
 | N3 | A read-only `kubectl get sandboxes` (list and get; namespace equals owner, D10), served by the gateways through an aggregated API before C17. Nothing is written to etcd. | The Kubernetes-native view without waiting for Phase 6. | Not built (C17 is Phase 6) | §16's aggregated-API design | M |
 | N4 | Create-policy rules in OPA (Rego), evaluated in-process at create time, with per-team rules, next to today's fixed rules. Boot-path latency is called out in its PR. | The bank's own policy language judges each sandbox, as its admission policy does for agent-sandbox pods. | `internal/createpolicy` is a fixed YAML schema, one file for every caller on a node; no Rego, OPA or CEL | — | M |
@@ -1740,12 +1740,28 @@ How to read it:
   sandbox writes about 23 objects per sandbox's life, all through etcd.
 - AerolVM's worker had 3 of the machine's 4 CPUs; agent-sandbox had the
   whole second machine.
-- Not yet measured, from N1's list: p99 (needs more than 10 samples),
-  several templates, one command's round trip, and both systems run until
-  the machine is full. The first run also lost AerolVM's burst phase to a
-  dropped `kubectl exec` stream; it was rerun by hand on the same cluster
-  (three samples above), and `n1.sh` now records a phase that prints nothing
-  instead of stopping.
+- The first run lost AerolVM's burst phase to a dropped `kubectl exec`
+  stream; it was rerun by hand on the same cluster (three samples above),
+  and `n1.sh` now records a phase that prints nothing instead of stopping.
+
+**N1, the rest** (run `p1-n1`, same setup, 2026-11-11; `n1.sh <name> rest`,
+a build of every Phase 1 PR):
+
+| | agent-sandbox | AerolVM |
+|---|---|---|
+| Cold create (50): p50 / p90 / p99 | 1,078 / 1,323 / 14,174 ms (two of 50 took 12.6 s and 14.2 s) | 232 / 328 / 358 ms |
+| `python:3.12-slim`, cold (10): p50 | 1,100 ms | 231 ms |
+| `node:22-alpine`, cold (10): p50 | 1,031 ms | 258 ms |
+| One command's round trip (20): p50 / p99 | 116 / 130 ms (`kubectl exec`) | 97 / 197 ms (the exec API) |
+| Sandboxes on one machine until the next is refused | 37: "Insufficient cpu" (Kubernetes counts each pod's 100m request) | 256: "no free slot" in the network-namespace pool |
+
+- For a plain image like this one, `kubectl exec` is how a client runs a
+  command in an agent-sandbox sandbox, so that is what was timed.
+- The two fills stop on policy, not on the machine. Kubernetes cannot place
+  more requests than the machine's CPUs. AerolVM over-provisions CPU and
+  memory 10× by default and keeps 5% of memory free; here its stop was
+  `SB_CONTAINERD_NETNS_POOL_SIZE` (256), a setting. S3 ran 1,000 sandboxes
+  in one pod on an m7i.4xlarge.
 
 **S5, machines go only when AerolVM says so: pass** (run `p0-s5`, EKS
 1.36, Karpenter 1.15.1, 2026-11-11; harness `integration-tests/k8s/s5.sh`).
