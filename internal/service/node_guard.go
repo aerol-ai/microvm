@@ -211,11 +211,16 @@ type namedRuntime struct {
 // nodeGuardRuntimes are the runtimes whose sandboxes sit on a host bridge
 // or TAP subnet, by the name the create gate uses.
 func (s *Service) nodeGuardRuntimes() []namedRuntime {
-	return []namedRuntime{
-		{models.ContainerEngineDocker, s.docker},
-		{models.ContainerEngineContainerd, s.containerd},
-		{models.RuntimeFirecracker, s.firecracker},
+	out := make([]namedRuntime, 0, 3)
+	// No Docker floor or guard on a host without Docker (C2): installing
+	// one only fails, and logs an error, on every pass.
+	if !s.cfg.DockerDisabled {
+		out = append(out, namedRuntime{models.ContainerEngineDocker, s.docker})
 	}
+	return append(out,
+		namedRuntime{models.ContainerEngineContainerd, s.containerd},
+		namedRuntime{models.RuntimeFirecracker, s.firecracker},
+	)
 }
 
 // ApplyNodeGuard installs the guard on every runtime. The daemon calls it at

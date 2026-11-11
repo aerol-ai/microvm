@@ -194,3 +194,32 @@ func TestWireContainerEngineConfiguresContainerdAOCRPullAuth(t *testing.T) {
 		})
 	}
 }
+
+// C2: without Docker, containerd is the only event source and nothing asks
+// Docker for its bridge.
+func TestDockerOffWiring(t *testing.T) {
+	driver := &fakeEventsSource{prefix: "ctd"}
+	dc := &docker.Client{}
+	on := config.Config{ContainerEngine: models.ContainerEngineContainerd}
+	off := config.Config{ContainerEngine: models.ContainerEngineContainerd, DockerDisabled: true}
+
+	if _, ok := containerdEventsSource(on, testLogger(), dc, driver).(*multiEventsSource); !ok {
+		t.Fatal("Docker on: want Docker and containerd fanned in")
+	}
+	if got := containerdEventsSource(off, testLogger(), dc, driver); got != docker.EventsSource(driver) {
+		t.Fatalf("Docker off: event source %T, want containerd's alone", got)
+	}
+	if got := containerdEventsSource(on, testLogger(), nil, driver); got != docker.EventsSource(driver) {
+		t.Fatalf("no Docker client: event source %T, want containerd's alone", got)
+	}
+
+	if dockerBridgeSource(on, dc) == nil {
+		t.Fatal("Docker on: want the Docker client as the bridge source")
+	}
+	if src := dockerBridgeSource(off, dc); src != nil {
+		t.Fatalf("Docker off: bridge source %v, want a nil interface", src)
+	}
+	if src := dockerBridgeSource(on, nil); src != nil {
+		t.Fatalf("no Docker client: bridge source %v, want a nil interface", src)
+	}
+}

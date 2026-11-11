@@ -6262,9 +6262,14 @@ func (s *Service) Health(ctx context.Context) (models.HealthStatus, error) {
 		return models.HealthStatus{}, err
 	}
 
-	dockerStatus := "ok"
-	if err := s.docker.Ping(ctx); err != nil {
-		dockerStatus = err.Error()
+	// A containerd host with no Docker (SB_DOCKER_ENABLED=false, C2) is not
+	// degraded by its absence.
+	dockerStatus := "disabled"
+	if !s.cfg.DockerDisabled {
+		dockerStatus = "ok"
+		if err := s.docker.Ping(ctx); err != nil {
+			dockerStatus = err.Error()
+		}
 	}
 
 	caddyStatus := "ok"
@@ -6346,7 +6351,7 @@ func (s *Service) Health(ctx context.Context) (models.HealthStatus, error) {
 	}
 
 	status := "ok"
-	if dockerStatus != "ok" || caddyStatus != "ok" {
+	if (!s.cfg.DockerDisabled && dockerStatus != "ok") || caddyStatus != "ok" {
 		status = "degraded"
 	}
 	if s.cfg.EnableFirecracker && firecrackerStatus != "ok" {
@@ -6679,11 +6684,21 @@ func (s *Service) Reconcile(ctx context.Context) error {
 	// F12). What this pass cannot see, it leaves alone: rows that would be
 	// matched against Docker's list, and the stale-mount sweep, which would
 	// otherwise read "not listed" as "gone".
-	dockerManaged, dockerErr := s.docker.ListManaged(ctx)
-	dockerListed := dockerErr == nil
-	if !dockerListed {
-		s.logger.Warn("reconcile: docker listing failed; leaving docker-owned sandboxes and mounts for the next pass", "error", dockerErr)
-		dockerManaged = map[string]*models.SandboxRuntimeState{}
+	//
+	// With Docker off (SB_DOCKER_ENABLED=false, C2) there is nothing to list
+	// and no warning to give: Docker-owned rows (there should be none) are
+	// left alone, and the mount sweep still runs, since no Docker sandbox
+	// can hold a mount here.
+	dockerManaged := map[string]*models.SandboxRuntimeState{}
+	dockerListed := false
+	if !s.cfg.DockerDisabled {
+		m, dockerErr := s.docker.ListManaged(ctx)
+		dockerListed = dockerErr == nil
+		if dockerListed {
+			dockerManaged = m
+		} else {
+			s.logger.Warn("reconcile: docker listing failed; leaving docker-owned sandboxes and mounts for the next pass", "error", dockerErr)
+		}
 	}
 	containerdManaged := map[string]*models.SandboxRuntimeState{}
 	if s.containerd != nil {
@@ -7173,7 +7188,9 @@ func (s *Service) Reconcile(ctx context.Context) error {
 			}
 		}
 	}
-	removeOrphans(s.docker, models.RuntimeDocker, models.ContainerEngineDocker, dockerManaged)
+	if dockerListed {
+		removeOrphans(s.docker, models.RuntimeDocker, models.ContainerEngineDocker, dockerManaged)
+	}
 	if s.containerd != nil {
 		// containerd is the default engine on clusters. finalizeStaleLocalSandbox
 		// deletes the row before runtime Destroy and names this sweep as the
@@ -7220,7 +7237,7 @@ func (s *Service) Reconcile(ctx context.Context) error {
 			keep[id] = struct{}{}
 		}
 	}
-	if dockerListed {
+	if dockerListed || s.cfg.DockerDisabled {
 		s.mounts.Sweep(keep)
 	}
 

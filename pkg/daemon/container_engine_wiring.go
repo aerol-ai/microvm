@@ -63,11 +63,7 @@ func wireContainerEngine(ctx context.Context, cfg config.Config, logger *slog.Lo
 	}
 	warmPool := wireContainerdWarmPool(ctx, cfg, logger, driver, admitter)
 	svc.SetContainerdRuntime(driver)
-	if dockerClient != nil {
-		svc.SetEventsSource(newMultiEventsSource(logger, dockerClient, driver))
-	} else {
-		svc.SetEventsSource(driver)
-	}
+	svc.SetEventsSource(containerdEventsSource(cfg, logger, dockerClient, driver))
 	logger.Info("containerd engine enabled",
 		"socket", cfg.ContainerdSocket,
 		"namespace", cfg.ContainerdNamespace,
@@ -232,4 +228,16 @@ func (m *multiEventsSource) ContainerPID(ctx context.Context, containerRef strin
 	// running here" — never re-invoke a source (the old code double-called
 	// sources[0], doubling a failed RPC).
 	return 0, firstErr
+}
+
+// containerdEventsSource is the containerd engine's event source: Docker's
+// and containerd's streams together while both engines may own sandboxes on
+// the host, or containerd's alone when there is no Docker client or Docker
+// is off (SB_DOCKER_ENABLED=false, C2), where a Docker stream would only
+// fail and be retried forever.
+func containerdEventsSource(cfg config.Config, logger *slog.Logger, dockerClient *docker.Client, driver docker.EventsSource) docker.EventsSource {
+	if dockerClient != nil && !cfg.DockerDisabled {
+		return newMultiEventsSource(logger, dockerClient, driver)
+	}
+	return driver
 }

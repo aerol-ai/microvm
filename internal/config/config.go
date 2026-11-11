@@ -522,6 +522,16 @@ type Config struct {
 	// DockerPoolEnabled gates the warm Docker container pool (default off in v1).
 	// SB_DOCKER_POOL_ENABLED.
 	DockerPoolEnabled bool
+	// DockerDisabled is true on a containerd-engine host with no Docker at
+	// all, such as a Kubernetes worker pod (SB_DOCKER_ENABLED=false; the
+	// default is enabled; Kubernetes v2 plan C2). Then sandboxd never
+	// pings, lists, watches or firewalls Docker: /health reports it
+	// "disabled" instead of degraded, reconcile and the egress floor leave
+	// it out, and the event stream is containerd's alone. Only valid with
+	// the containerd engine, and not with the Docker warm or
+	// network-namespace pools. Named for the off state so a Config built in
+	// code (tests) keeps Docker on.
+	DockerDisabled bool
 	// DockerPoolDepth is warm slots per image key. SB_DOCKER_POOL_DEPTH.
 	DockerPoolDepth int
 	// DockerPoolImages is a comma-separated list of pinned warm targets.
@@ -3147,6 +3157,9 @@ func load(keyTool bool) (Config, error) {
 	if err := cfg.loadAPIAdmissionConfig(); err != nil {
 		return Config{}, err
 	}
+	if err := cfg.loadDockerEnabled(); err != nil {
+		return Config{}, err
+	}
 	if err := validateSandboxTokens(&cfg); err != nil {
 		return Config{}, err
 	}
@@ -3640,6 +3653,40 @@ func checkClusterCredentialKey(cfg Config) error {
 			return fmt.Errorf("SB_CREDENTIAL_ENCRYPTION_KEY is required when SB_ENABLE_CLUSTER=true (or place a shared key at %s; set SB_CLUSTER_INSECURE_CREDENTIALS=true to opt out — a shared key alone does not make sealed creds survive failover; recipient-set sealing + async fan-out, or a KMS provider, is also required)", cfg.CredentialEncryptionKeyPath)
 		}
 		return fmt.Errorf("stat %s: %w", cfg.CredentialEncryptionKeyPath, err)
+	}
+	return nil
+}
+
+// loadDockerEnabled reads SB_DOCKER_ENABLED strictly and refuses the
+// settings that need Docker when it is off: the Docker engine itself, and
+// the Docker warm and network-namespace pools.
+func (c *Config) loadDockerEnabled() error {
+	c.DockerDisabled = false
+	v := strings.TrimSpace(os.Getenv("SB_DOCKER_ENABLED"))
+	if v == "" {
+		return nil
+	}
+	on, err := strconv.ParseBool(v)
+	if err != nil {
+		return fmt.Errorf("SB_DOCKER_ENABLED must be true or false, got %q", v)
+	}
+	c.DockerDisabled = !on
+	if on {
+		return nil
+	}
+	if models.ResolveContainerEngineOrDocker(c.ContainerEngine) != models.ContainerEngineContainerd {
+		return errors.New("SB_DOCKER_ENABLED=false needs SB_CONTAINER_ENGINE=containerd: the docker engine runs sandboxes in Docker")
+	}
+	for _, f := range []struct {
+		on   bool
+		name string
+	}{
+		{c.DockerPoolEnabled, "SB_DOCKER_POOL_ENABLED"},
+		{c.DockerNetnsPoolEnabled, "SB_DOCKER_NETNS_POOL_ENABLED"},
+	} {
+		if f.on {
+			return fmt.Errorf("%s=true needs Docker, and SB_DOCKER_ENABLED=false", f.name)
+		}
 	}
 	return nil
 }
