@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"net"
 	"os"
 	"path/filepath"
 	"time"
@@ -139,7 +138,7 @@ func setupRaft(cfg raftSetupConfig, fsm *placementFSM, logger *slog.Logger) (*ra
 		return nil, fmt.Errorf("raft setup: snapshot store: %w", err)
 	}
 
-	advertise, err := net.ResolveTCPAddr("tcp", cfg.AdvertiseAddr)
+	advertise, err := raftAdvertiseAddr(cfg.AdvertiseAddr)
 	if err != nil {
 		_ = logStore.Close()
 		_ = stableStore.Close()
@@ -162,6 +161,19 @@ func setupRaft(cfg raftSetupConfig, fsm *placementFSM, logger *slog.Logger) (*ra
 			Timeout:               raftTransportTimeout,
 			Logger:                hclogAdapter(logger),
 			ServerAddressProvider: nil,
+		})
+	} else if name, ok := advertise.(nameAddr); ok {
+		stream, serr := newTCPStreamLayer(cfg.BindAddr, name)
+		if serr != nil {
+			_ = logStore.Close()
+			_ = stableStore.Close()
+			return nil, fmt.Errorf("raft setup: tcp transport on %q: %w", cfg.BindAddr, serr)
+		}
+		transport = raft.NewNetworkTransportWithConfig(&raft.NetworkTransportConfig{
+			Stream:  stream,
+			MaxPool: 3,
+			Timeout: raftTransportTimeout,
+			Logger:  hclogAdapter(logger),
 		})
 	} else {
 		transport, err = raft.NewTCPTransportWithLogger(cfg.BindAddr, advertise, 3, raftTransportTimeout, hclogAdapter(logger))
