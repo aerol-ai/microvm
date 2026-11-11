@@ -1886,6 +1886,62 @@ cluster time in all, about $8.70 (the last cluster proved #1145 and #1146
 live) (the m7i.4xlarge S3 runs are about two
 thirds of it). S4's offline half cost nothing.
 
+### Phase 2 results
+
+**Cluster mode on kind first** (2026-11-12, `AEROL_K8S_MODE=cluster make k8s-dev`:
+three kind workers in zones z-a, z-b and z-c, kindnet enforcing NetworkPolicies).
+The cell came up Ready, ran gVisor sandboxes through a gateway, moved a
+sandbox to another zone on a decommission, kept serving while the leader's
+pod and a server pod were replaced (no restarts), and refused a create that
+broke the create policy. It found these, all fixed before EKS:
+
+- F17. `sandboxd init` and `join` refused a DNS name for `--advertise`, so the
+  first server pod never started (C4 meant to allow it). Memberlist needs an
+  IP: gossip now resolves the name, with retries, and the operator gives each
+  server its pod IP for gossip while Raft keeps the name.
+- F18. The pods' start script loaded `cluster.env` after the pod's own
+  settings, so a file beat the operator. The pod's settings now win, as in
+  `sandboxd`'s own loader.
+- F19. The worker's setup init container copied the agent's rights: on a
+  worker it ran privileged, with containerd's folders and the two-way netns
+  mount. It now has no rights, a read-only root and three mounts.
+- F20. A pool's `runtimes` never reached its workers, so a "gVisor only" pool
+  ran runc too. The gateway Service had 443 and 80 with no edge and no API
+  port. Join tokens and the webhook certificate were mounted whole, which
+  `aerolvm k8s verify` cannot tell from a DNS token.
+
+**The exit gate on EKS** (2026-11-12, run `p2-cell-1`, `integration-tests/k8s/cell.sh`,
+EKS 1.36, us-east-1a/b/c; 3 m7i.large system nodes for servers, gateways and
+the operator; 3 m7i.xlarge workers with IMDSv2 and a hop limit of 1; the VPC
+CNI enforcing NetworkPolicies). The images were built inside the cluster from
+a 12 MB source tarball (370 s) and pushed to the run's ECR repositories.
+
+- Preflight (P10): all three workers stopped with "br_netfilter: the
+  br_netfilter kernel module is not loaded" on their `AerolNode` (F2, stock
+  AL2023, kernel 6.18). Once it was loaded they joined on the kubelet's next
+  try, 74 s after the first failure. The cell was Ready 2 minutes after the
+  install.
+- Chaos (§19): 50 concurrent gVisor creates with `failover: recreate`, each
+  with its own Idempotency-Key, spread over 20 s; 5 s in, the Raft leader's
+  pod and a worker pod (forced past the delete guard) were deleted at once.
+  33 creates were in flight or started after. All 50 succeeded (p50 1.1 s),
+  none was lost, duplicated or extra, and the list held all 50 17.7 s later.
+  The killed worker's 75 sandboxes (from all runs) were recreated on the two
+  other workers 20.5 to 38.0 s after the kill; leadership moved. An earlier
+  run with the leader and a worker killed together: 11 sandboxes back in 8.1
+  to 12.3 s.
+- `aerolvm k8s verify`, every rule: pass, with signatures skipped (dev
+  images). IMDS read from the 3 EC2 instances; 57 addresses refused to a
+  probe sandbox; the server ingress wall present.
+- Harness findings, not product bugs: the cluster list pages over every
+  placement and filters each page by tag, so one run's sandboxes span pages
+  (follow `X-Cluster-List-Next-Page-Token`); the EBS CSI controller needs Pod
+  Identity once pods cannot reach IMDS; a presigned URL needs its `&` signs
+  escaped for `sed`.
+
+Not yet: `verify` with signatures, which needs a release; external-CA mode
+(C23), which is refused with a reason until built.
+
 ## 19. Tests, drills and benchmarks
 
 ### Offline (`make test`)

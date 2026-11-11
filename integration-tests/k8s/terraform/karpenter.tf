@@ -8,8 +8,10 @@
 # within this throwaway account use, narrow on IAM (instance profiles and
 # passing the node role only). No interruption queue: S5 does not test spot.
 
+# Also the cell's EBS CSI controller (main.tf): with an IMDS hop limit of 1
+# no pod reaches the node role, so it gets a role of its own too.
 resource "aws_eks_addon" "pod_identity" {
-  count        = var.karpenter ? 1 : 0
+  count        = var.karpenter || var.ebs_csi ? 1 : 0
   cluster_name = aws_eks_cluster.this.name
   addon_name   = "eks-pod-identity-agent"
 }
