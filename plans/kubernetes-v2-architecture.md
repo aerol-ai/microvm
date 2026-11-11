@@ -117,7 +117,7 @@ section 19.
 | G2 | **No single point of failure.** | At least 3 gateways, 3 or 5 servers, 2 operator replicas, workers in every zone. |
 | G3 | **Scale out by adding machines.** | One cell: at least 500 workers, 100,000 live sandboxes and 1,000 creates per second (**targets**). Before v0.6.12 the code topped out near 150 creates per second per cluster (an estimate, section 9.3). §9.4 E2 shipped since; it is expected to allow 1,000–3,000 reserves per second (also an estimate). Phase 0 S4 measures it, so this needs the work in section 9.4. Past one cell: add cells. |
 | G4 | **Kubernetes load grows with machines, not sandboxes.** | AerolVM's writes to the Kubernetes API are a few per machine per minute, and zero per sandbox. The later facade's TokenReview and SubjectAccessReview calls (§16) are reads, cached for 10 s by the standard delegating authorizer, and grow with distinct callers, not sandboxes; they do not count against this budget. |
-| G5 | **As fast as on plain VMs.** | gVisor create p50 within 10% of the same machine type outside Kubernetes. Today on EC2, warm path: gVisor 284 ms, containerd 189 ms (`plans/investor-benchmark-observability.md`). |
+| G5 | **As fast as on plain VMs.** | gVisor create p50 within 10% of the same machine type outside Kubernetes. Today on EC2 (`README.md`, benchmark table): gVisor 284 ms and containerd 189 ms on a cold create with the warm pool off; from the warm pool, gVisor 34 ms and containerd 31 ms. |
 | G6 | **Dense.** | Sandboxes per machine limited only by CPU, memory and disk. No 110-pod cap. No VPC address per sandbox. (Today's per-worker network pool defaults to 256 sandboxes, `SB_CONTAINERD_NETNS_POOL_SIZE` in `internal/config/config.go`, so it must be sized from the machine.) |
 | G7 | **Heals itself.** | A dead worker's failover sandboxes run elsewhere within 60 s (one worker; a whole zone follows G1). A dead server is replaced with no human. A dead gateway leaves the load balancer within 10 s. |
 | G8 | **Planned work loses nothing.** | An AerolVM upgrade restarts 0 sandboxes. A machine replacement never loses a sandbox by surprise: each is moved, rebuilt or finished first, by its own policy. |
@@ -195,7 +195,7 @@ long-lived things per machine, and sandboxes are many, small and fast.
 
 | | Kubernetes pod | AerolVM sandbox |
 |---|---|---|
-| Start time | Kubernetes' own goal: 99% of pods within 5 s. We measured 5.5 s cold and 0.04–0.05 s from a warm pool with agent-sandbox on kind (`agent-sandbox-feature-parity.md`). | 4 ms (V8 isolate) to 284 ms (gVisor) on EC2, warm path |
+| Start time | Kubernetes' own goal: 99% of pods within 5 s. We measured 5.5 s cold and 0.04–0.05 s from a warm pool with agent-sandbox on kind (`agent-sandbox-feature-parity.md`). | 4 ms (V8 isolate) to 34 ms (gVisor from the warm pool) on EC2; 284 ms for a cold gVisor create with the pool off (`README.md`) |
 | How many per machine | 110 by default. On EKS each pod also takes a VPC address: an m7i.8xlarge holds at most 234 pods, and managed node groups cap it at 250. | As many as CPU, memory and disk allow |
 | Network address | One VPC address each (EKS VPC CNI) | Private to the worker pod. One VPC address per machine. |
 | Cost to Kubernetes | Several etcd writes each | None |
@@ -618,6 +618,13 @@ does not ask Kubernetes (K5), so the worker pod does that work itself:
 | Network namespaces shared between `agent` and `runtime` (`/run/netns`) | Two-way mount propagation, which Kubernetes allows only in privileged containers |
 | External storage through FUSE | `/dev/fuse` and `CAP_SYS_ADMIN` |
 | Firecracker (Phase 5) | `/dev/kvm` and tap devices |
+
+Inside the privileged pod, every sandbox still gets the containerd engine's own
+envelope: the default seccomp profile, a trimmed set of rights, masked and
+read-only paths and no new privileges (`internal/runtime/containerd/security.go`).
+That holds only while the node-wide `SB_CONTAINER_PRIVILEGED` setting is off,
+which is its default and is enforced in enterprise mode; the chart never turns
+it on.
 
 Linux lets only root make namespaces, mount filesystems, write network rules
 and set cgroup limits, with one exception: inside a user namespace. Because
@@ -1373,7 +1380,7 @@ flowchart TB
 
 | Phase | What | Exit gate |
 |---|---|---|
-| **0. Spikes** (2–3 weeks) | S1: the worker pod on EKS (Amazon Linux 2023 and Bottlerocket) and AKS (Azure Linux and Ubuntu): our containerd and gVisor in a privileged `runtime` container, every sandbox placed under the pod's own cgroup path, bridge in the pod's network. S2: change the `agent` image in place and check no sandbox restarts, and that continuous I/O on an externally mounted file keeps working across the swap (eng review OV-E2). S3: memory pressure: does the kubelet ever evict the worker pod? S3 also records kubelet CPU and memory and the number of cAdvisor container series per worker pod at 100, 500 and 1,000 sandboxes; if that cost is too high, Phase 1 picks a fix through its own decision (eng review D3). S4: how far one cell goes: Raft writes per second, apply latency, snapshot and restore time at 100k, 250k and 1M placements. S5: Karpenter and NAP with `do-not-disrupt`, `expireAfter: Never` and a cordon-triggered decommission; an EKS managed node group upgrade inside its 15-minute limit. S6: `/dev/kvm` and Firecracker speed on an EC2 instance with nested virtualization. S7 (CEO review CE3): the worker pod with a named list of rights instead of `privileged: true`. S8 (eng review D8): per-sandbox disk limits with XFS project quotas on local NVMe, on Amazon Linux 2023 and Bottlerocket. S9: the worker pod in a Kubernetes user namespace (`hostUsers: false`): per-sandbox CPU and memory limits, sandbox networking and gVisor, on the same images as S7 (§8.7). P7: the evidence pack draft v1, sent with the privileged-pod question (Q6) on day one while the spikes run (R4); updated with S7's and S9's results. A "no" stops the spikes. | Numbers written into this plan. If S1 or S2 fails, stop and rethink K2 and K3 before Phase 1. |
+| **0. Spikes** (2–3 weeks) | S1: the worker pod on EKS (Amazon Linux 2023 and Bottlerocket) and AKS (Azure Linux and Ubuntu): our containerd and gVisor in a privileged `runtime` container, every sandbox placed under the pod's own cgroup path, bridge in the pod's network. S2: change the `agent` image in place and check no sandbox restarts, and that continuous I/O on an externally mounted file keeps working across the swap (eng review OV-E2). S3: memory pressure: does the kubelet ever evict the worker pod? S3 also records kubelet CPU and memory and the number of cAdvisor container series per worker pod at 100, 500 and 1,000 sandboxes; if that cost is too high, Phase 1 picks a fix through its own decision (eng review D3). S4: how far one cell goes: Raft writes per second, apply latency, snapshot and restore time at 100k, 250k and 1M placements. S5: Karpenter and NAP with `do-not-disrupt`, `expireAfter: Never` and a cordon-triggered decommission; an EKS managed node group upgrade inside its 15-minute limit. S6: `/dev/kvm` and Firecracker speed on an EC2 instance with nested virtualization. S7 (CEO review CE3): the worker pod with a named list of rights instead of `privileged: true`. S8 (eng review D8): per-sandbox disk limits with XFS project quotas on local NVMe, on Amazon Linux 2023 and Bottlerocket. S9: the worker pod in a Kubernetes user namespace (`hostUsers: false`): per-sandbox CPU and memory limits, sandbox networking and gVisor, on the same images as S7 (§8.7). P7: the evidence pack draft v1, sent with the privileged-pod question (Q6) on day one while the spikes run (R4); updated with S7's and S9's results. N1: the side-by-side benchmark with agent-sandbox (§18, after the phase table). A "no" stops the spikes. | Numbers written into this plan. If S1 or S2 fails, stop and rethink K2 and K3 before Phase 1. |
 | **1. Ready for pods** | C1–C7, C12, C24 (Phase 1 part), C25, C27, images (P1), chart `single` mode (P3), `make k8s-dev` and docs (P4), `aerolvm k8s verify` single-mode subset (P8), install notes (P10) | kind smoke test in CI; `cosign verify` passes; the `aerolvm k8s verify` subset passes on the kind install and fails on a seeded violation; gVisor create p50 in a pod within 10% of the same machine without Kubernetes (G5) |
 | **2. Cluster mode on EKS** | C8–C11, C13, C19, C20, C22, C23, C24 (Phase 2 part), C26, operator (P2), Karpenter integration, runbook and alerts (P6), chart monitoring (P9), evidence pack final (P7), full `aerolvm k8s verify` (P8), operator preflight, printer columns, Events, Argo CD check and bank preset (P10) | Live `k8s-cell-3zone` scenario green, including the chaos step (section 19); full `aerolvm k8s verify` passes on that cell |
 | **3. Prove it on EKS** | C18 (one fix at a time, measured), every drill in section 19, the scale bench, a 72-hour soak | G1–G12 measured and published in this plan |
@@ -1383,6 +1390,42 @@ flowchart TB
 
 The Daytona migration preset (D4.2) can ship any time after Phase 1. It needs
 no new server code.
+
+### After Phase 0: work to pull ahead of agent-sandbox (N1–N8)
+
+Added after the reviews (2026-11-11). These items come from comparing this
+plan with agent-sandbox (`plans/agent-sandbox-feature-parity.md`). Each one
+was checked on 2026-11-11 against agent-sandbox's code (commit `4d39311` and
+its `main` at `580cb3e6`) and against AerolVM's `main`. **N1 is itself
+verification, so it runs with the Phase 0 spikes. None of N2–N8 starts until
+the gate below is met.**
+
+**The gate: what came before is verified.**
+
+1. Phase 0 is done: spikes S1–S9 have run, their numbers are written into this
+   plan, and S1 and S2 passed (the Phase 0 exit gate above).
+2. N1 has run, and its numbers are written here. If agent-sandbox comes within
+   about 2x of AerolVM on the bank's real workload (cold start, warm start, a
+   burst larger than the warm pool), stop and choose between this plan, pod
+   mode (`TODOS.md`) and building on agent-sandbox before any of N2–N8.
+3. Every fact this plan states about agent-sandbox and about AerolVM's code is
+   checked again against agent-sandbox's current release and AerolVM's `main`,
+   and every receipt still holds.
+4. The bank has answered Q6 (privileged pods).
+
+| # | Item | Why | Today (checked 2026-11-11) | Depends on | Size |
+|---|---|---|---|---|---|
+| N1 | Side-by-side benchmark: agent-sandbox with gVisor next to AerolVM's worker pod, on the same EKS cluster and machine type. Cold and warm start p50 and p99, a burst larger than the warm pool, several templates, one command's round trip, sandboxes per machine until full, etcd writes per sandbox. | Every comparison so far uses numbers from different machines: agent-sandbox on kind on a laptop, AerolVM on EC2. | Not run | S1 | M |
+| N2 | Split `sandboxd` on the worker: an unprivileged part reads API calls, uploads and mount settings; a small privileged helper does only the network, firewall, cgroup and mount work, behind a narrow local API. | A bug in the code that reads tenant input stops being root on the machine. This is the largest security gap against agent-sandbox, whose own code never runs privileged on a machine. | `sandboxd` runs as root with no hardening on VMs (`packaging/sandboxd.service`), and mount helpers run on the host (`pkg/mounts/adapters`) | S7 and S9 results | L |
+| N3 | A read-only `kubectl get sandboxes` (list and get; namespace equals owner, D10), served by the gateways through an aggregated API before C17. Nothing is written to etcd. | The Kubernetes-native view without waiting for Phase 6. | Not built (C17 is Phase 6) | §16's aggregated-API design | M |
+| N4 | Create-policy rules in OPA (Rego), evaluated in-process at create time, with per-team rules, next to today's fixed rules. Boot-path latency is called out in its PR. | The bank's own policy language judges each sandbox, as its admission policy does for agent-sandbox pods. | `internal/createpolicy` is a fixed YAML schema, one file for every caller on a node; no Rego, OPA or CEL | — | M |
+| N5 | Every sandbox's egress decisions logged, not only gateway traffic, and SIEM-native outputs (syslog, Splunk HEC, CloudWatch) next to today's export. | The network sees one address per worker, so the bank's flow logs cannot tell sandboxes apart. | Egress decisions reach the audit chain only for gateway traffic and WASM and V8 isolates; other sandboxes get counters. Audit export has stdout, file, webhook (NDJSON, HMAC, mTLS), S3 and a bus hook. | — | M |
+| N6 | Per-team worker pools, enforced by the create policy: an owner maps to required node labels, and placement refuses other nodes. Cluster placement code, so regression tests and a cluster-correctness call-out. | One escape or one bug reaches one team, not every team on a machine. | Placement rules are only what the caller asks for (`internal/service/placement_rules.go`); nothing forces a team onto its own nodes | — | M |
+| N7 | Firecracker for untrusted code from several teams, moved forward from Phase 5. | A hardware wall, like Kata in agent-sandbox. | Firecracker pools are Phase 5 | S6 | Re-sequencing |
+| N8 | Mounts and volumes attached when a warm sandbox is handed out (parity plan V2), and the chart turns the containerd warm pool on. | A warm pool that serves almost any request, which agent-sandbox cannot: there, env and volume templates force a cold start. | Env already rides the containerd warm pool (`internal/runtime/containerd/warm_adopt.go`, since 2026-11-08), except `SB_*`, `USER`, `LOGNAME` and the egress CA; mounts still force a cold start; both warm pools are off by default | Create path: the `/touch-create-sandbox` rules | M |
+
+Order after the gate: N2 and N6 first, for the bank's security review; then N8;
+then N3, N4 and N5. N7 follows S6.
 
 ## 19. Tests, drills and benchmarks
 
@@ -1621,9 +1664,9 @@ Phase 1, after the 2–3 week Phase 0 spikes.
 - REALITY: already-done finding. §9.4 fixes E2, E3a, E3b, C13 and part of C8, C9 and C10 shipped after the plan date. `internal/cluster/admission_ledger.go:1`
 - REALITY: surface-check pass. Every named file, setting and route exists on `main`. `pkg/api/v1/routes.go:272`
 - REALITY: binding-decisions finding. The 2026-09-30 decisions put the agent-sandbox API facade in Phase 3 and replace own CRDs. v2 moves the facade to Phase 6 and adds its own `SandboxTemplate` and `SandboxPool` CRDs. It withdraws husk pods and the license gate, which is an announced, user-driven reversal (2026-11-04). §10.1 and §16 `plans/kubernetes-deployment.md:23`
-- REALITY: numbers finding. 751 B per placement [measured: secrets-hardening fleet-scale]. gVisor 284 ms and containerd 189 ms warm [measured: `plans/investor-benchmark-observability.md:28`]. A 6–7 ms commit [measured: `plans/warm-create-latency-tier1.md:60`]. "~150 creates/s" [estimated, now stale: E2 expects 1,000–3,000 reserves/s, also an estimate; re-measure before the gate]. The ID-clash chance of about 1 in 140,000 at 1M live re-derives as n²/2^57 ≈ 1 in 144,000. §9.3 L-a
+- REALITY: numbers finding. 751 B per placement [measured: secrets-hardening fleet-scale]. gVisor 284 ms and containerd 189 ms [measured: `plans/investor-benchmark-observability.md:28`]; corrected 2026-11-11: those are cold creates with the warm pool off, and the warm-pool p50s are 34 ms and 31 ms (`README.md`). A 6–7 ms commit [measured: `plans/warm-create-latency-tier1.md:60`]. "~150 creates/s" [estimated, now stale: E2 expects 1,000–3,000 reserves/s, also an estimate; re-measure before the gate]. The ID-clash chance of about 1 in 140,000 at 1M live re-derives as n²/2^57 ≈ 1 in 144,000. §9.3 L-a
 - REALITY: deferred-asks pass. No linked issue. the plan header `plans/kubernetes-v2-architecture.md:3`
-- REALITY: pr-count pass. No `.gstack/ship-policy.json`, so the default is one PR per wave. The plan ships each phase as stacked PRs. §18 `plans/kubernetes-v2-architecture.md:1360`
+- REALITY: pr-count pass. No `.gstack/ship-policy.json`, so the default is one PR per wave. The plan ships each phase as stacked PRs. §18 `plans/kubernetes-v2-architecture.md:1367`
 
 **0C. Dream state.**
 ```
@@ -1679,14 +1722,15 @@ from the previous fix).
 **10x check.** As written, the plan makes AerolVM *runnable* on EKS and AKS. The
 10x version makes it the *default answer* there. Once the Phase 6 facade lands, agent frameworks that already
 speak the Kubernetes agent-sandbox API (LiteLLM Agent Platform, Dify, OpenSandbox
-users) point at AerolVM and get image-cached creates about 20x faster (gVisor 284 ms
-with the image cached [measured] against 5.5 s for a cold pod [measured, kind]), no 110-pod
+users) point at AerolVM and get cold creates about 20x faster (gVisor 284 ms
+with the warm pool off [measured] against 5.5 s for a cold pod [measured, kind]), no 110-pod
 or VPC-address limit per machine, and zero etcd writes per sandbox, with no
 code change for the common fields (unsupported upstream fields are refused with
 a clear error). Warm-pool hits are in the same range as agent-sandbox's own warm
 pool (AerolVM's warm-pool hit 28 ms p50 on runc since v0.6.0, 43 ms before [measured,
 `plans/warm-create-latency-tier1.md`] against 40–50 ms [measured, kind]); gVisor
-from a warm pool is not measured yet, and Phase 0 measures it. And a bank's security team gets the evidence it needs in a week, not
+from AerolVM's warm pool measured 34 ms p50 on EC2 (`README.md`, 2026-10-04; corrected
+2026-11-11, it was thought unmeasured). And a bank's security team gets the evidence it needs in a week, not
 a quarter. (After RQ10, the agent-sandbox part is Phase 6 work, not Phases 0–2.)
 
 **Platonic ideal.**
@@ -2950,7 +2994,7 @@ Reality rows (eng):
 - REALITY: binding-decisions pass. This review keeps every CEO answer (RQ1–RQ17) and the 2026-11-10 decision-log entries. `plans/kubernetes-v2-architecture.md:3`
 - REALITY: numbers finding. The CEO-review tags hold; S4's restore time must be re-measured with the new snapshot interval [re-measure before gate]. `internal/config/config.go:2171`
 - REALITY: deferred-asks pass. No linked issue. `plans/kubernetes-v2-architecture.md:1`
-- REALITY: pr-count pass. No ship policy; each phase ships as stacked PRs. `plans/kubernetes-v2-architecture.md:1360`
+- REALITY: pr-count pass. No ship policy; each phase ships as stacked PRs. `plans/kubernetes-v2-architecture.md:1367`
 
 
 
@@ -3544,7 +3588,7 @@ Critical gaps: 0. No path is untested, unhandled and silent at once.
 
 | Step | Modules touched | Depends on |
 |---|---|---|
-| Phase 0 spikes S1–S9 | `integration-tests/` (spike scripts) | — |
+| Phase 0 spikes S1–S9 and benchmark N1 | `integration-tests/` (spike scripts) | — |
 | A. Images and publishing (P1, D2) | `.github/workflows/`, image build files, chart | — |
 | B. Cluster core (C13, D6, C8/C10 on all clusters, C19) | `internal/cluster/` | — |
 | C. Worker pod runtime (C7, C14, OV-E2, C27) | `internal/runtime/`, `pkg/hostproc`, `pkg/mounts`, `internal/service` (lease file) | Phase 0 S1/S2 |

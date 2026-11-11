@@ -24,14 +24,14 @@ are CE1–CE6, so they do not clash with the plan's §9.4 fixes E1–E8.
 ### 10x Check
 As written, the plan makes AerolVM runnable on EKS and AKS. The 10x version makes
 it the default answer there. Once the Phase 6 facade lands, agent frameworks that already speak the Kubernetes
-agent-sandbox API (LiteLLM Agent Platform, Dify, OpenSandbox users) point at AerolVM and get image-cached creates about 20x faster (gVisor 284 ms on the
-warm path [measured] against 5.5 s for a cold pod [measured, kind]), no 110-pod
+agent-sandbox API (LiteLLM Agent Platform, Dify, OpenSandbox users) point at AerolVM and get cold creates about 20x faster (gVisor 284 ms with the
+warm pool off [measured] against 5.5 s for a cold pod [measured, kind]), no 110-pod
 or VPC-address limit per machine, and zero etcd writes per sandbox, with no
 code change for the common fields (unsupported upstream fields are refused with
 a clear error). Warm creates are in the same range as agent-sandbox's own warm
 pool (AerolVM's warm path 28 ms p50 on runc since v0.6.0, 43 ms before [measured,
 `plans/warm-create-latency-tier1.md`] against 40–50 ms [measured, kind]); gVisor
-from a warm pool is not measured yet, and Phase 0 measures it. A
+from AerolVM's warm pool measured 34 ms p50 on EC2 (`README.md`). A
 bank's security team gets checkable evidence in a week, not a quarter.
 
 ### Platonic Ideal
@@ -80,3 +80,9 @@ bank's security team gets checkable evidence in a week, not a quarter.
 - Round 1 (score 5/10, FAIL): fixed in place, except CE1's K5/template conflict, which was reopened and decided (RQ9).
 - Round 2 (score 6/10, FAIL): fixed in place, except two new choices: facade storage (RQ10: facade out of this phase, no storage) and namespace rules (deferred with the facade). 
 - Round 3 (score 7/10, FAIL, final round allowed): 18 issues, all fixed in place within the approved decisions; verified by the reviewer of record against the plan text (see the plan's round-3 note), not re-reviewed.
+
+## Added after the reviews (2026-11-10 and 2026-11-11)
+- §5 options F and G: the Kubernetes Gateway API does not pick the worker, and workers never take client traffic straight from it; a bank's own Gateway can stand in front (§7.1).
+- §8.7: why the worker needs root at all, and Phase 0 spike S9 (the worker pod in a Kubernetes user namespace). Pod mode is a `TODOS.md` entry if S9 fails.
+- §18: N1 (side-by-side benchmark with agent-sandbox, in Phase 0) and N2–N8 (work to pull ahead of agent-sandbox), which start only after the Phase 0 gate.
+- Corrected: 284 ms for gVisor is a cold create with the warm pool off; the warm-pool p50s are 34 ms (gVisor) and 31 ms (containerd).
