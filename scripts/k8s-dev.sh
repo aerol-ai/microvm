@@ -37,9 +37,11 @@ mkdir -p "$dist"
 echo "k8s-dev: building linux/$arch binaries" >&2
 CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build -trimpath -o "$dist/toolboxd_linux_$arch" ./cmd/toolboxd
 CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build -trimpath -o "$dist/aerolvm-supervisor_linux_$arch" ./cmd/aerolvm-supervisor
+# -buildvcs=false: the container's git refuses a checkout another user owns
+# (a CI runner's), and sandboxd's version comes from ldflags anyway.
 docker run --rm -e GOTOOLCHAIN=auto -e CGO_ENABLED=1 \
   -v "$root":/src -v "$(go env GOMODCACHE)":/go/pkg/mod -v "$dist":/out -w /src \
-  golang:1.26 go build -trimpath -o "/out/sandboxd_linux_$arch" ./cmd/sandboxd
+  golang:1.26 go build -buildvcs=false -trimpath -o "/out/sandboxd_linux_$arch" ./cmd/sandboxd
 
 images="aerolvm,aerolvm-runtime"
 if [[ "$edge" == 1 ]]; then
