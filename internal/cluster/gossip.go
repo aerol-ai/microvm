@@ -624,7 +624,11 @@ func setupGossip(cfg gossipSetupConfig, admitter *capacity.Admitter, logger *slo
 		if err != nil {
 			return nil, fmt.Errorf("gossip setup: parse advertise addr %q: %w", cfg.AdvertiseAddr, err)
 		}
-		mlCfg.AdvertiseAddr = ahost
+		ip, err := gossipAdvertiseIP(ahost)
+		if err != nil {
+			return nil, fmt.Errorf("gossip setup: advertise addr %q: %w", cfg.AdvertiseAddr, err)
+		}
+		mlCfg.AdvertiseAddr = ip
 		mlCfg.AdvertisePort = aport
 	}
 
@@ -1104,6 +1108,60 @@ func (g *gossipNode) Close() error {
 		return g.ml.Shutdown()
 	}
 	return nil
+}
+
+// lookupGossipIP resolves a gossip advertise name; tests replace it.
+var lookupGossipIP = func(ctx context.Context, host string) ([]net.IP, error) {
+	return net.DefaultResolver.LookupIP(ctx, "ip", host)
+}
+
+// How long a start keeps trying to resolve its gossip advertise name, and
+// how often. A new pod's DNS record appears a few seconds after the pod
+// gets its IP, and a start that exits on the first miss turns that into a
+// container restart.
+var (
+	gossipResolveWait  = time.Minute
+	gossipResolveEvery = time.Second
+)
+
+// gossipAdvertiseIP is the IP memberlist advertises, which must be an IP.
+// A server may advertise a DNS name (C4): Raft keeps the name and resolves
+// it on every dial, but memberlist cannot, so a name is resolved here, once
+// per start, through DNS. A headless Service's record follows its pod, so a
+// server that moved advertises its new address after the restart that moved
+// it. (The operator's server pods set SB_GOSSIP_ADVERTISE_ADDR to the pod
+// IP and skip this; it serves a name given any other way.) IPv4 first, as
+// memberlist's own address picking does.
+func gossipAdvertiseIP(host string) (string, error) {
+	if host == "" || net.ParseIP(host) != nil {
+		return host, nil
+	}
+	deadline := time.Now().Add(gossipResolveWait)
+	for {
+		ip, err := resolveGossipIP(host)
+		if err == nil || !time.Now().Before(deadline) {
+			return ip, err
+		}
+		time.Sleep(gossipResolveEvery)
+	}
+}
+
+func resolveGossipIP(host string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	ips, err := lookupGossipIP(ctx, host)
+	if err != nil {
+		return "", fmt.Errorf("resolve %q: %w", host, err)
+	}
+	for _, ip := range ips {
+		if ip.To4() != nil {
+			return ip.String(), nil
+		}
+	}
+	if len(ips) > 0 {
+		return ips[0].String(), nil
+	}
+	return "", fmt.Errorf("resolve %q: no address", host)
 }
 
 func splitHostPort(addr string) (string, int, error) {
