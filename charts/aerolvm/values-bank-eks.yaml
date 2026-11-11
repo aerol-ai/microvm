@@ -1,0 +1,130 @@
+# A starting point for a bank on EKS (plans/kubernetes-v2-architecture.md
+# P10): the setup the bank evidence pack (P7) describes. Copy it, fill in
+# every <...>, then:
+#
+#   kubectl create namespace aerolvm-system
+#   kubectl label namespace aerolvm-system pod-security.kubernetes.io/enforce=restricted
+#   helm install aerolvm charts/aerolvm -n aerolvm-system -f values-bank-eks.yaml
+#
+# What this file sets:
+#   - cluster mode over three zones, with gVisor as the only runtime;
+#   - Kubernetes NetworkPolicies around the worker pods, and sandboxes kept
+#     off private addresses;
+#   - API and sandbox links over HTTPS, the certificate from your issuer;
+#   - Prometheus monitoring, alerts and dashboards;
+#   - worker machines replaced every 30 days.
+#
+# What it cannot set, and you must:
+#   - Pod Security: label the release namespace `restricted` (above). The
+#     chart makes the worker namespace and labels it `privileged`: worker
+#     pods are the one exception, and only that namespace allows it.
+#   - The worker NodePool (Karpenter): `expireAfter: Never`, no
+#     `terminationGracePeriod`, the label and taint below. The operator
+#     replaces machines by age instead (maxMachineAge), moving sandboxes
+#     first. Example: docs, Kubernetes cluster mode, "Karpenter".
+#   - The EC2NodeClass: `metadataOptions.httpTokens: required` and
+#     `httpPutResponseHopLimit: 1` (Karpenter's defaults; keep them). A pod
+#     then cannot reach the machine's instance metadata, so no sandbox can
+#     use the machine's IAM role.
+#   - br_netfilter on worker machines: load it in the node image or its user
+#     data (`modprobe br_netfilter`, listed in /etc/modules-load.d). Stock
+#     Amazon Linux 2023 does not; each worker's preflight checks it.
+#   - cert-manager, and kube-prometheus-stack (or the Prometheus Operator).
+
+mode: cluster
+
+image:
+  registry: ghcr.io/aerol-ai
+  # Pin the version you verified with `cosign verify`. Better, mirror the
+  # images to your own registry and point `registry` at it.
+  tag: "<version>"
+  pullPolicy: IfNotPresent
+
+worker:
+  # Every sandbox runs under gVisor: a second kernel between its code and
+  # the machine. The worker pool below runs gVisor only, so a create that
+  # asks for runc is refused.
+  defaultRuntime: gvisor
+  # Sandboxes cannot reach private addresses unless a create allows them.
+  blockPrivateByDefault: true
+  # Each team's reserved and used CPU and memory, for the cost split.
+  usageMetrics:
+    enabled: true
+
+networkPolicy:
+  enabled: true
+  # The private ranges the worker pods themselves need: VPC endpoints for
+  # object storage or KMS, a private registry, the NodeLocal DNSCache
+  # address. Nothing here reaches sandboxes on its own.
+  extraEgressCIDRs: []
+    # - <vpc-endpoint-cidr>
+
+edge:
+  enabled: true
+  domain: "<sandboxes.bank.example>"
+  certManager:
+    # Your own certificate authority, or Let's Encrypt with DNS-01.
+    issuerRef: { name: "<issuer>", kind: ClusterIssuer }
+
+monitoring:
+  enabled: true
+  # kube-prometheus-stack reads objects labelled with its release name.
+  labels: { release: kube-prometheus-stack }
+  # A token that can only read metrics (`aerolvm token create --name
+  # prometheus --role viewer --team '*'`), in a Secret in this namespace.
+  scrapeToken:
+    existingSecret: "<prometheus-token-secret>"
+    key: token
+
+cluster:
+  name: aerolvm
+  # This cell's number, 1 to 255; give each cell its own.
+  cell: 1
+  zones: ["<eu-west-1a>", "<eu-west-1b>", "<eu-west-1c>"]
+  servers:
+    count: 3
+    storage:
+      size: 50Gi
+      # Binds on first use (WaitForFirstConsumer), so each server's disk
+      # lands in its own zone.
+      storageClassName: gp3
+  gateways:
+    minReplicas: 3
+    service:
+      type: LoadBalancer
+      # An internal Network Load Balancer, through the AWS Load Balancer
+      # Controller, straight to the gateway pods.
+      annotations:
+        service.beta.kubernetes.io/aws-load-balancer-type: external
+        service.beta.kubernetes.io/aws-load-balancer-nlb-target-type: ip
+        service.beta.kubernetes.io/aws-load-balancer-scheme: internal
+    # Or sit behind your own Gateway API Gateway instead:
+    # gatewayRef: { name: <bank-gateway>, namespace: <gateways> }
+  workerPools:
+    - name: gvisor-general
+      runtimes: [gvisor]
+      nodeSelector: { aerolvm.io/pool: gvisor-general }
+      tolerations: [{ key: aerolvm.io/pool, operator: Exists, effect: NoSchedule }]
+      # The size of one machine in the NodePool; the worker pod asks for
+      # nearly all of it.
+      machine: { cpu: 32, memoryGiB: 128 }
+      minWorkers: 3
+      maxWorkers: 60
+      headroomPercent: 15
+      # Extra room per zone, so a lost zone's sandboxes come back quickly.
+      zoneLossReservePercent: 10
+      provisioner: karpenter
+      decommission: { drainWindow: 15m, deadline: 45m }
+      maxMachineAge: 720h
+  # What any sandbox may be (docs: Limit what users can create). Every
+  # node checks it; a create that breaks a rule is refused with 403.
+  createPolicy:
+    version: 1
+    images:
+      # Your own registry, which mirrors the images teams may use.
+      allowed_registries: ["<registry.bank.example>"]
+    runtimes: [gvisor]
+    limits: { max_cpu: 8, max_memory_mb: 16384, max_disk_gb: 100 }
+    allow_gpu: false
+  operator:
+    replicas: 2

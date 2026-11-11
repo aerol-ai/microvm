@@ -947,6 +947,14 @@ jobs:
           grep -q 'kind: ServiceMonitor' <<<"$out"
           grep -q 'kind: PrometheusRule' <<<"$out"
           grep -q 'grafana_dashboard: "1"' <<<"$out"
+          # P10: the bank preset renders everything the evidence pack
+          # names, with gVisor as the only runtime.
+          helm lint charts/aerolvm -f charts/aerolvm/values-bank-eks.yaml
+          out="$(helm template t charts/aerolvm -f charts/aerolvm/values-bank-eks.yaml)"
+          for kind in AerolCluster NetworkPolicy ServiceMonitor PrometheusRule Certificate; do
+            grep -q "kind: $kind" <<<"$out" || { echo "::error::the bank preset rendered no $kind"; exit 1; }
+          done
+          grep -q 'SB_CONTAINER_RUNTIME, value: "gvisor"' <<<"$out"
 
       # The chart's alerts, recording rules and dashboards (P6, P9): every
       # metric they read is registered in the Go code (or is the

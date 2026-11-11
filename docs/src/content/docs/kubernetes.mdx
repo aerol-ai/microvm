@@ -5,7 +5,7 @@ description: Run AerolVM on a Kubernetes cluster with its Helm chart. Single mod
 
 import { Tabs, TabItem, Aside } from '@astrojs/starlight/components';
 
-AerolVM runs on Kubernetes from a Helm chart. Today the chart has one mode, **single**: one worker pod that holds the AerolVM server and every sandbox. It suits a laptop with kind, a test cluster or a small install. Cluster mode, with separate gateway, server and worker pods and an operator, comes later.
+AerolVM runs on Kubernetes from a Helm chart. The chart has two modes. This page is about **single** mode: one worker pod that holds the AerolVM server and every sandbox. It suits a laptop with kind, a test cluster or a small install. For many machines across zones, with separate server, gateway and worker pods and an operator, see [cluster mode](/kubernetes-cluster/).
 
 Your code does not change. You talk to the same API with the same SDKs.
 
@@ -203,7 +203,7 @@ The NetworkPolicy works only if your cluster's network plugin enforces NetworkPo
 
 ### Tell AerolVM your cluster's addresses
 
-AerolVM cannot guess your cluster's addresses, so list them in a values file. When cluster mode comes, its operator will fill these in for you.
+AerolVM cannot guess your cluster's addresses, so list them in a values file. In [cluster mode](/kubernetes-cluster/) the operator fills these in for you.
 
 ```yaml
 worker:
