@@ -44,7 +44,7 @@ spec:
               - 192.168.0.0/16
               - 100.64.0.0/10
               - 169.254.0.0/16
-              {{- range concat .Values.worker.egressPrivateRanges .Values.worker.egressDenyFloor }}
+              {{- range concat (.Values.worker.egressPrivateRanges | default list) (.Values.worker.egressDenyFloor | default list) }}
               {{- if not (contains ":" .) }}
               - {{ include "aerolvm.cidr" . }}
               {{- end }}
