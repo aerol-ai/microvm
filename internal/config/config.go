@@ -186,6 +186,14 @@ type Config struct {
 	// (SB_SANDBOX_NODE_PORTS_ALLOW, default empty; refused in enterprise
 	// mode). Sandboxes are default-denied from the node they run on.
 	SandboxNodePortsAllow []SandboxNodePort
+	// SandboxNodeIngressClosed keeps 80 and 443 closed to sandboxes on an
+	// ingress node (SB_SANDBOX_NODE_INGRESS=false; default open). On a
+	// server the internet reaches those ports on its own address anyway, so
+	// a sandbox may too. In a Kubernetes pod the internet reaches them
+	// through a Service, and a sandbox's own traffic to the public name
+	// leaves the pod; a direct path would skip the private-range block when
+	// that Service is internal (C24).
+	SandboxNodeIngressClosed bool
 	// DiskLimitCheckInterval is how often the disk watchdog checks each
 	// container sandbox's writable layer against its DiskGB
 	// (SB_DISK_LIMIT_CHECK_INTERVAL, default 15s; 0 turns it off). The
@@ -2201,6 +2209,7 @@ func load(keyTool bool) (Config, error) {
 		ResourceLimitsOff:                 getEnvBool("SB_RESOURCE_LIMITS_DISABLED", false),
 		SandboxPidsLimit:                  getEnvInt("SB_SANDBOX_PIDS_LIMIT", 4096),
 		SandboxInterconnect:               getEnvBool("SB_SANDBOX_INTERCONNECT", false),
+		SandboxNodeIngressClosed:          !getEnvBool("SB_SANDBOX_NODE_INGRESS", true),
 		DiskLimitCheckInterval:            getEnvDuration("SB_DISK_LIMIT_CHECK_INTERVAL", 15*time.Second),
 		Runtime:                           getEnv("SB_CONTAINER_RUNTIME", models.RuntimeDocker),
 		ContainerEngine:                   getEnv("SB_CONTAINER_ENGINE", models.ContainerEngineDocker),
