@@ -107,7 +107,7 @@ The server runs containers with one of two engines. Your code does not change be
 | | Docker | containerd |
 |---|---|---|
 | Used by | A single server, and local installs on Mac and Linux | Clusters set up with Terraform, or the installer's `--with-containerd-engine` flag |
-| Disk limit (`diskGB`) | Enforced | Recorded, but not enforced |
+| Disk limit (`diskGB`) | Enforced | Enforced when the server sets `SB_CONTAINERD_DISK_QUOTA=true` (its containerd storage must be XFS with project quotas); otherwise recorded, but not enforced |
 
 containerd is the engine Docker itself is built on. AerolVM talks to it directly, which skips a layer.
 

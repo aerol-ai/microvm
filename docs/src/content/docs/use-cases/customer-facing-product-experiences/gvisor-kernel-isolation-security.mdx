@@ -185,7 +185,7 @@ So gVisor is a better wall for code you do not trust, such as code your users se
 
 ## Good to know
 
-- **gVisor has limits.** It cannot run privileged containers, it does not enforce `diskGB`, and it does not work with GPUs. See [gVisor](/gvisor-sandbox/).
+- **gVisor has limits.** It cannot run privileged containers, it enforces `diskGB` only on a containerd server with `SB_CONTAINERD_DISK_QUOTA=true`, and it does not work with GPUs. See [gVisor](/gvisor-sandbox/).
 - **Some programs act differently under gVisor.** Its kernel does not have every feature of the real Linux kernel. Test your workload under gVisor before you switch to it.
 
 ## Next steps
