@@ -61,9 +61,9 @@ var k8sAlerts = map[string]string{
 	"AerolVMSandboxEgressToClusterRanges": "warning",
 }
 
-// operatorMetrics are the operator's (P2) series. No Go file in this tree
-// registers them yet: these are the names agreed with the operator's work,
-// and the operator's own tests must keep them.
+// operatorMetrics are the operator's (P2) series, registered in its own Go
+// module (operator/); TestKubernetesChartOperatorMetricsRegistered checks
+// each one is, so a renamed metric cannot leave an alert that never fires.
 var operatorMetrics = []string{
 	"aerolvm_operator_reconcile_errors_total",
 	"aerolvm_operator_nodes",
@@ -734,4 +734,34 @@ func helmAtLeast(v string, major, minor int) bool {
 	gotMajor, _ := strconv.Atoi(m[1])
 	gotMinor, _ := strconv.Atoi(m[2])
 	return gotMajor > major || (gotMajor == major && gotMinor >= minor)
+}
+
+// The operator's metrics the chart's alerts and dashboards read are the
+// ones its code registers: the operator is its own module, outside the
+// cmd/internal/pkg scan that checks sandboxd's.
+func TestKubernetesChartOperatorMetricsRegistered(t *testing.T) {
+	root := repoRoot(t)
+	literal := regexp.MustCompile(`"(aerolvm_operator_[a-z0-9_]+)"`)
+	registered := map[string]bool{}
+	err := filepath.WalkDir(filepath.Join(root, "operator"), func(path string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() || !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
+			return err
+		}
+		src, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		for _, m := range literal.FindAllStringSubmatch(string(src), -1) {
+			registered[m[1]] = true
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range append(append([]string{}, operatorMetrics...), operatorHistograms...) {
+		if !registered[name] {
+			t.Errorf("the chart reads %s, which the operator does not register", name)
+		}
+	}
 }

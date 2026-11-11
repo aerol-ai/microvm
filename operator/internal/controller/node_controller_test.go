@@ -1,0 +1,423 @@
+package controller
+
+import (
+	"context"
+	"errors"
+	"strings"
+	"testing"
+	"time"
+
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/record"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	v1 "github.com/aerol-ai/microvm/operator/api/v1alpha1"
+	"github.com/aerol-ai/microvm/operator/internal/aerolapi"
+)
+
+type nodeRig struct {
+	t   *testing.T
+	r   *NodeReconciler
+	api *fakeAPI
+	cl  client.Client
+	now time.Time
+}
+
+func newNodeRig(t *testing.T, c *v1.AerolCluster, objs ...client.Object) *nodeRig {
+	t.Helper()
+	all := append([]client.Object{c, adminSecret(), templates(t)}, objs...)
+	cl := newFakeClient(t, all...)
+	api := newFakeAPI()
+	g := &nodeRig{t: t, api: api, cl: cl, now: time.Unix(2_000_000_000, 0)}
+	g.r = &NodeReconciler{Client: cl, Scheme: cl.Scheme(), Recorder: record.NewFakeRecorder(200), API: api.factory,
+		Namespace: testNS, WorkerNamespace: testWorkerNS, Templates: "aerolvm-pod-templates", Now: func() time.Time { return g.now }}
+	return g
+}
+
+func (g *nodeRig) reconcile(name string) ctrl.Result {
+	g.t.Helper()
+	res, err := g.r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: testNS, Name: name}})
+	if err != nil {
+		g.t.Fatalf("reconcile %s: %v", name, err)
+	}
+	return res
+}
+
+func (g *nodeRig) node(name string) *v1.AerolNode {
+	g.t.Helper()
+	var n v1.AerolNode
+	if err := g.cl.Get(context.Background(), types.NamespacedName{Namespace: testNS, Name: name}, &n); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
+		g.t.Fatal(err)
+	}
+	return &n
+}
+
+func (g *nodeRig) pod(ns, name string) *corev1.Pod {
+	g.t.Helper()
+	var p corev1.Pod
+	if err := g.cl.Get(context.Background(), types.NamespacedName{Namespace: ns, Name: name}, &p); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
+		g.t.Fatal(err)
+	}
+	return &p
+}
+
+// running makes p scheduled on machine with the agent ready (or not).
+func (g *nodeRig) running(p *corev1.Pod, machine string, ready bool) {
+	g.t.Helper()
+	p.Spec.NodeName = machine
+	if err := g.cl.Update(context.Background(), p); err != nil {
+		g.t.Fatal(err)
+	}
+	p.Status.Phase = corev1.PodRunning
+	p.Status.ContainerStatuses = []corev1.ContainerStatus{{Name: AgentContainer, Ready: ready, Image: p.Spec.Containers[containerIndex(p.Spec.Containers, AgentContainer)].Image, ImageID: "sha256:old"}}
+	if err := g.cl.Status().Update(context.Background(), p); err != nil {
+		g.t.Fatal(err)
+	}
+}
+
+func machine(name string) *corev1.Node {
+	return &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: name, Labels: map[string]string{LabelZone: "z-a"}}}
+}
+
+func TestNodeServerZeroBootstrapsThenServes(t *testing.T) {
+	g := newNodeRig(t, testCluster(), node("prod-server-0", v1.RoleServer, "", "z-a"), machine("m1"))
+	g.reconcile("prod-server-0")
+	p := g.pod(testNS, "prod-server-0")
+	if p == nil || !strings.Contains(p.Spec.InitContainers[0].Command[2], "sandboxd init --files-only") {
+		t.Fatalf("server-0 pod = %+v", p)
+	}
+	if len(p.OwnerReferences) != 1 || p.OwnerReferences[0].Name != "prod-server-0" {
+		t.Fatalf("owner = %+v", p.OwnerReferences)
+	}
+	if len(g.api.minted) != 0 {
+		t.Fatal("server 0 of a new cluster minted a join token")
+	}
+	if n := g.node("prod-server-0"); n.Status.State != v1.StatePending {
+		t.Fatalf("state %s", n.Status.State)
+	}
+	// Scheduled, agent not ready: joining.
+	g.running(p, "m1", false)
+	g.reconcile("prod-server-0")
+	if n := g.node("prod-server-0"); n.Status.State != v1.StateJoining {
+		t.Fatalf("state %s", n.Status.State)
+	}
+	// Ready, but not a member yet: still joining.
+	p = g.pod(testNS, "prod-server-0")
+	g.running(p, "m1", true)
+	g.reconcile("prod-server-0")
+	if n := g.node("prod-server-0"); n.Status.State != v1.StateJoining {
+		t.Fatalf("state %s", n.Status.State)
+	}
+	g.api.nodes["prod-server-0"] = aerolapi.Node{Alive: true, Version: "v0.7.2", SandboxesRunning: 0,
+		Capacity: aerolapi.Capacity{CPUBudget: 4, ReservedCPU: 1, MemoryBudgetMB: 4096, ReservedMemoryMB: 1024}}
+	g.reconcile("prod-server-0")
+	n := g.node("prod-server-0")
+	if n.Status.State != v1.StateServing || n.Status.Version != "v0.7.2" || n.Status.FreeCPU != "3.0" || n.Status.FreeMemory != "3072Mi" {
+		t.Fatalf("serving status = %+v", n.Status)
+	}
+	// Gossip loses it: suspect. It restarts: restarting.
+	g.now = g.now.Add(2 * time.Minute)
+	g.api.nodes["prod-server-0"] = aerolapi.Node{Alive: false}
+	g.reconcile("prod-server-0")
+	if n := g.node("prod-server-0"); n.Status.State != v1.StateSuspect {
+		t.Fatalf("state %s", n.Status.State)
+	}
+	g.api.nodes["prod-server-0"] = aerolapi.Node{Alive: true, Restarting: true}
+	g.reconcile("prod-server-0")
+	if n := g.node("prod-server-0"); n.Status.State != v1.StateRestarting {
+		t.Fatalf("state %s", n.Status.State)
+	}
+}
+
+func TestNodeWorkerJoinsWithItsOwnToken(t *testing.T) {
+	c := bootstrapped(testCluster())
+	g := newNodeRig(t, c, node("prod-general-aaaaa", v1.RoleWorker, "general", "z-a"), machine("m1"))
+	g.api.mintErr = errors.New("leader down")
+	g.reconcile("prod-general-aaaaa")
+	if n := g.node("prod-general-aaaaa"); n.Status.State != v1.StatePending || !strings.Contains(n.Status.Reason, "join token") {
+		t.Fatalf("no token: %+v", n.Status)
+	}
+	if g.pod(testWorkerNS, "prod-general-aaaaa") != nil {
+		t.Fatal("pod made without its token")
+	}
+	g.api.mintErr = nil
+	g.reconcile("prod-general-aaaaa")
+	var s corev1.Secret
+	if err := g.cl.Get(context.Background(), types.NamespacedName{Namespace: testWorkerNS, Name: "prod-general-aaaaa-join"}, &s); err != nil {
+		t.Fatal(err)
+	}
+	if string(s.Data["token"]) != "tok-worker" || string(s.Data["join_url"]) != "https://s0:7003" || len(g.api.minted) != 1 {
+		t.Fatalf("join secret = %v minted %v", s.Data, g.api.minted)
+	}
+	p := g.pod(testWorkerNS, "prod-general-aaaaa")
+	if p == nil || len(p.OwnerReferences) != 0 {
+		t.Fatalf("worker pod = %+v (no owner reference across namespaces)", p)
+	}
+	g.running(p, "m1", true)
+	g.api.nodes["prod-general-aaaaa"] = aerolapi.Node{Alive: true, SandboxesRunning: 4}
+	g.reconcile("prod-general-aaaaa")
+	if n := g.node("prod-general-aaaaa"); n.Status.State != v1.StateServing || n.Status.Sandboxes != 4 {
+		t.Fatalf("status = %+v", n.Status)
+	}
+	// The spent token is gone.
+	if err := g.cl.Get(context.Background(), types.NamespacedName{Namespace: testWorkerNS, Name: "prod-general-aaaaa-join"}, &s); !apierrors.IsNotFound(err) {
+		t.Fatalf("join secret after serving: %v", err)
+	}
+	// Cordoned in AerolVM: draining.
+	g.api.nodes["prod-general-aaaaa"] = aerolapi.Node{Alive: true, Drained: true}
+	g.reconcile("prod-general-aaaaa")
+	if n := g.node("prod-general-aaaaa"); n.Status.State != v1.StateDraining {
+		t.Fatalf("state %s", n.Status.State)
+	}
+}
+
+// A worker whose setup keeps failing is ended and replaced; a server
+// stays Failed for a person.
+func TestNodeSetupFailing(t *testing.T) {
+	c := bootstrapped(testCluster())
+	g := newNodeRig(t, c, node("prod-general-bbbbb", v1.RoleWorker, "general", "z-a"), node("prod-server-1", v1.RoleServer, "", "z-b"), machine("m1"))
+	g.reconcile("prod-general-bbbbb")
+	g.reconcile("prod-server-1")
+	for _, ref := range []types.NamespacedName{{Namespace: testWorkerNS, Name: "prod-general-bbbbb"}, {Namespace: testNS, Name: "prod-server-1"}} {
+		p := g.pod(ref.Namespace, ref.Name)
+		p.Spec.NodeName = "m1"
+		if err := g.cl.Update(context.Background(), p); err != nil {
+			t.Fatal(err)
+		}
+		p.Status.InitContainerStatuses = []corev1.ContainerStatus{{Name: SetupContainer,
+			State: corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: "CrashLoopBackOff", Message: "join refused"}}}}
+		if err := g.cl.Status().Update(context.Background(), p); err != nil {
+			t.Fatal(err)
+		}
+	}
+	g.now = time.Now().Add(10 * time.Minute)
+	g.reconcile("prod-general-bbbbb")
+	if n := g.node("prod-general-bbbbb"); n.Status.State != v1.StateFailed || g.pod(testWorkerNS, "prod-general-bbbbb") != nil {
+		t.Fatalf("worker: %+v", n.Status)
+	}
+	g.reconcile("prod-server-1")
+	if n := g.node("prod-server-1"); n.Status.State != v1.StateFailed || g.pod(testNS, "prod-server-1") == nil {
+		t.Fatalf("server: %+v", n.Status)
+	}
+}
+
+// Its turn in the rollout: the agent (and edge) image swaps in place.
+func TestNodeSwapsAgentOnItsTurn(t *testing.T) {
+	c := bootstrapped(testCluster())
+	n := node("prod-general-ccccc", v1.RoleWorker, "general", "z-a")
+	g := newNodeRig(t, c, n, machine("m1"))
+	g.reconcile(n.Name)
+	p := g.pod(testWorkerNS, n.Name)
+	g.running(p, "m1", true)
+	g.api.nodes[n.Name] = aerolapi.Node{Alive: true}
+	cur := g.node(n.Name)
+	cur.Annotations = map[string]string{AnnotationAgentVersion: "v0.7.3"}
+	if err := g.cl.Update(context.Background(), cur); err != nil {
+		t.Fatal(err)
+	}
+	g.reconcile(n.Name)
+	p = g.pod(testWorkerNS, n.Name)
+	if p.Spec.Containers[1].Image != "registry.example/aerol/aerolvm:v0.7.3" || p.Spec.Containers[2].Image != "registry.example/aerol/aerolvm-edge:v0.7.3" {
+		t.Fatalf("images %s %s", p.Spec.Containers[1].Image, p.Spec.Containers[2].Image)
+	}
+	if p.Spec.Containers[0].Image != "registry.example/aerol/aerolvm-runtime:v0.7.2" {
+		t.Fatal("the runtime container's image changed in place: every sandbox would end")
+	}
+	if got := g.node(n.Name); got.Status.AgentImageID != "sha256:old" {
+		t.Fatalf("old image id not kept: %+v", got.Status)
+	}
+	// Again: already swapped, nothing to do.
+	g.reconcile(n.Name)
+}
+
+// Maintenance mode (C22): the server's pod is made again holding its
+// volume, and back as a server when the annotation goes.
+func TestNodeServerMaintenance(t *testing.T) {
+	c := bootstrapped(testCluster())
+	n := node("prod-server-2", v1.RoleServer, "", "z-c")
+	g := newNodeRig(t, c, n)
+	g.reconcile(n.Name)
+	if g.pod(testNS, n.Name) == nil {
+		t.Fatal("no pod")
+	}
+	set := func(on bool) {
+		cur := g.node(n.Name)
+		cur.Annotations = map[string]string{}
+		if on {
+			cur.Annotations[v1.AnnotationMaintenance] = "true"
+		}
+		if err := g.cl.Update(context.Background(), cur); err != nil {
+			t.Fatal(err)
+		}
+	}
+	set(true)
+	g.reconcile(n.Name) // deletes the server pod
+	if g.pod(testNS, n.Name) != nil || g.node(n.Name).Status.State != v1.StateMaintenance {
+		t.Fatal("server pod not replaced for maintenance")
+	}
+	g.reconcile(n.Name) // makes the held pod
+	p := g.pod(testNS, n.Name)
+	if p == nil || p.Labels[v1.AnnotationMaintenance] != "true" || len(p.Spec.InitContainers) != 0 {
+		t.Fatalf("held pod = %+v", p)
+	}
+	g.reconcile(n.Name)
+	if g.node(n.Name).Status.State != v1.StateMaintenance {
+		t.Fatal("not held")
+	}
+	set(false)
+	g.reconcile(n.Name)
+	if g.pod(testNS, n.Name) != nil {
+		t.Fatal("held pod kept after maintenance")
+	}
+	g.reconcile(n.Name)
+	if p := g.pod(testNS, n.Name); p == nil || p.Labels[v1.AnnotationMaintenance] == "true" {
+		t.Fatal("server not back")
+	}
+}
+
+// A worker's machine is gone (its Node deleted): the leader hears it, and
+// once failover is done the node leaves and the AerolNode goes.
+func TestNodeMachineGoneThenRemoved(t *testing.T) {
+	c := bootstrapped(testCluster())
+	n := node("prod-general-ddddd", v1.RoleWorker, "general", "z-a")
+	g := newNodeRig(t, c, n, machine("m1"))
+	g.reconcile(n.Name)
+	p := g.pod(testWorkerNS, n.Name)
+	g.running(p, "m-gone", true)
+	before := testutilCounter(workerPodsLost)
+	g.reconcile(n.Name)
+	if len(g.api.gone) != 1 || g.node(n.Name).Status.State != v1.StateSuspect || testutilCounter(workerPodsLost) != before+1 {
+		t.Fatalf("gone %v state %s", g.api.gone, g.node(n.Name).Status.State)
+	}
+	// The pod goes with its Node.
+	if err := g.cl.Delete(context.Background(), p); err != nil {
+		t.Fatal(err)
+	}
+	g.api.nodes[n.Name] = aerolapi.Node{Alive: true}
+	g.reconcile(n.Name) // partition: still alive in gossip, nothing removed
+	if len(g.api.deleted) != 0 {
+		t.Fatal("deleted a live node")
+	}
+	g.api.nodes[n.Name] = aerolapi.Node{Alive: false, SandboxesOwned: 3}
+	g.reconcile(n.Name)
+	if g.node(n.Name).Status.State != v1.StateDead {
+		t.Fatalf("state %s", g.node(n.Name).Status.State)
+	}
+	g.api.nodes[n.Name] = aerolapi.Node{Alive: false}
+	g.reconcile(n.Name)
+	if len(g.api.deleted) != 1 || g.node(n.Name).Status.State != v1.StateRemoved {
+		t.Fatalf("deleted %v state %s", g.api.deleted, g.node(n.Name).Status.State)
+	}
+	g.reconcile(n.Name)
+	if g.node(n.Name) != nil {
+		t.Fatal("removed AerolNode kept")
+	}
+}
+
+// The machine is cordoned: the worker decommissions, waits its drain
+// window, moves what it can, and leaves.
+func TestNodeDecommission(t *testing.T) {
+	c := bootstrapped(testCluster())
+	short := metav1.Duration{Duration: time.Minute}
+	c.Spec.WorkerPools[0].Decommission = v1.DecommissionSpec{DrainWindow: &short}
+	n := node("prod-general-eeeee", v1.RoleWorker, "general", "z-a")
+	m := machine("m1")
+	g := newNodeRig(t, c, n, m)
+	g.reconcile(n.Name)
+	p := g.pod(testWorkerNS, n.Name)
+	g.running(p, "m1", true)
+	g.api.nodes[n.Name] = aerolapi.Node{Alive: true, SandboxesOwned: 4}
+	m.Spec.Unschedulable = true
+	if err := g.cl.Update(context.Background(), m); err != nil {
+		t.Fatal(err)
+	}
+	g.reconcile(n.Name) // trigger
+	if g.node(n.Name).Annotations[v1.AnnotationDecommission] != "true" {
+		t.Fatal("a cordoned machine did not start a decommission")
+	}
+	g.reconcile(n.Name) // drain window
+	got := g.node(n.Name)
+	if got.Status.State != v1.StateDraining || got.Status.Decommission == nil || len(g.api.cordoned) != 1 {
+		t.Fatalf("draining = %+v cordoned %v", got.Status, g.api.cordoned)
+	}
+	passes := 0
+	g.api.evacuate = func(id string, req aerolapi.EvacuateRequest) (aerolapi.EvacuateResult, error) {
+		passes++
+		if passes == 1 {
+			return aerolapi.EvacuateResult{Moved: []string{"a", "b"}, RemainingMovable: 1, Remaining: 1}, nil
+		}
+		return aerolapi.EvacuateResult{Moved: []string{"c"}, Remaining: 1, Stopped: 1, Done: !req.StopRemaining && false || req.StopRemaining}, nil
+	}
+	g.now = g.now.Add(2 * time.Minute)
+	g.reconcile(n.Name)
+	if got := g.node(n.Name); got.Status.State != v1.StateDecommissioning || got.Status.Decommission.Moved != 2 || got.Status.Decommission.Remaining != 2 {
+		t.Fatalf("pass 1 = %+v", got.Status)
+	}
+	g.now = g.now.Add(time.Hour) // past the deadline: stop the rest
+	g.reconcile(n.Name)
+	if g.pod(testWorkerNS, n.Name) != nil {
+		t.Fatal("pod kept after the decommission ended")
+	}
+	got = g.node(n.Name)
+	if got.Status.State != v1.StateRemoved || !got.Status.Decommission.NodeDeleted || got.Status.Decommission.Moved != 3 || len(g.api.deleted) != 1 {
+		t.Fatalf("after = %+v deleted %v", got.Status, g.api.deleted)
+	}
+}
+
+// The webhook's twin: deleting an AerolNode cleans up its worker pod and
+// token in the worker namespace, which owner references cannot reach.
+func TestNodeCleanupAcrossNamespaces(t *testing.T) {
+	c := bootstrapped(testCluster())
+	n := node("prod-general-fffff", v1.RoleWorker, "general", "z-a")
+	n.Finalizers = []string{"test/hold"}
+	g := newNodeRig(t, c, n)
+	g.reconcile(n.Name)
+	if g.pod(testWorkerNS, n.Name) == nil {
+		t.Fatal("no pod")
+	}
+	if err := g.cl.Delete(context.Background(), g.node(n.Name)); err != nil {
+		t.Fatal(err)
+	}
+	g.reconcile(n.Name)
+	if g.pod(testWorkerNS, n.Name) != nil {
+		t.Fatal("worker pod left behind")
+	}
+}
+
+func TestDecommissionDefaultsAndDrift(t *testing.T) {
+	if drainWindow(nil) != defaultDrainWindow || drainWindow(&v1.WorkerPoolSpec{Provisioner: "eks-managed"}) != eksManagedDrain {
+		t.Fatal("drain window defaults")
+	}
+	if decomDeadline(nil) != defaultDecomDeadline {
+		t.Fatal("deadline default")
+	}
+	c := bootstrapped(testCluster())
+	n := node("prod-general-ggggg", v1.RoleWorker, "general", "z-a")
+	g := newNodeRig(t, c, n, machine("m7"))
+	nc := &unstructured.Unstructured{}
+	nc.SetGroupVersionKind(nodeClaimGVK)
+	nc.SetName("nc-1")
+	_ = unstructured.SetNestedField(nc.Object, "m7", "status", "nodeName")
+	_ = unstructured.SetNestedSlice(nc.Object, []any{map[string]any{"type": "Drifted", "status": "True"}}, "status", "conditions")
+	if err := g.cl.Create(context.Background(), nc); err != nil {
+		t.Skipf("the fake client cannot hold a NodeClaim: %v", err)
+	}
+	if !g.r.nodeClaimDrifted(context.Background(), "m7") || g.r.nodeClaimDrifted(context.Background(), "m8") {
+		t.Fatal("drift not read")
+	}
+	g.r.retireMachine(context.Background(), "m7")
+	if g.r.nodeClaim(context.Background(), "m7") != nil {
+		t.Fatal("NodeClaim not deleted")
+	}
+}
