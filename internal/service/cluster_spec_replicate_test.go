@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -19,11 +20,25 @@ type specWriteThroughCluster struct {
 	mu       sync.Mutex
 	spec     *models.CreateSandboxRequest
 	upserted []models.CreateSandboxRequest
+	// reads counts SpecOf calls: on a worker each one is a round trip to
+	// the servers (Agent.SpecOf → lookupPlacement).
+	reads int
+}
+
+func recreateFailover() *models.Failover {
+	return &models.Failover{Policy: models.FailoverPolicyRecreate}
+}
+
+func (s *specWriteThroughCluster) readCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.reads
 }
 
 func (s *specWriteThroughCluster) SpecOf(string) *models.CreateSandboxRequest {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.reads++
 	if s.spec == nil {
 		return nil
 	}
@@ -111,7 +126,7 @@ func TestUpdateLifecycleWritesThroughToClusterSpec(t *testing.T) {
 	const sandboxID = "sb-lifecycle-replicate"
 	if err := st.Create(ctx, &models.Sandbox{
 		ID: sandboxID, Image: "alpine", Status: models.SandboxStatusStarted,
-		ContainerID: "ctr-lifecycle-replicate", ContainerIP: "10.0.0.31",
+		ContainerID: "ctr-lifecycle-replicate", Failover: recreateFailover(), ContainerIP: "10.0.0.31",
 		CPU: 1, MemoryMB: 512, Runtime: models.RuntimeDocker,
 		CreatedAt: now, UpdatedAt: now,
 	}); err != nil {
@@ -181,7 +196,7 @@ func TestUpdateTagsWritesThroughToClusterSpec(t *testing.T) {
 	const sandboxID = "sb-tags-replicate"
 	if err := st.Create(ctx, &models.Sandbox{
 		ID: sandboxID, Image: "alpine", Status: models.SandboxStatusStarted,
-		ContainerID: "ctr-tags-replicate", ContainerIP: "10.0.0.32",
+		ContainerID: "ctr-tags-replicate", Failover: recreateFailover(), ContainerIP: "10.0.0.32",
 		CPU: 1, MemoryMB: 512, Runtime: models.RuntimeDocker,
 		CreatedAt: now, UpdatedAt: now,
 	}); err != nil {
@@ -244,7 +259,7 @@ func TestUpsertCompatStateWritesThroughToClusterSpec(t *testing.T) {
 	const sandboxID = "sb-compat-replicate"
 	if err := st.Create(ctx, &models.Sandbox{
 		ID: sandboxID, Image: "alpine", Status: models.SandboxStatusStarted,
-		ContainerID: "ctr-compat-replicate", ContainerIP: "10.0.0.34",
+		ContainerID: "ctr-compat-replicate", Failover: recreateFailover(), ContainerIP: "10.0.0.34",
 		CPU: 1, MemoryMB: 512, Runtime: models.RuntimeDocker,
 		CreatedAt: now, UpdatedAt: now,
 	}); err != nil {
@@ -309,5 +324,131 @@ func TestNormalizeCreateRequestStripsCompatState(t *testing.T) {
 	}
 	if got := normalizeCreateRequest(req); got.CompatState != nil {
 		t.Fatalf("normalizeCreateRequest kept CompatState = %+v, want nil", got.CompatState)
+	}
+}
+
+// TestSpecWriteThroughRaftWrites pins how many replicated-spec writes (each a
+// Raft log entry) and spec reads (each a round trip to the servers from a
+// worker) one service call makes. Every /v1 and facade route that changes a
+// sandbox's lifecycle, tags, facade state or size ends in one of these calls,
+// so this table is the per-route Raft cost.
+//
+//   - Lifecycle, tags and facade state are read back only by a failover
+//     recreate, so a sandbox without failover=recreate writes nothing and
+//     reads nothing: an E2B setTimeout keep-alive on a default sandbox is free.
+//   - A write that changes nothing is skipped, whatever the policy.
+//   - Size is read by team quotas for every sandbox, so a resize always writes.
+func TestSpecWriteThroughRaftWrites(t *testing.T) {
+	lifecycle := func(svc *Service, id string) error {
+		_, err := svc.UpdateLifecycle(context.Background(), id, models.Lifecycle{StopIfIdleFor: 5 * time.Minute})
+		return err
+	}
+	tags := func(svc *Service, id string) error {
+		return svc.UpdateTags(context.Background(), id, map[string]string{"team": "sdk"})
+	}
+	facadeState := func(svc *Service, id string) error {
+		return svc.UpsertCompatState(context.Background(), id, models.FacadeE2B, `{"on_timeout":"pause"}`)
+	}
+	resize := func(svc *Service, id string) error {
+		_, err := svc.ResizeSandbox(context.Background(), id, models.ResizeSandboxRequest{CPU: 2, MemoryMB: 1024})
+		return err
+	}
+
+	const skipReads = -1
+	cases := []struct {
+		name       string
+		recreate   bool
+		op         func(*Service, string) error
+		calls      int
+		wantWrites int
+		wantReads  int // skipReads: not asserted
+	}{
+		{"lifecycle, default sandbox", false, lifecycle, 1, 0, 0},
+		{"lifecycle, failover sandbox", true, lifecycle, 1, 1, skipReads},
+		{"lifecycle, failover sandbox, same value twice", true, lifecycle, 2, 1, skipReads},
+		{"tags, default sandbox", false, tags, 1, 0, 0},
+		{"tags, failover sandbox", true, tags, 1, 1, skipReads},
+		{"tags, failover sandbox, same value twice", true, tags, 2, 1, skipReads},
+		{"facade state, default sandbox", false, facadeState, 1, 0, 0},
+		{"facade state, failover sandbox", true, facadeState, 1, 1, skipReads},
+		{"facade state, failover sandbox, same value twice", true, facadeState, 2, 1, skipReads},
+		{"resize, default sandbox", false, resize, 1, 1, skipReads},
+	}
+	for i, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			svc, _, st := newCapacityHarness(t, nil, nil)
+			stub := &specWriteThroughCluster{
+				Noop: cluster.NewNoop("self", "http://self", ""),
+				spec: &models.CreateSandboxRequest{Image: "alpine", CPU: 1, MemoryMB: 512, DiskGB: 1},
+			}
+			svc.AttachCluster(stub)
+
+			id := fmt.Sprintf("sb-raft-writes-%d", i)
+			sb := &models.Sandbox{
+				ID: id, Image: "alpine", Status: models.SandboxStatusStarted,
+				ContainerID: "ctr-" + id, ContainerIP: fmt.Sprintf("10.0.1.%d", i+1),
+				CPU: 1, MemoryMB: 512, DiskGB: 1, Runtime: models.RuntimeDocker,
+				CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC(),
+			}
+			if tc.recreate {
+				sb.Failover = recreateFailover()
+			}
+			if err := st.Create(ctx, sb); err != nil {
+				t.Fatalf("seed sandbox: %v", err)
+			}
+
+			for n := 0; n < tc.calls; n++ {
+				if err := tc.op(svc, id); err != nil {
+					t.Fatalf("call %d: %v", n+1, err)
+				}
+			}
+			if got := len(stub.calls()); got != tc.wantWrites {
+				t.Errorf("Raft spec writes = %d, want %d", got, tc.wantWrites)
+			}
+			if tc.wantReads != skipReads {
+				if got := stub.readCount(); got != tc.wantReads {
+					t.Errorf("spec reads (server round trips) = %d, want %d", got, tc.wantReads)
+				}
+			}
+		})
+	}
+}
+
+// TestReplicateRecoverySpecPatchSkipsStandalone pins the single-node short
+// circuit: with the Noop cluster there is no replicated spec, so the helper
+// returns before reading the store, even for a failover=recreate row, and
+// the patch never runs. With a real cluster the same row is patched.
+func TestReplicateRecoverySpecPatchSkipsStandalone(t *testing.T) {
+	ctx := context.Background()
+	svc, _, st := newCapacityHarness(t, nil, nil)
+	now := time.Now().UTC()
+	const sandboxID = "sb-recovery-standalone"
+	if err := st.Create(ctx, &models.Sandbox{
+		ID: sandboxID, Image: "alpine", Status: models.SandboxStatusStarted,
+		ContainerID: "ctr-recovery-standalone", ContainerIP: "10.0.0.36",
+		CPU: 1, MemoryMB: 512, Runtime: models.RuntimeDocker, Failover: recreateFailover(),
+		CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("seed sandbox: %v", err)
+	}
+
+	patched := 0
+	patch := func(spec *models.CreateSandboxRequest) { patched++; spec.Tags = map[string]string{"k": "v"} }
+
+	svc.AttachCluster(cluster.NewNoop("self", "http://self", ""))
+	svc.replicateRecoverySpecPatch(ctx, sandboxID, nil, patch)
+	if patched != 0 {
+		t.Fatalf("standalone: patch ran %d times, want 0", patched)
+	}
+
+	stub := &specWriteThroughCluster{
+		Noop: cluster.NewNoop("self", "http://self", ""),
+		spec: &models.CreateSandboxRequest{Image: "alpine"},
+	}
+	svc.AttachCluster(stub)
+	svc.replicateRecoverySpecPatch(ctx, sandboxID, nil, patch)
+	if patched != 1 || len(stub.calls()) != 1 {
+		t.Fatalf("cluster: patch ran %d times and wrote %d specs, want 1 and 1", patched, len(stub.calls()))
 	}
 }
