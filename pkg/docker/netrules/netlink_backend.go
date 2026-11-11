@@ -22,6 +22,8 @@ type nftAPI interface {
 	DelRule(r *nftables.Rule) error
 	ListChains() ([]*nftables.Chain, error)
 	AddChain(c *nftables.Chain) *nftables.Chain
+	ListTablesOfFamily(family nftables.TableFamily) ([]*nftables.Table, error)
+	AddTable(t *nftables.Table) *nftables.Table
 	FlushChain(c *nftables.Chain)
 	Flush() error
 }
@@ -201,6 +203,9 @@ func (b *netlinkBackend) EnsureUserChain(chain string) error {
 			c.Table.Name == tbl.Name && c.Table.Family == tbl.Family {
 			return nil
 		}
+	}
+	if err := ensureTable(conn, tbl); err != nil {
+		return err
 	}
 	conn.AddChain(&nftables.Chain{Name: chain, Table: tbl})
 	if err := conn.Flush(); err != nil {
@@ -441,6 +446,28 @@ func (b *netlinkBackend) FlushChain(chain string) error {
 
 // ensureBaseChain adds a filter base chain (policy accept, priority 0) when
 // the table has none of that name yet.
+// ensureTable queues the table's creation, in the caller's batch, when it
+// does not exist yet. On a host with Docker or iptables-nft in use, the ip
+// filter table is always there; in a network namespace nothing has touched
+// (a Kubernetes worker pod's), there are no tables at all, and adding a
+// chain to a missing table failed with ENOENT, so sandboxd exited at boot
+// (Kubernetes Phase 0, finding F1). Listed first, not added blindly: adding
+// an existing table is an update, and nothing here should change a table
+// someone else made.
+func ensureTable(conn nftAPI, tbl *nftables.Table) error {
+	tables, err := conn.ListTablesOfFamily(tbl.Family)
+	if err != nil {
+		return fmt.Errorf("nft list tables: %w", err)
+	}
+	for _, t := range tables {
+		if t != nil && t.Name == tbl.Name {
+			return nil
+		}
+	}
+	conn.AddTable(tbl)
+	return nil
+}
+
 func ensureBaseChain(conn nftAPI, tbl *nftables.Table, name string, hook *nftables.ChainHook) error {
 	chains, err := conn.ListChains()
 	if err != nil {
@@ -450,6 +477,9 @@ func ensureBaseChain(conn nftAPI, tbl *nftables.Table, name string, hook *nftabl
 		if c != nil && c.Name == name && c.Table != nil && c.Table.Name == tbl.Name && c.Table.Family == tbl.Family {
 			return nil
 		}
+	}
+	if err := ensureTable(conn, tbl); err != nil {
+		return err
 	}
 	accept := nftables.ChainPolicyAccept
 	conn.AddChain(&nftables.Chain{
