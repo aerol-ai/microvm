@@ -242,9 +242,11 @@ func (s *Service) OwnershipFenced(id string) bool {
 		return false
 	}
 	s.ownership.mu.Lock()
-	defer s.ownership.mu.Unlock()
 	_, ok := s.ownership.fenced[id]
-	return ok
+	s.ownership.mu.Unlock()
+	// A sandbox released for a decommission move (C9) is held the same way:
+	// its placement is about to name another node.
+	return ok || s.moveFenced(id)
 }
 
 // FenceOwnershipForTest marks ids fenced without touching the runtime, for

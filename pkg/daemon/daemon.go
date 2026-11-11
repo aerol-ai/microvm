@@ -697,6 +697,12 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 			logger.Error("cluster: client exposes no AttachRecreator; failover recreation is disabled on this node",
 				"node_role", cfg.NodeRole)
 		}
+		// A server that also runs sandboxes (mixed role) is its own
+		// decommission source or target (C9); a worker agent serves the
+		// leader's move route straight from the service.
+		if withMoves, ok := clusterClient.(interface{ AttachMoveHandler(cluster.MoveHandler) }); ok {
+			withMoves.AttachMoveHandler(svc)
+		}
 		// Phase 6 PR-D: template-aware placement. The capacity lease
 		// cache asks the service for the local "ready" template
 		// inventory at every heartbeat tick; the result is overlaid

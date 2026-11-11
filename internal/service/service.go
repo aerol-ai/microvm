@@ -637,6 +637,9 @@ type Service struct {
 	// ownership is the worker's ownership lease and fence
 	// (ownership_lease.go). Zero value: not begun, fences nothing.
 	ownership ownershipLease
+	// moves holds the sandboxes released for a decommission move (C9,
+	// decommission.go); OwnershipFenced folds them in.
+	moves moveFences
 	// ownershipFile writes that lease for the runtime supervisor
 	// (ownership_lease_file.go).
 	ownershipFile ownershipLeaseFile
