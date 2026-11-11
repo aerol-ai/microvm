@@ -1811,8 +1811,9 @@ What it says:
 The live half, still to run: the same reserves on three server nodes of the
 EC2 harness, so a real disk and network replace the 6.5 ms model.
 
-**Cost so far:** eleven clusters and two S6 instances, about 12 hours of
-cluster time in all, about $7.40 (the m7i.4xlarge S3 runs are about two
+**Cost so far:** twelve clusters and two S6 instances, about 13.5 hours of
+cluster time in all, about $8.70 (the last cluster proved #1145 and #1146
+live) (the m7i.4xlarge S3 runs are about two
 thirds of it). S4's offline half cost nothing.
 
 ## 19. Tests, drills and benchmarks

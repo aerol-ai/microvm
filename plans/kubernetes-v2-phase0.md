@@ -77,12 +77,12 @@ to main.
 
 | Item | PR | Base | State |
 |---|---|---|---|
-| F12: sandboxd misses deaths without Docker (event fan-in; reconcile) | #1142 | main | Open |
+| F12: sandboxd misses deaths without Docker (event fan-in; reconcile) | #1142 | main | **Merged** |
 | F1: create the ip filter table when missing | #1144 | main | Open; kernel test fails on main, passes here |
-| F3: size admission from the sandboxes' cgroup | #1145 | #1141 | Open |
-| F10: sandboxd makes each sandbox the kernel's whole OOM choice | #1146 | #1141 | Open; live S3 with `--no-keeper` running |
+| F3: size admission from the sandboxes' cgroup | #1145 | #1141 | Open; **proven live**: 15 CPUs and 51,200 MB from the cgroup (machine 16 and 63,258); a create into a full cgroup gets 503 in 0.84 s |
+| F10: sandboxd makes each sandbox the kernel's whole OOM choice | #1146 | #1141 | Open; **proven live** with the harness loop off: 1,003 groups marked by sandboxd, only whole sandboxes killed, pod limit never hit, sandboxd answered. 4 late gVisor processes found unmarked; a second pass once ready fixes it |
 | C12: cell number in new sandbox IDs | #1147 | main | Open |
-| Go 1.26.11 for GO-2026-6859 (blocks `go-security` on every PR) | #1143 | main | Open; merge first |
+| Go 1.26.11 for GO-2026-6859 (blocks `go-security` on every PR) | #1143 | main | **Merged** |
 
 Next, in order: C1 (a cluster-aware `/ready`; needs "cut off" defined
 against the ownership lease), F13 (mount helpers where `runsc` runs), C2
