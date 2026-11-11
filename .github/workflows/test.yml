@@ -47,6 +47,7 @@ jobs:
       rust_sdk: ${{ (github.event_name != 'pull_request' || github.base_ref == 'main') && steps.filter.outputs.rust_sdk || 'false' }}
       installer: ${{ (github.event_name != 'pull_request' || github.base_ref == 'main') && steps.filter.outputs.installer || 'false' }}
       installer_harness: ${{ (github.event_name != 'pull_request' || github.base_ref == 'main') && steps.filter.outputs.installer_harness || 'false' }}
+      kubernetes: ${{ (github.event_name != 'pull_request' || github.base_ref == 'main') && steps.filter.outputs.kubernetes || 'false' }}
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -148,6 +149,17 @@ jobs:
               - '.github/workflows/release.yml'
               # caddy_version_test checks the plugin's Caddy pin.
               - 'caddymod/go.mod'
+            # The Helm chart, the images and the runtime supervisor: the
+            # kubernetes job lints the chart and runs it on kind.
+            kubernetes:
+              - 'charts/**'
+              - 'packaging/images/**'
+              - 'scripts/build-images.sh'
+              - 'scripts/k8s-dev.sh'
+              - 'scripts/k8s-smoke.sh'
+              - 'cmd/aerolvm-supervisor/**'
+              - 'internal/supervisor/**'
+              - '.github/workflows/test.yml'
 
   # go-tests and go-race each run as two jobs. "cluster-service" runs
   # internal/cluster and internal/service, each split by test name into parts
@@ -770,6 +782,56 @@ jobs:
           go test -tags integration -count=1 \
             -run '^(TestEveryCaseThatStopsSandboxdWaitsForTheRejoin|TestTheRejoinWaitIsWiredEndToEnd|TestDisruptiveCasesChooseANonSeedVictim|TestParseMachineConfigRealScenarios)$' \
             ./integration-tests/suite/
+
+  # The Helm chart in single mode on kind (plans/kubernetes-v2-architecture.md,
+  # Phase 1 exit): lint and render it, build the images from this checkout,
+  # install it, use a runc and a gVisor sandbox through the API, and delete
+  # the worker pod with them running (finding F8). Advisory, like the other
+  # heavy suites; it runs only when the chart, the images or the supervisor
+  # change.
+  kubernetes:
+    needs: paths
+    if: needs.paths.outputs.kubernetes == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install Helm and kind
+        run: |
+          curl -fsSL -o helm.tgz https://get.helm.sh/helm-v3.22.1-linux-amd64.tar.gz
+          echo "896cf63684a42a723d61c980369d6e588330927deb13676ca0d85006dd6da0ea  helm.tgz" | sha256sum -c -
+          tar -xzf helm.tgz linux-amd64/helm
+          sudo install -m 0755 linux-amd64/helm /usr/local/bin/helm
+          curl -fsSL -o kind https://github.com/kubernetes-sigs/kind/releases/download/v0.33.0/kind-linux-amd64
+          echo "aee6151561422756b764a4ae28e7f44cda5af5a9eead3cc9985112b1de8d8e0d  kind" | sha256sum -c -
+          sudo install -m 0755 kind /usr/local/bin/kind
+
+      - name: Lint and render the chart
+        run: |
+          helm lint charts/aerolvm
+          helm template t charts/aerolvm | grep -q 'kind: StatefulSet'
+          if helm template t charts/aerolvm --set mode=cluster >/dev/null 2>&1; then
+            echo "::error::mode=cluster rendered; only single mode exists"
+            exit 1
+          fi
+
+      - name: Install single mode on kind
+        run: make k8s-dev
+
+      - name: Smoke test
+        run: scripts/k8s-smoke.sh
+
+      - name: Worker logs
+        if: failure()
+        run: kubectl -n aerolvm logs aerolvm-0 --all-containers --tail=200 || true
 
   # Job id stays `changes` because ruleset 16186085 requires that check.
   # It gates the merge on the DCO sign-off (checked in `paths`) and the
