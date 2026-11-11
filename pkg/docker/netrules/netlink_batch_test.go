@@ -168,6 +168,10 @@ func (f *chainNFT) Flush() error {
 func (f *chainNFT) ListChains() ([]*nftables.Chain, error)     { return nil, nil }
 func (f *chainNFT) AddChain(c *nftables.Chain) *nftables.Chain { return c }
 func (f *chainNFT) FlushChain(*nftables.Chain)                 {}
+func (f *chainNFT) ListTablesOfFamily(nftables.TableFamily) ([]*nftables.Table, error) {
+	return nil, nil
+}
+func (f *chainNFT) AddTable(t *nftables.Table) *nftables.Table { return t }
 
 func netlinkChainBackend(f *chainNFT) *netlinkBackend {
 	return &netlinkBackend{newConn: func() (nftAPI, error) { return f, nil }}
