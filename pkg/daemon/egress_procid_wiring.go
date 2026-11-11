@@ -36,9 +36,10 @@ func gatewayIDs(name string) (uint32, int, error) {
 		if !pair {
 			gidText = uidText
 		}
-		gid, err := strconv.ParseUint(gidText, 10, 32)
-		if err != nil {
-			return 0, 0, fmt.Errorf("gid %q is not a number", gidText)
+		// Signed 32-bit, so the gid fits int on the 32-bit builds too.
+		gid, err := strconv.ParseInt(gidText, 10, 32)
+		if err != nil || gid < 0 {
+			return 0, 0, fmt.Errorf("gid %q is not a number from 0 to 2147483647", gidText)
 		}
 		return uint32(uid), int(gid), nil
 	}

@@ -90,6 +90,8 @@ func TestGatewayIDs(t *testing.T) {
 		{name: "0", uid: 0, gid: 0},
 		{name: "nobody-here", wantErr: "unknown user"},
 		{name: "65532:abc", wantErr: `gid "abc" is not a number`},
+		{name: "65532:4294967295", wantErr: `gid "4294967295" is not a number from 0 to 2147483647`},
+		{name: "65532:-1", wantErr: `gid "-1" is not a number`},
 		{name: "abc:1", wantErr: `uid "abc" is not a number`},
 		{name: "4294967296", wantErr: "unknown user"},
 		{name: "bad-uid", wantErr: `uid "x"`},
