@@ -2266,7 +2266,7 @@ func TestHostFromURLMoreWave16(t *testing.T) {
 	_ = l4ListenPort("bad")
 	_ = sandboxContainerRef(&models.Sandbox{ContainerID: "c", ID: "s"})
 	_ = sandboxContainerRef(&models.Sandbox{ID: "s"})
-	_, _ = GenerateSandboxID()
+	_, _ = (&Service{}).NewSandboxID()
 }
 
 func TestReconcileOfflineWasmAndFCWave17(t *testing.T) {
@@ -5745,9 +5745,9 @@ func TestThinWrappersAndSettersWave7(t *testing.T) {
 	_ = imageStillReferenced(nil, "img")
 	_ = imageStillReferenced([]*models.Sandbox{{Image: "img", Status: models.SandboxStatusStarted}}, "img")
 	_ = imageStillReferenced([]*models.Sandbox{{Image: "other", Status: models.SandboxStatusStarted}}, "img")
-	id, err := GenerateSandboxID()
+	id, err := (&Service{}).NewSandboxID()
 	if err != nil || id == "" {
-		t.Fatalf("GenerateSandboxID: %v %q", err, id)
+		t.Fatalf("NewSandboxID: %v %q", err, id)
 	}
 }
 

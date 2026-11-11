@@ -44,7 +44,7 @@ const (
 // is not idempotent, which keeps the mechanism opt-in. The owner is mixed in so
 // two tenants that happen to choose the same key never collide, and so a
 // derived id satisfies CreateSandboxWithID's owner check on replay. The shape
-// ("sb-" + 16 hex) matches service.GenerateSandboxID, so the id is a valid
+// ("sb-" + 16 hex) matches Service.NewSandboxID, so the id is a valid
 // container name and is indistinguishable downstream from a random one.
 func DeterministicSandboxID(ownerRef, key string) string {
 	key = strings.TrimSpace(key)
@@ -321,7 +321,7 @@ func Prepare(w http.ResponseWriter, r *http.Request, svc *service.Service, req m
 	// bounded instead of O(fleet) (one Member per eligible worker).
 	sandboxID := strings.TrimSpace(opts.PreferredSandboxID)
 	if sandboxID == "" {
-		generated, genErr := service.GenerateSandboxID()
+		generated, genErr := svc.NewSandboxID()
 		if genErr != nil {
 			writeMsg(w, http.StatusInternalServerError, "cluster: generate sandbox id: "+genErr.Error())
 			return Decision{}, false

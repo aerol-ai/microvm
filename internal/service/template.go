@@ -610,7 +610,7 @@ func (s *Service) runTemplateGC(ctx context.Context, now time.Time) {
 }
 
 // generateTemplateID returns "tpl-<16 hex chars>". Same shape as
-// generateSandboxID — different prefix so a glance at the ID
+// NewSandboxID — different prefix so a glance at the ID
 // immediately distinguishes a template from a sandbox.
 func generateTemplateID() (string, error) {
 	buf := make([]byte, 8)

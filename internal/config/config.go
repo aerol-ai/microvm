@@ -1165,6 +1165,12 @@ type Config struct {
 	// EnableCluster=false — single-node mode is implicitly "mixed".
 	NodeRole string
 	NodeID   string
+	// CellID is the cell this node's sandboxes belong to, 1 to 255
+	// (SB_CELL_ID, default 1). New sandbox IDs carry it in their first two
+	// hex digits, so once there is more than one cell a gateway can route
+	// an ID without a lookup (plans/kubernetes-v2-architecture.md §12.3,
+	// C12). Every node of one cluster is one cell and must share it.
+	CellID int
 	// NodeName is the operator-friendly label gossiped to peers and shown on
 	// the dashboard (e.g. "node1", "wrk2"). Display-only; raft/gossip identity
 	// stays on NodeID. SB_NODE_NAME; empty falls back to NodeID at display
@@ -3167,6 +3173,9 @@ func load(keyTool bool) (Config, error) {
 	if err := cfg.loadAPIAdmissionConfig(); err != nil {
 		return Config{}, err
 	}
+	if err := cfg.loadCellID(); err != nil {
+		return Config{}, err
+	}
 	if err := validateSandboxTokens(&cfg); err != nil {
 		return Config{}, err
 	}
@@ -3661,6 +3670,23 @@ func checkClusterCredentialKey(cfg Config) error {
 		}
 		return fmt.Errorf("stat %s: %w", cfg.CredentialEncryptionKeyPath, err)
 	}
+	return nil
+}
+
+// loadCellID reads SB_CELL_ID strictly: a value that is not a number from
+// 1 to 255 stops the boot. getEnvInt's quiet fall back to the default
+// would put a node with a typo in cell 1, and its IDs in the wrong cell.
+func (c *Config) loadCellID() error {
+	c.CellID = 1
+	v := strings.TrimSpace(os.Getenv("SB_CELL_ID"))
+	if v == "" {
+		return nil
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 1 || n > 255 {
+		return fmt.Errorf("SB_CELL_ID must be a cell number from 1 to 255, got %q", v)
+	}
+	c.CellID = n
 	return nil
 }
 

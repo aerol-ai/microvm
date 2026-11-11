@@ -2072,7 +2072,7 @@ func ValidTemplateID(templateID string) bool {
 }
 
 // sandboxIDPattern is the delimiter-safe grammar for a sandbox ID. It matches
-// what generateSandboxID produces ("sb-" + hex) and the warm-slot / facade IDs
+// what Service.NewSandboxID produces ("sb-" + hex) and the warm-slot / facade IDs
 // (fc-*, wasm-*, iso-*), and it is the grammar the firecracker and containerd
 // drivers already enforce. Disallowing '.', '/', and every other separator is
 // what makes an ID safe to use as a filesystem path component, a URL segment,

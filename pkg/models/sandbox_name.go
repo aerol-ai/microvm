@@ -15,7 +15,7 @@ import (
 // another tenant's key, so new creates reject it.
 const SandboxNameOwnerPrefix = "owner:"
 
-// generatedSandboxIDPattern is the shape generateSandboxID produces
+// generatedSandboxIDPattern is the shape Service.NewSandboxID produces
 // ("sb-" + 16 lowercase hex). Clients route a reference by this shape alone:
 // a ref that matches is an ID, anything else is a name. A name with this
 // shape would be unreachable by name, so creates reject it.
