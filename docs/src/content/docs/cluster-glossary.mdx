@@ -89,6 +89,7 @@ You do not need to set these yourself. They help when you read logs or fix probl
 | `SB_NODE_LABELS` | This node's labels, as `key=value` pairs split by commas, such as `tier=pci,gpu=a10`. A create can ask for labels. At most 16 labels. A bad label stops the node from starting. | Empty (no labels) |
 | `SB_CLUSTER_BOOTSTRAP` | `true` only on the seed, `false` on every other node. Only a node whose role has `server`, or is `mixed`, can be the seed. | `false` |
 | `SB_CLUSTER_MAX_AUTO_VOTERS` | The most server nodes that vote. Extra server nodes join as non-voters. `0` means no cap. | `5` |
+| `SB_READY_LEADER_GRACE` | How long a node may go without hearing from a working control plane before `GET /ready` answers 503, such as `10s`. Keep it above a normal leader election (a second or two) so one election does not take every node out of rotation. | `10s` |
 
 ### Addresses
 
