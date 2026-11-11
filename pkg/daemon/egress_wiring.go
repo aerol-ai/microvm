@@ -9,7 +9,6 @@ import (
 
 	"github.com/aerol-ai/microvm/internal/config"
 	"github.com/aerol-ai/microvm/internal/egress"
-	"github.com/aerol-ai/microvm/internal/network/cni"
 	"github.com/aerol-ai/microvm/internal/service"
 	"github.com/aerol-ai/microvm/pkg/docker"
 	"github.com/aerol-ai/microvm/pkg/models"
@@ -49,8 +48,9 @@ func wireEgressGateway(ctx context.Context, cfg config.Config, svc *service.Serv
 			}
 		}
 		if cfg.ContainerEngine == models.ContainerEngineContainerd {
-			if gw, ok := firstHost(cni.DefaultBridgeSubnet); ok {
-				out = append(out, egress.Bridge{Name: "aerolvm0", GatewayIP: gw, Subnet: netip.MustParsePrefix(cni.DefaultBridgeSubnet).Masked()})
+			subnet := containerdBridgeSubnet(cfg)
+			if gw, ok := firstHost(subnet); ok {
+				out = append(out, egress.Bridge{Name: "aerolvm0", GatewayIP: gw, Subnet: netip.MustParsePrefix(subnet).Masked()})
 			}
 		}
 		return out
