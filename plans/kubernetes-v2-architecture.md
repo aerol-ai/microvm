@@ -1458,6 +1458,7 @@ or the smoke test until the spike worked around it. Phase 1 must fix each in
 | F9 | cAdvisor, inside the kubelet, tracks every sandbox's cgroup as its own container: 57 series per sandbox, with no pod or container label. At 1,000 sandboxes one node exposes 57,823 cAdvisor series (1,095 with none), so a Prometheus scraping 2,000 such nodes would hold over 100 million series. The worker pod's own series stay at 177. | None needed for the spike | Eng review D3's decision, now with numbers: P9's ServiceMonitor drops `/sandboxes/` series at scrape time (metric relabelling), and the operator documents it; or move sandbox cgroups out of cAdvisor's view, if a kubelet setting allows it. Usage per sandbox comes from C20, not from cAdvisor. |
 | F10 | **One pod-level out-of-memory event killed every process in the worker container:** all sandboxes, every shim, `containerd` and `sandboxd` (one event; 172 runsc helpers, 88 shims, 77 runsc, 61 gVisor sentries, 21 runsc sandbox processes, 2 containerd, 2 sandboxd). The kubelet's default (`singleProcessOOMKill` unset, so false) kills a container's processes as one group. §8.3 assumed the kernel would stop one sandbox first and the machinery last; on EKS 1.36 it does not. The kubelet did not evict the pod and the node never reported MemoryPressure: it was the pod's cgroup limit alone. | `common.sh` (`c7_setup`, `keep_sandboxes_first`, `in_runtime_group`): group-kill off, each sandbox's group on, a cap on `sandboxes/`, containerd inside the cap. Proven by S3's seventh run | The design under "F10, seven runs" below, in `sandboxd` and the worker image. Not the kubelet's `singleProcessOOMKill: true`: a gVisor sandbox is several processes sharing one memory file, so killing one frees nothing (fourth run). Admission sized from the pod's limit (F3), with each sandbox's helpers counted. |
 | F13 | In the split pod, an external mount (FUSE: rclone, sshfs, s3fs) never reaches the sandbox, and the create still succeeds: `sandboxd` runs the helper in the agent container and mounts under `/var/lib/sandboxd/mounts`, a folder the runtime container shares without mount propagation, so `runsc` binds the empty folder underneath. The sandbox silently writes to local disk. An agent restart also ends the helper, and nothing mounts it again. (The one-container worker does not have the first problem.) Also: `fusermount3` needs `/bin/mount` (util-linux) in the image. | None | Phase 1 (with C7 and F8): mount helpers run where `runsc` runs (the runtime container, or a helper there the agent asks), so the mount is in the namespace that builds the sandbox and outlives agent restarts; `sandboxd` checks the mount is visible to the runtime before it starts the sandbox and fails the create if not; after an agent restart it finds the live helpers instead of dropping them. OV-E2 reruns as the test. |
+| F14 | `sandboxd init` and `sandboxd join` need systemd. They write the cluster's files (the CA, this node's certificate, the gossip key, the server key, `cluster.env`), then run `systemctl daemon-reload` and restart `sandboxd`; with no systemd that step fails and they remove every file they wrote. A server or gateway pod cannot be set up with them. | None (found reading `internal/nodejoin/init.go`, 2026-11-11, while setting up C5's measurement) | Phase 2, with the operator: it makes the cluster's files (or `sandboxd init` gets a mode that only writes them) and mounts them into server and gateway pods. C5's `restricted` measurement waits for that. |
 | F11 | At 1M placements a Raft snapshot holds up Apply for about 1.1 s, and the FSM takes 2.4 GiB per server (S4, offline). Small at G3's 100,000 per cell. | None needed | Phase 3: snapshot without copying every row under the lock, before any cell is meant to hold 1M placements. Until then cells stay at or below 250k. |
 | F12 | After S3's seventh run, 14 sandboxes the kernel had killed (their groups empty) were still listed as `started` 12 minutes later, and a command sent to one got a 502. `sandboxd`'s log shows its Docker event stream failing (F4), and containerd failing to publish its OOM events under the pressure ("context deadline exceeded"). The containerd engine has its own event stream (`internal/runtime/containerd/events.go`); why it did not mark them is not yet known. | None | Phase 1: find why, then make a sandbox's death reach its row on the containerd engine (task exit, OOM event, or an empty group found by reconcile), and tell its owner it was killed for memory. A regression test kills a sandbox's group and checks the row. |
 | F7 | Bottlerocket 1.68 sets `user.max_user_namespaces=0`. gVisor's gofer makes a user namespace, so every gVisor create fails with "fork/exec /proc/self/exe: no space left on device". It also means Kubernetes user namespaces (spike S9) cannot work on a default Bottlerocket node. | Raised to 62775 at run time from a node debug pod | A bank decision, not code: Bottlerocket's `settings.kernel.sysctl` raises it per node pool. The chart's docs and `aerolvm k8s verify` (P8) must check it. |
@@ -1581,8 +1582,13 @@ reason for each line instead of "privileged". It is still not enough for the
 split pod: S2's shared `/run/netns` needs Bidirectional mount propagation,
 which Kubernetes allows only in privileged containers. So S7 holds for the
 split worker only once F8's fix lands (make the namespaces in the runtime
-container). Not yet run: S7 on Bottlerocket (F7 applies there too) and S3
-with the list.
+container). S7 on Bottlerocket (run `p0-br`, 2026-11-11, EKS 1.36, m6id.xlarge,
+with C7 and F7's stand-in) passes the same way: a gVisor sandbox in 1,515 ms,
+`kubectl exec` works, and the sandbox sits in `sandboxes/<id>` with its own
+1 GiB limit. A first try without C7 failed with `runsc` unable to write
+`/sys/fs/cgroup/cgroup.subtree_control` (read-only): the read-write remount
+is part of C7's setup, so a pod without `privileged` needs both. Not yet run:
+S3 with the list.
 
 **S3, scale and memory pressure** (run `p0-s3`, m7i.4xlarge, AL2023, a 15-CPU
 54 GiB Guaranteed worker pod, C7 on, 2026-11-11):
@@ -1675,9 +1681,10 @@ What it shows:
   in `/proc/mounts`. Name the device. Phase 1's worker mounts the NVMe on a
   path of its own, not over a volume.
 
-So C27 can give each sandbox its own disk limit on local NVMe (AL2023;
-Bottlerocket not run). The 10%-free create refusal and the alert stay as
-designed, for the image store and the database.
+So C27 can give each sandbox its own disk limit on local NVMe, on AL2023
+and on Bottlerocket (run `p0-br`, 2026-11-11, the same machine type: 99.0 MB
+against 100 MB, and 300 MB unlimited). The 10%-free create refusal and the
+alert stay as designed, for the image store and the database.
 
 **S6, Firecracker on a nested-virtualization machine: pass** (2026-11-11,
 one m8i.xlarge with `CpuOptions.NestedVirtualization=enabled`, Amazon Linux

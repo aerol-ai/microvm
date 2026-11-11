@@ -61,10 +61,10 @@ anything else, as the plan's Phase 0 exit gate says.
 | S1 | **Done, 2026-11-10. Pass** on AL2023 and Bottlerocket with the C7 prototype (`SB_CONTAINERD_CGROUP_PARENT`), loading `br_netfilter` (F2) and, on Bottlerocket, raising `user.max_user_namespaces` (F7) | Same |
 | S2 | **Done, 2026-11-10. Pass:** only the agent restarted; the sandbox kept running with the same processes. Finding F8 (namespace mounts leak onto the machine). The external-mount part (OV-E2) **fails** (2026-11-11): in the split pod an rclone mount never reaches the sandbox and the create still succeeds; the agent swap also ends the helper (F13) | v2 plan §18, "Phase 0 results" |
 | S9 | **Done, 2026-11-10. Fails on per-sandbox limits:** a user-namespaced pod cannot make cgroups (read-only, not delegated). Networking and gVisor work. Images keep S7's answer | v2 plan §18, "Phase 0 results" |
-| S7 | **Done for the one-container worker on AL2023, 2026-11-10. Pass** with 14 named rights, seccomp and AppArmor unconfined, and two stand-ins (cgroup and `/proc/sys` remounted read-write). The split pod needs F8's fix first (Bidirectional propagation needs privileged). Bottlerocket not run | v2 plan §18, "Phase 0 results" |
+| S7 | **Done for the one-container worker on AL2023, 2026-11-10. Pass** with 14 named rights, seccomp and AppArmor unconfined, and two stand-ins (cgroup and `/proc/sys` remounted read-write). The split pod needs F8's fix first (Bidirectional propagation needs privileged). **Bottlerocket: pass, 2026-11-11** (run `p0-br`, with C7 and F7's stand-in): a gVisor sandbox in 1,515 ms, in its own 1 GiB group inside the pod. Without C7 it fails: the cgroup remount is part of C7's setup, and `runsc` cannot write a read-only `/sys/fs/cgroup` | v2 plan §18, "Phase 0 results" |
 | S3 | **Done, 2026-11-11.** 1,000 gVisor sandboxes in one pod; findings F9 (57 cAdvisor series per sandbox) and F10 (one pod-level OOM kills the whole worker, machinery included). No eviction: the pod's own limit is the danger. **F10 fixed in the seventh run:** a cap on `sandboxes/`, containerd and its shims inside it, `memory.min` on `sandboxd`'s group; the pod's limit was never hit, only whole sandboxes died, `sandboxd` answered and created. New finding F12: `sandboxd` did not notice the killed sandboxes | v2 plan §18, "Phase 0 results" |
 | S4 | **Offline half done, 2026-11-11.** FSM apply about 8 µs at 100k to 1M placements; commits about 2,000 a second with 64 in flight (6.5 ms modelled sync); at 1M a snapshot holds up Apply for 1.1 s and the FSM needs 2.4 GiB (finding F11, for Phase 3). Live half (three EC2 server nodes) still to run | v2 plan §18, "Phase 0 results" |
-| S8 | **Done, 2026-11-11. Pass** on AL2023 (m6id.xlarge NVMe as XFS with project quotas): a gVisor sandbox with a 100 MB quota stopped at 99.0 MB, the other wrote 300 MB; gVisor keeps its root overlay in a disk file in the writable layer. Bottlerocket not run | v2 plan §18, "Phase 0 results" |
+| S8 | **Done, 2026-11-11. Pass** on AL2023 (m6id.xlarge NVMe as XFS with project quotas): a gVisor sandbox with a 100 MB quota stopped at 99.0 MB, the other wrote 300 MB; gVisor keeps its root overlay in a disk file in the writable layer. **Bottlerocket: pass, 2026-11-11** (run `p0-br`, the same m6id.xlarge NVMe): 99.0 MB against 100 MB, and 300 MB unlimited | v2 plan §18, "Phase 0 results" |
 | S6 | **Done, 2026-11-11. Pass:** m8i.xlarge with nested virtualization has `/dev/kvm`; Firecracker v1.18.0 cold-booted a guest 5 of 5 times in 817 to 862 ms. Not compared with metal; warm pool and snapshot restore not measured under nested virtualization (needed for N7) | v2 plan §18, "Phase 0 results" |
 | N1 | **First run done, 2026-11-11.** Same machine type, same gVisor sandbox: cold p50 1.16 s (agent-sandbox) against 239 ms (AerolVM); warm 290 ms against 19 ms; a burst of 20 on a pool of 5 in about 5 s against 1.2 s; 231 Kubernetes API writes for 10 sandboxes against 0. Agent-sandbox times include about 0.2 s of `kubectl`. Still to measure: p99, several templates, a command's round trip, machine-full density | v2 plan §18, "Phase 0 results" |
 | S5 | **Done, 2026-11-11. Pass:** Karpenter 1.15.1 left a drifted machine alone for 3 minutes while the worker had `do-not-disrupt`, then replaced it within 2 minutes of the operator stand-in letting go; a managed node group AMI upgrade cordoned first, the stand-in let the worker go 37 s later, and the upgrade succeeded in 450 s. On Karpenter pools the signal is NodeClaim `Drifted`, not a cordon | v2 plan §18, "Phase 0 results" |
@@ -83,11 +83,22 @@ to main.
 | F10: sandboxd makes each sandbox the kernel's whole OOM choice | #1146 | #1141 | Open; **proven live** with the harness loop off: 1,003 groups marked by sandboxd, only whole sandboxes killed, pod limit never hit, sandboxd answered. 4 late gVisor processes found unmarked; a second pass once ready fixes it |
 | C12: cell number in new sandbox IDs | #1147 | main | Open |
 | C1: `GET /ready`, 503 while cut off from the control plane (the first plan's D8) | #1148 | main | Open |
+| C2: `SB_DOCKER_ENABLED=false`, no Docker on the containerd engine (F4, F5) | #1149 | main | Open |
+| C27 part 1: refuse new sandboxes under a disk floor (`SB_DISK_FLOOR_RATIO`), 80% alert | #1150 | main | Open; **proven live** on Bottlerocket: at 5% free a create got 503 "disk floor breached"; after freeing, the next create succeeded |
+| C27 part 2: `diskGB` as an XFS project quota on each containerd sandbox (`SB_CONTAINERD_DISK_QUOTA`) | #1151 | main | Open; **proven live** on Bottlerocket: gVisor and runc with 1 GB stopped at 1023 MB, 3 GB wrote 2 GB, a resize to 2 GB let 1 GB more through. The first live try found overlay copy-up failing (EXDEV) with only the upper directory in the project; fixed |
+| C3: the containerd sandbox range as a setting (`SB_CONTAINERD_BRIDGE_SUBNET`) | #1152 | main | Open; **proven live** on Bottlerocket with 10.200.0.0/16: runc at 10.200.0.2, gVisor at 10.200.0.3, both online, no rule left naming 10.88.0.0/16 |
+| C6: the egress gateway without systemd (numeric `SB_EGRESS_GATEWAY_USER`, `SB_EGRESS_PEER_CGROUP=none`) | #1153 | main | Open; **proven live** on Bottlerocket: gateway as uid 65532 with only `NET_ADMIN` and `NET_BIND_SERVICE`, `egress_gateway_ready`, example.com allowed and another site blocked |
 | Go 1.26.11 for GO-2026-6859 (blocks `go-security` on every PR) | #1143 | main | **Merged** |
 
-Next, in order: F13 (mount helpers where `runsc` runs), C2
-(no Docker on the containerd engine), then C7's split worker in the images
-(P1) and the chart's `single` mode (P3).
+Next, in order: C4 (Raft dials DNS names), then C7's split worker in the
+images (P1) and the chart's `single` mode (P3). C5 (servers and gateways
+under `restricted` pod security) is measured once those pods exist: their
+cluster files cannot come from `sandboxd init` in a pod (finding F14), so
+the measurement needs the chart's or the operator's way of making them.
+F13's fix (mount helpers where `runsc` runs) needs a small privileged helper
+in the runtime container, the same helper F8's fix needs; that helper is N2,
+which waits for its gate (Phase 0 done, N1, the facts checked again, and the
+bank's answer to Q6).
 
 ## Cost, before it is spent
 
