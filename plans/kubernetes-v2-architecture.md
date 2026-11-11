@@ -982,6 +982,9 @@ cordons first.
 
 - **Karpenter (EKS) and Node Auto Provisioning (AKS, which is Karpenter
   underneath).** Worker pods carry `karpenter.sh/do-not-disrupt: "true"`.
+  Karpenter does not cordon a machine that annotation holds, so on these
+  pools the operator watches the NodeClaim's `Drifted` condition instead of
+  a cordon (Phase 0 S5).
   That annotation stops consolidation always, and stops drift only when the
   NodePool has no `terminationGracePeriod`. It does **not** stop expiry, node
   auto-repair or interruption, and a `terminationGracePeriod` overrides both
@@ -1323,7 +1326,7 @@ example admission policy that refuses unsigned AerolVM images.
 | C2 | No Docker check when the engine is containerd; start with no Docker present | No Docker on EKS or AKS machines | S |
 | C3 | Sandbox address range as a setting | A sandbox may need to reach a bank network in 10.88.0.0/16 | S–M, fragile area, regression tests |
 | C4 | Raft advertises and dials DNS names | Server pods change IP when they move (L1) | M, fragile area, regression tests |
-| C5 | Gateways and servers run with no special rights | `restricted` pod security | To measure |
+| C5 | Gateways and servers run with no special rights | `restricted` pod security | **Measured on kind, 2026-11-11:** a server and an ingress pod ran under `restricted` (uid 65532, no capabilities, read-only root), set up with F14's `--files-only`; the server led, the gateway joined, both `/ready` 200. Each needs `SB_CONTAINER_ENGINE=containerd` (with `SB_DOCKER_ENABLED=false`), its database in a folder sandboxd makes (`SB_DB_PATH=/var/lib/sandboxd/db/state.db`: it cannot change the mode of a volume's own root) and a writable `/run/sandboxd`; Phase 2's chart sets these (`integration-tests/k8s/c5.sh`) |
 | C6 | Egress gateway starts without systemd | No systemd in a pod | S |
 | C7 | Split the worker into `runtime`, `agent` and `edge` containers; containerd socket and shared folders; every sandbox's cgroup under the pod, refused otherwise. **The ownership lease is enforced where the sandboxes live** (CEO review outside voice, critical): today only `sandboxd` checks it (`internal/service/ownership_lease.go:193-197`), so with the `agent` down its sandboxes would keep running while the cluster recreates them. The `agent` renews a local lease file in the shared folder; the `runtime` supervisor stops every sandbox when that file's expiry passes without renewal. A test keeps the `agent` down past the lease and checks no sandbox runs twice. Mount helpers (`pkg/mounts`) also run under the `runtime` container's cgroup with Bidirectional mount propagation, so sandboxes keep their mounts across an `agent` restart (eng review OV-E2). | Sections 8.2, 8.3 | M |
 | C8 | "Restarting" notice before an in-place restart **outside a rollout** (a pod `SIGTERM` or kubelet restart), wired to the existing `TransferLeadership` on servers; rollout restarts are already covered (`dead_owner.go:178`) Applies to every cluster, plain VMs included (eng review D9, which reverses D7 for this item): existing VM tests are updated to the new behavior, table rows assert it on VMs, and the release note says VM clusters change. | Section 10.2 (L2) | M, cluster area, regression tests |
@@ -1415,7 +1418,7 @@ the gate below is met.**
 
 | # | Item | Why | Today (checked 2026-11-11) | Depends on | Size |
 |---|---|---|---|---|---|
-| N1 | Side-by-side benchmark: agent-sandbox with gVisor next to AerolVM's worker pod, on the same EKS cluster and machine type. Cold and warm start p50 and p99, a burst larger than the warm pool, several templates, one command's round trip, sandboxes per machine until full, etcd writes per sandbox. | Every comparison so far uses numbers from different machines: agent-sandbox on kind on a laptop, AerolVM on EC2. | Not run | S1 | M |
+| N1 | Side-by-side benchmark: agent-sandbox with gVisor next to AerolVM's worker pod, on the same EKS cluster and machine type. Cold and warm start p50 and p99, a burst larger than the warm pool, several templates, one command's round trip, sandboxes per machine until full, etcd writes per sandbox. | Every comparison so far uses numbers from different machines: agent-sandbox on kind on a laptop, AerolVM on EC2. | Done 2026-11-11 (runs `p0-n1`, `p1-n1`; §18, "Phase 0 results") | S1 | M |
 | N2 | Split `sandboxd` on the worker: an unprivileged part reads API calls, uploads and mount settings; a small privileged helper does only the network, firewall, cgroup and mount work, behind a narrow local API. | A bug in the code that reads tenant input stops being root on the machine. This is the largest security gap against agent-sandbox, whose own code never runs privileged on a machine. | `sandboxd` runs as root with no hardening on VMs (`packaging/sandboxd.service`), and mount helpers run on the host (`pkg/mounts/adapters`) | S7 and S9 results | L |
 | N3 | A read-only `kubectl get sandboxes` (list and get; namespace equals owner, D10), served by the gateways through an aggregated API before C17. Nothing is written to etcd. | The Kubernetes-native view without waiting for Phase 6. | Not built (C17 is Phase 6) | §16's aggregated-API design | M |
 | N4 | Create-policy rules in OPA (Rego), evaluated in-process at create time, with per-team rules, next to today's fixed rules. Boot-path latency is called out in its PR. | The bank's own policy language judges each sandbox, as its admission policy does for agent-sandbox pods. | `internal/createpolicy` is a fixed YAML schema, one file for every caller on a node; no Rego, OPA or CEL | — | M |
@@ -1426,6 +1429,462 @@ the gate below is met.**
 
 Order after the gate: N2 and N6 first, for the bank's security review; then N8;
 then N3, N4 and N5. N7 follows S6.
+
+### Phase 0 results
+
+Filled in as each spike runs (`plans/kubernetes-v2-phase0.md`). Harness:
+`integration-tests/k8s/`.
+
+**H0, the harness: pass** (2026-11-10, run `p0-h0-1`). EKS 1.36.5,
+Amazon Linux 2023 with kernel 6.18.56 on an m7i.xlarge worker. Inside one
+privileged pod: our own containerd 2.1.4, runc 1.3.0, the latest gVisor, and
+`sandboxd` built from this branch on the containerd engine. One gVisor sandbox
+was created in 1,878 ms (cold, image pull included, through a port-forward),
+and a command ran in it. The pod is in the Guaranteed class.
+
+**What the runs found that a VM never showed.** Each one stopped `sandboxd`
+or the smoke test until the spike worked around it. Phase 1 must fix each in
+`sandboxd`:
+
+| # | Found | Spike's stand-in | Phase 1 fix |
+|---|---|---|---|
+| F1 | `sandboxd` adds its `AEROLVM-USER` chain to an `ip filter` table it never creates (`pkg/docker/netrules/netlink_backend.go`, `EnsureUserChain`). On a VM, Docker made the table; a new pod network has none, so `sandboxd` exits. | `run.sh` creates the `filter` tables and their base chains with `nft` | `sandboxd` creates the table and its `FORWARD` chain when they are missing |
+| F2 | Stock EKS AL2023 nodes do not load `br_netfilter`. `sandboxd` refuses to start without `bridge-nf-call-iptables`, rightly: traffic between sandboxes on one bridge would skip the firewall. A pod cannot load a module without the host's `/lib/modules`, a host path K4 forbids. | Loaded once from a node debug pod | A design choice for §8.4: route each sandbox on its own link with no bridge, or bridge-family `nft` rules, or have the bank's node configuration load the module |
+| F3 | Capacity admission sizes itself from the machine (4 cores, 15,705 MB), not the pod's limit (3 CPUs, 12 GiB). | None | Read the limits from the pod's own cgroup |
+| F4 | `/health` reports "degraded" because it pings Docker (confirms C2). Docker's reconcile and event stream log an error every 30 s. | None needed | C2, plus: no Docker client at all on the containerd engine |
+| F5 | The egress floor and node guard for the Docker engine need Docker, and on a host without it they fail and log an error on every pass. The containerd ones install. (Corrected after Phase 0: this first said creates on runtime `docker` were refused. On the containerd engine every runtime's create is gated by the containerd floor, `nodeGuardRuntimeName`, so they are not; a runc create on the worker is still to be run live.) | None needed | The same as F4: no Docker floor or guard on the containerd engine |
+| F6 | Hostname-filtered egress needs the egress gateway (its user and socket), which the pod lacks, so those creates are refused. | None | The gateway as one more container in the worker pod |
+| F8 | With the agent's `/run/netns` shared to the runtime container by Bidirectional mount propagation, the network namespaces `sandboxd` mounts there land in the machine's own mount table. When the pod is deleted or dies, nothing removes them: the kubelet cannot tear the volume down, and the pod sticks in Terminating. It also breaks K4 (AerolVM touches the machine only through the kernel). | `lib.sh` unmounts them in the machine's mount namespace (`nsenter -t 1 -m`) before replacing a worker pod | Make the namespaces where they are used: in the runtime container, through a small privileged helper (the N2 split), so nothing has to cross containers or reach the machine |
+| F9 | cAdvisor, inside the kubelet, tracks every sandbox's cgroup as its own container: 57 series per sandbox, with no pod or container label. At 1,000 sandboxes one node exposes 57,823 cAdvisor series (1,095 with none), so a Prometheus scraping 2,000 such nodes would hold over 100 million series. The worker pod's own series stay at 177. | None needed for the spike | Eng review D3's decision, now with numbers: P9's ServiceMonitor drops `/sandboxes/` series at scrape time (metric relabelling), and the operator documents it; or move sandbox cgroups out of cAdvisor's view, if a kubelet setting allows it. Usage per sandbox comes from C20, not from cAdvisor. |
+| F10 | **One pod-level out-of-memory event killed every process in the worker container:** all sandboxes, every shim, `containerd` and `sandboxd` (one event; 172 runsc helpers, 88 shims, 77 runsc, 61 gVisor sentries, 21 runsc sandbox processes, 2 containerd, 2 sandboxd). The kubelet's default (`singleProcessOOMKill` unset, so false) kills a container's processes as one group. §8.3 assumed the kernel would stop one sandbox first and the machinery last; on EKS 1.36 it does not. The kubelet did not evict the pod and the node never reported MemoryPressure: it was the pod's cgroup limit alone. | `common.sh` (`c7_setup`, `keep_sandboxes_first`, `in_runtime_group`): group-kill off, each sandbox's group on, a cap on `sandboxes/`, containerd inside the cap. Proven by S3's seventh run | The design under "F10, seven runs" below, in `sandboxd` and the worker image. Not the kubelet's `singleProcessOOMKill: true`: a gVisor sandbox is several processes sharing one memory file, so killing one frees nothing (fourth run). Admission sized from the pod's limit (F3), with each sandbox's helpers counted. |
+| F13 | In the split pod, an external mount (FUSE: rclone, sshfs, s3fs) never reaches the sandbox, and the create still succeeds: `sandboxd` runs the helper in the agent container and mounts under `/var/lib/sandboxd/mounts`, a folder the runtime container shares without mount propagation, so `runsc` binds the empty folder underneath. The sandbox silently writes to local disk. An agent restart also ends the helper, and nothing mounts it again. (The one-container worker does not have the first problem.) Also: `fusermount3` needs `/bin/mount` (util-linux) in the image. | None | Phase 1 (with C7 and F8): mount helpers run where `runsc` runs (the runtime container, or a helper there the agent asks), so the mount is in the namespace that builds the sandbox and outlives agent restarts; `sandboxd` checks the mount is visible to the runtime before it starts the sandbox and fails the create if not; after an agent restart it finds the live helpers instead of dropping them. OV-E2 reruns as the test. |
+| F14 | `sandboxd init` and `sandboxd join` need systemd. They write the cluster's files (the CA, this node's certificate, the gossip key, the server key, `cluster.env`), then run `systemctl daemon-reload` and restart `sandboxd`; with no systemd that step fails and they remove every file they wrote. A server or gateway pod cannot be set up with them. | None (found reading `internal/nodejoin/init.go`, 2026-11-11, while setting up C5's measurement) | **Fixed (feat/f14-files-only):** `sandboxd init --files-only` and `sandboxd join ... --files-only` write the files and stop: no root, no drop-in, no restart. A plain `init` re-run against the started sandboxd admits the node and registers tokens, without root. C5 measured with it on kind (§18). |
+| F16 | Admission counts a worker's live pending reservations by walking them on every reserve (`livePendingReservationCountLocked`, `internal/cluster/fsm.go`). S4's live run left every reserve pending on one stand-in worker, so filling to 100,000 dropped from 1,816 to 192 reserves a second (a local CPU profile: 38% in that walk). On a real cell a worker's pending reservations are its creates in flight, so the cost stays small. | S4 live (run `p1-s4`) | Phase 3, with F11: keep a live count per worker if one worker ever has thousands of creates in flight. |
+| F11 | At 1M placements a Raft snapshot holds up Apply for about 1.1 s, and the FSM takes 2.4 GiB per server (S4, offline). Small at G3's 100,000 per cell. | None needed | Phase 3: snapshot without copying every row under the lock, before any cell is meant to hold 1M placements. Until then cells stay at or below 250k. |
+| F12 | After S3's seventh run, 14 sandboxes the kernel had killed (their groups empty) were still listed as `started` 12 minutes later, and a command sent to one got a 502. `sandboxd`'s log shows its Docker event stream failing (F4), and containerd failing to publish its OOM events under the pressure ("context deadline exceeded"). The containerd engine has its own event stream (`internal/runtime/containerd/events.go`); why it did not mark them is not yet known. | None | Phase 1: find why, then make a sandbox's death reach its row on the containerd engine (task exit, OOM event, or an empty group found by reconcile), and tell its owner it was killed for memory. A regression test kills a sandbox's group and checks the row. |
+| F7 | Bottlerocket 1.68 sets `user.max_user_namespaces=0`. gVisor's gofer makes a user namespace, so every gVisor create fails with "fork/exec /proc/self/exe: no space left on device". It also means Kubernetes user namespaces (spike S9) cannot work on a default Bottlerocket node. | Raised to 62775 at run time from a node debug pod | A bank decision, not code: Bottlerocket's `settings.kernel.sysctl` raises it per node pool. The chart's docs and `aerolvm k8s verify` (P8) must check it. |
+
+**S1, where a sandbox lands: half done** (same run).
+
+- **Network: pass.** The bridge `aerolvm0`, the sandboxes' links and the
+  network-namespace pool are all inside the pod's network. The machine's own
+  links (`lo`, its two ENIs, one VPC CNI link) show none of them.
+- **cgroup, without C7: fails as §8.3 predicted.** The sandbox's processes
+  (`runsc-sandbox`, `runsc-gofer`) sit in `/aerolvm/<sandbox id>` at the
+  machine's top level, outside the pod's
+  `kubepods.slice/kubepods-pod….slice/cri-containerd-….scope`. Only the shim
+  and runsc's fd-parking process stay inside. So Kubernetes does not see the
+  sandbox's CPU and memory, and the pod's limit does not cap it.
+- **cgroup, with the C7 prototype, AL2023: pass** (run `p0-s1-al2023`,
+  2026-11-10). `SB_CONTAINERD_CGROUP_PARENT` puts every sandbox at
+  `<parent>/<id>`; the worker's supervisor moves its own processes into
+  `supervisor/`, hands cpu, memory and pids down, and points `sandboxd` at
+  `<its own group>/sandboxes`. The gVisor sandbox (`gvisor_sentry` and its
+  parent) now sits in `…/cri-containerd-<worker>.scope/sandboxes/<id>`; the
+  shim and runsc's helpers sit in `…/supervisor`. Its memory (13.8 MB) is
+  charged inside the worker container's group, whose `memory.max` is the
+  pod's 12 GiB limit. `kubectl exec` into the worker still works. Cold
+  create: 1,872 ms.
+- **cgroup, with the C7 prototype, Bottlerocket 1.68.1: pass, with F2's and
+  F7's stand-ins** (same cluster, worker node group swapped). Every process
+  of the worker pod sits in the pod's group: `sandboxd`, containerd, the shim
+  and runsc's helpers in `supervisor/`, the gVisor sandbox in
+  `sandboxes/<id>`. The sandbox keeps its own limit inside the pod's
+  (`memory.max` 1 GiB under the container's 12 GiB). Cold create: 1,726 ms.
+  Bottlerocket's node containerd is 2.2.9, AL2023's 2.3.7; both run kernel
+  6.18.56.
+
+**S1 verdict: pass on both EKS images, once C7 and the F2 and F7 stand-ins
+are in place.**
+
+**S2, the in-place agent upgrade: pass** (run `p0-s2`, AL2023, 2026-11-10).
+The worker pod is split as §8.2 says: `runtime` (the supervisor, containerd
+and every sandbox, with C7's cgroup placement) and `agent` (`sandboxd`). They
+share containerd's root, `sandboxd`'s data, the containerd socket, `/run/sandboxd`,
+the cgroup path and `/run/netns`, each at the same path in both. Changing
+only the agent's image restarted only the agent (agent 1, runtime 0). The
+gVisor sandbox made before the swap kept running: its uptime went from 6.97 s
+to 99.27 s, a file it wrote was still there, and its ten processes had the
+same PIDs before and after. A new sandbox through the new agent took
+1,066 ms. The API was down for 70 s, mostly the spike's own doing: the old
+agent's first process is a bash script that ignores SIGTERM, so Kubernetes
+waited out the 30 s grace period, and the new agent spent about 35 s
+installing tools before `sandboxd` started. A real `agent` image, with
+`sandboxd` as its first process, should take seconds; P1's images will show it.
+
+Two things the split needed that the plan's §8.2 list already implies: the
+agent must see containerd's root at the same path (containerd's client
+library, inside `sandboxd`, mounts an image's snapshot itself to read its
+`/etc/passwd`), and `/run/netns` must propagate from the agent to the runtime
+container, which is what causes F8.
+
+**Verdict after S1 and S2: K2 and K3 stand.** One worker pod per machine,
+with sandboxes inside its box and the agent upgraded in place, works on EKS,
+given the C7 fix and answers to F1 to F8. S2's external-mount check (eng
+review OV-E2) failed; see F13 below.
+
+**OV-E2, an external mount across the agent swap: fails, and earlier than
+expected** (run on `p0-s5`, the split worker pod, 2026-11-11; harness
+`integration-tests/k8s/s2m.sh`). A gVisor sandbox was created with an rclone
+mount at `/mnt/ext` (rclone's `local` backend standing in for a remote
+store, kept in a folder both containers share). The create succeeded, but
+the mount never reached the sandbox: the agent container held the FUSE
+mount, the runtime container (where `runsc` gives the sandbox its files)
+saw none, and the sandbox got the empty folder underneath. It could not
+read the store's file, and nothing it wrote reached the store (a writer
+loop was at 556 lines; the store held only its seed file). After the agent
+swap, the rclone process and the mount were gone, and the new `sandboxd`
+did not mount them again. The writer kept writing into the sandbox's own
+folder throughout. Finding F13.
+
+**S9, the worker in a Kubernetes user namespace: fails on question 1**
+(run `p0-s9`, AL2023, EKS 1.36.5, node containerd 2.3.7, 2026-11-10). The pod
+had `hostUsers: false`, was not privileged, and had a named list of rights
+(`SYS_ADMIN`, `NET_ADMIN` and others) that apply only inside its namespaces.
+
+| S9 question | Answer |
+|---|---|
+| Does root in the pod stay harmless on the machine? | Yes. The pod's root maps to user 3092512768 on the machine. |
+| 1. Per-sandbox CPU and memory limits | **No.** `/sys/fs/cgroup` is mounted read-only and the pod sees its own group as `/`. A remount to read-write is refused. A fresh cgroup v2 mount works, but its files belong to the machine's root (`65534` as the pod sees them), so making a group or handing a controller down is refused. Kubernetes does not hand a pod's cgroup to the pod's user namespace. |
+| 2. The sandbox network | Yes, all of it: a bridge, new network namespaces, a link from the pod into one, nftables rules, and `bridge-nf-call-iptables` is visible. |
+| 3. gVisor | Starts: `runsc --rootless --network=none --ignore-cgroups do` runs. The full worker did not get that far, because C7 refused the cgroup parent it was given (fail-closed, as designed). |
+
+So S9 cannot replace `privileged` on EKS 1.36 for a worker that serves
+several teams: without per-sandbox limits, one sandbox can use the whole
+pod's CPU and memory. As §8.7 says, each image keeps S7's result. S9 comes
+back if Kubernetes or containerd starts delegating a pod's cgroup to its user
+namespace, or for N6's one-team worker pools, where sandboxes sharing one
+limit may be acceptable.
+
+**S7, a named list of rights instead of `privileged: true`: pass for the
+one-container worker on AL2023, with two stand-ins** (run `p0-s7`,
+2026-11-10). The pod ran with `privileged: false`, these rights added:
+`SYS_ADMIN`, `NET_ADMIN`, `NET_RAW`, `SYS_CHROOT`, `SYS_PTRACE`,
+`SYS_RESOURCE`, `MKNOD`, `SETUID`, `SETGID`, `SETPCAP`, `DAC_OVERRIDE`,
+`FOWNER`, `CHOWN` and `KILL`, and seccomp and AppArmor unconfined. A gVisor
+sandbox was created in 1,594 ms, a command ran, `kubectl exec` still works,
+and with C7 the sandbox sat in `<worker scope>/sandboxes/<id>` with its own
+1 GiB limit inside the pod's 12 GiB. The pod now has its own cgroup
+namespace and sees its group as `/`; the C7 setup handles that.
+
+The two stand-ins, both done with the pod's own `CAP_SYS_ADMIN`:
+
+- `/sys/fs/cgroup` comes read-only; the worker remounts it read-write.
+- `/proc/sys` comes read-only, and `sandboxd` sets per-network settings
+  there (`ip_forward` and the bridge ones, which live in the pod's own
+  network namespace). Kubernetes' own way is the pod's
+  `securityContext.sysctls`, but these count as "unsafe" and need the
+  kubelet's `--allowed-unsafe-sysctls`: a node setting the bank would make.
+
+What S7 does and does not buy, said plainly: `SYS_ADMIN` with seccomp off is
+still close to root on the machine. The gain is that every right not listed
+and the machine's devices are withheld, and the bank gets a list with a
+reason for each line instead of "privileged". It is still not enough for the
+split pod: S2's shared `/run/netns` needs Bidirectional mount propagation,
+which Kubernetes allows only in privileged containers. So S7 holds for the
+split worker only once F8's fix lands (make the namespaces in the runtime
+container). S7 on Bottlerocket (run `p0-br`, 2026-11-11, EKS 1.36, m6id.xlarge,
+with C7 and F7's stand-in) passes the same way: a gVisor sandbox in 1,515 ms,
+`kubectl exec` works, and the sandbox sits in `sandboxes/<id>` with its own
+1 GiB limit. A first try without C7 failed with `runsc` unable to write
+`/sys/fs/cgroup/cgroup.subtree_control` (read-only): the read-write remount
+is part of C7's setup, so a pod without `privileged` needs both. Not yet run:
+S3 with the list.
+
+**S3, scale and memory pressure** (run `p0-s3`, m7i.4xlarge, AL2023, a 15-CPU
+54 GiB Guaranteed worker pod, C7 on, 2026-11-11):
+
+| Sandboxes (gVisor, 0.1 CPU, 64 MB) | Created | cAdvisor series, worker pod / whole node | kubelet memory | Pod memory |
+|---|---|---|---|---|
+| 0 | — | 177 / 1,095 | 94 MB | 1.5 GB |
+| 100 | 100 of 100 in 7 s | 177 / 6,460 | 108 MB | 3.6 GB |
+| 500 | 400 of 400 in 25 s | 177 / 29,320 | 121 MB | 12.0 GB |
+| 1,000 | 500 of 500 in 34 s | 177 / 57,823 | 170 MB | 22.7 GB |
+
+Creates ran 20 at a time through a port-forward from a laptop, so the rate
+(about 15 a second) is a floor, not the cell's number (S4 measures that).
+The kubelet's CPU time grew from 1.7 s to 25.4 s over the ramp. The
+sandbox cgroups are where cAdvisor's series come from (F9).
+
+Pressure: every sandbox then wrote 48 MB to its own tmpfs. 684 did before
+the pod's 54 GiB limit was hit; then one out-of-memory event killed the
+whole worker container (F10), and the pod ended Failed. **Does the kubelet
+ever evict the worker pod? Not here: the node never reached MemoryPressure.
+The danger is the pod's own limit, not eviction.**
+
+**F10, seven runs** (runs 2 to 5 on `p0-s3b`, 6 and 7 on `p0-s3c`, same
+shape, 2026-11-11). Each run repeated the 1,000-sandbox ramp and the
+pressure:
+
+| Run | Change | What the kernel did | sandboxd |
+|---|---|---|---|
+| 2 | The supervisor sets `memory.oom.group` 0 on the pod, its container and `sandboxes/`, and runs the machinery at OOM score -999; `sandboxd` gives each sandbox's spec `oomScoreAdj` 500 | Killed 2 tiny `exe` processes; the machinery survived | Stalled with the pod at its limit |
+| 3 | A shim wrapper sets its own score to 500 | No change: containerd sets each shim's score from its own (-999) after starting it, and gVisor's helpers inherit it | Stalled |
+| 4 | A loop sets score 500 on every process in each sandbox's group | Killed 1 `gvisor_sentry`; freed nothing, because a gVisor sandbox's tmpfs is one shared memory file held by several of its processes | Stalled |
+| 5 | The loop also sets `memory.oom.group` 1 on each sandbox's group | Killed 2 whole sandboxes (26 processes) and nothing else; `containerd` and `sandboxd` survived, 0 restarts | Still stalled: the pod stayed at its limit |
+| 6 (`p0-s3c`) | `sandboxes/` gets `memory.max` of the pod's limit minus a reserve (10%, between 1 and 4 GiB: 50 GiB here); `supervisor/` gets `memory.min` of the reserve | The cap was never reached. Every sandbox's shim, `runsc` and `runsc-fd-parking` are containerd's children and sat in `supervisor/`: 8.0 GB at 1,000 sandboxes, about 8 MB each, past the 4 GiB reserve. Sandboxes (49.95 GB) plus that hit the container's own limit 319 times; the kernel killed 2 whole sandboxes and nothing else | Did not answer |
+| 7 (`p0-s3c`) | containerd starts in `sandboxes/_runtime`, inside the cap, so everything it spawns is charged there from its first page | **The container's own limit was never hit** (0 local `max` events; peak 54.5 of 58.0 GB). The cap took every hit (137,835 `max` events). 14 sandboxes died, each whole (their groups were empty afterwards); `_runtime` (containerd and 1,000 shims, 7.5 GB) and `supervisor/` (`sandboxd`, 615 MB) had no out-of-memory events. 0 restarts | **Answered**, and created a new sandbox (in 22.8 s, because `sandboxes/` sat at its cap) |
+
+Why run 6 failed and run 7 needed containerd moved: a process's helpers
+cannot be moved to another group after they start, because cgroup v2 leaves
+memory charged to the group where it was used, and gVisor's shim ignores
+containerd's `shim_cgroup` option (it is declared in its options and never
+read).
+
+**F10 is fixed in the spike. The Phase 1 design, as proven:**
+
+- The worker's groups: `supervisor/` holds `sandboxd` (and, in the split pod,
+  the agent container is this part) with `memory.min` of the reserve;
+  `sandboxes/` has `memory.max` of the pod's limit minus the reserve and
+  holds `_runtime/` (containerd and every shim and `runsc` helper, OOM score
+  -999, `memory.oom.group` 0) and one group per sandbox.
+- `memory.oom.group` is 0 on the pod, the container, `sandboxes/` and
+  `_runtime/`, and 1 on each sandbox's group, so one out-of-memory event
+  kills one whole sandbox and nothing else.
+- Each sandbox's processes get OOM score 500. `sandboxd` sets the score and
+  the group's `memory.oom.group` right after the sandbox starts; the spike's
+  loop is only a stand-in.
+- The reserve only has to cover `sandboxd` (615 MB here at 1,000
+  sandboxes), so 10% capped at 4 GiB is generous.
+- Admission sized from the pod (F3) and charged about 8 MB more per sandbox
+  for its helpers (they now count against the cap) keeps normal use away
+  from the cap. A create that reaches a full cap waits, as run 7's 22.8 s
+  create did; admission should refuse it instead.
+- F12 (below) is what run 7 found next: `sandboxd` did not notice the
+  sandboxes the kernel killed.
+
+**F10's full fix, as it ships: pass** (run `p1-f10`, EKS 1.36, AL2023,
+m7i.4xlarge, 2026-11-11; `s3.sh --supervisor`, a build of every Phase 1 PR).
+The split worker pod: the runtime container is the Phase 1 Go supervisor
+(#1154: cgroup shape, cap, containerd in `_runtime`), the agent container is
+`sandboxd` (#1146: each sandbox's group `memory.oom.group` 1 and OOM score
+500). No stand-in loop. 1,000 gVisor sandboxes, then each filled 48 MB of its
+`/dev/shm`:
+
+| Group | Memory after | Limit | Limit hit |
+|---|---|---|---|
+| Pod | 51.3 GB | 55.8 GB | 0 times |
+| Runtime container | 49.4 GB | 53.7 GB | 0 times |
+| Agent container (`sandboxd`) | 0.8 GB | 2.1 GB | 0 times |
+| `sandboxes/` | 49.36 GB | 49.39 GB (the container's 50 GiB minus 4 GiB) | 389,421 times |
+| `supervisor/` | 0.4 MB | `memory.min` 4 GiB | 0 times |
+
+- Every out-of-memory event stayed in `sandboxes/`. The kernel's log shows
+  11 kills in 90 minutes, each a whole sandbox's group (22 `runsc` and 100
+  gVisor kernel processes in all); `sandboxd` marked all 11 stopped
+  (F12's fix holds).
+- No container restarted, the pod was not evicted, the node never reported
+  MemoryPressure, and `sandboxd` answered throughout. A create into the full
+  cap got 503 "live memory floor breached" in 6 ms.
+- The gVisor kernel processes keep the OOM score of the containerd that
+  started them (-999); each sandbox's `runsc` process has 500, the kernel
+  picks it, and the group kill takes the rest. Whole sandboxes die either
+  way. Spend about $1.
+
+**S8, a disk limit per sandbox: pass** (run `p0-s8`, EKS 1.36, AL2023, an
+m6id.xlarge with a 220 GB NVMe instance store, 2026-11-11). The worker
+formatted the NVMe as XFS with project quotas and mounted it as containerd's
+root (`prepare_nvme`). Two gVisor sandboxes; one got a 100 MB project quota
+on its writable layer (containerd's snapshot directory for it), then each
+wrote 300 MB into its root filesystem:
+
+| Sandbox | Written | On disk in its writable layer | Quota report |
+|---|---|---|---|
+| Limited (100 MB) | 99.0 MB (103,809,024 bytes), then "no space" | 100 MB | 99.0M of 100M |
+| Unlimited | 300 MB | 301 MB | — |
+
+What it shows:
+
+- gVisor keeps a sandbox's root overlay on disk, in one file in the writable
+  layer (`.gvisor.filestore.<id>`, sparse), not in memory. So a project
+  quota on that directory caps what the sandbox can write, and the sandbox
+  sees an ordinary "disk full".
+- Inside the sandbox, `df /` still shows an 8 PiB root: a program cannot see
+  its limit coming, only hit it.
+- In the spike the quota was set after the sandbox started; `xfs_quota
+  project -s` tagged the files already there, including the file store. C27
+  sets it in `sandboxd` before the task starts.
+- The first run failed with "cannot set limits: Function not implemented":
+  the pod's emptyDir (the root disk, mounted `noquota`) sits under the NVMe
+  at the same path, and given the path, `xfs_quota` acts on the first entry
+  in `/proc/mounts`. Name the device. Phase 1's worker mounts the NVMe on a
+  path of its own, not over a volume.
+
+So C27 can give each sandbox its own disk limit on local NVMe, on AL2023
+and on Bottlerocket (run `p0-br`, 2026-11-11, the same machine type: 99.0 MB
+against 100 MB, and 300 MB unlimited). The 10%-free create refusal and the
+alert stay as designed, for the image store and the database.
+
+**S6, Firecracker on a nested-virtualization machine: pass** (2026-11-11,
+one m8i.xlarge with `CpuOptions.NestedVirtualization=enabled`, Amazon Linux
+2023, kernel 6.18.56; no Kubernetes; harness `integration-tests/k8s/s6/`).
+AWS reported nested virtualization on; all 4 vCPUs have the `vmx` flag;
+`/dev/kvm` is there. Firecracker v1.18.0 booted its CI guest kernel 6.1.155
+(1 vCPU, 256 MiB, a busybox root disk whose init prints a marker and
+reboots) five times out of five: 862, 838, 827, 817 and 828 ms from starting
+the process to the guest's reboot.
+
+What it does and does not say:
+
+- **N7 is possible on EKS without metal machines:** an m8i/c8i/r8i node
+  with nested virtualization can run Firecracker, so a Firecracker worker
+  pool is a node-group setting, not a metal-instance budget.
+- **The speed is not measured against metal.** These are full cold boots of
+  a stock kernel under a second layer of virtualization, and there is no
+  same-script number from a metal machine. AerolVM's own Firecracker create
+  is p50 34 ms from its warm pool on a c5.metal (README "Create latency");
+  neither the warm pool nor snapshot restore is measured under nested
+  virtualization. N7's go or no-go needs those, on the same script.
+- Firecracker's CI publishes guest kernels per minor version and lags its
+  releases: v1.16 to v1.18 had none, so the first run fetched no kernel and
+  every boot failed at once. The harness now takes the newest that has one.
+
+**N1, side by side with agent-sandbox: first run** (run `p0-n1`, EKS 1.36,
+two m7i.xlarge workers, 2026-11-11; harness `integration-tests/k8s/n1.sh`).
+One machine ran agent-sandbox v1.0.10 (controller with `--extensions`) with
+gVisor release-20261102.0 added to the machine's own containerd and a
+`gvisor` RuntimeClass; the other ran AerolVM's worker pod (3 CPUs, 12 GiB,
+C7 and F10's setup). The same sandbox on both: `alpine:3.20` asleep under
+gVisor, 0.1 CPU, 64 MB. Every timing was taken from one bench pod inside the
+cluster: agent-sandbox through `kubectl apply` and `kubectl wait`, AerolVM
+through `curl` to the worker's Service.
+
+| | agent-sandbox | AerolVM |
+|---|---|---|
+| Cold create, no warm pool (10) | p50 1.16 s (1.03–1.24 s): a Sandbox to Ready | p50 239 ms (179–284 ms) |
+| Warm create, pool of 5 (10) | p50 290 ms (261–342 ms, one at 1.13 s): a SandboxClaim to Ready | p50 19 ms (19–23 ms) |
+| Burst of 20 against a pool of 5 | all Ready in 5.2 s and 4.8 s (2 runs) | all created in 1.16 to 1.30 s (3 runs) |
+| Kubernetes API writes for 10 cold create-and-delete | 231 (50 Sandbox, 110 pod, 71 event) | 0 |
+| Sandboxes per machine | one pod each: at most 58 pods on an m7i.xlarge (VPC CNI), less the node's own | 1,000 in one pod on an m7i.4xlarge (S3); not run to full here |
+
+How to read it:
+
+- The agent-sandbox times include `kubectl` itself: in the same pod, a
+  `kubectl get` took about 70 ms and a `kubectl wait` that was already true
+  about 165 ms. A Go client would save most of that, so agent-sandbox's
+  warm path is roughly 50 to 100 ms of real work, still about 3 to 5 times
+  AerolVM's 19 ms. The cold gap (about 0.9 s of real work against 0.24 s)
+  and the burst gap (4 times) are well beyond that overhead.
+- AerolVM writes nothing to the Kubernetes API per sandbox (K4); agent-
+  sandbox writes about 23 objects per sandbox's life, all through etcd.
+- AerolVM's worker had 3 of the machine's 4 CPUs; agent-sandbox had the
+  whole second machine.
+- The first run lost AerolVM's burst phase to a dropped `kubectl exec`
+  stream; it was rerun by hand on the same cluster (three samples above),
+  and `n1.sh` now records a phase that prints nothing instead of stopping.
+
+**N1, the rest** (run `p1-n1`, same setup, 2026-11-11; `n1.sh <name> rest`,
+a build of every Phase 1 PR):
+
+| | agent-sandbox | AerolVM |
+|---|---|---|
+| Cold create (50): p50 / p90 / p99 | 1,078 / 1,323 / 14,174 ms (two of 50 took 12.6 s and 14.2 s) | 232 / 328 / 358 ms |
+| `python:3.12-slim`, cold (10): p50 | 1,100 ms | 231 ms |
+| `node:22-alpine`, cold (10): p50 | 1,031 ms | 258 ms |
+| One command's round trip (20): p50 / p99 | 116 / 130 ms (`kubectl exec`) | 97 / 197 ms (the exec API) |
+| Sandboxes on one machine until the next is refused | 37: "Insufficient cpu" (Kubernetes counts each pod's 100m request) | 256: "no free slot" in the network-namespace pool |
+
+- For a plain image like this one, `kubectl exec` is how a client runs a
+  command in an agent-sandbox sandbox, so that is what was timed.
+- The two fills stop on policy, not on the machine. Kubernetes cannot place
+  more requests than the machine's CPUs. AerolVM over-provisions CPU and
+  memory 10× by default and keeps 5% of memory free; here its stop was
+  `SB_CONTAINERD_NETNS_POOL_SIZE` (256), a setting. S3 ran 1,000 sandboxes
+  in one pod on an m7i.4xlarge.
+
+**S5, machines go only when AerolVM says so: pass** (run `p0-s5`, EKS
+1.36, Karpenter 1.15.1, 2026-11-11; harness `integration-tests/k8s/s5.sh`).
+The operator was a stand-in script: it "decommissions" a worker by deleting
+its sandboxes (standing in for moving them) and then lets the pod go.
+
+- **Karpenter, drift.** A worker pod with `karpenter.sh/do-not-disrupt` on a
+  NodePool with `expireAfter: Never` and no `terminationGracePeriod`.
+  Karpenter brought up the machine 46 s after the pod appeared. Changing
+  the NodePool's template marked the machine `Drifted` within 2 s. For the
+  next 3 minutes Karpenter left it alone: the machine, the worker and its
+  3 sandboxes stayed, and Karpenter recorded `DisruptionBlocked: Pod has
+  "karpenter.sh/do-not-disrupt" annotation`. Once the stand-in emptied the
+  worker and removed the annotation, the pod was gone in 94 s and the old
+  machine in 119 s; Karpenter had brought up a replacement first.
+- **Managed node group upgrade.** The worker pod on the node group, with a
+  PodDisruptionBudget that refuses its eviction, and the AMI upgraded one
+  release (1.36.5-20261031 to 1.36.5-20261107). EKS cordoned the old
+  machine 133 s in (`unschedulable`, plus the
+  `node.kubernetes.io/unschedulable` taint), before evicting. The stand-in
+  saw the cordon, emptied the worker and let the pod go 37 s later. The
+  upgrade succeeded after 450 s with no errors, inside the 15-minute
+  eviction limit. The worker then started on the new machine.
+
+What changes in §10.6: on Karpenter pools a drifted machine is **not**
+cordoned while `do-not-disrupt` holds it, so the operator's signal there is
+the NodeClaim's `Drifted` condition, not a cordon. On managed node groups
+the cordon comes first, as §10.6 says. The 37 s here is three sandboxes
+deleted; a real decommission moves them, and its budget is the 14 minutes
+§10.6 sets. Not run: an upgrade that runs out the 15 minutes (EKS documents
+the `PodEvictionFailure`), and Karpenter expiry, which `expireAfter: Never`
+turns off.
+
+**S4, how far one cell goes: the offline half** (2026-11-11, an M1 Max
+laptop, no AWS). `BenchmarkFSMCellCeiling` in
+`internal/cluster/fsm_cell_ceiling_bench_test.go` fills the placement FSM, then
+times one more create's apply, a snapshot, its persist and a restore into a
+fresh FSM. Every placement also holds one TCP port, so a real cell's rows are
+lighter than these.
+
+| Placements | Apply one create | Snapshot holds up Apply | Snapshot size / persist | Restore | Heap |
+|---|---|---|---|---|---|
+| 100k | 7.8 µs | 89 ms | 19.5 MiB / 95 ms | 0.4 s | 243 MiB |
+| 250k | 8.0 µs | 242 ms | 48 MiB / 322 ms | 1.2 s | 623 MiB |
+| 1M | 8.2 µs | 1.1 s | 193 MiB / 2.4 s | 6.8 s | 2.4 GiB |
+
+The commit side comes from the existing `BenchmarkReserveCommit` (a 6.5 ms
+sync on every log write, standing in for the disk): 68 reserves a second with
+one caller, 633 with 16 and 2,252 with 64, because concurrent reserves share a
+sync (0.06 syncs per reserve at 64).
+
+What it says:
+
+- **The FSM is not the ceiling.** Apply stays near 8 µs from 100k to 1M
+  placements; one goroutine could apply about 120,000 creates a second.
+- **The commit path is**, at about 2,000 creates a second with 64 creates in
+  flight: above G3's 1,000-a-second target, on a modelled disk.
+- **At 1M placements, snapshots become a soft limit.** A snapshot holds up
+  Apply for about 1.1 s (slower on a server core than on this laptop). With
+  the snapshot cadence in `raft.go` (checked every 120 s, at 8,192 new
+  entries), creates pause for about a second every two minutes or so: a p99
+  spike, not a lower rate. Restores take 6.8 s, and each server holds about
+  2.4 GiB for the FSM alone. At G3's 100,000 live sandboxes per cell all of
+  this is small (89 ms, 0.4 s, 243 MiB).
+- **Finding F11 (Phase 3, not Phase 1):** if a cell is ever meant to hold
+  1M placements, Snapshot must stop copying every row under the lock (a
+  copy-on-write map, or snapshotting from a read view). Until then, cells
+  stay at or below 250k placements and §12's cells carry the rest.
+
+**The live half** (run `p1-s4`, 2026-11-11, `integration-tests/k8s/s4live.sh`;
+`internal/cluster/s4_live_test.go`): the same reserves on three m7i.xlarge
+Amazon Linux 2023 servers in one zone, each with the production Raft setup
+(`setupRaft`: TCP, raft-wal, Bolt stable store, production timers) on its
+own gp3 root disk.
+
+| Reserves in flight | Reserves a second | Latency p50 / p99 |
+|---|---|---|
+| 1 | 304 | 2.9 / 5.8 ms |
+| 16 | 2,280 | 7.0 / 10.3 ms |
+| 64 | 1,816 | 32 / 82 ms |
+
+- A real sync is faster than the 6.5 ms model (one reserve at a time took
+  2.9 ms), and 16 or 64 in flight share syncs as the model said: about
+  2,000 creates a second, twice G3's 1,000.
+- A snapshot at 100,000 placements took 200 ms on this disk, copy and
+  persist together.
+- Filling to 100,000 on one stand-in worker slowed to 192 a second: finding
+  F16, a walk over one worker's pending reservations, which a real worker
+  keeps short.
+
+**Cost so far:** twelve clusters and two S6 instances, about 13.5 hours of
+cluster time in all, about $8.70 (the last cluster proved #1145 and #1146
+live) (the m7i.4xlarge S3 runs are about two
+thirds of it). S4's offline half cost nothing.
 
 ## 19. Tests, drills and benchmarks
 

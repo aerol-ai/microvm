@@ -1,0 +1,27 @@
+# The same sandbox on both sides: alpine:3.20 asleep under gVisor, 0.1 CPU and
+# 64 Mi. agent-sandbox's version is a SandboxTemplate plus a warm pool of 5.
+apiVersion: extensions.agents.x-k8s.io/v1beta1
+kind: SandboxTemplate
+metadata:
+  name: n1-gvisor
+  namespace: n1
+spec:
+  podTemplate:
+    spec:
+      runtimeClassName: gvisor
+      containers:
+        - name: sandbox
+          image: alpine:3.20
+          command: ["sleep", "infinity"]
+          resources:
+            requests: { cpu: 100m, memory: 64Mi }
+            limits: { cpu: 100m, memory: 64Mi }
+---
+apiVersion: extensions.agents.x-k8s.io/v1beta1
+kind: SandboxWarmPool
+metadata:
+  name: n1-pool
+  namespace: n1
+spec:
+  replicas: 5
+  sandboxTemplateRef: { name: n1-gvisor }

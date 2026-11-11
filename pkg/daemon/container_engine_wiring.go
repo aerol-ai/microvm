@@ -35,6 +35,13 @@ func wireContainerEngine(ctx context.Context, cfg config.Config, logger *slog.Lo
 		svc.SetEventsSource(dockerClient)
 		return nil, nil
 	}
+	// A configured cgroup parent must be able to hold sandboxes with their
+	// limits before any is created; refuse to start otherwise (plan C7).
+	if cfg.ContainerdCgroupParent != "" {
+		if err := cntr.CheckCgroupParent(cntr.CgroupRoot, cfg.ContainerdCgroupParent); err != nil {
+			return nil, fmt.Errorf("containerd cgroup parent: %w", err)
+		}
+	}
 	// Dedicated AEROLVM-USER manager for the containerd driver so its rules
 	// never collide with the docker driver's DOCKER-USER rules on a
 	// mixed-engine (migrating) host. EnsureChain bootstraps the chain and

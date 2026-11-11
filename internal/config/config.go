@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"path"
 	"path/filepath"
 	"regexp"
 	"slices"
@@ -206,6 +207,14 @@ type Config struct {
 	// ContainerdRunDir is the host workdir for per-sandbox host files
 	// (resolv.conf, hosts, task logs). SB_CONTAINERD_RUN_DIR.
 	ContainerdRunDir string
+	// ContainerdCgroupParent, when set, is the cgroup (a path under the
+	// cgroup v2 root, e.g. a Kubernetes worker pod's own group) that every
+	// containerd-engine sandbox's cgroup is made under, as <parent>/<id>.
+	// Unset keeps containerd's default, /<namespace>/<id> at the root of the
+	// machine's tree. Inside a Kubernetes pod that default puts sandboxes
+	// outside the pod's CPU and memory box (plans/kubernetes-v2-architecture.md
+	// §8.3, C7; seen live in Phase 0 spike S1). SB_CONTAINERD_CGROUP_PARENT.
+	ContainerdCgroupParent string
 	// ContainerdLogDir overrides per-task log file placement; defaults to
 	// ${ContainerdRunDir}/logs. SB_CONTAINERD_LOG_DIR.
 	ContainerdLogDir string
@@ -2143,6 +2152,7 @@ func load(keyTool bool) (Config, error) {
 		ContainerdSocket:                  getEnv("SB_CONTAINERD_SOCKET", "/run/containerd/containerd.sock"),
 		ContainerdNamespace:               getEnv("SB_CONTAINERD_NAMESPACE", "aerolvm"),
 		ContainerdRunDir:                  getEnv("SB_CONTAINERD_RUN_DIR", DefaultContainerdRunDir),
+		ContainerdCgroupParent:            strings.TrimSpace(os.Getenv("SB_CONTAINERD_CGROUP_PARENT")),
 		ContainerdLogDir:                  strings.TrimSpace(os.Getenv("SB_CONTAINERD_LOG_DIR")),
 		ContainerdNativeNetnsPoolEnabled:  getEnvBool("SB_CONTAINERD_NATIVE_NETNS_POOL_ENABLED", false),
 		ContainerdNetnsPoolDepth:          getEnvInt("SB_CONTAINERD_NETNS_POOL_DEPTH", 4),
@@ -2722,6 +2732,16 @@ func load(keyTool bool) (Config, error) {
 		}
 		if strings.TrimSpace(cfg.ContainerdNamespace) == "" {
 			return Config{}, errors.New("SB_CONTAINERD_NAMESPACE is required when SB_CONTAINER_ENGINE=containerd")
+		}
+	}
+	if p := cfg.ContainerdCgroupParent; p != "" {
+		// A relative or unclean path would be joined onto whatever the
+		// runtime treats as its base; refuse it rather than guess.
+		if !strings.HasPrefix(p, "/") || path.Clean(p) != p || p == "/" {
+			return Config{}, fmt.Errorf("SB_CONTAINERD_CGROUP_PARENT must be a clean absolute cgroup path below the root, got %q", p)
+		}
+		if cfg.ContainerEngine != models.ContainerEngineContainerd {
+			return Config{}, errors.New("SB_CONTAINERD_CGROUP_PARENT needs SB_CONTAINER_ENGINE=containerd")
 		}
 	}
 
