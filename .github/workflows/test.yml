@@ -142,6 +142,10 @@ jobs:
               - 'integration-tests/**'
               - 'Terraform/**'
               - '.github/workflows/test.yml'
+              # k8s_images_test.go checks the Kubernetes image pins and the
+              # release job that builds them.
+              - 'packaging/images/**'
+              - '.github/workflows/release.yml'
               # caddy_version_test checks the plugin's Caddy pin.
               - 'caddymod/go.mod'
 
