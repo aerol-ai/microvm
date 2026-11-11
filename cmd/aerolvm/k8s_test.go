@@ -15,8 +15,8 @@ func runtimeGOOS() string { return runtime.GOOS }
 
 // A worker pod as the chart makes it: no token, emptyDirs, the API port,
 // a sandbox range set by C3, the API token from its Secret, the edge
-// certificate mounted by key (C25), and runtime and agent privileged.
-// Another install's pod in the namespace is not checked.
+// certificate mounted by key (C25), runtime and agent privileged, and an
+// EC2 machine under it. Another app's pod in the namespace is not checked.
 const k8sGoodPods = `{"items":[{
   "metadata":{"name":"aerolvm-0","labels":{"app.kubernetes.io/name":"aerolvm","app.kubernetes.io/instance":"aerolvm","app.kubernetes.io/component":"worker"}},
   "spec":{
@@ -34,6 +34,13 @@ const k8sGoodPods = `{"items":[{
   "status":{"podIP":"10.244.0.12"}},
   {"metadata":{"name":"other-install-0","labels":{"app.kubernetes.io/name":"aerolvm","app.kubernetes.io/instance":"other","app.kubernetes.io/component":"worker"}},
    "spec":{"containers":[{"name":"runtime","image":"ghcr.io/x/unsigned:v1","securityContext":{"privileged":true}}],"volumes":[{"name":"h","hostPath":{"path":"/"}}]}}]}`
+
+// The machine under the worker pod, and its IMDS settings as the aws CLI
+// prints them.
+const (
+	k8sGoodNodes = "ip-10-0-1-5.ec2.internal\taws:///us-east-1a/i-0abc\nkind-node\tkind://docker/aerolvm/kind-node\n"
+	k8sGoodIMDS  = `{"Reservations":[{"Instances":[{"InstanceId":"i-0abc","MetadataOptions":{"HttpTokens":"required","HttpPutResponseHopLimit":1,"HttpEndpoint":"enabled"}}]}]}`
+)
 
 // k8sNamespaceLabelled is a namespace whose Pod Security enforce label is level.
 func k8sNamespaceLabelled(level string) string {
@@ -76,6 +83,10 @@ type fakeK8s struct {
 	dnsPods      string
 	apiEndpoints string
 	namespaces   map[string]string
+	nodes        string
+	awsOut       string
+	awsErr       error
+	awsCalls     []string
 	cosignErr    map[string]error
 	probeOut     map[string]string
 	probeErr     error
@@ -86,7 +97,7 @@ type fakeK8s struct {
 // goodK8s is a clean single-mode install: every check passes.
 func goodK8s() *fakeK8s {
 	return &fakeK8s{pods: k8sGoodPods, apiIP: "10.96.0.1", policies: k8sGoodPolicies, dnsPods: k8sDNSPods, apiEndpoints: k8sAPIEndpoints,
-		namespaces: map[string]string{"aerolvm": k8sNamespaceLabelled("privileged")}}
+		namespaces: map[string]string{"aerolvm": k8sNamespaceLabelled("privileged")}, nodes: k8sGoodNodes, awsOut: k8sGoodIMDS}
 }
 
 func (f *fakeK8s) env() k8sEnv {
@@ -116,8 +127,14 @@ func (f *fakeK8s) env() k8sEnv {
 				return answer(f.apiEndpoints)
 			case args[0] == "get" && args[1] == "namespace":
 				return answer(f.namespaces[args[2]])
+			case args[0] == "get" && args[1] == "nodes":
+				return answer(f.nodes)
 			}
 			return nil, errors.New("unexpected kubectl " + strings.Join(args, " "))
+		},
+		aws: func(_ context.Context, args ...string) ([]byte, error) {
+			f.awsCalls = append(f.awsCalls, strings.Join(args, " "))
+			return []byte(f.awsOut), f.awsErr
 		},
 		cosign: func(_ context.Context, image string) error {
 			f.signed = append(f.signed, image)
@@ -149,11 +166,15 @@ func TestK8sVerifyPasses(t *testing.T) {
 		}
 	}
 	// One namespace, so no release namespace check.
-	if len(checks) != 10 {
-		t.Fatalf("%d checks, want 10: %+v", len(checks), checks)
+	if len(checks) != 11 {
+		t.Fatalf("%d checks, want 11: %+v", len(checks), checks)
 	}
 	if strings.Join(f.signed, ",") != "ghcr.io/aerol-ai/aerolvm-runtime:v1,ghcr.io/aerol-ai/aerolvm:v1" {
 		t.Fatalf("signatures checked for %v, want each image once", f.signed)
+	}
+	// Only the worker's machine is read, in its own region.
+	if len(f.awsCalls) != 1 || f.awsCalls[0] != "ec2 describe-instances --region us-east-1 --output json --instance-ids i-0abc" {
+		t.Fatalf("aws calls %q", f.awsCalls)
 	}
 	if len(f.commands) != 2 || !strings.HasPrefix(f.commands[0], "docker alpine:3.20 ") || !strings.HasPrefix(f.commands[1], "gvisor alpine:3.20 ") {
 		t.Fatalf("probes %v", f.commands)
@@ -307,6 +328,7 @@ const (
   "policyTypes":["Egress"],
   "egress":[{"to":[{"namespaceSelector":{"matchLabels":{"kubernetes.io/metadata.name":"aerolvm-system"}},"podSelector":{"matchLabels":{"aerolvm.io/cluster":"prod"}}}]},
     {"to":[{"ipBlock":{"cidr":"0.0.0.0/0","except":["10.0.0.0/8","172.16.0.0/12","192.168.0.0/16","100.64.0.0/10","169.254.0.0/16"]}}]}]}}]}`
+	k8sClusterIMDS = `{"Reservations":[{"Instances":[{"InstanceId":"i-0w1","MetadataOptions":{"HttpTokens":"required","HttpPutResponseHopLimit":1,"HttpEndpoint":"enabled"}}]}]}`
 )
 
 // clusterK8s is a clean cluster-mode install.
@@ -314,6 +336,8 @@ func clusterK8s() *fakeK8s {
 	f := goodK8s()
 	f.pods, f.workerPods, f.workerPolicy = k8sClusterPods, k8sClusterWorkers, k8sClusterWorkerPolicy
 	f.namespaces = map[string]string{"aerolvm-system": k8sNamespaceLabelled("restricted"), k8sWorkerNS: k8sNamespaceLabelled("privileged")}
+	f.nodes = "ip-10-0-2-7.eu-west-1.compute.internal\taws:///eu-west-1b/i-0w1\n"
+	f.awsOut = k8sClusterIMDS
 	return f
 }
 
@@ -329,7 +353,7 @@ func TestK8sVerifyClusterModePasses(t *testing.T) {
 		}
 	}
 	got := k8sResults(checks)
-	if len(checks) != 11 || got[k8sReleaseNSCheck] == "" {
+	if len(checks) != 12 || got[k8sReleaseNSCheck] == "" {
 		t.Fatalf("%d checks: %+v", len(checks), checks)
 	}
 	for check, want := range map[string]string{
@@ -337,6 +361,7 @@ func TestK8sVerifyClusterModePasses(t *testing.T) {
 		k8sAPICheck:          "pass: the 1 operator pod(s) hold one by design",
 		k8sPrivilegedCheck:   "pass: 1 worker pod(s) in namespace aerolvm-workers",
 		k8sPolicyCheck:       "pass: prod-worker-a (prod-worker-egress)",
+		k8sIMDSCheck:         "pass: 1 EC2 instance(s)",
 		"images signed by the AerolVM release workflow": "pass: ghcr.io/aerol-ai/aerolvm-edge:v1, ghcr.io/aerol-ai/aerolvm-operator:v1",
 	} {
 		if !strings.HasPrefix(got[check], want) {
@@ -394,6 +419,10 @@ func TestK8sVerifyClusterModeFailures(t *testing.T) {
 			f: with(func(f *fakeK8s) { f.workerPods = "" })},
 		{name: "no pods in either namespace", check: "AerolVM pods found", want: "fail: no pods labelled app.kubernetes.io/name=aerolvm and app.kubernetes.io/instance=aerolvm or aerolvm.io/cluster=prod in namespace aerolvm-system or aerolvm-workers",
 			f: with(func(f *fakeK8s) { f.pods, f.workerPods = `{"items":[]}`, `{"items":[]}` })},
+		{name: "the IMDS hop limit of 2", check: k8sIMDSCheck, want: "fail: ip-10-0-2-7.eu-west-1.compute.internal (i-0w1): hop limit 2, want 1",
+			f: with(func(f *fakeK8s) {
+				f.awsOut = strings.Replace(k8sClusterIMDS, `"HttpPutResponseHopLimit":1`, `"HttpPutResponseHopLimit":2`, 1)
+			})},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			got := k8sResults(k8sVerify(context.Background(), tc.f.env(), k8sClusterOpts))[tc.check]
@@ -460,9 +489,21 @@ func TestK8sVerifyCommand(t *testing.T) {
 		Checks []k8sCheck `json:"checks"`
 	}
 	h.jsonOut(&out)
-	if !out.OK || len(out.Checks) != 10 {
-		t.Fatalf("%+v", out)
+	if !out.OK || len(out.Checks) != 11 || strings.Contains(h.stderr.String(), "warning") {
+		t.Fatalf("%+v %s", out, h.stderr.String())
 	}
+
+	// No AWS credentials here: the IMDS check is skipped with a warning
+	// naming why, and the run still passes (the plan's error table).
+	f.awsErr = errK8sNoAWSCredentials
+	if code := h.run("k8s", "verify", "--kube-context", "kind-x"); code != exitOK {
+		t.Fatalf("a skipped IMDS check exited %d: %s %s", code, h.stdout.String(), h.stderr.String())
+	}
+	if !strings.Contains(h.stdout.String(), "SKIP") ||
+		!strings.Contains(h.stderr.String(), "aerolvm: warning: not checked: worker machines allow IMDSv2 only, with a hop limit of 1: no AWS credentials") {
+		t.Fatalf("stdout %q stderr %q", h.stdout.String(), h.stderr.String())
+	}
+	f.awsErr = nil
 
 	f.probeOut = map[string]string{"docker": "10.96.0.1:443"}
 	if code := h.run("k8s", "verify", "--kube-context", "kind-x", "--probe-runtimes", "docker"); code != exitError {

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net/netip"
+	"os"
 	"os/exec"
 	"regexp"
 	"slices"
@@ -26,11 +27,13 @@ import (
 // limits the worker pod's egress, and a probe sandbox cannot reach the
 // worker's own ports, another pod or the Kubernetes API (C24). Phase 2
 // adds the cluster layout: privileged containers only in the worker
-// namespace, and each namespace's Pod Security label.
+// namespace, each namespace's Pod Security label, and the worker machines'
+// IMDS hop limit.
 //
-// It reads the cluster with the kubectl and cosign already on this machine
-// (so the CLI carries no Kubernetes client), and probes through the AerolVM
-// API the CLI is logged in to.
+// It reads the cluster with the kubectl, cosign and aws already on this
+// machine (so the CLI carries no Kubernetes or AWS client, and holds no
+// credential of its own), and probes through the AerolVM API the CLI is
+// logged in to.
 
 const (
 	k8sPass = "pass"
@@ -81,6 +84,9 @@ type k8sEnv struct {
 	// probe creates a sandbox of runtime from image, runs command in it,
 	// destroys it, and returns the command's stdout.
 	probe func(ctx context.Context, image, runtime, command string) (string, error)
+	// aws runs the aws CLI with args. It fails with errK8sNoAWSCLI or
+	// errK8sNoAWSCredentials when either is missing.
+	aws func(ctx context.Context, args ...string) ([]byte, error)
 }
 
 type k8sVerifyOptions struct {
@@ -108,7 +114,8 @@ type k8sPod struct {
 		Labels    map[string]string `json:"labels"`
 	} `json:"metadata"`
 	Spec struct {
-		AutomountServiceAccountToken *bool `json:"automountServiceAccountToken"`
+		NodeName                     string `json:"nodeName"`
+		AutomountServiceAccountToken *bool  `json:"automountServiceAccountToken"`
 		Volumes                      []struct {
 			Name     string `json:"name"`
 			HostPath *struct {
@@ -316,6 +323,7 @@ func k8sVerify(ctx context.Context, env k8sEnv, o k8sVerifyOptions) []k8sCheck {
 	checks = append(checks, k8sPrivileged(pods, o.workerNamespace))
 	checks = append(checks, k8sPodSecurity(ctx, env, o)...)
 	checks = append(checks, k8sEgressPolicy(ctx, env, pods))
+	checks = append(checks, k8sIMDS(ctx, env, pods))
 	checks = append(checks, k8sProbe(ctx, env, pods, o)...)
 	return checks
 }
@@ -825,6 +833,23 @@ var k8sEnvFor = func(a *app, c *commonFlags, kubeContext string) k8sEnv {
 			}
 			return out.Stdout, nil
 		},
+		// The aws CLI reads the caller's own credentials (environment,
+		// profile, SSO) as it always does; verify neither asks for nor keeps
+		// them.
+		aws: func(ctx context.Context, args ...string) ([]byte, error) {
+			cmd := exec.CommandContext(ctx, "aws", args...)
+			// The output is read here, not by a person: no pager.
+			cmd.Env = append(os.Environ(), "AWS_PAGER=")
+			out, err := cmd.Output()
+			var ee *exec.ExitError
+			switch {
+			case errors.Is(err, exec.ErrNotFound):
+				return nil, errK8sNoAWSCLI
+			case errors.As(err, &ee):
+				return nil, awsFailure(ee.ExitCode(), ee.Stderr)
+			}
+			return out, err
+		},
 	}
 }
 
@@ -859,8 +884,13 @@ func runK8s(ctx context.Context, a *app, args []string) int {
 	checks := k8sVerify(ctx, k8sEnvFor(a, c, kubeContext), o)
 	failed := 0
 	for _, ch := range checks {
-		if ch.Result == k8sFail {
+		switch ch.Result {
+		case k8sFail:
 			failed++
+		case k8sSkip:
+			// A skip passes the run, so say it where a person or a CI log
+			// will see it, apart from the table.
+			a.note("aerolvm: warning: not checked: %s: %s", ch.Name, ch.Detail)
 		}
 	}
 	if c.json {
