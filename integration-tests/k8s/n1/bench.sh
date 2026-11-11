@@ -96,8 +96,9 @@ case "$phase" in
     t0=$(now)
     for i in $(seq 1 "$n"); do claim_yaml "n1-burst-$i" burst; echo ---; done | k apply -f - >/dev/null
     k wait --for=condition=Ready sandboxclaim -l n1=burst --timeout=600s >/dev/null; t1=$(now)
+    # Only the total: a claim served from the pool keeps its sandbox's Ready
+    # time from when it joined the pool, so per-claim times read negative.
     echo "N1 as-burst all $n ready in $(( t1 - t0 )) ms (pool of 5)"
-    k get sandboxclaim -l n1=burst -o json | jq -r '.items[] | ((.status.conditions[]? | select(.type=="Ready") | .lastTransitionTime | fromdate) - (.metadata.creationTimestamp | fromdate))' | sort -n | awk '{a[NR]=$1} END {print "N1 as-burst per-claim seconds: min " a[1] " p50 " a[int(NR/2)+1] " max " a[NR]}'
     k delete sandboxclaim -l n1=burst --wait=false >/dev/null ;;
   av-cold|av-warm)
     id="$(av_create)"; [[ -n "$id" ]] && av "/v1/sandboxes/$id" -X DELETE >/dev/null

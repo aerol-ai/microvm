@@ -1686,6 +1686,43 @@ What it does and does not say:
   releases: v1.16 to v1.18 had none, so the first run fetched no kernel and
   every boot failed at once. The harness now takes the newest that has one.
 
+**N1, side by side with agent-sandbox: first run** (run `p0-n1`, EKS 1.36,
+two m7i.xlarge workers, 2026-11-11; harness `integration-tests/k8s/n1.sh`).
+One machine ran agent-sandbox v1.0.10 (controller with `--extensions`) with
+gVisor release-20261102.0 added to the machine's own containerd and a
+`gvisor` RuntimeClass; the other ran AerolVM's worker pod (3 CPUs, 12 GiB,
+C7 and F10's setup). The same sandbox on both: `alpine:3.20` asleep under
+gVisor, 0.1 CPU, 64 MB. Every timing was taken from one bench pod inside the
+cluster: agent-sandbox through `kubectl apply` and `kubectl wait`, AerolVM
+through `curl` to the worker's Service.
+
+| | agent-sandbox | AerolVM |
+|---|---|---|
+| Cold create, no warm pool (10) | p50 1.16 s (1.03–1.24 s): a Sandbox to Ready | p50 239 ms (179–284 ms) |
+| Warm create, pool of 5 (10) | p50 290 ms (261–342 ms, one at 1.13 s): a SandboxClaim to Ready | p50 19 ms (19–23 ms) |
+| Burst of 20 against a pool of 5 | all Ready in 5.2 s and 4.8 s (2 runs) | all created in 1.16 to 1.30 s (3 runs) |
+| Kubernetes API writes for 10 cold create-and-delete | 231 (50 Sandbox, 110 pod, 71 event) | 0 |
+| Sandboxes per machine | one pod each: at most 58 pods on an m7i.xlarge (VPC CNI), less the node's own | 1,000 in one pod on an m7i.4xlarge (S3); not run to full here |
+
+How to read it:
+
+- The agent-sandbox times include `kubectl` itself: in the same pod, a
+  `kubectl get` took about 70 ms and a `kubectl wait` that was already true
+  about 165 ms. A Go client would save most of that, so agent-sandbox's
+  warm path is roughly 50 to 100 ms of real work, still about 3 to 5 times
+  AerolVM's 19 ms. The cold gap (about 0.9 s of real work against 0.24 s)
+  and the burst gap (4 times) are well beyond that overhead.
+- AerolVM writes nothing to the Kubernetes API per sandbox (K4); agent-
+  sandbox writes about 23 objects per sandbox's life, all through etcd.
+- AerolVM's worker had 3 of the machine's 4 CPUs; agent-sandbox had the
+  whole second machine.
+- Not yet measured, from N1's list: p99 (needs more than 10 samples),
+  several templates, one command's round trip, and both systems run until
+  the machine is full. The first run also lost AerolVM's burst phase to a
+  dropped `kubectl exec` stream; it was rerun by hand on the same cluster
+  (three samples above), and `n1.sh` now records a phase that prints nothing
+  instead of stopping.
+
 **S4, how far one cell goes: the offline half** (2026-11-11, an M1 Max
 laptop, no AWS). `BenchmarkFSMCellCeiling` in
 `internal/cluster/fsm_cell_ceiling_bench_test.go` fills the placement FSM, then
@@ -1725,9 +1762,9 @@ What it says:
 The live half, still to run: the same reserves on three server nodes of the
 EC2 harness, so a real disk and network replace the 6.5 ms model.
 
-**Cost so far:** nine clusters, about 9.8 hours of cluster time in all,
-about $6.10 (the m7i.4xlarge S3 runs are about three quarters of it). S4's
-offline half cost nothing.
+**Cost so far:** ten clusters and two S6 instances, about 10.8 hours of
+cluster time in all, about $6.70 (the m7i.4xlarge S3 runs are about two
+thirds of it). S4's offline half cost nothing.
 
 ## 19. Tests, drills and benchmarks
 

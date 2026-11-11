@@ -79,7 +79,12 @@ spec:
   volumes: [{ name: scripts, configMap: { name: n1-scripts } }]
 YAML
 kubectl -n n1 wait --for=condition=Ready pod/n1-bench --timeout=5m >/dev/null
-bench() { kubectl -n n1 exec n1-bench -- env AV_TOKEN="$token" bash /scripts/bench.sh "$@" 2>&1 | grep '^N1' | tee -a "$report"; }
+# A phase that prints nothing (the first N1 run lost av-burst's exec stream)
+# is recorded as such; set -e would otherwise end the run there.
+bench() {
+  kubectl -n n1 exec n1-bench -- env AV_TOKEN="$token" bash /scripts/bench.sh "$@" 2>&1 | grep '^N1' | tee -a "$report" ||
+    say "N1 $1: no result (the exec stream ended early); rerun: kubectl -n n1 exec n1-bench -- bash /scripts/bench.sh $*"
+}
 
 say "--- agent-sandbox"
 bench as-cold "$N"

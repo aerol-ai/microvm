@@ -66,7 +66,8 @@ anything else, as the plan's Phase 0 exit gate says.
 | S4 | **Offline half done, 2026-11-11.** FSM apply about 8 µs at 100k to 1M placements; commits about 2,000 a second with 64 in flight (6.5 ms modelled sync); at 1M a snapshot holds up Apply for 1.1 s and the FSM needs 2.4 GiB (finding F11, for Phase 3). Live half (three EC2 server nodes) still to run | v2 plan §18, "Phase 0 results" |
 | S8 | **Done, 2026-11-11. Pass** on AL2023 (m6id.xlarge NVMe as XFS with project quotas): a gVisor sandbox with a 100 MB quota stopped at 99.0 MB, the other wrote 300 MB; gVisor keeps its root overlay in a disk file in the writable layer. Bottlerocket not run | v2 plan §18, "Phase 0 results" |
 | S6 | **Done, 2026-11-11. Pass:** m8i.xlarge with nested virtualization has `/dev/kvm`; Firecracker v1.18.0 cold-booted a guest 5 of 5 times in 817 to 862 ms. Not compared with metal; warm pool and snapshot restore not measured under nested virtualization (needed for N7) | v2 plan §18, "Phase 0 results" |
-| S5, N1 | Not started; N1 harness written | — |
+| N1 | **First run done, 2026-11-11.** Same machine type, same gVisor sandbox: cold p50 1.16 s (agent-sandbox) against 239 ms (AerolVM); warm 290 ms against 19 ms; a burst of 20 on a pool of 5 in about 5 s against 1.2 s; 231 Kubernetes API writes for 10 sandboxes against 0. Agent-sandbox times include about 0.2 s of `kubectl`. Still to measure: p99, several templates, a command's round trip, machine-full density | v2 plan §18, "Phase 0 results" |
+| S5 | Not started | — |
 
 ## Cost, before it is spent
 
