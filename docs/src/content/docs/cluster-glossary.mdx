@@ -90,6 +90,7 @@ You do not need to set these yourself. They help when you read logs or fix probl
 | `SB_CELL_ID` | The cell this cluster belongs to, a number from 1 to 255. New sandbox IDs start with it as two hex digits (cell 7 gives `sb-07…`). Set the same number on every node of a cluster. Leave it at 1 unless you run more than one cell. A value outside 1 to 255 stops the node from starting. | `1` |
 | `SB_CLUSTER_BOOTSTRAP` | `true` only on the seed, `false` on every other node. Only a node whose role has `server`, or is `mixed`, can be the seed. | `false` |
 | `SB_CLUSTER_MAX_AUTO_VOTERS` | The most server nodes that vote. Extra server nodes join as non-voters. `0` means no cap. | `5` |
+| `SB_READY_LEADER_GRACE` | How long a node may go without hearing from a working control plane before `GET /ready` answers 503, such as `10s`. Keep it above a normal leader election (a second or two) so one election does not take every node out of rotation. | `10s` |
 
 ### Addresses
 

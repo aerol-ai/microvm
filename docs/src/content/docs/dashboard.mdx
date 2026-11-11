@@ -152,6 +152,7 @@ There are no buttons to create or resize sandboxes. Use the [SDKs](/sdk-setup/) 
 
 - **The page itself (`GET /ui`) needs no login.** It is plain HTML and JavaScript. It holds no passwords and no server data. You sign in before the page calls any API that needs a login. A normal login page works the same way.
 - **`GET /health` needs no login either.** Load balancers call it to check that a node is up. It reports only the node's own health.
+- **`GET /ready` needs no login.** Load balancers and Kubernetes call it to decide whether to send a node traffic. It answers 200 when the node is ready and 503 when it is not, with one line that says why. In a cluster, a node that has lost touch with the control plane for more than 10 seconds answers 503 while `/health` still answers 200.
 - **Every other call the page makes needs your token.** That includes `GET /v1/...`, `GET /v1/metrics` and the buttons. The page sends the token as `Authorization: Bearer <token>`. The server checks it like any SDK call, with the same role checks.
 - **`/v1/metrics` needs a role bound to every team.** Its counters show how the whole system runs: lease state, queue lengths and secret decrypt failures.
 - **The page never calls `/debug/vars`.** Caddy does not forward it from your API domain. It stays `admin`-only, on each node's own port.

@@ -251,6 +251,11 @@ func (s *Server) registerRoutes(mux apihttp.Mux) {
 	// balancers) which should keep working across API version rollouts.
 	// Public by design.
 	mux.Handle("GET /health", http.HandlerFunc(s.handleHealth))
+	// /ready is for readiness probes (Kubernetes, load balancers): 503 while
+	// this node should not get traffic, such as when it is cut off from the
+	// cluster's control plane. Public for the same reason as /health; the
+	// body says only ready or not, and why.
+	mux.Handle("GET /ready", http.HandlerFunc(s.handleReady))
 
 	// Sign-in discovery (§5.6): public by design, since a person reads it
 	// before holding any credential. It lists no issuer with identity off.
@@ -337,6 +342,14 @@ func (s *Server) registerRoutes(mux apihttp.Mux) {
 // dashboard's metrics): v1 authentication and the v1 403 body.
 func (s *Server) route(perm controlplane.Permission, next http.Handler) http.Handler {
 	return apihttp.Router{Authenticate: s.requireAuth, Audit: s.audit}.Route(perm, next)
+}
+
+func (s *Server) handleReady(w http.ResponseWriter, r *http.Request) {
+	if err := s.service.Ready(r.Context()); err != nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"status": "not_ready", "reason": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ready"})
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
