@@ -23,15 +23,20 @@ tmp="$(mktemp -d)"
 pf="" epf=""
 trap 'for p in $pf $epf; do kill "$p" 2>/dev/null; done; rm -rf "$tmp"' EXIT
 (cd "$root" && go build -o "$tmp/aerolvm" ./cmd/aerolvm)
-k port-forward svc/aerolvm "$port:21212" >/dev/null 2>&1 &
-pf=$!
+# A port-forward exits when its pod goes away, and right after `make
+# k8s-dev` replaced the pod it can still pick the old one: start it again
+# until the API answers.
+forward_api() { k port-forward svc/aerolvm "$port:21212" >/dev/null 2>&1 & pf=$!; }
+forward_api
 export SB_API_URL="http://127.0.0.1:$port"
 SB_PAT_TOKEN="$(k get secret aerolvm-api-token -o jsonpath='{.data.SB_PAT_TOKEN}' | base64 -d)"
 export SB_PAT_TOKEN
-for _ in $(seq 1 30); do
+for _ in $(seq 1 60); do
   "$tmp/aerolvm" health >/dev/null 2>&1 && break
+  kill -0 "$pf" 2>/dev/null || forward_api
   sleep 1
 done
+"$tmp/aerolvm" health >/dev/null || { echo "k8s-smoke: the API never answered through kubectl port-forward" >&2; exit 1; }
 
 pod_ip="$(k get pod aerolvm-0 -o jsonpath='{.status.podIP}')"
 kube_api="$(kubectl --context "kind-$cluster" get svc kubernetes -o jsonpath='{.spec.clusterIP}')"
@@ -69,13 +74,14 @@ k delete pod aerolvm-violation --wait=false >/dev/null
 
 if k get svc aerolvm-edge >/dev/null 2>&1; then
   edge_port="${AEROL_SMOKE_EDGE_PORT:-21291}"
-  k port-forward svc/aerolvm-edge "$edge_port:443" >/dev/null 2>&1 &
-  epf=$!
+  forward_edge() { k port-forward svc/aerolvm-edge "$edge_port:443" >/dev/null 2>&1 & epf=$!; }
+  forward_edge
   domain="$(k get pod aerolvm-0 -o jsonpath='{.spec.containers[?(@.name=="agent")].env[?(@.name=="SB_DOMAIN")].value}')"
   https() { curl -sk --max-time 10 --resolve "$1:$edge_port:127.0.0.1" "https://$1:$edge_port${2:-/}"; }
   served() { openssl s_client -connect "127.0.0.1:$edge_port" -servername "$domain" </dev/null 2>/dev/null | openssl x509 -noout -serial 2>/dev/null; }
-  for _ in $(seq 1 30); do
+  for _ in $(seq 1 60); do
     https "$domain" /health | grep -q '"status":"ok"' && break
+    kill -0 "$epf" 2>/dev/null || forward_edge
     sleep 1
   done
   https "$domain" /health | grep -q '"status":"ok"' || { echo "k8s-smoke: the API does not answer at https://$domain" >&2; exit 1; }
@@ -84,7 +90,7 @@ if k get svc aerolvm-edge >/dev/null 2>&1; then
   id="$("$tmp/aerolvm" create --image alpine:3.20 --json | jq -r '.id // empty')"
   [[ -n "$id" ]] || { echo "k8s-smoke: edge sandbox create failed" >&2; exit 1; }
   "$tmp/aerolvm" exec "$id" --background -- sh -c \
-    'while true; do printf "HTTP/1.0 200 OK\r\nContent-Length: 6\r\n\r\nhello\n" | nc -l -p 8080 >/dev/null; done' >/dev/null
+    'while true; do printf "HTTP/1.0 200 OK\r\nContent-Length: 6\r\n\r\nhello\n" | nc -l -p 8080 >/dev/null; done' >/dev/null 2>&1
   url="$("$tmp/aerolvm" expose "$id" 8080 --json | jq -r '.public_url // empty')"
   link="${url#https://}"
   body=""
