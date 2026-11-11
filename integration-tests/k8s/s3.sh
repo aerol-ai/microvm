@@ -1,0 +1,119 @@
+#!/usr/bin/env bash
+# s3.sh: spike S3 (plans/kubernetes-v2-phase0.md). Memory pressure, and what
+# the kubelet and cAdvisor pay per sandbox.
+#
+#   cluster.sh up <name> --type m7i.4xlarge
+#   s3.sh <name>          # writes .state/<name>/s3-report.txt
+#   cluster.sh down <name>
+#
+# 1. A machine-sized worker pod (15 CPUs, 54 GiB, Guaranteed, C7 on).
+# 2. At 0, 100, 500 and 1,000 small gVisor sandboxes (0.1 CPU, 64 MB each):
+#    cAdvisor series for the pod, the kubelet's CPU time and memory, the
+#    pod's memory and the machine's free memory.
+# 3. Every sandbox fills 48 MB of its /dev/shm at once, pushing the pod past
+#    its limit. Recorded: what the kernel killed, whether the kubelet evicted
+#    the pod, the node's MemoryPressure, and whether sandboxd still answers.
+set -euo pipefail
+# shellcheck source=lib.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib.sh"
+
+name="${1:?usage: s3.sh <name> [--pressure-only]}"
+pressure_only=0
+[[ "${2:-}" == "--pressure-only" ]] && pressure_only=1
+if [[ "$pressure_only" == 1 ]]; then lib_init "$name" s3-pressure-report.txt; else lib_init "$name" s3-report.txt; fi
+STAGES=(100 500 1000)
+PARALLEL=20
+
+if [[ "$pressure_only" == 0 ]]; then
+publish_build
+load_br_netfilter
+
+# The H0 worker, sized to an m7i.4xlarge and with room for 1,200 network
+# namespaces (the default pool of 256 would otherwise be what S3 measures).
+manifest="$sd/worker-s3.yaml"
+python3 - "$LIB_DIR/manifests/worker-h0.yaml" "$manifest" <<'EOF'
+import sys
+s = open(sys.argv[1]).read()
+s = s.replace('requests: { cpu: "3", memory: 12Gi }', 'requests: { cpu: "15", memory: 54Gi }')
+s = s.replace('limits: { cpu: "3", memory: 12Gi }', 'limits: { cpu: "15", memory: 54Gi }')
+s = s.replace('        - name: POD_NAME\n', '        - name: SB_CONTAINERD_NETNS_POOL_SIZE\n          value: "1200"\n        - name: POD_NAME\n', 1)
+open(sys.argv[2], "w").write(s)
+EOF
+grep -q 'memory: 54Gi' "$manifest" && grep -q 'NETNS_POOL_SIZE' "$manifest" || { echo "s3: manifest edit failed" >&2; exit 1; }
+apply_worker "$manifest" 1
+wait_ready
+fi
+# --pressure-only reuses the worker and sandboxes already on the cluster.
+token="$(cat "$sd/api-token")"
+wait_api
+node="$(kubectl -n "$NS" get pod "$POD" -o jsonpath='{.spec.nodeName}')"
+uid="$(pod_uid)"
+
+measure() {
+  local label="$1" series total
+  series="$(kubectl get --raw "/api/v1/nodes/$node/proxy/metrics/cadvisor" | grep -c 'pod="worker-0"' || true)"
+  total="$(kubectl get --raw "/api/v1/nodes/$node/proxy/metrics/cadvisor" | grep -vc '^#' || true)"
+  say "--- $label: cAdvisor series for the worker pod: $series; all cAdvisor series on the node: $total"
+  # kubelet's CPU seconds so far (utime + stime) and memory; the pod's memory;
+  # the machine's available memory.
+  node_debug "hz=\$(getconf CLK_TCK); for d in /proc/[0-9]*; do [ \"\$(cat \$d/comm 2>/dev/null)\" = kubelet ] && awk -v hz=\$hz '{printf \"kubelet cpu_seconds=%.1f \", (\$14+\$15)/hz}' \$d/stat && grep VmRSS \$d/status | tr -s ' '; done; echo pod memory.current=\$(cat /sys/fs/cgroup/kubepods.slice/kubepods-pod${uid}.slice/memory.current) machine MemAvailable=\$(grep MemAvailable /proc/meminfo | tr -s ' ' | cut -d' ' -f2)kB"
+}
+
+count_sandboxes() { api /v1/sandboxes | jq 'length'; }
+
+ramp_to() {
+  local target="$1" have need t0 ok
+  have="$(count_sandboxes)"
+  need=$(( target - have ))
+  (( need > 0 )) || return 0
+  t0=$(ms)
+  forward
+  seq 1 "$need" | xargs -P "$PARALLEL" -I{} sh -c \
+    "curl -fsS --max-time 120 -o /dev/null -H 'Authorization: Bearer $token' -H 'Content-Type: application/json' \
+       -d '{\"image\":\"alpine:3.20\",\"runtime\":\"gvisor\",\"cpu\":0.1,\"memory_mb\":64,\"disk_gb\":1}' \
+       http://127.0.0.1:21212/v1/sandboxes && echo ok || echo fail" > "$sd/ramp-$target.txt" 2>/dev/null || true
+  ok="$(grep -c '^ok' "$sd/ramp-$target.txt" || true)"
+  say "ramp to $target: $ok of $need creates ok in $(( ($(ms) - t0) / 1000 )) s (parallel $PARALLEL); sandboxes now: $(count_sandboxes)"
+}
+
+if [[ "$pressure_only" == 0 ]]; then
+  measure "0 sandboxes"
+  for n in "${STAGES[@]}"; do
+    ramp_to "$n"
+    sleep 30
+    measure "$n sandboxes"
+  done
+fi
+
+# Memory pressure: each sandbox writes 48 MB to its tmpfs at once. Within each
+# sandbox's own 64 MB limit, but together about 48 GB on top of the gVisor
+# processes, past the pod's 54 GiB.
+say "--- pressure: every sandbox fills 48 MB of /dev/shm"
+forward
+api /v1/sandboxes | jq -r '.[].id' > "$sd/ids.txt"
+# One small script per sandbox: macOS xargs -I caps a replaced argument at
+# 255 bytes, and a command with the token inside is longer, so xargs ran
+# nothing on the first S3 run.
+cat > "$sd/fill-one.sh" <<EOF
+#!/bin/sh
+curl -fsS --max-time 120 -o /dev/null -H 'Authorization: Bearer $token' -H 'Content-Type: application/json' \\
+  -d '{"command":"dd if=/dev/zero of=/dev/shm/fill bs=1M count=48 2>/dev/null; echo done"}' \\
+  "http://127.0.0.1:21212/v1/sandboxes/\$1/toolbox/process/execute" && echo ok || echo fail
+EOF
+xargs -P 40 -n 1 sh "$sd/fill-one.sh" < "$sd/ids.txt" > "$sd/fill.txt" 2>/dev/null || true
+say "fill: $(grep -c '^ok' "$sd/fill.txt" || true) ok, $(grep -c '^fail' "$sd/fill.txt" || true) failed"
+sleep 60
+say "worker pod: phase $(kubectl -n "$NS" get pod "$POD" -o jsonpath='{.status.phase}') reason '$(kubectl -n "$NS" get pod "$POD" -o jsonpath='{.status.reason}')' restarts $(kubectl -n "$NS" get pod "$POD" -o jsonpath='{.status.containerStatuses[0].restartCount}') state $(kubectl -n "$NS" get pod "$POD" -o jsonpath='{.status.containerStatuses[0].state}' | cut -c1-120)"
+say "node MemoryPressure: $(kubectl get node "$node" -o jsonpath='{.status.conditions[?(@.type=="MemoryPressure")].status}')"
+say "--- events in the worker namespace"
+kubectl -n "$NS" get events --sort-by=.lastTimestamp 2>/dev/null | grep -iE 'evict|oom|kill|memory' | tail -8 | cut -c1-200 | tee -a "$report" >/dev/null || true
+say "--- the kernel's OOM kills on the machine (last 10)"
+node_debug "chroot /host journalctl -k --since '-15 min' --no-pager 2>/dev/null | grep -iE 'killed process|oom-kill' | tail -10 | cut -c1-220"
+forward
+if alive="$(count_sandboxes 2>/dev/null)"; then
+  say "sandboxd still answers; sandboxes listed: $alive"
+else
+  say "sandboxd does not answer"
+fi
+measure "after pressure"
+say "--- done; report in $report"

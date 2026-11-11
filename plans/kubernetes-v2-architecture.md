@@ -1452,6 +1452,8 @@ or the smoke test until the spike worked around it. Phase 1 must fix each in
 | F5 | The egress floor and node guard for runtime `docker` need Docker, so creates on that runtime are refused; the containerd ones install. | None needed | The same as F4 |
 | F6 | Hostname-filtered egress needs the egress gateway (its user and socket), which the pod lacks, so those creates are refused. | None | The gateway as one more container in the worker pod |
 | F8 | With the agent's `/run/netns` shared to the runtime container by Bidirectional mount propagation, the network namespaces `sandboxd` mounts there land in the machine's own mount table. When the pod is deleted or dies, nothing removes them: the kubelet cannot tear the volume down, and the pod sticks in Terminating. It also breaks K4 (AerolVM touches the machine only through the kernel). | `lib.sh` unmounts them in the machine's mount namespace (`nsenter -t 1 -m`) before replacing a worker pod | Make the namespaces where they are used: in the runtime container, through a small privileged helper (the N2 split), so nothing has to cross containers or reach the machine |
+| F9 | cAdvisor, inside the kubelet, tracks every sandbox's cgroup as its own container: 57 series per sandbox, with no pod or container label. At 1,000 sandboxes one node exposes 57,823 cAdvisor series (1,095 with none), so a Prometheus scraping 2,000 such nodes would hold over 100 million series. The worker pod's own series stay at 177. | None needed for the spike | Eng review D3's decision, now with numbers: P9's ServiceMonitor drops `/sandboxes/` series at scrape time (metric relabelling), and the operator documents it; or move sandbox cgroups out of cAdvisor's view, if a kubelet setting allows it. Usage per sandbox comes from C20, not from cAdvisor. |
+| F10 | **One pod-level out-of-memory event killed every process in the worker container:** all sandboxes, every shim, `containerd` and `sandboxd` (one event; 172 runsc helpers, 88 shims, 77 runsc, 61 gVisor sentries, 21 runsc sandbox processes, 2 containerd, 2 sandboxd). The kubelet's default (`singleProcessOOMKill` unset, so false) kills a container's processes as one group. §8.3 assumed the kernel would stop one sandbox first and the machinery last; on EKS 1.36 it does not. The kubelet did not evict the pod and the node never reported MemoryPressure: it was the pod's cgroup limit alone. | None: S3 records it | Pick before Phase 1: (a) the bank's kubelet sets `singleProcessOOMKill: true` on worker pools; or (b) the supervisor sets its own container's `memory.oom.group` to 0, each sandbox's group to 1 (a sandbox dies whole, alone), and gives the machinery the lowest OOM score. In both cases admission must size itself from the pod's limit (F3), so overcommit does not drive the pod into its limit in normal use. |
 | F7 | Bottlerocket 1.68 sets `user.max_user_namespaces=0`. gVisor's gofer makes a user namespace, so every gVisor create fails with "fork/exec /proc/self/exe: no space left on device". It also means Kubernetes user namespaces (spike S9) cannot work on a default Bottlerocket node. | Raised to 62775 at run time from a node debug pod | A bank decision, not code: Bottlerocket's `settings.kernel.sysctl` raises it per node pool. The chart's docs and `aerolvm k8s verify` (P8) must check it. |
 
 **S1, where a sandbox lands: half done** (same run).
@@ -1563,8 +1565,29 @@ split worker only once F8's fix lands (make the namespaces in the runtime
 container). Not yet run: S7 on Bottlerocket (F7 applies there too) and S3
 with the list.
 
-**Cost so far:** five clusters, about 4.5 hours of cluster time in all,
-about $1.55.
+**S3, scale and memory pressure** (run `p0-s3`, m7i.4xlarge, AL2023, a 15-CPU
+54 GiB Guaranteed worker pod, C7 on, 2026-11-11):
+
+| Sandboxes (gVisor, 0.1 CPU, 64 MB) | Created | cAdvisor series, worker pod / whole node | kubelet memory | Pod memory |
+|---|---|---|---|---|
+| 0 | — | 177 / 1,095 | 94 MB | 1.5 GB |
+| 100 | 100 of 100 in 7 s | 177 / 6,460 | 108 MB | 3.6 GB |
+| 500 | 400 of 400 in 25 s | 177 / 29,320 | 121 MB | 12.0 GB |
+| 1,000 | 500 of 500 in 34 s | 177 / 57,823 | 170 MB | 22.7 GB |
+
+Creates ran 20 at a time through a port-forward from a laptop, so the rate
+(about 15 a second) is a floor, not the cell's number (S4 measures that).
+The kubelet's CPU time grew from 1.7 s to 25.4 s over the ramp. The
+sandbox cgroups are where cAdvisor's series come from (F9).
+
+Pressure: every sandbox then wrote 48 MB to its own tmpfs. 684 did before
+the pod's 54 GiB limit was hit; then one out-of-memory event killed the
+whole worker container (F10), and the pod ended Failed. **Does the kubelet
+ever evict the worker pod? Not here: the node never reached MemoryPressure.
+The danger is the pod's own limit, not eviction.**
+
+**Cost so far:** six clusters, about 5.3 hours of cluster time in all,
+about $2.30 (S3's m7i.4xlarge is most of the rise).
 
 ## 19. Tests, drills and benchmarks
 
