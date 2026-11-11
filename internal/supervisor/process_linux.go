@@ -66,6 +66,15 @@ func StartInGroup(dir string, argv []string) (int, error) {
 	return pid, nil
 }
 
+// Unmount detaches the mount at path; a path that is not a mount point
+// (EINVAL) is no error.
+func Unmount(path string) error {
+	if err := unix.Unmount(path, unix.MNT_DETACH); err != nil && !errors.Is(err, unix.EINVAL) {
+		return err
+	}
+	return nil
+}
+
 // Terminate asks pid to stop.
 func Terminate(pid int) { _ = syscall.Kill(pid, syscall.SIGTERM) }
 

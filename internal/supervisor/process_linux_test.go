@@ -3,9 +3,11 @@
 package supervisor
 
 import (
+	"errors"
 	"os/exec"
 	"path/filepath"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -20,6 +22,13 @@ func TestProcessCallsOnLinux(t *testing.T) {
 	// container lacks (the worker's runtime container has it, spike S7);
 	// Run only logs a failure, so either result is fine here.
 	_ = LowerOwnOOMScore()
+	// A path that is not a mount point is no error; a missing one is.
+	if err := Unmount(t.TempDir()); err != nil && !errors.Is(err, syscall.EPERM) {
+		t.Fatalf("Unmount of a plain folder: %v", err)
+	}
+	if err := Unmount(filepath.Join(t.TempDir(), "missing")); err == nil {
+		t.Fatal("unmounted a path that does not exist")
+	}
 	if _, err := StartInGroup(filepath.Join(t.TempDir(), "missing"), []string{"true"}); err == nil {
 		t.Fatal("started in a group that does not exist")
 	}

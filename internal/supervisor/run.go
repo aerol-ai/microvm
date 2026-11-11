@@ -21,10 +21,13 @@ type Settings struct {
 	// ParentFile is where the agent container reads its
 	// SB_CONTAINERD_CGROUP_PARENT, on a folder both containers mount.
 	ParentFile string
+	// NetnsDir holds the network namespaces the agent mounts for sandboxes;
+	// they are unmounted when the supervisor stops (UnmountNamespaces).
+	NetnsDir string
 }
 
-// SettingsFromEnv reads SB_CONTAINERD_BINARY, SB_CONTAINERD_CONFIG and
-// SB_CGROUP_PARENT_FILE, with the runtime image's defaults.
+// SettingsFromEnv reads SB_CONTAINERD_BINARY, SB_CONTAINERD_CONFIG,
+// SB_CGROUP_PARENT_FILE and SB_NETNS_DIR, with the runtime image's defaults.
 func SettingsFromEnv() Settings {
 	get := func(k, def string) string {
 		if v := strings.TrimSpace(os.Getenv(k)); v != "" {
@@ -36,6 +39,7 @@ func SettingsFromEnv() Settings {
 		ContainerdBinary: get("SB_CONTAINERD_BINARY", "containerd"),
 		ContainerdConfig: get("SB_CONTAINERD_CONFIG", "/etc/containerd/config.toml"),
 		ParentFile:       get("SB_CGROUP_PARENT_FILE", "/run/aerolvm/cgroup-parent"),
+		NetnsDir:         get("SB_NETNS_DIR", "/run/netns"),
 	}
 }
 
@@ -48,6 +52,7 @@ type OS struct {
 	BecomeReaper func() error
 	StartInGroup func(dir string, argv []string) (int, error)
 	Terminate    func(pid int)
+	Unmount      func(path string) error
 	Reap         func(watched *atomic.Int64, exited chan<- int, log *slog.Logger)
 	// DefaultConfig prints containerd's default configuration.
 	DefaultConfig func(binary string) ([]byte, error)
@@ -68,6 +73,7 @@ func RealOS() OS {
 		BecomeReaper: BecomeReaper,
 		StartInGroup: StartInGroup,
 		Terminate:    Terminate,
+		Unmount:      Unmount,
 		Reap:         Reap,
 		DefaultConfig: func(binary string) ([]byte, error) {
 			return exec.Command(binary, "config", "default").Output()
@@ -133,7 +139,36 @@ func Run(ctx context.Context, s Settings, sys OS, log *slog.Logger) error {
 		HealthyAfter: time.Minute,
 	}
 	k.Run(ctx)
+	UnmountNamespaces(s.NetnsDir, sys.Unmount, log)
 	return nil
+}
+
+// UnmountNamespaces removes the network-namespace mounts in dir as the pod
+// ends. The agent mounts them with Bidirectional propagation so this
+// container sees them, which also puts them in the machine's own mount
+// table; left there, the kubelet cannot remove the pod's volume and the pod
+// stays in Terminating (finding F8, seen on EKS and kind). This container
+// stops only with the pod (an agent upgrade never stops it), so it is the
+// one that can clean up without ending a live sandbox. Its own mount of dir
+// must be Bidirectional too, so the unmount reaches the machine.
+func UnmountNamespaces(dir string, unmount func(string) error, log *slog.Logger) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			log.Warn("supervisor: could not list network namespaces to unmount", "dir", dir, "error", err)
+		}
+		return
+	}
+	n := 0
+	for _, e := range entries {
+		p := filepath.Join(dir, e.Name())
+		if err := unmount(p); err != nil {
+			log.Warn("supervisor: could not unmount a network namespace", "path", p, "error", err)
+			continue
+		}
+		n++
+	}
+	log.Info("supervisor: network namespaces unmounted", "count", n)
 }
 
 func ensureConfig(s Settings, sys OS) error {

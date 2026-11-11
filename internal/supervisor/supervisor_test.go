@@ -223,7 +223,7 @@ func TestSettingsFromEnv(t *testing.T) {
 	t.Setenv("SB_CONTAINERD_CONFIG", " /etc/c.toml ")
 	t.Setenv("SB_CGROUP_PARENT_FILE", "")
 	s := SettingsFromEnv()
-	if s.ContainerdBinary != "containerd" || s.ContainerdConfig != "/etc/c.toml" || s.ParentFile != "/run/aerolvm/cgroup-parent" {
+	if s.ContainerdBinary != "containerd" || s.ContainerdConfig != "/etc/c.toml" || s.ParentFile != "/run/aerolvm/cgroup-parent" || s.NetnsDir != "/run/netns" {
 		t.Fatalf("%+v", s)
 	}
 }
@@ -322,7 +322,13 @@ func TestKeeperStopsWhileWaiting(t *testing.T) {
 func TestRun(t *testing.T) {
 	l := fakeCgroup(t, "/kubepods/pod1/ctr", "12884901888", "1")
 	dir := t.TempDir()
-	s := Settings{ContainerdBinary: "/opt/containerd", ContainerdConfig: filepath.Join(dir, "etc", "config.toml"), ParentFile: filepath.Join(dir, "run", "cgroup-parent")}
+	netns := filepath.Join(dir, "netns")
+	_ = os.MkdirAll(netns, 0o755)
+	for _, n := range []string{"aerol-netns-0", "aerol-netns-1"} {
+		_ = os.WriteFile(filepath.Join(netns, n), nil, 0o644)
+	}
+	s := Settings{ContainerdBinary: "/opt/containerd", ContainerdConfig: filepath.Join(dir, "etc", "config.toml"), ParentFile: filepath.Join(dir, "run", "cgroup-parent"), NetnsDir: netns}
+	var unmounted []string
 	ctx, cancel := context.WithCancel(context.Background())
 	var remounted bool
 	var startedIn string
@@ -349,7 +355,14 @@ func TestRun(t *testing.T) {
 			return 4242, nil
 		},
 		Terminate: func(pid int) { terminated.Store(int64(pid)) },
-		Reap:      func(*atomic.Int64, chan<- int, *slog.Logger) {},
+		Unmount: func(p string) error {
+			if terminated.Load() == 0 {
+				t.Error("a namespace was unmounted while containerd still ran")
+			}
+			unmounted = append(unmounted, filepath.Base(p))
+			return nil
+		},
+		Reap: func(*atomic.Int64, chan<- int, *slog.Logger) {},
 	}
 	var logs bytes.Buffer
 	if err := Run(ctx, s, sys, slog.New(slog.NewTextHandler(&logs, nil))); err != nil {
@@ -372,6 +385,38 @@ func TestRun(t *testing.T) {
 	}
 	if !strings.Contains(logs.String(), "could not lower its own OOM score") {
 		t.Fatal("a failed OOM score change was not logged")
+	}
+	if strings.Join(unmounted, ",") != "aerol-netns-0,aerol-netns-1" {
+		t.Fatalf("unmounted %v, want both namespaces after containerd stopped (finding F8)", unmounted)
+	}
+}
+
+func TestUnmountNamespaces(t *testing.T) {
+	var logs bytes.Buffer
+	log := slog.New(slog.NewTextHandler(&logs, nil))
+	UnmountNamespaces(filepath.Join(t.TempDir(), "missing"), func(string) error { t.Fatal("nothing to unmount"); return nil }, log)
+	if logs.Len() != 0 {
+		t.Fatalf("a missing folder was reported: %s", logs.String())
+	}
+	dir := t.TempDir()
+	for _, n := range []string{"a", "b"} {
+		_ = os.WriteFile(filepath.Join(dir, n), nil, 0o644)
+	}
+	UnmountNamespaces(dir, func(p string) error {
+		if filepath.Base(p) == "a" {
+			return errors.New("EBUSY")
+		}
+		return nil
+	}, log)
+	if !strings.Contains(logs.String(), "could not unmount a network namespace") || !strings.Contains(logs.String(), "count=1") {
+		t.Fatalf("logs: %s", logs.String())
+	}
+	file := filepath.Join(t.TempDir(), "file")
+	_ = os.WriteFile(file, nil, 0o644)
+	logs.Reset()
+	UnmountNamespaces(file, func(string) error { return nil }, log)
+	if !strings.Contains(logs.String(), "could not list network namespaces") {
+		t.Fatalf("a folder that cannot be listed was not reported: %s", logs.String())
 	}
 }
 
