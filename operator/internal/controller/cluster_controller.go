@@ -97,6 +97,9 @@ func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	if err := r.syncEdgeSecret(ctx, &c); err != nil {
 		return ctrl.Result{}, err
 	}
+	if err := r.syncCreatePolicy(ctx, &c); err != nil {
+		return ctrl.Result{}, err
+	}
 	nodes, err := listNodes(ctx, r.Client, &c)
 	if err != nil {
 		return ctrl.Result{}, err
@@ -258,7 +261,15 @@ func (r *ClusterReconciler) ensureServices(ctx context.Context, c *v1.AerolClust
 			gw.Spec.ExternalTrafficPolicy = corev1.ServiceExternalTrafficPolicyLocal
 		}
 		gw.Spec.Selector = map[string]string{LabelCluster: c.Name, LabelComponent: v1.RoleGateway}
-		gw.Spec.Ports = []corev1.ServicePort{port("https", 443), port("http", 80), port("ssh", 2220)}
+		// With the edge, the gateways' Caddy serves the API and the
+		// sandbox links on 443 (and 80 for redirects). Without it nothing
+		// listens there, so the Service carries sandboxd's own API port
+		// instead, for in-cluster clients and a port-forward.
+		if c.Spec.Edge.Domain != "" {
+			gw.Spec.Ports = []corev1.ServicePort{port("https", 443), port("http", 80), port("ssh", 2220)}
+		} else {
+			gw.Spec.Ports = []corev1.ServicePort{port("api", APIPort), port("ssh", 2220)}
+		}
 	})
 }
 
@@ -511,6 +522,28 @@ func (r *ClusterReconciler) SetupWithManager(mgr ctrl.Manager) error {
 // syncEdgeSecret copies the sandbox-link certificate, its certificate and
 // key only, into the worker namespace (C25). A renewal reaches the copy on
 // the next pass; sandboxd reloads it from the file.
+// syncCreatePolicy keeps a copy of the create policy's ConfigMap in the
+// worker namespace, where worker pods mount it: a ConfigMap volume is
+// namespaced. Only the policy key is copied.
+func (r *ClusterReconciler) syncCreatePolicy(ctx context.Context, c *v1.AerolCluster) error {
+	ref := c.Spec.Security.CreatePolicy
+	if ref == nil || ref.Name == "" || r.WorkerNamespace == "" || r.WorkerNamespace == c.Namespace {
+		return nil
+	}
+	var src corev1.ConfigMap
+	if err := r.Get(ctx, types.NamespacedName{Namespace: c.Namespace, Name: ref.Name}, &src); err != nil {
+		// Not there yet: workers refuse creates until it is (fail closed).
+		return client.IgnoreNotFound(err)
+	}
+	dst := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: ref.Name, Namespace: r.WorkerNamespace}}
+	_, err := controllerutil.CreateOrUpdate(ctx, r.Client, dst, func() error {
+		dst.Labels = clusterLabels(c)
+		dst.Data = map[string]string{CreatePolicyKey: src.Data[CreatePolicyKey]}
+		return nil
+	})
+	return err
+}
+
 func (r *ClusterReconciler) syncEdgeSecret(ctx context.Context, c *v1.AerolCluster) error {
 	name := c.Spec.Edge.TLSSecret
 	if name == "" || r.WorkerNamespace == "" || r.WorkerNamespace == c.Namespace {

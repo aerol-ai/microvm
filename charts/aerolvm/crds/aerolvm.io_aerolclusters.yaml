@@ -281,7 +281,11 @@ spec:
                 description: Security holds node identity and secret settings.
                 properties:
                   createPolicy:
-                    description: CreatePolicy is a ConfigMap rendered as SB_CREATE_POLICY_FILE.
+                    description: |-
+                      CreatePolicy names a ConfigMap in this namespace whose key
+                      policy.yaml is the create policy (SB_CREATE_POLICY_FILE) on every
+                      node; the operator copies it to the worker namespace. While it is
+                      missing, every create is refused.
                     properties:
                       name:
                         default: ""
@@ -514,6 +518,14 @@ spec:
                       - cpu
                       - memoryGiB
                       type: object
+                    maxMachineAge:
+                      description: |-
+                        MaxMachineAge retires a worker whose machine is older, by
+                        decommission: one per zone at a time, and only while no zone is
+                        short of room. Worker NodePools set Karpenter's expireAfter to Never
+                        (§10.6), so this is how their machines still get patched. Empty:
+                        never.
+                      type: string
                     maxWorkers:
                       format: int32
                       minimum: 0
@@ -547,7 +559,10 @@ spec:
                       - none
                       type: string
                     runtimes:
-                      description: 'Runtimes this pool runs: runc and gvisor today.'
+                      description: |-
+                        Runtimes this pool runs: runc and gvisor today. Its workers run
+                        only these, so [gvisor] never runs a sandbox on runc. Empty: what
+                        the chart's worker settings allow.
                       items:
                         type: string
                       type: array

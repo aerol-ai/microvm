@@ -135,7 +135,9 @@ type WorkerPoolSpec struct {
 	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`
 	// +kubebuilder:validation:MaxLength=40
 	Name string `json:"name"`
-	// Runtimes this pool runs: runc and gvisor today.
+	// Runtimes this pool runs: runc and gvisor today. Its workers run
+	// only these, so [gvisor] never runs a sandbox on runc. Empty: what
+	// the chart's worker settings allow.
 	// +optional
 	Runtimes []string `json:"runtimes,omitempty"`
 	// NodeSelector picks the pool's machines, such as
@@ -175,6 +177,13 @@ type WorkerPoolSpec struct {
 	Provisioner string `json:"provisioner,omitempty"`
 	// +optional
 	Decommission DecommissionSpec `json:"decommission,omitempty"`
+	// MaxMachineAge retires a worker whose machine is older, by
+	// decommission: one per zone at a time, and only while no zone is
+	// short of room. Worker NodePools set Karpenter's expireAfter to Never
+	// (§10.6), so this is how their machines still get patched. Empty:
+	// never.
+	// +optional
+	MaxMachineAge *metav1.Duration `json:"maxMachineAge,omitempty"`
 }
 
 // MachineSpec is one machine's size.
@@ -227,7 +236,10 @@ type SecuritySpec struct {
 	// AerolCluster that sets it is refused with a reason.
 	// +optional
 	ExternalCA *ExternalCASpec `json:"externalCA,omitempty"`
-	// CreatePolicy is a ConfigMap rendered as SB_CREATE_POLICY_FILE.
+	// CreatePolicy names a ConfigMap in this namespace whose key
+	// policy.yaml is the create policy (SB_CREATE_POLICY_FILE) on every
+	// node; the operator copies it to the worker namespace. While it is
+	// missing, every create is refused.
 	// +optional
 	CreatePolicy *corev1.LocalObjectReference `json:"createPolicy,omitempty"`
 }

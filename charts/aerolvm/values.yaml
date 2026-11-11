@@ -124,6 +124,10 @@ networkPolicy:
   #    sandbox images, VPC endpoints for object storage or KMS, or the
   #    NodeLocal DNSCache address (often 169.254.20.10/32).
   extraEgressCIDRs: []
+  # Cluster mode only: who else may reach a worker pod, as NetworkPolicy
+  # peers. The gateways, servers, other workers and (with monitoring on)
+  # Prometheus are already allowed; nothing else needs to.
+  extraIngressFrom: []
 
 # Sandbox links and the API over HTTPS (C25): an edge container runs
 # AerolVM's Caddy, as on a domain install. The API is https://<domain> and
@@ -170,6 +174,9 @@ monitoring:
   # seconds, so a slower scrape loses detail, never usage.
   interval: 30s
   scrapeTimeout: 10s
+  # The namespace Prometheus runs in. In cluster mode the workers'
+  # NetworkPolicy lets it, and only it, read their metrics.
+  prometheusNamespace: monitoring
   # /v1/metrics needs a token allowed to read metrics. Empty uses the API
   # token, which can do everything. Better, with API tokens on
   # (SB_IDENTITY_ENABLED): a token that can only read, `aerolvm token
@@ -252,7 +259,19 @@ cluster:
   #     headroomPercent: 15
   #     provisioner: karpenter
   #     decommission: { drainWindow: 15m }
+  #     # Replace machines older than this, one per zone at a time. Set it
+  #     # on Karpenter pools: their NodePool has expireAfter: Never.
+  #     maxMachineAge: 720h
   workerPools: []
+  # The create policy every node holds new sandboxes to: which images,
+  # registries and runtimes, how big, root or not, GPU or not (docs: Limit
+  # what users can create). Empty allows everything. Every pod mounts it,
+  # so a change here reaches running nodes within a minute. For example:
+  #   version: 1
+  #   images: { allowed_registries: [registry.bank.example] }
+  #   runtimes: [gvisor]
+  #   limits: { max_cpu: 4, max_memory_mb: 8192, max_disk_gb: 50 }
+  createPolicy: {}
   operator:
     replicas: 2
     resources:

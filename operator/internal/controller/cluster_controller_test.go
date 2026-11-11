@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sort"
 	"strings"
 	"testing"
@@ -171,6 +172,39 @@ func TestGatewayServiceBehindGatewayRef(t *testing.T) {
 	}
 }
 
+// The gateway Service's ports follow the edge: Caddy's 443 and 80 with it,
+// sandboxd's API port without it (nothing listens on 443 then).
+func TestGatewayServicePorts(t *testing.T) {
+	names := func(svc corev1.Service) string {
+		var out []string
+		for _, p := range svc.Spec.Ports {
+			out = append(out, fmt.Sprintf("%s:%d", p.Name, p.Port))
+		}
+		return strings.Join(out, ",")
+	}
+	for _, tc := range []struct {
+		name, domain, want string
+	}{
+		{name: "no edge", want: "api:21212,ssh:2220"},
+		{name: "edge", domain: "sandboxes.bank.example", want: "https:443,http:80,ssh:2220"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := testCluster()
+			c.Spec.Edge.Domain = tc.domain
+			r, api, cl := clusterRig(t, bootstrapped(c))
+			api.membersErr = errors.New("down")
+			reconcileCluster(t, r)
+			var svc corev1.Service
+			if err := cl.Get(context.Background(), types.NamespacedName{Namespace: testNS, Name: "prod-gateway"}, &svc); err != nil {
+				t.Fatal(err)
+			}
+			if got := names(svc); got != tc.want {
+				t.Fatalf("ports = %s, want %s", got, tc.want)
+			}
+		})
+	}
+}
+
 // Upgrades: spec.version moves, the operator starts the images rollout,
 // marks each node's turn, and rolls back when the version goes back.
 func TestClusterUpgradeFlow(t *testing.T) {
@@ -307,5 +341,38 @@ func TestClusterCopiesEdgeCertificate(t *testing.T) {
 	}
 	if len(dst.Data) != 2 || string(dst.Data["tls.key"]) != "KEY" || dst.Type != corev1.SecretTypeTLS {
 		t.Fatalf("copy = %v (%s)", dst.Data, dst.Type)
+	}
+}
+
+// The create policy's ConfigMap reaches the worker namespace, its policy
+// key only, and follows a change.
+func TestClusterCopiesCreatePolicy(t *testing.T) {
+	c := bootstrapped(testCluster())
+	c.Spec.Security.CreatePolicy = &corev1.LocalObjectReference{Name: "prod-create-policy"}
+	r, api, cl := clusterRig(t, c)
+	r.WorkerNamespace = testWorkerNS
+	api.membersErr = errors.New("down")
+	reconcileCluster(t, r) // not made yet: nothing to copy, no error
+	ctx := context.Background()
+	src := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: "prod-create-policy", Namespace: testNS},
+		Data: map[string]string{CreatePolicyKey: "version: 1\nruntimes: [gvisor]\n", "notes": "not copied"}}
+	if err := cl.Create(ctx, src); err != nil {
+		t.Fatal(err)
+	}
+	reconcileCluster(t, r)
+	var dst corev1.ConfigMap
+	if err := cl.Get(ctx, types.NamespacedName{Namespace: testWorkerNS, Name: "prod-create-policy"}, &dst); err != nil {
+		t.Fatal(err)
+	}
+	if len(dst.Data) != 1 || dst.Data[CreatePolicyKey] != "version: 1\nruntimes: [gvisor]\n" {
+		t.Fatalf("copy = %v", dst.Data)
+	}
+	src.Data[CreatePolicyKey] = "version: 1\nruntimes: [gvisor]\nallow_gpu: false\n"
+	if err := cl.Update(ctx, src); err != nil {
+		t.Fatal(err)
+	}
+	reconcileCluster(t, r)
+	if err := cl.Get(ctx, types.NamespacedName{Namespace: testWorkerNS, Name: "prod-create-policy"}, &dst); err != nil || !strings.Contains(dst.Data[CreatePolicyKey], "allow_gpu") {
+		t.Fatalf("after a change: %v %v", dst.Data, err)
 	}
 }

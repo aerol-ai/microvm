@@ -38,10 +38,15 @@ containers:
         set -eu
         # This node's settings and the cluster files its setup container
         # wrote, loaded as systemd loads them on a VM.
+        # The pod's own settings beat both files, as sandboxd's own loader
+        # has it: the operator sets some per start (a server's gossip
+        # address is its pod IP now, where cluster.env keeps its DNS name).
+        pod_env="$(export -p)"
         set -a
         . /etc/sandboxd/sandboxd.env
         [ -s /etc/sandboxd/cluster.env ] && . /etc/sandboxd/cluster.env
         set +a
+        eval "$pod_env"
         # sandboxd cannot change the mode of a volume's own root (C5), so
         # its database lives one folder down.
         mkdir -p /var/lib/sandboxd/db

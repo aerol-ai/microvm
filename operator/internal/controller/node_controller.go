@@ -305,6 +305,15 @@ func (r *NodeReconciler) ensureJoinSecret(ctx context.Context, c *v1.AerolCluste
 // observe sets the node's state from its pod and from AerolVM.
 func (r *NodeReconciler) observe(ctx context.Context, c *v1.AerolCluster, n *v1.AerolNode, pod *corev1.Pod, api AerolAPI) (ctrl.Result, error) {
 	n.Status.PodName, n.Status.NodeName = pod.Name, pod.Spec.NodeName
+	if why := preflightFailed(pod); why != "" {
+		// The machine is wrong, not the pod: a new pod would only land on
+		// a machine like it. This one stays, holding its machine out of
+		// service with the reason, and its slot is free for a worker on
+		// another machine. The kubelet retries the check, so a machine
+		// fixed in place joins by itself.
+		r.setState(n, v1.StateFailed, why)
+		return ctrl.Result{RequeueAfter: time.Minute}, nil
+	}
 	if why := setupFailing(pod, r.now()); why != "" {
 		r.setState(n, v1.StateFailed, why)
 		if n.Spec.Role != v1.RoleServer {
@@ -376,6 +385,37 @@ func containerImage(pod *corev1.Pod, name string) (string, string) {
 		}
 	}
 	return "", ""
+}
+
+// preflightFailed is the worker preflight's reason when its last run
+// failed: the last line of its termination message, which names each
+// failed check and its fix (sandboxd preflight --pod).
+func preflightFailed(pod *corev1.Pod) string {
+	for _, cs := range pod.Status.InitContainerStatuses {
+		if cs.Name != PreflightContainer {
+			continue
+		}
+		t := cs.State.Terminated
+		if t == nil {
+			t = cs.LastTerminationState.Terminated
+		}
+		if t == nil || t.ExitCode == 0 || cs.State.Running != nil {
+			return ""
+		}
+		msg := strings.TrimSpace(t.Message)
+		if i := strings.LastIndexByte(msg, '\n'); i >= 0 {
+			msg = strings.TrimSpace(msg[i+1:])
+		}
+		if msg == "" {
+			msg = fmt.Sprintf("preflight failed (exit %d)", t.ExitCode)
+		}
+		const max = 1024
+		if len(msg) > max {
+			msg = msg[:max]
+		}
+		return msg
+	}
+	return ""
 }
 
 // setupFailing names why the pod cannot start: its setup container keeps

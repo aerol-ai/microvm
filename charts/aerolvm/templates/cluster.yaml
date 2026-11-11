@@ -135,6 +135,26 @@ spec:
     domain: {{ .Values.edge.domain | quote }}
     tlsSecret: {{ include "aerolvm.edgeTLSSecret" . }}
   {{- end }}
+  security:
+    createPolicy:
+      name: {{ .Values.cluster.name }}-create-policy
+---
+# The create policy (docs: Limit what users can create), on every node:
+# the node a create reaches checks it, and the worker that runs it checks
+# again. The operator copies it to the worker namespace. Always made, and
+# every pod always mounts it, so turning a policy on, changing it or
+# turning it off is a change to this ConfigMap that reaches every running
+# pod within a minute. With none set it is `version: 1`, which allows
+# everything.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Values.cluster.name }}-create-policy
+  labels:
+    {{- include "aerolvm.labels" . | nindent 4 }}
+data:
+  policy.yaml: |
+    {{- toYaml (.Values.cluster.createPolicy | default (dict "version" 1)) | nindent 4 }}
 {{- with .Values.cluster.gateways.gatewayRef }}
 ---
 # Behind the bank's own Gateway (§7.1): fixed routes, written once, none

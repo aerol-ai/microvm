@@ -41,6 +41,31 @@ affinity:
   {{- toYaml . | nindent 2 }}
 {{- end }}
 {{- end }}
+initContainers:
+  # Checks the machine this pod landed on before anything starts (P10):
+  # cgroup v2, the kernel version and br_netfilter. Every machine is
+  # checked, a machine added later included. A failure stops the pod
+  # here, its last log line naming each problem and its fix; the
+  # kubelet keeps that line as the termination message, and the
+  # operator shows it on the worker's AerolNode. Needs no rights.
+  - name: preflight
+    image: {{ include "aerolvm.image" (dict "root" $root "name" "aerolvm") }}
+    imagePullPolicy: {{ $root.Values.image.pullPolicy }}
+    command: ["sandboxd", "preflight", "--pod"]
+    terminationMessagePolicy: FallbackToLogsOnError
+    securityContext:
+      runAsUser: 65532
+      runAsGroup: 65532
+      runAsNonRoot: true
+      allowPrivilegeEscalation: false
+      readOnlyRootFilesystem: true
+      capabilities:
+        drop: ["ALL"]
+    # Requests equal limits, as in every container here: the pod stays
+    # Guaranteed (S3).
+    resources:
+      requests: { cpu: 100m, memory: 64Mi }
+      limits: { cpu: 100m, memory: 64Mi }
 containers:
   - name: runtime
     image: {{ include "aerolvm.image" (dict "root" $root "name" "aerolvm-runtime") }}
@@ -51,6 +76,14 @@ containers:
       privileged: true
     resources:
       {{- toYaml $root.Values.worker.runtime.resources | nindent 6 }}
+    {{- if $cluster }}
+    env:
+      # sandboxd's ownership lease (C7). When it runs out the supervisor
+      # freezes the sandboxes it fences, even with sandboxd down; that is
+      # what lets a machine the operator says is gone fail over at its
+      # lease limit instead of after the grace (C19).
+      - { name: SB_OWNERSHIP_LEASE_FILE, value: /run/aerolvm/ownership-lease }
+    {{- end }}
     volumeMounts:
       - { name: containerd, mountPath: /var/lib/containerd }
       - { name: state, mountPath: /var/lib/sandboxd }
@@ -103,10 +136,15 @@ containers:
         # This node's settings and the cluster files its setup container
         # wrote (join --files-only, F14), loaded as systemd loads them on
         # a VM.
+        # The pod's own settings beat both files, as sandboxd's own loader
+        # has it: the operator sets some per start (a server's gossip
+        # address is its pod IP now, where cluster.env keeps its DNS name).
+        pod_env="$(export -p)"
         set -a
         . /etc/sandboxd/sandboxd.env
         [ -s /etc/sandboxd/cluster.env ] && . /etc/sandboxd/cluster.env
         set +a
+        eval "$pod_env"
         {{- end }}
         exec sandboxd
     env:
@@ -123,6 +161,11 @@ containers:
         valueFrom:
           fieldRef:
             fieldPath: metadata.name
+      {{- if $cluster }}
+      # Written after each ownership answer from the leader, for the
+      # runtime container's supervisor (C7, C19).
+      - { name: SB_OWNERSHIP_LEASE_FILE, value: /run/aerolvm/ownership-lease }
+      {{- end }}
       - { name: SB_API_HOST, value: "0.0.0.0" }
       - { name: SB_API_PORT, value: "21212" }
       - { name: SB_DB_PATH, value: /var/lib/sandboxd/state.db }

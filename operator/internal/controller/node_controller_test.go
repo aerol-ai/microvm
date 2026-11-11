@@ -421,3 +421,74 @@ func TestDecommissionDefaultsAndDrift(t *testing.T) {
 		t.Fatal("NodeClaim not deleted")
 	}
 }
+
+// A worker whose machine fails the preflight (P10) stays out of service with
+// the check's own reason, keeps its pod (and so its machine), and serves
+// once a retry passes.
+func TestNodePreflightFailed(t *testing.T) {
+	c := bootstrapped(testCluster())
+	g := newNodeRig(t, c, node("prod-general-ccccc", v1.RoleWorker, "general", "z-a"), machine("m1"))
+	g.reconcile("prod-general-ccccc")
+	p := g.pod(testWorkerNS, "prod-general-ccccc")
+	p.Spec.NodeName = "m1"
+	if err := g.cl.Update(context.Background(), p); err != nil {
+		t.Fatal(err)
+	}
+	why := "preflight failed: br_netfilter: the br_netfilter kernel module is not loaded (fix: load it)"
+	p.Status.InitContainerStatuses = []corev1.ContainerStatus{{Name: PreflightContainer,
+		State: corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: "CrashLoopBackOff"}},
+		LastTerminationState: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 1,
+			Message: "CHECK  STATUS  DETAIL\nbr_netfilter  fail  not loaded\n" + why + "\n"}}}}
+	if err := g.cl.Status().Update(context.Background(), p); err != nil {
+		t.Fatal(err)
+	}
+	g.reconcile("prod-general-ccccc")
+	if n := g.node("prod-general-ccccc"); n.Status.State != v1.StateFailed || n.Status.Reason != why {
+		t.Fatalf("status = %s %q, want Failed %q", n.Status.State, n.Status.Reason, why)
+	}
+	if g.pod(testWorkerNS, "prod-general-ccccc") == nil {
+		t.Fatal("the pod holding the bad machine was deleted")
+	}
+	// The machine is fixed: the kubelet's retry passes and the agent runs.
+	p = g.pod(testWorkerNS, "prod-general-ccccc")
+	p.Status.InitContainerStatuses = []corev1.ContainerStatus{{Name: PreflightContainer,
+		State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 0}}}}
+	if err := g.cl.Status().Update(context.Background(), p); err != nil {
+		t.Fatal(err)
+	}
+	g.running(p, "m1", true)
+	g.api.nodes["prod-general-ccccc"] = aerolapi.Node{Alive: true, Version: "v0.7.2"}
+	g.reconcile("prod-general-ccccc")
+	if n := g.node("prod-general-ccccc"); n.Status.State != v1.StateServing {
+		t.Fatalf("after the fix: %s %q", n.Status.State, n.Status.Reason)
+	}
+}
+
+func TestPreflightFailedReason(t *testing.T) {
+	term := func(code int32, msg string) *corev1.ContainerStateTerminated {
+		return &corev1.ContainerStateTerminated{ExitCode: code, Message: msg}
+	}
+	long := strings.Repeat("x", 2000)
+	cases := []struct {
+		name string
+		cs   corev1.ContainerStatus
+		want string
+	}{
+		{name: "failed now", cs: corev1.ContainerStatus{Name: PreflightContainer, State: corev1.ContainerState{Terminated: term(1, "a\nlast line\n")}}, want: "last line"},
+		{name: "no message", cs: corev1.ContainerStatus{Name: PreflightContainer, State: corev1.ContainerState{Terminated: term(2, "")}}, want: "preflight failed (exit 2)"},
+		{name: "passed", cs: corev1.ContainerStatus{Name: PreflightContainer, State: corev1.ContainerState{Terminated: term(0, "")}}},
+		{name: "running again after a failure", cs: corev1.ContainerStatus{Name: PreflightContainer,
+			State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{}}, LastTerminationState: corev1.ContainerState{Terminated: term(1, "old")}}},
+		{name: "not started", cs: corev1.ContainerStatus{Name: PreflightContainer}},
+		{name: "another container", cs: corev1.ContainerStatus{Name: SetupContainer, State: corev1.ContainerState{Terminated: term(1, "x")}}},
+		{name: "kept short", cs: corev1.ContainerStatus{Name: PreflightContainer, State: corev1.ContainerState{Terminated: term(1, long)}}, want: long[:1024]},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			pod := &corev1.Pod{Status: corev1.PodStatus{InitContainerStatuses: []corev1.ContainerStatus{tc.cs}}}
+			if got := preflightFailed(pod); got != tc.want {
+				t.Fatalf("got %q, want %q", got, tc.want)
+			}
+		})
+	}
+}

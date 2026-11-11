@@ -3,6 +3,7 @@ package controller
 import (
 	"fmt"
 	"math"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -37,6 +38,8 @@ const (
 	RuntimeContainer = "runtime"
 	// SetupContainer is the init container the operator adds.
 	SetupContainer = "setup"
+	// PreflightContainer is the worker template's machine check (P10).
+	PreflightContainer = "preflight"
 	// EtcVolume holds /etc/sandboxd: sandboxd.env and the cluster files
 	// init or join writes.
 	EtcVolume = "etc"
@@ -44,6 +47,12 @@ const (
 	StateVolume = "state"
 	// JoinVolume holds the pod's join token Secret.
 	JoinVolume = "join"
+	// CreatePolicyVolume holds the operator's create policy, when the
+	// AerolCluster names one.
+	CreatePolicyVolume = "create-policy"
+	// CreatePolicyKey is the ConfigMap key that holds the policy file.
+	CreatePolicyKey = "policy.yaml"
+	createPolicyDir = "/etc/aerolvm/create-policy"
 )
 
 // Labels the operator puts on every pod and object it makes.
@@ -235,6 +244,10 @@ func Stamp(t corev1.PodTemplateSpec, in StampInput) (*corev1.Pod, error) {
 	}
 
 	setEnv(&pod.Spec, AgentContainer, nodeEnv(in))
+	addCreatePolicy(&pod.Spec, in.Cluster)
+	if n.Spec.Role == v1.RoleWorker && in.Pool != nil {
+		setPoolRuntimes(&pod.Spec, in.Pool.Runtimes)
+	}
 	if in.Maintenance {
 		holdServer(&pod.Spec)
 		pod.Labels[v1.AnnotationMaintenance] = "true"
@@ -260,7 +273,21 @@ func nodeEnv(in StampInput) []corev1.EnvVar {
 	if n.Spec.Role == v1.RoleWorker && in.Pool != nil && len(in.Pool.Runtimes) > 0 {
 		env = append(env, corev1.EnvVar{Name: "SB_NODE_LABELS", Value: "aerolvm.io/pool=" + in.Pool.Name})
 	}
+	if n.Spec.Role == v1.RoleServer {
+		// cluster.env keeps the server's DNS name, which Raft advertises
+		// (C4). Gossip needs an IP: the kubelet's, at every start, so a
+		// new pod never waits on its own DNS record and a moved one
+		// advertises where it is now. The pod's own setting beats
+		// cluster.env.
+		env = append(env, podIPEnv(), corev1.EnvVar{Name: "SB_GOSSIP_ADVERTISE_ADDR", Value: fmt.Sprintf("$(POD_IP):%d", GossipPort)})
+	}
 	return env
+}
+
+func podIPEnv() corev1.EnvVar {
+	return corev1.EnvVar{Name: "POD_IP", ValueFrom: &corev1.EnvVarSource{
+		FieldRef: &corev1.ObjectFieldSelector{FieldPath: "status.podIP"},
+	}}
 }
 
 // advertise is the address the node gives the cluster: a server's stable
@@ -294,8 +321,11 @@ func addSetup(spec *corev1.PodSpec, in StampInput) {
 		cmd = fmt.Sprintf(`exec sandboxd init --files-only --role %s --node-id %s --advertise "%s"`, role, n.Name, advertise(in))
 	} else {
 		cmd = fmt.Sprintf(`exec sandboxd join "$(cat /var/run/aerolvm-join/join_url)" --token "$(cat /var/run/aerolvm-join/token)" --ca-cert-hash "$(cat /var/run/aerolvm-join/ca_cert_hash)" --role %s --node-id %s --advertise "%s" --files-only`, role, n.Name, advertise(in))
+		// By key, so the pod gets exactly the three things a join needs,
+		// and aerolvm k8s verify can see that (it cannot read Secrets).
 		spec.Volumes = append(spec.Volumes, corev1.Volume{Name: JoinVolume, VolumeSource: corev1.VolumeSource{
-			Secret: &corev1.SecretVolumeSource{SecretName: JoinSecret(n.Name), DefaultMode: ptr[int32](0o400)},
+			Secret: &corev1.SecretVolumeSource{SecretName: JoinSecret(n.Name), DefaultMode: ptr[int32](0o400),
+				Items: []corev1.KeyToPath{{Key: "join_url", Path: "join_url"}, {Key: "token", Path: "token"}, {Key: "ca_cert_hash", Path: "ca_cert_hash"}}},
 		}})
 	}
 	setup := corev1.Container{
@@ -303,18 +333,62 @@ func addSetup(spec *corev1.PodSpec, in StampInput) {
 		Image:           agent.Image,
 		ImagePullPolicy: agent.ImagePullPolicy,
 		Command:         []string{"/bin/sh", "-c", setupScript + cmd},
-		Env: append([]corev1.EnvVar{{Name: "POD_IP", ValueFrom: &corev1.EnvVarSource{
-			FieldRef: &corev1.ObjectFieldSelector{FieldPath: "status.podIP"},
-		}}}, agent.Env...),
+		Env:             setupEnv(agent.Env),
 		EnvFrom:         agent.EnvFrom,
-		VolumeMounts:    agent.VolumeMounts,
-		SecurityContext: agent.SecurityContext,
+		VolumeMounts:    setupMounts(agent.VolumeMounts),
+		SecurityContext: setupSecurity(agent.SecurityContext),
 	}
 	if !in.Bootstrap {
 		setup.VolumeMounts = append(append([]corev1.VolumeMount{}, setup.VolumeMounts...),
 			corev1.VolumeMount{Name: JoinVolume, MountPath: "/var/run/aerolvm-join", ReadOnly: true})
 	}
-	spec.InitContainers = append([]corev1.Container{setup}, spec.InitContainers...)
+	// After the template's own: a worker's preflight checks its machine
+	// before setup spends the single-use join token on it.
+	spec.InitContainers = append(spec.InitContainers, setup)
+}
+
+// setupMounts are the agent's folders setup writes: the node's settings and
+// cluster files (etc), its state (a server's Raft folder, which init checks)
+// and scratch space where the agent has its own. Never the sandbox
+// machinery a worker's agent mounts (containerd's folders, the two-way
+// netns mount, which only a privileged container may have).
+func setupMounts(agent []corev1.VolumeMount) []corev1.VolumeMount {
+	var out []corev1.VolumeMount
+	for _, m := range agent {
+		switch m.Name {
+		case EtcVolume, StateVolume, "tmp":
+			out = append(out, m)
+		}
+	}
+	return out
+}
+
+// setupSecurity is the agent's user with no rights at all: setup only
+// writes files and calls the join port. A worker's agent is privileged;
+// its setup must not be (aerolvm k8s verify allows privilege only in
+// runtime and agent).
+func setupSecurity(agent *corev1.SecurityContext) *corev1.SecurityContext {
+	sc := &corev1.SecurityContext{}
+	if agent != nil {
+		sc = agent.DeepCopy()
+	}
+	sc.Privileged = ptr(false)
+	sc.AllowPrivilegeEscalation = ptr(false)
+	sc.ReadOnlyRootFilesystem = ptr(true)
+	sc.Capabilities = &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}}
+	return sc
+}
+
+// setupEnv is the agent's settings with POD_IP first, which the setup
+// command and $(POD_IP) references need, once.
+func setupEnv(agent []corev1.EnvVar) []corev1.EnvVar {
+	env := []corev1.EnvVar{podIPEnv()}
+	for _, e := range agent {
+		if e.Name != "POD_IP" {
+			env = append(env, e)
+		}
+	}
+	return env
 }
 
 // holdServer swaps sandboxd for a process that holds the pod (C22), so a
@@ -422,6 +496,61 @@ func setResources(spec *corev1.PodSpec, name string, r corev1.ResourceRequiremen
 	if i := containerIndex(spec.Containers, name); i >= 0 {
 		spec.Containers[i].Resources = r
 	}
+}
+
+// addCreatePolicy gives the agent the AerolCluster's create policy
+// (SB_CREATE_POLICY_FILE). Every role gets it: the node a create reaches
+// checks it before placing, and the worker that runs it checks again. The
+// volume is optional on purpose: sandboxd refuses every create while a
+// named policy file is missing (fail closed) and loads it once the
+// ConfigMap appears, so a pod never waits on it and never runs without it.
+func addCreatePolicy(spec *corev1.PodSpec, c *v1.AerolCluster) {
+	if c.Spec.Security.CreatePolicy == nil || c.Spec.Security.CreatePolicy.Name == "" {
+		return
+	}
+	spec.Volumes = append(spec.Volumes, corev1.Volume{Name: CreatePolicyVolume, VolumeSource: corev1.VolumeSource{
+		ConfigMap: &corev1.ConfigMapVolumeSource{
+			LocalObjectReference: *c.Spec.Security.CreatePolicy,
+			Items:                []corev1.KeyToPath{{Key: CreatePolicyKey, Path: CreatePolicyKey}},
+			Optional:             ptr(true),
+		},
+	}})
+	i := containerIndex(spec.Containers, AgentContainer)
+	spec.Containers[i].VolumeMounts = append(spec.Containers[i].VolumeMounts,
+		corev1.VolumeMount{Name: CreatePolicyVolume, MountPath: createPolicyDir, ReadOnly: true})
+	setEnv(spec, AgentContainer, []corev1.EnvVar{{Name: "SB_CREATE_POLICY_FILE", Value: createPolicyDir + "/" + CreatePolicyKey}})
+}
+
+// setPoolRuntimes makes a worker run only its pool's runtimes. The worker
+// advertises them (SB_HOST_RUNTIMES), so placement never sends it a create
+// that names another; and a create that names none gets the worker's
+// default, so a default outside the list becomes the pool's first runtime.
+// A gVisor-only pool then never runs a sandbox on runc. "runc" is the
+// pool's word for sandboxd's "docker" runtime.
+func setPoolRuntimes(spec *corev1.PodSpec, runtimes []string) {
+	var list []string
+	for _, r := range runtimes {
+		if r == "runc" {
+			r = "docker"
+		}
+		if r != "" && !slices.Contains(list, r) {
+			list = append(list, r)
+		}
+	}
+	if len(list) == 0 {
+		return
+	}
+	env := []corev1.EnvVar{{Name: "SB_HOST_RUNTIMES", Value: strings.Join(list, ",")}}
+	def := "docker"
+	for _, e := range spec.Containers[containerIndex(spec.Containers, AgentContainer)].Env {
+		if e.Name == "SB_CONTAINER_RUNTIME" && e.Value != "" {
+			def = e.Value
+		}
+	}
+	if !slices.Contains(list, def) {
+		env = append(env, corev1.EnvVar{Name: "SB_CONTAINER_RUNTIME", Value: list[0]})
+	}
+	setEnv(spec, AgentContainer, env)
 }
 
 // setEnv sets each of env on container name, replacing a value the

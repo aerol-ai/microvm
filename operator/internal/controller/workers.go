@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -52,7 +53,17 @@ func (r *ClusterReconciler) ensureWorkers(ctx context.Context, c *v1.AerolCluste
 		}
 		total := 0
 		for _, n := range nodes {
-			if n.Spec.Role != v1.RoleWorker || n.Spec.Pool != pool.Name || ended(n) {
+			if n.Spec.Role != v1.RoleWorker || n.Spec.Pool != pool.Name {
+				continue
+			}
+			if n.Status.State == v1.StateFailed && n.DeletionTimestamp == nil {
+				// A worker held by a failed preflight is no capacity, but
+				// its machine is still there: it counts toward the
+				// maximum, so a bad node image cannot buy machines
+				// without end.
+				total++
+			}
+			if ended(n) {
 				continue
 			}
 			zw := zones[n.Spec.Zone]
@@ -94,15 +105,71 @@ func (r *ClusterReconciler) ensureWorkers(ctx context.Context, c *v1.AerolCluste
 			if err := r.markDecommission(ctx, c, want.remove, "scale-down: its zone has twice the room the pool keeps free"); err != nil {
 				return err
 			}
+			continue
+		}
+		if want.calm && pool.MaxMachineAge != nil && pool.MaxMachineAge.Duration > 0 {
+			cutoff := r.Now().Add(-pool.MaxMachineAge.Duration)
+			for _, name := range oldMachines(c.Spec.Zones, zones, want.add, r.machineBirths(ctx, zones), cutoff) {
+				why := fmt.Sprintf("its machine is older than maxMachineAge (%s)", pool.MaxMachineAge.Duration)
+				if err := r.markDecommission(ctx, c, name, why); err != nil {
+					return err
+				}
+			}
 		}
 	}
 	return nil
+}
+
+// machineBirths maps each serving worker to when its machine joined
+// Kubernetes. A machine that cannot be read is left out, so it is never
+// retired by mistake.
+func (r *ClusterReconciler) machineBirths(ctx context.Context, zones map[string]*zoneWorkers) map[string]time.Time {
+	born := map[string]time.Time{}
+	for _, zw := range zones {
+		for _, n := range zw.live {
+			if n.Status.State != v1.StateServing || n.Status.NodeName == "" {
+				continue
+			}
+			var node corev1.Node
+			if err := r.Get(ctx, client.ObjectKey{Name: n.Status.NodeName}, &node); err != nil {
+				continue
+			}
+			born[n.Name] = node.CreationTimestamp.Time
+		}
+	}
+	return born
+}
+
+// oldMachines picks, per zone, the serving worker on the oldest machine
+// born before cutoff. A zone with a worker already leaving, still
+// starting or being added this pass waits its turn: one retirement per
+// zone at a time keeps the zone's room, and the floor adds the
+// replacement on the next pass.
+func oldMachines(zoneOrder []string, zones map[string]*zoneWorkers, adding map[string]int, born map[string]time.Time, cutoff time.Time) []string {
+	var out []string
+	for _, z := range zoneOrder {
+		zw := zones[z]
+		if zw == nil || zw.leaving > 0 || zw.pending > 0 || adding[z] > 0 {
+			continue
+		}
+		pick, oldest := "", cutoff
+		for _, n := range zw.live {
+			if t, ok := born[n.Name]; ok && n.Status.State == v1.StateServing && t.Before(oldest) {
+				pick, oldest = n.Name, t
+			}
+		}
+		if pick != "" {
+			out = append(out, pick)
+		}
+	}
+	return out
 }
 
 // workerPlan is what one pass changes in a pool.
 type workerPlan struct {
 	add    map[string]int
 	remove string // a worker to decommission
+	calm   bool   // members known and no zone short: old machines may retire
 }
 
 // wantedWorkers decides one pass for a pool: the floor in every zone; one
@@ -131,7 +198,8 @@ func wantedWorkers(zoneOrder []string, pool *v1.WorkerPoolSpec, zones map[string
 			}
 		}
 	}
-	if short || !haveMembers || need <= 0 {
+	plan.calm = haveMembers && !short
+	if !plan.calm || need <= 0 {
 		return plan
 	}
 	// Scale down: the zone with the most spare room, if it holds twice

@@ -138,9 +138,14 @@ spec:
           volumeMounts:
             - { name: webhook-cert, mountPath: /etc/aerolvm-operator/webhook, readOnly: true }
       volumes:
+        # By key: the webhook needs its certificate and key, never the CA's
+        # copy or anything else a Secret might gain.
         - name: webhook-cert
           secret:
             secretName: {{ $op }}-webhook
+            items:
+              - { key: tls.crt, path: tls.crt }
+              - { key: tls.key, path: tls.key }
 ---
 apiVersion: v1
 kind: Service
