@@ -374,6 +374,13 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 	svc.RecordKeyCustody()
 	service.PublishKeyCustody(cfg, keys.custodyFacts())
 	svc.SetDockerAuxClient(dockerClient)
+	if cfg.ContainerEngine == models.ContainerEngineContainerd {
+		subnet, err := resolveContainerdBridgeSubnet(cfg, logger)
+		if err != nil {
+			return err
+		}
+		cfg.ContainerdBridgeSubnet = subnet
+	}
 	var ctdWiring *containerdEngineWiring
 	if ctd, err := wireContainerEngine(ctx, cfg, logger, svc, db, dockerClient, rules, admitter); err != nil {
 		return fmt.Errorf("wire container engine: %w", err)

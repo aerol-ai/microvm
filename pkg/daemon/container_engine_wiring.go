@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/config"
-	"github.com/aerol-ai/microvm/internal/network/cni"
 	cntr "github.com/aerol-ai/microvm/internal/runtime/containerd"
 	"github.com/aerol-ai/microvm/internal/service"
 	"github.com/aerol-ai/microvm/internal/store"
@@ -53,7 +52,7 @@ func wireContainerEngine(ctx context.Context, cfg config.Config, logger *slog.Lo
 	// dockerd sets FORWARD policy to DROP and only ACCEPTs docker0; our aerolvm0
 	// bridge needs its own FORWARD ACCEPTs or all sandbox egress + peer traffic
 	// is dropped. EnsureChain installs them (below per-IP DROPs) for this subnet.
-	ctdRules.SetBridgeSubnet(cni.DefaultBridgeSubnet)
+	ctdRules.SetBridgeSubnet(containerdBridgeSubnet(cfg))
 	if err := ctdRules.EnsureChain(); err != nil {
 		return nil, fmt.Errorf("bootstrap AEROLVM-USER chain: %w", err)
 	}

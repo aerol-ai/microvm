@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/netip"
 	"net/url"
 	"os"
 	"path"
@@ -245,6 +246,12 @@ type Config struct {
 	ContainerdCNIPluginDir string
 	// ContainerdCNIConfPath is the bridge conflist used for ADD/DEL.
 	ContainerdCNIConfPath string
+	// ContainerdBridgeSubnet is the IPv4 range containerd sandboxes get
+	// their addresses from (C3: a bank network may already use 10.88.0.0/16).
+	// SB_CONTAINERD_BRIDGE_SUBNET. Empty here means "not set"; the daemon
+	// resolves it at boot against the conflist (resolveContainerdBridgeSubnet)
+	// and every user reads the resolved value.
+	ContainerdBridgeSubnet string
 	// ContainerdBuildKitAddr is the buildkitd control socket used for image
 	// builds on the containerd engine (buildctl --addr). The bootstrap installs
 	// buildkitd at the default socket with a containerd worker on the aerolvm
@@ -2195,6 +2202,7 @@ func load(keyTool bool) (Config, error) {
 		ContainerdNetnsPoolSize:           getEnvInt("SB_CONTAINERD_NETNS_POOL_SIZE", 256),
 		ContainerdCNIPluginDir:            getEnv("SB_CONTAINERD_CNI_PLUGIN_DIR", "/opt/cni/bin"),
 		ContainerdCNIConfPath:             getEnv("SB_CONTAINERD_CNI_CONF_PATH", "/etc/cni/net.d/aerolvm.conflist"),
+		ContainerdBridgeSubnet:            strings.TrimSpace(os.Getenv("SB_CONTAINERD_BRIDGE_SUBNET")),
 		ContainerdBuildKitAddr:            getEnv("SB_CONTAINERD_BUILDKIT_ADDR", "unix:///run/buildkit/buildkitd.sock"),
 		ContainerdNetnsPoolRefillInterval: getEnvDuration("SB_CONTAINERD_NETNS_POOL_REFILL_INTERVAL", 2*time.Second),
 		ContainerdPoolEnabled:             getEnvBool("SB_CONTAINERD_POOL_ENABLED", false),
@@ -2769,6 +2777,9 @@ func load(keyTool bool) (Config, error) {
 	}
 	cfg.ContainerEngine = resolvedEngine
 	if cfg.ContainerdDiskQuota, err = loadContainerdDiskQuota(cfg.ContainerEngine); err != nil {
+		return Config{}, err
+	}
+	if err := validateBridgeSubnet(cfg.ContainerdBridgeSubnet); err != nil {
 		return Config{}, err
 	}
 	if cfg.ContainerEngine == models.ContainerEngineContainerd {
@@ -3819,6 +3830,27 @@ func loadDiskFloorRatio() (float64, error) {
 		return 0, fmt.Errorf("SB_DISK_FLOOR_RATIO must be 0 (off) or a fraction below 1 such as 0.10, got %q", raw)
 	}
 	return ratio, nil
+}
+
+// validateBridgeSubnet checks SB_CONTAINERD_BRIDGE_SUBNET when set: an IPv4
+// network address (10.200.0.0/16, not 10.200.3.4/16, so the operator and
+// the firewall mean the same range) between /8 and /24. A /24 still holds
+// 253 sandboxes; anything smaller is a typo more often than a plan.
+func validateBridgeSubnet(raw string) error {
+	if raw == "" {
+		return nil
+	}
+	p, err := netip.ParsePrefix(raw)
+	if err != nil || !p.Addr().Is4() {
+		return fmt.Errorf("SB_CONTAINERD_BRIDGE_SUBNET must be an IPv4 range such as 10.200.0.0/16, got %q", raw)
+	}
+	if p != p.Masked() {
+		return fmt.Errorf("SB_CONTAINERD_BRIDGE_SUBNET %q is not a network address; did you mean %s?", raw, p.Masked())
+	}
+	if p.Bits() < 8 || p.Bits() > 24 {
+		return fmt.Errorf("SB_CONTAINERD_BRIDGE_SUBNET %q must be between /8 and /24", raw)
+	}
+	return nil
 }
 
 func getEnvFloat(key string, fallback float64) float64 {
