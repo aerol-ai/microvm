@@ -24,10 +24,19 @@ type Settings struct {
 	// NetnsDir holds the network namespaces the agent mounts for sandboxes;
 	// they are unmounted when the supervisor stops (UnmountNamespaces).
 	NetnsDir string
+	// LeaseFile is sandboxd's ownership lease (SB_OWNERSHIP_LEASE_FILE,
+	// cluster mode); empty turns the LeaseGuard off.
+	LeaseFile string
 }
 
+// leaseCheckInterval paces the LeaseGuard: well under sandboxd's own
+// expiry check (lease/15, 1 s by default), so the freeze here is never the
+// late one.
+const leaseCheckInterval = 500 * time.Millisecond
+
 // SettingsFromEnv reads SB_CONTAINERD_BINARY, SB_CONTAINERD_CONFIG,
-// SB_CGROUP_PARENT_FILE and SB_NETNS_DIR, with the runtime image's defaults.
+// SB_CGROUP_PARENT_FILE, SB_NETNS_DIR and SB_OWNERSHIP_LEASE_FILE, with the
+// runtime image's defaults.
 func SettingsFromEnv() Settings {
 	get := func(k, def string) string {
 		if v := strings.TrimSpace(os.Getenv(k)); v != "" {
@@ -40,6 +49,7 @@ func SettingsFromEnv() Settings {
 		ContainerdConfig: get("SB_CONTAINERD_CONFIG", "/etc/containerd/config.toml"),
 		ParentFile:       get("SB_CGROUP_PARENT_FILE", "/run/aerolvm/cgroup-parent"),
 		NetnsDir:         get("SB_NETNS_DIR", "/run/netns"),
+		LeaseFile:        get("SB_OWNERSHIP_LEASE_FILE", ""),
 	}
 }
 
@@ -53,6 +63,7 @@ type OS struct {
 	StartInGroup func(dir string, argv []string) (int, error)
 	Terminate    func(pid int)
 	Unmount      func(path string) error
+	SetFrozen    func(dir string, frozen bool) error
 	Reap         func(watched *atomic.Int64, exited chan<- int, log *slog.Logger)
 	// DefaultConfig prints containerd's default configuration.
 	DefaultConfig func(binary string) ([]byte, error)
@@ -74,6 +85,7 @@ func RealOS() OS {
 		StartInGroup: StartInGroup,
 		Terminate:    Terminate,
 		Unmount:      Unmount,
+		SetFrozen:    SetCgroupFrozen,
 		Reap:         Reap,
 		DefaultConfig: func(binary string) ([]byte, error) {
 			return exec.Command(binary, "config", "default").Output()
@@ -119,6 +131,17 @@ func Run(ctx context.Context, s Settings, sys OS, log *slog.Logger) error {
 	if err := ensureConfig(s, sys); err != nil {
 		return err
 	}
+	guardDone := make(chan struct{})
+	if s.LeaseFile != "" {
+		g := &LeaseGuard{File: s.LeaseFile, SandboxesDir: l.dir(sandboxesGroup), SetFrozen: sys.SetFrozen, Now: time.Now, Log: log}
+		go func() {
+			defer close(guardDone)
+			g.Run(ctx, leaseCheckInterval)
+		}()
+		log.Info("supervisor: enforcing sandboxd's ownership lease", "file", s.LeaseFile)
+	} else {
+		close(guardDone)
+	}
 
 	var watched atomic.Int64
 	exited := make(chan int, 1)
@@ -139,6 +162,7 @@ func Run(ctx context.Context, s Settings, sys OS, log *slog.Logger) error {
 		HealthyAfter: time.Minute,
 	}
 	k.Run(ctx)
+	<-guardDone
 	UnmountNamespaces(s.NetnsDir, sys.Unmount, log)
 	return nil
 }

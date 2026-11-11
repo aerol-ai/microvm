@@ -12,6 +12,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/aerol-ai/microvm/internal/ownerlease"
 )
 
 func quiet() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }
@@ -222,9 +224,14 @@ func TestSettingsFromEnv(t *testing.T) {
 	t.Setenv("SB_CONTAINERD_BINARY", "")
 	t.Setenv("SB_CONTAINERD_CONFIG", " /etc/c.toml ")
 	t.Setenv("SB_CGROUP_PARENT_FILE", "")
+	t.Setenv("SB_OWNERSHIP_LEASE_FILE", "")
 	s := SettingsFromEnv()
-	if s.ContainerdBinary != "containerd" || s.ContainerdConfig != "/etc/c.toml" || s.ParentFile != "/run/aerolvm/cgroup-parent" || s.NetnsDir != "/run/netns" {
+	if s.ContainerdBinary != "containerd" || s.ContainerdConfig != "/etc/c.toml" || s.ParentFile != "/run/aerolvm/cgroup-parent" || s.NetnsDir != "/run/netns" || s.LeaseFile != "" {
 		t.Fatalf("%+v", s)
+	}
+	t.Setenv("SB_OWNERSHIP_LEASE_FILE", "/run/aerolvm/ownership-lease")
+	if s := SettingsFromEnv(); s.LeaseFile != "/run/aerolvm/ownership-lease" {
+		t.Fatalf("lease file %q", s.LeaseFile)
 	}
 }
 
@@ -327,7 +334,17 @@ func TestRun(t *testing.T) {
 	for _, n := range []string{"aerol-netns-0", "aerol-netns-1"} {
 		_ = os.WriteFile(filepath.Join(netns, n), nil, 0o644)
 	}
-	s := Settings{ContainerdBinary: "/opt/containerd", ContainerdConfig: filepath.Join(dir, "etc", "config.toml"), ParentFile: filepath.Join(dir, "run", "cgroup-parent"), NetnsDir: netns}
+	s := Settings{ContainerdBinary: "/opt/containerd", ContainerdConfig: filepath.Join(dir, "etc", "config.toml"), ParentFile: filepath.Join(dir, "run", "cgroup-parent"), NetnsDir: netns,
+		LeaseFile: filepath.Join(dir, "ownership-lease")}
+	// A lease that already ran out, fencing one sandbox: the guard Run
+	// starts freezes it (T3).
+	if err := os.MkdirAll(filepath.Join(l.Root, "kubepods/pod1/ctr/sandboxes/sb-1"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := ownerlease.Write(s.LeaseFile, ownerlease.Lease{ConfirmedUnixMs: 1, WrittenUnixMs: 15_001, LeaseMs: 15_000, Fence: []string{"sb-1"}}); err != nil {
+		t.Fatal(err)
+	}
+	froze := make(chan string, 1)
 	var unmounted []string
 	ctx, cancel := context.WithCancel(context.Background())
 	var remounted bool
@@ -363,10 +380,24 @@ func TestRun(t *testing.T) {
 			return nil
 		},
 		Reap: func(*atomic.Int64, chan<- int, *slog.Logger) {},
+		SetFrozen: func(d string, frozen bool) error {
+			if frozen {
+				froze <- d
+			}
+			return nil
+		},
 	}
 	var logs bytes.Buffer
 	if err := Run(ctx, s, sys, slog.New(slog.NewTextHandler(&logs, nil))); err != nil {
 		t.Fatal(err)
+	}
+	select {
+	case d := <-froze:
+		if d != filepath.Join(l.Root, "kubepods/pod1/ctr/sandboxes/sb-1") {
+			t.Fatalf("froze %s", d)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the lease guard never froze the fenced sandbox")
 	}
 	if !remounted {
 		t.Fatal("a read-only cgroup mount was not made writable")

@@ -83,6 +83,14 @@ Mitigation:
   followers (a rolling upgrade) do not fire the alert. The alert names the
   follower; check that node's health, disk and Raft log errors, and the
   leader's journal (`raft replication pipeline send stalled`, `peer=`).
+- `SandboxdOwnershipLeaseFileWriteFailing` (Kubernetes worker pods): the
+  agent container cannot write `SB_OWNERSHIP_LEASE_FILE`, so the runtime
+  container's supervisor freezes the pod's recreate-policy sandboxes when the
+  last lease written runs out, even though sandboxd still reaches the leader.
+  The agent log says why (`ownership lease file: write failed`). Check that
+  the shared folder (`/run/aerolvm`) is mounted in both containers and not
+  full. The supervisor thaws each sandbox at the first write that follows a
+  successful leader read and proves it still owned.
 
 ## Scheduler and Capacity Checks
 
