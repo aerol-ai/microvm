@@ -299,18 +299,12 @@ func newTestClusterFromConfig(t *testing.T, cfg config.Config) (*Cluster, func()
 	}
 }
 
-// pickFreeTCPPort grabs an unused port. There's an inherent race between
-// returning the port and the caller binding it, but for an in-process test
-// with high random ports the collision risk is negligible.
+// pickFreeTCPPort returns an unused loopback port for the caller to bind
+// later. It comes from below the ephemeral range (reserveTestPort), so no
+// ":0" listener or outgoing connection takes it in between.
 func pickFreeTCPPort(t *testing.T) int {
 	t.Helper()
-	l, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("pickFreeTCPPort: %v", err)
-	}
-	port := l.Addr().(*net.TCPAddr).Port
-	_ = l.Close()
-	return port
+	return reserveTestPort(t, false)
 }
 
 // waitForLeader blocks until the cluster reports a leader and its placement
