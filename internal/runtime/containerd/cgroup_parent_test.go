@@ -22,9 +22,10 @@ func TestCgroupSpecOpts(t *testing.T) {
 	for _, tc := range []struct {
 		name, parent, want string
 		wantOpts           int
+		wantAdj            *int
 	}{
-		{"no parent leaves containerd's default", "", "", 0},
-		{"parent puts the sandbox under it", testPodCgroup, testPodCgroup + "/sb-1", 1},
+		{"no parent leaves containerd's default", "", "", 0, nil},
+		{"parent puts the sandbox under it, first in line for the OOM killer", testPodCgroup, testPodCgroup + "/sb-1", 2, intPtr(sandboxOOMScoreAdj)},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			d := &Driver{cfg: Config{CgroupParent: tc.parent}}
@@ -41,7 +42,26 @@ func TestCgroupSpecOpts(t *testing.T) {
 			if spec.Linux.CgroupsPath != tc.want {
 				t.Fatalf("CgroupsPath = %q, want %q", spec.Linux.CgroupsPath, tc.want)
 			}
+			switch {
+			case tc.wantAdj == nil && spec.Process != nil && spec.Process.OOMScoreAdj != nil:
+				t.Fatalf("OOMScoreAdj = %d, want unset", *spec.Process.OOMScoreAdj)
+			case tc.wantAdj != nil && (spec.Process == nil || spec.Process.OOMScoreAdj == nil || *spec.Process.OOMScoreAdj != *tc.wantAdj):
+				t.Fatalf("OOMScoreAdj = %v, want %d", spec.Process, *tc.wantAdj)
+			}
 		})
+	}
+}
+
+func intPtr(v int) *int { return &v }
+
+// The score lands on an existing process section without touching the rest.
+func TestWithOOMScoreAdjKeepsProcess(t *testing.T) {
+	spec := &specs.Spec{Process: &specs.Process{Args: []string{"toolboxd"}}}
+	if err := withOOMScoreAdj(500)(context.Background(), nil, &containers.Container{}, spec); err != nil {
+		t.Fatal(err)
+	}
+	if spec.Process.OOMScoreAdj == nil || *spec.Process.OOMScoreAdj != 500 || len(spec.Process.Args) != 1 {
+		t.Fatalf("process = %+v", spec.Process)
 	}
 }
 

@@ -70,5 +70,20 @@ c7_setup() {
   done
   echo "+cpu +memory +pids" > "$cg/cgroup.subtree_control"
   echo "+cpu +memory +pids" > "$cg/sandboxes/cgroup.subtree_control"
+  # Finding F10 (S3): with the kubelet's default, one pod-level OOM kills
+  # every process in this container, as a group: all sandboxes and the
+  # machinery. Turn group-killing off here, on sandboxes/, and on the pod's
+  # own group when it is visible, so the kernel kills only the process it
+  # picks; sandboxd gives each sandbox a high OOM score, so it picks one.
+  echo 0 > "$cg/memory.oom.group" 2>/dev/null || true
+  echo 0 > "$cg/sandboxes/memory.oom.group" 2>/dev/null || true
+  [[ -n "$self" ]] && echo 0 > "/sys/fs/cgroup$(dirname "$self")/memory.oom.group" 2>/dev/null || true
   echo "${self}/sandboxes"
+}
+
+# protect_from_oom lowers the caller's OOM score; what it starts inherits it.
+# The machinery (containerd, sandboxd) must never be the kernel's choice when
+# the pod hits its limit (finding F10).
+protect_from_oom() {
+  echo -999 > "/proc/$1/oom_score_adj" 2>/dev/null || echo "worker: could not lower the OOM score" >&2
 }

@@ -1,13 +1,16 @@
 package containerd
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path"
 	"path/filepath"
 	"strings"
 
+	"github.com/containerd/containerd/v2/core/containers"
 	"github.com/containerd/containerd/v2/pkg/oci"
+	specs "github.com/opencontainers/runtime-spec/specs-go"
 )
 
 // CgroupRoot is where the cgroup v2 tree is mounted. A var so tests can point
@@ -18,6 +21,15 @@ var CgroupRoot = "/sys/fs/cgroup"
 // (resourceSpecOpts sets CPU, memory and pids). The parent must hand all three
 // down to its children, or a sandbox under it would run with no limits.
 var cgroupParentControllers = []string{"cpu", "memory", "pids"}
+
+// sandboxOOMScoreAdj is each sandbox's OOM score when a cgroup parent is set.
+// Inside a worker pod, sandboxes and the machinery (containerd, sandboxd)
+// share one memory limit. When the pod hits it, the kernel kills the process
+// with the highest score in the pod; the machinery runs at -999 (the worker's
+// supervisor sets that), so a sandbox is always chosen first. Phase 0 spike S3
+// found the opposite with the defaults: one pod-level OOM killed every
+// sandbox and sandboxd with them (finding F10).
+const sandboxOOMScoreAdj = 500
 
 // cgroupSpecOpts places a container's cgroup under the configured parent, as
 // <parent>/<id>. With no parent it adds nothing, and containerd's default
@@ -33,7 +45,23 @@ func (d *Driver) cgroupSpecOpts(id string) []oci.SpecOpts {
 	if d.cfg.CgroupParent == "" {
 		return nil
 	}
-	return []oci.SpecOpts{oci.WithCgroup(path.Join(d.cfg.CgroupParent, id))}
+	return []oci.SpecOpts{
+		oci.WithCgroup(path.Join(d.cfg.CgroupParent, id)),
+		withOOMScoreAdj(sandboxOOMScoreAdj),
+	}
+}
+
+// withOOMScoreAdj sets the OOM score the runtime gives the sandbox's
+// processes (runc and runsc both apply process.oomScoreAdj).
+func withOOMScoreAdj(adj int) oci.SpecOpts {
+	return func(_ context.Context, _ oci.Client, _ *containers.Container, s *specs.Spec) error {
+		if s.Process == nil {
+			s.Process = &specs.Process{}
+		}
+		v := adj
+		s.Process.OOMScoreAdj = &v
+		return nil
+	}
 }
 
 // CheckCgroupParent verifies at boot that parent can hold sandboxes with

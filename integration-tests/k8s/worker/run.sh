@@ -22,6 +22,7 @@ fi
 # containerd's root is an emptyDir on the machine's disk (see the pod spec):
 # its overlayfs snapshots cannot sit on the container's own overlay root.
 mkdir -p /run/containerd /etc/containerd
+protect_from_oom $$
 containerd config default > /etc/containerd/config.toml
 containerd --config /etc/containerd/config.toml 2>&1 | sed -u 's/^/[containerd] /' &
 for _ in $(seq 1 60); do

@@ -19,6 +19,7 @@ echo "$parent" > /run/aerolvm/cgroup-parent.tmp
 mv /run/aerolvm/cgroup-parent.tmp /run/aerolvm/cgroup-parent
 echo "runtime: sandboxes go under $parent"
 
+protect_from_oom $$
 containerd config default > /etc/containerd/config.toml
 while true; do
   containerd --config /etc/containerd/config.toml 2>&1 | sed -u 's/^/[containerd] /' || true
