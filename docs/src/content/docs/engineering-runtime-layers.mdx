@@ -84,6 +84,8 @@ A few terms in that table:
 
 The API still says `runtime: "docker"` for OCI sandboxes. On servers, AerolVM runs them with its own **containerd** driver (`SB_CONTAINER_ENGINE=containerd`), which talks to containerd without going through Docker. gVisor plugs in beside that path as another OCI runtime.
 
+A server with no Docker installed at all, such as a Kubernetes worker pod, also sets `SB_DOCKER_ENABLED=false`. Then AerolVM never asks Docker for anything, and `GET /health` shows Docker as `disabled` instead of reporting the server as degraded. This setting needs `SB_CONTAINER_ENGINE=containerd`.
+
 WASM and isolate sit off the OCI diagram entirely. They isolate at the language-VM layer, not the container layer. They give up full syscall compatibility in exchange for packing more sandboxes per server and faster creates (see [WASM architecture](/wasm-architecture/) and [V8 isolate](/isolate-sandbox/)).
 
 Here is where each `runtime` value goes once a create call reaches the service layer.
