@@ -70,6 +70,18 @@ if [[ -d "$(dirname "$runsc_src")/gvisor-bin" ]]; then
   find "$(dirname "$runsc_src")/gvisor-bin" -maxdepth 1 -type f -exec install -m 0755 {} "$BIN/gvisor-bin/" \;
 fi
 
+# OV-E2 (S2's external-mount check) only: rclone, for a FUSE mount.
+RCLONE_VERSION="v1.75.2"
+RCLONE_SHA256="349ac8fba6ff65d6247043f1750cdcb518ec5d500ef91463a10d37c0ccdf3702"
+if [[ "${AEROL_FETCH_RCLONE:-0}" == 1 ]]; then
+  dnf -y -q install unzip >/dev/null
+  get rclone.zip "https://github.com/rclone/rclone/releases/download/${RCLONE_VERSION}/rclone-${RCLONE_VERSION}-linux-amd64.zip"
+  check256 "$RCLONE_SHA256" rclone.zip
+  unzip -q -j rclone.zip "rclone-${RCLONE_VERSION}-linux-amd64/rclone" -d .
+  install -m 0755 rclone "$BIN/rclone"
+  "$BIN/rclone" version | head -1
+fi
+
 "$BIN/containerd" --version
 "$BIN/runc" --version | head -1
 "$BIN/runsc" --version | head -1
