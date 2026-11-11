@@ -52,12 +52,20 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		effectiveRuntime = d.cfg.DefaultRuntime
 	}
 	logf := func(msg string, args ...any) { d.logger.Warn(msg, args...) }
-	if err := models.ValidateRuntimeRequest(req, effectiveRuntime, d.cfg.Privileged, logf); err != nil {
+	// ValidateRuntimeRequest logs only its "gVisor ignores DiskGB" warning,
+	// which is not true here with the disk limit on: the gVisor file store
+	// sits in the limited writable layer (spike S8).
+	validateLogf := logf
+	if d.cfg.DiskQuota {
+		validateLogf = nil
+	}
+	if err := models.ValidateRuntimeRequest(req, effectiveRuntime, d.cfg.Privileged, validateLogf); err != nil {
 		return nil, err
 	}
-	// DiskGB: dockerd may enforce via StorageOpt; containerd overlayfs does not
-	// (plans/containerd-engine-phase0-decisions.md DiskGB row). Soft-ignore.
-	if req.DiskGB > 0 && !models.DiskGBEnforced(models.ContainerEngineContainerd, effectiveRuntime) {
+	// DiskGB: enforced only with SB_CONTAINERD_DISK_QUOTA (limitWritableLayer,
+	// below); otherwise soft-ignored, as overlayfs alone has no limit
+	// (plans/containerd-engine-phase0-decisions.md DiskGB row).
+	if req.DiskGB > 0 && !d.cfg.DiskQuota && !models.DiskGBEnforced(models.ContainerEngineContainerd, effectiveRuntime) {
 		logf("ignoring disk quota: containerd overlayfs DiskGB not enforced yet", "disk_gb", req.DiskGB)
 	}
 	ociRuntime, err := models.ResolveOCIRuntime(effectiveRuntime)
@@ -311,6 +319,16 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 	// it compares with every report before it; containerd_container and
 	// containerd_task are its two parts.
 	createtiming.From(ctx).RecordStage("containerd_container", time.Since(createStart))
+	// The disk limit goes on the empty writable layer before anything runs
+	// in it. A failure is the create's: the container (and with it the
+	// snapshot) goes in the rollback above.
+	if d.cfg.DiskQuota && req.DiskGB > 0 {
+		quotaStart := time.Now()
+		if err := d.limitWritableLayer(ctx, client, sandboxID, req.DiskGB); err != nil {
+			return nil, err
+		}
+		createtiming.From(ctx).RecordStage("containerd_disk_quota", time.Since(quotaStart))
+	}
 	// The prepaid address is this sandbox's from here (a duplicate create
 	// stopped at NewContainer above), and the workload hasn't started: put
 	// the request's rules on it now, so the workload never runs without
@@ -972,6 +990,17 @@ func (d *Driver) Resize(ctx context.Context, containerRef string, req models.Res
 	if err != nil {
 		return fmt.Errorf("load container: %w", err)
 	}
+	// The disk limit is on the snapshot, not the task, so it changes
+	// whether the sandbox runs or not.
+	if d.cfg.DiskQuota && req.DiskGB > 0 {
+		info, err := container.Info(client.withNS(ctx))
+		if err != nil {
+			return fmt.Errorf("resize disk: %w", err)
+		}
+		if err := d.limitWritableLayer(ctx, client, info.SnapshotKey, req.DiskGB); err != nil {
+			return err
+		}
+	}
 	task, err := container.Task(ctx, nil)
 	if err != nil {
 		// Stopped sandbox: the store holds the new size and it takes effect via
@@ -1000,8 +1029,7 @@ func (d *Driver) Resize(ctx context.Context, containerRef string, req models.Res
 	if res.Memory == nil && res.CPU == nil {
 		return nil
 	}
-	// DiskGB is soft-ignored (containerd overlayfs has no live quota; same as
-	// create — plans/containerd-engine-phase0-decisions.md DiskGB row).
+	// DiskGB was handled above, on the snapshot.
 	return task.Update(ctx, cntr.WithResources(res))
 }
 

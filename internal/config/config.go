@@ -221,6 +221,12 @@ type Config struct {
 	// ContainerdNativeNetnsPoolEnabled gates the CNI-backed native netns pool
 	// for containerd creates (Phase 2). Default off — dockerd path unchanged.
 	ContainerdNativeNetnsPoolEnabled bool
+	// ContainerdDiskQuota enforces each sandbox's DiskGB as an XFS project
+	// quota on its writable layer (C27 in plans/kubernetes-v2-architecture.md,
+	// proven by spike S8). containerd's snapshots must sit on XFS mounted with
+	// prjquota, on a volume nothing else uses project IDs on: a sandbox's
+	// project ID is its overlay snapshot's number. SB_CONTAINERD_DISK_QUOTA.
+	ContainerdDiskQuota bool
 	// ContainerdNetnsPoolDepth is the number of slots the refiller keeps
 	// pre-realized (CNI ADD done) for a fast warm-hit create. It is the WARM
 	// target, NOT the total capacity — see ContainerdNetnsPoolSize.
@@ -2762,6 +2768,9 @@ func load(keyTool bool) (Config, error) {
 		return Config{}, fmt.Errorf("invalid SB_CONTAINER_ENGINE: %w", err)
 	}
 	cfg.ContainerEngine = resolvedEngine
+	if cfg.ContainerdDiskQuota, err = loadContainerdDiskQuota(cfg.ContainerEngine); err != nil {
+		return Config{}, err
+	}
 	if cfg.ContainerEngine == models.ContainerEngineContainerd {
 		if strings.TrimSpace(cfg.ContainerdSocket) == "" {
 			return Config{}, errors.New("SB_CONTAINERD_SOCKET is required when SB_CONTAINER_ENGINE=containerd")
@@ -3841,6 +3850,24 @@ func (c *Config) loadReadyLeaderGrace() error {
 	}
 	c.ReadyLeaderGrace = d
 	return nil
+}
+
+// loadContainerdDiskQuota reads SB_CONTAINERD_DISK_QUOTA strictly: the
+// default is off, so a typo must not silently leave every sandbox's disk
+// unlimited, and only the containerd engine can enforce it.
+func loadContainerdDiskQuota(engine string) (bool, error) {
+	raw := strings.TrimSpace(os.Getenv("SB_CONTAINERD_DISK_QUOTA"))
+	if raw == "" {
+		return false, nil
+	}
+	on, err := strconv.ParseBool(raw)
+	if err != nil {
+		return false, fmt.Errorf("SB_CONTAINERD_DISK_QUOTA must be true or false, got %q", raw)
+	}
+	if on && engine != models.ContainerEngineContainerd {
+		return false, errors.New("SB_CONTAINERD_DISK_QUOTA=true needs SB_CONTAINER_ENGINE=containerd")
+	}
+	return on, nil
 }
 
 func getEnvDuration(key string, fallback time.Duration) time.Duration {

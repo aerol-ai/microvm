@@ -208,6 +208,18 @@ func (d *Driver) adoptParked(ctx context.Context, req models.CreateSandboxReques
 	if err := d.assertSandboxNotExists(ctx, client, sandboxID, slot.ContainerID); err != nil {
 		return nil, err
 	}
+	// The slot's writable layer gets the request's disk limit before the
+	// toolbox takes the sandbox's identity; a failure destroys the slot and
+	// the create goes cold (tryWarmAdopt), where the same limit applies.
+	if d.cfg.DiskQuota && req.DiskGB > 0 {
+		info, err := container.Info(client.withNS(ctx))
+		if err != nil {
+			return nil, err
+		}
+		if err := d.limitWritableLayer(ctx, client, info.SnapshotKey, req.DiskGB); err != nil {
+			return nil, err
+		}
+	}
 
 	adoptNonce, err := dockerpkg.MintReadyNonce()
 	if err != nil {
