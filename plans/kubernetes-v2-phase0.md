@@ -69,6 +69,26 @@ anything else, as the plan's Phase 0 exit gate says.
 | N1 | **First run done, 2026-11-11.** Same machine type, same gVisor sandbox: cold p50 1.16 s (agent-sandbox) against 239 ms (AerolVM); warm 290 ms against 19 ms; a burst of 20 on a pool of 5 in about 5 s against 1.2 s; 231 Kubernetes API writes for 10 sandboxes against 0. Agent-sandbox times include about 0.2 s of `kubectl`. Still to measure: p99, several templates, a command's round trip, machine-full density | v2 plan §18, "Phase 0 results" |
 | S5 | **Done, 2026-11-11. Pass:** Karpenter 1.15.1 left a drifted machine alone for 3 minutes while the worker had `do-not-disrupt`, then replaced it within 2 minutes of the operator stand-in letting go; a managed node group AMI upgrade cordoned first, the stand-in let the worker go 37 s later, and the upgrade succeeded in 450 s. On Karpenter pools the signal is NodeClaim `Drifted`, not a cordon | v2 plan §18, "Phase 0 results" |
 
+## Phase 1, started (2026-11-11)
+
+Fixes for what Phase 0 found, one PR each. The ones that need the C7
+cgroup parent are stacked on #1141; the others are bugs on main too and go
+to main.
+
+| Item | PR | Base | State |
+|---|---|---|---|
+| F12: sandboxd misses deaths without Docker (event fan-in; reconcile) | #1142 | main | Open |
+| F1: create the ip filter table when missing | #1144 | main | Open; kernel test fails on main, passes here |
+| F3: size admission from the sandboxes' cgroup | #1145 | #1141 | Open |
+| F10: sandboxd makes each sandbox the kernel's whole OOM choice | #1146 | #1141 | Open; live S3 with `--no-keeper` running |
+| C12: cell number in new sandbox IDs | #1147 | main | Open |
+| Go 1.26.11 for GO-2026-6859 (blocks `go-security` on every PR) | #1143 | main | Open; merge first |
+
+Next, in order: C1 (a cluster-aware `/ready`; needs "cut off" defined
+against the ownership lease), F13 (mount helpers where `runsc` runs), C2
+(no Docker on the containerd engine), then C7's split worker in the images
+(P1) and the chart's `single` mode (P3).
+
 ## Cost, before it is spent
 
 Prices are us-east-1 on-demand. A normal run is 1 to 2 hours:
