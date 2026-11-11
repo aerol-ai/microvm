@@ -87,7 +87,11 @@ func run(args []string) error {
 	ctrl.SetLogger(zap.New())
 	scheme := newScheme()
 	namespaces := map[string]cache.Config{o.namespace: {}, o.workerNamespace: {}}
-	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
+	cfg, err := ctrl.GetConfig()
+	if err != nil {
+		return err
+	}
+	mgr, err := ctrl.NewManager(cfg, ctrl.Options{
 		Scheme:                 scheme,
 		Metrics:                metricsserver.Options{BindAddress: o.metricsAddr},
 		HealthProbeBindAddress: o.probeAddr,
@@ -103,6 +107,15 @@ func run(args []string) error {
 	if err != nil {
 		return err
 	}
+	if err := wire(mgr, o, scheme); err != nil {
+		return err
+	}
+	return mgr.Start(ctrl.SetupSignalHandler())
+}
+
+// wire adds the controllers, the delete guard and the health checks to mgr.
+// Apart from run so a test can wire a manager that never starts.
+func wire(mgr ctrl.Manager, o options, scheme *runtime.Scheme) error {
 	// The node controller finds the pods on a Kubernetes Node that changed.
 	if err := mgr.GetFieldIndexer().IndexField(context.Background(), &corev1.Pod{}, "spec.nodeName", func(o client.Object) []string {
 		return []string{o.(*corev1.Pod).Spec.NodeName}
@@ -131,8 +144,5 @@ func run(args []string) error {
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
 		return err
 	}
-	if err := mgr.AddReadyzCheck("readyz", healthz.Ping); err != nil {
-		return err
-	}
-	return mgr.Start(ctrl.SetupSignalHandler())
+	return mgr.AddReadyzCheck("readyz", healthz.Ping)
 }
