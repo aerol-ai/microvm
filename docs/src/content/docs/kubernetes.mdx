@@ -190,6 +190,137 @@ Good to know about the edge:
 - **You can bring your own certificate.** Put it in a TLS Secret for the domain and its wildcard, and set `edge.existingTLSSecret` instead of an issuer.
 - **[Custom domains](/custom-domains/) work as on a server.** Their certificates are issued when first needed. They are kept in the pod, so they are issued again after the pod is replaced.
 
+## Keep sandboxes off your network
+
+Sandboxes run code you may not trust. On Kubernetes, a sandbox's traffic leaves with the worker pod's address. So your cluster's own rules cannot tell a sandbox apart from AerolVM. AerolVM keeps sandboxes away from your network with two walls:
+
+- **AerolVM's firewall inside the pod.** A sandbox with no network policy cannot reach private addresses (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `169.254.0.0/16`), the worker pod's own ports, or the cloud metadata service. It can still reach the internet and look up names.
+- **A NetworkPolicy on the worker pod.** The chart adds one. The pod may reach the other AerolVM pods of the install, the cluster DNS, and the internet. It may not reach private addresses.
+
+<Aside type="note">
+The NetworkPolicy works only if your cluster's network plugin enforces NetworkPolicy. Most do, such as Calico, Cilium and the Amazon VPC CNI with network policy turned on. A plugin that does not simply ignores it. The firewall inside the pod works either way.
+</Aside>
+
+### Tell AerolVM your cluster's addresses
+
+AerolVM cannot guess your cluster's addresses, so list them in a values file. When cluster mode comes, its operator will fill these in for you.
+
+```yaml
+worker:
+  # The Kubernetes API server. No sandbox can ever reach these,
+  # whatever its policy says.
+  egressDenyFloor:
+    - 10.96.0.1     # kubectl get svc kubernetes -n default
+    - 172.18.0.2    # kubectl get endpointslices -n default -l kubernetes.io/service-name=kubernetes
+  # Your cluster's pod, Service and node ranges. Closed to sandboxes
+  # by default. You can open one on purpose (see below).
+  egressPrivateRanges:
+    - 10.244.0.0/16 # pods
+    - 10.96.0.0/12  # Services
+    - 172.18.0.0/16 # nodes
+```
+
+Then install, or upgrade, with that file:
+
+```bash
+helm upgrade --install aerolvm charts/aerolvm --namespace aerolvm -f values.yaml
+```
+
+Good to know:
+
+- **List your ranges even if they are private already.** The NetworkPolicy leaves them out too. And some clusters use ranges outside the private ones. For example, EKS custom networking gives pods addresses in `100.64.0.0/10`.
+- **Keep only the API server in `egressDenyFloor`.** Nothing can open an address there. Never put the cluster DNS address (often `10.96.0.10`) there, or sandboxes cannot look up names. Inside a range in `egressPrivateRanges` it is fine: AerolVM keeps the DNS address open.
+- **A change needs a new pod.** The chart never restarts the worker pod on its own, because that ends every sandbox. After you change these two lists, run `helm upgrade`, then delete the pod `aerolvm-0` when you are ready. Kubernetes starts a new one with the new lists.
+
+### Open one internal range on purpose
+
+Say some sandboxes must reach an internal API at `10.50.0.0/16`. Open it in **two places**. If you open it in only one, sandboxes still cannot reach it.
+
+**1. In AerolVM, with an egress profile.** A profile is a named allow list. Sandboxes that use it can reach the range. Other sandboxes still cannot. See [Reusable allow lists](/advanced-network-rules/#reusable-allow-lists) for more.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    await client.putEgressProfile('bank-api', {
+      allowOut: ['10.50.0.0/16', 'pypi.org'],
+      description: 'the internal API, and pip',
+    })
+
+    const sandbox = await client.create({
+      image: 'python:3.12',
+      egressProfiles: ['bank-api'],
+    })
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    client.put_egress_profile('bank-api', {
+        'allowOut': ['10.50.0.0/16', 'pypi.org'],
+        'description': 'the internal API, and pip',
+    })
+
+    sandbox = client.create({
+        'image': 'python:3.12',
+        'egressProfiles': ['bank-api'],
+    })
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    _, err := client.PutEgressProfile(ctx, "bank-api", sdktypes.EgressProfileOptions{
+        AllowOut:    []string{"10.50.0.0/16", "pypi.org"},
+        Description: "the internal API, and pip",
+    })
+    if err != nil {
+        return err
+    }
+    sandbox, err := client.Create(ctx, sdktypes.CreateSandboxOptions{
+        Image:          "python:3.12",
+        EgressProfiles: []string{"bank-api"},
+    })
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    client.put_egress_profile("bank-api", EgressProfileOptions {
+        allow_out: vec!["10.50.0.0/16".to_string(), "pypi.org".to_string()],
+        description: "the internal API, and pip".to_string(),
+    })?;
+
+    let sandbox = client.create(CreateOptions {
+        image: "python:3.12".to_string(),
+        egress_profiles: Some(vec!["bank-api".to_string()]),
+        ..Default::default()
+    })?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    client.putEgressProfile("bank-api", new EgressProfileOptions()
+        .setAllowOut(List.of("10.50.0.0/16", "pypi.org"))
+        .setDescription("the internal API, and pip"));
+
+    Sandbox sandbox = client.create(
+        new CreateOptions()
+            .setImage("python:3.12")
+            .setEgressProfiles(List.of("bank-api"))
+    );
+    ```
+  </TabItem>
+</Tabs>
+
+A sandbox that uses a profile can reach only what the profile allows. That is why `pypi.org` is in the list too: add every site the sandbox needs.
+
+**2. In the worker pod's NetworkPolicy.** Add the same range to your values file and run `helm upgrade`. This change needs no new pod: the network plugin applies it at once.
+
+```yaml
+networkPolicy:
+  extraEgressCIDRs:
+    - 10.50.0.0/16
+```
+
+Put other private addresses the worker pod itself needs in the same list. Examples: a private registry for sandbox images, a VPC endpoint for object storage or KMS, or the NodeLocal DNSCache address (often `169.254.20.10`).
+
 ## Check the install
 
 `aerolvm k8s verify` checks a live install against the rules a security team asks about, and exits with 1 if any fails:
@@ -198,7 +329,8 @@ Good to know about the edge:
 - no pod mounts a folder from the node;
 - no pod holds a Kubernetes API credential;
 - no pod holds a DNS provider token: a pod may mount only a certificate, its key and its authority from a Secret, each named;
-- a runc and a gVisor sandbox cannot reach the worker pod's own ports or the Kubernetes API.
+- a NetworkPolicy limits where the worker pod can connect, and no policy on it opens every address, every pod, or a whole private range;
+- a runc and a gVisor sandbox cannot reach the worker pod's own ports, another pod (a cluster DNS pod), or the Kubernetes API.
 
 It reads the cluster with your `kubectl`, and makes its two test sandboxes through the API you set up above. It deletes them when it is done.
 
@@ -306,6 +438,11 @@ Set these with `--set` or a values file.
 | `worker.diskFloorRatio` | New sandboxes are turned away while less than this share of the sandbox disk is free. `"0"` turns it off. | `"0.10"` |
 | `worker.blockPrivateByDefault` | Sandboxes cannot reach private addresses unless a create allows them. | `true` |
 | `worker.usageMetrics.enabled` | [Usage per team](#usage-per-team) on `/v1/metrics`. Owner names become label values. | `true` |
+| `worker.egressDenyFloor` | [Addresses no sandbox can ever reach](#tell-aerolvm-your-clusters-addresses), such as the Kubernetes API server. | none |
+| `worker.egressPrivateRanges` | Your cluster's pod, Service and node ranges. Sandboxes cannot reach them unless an egress profile opens one. Needs `worker.blockPrivateByDefault`. | none |
+| `networkPolicy.enabled` | Give the worker pod an egress NetworkPolicy. | `true` |
+| `networkPolicy.extraEgressCIDRs` | Private ranges the worker pod may reach: the one you [open on purpose](#open-one-internal-range-on-purpose), or a registry or endpoint the pod needs. | none |
+| `networkPolicy.dns` | Where your cluster DNS runs, as `namespace` and `podLabels`. | `kube-system`, `k8s-app: kube-dns` |
 | `worker.containerdVolume` | Where images and sandbox files live. Use a local disk for real work. | an `emptyDir` |
 | `worker.extraEnv` | Any other server setting, as `SB_NAME: value`. | none |
 | `apiToken.existingSecret` | Use your own token Secret (key `SB_PAT_TOKEN`) instead of the one the chart makes. | none |
