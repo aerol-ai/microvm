@@ -46,9 +46,10 @@ url_of() { sed -n "s/^$1 *= *\"\(.*\)\"$/\1/p" "$sd/urls.tfvars"; }
 # load br_netfilter, and sandboxd refuses to start without it. modprobe runs
 # in a node debug pod against the host's /lib/modules (at /host), because
 # Bottlerocket's host has no shell to chroot into.
+# An optional label selector picks the machines (S5's Karpenter machines).
 load_br_netfilter() {
-  local n d
-  for n in $(kubectl get nodes -l aerolvm.io/pool=phase0 -o jsonpath='{.items[*].metadata.name}'); do
+  local sel="${1:-aerolvm.io/pool=phase0}" n d
+  for n in $(kubectl get nodes -l "$sel" -o jsonpath='{.items[*].metadata.name}'); do
     kubectl debug "node/$n" --profile=sysadmin --image="$DEBUG_IMAGE" -- \
       sh -c 'dnf -y -q install kmod >/dev/null && modprobe -d /host br_netfilter && echo "br_netfilter: $(grep -c ^br_netfilter /proc/modules) loaded"' >/dev/null 2>&1 || true
   done

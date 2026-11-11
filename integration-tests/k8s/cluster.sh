@@ -4,6 +4,7 @@
 #
 #   cluster.sh up   <name> [--ttl 3h] [--ami AL2023_x86_64_STANDARD|BOTTLEROCKET_x86_64]
 #                          [--type m7i.xlarge] [--workers 1] [--version 1.36]
+#                          [--release 1.36.5-20261031] [--karpenter]
 #   cluster.sh down <name>
 #   cluster.sh kubeconfig <name>      # prints the kubeconfig path
 #   cluster.sh allow-ip <name>        # let this machine's current address in
@@ -16,10 +17,11 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TF_DIR="$HERE/terraform"
+KARPENTER_VERSION=1.15.1
 
 die() { echo "cluster.sh: $*" >&2; exit 1; }
 
-usage() { sed -n '2,14p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 2; }
+usage() { sed -n '2,15p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 2; }
 
 # ttl_from_now turns "3h" or "90m" into an RFC 3339 UTC time. macOS date and
 # GNU date spell the offset differently.
@@ -47,8 +49,13 @@ tf() {
 cmd_up() {
   local name="${1:-}"; [[ -n "$name" ]] || usage; shift
   local ttl="3h" ami="AL2023_x86_64_STANDARD" type="m7i.xlarge" workers=1 version="1.36"
+  local release="" karpenter=false
   while [[ $# -gt 0 ]]; do
     case "$1" in
+      # The worker node group's AMI release; S5 starts one behind to upgrade.
+      --release) release="$2"; shift 2 ;;
+      # Spike S5: Karpenter's IAM in Terraform, and its chart once up.
+      --karpenter) karpenter=true; shift ;;
       --ttl) ttl="$2"; shift 2 ;;
       --ami) ami="$2"; shift 2 ;;
       --type) type="$2"; shift 2 ;;
@@ -66,13 +73,23 @@ cmd_up() {
   # applied (the zone list, for one, depends on the worker type).
   jq -n --arg name "$name" --arg ttl "$(ttl_from_now "$ttl")" --arg ami "$ami" \
     --arg type "$type" --argjson workers "$workers" --arg version "$version" --arg cidr "${ip}/32" \
+    --arg release "$release" --argjson karpenter "$karpenter" \
     '{name: $name, ttl: $ttl, worker_ami_type: $ami, worker_instance_type: $type,
-      worker_count: $workers, kubernetes_version: $version, api_allowed_cidrs: [$cidr]}' \
+      worker_count: $workers, kubernetes_version: $version, api_allowed_cidrs: [$cidr],
+      worker_release_version: $release, karpenter: $karpenter}' \
     > "$sd/run.tfvars.json"
   tf "$name" init -input=false -backend=false >/dev/null
   tf "$name" apply -input=false -auto-approve -state="$sd/terraform.tfstate" -var-file="$sd/run.tfvars.json"
   local region; region="$(tf "$name" output -state="$sd/terraform.tfstate" -raw region)"
   aws eks update-kubeconfig --name "$name" --region "$region" --kubeconfig "$sd/kubeconfig" >/dev/null
+  if [[ "$karpenter" == true ]]; then
+    # One replica: the chart's two want two machines, and the only machine
+    # without the worker taint is the one system node.
+    KUBECONFIG="$sd/kubeconfig" helm upgrade --install karpenter oci://public.ecr.aws/karpenter/karpenter \
+      --version "$KARPENTER_VERSION" --namespace kube-system \
+      --set settings.clusterName="$name" --set replicas=1 --wait >/dev/null
+    echo "up: Karpenter $KARPENTER_VERSION installed"
+  fi
   date -u +%Y-%m-%dT%H:%M:%SZ > "$sd/started-at"
   echo "up: $name; kubeconfig $sd/kubeconfig"
 }
@@ -106,6 +123,26 @@ cmd_down() {
   local state=(-input=false -auto-approve -state="$sd/terraform.tfstate" -var-file="$sd/run.tfvars.json")
   local region; region="$(tf "$name" output -state="$sd/terraform.tfstate" -raw region 2>/dev/null || echo "${AWS_REGION:-us-east-1}")"
   tf "$name" init -input=false -backend=false >/dev/null
+  if jq -e '.karpenter == true' "$sd/run.tfvars.json" >/dev/null 2>&1; then
+    # Karpenter's machines and instance profiles are not in Terraform's
+    # state: have Karpenter remove them (deleting its NodePools ends their
+    # machines; deleting the EC2NodeClasses ends the profiles, which would
+    # otherwise keep the node role from being deleted), then end any machine
+    # it left.
+    KUBECONFIG="$sd/kubeconfig" kubectl delete nodepools.karpenter.sh --all --timeout=10m >/dev/null 2>&1 || true
+    KUBECONFIG="$sd/kubeconfig" kubectl delete ec2nodeclasses.karpenter.k8s.aws --all --timeout=5m >/dev/null 2>&1 || true
+    local left; left="$(aws ec2 describe-instances --region "$region" \
+      --filters "Name=tag:kubernetes.io/cluster/$name,Values=owned" "Name=tag-key,Values=karpenter.sh/nodepool" \
+        Name=instance-state-name,Values=pending,running,stopping,stopped \
+      --query 'Reservations[].Instances[].InstanceId' --output text)"
+    if [[ -n "$left" ]]; then
+      echo "down: ending machines Karpenter left: $left"
+      # shellcheck disable=SC2086
+      aws ec2 terminate-instances --region "$region" --instance-ids $left >/dev/null
+      # shellcheck disable=SC2086
+      aws ec2 wait instance-terminated --region "$region" --instance-ids $left
+    fi
+  fi
   # Machines first, then what they left, then the rest.
   tf "$name" destroy "${state[@]}" -target=aws_eks_node_group.worker -target=aws_eks_node_group.system
   remove_leftovers "$name" "$region"

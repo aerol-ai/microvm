@@ -77,6 +77,8 @@ resource "aws_subnet" "public" {
     Name                                = "${var.name}-${local.zones[count.index]}"
     "kubernetes.io/cluster/${var.name}" = "shared"
     "kubernetes.io/role/elb"            = "1"
+    # Karpenter's EC2NodeClass finds the subnets by this (spike S5).
+    "karpenter.sh/discovery" = var.name
   }
 }
 
@@ -189,6 +191,7 @@ resource "aws_eks_node_group" "worker" {
   node_role_arn   = aws_iam_role.node.arn
   subnet_ids      = aws_subnet.public[*].id
   ami_type        = var.worker_ami_type
+  release_version = var.worker_release_version == "" ? null : var.worker_release_version
   instance_types  = [var.worker_instance_type]
   disk_size       = var.worker_disk_gib
   labels          = { "aerolvm.io/pool" = "phase0" }

@@ -44,3 +44,15 @@ variable "api_allowed_cidrs" {
   description = "Who may reach the cluster's API endpoint. run.sh passes this machine's address."
   type        = list(string)
 }
+
+variable "worker_release_version" {
+  description = "The worker node group's AMI release (e.g. 1.36.5-20261031). Empty takes the latest. S5 starts one behind so it can upgrade."
+  type        = string
+  default     = ""
+}
+
+variable "karpenter" {
+  description = "Add what Karpenter needs (spike S5): its controller's role through EKS Pod Identity. cluster.sh installs the chart."
+  type        = bool
+  default     = false
+}
