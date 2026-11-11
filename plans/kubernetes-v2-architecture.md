@@ -1453,7 +1453,9 @@ or the smoke test until the spike worked around it. Phase 1 must fix each in
 | F6 | Hostname-filtered egress needs the egress gateway (its user and socket), which the pod lacks, so those creates are refused. | None | The gateway as one more container in the worker pod |
 | F8 | With the agent's `/run/netns` shared to the runtime container by Bidirectional mount propagation, the network namespaces `sandboxd` mounts there land in the machine's own mount table. When the pod is deleted or dies, nothing removes them: the kubelet cannot tear the volume down, and the pod sticks in Terminating. It also breaks K4 (AerolVM touches the machine only through the kernel). | `lib.sh` unmounts them in the machine's mount namespace (`nsenter -t 1 -m`) before replacing a worker pod | Make the namespaces where they are used: in the runtime container, through a small privileged helper (the N2 split), so nothing has to cross containers or reach the machine |
 | F9 | cAdvisor, inside the kubelet, tracks every sandbox's cgroup as its own container: 57 series per sandbox, with no pod or container label. At 1,000 sandboxes one node exposes 57,823 cAdvisor series (1,095 with none), so a Prometheus scraping 2,000 such nodes would hold over 100 million series. The worker pod's own series stay at 177. | None needed for the spike | Eng review D3's decision, now with numbers: P9's ServiceMonitor drops `/sandboxes/` series at scrape time (metric relabelling), and the operator documents it; or move sandbox cgroups out of cAdvisor's view, if a kubelet setting allows it. Usage per sandbox comes from C20, not from cAdvisor. |
-| F10 | **One pod-level out-of-memory event killed every process in the worker container:** all sandboxes, every shim, `containerd` and `sandboxd` (one event; 172 runsc helpers, 88 shims, 77 runsc, 61 gVisor sentries, 21 runsc sandbox processes, 2 containerd, 2 sandboxd). The kubelet's default (`singleProcessOOMKill` unset, so false) kills a container's processes as one group. §8.3 assumed the kernel would stop one sandbox first and the machinery last; on EKS 1.36 it does not. The kubelet did not evict the pod and the node never reported MemoryPressure: it was the pod's cgroup limit alone. | None: S3 records it | Pick before Phase 1: (a) the bank's kubelet sets `singleProcessOOMKill: true` on worker pools; or (b) the supervisor sets its own container's `memory.oom.group` to 0, each sandbox's group to 1 (a sandbox dies whole, alone), and gives the machinery the lowest OOM score. In both cases admission must size itself from the pod's limit (F3), so overcommit does not drive the pod into its limit in normal use. |
+| F10 | **One pod-level out-of-memory event killed every process in the worker container:** all sandboxes, every shim, `containerd` and `sandboxd` (one event; 172 runsc helpers, 88 shims, 77 runsc, 61 gVisor sentries, 21 runsc sandbox processes, 2 containerd, 2 sandboxd). The kubelet's default (`singleProcessOOMKill` unset, so false) kills a container's processes as one group. §8.3 assumed the kernel would stop one sandbox first and the machinery last; on EKS 1.36 it does not. The kubelet did not evict the pod and the node never reported MemoryPressure: it was the pod's cgroup limit alone. | `common.sh` (`c7_setup`, `keep_sandboxes_first`, `in_runtime_group`): group-kill off, each sandbox's group on, a cap on `sandboxes/`, containerd inside the cap. Proven by S3's seventh run | The design under "F10, seven runs" below, in `sandboxd` and the worker image. Not the kubelet's `singleProcessOOMKill: true`: a gVisor sandbox is several processes sharing one memory file, so killing one frees nothing (fourth run). Admission sized from the pod's limit (F3), with each sandbox's helpers counted. |
+| F11 | At 1M placements a Raft snapshot holds up Apply for about 1.1 s, and the FSM takes 2.4 GiB per server (S4, offline). Small at G3's 100,000 per cell. | None needed | Phase 3: snapshot without copying every row under the lock, before any cell is meant to hold 1M placements. Until then cells stay at or below 250k. |
+| F12 | After S3's seventh run, 14 sandboxes the kernel had killed (their groups empty) were still listed as `started` 12 minutes later, and a command sent to one got a 502. `sandboxd`'s log shows its Docker event stream failing (F4), and containerd failing to publish its OOM events under the pressure ("context deadline exceeded"). The containerd engine has its own event stream (`internal/runtime/containerd/events.go`); why it did not mark them is not yet known. | None | Phase 1: find why, then make a sandbox's death reach its row on the containerd engine (task exit, OOM event, or an empty group found by reconcile), and tell its owner it was killed for memory. A regression test kills a sandbox's group and checks the row. |
 | F7 | Bottlerocket 1.68 sets `user.max_user_namespaces=0`. gVisor's gofer makes a user namespace, so every gVisor create fails with "fork/exec /proc/self/exe: no space left on device". It also means Kubernetes user namespaces (spike S9) cannot work on a default Bottlerocket node. | Raised to 62775 at run time from a node debug pod | A bank decision, not code: Bottlerocket's `settings.kernel.sysctl` raises it per node pool. The chart's docs and `aerolvm k8s verify` (P8) must check it. |
 
 **S1, where a sandbox lands: half done** (same run).
@@ -1586,8 +1588,9 @@ whole worker container (F10), and the pod ended Failed. **Does the kubelet
 ever evict the worker pod? Not here: the node never reached MemoryPressure.
 The danger is the pod's own limit, not eviction.**
 
-**F10, four fix attempts** (run `p0-s3b`, same shape, 2026-11-11). Each run
-repeated the 1,000-sandbox ramp and the pressure:
+**F10, seven runs** (runs 2 to 5 on `p0-s3b`, 6 and 7 on `p0-s3c`, same
+shape, 2026-11-11). Each run repeated the 1,000-sandbox ramp and the
+pressure:
 
 | Run | Change | What the kernel did | sandboxd |
 |---|---|---|---|
@@ -1595,16 +1598,36 @@ repeated the 1,000-sandbox ramp and the pressure:
 | 3 | A shim wrapper sets its own score to 500 | No change: containerd sets each shim's score from its own (-999) after starting it, and gVisor's helpers inherit it | Stalled |
 | 4 | A loop sets score 500 on every process in each sandbox's group | Killed 1 `gvisor_sentry`; freed nothing, because a gVisor sandbox's tmpfs is one shared memory file held by several of its processes | Stalled |
 | 5 | The loop also sets `memory.oom.group` 1 on each sandbox's group | Killed 2 whole sandboxes (26 processes) and nothing else; `containerd` and `sandboxd` survived, 0 restarts | Still stalled: the pod stayed at its limit |
+| 6 (`p0-s3c`) | `sandboxes/` gets `memory.max` of the pod's limit minus a reserve (10%, between 1 and 4 GiB: 50 GiB here); `supervisor/` gets `memory.min` of the reserve | The cap was never reached. Every sandbox's shim, `runsc` and `runsc-fd-parking` are containerd's children and sat in `supervisor/`: 8.0 GB at 1,000 sandboxes, about 8 MB each, past the 4 GiB reserve. Sandboxes (49.95 GB) plus that hit the container's own limit 319 times; the kernel killed 2 whole sandboxes and nothing else | Did not answer |
+| 7 (`p0-s3c`) | containerd starts in `sandboxes/_runtime`, inside the cap, so everything it spawns is charged there from its first page | **The container's own limit was never hit** (0 local `max` events; peak 54.5 of 58.0 GB). The cap took every hit (137,835 `max` events). 14 sandboxes died, each whole (their groups were empty afterwards); `_runtime` (containerd and 1,000 shims, 7.5 GB) and `supervisor/` (`sandboxd`, 615 MB) had no out-of-memory events. 0 restarts | **Answered**, and created a new sandbox (in 22.8 s, because `sandboxes/` sat at its cap) |
 
-So the victim choice is fixed (whole sandboxes, never the machinery), but a
-pod at its limit still starves `sandboxd`. **The Phase 1 design for F10:**
-give `sandboxes/` its own `memory.max`, the pod's limit minus a reserve for
-the machinery, and protect `supervisor/` with `memory.min`. Out-of-memory
-events then happen inside `sandboxes/` and only ever kill a whole sandbox
-(each sandbox's group keeps `memory.oom.group` 1), and the machinery always
-has memory to answer with. `sandboxd` sets each sandbox's score and group
-right after it starts; the spike's loop is only a stand-in. Admission sized
-from the pod (F3) keeps normal use away from the cap. Not yet proven live.
+Why run 6 failed and run 7 needed containerd moved: a process's helpers
+cannot be moved to another group after they start, because cgroup v2 leaves
+memory charged to the group where it was used, and gVisor's shim ignores
+containerd's `shim_cgroup` option (it is declared in its options and never
+read).
+
+**F10 is fixed in the spike. The Phase 1 design, as proven:**
+
+- The worker's groups: `supervisor/` holds `sandboxd` (and, in the split pod,
+  the agent container is this part) with `memory.min` of the reserve;
+  `sandboxes/` has `memory.max` of the pod's limit minus the reserve and
+  holds `_runtime/` (containerd and every shim and `runsc` helper, OOM score
+  -999, `memory.oom.group` 0) and one group per sandbox.
+- `memory.oom.group` is 0 on the pod, the container, `sandboxes/` and
+  `_runtime/`, and 1 on each sandbox's group, so one out-of-memory event
+  kills one whole sandbox and nothing else.
+- Each sandbox's processes get OOM score 500. `sandboxd` sets the score and
+  the group's `memory.oom.group` right after the sandbox starts; the spike's
+  loop is only a stand-in.
+- The reserve only has to cover `sandboxd` (615 MB here at 1,000
+  sandboxes), so 10% capped at 4 GiB is generous.
+- Admission sized from the pod (F3) and charged about 8 MB more per sandbox
+  for its helpers (they now count against the cap) keeps normal use away
+  from the cap. A create that reaches a full cap waits, as run 7's 22.8 s
+  create did; admission should refuse it instead.
+- F12 (below) is what run 7 found next: `sandboxd` did not notice the
+  sandboxes the kernel killed.
 
 **S4, how far one cell goes: the offline half** (2026-11-11, an M1 Max
 laptop, no AWS). `BenchmarkFSMCellCeiling` in
@@ -1645,8 +1668,9 @@ What it says:
 The live half, still to run: the same reserves on three server nodes of the
 EC2 harness, so a real disk and network replace the 6.5 ms model.
 
-**Cost so far:** seven clusters, about 7.6 hours of cluster time in all,
-about $4.60 (the m7i.4xlarge S3 runs are about two thirds of it).
+**Cost so far:** eight clusters, about 9 hours of cluster time in all,
+about $5.70 (the m7i.4xlarge S3 runs are about three quarters of it). S4's
+offline half cost nothing.
 
 ## 19. Tests, drills and benchmarks
 
