@@ -111,7 +111,7 @@ func TestStampWorkerAndGateway(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if pod.Namespace != testWorkerNS || pod.Labels[LabelPool] != "general" || pod.Annotations["karpenter.sh/do-not-disrupt"] != "true" {
+	if pod.Namespace != testWorkerNS || pod.Labels[LabelPool] != "general" || pod.Labels[LabelZone] != "z-c" || pod.Annotations["karpenter.sh/do-not-disrupt"] != "true" {
 		t.Fatalf("worker meta = %+v", pod.ObjectMeta)
 	}
 	if pod.Spec.NodeSelector["aerolvm.io/pool"] != "general" {

@@ -2,8 +2,12 @@
 #
 # mode: single runs AerolVM in one pod with no operator: a worker pod whose
 # runtime container holds containerd and every sandbox, and whose agent
-# container is sandboxd. For kind, laptops and small installs. Cluster mode
-# (gateways, servers and an operator) comes with the operator in Phase 2.
+# container is sandboxd. For kind, laptops and small installs.
+#
+# mode: cluster installs the AerolVM operator and one AerolCluster (the
+# cluster block below): three or five servers, gateways in every zone, and
+# worker pools that grow and shrink with load (plans/kubernetes-v2-architecture.md
+# Phase 2). The worker block's container settings apply to every worker.
 mode: single
 
 image:
@@ -190,3 +194,69 @@ monitoring:
   # sidecar must watch it (kube-prometheus-stack:
   # grafana.sidecar.dashboards.searchNamespace).
   dashboardsNamespace: ""
+
+# Cluster mode (mode: cluster). The operator turns this into servers,
+# gateways and workers, and keeps them there.
+cluster:
+  # The AerolCluster's name; every node and Service is named after it.
+  name: aerolvm
+  # Worker pods run here: the one namespace where privileged pods are
+  # allowed (§8.7). The chart makes it, labelled for privileged pods,
+  # unless createWorkerNamespace is false (then make and label it first).
+  workerNamespace: aerolvm-workers
+  createWorkerNamespace: true
+  # The AerolVM release the cluster runs. Empty: the chart's appVersion.
+  # Changing it upgrades the cluster in order; setting it back rolls back.
+  version: ""
+  # This cluster's number, 1 to 255, in every new sandbox ID (C12).
+  cell: 1
+  # The zones to spread over, such as [eu-west-1a, eu-west-1b, eu-west-1c].
+  # Servers go one per zone; gateways and workers spread across them.
+  zones: []
+  servers:
+    count: 3
+    storage:
+      size: 20Gi
+      # A class that binds on first use (volumeBindingMode:
+      # WaitForFirstConsumer), so each server's disk lands in its zone.
+      storageClassName: ""
+    resources:
+      requests: { cpu: "1", memory: 2Gi }
+      limits: { cpu: "2", memory: 4Gi }
+    nodeSelector: {}
+    tolerations: []
+  gateways:
+    minReplicas: 3
+    maxReplicas: 30
+    resources:
+      requests: { cpu: 500m, memory: 512Mi }
+      limits: { cpu: "1", memory: 1Gi }
+    service:
+      type: LoadBalancer
+      annotations: {}
+    # Put the gateways behind your own Gateway API Gateway instead of a
+    # load balancer (§7.1): { name: bank-gateway, namespace: gateways }.
+    # The chart writes an HTTPRoute for the API host, a TLSRoute in
+    # passthrough mode for the sandbox links and a TCPRoute for SSH.
+    gatewayRef: {}
+    nodeSelector: {}
+    tolerations: []
+  # One worker pod per machine, sized to the machine (§8.1). For example:
+  #   - name: gvisor-general
+  #     runtimes: [gvisor]
+  #     nodeSelector: { aerolvm.io/pool: gvisor-general }
+  #     tolerations: [{ key: aerolvm.io/pool, operator: Exists, effect: NoSchedule }]
+  #     machine: { cpu: 32, memoryGiB: 128 }
+  #     minWorkers: 3
+  #     maxWorkers: 300
+  #     headroomPercent: 15
+  #     provisioner: karpenter
+  #     decommission: { drainWindow: 15m }
+  workerPools: []
+  operator:
+    replicas: 2
+    resources:
+      requests: { cpu: 100m, memory: 128Mi }
+      limits: { cpu: 500m, memory: 512Mi }
+    nodeSelector: {}
+    tolerations: []

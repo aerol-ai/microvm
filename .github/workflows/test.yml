@@ -53,6 +53,7 @@ jobs:
       installer: ${{ (github.event_name != 'pull_request' || github.base_ref == 'main') && steps.filter.outputs.installer || 'false' }}
       installer_harness: ${{ (github.event_name != 'pull_request' || github.base_ref == 'main') && steps.filter.outputs.installer_harness || 'false' }}
       kubernetes: ${{ (github.event_name != 'pull_request' || github.base_ref == 'main') && steps.filter.outputs.kubernetes || 'false' }}
+      operator: ${{ (github.event_name != 'pull_request' || github.base_ref == 'main') && steps.filter.outputs.operator || 'false' }}
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -175,6 +176,14 @@ jobs:
               - 'setup/prometheus/k8s_chart_test.go'
               - 'setup/prometheus/testdata/k8s-chart-rules.test.yaml'
               - 'setup/runbooks/kubernetes.md'
+              - 'operator/**'
+              - '.github/workflows/test.yml'
+            # The operator: its own Go module (go-tests from the root never
+            # reaches it), and the chart's pod templates it stamps.
+            operator:
+              - 'operator/**'
+              - 'charts/**'
+              - 'pkg/upgradewire/**'
               - '.github/workflows/test.yml'
 
   # go-tests and go-race each run as two jobs. "cluster-service" runs
@@ -813,6 +822,43 @@ jobs:
   # the worker pod with them running (finding F8). Advisory, like the other
   # heavy suites; it runs only when the chart, the images or the supervisor
   # change.
+  # The operator (plans/kubernetes-v2-architecture.md P2): vet and race
+  # tests, then the chart's cluster-mode pod templates, rendered by Helm,
+  # parsed strictly and stamped for every role, so the chart and the
+  # operator agree on container and volume names.
+  operator-tests:
+    needs: paths
+    if: needs.paths.outputs.operator == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: operator/go.sum
+
+      - name: Install Helm
+        run: |
+          curl -fsSL -o helm.tgz https://get.helm.sh/helm-v3.22.1-linux-amd64.tar.gz
+          echo "896cf63684a42a723d61c980369d6e588330927deb13676ca0d85006dd6da0ea  helm.tgz" | sha256sum -c -
+          tar -xzf helm.tgz linux-amd64/helm
+          sudo install -m 0755 linux-amd64/helm /usr/local/bin/helm
+
+      - name: Render the chart's pod templates
+        run: scripts/chart-pod-templates.sh > "$RUNNER_TEMP/pod-templates.yaml"
+
+      - name: Vet and test the operator
+        working-directory: operator
+        env:
+          AEROLVM_POD_TEMPLATES: ${{ runner.temp }}/pod-templates.yaml
+        run: |
+          go vet ./...
+          go test -race -count=1 -cover ./...
+
   kubernetes:
     needs: paths
     if: needs.paths.outputs.kubernetes == 'true'
@@ -847,8 +893,21 @@ jobs:
         run: |
           helm lint charts/aerolvm
           helm template t charts/aerolvm | grep -q 'kind: StatefulSet'
+          # Cluster mode (P2): the operator, its webhook, the AerolCluster
+          # and the pod templates; no single-mode StatefulSet. It refuses
+          # without zones and worker pools.
+          cluster="--set mode=cluster --set cluster.zones={a,b,c} --set cluster.workerPools[0].name=general --set cluster.workerPools[0].machine.cpu=8 --set cluster.workerPools[0].machine.memoryGiB=32 --set cluster.workerPools[0].minWorkers=3 --set cluster.workerPools[0].maxWorkers=9"
+          helm lint charts/aerolvm $cluster
+          out="$(helm template t charts/aerolvm $cluster)"
+          for kind in AerolCluster ValidatingWebhookConfiguration PriorityClass Namespace; do
+            grep -q "kind: $kind" <<<"$out" || { echo "::error::cluster mode rendered no $kind"; exit 1; }
+          done
+          if grep -q 'kind: StatefulSet' <<<"$out"; then
+            echo "::error::cluster mode rendered the single-mode StatefulSet"
+            exit 1
+          fi
           if helm template t charts/aerolvm --set mode=cluster >/dev/null 2>&1; then
-            echo "::error::mode=cluster rendered; only single mode exists"
+            echo "::error::cluster mode rendered with no zones or worker pools"
             exit 1
           fi
           edge="--set edge.enabled=true --set edge.domain=aerolvm.test --set edge.certManager.issuerRef.name=ci"

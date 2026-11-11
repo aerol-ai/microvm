@@ -10,6 +10,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -282,5 +283,29 @@ func TestClusterNotFoundAndHelpers(t *testing.T) {
 	}
 	if apiURL(testCluster()) != "http://prod-api.aerolvm-system.svc:21212" {
 		t.Fatal(apiURL(testCluster()))
+	}
+}
+
+// The sandbox-link certificate reaches the worker namespace, its
+// certificate and key only (C25): no other key (a DNS token) follows it.
+func TestClusterCopiesEdgeCertificate(t *testing.T) {
+	c := bootstrapped(testCluster())
+	c.Spec.Edge = v1.EdgeSpec{Domain: "sbx.example.com", TLSSecret: "aerolvm-edge-tls"}
+	src := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "aerolvm-edge-tls", Namespace: testNS},
+		Data: map[string][]byte{"tls.crt": []byte("CERT"), "tls.key": []byte("KEY"), "dns-token": []byte("secret")}}
+	r, api, cl := clusterRig(t, c)
+	r.WorkerNamespace = testWorkerNS
+	api.membersErr = errors.New("down")
+	reconcileCluster(t, r) // not issued yet: nothing to copy, no error
+	if err := cl.Create(context.Background(), src); err != nil {
+		t.Fatal(err)
+	}
+	reconcileCluster(t, r)
+	var dst corev1.Secret
+	if err := cl.Get(context.Background(), types.NamespacedName{Namespace: testWorkerNS, Name: "aerolvm-edge-tls"}, &dst); err != nil {
+		t.Fatal(err)
+	}
+	if len(dst.Data) != 2 || string(dst.Data["tls.key"]) != "KEY" || dst.Type != corev1.SecretTypeTLS {
+		t.Fatalf("copy = %v (%s)", dst.Data, dst.Type)
 	}
 }

@@ -205,6 +205,12 @@ type EdgeSpec struct {
 	// IssuerRef is the cert-manager issuer of the wildcard certificate.
 	// +optional
 	IssuerRef *IssuerRef `json:"issuerRef,omitempty"`
+	// TLSSecret holds the wildcard certificate in the AerolCluster's
+	// namespace. The operator keeps a copy, its certificate and key only,
+	// in the worker namespace, where worker pods mount it: a Secret volume
+	// is namespaced, and a second Certificate would be a second issuance.
+	// +optional
+	TLSSecret string `json:"tlsSecret,omitempty"`
 }
 
 // IssuerRef names a cert-manager issuer.

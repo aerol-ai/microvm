@@ -61,6 +61,8 @@ type ClusterReconciler struct {
 	Scheme   *runtime.Scheme
 	Recorder record.EventRecorder
 	API      APIFactory
+	// WorkerNamespace holds the worker pods.
+	WorkerNamespace string
 	// Now is the clock; tests replace it.
 	Now func() time.Time
 }
@@ -90,6 +92,9 @@ func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		return ctrl.Result{}, err
 	}
 	if err := r.ensureServices(ctx, &c); err != nil {
+		return ctrl.Result{}, err
+	}
+	if err := r.syncEdgeSecret(ctx, &c); err != nil {
 		return ctrl.Result{}, err
 	}
 	nodes, err := listNodes(ctx, r.Client, &c)
@@ -253,7 +258,7 @@ func (r *ClusterReconciler) ensureServices(ctx context.Context, c *v1.AerolClust
 			gw.Spec.ExternalTrafficPolicy = corev1.ServiceExternalTrafficPolicyLocal
 		}
 		gw.Spec.Selector = map[string]string{LabelCluster: c.Name, LabelComponent: v1.RoleGateway}
-		gw.Spec.Ports = []corev1.ServicePort{port("https", 443), port("http", 80), port("ssh", 2222)}
+		gw.Spec.Ports = []corev1.ServicePort{port("https", 443), port("http", 80), port("ssh", 2220)}
 	})
 }
 
@@ -501,4 +506,31 @@ func (r *ClusterReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Owns(&corev1.Service{}).
 		Named("aerolcluster").
 		Complete(r)
+}
+
+// syncEdgeSecret copies the sandbox-link certificate, its certificate and
+// key only, into the worker namespace (C25). A renewal reaches the copy on
+// the next pass; sandboxd reloads it from the file.
+func (r *ClusterReconciler) syncEdgeSecret(ctx context.Context, c *v1.AerolCluster) error {
+	name := c.Spec.Edge.TLSSecret
+	if name == "" || r.WorkerNamespace == "" || r.WorkerNamespace == c.Namespace {
+		return nil
+	}
+	var src corev1.Secret
+	if err := r.Get(ctx, types.NamespacedName{Namespace: c.Namespace, Name: name}, &src); err != nil {
+		// Not issued yet: worker pods wait for it, as a single-mode pod
+		// waits for its Secret.
+		return client.IgnoreNotFound(err)
+	}
+	dst := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: r.WorkerNamespace}}
+	_, err := controllerutil.CreateOrUpdate(ctx, r.Client, dst, func() error {
+		dst.Labels = clusterLabels(c)
+		dst.Type = corev1.SecretTypeTLS
+		dst.Data = map[string][]byte{
+			corev1.TLSCertKey:       src.Data[corev1.TLSCertKey],
+			corev1.TLSPrivateKeyKey: src.Data[corev1.TLSPrivateKeyKey],
+		}
+		return nil
+	})
+	return err
 }

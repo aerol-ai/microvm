@@ -1,0 +1,748 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.23.0
+  name: aerolclusters.aerolvm.io
+spec:
+  group: aerolvm.io
+  names:
+    kind: AerolCluster
+    listKind: AerolClusterList
+    plural: aerolclusters
+    shortNames:
+    - ac
+    singular: aerolcluster
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.version
+      name: Version
+      type: string
+    - jsonPath: .status.version
+      name: Running
+      type: string
+    - jsonPath: .status.phase
+      name: Phase
+      type: string
+    - jsonPath: .status.servers.ready
+      name: Servers
+      type: integer
+    - jsonPath: .status.workers.ready
+      name: Workers
+      type: integer
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: AerolCluster is one AerolVM cell.
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: |-
+              AerolClusterSpec is one AerolVM cell: its version, zones, servers,
+              gateways and worker pools (plans/kubernetes-v2-architecture.md §10.1).
+            properties:
+              cell:
+                default: 1
+                description: |-
+                  Cell is this cluster's number, 1 to 255. It goes into every new
+                  sandbox ID (C12), so it never changes after the cluster starts.
+                format: int32
+                maximum: 255
+                minimum: 1
+                type: integer
+              edge:
+                description: Edge is the sandbox-link domain and its certificate (C25).
+                properties:
+                  domain:
+                    description: 'Domain is the wildcard''s base: links are <id>-<port>.<domain>.'
+                    type: string
+                  issuerRef:
+                    description: IssuerRef is the cert-manager issuer of the wildcard
+                      certificate.
+                    properties:
+                      kind:
+                        enum:
+                        - Issuer
+                        - ClusterIssuer
+                        type: string
+                      name:
+                        type: string
+                    required:
+                    - kind
+                    - name
+                    type: object
+                  tlsSecret:
+                    description: |-
+                      TLSSecret holds the wildcard certificate in the AerolCluster's
+                      namespace. The operator keeps a copy, its certificate and key only,
+                      in the worker namespace, where worker pods mount it: a Secret volume
+                      is namespaced, and a second Certificate would be a second issuance.
+                    type: string
+                type: object
+              gateways:
+                description: Gateways serve the API, sandbox links, SSH and TLS ports
+                  (C11).
+                properties:
+                  gatewayRef:
+                    description: |-
+                      GatewayRef puts the gateways behind the bank's own Gateway API
+                      Gateway instead of a load balancer (§7.1).
+                    properties:
+                      name:
+                        type: string
+                      namespace:
+                        type: string
+                    required:
+                    - name
+                    type: object
+                  maxReplicas:
+                    format: int32
+                    type: integer
+                  minReplicas:
+                    description: MinReplicas is at least one per zone.
+                    format: int32
+                    minimum: 1
+                    type: integer
+                  nodeSelector:
+                    additionalProperties:
+                      type: string
+                    type: object
+                  resources:
+                    description: ResourceRequirements describes the compute resource
+                      requirements.
+                    properties:
+                      claims:
+                        description: |-
+                          Claims lists the names of resources, defined in spec.resourceClaims,
+                          that are used by this container.
+
+                          This field depends on the
+                          DynamicResourceAllocation feature gate.
+
+                          This field is immutable. It can only be set for containers.
+                        items:
+                          description: ResourceClaim references one entry in PodSpec.ResourceClaims.
+                          properties:
+                            name:
+                              description: |-
+                                Name must match the name of one entry in pod.spec.resourceClaims of
+                                the Pod where this field is used. It makes that resource available
+                                inside a container.
+                              type: string
+                            request:
+                              description: |-
+                                Request is the name chosen for a request in the referenced claim.
+                                If empty, everything from the claim is made available, otherwise
+                                only the result of this request.
+                              type: string
+                          required:
+                          - name
+                          type: object
+                        type: array
+                        x-kubernetes-list-map-keys:
+                        - name
+                        x-kubernetes-list-type: map
+                      limits:
+                        additionalProperties:
+                          anyOf:
+                          - type: integer
+                          - type: string
+                          pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                          x-kubernetes-int-or-string: true
+                        description: |-
+                          Limits describes the maximum amount of compute resources allowed.
+                          More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
+                        type: object
+                      requests:
+                        additionalProperties:
+                          anyOf:
+                          - type: integer
+                          - type: string
+                          pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                          x-kubernetes-int-or-string: true
+                        description: |-
+                          Requests describes the minimum amount of compute resources required.
+                          If Requests is omitted for a container, it defaults to Limits if that is explicitly specified,
+                          otherwise to an implementation-defined value. Requests cannot exceed Limits.
+                          More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
+                        type: object
+                    type: object
+                  service:
+                    description: Service is the gateways' own load balancer. Ignored
+                      with GatewayRef.
+                    properties:
+                      annotations:
+                        additionalProperties:
+                          type: string
+                        type: object
+                      type:
+                        default: LoadBalancer
+                        description: Service Type string describes ingress methods
+                          for a service
+                        type: string
+                    type: object
+                  tolerations:
+                    items:
+                      description: |-
+                        The pod this Toleration is attached to tolerates any taint that matches
+                        the triple <key,value,effect> using the matching operator <operator>.
+                      properties:
+                        effect:
+                          description: |-
+                            Effect indicates the taint effect to match. Empty means match all taint effects.
+                            When specified, allowed values are NoSchedule, PreferNoSchedule and NoExecute.
+                          type: string
+                        key:
+                          description: |-
+                            Key is the taint key that the toleration applies to. Empty means match all taint keys.
+                            If the key is empty, operator must be Exists; this combination means to match all values and all keys.
+                          type: string
+                        operator:
+                          description: |-
+                            Operator represents a key's relationship to the value.
+                            Valid operators are Exists, Equal, Lt, and Gt. Defaults to Equal.
+                            Exists is equivalent to wildcard for value, so that a pod can
+                            tolerate all taints of a particular category.
+                            Lt and Gt perform numeric comparisons (requires feature gate TaintTolerationComparisonOperators).
+                          type: string
+                        tolerationSeconds:
+                          description: |-
+                            TolerationSeconds represents the period of time the toleration (which must be
+                            of effect NoExecute, otherwise this field is ignored) tolerates the taint. By default,
+                            it is not set, which means tolerate the taint forever (do not evict). Zero and
+                            negative values will be treated as 0 (evict immediately) by the system.
+                          format: int64
+                          type: integer
+                        value:
+                          description: |-
+                            Value is the taint value the toleration matches to.
+                            If the operator is Exists, the value should be empty, otherwise just a regular string.
+                          type: string
+                      type: object
+                    type: array
+                required:
+                - minReplicas
+                type: object
+              images:
+                description: Images says where the images come from.
+                properties:
+                  pullPolicy:
+                    description: PullPolicy describes a policy for if/when to pull
+                      a container image
+                    type: string
+                  pullSecrets:
+                    items:
+                      description: |-
+                        LocalObjectReference contains enough information to let you locate the
+                        referenced object inside the same namespace.
+                      properties:
+                        name:
+                          default: ""
+                          description: |-
+                            Name of the referent.
+                            This field is effectively required, but due to backwards compatibility is
+                            allowed to be empty. Instances of this type with an empty value here are
+                            almost certainly wrong.
+                            More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                          type: string
+                      type: object
+                      x-kubernetes-map-type: atomic
+                    type: array
+                  registry:
+                    default: ghcr.io/aerol-ai
+                    description: |-
+                      Registry holds aerolvm, aerolvm-runtime and aerolvm-edge, tagged by
+                      version. A bank's own registry mirrors them (`aerolvm release pull
+                      --images`).
+                    type: string
+                type: object
+              security:
+                description: Security holds node identity and secret settings.
+                properties:
+                  createPolicy:
+                    description: CreatePolicy is a ConfigMap rendered as SB_CREATE_POLICY_FILE.
+                    properties:
+                      name:
+                        default: ""
+                        description: |-
+                          Name of the referent.
+                          This field is effectively required, but due to backwards compatibility is
+                          allowed to be empty. Instances of this type with an empty value here are
+                          almost certainly wrong.
+                          More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                        type: string
+                    type: object
+                    x-kubernetes-map-type: atomic
+                  externalCA:
+                    description: |-
+                      ExternalCA gets every pod's node certificate from the bank's issuer
+                      through cert-manager instead of a join token (R2). Not built yet: an
+                      AerolCluster that sets it is refused with a reason.
+                    properties:
+                      issuerRef:
+                        description: IssuerRef names a cert-manager issuer.
+                        properties:
+                          kind:
+                            enum:
+                            - Issuer
+                            - ClusterIssuer
+                            type: string
+                          name:
+                            type: string
+                        required:
+                        - kind
+                        - name
+                        type: object
+                    required:
+                    - issuerRef
+                    type: object
+                type: object
+              servers:
+                description: 'Servers are the Raft servers: three or five, one zone
+                  each.'
+                properties:
+                  count:
+                    default: 3
+                    description: |-
+                      Count is 3 or 5. Three survive any one zone; five survive any one
+                      zone or any two servers (§11).
+                    enum:
+                    - 3
+                    - 5
+                    format: int32
+                    type: integer
+                  nodeSelector:
+                    additionalProperties:
+                      type: string
+                    type: object
+                  resources:
+                    description: ResourceRequirements describes the compute resource
+                      requirements.
+                    properties:
+                      claims:
+                        description: |-
+                          Claims lists the names of resources, defined in spec.resourceClaims,
+                          that are used by this container.
+
+                          This field depends on the
+                          DynamicResourceAllocation feature gate.
+
+                          This field is immutable. It can only be set for containers.
+                        items:
+                          description: ResourceClaim references one entry in PodSpec.ResourceClaims.
+                          properties:
+                            name:
+                              description: |-
+                                Name must match the name of one entry in pod.spec.resourceClaims of
+                                the Pod where this field is used. It makes that resource available
+                                inside a container.
+                              type: string
+                            request:
+                              description: |-
+                                Request is the name chosen for a request in the referenced claim.
+                                If empty, everything from the claim is made available, otherwise
+                                only the result of this request.
+                              type: string
+                          required:
+                          - name
+                          type: object
+                        type: array
+                        x-kubernetes-list-map-keys:
+                        - name
+                        x-kubernetes-list-type: map
+                      limits:
+                        additionalProperties:
+                          anyOf:
+                          - type: integer
+                          - type: string
+                          pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                          x-kubernetes-int-or-string: true
+                        description: |-
+                          Limits describes the maximum amount of compute resources allowed.
+                          More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
+                        type: object
+                      requests:
+                        additionalProperties:
+                          anyOf:
+                          - type: integer
+                          - type: string
+                          pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                          x-kubernetes-int-or-string: true
+                        description: |-
+                          Requests describes the minimum amount of compute resources required.
+                          If Requests is omitted for a container, it defaults to Limits if that is explicitly specified,
+                          otherwise to an implementation-defined value. Requests cannot exceed Limits.
+                          More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
+                        type: object
+                    type: object
+                  storage:
+                    description: |-
+                      Storage is each server's disk. It cannot move between zones, so each
+                      server is pinned to its zone.
+                    properties:
+                      size:
+                        anyOf:
+                        - type: integer
+                        - type: string
+                        default: 20Gi
+                        pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                        x-kubernetes-int-or-string: true
+                      storageClassName:
+                        type: string
+                    required:
+                    - size
+                    type: object
+                  tolerations:
+                    items:
+                      description: |-
+                        The pod this Toleration is attached to tolerates any taint that matches
+                        the triple <key,value,effect> using the matching operator <operator>.
+                      properties:
+                        effect:
+                          description: |-
+                            Effect indicates the taint effect to match. Empty means match all taint effects.
+                            When specified, allowed values are NoSchedule, PreferNoSchedule and NoExecute.
+                          type: string
+                        key:
+                          description: |-
+                            Key is the taint key that the toleration applies to. Empty means match all taint keys.
+                            If the key is empty, operator must be Exists; this combination means to match all values and all keys.
+                          type: string
+                        operator:
+                          description: |-
+                            Operator represents a key's relationship to the value.
+                            Valid operators are Exists, Equal, Lt, and Gt. Defaults to Equal.
+                            Exists is equivalent to wildcard for value, so that a pod can
+                            tolerate all taints of a particular category.
+                            Lt and Gt perform numeric comparisons (requires feature gate TaintTolerationComparisonOperators).
+                          type: string
+                        tolerationSeconds:
+                          description: |-
+                            TolerationSeconds represents the period of time the toleration (which must be
+                            of effect NoExecute, otherwise this field is ignored) tolerates the taint. By default,
+                            it is not set, which means tolerate the taint forever (do not evict). Zero and
+                            negative values will be treated as 0 (evict immediately) by the system.
+                          format: int64
+                          type: integer
+                        value:
+                          description: |-
+                            Value is the taint value the toleration matches to.
+                            If the operator is Exists, the value should be empty, otherwise just a regular string.
+                          type: string
+                      type: object
+                    type: array
+                required:
+                - count
+                - storage
+                type: object
+              version:
+                description: |-
+                  Version is the AerolVM release every node runs, such as v0.7.2. It is
+                  the one place that sets the version on Kubernetes (eng review D6):
+                  raising it starts an upgrade, lowering it rolls back.
+                pattern: ^v[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$
+                type: string
+              workerPools:
+                description: WorkerPools run the sandboxes, one worker pod per machine.
+                items:
+                  description: WorkerPoolSpec is one kind of worker machine.
+                  properties:
+                    decommission:
+                      description: DecommissionSpec times a worker's decommission
+                        (§10.5).
+                      properties:
+                        deadline:
+                          description: |-
+                            Deadline is when what could not move is stopped, counted from the
+                            start. Default 45m.
+                          type: string
+                        drainWindow:
+                          description: |-
+                            DrainWindow is the time sandboxes get to end by themselves before
+                            the moves start. Default 15m (5m on eks-managed pools, §10.6).
+                          type: string
+                      type: object
+                    headroomPercent:
+                      description: |-
+                        HeadroomPercent is how much of each zone's room is kept free; the
+                        operator adds a worker when a zone has less (§10.4).
+                      format: int32
+                      maximum: 90
+                      minimum: 0
+                      type: integer
+                    images:
+                      description: Images are pulled before a new worker says it is
+                        ready.
+                      items:
+                        type: string
+                      type: array
+                    machine:
+                      description: |-
+                        Machine is the size of one machine; the worker pod asks for nearly
+                        all of it (§8.1).
+                      properties:
+                        cpu:
+                          format: int32
+                          minimum: 1
+                          type: integer
+                        memoryGiB:
+                          format: int32
+                          minimum: 1
+                          type: integer
+                      required:
+                      - cpu
+                      - memoryGiB
+                      type: object
+                    maxWorkers:
+                      format: int32
+                      minimum: 0
+                      type: integer
+                    minWorkers:
+                      description: MinWorkers is the floor, spread across the zones.
+                      format: int32
+                      minimum: 0
+                      type: integer
+                    name:
+                      maxLength: 40
+                      pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
+                      type: string
+                    nodeSelector:
+                      additionalProperties:
+                        type: string
+                      description: |-
+                        NodeSelector picks the pool's machines, such as
+                        {aerolvm.io/pool: gvisor-general}.
+                      type: object
+                    provisioner:
+                      default: none
+                      description: |-
+                        Provisioner says who brings machines and sets the decommission
+                        deadline: karpenter, nap, eks-managed, aks-pool or none.
+                      enum:
+                      - karpenter
+                      - nap
+                      - eks-managed
+                      - aks-pool
+                      - none
+                      type: string
+                    runtimes:
+                      description: 'Runtimes this pool runs: runc and gvisor today.'
+                      items:
+                        type: string
+                      type: array
+                    tolerations:
+                      items:
+                        description: |-
+                          The pod this Toleration is attached to tolerates any taint that matches
+                          the triple <key,value,effect> using the matching operator <operator>.
+                        properties:
+                          effect:
+                            description: |-
+                              Effect indicates the taint effect to match. Empty means match all taint effects.
+                              When specified, allowed values are NoSchedule, PreferNoSchedule and NoExecute.
+                            type: string
+                          key:
+                            description: |-
+                              Key is the taint key that the toleration applies to. Empty means match all taint keys.
+                              If the key is empty, operator must be Exists; this combination means to match all values and all keys.
+                            type: string
+                          operator:
+                            description: |-
+                              Operator represents a key's relationship to the value.
+                              Valid operators are Exists, Equal, Lt, and Gt. Defaults to Equal.
+                              Exists is equivalent to wildcard for value, so that a pod can
+                              tolerate all taints of a particular category.
+                              Lt and Gt perform numeric comparisons (requires feature gate TaintTolerationComparisonOperators).
+                            type: string
+                          tolerationSeconds:
+                            description: |-
+                              TolerationSeconds represents the period of time the toleration (which must be
+                              of effect NoExecute, otherwise this field is ignored) tolerates the taint. By default,
+                              it is not set, which means tolerate the taint forever (do not evict). Zero and
+                              negative values will be treated as 0 (evict immediately) by the system.
+                            format: int64
+                            type: integer
+                          value:
+                            description: |-
+                              Value is the taint value the toleration matches to.
+                              If the operator is Exists, the value should be empty, otherwise just a regular string.
+                            type: string
+                        type: object
+                      type: array
+                    zoneLossReservePercent:
+                      description: |-
+                        ZoneLossReservePercent is extra room per zone, so more of a lost
+                        zone's recreate sandboxes come back quickly (RQ15).
+                      format: int32
+                      maximum: 90
+                      minimum: 0
+                      type: integer
+                  required:
+                  - machine
+                  - maxWorkers
+                  - minWorkers
+                  - name
+                  type: object
+                minItems: 1
+                type: array
+              zones:
+                description: |-
+                  Zones the cluster spreads over, such as [eu-west-1a, eu-west-1b,
+                  eu-west-1c]. Servers go one per zone; gateways and workers spread
+                  across them.
+                items:
+                  type: string
+                minItems: 1
+                type: array
+            required:
+            - gateways
+            - servers
+            - version
+            - workerPools
+            - zones
+            type: object
+          status:
+            description: AerolClusterStatus is what the operator saw last.
+            properties:
+              conditions:
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+              gateways:
+                description: TierStatus counts one tier's nodes.
+                properties:
+                  desired:
+                    format: int32
+                    type: integer
+                  ready:
+                    format: int32
+                    type: integer
+                required:
+                - desired
+                - ready
+                type: object
+              observedGeneration:
+                format: int64
+                type: integer
+              phase:
+                description: Phase is Bootstrapping, Ready, Upgrading or Degraded.
+                type: string
+              rollout:
+                description: Rollout is AerolVM's own upgrade record, when one exists.
+                properties:
+                  id:
+                    type: string
+                  state:
+                    type: string
+                  target:
+                    type: string
+                type: object
+              servers:
+                description: TierStatus counts one tier's nodes.
+                properties:
+                  desired:
+                    format: int32
+                    type: integer
+                  ready:
+                    format: int32
+                    type: integer
+                required:
+                - desired
+                - ready
+                type: object
+              version:
+                description: Version is the version every node runs, once they all
+                  agree.
+                type: string
+              workers:
+                description: TierStatus counts one tier's nodes.
+                properties:
+                  desired:
+                    format: int32
+                    type: integer
+                  ready:
+                    format: int32
+                    type: integer
+                required:
+                - desired
+                - ready
+                type: object
+            type: object
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

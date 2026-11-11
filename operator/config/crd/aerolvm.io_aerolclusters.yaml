@@ -92,6 +92,13 @@ spec:
                     - kind
                     - name
                     type: object
+                  tlsSecret:
+                    description: |-
+                      TLSSecret holds the wildcard certificate in the AerolCluster's
+                      namespace. The operator keeps a copy, its certificate and key only,
+                      in the worker namespace, where worker pods mount it: a Secret volume
+                      is namespaced, and a second Certificate would be a second issuance.
+                    type: string
                 type: object
               gateways:
                 description: Gateways serve the API, sandbox links, SSH and TLS ports

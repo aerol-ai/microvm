@@ -1,0 +1,221 @@
+{{- if eq .Values.mode "cluster" }}
+{{- $name := include "aerolvm.name" . }}
+{{- $op := printf "%s-operator" $name }}
+{{- $workerNS := .Values.cluster.workerNamespace }}
+# The operator (plans/kubernetes-v2-architecture.md §7.4): the only AerolVM
+# part that writes to the Kubernetes API while the cluster runs. Two
+# replicas, one leader. Its rights (§15.1): its own namespace and the worker
+# namespace (pods, the join-token Secrets, Services, volume claims), Nodes
+# and Karpenter NodeClaims (read; a NodeClaim deleted to return an emptied
+# machine), and its own objects. No other pod of AerolVM has any.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $op }}
+  labels:
+    {{- include "aerolvm.labels" . | nindent 4 }}
+    app.kubernetes.io/component: operator
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ $op }}
+  labels:
+    {{- include "aerolvm.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: [nodes]
+    verbs: [get, list, watch]
+  - apiGroups: [karpenter.sh]
+    resources: [nodeclaims]
+    verbs: [get, list, watch, delete]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ $op }}
+  labels:
+    {{- include "aerolvm.labels" . | nindent 4 }}
+roleRef: { apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: {{ $op }} }
+subjects:
+  - { kind: ServiceAccount, name: {{ $op }}, namespace: {{ .Release.Namespace }} }
+{{- range $ns := list .Release.Namespace $workerNS | uniq }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ $op }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "aerolvm.labels" $ | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: [pods, secrets, services, configmaps, persistentvolumeclaims]
+    verbs: [get, list, watch, create, update, patch, delete]
+  - apiGroups: [""]
+    resources: [events]
+    verbs: [create, patch]
+  - apiGroups: [aerolvm.io]
+    resources: [aerolclusters, aerolnodes]
+    verbs: [get, list, watch, create, update, patch, delete]
+  - apiGroups: [aerolvm.io]
+    resources: [aerolclusters/status, aerolnodes/status]
+    verbs: [get, update, patch]
+  - apiGroups: [coordination.k8s.io]
+    resources: [leases]
+    verbs: [get, list, watch, create, update, patch, delete]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $op }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "aerolvm.labels" $ | nindent 4 }}
+roleRef: { apiGroup: rbac.authorization.k8s.io, kind: Role, name: {{ $op }} }
+subjects:
+  - { kind: ServiceAccount, name: {{ $op }}, namespace: {{ $.Release.Namespace }} }
+{{- end }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $op }}
+  labels:
+    {{- include "aerolvm.labels" . | nindent 4 }}
+    app.kubernetes.io/component: operator
+spec:
+  replicas: {{ .Values.cluster.operator.replicas }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: aerolvm
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: operator
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: aerolvm
+        app.kubernetes.io/instance: {{ .Release.Name }}
+        app.kubernetes.io/component: operator
+    spec:
+      serviceAccountName: {{ $op }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile: { type: RuntimeDefault }
+      {{- with .Values.cluster.operator.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.cluster.operator.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: operator
+          image: {{ include "aerolvm.image" (dict "root" . "name" "aerolvm-operator") }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - --namespace={{ .Release.Namespace }}
+            - --worker-namespace={{ $workerNS }}
+            - --pod-templates={{ $name }}-pod-templates
+            - --service-account={{ $op }}
+          ports:
+            - { name: webhook, containerPort: 9443 }
+            - { name: metrics, containerPort: 8080 }
+            - { name: probes, containerPort: 8081 }
+          livenessProbe:
+            httpGet: { path: /healthz, port: probes }
+          readinessProbe:
+            httpGet: { path: /readyz, port: probes }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+          resources:
+            {{- toYaml .Values.cluster.operator.resources | nindent 12 }}
+          volumeMounts:
+            - { name: webhook-cert, mountPath: /etc/aerolvm-operator/webhook, readOnly: true }
+      volumes:
+        - name: webhook-cert
+          secret:
+            secretName: {{ $op }}-webhook
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $op }}
+  labels:
+    {{- include "aerolvm.labels" . | nindent 4 }}
+    app.kubernetes.io/component: operator
+spec:
+  selector:
+    app.kubernetes.io/name: aerolvm
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: operator
+  ports:
+    - { name: webhook, port: 443, targetPort: webhook }
+    - { name: metrics, port: 8080, targetPort: metrics }
+---
+# The webhook's own certificate, from a self-signed issuer: only the API
+# server calls it, and cert-manager hands the API server the CA.
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: {{ $op }}-selfsigned
+  labels:
+    {{- include "aerolvm.labels" . | nindent 4 }}
+spec:
+  selfSigned: {}
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: {{ $op }}-webhook
+  labels:
+    {{- include "aerolvm.labels" . | nindent 4 }}
+spec:
+  secretName: {{ $op }}-webhook
+  dnsNames:
+    - {{ $op }}.{{ .Release.Namespace }}.svc
+    - {{ $op }}.{{ .Release.Namespace }}.svc.cluster.local
+  issuerRef: { name: {{ $op }}-selfsigned, kind: Issuer }
+---
+# The worker-pod delete guard (C26, eng review D5). failurePolicy Ignore: an
+# operator outage never blocks a cluster repair; a worker pod lost without
+# a decommission raises an alert instead.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingWebhookConfiguration
+metadata:
+  name: {{ $op }}-worker-pod-guard
+  labels:
+    {{- include "aerolvm.labels" . | nindent 4 }}
+  annotations:
+    cert-manager.io/inject-ca-from: {{ .Release.Namespace }}/{{ $op }}-webhook
+webhooks:
+  - name: worker-pod-delete.aerolvm.io
+    admissionReviewVersions: [v1]
+    sideEffects: None
+    failurePolicy: Ignore
+    timeoutSeconds: 5
+    clientConfig:
+      service:
+        name: {{ $op }}
+        namespace: {{ .Release.Namespace }}
+        path: /validate-worker-pod-delete
+        port: 443
+    rules:
+      - apiGroups: [""]
+        apiVersions: [v1]
+        operations: [DELETE]
+        resources: [pods]
+        scope: Namespaced
+    namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: {{ $workerNS }}
+    objectSelector:
+      matchLabels:
+        app.kubernetes.io/name: aerolvm
+        app.kubernetes.io/component: worker
+{{- end }}

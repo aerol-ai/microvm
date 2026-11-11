@@ -183,6 +183,10 @@ func Stamp(t corev1.PodTemplateSpec, in StampInput) (*corev1.Pod, error) {
 	if n.Spec.Pool != "" {
 		pod.Labels[LabelPool] = n.Spec.Pool
 	}
+	if n.Spec.Zone != "" {
+		// Dashboards and the headroom alert group by zone (P9).
+		pod.Labels[LabelZone] = n.Spec.Zone
+	}
 
 	for i := range pod.Spec.Containers {
 		setReleaseImage(&pod.Spec.Containers[i], c.Spec.Images.Registry, in.Version)

@@ -106,7 +106,7 @@ func run(args []string) error {
 		return err
 	}
 	rec := mgr.GetEventRecorderFor("aerolvm-operator")
-	if err := (&controller.ClusterReconciler{Client: mgr.GetClient(), Scheme: scheme, Recorder: rec}).SetupWithManager(mgr); err != nil {
+	if err := (&controller.ClusterReconciler{Client: mgr.GetClient(), Scheme: scheme, Recorder: rec, WorkerNamespace: o.workerNamespace}).SetupWithManager(mgr); err != nil {
 		return err
 	}
 	if err := (&controller.NodeReconciler{
