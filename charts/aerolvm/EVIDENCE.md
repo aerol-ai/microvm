@@ -135,7 +135,9 @@ sets it is refused with a reason.
 
 | From | To | Allowed | Enforced by |
 |---|---|---|---|
-| Clients | Gateways | Through the gateways' load balancer, or your own Gateway API Gateway | Your load balancer |
+| Clients | Gateways | The client ports only (the API, SSH, and 443 and 80 with the edge), through the gateways' load balancer or your own Gateway API Gateway | Your load balancer; NetworkPolicy `<release>-gateway-ingress` |
+| Anything but AerolVM's pods | Gateways' cluster ports, servers | Nothing (Prometheus may read the servers' metrics) | NetworkPolicies `<release>-gateway-ingress`, `<release>-server-ingress` |
+| The API server | The operator | Its webhook port only | NetworkPolicy `<release>-operator-ingress` |
 | Gateways | Workers | Forwarded requests, over mutual TLS | NetworkPolicy `<release>-worker-ingress`; mTLS |
 | Servers, other workers | Workers | Raft, gossip and the internal port | Same |
 | Prometheus | Workers | The metrics port only, from the namespace you name | Same |
@@ -152,9 +154,17 @@ with network policy turned on, or Calico or Cilium).
 - Without the edge, clients reach the gateways' API over plain HTTP inside
   the cluster. Turn the edge on for HTTPS (the bank preset does).
 - The operator reaches the servers' API over plain HTTP inside the cluster,
-  with the admin token. There is no NetworkPolicy around the servers and
-  gateways yet, so any pod in the cluster can reach those ports; every call
-  still needs a valid token.
+  with the admin token. Only AerolVM's own pods can reach that port.
+- A NetworkPolicy sees a sandbox's traffic as its worker pod's, and worker
+  pods may reach the servers and each other. So a sandbox whose create
+  opens the cluster's pod range (`network_allow_out`) can reach those ports.
+  It still cannot use them: Raft and the internal port take only the
+  cluster's node certificates (mutual TLS), gossip only the cluster's
+  gossip key, and the API a token. Leave the pod range closed (it is by
+  default; no sandbox needs it). The create policy cannot refuse it yet.
+- `networkPolicy.extraIngressFrom` adds callers to the workers' wall only.
+  The servers, the gateways' cluster ports and the operator take no extra
+  callers: nothing outside AerolVM needs them.
 
 ## 5. Data flows
 
@@ -254,7 +264,8 @@ cert-manager and Prometheus.
 Run `aerolvm k8s verify --namespace <release namespace> --worker-namespace
 aerolvm-workers --release <Helm release> --cluster <AerolCluster name>`. It
 exits 1 on any failed rule. Rules about the cluster layout (the release
-namespace's label, the worker ingress policy) run in cluster mode only; the
+namespace's label, the worker and server ingress policies) run in cluster
+mode only; the
 Gateway rules run when the chart made Gateway API routes
 (`cluster.gateways.gatewayRef`); the probe runs once per runtime.
 
@@ -269,6 +280,7 @@ Gateway rules run when the chart made Gateway API routes
 - the release namespace enforces restricted Pod Security
 - a NetworkPolicy limits the worker pods' egress
 - a NetworkPolicy limits who reaches the worker pods
+- a NetworkPolicy limits who reaches the servers
 - worker machines allow IMDSv2 only, with a hop limit of 1
 - the Gateway accepted every AerolVM route
 - the sandbox-link listener passes TLS through

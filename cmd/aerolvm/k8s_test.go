@@ -357,6 +357,11 @@ const (
   "ingress":[{"from":[{"namespaceSelector":{"matchLabels":{"kubernetes.io/metadata.name":"aerolvm-system"}},"podSelector":{"matchLabels":{"aerolvm.io/cluster":"prod"}}},
       {"podSelector":{"matchLabels":{"aerolvm.io/cluster":"prod","app.kubernetes.io/component":"worker"}}}]},
     {"from":[{"namespaceSelector":{"matchLabels":{"kubernetes.io/metadata.name":"monitoring"}}},{"ipBlock":{"cidr":"10.50.0.0/16"}},{"ipBlock":{"cidr":"nope"}}],"ports":[{"port":21212}]}]}}]}`
+	// The release namespace's policies: the servers' ingress wall.
+	k8sClusterReleasePolicy = `{"items":[{"metadata":{"name":"prod-server-ingress"},"spec":{
+  "podSelector":{"matchLabels":{"aerolvm.io/cluster":"prod","app.kubernetes.io/component":"server"}},
+  "policyTypes":["Ingress"],
+  "ingress":[{"from":[{"namespaceSelector":{"matchLabels":{"kubernetes.io/metadata.name":"aerolvm-system"}},"podSelector":{"matchLabels":{"aerolvm.io/cluster":"prod"}}}]}]}}]}`
 	k8sClusterIMDS = `{"Reservations":[{"Instances":[{"InstanceId":"i-0w1","MetadataOptions":{"HttpTokens":"required","HttpPutResponseHopLimit":1,"HttpEndpoint":"enabled"}}]}]}`
 )
 
@@ -386,6 +391,7 @@ func k8sRouteJSON(name, parent, hostnames, conditions string) string {
 func clusterK8s() *fakeK8s {
 	f := goodK8s()
 	f.pods, f.workerPods, f.workerPolicy = k8sClusterPods, k8sClusterWorkers, k8sClusterWorkerPolicy
+	f.policies = k8sClusterReleasePolicy
 	f.namespaces = map[string]string{"aerolvm-system": k8sNamespaceLabelled("restricted"), k8sWorkerNS: k8sNamespaceLabelled("privileged")}
 	f.nodes = "ip-10-0-2-7.eu-west-1.compute.internal\taws:///eu-west-1b/i-0w1\n"
 	f.awsOut = k8sClusterIMDS
@@ -410,7 +416,7 @@ func TestK8sVerifyClusterModePasses(t *testing.T) {
 		}
 	}
 	got := k8sResults(checks)
-	if len(checks) != 15 || got[k8sReleaseNSCheck] == "" || got[k8sRoutesAccepted] == "" || got[k8sLinksPassthrough] == "" {
+	if len(checks) != 16 || got[k8sReleaseNSCheck] == "" || got[k8sRoutesAccepted] == "" || got[k8sLinksPassthrough] == "" {
 		t.Fatalf("%d checks: %+v", len(checks), checks)
 	}
 	for check, want := range map[string]string{
@@ -419,6 +425,7 @@ func TestK8sVerifyClusterModePasses(t *testing.T) {
 		k8sPrivilegedCheck:   "pass: 1 worker pod(s) in namespace aerolvm-workers",
 		k8sPolicyCheck:       "pass: prod-worker-a (prod-worker-egress)",
 		k8sRuleIngress:       "pass: prod-worker-a (prod-worker-ingress)",
+		k8sRuleServerIngress: "pass: prod-server-0 (prod-server-ingress)",
 		k8sIMDSCheck:         "pass: 1 EC2 instance(s)",
 		k8sRoutesAccepted:    "pass: HTTPRoute prod-api, TLSRoute prod-links, TCPRoute prod-ssh",
 		k8sLinksPassthrough:  "pass: Gateway infra/bank-gw listener links",
@@ -485,6 +492,12 @@ func TestK8sVerifyClusterModeFailures(t *testing.T) {
 			f: with(func(f *fakeK8s) { f.namespaces[k8sWorkerNS] = k8sNamespaceLabelled("restricted") })},
 		{name: "no policy in the worker namespace", check: k8sPolicyCheck, want: "fail: prod-worker-a: no NetworkPolicy limits its egress",
 			f: with(func(f *fakeK8s) { f.workerPolicy = `{"items":[]}` })},
+		{name: "no policy limits who reaches the servers", check: k8sRuleServerIngress, want: "fail: prod-server-0: no NetworkPolicy limits who reaches it",
+			f: with(func(f *fakeK8s) { f.policies = `{"items":[]}` })},
+		{name: "a server policy that lets in every pod", check: k8sRuleServerIngress, want: "fail: prod-server-0: NetworkPolicy prod-server-ingress lets every pod in the cluster reach the pod",
+			f: with(func(f *fakeK8s) {
+				f.policies = strings.Replace(k8sClusterReleasePolicy, `"ingress":[`, `"ingress":[{"from":[{"namespaceSelector":{},"podSelector":{}}]},`, 1)
+			})},
 		{name: "no policy limits who reaches the worker", check: k8sRuleIngress, want: "fail: prod-worker-a: no NetworkPolicy limits who reaches it",
 			f: with(func(f *fakeK8s) {
 				f.workerPolicy = strings.Replace(k8sClusterWorkerPolicy, `"policyTypes":["Ingress"]`, `"policyTypes":["Egress"]`, 1)

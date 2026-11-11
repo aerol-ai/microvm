@@ -129,7 +129,8 @@ networkPolicy:
   extraEgressCIDRs: []
   # Cluster mode only: who else may reach a worker pod, as NetworkPolicy
   # peers. The gateways, servers, other workers and (with monitoring on)
-  # Prometheus are already allowed; nothing else needs to.
+  # Prometheus are already allowed; nothing else needs to. Workers only:
+  # the servers, gateways' cluster ports and operator take no extra peers.
   extraIngressFrom: []
 
 # Sandbox links and the API over HTTPS (C25): an edge container runs

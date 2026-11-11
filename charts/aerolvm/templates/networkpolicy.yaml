@@ -119,5 +119,86 @@ spec:
     - from:
         {{- toYaml . | nindent 8 }}
     {{- end }}
+---
+# Who may reach the servers in cluster mode (§15.3): this install's own
+# pods (other servers, the gateways, the operator, the workers) and
+# Prometheus on the API port. Nothing else in the cluster: the servers hold
+# the cluster's state and the admin token.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "aerolvm.name" . }}-server-ingress
+  labels:
+    {{- include "aerolvm.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: aerolvm
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: server
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        {{- include "aerolvm.installPeers" . | nindent 8 }}
+    {{- if .Values.monitoring.enabled }}
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.monitoring.prometheusNamespace }}
+      ports:
+        - { protocol: TCP, port: 21212 }
+    {{- end }}
+---
+# The gateways take every client's request: anyone may reach their client
+# ports (the API, SSH, and HTTPS and HTTP with the edge). The cluster ports
+# (gossip, the internal mTLS port) are this install's pods' only.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "aerolvm.name" . }}-gateway-ingress
+  labels:
+    {{- include "aerolvm.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: aerolvm
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: gateway
+  policyTypes: [Ingress]
+  ingress:
+    - ports:
+        - { protocol: TCP, port: 21212 }
+        - { protocol: TCP, port: 2220 }
+        - { protocol: TCP, port: 443 }
+        - { protocol: TCP, port: 80 }
+    - from:
+        {{- include "aerolvm.installPeers" . | nindent 8 }}
+---
+# The operator: the API server calls its webhook (the API server has no pod
+# address to name, so the port is open), Prometheus reads its metrics.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "aerolvm.name" . }}-operator-ingress
+  labels:
+    {{- include "aerolvm.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: aerolvm
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: operator
+  policyTypes: [Ingress]
+  ingress:
+    - ports:
+        - { protocol: TCP, port: 9443 }
+    {{- if .Values.monitoring.enabled }}
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.monitoring.prometheusNamespace }}
+      ports:
+        - { protocol: TCP, port: 8080 }
+    {{- end }}
 {{- end }}
 {{- end }}

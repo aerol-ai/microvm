@@ -50,3 +50,21 @@ sandbox traffic: sandboxd and the egress gateway read the same lists. */ -}}
 {{- define "aerolvm.tokenSecret" -}}
 {{- .Values.apiToken.existingSecret | default (printf "%s-api-token" (include "aerolvm.name" .)) -}}
 {{- end -}}
+
+{{- /* NetworkPolicy peers: every pod of this install, the release
+namespace's (servers, gateways, the operator) and the workers. */ -}}
+{{- define "aerolvm.installPeers" -}}
+- namespaceSelector:
+    matchLabels:
+      kubernetes.io/metadata.name: {{ .Release.Namespace }}
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: aerolvm
+      app.kubernetes.io/instance: {{ .Release.Name }}
+- namespaceSelector:
+    matchLabels:
+      kubernetes.io/metadata.name: {{ .Values.cluster.workerNamespace }}
+  podSelector:
+    matchLabels:
+      {{- include "aerolvm.selector" . | nindent 6 }}
+{{- end -}}

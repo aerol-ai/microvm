@@ -61,26 +61,27 @@ const (
 // pack promises is what verify checks. k8sRuleProbe runs once per runtime,
 // with <runtime> filled in.
 const (
-	k8sRuleFound        = "AerolVM pods found"
-	k8sRuleSigned       = "images signed by the AerolVM release workflow"
-	k8sRuleNoHostMounts = "no folders mounted from the machine"
-	k8sRuleNoAPI        = "no Kubernetes API credential in the pods"
-	k8sRuleNoDNSToken   = "no DNS provider token in the pods"
-	k8sRulePrivileged   = "privileged containers only in the worker pods' runtime and agent"
-	k8sRuleWorkerNS     = "the worker namespace's Pod Security label is privileged"
-	k8sRuleReleaseNS    = "the release namespace enforces restricted Pod Security"
-	k8sRuleEgress       = "a NetworkPolicy limits the worker pods' egress"
-	k8sRuleIngress      = "a NetworkPolicy limits who reaches the worker pods"
-	k8sRuleIMDS         = "worker machines allow IMDSv2 only, with a hop limit of 1"
-	k8sRoutesAccepted   = "the Gateway accepted every AerolVM route"
-	k8sLinksPassthrough = "the sandbox-link listener passes TLS through"
-	k8sRuleProbe        = "a <runtime> sandbox cannot reach the worker, another pod or the Kubernetes API"
+	k8sRuleFound         = "AerolVM pods found"
+	k8sRuleSigned        = "images signed by the AerolVM release workflow"
+	k8sRuleNoHostMounts  = "no folders mounted from the machine"
+	k8sRuleNoAPI         = "no Kubernetes API credential in the pods"
+	k8sRuleNoDNSToken    = "no DNS provider token in the pods"
+	k8sRulePrivileged    = "privileged containers only in the worker pods' runtime and agent"
+	k8sRuleWorkerNS      = "the worker namespace's Pod Security label is privileged"
+	k8sRuleReleaseNS     = "the release namespace enforces restricted Pod Security"
+	k8sRuleEgress        = "a NetworkPolicy limits the worker pods' egress"
+	k8sRuleIngress       = "a NetworkPolicy limits who reaches the worker pods"
+	k8sRuleServerIngress = "a NetworkPolicy limits who reaches the servers"
+	k8sRuleIMDS          = "worker machines allow IMDSv2 only, with a hop limit of 1"
+	k8sRoutesAccepted    = "the Gateway accepted every AerolVM route"
+	k8sLinksPassthrough  = "the sandbox-link listener passes TLS through"
+	k8sRuleProbe         = "a <runtime> sandbox cannot reach the worker, another pod or the Kubernetes API"
 )
 
 // k8sVerifyRules is every rule, in the order verify reports them.
 var k8sVerifyRules = []string{
 	k8sRuleFound, k8sRuleSigned, k8sRuleNoHostMounts, k8sRuleNoAPI, k8sRuleNoDNSToken, k8sRulePrivileged,
-	k8sRuleWorkerNS, k8sRuleReleaseNS, k8sRuleEgress, k8sRuleIngress, k8sRuleIMDS, k8sRoutesAccepted,
+	k8sRuleWorkerNS, k8sRuleReleaseNS, k8sRuleEgress, k8sRuleIngress, k8sRuleServerIngress, k8sRuleIMDS, k8sRoutesAccepted,
 	k8sLinksPassthrough, k8sRuleProbe,
 }
 
@@ -400,7 +401,8 @@ func k8sVerify(ctx context.Context, env k8sEnv, o k8sVerifyOptions) []k8sCheck {
 	checks = append(checks, k8sPodSecurity(ctx, env, o)...)
 	checks = append(checks, k8sEgressPolicy(ctx, env, pods))
 	if o.workerNamespace != o.namespace {
-		checks = append(checks, k8sIngressPolicy(ctx, env, pods))
+		checks = append(checks, k8sIngressPolicy(ctx, env, pods, "worker", k8sRuleIngress),
+			k8sIngressPolicy(ctx, env, pods, "server", k8sRuleServerIngress))
 	}
 	checks = append(checks, k8sIMDS(ctx, env, pods))
 	checks = append(checks, k8sGatewayRoutes(ctx, env, o)...)
@@ -726,15 +728,16 @@ func k8sEgressPolicy(ctx context.Context, env k8sEnv, pods []k8sPod) k8sCheck {
 }
 
 // k8sIngressPolicy checks, in cluster mode, that a NetworkPolicy limits who
-// reaches each worker pod (§8.7, wall 3): the chart's lets in only the
-// gateways, servers, other workers and Prometheus. A policy whose rule lets
-// in every pod or every address fails the check, as for egress.
-func k8sIngressPolicy(ctx context.Context, env k8sEnv, pods []k8sPod) k8sCheck {
-	const name = k8sRuleIngress
+// reaches each pod of a role: the workers (§8.7, wall 3) and the servers,
+// which hold the cluster's state and its admin token (§15.3). The chart's
+// let in only this install's pods and Prometheus. A policy whose rule lets
+// in every pod or every address fails the check, as for egress. Gateways
+// are left out: anyone may reach their client ports by design.
+func k8sIngressPolicy(ctx context.Context, env k8sEnv, pods []k8sPod, role, name string) k8sCheck {
 	policies := map[string][]k8sNetworkPolicy{}
 	var bad, ok []string
 	for _, p := range pods {
-		if p.Metadata.Labels[k8sComponent] != "worker" {
+		if p.Metadata.Labels[k8sComponent] != role {
 			continue
 		}
 		ns := p.Metadata.Namespace
@@ -769,7 +772,7 @@ func k8sIngressPolicy(ctx context.Context, env k8sEnv, pods []k8sPod) k8sCheck {
 	case len(bad) > 0:
 		return k8sCheck{Name: name, Result: k8sFail, Detail: strings.Join(bad, "; ")}
 	case len(ok) == 0:
-		return k8sCheck{Name: name, Result: k8sFail, Detail: "no worker pod (label app.kubernetes.io/component=worker) to check"}
+		return k8sCheck{Name: name, Result: k8sFail, Detail: fmt.Sprintf("no %s pod (label app.kubernetes.io/component=%s) to check", role, role)}
 	}
 	return k8sCheck{Name: name, Result: k8sPass, Detail: strings.Join(ok, "; ")}
 }
