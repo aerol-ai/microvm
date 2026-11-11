@@ -87,6 +87,7 @@ You do not need to set these yourself. They help when you read logs or fix probl
 | `SB_NODE_ROLE` | This node's jobs. See [Node roles](#node-roles). Any value but `mixed` needs `SB_ENABLE_CLUSTER=true`. | `mixed` |
 | `SB_NODE_ZONE` | This node's zone, such as `eu-west-1a`. A create can ask for a zone. See [Choose where a sandbox runs](/engineering-placement-failover/#choose-where-a-sandbox-runs). | Empty (no zone) |
 | `SB_NODE_LABELS` | This node's labels, as `key=value` pairs split by commas, such as `tier=pci,gpu=a10`. A create can ask for labels. At most 16 labels. A bad label stops the node from starting. | Empty (no labels) |
+| `SB_CELL_ID` | The cell this cluster belongs to, a number from 1 to 255. New sandbox IDs start with it as two hex digits (cell 7 gives `sb-07…`). Set the same number on every node of a cluster. Leave it at 1 unless you run more than one cell. A value outside 1 to 255 stops the node from starting. | `1` |
 | `SB_CLUSTER_BOOTSTRAP` | `true` only on the seed, `false` on every other node. Only a node whose role has `server`, or is `mixed`, can be the seed. | `false` |
 | `SB_CLUSTER_MAX_AUTO_VOTERS` | The most server nodes that vote. Extra server nodes join as non-voters. `0` means no cap. | `5` |
 
