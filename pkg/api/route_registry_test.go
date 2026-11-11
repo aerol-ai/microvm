@@ -229,6 +229,7 @@ var routePermissions = map[string]string{
 	"POST /v1/cluster/internal/secrets":                       "cluster.internal",
 	"POST /v1/cluster/internal/select-placement":              "cluster.internal",
 	"POST /v1/cluster/nodes/{id}/drain":                       "fleet.admin",
+	"POST /v1/cluster/nodes/{id}/gone":                        "fleet.admin",
 	"POST /v1/cluster/nodes/{id}/cordon":                      "fleet.admin",
 	"POST /v1/cluster/nodes/{id}/storage-retired":             "fleet.admin",
 	"POST /v1/cluster/nodes/{id}/uncordon":                    "fleet.admin",
