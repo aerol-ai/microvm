@@ -98,10 +98,24 @@ to main.
 | C25: the edge container (Caddy) and a cert-manager certificate for the API and sandbox links; sandboxd has Caddy reload a renewed certificate | #1159, #1161 | main, #1158 | Open; **proven live on kind** with cert-manager v1.21.3 and a self-signed issuer: the API and a sandbox link over HTTPS; a renewed certificate served in 22 to 96 s with no restart. Found F15: sandboxd started before Caddy never took :443; the agent now waits for Caddy |
 | Go 1.26.11 for GO-2026-6859 (blocks `go-security` on every PR) | #1143 | main | **Merged** |
 
-Every Phase 1 item now has a PR. Left before Phase 1's exit: the G5
-measurement (a gVisor create in a pod within 10% of the same machine
-without Kubernetes), `cosign verify` against the first release that signs
-the images, and the `kubernetes` CI job once the stack reaches `main`.
+Every Phase 1 item now has a PR. **G5 passes** (run p1-g5, 2026-11-11,
+`integration-tests/k8s/g5.sh`, one m7i.xlarge AL2023 node, a build of every
+Phase 1 PR): cold gVisor creates (warm pool off, each destroyed before the
+next, timed against 127.0.0.1) in the split worker pod (C7 on, Guaranteed,
+the agent at the chart's 500m CPU), then the same binaries on the same
+machine as one plain systemd service:
+
+| Run | Pod p50 / p90 | Machine p50 / p90 | Pod / machine |
+|---|---|---|---|
+| 30 creates | 72 / 76 ms | 68 / 75 ms | 1.06 |
+| 50 creates | 71 / 76 ms | 68 / 71 ms | 1.04 |
+
+The bar is 1.10. Both sides are far under the README's 284 ms gVisor row,
+which is another machine (t3.medium) without the network-namespace pool; G5
+compares one machine with itself. Spend about $0.50 (one cluster, ~1.2 h).
+
+Left before Phase 1's exit: `cosign verify` against the first release that
+signs the images, and the `kubernetes` CI job once the stack reaches `main`.
 C5 (servers and gateways
 under `restricted` pod security) is measured once those pods exist: their
 cluster files cannot come from `sandboxd init` in a pod (finding F14), so
