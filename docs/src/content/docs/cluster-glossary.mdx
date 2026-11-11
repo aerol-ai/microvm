@@ -109,7 +109,7 @@ The server nodes keep their records on disk, so the records survive restarts.
 | Setting | What it does | Default |
 |---|---|---|
 | `SB_RAFT_BIND_ADDR` | The address this node listens on for voting traffic. | `0.0.0.0:7000` |
-| `SB_RAFT_ADVERTISE_ADDR` | The address other nodes use to reach that listener. It must be a real address they can reach, not `0.0.0.0`. `sandboxd init` and `join` set it to `<node IP>:7000`. | The same as `SB_RAFT_BIND_ADDR` |
+| `SB_RAFT_ADVERTISE_ADDR` | The address other nodes use to reach that listener. It must be a real address they can reach, not `0.0.0.0`. `sandboxd init` and `join` set it to `<node IP>:7000`. A DNS name with a port (`server-0.aerolvm.svc:7000`) is kept as a name, so a server that moves to a new IP stays reachable: other nodes look the name up each time they connect. | The same as `SB_RAFT_BIND_ADDR` |
 | `SB_RAFT_DATA_DIR` | Where the node keeps its log of changes, and its snapshots (saved copies of the records). | `/var/lib/sandboxd/raft` (a `raft` folder next to `SB_DB_PATH`) |
 
 ### Node-finding settings (`SB_GOSSIP_*`)
