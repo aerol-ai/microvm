@@ -158,6 +158,10 @@ spec:
             - { name: SB_L4_TLS_LISTEN, value: ":443" }
             - { name: SB_L4_TLS_FALLBACK, value: "127.0.0.1:8443" }
             - { name: SB_TLS_CERT_WATCH_FILE, value: /etc/aerolvm/tls/tls.crt }
+            # The internet reaches 80 and 443 through the edge Service, and
+            # so does a sandbox's traffic to the public name; the pod's own
+            # ports stay closed to sandboxes (C24).
+            - { name: SB_SANDBOX_NODE_INGRESS, value: "false" }
             {{- else }}
             - { name: SB_ENABLE_CADDY, value: "false" }
             {{- end }}
