@@ -171,6 +171,10 @@ jobs:
               - 'internal/supervisor/**'
               - 'pkg/caddy/cert_reload*.go'
               - 'pkg/daemon/tls_cert_watch*.go'
+              # The chart's monitoring checks (P6, P9).
+              - 'setup/prometheus/k8s_chart_test.go'
+              - 'setup/prometheus/testdata/k8s-chart-rules.test.yaml'
+              - 'setup/runbooks/kubernetes.md'
               - '.github/workflows/test.yml'
 
   # go-tests and go-race each run as two jobs. "cluster-service" runs
@@ -833,6 +837,11 @@ jobs:
           curl -fsSL -o kind https://github.com/kubernetes-sigs/kind/releases/download/v0.33.0/kind-linux-amd64
           echo "aee6151561422756b764a4ae28e7f44cda5af5a9eead3cc9985112b1de8d8e0d  kind" | sha256sum -c -
           sudo install -m 0755 kind /usr/local/bin/kind
+          # promtool, for the chart's alert rules (P6, P9).
+          curl -fsSL -o prometheus.tgz https://github.com/prometheus/prometheus/releases/download/v3.5.0/prometheus-3.5.0.linux-amd64.tar.gz
+          echo "e811827af26d822afb09a4f28314f61b618b12cff5369835a67f674d8b46f39a  prometheus.tgz" | sha256sum -c -
+          tar -xzf prometheus.tgz prometheus-3.5.0.linux-amd64/promtool
+          sudo install -m 0755 prometheus-3.5.0.linux-amd64/promtool /usr/local/bin/promtool
 
       - name: Lint and render the chart
         run: |
@@ -864,6 +873,28 @@ jobs:
           grep -q -- '- 10.96.0.1/32' <<<"$out"
           grep -q -- '- 10.244.0.0/16' <<<"$out"
           grep -q 'cidr: 10.50.0.0/16' <<<"$out"
+          # P9: monitoring is off by default (its kinds need the Prometheus
+          # Operator's CRDs) and renders a ServiceMonitor, the rules and
+          # the dashboards when on.
+          if helm template t charts/aerolvm | grep -qE 'kind: (ServiceMonitor|PrometheusRule)'; then
+            echo "::error::monitoring rendered while monitoring.enabled is false"
+            exit 1
+          fi
+          helm lint charts/aerolvm --set monitoring.enabled=true
+          out="$(helm template t charts/aerolvm --set monitoring.enabled=true)"
+          grep -q 'kind: ServiceMonitor' <<<"$out"
+          grep -q 'kind: PrometheusRule' <<<"$out"
+          grep -q 'grafana_dashboard: "1"' <<<"$out"
+
+      # The chart's alerts, recording rules and dashboards (P6, P9): every
+      # metric they read is registered in the Go code (or is the
+      # operator's or kube-state-metrics'), every alert has its runbook
+      # entry, promtool checks and unit-tests the rules, and the rendered
+      # PrometheusRule holds exactly the rule file.
+      - name: Check the chart's monitoring
+        env:
+          AEROLVM_CHART_TOOLS: require
+        run: go test -count=1 -run '^TestKubernetesChart' -v ./setup/prometheus/
 
       # kind's nodes share this runner's kernel, which has no br_netfilter
       # loaded; sandboxd refuses to start without it, since sandbox
