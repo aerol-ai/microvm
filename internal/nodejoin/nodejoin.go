@@ -46,6 +46,11 @@ type Paths struct {
 	AdminContext string // the login `aerolvm config import` reads
 	CgroupRoot   string
 	KVMDevice    string
+	// OSRelease is the kernel's release string (the pod preflight).
+	OSRelease string
+	// BridgeNF is br_netfilter's sysctl: present only with the module
+	// loaded (the pod preflight).
+	BridgeNF string
 }
 
 // DefaultPaths are a node's real paths.
@@ -62,6 +67,8 @@ func DefaultPaths() Paths {
 		AdminContext: "/etc/sandboxd/admin-context.json",
 		CgroupRoot:   "/sys/fs/cgroup",
 		KVMDevice:    "/dev/kvm",
+		OSRelease:    "/proc/sys/kernel/osrelease",
+		BridgeNF:     "/proc/sys/net/bridge/bridge-nf-call-iptables",
 	}
 }
 
