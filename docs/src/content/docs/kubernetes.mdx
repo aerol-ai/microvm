@@ -357,6 +357,42 @@ Karpenter sets both by default. EKS managed node groups with your own launch tem
 
 If there is no `aws` CLI, no AWS credentials, or the machines are not on AWS (kind, for example), `verify` skips this check. It prints `SKIP` in the table and a warning, and the run can still pass. Every other check must pass for exit code 0.
 
+## Monitoring
+
+The chart can set up Prometheus and Grafana for you. It needs the Prometheus Operator, which [kube-prometheus-stack](https://github.com/prometheus-community/helm-charts/tree/main/charts/kube-prometheus-stack) installs. It is off by default, because without the Prometheus Operator the install would fail.
+
+Turn it on:
+
+```bash
+helm upgrade aerolvm charts/aerolvm --namespace aerolvm --reuse-values \
+  --set monitoring.enabled=true \
+  --set monitoring.labels.release=kube-prometheus-stack
+```
+
+`monitoring.labels` must match what your Prometheus looks for. kube-prometheus-stack only reads objects labelled with its own release name, shown here as `kube-prometheus-stack`.
+
+You get three things:
+
+- **Scraping.** Prometheus reads [`/v1/metrics`](/dashboard/#collect-metrics-with-prometheus) on every AerolVM pod, once each.
+- **Alerts.** 24 alerts, such as a pod that is not ready, a `runtime` container that restarted, a disk that is filling up, no room for new sandboxes, an upgrade that is stuck, and more. Each one links to its entry in the [Kubernetes runbook](https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/kubernetes.md), which says what it means and what to do. The chart also adds the [usage per team](#usage-per-team) sums.
+- **Two Grafana dashboards.** **AerolVM on Kubernetes** shows health, room and sandboxes, failover and upgrades. **AerolVM usage per team** shows what each team reserves and uses. Grafana loads them by itself if its sidecar watches this namespace.
+
+Good to know:
+
+- **Three alerts need kube-state-metrics.** They read pod status from it. kube-prometheus-stack runs it. Without it, turn them off with `monitoring.prometheusRule.disabledAlerts`: `AerolVMPodNotReady`, `AerolVMRuntimeContainerRestarted` and `AerolVMPodImagePullStuck`.
+- **Some alerts wait for cluster mode.** Alerts about nodes and upgrades need cluster mode. In single mode they never fire.
+
+### Use a token that can only read
+
+Prometheus needs a token to read `/v1/metrics`. By default it uses the API token, which can do everything. If you turned on API tokens (`SB_IDENTITY_ENABLED: "true"` in `worker.extraEnv`), make a read-only token instead. Put it in a Secret in the same namespace:
+
+```bash
+kubectl -n aerolvm create secret generic aerolvm-metrics-token \
+  --from-literal=token="$(aerolvm token create --name prometheus --role viewer --team '*' --expires-in 90d)"
+```
+
+Then set `monitoring.scrapeToken.existingSecret=aerolvm-metrics-token`. Make a new token before this one expires, or Prometheus loses access.
+
 ## Usage per team
 
 The worker pod asks Kubernetes for a whole machine. So a cost tool such as OpenCost or Kubecost sees one big pod, not which team used it. To fill that gap, the server adds four counters per owner to its [`/v1/metrics`](/dashboard/#collect-metrics-with-prometheus). An owner is the team a sandbox belongs to.
@@ -383,7 +419,7 @@ Good to know:
 
 ### Add them up in Prometheus
 
-Scrape `/v1/metrics` on every worker pod, as on a server (see [Collect metrics with Prometheus](/dashboard/#collect-metrics-with-prometheus)). Then add these rules. Each one adds up one counter across every worker and every restart. Because each worker keeps its own counters, a restart, a worker that leaves or a new cluster leader loses or double-counts nothing that was scraped.
+With [Monitoring](#monitoring) on, the chart scrapes every worker and adds these rules for you, with an extra `aerolvm_cluster` label. Without it, scrape `/v1/metrics` on every worker pod, as on a server (see [Collect metrics with Prometheus](/dashboard/#collect-metrics-with-prometheus)). Then add these rules. Each one adds up one counter across every worker and every restart. Because each worker keeps its own counters, a restart, a worker that leaves or a new cluster leader loses or double-counts nothing that was scraped.
 
 ```yaml title="aerolvm-usage-rules.yml"
 groups:
@@ -470,6 +506,11 @@ Set these with `--set` or a values file.
 | `edge.certManager.issuerRef` | The cert-manager issuer for the certificate, as `name` and `kind` (`ClusterIssuer` when you leave `kind` out). | none |
 | `edge.existingTLSSecret` | Your own TLS Secret for the domain and its wildcard, instead of an issuer. | none |
 | `edge.service.type` | How the edge is reached from outside the cluster. | `LoadBalancer` |
+| `monitoring.enabled` | [Monitoring](#monitoring): scraping, alerts and dashboards. Needs the Prometheus Operator. | `false` |
+| `monitoring.labels` | Labels your Prometheus looks for, such as `release: kube-prometheus-stack`. | none |
+| `monitoring.scrapeToken.existingSecret` | A Secret with a read-only token for Prometheus (key `token`, or `monitoring.scrapeToken.key`). | the API token |
+| `monitoring.prometheusRule.disabledAlerts` | Alerts to leave out, by name. | none |
+| `monitoring.grafanaDashboards` | Add the two Grafana dashboards. | `true` |
 | `image.tag` | The AerolVM version to run. | the chart's version |
 
 ## Good to know
