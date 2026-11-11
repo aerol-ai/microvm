@@ -115,6 +115,17 @@ func (c *Cluster) SelectPlacement(req capacity.Request) (PlacementTarget, error)
 // slice the router uses to record the secret recipient set at reserve time
 // (plans/secrets-hardening §3d-1). The target is always one of candidates.
 func (c *Cluster) SelectPlacementWithCandidates(req capacity.Request) (PlacementTarget, []Member, error) {
+	return c.selectPlacement(req, placementOpts{})
+}
+
+// placementOpts are placement inputs that are not part of the request.
+type placementOpts struct {
+	// avoidZone is the zone of the node a failover moves the sandbox off
+	// (C10). Candidates there are used only when no other zone has room.
+	avoidZone string
+}
+
+func (c *Cluster) selectPlacement(req capacity.Request, opts placementOpts) (PlacementTarget, []Member, error) {
 	all := c.withCatalogueTemplateHolders(c.membersWithCapacity(), req.TemplateID)
 	rejects := make(map[string]int64)
 	if err := LargeClusterTopologyError(all); err != nil {
@@ -257,15 +268,20 @@ func (c *Cluster) SelectPlacementWithCandidates(req capacity.Request) (Placement
 		return PlacementTarget{}, nil, noPlacementTargetError(req, requiredReachable, labelMatched, rejects["egress_gateway"] > 0, full)
 	}
 
+	score := func(m Member) float64 {
+		extra, byRuntime := pending.of(m.NodeID)
+		return placementScore(m, req, extra, byRuntime)
+	}
+	// Zone rules (C10), on a pool so the full candidate set still goes back
+	// for the secret recipients: off the failed zone when another has
+	// room, then one zone chosen by free room.
+	pool := spreadByZone(withoutZone(candidates, opts.avoidZone), score)
+
 	// Power-of-two-choices.
-	a, b := pickTwo(candidates)
+	a, b := pickTwo(pool)
 	winner := a
-	if !sameNode(a, b) {
-		extraA, byRuntimeA := pending.of(a.NodeID)
-		extraB, byRuntimeB := pending.of(b.NodeID)
-		if placementScore(b, req, extraB, byRuntimeB) > placementScore(a, req, extraA, byRuntimeA) {
-			winner = b
-		}
+	if !sameNode(a, b) && score(b) > score(a) {
+		winner = b
 	}
 
 	if winner.NodeID == c.nodeID {
@@ -327,6 +343,16 @@ func sameSecretRecipientSet(a, b []string) bool {
 // remaining stable for a given sandbox.
 // When the cluster is smaller than owner+maxBackups, every eligible candidate
 // is included. Empty ownerID or candidates yields nil.
+//
+// Zones (C10): backups go to zones other than the owner's first, one per
+// zone before a second in any, then to nodes whose zone is unknown, and to
+// the owner's own zone last. A zone loss then cannot take the owner and
+// every backup together. HRW order holds inside each step, so the set stays
+// stable for a sandbox, and a cluster without zones gets exactly the set it
+// got before. A build without this rule picks a different set for a zoned
+// cluster, so during a rolling upgrade old and new nodes disagree; that is
+// safe only because the set is chosen once, when the create is reserved,
+// and recorded with the placement, never chosen again by another node.
 func SelectSecretRecipients(sandboxID string, candidates []Member, ownerID string, maxBackups int) []string {
 	ownerID = strings.TrimSpace(ownerID)
 	if ownerID == "" || len(candidates) == 0 {
@@ -335,10 +361,18 @@ func SelectSecretRecipients(sandboxID string, candidates []Member, ownerID strin
 	if maxBackups < 0 {
 		maxBackups = 0
 	}
+	ownerZone := ""
+	for _, m := range candidates {
+		if strings.TrimSpace(m.NodeID) == ownerID {
+			ownerZone = memberZone(m)
+			break
+		}
+	}
 	seen := map[string]struct{}{ownerID: {}}
 	out := []string{ownerID}
 	type scored struct {
 		id    string
+		zone  string
 		score uint64
 	}
 	rest := make([]scored, 0, len(candidates))
@@ -351,7 +385,7 @@ func SelectSecretRecipients(sandboxID string, candidates []Member, ownerID strin
 			continue
 		}
 		seen[id] = struct{}{}
-		rest = append(rest, scored{id: id, score: secretRecipientScore(sandboxID, id)})
+		rest = append(rest, scored{id: id, zone: memberZone(m), score: secretRecipientScore(sandboxID, id)})
 	}
 	sort.SliceStable(rest, func(i, j int) bool {
 		if rest[i].score != rest[j].score {
@@ -362,8 +396,46 @@ func SelectSecretRecipients(sandboxID string, candidates []Member, ownerID strin
 	if maxBackups > len(rest) {
 		maxBackups = len(rest)
 	}
-	for i := 0; i < maxBackups; i++ {
-		out = append(out, rest[i].id)
+	// rank: 0 another known zone, 1 unknown zone, 2 the owner's zone. With
+	// no zones anywhere every node ranks the same and HRW order stands.
+	rank := func(z string) int {
+		switch {
+		case z == ownerZone:
+			return 2
+		case z == "":
+			return 1
+		default:
+			return 0
+		}
+	}
+	// No size hint: maxBackups comes from the request, and the map only
+	// ever holds the few backups picked.
+	picked := make(map[string]bool)
+	take := func(c scored) {
+		out = append(out, c.id)
+		picked[c.id] = true
+	}
+	// First, the best node of each other zone, so two backups land in two
+	// zones when there are two to use.
+	usedZone := map[string]bool{}
+	for _, c := range rest {
+		if len(out)-1 == maxBackups {
+			break
+		}
+		if rank(c.zone) == 0 && !usedZone[c.zone] {
+			usedZone[c.zone] = true
+			take(c)
+		}
+	}
+	for r := 0; r <= 2 && len(out)-1 < maxBackups; r++ {
+		for _, c := range rest {
+			if len(out)-1 == maxBackups {
+				break
+			}
+			if !picked[c.id] && rank(c.zone) == r {
+				take(c)
+			}
+		}
 	}
 	return out
 }

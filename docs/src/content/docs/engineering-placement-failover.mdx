@@ -278,6 +278,16 @@ The rules for labels:
 
 The cluster members list (`GET /v1/cluster/members`) shows each node's `zone` and `labels`, so you can see what a rule can target.
 
+### What zones do on their own
+
+Once nodes have zones, the cluster uses them even when a create asks for nothing:
+
+- **New sandboxes spread across zones by free room.** The leader picks two zones at random and takes the one with more free room on average. Then it picks a node in that zone as usual. So each zone keeps about the same headroom, and a zone loss leaves the others able to take its sandboxes.
+- **Failover never goes back into the zone that just lost a node,** unless no other zone has room. A zone outage takes its nodes one by one, so a sandbox moved to a neighbor in the same zone would likely move again.
+- **Sealed-secret backups go to other zones.** A `failover.policy="recreate"` sandbox keeps backup copies of its sealed secrets on other nodes. Those copies go to zones other than the owner's first, one per zone. So one zone loss cannot take the owner and every copy together.
+
+A cluster with no zones, or with every node in one zone, places exactly as before. On Kubernetes the operator sets `SB_NODE_ZONE` from the machine's `topology.kubernetes.io/zone` label.
+
 ### Ask for a node in the create
 
 Add `placement` to the create. Set `zone`, `labels`, or both:

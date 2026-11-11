@@ -91,6 +91,9 @@ type capacityLeaseCache struct {
 
 	mu     sync.RWMutex
 	leases map[string]capacityLease
+	// zones keeps each node's last reported zone past its lease (C10):
+	// failover needs a dead node's zone after its lease is dropped.
+	zones zoneMemory
 	// nextAttempt / failures schedule each peer INDEPENDENTLY, so one slow
 	// or dead endpoint cannot postpone a healthy peer's refresh.
 	nextAttempt map[string]time.Time
@@ -335,7 +338,17 @@ func (c *capacityLeaseCache) setReported(nodeID string, snap capacity.Snapshot, 
 		c.leases[nodeID] = capacityLease{snapshot: snap, updated: updated, mark: mark}
 	}
 	c.mu.Unlock()
+	c.zones.record(nodeID, memberZone(Member{Capacity: snap}))
 	c.unreported.reported(nodeID, mark)
+}
+
+// lastKnownZone is the zone nodeID last reported to this server, or "" when
+// it never did (C10).
+func (c *capacityLeaseCache) lastKnownZone(nodeID string) string {
+	if c == nil {
+		return ""
+	}
+	return c.zones.zoneOf(nodeID)
 }
 
 // unreportedMark is the position a heartbeat requested now is measured

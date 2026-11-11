@@ -333,6 +333,26 @@ func (c *Cluster) selectRecreationTarget(p Placement, exclude ...string) (Placem
 // excludes every candidate: the failover must not move it (P1.5), and the
 // caller says so in a counter and an audit record rather than a bare log.
 func (c *Cluster) selectRecreationTargetFor(p Placement, exclude ...string) (PlacementTarget, error) {
+	return c.selectRecreationTargetAvoiding(p, "", exclude...)
+}
+
+// selectFailoverTarget is selectRecreationTargetFor for a dead owner's
+// sandbox: it keeps the sandbox out of the dead node's zone unless no other
+// zone has room for it (C10). A zone loss takes its nodes one by one, so a
+// sandbox moved to a neighbour in the same zone would likely move again.
+func (c *Cluster) selectFailoverTarget(p Placement, deadNodeID string) (PlacementTarget, error) {
+	return c.selectRecreationTargetAvoiding(p, c.lastKnownZone(deadNodeID))
+}
+
+// lastKnownZone is the zone nodeID last reported to this server (C10).
+func (c *Cluster) lastKnownZone(nodeID string) string {
+	if c == nil {
+		return ""
+	}
+	return c.capacityLeases.lastKnownZone(nodeID)
+}
+
+func (c *Cluster) selectRecreationTargetAvoiding(p Placement, avoidZone string, exclude ...string) (PlacementTarget, error) {
 	spec := p.Spec
 	if spec == nil {
 		return PlacementTarget{}, ErrNoReassignTarget
@@ -350,7 +370,8 @@ func (c *Cluster) selectRecreationTargetFor(p Placement, exclude ...string) (Pla
 	// is needed only when exclusions apply or a small recipient set constrains
 	// the candidates.
 	if !placementHasSecretHandle(p) && len(exclude) == 0 {
-		return c.SelectPlacement(req)
+		target, _, err := c.selectPlacement(req, placementOpts{avoidZone: avoidZone})
+		return target, err
 	}
 	drained := c.fsm.drainedNodesSnapshot()
 	denied := c.fsm.deniedNodeSet()
@@ -363,6 +384,11 @@ func (c *Cluster) selectRecreationTargetFor(p Placement, exclude ...string) (Pla
 	var best Member
 	bestScore := -1.0
 	found := false
+	// The best outside avoidZone, which wins over best when there is one
+	// (C10: never back into the zone that just failed if another has room).
+	var bestAway Member
+	bestAwayScore := -1.0
+	foundAway := false
 	labelMatched := false
 	for _, m := range all {
 		// A node going down to restart (C8) is no failover target: the
@@ -408,12 +434,20 @@ func (c *Cluster) selectRecreationTargetFor(p Placement, exclude ...string) (Pla
 			bestScore = s
 			found = true
 		}
+		if avoidZone != "" && memberZone(m) != avoidZone && (!foundAway || s > bestAwayScore) {
+			bestAway = m
+			bestAwayScore = s
+			foundAway = true
+		}
 	}
 	if !found {
 		if len(req.Labels) > 0 && !labelMatched {
 			return PlacementTarget{}, models.PlacementUnsatisfiableError(req.Labels)
 		}
 		return PlacementTarget{}, ErrNoReassignTarget
+	}
+	if foundAway {
+		best = bestAway
 	}
 	if best.NodeID == c.nodeID {
 		return PlacementTarget{NodeID: c.nodeID, APIURL: c.apiURL, DataPlaneHost: c.dataPlaneHost, IsSelf: true}, nil

@@ -317,7 +317,7 @@ func (c *Cluster) evictOwnerPlacements(ctx context.Context, nodeID string) (reas
 		if !placementWantsFailoverRecreate(p) {
 			continue
 		}
-		target, err := c.selectRecreationTargetFor(p)
+		target, err := c.selectFailoverTarget(p, nodeID)
 		if err != nil {
 			// A placement rule no live node satisfies is not a reason to
 			// move the sandbox somewhere it must not run: it is orphaned
