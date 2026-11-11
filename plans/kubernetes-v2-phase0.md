@@ -88,10 +88,15 @@ to main.
 | C27 part 2: `diskGB` as an XFS project quota on each containerd sandbox (`SB_CONTAINERD_DISK_QUOTA`) | #1151 | main | Open; **proven live** on Bottlerocket: gVisor and runc with 1 GB stopped at 1023 MB, 3 GB wrote 2 GB, a resize to 2 GB let 1 GB more through. The first live try found overlay copy-up failing (EXDEV) with only the upper directory in the project; fixed |
 | C3: the containerd sandbox range as a setting (`SB_CONTAINERD_BRIDGE_SUBNET`) | #1152 | main | Open; **proven live** on Bottlerocket with 10.200.0.0/16: runc at 10.200.0.2, gVisor at 10.200.0.3, both online, no rule left naming 10.88.0.0/16 |
 | C6: the egress gateway without systemd (numeric `SB_EGRESS_GATEWAY_USER`, `SB_EGRESS_PEER_CGROUP=none`) | #1153 | main | Open; **proven live** on Bottlerocket: gateway as uid 65532 with only `NET_ADMIN` and `NET_BIND_SERVICE`, `egress_gateway_ready`, example.com allowed and another site blocked |
+| C4: Raft advertises and dials DNS names | #1155 | main | Open; two real Raft servers by name, with and without TLS; the whole cluster package passes |
+| C7: the runtime supervisor (`aerolvm-supervisor`): the runtime container's cgroup shape, containerd kept in `sandboxes/_runtime`, orphans reaped | #1154 | main | Open; checked on a real kernel (a privileged container with its own cgroup namespace): the shape, containerd in `_runtime`, restarted after `kill -9`, no zombies |
+| P1: the `aerolvm`, `aerolvm-runtime` and `aerolvm-edge` images; the release job pushes, signs and attests them | #1156 | #1154 | Open; built locally for arm64: runc and gVisor containers ran under the supervisor's containerd; Caddy with every plugin, non-root, read-only root |
 | Go 1.26.11 for GO-2026-6859 (blocks `go-security` on every PR) | #1143 | main | **Merged** |
 
-Next, in order: C4 (Raft dials DNS names), then C7's split worker in the
-images (P1) and the chart's `single` mode (P3). C5 (servers and gateways
+Next, in order: the chart's `single` mode (P3) with `make k8s-dev` and the
+docs (P4), the in-pod firewall and chart settings (C24), `aerolvm k8s
+verify` (P8), cert-manager (C25), install notes (P10), and the ownership
+lease in the runtime supervisor (T3). C5 (servers and gateways
 under `restricted` pod security) is measured once those pods exist: their
 cluster files cannot come from `sandboxd init` in a pod (finding F14), so
 the measurement needs the chart's or the operator's way of making them.
