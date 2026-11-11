@@ -913,7 +913,8 @@ func runK8s(ctx context.Context, a *app, args []string) int {
 
 const k8sHelp = `Check a Kubernetes install of AerolVM against its security rules.
 
-Usage: aerolvm k8s verify [--namespace aerolvm] [--release aerolvm]
+Usage: aerolvm k8s verify [--namespace aerolvm] [--worker-namespace <ns>]
+                          [--release aerolvm] [--cluster <name>]
                           [--kube-context <name>] [--skip-signatures]
                           [--probe-image alpine:3.20] [--probe-runtimes docker,gvisor]
                           [--json]
@@ -921,18 +922,39 @@ Usage: aerolvm k8s verify [--namespace aerolvm] [--release aerolvm]
 Checks, and exits 1 if any fails:
   - every image is signed by the AerolVM release workflow (needs cosign);
   - no pod mounts a folder from the machine;
-  - no pod holds a Kubernetes API credential;
+  - no pod but the operator holds a Kubernetes API credential;
   - no pod holds a DNS provider token (Secret volumes may mount only
     tls.crt, tls.key and ca.crt, by name);
+  - only the worker pods' runtime and agent containers are privileged, and
+    only in the worker namespace;
+  - the worker namespace is labelled pod-security.kubernetes.io/enforce=
+    privileged, and in cluster mode the release namespace enforces
+    restricted;
   - a NetworkPolicy limits each worker pod's egress, and none of the
     policies on it opens a whole private range, every address or every pod;
-  - a sandbox of each probe runtime cannot reach the worker pod's own
+  - on AWS, each machine that runs a worker pod allows IMDSv2 only, with a
+    hop limit of 1, so no pod or sandbox can reach the metadata service;
+  - with gateways.gatewayRef, your Gateway accepted the HTTPRoute
+    <cluster>-api, the TLSRoute <cluster>-links and the TCPRoute
+    <cluster>-ssh, and the listener for sandbox links passes TLS through;
+  - a sandbox of each probe runtime cannot reach the AerolVM pods' own
     ports, a cluster DNS pod's address, or the Kubernetes API at its
     Service address and its own addresses.
+
+--namespace is where the chart is installed. In cluster mode the worker
+pods run in their own namespace: pass it as --worker-namespace (by default
+the same namespace, as in single mode). --cluster is the AerolCluster's
+name, the release name by default.
 
 It reads the cluster with your kubectl, and creates the probe sandboxes
 through the AerolVM API you are logged in to (aerolvm login, or SB_API_URL
 and SB_PAT_TOKEN, for example through kubectl port-forward). The probe
-sandboxes are deleted afterwards. --skip-signatures reports the image check
+sandboxes are deleted afterwards. It reads the IMDS settings with your aws
+CLI and your own AWS credentials (AWS_PROFILE and the rest work as usual);
+it never stores them. It needs ec2:DescribeInstances.
+
+A check that cannot run is reported as SKIP, with a warning, and does not
+fail the run: the IMDS check when there is no aws CLI, no AWS credentials,
+or the machines are not on AWS. --skip-signatures reports the image check
 as skipped, for images you built yourself.
 `

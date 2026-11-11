@@ -327,16 +327,35 @@ Put other private addresses the worker pod itself needs in the same list. Exampl
 
 - every image is signed by the AerolVM release workflow (it needs `cosign` v3 or later);
 - no pod mounts a folder from the node;
-- no pod holds a Kubernetes API credential;
+- no pod holds a Kubernetes API credential. The operator is the one exception, because its job is to talk to Kubernetes;
 - no pod holds a DNS provider token: a pod may mount only a certificate, its key and its authority from a Secret, each named;
+- only the worker pod's `runtime` and `agent` containers run privileged, and only in the worker namespace;
+- the worker namespace has the label `pod-security.kubernetes.io/enforce=privileged`. When the other AerolVM pods have their own namespace, that namespace must have `restricted`;
 - a NetworkPolicy limits where the worker pod can connect, and no policy on it opens every address, every pod, or a whole private range;
-- a runc and a gVisor sandbox cannot reach the worker pod's own ports, another pod (a cluster DNS pod), or the Kubernetes API.
+- on AWS, each machine that runs a worker pod turns off the old metadata service (IMDSv1) and has a hop limit of 1 (see below);
+- if your own Gateway is in front of AerolVM (`gateways.gatewayRef`), it accepted all three AerolVM routes, and the listener for sandbox links passes the encrypted traffic through as it is;
+- a runc and a gVisor sandbox cannot reach the AerolVM pods' own ports, another pod (a cluster DNS pod), or the Kubernetes API.
 
-It reads the cluster with your `kubectl`, and makes its two test sandboxes through the API you set up above. It deletes them when it is done.
+It reads the cluster with your `kubectl`, and makes its two test sandboxes through the API you set up above. It deletes them when it is done. Your `kubectl` must be able to read pods, NetworkPolicies, namespaces and nodes.
 
 ```bash
 aerolvm k8s verify --namespace aerolvm
 ```
+
+If the worker pods run in a namespace of their own, name it too, with `--worker-namespace`. Without it, `verify` looks for them in `--namespace`.
+
+### The metadata service check
+
+Each cloud machine has a metadata service. It hands out the machine's own cloud credentials, so no sandbox and no pod should reach it. AerolVM's firewall already blocks sandboxes from it. The machine's own settings are the second wall:
+
+- **IMDSv2 only** (`HttpTokens` set to `required`). The old version, IMDSv1, answers anyone who can reach it.
+- **A hop limit of 1** (`HttpPutResponseHopLimit`). Each pod has its own network, one step (hop) away from the machine. With a limit of 1, the service's answer cannot travel that far, so pods and sandboxes get nothing.
+
+Karpenter sets both by default. EKS managed node groups with your own launch template use a hop limit of 2, so set it to 1 there.
+
+`verify` reads these settings with your own `aws` CLI and your own AWS credentials. Set `AWS_PROFILE` or sign in as you normally do. The credentials need the `ec2:DescribeInstances` permission. `verify` does not keep them.
+
+If there is no `aws` CLI, no AWS credentials, or the machines are not on AWS (kind, for example), `verify` skips this check. It prints `SKIP` in the table and a warning, and the run can still pass. Every other check must pass for exit code 0.
 
 ## Usage per team
 
