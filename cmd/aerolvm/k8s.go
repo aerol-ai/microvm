@@ -1,6 +1,7 @@
 package main
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -24,7 +25,8 @@ import (
 // Kubernetes API credential or DNS provider token (C25), a NetworkPolicy
 // limits the worker pod's egress, and a probe sandbox cannot reach the
 // worker's own ports, another pod or the Kubernetes API (C24). Phase 2
-// adds the full layout.
+// adds the cluster layout: privileged containers only in the worker
+// namespace, and each namespace's Pod Security label.
 //
 // It reads the cluster with the kubectl and cosign already on this machine
 // (so the CLI carries no Kubernetes client), and probes through the AerolVM
@@ -43,7 +45,16 @@ const (
 	k8sSSHGatewayPort = 2220
 	// The containerd sandbox range when SB_CONTAINERD_BRIDGE_SUBNET is unset.
 	k8sDefaultBridge = "10.88.0.0/16"
+
+	k8sComponent = "app.kubernetes.io/component"
+	// The Pod Security admission label that decides what a namespace admits.
+	k8sPodSecurityEnforce = "pod-security.kubernetes.io/enforce"
 )
+
+// k8sPrivilegedContainers are the worker pod's containers that run
+// privileged (§8.7): runtime builds sandboxes and agent makes their network
+// namespaces. edge and egress never need it.
+var k8sPrivilegedContainers = map[string]bool{"runtime": true, "agent": true}
 
 // k8sTLSKeys are the only Secret keys a worker pod may mount (C25): the
 // edge certificate and key cert-manager writes, and its CA.
@@ -73,9 +84,16 @@ type k8sEnv struct {
 }
 
 type k8sVerifyOptions struct {
-	namespace, release, probeImage string
-	probeRuntimes                  []string
-	skipSignatures                 bool
+	// namespace is the release namespace; workerNamespace is where the
+	// worker pods run, the same namespace in single mode.
+	namespace, workerNamespace string
+	// release is the Helm release and cluster the AerolCluster's name: the
+	// chart labels the pods it makes with the first, the operator the pods
+	// it makes with the second.
+	release, cluster string
+	probeImage       string
+	probeRuntimes    []string
+	skipSignatures   bool
 }
 
 // k8sPodList is the part of `kubectl get pods -o json` verify reads.
@@ -85,8 +103,9 @@ type k8sPodList struct {
 
 type k8sPod struct {
 	Metadata struct {
-		Name   string            `json:"name"`
-		Labels map[string]string `json:"labels"`
+		Name      string            `json:"name"`
+		Namespace string            `json:"namespace"`
+		Labels    map[string]string `json:"labels"`
 	} `json:"metadata"`
 	Spec struct {
 		AutomountServiceAccountToken *bool `json:"automountServiceAccountToken"`
@@ -126,6 +145,13 @@ type k8sContainer struct {
 			Name string `json:"name"`
 		} `json:"secretRef"`
 	} `json:"envFrom"`
+	SecurityContext *struct {
+		Privileged *bool `json:"privileged"`
+	} `json:"securityContext"`
+}
+
+func (c k8sContainer) privileged() bool {
+	return c.SecurityContext != nil && c.SecurityContext.Privileged != nil && *c.SecurityContext.Privileged
 }
 
 // k8sNetworkPolicyList is the part of `kubectl get networkpolicies -o json`
@@ -277,25 +303,56 @@ func (p k8sPod) all() []k8sContainer {
 
 // k8sVerify runs every check and returns them in order.
 func k8sVerify(ctx context.Context, env k8sEnv, o k8sVerifyOptions) []k8sCheck {
-	selector := "app.kubernetes.io/name=aerolvm,app.kubernetes.io/instance=" + o.release
-	raw, err := env.kubectl(ctx, "get", "pods", "-n", o.namespace, "-l", selector, "-o", "json")
+	o.workerNamespace = cmp.Or(o.workerNamespace, o.namespace)
+	o.cluster = cmp.Or(o.cluster, o.release)
+	const found = "AerolVM pods found"
+	pods, err := k8sPods(ctx, env, o)
 	if err != nil {
-		return []k8sCheck{{Name: "AerolVM pods found", Result: k8sFail, Detail: err.Error()}}
+		return []k8sCheck{{Name: found, Result: k8sFail, Detail: err.Error()}}
 	}
-	var pods k8sPodList
-	if err := json.Unmarshal(raw, &pods); err != nil || len(pods.Items) == 0 {
-		detail := fmt.Sprintf("no pods labelled %s in namespace %s", selector, o.namespace)
-		if err != nil {
-			detail = "kubectl output: " + err.Error()
-		}
-		return []k8sCheck{{Name: "AerolVM pods found", Result: k8sFail, Detail: detail}}
-	}
-	checks := []k8sCheck{{Name: "AerolVM pods found", Result: k8sPass, Detail: strconv.Itoa(len(pods.Items)) + " pod(s)"}}
-	checks = append(checks, k8sImagesSigned(ctx, env, pods.Items, o.skipSignatures))
-	checks = append(checks, k8sNoHostMounts(pods.Items), k8sNoAPIRights(pods.Items), k8sNoDNSToken(pods.Items))
-	checks = append(checks, k8sEgressPolicy(ctx, env, pods.Items, o.namespace))
-	checks = append(checks, k8sProbe(ctx, env, pods.Items, o)...)
+	checks := []k8sCheck{{Name: found, Result: k8sPass, Detail: strconv.Itoa(len(pods)) + " pod(s)"}}
+	checks = append(checks, k8sImagesSigned(ctx, env, pods, o.skipSignatures))
+	checks = append(checks, k8sNoHostMounts(pods), k8sNoAPIRights(pods, o.namespace), k8sNoDNSToken(pods))
+	checks = append(checks, k8sPrivileged(pods, o.workerNamespace))
+	checks = append(checks, k8sPodSecurity(ctx, env, o)...)
+	checks = append(checks, k8sEgressPolicy(ctx, env, pods))
+	checks = append(checks, k8sProbe(ctx, env, pods, o)...)
 	return checks
+}
+
+// k8sPods lists the install's pods in the release namespace and, in cluster
+// mode, the worker namespace. A pod is the install's when it carries the
+// release's label (the chart made it) or the AerolCluster's (the operator
+// did): the operator's pods carry only the second, so a label selector,
+// which cannot say "or", would miss one kind or the other.
+func k8sPods(ctx context.Context, env k8sEnv, o k8sVerifyOptions) ([]k8sPod, error) {
+	namespaces := []string{o.namespace}
+	if o.workerNamespace != o.namespace {
+		namespaces = append(namespaces, o.workerNamespace)
+	}
+	var pods []k8sPod
+	for _, ns := range namespaces {
+		raw, err := env.kubectl(ctx, "get", "pods", "-n", ns, "-l", "app.kubernetes.io/name=aerolvm", "-o", "json")
+		if err != nil {
+			return nil, err
+		}
+		var list k8sPodList
+		if err := json.Unmarshal(raw, &list); err != nil {
+			return nil, fmt.Errorf("kubectl output: %w", err)
+		}
+		for _, p := range list.Items {
+			if p.Metadata.Labels["app.kubernetes.io/instance"] != o.release && p.Metadata.Labels["aerolvm.io/cluster"] != o.cluster {
+				continue
+			}
+			p.Metadata.Namespace = ns
+			pods = append(pods, p)
+		}
+	}
+	if len(pods) == 0 {
+		return nil, fmt.Errorf("no pods labelled app.kubernetes.io/name=aerolvm and app.kubernetes.io/instance=%s or aerolvm.io/cluster=%s in namespace %s",
+			o.release, o.cluster, strings.Join(namespaces, " or "))
+	}
+	return pods, nil
 }
 
 func k8sImagesSigned(ctx context.Context, env k8sEnv, pods []k8sPod, skip bool) k8sCheck {
@@ -342,10 +399,18 @@ func k8sNoHostMounts(pods []k8sPod) k8sCheck {
 	return k8sCheck{Name: name, Result: k8sPass}
 }
 
-func k8sNoAPIRights(pods []k8sPod) k8sCheck {
+// k8sNoAPIRights checks no pod holds a Kubernetes API credential, except
+// the operator in the release namespace: it is the one part that writes to
+// the Kubernetes API (§7.4, §15.1).
+func k8sNoAPIRights(pods []k8sPod, releaseNamespace string) k8sCheck {
 	const name = "no Kubernetes API credential in the pods"
 	var found []string
+	operators := 0
 	for _, p := range pods {
+		if p.Metadata.Labels[k8sComponent] == "operator" && p.Metadata.Namespace == releaseNamespace {
+			operators++
+			continue
+		}
 		if a := p.Spec.AutomountServiceAccountToken; a == nil || *a {
 			found = append(found, p.Metadata.Name+": automountServiceAccountToken is not false")
 		}
@@ -363,7 +428,100 @@ func k8sNoAPIRights(pods []k8sPod) k8sCheck {
 	if len(found) > 0 {
 		return k8sCheck{Name: name, Result: k8sFail, Detail: strings.Join(found, "; ")}
 	}
+	if operators > 0 {
+		return k8sCheck{Name: name, Result: k8sPass, Detail: fmt.Sprintf("the %d operator pod(s) hold one by design", operators)}
+	}
 	return k8sCheck{Name: name, Result: k8sPass}
+}
+
+// k8sPrivileged checks privilege stays where §7 and §15.1 put it: in the
+// worker pods' runtime and agent containers, in the worker namespace, the
+// one namespace the bank approves for privileged pods. The gateways face
+// the internet and the servers hold the placement table, so one of them
+// privileged would hand its machine to whoever broke into it. Init
+// containers are held to it too: the worker pod needs none privileged.
+func k8sPrivileged(pods []k8sPod, workerNamespace string) k8sCheck {
+	const name = "privileged containers only in the worker pods' runtime and agent"
+	var bad []string
+	workers := 0
+	for _, p := range pods {
+		worker := p.Metadata.Labels[k8sComponent] == "worker"
+		if worker && p.Metadata.Namespace == workerNamespace {
+			workers++
+		}
+		check := func(c k8sContainer, init bool) {
+			if !c.privileged() {
+				return
+			}
+			where := p.Metadata.Namespace + "/" + p.Metadata.Name + "/" + c.Name
+			switch {
+			case p.Metadata.Namespace != workerNamespace:
+				bad = append(bad, where+" is privileged outside the worker namespace "+workerNamespace)
+			case !worker:
+				bad = append(bad, where+" is privileged in a pod that is not a worker")
+			case init || !k8sPrivilegedContainers[c.Name]:
+				bad = append(bad, where+" is privileged; only runtime and agent may be")
+			}
+		}
+		for _, c := range p.Spec.InitContainers {
+			check(c, true)
+		}
+		for _, c := range p.Spec.Containers {
+			check(c, false)
+		}
+	}
+	if len(bad) > 0 {
+		return k8sCheck{Name: name, Result: k8sFail, Detail: strings.Join(bad, "; ")}
+	}
+	return k8sCheck{Name: name, Result: k8sPass, Detail: fmt.Sprintf("%d worker pod(s) in namespace %s", workers, workerNamespace)}
+}
+
+// k8sNamespace is the part of `kubectl get namespace -o json` verify reads.
+type k8sNamespace struct {
+	Metadata struct {
+		Labels map[string]string `json:"labels"`
+	} `json:"metadata"`
+}
+
+// k8sPodSecurity checks each namespace's Pod Security label, which decides
+// what Kubernetes admits there from now on, not only what runs today. The
+// worker namespace must say privileged, so the bank's approval names exactly
+// one namespace, and a namespace that says less refuses the worker pods
+// when they next start. In cluster mode the release namespace must enforce
+// restricted (§15.1). A missing label there fails rather than warns: with
+// no label nothing stops a privileged gateway or server after a bad upgrade
+// or a hand edit, and that refusal is what a bank's reviewer asks for.
+func k8sPodSecurity(ctx context.Context, env k8sEnv, o k8sVerifyOptions) []k8sCheck {
+	label := func(ns string) (string, error) {
+		raw, err := env.kubectl(ctx, "get", "namespace", ns, "-o", "json")
+		if err != nil {
+			return "", err
+		}
+		var n k8sNamespace
+		if err := json.Unmarshal(raw, &n); err != nil {
+			return "", fmt.Errorf("kubectl output: %w", err)
+		}
+		return n.Metadata.Labels[k8sPodSecurityEnforce], nil
+	}
+	want := func(name, ns, level, why string) k8sCheck {
+		got, err := label(ns)
+		switch {
+		case err != nil:
+			return k8sCheck{Name: name, Result: k8sFail, Detail: err.Error()}
+		case got == "":
+			return k8sCheck{Name: name, Result: k8sFail, Detail: fmt.Sprintf("namespace %s has no %s label; set it to %s (%s)", ns, k8sPodSecurityEnforce, level, why)}
+		case got != level:
+			return k8sCheck{Name: name, Result: k8sFail, Detail: fmt.Sprintf("namespace %s enforces %s, not %s (%s)", ns, got, level, why)}
+		}
+		return k8sCheck{Name: name, Result: k8sPass, Detail: fmt.Sprintf("namespace %s: %s=%s", ns, k8sPodSecurityEnforce, level)}
+	}
+	checks := []k8sCheck{want("the worker namespace's Pod Security label is privileged", o.workerNamespace, "privileged",
+		"the one namespace for privileged pods")}
+	if o.workerNamespace != o.namespace {
+		checks = append(checks, want("the release namespace enforces restricted Pod Security", o.namespace, "restricted",
+			"gateways, servers and the operator need no rights"))
+	}
+	return checks
 }
 
 // k8sNoDNSToken checks no worker pod holds a DNS provider token (C25):
@@ -427,24 +585,30 @@ func k8sNoDNSToken(pods []k8sPod) k8sCheck {
 // pod. A policy that selects the pod but opens a whole private range, every
 // address or every pod fails the check: policies add up, so one such rule
 // undoes the rest. Only worker pods are held to it; they are the ones that
-// carry sandbox traffic.
-func k8sEgressPolicy(ctx context.Context, env k8sEnv, pods []k8sPod, namespace string) k8sCheck {
+// carry sandbox traffic. A NetworkPolicy selects pods in its own namespace
+// only, so each worker is read against its own namespace's policies.
+func k8sEgressPolicy(ctx context.Context, env k8sEnv, pods []k8sPod) k8sCheck {
 	const name = "a NetworkPolicy limits the worker pods' egress"
-	raw, err := env.kubectl(ctx, "get", "networkpolicies", "-n", namespace, "-o", "json")
-	if err != nil {
-		return k8sCheck{Name: name, Result: k8sFail, Detail: err.Error()}
-	}
-	var list k8sNetworkPolicyList
-	if err := json.Unmarshal(raw, &list); err != nil {
-		return k8sCheck{Name: name, Result: k8sFail, Detail: "kubectl output: " + err.Error()}
-	}
+	policies := map[string][]k8sNetworkPolicy{}
 	var bad, ok []string
 	for _, p := range pods {
-		if p.Metadata.Labels["app.kubernetes.io/component"] != "worker" {
+		if p.Metadata.Labels[k8sComponent] != "worker" {
 			continue
 		}
+		ns := p.Metadata.Namespace
+		if _, read := policies[ns]; !read {
+			raw, err := env.kubectl(ctx, "get", "networkpolicies", "-n", ns, "-o", "json")
+			if err != nil {
+				return k8sCheck{Name: name, Result: k8sFail, Detail: err.Error()}
+			}
+			var list k8sNetworkPolicyList
+			if err := json.Unmarshal(raw, &list); err != nil {
+				return k8sCheck{Name: name, Result: k8sFail, Detail: "kubectl output: " + err.Error()}
+			}
+			policies[ns] = list.Items
+		}
 		var by []string
-		for _, np := range list.Items {
+		for _, np := range policies[ns] {
 			if !np.limitsEgress() || !np.Spec.PodSelector.matches(p.Metadata.Labels) {
 				continue
 			}
@@ -541,9 +705,13 @@ func k8sOtherPodTargets(ctx context.Context, env k8sEnv) []string {
 // k8sProbe runs a sandbox of each runtime and has it try every address it
 // must not reach: the worker pod's ports on the pod's address and on the
 // sandbox bridge's gateway, another pod's address, and the Kubernetes API
-// at its Service address and its own addresses. Any that answers fails.
+// at its Service address and its own addresses. Any that answers fails. In
+// cluster mode that is every AerolVM pod's ports; only workers have a
+// sandbox bridge, and every worker's is at the same address, so each target
+// is tried once.
 func k8sProbe(ctx context.Context, env k8sEnv, pods []k8sPod, o k8sVerifyOptions) []k8sCheck {
 	var targets []string
+	seen := map[string]bool{}
 	for _, p := range pods {
 		ports := map[int]bool{k8sSSHGatewayPort: true}
 		bridge := k8sDefaultBridge
@@ -558,7 +726,7 @@ func k8sProbe(ctx context.Context, env k8sEnv, pods []k8sPod, o k8sVerifyOptions
 			}
 		}
 		addrs := []string{p.Status.PodIP}
-		if prefix, err := netip.ParsePrefix(bridge); err == nil {
+		if prefix, err := netip.ParsePrefix(bridge); err == nil && p.Metadata.Labels[k8sComponent] == "worker" {
 			addrs = append(addrs, prefix.Masked().Addr().Next().String())
 		}
 		sorted := make([]int, 0, len(ports))
@@ -571,7 +739,10 @@ func k8sProbe(ctx context.Context, env k8sEnv, pods []k8sPod, o k8sVerifyOptions
 				continue
 			}
 			for _, port := range sorted {
-				targets = append(targets, fmt.Sprintf("%s:%d", addr, port))
+				if t := fmt.Sprintf("%s:%d", addr, port); !seen[t] {
+					seen[t] = true
+					targets = append(targets, t)
+				}
 			}
 		}
 	}
@@ -666,7 +837,9 @@ func runK8s(ctx context.Context, a *app, args []string) int {
 	var o k8sVerifyOptions
 	var kubeContext, runtimes string
 	fs.StringVar(&o.namespace, "namespace", "aerolvm", "")
+	fs.StringVar(&o.workerNamespace, "worker-namespace", "", "")
 	fs.StringVar(&o.release, "release", "aerolvm", "")
+	fs.StringVar(&o.cluster, "cluster", "", "")
 	fs.StringVar(&kubeContext, "kube-context", "", "")
 	fs.StringVar(&o.probeImage, "probe-image", "alpine:3.20", "")
 	fs.StringVar(&runtimes, "probe-runtimes", "docker,gvisor", "")

@@ -14,22 +14,31 @@ import (
 func runtimeGOOS() string { return runtime.GOOS }
 
 // A worker pod as the chart makes it: no token, emptyDirs, the API port,
-// a sandbox range set by C3, the API token from its Secret, and the edge
-// certificate mounted by key (C25).
+// a sandbox range set by C3, the API token from its Secret, the edge
+// certificate mounted by key (C25), and runtime and agent privileged.
+// Another install's pod in the namespace is not checked.
 const k8sGoodPods = `{"items":[{
   "metadata":{"name":"aerolvm-0","labels":{"app.kubernetes.io/name":"aerolvm","app.kubernetes.io/instance":"aerolvm","app.kubernetes.io/component":"worker"}},
   "spec":{
+    "nodeName":"ip-10-0-1-5.ec2.internal",
     "automountServiceAccountToken":false,
     "volumes":[{"name":"containerd","emptyDir":{}},{"name":"netns","emptyDir":{}},
       {"name":"edge-tls","secret":{"secretName":"aerolvm-edge-tls","items":[{"key":"tls.crt","path":"tls.crt"},{"key":"tls.key","path":"tls.key"}]}}],
     "containers":[
-      {"name":"runtime","image":"ghcr.io/aerol-ai/aerolvm-runtime:v1"},
-      {"name":"agent","image":"ghcr.io/aerol-ai/aerolvm:v1","ports":[{"containerPort":21212}],
+      {"name":"runtime","image":"ghcr.io/aerol-ai/aerolvm-runtime:v1","securityContext":{"privileged":true}},
+      {"name":"agent","image":"ghcr.io/aerol-ai/aerolvm:v1","ports":[{"containerPort":21212}],"securityContext":{"privileged":true},
        "env":[{"name":"SB_CONTAINERD_BRIDGE_SUBNET","value":"10.200.0.0/16"},
          {"name":"SB_PAT_TOKEN","valueFrom":{"secretKeyRef":{"name":"aerolvm-api-token","key":"SB_PAT_TOKEN"}}},
          {"name":"SB_ROUTE_DNS_ADDR","value":"127.0.0.1:53053"}]},
-      {"name":"egress","image":"ghcr.io/aerol-ai/aerolvm:v1"}]},
-  "status":{"podIP":"10.244.0.12"}}]}`
+      {"name":"egress","image":"ghcr.io/aerol-ai/aerolvm:v1","securityContext":{"privileged":false}}]},
+  "status":{"podIP":"10.244.0.12"}},
+  {"metadata":{"name":"other-install-0","labels":{"app.kubernetes.io/name":"aerolvm","app.kubernetes.io/instance":"other","app.kubernetes.io/component":"worker"}},
+   "spec":{"containers":[{"name":"runtime","image":"ghcr.io/x/unsigned:v1","securityContext":{"privileged":true}}],"volumes":[{"name":"h","hostPath":{"path":"/"}}]}}]}`
+
+// k8sNamespaceLabelled is a namespace whose Pod Security enforce label is level.
+func k8sNamespaceLabelled(level string) string {
+	return `{"metadata":{"labels":{"kubernetes.io/metadata.name":"x","pod-security.kubernetes.io/enforce":"` + level + `"}}}`
+}
 
 // The chart's egress NetworkPolicy as the API server returns it (C24),
 // with the range a bank opened on purpose, and another app's policy that
@@ -53,14 +62,20 @@ const (
 	k8sAPIEndpoints = `{"items":[{"endpoints":[{"addresses":["172.18.0.2"]},{"addresses":["fd00::2"]}],"ports":[{"port":6443}]}]}`
 )
 
+// The worker namespace in the cluster-mode fixtures.
+const k8sWorkerNS = "aerolvm-workers"
+
 type fakeK8s struct {
 	pods         string
+	workerPods   string // pods in k8sWorkerNS
 	podsErr      error
 	apiIP        string
 	policies     string
 	policiesErr  error
+	workerPolicy string // NetworkPolicies in k8sWorkerNS
 	dnsPods      string
 	apiEndpoints string
+	namespaces   map[string]string
 	cosignErr    map[string]error
 	probeOut     map[string]string
 	probeErr     error
@@ -68,9 +83,10 @@ type fakeK8s struct {
 	signed       []string
 }
 
-// goodK8s is a clean install: every check passes.
+// goodK8s is a clean single-mode install: every check passes.
 func goodK8s() *fakeK8s {
-	return &fakeK8s{pods: k8sGoodPods, apiIP: "10.96.0.1", policies: k8sGoodPolicies, dnsPods: k8sDNSPods, apiEndpoints: k8sAPIEndpoints}
+	return &fakeK8s{pods: k8sGoodPods, apiIP: "10.96.0.1", policies: k8sGoodPolicies, dnsPods: k8sDNSPods, apiEndpoints: k8sAPIEndpoints,
+		namespaces: map[string]string{"aerolvm": k8sNamespaceLabelled("privileged")}}
 }
 
 func (f *fakeK8s) env() k8sEnv {
@@ -86,14 +102,20 @@ func (f *fakeK8s) env() k8sEnv {
 			switch {
 			case args[0] == "get" && args[1] == "pods" && args[3] == "kube-system":
 				return answer(f.dnsPods)
+			case args[0] == "get" && args[1] == "pods" && args[3] == k8sWorkerNS:
+				return answer(f.workerPods)
 			case args[0] == "get" && args[1] == "pods":
 				return []byte(f.pods), f.podsErr
 			case args[0] == "get" && args[1] == "svc":
 				return []byte(f.apiIP), nil
+			case args[0] == "get" && args[1] == "networkpolicies" && args[3] == k8sWorkerNS:
+				return answer(f.workerPolicy)
 			case args[0] == "get" && args[1] == "networkpolicies":
 				return []byte(f.policies), f.policiesErr
 			case args[0] == "get" && args[1] == "endpointslices":
 				return answer(f.apiEndpoints)
+			case args[0] == "get" && args[1] == "namespace":
+				return answer(f.namespaces[args[2]])
 			}
 			return nil, errors.New("unexpected kubectl " + strings.Join(args, " "))
 		},
@@ -126,8 +148,9 @@ func TestK8sVerifyPasses(t *testing.T) {
 			t.Fatalf("%s: %s %s", c.Name, c.Result, c.Detail)
 		}
 	}
-	if len(checks) != 8 {
-		t.Fatalf("%d checks, want 8: %+v", len(checks), checks)
+	// One namespace, so no release namespace check.
+	if len(checks) != 10 {
+		t.Fatalf("%d checks, want 10: %+v", len(checks), checks)
 	}
 	if strings.Join(f.signed, ",") != "ghcr.io/aerol-ai/aerolvm-runtime:v1,ghcr.io/aerol-ai/aerolvm:v1" {
 		t.Fatalf("signatures checked for %v, want each image once", f.signed)
@@ -151,7 +174,13 @@ func TestK8sVerifyPasses(t *testing.T) {
 	}
 }
 
-const k8sPolicyCheck = "a NetworkPolicy limits the worker pods' egress"
+const (
+	k8sPolicyCheck     = "a NetworkPolicy limits the worker pods' egress"
+	k8sPrivilegedCheck = "privileged containers only in the worker pods' runtime and agent"
+	k8sWorkerNSCheck   = "the worker namespace's Pod Security label is privileged"
+	k8sReleaseNSCheck  = "the release namespace enforces restricted Pod Security"
+	k8sAPICheck        = "no Kubernetes API credential in the pods"
+)
 
 func TestK8sVerifyFailures(t *testing.T) {
 	podsWith := func(edit func(string) string) string { return edit(k8sGoodPods) }
@@ -198,7 +227,7 @@ func TestK8sVerifyFailures(t *testing.T) {
 			return strings.Replace(s, `"containers":[`, `"initContainers":[{"name":"setup","image":"ghcr.io/aerol-ai/aerolvm:v1","env":[{"name":"SB_DNS_API_TOKEN","value":"x"}]}],"containers":[`, 1)
 		})}, check: "no DNS provider token in the pods", want: "fail: aerolvm-0/setup: environment variable SB_DNS_API_TOKEN"},
 		{name: "a Secret loaded whole", f: &fakeK8s{pods: podsWith(func(s string) string {
-			return strings.Replace(s, `{"name":"egress","image":"ghcr.io/aerol-ai/aerolvm:v1"}`, `{"name":"egress","image":"ghcr.io/aerol-ai/aerolvm:v1","envFrom":[{"configMapRef":{"name":"settings"}},{"secretRef":{"name":"dns"}}]}`, 1)
+			return strings.Replace(s, `{"name":"egress","image":"ghcr.io/aerol-ai/aerolvm:v1",`, `{"name":"egress","image":"ghcr.io/aerol-ai/aerolvm:v1","envFrom":[{"configMapRef":{"name":"settings"}},{"secretRef":{"name":"dns"}}],`, 1)
 		})}, check: "no DNS provider token in the pods", want: "fail: aerolvm-0/egress: Secret dns loaded whole into the environment"},
 		{name: "an unsigned init container image", f: &fakeK8s{pods: podsWith(func(s string) string {
 			return strings.Replace(s, `"containers":[`, `"initContainers":[{"name":"setup","image":"ghcr.io/x/setup:v1"}],"containers":[`, 1)
@@ -225,6 +254,25 @@ func TestK8sVerifyFailures(t *testing.T) {
 		{name: "no worker pod", f: with(func(f *fakeK8s) {
 			f.pods = strings.Replace(k8sGoodPods, `,"app.kubernetes.io/component":"worker"`, ``, 1)
 		}), check: k8sPolicyCheck, want: "fail: no worker pod"},
+
+		// P8 Phase 2: privilege only where the plan puts it.
+		{name: "a privileged egress container", f: with(func(f *fakeK8s) {
+			f.pods = strings.Replace(k8sGoodPods, `"securityContext":{"privileged":false}`, `"securityContext":{"privileged":true}`, 1)
+		}), check: k8sPrivilegedCheck, want: "fail: aerolvm/aerolvm-0/egress is privileged; only runtime and agent may be"},
+		{name: "a privileged init container in the worker", f: with(func(f *fakeK8s) {
+			f.pods = strings.Replace(k8sGoodPods, `"containers":[`, `"initContainers":[{"name":"runtime","image":"ghcr.io/aerol-ai/aerolvm:v1","securityContext":{"privileged":true}}],"containers":[`, 1)
+		}), check: k8sPrivilegedCheck, want: "fail: aerolvm/aerolvm-0/runtime is privileged; only runtime and agent may be"},
+		{name: "a privileged pod that is not a worker", f: with(func(f *fakeK8s) {
+			f.pods = strings.Replace(k8sGoodPods, `"app.kubernetes.io/component":"worker"}},
+  "spec":{`, `"app.kubernetes.io/component":"gateway"}},
+  "spec":{`, 1)
+		}), check: k8sPrivilegedCheck, want: "fail: aerolvm/aerolvm-0/runtime is privileged in a pod that is not a worker"},
+		{name: "the namespace has no Pod Security label", f: with(func(f *fakeK8s) { f.namespaces["aerolvm"] = `{"metadata":{}}` }),
+			check: k8sWorkerNSCheck, want: "fail: namespace aerolvm has no pod-security.kubernetes.io/enforce label; set it to privileged"},
+		{name: "the namespace enforces baseline", f: with(func(f *fakeK8s) { f.namespaces["aerolvm"] = k8sNamespaceLabelled("baseline") }),
+			check: k8sWorkerNSCheck, want: "fail: namespace aerolvm enforces baseline, not privileged"},
+		{name: "the namespace cannot be read", f: with(func(f *fakeK8s) { f.namespaces = nil }), check: k8sWorkerNSCheck, want: "fail: forbidden"},
+		{name: "the namespace not JSON", f: with(func(f *fakeK8s) { f.namespaces["aerolvm"] = "nope" }), check: k8sWorkerNSCheck, want: "fail: kubectl output"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			got := k8sResults(k8sVerify(context.Background(), tc.f.env(), k8sOpts))[tc.check]
@@ -232,6 +280,148 @@ func TestK8sVerifyFailures(t *testing.T) {
 				t.Fatalf("%s = %q, want %q", tc.check, got, tc.want)
 			}
 		})
+	}
+}
+
+// A cluster-mode install (§7): the chart's operator and the operator's
+// server and gateway in the release namespace, and a worker in its own
+// namespace. The chart labels its pods with the release, the operator with
+// the AerolCluster's name. Only the operator holds a Kubernetes API token.
+const (
+	k8sClusterPods = `{"items":[
+ {"metadata":{"name":"aerolvm-operator-7d9","labels":{"app.kubernetes.io/name":"aerolvm","app.kubernetes.io/instance":"aerolvm","app.kubernetes.io/component":"operator"}},
+  "spec":{"containers":[{"name":"operator","image":"ghcr.io/aerol-ai/aerolvm-operator:v1"}]},"status":{"podIP":"10.244.1.2"}},
+ {"metadata":{"name":"prod-server-0","labels":{"app.kubernetes.io/name":"aerolvm","aerolvm.io/cluster":"prod","app.kubernetes.io/component":"server"}},
+  "spec":{"automountServiceAccountToken":false,"containers":[{"name":"server","image":"ghcr.io/aerol-ai/aerolvm:v1","ports":[{"containerPort":7946}],"securityContext":{"privileged":false}}]},"status":{"podIP":"10.244.1.3"}},
+ {"metadata":{"name":"prod-gateway-abc","labels":{"app.kubernetes.io/name":"aerolvm","aerolvm.io/cluster":"prod","app.kubernetes.io/component":"gateway"}},
+  "spec":{"automountServiceAccountToken":false,"containers":[{"name":"gateway","image":"ghcr.io/aerol-ai/aerolvm:v1","ports":[{"containerPort":21212}]}]},"status":{"podIP":"10.244.1.4"}}]}`
+	k8sClusterWorkers = `{"items":[
+ {"metadata":{"name":"prod-worker-a","labels":{"app.kubernetes.io/name":"aerolvm","aerolvm.io/cluster":"prod","app.kubernetes.io/component":"worker"}},
+  "spec":{"nodeName":"ip-10-0-2-7.eu-west-1.compute.internal","automountServiceAccountToken":false,"containers":[
+    {"name":"runtime","image":"ghcr.io/aerol-ai/aerolvm-runtime:v1","securityContext":{"privileged":true}},
+    {"name":"agent","image":"ghcr.io/aerol-ai/aerolvm:v1","ports":[{"containerPort":21212}],"securityContext":{"privileged":true}},
+    {"name":"edge","image":"ghcr.io/aerol-ai/aerolvm-edge:v1"}]},
+  "status":{"podIP":"10.244.2.9"}}]}`
+	k8sClusterWorkerPolicy = `{"items":[{"metadata":{"name":"prod-worker-egress"},"spec":{
+  "podSelector":{"matchLabels":{"aerolvm.io/cluster":"prod","app.kubernetes.io/component":"worker"}},
+  "policyTypes":["Egress"],
+  "egress":[{"to":[{"namespaceSelector":{"matchLabels":{"kubernetes.io/metadata.name":"aerolvm-system"}},"podSelector":{"matchLabels":{"aerolvm.io/cluster":"prod"}}}]},
+    {"to":[{"ipBlock":{"cidr":"0.0.0.0/0","except":["10.0.0.0/8","172.16.0.0/12","192.168.0.0/16","100.64.0.0/10","169.254.0.0/16"]}}]}]}}]}`
+)
+
+// clusterK8s is a clean cluster-mode install.
+func clusterK8s() *fakeK8s {
+	f := goodK8s()
+	f.pods, f.workerPods, f.workerPolicy = k8sClusterPods, k8sClusterWorkers, k8sClusterWorkerPolicy
+	f.namespaces = map[string]string{"aerolvm-system": k8sNamespaceLabelled("restricted"), k8sWorkerNS: k8sNamespaceLabelled("privileged")}
+	return f
+}
+
+var k8sClusterOpts = k8sVerifyOptions{namespace: "aerolvm-system", workerNamespace: k8sWorkerNS, release: "aerolvm", cluster: "prod",
+	probeImage: "alpine:3.20", probeRuntimes: []string{"docker", "gvisor"}}
+
+func TestK8sVerifyClusterModePasses(t *testing.T) {
+	f := clusterK8s()
+	checks := k8sVerify(context.Background(), f.env(), k8sClusterOpts)
+	for _, c := range checks {
+		if c.Result != k8sPass {
+			t.Errorf("%s: %s %s", c.Name, c.Result, c.Detail)
+		}
+	}
+	got := k8sResults(checks)
+	if len(checks) != 11 || got[k8sReleaseNSCheck] == "" {
+		t.Fatalf("%d checks: %+v", len(checks), checks)
+	}
+	for check, want := range map[string]string{
+		"AerolVM pods found": "pass: 4 pod(s)",
+		k8sAPICheck:          "pass: the 1 operator pod(s) hold one by design",
+		k8sPrivilegedCheck:   "pass: 1 worker pod(s) in namespace aerolvm-workers",
+		k8sPolicyCheck:       "pass: prod-worker-a (prod-worker-egress)",
+		"images signed by the AerolVM release workflow": "pass: ghcr.io/aerol-ai/aerolvm-edge:v1, ghcr.io/aerol-ai/aerolvm-operator:v1",
+	} {
+		if !strings.HasPrefix(got[check], want) {
+			t.Errorf("%s = %q, want %q", check, got[check], want)
+		}
+	}
+	// Every AerolVM pod's ports are probed; the sandbox bridge only once.
+	probe := f.commands[0]
+	for _, target := range []string{"10.244.1.3:7946", "10.244.1.4:21212", "10.244.2.9:21212", "10.88.0.1:21212"} {
+		if !strings.Contains(probe, target) {
+			t.Errorf("the probe does not try %s: %s", target, probe)
+		}
+	}
+	if strings.Count(probe, "10.88.0.1:2220") != 1 || strings.Contains(probe, "10.88.0.1:7946") {
+		t.Errorf("the bridge is probed per pod: %s", probe)
+	}
+}
+
+func TestK8sVerifyClusterModeFailures(t *testing.T) {
+	with := func(edit func(*fakeK8s)) *fakeK8s {
+		f := clusterK8s()
+		edit(f)
+		return f
+	}
+	for _, tc := range []struct {
+		name, check, want string
+		f                 *fakeK8s
+	}{
+		{name: "a privileged server", check: k8sPrivilegedCheck, want: "fail: aerolvm-system/prod-server-0/server is privileged outside the worker namespace aerolvm-workers",
+			f: with(func(f *fakeK8s) {
+				f.pods = strings.Replace(k8sClusterPods, `"privileged":false`, `"privileged":true`, 1)
+			})},
+		{name: "a server with a token", check: k8sAPICheck, want: "fail: prod-server-0: automountServiceAccountToken is not false",
+			f: with(func(f *fakeK8s) {
+				f.pods = strings.Replace(k8sClusterPods, `"automountServiceAccountToken":false,`, ``, 1)
+			})},
+		{name: "an operator pod outside the release namespace", check: k8sAPICheck, want: "fail: prod-worker-a: automountServiceAccountToken is not false",
+			f: with(func(f *fakeK8s) {
+				f.workerPods = strings.Replace(strings.Replace(k8sClusterWorkers, `"automountServiceAccountToken":false,`, ``, 1),
+					`"app.kubernetes.io/component":"worker"`, `"app.kubernetes.io/component":"operator"`, 1)
+			})},
+		{name: "the release namespace unlabelled", check: k8sReleaseNSCheck, want: "fail: namespace aerolvm-system has no pod-security.kubernetes.io/enforce label; set it to restricted",
+			f: with(func(f *fakeK8s) { f.namespaces["aerolvm-system"] = `{"metadata":{}}` })},
+		{name: "the release namespace enforces baseline", check: k8sReleaseNSCheck, want: "fail: namespace aerolvm-system enforces baseline, not restricted",
+			f: with(func(f *fakeK8s) { f.namespaces["aerolvm-system"] = k8sNamespaceLabelled("baseline") })},
+		{name: "the release namespace allows privileged pods", check: k8sReleaseNSCheck, want: "fail: namespace aerolvm-system enforces privileged, not restricted",
+			f: with(func(f *fakeK8s) { f.namespaces["aerolvm-system"] = k8sNamespaceLabelled("privileged") })},
+		{name: "the worker namespace enforces restricted", check: k8sWorkerNSCheck, want: "fail: namespace aerolvm-workers enforces restricted, not privileged",
+			f: with(func(f *fakeK8s) { f.namespaces[k8sWorkerNS] = k8sNamespaceLabelled("restricted") })},
+		{name: "no policy in the worker namespace", check: k8sPolicyCheck, want: "fail: prod-worker-a: no NetworkPolicy limits its egress",
+			f: with(func(f *fakeK8s) { f.workerPolicy = `{"items":[]}` })},
+		{name: "the worker namespace's policies unreadable", check: k8sPolicyCheck, want: "fail: forbidden",
+			f: with(func(f *fakeK8s) { f.workerPolicy = "" })},
+		{name: "the worker pods unreadable", check: "AerolVM pods found", want: "fail: forbidden",
+			f: with(func(f *fakeK8s) { f.workerPods = "" })},
+		{name: "no pods in either namespace", check: "AerolVM pods found", want: "fail: no pods labelled app.kubernetes.io/name=aerolvm and app.kubernetes.io/instance=aerolvm or aerolvm.io/cluster=prod in namespace aerolvm-system or aerolvm-workers",
+			f: with(func(f *fakeK8s) { f.pods, f.workerPods = `{"items":[]}`, `{"items":[]}` })},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := k8sResults(k8sVerify(context.Background(), tc.f.env(), k8sClusterOpts))[tc.check]
+			if !strings.HasPrefix(got, tc.want) {
+				t.Fatalf("%s = %q, want %q", tc.check, got, tc.want)
+			}
+		})
+	}
+}
+
+// The command passes --worker-namespace and --cluster through, and both
+// default to single mode's values.
+func TestK8sVerifyClusterFlags(t *testing.T) {
+	h := newHarness(t)
+	f := clusterK8s()
+	orig := k8sEnvFor
+	t.Cleanup(func() { k8sEnvFor = orig })
+	k8sEnvFor = func(*app, *commonFlags, string) k8sEnv { return f.env() }
+	if code := h.run("k8s", "verify", "--namespace", "aerolvm-system", "--worker-namespace", k8sWorkerNS, "--cluster", "prod"); code != exitOK {
+		t.Fatalf("exit %d: %s %s", code, h.stdout.String(), h.stderr.String())
+	}
+	// With neither flag, verify looks for a single-mode install in the
+	// release namespace and finds only the chart's operator pod.
+	if code := h.run("k8s", "verify", "--namespace", "aerolvm-system", "--json"); code != exitError {
+		t.Fatalf("exit %d, want 1", code)
+	}
+	if !strings.Contains(h.stdout.String(), `"detail": "1 pod(s)"`) {
+		t.Fatalf("%s", h.stdout.String())
 	}
 }
 
@@ -270,7 +460,7 @@ func TestK8sVerifyCommand(t *testing.T) {
 		Checks []k8sCheck `json:"checks"`
 	}
 	h.jsonOut(&out)
-	if !out.OK || len(out.Checks) != 8 {
+	if !out.OK || len(out.Checks) != 10 {
 		t.Fatalf("%+v", out)
 	}
 
