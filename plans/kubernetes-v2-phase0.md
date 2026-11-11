@@ -89,14 +89,20 @@ to main.
 | C3: the containerd sandbox range as a setting (`SB_CONTAINERD_BRIDGE_SUBNET`) | #1152 | main | Open; **proven live** on Bottlerocket with 10.200.0.0/16: runc at 10.200.0.2, gVisor at 10.200.0.3, both online, no rule left naming 10.88.0.0/16 |
 | C6: the egress gateway without systemd (numeric `SB_EGRESS_GATEWAY_USER`, `SB_EGRESS_PEER_CGROUP=none`) | #1153 | main | Open; **proven live** on Bottlerocket: gateway as uid 65532 with only `NET_ADMIN` and `NET_BIND_SERVICE`, `egress_gateway_ready`, example.com allowed and another site blocked |
 | C4: Raft advertises and dials DNS names | #1155 | main | Open; two real Raft servers by name, with and without TLS; the whole cluster package passes |
-| C7: the runtime supervisor (`aerolvm-supervisor`): the runtime container's cgroup shape, containerd kept in `sandboxes/_runtime`, orphans reaped | #1154 | main | Open; checked on a real kernel (a privileged container with its own cgroup namespace): the shape, containerd in `_runtime`, restarted after `kill -9`, no zombies |
+| C7: the runtime supervisor (`aerolvm-supervisor`): the runtime container's cgroup shape, containerd kept in `sandboxes/_runtime`, orphans reaped; F8's fix (it unmounts `/run/netns/*` as the pod ends) | #1154 | main | Open; checked on a real kernel (a privileged container with its own cgroup namespace): the shape, containerd in `_runtime`, restarted after `kill -9`, no zombies. F8 on kind: the pod deletes in 1 to 2 s with sandboxes running, 0 namespace mounts left (before: stuck past 90 s with 7) |
+| T3 (C7): the ownership lease enforced where the sandboxes live: sandboxd writes `SB_OWNERSHIP_LEASE_FILE`, the supervisor freezes the fenced sandboxes when it runs out and thaws only on proof | #1162 | #1154 | Open; real kernel: a frozen process stops, no thaw without proof. **Live on kind** with a hand-written lease: runc and gVisor frozen at 15.0 s, `exec` gets no answer; a lease proving only runc thaws only runc. The cross-node test needs Phase 2's cluster chart |
 | P1: the `aerolvm`, `aerolvm-runtime` and `aerolvm-edge` images; the release job pushes, signs and attests them | #1156 | #1154 | Open; built locally for arm64: runc and gVisor containers ran under the supervisor's containerd; Caddy with every plugin, non-root, read-only root |
+| P3, P4, P10: the Helm chart's `single` mode, `make k8s-dev`, the kind smoke test in CI (advisory), the Kubernetes docs page, the install notes | #1157 | #1156 | Open; **proven live on kind**: 3/3 Ready; runc and gVisor sandboxes online; an allow list kept to example.com; an agent upgrade in place kept both sandboxes running; the pod deletes in about 1 s. Three bugs found and fixed there (the gateway's rights, the CNI state across an agent restart, F8) |
+| C24 (Phase 1 part): the chart's private-range default and the in-pod firewall; the smoke test checks sandboxes cannot reach the worker or the Kubernetes API | #1157, #1160 | #1156, main | Open; **proven live on kind**: runc and gVisor refused on all 9 worker and API addresses. With the edge on, sandboxd's node guard had opened the pod's 443 and 80 to sandboxes; #1160 adds `SB_SANDBOX_NODE_INGRESS=false` and the chart sets it |
+| P8 (single-mode subset): `aerolvm k8s verify`: signed images, no host folders, no API credential, no DNS token, the probe sandboxes | #1158, #1161 | #1157, #1158 | Open; **proven live on kind**: every check PASS (signatures skipped for local images), FAIL on a seeded host-folder pod; it caught the open 443 above |
+| C25: the edge container (Caddy) and a cert-manager certificate for the API and sandbox links; sandboxd has Caddy reload a renewed certificate | #1159, #1161 | main, #1158 | Open; **proven live on kind** with cert-manager v1.21.3 and a self-signed issuer: the API and a sandbox link over HTTPS; a renewed certificate served in 22 to 96 s with no restart. Found F15: sandboxd started before Caddy never took :443; the agent now waits for Caddy |
 | Go 1.26.11 for GO-2026-6859 (blocks `go-security` on every PR) | #1143 | main | **Merged** |
 
-Next, in order: the chart's `single` mode (P3) with `make k8s-dev` and the
-docs (P4), the in-pod firewall and chart settings (C24), `aerolvm k8s
-verify` (P8), cert-manager (C25), install notes (P10), and the ownership
-lease in the runtime supervisor (T3). C5 (servers and gateways
+Every Phase 1 item now has a PR. Left before Phase 1's exit: the G5
+measurement (a gVisor create in a pod within 10% of the same machine
+without Kubernetes), `cosign verify` against the first release that signs
+the images, and the `kubernetes` CI job once the stack reaches `main`.
+C5 (servers and gateways
 under `restricted` pod security) is measured once those pods exist: their
 cluster files cannot come from `sandboxd init` in a pod (finding F14), so
 the measurement needs the chart's or the operator's way of making them.
