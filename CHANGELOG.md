@@ -14,12 +14,12 @@ timeline
     July 2026 : 1 release : v0.5.5
     September 2026 : 3 releases : v0.5.6 to v0.6.0
     October 2026 : 8 releases : v0.6.1 to v0.6.8
-    November 2026 : 6 releases : v0.6.9 to v0.7.0
+    November 2026 : 7 releases : v0.6.9 to v0.7.1
 ```
 
 | Release line | Releases | Dates | Latest |
 |---|---|---|---|
-| [0.7](#07-release-line) | 1 | Nov 10, 2026 | [v0.7.0](#v070-run-clusters-like-kubernetes-one-line-joins-kubectl-style-commands-and-rolling-upgrades) |
+| [0.7](#07-release-line) | 2 | Nov 10, 2026 to Nov 11, 2026 | [v0.7.1](#v071-aerolvm-on-kubernetes) |
 | [0.6](#06-release-line) | 14 | Sep 28, 2026 to Nov 9, 2026 | [v0.6.13](#v0613-cluster-writes-that-never-hang-creates-right-after-a-leader-change-and-a-mirror-fallback-for-terraform-nodes) |
 | [0.5](#05-release-line) | 7 | Jun 1, 2026 to Sep 28, 2026 | [v0.5.7](#v057-dependency-updates) |
 | [0.4](#04-release-line) | 1 | May 28, 2026 | [v0.4.1](#v041-firecracker-runtime-wiring) |
@@ -28,6 +28,27 @@ timeline
 | [0.1](#01-release-line) | 8 | May 8, 2026 to May 16, 2026 | [v0.1.7](#v017-daytona-and-e2b-compatibility-snapshots-image-builds) |
 
 ## 0.7 release line
+
+### v0.7.1: AerolVM on Kubernetes
+
+*November 11, 2026* · [Full notes](https://github.com/aerol-ai/microvm/releases/tag/v0.7.1)
+
+Run AerolVM on Kubernetes. A Helm chart installs one worker pod that holds the server and every sandbox, with signed images, HTTPS sandbox links through cert-manager, and a command that checks the install against its security rules.
+
+> **New sandbox IDs carry a cell number.** IDs made by v0.7.1 start with the node's cell (`SB_CELL_ID`, default 1). Old IDs keep working. Read "Upgrade notes" at the end.
+
+- **A Helm chart for Kubernetes.** `charts/aerolvm` installs AerolVM in `single` mode: one worker pod with a `runtime` container (containerd and every sandbox), an `agent` container (the server) and an `egress` container (the hostname filter). A chart upgrade never restarts the pod, and changing the agent's image restarts only the agent: sandboxes keep running. `make k8s-dev` runs it on kind from a checkout. (#1157)
+- **Signed images.** The release now publishes `aerolvm`, `aerolvm-runtime` and `aerolvm-edge` to ghcr.io for amd64 and arm64, signed with cosign by the release workflow, with an SBOM and build provenance. `RELEASE-VERIFICATION.md` shows how to check them. (#1156)
+- **`aerolvm k8s verify` checks an install.** It checks that the images are signed, that no pod mounts a folder from the node or holds a Kubernetes API credential or a DNS provider token, and that a runc and a gVisor sandbox cannot reach the worker pod's ports or the Kubernetes API. It exits 1 if any check fails. (#1158, #1161)
+- **HTTPS sandbox links on Kubernetes.** With `edge.enabled`, an edge container serves the API and every sandbox port over HTTPS, with a certificate from cert-manager. A renewed certificate is used without a restart. (#1159, #1161)
+- **Sandboxes stay inside the pod's limits.** The runtime container caps the sandboxes' memory below the pod's limit, keeps a reserve for the server, and makes each sandbox the kernel's whole choice when memory runs out: one sandbox stops, the server and other sandboxes keep running. Tested with 1,000 gVisor sandboxes on one machine. (#1146, #1154)
+- **`GET /ready`.** It answers 503 while a cluster node is cut off from the control plane, so a load balancer or Kubernetes stops sending it traffic. `/health` is unchanged. (#1148)
+- **Disk limits on the containerd engine.** New sandboxes are refused when the sandbox disk is nearly full (`SB_DISK_FLOOR_RATIO`), and `diskGB` can be enforced as an XFS project quota per sandbox (`SB_CONTAINERD_DISK_QUOTA`). (#1150, #1151)
+
+**Before you upgrade:**
+
+- **Sandbox IDs.** New IDs start with the cell number in their first two hex digits (`SB_CELL_ID`, 1 to 255, default 1). Code that parses IDs only as opaque strings is unaffected. Every node of one cluster must use the same cell.
+- **Nothing changes until you turn it on.** Every new setting above is off by default except `/ready`, which is a new route.
 
 ### v0.7.0: Run clusters like Kubernetes: one-line joins, kubectl-style commands and rolling upgrades
 
