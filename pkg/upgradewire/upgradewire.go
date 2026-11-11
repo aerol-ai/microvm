@@ -72,6 +72,8 @@ const (
 	ErrCodeRolloutConflict       = "rollout_conflict"        // the current rollout's state refuses the command
 	ErrCodeSkew                  = "version_skew"            // target below upgrade_from_min, or a downgrade
 	ErrCodeRemoteUpgradeDisabled = "remote_upgrade_disabled" // SB_REMOTE_UPGRADE=false on the node
+	ErrCodeOperatorDriven        = "operator_driven"         // SB_UPGRADE_DRIVER=operator on the node: the operator swaps its image
+	ErrCodeKubernetesManaged     = "kubernetes_managed"      // apply or rollback on a cluster the operator upgrades
 	ErrCodeNeedsDowntime         = "needs_allow_downtime"    // one or two voters and no AllowDowntime
 	ErrCodeSkippedNodes          = "skipped_nodes"           // finalize while nodes are still skipped
 	ErrCodeHashMismatch          = "hash_mismatch"           // upload body does not hash to its path
@@ -209,7 +211,11 @@ type RolloutNode struct {
 	ManualCommand string `json:"manual_command,omitempty"`
 	// Migrated is true once the node ran its one-way schema migrations
 	// at finalize (§6.5); finalized waits for every node.
-	Migrated  bool      `json:"migrated,omitempty"`
+	Migrated bool `json:"migrated,omitempty"`
+	// Operator is true for a node the Kubernetes operator upgrades
+	// (C13). While its state is "upgrading", the operator swaps the
+	// node's agent image; the node is done once it reports the target.
+	Operator  bool      `json:"operator,omitempty"`
 	UpdatedAt time.Time `json:"updated_at"`
 }
 

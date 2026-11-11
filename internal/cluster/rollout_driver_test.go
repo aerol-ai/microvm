@@ -34,6 +34,8 @@ type fakeRolloutHost struct {
 	drains  []string
 	applied uint64
 	clock   time.Time
+	// oldServer stands for a Raft server too old for the operator flag.
+	oldServer bool
 }
 
 func newFakeRolloutHost(fsm *placementFSM, self string) *fakeRolloutHost {
@@ -112,6 +114,7 @@ func (h *fakeRolloutHost) event(_ context.Context, rc RolloutCommand) (rolloutAp
 	}
 	return h.apply(command{Op: opRolloutCommand, RolloutCmd: &rc})
 }
+func (h *fakeRolloutHost) operatorStepsAllowed() bool { return !h.oldServer }
 func (h *fakeRolloutHost) finalizeTarget(r *RolloutRecord) (ActiveVersion, error) {
 	return ActiveVersion{FV: 13, Release: r.TargetVersion}, nil
 }
@@ -153,6 +156,8 @@ type fakeNode struct {
 	applies     int
 	stages      int
 	finalizes   int
+	// applyCalls counts every apply call, refused ones too.
+	applyCalls int
 }
 
 // fakeNodes is rolloutNodeClient over fakeNodes; an apply "restarts" the
@@ -189,6 +194,7 @@ func (f *fakeNodes) Step(_ context.Context, m Member, req UpgradeStepRequest) (U
 		f.mu.Unlock()
 		return resp, err
 	case UpgradeStepApply:
+		n.applyCalls++
 		if n.applyErr != nil {
 			err := n.applyErr
 			f.mu.Unlock()

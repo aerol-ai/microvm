@@ -249,6 +249,8 @@ aerolvm release pull v0.7.0 -o aerolvm-v0.7.0.tgz
 aerolvm upgrade apply v0.7.0 --from aerolvm-v0.7.0.tgz --wait
 ```
 
+**On Kubernetes,** the AerolVM operator upgrades the cluster. Change `spec.version` on your `AerolCluster` (with `helm upgrade`, or by editing the object), and the operator walks the nodes in the same order, swapping each pod's image when its turn comes. `aerolvm upgrade apply` and `aerolvm upgrade rollback` refuse there with `kubernetes_managed`, so the version has one owner. To roll back, set `spec.version` back. `status`, `stop`, `resume` and `finalize` work as usual.
+
 The same commands upgrade a single server, too: `apply` upgrades that one node. [Upgrade](/cluster/upgrade/) says what running sandboxes see during an upgrade, and how to make the first upgrade from a release older than these commands.
 
 ### Use more than one cluster

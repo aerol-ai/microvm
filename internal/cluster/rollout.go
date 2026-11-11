@@ -89,6 +89,9 @@ func (c *Cluster) ApplyRollout(ctx context.Context, caller string, req upgradewi
 	if !c.IsLeader() {
 		return nil, false, ErrNotLeader
 	}
+	if err := c.refuseUnlessOperator(ctx); err != nil {
+		return nil, false, err
+	}
 	if err := c.raftServersRunAtLeast(rolloutFSMOpsVersion, "rollouts"); err != nil {
 		return nil, false, rolloutErr(http.StatusConflict, "cluster_version", err.Error(), "upgrade every server to a release with rollouts first (install.sh, once per node)")
 	}
@@ -153,6 +156,11 @@ func (c *Cluster) RolloutCommand(ctx context.Context, caller, command string) (*
 	case evStop, evResume, evFinalize, evRollback:
 	default:
 		return nil, rolloutErr(http.StatusBadRequest, "bad_request", "unknown rollout command "+command, "")
+	}
+	if command == evRollback {
+		if err := c.refuseUnlessOperator(ctx); err != nil {
+			return nil, err
+		}
 	}
 	cur, active := c.fsm.rolloutView()
 	v := decideRollout(cur, rolloutEvent{Kind: command})

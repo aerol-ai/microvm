@@ -137,6 +137,9 @@ type Config struct {
 	// commands over the API. Default true, false in enterprise mode unless
 	// set (remote_upgrade.go).
 	RemoteUpgrade bool
+	// UpgradeDriver is SB_UPGRADE_DRIVER: empty, or "operator" when the
+	// Kubernetes operator upgrades this node (remote_upgrade.go).
+	UpgradeDriver string
 	// UpgradeServeMBPS is SB_UPGRADE_SERVE_MBPS: the cap, in MB/s, on the
 	// release-file copies one server serves to other nodes during a
 	// rollout (CEO D15). Default DefaultUpgradeServeMBPS.

@@ -132,9 +132,13 @@ type RolloutNodeRecord struct {
 	DeadlineUnixNano int64  `json:"deadline_unix_nano,omitempty"`
 	// Migrated is true once the node ran its one-way migrations at
 	// finalize.
-	Migrated        bool   `json:"migrated,omitempty"`
-	ManualCommand   string `json:"manual_command,omitempty"`
-	UpdatedUnixNano int64  `json:"updated_unix_nano"`
+	Migrated      bool   `json:"migrated,omitempty"`
+	ManualCommand string `json:"manual_command,omitempty"`
+	// Operator is set when the node answered its stage step that the
+	// Kubernetes operator upgrades it (C13): the walk marks its turn and
+	// waits for the operator to swap its image, instead of calling it.
+	Operator        bool  `json:"operator,omitempty"`
+	UpdatedUnixNano int64 `json:"updated_unix_nano"`
 }
 
 // RolloutCommand is opRolloutCommand.
@@ -158,17 +162,21 @@ type RolloutNodeUpdate struct {
 	// ExpectState makes the move a compare-and-set: it applies only while
 	// the node is in this state. Empty applies from any state the table
 	// allows.
-	ExpectState      string            `json:"expect_state,omitempty"`
-	Version          string            `json:"version,omitempty"`
-	Arch             string            `json:"arch,omitempty"`
-	Error            string            `json:"error,omitempty"`
-	ClearError       bool              `json:"clear_error,omitempty"`
-	Op               string            `json:"op,omitempty"`
-	Term             uint64            `json:"term,omitempty"`
-	DeadlineUnixNano int64             `json:"deadline_unix_nano,omitempty"`
-	Migrated         bool              `json:"migrated,omitempty"`
-	ManualCommand    string            `json:"manual_command,omitempty"`
-	PrevFiles        map[string]string `json:"prev_files,omitempty"`
+	ExpectState      string `json:"expect_state,omitempty"`
+	Version          string `json:"version,omitempty"`
+	Arch             string `json:"arch,omitempty"`
+	Error            string `json:"error,omitempty"`
+	ClearError       bool   `json:"clear_error,omitempty"`
+	Op               string `json:"op,omitempty"`
+	Term             uint64 `json:"term,omitempty"`
+	DeadlineUnixNano int64  `json:"deadline_unix_nano,omitempty"`
+	Migrated         bool   `json:"migrated,omitempty"`
+	ManualCommand    string `json:"manual_command,omitempty"`
+	// Operator marks the node operator-driven (C13). Written only once
+	// every Raft server applies it (rolloutOperatorFSMOpsVersion): an older
+	// server would drop it and, as leader, call the node itself.
+	Operator  bool              `json:"operator,omitempty"`
+	PrevFiles map[string]string `json:"prev_files,omitempty"`
 	// Add puts a node into the rollout (a join during the rollout, §6.5).
 	Add *RolloutNodeRecord `json:"add,omitempty"`
 	// Pause, on a node update, records that the one --pause-after pause
@@ -460,6 +468,9 @@ func (f *placementFSM) applyRolloutNodeLocked(cmd command) (any, error) {
 		if in.ManualCommand != "" {
 			n.ManualCommand = in.ManualCommand
 		}
+		if in.Operator {
+			n.Operator = true
+		}
 		n.UpdatedUnixNano = stamp
 	}
 	if len(in.PrevFiles) > 0 {
@@ -571,7 +582,7 @@ func RolloutAPIView(r *RolloutRecord, active ActiveVersion) *upgradewire.Rollout
 		out.Nodes = append(out.Nodes, upgradewire.RolloutNode{
 			NodeID: n.NodeID, Role: n.Role, Arch: n.Arch, State: n.State, Version: n.Version,
 			Order: n.Order, Batch: n.Batch, Error: n.Error, ManualCommand: n.ManualCommand, Migrated: n.Migrated,
-			UpdatedAt: time.Unix(0, n.UpdatedUnixNano).UTC(),
+			Operator: n.Operator, UpdatedAt: time.Unix(0, n.UpdatedUnixNano).UTC(),
 		})
 	}
 	return out
