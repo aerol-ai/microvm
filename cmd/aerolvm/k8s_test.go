@@ -95,6 +95,7 @@ type fakeK8s struct {
 	cosignErr map[string]error
 	probeOut  map[string]string
 	probeErr  error
+	probeErrs map[string]error // by runtime
 	commands  []string
 	signed    []string
 }
@@ -158,6 +159,9 @@ func (f *fakeK8s) env() k8sEnv {
 		},
 		probe: func(_ context.Context, image, runtime, command string) (string, error) {
 			f.commands = append(f.commands, runtime+" "+image+" "+command)
+			if err := f.probeErrs[runtime]; err != nil {
+				return "", err
+			}
 			return f.probeOut[runtime], f.probeErr
 		},
 	}
@@ -213,11 +217,11 @@ func TestK8sVerifyPasses(t *testing.T) {
 }
 
 const (
-	k8sPolicyCheck     = "a NetworkPolicy limits the worker pods' egress"
-	k8sPrivilegedCheck = "privileged containers only in the worker pods' runtime and agent"
-	k8sWorkerNSCheck   = "the worker namespace's Pod Security label is privileged"
-	k8sReleaseNSCheck  = "the release namespace enforces restricted Pod Security"
-	k8sAPICheck        = "no Kubernetes API credential in the pods"
+	k8sPolicyCheck     = k8sRuleEgress
+	k8sPrivilegedCheck = k8sRulePrivileged
+	k8sWorkerNSCheck   = k8sRuleWorkerNS
+	k8sReleaseNSCheck  = k8sRuleReleaseNS
+	k8sAPICheck        = k8sRuleNoAPI
 )
 
 func TestK8sVerifyFailures(t *testing.T) {
@@ -335,7 +339,9 @@ const (
   "spec":{"automountServiceAccountToken":false,"containers":[{"name":"gateway","image":"ghcr.io/aerol-ai/aerolvm:v1","ports":[{"containerPort":21212}]}]},"status":{"podIP":"10.244.1.4"}}]}`
 	k8sClusterWorkers = `{"items":[
  {"metadata":{"name":"prod-worker-a","labels":{"app.kubernetes.io/name":"aerolvm","aerolvm.io/cluster":"prod","app.kubernetes.io/component":"worker"}},
-  "spec":{"nodeName":"ip-10-0-2-7.eu-west-1.compute.internal","automountServiceAccountToken":false,"containers":[
+  "spec":{"nodeName":"ip-10-0-2-7.eu-west-1.compute.internal","automountServiceAccountToken":false,
+    "volumes":[{"name":"join","secret":{"secretName":"prod-worker-a-join","items":[{"key":"join_url","path":"join_url"},{"key":"token","path":"token"},{"key":"ca_cert_hash","path":"ca_cert_hash"}]}}],
+    "containers":[
     {"name":"runtime","image":"ghcr.io/aerol-ai/aerolvm-runtime:v1","securityContext":{"privileged":true}},
     {"name":"agent","image":"ghcr.io/aerol-ai/aerolvm:v1","ports":[{"containerPort":21212}],"securityContext":{"privileged":true}},
     {"name":"edge","image":"ghcr.io/aerol-ai/aerolvm-edge:v1"}]},
@@ -344,7 +350,13 @@ const (
   "podSelector":{"matchLabels":{"aerolvm.io/cluster":"prod","app.kubernetes.io/component":"worker"}},
   "policyTypes":["Egress"],
   "egress":[{"to":[{"namespaceSelector":{"matchLabels":{"kubernetes.io/metadata.name":"aerolvm-system"}},"podSelector":{"matchLabels":{"aerolvm.io/cluster":"prod"}}}]},
-    {"to":[{"ipBlock":{"cidr":"0.0.0.0/0","except":["10.0.0.0/8","172.16.0.0/12","192.168.0.0/16","100.64.0.0/10","169.254.0.0/16"]}}]}]}}]}`
+    {"to":[{"ipBlock":{"cidr":"0.0.0.0/0","except":["10.0.0.0/8","172.16.0.0/12","192.168.0.0/16","100.64.0.0/10","169.254.0.0/16"]}}]}]}},
+ {"metadata":{"name":"prod-worker-ingress"},"spec":{
+  "podSelector":{"matchLabels":{"aerolvm.io/cluster":"prod","app.kubernetes.io/component":"worker"}},
+  "policyTypes":["Ingress"],
+  "ingress":[{"from":[{"namespaceSelector":{"matchLabels":{"kubernetes.io/metadata.name":"aerolvm-system"}},"podSelector":{"matchLabels":{"aerolvm.io/cluster":"prod"}}},
+      {"podSelector":{"matchLabels":{"aerolvm.io/cluster":"prod","app.kubernetes.io/component":"worker"}}}]},
+    {"from":[{"namespaceSelector":{"matchLabels":{"kubernetes.io/metadata.name":"monitoring"}}},{"ipBlock":{"cidr":"10.50.0.0/16"}},{"ipBlock":{"cidr":"nope"}}],"ports":[{"port":21212}]}]}}]}`
 	k8sClusterIMDS = `{"Reservations":[{"Instances":[{"InstanceId":"i-0w1","MetadataOptions":{"HttpTokens":"required","HttpPutResponseHopLimit":1,"HttpEndpoint":"enabled"}}]}]}`
 )
 
@@ -398,7 +410,7 @@ func TestK8sVerifyClusterModePasses(t *testing.T) {
 		}
 	}
 	got := k8sResults(checks)
-	if len(checks) != 14 || got[k8sReleaseNSCheck] == "" || got[k8sRoutesAccepted] == "" || got[k8sLinksPassthrough] == "" {
+	if len(checks) != 15 || got[k8sReleaseNSCheck] == "" || got[k8sRoutesAccepted] == "" || got[k8sLinksPassthrough] == "" {
 		t.Fatalf("%d checks: %+v", len(checks), checks)
 	}
 	for check, want := range map[string]string{
@@ -406,6 +418,7 @@ func TestK8sVerifyClusterModePasses(t *testing.T) {
 		k8sAPICheck:          "pass: the 1 operator pod(s) hold one by design",
 		k8sPrivilegedCheck:   "pass: 1 worker pod(s) in namespace aerolvm-workers",
 		k8sPolicyCheck:       "pass: prod-worker-a (prod-worker-egress)",
+		k8sRuleIngress:       "pass: prod-worker-a (prod-worker-ingress)",
 		k8sIMDSCheck:         "pass: 1 EC2 instance(s)",
 		k8sRoutesAccepted:    "pass: HTTPRoute prod-api, TLSRoute prod-links, TCPRoute prod-ssh",
 		k8sLinksPassthrough:  "pass: Gateway infra/bank-gw listener links",
@@ -456,10 +469,42 @@ func TestK8sVerifyClusterModeFailures(t *testing.T) {
 			f: with(func(f *fakeK8s) { f.namespaces["aerolvm-system"] = k8sNamespaceLabelled("baseline") })},
 		{name: "the release namespace allows privileged pods", check: k8sReleaseNSCheck, want: "fail: namespace aerolvm-system enforces privileged, not restricted",
 			f: with(func(f *fakeK8s) { f.namespaces["aerolvm-system"] = k8sNamespaceLabelled("privileged") })},
+		{name: "a join Secret mounted whole", check: k8sRuleNoDNSToken, want: "fail: prod-worker-a: volume join mounts every key of Secret prod-worker-a-join",
+			f: with(func(f *fakeK8s) {
+				f.workerPods = strings.Replace(k8sClusterWorkers, `,"items":[{"key":"join_url","path":"join_url"},{"key":"token","path":"token"},{"key":"ca_cert_hash","path":"ca_cert_hash"}]`, ``, 1)
+			})},
+		{name: "another key in a join Secret", check: k8sRuleNoDNSToken, want: "fail: prod-worker-a: volume join mounts key dns-token of Secret prod-worker-a-join",
+			f: with(func(f *fakeK8s) {
+				f.workerPods = strings.Replace(k8sClusterWorkers, `{"key":"token","path":"token"}`, `{"key":"dns-token","path":"token"}`, 1)
+			})},
+		{name: "a token key in a Secret that is not a join Secret", check: k8sRuleNoDNSToken, want: "fail: prod-worker-a: volume join mounts key join_url of Secret dns-creds; prod-worker-a: volume join mounts key token of Secret dns-creds",
+			f: with(func(f *fakeK8s) {
+				f.workerPods = strings.Replace(k8sClusterWorkers, `"secretName":"prod-worker-a-join"`, `"secretName":"dns-creds"`, 1)
+			})},
 		{name: "the worker namespace enforces restricted", check: k8sWorkerNSCheck, want: "fail: namespace aerolvm-workers enforces restricted, not privileged",
 			f: with(func(f *fakeK8s) { f.namespaces[k8sWorkerNS] = k8sNamespaceLabelled("restricted") })},
 		{name: "no policy in the worker namespace", check: k8sPolicyCheck, want: "fail: prod-worker-a: no NetworkPolicy limits its egress",
 			f: with(func(f *fakeK8s) { f.workerPolicy = `{"items":[]}` })},
+		{name: "no policy limits who reaches the worker", check: k8sRuleIngress, want: "fail: prod-worker-a: no NetworkPolicy limits who reaches it",
+			f: with(func(f *fakeK8s) {
+				f.workerPolicy = strings.Replace(k8sClusterWorkerPolicy, `"policyTypes":["Ingress"]`, `"policyTypes":["Egress"]`, 1)
+			})},
+		{name: "an ingress rule with no source", check: k8sRuleIngress, want: "fail: prod-worker-a: NetworkPolicy prod-worker-ingress lets every address reach the pod",
+			f: with(func(f *fakeK8s) {
+				f.workerPolicy = strings.Replace(k8sClusterWorkerPolicy, `"ingress":[`, `"ingress":[{},`, 1)
+			})},
+		{name: "an ingress rule from every pod", check: k8sRuleIngress, want: "fail: prod-worker-a: NetworkPolicy prod-worker-ingress lets every pod in the cluster reach the pod",
+			f: with(func(f *fakeK8s) {
+				f.workerPolicy = strings.Replace(k8sClusterWorkerPolicy, `"ingress":[`, `"ingress":[{"from":[{"namespaceSelector":{}}]},`, 1)
+			})},
+		{name: "an ingress rule from every address", check: k8sRuleIngress, want: "fail: prod-worker-a: NetworkPolicy prod-worker-ingress lets every address reach the pod (ipBlock 0.0.0.0/0)",
+			f: with(func(f *fakeK8s) {
+				f.workerPolicy = strings.Replace(k8sClusterWorkerPolicy, `{"ipBlock":{"cidr":"10.50.0.0/16"}}`, `{"ipBlock":{"cidr":"0.0.0.0/0"}}`, 1)
+			})},
+		{name: "a policy with no policyTypes counts for ingress", check: k8sRuleIngress, want: "pass: prod-worker-a (prod-worker-ingress)",
+			f: with(func(f *fakeK8s) {
+				f.workerPolicy = strings.Replace(k8sClusterWorkerPolicy, `"policyTypes":["Ingress"],`, ``, 1)
+			})},
 		{name: "the worker namespace's policies unreadable", check: k8sPolicyCheck, want: "fail: forbidden",
 			f: with(func(f *fakeK8s) { f.workerPolicy = "" })},
 		{name: "the worker pods unreadable", check: "AerolVM pods found", want: "fail: forbidden",
@@ -696,5 +741,31 @@ func TestCosignFailure(t *testing.T) {
 	err = cosignFailure(errors.New("exit status 1"), []byte("Error: none of the expected identities matched\n"))
 	if strings.Contains(err.Error(), "cosign v3") || !strings.Contains(err.Error(), "none of the expected identities matched") {
 		t.Fatalf("err = %v, want the last line only", err)
+	}
+}
+
+// A runtime the install's create policy refuses (the bank preset: gVisor
+// only) is skipped, not failed: its walls are moot. If every runtime is
+// refused, nothing was probed, and that fails.
+func TestK8sProbeSkipsRuntimesThePolicyRefuses(t *testing.T) {
+	refused := errors.New(`api 403: create refused by policy rule "runtimes": runtime "docker" is not allowed on this server`)
+	f := goodK8s()
+	f.probeErrs = map[string]error{"docker": refused}
+	got := k8sResults(k8sVerify(context.Background(), f.env(), k8sOpts))
+	if !strings.HasPrefix(got["a docker sandbox cannot reach the worker, another pod or the Kubernetes API"], "skip: the create policy allows no docker sandbox") ||
+		!strings.HasPrefix(got["a gvisor sandbox cannot reach the worker, another pod or the Kubernetes API"], "pass:") {
+		t.Fatalf("results = %v", got)
+	}
+	f = goodK8s()
+	f.probeErrs = map[string]error{"docker": refused, "gvisor": refused}
+	got = k8sResults(k8sVerify(context.Background(), f.env(), k8sOpts))
+	if !strings.HasPrefix(got["a docker or gvisor sandbox cannot reach the worker, another pod or the Kubernetes API"], "fail: no probe sandbox could be made") {
+		t.Fatalf("results = %v", got)
+	}
+	// Any other refusal is still a failure.
+	f = goodK8s()
+	f.probeErrs = map[string]error{"docker": errors.New("cluster: no worker placement target available")}
+	if got := k8sResults(k8sVerify(context.Background(), f.env(), k8sOpts)); !strings.HasPrefix(got["a docker sandbox cannot reach the worker, another pod or the Kubernetes API"], "fail: probe:") {
+		t.Fatalf("results = %v", got)
 	}
 }

@@ -108,7 +108,7 @@ func awsFailure(code int, stderr []byte) error {
 
 // k8sIMDS checks the IMDS settings of every machine that runs a worker pod.
 func k8sIMDS(ctx context.Context, env k8sEnv, pods []k8sPod) k8sCheck {
-	const name = "worker machines allow IMDSv2 only, with a hop limit of 1"
+	const name = k8sRuleIMDS
 	nodes := map[string]bool{}
 	for _, p := range pods {
 		if p.Metadata.Labels[k8sComponent] == "worker" && p.Spec.NodeName != "" {

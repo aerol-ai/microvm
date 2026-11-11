@@ -55,6 +55,35 @@ const (
 	k8sPodSecurityEnforce = "pod-security.kubernetes.io/enforce"
 )
 
+// The rules verify checks, each by the name its check reports. The bank
+// evidence pack (P7, charts/aerolvm/EVIDENCE.md) lists exactly these, and
+// TestEvidencePackListsVerifyRules fails when the two differ, so what the
+// pack promises is what verify checks. k8sRuleProbe runs once per runtime,
+// with <runtime> filled in.
+const (
+	k8sRuleFound        = "AerolVM pods found"
+	k8sRuleSigned       = "images signed by the AerolVM release workflow"
+	k8sRuleNoHostMounts = "no folders mounted from the machine"
+	k8sRuleNoAPI        = "no Kubernetes API credential in the pods"
+	k8sRuleNoDNSToken   = "no DNS provider token in the pods"
+	k8sRulePrivileged   = "privileged containers only in the worker pods' runtime and agent"
+	k8sRuleWorkerNS     = "the worker namespace's Pod Security label is privileged"
+	k8sRuleReleaseNS    = "the release namespace enforces restricted Pod Security"
+	k8sRuleEgress       = "a NetworkPolicy limits the worker pods' egress"
+	k8sRuleIngress      = "a NetworkPolicy limits who reaches the worker pods"
+	k8sRuleIMDS         = "worker machines allow IMDSv2 only, with a hop limit of 1"
+	k8sRoutesAccepted   = "the Gateway accepted every AerolVM route"
+	k8sLinksPassthrough = "the sandbox-link listener passes TLS through"
+	k8sRuleProbe        = "a <runtime> sandbox cannot reach the worker, another pod or the Kubernetes API"
+)
+
+// k8sVerifyRules is every rule, in the order verify reports them.
+var k8sVerifyRules = []string{
+	k8sRuleFound, k8sRuleSigned, k8sRuleNoHostMounts, k8sRuleNoAPI, k8sRuleNoDNSToken, k8sRulePrivileged,
+	k8sRuleWorkerNS, k8sRuleReleaseNS, k8sRuleEgress, k8sRuleIngress, k8sRuleIMDS, k8sRoutesAccepted,
+	k8sLinksPassthrough, k8sRuleProbe,
+}
+
 // k8sPrivilegedContainers are the worker pod's containers that run
 // privileged (§8.7): runtime builds sandboxes and agent makes their network
 // namespaces. edge and egress never need it.
@@ -63,6 +92,10 @@ var k8sPrivilegedContainers = map[string]bool{"runtime": true, "agent": true}
 // k8sTLSKeys are the only Secret keys a worker pod may mount (C25): the
 // edge certificate and key cert-manager writes, and its CA.
 var k8sTLSKeys = map[string]bool{"tls.crt": true, "tls.key": true, "ca.crt": true}
+
+// k8sJoinKeys are the keys of a node's join-token Secret (cluster mode),
+// mounted by name into that one pod.
+var k8sJoinKeys = map[string]bool{"join_url": true, "token": true, "ca_cert_hash": true}
 
 // k8sDNSTokenEnv matches the environment names DNS provider credentials go
 // by: Caddy's DNS token on a VM install (SB_DNS_API_TOKEN) and the
@@ -175,7 +208,10 @@ type k8sNetworkPolicy struct {
 	Spec struct {
 		PodSelector k8sLabelSelector `json:"podSelector"`
 		PolicyTypes []string         `json:"policyTypes"`
-		Egress      []struct {
+		Ingress     []struct {
+			From []k8sPolicyPeer `json:"from"`
+		} `json:"ingress"`
+		Egress []struct {
 			To []struct {
 				PodSelector       *k8sLabelSelector `json:"podSelector"`
 				NamespaceSelector *k8sLabelSelector `json:"namespaceSelector"`
@@ -233,6 +269,45 @@ func (s k8sLabelSelector) matches(labels map[string]string) bool {
 		}
 	}
 	return true
+}
+
+// k8sPolicyPeer is one ingress source of a NetworkPolicy.
+type k8sPolicyPeer struct {
+	PodSelector       *k8sLabelSelector `json:"podSelector"`
+	NamespaceSelector *k8sLabelSelector `json:"namespaceSelector"`
+	IPBlock           *struct {
+		CIDR string `json:"cidr"`
+	} `json:"ipBlock"`
+}
+
+// limitsIngress reports a policy that limits who reaches the pods it
+// selects. Kubernetes counts every policy as an ingress policy unless its
+// policyTypes leave Ingress out.
+func (np k8sNetworkPolicy) limitsIngress() bool {
+	return len(np.Spec.PolicyTypes) == 0 || slices.Contains(np.Spec.PolicyTypes, "Ingress")
+}
+
+// admitsAnyone names an ingress rule of the policy that lets every pod or
+// every address reach the pods it selects, or "" when none does.
+// NetworkPolicies add up, so one such rule undoes the wall.
+func (np k8sNetworkPolicy) admitsAnyone() string {
+	for _, rule := range np.Spec.Ingress {
+		if len(rule.From) == 0 {
+			return "lets every address reach the pod"
+		}
+		for _, peer := range rule.From {
+			if peer.NamespaceSelector.empty() && (peer.PodSelector == nil || peer.PodSelector.empty()) {
+				return "lets every pod in the cluster reach the pod"
+			}
+			if peer.IPBlock == nil {
+				continue
+			}
+			if block, err := netip.ParsePrefix(peer.IPBlock.CIDR); err == nil && block.Bits() == 0 {
+				return fmt.Sprintf("lets every address reach the pod (ipBlock %s)", block)
+			}
+		}
+	}
+	return ""
 }
 
 // limitsEgress reports a policy that limits the egress of the pods it
@@ -313,7 +388,7 @@ func (p k8sPod) all() []k8sContainer {
 func k8sVerify(ctx context.Context, env k8sEnv, o k8sVerifyOptions) []k8sCheck {
 	o.workerNamespace = cmp.Or(o.workerNamespace, o.namespace)
 	o.cluster = cmp.Or(o.cluster, o.release)
-	const found = "AerolVM pods found"
+	const found = k8sRuleFound
 	pods, err := k8sPods(ctx, env, o)
 	if err != nil {
 		return []k8sCheck{{Name: found, Result: k8sFail, Detail: err.Error()}}
@@ -324,6 +399,9 @@ func k8sVerify(ctx context.Context, env k8sEnv, o k8sVerifyOptions) []k8sCheck {
 	checks = append(checks, k8sPrivileged(pods, o.workerNamespace))
 	checks = append(checks, k8sPodSecurity(ctx, env, o)...)
 	checks = append(checks, k8sEgressPolicy(ctx, env, pods))
+	if o.workerNamespace != o.namespace {
+		checks = append(checks, k8sIngressPolicy(ctx, env, pods))
+	}
 	checks = append(checks, k8sIMDS(ctx, env, pods))
 	checks = append(checks, k8sGatewayRoutes(ctx, env, o)...)
 	checks = append(checks, k8sProbe(ctx, env, pods, o)...)
@@ -366,7 +444,7 @@ func k8sPods(ctx context.Context, env k8sEnv, o k8sVerifyOptions) ([]k8sPod, err
 }
 
 func k8sImagesSigned(ctx context.Context, env k8sEnv, pods []k8sPod, skip bool) k8sCheck {
-	const name = "images signed by the AerolVM release workflow"
+	const name = k8sRuleSigned
 	images := map[string]bool{}
 	for _, p := range pods {
 		for _, c := range p.all() {
@@ -394,7 +472,7 @@ func k8sImagesSigned(ctx context.Context, env k8sEnv, pods []k8sPod, skip bool) 
 }
 
 func k8sNoHostMounts(pods []k8sPod) k8sCheck {
-	const name = "no folders mounted from the machine"
+	const name = k8sRuleNoHostMounts
 	var found []string
 	for _, p := range pods {
 		for _, v := range p.Spec.Volumes {
@@ -413,7 +491,7 @@ func k8sNoHostMounts(pods []k8sPod) k8sCheck {
 // the operator in the release namespace: it is the one part that writes to
 // the Kubernetes API (§7.4, §15.1).
 func k8sNoAPIRights(pods []k8sPod, releaseNamespace string) k8sCheck {
-	const name = "no Kubernetes API credential in the pods"
+	const name = k8sRuleNoAPI
 	var found []string
 	operators := 0
 	for _, p := range pods {
@@ -451,7 +529,7 @@ func k8sNoAPIRights(pods []k8sPod, releaseNamespace string) k8sCheck {
 // privileged would hand its machine to whoever broke into it. Init
 // containers are held to it too: the worker pod needs none privileged.
 func k8sPrivileged(pods []k8sPod, workerNamespace string) k8sCheck {
-	const name = "privileged containers only in the worker pods' runtime and agent"
+	const name = k8sRulePrivileged
 	var bad []string
 	workers := 0
 	for _, p := range pods {
@@ -525,10 +603,10 @@ func k8sPodSecurity(ctx context.Context, env k8sEnv, o k8sVerifyOptions) []k8sCh
 		}
 		return k8sCheck{Name: name, Result: k8sPass, Detail: fmt.Sprintf("namespace %s: %s=%s", ns, k8sPodSecurityEnforce, level)}
 	}
-	checks := []k8sCheck{want("the worker namespace's Pod Security label is privileged", o.workerNamespace, "privileged",
+	checks := []k8sCheck{want(k8sRuleWorkerNS, o.workerNamespace, "privileged",
 		"the one namespace for privileged pods")}
 	if o.workerNamespace != o.namespace {
-		checks = append(checks, want("the release namespace enforces restricted Pod Security", o.namespace, "restricted",
+		checks = append(checks, want(k8sRuleReleaseNS, o.namespace, "restricted",
 			"gateways, servers and the operator need no rights"))
 	}
 	return checks
@@ -543,7 +621,7 @@ func k8sPodSecurity(ctx context.Context, env k8sEnv, o k8sVerifyOptions) []k8sCh
 // cannot be seen), and on a Secret volume that mounts any key but a TLS
 // certificate's or does not name its keys.
 func k8sNoDNSToken(pods []k8sPod) k8sCheck {
-	const name = "no DNS provider token in the pods"
+	const name = k8sRuleNoDNSToken
 	var found []string
 	secret := func(pod, volume string, s *k8sSecretSource) {
 		ref := s.SecretName + s.Name
@@ -552,6 +630,11 @@ func k8sNoDNSToken(pods []k8sPod) k8sCheck {
 			return
 		}
 		for _, it := range s.Items {
+			// A node's one-time join token (the operator's <pod>-join
+			// Secret) is no DNS token: its three keys are allowed there.
+			if strings.HasSuffix(ref, "-join") && k8sJoinKeys[it.Key] {
+				continue
+			}
 			if !k8sTLSKeys[it.Key] {
 				found = append(found, fmt.Sprintf("%s: volume %s mounts key %s of Secret %s", pod, volume, it.Key, ref))
 			}
@@ -598,7 +681,7 @@ func k8sNoDNSToken(pods []k8sPod) k8sCheck {
 // carry sandbox traffic. A NetworkPolicy selects pods in its own namespace
 // only, so each worker is read against its own namespace's policies.
 func k8sEgressPolicy(ctx context.Context, env k8sEnv, pods []k8sPod) k8sCheck {
-	const name = "a NetworkPolicy limits the worker pods' egress"
+	const name = k8sRuleEgress
 	policies := map[string][]k8sNetworkPolicy{}
 	var bad, ok []string
 	for _, p := range pods {
@@ -629,6 +712,55 @@ func k8sEgressPolicy(ctx context.Context, env k8sEnv, pods []k8sPod) k8sCheck {
 		}
 		if len(by) == 0 {
 			bad = append(bad, p.Metadata.Name+": no NetworkPolicy limits its egress (networkPolicy.enabled in the chart)")
+			continue
+		}
+		ok = append(ok, fmt.Sprintf("%s (%s)", p.Metadata.Name, strings.Join(by, ", ")))
+	}
+	switch {
+	case len(bad) > 0:
+		return k8sCheck{Name: name, Result: k8sFail, Detail: strings.Join(bad, "; ")}
+	case len(ok) == 0:
+		return k8sCheck{Name: name, Result: k8sFail, Detail: "no worker pod (label app.kubernetes.io/component=worker) to check"}
+	}
+	return k8sCheck{Name: name, Result: k8sPass, Detail: strings.Join(ok, "; ")}
+}
+
+// k8sIngressPolicy checks, in cluster mode, that a NetworkPolicy limits who
+// reaches each worker pod (§8.7, wall 3): the chart's lets in only the
+// gateways, servers, other workers and Prometheus. A policy whose rule lets
+// in every pod or every address fails the check, as for egress.
+func k8sIngressPolicy(ctx context.Context, env k8sEnv, pods []k8sPod) k8sCheck {
+	const name = k8sRuleIngress
+	policies := map[string][]k8sNetworkPolicy{}
+	var bad, ok []string
+	for _, p := range pods {
+		if p.Metadata.Labels[k8sComponent] != "worker" {
+			continue
+		}
+		ns := p.Metadata.Namespace
+		if _, read := policies[ns]; !read {
+			raw, err := env.kubectl(ctx, "get", "networkpolicies", "-n", ns, "-o", "json")
+			if err != nil {
+				return k8sCheck{Name: name, Result: k8sFail, Detail: err.Error()}
+			}
+			var list k8sNetworkPolicyList
+			if err := json.Unmarshal(raw, &list); err != nil {
+				return k8sCheck{Name: name, Result: k8sFail, Detail: "kubectl output: " + err.Error()}
+			}
+			policies[ns] = list.Items
+		}
+		var by []string
+		for _, np := range policies[ns] {
+			if !np.limitsIngress() || !np.Spec.PodSelector.matches(p.Metadata.Labels) {
+				continue
+			}
+			by = append(by, np.Metadata.Name)
+			if open := np.admitsAnyone(); open != "" {
+				bad = append(bad, fmt.Sprintf("%s: NetworkPolicy %s %s", p.Metadata.Name, np.Metadata.Name, open))
+			}
+		}
+		if len(by) == 0 {
+			bad = append(bad, p.Metadata.Name+": no NetworkPolicy limits who reaches it (networkPolicy.enabled in the chart)")
 			continue
 		}
 		ok = append(ok, fmt.Sprintf("%s (%s)", p.Metadata.Name, strings.Join(by, ", ")))
@@ -768,10 +900,16 @@ func k8sProbe(ctx context.Context, env k8sEnv, pods []k8sPod, o k8sVerifyOptions
 	}
 	targets = append(targets, other...)
 	command := "for t in " + strings.Join(targets, " ") + `; do nc -z -w 3 "${t%:*}" "${t#*:}" 2>/dev/null && echo "$t"; done; true`
+	probed := false
 	for _, rt := range o.probeRuntimes {
-		name := fmt.Sprintf("a %s sandbox cannot reach the worker, another pod or the Kubernetes API", rt)
+		name := strings.Replace(k8sRuleProbe, "<runtime>", rt, 1)
 		out, err := env.probe(ctx, o.probeImage, rt, command)
 		switch {
+		case err != nil && strings.Contains(err.Error(), `policy rule "runtimes"`):
+			// The install's create policy runs no such sandbox (the bank
+			// preset allows gVisor only): its walls are moot, not broken.
+			checks = append(checks, k8sCheck{Name: name, Result: k8sSkip, Detail: "the create policy allows no " + rt + " sandbox: " + err.Error()})
+			continue
 		case err != nil:
 			checks = append(checks, k8sCheck{Name: name, Result: k8sFail, Detail: "probe: " + err.Error()})
 		case strings.TrimSpace(out) != "":
@@ -779,6 +917,12 @@ func k8sProbe(ctx context.Context, env k8sEnv, pods []k8sPod, o k8sVerifyOptions
 		default:
 			checks = append(checks, k8sCheck{Name: name, Result: k8sPass, Detail: fmt.Sprintf("%d addresses refused", len(targets))})
 		}
+		probed = true
+	}
+	if !probed && len(o.probeRuntimes) > 0 {
+		// Every runtime refused: nothing was probed, and that is no pass.
+		checks = append(checks, k8sCheck{Name: strings.Replace(k8sRuleProbe, "<runtime>", strings.Join(o.probeRuntimes, " or "), 1),
+			Result: k8sFail, Detail: "no probe sandbox could be made: set --probe-runtimes to a runtime this install allows"})
 	}
 	return checks
 }

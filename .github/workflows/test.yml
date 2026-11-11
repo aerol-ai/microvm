@@ -119,6 +119,9 @@ jobs:
               # pkg/caddy's tests check the static route against the plugin's
               # constants and test config.
               - 'caddymod/**'
+              # cmd/aerolvm's tests check the evidence pack lists exactly the
+              # rules `aerolvm k8s verify` checks (P7).
+              - 'charts/aerolvm/EVIDENCE.md'
             go_sdk:
               - 'sdk/go/**'
               - 'go.mod'

@@ -10,7 +10,7 @@ import (
 	"testing"
 )
 
-const k8sIMDSCheck = "worker machines allow IMDSv2 only, with a hop limit of 1"
+const k8sIMDSCheck = k8sRuleIMDS
 
 func k8sIMDSAnswer(id, tokens string, hops int, endpoint string) string {
 	return fmt.Sprintf(`{"Reservations":[{"Instances":[{"InstanceId":%q,"MetadataOptions":{"HttpTokens":%q,"HttpPutResponseHopLimit":%d,"HttpEndpoint":%q}}]}]}`, id, tokens, hops, endpoint)

@@ -26,11 +26,6 @@ var k8sGatewayRouteKinds = []struct{ kind, resource, suffix string }{
 	{"TCPRoute", "tcproutes.gateway.networking.k8s.io", "-ssh"},
 }
 
-const (
-	k8sRoutesAccepted   = "the Gateway accepted every AerolVM route"
-	k8sLinksPassthrough = "the sandbox-link listener passes TLS through"
-)
-
 // k8sParentRef is a route's reference to its Gateway. Port 0 and an empty
 // sectionName mean "any listener".
 type k8sParentRef struct {
