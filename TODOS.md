@@ -12,23 +12,6 @@ Every entry was re-verified against `main` at `704c9e74` on 2026-10-06.
 
 ---
 
-## Enforce the ownership lease when sandboxd is down on a VM
-
-- **What:** on a plain VM, a cluster worker whose `sandboxd` crashes or
-  crash-loops leaves its containerd sandboxes running (they are not in the
-  sandboxd unit's cgroup), while the leader, after `SB_DEAD_OWNER_GRACE`,
-  recreates its `failover.policy=recreate` sandboxes on another node: two
-  executors of one sandbox (invariant I1).
-- **Why open:** the Kubernetes plan fixed this for worker pods only (C7, T3:
-  sandboxd writes `SB_OWNERSHIP_LEASE_FILE` and the runtime supervisor
-  freezes what it fences once the lease runs out). The CEO review's RQ17
-  answer (2026-11-10) put the VM case here.
-- **Where to start:** `internal/ownerlease` (the file) and
-  `internal/supervisor/lease.go` (`LeaseGuard`, which freezes
-  `<cgroup parent>/<ref>` and thaws only on proof). A VM needs a small
-  watchdog outside the sandboxd unit (its own systemd unit, or containerd's)
-  running the same guard over containerd's cgroup parent.
-
 ## The snapshot list is node-local on a cluster (API)
 
 `GET /v1/snapshots` (`pkg/api/v1/snapshot.go` `listSnapshots`) reads only the
@@ -705,7 +688,10 @@ the skip.
 - **Effort:** human M / CC S. **Priority:** P1.
 - **Depends on:** nothing. Can share code with C7 when the Kubernetes work starts.
 - **Start:** `internal/service/ownership_lease.go` (`StartOwnershipLease`) and
-  the systemd unit in `scripts/install.sh` (around line 2809).
+  the systemd unit in `scripts/install.sh` (around line 2809). C7's T3 built
+  the pod version to reuse: sandboxd writes `SB_OWNERSHIP_LEASE_FILE`
+  (`internal/ownerlease`), and `internal/supervisor/lease.go` (`LeaseGuard`)
+  freezes `<cgroup parent>/<ref>` when it runs out and thaws only on proof.
 
 ---
 
