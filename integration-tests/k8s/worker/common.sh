@@ -81,6 +81,39 @@ c7_setup() {
   echo "${self}/sandboxes"
 }
 
+# keep_sandboxes_first makes each sandbox the kernel's first and whole
+# choice when the pod runs out of memory, every 2 s, in the background:
+#
+#   - every process under the sandboxes group gets OOM score 500. The spec's
+#     oomScoreAdj is not enough: runsc applies it only to its own boot
+#     process, containerd sets each shim's score from its own (-999), and
+#     gVisor's helper processes, which hold a sandbox's memory, inherit the
+#     shim's (third S3 run);
+#   - each sandbox's own group gets memory.oom.group 1, so the kernel kills
+#     all of that sandbox's processes together. A gVisor sandbox's tmpfs is
+#     one shared memory file held by several of its processes; killing one
+#     of them frees nothing, and the pod stays wedged at its limit (fourth
+#     S3 run). The groups above it stay at 0 (c7_setup), so one OOM never
+#     takes the machinery or other sandboxes.
+#
+# Phase 1 does both in sandboxd right after a sandbox starts; this loop is
+# the spike's stand-in. Builtins only: a fork per process would cost
+# thousands of forks per pass at 1,000 sandboxes.
+keep_sandboxes_first() {
+  local dir="$1" d pid v
+  while true; do
+    for d in "$dir"/*/; do
+      [[ -e "$d/memory.oom.group" ]] || continue
+      { read -r v < "$d/memory.oom.group"; } 2>/dev/null && [[ "$v" == 1 ]] || echo 1 > "$d/memory.oom.group" 2>/dev/null
+      while read -r pid; do
+        { read -r v < "/proc/$pid/oom_score_adj"; } 2>/dev/null || continue
+        [[ "$v" == 500 ]] || echo 500 > "/proc/$pid/oom_score_adj" 2>/dev/null
+      done < "$d/cgroup.procs"
+    done
+    sleep 2
+  done
+}
+
 # protect_from_oom lowers the caller's OOM score; what it starts inherits it.
 # The machinery (containerd, sandboxd) must never be the kernel's choice when
 # the pod hits its limit (finding F10).

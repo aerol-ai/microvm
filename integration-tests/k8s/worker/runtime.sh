@@ -18,6 +18,7 @@ mkdir -p /run/aerolvm /run/containerd /etc/containerd
 echo "$parent" > /run/aerolvm/cgroup-parent.tmp
 mv /run/aerolvm/cgroup-parent.tmp /run/aerolvm/cgroup-parent
 echo "runtime: sandboxes go under $parent"
+keep_sandboxes_first "/sys/fs/cgroup${parent}" &
 
 protect_from_oom $$
 containerd config default > /etc/containerd/config.toml

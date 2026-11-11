@@ -17,6 +17,7 @@ if [[ "${AEROL_C7_CGROUP_PARENT:-0}" == 1 ]]; then
   SB_CONTAINERD_CGROUP_PARENT="$(c7_setup)"
   export SB_CONTAINERD_CGROUP_PARENT
   echo "run: C7 on; sandboxes go under ${SB_CONTAINERD_CGROUP_PARENT}"
+  keep_sandboxes_first "/sys/fs/cgroup${SB_CONTAINERD_CGROUP_PARENT}" &
 fi
 
 # containerd's root is an emptyDir on the machine's disk (see the pod spec):

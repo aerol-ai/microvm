@@ -1586,8 +1586,28 @@ whole worker container (F10), and the pod ended Failed. **Does the kubelet
 ever evict the worker pod? Not here: the node never reached MemoryPressure.
 The danger is the pod's own limit, not eviction.**
 
-**Cost so far:** six clusters, about 5.3 hours of cluster time in all,
-about $2.30 (S3's m7i.4xlarge is most of the rise).
+**F10, four fix attempts** (run `p0-s3b`, same shape, 2026-11-11). Each run
+repeated the 1,000-sandbox ramp and the pressure:
+
+| Run | Change | What the kernel did | sandboxd |
+|---|---|---|---|
+| 2 | The supervisor sets `memory.oom.group` 0 on the pod, its container and `sandboxes/`, and runs the machinery at OOM score -999; `sandboxd` gives each sandbox's spec `oomScoreAdj` 500 | Killed 2 tiny `exe` processes; the machinery survived | Stalled with the pod at its limit |
+| 3 | A shim wrapper sets its own score to 500 | No change: containerd sets each shim's score from its own (-999) after starting it, and gVisor's helpers inherit it | Stalled |
+| 4 | A loop sets score 500 on every process in each sandbox's group | Killed 1 `gvisor_sentry`; freed nothing, because a gVisor sandbox's tmpfs is one shared memory file held by several of its processes | Stalled |
+| 5 | The loop also sets `memory.oom.group` 1 on each sandbox's group | Killed 2 whole sandboxes (26 processes) and nothing else; `containerd` and `sandboxd` survived, 0 restarts | Still stalled: the pod stayed at its limit |
+
+So the victim choice is fixed (whole sandboxes, never the machinery), but a
+pod at its limit still starves `sandboxd`. **The Phase 1 design for F10:**
+give `sandboxes/` its own `memory.max`, the pod's limit minus a reserve for
+the machinery, and protect `supervisor/` with `memory.min`. Out-of-memory
+events then happen inside `sandboxes/` and only ever kill a whole sandbox
+(each sandbox's group keeps `memory.oom.group` 1), and the machinery always
+has memory to answer with. `sandboxd` sets each sandbox's score and group
+right after it starts; the spike's loop is only a stand-in. Admission sized
+from the pod (F3) keeps normal use away from the cap. Not yet proven live.
+
+**Cost so far:** seven clusters, about 7.6 hours of cluster time in all,
+about $4.60 (the m7i.4xlarge S3 runs are about two thirds of it).
 
 ## 19. Tests, drills and benchmarks
 
