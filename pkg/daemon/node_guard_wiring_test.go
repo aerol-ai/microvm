@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"log/slog"
+	"net/netip"
 	"os"
 	"slices"
 	"strings"
@@ -39,6 +40,41 @@ func TestConfigureHostMediatedNodeGuard(t *testing.T) {
 	configureHostMediatedNodeGuard(config.Config{NodeRole: config.NodeRoleWorker}, logger)
 	if got := egresspolicy.NodeAllowedPorts(); len(got) != 0 || os.Getenv(egresspolicy.NodePortsEnv) != "" || logs.Len() != 0 {
 		t.Fatalf("a worker with no hatch allows nothing: %v %q %s", got, os.Getenv(egresspolicy.NodePortsEnv), logs.String())
+	}
+}
+
+// TestConfigureEgressRanges (C24): isolate and the host-firewall floor (in
+// this process) and the WASM workers (through their environment, which a
+// worker reads back) get the same deny floor and private ranges.
+func TestConfigureEgressRanges(t *testing.T) {
+	prevFloor, prevPrivate := egresspolicy.ExtraDenyFloor(), egresspolicy.ExtraPrivateRanges()
+	t.Cleanup(func() { egresspolicy.SetRanges(prevFloor, prevPrivate) })
+	t.Setenv(egresspolicy.DenyFloorEnv, "")
+	t.Setenv(egresspolicy.PrivateRangesEnv, "")
+	t.Setenv(egresspolicy.BlockPrivateEnv, "")
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logs, nil))
+	floor := []netip.Prefix{netip.MustParsePrefix("10.96.0.1/32")}
+	private := []netip.Prefix{netip.MustParsePrefix("10.244.0.0/16"), netip.MustParsePrefix("198.18.0.0/15")}
+	configureEgressRanges(config.Config{EgressDenyFloorCIDRs: floor, EgressPrivateDefaultCIDRs: private, EgressBlockPrivateByDefault: true}, logger)
+	if !slices.Equal(egresspolicy.ExtraDenyFloor(), floor) || !slices.Equal(egresspolicy.ExtraPrivateRanges(), private) {
+		t.Fatalf("in-process lists = %v %v", egresspolicy.ExtraDenyFloor(), egresspolicy.ExtraPrivateRanges())
+	}
+	if os.Getenv(egresspolicy.DenyFloorEnv) != "10.96.0.1/32" || os.Getenv(egresspolicy.PrivateRangesEnv) != "10.244.0.0/16,198.18.0.0/15" || os.Getenv(egresspolicy.BlockPrivateEnv) != "true" {
+		t.Fatalf("worker env = %q %q %q", os.Getenv(egresspolicy.DenyFloorEnv), os.Getenv(egresspolicy.PrivateRangesEnv), os.Getenv(egresspolicy.BlockPrivateEnv))
+	}
+	// What a worker does at start reads back the same lists.
+	egresspolicy.SetRanges(nil, nil)
+	if err := egresspolicy.LoadRangesFromEnv(); err != nil || !slices.Equal(egresspolicy.ExtraDenyFloor(), floor) || !slices.Equal(egresspolicy.ExtraPrivateRanges(), private) {
+		t.Fatalf("a worker reads %v %v (%v)", egresspolicy.ExtraDenyFloor(), egresspolicy.ExtraPrivateRanges(), err)
+	}
+	if !strings.Contains(logs.String(), "deny_floor=10.96.0.1/32") {
+		t.Fatalf("the lists must be logged: %s", logs.String())
+	}
+	logs.Reset()
+	configureEgressRanges(config.Config{}, logger)
+	if len(egresspolicy.ExtraDenyFloor()) != 0 || os.Getenv(egresspolicy.DenyFloorEnv) != "" || os.Getenv(egresspolicy.BlockPrivateEnv) != "false" || logs.Len() != 0 {
+		t.Fatalf("no lists, nothing: %v %q %s", egresspolicy.ExtraDenyFloor(), os.Getenv(egresspolicy.DenyFloorEnv), logs.String())
 	}
 }
 

@@ -125,6 +125,7 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 	defer cancel()
 	logger.Info("starting sandboxd", "version", version.Version, "addr", cfg.ListenAddr())
 	configureHostMediatedNodeGuard(cfg, logger)
+	configureEgressRanges(cfg, logger)
 	// Before anything dials a toolbox: every toolbox connection is
 	// dialed with this bound.
 	toolboxhttp.SetDeadPeerTimeout(cfg.ToolboxDeadPeerTimeout)

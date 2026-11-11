@@ -330,6 +330,21 @@ type Config struct {
 	// (SB_EGRESS_BLOCK_PRIVATE_BY_DEFAULT, plans/agent-sandbox-feature-parity.md
 	// T4). A create that sets any policy keeps its own. Off by default.
 	EgressBlockPrivateByDefault bool
+	// EgressDenyFloorCIDRs are addresses no sandbox may reach, whatever its
+	// policy or egress profile allows: they join the cloud metadata
+	// endpoints on the deny floor of every runtime (the host firewall, the
+	// egress gateway, and the WASM and isolate dial guards). On Kubernetes
+	// the API server's addresses go here (SB_EGRESS_DENY_FLOOR_CIDRS,
+	// plans/kubernetes-v2-architecture.md C24). Default empty.
+	EgressDenyFloorCIDRs []netip.Prefix
+	// EgressPrivateDefaultCIDRs are ranges treated like RFC 1918: a sandbox
+	// with no egress policy cannot reach them, and a policy opens one only
+	// with an allow entry for it, so a bank can open one range on purpose.
+	// On Kubernetes the cluster's pod, Service and node ranges go here; a
+	// cluster may use ranges outside RFC 1918
+	// (SB_EGRESS_PRIVATE_DEFAULT_CIDRS, C24). Needs
+	// SB_EGRESS_BLOCK_PRIVATE_BY_DEFAULT. Default empty.
+	EgressPrivateDefaultCIDRs []netip.Prefix
 	// CreatePolicyFile is the operator's create policy
 	// (SB_CREATE_POLICY_FILE, internal/createpolicy): allowed images,
 	// registries and runtimes, size limits, non-root and GPU rules, checked
@@ -3019,6 +3034,9 @@ func load(keyTool bool) (Config, error) {
 		return Config{}, err
 	}
 	if err := validateSandboxNodePorts(cfg); err != nil {
+		return Config{}, err
+	}
+	if err := loadEgressRanges(&cfg); err != nil {
 		return Config{}, err
 	}
 	if cfg.L4PortRangeStart < 1024 || cfg.L4PortRangeEnd > 65535 || cfg.L4PortRangeStart >= cfg.L4PortRangeEnd {
