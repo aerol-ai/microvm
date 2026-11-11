@@ -1457,6 +1457,7 @@ or the smoke test until the spike worked around it. Phase 1 must fix each in
 | F8 | With the agent's `/run/netns` shared to the runtime container by Bidirectional mount propagation, the network namespaces `sandboxd` mounts there land in the machine's own mount table. When the pod is deleted or dies, nothing removes them: the kubelet cannot tear the volume down, and the pod sticks in Terminating. It also breaks K4 (AerolVM touches the machine only through the kernel). | `lib.sh` unmounts them in the machine's mount namespace (`nsenter -t 1 -m`) before replacing a worker pod | Make the namespaces where they are used: in the runtime container, through a small privileged helper (the N2 split), so nothing has to cross containers or reach the machine |
 | F9 | cAdvisor, inside the kubelet, tracks every sandbox's cgroup as its own container: 57 series per sandbox, with no pod or container label. At 1,000 sandboxes one node exposes 57,823 cAdvisor series (1,095 with none), so a Prometheus scraping 2,000 such nodes would hold over 100 million series. The worker pod's own series stay at 177. | None needed for the spike | Eng review D3's decision, now with numbers: P9's ServiceMonitor drops `/sandboxes/` series at scrape time (metric relabelling), and the operator documents it; or move sandbox cgroups out of cAdvisor's view, if a kubelet setting allows it. Usage per sandbox comes from C20, not from cAdvisor. |
 | F10 | **One pod-level out-of-memory event killed every process in the worker container:** all sandboxes, every shim, `containerd` and `sandboxd` (one event; 172 runsc helpers, 88 shims, 77 runsc, 61 gVisor sentries, 21 runsc sandbox processes, 2 containerd, 2 sandboxd). The kubelet's default (`singleProcessOOMKill` unset, so false) kills a container's processes as one group. §8.3 assumed the kernel would stop one sandbox first and the machinery last; on EKS 1.36 it does not. The kubelet did not evict the pod and the node never reported MemoryPressure: it was the pod's cgroup limit alone. | `common.sh` (`c7_setup`, `keep_sandboxes_first`, `in_runtime_group`): group-kill off, each sandbox's group on, a cap on `sandboxes/`, containerd inside the cap. Proven by S3's seventh run | The design under "F10, seven runs" below, in `sandboxd` and the worker image. Not the kubelet's `singleProcessOOMKill: true`: a gVisor sandbox is several processes sharing one memory file, so killing one frees nothing (fourth run). Admission sized from the pod's limit (F3), with each sandbox's helpers counted. |
+| F13 | In the split pod, an external mount (FUSE: rclone, sshfs, s3fs) never reaches the sandbox, and the create still succeeds: `sandboxd` runs the helper in the agent container and mounts under `/var/lib/sandboxd/mounts`, a folder the runtime container shares without mount propagation, so `runsc` binds the empty folder underneath. The sandbox silently writes to local disk. An agent restart also ends the helper, and nothing mounts it again. (The one-container worker does not have the first problem.) Also: `fusermount3` needs `/bin/mount` (util-linux) in the image. | None | Phase 1 (with C7 and F8): mount helpers run where `runsc` runs (the runtime container, or a helper there the agent asks), so the mount is in the namespace that builds the sandbox and outlives agent restarts; `sandboxd` checks the mount is visible to the runtime before it starts the sandbox and fails the create if not; after an agent restart it finds the live helpers instead of dropping them. OV-E2 reruns as the test. |
 | F11 | At 1M placements a Raft snapshot holds up Apply for about 1.1 s, and the FSM takes 2.4 GiB per server (S4, offline). Small at G3's 100,000 per cell. | None needed | Phase 3: snapshot without copying every row under the lock, before any cell is meant to hold 1M placements. Until then cells stay at or below 250k. |
 | F12 | After S3's seventh run, 14 sandboxes the kernel had killed (their groups empty) were still listed as `started` 12 minutes later, and a command sent to one got a 502. `sandboxd`'s log shows its Docker event stream failing (F4), and containerd failing to publish its OOM events under the pressure ("context deadline exceeded"). The containerd engine has its own event stream (`internal/runtime/containerd/events.go`); why it did not mark them is not yet known. | None | Phase 1: find why, then make a sandbox's death reach its row on the containerd engine (task exit, OOM event, or an empty group found by reconcile), and tell its owner it was killed for memory. A regression test kills a sandbox's group and checks the row. |
 | F7 | Bottlerocket 1.68 sets `user.max_user_namespaces=0`. gVisor's gofer makes a user namespace, so every gVisor create fails with "fork/exec /proc/self/exe: no space left on device". It also means Kubernetes user namespaces (spike S9) cannot work on a default Bottlerocket node. | Raised to 62775 at run time from a node debug pod | A bank decision, not code: Bottlerocket's `settings.kernel.sysctl` raises it per node pool. The chart's docs and `aerolvm k8s verify` (P8) must check it. |
@@ -1517,9 +1518,22 @@ container, which is what causes F8.
 
 **Verdict after S1 and S2: K2 and K3 stand.** One worker pod per machine,
 with sandboxes inside its box and the agent upgraded in place, works on EKS,
-given the C7 fix and answers to F1 to F8. S2's external-mount check (I/O on a
-mounted file across the swap, eng review OV-E2) is not done yet: it needs a
-mount backend in the harness.
+given the C7 fix and answers to F1 to F8. S2's external-mount check (eng
+review OV-E2) failed; see F13 below.
+
+**OV-E2, an external mount across the agent swap: fails, and earlier than
+expected** (run on `p0-s5`, the split worker pod, 2026-11-11; harness
+`integration-tests/k8s/s2m.sh`). A gVisor sandbox was created with an rclone
+mount at `/mnt/ext` (rclone's `local` backend standing in for a remote
+store, kept in a folder both containers share). The create succeeded, but
+the mount never reached the sandbox: the agent container held the FUSE
+mount, the runtime container (where `runsc` gives the sandbox its files)
+saw none, and the sandbox got the empty folder underneath. It could not
+read the store's file, and nothing it wrote reached the store (a writer
+loop was at 556 lines; the store held only its seed file). After the agent
+swap, the rclone process and the mount were gone, and the new `sandboxd`
+did not mount them again. The writer kept writing into the sandbox's own
+folder throughout. Finding F13.
 
 **S9, the worker in a Kubernetes user namespace: fails on question 1**
 (run `p0-s9`, AL2023, EKS 1.36.5, node containerd 2.3.7, 2026-11-10). The pod

@@ -69,8 +69,10 @@ say "the store sees the sandbox's file: '$(in_agent 'cat /var/lib/sandboxd/remot
 say "--- 2. a writer in the sandbox, then the agent swap"
 run_in "$id" 'setsid sh -c "i=0; while true; do i=\$((i+1)); echo \$i >> /mnt/ext/log 2>>/tmp/writer.err; sleep 0.2; done" </dev/null >/dev/null 2>&1 &' >/dev/null
 sleep 5
-lines_in() { run_in "$id" 'wc -l < /mnt/ext/log 2>&1' | jq -r '.stdout' | tr -d '[:space:]'; }
-lines_store() { in_agent 'wc -l < /var/lib/sandboxd/remote/log 2>&1' | tr -d '[:space:]'; }
+# Both print "none" rather than fail: a missing log is a result here, and
+# set -e would end the run on it (second OV-E2 run).
+lines_in() { run_in "$id" 'wc -l < /mnt/ext/log 2>/dev/null || echo none' | jq -r '.stdout' | tr -d '[:space:]'; }
+lines_store() { in_agent 'wc -l < /var/lib/sandboxd/remote/log 2>/dev/null || echo none' | tr -d '[:space:]'; }
 say "before the swap: lines seen in the sandbox $(lines_in), in the store $(lines_store); restarts: $(restarts)"
 
 t_swap=$(ms)
@@ -96,6 +98,7 @@ say "after the swap: lines seen in the sandbox $a1 then $a2 ten seconds later; i
 say "the writer's errors: '$(run_in "$id" 'tail -2 /tmp/writer.err 2>/dev/null' | jq -r '.stdout' | tr '\n' ';')'"
 say "reading the mount now: '$(run_in "$id" 'ls /mnt/ext 2>&1 | head -3' | jq -r '.stdout' | tr '\n' ' ')'"
 # No pgrep in the runtime container's image; count by /proc.
+say "the new agent's FUSE mounts: $(in_agent "grep -c ' fuse.rclone ' /proc/self/mountinfo || true"); sandboxd's view: $(api "/v1/sandboxes/$id" | jq -c '{status, mounts: [.mounts[]? | .target]}')"
 say "rclone processes now: agent $(in_agent 'grep -lx rclone /proc/[0-9]*/comm 2>/dev/null | wc -l'), runtime $(in_runtime 'grep -lx rclone /proc/[0-9]*/comm 2>/dev/null | wc -l')"
 verdict=PASS
 [[ "$a2" =~ ^[0-9]+$ && "$a1" =~ ^[0-9]+$ && "$a2" -gt "$a1" ]] || verdict=FAIL

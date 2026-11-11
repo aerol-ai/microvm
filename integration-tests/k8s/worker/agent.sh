@@ -7,8 +7,9 @@ set -euo pipefail
 source "$(dirname "$0")/common.sh"
 
 dnf -y -q install iproute iptables-nft nftables procps-ng >/dev/null
-# OV-E2: rclone's FUSE mounts need fusermount3.
-[[ -x /opt/aerolvm/bin/rclone ]] && dnf -y -q install fuse3 >/dev/null
+# OV-E2: rclone's FUSE mounts need fusermount3, and fusermount3 runs
+# /bin/mount (util-linux), which the base image lacks (first OV-E2 run).
+[[ -x /opt/aerolvm/bin/rclone ]] && dnf -y -q install fuse3 util-linux >/dev/null
 export PATH="/opt/aerolvm/bin:$PATH"
 
 # Wait for the runtime container: its containerd socket and the cgroup path
