@@ -36,6 +36,7 @@ An optional lead paragraph, or a `>` note for something every user must act on.
 gh release create vX.Y.Z --target <main commit> --title "vX.Y.Z: <short summary>" --notes-file notes.md --latest=false
 ```
 
+- **Set the chart's `appVersion` to the new tag first,** in `charts/aerolvm/Chart.yaml`, through a PR merged before you publish. The chart's default image tag is its `appVersion`, so a chart that still names the previous release installs that release's images (and before v0.7.1 there were none).
 - **The tag must look like `vX.Y.Z`,** with an optional `-suffix`. The release workflow rejects other tags.
 - **Do not pass `--generate-notes`.** The workflow already appends GitHub's generated list, so the flag makes it appear twice.
 - **Publish with `--latest=false`.** The installer downloads from the latest release, so a release with no files yet would break every new install. The workflow marks the release as latest once it has attached the files. If you publish with `--latest` by mistake, the workflow points latest back at the previous release first.

@@ -115,8 +115,18 @@ The bar is 1.10. Both sides are far under the README's 284 ms gVisor row,
 which is another machine (t3.medium) without the network-namespace pool; G5
 compares one machine with itself. Spend about $0.50 (one cluster, ~1.2 h).
 
-Left before Phase 1's exit: `cosign verify` against the first release that
-signs the images, and the `kubernetes` CI job once the stack reaches `main`.
+**Phase 1's exit checks are all met (2026-11-12).** The stack merged as
+#1164 (`3b69da23`); the `kubernetes` CI job passed on it and on `main`
+(both installs on kind, with and without the edge). v0.7.1 published the
+three images, and each verified with cosign v3.1.4 against the release
+workflow's identity (cosign v2 reports "no signatures found": the release
+signs in cosign v3's bundle format; `RELEASE-VERIFICATION.md` now says so).
+The aerolvm image's SLSA provenance verified with `gh attestation verify`.
+On a fresh kind cluster running the released v0.7.1 images, `aerolvm k8s
+verify` passed every check with signatures checked. On the first such
+cluster, two gVisor creates timed out waiting for the toolbox (30 s) while
+runc worked; a fresh cluster then made three in 4.1, 0.26 and 0.26 s and
+passed, so the cause is unknown and was not seen again.
 C5 (servers and gateways
 under `restricted` pod security) is measured once those pods exist: their
 cluster files cannot come from `sandboxd init` in a pod (finding F14), so

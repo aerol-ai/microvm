@@ -342,6 +342,19 @@ func k8sProbe(ctx context.Context, env k8sEnv, pods []k8sPod, o k8sVerifyOptions
 	return checks
 }
 
+// cosignFailure is a failed `cosign verify`: its last line, and a hint when
+// the cosign here is too old for the release's signatures. The release signs
+// with cosign v3, in its newer bundle format, which cosign v2 cannot find:
+// it reports "no signatures found" for an image that is signed.
+func cosignFailure(err error, out []byte) error {
+	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+	last := lines[len(lines)-1]
+	if strings.Contains(string(out), "no signatures found") {
+		last += " (the release signs with cosign v3; check with cosign v3 or later)"
+	}
+	return fmt.Errorf("%v: %s", err, last)
+}
+
 // k8sEnvFor builds the real environment; tests replace it.
 var k8sEnvFor = func(a *app, c *commonFlags, kubeContext string) k8sEnv {
 	return k8sEnv{
@@ -361,8 +374,7 @@ var k8sEnvFor = func(a *app, c *commonFlags, kubeContext string) k8sEnv {
 				"--certificate-identity-regexp", k8sSignerIdentity,
 				"--certificate-oidc-issuer", k8sSignerIssuer)
 			if out, err := cmd.CombinedOutput(); err != nil {
-				lines := strings.Split(strings.TrimSpace(string(out)), "\n")
-				return fmt.Errorf("%v: %s", err, lines[len(lines)-1])
+				return cosignFailure(err, out)
 			}
 			return nil
 		},
