@@ -257,6 +257,10 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 	// deployments that never configured SB_HOST_DISK_GB. Disk admission stays
 	// opt-in: DiskTotalGB only carries the operator's declared budget.
 	detectedDiskTotalGB := host.DiskTotalGB
+	host, memProbe, err := capacityFromCgroupParent(cfg, logger, host, capacity.NewProcMeminfoProbe())
+	if err != nil {
+		return err
+	}
 	if cfg.HostCPUCoresOverride > 0 {
 		host.CPUCores = cfg.HostCPUCoresOverride
 	}
@@ -300,7 +304,7 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 		CPUOverProvisionFactor:    cfg.CPUOverProvisionFactor,
 		MemoryOverProvisionFactor: cfg.MemoryOverProvisionFactor,
 		RSSWatermarkRatio:         cfg.FirecrackerRSSWatermarkRatio,
-	}, capacity.NewProcMeminfoProbe(), rssSource)
+	}, memProbe, rssSource)
 	logger.Info("capacity admission configured",
 		"host_cpu_cores", host.CPUCores,
 		"host_memory_mb", host.MemoryTotalMB,
