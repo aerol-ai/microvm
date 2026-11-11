@@ -1662,6 +1662,30 @@ So C27 can give each sandbox its own disk limit on local NVMe (AL2023;
 Bottlerocket not run). The 10%-free create refusal and the alert stay as
 designed, for the image store and the database.
 
+**S6, Firecracker on a nested-virtualization machine: pass** (2026-11-11,
+one m8i.xlarge with `CpuOptions.NestedVirtualization=enabled`, Amazon Linux
+2023, kernel 6.18.56; no Kubernetes; harness `integration-tests/k8s/s6/`).
+AWS reported nested virtualization on; all 4 vCPUs have the `vmx` flag;
+`/dev/kvm` is there. Firecracker v1.18.0 booted its CI guest kernel 6.1.155
+(1 vCPU, 256 MiB, a busybox root disk whose init prints a marker and
+reboots) five times out of five: 862, 838, 827, 817 and 828 ms from starting
+the process to the guest's reboot.
+
+What it does and does not say:
+
+- **N7 is possible on EKS without metal machines:** an m8i/c8i/r8i node
+  with nested virtualization can run Firecracker, so a Firecracker worker
+  pool is a node-group setting, not a metal-instance budget.
+- **The speed is not measured against metal.** These are full cold boots of
+  a stock kernel under a second layer of virtualization, and there is no
+  same-script number from a metal machine. AerolVM's own Firecracker create
+  is p50 34 ms from its warm pool on a c5.metal (README "Create latency");
+  neither the warm pool nor snapshot restore is measured under nested
+  virtualization. N7's go or no-go needs those, on the same script.
+- Firecracker's CI publishes guest kernels per minor version and lags its
+  releases: v1.16 to v1.18 had none, so the first run fetched no kernel and
+  every boot failed at once. The harness now takes the newest that has one.
+
 **S4, how far one cell goes: the offline half** (2026-11-11, an M1 Max
 laptop, no AWS). `BenchmarkFSMCellCeiling` in
 `internal/cluster/fsm_cell_ceiling_bench_test.go` fills the placement FSM, then

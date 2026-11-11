@@ -65,7 +65,8 @@ anything else, as the plan's Phase 0 exit gate says.
 | S3 | **Done, 2026-11-11.** 1,000 gVisor sandboxes in one pod; findings F9 (57 cAdvisor series per sandbox) and F10 (one pod-level OOM kills the whole worker, machinery included). No eviction: the pod's own limit is the danger. **F10 fixed in the seventh run:** a cap on `sandboxes/`, containerd and its shims inside it, `memory.min` on `sandboxd`'s group; the pod's limit was never hit, only whole sandboxes died, `sandboxd` answered and created. New finding F12: `sandboxd` did not notice the killed sandboxes | v2 plan §18, "Phase 0 results" |
 | S4 | **Offline half done, 2026-11-11.** FSM apply about 8 µs at 100k to 1M placements; commits about 2,000 a second with 64 in flight (6.5 ms modelled sync); at 1M a snapshot holds up Apply for 1.1 s and the FSM needs 2.4 GiB (finding F11, for Phase 3). Live half (three EC2 server nodes) still to run | v2 plan §18, "Phase 0 results" |
 | S8 | **Done, 2026-11-11. Pass** on AL2023 (m6id.xlarge NVMe as XFS with project quotas): a gVisor sandbox with a 100 MB quota stopped at 99.0 MB, the other wrote 300 MB; gVisor keeps its root overlay in a disk file in the writable layer. Bottlerocket not run | v2 plan §18, "Phase 0 results" |
-| S5, S6, N1 | Not started; S6 and N1 harnesses written | — |
+| S6 | **Done, 2026-11-11. Pass:** m8i.xlarge with nested virtualization has `/dev/kvm`; Firecracker v1.18.0 cold-booted a guest 5 of 5 times in 817 to 862 ms. Not compared with metal; warm pool and snapshot restore not measured under nested virtualization (needed for N7) | v2 plan §18, "Phase 0 results" |
+| S5, N1 | Not started; N1 harness written | — |
 
 ## Cost, before it is spent
 

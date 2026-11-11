@@ -58,10 +58,15 @@ try:
             except Exception:
                 text = out
             for line in text.splitlines():
-                if "S6" in line and line not in seen:
+                # The serial console shows each line twice (the script's own
+                # copy and cloud-init's), with different prefixes.
+                if "S6" not in line:
+                    continue
+                line = line.strip()
+                line = line[line.find("S6"):]
+                if line not in seen:
                     seen.add(line)
-                    line = line.strip()
-                    print(line[line.find("S6"):], flush=True)
+                    print(line, flush=True)
             if "S6-DONE" in text:
                 break
     else:

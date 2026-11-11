@@ -15,8 +15,16 @@ arch=x86_64
 rel="$(basename "$(curl -fsSLI -o /dev/null -w '%{url_effective}' https://github.com/firecracker-microvm/firecracker/releases/latest)")"
 curl -fsSL "https://github.com/firecracker-microvm/firecracker/releases/download/$rel/firecracker-$rel-$arch.tgz" | tar -xz
 fc="release-$rel-$arch/firecracker-$rel-$arch"
-ci="${rel%.*}"
-key="$(curl -fsSL "http://spec.ccfc.min.s3.amazonaws.com/?prefix=firecracker-ci/$ci/$arch/vmlinux-&list-type=2" | grep -oP "(?<=<Key>)(firecracker-ci/$ci/$arch/vmlinux-[0-9]+\.[0-9]+\.[0-9]{1,3})(?=</Key>)" | sort -V | tail -1)"
+# Firecracker's CI publishes guest kernels per minor version, and lags the
+# releases (first S6 run: v1.18 had none, so no kernel was fetched and every
+# boot failed at once). Take the newest CI version that has one.
+bucket=http://spec.ccfc.min.s3.amazonaws.com
+key=""
+for ci in $(curl -fsSL "$bucket/?prefix=firecracker-ci/&delimiter=/&list-type=2" | grep -oP '(?<=<Prefix>firecracker-ci/)v1\.[0-9]+(?=/</Prefix>)' | sort -Vr); do
+  key="$(curl -fsSL "$bucket/?prefix=firecracker-ci/$ci/$arch/vmlinux-&list-type=2" | grep -oP "(?<=<Key>)(firecracker-ci/$ci/$arch/vmlinux-[0-9]+\.[0-9]+\.[0-9]{1,3})(?=</Key>)" | sort -V | tail -1)"
+  [ -n "$key" ] && break
+done
+[ -n "$key" ] || { echo "S6: no guest kernel found in Firecracker's CI bucket"; echo S6-DONE; exit 0; }
 curl -fsSL -o vmlinux "https://s3.amazonaws.com/spec.ccfc.min/$key"
 # A tiny root disk: static busybox and an init that prints a marker on the
 # serial port and reboots, which ends the Firecracker process. A disk, not an
@@ -40,5 +48,7 @@ for i in 1 2 3 4 5; do
   t1=$(date +%s%N)
   booted=no; echo "$out" | grep -q S6-GUEST-BOOTED && booted=yes
   echo "S6: boot $i: $(( (t1 - t0) / 1000000 )) ms from start to the guest's reboot; guest printed its marker: $booted"
+  # A boot that printed no marker: show why, once.
+  if [ "$booted" = no ] && [ "$i" = 1 ]; then echo "$out" | tail -5 | sed 's/^/S6: firecracker said: /'; fi
 done
 echo S6-DONE
