@@ -353,6 +353,11 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 	if err := task.Start(ctx); err != nil {
 		return nil, fmt.Errorf("start task: %w", err)
 	}
+	if d.cfg.CgroupParent != "" {
+		if err := d.markWholeOOMVictim(d.sandboxCgroupPath(sandboxID)); err != nil {
+			return nil, err
+		}
+	}
 	createtiming.From(ctx).RecordStage("containerd_start", time.Since(startStart))
 
 	// containerd_address: reading the started task's IPv4 back (the netns
@@ -380,6 +385,14 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		return nil, err
 	}
 	createtiming.From(ctx).RecordReadinessWaits(0, time.Since(readyStart), readinessSource)
+	// Again, now that the sandbox answers: gVisor starts some of its
+	// processes after task.Start returns, and the pass above can miss them
+	// (4 of 7,021 gvisor_sentry processes in a 1,000-sandbox run).
+	if d.cfg.CgroupParent != "" {
+		if err := d.markWholeOOMVictim(d.sandboxCgroupPath(sandboxID)); err != nil {
+			return nil, err
+		}
+	}
 
 	switch {
 	case earlyRules && state.ContainerIP != strings.TrimSpace(prepaidIP):
@@ -565,6 +578,14 @@ func (d *Driver) startTask(ctx context.Context, containerRef, sandboxID, toolbox
 	if err := task.Start(ctx); err != nil {
 		return nil, fmt.Errorf("start task: %w", err)
 	}
+	// A restart makes the task's cgroup anew; mark it again (F10).
+	if spec != nil && spec.Linux != nil {
+		if err := d.markWholeOOMVictim(spec.Linux.CgroupsPath); err != nil {
+			_ = task.Kill(ctx, syscall.SIGKILL)
+			_, _ = task.Delete(ctx, cntr.WithProcessKill)
+			return nil, err
+		}
+	}
 	if parked != nil {
 		waitCtx, cancel := context.WithTimeout(ctx, d.cfg.ToolboxWaitTimeout)
 		err := readoptParkedFn(waitCtx, parked, sandboxID, toolboxToken, adoptEnv)
@@ -580,6 +601,14 @@ func (d *Driver) startTask(ctx context.Context, containerRef, sandboxID, toolbox
 	state, err := d.runtimeStateAfterStart(ctx, container, task, containerRef, "")
 	if err != nil {
 		return nil, err
+	}
+	// Again, for processes gVisor started after task.Start returned.
+	if spec != nil && spec.Linux != nil {
+		if err := d.markWholeOOMVictim(spec.Linux.CgroupsPath); err != nil {
+			_ = task.Kill(ctx, syscall.SIGKILL)
+			_, _ = task.Delete(ctx, cntr.WithProcessKill)
+			return nil, err
+		}
 	}
 	state.StartedAt = startedAt
 	return state, nil
