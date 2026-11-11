@@ -14,16 +14,20 @@ import (
 func runtimeGOOS() string { return runtime.GOOS }
 
 // A worker pod as the chart makes it: no token, emptyDirs, the API port,
-// and a sandbox range set by C3.
+// a sandbox range set by C3, the API token from its Secret, and the edge
+// certificate mounted by key (C25).
 const k8sGoodPods = `{"items":[{
   "metadata":{"name":"aerolvm-0"},
   "spec":{
     "automountServiceAccountToken":false,
-    "volumes":[{"name":"containerd","emptyDir":{}},{"name":"netns","emptyDir":{}}],
+    "volumes":[{"name":"containerd","emptyDir":{}},{"name":"netns","emptyDir":{}},
+      {"name":"edge-tls","secret":{"secretName":"aerolvm-edge-tls","items":[{"key":"tls.crt","path":"tls.crt"},{"key":"tls.key","path":"tls.key"}]}}],
     "containers":[
       {"name":"runtime","image":"ghcr.io/aerol-ai/aerolvm-runtime:v1"},
       {"name":"agent","image":"ghcr.io/aerol-ai/aerolvm:v1","ports":[{"containerPort":21212}],
-       "env":[{"name":"SB_CONTAINERD_BRIDGE_SUBNET","value":"10.200.0.0/16"}]},
+       "env":[{"name":"SB_CONTAINERD_BRIDGE_SUBNET","value":"10.200.0.0/16"},
+         {"name":"SB_PAT_TOKEN","valueFrom":{"secretKeyRef":{"name":"aerolvm-api-token","key":"SB_PAT_TOKEN"}}},
+         {"name":"SB_ROUTE_DNS_ADDR","value":"127.0.0.1:53053"}]},
       {"name":"egress","image":"ghcr.io/aerol-ai/aerolvm:v1"}]},
   "status":{"podIP":"10.244.0.12"}}]}`
 
@@ -78,8 +82,8 @@ func TestK8sVerifyPasses(t *testing.T) {
 			t.Fatalf("%s: %s %s", c.Name, c.Result, c.Detail)
 		}
 	}
-	if len(checks) != 6 {
-		t.Fatalf("%d checks, want 6: %+v", len(checks), checks)
+	if len(checks) != 7 {
+		t.Fatalf("%d checks, want 7: %+v", len(checks), checks)
 	}
 	if strings.Join(f.signed, ",") != "ghcr.io/aerol-ai/aerolvm-runtime:v1,ghcr.io/aerol-ai/aerolvm:v1" {
 		t.Fatalf("signatures checked for %v, want each image once", f.signed)
@@ -117,6 +121,27 @@ func TestK8sVerifyFailures(t *testing.T) {
 		{name: "a projected token", f: &fakeK8s{pods: podsWith(func(s string) string {
 			return strings.Replace(s, `{"name":"containerd","emptyDir":{}}`, `{"name":"kube-api-access","projected":{"sources":[{"serviceAccountToken":{"path":"token"}}]}}`, 1)
 		})}, check: "no Kubernetes API credential in the pods", want: "fail: aerolvm-0: volume kube-api-access holds a service account token"},
+		{name: "a Secret volume with every key", f: &fakeK8s{pods: podsWith(func(s string) string {
+			return strings.Replace(s, `,"items":[{"key":"tls.crt","path":"tls.crt"},{"key":"tls.key","path":"tls.key"}]`, ``, 1)
+		})}, check: "no DNS provider token in the pods", want: "fail: aerolvm-0: volume edge-tls mounts every key of Secret aerolvm-edge-tls"},
+		{name: "a Secret volume with another key", f: &fakeK8s{pods: podsWith(func(s string) string {
+			return strings.Replace(s, `{"key":"tls.key","path":"tls.key"}`, `{"key":"api-token","path":"token"}`, 1)
+		})}, check: "no DNS provider token in the pods", want: "fail: aerolvm-0: volume edge-tls mounts key api-token of Secret aerolvm-edge-tls"},
+		{name: "a projected Secret", f: &fakeK8s{pods: podsWith(func(s string) string {
+			return strings.Replace(s, `{"name":"containerd","emptyDir":{}}`, `{"name":"creds","projected":{"sources":[{"secret":{"name":"route53","items":[{"key":"secret-access-key"}]}}]}}`, 1)
+		})}, check: "no DNS provider token in the pods", want: "fail: aerolvm-0: volume creds mounts key secret-access-key of Secret route53"},
+		{name: "a provider token in the environment", f: &fakeK8s{pods: podsWith(func(s string) string {
+			return strings.Replace(s, `{"name":"SB_ROUTE_DNS_ADDR"`, `{"name":"CLOUDFLARE_API_TOKEN","value":"x"},{"name":"SB_ROUTE_DNS_ADDR"`, 1)
+		})}, check: "no DNS provider token in the pods", want: "fail: aerolvm-0/agent: environment variable CLOUDFLARE_API_TOKEN"},
+		{name: "Caddy's DNS token in an init container", f: &fakeK8s{pods: podsWith(func(s string) string {
+			return strings.Replace(s, `"containers":[`, `"initContainers":[{"name":"setup","image":"ghcr.io/aerol-ai/aerolvm:v1","env":[{"name":"SB_DNS_API_TOKEN","value":"x"}]}],"containers":[`, 1)
+		})}, check: "no DNS provider token in the pods", want: "fail: aerolvm-0/setup: environment variable SB_DNS_API_TOKEN"},
+		{name: "a Secret loaded whole", f: &fakeK8s{pods: podsWith(func(s string) string {
+			return strings.Replace(s, `{"name":"egress","image":"ghcr.io/aerol-ai/aerolvm:v1"}`, `{"name":"egress","image":"ghcr.io/aerol-ai/aerolvm:v1","envFrom":[{"configMapRef":{"name":"settings"}},{"secretRef":{"name":"dns"}}]}`, 1)
+		})}, check: "no DNS provider token in the pods", want: "fail: aerolvm-0/egress: Secret dns loaded whole into the environment"},
+		{name: "an unsigned init container image", f: &fakeK8s{pods: podsWith(func(s string) string {
+			return strings.Replace(s, `"containers":[`, `"initContainers":[{"name":"setup","image":"ghcr.io/x/setup:v1"}],"containers":[`, 1)
+		}), cosignErr: map[string]error{"ghcr.io/x/setup:v1": errors.New("no signatures found")}}, check: "images signed by the AerolVM release workflow", want: "fail: ghcr.io/x/setup:v1 (no signatures found)"},
 		{name: "an unsigned image", f: &fakeK8s{pods: k8sGoodPods, cosignErr: map[string]error{"ghcr.io/aerol-ai/aerolvm:v1": errors.New("no signatures found")}}, check: "images signed by the AerolVM release workflow", want: "fail: ghcr.io/aerol-ai/aerolvm:v1 (no signatures found)"},
 		{name: "a sandbox reaches the API", f: &fakeK8s{pods: k8sGoodPods, probeOut: map[string]string{"gvisor": "10.244.0.12:21212\n10.96.0.1:443\n"}}, check: "a gvisor sandbox cannot reach the worker or the Kubernetes API", want: "fail: reached 10.244.0.12:21212, 10.96.0.1:443"},
 		{name: "the probe cannot run", f: &fakeK8s{pods: k8sGoodPods, probeErr: errors.New("not logged in")}, check: "a docker sandbox cannot reach the worker or the Kubernetes API", want: "fail: probe: not logged in"},
@@ -165,7 +190,7 @@ func TestK8sVerifyCommand(t *testing.T) {
 		Checks []k8sCheck `json:"checks"`
 	}
 	h.jsonOut(&out)
-	if !out.OK || len(out.Checks) != 6 {
+	if !out.OK || len(out.Checks) != 7 {
 		t.Fatalf("%+v", out)
 	}
 

@@ -65,7 +65,7 @@ const caddyPlugin = "github.com/aerol-ai/microvm/caddymod=./caddymod"
 
 // caddyBuilders lists every file that builds Caddy, and what each must say.
 // Every one of them builds the custom Caddy, so every one names
-// CADDY_BUILD_VERSION.
+// CADDY_BUILD_VERSION, or reads it and the plugin pins from install.sh.
 func caddyBuilders(p caddyPins) map[string][]string {
 	v := p.buildVersion
 	return map[string][]string{
@@ -84,6 +84,15 @@ func caddyBuilders(p caddyPins) map[string][]string {
 			"--with " + p.l4 + " ",
 			"--with " + p.cloudflare + " ",
 			"--with " + p.s3 + " ",
+		},
+		// The edge image for kind (C25) reads the pins at build time.
+		"scripts/k8s-dev.sh": {
+			`pin() { sed -n "s/^$1=\"\(.*\)\"$/\1/p" scripts/install.sh; }`,
+			`xcaddy" \` + "\n" + `    build "$(pin CADDY_BUILD_VERSION)"`,
+			"--with " + caddyPlugin + " \\",
+			`--with "$(pin CADDY_L4_MODULE)"`,
+			`--with "$(pin CADDY_DNS_CLOUDFLARE_MODULE)"`,
+			`--with "$(pin CADDY_STORAGE_S3_MODULE)"`,
 		},
 		"Makefile": {
 			"CADDY_E2E_VERSION ?= " + v + "\n",

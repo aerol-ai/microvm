@@ -22,7 +22,7 @@ func TestCaddyForwardsEveryPublicRoute(t *testing.T) {
 	for _, prefix := range publicRoutePrefixes {
 		paths = append(paths, routePath(prefix))
 	}
-	for _, file := range []string{"../../packaging/Caddyfile.template", "../../scripts/install.sh"} {
+	for _, file := range []string{"../../packaging/Caddyfile.template", "../../scripts/install.sh", "../../charts/aerolvm/templates/edge-config.yaml"} {
 		matchers := apiPathMatchers(t, file)
 		for _, path := range paths {
 			if !caddyPathMatches(matchers, path) {

@@ -66,3 +66,25 @@ worker:
 service:
   type: ClusterIP
   port: 21212
+
+# Sandbox links and the API over HTTPS (C25): an edge container runs
+# AerolVM's Caddy, as on a domain install. The API is https://<domain> and
+# a sandbox's port is https://<id>-<port>.<domain>. The certificate comes
+# from cert-manager (a chart prerequisite when this is on): point
+# certManager.issuerRef at your issuer, or name a kubernetes.io/tls Secret
+# you keep yourself. No pod holds a DNS provider token. Point the domain and
+# its wildcard at edge.service.
+edge:
+  enabled: false
+  domain: ""
+  certManager:
+    # For example { name: letsencrypt-dns, kind: ClusterIssuer }.
+    issuerRef: {}
+  # A Secret with tls.crt and tls.key for <domain> and *.<domain>, instead
+  # of a cert-manager Certificate.
+  existingTLSSecret: ""
+  resources:
+    requests: { cpu: 250m, memory: 256Mi }
+    limits: { cpu: 250m, memory: 256Mi }
+  service:
+    type: LoadBalancer
