@@ -5,7 +5,7 @@
 #
 #   scripts/build-images.sh --dist <dir> --version <tag> [--registry <repo>]
 #                           [--platforms linux/amd64,linux/arm64] [--push]
-#                           [--metadata-dir <dir>]
+#                           [--metadata-dir <dir>] [--images aerolvm,aerolvm-runtime]
 #
 # --dist holds the release build's files, named as release.yml names them:
 # sandboxd_linux_<arch>, toolboxd_linux_<arch>, aerolvm-supervisor_linux_<arch>
@@ -15,10 +15,11 @@
 # With --push the images go to the registry with an SBOM and SLSA provenance
 # attached, and each image's digest is written to <metadata-dir>/<image>.json
 # for signing. Without it, one platform is built and loaded into the local
-# Docker (a kind cluster, `make k8s-dev`).
+# Docker (a kind cluster, `make k8s-dev`). --images builds only those named
+# (single mode needs no aerolvm-edge, so `make k8s-dev` skips the Caddy build).
 set -euo pipefail
 
-dist="" version="" registry="ghcr.io/aerol-ai" platforms="" push=0 meta=""
+dist="" version="" registry="ghcr.io/aerol-ai" platforms="" push=0 meta="" images="aerolvm,aerolvm-runtime,aerolvm-edge"
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --dist) dist="$2"; shift 2 ;;
@@ -27,6 +28,7 @@ while [[ $# -gt 0 ]]; do
     --platforms) platforms="$2"; shift 2 ;;
     --push) push=1; shift ;;
     --metadata-dir) meta="$2"; shift 2 ;;
+    --images) images="$2"; shift 2 ;;
     *) echo "build-images: unknown flag $1" >&2; exit 2 ;;
   esac
 done
@@ -49,7 +51,9 @@ trap 'rm -rf "$ctx"' EXIT
 for platform in ${platforms//,/ }; do
   arch="${platform#linux/}"
   mkdir -p "$ctx/$arch"
-  for bin in sandboxd toolboxd aerolvm-supervisor caddy; do
+  bins="sandboxd toolboxd aerolvm-supervisor"
+  [[ ",$images," == *,aerolvm-edge,* ]] && bins="$bins caddy"
+  for bin in $bins; do
     src="$dist/${bin}_linux_${arch}"
     [[ -f "$src" ]] || { echo "build-images: missing $src" >&2; exit 1; }
     install -m 0755 "$src" "$ctx/$arch/$bin"
@@ -62,7 +66,8 @@ while IFS='=' read -r key value; do
   args+=(--build-arg "$key=$value")
 done < "$root/packaging/images/versions.env"
 
-for image in aerolvm aerolvm-runtime aerolvm-edge; do
+for image in ${images//,/ }; do
+  case "$image" in aerolvm|aerolvm-runtime|aerolvm-edge) ;; *) echo "build-images: unknown image $image" >&2; exit 2 ;; esac
   file="$root/packaging/images/${image#aerolvm-}.Dockerfile"
   [[ "$image" == aerolvm ]] && file="$root/packaging/images/aerolvm.Dockerfile"
   out=(--load)

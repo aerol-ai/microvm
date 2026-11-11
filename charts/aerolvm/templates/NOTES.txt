@@ -1,0 +1,25 @@
+AerolVM is starting in {{ .Release.Namespace }} ({{ .Values.mode }} mode).
+
+1. Wait until it is ready (the first start pulls images):
+
+   kubectl -n {{ .Release.Namespace }} wait --for=condition=Ready pod/{{ include "aerolvm.name" . }}-0 --timeout=5m
+
+2. Reach the API from this machine:
+
+   kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "aerolvm.name" . }} 21212:{{ .Values.service.port }}
+
+3. Read the API token, then point an SDK at http://127.0.0.1:21212 with it:
+
+   kubectl -n {{ .Release.Namespace }} get secret {{ include "aerolvm.tokenSecret" . }} -o jsonpath='{.data.SB_PAT_TOKEN}' | base64 -d
+
+Health: `kubectl -n {{ .Release.Namespace }} get pod {{ include "aerolvm.name" . }}-0` shows 3/3 READY
+when sandboxd serves; `aerolvm health` (the CLI) reports the same through the API.
+
+The worker pod runs privileged: the namespace must allow it
+(pod-security.kubernetes.io/enforce=privileged, or no Pod Security labels).
+
+Upgrading: a chart upgrade never restarts the worker pod, which would end every
+sandbox. To move sandboxd to a new image, change the agent container in place;
+only it restarts, and the sandboxes keep running:
+
+   kubectl -n {{ .Release.Namespace }} set image pod/{{ include "aerolvm.name" . }}-0 agent=<image>

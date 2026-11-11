@@ -1,0 +1,205 @@
+{{- if ne .Values.mode "single" }}
+{{- fail "only mode: single exists yet; cluster mode comes with the operator (plans/kubernetes-v2-architecture.md, Phase 2)" }}
+{{- end }}
+{{- $name := include "aerolvm.name" . }}
+# The worker pod (plans/kubernetes-v2-architecture.md §8.2): runtime holds
+# containerd and every sandbox and changes only with containerd or gVisor;
+# agent is sandboxd; egress is the hostname-filtering gateway (C6). The
+# containers hand each other folders at the same path.
+#
+# updateStrategy OnDelete: a chart upgrade never deletes the pod, which would
+# end every sandbox. Upgrade sandboxd by changing the agent container's image
+# in place (NOTES.txt); only that container restarts.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "aerolvm.labels" . | nindent 4 }}
+    app.kubernetes.io/component: worker
+spec:
+  serviceName: {{ $name }}
+  replicas: 1
+  updateStrategy:
+    type: OnDelete
+  selector:
+    matchLabels:
+      {{- include "aerolvm.selector" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "aerolvm.selector" . | nindent 8 }}
+    spec:
+      # No Kubernetes API rights (plan §8.7, wall 4).
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      terminationGracePeriodSeconds: 30
+      {{- with .Values.worker.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.worker.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.worker.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: runtime
+          image: {{ include "aerolvm.image" (dict "root" . "name" "aerolvm-runtime") }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          # Privileged: it builds sandboxes (cgroups, namespaces, gVisor).
+          # No liveness probe: restarting this container ends every sandbox.
+          securityContext:
+            privileged: true
+          resources:
+            {{- toYaml .Values.worker.runtime.resources | nindent 12 }}
+          volumeMounts:
+            - { name: containerd, mountPath: /var/lib/containerd }
+            - { name: state, mountPath: /var/lib/sandboxd }
+            - { name: run-containerd, mountPath: /run/containerd }
+            - { name: run-aerolvm, mountPath: /run/aerolvm }
+            - { name: run-sandboxd, mountPath: /run/sandboxd }
+            - { name: toolbox, mountPath: /opt/aerolvm/toolbox }
+            # The network namespaces the agent makes, where containerd starts
+            # sandboxes in them. Bidirectional, so the supervisor's unmount
+            # when the pod ends reaches the machine; left mounted there, they
+            # keep the pod in Terminating (finding F8).
+            - { name: netns, mountPath: /run/netns, mountPropagation: Bidirectional }
+        - name: agent
+          image: {{ include "aerolvm.image" (dict "root" . "name" "aerolvm") }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            privileged: true
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              # The runtime container's containerd socket and the cgroup it
+              # set up for sandboxes, both on shared folders.
+              for _ in $(seq 1 120); do
+                [ -S /run/containerd/containerd.sock ] && [ -s /run/aerolvm/cgroup-parent ] && break
+                sleep 1
+              done
+              [ -s /run/aerolvm/cgroup-parent ] || { echo "agent: the runtime container did not start" >&2; exit 1; }
+              SB_CONTAINERD_CGROUP_PARENT="$(cat /run/aerolvm/cgroup-parent)"
+              export SB_CONTAINERD_CGROUP_PARENT
+              # containerd bind-mounts toolboxd into each sandbox from the
+              # runtime container, so it must be on a shared folder. Replaced
+              # by rename: running sandboxes keep the copy they started with.
+              cp /usr/local/bin/toolboxd /opt/aerolvm/toolbox/.toolboxd.new
+              mv -f /opt/aerolvm/toolbox/.toolboxd.new /opt/aerolvm/toolbox/toolboxd
+              mkdir -p /var/lib/sandboxd/mounts /run/sandboxd
+              chmod 0700 /var/lib/sandboxd/mounts /run/sandboxd
+              exec sandboxd
+          env:
+            - name: SB_PAT_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "aerolvm.tokenSecret" . }}
+                  key: SB_PAT_TOKEN
+            - name: SB_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - { name: SB_API_HOST, value: "0.0.0.0" }
+            - { name: SB_API_PORT, value: "21212" }
+            - { name: SB_DB_PATH, value: /var/lib/sandboxd/state.db }
+            - { name: SB_TOOLBOX_BINARY_PATH, value: /opt/aerolvm/toolbox/toolboxd }
+            - { name: SB_TOOLBOX_MOUNT_PATH, value: /usr/local/bin/toolboxd }
+            - { name: SB_TOOLBOX_PORT, value: "2280" }
+            - { name: SB_ENABLE_CADDY, value: "false" }
+            - { name: SB_ENABLE_NETWORK_RULES, value: "true" }
+            - { name: SB_MOUNTS_ROOT, value: /var/lib/sandboxd/mounts }
+            - { name: SB_MOUNTS_CRED_DIR, value: /run/sandboxd }
+            - { name: SB_HOST_RUNTIMES, value: "docker,gvisor" }
+            - { name: SB_CONTAINER_ENGINE, value: containerd }
+            - { name: SB_CONTAINERD_SOCKET, value: /run/containerd/containerd.sock }
+            - { name: SB_CONTAINERD_NAMESPACE, value: aerolvm }
+            - { name: SB_CONTAINERD_NATIVE_NETNS_POOL_ENABLED, value: "true" }
+            # No Docker in the pod (C2).
+            - { name: SB_DOCKER_ENABLED, value: "false" }
+            - { name: SB_DISK_FLOOR_RATIO, value: {{ .Values.worker.diskFloorRatio | quote }} }
+            - { name: SB_EGRESS_BLOCK_PRIVATE_BY_DEFAULT, value: {{ .Values.worker.blockPrivateByDefault | quote }} }
+            # The egress container's user, by number (C6).
+            - { name: SB_EGRESS_GATEWAY_USER, value: "65532" }
+            {{- with .Values.worker.defaultRuntime }}
+            - { name: SB_CONTAINER_RUNTIME, value: {{ . | quote }} }
+            {{- end }}
+            {{- range $k, $v := .Values.worker.extraEnv }}
+            - { name: {{ $k }}, value: {{ $v | quote }} }
+            {{- end }}
+          ports:
+            - { name: api, containerPort: 21212 }
+          # Ready while sandboxd can serve (C1). No liveness probe: a
+          # restart of this container is safe but never needed for health.
+          readinessProbe:
+            httpGet: { path: /ready, port: api }
+            periodSeconds: 5
+          resources:
+            {{- toYaml .Values.worker.agent.resources | nindent 12 }}
+          volumeMounts:
+            # containerd's root too: containerd's client library, inside
+            # sandboxd, mounts an image's snapshot to read its users (S2).
+            - { name: containerd, mountPath: /var/lib/containerd }
+            - { name: state, mountPath: /var/lib/sandboxd }
+            - { name: run-containerd, mountPath: /run/containerd }
+            - { name: run-aerolvm, mountPath: /run/aerolvm }
+            - { name: run-sandboxd, mountPath: /run/sandboxd }
+            - { name: toolbox, mountPath: /opt/aerolvm/toolbox }
+            # The CNI host-local plugin's record of the addresses it gave
+            # out. In the container's own filesystem it was lost on an agent
+            # restart, and the next warm slot got a running sandbox's
+            # address again, cutting that sandbox off (found on kind).
+            - { name: cni-state, mountPath: /var/lib/cni }
+            # Kubernetes allows Bidirectional only in privileged containers.
+            - { name: netns, mountPath: /run/netns, mountPropagation: Bidirectional }
+        - name: egress
+          image: {{ include "aerolvm.image" (dict "root" . "name" "aerolvm") }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          # The hostname-filtering gateway without systemd (C6): its own
+          # process in the pod's network, as uid 65532 with two rights. A
+          # container that starts as that user would get neither: Kubernetes
+          # puts added capabilities in the bounding set only, never ambient.
+          # So it starts as root with just enough to hand itself over, and
+          # setpriv drops to 65532 keeping exactly NET_ADMIN and
+          # NET_BIND_SERVICE, as the systemd unit's AmbientCapabilities does.
+          command:
+            - setpriv
+            - --reuid=65532
+            - --regid=65532
+            - --clear-groups
+            - --inh-caps=-all,+net_admin,+net_bind_service
+            - --ambient-caps=-all,+net_admin,+net_bind_service
+            - --bounding-set=-all,+net_admin,+net_bind_service
+            - /usr/local/bin/sandboxd
+            - egress-gateway
+          env:
+            - { name: SB_EGRESS_PEER_CGROUP, value: none }
+            - { name: SB_EGRESS_STATE_DIR, value: /var/lib/aerolvm-egress }
+          securityContext:
+            runAsUser: 0
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+              add: ["NET_ADMIN", "NET_BIND_SERVICE", "SETUID", "SETGID", "SETPCAP"]
+          resources:
+            {{- toYaml .Values.worker.egress.resources | nindent 12 }}
+          volumeMounts:
+            - { name: run-aerolvm, mountPath: /run/aerolvm }
+            - { name: egress-state, mountPath: /var/lib/aerolvm-egress }
+      volumes:
+        - name: containerd
+          {{- toYaml .Values.worker.containerdVolume | nindent 10 }}
+        - name: state
+          {{- toYaml .Values.worker.stateVolume | nindent 10 }}
+        - { name: run-containerd, emptyDir: {} }
+        - { name: run-aerolvm, emptyDir: {} }
+        - { name: run-sandboxd, emptyDir: {} }
+        - { name: toolbox, emptyDir: {} }
+        - { name: cni-state, emptyDir: {} }
+        - { name: netns, emptyDir: {} }
+        - { name: egress-state, emptyDir: {} }
