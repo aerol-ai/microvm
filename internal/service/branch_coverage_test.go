@@ -127,8 +127,8 @@ func TestServiceHelperRandomBranches(t *testing.T) {
 
 	t.Run("sandbox id failure", func(t *testing.T) {
 		setRandReader(t, &scriptedRandReader{errs: []error{errors.New("id entropy exhausted")}})
-		if _, err := generateSandboxID(); err == nil || !strings.Contains(err.Error(), "id entropy exhausted") {
-			t.Fatalf("generateSandboxID() error = %v, want id entropy failure", err)
+		if _, err := newSandboxIDInCell(1); err == nil || !strings.Contains(err.Error(), "id entropy exhausted") {
+			t.Fatalf("newSandboxIDInCell(1) error = %v, want id entropy failure", err)
 		}
 	})
 

@@ -532,9 +532,9 @@ func TestServiceHelperUtilities(t *testing.T) {
 		t.Fatalf("toolbox token is not hex: %v", err)
 	}
 
-	id, err := GenerateSandboxID()
+	id, err := (&Service{}).NewSandboxID()
 	if err != nil {
-		t.Fatalf("GenerateSandboxID() error = %v", err)
+		t.Fatalf("NewSandboxID() error = %v", err)
 	}
 	if !strings.HasPrefix(id, "sb-") || len(id) != 19 {
 		t.Fatalf("sandbox id = %q, want sb- prefix plus 16 hex chars", id)
