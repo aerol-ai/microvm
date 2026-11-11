@@ -83,9 +83,15 @@ cmd_up() {
   local region; region="$(tf "$name" output -state="$sd/terraform.tfstate" -raw region)"
   aws eks update-kubeconfig --name "$name" --region "$region" --kubeconfig "$sd/kubeconfig" >/dev/null
   if [[ "$karpenter" == true ]]; then
+    # Karpenter's chart is only on an OCI registry, which Helm reads from
+    # 3.8 on (the first S5 run stopped here on 3.6). HELM picks the binary.
+    local helm="${HELM:-helm}" hv
+    hv="$("$helm" version --short 2>/dev/null | sed -E 's/^v([0-9]+)\.([0-9]+).*/\1 \2/')"
+    read -r hmaj hmin <<<"${hv:-0 0}"
+    (( hmaj > 3 || (hmaj == 3 && hmin >= 8) )) || die "Karpenter's chart needs Helm 3.8 or newer; $helm is ${hv:-missing} (set HELM=)"
     # One replica: the chart's two want two machines, and the only machine
     # without the worker taint is the one system node.
-    KUBECONFIG="$sd/kubeconfig" helm upgrade --install karpenter oci://public.ecr.aws/karpenter/karpenter \
+    KUBECONFIG="$sd/kubeconfig" "$helm" upgrade --install karpenter oci://public.ecr.aws/karpenter/karpenter \
       --version "$KARPENTER_VERSION" --namespace kube-system \
       --set settings.clusterName="$name" --set replicas=1 --wait >/dev/null
     echo "up: Karpenter $KARPENTER_VERSION installed"

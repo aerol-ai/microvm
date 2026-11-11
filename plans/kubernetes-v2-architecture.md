@@ -982,6 +982,9 @@ cordons first.
 
 - **Karpenter (EKS) and Node Auto Provisioning (AKS, which is Karpenter
   underneath).** Worker pods carry `karpenter.sh/do-not-disrupt: "true"`.
+  Karpenter does not cordon a machine that annotation holds, so on these
+  pools the operator watches the NodeClaim's `Drifted` condition instead of
+  a cordon (Phase 0 S5).
   That annotation stops consolidation always, and stops drift only when the
   NodePool has no `terminationGracePeriod`. It does **not** stop expiry, node
   auto-repair or interruption, and a `terminationGracePeriod` overrides both
@@ -1723,6 +1726,38 @@ How to read it:
   (three samples above), and `n1.sh` now records a phase that prints nothing
   instead of stopping.
 
+**S5, machines go only when AerolVM says so: pass** (run `p0-s5`, EKS
+1.36, Karpenter 1.15.1, 2026-11-11; harness `integration-tests/k8s/s5.sh`).
+The operator was a stand-in script: it "decommissions" a worker by deleting
+its sandboxes (standing in for moving them) and then lets the pod go.
+
+- **Karpenter, drift.** A worker pod with `karpenter.sh/do-not-disrupt` on a
+  NodePool with `expireAfter: Never` and no `terminationGracePeriod`.
+  Karpenter brought up the machine 46 s after the pod appeared. Changing
+  the NodePool's template marked the machine `Drifted` within 2 s. For the
+  next 3 minutes Karpenter left it alone: the machine, the worker and its
+  3 sandboxes stayed, and Karpenter recorded `DisruptionBlocked: Pod has
+  "karpenter.sh/do-not-disrupt" annotation`. Once the stand-in emptied the
+  worker and removed the annotation, the pod was gone in 94 s and the old
+  machine in 119 s; Karpenter had brought up a replacement first.
+- **Managed node group upgrade.** The worker pod on the node group, with a
+  PodDisruptionBudget that refuses its eviction, and the AMI upgraded one
+  release (1.36.5-20261031 to 1.36.5-20261107). EKS cordoned the old
+  machine 133 s in (`unschedulable`, plus the
+  `node.kubernetes.io/unschedulable` taint), before evicting. The stand-in
+  saw the cordon, emptied the worker and let the pod go 37 s later. The
+  upgrade succeeded after 450 s with no errors, inside the 15-minute
+  eviction limit. The worker then started on the new machine.
+
+What changes in §10.6: on Karpenter pools a drifted machine is **not**
+cordoned while `do-not-disrupt` holds it, so the operator's signal there is
+the NodeClaim's `Drifted` condition, not a cordon. On managed node groups
+the cordon comes first, as §10.6 says. The 37 s here is three sandboxes
+deleted; a real decommission moves them, and its budget is the 14 minutes
+§10.6 sets. Not run: an upgrade that runs out the 15 minutes (EKS documents
+the `PodEvictionFailure`), and Karpenter expiry, which `expireAfter: Never`
+turns off.
+
 **S4, how far one cell goes: the offline half** (2026-11-11, an M1 Max
 laptop, no AWS). `BenchmarkFSMCellCeiling` in
 `internal/cluster/fsm_cell_ceiling_bench_test.go` fills the placement FSM, then
@@ -1762,8 +1797,8 @@ What it says:
 The live half, still to run: the same reserves on three server nodes of the
 EC2 harness, so a real disk and network replace the 6.5 ms model.
 
-**Cost so far:** ten clusters and two S6 instances, about 10.8 hours of
-cluster time in all, about $6.70 (the m7i.4xlarge S3 runs are about two
+**Cost so far:** eleven clusters and two S6 instances, about 12 hours of
+cluster time in all, about $7.40 (the m7i.4xlarge S3 runs are about two
 thirds of it). S4's offline half cost nothing.
 
 ## 19. Tests, drills and benchmarks
