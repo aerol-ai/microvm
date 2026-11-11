@@ -160,6 +160,8 @@ jobs:
               - 'cmd/aerolvm/k8s*.go'
               - 'cmd/aerolvm-supervisor/**'
               - 'internal/supervisor/**'
+              - 'pkg/caddy/cert_reload*.go'
+              - 'pkg/daemon/tls_cert_watch*.go'
               - '.github/workflows/test.yml'
 
   # go-tests and go-race each run as two jobs. "cluster-service" runs
@@ -823,11 +825,26 @@ jobs:
             echo "::error::mode=cluster rendered; only single mode exists"
             exit 1
           fi
+          edge="--set edge.enabled=true --set edge.domain=aerolvm.test --set edge.certManager.issuerRef.name=ci"
+          helm lint charts/aerolvm $edge
+          helm template t charts/aerolvm $edge | grep -q 'kind: Certificate'
+          if helm template t charts/aerolvm --set edge.enabled=true --set edge.domain=aerolvm.test >/dev/null 2>&1; then
+            echo "::error::the edge rendered with no certificate source"
+            exit 1
+          fi
 
       - name: Install single mode on kind
         run: make k8s-dev
 
       - name: Smoke test
+        run: scripts/k8s-smoke.sh
+
+      # The same install with the edge (C25): Caddy, cert-manager, HTTPS
+      # sandbox links and a certificate renewal.
+      - name: Install with the edge on kind
+        run: AEROL_K8S_EDGE=1 make k8s-dev
+
+      - name: Smoke test with the edge
         run: scripts/k8s-smoke.sh
 
       - name: Worker logs

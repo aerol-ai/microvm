@@ -21,6 +21,10 @@ app.kubernetes.io/component: worker
 {{- printf "%s/%s:%s" .root.Values.image.registry .name $tag -}}
 {{- end -}}
 
+{{- define "aerolvm.edgeTLSSecret" -}}
+{{- .Values.edge.existingTLSSecret | default (printf "%s-edge-tls" (include "aerolvm.name" .)) -}}
+{{- end -}}
+
 {{- define "aerolvm.tokenSecret" -}}
 {{- .Values.apiToken.existingSecret | default (printf "%s-api-token" (include "aerolvm.name" .)) -}}
 {{- end -}}

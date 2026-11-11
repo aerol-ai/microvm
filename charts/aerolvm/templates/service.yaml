@@ -12,3 +12,20 @@ spec:
     - name: api
       port: {{ .Values.service.port }}
       targetPort: api
+{{- if .Values.edge.enabled }}
+---
+# The edge: point <domain> and *.<domain> here.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "aerolvm.name" . }}-edge
+  labels:
+    {{- include "aerolvm.labels" . | nindent 4 }}
+spec:
+  type: {{ .Values.edge.service.type }}
+  selector:
+    {{- include "aerolvm.selector" . | nindent 4 }}
+  ports:
+    - { name: https, port: 443, targetPort: https }
+    - { name: http, port: 80, targetPort: http }
+{{- end }}

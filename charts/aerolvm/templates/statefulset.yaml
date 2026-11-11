@@ -33,6 +33,15 @@ spec:
       # No Kubernetes API rights (plan §8.7, wall 4).
       automountServiceAccountToken: false
       enableServiceLinks: false
+      {{- if .Values.edge.enabled }}
+      # The edge container is not root, and Kubernetes gives a non-root
+      # container no ambient capabilities, so ports 80 and 443 are opened
+      # to every user in the pod's network instead (a namespaced sysctl
+      # Kubernetes counts as safe).
+      securityContext:
+        sysctls:
+          - { name: net.ipv4.ip_unprivileged_port_start, value: "0" }
+      {{- end }}
       terminationGracePeriodSeconds: 30
       {{- with .Values.worker.nodeSelector }}
       nodeSelector:
@@ -73,7 +82,7 @@ spec:
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           securityContext:
             privileged: true
-          command: ["/bin/sh", "-c"]
+          command: ["/bin/bash", "-c"]
           args:
             - |
               set -eu
@@ -93,6 +102,17 @@ spec:
               mv -f /opt/aerolvm/toolbox/.toolboxd.new /opt/aerolvm/toolbox/toolboxd
               mkdir -p /var/lib/sandboxd/mounts /run/sandboxd
               chmod 0700 /var/lib/sandboxd/mounts /run/sandboxd
+              {{- if .Values.edge.enabled }}
+              # Caddy's admin API first, as systemd orders the two on a VM:
+              # sandboxd sets caddy-l4 up on :443 when it starts, and after a
+              # failure tries again only on the first TCP exposure, so an
+              # install that exposes only HTTP ports would never serve :443
+              # (finding F15).
+              for _ in $(seq 1 60); do
+                (exec 3<>/dev/tcp/127.0.0.1/2019) 2>/dev/null && break
+                sleep 1
+              done
+              {{- end }}
               exec sandboxd
           env:
             - name: SB_PAT_TOKEN
@@ -110,7 +130,6 @@ spec:
             - { name: SB_TOOLBOX_BINARY_PATH, value: /opt/aerolvm/toolbox/toolboxd }
             - { name: SB_TOOLBOX_MOUNT_PATH, value: /usr/local/bin/toolboxd }
             - { name: SB_TOOLBOX_PORT, value: "2280" }
-            - { name: SB_ENABLE_CADDY, value: "false" }
             - { name: SB_ENABLE_NETWORK_RULES, value: "true" }
             - { name: SB_MOUNTS_ROOT, value: /var/lib/sandboxd/mounts }
             - { name: SB_MOUNTS_CRED_DIR, value: /run/sandboxd }
@@ -127,6 +146,24 @@ spec:
             - { name: SB_EGRESS_GATEWAY_USER, value: "65532" }
             {{- with .Values.worker.defaultRuntime }}
             - { name: SB_CONTAINER_RUNTIME, value: {{ . | quote }} }
+            {{- end }}
+            {{- if .Values.edge.enabled }}
+            # A domain install's settings (scripts/install.sh), with the
+            # certificate from a file Caddy loads and sandboxd watches (C25).
+            - { name: SB_ENABLE_CADDY, value: "true" }
+            - { name: SB_DOMAIN, value: {{ .Values.edge.domain | quote }} }
+            - { name: SB_PUBLIC_HOST, value: {{ .Values.edge.domain | quote }} }
+            - { name: SB_CADDY_ADMIN_URL, value: "http://127.0.0.1:2019" }
+            - { name: SB_CADDY_SERVER_ID, value: srv0 }
+            - { name: SB_L4_TLS_LISTEN, value: ":443" }
+            - { name: SB_L4_TLS_FALLBACK, value: "127.0.0.1:8443" }
+            - { name: SB_TLS_CERT_WATCH_FILE, value: /etc/aerolvm/tls/tls.crt }
+            # The internet reaches 80 and 443 through the edge Service, and
+            # so does a sandbox's traffic to the public name; the pod's own
+            # ports stay closed to sandboxes (C24).
+            - { name: SB_SANDBOX_NODE_INGRESS, value: "false" }
+            {{- else }}
+            - { name: SB_ENABLE_CADDY, value: "false" }
             {{- end }}
             {{- range $k, $v := .Values.worker.extraEnv }}
             - { name: {{ $k }}, value: {{ $v | quote }} }
@@ -156,6 +193,38 @@ spec:
             - { name: cni-state, mountPath: /var/lib/cni }
             # Kubernetes allows Bidirectional only in privileged containers.
             - { name: netns, mountPath: /run/netns, mountPropagation: Bidirectional }
+            {{- if .Values.edge.enabled }}
+            # The certificate alone, to see it change: sandboxd never
+            # needs the key.
+            - { name: edge-cert, mountPath: /etc/aerolvm/tls, readOnly: true }
+            {{- end }}
+        {{- if .Values.edge.enabled }}
+        - name: edge
+          image: {{ include "aerolvm.image" (dict "root" . "name" "aerolvm-edge") }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          # AerolVM's Caddy for sandbox links and the API over HTTPS. Its
+          # own container, so a sandboxd restart never cuts an open
+          # connection. Non-root, no rights, read-only root disk.
+          args: ["run", "--config", "/etc/caddy/Caddyfile", "--adapter", "caddyfile"]
+          securityContext:
+            runAsUser: 65532
+            runAsGroup: 65532
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          ports:
+            - { name: https, containerPort: 443 }
+            - { name: http, containerPort: 80 }
+          resources:
+            {{- toYaml .Values.edge.resources | nindent 12 }}
+          volumeMounts:
+            - { name: edge-config, mountPath: /etc/caddy, readOnly: true }
+            - { name: edge-tls, mountPath: /etc/aerolvm/tls, readOnly: true }
+            - { name: edge-data, mountPath: /data }
+            - { name: edge-state, mountPath: /config }
+        {{- end }}
         - name: egress
           image: {{ include "aerolvm.image" (dict "root" . "name" "aerolvm") }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
@@ -203,3 +272,23 @@ spec:
         - { name: cni-state, emptyDir: {} }
         - { name: netns, emptyDir: {} }
         - { name: egress-state, emptyDir: {} }
+        {{- if .Values.edge.enabled }}
+        - name: edge-config
+          configMap:
+            name: {{ include "aerolvm.name" . }}-edge
+        # Mounted by key, so a Secret that gains other keys (a DNS token)
+        # never reaches a pod; aerolvm k8s verify checks this (C25).
+        - name: edge-tls
+          secret:
+            secretName: {{ include "aerolvm.edgeTLSSecret" . }}
+            items:
+              - { key: tls.crt, path: tls.crt }
+              - { key: tls.key, path: tls.key }
+        - name: edge-cert
+          secret:
+            secretName: {{ include "aerolvm.edgeTLSSecret" . }}
+            items:
+              - { key: tls.crt, path: tls.crt }
+        - { name: edge-data, emptyDir: {} }
+        - { name: edge-state, emptyDir: {} }
+        {{- end }}

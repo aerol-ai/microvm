@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/netip"
 	"os/exec"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -19,8 +20,9 @@ import (
 // evidence pack (P7) states, and exits 1 on any miss, so a bank can run it
 // instead of reading YAML. Phase 1 covers single mode: the images are
 // signed, the worker pod mounts nothing from the machine and holds no
-// Kubernetes API credential, and a probe sandbox cannot reach the worker's
-// own ports or the Kubernetes API (C24). Phase 2 adds the full layout.
+// Kubernetes API credential or DNS provider token (C25), and a probe
+// sandbox cannot reach the worker's own ports or the Kubernetes API (C24).
+// Phase 2 adds the full layout.
 //
 // It reads the cluster with the kubectl and cosign already on this machine
 // (so the CLI carries no Kubernetes client), and probes through the AerolVM
@@ -40,6 +42,15 @@ const (
 	// The containerd sandbox range when SB_CONTAINERD_BRIDGE_SUBNET is unset.
 	k8sDefaultBridge = "10.88.0.0/16"
 )
+
+// k8sTLSKeys are the only Secret keys a worker pod may mount (C25): the
+// edge certificate and key cert-manager writes, and its CA.
+var k8sTLSKeys = map[string]bool{"tls.crt": true, "tls.key": true, "ca.crt": true}
+
+// k8sDNSTokenEnv matches the environment names DNS provider credentials go
+// by: Caddy's DNS token on a VM install (SB_DNS_API_TOKEN) and the
+// providers' own (Cloudflare, Route 53, DigitalOcean).
+var k8sDNSTokenEnv = regexp.MustCompile(`(?i)(^|_)DNS_.*(TOKEN|KEY|SECRET|PASSWORD|CREDENTIAL)|^(CLOUDFLARE|CF_API|CF_DNS|CF_ZONE|ROUTE53|DIGITALOCEAN)|^DO_AUTH_TOKEN$`)
 
 type k8sCheck struct {
 	Name   string `json:"name"`
@@ -81,27 +92,53 @@ type k8sPod struct {
 			HostPath *struct {
 				Path string `json:"path"`
 			} `json:"hostPath"`
+			Secret    *k8sSecretSource `json:"secret"`
 			Projected *struct {
 				Sources []struct {
 					ServiceAccountToken *json.RawMessage `json:"serviceAccountToken"`
+					Secret              *k8sSecretSource `json:"secret"`
 				} `json:"sources"`
 			} `json:"projected"`
 		} `json:"volumes"`
-		Containers []struct {
-			Name  string `json:"name"`
-			Image string `json:"image"`
-			Ports []struct {
-				ContainerPort int `json:"containerPort"`
-			} `json:"ports"`
-			Env []struct {
-				Name  string `json:"name"`
-				Value string `json:"value"`
-			} `json:"env"`
-		} `json:"containers"`
+		InitContainers []k8sContainer `json:"initContainers"`
+		Containers     []k8sContainer `json:"containers"`
 	} `json:"spec"`
 	Status struct {
 		PodIP string `json:"podIP"`
 	} `json:"status"`
+}
+
+type k8sContainer struct {
+	Name  string `json:"name"`
+	Image string `json:"image"`
+	Ports []struct {
+		ContainerPort int `json:"containerPort"`
+	} `json:"ports"`
+	Env []struct {
+		Name  string `json:"name"`
+		Value string `json:"value"`
+	} `json:"env"`
+	EnvFrom []struct {
+		SecretRef *struct {
+			Name string `json:"name"`
+		} `json:"secretRef"`
+	} `json:"envFrom"`
+}
+
+// k8sSecretSource is a Secret volume, or a Secret in a projected volume:
+// SecretName is set on the first, Name on the second.
+type k8sSecretSource struct {
+	SecretName string `json:"secretName"`
+	Name       string `json:"name"`
+	Items      []struct {
+		Key string `json:"key"`
+	} `json:"items"`
+}
+
+// all is every container in the pod, init containers first: an image or a
+// token in an init container is in the pod as much as one in the others.
+func (p k8sPod) all() []k8sContainer {
+	return append(append([]k8sContainer(nil), p.Spec.InitContainers...), p.Spec.Containers...)
 }
 
 // k8sVerify runs every check and returns them in order.
@@ -121,7 +158,7 @@ func k8sVerify(ctx context.Context, env k8sEnv, o k8sVerifyOptions) []k8sCheck {
 	}
 	checks := []k8sCheck{{Name: "AerolVM pods found", Result: k8sPass, Detail: strconv.Itoa(len(pods.Items)) + " pod(s)"}}
 	checks = append(checks, k8sImagesSigned(ctx, env, pods.Items, o.skipSignatures))
-	checks = append(checks, k8sNoHostMounts(pods.Items), k8sNoAPIRights(pods.Items))
+	checks = append(checks, k8sNoHostMounts(pods.Items), k8sNoAPIRights(pods.Items), k8sNoDNSToken(pods.Items))
 	checks = append(checks, k8sProbe(ctx, env, pods.Items, o)...)
 	return checks
 }
@@ -130,7 +167,7 @@ func k8sImagesSigned(ctx context.Context, env k8sEnv, pods []k8sPod, skip bool) 
 	const name = "images signed by the AerolVM release workflow"
 	images := map[string]bool{}
 	for _, p := range pods {
-		for _, c := range p.Spec.Containers {
+		for _, c := range p.all() {
 			images[c.Image] = true
 		}
 	}
@@ -184,6 +221,61 @@ func k8sNoAPIRights(pods []k8sPod) k8sCheck {
 			for _, s := range v.Projected.Sources {
 				if s.ServiceAccountToken != nil {
 					found = append(found, fmt.Sprintf("%s: volume %s holds a service account token", p.Metadata.Name, v.Name))
+				}
+			}
+		}
+	}
+	if len(found) > 0 {
+		return k8sCheck{Name: name, Result: k8sFail, Detail: strings.Join(found, "; ")}
+	}
+	return k8sCheck{Name: name, Result: k8sPass}
+}
+
+// k8sNoDNSToken checks no worker pod holds a DNS provider token (C25):
+// cert-manager keeps it in its own namespace and hands the pods only the
+// certificate. It reads the pod spec alone, so it needs no right to read
+// Secrets: a token can reach a pod as an environment variable, as a whole
+// Secret loaded into the environment, or as a Secret volume, so it fails
+// on a credential-named variable, on any Secret loaded whole (its names
+// cannot be seen), and on a Secret volume that mounts any key but a TLS
+// certificate's or does not name its keys.
+func k8sNoDNSToken(pods []k8sPod) k8sCheck {
+	const name = "no DNS provider token in the pods"
+	var found []string
+	secret := func(pod, volume string, s *k8sSecretSource) {
+		ref := s.SecretName + s.Name
+		if len(s.Items) == 0 {
+			found = append(found, fmt.Sprintf("%s: volume %s mounts every key of Secret %s (name its keys: tls.crt, tls.key)", pod, volume, ref))
+			return
+		}
+		for _, it := range s.Items {
+			if !k8sTLSKeys[it.Key] {
+				found = append(found, fmt.Sprintf("%s: volume %s mounts key %s of Secret %s", pod, volume, it.Key, ref))
+			}
+		}
+	}
+	for _, p := range pods {
+		for _, v := range p.Spec.Volumes {
+			if v.Secret != nil {
+				secret(p.Metadata.Name, v.Name, v.Secret)
+			}
+			if v.Projected != nil {
+				for _, src := range v.Projected.Sources {
+					if src.Secret != nil {
+						secret(p.Metadata.Name, v.Name, src.Secret)
+					}
+				}
+			}
+		}
+		for _, c := range p.all() {
+			for _, e := range c.Env {
+				if k8sDNSTokenEnv.MatchString(e.Name) {
+					found = append(found, fmt.Sprintf("%s/%s: environment variable %s", p.Metadata.Name, c.Name, e.Name))
+				}
+			}
+			for _, ef := range c.EnvFrom {
+				if ef.SecretRef != nil {
+					found = append(found, fmt.Sprintf("%s/%s: Secret %s loaded whole into the environment", p.Metadata.Name, c.Name, ef.SecretRef.Name))
 				}
 			}
 		}
@@ -353,6 +445,8 @@ Checks, and exits 1 if any fails:
   - every image is signed by the AerolVM release workflow (needs cosign);
   - no pod mounts a folder from the machine;
   - no pod holds a Kubernetes API credential;
+  - no pod holds a DNS provider token (Secret volumes may mount only
+    tls.crt, tls.key and ca.crt, by name);
   - a sandbox of each probe runtime cannot reach the worker pod's own ports
     or the Kubernetes API.
 
