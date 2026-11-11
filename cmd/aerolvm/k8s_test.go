@@ -277,3 +277,16 @@ func TestK8sProbeEdges(t *testing.T) {
 		t.Fatal("a probe ran without an AerolVM login")
 	}
 }
+
+// An older cosign finds no signature on a signed release image: the failure
+// says which cosign to use.
+func TestCosignFailure(t *testing.T) {
+	err := cosignFailure(errors.New("exit status 1"), []byte("Error: no signatures found\nmain.go:69: error during command execution: no signatures found\n"))
+	if !strings.Contains(err.Error(), "cosign v3 or later") {
+		t.Fatalf("err = %v, want the cosign v3 hint", err)
+	}
+	err = cosignFailure(errors.New("exit status 1"), []byte("Error: none of the expected identities matched\n"))
+	if strings.Contains(err.Error(), "cosign v3") || !strings.Contains(err.Error(), "none of the expected identities matched") {
+		t.Fatalf("err = %v, want the last line only", err)
+	}
+}

@@ -194,7 +194,7 @@ Good to know about the edge:
 
 `aerolvm k8s verify` checks a live install against the rules a security team asks about, and exits with 1 if any fails:
 
-- every image is signed by the AerolVM release workflow (it needs `cosign`);
+- every image is signed by the AerolVM release workflow (it needs `cosign` v3 or later);
 - no pod mounts a folder from the node;
 - no pod holds a Kubernetes API credential;
 - no pod holds a DNS provider token: a pod may mount only a certificate, its key and its authority from a Secret, each named;
