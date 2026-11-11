@@ -16,12 +16,16 @@ var (
 	hostPressureLiveMemoryFree = expvar.NewInt("aerolvm_host_pressure_live_memory_free_mb")
 	hostPressureReservedDisk   = expvar.NewInt("aerolvm_host_pressure_reserved_disk_gb")
 	hostPressureDiskBudget     = expvar.NewInt("aerolvm_host_pressure_disk_budget_gb")
-	hostPressureReservedGPUs   = expvar.NewInt("aerolvm_host_pressure_reserved_gpus")
-	hostPressureGPUCount       = expvar.NewInt("aerolvm_host_pressure_gpu_count")
-	hostPressureCanAdmit       = expvar.NewInt("aerolvm_host_pressure_can_admit")
-	hostPressureRejectReasons  = expvar.NewMap("aerolvm_host_pressure_reject_reasons")
-	hostPressureReasonKeysMu   sync.Mutex
-	hostPressureReasonKeys     = make(map[string]struct{})
+	// The sandbox volume's live size and free space (C27), for the 80%-used
+	// alert. Both 0 on a host without a disk probe, which the alert skips.
+	hostPressureSandboxDiskTotal = expvar.NewInt("aerolvm_host_pressure_sandbox_disk_total_mb")
+	hostPressureSandboxDiskFree  = expvar.NewInt("aerolvm_host_pressure_sandbox_disk_free_mb")
+	hostPressureReservedGPUs     = expvar.NewInt("aerolvm_host_pressure_reserved_gpus")
+	hostPressureGPUCount         = expvar.NewInt("aerolvm_host_pressure_gpu_count")
+	hostPressureCanAdmit         = expvar.NewInt("aerolvm_host_pressure_can_admit")
+	hostPressureRejectReasons    = expvar.NewMap("aerolvm_host_pressure_reject_reasons")
+	hostPressureReasonKeysMu     sync.Mutex
+	hostPressureReasonKeys       = make(map[string]struct{})
 	// aerolvm_sandboxes_by_runtime{key="docker|gvisor|wasm|isolate|firecracker"}
 	// — live sandbox count per isolation type (the bare host_pressure_sandboxes
 	// gauge has no runtime label). Stale runtimes are deleted so a runtime that
@@ -48,6 +52,8 @@ func recordHostPressure(s Snapshot) {
 	hostPressureLiveMemoryFree.Set(int64(s.LiveMemoryFreeMB))
 	hostPressureReservedDisk.Set(int64(s.ReservedDiskGB))
 	hostPressureDiskBudget.Set(int64(s.DiskBudgetGB))
+	hostPressureSandboxDiskTotal.Set(int64(s.SandboxDiskTotalMB))
+	hostPressureSandboxDiskFree.Set(int64(s.SandboxDiskFreeMB))
 	hostPressureReservedGPUs.Set(int64(s.ReservedGPUs))
 	hostPressureGPUCount.Set(int64(s.GPUCount))
 	hostPressureActualRSS.Set(int64(s.ActualRSSMB))

@@ -136,6 +136,22 @@ groups:
           description: "Cluster-wide reserved disk is above 90% of the configured admission budget."
           runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/slo-breach.md"
 
+      # One node's sandbox volume (SB_DISK_FLOOR_PATH, or the container
+      # engine's data folder) is filling. Reserved disk above is a promise;
+      # this is the space actually written, which on containerd and gVisor
+      # one sandbox can take past its diskGB. At SB_DISK_FLOOR_RATIO free the
+      # node refuses new creates; this fires well before that.
+      - alert: SandboxdSandboxDiskHigh
+        expr: (1 - aerolvm_host_pressure_sandbox_disk_free_mb / aerolvm_host_pressure_sandbox_disk_total_mb) > 0.8 and aerolvm_host_pressure_sandbox_disk_total_mb > 0
+        for: 10m
+        labels:
+          severity: warning
+          component: capacity
+        annotations:
+          summary: "sandboxd sandbox volume is over 80% used"
+          description: "{{ $labels.instance }}'s sandbox volume is over 80% used. Below SB_DISK_FLOOR_RATIO free it refuses new sandboxes with 503."
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/slo-breach.md#sandbox-disk"
+
   - name: sandboxd.ingress-and-data-plane
     interval: 30s
     rules:

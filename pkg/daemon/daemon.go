@@ -304,6 +304,7 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 		CPUReservationRatio:       cfg.CPUReservationRatio,
 		MemoryReservationRatio:    cfg.MemoryReservationRatio,
 		DiskReservationRatio:      cfg.DiskReservationRatio,
+		DiskFloorRatio:            cfg.DiskFloorRatio,
 		MemoryFloorRatio:          cfg.MemoryFloorRatio,
 		CPUOverProvisionFactor:    cfg.CPUOverProvisionFactor,
 		MemoryOverProvisionFactor: cfg.MemoryOverProvisionFactor,
@@ -327,6 +328,9 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 		"memory_overprovision_factor", cfg.MemoryOverProvisionFactor,
 		"rss_watermark_ratio", cfg.FirecrackerRSSWatermarkRatio,
 	)
+	if err := wireDiskFloor(logger, cfg, admitter, capacity.NewStatfsDiskProbe); err != nil {
+		return err
+	}
 	// The docker engine's sandbox bridge holds 1,023 ports; count them as a
 	// slot pool before any create or reservation replay can fill it.
 	wireDockerBridgeSlots(ctx, cfg, logger, dockerClient, admitter)
