@@ -159,6 +159,21 @@ Then create a sandbox. This one uses gVisor, which adds a second kernel between 
   </TabItem>
 </Tabs>
 
+## Check the install
+
+`aerolvm k8s verify` checks a live install against the rules a security team asks about, and exits with 1 if any fails:
+
+- every image is signed by the AerolVM release workflow (it needs `cosign`);
+- no pod mounts a folder from the node;
+- no pod holds a Kubernetes API credential;
+- a runc and a gVisor sandbox cannot reach the worker pod's own ports or the Kubernetes API.
+
+It reads the cluster with your `kubectl`, and makes its two test sandboxes through the API you set up above. It deletes them when it is done.
+
+```bash
+aerolvm k8s verify --namespace aerolvm
+```
+
 ## Upgrade
 
 A chart upgrade never restarts the worker pod, because that would end every sandbox. To move the server to a new version, change the agent container's image in place. Only that container restarts, and the sandboxes keep running:

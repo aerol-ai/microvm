@@ -3,7 +3,9 @@
 # client does (plans/kubernetes-v2-architecture.md, Phase 1 exit): create a
 # runc and a gVisor sandbox through the API and run a command in each; check
 # neither can reach the worker pod's own ports or the Kubernetes API (C24);
-# then delete the worker pod with both running and check it goes away
+# run `aerolvm k8s verify` (P8), which must pass here and fail once a pod
+# with the install's labels mounts a host folder; then delete the worker pod
+# with both sandboxes running and check it goes away
 # (finding F8: leftover namespace mounts kept it in Terminating). CI runs it
 # on kind.
 set -euo pipefail
@@ -46,6 +48,21 @@ for runtime in docker gvisor; do
   fi
   echo "k8s-smoke: $runtime sandbox cannot reach the worker's ports or the Kubernetes API"
 done
+
+# P8: the install passes; a seeded violation fails. Locally built images
+# carry no release signature, so that check is skipped here.
+"$tmp/aerolvm" k8s verify --kube-context "kind-$cluster" --namespace "$namespace" --skip-signatures
+k run aerolvm-violation --image=registry.k8s.io/pause:3.10 --restart=Never \
+  --labels=app.kubernetes.io/name=aerolvm,app.kubernetes.io/instance=aerolvm \
+  --overrides='{"spec":{"volumes":[{"name":"host","hostPath":{"path":"/tmp"}}],"containers":[{"name":"violation","image":"registry.k8s.io/pause:3.10","volumeMounts":[{"name":"host","mountPath":"/host"}]}]}}' >/dev/null
+if "$tmp/aerolvm" k8s verify --kube-context "kind-$cluster" --namespace "$namespace" --skip-signatures --probe-runtimes docker >"$tmp/violation.txt" 2>&1; then
+  cat "$tmp/violation.txt" >&2
+  echo "k8s-smoke: aerolvm k8s verify passed with a host folder mounted" >&2
+  exit 1
+fi
+grep -q "FAIL.*no folders mounted from the machine" "$tmp/violation.txt" || { cat "$tmp/violation.txt" >&2; exit 1; }
+echo "k8s-smoke: aerolvm k8s verify fails on the seeded host folder"
+k delete pod aerolvm-violation --wait=false >/dev/null
 
 kill "$pf"; pf=""
 start=$(date +%s)

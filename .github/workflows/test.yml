@@ -157,6 +157,7 @@ jobs:
               - 'scripts/build-images.sh'
               - 'scripts/k8s-dev.sh'
               - 'scripts/k8s-smoke.sh'
+              - 'cmd/aerolvm/k8s*.go'
               - 'cmd/aerolvm-supervisor/**'
               - 'internal/supervisor/**'
               - '.github/workflows/test.yml'
