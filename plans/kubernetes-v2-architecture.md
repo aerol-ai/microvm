@@ -1606,6 +1606,45 @@ has memory to answer with. `sandboxd` sets each sandbox's score and group
 right after it starts; the spike's loop is only a stand-in. Admission sized
 from the pod (F3) keeps normal use away from the cap. Not yet proven live.
 
+**S4, how far one cell goes: the offline half** (2026-11-11, an M1 Max
+laptop, no AWS). `BenchmarkFSMCellCeiling` in
+`internal/cluster/fsm_cell_ceiling_bench_test.go` fills the placement FSM, then
+times one more create's apply, a snapshot, its persist and a restore into a
+fresh FSM. Every placement also holds one TCP port, so a real cell's rows are
+lighter than these.
+
+| Placements | Apply one create | Snapshot holds up Apply | Snapshot size / persist | Restore | Heap |
+|---|---|---|---|---|---|
+| 100k | 7.8 µs | 89 ms | 19.5 MiB / 95 ms | 0.4 s | 243 MiB |
+| 250k | 8.0 µs | 242 ms | 48 MiB / 322 ms | 1.2 s | 623 MiB |
+| 1M | 8.2 µs | 1.1 s | 193 MiB / 2.4 s | 6.8 s | 2.4 GiB |
+
+The commit side comes from the existing `BenchmarkReserveCommit` (a 6.5 ms
+sync on every log write, standing in for the disk): 68 reserves a second with
+one caller, 633 with 16 and 2,252 with 64, because concurrent reserves share a
+sync (0.06 syncs per reserve at 64).
+
+What it says:
+
+- **The FSM is not the ceiling.** Apply stays near 8 µs from 100k to 1M
+  placements; one goroutine could apply about 120,000 creates a second.
+- **The commit path is**, at about 2,000 creates a second with 64 creates in
+  flight: above G3's 1,000-a-second target, on a modelled disk.
+- **At 1M placements, snapshots become a soft limit.** A snapshot holds up
+  Apply for about 1.1 s (slower on a server core than on this laptop). With
+  the snapshot cadence in `raft.go` (checked every 120 s, at 8,192 new
+  entries), creates pause for about a second every two minutes or so: a p99
+  spike, not a lower rate. Restores take 6.8 s, and each server holds about
+  2.4 GiB for the FSM alone. At G3's 100,000 live sandboxes per cell all of
+  this is small (89 ms, 0.4 s, 243 MiB).
+- **Finding F11 (Phase 3, not Phase 1):** if a cell is ever meant to hold
+  1M placements, Snapshot must stop copying every row under the lock (a
+  copy-on-write map, or snapshotting from a read view). Until then, cells
+  stay at or below 250k placements and §12's cells carry the rest.
+
+The live half, still to run: the same reserves on three server nodes of the
+EC2 harness, so a real disk and network replace the 6.5 ms model.
+
 **Cost so far:** seven clusters, about 7.6 hours of cluster time in all,
 about $4.60 (the m7i.4xlarge S3 runs are about two thirds of it).
 
