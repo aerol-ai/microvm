@@ -9,9 +9,10 @@
 # <arch>/toolboxd from the release build, and versions.env's pins arrive as
 # build args. sandboxd links glibc, so the base is a Debian with a newer one
 # than the release build machine's.
-ARG DEBIAN_IMAGE
+# The base is pinned by its multi-arch index digest right here, where
+# Scorecard and Dependabot read it (a FROM ${ARG} hides the pin from both).
 
-FROM ${DEBIAN_IMAGE} AS fetch
+FROM debian:trixie-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2 AS fetch
 ARG TARGETARCH
 ARG CNI_PLUGINS_VERSION
 ARG CNI_PLUGINS_SHA256_AMD64
@@ -31,7 +32,7 @@ RUN set -eu; \
     mkdir -p /out/cni; \
     tar -xzf cni.tgz -C /out/cni
 
-FROM ${DEBIAN_IMAGE}
+FROM debian:trixie-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2
 ARG TARGETARCH
 ARG VERSION=dev
 ARG REVISION=unknown
