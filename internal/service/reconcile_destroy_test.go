@@ -52,9 +52,15 @@ type fakeReconcileRuntime struct {
 	// missing and reinstalled it.
 	networkBlockAllInserted bool
 	networkBlockAllErr      error
+	// listErr makes ListManaged fail, the way the Docker client does on a
+	// host where dockerd is stopped or was never installed.
+	listErr error
 }
 
 func (f *fakeReconcileRuntime) ListManaged(_ context.Context) (map[string]*models.SandboxRuntimeState, error) {
+	if f.listErr != nil {
+		return nil, f.listErr
+	}
 	out := make(map[string]*models.SandboxRuntimeState, len(f.managed))
 	for k, v := range f.managed {
 		out[k] = v

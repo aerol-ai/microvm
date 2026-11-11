@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -157,7 +158,7 @@ func TestCoverage95ContainerEngineWiringBranches(t *testing.T) {
 
 func TestCoverage95MultiEventsSourceEdgeCases(t *testing.T) {
 	t.Run("empty_sources", func(t *testing.T) {
-		mux := newMultiEventsSource()
+		mux := newMultiEventsSource(testLogger())
 		ctx, cancel := context.WithCancel(context.Background())
 		errCh := make(chan error, 1)
 		go func() { errCh <- mux.StreamEvents(ctx, make(chan docker.DockerEvent)) }()
@@ -167,9 +168,9 @@ func TestCoverage95MultiEventsSourceEdgeCases(t *testing.T) {
 		}
 	})
 
-	t.Run("single_source", func(t *testing.T) {
+	t.Run("single_source_nil_logger", func(t *testing.T) {
 		src := &fakeEventsSource{prefix: "only", n: 1}
-		mux := newMultiEventsSource(src)
+		mux := newMultiEventsSource(nil, src)
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 		out := make(chan docker.DockerEvent, 1)
@@ -186,7 +187,7 @@ func TestCoverage95MultiEventsSourceEdgeCases(t *testing.T) {
 
 	t.Run("cancel_during_forward", func(t *testing.T) {
 		src := &fakeEventsSource{prefix: "slow", n: 100}
-		mux := newMultiEventsSource(src)
+		mux := newMultiEventsSource(testLogger(), src)
 		ctx, cancel := context.WithCancel(context.Background())
 		out := make(chan docker.DockerEvent)
 		go func() { _ = mux.StreamEvents(ctx, out) }()
@@ -194,22 +195,126 @@ func TestCoverage95MultiEventsSourceEdgeCases(t *testing.T) {
 		cancel()
 	})
 
-	t.Run("first_source_error_cancels_mux", func(t *testing.T) {
-		mux := newMultiEventsSource(&fakeEventsSource{prefix: "a", n: 5}, &boomEventsSource{})
+	t.Run("failing_source_does_not_stop_the_others", func(t *testing.T) {
+		oldInitial, oldMax := eventSourceRetryInitial, eventSourceRetryMax
+		eventSourceRetryInitial, eventSourceRetryMax = time.Millisecond, 4*time.Millisecond
+		t.Cleanup(func() { eventSourceRetryInitial, eventSourceRetryMax = oldInitial, oldMax })
+
+		// Docker on a host where dockerd is stopped or absent: every
+		// subscribe fails at once. containerd keeps producing.
+		boom := &boomEventsSource{}
+		healthy := &tickEventsSource{prefix: "ctd", every: time.Millisecond}
+		mux := newMultiEventsSource(testLogger(), boom, healthy)
 		ctx, cancel := context.WithCancel(context.Background())
-		defer cancel()
 		out := make(chan docker.DockerEvent, 8)
-		if err := mux.StreamEvents(ctx, out); err == nil {
-			t.Fatal("expected stream error")
+		done := make(chan error, 1)
+		go func() { done <- mux.StreamEvents(ctx, out) }()
+
+		got := 0
+		deadline := time.After(5 * time.Second)
+		for got < 50 {
+			select {
+			case ev := <-out:
+				if ev.SandboxID != "ctd" {
+					t.Fatalf("event = %+v", ev)
+				}
+				got++
+			case err := <-done:
+				t.Fatalf("StreamEvents returned %v after %d events: one failing source ended the others (finding F12)", err, got)
+			case <-deadline:
+				t.Fatalf("only %d of 50 events from the healthy source", got)
+			}
+		}
+		if calls := boom.calls.Load(); calls < 2 {
+			t.Fatalf("the failing source was subscribed %d times; it must be retried on its own", calls)
+		}
+		cancel()
+		if err := <-done; !errors.Is(err, context.Canceled) {
+			t.Fatalf("StreamEvents = %v after cancel, want context.Canceled", err)
 		}
 	})
 }
 
-type boomEventsSource struct{}
+func TestMultiEventsSourceRetriesAStreamThatDropsLater(t *testing.T) {
+	oldInitial, oldMax := eventSourceRetryInitial, eventSourceRetryMax
+	eventSourceRetryInitial, eventSourceRetryMax = time.Millisecond, 4*time.Millisecond
+	t.Cleanup(func() { eventSourceRetryInitial, eventSourceRetryMax = oldInitial, oldMax })
+
+	// dockerd restarting on a VM: the stream stays up longer than the
+	// longest wait, then drops. Each drop is followed by a new subscribe.
+	flaky := &dropAfterEventsSource{after: 10 * time.Millisecond}
+	mux := newMultiEventsSource(testLogger(), flaky, &tickEventsSource{prefix: "ctd", every: time.Millisecond})
+	ctx, cancel := context.WithCancel(context.Background())
+	out := make(chan docker.DockerEvent, 64)
+	done := make(chan error, 1)
+	go func() { done <- mux.StreamEvents(ctx, out) }()
+	go func() {
+		for range out {
+		}
+	}()
+	deadline := time.Now().Add(5 * time.Second)
+	for flaky.calls.Load() < 3 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	cancel()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("StreamEvents = %v, want context.Canceled", err)
+	}
+	if calls := flaky.calls.Load(); calls < 3 {
+		t.Fatalf("a stream that dropped was subscribed %d times, want it retried after each drop", calls)
+	}
+}
+
+// dropAfterEventsSource stays subscribed for `after`, then fails.
+type dropAfterEventsSource struct {
+	after time.Duration
+	calls atomic.Int32
+}
+
+func (s *dropAfterEventsSource) StreamEvents(ctx context.Context, _ chan<- docker.DockerEvent) error {
+	s.calls.Add(1)
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(s.after):
+		return errors.New("dockerd went away")
+	}
+}
+
+func (s *dropAfterEventsSource) ContainerPID(context.Context, string) (int, error) { return 0, nil }
+
+type boomEventsSource struct{ calls atomic.Int32 }
 
 func (b *boomEventsSource) StreamEvents(context.Context, chan<- docker.DockerEvent) error {
+	b.calls.Add(1)
 	return errors.New("stream boom")
 }
+
+// tickEventsSource sends one event every `every` until ctx ends: a stream
+// that stays up.
+type tickEventsSource struct {
+	prefix string
+	every  time.Duration
+}
+
+func (s *tickEventsSource) StreamEvents(ctx context.Context, out chan<- docker.DockerEvent) error {
+	t := time.NewTicker(s.every)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-t.C:
+			select {
+			case out <- docker.DockerEvent{SandboxID: s.prefix, Action: "die"}:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+	}
+}
+
+func (s *tickEventsSource) ContainerPID(context.Context, string) (int, error) { return 0, nil }
 
 func (b *boomEventsSource) ContainerPID(context.Context, string) (int, error) {
 	return 0, nil

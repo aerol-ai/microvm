@@ -5441,11 +5441,14 @@ func TestReconcileListManagedErrorsWave7(t *testing.T) {
 	ctx := context.Background()
 
 	t.Run("docker_list", func(t *testing.T) {
+		// A failed Docker listing no longer stops the pass: the rows it
+		// would have matched are left for the next one, everything else is
+		// reconciled (TestReconcileWithoutDockerStillReconcilesContainerd).
 		rt := &listErrRuntime{recordingRuntime: &recordingRuntime{}, listErr: errors.New("docker list boom")}
 		svc, _, _ := newServiceRuntimeHarness(t, rt.recordingRuntime)
 		svc.docker = rt
-		if err := svc.Reconcile(ctx); err == nil || !strings.Contains(err.Error(), "docker list boom") {
-			t.Fatalf("err = %v", err)
+		if err := svc.Reconcile(ctx); err != nil {
+			t.Fatalf("err = %v, want nil", err)
 		}
 	})
 

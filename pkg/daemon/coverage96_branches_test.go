@@ -106,7 +106,9 @@ func TestCov96RunDockerUnreachableIsNonFatal(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	for _, want := range []string{"ready socket sweep failed", "initial reconcile failed"} {
+	// Reconcile itself no longer fails without Docker; it says it left the
+	// Docker-owned sandboxes for the next pass.
+	for _, want := range []string{"ready socket sweep failed", "docker listing failed"} {
 		if !strings.Contains(logs, want) {
 			t.Errorf("log lacks %q", want)
 		}
