@@ -64,7 +64,8 @@ anything else, as the plan's Phase 0 exit gate says.
 | S7 | **Done for the one-container worker on AL2023, 2026-11-10. Pass** with 14 named rights, seccomp and AppArmor unconfined, and two stand-ins (cgroup and `/proc/sys` remounted read-write). The split pod needs F8's fix first (Bidirectional propagation needs privileged). Bottlerocket not run | v2 plan §18, "Phase 0 results" |
 | S3 | **Done, 2026-11-11.** 1,000 gVisor sandboxes in one pod; findings F9 (57 cAdvisor series per sandbox) and F10 (one pod-level OOM kills the whole worker, machinery included). No eviction: the pod's own limit is the danger. **F10 fixed in the seventh run:** a cap on `sandboxes/`, containerd and its shims inside it, `memory.min` on `sandboxd`'s group; the pod's limit was never hit, only whole sandboxes died, `sandboxd` answered and created. New finding F12: `sandboxd` did not notice the killed sandboxes | v2 plan §18, "Phase 0 results" |
 | S4 | **Offline half done, 2026-11-11.** FSM apply about 8 µs at 100k to 1M placements; commits about 2,000 a second with 64 in flight (6.5 ms modelled sync); at 1M a snapshot holds up Apply for 1.1 s and the FSM needs 2.4 GiB (finding F11, for Phase 3). Live half (three EC2 server nodes) still to run | v2 plan §18, "Phase 0 results" |
-| S5, S6, S8, N1 | Not started; S6, S8 and N1 harnesses written | — |
+| S8 | **Done, 2026-11-11. Pass** on AL2023 (m6id.xlarge NVMe as XFS with project quotas): a gVisor sandbox with a 100 MB quota stopped at 99.0 MB, the other wrote 300 MB; gVisor keeps its root overlay in a disk file in the writable layer. Bottlerocket not run | v2 plan §18, "Phase 0 results" |
+| S5, S6, N1 | Not started; S6 and N1 harnesses written | — |
 
 ## Cost, before it is spent
 

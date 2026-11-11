@@ -1629,6 +1629,39 @@ read).
 - F12 (below) is what run 7 found next: `sandboxd` did not notice the
   sandboxes the kernel killed.
 
+**S8, a disk limit per sandbox: pass** (run `p0-s8`, EKS 1.36, AL2023, an
+m6id.xlarge with a 220 GB NVMe instance store, 2026-11-11). The worker
+formatted the NVMe as XFS with project quotas and mounted it as containerd's
+root (`prepare_nvme`). Two gVisor sandboxes; one got a 100 MB project quota
+on its writable layer (containerd's snapshot directory for it), then each
+wrote 300 MB into its root filesystem:
+
+| Sandbox | Written | On disk in its writable layer | Quota report |
+|---|---|---|---|
+| Limited (100 MB) | 99.0 MB (103,809,024 bytes), then "no space" | 100 MB | 99.0M of 100M |
+| Unlimited | 300 MB | 301 MB | — |
+
+What it shows:
+
+- gVisor keeps a sandbox's root overlay on disk, in one file in the writable
+  layer (`.gvisor.filestore.<id>`, sparse), not in memory. So a project
+  quota on that directory caps what the sandbox can write, and the sandbox
+  sees an ordinary "disk full".
+- Inside the sandbox, `df /` still shows an 8 PiB root: a program cannot see
+  its limit coming, only hit it.
+- In the spike the quota was set after the sandbox started; `xfs_quota
+  project -s` tagged the files already there, including the file store. C27
+  sets it in `sandboxd` before the task starts.
+- The first run failed with "cannot set limits: Function not implemented":
+  the pod's emptyDir (the root disk, mounted `noquota`) sits under the NVMe
+  at the same path, and given the path, `xfs_quota` acts on the first entry
+  in `/proc/mounts`. Name the device. Phase 1's worker mounts the NVMe on a
+  path of its own, not over a volume.
+
+So C27 can give each sandbox its own disk limit on local NVMe (AL2023;
+Bottlerocket not run). The 10%-free create refusal and the alert stay as
+designed, for the image store and the database.
+
 **S4, how far one cell goes: the offline half** (2026-11-11, an M1 Max
 laptop, no AWS). `BenchmarkFSMCellCeiling` in
 `internal/cluster/fsm_cell_ceiling_bench_test.go` fills the placement FSM, then
@@ -1668,8 +1701,8 @@ What it says:
 The live half, still to run: the same reserves on three server nodes of the
 EC2 harness, so a real disk and network replace the 6.5 ms model.
 
-**Cost so far:** eight clusters, about 9 hours of cluster time in all,
-about $5.70 (the m7i.4xlarge S3 runs are about three quarters of it). S4's
+**Cost so far:** nine clusters, about 9.8 hours of cluster time in all,
+about $6.10 (the m7i.4xlarge S3 runs are about three quarters of it). S4's
 offline half cost nothing.
 
 ## 19. Tests, drills and benchmarks
