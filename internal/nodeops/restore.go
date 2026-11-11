@@ -81,7 +81,7 @@ func Restore(ctx context.Context, o RestoreOptions) (RestoreResult, error) {
 	}
 	live := root == o.liveRoot
 	if live && o.Host.UnitActive(ctx, sandboxdUnit) {
-		return res, errors.New("sandboxd is running; stop it first (sudo systemctl stop sandboxd): a restore under a running sandboxd mixes two databases")
+		return res, fmt.Errorf("sandboxd is running; stop it first (%s): a restore under a running sandboxd mixes two databases", stopHint(o.Host))
 	}
 	idx, err := scanArchive(o.Input)
 	if err != nil {
