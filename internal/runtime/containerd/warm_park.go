@@ -278,6 +278,11 @@ func (d *Driver) parkContainer(ctx context.Context, slotID string, key container
 	if err := task.Start(ctx); err != nil {
 		return nil, fmt.Errorf("park start: %w", err)
 	}
+	if d.cfg.CgroupParent != "" {
+		if err := d.markWholeOOMVictim(d.sandboxCgroupPath(slotID)); err != nil {
+			return nil, fmt.Errorf("park: %w", err)
+		}
+	}
 
 	waitCtx, cancel := context.WithTimeout(ctx, d.cfg.ToolboxWaitTimeout)
 	defer cancel()

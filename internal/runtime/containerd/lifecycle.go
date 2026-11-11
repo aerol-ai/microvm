@@ -353,6 +353,11 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 	if err := task.Start(ctx); err != nil {
 		return nil, fmt.Errorf("start task: %w", err)
 	}
+	if d.cfg.CgroupParent != "" {
+		if err := d.markWholeOOMVictim(d.sandboxCgroupPath(sandboxID)); err != nil {
+			return nil, err
+		}
+	}
 	createtiming.From(ctx).RecordStage("containerd_start", time.Since(startStart))
 
 	// containerd_address: reading the started task's IPv4 back (the netns
@@ -564,6 +569,14 @@ func (d *Driver) startTask(ctx context.Context, containerRef, sandboxID, toolbox
 	}
 	if err := task.Start(ctx); err != nil {
 		return nil, fmt.Errorf("start task: %w", err)
+	}
+	// A restart makes the task's cgroup anew; mark it again (F10).
+	if spec != nil && spec.Linux != nil {
+		if err := d.markWholeOOMVictim(spec.Linux.CgroupsPath); err != nil {
+			_ = task.Kill(ctx, syscall.SIGKILL)
+			_, _ = task.Delete(ctx, cntr.WithProcessKill)
+			return nil, err
+		}
 	}
 	if parked != nil {
 		waitCtx, cancel := context.WithTimeout(ctx, d.cfg.ToolboxWaitTimeout)

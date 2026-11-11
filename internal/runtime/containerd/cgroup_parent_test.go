@@ -2,13 +2,17 @@ package containerd
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
+	cntr "github.com/containerd/containerd/v2/client"
 	"github.com/containerd/containerd/v2/core/containers"
+	"github.com/containerd/containerd/v2/pkg/oci"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 
 	"github.com/aerol-ai/microvm/internal/pool/containerdpool"
@@ -77,6 +81,7 @@ func TestCreateSpecUsesCgroupParent(t *testing.T) {
 			d := newTestDriver(t)
 			d.cfg.CgroupParent = testPodCgroup
 			id := "sb-cg-" + rt
+			cg, proc := fakeOOMTree(t, map[string][]int{testPodCgroup + "/" + id: {4100}}, []int{4100})
 			if _, err := d.Create(context.Background(), models.CreateSandboxRequest{
 				Image: "alpine:3.20", ContainerCommand: []string{"sleep", "inf"}, Runtime: rt,
 			}, id, "tok", nil); err != nil {
@@ -85,6 +90,7 @@ func TestCreateSpecUsesCgroupParent(t *testing.T) {
 			if got := cap.last(t).Linux.CgroupsPath; got != testPodCgroup+"/"+id {
 				t.Fatalf("CgroupsPath = %q, want %q", got, testPodCgroup+"/"+id)
 			}
+			assertWholeOOMVictim(t, cg, proc, testPodCgroup+"/"+id, 4100)
 		})
 	}
 }
@@ -121,12 +127,15 @@ func TestParkSpecUsesCgroupParent(t *testing.T) {
 	}, nil, nil)
 	d.SetClient(NewTestClient("aerolvm", tr))
 	d.SetNetnsHandoff(&harnessNetns{path: "/run/netns/park-cg", ip: "10.88.0.80"})
+	cg, proc := fakeOOMTree(t, map[string][]int{testPodCgroup + "/park-cg": {4300}}, []int{4300})
 	if _, err := d.parkContainer(context.Background(), "park-cg", containerdpool.Key{Image: "cfg:test", Runtime: models.RuntimeGvisor}); err != nil {
 		t.Fatal(err)
 	}
 	if got := cap.last(t).Linux.CgroupsPath; got != testPodCgroup+"/park-cg" {
 		t.Fatalf("CgroupsPath = %q, want %q", got, testPodCgroup+"/park-cg")
 	}
+	// A parked slot is a sandbox in waiting: adoption keeps its group.
+	assertWholeOOMVictim(t, cg, proc, testPodCgroup+"/park-cg", 4300)
 }
 
 func TestCheckCgroupParent(t *testing.T) {
@@ -194,4 +203,158 @@ func cgWrite(t *testing.T, file, body string) {
 	if err := os.WriteFile(file, []byte(body), 0o644); err != nil {
 		t.Fatal(err)
 	}
+}
+
+// fakeOOMTree points CgroupRoot and ProcRoot at temporary trees: each group
+// with memory.oom.group 0 and the listed PIDs in cgroup.procs, and each PID
+// in pids with OOM score -999 (inherited from the shim, as in Phase 0 S3).
+func fakeOOMTree(t *testing.T, groups map[string][]int, pids []int) (cgRoot, procRoot string) {
+	t.Helper()
+	cgRoot, procRoot = t.TempDir(), t.TempDir()
+	for g, members := range groups {
+		dir := filepath.Join(cgRoot, filepath.FromSlash(g))
+		cgWrite(t, filepath.Join(dir, "memory.oom.group"), "0\n")
+		var b strings.Builder
+		for _, pid := range members {
+			fmt.Fprintf(&b, "%d\n", pid)
+		}
+		cgWrite(t, filepath.Join(dir, "cgroup.procs"), b.String())
+	}
+	for _, pid := range pids {
+		cgWrite(t, filepath.Join(procRoot, strconv.Itoa(pid), "oom_score_adj"), "-999\n")
+	}
+	oldCg, oldProc := CgroupRoot, ProcRoot
+	CgroupRoot, ProcRoot = cgRoot, procRoot
+	t.Cleanup(func() { CgroupRoot, ProcRoot = oldCg, oldProc })
+	return cgRoot, procRoot
+}
+
+func readTrim(t *testing.T, file string) string {
+	t.Helper()
+	b, err := os.ReadFile(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return strings.TrimSpace(string(b))
+}
+
+func assertWholeOOMVictim(t *testing.T, cgRoot, procRoot, group string, pids ...int) {
+	t.Helper()
+	if got := readTrim(t, filepath.Join(cgRoot, filepath.FromSlash(group), "memory.oom.group")); got != "1" {
+		t.Fatalf("%s memory.oom.group = %q, want 1", group, got)
+	}
+	for _, pid := range pids {
+		if got := readTrim(t, filepath.Join(procRoot, strconv.Itoa(pid), "oom_score_adj")); got != "500" {
+			t.Fatalf("pid %d oom_score_adj = %q, want 500", pid, got)
+		}
+	}
+}
+
+// Regression (Kubernetes Phase 0, finding F10): a sandbox the kernel kills
+// in part frees nothing, and one with the shim's -999 score is never picked.
+func TestMarkWholeOOMVictim(t *testing.T) {
+	group := testPodCgroup + "/sb-1"
+	t.Run("marks the group and every process in it and below", func(t *testing.T) {
+		// 104 is listed but has exited: skipped, not an error.
+		cg, proc := fakeOOMTree(t, map[string][]int{group: {101, 102, 104}, group + "/inner": {103}}, []int{101, 102, 103})
+		d := &Driver{cfg: Config{CgroupParent: testPodCgroup}}
+		if err := d.markWholeOOMVictim(group); err != nil {
+			t.Fatal(err)
+		}
+		assertWholeOOMVictim(t, cg, proc, group, 101, 102, 103)
+	})
+	for _, tc := range []struct {
+		name, parent, group string
+	}{
+		{"no cgroup parent", "", group},
+		{"a group outside the parent", testPodCgroup, "/aerolvm/sb-1"},
+		{"the parent itself", testPodCgroup, testPodCgroup},
+		{"no group", testPodCgroup, ""},
+	} {
+		t.Run("leaves alone: "+tc.name, func(t *testing.T) {
+			cg, proc := fakeOOMTree(t, map[string][]int{group: {101}, "/aerolvm/sb-1": {101}}, []int{101})
+			d := &Driver{cfg: Config{CgroupParent: tc.parent}}
+			if err := d.markWholeOOMVictim(tc.group); err != nil {
+				t.Fatal(err)
+			}
+			for _, g := range []string{group, "/aerolvm/sb-1"} {
+				if got := readTrim(t, filepath.Join(cg, filepath.FromSlash(g), "memory.oom.group")); got != "0" {
+					t.Fatalf("%s memory.oom.group = %q, want it untouched", g, got)
+				}
+			}
+			if got := readTrim(t, filepath.Join(proc, "101", "oom_score_adj")); got != "-999" {
+				t.Fatalf("oom_score_adj = %q, want it untouched", got)
+			}
+		})
+	}
+	for _, tc := range []struct {
+		name  string
+		setup func(t *testing.T, cg, proc string)
+		want  string
+	}{
+		{"the group is missing", func(t *testing.T, cg, _ string) {
+			if err := os.RemoveAll(filepath.Join(cg, filepath.FromSlash(group))); err != nil {
+				t.Fatal(err)
+			}
+		}, "set memory.oom.group"},
+		{"cgroup.procs is unreadable", func(t *testing.T, cg, _ string) {
+			if err := os.Remove(filepath.Join(cg, filepath.FromSlash(group), "cgroup.procs")); err != nil {
+				t.Fatal(err)
+			}
+		}, "read cgroup.procs"},
+		{"a score cannot be written", func(t *testing.T, _, proc string) {
+			f := filepath.Join(proc, "101", "oom_score_adj")
+			if err := os.Remove(f); err != nil {
+				t.Fatal(err)
+			}
+			cgMkdir(t, f)
+		}, "set OOM score of pid 101"},
+	} {
+		t.Run("fails when "+tc.name, func(t *testing.T) {
+			cg, proc := fakeOOMTree(t, map[string][]int{group: {101}}, []int{101})
+			tc.setup(t, cg, proc)
+			err := (&Driver{cfg: Config{CgroupParent: testPodCgroup}}).markWholeOOMVictim(group)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("err = %v, want one containing %q", err, tc.want)
+			}
+		})
+	}
+}
+
+// A restart makes the task's cgroup anew, so Start marks it again; a mark
+// that fails stops the restart and leaves no task running.
+func TestStartMarksRestartedSandbox(t *testing.T) {
+	group := testPodCgroup + "/sb-stopped"
+	newDriver := func(t *testing.T) (*Driver, *fakeTask) {
+		stubToolboxProbe(t)
+		task := &fakeTask{status: cntr.Stopped}
+		tr := newFakeTransport()
+		tr.containers["sb-stopped"] = &fakeContainer{
+			id: "sb-stopped", task: task,
+			specOverride: &oci.Spec{Linux: &specs.Linux{CgroupsPath: group}},
+		}
+		d := newTestDriver(t)
+		d.cfg.CgroupParent = testPodCgroup
+		d.SetClient(NewTestClient("aerolvm", tr))
+		return d, task
+	}
+	t.Run("marked", func(t *testing.T) {
+		cg, proc := fakeOOMTree(t, map[string][]int{group: {4200}}, []int{4200})
+		d, _ := newDriver(t)
+		if _, err := d.Start(context.Background(), "sb-stopped"); err != nil {
+			t.Fatal(err)
+		}
+		assertWholeOOMVictim(t, cg, proc, group, 4200)
+	})
+	t.Run("a failed mark stops the restart", func(t *testing.T) {
+		fakeOOMTree(t, map[string][]int{}, nil)
+		d, task := newDriver(t)
+		_, err := d.Start(context.Background(), "sb-stopped")
+		if err == nil || !strings.Contains(err.Error(), "set memory.oom.group") {
+			t.Fatalf("Start = %v, want the marking error", err)
+		}
+		if task.killed == 0 {
+			t.Fatal("the restarted task was left running after the mark failed")
+		}
+	})
 }
