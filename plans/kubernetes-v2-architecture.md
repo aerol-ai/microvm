@@ -1653,6 +1653,34 @@ read).
 - F12 (below) is what run 7 found next: `sandboxd` did not notice the
   sandboxes the kernel killed.
 
+**F10's full fix, as it ships: pass** (run `p1-f10`, EKS 1.36, AL2023,
+m7i.4xlarge, 2026-11-11; `s3.sh --supervisor`, a build of every Phase 1 PR).
+The split worker pod: the runtime container is the Phase 1 Go supervisor
+(#1154: cgroup shape, cap, containerd in `_runtime`), the agent container is
+`sandboxd` (#1146: each sandbox's group `memory.oom.group` 1 and OOM score
+500). No stand-in loop. 1,000 gVisor sandboxes, then each filled 48 MB of its
+`/dev/shm`:
+
+| Group | Memory after | Limit | Limit hit |
+|---|---|---|---|
+| Pod | 51.3 GB | 55.8 GB | 0 times |
+| Runtime container | 49.4 GB | 53.7 GB | 0 times |
+| Agent container (`sandboxd`) | 0.8 GB | 2.1 GB | 0 times |
+| `sandboxes/` | 49.36 GB | 49.39 GB (the container's 50 GiB minus 4 GiB) | 389,421 times |
+| `supervisor/` | 0.4 MB | `memory.min` 4 GiB | 0 times |
+
+- Every out-of-memory event stayed in `sandboxes/`. The kernel's log shows
+  11 kills in 90 minutes, each a whole sandbox's group (22 `runsc` and 100
+  gVisor kernel processes in all); `sandboxd` marked all 11 stopped
+  (F12's fix holds).
+- No container restarted, the pod was not evicted, the node never reported
+  MemoryPressure, and `sandboxd` answered throughout. A create into the full
+  cap got 503 "live memory floor breached" in 6 ms.
+- The gVisor kernel processes keep the OOM score of the containerd that
+  started them (-999); each sandbox's `runsc` process has 500, the kernel
+  picks it, and the group kill takes the rest. Whole sandboxes die either
+  way. Spend about $1.
+
 **S8, a disk limit per sandbox: pass** (run `p0-s8`, EKS 1.36, AL2023, an
 m6id.xlarge with a 220 GB NVMe instance store, 2026-11-11). The worker
 formatted the NVMe as XFS with project quotas and mounted it as containerd's

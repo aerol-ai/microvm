@@ -80,7 +80,7 @@ to main.
 | F12: sandboxd misses deaths without Docker (event fan-in; reconcile) | #1142 | main | **Merged** |
 | F1: create the ip filter table when missing | #1144 | main | Open; kernel test fails on main, passes here |
 | F3: size admission from the sandboxes' cgroup | #1145 | #1141 | Open; **proven live**: 15 CPUs and 51,200 MB from the cgroup (machine 16 and 63,258); a create into a full cgroup gets 503 in 0.84 s |
-| F10: sandboxd makes each sandbox the kernel's whole OOM choice | #1146 | #1141 | Open; **proven live** with the harness loop off: 1,003 groups marked by sandboxd, only whole sandboxes killed, pod limit never hit, sandboxd answered. 4 late gVisor processes found unmarked; a second pass once ready fixes it |
+| F10: sandboxd makes each sandbox the kernel's whole OOM choice | #1146 | #1141 | Open; **proven live** with the harness loop off: 1,003 groups marked by sandboxd, only whole sandboxes killed, pod limit never hit, sandboxd answered. 4 late gVisor processes found unmarked; a second pass once ready fixes it. **Full fix proven with the shipped code** (run p1-f10, `s3.sh --supervisor`: the Go supervisor #1154 + this): 1,000 gVisor sandboxes past their cap; pod, runtime and agent limits never hit; 11 OOM kills, each a whole sandbox; nothing restarted; a create into the full cap got 503 in 6 ms |
 | C12: cell number in new sandbox IDs | #1147 | main | Open |
 | C1: `GET /ready`, 503 while cut off from the control plane (the first plan's D8) | #1148 | main | Open |
 | C2: `SB_DOCKER_ENABLED=false`, no Docker on the containerd engine (F4, F5) | #1149 | main | Open |

@@ -181,9 +181,12 @@ sleep 60
 forward
 if alive="$(count_sandboxes 2>/dev/null)"; then
   say "sandboxd still answers; sandboxes listed: $alive"
+  # With sandboxes/ still full, admission's refusal (503) is the right
+  # answer; record it rather than stop the run (curl -f fails on it).
   t0=$(ms)
-  id="$(api /v1/sandboxes -X POST -d '{"image":"alpine:3.20","runtime":"gvisor","cpu":0.1,"memory_mb":64}' 2>/dev/null | jq -r '.id // empty')"
-  say "a new create after the pressure: $([[ -n "$id" ]] && echo "ok in $(( $(ms) - t0 )) ms" || echo failed)"
+  created="$(curl -sS --max-time 120 -w ' HTTP %{http_code}' -H "Authorization: Bearer $token" -H 'Content-Type: application/json' \
+    -d '{"image":"alpine:3.20","runtime":"gvisor","cpu":0.1,"memory_mb":64}' http://127.0.0.1:21212/v1/sandboxes 2>&1 || true)"
+  say "a new create after the pressure, in $(( $(ms) - t0 )) ms: $(grep -oE '"id":"[^"]*"|"error":"[^"]*"| HTTP [0-9]+' <<<"$created" | head -3 | tr '\n' ' ')"
 else
   say "sandboxd does not answer"
 fi
