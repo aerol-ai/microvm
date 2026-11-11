@@ -6455,6 +6455,7 @@ func (s *Service) Capacity() capacity.Snapshot {
 		snap.LocalWasmModuleIDs = refs
 	}
 	snap.EgressGatewayReady = s.EgressGatewayReady()
+	snap.OwnershipLeaseFile = s.cfg.EnableCluster && s.cfg.OwnershipLeaseFile != ""
 	// Warm-pool entry status: how GET /v1/warm-pools on any node reports
 	// this one, with no fan-out (W1).
 	snap.WarmPools = s.localWarmPoolStatus()

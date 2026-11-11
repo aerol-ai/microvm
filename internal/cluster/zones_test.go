@@ -182,6 +182,38 @@ func TestZoneMemory(t *testing.T) {
 	}
 }
 
+// Nodes churn on Kubernetes (each replaced worker is a new ID): a full
+// memory drops facts no heartbeat renewed for zoneFactStale, so new nodes
+// keep their zone rule; facts heard recently are kept.
+func TestZoneMemoryDropsStaleFacts(t *testing.T) {
+	z := &zoneMemory{}
+	t0 := time.Unix(1000, 0)
+	for i := 0; i < maxRememberedZones; i++ {
+		seen := t0
+		if i%2 == 0 {
+			seen = t0.Add(zoneFactStale) // heard recently
+		}
+		z.recordFact(fmt.Sprintf("n%d", i), nodeFact{zone: "a", seen: seen})
+	}
+	now := t0.Add(zoneFactStale + time.Minute)
+	z.recordFact("new", nodeFact{zone: "b", seen: now})
+	if z.zoneOf("new") != "b" {
+		t.Fatal("a new node got no zone with the memory full of stale facts")
+	}
+	if z.zoneOf("n0") != "a" || z.zoneOf("n1") != "" {
+		t.Fatalf("kept n0=%q (recent) and n1=%q (stale), want a and none", z.zoneOf("n0"), z.zoneOf("n1"))
+	}
+	// Full of recent facts: nothing to drop, nothing added.
+	f := &zoneMemory{}
+	for i := 0; i < maxRememberedZones; i++ {
+		f.recordFact(fmt.Sprintf("n%d", i), nodeFact{zone: "a", seen: now})
+	}
+	f.recordFact("late", nodeFact{zone: "b", seen: now})
+	if f.zoneOf("late") != "" {
+		t.Fatal("memory grew past its bound")
+	}
+}
+
 func zoneCluster(t *testing.T, members ...Member) *Cluster {
 	t.Helper()
 	idx := newGossipMemberIndex()

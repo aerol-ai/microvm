@@ -136,6 +136,8 @@ func (c *Cluster) cancelDeadOwnerWatch(nodeID string) {
 		return
 	}
 	c.deadOwners.clear(nodeID)
+	// Back in gossip, so its machine was not gone after all (C19).
+	c.gone.clearGone(nodeID)
 }
 
 // startDeadOwnerLoop spawns the periodic reconciler that evicts nodes whose
@@ -174,7 +176,12 @@ func (c *Cluster) startDeadOwnerLoop() {
 // will idempotently re-orphan (no-op) and then remove the server (idempotent
 // at the raft layer).
 func (c *Cluster) reconcileDeadOwners(ctx context.Context) {
-	if c.raft == nil || c.raft.raft.State() != raft.Leader {
+	if c.raft == nil {
+		return
+	}
+	leading := c.raft.raft.State() == raft.Leader
+	c.gone.observeLeadership(leading, c.raft.raft.CurrentTerm(), time.Now())
+	if !leading {
 		return
 	}
 	grace := DeadOwnerGrace(c.cfg)
@@ -191,6 +198,7 @@ func (c *Cluster) reconcileDeadOwners(ctx context.Context) {
 		if m.Alive {
 			live[m.NodeID] = true
 			c.deadOwners.clear(m.NodeID)
+			c.gone.clearGone(m.NodeID)
 		}
 	}
 
@@ -230,20 +238,24 @@ func (c *Cluster) reconcileDeadOwners(ctx context.Context) {
 
 	now := time.Now()
 	for nodeID, since := range c.deadOwners.snapshot() {
-		if now.Sub(since) < grace {
+		// The operator said its machine is gone (C19): once the node's own
+		// lease has run out, nothing it runs is live, so the grace is not
+		// needed. A gone machine is not restarting or upgrading either.
+		gone := c.gone.isGone(nodeID)
+		if now.Sub(since) < grace && !c.goneFailoverDue(nodeID, now) {
 			continue
 		}
 		// A node the rollout is upgrading is restarting, not dead: no
 		// failover until its step deadline (--node-timeout) passes, so a
 		// restart longer than the grace moves none of its sandboxes (§6.2,
 		// Codex eng finding 2). Past the deadline it is judged as before.
-		if deadline, upgrading := c.fsm.upgradingDeadline(nodeID); upgrading && now.Before(deadline) {
+		if deadline, upgrading := c.fsm.upgradingDeadline(nodeID); upgrading && now.Before(deadline) && !gone {
 			continue
 		}
 		// A node that announced a restart on SIGTERM (C8) gets the restart
 		// window, for a pod or kubelet restart outside a rollout. A deleted
 		// node never waits: it is not coming back.
-		if until, restarting := c.deadOwners.restarting(nodeID); restarting && now.Before(until) && !c.fsm.deniedNodeSet()[nodeID] {
+		if until, restarting := c.deadOwners.restarting(nodeID); restarting && now.Before(until) && !gone && !c.fsm.deniedNodeSet()[nodeID] {
 			continue
 		}
 		if live[nodeID] {
@@ -277,6 +289,10 @@ func (c *Cluster) evictDeadOwner(ctx context.Context, nodeID string) {
 	}
 	c.runEvictDeadOwnerStepHook(evictStepRemoveServer, "")
 	c.removeDeadOwnerServer(nodeID)
+	// Its failover is done; its C19 marks and C10 facts would only fill
+	// their bounded maps.
+	c.gone.forget(nodeID)
+	c.capacityLeases.forgetNode(nodeID)
 }
 
 // errOwnerRejoined is evictOwnerPlacements' answer when the owner shows alive

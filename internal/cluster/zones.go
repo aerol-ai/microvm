@@ -4,6 +4,7 @@ import (
 	"math/rand"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/aerol-ai/microvm/pkg/models"
 )
@@ -121,41 +122,65 @@ func withoutZone(candidates []Member, zone string) []Member {
 }
 
 // maxRememberedZones bounds zoneMemory. A server sees each node it ever held
-// a heartbeat from; past this many it stops adding new ones, so a fleet that
-// churns node IDs cannot grow it forever. A node it does not know gets no
-// zone rule on failover, which is today's behavior.
+// a heartbeat from. When full, it drops what it last heard more than
+// zoneFactStale ago; if it is still full it adds nothing, and a node it
+// does not know gets no zone rule on failover, which is today's behavior.
 const maxRememberedZones = 8192
 
-// zoneMemory keeps the last zone each node reported. The capacity lease of a
-// node that dies is dropped once it leaves the membership view, but the
-// failover that follows needs its zone, so it is kept here apart from the
-// lease. Each server fills its own from the heartbeats it reads; a server
-// that becomes leader after a node died may not know that node's zone, and
-// then the failover has no zone rule.
+// zoneFactStale is how long a fact stays worth keeping after its node's last
+// heartbeat. A fact matters only until the node's failover is done, which
+// starts within the dead-owner grace; a live node renews its fact with every
+// heartbeat. Nodes churn on Kubernetes (each replaced worker is a new node
+// ID), so without dropping old facts the memory would fill for good and
+// every later node would lose its zone rule and early failover.
+const zoneFactStale = time.Hour
+
+// zoneMemory keeps what each node last reported that a failover still needs
+// after the node is gone: its zone (C10) and whether its runtime enforces the
+// ownership lease with sandboxd down (C19). The capacity lease of a node that
+// dies is dropped once it leaves the membership view, so this is kept apart
+// from it. Each server fills its own from the heartbeats it reads; a server
+// that becomes leader after a node died may not know that node, and then the
+// failover has no zone rule and no early start, which is today's behavior.
 type zoneMemory struct {
 	mu    sync.RWMutex
-	zones map[string]string
+	zones map[string]nodeFact
+}
+
+// nodeFact is what zoneMemory keeps per node.
+type nodeFact struct {
+	zone      string
+	leaseFile bool
+	seen      time.Time // when it was recorded
 }
 
 func (z *zoneMemory) record(nodeID, zone string) {
+	z.recordFact(nodeID, nodeFact{zone: zone})
+}
+
+func (z *zoneMemory) recordFact(nodeID string, f nodeFact) {
 	if z == nil || nodeID == "" {
 		return
+	}
+	if f.seen.IsZero() {
+		f.seen = time.Now()
 	}
 	z.mu.Lock()
 	defer z.mu.Unlock()
 	if z.zones == nil {
-		z.zones = make(map[string]string)
+		z.zones = make(map[string]nodeFact)
 	}
-	if cur, ok := z.zones[nodeID]; ok {
-		if cur != zone {
-			z.zones[nodeID] = zone
+	if _, ok := z.zones[nodeID]; !ok && len(z.zones) >= maxRememberedZones {
+		for id, old := range z.zones {
+			if f.seen.Sub(old.seen) > zoneFactStale {
+				delete(z.zones, id)
+			}
 		}
-		return
+		if len(z.zones) >= maxRememberedZones {
+			return
+		}
 	}
-	if len(z.zones) >= maxRememberedZones {
-		return
-	}
-	z.zones[nodeID] = zone
+	z.zones[nodeID] = f
 }
 
 func (z *zoneMemory) zoneOf(nodeID string) string {
@@ -164,7 +189,29 @@ func (z *zoneMemory) zoneOf(nodeID string) string {
 	}
 	z.mu.RLock()
 	defer z.mu.RUnlock()
-	return z.zones[nodeID]
+	return z.zones[nodeID].zone
+}
+
+// leaseFileOf reports whether nodeID's last heartbeat said its runtime
+// enforces the ownership lease with sandboxd down (C19).
+func (z *zoneMemory) leaseFileOf(nodeID string) bool {
+	if z == nil {
+		return false
+	}
+	z.mu.RLock()
+	defer z.mu.RUnlock()
+	return z.zones[nodeID].leaseFile
+}
+
+// lastHeard is when nodeID's last heartbeat reached this server (C19), or
+// zero when none did.
+func (z *zoneMemory) lastHeard(nodeID string) time.Time {
+	if z == nil {
+		return time.Time{}
+	}
+	z.mu.RLock()
+	defer z.mu.RUnlock()
+	return z.zones[nodeID].seen
 }
 
 func (z *zoneMemory) forget(nodeID string) {

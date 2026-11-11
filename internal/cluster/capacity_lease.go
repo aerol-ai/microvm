@@ -338,8 +338,34 @@ func (c *capacityLeaseCache) setReported(nodeID string, snap capacity.Snapshot, 
 		c.leases[nodeID] = capacityLease{snapshot: snap, updated: updated, mark: mark}
 	}
 	c.mu.Unlock()
-	c.zones.record(nodeID, memberZone(Member{Capacity: snap}))
+	c.zones.recordFact(nodeID, nodeFact{zone: memberZone(Member{Capacity: snap}), leaseFile: snap.OwnershipLeaseFile})
 	c.unreported.reported(nodeID, mark)
+}
+
+// forgetNode drops what this server kept about nodeID for its failover
+// (zoneMemory), once that failover is done.
+func (c *capacityLeaseCache) forgetNode(nodeID string) {
+	if c == nil {
+		return
+	}
+	c.zones.forget(nodeID)
+}
+
+// lastKnownLeaseFile reports whether nodeID's last heartbeat to this server
+// said its runtime enforces the ownership lease with sandboxd down (C19).
+func (c *capacityLeaseCache) lastKnownLeaseFile(nodeID string) bool {
+	if c == nil {
+		return false
+	}
+	return c.zones.leaseFileOf(nodeID)
+}
+
+// lastHeard is when nodeID's last heartbeat reached this server (C19).
+func (c *capacityLeaseCache) lastHeard(nodeID string) time.Time {
+	if c == nil {
+		return time.Time{}
+	}
+	return c.zones.lastHeard(nodeID)
 }
 
 // lastKnownZone is the zone nodeID last reported to this server, or "" when

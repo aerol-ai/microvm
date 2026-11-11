@@ -277,6 +277,9 @@ func RegisterRoutes(mux apihttp.Mux, d Deps) {
 	// Any role. DELETE /cluster/members/{id} keeps its servers-only answers.
 	mux.Handle("DELETE "+PathPrefix+"/cluster/nodes/{id}", op(http.HandlerFunc(h.clusterDeleteNode)))
 	mux.Handle("POST "+PathPrefix+"/cluster/nodes/{id}/uncordon", op(http.HandlerFunc(h.clusterUncordonNode)))
+	// The operator's "this node's machine is gone" (C19): the leader may
+	// fail it over at its ownership lease limit instead of after the grace.
+	mux.Handle("POST "+PathPrefix+"/cluster/nodes/{id}/gone", op(http.HandlerFunc(h.clusterNodeGone)))
 	mux.Handle("POST "+PathPrefix+"/cluster/nodes/{id}/storage-retired", op(http.HandlerFunc(h.clusterRetireNodeStorage)))
 	mux.Handle("DELETE "+PathPrefix+"/cluster/nodes/{id}/storage-retired", op(http.HandlerFunc(h.clusterRevokeNodeStorageRetirement)))
 	mux.Handle("GET "+PathPrefix+"/cluster/storage-retirements", op(http.HandlerFunc(h.clusterListNodeStorageRetirements)))
