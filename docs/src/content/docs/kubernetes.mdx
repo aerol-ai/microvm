@@ -32,6 +32,7 @@ The worker pod has three containers:
 ## What you need
 
 - A Kubernetes cluster with Linux nodes (amd64 or arm64) that use cgroup v2. Recent EKS, AKS, GKE and kind nodes do.
+- The `br_netfilter` kernel module loaded on the nodes that run the worker pod (`sudo modprobe br_netfilter`). The server refuses to start without it, because sandboxes on the same node could then reach each other. Stock EKS nodes and Linux machines running kind often lack it; Docker Desktop has it.
 - Helm 3.8 or later, and `kubectl`.
 - A namespace that allows privileged pods. The worker pod builds sandboxes, which needs full rights on its node.
 

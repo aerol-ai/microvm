@@ -833,6 +833,12 @@ jobs:
             exit 1
           fi
 
+      # kind's nodes share this runner's kernel, which has no br_netfilter
+      # loaded; sandboxd refuses to start without it, since sandbox
+      # isolation on the bridge would fail open (Kubernetes v2 finding F2).
+      - name: Load br_netfilter
+        run: sudo modprobe br_netfilter
+
       - name: Install single mode on kind
         run: make k8s-dev
 
