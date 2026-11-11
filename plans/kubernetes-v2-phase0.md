@@ -33,9 +33,10 @@ anything else, as the plan's Phase 0 exit gate says.
 5. **Each run reports its cost** (machine hours times the price, plus the EKS
    control plane), and the result goes into the plan in the same PR as the
    spike's code.
-6. **AKS waits.** The plan's AKS parts (S1's AKS images, S7 on AKS) need Azure
-   access, which this effort does not have yet. They are recorded as "not run"
-   until it does.
+6. **AKS waits.** The plan's AKS parts (S1's AKS images, S7 on AKS) are
+   recorded as "not run". On 2026-11-11 the owner chose to skip them for now
+   (an Azure subscription is set up on the dev machine, but its sign-in had
+   expired); they run when the owner asks.
 
 ## The order
 
