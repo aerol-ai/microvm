@@ -1156,6 +1156,12 @@ type Config struct {
 	// EnableCluster=false — single-node mode is implicitly "mixed".
 	NodeRole string
 	NodeID   string
+	// ReadyLeaderGrace is how long a cluster node may go without proof of a
+	// working control plane before /ready answers 503 (SB_READY_LEADER_GRACE,
+	// default 10 s: above a normal raft election, so one does not take a
+	// node out of rotation). Kubernetes probes /ready to stop sending a
+	// cut-off node traffic (Kubernetes v2 plan C1).
+	ReadyLeaderGrace time.Duration
 	// NodeName is the operator-friendly label gossiped to peers and shown on
 	// the dashboard (e.g. "node1", "wrk2"). Display-only; raft/gossip identity
 	// stays on NodeID. SB_NODE_NAME; empty falls back to NodeID at display
@@ -3147,6 +3153,9 @@ func load(keyTool bool) (Config, error) {
 	if err := cfg.loadAPIAdmissionConfig(); err != nil {
 		return Config{}, err
 	}
+	if err := cfg.loadReadyLeaderGrace(); err != nil {
+		return Config{}, err
+	}
 	if err := validateSandboxTokens(&cfg); err != nil {
 		return Config{}, err
 	}
@@ -3690,6 +3699,25 @@ func getEnvFloat(key string, fallback float64) float64 {
 		return fallback
 	}
 	return parsed
+}
+
+// DefaultReadyLeaderGrace is ReadyLeaderGrace's default.
+const DefaultReadyLeaderGrace = 10 * time.Second
+
+// loadReadyLeaderGrace reads SB_READY_LEADER_GRACE strictly: a typo stops
+// the boot, rather than quietly fall back to the default.
+func (c *Config) loadReadyLeaderGrace() error {
+	c.ReadyLeaderGrace = DefaultReadyLeaderGrace
+	v := strings.TrimSpace(os.Getenv("SB_READY_LEADER_GRACE"))
+	if v == "" {
+		return nil
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil || d <= 0 {
+		return fmt.Errorf("SB_READY_LEADER_GRACE must be a positive duration such as 10s, got %q", v)
+	}
+	c.ReadyLeaderGrace = d
+	return nil
 }
 
 func getEnvDuration(key string, fallback time.Duration) time.Duration {

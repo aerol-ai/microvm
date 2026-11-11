@@ -212,6 +212,12 @@ type Agent struct {
 	// endpoint on worker/ingress-only agents.
 	placementVersion          atomic.Uint64
 	lastNoControlPlaneLogUnix atomic.Int64
+	// contact is the last successful control-plane exchange, for /ready
+	// (readiness.go).
+	contact agentContact
+	// leaderProbeHook stands in for Leader in readiness tests. Always nil
+	// in production.
+	leaderProbeHook func() string
 
 	// recreator is the service-layer hook the worker owner watcher calls to
 	// materialize placements the FSM assigned to this node. Attached after
@@ -1621,6 +1627,7 @@ func (a *Agent) doControlPlaneBytes(ctx context.Context, method, publicPath, int
 	for _, m := range members {
 		err := a.tryControlPlaneMember(ctx, m, method, publicPath, internalPath, body, out)
 		if err == nil {
+			a.contact.record(time.Now())
 			return nil
 		}
 		if firstErr == nil {
