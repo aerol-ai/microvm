@@ -203,7 +203,7 @@ The NetworkPolicy works only if your cluster's network plugin enforces NetworkPo
 
 ### Tell AerolVM your cluster's addresses
 
-AerolVM cannot guess your cluster's addresses, so list them in a values file. In [cluster mode](/kubernetes-cluster/) the operator fills these in for you.
+AerolVM cannot guess your cluster's addresses, so list them in a values file. In [cluster mode](/kubernetes-cluster/) the operator finds the API server and the pod and Service ranges for you; you list only node ranges outside the private ranges.
 
 ```yaml
 worker:

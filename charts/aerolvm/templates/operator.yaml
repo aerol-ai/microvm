@@ -7,7 +7,9 @@
 # replicas, one leader. Its rights (§15.1): its own namespace and the worker
 # namespace (pods, the join-token Secrets, Services, volume claims), Nodes
 # and Karpenter NodeClaims (read; a NodeClaim deleted to return an emptied
-# machine), and its own objects. No other pod of AerolVM has any.
+# machine), the API server's Service and EndpointSlice in default and the
+# ServiceCIDRs (read, C24), and its own objects. No other pod of AerolVM
+# has any.
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -29,6 +31,10 @@ rules:
   - apiGroups: [karpenter.sh]
     resources: [nodeclaims]
     verbs: [get, list, watch, delete]
+  # The cluster's Service ranges, kept from sandboxes (C24).
+  - apiGroups: [networking.k8s.io]
+    resources: [servicecidrs]
+    verbs: [list]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -37,6 +43,36 @@ metadata:
   labels:
     {{- include "aerolvm.labels" . | nindent 4 }}
 roleRef: { apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: {{ $op }} }
+subjects:
+  - { kind: ServiceAccount, name: {{ $op }}, namespace: {{ .Release.Namespace }} }
+---
+# The API server's own Service and addresses, which no sandbox may reach
+# (C24): these two objects in default, read only.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ $op }}-api-server
+  namespace: default
+  labels:
+    {{- include "aerolvm.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: [services]
+    resourceNames: [kubernetes]
+    verbs: [get]
+  - apiGroups: [discovery.k8s.io]
+    resources: [endpointslices]
+    resourceNames: [kubernetes]
+    verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $op }}-api-server
+  namespace: default
+  labels:
+    {{- include "aerolvm.labels" . | nindent 4 }}
+roleRef: { apiGroup: rbac.authorization.k8s.io, kind: Role, name: {{ $op }}-api-server }
 subjects:
   - { kind: ServiceAccount, name: {{ $op }}, namespace: {{ .Release.Namespace }} }
 {{- range $ns := list .Release.Namespace $workerNS | uniq }}

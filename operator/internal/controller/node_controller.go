@@ -62,11 +62,18 @@ type NodeReconciler struct {
 	// Templates is the chart's pod-templates ConfigMap.
 	Templates string
 	Now       func() time.Time
+	// Reader reads past the manager's cache, which holds only AerolVM's
+	// namespaces: the API server's Service and addresses in default, and
+	// the ServiceCIDRs (C24). Nil uses the client.
+	Reader client.Reader
 }
 
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=nodes,verbs=get;list;watch
 // +kubebuilder:rbac:groups=karpenter.sh,resources=nodeclaims,verbs=get;list;watch;delete
+// +kubebuilder:rbac:groups="",namespace=default,resources=services,resourceNames=kubernetes,verbs=get
+// +kubebuilder:rbac:groups=discovery.k8s.io,namespace=default,resources=endpointslices,resourceNames=kubernetes,verbs=get
+// +kubebuilder:rbac:groups=networking.k8s.io,resources=servicecidrs,verbs=list
 
 func (r *NodeReconciler) podNamespace(role string) string {
 	if role == v1.RoleWorker && r.WorkerNamespace != "" {
@@ -84,7 +91,10 @@ func (r *NodeReconciler) Reconcile(ctx context.Context, req ctrl.Request) (res c
 	}()
 	var n v1.AerolNode
 	if err := r.Get(ctx, req.NamespacedName, &n); err != nil {
-		return ctrl.Result{}, client.IgnoreNotFound(err)
+		if apierrors.IsNotFound(err) {
+			return ctrl.Result{}, r.sweepGone(ctx, req.Name)
+		}
+		return ctrl.Result{}, err
 	}
 	if n.DeletionTimestamp != nil {
 		return ctrl.Result{}, r.cleanup(ctx, &n)
@@ -207,11 +217,23 @@ func (r *NodeReconciler) createPod(ctx context.Context, c *v1.AerolCluster, n *v
 	bootstrap := n.Spec.Role == v1.RoleServer && n.Name == ServerName(c.Name, 0) &&
 		!meta.IsStatusConditionTrue(c.Status.Conditions, CondBootstrapped)
 	ns := r.podNamespace(n.Spec.Role)
-	if !bootstrap {
+	maint := n.Spec.Role == v1.RoleServer && n.Annotations[v1.AnnotationMaintenance] == "true"
+	// A maintenance pod runs no setup, so it needs no token: it is how a
+	// cluster that lost quorum is repaired, when no token can be minted.
+	if !bootstrap && !maint {
 		if err := r.ensureJoinSecret(ctx, c, n, ns, api); err != nil {
 			joinTokenErrors.Inc()
-			r.setState(n, v1.StatePending, "waiting for a join token: "+err.Error())
-			return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+			if n.Spec.Role != v1.RoleServer {
+				r.setState(n, v1.StatePending, "waiting for a join token: "+err.Error())
+				return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+			}
+			// Minting needs a leader. A server pod made again (moved, or
+			// its pod lost) keeps its identity on its disk, and its setup
+			// then needs no token: waiting here would keep a cluster that
+			// lost two of three servers from ever getting them back. The
+			// token volume is optional for servers; one that has no
+			// identity waits in setup until observe can mint it a token.
+			log.FromContext(ctx).Info("no join token for a server; making its pod without one", "node", n.Name, "error", err.Error())
 		}
 	}
 	t, err := r.template(ctx, n.Spec.Role)
@@ -219,8 +241,15 @@ func (r *NodeReconciler) createPod(ctx context.Context, c *v1.AerolCluster, n *v
 		r.setState(n, v1.StateFailed, err.Error())
 		return ctrl.Result{RequeueAfter: time.Minute}, nil
 	}
-	in := StampInput{Cluster: c, Node: n, Namespace: ns, Version: c.Spec.Version, Bootstrap: bootstrap,
-		Maintenance: n.Spec.Role == v1.RoleServer && n.Annotations[v1.AnnotationMaintenance] == "true"}
+	// The version last ordered for this node (its rollout turn), else the
+	// cluster's: a pod made again during an upgrade, before its turn, keeps
+	// its version, so swapAgent never moves it back down and the leader's
+	// order holds. A node new to the cluster has no turn and takes the target.
+	version := c.Spec.Version
+	if v := n.Annotations[AnnotationAgentVersion]; v != "" {
+		version = v
+	}
+	in := StampInput{Cluster: c, Node: n, Namespace: ns, Version: version, Bootstrap: bootstrap, Maintenance: maint}
 	if n.Spec.Role == v1.RoleServer {
 		in.PVC = PVCName(n.Name)
 	}
@@ -230,6 +259,7 @@ func (r *NodeReconciler) createPod(ctx context.Context, c *v1.AerolCluster, n *v
 			r.setState(n, v1.StateFailed, "pool "+n.Spec.Pool+" is not in the AerolCluster")
 			return ctrl.Result{}, nil
 		}
+		in.Addresses = readClusterAddresses(ctx, r.apiReader(), r.Client)
 	}
 	pod, err := Stamp(t, in)
 	if err != nil {
@@ -305,6 +335,14 @@ func (r *NodeReconciler) ensureJoinSecret(ctx context.Context, c *v1.AerolCluste
 // observe sets the node's state from its pod and from AerolVM.
 func (r *NodeReconciler) observe(ctx context.Context, c *v1.AerolCluster, n *v1.AerolNode, pod *corev1.Pod, api AerolAPI) (ctrl.Result, error) {
 	n.Status.PodName, n.Status.NodeName = pod.Name, pod.Spec.NodeName
+	if n.Spec.Role == v1.RoleServer && setupHasFailed(pod) {
+		// A server made without a token (createPod) whose disk held no
+		// identity: mint one now that a leader may be back. The kubelet
+		// puts it in the pod's optional volume before setup's next try.
+		if err := r.ensureJoinSecret(ctx, c, n, pod.Namespace, api); err != nil {
+			joinTokenErrors.Inc()
+		}
+	}
 	if why := preflightFailed(pod); why != "" {
 		// The machine is wrong, not the pod: a new pod would only land on
 		// a machine like it. This one stays, holding its machine out of
@@ -354,9 +392,13 @@ func (r *NodeReconciler) observe(ctx context.Context, c *v1.AerolCluster, n *v1.
 		r.setState(n, v1.StateServing, "")
 	}
 	if n.Status.State == v1.StateServing {
-		// The token was single use and is spent.
-		_ = client.IgnoreNotFound(r.Delete(ctx, &corev1.Secret{ObjectMeta: metav1.ObjectMeta{
-			Name: JoinSecret(n.Name), Namespace: r.podNamespace(n.Spec.Role)}}))
+		// The token was single use and is spent. Deleted once: the cached
+		// read keeps every later pass, on every serving node, from sending
+		// the API server a delete that only finds nothing.
+		var s corev1.Secret
+		if err := r.Get(ctx, types.NamespacedName{Name: JoinSecret(n.Name), Namespace: r.podNamespace(n.Spec.Role)}, &s); err == nil {
+			_ = client.IgnoreNotFound(r.Delete(ctx, &s))
+		}
 	}
 	if r.now().Sub(n.Status.LastUpdated.Time) >= statusEvery {
 		n.Status.Version = node.Version
@@ -416,6 +458,22 @@ func preflightFailed(pod *corev1.Pod) string {
 		return msg
 	}
 	return ""
+}
+
+// setupHasFailed reports that the pod's setup container has exited with
+// an error at least once.
+func setupHasFailed(pod *corev1.Pod) bool {
+	for _, cs := range pod.Status.InitContainerStatuses {
+		if cs.Name != SetupContainer {
+			continue
+		}
+		for _, t := range []*corev1.ContainerStateTerminated{cs.State.Terminated, cs.LastTerminationState.Terminated} {
+			if t != nil && t.ExitCode != 0 {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // setupFailing names why the pod cannot start: its setup container keeps
@@ -572,6 +630,51 @@ func (r *NodeReconciler) cleanup(ctx context.Context, n *v1.AerolNode) error {
 		return err
 	}
 	return client.IgnoreNotFound(r.Delete(ctx, &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: JoinSecret(n.Name), Namespace: ns}}))
+}
+
+// sweepGone removes a deleted worker AerolNode's pod and join Secret. They
+// live in the worker namespace, where no owner reference reaches (an owner
+// must share its namespace), so the garbage collector never takes them.
+// No finalizer: helm uninstall deletes the operator and the AerolCluster at
+// once, and a finalizer would then hold every AerolNode's deletion forever.
+// The pod watch maps each worker pod back here when the operator starts,
+// so a node deleted while it was down is swept then.
+func (r *NodeReconciler) sweepGone(ctx context.Context, name string) error {
+	ns := r.WorkerNamespace
+	if ns == "" || ns == r.Namespace {
+		return nil // owner references take them
+	}
+	var pod corev1.Pod
+	podLeft := r.Get(ctx, types.NamespacedName{Namespace: ns, Name: name}, &pod) == nil &&
+		pod.Labels[LabelNode] == name && pod.DeletionTimestamp == nil
+	var secret corev1.Secret
+	secretLeft := r.Get(ctx, types.NamespacedName{Namespace: ns, Name: JoinSecret(name)}, &secret) == nil
+	if !podLeft && !secretLeft {
+		return nil // the usual case: costs no API call
+	}
+	// The cache can be behind: only the API server may say the node is gone.
+	if err := r.apiReader().Get(ctx, types.NamespacedName{Namespace: r.Namespace, Name: name}, &v1.AerolNode{}); !apierrors.IsNotFound(err) {
+		return err
+	}
+	if podLeft {
+		uid := pod.UID
+		if err := client.IgnoreNotFound(r.Delete(ctx, &pod, client.Preconditions{UID: &uid})); err != nil {
+			return err
+		}
+		log.FromContext(ctx).Info("removed the pod of a deleted AerolNode", "pod", ns+"/"+name)
+	}
+	if secretLeft {
+		return client.IgnoreNotFound(r.Delete(ctx, &secret))
+	}
+	return nil
+}
+
+// apiReader reads straight from the API server (see Reader).
+func (r *NodeReconciler) apiReader() client.Reader {
+	if r.Reader != nil {
+		return r.Reader
+	}
+	return r.Client
 }
 
 // SetupWithManager registers the controller and maps pods and Nodes back

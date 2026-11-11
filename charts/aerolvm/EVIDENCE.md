@@ -51,8 +51,10 @@ The operator's Kubernetes rights, all named in the chart's
   Services, ConfigMaps and volume claims (to make and replace AerolVM's pods,
   hand each pod its join token, and keep each server's disk); Events; leader
   election leases; its own `AerolCluster` and `AerolNode` objects.
-- **Across the cluster:** read Nodes; read Karpenter NodeClaims, and delete one
-  to give back a machine it has emptied.
+- **Across the cluster:** read Nodes; list ServiceCIDRs; read Karpenter
+  NodeClaims, and delete one to give back a machine it has emptied.
+- **In `default`:** read the `kubernetes` Service and its EndpointSlice, by
+  name, to keep sandboxes away from the API server.
 - **Not:** `pods/exec`, any other namespace, cluster roles, TokenReview, or
   anything in cert-manager.
 
@@ -139,7 +141,7 @@ sets it is refused with a reason.
 | Prometheus | Workers | The metrics port only, from the namespace you name | Same |
 | Anything else | Workers | Nothing | Same |
 | Workers | AerolVM pods, cluster DNS, the internet | Only these, never a private range | NetworkPolicy `<release>-worker-egress` |
-| Sandboxes | Your network, other pods, the Kubernetes API, the worker's own ports | Nothing, unless a create opens one internal range on purpose | AerolVM's own firewall in each worker, then the egress NetworkPolicy around the whole pod |
+| Sandboxes | Your network, other pods, the Kubernetes API, the worker's own ports | Nothing, unless a create opens one internal range on purpose. The API server can never be opened: the operator puts its addresses on every new worker's deny floor, and the cluster's pod and Service ranges in its closed-by-default list | AerolVM's own firewall in each worker, then the egress NetworkPolicy around the whole pod |
 | Sandboxes | The cloud metadata service | Never | AerolVM's firewall, the egress NetworkPolicy, and the machine's IMDS hop limit of 1 |
 
 NetworkPolicies need a network plugin that enforces them (on EKS: the VPC CNI

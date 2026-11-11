@@ -16,6 +16,7 @@ import (
 	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"sigs.k8s.io/yaml"
 
 	dto "github.com/prometheus/client_model/go"
@@ -140,7 +141,8 @@ func templates(t *testing.T) *corev1.ConfigMap {
 	t.Helper()
 	agent := corev1.Container{
 		Name: AgentContainer, Image: "ghcr.io/aerol-ai/aerolvm:v0.7.1",
-		Env:          []corev1.EnvVar{{Name: "SB_API_PORT", Value: "21212"}, {Name: "SB_NODE_ROLE", Value: "single"}},
+		Env: []corev1.EnvVar{{Name: "SB_API_PORT", Value: "21212"}, {Name: "SB_NODE_ROLE", Value: "single"},
+			{Name: "SB_ENABLE_NETWORK_RULES", Value: "true"}, {Name: "SB_EGRESS_BLOCK_PRIVATE_BY_DEFAULT", Value: "true"}},
 		VolumeMounts: []corev1.VolumeMount{{Name: EtcVolume, MountPath: "/etc/sandboxd"}, {Name: StateVolume, MountPath: "/var/lib/sandboxd"}},
 		Resources: corev1.ResourceRequirements{Limits: corev1.ResourceList{
 			corev1.ResourceCPU: resource.MustParse("1"), corev1.ResourceMemory: resource.MustParse("1Gi")}},
@@ -196,4 +198,10 @@ func testutilCounter(c interface{ Write(*dto.Metric) error }) float64 {
 	var m dto.Metric
 	_ = c.Write(&m)
 	return m.GetCounter().GetValue()
+}
+
+// newFakeClientWith is newFakeClient with calls intercepted, for failures.
+func newFakeClientWith(t *testing.T, funcs interceptor.Funcs, objs ...client.Object) client.Client {
+	t.Helper()
+	return fake.NewClientBuilder().WithScheme(testScheme(t)).WithObjects(objs...).WithInterceptorFuncs(funcs).Build()
 }

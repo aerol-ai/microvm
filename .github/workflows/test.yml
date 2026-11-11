@@ -819,14 +819,9 @@ jobs:
             -run '^(TestEveryCaseThatStopsSandboxdWaitsForTheRejoin|TestTheRejoinWaitIsWiredEndToEnd|TestDisruptiveCasesChooseANonSeedVictim|TestParseMachineConfigRealScenarios)$' \
             ./integration-tests/suite/
 
-  # The Helm chart in single mode on kind (plans/kubernetes-v2-architecture.md,
-  # Phase 1 exit): lint and render it, build the images from this checkout,
-  # install it, use a runc and a gVisor sandbox through the API, and delete
-  # the worker pod with them running (finding F8). Advisory, like the other
-  # heavy suites; it runs only when the chart, the images or the supervisor
-  # change.
-  # The operator (plans/kubernetes-v2-architecture.md P2): vet and race
-  # tests, then the chart's cluster-mode pod templates, rendered by Helm,
+  # The operator (plans/kubernetes-v2-architecture.md P2): generated files
+  # up to date, vet and race tests (the chart's RBAC grants what the
+  # markers ask), then the chart's cluster-mode pod templates, rendered by Helm,
   # parsed strictly and stamped for every role, so the chart and the
   # operator agree on container and volume names.
   operator-tests:
@@ -851,17 +846,39 @@ jobs:
           tar -xzf helm.tgz linux-amd64/helm
           sudo install -m 0755 linux-amd64/helm /usr/local/bin/helm
 
-      - name: Render the chart's pod templates
-        run: scripts/chart-pod-templates.sh > "$RUNNER_TEMP/pod-templates.yaml"
+      - name: Render the chart's pod templates and operator RBAC
+        run: |
+          scripts/chart-pod-templates.sh > "$RUNNER_TEMP/pod-templates.yaml"
+          helm template t charts/aerolvm --namespace aerolvm-system \
+            --set mode=cluster --set 'cluster.zones={z-a,z-b,z-c}' \
+            --set 'cluster.workerPools[0].name=general' \
+            --set 'cluster.workerPools[0].machine.cpu=8' --set 'cluster.workerPools[0].machine.memoryGiB=32' \
+            --set 'cluster.workerPools[0].minWorkers=3' --set 'cluster.workerPools[0].maxWorkers=9' \
+            --show-only templates/operator.yaml > "$RUNNER_TEMP/chart-operator.yaml"
+
+      # The CRDs, deep copies and RBAC are generated from the Go types and
+      # markers; a stale copy fails here, not on a live cluster.
+      - name: Generated files are up to date
+        working-directory: operator
+        run: |
+          go generate ./api/...
+          git diff --exit-code -- . ../charts/aerolvm/crds
 
       - name: Vet and test the operator
         working-directory: operator
         env:
           AEROLVM_POD_TEMPLATES: ${{ runner.temp }}/pod-templates.yaml
+          AEROLVM_CHART_OPERATOR: ${{ runner.temp }}/chart-operator.yaml
         run: |
           go vet ./...
           go test -race -count=1 -cover ./...
 
+  # The Helm chart in single mode on kind (plans/kubernetes-v2-architecture.md,
+  # Phase 1 exit): lint and render it, build the images from this checkout,
+  # install it, use a runc and a gVisor sandbox through the API, and delete
+  # the worker pod with them running (finding F8). Advisory, like the other
+  # heavy suites; it runs only when the chart, the images or the supervisor
+  # change.
   kubernetes:
     needs: paths
     if: needs.paths.outputs.kubernetes == 'true'

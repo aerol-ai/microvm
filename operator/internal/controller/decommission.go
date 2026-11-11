@@ -35,6 +35,9 @@ import (
 
 var nodeClaimGVK = schema.GroupVersionKind{Group: "karpenter.sh", Version: "v1", Kind: "NodeClaim"}
 
+// karpenterNodePoolLabel is on every Node Karpenter launches.
+const karpenterNodePoolLabel = "karpenter.sh/nodepool"
+
 // decommissionTriggers starts a decommission when the worker's machine is
 // cordoned or its NodeClaim drifted.
 func (r *NodeReconciler) decommissionTriggers(ctx context.Context, c *v1.AerolCluster, n *v1.AerolNode, pod *corev1.Pod) (ctrl.Result, bool, error) {
@@ -49,7 +52,7 @@ func (r *NodeReconciler) decommissionTriggers(ctx context.Context, c *v1.AerolCl
 	switch {
 	case node.Spec.Unschedulable:
 		why = "its machine " + node.Name + " was cordoned"
-	case r.nodeClaimDrifted(ctx, node.Name):
+	case r.nodeClaimDrifted(ctx, &node):
 		why = "its machine " + node.Name + " drifted (Karpenter)"
 	}
 	if why == "" {
@@ -71,8 +74,14 @@ func (r *NodeReconciler) decommissionTriggers(ctx context.Context, c *v1.AerolCl
 
 // nodeClaimDrifted reports whether node's Karpenter NodeClaim has
 // Drifted=True. No Karpenter, no NodeClaim: false.
-func (r *NodeReconciler) nodeClaimDrifted(ctx context.Context, node string) bool {
-	nc := r.nodeClaim(ctx, node)
+func (r *NodeReconciler) nodeClaimDrifted(ctx context.Context, node *corev1.Node) bool {
+	// Only a machine Karpenter made has a NodeClaim; it labels each one
+	// with its NodePool. Others never cost a NodeClaim read, and a cluster
+	// without Karpenter never starts a NodeClaim informer.
+	if node.Labels[karpenterNodePoolLabel] == "" {
+		return false
+	}
+	nc := r.nodeClaim(ctx, node.Name)
 	if nc == nil {
 		return false
 	}

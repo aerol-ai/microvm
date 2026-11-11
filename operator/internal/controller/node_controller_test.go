@@ -15,6 +15,7 @@ import (
 	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	v1 "github.com/aerol-ai/microvm/operator/api/v1alpha1"
 	"github.com/aerol-ai/microvm/operator/internal/aerolapi"
@@ -174,6 +175,22 @@ func TestNodeWorkerJoinsWithItsOwnToken(t *testing.T) {
 	if err := g.cl.Get(context.Background(), types.NamespacedName{Namespace: testWorkerNS, Name: "prod-general-aaaaa-join"}, &s); !apierrors.IsNotFound(err) {
 		t.Fatalf("join secret after serving: %v", err)
 	}
+	// Spent once: later passes over a serving node send no delete at all
+	// (at 2,000 nodes that is a delete per node per pass).
+	deletes := 0
+	g.r.Client = interceptor.NewClient(g.cl.(client.WithWatch), interceptor.Funcs{
+		Delete: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+			if _, ok := obj.(*corev1.Secret); ok {
+				deletes++
+			}
+			return c.Delete(ctx, obj, opts...)
+		},
+	})
+	g.reconcile("prod-general-aaaaa")
+	if deletes != 0 {
+		t.Fatalf("%d Secret deletes on a pass after the token was spent", deletes)
+	}
+	g.r.Client = g.cl
 	// Cordoned in AerolVM: draining.
 	g.api.nodes["prod-general-aaaaa"] = aerolapi.Node{Alive: true, Drained: true}
 	g.reconcile("prod-general-aaaaa")
@@ -395,6 +412,68 @@ func TestNodeCleanupAcrossNamespaces(t *testing.T) {
 	}
 }
 
+// A worker AerolNode deleted outright (no finalizer held it): its pod and
+// join Secret in the worker namespace, where no owner reference reaches,
+// go with it. Pods of nodes that still exist are left alone, even while
+// the cache has not seen them yet.
+func TestNodeSweepsAGoneWorker(t *testing.T) {
+	c := bootstrapped(testCluster())
+	n := node("prod-general-hhhhh", v1.RoleWorker, "general", "z-a")
+	g := newNodeRig(t, c, n)
+	g.reconcile(n.Name)
+	if g.pod(testWorkerNS, n.Name) == nil {
+		t.Fatal("no pod")
+	}
+	var s corev1.Secret
+	if err := g.cl.Get(context.Background(), types.NamespacedName{Namespace: testWorkerNS, Name: JoinSecret(n.Name)}, &s); err != nil {
+		t.Fatal(err)
+	}
+
+	// The cache does not have the node yet; the API server does.
+	behind := newFakeClient(t)
+	g.r.Client = interceptor.NewClient(g.cl.(client.WithWatch), interceptor.Funcs{
+		Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			if _, ok := obj.(*v1.AerolNode); ok {
+				return behind.Get(ctx, key, obj, opts...)
+			}
+			return c.Get(ctx, key, obj, opts...)
+		},
+	})
+	g.r.Reader = g.cl
+	g.reconcile(n.Name)
+	if g.pod(testWorkerNS, n.Name) == nil {
+		t.Fatal("a live node's pod was swept on a stale cache")
+	}
+	g.r.Client, g.r.Reader = g.cl, nil
+
+	if err := g.cl.Delete(context.Background(), g.node(n.Name)); err != nil {
+		t.Fatal(err)
+	}
+	g.reconcile(n.Name)
+	if g.pod(testWorkerNS, n.Name) != nil {
+		t.Fatal("worker pod left behind")
+	}
+	if err := g.cl.Get(context.Background(), types.NamespacedName{Namespace: testWorkerNS, Name: JoinSecret(n.Name)}, &s); !apierrors.IsNotFound(err) {
+		t.Fatalf("join secret left behind: %v", err)
+	}
+	g.reconcile(n.Name) // nothing left: a no-op
+
+	// A pod by that name that is not this node's is not touched.
+	other := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "prod-general-iiiii", Namespace: testWorkerNS}}
+	if err := g.cl.Create(context.Background(), other); err != nil {
+		t.Fatal(err)
+	}
+	g.reconcile("prod-general-iiiii")
+	if g.pod(testWorkerNS, "prod-general-iiiii") == nil {
+		t.Fatal("swept a pod the operator did not make")
+	}
+	// One namespace: owner references do it.
+	g.r.WorkerNamespace = testNS
+	if err := g.r.sweepGone(context.Background(), "x"); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestDecommissionDefaultsAndDrift(t *testing.T) {
 	if drainWindow(nil) != defaultDrainWindow || drainWindow(&v1.WorkerPoolSpec{Provisioner: "eks-managed"}) != eksManagedDrain {
 		t.Fatal("drain window defaults")
@@ -404,7 +483,9 @@ func TestDecommissionDefaultsAndDrift(t *testing.T) {
 	}
 	c := bootstrapped(testCluster())
 	n := node("prod-general-ggggg", v1.RoleWorker, "general", "z-a")
-	g := newNodeRig(t, c, n, machine("m7"))
+	m7 := machine("m7")
+	m7.Labels[karpenterNodePoolLabel] = "general"
+	g := newNodeRig(t, c, n, m7)
 	nc := &unstructured.Unstructured{}
 	nc.SetGroupVersionKind(nodeClaimGVK)
 	nc.SetName("nc-1")
@@ -413,9 +494,26 @@ func TestDecommissionDefaultsAndDrift(t *testing.T) {
 	if err := g.cl.Create(context.Background(), nc); err != nil {
 		t.Skipf("the fake client cannot hold a NodeClaim: %v", err)
 	}
-	if !g.r.nodeClaimDrifted(context.Background(), "m7") || g.r.nodeClaimDrifted(context.Background(), "m8") {
+	m8 := machine("m8")
+	m8.Labels[karpenterNodePoolLabel] = "general"
+	if !g.r.nodeClaimDrifted(context.Background(), m7) || g.r.nodeClaimDrifted(context.Background(), m8) {
 		t.Fatal("drift not read")
 	}
+	// A machine Karpenter did not make (no NodePool label) has no NodeClaim:
+	// it is not read, even when one names it.
+	reads := 0
+	g.r.Client = interceptor.NewClient(g.cl.(client.WithWatch), interceptor.Funcs{
+		List: func(ctx context.Context, c client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+			if _, ok := list.(*unstructured.UnstructuredList); ok {
+				reads++
+			}
+			return c.List(ctx, list, opts...)
+		},
+	})
+	if g.r.nodeClaimDrifted(context.Background(), machine("m7")) || reads != 0 {
+		t.Fatalf("an unlabeled machine read NodeClaims (%d reads)", reads)
+	}
+	g.r.Client = g.cl
 	g.r.retireMachine(context.Background(), "m7")
 	if g.r.nodeClaim(context.Background(), "m7") != nil {
 		t.Fatal("NodeClaim not deleted")
@@ -490,5 +588,100 @@ func TestPreflightFailedReason(t *testing.T) {
 				t.Fatalf("got %q, want %q", got, tc.want)
 			}
 		})
+	}
+}
+
+// Without a leader no join token can be minted. A server pod made again
+// keeps its identity on its disk, so it is made without one (its token
+// volume optional); a worker waits for its token. The maintenance pod, how
+// a cluster that lost quorum is repaired, never needs one.
+func TestNodeServersComeBackWithoutQuorum(t *testing.T) {
+	c := bootstrapped(testCluster())
+	srv, wrk := node("prod-server-1", v1.RoleServer, "", "z-b"), node("prod-general-eeeee", v1.RoleWorker, "general", "z-a")
+	g := newNodeRig(t, c, srv, wrk, machine("m1"))
+	g.api.mintErr = errors.New("no leader")
+
+	g.reconcile(srv.Name)
+	p := g.pod(testNS, srv.Name)
+	if p == nil {
+		t.Fatal("a server pod was not made without a token")
+	}
+	var join *corev1.SecretVolumeSource
+	for _, v := range p.Spec.Volumes {
+		if v.Name == JoinVolume {
+			join = v.Secret
+		}
+	}
+	if join == nil || join.Optional == nil || !*join.Optional {
+		t.Fatalf("server join volume = %+v, want optional", join)
+	}
+	g.reconcile(wrk.Name)
+	if g.pod(testWorkerNS, wrk.Name) != nil || g.node(wrk.Name).Status.State != v1.StatePending {
+		t.Fatalf("a worker was made without a token: %+v", g.node(wrk.Name).Status)
+	}
+
+	// Its setup failed (no identity on the disk): a token is minted once a
+	// leader is back, for the optional volume.
+	p.Spec.NodeName = "m1"
+	if err := g.cl.Update(context.Background(), p); err != nil {
+		t.Fatal(err)
+	}
+	p.Status.InitContainerStatuses = []corev1.ContainerStatus{{Name: SetupContainer,
+		LastTerminationState: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 2}},
+		State:                corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: "CrashLoopBackOff"}}}}
+	if err := g.cl.Status().Update(context.Background(), p); err != nil {
+		t.Fatal(err)
+	}
+	g.reconcile(srv.Name) // still no leader: nothing to mint, no error
+	var s corev1.Secret
+	if err := g.cl.Get(context.Background(), types.NamespacedName{Namespace: testNS, Name: JoinSecret(srv.Name)}, &s); !apierrors.IsNotFound(err) {
+		t.Fatalf("a token without a leader: %v", err)
+	}
+	g.api.mintErr = nil
+	g.reconcile(srv.Name)
+	if err := g.cl.Get(context.Background(), types.NamespacedName{Namespace: testNS, Name: JoinSecret(srv.Name)}, &s); err != nil {
+		t.Fatalf("no token minted once a leader is back: %v", err)
+	}
+}
+
+func TestNodeMaintenanceWithoutQuorum(t *testing.T) {
+	c := bootstrapped(testCluster())
+	n := node("prod-server-2", v1.RoleServer, "", "z-c")
+	n.Annotations = map[string]string{v1.AnnotationMaintenance: "true"}
+	g := newNodeRig(t, c, n)
+	g.api.mintErr = errors.New("no leader")
+	g.reconcile(n.Name)
+	p := g.pod(testNS, n.Name)
+	if p == nil || p.Labels[v1.AnnotationMaintenance] != "true" || len(p.Spec.InitContainers) != 0 {
+		t.Fatalf("held pod without a leader = %+v", p)
+	}
+}
+
+// A pod made again during an upgrade keeps the version last ordered for its
+// node, so the image swap that follows never moves it back down; a node
+// with no turn yet takes spec.version.
+func TestNodePodMadeAgainKeepsItsVersion(t *testing.T) {
+	c := bootstrapped(testCluster()) // spec.version v0.7.2
+	held := node("prod-general-fffff", v1.RoleWorker, "general", "z-a")
+	held.Annotations = map[string]string{AnnotationAgentVersion: "v0.7.1"}
+	fresh := node("prod-general-ggggg", v1.RoleWorker, "general", "z-b")
+	g := newNodeRig(t, c, held, fresh, machine("m1"))
+	g.reconcile(held.Name)
+	g.reconcile(fresh.Name)
+	image := func(name string) string {
+		p := g.pod(testWorkerNS, name)
+		return p.Spec.Containers[containerIndex(p.Spec.Containers, AgentContainer)].Image
+	}
+	if got := image(held.Name); got != "registry.example/aerol/aerolvm:v0.7.1" {
+		t.Fatalf("pod made before its turn runs %s", got)
+	}
+	if got := image(fresh.Name); got != "registry.example/aerol/aerolvm:v0.7.2" {
+		t.Fatalf("a new node runs %s", got)
+	}
+	p := g.pod(testWorkerNS, held.Name)
+	g.running(p, "m1", false)
+	g.reconcile(held.Name) // swapAgent with the same version: no patch back
+	if got := image(held.Name); got != "registry.example/aerol/aerolvm:v0.7.1" || g.node(held.Name).Status.State == v1.StateRestarting {
+		t.Fatalf("swapped to %s, state %s", got, g.node(held.Name).Status.State)
 	}
 }

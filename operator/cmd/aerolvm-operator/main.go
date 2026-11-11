@@ -95,6 +95,10 @@ func run(args []string) error {
 		LeaderElection:         o.leaderElect,
 		LeaderElectionID:       "aerolvm-operator.aerolvm.io",
 		Cache:                  cache.Options{DefaultNamespaces: namespaces},
+		// Karpenter's NodeClaims are read untyped (no Karpenter Go module
+		// here); cached like everything else, so a worker pass reads the
+		// informer, not the API server.
+		Client: client.Options{Cache: &client.CacheOptions{Unstructured: true}},
 	})
 	if err != nil {
 		return err
@@ -112,6 +116,7 @@ func run(args []string) error {
 	if err := (&controller.NodeReconciler{
 		Client: mgr.GetClient(), Scheme: scheme, Recorder: rec,
 		Namespace: o.namespace, WorkerNamespace: o.workerNamespace, Templates: o.templates,
+		Reader: mgr.GetAPIReader(),
 	}).SetupWithManager(mgr); err != nil {
 		return err
 	}

@@ -164,6 +164,9 @@ type StampInput struct {
 	Pool *v1.WorkerPoolSpec
 	// PVC is a server's volume claim.
 	PVC string
+	// Addresses are the cluster's own, kept from sandboxes (C24): a
+	// worker's only.
+	Addresses clusterAddresses
 }
 
 // Stamp makes node's pod from its role's template.
@@ -247,6 +250,7 @@ func Stamp(t corev1.PodTemplateSpec, in StampInput) (*corev1.Pod, error) {
 	addCreatePolicy(&pod.Spec, in.Cluster)
 	if n.Spec.Role == v1.RoleWorker && in.Pool != nil {
 		setPoolRuntimes(&pod.Spec, in.Pool.Runtimes)
+		setEgressRanges(&pod.Spec, in.Addresses)
 	}
 	if in.Maintenance {
 		holdServer(&pod.Spec)
@@ -324,8 +328,11 @@ func addSetup(spec *corev1.PodSpec, in StampInput) {
 		// By key, so the pod gets exactly the three things a join needs,
 		// and aerolvm k8s verify can see that (it cannot read Secrets).
 		spec.Volumes = append(spec.Volumes, corev1.Volume{Name: JoinVolume, VolumeSource: corev1.VolumeSource{
+			// Optional for a server: one made again keeps its identity on
+			// its disk and its setup needs no token (createPod).
 			Secret: &corev1.SecretVolumeSource{SecretName: JoinSecret(n.Name), DefaultMode: ptr[int32](0o400),
-				Items: []corev1.KeyToPath{{Key: "join_url", Path: "join_url"}, {Key: "token", Path: "token"}, {Key: "ca_cert_hash", Path: "ca_cert_hash"}}},
+				Optional: ptr(n.Spec.Role == v1.RoleServer),
+				Items:    []corev1.KeyToPath{{Key: "join_url", Path: "join_url"}, {Key: "token", Path: "token"}, {Key: "ca_cert_hash", Path: "ca_cert_hash"}}},
 		}})
 	}
 	setup := corev1.Container{

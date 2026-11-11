@@ -60,8 +60,11 @@ worker:
   usageMetrics:
     enabled: true
   # The cluster's own addresses (C24). Each entry is an address or a CIDR.
-  # In cluster mode the operator fills these in (Phase 2); in single mode
-  # you set them. Empty by default because the chart cannot know them.
+  # In cluster mode the operator adds the API server to the first and the
+  # pod and Service ranges to the second, for every new worker; you add
+  # only what the API cannot tell it, such as node ranges outside the
+  # private ranges. In single mode you set both. Empty by default because
+  # the chart cannot know them.
   #
   # egressDenyFloor: addresses no sandbox can ever reach, whatever its
   # egress profile says. Put the Kubernetes API server here: its Service
