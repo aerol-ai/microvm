@@ -89,6 +89,37 @@ func TestParseFull(t *testing.T) {
 	}
 }
 
+// TestDenyFloorCarriesTheNodeFloor (C24): the node's extra deny floor (the
+// Kubernetes API server) is on every floor this package hands out, file or
+// no file, after the file's deny_cidrs and the metadata endpoints.
+func TestDenyFloorCarriesTheNodeFloor(t *testing.T) {
+	prevFloor, prevPrivate := egresspolicy.ExtraDenyFloor(), egresspolicy.ExtraPrivateRanges()
+	t.Cleanup(func() { egresspolicy.SetRanges(prevFloor, prevPrivate) })
+	api := netip.MustParsePrefix("10.96.0.1/32")
+	egresspolicy.SetRanges([]netip.Prefix{api}, nil)
+	op, err := Parse([]byte("version: 1\ndeny_cidrs: [10.99.0.0/16]\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	withFile := append(append([]netip.Prefix{netip.MustParsePrefix("10.99.0.0/16")}, egresspolicy.MetadataPrefixes...), api)
+	noFile := append(slices.Clone(egresspolicy.MetadataPrefixes), api)
+	for _, tc := range []struct {
+		name string
+		got  []netip.Prefix
+		want []netip.Prefix
+	}{
+		{"file", op.DenyFloor(), withFile},
+		{"file guard", op.Guard().DenyFloor, withFile},
+		{"file isolate guard", op.IsolateGuard().DenyFloor, withFile},
+		{"no file", (*Operator)(nil).DenyFloor(), noFile},
+		{"no file isolate guard", (*Operator)(nil).IsolateGuard().DenyFloor, noFile},
+	} {
+		if !slices.Equal(tc.got, tc.want) {
+			t.Errorf("%s: floor = %v, want %v", tc.name, tc.got, tc.want)
+		}
+	}
+}
+
 func TestNilOperatorDefaults(t *testing.T) {
 	var op *Operator
 	if op.DefaultMode() != ModeOpen || !op.NodeControlPortGuard() || !op.BuiltinProfiles() {
