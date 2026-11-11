@@ -237,6 +237,9 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 	configureAOCRPullAuth(logger, cfg, models.ContainerEngineDocker, dockerClient)
 
 	caddyClient := caddy.New(cfg)
+	if cfg.EnableCaddy && cfg.TLSCertWatchFile != "" {
+		go watchTLSCertificate(ctx, cfg.TLSCertWatchFile, caddyClient.ReloadCertificates, logger)
+	}
 
 	mountManager, err := mounts.New(logger, mounts.Config{
 		RootDir:     cfg.MountsRootPath,

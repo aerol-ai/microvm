@@ -383,6 +383,11 @@ type Config struct {
 	// TLSIssuer selects the on-demand policy's issuer (SB_TLS_ISSUER):
 	// "acme" (default) or "internal", Caddy's own CA, for labs.
 	TLSIssuer string
+	// TLSCertWatchFile is a certificate Caddy loads from a file, watched for
+	// changes so Caddy reloads it (SB_TLS_CERT_WATCH_FILE). On Kubernetes,
+	// cert-manager renews the sandbox-link wildcard into a mounted Secret
+	// and Caddy does not watch files (C25). Empty: no watch.
+	TLSCertWatchFile string
 	// ACMEDaemonBudgetFraction is the high-water mark on the daemon-wide
 	// ACME issuance bucket — when usage crosses this fraction of Let's
 	// Encrypt's published `new-orders` limit (300 / 3h), TLSAsk returns
@@ -2245,6 +2250,7 @@ func load(keyTool bool) (Config, error) {
 		TLSACMECA:                         strings.TrimSpace(getEnv("SB_TLS_ACME_CA", "")),
 		TLSACMECARoot:                     strings.TrimSpace(getEnv("SB_TLS_ACME_CA_ROOT", "")),
 		TLSIssuer:                         strings.ToLower(strings.TrimSpace(getEnv("SB_TLS_ISSUER", TLSIssuerACME))),
+		TLSCertWatchFile:                  strings.TrimSpace(os.Getenv("SB_TLS_CERT_WATCH_FILE")),
 		ACMEDaemonBudgetFraction:          getEnvFloat("SB_ACME_DAEMON_BUDGET_FRACTION", 0.8),
 		ACMEDaemonBudgetWindow:            getEnvDuration("SB_ACME_DAEMON_BUDGET_WINDOW", 3*time.Hour),
 		ACMEDaemonBudgetCapacity:          getEnvInt("SB_ACME_DAEMON_BUDGET_CAPACITY", 300),
