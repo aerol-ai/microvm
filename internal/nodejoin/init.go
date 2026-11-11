@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"net"
 	"os"
 	"path/filepath"
@@ -166,6 +167,12 @@ type InitOptions struct {
 	WaitTimeout  time.Duration
 	MinFreeBytes uint64
 	InstallerURL string
+	// FilesOnly writes the cluster's files and stops (finding F14): no
+	// root check, no systemd drop-in, no restart. It is for a machine with
+	// no systemd, such as a Kubernetes pod's init container, whose sandboxd
+	// loads cluster.env itself. Run init again without it once that
+	// sandboxd is up, to admit this node and register the join tokens.
+	FilesOnly bool
 }
 
 // Initer starts a cluster on this machine.
@@ -196,7 +203,11 @@ type InitResult struct {
 // changes no file and no key: it checks sandboxd leads, registers the
 // tokens again (the cluster answers the stored rows) and prints the same.
 func (in *Initer) Run(ctx context.Context, o InitOptions) (InitResult, error) {
-	if !in.Host.IsRoot() {
+	// Root writes a machine's system files. A files-only run writes to
+	// folders its user owns, and a re-run writes no cluster file, so
+	// neither needs it; a user who cannot read sandboxd.env stops below.
+	root := in.Host.IsRoot()
+	if !root && !o.FilesOnly && !fileExistsAt(in.Paths.ClusterEnv) {
 		return InitResult{}, errors.New("run sandboxd init as root (sudo)")
 	}
 	if err := installed(in.Paths); err != nil {
@@ -204,6 +215,9 @@ func (in *Initer) Run(ctx context.Context, o InitOptions) (InitResult, error) {
 	}
 	env, err := loadNodeEnv(in.Paths)
 	if err != nil {
+		if !root && errors.Is(err, fs.ErrPermission) {
+			return InitResult{}, errors.New("run sandboxd init as root (sudo)")
+		}
 		return InitResult{}, err
 	}
 	nodeID, err := pickNodeID(in.Host, o.NodeID)
@@ -247,12 +261,20 @@ func (in *Initer) Run(ctx context.Context, o InitOptions) (InitResult, error) {
 		return InitResult{}, ErrPreflight
 	}
 
+	if !again && !o.FilesOnly && !root {
+		return InitResult{}, errors.New("run sandboxd init as root (sudo)")
+	}
 	if !again {
 		journal := &fileJournal{}
 		ca, err = in.writeSeed(ctx, journal, env, nodeID, advertise, custody, o)
 		if err != nil {
 			in.undo(journal, "")
 			return InitResult{}, err
+		}
+		if o.FilesOnly {
+			in.printf("[init] files written (--files-only). Start sandboxd with %s and %s in its environment, then run `sandboxd init` again to admit this node and register the join tokens\n",
+				in.Paths.EnvFile, in.Paths.ClusterEnv)
+			return InitResult{NodeID: nodeID, ClusterID: cluster.CACertHash(ca.Certificate())}, nil
 		}
 		in.printf("[init] files written; restarting sandboxd in cluster mode\n")
 		if err := in.Host.DaemonReload(ctx); err != nil {
@@ -263,6 +285,9 @@ func (in *Initer) Run(ctx context.Context, o InitOptions) (InitResult, error) {
 			in.undo(journal, "")
 			return InitResult{}, fmt.Errorf("%w (see: systemctl status sandboxd; journalctl -u sandboxd)", err)
 		}
+	} else if o.FilesOnly {
+		in.printf("[init] this node's cluster files are already written; nothing to do\n")
+		return InitResult{NodeID: nodeID, ClusterID: cluster.CACertHash(ca.Certificate()), Again: true}, nil
 	} else {
 		in.printf("[init] this node already started the cluster; checking it and registering the tokens again\n")
 	}
@@ -388,6 +413,11 @@ func (in *Initer) writeSeed(ctx context.Context, jr *fileJournal, env nodeEnv, n
 	}
 	if err := jr.mergeEnv(in.Paths.ClusterEnv, clusterEnvHeader, set); err != nil {
 		return nil, err
+	}
+	if o.FilesOnly {
+		// No systemd loads it: the caller puts cluster.env in sandboxd's
+		// environment itself.
+		return ca, nil
 	}
 	if err := jr.write(in.Paths.DropIn, []byte(dropInBody), 0o644); err != nil {
 		return nil, err
