@@ -24,6 +24,17 @@ type bridgeSource interface {
 	SandboxBridge(ctx context.Context) (docker.SandboxNetwork, error)
 }
 
+// dockerBridgeSource is the Docker client as a bridgeSource, or a nil
+// interface on a host without Docker (C2), so its users go straight to the
+// containerd bridge instead of asking Docker first and logging the failure.
+// (A nil *docker.Client in the interface would not compare equal to nil.)
+func dockerBridgeSource(cfg config.Config, c *docker.Client) bridgeSource {
+	if c == nil || cfg.DockerDisabled {
+		return nil
+	}
+	return c
+}
+
 // wireEgressGateway connects sandboxd to the egress-gateway process when
 // hostname filtering is on (plans/egress-domain-filtering.md D9). sandboxd
 // discovers the sandbox bridges (docker network, aerolvm0) and hands them to

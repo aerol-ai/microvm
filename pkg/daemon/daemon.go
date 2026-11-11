@@ -225,8 +225,12 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 		if err := docker.EnsureReadyDir(readyDir); err != nil {
 			return fmt.Errorf("ready socket dir: %w", err)
 		}
-		if err := dockerClient.SweepOrphanReadySockets(ctx); err != nil {
-			logger.Warn("ready socket sweep failed", "error", err)
+		// The sweep asks Docker which sockets its containers still use;
+		// without Docker (C2) there is nothing to ask.
+		if !cfg.DockerDisabled {
+			if err := dockerClient.SweepOrphanReadySockets(ctx); err != nil {
+				logger.Warn("ready socket sweep failed", "error", err)
+			}
 		}
 	}
 	configureMirror(logger, cfg, dockerClient)
@@ -737,7 +741,7 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 	// The IPv6 fence (internal/network/ipv6fence): synced once here, before
 	// the API serves, so no container or Firecracker sandbox is created
 	// without it; while it is not installed those creates are refused.
-	wireIPv6Fence(ctx, cfg, svc, dockerClient, logger)
+	wireIPv6Fence(ctx, cfg, svc, dockerBridgeSource(cfg, dockerClient), logger)
 
 	// Bootstrap caddy-l4 at boot so the first L4 exposure isn't paying for
 	// it. Best-effort by design: a cold-started caddy may still be coming
@@ -766,7 +770,7 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 	if cfg.EgressBlockPrivateByDefault {
 		svc.EnableBlockPrivateByDefault()
 	}
-	wireEgressGateway(ctx, cfg, svc, dockerClient, logger)
+	wireEgressGateway(ctx, cfg, svc, dockerBridgeSource(cfg, dockerClient), logger)
 	// After the gateway is wired: whether its ports are open depends on it.
 	wireNodeGuard(ctx, cfg, svc)
 	wireEgressProfiles(ctx, cfg, svc)
