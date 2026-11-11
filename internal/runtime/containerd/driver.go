@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/sync/singleflight"
@@ -36,6 +37,9 @@ type Config struct {
 	LogDir             string
 	RunDir             string
 	NativeNetnsPool    bool
+	// DiskQuota enforces DiskGB as an XFS project quota on each sandbox's
+	// writable layer (disk_quota.go).
+	DiskQuota bool
 }
 
 // FromDaemonConfig maps internal config into driver-local settings.
@@ -73,6 +77,7 @@ func FromDaemonConfig(cfg config.Config) Config {
 		LogDir:             logDir,
 		RunDir:             runDir,
 		NativeNetnsPool:    cfg.ContainerdNativeNetnsPoolEnabled,
+		DiskQuota:          cfg.ContainerdDiskQuota,
 	}
 }
 
@@ -117,6 +122,11 @@ type Driver struct {
 	// its output into (logio.go). A running task missing from it gets
 	// re-attached by ListManaged.
 	drainedTasks sync.Map
+
+	// diskQuotaReady latches the one-time check that the snapshots'
+	// filesystem enforces project quotas; diskQuotaMu single-flights it.
+	diskQuotaReady atomic.Bool
+	diskQuotaMu    sync.Mutex
 }
 
 type startLock struct {
